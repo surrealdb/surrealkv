@@ -1,0 +1,59 @@
+[package]
+name = "surrealkv-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+surrealkv = { path = ".." }
+tempfile = "3.23"
+rand = "0.9"
+rand_chacha = "0.9"
+
+[[bin]]
+name = "block_roundtrip"
+path = "fuzz_targets/block_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_iterator"
+path = "fuzz_targets/block_iterator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "index_lookup"
+path = "fuzz_targets/index_lookup.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "table_roundtrip"
+path = "fuzz_targets/table_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "table_iterator"
+path = "fuzz_targets/table_iterator.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bloom_filter"
+path = "fuzz_targets/bloom_filter.rs"
+test = false
+doc = false
+bench = false
+

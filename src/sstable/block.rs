@@ -11,24 +11,24 @@ use crate::{Comparator, InternalKeyComparator, Key, Value};
 pub(crate) type BlockData = Vec<u8>;
 
 #[derive(Eq, PartialEq, Debug, Clone, Default)]
-pub(crate) struct BlockHandle {
-	pub(crate) offset: usize,
-	pub(crate) size: usize,
+pub struct BlockHandle {
+	pub offset: usize,
+	pub size: usize,
 }
 
 impl BlockHandle {
-	pub(crate) fn new(offset: usize, size: usize) -> BlockHandle {
+	pub fn new(offset: usize, size: usize) -> BlockHandle {
 		BlockHandle {
 			offset,
 			size,
 		}
 	}
 
-	pub(crate) fn offset(&self) -> usize {
+	pub fn offset(&self) -> usize {
 		self.offset
 	}
 
-	pub(crate) fn size(&self) -> usize {
+	pub fn size(&self) -> usize {
 		self.size
 	}
 
@@ -44,7 +44,7 @@ impl BlockHandle {
 
 	/// Returns bytes for a encoded BlockHandle
 	#[inline]
-	pub(crate) fn encode(&self) -> Vec<u8> {
+	pub fn encode(&self) -> Vec<u8> {
 		let cap = self.offset.required_space() + self.size.required_space();
 		let mut v = vec![0; cap]; // Initialize v with zeros
 		self.encode_into(&mut v);
@@ -82,17 +82,17 @@ impl BlockHandle {
 ///     +-----------------+---------------------+--------------------+--------------+----------------+
 /// ```
 #[derive(Clone)]
-pub(crate) struct Block {
-	pub(crate) block: BlockData,
+pub struct Block {
+	pub block: BlockData,
 	comparator: Arc<InternalKeyComparator>,
 }
 
 impl Block {
-	pub(crate) fn iter(&self, keys_only: bool) -> Result<BlockIterator> {
+	pub fn iter(&self, keys_only: bool) -> Result<BlockIterator> {
 		BlockIterator::new(Arc::clone(&self.comparator), self.block.clone(), keys_only)
 	}
 
-	pub(crate) fn new(data: BlockData, comparator: Arc<InternalKeyComparator>) -> Block {
+	pub fn new(data: BlockData, comparator: Arc<InternalKeyComparator>) -> Block {
 		assert!(data.len() > 4);
 		Block {
 			block: data,
@@ -105,7 +105,7 @@ impl Block {
 	}
 }
 
-pub(crate) struct BlockWriter {
+pub struct BlockWriter {
 	restart_interval: usize,
 	// Destination buffer
 	buffer: Vec<u8>,
@@ -113,7 +113,7 @@ pub(crate) struct BlockWriter {
 	restart_points: Vec<u32>,
 	// Number of entries since last restart
 	restart_counter: usize,
-	pub(crate) last_key: Vec<u8>,
+	pub last_key: Vec<u8>,
 	num_entries: usize,
 	/// internal key comparator
 	internal_cmp: Arc<InternalKeyComparator>,
@@ -172,7 +172,7 @@ pub(crate) struct BlockWriter {
 //
 impl BlockWriter {
 	// Constructor for BlockWriter
-	pub(crate) fn new(
+	pub fn new(
 		size: usize,
 		restart_interval: usize,
 		internal_cmp: Arc<InternalKeyComparator>,
@@ -189,7 +189,7 @@ impl BlockWriter {
 	}
 
 	// Adds a key-value pair to the block
-	pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+	pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
 		// println!("key: {:?}", key);
 		// Ensure the restart counter is within the interval limit
 		assert!(self.restart_counter <= self.restart_interval);
@@ -294,7 +294,7 @@ impl BlockWriter {
 	}
 
 	// Finalizes the block and returns the block data
-	pub(crate) fn finish(mut self) -> Result<BlockData> {
+	pub fn finish(mut self) -> Result<BlockData> {
 		// 1. Append RESTARTS
 		for &r in self.restart_points.iter() {
 			self.buffer.write_fixedint(r).map_err(|e| {
@@ -324,7 +324,7 @@ impl BlockWriter {
 	}
 }
 
-pub(crate) struct BlockIterator {
+pub struct BlockIterator {
 	block: BlockData,
 	restart_points: Vec<u32>,
 	offset: usize,
@@ -339,7 +339,7 @@ pub(crate) struct BlockIterator {
 	/// internal key comparator
 	internal_cmp: Arc<InternalKeyComparator>,
 	/// When true, only return keys without allocating values
-	keys_only: bool,
+	pub keys_only: bool,
 }
 
 impl BlockIterator {
@@ -558,7 +558,7 @@ impl DoubleEndedIterator for BlockIterator {
 
 impl BlockIterator {
 	// Checks if the iterator is valid (has a current entry)
-	pub(crate) fn valid(&self) -> bool {
+	pub fn valid(&self) -> bool {
 		!self.current_key.is_empty()
 			&& self.current_value_offset_start != 0
 			&& self.current_value_offset_end != 0
@@ -566,7 +566,7 @@ impl BlockIterator {
 	}
 
 	// Move to the first entry
-	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
+	pub fn seek_to_first(&mut self) -> Result<()> {
 		if self.restart_points.is_empty() {
 			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
 			log::error!("[BLOCK] {}", err);
@@ -584,7 +584,7 @@ impl BlockIterator {
 	}
 
 	// Move to the last entry
-	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
+	pub fn seek_to_last(&mut self) -> Result<()> {
 		if self.restart_points.is_empty() {
 			self.reset();
 			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
@@ -605,7 +605,7 @@ impl BlockIterator {
 	}
 
 	// Move to a specific key or the next larger key
-	pub(crate) fn seek(&mut self, target: &[u8]) -> Result<Option<()>> {
+	pub fn seek(&mut self, target: &[u8]) -> Result<Option<()>> {
 		self.reset();
 
 		// Guard against empty blocks (corrupt or malformed)
@@ -658,7 +658,7 @@ impl BlockIterator {
 	}
 
 	// Move to the next entry
-	pub(crate) fn advance(&mut self) -> Result<bool> {
+	pub fn advance(&mut self) -> Result<bool> {
 		if self.offset >= self.restart_offset {
 			self.reset();
 			return Ok(false);
@@ -675,7 +675,7 @@ impl BlockIterator {
 	}
 
 	// Move to the previous entry
-	pub(crate) fn prev(&mut self) -> Result<bool> {
+	pub fn prev(&mut self) -> Result<bool> {
 		let original = self.current_entry_offset;
 		if original == 0 {
 			self.reset();
@@ -727,13 +727,13 @@ impl BlockIterator {
 
 	// Get the current key
 	#[inline]
-	pub(crate) fn key(&self) -> InternalKey {
+	pub fn key(&self) -> InternalKey {
 		InternalKey::decode(&self.current_key)
 	}
 
 	// Get the current value
 	#[inline]
-	pub(crate) fn value(&self) -> Value {
+	pub fn value(&self) -> Value {
 		if self.keys_only {
 			Vec::new()
 		} else {
@@ -743,19 +743,19 @@ impl BlockIterator {
 
 	/// Returns the raw encoded key bytes without allocation
 	#[inline]
-	pub(crate) fn key_bytes(&self) -> &[u8] {
+	pub fn key_bytes(&self) -> &[u8] {
 		&self.current_key
 	}
 
 	/// Returns the raw value bytes without allocation
 	#[inline]
-	pub(crate) fn value_bytes(&self) -> &[u8] {
+	pub fn value_bytes(&self) -> &[u8] {
 		&self.block[self.current_value_offset_start..self.current_value_offset_end]
 	}
 
 	/// Returns user key slice from current key without allocation
 	#[inline]
-	pub(crate) fn user_key(&self) -> &[u8] {
+	pub fn user_key(&self) -> &[u8] {
 		InternalKey::user_key_from_encoded(&self.current_key)
 	}
 }

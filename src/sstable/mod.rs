@@ -1,10 +1,10 @@
-pub(crate) mod block;
-pub(crate) mod bloom;
-pub(crate) mod error;
-pub(crate) mod filter_block;
-pub(crate) mod index_block;
-pub(crate) mod meta;
-pub(crate) mod table;
+pub mod block;
+pub mod bloom;
+pub mod error;
+pub mod filter_block;
+pub mod index_block;
+pub mod meta;
+pub mod table;
 
 use std::cmp::Ordering;
 use std::fmt::Debug;
@@ -15,8 +15,8 @@ use crate::Key;
 // bits of a 64-bit integer. 1 << 56 shifts the number 1 left by 56 bits,
 // resulting in a binary number with a 1 followed by 56 zeros. Subtracting 1
 // gives a binary number with 56 ones, which is the maximum value for 56 bits.
-pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
-pub(crate) const INTERNAL_KEY_TIMESTAMP_MAX: u64 = u64::MAX;
+pub const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
+pub const INTERNAL_KEY_TIMESTAMP_MAX: u64 = u64::MAX;
 
 // Helper function for reading u64 from byte slices without unwrap()
 // Safe to use when bounds have already been checked
@@ -96,14 +96,14 @@ impl From<u8> for InternalKeyKind {
 /// InternalKey is the main key type used throughout the LSM tree
 /// It includes a timestamp field for versioned queries
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct InternalKey {
-	pub(crate) user_key: Key,
-	pub(crate) timestamp: u64, // System time in nanoseconds since epoch
-	pub(crate) trailer: u64,   // (seq_num << 8) | kind
+pub struct InternalKey {
+	pub user_key: Key,
+	pub timestamp: u64, // System time in nanoseconds since epoch
+	pub trailer: u64,   // (seq_num << 8) | kind
 }
 
 impl InternalKey {
-	pub(crate) fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind, timestamp: u64) -> Self {
+	pub fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind, timestamp: u64) -> Self {
 		Self {
 			user_key,
 			timestamp,
@@ -147,7 +147,7 @@ impl InternalKey {
 		trailer_to_seq_num(Self::trailer_from_encoded(encoded))
 	}
 
-	pub(crate) fn encode(&self) -> Vec<u8> {
+	pub fn encode(&self) -> Vec<u8> {
 		let mut buf = self.user_key.clone();
 		buf.extend_from_slice(&self.trailer.to_be_bytes());
 		buf.extend_from_slice(&self.timestamp.to_be_bytes());
@@ -155,11 +155,11 @@ impl InternalKey {
 	}
 
 	#[inline]
-	pub(crate) fn seq_num(&self) -> u64 {
+	pub fn seq_num(&self) -> u64 {
 		trailer_to_seq_num(self.trailer)
 	}
 
-	pub(crate) fn kind(&self) -> InternalKeyKind {
+	pub fn kind(&self) -> InternalKeyKind {
 		trailer_to_kind(self.trailer)
 	}
 

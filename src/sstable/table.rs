@@ -79,7 +79,7 @@ pub(crate) struct Footer {
 }
 
 impl Footer {
-	pub(crate) fn new(metaix: BlockHandle, index: BlockHandle) -> Footer {
+	pub fn new(metaix: BlockHandle, index: BlockHandle) -> Footer {
 		Footer {
 			meta_index: metaix,
 			index,
@@ -171,13 +171,13 @@ impl Footer {
 
 // Defines a writer for constructing and writing table structures to a storage
 // medium.
-pub(crate) struct TableWriter<W: Write> {
+pub struct TableWriter<W: Write> {
 	writer: W,                                 // Underlying writer to write data to.
 	opts: Arc<Options>,                        // Shared table options.
 	compression_selector: CompressionSelector, // Level-aware compression selector.
 	target_level: u8,                          // Target level this SSTable will be written to.
 
-	pub(crate) meta: TableMetadata, // Metadata properties of the table.
+	pub meta: TableMetadata, // Metadata properties of the table.
 
 	offset: usize, // Current offset in the writer where the next write will happen.
 	prev_block_last_key: Vec<u8>, // Last key of the previous block.
@@ -192,7 +192,7 @@ pub(crate) struct TableWriter<W: Write> {
 
 impl<W: Write> TableWriter<W> {
 	// Constructs a new TableWriter with level-specific compression.
-	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
+	pub fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
 		let fb = {
 			if let Some(policy) = opts.filter_policy.clone() {
 				let mut f = FilterBlockWriter::new(Arc::clone(&policy));
@@ -232,7 +232,7 @@ impl<W: Write> TableWriter<W> {
 	}
 
 	// Adds a key-value pair to the table, ensuring keys are in ascending order.
-	pub(crate) fn add(&mut self, key: InternalKey, val: &[u8]) -> Result<()> {
+	pub fn add(&mut self, key: InternalKey, val: &[u8]) -> Result<()> {
 		// Ensure there's a data block to add to.
 		assert!(self.data_block.is_some());
 		let enc_key = key.encode();
@@ -316,7 +316,7 @@ impl<W: Write> TableWriter<W> {
 
 	// Finalizes the table writing process, writing any pending blocks and the
 	// footer.
-	pub(crate) fn finish(mut self) -> Result<usize> {
+	pub fn finish(mut self) -> Result<usize> {
 		// Before finishing, update final properties
 		self.meta.properties.created_at = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
@@ -614,7 +614,7 @@ pub enum IndexType {
 }
 
 #[derive(Clone)]
-pub(crate) struct Table {
+pub struct Table {
 	pub id: u64,
 	pub file: Arc<dyn File>,
 	#[allow(unused)]
@@ -624,13 +624,13 @@ pub(crate) struct Table {
 	pub(crate) meta: TableMetadata, // Metadata properties of the table.
 
 	pub(crate) index_block: IndexType,
-	pub(crate) filter_reader: Option<FilterBlockReader>,
+	pub filter_reader: Option<FilterBlockReader>,
 
 	pub(crate) internal_cmp: Arc<InternalKeyComparator>, // Internal key comparator for the table.
 }
 
 impl Table {
-	pub(crate) fn new(
+	pub fn new(
 		id: u64,
 		opts: Arc<Options>,
 		file: Arc<dyn File>,
@@ -742,7 +742,7 @@ impl Table {
 		Ok(b)
 	}
 
-	pub(crate) fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
+	pub fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
 		// CALL ONCE and store
 		let key_encoded = key.encode();
 
@@ -825,7 +825,7 @@ impl Table {
 		}
 	}
 
-	pub(crate) fn iter(
+	pub fn iter(
 		self: &Arc<Self>,
 		keys_only: bool,
 		range: Option<InternalKeyRange>,
@@ -895,7 +895,7 @@ impl Table {
 	}
 }
 
-pub(crate) struct TableIterator {
+pub struct TableIterator {
 	table: Arc<Table>,
 	current_block: Option<BlockIterator>,
 	current_block_off: usize,
