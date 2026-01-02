@@ -200,6 +200,9 @@ pub struct Options {
 	/// Controls behavior when WAL corruption is detected during recovery.
 	/// Default: TolerateCorruptedWithRepair (attempt repair and continue)
 	pub wal_recovery_mode: WalRecoveryMode,
+
+	pub max_auto_readahead_size: usize,
+	pub initial_auto_readahead_size: usize,
 }
 
 impl Default for Options {
@@ -233,6 +236,8 @@ impl Default for Options {
 			clock,
 			flush_on_close: true,
 			wal_recovery_mode: WalRecoveryMode::default(),
+			max_auto_readahead_size: 256 * 1024,   // 256KB
+			initial_auto_readahead_size: 8 * 1024, // 8KB
 		}
 	}
 }
@@ -534,6 +539,16 @@ impl Options {
 		}
 
 		Ok(())
+	}
+
+	pub const fn with_max_auto_readahead_size(mut self, size: usize) -> Self {
+		self.max_auto_readahead_size = size;
+		self
+	}
+
+	pub const fn with_initial_auto_readahead_size(mut self, size: usize) -> Self {
+		self.initial_auto_readahead_size = size;
+		self
 	}
 }
 

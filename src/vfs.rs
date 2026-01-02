@@ -1,5 +1,7 @@
 use std::fs::File as SysFile;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
 
 #[cfg(not(target_arch = "wasm32"))]
 use fs2::FileExt as LockFileExt;
@@ -31,6 +33,8 @@ pub trait File: Send + Sync {
 	#[allow(unused)]
 	fn sync_data(&self) -> Result<()>;
 	fn size(&self) -> Result<u64>;
+	fn supports_prefetch(&self) -> bool;
+	fn prefetch(&self, offset: u64, length: usize) -> Result<()>;
 }
 
 pub type InMemoryFile = Vec<u8>;
@@ -106,6 +110,17 @@ impl File for InMemoryFile {
 
 	fn size(&self) -> Result<u64> {
 		Ok(self.len() as u64)
+	}
+
+	fn supports_prefetch(&self) -> bool {
+		false // In-memory files don't support prefetch
+	}
+
+	fn prefetch(&self, _offset: u64, _length: usize) -> Result<()> {
+		Err(Error::Io(std::sync::Arc::new(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"Prefetch not supported for in-memory files",
+		))))
 	}
 }
 
@@ -223,6 +238,44 @@ impl File for SysFile {
 		match SysFile::metadata(self) {
 			Ok(v) => Ok(v.len()),
 			Err(e) => Err(Error::Io(e.into())),
+		}
+	}
+
+	fn supports_prefetch(&self) -> bool {
+		#[cfg(target_os = "linux")]
+		{
+			true
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			false
+		}
+	}
+
+	#[allow(unused_variables)]
+	fn prefetch(&self, offset: u64, length: usize) -> Result<()> {
+		#[cfg(target_os = "linux")]
+		{
+			// Use posix_fadvise to hint that we'll need this data soon
+			let ret = unsafe {
+				libc::posix_fadvise(
+					self.as_raw_fd(),
+					offset as libc::off_t,
+					length as libc::off_t,
+					libc::POSIX_FADV_WILLNEED,
+				)
+			};
+			if ret == 0 {
+				Ok(())
+			} else {
+				// If posix_fadvise fails, it's not critical - return success anyway
+				// The system will still work, just without prefetch hints
+				Ok(())
+			}
+		}
+		#[cfg(not(target_os = "linux"))]
+		{
+			Ok(())
 		}
 	}
 }

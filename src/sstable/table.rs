@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
 use crate::sstable::error::SSTableError;
 use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
-use crate::sstable::index_block::{TopLevelIndex, TopLevelIndexWriter};
+use crate::sstable::index_block::{BlockPrefetcher, TopLevelIndex, TopLevelIndexWriter};
 use crate::sstable::meta::TableMetadata;
 use crate::sstable::{
 	InternalKey,
@@ -843,6 +843,10 @@ impl Table {
 			keys_only,
 			range,
 			reverse_started: false,
+			block_prefetcher: BlockPrefetcher::new(
+				self.opts.initial_auto_readahead_size,
+				self.opts.max_auto_readahead_size,
+			),
 		}
 	}
 
@@ -913,6 +917,8 @@ pub(crate) struct TableIterator {
 	/// Whether reverse iteration has started (to distinguish from just
 	/// positioned)
 	reverse_started: bool,
+	// Block prefetcher for readahead during iteration
+	block_prefetcher: BlockPrefetcher,
 }
 
 impl TableIterator {
@@ -975,6 +981,8 @@ impl TableIterator {
 	}
 
 	fn load_block(&mut self, handle: &BlockHandle) -> Result<()> {
+		self.block_prefetcher.prefetch_if_needed(handle, self.table.file.as_ref());
+
 		let block = self.table.read_block(handle)?;
 		let mut block_iter = block.iter(self.keys_only)?;
 

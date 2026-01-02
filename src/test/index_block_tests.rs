@@ -1,10 +1,18 @@
+use std::collections::HashMap;
+use std::fs::File as SysFile;
 use std::sync::Arc;
 use std::vec;
 
+use tempdir::TempDir;
 use test_log::test;
 
 use crate::sstable::block::BlockHandle;
-use crate::sstable::index_block::{BlockHandleWithKey, TopLevelIndex, TopLevelIndexWriter};
+use crate::sstable::index_block::{
+	BlockHandleWithKey,
+	BlockPrefetcher,
+	TopLevelIndex,
+	TopLevelIndexWriter,
+};
 use crate::sstable::{InternalKey, InternalKeyKind};
 use crate::vfs::File;
 use crate::{CompressionType, Error, Options};
@@ -115,8 +123,6 @@ fn test_top_level_index_writer_exact_block_size() {
 #[test]
 fn test_find_block_handle_by_key() {
 	let opts = Arc::new(Options::default());
-	let d = Vec::new();
-	let f = wrap_buffer(d);
 
 	// Create separator keys as full encoded internal keys
 	let sep_c = create_internal_key(b"c".to_vec(), 1);
@@ -132,7 +138,7 @@ fn test_find_block_handle_by_key() {
 			BlockHandleWithKey::new(sep_f.clone(), BlockHandle::new(10, 10)),
 			BlockHandleWithKey::new(sep_j.clone(), BlockHandle::new(20, 10)),
 		],
-		file: f.clone(),
+		partition_map: HashMap::new(),
 	};
 
 	// A list of tuples where the first element is the encoded internal key to find,
@@ -229,8 +235,6 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 	// using the correct descending sequence number ordering:
 	// (foo, 100) < (foo, 50) < (foo, 1) in InternalKey ordering
 	let opts = Arc::new(Options::default());
-	let d = Vec::new();
-	let f = wrap_buffer(d);
 
 	// Simulate partitions where same user key "foo" spans multiple partitions
 	// Partition 0: contains (foo, 100) to (foo, 60), separator = (foo, 60)
@@ -254,7 +258,7 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 			BlockHandleWithKey::new(sep_foo_20.clone(), BlockHandle::new(100, 100)),
 			BlockHandleWithKey::new(sep_g.clone(), BlockHandle::new(200, 100)),
 		],
-		file: f,
+		partition_map: HashMap::new(),
 	};
 
 	// Test cases: (query_key, expected_partition_index)
@@ -317,8 +321,6 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 fn test_find_block_handle_by_key_different_user_keys() {
 	// Tests partition lookup with different user keys using shortened separators
 	let opts = Arc::new(Options::default());
-	let d = Vec::new();
-	let f = wrap_buffer(d);
 
 	// Partition 0: contains "apple" keys, separator = (b, MAX) [shortened from apple/banana
 	// boundary] Partition 1: contains "banana", "cherry" keys, separator = (d, MAX)
@@ -353,7 +355,7 @@ fn test_find_block_handle_by_key_different_user_keys() {
 			BlockHandleWithKey::new(sep_d.clone(), BlockHandle::new(100, 100)),
 			BlockHandleWithKey::new(sep_e.clone(), BlockHandle::new(200, 100)),
 		],
-		file: f,
+		partition_map: HashMap::new(),
 	};
 
 	let test_cases = vec![
@@ -418,8 +420,6 @@ fn test_find_block_handle_by_key_different_user_keys() {
 fn test_find_block_handle_returns_correct_partition_index() {
 	// Verifies the optimization that returns (index, handle) tuple
 	let opts = Arc::new(Options::default());
-	let d = Vec::new();
-	let f = wrap_buffer(d);
 
 	let sep_keys: Vec<_> =
 		(0..5).map(|i| create_internal_key(format!("key_{:02}", i).into_bytes(), 100)).collect();
@@ -432,7 +432,7 @@ fn test_find_block_handle_returns_correct_partition_index() {
 			.enumerate()
 			.map(|(i, sep)| BlockHandleWithKey::new(sep.clone(), BlockHandle::new(i * 100, 100)))
 			.collect(),
-		file: f,
+		partition_map: HashMap::new(),
 	};
 
 	// Query for each separator key and verify correct index is returned
@@ -453,8 +453,6 @@ fn test_find_block_handle_returns_correct_partition_index() {
 fn test_partition_lookup_empty_partition_returns_none() {
 	// Edge case: Query beyond all partitions
 	let opts = Arc::new(Options::default());
-	let d = Vec::new();
-	let f = wrap_buffer(d);
 
 	let sep = create_internal_key(b"zzz".to_vec(), 1);
 
@@ -462,7 +460,7 @@ fn test_partition_lookup_empty_partition_returns_none() {
 		id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
-		file: f,
+		partition_map: HashMap::new(),
 	};
 
 	// Query for key beyond the single partition
@@ -475,8 +473,6 @@ fn test_partition_lookup_empty_partition_returns_none() {
 fn test_partition_lookup_single_partition() {
 	// Edge case: Only one partition
 	let opts = Arc::new(Options::default());
-	let d = Vec::new();
-	let f = wrap_buffer(d);
 
 	let sep = create_internal_key(b"middle".to_vec(), 1);
 
@@ -484,7 +480,7 @@ fn test_partition_lookup_single_partition() {
 		id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
-		file: f,
+		partition_map: HashMap::new(),
 	};
 
 	// Query before the separator
@@ -510,8 +506,6 @@ fn test_partition_lookup_single_partition() {
 fn test_partition_lookup_exact_separator_match() {
 	// Edge case: Query key exactly matches a separator
 	let opts = Arc::new(Options::default());
-	let d = Vec::new();
-	let f = wrap_buffer(d);
 
 	let sep_a = create_internal_key(b"aaa".to_vec(), 50);
 	let sep_b = create_internal_key(b"bbb".to_vec(), 50);
@@ -525,7 +519,7 @@ fn test_partition_lookup_exact_separator_match() {
 			BlockHandleWithKey::new(sep_b.clone(), BlockHandle::new(100, 100)),
 			BlockHandleWithKey::new(sep_c.clone(), BlockHandle::new(200, 100)),
 		],
-		file: f,
+		partition_map: HashMap::new(),
 	};
 
 	// Query exactly "bbb" at same seq
@@ -533,4 +527,146 @@ fn test_partition_lookup_exact_separator_match() {
 	assert!(result.is_some());
 	let (idx, _) = result.unwrap();
 	assert_eq!(idx, 1, "Exact match should return that partition");
+}
+
+#[test]
+fn test_cache_dependencies() {
+	let opts = Arc::new(Options::default());
+	let max_block_size = 50; // Small size to force multiple partitions
+	let mut writer = TopLevelIndexWriter::new(opts.clone(), max_block_size);
+
+	// Add entries to create partitions
+	for i in 0..5 {
+		let key = create_internal_key(format!("key_{i:03}").as_bytes().to_vec(), 1);
+		let handle = format!("handle_{i}").into_bytes();
+		writer.add(&key, &handle).unwrap();
+	}
+
+	// Write to buffer
+	let mut buffer = Vec::new();
+	let (top_level_handle, _) = writer.finish(&mut buffer, CompressionType::None, 0).unwrap();
+
+	// Read it back
+	let file = wrap_buffer(buffer);
+	let index = TopLevelIndex::new(0, opts.clone(), file, &top_level_handle).unwrap();
+
+	// Verify partitions are cached
+	assert!(!index.partition_map.is_empty());
+	assert_eq!(index.partition_map.len(), index.blocks.len());
+
+	// Test loading from cache
+	for partition in &index.blocks {
+		let cached_block = index.partition_map.get(&partition.offset());
+		assert!(cached_block.is_some());
+	}
+}
+
+#[test]
+fn test_block_prefetcher() {
+	let mut prefetcher = BlockPrefetcher::new(512, 256 * 1024); // compaction, initial readahead, max readahead
+
+	let handle = BlockHandle::new(0, 100);
+
+	// Test first read should not prefetch
+	let test_file = wrap_buffer(vec![]);
+	let should_prefetch = prefetcher.prefetch_if_needed(&handle, test_file.as_ref());
+	assert!(!should_prefetch);
+
+	// Test sequential access pattern
+	let mut seq_prefetcher = BlockPrefetcher::new(512, 256 * 1024);
+	let handle1 = BlockHandle::new(0, 100);
+	let handle2 = BlockHandle::new(100, 100); // Sequential to handle1
+
+	// First access
+	let should_prefetch = seq_prefetcher.prefetch_if_needed(&handle1, test_file.as_ref());
+	assert!(!should_prefetch);
+
+	// Second sequential access (still no prefetch)
+	let should_prefetch = seq_prefetcher.prefetch_if_needed(&handle2, test_file.as_ref());
+	assert!(!should_prefetch);
+
+	// Third sequential access (should trigger prefetch)
+	let handle3 = BlockHandle::new(200, 100);
+	let should_prefetch = seq_prefetcher.prefetch_if_needed(&handle3, test_file.as_ref());
+	assert!(should_prefetch);
+
+	// Test exponential growth capping
+	let mut capped_prefetcher = BlockPrefetcher::new(8 * 1024, 32 * 1024); // 8KB initial, 32KB max
+	assert_eq!(capped_prefetcher.readahead_size, 8 * 1024);
+
+	// Grow multiple times to test capping
+	capped_prefetcher.grow_readahead_size(); // Should become 16KB
+	assert_eq!(capped_prefetcher.readahead_size, 16 * 1024);
+
+	capped_prefetcher.grow_readahead_size(); // Should become 32KB
+	assert_eq!(capped_prefetcher.readahead_size, 32 * 1024);
+
+	capped_prefetcher.grow_readahead_size(); // Should stay at 32KB (capped)
+	assert_eq!(capped_prefetcher.readahead_size, 32 * 1024);
+}
+
+#[test]
+fn test_block_prefetcher_sequential() {
+	let mut prefetcher = BlockPrefetcher::new(512, 256 * 1024);
+	let test_file = wrap_buffer(vec![0u8; 10000]); // Need some file content
+
+	// Create 3 SEQUENTIAL block handles
+	let handle1 = BlockHandle::new(0, 100); // Block at 0-99
+	let handle2 = BlockHandle::new(100, 100); // Block at 100-199 (sequential!)
+	let handle3 = BlockHandle::new(200, 100); // Block at 200-299 (sequential!)
+
+	// First read: should NOT prefetch (num_file_reads becomes 1)
+	let should_prefetch = prefetcher.prefetch_if_needed(&handle1, test_file.as_ref());
+	assert!(!should_prefetch, "First read should not prefetch");
+
+	// Second read (sequential): should NOT prefetch (num_file_reads becomes 2)
+	let should_prefetch = prefetcher.prefetch_if_needed(&handle2, test_file.as_ref());
+	assert!(!should_prefetch, "Second read should not prefetch");
+
+	// Third read (sequential): SHOULD prefetch (num_file_reads becomes 3, which is > 2)
+	let should_prefetch = prefetcher.prefetch_if_needed(&handle3, test_file.as_ref());
+	assert!(should_prefetch, "Third sequential read should trigger prefetch");
+}
+
+#[test]
+fn test_block_prefetcher_non_sequential_resets() {
+	let mut prefetcher = BlockPrefetcher::new(512, 256 * 1024);
+	let test_file = wrap_buffer(vec![0u8; 10000]);
+
+	// Sequential reads
+	let handle1 = BlockHandle::new(0, 100);
+	let handle2 = BlockHandle::new(100, 100);
+
+	prefetcher.prefetch_if_needed(&handle1, test_file.as_ref()); // num = 1
+	prefetcher.prefetch_if_needed(&handle2, test_file.as_ref()); // num = 2
+
+	// Non-sequential jump!
+	let handle_jump = BlockHandle::new(5000, 100);
+	let should_prefetch = prefetcher.prefetch_if_needed(&handle_jump, test_file.as_ref());
+	assert!(!should_prefetch, "Non-sequential access should reset and not prefetch");
+	// After reset: num_sequential_reads = 1, prev_offset = 5000, prev_len = 100
+
+	// First read after reset: num becomes 2, still <= 2
+	let handle3 = BlockHandle::new(5100, 100);
+	let should_prefetch = prefetcher.prefetch_if_needed(&handle3, test_file.as_ref());
+	assert!(!should_prefetch, "First read after reset should not prefetch (num=2)");
+
+	// Second read after reset: num becomes 3, > 2, would trigger prefetch
+	// InMemoryFile doesn't support prefetch, so returns true (fallback needed)
+	let handle4 = BlockHandle::new(5200, 100);
+	let should_prefetch = prefetcher.prefetch_if_needed(&handle4, test_file.as_ref());
+	assert!(should_prefetch, "Second read after reset triggers prefetch attempt (num=3)");
+}
+
+#[test]
+fn test_supports_prefetch() {
+	// create a test file using tempfile
+	let dir = TempDir::new("test").unwrap();
+	let dir = dir.path();
+
+	let file_path = dir.join("foo");
+	let file = SysFile::create(file_path).unwrap();
+	let file: Arc<dyn File> = Arc::new(file);
+
+	println!("supports pefetch {}", file.supports_prefetch());
 }

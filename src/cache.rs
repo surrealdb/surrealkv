@@ -10,13 +10,11 @@ use crate::Value;
 
 /// Kind constants for differentiating cache entry types
 const KIND_DATA: u8 = 0;
-const KIND_INDEX: u8 = 1;
 const KIND_VLOG: u8 = 2;
 
 #[derive(Clone)]
 pub(crate) enum Item {
 	Data(Arc<Block>),
-	Index(Arc<Block>),
 	VLog(Value),
 }
 
@@ -54,7 +52,6 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
 	fn weight(&self, _: &CacheKey, item: &Item) -> u64 {
 		match item {
 			Item::Data(block) => block.size() as u64,
-			Item::Index(block) => block.size() as u64,
 			Item::VLog(value) => value.len() as u64,
 		}
 	}
@@ -101,11 +98,6 @@ impl BlockCache {
 		self.data.insert((KIND_DATA, table_id, offset).into(), Item::Data(block));
 	}
 
-	/// Inserts an index block into the cache.
-	pub(crate) fn insert_index_block(&self, table_id: u64, offset: u64, block: Arc<Block>) {
-		self.data.insert((KIND_INDEX, table_id, offset).into(), Item::Index(block));
-	}
-
 	/// Inserts a VLog value into the cache.
 	pub(crate) fn insert_vlog(&self, file_id: u32, offset: u64, value: Value) {
 		self.data.insert((KIND_VLOG, file_id as u64, offset).into(), Item::VLog(value));
@@ -127,26 +119,6 @@ impl BlockCache {
 
 		match item.as_ref()? {
 			Item::Data(block) => Some(Arc::clone(block)),
-			_ => None,
-		}
-	}
-
-	/// Retrieves an index block from the cache.
-	pub(crate) fn get_index_block(&self, table_id: u64, offset: u64) -> Option<Arc<Block>> {
-		let key = (KIND_INDEX, table_id, &offset);
-		let item = self.data.get(&key);
-
-		#[cfg(test)]
-		{
-			if item.is_some() {
-				self.index_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			} else {
-				self.index_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-			}
-		}
-
-		match item.as_ref()? {
-			Item::Index(block) => Some(Arc::clone(block)),
 			_ => None,
 		}
 	}
