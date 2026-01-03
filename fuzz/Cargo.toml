@@ -57,3 +57,9 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "bplustree"
+path = "fuzz_targets/bplustree.rs"
+test = false
+doc = false
+bench = false

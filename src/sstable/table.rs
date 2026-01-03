@@ -630,12 +630,7 @@ pub struct Table {
 }
 
 impl Table {
-	pub fn new(
-		id: u64,
-		opts: Arc<Options>,
-		file: Arc<dyn File>,
-		file_size: u64,
-	) -> Result<Table> {
+	pub fn new(id: u64, opts: Arc<Options>, file: Arc<dyn File>, file_size: u64) -> Result<Table> {
 		// Read in the following order:
 		//    1. Footer
 		//    2. [index block]
