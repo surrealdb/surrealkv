@@ -49,7 +49,8 @@ pub enum Error {
 	VlogGCAlreadyInProgress,
 	InvalidArgument(String),
 	InvalidTag(String),
-	BPlusTree(String), // B+ tree specific errors
+	BPlusTree(String),    // B+ tree specific errors
+	InterleavedIteration, // Interleaved iteration not supported
 	/// WAL corruption detected during recovery, includes location for repair
 	WalCorruption {
 		segment_id: usize,
@@ -100,6 +101,7 @@ impl fmt::Display for Error {
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::BPlusTree(err) => write!(f, "B+ tree error: {err}"),
+            Self::InterleavedIteration => write!(f, "Interleaved iteration not supported: cannot mix next() and next_back() on same iterator"),
             Self::WalCorruption { segment_id, offset, message } => write!(
                 f,
                 "WAL corruption in segment {} at offset {}: {}",

@@ -795,7 +795,8 @@ impl CommitEnv for LsmCommitEnv {
 					.encode();
 
 					// Collect and delete all existing entries for this user key
-					let range_iter = versioned_index_guard.range(&start_key, &end_key)?;
+					let range_iter =
+						versioned_index_guard.range(start_key.as_slice()..=end_key.as_slice())?;
 					let mut keys_to_delete = Vec::new();
 					for entry in range_iter {
 						let (key, _) = entry?;

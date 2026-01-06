@@ -3915,3 +3915,126 @@ fn test_reverse_iteration_empty_range() {
 	let result = iter.next_back();
 	assert!(result.is_none(), "Empty range should return None on next_back()");
 }
+
+#[test]
+fn test_table_properties_persistence() {
+	// Test that table properties are correctly persisted through write/load cycle
+	let mut buffer = Vec::new();
+	let table_id = 42;
+	let opts = default_opts();
+
+	// Step 1: Create TableWriter and add entries
+	let mut writer = TableWriter::new(&mut buffer, table_id, opts.clone(), 0);
+
+	let mut entries = Vec::new();
+	let mut expected_deletions = 0u64;
+	let mut expected_tombstones = 0u64;
+
+	for i in 0..50 {
+		let key = format!("key_{:03}", i).into_bytes();
+		let value = format!("value_{:03}", i).into_bytes();
+		let seq = 1000 + i;
+
+		let kind = match i % 10 {
+			0..=6 => InternalKeyKind::Set,
+			7..=8 => {
+				expected_deletions += 1;
+				expected_tombstones += 1;
+				InternalKeyKind::Delete
+			}
+			9 => {
+				expected_deletions += 1;
+				expected_tombstones += 1; // RangeDelete is also counted as a tombstone
+				InternalKeyKind::RangeDelete
+			}
+			_ => unreachable!(),
+		};
+
+		let internal_key = InternalKey::new(key.clone(), seq, kind, 0);
+
+		let entry_value = match kind {
+			InternalKeyKind::Delete | InternalKeyKind::RangeDelete => vec![],
+			_ => value.clone(),
+		};
+
+		writer.add(internal_key, &entry_value).unwrap();
+		entries.push((key, value, seq, kind));
+	}
+
+	// Step 2: Finish writing to buffer
+	let size = writer.finish().unwrap();
+
+	// Step 3: Create new Table from buffer (load phase)
+	let table = Table::new(table_id, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+
+	// Step 4: Verify all properties match expected values
+	let meta = &table.meta;
+	let props = &meta.properties;
+
+	// Basic properties
+	assert_eq!(props.id, table_id, "Table ID should match");
+	assert_eq!(props.table_format, TableFormat::LSMV1, "Table format should be LSMV1");
+	assert_eq!(props.num_entries, 50, "Number of entries should be 50");
+	assert_eq!(props.item_count, 50, "Item count should be 50");
+	assert_eq!(props.key_count, 50, "Key count should be 50");
+	assert_eq!(props.num_deletions, expected_deletions, "Number of deletions should match");
+	assert_eq!(props.tombstone_count, expected_tombstones, "Tombstone count should match");
+	assert_eq!(props.global_seq_num, 0, "Global sequence number should be 0");
+	assert!(props.num_data_blocks > 0, "Should have at least one data block");
+	assert!(props.data_size > 0, "Data size should be greater than 0");
+
+	// Index properties
+	assert!(props.index_size > 0, "Index size should be tracked");
+	assert!(props.index_partitions > 0, "Should have at least one index partition");
+	assert!(props.top_level_index_size > 0, "Top-level index size should be tracked");
+
+	// Filter properties
+	assert!(props.filter_size > 0, "Filter size should be tracked");
+
+	// Raw size metrics
+	assert!(props.raw_key_size > 0, "Raw key size should be tracked");
+	assert!(props.raw_value_size > 0, "Raw value size should be tracked");
+	assert_eq!(
+		props.raw_key_size + props.raw_value_size,
+		props.data_size,
+		"Raw sizes should sum to data_size"
+	);
+
+	// Sequence number range
+	assert_eq!(props.seqnos.0, 1000, "Smallest sequence number should be 1000");
+	assert_eq!(props.seqnos.1, 1049, "Largest sequence number should be 1049");
+	assert_eq!(meta.smallest_seq_num, 1000, "Metadata smallest seq num should match");
+	assert_eq!(meta.largest_seq_num, 1049, "Metadata largest seq num should match");
+
+	// Compression
+	assert_eq!(props.compression, crate::CompressionType::None, "Compression should be None");
+
+	// Block properties
+	assert!(props.block_size > 0, "Block size should be tracked");
+	assert!(props.block_count > 0, "Block count should be tracked");
+
+	// Time metrics (timestamps are 0 in this test)
+	assert_eq!(props.oldest_key_time, 0, "Oldest key time should be 0");
+	assert_eq!(props.newest_key_time, 0, "Newest key time should be 0");
+
+	// Range deletion metrics
+	assert_eq!(props.num_range_deletions, 5, "Should have 5 range deletions");
+
+	// Created at timestamp
+	assert!(props.created_at > 0, "Created at timestamp should be set");
+
+	// Verify smallest and largest point keys
+	assert!(meta.smallest_point.is_some(), "Should have smallest point key");
+	assert!(meta.largest_point.is_some(), "Should have largest point key");
+	if let Some(smallest) = &meta.smallest_point {
+		assert_eq!(&smallest.user_key, b"key_000", "Smallest key should be key_000");
+		assert_eq!(smallest.seq_num(), 1000, "Smallest seq num should be 1000");
+	}
+	if let Some(largest) = &meta.largest_point {
+		assert_eq!(&largest.user_key, b"key_049", "Largest key should be key_049");
+		assert_eq!(largest.seq_num(), 1049, "Largest seq num should be 1049");
+	}
+
+	// Verify TableMetadata fields
+	assert_eq!(meta.has_point_keys, Some(true), "Should have point keys");
+}
