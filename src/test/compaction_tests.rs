@@ -58,7 +58,7 @@ impl TestEnv {
 		let file = File::create(&table_path)?;
 
 		// Create a TableWriter
-		let mut writer = TableWriter::new(file, id, self.options.clone(), 0); // Test table, use L0
+		let mut writer = TableWriter::new(file, id, Arc::clone(&self.options), 0); // Test table, use L0
 
 		// Add entries to the table
 		for (key, value) in entries {
@@ -74,7 +74,7 @@ impl TestEnv {
 		let file = Arc::new(file);
 
 		// Create and return the table
-		let table = Table::new(id, self.options.clone(), file, file_size)?;
+		let table = Table::new(id, Arc::clone(&self.options), file, file_size)?;
 
 		Ok(Arc::new(table))
 	}
@@ -187,7 +187,7 @@ fn create_compaction_options(
 	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
 	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
-	let vlog = Arc::new(crate::vlog::VLog::new(opts.clone(), None).unwrap());
+	let vlog = Arc::new(crate::vlog::VLog::new(Arc::clone(&opts), None).unwrap());
 
 	CompactionOptions {
 		lopts: opts,
@@ -601,7 +601,7 @@ async fn test_simple_merge_compaction() {
 	let strategy = Arc::new(Strategy::new(4, 2));
 
 	// Create compaction options
-	let compaction_options = create_compaction_options(env.options, manifest.clone());
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 
 	// Create the compactor
 	let compactor = Compactor::new(compaction_options, strategy);
@@ -792,7 +792,7 @@ async fn test_multi_level_merge_compaction() {
 
 	// Create the strategy and compactor
 	let strategy = Arc::new(Strategy::new(4, 2));
-	let compaction_options = create_compaction_options(env.options, manifest.clone());
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 	let compactor = Compactor::new(compaction_options, strategy);
 
 	// Run multiple rounds of compaction
@@ -1143,7 +1143,7 @@ async fn test_compaction_with_large_keys_and_values() {
 
 	// Set up compaction
 	let strategy = Arc::new(Strategy::new(4, 2));
-	let compaction_options = create_compaction_options(env.options, manifest.clone());
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 	let compactor = Compactor::new(compaction_options, strategy);
 
 	// Run compaction
@@ -1215,7 +1215,7 @@ async fn test_compaction_respects_sequence_numbers() {
 
 	// Set up compaction
 	let strategy = Arc::new(Strategy::new(4, 2));
-	let compaction_options = create_compaction_options(env.options, manifest.clone());
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 	let compactor = Compactor::new(compaction_options, strategy);
 
 	// Run compaction
@@ -1305,7 +1305,7 @@ async fn test_tombstone_propagation() {
 
 	// Run compaction
 	let strategy = Arc::new(Strategy::new(1, 2));
-	let compaction_options = create_compaction_options(env.options, manifest.clone());
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 	let compactor = Compactor::new(compaction_options, strategy);
 	let result = compactor.compact();
 	assert!(result.is_ok(), "Compaction failed");
@@ -1400,7 +1400,7 @@ async fn test_l0_overlapping_keys_compaction() {
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let strategy = Arc::new(Strategy::new(1, 2));
-	let compaction_options = create_compaction_options(env.options, manifest.clone());
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 	let compactor = Compactor::new(compaction_options, strategy);
 	perform_compaction_rounds(&compactor, 2);
 
@@ -1516,7 +1516,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let strategy = Arc::new(Strategy::new(1, 2));
-	let compaction_options = create_compaction_options(env.options, manifest.clone());
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 	let compactor = Compactor::new(compaction_options, strategy);
 	perform_compaction_rounds(&compactor, 2);
 
@@ -1633,7 +1633,7 @@ async fn test_tombstone_propagation_through_levels() {
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let strategy = Arc::new(Strategy::new(1, 2));
-	let compaction_options = create_compaction_options(env.options, manifest.clone());
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 	let compactor = Compactor::new(compaction_options, strategy);
 	compactor.compact().unwrap();
 
@@ -1892,7 +1892,7 @@ async fn test_soft_delete_compaction_behavior() {
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let strategy = Arc::new(Strategy::new(1, 1)); // base_level_size=1, multiplier=1
-	let mut compaction_options = create_compaction_options(env.options, manifest.clone());
+	let mut compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 	compaction_options.vlog = None;
 	let compactor = Compactor::new(compaction_options, strategy);
 
@@ -2036,7 +2036,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 
 	let strategy = Arc::new(Strategy::new(1, 1));
 	// NOTE: Do NOT set vlog = None - we need VLog enabled to trigger the bug
-	let compaction_options = create_compaction_options(env.options, manifest.clone());
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 
 	let compactor = Compactor::new(compaction_options, strategy);
 

@@ -512,11 +512,11 @@ mod tests {
 	#[test]
 	fn test_wal_append_to_existing() {
 		let temp_dir = create_temp_directory();
-		let opts = Options::default();
 
 		// First session - write some data
 		{
-			let mut wal = Wal::open(temp_dir.path(), opts.clone()).unwrap();
+			let opts = Options::default();
+			let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
 			wal.append(&[1, 2, 3, 4]).unwrap();
 			wal.close().unwrap();
 		}
@@ -528,6 +528,7 @@ mod tests {
 
 		// Second session - should append to same file
 		{
+			let opts = Options::default();
 			let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
 			wal.append(&[5, 6, 7, 8]).unwrap();
 			wal.close().unwrap();
@@ -553,7 +554,6 @@ mod tests {
 		use crate::wal::reader::Reader;
 
 		let temp_dir = create_temp_directory();
-		let opts = Options::default();
 
 		// Create test data of varying lengths to stress block alignment
 		let test_records: Vec<Vec<u8>> = vec![
@@ -572,7 +572,8 @@ mod tests {
 		// Write records across multiple sessions (close and reopen between each)
 		// This tests that block_offset is correctly restored each time
 		for (i, record) in test_records.iter().enumerate() {
-			let mut wal = Wal::open(temp_dir.path(), opts.clone()).unwrap();
+			let opts = Options::default();
+			let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
 			wal.append(record).unwrap();
 			wal.close().unwrap();
 
@@ -819,12 +820,12 @@ mod tests {
 	fn test_open_with_min_log_number_uses_highest_segment() {
 		let temp_dir = create_temp_directory();
 		let wal_path = temp_dir.path();
-		let opts = Options::default();
 
 		// Step 1: Create WAL segments 1, 2, 3 using the WAL API
 		// Create segment 1 (00000000000000000001.wal)
 		{
-			let mut wal = Wal::open_with_min_log_number(wal_path, 1, opts.clone()).unwrap();
+			let opts = Options::default();
+			let mut wal = Wal::open_with_min_log_number(wal_path, 1, opts).unwrap();
 			assert_eq!(wal.get_active_log_number(), 1);
 			wal.append(b"data_in_segment_1").unwrap();
 			wal.close().unwrap();
@@ -832,7 +833,8 @@ mod tests {
 
 		// Create segment 2
 		{
-			let mut wal = Wal::open_with_min_log_number(wal_path, 2, opts.clone()).unwrap();
+			let opts = Options::default();
+			let mut wal = Wal::open_with_min_log_number(wal_path, 2, opts).unwrap();
 			// At this point, highest on disk is 1, min is 2, so max(2, 1) = 2
 			assert_eq!(wal.get_active_log_number(), 2);
 			wal.append(b"data_in_segment_2").unwrap();
@@ -841,7 +843,8 @@ mod tests {
 
 		// Create segment 3
 		{
-			let mut wal = Wal::open_with_min_log_number(wal_path, 3, opts.clone()).unwrap();
+			let opts = Options::default();
+			let mut wal = Wal::open_with_min_log_number(wal_path, 3, opts).unwrap();
 			assert_eq!(wal.get_active_log_number(), 3);
 			wal.append(b"data_in_segment_3").unwrap();
 			wal.close().unwrap();
@@ -868,7 +871,8 @@ mod tests {
 		// after crash) The fix should cause WAL to open at segment 3 (highest on
 		// disk), not 1
 		{
-			let mut wal = Wal::open_with_min_log_number(wal_path, 1, opts.clone()).unwrap();
+			let opts = Options::default();
+			let mut wal = Wal::open_with_min_log_number(wal_path, 1, opts).unwrap();
 
 			let active = wal.get_active_log_number();
 			log::info!("After open_with_min_log_number(1): active_log_number = {}", active);
@@ -885,6 +889,7 @@ mod tests {
 		// Step 3: Edge case - open with min_log_number higher than any segment on disk
 		// max(5, 3) = 5, so should open at 5
 		{
+			let opts = Options::default();
 			let mut wal = Wal::open_with_min_log_number(wal_path, 5, opts).unwrap();
 
 			assert_eq!(

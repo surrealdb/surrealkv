@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
-use crate::clock::MockLogicalClock;
+use crate::clock::{LogicalClock, MockLogicalClock};
 use crate::iter::CompactionIterator;
 use crate::sstable::{InternalKey, InternalKeyKind};
 use crate::vlog::{VLog, ValueLocation};
@@ -317,7 +317,7 @@ async fn test_combined_iterator_returns_latest_version() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		false, // not bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -373,7 +373,7 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		false, // not bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -431,7 +431,7 @@ async fn test_hard_delete_at_bottom_level() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		true, // bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -474,7 +474,7 @@ async fn test_hard_delete_at_non_bottom_level() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		false, // not bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -537,7 +537,7 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		false, // not bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -678,7 +678,7 @@ async fn test_sequence_ordering_across_iterators() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		false, // not bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -832,7 +832,7 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		false, // not bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		true, // enable versioning
 		retention_period_ns,
 		clock,
@@ -1013,7 +1013,7 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3, iter4],
 		true, // BOTTOM LEVEL - delete markers should be dropped
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		true, // enable versioning
 		retention_period_ns,
 		clock,
@@ -1174,7 +1174,7 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		false, // NON-BOTTOM LEVEL
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		false, // VERSIONING DISABLED
 		retention_period_ns,
 		clock,
@@ -1316,7 +1316,7 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		true, // BOTTOM LEVEL
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		false, // VERSIONING DISABLED
 		retention_period_ns,
 		clock,
@@ -1427,7 +1427,7 @@ async fn test_delete_list_logic() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
 			true, // bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			retention_period,
 			clock,
@@ -1482,7 +1482,7 @@ async fn test_delete_list_logic() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
 			true, // bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			retention_period,
 			clock,
@@ -1533,7 +1533,7 @@ async fn test_delete_list_logic() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
 			true, // bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			false, // disable versioning
 			retention_period,
 			clock,
@@ -1587,7 +1587,7 @@ async fn test_delete_list_logic() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
 			true, // bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			retention_period,
 			clock,
@@ -1642,7 +1642,7 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		false, // non-bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		true, // enable versioning
 		1000, // retention period
 		clock,
@@ -1708,7 +1708,7 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		false, // non-bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		true, // enable versioning
 		1000, // retention period
 		clock,
@@ -1766,7 +1766,7 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		false, // non-bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		true, // enable versioning
 		1000, // retention period
 		clock,
@@ -1822,7 +1822,7 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		false, // non-bottom level
-		Some(vlog.clone()),
+		Some(Arc::clone(&vlog)),
 		true, // enable versioning
 		1000, // retention period
 		clock,
@@ -1880,10 +1880,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			false, // non-bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -1934,10 +1934,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			true, // bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -1992,10 +1992,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			false, // non-bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -2051,10 +2051,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			false, // non-bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -2125,10 +2125,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2, iter3],
 			false, // non-bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -2177,10 +2177,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			false, // non-bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -2227,10 +2227,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			true, // bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -2285,10 +2285,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2, iter3],
 			false, // non-bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			1000, // retention period
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -2341,10 +2341,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			false, // non-bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -2398,10 +2398,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2, iter3],
 			false, // non-bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -2449,10 +2449,10 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			false, // non-bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
-			clock.clone(),
+			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 		);
 
 		let mut result = Vec::new();
@@ -2499,7 +2499,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			true, // bottom level
-			Some(vlog.clone()),
+			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
 			clock,

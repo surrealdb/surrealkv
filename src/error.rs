@@ -383,7 +383,7 @@ mod tests {
 
 		// Set a hard error
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "test error"))),
+			Error::Io(Arc::new(std::io::Error::other("test error"))),
 			BackgroundErrorReason::MemtablaFlush,
 		);
 
@@ -400,7 +400,7 @@ mod tests {
 
 		// VLog GC I/O is HardError - stops writes but less severe than FatalError
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "test error"))),
+			Error::Io(Arc::new(std::io::Error::other("test error"))),
 			BackgroundErrorReason::VLogGC,
 		);
 
@@ -415,7 +415,7 @@ mod tests {
 
 		// Set a hard error first (VLog GC I/O)
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "hard error"))),
+			Error::Io(Arc::new(std::io::Error::other("hard error"))),
 			BackgroundErrorReason::VLogGC,
 		);
 
@@ -423,7 +423,7 @@ mod tests {
 
 		// Set a fatal error - should upgrade
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "fatal error"))),
+			Error::Io(Arc::new(std::io::Error::other("fatal error"))),
 			BackgroundErrorReason::MemtablaFlush,
 		);
 
@@ -439,15 +439,15 @@ mod tests {
 
 		// Set a hard error first
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "hard error"))),
+			Error::Io(Arc::new(std::io::Error::other("hard error"))),
 			BackgroundErrorReason::MemtablaFlush,
 		);
 
-		let first_error = handler.get_error().unwrap().error.clone();
+		let first_error = handler.get_error().unwrap().error;
 
 		// Try to set a soft error - should not downgrade
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "soft error"))),
+			Error::Io(Arc::new(std::io::Error::other("soft error"))),
 			BackgroundErrorReason::Compaction,
 		);
 
@@ -461,7 +461,7 @@ mod tests {
 		let handler = BackgroundErrorHandler::new();
 
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "test error"))),
+			Error::Io(Arc::new(std::io::Error::other("test error"))),
 			BackgroundErrorReason::MemtablaFlush,
 		);
 
