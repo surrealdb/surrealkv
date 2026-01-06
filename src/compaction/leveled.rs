@@ -1,9 +1,10 @@
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::levels::{Level, LevelManifest};
-use crate::InternalKeyRange;
+use crate::{InternalKeyRange, Options};
 
 /// Compaction priority strategy for selecting files to compact
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -22,43 +23,59 @@ pub enum CompactionPriority {
 }
 
 pub(crate) struct Strategy {
-	// Base size for L0 (in number of tables)
-	base_level_size: usize,
-	// Size multiplier between levels
-	size_multiplier: usize,
-	// Track the last compacted level for round-robin selection
-	last_compacted_level: AtomicUsize,
-	// Compaction priority strategy
+	// Number of L0 files that trigger compaction
+	level0_file_num_trigger: usize,
+	// Base size for level 1+ in bytes
+	max_bytes_for_level_base: u64,
+	// Size multiplier for each level
+	max_bytes_for_level_multiplier: f64,
 	compaction_priority: CompactionPriority,
+	// Track the last compacted level for round-robin selection (used for tiebreaking)
+	last_compacted_level: AtomicUsize,
 }
 
 impl Default for Strategy {
 	fn default() -> Self {
+		let opts = Options::default();
 		Self {
-			base_level_size: 4,
-			size_multiplier: 10,
-			last_compacted_level: AtomicUsize::new(0),
+			level0_file_num_trigger: opts.level0_file_num_compaction_trigger,
+			max_bytes_for_level_base: opts.max_bytes_for_level_base,
+			max_bytes_for_level_multiplier: opts.max_bytes_for_level_multiplier,
 			compaction_priority: CompactionPriority::default(),
+			last_compacted_level: AtomicUsize::new(0),
 		}
 	}
 }
 
 impl Strategy {
-	#[cfg(test)]
-	pub(crate) fn new(base_level_size: usize, size_multiplier: usize) -> Self {
+	/// Create a Strategy from Options
+	pub(crate) fn from_options(opts: Arc<Options>) -> Self {
 		Self {
-			base_level_size,
-			size_multiplier,
-			last_compacted_level: AtomicUsize::new(0),
+			level0_file_num_trigger: opts.level0_file_num_compaction_trigger,
+			max_bytes_for_level_base: opts.max_bytes_for_level_base,
+			max_bytes_for_level_multiplier: opts.max_bytes_for_level_multiplier,
 			compaction_priority: CompactionPriority::default(),
+			last_compacted_level: AtomicUsize::new(0),
 		}
 	}
 
-	fn calculate_level_size_limit(&self, level: u8) -> usize {
+	/// Get the L0 compaction trigger (file count)
+	fn level0_trigger(&self) -> usize {
+		self.level0_file_num_trigger
+	}
+
+	/// Calculate max bytes for a level (L1+ only, L0 uses count-based)
+	fn max_bytes_for_level(&self, level: u8) -> u64 {
 		if level == 0 {
-			return self.base_level_size;
+			return 0; // L0 uses count-based
 		}
-		self.base_level_size * self.size_multiplier.pow(level as u32)
+		(self.max_bytes_for_level_base as f64
+			* self.max_bytes_for_level_multiplier.powi((level - 1) as i32)) as u64
+	}
+
+	/// Calculate total bytes in a level
+	fn level_bytes(level: &Level) -> u64 {
+		level.tables.iter().map(|t| t.file_size).sum()
 	}
 
 	pub(crate) fn select_tables_for_compaction(
@@ -129,7 +146,10 @@ impl Strategy {
 
 		// Find overlapping tables from next level
 		if let Some(bounds) = source_bounds {
-			for table in next_level.overlapping_tables(&bounds) {
+			let overlapping_tables: Vec<_> = next_level.overlapping_tables(&bounds).collect();
+
+			// Add overlapping tables
+			for table in overlapping_tables {
 				if table_id_set.insert(table.id) {
 					tables.push(table.id);
 				}
@@ -269,47 +289,51 @@ impl Strategy {
 		choices.first().map(|choice| choice.table_id)
 	}
 
-	pub(crate) fn find_compaction_level(&self, manifest: &LevelManifest) -> Option<u8> {
+	/// Compute compaction scores for all levels
+	/// Returns vector of (level, score) pairs sorted by score descending
+	/// Only includes levels with score >= 1.0
+	fn compute_compaction_scores(&self, manifest: &LevelManifest) -> Vec<(u8, f64)> {
 		let levels = manifest.levels.get_levels();
-		let last_level_index = manifest.last_level_index();
+		let mut scores = Vec::new();
 
-		// L0 gets highest priority - check first
-		// L0 files can overlap, so they accumulate quickly and block reads
-		if levels[0].tables.len() >= self.calculate_level_size_limit(0) {
-			return Some(0);
+		// L0: score = file_count / trigger
+		let l0_score = levels[0].tables.len() as f64 / self.level0_trigger() as f64;
+		if l0_score >= 1.0 {
+			scores.push((0, l0_score));
 		}
 
-		// Track last compacted level for round-robin fairness
-		// This prevents always picking the same level when multiple need compaction
-		let start = self.last_compacted_level.load(Ordering::Relaxed);
-		let mut candidates: Vec<u8> = Vec::new();
-
-		// Find all levels that exceed their size limits
-		for level in 1..=last_level_index {
-			let current_size = levels[level as usize].tables.len();
-			let size_limit = self.calculate_level_size_limit(level);
-			if current_size >= size_limit {
-				candidates.push(level);
+		// L1+: score = level_bytes / max_bytes_for_level
+		for level in 1..=manifest.last_level_index() {
+			let bytes = Self::level_bytes(&levels[level as usize]);
+			let target = self.max_bytes_for_level(level);
+			if target > 0 {
+				let score = bytes as f64 / target as f64;
+				if score >= 1.0 {
+					scores.push((level, score));
+				}
 			}
 		}
 
+		// Sort descending by score
+		scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+		scores
+	}
+
+	pub(crate) fn find_compaction_level(&self, manifest: &LevelManifest) -> Option<u8> {
+		let scores = self.compute_compaction_scores(manifest);
+
 		// No levels need compaction
-		if candidates.is_empty() {
+		if scores.is_empty() {
 			return None;
 		}
 
-		// Round-robin selection: pick the first candidate after our last compacted
-		// level
-		for level in &candidates {
-			if *level as usize > start {
-				self.last_compacted_level.store(*level as usize, Ordering::Relaxed);
-				return Some(*level);
-			}
-		}
+		// Pick the level with the highest score
+		let (level, _score) = scores[0];
 
-		// All candidates are <= start, so wrap around and pick the first one
-		let level = candidates[0];
-		self.last_compacted_level.store(level as usize, Ordering::Relaxed);
+		// Update last compacted level for tiebreaking (though score-based selection makes this less
+		// critical)
+		self.last_compacted_level.store(level as usize, Ordering::SeqCst);
 		Some(level)
 	}
 }
@@ -323,13 +347,16 @@ impl CompactionStrategy for Strategy {
 
 		let levels = manifest.levels.get_levels();
 
-		if source_level >= manifest.last_level_index() {
-			return CompactionChoice::Skip;
-		}
+		// Allow same-level compaction at the bottom level for tombstone cleanup
+		let target_level = if source_level >= manifest.last_level_index() {
+			source_level // Same-level compaction
+		} else {
+			source_level + 1
+		};
 
 		let tables_to_merge = self.select_tables_for_compaction(
 			&levels[source_level as usize],
-			&levels[(source_level + 1) as usize],
+			&levels[target_level as usize],
 			source_level,
 		);
 
@@ -340,7 +367,7 @@ impl CompactionStrategy for Strategy {
 		CompactionChoice::Merge(CompactionInput {
 			tables_to_merge,
 			source_level,
-			target_level: source_level + 1,
+			target_level,
 		})
 	}
 }

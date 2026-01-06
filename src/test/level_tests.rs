@@ -47,7 +47,7 @@ fn make_range(
 /// Creates a table with specific key range for testing
 fn create_test_table(id: u64, keys: &[&str], opts: Arc<Options>) -> Arc<Table> {
 	let mut buf = Vec::new();
-	let mut writer = TableWriter::new(&mut buf, id, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buf, id, Arc::clone(&opts), 0);
 
 	for (i, key) in keys.iter().enumerate() {
 		let ikey =
@@ -67,7 +67,7 @@ fn create_test_level(table_ranges: &[(&str, &str)], opts: Arc<Options>) -> Level
 
 	for (id, (smallest, largest)) in table_ranges.iter().enumerate() {
 		// Create table with just the boundary keys
-		let table = create_test_table((id + 1) as u64, &[smallest, largest], opts.clone());
+		let table = create_test_table((id + 1) as u64, &[smallest, largest], Arc::clone(&opts));
 		tables.push(table);
 	}
 
