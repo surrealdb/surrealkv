@@ -232,7 +232,7 @@ fn test_many_items() {
 	let mut buffer = Vec::with_capacity(10240); // 10KB initial capacity
 
 	// Create TableWriter
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Number of items to generate
 	let num_items = 10001;
@@ -304,7 +304,7 @@ fn test_iter_items() {
 	let mut buffer = Vec::new();
 
 	// Create TableWriter
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Number of items to generate
 	let num_items = 10001;
@@ -1561,7 +1561,7 @@ fn test_table_with_partitioned_index() {
 	let opts = Arc::new(opts);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 1, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
 
 	// Add enough entries to create multiple data blocks and index partitions
 	for i in 0..100 {
@@ -1639,7 +1639,7 @@ fn test_get_nonexistent_key_returns_none() {
 	// Disable bloom filter so we actually exercise the key comparison logic.
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add only key_bbb to the table
 	let key = b"key_bbb";
@@ -1680,7 +1680,7 @@ fn test_get_same_key_different_sequence_numbers() {
 	// seq_nums sort first)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let user_key = b"my_key";
 
@@ -1733,7 +1733,7 @@ fn test_get_with_lower_sequence_number() {
 	// Snapshot at seq=25 can't see future version at seq=50
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1770,7 +1770,7 @@ fn test_get_with_lower_sequence_number() {
 fn test_get_empty_table() {
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let size = writer.finish().unwrap();
 	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
@@ -1785,7 +1785,7 @@ fn test_get_multiple_keys_with_sequence_variations() {
 	// Ensures fix doesn't cause cross-key contamination with different seq_nums
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_a = InternalKey::new(Vec::from(b"key_a"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_a, b"value_a_100").unwrap();
@@ -1827,7 +1827,7 @@ fn test_get_boundary_conditions() {
 	// Edge cases with sequence number boundaries (seq=0, seq=MAX, seq=1)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1868,7 +1868,7 @@ fn test_get_lookup_higher_than_stored() {
 	// though 25 < 50 numerically)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1901,7 +1901,7 @@ fn test_get_partition_index_sequence_numbers() {
 	// Partition index handles sequence numbers correctly across multiple blocks
 	let opts = Arc::new(Options::new().with_filter_policy(None).with_block_size(512));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	for i in 0..20 {
 		let key = format!("aaa_key_{:03}", i);
@@ -1961,7 +1961,7 @@ fn test_get_nonexistent_key_greater_than_all() {
 	// Key greater than all stored keys should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1986,7 +1986,7 @@ fn test_get_nonexistent_key_between_existing() {
 	// Key between existing keys should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -2011,7 +2011,7 @@ fn test_get_with_tombstone() {
 	// Tombstones should be found and returned
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_other = InternalKey::new(Vec::from(b"key_other"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_other, b"value_other").unwrap();
@@ -2039,7 +2039,7 @@ fn test_get_nonexistent_with_similar_prefix() {
 	// Prefix of existing keys should not match
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key1 = InternalKey::new(Vec::from(b"user_data"), 100, InternalKeyKind::Set, 0);
 	writer.add(key1, b"value1").unwrap();
@@ -2064,7 +2064,7 @@ fn test_get_nonexistent_empty_key() {
 	// Empty key should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -2086,7 +2086,7 @@ fn test_get_nonexistent_with_special_chars() {
 	// Binary keys with special bytes handled correctly
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key1 = InternalKey::new(Vec::from(b"key\x00"), 100, InternalKeyKind::Set, 0);
 	writer.add(key1, b"value0").unwrap();
@@ -2111,7 +2111,7 @@ fn test_get_nonexistent_in_large_table() {
 	// Non-existent key in multi-block table should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None).with_block_size(512));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	for i in 0..100 {
 		if i == 50 {
@@ -2140,7 +2140,7 @@ fn test_get_all_keys_same_prefix_different_suffix() {
 	// Keys with same prefix but different suffix don't match
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_a = InternalKey::new(Vec::from(b"prefix_a"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_a, b"value_a").unwrap();
@@ -2166,7 +2166,7 @@ fn test_table_iterator_seek_nonexistent_key() {
 	// at the next greater key (correct iterator semantics)
 	let opts = Arc::new(Options::default());
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add only key_bbb to the table
 	let key = b"key_bbb";
@@ -2209,7 +2209,7 @@ fn test_table_iterator_seek_nonexistent_past_end() {
 	// Test that seeking past all keys makes iterator invalid
 	let opts = Arc::new(Options::default());
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key = b"key_bbb";
 	let value = b"value_bbb";
@@ -2233,7 +2233,7 @@ fn test_table_iterator_seek_exact_match() {
 	// Test that seeking to an existing key positions at that key
 	let opts = Arc::new(Options::default());
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key = b"key_bbb";
 	let value = b"value_bbb";
@@ -3068,7 +3068,7 @@ fn test_get_block_boundary_same_user_key_bug() {
 	);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let user_key = b"test";
 
@@ -3156,7 +3156,7 @@ fn test_iterator_trait_prev_multi_partition_bug() {
 	);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add enough keys to create multiple data blocks, which creates multiple index entries,
 	// which in turn creates multiple index partitions
@@ -3254,7 +3254,7 @@ fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
 	);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add many versions of the SAME user key with decreasing seq_nums
 	// Internal key ordering: user_key ASC, seq_num DESC
@@ -3376,7 +3376,7 @@ fn test_table_get_mvcc_correct_version() {
 	// Query at different seq_nums should return correct version
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let user_key = b"my_key";
 
@@ -3424,7 +3424,7 @@ fn test_table_get_returns_none_for_future_version() {
 	// Expected: Should return None (no visible version)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Key only has version at seq=100
 	let key = InternalKey::new(b"future_key".to_vec(), 100, InternalKeyKind::Set, 0);
@@ -3445,7 +3445,7 @@ fn test_table_get_different_user_keys() {
 	// Verify no cross-contamination
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let keys = ["apple", "banana", "cherry", "date"];
 	for key in &keys {
@@ -3481,7 +3481,7 @@ fn test_table_get_at_block_boundaries() {
 		                                                              * force splits */
 	);
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add enough keys to span multiple blocks
 	for i in 0..20 {
@@ -3518,7 +3518,7 @@ fn test_table_get_tombstone_handling() {
 	// Table::get should still return the tombstone, caller handles it
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add a set followed by a delete
 	let set_key = InternalKey::new(b"my_key".to_vec(), 100, InternalKeyKind::Set, 0);
@@ -3553,7 +3553,7 @@ fn test_table_get_user_key_mismatch() {
 	// Expected: Should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Only add "apple" and "cherry", not "banana"
 	let key1 = InternalKey::new(b"apple".to_vec(), 100, InternalKeyKind::Set, 0);
@@ -3924,7 +3924,7 @@ fn test_table_properties_persistence() {
 	let opts = default_opts();
 
 	// Step 1: Create TableWriter and add entries
-	let mut writer = TableWriter::new(&mut buffer, table_id, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, table_id, Arc::clone(&opts), 0);
 
 	let mut entries = Vec::new();
 	let mut expected_deletions = 0u64;

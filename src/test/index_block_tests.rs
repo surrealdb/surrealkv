@@ -96,7 +96,7 @@ fn test_top_level_index_writer_exact_block_size() {
 // fn test_top_level_index() {
 //     let opts = Arc::new(Options::default());
 //     let max_block_size = 10;
-//     let mut writer = TopLevelIndexWriter::new(opts.clone(), max_block_size);
+//     let mut writer = TopLevelIndexWriter::new(Arc::clone(&opts), max_block_size);
 
 //     let key1 = create_internal_key(b"key1".to_vec(), 1);
 //     let handle1 = vec![1, 2, 3];
@@ -132,7 +132,7 @@ fn test_find_block_handle_by_key() {
 			BlockHandleWithKey::new(sep_f.clone(), BlockHandle::new(10, 10)),
 			BlockHandleWithKey::new(sep_j.clone(), BlockHandle::new(20, 10)),
 		],
-		file: f.clone(),
+		file: Arc::clone(&f),
 	};
 
 	// A list of tuples where the first element is the encoded internal key to find,
@@ -164,7 +164,7 @@ fn test_find_block_handle_by_key() {
 fn test_partitioned_index_lookup() {
 	let opts = Arc::new(Options::default());
 	let max_block_size = 50; // Small size to force multiple partitions
-	let mut writer = TopLevelIndexWriter::new(opts.clone(), max_block_size);
+	let mut writer = TopLevelIndexWriter::new(Arc::clone(&opts), max_block_size);
 
 	// Add enough entries to create multiple partitions
 	let entries = vec![

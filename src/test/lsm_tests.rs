@@ -1101,7 +1101,7 @@ async fn test_vlog_concurrent_operations() {
 	// Concurrent reads
 	let read_handles: Vec<_> = (0..5)
 		.map(|reader_id| {
-			let tree = tree.clone();
+			let tree = Arc::clone(&tree);
 			let expected_values = expected_values.clone();
 			tokio::spawn(async move {
 				for (key, expected_value) in expected_values {
@@ -2258,7 +2258,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 	}
 
 	// Phase 2: Check manifest state after shutdown
-	let manifest = LevelManifest::new(opts.clone()).expect("Failed to load manifest");
+	let manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to load manifest");
 	let log_number = manifest.get_log_number();
 
 	// CRITICAL CHECK: log_number should be > 0 to skip WAL #0
@@ -2271,7 +2271,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 	// Phase 3: Restart and verify WAL was actually skipped
 	{
 		// Create a custom Core to inspect if WAL was replayed
-		let inner = Arc::new(CoreInner::new(opts.clone()).unwrap());
+		let inner = Arc::new(CoreInner::new(Arc::clone(&opts)).unwrap());
 
 		// Before WAL replay, memtable should be empty
 		let memtable_before = inner.active_memtable.read().unwrap().clone();
@@ -2446,7 +2446,7 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		tree.close().await.unwrap();
 
 		// Get the manifest sequence after shutdown flush
-		let manifest = LevelManifest::new(opts.clone()).unwrap();
+		let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
 		manifest_seq_initial = manifest.get_last_sequence();
 	}
 
@@ -2640,7 +2640,7 @@ async fn test_shutdown_with_empty_memtable() {
 		tree.close().await.unwrap();
 
 		// Verify manifest unchanged (no unnecessary updates)
-		let manifest = LevelManifest::new(opts.clone()).unwrap();
+		let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
 		assert_eq!(manifest.get_log_number(), log_number_before);
 		assert_eq!(manifest.get_last_sequence(), last_seq_before);
 	}
@@ -2877,7 +2877,7 @@ async fn test_wal_append_after_crash_recovery() {
 	};
 
 	// Verify manifest didn't change (no flush happened)
-	let manifest = LevelManifest::new(opts.clone()).unwrap();
+	let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
 	assert_eq!(manifest.get_log_number(), manifest_log, "Manifest should not change on crash");
 
 	// Phase 2: Reopen and verify WAL is reused (SAME number)
@@ -3020,7 +3020,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 
 	// Cycle 2: Reopen, verify recovery, write more, flush, close
 	{
-		let manifest_before = LevelManifest::new(opts.clone()).unwrap();
+		let manifest_before = LevelManifest::new(Arc::clone(&opts)).unwrap();
 		let log_num_before = manifest_before.get_log_number();
 
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
@@ -3668,7 +3668,7 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 		}
 
 		// Check manifest state after close
-		let manifest = LevelManifest::new(opts.clone()).unwrap();
+		let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
 		let log_number_after_close = manifest.get_log_number();
 		previous_log_numbers.push(log_number_after_close);
 

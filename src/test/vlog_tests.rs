@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
+use crate::clock::LogicalClock;
 use crate::discard::DiscardStats;
 use crate::vlog::{
 	VLog,
@@ -34,8 +35,9 @@ fn create_test_vlog(opts: Option<Options>) -> (VLog, TempDir, Arc<Options>) {
 	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
 	let opts = Arc::new(opts);
-	let vlog = VLog::new(opts.clone(), None).unwrap();
-	(vlog, temp_dir, opts)
+	let opts_clone = Arc::clone(&opts);
+	let vlog = VLog::new(opts, None).unwrap();
+	(vlog, temp_dir, opts_clone)
 }
 
 #[test]
@@ -205,7 +207,7 @@ async fn test_prefill_file_handles() {
 	vlog1.close().await.unwrap();
 
 	// Create a new VLog instance - this should trigger prefill_file_handles
-	let vlog2 = VLog::new(opts.clone(), None).unwrap();
+	let vlog2 = VLog::new(opts, None).unwrap();
 
 	// Verify that all existing files can be read
 	for (i, pointer) in pointers.iter().enumerate() {
@@ -520,9 +522,10 @@ async fn test_vlog_with_file_header() {
 #[test(tokio::test)]
 async fn test_vlog_restart_continues_last_file() {
 	let temp_dir = TempDir::new().unwrap();
+	let vlog_max_file_size = 2048;
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
-		vlog_max_file_size: 2048,
+		vlog_max_file_size,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
 		..Default::default()
 	};
@@ -532,12 +535,14 @@ async fn test_vlog_restart_continues_last_file() {
 	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
 	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
+	let opts = Arc::new(opts);
+
 	let mut pointers = Vec::new();
 
 	// Phase 1: Create initial VLog and add some data (but not enough to fill the
 	// file)
 	{
-		let vlog1 = VLog::new(Arc::new(opts.clone()), None).unwrap();
+		let vlog1 = VLog::new(Arc::clone(&opts), None).unwrap();
 
 		// Add some data to the first file
 		for i in 0..3 {
@@ -561,7 +566,7 @@ async fn test_vlog_restart_continues_last_file() {
 		// Get the file size to ensure it's not at max capacity
 		let file_path = vlog1.vlog_file_path(first_file_id);
 		let file_size = std::fs::metadata(&file_path).unwrap().len();
-		assert!(file_size < opts.vlog_max_file_size, "File should not be at max capacity");
+		assert!(file_size < vlog_max_file_size, "File should not be at max capacity");
 
 		// Check that active_writer_id is correctly set
 		let active_writer_id = vlog1.active_writer_id.load(Ordering::SeqCst);
@@ -577,7 +582,7 @@ async fn test_vlog_restart_continues_last_file() {
 
 	// Phase 2: Restart VLog and verify it continues with the last file
 	{
-		let vlog2 = VLog::new(Arc::new(opts.clone()), None).unwrap();
+		let vlog2 = VLog::new(Arc::clone(&opts), None).unwrap();
 
 		// Check that active_writer_id is set to the last file (file 0)
 		let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
@@ -672,12 +677,14 @@ async fn test_vlog_restart_with_multiple_files() {
 	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
 	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
+	let opts = Arc::new(opts);
+
 	let mut all_pointers = Vec::new();
 	let mut highest_file_id = 0;
 
 	// Phase 1: Create VLog and add enough data to create 5+ files
 	{
-		let vlog1 = VLog::new(Arc::new(opts.clone()), None).unwrap();
+		let vlog1 = VLog::new(Arc::clone(&opts), None).unwrap();
 
 		// Add enough data to create at least 5 VLog files
 		for i in 0..50 {
@@ -711,7 +718,7 @@ async fn test_vlog_restart_with_multiple_files() {
 
 	// Phase 2: Restart VLog and verify it picks up the correct active writer
 	{
-		let vlog2 = VLog::new(Arc::new(opts.clone()), None).unwrap();
+		let vlog2 = VLog::new(Arc::clone(&opts), None).unwrap();
 
 		// Check that active_writer_id is set to the highest file ID
 		let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
@@ -810,9 +817,10 @@ async fn test_vlog_restart_with_multiple_files() {
 #[test(tokio::test)]
 async fn test_vlog_writer_reopen_append_only_behavior() {
 	let temp_dir = TempDir::new().unwrap();
+	let vlog_max_file_size = 2048;
 	let opts = Arc::new(Options {
 		path: temp_dir.path().to_path_buf(),
-		vlog_max_file_size: 2048,
+		vlog_max_file_size,
 		vlog_checksum_verification: VLogChecksumLevel::Full,
 		..Default::default()
 	});
@@ -935,7 +943,7 @@ async fn test_vlog_writer_reopen_append_only_behavior() {
 		let vlog_file_path = opts.vlog_file_path(file_id as u64);
 		std::fs::copy(&test_file_path, &vlog_file_path).unwrap();
 
-		let vlog = VLog::new(opts.clone(), None).unwrap();
+		let vlog = VLog::new(opts, None).unwrap();
 
 		// Verify ALL phase 1 data can still be read (proving no overwrite occurred)
 		for (i, (pointer, (_, expected_value))) in
@@ -970,7 +978,7 @@ async fn test_vlog_writer_reopen_append_only_behavior() {
 		let mut writer3 = VLogWriter::new(
 			&test_file_path,
 			file_id,
-			opts.vlog_max_file_size,
+			vlog_max_file_size,
 			CompressionType::None as u8,
 		)
 		.unwrap();
@@ -1033,7 +1041,7 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 	let retention_ns = 2000; // 2 seconds retention - very short for testing
 
 	let opts = Options {
-		clock: mock_clock.clone(),
+		clock: Arc::clone(&mock_clock) as Arc<dyn LogicalClock>,
 		vlog_max_file_size: 950, /* Small files to force frequent rotations (like VLog
 		                          * compaction test) */
 		vlog_gc_discard_ratio: 0.0, // Disable discard ratio to preserve all values initially

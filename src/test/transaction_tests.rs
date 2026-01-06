@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::sync::Arc;
 
 use tempdir::TempDir;
 use test_log::test;
@@ -1966,25 +1967,26 @@ async fn test_versioned_queries_with_deletes() {
 	let temp_dir = create_temp_directory();
 	let opts: Options =
 		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
-	let tree = TreeBuilder::with_options(opts.clone()).build().unwrap();
+	let clock = Arc::clone(&opts.clock);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
 
 	// Insert first version
 	let mut tx1 = tree.begin().unwrap();
 	tx1.set(b"key1", b"value1").unwrap();
 	tx1.commit().await.unwrap();
-	let ts1 = opts.clock.now();
+	let ts1 = clock.now();
 
 	// Update with second version
 	let mut tx2 = tree.begin().unwrap();
 	tx2.set(b"key1", b"value2").unwrap();
 	tx2.commit().await.unwrap();
-	let ts2 = opts.clock.now();
+	let ts2 = clock.now();
 
 	// Delete the key
 	let mut tx3 = tree.begin().unwrap();
 	tx3.soft_delete(b"key1").unwrap(); // Hard delete
 	tx3.commit().await.unwrap();
-	let ts3 = opts.clock.now();
+	let ts3 = clock.now();
 
 	// Test regular get (should return None due to delete)
 	let tx = tree.begin().unwrap();
@@ -2454,7 +2456,8 @@ async fn test_range_at_version_with_deletes() {
 	let temp_dir = create_temp_directory();
 	let opts: Options =
 		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
-	let tree = TreeBuilder::with_options(opts.clone()).build().unwrap();
+	let clock = Arc::clone(&opts.clock);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
 
 	// Insert data without explicit timestamps (will use auto-generated timestamps)
 	let mut tx1 = tree.begin().unwrap();
@@ -2462,7 +2465,7 @@ async fn test_range_at_version_with_deletes() {
 	tx1.set(b"key2", b"value2").unwrap();
 	tx1.set(b"key3", b"value3").unwrap();
 	tx1.commit().await.unwrap();
-	let ts_after_insert = opts.clock.now();
+	let ts_after_insert = clock.now();
 
 	// Query at this point should show all three keys
 	let tx_before = tree.begin().unwrap();
@@ -2478,7 +2481,7 @@ async fn test_range_at_version_with_deletes() {
 	tx2.delete(b"key2").unwrap();
 	tx2.soft_delete(b"key3").unwrap();
 	tx2.commit().await.unwrap();
-	let ts_after_deletes = opts.clock.now();
+	let ts_after_deletes = clock.now();
 
 	// Test range_at_version at a time after the deletes
 	// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
@@ -2638,7 +2641,8 @@ async fn test_count_at_version_with_deletes() {
 	let temp_dir = create_temp_directory();
 	let opts: Options =
 		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
-	let tree = TreeBuilder::with_options(opts.clone()).build().unwrap();
+	let clock = Arc::clone(&opts.clock);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
 
 	// Insert data without explicit timestamps
 	let mut tx1 = tree.begin().unwrap();
@@ -2646,7 +2650,7 @@ async fn test_count_at_version_with_deletes() {
 	tx1.set(b"key2", b"value2").unwrap();
 	tx1.set(b"key3", b"value3").unwrap();
 	tx1.commit().await.unwrap();
-	let ts_after_insert = opts.clock.now();
+	let ts_after_insert = clock.now();
 
 	// Count at this point should show all three keys
 	let tx_before = tree.begin().unwrap();
@@ -2658,7 +2662,7 @@ async fn test_count_at_version_with_deletes() {
 	tx_delete.delete(b"key2").unwrap(); // Hard delete
 	tx_delete.soft_delete(b"key3").unwrap(); // Soft delete
 	tx_delete.commit().await.unwrap();
-	let ts_after_delete = opts.clock.now();
+	let ts_after_delete = clock.now();
 
 	// Count after deletes
 	let tx_after = tree.begin().unwrap();

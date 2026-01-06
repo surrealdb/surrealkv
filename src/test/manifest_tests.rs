@@ -23,7 +23,7 @@ fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Resul
 	let mut file = SysFile::create(&table_file_path)?;
 
 	// Create TableWriter that writes directly to the file
-	let mut writer = TableWriter::new(&mut file, table_id, opts.clone(), 0); // L0 for test
+	let mut writer = TableWriter::new(&mut file, table_id, Arc::clone(&opts), 0); // L0 for test
 
 	// Generate and add items
 	for i in 0..num_items {
@@ -68,19 +68,22 @@ fn test_level_manifest_persistence() {
 	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
 
 	// Create a new manifest with 3 levels
-	let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
+	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
 	// Create tables and add them to the manifest
 	// Create 2 tables for level 0
 	let table_id1 = 1;
-	let table1 = create_test_table(table_id1, 100, opts.clone()).expect("Failed to create table 1");
+	let table1 =
+		create_test_table(table_id1, 100, Arc::clone(&opts)).expect("Failed to create table 1");
 
 	let table_id2 = 2;
-	let table2 = create_test_table(table_id2, 200, opts.clone()).expect("Failed to create table 2");
+	let table2 =
+		create_test_table(table_id2, 200, Arc::clone(&opts)).expect("Failed to create table 2");
 
 	// Create a table for level 1
 	let table_id3 = 3;
-	let table3 = create_test_table(table_id3, 300, opts.clone()).expect("Failed to create table 3");
+	let table3 =
+		create_test_table(table_id3, 300, Arc::clone(&opts)).expect("Failed to create table 3");
 
 	let expected_next_id = 100;
 	manifest.next_table_id.store(expected_next_id, Ordering::SeqCst);
@@ -121,7 +124,7 @@ fn test_level_manifest_persistence() {
 
 	// Load the manifest directly to verify persistence
 	let manifest_path = opts.manifest_file_path(0);
-	let loaded_manifest = LevelManifest::load_from_file(&manifest_path, opts.clone())
+	let loaded_manifest = LevelManifest::load_from_file(&manifest_path, Arc::clone(&opts))
 		.expect("Failed to load manifest");
 
 	// Verify all manifest fields were persisted correctly
@@ -172,8 +175,8 @@ fn test_level_manifest_persistence() {
 	);
 
 	// Create a new manifest from the same path (simulating restart/recovery)
-	let new_manifest =
-		LevelManifest::new(opts.clone()).expect("Failed to create manifest from existing file");
+	let new_manifest = LevelManifest::new(Arc::clone(&opts))
+		.expect("Failed to create manifest from existing file");
 
 	// Verify all manifest fields were loaded correctly in the new manifest
 	assert_eq!(
@@ -341,7 +344,7 @@ fn create_test_table_with_seq_nums(
 	let mut file = SysFile::create(&table_file_path)?;
 
 	// Create TableWriter that writes directly to the file
-	let mut writer = TableWriter::new(&mut file, table_id, opts.clone(), 0); // L0 for test
+	let mut writer = TableWriter::new(&mut file, table_id, Arc::clone(&opts), 0); // L0 for test
 
 	// Generate and add items with specific sequence numbers
 	for seq_num in seq_start..=seq_end {
@@ -386,15 +389,15 @@ fn test_lsn_with_multiple_l0_tables() {
 	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
 
 	// Create a new manifest
-	let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
+	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
 	// Test 1: Empty manifest should have last_sequence of 0
 	assert_eq!(manifest.get_last_sequence(), 0, "Empty manifest should return last_sequence of 0");
 
 	// Test 2: Add single table via changeset
 	// Create table with sequence numbers 1-10 (largest_seq_num = 10)
-	let table1 =
-		create_test_table_with_seq_nums(1, 1, 10, opts.clone()).expect("Failed to create table 1");
+	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
+		.expect("Failed to create table 1");
 
 	let changeset1 = ManifestChangeSet {
 		new_tables: vec![(0, table1)],
@@ -406,8 +409,8 @@ fn test_lsn_with_multiple_l0_tables() {
 
 	// Test 3: Add table with higher sequence numbers
 	// Create table with sequence numbers 11-20 (largest_seq_num = 20)
-	let table2 =
-		create_test_table_with_seq_nums(2, 11, 20, opts.clone()).expect("Failed to create table 2");
+	let table2 = create_test_table_with_seq_nums(2, 11, 20, Arc::clone(&opts))
+		.expect("Failed to create table 2");
 
 	let changeset2 = ManifestChangeSet {
 		new_tables: vec![(0, table2)],
@@ -423,8 +426,8 @@ fn test_lsn_with_multiple_l0_tables() {
 
 	// Test 4: Add table with even higher sequence numbers
 	// Create table with sequence numbers 21-30 (largest_seq_num = 30)
-	let table3 =
-		create_test_table_with_seq_nums(3, 21, 30, opts.clone()).expect("Failed to create table 3");
+	let table3 = create_test_table_with_seq_nums(3, 21, 30, Arc::clone(&opts))
+		.expect("Failed to create table 3");
 
 	let changeset3 = ManifestChangeSet {
 		new_tables: vec![(0, table3)],
@@ -461,8 +464,8 @@ fn test_lsn_with_multiple_l0_tables() {
 
 	// Test 6: Add table with lower sequence numbers (simulating out-of-order
 	// insertion) Create table with sequence numbers 5-8 (largest_seq_num = 8)
-	let table4 =
-		create_test_table_with_seq_nums(4, 5, 8, opts.clone()).expect("Failed to create table 4");
+	let table4 = create_test_table_with_seq_nums(4, 5, 8, Arc::clone(&opts))
+		.expect("Failed to create table 4");
 
 	let changeset4 = ManifestChangeSet {
 		new_tables: vec![(0, table4)],
@@ -544,14 +547,16 @@ fn test_last_sequence_persistence_across_manifest_reload() {
 
 	// Create manifest with tables via changeset and verify last_sequence
 	{
-		let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
+		let mut manifest =
+			LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
 		// Create tables with different sequence ranges
-		let table1 = create_test_table_with_seq_nums(1, 1, 20, opts.clone())
+		let table1 = create_test_table_with_seq_nums(1, 1, 20, Arc::clone(&opts))
 			.expect("Failed to create table 1");
-		let table2 = create_test_table_with_seq_nums(2, 21, expected_last_sequence, opts.clone())
-			.expect("Failed to create table 2");
-		let table3 = create_test_table_with_seq_nums(3, 10, 30, opts.clone())
+		let table2 =
+			create_test_table_with_seq_nums(2, 21, expected_last_sequence, Arc::clone(&opts))
+				.expect("Failed to create table 2");
+		let table3 = create_test_table_with_seq_nums(3, 10, 30, Arc::clone(&opts))
 			.expect("Failed to create table 3");
 
 		// Add all tables via a single changeset
@@ -619,12 +624,12 @@ fn test_manifest_v1_with_log_number_and_last_sequence() {
 	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	// Create a manifest with log_number and last_sequence set
-	let mut manifest = LevelManifest::new(opts.clone()).expect("Failed to create manifest");
+	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
 
 	// Add a table to ensure non-trivial state
 	// Table with sequence numbers 100-200, so last_sequence should be 200
-	let table =
-		create_test_table_with_seq_nums(1, 100, 200, opts.clone()).expect("Failed to create table");
+	let table = create_test_table_with_seq_nums(1, 100, 200, Arc::clone(&opts))
+		.expect("Failed to create table");
 
 	// Use changeset to atomically set log_number and add table
 	// The changeset will automatically update last_sequence from the table's

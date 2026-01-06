@@ -433,7 +433,7 @@ fn test_range_skips_non_overlapping_tables() {
 		let opts = Arc::new(Options::new());
 		let mut buf = Vec::new();
 		{
-			let mut w = TableWriter::new(&mut buf, 0, opts.clone(), 0); // L0 for test
+			let mut w = TableWriter::new(&mut buf, 0, Arc::clone(&opts), 0); // L0 for test
 			for (k, v) in data {
 				let ikey = InternalKey::new(k.to_vec(), 1, InternalKeyKind::Set, 0);
 				w.add(ikey, v).unwrap();
@@ -784,7 +784,7 @@ fn create_test_table_with_range(
 	let table_file_path = opts.sstable_file_path(table_id);
 	let mut file = SysFile::create(&table_file_path)?;
 
-	let mut writer = TableWriter::new(&mut file, table_id, opts.clone(), 0); // L0 for test
+	let mut writer = TableWriter::new(&mut file, table_id, Arc::clone(&opts), 0); // L0 for test
 
 	// Generate incremental keys spanning the range
 	let mut keys = Vec::new();
@@ -874,9 +874,9 @@ fn test_level0_tables_before_range_skipped() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables with ranges: [a-c], [d-f], [g-i]
-	let table1 = create_test_table_with_range(1, "a", "c", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(2, "d", "f", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(3, "g", "i", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "c", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(2, "d", "f", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(3, "g", "i", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
@@ -902,9 +902,9 @@ fn test_level0_tables_after_range_skipped() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables with ranges: [m-o], [p-r], [s-u]
-	let table1 = create_test_table_with_range(1, "m", "o", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(2, "p", "r", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(3, "s", "u", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "m", "o", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(2, "p", "r", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(3, "s", "u", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
@@ -930,9 +930,9 @@ fn test_level0_overlapping_tables_included() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables with overlapping ranges
-	let table1 = create_test_table_with_range(1, "a", "e", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(2, "c", "g", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(3, "f", "j", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "e", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(2, "c", "g", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(3, "f", "j", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
@@ -959,11 +959,11 @@ fn test_level0_mixed_overlap_scenarios() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables: [a-c], [e-g], [i-k], [d-f], [j-m]
-	let table1 = create_test_table_with_range(1, "a", "c", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(2, "e", "g", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(3, "i", "k", 7, opts.clone()).unwrap();
-	let table4 = create_test_table_with_range(4, "d", "f", 10, opts.clone()).unwrap();
-	let table5 = create_test_table_with_range(5, "j", "m", 13, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "c", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(2, "e", "g", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(3, "i", "k", 7, Arc::clone(&opts)).unwrap();
+	let table4 = create_test_table_with_range(4, "d", "f", 10, Arc::clone(&opts)).unwrap();
+	let table5 = create_test_table_with_range(5, "j", "m", 13, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(
 		vec![table1, table2, table3, table4, table5],
@@ -994,11 +994,11 @@ fn test_level1_binary_search_correct_range() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables with non-overlapping sorted ranges
-	let table1 = create_test_table_with_range(11, "a", "b", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(12, "c", "d", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(13, "e", "f", 7, opts.clone()).unwrap();
-	let table4 = create_test_table_with_range(14, "g", "h", 10, opts.clone()).unwrap();
-	let table5 = create_test_table_with_range(15, "i", "j", 13, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(11, "a", "b", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(12, "c", "d", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(13, "e", "f", 7, Arc::clone(&opts)).unwrap();
+	let table4 = create_test_table_with_range(14, "g", "h", 10, Arc::clone(&opts)).unwrap();
+	let table5 = create_test_table_with_range(15, "i", "j", 13, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(
 		vec![],
@@ -1028,9 +1028,9 @@ fn test_level1_query_before_all_tables() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables: [d-f], [g-i], [j-l]
-	let table1 = create_test_table_with_range(11, "d", "f", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(12, "g", "i", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(13, "j", "l", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(11, "d", "f", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(12, "g", "i", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(13, "j", "l", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
@@ -1056,9 +1056,9 @@ fn test_level1_query_after_all_tables() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables: [a-c], [d-f], [g-i]
-	let table1 = create_test_table_with_range(11, "a", "c", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(12, "d", "f", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(13, "g", "i", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(11, "a", "c", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(12, "d", "f", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(13, "g", "i", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
@@ -1084,9 +1084,9 @@ fn test_level1_query_spans_all_tables() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables: [b-d], [e-g], [h-j]
-	let table1 = create_test_table_with_range(11, "b", "d", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(12, "e", "g", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(13, "h", "j", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(11, "b", "d", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(12, "e", "g", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(13, "h", "j", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
@@ -1112,7 +1112,7 @@ fn test_bound_included_start_and_end() {
 	let opts = Arc::new(opts);
 
 	// Create table with keys: "d1", "d5", "h"
-	let table1 = create_test_table_with_range(1, "d", "h", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "d", "h", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1137,7 +1137,7 @@ fn test_bound_excluded_start_and_end() {
 	let opts = Arc::new(opts);
 
 	// Create table with keys: "d1", "d5", "h"
-	let table1 = create_test_table_with_range(1, "d", "h", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "d", "h", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1164,7 +1164,7 @@ fn test_bound_unbounded_start() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1186,7 +1186,7 @@ fn test_bound_unbounded_end() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1208,8 +1208,8 @@ fn test_fully_unbounded_range() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(2, "n", "z", 4, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(2, "n", "z", 4, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1, table2], vec![], vec![], opts);
 
@@ -1251,7 +1251,7 @@ fn test_single_key_range() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1278,7 +1278,7 @@ fn test_inverted_range() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1303,9 +1303,9 @@ fn test_mixed_level0_and_level1_tables() {
 	let opts = Arc::new(opts);
 
 	// Create both L0 and L1 tables
-	let l0_table = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
-	let l1_table1 = create_test_table_with_range(11, "d", "h", 4, opts.clone()).unwrap();
-	let l1_table2 = create_test_table_with_range(12, "i", "n", 7, opts.clone()).unwrap();
+	let l0_table = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
+	let l1_table1 = create_test_table_with_range(11, "d", "h", 4, Arc::clone(&opts)).unwrap();
+	let l1_table2 = create_test_table_with_range(12, "i", "n", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![l0_table], vec![l1_table1, l1_table2], vec![], opts);

@@ -274,7 +274,7 @@ mod tests {
 
 		for i in 0..threads {
 			let path = temp_path.clone();
-			let thread_barrier = barrier.clone();
+			let thread_barrier = Arc::clone(&barrier);
 
 			let handle = tokio::task::spawn_blocking(move || {
 				// Wait for all threads to be ready
@@ -319,7 +319,7 @@ mod tests {
 
 	// 	for i in 0..tasks {
 	// 		let path = temp_path.clone();
-	// 		let task_barrier = barrier.clone();
+	// 		let task_barrier = Arc::clone(&barrier);
 
 	// 		let handle = tokio::task::spawn(async move {
 	// 			// Wait for all tasks to be ready
