@@ -241,8 +241,9 @@ impl CoreInner {
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
 
-		manifest.apply_changeset(&changeset)?;
+		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
+			manifest.revert_changeset(rollback);
 			let error = Error::Other(format!(
 				"Failed to atomically update manifest: table_id={}, log_number={}: {}",
 				table_id,
@@ -561,8 +562,9 @@ impl CoreInner {
 				};
 
 				let mut manifest = self.level_manifest.write()?;
-				manifest.apply_changeset(&changeset)?;
+				let rollback = manifest.apply_changeset(&changeset)?;
 				if let Err(e) = write_manifest_to_disk(&manifest) {
+					manifest.revert_changeset(rollback);
 					let error = Error::Other(format!(
 						"Failed to update manifest log_number after immutable flush: {}",
 						e
