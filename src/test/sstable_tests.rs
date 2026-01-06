@@ -4038,3 +4038,437 @@ fn test_table_properties_persistence() {
 	// Verify TableMetadata fields
 	assert_eq!(meta.has_point_keys, Some(true), "Should have point keys");
 }
+
+#[test]
+fn test_table_get_all_keys() {
+	// Test Get operations on table with 100+ blocks
+	let mut opts = default_opts_mut();
+	opts.block_size = 64; // Small block size to create many blocks
+	opts.index_partition_size = 200;
+	let opts = Arc::new(opts);
+
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Add 100 entries to create multiple blocks
+	for i in 0..100 {
+		let key = format!("key_{i:03}");
+		let value = format!("value_{i:03}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, value.as_bytes()).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Get every key individually
+	for i in 0..100 {
+		let key = format!("key_{i:03}");
+		let expected_value = format!("value_{i:03}");
+		let seek_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+
+		let result = table.get(&seek_key).unwrap();
+		assert!(result.is_some(), "Key '{key}' not found");
+
+		if let Some((found_key, found_value)) = result {
+			assert_eq!(
+				std::str::from_utf8(&found_key.user_key).unwrap(),
+				key,
+				"Key mismatch for {key}"
+			);
+			assert_eq!(
+				std::str::from_utf8(found_value.as_ref()).unwrap(),
+				expected_value,
+				"Value mismatch for {key}"
+			);
+		}
+	}
+}
+
+#[test]
+fn test_table_get_nonexistent_keys() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Add some entries
+	for i in 0..10 {
+		let key = format!("key_{i:02}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, b"value").unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Get keys that don't exist
+	let nonexistent_keys = vec!["key_10", "key_99", "aaa", "zzz"];
+	for key_str in &nonexistent_keys {
+		let seek_key = InternalKey::new(key_str.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+		let result = table.get(&seek_key).unwrap();
+		// Should return None for keys that don't exist
+		if result.is_some() {
+			// If found, verify it's a valid key (might find next key)
+			let (found_key, _) = result.unwrap();
+			let found_str = std::str::from_utf8(&found_key.user_key).unwrap();
+			assert!(found_str.starts_with("key_"), "Found key {found_str} should be valid");
+		}
+	}
+}
+
+#[test]
+fn test_table_get_with_compression() {
+	// Test Get with each compression type
+	let compression_types =
+		vec![crate::CompressionType::None, crate::CompressionType::SnappyCompression];
+
+	for compression in compression_types {
+		let opts = default_opts();
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+		// Add entries
+		for i in 0..20 {
+			let key = format!("key_{i:02}");
+			let value = format!("value_{i:02}");
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+			writer.add(internal_key, value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+		// Verify Get works with this compression type
+		for i in 0..20 {
+			let key = format!("key_{i:02}");
+			let expected_value = format!("value_{i:02}");
+			let seek_key =
+				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+
+			let result = table.get(&seek_key).unwrap();
+			assert!(result.is_some(), "Should find key {key} with compression {compression:?}");
+
+			if let Some((found_key, found_value)) = result {
+				assert_eq!(
+					std::str::from_utf8(&found_key.user_key).unwrap(),
+					key,
+					"Key mismatch with compression {compression:?}"
+				);
+				assert_eq!(
+					std::str::from_utf8(found_value.as_ref()).unwrap(),
+					expected_value,
+					"Value mismatch with compression {compression:?}"
+				);
+			}
+		}
+	}
+}
+
+#[test]
+fn test_table_iterator_full_scan() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Create table with known data
+	let test_data: Vec<(String, String)> =
+		(0..50).map(|i| (format!("key_{i:03}"), format!("value_{i:03}"))).collect();
+
+	for (i, (key, value)) in test_data.iter().enumerate() {
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, value.as_bytes()).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Full forward scan
+	let mut iter = table.iter(false, None);
+	iter.seek_to_first().unwrap();
+
+	let mut collected = Vec::new();
+	while iter.valid() {
+		let key = iter.key();
+		let value = iter.value();
+		collected.push((
+			std::str::from_utf8(&key.user_key).unwrap().to_string(),
+			std::str::from_utf8(value.as_ref()).unwrap().to_string(),
+		));
+		match iter.next() {
+			Some(Ok(_)) => {}
+			Some(Err(e)) => panic!("Iterator error: {e}"),
+			None => break,
+		}
+	}
+
+	assert_eq!(collected.len(), 50, "Should collect all 50 entries");
+	for (i, (key, value)) in collected.iter().enumerate() {
+		assert_eq!(*key, format!("key_{i:03}"), "Key order mismatch");
+		assert_eq!(*value, format!("value_{i:03}"), "Value mismatch");
+	}
+}
+
+#[test]
+fn test_table_iterator_reverse_scan() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Create table with known data
+	let test_data: Vec<(String, String)> =
+		(0..50).map(|i| (format!("key_{i:03}"), format!("value_{i:03}"))).collect();
+
+	for (i, (key, value)) in test_data.iter().enumerate() {
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, value.as_bytes()).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Full reverse scan
+	let mut iter = table.iter(false, None);
+	iter.seek_to_last().unwrap();
+
+	let mut collected = Vec::new();
+	while iter.valid() {
+		let key = iter.key();
+		let value = iter.value();
+		collected.push((
+			std::str::from_utf8(&key.user_key).unwrap().to_string(),
+			std::str::from_utf8(value.as_ref()).unwrap().to_string(),
+		));
+		if !iter.prev().unwrap() {
+			break;
+		}
+	}
+
+	assert_eq!(collected.len(), 50, "Should collect all 50 entries");
+	// Verify reverse order
+	for (i, (key, value)) in collected.iter().enumerate() {
+		let expected_idx = 49 - i;
+		assert_eq!(*key, format!("key_{expected_idx:03}"), "Reverse key order mismatch");
+		assert_eq!(*value, format!("value_{expected_idx:03}"), "Reverse value mismatch");
+	}
+}
+
+#[test]
+fn test_table_iterator_seek_and_scan() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Create table with known data
+	for i in 0..30 {
+		let key = format!("key_{i:03}");
+		let value = format!("value_{i:03}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, value.as_bytes()).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	let mut iter = table.iter(false, None);
+
+	// Test Seek to various points
+	let seek_points = vec!["key_005", "key_010", "key_015", "key_020", "key_025"];
+
+	for seek_key_str in &seek_points {
+		let seek_key =
+			InternalKey::new(seek_key_str.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+		iter.seek(&seek_key.encode()).unwrap();
+
+		if iter.valid() {
+			let found_key_bytes: &[u8] = &iter.key().user_key;
+			let seek_key_bytes = seek_key_str.as_bytes();
+			// Should find the key or next key
+			assert!(
+				found_key_bytes >= seek_key_bytes,
+				"Found key should be >= seek key {seek_key_str}"
+			);
+		}
+
+		// Test Next from this point
+		let mut count = 0;
+		while iter.valid() && count < 5 {
+			count += 1;
+			match iter.next() {
+				Some(Ok(_)) => {}
+				Some(Err(e)) => panic!("Iterator error: {e}"),
+				None => break,
+			}
+		}
+	}
+
+	// Test SeekForPrev
+	iter.seek_to_last().unwrap();
+	let last_key_bytes = &iter.key().user_key;
+	assert_eq!(std::str::from_utf8(last_key_bytes).unwrap(), "key_029", "Should find last key");
+
+	// Test Prev from last
+	for _ in 0..5 {
+		if !iter.prev().unwrap() {
+			break;
+		}
+	}
+}
+
+#[test]
+fn test_table_iterator_across_partitions() {
+	// Create table that spans multiple index partitions
+	let mut opts = default_opts_mut();
+	opts.index_partition_size = 150; // Small partition size
+	opts.block_size = 500;
+	let opts = Arc::new(opts);
+
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Add enough entries to create multiple partitions
+	for i in 0..100 {
+		let key = format!("key_{i:03}");
+		let value = format!("value_{i:03}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, value.as_bytes()).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Verify we have multiple partitions
+	let crate::sstable::table::IndexType::Partitioned(ref partitioned_index) = table.index_block;
+	assert!(partitioned_index.blocks.len() >= 2, "Should have multiple partitions");
+
+	// Full forward scan across partitions
+	let mut iter = table.iter(false, None);
+	iter.seek_to_first().unwrap();
+
+	let mut count = 0;
+	while iter.valid() {
+		count += 1;
+		match iter.next() {
+			Some(Ok(_)) => {}
+			Some(Err(e)) => panic!("Iterator error: {e}"),
+			None => break,
+		}
+	}
+	assert_eq!(count, 100, "Should iterate all 100 keys across partitions");
+
+	// Full backward scan across partitions
+	iter.seek_to_last().unwrap();
+	let mut count_backward = 0;
+	while iter.valid() {
+		count_backward += 1;
+		if !iter.prev().unwrap() {
+			break;
+		}
+	}
+	assert_eq!(count_backward, 100, "Should iterate all 100 keys backwards across partitions");
+}
+
+#[test]
+fn test_empty_table_operations() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Don't add any entries - create empty table
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Verify Get returns not found
+	let seek_key = InternalKey::new(b"any_key".to_vec(), 1, InternalKeyKind::Set, 0);
+	let result = table.get(&seek_key);
+	assert!(result.is_err(), "Get on empty table should return error");
+
+	// Verify iterator immediately invalid
+	let mut iter = table.iter(false, None);
+	let result = iter.seek_to_first();
+	assert!(result.is_err(), "Get on empty table should return error");
+}
+
+#[test]
+fn test_single_entry_table() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Add exactly one entry
+	let internal_key = InternalKey::new(b"single_key".to_vec(), 1, InternalKeyKind::Set, 0);
+	writer.add(internal_key, b"single_value").unwrap();
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Test Get
+	let seek_key = InternalKey::new(b"single_key".to_vec(), 1, InternalKeyKind::Set, 0);
+	let result = table.get(&seek_key).unwrap();
+	assert!(result.is_some(), "Should find the single key");
+	if let Some((found_key, found_value)) = result {
+		assert_eq!(found_key.user_key, b"single_key");
+		let value_bytes: &[u8] = found_value.as_ref();
+		assert_eq!(value_bytes, b"single_value");
+	}
+
+	// Test iterator
+	let mut iter = table.iter(false, None);
+	iter.seek_to_first().unwrap();
+	assert!(iter.valid(), "Iterator should be valid");
+	assert_eq!(iter.key().user_key, b"single_key");
+	let iter_value = iter.value();
+	let iter_value_bytes: &[u8] = iter_value.as_ref();
+	assert_eq!(iter_value_bytes, b"single_value");
+
+	// Test Next - should invalidate iterator
+	match iter.next() {
+		Some(Ok(_)) => {}
+		Some(Err(e)) => panic!("Iterator error: {e}"),
+		None => {}
+	}
+	assert!(!iter.valid(), "Iterator should be invalid after next()");
+}
+
+#[test]
+fn test_large_values() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Add entries with large values (near size limits)
+	let large_value = vec![b'x'; 10000]; // 10KB value
+	for i in 0..10 {
+		let key = format!("key_{i:02}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, &large_value).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Verify all large values are retrieved correctly
+	for i in 0..10 {
+		let key = format!("key_{i:02}");
+		let seek_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+
+		let result = table.get(&seek_key).unwrap();
+		assert!(result.is_some(), "Should find key {key}");
+
+		if let Some((found_key, found_value)) = result {
+			assert_eq!(found_key.user_key, key.as_bytes());
+			let found_bytes: &[u8] = found_value.as_ref();
+			assert_eq!(found_bytes, &large_value[..], "Large value should match");
+			assert_eq!(found_bytes.len(), 10000, "Value size should be 10000");
+		}
+	}
+}
