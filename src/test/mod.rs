@@ -17,6 +17,8 @@ pub mod index_block_tests;
 #[cfg(test)]
 pub mod iterator_tests;
 #[cfg(test)]
+pub mod level_tests;
+#[cfg(test)]
 pub mod lsm_tests;
 #[cfg(test)]
 pub mod manifest_tests;
