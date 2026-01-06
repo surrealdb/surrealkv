@@ -94,7 +94,8 @@ impl Strategy {
 		let source_tables: Vec<_> = if source_level_num == 0 {
 			source_level.tables.iter().collect()
 		} else {
-			source_level.tables.iter().take(1).collect()
+			// For L1+, use the table(s) we actually selected by ID
+			source_level.tables.iter().filter(|t| table_id_set.contains(&t.id)).collect()
 		};
 
 		// Build InternalKeyRange from smallest_point/largest_point

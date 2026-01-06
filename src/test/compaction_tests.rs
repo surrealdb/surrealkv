@@ -1089,6 +1089,123 @@ fn test_l1_to_l2_table_selection() {
 	assert_eq!(selected_tables.len(), 1, "Should select exactly 1 table (only L1 table since overlap detection may not work in test)");
 }
 
+#[test]
+fn test_l1_compaction_bounds_correctness() {
+	// This test verifies that compaction uses the CORRECT table's bounds
+	// when selecting overlapping tables from the next level.
+	//
+	// Bug scenario: If we select table3 (by size) but compute bounds from table1 (first by key),
+	// we'll select wrong L2 tables.
+
+	let env = TestEnv::new();
+	let strategy = Strategy::new(4, 10);
+
+	// Create L1 with 3 tables using proper L1+ insertion (sorted by key)
+	let mut source_level = Level::with_capacity(10);
+
+	// Table1: Smallest key ("a"), SMALL size (10 entries)
+	let table1 = env
+		.create_test_table(
+			1,
+			create_ordered_entries("a", 10, 10, 100, None), // a-00010 to a-00019, 10 entries
+		)
+		.unwrap();
+
+	// Table2: Middle key ("b"), MEDIUM size (20 entries)
+	let table2 = env
+		.create_test_table(
+			2,
+			create_ordered_entries("b", 20, 20, 150, None), // b-00020 to b-00039, 20 entries
+		)
+		.unwrap();
+
+	// Table3: Largest key ("c"), LARGEST size (30 entries) - should be selected by compensated size
+	let table3 = env
+		.create_test_table(
+			3,
+			create_ordered_entries("c", 30, 30, 200, None), // c-00030 to c-00059, 30 entries
+		)
+		.unwrap();
+
+	// Use proper L1+ insertion (sorted by smallest key)
+	source_level.insert_sorted_by_key(table1.clone()); // First by key: a < b < c
+	source_level.insert_sorted_by_key(table2.clone());
+	source_level.insert_sorted_by_key(table3.clone());
+
+	// Verify ordering: table1 should be first (smallest key)
+	assert_eq!(source_level.tables[0].id, 1, "First table should be table1 (smallest key)");
+
+	// Verify table3 is largest (most entries = largest file size)
+	assert!(table3.file_size > table2.file_size);
+	assert!(table2.file_size > table1.file_size);
+
+	// Create L2 with tables that overlap with SPECIFIC L1 tables
+	let mut next_level = Level::with_capacity(10);
+
+	// L2 table that overlaps with table1 (a-keys)
+	let l2_table_a = env
+		.create_test_table(
+			10,
+			create_ordered_entries("a", 5, 15, 50, None), // a-00005 to a-00019 (overlaps table1)
+		)
+		.unwrap();
+
+	// L2 table that overlaps with table3 (c-keys) - this is the one we should select!
+	let l2_table_c = env
+		.create_test_table(
+			11,
+			create_ordered_entries("c", 25, 35, 120, None), // c-00025 to c-00059 (overlaps table3)
+		)
+		.unwrap();
+
+	// L2 table that doesn't overlap with any L1 table
+	let l2_table_d = env
+		.create_test_table(
+			12,
+			create_ordered_entries("d", 100, 10, 300, None), // d-00100 to d-00109 (no overlap)
+		)
+		.unwrap();
+
+	next_level.insert_sorted_by_key(l2_table_a.clone());
+	next_level.insert_sorted_by_key(l2_table_c.clone());
+	next_level.insert_sorted_by_key(l2_table_d.clone());
+
+	// Call select_tables_for_compaction for L1 → L2
+	let selected_tables = strategy.select_tables_for_compaction(&source_level, &next_level, 1);
+
+	// Verify we selected exactly ONE L1 table
+	let source_table_ids: HashSet<_> = source_level.tables.iter().map(|t| t.id).collect();
+	let selected_source_ids: HashSet<_> =
+		selected_tables.iter().filter(|&&id| source_table_ids.contains(&id)).copied().collect();
+
+	assert_eq!(selected_source_ids.len(), 1, "Should select exactly ONE L1 table");
+
+	// The selected L1 table should be table3 (largest by compensated size)
+	let selected_l1_id = *selected_source_ids.iter().next().unwrap();
+	assert_eq!(
+		selected_l1_id, 3,
+		"Should select table3 (largest size), but selected table{}",
+		selected_l1_id
+	);
+
+	// Verify we selected the CORRECT L2 table (l2_table_c, which overlaps with table3)
+	// NOT l2_table_a (which overlaps with table1, the first table by key)
+	let l2_table_ids: HashSet<_> = next_level.tables.iter().map(|t| t.id).collect();
+	let selected_l2_ids: HashSet<_> =
+		selected_tables.iter().filter(|&&id| l2_table_ids.contains(&id)).copied().collect();
+
+	assert!(
+		selected_l2_ids.contains(&11),
+		"Should select L2 table 11 (overlaps with selected table3), but selected: {:?}",
+		selected_l2_ids
+	);
+	assert!(
+		!selected_l2_ids.contains(&10),
+		"Should NOT select L2 table 10 (overlaps with table1, not selected table3)"
+	);
+	assert!(!selected_l2_ids.contains(&12), "Should NOT select L2 table 12 (no overlap)");
+}
+
 #[test(tokio::test)]
 async fn test_compaction_with_large_keys_and_values() {
 	let env = TestEnv::new();

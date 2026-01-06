@@ -869,8 +869,12 @@ impl Table {
 		match &range.0 {
 			// lower bound
 			Bound::Unbounded => false,
-			Bound::Included(k) | Bound::Excluded(k) => {
+			Bound::Included(k) => {
 				self.opts.comparator.compare(&largest.user_key, &k.user_key) == Ordering::Less
+			}
+			Bound::Excluded(k) => {
+				// Range starts AFTER k, so table is before if table.largest <= k
+				self.opts.comparator.compare(&largest.user_key, &k.user_key) != Ordering::Greater
 			}
 		}
 	}
@@ -884,8 +888,12 @@ impl Table {
 		match &range.1 {
 			// upper bound
 			Bound::Unbounded => false,
-			Bound::Included(k) | Bound::Excluded(k) => {
+			Bound::Included(k) => {
 				self.opts.comparator.compare(&smallest.user_key, &k.user_key) == Ordering::Greater
+			}
+			Bound::Excluded(k) => {
+				// Range ends BEFORE k, so table is after if table.smallest >= k
+				self.opts.comparator.compare(&smallest.user_key, &k.user_key) != Ordering::Less
 			}
 		}
 	}
