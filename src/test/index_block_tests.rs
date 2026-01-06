@@ -139,12 +139,12 @@ fn test_find_block_handle_by_key() {
 	// and the second element is the expected separator key result.
 	let test_cases: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
 		(create_internal_key(b"a".to_vec(), 1), Some(sep_c.clone())),
-		(create_internal_key(b"c".to_vec(), 1), Some(sep_c.clone())),
+		(create_internal_key(b"c".to_vec(), 1), Some(sep_c)),
 		(create_internal_key(b"d".to_vec(), 1), Some(sep_f.clone())),
 		(create_internal_key(b"e".to_vec(), 1), Some(sep_f.clone())),
-		(create_internal_key(b"f".to_vec(), 1), Some(sep_f.clone())),
+		(create_internal_key(b"f".to_vec(), 1), Some(sep_f)),
 		(create_internal_key(b"g".to_vec(), 1), Some(sep_j.clone())),
-		(create_internal_key(b"j".to_vec(), 1), Some(sep_j.clone())),
+		(create_internal_key(b"j".to_vec(), 1), Some(sep_j)),
 		(create_internal_key(b"z".to_vec(), 1), None),
 	];
 
@@ -250,9 +250,9 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 		id: 0,
 		opts,
 		blocks: vec![
-			BlockHandleWithKey::new(sep_foo_60.clone(), BlockHandle::new(0, 100)),
-			BlockHandleWithKey::new(sep_foo_20.clone(), BlockHandle::new(100, 100)),
-			BlockHandleWithKey::new(sep_g.clone(), BlockHandle::new(200, 100)),
+			BlockHandleWithKey::new(sep_foo_60, BlockHandle::new(0, 100)),
+			BlockHandleWithKey::new(sep_foo_20, BlockHandle::new(100, 100)),
+			BlockHandleWithKey::new(sep_g, BlockHandle::new(200, 100)),
 		],
 		file: f,
 	};
@@ -349,9 +349,9 @@ fn test_find_block_handle_by_key_different_user_keys() {
 		id: 0,
 		opts,
 		blocks: vec![
-			BlockHandleWithKey::new(sep_b.clone(), BlockHandle::new(0, 100)),
-			BlockHandleWithKey::new(sep_d.clone(), BlockHandle::new(100, 100)),
-			BlockHandleWithKey::new(sep_e.clone(), BlockHandle::new(200, 100)),
+			BlockHandleWithKey::new(sep_b, BlockHandle::new(0, 100)),
+			BlockHandleWithKey::new(sep_d, BlockHandle::new(100, 100)),
+			BlockHandleWithKey::new(sep_e, BlockHandle::new(200, 100)),
 		],
 		file: f,
 	};
@@ -461,7 +461,7 @@ fn test_partition_lookup_empty_partition_returns_none() {
 	let index = TopLevelIndex {
 		id: 0,
 		opts,
-		blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
+		blocks: vec![BlockHandleWithKey::new(sep, BlockHandle::new(0, 100))],
 		file: f,
 	};
 
@@ -521,9 +521,9 @@ fn test_partition_lookup_exact_separator_match() {
 		id: 0,
 		opts,
 		blocks: vec![
-			BlockHandleWithKey::new(sep_a.clone(), BlockHandle::new(0, 100)),
+			BlockHandleWithKey::new(sep_a, BlockHandle::new(0, 100)),
 			BlockHandleWithKey::new(sep_b.clone(), BlockHandle::new(100, 100)),
-			BlockHandleWithKey::new(sep_c.clone(), BlockHandle::new(200, 100)),
+			BlockHandleWithKey::new(sep_c, BlockHandle::new(200, 100)),
 		],
 		file: f,
 	};

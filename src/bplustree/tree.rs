@@ -3270,9 +3270,9 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Test insertions
-		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
-		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
-		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
+		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key2", b"value2").unwrap();
+		tree.insert(b"key3", b"value3").unwrap();
 
 		// Test retrievals
 		assert_eq!(tree.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
@@ -3592,7 +3592,7 @@ mod tests {
 	#[test]
 	fn test_single_insert_search() {
 		let mut tree = create_test_tree(true);
-		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+		tree.insert(b"key1", b"value1").unwrap();
 		assert_eq!(tree.get(b"key1").unwrap().as_deref(), Some(b"value1".as_ref()));
 	}
 
@@ -3601,12 +3601,12 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Insert multiple keys to ensure we're working with a leaf node
-		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
-		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
-		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
+		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key2", b"value2").unwrap();
+		tree.insert(b"key3", b"value3").unwrap();
 
 		// Update existing key in the same leaf
-		tree.insert(b"key2".to_vec(), b"updated_value2".to_vec()).unwrap();
+		tree.insert(b"key2", b"updated_value2").unwrap();
 
 		// Verify the update
 		assert_eq!(tree.get(b"key1").unwrap().as_deref(), Some(b"value1".as_ref()));
@@ -3619,17 +3619,17 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Insert initial key
-		tree.insert(b"key".to_vec(), b"value1".to_vec()).unwrap();
+		tree.insert(b"key", b"value1").unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value1".as_ref()));
 
 		// Update multiple times
-		tree.insert(b"key".to_vec(), b"value2".to_vec()).unwrap();
+		tree.insert(b"key", b"value2").unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value2".as_ref()));
 
-		tree.insert(b"key".to_vec(), b"value3".to_vec()).unwrap();
+		tree.insert(b"key", b"value3").unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value3".as_ref()));
 
-		tree.insert(b"key".to_vec(), b"final_value".to_vec()).unwrap();
+		tree.insert(b"key", b"final_value").unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"final_value".as_ref()));
 	}
 
@@ -3638,18 +3638,18 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Insert initial keys to create some tree structure
-		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
-		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
-		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
+		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key2", b"value2").unwrap();
+		tree.insert(b"key3", b"value3").unwrap();
 
 		// Get initial tree stats
 		let (height_before, nodes_before, keys_before, leaves_before) =
 			tree.calculate_tree_stats().unwrap();
 
 		// Update existing keys - should not create new nodes
-		tree.insert(b"key1".to_vec(), b"updated_value1".to_vec()).unwrap();
-		tree.insert(b"key2".to_vec(), b"updated_value2".to_vec()).unwrap();
-		tree.insert(b"key3".to_vec(), b"updated_value3".to_vec()).unwrap();
+		tree.insert(b"key1", b"updated_value1").unwrap();
+		tree.insert(b"key2", b"updated_value2").unwrap();
+		tree.insert(b"key3", b"updated_value3").unwrap();
 
 		// Get stats after updates
 		let (height_after, nodes_after, keys_after, leaves_after) =
@@ -3704,7 +3704,7 @@ mod tests {
 		let keys = vec![b"b".to_vec(), b"d".to_vec(), b"f".to_vec(), b"h".to_vec(), b"j".to_vec()];
 
 		for key in &keys {
-			tree.insert(key.clone(), b"value".to_vec()).unwrap();
+			tree.insert(key.clone(), b"value").unwrap();
 		}
 
 		// Delete middle key to force predecessor/successor use
@@ -3728,7 +3728,7 @@ mod tests {
 		}
 
 		for key in &keys {
-			tree.insert(key.clone(), b"value".to_vec()).unwrap();
+			tree.insert(key.clone(), b"value").unwrap();
 		}
 
 		// Delete first and last keys in sequence
@@ -3779,7 +3779,7 @@ mod tests {
 			assert_eq!(tree.get(b"mango")?, None, "Non-existent key found unexpectedly");
 
 			// Add new data and verify
-			tree.insert(b"mango".to_vec(), b"orange".to_vec())?;
+			tree.insert(b"mango", b"orange")?;
 			assert_eq!(
 				tree.get(b"mango")?.as_ref().map(|b| b.as_ref()),
 				Some(b"orange".as_ref()),
@@ -3808,9 +3808,9 @@ mod tests {
 		// Insert test data
 		{
 			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
-			tree.insert(b"one".to_vec(), b"1".to_vec())?;
-			tree.insert(b"two".to_vec(), b"2".to_vec())?;
-			tree.insert(b"three".to_vec(), b"3".to_vec())?;
+			tree.insert(b"one", b"1")?;
+			tree.insert(b"two", b"2")?;
+			tree.insert(b"three", b"3")?;
 		}
 
 		// Delete and verify
@@ -3838,9 +3838,9 @@ mod tests {
 	fn test_concurrent_operations() {
 		let mut tree = create_test_tree(true);
 		// Insert and delete same key repeatedly
-		tree.insert(b"key".to_vec(), b"v1".to_vec()).unwrap();
+		tree.insert(b"key", b"v1").unwrap();
 		tree.delete(b"key").unwrap();
-		tree.insert(b"key".to_vec(), b"v2".to_vec()).unwrap();
+		tree.insert(b"key", b"v2").unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"v2".as_ref()));
 	}
 
@@ -3852,7 +3852,7 @@ mod tests {
 		// Create and immediately drop
 		{
 			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
-			tree.insert(b"test".to_vec(), b"value".to_vec()).unwrap();
+			tree.insert(b"test", b"value").unwrap();
 			// Explicit drop before end of scope
 			drop(tree);
 		}
@@ -3870,7 +3870,7 @@ mod tests {
 		let path = file.path();
 
 		let mut tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
-		tree.insert(b"close".to_vec(), b"test".to_vec()).unwrap();
+		tree.insert(b"close", b"test").unwrap();
 		tree.close().unwrap(); // Explicit close
 	}
 
@@ -4136,9 +4136,9 @@ mod tests {
 	#[test]
 	fn test_range() {
 		let mut tree = create_test_tree(true);
-		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
-		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
-		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
+		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key3", b"value3").unwrap();
+		tree.insert(b"key2", b"value2").unwrap();
 
 		let mut iter = tree.range(b"key2".as_slice()..=b"key3".as_slice()).unwrap();
 		let (k1, v1) = iter.next().unwrap().unwrap();
@@ -4151,8 +4151,8 @@ mod tests {
 	#[test]
 	fn test_range_empty() {
 		let mut tree = create_test_tree(true);
-		tree.insert(b"a".to_vec(), b"1".to_vec()).unwrap();
-		tree.insert(b"c".to_vec(), b"3".to_vec()).unwrap();
+		tree.insert(b"a", b"1").unwrap();
+		tree.insert(b"c", b"3").unwrap();
 		let mut iter = tree.range(b"b".as_slice()..b"b".as_slice()).unwrap();
 		assert!(iter.next().is_none());
 	}

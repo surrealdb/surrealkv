@@ -3320,7 +3320,7 @@ fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
 	let query_seq = 30u64;
 	let lookup_key = InternalKey::new(user_key.to_vec(), query_seq, InternalKeyKind::Set, 0);
 
-	let result = table.get(&lookup_key.clone()).unwrap();
+	let result = table.get(&lookup_key).unwrap();
 
 	// The expected result: we should find a version with seq_num <= query_seq
 	// For query_seq=30, we should find (foo, 30) with value "value_at_seq_30"
@@ -3685,7 +3685,7 @@ fn test_range_at_exact_block_boundary() {
 		.collect();
 
 	let (src, size) = build_table(data);
-	let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Test with bound that might be at a block boundary
 	let iter = table.iter(
@@ -3965,7 +3965,7 @@ fn test_table_properties_persistence() {
 	let size = writer.finish().unwrap();
 
 	// Step 3: Create new Table from buffer (load phase)
-	let table = Table::new(table_id, opts.clone(), wrap_buffer(buffer), size as u64).unwrap();
+	let table = Table::new(table_id, opts, wrap_buffer(buffer), size as u64).unwrap();
 
 	// Step 4: Verify all properties match expected values
 	let meta = &table.meta;
