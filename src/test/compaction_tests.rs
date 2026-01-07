@@ -8,7 +8,7 @@ use test_log::test;
 
 use crate::clock::MockLogicalClock;
 use crate::compaction::compactor::{CompactionOptions, Compactor};
-use crate::compaction::leveled::Strategy;
+use crate::compaction::leveled::{CompactionPriority, Strategy};
 use crate::compaction::{CompactionChoice, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::CompactionIterator;
@@ -17,13 +17,13 @@ use crate::memtable::ImmutableMemtables;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
 use crate::sstable::{InternalKey, InternalKeyKind};
 use crate::vlog::ValueLocation;
-use crate::{CompressionType, Key, Options as LSMOptions, Value};
+use crate::{CompressionType, Key, Options, Value};
 
 /// Test environment setup helpers
 struct TestEnv {
 	#[allow(unused)]
 	temp_dir: TempDir,
-	options: Arc<LSMOptions>,
+	options: Arc<Options>,
 }
 
 impl TestEnv {
@@ -36,7 +36,7 @@ impl TestEnv {
 		let table_dir = temp_dir.path().join("sstables");
 		std::fs::create_dir_all(&table_dir).unwrap();
 
-		let options = Arc::new(LSMOptions {
+		let options = Arc::new(Options {
 			path: temp_dir.path().to_path_buf(),
 			level_count,
 			max_memtable_size: 1024 * 1024, // 1MB
@@ -134,15 +134,20 @@ fn create_entries(min_key: u64, max_key: u64, min_seq: u64) -> Vec<(InternalKey,
 /// Helper function to create Options compatible with old Strategy::new(level0_trigger, multiplier)
 /// This approximates the old count-based behavior with bytes-based limits
 fn create_options_with_compaction_settings(
-	base_opts: &LSMOptions,
+	base_opts: &Options,
 	level0_trigger: usize,
 	multiplier: f64,
-) -> Arc<LSMOptions> {
+) -> Arc<Options> {
 	let mut opts = (*base_opts).clone();
-	opts.level0_file_num_compaction_trigger = level0_trigger;
-	opts.max_bytes_for_level_base = 10 * 1024 * 1024; // 10MB base (reasonable default for tests)
-	opts.max_bytes_for_level_multiplier = multiplier;
+	opts.level0_max_files = level0_trigger;
+	opts.max_bytes_for_level = 1024;
+	opts.level_multiplier = multiplier;
 	Arc::new(opts)
+}
+
+/// Helper function to create a Strategy with a specific compaction priority for tests
+fn create_strategy_with_priority(opts: &Options, priority: CompactionPriority) -> Strategy {
+	Strategy::from_options_with_priority(Arc::new(opts.clone()), priority)
 }
 
 /// Creates test manifest with tables at specified levels
@@ -194,7 +199,7 @@ fn create_test_manifest(
 
 /// Creates compaction options for testing
 fn create_compaction_options(
-	opts: Arc<LSMOptions>,
+	opts: Arc<Options>,
 	manifest: Arc<RwLock<LevelManifest>>,
 ) -> CompactionOptions {
 	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
@@ -328,7 +333,7 @@ fn test_level_selection() {
 	let strategy = Strategy::from_options(opts);
 
 	// Test the strategy's level selection
-	let choice = strategy.pick_levels(&manifest.read().unwrap());
+	let choice = strategy.pick_levels(&manifest.read().unwrap()).unwrap();
 
 	// Verify L0 was selected for compaction (as it exceeds its limit)
 	match choice {
@@ -371,7 +376,7 @@ fn test_compaction_edge_cases() {
 	let strategy = Strategy::from_options(opts);
 
 	// Test strategy with empty level
-	let choice = strategy.pick_levels(&manifest.read().unwrap());
+	let choice = strategy.pick_levels(&manifest.read().unwrap()).unwrap();
 
 	// Strategy should skip compaction when L0 is empty
 	match choice {
@@ -399,7 +404,7 @@ fn test_compaction_edge_cases() {
 	let manifest = create_test_manifest(&env, last_level_tables).unwrap();
 
 	// Test strategy with many tables in last level
-	let choice = strategy.pick_levels(&manifest.read().unwrap());
+	let choice = strategy.pick_levels(&manifest.read().unwrap()).unwrap();
 
 	// With new implementation, bottom-level compaction is allowed (same-level compaction)
 	// If the last level exceeds its byte limit, it can compact to itself for tombstone cleanup
@@ -417,113 +422,101 @@ fn test_compaction_edge_cases() {
 }
 
 #[test]
-fn test_level_selection_round_robin() {
+fn test_level_selection_score_based() {
 	let env = TestEnv::new();
 
-	// Define tables where multiple levels exceed their limits
-	let level_tables = vec![
-		// L0: 3 tables (below limit of 4)
-		vec![
-			(1, 100, 10, 20), // id, min_seq, min_key, max_key
-			(2, 110, 30, 40),
-			(3, 120, 50, 60),
-		],
-		// L1: 9 tables (exceeds limit of 8)
-		vec![
-			(11, 50, 5, 15),
-			(12, 55, 10, 20),
-			(13, 60, 25, 35),
-			(14, 65, 30, 40),
-			(15, 70, 45, 55),
-			(16, 75, 50, 60),
-			(17, 80, 65, 75),
-			(18, 85, 70, 80),
-			(19, 90, 85, 95),
-		],
-		// L2: 17 tables (exceeds limit of 16)
-		vec![
-			(21, 30, 0, 10),
-			(22, 32, 5, 15),
-			(23, 34, 10, 20),
-			(24, 36, 15, 25),
-			(25, 38, 20, 30),
-			(26, 40, 25, 35),
-			(27, 42, 30, 40),
-			(28, 44, 35, 45),
-			(29, 46, 40, 50),
-			(30, 48, 45, 55),
-			(31, 50, 50, 60),
-			(32, 52, 55, 65),
-			(33, 54, 60, 70),
-			(34, 56, 65, 75),
-			(35, 58, 70, 80),
-			(36, 60, 75, 85),
-			(37, 62, 80, 90),
-		],
-		// L3: 32 tables
-		(0..32).map(|i| (41 + i, 20 + i, i, (i + 5))).collect(),
-	];
+	// Create levels with tables of known sizes to verify score calculation
+	let mut levels = Levels::new(3, 10);
 
-	// Create the manifest with these tables
-	let manifest = create_test_manifest(&env, level_tables).unwrap();
+	// Create L1 with small amount of data
+	let l1_entries = create_entries(0, 5, 100);
+	let l1_table = env.create_test_table(1, l1_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(Arc::clone(&l1_table));
 
-	// Use very small byte limits so that the test tables will exceed them
+	// Create L2 with more data (larger file)
+	let l2_entries = create_entries(0, 50, 200);
+	let l2_table = env.create_test_table(2, l2_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[2]).insert(Arc::clone(&l2_table));
+
+	// Read actual file sizes
+	let l1_bytes = l1_table.file_size;
+	let l2_bytes = l2_table.file_size;
+
+	// Set up options where L2 will have a higher score than L1
+	// max_bytes_for_level_base: Set so L1 score < 1.0 but L2 score > 1.0
+	// level_multiplier: 1.0 so L2 target = L1 target (both use base)
+	let max_bytes_for_level_base = l1_bytes * 2; // L1 score will be ~0.5
+	let level_multiplier = 1.0; // L2 target = base * 1.0^1 = base
+
+	// Create manifest
+	let manifest_path = env.options.path.join("test_manifest_score");
+	let manifest = LevelManifest {
+		path: manifest_path,
+		levels,
+		hidden_set: HashSet::new(),
+		next_table_id: Arc::new(AtomicU64::new(1000)),
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
+	write_manifest_to_disk(&manifest).unwrap();
+	let manifest = Arc::new(RwLock::new(manifest));
+
+	// Calculate expected scores using the actual formula
+	// L1 score = l1_bytes / max_bytes_for_level(1)
+	//          = l1_bytes / (max_bytes_for_level_base * multiplier^0)
+	//          = l1_bytes / max_bytes_for_level_base
+	let l1_score = l1_bytes as f64 / max_bytes_for_level_base as f64;
+
+	// L2 score = l2_bytes / max_bytes_for_level(2)
+	//          = l2_bytes / (max_bytes_for_level_base * multiplier^1)
+	//          = l2_bytes / (max_bytes_for_level_base * 1.0)
+	//          = l2_bytes / max_bytes_for_level_base
+	let l2_score = l2_bytes as f64 / max_bytes_for_level_base as f64;
+
+	// Create strategy with calculated limits
 	let mut opts = (*env.options).clone();
-	opts.level0_file_num_compaction_trigger = 4;
-	opts.max_bytes_for_level_base = 1024; // 1KB - very small so tables exceed it
-	opts.max_bytes_for_level_multiplier = 2.0;
+	opts.max_bytes_for_level = max_bytes_for_level_base;
+	opts.level_multiplier = level_multiplier;
 	let opts = Arc::new(opts);
 	let strategy = Strategy::from_options(opts);
+
+	// Verify selection matches expected highest score
 	let manifest_guard = manifest.read().unwrap();
+	let choice = strategy.pick_levels(&manifest_guard).unwrap();
 
-	// Track the selected level candidates
-	let mut selected_candidates = Vec::new();
-
-	struct TestStrategy<'a> {
-		base: &'a Strategy,
-		selected_candidates: &'a mut Vec<u8>,
-		levels_guard: &'a LevelManifest,
-	}
-
-	impl TestStrategy<'_> {
-		fn track_selections(&mut self, count: usize) {
-			for _ in 0..count {
-				let candidate = self.base.find_compaction_level(self.levels_guard);
-				if let Some(level) = candidate {
-					self.selected_candidates.push(level);
-				}
+	match choice {
+		CompactionChoice::Merge(input) => {
+			// Since l2_bytes > l1_bytes, l2_score > l1_score
+			// And l2_score should be >= 1.0 (since we set base to make L1 ~0.5)
+			if l2_score > l1_score && l2_score >= 1.0 {
+				assert_eq!(
+					input.source_level, 2,
+					"L2 should be selected (score {:.2} > L1 score {:.2})",
+					l2_score, l1_score
+				);
+			} else if l1_score >= 1.0 {
+				assert_eq!(
+					input.source_level, 1,
+					"L1 should be selected (score {:.2} >= 1.0)",
+					l1_score
+				);
+			} else {
+				panic!(
+					"Unexpected selection: L{} selected when L1 score {:.2}, L2 score {:.2}",
+					input.source_level, l1_score, l2_score
+				);
 			}
 		}
-	}
-
-	// Track what levels would be selected with score-based selection
-	let mut test_strategy = TestStrategy {
-		base: &strategy,
-		selected_candidates: &mut selected_candidates,
-		levels_guard: &manifest_guard,
-	};
-
-	// Run several selections
-	test_strategy.track_selections(6);
-
-	// With score-based selection, the highest-scoring level should always be selected
-	// Since we're not actually compacting, scores don't change, so same level selected each time
-	assert_eq!(selected_candidates.len(), 6, "Should have 6 level selections");
-
-	// All selections should be the same (highest scoring level)
-	// With very small byte limits (1KB base), the test tables will exceed limits
-	if !selected_candidates.is_empty() {
-		let first_level = selected_candidates[0];
-		// All selections should be the same level (highest score)
-		assert!(
-			selected_candidates.iter().all(|&l| l == first_level),
-			"Score-based selection should always pick highest-scoring level: {:?}",
-			selected_candidates
-		);
-		assert!((1..=3).contains(&first_level), "Should select a valid level");
-	} else {
-		// If no levels selected, it means tables are too small - this is OK for this test
-		// The test verifies score-based selection works when levels exceed limits
+		CompactionChoice::Skip => {
+			assert!(
+				l1_score < 1.0 && l2_score < 1.0,
+				"Skip only when all scores < 1.0 (L1: {:.2}, L2: {:.2})",
+				l1_score,
+				l2_score
+			);
+		}
 	}
 }
 
@@ -580,7 +573,7 @@ async fn test_simple_merge_compaction() {
 	}
 
 	// Initialize levels with these tables
-	let mut levels = Levels::new(2, 10);
+	let mut levels = Levels::new(3, 10);
 
 	// Add tables to L0
 	for table in l0_tables {
@@ -1007,7 +1000,8 @@ fn test_select_tables_for_compaction_bug() {
 	next_level.insert(table_dup); // This will potentially cause problems
 
 	// Call select_tables_for_compaction
-	let selected_tables = strategy.select_tables_for_compaction(&source_level, &next_level, 0);
+	let selected_tables =
+		strategy.select_tables_for_compaction(&source_level, &next_level, 0).unwrap();
 
 	// Check for duplicates
 	let mut unique_ids = HashSet::new();
@@ -1102,7 +1096,8 @@ fn test_l1_to_l2_table_selection() {
 	next_level.insert(table11);
 
 	// Call select_tables_for_compaction for L1 → L2 (source_level_num = 1)
-	let selected_tables = strategy.select_tables_for_compaction(&source_level, &next_level, 1);
+	let selected_tables =
+		strategy.select_tables_for_compaction(&source_level, &next_level, 1).unwrap();
 
 	// For L1+, we should select only ONE table from source level
 	let source_table_ids: HashSet<_> = source_level.tables.iter().map(|t| t.id).collect();
@@ -1217,7 +1212,8 @@ fn test_l1_compaction_bounds_correctness() {
 	next_level.insert_sorted_by_key(l2_table_d);
 
 	// Call select_tables_for_compaction for L1 → L2
-	let selected_tables = strategy.select_tables_for_compaction(&source_level, &next_level, 1);
+	let selected_tables =
+		strategy.select_tables_for_compaction(&source_level, &next_level, 1).unwrap();
 
 	// Verify we selected exactly ONE L1 table
 	let source_table_ids: HashSet<_> = source_level.tables.iter().map(|t| t.id).collect();
@@ -1427,7 +1423,7 @@ async fn test_compaction_respects_sequence_numbers() {
 async fn test_tombstone_propagation() {
 	// Test 95% deletion via tombstones with bottom-level filtering
 	let env = TestEnv::new();
-	let mut levels = Levels::new(2, 10);
+	let mut levels = Levels::new(3, 10);
 
 	// Create entries with tombstones before values (higher seq numbers first)
 	let mut all_entries = Vec::new();
@@ -1802,9 +1798,9 @@ async fn test_tombstone_propagation_through_levels() {
 
 	// Use very small byte limits to ensure compaction is triggered
 	let mut opts = (*env.options).clone();
-	opts.level0_file_num_compaction_trigger = 1;
-	opts.max_bytes_for_level_base = 1024; // 1KB - very small so tables exceed it
-	opts.max_bytes_for_level_multiplier = 2.0;
+	opts.level0_max_files = 1;
+	opts.max_bytes_for_level = 1024; // 1KB - very small so tables exceed it
+	opts.level_multiplier = 2.0;
 	let opts = Arc::new(opts);
 	let strategy = Arc::new(Strategy::from_options(opts));
 	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
@@ -2019,7 +2015,7 @@ fn test_table_properties_population() {
 #[test(tokio::test)]
 async fn test_soft_delete_compaction_behavior() {
 	let env = TestEnv::new_with_levels(2); // Only 2 levels: L0 and L1
-	let mut levels = Levels::new(2, 10);
+	let mut levels = Levels::new(3, 10);
 
 	// Create L0 tables: 2 tables to exceed L0 limit (1) and trigger L0→L1
 	// compaction
@@ -2176,7 +2172,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 	// when the code tried to decode them as ValueLocation.
 
 	let env = TestEnv::new_with_levels(2);
-	let mut levels = Levels::new(2, 10);
+	let mut levels = Levels::new(3, 10);
 
 	let key = b"test-key".to_vec();
 
@@ -2258,9 +2254,9 @@ fn test_score_based_level_selection() {
 
 	// Create options with specific compaction settings
 	let mut opts = (*env.options).clone();
-	opts.level0_file_num_compaction_trigger = 4;
-	opts.max_bytes_for_level_base = 100 * 1024 * 1024; // 100MB
-	opts.max_bytes_for_level_multiplier = 10.0;
+	opts.level0_max_files = 4;
+	opts.max_bytes_for_level = 100 * 1024 * 1024; // 100MB
+	opts.level_multiplier = 10.0;
 	let opts = Arc::new(opts);
 	let strategy = Strategy::from_options(opts);
 
@@ -2280,7 +2276,7 @@ fn test_score_based_level_selection() {
 	}
 
 	// Score-based selection should pick the level with highest score
-	let choice = strategy.pick_levels(&manifest);
+	let choice = strategy.pick_levels(&manifest).unwrap();
 	match choice {
 		CompactionChoice::Merge(input) => {
 			// Should pick a level that needs compaction (score >= 1.0)
@@ -2299,8 +2295,8 @@ fn test_bytes_based_level_limits() {
 
 	// Create options with bytes-based limits
 	let mut opts = (*env.options).clone();
-	opts.max_bytes_for_level_base = 100 * 1024 * 1024; // 100MB base
-	opts.max_bytes_for_level_multiplier = 10.0;
+	opts.max_bytes_for_level = 100 * 1024 * 1024; // 100MB base
+	opts.level_multiplier = 10.0;
 	let opts = Arc::new(opts);
 	let strategy = Strategy::from_options(opts);
 
@@ -2313,7 +2309,7 @@ fn test_bytes_based_level_limits() {
 	}
 
 	// Check that L1 can be selected if it exceeds limit
-	let choice = strategy.pick_levels(&manifest);
+	let choice = strategy.pick_levels(&manifest).unwrap();
 	match choice {
 		CompactionChoice::Merge(input) => {
 			// Should pick a level that needs compaction
@@ -2334,8 +2330,8 @@ fn test_bottom_level_compaction() {
 
 	// Create options
 	let mut opts = (*env.options).clone();
-	opts.max_bytes_for_level_base = 100 * 1024 * 1024; // 100MB
-	opts.max_bytes_for_level_multiplier = 10.0;
+	opts.max_bytes_for_level = 100 * 1024 * 1024; // 100MB
+	opts.level_multiplier = 10.0;
 	let opts = Arc::new(opts);
 	let strategy = Strategy::from_options(opts);
 
@@ -2348,7 +2344,7 @@ fn test_bottom_level_compaction() {
 
 	// Bottom level compaction should be allowed (same-level compaction)
 	// Note: This will only trigger if L2 exceeds its byte limit
-	let choice = strategy.pick_levels(&manifest);
+	let choice = strategy.pick_levels(&manifest).unwrap();
 	match choice {
 		CompactionChoice::Merge(input) => {
 			// If L2 is selected, it should compact to same level
@@ -2363,4 +2359,756 @@ fn test_bottom_level_compaction() {
 			// Skip is OK if L2 doesn't exceed limit
 		}
 	}
+}
+
+fn create_test_table_with_bounds(
+	temp_dir: &TempDir,
+	opts: &Arc<Options>,
+	id: u64,
+	smallest_key: &[u8],
+	largest_key: &[u8],
+) -> Arc<crate::sstable::table::Table> {
+	// Ensure the sstable directory exists in the temp directory
+	let sstable_dir = temp_dir.path().join("sstables");
+	std::fs::create_dir_all(&sstable_dir).unwrap();
+
+	let table_path = opts.sstable_file_path(id);
+	let file = File::create(&table_path).unwrap();
+
+	let mut writer = crate::sstable::table::TableWriter::new(file, id, Arc::clone(opts), 0);
+
+	// Add smallest key
+	let small_key = InternalKey::new(smallest_key.to_vec(), 1, InternalKeyKind::Set, 0);
+	let value = ValueLocation::with_inline_value(b"v".to_vec()).encode();
+	writer.add(small_key, &value).unwrap();
+
+	// Add largest key (if different)
+	if smallest_key != largest_key {
+		let large_key = InternalKey::new(largest_key.to_vec(), 2, InternalKeyKind::Set, 0);
+		writer.add(large_key, &value).unwrap();
+	}
+
+	writer.finish().unwrap();
+
+	let file = std::fs::File::open(&table_path).unwrap();
+	let file_size = file.metadata().unwrap().len();
+	let table =
+		crate::sstable::table::Table::new(id, Arc::clone(opts), Arc::new(file), file_size).unwrap();
+	Arc::new(table)
+}
+
+#[test]
+fn test_get_user_key_range_single_table() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+	let table = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"z");
+	level.insert(table);
+
+	let mut ids = HashSet::new();
+	ids.insert(1);
+
+	let result = Strategy::get_user_key_range(&level, &ids);
+	assert_eq!(result, Some((b"a".to_vec(), b"z".to_vec())));
+}
+
+#[test]
+fn test_get_user_key_range_multiple_tables() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+	let table1 = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"m");
+	let table2 = create_test_table_with_bounds(&temp_dir, &opts, 2, b"g", b"z");
+	level.insert(table1);
+	level.insert(table2);
+
+	let mut ids = HashSet::new();
+	ids.insert(1);
+	ids.insert(2);
+
+	let result = Strategy::get_user_key_range(&level, &ids);
+	assert_eq!(result, Some((b"a".to_vec(), b"z".to_vec())));
+}
+
+#[test]
+fn test_get_user_key_range_empty_ids() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+	let table = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"z");
+	level.insert(table);
+
+	let ids = HashSet::new();
+
+	let result = Strategy::get_user_key_range(&level, &ids);
+	assert_eq!(result, None);
+}
+
+#[test]
+fn test_select_overlapping_ranges_no_overlap() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+	let table1 = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"b");
+	let table2 = create_test_table_with_bounds(&temp_dir, &opts, 2, b"d", b"e");
+	let table3 = create_test_table_with_bounds(&temp_dir, &opts, 3, b"g", b"h");
+	level.insert(table1);
+	level.insert(table2);
+	level.insert(table3);
+
+	let result = Strategy::select_overlapping_ranges(&level, 2).unwrap();
+	assert_eq!(result.len(), 1);
+	assert!(result.contains(&2));
+}
+
+#[test]
+fn test_select_overlapping_ranges_direct_overlap() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+	let table1 = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"c");
+	let table2 = create_test_table_with_bounds(&temp_dir, &opts, 2, b"c", b"e");
+	level.insert(table1);
+	level.insert(table2);
+
+	let result = Strategy::select_overlapping_ranges(&level, 1).unwrap();
+	assert_eq!(result.len(), 2);
+	assert!(result.contains(&1));
+	assert!(result.contains(&2));
+}
+
+#[test]
+fn test_select_overlapping_ranges_chain() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+	let table1 = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"b");
+	let table2 = create_test_table_with_bounds(&temp_dir, &opts, 2, b"b", b"c");
+	let table3 = create_test_table_with_bounds(&temp_dir, &opts, 3, b"c", b"d");
+	let table4 = create_test_table_with_bounds(&temp_dir, &opts, 4, b"e", b"f");
+	level.insert(table1);
+	level.insert(table2);
+	level.insert(table3);
+	level.insert(table4);
+
+	let result = Strategy::select_overlapping_ranges(&level, 2).unwrap();
+	assert_eq!(result.len(), 3);
+	assert!(result.contains(&1));
+	assert!(result.contains(&2));
+	assert!(result.contains(&3));
+	assert!(!result.contains(&4));
+}
+
+#[test]
+fn test_select_overlapping_ranges_full_overlap() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+	let table1 = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"z");
+	let table2 = create_test_table_with_bounds(&temp_dir, &opts, 2, b"b", b"c");
+	level.insert(table1);
+	level.insert(table2);
+
+	let result = Strategy::select_overlapping_ranges(&level, 1).unwrap();
+	assert_eq!(result.len(), 2);
+	assert!(result.contains(&1));
+	assert!(result.contains(&2));
+}
+
+#[test]
+fn test_select_overlapping_ranges_adjacent_no_overlap() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+	let table1 = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"b");
+	let table2 = create_test_table_with_bounds(&temp_dir, &opts, 2, b"c", b"d");
+	level.insert(table1);
+	level.insert(table2);
+
+	let result = Strategy::select_overlapping_ranges(&level, 1).unwrap();
+	assert_eq!(result.len(), 1);
+	assert!(result.contains(&1));
+}
+
+#[test]
+fn test_expand_same_user_key_different_seq() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+
+	// Ensure the sstable directory exists in the temp directory
+	let sstable_dir = temp_dir.path().join("sstables");
+	std::fs::create_dir_all(&sstable_dir).unwrap();
+
+	// File 1: user_key="foo" at seq=100 (newest)
+	let table_path1 = opts.sstable_file_path(1);
+	let file1 = File::create(&table_path1).unwrap();
+	let mut writer1 = crate::sstable::table::TableWriter::new(file1, 1, Arc::clone(&opts), 0);
+	let key1 = InternalKey::new(b"foo".to_vec(), 100, InternalKeyKind::Set, 0);
+	let value = ValueLocation::with_inline_value(b"v1".to_vec()).encode();
+	writer1.add(key1, &value).unwrap();
+	writer1.finish().unwrap();
+	let file1 = std::fs::File::open(&table_path1).unwrap();
+	let file_size1 = file1.metadata().unwrap().len();
+	let table1 =
+		crate::sstable::table::Table::new(1, Arc::clone(&opts), Arc::new(file1), file_size1)
+			.unwrap();
+	level.insert(Arc::new(table1));
+
+	// File 2: user_key="foo" at seq=50 (older version)
+	let table_path2 = opts.sstable_file_path(2);
+	let file2 = File::create(&table_path2).unwrap();
+	let mut writer2 = crate::sstable::table::TableWriter::new(file2, 2, Arc::clone(&opts), 0);
+	let key2 = InternalKey::new(b"foo".to_vec(), 50, InternalKeyKind::Set, 0);
+	writer2.add(key2, &value).unwrap();
+	writer2.finish().unwrap();
+	let file2 = std::fs::File::open(&table_path2).unwrap();
+	let file_size2 = file2.metadata().unwrap().len();
+	let table2 =
+		crate::sstable::table::Table::new(2, Arc::clone(&opts), Arc::new(file2), file_size2)
+			.unwrap();
+	level.insert(Arc::new(table2));
+
+	// When selecting File 1, File 2 MUST be included (same user key, different seq)
+	let result = Strategy::select_overlapping_ranges(&level, 1).unwrap();
+	assert_eq!(result.len(), 2, "Both files with same user key should be included");
+	assert!(result.contains(&1));
+	assert!(result.contains(&2));
+}
+
+#[test]
+fn test_select_overlapping_ranges_nonexistent_id() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+	let table = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"z");
+	level.insert(table);
+
+	let result = Strategy::select_overlapping_ranges(&level, 999);
+	assert!(result.is_err());
+	match result {
+		Err(crate::error::Error::TableNotFound(id)) => assert_eq!(id, 999),
+		_ => panic!("Expected TableNotFound error"),
+	}
+}
+
+/// Helper function to create entries with specific string keys
+fn create_entries_with_keys(keys: &[&str], seq_num: u64) -> Vec<(InternalKey, Vec<u8>)> {
+	let mut entries = Vec::new();
+	for (i, key) in keys.iter().enumerate() {
+		let user_key = key.as_bytes().to_vec();
+		let internal_key = InternalKey::new(user_key, seq_num + i as u64, InternalKeyKind::Set, 0);
+		let value = format!("value-{}", key).into_bytes();
+		let encoded_value = create_inline_value(&value);
+		entries.push((internal_key, encoded_value));
+	}
+	entries
+}
+
+#[test]
+fn test_clean_cut_shared_boundary_key() {
+	let env = TestEnv::new();
+
+	// Create L1 with files that share a boundary key "foo"
+	// File 1: keys "a" to "foo" (boundary)
+	// File 2: keys "foo" to "m" (shares boundary with file 1)
+	// File 3: keys "n" to "z" (no shared boundary)
+
+	let mut levels = Levels::new(3, 10);
+
+	// File 1: a, b, c, ..., foo
+	let mut file1_keys: Vec<String> = (b'a'..=b'f').map(|c| char::from(c).to_string()).collect();
+	file1_keys.push("foo".to_string());
+	let file1_keys_refs: Vec<&str> = file1_keys.iter().map(|s| s.as_str()).collect();
+	let file1_entries = create_entries_with_keys(&file1_keys_refs, 100);
+	let table1 = env.create_test_table(1, file1_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table1);
+
+	// File 2: foo, g, h, ..., m
+	let mut file2_keys: Vec<String> = vec!["foo".to_string()];
+	file2_keys.extend((b'g'..=b'm').map(|c| char::from(c).to_string()));
+	let file2_keys_refs: Vec<&str> = file2_keys.iter().map(|s| s.as_str()).collect();
+	let file2_entries = create_entries_with_keys(&file2_keys_refs, 200);
+	let table2 = env.create_test_table(2, file2_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table2);
+
+	// File 3: n, o, p, ..., z (no shared boundary)
+	let file3_keys: Vec<String> = (b'n'..=b'z').map(|c| char::from(c).to_string()).collect();
+	let file3_keys_refs: Vec<&str> = file3_keys.iter().map(|s| s.as_str()).collect();
+	let file3_entries = create_entries_with_keys(&file3_keys_refs, 300);
+	let table3 = env.create_test_table(3, file3_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table3);
+
+	// Create manifest
+	let manifest_path = env.options.path.join("test_manifest");
+	let manifest = LevelManifest {
+		path: manifest_path,
+		levels,
+		hidden_set: HashSet::new(),
+		next_table_id: Arc::new(AtomicU64::new(1000)),
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
+	write_manifest_to_disk(&manifest).unwrap();
+	let manifest = Arc::new(RwLock::new(manifest));
+
+	let levels_guard = manifest.read().unwrap();
+	let source_level = &levels_guard.levels.get_levels()[1];
+
+	// Test clean cut expansion directly: selecting File 1 should expand to include File 2
+	let selected = Strategy::select_overlapping_ranges(source_level, 1).unwrap();
+
+	// Verify file 1 and file 2 are both included (shared boundary "foo")
+	assert!(selected.contains(&1), "File 1 should be included (initially selected)");
+	assert!(
+		selected.contains(&2),
+		"File 2 should be included (shares boundary key 'foo' with file 1)"
+	);
+	// Verify file 3 is NOT included (no shared boundary)
+	assert!(!selected.contains(&3), "File 3 should NOT be included (no shared boundary)");
+}
+
+#[test]
+fn test_clean_cut_chain_expansion() {
+	let env = TestEnv::new();
+
+	// Create L1 with files forming a chain of shared boundaries
+	// File 1: keys "a" to "b" (boundary "b")
+	// File 2: keys "b" to "c" (shares "b" with file 1, boundary "c")
+	// File 3: keys "c" to "d" (shares "c" with file 2)
+	// File 4: keys "e" to "f" (no shared boundary)
+
+	let mut levels = Levels::new(3, 10);
+
+	// File 1: a, b
+	let file1_entries = create_entries_with_keys(&["a", "b"], 100);
+	let table1 = env.create_test_table(1, file1_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table1);
+
+	// File 2: b, c
+	let file2_entries = create_entries_with_keys(&["b", "c"], 200);
+	let table2 = env.create_test_table(2, file2_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table2);
+
+	// File 3: c, d
+	let file3_entries = create_entries_with_keys(&["c", "d"], 300);
+	let table3 = env.create_test_table(3, file3_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table3);
+
+	// File 4: e, f (no shared boundary)
+	let file4_entries = create_entries_with_keys(&["e", "f"], 400);
+	let table4 = env.create_test_table(4, file4_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table4);
+
+	// Create manifest
+	let manifest_path = env.options.path.join("test_manifest");
+	let manifest = LevelManifest {
+		path: manifest_path,
+		levels,
+		hidden_set: HashSet::new(),
+		next_table_id: Arc::new(AtomicU64::new(1000)),
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
+	write_manifest_to_disk(&manifest).unwrap();
+	let manifest = Arc::new(RwLock::new(manifest));
+
+	let levels_guard = manifest.read().unwrap();
+	let source_level = &levels_guard.levels.get_levels()[1];
+
+	// Test clean cut expansion directly: selecting File 2 should expand to include Files 1 and 3
+	let selected = Strategy::select_overlapping_ranges(source_level, 2).unwrap();
+
+	// Verify all three files in the chain are included
+	assert!(selected.contains(&1), "File 1 should be included (chain expansion)");
+	assert!(selected.contains(&2), "File 2 should be included (initially selected)");
+	assert!(selected.contains(&3), "File 3 should be included (chain expansion)");
+	// Verify file 4 is NOT included (no shared boundary)
+	assert!(!selected.contains(&4), "File 4 should NOT be included (no shared boundary)");
+}
+
+#[test]
+fn test_clean_cut_no_expansion_needed() {
+	let env = TestEnv::new();
+
+	// Create L1 with files that have no shared boundaries
+	// File 1: keys "a" to "b"
+	// File 2: keys "d" to "e"
+	// File 3: keys "g" to "h"
+
+	let mut levels = Levels::new(3, 10);
+
+	// File 1: a, b
+	let file1_entries = create_entries_with_keys(&["a", "b"], 100);
+	let table1 = env.create_test_table(1, file1_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table1);
+
+	// File 2: d, e
+	let file2_entries = create_entries_with_keys(&["d", "e"], 200);
+	let table2 = env.create_test_table(2, file2_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table2);
+
+	// File 3: g, h
+	let file3_entries = create_entries_with_keys(&["g", "h"], 300);
+	let table3 = env.create_test_table(3, file3_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table3);
+
+	// Create manifest
+	let manifest_path = env.options.path.join("test_manifest");
+	let manifest = LevelManifest {
+		path: manifest_path,
+		levels,
+		hidden_set: HashSet::new(),
+		next_table_id: Arc::new(AtomicU64::new(1000)),
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
+	write_manifest_to_disk(&manifest).unwrap();
+	let manifest = Arc::new(RwLock::new(manifest));
+
+	let levels_guard = manifest.read().unwrap();
+	let source_level = &levels_guard.levels.get_levels()[1];
+
+	// Test clean cut expansion directly: selecting File 1 should not expand (no shared boundaries)
+	let selected = Strategy::select_overlapping_ranges(source_level, 1).unwrap();
+
+	// Verify only File 1 is selected (no expansion needed)
+	assert_eq!(
+		selected.len(),
+		1,
+		"Only one file should be selected when there are no shared boundaries"
+	);
+	assert!(selected.contains(&1), "File 1 should be the only selected file");
+}
+
+#[test]
+fn test_clean_cut_integration_shared_boundary() {
+	let env = TestEnv::new();
+
+	// Create L1 with files where File 1 is largest and shares boundary with File 2
+	// File 1: keys "a" to "foo" (largest file - will be selected by ByCompensatedSize)
+	// File 2: keys "foo" to "m" (shares boundary with file 1)
+	// File 3: keys "n" to "z" (no shared boundary)
+
+	let mut levels = Levels::new(3, 10);
+
+	// File 1: a, b, c, ..., foo (make it largest by adding keys BEFORE foo)
+	let mut file1_keys: Vec<String> = Vec::new();
+	// Add many keys in the range before "foo"
+	for i in 0..20 {
+		file1_keys.push(format!("a{:02}", i));
+	}
+	file1_keys.extend((b'b'..=b'f').map(|c| char::from(c).to_string()));
+	file1_keys.push("foo".to_string());
+	let file1_keys_refs: Vec<&str> = file1_keys.iter().map(|s| s.as_str()).collect();
+	let file1_entries = create_entries_with_keys(&file1_keys_refs, 100);
+	let table1 = env.create_test_table(1, file1_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table1);
+
+	// File 2: foo, g, h, ..., m (smaller)
+	let mut file2_keys: Vec<String> = vec!["foo".to_string()];
+	file2_keys.extend((b'g'..=b'm').map(|c| char::from(c).to_string()));
+	let file2_keys_refs: Vec<&str> = file2_keys.iter().map(|s| s.as_str()).collect();
+	let file2_entries = create_entries_with_keys(&file2_keys_refs, 200);
+	let table2 = env.create_test_table(2, file2_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table2);
+
+	// File 3: n, o, p, ..., z (smaller - no shared boundary)
+	let file3_keys: Vec<String> = (b'n'..=b'z').map(|c| char::from(c).to_string()).collect();
+	let file3_keys_refs: Vec<&str> = file3_keys.iter().map(|s| s.as_str()).collect();
+	let file3_entries = create_entries_with_keys(&file3_keys_refs, 300);
+	let table3 = env.create_test_table(3, file3_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table3);
+
+	// Create manifest
+	let manifest_path = env.options.path.join("test_manifest");
+	let manifest = LevelManifest {
+		path: manifest_path,
+		levels,
+		hidden_set: HashSet::new(),
+		next_table_id: Arc::new(AtomicU64::new(1000)),
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
+	write_manifest_to_disk(&manifest).unwrap();
+	let manifest = Arc::new(RwLock::new(manifest));
+
+	// Create strategy with default priority (ByCompensatedSize)
+	let opts = create_options_with_compaction_settings(&env.options, 4, 2.0);
+	let strategy = Strategy::from_options(opts);
+
+	let levels_guard = manifest.read().unwrap();
+	let source_level = &levels_guard.levels.get_levels()[1];
+	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
+
+	// File 1 should be selected (largest), and should expand to include File 2
+	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
+
+	// Verify File 1 and File 2 are both included (shared "foo" boundary)
+	assert!(selected.contains(&1), "File 1 should be included (initially selected as largest)");
+	assert!(
+		selected.contains(&2),
+		"File 2 should be included (shares boundary key 'foo' with file 1)"
+	);
+	// Verify File 3 is NOT included (no shared boundary)
+	assert!(!selected.contains(&3), "File 3 should NOT be included (no shared boundary)");
+}
+
+#[test]
+fn test_clean_cut_integration_chain_expansion() {
+	let env = TestEnv::new();
+
+	// Create L1 with files forming a chain, File 2 is largest
+	// File 1: keys "a" to "b"
+	// File 2: keys "b" to "c" (largest - will be selected)
+	// File 3: keys "c" to "d" (shares boundary with file 2)
+	// File 4: keys "e" to "f" (no shared boundary)
+
+	let mut levels = Levels::new(3, 10);
+
+	// File 1: a, b (smallest)
+	let file1_entries = create_entries_with_keys(&["a", "b"], 100);
+	let table1 = env.create_test_table(1, file1_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table1);
+
+	// File 2: b, c (largest - add more entries to make it largest)
+	// File 2: b, c (largest - add more entries BEFORE "c" to make it largest)
+	let mut file2_keys = vec!["b".to_string()];
+	// Add more keys between "b" and "c" to make File 2 the largest
+	for i in 0..10 {
+		file2_keys.push(format!("b{}", i)); // "b0", "b1", ..., "b9" are all < "c"
+	}
+	file2_keys.push("c".to_string()); // "c" is still the largest key
+	let file2_keys_refs: Vec<&str> = file2_keys.iter().map(|s| s.as_str()).collect();
+	let file2_entries = create_entries_with_keys(&file2_keys_refs, 200);
+	let table2 = env.create_test_table(2, file2_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table2);
+
+	// File 3: c, d
+	let file3_entries = create_entries_with_keys(&["c", "d"], 300);
+	let table3 = env.create_test_table(3, file3_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table3);
+
+	// File 4: e, f (no shared boundary)
+	let file4_entries = create_entries_with_keys(&["e", "f"], 400);
+	let table4 = env.create_test_table(4, file4_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table4);
+
+	// Create manifest
+	let manifest_path = env.options.path.join("test_manifest");
+	let manifest = LevelManifest {
+		path: manifest_path,
+		levels,
+		hidden_set: HashSet::new(),
+		next_table_id: Arc::new(AtomicU64::new(1000)),
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
+	write_manifest_to_disk(&manifest).unwrap();
+	let manifest = Arc::new(RwLock::new(manifest));
+
+	// Create strategy with default priority (ByCompensatedSize)
+	let opts = create_options_with_compaction_settings(&env.options, 4, 2.0);
+	let strategy = Strategy::from_options(opts);
+
+	let levels_guard = manifest.read().unwrap();
+	let source_level = &levels_guard.levels.get_levels()[1];
+	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
+
+	// File 2 should be selected (largest), and should expand to include Files 1 and 3
+	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
+
+	// Verify all three files in the chain are included
+	assert!(selected.contains(&1), "File 1 should be included (chain expansion)");
+	assert!(selected.contains(&2), "File 2 should be included (initially selected as largest)");
+	assert!(selected.contains(&3), "File 3 should be included (chain expansion)");
+	// Verify File 4 is NOT included (no shared boundary)
+	assert!(!selected.contains(&4), "File 4 should NOT be included (no shared boundary)");
+}
+
+#[test]
+fn test_clean_cut_integration_with_oldest_seq_priority() {
+	let env = TestEnv::new();
+
+	// Create L1 with files where File 1 has oldest sequence
+	// File 1: seq 100, keys "a" to "foo"
+	// File 2: seq 200, keys "foo" to "m"
+	// File 3: seq 300, keys "n" to "z"
+
+	let mut levels = Levels::new(3, 10);
+
+	// File 1: a, b, c, ..., foo (oldest sequence)
+	let mut file1_keys: Vec<String> = (b'a'..=b'f').map(|c| char::from(c).to_string()).collect();
+	file1_keys.push("foo".to_string());
+	let file1_keys_refs: Vec<&str> = file1_keys.iter().map(|s| s.as_str()).collect();
+	let file1_entries = create_entries_with_keys(&file1_keys_refs, 100);
+	let table1 = env.create_test_table(1, file1_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table1);
+
+	// File 2: foo, g, h, ..., m
+	let mut file2_keys: Vec<String> = vec!["foo".to_string()];
+	file2_keys.extend((b'g'..=b'm').map(|c| char::from(c).to_string()));
+	let file2_keys_refs: Vec<&str> = file2_keys.iter().map(|s| s.as_str()).collect();
+	let file2_entries = create_entries_with_keys(&file2_keys_refs, 200);
+	let table2 = env.create_test_table(2, file2_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table2);
+
+	// File 3: n, o, p, ..., z
+	let file3_keys: Vec<String> = (b'n'..=b'z').map(|c| char::from(c).to_string()).collect();
+	let file3_keys_refs: Vec<&str> = file3_keys.iter().map(|s| s.as_str()).collect();
+	let file3_entries = create_entries_with_keys(&file3_keys_refs, 300);
+	let table3 = env.create_test_table(3, file3_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table3);
+
+	// Create manifest
+	let manifest_path = env.options.path.join("test_manifest");
+	let manifest = LevelManifest {
+		path: manifest_path,
+		levels,
+		hidden_set: HashSet::new(),
+		next_table_id: Arc::new(AtomicU64::new(1000)),
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
+	write_manifest_to_disk(&manifest).unwrap();
+	let manifest = Arc::new(RwLock::new(manifest));
+
+	// Create strategy with OldestSmallestSeqFirst priority
+	let opts = create_options_with_compaction_settings(&env.options, 4, 2.0);
+	let strategy = create_strategy_with_priority(&opts, CompactionPriority::OldestSmallestSeqFirst);
+
+	let levels_guard = manifest.read().unwrap();
+	let source_level = &levels_guard.levels.get_levels()[1];
+	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
+
+	// File 1 should be selected (oldest sequence), and should expand to include File 2
+	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
+
+	// Verify File 1 and File 2 are both included (shared "foo" boundary)
+	assert!(selected.contains(&1), "File 1 should be included (initially selected as oldest)");
+	assert!(
+		selected.contains(&2),
+		"File 2 should be included (shares boundary key 'foo' with file 1)"
+	);
+	// Verify File 3 is NOT included (no shared boundary)
+	assert!(!selected.contains(&3), "File 3 should NOT be included (no shared boundary)");
+}
+
+#[test]
+fn test_clean_cut_integration_no_expansion() {
+	let env = TestEnv::new();
+
+	// Create L1 with files that have no shared boundaries, File 1 is largest
+	// File 1: keys "a" to "b" (largest)
+	// File 2: keys "d" to "e"
+	// File 3: keys "g" to "h"
+
+	let mut levels = Levels::new(3, 10);
+
+	// File 1: a, b (make it largest by adding more keys BEFORE "b")
+	let mut file1_keys = vec!["a".to_string()];
+	for i in 0..10 {
+		file1_keys.push(format!("a{}", i)); // "a0", "a1", ..., "a9" are all < "b"
+	}
+	file1_keys.push("b".to_string()); // "b" is still the largest key
+	let file1_keys_refs: Vec<&str> = file1_keys.iter().map(|s| s.as_str()).collect();
+	let file1_entries = create_entries_with_keys(&file1_keys_refs, 100);
+	let table1 = env.create_test_table(1, file1_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table1);
+
+	// File 2: d, e
+	let file2_entries = create_entries_with_keys(&["d", "e"], 200);
+	let table2 = env.create_test_table(2, file2_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table2);
+
+	// File 3: g, h
+	let file3_entries = create_entries_with_keys(&["g", "h"], 300);
+	let table3 = env.create_test_table(3, file3_entries).unwrap();
+	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(table3);
+
+	// Create manifest
+	let manifest_path = env.options.path.join("test_manifest");
+	let manifest = LevelManifest {
+		path: manifest_path,
+		levels,
+		hidden_set: HashSet::new(),
+		next_table_id: Arc::new(AtomicU64::new(1000)),
+		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	};
+	write_manifest_to_disk(&manifest).unwrap();
+	let manifest = Arc::new(RwLock::new(manifest));
+
+	// Create strategy with default priority (ByCompensatedSize)
+	let opts = create_options_with_compaction_settings(&env.options, 4, 2.0);
+	let strategy = Strategy::from_options(opts);
+
+	let levels_guard = manifest.read().unwrap();
+	let source_level = &levels_guard.levels.get_levels()[1];
+	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
+
+	// File 1 should be selected (largest), but should NOT expand (no shared boundaries)
+	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
+
+	// Verify only File 1 is selected (no expansion needed)
+	assert_eq!(
+		selected.len(),
+		1,
+		"Only one file should be selected when there are no shared boundaries"
+	);
+	assert!(selected.contains(&1), "File 1 should be the only selected file");
 }

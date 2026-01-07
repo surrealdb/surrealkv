@@ -4,6 +4,7 @@ pub(crate) mod compactor;
 pub(crate) mod leveled;
 
 use crate::levels::LevelManifest;
+use crate::Result;
 
 /// Represents the input for a compaction operation
 #[derive(Debug, Eq, PartialEq, Clone)]
@@ -23,5 +24,5 @@ pub enum CompactionChoice {
 /// Defines the strategy interface for compaction
 pub trait CompactionStrategy: Send + Sync {
 	/// Determines which levels should be compacted
-	fn pick_levels(&self, manifest: &LevelManifest) -> CompactionChoice;
+	fn pick_levels(&self, manifest: &LevelManifest) -> Result<CompactionChoice>;
 }

@@ -82,7 +82,7 @@ impl Compactor {
 
 	pub(crate) fn compact(&self) -> Result<()> {
 		let levels_guard = self.options.level_manifest.write()?;
-		let choice = self.strategy.pick_levels(&levels_guard);
+		let choice = self.strategy.pick_levels(&levels_guard)?;
 
 		match choice {
 			CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input),
