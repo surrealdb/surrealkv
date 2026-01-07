@@ -406,7 +406,6 @@ fn test_compaction_edge_cases() {
 	// Test strategy with many tables in last level
 	let choice = strategy.pick_levels(&manifest.read().unwrap()).unwrap();
 
-	// With new implementation, bottom-level compaction is allowed (same-level compaction)
 	// If the last level exceeds its byte limit, it can compact to itself for tombstone cleanup
 	match choice {
 		CompactionChoice::Skip => {
@@ -2398,7 +2397,7 @@ fn create_test_table_with_bounds(
 }
 
 #[test]
-fn test_get_user_key_range_single_table() {
+fn test_combined_key_range_single_table() {
 	let temp_dir = TempDir::new().unwrap();
 	let opts = Arc::new(Options {
 		path: temp_dir.path().to_path_buf(),
@@ -2412,12 +2411,19 @@ fn test_get_user_key_range_single_table() {
 	let mut ids = HashSet::new();
 	ids.insert(1);
 
-	let result = Strategy::get_user_key_range(&level, &ids);
-	assert_eq!(result, Some((b"a".to_vec(), b"z".to_vec())));
+	let result = Strategy::combined_key_range(level.tables.iter().filter(|t| ids.contains(&t.id)));
+	assert!(result.is_some());
+	if let Some((std::ops::Bound::Included(smallest), std::ops::Bound::Included(largest))) = result
+	{
+		assert_eq!(&smallest.user_key, b"a");
+		assert_eq!(&largest.user_key, b"z");
+	} else {
+		panic!("Expected Included bounds");
+	}
 }
 
 #[test]
-fn test_get_user_key_range_multiple_tables() {
+fn test_combined_key_range_multiple_tables() {
 	let temp_dir = TempDir::new().unwrap();
 	let opts = Arc::new(Options {
 		path: temp_dir.path().to_path_buf(),
@@ -2434,12 +2440,51 @@ fn test_get_user_key_range_multiple_tables() {
 	ids.insert(1);
 	ids.insert(2);
 
-	let result = Strategy::get_user_key_range(&level, &ids);
-	assert_eq!(result, Some((b"a".to_vec(), b"z".to_vec())));
+	let result = Strategy::combined_key_range(level.tables.iter().filter(|t| ids.contains(&t.id)));
+	assert!(result.is_some());
+	if let Some((std::ops::Bound::Included(smallest), std::ops::Bound::Included(largest))) = result
+	{
+		assert_eq!(&smallest.user_key, b"a");
+		assert_eq!(&largest.user_key, b"z");
+	} else {
+		panic!("Expected Included bounds");
+	}
 }
 
 #[test]
-fn test_get_user_key_range_empty_ids() {
+fn test_combined_key_range_overlapping_tables() {
+	let temp_dir = TempDir::new().unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		..Default::default()
+	});
+
+	let mut level = Level::with_capacity(10);
+	let table1 = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"m");
+	let table2 = create_test_table_with_bounds(&temp_dir, &opts, 2, b"m", b"t");
+	let table3 = create_test_table_with_bounds(&temp_dir, &opts, 3, b"t", b"v");
+	level.insert(table1);
+	level.insert(table2);
+	level.insert(table3);
+
+	let mut ids = HashSet::new();
+	ids.insert(1);
+	ids.insert(2);
+	ids.insert(3);
+
+	let result = Strategy::combined_key_range(level.tables.iter().filter(|t| ids.contains(&t.id)));
+	assert!(result.is_some());
+	if let Some((std::ops::Bound::Included(smallest), std::ops::Bound::Included(largest))) = result
+	{
+		assert_eq!(&smallest.user_key, b"a");
+		assert_eq!(&largest.user_key, b"v");
+	} else {
+		panic!("Expected Included bounds");
+	}
+}
+
+#[test]
+fn test_combined_key_range_empty_ids() {
 	let temp_dir = TempDir::new().unwrap();
 	let opts = Arc::new(Options {
 		path: temp_dir.path().to_path_buf(),
@@ -2450,9 +2495,9 @@ fn test_get_user_key_range_empty_ids() {
 	let table = create_test_table_with_bounds(&temp_dir, &opts, 1, b"a", b"z");
 	level.insert(table);
 
-	let ids = HashSet::new();
+	let ids: HashSet<u64> = HashSet::new();
 
-	let result = Strategy::get_user_key_range(&level, &ids);
+	let result = Strategy::combined_key_range(level.tables.iter().filter(|t| ids.contains(&t.id)));
 	assert_eq!(result, None);
 }
 

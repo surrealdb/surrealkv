@@ -1,8 +1,10 @@
 use std::collections::HashSet;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::levels::{Level, LevelManifest};
+use crate::sstable::table::Table;
 use crate::{InternalKeyRange, Options, Result};
 
 /// Compaction priority strategy for selecting files to compact
@@ -68,11 +70,9 @@ impl Strategy {
 		}
 	}
 
-	/// Calculate max bytes for a level (L1+ only, L0 uses count-based)
-	fn max_bytes_for_level(&self, level: u8) -> u64 {
-		if level == 0 {
-			return 0; // L0 uses count-based
-		}
+	/// Calculate max bytes for a level
+	fn target_bytes_for_level(&self, level: u8) -> u64 {
+		assert!(level >= 1, "L0 should not use target_bytes_for_level");
 		(self.max_bytes_for_level as f64 * self.level_multiplier.powi((level - 1) as i32)) as u64
 	}
 
@@ -81,42 +81,64 @@ impl Strategy {
 		level.tables.iter().map(|t| t.file_size).sum()
 	}
 
-	/// Get combined user key range from selected tables
-	/// Returns (smallest_user_key, largest_user_key) if any tables have bounds
-	pub(crate) fn get_user_key_range(
-		level: &Level,
-		ids: &HashSet<u64>,
-	) -> Option<(Vec<u8>, Vec<u8>)> {
-		let mut smallest: Option<Vec<u8>> = None;
-		let mut largest: Option<Vec<u8>> = None;
-
-		for table in &level.tables {
-			if !ids.contains(&table.id) {
-				continue;
-			}
-
-			if let (Some(s), Some(l)) =
-				(table.meta.smallest_point.as_ref(), table.meta.largest_point.as_ref())
-			{
-				smallest = Some(match smallest {
-					None => s.user_key.clone(),
-					Some(ref curr) if s.user_key < *curr => s.user_key.clone(),
-					Some(curr) => curr,
-				});
-				largest = Some(match largest {
-					None => l.user_key.clone(),
-					Some(ref curr) if l.user_key > *curr => l.user_key.clone(),
-					Some(curr) => curr,
-				});
-			}
-		}
-
-		smallest.zip(largest)
+	/// Get combined key range from an iterator of tables.
+	/// Returns the bounding box (smallest, largest) as an InternalKeyRange.
+	pub(crate) fn combined_key_range<'a>(
+		tables: impl Iterator<Item = &'a Arc<Table>>,
+	) -> Option<InternalKeyRange> {
+		tables
+			.filter_map(|t| {
+				let smallest = t.meta.smallest_point.as_ref()?;
+				let largest = t.meta.largest_point.as_ref()?;
+				Some((smallest.clone(), largest.clone()))
+			})
+			.fold(None, |acc, (s, l)| match acc {
+				None => Some((Bound::Included(s), Bound::Included(l))),
+				Some((Bound::Included(acc_s), Bound::Included(acc_l))) => {
+					let new_s = if s.user_key < acc_s.user_key {
+						s
+					} else {
+						acc_s
+					};
+					let new_l = if l.user_key > acc_l.user_key {
+						l
+					} else {
+						acc_l
+					};
+					Some((Bound::Included(new_s), Bound::Included(new_l)))
+				}
+				_ => acc,
+			})
 	}
 
-	/// Expand file selection to include all files sharing boundary user keys
+	/// Expand file selection to include all files sharing boundary user keys.
 	/// This will be useful later when we compact based on a size limit where
 	/// there could be multiple tables that overlap with the same user key range.
+	///
+	/// # Example
+	///
+	/// Given L1 with 4 files:
+	///
+	/// File 1: [a -------- b]
+	/// File 2:             [b -------- c]   ← shares "b" with File 1
+	/// File 3:                         [c -------- d]   ← shares "c" with File 2
+	/// File 4:                                     [e -------- f]   ← isolated (gap before "e")
+	/// ///
+	/// If we start with `initial_table_id = 2` (File 2):
+	///
+	/// **Iteration 1:**
+	/// - Selected: {2}, combined range: [b, c]
+	/// - File 1 [a,b]: a <= c ✓ AND b >= b ✓ → overlaps (shares "b") → add
+	/// - File 3 [c,d]: c <= c ✓ AND d >= b ✓ → overlaps (shares "c") → add
+	/// - File 4 [e,f]: e <= c ✗ → no overlap → skip
+	/// - Selected: {1, 2, 3}
+	///
+	/// **Iteration 2:**
+	/// - Selected: {1, 2, 3}, combined range: [a, d]
+	/// - File 4 [e,f]: e <= d ✗ → no overlap → skip
+	/// - No new files added
+	///
+	/// **Result:** {1, 2, 3} - File 4 excluded due to clean gap between "d" and "e"
 	pub(crate) fn select_overlapping_ranges(
 		level: &Level,
 		initial_table_id: u64,
@@ -129,40 +151,31 @@ impl Strategy {
 		let mut selected_ids: HashSet<u64> = HashSet::new();
 		selected_ids.insert(initial_table_id);
 
+		// Keep expanding until no new files are added (fixed point)
 		loop {
 			let old_size = selected_ids.len();
 
-			// Get combined user key range of all selected tables
-			let (smallest_user_key, largest_user_key) =
-				match Self::get_user_key_range(level, &selected_ids) {
-					Some(range) => range,
-					None => break, // No bounds available
-				};
+			// Get combined key range of all currently selected tables
+			// This range may grow as we add more tables
+			let range = match Self::combined_key_range(
+				level.tables.iter().filter(|t| selected_ids.contains(&t.id)),
+			) {
+				Some(r) => r,
+				None => break, // No bounds available
+			};
 
-			// Find all tables that overlap this user key range
+			// Find all tables that overlap with the combined range
 			for table in &level.tables {
-				if selected_ids.contains(&table.id) {
-					continue;
-				}
-
-				// Check if table overlaps with the selected range (by user key)
-				if let (Some(t_smallest), Some(t_largest)) =
-					(table.meta.smallest_point.as_ref(), table.meta.largest_point.as_ref())
-				{
-					// Overlap check: table overlaps if its range intersects with selected range
-					// We check user_key only (not sequence) for clean cut
-					if t_smallest.user_key <= largest_user_key
-						&& t_largest.user_key >= smallest_user_key
-					{
-						selected_ids.insert(table.id);
-					}
+				if !selected_ids.contains(&table.id) && table.overlaps_with_range(&range) {
+					selected_ids.insert(table.id);
 				}
 			}
 
-			// No new files added, we have a clean cut
+			// No new files added
 			if selected_ids.len() == old_size {
 				break;
 			}
+			// Otherwise, loop again with the expanded range to catch transitive overlaps
 		}
 
 		Ok(selected_ids.into_iter().collect())
@@ -212,33 +225,7 @@ impl Strategy {
 		};
 
 		// Build InternalKeyRange from smallest_point/largest_point
-		let source_bounds: Option<InternalKeyRange> = source_tables
-			.iter()
-			.filter_map(|t| {
-				let smallest = t.meta.smallest_point.as_ref()?;
-				let largest = t.meta.largest_point.as_ref()?;
-				Some((smallest.clone(), largest.clone()))
-			})
-			.fold(None, |acc, (s, l)| {
-				use std::ops::Bound;
-				match acc {
-					None => Some((Bound::Included(s), Bound::Included(l))),
-					Some((Bound::Included(acc_s), Bound::Included(acc_l))) => {
-						let new_s = if s.user_key < acc_s.user_key {
-							s
-						} else {
-							acc_s
-						};
-						let new_l = if l.user_key > acc_l.user_key {
-							l
-						} else {
-							acc_l
-						};
-						Some((Bound::Included(new_s), Bound::Included(new_l)))
-					}
-					_ => acc,
-				}
-			});
+		let source_bounds = Self::combined_key_range(source_tables.iter().copied());
 
 		// Find overlapping tables from next level
 		if let Some(bounds) = source_bounds {
@@ -404,7 +391,7 @@ impl Strategy {
 		// L1+: score = level_bytes / max_bytes_for_level
 		for level in 1..=manifest.last_level_index() {
 			let bytes = Self::level_bytes(&levels[level as usize]);
-			let target = self.max_bytes_for_level(level);
+			let target = self.target_bytes_for_level(level);
 			if target > 0 {
 				let score = bytes as f64 / target as f64;
 				if score >= 1.0 {
