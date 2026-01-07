@@ -1031,8 +1031,10 @@ impl Core {
 		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
 
 		// Initialize background task manager
-		let task_manager =
-			Arc::new(TaskManager::new(Arc::clone(&inner) as Arc<dyn CompactionOperations>));
+		let task_manager = Arc::new(TaskManager::new(
+			Arc::clone(&inner) as Arc<dyn CompactionOperations>,
+			Arc::clone(&opts),
+		));
 
 		let commit_env =
 			Arc::new(LsmCommitEnv::new(Arc::clone(&inner), Arc::clone(&task_manager))?);
