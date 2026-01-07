@@ -1,6 +1,7 @@
+use std::sync::Arc;
+
 use super::LevelManifest;
 use crate::sstable::table::Table;
-use std::sync::Arc;
 
 /// Iterates through all levels
 pub(crate) struct LevelManifestIterator<'a> {

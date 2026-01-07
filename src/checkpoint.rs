@@ -66,7 +66,8 @@ impl CheckpointMetadata {
 		}
 	}
 
-	/// Checks if this metadata version is compatible with current implementation
+	/// Checks if this metadata version is compatible with current
+	/// implementation
 	pub fn is_compatible(&self) -> bool {
 		// For now, we only support version 1
 		self.version == CHECKPOINT_VERSION
@@ -265,8 +266,9 @@ impl DatabaseCheckpoint {
 
 	/// Flushes all memtables to ensure checkpoint consistency
 	fn flush_all_memtables(&self) -> Result<()> {
-		// Keep calling compact_memtable until all memtables (active + immutable) are flushed
-		// compact_memtable already handles the logic of checking if there's anything to flush
+		// Keep calling compact_memtable until all memtables (active + immutable) are
+		// flushed compact_memtable already handles the logic of checking if there's
+		// anything to flush
 		loop {
 			// Check if there are any memtables to flush
 			let has_active = {
@@ -363,7 +365,8 @@ impl DatabaseCheckpoint {
 		Ok(0)
 	}
 
-	/// Copies VLog-related directories to the checkpoint directory if VLog is enabled
+	/// Copies VLog-related directories to the checkpoint directory if VLog is
+	/// enabled
 	fn copy_vlog_directories(&self, dest_dir: &Path) -> Result<u64> {
 		if !self.core.opts.enable_vlog {
 			return Ok(0);
@@ -481,7 +484,8 @@ impl DatabaseCheckpoint {
 		CheckpointMetadata::from_bytes(&data)
 	}
 
-	/// Helper function to copy a directory recursively (synchronous version to avoid recursion issues)
+	/// Helper function to copy a directory recursively (synchronous version to
+	/// avoid recursion issues)
 	fn copy_directory_sync(source: &Path, dest: &Path) -> Result<u64> {
 		if !source.exists() {
 			return Ok(0);
@@ -558,8 +562,9 @@ impl DatabaseCheckpoint {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use test_log::test;
+
+	use super::*;
 
 	#[test]
 	fn test_checkpoint_metadata_serialization() {
@@ -603,7 +608,8 @@ mod tests {
 		let bytes = metadata.to_bytes().unwrap();
 
 		// Verify the binary format structure
-		// 4 bytes version + 8 bytes timestamp + 8 bytes seq + 8 bytes count + 8 bytes size = 36 bytes
+		// 4 bytes version + 8 bytes timestamp + 8 bytes seq + 8 bytes count + 8 bytes
+		// size = 36 bytes
 		assert_eq!(bytes.len(), 36);
 
 		// Check that version is at the beginning (big endian)

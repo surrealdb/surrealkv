@@ -1,11 +1,10 @@
-use crate::error::{Error, Result};
-
+use std::fs::File as SysFile;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 #[cfg(not(target_arch = "wasm32"))]
 use fs2::FileExt as LockFileExt;
 
-use std::fs::File as SysFile;
+use crate::error::{Error, Result};
 
 pub trait File: Send + Sync {
 	#[allow(unused)]

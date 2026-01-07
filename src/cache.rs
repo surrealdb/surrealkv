@@ -1,12 +1,12 @@
-use quick_cache::Weighter;
-use quick_cache::{sync::Cache as QCache, Equivalent};
+#[cfg(test)]
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
+use quick_cache::sync::Cache as QCache;
+use quick_cache::{Equivalent, Weighter};
+
 use crate::sstable::block::Block;
 use crate::Value;
-
-pub type CacheID = u64;
 
 /// Kind constants for differentiating cache entry types
 const KIND_DATA: u8 = 0;
@@ -62,7 +62,6 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
 
 pub(crate) struct BlockCache {
 	data: QCache<CacheKey, Item, BlockWeighter>,
-	id: AtomicU64,
 	// Cache statistics (only enabled in tests)
 	#[cfg(test)]
 	data_hits: AtomicU64,
@@ -82,7 +81,6 @@ impl BlockCache {
 	pub(crate) fn with_capacity_bytes(bytes: u64) -> Self {
 		Self {
 			data: QCache::with_weighter(10_000, bytes, BlockWeighter),
-			id: AtomicU64::new(0),
 			#[cfg(test)]
 			data_hits: AtomicU64::new(0),
 			#[cfg(test)]
@@ -128,7 +126,7 @@ impl BlockCache {
 		}
 
 		match item.as_ref()? {
-			Item::Data(block) => Some(block.clone()),
+			Item::Data(block) => Some(Arc::clone(block)),
 			_ => None,
 		}
 	}
@@ -148,7 +146,7 @@ impl BlockCache {
 		}
 
 		match item.as_ref()? {
-			Item::Index(block) => Some(block.clone()),
+			Item::Index(block) => Some(Arc::clone(block)),
 			_ => None,
 		}
 	}
@@ -171,11 +169,6 @@ impl BlockCache {
 			Item::VLog(value) => Some(value.clone()),
 			_ => None,
 		}
-	}
-
-	pub(crate) fn new_cache_id(&self) -> CacheID {
-		let id = self.id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-		id + 1
 	}
 
 	#[cfg(test)]

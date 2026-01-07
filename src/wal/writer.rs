@@ -3,8 +3,15 @@ use std::io;
 use crc32fast::Hasher;
 
 use super::{
-	BufferedFileWriter, CompressionType, Error, IOError, RecordType, Result, WritableFile,
-	BLOCK_SIZE, HEADER_SIZE,
+	BufferedFileWriter,
+	CompressionType,
+	Error,
+	IOError,
+	RecordType,
+	Result,
+	WritableFile,
+	BLOCK_SIZE,
+	HEADER_SIZE,
 };
 
 /// Writer for WAL records.
@@ -15,7 +22,8 @@ pub struct Writer {
 	/// Current offset within the current block (0 to BLOCK_SIZE).
 	block_offset: usize,
 
-	/// If true, writes are not automatically flushed. User must call write_buffer().
+	/// If true, writes are not automatically flushed. User must call
+	/// write_buffer().
 	manual_flush: bool,
 
 	/// The compression type to use for records.
@@ -57,8 +65,9 @@ impl Writer {
 
 	/// Adds a record to the WAL.
 	///
-	/// The record is automatically fragmented if it doesn't fit in the current block.
-	/// If manual_flush is false, the data is automatically flushed to disk.
+	/// The record is automatically fragmented if it doesn't fit in the current
+	/// block. If manual_flush is false, the data is automatically flushed to
+	/// disk.
 	///
 	/// # Parameters
 	/// - `slice`: The data to write.
@@ -213,8 +222,8 @@ impl Writer {
 
 		// Write header (7-byte format)
 		let mut header = Vec::with_capacity(HEADER_SIZE);
-		header.extend_from_slice(&crc.to_le_bytes());
-		header.extend_from_slice(&(length as u16).to_le_bytes());
+		header.extend_from_slice(&crc.to_be_bytes());
+		header.extend_from_slice(&(length as u16).to_be_bytes());
 		header.push(record_type as u8);
 
 		self.dest.append(&header)?;
@@ -228,9 +237,11 @@ impl Writer {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use std::fs::File;
+
 	use tempdir::TempDir;
+
+	use super::*;
 
 	#[test]
 	fn test_writer_basic() {

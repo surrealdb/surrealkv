@@ -6,6 +6,7 @@ mod clock;
 mod commit;
 mod compaction;
 mod comparator;
+mod compression;
 mod discard;
 mod error;
 mod iter;
@@ -26,31 +27,32 @@ mod write_controller;
 #[cfg(test)]
 mod test;
 
+use std::path::PathBuf;
+use std::sync::Arc;
+
+pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
+use sstable::bloom::LevelDBBloomFilter;
+
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-use crate::sstable::InternalKey;
 pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
-pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
-
-use bytes::Bytes;
-use sstable::{bloom::LevelDBBloomFilter, INTERNAL_KEY_SEQ_NUM_MAX};
-use std::{borrow::Cow, path::PathBuf, sync::Arc};
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {
 	/// Convert the key to a slice of bytes
 	fn as_slice(&self) -> &[u8];
 	/// Convert the key to an owned bytes slice
-	fn into_bytes(self) -> Bytes;
+	fn into_bytes(self) -> Value;
 }
 
 impl IntoBytes for &[u8] {
 	fn as_slice(&self) -> &[u8] {
 		self
 	}
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(self)
+
+	fn into_bytes(self) -> Value {
+		self.to_vec()
 	}
 }
 
@@ -58,8 +60,9 @@ impl<const N: usize> IntoBytes for &[u8; N] {
 	fn as_slice(&self) -> &[u8] {
 		&self[..]
 	}
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(&self[..])
+
+	fn into_bytes(self) -> Value {
+		self.to_vec()
 	}
 }
 
@@ -67,8 +70,9 @@ impl IntoBytes for Vec<u8> {
 	fn as_slice(&self) -> &[u8] {
 		self.as_slice()
 	}
-	fn into_bytes(self) -> Bytes {
-		Bytes::from(self)
+
+	fn into_bytes(self) -> Value {
+		self
 	}
 }
 
@@ -76,25 +80,8 @@ impl IntoBytes for &Vec<u8> {
 	fn as_slice(&self) -> &[u8] {
 		&self[..]
 	}
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(&self[..])
-	}
-}
 
-impl IntoBytes for Bytes {
-	fn as_slice(&self) -> &[u8] {
-		self.as_ref()
-	}
-	fn into_bytes(self) -> Bytes {
-		self
-	}
-}
-
-impl IntoBytes for &Bytes {
-	fn as_slice(&self) -> &[u8] {
-		self.as_ref()
-	}
-	fn into_bytes(self) -> Bytes {
+	fn into_bytes(self) -> Value {
 		self.clone()
 	}
 }
@@ -103,26 +90,9 @@ impl IntoBytes for &str {
 	fn as_slice(&self) -> &[u8] {
 		self.as_bytes()
 	}
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(self.as_bytes())
-	}
-}
 
-impl IntoBytes for String {
-	fn as_slice(&self) -> &[u8] {
-		self.as_bytes()
-	}
-	fn into_bytes(self) -> Bytes {
-		Bytes::from(self.into_bytes())
-	}
-}
-
-impl IntoBytes for &String {
-	fn as_slice(&self) -> &[u8] {
-		self.as_bytes()
-	}
-	fn into_bytes(self) -> Bytes {
-		Bytes::copy_from_slice(self.as_bytes())
+	fn into_bytes(self) -> Value {
+		self.as_bytes().to_vec()
 	}
 }
 
@@ -130,32 +100,22 @@ impl IntoBytes for Box<[u8]> {
 	fn as_slice(&self) -> &[u8] {
 		self.as_ref()
 	}
-	fn into_bytes(self) -> Bytes {
-		Bytes::from(self)
-	}
-}
 
-impl<'a> IntoBytes for Cow<'a, [u8]> {
-	fn as_slice(&self) -> &[u8] {
-		self.as_ref()
-	}
-	fn into_bytes(self) -> Bytes {
-		match self {
-			Cow::Borrowed(s) => Bytes::copy_from_slice(s),
-			Cow::Owned(v) => Bytes::from(v),
-		}
+	fn into_bytes(self) -> Value {
+		self.into_vec()
 	}
 }
 
 /// Type alias for iterator results containing key-value pairs
-/// Value is optional to support keys-only iteration without allocating empty values
+/// Value is optional to support keys-only iteration without allocating empty
+/// values
 pub type IterResult = Result<(Key, Option<Value>)>;
 
 /// The Key type used throughout the LSM tree
-pub type Key = Bytes;
+pub type Key = Vec<u8>;
 
 /// The Value type used throughout the LSM tree  
-pub type Value = Bytes;
+pub type Value = Vec<u8>;
 
 /// Type alias for version/timestamp values
 pub type Version = u64;
@@ -192,7 +152,8 @@ pub struct Options {
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
-	pub compression: CompressionType,
+	pub(crate) internal_comparator: Arc<InternalKeyComparator>,
+	pub compression_per_level: Vec<CompressionType>,
 	pub(crate) block_cache: Arc<cache::BlockCache>,
 	pub path: PathBuf,
 	pub level_count: u8,
@@ -204,8 +165,8 @@ pub struct Options {
 	pub vlog_checksum_verification: VLogChecksumLevel,
 	/// If true, disables `VLog` creation entirely
 	pub enable_vlog: bool,
-	/// Discard ratio threshold for triggering `VLog` garbage collection (0.0 - 1.0)
-	/// Default: 0.5 (50% discardable data triggers GC)
+	/// Discard ratio threshold for triggering `VLog` garbage collection (0.0 -
+	/// 1.0) Default: 0.5 (50% discardable data triggers GC)
 	pub vlog_gc_discard_ratio: f64,
 	/// If value size is less than this, it will be stored inline in `SSTable`
 	pub vlog_value_threshold: usize,
@@ -247,6 +208,17 @@ pub struct Options {
 	/// Initial delayed write rate in bytes/sec
 	/// Default: 32MB/s
 	pub delayed_write_rate: u64,
+	// Compaction configuration
+	/// Number of L0 files that trigger compaction
+	/// Default: 4
+	pub level0_max_files: usize,
+	/// Base size for level 1 in bytes
+	/// Default: 256MB
+	pub max_bytes_for_level: u64,
+	/// Multiplier for calculating max bytes for each level
+	/// Level N max bytes = base * multiplier^(N-1)
+	/// Default: 10.0
+	pub level_multiplier: f64,
 }
 
 impl Default for Options {
@@ -255,11 +227,15 @@ impl Default for Options {
 		// Initialize the logical clock
 		let clock = Arc::new(DefaultLogicalClock::new());
 
+		let comparator: Arc<dyn Comparator> = Arc::new(crate::BytewiseComparator {});
+		let internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&comparator)));
+
 		Self {
 			block_size: 64 * 1024, // 64KB
 			block_restart_interval: 16,
-			comparator: Arc::new(crate::BytewiseComparator {}),
-			compression: CompressionType::None,
+			comparator,
+			internal_comparator,
+			compression_per_level: Vec::new(),
 			filter_policy: Some(Arc::new(bf)),
 			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)), // 1MB cache
 			path: PathBuf::from(""),
@@ -280,6 +256,9 @@ impl Default for Options {
 			level0_slowdown_writes_trigger: 8,
 			level0_stop_writes_trigger: 12,
 			delayed_write_rate: 32 * 1024 * 1024, // 32MB/s
+			level0_max_files: 4,
+			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
+			level_multiplier: 10.0,
 		}
 	}
 }
@@ -305,12 +284,63 @@ impl Options {
 	}
 
 	pub fn with_comparator(mut self, value: Arc<dyn Comparator>) -> Self {
+		self.internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&value)));
 		self.comparator = value;
 		self
 	}
 
-	pub const fn with_compression(mut self, value: CompressionType) -> Self {
-		self.compression = value;
+	/// Disables compression for data blocks in SSTables.
+	///
+	/// This clears the compression_per_level vector, causing all levels
+	/// to default to CompressionType::None.
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::Options;
+	///
+	/// let opts = Options::new().without_compression();
+	/// ```
+	pub fn without_compression(mut self) -> Self {
+		self.compression_per_level = Vec::new();
+		self
+	}
+
+	/// Sets compression per level. Vector index corresponds to level number.
+	/// If vector is shorter than level count, last compression type is used for
+	/// higher levels. If vector is empty, global compression setting is used.
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::{Options, CompressionType};
+	///
+	/// let opts = Options::new()
+	///     .with_compression_per_level(vec![
+	///         CompressionType::None,        // L0: no compression
+	///         CompressionType::SnappyCompression, // L1+: Snappy compression
+	///     ]);
+	/// ```
+	pub fn with_compression_per_level(mut self, levels: Vec<CompressionType>) -> Self {
+		self.compression_per_level = levels;
+		self
+	}
+
+	/// Convenience method: no compression on L0, Snappy compression on other
+	/// levels. Equivalent to
+	/// `with_compression_per_level(vec![CompressionType::None,
+	/// CompressionType::SnappyCompression])`.
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::Options;
+	///
+	/// let opts = Options::new().with_l0_no_compression();
+	/// ```
+	pub fn with_l0_no_compression(mut self) -> Self {
+		self.compression_per_level =
+			vec![CompressionType::None, CompressionType::SnappyCompression];
 		self
 	}
 
@@ -329,7 +359,8 @@ impl Options {
 		self
 	}
 
-	/// Sets the unified block cache capacity (includes data blocks, index blocks, and VLog values)
+	/// Sets the unified block cache capacity (includes data blocks, index
+	/// blocks, and VLog values)
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
 		self.block_cache = Arc::new(cache::BlockCache::with_capacity_bytes(capacity_bytes));
 		self
@@ -368,7 +399,8 @@ impl Options {
 	}
 
 	/// Enables or disables versioned queries with timestamp tracking
-	/// When enabled, automatically configures VLog and value threshold for optimal versioned query support
+	/// When enabled, automatically configures VLog and value threshold for
+	/// optimal versioned query support
 	pub fn with_versioning(mut self, value: bool, retention_ns: u64) -> Self {
 		self.enable_versioning = value;
 		self.versioned_history_retention_ns = retention_ns;
@@ -383,9 +415,10 @@ impl Options {
 
 	/// Controls whether to flush the active memtable during database shutdown.
 	///
-	/// When enabled, ensures all in-memory data is persisted to SSTables before closing,
-	/// at the cost of slower shutdown. When disabled, allows faster shutdown but unpersisted
-	/// data in the active memtable will be lost if WAL is not enabled.
+	/// When enabled, ensures all in-memory data is persisted to SSTables before
+	/// closing, at the cost of slower shutdown. When disabled, allows faster
+	/// shutdown but unpersisted data in the active memtable will be lost if
+	/// WAL is not enabled.
 	///
 	/// # Arguments
 	///
@@ -399,7 +432,8 @@ impl Options {
 		self
 	}
 
-	/// Sets the WAL recovery mode to control behavior when corruption is detected.
+	/// Sets the WAL recovery mode to control behavior when corruption is
+	/// detected.
 	///
 	/// # Arguments
 	///
@@ -491,7 +525,8 @@ impl Options {
 	}
 
 	/// Validates the configuration options for consistency and correctness
-	/// This should be called when the store starts to catch configuration errors early
+	/// This should be called when the store starts to catch configuration
+	/// errors early
 	pub fn validate(&self) -> Result<()> {
 		// Validate VLog GC discard ratio
 		if !(0.0..=1.0).contains(&self.vlog_gc_discard_ratio) {
@@ -510,7 +545,8 @@ impl Options {
 				));
 			}
 
-			// Versioned queries don't work well with value threshold (values should go to VLog)
+			// Versioned queries don't work well with value threshold (values should go to
+			// VLog)
 			if self.vlog_value_threshold > 0 {
 				return Err(Error::InvalidArgument(
 					"Versioned queries require all values to be stored in VLog. Set vlog_value_threshold to 0.".to_string(),
@@ -542,12 +578,14 @@ impl CompressionType {
 	}
 }
 
-impl From<u8> for CompressionType {
-	fn from(byte: u8) -> Self {
+impl TryFrom<u8> for CompressionType {
+	type Error = Error;
+
+	fn try_from(byte: u8) -> Result<Self> {
 		match byte {
-			0 => Self::None,
-			1 => Self::SnappyCompression,
-			_ => panic!("Unknown compression type"),
+			0 => Ok(Self::None),
+			1 => Ok(Self::SnappyCompression),
+			_ => Err(Error::Compression(format!("Unknown compression type: {}", byte))),
 		}
 	}
 }
@@ -568,43 +606,50 @@ pub trait FilterPolicy: Send + Sync {
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
 }
 
-pub(crate) trait Iterator {
-	/// An iterator is either positioned at a key/value pair, or
-	/// not valid.  This method returns true iff the iterator is valid.
-	fn valid(&self) -> bool;
+use std::ops::Bound;
 
-	/// Position at the first key in the source.  The iterator is `Valid()`
-	/// after this call iff the source is not empty.
-	fn seek_to_first(&mut self);
+/// Type alias for InternalKey range bounds
+pub(crate) type InternalKeyRangeBound = Bound<sstable::InternalKey>;
+/// Type alias for InternalKey ranges
+pub(crate) type InternalKeyRange = (InternalKeyRangeBound, InternalKeyRangeBound);
 
-	/// Position at the last key in the source.  The iterator is
-	/// `Valid()` after this call iff the source is not empty.
-	fn seek_to_last(&mut self);
+/// Converts user key bounds to InternalKeyRange for efficient iteration.
+pub(crate) fn user_range_to_internal_range(
+	lower: Bound<&[u8]>,
+	upper: Bound<&[u8]>,
+) -> InternalKeyRange {
+	use sstable::{
+		InternalKey,
+		InternalKeyKind,
+		INTERNAL_KEY_SEQ_NUM_MAX,
+		INTERNAL_KEY_TIMESTAMP_MAX,
+	};
 
-	/// Position at the first key in the source that is at or past target.
-	/// The iterator is valid after this call iff the source contains
-	/// an entry that comes at or past target.
-	fn seek(&mut self, target: &[u8]) -> Option<()>;
+	let start_bound = match lower {
+		Bound::Unbounded => Bound::Unbounded,
+		Bound::Included(key) => Bound::Included(InternalKey::new(
+			key.into_bytes(),
+			INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Max,
+			INTERNAL_KEY_TIMESTAMP_MAX,
+		)),
+		Bound::Excluded(key) => {
+			Bound::Excluded(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
+		}
+	};
 
-	/// Moves to the next entry in the source.  After this call, the iterator is
-	/// valid iff the iterator was not positioned at the last entry in the source.
-	/// REQUIRES: `valid()`
-	fn advance(&mut self) -> bool;
+	let end_bound = match upper {
+		Bound::Unbounded => Bound::Unbounded,
+		Bound::Included(key) => {
+			Bound::Included(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
+		}
+		Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
+			key.into_bytes(),
+			INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Max,
+			INTERNAL_KEY_TIMESTAMP_MAX,
+		)),
+	};
 
-	/// Moves to the previous entry in the source.  After this call, the iterator
-	/// is valid iff the iterator was not positioned at the first entry in source.
-	/// REQUIRES: `valid()`
-	fn prev(&mut self) -> bool;
-
-	/// Return the key for the current entry.  The underlying storage for
-	/// the returned slice is valid only until the next modification of
-	/// the iterator.
-	/// REQUIRES: `valid()`
-	fn key(&self) -> Arc<InternalKey>;
-
-	/// Return the value for the current entry.  The underlying storage for
-	/// the returned slice is valid only until the next modification of
-	/// the iterator.
-	/// REQUIRES: `valid()`
-	fn value(&self) -> Value;
+	(start_bound, end_bound)
 }

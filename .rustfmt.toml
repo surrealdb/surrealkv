@@ -10,6 +10,8 @@ imports_layout = "HorizontalVertical"
 # configured level of granularity.
 imports_granularity = "Module"
 
+group_imports = "StdExternalCrate"
+
 # Merge multiple derives into a single one.
 merge_derives = true
 
@@ -35,3 +37,5 @@ use_small_heuristics = "Off"
 
 # Break comments to fit on the line.
 wrap_comments = true
+
+comment_width = 100

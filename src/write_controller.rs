@@ -289,11 +289,13 @@ impl WriteController {
 	}
 
 	/// Get total number of stops
+	#[cfg(test)]
 	pub fn get_total_stops(&self) -> u64 {
 		self.total_stops.load(Ordering::Relaxed)
 	}
 
 	/// Get total number of delays
+	#[cfg(test)]
 	pub fn get_total_delays(&self) -> u64 {
 		self.total_delays.load(Ordering::Relaxed)
 	}
@@ -341,10 +343,12 @@ impl Drop for DelayGuard {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
-	use parking_lot::Mutex;
 	use std::thread;
 	use std::time::Duration;
+
+	use parking_lot::Mutex;
+
+	use super::*;
 
 	#[test]
 	fn test_write_controller_basic() {
@@ -785,7 +789,8 @@ mod tests {
 		let condition = recalculate_write_stall_conditions(0, 0, 0, 0, 0, &controller, &mut guard);
 
 		// With max_write_buffer_number=0, even 0 immutable memtables triggers stop (0 >= 0)
-		// This matches RocksDB behavior - it's a degenerate config that shouldn't happen in practice
+		// This matches RocksDB behavior - it's a degenerate config that shouldn't happen in
+		// practice
 		assert_eq!(condition, WriteStallCondition::Stopped);
 		assert!(controller.is_stopped());
 	}

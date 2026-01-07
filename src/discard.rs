@@ -1,7 +1,5 @@
-use std::{
-	fs::{File, OpenOptions},
-	path::Path,
-};
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 
 use memmap2::{MmapMut, MmapOptions};
 use parking_lot::Mutex;
@@ -270,8 +268,8 @@ impl DiscardStats {
 		Ok(())
 	}
 
-	/// Returns all files with discard bytes, sorted by discard bytes (descending)
-	/// Returns a vector of (file_id, discard_bytes) tuples
+	/// Returns all files with discard bytes, sorted by discard bytes
+	/// (descending) Returns a vector of (file_id, discard_bytes) tuples
 	pub(crate) fn get_gc_candidates(&self) -> Vec<(u32, u64)> {
 		let next_empty_slot = *self.next_empty_slot.lock();
 
@@ -348,9 +346,10 @@ impl Drop for DiscardStats {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use tempfile::TempDir;
 	use test_log::test;
+
+	use super::*;
 
 	#[test]
 	fn test_discard_stats_basic() {

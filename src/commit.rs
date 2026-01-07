@@ -1,17 +1,13 @@
 // This commit pipeline is inspired by Pebble's commit pipeline.
 
-use std::sync::{
-	atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
-	Arc,
-};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, Semaphore};
 
-use crate::{
-	batch::Batch,
-	error::{Error, Result},
-};
+use crate::batch::Batch;
+use crate::error::{Error, Result};
 
 const MAX_CONCURRENT_COMMITS: usize = 8;
 const DEQUEUE_BITS: u32 = 32;
@@ -24,6 +20,9 @@ pub trait CommitEnv: Send + Sync + 'static {
 
 	// Apply processed batch to memtable
 	fn apply(&self, batch: &Batch) -> Result<()>;
+
+	// Check for background errors before committing
+	fn check_background_error(&self) -> Result<()>;
 }
 
 // Lock-free commit queue entry
@@ -131,7 +130,8 @@ impl CommitQueue {
 		self.head_tail.fetch_add(1 << DEQUEUE_BITS, Ordering::Release);
 	}
 
-	// Multi-consumer dequeue - removes the earliest enqueued Batch, if it is applied
+	// Multi-consumer dequeue - removes the earliest enqueued Batch, if it is
+	// applied
 	fn dequeue_applied(&self) -> Option<Arc<CommitBatch>> {
 		loop {
 			let ptrs = self.head_tail.load(Ordering::Acquire);
@@ -213,6 +213,9 @@ impl CommitPipeline {
 			return Err(Error::PipelineStall);
 		}
 
+		// Check for background errors before proceeding
+		self.env.check_background_error()?;
+
 		if batch.is_empty() {
 			return Ok(());
 		}
@@ -256,6 +259,9 @@ impl CommitPipeline {
 			return Err(Error::PipelineStall);
 		}
 
+		// Check for background errors before proceeding
+		self.env.check_background_error()?;
+
 		if batch.is_empty() {
 			return Ok(());
 		}
@@ -266,11 +272,11 @@ impl CommitPipeline {
 		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
 
 		// Phase 1: Assign sequence number and write to WAL (serialized)
-		let processed_batch = self.prepare(&mut batch, commit_batch.clone(), sync)?;
+		let processed_batch = self.prepare(&mut batch, Arc::clone(&commit_batch), sync)?;
 
 		// Phase 2: Apply to memtable (concurrent)
 		let apply_result = {
-			let env = self.env.clone();
+			let env = Arc::clone(&self.env);
 			env.apply(&processed_batch)
 		};
 
@@ -308,7 +314,7 @@ impl CommitPipeline {
 		batch.set_starting_seq_num(seq_num);
 
 		// Enqueue operation (single producer)
-		self.pending.enqueue(commit_batch.clone());
+		self.pending.enqueue(commit_batch);
 
 		// Write to WAL and process VLog (serialized under lock)
 		let processed_batch = self.env.write(batch, seq_num, sync)?;
@@ -376,11 +382,11 @@ impl Drop for CommitPipeline {
 #[cfg(test)]
 mod tests {
 	use std::time::Duration;
+
 	use test_log::test;
 
-	use crate::sstable::InternalKeyKind;
-
 	use super::*;
+	use crate::sstable::InternalKeyKind;
 
 	struct MockEnv;
 
@@ -391,8 +397,8 @@ mod tests {
 			for entry in batch.entries() {
 				new_batch.add_record(
 					entry.kind,
-					&entry.key,
-					entry.value.as_deref(),
+					entry.key.clone(),
+					entry.value.clone(),
 					entry.timestamp,
 				)?;
 			}
@@ -402,6 +408,10 @@ mod tests {
 		fn apply(&self, _batch: &Batch) -> Result<()> {
 			Ok(())
 		}
+
+		fn check_background_error(&self) -> Result<()> {
+			Ok(())
+		}
 	}
 
 	#[test(tokio::test)]
@@ -409,7 +419,9 @@ mod tests {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		let result = pipeline.commit(batch, false).await;
 		assert!(result.is_ok(), "Single commit failed: {result:?}");
@@ -433,8 +445,8 @@ mod tests {
 			batch
 				.add_record(
 					InternalKeyKind::Set,
-					&format!("key{i}").into_bytes(),
-					Some(&[1, 2, 3]),
+					format!("key{i}").into_bytes(),
+					Some(vec![1, 2, 3]),
 					i,
 				)
 				.unwrap();
@@ -453,14 +465,14 @@ mod tests {
 
 		let mut handles = vec![];
 		for i in 0..10 {
-			let pipeline = pipeline.clone();
+			let pipeline = Arc::clone(&pipeline);
 			let handle = tokio::spawn(async move {
 				let mut batch = Batch::new(0);
 				batch
 					.add_record(
 						InternalKeyKind::Set,
-						&format!("key{i}").into_bytes(),
-						Some(&[1, 2, 3]),
+						format!("key{i}").into_bytes(),
+						Some(vec![1, 2, 3]),
 						i,
 					)
 					.unwrap();
@@ -500,8 +512,8 @@ mod tests {
 			for entry in batch.entries() {
 				new_batch.add_record(
 					entry.kind,
-					&entry.key,
-					entry.value.as_deref(),
+					entry.key.clone(),
+					entry.value.clone(),
 					entry.timestamp,
 				)?;
 			}
@@ -515,6 +527,10 @@ mod tests {
 			}
 			Ok(())
 		}
+
+		fn check_background_error(&self) -> Result<()> {
+			Ok(())
+		}
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -523,14 +539,14 @@ mod tests {
 
 		let mut handles = vec![];
 		for i in 0..5 {
-			let pipeline = pipeline.clone();
+			let pipeline = Arc::clone(&pipeline);
 			let handle = tokio::spawn(async move {
 				let mut batch = Batch::new(0);
 				batch
 					.add_record(
 						InternalKeyKind::Set,
-						&format!("key{i}").into_bytes(),
-						Some(&[1, 2, 3]),
+						format!("key{i}").into_bytes(),
+						Some(vec![1, 2, 3]),
 						i,
 					)
 					.unwrap();
@@ -557,7 +573,9 @@ mod tests {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		let result = pipeline.sync_commit(batch, false);
 		assert!(result.is_ok(), "Sync commit failed: {result:?}");
@@ -578,8 +596,8 @@ mod tests {
 			batch
 				.add_record(
 					InternalKeyKind::Set,
-					&format!("key{i}").into_bytes(),
-					Some(&[1, 2, 3]),
+					format!("key{i}").into_bytes(),
+					Some(vec![1, 2, 3]),
 					i as u64,
 				)
 				.unwrap();
@@ -613,7 +631,9 @@ mod tests {
 		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		let result = pipeline.sync_commit(batch, true); // sync_wal = true
 		assert!(result.is_ok(), "Sync commit with sync_wal failed: {result:?}");
@@ -629,11 +649,17 @@ mod tests {
 		pipeline.set_seq_num(100);
 
 		let mut batch1 = Batch::new(0);
-		batch1.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch1
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		let mut batch2 = Batch::new(0);
-		batch2.add_record(InternalKeyKind::Set, b"key2", Some(b"value2"), 1).unwrap();
-		batch2.add_record(InternalKeyKind::Set, b"key3", Some(b"value3"), 2).unwrap();
+		batch2
+			.add_record(InternalKeyKind::Set, b"key2".to_vec(), Some(b"value2".to_vec()), 1)
+			.unwrap();
+		batch2
+			.add_record(InternalKeyKind::Set, b"key3".to_vec(), Some(b"value3".to_vec()), 2)
+			.unwrap();
 
 		// Commit first batch
 		pipeline.sync_commit(batch1, false).unwrap();
@@ -652,7 +678,9 @@ mod tests {
 		pipeline.shutdown();
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		let result = pipeline.sync_commit(batch, false);
 		assert!(result.is_err(), "Sync commit after shutdown should fail");
@@ -697,8 +725,8 @@ mod tests {
 			for entry in batch.entries() {
 				new_batch.add_record(
 					entry.kind,
-					&entry.key,
-					entry.value.as_deref(),
+					entry.key.clone(),
+					entry.value.clone(),
 					entry.timestamp,
 				)?;
 			}
@@ -709,15 +737,21 @@ mod tests {
 			self.apply_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 			Ok(())
 		}
+
+		fn check_background_error(&self) -> Result<()> {
+			Ok(())
+		}
 	}
 
 	#[test]
 	fn test_sync_commit_calls_write_and_apply() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline = CommitPipeline::new(env.clone());
+		let pipeline = CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>);
 
 		let mut batch = Batch::new(0);
-		batch.add_record(InternalKeyKind::Set, b"key1", Some(b"value1"), 0).unwrap();
+		batch
+			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
+			.unwrap();
 
 		// Verify initial state
 		assert_eq!(env.write_calls(), 0);
@@ -737,7 +771,7 @@ mod tests {
 	#[test]
 	fn test_sync_commit_multiple_batches_tracking() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline = CommitPipeline::new(env.clone());
+		let pipeline = CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>);
 
 		// Commit multiple batches
 		for i in 0..3 {
@@ -745,8 +779,8 @@ mod tests {
 			batch
 				.add_record(
 					InternalKeyKind::Set,
-					&format!("key{i}").into_bytes(),
-					Some(&[1, 2, 3]),
+					format!("key{i}").into_bytes(),
+					Some(vec![1, 2, 3]),
 					i as u64,
 				)
 				.unwrap();
@@ -764,7 +798,7 @@ mod tests {
 	#[test]
 	fn test_sync_commit_concurrent_access() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline_clone = CommitPipeline::new(env.clone());
+		let pipeline_clone = CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>);
 		let pipeline = Arc::new(pipeline_clone);
 
 		// Test concurrent access to sync_commit
@@ -773,8 +807,8 @@ mod tests {
 		let batches_per_thread = 5;
 
 		for thread_id in 0..num_threads {
-			let pipeline = pipeline.clone();
-			let _env = env.clone();
+			let pipeline = Arc::clone(&pipeline);
+			let _env = Arc::clone(&env);
 
 			let handle = std::thread::spawn(move || {
 				for batch_id in 0..batches_per_thread {
@@ -782,8 +816,8 @@ mod tests {
 					batch
 						.add_record(
 							InternalKeyKind::Set,
-							&format!("thread_{thread_id}_batch_{batch_id}").into_bytes(),
-							Some(&[thread_id as u8, batch_id as u8]),
+							format!("thread_{thread_id}_batch_{batch_id}").into_bytes(),
+							Some(vec![thread_id as u8, batch_id as u8]),
 							batch_id,
 						)
 						.unwrap();

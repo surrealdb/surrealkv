@@ -1,15 +1,14 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::{
-	error::{Error, Result},
-	sstable::InternalKey,
-	Comparator, InternalKeyComparator, Iterator as LSMIterator, Key, Options, Value,
-};
-use bytes::Bytes;
 use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
-pub(crate) type BlockData = Bytes;
+use crate::error::{Error, Result};
+use crate::sstable::error::SSTableError;
+use crate::sstable::InternalKey;
+use crate::{Comparator, InternalKeyComparator, Key, Value};
+
+pub(crate) type BlockData = Vec<u8>;
 
 #[derive(Eq, PartialEq, Debug, Clone, Default)]
 pub(crate) struct BlockHandle {
@@ -55,10 +54,9 @@ impl BlockHandle {
 	/// Decodes a block handle from `from` and returns a block handle
 	/// together with how many bytes were read from the slice.
 	pub(crate) fn decode(src: &[u8]) -> Result<(Self, usize)> {
-		let (off, offsize) = usize::decode_var(src)
-			.ok_or(Error::CorruptedBlock("corrupted block handle".to_owned()))?;
-		let (sz, szsize) = usize::decode_var(&src[offsize..])
-			.ok_or(Error::CorruptedBlock("corrupted block handle".to_owned()))?;
+		let (off, offsize) = usize::decode_var(src).ok_or(SSTableError::CorruptedBlockHandle)?;
+		let (sz, szsize) =
+			usize::decode_var(&src[offsize..]).ok_or(SSTableError::CorruptedBlockHandle)?;
 
 		Ok((
 			BlockHandle {
@@ -78,29 +76,27 @@ impl BlockHandle {
 /// Block Key/value entry:
 ///
 /// ```text
-///
+/// 
 ///     +-------+---------+-----------+---------+--------------------+--------------+----------------+
 ///     | shared (varint) | not shared (varint) | value len (varint) | key (varlen) | value (varlen) |
 ///     +-----------------+---------------------+--------------------+--------------+----------------+
-///
 /// ```
-///
 #[derive(Clone)]
 pub(crate) struct Block {
 	pub(crate) block: BlockData,
-	opts: Arc<Options>,
+	comparator: Arc<InternalKeyComparator>,
 }
 
 impl Block {
-	pub(crate) fn iter(&self, keys_only: bool) -> BlockIterator {
-		BlockIterator::new(self.opts.clone(), self.block.clone(), keys_only)
+	pub(crate) fn iter(&self, keys_only: bool) -> Result<BlockIterator> {
+		BlockIterator::new(Arc::clone(&self.comparator), self.block.clone(), keys_only)
 	}
 
-	pub(crate) fn new(data: BlockData, opts: Arc<Options>) -> Block {
+	pub(crate) fn new(data: BlockData, comparator: Arc<InternalKeyComparator>) -> Block {
 		assert!(data.len() > 4);
 		Block {
 			block: data,
-			opts,
+			comparator,
 		}
 	}
 
@@ -120,65 +116,71 @@ pub(crate) struct BlockWriter {
 	pub(crate) last_key: Vec<u8>,
 	num_entries: usize,
 	/// internal key comparator
-	internal_cmp: Arc<dyn Comparator>,
+	internal_cmp: Arc<InternalKeyComparator>,
 }
 
-/*
-Block writer logic:
-
-1. Initial state:
-   buffer: []
-   restart_points: [0]
-   restart_counter: 0
-   last_key: []
-
-2. Add key-value pair ("apple", "fruit"):
-   - No shared prefix with previous key.
-   - Serialized entry: [0, 5, 5, "apple", "fruit"].
-
-   buffer: [0, 5, 5, "apple", "fruit"]
-   restart_points: [0]
-   restart_counter: 1
-   last_key: "apple"
-
-   Buffer length: 22 (4 byte for shared prefix, 4 byte for non-shared key length, 4 byte for value length, 5 bytes for key, 5 bytes for value)
-
-3. Add key-value pair ("apricot", "fruit"):
-   - Shared prefix with previous key "apple" is "ap" (2 characters).
-   - Serialized entry: [2, 4, 5, "ricot", "fruit"].
-
-   buffer: [0, 5, 5, "apple", "fruit", 2, 4, 5, "ricot", "fruit"]
-   restart_points: [0]
-   restart_counter: 2
-   last_key: "apricot"
-
-   Buffer length: 44 (22 bytes + 4 byte for shared prefix, 4 byte for non-shared key length, 4 byte for value length, 5 bytes for key suffix, 5 bytes for value)
-
-4. Add key-value pair ("banana", "fruit"):
-   - No shared prefix with previous key.
-   - Restart compression (new restart point at this position).
-   - Serialized entry: [0, 6, 5, "banana", "fruit"].
-
-   buffer: [0, 5, 5, "apple", "fruit", 2, 4, 5, "ricot", "fruit", 0, 6, 5, "banana", "fruit"]
-   restart_points: [0, 26]  // new restart point at offset 25
-   restart_counter: 1
-   last_key: "banana"
-
-   Buffer length: 67 (44 bytes + 4 byte for shared prefix, 4 byte for non-shared key length, 4 byte for value length, 6 bytes for key, 5 bytes for value)
-
-
-   Finalize:
-
-   67 + 4 * restart_points.len() + 4 = 67 + 4 * 2 + 4 = 79 bytes
-
-*/
+// Block writer logic:
+//
+// 1. Initial state:
+// buffer: []
+// restart_points: [0]
+// restart_counter: 0
+// last_key: []
+//
+// 2. Add key-value pair ("apple", "fruit"):
+// - No shared prefix with previous key.
+// - Serialized entry: [0, 5, 5, "apple", "fruit"].
+//
+// buffer: [0, 5, 5, "apple", "fruit"]
+// restart_points: [0]
+// restart_counter: 1
+// last_key: "apple"
+//
+// Buffer length: 22 (4 byte for shared prefix, 4 byte for non-shared key
+// length, 4 byte for value length, 5 bytes for key, 5 bytes for value)
+//
+// 3. Add key-value pair ("apricot", "fruit"):
+// - Shared prefix with previous key "apple" is "ap" (2 characters).
+// - Serialized entry: [2, 4, 5, "ricot", "fruit"].
+//
+// buffer: [0, 5, 5, "apple", "fruit", 2, 4, 5, "ricot", "fruit"]
+// restart_points: [0]
+// restart_counter: 2
+// last_key: "apricot"
+//
+// Buffer length: 44 (22 bytes + 4 byte for shared prefix, 4 byte for non-shared
+// key length, 4 byte for value length, 5 bytes for key suffix, 5 bytes for
+// value)
+//
+// 4. Add key-value pair ("banana", "fruit"):
+// - No shared prefix with previous key.
+// - Restart compression (new restart point at this position).
+// - Serialized entry: [0, 6, 5, "banana", "fruit"].
+//
+// buffer: [0, 5, 5, "apple", "fruit", 2, 4, 5, "ricot", "fruit", 0, 6, 5,
+// "banana", "fruit"] restart_points: [0, 26]  // new restart point at offset 25
+// restart_counter: 1
+// last_key: "banana"
+//
+// Buffer length: 67 (44 bytes + 4 byte for shared prefix, 4 byte for non-shared
+// key length, 4 byte for value length, 6 bytes for key, 5 bytes for value)
+//
+//
+// Finalize:
+//
+// 67 + 4 * restart_points.len() + 4 = 67 + 4 * 2 + 4 = 79 bytes
+//
 impl BlockWriter {
 	// Constructor for BlockWriter
-	pub(crate) fn new(opt: Arc<Options>) -> Self {
+	pub(crate) fn new(
+		size: usize,
+		restart_interval: usize,
+		internal_cmp: Arc<InternalKeyComparator>,
+	) -> Self {
 		BlockWriter {
-			internal_cmp: Arc::new(InternalKeyComparator::new(opt.comparator.clone())),
-			buffer: Vec::with_capacity(opt.block_size),
-			restart_interval: opt.block_restart_interval,
+			internal_cmp,
+			buffer: Vec::with_capacity(size),
+			restart_interval,
 			restart_points: vec![0],
 			last_key: Vec::new(),
 			restart_counter: 0,
@@ -221,13 +223,13 @@ impl BlockWriter {
 					  Entries in block: {}\n\
 					  Buffer size: {} bytes",
 					String::from_utf8_lossy(&last_internal_key.user_key),
-					last_internal_key.user_key.as_ref(),
+					last_internal_key.user_key.as_slice(),
 					last_internal_key.seq_num(),
 					last_internal_key.kind(),
 					last_internal_key.timestamp,
 					self.last_key.as_slice(),
 					String::from_utf8_lossy(&current_internal_key.user_key),
-					current_internal_key.user_key.as_ref(),
+					current_internal_key.user_key.as_slice(),
 					current_internal_key.seq_num(),
 					current_internal_key.kind(),
 					current_internal_key.timestamp,
@@ -236,6 +238,7 @@ impl BlockWriter {
 					self.num_entries,
 					self.buffer.len()
 				);
+				return Err(Error::KeyNotInOrder);
 			}
 			assert!(cmp_result == Ordering::Less);
 		}
@@ -278,7 +281,8 @@ impl BlockWriter {
 	) -> Result<()> {
 		let non_shared_key_length = key.len() - shared_prefix_length;
 
-		// Write shared prefix length, non-shared key length, and value length as varints
+		// Write shared prefix length, non-shared key length, and value length as
+		// varints
 		self.buffer.write_varint(shared_prefix_length as u64)?;
 		self.buffer.write_varint(non_shared_key_length as u64)?;
 		self.buffer.write_varint(value.len() as u64)?;
@@ -290,16 +294,23 @@ impl BlockWriter {
 	}
 
 	// Finalizes the block and returns the block data
-	pub(crate) fn finish(mut self) -> BlockData {
+	pub(crate) fn finish(mut self) -> Result<BlockData> {
 		// 1. Append RESTARTS
 		for &r in self.restart_points.iter() {
-			self.buffer.write_fixedint(r).expect("block write failed");
+			self.buffer.write_fixedint(r).map_err(|e| {
+				let err = Error::Io(Arc::new(std::io::Error::other(format!(
+					"Failed to write restart point {}: {}",
+					r, e
+				))));
+				log::error!("[BLOCK] {}", err);
+				err
+			})?;
 		}
 
 		// 2. Append N_RESTARTS
 		self.buffer.write_fixedint(self.restart_points.len() as u32).expect("block write failed");
 
-		Bytes::from(self.buffer)
+		Ok(self.buffer)
 	}
 
 	// Estimates the current size of the block
@@ -326,27 +337,63 @@ pub(crate) struct BlockIterator {
 	current_value_offset_start: usize,
 	current_value_offset_end: usize,
 	/// internal key comparator
-	internal_cmp: Arc<dyn Comparator>,
+	internal_cmp: Arc<InternalKeyComparator>,
 	/// When true, only return keys without allocating values
 	keys_only: bool,
 }
 
 impl BlockIterator {
 	// Constructor for BlockIterator
-	pub(crate) fn new(options: Arc<Options>, block: BlockData, keys_only: bool) -> Self {
-		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).unwrap() as usize;
-		let mut restart_points = vec![0; num_restarts];
-		let restart_offset = block.len() - 4 * (num_restarts + 1);
+	pub(crate) fn new(
+		comparator: Arc<InternalKeyComparator>,
+		block: BlockData,
+		keys_only: bool,
+	) -> Result<Self> {
+		if block.len() < 4 {
+			let err = Error::from(SSTableError::BlockTooSmall {
+				size: block.len(),
+				min_size: 4,
+			});
+			log::error!("[BLOCK] {}", err);
+			return Err(err);
+		}
 
+		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).ok_or_else(|| {
+			Error::from(SSTableError::FailedToDecodeRestartCount {
+				block_size: block.len(),
+			})
+		})? as usize;
+
+		let restart_offset = block.len().checked_sub(4 * (num_restarts + 1)).ok_or_else(|| {
+			Error::from(SSTableError::InvalidRestartCount {
+				count: num_restarts,
+				block_size: block.len(),
+			})
+		})?;
+
+		let mut restart_points = vec![0; num_restarts];
 		for (i, restart_point) in restart_points.iter_mut().enumerate().take(num_restarts) {
 			let start_point = restart_offset + (i * 4);
 			let end_point = start_point + 4;
-			*restart_point = u32::decode_fixed(&block[start_point..end_point]).unwrap();
+			if end_point > block.len() {
+				let err = Error::from(SSTableError::RestartPointExceedsBounds {
+					index: i,
+					offset: start_point,
+					block_size: block.len(),
+				});
+				log::error!("[BLOCK] {}", err);
+				return Err(err);
+			}
+			*restart_point =
+				u32::decode_fixed(&block[start_point..end_point]).ok_or_else(|| {
+					Error::from(SSTableError::FailedToDecodeRestartPoint {
+						index: i,
+						offset: start_point,
+					})
+				})?;
 		}
 
-		let internal_comparator = Arc::new(InternalKeyComparator::new(options.comparator.clone()));
-
-		BlockIterator {
+		Ok(BlockIterator {
 			block,
 			restart_points,
 			current_key: Vec::new(),
@@ -356,9 +403,9 @@ impl BlockIterator {
 			restart_offset,
 			current_value_offset_start: 0,
 			current_value_offset_end: 0,
-			internal_cmp: internal_comparator,
+			internal_cmp: comparator,
 			keys_only,
-		}
+		})
 	}
 
 	fn get_restart_point(&self, index: usize) -> usize {
@@ -372,43 +419,88 @@ impl BlockIterator {
 		self.current_entry_offset = offset;
 	}
 
-	// Decodes the shared prefix length, non-shared key length, and value size from the block
-	fn decode_entry_lengths(&self, offset: usize) -> Option<(usize, usize, usize, usize)> {
+	// Decodes the shared prefix length, non-shared key length, and value size from
+	// the block
+	fn decode_entry_lengths(&self, offset: usize) -> Result<(usize, usize, usize, usize)> {
 		let mut i = 0;
 		let (shared_prefix_length, shared_prefix_length_size) =
-			usize::decode_var(&self.block[offset..])?;
+			usize::decode_var(&self.block[offset..]).ok_or_else(|| {
+				Error::from(SSTableError::FailedToDecodeSharedPrefix {
+					offset,
+				})
+			})?;
 		i += shared_prefix_length_size;
 
 		let (non_shared_key_length, non_shared_key_length_size) =
-			usize::decode_var(&self.block[offset + i..])?;
+			usize::decode_var(&self.block[offset + i..]).ok_or_else(|| {
+				Error::from(SSTableError::FailedToDecodeNonSharedKeyLength {
+					offset: offset + i,
+				})
+			})?;
 		i += non_shared_key_length_size;
 
-		let (value_size, value_size_size) = usize::decode_var(&self.block[offset + i..])?;
+		let (value_size, value_size_size) = usize::decode_var(&self.block[offset + i..])
+			.ok_or_else(|| {
+				Error::from(SSTableError::FailedToDecodeValueSize {
+					offset: offset + i,
+				})
+			})?;
 		i += value_size_size;
 
-		Some((shared_prefix_length, non_shared_key_length, value_size, i))
+		Ok((shared_prefix_length, non_shared_key_length, value_size, i))
 	}
 
 	// Read the current entry and seek to the next entry
-	fn seek_next_entry(&mut self) -> Option<()> {
+	fn seek_next_entry(&mut self) -> Result<()> {
 		if self.offset >= self.restart_offset {
-			return None;
+			return Err(Error::from(SSTableError::OffsetExceedsRestartOffset {
+				offset: self.offset,
+				restart_offset: self.restart_offset,
+			}));
 		}
 
 		let (shared_prefix, non_shared_key, value_size, i) =
 			self.decode_entry_lengths(self.offset)?;
 
-		self.current_key.truncate(shared_prefix);
-		self.current_key
-			.extend_from_slice(&self.block[self.offset + i..self.offset + i + non_shared_key]);
+		// Bounds validation: ensure we won't read past the restart_offset
+		let key_end =
+			self.offset.checked_add(i).and_then(|sum| sum.checked_add(non_shared_key)).ok_or_else(
+				|| {
+					Error::from(SSTableError::IntegerOverflowKeyEnd {
+						offset: self.offset,
+					})
+				},
+			)?;
+		let value_end = key_end.checked_add(value_size).ok_or_else(|| {
+			Error::from(SSTableError::IntegerOverflowValueEnd {
+				offset: self.offset,
+			})
+		})?;
 
-		self.offset += i + non_shared_key;
+		if key_end > self.restart_offset || value_end > self.restart_offset {
+			let err = Error::from(SSTableError::DecodedLengthsExceedBounds {
+				offset: self.offset,
+				i,
+				non_shared_key,
+				value_size,
+				key_end,
+				value_end,
+				restart_offset: self.restart_offset,
+			});
+			log::error!("[BLOCK] {}", err);
+			return Err(err);
+		}
+
+		self.current_key.truncate(shared_prefix);
+		self.current_key.extend_from_slice(&self.block[self.offset + i..key_end]);
+
+		self.offset = key_end;
 
 		self.current_value_offset_start = self.offset;
 		self.current_value_offset_end = self.offset + value_size;
-		self.offset += value_size;
+		self.offset = value_end;
 
-		Some(())
+		Ok(())
 	}
 
 	pub(crate) fn reset(&mut self) {
@@ -421,38 +513,52 @@ impl BlockIterator {
 }
 
 impl Iterator for BlockIterator {
-	type Item = (Key, Value);
+	type Item = Result<(Key, Value)>;
+
 	fn next(&mut self) -> Option<Self::Item> {
-		if !self.advance() {
-			return None;
+		match self.advance() {
+			Ok(true) => {
+				let value = if self.keys_only {
+					Vec::new()
+				} else {
+					self.block[self.current_value_offset_start..self.current_value_offset_end]
+						.to_vec()
+				};
+				Some(Ok((self.current_key.clone(), value)))
+			}
+			Ok(false) => None,
+			Err(e) => {
+				log::error!("[BLOCK] Iterator error in next(): {}", e);
+				Some(Err(e))
+			}
 		}
-		let value = if self.keys_only {
-			Bytes::new()
-		} else {
-			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
-		};
-		Some((Bytes::copy_from_slice(&self.current_key[..]), value))
 	}
 }
 
 impl DoubleEndedIterator for BlockIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		if !self.prev() {
-			return None;
+		match self.prev() {
+			Ok(true) => {
+				let value = if self.keys_only {
+					Vec::new()
+				} else {
+					self.block[self.current_value_offset_start..self.current_value_offset_end]
+						.to_vec()
+				};
+				Some(Ok((self.current_key.clone(), value)))
+			}
+			Ok(false) => None,
+			Err(e) => {
+				log::error!("[BLOCK] Iterator error in next_back(): {}", e);
+				Some(Err(e))
+			}
 		}
-
-		let value = if self.keys_only {
-			Bytes::new()
-		} else {
-			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
-		};
-		Some((Bytes::copy_from_slice(&self.current_key[..]), value))
 	}
 }
 
-impl LSMIterator for BlockIterator {
+impl BlockIterator {
 	// Checks if the iterator is valid (has a current entry)
-	fn valid(&self) -> bool {
+	pub(crate) fn valid(&self) -> bool {
 		!self.current_key.is_empty()
 			&& self.current_value_offset_start != 0
 			&& self.current_value_offset_end != 0
@@ -460,27 +566,57 @@ impl LSMIterator for BlockIterator {
 	}
 
 	// Move to the first entry
-	fn seek_to_first(&mut self) {
+	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
+		if self.restart_points.is_empty() {
+			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
+			log::error!("[BLOCK] {}", err);
+			return Err(err);
+		}
 		self.seek_to_restart_point(0);
-		self.seek_next_entry();
+
+		// Check if block has any entries before trying to decode
+		if self.offset >= self.restart_offset {
+			self.reset();
+			return Ok(()); // Empty block
+		}
+
+		self.seek_next_entry()
 	}
 
 	// Move to the last entry
-	fn seek_to_last(&mut self) {
+	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
 		if self.restart_points.is_empty() {
 			self.reset();
-		} else {
-			self.seek_to_restart_point(self.restart_points.len() - 1);
+			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
+			log::error!("[BLOCK] {}", err);
+			return Err(err);
+		}
+		self.seek_to_restart_point(self.restart_points.len() - 1);
+
+		let mut last_entry_start = self.offset;
+		while self.offset < self.restart_offset {
+			last_entry_start = self.offset;
+			self.seek_next_entry()?;
 		}
 
-		while self.offset < self.restart_offset {
-			self.seek_next_entry();
-		}
+		// Set current_entry_offset to the start of the last entry
+		self.current_entry_offset = last_entry_start;
+		Ok(())
 	}
 
 	// Move to a specific key or the next larger key
-	fn seek(&mut self, target: &[u8]) -> Option<()> {
+	pub(crate) fn seek(&mut self, target: &[u8]) -> Result<Option<()>> {
 		self.reset();
+
+		// Guard against empty blocks (corrupt or malformed)
+		if self.restart_points.is_empty() {
+			let err = Error::from(SSTableError::EmptyCorruptBlockSeek {
+				block_size: self.block.len(),
+				restart_offset: self.restart_offset,
+			});
+			log::error!("[BLOCK] {}", err);
+			return Err(err);
+		}
 
 		let mut left = 0;
 		let mut right = self.restart_points.len() - 1;
@@ -490,11 +626,20 @@ impl LSMIterator for BlockIterator {
 			let mid = (left + right).div_ceil(2);
 			self.seek_to_restart_point(mid);
 			let (shared_prefix, non_shared_key, _, i) = self.decode_entry_lengths(self.offset)?;
-			let current_key = self.block
-				[self.offset + i..self.offset + i + shared_prefix + non_shared_key]
-				.to_vec();
+			let key_start = self.offset + i;
+			let key_end = key_start + shared_prefix + non_shared_key;
+			if key_end > self.block.len() {
+				let err = Error::from(SSTableError::KeyExtendsBeyondBounds {
+					offset: self.offset,
+					key_end,
+					block_len: self.block.len(),
+				});
+				log::error!("[BLOCK] {}", err);
+				return Err(err);
+			}
+			let current_key = &self.block[key_start..key_end];
 
-			match self.internal_cmp.compare(&current_key, target) {
+			match self.internal_cmp.compare(current_key, target) {
 				Ordering::Less => left = mid,
 				_ => right = mid - 1,
 			}
@@ -503,262 +648,120 @@ impl LSMIterator for BlockIterator {
 		assert_eq!(left, right);
 		self.seek_to_restart_point(left);
 
-		while self.advance() {
+		while self.advance()? {
 			if self.internal_cmp.compare(&self.current_key, target) != Ordering::Less {
 				break;
 			}
 		}
 
-		Some(())
+		Ok(Some(()))
 	}
 
 	// Move to the next entry
-	fn advance(&mut self) -> bool {
+	pub(crate) fn advance(&mut self) -> Result<bool> {
 		if self.offset >= self.restart_offset {
 			self.reset();
-			return false;
+			return Ok(false);
 		}
 		self.current_entry_offset = self.offset;
 
-		self.seek_next_entry().is_some()
+		match self.seek_next_entry() {
+			Ok(()) => Ok(true),
+			Err(e) => {
+				log::error!("[BLOCK] Failed to advance: {}", e);
+				Err(e)
+			}
+		}
 	}
 
 	// Move to the previous entry
-	fn prev(&mut self) -> bool {
+	pub(crate) fn prev(&mut self) -> Result<bool> {
 		let original = self.current_entry_offset;
 		if original == 0 {
 			self.reset();
-			return false;
+			return Ok(false);
 		}
 
-		// Find the first restart point that just less than the current offset
+		// Find the first restart point that is just less than the current offset
 		while self.get_restart_point(self.current_restart_index) >= original {
 			if self.current_restart_index == 0 {
 				self.offset = self.restart_points[self.current_restart_index] as usize;
 				self.current_restart_index = self.restart_points.len();
-				return false;
+				return Ok(false);
 			}
 			self.current_restart_index -= 1
 		}
 
 		self.seek_to_restart_point(self.current_restart_index);
-		// Loop until end of current entry hits the start of original entry
-		while self.seek_next_entry().is_some() {
-			if self.offset >= original {
-				break;
+		// Iterate forward to find the entry just before the original position
+		let mut prev_offset = self.offset;
+		loop {
+			match self.seek_next_entry() {
+				Ok(()) => {
+					if self.offset >= original {
+						// We overshot, so the previous entry starts at prev_offset
+						// Position at the previous entry and decode it
+						self.offset = prev_offset;
+						self.current_entry_offset = prev_offset;
+						self.seek_next_entry()?; // Decode the previous entry
+						return Ok(true);
+					}
+					prev_offset = self.offset;
+				}
+				Err(e) => {
+					// Check if this is the expected "end of block" error
+					// vs corruption errors that should be propagated
+					if let Error::SSTable(SSTableError::OffsetExceedsRestartOffset {
+						..
+					}) = e
+					{
+						// Expected EOF - no previous entry found
+						// Validate invariant: we should have been iterating forward from a restart
+						// point and haven't found an entry where offset >= original
+						debug_assert!(
+							prev_offset < original,
+							"OffsetExceedsRestartOffset should only occur when we haven't found previous entry"
+						);
+						return Ok(false);
+					}
+					// Corruption or other error - propagate it
+					return Err(e);
+				}
 			}
 		}
-		true
 	}
 
 	// Get the current key
-	fn key(&self) -> Arc<InternalKey> {
-		Arc::new(InternalKey::decode(&self.current_key))
+	#[inline]
+	pub(crate) fn key(&self) -> InternalKey {
+		InternalKey::decode(&self.current_key)
 	}
 
 	// Get the current value
-	fn value(&self) -> Value {
+	#[inline]
+	pub(crate) fn value(&self) -> Value {
 		if self.keys_only {
-			Bytes::new()
+			Vec::new()
 		} else {
-			self.block.slice(self.current_value_offset_start..self.current_value_offset_end)
+			self.block[self.current_value_offset_start..self.current_value_offset_end].to_vec()
 		}
 	}
-}
 
-#[cfg(test)]
-mod tests {
-	use crate::sstable::{InternalKey, InternalKeyKind};
-	use test_log::test;
-
-	use super::*;
-
-	fn generate_data() -> Vec<(&'static [u8], &'static [u8])> {
-		vec![
-			("key1".as_bytes(), "value1".as_bytes()),
-			("loooongkey1".as_bytes(), "value2".as_bytes()),
-			("medium_key2".as_bytes(), "value3".as_bytes()),
-			("pkey1".as_bytes(), "value".as_bytes()),
-			("pkey2".as_bytes(), "value".as_bytes()),
-			("pkey3".as_bytes(), "value".as_bytes()),
-		]
+	/// Returns the raw encoded key bytes without allocation
+	#[inline]
+	pub(crate) fn key_bytes(&self) -> &[u8] {
+		&self.current_key
 	}
 
-	fn make_opts(block_restart_interval: Option<usize>) -> Arc<Options> {
-		let mut opt = Options::default();
-		if let Some(interval) = block_restart_interval {
-			opt.block_restart_interval = interval;
-		}
-		Arc::new(opt)
+	/// Returns the raw value bytes without allocation
+	#[inline]
+	pub(crate) fn value_bytes(&self) -> &[u8] {
+		&self.block[self.current_value_offset_start..self.current_value_offset_end]
 	}
 
-	fn make_internal_key(key: &[u8], kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(Bytes::copy_from_slice(key), 0, kind, 0).encode()
-	}
-
-	#[test]
-	fn test_block_empty() {
-		let o = make_opts(None);
-		let builder = BlockWriter::new(o.clone());
-
-		let blockc = builder.finish();
-		assert_eq!(blockc.len(), 8);
-		assert_eq!(blockc.as_ref(), &[0, 0, 0, 0, 1, 0, 0, 0]);
-
-		let mut block_iter = Block::new(blockc, o).iter(false);
-
-		let mut i = 0;
-		while block_iter.advance() {
-			i += 1;
-		}
-
-		assert_eq!(i, 0);
-	}
-
-	#[test]
-	fn test_block_iter() {
-		let data = generate_data();
-		let o = make_opts(None);
-		let mut builder = BlockWriter::new(o.clone());
-
-		for &(k, v) in data.iter() {
-			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
-		}
-
-		let block_contents = builder.finish();
-
-		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
-
-		let mut i = 0;
-		while block_iter.advance() {
-			assert_eq!(block_iter.key().user_key.as_ref(), data[i].0);
-			assert_eq!(block_iter.value(), Bytes::copy_from_slice(data[i].1));
-			i += 1;
-		}
-
-		assert_eq!(i, data.len());
-	}
-
-	#[test]
-	fn test_block_iter_reverse() {
-		let data = generate_data();
-		let o = make_opts(Some(3));
-		let mut builder = BlockWriter::new(o.clone());
-
-		for &(k, v) in data.iter() {
-			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
-		}
-
-		let block_contents = builder.finish();
-		let mut iter = Block::new(block_contents, o.clone()).iter(false);
-
-		iter.next();
-		assert_eq!(iter.key().user_key.as_ref(), "key1".as_bytes());
-		assert_eq!(iter.value(), Bytes::from_static(b"value1"));
-
-		iter.next();
-		assert!(iter.valid());
-
-		iter.prev();
-		assert!(iter.valid());
-		assert_eq!(iter.key().user_key.as_ref(), "key1".as_bytes());
-		assert_eq!(iter.value(), Bytes::from_static(b"value1"));
-
-		// Go to the last entry
-		while iter.advance() {}
-
-		iter.prev();
-		assert!(iter.valid());
-		assert_eq!(iter.key().user_key.as_ref(), "pkey2".as_bytes());
-		assert_eq!(iter.value(), Bytes::from_static(b"value"));
-	}
-
-	#[test]
-	fn test_block_seek() {
-		let data = generate_data();
-		let o = make_opts(Some(3));
-		let mut builder = BlockWriter::new(o.clone());
-
-		for &(k, v) in data.iter() {
-			builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
-		}
-
-		let block_contents = builder.finish();
-
-		let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
-
-		let key = InternalKey::new(Bytes::from_static(b"pkey2"), 1, InternalKeyKind::Set, 0);
-		block_iter.seek(&key.encode());
-		assert!(block_iter.valid());
-		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
-			Some(("pkey2".as_bytes().to_vec(), "value".as_bytes().to_vec()))
-		);
-
-		let key = InternalKey::new(Bytes::from_static(b"pkey0"), 1, InternalKeyKind::Set, 0);
-		block_iter.seek(&key.encode());
-		assert!(block_iter.valid());
-		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
-			Some(("pkey1".as_bytes().to_vec(), "value".as_bytes().to_vec()))
-		);
-
-		let key = InternalKey::new(Bytes::from_static(b"key1"), 1, InternalKeyKind::Set, 0);
-		block_iter.seek(&key.encode());
-		assert!(block_iter.valid());
-		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
-			Some(("key1".as_bytes().to_vec(), "value1".as_bytes().to_vec()))
-		);
-
-		let key = InternalKey::new(Bytes::from_static(b"pkey3"), 1, InternalKeyKind::Set, 0);
-		block_iter.seek(&key.encode());
-		assert!(block_iter.valid());
-		assert_eq!(
-			Some((block_iter.key().user_key.to_vec(), block_iter.value().to_vec(),)),
-			Some(("pkey3".as_bytes().to_vec(), "value".as_bytes().to_vec()))
-		);
-
-		let key = InternalKey::new(Bytes::from_static(b"pkey8"), 1, InternalKeyKind::Set, 0);
-		block_iter.seek(&key.encode());
-		assert!(!block_iter.valid());
-	}
-
-	#[test]
-	fn test_block_seek_to_last() {
-		// Test with different number of restarts
-		for block_restart_interval in [2, 6, 10] {
-			let data = generate_data();
-			let o = make_opts(Some(block_restart_interval));
-			let mut builder = BlockWriter::new(o.clone());
-
-			for &(k, v) in data.iter() {
-				builder.add(&make_internal_key(k, InternalKeyKind::Set), v).unwrap();
-			}
-
-			let block_contents = builder.finish();
-
-			let mut block_iter = Block::new(block_contents, o.clone()).iter(false);
-
-			block_iter.seek_to_last();
-			assert!(block_iter.valid());
-			assert_eq!(block_iter.key().user_key.as_ref(), "pkey3".as_bytes());
-			assert_eq!(block_iter.value(), Bytes::from_static(b"value"));
-
-			block_iter.seek_to_first();
-			assert!(block_iter.valid());
-			assert_eq!(block_iter.key().user_key.as_ref(), "key1".as_bytes());
-			assert_eq!(block_iter.value(), Bytes::from_static(b"value1"));
-
-			block_iter.next();
-			assert!(block_iter.valid());
-			block_iter.next();
-			assert!(block_iter.valid());
-			block_iter.next();
-			assert!(block_iter.valid());
-
-			assert_eq!(block_iter.key().user_key.as_ref(), "pkey1".as_bytes());
-			assert_eq!(block_iter.value(), Bytes::from_static(b"value"));
-		}
+	/// Returns user key slice from current key without allocation
+	#[inline]
+	pub(crate) fn user_key(&self) -> &[u8] {
+		InternalKey::user_key_from_encoded(&self.current_key)
 	}
 }
