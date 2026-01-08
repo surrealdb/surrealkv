@@ -36,7 +36,14 @@ use sstable::bloom::LevelDBBloomFilter;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
+pub use crate::transaction::{
+	CommitOptions,
+	Durability,
+	Mode,
+	ReadOptions,
+	Transaction,
+	WriteOptions,
+};
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {
@@ -193,19 +200,31 @@ pub struct Options {
 	pub wal_recovery_mode: WalRecoveryMode,
 
 	// Write stall configuration
-	/// Maximum number of immutable memtables before stopping writes
+	/// Maximum number of immutable memtables before stopping writes.
+	/// When this limit is reached, writes are blocked until memtables
+	/// are flushed to disk. A value of 2 provides a balance between
+	/// memory usage and write throughput.
 	/// Default: 2
 	pub max_write_buffer_number: usize,
 
-	/// L0 file count that triggers write slowdown
+	/// L0 file count that triggers write slowdown.
+	/// When L0 files reach this count, writes are rate-limited to give
+	/// compaction time to reduce file count. Higher values allow more
+	/// write bursts but may delay read performance.
 	/// Default: 8
 	pub level0_slowdown_writes_trigger: usize,
 
-	/// L0 file count that stops writes completely
+	/// L0 file count that stops writes completely.
+	/// When L0 files exceed this count, all writes are blocked until
+	/// compaction reduces file count below this threshold.
 	/// Default: 12
 	pub level0_stop_writes_trigger: usize,
 
-	/// Initial delayed write rate in bytes/sec
+	/// Initial delayed write rate in bytes/sec.
+	/// When write slowdown is triggered, writes are throttled to this
+	/// rate initially, then adaptively adjusted based on compaction
+	/// progress. 32MB/s provides reasonable throughput while allowing
+	/// compaction to catch up.
 	/// Default: 32MB/s
 	pub delayed_write_rate: u64,
 	// Compaction configuration

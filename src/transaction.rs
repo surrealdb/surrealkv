@@ -61,27 +61,11 @@ pub enum Durability {
 /// Options for write operations in transactions.
 /// This struct allows configuring various parameters for write operations
 /// like set() and delete().
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct WriteOptions {
-	/// Durability level for the write operation
-	pub durability: Durability,
 	/// Optional timestamp for the write operation. If None, uses the current
 	/// timestamp.
 	pub timestamp: Option<u64>,
-	/// If true, return error instead of blocking when write stall occurs.
-	/// Allows applications to handle backpressure themselves.
-	/// Default: false
-	pub no_slowdown: bool,
-}
-
-impl Default for WriteOptions {
-	fn default() -> Self {
-		Self {
-			durability: Durability::Eventual,
-			timestamp: None,
-			no_slowdown: false,
-		}
-	}
 }
 
 impl WriteOptions {
@@ -90,15 +74,43 @@ impl WriteOptions {
 		Self::default()
 	}
 
-	/// Sets the durability level for write operations
-	pub fn with_durability(mut self, durability: Durability) -> Self {
-		self.durability = durability;
-		self
-	}
-
 	/// Sets the timestamp for write operations
 	pub fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
 		self.timestamp = timestamp;
+		self
+	}
+}
+
+/// Options for commit operations.
+/// Allows configuring commit-time behavior like durability and backpressure.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CommitOptions {
+	/// Durability level for the commit.
+	/// If None, uses the transaction's default durability.
+	/// Default: None (use transaction default)
+	pub durability: Option<Durability>,
+
+	/// If true, return error instead of blocking when write stall occurs.
+	/// Allows applications to handle backpressure themselves.
+	/// Default: false
+	pub no_slowdown: bool,
+}
+
+impl CommitOptions {
+	/// Creates a new CommitOptions with default values
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Sets the durability level for this commit
+	pub fn with_durability(mut self, durability: Durability) -> Self {
+		self.durability = Some(durability);
+		self
+	}
+
+	/// Sets no_slowdown option
+	pub fn with_no_slowdown(mut self, no_slowdown: bool) -> Self {
+		self.no_slowdown = no_slowdown;
 		self
 	}
 }
@@ -280,7 +292,7 @@ impl Transaction {
 		} else {
 			Entry::new(key, Some(value), InternalKeyKind::Set, self.savepoints, write_seqno)
 		};
-		self.write_with_options(entry, options)?;
+		self.write_entry(entry)?;
 		Ok(())
 	}
 
@@ -311,7 +323,7 @@ impl Transaction {
 		} else {
 			Entry::new(key, None::<&[u8]>, InternalKeyKind::Delete, self.savepoints, write_seqno)
 		};
-		self.write_with_options(entry, options)?;
+		self.write_entry(entry)?;
 		Ok(())
 	}
 
@@ -357,7 +369,7 @@ impl Transaction {
 				write_seqno,
 			)
 		};
-		self.write_with_options(entry, options)?;
+		self.write_entry(entry)?;
 		Ok(())
 	}
 
@@ -395,7 +407,7 @@ impl Transaction {
 		} else {
 			Entry::new(key, Some(value), InternalKeyKind::Replace, self.savepoints, write_seqno)
 		};
-		self.write_with_options(entry, options)?;
+		self.write_entry(entry)?;
 		Ok(())
 	}
 
@@ -813,9 +825,8 @@ impl Transaction {
 		}
 	}
 
-	/// Writes a value for a key with custom write options. None is used for
-	/// deletion.
-	fn write_with_options(&mut self, e: Entry, options: &WriteOptions) -> Result<()> {
+	/// Writes an entry to the transaction's write set.
+	fn write_entry(&mut self, e: Entry) -> Result<()> {
 		// If the transaction mode is not mutable (i.e., it's read-only), return an
 		// error.
 		if !self.mode.mutable() {
@@ -829,8 +840,6 @@ impl Transaction {
 		if e.key.is_empty() {
 			return Err(Error::EmptyKey);
 		}
-
-		self.durability = options.durability;
 
 		// Add the entry to the write set
 		let key = e.key.clone();
@@ -863,7 +872,26 @@ impl Transaction {
 	}
 
 	/// Commits the transaction, by writing all pending entries to the store.
+	/// Uses default commit options (blocks on write stall).
 	pub async fn commit(&mut self) -> Result<()> {
+		self.commit_with_options(&CommitOptions::default()).await
+	}
+
+	/// Commits the transaction with custom options.
+	///
+	/// # Arguments
+	/// * `options` - Commit options controlling behavior like backpressure handling
+	///
+	/// # Example
+	/// ```ignore
+	/// // Fail fast instead of blocking on write stall
+	/// let options = CommitOptions::new().with_no_slowdown(true);
+	/// match txn.commit_with_options(&options).await {
+	///     Err(Error::WriteStall(_)) => { /* handle backpressure */ }
+	///     result => result?
+	/// }
+	/// ```
+	pub async fn commit_with_options(&mut self, options: &CommitOptions) -> Result<()> {
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -894,8 +922,7 @@ impl Transaction {
 			.sum();
 
 		// Preprocess: check stall conditions and apply backpressure
-		// Always wait for stall to clear in commit (no_slowdown=false)
-		self.core.preprocess_write(estimated_write_size, false).await?;
+		self.core.preprocess_write(estimated_write_size, options.no_slowdown).await?;
 
 		// Prepare for commit - uses the new Oracle method
 		let _ = self.core.oracle.prepare_commit(self)?;
@@ -928,7 +955,9 @@ impl Transaction {
 		}
 
 		// Write the batch to storage
-		let should_sync = self.durability == Durability::Immediate;
+		// Use commit options durability if specified, otherwise use transaction default
+		let durability = options.durability.unwrap_or(self.durability);
+		let should_sync = durability == Durability::Immediate;
 		self.core.commit(batch, should_sync).await?;
 
 		// Mark the transaction as closed

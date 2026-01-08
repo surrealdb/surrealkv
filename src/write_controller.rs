@@ -4,16 +4,27 @@
 //! when dropped, similar to Mutex/RwLock guards in Rust's standard library.
 
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+use parking_lot::Mutex;
+use tokio::sync::Notify;
 
 /// Constants for rate limiting
 const MICROS_PER_SECOND: u64 = 1_000_000;
 const MICROS_PER_REFILL: u64 = 1_000; // 1ms
 
-/// Rate adjustment ratios (verified from RocksDB)
-pub const INC_SLOWDOWN_RATIO: f64 = 0.8; // Slow by 20%
-pub const NEAR_STOP_SLOWDOWN_RATIO: f64 = 0.6; // Aggressive slow by 40%
+/// Slowdown ratio during delayed writes.
+/// Each cycle reduces write rate by 25%, allowing approximately 4 adjustment
+/// cycles before hitting minimum rate. This provides gradual backpressure
+/// while giving compaction time to catch up.
+pub const INC_SLOWDOWN_RATIO: f64 = 0.75;
+
+/// Aggressive slowdown ratio after recovering from a complete stop.
+/// Reduces write rate by 50% to prevent immediately re-triggering stop
+/// conditions. More aggressive than normal slowdown since the system
+/// was just under severe pressure.
+pub const NEAR_STOP_SLOWDOWN_RATIO: f64 = 0.5;
 
 /// Write stall condition
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +92,9 @@ pub fn recalculate_write_stall_conditions(
 	// Update guard based on condition
 	match (condition, cause) {
 		(WriteStallCondition::Stopped, WriteStallCause::MemtableLimit) => {
-			**guard_holder = Some(WriteStallGuard::Stop(write_controller.acquire_stop_guard()));
+			**guard_holder = Some(WriteStallGuard::Stop {
+				_guard: write_controller.acquire_stop_guard(),
+			});
 			log::warn!(
 				"Stopping writes: {} immutable memtables (max: {})",
 				num_immutable_memtables,
@@ -89,7 +102,9 @@ pub fn recalculate_write_stall_conditions(
 			);
 		}
 		(WriteStallCondition::Stopped, WriteStallCause::L0FileCountLimit) => {
-			**guard_holder = Some(WriteStallGuard::Stop(write_controller.acquire_stop_guard()));
+			**guard_holder = Some(WriteStallGuard::Stop {
+				_guard: write_controller.acquire_stop_guard(),
+			});
 			log::warn!(
 				"Stopping writes: {} L0 files (max: {})",
 				num_l0_files,
@@ -98,8 +113,9 @@ pub fn recalculate_write_stall_conditions(
 		}
 		(WriteStallCondition::Delayed, _cause) => {
 			let write_rate = calculate_delayed_write_rate(write_controller, was_stopped);
-			**guard_holder =
-				Some(WriteStallGuard::Delay(write_controller.acquire_delay_guard(write_rate)));
+			**guard_holder = Some(WriteStallGuard::Delay {
+				_guard: write_controller.acquire_delay_guard(write_rate),
+			});
 			log::warn!("Delaying writes at {} bytes/sec", write_rate);
 		}
 		(WriteStallCondition::Stopped, WriteStallCause::None) => {
@@ -154,6 +170,8 @@ pub struct WriteController {
 	delayed_write_rate: AtomicU64,
 	max_delayed_write_rate: AtomicU64,
 	credit_state: Mutex<CreditState>,
+	/// Notifies waiting writers when stall conditions clear
+	stall_cleared: Notify,
 	// Statistics
 	total_stops: AtomicU64,
 	total_delays: AtomicU64,
@@ -169,6 +187,7 @@ impl WriteController {
 			delayed_write_rate: AtomicU64::new(delayed_write_rate),
 			max_delayed_write_rate: AtomicU64::new(max_delayed_write_rate),
 			credit_state: Mutex::new(CreditState::new()),
+			stall_cleared: Notify::new(),
 			total_stops: AtomicU64::new(0),
 			total_delays: AtomicU64::new(0),
 			total_delay_micros: AtomicU64::new(0),
@@ -188,7 +207,7 @@ impl WriteController {
 	pub fn acquire_delay_guard(self: &Arc<Self>, write_rate: u64) -> DelayGuard {
 		if self.total_delayed.fetch_add(1, Ordering::Relaxed) == 0 {
 			// Starting delay, reset counters
-			let mut state = self.credit_state.lock().unwrap();
+			let mut state = self.credit_state.lock();
 			state.next_refill_time = 0;
 			state.credit_in_bytes = 0;
 		}
@@ -210,8 +229,8 @@ impl WriteController {
 		self.total_delayed.load(Ordering::Relaxed) > 0
 	}
 
-	/// Calculate delay in microseconds for given number of bytes
-	/// Credit-based rate limiter algorithm adapted from RocksDB
+	/// Calculate delay in microseconds for given number of bytes.
+	/// Uses a credit-based rate limiter algorithm with token bucket semantics.
 	pub fn calculate_delay(&self, num_bytes: u64) -> u64 {
 		if self.total_stopped.load(Ordering::Relaxed) > 0 {
 			return 0;
@@ -220,7 +239,7 @@ impl WriteController {
 			return 0;
 		}
 
-		let mut state = self.credit_state.lock().unwrap();
+		let mut state = self.credit_state.lock();
 
 		// Check if we have enough credits
 		if state.credit_in_bytes >= num_bytes {
@@ -305,18 +324,36 @@ impl WriteController {
 	}
 
 	fn release_stop(&self) {
-		self.total_stopped.fetch_sub(1, Ordering::Relaxed);
+		let prev = self.total_stopped.fetch_sub(1, Ordering::Relaxed);
+		// Notify waiters when transitioning out of stopped state
+		if prev == 1 {
+			self.stall_cleared.notify_waiters();
+		}
 	}
 
 	fn release_delay(&self) {
-		self.total_delayed.fetch_sub(1, Ordering::Relaxed);
+		let prev = self.total_delayed.fetch_sub(1, Ordering::Relaxed);
+		// Notify waiters when transitioning out of delayed state
+		if prev == 1 {
+			self.stall_cleared.notify_waiters();
+		}
+	}
+
+	/// Returns a future that completes when stall conditions clear.
+	/// Use with a timeout for fallback behavior.
+	pub fn notified(&self) -> tokio::sync::futures::Notified<'_> {
+		self.stall_cleared.notified()
 	}
 }
 
 /// RAII guard for write stall conditions (released when dropped)
 pub enum WriteStallGuard {
-	Stop(StopGuard),
-	Delay(DelayGuard),
+	Stop {
+		_guard: StopGuard,
+	},
+	Delay {
+		_guard: DelayGuard,
+	},
 }
 
 /// Guard that stops all writes until dropped
@@ -449,9 +486,9 @@ mod tests {
 		let controller = Arc::new(WriteController::new(1_000_000, 1_000_000));
 		let _guard = controller.acquire_delay_guard(1_000_000);
 
-		// When already delayed, should slow down by 20%
+		// When already delayed, should slow down by 25%
 		let rate = calculate_delayed_write_rate(&controller, false);
-		assert_eq!(rate, 800_000); // 1MB * 0.8
+		assert_eq!(rate, 750_000); // 1MB * 0.75
 	}
 
 	#[test]
@@ -459,11 +496,11 @@ mod tests {
 		let controller = Arc::new(WriteController::new(20_000, 20_000));
 		let _guard = controller.acquire_delay_guard(20_000);
 
-		// Even with 20% slowdown (would be 16KB), enforce minimum
+		// Even with 25% slowdown (would be 15KB), enforce minimum
 		let rate = calculate_delayed_write_rate(&controller, false);
 		assert_eq!(rate, 16 * 1024); // MIN_WRITE_RATE
 
-		// Aggressive slowdown would go below minimum
+		// Aggressive 50% slowdown would go below minimum
 		let rate_after_stop = calculate_delayed_write_rate(&controller, true);
 		assert_eq!(rate_after_stop, 16 * 1024); // MIN_WRITE_RATE
 	}
@@ -475,19 +512,19 @@ mod tests {
 		// Simulate cascading slowdown
 		let _guard = controller.acquire_delay_guard(10_000_000);
 
-		// First slowdown: 10MB * 0.8 = 8MB
+		// First slowdown: 10MB * 0.75 = 7.5MB
 		let rate1 = calculate_delayed_write_rate(&controller, false);
-		assert_eq!(rate1, 8_000_000);
+		assert_eq!(rate1, 7_500_000);
 
 		// Update rate and check again
 		controller.set_delayed_write_rate(rate1);
 		let rate2 = calculate_delayed_write_rate(&controller, false);
-		assert_eq!(rate2, 6_400_000); // 8MB * 0.8
+		assert_eq!(rate2, 5_625_000); // 7.5MB * 0.75
 
-		// Third slowdown: 6.4MB * 0.8 = 5.12MB
+		// Third slowdown: 5.625MB * 0.75 = 4.21875MB
 		controller.set_delayed_write_rate(rate2);
 		let rate3 = calculate_delayed_write_rate(&controller, false);
-		assert_eq!(rate3, 5_120_000);
+		assert_eq!(rate3, 4_218_750);
 	}
 
 	#[test]
@@ -775,8 +812,8 @@ mod tests {
 			let mut guard = guard_holder.lock();
 			recalculate_write_stall_conditions(4, 0, 5, 8, 12, &controller, &mut guard);
 
-			// Should apply aggressive slowdown: 10MB * 0.6 = 6MB
-			assert_eq!(controller.delayed_write_rate(), 6_000_000);
+			// Should apply aggressive slowdown: 10MB * 0.5 = 5MB
+			assert_eq!(controller.delayed_write_rate(), 5_000_000);
 		}
 	}
 
@@ -789,8 +826,7 @@ mod tests {
 		let condition = recalculate_write_stall_conditions(0, 0, 0, 0, 0, &controller, &mut guard);
 
 		// With max_write_buffer_number=0, even 0 immutable memtables triggers stop (0 >= 0)
-		// This matches RocksDB behavior - it's a degenerate config that shouldn't happen in
-		// practice
+		// This is a degenerate config that shouldn't happen in practice
 		assert_eq!(condition, WriteStallCondition::Stopped);
 		assert!(controller.is_stopped());
 	}

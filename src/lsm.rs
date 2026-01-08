@@ -228,9 +228,18 @@ impl CoreInner {
 				));
 			}
 
-			// Block until compaction catches up
+			// Block until compaction catches up using notification-based waiting.
+			// Uses tokio::select! with a timeout fallback to handle edge cases
+			// where notification might be missed.
 			while self.write_controller.is_stopped() {
-				tokio::time::sleep(Duration::from_millis(100)).await;
+				tokio::select! {
+					_ = self.write_controller.notified() => {
+						// Stall condition may have cleared - re-check in loop
+					}
+					_ = tokio::time::sleep(Duration::from_secs(1)) => {
+						// Timeout fallback - re-check condition
+					}
+				}
 
 				// Check for shutdown
 				if self.shutting_down.load(std::sync::atomic::Ordering::Acquire) {
@@ -398,6 +407,26 @@ impl CoreInner {
 		// Track the WAL number that contains this memtable's data
 		// (the old WAL before rotation)
 		immutable_memtables.add(table_id, flushed_wal_number, Arc::clone(&flushed_memtable));
+
+		// Check stall conditions IMMEDIATELY after adding immutable memtable.
+		// This applies backpressure before the slow flush I/O, preventing
+		// additional writes from stacking up while we flush.
+		let num_immutable = immutable_memtables.len();
+		let manifest = self.level_manifest.read()?;
+		let num_l0_files = manifest.levels.get_levels()[0].tables.len();
+		drop(manifest);
+
+		let mut guard_holder = self.write_stall_guard.lock();
+		crate::write_controller::recalculate_write_stall_conditions(
+			num_immutable,
+			num_l0_files,
+			self.opts.max_write_buffer_number,
+			self.opts.level0_slowdown_writes_trigger,
+			self.opts.level0_stop_writes_trigger,
+			&self.write_controller,
+			&mut guard_holder,
+		);
+		drop(guard_holder);
 
 		// Now we can release locks - the memtable is safely in immutable_memtables
 		// and no other thread can race us on this specific data
