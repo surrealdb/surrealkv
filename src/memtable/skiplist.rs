@@ -30,7 +30,7 @@ use std::sync::Arc;
 use rand::Rng;
 
 use crate::comparator::{Comparator, InternalKeyComparator};
-use crate::memtable::arena::ConcurrentArena;
+use crate::memtable::arena::Arena;
 use crate::sstable::InternalKeyKind;
 
 // ============================================================================
@@ -208,11 +208,11 @@ impl Splice {
 unsafe impl Send for Splice {}
 
 // ============================================================================
-// InlineSkipList
+// SkipList
 // ============================================================================
 
-pub struct InlineSkipList<C: SkipListComparator> {
-	arena: Arc<ConcurrentArena>,
+pub struct SkipList<C: SkipListComparator> {
+	arena: Arc<Arena>,
 	head: *mut Node,
 	max_height: AtomicI32,
 	comparator: C,
@@ -220,16 +220,11 @@ pub struct InlineSkipList<C: SkipListComparator> {
 	k_scaled_inverse_branching: u32,
 }
 
-unsafe impl<C: SkipListComparator> Send for InlineSkipList<C> {}
-unsafe impl<C: SkipListComparator> Sync for InlineSkipList<C> {}
+unsafe impl<C: SkipListComparator> Send for SkipList<C> {}
+unsafe impl<C: SkipListComparator> Sync for SkipList<C> {}
 
-impl<C: SkipListComparator> InlineSkipList<C> {
-	pub fn new(
-		comparator: C,
-		arena: Arc<ConcurrentArena>,
-		max_height: i32,
-		branching: u16,
-	) -> Self {
+impl<C: SkipListComparator> SkipList<C> {
+	pub fn new(comparator: C, arena: Arc<Arena>, max_height: i32, branching: u16) -> Self {
 		let max_height = max_height.max(1) as u16;
 		let k_scaled_inverse_branching = u32::MAX / branching as u32;
 
@@ -716,7 +711,7 @@ impl<C: SkipListComparator> InlineSkipList<C> {
 // ============================================================================
 
 pub struct SkipListIterator<'a, C: SkipListComparator> {
-	list: &'a InlineSkipList<C>,
+	list: &'a SkipList<C>,
 	node: *const Node,
 }
 

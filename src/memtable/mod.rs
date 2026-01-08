@@ -6,12 +6,12 @@ use std::sync::Arc;
 mod arena;
 mod skiplist;
 
-use arena::{ConcurrentArena, K_MIN_BLOCK_SIZE};
+use arena::Arena;
 use skiplist::{
 	encode_entry,
 	encoded_entry_size,
-	InlineSkipList,
 	MemTableKeyComparator,
+	SkipList,
 	SkipListIterator,
 };
 
@@ -68,7 +68,7 @@ impl ImmutableMemtables {
 }
 
 pub(crate) struct MemTable {
-	skiplist: InlineSkipList<MemTableKeyComparator>,
+	skiplist: SkipList<MemTableKeyComparator>,
 	latest_seq_num: AtomicU64,
 	map_size: AtomicU32,
 	/// WAL number that was current when this memtable started receiving writes.
@@ -83,13 +83,12 @@ impl Default for MemTable {
 }
 
 impl MemTable {
-	#[allow(unused)]
 	pub(crate) fn new() -> Self {
 		let comparator =
 			Arc::new(InternalKeyComparator::new(Arc::new(crate::BytewiseComparator {})));
-		let arena = Arc::new(ConcurrentArena::new(K_MIN_BLOCK_SIZE));
+		let arena = Arc::new(Arena::new(1024 * 1024 * 1024));
 		let mem_cmp = MemTableKeyComparator::new(Arc::clone(&comparator));
-		let skiplist = InlineSkipList::new(mem_cmp, arena, 12, 4);
+		let skiplist = SkipList::new(mem_cmp, arena, 12, 4);
 		MemTable {
 			skiplist,
 			latest_seq_num: AtomicU64::new(0),
@@ -307,7 +306,7 @@ pub(crate) struct MemTableRangeInternalIterator<'a> {
 
 impl<'a> MemTableRangeInternalIterator<'a> {
 	pub(crate) fn new(
-		skiplist: &'a InlineSkipList<MemTableKeyComparator>,
+		skiplist: &'a SkipList<MemTableKeyComparator>,
 		range: InternalKeyRange,
 		keys_only: bool,
 	) -> Self {
