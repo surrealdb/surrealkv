@@ -1,10 +1,22 @@
 use std::fs::File as SysFile;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crossbeam_skiplist::SkipMap;
+mod arena;
+mod skiplist;
+
+use arena::{ConcurrentArena, K_MIN_BLOCK_SIZE};
+use skiplist::{
+	encode_entry,
+	encoded_entry_size,
+	InlineSkipList,
+	MemTableKeyComparator,
+	SkipListIterator,
+};
 
 use crate::batch::Batch;
+use crate::comparator::InternalKeyComparator;
 use crate::error::Result;
 use crate::iter::CompactionIterator;
 use crate::sstable::table::{Table, TableWriter};
@@ -56,7 +68,7 @@ impl ImmutableMemtables {
 }
 
 pub(crate) struct MemTable {
-	map: SkipMap<InternalKey, Value>,
+	skiplist: InlineSkipList<MemTableKeyComparator>,
 	latest_seq_num: AtomicU64,
 	map_size: AtomicU32,
 	/// WAL number that was current when this memtable started receiving writes.
@@ -73,8 +85,13 @@ impl Default for MemTable {
 impl MemTable {
 	#[allow(unused)]
 	pub(crate) fn new() -> Self {
+		let comparator =
+			Arc::new(InternalKeyComparator::new(Arc::new(crate::BytewiseComparator {})));
+		let arena = Arc::new(ConcurrentArena::new(K_MIN_BLOCK_SIZE));
+		let mem_cmp = MemTableKeyComparator::new(Arc::clone(&comparator));
+		let skiplist = InlineSkipList::new(mem_cmp, arena, 12, 4);
 		MemTable {
-			map: SkipMap::new(),
+			skiplist,
 			latest_seq_num: AtomicU64::new(0),
 			map_size: AtomicU32::new(0),
 			wal_number: AtomicU64::new(0),
@@ -96,19 +113,29 @@ impl MemTable {
 
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
 		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
-		let range = InternalKey::new(
-			key.to_vec(),
-			seq_no,
-			InternalKeyKind::Set, // This field is not checked in the comparator
-			0,                    // This field is not checked in the comparator
-		)..;
+		// Create search key: user_key + trailer + timestamp
+		let search_key = InternalKey::new(key.to_vec(), seq_no, InternalKeyKind::Set, 0);
+		let search_key_bytes = search_key.encode();
 
-		let mut iter = self.map.range(range).take_while(|entry| &entry.key().user_key[..] == key);
-		iter.next().map(|entry| (entry.key().clone(), entry.value().clone()))
+		// Pass internal key directly - seek() will add the length prefix internally
+		let mut iter = self.skiplist.iter();
+		iter.seek(&search_key_bytes);
+
+		if iter.valid() {
+			let found_key_bytes = iter.key();
+			let found_key = InternalKey::decode(found_key_bytes);
+			if found_key.user_key == key {
+				let value_bytes = iter.value();
+				return Some((found_key, value_bytes.to_vec()));
+			}
+		}
+		None
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
-		self.map.is_empty()
+		let mut iter = self.skiplist.iter();
+		iter.seek_to_first();
+		!iter.valid()
 	}
 
 	pub(crate) fn size(&self) -> usize {
@@ -164,7 +191,27 @@ impl MemTable {
 
 	/// Inserts a key-value pair into the memtable.
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> u32 {
-		self.map.insert(key.clone(), value.clone());
+		// Calculate entry size
+		let entry_size = encoded_entry_size(key.user_key.len(), value.len());
+
+		// Allocate space for entry
+		let key_ptr = self.skiplist.allocate_key(entry_size);
+
+		// Encode entry into allocated space
+		unsafe {
+			encode_entry(
+				std::slice::from_raw_parts_mut(key_ptr, entry_size),
+				&key.user_key,
+				key.seq_num(),
+				key.kind(),
+				key.timestamp,
+				value,
+			);
+		}
+
+		// Insert into skiplist
+		self.skiplist.insert(key_ptr);
+
 		key.size() as u32 + value.len() as u32
 	}
 
@@ -233,34 +280,294 @@ impl MemTable {
 		Ok(created_table)
 	}
 
-	pub(crate) fn iter(
-		&self,
-		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = Result<(InternalKey, Value)>> + '_ {
-		self.map.iter().map(move |entry| {
-			let key = entry.key().clone();
-			let value = if keys_only {
-				Value::new()
-			} else {
-				entry.value().clone()
-			};
-			Ok((key, value))
-		})
+	pub(crate) fn iter(&self, keys_only: bool) -> MemTableRangeInternalIterator<'_> {
+		self.range((Bound::Unbounded, Bound::Unbounded), keys_only)
 	}
 
 	pub(crate) fn range(
 		&self,
 		range: InternalKeyRange,
 		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = Result<(InternalKey, Value)>> + '_ {
-		self.map.range(range).map(move |entry| {
-			let key = entry.key().clone();
-			let value = if keys_only {
-				Value::new()
-			} else {
-				entry.value().clone()
-			};
-			Ok((key, value))
-		})
+	) -> MemTableRangeInternalIterator<'_> {
+		MemTableRangeInternalIterator::new(&self.skiplist, range, keys_only)
+	}
+}
+
+/// Adapter that wraps a SkipListIterator and implements Iterator/DoubleEndedIterator
+/// This allows memtable range iterators to be used in merge iterators
+pub(crate) struct MemTableRangeInternalIterator<'a> {
+	start_bound: Bound<InternalKey>,
+	end_bound: Bound<InternalKey>,
+	keys_only: bool,
+	iter: SkipListIterator<'a, MemTableKeyComparator>,
+	empty_value_buffer: Vec<u8>,
+	exhausted: bool,
+	backward_initialized: bool,
+}
+
+impl<'a> MemTableRangeInternalIterator<'a> {
+	pub(crate) fn new(
+		skiplist: &'a InlineSkipList<MemTableKeyComparator>,
+		range: InternalKeyRange,
+		keys_only: bool,
+	) -> Self {
+		let (start_bound, end_bound) = range;
+		let mut iter = skiplist.iter();
+
+		// Seek to the start of the range
+		match &start_bound {
+			Bound::Included(ref key) => {
+				let encoded = key.encode();
+				iter.seek(&encoded);
+			}
+			Bound::Excluded(ref key) => {
+				let encoded = key.encode();
+				iter.seek(&encoded);
+				// Skip past the excluded start key if we landed on it
+				// Extract user key without allocating
+				if iter.valid() {
+					let found_user_key = InternalKey::user_key_from_encoded(iter.key());
+					if found_user_key == key.user_key.as_slice() {
+						iter.next();
+					}
+				}
+			}
+			Bound::Unbounded => {
+				iter.seek_to_first();
+			}
+		}
+
+		let exhausted = !iter.valid() || !Self::check_end_bound_static(&iter, &end_bound);
+
+		Self {
+			start_bound,
+			end_bound,
+			keys_only,
+			iter,
+			empty_value_buffer: Vec::new(),
+			exhausted,
+			backward_initialized: false,
+		}
+	}
+
+	fn check_end_bound_static(
+		iter: &SkipListIterator<'a, MemTableKeyComparator>,
+		end_bound: &Bound<InternalKey>,
+	) -> bool {
+		if !iter.valid() {
+			return false;
+		}
+
+		match end_bound {
+			Bound::Included(ref end_key) => {
+				// Extract user key without allocating
+				let current_user_key = InternalKey::user_key_from_encoded(iter.key());
+				current_user_key <= end_key.user_key.as_slice()
+			}
+			Bound::Excluded(ref end_key) => {
+				// Extract user key without allocating
+				let current_user_key = InternalKey::user_key_from_encoded(iter.key());
+				current_user_key < end_key.user_key.as_slice()
+			}
+			Bound::Unbounded => true,
+		}
+	}
+
+	fn check_end_bound(&self) -> bool {
+		Self::check_end_bound_static(&self.iter, &self.end_bound)
+	}
+
+	fn valid(&self) -> bool {
+		!self.exhausted && self.iter.valid()
+	}
+
+	fn next_internal(&mut self) -> Result<bool> {
+		if self.exhausted || !self.iter.valid() {
+			self.exhausted = true;
+			return Ok(false);
+		}
+
+		self.iter.next();
+
+		if !self.iter.valid() || !self.check_end_bound() {
+			self.exhausted = true;
+			return Ok(false);
+		}
+
+		Ok(true)
+	}
+
+	fn prev_internal(&mut self) -> Result<bool> {
+		if self.exhausted {
+			return Ok(false);
+		}
+
+		self.iter.prev();
+
+		if !self.iter.valid() {
+			self.exhausted = true;
+			return Ok(false);
+		}
+
+		// When going backwards, check if we've gone before the start bound
+		// Extract user key without allocating
+		let current_user_key = InternalKey::user_key_from_encoded(self.iter.key());
+
+		match &self.start_bound {
+			Bound::Included(ref start_key) => {
+				if current_user_key < start_key.user_key.as_slice() {
+					self.exhausted = true;
+					return Ok(false);
+				}
+			}
+			Bound::Excluded(ref start_key) => {
+				if current_user_key <= start_key.user_key.as_slice() {
+					self.exhausted = true;
+					return Ok(false);
+				}
+			}
+			Bound::Unbounded => {}
+		}
+
+		Ok(true)
+	}
+
+	#[allow(unused)]
+	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
+		// Re-seek to the start of the range
+		match &self.start_bound {
+			Bound::Included(ref key) => {
+				let encoded = key.encode();
+				self.iter.seek(&encoded);
+			}
+			Bound::Excluded(ref key) => {
+				let encoded = key.encode();
+				self.iter.seek(&encoded);
+				// Skip past the excluded start key if we landed on it
+				// Extract user key without allocating
+				if self.iter.valid() {
+					let found_user_key = InternalKey::user_key_from_encoded(self.iter.key());
+					if found_user_key == key.user_key.as_slice() {
+						self.iter.next();
+					}
+				}
+			}
+			Bound::Unbounded => {
+				self.iter.seek_to_first();
+			}
+		}
+
+		self.exhausted = !self.iter.valid() || !self.check_end_bound();
+		self.backward_initialized = false;
+		Ok(())
+	}
+
+	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
+		// Seek to the end of the range
+		match &self.end_bound {
+			Bound::Included(ref key) => {
+				let encoded = key.encode();
+				self.iter.seek(&encoded);
+				// If we found the exact key or went past it, stay there or go back
+				// Extract user key without allocating
+				if self.iter.valid() {
+					let found_user_key = InternalKey::user_key_from_encoded(self.iter.key());
+					if found_user_key > key.user_key.as_slice() {
+						// We went past, go back
+						self.iter.prev();
+					}
+				} else {
+					// Went past the end, go to last entry
+					self.iter.seek_to_last();
+				}
+			}
+			Bound::Excluded(ref key) => {
+				let encoded = key.encode();
+				self.iter.seek(&encoded);
+				// Go to the entry just before this key
+				if self.iter.valid() {
+					self.iter.prev();
+				} else {
+					self.iter.seek_to_last();
+				}
+			}
+			Bound::Unbounded => {
+				self.iter.seek_to_last();
+			}
+		}
+
+		// Ensure we're still within the start bound
+		// Extract user key without allocating
+		if self.iter.valid() {
+			let current_user_key = InternalKey::user_key_from_encoded(self.iter.key());
+
+			match &self.start_bound {
+				Bound::Included(ref start_key) => {
+					if current_user_key < start_key.user_key.as_slice() {
+						self.exhausted = true;
+					}
+				}
+				Bound::Excluded(ref start_key) => {
+					if current_user_key <= start_key.user_key.as_slice() {
+						self.exhausted = true;
+					}
+				}
+				Bound::Unbounded => {}
+			}
+		}
+
+		self.exhausted = self.exhausted || !self.iter.valid();
+		self.backward_initialized = true;
+		Ok(())
+	}
+
+	pub(crate) fn key(&self) -> &[u8] {
+		if self.iter.valid() && !self.exhausted {
+			self.iter.key()
+		} else {
+			&[]
+		}
+	}
+
+	pub(crate) fn value(&self) -> &[u8] {
+		if self.keys_only {
+			&self.empty_value_buffer
+		} else if self.iter.valid() && !self.exhausted {
+			self.iter.value()
+		} else {
+			&self.empty_value_buffer
+		}
+	}
+}
+
+impl Iterator for MemTableRangeInternalIterator<'_> {
+	type Item = Result<(InternalKey, Value)>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		if !self.valid() {
+			return None;
+		}
+
+		let key = InternalKey::decode(self.key());
+		let value = self.value().to_vec();
+		let _ = self.next_internal();
+		Some(Ok((key, value)))
+	}
+}
+
+impl DoubleEndedIterator for MemTableRangeInternalIterator<'_> {
+	fn next_back(&mut self) -> Option<Self::Item> {
+		if !self.backward_initialized {
+			let _ = self.seek_to_last();
+			self.backward_initialized = true;
+		}
+		if !self.valid() {
+			return None;
+		}
+
+		let key = InternalKey::decode(self.key());
+		let value = self.value().to_vec();
+		let _ = self.prev_internal();
+		Some(Ok((key, value)))
 	}
 }

@@ -622,3 +622,69 @@ fn test_get_highest_seq_num() {
 
 	assert_eq!(batch.get_highest_seq_num(), 14);
 }
+
+#[test]
+fn test_excluded_bound_skips_all_versions_of_key() {
+	// This test verifies that Bound::Excluded skips ALL entries with the same user key,
+	// not just one entry. In an LSM tree, there can be multiple versions of the same
+	// key with different sequence numbers.
+
+	// Create entries where key "b" has multiple versions
+	let (memtable, _) = create_test_memtable(vec![
+		(b"a".to_vec(), b"value-a".to_vec(), InternalKeyKind::Set, Some(10)),
+		(b"b".to_vec(), b"value-b1".to_vec(), InternalKeyKind::Set, Some(30)), // Newest version
+		(b"b".to_vec(), b"value-b2".to_vec(), InternalKeyKind::Set, Some(20)), // Middle version
+		(b"b".to_vec(), b"value-b3".to_vec(), InternalKeyKind::Set, Some(10)), // Oldest version
+		(b"c".to_vec(), b"value-c".to_vec(), InternalKeyKind::Set, Some(15)),
+	]);
+
+	use std::ops::Bound;
+
+	// Query with Bound::Excluded("b") - should skip ALL versions of "b"
+	let range_entries: Vec<_> = memtable
+		.range(
+			user_range_to_internal_range(Bound::Excluded("b".as_bytes()), Bound::Unbounded),
+			false,
+		)
+		.map(|r| r.unwrap())
+		.collect();
+
+	let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
+
+	// Should only contain "c" - all versions of "b" should be excluded
+	assert_eq!(user_keys.len(), 1, "Expected only 'c', but got {:?}", user_keys);
+	assert_eq!(&user_keys[0], b"c");
+}
+
+#[test]
+fn test_excluded_bound_seek_to_first_skips_all_versions() {
+	// Same test but after calling seek_to_first()
+	let (memtable, _) = create_test_memtable(vec![
+		(b"a".to_vec(), b"value-a".to_vec(), InternalKeyKind::Set, Some(10)),
+		(b"b".to_vec(), b"value-b1".to_vec(), InternalKeyKind::Set, Some(30)),
+		(b"b".to_vec(), b"value-b2".to_vec(), InternalKeyKind::Set, Some(20)),
+		(b"b".to_vec(), b"value-b3".to_vec(), InternalKeyKind::Set, Some(10)),
+		(b"c".to_vec(), b"value-c".to_vec(), InternalKeyKind::Set, Some(15)),
+	]);
+
+	use std::ops::Bound;
+
+	let mut iter = memtable.range(
+		user_range_to_internal_range(Bound::Excluded("b".as_bytes()), Bound::Unbounded),
+		false,
+	);
+
+	// Iterate once
+	let first = iter.next();
+	assert!(first.is_some());
+	let (key, _) = first.unwrap().unwrap();
+	assert_eq!(&key.user_key, b"c", "First key should be 'c', not a version of 'b'");
+
+	// Reset and try again
+	iter.seek_to_first().unwrap();
+
+	let first = iter.next();
+	assert!(first.is_some());
+	let (key, _) = first.unwrap().unwrap();
+	assert_eq!(&key.user_key, b"c", "After seek_to_first, first key should still be 'c'");
+}
