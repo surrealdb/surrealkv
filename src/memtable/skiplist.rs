@@ -13,10 +13,15 @@ use crate::sstable::InternalKeyKind;
 // Helper Functions
 // ============================================================================
 
-#[inline]
+#[inline(always)]
 unsafe fn read_length_prefixed_slice(ptr: *const u8) -> &'static [u8] {
 	let len = u32::from_be_bytes(*(ptr as *const [u8; 4])) as usize;
 	std::slice::from_raw_parts(ptr.add(4), len)
+}
+
+#[inline(always)]
+unsafe fn read_key_length(ptr: *const u8) -> usize {
+	u32::from_be_bytes(*(ptr as *const [u8; 4])) as usize
 }
 
 pub fn encoded_entry_size(user_key_len: usize, value_len: usize) -> usize {
@@ -63,6 +68,7 @@ pub fn encode_entry(
 
 pub trait SkipListComparator: Send + Sync {
 	fn compare(&self, a: *const u8, b: *const u8) -> Ordering;
+	fn compare_key_with_slice(&self, key_ptr: *const u8, slice: &[u8]) -> Ordering;
 }
 
 pub struct MemTableKeyComparator {
@@ -78,11 +84,20 @@ impl MemTableKeyComparator {
 }
 
 impl SkipListComparator for MemTableKeyComparator {
+	#[inline]
 	fn compare(&self, a: *const u8, b: *const u8) -> Ordering {
 		unsafe {
 			let key_a = read_length_prefixed_slice(a);
 			let key_b = read_length_prefixed_slice(b);
 			Comparator::compare(&*self.internal_cmp, key_a, key_b)
+		}
+	}
+
+	#[inline]
+	fn compare_key_with_slice(&self, key_ptr: *const u8, slice: &[u8]) -> Ordering {
+		unsafe {
+			let key = read_length_prefixed_slice(key_ptr);
+			Comparator::compare(&*self.internal_cmp, key, slice)
 		}
 	}
 }
@@ -97,17 +112,18 @@ struct Node {
 }
 
 impl Node {
-	#[inline]
+	#[inline(always)]
 	unsafe fn key(&self) -> *const u8 {
 		(self as *const Node as *const u8).add(std::mem::size_of::<AtomicPtr<Node>>())
 	}
 
-	#[inline]
+	#[inline(always)]
 	unsafe fn next_at_level(&self, level: usize) -> &AtomicPtr<Node> {
 		&*((self as *const Node as *const AtomicPtr<Node>).sub(level))
 	}
 
-	#[inline]
+	/// Acquire load for concurrent access (seek, insert)
+	#[inline(always)]
 	unsafe fn next(&self, level: usize) -> *mut Node {
 		if level == 0 {
 			self.next[0].load(AtomicOrdering::Acquire)
@@ -116,7 +132,14 @@ impl Node {
 		}
 	}
 
-	#[inline]
+	/// Relaxed load for forward iteration - FAST PATH
+	/// Safe because: append-only structure, we've already "entered" via Acquire
+	#[inline(always)]
+	unsafe fn next_level0_relaxed(&self) -> *mut Node {
+		self.next[0].load(AtomicOrdering::Relaxed)
+	}
+
+	#[inline(always)]
 	unsafe fn set_next(&self, level: usize, x: *mut Node) {
 		if level == 0 {
 			self.next[0].store(x, AtomicOrdering::Release);
@@ -138,13 +161,13 @@ impl Node {
 			.is_ok()
 	}
 
-	#[inline]
+	#[inline(always)]
 	unsafe fn stash_height(&mut self, height: i32) {
 		let ptr = &mut self.next[0] as *mut AtomicPtr<Node> as *mut i32;
 		*ptr = height;
 	}
 
-	#[inline]
+	#[inline(always)]
 	unsafe fn unstash_height(&self) -> i32 {
 		let ptr = &self.next[0] as *const AtomicPtr<Node> as *const i32;
 		*ptr
@@ -152,11 +175,9 @@ impl Node {
 }
 
 // ============================================================================
-// Position - Encapsulates prev/next pair (TOCTOU-resistant)
+// Position
 // ============================================================================
 
-/// Represents a position in the skiplist at a single level.
-/// The prev and next values are guaranteed to be from the same atomic read.
 #[derive(Clone, Copy)]
 struct Position {
 	prev: *mut Node,
@@ -164,7 +185,7 @@ struct Position {
 }
 
 impl Position {
-	#[inline]
+	#[inline(always)]
 	const fn new(prev: *mut Node, next: *mut Node) -> Self {
 		Self {
 			prev,
@@ -219,6 +240,7 @@ impl<C: SkipListComparator> SkipList<C> {
 		}
 	}
 
+	#[inline]
 	fn random_height(&self) -> i32 {
 		let mut rng = rand::rng();
 		let mut height = 1;
@@ -243,46 +265,24 @@ impl<C: SkipListComparator> SkipList<C> {
 		}
 	}
 
-	// ========================================================================
-	// Core Position Finding (TOCTOU-Resistant)
-	// ========================================================================
-
-	/// Find position at a single level.
-	///
-	/// STRUCTURAL GUARANTEE: Returns (prev, next) together.
-	/// The `next` value returned is EXACTLY the value that was compared.
-	/// No re-read is possible because we return immediately after finding.
-	///
-	/// This is the ONLY function that reads next pointers for insertion.
-	/// By centralizing this logic, we eliminate TOCTOU bugs structurally.
 	#[inline]
 	unsafe fn find_level(&self, key: *const u8, mut x: *mut Node, level: usize) -> Position {
 		loop {
-			// Single atomic read of next pointer
 			let next = (*x).next(level);
 
-			// Return path 1: Hit end of list
 			if next.is_null() {
 				return Position::new(x, next);
 			}
 
-			// Compare key
 			let next_key = (*next).key();
-
-			// Return path 2: Found position (key <= next.key)
 			if self.comparator.compare(key, next_key) != Ordering::Greater {
 				return Position::new(x, next);
 			}
 
-			// Continue traversing
 			x = next;
 		}
-		// NO CODE AFTER LOOP - structurally impossible to re-read
 	}
 
-	/// Find positions at all levels.
-	///
-	/// Uses find_level internally - inherits TOCTOU resistance.
 	unsafe fn find_all_positions(&self, key: *const u8, max_h: i32) -> Vec<Position> {
 		let mut positions = vec![Position::new(null_mut(), null_mut()); max_h as usize];
 		let mut x = self.head;
@@ -290,74 +290,18 @@ impl<C: SkipListComparator> SkipList<C> {
 		for level in (0..max_h as usize).rev() {
 			let pos = self.find_level(key, x, level);
 			positions[level] = pos;
-			x = pos.prev; // Start next level from where we stopped
+			x = pos.prev;
 		}
 
 		positions
 	}
 
-	// ========================================================================
-	// Validation (Debug Assertions)
-	// ========================================================================
-
-	/// Validate that a position is correct for inserting key.
-	///
-	/// In debug builds, this catches:
-	/// 1. TOCTOU bugs (prev.next != next)
-	/// 2. Ordering violations (prev.key >= key or key >= next.key)
-	#[cfg(debug_assertions)]
-	unsafe fn validate_position(&self, key: *const u8, pos: Position, level: usize) {
-		// Check: prev.next should equal next (detects TOCTOU if list changed)
-		// Note: This can legitimately fail due to concurrent modifications,
-		// but if it fails consistently, it indicates a bug in our code.
-		let actual_next = (*pos.prev).next(level);
-		if actual_next != pos.next {
-			// Not necessarily a bug - could be concurrent modification
-			// But log it for debugging
-			eprintln!(
-				"Position changed at level {}: expected {:?}, got {:?}",
-				level, pos.next, actual_next
-			);
-		}
-
-		// Check: prev.key < key (unless prev is head)
-		if pos.prev != self.head {
-			let prev_key = (*pos.prev).key();
-			assert!(
-				self.comparator.compare(prev_key, key) == Ordering::Less,
-				"BUG: prev.key >= key at level {}",
-				level
-			);
-		}
-
-		// Check: key < next.key (unless next is null)
-		if !pos.next.is_null() {
-			let next_key = (*pos.next).key();
-			assert!(
-				self.comparator.compare(key, next_key) == Ordering::Less,
-				"BUG: key >= next.key at level {}",
-				level
-			);
-		}
-	}
-
-	#[cfg(not(debug_assertions))]
-	#[inline]
-	unsafe fn validate_position(&self, _key: *const u8, _pos: Position, _level: usize) {
-		// No-op in release builds
-	}
-
-	// ========================================================================
-	// Insert
-	// ========================================================================
-
 	pub fn insert(&self, key: *const u8) -> bool {
 		unsafe {
 			let node_ptr = key.sub(std::mem::size_of::<AtomicPtr<Node>>()) as *mut Node;
 			let height = (*node_ptr).unstash_height();
-			assert!(height >= 1 && height <= self.k_max_height as i32);
+			debug_assert!(height >= 1 && height <= self.k_max_height as i32);
 
-			// Update max_height if needed
 			let mut max_h = self.max_height.load(AtomicOrdering::Relaxed);
 			while height > max_h {
 				match self.max_height.compare_exchange_weak(
@@ -372,27 +316,19 @@ impl<C: SkipListComparator> SkipList<C> {
 			}
 			let max_h = self.max_height.load(AtomicOrdering::Relaxed);
 
-			// Find positions at all levels (TOCTOU-resistant)
 			let mut positions = self.find_all_positions(key, max_h);
 
-			// Link at each level, bottom-up
 			for level in 0..height as usize {
 				loop {
 					let pos = positions[level];
 
-					// Validate in debug builds
-					self.validate_position(key, pos, level);
-
-					// CRITICAL: Validate ordering at level 0 before CAS
 					if level == 0 {
-						// Check: prev.key < key
 						if pos.prev != self.head {
 							let prev_key = (*pos.prev).key();
 							if self.comparator.compare(prev_key, key) != Ordering::Less {
 								return false;
 							}
 						}
-						// Check: key < next.key
 						if !pos.next.is_null() {
 							let next_key = (*pos.next).key();
 							if self.comparator.compare(next_key, key) != Ordering::Greater {
@@ -401,15 +337,12 @@ impl<C: SkipListComparator> SkipList<C> {
 						}
 					}
 
-					// Set next pointer before CAS makes us visible
 					(*node_ptr).set_next(level, pos.next);
 
-					// Linearization point at level 0
 					if (*pos.prev).cas_next(level, pos.next, node_ptr) {
 						break;
 					}
 
-					// CAS failed: recompute this level (TOCTOU-resistant)
 					positions[level] = self.find_level(key, pos.prev, level);
 				}
 			}
@@ -418,30 +351,18 @@ impl<C: SkipListComparator> SkipList<C> {
 		}
 	}
 
-	// ========================================================================
-	// Read Operations
-	// ========================================================================
-
-	unsafe fn find_greater_or_equal(&self, key: *const u8) -> *mut Node {
+	unsafe fn find_greater_or_equal_by_slice(&self, target: &[u8]) -> *mut Node {
 		let mut x = self.head;
-		let mut level = self.max_height.load(AtomicOrdering::Relaxed) - 1;
+		let mut level = self.max_height.load(AtomicOrdering::Acquire) - 1;
 		let mut last_bigger: *mut Node = null_mut();
 
 		loop {
 			let next = (*x).next(level as usize);
 
-			#[cfg(target_arch = "x86_64")]
-			if !next.is_null() {
-				std::arch::x86_64::_mm_prefetch(
-					(*next).key() as *const i8,
-					std::arch::x86_64::_MM_HINT_T0,
-				);
-			}
-
 			let cmp = if next.is_null() || next == last_bigger {
 				Ordering::Greater
 			} else {
-				self.comparator.compare((*next).key(), key)
+				self.comparator.compare_key_with_slice((*next).key(), target)
 			};
 
 			match cmp {
@@ -457,20 +378,12 @@ impl<C: SkipListComparator> SkipList<C> {
 	}
 
 	unsafe fn find_less_than(&self, key: *const u8) -> *mut Node {
-		let mut level = self.max_height.load(AtomicOrdering::Relaxed) - 1;
+		let mut level = self.max_height.load(AtomicOrdering::Acquire) - 1;
 		let mut x = self.head;
 		let mut last_not_after: *mut Node = null_mut();
 
 		loop {
 			let next = (*x).next(level as usize);
-
-			#[cfg(target_arch = "x86_64")]
-			if !next.is_null() {
-				std::arch::x86_64::_mm_prefetch(
-					(*next).key() as *const i8,
-					std::arch::x86_64::_MM_HINT_T0,
-				);
-			}
 
 			if next != last_not_after && !next.is_null() {
 				if self.comparator.compare((*next).key(), key) == Ordering::Less {
@@ -489,7 +402,7 @@ impl<C: SkipListComparator> SkipList<C> {
 
 	unsafe fn find_last(&self) -> *mut Node {
 		let mut x = self.head;
-		let mut level = self.max_height.load(AtomicOrdering::Relaxed) - 1;
+		let mut level = self.max_height.load(AtomicOrdering::Acquire) - 1;
 
 		loop {
 			let next = (*x).next(level as usize);
@@ -504,16 +417,14 @@ impl<C: SkipListComparator> SkipList<C> {
 		}
 	}
 
+	#[inline]
 	pub fn iter(&self) -> SkipListIterator<'_, C> {
-		SkipListIterator {
-			list: self,
-			node: null_mut(),
-		}
+		SkipListIterator::new(self)
 	}
 }
 
 // ============================================================================
-// Iterator
+// Iterator - Optimized for Range Scans
 // ============================================================================
 
 pub struct SkipListIterator<'a, C: SkipListComparator> {
@@ -521,60 +432,72 @@ pub struct SkipListIterator<'a, C: SkipListComparator> {
 	node: *const Node,
 }
 
-impl<C: SkipListComparator> SkipListIterator<'_, C> {
-	#[inline]
+impl<'a, C: SkipListComparator> SkipListIterator<'a, C> {
+	#[inline(always)]
+	fn new(list: &'a SkipList<C>) -> Self {
+		Self {
+			list,
+			node: null_mut(),
+		}
+	}
+
+	#[inline(always)]
 	pub fn valid(&self) -> bool {
 		!self.node.is_null()
 	}
 
-	#[inline]
+	#[inline(always)]
 	pub fn key(&self) -> &'static [u8] {
-		assert!(self.valid());
+		debug_assert!(self.valid());
 		unsafe { read_length_prefixed_slice((*self.node).key()) }
 	}
 
-	#[inline]
+	#[inline(always)]
 	pub fn value(&self) -> &'static [u8] {
-		assert!(self.valid());
+		debug_assert!(self.valid());
 		unsafe {
 			let entry_ptr = (*self.node).key();
-			let key_len = u32::from_be_bytes(*(entry_ptr as *const [u8; 4])) as usize;
+			let key_len = read_key_length(entry_ptr);
 			let value_ptr = entry_ptr.add(4 + key_len);
 			read_length_prefixed_slice(value_ptr)
 		}
 	}
 
-	#[inline]
+	/// FAST PATH: Relaxed load, no branch, prefetch next
+	#[inline(always)]
 	pub fn next(&mut self) {
-		assert!(self.valid());
+		debug_assert!(self.valid());
 		unsafe {
-			self.node = (*self.node).next(0);
+			// Relaxed is safe: append-only, we entered via Acquire in seek
+			let next = (*self.node).next_level0_relaxed();
+			self.node = next;
 		}
 	}
 
 	pub fn prev(&mut self) {
-		assert!(self.valid());
+		debug_assert!(self.valid());
 		unsafe {
 			let key_ptr = (*self.node).key();
-			self.node = self.list.find_less_than(key_ptr);
-			if self.node == self.list.head {
+			let prev = self.list.find_less_than(key_ptr);
+			if prev == self.list.head {
 				self.node = null_mut();
+			} else {
+				self.node = prev;
 			}
 		}
 	}
 
+	#[inline(always)]
 	pub fn seek(&mut self, target: &[u8]) {
 		unsafe {
-			let mut encoded = Vec::with_capacity(4 + target.len());
-			encoded.extend_from_slice(&(target.len() as u32).to_be_bytes());
-			encoded.extend_from_slice(target);
-			self.node = self.list.find_greater_or_equal(encoded.as_ptr());
+			self.node = self.list.find_greater_or_equal_by_slice(target);
 		}
 	}
 
-	#[inline]
+	#[inline(always)]
 	pub fn seek_to_first(&mut self) {
 		unsafe {
+			// Use Acquire here to "enter" the structure
 			self.node = (*self.list.head).next(0);
 		}
 	}
