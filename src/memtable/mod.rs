@@ -65,6 +65,16 @@ impl ImmutableMemtables {
 	pub(crate) fn is_empty(&self) -> bool {
 		self.0.is_empty()
 	}
+
+	pub(crate) fn len(&self) -> usize {
+		self.0.len()
+	}
+
+	/// Returns the oldest (first) immutable memtable entry.
+	/// Entries are sorted by table_id, so the first entry is the oldest.
+	pub(crate) fn first(&self) -> Option<&ImmutableEntry> {
+		self.0.first()
+	}
 }
 
 pub(crate) struct MemTable {
@@ -175,7 +185,7 @@ impl MemTable {
 				empty_val.clone()
 			};
 
-			self.insert_into_memtable(&ikey, &val);
+			self.insert_into_memtable(&ikey, &val)?;
 		}
 
 		// Get the highest sequence number used from the batch
@@ -185,12 +195,13 @@ impl MemTable {
 	}
 
 	/// Inserts a key-value pair into the memtable.
-	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) {
+	/// Returns Err(ArenaFull) if there's not enough space.
+	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
 		// Calculate entry size
 		let entry_size = encoded_entry_size(key.user_key.len(), value.len());
 
 		// Allocate space for entry
-		let key_ptr = self.skiplist.allocate_key(entry_size);
+		let key_ptr = self.skiplist.allocate_key(entry_size).ok_or(crate::Error::ArenaFull)?;
 
 		// Encode entry into allocated space
 		unsafe {
@@ -206,6 +217,7 @@ impl MemTable {
 
 		// Insert into skiplist
 		self.skiplist.insert(key_ptr);
+		Ok(())
 	}
 
 	/// Updates the latest sequence number in the memtable.
@@ -278,11 +290,6 @@ impl MemTable {
 	) -> MemTableRangeInternalIterator<'_> {
 		MemTableRangeInternalIterator::new(&self.skiplist, range, keys_only)
 	}
-
-    /// Returns true if the memtable has reached its size limit
-    pub fn should_flush(&self) -> bool {
-        self.arena.size() >= self.arena.capacity() * 9 / 10  // 90% threshold
-    }
 }
 
 /// Adapter that wraps a SkipListIterator and implements Iterator/DoubleEndedIterator

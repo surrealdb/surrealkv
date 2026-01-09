@@ -38,6 +38,7 @@ pub enum Error {
 	TransactionWithoutSavepoint,
 	KeyNotFound,
 	WriteStall,
+	ArenaFull, // Memtable arena is full, need rotation
 	FileDescriptorNotFound,
 	TableIDCollision(u64),
 	TableNotFound(u64),
@@ -90,6 +91,7 @@ impl fmt::Display for Error {
             Self::TransactionWithoutSavepoint => write!(f, "Transaction has no savepoint to rollback to"),
             Self::KeyNotFound => write!(f, "Key not found"),
             Self::WriteStall => write!(f, "Write stall"),
+            Self::ArenaFull => write!(f, "Memtable arena is full"),
             Self::FileDescriptorNotFound => write!(f, "File descriptor not found"),
 			Self::TableIDCollision(id) => write!(f, "CRITICAL ERROR: Table ID collision detected. New table ID {id} conflicts with a table ID in the merge list."),
 			Self::TableNotFound(id) => write!(f, "Table not found: {id}"),

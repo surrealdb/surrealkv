@@ -55,6 +55,9 @@ pub trait CompactionOperations: Send + Sync {
 
 	/// Returns a reference to the background error handler
 	fn error_handler(&self) -> Arc<BackgroundErrorHandler>;
+
+	/// Returns true if there are immutable memtables pending flush.
+	fn has_pending_immutables(&self) -> bool;
 }
 
 // ===== Core LSM Tree Implementation =====
@@ -381,6 +384,159 @@ impl CoreInner {
 		Ok(())
 	}
 
+	/// Rotates the active memtable to the immutable queue WITHOUT flushing to SST.
+	/// This is a fast operation (no disk I/O) that:
+	/// 1. Rotates WAL to a new file
+	/// 2. Swaps active memtable with a fresh one
+	/// 3. Adds old memtable to immutable queue
+	///
+	/// The actual SST flush happens asynchronously via background task.
+	pub(crate) fn rotate_memtable(&self, _force: bool) -> Result<()> {
+		// Step 1: Acquire WRITE lock upfront to prevent race conditions
+		let mut active_memtable = self.active_memtable.write()?;
+
+		if active_memtable.is_empty() {
+			return Ok(());
+		}
+
+		log::debug!("rotate_memtable: rotating memtable size={}", active_memtable.size());
+
+		// Step 2: Rotate WAL while STILL holding memtable write lock
+		let (flushed_wal_number, new_wal_number) = {
+			let mut wal_guard = self.wal.write();
+			let old_log_number = wal_guard.get_active_log_number();
+			wal_guard.rotate().map_err(|e| {
+				Error::Other(format!("Failed to rotate WAL before memtable rotation: {}", e))
+			})?;
+			let new_log_number = wal_guard.get_active_log_number();
+			drop(wal_guard);
+
+			log::debug!(
+				"WAL rotated during memtable rotation: {} -> {}",
+				old_log_number,
+				new_log_number
+			);
+			(old_log_number, new_log_number)
+		};
+
+		// Step 3: Swap memtable while STILL holding write lock
+		let flushed_memtable = std::mem::replace(
+			&mut *active_memtable,
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+		);
+
+		// Set the WAL number on the new (empty) active memtable
+		active_memtable.set_wal_number(new_wal_number);
+
+		// Get table ID and track immutable memtable with its WAL number
+		let mut immutable_memtables = self.immutable_memtables.write()?;
+		let table_id = self.level_manifest.read()?.next_table_id();
+		immutable_memtables.add(table_id, flushed_wal_number, Arc::clone(&flushed_memtable));
+
+		// Release locks
+		drop(active_memtable);
+		drop(immutable_memtables);
+
+		log::debug!(
+			"rotate_memtable: completed rotation, table_id={}, wal_number={}",
+			table_id,
+			flushed_wal_number
+		);
+
+		Ok(())
+	}
+
+	/// Flushes the oldest immutable memtable to an SSTable.
+	/// Returns Ok(Some(table)) if a memtable was flushed, Ok(None) if queue was empty.
+	///
+	/// This method:
+	/// 1. Gets the oldest entry from immutable queue (lowest table_id)
+	/// 2. Flushes it to SST via flush_and_update_manifest (which also removes from queue)
+	/// 3. Schedules async WAL cleanup
+	fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
+		// Get the oldest immutable entry (clone to release lock before I/O)
+		let entry = {
+			let guard = self.immutable_memtables.read()?;
+			guard.first().cloned()
+		};
+
+		let entry = match entry {
+			Some(e) => e,
+			None => {
+				log::debug!("flush_oldest_immutable_to_sst: no immutables to flush");
+				return Ok(None);
+			}
+		};
+
+		// Skip empty memtables
+		if entry.memtable.is_empty() {
+			let mut guard = self.immutable_memtables.write()?;
+			guard.remove(entry.table_id);
+			log::debug!(
+				"flush_oldest_immutable_to_sst: skipped empty memtable table_id={}",
+				entry.table_id
+			);
+			return Ok(None);
+		}
+
+		log::debug!(
+			"flush_oldest_immutable_to_sst: flushing table_id={}, wal_number={}",
+			entry.table_id,
+			entry.wal_number
+		);
+
+		// Flush to SST (this also removes from immutable queue and updates manifest)
+		let table =
+			self.flush_and_update_manifest(&entry.memtable, entry.table_id, entry.wal_number)?;
+
+		// Schedule async WAL cleanup
+		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
+		let min_wal_to_keep = entry.wal_number + 1;
+
+		tokio::spawn(async move {
+			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+				Ok(count) if count > 0 => {
+					log::info!(
+						"Cleaned up {} old WAL segments (min_wal_to_keep={})",
+						count,
+						min_wal_to_keep
+					);
+				}
+				Ok(_) => {}
+				Err(e) => {
+					log::warn!("Failed to clean up old WAL segments: {}", e);
+				}
+			}
+		});
+
+		log::debug!(
+			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
+			table.id,
+			table.file_size
+		);
+
+		Ok(Some(table))
+	}
+
+	/// Flushes ALL immutable memtables synchronously.
+	/// Used by Tree::flush() and checkpoint for forced/sync flush.
+	/// Blocks until all immutables are written to SST.
+	pub(crate) fn flush_all_immutables_sync(&self) -> Result<()> {
+		let mut count = 0;
+		while self.flush_oldest_immutable_to_sst()?.is_some() {
+			count += 1;
+		}
+		if count > 0 {
+			log::debug!("flush_all_immutables_sync: flushed {} immutable memtables", count);
+		}
+		Ok(())
+	}
+
+	/// Returns true if there are immutable memtables pending flush.
+	pub(crate) fn has_pending_immutables(&self) -> bool {
+		self.immutable_memtables.read().map(|guard| !guard.is_empty()).unwrap_or(false)
+	}
+
 	/// Flushes active memtable to SST and updates manifest log_number.
 	///
 	/// This is the core flush logic used by both shutdown and normal memtable
@@ -669,9 +825,10 @@ impl CoreInner {
 }
 
 impl CompactionOperations for CoreInner {
-	/// Triggers a memtable flush to create space for new writes
+	/// Flushes the oldest immutable memtable to SST.
+	/// Called by background task. Returns Ok(()) even if nothing to flush.
 	fn compact_memtable(&self) -> Result<()> {
-		self.make_room_for_write(false) // Don't force, respect threshold
+		self.flush_oldest_immutable_to_sst().map(|_| ())
 	}
 
 	/// Performs compaction to merge SSTables and maintain read performance.
@@ -697,6 +854,10 @@ impl CompactionOperations for CoreInner {
 	/// Returns a reference to the background error handler
 	fn error_handler(&self) -> Arc<BackgroundErrorHandler> {
 		Arc::clone(&self.error_handler)
+	}
+
+	fn has_pending_immutables(&self) -> bool {
+		self.immutable_memtables.read().map(|guard| !guard.is_empty()).unwrap_or(false)
 	}
 }
 
@@ -840,35 +1001,33 @@ impl CommitEnv for LsmCommitEnv {
 		Ok(processed_batch)
 	}
 
-	// Apply batch to memtable (can be called concurrently)
+	/// Apply batch to memtable with retry on arena full.
 	fn apply(&self, batch: &Batch) -> Result<()> {
-		// Writes a batch of key-value pairs to the LSM tree.
-		//
-		// Write path in LSM trees:
-		// 1. Write to WAL (Write-Ahead Log) for durability [not shown here]
-		// 2. Insert into active memtable for fast access
-		// 3. Trigger background flush if memtable is full
-		// 4. Apply write stall if too many L0 files accumulate
-		let active_memtable = self.core.active_memtable.read()?;
+		// Try to add to current memtable
+		let result = {
+			let active_memtable = self.core.active_memtable.read()?;
+			active_memtable.add(batch)
+		};
 
-		// Check if memtable needs flushing
-		if active_memtable.should_flush() {
-			log::debug!(
-				"Memtable size {} exceeds threshold {}, triggering background flush",
-				active_memtable.size(),
-				self.core.opts.max_memtable_size
-			);
-			// Wake up background thread to flush memtable
-			if let Some(ref task_manager) = self.task_manager {
-				task_manager.wake_up_memtable();
+		match result {
+			Ok(()) => Ok(()),
+			Err(Error::ArenaFull) => {
+				// Arena is full - rotate memtable and retry
+				log::debug!("apply: arena full, rotating memtable");
+
+				self.core.rotate_memtable(true)?;
+
+				// Schedule background flush
+				if let Some(ref task_manager) = self.task_manager {
+					task_manager.wake_up_memtable();
+				}
+
+				// Retry on new memtable - must succeed
+				let active_memtable = self.core.active_memtable.read()?;
+				active_memtable.add(batch)
 			}
+			Err(e) => Err(e),
 		}
-
-		// Add the batch to the active memtable
-		active_memtable.add(batch)?;
-		println!("apply: size={} {}", active_memtable.size(), self.core.opts.max_memtable_size);
-
-		Ok(())
 	}
 
 	// Check for background errors before committing
@@ -1483,9 +1642,20 @@ impl Tree {
 		}
 	}
 
-	/// Flushes the active memtable to disk
+	/// Flushes all memtables to disk synchronously.
+	/// This is a blocking operation that ensures all data is persisted before returning.
 	pub fn flush(&self) -> Result<()> {
-		self.core.make_room_for_write(true) // Force flush, bypass threshold
+		// Step 1: Rotate active memtable if it has data
+		{
+			let active = self.core.inner.active_memtable.read()?;
+			if !active.is_empty() {
+				drop(active); // Release read lock before acquiring write lock
+				self.core.inner.rotate_memtable(true)?; // force=true bypasses threshold
+			}
+		}
+
+		// Step 2: Flush all immutable memtables synchronously
+		self.core.inner.flush_all_immutables_sync()
 	}
 
 	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {

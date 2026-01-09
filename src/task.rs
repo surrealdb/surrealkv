@@ -69,14 +69,37 @@ impl TaskManager {
 					running.store(true, Ordering::SeqCst);
 					log::debug!("Memtable flush task starting");
 
-					if let Err(e) = core.compact_memtable() {
-						log::error!("Memtable compaction task error: {e:?}");
-						core.error_handler().set_error(e, BackgroundErrorReason::MemtablaFlush);
-					} else {
-						log::debug!("Memtable flush task completed successfully");
-						// If memtable compaction succeeded, trigger level compaction
-						level_notify.notify_one();
+					// Flush ALL pending immutable memtables in a loop
+					let mut flush_count = 0;
+					loop {
+						match core.compact_memtable() {
+							Ok(()) => {
+								// Check if there are more immutables to flush
+								if !core.has_pending_immutables() {
+									break;
+								}
+								flush_count += 1;
+							}
+							Err(e) => {
+								log::error!("Memtable compaction task error: {e:?}");
+								core.error_handler()
+									.set_error(e, BackgroundErrorReason::MemtablaFlush);
+								break;
+							}
+						}
 					}
+
+					if flush_count > 0 {
+						log::debug!(
+							"Memtable flush task completed: flushed {} memtables",
+							flush_count
+						);
+						// Trigger level compaction after successful flushes
+						level_notify.notify_one();
+					} else {
+						log::debug!("Memtable flush task: no immutables to flush");
+					}
+
 					running.store(false, Ordering::SeqCst);
 				}
 			});
@@ -254,6 +277,10 @@ mod tests {
 
 		fn error_handler(&self) -> Arc<BackgroundErrorHandler> {
 			Arc::new(BackgroundErrorHandler::new())
+		}
+
+		fn has_pending_immutables(&self) -> bool {
+			false // Mock always returns false (no immutables)
 		}
 	}
 
