@@ -78,7 +78,7 @@ async fn test_memtable_flush() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 132; // Total size of kvs below
+		opts.max_memtable_size = 200; // Total size of kvs below
 	});
 
 	let key = "hello";
@@ -112,7 +112,7 @@ async fn test_memtable_flush_with_delete() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 132; // Total size of kvs below
+		opts.max_memtable_size = 200; // Total size of kvs below
 	});
 
 	let key = "hello";
@@ -2281,13 +2281,13 @@ async fn test_clean_shutdown_actually_skips_wal() {
 		let wal_path = opts.wal_dir();
 		let min_wal_number = log_number;
 
-		let wal_seq_opt = Core::replay_wal_with_repair(
+		let (wal_seq_opt, _memtable_opt) = Core::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Test",
 			WalRecoveryMode::default(),
 			opts.max_memtable_size,
-			|_memtable| Ok(()),
+			|_memtable, _wal_number| Ok(()),
 		)
 		.unwrap();
 

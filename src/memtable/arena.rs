@@ -83,10 +83,6 @@ impl Arena {
 		let s = self.n.load(Ordering::Relaxed);
 		s.min(self.buf.len() as u64) as usize
 	}
-
-	pub fn capacity(&self) -> usize {
-		self.buf.len()
-	}
 }
 
 #[cfg(test)]

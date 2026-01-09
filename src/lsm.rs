@@ -1067,45 +1067,35 @@ impl std::ops::Deref for Core {
 }
 
 impl Core {
-	/// Function to replay WAL with configurable recovery behavior on
-	/// corruption.
+	/// Replays WAL with configurable corruption handling.
+	///
+	/// Creates one memtable per WAL segment. Flushes all but the last memtable
+	/// to SST via the provided callback. Returns the last memtable as active.
 	///
 	/// # Arguments
-	///
-	/// * `wal_path` - Path to the WAL directory
-	/// * `min_wal_number` - Minimum WAL number to replay (older segments are skipped)
-	/// * `context` - Context string for error messages (e.g., "Database startup")
-	/// * `recovery_mode` - Controls behavior on corruption:
-	///   - `AbsoluteConsistency`: Fail immediately on any corruption
-	///   - `TolerateCorruptedWithRepair`: Attempt repair and continue (default)
-	/// * `set_recovered_memtable` - Callback to set the recovered memtable
+	/// * `wal_path` - Path to WAL directory
+	/// * `min_wal_number` - Minimum WAL to replay
+	/// * `context` - Context string for error messages
+	/// * `recovery_mode` - How to handle corruption
+	/// * `arena_size` - Size for memtable arenas
+	/// * `flush_memtable` - Callback to flush intermediate memtables to SST
 	///
 	/// # Returns
-	///
-	/// * `Ok(Some(seq_num))` - WAL was replayed successfully
-	/// * `Ok(None)` - WAL was skipped (already flushed) or empty
-	/// * `Err(...)` - Error during replay (corruption in AbsoluteConsistency mode, or unrecoverable
-	///   error)
+	/// * `(Option<max_seq_num>, Option<active_memtable>)`
 	pub(crate) fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		min_wal_number: u64,
 		context: &str,
 		recovery_mode: WalRecoveryMode,
 		arena_size: usize,
-		mut set_recovered_memtable: F,
-	) -> Result<Option<u64>>
+		mut flush_memtable: F,
+	) -> Result<(Option<u64>, Option<Arc<MemTable>>)>
 	where
-		F: FnMut(Arc<MemTable>) -> Result<()>,
+		F: FnMut(Arc<MemTable>, u64) -> Result<()>,
 	{
-		// Create a new empty memtable to recover WAL entries
-		let recovered_memtable = Arc::new(MemTable::new(arena_size));
-
-		// Replay WAL
-		let wal_seq_num_opt = match replay_wal(wal_path, &recovered_memtable, min_wal_number) {
-			Ok(seq_num_opt) => {
-				// WAL was replayed successfully (or was empty/skipped)
-				seq_num_opt
-			}
+		// Replay WAL - returns memtables per segment
+		let (wal_seq_num_opt, memtables) = match replay_wal(wal_path, min_wal_number, arena_size) {
+			Ok(result) => result,
 			Err(Error::WalCorruption {
 				segment_id,
 				offset,
@@ -1114,7 +1104,6 @@ impl Core {
 				// Handle corruption based on recovery mode
 				match recovery_mode {
 					WalRecoveryMode::AbsoluteConsistency => {
-						// Fail immediately on any corruption - no repair attempted
 						log::error!(
 							"WAL corruption detected in segment {} at offset {}: {}. \
 							AbsoluteConsistency mode: failing immediately without repair.",
@@ -1129,7 +1118,6 @@ impl Core {
 						});
 					}
 					WalRecoveryMode::TolerateCorruptedWithRepair => {
-						// Current behavior: attempt repair and retry
 						log::warn!(
 							"Detected WAL corruption in segment {} at offset {}: {}. Attempting repair...",
 							segment_id,
@@ -1137,7 +1125,7 @@ impl Core {
 							message
 						);
 
-						// Attempt to repair the corrupted segment
+						// Attempt repair
 						if let Err(repair_err) = repair_corrupted_wal_segment(wal_path, segment_id)
 						{
 							log::error!("Failed to repair WAL segment: {repair_err}");
@@ -1146,34 +1134,19 @@ impl Core {
 							)));
 						}
 
-						// After repair, replay again to recover data from ALL segments.
-						// The initial replay stopped at the corruption point and didn't process
-						// subsequent segments.
-						let retry_memtable = Arc::new(MemTable::new(arena_size));
-						match replay_wal(wal_path, &retry_memtable, min_wal_number) {
-							Ok(retry_seq_num) => {
-								// Successful replay after repair
-								log::info!(
-									"WAL replay after repair succeeded: {} entries recovered",
-									retry_memtable.iter(true).count()
-								);
-								if !retry_memtable.is_empty() {
-									set_recovered_memtable(retry_memtable)?;
-								}
-								return Ok(retry_seq_num);
-							}
+						// Retry after repair
+						match replay_wal(wal_path, min_wal_number, arena_size) {
+							Ok(result) => result,
 							Err(Error::WalCorruption {
 								segment_id: seg_id,
 								offset: off,
 								message,
 							}) => {
-								// WAL still corrupted after repair - fail
 								return Err(Error::Other(format!(
-									"{context} failed: WAL segment {seg_id} still corrupted at offset {off} after repair with message: {message}"
+									"{context} failed: WAL segment {seg_id} still corrupted at offset {off} after repair: {message}"
 								)));
 							}
 							Err(retry_err) => {
-								// Replay failed after repair - fail
 								return Err(Error::Other(format!(
 									"{context} failed: WAL replay failed after repair. {retry_err}"
 								)));
@@ -1182,19 +1155,34 @@ impl Core {
 					}
 				}
 			}
-			Err(e) => {
-				// Other errors (IO, etc.) - propagate
-				return Err(e);
-			}
+			Err(e) => return Err(e),
 		};
 
-		// Only set recovered_memtable if we didn't go through repair path
-		// (repair path returns early with retry_memtable already set)
-		if !recovered_memtable.is_empty() {
-			set_recovered_memtable(recovered_memtable)?;
+		// If no memtables, nothing was recovered
+		if memtables.is_empty() {
+			return Ok((None, None));
 		}
 
-		Ok(wal_seq_num_opt)
+		// Flush all memtables except the last to SST
+		let memtable_count = memtables.len();
+		if memtable_count > 1 {
+			log::info!("Recovery: flushing {} intermediate memtables to SST", memtable_count - 1);
+			for (memtable, wal_number) in memtables.iter().take(memtable_count - 1) {
+				if !memtable.is_empty() {
+					flush_memtable(Arc::clone(memtable), *wal_number)?;
+				}
+			}
+		}
+
+		// Return the last memtable as the active one
+		let (last_memtable, last_wal_number) = memtables.into_iter().last().unwrap();
+		log::info!(
+			"Recovery: setting last memtable (wal={}) as active with {} entries",
+			last_wal_number,
+			last_memtable.iter(true).count()
+		);
+
+		Ok((wal_seq_num_opt, Some(last_memtable)))
 	}
 
 	/// Creates a new LSM tree with background task management
@@ -1229,21 +1217,32 @@ impl Core {
 		);
 
 		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
-		let wal_seq_num_opt = Self::replay_wal_with_repair(
+		let (wal_seq_num_opt, recovered_memtable) = Self::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Database startup",
 			opts.wal_recovery_mode,
 			opts.max_memtable_size,
-			|memtable| {
-				let mut active_memtable = inner.active_memtable.write()?;
-				*active_memtable = memtable;
+			|memtable, wal_number| {
+				// Flush intermediate memtable to SST during recovery
+				let table_id = inner.level_manifest.read()?.next_table_id();
+				inner.flush_and_update_manifest(&memtable, table_id, wal_number)?;
+				log::info!(
+					"Recovery: flushed memtable to SST table_id={}, wal_number={}",
+					table_id,
+					wal_number
+				);
 				Ok(())
 			},
 		)?;
 
-		// After WAL replay, ensure the active memtable has the correct WAL number set
-		// This is needed because the recovered memtable replaces the initial one
+		// Set recovered memtable as active (if any)
+		if let Some(memtable) = recovered_memtable {
+			let mut active_memtable = inner.active_memtable.write()?;
+			*active_memtable = memtable;
+		}
+
+		// Ensure the active memtable has the correct WAL number set
 		{
 			let active_memtable = inner.active_memtable.read()?;
 			let current_wal_number = inner.wal.read().get_active_log_number();
@@ -1579,20 +1578,32 @@ impl Tree {
 		// Replay any WAL entries that were restored
 		let wal_path = self.core.inner.opts.path.join("wal");
 		let min_wal_number = self.core.inner.level_manifest.read()?.get_log_number();
-		let wal_seq_num_opt = Core::replay_wal_with_repair(
+		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Database restore",
 			self.core.inner.opts.wal_recovery_mode,
 			self.core.inner.opts.max_memtable_size,
-			|memtable| {
-				let mut active_memtable = self.core.inner.active_memtable.write()?;
-				*active_memtable = memtable;
+			|memtable, wal_number| {
+				// Flush intermediate memtable to SST during recovery
+				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
+				self.core.inner.flush_and_update_manifest(&memtable, table_id, wal_number)?;
+				log::info!(
+					"Restore: flushed memtable to SST table_id={}, wal_number={}",
+					table_id,
+					wal_number
+				);
 				Ok(())
 			},
 		)?;
 
-		// After WAL replay, ensure the active memtable has the correct WAL number set
+		// Set recovered memtable as active (if any)
+		if let Some(memtable) = recovered_memtable {
+			let mut active_memtable = self.core.inner.active_memtable.write()?;
+			*active_memtable = memtable;
+		}
+
+		// Ensure the active memtable has the correct WAL number set
 		{
 			let active_memtable = self.core.inner.active_memtable.read()?;
 			let current_wal_number = self.core.inner.wal.read().get_active_log_number();

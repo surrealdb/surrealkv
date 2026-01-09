@@ -149,7 +149,10 @@ fn test_wal_replay_all_segments() {
 	let memtable = Arc::new(MemTable::default());
 
 	// Replay WAL - should replay all segments
-	let sequence_number_opt = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
+	let arena_size = 1024 * 1024; // 1MB for tests
+	let (sequence_number_opt, memtables) = replay_wal(temp_dir.path(), 0, arena_size).unwrap();
+
+	// let sequence_number_opt = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
 	let sequence_number = sequence_number_opt.unwrap_or(0);
 
 	// Count actual entries in memtable

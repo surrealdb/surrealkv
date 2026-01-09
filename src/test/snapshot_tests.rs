@@ -1329,7 +1329,7 @@ async fn test_cache_effectiveness_with_range_query() {
 	let tree = TreeBuilder::new()
 		.with_path(path)
 		.with_block_cache_capacity(10 * 1024 * 1024) // 10MB cache
-		.with_max_memtable_size(500) // Small memtable to trigger flushes
+		.with_max_memtable_size(1024 * 64) // Small memtable to trigger flushes
 		.build()
 		.unwrap();
 

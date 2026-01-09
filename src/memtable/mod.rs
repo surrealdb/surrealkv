@@ -66,10 +66,6 @@ impl ImmutableMemtables {
 		self.0.is_empty()
 	}
 
-	pub(crate) fn len(&self) -> usize {
-		self.0.len()
-	}
-
 	/// Returns the oldest (first) immutable memtable entry.
 	/// Entries are sorted by table_id, so the first entry is the oldest.
 	pub(crate) fn first(&self) -> Option<&ImmutableEntry> {
