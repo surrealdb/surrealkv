@@ -987,6 +987,7 @@ async fn test_compression_per_level_with_different_levels() {
 	// Insert enough data to potentially create multiple levels
 	let mut keys = Vec::new();
 	for i in 0..5000 {
+		println!("Inserting key {}", i);
 		let key = format!("test_key_{:04}", i).into_bytes();
 		let value = generate_compressible_value(500, b'X');
 		keys.push(key.clone());

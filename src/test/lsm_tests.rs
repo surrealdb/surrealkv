@@ -2286,6 +2286,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 			min_wal_number,
 			"Test",
 			WalRecoveryMode::default(),
+			opts.max_memtable_size,
 			|_memtable| Ok(()),
 		)
 		.unwrap();

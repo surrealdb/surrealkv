@@ -157,7 +157,7 @@ impl CoreInner {
 
 		// Initialize active memtable with its WAL number set to the initial WAL
 		// This tracks which WAL the memtable's data belongs to for later flush
-		let initial_memtable = Arc::new(MemTable::new());
+		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size));
 		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
 		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
@@ -326,8 +326,12 @@ impl CoreInner {
 		};
 
 		// Step 3: Swap memtable while STILL holding write lock
-		// Take the memtable data that we will flush
-		let flushed_memtable = std::mem::take(&mut *active_memtable);
+		// Take the memtable data that we will flush and replace with a new one
+		// using the configured arena size
+		let flushed_memtable = std::mem::replace(
+			&mut *active_memtable,
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+		);
 
 		// Set the WAL number on the new (empty) active memtable
 		// This tracks which WAL the new memtable's data will belong to
@@ -416,9 +420,18 @@ impl CoreInner {
 
 		let mut immutable_memtables = self.immutable_memtables.write()?;
 
+		// Get the current WAL number for the new memtable
+		let current_wal_number = self.wal.read().get_active_log_number();
+
 		// Swap the active memtable with a new empty one
 		// This allows writes to continue immediately
-		let flushed_memtable = std::mem::take(&mut *active_memtable);
+		let flushed_memtable = std::mem::replace(
+			&mut *active_memtable,
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+		);
+
+		// Set the WAL number on the new active memtable
+		active_memtable.set_wal_number(current_wal_number);
 
 		// Get table ID for the SST file
 		let table_id = self.level_manifest.read()?.next_table_id();
@@ -839,7 +852,7 @@ impl CommitEnv for LsmCommitEnv {
 		let active_memtable = self.core.active_memtable.read()?;
 
 		// Check if memtable needs flushing
-		if active_memtable.size() > self.core.opts.max_memtable_size {
+		if active_memtable.should_flush() {
 			log::debug!(
 				"Memtable size {} exceeds threshold {}, triggering background flush",
 				active_memtable.size(),
@@ -853,6 +866,7 @@ impl CommitEnv for LsmCommitEnv {
 
 		// Add the batch to the active memtable
 		active_memtable.add(batch)?;
+		println!("apply: size={} {}", active_memtable.size(), self.core.opts.max_memtable_size);
 
 		Ok(())
 	}
@@ -918,13 +932,14 @@ impl Core {
 		min_wal_number: u64,
 		context: &str,
 		recovery_mode: WalRecoveryMode,
+		arena_size: usize,
 		mut set_recovered_memtable: F,
 	) -> Result<Option<u64>>
 	where
 		F: FnMut(Arc<MemTable>) -> Result<()>,
 	{
 		// Create a new empty memtable to recover WAL entries
-		let recovered_memtable = Arc::new(MemTable::default());
+		let recovered_memtable = Arc::new(MemTable::new(arena_size));
 
 		// Replay WAL
 		let wal_seq_num_opt = match replay_wal(wal_path, &recovered_memtable, min_wal_number) {
@@ -975,7 +990,7 @@ impl Core {
 						// After repair, replay again to recover data from ALL segments.
 						// The initial replay stopped at the corruption point and didn't process
 						// subsequent segments.
-						let retry_memtable = Arc::new(MemTable::default());
+						let retry_memtable = Arc::new(MemTable::new(arena_size));
 						match replay_wal(wal_path, &retry_memtable, min_wal_number) {
 							Ok(retry_seq_num) => {
 								// Successful replay after repair
@@ -1060,6 +1075,7 @@ impl Core {
 			min_wal_number,
 			"Database startup",
 			opts.wal_recovery_mode,
+			opts.max_memtable_size,
 			|memtable| {
 				let mut active_memtable = inner.active_memtable.write()?;
 				*active_memtable = memtable;
@@ -1380,7 +1396,7 @@ impl Tree {
 		// This discards any pending writes, which is correct for restore operations
 		{
 			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable = Arc::new(MemTable::default());
+			*active_memtable = Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size));
 		}
 
 		{
@@ -1409,6 +1425,7 @@ impl Tree {
 			min_wal_number,
 			"Database restore",
 			self.core.inner.opts.wal_recovery_mode,
+			self.core.inner.opts.max_memtable_size,
 			|memtable| {
 				let mut active_memtable = self.core.inner.active_memtable.write()?;
 				*active_memtable = memtable;

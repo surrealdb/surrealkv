@@ -456,7 +456,7 @@ fn test_range_skips_non_overlapping_tables() {
 	let levels = Levels(vec![Arc::new(level0)]);
 
 	let iter_state = IterState {
-		active: Arc::new(MemTable::new()),
+		active: Arc::new(MemTable::default()),
 		immutable: Vec::new(),
 		levels,
 	};
@@ -849,7 +849,7 @@ fn create_iter_state_with_tables(
 	let levels = Levels(vec![Arc::new(level0), Arc::new(level1), Arc::new(level2)]);
 
 	IterState {
-		active: Arc::new(MemTable::new()),
+		active: Arc::new(MemTable::default()),
 		immutable: vec![],
 		levels,
 	}

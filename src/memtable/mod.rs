@@ -1,6 +1,6 @@
 use std::fs::File as SysFile;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod arena;
@@ -68,9 +68,9 @@ impl ImmutableMemtables {
 }
 
 pub(crate) struct MemTable {
+	arena: Arc<Arena>,
 	skiplist: SkipList<MemTableKeyComparator>,
 	latest_seq_num: AtomicU64,
-	map_size: AtomicU32,
 	/// WAL number that was current when this memtable started receiving writes.
 	/// Used to determine which WALs can be safely deleted after flush.
 	wal_number: AtomicU64,
@@ -78,21 +78,21 @@ pub(crate) struct MemTable {
 
 impl Default for MemTable {
 	fn default() -> Self {
-		Self::new()
+		Self::new(1024 * 1024)
 	}
 }
 
 impl MemTable {
-	pub(crate) fn new() -> Self {
+	pub(crate) fn new(arena_capacity: usize) -> Self {
 		let comparator =
 			Arc::new(InternalKeyComparator::new(Arc::new(crate::BytewiseComparator {})));
-		let arena = Arc::new(Arena::new(1024 * 1024 * 1024));
+		let arena = Arc::new(Arena::new(arena_capacity));
 		let mem_cmp = MemTableKeyComparator::new(Arc::clone(&comparator));
-		let skiplist = SkipList::new(mem_cmp, arena, 12, 4);
+		let skiplist = SkipList::new(mem_cmp, arena.clone(), 12, 4);
 		MemTable {
+			arena,
 			skiplist,
 			latest_seq_num: AtomicU64::new(0),
-			map_size: AtomicU32::new(0),
 			wal_number: AtomicU64::new(0),
 		}
 	}
@@ -138,7 +138,7 @@ impl MemTable {
 	}
 
 	pub(crate) fn size(&self) -> usize {
-		self.map_size.load(Ordering::Acquire) as usize
+		self.arena.size()
 	}
 
 	/// Adds a batch of operations to the memtable.
@@ -150,18 +150,15 @@ impl MemTable {
 	/// * `batch` - The batch of operations to apply
 	/// * `starting_seq_num` - The starting sequence number for this batch (records get consecutive
 	///   numbers)
-	pub(crate) fn add(&self, batch: &Batch) -> Result<(u32, u32)> {
-		let (record_size, highest_seq_num) = self.apply_batch_to_memtable(batch)?;
-		let size_before = self.update_memtable_size(record_size);
+	pub(crate) fn add(&self, batch: &Batch) -> Result<()> {
+		let highest_seq_num = self.apply_batch_to_memtable(batch)?;
 		self.update_latest_sequence_number(highest_seq_num);
-		Ok((record_size, size_before + record_size))
+		Ok(())
 	}
 
 	/// Applies the batch of operations to the in-memory table (memtable).
 	/// Returns (total_record_size, highest_seq_num_used).
-	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<(u32, u64)> {
-		let mut record_size = 0;
-
+	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<u64> {
 		// Pre-allocate empty value Bytes for delete operations to avoid repeated
 		// allocations
 		let empty_val = Value::new();
@@ -178,18 +175,17 @@ impl MemTable {
 				empty_val.clone()
 			};
 
-			let entry_size = self.insert_into_memtable(&ikey, &val);
-			record_size += entry_size;
+			self.insert_into_memtable(&ikey, &val);
 		}
 
 		// Get the highest sequence number used from the batch
 		let highest_seq_num = batch.get_highest_seq_num();
 
-		Ok((record_size, highest_seq_num))
+		Ok(highest_seq_num)
 	}
 
 	/// Inserts a key-value pair into the memtable.
-	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> u32 {
+	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) {
 		// Calculate entry size
 		let entry_size = encoded_entry_size(key.user_key.len(), value.len());
 
@@ -210,14 +206,6 @@ impl MemTable {
 
 		// Insert into skiplist
 		self.skiplist.insert(key_ptr);
-
-		key.size() as u32 + value.len() as u32
-	}
-
-	/// Updates the size of the memtable by adding the size of the newly added
-	/// records.
-	fn update_memtable_size(&self, record_size: u32) -> u32 {
-		self.map_size.fetch_add(record_size, std::sync::atomic::Ordering::AcqRel)
 	}
 
 	/// Updates the latest sequence number in the memtable.
@@ -290,6 +278,11 @@ impl MemTable {
 	) -> MemTableRangeInternalIterator<'_> {
 		MemTableRangeInternalIterator::new(&self.skiplist, range, keys_only)
 	}
+
+    /// Returns true if the memtable has reached its size limit
+    pub fn should_flush(&self) -> bool {
+        self.arena.size() >= self.arena.capacity() * 9 / 10  // 90% threshold
+    }
 }
 
 /// Adapter that wraps a SkipListIterator and implements Iterator/DoubleEndedIterator

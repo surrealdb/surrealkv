@@ -16,7 +16,7 @@ fn assert_value(encoded_value: &Value, expected_value: &[u8]) {
 
 #[test]
 fn memtable_get() {
-	let memtable = MemTable::new();
+	let memtable = MemTable::default();
 	let key = b"foo".to_vec();
 	let value = b"value".to_vec();
 
@@ -31,7 +31,7 @@ fn memtable_get() {
 
 #[test]
 fn memtable_size() {
-	let memtable = MemTable::new();
+	let memtable = MemTable::default();
 	let key = b"foo".to_vec();
 	let value = b"value".to_vec();
 
@@ -45,7 +45,7 @@ fn memtable_size() {
 
 #[test]
 fn memtable_lsn() {
-	let memtable = MemTable::new();
+	let memtable = MemTable::default();
 	let key = b"foo".to_vec();
 	let value = b"value".to_vec();
 	let seq_num = 100;
@@ -60,7 +60,7 @@ fn memtable_lsn() {
 
 #[test]
 fn memtable_add_and_get() {
-	let memtable = MemTable::new();
+	let memtable = MemTable::default();
 	let key1 = b"key1".to_vec();
 	let value1 = b"value1".to_vec();
 
@@ -86,7 +86,7 @@ fn memtable_add_and_get() {
 
 #[test]
 fn memtable_get_latest_seq_no() {
-	let memtable = MemTable::new();
+	let memtable = MemTable::default();
 	let key1 = b"key1".to_vec();
 	let value1 = b"value1".to_vec();
 	let value2 = b"value2".to_vec();
@@ -110,7 +110,7 @@ fn memtable_get_latest_seq_no() {
 
 #[test]
 fn memtable_prefix() {
-	let memtable = MemTable::new();
+	let memtable = MemTable::default();
 	let key1 = b"foo".to_vec();
 	let value1 = b"value1".to_vec();
 
@@ -135,7 +135,7 @@ fn memtable_prefix() {
 type TestEntry = (Vec<u8>, Vec<u8>, InternalKeyKind, Option<u64>);
 
 fn create_test_memtable(entries: Vec<TestEntry>) -> (Arc<MemTable>, u64) {
-	let memtable = Arc::new(MemTable::new());
+	let memtable = Arc::new(MemTable::default());
 
 	let mut last_seq = 0;
 
@@ -176,7 +176,7 @@ fn create_test_memtable(entries: Vec<TestEntry>) -> (Arc<MemTable>, u64) {
 
 #[test]
 fn test_empty_memtable() {
-	let memtable = Arc::new(MemTable::new());
+	let memtable = Arc::new(MemTable::default());
 
 	// Test that iterator is empty
 	let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
@@ -559,34 +559,29 @@ fn test_large_dataset() {
 
 #[test]
 fn test_memtable_size_tracking() {
-	let memtable = Arc::new(MemTable::new());
-
-	// Initially empty
-	assert_eq!(memtable.size(), 0);
+	let memtable = Arc::new(MemTable::default());
 
 	// Add some data
 	let mut batch = Batch::new(1);
 	batch.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
 	batch.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
 
-	let (record_size, total_size) = memtable.add(&batch).unwrap();
-	assert!(record_size > 0);
-	assert_eq!(total_size, record_size);
-	assert_eq!(memtable.size(), total_size as usize);
+	memtable.add(&batch).unwrap();
+	let size1 = memtable.size();
+	assert!(size1 > 0);
 
 	// Add more data
 	let mut batch2 = Batch::new(2);
 	batch2.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
 
-	let (record_size2, total_size2) = memtable.add(&batch2).unwrap();
-	assert!(record_size2 > 0);
-	assert_eq!(total_size2, total_size + record_size2);
-	assert_eq!(memtable.size(), total_size2 as usize);
+	memtable.add(&batch2).unwrap();
+	let size2 = memtable.size();
+	assert!(size2 > size1);
 }
 
 #[test]
 fn test_latest_sequence_number() {
-	let memtable = Arc::new(MemTable::new());
+	let memtable = Arc::new(MemTable::default());
 
 	// Initially 0
 	assert_eq!(memtable.lsn(), 0);

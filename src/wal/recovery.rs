@@ -370,7 +370,7 @@ mod tests {
 		fs::create_dir_all(wal_dir).unwrap();
 
 		// Create a memtable to replay into
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::default());
 
 		// Test case: Multiple batches across multiple WAL segments
 		// This verifies that ALL segments are replayed, not just the latest
@@ -423,7 +423,7 @@ mod tests {
 	fn test_replay_wal_empty_directory() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::default());
 
 		let max_seq_num_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
@@ -436,7 +436,7 @@ mod tests {
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
 
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::default());
 
 		// Test with multiple single-entry batches across 3 WAL segments
 		// This tests that ALL segments are replayed, not just the latest
@@ -505,7 +505,7 @@ mod tests {
 		wal.close().unwrap();
 
 		// Create a fresh memtable for the test
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::default());
 		let max_seq_num_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		// Both segments should be replayed, max should be 301
@@ -570,12 +570,13 @@ mod tests {
 		drop(file);
 
 		// Test using Core::replay_wal_with_repair (the actual production flow)
-		let recovered_memtable = Arc::new(std::sync::RwLock::new(Arc::new(MemTable::new())));
+		let recovered_memtable = Arc::new(std::sync::RwLock::new(Arc::new(MemTable::default())));
 		let max_seq_num = crate::lsm::Core::replay_wal_with_repair(
 			wal_dir,
 			0,
 			"Test repair",
 			WalRecoveryMode::TolerateCorruptedWithRepair,
+			1024,
 			|memtable| {
 				// This closure is called with the recovered memtable
 				*recovered_memtable.write().unwrap() = memtable;
@@ -657,12 +658,13 @@ mod tests {
 		file.write_all(&data).unwrap(); // Data
 		drop(file);
 
-		let recovered_memtable = Arc::new(std::sync::RwLock::new(Arc::new(MemTable::new())));
+		let recovered_memtable = Arc::new(std::sync::RwLock::new(Arc::new(MemTable::default())));
 		let max_seq_num = crate::lsm::Core::replay_wal_with_repair(
 			wal_dir,
 			0,
 			"Test repair",
 			WalRecoveryMode::TolerateCorruptedWithRepair,
+			1024,
 			|memtable| {
 				*recovered_memtable.write().unwrap() = memtable;
 				Ok(())
@@ -713,7 +715,7 @@ mod tests {
 		file.write_all(b"CORRUPTED_DATA_AT_END").unwrap();
 
 		// Replay with TolerateCorruptedTailRecords (default)
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::default());
 		let result = replay_wal(wal_dir, &memtable, 0);
 
 		// Should report corruption as an error
@@ -744,7 +746,7 @@ mod tests {
 		wal.append(&batch.encode().unwrap()).unwrap();
 		wal.close().unwrap();
 
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::default());
 		let result = replay_wal(wal_dir, &memtable, 0);
 
 		assert!(result.is_ok());
@@ -768,7 +770,7 @@ mod tests {
 		wal.close().unwrap();
 
 		// Replay - DefaultReporter is created internally
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::default());
 		let seq_num_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		assert_eq!(seq_num_opt, Some(100));
@@ -809,7 +811,7 @@ mod tests {
 		wal.close().unwrap();
 
 		// Now attempt recovery - both WAL segments should be replayed
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::default());
 		let max_seq_num_opt = replay_wal(wal_dir, &memtable, 0).unwrap();
 
 		// Verify both segments were replayed
@@ -877,7 +879,7 @@ mod tests {
 		drop(file);
 
 		// Attempt recovery
-		let memtable = Arc::new(MemTable::new());
+		let memtable = Arc::new(MemTable::default());
 		let result = replay_wal(wal_dir, &memtable, 0);
 
 		// Should report corruption in segment 1
