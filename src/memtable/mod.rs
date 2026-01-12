@@ -10,6 +10,7 @@ use arena::Arena;
 use skiplist::{
 	encode_entry,
 	encoded_entry_size,
+	Inserter,
 	MemTableKeyComparator,
 	SkipList,
 	SkipListIterator,
@@ -144,7 +145,7 @@ impl MemTable {
 	}
 
 	pub(crate) fn size(&self) -> usize {
-		self.arena.size()
+		self.skiplist.size()
 	}
 
 	/// Adds a batch of operations to the memtable.

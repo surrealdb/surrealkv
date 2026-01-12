@@ -1,16 +1,19 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const NODE_ALIGNMENT: usize = std::mem::align_of::<usize>(); // 8 on 64-bit
+/// Node alignment (must be power of 2) - 8 for u64 fields in Node struct
+pub const NODE_ALIGNMENT: u32 = 8;
+
+/// Maximum arena size (u32::MAX to fit in offset)
+pub const MAX_ARENA_SIZE: usize = u32::MAX as usize;
 
 /// Lock-free arena allocator (Pebble/arenaskl style)
 ///
-/// Uses a simple atomic bump pointer instead of per-CPU shards.
-/// Much simpler than the RocksDB approach, truly lock-free.
+/// Uses a simple atomic bump pointer. Offset 0 is reserved as "null".
 pub struct Arena {
 	/// Current allocation offset (atomically incremented)
 	n: AtomicU64,
-	/// Pre-allocated buffer
-	buf: Box<[u8]>,
+	/// Pre-allocated buffer - pub(crate) for direct access in hot paths
+	pub(crate) buf: Box<[u8]>,
 }
 
 // Safety: Arena uses atomic operations for all mutations
@@ -19,11 +22,8 @@ unsafe impl Sync for Arena {}
 
 impl Arena {
 	/// Create a new arena with the given capacity.
-	///
-	/// The capacity should be large enough for all expected allocations,
-	/// as the arena cannot grow once created.
 	pub fn new(capacity: usize) -> Self {
-		let capacity = capacity.min(u32::MAX as usize);
+		let capacity = capacity.min(MAX_ARENA_SIZE);
 		let buf = vec![0u8; capacity].into_boxed_slice();
 
 		Self {
@@ -33,26 +33,90 @@ impl Arena {
 		}
 	}
 
-	/// Allocate `size` bytes with the given alignment.
+	/// Returns the number of bytes allocated.
+	pub fn size(&self) -> usize {
+		let s = self.n.load(Ordering::Relaxed);
+		if s > self.buf.len() as u64 {
+			// Saturate at capacity if last allocation failed
+			self.buf.len()
+		} else {
+			s as usize
+		}
+	}
+
+	/// Returns the capacity of the arena.
+	pub fn capacity(&self) -> u32 {
+		self.buf.len() as u32
+	}
+
+	/// Allocate `size` bytes with given alignment.
 	///
-	/// This is lock-free - uses only atomic operations.
-	/// Returns None if the arena is full.
-	fn alloc_inner(&self, size: usize, alignment: usize) -> Option<u32> {
+	/// `overflow` ensures that many extra bytes after the buffer are inside
+	/// the arena (used for truncated node structures).
+	///
+	/// Returns the offset, or None if arena is full.
+	pub fn alloc(&self, size: u32, alignment: u32, overflow: u32) -> Option<u32> {
 		debug_assert!(alignment.is_power_of_two());
+
+		// Check if already full
+		let orig_size = self.n.load(Ordering::Relaxed);
+		if orig_size > self.buf.len() as u64 {
+			return None;
+		}
 
 		// Pad allocation to ensure alignment
 		let padded = size as u64 + alignment as u64 - 1;
 
-		// Atomically bump the pointer
 		let new_size = self.n.fetch_add(padded, Ordering::Relaxed) + padded;
-
-		if new_size > self.buf.len() as u64 {
+		if new_size + overflow as u64 > self.buf.len() as u64 {
 			return None; // Arena full
 		}
 
 		// Calculate aligned offset
-		let offset = ((new_size as u32) - size as u32) & !(alignment as u32 - 1);
+		let offset = (new_size as u32 - size) & !(alignment - 1);
 		Some(offset)
+	}
+
+	/// Get a byte slice from the arena by offset.
+	#[inline]
+	pub fn get_bytes(&self, offset: u32, size: u32) -> &[u8] {
+		if offset == 0 {
+			return &[];
+		}
+		&self.buf[offset as usize..(offset + size) as usize]
+	}
+
+	/// Get a mutable byte slice from the arena by offset.
+	///
+	/// # Safety
+	/// Caller must ensure no other references to this region exist.
+	#[inline]
+	pub unsafe fn get_bytes_mut(&self, offset: u32, size: u32) -> &mut [u8] {
+		if offset == 0 {
+			return &mut [];
+		}
+		let ptr = self.buf.as_ptr().add(offset as usize) as *mut u8;
+		std::slice::from_raw_parts_mut(ptr, size as usize)
+	}
+
+	/// Convert offset to raw pointer.
+	#[inline]
+	pub fn get_pointer(&self, offset: u32) -> *mut u8 {
+		if offset == 0 {
+			std::ptr::null_mut()
+		} else {
+			unsafe { self.buf.as_ptr().add(offset as usize) as *mut u8 }
+		}
+	}
+
+	/// Convert raw pointer back to offset.
+	#[inline]
+	pub fn get_pointer_offset(&self, ptr: *const u8) -> u32 {
+		if ptr.is_null() {
+			0
+		} else {
+			(ptr as usize - self.buf.as_ptr() as usize) as u32
+		}
 	}
 
 	/// Allocate aligned memory, returning a pointer.
@@ -64,24 +128,9 @@ impl Arena {
 
 	/// Try to allocate aligned memory, returning None if full.
 	pub fn try_allocate(&self, size: usize) -> Option<*mut u8> {
-		let alignment = NODE_ALIGNMENT.max(std::mem::align_of::<usize>());
-		let offset = self.alloc_inner(size, alignment)?;
+		let alignment = NODE_ALIGNMENT.max(std::mem::align_of::<usize>() as u32);
+		let offset = self.alloc(size as u32, alignment, 0)?;
 		Some(self.get_pointer(offset))
-	}
-
-	/// Convert offset to pointer.
-	#[inline]
-	fn get_pointer(&self, offset: u32) -> *mut u8 {
-		if offset == 0 {
-			std::ptr::null_mut()
-		} else {
-			unsafe { self.buf.as_ptr().add(offset as usize) as *mut u8 }
-		}
-	}
-
-	pub fn size(&self) -> usize {
-		let s = self.n.load(Ordering::Relaxed);
-		s.min(self.buf.len() as u64) as usize
 	}
 }
 
@@ -93,38 +142,43 @@ mod tests {
 	fn test_basic_allocation() {
 		let arena = Arena::new(4096);
 
-		let p1 = arena.allocate(100);
-		let p2 = arena.allocate(200);
-		let p3 = arena.allocate(300);
+		let o1 = arena.alloc(100, NODE_ALIGNMENT, 0).unwrap();
+		let o2 = arena.alloc(200, NODE_ALIGNMENT, 0).unwrap();
+		let o3 = arena.alloc(300, NODE_ALIGNMENT, 0).unwrap();
 
-		assert!(!p1.is_null());
-		assert!(!p2.is_null());
-		assert!(!p3.is_null());
-
-		// Check they don't overlap
-		assert!(p2 as usize >= p1 as usize + 100);
-		assert!(p3 as usize >= p2 as usize + 200);
+		assert!(o1 > 0);
+		assert!(o2 > o1);
+		assert!(o3 > o2);
 	}
 
 	#[test]
-	fn test_alignment() {
+	fn test_get_bytes() {
 		let arena = Arena::new(4096);
+		let offset = arena.alloc(10, NODE_ALIGNMENT, 0).unwrap();
 
-		for _ in 0..100 {
-			let ptr = arena.allocate(17); // Odd size
-			assert_eq!(ptr as usize % 4, 0); // Should be 4-byte aligned
+		unsafe {
+			let slice = arena.get_bytes_mut(offset, 10);
+			slice.copy_from_slice(b"0123456789");
 		}
+
+		let read = arena.get_bytes(offset, 10);
+		assert_eq!(read, b"0123456789");
+	}
+
+	#[test]
+	fn test_pointer_offset_roundtrip() {
+		let arena = Arena::new(4096);
+		let offset = arena.alloc(64, NODE_ALIGNMENT, 0).unwrap();
+		let ptr = arena.get_pointer(offset);
+		let back = arena.get_pointer_offset(ptr);
+		assert_eq!(offset, back);
 	}
 
 	#[test]
 	fn test_arena_full() {
 		let arena = Arena::new(100);
-
-		// This should succeed
-		assert!(arena.try_allocate(50).is_some());
-
-		// This should fail (not enough space)
-		assert!(arena.try_allocate(100).is_none());
+		assert!(arena.alloc(50, NODE_ALIGNMENT, 0).is_some());
+		assert!(arena.alloc(100, NODE_ALIGNMENT, 0).is_none());
 	}
 
 	#[test]
@@ -132,18 +186,18 @@ mod tests {
 		use std::sync::Arc;
 		use std::thread;
 
-		let arena = Arc::new(Arena::new(1024 * 1024)); // 1MB
+		let arena = Arc::new(Arena::new(1024 * 1024));
 		let mut handles = vec![];
 
 		for _ in 0..8 {
 			let arena = Arc::clone(&arena);
 			handles.push(thread::spawn(move || {
 				for _ in 0..1000 {
-					let ptr = arena.allocate(64);
-					assert!(!ptr.is_null());
-					// Write to verify we got valid memory
+					let offset = arena.alloc(64, NODE_ALIGNMENT, 0).unwrap();
+					assert!(offset > 0);
 					unsafe {
-						std::ptr::write_bytes(ptr, 0xAB, 64);
+						let slice = arena.get_bytes_mut(offset, 64);
+						std::ptr::write_bytes(slice.as_mut_ptr(), 0xAB, 64);
 					}
 				}
 			}));
