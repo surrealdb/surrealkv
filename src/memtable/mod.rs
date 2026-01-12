@@ -7,21 +7,13 @@ mod arena;
 mod skiplist;
 
 use arena::Arena;
-use skiplist::{
-	encode_entry,
-	encoded_entry_size,
-	Inserter,
-	MemTableKeyComparator,
-	SkipList,
-	SkipListIterator,
-};
+use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
 
 use crate::batch::Batch;
-use crate::comparator::InternalKeyComparator;
 use crate::error::Result;
 use crate::iter::CompactionIterator;
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX};
+use crate::sstable::InternalKey;
 use crate::vfs::File;
 use crate::{InternalKeyRange, Options, Value};
 
@@ -75,8 +67,7 @@ impl ImmutableMemtables {
 }
 
 pub(crate) struct MemTable {
-	arena: Arc<Arena>,
-	skiplist: SkipList<MemTableKeyComparator>,
+	skiplist: Skiplist,
 	latest_seq_num: AtomicU64,
 	/// WAL number that was current when this memtable started receiving writes.
 	/// Used to determine which WALs can be safely deleted after flush.
@@ -91,13 +82,10 @@ impl Default for MemTable {
 
 impl MemTable {
 	pub(crate) fn new(arena_capacity: usize) -> Self {
-		let comparator =
-			Arc::new(InternalKeyComparator::new(Arc::new(crate::BytewiseComparator {})));
 		let arena = Arc::new(Arena::new(arena_capacity));
-		let mem_cmp = MemTableKeyComparator::new(Arc::clone(&comparator));
-		let skiplist = SkipList::new(mem_cmp, arena.clone(), 12, 4);
+		let cmp: Compare = |a, b| a.cmp(b);
+		let skiplist = Skiplist::new(arena.clone(), cmp);
 		MemTable {
-			arena,
 			skiplist,
 			latest_seq_num: AtomicU64::new(0),
 			wal_number: AtomicU64::new(0),
@@ -118,34 +106,46 @@ impl MemTable {
 	}
 
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
-		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
-		// Create search key: user_key + trailer + timestamp
-		let search_key = InternalKey::new(key.to_vec(), seq_no, InternalKeyKind::Set, 0);
-		let search_key_bytes = search_key.encode();
+		use crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX;
 
-		// Pass internal key directly - seek() will add the length prefix internally
+		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 		let mut iter = self.skiplist.iter();
-		iter.seek(&search_key_bytes);
+		iter.seek_ge(key);
 
-		if iter.valid() {
-			let found_key_bytes = iter.key();
-			let found_key = InternalKey::decode(found_key_bytes);
-			if found_key.user_key == key {
-				let value_bytes = iter.value();
-				return Some((found_key, value_bytes.to_vec()));
+		// Find the entry with highest sequence number <= max_seq
+		while iter.valid() {
+			let found_key = iter.key();
+			if found_key != key {
+				break; // Moved past our key
 			}
+
+			let found_trailer = iter.trailer();
+			let found_seq = found_trailer >> 8;
+
+			// Check if this entry's sequence number is <= requested seq_no
+			if found_seq <= max_seq {
+				// This is the newest version with seq <= max_seq
+				let internal_key = InternalKey {
+					user_key: found_key.to_vec(),
+					timestamp: 0,
+					trailer: found_trailer,
+				};
+				return Some((internal_key, iter.value().to_vec()));
+			}
+
+			iter.next();
 		}
 		None
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
 		let mut iter = self.skiplist.iter();
-		iter.seek_to_first();
+		iter.first();
 		!iter.valid()
 	}
 
 	pub(crate) fn size(&self) -> usize {
-		self.skiplist.size()
+		self.skiplist.size() as usize
 	}
 
 	/// Adds a batch of operations to the memtable.
@@ -194,27 +194,13 @@ impl MemTable {
 	/// Inserts a key-value pair into the memtable.
 	/// Returns Err(ArenaFull) if there's not enough space.
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
-		// Calculate entry size
-		let entry_size = encoded_entry_size(key.user_key.len(), value.len());
+		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
 
-		// Allocate space for entry
-		let key_ptr = self.skiplist.allocate_key(entry_size).ok_or(crate::Error::ArenaFull)?;
-
-		// Encode entry into allocated space
-		unsafe {
-			encode_entry(
-				std::slice::from_raw_parts_mut(key_ptr, entry_size),
-				&key.user_key,
-				key.seq_num(),
-				key.kind(),
-				key.timestamp,
-				value,
-			);
+		match self.skiplist.add(&key.user_key, trailer, value) {
+			Ok(()) => Ok(()),
+			Err(SkiplistError::RecordExists) => Ok(()), // Duplicate is not an error in memtable
+			Err(SkiplistError::ArenaFull) => Err(crate::Error::ArenaFull),
 		}
-
-		// Insert into skiplist
-		self.skiplist.insert(key_ptr);
-		Ok(())
 	}
 
 	/// Updates the latest sequence number in the memtable.
@@ -289,50 +275,55 @@ impl MemTable {
 	}
 }
 
-/// Adapter that wraps a SkipListIterator and implements Iterator/DoubleEndedIterator
+/// Adapter that wraps a SkiplistIterator and implements Iterator/DoubleEndedIterator
 /// This allows memtable range iterators to be used in merge iterators
 pub(crate) struct MemTableRangeInternalIterator<'a> {
 	start_bound: Bound<InternalKey>,
 	end_bound: Bound<InternalKey>,
 	keys_only: bool,
-	iter: SkipListIterator<'a, MemTableKeyComparator>,
+	iter: SkiplistIterator<'a>,
 	empty_value_buffer: Vec<u8>,
 	exhausted: bool,
 	backward_initialized: bool,
 }
 
 impl<'a> MemTableRangeInternalIterator<'a> {
-	pub(crate) fn new(
-		skiplist: &'a SkipList<MemTableKeyComparator>,
-		range: InternalKeyRange,
-		keys_only: bool,
-	) -> Self {
+	pub(crate) fn new(skiplist: &'a Skiplist, range: InternalKeyRange, keys_only: bool) -> Self {
 		let (start_bound, end_bound) = range;
+
+		// Convert InternalKey bounds to user key bounds for skiplist iterator
+		let lower_bound = match &start_bound {
+			Bound::Included(key) => Some(key.user_key.clone()),
+			Bound::Excluded(_) | Bound::Unbounded => None,
+		};
+		let upper_bound = match &end_bound {
+			Bound::Excluded(key) => Some(key.user_key.clone()),
+			Bound::Included(_) | Bound::Unbounded => None,
+		};
+
+		// Create iterator without bounds first, then set them
 		let mut iter = skiplist.iter();
+		iter.set_bounds(lower_bound.as_deref(), upper_bound.as_deref());
 
 		// Seek to the start of the range
 		match &start_bound {
 			Bound::Included(ref key) => {
-				let encoded = key.encode();
-				iter.seek(&encoded);
+				iter.seek_ge(&key.user_key);
 			}
 			Bound::Excluded(ref key) => {
-				let encoded = key.encode();
-				iter.seek(&encoded);
-				// Skip past the excluded start key if we landed on it
-				// Extract user key without allocating
-				if iter.valid() {
-					let found_user_key = InternalKey::user_key_from_encoded(iter.key());
-					if found_user_key == key.user_key.as_slice() {
-						iter.next();
-					}
+				iter.seek_ge(&key.user_key);
+				// Skip ALL entries with this user key (they have same user key, different seqnums)
+				while iter.valid() && iter.key() == key.user_key.as_slice() {
+					iter.next();
 				}
 			}
 			Bound::Unbounded => {
-				iter.seek_to_first();
+				iter.first();
 			}
 		}
 
+		// Upper bound is now checked automatically by iterator, but we still need to check
+		// if it's excluded vs included
 		let exhausted = !iter.valid() || !Self::check_end_bound_static(&iter, &end_bound);
 
 		Self {
@@ -346,25 +337,14 @@ impl<'a> MemTableRangeInternalIterator<'a> {
 		}
 	}
 
-	fn check_end_bound_static(
-		iter: &SkipListIterator<'a, MemTableKeyComparator>,
-		end_bound: &Bound<InternalKey>,
-	) -> bool {
+	fn check_end_bound_static(iter: &SkiplistIterator<'a>, end_bound: &Bound<InternalKey>) -> bool {
 		if !iter.valid() {
 			return false;
 		}
 
 		match end_bound {
-			Bound::Included(ref end_key) => {
-				// Extract user key without allocating
-				let current_user_key = InternalKey::user_key_from_encoded(iter.key());
-				current_user_key <= end_key.user_key.as_slice()
-			}
-			Bound::Excluded(ref end_key) => {
-				// Extract user key without allocating
-				let current_user_key = InternalKey::user_key_from_encoded(iter.key());
-				current_user_key < end_key.user_key.as_slice()
-			}
+			Bound::Included(ref end_key) => iter.key() <= end_key.user_key.as_slice(),
+			Bound::Excluded(ref end_key) => iter.key() < end_key.user_key.as_slice(),
 			Bound::Unbounded => true,
 		}
 	}
@@ -406,8 +386,7 @@ impl<'a> MemTableRangeInternalIterator<'a> {
 		}
 
 		// When going backwards, check if we've gone before the start bound
-		// Extract user key without allocating
-		let current_user_key = InternalKey::user_key_from_encoded(self.iter.key());
+		let current_user_key = self.iter.key();
 
 		match &self.start_bound {
 			Bound::Included(ref start_key) => {
@@ -433,23 +412,17 @@ impl<'a> MemTableRangeInternalIterator<'a> {
 		// Re-seek to the start of the range
 		match &self.start_bound {
 			Bound::Included(ref key) => {
-				let encoded = key.encode();
-				self.iter.seek(&encoded);
+				self.iter.seek_ge(&key.user_key);
 			}
 			Bound::Excluded(ref key) => {
-				let encoded = key.encode();
-				self.iter.seek(&encoded);
-				// Skip past the excluded start key if we landed on it
-				// Extract user key without allocating
-				if self.iter.valid() {
-					let found_user_key = InternalKey::user_key_from_encoded(self.iter.key());
-					if found_user_key == key.user_key.as_slice() {
-						self.iter.next();
-					}
+				self.iter.seek_ge(&key.user_key);
+				// Skip ALL entries with this user key (they have same user key, different seqnums)
+				while self.iter.valid() && self.iter.key() == key.user_key.as_slice() {
+					self.iter.next();
 				}
 			}
 			Bound::Unbounded => {
-				self.iter.seek_to_first();
+				self.iter.first();
 			}
 		}
 
@@ -462,40 +435,35 @@ impl<'a> MemTableRangeInternalIterator<'a> {
 		// Seek to the end of the range
 		match &self.end_bound {
 			Bound::Included(ref key) => {
-				let encoded = key.encode();
-				self.iter.seek(&encoded);
+				self.iter.seek_ge(&key.user_key);
 				// If we found the exact key or went past it, stay there or go back
-				// Extract user key without allocating
 				if self.iter.valid() {
-					let found_user_key = InternalKey::user_key_from_encoded(self.iter.key());
-					if found_user_key > key.user_key.as_slice() {
+					if self.iter.key() > key.user_key.as_slice() {
 						// We went past, go back
 						self.iter.prev();
 					}
 				} else {
 					// Went past the end, go to last entry
-					self.iter.seek_to_last();
+					self.iter.last();
 				}
 			}
 			Bound::Excluded(ref key) => {
-				let encoded = key.encode();
-				self.iter.seek(&encoded);
+				self.iter.seek_ge(&key.user_key);
 				// Go to the entry just before this key
 				if self.iter.valid() {
 					self.iter.prev();
 				} else {
-					self.iter.seek_to_last();
+					self.iter.last();
 				}
 			}
 			Bound::Unbounded => {
-				self.iter.seek_to_last();
+				self.iter.last();
 			}
 		}
 
 		// Ensure we're still within the start bound
-		// Extract user key without allocating
 		if self.iter.valid() {
-			let current_user_key = InternalKey::user_key_from_encoded(self.iter.key());
+			let current_user_key = self.iter.key();
 
 			match &self.start_bound {
 				Bound::Included(ref start_key) => {
@@ -517,14 +485,6 @@ impl<'a> MemTableRangeInternalIterator<'a> {
 		Ok(())
 	}
 
-	pub(crate) fn key(&self) -> &[u8] {
-		if self.iter.valid() && !self.exhausted {
-			self.iter.key()
-		} else {
-			&[]
-		}
-	}
-
 	pub(crate) fn value(&self) -> &[u8] {
 		if self.keys_only {
 			&self.empty_value_buffer
@@ -544,10 +504,17 @@ impl Iterator for MemTableRangeInternalIterator<'_> {
 			return None;
 		}
 
-		let key = InternalKey::decode(self.key());
+		// Reconstruct InternalKey from key bytes + trailer
+		let user_key = self.iter.key().to_vec();
+		let trailer = self.iter.trailer();
+		let internal_key = InternalKey {
+			user_key,
+			timestamp: 0,
+			trailer,
+		};
 		let value = self.value().to_vec();
 		let _ = self.next_internal();
-		Some(Ok((key, value)))
+		Some(Ok((internal_key, value)))
 	}
 }
 
@@ -561,9 +528,16 @@ impl DoubleEndedIterator for MemTableRangeInternalIterator<'_> {
 			return None;
 		}
 
-		let key = InternalKey::decode(self.key());
+		// Reconstruct InternalKey from key bytes + trailer
+		let user_key = self.iter.key().to_vec();
+		let trailer = self.iter.trailer();
+		let internal_key = InternalKey {
+			user_key,
+			timestamp: 0,
+			trailer,
+		};
 		let value = self.value().to_vec();
 		let _ = self.prev_internal();
-		Some(Ok((key, value)))
+		Some(Ok((internal_key, value)))
 	}
 }

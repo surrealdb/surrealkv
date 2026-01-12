@@ -74,11 +74,11 @@ impl TaskManager {
 					loop {
 						match core.compact_memtable() {
 							Ok(()) => {
+								flush_count += 1;
 								// Check if there are more immutables to flush
 								if !core.has_pending_immutables() {
 									break;
 								}
-								flush_count += 1;
 							}
 							Err(e) => {
 								log::error!("Memtable compaction task error: {e:?}");

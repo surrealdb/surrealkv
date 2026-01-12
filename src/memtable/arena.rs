@@ -1,14 +1,8 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Node alignment (must be power of 2) - 8 for u64 fields in Node struct
-pub const NODE_ALIGNMENT: u32 = 8;
-
 /// Maximum arena size (u32::MAX to fit in offset)
 pub const MAX_ARENA_SIZE: usize = u32::MAX as usize;
 
-/// Lock-free arena allocator (Pebble/arenaskl style)
-///
-/// Uses a simple atomic bump pointer. Offset 0 is reserved as "null".
 pub struct Arena {
 	/// Current allocation offset (atomically incremented)
 	n: AtomicU64,
@@ -42,11 +36,6 @@ impl Arena {
 		} else {
 			s as usize
 		}
-	}
-
-	/// Returns the capacity of the arena.
-	pub fn capacity(&self) -> u32 {
-		self.buf.len() as u32
 	}
 
 	/// Allocate `size` bytes with given alignment.
@@ -118,20 +107,6 @@ impl Arena {
 			(ptr as usize - self.buf.as_ptr() as usize) as u32
 		}
 	}
-
-	/// Allocate aligned memory, returning a pointer.
-	///
-	/// Panics if the arena is full. For fallible allocation, use `try_allocate`.
-	pub fn allocate(&self, size: usize) -> *mut u8 {
-		self.try_allocate(size).expect("Arena: allocation failed - arena is full")
-	}
-
-	/// Try to allocate aligned memory, returning None if full.
-	pub fn try_allocate(&self, size: usize) -> Option<*mut u8> {
-		let alignment = NODE_ALIGNMENT.max(std::mem::align_of::<usize>() as u32);
-		let offset = self.alloc(size as u32, alignment, 0)?;
-		Some(self.get_pointer(offset))
-	}
 }
 
 #[cfg(test)]
@@ -142,9 +117,9 @@ mod tests {
 	fn test_basic_allocation() {
 		let arena = Arena::new(4096);
 
-		let o1 = arena.alloc(100, NODE_ALIGNMENT, 0).unwrap();
-		let o2 = arena.alloc(200, NODE_ALIGNMENT, 0).unwrap();
-		let o3 = arena.alloc(300, NODE_ALIGNMENT, 0).unwrap();
+		let o1 = arena.alloc(100, 8, 0).unwrap();
+		let o2 = arena.alloc(200, 8, 0).unwrap();
+		let o3 = arena.alloc(300, 8, 0).unwrap();
 
 		assert!(o1 > 0);
 		assert!(o2 > o1);
@@ -154,7 +129,7 @@ mod tests {
 	#[test]
 	fn test_get_bytes() {
 		let arena = Arena::new(4096);
-		let offset = arena.alloc(10, NODE_ALIGNMENT, 0).unwrap();
+		let offset = arena.alloc(10, 8, 0).unwrap();
 
 		unsafe {
 			let slice = arena.get_bytes_mut(offset, 10);
@@ -168,7 +143,7 @@ mod tests {
 	#[test]
 	fn test_pointer_offset_roundtrip() {
 		let arena = Arena::new(4096);
-		let offset = arena.alloc(64, NODE_ALIGNMENT, 0).unwrap();
+		let offset = arena.alloc(64, 8, 0).unwrap();
 		let ptr = arena.get_pointer(offset);
 		let back = arena.get_pointer_offset(ptr);
 		assert_eq!(offset, back);
@@ -177,8 +152,8 @@ mod tests {
 	#[test]
 	fn test_arena_full() {
 		let arena = Arena::new(100);
-		assert!(arena.alloc(50, NODE_ALIGNMENT, 0).is_some());
-		assert!(arena.alloc(100, NODE_ALIGNMENT, 0).is_none());
+		assert!(arena.alloc(50, 8, 0).is_some());
+		assert!(arena.alloc(100, 8, 0).is_none());
 	}
 
 	#[test]
@@ -193,7 +168,7 @@ mod tests {
 			let arena = Arc::clone(&arena);
 			handles.push(thread::spawn(move || {
 				for _ in 0..1000 {
-					let offset = arena.alloc(64, NODE_ALIGNMENT, 0).unwrap();
+					let offset = arena.alloc(64, 8, 0).unwrap();
 					assert!(offset > 0);
 					unsafe {
 						let slice = arena.get_bytes_mut(offset, 64);

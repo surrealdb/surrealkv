@@ -270,120 +270,6 @@ impl CoreInner {
 		Ok(table)
 	}
 
-	/// Makes room for new writes by flushing the active memtable if needed.
-	///
-	/// Triggers a flush operation to make room for new writes.
-	///
-	/// This is called when the active memtable exceeds the configured size
-	/// threshold. The operation proceeds in stages:
-	/// 1. Acquire memtable write lock and check if flushing is needed
-	/// 2. If flushing, rotate WAL while STILL holding memtable lock
-	/// 3. Swap memtable while STILL holding the lock (atomically with WAL rotation)
-	/// 4. Release locks, then flush memtable to SST and update manifest
-	/// 5. Asynchronously clean up old WAL segments
-	fn make_room_for_write(&self, force: bool) -> Result<()> {
-		// Step 1: Acquire WRITE lock upfront to prevent race conditions
-		// We need the write lock before checking/rotating/swapping to ensure atomicity
-		let mut active_memtable = self.active_memtable.write()?;
-		let size = active_memtable.size();
-
-		if active_memtable.is_empty() {
-			return Ok(());
-		}
-
-		// Check if memtable actually exceeds threshold
-		// Prevents flushing small memtables from queued notifications
-		// Multiple concurrent writes can each call wake_up_memtable(), creating
-		// a notification queue. This check ensures we only flush when needed.
-		// The 'force' parameter allows bypassing this for explicit flush calls.
-		if !force && size < self.opts.max_memtable_size {
-			log::debug!(
-				"make_room_for_write: memtable size {} below threshold {}, skipping flush",
-				size,
-				self.opts.max_memtable_size
-			);
-			return Ok(());
-		}
-
-		log::debug!("make_room_for_write: flushing memtable size={}", size);
-
-		// Step 2: Rotate WAL while STILL holding memtable write lock
-		// We must rotate WAL and swap memtable atomically
-		// to prevent the race condition described above
-		let (flushed_wal_number, new_wal_number, wal_dir) = {
-			let mut wal_guard = self.wal.write();
-			let old_log_number = wal_guard.get_active_log_number();
-			let dir = wal_guard.get_dir_path().to_path_buf();
-			wal_guard.rotate().map_err(|e| {
-				Error::Other(format!("Failed to rotate WAL before memtable flush: {}", e))
-			})?;
-			let new_log_number = wal_guard.get_active_log_number();
-			drop(wal_guard);
-
-			log::debug!(
-				"WAL rotated before memtable flush: {} -> {}",
-				old_log_number,
-				new_log_number
-			);
-			(old_log_number, new_log_number, dir)
-		};
-
-		// Step 3: Swap memtable while STILL holding write lock
-		// Take the memtable data that we will flush and replace with a new one
-		// using the configured arena size
-		let flushed_memtable = std::mem::replace(
-			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size)),
-		);
-
-		// Set the WAL number on the new (empty) active memtable
-		// This tracks which WAL the new memtable's data will belong to
-		active_memtable.set_wal_number(new_wal_number);
-
-		// Get table ID and track immutable memtable with its WAL number
-		let mut immutable_memtables = self.immutable_memtables.write()?;
-		let table_id = self.level_manifest.read()?.next_table_id();
-		// Track the WAL number that contains this memtable's data
-		// (the old WAL before rotation)
-		immutable_memtables.add(table_id, flushed_wal_number, Arc::clone(&flushed_memtable));
-
-		// Now we can release locks - the memtable is safely in immutable_memtables
-		// and no other thread can race us on this specific data
-		drop(active_memtable);
-		drop(immutable_memtables);
-
-		// Step 4: Flush the memtable to SST and update manifest (slow I/O operation, no locks held)
-		let _table =
-			self.flush_and_update_manifest(&flushed_memtable, table_id, flushed_wal_number)?;
-
-		// Step 5: Async WAL cleanup using values we already have
-		// No need to re-acquire locks - we captured wal_dir and flushed_wal_number
-		// earlier
-		let min_wal_to_keep = flushed_wal_number + 1; // Same as log_number
-
-		log::debug!("Scheduling async WAL cleanup (min_wal_to_keep={})", min_wal_to_keep);
-
-		tokio::spawn(async move {
-			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
-				Ok(count) if count > 0 => {
-					log::info!(
-						"Cleaned up {} old WAL segments (min_wal_to_keep={})",
-						count,
-						min_wal_to_keep
-					);
-				}
-				Ok(_) => {
-					log::debug!("No old WAL segments to clean up");
-				}
-				Err(e) => {
-					log::warn!("Failed to clean up old WAL segments: {}", e);
-				}
-			}
-		});
-
-		Ok(())
-	}
-
 	/// Rotates the active memtable to the immutable queue WITHOUT flushing to SST.
 	/// This is a fast operation (no disk I/O) that:
 	/// 1. Rotates WAL to a new file
@@ -530,11 +416,6 @@ impl CoreInner {
 			log::debug!("flush_all_immutables_sync: flushed {} immutable memtables", count);
 		}
 		Ok(())
-	}
-
-	/// Returns true if there are immutable memtables pending flush.
-	pub(crate) fn has_pending_immutables(&self) -> bool {
-		self.immutable_memtables.read().map(|guard| !guard.is_empty()).unwrap_or(false)
 	}
 
 	/// Flushes active memtable to SST and updates manifest log_number.
