@@ -742,13 +742,26 @@ impl<'a> KMergeIterator<'a> {
 
 		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
 
+		// Extract user key bounds from InternalKeyRange (Pebble model: inclusive lower, exclusive
+		// upper)
+		let (start_bound, end_bound) = query_range.as_ref();
+		let lower = match start_bound {
+			Bound::Included(key) | Bound::Excluded(key) => Some(key.user_key.as_slice()),
+			Bound::Unbounded => None,
+		};
+		let upper = match end_bound {
+			Bound::Excluded(key) => Some(key.user_key.as_slice()),
+			Bound::Included(_) | Bound::Unbounded => None, /* Included upper handled by table
+			                                                * iterators */
+		};
+
 		// Active memtable
-		let active_iter = state_ref.active.range((*query_range).clone(), keys_only);
+		let active_iter = state_ref.active.range(lower, upper, keys_only);
 		iterators.push(Box::new(active_iter));
 
 		// Immutable memtables
 		for memtable in &state_ref.immutable {
-			let iter = memtable.range((*query_range).clone(), keys_only);
+			let iter = memtable.range(lower, upper, keys_only);
 			iterators.push(Box::new(iter));
 		}
 

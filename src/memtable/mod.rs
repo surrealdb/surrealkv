@@ -1,5 +1,4 @@
 use std::fs::File as SysFile;
-use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -15,7 +14,7 @@ use crate::iter::CompactionIterator;
 use crate::sstable::table::{Table, TableWriter};
 use crate::sstable::InternalKey;
 use crate::vfs::File;
-use crate::{InternalKeyRange, Options, Value};
+use crate::{Options, Value};
 
 /// Entry in the immutable memtables list, tracking both the table ID
 /// and the WAL number that contains this memtable's data.
@@ -133,7 +132,7 @@ impl MemTable {
 				return Some((internal_key, iter.value().to_vec()));
 			}
 
-			iter.next();
+			iter.advance();
 		}
 		None
 	}
@@ -196,7 +195,7 @@ impl MemTable {
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
 		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
 
-		match self.skiplist.add(&key.user_key, trailer, value) {
+		match self.skiplist.add(&key.user_key, trailer, key.timestamp, value) {
 			Ok(()) => Ok(()),
 			Err(SkiplistError::RecordExists) => Ok(()), // Duplicate is not an error in memtable
 			Err(SkiplistError::ArenaFull) => Err(crate::Error::ArenaFull),
@@ -262,282 +261,62 @@ impl MemTable {
 		Ok(created_table)
 	}
 
-	pub(crate) fn iter(&self, keys_only: bool) -> MemTableRangeInternalIterator<'_> {
-		self.range((Bound::Unbounded, Bound::Unbounded), keys_only)
+	pub(crate) fn iter(&self, keys_only: bool) -> MemTableIterator<'_> {
+		self.range(None, None, keys_only)
 	}
 
+	/// Returns an iterator over keys in [lower, upper)
+	/// Lower is inclusive, upper is exclusive (Pebble model)
 	pub(crate) fn range(
 		&self,
-		range: InternalKeyRange,
+		lower: Option<&[u8]>, // Inclusive, None = unbounded
+		upper: Option<&[u8]>, // Exclusive, None = unbounded
 		keys_only: bool,
-	) -> MemTableRangeInternalIterator<'_> {
-		MemTableRangeInternalIterator::new(&self.skiplist, range, keys_only)
-	}
-}
+	) -> MemTableIterator<'_> {
+		let mut iter = self.skiplist.new_iter(lower, upper);
 
-/// Adapter that wraps a SkiplistIterator and implements Iterator/DoubleEndedIterator
-/// This allows memtable range iterators to be used in merge iterators
-pub(crate) struct MemTableRangeInternalIterator<'a> {
-	start_bound: Bound<InternalKey>,
-	end_bound: Bound<InternalKey>,
-	keys_only: bool,
-	iter: SkiplistIterator<'a>,
-	empty_value_buffer: Vec<u8>,
-	exhausted: bool,
-	backward_initialized: bool,
-}
-
-impl<'a> MemTableRangeInternalIterator<'a> {
-	pub(crate) fn new(skiplist: &'a Skiplist, range: InternalKeyRange, keys_only: bool) -> Self {
-		let (start_bound, end_bound) = range;
-
-		// Convert InternalKey bounds to user key bounds for skiplist iterator
-		let lower_bound = match &start_bound {
-			Bound::Included(key) => Some(key.user_key.clone()),
-			Bound::Excluded(_) | Bound::Unbounded => None,
-		};
-		let upper_bound = match &end_bound {
-			Bound::Excluded(key) => Some(key.user_key.clone()),
-			Bound::Included(_) | Bound::Unbounded => None,
-		};
-
-		// Create iterator without bounds first, then set them
-		let mut iter = skiplist.iter();
-		iter.set_bounds(lower_bound.as_deref(), upper_bound.as_deref());
-
-		// Seek to the start of the range
-		match &start_bound {
-			Bound::Included(ref key) => {
-				iter.seek_ge(&key.user_key);
-			}
-			Bound::Excluded(ref key) => {
-				iter.seek_ge(&key.user_key);
-				// Skip ALL entries with this user key (they have same user key, different seqnums)
-				while iter.valid() && iter.key() == key.user_key.as_slice() {
-					iter.next();
-				}
-			}
-			Bound::Unbounded => {
-				iter.first();
-			}
-		}
-
-		// Upper bound is now checked automatically by iterator, but we still need to check
-		// if it's excluded vs included
-		let exhausted = !iter.valid() || !Self::check_end_bound_static(&iter, &end_bound);
-
-		Self {
-			start_bound,
-			end_bound,
-			keys_only,
-			iter,
-			empty_value_buffer: Vec::new(),
-			exhausted,
-			backward_initialized: false,
-		}
-	}
-
-	fn check_end_bound_static(iter: &SkiplistIterator<'a>, end_bound: &Bound<InternalKey>) -> bool {
-		if !iter.valid() {
-			return false;
-		}
-
-		match end_bound {
-			Bound::Included(ref end_key) => iter.key() <= end_key.user_key.as_slice(),
-			Bound::Excluded(ref end_key) => iter.key() < end_key.user_key.as_slice(),
-			Bound::Unbounded => true,
-		}
-	}
-
-	fn check_end_bound(&self) -> bool {
-		Self::check_end_bound_static(&self.iter, &self.end_bound)
-	}
-
-	fn valid(&self) -> bool {
-		!self.exhausted && self.iter.valid()
-	}
-
-	fn next_internal(&mut self) -> Result<bool> {
-		if self.exhausted || !self.iter.valid() {
-			self.exhausted = true;
-			return Ok(false);
-		}
-
-		self.iter.next();
-
-		if !self.iter.valid() || !self.check_end_bound() {
-			self.exhausted = true;
-			return Ok(false);
-		}
-
-		Ok(true)
-	}
-
-	fn prev_internal(&mut self) -> Result<bool> {
-		if self.exhausted {
-			return Ok(false);
-		}
-
-		self.iter.prev();
-
-		if !self.iter.valid() {
-			self.exhausted = true;
-			return Ok(false);
-		}
-
-		// When going backwards, check if we've gone before the start bound
-		let current_user_key = self.iter.key();
-
-		match &self.start_bound {
-			Bound::Included(ref start_key) => {
-				if current_user_key < start_key.user_key.as_slice() {
-					self.exhausted = true;
-					return Ok(false);
-				}
-			}
-			Bound::Excluded(ref start_key) => {
-				if current_user_key <= start_key.user_key.as_slice() {
-					self.exhausted = true;
-					return Ok(false);
-				}
-			}
-			Bound::Unbounded => {}
-		}
-
-		Ok(true)
-	}
-
-	#[allow(unused)]
-	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
-		// Re-seek to the start of the range
-		match &self.start_bound {
-			Bound::Included(ref key) => {
-				self.iter.seek_ge(&key.user_key);
-			}
-			Bound::Excluded(ref key) => {
-				self.iter.seek_ge(&key.user_key);
-				// Skip ALL entries with this user key (they have same user key, different seqnums)
-				while self.iter.valid() && self.iter.key() == key.user_key.as_slice() {
-					self.iter.next();
-				}
-			}
-			Bound::Unbounded => {
-				self.iter.first();
-			}
-		}
-
-		self.exhausted = !self.iter.valid() || !self.check_end_bound();
-		self.backward_initialized = false;
-		Ok(())
-	}
-
-	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
-		// Seek to the end of the range
-		match &self.end_bound {
-			Bound::Included(ref key) => {
-				self.iter.seek_ge(&key.user_key);
-				// If we found the exact key or went past it, stay there or go back
-				if self.iter.valid() {
-					if self.iter.key() > key.user_key.as_slice() {
-						// We went past, go back
-						self.iter.prev();
-					}
-				} else {
-					// Went past the end, go to last entry
-					self.iter.last();
-				}
-			}
-			Bound::Excluded(ref key) => {
-				self.iter.seek_ge(&key.user_key);
-				// Go to the entry just before this key
-				if self.iter.valid() {
-					self.iter.prev();
-				} else {
-					self.iter.last();
-				}
-			}
-			Bound::Unbounded => {
-				self.iter.last();
-			}
-		}
-
-		// Ensure we're still within the start bound
-		if self.iter.valid() {
-			let current_user_key = self.iter.key();
-
-			match &self.start_bound {
-				Bound::Included(ref start_key) => {
-					if current_user_key < start_key.user_key.as_slice() {
-						self.exhausted = true;
-					}
-				}
-				Bound::Excluded(ref start_key) => {
-					if current_user_key <= start_key.user_key.as_slice() {
-						self.exhausted = true;
-					}
-				}
-				Bound::Unbounded => {}
-			}
-		}
-
-		self.exhausted = self.exhausted || !self.iter.valid();
-		self.backward_initialized = true;
-		Ok(())
-	}
-
-	pub(crate) fn value(&self) -> &[u8] {
-		if self.keys_only {
-			&self.empty_value_buffer
-		} else if self.iter.valid() && !self.exhausted {
-			self.iter.value()
+		// Pre-position for forward iteration
+		if let Some(lower_key) = lower {
+			iter.seek_ge(lower_key);
 		} else {
-			&self.empty_value_buffer
+			iter.first();
+		}
+
+		MemTableIterator {
+			iter,
+			keys_only,
 		}
 	}
 }
 
-impl Iterator for MemTableRangeInternalIterator<'_> {
+/// Thin wrapper around SkiplistIterator for keys_only optimization and Result wrapping
+pub(crate) struct MemTableIterator<'a> {
+	iter: SkiplistIterator<'a>,
+	keys_only: bool,
+}
+
+impl Iterator for MemTableIterator<'_> {
 	type Item = Result<(InternalKey, Value)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
-		if !self.valid() {
-			return None;
-		}
-
-		// Reconstruct InternalKey from key bytes + trailer
-		let user_key = self.iter.key().to_vec();
-		let trailer = self.iter.trailer();
-		let internal_key = InternalKey {
-			user_key,
-			timestamp: 0,
-			trailer,
+		let (key, value) = self.iter.next()?;
+		let value = if self.keys_only {
+			vec![]
+		} else {
+			value
 		};
-		let value = self.value().to_vec();
-		let _ = self.next_internal();
-		Some(Ok((internal_key, value)))
+		Some(Ok((key, value)))
 	}
 }
 
-impl DoubleEndedIterator for MemTableRangeInternalIterator<'_> {
+impl DoubleEndedIterator for MemTableIterator<'_> {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		if !self.backward_initialized {
-			let _ = self.seek_to_last();
-			self.backward_initialized = true;
-		}
-		if !self.valid() {
-			return None;
-		}
-
-		// Reconstruct InternalKey from key bytes + trailer
-		let user_key = self.iter.key().to_vec();
-		let trailer = self.iter.trailer();
-		let internal_key = InternalKey {
-			user_key,
-			timestamp: 0,
-			trailer,
+		let (key, value) = self.iter.next_back()?;
+		let value = if self.keys_only {
+			vec![]
+		} else {
+			value
 		};
-		let value = self.value().to_vec();
-		let _ = self.prev_internal();
-		Some(Ok((internal_key, value)))
+		Some(Ok((key, value)))
 	}
 }

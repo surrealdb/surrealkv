@@ -1,10 +1,13 @@
 use std::cmp::Ordering;
+use std::iter::DoubleEndedIterator;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use rand::Rng;
 
 use crate::memtable::arena::Arena;
+use crate::sstable::InternalKey;
+use crate::Value;
 
 const MAX_HEIGHT: usize = 20;
 const P_VALUE: f64 = 1.0 / std::f64::consts::E; // ~0.368
@@ -64,6 +67,8 @@ struct Node {
 	key_size: u32,
 	/// Trailer: (seq_num << 8) | kind
 	key_trailer: u64,
+	/// Timestamp: System time in nanoseconds
+	key_timestamp: u64,
 	/// Size of value in bytes
 	value_size: u32,
 	/// Padding for 8-byte alignment of tower
@@ -143,6 +148,7 @@ fn new_node(
 	height: u32,
 	key: &[u8],
 	trailer: u64,
+	timestamp: u64,
 	value: &[u8],
 ) -> Option<*mut Node> {
 	if height < 1 || height > MAX_HEIGHT as u32 {
@@ -153,6 +159,7 @@ fn new_node(
 
 	unsafe {
 		(*nd).key_trailer = trailer;
+		(*nd).key_timestamp = timestamp;
 		// Copy key bytes directly (no length prefix!)
 		let key_bytes = arena.get_bytes_mut((*nd).key_offset, (*nd).key_size);
 		key_bytes.copy_from_slice(key);
@@ -287,9 +294,9 @@ impl Skiplist {
 	}
 
 	/// Add a key
-	pub fn add(&self, key: &[u8], trailer: u64, value: &[u8]) -> Result<(), Error> {
+	pub fn add(&self, key: &[u8], trailer: u64, timestamp: u64, value: &[u8]) -> Result<(), Error> {
 		let mut ins = Inserter::new();
-		self.add_internal(key, trailer, value, &mut ins)
+		self.add_internal(key, trailer, timestamp, value, &mut ins)
 	}
 
 	/// Internal add
@@ -297,6 +304,7 @@ impl Skiplist {
 		&self,
 		key: &[u8],
 		trailer: u64,
+		timestamp: u64,
 		value: &[u8],
 		ins: &mut Inserter,
 	) -> Result<(), Error> {
@@ -306,7 +314,7 @@ impl Skiplist {
 		}
 
 		// Allocate node
-		let (nd, height) = self.new_node(key, trailer, value)?;
+		let (nd, height) = self.new_node(key, trailer, timestamp, value)?;
 		let nd_offset = self.arena.get_pointer_offset(nd as *const u8);
 
 		// Link at each level
@@ -376,9 +384,16 @@ impl Skiplist {
 	}
 
 	/// Create new node with height CAS
-	fn new_node(&self, key: &[u8], trailer: u64, value: &[u8]) -> Result<(*mut Node, u32), Error> {
+	fn new_node(
+		&self,
+		key: &[u8],
+		trailer: u64,
+		timestamp: u64,
+		value: &[u8],
+	) -> Result<(*mut Node, u32), Error> {
 		let height = self.random_height();
-		let nd = new_node(&self.arena, height, key, trailer, value).ok_or(Error::ArenaFull)?;
+		let nd = new_node(&self.arena, height, key, trailer, timestamp, value)
+			.ok_or(Error::ArenaFull)?;
 
 		// Try to increase height via CAS
 		let mut list_height = self.height();
@@ -560,12 +575,12 @@ impl Skiplist {
 	}
 
 	/// Create iterator
-	pub fn iter(&self) -> SkiplistIterator<'_> {
+	pub(crate) fn iter(&self) -> SkiplistIterator<'_> {
 		self.new_iter(None, None)
 	}
 
 	/// Create iterator with bounds
-	pub fn new_iter<'b>(
+	pub(crate) fn new_iter<'b>(
 		&'b self,
 		lower: Option<&[u8]>,
 		upper: Option<&[u8]>,
@@ -577,6 +592,9 @@ impl Skiplist {
 			upper: upper.map(|s| s.to_vec()),
 			lower_node: std::ptr::null_mut(),
 			upper_node: std::ptr::null_mut(),
+			forward_done: false,
+			backward_done: false,
+			backward_started: false,
 		}
 	}
 }
@@ -586,13 +604,16 @@ impl Skiplist {
 // ============================================================================
 
 /// Iterator
-pub struct SkiplistIterator<'a> {
+pub(crate) struct SkiplistIterator<'a> {
 	list: &'a Skiplist,
 	nd: *mut Node,
 	lower: Option<Vec<u8>>, // Inclusive lower bound (owned for lifetime flexibility)
 	upper: Option<Vec<u8>>, // Exclusive upper bound (owned for lifetime flexibility)
 	lower_node: *mut Node,  // Cached node at lower bound
 	upper_node: *mut Node,  // Cached node at upper bound
+	forward_done: bool,     // Set when next() reaches end
+	backward_done: bool,    // Set when next_back() reaches start
+	backward_started: bool, // Tracks if next_back() has repositioned
 }
 
 impl<'a> SkiplistIterator<'a> {
@@ -604,14 +625,6 @@ impl<'a> SkiplistIterator<'a> {
 			&& !self.nd.is_null()
 			&& self.nd != self.lower_node
 			&& self.nd != self.upper_node
-	}
-
-	/// Set bounds
-	pub fn set_bounds(&mut self, lower: Option<&[u8]>, upper: Option<&[u8]>) {
-		self.lower = lower.map(|s| s.to_vec());
-		self.upper = upper.map(|s| s.to_vec());
-		self.lower_node = std::ptr::null_mut();
-		self.upper_node = std::ptr::null_mut();
 	}
 
 	/// Get current key (user_key bytes only)
@@ -626,6 +639,13 @@ impl<'a> SkiplistIterator<'a> {
 	pub fn trailer(&self) -> u64 {
 		debug_assert!(self.valid());
 		unsafe { (*self.nd).key_trailer }
+	}
+
+	/// Get current timestamp
+	#[inline]
+	pub fn timestamp(&self) -> u64 {
+		debug_assert!(self.valid());
+		unsafe { (*self.nd).key_timestamp }
 	}
 
 	/// Get current value
@@ -673,8 +693,8 @@ impl<'a> SkiplistIterator<'a> {
 		}
 	}
 
-	/// Move to next entry
-	pub fn next(&mut self) {
+	/// Advance to next entry (internal method, renamed to avoid trait conflict)
+	pub fn advance(&mut self) {
 		debug_assert!(self.valid());
 		self.nd = self.list.get_next(self.nd, 0);
 		if self.nd == self.list.tail || self.nd == self.upper_node {
@@ -783,5 +803,65 @@ impl<'a> SkiplistIterator<'a> {
 		}
 
 		(prev, next)
+	}
+}
+
+// ============================================================================
+// Iterator Traits (matching Pebble's direct iterator usage)
+// ============================================================================
+
+impl Iterator for SkiplistIterator<'_> {
+	type Item = (InternalKey, Value);
+
+	fn next(&mut self) -> Option<Self::Item> {
+		if self.forward_done {
+			return None;
+		}
+
+		if !self.valid() {
+			self.forward_done = true;
+			return None;
+		}
+
+		let key = InternalKey {
+			user_key: self.key().to_vec(),
+			timestamp: self.timestamp(),
+			trailer: self.trailer(),
+		};
+		let value = self.value().to_vec();
+		self.advance();
+		Some((key, value))
+	}
+}
+
+impl DoubleEndedIterator for SkiplistIterator<'_> {
+	fn next_back(&mut self) -> Option<Self::Item> {
+		if self.backward_done {
+			return None;
+		}
+
+		if !self.backward_started {
+			// First call - reposition for backward iteration
+			self.backward_started = true;
+			match self.upper.clone() {
+				Some(upper) => self.seek_lt(&upper),
+				None => self.last(),
+			}
+		} else {
+			self.prev();
+		}
+
+		if !self.valid() {
+			self.backward_done = true;
+			return None;
+		}
+
+		let key = InternalKey {
+			user_key: self.key().to_vec(),
+			timestamp: self.timestamp(),
+			trailer: self.trailer(),
+		};
+		let value = self.value().to_vec();
+		Some((key, value))
 	}
 }
