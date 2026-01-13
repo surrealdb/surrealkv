@@ -407,11 +407,63 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
-		self.get_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
+		self.get_at_version_with_options(
+			key,
+			&ReadOptions::default().with_timestamp(Some(timestamp)),
+		)
 	}
 
 	/// Gets a value for a key, with custom read options.
-	pub fn get_with_options<K>(&self, key: K, options: &ReadOptions) -> Result<Option<Value>>
+	pub fn get_with_options<K>(&self, key: K, _options: &ReadOptions) -> Result<Option<Value>>
+	where
+		K: IntoBytes,
+	{
+		// If the transaction is closed, return an error.
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		// If the key is empty, return an error.
+		if key.as_slice().is_empty() {
+			return Err(Error::EmptyKey);
+		}
+
+		// Do not allow reads if it is a write-only transaction
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// RYOW semantics: Read your own writes. If the value is in the write set,
+		// return it.
+		if let Some(last_entry) =
+			self.write_set.get(key.as_slice()).and_then(|entries| entries.last())
+		{
+			// If the entry is a tombstone, return None.
+			if last_entry.is_tombstone() {
+				return Ok(None);
+			}
+			if let Some(v) = &last_entry.value {
+				return Ok(Some(v.clone()));
+			}
+			// If the entry has no value, it means the key was deleted in this transaction.
+			return Ok(None);
+		}
+
+		// The value is not in the write set, so attempt to get it from the snapshot.
+		match self.snapshot.as_ref().unwrap().get(key.as_slice())? {
+			Some(val) => {
+				// Resolve the value reference through VLog if needed
+				let resolved_value = self.core.resolve_value(&val.0)?;
+				Ok(Some(resolved_value))
+			}
+			None => Ok(None),
+		}
+	}
+
+	pub fn get_at_version_with_options<K>(
+		&self,
+		key: K,
+		options: &ReadOptions,
+	) -> Result<Option<Value>>
 	where
 		K: IntoBytes,
 	{
@@ -441,32 +493,10 @@ impl Transaction {
 				Some(snapshot) => snapshot.get_at_version(key.as_slice(), timestamp),
 				None => Err(Error::NoSnapshot),
 			};
-		}
-
-		// RYOW semantics: Read your own writes. If the value is in the write set,
-		// return it.
-		if let Some(last_entry) =
-			self.write_set.get(key.as_slice()).and_then(|entries| entries.last())
-		{
-			// If the entry is a tombstone, return None.
-			if last_entry.is_tombstone() {
-				return Ok(None);
-			}
-			if let Some(v) = &last_entry.value {
-				return Ok(Some(v.clone()));
-			}
-			// If the entry has no value, it means the key was deleted in this transaction.
-			return Ok(None);
-		}
-
-		// The value is not in the write set, so attempt to get it from the snapshot.
-		match self.snapshot.as_ref().unwrap().get(key.as_slice())? {
-			Some(val) => {
-				// Resolve the value reference through VLog if needed
-				let resolved_value = self.core.resolve_value(&val.0)?;
-				Ok(Some(resolved_value))
-			}
-			None => Ok(None),
+		} else {
+			return Err(Error::InvalidArgument(
+				"Timestamp is required for versioned queries".to_string(),
+			));
 		}
 	}
 
@@ -627,7 +657,7 @@ impl Transaction {
 		let mut options =
 			ReadOptions::default().with_keys_only(true).with_timestamp(Some(timestamp));
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.keys_with_options(&options)
+		self.keys_at_version_with_options(&options)
 	}
 
 	/// Gets keys in a key range, with custom read options.
@@ -645,7 +675,20 @@ impl Transaction {
 		&self,
 		options: &ReadOptions,
 	) -> Result<Box<dyn DoubleEndedIterator<Item = KeysResult> + '_>> {
-		// If timestamp is specified, use versioned query
+		// Force keys_only to true for this method
+		let options = options.clone().with_keys_only(true);
+		let start_key = options.lower_bound.clone().unwrap_or_default();
+		let end_key = options.upper_bound.clone().unwrap_or_default();
+		Ok(Box::new(
+			TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
+				.map(|result| result.map(|(key, _)| key)),
+		))
+	}
+
+	pub fn keys_at_version_with_options(
+		&self,
+		options: &ReadOptions,
+	) -> Result<Box<dyn DoubleEndedIterator<Item = KeysResult> + '_>> {
 		if let Some(timestamp) = options.timestamp {
 			// Check if versioned queries are enabled
 			if !self.core.opts.enable_versioning {
@@ -664,14 +707,9 @@ impl Transaction {
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
-			// Force keys_only to true for this method
-			let options = options.clone().with_keys_only(true);
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
-			Ok(Box::new(
-				TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
-					.map(|result| result.map(|(key, _)| key)),
-			))
+			return Err(Error::InvalidArgument(
+				"Timestamp is required for versioned queries".to_string(),
+			));
 		}
 	}
 
@@ -715,7 +753,7 @@ impl Transaction {
 	{
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.range_with_options(&options)
+		self.range_at_version_with_options(&options)
 	}
 
 	/// Gets keys and values in a range, with custom read options.
@@ -730,7 +768,26 @@ impl Transaction {
 		&self,
 		options: &ReadOptions,
 	) -> Result<Box<dyn DoubleEndedIterator<Item = RangeResult> + '_>> {
-		// If timestamp is specified, use versioned query
+		let start_key = options.lower_bound.clone().unwrap_or_default();
+		let end_key = options.upper_bound.clone().unwrap_or_default();
+		Ok(Box::new(
+			TransactionRangeIterator::new_with_options(self, start_key, end_key, options)?.map(
+				|result| {
+					result.and_then(|(k, v)| {
+						v.ok_or_else(|| {
+							Error::InvalidArgument("Expected value for range query".to_string())
+						})
+						.map(|value| (k, value))
+					})
+				},
+			),
+		))
+	}
+
+	pub fn range_at_version_with_options(
+		&self,
+		options: &ReadOptions,
+	) -> Result<Box<dyn DoubleEndedIterator<Item = RangeResult> + '_>> {
 		if let Some(timestamp) = options.timestamp {
 			// Check if versioned queries are enabled
 			if !self.core.opts.enable_versioning {
@@ -749,20 +806,9 @@ impl Transaction {
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
-			Ok(Box::new(
-				TransactionRangeIterator::new_with_options(self, start_key, end_key, options)?.map(
-					|result| {
-						result.and_then(|(k, v)| {
-							v.ok_or_else(|| {
-								Error::InvalidArgument("Expected value for range query".to_string())
-							})
-							.map(|value| (k, value))
-						})
-					},
-				),
-			))
+			return Err(Error::InvalidArgument(
+				"Timestamp is required for versioned queries".to_string(),
+			));
 		}
 	}
 
