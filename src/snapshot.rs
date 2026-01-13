@@ -742,7 +742,7 @@ impl<'a> KMergeIterator<'a> {
 
 		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
 
-		// Extract user key bounds from InternalKeyRange (Pebble model: inclusive lower, exclusive
+		// Extract user key bounds from InternalKeyRange (inclusive lower, exclusive
 		// upper)
 		let (start_bound, end_bound) = query_range.as_ref();
 		let lower = match start_bound {
