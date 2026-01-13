@@ -271,7 +271,7 @@ impl DatabaseCheckpoint {
 			let active = self.core.active_memtable.read()?;
 			if !active.is_empty() {
 				drop(active); // Release read lock before acquiring write lock
-				self.core.rotate_memtable(true)?; // force=true
+				self.core.rotate_memtable()?;
 			}
 		}
 

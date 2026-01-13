@@ -258,14 +258,34 @@ impl WalTestHelper {
 		}
 	}
 
-	/// Verify that memtable contains expected keys
-	pub fn verify_entries(memtable: &Arc<MemTable>, expected_keys: &[String]) {
+	/// Count total entries across all memtables
+	pub fn count_total_entries(memtables: &[(Arc<MemTable>, u64)]) -> usize {
+		memtables.iter().map(|(m, _)| m.iter(false).count()).sum()
+	}
+
+	/// Verify total entry count across all memtables
+	pub fn verify_total_entry_count(memtables: &[(Arc<MemTable>, u64)], expected: usize) {
+		let actual = Self::count_total_entries(memtables);
+		assert_eq!(
+			actual, expected,
+			"Total entry count mismatch. Found: {}, Expected: {}",
+			actual, expected
+		);
+	}
+
+	/// Verify that all memtables together contain expected keys
+	pub fn verify_entries_across_memtables(
+		memtables: &[(Arc<MemTable>, u64)],
+		expected_keys: &[String],
+	) {
 		let mut found_keys = Vec::new();
-		for entry in memtable.iter(false) {
-			// entry is Result<(InternalKey, Bytes)>
-			let (entry_key, _) = entry.unwrap();
-			let key = String::from_utf8(entry_key.user_key.clone()).unwrap();
-			found_keys.push(key);
+		for (memtable, _) in memtables {
+			for entry in memtable.iter(false) {
+				// entry is Result<(InternalKey, Bytes)>
+				let (entry_key, _) = entry.unwrap();
+				let key = String::from_utf8(entry_key.user_key.clone()).unwrap();
+				found_keys.push(key);
+			}
 		}
 		found_keys.sort();
 
@@ -283,16 +303,6 @@ impl WalTestHelper {
 		for (found, expected) in found_keys.iter().zip(expected_sorted.iter()) {
 			assert_eq!(found, expected, "Key mismatch");
 		}
-	}
-
-	/// Verify entry count in memtable
-	pub fn verify_entry_count(memtable: &Arc<MemTable>, expected_count: usize) {
-		let actual_count = memtable.iter(false).count();
-		assert_eq!(
-			actual_count, expected_count,
-			"Entry count mismatch. Found: {}, Expected: {}",
-			actual_count, expected_count
-		);
 	}
 
 	/// Generate expected keys for a segment range

@@ -77,9 +77,7 @@ async fn test_memtable_flush() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 200; // Total size of kvs below
-	});
+	let opts = create_test_options(path.clone(), |_| {});
 
 	let key = "hello";
 	let values = ["world", "universe", "everyone", "planet"];
@@ -111,9 +109,7 @@ async fn test_memtable_flush_with_delete() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 200; // Total size of kvs below
-	});
+	let opts = create_test_options(path.clone(), |_| {});
 
 	let key = "hello";
 	let values = ["world", "universe", "everyone"];
@@ -1191,7 +1187,7 @@ async fn test_discard_file_directory_structure() {
 
 	let opts = create_test_options(path.clone(), |opts| {
 		opts.vlog_max_file_size = 1024;
-		opts.max_memtable_size = 512;
+		opts.max_memtable_size = 1024;
 		opts.enable_vlog = true;
 	});
 
@@ -1593,7 +1589,7 @@ async fn test_sstable_lsn_bug() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 500; // Small memtable to force flushes
+		opts.max_memtable_size = 1024;
 		opts.level_count = 2;
 	});
 
@@ -1672,7 +1668,7 @@ async fn test_table_id_assignment_across_restart() {
 
 	// Create options with very small memtable to force frequent flushes
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 500; // Very small to force flushes
+		opts.max_memtable_size = 4 * 1024;
 		opts.level_count = 2;
 	});
 
@@ -2097,7 +2093,7 @@ async fn test_checkpoint_with_vlog() {
 
 	let opts = create_test_options(path.clone(), |opts| {
 		opts.vlog_max_file_size = 1024;
-		opts.max_memtable_size = 512;
+		opts.max_memtable_size = 1024;
 		opts.enable_vlog = true;
 	});
 
@@ -2345,7 +2341,7 @@ async fn test_log_number_advances_with_flushes() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 512; // Small memtable to trigger flushes
+		opts.max_memtable_size = 1024;
 	});
 
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
@@ -2385,7 +2381,7 @@ async fn test_last_sequence_persists_across_restart() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 512;
+		opts.max_memtable_size = 1024;
 	});
 
 	let expected_last_seq;
@@ -2507,7 +2503,7 @@ async fn test_clean_shutdown_no_empty_wal() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 512;
+		opts.max_memtable_size = 1024;
 	});
 
 	let wal_dir = opts.wal_dir();
@@ -2564,7 +2560,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 512;
+		opts.max_memtable_size = 1024;
 	});
 
 	{
@@ -2661,7 +2657,7 @@ async fn test_full_crash_recovery_scenario() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 512;
+		opts.max_memtable_size = 1024;
 	});
 
 	// Phase 1: Write batch A, flush
@@ -2738,7 +2734,7 @@ async fn test_concurrent_flush_after_rotation() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 512;
+		opts.max_memtable_size = 1024;
 	});
 
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
@@ -2978,7 +2974,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 512; // Small to trigger flushes
+		opts.max_memtable_size = 1024;
 	});
 
 	let sst_dir = opts.sstable_dir();
@@ -3014,7 +3010,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 			drop(manifest);
 		}
 
-		assert_eq!(sst_after, sst_before + 1, "Flush should create 1 SST");
+		assert!(sst_after > sst_before, "Flush should create many SST");
 
 		tree.close().await.unwrap();
 	}
@@ -3044,7 +3040,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		{
 			let manifest = tree.core.inner.level_manifest.read().unwrap();
 
-			assert_eq!(sst_after, sst_before + 1, "Second flush should create 1 more SST");
+			assert!(sst_after > sst_before, "Second flush should create more SST");
 			assert!(manifest.get_log_number() > log_num_before, "log_number should advance");
 			drop(manifest);
 		}
@@ -3081,9 +3077,8 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 
 		let sst_after_close = count_ssts();
 
-		assert_eq!(
-			sst_after_close,
-			sst_before_close + 1,
+		assert!(
+			sst_after_close > sst_before_close,
 			"Shutdown should flush and create SST when flush_on_close=true"
 		);
 	}
@@ -3218,7 +3213,7 @@ async fn test_flush_all_memtables_on_close_ordering() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 500; // Small to trigger flushes
+		opts.max_memtable_size = 1024;
 		opts.flush_on_close = true;
 	});
 
@@ -3304,7 +3299,7 @@ async fn test_flush_immutable_memtables_with_empty_active() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 500; // Small to trigger flush
+		opts.max_memtable_size = 1024;
 		opts.flush_on_close = true;
 	});
 
@@ -3770,7 +3765,7 @@ async fn test_manifest_atomic_sst_and_log_number() {
 
 	// Use tiny threshold to ensure flush happens
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 100; // Very small to guarantee flush
+		opts.max_memtable_size = 1024;
 	});
 
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();

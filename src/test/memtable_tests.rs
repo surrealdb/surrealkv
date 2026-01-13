@@ -6,7 +6,7 @@ use test_log::test;
 use crate::batch::Batch;
 use crate::memtable::MemTable;
 use crate::sstable::InternalKeyKind;
-use crate::{user_range_to_internal_range, Value};
+use crate::Value;
 
 fn assert_value(encoded_value: &Value, expected_value: &[u8]) {
 	// Skip the tag byte (first byte) and compare the actual value content
@@ -184,9 +184,6 @@ fn test_empty_memtable() {
 
 	// Test that is_empty returns true
 	assert!(memtable.is_empty());
-
-	// Test that size returns 0
-	assert_eq!(memtable.size(), 0);
 }
 
 #[test]

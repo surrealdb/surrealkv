@@ -986,7 +986,7 @@ async fn test_range_value_pointer_resolution_bug() {
 
 	let tree = TreeBuilder::new()
 		.with_path(temp_dir.path().to_path_buf())
-		.with_max_memtable_size(512)
+		.with_max_memtable_size(64 * 1024)
 		.build()
 		.unwrap();
 

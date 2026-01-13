@@ -277,7 +277,7 @@ impl CoreInner {
 	/// 3. Adds old memtable to immutable queue
 	///
 	/// The actual SST flush happens asynchronously via background task.
-	pub(crate) fn rotate_memtable(&self, _force: bool) -> Result<()> {
+	pub(crate) fn rotate_memtable(&self) -> Result<()> {
 		// Step 1: Acquire WRITE lock upfront to prevent race conditions
 		let mut active_memtable = self.active_memtable.write()?;
 
@@ -896,7 +896,7 @@ impl CommitEnv for LsmCommitEnv {
 				// Arena is full - rotate memtable and retry
 				log::debug!("apply: arena full, rotating memtable");
 
-				self.core.rotate_memtable(true)?;
+				self.core.rotate_memtable()?;
 
 				// Schedule background flush
 				if let Some(ref task_manager) = self.task_manager {
@@ -1542,7 +1542,7 @@ impl Tree {
 			let active = self.core.inner.active_memtable.read()?;
 			if !active.is_empty() {
 				drop(active); // Release read lock before acquiring write lock
-				self.core.inner.rotate_memtable(true)?; // force=true bypasses threshold
+				self.core.inner.rotate_memtable()?;
 			}
 		}
 
