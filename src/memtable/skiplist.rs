@@ -607,8 +607,6 @@ impl Skiplist {
 			upper: upper.map(|s| s.to_vec()),
 			lower_node: std::ptr::null_mut(),
 			upper_node: std::ptr::null_mut(),
-			forward_done: false,
-			backward_done: false,
 			backward_started: false,
 		}
 	}
@@ -626,8 +624,6 @@ pub(crate) struct SkiplistIterator<'a> {
 	upper: Option<Vec<u8>>, // Exclusive upper bound (owned for lifetime flexibility)
 	lower_node: *mut Node,  // Cached node at lower bound
 	upper_node: *mut Node,  // Cached node at upper bound
-	forward_done: bool,     // Set when next() reaches end
-	backward_done: bool,    // Set when next_back() reaches start
 	backward_started: bool, // Tracks if next_back() has repositioned
 }
 
@@ -672,6 +668,7 @@ impl<'a> SkiplistIterator<'a> {
 
 	/// Move to first entry
 	pub fn first(&mut self) {
+		self.backward_started = false; // Reset on reposition
 		self.nd = self.list.get_next(self.list.head, 0);
 		if self.nd == self.list.tail || self.nd == self.upper_node {
 			return;
@@ -691,6 +688,7 @@ impl<'a> SkiplistIterator<'a> {
 
 	/// Move to last entry
 	pub fn last(&mut self) {
+		self.backward_started = false; // Reset on reposition
 		self.nd = self.list.get_prev(self.list.tail, 0);
 		if self.nd == self.list.head || self.nd == self.lower_node {
 			return;
@@ -750,6 +748,7 @@ impl<'a> SkiplistIterator<'a> {
 
 	/// Seek to first entry >= key
 	pub fn seek_ge(&mut self, key: &[u8]) {
+		self.backward_started = false; // Reset on reposition
 		let (_, next) = self.seek_for_base_splice(key);
 		self.nd = next;
 		if self.nd == self.list.tail || self.nd == self.upper_node {
@@ -770,6 +769,7 @@ impl<'a> SkiplistIterator<'a> {
 
 	/// Seek to last entry < key
 	pub fn seek_lt(&mut self, key: &[u8]) {
+		self.backward_started = false; // Reset on reposition
 		let (prev, _) = self.seek_for_base_splice(key);
 		self.nd = prev;
 		if self.nd == self.list.head || self.nd == self.lower_node {
@@ -829,12 +829,7 @@ impl Iterator for SkiplistIterator<'_> {
 	type Item = (InternalKey, Value);
 
 	fn next(&mut self) -> Option<Self::Item> {
-		if self.forward_done {
-			return None;
-		}
-
 		if !self.valid() {
-			self.forward_done = true;
 			return None;
 		}
 
@@ -851,23 +846,18 @@ impl Iterator for SkiplistIterator<'_> {
 
 impl DoubleEndedIterator for SkiplistIterator<'_> {
 	fn next_back(&mut self) -> Option<Self::Item> {
-		if self.backward_done {
-			return None;
-		}
-
 		if !self.backward_started {
 			// First call - reposition for backward iteration
-			self.backward_started = true;
 			match self.upper.clone() {
 				Some(upper) => self.seek_lt(&upper),
 				None => self.last(),
 			}
+			self.backward_started = true; // Set AFTER reposition
 		} else {
 			self.prev();
 		}
 
 		if !self.valid() {
-			self.backward_done = true;
 			return None;
 		}
 
