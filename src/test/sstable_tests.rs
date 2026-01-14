@@ -164,7 +164,7 @@ fn test_table_seek() {
 	let opts = default_opts();
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 
 	let key = InternalKey::new(Vec::from(b"bcd"), 2, InternalKeyKind::Set, 0);
 	iter.seek(&key.encode()).unwrap();
@@ -192,33 +192,33 @@ fn test_table_iter() {
 	let opts = default_opts();
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 
-	iter.advance().unwrap();
+	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"abc"[..], &b"def"[..]));
 
-	iter.advance().unwrap();
+	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"abd"[..], &b"dee"[..]));
 
-	iter.advance().unwrap();
+	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"bcd"[..], &b"asa"[..]));
 
-	iter.advance().unwrap();
+	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"bsr"[..], &b"a00"[..]));
 
-	iter.advance().unwrap();
+	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"xyz"[..], &b"xxx"[..]));
 
-	iter.advance().unwrap();
+	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"xzz"[..], &b"yyy"[..]));
 
-	iter.advance().unwrap();
+	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"zzz"[..], &b"111"[..]));
 }
@@ -336,7 +336,7 @@ fn test_iter_items() {
 		"Table should contain num_items entries"
 	);
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	let mut item = 0;
 	while iter.valid() {
@@ -953,7 +953,7 @@ fn test_table_iterator_no_items_lost() {
 	let opts = default_opts();
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	let mut collected_items = Vec::new();
 
@@ -1003,7 +1003,7 @@ fn test_table_iterator_does_not_restart_after_exhaustion() {
 	let opts = default_opts();
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	let mut seen_keys = Vec::new();
 	let mut iteration_count = 0;
@@ -1060,14 +1060,14 @@ fn test_table_iterator_advance_method_correctness() {
 	let opts = default_opts();
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 
 	for expected_index in 0..data.len() {
-		let advance_result = iter.advance().unwrap();
+		let advance_result = iter.next().unwrap();
 
 		assert!(
 			advance_result,
-			"advance() should return true when moving to item {} (of {})",
+			"next() should return true when moving to item {} (of {})",
 			expected_index,
 			data.len()
 		);
@@ -1082,21 +1082,18 @@ fn test_table_iterator_advance_method_correctness() {
             );
 	}
 
-	let final_advance = iter.advance().unwrap();
-	assert!(
-		!final_advance,
-		"advance() should return false when trying to advance past the last item"
-	);
+	let final_advance = iter.next().unwrap();
+	assert!(!final_advance, "next() should return false when trying to advance past the last item");
 	assert!(!iter.valid(), "Iterator should be invalid after advancing past the last item");
 
 	for i in 0..3 {
-		let advance_result = iter.advance().unwrap();
+		let advance_result = iter.next().unwrap();
 		assert!(
 			!advance_result,
-			"advance() should continue returning false after exhaustion (call #{})",
+			"next() should continue returning false after exhaustion (call #{})",
 			i + 1
 		);
-		assert!(!iter.valid(), "Iterator should remain invalid after additional advance() calls");
+		assert!(!iter.valid(), "Iterator should remain invalid after additional next() calls");
 	}
 }
 
@@ -1109,7 +1106,7 @@ fn test_table_iterator_edge_cases() {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 		let collected = collect_all(&mut iter).unwrap();
 		assert_eq!(collected.len(), 1, "Single item table should return exactly 1 item");
 
@@ -1126,7 +1123,7 @@ fn test_table_iterator_edge_cases() {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 		let collected = collect_all(&mut iter).unwrap();
 		assert_eq!(collected.len(), 2, "Two item table should return exactly 2 items");
 
@@ -1149,7 +1146,7 @@ fn test_table_iterator_edge_cases() {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 		let collected = collect_all(&mut iter).unwrap();
 		assert_eq!(collected.len(), 100, "Large table should return exactly 100 items");
 
@@ -1186,7 +1183,7 @@ fn test_table_iterator_seek_then_iterate() {
 	let test_cases = vec![("item_01", 0), ("item_03", 2), ("item_05", 4)];
 
 	for (seek_key, expected_start_index) in test_cases {
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 
 		let internal_key =
 			InternalKey::new(Vec::from(seek_key.as_bytes()), 1, InternalKeyKind::Set, 0);
@@ -1202,7 +1199,7 @@ fn test_table_iterator_seek_then_iterate() {
 			let value_str = std::str::from_utf8(current_value.as_ref()).unwrap();
 			remaining_items.push((key_str.to_string(), value_str.to_string()));
 
-			if !iter.advance().unwrap() {
+			if !iter.next().unwrap() {
 				break;
 			}
 		}
@@ -1248,7 +1245,7 @@ fn test_table_iterator_seek_behavior() {
 
 	// Test seek to existing key
 	{
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 		let seek_key = InternalKey::new(Vec::from(b"key_005"), 1, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode()).unwrap();
 
@@ -1282,7 +1279,7 @@ fn test_table_iterator_seek_behavior() {
 
 	// Test seek to non-existing key (should find next key)
 	{
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 		let seek_key = InternalKey::new(Vec::from(b"key_003"), 1, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode()).unwrap();
 
@@ -1294,7 +1291,7 @@ fn test_table_iterator_seek_behavior() {
 
 	// Test seek past end
 	{
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 		let seek_key = InternalKey::new(Vec::from(b"key_999"), 1, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode()).unwrap();
 
@@ -1319,7 +1316,7 @@ fn test_table_iterator_performance_regression() {
 	use std::time::Instant;
 
 	let start = Instant::now();
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	let count = count_iter(&mut iter).unwrap();
 	let duration = start.elapsed();
 
@@ -1329,7 +1326,7 @@ fn test_table_iterator_performance_regression() {
 
 	let start = Instant::now();
 	for i in (0..1000).step_by(100) {
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 		let seek_key =
 			InternalKey::new(format!("key_{i:06}").into_bytes(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode()).unwrap();
@@ -1347,14 +1344,14 @@ fn test_table_iterator_state_invariants() {
 	let opts = default_opts();
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 
 	while iter.valid() {
 		let _key = iter.key();
 		let _value = iter.value();
 
-		if !iter.advance().unwrap() {
+		if !iter.next().unwrap() {
 			break;
 		}
 	}
@@ -1362,10 +1359,7 @@ fn test_table_iterator_state_invariants() {
 	assert!(!iter.valid(), "Iterator should be invalid after exhaustion");
 
 	for _ in 0..5 {
-		assert!(
-			!iter.advance().unwrap(),
-			"advance() should continue returning false after exhaustion"
-		);
+		assert!(!iter.next().unwrap(), "next() should continue returning false after exhaustion");
 		assert!(!iter.valid(), "Iterator should remain invalid");
 
 		let next_result = iter.next();
@@ -1386,7 +1380,7 @@ fn test_table_iterator_multiple_iterations() {
 
 	// Create multiple iterators and verify they work independently
 	for iteration in 0..3 {
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 		let collected = collect_all(&mut iter).unwrap();
 
 		assert_eq!(
@@ -1428,11 +1422,11 @@ fn test_table_iterator_positioning_edge_cases() {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 
-		// advance() tries to seek_to_first() which fails on empty table (no valid blocks)
-		let result = iter.advance();
-		assert!(result.is_err(), "advance() on empty table should return error (no valid blocks)");
+		// next() tries to seek_to_first() which fails on empty table (no valid blocks)
+		let result = iter.next();
+		assert!(result.is_err(), "next() on empty table should return error (no valid blocks)");
 
 		// Iterator should not be valid
 		assert!(!iter.valid(), "Iterator should not be valid on empty table");
@@ -1445,12 +1439,12 @@ fn test_table_iterator_positioning_edge_cases() {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 
-		assert!(iter.advance().unwrap(), "First advance should succeed on single-item table");
+		assert!(iter.next().unwrap(), "First advance should succeed on single-item table");
 		assert!(iter.valid(), "Iterator should be valid after first advance");
 
-		assert!(!iter.advance().unwrap(), "Second advance should fail on single-item table");
+		assert!(!iter.next().unwrap(), "Second advance should fail on single-item table");
 		assert!(!iter.valid(), "Iterator should be invalid after second advance");
 	}
 
@@ -1461,16 +1455,16 @@ fn test_table_iterator_positioning_edge_cases() {
 		let opts = default_opts();
 		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 
 		// Exhaust the iterator
-		while iter.advance().unwrap() {
+		while iter.next().unwrap() {
 			// just advance
 		}
 		assert!(!iter.valid(), "Iterator should be invalid after exhaustion");
 
 		// Further operations should not restart the iterator
-		assert!(!iter.advance().unwrap(), "advance() after exhaustion should return false");
+		assert!(!iter.next().unwrap(), "next() after exhaustion should return false");
 		assert!(!iter.valid(), "Iterator should remain invalid");
 
 		let next_result = iter.next();
@@ -1488,19 +1482,19 @@ fn test_table_iterator_next_vs_advance_consistency() {
 	let opts = default_opts();
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-	// Test with manual advance() loop - need to position first
-	let mut iter1 = table.iter(None);
+	// Test with manual next() loop - need to position first
+	let mut iter1 = table.iter(None).unwrap();
 	iter1.seek_to_first().unwrap();
 	let mut collected_via_advance = Vec::new();
 	while iter1.valid() {
 		collected_via_advance.push((iter1.key().to_owned(), iter1.value().to_vec()));
-		if !iter1.advance().unwrap() {
+		if !iter1.next().unwrap() {
 			break;
 		}
 	}
 
 	// Test with standard iterator interface
-	let mut iter2 = table.iter(None);
+	let mut iter2 = table.iter(None).unwrap();
 	iter2.seek_to_first().unwrap();
 	let mut collected_via_next = Vec::new();
 	while iter2.valid() {
@@ -1514,7 +1508,7 @@ fn test_table_iterator_next_vs_advance_consistency() {
 	assert_eq!(
 		collected_via_next.len(),
 		collected_via_advance.len(),
-		"next() and advance() should yield same number of items"
+		"next() and next() should yield same number of items"
 	);
 
 	for (i, ((next_key, next_val), (adv_key, adv_val))) in
@@ -1522,12 +1516,12 @@ fn test_table_iterator_next_vs_advance_consistency() {
 	{
 		assert_eq!(
 			next_key.user_key, adv_key.user_key,
-			"Key mismatch at position {i} between next() and advance()"
+			"Key mismatch at position {i} between next() and next()"
 		);
 		assert_eq!(
 			next_val.as_slice(),
 			*adv_val,
-			"Value mismatch at position {i} between next() and advance()"
+			"Value mismatch at position {i} between next() and next()"
 		);
 	}
 }
@@ -1546,7 +1540,7 @@ fn test_table_iterator_basic_correctness() {
 	let opts = default_opts();
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	let collected = collect_all(&mut iter).unwrap();
 
 	assert_eq!(collected.len(), 50, "Should collect exactly 50 items");
@@ -1621,7 +1615,7 @@ fn test_table_with_partitioned_index() {
 	}
 
 	// Test full iteration
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	let collected = collect_all(&mut iter).unwrap();
 	assert_eq!(collected.len(), 100, "Should iterate through all entries");
 
@@ -2190,7 +2184,7 @@ fn test_table_iterator_seek_nonexistent_key() {
 
 	// Seek to key_aaa which does NOT exist
 	// key_aaa < key_bbb lexicographically
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	let lookup_key = InternalKey::new(
 		Vec::from(b"key_aaa"),
 		2, // Higher seq number for lookup
@@ -2231,7 +2225,7 @@ fn test_table_iterator_seek_nonexistent_past_end() {
 	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 	// Seek to key_zzz which is past all keys
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	let lookup_key = InternalKey::new(Vec::from(b"key_zzz"), 2, InternalKeyKind::Set, 0);
 	iter.seek(&lookup_key.encode()).unwrap();
 
@@ -2255,7 +2249,7 @@ fn test_table_iterator_seek_exact_match() {
 	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 	// Seek to key_bbb which exists
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	let lookup_key = InternalKey::new(Vec::from(b"key_bbb"), 2, InternalKeyKind::Set, 0);
 	iter.seek(&lookup_key.encode()).unwrap();
 
@@ -2290,10 +2284,12 @@ fn test_table_iter_upper_bound_included() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Iterate with range (Unbounded, Included("key_005"))
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Unbounded,
-		Bound::Included(b"key_005".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Unbounded,
+			Bound::Included(b"key_005".as_slice()),
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_first().unwrap();
@@ -2339,10 +2335,12 @@ fn test_table_iter_upper_bound_excluded() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Iterate with range (Unbounded, Excluded("key_005"))
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Unbounded,
-		Bound::Excluded(b"key_005".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Unbounded,
+			Bound::Excluded(b"key_005".as_slice()),
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_first().unwrap();
@@ -2387,7 +2385,7 @@ fn test_table_iter_unbounded_reverse() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// First test forward iteration to make sure table has data
-	let mut iter_temp = table.iter(None);
+	let mut iter_temp = table.iter(None).unwrap();
 	let collected = collect_all(&mut iter_temp).unwrap();
 	assert_eq!(collected.len(), 10, "Forward iteration should return 10 items");
 
@@ -2404,7 +2402,7 @@ fn test_table_iter_unbounded_reverse() {
 	);
 
 	// Test unbounded reverse iteration
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_last().unwrap(); // Position at the end for reverse iteration
 
 	let mut results = Vec::new();
@@ -2442,10 +2440,12 @@ fn test_table_iter_lower_bound_included_reverse() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Iterate with range (Included("key_003"), Unbounded) using prev()
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Included(b"key_003".as_slice()),
-		Bound::Unbounded,
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Included(b"key_003".as_slice()),
+			Bound::Unbounded,
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_to_last().unwrap();
@@ -2492,10 +2492,12 @@ fn test_table_iter_both_bounds() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Iterate with range (Included("key_002"), Excluded("key_007"))
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Included(b"key_002".as_slice()),
-		Bound::Excluded(b"key_007".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Included(b"key_002".as_slice()),
+			Bound::Excluded(b"key_007".as_slice()),
+		)))
+		.unwrap();
 	iter.seek_first().unwrap();
 
 	let mut results = Vec::new();
@@ -2538,7 +2540,7 @@ fn test_table_iter_unbounded() {
 
 	// Test that (Bound::Unbounded, Bound::Unbounded) returns all items
 	let mut iter =
-		table.iter(Some(user_range_to_internal_range(Bound::Unbounded, Bound::Unbounded)));
+		table.iter(Some(user_range_to_internal_range(Bound::Unbounded, Bound::Unbounded))).unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_first().unwrap();
@@ -2598,7 +2600,7 @@ fn test_table_iter_forward_and_backward() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Test forward iteration
-	let mut forward_iter = table.iter(None);
+	let mut forward_iter = table.iter(None).unwrap();
 	forward_iter.seek_to_first().unwrap();
 	let mut forward_keys = Vec::new();
 	while forward_iter.valid() {
@@ -2613,7 +2615,7 @@ fn test_table_iter_forward_and_backward() {
 	assert_eq!(forward_keys[29], "key_029");
 
 	// Test backward iteration on separate iterator
-	let mut backward_iter = table.iter(None);
+	let mut backward_iter = table.iter(None).unwrap();
 	backward_iter.seek_to_last().unwrap();
 	let mut backward_keys = Vec::new();
 	while backward_iter.valid() {
@@ -2628,7 +2630,7 @@ fn test_table_iter_forward_and_backward() {
 	assert_eq!(backward_keys[29], "key_000");
 
 	// Test seeking to last and then going backward
-	let mut seek_iter = table.iter(None);
+	let mut seek_iter = table.iter(None).unwrap();
 	seek_iter.seek_to_last().unwrap();
 	let mut seek_backward = Vec::new();
 	while seek_iter.valid() {
@@ -2678,10 +2680,12 @@ fn test_table_iter_upper_bound_excluded_reverse() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Reverse iteration with EXCLUDED upper bound
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Unbounded,
-		Bound::Excluded(b"key_005".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Unbounded,
+			Bound::Excluded(b"key_005".as_slice()),
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_last().unwrap();
@@ -2723,10 +2727,12 @@ fn test_table_iter_upper_bound_included_reverse_nonexistent_key() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Reverse iteration with INCLUDED upper bound on non-existent key
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Unbounded,
-		Bound::Included(b"key_005".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Unbounded,
+			Bound::Included(b"key_005".as_slice()),
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_last().unwrap();
@@ -2768,10 +2774,12 @@ fn test_table_iter_lower_bound_excluded_forward_with_multiple_versions() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Forward iteration with EXCLUDED lower bound
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Excluded(b"key_003".as_slice()),
-		Bound::Unbounded,
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Excluded(b"key_003".as_slice()),
+			Bound::Unbounded,
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_first().unwrap();
@@ -2809,10 +2817,12 @@ fn test_table_iter_excluded_bound_across_multiple_blocks() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Forward iteration with excluded lower bound
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Excluded(b"key_003".as_slice()),
-		Bound::Unbounded,
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Excluded(b"key_003".as_slice()),
+			Bound::Unbounded,
+		)))
+		.unwrap();
 	iter.seek_first().unwrap();
 
 	let mut results = Vec::new();
@@ -2866,10 +2876,12 @@ fn test_table_iter_excluded_bound_across_partitions_reverse() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Reverse iteration with excluded upper bound
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Unbounded,
-		Bound::Excluded(b"key_003".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Unbounded,
+			Bound::Excluded(b"key_003".as_slice()),
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_last().unwrap();
@@ -2921,10 +2933,12 @@ fn test_table_iter_both_bounds_excluded_same_key() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Forward iteration with both bounds excluded at same key
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Excluded(b"key_003".as_slice()),
-		Bound::Excluded(b"key_003".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Excluded(b"key_003".as_slice()),
+			Bound::Excluded(b"key_003".as_slice()),
+		)))
+		.unwrap();
 	iter.seek_first().unwrap();
 
 	let results = collect_all(&mut iter).unwrap();
@@ -2956,10 +2970,12 @@ fn test_table_iter_both_bounds_excluded_same_key_reverse() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Reverse iteration with both bounds excluded at same key
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Excluded(b"key_003".as_slice()),
-		Bound::Excluded(b"key_003".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Excluded(b"key_003".as_slice()),
+			Bound::Excluded(b"key_003".as_slice()),
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_last().unwrap();
@@ -3000,10 +3016,12 @@ fn test_table_iter_excluded_bounds_adjacent_keys() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Forward iteration
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Excluded(b"key_002".as_slice()),
-		Bound::Excluded(b"key_004".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Excluded(b"key_002".as_slice()),
+			Bound::Excluded(b"key_004".as_slice()),
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_first().unwrap();
@@ -3058,10 +3076,12 @@ fn test_table_iter_multiple_versions_at_both_bounds() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Forward iteration
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Excluded(b"key_002".as_slice()),
-		Bound::Excluded(b"key_005".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Excluded(b"key_002".as_slice()),
+			Bound::Excluded(b"key_005".as_slice()),
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_first().unwrap();
@@ -3227,7 +3247,7 @@ fn test_iterator_trait_prev_multi_partition_bug() {
 	println!("Created table with {} index partitions", num_partitions);
 
 	// Create iterator and position at the LAST entry
-	let mut iter = table_arc.iter(None);
+	let mut iter = table_arc.iter(None).unwrap();
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid(), "Iterator should be valid after seek_to_last");
 
@@ -3243,7 +3263,7 @@ fn test_iterator_trait_prev_multi_partition_bug() {
 
 	// Now test with explicit trait method call
 	// Reset iterator
-	let mut iter2 = table_arc.iter(None);
+	let mut iter2 = table_arc.iter(None).unwrap();
 	iter2.seek_to_last().unwrap();
 	assert!(iter2.valid(), "Iterator should be valid after seek_to_last");
 
@@ -3621,7 +3641,7 @@ fn test_reverse_iteration_unbounded_consistency() {
 	let opts = default_opts();
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 
 	// Collect all items in reverse
 	iter.seek_to_last().unwrap();
@@ -3670,7 +3690,7 @@ fn test_prev_iteration_across_partitions() {
 	assert!(index.blocks.len() > 1, "Test requires multiple partitions");
 
 	// Test reverse iteration crosses partitions correctly
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_last().unwrap();
 	let mut results = Vec::new();
 
@@ -3705,7 +3725,7 @@ fn test_seek_to_last_valid_block() {
 	let opts = default_opts();
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_last().unwrap();
 
 	assert!(iter.valid());
@@ -3736,10 +3756,12 @@ fn test_range_at_exact_block_boundary() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Test with bound that might be at a block boundary
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Included(b"key_003".as_slice()),
-		Bound::Included(b"key_006".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Included(b"key_003".as_slice()),
+			Bound::Included(b"key_006".as_slice()),
+		)))
+		.unwrap();
 
 	let collected = collect_all(&mut iter).unwrap();
 	let results: Vec<String> =
@@ -3767,10 +3789,12 @@ fn test_range_with_multiple_versions_at_boundary() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Included bound should include ALL versions
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Included(b"key_002".as_slice()),
-		Bound::Included(b"key_003".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Included(b"key_002".as_slice()),
+			Bound::Included(b"key_003".as_slice()),
+		)))
+		.unwrap();
 
 	let collected = collect_all(&mut iter).unwrap();
 	let results: Vec<(String, u64)> = collected
@@ -3807,10 +3831,12 @@ fn test_excluded_bound_skips_all_versions() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Excluded lower bound should skip ALL versions of key_002
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Excluded(b"key_002".as_slice()),
-		Bound::Unbounded,
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Excluded(b"key_002".as_slice()),
+			Bound::Unbounded,
+		)))
+		.unwrap();
 
 	let collected = collect_all(&mut iter).unwrap();
 	let results: Vec<String> =
@@ -3840,10 +3866,12 @@ fn test_reverse_iteration_with_excluded_upper_bound() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Excluded upper bound in reverse
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Unbounded,
-		Bound::Excluded(b"key_003".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Unbounded,
+			Bound::Excluded(b"key_003".as_slice()),
+		)))
+		.unwrap();
 
 	let mut results = Vec::new();
 	iter.seek_last().unwrap();
@@ -3873,10 +3901,12 @@ fn test_empty_range_returns_nothing() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Range [ccc, ccc] - "ccc" doesn't exist
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Included(b"ccc".as_slice()),
-		Bound::Included(b"ccc".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Included(b"ccc".as_slice()),
+			Bound::Included(b"ccc".as_slice()),
+		)))
+		.unwrap();
 
 	let results = collect_all(&mut iter).unwrap();
 	assert_eq!(results.len(), 0, "Range for non-existent key should be empty");
@@ -3891,10 +3921,12 @@ fn test_range_completely_before_table() {
 	let opts = default_opts();
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Included(b"aaa".as_slice()),
-		Bound::Included(b"bbb".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Included(b"aaa".as_slice()),
+			Bound::Included(b"bbb".as_slice()),
+		)))
+		.unwrap();
 
 	let results = collect_all(&mut iter).unwrap();
 	assert_eq!(results.len(), 0, "Range before all keys should be empty");
@@ -3909,10 +3941,12 @@ fn test_range_completely_after_table() {
 	let opts = default_opts();
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Included(b"xxx".as_slice()),
-		Bound::Included(b"zzz".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Included(b"xxx".as_slice()),
+			Bound::Included(b"zzz".as_slice()),
+		)))
+		.unwrap();
 
 	let results = collect_all(&mut iter).unwrap();
 	assert_eq!(results.len(), 0, "Range after all keys should be empty");
@@ -3928,10 +3962,12 @@ fn test_reverse_iteration_empty_range() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Range [ccc, ccc] doesn't exist
-	let mut iter = table.iter(Some(user_range_to_internal_range(
-		Bound::Included(b"ccc".as_slice()),
-		Bound::Included(b"ccc".as_slice()),
-	)));
+	let mut iter = table
+		.iter(Some(user_range_to_internal_range(
+			Bound::Included(b"ccc".as_slice()),
+			Bound::Included(b"ccc".as_slice()),
+		)))
+		.unwrap();
 
 	let result = iter.seek_last();
 	assert!(result.is_err() || !iter.valid(), "Empty range should be invalid on seek_last()");
@@ -4209,7 +4245,7 @@ fn test_table_iterator_full_scan() {
 	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 	// Full forward scan
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 
 	let mut collected = Vec::new();
@@ -4254,7 +4290,7 @@ fn test_table_iterator_reverse_scan() {
 	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
 
 	// Full reverse scan
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_last().unwrap();
 
 	let mut collected = Vec::new();
@@ -4297,7 +4333,7 @@ fn test_table_iterator_seek_and_scan() {
 	let size = writer.finish().unwrap();
 	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 
 	// Test Seek to various points
 	let seek_points = vec!["key_005", "key_010", "key_015", "key_020", "key_025"];
@@ -4370,7 +4406,7 @@ fn test_table_iterator_across_partitions() {
 	assert!(partitioned_index.blocks.len() >= 2, "Should have multiple partitions");
 
 	// Full forward scan across partitions
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 
 	let mut count = 0;
@@ -4412,7 +4448,7 @@ fn test_empty_table_operations() {
 	assert!(result.is_err(), "Get on empty table should return error");
 
 	// Verify iterator immediately invalid
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	let result = iter.seek_to_first();
 	assert!(result.is_err(), "Get on empty table should return error");
 }
@@ -4441,7 +4477,7 @@ fn test_single_entry_table() {
 	}
 
 	// Test iterator
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid(), "Iterator should be valid");
 	assert_eq!(iter.key().user_key(), b"single_key");

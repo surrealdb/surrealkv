@@ -108,9 +108,11 @@ impl Compactor {
 		let to_merge: Vec<_> =
 			input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
 
+		// Keep tables alive while iterators borrow from them
 		let iterators: Vec<BoxedInternalIterator<'_>> = to_merge
-			.into_iter()
-			.map(|table| Box::new(table.iter(None)) as BoxedInternalIterator<'_>)
+			.iter()
+			.filter_map(|table| table.iter(None).ok())
+			.map(|iter| Box::new(iter) as BoxedInternalIterator<'_>)
 			.collect();
 
 		drop(levels);

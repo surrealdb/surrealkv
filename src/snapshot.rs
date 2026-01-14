@@ -754,8 +754,9 @@ impl<'a> KMergeIterator<'a> {
 					if table.is_before_range(&query_range) || table.is_after_range(&query_range) {
 						continue;
 					}
-					let table_iter = table.iter(Some((*query_range).clone()));
-					iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
+					if let Ok(table_iter) = table.iter(Some((*query_range).clone())) {
+						iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
+					}
 				}
 			} else {
 				// Level 1+: Tables have non-overlapping key ranges, use binary search
@@ -763,8 +764,9 @@ impl<'a> KMergeIterator<'a> {
 				let end_idx = level.find_last_overlapping_table(&query_range);
 
 				for table in &level.tables[start_idx..end_idx] {
-					let table_iter = table.iter(Some((*query_range).clone()));
-					iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
+					if let Ok(table_iter) = table.iter(Some((*query_range).clone())) {
+						iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
+					}
 				}
 			}
 		}

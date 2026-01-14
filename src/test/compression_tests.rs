@@ -117,7 +117,7 @@ fn test_compression_10k_pairs_roundtrip() {
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	let mut count = 0;
 	iter.seek_to_first().unwrap();
 	while iter.valid() {
@@ -128,7 +128,7 @@ fn test_compression_10k_pairs_roundtrip() {
 		assert_eq!(value, &data[count].1[..]);
 
 		count += 1;
-		iter.advance().unwrap();
+		iter.next().unwrap();
 	}
 	assert_eq!(count, 10_000, "Should iterate through all 10k entries");
 
@@ -201,8 +201,8 @@ fn test_compression_size_reduction() {
 			.unwrap(),
 	);
 
-	let mut iter_uncompressed = table_uncompressed.iter(None);
-	let mut iter_compressed = table_compressed.iter(None);
+	let mut iter_uncompressed = table_uncompressed.iter(None).unwrap();
+	let mut iter_compressed = table_compressed.iter(None).unwrap();
 
 	iter_uncompressed.seek_to_first().unwrap();
 	iter_compressed.seek_to_first().unwrap();
@@ -212,8 +212,8 @@ fn test_compression_size_reduction() {
 		assert_eq!(iter_uncompressed.key().user_key(), iter_compressed.key().user_key());
 		assert_eq!(iter_uncompressed.value(), iter_compressed.value());
 		count += 1;
-		iter_uncompressed.advance().unwrap();
-		iter_compressed.advance().unwrap();
+		iter_uncompressed.next().unwrap();
+		iter_compressed.next().unwrap();
 	}
 	assert_eq!(count, 10_000, "Both tables should have identical 10k entries");
 }
@@ -261,7 +261,7 @@ fn test_compression_mixed_patterns() {
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	let mut count = 0;
 
@@ -269,7 +269,7 @@ fn test_compression_mixed_patterns() {
 		assert_eq!(iter.key().user_key(), &data[count].0[..]);
 		assert_eq!(iter.value(), &data[count].1[..]);
 		count += 1;
-		iter.advance().unwrap();
+		iter.next().unwrap();
 	}
 
 	assert_eq!(count, 10_000, "Should have all 10k mixed pattern entries");
@@ -296,7 +296,7 @@ fn test_compression_iterator_operations() {
 	};
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
@@ -322,7 +322,7 @@ fn test_compression_iterator_operations() {
 	while iter.valid() {
 		assert_eq!(iter.key().user_key(), &data[forward_count].0[..]);
 		forward_count += 1;
-		iter.advance().unwrap();
+		iter.next().unwrap();
 	}
 	assert_eq!(forward_count, 10_000);
 
@@ -351,7 +351,7 @@ fn test_compression_iterator_operations() {
 
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
-	iter.advance().unwrap();
+	iter.next().unwrap();
 	assert_eq!(iter.key().user_key(), &data[1].0[..]);
 	iter.prev().unwrap();
 	assert_eq!(iter.key().user_key(), &data[0].0[..]);
@@ -360,8 +360,8 @@ fn test_compression_iterator_operations() {
 	iter.seek(&mid_key.encode()).unwrap();
 	assert_eq!(iter.key().user_key(), &data[5000].0[..]);
 
-	iter.advance().unwrap();
-	iter.advance().unwrap();
+	iter.next().unwrap();
+	iter.next().unwrap();
 	assert_eq!(iter.key().user_key(), &data[5002].0[..]);
 	iter.prev().unwrap();
 	assert_eq!(iter.key().user_key(), &data[5001].0[..]);
@@ -397,7 +397,7 @@ fn test_compression_large_values() {
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	let mut count = 0;
 
@@ -410,7 +410,7 @@ fn test_compression_large_values() {
 		assert_eq!(value, &data[count].1[..], "Value content mismatch at index {}", count);
 
 		count += 1;
-		iter.advance().unwrap();
+		iter.next().unwrap();
 	}
 
 	assert_eq!(count, 1_000, "Should have all 1000 large value entries");
@@ -447,7 +447,7 @@ fn test_compression_checksum_verification() {
 	let table = Arc::new(
 		Table::new(1, Arc::clone(&opts), wrap_buffer(buffer.clone()), size as u64).unwrap(),
 	);
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid(), "Uncorrupted table should be valid");
 
@@ -466,7 +466,7 @@ fn test_compression_checksum_verification() {
 		Ok(corrupted_table) => {
 			// Corruption might be in a data block - try to iterate
 			let corrupted_table = Arc::new(corrupted_table);
-			let mut corrupted_iter = corrupted_table.iter(None);
+			let mut corrupted_iter = corrupted_table.iter(None).unwrap();
 			assert!(
 				corrupted_iter.seek_to_first().is_err(),
 				"seek_to_first() on corrupted table should return error"
@@ -903,7 +903,7 @@ fn test_table_writer_with_level_compression() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), buffer_len).unwrap());
 
 	// Verify the table was created successfully
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"key1");

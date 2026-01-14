@@ -5,6 +5,7 @@ pub(crate) mod filter_block;
 pub(crate) mod index_block;
 pub(crate) mod meta;
 pub(crate) mod table;
+pub(crate) mod two_level_iter;
 
 use std::cmp::Ordering;
 use std::fmt::Debug;

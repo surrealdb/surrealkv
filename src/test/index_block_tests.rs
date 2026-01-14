@@ -602,7 +602,7 @@ fn test_partitioned_index_seek_correctness() {
 	}
 
 	// Test SeekForPrev - iterate backwards
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid(), "Iterator should be valid after seek_to_last");
 
@@ -717,7 +717,7 @@ fn test_partitioned_index_reseek() {
 		crate::sstable::table::Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap(),
 	);
 
-	let mut iter = table.iter(None);
+	let mut iter = table.iter(None).unwrap();
 
 	// Seek to middle key
 	let seek_key = InternalKey::new(b"0055".to_vec(), 4, InternalKeyKind::Set, 0);
@@ -904,7 +904,7 @@ fn test_partitioned_index_varying_partition_sizes() {
 		}
 
 		// Test iterator works at this partition size
-		let mut iter = table.iter(None);
+		let mut iter = table.iter(None).unwrap();
 		iter.seek_to_first().unwrap();
 		let mut count = 0;
 
