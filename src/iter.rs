@@ -6,7 +6,7 @@ use crate::clock::LogicalClock;
 use crate::error::Result;
 use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
-use crate::{Comparator, InternalKeyComparator, Value};
+use crate::{Comparator, Value};
 
 /// Boxed internal iterator type for dynamic dispatch
 pub type BoxedInternalIterator<'a> = Box<dyn InternalIterator + 'a>;
@@ -39,13 +39,13 @@ pub(crate) struct MergingIterator<'a> {
 	/// Number of active (non-exhausted) levels
 	active_count: usize,
 	/// Comparator for keys
-	cmp: Arc<InternalKeyComparator>,
+	cmp: Arc<dyn Comparator>,
 	/// Direction (forward/backward)
 	direction: Direction,
 }
 
 impl<'a> MergingIterator<'a> {
-	pub fn new(iterators: Vec<BoxedInternalIterator<'a>>, cmp: Arc<InternalKeyComparator>) -> Self {
+	pub fn new(iterators: Vec<BoxedInternalIterator<'a>>, cmp: Arc<dyn Comparator>) -> Self {
 		let levels: Vec<_> = iterators
 			.into_iter()
 			.map(|iter| MergeLevel {
@@ -307,7 +307,7 @@ pub(crate) struct CompactionIterator<'a> {
 impl<'a> CompactionIterator<'a> {
 	pub(crate) fn new(
 		iterators: Vec<BoxedInternalIterator<'a>>,
-		cmp: Arc<InternalKeyComparator>,
+		cmp: Arc<dyn Comparator>,
 		is_bottom_level: bool,
 		vlog: Option<Arc<VLog>>,
 		enable_versioning: bool,

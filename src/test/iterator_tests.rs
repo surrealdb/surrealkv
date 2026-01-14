@@ -4,8 +4,9 @@ use tempfile::TempDir;
 use test_log::test;
 
 use crate::clock::{LogicalClock, MockLogicalClock};
+use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::iter::CompactionIterator;
-use crate::sstable::{InternalKey, InternalKeyKind};
+use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind, InternalKeyRef};
 use crate::vlog::{VLog, ValueLocation};
 use crate::{Options, Result, VLogChecksumLevel, Value};
 
@@ -42,43 +43,93 @@ fn create_vlog_value(vlog: &Arc<VLog>, key: &[u8], value: &[u8]) -> Value {
 	ValueLocation::with_pointer(pointer).encode()
 }
 
+fn create_comparator() -> Arc<InternalKeyComparator> {
+	Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())))
+}
+
 // Creates a mock iterator with predefined entries
 struct MockIterator {
 	items: Vec<(InternalKey, Value)>,
+	encoded_keys: Vec<Vec<u8>>, // Store encoded keys to avoid temporary references
 	index: usize,
 }
 
 impl MockIterator {
 	fn new(items: Vec<(InternalKey, Value)>) -> Self {
+		let encoded_keys: Vec<Vec<u8>> = items.iter().map(|(key, _)| key.encode()).collect();
 		Self {
 			items,
+			encoded_keys,
 			index: 0,
 		}
 	}
 }
 
-impl Iterator for MockIterator {
-	type Item = Result<(InternalKey, Value)>;
+impl InternalIterator for MockIterator {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		// Find first key >= target
+		for i in 0..self.encoded_keys.len() {
+			if self.encoded_keys[i].as_slice() >= target {
+				self.index = i;
+				return Ok(true);
+			}
+		}
+		self.index = self.items.len(); // Invalid position
+		Ok(false)
+	}
 
-	fn next(&mut self) -> Option<Self::Item> {
-		if self.index < self.items.len() {
-			let item = self.items[self.index].clone();
-			self.index += 1;
-			Some(Ok(item))
+	fn seek_first(&mut self) -> Result<bool> {
+		if self.items.is_empty() {
+			self.index = 0;
+			Ok(false)
 		} else {
-			None
+			self.index = 0;
+			Ok(true)
 		}
 	}
-}
 
-impl DoubleEndedIterator for MockIterator {
-	fn next_back(&mut self) -> Option<Self::Item> {
-		if self.index < self.items.len() {
-			let item = self.items.pop()?;
-			Some(Ok(item))
+	fn seek_last(&mut self) -> Result<bool> {
+		if self.items.is_empty() {
+			self.index = 0;
+			Ok(false)
 		} else {
-			None
+			self.index = self.items.len() - 1;
+			Ok(true)
 		}
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		if self.index + 1 < self.items.len() {
+			self.index += 1;
+			Ok(true)
+		} else {
+			self.index = self.items.len(); // Invalid position
+			Ok(false)
+		}
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		if self.index > 0 {
+			self.index -= 1;
+			Ok(true)
+		} else {
+			self.index = usize::MAX; // Invalid position
+			Ok(false)
+		}
+	}
+
+	fn valid(&self) -> bool {
+		self.index < self.items.len()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		debug_assert!(self.valid());
+		InternalKeyRef::from_encoded(&self.encoded_keys[self.index])
+	}
+
+	fn value(&self) -> &[u8] {
+		debug_assert!(self.valid());
+		&self.items[self.index].1
 	}
 }
 
@@ -110,6 +161,7 @@ fn test_merge_iterator_sequence_ordering() {
 	// Create the merge iterator
 	let mut merge_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false,
 		None,
 		false, // versioning disabled
@@ -188,6 +240,7 @@ fn test_compaction_iterator_hard_delete_filtering() {
 	// Test non-bottom level (should keep hard delete entries)
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false,
 		None,
 		false,
@@ -261,6 +314,7 @@ fn test_compaction_iterator_hard_delete_filtering() {
 	// Use bottom level
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		true, // bottom level
 		None,
 		false,
@@ -316,6 +370,7 @@ async fn test_combined_iterator_returns_latest_version() {
 	// Create compaction iterator (non-bottom level)
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -372,6 +427,7 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -430,6 +486,7 @@ async fn test_hard_delete_at_bottom_level() {
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		true, // bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -473,6 +530,7 @@ async fn test_hard_delete_at_non_bottom_level() {
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -536,6 +594,7 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -613,6 +672,7 @@ fn test_no_vlog_no_delete_list() {
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // not bottom level
 		None,  // no vlog
 		false,
@@ -677,6 +737,7 @@ async fn test_sequence_ordering_across_iterators() {
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -831,6 +892,7 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1012,6 +1074,7 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3, iter4],
+		create_comparator(),
 		true, // BOTTOM LEVEL - delete markers should be dropped
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1173,6 +1236,7 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // NON-BOTTOM LEVEL
 		Some(Arc::clone(&vlog)),
 		false, // VERSIONING DISABLED
@@ -1315,6 +1379,7 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		true, // BOTTOM LEVEL
 		Some(Arc::clone(&vlog)),
 		false, // VERSIONING DISABLED
@@ -1426,6 +1491,7 @@ async fn test_delete_list_logic() {
 		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -1481,6 +1547,7 @@ async fn test_delete_list_logic() {
 		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -1532,6 +1599,7 @@ async fn test_delete_list_logic() {
 		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			false, // disable versioning
@@ -1586,6 +1654,7 @@ async fn test_delete_list_logic() {
 		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -1641,6 +1710,7 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 	// Test non-bottom level compaction (should preserve Replace)
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // non-bottom level
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1707,6 +1777,7 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 	// Test compaction
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // non-bottom level
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1765,6 +1836,7 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 	// Test compaction
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // non-bottom level
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1821,6 +1893,7 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 	// Test non-bottom level compaction
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // non-bottom level
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1879,6 +1952,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test non-bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -1933,6 +2007,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -1991,6 +2066,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2050,6 +2126,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2124,6 +2201,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2, iter3],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2176,6 +2254,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test non-bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2226,6 +2305,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2284,6 +2364,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test non-bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2, iter3],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2340,6 +2421,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
@@ -2397,6 +2479,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2, iter3],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
@@ -2448,6 +2531,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test non-bottom level compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
@@ -2498,6 +2582,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Test bottom level compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			false, // versioning disabled

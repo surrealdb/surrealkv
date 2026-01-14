@@ -179,8 +179,16 @@ fn test_empty_memtable() {
 	let memtable = Arc::new(MemTable::default());
 
 	// Test that iterator is empty
-	let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
-	assert!(entries.is_empty());
+	let mut iter = memtable.iter();
+	iter.seek_first().unwrap();
+	let mut count = 0;
+	while iter.valid() {
+		count += 1;
+		if !iter.next().unwrap_or(false) {
+			break;
+		}
+	}
+	assert_eq!(count, 0);
 
 	// Test that is_empty returns true
 	assert!(memtable.is_empty());
@@ -196,7 +204,18 @@ fn test_single_key() {
 	)]);
 
 	// Collect all entries
-	let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
+	let mut iter = memtable.iter();
+	iter.seek_first().unwrap();
+	let mut entries = Vec::new();
+	while iter.valid() {
+		let key = iter.key().to_owned();
+		let value_bytes = iter.value();
+		let value = value_bytes.to_vec();
+		entries.push((key, value));
+		if !iter.next().unwrap_or(false) {
+			break;
+		}
+	}
 	assert_eq!(entries.len(), 1);
 
 	let (key, encoded_value) = &entries[0];
@@ -223,7 +242,18 @@ fn test_multiple_keys() {
 	]);
 
 	// Collect all entries
-	let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
+	let mut iter = memtable.iter();
+	iter.seek_first().unwrap();
+	let mut entries = Vec::new();
+	while iter.valid() {
+		let key = iter.key().to_owned();
+		let value_bytes = iter.value();
+		let value = value_bytes.to_vec();
+		entries.push((key, value));
+		if !iter.next().unwrap_or(false) {
+			break;
+		}
+	}
 	assert_eq!(entries.len(), 3);
 
 	// Extract user keys for comparison
@@ -253,7 +283,18 @@ fn test_sequence_number_ordering() {
 	]);
 
 	// Collect all entries
-	let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
+	let mut iter = memtable.iter();
+	iter.seek_first().unwrap();
+	let mut entries = Vec::new();
+	while iter.valid() {
+		let key = iter.key().to_owned();
+		let value_bytes = iter.value();
+		let value = value_bytes.to_vec();
+		entries.push((key, value));
+		if !iter.next().unwrap_or(false) {
+			break;
+		}
+	}
 	assert_eq!(entries.len(), 3);
 
 	// Extract sequence numbers and values
@@ -316,7 +357,18 @@ fn test_tombstones() {
 	]);
 
 	// Iterator should see all entries including tombstones
-	let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
+	let mut iter = memtable.iter();
+	iter.seek_first().unwrap();
+	let mut entries = Vec::new();
+	while iter.valid() {
+		let key = iter.key().to_owned();
+		let value_bytes = iter.value();
+		let value = value_bytes.to_vec();
+		entries.push((key, value));
+		if !iter.next().unwrap_or(false) {
+			break;
+		}
+	}
 
 	// Count entries for each key
 	let mut key_counts = HashMap::new();
@@ -341,7 +393,18 @@ fn test_key_kinds() {
 	]);
 
 	// All key types should be visible in the iterator
-	let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
+	let mut iter = memtable.iter();
+	iter.seek_first().unwrap();
+	let mut entries = Vec::new();
+	while iter.valid() {
+		let key = iter.key().to_owned();
+		let value_bytes = iter.value();
+		let value = value_bytes.to_vec();
+		entries.push((key, value));
+		if !iter.next().unwrap_or(false) {
+			break;
+		}
+	}
 	assert_eq!(entries.len(), 4);
 
 	// Extract and verify key information
@@ -396,15 +459,24 @@ fn test_range_query() {
 
 	// Test inclusive lower, exclusive upper (Pebble model)
 	// For Included("k") upper, we use Excluded("l") to include "k"
-	let range_entries: Vec<_> = memtable
-		.range(
-			Some("c".as_bytes()), // Inclusive lower
-			Some("l".as_bytes()), // Exclusive upper (includes "k")
-			false,
-		)
-		.map(|r| r.unwrap())
-		.filter(|(key, _)| key.user_key.as_slice() <= b"k".as_slice()) // Filter to include only up to "k"
-		.collect();
+	let mut range_iter = memtable.range(
+		Some("c".as_bytes()), // Inclusive lower
+		Some("k".as_bytes()), // Exclusive upper (includes "k")
+	);
+	range_iter.seek_first().unwrap();
+	let mut range_entries = Vec::new();
+	while range_iter.valid() {
+		let key = range_iter.key().to_owned();
+		let value_bytes = range_iter.value();
+		let value = value_bytes.to_vec();
+		// Filter to include only up to "k"
+		if key.user_key.as_slice() <= b"k".as_slice() {
+			range_entries.push((key, value));
+		}
+		if !range_iter.next().unwrap_or(false) {
+			break;
+		}
+	}
 
 	let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -416,14 +488,21 @@ fn test_range_query() {
 	assert_eq!(&user_keys[4], b"k");
 
 	// Test exclusive range (Pebble model)
-	let range_entries: Vec<_> = memtable
-		.range(
-			Some("c".as_bytes()), // Inclusive lower
-			Some("k".as_bytes()), // Exclusive upper (excludes "k")
-			false,
-		)
-		.map(|r| r.unwrap())
-		.collect();
+	let mut range_iter = memtable.range(
+		Some("c".as_bytes()), // Inclusive lower
+		Some("k".as_bytes()), // Exclusive upper (excludes "k")
+	);
+	range_iter.seek_first().unwrap();
+	let mut range_entries = Vec::new();
+	while range_iter.valid() {
+		let key = range_iter.key().to_owned();
+		let value_bytes = range_iter.value();
+		let value = value_bytes.to_vec();
+		range_entries.push((key, value));
+		if !range_iter.next().unwrap_or(false) {
+			break;
+		}
+	}
 
 	let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
@@ -446,14 +525,21 @@ fn test_range_query_with_sequence_numbers() {
 	]);
 
 	// Perform a range query from "a" to "f" (Pebble model: inclusive lower, exclusive upper)
-	let range_entries: Vec<_> = memtable
-		.range(
-			Some("a".as_bytes()), // Inclusive lower
-			Some("f".as_bytes()), // Exclusive upper
-			false,
-		)
-		.map(|r| r.unwrap())
-		.collect();
+	let mut range_iter = memtable.range(
+		Some("a".as_bytes()), // Inclusive lower
+		Some("f".as_bytes()), // Exclusive upper
+	);
+	range_iter.seek_first().unwrap();
+	let mut range_entries = Vec::new();
+	while range_iter.valid() {
+		let key = range_iter.key().to_owned();
+		let value_bytes = range_iter.value();
+		let value = value_bytes.to_vec();
+		range_entries.push((key, value));
+		if !range_iter.next().unwrap_or(false) {
+			break;
+		}
+	}
 
 	// Extract user keys, sequence numbers and values
 	let mut entries_info = Vec::new();
@@ -499,7 +585,18 @@ fn test_binary_keys() {
 		(vec![0xFF, 0xFE, 0xFD], b"value4".to_vec(), InternalKeyKind::Set, None),
 	]);
 
-	let entries: Vec<_> = memtable.iter(false).map(|r| r.unwrap()).collect();
+	let mut iter = memtable.iter();
+	iter.seek_first().unwrap();
+	let mut entries = Vec::new();
+	while iter.valid() {
+		let key = iter.key().to_owned();
+		let value_bytes = iter.value();
+		let value = value_bytes.to_vec();
+		entries.push((key, value));
+		if !iter.next().unwrap_or(false) {
+			break;
+		}
+	}
 	assert_eq!(entries.len(), 4);
 
 	// Extract and verify user keys are in correct order
@@ -524,8 +621,16 @@ fn test_large_dataset() {
 	let (memtable, _) = create_test_memtable(entries);
 
 	// Test that all entries exist
-	let all_entries: Vec<_> = memtable.iter(false).collect::<Vec<_>>();
-	assert_eq!(all_entries.len(), 1000);
+	let mut iter = memtable.iter();
+	iter.seek_first().unwrap();
+	let mut count = 0;
+	while iter.valid() {
+		count += 1;
+		if !iter.next().unwrap_or(false) {
+			break;
+		}
+	}
+	assert_eq!(count, 1000);
 
 	// Test specific gets
 	let result = memtable.get(b"key0000", None);
@@ -629,16 +734,26 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 	let mut iter = memtable.range(
 		Some("b".as_bytes()), // Start at "b" (inclusive)
 		None,                 // No upper bound
-		false,
 	);
+	iter.seek_first().unwrap();
 	// Skip all entries with user key "b" (they have same user key, different seqnums)
 	let mut range_entries = Vec::new();
-	while let Some(item) = iter.next() {
-		let (key, value) = item.unwrap();
+	while iter.valid() {
+		let key = iter.key().to_owned();
+		let value_bytes = iter.value();
+		let value = value_bytes.to_vec();
 		if key.user_key != b"b" {
-			range_entries.push((key, value));
+			range_entries.push((key.clone(), value.clone()));
 			// Collect remaining entries
-			range_entries.extend(iter.map(|r| r.unwrap()));
+			while iter.next().unwrap_or(false) && iter.valid() {
+				let key = iter.key().to_owned();
+				let value_bytes = iter.value();
+				let value = value_bytes.to_vec();
+				range_entries.push((key, value));
+			}
+			break;
+		}
+		if !iter.next().unwrap_or(false) {
 			break;
 		}
 	}
@@ -675,7 +790,7 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 // 	}
 
 // 	// Iterate once
-// 	let first = iter.first();
+// 	let first = iter.seek_first();
 // 	assert!(first.is_some());
 // 	let (key, _) = first.unwrap().unwrap();
 // 	assert_eq!(&key.user_key, b"c", "First key should be 'c', not a version of 'b'");

@@ -14,7 +14,7 @@ use crate::iter::{BoxedInternalIterator, CompactionIterator};
 use crate::sstable::table::{Table, TableWriter};
 use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
 use crate::vfs::File;
-use crate::{Options, Value};
+use crate::{Comparator, Options, Value};
 
 /// Entry in the immutable memtables list, tracking both the table ID
 /// and the WAL number that contains this memtable's data.
@@ -236,7 +236,7 @@ impl MemTable {
 			let iter: BoxedInternalIterator<'_> = Box::new(iter);
 			let mut comp_iter = CompactionIterator::new(
 				vec![iter],
-				Arc::clone(&lsm_opts.internal_comparator),
+				Arc::clone(&lsm_opts.internal_comparator) as Arc<dyn Comparator>,
 				false,                       // not bottom level (L0 flush)
 				None,                        // no vlog access in flush context
 				false,                       // versioning disabled in flush context

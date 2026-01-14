@@ -12,7 +12,7 @@ use crate::memtable::ImmutableMemtables;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::vlog::VLog;
-use crate::Options as LSMOptions;
+use crate::{Comparator, Options as LSMOptions};
 
 /// RAII guard to ensure tables are unhidden if compaction fails
 struct HiddenTablesGuard {
@@ -174,7 +174,7 @@ impl Compactor {
 		let is_bottom_level = input.target_level >= max_level;
 		let mut comp_iter = CompactionIterator::new(
 			merge_iter,
-			Arc::clone(&self.options.lopts.internal_comparator),
+			Arc::clone(&self.options.lopts.internal_comparator) as Arc<dyn Comparator>,
 			is_bottom_level,
 			self.options.vlog.clone(),
 			self.options.lopts.enable_versioning,

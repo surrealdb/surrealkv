@@ -6,6 +6,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::batch::Batch;
+use crate::sstable::InternalIterator;
 use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
@@ -150,7 +151,14 @@ fn test_wal_replay_all_segments() {
 	let sequence_number = sequence_number_opt.unwrap_or(0);
 
 	// Count actual entries across ALL returned memtables
-	let entry_count: usize = memtables.iter().map(|(m, _)| m.iter(false).count()).sum();
+	let mut entry_count = 0;
+	for (memtable, _) in memtables {
+		let mut iter = memtable.iter();
+		while iter.valid() {
+			entry_count += 1;
+			iter.next().unwrap();
+		}
+	}
 
 	// Verify sequence number is from the latest segment (304 = 300 + 4)
 	assert_eq!(sequence_number, 304, "Expected max sequence number from all segments");

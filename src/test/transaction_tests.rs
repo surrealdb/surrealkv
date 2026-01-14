@@ -6,6 +6,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::lsm::Tree;
+use crate::test::{collect_transaction_all, collect_transaction_reverse};
 use crate::{Error, Key, Mode, Options, ReadOptions, TreeBuilder, WriteOptions};
 
 fn create_temp_directory() -> TempDir {
@@ -612,14 +613,13 @@ async fn test_range_basic_functionality() {
 	// Test basic range scan
 	{
 		let tx = store.begin().unwrap();
-		let range: Vec<_> =
-			tx.range(b"key2", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key2", b"key4").unwrap()).unwrap();
 
 		assert_eq!(range.len(), 2); // key2, key3 (key4 is exclusive)
 		assert_eq!(&range[0].0, b"key2");
-		assert_eq!(&range[0].1, b"value2");
+		assert_eq!(&range[0].1.as_ref().unwrap().as_slice(), b"value2");
 		assert_eq!(&range[1].0, b"key3");
-		assert_eq!(&range[1].1, b"value3");
+		assert_eq!(&range[1].1.as_ref().unwrap().as_slice(), b"value3");
 	}
 }
 
@@ -642,7 +642,7 @@ async fn test_range_with_bounds() {
 	{
 		let tx = store.begin().unwrap();
 		let beg = b"".as_slice();
-		let range: Vec<_> = tx.range(beg, b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(beg, b"key4").unwrap()).unwrap();
 		assert_eq!(range.len(), 3); // key1, key2, key3 (key4 is exclusive)
 		assert_eq!(&range[0].0, b"key1");
 		assert_eq!(&range[1].0, b"key2");
@@ -654,7 +654,7 @@ async fn test_range_with_bounds() {
 		let tx = store.begin().unwrap();
 		let beg = b"".as_slice();
 		let end = b"".as_slice();
-		let range: Vec<_> = tx.range(beg, end).unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(beg, end).unwrap()).unwrap();
 		assert_eq!(range.len(), 0);
 	}
 }
@@ -677,8 +677,9 @@ async fn test_range_with_limit() {
 	// Test with .take()
 	{
 		let tx = store.begin().unwrap();
-		let range: Vec<_> =
-			tx.range(b"key01", b"key10").unwrap().take(3).map(|r| r.unwrap()).collect::<Vec<_>>();
+		let all_range =
+			collect_transaction_all(&mut tx.range(b"key01", b"key10").unwrap()).unwrap();
+		let range: Vec<_> = all_range.into_iter().take(3).collect::<Vec<_>>();
 
 		assert_eq!(range.len(), 3);
 		assert_eq!(&range[0].0, b"key01");
@@ -712,14 +713,14 @@ async fn test_range_read_your_own_writes() {
 		tx.set(b"c", b"3_modified").unwrap();
 
 		// Range should see all changes ([a, f) to include e)
-		let range: Vec<_> = tx.range(b"a", b"f").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"a", b"f").unwrap()).unwrap();
 
 		assert_eq!(range.len(), 5);
-		assert_eq!(range[0], (Vec::from(b"a"), Vec::from(b"1")));
-		assert_eq!(range[1], (Vec::from(b"b"), Vec::from(b"2")));
-		assert_eq!(range[2], (Vec::from(b"c"), Vec::from(b"3_modified")));
-		assert_eq!(range[3], (Vec::from(b"d"), Vec::from(b"4")));
-		assert_eq!(range[4], (Vec::from(b"e"), Vec::from(b"5")));
+		assert_eq!(range[0], (Vec::from(b"a"), Some(Vec::from(b"1"))));
+		assert_eq!(range[1], (Vec::from(b"b"), Some(Vec::from(b"2"))));
+		assert_eq!(range[2], (Vec::from(b"c"), Some(Vec::from(b"3_modified"))));
+		assert_eq!(range[3], (Vec::from(b"d"), Some(Vec::from(b"4"))));
+		assert_eq!(range[4], (Vec::from(b"e"), Some(Vec::from(b"5"))));
 	}
 }
 
@@ -747,8 +748,7 @@ async fn test_range_with_deletes() {
 		tx.delete(b"key4").unwrap();
 
 		// Range should not see deleted keys ([key1, key6) to include key5)
-		let range: Vec<_> =
-			tx.range(b"key1", b"key6").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key6").unwrap()).unwrap();
 
 		assert_eq!(range.len(), 3);
 		assert_eq!(&range[0].0, b"key1");
@@ -779,11 +779,10 @@ async fn test_range_delete_then_set() {
 		tx.set(b"key2", b"new_value2").unwrap();
 
 		// Range should see the new value ([key1, key4) to include key3)
-		let range: Vec<_> =
-			tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
 
 		assert_eq!(range.len(), 3);
-		assert_eq!(range[1], (Vec::from(b"key2"), Vec::from(b"new_value2")));
+		assert_eq!(range[1], (Vec::from(b"key2"), Some(Vec::from(b"new_value2"))));
 	}
 }
 
@@ -802,7 +801,7 @@ async fn test_range_empty_result() {
 	// Query range with no data
 	{
 		let tx = store.begin().unwrap();
-		let range: Vec<_> = tx.range(b"m", b"n").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"m", b"n").unwrap()).unwrap();
 
 		assert_eq!(range.len(), 0);
 	}
@@ -826,8 +825,7 @@ async fn test_range_ordering() {
 	// Verify correct ordering in range ([key1, key6) to include key5)
 	{
 		let tx = store.begin().unwrap();
-		let range: Vec<_> =
-			tx.range(b"key1", b"key6").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key6").unwrap()).unwrap();
 
 		assert_eq!(range.len(), 5);
 		for (i, item) in range.iter().enumerate().take(5) {
@@ -855,8 +853,7 @@ async fn test_range_boundary_conditions() {
 		let tx = store.begin().unwrap();
 
 		// Range includes start but excludes end
-		let range: Vec<_> =
-			tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
 
 		assert_eq!(range.len(), 3);
 		assert_eq!(&range[0].0, b"key1");
@@ -866,8 +863,7 @@ async fn test_range_boundary_conditions() {
 	// Test single key range ([key2, key3) to include only key2)
 	{
 		let tx = store.begin().unwrap();
-		let range: Vec<_> =
-			tx.range(b"key2", b"key3").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key2", b"key3").unwrap()).unwrap();
 
 		assert_eq!(range.len(), 1);
 		assert_eq!(&range[0].0, b"key2");
@@ -887,14 +883,12 @@ async fn test_range_write_sequence_order() {
 		tx.set(b"key", b"value3").unwrap();
 
 		let end_key = b"key\x01";
-		let range: Vec<_> = tx
-			.range(b"key".as_slice(), end_key.as_slice())
-			.unwrap()
-			.map(|r| r.unwrap())
-			.collect::<Vec<_>>();
+		let range =
+			collect_transaction_all(&mut tx.range(b"key".as_slice(), end_key.as_slice()).unwrap())
+				.unwrap();
 
 		assert_eq!(range.len(), 1);
-		assert_eq!(&range[0].1, b"value3"); // Latest value
+		assert_eq!(range[0].1.as_ref().map(|v| v.as_slice()), Some(b"value3".as_slice())); // Latest value
 	}
 }
 
@@ -921,8 +915,8 @@ async fn test_keys_method() {
 		tx.set(b"key6", b"value6").unwrap();
 
 		// Get keys only
-		let keys_only: Vec<_> =
-			tx.keys(b"key1", b"key9").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let all_range = collect_transaction_all(&mut tx.range(b"key1", b"key9").unwrap()).unwrap();
+		let keys_only: Vec<_> = all_range.into_iter().map(|(k, _)| k).collect();
 
 		// Verify we got all 6 keys (5 from storage + 1 from write set)
 		assert_eq!(keys_only.len(), 6);
@@ -934,8 +928,8 @@ async fn test_keys_method() {
 		}
 
 		// Compare with regular range
-		let regular_range: Vec<_> =
-			tx.range(b"key1", b"key9").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let regular_range =
+			collect_transaction_all(&mut tx.range(b"key1", b"key9").unwrap()).unwrap();
 
 		// Should have same number of items
 		assert_eq!(regular_range.len(), keys_only.len());
@@ -947,14 +941,14 @@ async fn test_keys_method() {
 			if i < 5 {
 				// For keys from storage, check regular values are correct
 				assert_eq!(
-					regular_range[i].1.as_slice(),
+					regular_range[i].1.as_ref().unwrap().as_slice(),
 					format!("value{}", i + 1).as_bytes(),
 					"Regular range should have correct values from storage"
 				);
 			} else {
 				// For the key from write set
 				assert_eq!(
-					regular_range[i].1.as_slice(),
+					regular_range[i].1.as_ref().unwrap().as_slice(),
 					b"value6",
 					"Regular range should have correct value from write set"
 				);
@@ -964,8 +958,10 @@ async fn test_keys_method() {
 		// Test with a deleted key
 		tx.delete(b"key3").unwrap();
 
+		let all_range_after_delete =
+			collect_transaction_all(&mut tx.range(b"key1", b"key9").unwrap()).unwrap();
 		let keys_after_delete: Vec<_> =
-			tx.keys(b"key1", b"key9").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+			all_range_after_delete.into_iter().map(|(k, _)| k).collect();
 
 		// Should have 5 keys now (key3 is deleted)
 		assert_eq!(keys_after_delete.len(), 5);
@@ -1040,8 +1036,8 @@ async fn test_range_value_pointer_resolution_bug() {
 	{
 		let txn = tree.begin().unwrap();
 
-		let range_results: Vec<_> =
-			txn.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range_results =
+			collect_transaction_all(&mut txn.range(b"key1", b"key4").unwrap()).unwrap();
 
 		assert_eq!(range_results.len(), 3, "Should get 3 items from range query");
 
@@ -1064,7 +1060,7 @@ async fn test_range_value_pointer_resolution_bug() {
 
 			// The returned value should be the actual value, not a value pointer
 			assert_eq!(
-				returned_value.as_slice(),
+				returned_value.as_ref().unwrap().as_slice(),
 				expected_value.as_bytes(),
 				"Range should return resolved values, not value pointers. \
                      Expected actual value of {} bytes, but got a different value",
@@ -1098,19 +1094,14 @@ mod double_ended_iterator_tests {
 		// Test reverse iteration
 		{
 			let tx = store.begin().unwrap();
-			let mut iter = tx.range(b"key1", b"key6").unwrap();
-
-			// Collect in reverse order
-			let mut reverse_results = Vec::new();
-			while let Some(result) = iter.next_back() {
-				reverse_results.push(result);
-			}
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key6").unwrap()).unwrap();
 
 			// Should get results in reverse key order
 			assert_eq!(reverse_results.len(), 5);
 
 			// Check that keys are in reverse order
-			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|r| r.unwrap().0).collect();
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
 
 			assert_eq!(keys[0], b"key5");
 			assert_eq!(keys[1], b"key4");
@@ -1142,19 +1133,14 @@ mod double_ended_iterator_tests {
 			tx.set(b"key4", b"new_value4").unwrap();
 			tx.set(b"key6", b"new_value6").unwrap();
 
-			let mut iter = tx.range(b"key1", b"key7").unwrap();
-
-			// Collect in reverse order
-			let mut reverse_results = Vec::new();
-			while let Some(result) = iter.next_back() {
-				reverse_results.push(result);
-			}
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key7").unwrap()).unwrap();
 
 			// Should get results in reverse key order including transaction writes
 			assert_eq!(reverse_results.len(), 6);
 
 			// Check that keys are in reverse order
-			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|r| r.unwrap().0).collect();
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
 
 			assert_eq!(keys[0], b"key6");
 			assert_eq!(keys[1], b"key5");
@@ -1188,19 +1174,14 @@ mod double_ended_iterator_tests {
 			tx.delete(b"key2").unwrap();
 			tx.delete(b"key4").unwrap();
 
-			let mut iter = tx.range(b"key1", b"key6").unwrap();
-
-			// Collect in reverse order
-			let mut reverse_results = Vec::new();
-			while let Some(result) = iter.next_back() {
-				reverse_results.push(result);
-			}
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key6").unwrap()).unwrap();
 
 			// Should get results in reverse key order, excluding deleted keys
 			assert_eq!(reverse_results.len(), 3);
 
 			// Check that keys are in reverse order and deleted keys are excluded
-			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|r| r.unwrap().0).collect();
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
 
 			assert_eq!(keys[0], b"key5");
 			assert_eq!(keys[1], b"key3");
@@ -1235,19 +1216,14 @@ mod double_ended_iterator_tests {
 			tx.soft_delete(b"key2").unwrap();
 			tx.soft_delete(b"key4").unwrap();
 
-			let mut iter = tx.range(b"key1", b"key6").unwrap();
-
-			// Collect in reverse order
-			let mut reverse_results = Vec::new();
-			while let Some(result) = iter.next_back() {
-				reverse_results.push(result);
-			}
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key6").unwrap()).unwrap();
 
 			// Should get results in reverse key order, excluding soft deleted keys
 			assert_eq!(reverse_results.len(), 3);
 
 			// Check that keys are in reverse order and soft deleted keys are excluded
-			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|r| r.unwrap().0).collect();
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
 
 			assert_eq!(keys[0], b"key5");
 			assert_eq!(keys[1], b"key3");
@@ -1274,19 +1250,20 @@ mod double_ended_iterator_tests {
 			tx.commit().await.unwrap();
 		}
 
-		// Test reverse iteration with .rev().take()
+		// Test reverse iteration with take
 		{
 			let tx = store.begin().unwrap();
-			let iter = tx.range(b"key01", b"key11").unwrap();
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key01", b"key11").unwrap()).unwrap();
 
-			// Collect in reverse order with .rev().take(3)
-			let reverse_results: Vec<_> = iter.rev().take(3).collect();
+			// Take only first 3 results (which are the highest keys in reverse order)
+			let limited_results: Vec<_> = reverse_results.into_iter().take(3).collect();
 
 			// Should get exactly 3 results in reverse order
-			assert_eq!(reverse_results.len(), 3);
+			assert_eq!(limited_results.len(), 3);
 
 			// Check that keys are in reverse order
-			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|r| r.unwrap().0).collect();
+			let keys: Vec<Vec<u8>> = limited_results.into_iter().map(|(k, _)| k).collect();
 
 			assert_eq!(keys[0], b"key10");
 			assert_eq!(keys[1], b"key09");
@@ -1310,19 +1287,14 @@ mod double_ended_iterator_tests {
 		// Test reverse iteration with keys only
 		{
 			let tx = store.begin().unwrap();
-			let mut iter = tx.keys(b"key1", b"key4").unwrap();
-
-			// Collect in reverse order
-			let mut reverse_results = Vec::new();
-			while let Some(result) = iter.next_back() {
-				reverse_results.push(result);
-			}
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
 
 			// Should get results in reverse key order
 			assert_eq!(reverse_results.len(), 3);
 
 			// Check that keys are in reverse order
-			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|r| r.unwrap()).collect();
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
 
 			assert_eq!(keys[0], b"key3");
 			assert_eq!(keys[1], b"key2");
@@ -1356,19 +1328,14 @@ mod double_ended_iterator_tests {
 			tx.soft_delete(b"key4").unwrap(); // Soft delete existing
 			tx.set(b"key6", b"new_value6").unwrap(); // New key
 
-			let mut iter = tx.range(b"key0", b"key7").unwrap();
-
-			// Collect in reverse order
-			let mut reverse_results = Vec::new();
-			while let Some(result) = iter.next_back() {
-				reverse_results.push(result);
-			}
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key0", b"key7").unwrap()).unwrap();
 
 			// Should get results in reverse key order
 			assert_eq!(reverse_results.len(), 5);
 
 			// Check that keys are in reverse order
-			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|r| r.unwrap().0).collect();
+			let keys: Vec<Vec<u8>> = reverse_results.into_iter().map(|(k, _)| k).collect();
 
 			assert_eq!(keys[0], b"key6");
 			assert_eq!(keys[1], b"key5");
@@ -1397,10 +1364,11 @@ mod double_ended_iterator_tests {
 		// Test reverse iteration on empty range
 		{
 			let tx = store.begin().unwrap();
-			let mut iter = tx.range(b"key2", b"key5").unwrap();
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key2", b"key5").unwrap()).unwrap();
 
 			// Should get no results
-			assert!(iter.next_back().is_none());
+			assert_eq!(reverse_results.len(), 0);
 		}
 	}
 
@@ -1424,14 +1392,12 @@ mod double_ended_iterator_tests {
 			let tx = store.begin().unwrap();
 
 			// Forward iteration
-			let forward_results: Vec<_> = tx.range(b"key1", b"key5").unwrap().collect();
+			let forward_results =
+				collect_transaction_all(&mut tx.range(b"key1", b"key5").unwrap()).unwrap();
 
 			// Reverse iteration
-			let mut reverse_iter = tx.range(b"key1", b"key5").unwrap();
-			let mut reverse_results = Vec::new();
-			while let Some(result) = reverse_iter.next_back() {
-				reverse_results.push(result);
-			}
+			let reverse_results =
+				collect_transaction_reverse(&mut tx.range(b"key1", b"key5").unwrap()).unwrap();
 
 			// Reverse the forward results
 			let mut forward_reversed = forward_results;
@@ -1440,10 +1406,8 @@ mod double_ended_iterator_tests {
 			// Results should be identical
 			assert_eq!(forward_reversed.len(), reverse_results.len());
 			for (forward, reverse) in forward_reversed.iter().zip(reverse_results.iter()) {
-				let forward_result = forward.as_ref().unwrap();
-				let reverse_result = reverse.as_ref().unwrap();
-				assert_eq!(forward_result.0, reverse_result.0);
-				assert_eq!(forward_result.1, reverse_result.1);
+				assert_eq!(forward.0, reverse.0);
+				assert_eq!(forward.1, reverse.1);
 			}
 		}
 	}
@@ -1550,11 +1514,10 @@ mod savepoint_tests {
 		txn1.rollback_to_savepoint().unwrap();
 
 		// The scanned value should be the one before the savepoint.
-		let range: Vec<_> =
-			txn1.range(b"k1", b"k3").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut txn1.range(b"k1", b"k3").unwrap()).unwrap();
 		assert_eq!(range.len(), 1);
 		assert_eq!(&range[0].0, &k1);
-		assert_eq!(&range[0].1, &value);
+		assert_eq!(range[0].1.as_ref().unwrap(), &value);
 	}
 
 	#[test(tokio::test)]
@@ -1666,8 +1629,7 @@ async fn test_soft_delete_basic_functionality() {
 	// include key3)
 	{
 		let tx = store.begin().unwrap();
-		let range: Vec<_> =
-			tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
 		assert_eq!(range.len(), 2); // Only key1 and key3, key2 is filtered out
 		assert_eq!(&range[0].0, b"key1");
 		assert_eq!(&range[1].0, b"key3");
@@ -1706,8 +1668,7 @@ async fn test_soft_delete_vs_hard_delete() {
 	// Both should be invisible to range scans ([key1, key4) to include key3)
 	{
 		let tx = store.begin().unwrap();
-		let range: Vec<_> =
-			tx.range(b"key1", b"key4").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
 		assert_eq!(range.len(), 1); // Only key3
 		assert_eq!(&range[0].0, b"key3");
 	}
@@ -1738,8 +1699,7 @@ async fn test_soft_delete_in_transaction_write_set() {
 
 		// Range scan within transaction should not see soft deleted key ([key1, key3)
 		// to include key2)
-		let range: Vec<_> =
-			tx.range(b"key1", b"key3").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key3").unwrap()).unwrap();
 		assert_eq!(range.len(), 1); // Only key2
 		assert_eq!(&range[0].0, b"key2");
 
@@ -1820,8 +1780,7 @@ async fn test_soft_delete_range_scan_filtering() {
 	// key10)
 	{
 		let tx = store.begin().unwrap();
-		let range: Vec<_> =
-			tx.range(b"key01", b"key11").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key01", b"key11").unwrap()).unwrap();
 
 		// Should have 7 keys (10 - 3 soft deleted)
 		assert_eq!(range.len(), 7);
@@ -1878,8 +1837,7 @@ async fn test_soft_delete_mixed_with_other_operations() {
 	// include key4)
 	{
 		let tx = store.begin().unwrap();
-		let range: Vec<_> =
-			tx.range(b"key1", b"key5").unwrap().map(|r| r.unwrap()).collect::<Vec<_>>();
+		let range = collect_transaction_all(&mut tx.range(b"key1", b"key5").unwrap()).unwrap();
 		assert_eq!(range.len(), 2); // Only key3 and key4
 		assert_eq!(&range[0].0, b"key3");
 		assert_eq!(&range[1].0, b"key4");

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use crate::batch::Batch;
 use crate::memtable::MemTable;
+use crate::sstable::InternalIterator;
 use crate::wal::manager::Wal;
 use crate::wal::Options;
 use crate::Tree;
@@ -260,7 +261,15 @@ impl WalTestHelper {
 
 	/// Count total entries across all memtables
 	pub fn count_total_entries(memtables: &[(Arc<MemTable>, u64)]) -> usize {
-		memtables.iter().map(|(m, _)| m.iter(false).count()).sum()
+		let mut total_entries = 0;
+		for (memtable, _) in memtables {
+			let mut iter = memtable.iter();
+			while iter.valid() {
+				total_entries += 1;
+				iter.next().unwrap();
+			}
+		}
+		total_entries
 	}
 
 	/// Verify total entry count across all memtables
@@ -280,11 +289,11 @@ impl WalTestHelper {
 	) {
 		let mut found_keys = Vec::new();
 		for (memtable, _) in memtables {
-			for entry in memtable.iter(false) {
-				// entry is Result<(InternalKey, Bytes)>
-				let (entry_key, _) = entry.unwrap();
-				let key = String::from_utf8(entry_key.user_key.clone()).unwrap();
-				found_keys.push(key);
+			let mut iter = memtable.iter();
+			while iter.valid() {
+				let key = iter.key().to_owned().user_key.clone();
+				found_keys.push(String::from_utf8(key.to_vec()).unwrap());
+				iter.next().unwrap();
 			}
 		}
 		found_keys.sort();

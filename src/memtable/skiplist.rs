@@ -651,13 +651,6 @@ impl<'a> SkiplistIterator<'a> {
 		unsafe { (*self.nd).key_trailer }
 	}
 
-	/// Get current timestamp
-	#[inline]
-	pub fn timestamp(&self) -> u64 {
-		debug_assert!(self.is_valid());
-		unsafe { (*self.nd).key_timestamp }
-	}
-
 	/// Get current value
 	#[inline]
 	pub fn value_bytes(&self) -> &[u8] {
@@ -773,26 +766,6 @@ impl<'a> SkiplistIterator<'a> {
 				if (self.list.cmp)(upper, current_key) <= Ordering::Equal {
 					self.upper_node = self.nd;
 					self.nd = self.list.tail;
-					return;
-				}
-			}
-		}
-	}
-
-	/// Seek to last entry < key
-	pub fn seek_lt(&mut self, key: &[u8]) {
-		let (prev, _) = self.seek_for_base_splice(key);
-		self.nd = prev;
-		if self.nd == self.list.head || self.nd == self.lower_node {
-			return;
-		}
-		// Check lower bound
-		if let Some(lower) = self.lower.as_deref() {
-			if self.is_valid() {
-				let current_key = self.key_bytes();
-				if (self.list.cmp)(lower, current_key) == Ordering::Greater {
-					self.lower_node = self.nd;
-					self.nd = self.list.head;
 					return;
 				}
 			}

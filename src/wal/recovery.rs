@@ -364,6 +364,7 @@ mod tests {
 	use test_log::test;
 
 	use super::*;
+	use crate::sstable::InternalIterator;
 	use crate::wal::manager::Wal;
 	use crate::wal::Options;
 	use crate::WalRecoveryMode;
@@ -423,7 +424,14 @@ mod tests {
 		assert_eq!(memtables.len(), 2, "Should create one memtable per WAL segment");
 
 		// Verify the memtables contain entries from BOTH segments
-		let entry_count: usize = memtables.iter().map(|(m, _)| m.iter(false).count()).sum();
+		let mut entry_count = 0;
+		for (memtable, _) in memtables {
+			let mut iter = memtable.iter();
+			while iter.valid() {
+				entry_count += 1;
+				iter.next().unwrap();
+			}
+		}
 		assert_eq!(
 			entry_count, 7,
 			"Memtables should contain all 7 entries from both WAL segments (6 sets + 1 delete)"
@@ -485,7 +493,14 @@ mod tests {
 		assert_eq!(memtables.len(), 3, "Should create one memtable per WAL segment");
 
 		// Verify all 3 entries are in the memtables (from all 3 segments)
-		let entry_count: usize = memtables.iter().map(|(m, _)| m.iter(false).count()).sum();
+		let mut entry_count = 0;
+		for (memtable, _) in memtables {
+			let mut iter = memtable.iter();
+			while iter.valid() {
+				entry_count += 1;
+				iter.next().unwrap();
+			}
+		}
 		assert_eq!(
 			entry_count, 3,
 			"Memtables should contain all 3 entries from all 3 WAL segments"
@@ -535,7 +550,15 @@ mod tests {
 		assert_eq!(memtables.len(), 2, "Should create one memtable per WAL segment");
 
 		// Verify all 4 entries from both segments are in the memtables
-		let entry_count: usize = memtables.iter().map(|(m, _)| m.iter(false).count()).sum();
+		let mut entry_count = 0;
+		for (memtable, _) in memtables {
+			let mut iter = memtable.iter();
+			while iter.valid() {
+				entry_count += 1;
+				iter.next().unwrap();
+			}
+		}
+
 		assert_eq!(entry_count, 4, "Memtables should contain all 4 entries from both WAL segments");
 	}
 
@@ -695,7 +718,13 @@ mod tests {
 
 		// Verify that we got a memtable with entries from the first two batches
 		if let Some(memtable) = memtable_opt {
-			let entry_count = memtable.iter(false).count();
+			let mut entry_count = 0;
+			let mut iter = memtable.iter();
+			while iter.valid() {
+				entry_count += 1;
+				iter.next().unwrap();
+			}
+
 			assert_eq!(entry_count, 4, "Should have recovered 4 entries from first two batches");
 		} else {
 			panic!("Should have recovered a memtable");
@@ -841,7 +870,15 @@ mod tests {
 		assert_eq!(memtables.len(), 2, "Should create one memtable per WAL segment");
 
 		// Verify all 4 entries from both segments are recovered
-		let entry_count: usize = memtables.iter().map(|(m, _)| m.iter(false).count()).sum();
+		let mut entry_count = 0;
+		for (memtable, _) in memtables {
+			let mut iter = memtable.iter();
+			while iter.valid() {
+				entry_count += 1;
+				iter.next().unwrap();
+			}
+		}
+
 		assert_eq!(
 			entry_count, 4,
 			"Should recover all 4 entries from both WAL segments (2 from each)"
@@ -959,8 +996,41 @@ mod tests {
 		assert_eq!(memtables[2].1, 2, "Third memtable should have WAL 2");
 
 		// Verify each memtable has correct data
-		assert_eq!(memtables[0].0.iter(false).count(), 1);
-		assert_eq!(memtables[1].0.iter(false).count(), 1);
-		assert_eq!(memtables[2].0.iter(false).count(), 1);
+		{
+			let mut iter = memtables[0].0.iter();
+			iter.seek_first().unwrap();
+			let mut count = 0;
+			while iter.valid() {
+				count += 1;
+				if !iter.next().unwrap() {
+					break;
+				}
+			}
+			assert_eq!(count, 1);
+		}
+		{
+			let mut iter = memtables[1].0.iter();
+			iter.seek_first().unwrap();
+			let mut count = 0;
+			while iter.valid() {
+				count += 1;
+				if !iter.next().unwrap() {
+					break;
+				}
+			}
+			assert_eq!(count, 1);
+		}
+		{
+			let mut iter = memtables[2].0.iter();
+			iter.seek_first().unwrap();
+			let mut count = 0;
+			while iter.valid() {
+				count += 1;
+				if !iter.next().unwrap() {
+					break;
+				}
+			}
+			assert_eq!(count, 1);
+		}
 	}
 }

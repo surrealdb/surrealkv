@@ -993,16 +993,6 @@ impl TableIterator {
 		Err(Error::from(SSTableError::EmptyBlock))
 	}
 
-	#[cfg(test)]
-	pub(crate) fn key_owned(&self) -> InternalKey {
-		self.current_block.as_ref().unwrap().key().to_owned()
-	}
-
-	#[cfg(test)]
-	pub(crate) fn value_owned(&self) -> Value {
-		self.current_block.as_ref().unwrap().value().to_vec()
-	}
-
 	fn reset(&mut self) {
 		self.positioned = false;
 		self.exhausted = false;
