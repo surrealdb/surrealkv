@@ -4,7 +4,7 @@ use std::vec;
 use test_log::test;
 
 use crate::sstable::block::{Block, BlockWriter};
-use crate::sstable::{InternalKey, InternalKeyKind};
+use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind};
 use crate::Options;
 
 fn generate_data() -> Vec<(&'static [u8], &'static [u8])> {

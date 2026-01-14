@@ -137,7 +137,7 @@ impl Snapshot {
 			upper.map(Bound::Excluded).unwrap_or(Bound::Unbounded),
 		);
 
-		let mut merge_iter = KMergeIterator::new_from(iter_state, internal_range, true);
+		let mut merge_iter = KMergeIterator::new_from(iter_state, internal_range);
 		merge_iter.seek_first()?;
 
 		while merge_iter.valid() {
@@ -266,13 +266,12 @@ impl Snapshot {
 		&self,
 		lower: Option<&[u8]>,
 		upper: Option<&[u8]>,
-		keys_only: bool,
 	) -> Result<SnapshotIterator<'_>> {
 		let internal_range = crate::user_range_to_internal_range(
 			lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
 			upper.map(Bound::Excluded).unwrap_or(Bound::Unbounded),
 		);
-		SnapshotIterator::new_from(Arc::clone(&self.core), self.seq_num, internal_range, keys_only)
+		SnapshotIterator::new_from(Arc::clone(&self.core), self.seq_num, internal_range)
 	}
 
 	/// Queries the versioned index for a specific key at a specific timestamp
@@ -709,11 +708,7 @@ pub(crate) struct KMergeIterator<'iter> {
 }
 
 impl<'a> KMergeIterator<'a> {
-	pub(crate) fn new_from(
-		iter_state: IterState,
-		internal_range: InternalKeyRange,
-		keys_only: bool,
-	) -> Self {
+	pub(crate) fn new_from(iter_state: IterState, internal_range: InternalKeyRange) -> Self {
 		let boxed_state = Box::new(iter_state);
 
 		let query_range = Arc::new(internal_range);
@@ -739,12 +734,12 @@ impl<'a> KMergeIterator<'a> {
 		};
 
 		// Active memtable
-		let active_iter = state_ref.active.range(lower, upper, keys_only);
+		let active_iter = state_ref.active.range(lower, upper);
 		iterators.push(Box::new(active_iter) as BoxedInternalIterator<'a>);
 
 		// Immutable memtables
 		for memtable in &state_ref.immutable {
-			let iter = memtable.range(lower, upper, keys_only);
+			let iter = memtable.range(lower, upper);
 			iterators.push(Box::new(iter) as BoxedInternalIterator<'a>);
 		}
 
@@ -759,7 +754,7 @@ impl<'a> KMergeIterator<'a> {
 					if table.is_before_range(&query_range) || table.is_after_range(&query_range) {
 						continue;
 					}
-					let table_iter = table.iter(keys_only, Some((*query_range).clone()));
+					let table_iter = table.iter(Some((*query_range).clone()));
 					iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
 				}
 			} else {
@@ -768,7 +763,7 @@ impl<'a> KMergeIterator<'a> {
 				let end_idx = level.find_last_overlapping_table(&query_range);
 
 				for table in &level.tables[start_idx..end_idx] {
-					let table_iter = table.iter(keys_only, Some((*query_range).clone()));
+					let table_iter = table.iter(Some((*query_range).clone()));
 					iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
 				}
 			}
@@ -982,9 +977,6 @@ pub(crate) struct SnapshotIterator<'a> {
 	#[allow(dead_code)]
 	core: Arc<Core>,
 
-	/// When true, only return keys without resolving values
-	keys_only: bool,
-
 	/// Last user key seen (forward direction) - reusable buffer
 	last_key_fwd: Vec<u8>,
 
@@ -1002,12 +994,7 @@ pub(crate) struct SnapshotIterator<'a> {
 
 impl SnapshotIterator<'_> {
 	/// Creates a new iterator over a specific key range
-	fn new_from(
-		core: Arc<Core>,
-		seq_num: u64,
-		range: InternalKeyRange,
-		keys_only: bool,
-	) -> Result<Self> {
+	fn new_from(core: Arc<Core>, seq_num: u64, range: InternalKeyRange) -> Result<Self> {
 		// Create a temporary snapshot to use the helper method
 		let snapshot = Snapshot {
 			core: Arc::clone(&core),
@@ -1019,13 +1006,12 @@ impl SnapshotIterator<'_> {
 			vlog.incr_iterator_count();
 		}
 
-		let merge_iter = KMergeIterator::new_from(iter_state, range, keys_only);
+		let merge_iter = KMergeIterator::new_from(iter_state, range);
 
 		Ok(Self {
 			merge_iter,
 			snapshot_seq_num: seq_num,
 			core,
-			keys_only,
 			last_key_fwd: Vec::new(),
 			buffered_back_key: Vec::new(),
 			buffered_back_value: Vec::new(),
@@ -1219,12 +1205,8 @@ impl InternalIterator for SnapshotIterator<'_> {
 	}
 
 	fn value(&self) -> &[u8] {
-		if self.keys_only {
-			&[]
-		} else {
-			debug_assert!(self.valid());
-			self.merge_iter.value()
-		}
+		debug_assert!(self.valid());
+		self.merge_iter.value()
 	}
 }
 

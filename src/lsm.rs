@@ -1060,7 +1060,7 @@ impl Core {
 		// Count entries using InternalIterator API
 		let entry_count = {
 			use crate::sstable::InternalIterator;
-			let mut iter = last_memtable.iter(true);
+			let mut iter = last_memtable.iter();
 			let mut count = 0;
 			if iter.seek_first().unwrap_or(false) {
 				count += 1;

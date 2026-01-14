@@ -197,7 +197,7 @@ impl TopLevelIndex {
 	) -> Result<Self> {
 		let block =
 			read_table_block(Arc::clone(&opt.internal_comparator), Arc::clone(&f), location)?;
-		let mut iter = block.iter(false)?;
+		let mut iter = block.iter()?;
 		let mut blocks = Vec::new();
 		iter.seek_to_first()?;
 		while iter.is_valid() {

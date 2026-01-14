@@ -117,11 +117,13 @@ pub fn seq_range(b: divan::Bencher<'_, '_>, count: usize) {
 			let mut iter = txn.range(&keys[0], &end_bound).unwrap();
 			let mut results = Vec::new();
 			iter.seek_first().unwrap();
+			let mut item_count = 0;
 			while iter.valid() {
-				results.push((iter.key(), iter.value().unwrap()));
+				results.push(iter.key());
 				iter.next().unwrap();
+				item_count += 1;
 			}
-			let _ = results;
+			let _ = item_count;
 		}
 	});
 }

@@ -232,7 +232,7 @@ impl MemTable {
 			let file = SysFile::create(&table_file_path)?;
 			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
 
-			let iter = self.iter(false);
+			let iter = self.iter();
 			let iter: BoxedInternalIterator<'_> = Box::new(iter);
 			let mut comp_iter = CompactionIterator::new(
 				vec![iter],
@@ -262,8 +262,8 @@ impl MemTable {
 		Ok(created_table)
 	}
 
-	pub(crate) fn iter(&self, keys_only: bool) -> MemTableIterator<'_> {
-		self.range(None, None, keys_only)
+	pub(crate) fn iter(&self) -> MemTableIterator<'_> {
+		self.range(None, None)
 	}
 
 	/// Returns an iterator over keys in [lower, upper)
@@ -272,7 +272,6 @@ impl MemTable {
 		&self,
 		lower: Option<&[u8]>, // Inclusive, None = unbounded
 		upper: Option<&[u8]>, // Exclusive, None = unbounded
-		keys_only: bool,
 	) -> MemTableIterator<'_> {
 		let mut iter = self.skiplist.new_iter(lower, upper);
 
@@ -285,7 +284,6 @@ impl MemTable {
 
 		MemTableIterator {
 			iter,
-			keys_only,
 		}
 	}
 }
@@ -293,7 +291,6 @@ impl MemTable {
 /// Thin wrapper around SkiplistIterator for keys_only optimization
 pub(crate) struct MemTableIterator<'a> {
 	iter: SkiplistIterator<'a>,
-	keys_only: bool,
 }
 
 impl InternalIterator for MemTableIterator<'_> {
@@ -326,10 +323,6 @@ impl InternalIterator for MemTableIterator<'_> {
 	}
 
 	fn value(&self) -> &[u8] {
-		if self.keys_only {
-			&[]
-		} else {
-			self.iter.value()
-		}
+		self.iter.value()
 	}
 }

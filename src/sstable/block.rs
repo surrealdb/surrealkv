@@ -6,7 +6,7 @@ use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 use crate::error::{Error, Result};
 use crate::sstable::error::SSTableError;
 use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
-use crate::{Comparator, InternalKeyComparator, Key, Value};
+use crate::{Comparator, InternalKeyComparator};
 
 pub(crate) type BlockData = Vec<u8>;
 
@@ -88,8 +88,8 @@ pub(crate) struct Block {
 }
 
 impl Block {
-	pub(crate) fn iter(&self, keys_only: bool) -> Result<BlockIterator> {
-		BlockIterator::new(Arc::clone(&self.comparator), self.block.clone(), keys_only)
+	pub(crate) fn iter(&self) -> Result<BlockIterator> {
+		BlockIterator::new(Arc::clone(&self.comparator), self.block.clone())
 	}
 
 	pub(crate) fn new(data: BlockData, comparator: Arc<InternalKeyComparator>) -> Block {
@@ -338,17 +338,11 @@ pub(crate) struct BlockIterator {
 	current_value_offset_end: usize,
 	/// internal key comparator
 	internal_cmp: Arc<InternalKeyComparator>,
-	/// When true, only return keys without allocating values
-	keys_only: bool,
 }
 
 impl BlockIterator {
 	// Constructor for BlockIterator
-	pub(crate) fn new(
-		comparator: Arc<InternalKeyComparator>,
-		block: BlockData,
-		keys_only: bool,
-	) -> Result<Self> {
+	pub(crate) fn new(comparator: Arc<InternalKeyComparator>, block: BlockData) -> Result<Self> {
 		if block.len() < 4 {
 			let err = Error::from(SSTableError::BlockTooSmall {
 				size: block.len(),
@@ -404,7 +398,6 @@ impl BlockIterator {
 			current_value_offset_start: 0,
 			current_value_offset_end: 0,
 			internal_cmp: comparator,
-			keys_only,
 		})
 	}
 
@@ -562,11 +555,7 @@ impl InternalIterator for BlockIterator {
 	/// Zero-copy value access. Returns slice into block data.
 	fn value(&self) -> &[u8] {
 		debug_assert!(self.valid());
-		if self.keys_only {
-			&[]
-		} else {
-			&self.block[self.current_value_offset_start..self.current_value_offset_end]
-		}
+		&self.block[self.current_value_offset_start..self.current_value_offset_end]
 	}
 }
 
@@ -742,22 +731,6 @@ impl BlockIterator {
 					return Err(e);
 				}
 			}
-		}
-	}
-
-	// Get the current key (owned version)
-	#[inline]
-	pub(crate) fn key_owned(&self) -> InternalKey {
-		InternalKey::decode(&self.current_key)
-	}
-
-	// Get the current value (owned version)
-	#[inline]
-	pub(crate) fn value_owned(&self) -> Value {
-		if self.keys_only {
-			Vec::new()
-		} else {
-			self.block[self.current_value_offset_start..self.current_value_offset_end].to_vec()
 		}
 	}
 

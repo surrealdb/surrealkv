@@ -619,10 +619,10 @@ impl Skiplist {
 pub(crate) struct SkiplistIterator<'a> {
 	list: &'a Skiplist,
 	nd: *mut Node,
-	lower: Option<Vec<u8>>, // Inclusive lower bound (owned for lifetime flexibility)
-	upper: Option<Vec<u8>>, // Exclusive upper bound (owned for lifetime flexibility)
-	lower_node: *mut Node,  // Cached node at lower bound
-	upper_node: *mut Node,  // Cached node at upper bound
+	lower: Option<Vec<u8>>,   // Inclusive lower bound
+	upper: Option<Vec<u8>>,   // Exclusive upper bound
+	lower_node: *mut Node,    // Cached node at lower bound
+	upper_node: *mut Node,    // Cached node at upper bound
 	encoded_key_buf: Vec<u8>, // Buffer for encoded key to return InternalKeyRef
 }
 

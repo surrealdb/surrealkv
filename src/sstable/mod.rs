@@ -260,23 +260,8 @@ impl<'a> InternalKeyRef<'a> {
 		is_delete_kind(self.kind())
 	}
 
-	#[inline]
-	pub fn is_hard_delete_marker(&self) -> bool {
-		is_hard_delete_marker(self.kind())
-	}
-
-	#[inline]
-	pub fn is_replace(&self) -> bool {
-		is_replace_kind(self.kind())
-	}
-
 	pub fn to_owned(&self) -> InternalKey {
 		InternalKey::decode(self.encoded)
-	}
-
-	#[inline]
-	pub fn size(&self) -> usize {
-		self.encoded.len()
 	}
 }
 

@@ -9,7 +9,7 @@ use crate::levels::{Level, Levels};
 use crate::memtable::MemTable;
 use crate::snapshot::{IterState, KMergeIterator, Snapshot, VersionedRangeQueryParams};
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::{InternalKey, InternalKeyKind};
+use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind};
 use crate::vfs::File;
 use crate::{Options, Tree, TreeBuilder};
 

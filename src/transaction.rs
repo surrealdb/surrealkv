@@ -607,24 +607,6 @@ impl Transaction {
 		Ok(count)
 	}
 
-	/// Gets keys in a key range at the current timestamp.
-	///
-	/// Returns a cursor-based iterator. Use `seek_first()`, `next()`, `prev()` to navigate.
-	///
-	/// The iterator iterates over all keys in the range,
-	/// inclusive of the start key, but not the end key.
-	///
-	/// This function is faster than `range()` as it doesn't
-	/// fetch or resolve values from disk.
-	pub fn keys<K>(&self, start: K, end: K) -> Result<TransactionIterator<'_>>
-	where
-		K: IntoBytes,
-	{
-		let mut options = ReadOptions::default().with_keys_only(true);
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.keys_with_options(&options)
-	}
-
 	/// Gets keys in a key range at a specific timestamp.
 	///
 	/// The returned iterator is a double ended iterator
@@ -665,8 +647,8 @@ impl Transaction {
 		let options = options.clone().with_keys_only(true);
 		let start_key = options.lower_bound.clone().unwrap_or_default();
 		let end_key = options.upper_bound.clone().unwrap_or_default();
-		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?;
-		Ok(TransactionIterator::new(inner, Arc::clone(&self.core), true))
+		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key)?;
+		Ok(TransactionIterator::new(inner, Arc::clone(&self.core)))
 	}
 
 	pub fn keys_at_version_with_options(
@@ -755,8 +737,8 @@ impl Transaction {
 	pub fn range_with_options(&self, options: &ReadOptions) -> Result<TransactionIterator<'_>> {
 		let start_key = options.lower_bound.clone().unwrap_or_default();
 		let end_key = options.upper_bound.clone().unwrap_or_default();
-		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key, options)?;
-		Ok(TransactionIterator::new(inner, Arc::clone(&self.core), options.keys_only))
+		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key)?;
+		Ok(TransactionIterator::new(inner, Arc::clone(&self.core)))
 	}
 
 	pub fn range_at_version_with_options(
@@ -1114,9 +1096,6 @@ pub(crate) struct TransactionRangeIterator<'a> {
 	/// Current source
 	current_source: CurrentSource,
 
-	/// Keys only mode
-	keys_only: bool,
-
 	/// Buffer for write-set encoded key
 	ws_encoded_key_buf: Vec<u8>,
 
@@ -1131,7 +1110,6 @@ impl<'a> TransactionRangeIterator<'a> {
 		tx: &'a Transaction,
 		start_key: Vec<u8>,
 		end_key: Vec<u8>,
-		options: &ReadOptions,
 	) -> Result<Self> {
 		// Validate transaction state
 		if tx.closed {
@@ -1149,11 +1127,7 @@ impl<'a> TransactionRangeIterator<'a> {
 		};
 
 		// Create a snapshot iterator for the range (now returns SnapshotIterator directly)
-		let snapshot_iter = snapshot.range(
-			Some(start_key.as_slice()),
-			Some(end_key.as_slice()),
-			options.keys_only,
-		)?;
+		let snapshot_iter = snapshot.range(Some(start_key.as_slice()), Some(end_key.as_slice()))?;
 
 		// Collect write-set entries for the range
 		// We collect references to avoid cloning, and filter tombstones during iteration
@@ -1172,7 +1146,6 @@ impl<'a> TransactionRangeIterator<'a> {
 			ws_pos: 0,
 			ws_pos_back: ws_len,
 			current_source: CurrentSource::None,
-			keys_only: options.keys_only,
 			ws_encoded_key_buf: Vec::new(),
 			direction: MergeDirection::Forward,
 			initialized: false,
@@ -1430,9 +1403,6 @@ impl InternalIterator for TransactionRangeIterator<'_> {
 	}
 
 	fn value(&self) -> &[u8] {
-		if self.keys_only {
-			return &[];
-		}
 		debug_assert!(self.valid());
 		match self.current_source {
 			CurrentSource::Snapshot => self.snapshot_iter.value(),
@@ -1466,20 +1436,14 @@ impl InternalIterator for TransactionRangeIterator<'_> {
 pub struct TransactionIterator<'a> {
 	inner: TransactionRangeIterator<'a>,
 	core: Arc<Core>,
-	keys_only: bool,
 }
 
 impl<'a> TransactionIterator<'a> {
 	/// Creates a new transaction iterator
-	pub(crate) fn new(
-		inner: TransactionRangeIterator<'a>,
-		core: Arc<Core>,
-		keys_only: bool,
-	) -> Self {
+	pub(crate) fn new(inner: TransactionRangeIterator<'a>, core: Arc<Core>) -> Self {
 		Self {
 			inner,
 			core,
-			keys_only,
 		}
 	}
 
@@ -1528,9 +1492,6 @@ impl<'a> TransactionIterator<'a> {
 	/// Returns None if in keys-only mode.
 	pub fn value(&self) -> Result<Option<Value>> {
 		debug_assert!(self.valid());
-		if self.keys_only {
-			return Ok(None);
-		}
 		let raw_value = self.inner.value();
 		self.core.resolve_value(raw_value).map(Some)
 	}

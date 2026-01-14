@@ -5,7 +5,7 @@ use test_log::test;
 
 use crate::sstable::block::BlockHandle;
 use crate::sstable::index_block::{BlockHandleWithKey, TopLevelIndex, TopLevelIndexWriter};
-use crate::sstable::{InternalKey, InternalKeyKind};
+use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind};
 use crate::vfs::File;
 use crate::{CompressionType, Error, Options};
 

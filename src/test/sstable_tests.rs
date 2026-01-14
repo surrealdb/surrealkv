@@ -8,7 +8,7 @@ use test_log::test;
 
 use crate::sstable::block::BlockHandle;
 use crate::sstable::table::{ChecksumType, Footer, IndexType, Table, TableFormat, TableWriter};
-use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX};
+use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX};
 use crate::vfs::File;
 use crate::{user_range_to_internal_range, Options, Result};
 

@@ -110,7 +110,7 @@ impl Compactor {
 
 		let iterators: Vec<BoxedInternalIterator<'_>> = to_merge
 			.into_iter()
-			.map(|table| Box::new(table.iter(false, None)) as BoxedInternalIterator<'_>)
+			.map(|table| Box::new(table.iter(None)) as BoxedInternalIterator<'_>)
 			.collect();
 
 		drop(levels);

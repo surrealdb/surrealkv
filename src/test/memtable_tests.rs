@@ -5,7 +5,7 @@ use test_log::test;
 
 use crate::batch::Batch;
 use crate::memtable::MemTable;
-use crate::sstable::InternalKeyKind;
+use crate::sstable::{InternalIterator, InternalKeyKind};
 use crate::Value;
 
 fn assert_value(encoded_value: &Value, expected_value: &[u8]) {

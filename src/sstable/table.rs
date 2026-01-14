@@ -560,7 +560,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 	let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set, 0).encode();
 
 	// println!("Meta key: {:?}", meta_key);
-	let mut metaindexiter = metaix.iter(false)?;
+	let mut metaindexiter = metaix.iter()?;
 	metaindexiter.seek_internal(&meta_key)?;
 
 	if metaindexiter.is_valid() {
@@ -695,7 +695,7 @@ impl Table {
 		let filter_key =
 			InternalKey::new(Vec::from(filter_name.as_bytes()), 0, InternalKeyKind::Set, 0);
 
-		let mut metaindexiter = metaix.iter(false)?;
+		let mut metaindexiter = metaix.iter()?;
 		metaindexiter.seek_internal(&filter_key.encode())?;
 
 		if metaindexiter.is_valid() {
@@ -774,7 +774,7 @@ impl Table {
 
 				// Then search within the partition
 				// Note: Index blocks always need full key-value pairs to decode block handles
-				let mut partition_iter = partition_block.iter(false)?;
+				let mut partition_iter = partition_block.iter()?;
 				partition_iter.seek_internal(&key_encoded)?;
 
 				if partition_iter.is_valid() {
@@ -812,7 +812,7 @@ impl Table {
 
 		// Read block (potentially from cache)
 		let tb = self.read_block(&handle)?;
-		let mut iter = tb.iter(false)?;
+		let mut iter = tb.iter()?;
 
 		// Go to entry and check if it's the wanted entry.
 		iter.seek_internal(&key_encoded)?;
@@ -827,11 +827,7 @@ impl Table {
 		}
 	}
 
-	pub(crate) fn iter(
-		self: &Arc<Self>,
-		keys_only: bool,
-		range: Option<InternalKeyRange>,
-	) -> TableIterator {
+	pub(crate) fn iter(self: &Arc<Self>, range: Option<InternalKeyRange>) -> TableIterator {
 		let range = range.unwrap_or((Bound::Unbounded, Bound::Unbounded));
 
 		TableIterator {
@@ -842,7 +838,6 @@ impl Table {
 			exhausted: false,
 			current_partition_index: 0,
 			current_partition_iter: None,
-			keys_only,
 			range,
 			reverse_started: false,
 		}
@@ -916,8 +911,6 @@ pub(crate) struct TableIterator {
 	// For partitioned index support
 	current_partition_index: usize,
 	current_partition_iter: Option<BlockIterator>,
-	/// When true, only return keys without allocating values
-	keys_only: bool,
 	/// Range bounds for filtering (InternalKey)
 	range: InternalKeyRange,
 	/// Whether reverse iteration has started (to distinguish from just
@@ -957,7 +950,7 @@ impl TableIterator {
 		let partition_handle = &partitioned_index.blocks[self.current_partition_index];
 		let partition_block = partitioned_index.load_block(partition_handle)?;
 		// Note: Index blocks always need full key-value pairs to decode block handles
-		let mut partition_iter = partition_block.iter(false)?;
+		let mut partition_iter = partition_block.iter()?;
 		partition_iter.seek_to_first()?;
 
 		if partition_iter.is_valid() {
@@ -986,7 +979,7 @@ impl TableIterator {
 
 	fn load_block(&mut self, handle: &BlockHandle) -> Result<()> {
 		let block = self.table.read_block(handle)?;
-		let mut block_iter = block.iter(self.keys_only)?;
+		let mut block_iter = block.iter()?;
 
 		// Position at first entry in the new block
 		block_iter.seek_to_first()?;
@@ -1064,7 +1057,7 @@ impl TableIterator {
 
 			let partition_block = partitioned_index.load_block(partition_handle)?;
 			// Note: Index blocks always need full key-value pairs to decode block handles
-			let mut partition_iter = partition_block.iter(false)?;
+			let mut partition_iter = partition_block.iter()?;
 			partition_iter.seek_to_last()?;
 
 			if partition_iter.is_valid() {
@@ -1356,7 +1349,7 @@ impl TableIterator {
 			let partition_handle = &partitioned_index.blocks[0];
 			let partition_block = partitioned_index.load_block(partition_handle)?;
 			// Note: Index blocks always need full key-value pairs to decode block handles
-			let mut partition_iter = partition_block.iter(false)?;
+			let mut partition_iter = partition_block.iter()?;
 			partition_iter.seek_to_first()?;
 
 			if partition_iter.is_valid() {
@@ -1400,7 +1393,7 @@ impl TableIterator {
 
 			let last_partition_block = partitioned_index.load_block(last_partition_handle)?;
 			// Note: Index blocks always need full key-value pairs to decode block handles
-			let mut partition_iter = last_partition_block.iter(false)?;
+			let mut partition_iter = last_partition_block.iter()?;
 			partition_iter.seek_to_last()?;
 
 			if partition_iter.is_valid() {
@@ -1449,7 +1442,7 @@ impl TableIterator {
 
 				let partition_block = partitioned_index.load_block(block_handle)?;
 				// Note: Index blocks always need full key-value pairs to decode block handles
-				let mut partition_iter = partition_block.iter(false)?;
+				let mut partition_iter = partition_block.iter()?;
 				partition_iter.seek_internal(target)?;
 
 				if partition_iter.is_valid() {
