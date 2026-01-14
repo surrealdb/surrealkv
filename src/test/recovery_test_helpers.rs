@@ -264,6 +264,7 @@ impl WalTestHelper {
 		let mut total_entries = 0;
 		for (memtable, _) in memtables {
 			let mut iter = memtable.iter();
+			iter.seek_first().unwrap();
 			while iter.valid() {
 				total_entries += 1;
 				iter.next().unwrap();
@@ -290,6 +291,7 @@ impl WalTestHelper {
 		let mut found_keys = Vec::new();
 		for (memtable, _) in memtables {
 			let mut iter = memtable.iter();
+			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
 				found_keys.push(String::from_utf8(key.to_vec()).unwrap());

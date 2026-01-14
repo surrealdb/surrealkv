@@ -2062,12 +2062,18 @@ async fn test_timestamp_via_write_options() {
 	// timestamp
 	let tx = tree.begin().unwrap();
 	let value_before = tx
-		.get_with_options(b"key1", &ReadOptions::default().with_timestamp(Some(custom_timestamp)))
+		.get_at_version_with_options(
+			b"key1",
+			&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
+		)
 		.unwrap();
 	assert_eq!(value_before, Some(Vec::from(b"value1")));
 
 	let value_after = tx
-		.get_with_options(b"key1", &ReadOptions::default().with_timestamp(Some(delete_timestamp)))
+		.get_at_version_with_options(
+			b"key1",
+			&ReadOptions::default().with_timestamp(Some(delete_timestamp)),
+		)
 		.unwrap();
 	assert_eq!(value_after, None);
 }

@@ -267,7 +267,7 @@ impl MemTable {
 	}
 
 	/// Returns an iterator over keys in [lower, upper)
-	/// Lower is inclusive, upper is exclusive (Pebble model)
+	/// Lower is inclusive, upper is exclusive
 	pub(crate) fn range(
 		&self,
 		lower: Option<&[u8]>, // Inclusive, None = unbounded

@@ -457,11 +457,11 @@ fn test_range_query() {
 		(b"m".to_vec(), b"value-m".to_vec(), InternalKeyKind::Set, None),
 	]);
 
-	// Test inclusive lower, exclusive upper (Pebble model)
-	// For Included("k") upper, we use Excluded("l") to include "k"
+	// Test inclusive lower, exclusive upper
+	// To include "k", use upper bound "l" (exclusive upper means < upper)
 	let mut range_iter = memtable.range(
 		Some("c".as_bytes()), // Inclusive lower
-		Some("k".as_bytes()), // Exclusive upper (includes "k")
+		Some("l".as_bytes()), // Exclusive upper - includes "k" but not "l" or "m"
 	);
 	range_iter.seek_first().unwrap();
 	let mut range_entries = Vec::new();
@@ -469,10 +469,7 @@ fn test_range_query() {
 		let key = range_iter.key().to_owned();
 		let value_bytes = range_iter.value();
 		let value = value_bytes.to_vec();
-		// Filter to include only up to "k"
-		if key.user_key.as_slice() <= b"k".as_slice() {
-			range_entries.push((key, value));
-		}
+		range_entries.push((key, value));
 		if !range_iter.next().unwrap_or(false) {
 			break;
 		}
@@ -480,6 +477,7 @@ fn test_range_query() {
 
 	let user_keys: Vec<_> = range_entries.iter().map(|(key, _)| key.user_key.clone()).collect();
 
+	// Range [c, l) includes c, e, g, i, k (5 entries)
 	assert_eq!(user_keys.len(), 5);
 	assert_eq!(&user_keys[0], b"c");
 	assert_eq!(&user_keys[1], b"e");
@@ -487,7 +485,7 @@ fn test_range_query() {
 	assert_eq!(&user_keys[3], b"i");
 	assert_eq!(&user_keys[4], b"k");
 
-	// Test exclusive range (Pebble model)
+	// Test exclusive range
 	let mut range_iter = memtable.range(
 		Some("c".as_bytes()), // Inclusive lower
 		Some("k".as_bytes()), // Exclusive upper (excludes "k")
@@ -524,7 +522,7 @@ fn test_range_query_with_sequence_numbers() {
 		(b"e".to_vec(), b"value-e2".to_vec(), InternalKeyKind::Set, Some(15)), // Older version
 	]);
 
-	// Perform a range query from "a" to "f" (Pebble model: inclusive lower, exclusive upper)
+	// Perform a range query from "a" to "f" (inclusive lower, exclusive upper)
 	let mut range_iter = memtable.range(
 		Some("a".as_bytes()), // Inclusive lower
 		Some("f".as_bytes()), // Exclusive upper
@@ -730,7 +728,6 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 	]);
 
 	// Query with excluded lower bound "b" - manually skip ALL versions of "b"
-	// (Pebble model only supports inclusive lower, so we handle exclusion manually)
 	let mut iter = memtable.range(
 		Some("b".as_bytes()), // Start at "b" (inclusive)
 		None,                 // No upper bound
@@ -765,47 +762,55 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 	assert_eq!(&user_keys[0], b"c");
 }
 
-// #[test]
-// fn test_excluded_bound_first_skips_all_versions() {
-// 	let (memtable, _) = create_test_memtable(vec![
-// 		(b"a".to_vec(), b"value-a".to_vec(), InternalKeyKind::Set, Some(10)),
-// 		(b"b".to_vec(), b"value-b1".to_vec(), InternalKeyKind::Set, Some(30)),
-// 		(b"b".to_vec(), b"value-b2".to_vec(), InternalKeyKind::Set, Some(20)),
-// 		(b"b".to_vec(), b"value-b3".to_vec(), InternalKeyKind::Set, Some(10)),
-// 		(b"c".to_vec(), b"value-c".to_vec(), InternalKeyKind::Set, Some(15)),
-// 	]);
+#[test]
+fn test_excluded_bound_first_skips_all_versions() {
+	let (memtable, _) = create_test_memtable(vec![
+		(b"a".to_vec(), b"value-a".to_vec(), InternalKeyKind::Set, Some(10)),
+		(b"b".to_vec(), b"value-b1".to_vec(), InternalKeyKind::Set, Some(30)),
+		(b"b".to_vec(), b"value-b2".to_vec(), InternalKeyKind::Set, Some(20)),
+		(b"b".to_vec(), b"value-b3".to_vec(), InternalKeyKind::Set, Some(10)),
+		(b"c".to_vec(), b"value-c".to_vec(), InternalKeyKind::Set, Some(15)),
+	]);
 
-// 	// Test excluded lower bound - manually skip "b" entries (Pebble model only supports inclusive
-// 	// lower)
-// 	let mut iter = memtable.range(
-// 		Some("b".as_bytes()), // Start at "b" (inclusive)
-// 		None,                 // No upper bound
-// 		false,
-// 	);
-// 	// Skip all entries with user key "b"
-// 	while let Some(Ok((key, _))) = iter.next() {
-// 		if key.user_key != b"b" {
-// 			break;
-// 		}
-// 	}
+	// Test excluded lower bound - manually skip "b" entries
+	let mut iter = memtable.range(
+		Some("b".as_bytes()), // Start at "b" (inclusive)
+		None,                 // No upper bound
+	);
+	iter.seek_first().unwrap();
+	// Skip all entries with user key "b"
+	while iter.valid() {
+		let key = iter.key().to_owned();
+		if key.user_key != b"b" {
+			break;
+		}
+		if !iter.next().unwrap_or(false) {
+			break;
+		}
+	}
 
-// 	// Iterate once
-// 	let first = iter.seek_first();
-// 	assert!(first.is_some());
-// 	let (key, _) = first.unwrap().unwrap();
-// 	assert_eq!(&key.user_key, b"c", "First key should be 'c', not a version of 'b'");
+	// Iterate once
+	let first = iter.seek_first().unwrap();
+	assert!(first);
+	let key = iter.key().to_owned();
+	assert_eq!(&key.user_key, b"b", "First key should be 'b'");
 
-// 	// Reset and try again - create new iterator
-// 	let mut iter2 = memtable.range(Some("b".as_bytes()), None, false);
-// 	// Skip all entries with user key "b"
-// 	while let Some(Ok((key, _))) = iter2.next() {
-// 		if key.user_key != b"b" {
-// 			break;
-// 		}
-// 	}
+	// Reset and try again - create new iterator
+	let mut iter2 = memtable.range(Some("b".as_bytes()), None);
+	iter2.seek_first().unwrap();
+	// Skip all entries with user key "b"
+	while iter2.valid() {
+		let key = iter2.key().to_owned();
+		if key.user_key != b"b" {
+			break;
+		}
+		if !iter2.next().unwrap_or(false) {
+			break;
+		}
+	}
 
-// 	let first = iter2.first();
-// 	assert!(first.is_some());
-// 	let (key, _) = first.unwrap().unwrap();
-// 	assert_eq!(&key.user_key, b"c", "After reset, first key should still be 'c'");
-// }
+	let first = iter2.seek_first().unwrap();
+	assert!(first);
+	let key = iter2.key().to_owned();
+	assert_eq!(&key.user_key, b"b", "After reset, first key should still be 'b'");
+}

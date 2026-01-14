@@ -69,7 +69,6 @@ impl<'a> TwoLevelIterator<'a> {
 	}
 
 	/// Initialize the data block from the current first-level position.
-	/// This is the InitDataBlock pattern from RocksDB.
 	fn init_data_block(&mut self) -> Result<()> {
 		if !self.first_level.valid() {
 			self.second_level = None;
@@ -96,7 +95,6 @@ impl<'a> TwoLevelIterator<'a> {
 	}
 
 	/// Skip empty data blocks forward until we find a valid entry or exhaust.
-	/// This is the SkipEmptyDataBlocksForward pattern from RocksDB.
 	fn skip_empty_data_blocks_forward(&mut self) -> Result<()> {
 		loop {
 			// Check if current second_level is valid
@@ -120,7 +118,6 @@ impl<'a> TwoLevelIterator<'a> {
 	}
 
 	/// Skip empty data blocks backward until we find a valid entry or exhaust.
-	/// This is the SkipEmptyDataBlocksBackward pattern from RocksDB.
 	fn skip_empty_data_blocks_backward(&mut self) -> Result<()> {
 		loop {
 			// Check if current second_level is valid
@@ -174,7 +171,7 @@ impl<'a> TwoLevelIterator<'a> {
 		self.second_level.as_ref().unwrap().user_key()
 	}
 
-	/// Seek to first entry within bounds (RocksDB SeekToFirst with bounds)
+	/// Seek to first entry within bounds
 	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
 		self.exhausted = false;
 
@@ -220,7 +217,7 @@ impl<'a> TwoLevelIterator<'a> {
 		Ok(())
 	}
 
-	/// Seek to last entry within bounds (RocksDB SeekToLast with bounds)
+	/// Seek to last entry within bounds
 	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
 		self.exhausted = false;
 
@@ -299,7 +296,7 @@ impl<'a> TwoLevelIterator<'a> {
 		Ok(())
 	}
 
-	/// Internal seek to target key (RocksDB Seek pattern)
+	/// Internal seek to target key
 	fn seek_internal(&mut self, target: &[u8]) -> Result<()> {
 		self.first_level.seek(target)?;
 		self.init_data_block()?;

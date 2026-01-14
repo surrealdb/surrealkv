@@ -238,6 +238,7 @@ fn verify_keys_after_compaction(
 	for level in levels {
 		for table in &level.tables {
 			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
 				let value = iter.value().to_vec();
@@ -279,6 +280,7 @@ fn verify_all_keys_present(
 	for level in levels {
 		for table in &level.tables {
 			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
 
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
@@ -595,6 +597,7 @@ async fn test_simple_merge_compaction() {
 		for table in &levels.get_levels()[0].tables {
 			let mut table_keys = 0;
 			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
 
 			while iter.valid() {
 				table_keys += 1;
@@ -897,6 +900,7 @@ async fn test_multi_level_merge_compaction() {
 				let mut max_key = None;
 
 				let mut iter = table.iter(None).unwrap();
+				iter.seek_first().unwrap();
 				while iter.valid() {
 					let key = iter.key().to_owned().user_key.clone();
 					if min_key.is_none() {
@@ -1407,6 +1411,7 @@ async fn test_compaction_respects_sequence_numbers() {
 	for level in levels {
 		for table in &level.tables {
 			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
 				let location = ValueLocation::decode(&iter.value().to_vec()).unwrap();
@@ -1493,6 +1498,7 @@ async fn test_tombstone_propagation() {
 	for level in levels {
 		for table in &level.tables {
 			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned();
 				if key.kind() == InternalKeyKind::Set {
@@ -1591,6 +1597,7 @@ async fn test_l0_overlapping_keys_compaction() {
 	for level in levels {
 		for table in &level.tables {
 			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned();
 				let encoded_value = iter.value().to_vec();
@@ -1709,6 +1716,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 	for level in levels {
 		for table in &level.tables {
 			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned();
 				let encoded_value = iter.value().to_vec();
@@ -1834,6 +1842,7 @@ async fn test_tombstone_propagation_through_levels() {
 	let mut values = 0;
 	for table in &levels[3].tables {
 		let mut iter = table.iter(None).unwrap();
+		iter.seek_first().unwrap();
 		while iter.valid() {
 			let key = iter.key().to_owned();
 			match key.kind() {
@@ -2117,6 +2126,7 @@ async fn test_soft_delete_compaction_behavior() {
 	// Count entries in L1 (bottom level) after compaction
 	for table in &levels[1].tables {
 		let mut iter = table.iter(None).unwrap();
+		iter.seek_first().unwrap();
 		while iter.valid() {
 			let key = iter.key().to_owned();
 			match key.kind() {
@@ -2138,6 +2148,7 @@ async fn test_soft_delete_compaction_behavior() {
 	let mut found_keys = HashSet::new();
 	for table in &levels[1].tables {
 		let mut iter = table.iter(None).unwrap();
+		iter.seek_first().unwrap();
 		while iter.valid() {
 			let key = iter.key().to_owned();
 			let value = iter.value().to_vec();
@@ -2265,6 +2276,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 
 	for table in &levels[1].tables {
 		let mut iter = table.iter(None).unwrap();
+		iter.seek_first().unwrap();
 		while iter.valid() {
 			let key = iter.key().to_owned();
 			match key.kind() {

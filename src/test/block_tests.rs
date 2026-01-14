@@ -100,21 +100,34 @@ fn test_block_iter_reverse() {
 	let mut iter = Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
 	iter.seek_to_first().unwrap();
 
-	iter.next().unwrap();
+	// After seek_to_first, we're at first entry (key1)
 	assert_eq!(iter.key().user_key(), "key1".as_bytes());
 	assert_eq!(iter.value(), b"value1".to_vec());
 
+	// Advance to second entry (loooongkey1)
 	iter.next().unwrap();
 	assert!(iter.valid());
+	assert_eq!(iter.key().user_key(), "loooongkey1".as_bytes());
+	assert_eq!(iter.value(), b"value2".to_vec());
 
+	// Advance to third entry (medium_key2)
+	iter.next().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key().user_key(), "medium_key2".as_bytes());
+
+	// Go back to second entry (loooongkey1)
 	iter.prev().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key(), "key1".as_bytes());
-	assert_eq!(iter.value(), b"value1".to_vec());
+	assert_eq!(iter.key().user_key(), "loooongkey1".as_bytes());
+	assert_eq!(iter.value(), b"value2".to_vec());
 
-	// Go to the last entry
-	while iter.advance().unwrap() {}
+	// Go to the last entry using seek_to_last
+	iter.seek_to_last().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key().user_key(), "pkey3".as_bytes());
+	assert_eq!(iter.value(), b"value".to_vec());
 
+	// Move to second-to-last entry (pkey2)
 	iter.prev().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), "pkey2".as_bytes());

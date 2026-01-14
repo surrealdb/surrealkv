@@ -1214,94 +1214,120 @@ impl<'a> TransactionRangeIterator<'a> {
 
 	/// Position to minimum of two sources (forward merge)
 	fn position_to_min(&mut self) -> Result<bool> {
-		// Skip tombstones in write-set
-		while self.ws_valid() && self.ws_is_tombstone() {
-			// If snapshot has same key, skip it too
-			if self.snapshot_iter.valid() {
-				let snap_key = self.snapshot_iter.key().user_key();
-				if snap_key == self.ws_key() {
-					self.snapshot_iter.next()?;
+		loop {
+			let snap_valid = self.snapshot_iter.valid();
+			let ws_valid = self.ws_valid();
+
+			self.current_source = match (snap_valid, ws_valid) {
+				(false, false) => CurrentSource::None,
+				(true, false) => CurrentSource::Snapshot,
+				(false, true) => {
+					if self.ws_is_tombstone() {
+						// Skip tombstone and continue
+						self.ws_pos += 1;
+						continue;
+					}
+					self.populate_ws_encoded_key();
+					CurrentSource::WriteSet
 				}
-			}
-			self.ws_pos += 1;
+				(true, true) => {
+					let snap_key = self.snapshot_iter.key().user_key();
+					let ws_key = self.ws_key();
+
+					match snap_key.cmp(ws_key) {
+						Ordering::Less => {
+							// Snapshot key is smaller - return it
+							CurrentSource::Snapshot
+						}
+						Ordering::Greater => {
+							// Write-set key is smaller
+							if self.ws_is_tombstone() {
+								// Skip tombstone that doesn't mask snapshot
+								self.ws_pos += 1;
+								continue;
+							}
+							self.populate_ws_encoded_key();
+							CurrentSource::WriteSet
+						}
+						Ordering::Equal => {
+							// RYOW: write-set wins
+							if self.ws_is_tombstone() {
+								// Tombstone masks snapshot - skip both
+								self.snapshot_iter.next()?;
+								self.ws_pos += 1;
+								continue;
+							}
+							self.snapshot_iter.next()?;
+							self.populate_ws_encoded_key();
+							CurrentSource::WriteSet
+						}
+					}
+				}
+			};
+			return Ok(self.current_source != CurrentSource::None);
 		}
-
-		let snap_valid = self.snapshot_iter.valid();
-		let ws_valid = self.ws_valid();
-
-		self.current_source = match (snap_valid, ws_valid) {
-			(false, false) => CurrentSource::None,
-			(true, false) => CurrentSource::Snapshot,
-			(false, true) => {
-				self.populate_ws_encoded_key();
-				CurrentSource::WriteSet
-			}
-			(true, true) => {
-				let snap_key = self.snapshot_iter.key().user_key();
-				let ws_key = self.ws_key();
-
-				match snap_key.cmp(ws_key) {
-					Ordering::Less => CurrentSource::Snapshot,
-					Ordering::Greater => {
-						self.populate_ws_encoded_key();
-						CurrentSource::WriteSet
-					}
-					Ordering::Equal => {
-						// RYOW: write-set wins, skip snapshot
-						self.snapshot_iter.next()?;
-						self.populate_ws_encoded_key();
-						CurrentSource::WriteSet
-					}
-				}
-			}
-		};
-		Ok(self.current_source != CurrentSource::None)
 	}
 
 	/// Position to maximum of two sources (backward merge)
 	fn position_to_max(&mut self) -> Result<bool> {
-		// Skip tombstones in write-set (backward)
-		while self.ws_valid_back() && self.ws_is_tombstone_back() {
-			// If snapshot has same key, skip it too
-			if self.snapshot_iter.valid() {
-				let snap_key = self.snapshot_iter.key().user_key();
-				if snap_key == self.ws_key_back() {
-					self.snapshot_iter.prev()?;
+		loop {
+			let snap_valid = self.snapshot_iter.valid();
+			let ws_valid = self.ws_valid_back();
+
+			self.current_source = match (snap_valid, ws_valid) {
+				(false, false) => CurrentSource::None,
+				(true, false) => CurrentSource::Snapshot,
+				(false, true) => {
+					if self.ws_is_tombstone_back() {
+						// Skip tombstone and continue
+						self.ws_pos_back -= 1;
+						continue;
+					}
+					self.populate_ws_encoded_key();
+					CurrentSource::WriteSet
 				}
-			}
-			self.ws_pos_back -= 1;
+				(true, true) => {
+					let snap_key = self.snapshot_iter.key().user_key();
+					let ws_key = self.ws_key_back();
+
+					match snap_key.cmp(ws_key) {
+						Ordering::Greater => {
+							// Snapshot key is larger - return it (backward iteration)
+							CurrentSource::Snapshot
+						}
+						Ordering::Less => {
+							// Write-set key is larger
+							if self.ws_is_tombstone_back() {
+								// Skip tombstone that doesn't mask snapshot
+								self.ws_pos_back -= 1;
+								continue;
+							}
+							self.populate_ws_encoded_key();
+							CurrentSource::WriteSet
+						}
+						Ordering::Equal => {
+							// RYOW: write-set wins
+							if self.ws_is_tombstone_back() {
+								// Tombstone masks snapshot - skip both
+								self.snapshot_iter.prev()?;
+								self.ws_pos_back -= 1;
+								continue;
+							}
+							self.snapshot_iter.prev()?;
+							self.populate_ws_encoded_key();
+							CurrentSource::WriteSet
+						}
+					}
+				}
+			};
+			return Ok(self.current_source != CurrentSource::None);
 		}
+	}
 
-		let snap_valid = self.snapshot_iter.valid();
-		let ws_valid = self.ws_valid_back();
-
-		self.current_source = match (snap_valid, ws_valid) {
-			(false, false) => CurrentSource::None,
-			(true, false) => CurrentSource::Snapshot,
-			(false, true) => {
-				self.populate_ws_encoded_key();
-				CurrentSource::WriteSet
-			}
-			(true, true) => {
-				let snap_key = self.snapshot_iter.key().user_key();
-				let ws_key = self.ws_key_back();
-
-				match snap_key.cmp(ws_key) {
-					Ordering::Greater => CurrentSource::Snapshot,
-					Ordering::Less => {
-						self.populate_ws_encoded_key();
-						CurrentSource::WriteSet
-					}
-					Ordering::Equal => {
-						// RYOW: write-set wins, skip snapshot
-						self.snapshot_iter.prev()?;
-						self.populate_ws_encoded_key();
-						CurrentSource::WriteSet
-					}
-				}
-			}
-		};
-		Ok(self.current_source != CurrentSource::None)
+	/// Returns true if the current value is from the write-set (not snapshot)
+	/// Used to skip ValueLocation decode for raw write-set values
+	pub(crate) fn is_write_set_value(&self) -> bool {
+		self.current_source == CurrentSource::WriteSet
 	}
 }
 
@@ -1420,7 +1446,6 @@ impl InternalIterator for TransactionRangeIterator<'_> {
 }
 
 /// Public iterator for range scans over a transaction.
-/// Follows RocksDB/Pebble cursor pattern with explicit positioning methods.
 ///
 /// # Example
 /// ```ignore
@@ -1490,10 +1515,20 @@ impl<'a> TransactionIterator<'a> {
 
 	/// Get current value (may allocate for VLog resolution). Caller must check valid() first.
 	/// Returns None if in keys-only mode.
+	///
+	/// Note: Write-set values are stored RAW. Only persisted values (memtable/SSTable)
+	/// are encoded as ValueLocation. We skip decode for write-set values.
 	pub fn value(&self) -> Result<Option<Value>> {
 		debug_assert!(self.valid());
 		let raw_value = self.inner.value();
-		self.core.resolve_value(raw_value).map(Some)
+
+		// Write-set values are stored raw (not ValueLocation encoded)
+		// Only persisted values need ValueLocation decode
+		if self.inner.is_write_set_value() {
+			Ok(Some(raw_value.to_vec()))
+		} else {
+			self.core.resolve_value(raw_value).map(Some)
+		}
 	}
 
 	/// Get current key-value pair (convenience method)

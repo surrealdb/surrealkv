@@ -720,7 +720,7 @@ impl<'a> KMergeIterator<'a> {
 
 		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
 
-		// Extract user key bounds from InternalKeyRange (Pebble model: inclusive lower, exclusive
+		// Extract user key bounds from InternalKeyRange (inclusive lower, exclusive
 		// upper)
 		let (start_bound, end_bound) = query_range.as_ref();
 		let lower = match start_bound {
@@ -987,6 +987,12 @@ pub(crate) struct SnapshotIterator<'a> {
 	buffered_back_value: Vec<u8>,
 	has_buffered_back: bool,
 
+	/// For backward iteration: the current entry we're returning
+	/// (stored because merge_iter has already moved past it)
+	current_back_key: Vec<u8>,
+	current_back_value: Vec<u8>,
+	has_current_back: bool,
+
 	/// Direction of iteration
 	direction: MergeDirection,
 
@@ -1018,6 +1024,9 @@ impl SnapshotIterator<'_> {
 			buffered_back_key: Vec::new(),
 			buffered_back_value: Vec::new(),
 			has_buffered_back: false,
+			current_back_key: Vec::new(),
+			current_back_value: Vec::new(),
+			has_current_back: false,
 			direction: MergeDirection::Forward,
 			initialized: false,
 		})
@@ -1074,9 +1083,10 @@ impl SnapshotIterator<'_> {
 			return self.find_latest_visible_backward();
 		}
 
-		while self.merge_iter.valid() {
+		if self.merge_iter.valid() {
 			return self.find_latest_visible_backward();
 		}
+		self.has_current_back = false;
 		Ok(false)
 	}
 
@@ -1084,6 +1094,7 @@ impl SnapshotIterator<'_> {
 	/// Backward iteration sees oldest version first (lowest seq_num).
 	fn find_latest_visible_backward(&mut self) -> Result<bool> {
 		if !self.merge_iter.valid() {
+			self.has_current_back = false;
 			return Ok(false);
 		}
 
@@ -1131,19 +1142,24 @@ impl SnapshotIterator<'_> {
 		}
 
 		// Check if we found a valid (non-tombstone) entry
-		if let (Some(key_bytes), Some(_value_bytes)) = (latest_key, latest_value) {
+		if let (Some(key_bytes), Some(value_bytes)) = (latest_key, latest_value) {
 			let key_ref = InternalKeyRef::from_encoded(&key_bytes);
 			if key_ref.is_tombstone() {
 				// Latest visible is tombstone - skip this key, try next
+				self.has_current_back = false;
 				return self.skip_to_valid_backward();
 			}
-			// We have a valid entry - but we can't return a reference to local data
-			// For backward iteration, we need to position the merge_iter correctly
-			// This is complex - for now, we'll use the buffered approach
+			// Store the found entry in current_back buffers so valid()/key()/value() work
+			self.current_back_key.clear();
+			self.current_back_key.extend_from_slice(&key_bytes);
+			self.current_back_value.clear();
+			self.current_back_value.extend_from_slice(&value_bytes);
+			self.has_current_back = true;
 			return Ok(true);
 		}
 
 		// No visible version found for this key, try next
+		self.has_current_back = false;
 		self.skip_to_valid_backward()
 	}
 }
@@ -1153,6 +1169,7 @@ impl InternalIterator for SnapshotIterator<'_> {
 		self.direction = MergeDirection::Forward;
 		self.last_key_fwd.clear();
 		self.has_buffered_back = false;
+		self.has_current_back = false;
 		self.merge_iter.seek(target)?;
 		self.initialized = true;
 		self.skip_to_valid_forward()
@@ -1162,6 +1179,7 @@ impl InternalIterator for SnapshotIterator<'_> {
 		self.direction = MergeDirection::Forward;
 		self.last_key_fwd.clear();
 		self.has_buffered_back = false;
+		self.has_current_back = false;
 		self.merge_iter.seek_first()?;
 		self.initialized = true;
 		self.skip_to_valid_forward()
@@ -1170,6 +1188,7 @@ impl InternalIterator for SnapshotIterator<'_> {
 	fn seek_last(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Backward;
 		self.has_buffered_back = false;
+		self.has_current_back = false;
 		self.merge_iter.seek_last()?;
 		self.initialized = true;
 		self.skip_to_valid_backward()
@@ -1190,7 +1209,10 @@ impl InternalIterator for SnapshotIterator<'_> {
 		if !self.initialized {
 			return self.seek_last();
 		}
+		// For backward iteration, we can continue if we have a buffered next entry
+		// or if the merge_iter is still valid
 		if !self.merge_iter.valid() && !self.has_buffered_back {
+			self.has_current_back = false;
 			return Ok(false);
 		}
 		// For backward, skip_to_valid_backward handles the logic
@@ -1198,17 +1220,29 @@ impl InternalIterator for SnapshotIterator<'_> {
 	}
 
 	fn valid(&self) -> bool {
-		self.merge_iter.valid()
+		if self.direction == MergeDirection::Backward {
+			self.has_current_back
+		} else {
+			self.merge_iter.valid()
+		}
 	}
 
 	fn key(&self) -> InternalKeyRef<'_> {
 		debug_assert!(self.valid());
-		self.merge_iter.key()
+		if self.direction == MergeDirection::Backward {
+			InternalKeyRef::from_encoded(&self.current_back_key)
+		} else {
+			self.merge_iter.key()
+		}
 	}
 
 	fn value(&self) -> &[u8] {
 		debug_assert!(self.valid());
-		self.merge_iter.value()
+		if self.direction == MergeDirection::Backward {
+			&self.current_back_value
+		} else {
+			self.merge_iter.value()
+		}
 	}
 }
 

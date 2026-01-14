@@ -7,6 +7,7 @@
 use crate::snapshot::SnapshotIterator;
 use crate::sstable::{InternalIterator, InternalKey};
 use crate::transaction::TransactionIterator;
+use crate::vlog::ValueLocation;
 use crate::{Key, Result, Value};
 
 #[cfg(test)]
@@ -109,11 +110,15 @@ fn collect_transaction_reverse(
 	Ok(result)
 }
 
-/// Collects all entries from a SnapshotIterator
+/// Collects all entries from a SnapshotIterator starting from seek_first()
+/// Decodes ValueLocation encoding to return raw user values
 fn collect_snapshot_iter(iter: &mut SnapshotIterator) -> Result<Vec<(InternalKey, Vec<u8>)>> {
+	iter.seek_first()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		result.push((iter.key().to_owned(), iter.value().to_vec()));
+		let encoded_value = iter.value();
+		let decoded_value = ValueLocation::decode(encoded_value)?.value;
+		result.push((iter.key().to_owned(), decoded_value));
 		if !iter.next()? {
 			break;
 		}
@@ -122,11 +127,14 @@ fn collect_snapshot_iter(iter: &mut SnapshotIterator) -> Result<Vec<(InternalKey
 }
 
 /// Collects entries from a SnapshotIterator in reverse order
+/// Decodes ValueLocation encoding to return raw user values
 fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(InternalKey, Vec<u8>)>> {
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		result.push((iter.key().to_owned(), iter.value().to_vec()));
+		let encoded_value = iter.value();
+		let decoded_value = ValueLocation::decode(encoded_value)?.value;
+		result.push((iter.key().to_owned(), decoded_value));
 		if !iter.prev()? {
 			break;
 		}

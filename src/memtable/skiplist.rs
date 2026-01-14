@@ -674,9 +674,15 @@ impl<'a> SkiplistIterator<'a> {
 		self.encoded_key_buf.extend_from_slice(&timestamp.to_be_bytes());
 	}
 
-	/// Move to first entry
+	/// Move to first entry within bounds
 	pub fn first(&mut self) {
-		self.nd = self.list.get_next(self.list.head, 0);
+		// If we have a lower bound, seek to it; otherwise start at the beginning
+		if let Some(ref lower) = self.lower.clone() {
+			self.seek_ge(lower);
+		} else {
+			self.nd = self.list.get_next(self.list.head, 0);
+		}
+
 		if self.nd == self.list.tail || self.nd == self.upper_node {
 			return;
 		}
@@ -698,6 +704,21 @@ impl<'a> SkiplistIterator<'a> {
 		self.nd = self.list.get_prev(self.list.tail, 0);
 		if self.nd == self.list.head || self.nd == self.lower_node {
 			return;
+		}
+		// Check upper bound first - if entry is at or past upper, move backward
+		if let Some(upper) = self.upper.as_deref() {
+			while self.is_valid() {
+				let key = self.key_bytes();
+				if (self.list.cmp)(upper, key) == Ordering::Greater {
+					// key < upper, so this entry is valid
+					break;
+				}
+				// key >= upper, skip this entry
+				self.nd = self.list.get_prev(self.nd, 0);
+				if self.nd == self.list.head || self.nd == self.lower_node {
+					return;
+				}
+			}
 		}
 		// Check lower bound
 		if let Some(lower) = self.lower.as_deref() {

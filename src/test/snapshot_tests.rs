@@ -856,6 +856,7 @@ fn create_iter_state_with_tables(
 
 // Helper to count the number of items returned by iterator
 fn count_kmerge_items(mut iter: KMergeIterator) -> usize {
+	iter.seek_first().unwrap();
 	let mut count = 0;
 	while iter.valid() {
 		count += 1;

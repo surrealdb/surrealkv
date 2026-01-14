@@ -523,6 +523,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 	let first_key = keys.first().unwrap();
 
 	let mut iter = txn.range(first_key.as_slice(), &[0xFFu8; 100]).unwrap();
+	iter.seek_first().unwrap();
 
 	let mut scanned_count = 0;
 	let mut prev_key: Option<Vec<u8>> = None;
@@ -551,6 +552,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 	let start_key = &keys[0];
 	let end_key = &keys[99.min(keys.len() - 1)];
 	let mut partial_iter = txn.range(start_key.as_slice(), end_key.as_slice()).unwrap();
+	partial_iter.seek_first().unwrap();
 
 	let mut partial_count = 0;
 	while partial_iter.valid() {
@@ -668,6 +670,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 		let txn = tree.begin().unwrap();
 		let first_key = keys.first().unwrap();
 		let mut iter = txn.range(first_key.as_slice(), &[0xFFu8; 100]).unwrap();
+		iter.seek_first().unwrap();
 
 		let mut scanned_count = 0;
 		let mut prev_key: Option<Vec<u8>> = None;
