@@ -1057,10 +1057,23 @@ impl Core {
 
 		// Return the last memtable as the active one
 		let (last_memtable, last_wal_number) = memtables.into_iter().last().unwrap();
+		// Count entries using InternalIterator API
+		let entry_count = {
+			use crate::sstable::InternalIterator;
+			let mut iter = last_memtable.iter(true);
+			let mut count = 0;
+			if iter.seek_first().unwrap_or(false) {
+				count += 1;
+				while iter.next().unwrap_or(false) {
+					count += 1;
+				}
+			}
+			count
+		};
 		log::info!(
 			"Recovery: setting last memtable (wal={}) as active with {} entries",
 			last_wal_number,
-			last_memtable.iter(true).count()
+			entry_count
 		);
 
 		Ok((wal_seq_num_opt, Some(last_memtable)))

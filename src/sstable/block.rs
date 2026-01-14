@@ -5,7 +5,7 @@ use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::error::SSTableError;
-use crate::sstable::InternalKey;
+use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
 use crate::{Comparator, InternalKeyComparator, Key, Value};
 
 pub(crate) type BlockData = Vec<u8>;
@@ -512,53 +512,67 @@ impl BlockIterator {
 	}
 }
 
-impl Iterator for BlockIterator {
-	type Item = Result<(Key, Value)>;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		match self.advance() {
-			Ok(true) => {
-				let value = if self.keys_only {
-					Vec::new()
-				} else {
-					self.block[self.current_value_offset_start..self.current_value_offset_end]
-						.to_vec()
-				};
-				Some(Ok((self.current_key.clone(), value)))
-			}
-			Ok(false) => None,
-			Err(e) => {
-				log::error!("[BLOCK] Iterator error in next(): {}", e);
-				Some(Err(e))
-			}
-		}
+impl InternalIterator for BlockIterator {
+	/// Seek to first entry >= target using binary search on restart points.
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		// Use existing seek logic which handles binary search and block navigation
+		self.seek_internal(target)?;
+		Ok(self.is_valid())
 	}
-}
 
-impl DoubleEndedIterator for BlockIterator {
-	fn next_back(&mut self) -> Option<Self::Item> {
-		match self.prev() {
-			Ok(true) => {
-				let value = if self.keys_only {
-					Vec::new()
-				} else {
-					self.block[self.current_value_offset_start..self.current_value_offset_end]
-						.to_vec()
-				};
-				Some(Ok((self.current_key.clone(), value)))
-			}
-			Ok(false) => None,
-			Err(e) => {
-				log::error!("[BLOCK] Iterator error in next_back(): {}", e);
-				Some(Err(e))
-			}
+	/// Seek to first entry in block.
+	fn seek_first(&mut self) -> Result<bool> {
+		self.seek_to_first()?;
+		Ok(self.is_valid())
+	}
+
+	/// Seek to last entry in block.
+	fn seek_last(&mut self) -> Result<bool> {
+		self.seek_to_last()?;
+		Ok(self.is_valid())
+	}
+
+	/// Advance to next entry in block.
+	fn next(&mut self) -> Result<bool> {
+		if !self.is_valid() {
+			return Ok(false);
+		}
+		self.advance()
+	}
+
+	/// Move to previous entry in block.
+	/// Complex due to prefix compression - must rescan from restart point.
+	fn prev(&mut self) -> Result<bool> {
+		if !self.is_valid() {
+			return Ok(false);
+		}
+		self.prev_internal()
+	}
+
+	fn valid(&self) -> bool {
+		self.is_valid()
+	}
+
+	/// Zero-copy key access. current_key holds reconstructed key.
+	fn key(&self) -> InternalKeyRef<'_> {
+		debug_assert!(self.valid());
+		InternalKeyRef::from_encoded(&self.current_key)
+	}
+
+	/// Zero-copy value access. Returns slice into block data.
+	fn value(&self) -> &[u8] {
+		debug_assert!(self.valid());
+		if self.keys_only {
+			&[]
+		} else {
+			&self.block[self.current_value_offset_start..self.current_value_offset_end]
 		}
 	}
 }
 
 impl BlockIterator {
 	// Checks if the iterator is valid (has a current entry)
-	pub(crate) fn valid(&self) -> bool {
+	pub(crate) fn is_valid(&self) -> bool {
 		!self.current_key.is_empty()
 			&& self.current_value_offset_start != 0
 			&& self.current_value_offset_end != 0
@@ -605,7 +619,7 @@ impl BlockIterator {
 	}
 
 	// Move to a specific key or the next larger key
-	pub(crate) fn seek(&mut self, target: &[u8]) -> Result<Option<()>> {
+	pub(crate) fn seek_internal(&mut self, target: &[u8]) -> Result<Option<()>> {
 		self.reset();
 
 		// Guard against empty blocks (corrupt or malformed)
@@ -675,7 +689,7 @@ impl BlockIterator {
 	}
 
 	// Move to the previous entry
-	pub(crate) fn prev(&mut self) -> Result<bool> {
+	pub(crate) fn prev_internal(&mut self) -> Result<bool> {
 		let original = self.current_entry_offset;
 		if original == 0 {
 			self.reset();
@@ -731,15 +745,15 @@ impl BlockIterator {
 		}
 	}
 
-	// Get the current key
+	// Get the current key (owned version)
 	#[inline]
-	pub(crate) fn key(&self) -> InternalKey {
+	pub(crate) fn key_owned(&self) -> InternalKey {
 		InternalKey::decode(&self.current_key)
 	}
 
-	// Get the current value
+	// Get the current value (owned version)
 	#[inline]
-	pub(crate) fn value(&self) -> Value {
+	pub(crate) fn value_owned(&self) -> Value {
 		if self.keys_only {
 			Vec::new()
 		} else {

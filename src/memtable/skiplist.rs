@@ -14,15 +14,14 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::iter::DoubleEndedIterator;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
 use rand::Rng;
 
+use crate::error::Result as CrateResult;
 use crate::memtable::arena::Arena;
-use crate::sstable::InternalKey;
-use crate::Value;
+use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
 
 const MAX_HEIGHT: usize = 20;
 const P_VALUE: f64 = 1.0 / std::f64::consts::E; // ~0.368
@@ -607,7 +606,7 @@ impl Skiplist {
 			upper: upper.map(|s| s.to_vec()),
 			lower_node: std::ptr::null_mut(),
 			upper_node: std::ptr::null_mut(),
-			backward_started: false,
+			encoded_key_buf: Vec::new(),
 		}
 	}
 }
@@ -624,13 +623,13 @@ pub(crate) struct SkiplistIterator<'a> {
 	upper: Option<Vec<u8>>, // Exclusive upper bound (owned for lifetime flexibility)
 	lower_node: *mut Node,  // Cached node at lower bound
 	upper_node: *mut Node,  // Cached node at upper bound
-	backward_started: bool, // Tracks if next_back() has repositioned
+	encoded_key_buf: Vec<u8>, // Buffer for encoded key to return InternalKeyRef
 }
 
 impl<'a> SkiplistIterator<'a> {
 	/// Check if iterator is valid
 	#[inline]
-	pub fn valid(&self) -> bool {
+	pub fn is_valid(&self) -> bool {
 		self.nd != self.list.head
 			&& self.nd != self.list.tail
 			&& !self.nd.is_null()
@@ -640,43 +639,58 @@ impl<'a> SkiplistIterator<'a> {
 
 	/// Get current key (user_key bytes only)
 	#[inline]
-	pub fn key(&self) -> &[u8] {
-		debug_assert!(self.valid());
+	pub fn key_bytes(&self) -> &[u8] {
+		debug_assert!(self.is_valid());
 		unsafe { (*self.nd).get_key_bytes(&self.list.arena) }
 	}
 
 	/// Get current trailer
 	#[inline]
 	pub fn trailer(&self) -> u64 {
-		debug_assert!(self.valid());
+		debug_assert!(self.is_valid());
 		unsafe { (*self.nd).key_trailer }
 	}
 
 	/// Get current timestamp
 	#[inline]
 	pub fn timestamp(&self) -> u64 {
-		debug_assert!(self.valid());
+		debug_assert!(self.is_valid());
 		unsafe { (*self.nd).key_timestamp }
 	}
 
 	/// Get current value
 	#[inline]
-	pub fn value(&self) -> &[u8] {
-		debug_assert!(self.valid());
+	pub fn value_bytes(&self) -> &[u8] {
+		debug_assert!(self.is_valid());
 		unsafe { (*self.nd).get_value(&self.list.arena) }
+	}
+
+	/// Populate encoded key buffer for InternalKeyRef
+	fn populate_encoded_key(&mut self) {
+		if !self.is_valid() {
+			return;
+		}
+		// Access node data directly to avoid borrow conflict
+		let (key_bytes, trailer, timestamp) = unsafe {
+			let node = &*self.nd;
+			(node.get_key_bytes(&self.list.arena), node.key_trailer, node.key_timestamp)
+		};
+		self.encoded_key_buf.clear();
+		self.encoded_key_buf.extend_from_slice(key_bytes);
+		self.encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
+		self.encoded_key_buf.extend_from_slice(&timestamp.to_be_bytes());
 	}
 
 	/// Move to first entry
 	pub fn first(&mut self) {
-		self.backward_started = false; // Reset on reposition
 		self.nd = self.list.get_next(self.list.head, 0);
 		if self.nd == self.list.tail || self.nd == self.upper_node {
 			return;
 		}
 		// Check upper bound
 		if let Some(upper) = self.upper.as_deref() {
-			if self.valid() {
-				let key = self.key();
+			if self.is_valid() {
+				let key = self.key_bytes();
 				if (self.list.cmp)(upper, key) <= Ordering::Equal {
 					self.upper_node = self.nd;
 					self.nd = self.list.tail;
@@ -688,15 +702,14 @@ impl<'a> SkiplistIterator<'a> {
 
 	/// Move to last entry
 	pub fn last(&mut self) {
-		self.backward_started = false; // Reset on reposition
 		self.nd = self.list.get_prev(self.list.tail, 0);
 		if self.nd == self.list.head || self.nd == self.lower_node {
 			return;
 		}
 		// Check lower bound
 		if let Some(lower) = self.lower.as_deref() {
-			if self.valid() {
-				let key = self.key();
+			if self.is_valid() {
+				let key = self.key_bytes();
 				if (self.list.cmp)(lower, key) == Ordering::Greater {
 					self.lower_node = self.nd;
 					self.nd = self.list.head;
@@ -706,17 +719,17 @@ impl<'a> SkiplistIterator<'a> {
 		}
 	}
 
-	/// Advance to next entry (internal method, renamed to avoid trait conflict)
+	/// Advance to next entry (internal method)
 	pub fn advance(&mut self) {
-		debug_assert!(self.valid());
+		debug_assert!(self.is_valid());
 		self.nd = self.list.get_next(self.nd, 0);
 		if self.nd == self.list.tail || self.nd == self.upper_node {
 			return;
 		}
 		// Check upper bound
 		if let Some(upper) = self.upper.as_deref() {
-			if self.valid() {
-				let key = self.key();
+			if self.is_valid() {
+				let key = self.key_bytes();
 				if (self.list.cmp)(upper, key) <= Ordering::Equal {
 					self.upper_node = self.nd;
 					self.nd = self.list.tail;
@@ -726,17 +739,17 @@ impl<'a> SkiplistIterator<'a> {
 		}
 	}
 
-	/// Move to prev entry
-	pub fn prev(&mut self) {
-		debug_assert!(self.valid());
+	/// Move to prev entry (internal method)
+	pub fn prev_internal(&mut self) {
+		debug_assert!(self.is_valid());
 		self.nd = self.list.get_prev(self.nd, 0);
 		if self.nd == self.list.head || self.nd == self.lower_node {
 			return;
 		}
 		// Check lower bound
 		if let Some(lower) = self.lower.as_deref() {
-			if self.valid() {
-				let key = self.key();
+			if self.is_valid() {
+				let key = self.key_bytes();
 				if (self.list.cmp)(lower, key) == Ordering::Greater {
 					self.lower_node = self.nd;
 					self.nd = self.list.head;
@@ -748,7 +761,6 @@ impl<'a> SkiplistIterator<'a> {
 
 	/// Seek to first entry >= key
 	pub fn seek_ge(&mut self, key: &[u8]) {
-		self.backward_started = false; // Reset on reposition
 		let (_, next) = self.seek_for_base_splice(key);
 		self.nd = next;
 		if self.nd == self.list.tail || self.nd == self.upper_node {
@@ -756,8 +768,8 @@ impl<'a> SkiplistIterator<'a> {
 		}
 		// Check upper bound
 		if let Some(upper) = self.upper.as_deref() {
-			if self.valid() {
-				let current_key = self.key();
+			if self.is_valid() {
+				let current_key = self.key_bytes();
 				if (self.list.cmp)(upper, current_key) <= Ordering::Equal {
 					self.upper_node = self.nd;
 					self.nd = self.list.tail;
@@ -769,7 +781,6 @@ impl<'a> SkiplistIterator<'a> {
 
 	/// Seek to last entry < key
 	pub fn seek_lt(&mut self, key: &[u8]) {
-		self.backward_started = false; // Reset on reposition
 		let (prev, _) = self.seek_for_base_splice(key);
 		self.nd = prev;
 		if self.nd == self.list.head || self.nd == self.lower_node {
@@ -777,8 +788,8 @@ impl<'a> SkiplistIterator<'a> {
 		}
 		// Check lower bound
 		if let Some(lower) = self.lower.as_deref() {
-			if self.valid() {
-				let current_key = self.key();
+			if self.is_valid() {
+				let current_key = self.key_bytes();
 				if (self.list.cmp)(lower, current_key) == Ordering::Greater {
 					self.lower_node = self.nd;
 					self.nd = self.list.head;
@@ -822,51 +833,67 @@ impl<'a> SkiplistIterator<'a> {
 }
 
 // ============================================================================
-// Iterator Traits (matching Pebble's direct iterator usage)
+// InternalIterator Implementation
 // ============================================================================
 
-impl Iterator for SkiplistIterator<'_> {
-	type Item = (InternalKey, Value);
-
-	fn next(&mut self) -> Option<Self::Item> {
-		if !self.valid() {
-			return None;
-		}
-
-		let key = InternalKey {
-			user_key: self.key().to_vec(),
-			timestamp: self.timestamp(),
-			trailer: self.trailer(),
-		};
-		let value = self.value().to_vec();
-		self.advance();
-		Some((key, value))
+impl InternalIterator for SkiplistIterator<'_> {
+	/// Seek to first entry >= target.
+	/// Target is an encoded internal key, we extract user_key for comparison.
+	fn seek(&mut self, target: &[u8]) -> CrateResult<bool> {
+		let user_key = InternalKey::user_key_from_encoded(target);
+		self.seek_ge(user_key);
+		self.populate_encoded_key();
+		Ok(self.is_valid())
 	}
-}
 
-impl DoubleEndedIterator for SkiplistIterator<'_> {
-	fn next_back(&mut self) -> Option<Self::Item> {
-		if !self.backward_started {
-			// First call - reposition for backward iteration
-			match self.upper.clone() {
-				Some(upper) => self.seek_lt(&upper),
-				None => self.last(),
-			}
-			self.backward_started = true; // Set AFTER reposition
-		} else {
-			self.prev();
+	/// Seek to first entry.
+	fn seek_first(&mut self) -> CrateResult<bool> {
+		self.first();
+		self.populate_encoded_key();
+		Ok(self.is_valid())
+	}
+
+	/// Seek to last entry.
+	fn seek_last(&mut self) -> CrateResult<bool> {
+		self.last();
+		self.populate_encoded_key();
+		Ok(self.is_valid())
+	}
+
+	/// Move to next entry.
+	fn next(&mut self) -> CrateResult<bool> {
+		if !self.is_valid() {
+			return Ok(false);
 		}
+		self.advance();
+		self.populate_encoded_key();
+		Ok(self.is_valid())
+	}
 
-		if !self.valid() {
-			return None;
+	/// Move to previous entry.
+	fn prev(&mut self) -> CrateResult<bool> {
+		if !self.is_valid() {
+			return Ok(false);
 		}
+		self.prev_internal();
+		self.populate_encoded_key();
+		Ok(self.is_valid())
+	}
 
-		let key = InternalKey {
-			user_key: self.key().to_vec(),
-			timestamp: self.timestamp(),
-			trailer: self.trailer(),
-		};
-		let value = self.value().to_vec();
-		Some((key, value))
+	/// Check if positioned on valid entry.
+	fn valid(&self) -> bool {
+		self.is_valid()
+	}
+
+	/// Get current key as zero-copy reference.
+	fn key(&self) -> InternalKeyRef<'_> {
+		debug_assert!(self.is_valid());
+		InternalKeyRef::from_encoded(&self.encoded_key_buf)
+	}
+
+	/// Get current value as zero-copy reference.
+	fn value(&self) -> &[u8] {
+		debug_assert!(self.is_valid());
+		self.value_bytes()
 	}
 }

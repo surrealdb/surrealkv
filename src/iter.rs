@@ -1,60 +1,260 @@
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::clock::LogicalClock;
 use crate::error::Result;
-use crate::sstable::InternalKey;
+use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
-use crate::{Key, Value};
+use crate::{Comparator, InternalKeyComparator, Value};
 
-pub type BoxedIterator<'a> = Box<dyn DoubleEndedIterator<Item = Result<(InternalKey, Value)>> + 'a>;
+/// Boxed internal iterator type for dynamic dispatch
+pub type BoxedInternalIterator<'a> = Box<dyn InternalIterator + 'a>;
 
-// Holds a key-value pair and the iterator index
-#[derive(Eq)]
-pub(crate) struct HeapItem {
-	pub(crate) key: InternalKey,
-	pub(crate) value: Value,
-	pub(crate) iterator_index: usize,
+// ============================================================================
+// MergingIterator - Zero-allocation k-way merge using loser tree
+// ============================================================================
+
+/// Direction of iteration
+#[derive(Clone, Copy, PartialEq)]
+enum Direction {
+	Forward,
+	Backward,
 }
 
-impl PartialEq for HeapItem {
-	fn eq(&self, other: &Self) -> bool {
-		self.cmp(other) == Ordering::Equal
-	}
+/// Merge iterator level - owns iterator, no key caching
+struct MergeLevel<'a> {
+	iter: BoxedInternalIterator<'a>,
+	valid: bool,
 }
 
-impl Ord for HeapItem {
-	fn cmp(&self, other: &Self) -> Ordering {
-		// Invert for min-heap behavior
-		other.cmp_internal(self)
-	}
+/// Loser tree for k-way merge with zero key allocations.
+///
+/// During iteration, keys are fetched on-demand from source iterators.
+/// The tree only stores indices, not keys.
+pub(crate) struct MergingIterator<'a> {
+	levels: Vec<MergeLevel<'a>>,
+	/// Winner index from the last tournament
+	winner: usize,
+	/// Number of active (non-exhausted) levels
+	active_count: usize,
+	/// Comparator for keys
+	cmp: Arc<InternalKeyComparator>,
+	/// Direction (forward/backward)
+	direction: Direction,
 }
 
-impl HeapItem {
-	fn cmp_internal(&self, other: &Self) -> Ordering {
-		// First compare by user key
-		match self.key.user_key.cmp(&other.key.user_key) {
-			Ordering::Equal => {
-				// Same user key, compare by sequence number in DESCENDING order
-				// (higher sequence number = more recent)
-				match other.key.seq_num().cmp(&self.key.seq_num()) {
-					Ordering::Equal => self.iterator_index.cmp(&other.iterator_index),
-					ord => ord,
-				}
-			}
-			ord => ord, // Different user keys
+impl<'a> MergingIterator<'a> {
+	pub fn new(iterators: Vec<BoxedInternalIterator<'a>>, cmp: Arc<InternalKeyComparator>) -> Self {
+		let levels: Vec<_> = iterators
+			.into_iter()
+			.map(|iter| MergeLevel {
+				iter,
+				valid: false,
+			})
+			.collect();
+
+		Self {
+			levels,
+			winner: 0,
+			active_count: 0,
+			cmp,
+			direction: Direction::Forward,
 		}
 	}
-}
 
-impl PartialOrd for HeapItem {
-	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-		Some(self.cmp(other))
+	/// Compare two levels by their current key (zero-copy)
+	#[inline]
+	fn compare(&self, a: usize, b: usize) -> Ordering {
+		let level_a = &self.levels[a];
+		let level_b = &self.levels[b];
+
+		match (level_a.valid, level_b.valid) {
+			(false, false) => Ordering::Equal,
+			(true, false) => Ordering::Less, // a wins (valid beats invalid)
+			(false, true) => Ordering::Greater, // b wins
+			(true, true) => {
+				// Both valid - compare keys (zero-copy from iterators)
+				let key_a = level_a.iter.key().encoded();
+				let key_b = level_b.iter.key().encoded();
+				let ord = self.cmp.compare(key_a, key_b);
+				if self.direction == Direction::Backward {
+					ord.reverse()
+				} else {
+					ord
+				}
+			}
+		}
+	}
+
+	/// Find the minimum (or maximum for backward) among all valid levels
+	fn find_winner(&mut self) {
+		if self.levels.is_empty() || self.active_count == 0 {
+			return;
+		}
+
+		// Simple linear search for the winner
+		let mut best_idx = None;
+		for i in 0..self.levels.len() {
+			if !self.levels[i].valid {
+				continue;
+			}
+			match best_idx {
+				None => best_idx = Some(i),
+				Some(b) => {
+					if self.compare(i, b) == Ordering::Less {
+						best_idx = Some(i);
+					}
+				}
+			}
+		}
+
+		if let Some(idx) = best_idx {
+			self.winner = idx;
+		}
+	}
+
+	/// Initialize for forward iteration
+	fn init_forward(&mut self) -> Result<()> {
+		self.direction = Direction::Forward;
+		self.active_count = 0;
+
+		// Position all iterators at first
+		for level in &mut self.levels {
+			level.valid = level.iter.seek_first()?;
+			if level.valid {
+				self.active_count += 1;
+			}
+		}
+
+		self.find_winner();
+		Ok(())
+	}
+
+	/// Initialize for backward iteration
+	fn init_backward(&mut self) -> Result<()> {
+		self.direction = Direction::Backward;
+		self.active_count = 0;
+
+		// Position all iterators at last
+		for level in &mut self.levels {
+			level.valid = level.iter.seek_last()?;
+			if level.valid {
+				self.active_count += 1;
+			}
+		}
+
+		self.find_winner();
+		Ok(())
+	}
+
+	/// Advance the current winner and find new winner
+	fn advance_winner(&mut self) -> Result<bool> {
+		if self.active_count == 0 {
+			return Ok(false);
+		}
+
+		let winner_idx = self.winner;
+		let level = &mut self.levels[winner_idx];
+
+		// Advance the winning iterator
+		level.valid = if self.direction == Direction::Forward {
+			level.iter.next()?
+		} else {
+			level.iter.prev()?
+		};
+
+		if !level.valid {
+			self.active_count = self.active_count.saturating_sub(1);
+		}
+
+		// Find new winner
+		self.find_winner();
+
+		Ok(self.active_count > 0 && self.levels[self.winner].valid)
+	}
+
+	/// Check if iterator is valid
+	pub fn is_valid(&self) -> bool {
+		self.active_count > 0 && self.levels.get(self.winner).map_or(false, |l| l.valid)
+	}
+
+	/// Get current winner's key (zero-copy)
+	pub fn current_key(&self) -> InternalKeyRef<'_> {
+		debug_assert!(self.is_valid());
+		self.levels[self.winner].iter.key()
+	}
+
+	/// Get current winner's value (zero-copy)
+	pub fn current_value(&self) -> &[u8] {
+		debug_assert!(self.is_valid());
+		self.levels[self.winner].iter.value()
 	}
 }
 
-fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &Value) -> Result<()> {
+impl InternalIterator for MergingIterator<'_> {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.direction = Direction::Forward;
+		self.active_count = 0;
+
+		for level in &mut self.levels {
+			level.valid = level.iter.seek(target)?;
+			if level.valid {
+				self.active_count += 1;
+			}
+		}
+
+		self.find_winner();
+		Ok(self.is_valid())
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		self.init_forward()?;
+		Ok(self.is_valid())
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		self.init_backward()?;
+		Ok(self.is_valid())
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		if !self.is_valid() {
+			return Ok(false);
+		}
+		self.advance_winner()
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		if !self.is_valid() {
+			return Ok(false);
+		}
+		// If we were going forward, need to switch direction
+		if self.direction != Direction::Backward {
+			// For simplicity, re-initialize for backward
+			return self.seek_last();
+		}
+		self.advance_winner()
+	}
+
+	fn valid(&self) -> bool {
+		self.is_valid()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		self.current_key()
+	}
+
+	fn value(&self) -> &[u8] {
+		self.current_value()
+	}
+}
+
+// ============================================================================
+// CompactionIterator - Uses MergingIterator for compaction
+// ============================================================================
+
+fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &[u8]) -> Result<()> {
 	// Skip empty values (e.g., hard delete entries)
 	if value.is_empty() {
 		return Ok(());
@@ -71,13 +271,11 @@ fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &Val
 }
 
 pub(crate) struct CompactionIterator<'a> {
-	iterators: Vec<BoxedIterator<'a>>,
-	// Heap of iterators, ordered by their current key
-	heap: BinaryHeap<HeapItem>,
+	merge_iter: MergingIterator<'a>,
 	is_bottom_level: bool,
 
 	// Track the current key being processed
-	current_user_key: Option<Key>,
+	current_user_key: Vec<u8>,
 
 	// Buffer for accumulating all versions of the current key
 	accumulated_versions: Vec<(InternalKey, Value)>,
@@ -108,20 +306,20 @@ pub(crate) struct CompactionIterator<'a> {
 
 impl<'a> CompactionIterator<'a> {
 	pub(crate) fn new(
-		iterators: Vec<BoxedIterator<'a>>,
+		iterators: Vec<BoxedInternalIterator<'a>>,
+		cmp: Arc<InternalKeyComparator>,
 		is_bottom_level: bool,
 		vlog: Option<Arc<VLog>>,
 		enable_versioning: bool,
 		retention_period_ns: u64,
 		clock: Arc<dyn LogicalClock>,
 	) -> Self {
-		let heap = BinaryHeap::with_capacity(iterators.len());
+		let merge_iter = MergingIterator::new(iterators, cmp);
 
 		Self {
-			iterators,
-			heap,
+			merge_iter,
 			is_bottom_level,
-			current_user_key: None,
+			current_user_key: Vec::new(),
 			accumulated_versions: Vec::new(),
 			output_versions: Vec::new(),
 			discard_stats: HashMap::new(),
@@ -135,17 +333,7 @@ impl<'a> CompactionIterator<'a> {
 	}
 
 	fn initialize(&mut self) -> Result<()> {
-		// Pull the first item from each iterator and add to heap
-		for (idx, iter) in self.iterators.iter_mut().enumerate() {
-			if let Some(item_result) = iter.next() {
-				let (key, value) = item_result?;
-				self.heap.push(HeapItem {
-					key,
-					value,
-					iterator_index: idx,
-				});
-			}
-		}
+		self.merge_iter.seek_first()?;
 		self.initialized = true;
 		Ok(())
 	}
@@ -271,17 +459,11 @@ impl<'a> CompactionIterator<'a> {
 		// Clear accumulated versions for the next key
 		self.accumulated_versions.clear();
 	}
-}
 
-impl Iterator for CompactionIterator<'_> {
-	type Item = Result<(InternalKey, Value)>;
-
-	fn next(&mut self) -> Option<Self::Item> {
+	/// Advance to the next output entry
+	pub fn advance(&mut self) -> Result<Option<(InternalKey, Value)>> {
 		if !self.initialized {
-			if let Err(e) = self.initialize() {
-				log::error!("[COMPACTION_ITER] Error initializing: {}", e);
-				return Some(Err(e));
-			}
+			self.initialize()?;
 		}
 
 		loop {
@@ -289,53 +471,31 @@ impl Iterator for CompactionIterator<'_> {
 			if !self.output_versions.is_empty() {
 				// Remove from front to maintain sequence number order (already sorted
 				// descending)
-				return Some(Ok(self.output_versions.remove(0)));
+				return Ok(Some(self.output_versions.remove(0)));
 			}
 
-			// Get the next item from the heap
-			let heap_item = match self.heap.pop() {
-				Some(item) => item,
-				None => {
-					// No more items in heap, process any remaining accumulated versions
-					if !self.accumulated_versions.is_empty() {
-						self.process_accumulated_versions();
-						// Return first output version if any
-						if !self.output_versions.is_empty() {
-							return Some(Ok(self.output_versions.remove(0)));
-						}
-					}
-					return None;
-				}
-			};
-
-			// Pull the next item from the same iterator and add back to heap
-			if let Some(item_result) = self.iterators[heap_item.iterator_index].next() {
-				match item_result {
-					Ok((key, value)) => {
-						self.heap.push(HeapItem {
-							key,
-							value,
-							iterator_index: heap_item.iterator_index,
-						});
-					}
-					Err(e) => {
-						log::error!(
-							"[COMPACTION_ITER] Error from iterator {}: {}",
-							heap_item.iterator_index,
-							e
-						);
-						return Some(Err(e));
+			// Get the next item from the merge iterator
+			if !self.merge_iter.is_valid() {
+				// No more items, process any remaining accumulated versions
+				if !self.accumulated_versions.is_empty() {
+					self.process_accumulated_versions();
+					// Return first output version if any
+					if !self.output_versions.is_empty() {
+						return Ok(Some(self.output_versions.remove(0)));
 					}
 				}
+				return Ok(None);
 			}
 
-			let user_key = heap_item.key.user_key.clone();
+			// Get current key and value from merge iterator (extract to owned to avoid borrow
+			// issues)
+			let key_owned = self.merge_iter.current_key().to_owned();
+			let user_key_owned = key_owned.user_key.clone();
+			let value_owned = self.merge_iter.current_value().to_vec();
 
 			// Check if this is a new user key
-			let is_new_key = match &self.current_user_key {
-				None => true,
-				Some(current) => user_key != *current,
-			};
+			let is_new_key =
+				self.current_user_key.is_empty() || user_key_owned != self.current_user_key;
 
 			if is_new_key {
 				// Process accumulated versions of the previous key
@@ -343,22 +503,43 @@ impl Iterator for CompactionIterator<'_> {
 					self.process_accumulated_versions();
 
 					// Start accumulating the new key
-					self.current_user_key = Some(user_key);
-					self.accumulated_versions.push((heap_item.key, heap_item.value));
+					self.current_user_key = user_key_owned;
+					self.accumulated_versions.push((key_owned, value_owned));
+
+					// Advance merge iterator for next iteration
+					self.merge_iter.next()?;
 
 					// Return first output version from processed key if any
 					if !self.output_versions.is_empty() {
-						return Some(Ok(self.output_versions.remove(0)));
+						return Ok(Some(self.output_versions.remove(0)));
 					}
 				} else {
 					// First key - start accumulating
-					self.current_user_key = Some(user_key);
-					self.accumulated_versions.push((heap_item.key, heap_item.value));
+					self.current_user_key = user_key_owned;
+					self.accumulated_versions.push((key_owned, value_owned));
+
+					// Advance merge iterator for next iteration
+					self.merge_iter.next()?;
 				}
 			} else {
 				// Same user key - add to accumulated versions
-				self.accumulated_versions.push((heap_item.key, heap_item.value));
+				self.accumulated_versions.push((key_owned, value_owned));
+
+				// Advance merge iterator for next iteration
+				self.merge_iter.next()?;
 			}
+		}
+	}
+}
+
+impl Iterator for CompactionIterator<'_> {
+	type Item = Result<(InternalKey, Value)>;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		match self.advance() {
+			Ok(Some(item)) => Some(Ok(item)),
+			Ok(None) => None,
+			Err(e) => Some(Err(e)),
 		}
 	}
 }

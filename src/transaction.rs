@@ -1,17 +1,14 @@
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry as BTreeEntry;
-use std::collections::{btree_map, BTreeMap};
-use std::ops::Bound;
+use std::collections::BTreeMap;
 use std::sync::Arc;
-
-pub use double_ended_peekable::{DoubleEndedPeekable, DoubleEndedPeekableExt};
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
-use crate::snapshot::Snapshot;
-use crate::sstable::InternalKeyKind;
-use crate::{IntoBytes, IterResult, Key, KeysResult, RangeResult, Value, Version};
+use crate::snapshot::{MergeDirection, Snapshot, SnapshotIterator};
+use crate::sstable::{InternalIterator, InternalKeyKind, InternalKeyRef};
+use crate::{IntoBytes, Key, KeysResult, RangeResult, Value, Version};
 
 /// `Mode` is an enumeration representing the different modes a transaction can
 /// have in an MVCC (Multi-Version Concurrency Control) system.
@@ -612,20 +609,14 @@ impl Transaction {
 
 	/// Gets keys in a key range at the current timestamp.
 	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys in the
-	/// range in both forward and backward directions.
+	/// Returns a cursor-based iterator. Use `seek_first()`, `next()`, `prev()` to navigate.
 	///
 	/// The iterator iterates over all keys in the range,
 	/// inclusive of the start key, but not the end key.
 	///
 	/// This function is faster than `range()` as it doesn't
 	/// fetch or resolve values from disk.
-	pub fn keys<K>(
-		&self,
-		start: K,
-		end: K,
-	) -> Result<impl DoubleEndedIterator<Item = KeysResult> + '_>
+	pub fn keys<K>(&self, start: K, end: K) -> Result<TransactionIterator<'_>>
 	where
 		K: IntoBytes,
 	{
@@ -662,27 +653,20 @@ impl Transaction {
 
 	/// Gets keys in a key range, with custom read options.
 	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys in the
-	/// range in both forward and backward directions.
+	/// Returns a cursor-based iterator with explicit seek/next/prev methods.
 	///
 	/// The iterator iterates over all keys in the range,
 	/// inclusive of the start key, but not the end key.
 	///
 	/// This function is faster than `range()` as it doesn't
 	/// fetch or resolve values from disk.
-	pub fn keys_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<Box<dyn DoubleEndedIterator<Item = KeysResult> + '_>> {
+	pub fn keys_with_options(&self, options: &ReadOptions) -> Result<TransactionIterator<'_>> {
 		// Force keys_only to true for this method
 		let options = options.clone().with_keys_only(true);
 		let start_key = options.lower_bound.clone().unwrap_or_default();
 		let end_key = options.upper_bound.clone().unwrap_or_default();
-		Ok(Box::new(
-			TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?
-				.map(|result| result.map(|(key, _)| key)),
-		))
+		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key, &options)?;
+		Ok(TransactionIterator::new(inner, Arc::clone(&self.core), true))
 	}
 
 	pub fn keys_at_version_with_options(
@@ -715,17 +699,23 @@ impl Transaction {
 
 	/// Gets keys and values in a range, at the current timestamp.
 	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys and values
-	/// in the range in both forward and backward directions.
+	/// Returns a cursor-based iterator with explicit seek/next/prev methods.
+	/// Use `seek_first()` to position at the first key, then `next()` to iterate.
 	///
 	/// The iterator iterates over all keys and values in the
 	/// range, inclusive of the start key, but not the end key.
-	pub fn range<K>(
-		&self,
-		start: K,
-		end: K,
-	) -> Result<impl DoubleEndedIterator<Item = RangeResult> + '_>
+	///
+	/// # Example
+	/// ```ignore
+	/// let mut iter = tx.range(b"a", b"z")?;
+	/// iter.seek_first()?;
+	/// while iter.valid() {
+	///     let key = iter.key();
+	///     let value = iter.value()?;
+	///     iter.next()?;
+	/// }
+	/// ```
+	pub fn range<K>(&self, start: K, end: K) -> Result<TransactionIterator<'_>>
 	where
 		K: IntoBytes,
 	{
@@ -758,30 +748,15 @@ impl Transaction {
 
 	/// Gets keys and values in a range, with custom read options.
 	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys and values
-	/// in the range in both forward and backward directions.
+	/// Returns a cursor-based iterator with explicit seek/next/prev methods.
 	///
 	/// The iterator iterates over all keys and values in the
 	/// range, inclusive of the start key, but not the end key.
-	pub fn range_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<Box<dyn DoubleEndedIterator<Item = RangeResult> + '_>> {
+	pub fn range_with_options(&self, options: &ReadOptions) -> Result<TransactionIterator<'_>> {
 		let start_key = options.lower_bound.clone().unwrap_or_default();
 		let end_key = options.upper_bound.clone().unwrap_or_default();
-		Ok(Box::new(
-			TransactionRangeIterator::new_with_options(self, start_key, end_key, options)?.map(
-				|result| {
-					result.and_then(|(k, v)| {
-						v.ok_or_else(|| {
-							Error::InvalidArgument("Expected value for range query".to_string())
-						})
-						.map(|value| (k, value))
-					})
-				},
-			),
-		))
+		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key, options)?;
+		Ok(TransactionIterator::new(inner, Arc::clone(&self.core), options.keys_only))
 	}
 
 	pub fn range_at_version_with_options(
@@ -1113,17 +1088,41 @@ impl Entry {
 	}
 }
 
+/// Current source for the transaction iterator
+#[derive(Clone, Copy, PartialEq)]
+enum CurrentSource {
+	Snapshot,
+	WriteSet,
+	None,
+}
+
 /// An iterator that performs a merging scan over a transaction's snapshot and
-/// write set.
+/// write set. Implements InternalIterator for zero-copy iteration.
 pub(crate) struct TransactionRangeIterator<'a> {
-	/// Iterator over the consistent snapshot
-	snapshot_iter: DoubleEndedPeekable<Box<dyn DoubleEndedIterator<Item = IterResult> + 'a>>,
+	/// Snapshot iterator (implements InternalIterator)
+	snapshot_iter: SnapshotIterator<'a>,
 
-	/// Iterator over the transaction's write set
-	write_set_iter: DoubleEndedPeekable<btree_map::Range<'a, Key, Vec<Entry>>>,
+	/// Write-set entries for the range (collected, filtered for tombstones on access)
+	write_set_entries: Vec<(&'a Key, &'a Entry)>,
 
-	/// When true, only return keys without fetching values
+	/// Current position in write-set entries (forward iteration)
+	ws_pos: usize,
+
+	/// Current position in write-set entries (backward iteration)
+	ws_pos_back: usize,
+
+	/// Current source
+	current_source: CurrentSource,
+
+	/// Keys only mode
 	keys_only: bool,
+
+	/// Buffer for write-set encoded key
+	ws_encoded_key_buf: Vec<u8>,
+
+	/// Direction and initialization state
+	direction: MergeDirection,
+	initialized: bool,
 }
 
 impl<'a> TransactionRangeIterator<'a> {
@@ -1149,162 +1148,395 @@ impl<'a> TransactionRangeIterator<'a> {
 			None => return Err(Error::NoSnapshot),
 		};
 
-		// Create a snapshot iterator for the range
-		let iter = snapshot.range(
+		// Create a snapshot iterator for the range (now returns SnapshotIterator directly)
+		let snapshot_iter = snapshot.range(
 			Some(start_key.as_slice()),
 			Some(end_key.as_slice()),
 			options.keys_only,
 		)?;
-		let boxed_iter: Box<dyn DoubleEndedIterator<Item = IterResult> + 'a> = Box::new(iter);
 
-		// Use inclusive-exclusive range for write set: [start, end)
-		let write_set_range = (Bound::Included(start_key), Bound::Excluded(end_key));
-		let write_set_iter = tx.write_set.range(write_set_range);
+		// Collect write-set entries for the range
+		// We collect references to avoid cloning, and filter tombstones during iteration
+		let mut write_set_entries: Vec<(&'a Key, &'a Entry)> = Vec::new();
+		for (key, entry_list) in tx.write_set.range(start_key..end_key) {
+			if let Some(entry) = entry_list.last() {
+				write_set_entries.push((key, entry));
+			}
+		}
+
+		let ws_len = write_set_entries.len();
 
 		Ok(Self {
-			snapshot_iter: boxed_iter.double_ended_peekable(),
-			write_set_iter: write_set_iter.double_ended_peekable(),
+			snapshot_iter,
+			write_set_entries,
+			ws_pos: 0,
+			ws_pos_back: ws_len,
+			current_source: CurrentSource::None,
 			keys_only: options.keys_only,
+			ws_encoded_key_buf: Vec::new(),
+			direction: MergeDirection::Forward,
+			initialized: false,
 		})
 	}
 
-	/// Reads from the write set and skips deleted entries
-	fn read_from_write_set(&mut self) -> Option<IterResult> {
-		if let Some((ws_key, entries)) = self.write_set_iter.next() {
-			if let Some(last_entry) = entries.last() {
-				if last_entry.is_tombstone() {
-					// Deleted key, skip it by recursively getting the next entry
-					return self.next();
-				}
-
-				if self.keys_only {
-					// For keys-only mode, return None for the value to avoid allocations
-					return Some(Ok((ws_key.clone(), None)));
-				} else if let Some(value) = &last_entry.value {
-					return Some(Ok((ws_key.clone(), Some(value.clone()))));
-				}
-			}
-		}
-		None
+	/// Check if current write-set position is valid (forward)
+	fn ws_valid(&self) -> bool {
+		self.ws_pos < self.ws_pos_back
 	}
 
-	/// Reads from the write set in reverse order and skips deleted entries
-	fn read_from_write_set_back(&mut self) -> Option<IterResult> {
-		if let Some((ws_key, entries)) = self.write_set_iter.next_back() {
-			if let Some(last_entry) = entries.last() {
-				if last_entry.is_tombstone() {
-					// Deleted key, skip it by recursively getting the next entry
-					return self.next_back();
-				}
+	/// Check if current write-set position is valid (backward)
+	fn ws_valid_back(&self) -> bool {
+		self.ws_pos_back > self.ws_pos
+	}
 
-				if self.keys_only {
-					// For keys-only mode, return None for the value to avoid allocations
-					return Some(Ok((ws_key.clone(), None)));
-				} else if let Some(value) = &last_entry.value {
-					return Some(Ok((ws_key.clone(), Some(value.clone()))));
+	/// Get current write-set key (forward)
+	fn ws_key(&self) -> &[u8] {
+		debug_assert!(self.ws_valid());
+		self.write_set_entries[self.ws_pos].0.as_slice()
+	}
+
+	/// Get current write-set key (backward)
+	fn ws_key_back(&self) -> &[u8] {
+		debug_assert!(self.ws_valid_back());
+		self.write_set_entries[self.ws_pos_back - 1].0.as_slice()
+	}
+
+	/// Check if current write-set entry is a tombstone (forward)
+	fn ws_is_tombstone(&self) -> bool {
+		debug_assert!(self.ws_valid());
+		self.write_set_entries[self.ws_pos].1.is_tombstone()
+	}
+
+	/// Check if current write-set entry is a tombstone (backward)
+	fn ws_is_tombstone_back(&self) -> bool {
+		debug_assert!(self.ws_valid_back());
+		self.write_set_entries[self.ws_pos_back - 1].1.is_tombstone()
+	}
+
+	/// Populate encoded key buffer for write-set entry
+	fn populate_ws_encoded_key(&mut self) {
+		if !self.ws_valid() && !self.ws_valid_back() {
+			return;
+		}
+
+		let (key, entry) = if self.direction == MergeDirection::Forward {
+			if !self.ws_valid() {
+				return;
+			}
+			self.write_set_entries[self.ws_pos]
+		} else {
+			if !self.ws_valid_back() {
+				return;
+			}
+			self.write_set_entries[self.ws_pos_back - 1]
+		};
+
+		self.ws_encoded_key_buf.clear();
+		self.ws_encoded_key_buf.extend_from_slice(key);
+		// Add trailer (seq_num << 8 | kind) and timestamp
+		let trailer = ((entry.seqno as u64) << 8) | (entry.kind as u64);
+		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
+		self.ws_encoded_key_buf.extend_from_slice(&entry.timestamp.to_be_bytes());
+	}
+
+	/// Position to minimum of two sources (forward merge)
+	fn position_to_min(&mut self) -> Result<bool> {
+		// Skip tombstones in write-set
+		while self.ws_valid() && self.ws_is_tombstone() {
+			// If snapshot has same key, skip it too
+			if self.snapshot_iter.valid() {
+				let snap_key = self.snapshot_iter.key().user_key();
+				if snap_key == self.ws_key() {
+					self.snapshot_iter.next()?;
 				}
 			}
-		}
-		None
-	}
-}
-
-impl Iterator for TransactionRangeIterator<'_> {
-	type Item = IterResult;
-
-	/// Merges results from write set and snapshot in key order
-	fn next(&mut self) -> Option<Self::Item> {
-		// Fast path: if write set is empty, just use snapshot
-		if self.write_set_iter.peek().is_none() {
-			return self.snapshot_iter.next();
+			self.ws_pos += 1;
 		}
 
-		// Fast path: if snapshot is empty, just use write set
-		if self.snapshot_iter.peek().is_none() {
-			return self.read_from_write_set();
-		}
+		let snap_valid = self.snapshot_iter.valid();
+		let ws_valid = self.ws_valid();
 
-		// Merge results from both iterators
-		let has_snap = self.snapshot_iter.peek().is_some();
-		let has_ws = self.write_set_iter.peek().is_some();
-
-		let result = match (has_snap, has_ws) {
-			(false, false) => None,
-			(true, false) => self.snapshot_iter.next(),
-			(false, true) => self.read_from_write_set(),
+		self.current_source = match (snap_valid, ws_valid) {
+			(false, false) => CurrentSource::None,
+			(true, false) => CurrentSource::Snapshot,
+			(false, true) => {
+				self.populate_ws_encoded_key();
+				CurrentSource::WriteSet
+			}
 			(true, true) => {
-				// Compare keys to determine which comes first
-				if let (Some(Ok((snap_key, _))), Some((ws_key, _))) =
-					(self.snapshot_iter.peek(), self.write_set_iter.peek())
-				{
-					match snap_key.cmp(ws_key) {
-						Ordering::Less => self.snapshot_iter.next(),
-						Ordering::Greater => self.read_from_write_set(),
-						Ordering::Equal => {
-							// Same key - prioritize write set and skip snapshot
-							self.snapshot_iter.next();
-							self.read_from_write_set()
-						}
+				let snap_key = self.snapshot_iter.key().user_key();
+				let ws_key = self.ws_key();
+
+				match snap_key.cmp(ws_key) {
+					Ordering::Less => CurrentSource::Snapshot,
+					Ordering::Greater => {
+						self.populate_ws_encoded_key();
+						CurrentSource::WriteSet
 					}
-				} else if self.snapshot_iter.peek().is_some() {
-					// Snapshot has error, propagate it
-					self.snapshot_iter.next()
-				} else {
-					// This should never happen since we checked above
-					None
+					Ordering::Equal => {
+						// RYOW: write-set wins, skip snapshot
+						self.snapshot_iter.next()?;
+						self.populate_ws_encoded_key();
+						CurrentSource::WriteSet
+					}
 				}
 			}
 		};
-
-		result
+		Ok(self.current_source != CurrentSource::None)
 	}
-}
 
-impl DoubleEndedIterator for TransactionRangeIterator<'_> {
-	/// Merges results from write set and snapshot in reverse key order
-	fn next_back(&mut self) -> Option<Self::Item> {
-		// Fast path: if write set is empty, just use snapshot
-		if self.write_set_iter.peek_back().is_none() {
-			return self.snapshot_iter.next_back();
+	/// Position to maximum of two sources (backward merge)
+	fn position_to_max(&mut self) -> Result<bool> {
+		// Skip tombstones in write-set (backward)
+		while self.ws_valid_back() && self.ws_is_tombstone_back() {
+			// If snapshot has same key, skip it too
+			if self.snapshot_iter.valid() {
+				let snap_key = self.snapshot_iter.key().user_key();
+				if snap_key == self.ws_key_back() {
+					self.snapshot_iter.prev()?;
+				}
+			}
+			self.ws_pos_back -= 1;
 		}
 
-		// Fast path: if snapshot is empty, just use write set
-		if self.snapshot_iter.peek_back().is_none() {
-			return self.read_from_write_set_back();
-		}
+		let snap_valid = self.snapshot_iter.valid();
+		let ws_valid = self.ws_valid_back();
 
-		// Merge results from both iterators
-		let has_snap = self.snapshot_iter.peek_back().is_some();
-		let has_ws = self.write_set_iter.peek_back().is_some();
-
-		let result = match (has_snap, has_ws) {
-			(false, false) => None,
-			(true, false) => self.snapshot_iter.next_back(),
-			(false, true) => self.read_from_write_set_back(),
+		self.current_source = match (snap_valid, ws_valid) {
+			(false, false) => CurrentSource::None,
+			(true, false) => CurrentSource::Snapshot,
+			(false, true) => {
+				self.populate_ws_encoded_key();
+				CurrentSource::WriteSet
+			}
 			(true, true) => {
-				// Compare keys to determine which comes last
-				if let (Some(Ok((snap_key, _))), Some((ws_key, _))) =
-					(self.snapshot_iter.peek_back(), self.write_set_iter.peek_back())
-				{
-					match snap_key.as_slice().cmp(ws_key.as_slice()) {
-						Ordering::Greater => self.snapshot_iter.next_back(),
-						Ordering::Less => self.read_from_write_set_back(),
-						Ordering::Equal => {
-							// Same key - prioritize write set and skip snapshot
-							self.snapshot_iter.next_back();
-							self.read_from_write_set_back()
-						}
+				let snap_key = self.snapshot_iter.key().user_key();
+				let ws_key = self.ws_key_back();
+
+				match snap_key.cmp(ws_key) {
+					Ordering::Greater => CurrentSource::Snapshot,
+					Ordering::Less => {
+						self.populate_ws_encoded_key();
+						CurrentSource::WriteSet
 					}
-				} else if self.snapshot_iter.peek_back().is_some() {
-					// Snapshot has error, propagate it
-					self.snapshot_iter.next_back()
-				} else {
-					// This should never happen since we checked above
-					None
+					Ordering::Equal => {
+						// RYOW: write-set wins, skip snapshot
+						self.snapshot_iter.prev()?;
+						self.populate_ws_encoded_key();
+						CurrentSource::WriteSet
+					}
 				}
 			}
 		};
+		Ok(self.current_source != CurrentSource::None)
+	}
+}
 
-		result
+impl InternalIterator for TransactionRangeIterator<'_> {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.direction = MergeDirection::Forward;
+		self.initialized = true;
+
+		// Seek snapshot
+		self.snapshot_iter.seek(target)?;
+
+		// Binary search in write-set entries
+		let user_key = crate::sstable::InternalKey::user_key_from_encoded(target);
+		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < user_key);
+
+		self.position_to_min()
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Forward;
+		self.initialized = true;
+
+		// Seek snapshot to first
+		self.snapshot_iter.seek_first()?;
+
+		// Reset write-set position
+		self.ws_pos = 0;
+
+		self.position_to_min()
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Backward;
+		self.initialized = true;
+
+		// Seek snapshot to last
+		self.snapshot_iter.seek_last()?;
+
+		// Reset write-set position to end
+		self.ws_pos_back = self.write_set_entries.len();
+
+		self.position_to_max()
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		if !self.initialized {
+			return self.seek_first();
+		}
+
+		// Advance current source
+		match self.current_source {
+			CurrentSource::Snapshot => {
+				self.snapshot_iter.next()?;
+			}
+			CurrentSource::WriteSet => {
+				self.ws_pos += 1;
+			}
+			CurrentSource::None => return Ok(false),
+		}
+
+		self.position_to_min()
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		if !self.initialized {
+			return self.seek_last();
+		}
+
+		// If we were going forward, switch to backward
+		if self.direction != MergeDirection::Backward {
+			return self.seek_last();
+		}
+
+		// Advance current source (backward)
+		match self.current_source {
+			CurrentSource::Snapshot => {
+				self.snapshot_iter.prev()?;
+			}
+			CurrentSource::WriteSet => {
+				self.ws_pos_back -= 1;
+			}
+			CurrentSource::None => return Ok(false),
+		}
+
+		self.position_to_max()
+	}
+
+	fn valid(&self) -> bool {
+		self.current_source != CurrentSource::None
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		debug_assert!(self.valid());
+		match self.current_source {
+			CurrentSource::Snapshot => self.snapshot_iter.key(),
+			CurrentSource::WriteSet => InternalKeyRef::from_encoded(&self.ws_encoded_key_buf),
+			CurrentSource::None => panic!("key() called on invalid iterator"),
+		}
+	}
+
+	fn value(&self) -> &[u8] {
+		if self.keys_only {
+			return &[];
+		}
+		debug_assert!(self.valid());
+		match self.current_source {
+			CurrentSource::Snapshot => self.snapshot_iter.value(),
+			CurrentSource::WriteSet => {
+				let entry = if self.direction == MergeDirection::Forward {
+					self.write_set_entries[self.ws_pos].1
+				} else {
+					self.write_set_entries[self.ws_pos_back - 1].1
+				};
+				entry.value.as_ref().map_or(&[], |v| v.as_slice())
+			}
+			CurrentSource::None => panic!("value() called on invalid iterator"),
+		}
+	}
+}
+
+/// Public iterator for range scans over a transaction.
+/// Follows RocksDB/Pebble cursor pattern with explicit positioning methods.
+///
+/// # Example
+/// ```ignore
+/// let mut iter = tx.range(b"a", b"z")?;
+/// iter.seek_first()?;
+/// while iter.valid() {
+///     let key = iter.key();
+///     let value = iter.value()?;
+///     println!("{:?} = {:?}", key, value);
+///     iter.next()?;
+/// }
+/// ```
+pub struct TransactionIterator<'a> {
+	inner: TransactionRangeIterator<'a>,
+	core: Arc<Core>,
+	keys_only: bool,
+}
+
+impl<'a> TransactionIterator<'a> {
+	/// Creates a new transaction iterator
+	pub(crate) fn new(
+		inner: TransactionRangeIterator<'a>,
+		core: Arc<Core>,
+		keys_only: bool,
+	) -> Self {
+		Self {
+			inner,
+			core,
+			keys_only,
+		}
+	}
+
+	/// Seek to first entry. Returns true if valid.
+	pub fn seek_first(&mut self) -> Result<bool> {
+		self.inner.seek_first()
+	}
+
+	/// Seek to last entry. Returns true if valid.
+	pub fn seek_last(&mut self) -> Result<bool> {
+		self.inner.seek_last()
+	}
+
+	/// Seek to first entry >= target. Returns true if valid.
+	pub fn seek<K: AsRef<[u8]>>(&mut self, target: K) -> Result<bool> {
+		// Create a minimal encoded key for seeking
+		let mut encoded = target.as_ref().to_vec();
+		// Add minimum trailer (seq_num=0, kind=0) and timestamp=0
+		encoded.extend_from_slice(&0u64.to_be_bytes());
+		encoded.extend_from_slice(&0u64.to_be_bytes());
+		self.inner.seek(&encoded)
+	}
+
+	/// Move to next entry. Returns true if valid.
+	pub fn next(&mut self) -> Result<bool> {
+		self.inner.next()
+	}
+
+	/// Move to previous entry. Returns true if valid.
+	pub fn prev(&mut self) -> Result<bool> {
+		self.inner.prev()
+	}
+
+	/// Check if positioned on valid entry.
+	pub fn valid(&self) -> bool {
+		self.inner.valid()
+	}
+
+	/// Get current key (allocates). Caller must check valid() first.
+	pub fn key(&self) -> Key {
+		debug_assert!(self.valid());
+		self.inner.key().user_key().to_vec()
+	}
+
+	/// Get current value (may allocate for VLog resolution). Caller must check valid() first.
+	/// Returns None if in keys-only mode.
+	pub fn value(&self) -> Result<Option<Value>> {
+		debug_assert!(self.valid());
+		if self.keys_only {
+			return Ok(None);
+		}
+		let raw_value = self.inner.value();
+		self.core.resolve_value(raw_value).map(Some)
+	}
+
+	/// Get current key-value pair (convenience method)
+	pub fn entry(&self) -> Result<(Key, Option<Value>)> {
+		Ok((self.key(), self.value()?))
 	}
 }

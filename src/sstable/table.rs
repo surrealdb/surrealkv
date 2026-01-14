@@ -16,8 +16,10 @@ use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
 use crate::sstable::index_block::{TopLevelIndex, TopLevelIndexWriter};
 use crate::sstable::meta::TableMetadata;
 use crate::sstable::{
+	InternalIterator,
 	InternalKey,
 	InternalKeyKind,
+	InternalKeyRef,
 	INTERNAL_KEY_SEQ_NUM_MAX,
 	INTERNAL_KEY_TIMESTAMP_MAX,
 };
@@ -559,14 +561,14 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 
 	// println!("Meta key: {:?}", meta_key);
 	let mut metaindexiter = metaix.iter(false)?;
-	metaindexiter.seek(&meta_key)?;
+	metaindexiter.seek_internal(&meta_key)?;
 
-	if metaindexiter.valid() {
+	if metaindexiter.is_valid() {
 		let k = metaindexiter.key();
 		// Verify exact match to avoid using wrong entry
-		assert_eq!(k.user_key.as_slice(), b"meta");
+		assert_eq!(k.user_key(), b"meta");
 		let buf_bytes = metaindexiter.value();
-		return Ok(Some(TableMetadata::decode(&buf_bytes)?));
+		return Ok(Some(TableMetadata::decode(buf_bytes)?));
 	}
 	Ok(None)
 }
@@ -694,20 +696,20 @@ impl Table {
 			InternalKey::new(Vec::from(filter_name.as_bytes()), 0, InternalKeyKind::Set, 0);
 
 		let mut metaindexiter = metaix.iter(false)?;
-		metaindexiter.seek(&filter_key.encode())?;
+		metaindexiter.seek_internal(&filter_key.encode())?;
 
-		if metaindexiter.valid() {
+		if metaindexiter.is_valid() {
 			let k = metaindexiter.key();
 
 			// Verify exact match to avoid using wrong entry
-			assert_eq!(k.user_key.as_slice(), filter_name.as_bytes());
+			assert_eq!(k.user_key(), filter_name.as_bytes());
 			let val = metaindexiter.value();
 
-			let fbl = BlockHandle::decode(&val);
+			let fbl = BlockHandle::decode(val);
 			let filter_block_location = match fbl {
 				Err(e) => {
 					return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
-						value_bytes: val,
+						value_bytes: val.to_vec(),
 						context: format!("error: {:?}", e),
 					}));
 				}
@@ -773,9 +775,9 @@ impl Table {
 				// Then search within the partition
 				// Note: Index blocks always need full key-value pairs to decode block handles
 				let mut partition_iter = partition_block.iter(false)?;
-				partition_iter.seek(&key_encoded)?;
+				partition_iter.seek_internal(&key_encoded)?;
 
-				if partition_iter.valid() {
+				if partition_iter.is_valid() {
 					if self.internal_cmp.compare(&key_encoded, partition_iter.key_bytes())
 						!= Ordering::Greater
 					{
@@ -813,10 +815,10 @@ impl Table {
 		let mut iter = tb.iter(false)?;
 
 		// Go to entry and check if it's the wanted entry.
-		iter.seek(&key_encoded)?;
-		if iter.valid() {
+		iter.seek_internal(&key_encoded)?;
+		if iter.is_valid() {
 			if iter.user_key() == key.user_key.as_slice() {
-				Ok(Some((iter.key(), iter.value())))
+				Ok(Some((iter.key().to_owned(), iter.value().to_vec())))
 			} else {
 				Ok(None)
 			}
@@ -843,7 +845,6 @@ impl Table {
 			keys_only,
 			range,
 			reverse_started: false,
-			direction: None,
 		}
 	}
 
@@ -922,14 +923,6 @@ pub(crate) struct TableIterator {
 	/// Whether reverse iteration has started (to distinguish from just
 	/// positioned)
 	reverse_started: bool,
-	/// Direction of iteration to prevent interleaving
-	direction: Option<IterDirection>,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum IterDirection {
-	Forward,
-	Backward,
 }
 
 impl TableIterator {
@@ -939,11 +932,11 @@ impl TableIterator {
 		// First try to advance within current partition
 		if let Some(ref mut partition_iter) = self.current_partition_iter {
 			if partition_iter.advance()? {
-				let val = partition_iter.value();
-				let (handle, _) = match BlockHandle::decode(&val) {
+				let val = partition_iter.value_bytes();
+				let (handle, _) = match BlockHandle::decode(val) {
 					Err(e) => {
 						return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
-							value_bytes: val,
+							value_bytes: val.to_vec(),
 							context: format!("error: {:?}", e),
 						}));
 					}
@@ -967,12 +960,12 @@ impl TableIterator {
 		let mut partition_iter = partition_block.iter(false)?;
 		partition_iter.seek_to_first()?;
 
-		if partition_iter.valid() {
-			let val = partition_iter.value();
-			let (handle, _) = match BlockHandle::decode(&val) {
+		if partition_iter.is_valid() {
+			let val = partition_iter.value_bytes();
+			let (handle, _) = match BlockHandle::decode(val) {
 				Err(e) => {
 					return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
-						value_bytes: val,
+						value_bytes: val.to_vec(),
 						context: format!("error: {:?}", e),
 					}));
 				}
@@ -998,7 +991,7 @@ impl TableIterator {
 		// Position at first entry in the new block
 		block_iter.seek_to_first()?;
 
-		if block_iter.valid() {
+		if block_iter.is_valid() {
 			self.current_block = Some(block_iter);
 			self.current_block_off = handle.offset();
 			return Ok(());
@@ -1008,20 +1001,19 @@ impl TableIterator {
 	}
 
 	#[cfg(test)]
-	pub(crate) fn key(&self) -> InternalKey {
-		self.current_block.as_ref().unwrap().key()
+	pub(crate) fn key_owned(&self) -> InternalKey {
+		self.current_block.as_ref().unwrap().key().to_owned()
 	}
 
 	#[cfg(test)]
-	pub(crate) fn value(&self) -> Value {
-		self.current_block.as_ref().unwrap().value()
+	pub(crate) fn value_owned(&self) -> Value {
+		self.current_block.as_ref().unwrap().value().to_vec()
 	}
 
 	fn reset(&mut self) {
 		self.positioned = false;
 		self.exhausted = false;
 		self.current_block = None;
-		self.direction = None; // Reset direction to allow new iteration
 		self.reset_partitioned_state();
 	}
 
@@ -1030,9 +1022,9 @@ impl TableIterator {
 		self.current_block = None;
 	}
 
-	pub(crate) fn prev(&mut self) -> Result<bool> {
+	pub(crate) fn prev_internal(&mut self) -> Result<bool> {
 		if let Some(ref mut block) = self.current_block {
-			if block.prev()? {
+			if block.prev_internal()? {
 				return Ok(true);
 			}
 		}
@@ -1041,12 +1033,12 @@ impl TableIterator {
 
 		// Try to move to previous block within current partition
 		if let Some(ref mut partition_iter) = self.current_partition_iter {
-			if partition_iter.prev()? {
-				let val = partition_iter.value();
-				let (handle, _) = match BlockHandle::decode(&val) {
+			if partition_iter.prev_internal()? {
+				let val = partition_iter.value_bytes();
+				let (handle, _) = match BlockHandle::decode(val) {
 					Err(e) => {
 						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
-							value_bytes: val,
+							value_bytes: val.to_vec(),
 							context: format!("Block corruption in prev(): failed to decode BlockHandle. Error: {:?}", e),
 						});
 						log::error!("[TABLE_ITER] {}", err);
@@ -1057,7 +1049,7 @@ impl TableIterator {
 				self.load_block(&handle)?;
 				if let Some(ref mut block_iter) = self.current_block {
 					block_iter.seek_to_last()?;
-					return Ok(block_iter.valid());
+					return Ok(block_iter.is_valid());
 				}
 			}
 		}
@@ -1075,12 +1067,12 @@ impl TableIterator {
 			let mut partition_iter = partition_block.iter(false)?;
 			partition_iter.seek_to_last()?;
 
-			if partition_iter.valid() {
-				let val = partition_iter.value();
-				let (handle, _) = match BlockHandle::decode(&val) {
+			if partition_iter.is_valid() {
+				let val = partition_iter.value_bytes();
+				let (handle, _) = match BlockHandle::decode(val) {
 					Err(e) => {
 						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
-							value_bytes: val,
+							value_bytes: val.to_vec(),
 							context: format!("Block corruption in prev(): failed to decode BlockHandle in partition {}. Error: {:?}", self.current_partition_index, e),
 						});
 						log::error!("[TABLE_ITER] {}", err);
@@ -1092,7 +1084,7 @@ impl TableIterator {
 				self.load_block(&handle)?;
 				if let Some(ref mut block_iter) = self.current_block {
 					block_iter.seek_to_last()?;
-					return Ok(block_iter.valid());
+					return Ok(block_iter.is_valid());
 				}
 			}
 		}
@@ -1104,7 +1096,7 @@ impl TableIterator {
 	fn seek_to_lower_bound(&mut self, bound: &Bound<InternalKey>) -> Result<()> {
 		match bound {
 			Bound::Included(internal_key) => {
-				self.seek(&internal_key.encode())?;
+				self.seek_internal(&internal_key.encode())?;
 			}
 			Bound::Excluded(internal_key) => {
 				// For excluded bound, seek to highest version of the key, then skip all
@@ -1115,12 +1107,12 @@ impl TableIterator {
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
-				self.seek(&seek_key.encode())?;
+				self.seek_internal(&seek_key.encode())?;
 
 				// Skip ALL versions of the excluded key
-				while self.valid() {
+				while self.is_valid() {
 					let current_key = self.current_block.as_ref().unwrap().key();
-					if current_key.user_key != internal_key.user_key {
+					if current_key.user_key() != internal_key.user_key.as_slice() {
 						break;
 					}
 					if !self.advance()? {
@@ -1145,27 +1137,27 @@ impl TableIterator {
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
-				self.seek(&seek_key.encode())?;
+				self.seek_internal(&seek_key.encode())?;
 
 				// If seek went past table end (invalid), start from last key
-				if !self.valid() {
+				if !self.is_valid() {
 					self.seek_to_last()?;
 					return Ok(());
 				}
 
 				// Back up if we're beyond the bound (should only need a few steps)
-				while self.valid() {
+				while self.is_valid() {
 					let current_key = self.current_block.as_ref().unwrap().key();
 					let cmp = self
 						.table
 						.opts
 						.comparator
-						.compare(current_key.user_key.as_slice(), internal_key.user_key.as_slice());
+						.compare(current_key.user_key(), internal_key.user_key.as_slice());
 					if cmp != Ordering::Greater {
 						// Found a key <= bound, we're positioned correctly
 						break;
 					}
-					if !self.prev()? {
+					if !self.prev_internal()? {
 						// No more keys, iterator becomes invalid
 						break;
 					}
@@ -1179,25 +1171,25 @@ impl TableIterator {
 					InternalKeyKind::Max,
 					INTERNAL_KEY_TIMESTAMP_MAX,
 				);
-				self.seek(&seek_key.encode())?;
+				self.seek_internal(&seek_key.encode())?;
 
 				// If seek went past table end, start from last key
-				if !self.valid() {
+				if !self.is_valid() {
 					self.seek_to_last()?;
 				}
 
 				// Move backward until we find a key < end (strictly less)
-				while self.valid() {
+				while self.is_valid() {
 					let current_key = self.current_block.as_ref().unwrap().key();
 					let cmp = self
 						.table
 						.opts
 						.comparator
-						.compare(current_key.user_key.as_slice(), internal_key.user_key.as_slice());
+						.compare(current_key.user_key(), internal_key.user_key.as_slice());
 					if cmp == Ordering::Less {
 						break;
 					}
-					if !self.prev()? {
+					if !self.prev_internal()? {
 						break;
 					}
 				}
@@ -1236,136 +1228,122 @@ impl TableIterator {
 	}
 }
 
-impl Iterator for TableIterator {
-	type Item = Result<(InternalKey, Value)>;
+impl InternalIterator for TableIterator {
+	/// Seek to first entry >= target within bounds.
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.positioned = true;
+		self.exhausted = false;
 
-	fn next(&mut self) -> Option<Self::Item> {
-		// Check if direction was already set to backward
-		if self.direction == Some(IterDirection::Backward) {
-			return Some(Err(Error::InterleavedIteration));
-		}
+		// Use existing seek logic which handles block navigation
+		self.seek_internal(target)?;
 
-		// Set direction to forward on first iteration
-		if self.direction.is_none() {
-			self.direction = Some(IterDirection::Forward);
-		}
-
-		// If not positioned, position appropriately based on range
-		if !self.positioned {
-			let lower_bound = self.range.0.clone();
-			match self.seek_to_lower_bound(&lower_bound) {
-				Ok(()) => {
-					self.positioned = true;
-				}
-				Err(e) => {
-					log::error!("[TABLE_ITER] Error in seek_to_lower_bound(): {}", e);
-					return Some(Err(e));
-				}
+		// Check if result satisfies bounds
+		if self.is_valid() {
+			let user_key = self.current_block.as_ref().unwrap().user_key();
+			if !self.satisfies_upper_bound(user_key) {
+				self.mark_exhausted();
 			}
 		}
-
-		// If not valid, return None
-		if !self.valid() {
-			return None;
-		}
-
-		let block = self.current_block.as_ref().unwrap();
-		if !self.satisfies_upper_bound(block.user_key()) {
-			self.mark_exhausted();
-			return None;
-		}
-
-		let current_item = (block.key(), block.value());
-
-		// Advance for the next call to next()
-		match self.advance() {
-			Ok(_) => Some(Ok(current_item)),
-			Err(e) => {
-				log::error!("[TABLE_ITER] Error in advance(): {}", e);
-				Some(Err(e))
-			}
-		}
+		Ok(self.is_valid())
 	}
-}
 
-impl DoubleEndedIterator for TableIterator {
-	fn next_back(&mut self) -> Option<Self::Item> {
-		// Check if direction was already set to forward
-		if self.direction == Some(IterDirection::Forward) {
-			return Some(Err(Error::InterleavedIteration));
-		}
+	/// Seek to first entry within bounds.
+	fn seek_first(&mut self) -> Result<bool> {
+		self.positioned = true;
+		self.exhausted = false;
 
-		// Set direction to backward on first iteration
-		if self.direction.is_none() {
-			self.direction = Some(IterDirection::Backward);
-		}
+		// Seek to lower bound (handles Included/Excluded/Unbounded)
+		let lower = self.range.0.clone();
+		self.seek_to_lower_bound(&lower)?;
 
-		// If not positioned, position appropriately based on range
-		if !self.positioned {
-			// Seek to upper bound instead of always seeking to last
-			match &self.range.1 {
-				Bound::Included(_) | Bound::Excluded(_) => {
-					let upper_bound = self.range.1.clone();
-					match self.seek_to_upper_bound(&upper_bound) {
-						Ok(()) => {
-							self.positioned = true;
-							self.reverse_started = false;
-						}
-						Err(e) => {
-							log::error!("[TABLE_ITER] Error in seek_to_upper_bound(): {}", e);
-							return Some(Err(e));
-						}
-					}
-				}
-				Bound::Unbounded => match self.seek_to_last() {
-					Ok(()) => {
-						self.positioned = true;
-					}
-					Err(e) => {
-						log::error!("[TABLE_ITER] Error in seek_to_last(): {}", e);
-						return Some(Err(e));
-					}
-				},
+		// Verify within upper bound
+		if self.is_valid() {
+			let user_key = self.current_block.as_ref().unwrap().user_key();
+			if !self.satisfies_upper_bound(user_key) {
+				self.mark_exhausted();
 			}
 		}
+		Ok(self.is_valid())
+	}
 
-		// If positioned but not yet started reverse iteration, return current position
-		// first
-		if self.positioned && !self.reverse_started && self.valid() {
-			let block = self.current_block.as_ref().unwrap();
-			if !self.satisfies_lower_bound(block.user_key()) {
-				return None;
-			}
+	/// Seek to last entry within bounds.
+	fn seek_last(&mut self) -> Result<bool> {
+		self.positioned = true;
+		self.exhausted = false;
 
-			let item = (block.key(), block.value());
-			self.reverse_started = true;
-			return Some(Ok(item));
-		}
+		// Seek to upper bound
+		let upper = self.range.1.clone();
+		self.seek_to_upper_bound(&upper)?;
 
-		match self.prev() {
-			Ok(true) => {
-				let block = self.current_block.as_ref().unwrap();
-				if !self.satisfies_lower_bound(block.user_key()) {
-					return None;
-				}
-
-				let item = (block.key(), block.value());
-				Some(Ok(item))
-			}
-			Ok(false) => None,
-			Err(e) => {
-				log::error!("[TABLE_ITER] Error in prev(): {}", e);
-				Some(Err(e))
+		// Verify within lower bound
+		if self.is_valid() {
+			let user_key = self.current_block.as_ref().unwrap().user_key();
+			if !self.satisfies_lower_bound(user_key) {
+				self.mark_exhausted();
 			}
 		}
+		Ok(self.is_valid())
+	}
+
+	/// Move to next entry within bounds.
+	fn next(&mut self) -> Result<bool> {
+		if !self.is_valid() {
+			return Ok(false);
+		}
+
+		// Advance to next entry
+		self.advance()?;
+
+		// Check upper bound
+		if self.is_valid() {
+			let user_key = self.current_block.as_ref().unwrap().user_key();
+			if !self.satisfies_upper_bound(user_key) {
+				self.mark_exhausted();
+			}
+		}
+		Ok(self.is_valid())
+	}
+
+	/// Move to previous entry within bounds.
+	fn prev(&mut self) -> Result<bool> {
+		if !self.is_valid() {
+			return Ok(false);
+		}
+
+		// Move to previous entry
+		self.prev_internal()?;
+
+		// Check lower bound
+		if self.is_valid() {
+			let user_key = self.current_block.as_ref().unwrap().user_key();
+			if !self.satisfies_lower_bound(user_key) {
+				self.mark_exhausted();
+			}
+		}
+		Ok(self.is_valid())
+	}
+
+	fn valid(&self) -> bool {
+		self.is_valid()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		debug_assert!(self.valid());
+		// BlockIterator already returns encoded key bytes
+		InternalKeyRef::from_encoded(self.current_block.as_ref().unwrap().key_bytes())
+	}
+
+	fn value(&self) -> &[u8] {
+		debug_assert!(self.valid());
+		self.current_block.as_ref().unwrap().value_bytes()
 	}
 }
 
 impl TableIterator {
-	pub(crate) fn valid(&self) -> bool {
+	pub(crate) fn is_valid(&self) -> bool {
 		!self.exhausted
 			&& self.current_block.is_some()
-			&& self.current_block.as_ref().unwrap().valid()
+			&& self.current_block.as_ref().unwrap().is_valid()
 	}
 
 	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
@@ -1381,12 +1359,12 @@ impl TableIterator {
 			let mut partition_iter = partition_block.iter(false)?;
 			partition_iter.seek_to_first()?;
 
-			if partition_iter.valid() {
-				let val = partition_iter.value();
-				let (handle, _) = match BlockHandle::decode(&val) {
+			if partition_iter.is_valid() {
+				let val = partition_iter.value_bytes();
+				let (handle, _) = match BlockHandle::decode(val) {
 					Err(e) => {
 						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
-							value_bytes: val,
+							value_bytes: val.to_vec(),
 							context: format!(
 								"Failed to decode BlockHandle in seek_to_first(): {}",
 								e
@@ -1425,12 +1403,12 @@ impl TableIterator {
 			let mut partition_iter = last_partition_block.iter(false)?;
 			partition_iter.seek_to_last()?;
 
-			if partition_iter.valid() {
-				let val = partition_iter.value();
-				let (handle, _) = match BlockHandle::decode(&val) {
+			if partition_iter.is_valid() {
+				let val = partition_iter.value_bytes();
+				let (handle, _) = match BlockHandle::decode(val) {
 					Err(e) => {
 						let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
-							value_bytes: val,
+							value_bytes: val.to_vec(),
 							context: format!(
 								"Failed to decode BlockHandle in seek_to_last(): {}",
 								e
@@ -1461,7 +1439,7 @@ impl TableIterator {
 		}))
 	}
 
-	pub(crate) fn seek(&mut self, target: &[u8]) -> Result<Option<()>> {
+	pub(crate) fn seek_internal(&mut self, target: &[u8]) -> Result<Option<()>> {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// For partitioned index, use full internal key for correct partition lookup
@@ -1472,14 +1450,14 @@ impl TableIterator {
 				let partition_block = partitioned_index.load_block(block_handle)?;
 				// Note: Index blocks always need full key-value pairs to decode block handles
 				let mut partition_iter = partition_block.iter(false)?;
-				partition_iter.seek(target)?;
+				partition_iter.seek_internal(target)?;
 
-				if partition_iter.valid() {
-					let v = partition_iter.value();
-					let (handle, _) = match BlockHandle::decode(&v) {
+				if partition_iter.is_valid() {
+					let v = partition_iter.value_bytes();
+					let (handle, _) = match BlockHandle::decode(v) {
 						Err(e) => {
 							let err = Error::from(SSTableError::FailedToDecodeBlockHandle {
-								value_bytes: v,
+								value_bytes: v.to_vec(),
 								context: format!("Failed to decode BlockHandle in seek(): {}", e),
 							});
 							log::error!("[TABLE_ITER] {}", err);
@@ -1492,12 +1470,12 @@ impl TableIterator {
 					self.current_partition_iter = Some(partition_iter);
 					self.load_block(&handle)?;
 					if let Some(ref mut block_iter) = self.current_block {
-						block_iter.seek(target)?;
+						block_iter.seek_internal(target)?;
 						self.positioned = true;
 						self.exhausted = false;
 
 						// If not valid in current block, the key might be in next block
-						if !block_iter.valid() {
+						if !block_iter.is_valid() {
 							// Try to advance to next block
 							match self.skip_to_next_entry() {
 								Ok(true) => {
@@ -1554,7 +1532,7 @@ impl TableIterator {
 		// If not positioned, position at first entry
 		if !self.positioned {
 			self.seek_to_first()?;
-			return Ok(self.valid());
+			return Ok(self.is_valid());
 		}
 
 		// Try to advance within the current block first

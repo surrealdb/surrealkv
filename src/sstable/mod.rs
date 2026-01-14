@@ -207,3 +207,127 @@ impl PartialOrd for InternalKey {
 		Some(self.cmp(other))
 	}
 }
+
+/// A zero-copy reference to an internal key.
+/// The data lives in the source buffer (arena, block, etc.)
+#[derive(Clone, Copy)]
+pub(crate) struct InternalKeyRef<'a> {
+	encoded: &'a [u8],
+}
+
+impl<'a> InternalKeyRef<'a> {
+	#[inline]
+	pub fn from_encoded(encoded: &'a [u8]) -> Self {
+		debug_assert!(encoded.len() >= 16);
+		Self {
+			encoded,
+		}
+	}
+
+	#[inline]
+	pub fn user_key(&self) -> &'a [u8] {
+		InternalKey::user_key_from_encoded(self.encoded)
+	}
+
+	#[inline]
+	pub fn encoded(&self) -> &'a [u8] {
+		self.encoded
+	}
+
+	#[inline]
+	pub fn trailer(&self) -> u64 {
+		InternalKey::trailer_from_encoded(self.encoded)
+	}
+
+	#[inline]
+	pub fn seq_num(&self) -> u64 {
+		InternalKey::seq_num_from_encoded(self.encoded)
+	}
+
+	#[inline]
+	pub fn timestamp(&self) -> u64 {
+		let n = self.encoded.len() - 8;
+		read_u64_be(self.encoded, n)
+	}
+
+	#[inline]
+	pub fn kind(&self) -> InternalKeyKind {
+		trailer_to_kind(self.trailer())
+	}
+
+	#[inline]
+	pub fn is_tombstone(&self) -> bool {
+		is_delete_kind(self.kind())
+	}
+
+	#[inline]
+	pub fn is_hard_delete_marker(&self) -> bool {
+		is_hard_delete_marker(self.kind())
+	}
+
+	#[inline]
+	pub fn is_replace(&self) -> bool {
+		is_replace_kind(self.kind())
+	}
+
+	pub fn to_owned(&self) -> InternalKey {
+		InternalKey::decode(self.encoded)
+	}
+
+	#[inline]
+	pub fn size(&self) -> usize {
+		self.encoded.len()
+	}
+}
+
+impl PartialEq for InternalKeyRef<'_> {
+	fn eq(&self, other: &Self) -> bool {
+		self.encoded == other.encoded
+	}
+}
+
+impl Eq for InternalKeyRef<'_> {}
+
+impl std::fmt::Debug for InternalKeyRef<'_> {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("InternalKeyRef")
+			.field("user_key", &self.user_key())
+			.field("seq_num", &self.seq_num())
+			.field("kind", &self.kind())
+			.field("timestamp", &self.timestamp())
+			.finish()
+	}
+}
+
+use crate::error::Result;
+
+/// Cursor-based iterator for internal key-value pairs.
+/// Replaces Iterator/DoubleEndedIterator with explicit seek/next/prev.
+/// This trait enables zero-allocation iteration by returning references
+/// to data owned by the iterator's underlying storage.
+pub(crate) trait InternalIterator {
+	/// Seek to first key >= target. Returns Ok(true) if valid.
+	/// Target is an encoded internal key.
+	fn seek(&mut self, target: &[u8]) -> Result<bool>;
+
+	/// Seek to first entry. Returns Ok(true) if valid.
+	fn seek_first(&mut self) -> Result<bool>;
+
+	/// Seek to last entry. Returns Ok(true) if valid.
+	fn seek_last(&mut self) -> Result<bool>;
+
+	/// Move to next entry. Returns Ok(true) if valid.
+	fn next(&mut self) -> Result<bool>;
+
+	/// Move to previous entry. Returns Ok(true) if valid.
+	fn prev(&mut self) -> Result<bool>;
+
+	/// Check if positioned on valid entry.
+	fn valid(&self) -> bool;
+
+	/// Get current key (zero-copy). Caller must check valid() first.
+	fn key(&self) -> InternalKeyRef<'_>;
+
+	/// Get current value (zero-copy). Caller must check valid() first.
+	fn value(&self) -> &[u8];
+}

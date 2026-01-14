@@ -197,16 +197,19 @@ impl TopLevelIndex {
 	) -> Result<Self> {
 		let block =
 			read_table_block(Arc::clone(&opt.internal_comparator), Arc::clone(&f), location)?;
-		let iter = block.iter(false)?;
+		let mut iter = block.iter(false)?;
 		let mut blocks = Vec::new();
-		for item in iter {
-			let (key, handle) = item?;
+		iter.seek_to_first()?;
+		while iter.is_valid() {
+			let key = iter.key_bytes().to_vec();
+			let handle_bytes = iter.value_bytes();
 			// Store full encoded internal key for correct partition lookup
-			let (handle, _) = BlockHandle::decode(&handle)?;
+			let (handle, _) = BlockHandle::decode(handle_bytes)?;
 			blocks.push(BlockHandleWithKey {
 				separator_key: key,
 				handle,
 			});
+			iter.advance()?;
 		}
 		Ok(TopLevelIndex {
 			id,

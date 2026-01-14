@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
-use crate::iter::{BoxedIterator, CompactionIterator};
+use crate::iter::{BoxedInternalIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lsm::CoreInner;
 use crate::memtable::ImmutableMemtables;
@@ -108,9 +108,9 @@ impl Compactor {
 		let to_merge: Vec<_> =
 			input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
 
-		let iterators: Vec<BoxedIterator<'_>> = to_merge
+		let iterators: Vec<BoxedInternalIterator<'_>> = to_merge
 			.into_iter()
-			.map(|table| Box::new(table.iter(false, None)) as BoxedIterator<'_>)
+			.map(|table| Box::new(table.iter(false, None)) as BoxedInternalIterator<'_>)
 			.collect();
 
 		drop(levels);
@@ -162,7 +162,7 @@ impl Compactor {
 		&self,
 		path: &Path,
 		table_id: u64,
-		merge_iter: Vec<BoxedIterator<'_>>,
+		merge_iter: Vec<BoxedInternalIterator<'_>>,
 		input: &CompactionInput,
 	) -> Result<(bool, HashMap<u32, i64>)> {
 		let file = SysFile::create(path)?;
@@ -174,6 +174,7 @@ impl Compactor {
 		let is_bottom_level = input.target_level >= max_level;
 		let mut comp_iter = CompactionIterator::new(
 			merge_iter,
+			Arc::clone(&self.options.lopts.internal_comparator),
 			is_bottom_level,
 			self.options.vlog.clone(),
 			self.options.lopts.enable_versioning,

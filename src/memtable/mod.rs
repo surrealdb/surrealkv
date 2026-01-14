@@ -10,9 +10,9 @@ use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
 
 use crate::batch::Batch;
 use crate::error::Result;
-use crate::iter::CompactionIterator;
+use crate::iter::{BoxedInternalIterator, CompactionIterator};
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::InternalKey;
+use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
 use crate::vfs::File;
 use crate::{Options, Value};
 
@@ -112,8 +112,8 @@ impl MemTable {
 		iter.seek_ge(key);
 
 		// Find the entry with highest sequence number <= max_seq
-		while iter.valid() {
-			let found_key = iter.key();
+		while iter.is_valid() {
+			let found_key = iter.key_bytes();
 			if found_key != key {
 				break; // Moved past our key
 			}
@@ -129,7 +129,7 @@ impl MemTable {
 					timestamp: 0,
 					trailer: found_trailer,
 				};
-				return Some((internal_key, iter.value().to_vec()));
+				return Some((internal_key, iter.value_bytes().to_vec()));
 			}
 
 			iter.advance();
@@ -140,7 +140,7 @@ impl MemTable {
 	pub(crate) fn is_empty(&self) -> bool {
 		let mut iter = self.skiplist.iter();
 		iter.first();
-		!iter.valid()
+		!iter.is_valid()
 	}
 
 	pub(crate) fn size(&self) -> usize {
@@ -233,9 +233,10 @@ impl MemTable {
 			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
 
 			let iter = self.iter(false);
-			let iter = Box::new(iter);
+			let iter: BoxedInternalIterator<'_> = Box::new(iter);
 			let mut comp_iter = CompactionIterator::new(
 				vec![iter],
+				Arc::clone(&lsm_opts.internal_comparator),
 				false,                       // not bottom level (L0 flush)
 				None,                        // no vlog access in flush context
 				false,                       // versioning disabled in flush context
@@ -289,34 +290,46 @@ impl MemTable {
 	}
 }
 
-/// Thin wrapper around SkiplistIterator for keys_only optimization and Result wrapping
+/// Thin wrapper around SkiplistIterator for keys_only optimization
 pub(crate) struct MemTableIterator<'a> {
 	iter: SkiplistIterator<'a>,
 	keys_only: bool,
 }
 
-impl Iterator for MemTableIterator<'_> {
-	type Item = Result<(InternalKey, Value)>;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		let (key, value) = self.iter.next()?;
-		let value = if self.keys_only {
-			vec![]
-		} else {
-			value
-		};
-		Some(Ok((key, value)))
+impl InternalIterator for MemTableIterator<'_> {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.iter.seek(target)
 	}
-}
 
-impl DoubleEndedIterator for MemTableIterator<'_> {
-	fn next_back(&mut self) -> Option<Self::Item> {
-		let (key, value) = self.iter.next_back()?;
-		let value = if self.keys_only {
-			vec![]
+	fn seek_first(&mut self) -> Result<bool> {
+		self.iter.seek_first()
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		self.iter.seek_last()
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		self.iter.next()
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		self.iter.prev()
+	}
+
+	fn valid(&self) -> bool {
+		self.iter.valid()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		self.iter.key()
+	}
+
+	fn value(&self) -> &[u8] {
+		if self.keys_only {
+			&[]
 		} else {
-			value
-		};
-		Some(Ok((key, value)))
+			self.iter.value()
+		}
 	}
 }

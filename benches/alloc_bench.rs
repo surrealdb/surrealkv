@@ -114,8 +114,14 @@ pub fn seq_range(b: divan::Bencher<'_, '_>, count: usize) {
 		{
 			let txn = tree.begin().unwrap();
 			// Scan entire range from first key to end_bound (covers all keys)
-			let range_iter = txn.range(&keys[0], &end_bound).unwrap();
-			let _results: Vec<_> = range_iter.map(|r| r.unwrap()).collect();
+			let mut iter = txn.range(&keys[0], &end_bound).unwrap();
+			let mut results = Vec::new();
+			iter.seek_first().unwrap();
+			while iter.valid() {
+				results.push((iter.key(), iter.value().unwrap()));
+				iter.next().unwrap();
+			}
+			let _ = results;
 		}
 	});
 }
