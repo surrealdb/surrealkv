@@ -838,6 +838,7 @@ impl Table {
 			keys_only,
 			range,
 			reverse_started: false,
+			direction: None,
 		}
 	}
 
@@ -863,8 +864,12 @@ impl Table {
 		match &range.0 {
 			// lower bound
 			Bound::Unbounded => false,
-			Bound::Included(k) | Bound::Excluded(k) => {
+			Bound::Included(k) => {
 				self.opts.comparator.compare(&largest.user_key, &k.user_key) == Ordering::Less
+			}
+			Bound::Excluded(k) => {
+				// Range starts AFTER k, so table is before if table.largest <= k
+				self.opts.comparator.compare(&largest.user_key, &k.user_key) != Ordering::Greater
 			}
 		}
 	}
@@ -878,8 +883,12 @@ impl Table {
 		match &range.1 {
 			// upper bound
 			Bound::Unbounded => false,
-			Bound::Included(k) | Bound::Excluded(k) => {
+			Bound::Included(k) => {
 				self.opts.comparator.compare(&smallest.user_key, &k.user_key) == Ordering::Greater
+			}
+			Bound::Excluded(k) => {
+				// Range ends BEFORE k, so table is after if table.smallest >= k
+				self.opts.comparator.compare(&smallest.user_key, &k.user_key) != Ordering::Less
 			}
 		}
 	}
@@ -908,6 +917,14 @@ pub struct TableIterator {
 	/// Whether reverse iteration has started (to distinguish from just
 	/// positioned)
 	reverse_started: bool,
+	/// Direction of iteration to prevent interleaving
+	direction: Option<IterDirection>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum IterDirection {
+	Forward,
+	Backward,
 }
 
 impl TableIterator {
@@ -999,6 +1016,7 @@ impl TableIterator {
 		self.positioned = false;
 		self.exhausted = false;
 		self.current_block = None;
+		self.direction = None; // Reset direction to allow new iteration
 		self.reset_partitioned_state();
 	}
 
@@ -1217,6 +1235,16 @@ impl Iterator for TableIterator {
 	type Item = Result<(InternalKey, Value)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
+		// Check if direction was already set to backward
+		if self.direction == Some(IterDirection::Backward) {
+			return Some(Err(Error::InterleavedIteration));
+		}
+
+		// Set direction to forward on first iteration
+		if self.direction.is_none() {
+			self.direction = Some(IterDirection::Forward);
+		}
+
 		// If not positioned, position appropriately based on range
 		if !self.positioned {
 			let lower_bound = self.range.0.clone();
@@ -1257,6 +1285,16 @@ impl Iterator for TableIterator {
 
 impl DoubleEndedIterator for TableIterator {
 	fn next_back(&mut self) -> Option<Self::Item> {
+		// Check if direction was already set to forward
+		if self.direction == Some(IterDirection::Forward) {
+			return Some(Err(Error::InterleavedIteration));
+		}
+
+		// Set direction to backward on first iteration
+		if self.direction.is_none() {
+			self.direction = Some(IterDirection::Backward);
+		}
+
 		// If not positioned, position appropriately based on range
 		if !self.positioned {
 			// Seek to upper bound instead of always seeking to last

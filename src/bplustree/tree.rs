@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::fs::File;
 use std::io;
+use std::ops::{Bound, RangeBounds};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -2686,8 +2687,22 @@ impl<F: VfsFile> BPlusTree<F> {
 		Ok(())
 	}
 
-	pub fn range(&self, start_key: &[u8], end_key: &[u8]) -> Result<RangeScanIterator<'_, F>> {
-		RangeScanIterator::new(self, start_key, end_key)
+	pub fn range<'a, R: RangeBounds<&'a [u8]>>(
+		&self,
+		range: R,
+	) -> Result<RangeScanIterator<'_, F>> {
+		// Convert Bound<&&[u8]> to Bound<&[u8]> by dereferencing
+		let start = match range.start_bound() {
+			Bound::Included(k) => Bound::Included(*k),
+			Bound::Excluded(k) => Bound::Excluded(*k),
+			Bound::Unbounded => Bound::Unbounded,
+		};
+		let end = match range.end_bound() {
+			Bound::Included(k) => Bound::Included(*k),
+			Bound::Excluded(k) => Bound::Excluded(*k),
+			Bound::Unbounded => Bound::Unbounded,
+		};
+		RangeScanIterator::new(self, start, end)
 	}
 
 	/// Calculate the height of the B+ tree.
@@ -2985,14 +3000,30 @@ impl<F: VfsFile> BPlusTree<F> {
 pub struct RangeScanIterator<'a, F: VfsFile> {
 	tree: &'a BPlusTree<F>,
 	current_leaf: Option<LeafNode>,
-	end_key: Bytes,
+	end: Bound<Bytes>, // Included/Excluded/Unbounded
 	current_idx: usize,
 	current_end_idx: usize, // Pre-calculated end position in current leaf
 	reached_end: bool,
 }
 
 impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
-	pub(crate) fn new(tree: &'a BPlusTree<F>, start_key: &[u8], end_key: &[u8]) -> Result<Self> {
+	pub(crate) fn new(
+		tree: &'a BPlusTree<F>,
+		start: Bound<&[u8]>,
+		end: Bound<&[u8]>,
+	) -> Result<Self> {
+		// Handle start bound
+		let start_key = match start {
+			Bound::Included(key) => key,
+			Bound::Excluded(key) => {
+				// For excluded start, we need to find the next key after this one
+				// This is handled by partition_point which finds first key >= start_key
+				// So we can use the key as-is and skip it if it matches exactly
+				key
+			}
+			Bound::Unbounded => &[] as &[u8], // Empty slice means start from beginning
+		};
+
 		// Find the leaf containing the start key
 		let mut node_offset = tree.header.root_offset;
 
@@ -3000,7 +3031,11 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 		let leaf = loop {
 			match tree.read_node(node_offset)?.as_ref() {
 				NodeType::Internal(internal) => {
-					let idx = internal.find_child_index(start_key, tree.compare.as_ref());
+					let idx = if start_key.is_empty() {
+						0 // Start from first child for unbounded
+					} else {
+						internal.find_child_index(start_key, tree.compare.as_ref())
+					};
 					node_offset = internal.children[idx];
 				}
 				NodeType::Leaf(leaf) => {
@@ -3013,17 +3048,45 @@ impl<'a, F: VfsFile> RangeScanIterator<'a, F> {
 		};
 
 		// Find the first key >= start_key in the leaf
-		let current_idx =
-			leaf.keys.partition_point(|k| tree.compare.compare(k, start_key) == Ordering::Less);
+		let current_idx = if start_key.is_empty() {
+			0 // Start from beginning for unbounded
+		} else {
+			match start {
+				Bound::Included(key) => {
+					leaf.keys.partition_point(|k| tree.compare.compare(k, key) == Ordering::Less)
+				}
+				Bound::Excluded(key) => {
+					// Find first key > start_key
+					// partition_point returns first index where compare(k, key) ==
+					// Ordering::Greater
+					leaf.keys.partition_point(|k| tree.compare.compare(k, key) != Ordering::Greater)
+				}
+				Bound::Unbounded => 0,
+			}
+		};
+
+		// Handle end bound
+		let end = match end {
+			Bound::Included(key) => Bound::Included(Bytes::copy_from_slice(key)),
+			Bound::Excluded(key) => Bound::Excluded(Bytes::copy_from_slice(key)),
+			Bound::Unbounded => Bound::Unbounded,
+		};
 
 		// Pre-calculate end index in this leaf
-		let current_end_idx =
-			leaf.keys.partition_point(|k| tree.compare.compare(k, end_key) != Ordering::Greater);
+		let current_end_idx = match &end {
+			Bound::Included(end_k) => leaf
+				.keys
+				.partition_point(|k| tree.compare.compare(k, end_k.as_ref()) != Ordering::Greater),
+			Bound::Excluded(end_k) => leaf
+				.keys
+				.partition_point(|k| tree.compare.compare(k, end_k.as_ref()) == Ordering::Less),
+			Bound::Unbounded => leaf.keys.len(), // Unbounded: include all keys in leaf
+		};
 
 		Ok(RangeScanIterator {
 			tree,
 			current_leaf: Some(leaf),
-			end_key: Bytes::copy_from_slice(end_key),
+			end,
 			current_idx,
 			current_end_idx,
 			reached_end: false,
@@ -3053,10 +3116,18 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 					match self.tree.read_node(leaf.next_leaf) {
 						Ok(arc_node) => match arc_node.as_ref() {
 							NodeType::Leaf(next_leaf) => {
-								let next_end_idx = next_leaf.keys.partition_point(|k| {
-									self.tree.compare.compare(k, self.end_key.as_ref())
-										!= Ordering::Greater
-								});
+								let next_end_idx = match &self.end {
+									Bound::Included(end_k) => next_leaf.keys.partition_point(|k| {
+										self.tree.compare.compare(k, end_k.as_ref())
+											!= Ordering::Greater
+									}),
+									Bound::Excluded(end_k) => next_leaf.keys.partition_point(|k| {
+										self.tree.compare.compare(k, end_k.as_ref())
+											== Ordering::Less
+									}),
+									Bound::Unbounded => next_leaf.keys.len(), /* Unbounded:
+									                                           * include all keys */
+								};
 
 								self.current_leaf = Some(next_leaf.clone());
 								self.current_idx = 0;
@@ -3199,9 +3270,9 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Test insertions
-		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
-		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
-		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
+		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key2", b"value2").unwrap();
+		tree.insert(b"key3", b"value3").unwrap();
 
 		// Test retrievals
 		assert_eq!(tree.get(b"key1").unwrap().unwrap().as_ref(), b"value1");
@@ -3521,7 +3592,7 @@ mod tests {
 	#[test]
 	fn test_single_insert_search() {
 		let mut tree = create_test_tree(true);
-		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+		tree.insert(b"key1", b"value1").unwrap();
 		assert_eq!(tree.get(b"key1").unwrap().as_deref(), Some(b"value1".as_ref()));
 	}
 
@@ -3530,12 +3601,12 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Insert multiple keys to ensure we're working with a leaf node
-		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
-		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
-		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
+		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key2", b"value2").unwrap();
+		tree.insert(b"key3", b"value3").unwrap();
 
 		// Update existing key in the same leaf
-		tree.insert(b"key2".to_vec(), b"updated_value2".to_vec()).unwrap();
+		tree.insert(b"key2", b"updated_value2").unwrap();
 
 		// Verify the update
 		assert_eq!(tree.get(b"key1").unwrap().as_deref(), Some(b"value1".as_ref()));
@@ -3548,17 +3619,17 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Insert initial key
-		tree.insert(b"key".to_vec(), b"value1".to_vec()).unwrap();
+		tree.insert(b"key", b"value1").unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value1".as_ref()));
 
 		// Update multiple times
-		tree.insert(b"key".to_vec(), b"value2".to_vec()).unwrap();
+		tree.insert(b"key", b"value2").unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value2".as_ref()));
 
-		tree.insert(b"key".to_vec(), b"value3".to_vec()).unwrap();
+		tree.insert(b"key", b"value3").unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"value3".as_ref()));
 
-		tree.insert(b"key".to_vec(), b"final_value".to_vec()).unwrap();
+		tree.insert(b"key", b"final_value").unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"final_value".as_ref()));
 	}
 
@@ -3567,18 +3638,18 @@ mod tests {
 		let mut tree = create_test_tree(true);
 
 		// Insert initial keys to create some tree structure
-		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
-		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
-		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
+		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key2", b"value2").unwrap();
+		tree.insert(b"key3", b"value3").unwrap();
 
 		// Get initial tree stats
 		let (height_before, nodes_before, keys_before, leaves_before) =
 			tree.calculate_tree_stats().unwrap();
 
 		// Update existing keys - should not create new nodes
-		tree.insert(b"key1".to_vec(), b"updated_value1".to_vec()).unwrap();
-		tree.insert(b"key2".to_vec(), b"updated_value2".to_vec()).unwrap();
-		tree.insert(b"key3".to_vec(), b"updated_value3".to_vec()).unwrap();
+		tree.insert(b"key1", b"updated_value1").unwrap();
+		tree.insert(b"key2", b"updated_value2").unwrap();
+		tree.insert(b"key3", b"updated_value3").unwrap();
 
 		// Get stats after updates
 		let (height_after, nodes_after, keys_after, leaves_after) =
@@ -3633,7 +3704,7 @@ mod tests {
 		let keys = vec![b"b".to_vec(), b"d".to_vec(), b"f".to_vec(), b"h".to_vec(), b"j".to_vec()];
 
 		for key in &keys {
-			tree.insert(key.clone(), b"value".to_vec()).unwrap();
+			tree.insert(key.clone(), b"value").unwrap();
 		}
 
 		// Delete middle key to force predecessor/successor use
@@ -3657,7 +3728,7 @@ mod tests {
 		}
 
 		for key in &keys {
-			tree.insert(key.clone(), b"value".to_vec()).unwrap();
+			tree.insert(key.clone(), b"value").unwrap();
 		}
 
 		// Delete first and last keys in sequence
@@ -3708,7 +3779,7 @@ mod tests {
 			assert_eq!(tree.get(b"mango")?, None, "Non-existent key found unexpectedly");
 
 			// Add new data and verify
-			tree.insert(b"mango".to_vec(), b"orange".to_vec())?;
+			tree.insert(b"mango", b"orange")?;
 			assert_eq!(
 				tree.get(b"mango")?.as_ref().map(|b| b.as_ref()),
 				Some(b"orange".as_ref()),
@@ -3737,9 +3808,9 @@ mod tests {
 		// Insert test data
 		{
 			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator))?;
-			tree.insert(b"one".to_vec(), b"1".to_vec())?;
-			tree.insert(b"two".to_vec(), b"2".to_vec())?;
-			tree.insert(b"three".to_vec(), b"3".to_vec())?;
+			tree.insert(b"one", b"1")?;
+			tree.insert(b"two", b"2")?;
+			tree.insert(b"three", b"3")?;
 		}
 
 		// Delete and verify
@@ -3767,9 +3838,9 @@ mod tests {
 	fn test_concurrent_operations() {
 		let mut tree = create_test_tree(true);
 		// Insert and delete same key repeatedly
-		tree.insert(b"key".to_vec(), b"v1".to_vec()).unwrap();
+		tree.insert(b"key", b"v1").unwrap();
 		tree.delete(b"key").unwrap();
-		tree.insert(b"key".to_vec(), b"v2".to_vec()).unwrap();
+		tree.insert(b"key", b"v2").unwrap();
 		assert_eq!(tree.get(b"key").unwrap().as_deref(), Some(b"v2".as_ref()));
 	}
 
@@ -3781,7 +3852,7 @@ mod tests {
 		// Create and immediately drop
 		{
 			let mut tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
-			tree.insert(b"test".to_vec(), b"value".to_vec()).unwrap();
+			tree.insert(b"test", b"value").unwrap();
 			// Explicit drop before end of scope
 			drop(tree);
 		}
@@ -3799,7 +3870,7 @@ mod tests {
 		let path = file.path();
 
 		let mut tree = BPlusTree::disk(path, Arc::new(TestComparator)).unwrap();
-		tree.insert(b"close".to_vec(), b"test".to_vec()).unwrap();
+		tree.insert(b"close", b"test").unwrap();
 		tree.close().unwrap(); // Explicit close
 	}
 
@@ -3925,7 +3996,8 @@ mod tests {
 		}
 
 		// Test range 3-7
-		let results = tree.range(&serialize_u32(3), &serialize_u32(7)).unwrap();
+		let results =
+			tree.range(serialize_u32(3).as_slice()..=serialize_u32(7).as_slice()).unwrap();
 		let expected: Vec<_> = (3..=7).map(|i| (i, i * 10)).collect();
 		assert_eq!(
 			results.into_iter().map(|res| deserialize_pair(res.unwrap())).collect::<Vec<_>>(),
@@ -3944,7 +4016,8 @@ mod tests {
 		}
 
 		// Test range 5-15
-		let results = tree.range(&serialize_u32(5), &serialize_u32(15)).unwrap();
+		let results =
+			tree.range(serialize_u32(5).as_slice()..=serialize_u32(15).as_slice()).unwrap();
 		let expected: Vec<_> = (5..=15).map(|i| (i, i * 10)).collect();
 		assert_eq!(
 			results.into_iter().map(|res| deserialize_pair(res.unwrap())).collect::<Vec<_>>(),
@@ -3961,7 +4034,10 @@ mod tests {
 			tree.insert(serialize_u32(i), serialize_u32(i * 10)).unwrap();
 		}
 
-		let results: Vec<_> = tree.range(&serialize_u32(1), &serialize_u32(10)).unwrap().collect();
+		let results: Vec<_> = tree
+			.range(serialize_u32(1).as_slice()..=serialize_u32(10).as_slice())
+			.unwrap()
+			.collect();
 
 		assert_eq!(results.len(), 10);
 	}
@@ -3976,7 +4052,8 @@ mod tests {
 		}
 
 		// Start > end should return empty
-		let results: Vec<_> = tree.range(&serialize_u32(3), &serialize_u32(1)).unwrap().collect();
+		let results: Vec<_> =
+			tree.range(serialize_u32(3).as_slice()..serialize_u32(1).as_slice()).unwrap().collect();
 		assert!(results.is_empty());
 	}
 
@@ -3991,7 +4068,8 @@ mod tests {
 		}
 
 		// Range covering missing start/end
-		let results = tree.range(&serialize_u32(2), &serialize_u32(9)).unwrap();
+		let results =
+			tree.range(serialize_u32(2).as_slice()..=serialize_u32(9).as_slice()).unwrap();
 		let expected = vec![3, 5, 7, 9];
 		assert_eq!(
 			results
@@ -4010,11 +4088,17 @@ mod tests {
 		tree.insert(serialize_u32(5), vec![]).unwrap();
 
 		// Single key range
-		let results: Vec<_> = tree.range(&serialize_u32(5), &serialize_u32(5)).unwrap().collect();
+		let results: Vec<_> = tree
+			.range(serialize_u32(5).as_slice()..=serialize_u32(5).as_slice())
+			.unwrap()
+			.collect();
 		assert_eq!(results.len(), 1);
 
 		// Non-existent exact range
-		let results: Vec<_> = tree.range(&serialize_u32(3), &serialize_u32(3)).unwrap().collect();
+		let results: Vec<_> = tree
+			.range(serialize_u32(3).as_slice()..=serialize_u32(3).as_slice())
+			.unwrap()
+			.collect();
 		assert!(results.is_empty());
 	}
 
@@ -4037,7 +4121,8 @@ mod tests {
 		tree.insert(serialize_u32(15), vec![]).unwrap();
 
 		// Test range scan
-		let results = tree.range(&serialize_u32(5), &serialize_u32(15)).unwrap();
+		let results =
+			tree.range(serialize_u32(5).as_slice()..=serialize_u32(15).as_slice()).unwrap();
 		let expected = vec![5, 6, 8, 9, 10, 12, 15];
 		assert_eq!(
 			results
@@ -4051,11 +4136,11 @@ mod tests {
 	#[test]
 	fn test_range() {
 		let mut tree = create_test_tree(true);
-		tree.insert(b"key1".to_vec(), b"value1".to_vec()).unwrap();
-		tree.insert(b"key3".to_vec(), b"value3".to_vec()).unwrap();
-		tree.insert(b"key2".to_vec(), b"value2".to_vec()).unwrap();
+		tree.insert(b"key1", b"value1").unwrap();
+		tree.insert(b"key3", b"value3").unwrap();
+		tree.insert(b"key2", b"value2").unwrap();
 
-		let mut iter = tree.range(b"key2", b"key3").unwrap();
+		let mut iter = tree.range(b"key2".as_slice()..=b"key3".as_slice()).unwrap();
 		let (k1, v1) = iter.next().unwrap().unwrap();
 		assert_eq!((k1.as_ref(), v1.as_ref()), (b"key2".as_ref(), b"value2".as_ref()));
 		let (k2, v2) = iter.next().unwrap().unwrap();
@@ -4066,9 +4151,9 @@ mod tests {
 	#[test]
 	fn test_range_empty() {
 		let mut tree = create_test_tree(true);
-		tree.insert(b"a".to_vec(), b"1".to_vec()).unwrap();
-		tree.insert(b"c".to_vec(), b"3".to_vec()).unwrap();
-		let mut iter = tree.range(b"b", b"b").unwrap();
+		tree.insert(b"a", b"1").unwrap();
+		tree.insert(b"c", b"3").unwrap();
+		let mut iter = tree.range(b"b".as_slice()..b"b".as_slice()).unwrap();
 		assert!(iter.next().is_none());
 	}
 
@@ -4085,7 +4170,7 @@ mod tests {
 		// Range scan from key_05009 to key_05500
 		let start = b"key_05000";
 		let end = b"key_05500";
-		let mut iter = tree.range(start, end).unwrap();
+		let mut iter = tree.range(start.as_slice()..=end.as_slice()).unwrap();
 		for i in 5000..=5500 {
 			let expected_key = format!("key_{:05}", i).into_bytes();
 			let expected_value = format!("value_{:05}", i).into_bytes();

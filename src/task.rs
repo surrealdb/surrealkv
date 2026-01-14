@@ -8,6 +8,7 @@ use crate::compaction::leveled::Strategy;
 use crate::compaction::CompactionStrategy;
 use crate::error::BackgroundErrorReason;
 use crate::lsm::CompactionOperations;
+use crate::Options;
 
 /// Manages background tasks for the LSM tree
 pub(crate) struct TaskManager {
@@ -40,7 +41,7 @@ impl fmt::Debug for TaskManager {
 }
 
 impl TaskManager {
-	pub(crate) fn new(core: Arc<dyn CompactionOperations>) -> Self {
+	pub(crate) fn new(core: Arc<dyn CompactionOperations>, opts: Arc<Options>) -> Self {
 		let stop_flag = Arc::new(AtomicBool::new(false));
 		let memtable_notify = Arc::new(Notify::new());
 		let level_notify = Arc::new(Notify::new());
@@ -102,7 +103,8 @@ impl TaskManager {
 					log::debug!("Level compaction task starting");
 
 					// Use leveled compaction strategy
-					let strategy: Arc<dyn CompactionStrategy> = Arc::new(Strategy::default());
+					let strategy: Arc<dyn CompactionStrategy> =
+						Arc::new(Strategy::from_options(Arc::clone(&opts)));
 					if let Err(e) = core.compact(strategy) {
 						log::error!("Level compaction task error: {e:?}");
 						core.error_handler().set_error(e, BackgroundErrorReason::Compaction);
@@ -180,7 +182,7 @@ mod tests {
 	use crate::error::{BackgroundErrorHandler, Result};
 	use crate::lsm::CompactionOperations;
 	use crate::task::TaskManager;
-	use crate::Error;
+	use crate::{Error, Options};
 
 	// Mock CoreInner for testing
 	struct MockCoreInner {
@@ -257,8 +259,10 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_wake_up_memtable() {
+		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager = TaskManager::new(core.clone());
+		let task_manager =
+			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
 
 		task_manager.wake_up_memtable();
 		time::sleep(Duration::from_millis(100)).await; // Allow time for task to complete
@@ -271,8 +275,10 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_multiple_wake_up_memtable() {
+		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager = TaskManager::new(core.clone());
+		let task_manager =
+			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
 
 		for _ in 0..3 {
 			task_manager.wake_up_memtable();
@@ -291,8 +297,10 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_wake_up_level() {
+		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager = TaskManager::new(core.clone());
+		let task_manager =
+			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
 
 		task_manager.wake_up_level();
 		time::sleep(Duration::from_millis(100)).await; // Allow time for task to complete
@@ -305,8 +313,10 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_multiple_wake_up_level() {
+		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager = TaskManager::new(core.clone());
+		let task_manager =
+			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
 
 		for _ in 0..3 {
 			task_manager.wake_up_level();
@@ -325,8 +335,10 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_alternating_compactions() {
+		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager = TaskManager::new(core.clone());
+		let task_manager =
+			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
 
 		// Alternating between memtable and level compactions
 		for i in 0..4 {
@@ -351,10 +363,12 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_already_running_tasks() {
+		let opts = Arc::new(Options::default());
 		// Create core with longer delays to ensure tasks are still running when we try
 		// to wake them again
 		let core = Arc::new(MockCoreInner::with_delays(100, 100));
-		let task_manager = TaskManager::new(core.clone());
+		let task_manager =
+			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
 
 		// Wake up memtable and immediately try again while it's still running
 		task_manager.wake_up_memtable();
@@ -382,12 +396,14 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_concurrent_wake_up_memtable() {
+		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager = Arc::new(TaskManager::new(core.clone()));
+		let task_manager =
+			Arc::new(TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts));
 
 		let mut handles = vec![];
 		for _ in 0..10 {
-			let tm = task_manager.clone();
+			let tm = Arc::clone(&task_manager);
 			handles.push(tokio::spawn(async move {
 				tm.wake_up_memtable();
 			}));
@@ -411,12 +427,14 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_concurrent_wake_up_level() {
+		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager = Arc::new(TaskManager::new(core.clone()));
+		let task_manager =
+			Arc::new(TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts));
 
 		let mut handles = vec![];
 		for _ in 0..5 {
-			let tm = task_manager.clone();
+			let tm = Arc::clone(&task_manager);
 			handles.push(tokio::spawn(async move {
 				tm.wake_up_level();
 				// Small sleep to ensure some interleaving
@@ -462,7 +480,9 @@ mod tests {
 		core.level_compactions.store(0, Ordering::SeqCst);
 
 		// Now create the task manager and run the actual test
-		let task_manager = TaskManager::new(core.clone());
+		let opts = Arc::new(Options::default());
+		let task_manager =
+			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
 
 		// Trigger memtable compaction that will fail
 		task_manager.wake_up_memtable();
@@ -516,10 +536,12 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_task_from_fail() {
+		let opts = Arc::new(Options::default());
 		// Create a core that will fail on the first attempt but succeed on subsequent
 		// attempts
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager = TaskManager::new(core.clone());
+		let task_manager =
+			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
 
 		// Make first memtable compaction fail
 		core.fail_memtable.store(true, Ordering::SeqCst);

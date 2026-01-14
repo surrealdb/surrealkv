@@ -14,6 +14,37 @@ use crate::vfs::File;
 use crate::vlog::VLog;
 use crate::Options as LSMOptions;
 
+/// RAII guard to ensure tables are unhidden if compaction fails
+struct HiddenTablesGuard {
+	level_manifest: Arc<RwLock<LevelManifest>>,
+	table_ids: Vec<u64>,
+	committed: bool,
+}
+
+impl HiddenTablesGuard {
+	fn new(level_manifest: Arc<RwLock<LevelManifest>>, table_ids: &[u64]) -> Self {
+		Self {
+			level_manifest,
+			table_ids: table_ids.to_vec(),
+			committed: false,
+		}
+	}
+
+	fn commit(&mut self) {
+		self.committed = true;
+	}
+}
+
+impl Drop for HiddenTablesGuard {
+	fn drop(&mut self) {
+		if !self.committed {
+			if let Ok(mut levels) = self.level_manifest.write() {
+				levels.unhide_tables(&self.table_ids);
+			}
+		}
+	}
+}
+
 /// Compaction options
 pub(crate) struct CompactionOptions {
 	pub(crate) lopts: Arc<LSMOptions>,
@@ -51,7 +82,7 @@ impl Compactor {
 
 	pub(crate) fn compact(&self) -> Result<()> {
 		let levels_guard = self.options.level_manifest.write()?;
-		let choice = self.strategy.pick_levels(&levels_guard);
+		let choice = self.strategy.pick_levels(&levels_guard)?;
 
 		match choice {
 			CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input),
@@ -64,57 +95,64 @@ impl Compactor {
 		mut levels: RwLockWriteGuard<'_, LevelManifest>,
 		input: &CompactionInput,
 	) -> Result<()> {
-		let merge_result = {
-			let tables = levels.get_all_tables();
+		// Hide tables that are being merged
+		levels.hide_tables(&input.tables_to_merge);
 
-			let to_merge: Vec<_> =
-				input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
+		// Create guard to ensure tables are unhidden on error
+		let mut guard = HiddenTablesGuard::new(
+			Arc::clone(&self.options.level_manifest),
+			&input.tables_to_merge,
+		);
 
-			let iterators: Vec<BoxedIterator<'_>> = to_merge
-				.into_iter()
-				.map(|table| Box::new(table.iter(false, None)) as BoxedIterator<'_>)
-				.collect();
+		let tables = levels.get_all_tables();
+		let to_merge: Vec<_> =
+			input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
 
-			// Hide tables that are being merged
-			levels.hide_tables(&input.tables_to_merge);
-			drop(levels);
+		let iterators: Vec<BoxedIterator<'_>> = to_merge
+			.into_iter()
+			.map(|table| Box::new(table.iter(false, None)) as BoxedIterator<'_>)
+			.collect();
 
-			// Create new table
-			let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
-			let new_table_path = self.get_table_path(new_table_id);
+		drop(levels);
 
-			// Write merged data - returns (table_created, discard_stats)
-			let (table_created, discard_stats) =
-				self.write_merged_table(&new_table_path, new_table_id, iterators, input)?;
+		// Create new table
+		let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
+		let new_table_path = self.get_table_path(new_table_id);
 
-			// Open table only if one was created
-			let new_table = if table_created {
-				Some(self.open_table(new_table_id, &new_table_path)?)
-			} else {
-				None
+		// Write merged data - returns (table_created, discard_stats)
+		let (table_created, discard_stats) =
+			match self.write_merged_table(&new_table_path, new_table_id, iterators, input) {
+				Ok(result) => result,
+				Err(e) => {
+					// Guard will unhide tables on drop
+					return Err(e);
+				}
 			};
 
-			Ok((new_table, discard_stats))
+		// Open table only if one was created
+		let new_table = if table_created {
+			match self.open_table(new_table_id, &new_table_path) {
+				Ok(table) => Some(table),
+				Err(e) => {
+					// Guard will unhide tables on drop
+					return Err(e);
+				}
+			}
+		} else {
+			None
 		};
 
-		match merge_result {
-			Ok((new_table, discard_stats)) => {
-				self.update_manifest(input, new_table)?;
-				self.cleanup_old_tables(input);
+		// Update manifest - this will commit the guard on success
+		self.update_manifest(input, new_table, &mut guard)?;
 
-				if !discard_stats.is_empty() {
-					if let Some(ref vlog) = self.options.vlog {
-						vlog.update_discard_stats(&discard_stats);
-					}
-				}
-				Ok(())
-			}
-			Err(e) => {
-				let mut levels = self.options.level_manifest.write()?;
-				levels.unhide_tables(&input.tables_to_merge);
-				Err(e)
+		self.cleanup_old_tables(input);
+
+		if !discard_stats.is_empty() {
+			if let Some(ref vlog) = self.options.vlog {
+				vlog.update_discard_stats(&discard_stats);
 			}
 		}
+		Ok(())
 	}
 
 	/// Returns (table_created, discard_stats)
@@ -171,6 +209,7 @@ impl Compactor {
 		&self,
 		input: &CompactionInput,
 		new_table: Option<Arc<Table>>,
+		guard: &mut HiddenTablesGuard,
 	) -> Result<()> {
 		let mut manifest = self.options.level_manifest.write()?;
 		let _imm_guard = self.options.immutable_memtables.write();
@@ -198,16 +237,23 @@ impl Compactor {
 			changeset.new_tables.push((input.target_level, table));
 		}
 
-		manifest.apply_changeset(&changeset)?;
+		let rollback = manifest.apply_changeset(&changeset)?;
 
+		// Write manifest to disk - if this fails, revert in-memory state
 		if let Err(e) = write_manifest_to_disk(&manifest) {
+			manifest.revert_changeset(rollback);
 			self.options
 				.error_handler
 				.set_error(e.clone(), crate::error::BackgroundErrorReason::ManifestWrite);
 			return Err(e);
 		}
 
+		// Unhide tables before committing guard (they'll be removed from manifest anyway)
 		manifest.unhide_tables(&input.tables_to_merge);
+
+		// Commit guard - tables are now properly handled in manifest
+		guard.commit();
+
 		Ok(())
 	}
 

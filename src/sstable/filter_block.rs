@@ -258,7 +258,8 @@ mod tests {
 		let filter_policy = Arc::new(LevelDBBloomFilter::new(bits_per_key));
 
 		// Create a FilterBlockWriter
-		let mut filter_writer = FilterBlockWriter::new(filter_policy.clone());
+		let mut filter_writer =
+			FilterBlockWriter::new(Arc::clone(&filter_policy) as Arc<dyn FilterPolicy>);
 
 		// Start a single block
 		filter_writer.start_block(0);
@@ -326,7 +327,7 @@ mod tests {
 	#[test]
 	fn test_basic_bloom_filter() {
 		let policy = Arc::new(LevelDBBloomFilter::new(10));
-		let mut w = FilterBlockWriter::new(policy.clone());
+		let mut w = FilterBlockWriter::new(Arc::clone(&policy) as Arc<dyn FilterPolicy>);
 
 		w.start_block(0);
 		w.add_key("foo".as_bytes());

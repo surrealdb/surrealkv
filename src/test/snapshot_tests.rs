@@ -7,7 +7,7 @@ use test_log::test;
 
 use crate::levels::{Level, Levels};
 use crate::memtable::MemTable;
-use crate::snapshot::{IterState, KMergeIterator};
+use crate::snapshot::{IterState, KMergeIterator, Snapshot, VersionedRangeQueryParams};
 use crate::sstable::table::{Table, TableWriter};
 use crate::sstable::{InternalKey, InternalKeyKind};
 use crate::vfs::File;
@@ -433,7 +433,7 @@ fn test_range_skips_non_overlapping_tables() {
 		let opts = Arc::new(Options::new());
 		let mut buf = Vec::new();
 		{
-			let mut w = TableWriter::new(&mut buf, 0, opts.clone(), 0); // L0 for test
+			let mut w = TableWriter::new(&mut buf, 0, Arc::clone(&opts), 0); // L0 for test
 			for (k, v) in data {
 				let ikey = InternalKey::new(k.to_vec(), 1, InternalKeyKind::Set, 0);
 				w.add(ikey, v).unwrap();
@@ -784,7 +784,7 @@ fn create_test_table_with_range(
 	let table_file_path = opts.sstable_file_path(table_id);
 	let mut file = SysFile::create(&table_file_path)?;
 
-	let mut writer = TableWriter::new(&mut file, table_id, opts.clone(), 0); // L0 for test
+	let mut writer = TableWriter::new(&mut file, table_id, Arc::clone(&opts), 0); // L0 for test
 
 	// Generate incremental keys spanning the range
 	let mut keys = Vec::new();
@@ -874,9 +874,9 @@ fn test_level0_tables_before_range_skipped() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables with ranges: [a-c], [d-f], [g-i]
-	let table1 = create_test_table_with_range(1, "a", "c", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(2, "d", "f", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(3, "g", "i", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "c", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(2, "d", "f", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(3, "g", "i", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
@@ -902,9 +902,9 @@ fn test_level0_tables_after_range_skipped() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables with ranges: [m-o], [p-r], [s-u]
-	let table1 = create_test_table_with_range(1, "m", "o", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(2, "p", "r", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(3, "s", "u", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "m", "o", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(2, "p", "r", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(3, "s", "u", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
@@ -930,9 +930,9 @@ fn test_level0_overlapping_tables_included() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables with overlapping ranges
-	let table1 = create_test_table_with_range(1, "a", "e", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(2, "c", "g", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(3, "f", "j", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "e", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(2, "c", "g", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(3, "f", "j", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
@@ -959,11 +959,11 @@ fn test_level0_mixed_overlap_scenarios() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables: [a-c], [e-g], [i-k], [d-f], [j-m]
-	let table1 = create_test_table_with_range(1, "a", "c", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(2, "e", "g", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(3, "i", "k", 7, opts.clone()).unwrap();
-	let table4 = create_test_table_with_range(4, "d", "f", 10, opts.clone()).unwrap();
-	let table5 = create_test_table_with_range(5, "j", "m", 13, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "c", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(2, "e", "g", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(3, "i", "k", 7, Arc::clone(&opts)).unwrap();
+	let table4 = create_test_table_with_range(4, "d", "f", 10, Arc::clone(&opts)).unwrap();
+	let table5 = create_test_table_with_range(5, "j", "m", 13, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(
 		vec![table1, table2, table3, table4, table5],
@@ -994,11 +994,11 @@ fn test_level1_binary_search_correct_range() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables with non-overlapping sorted ranges
-	let table1 = create_test_table_with_range(11, "a", "b", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(12, "c", "d", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(13, "e", "f", 7, opts.clone()).unwrap();
-	let table4 = create_test_table_with_range(14, "g", "h", 10, opts.clone()).unwrap();
-	let table5 = create_test_table_with_range(15, "i", "j", 13, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(11, "a", "b", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(12, "c", "d", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(13, "e", "f", 7, Arc::clone(&opts)).unwrap();
+	let table4 = create_test_table_with_range(14, "g", "h", 10, Arc::clone(&opts)).unwrap();
+	let table5 = create_test_table_with_range(15, "i", "j", 13, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(
 		vec![],
@@ -1028,9 +1028,9 @@ fn test_level1_query_before_all_tables() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables: [d-f], [g-i], [j-l]
-	let table1 = create_test_table_with_range(11, "d", "f", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(12, "g", "i", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(13, "j", "l", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(11, "d", "f", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(12, "g", "i", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(13, "j", "l", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
@@ -1056,9 +1056,9 @@ fn test_level1_query_after_all_tables() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables: [a-c], [d-f], [g-i]
-	let table1 = create_test_table_with_range(11, "a", "c", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(12, "d", "f", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(13, "g", "i", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(11, "a", "c", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(12, "d", "f", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(13, "g", "i", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
@@ -1084,9 +1084,9 @@ fn test_level1_query_spans_all_tables() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables: [b-d], [e-g], [h-j]
-	let table1 = create_test_table_with_range(11, "b", "d", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(12, "e", "g", 4, opts.clone()).unwrap();
-	let table3 = create_test_table_with_range(13, "h", "j", 7, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(11, "b", "d", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(12, "e", "g", 4, Arc::clone(&opts)).unwrap();
+	let table3 = create_test_table_with_range(13, "h", "j", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
@@ -1112,7 +1112,7 @@ fn test_bound_included_start_and_end() {
 	let opts = Arc::new(opts);
 
 	// Create table with keys: "d1", "d5", "h"
-	let table1 = create_test_table_with_range(1, "d", "h", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "d", "h", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1137,7 +1137,7 @@ fn test_bound_excluded_start_and_end() {
 	let opts = Arc::new(opts);
 
 	// Create table with keys: "d1", "d5", "h"
-	let table1 = create_test_table_with_range(1, "d", "h", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "d", "h", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1164,7 +1164,7 @@ fn test_bound_unbounded_start() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1186,7 +1186,7 @@ fn test_bound_unbounded_end() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1208,8 +1208,8 @@ fn test_fully_unbounded_range() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
-	let table2 = create_test_table_with_range(2, "n", "z", 4, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
+	let table2 = create_test_table_with_range(2, "n", "z", 4, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1, table2], vec![], vec![], opts);
 
@@ -1251,7 +1251,7 @@ fn test_single_key_range() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "z", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1278,7 +1278,7 @@ fn test_inverted_range() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1303,9 +1303,9 @@ fn test_mixed_level0_and_level1_tables() {
 	let opts = Arc::new(opts);
 
 	// Create both L0 and L1 tables
-	let l0_table = create_test_table_with_range(1, "a", "m", 1, opts.clone()).unwrap();
-	let l1_table1 = create_test_table_with_range(11, "d", "h", 4, opts.clone()).unwrap();
-	let l1_table2 = create_test_table_with_range(12, "i", "n", 7, opts.clone()).unwrap();
+	let l0_table = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
+	let l1_table1 = create_test_table_with_range(11, "d", "h", 4, Arc::clone(&opts)).unwrap();
+	let l1_table2 = create_test_table_with_range(12, "i", "n", 7, Arc::clone(&opts)).unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![l0_table], vec![l1_table1, l1_table2], vec![], opts);
@@ -1791,4 +1791,166 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 		assert_eq!(range[2].1.as_ref().unwrap().as_slice(), b"v2_updated");
 		assert_eq!(&range[3].0, b"key1");
 	}
+}
+
+fn setup_versioned_tree() -> (crate::lsm::Tree, TempDir) {
+	let temp_dir = create_temp_directory();
+	let opts: Options =
+		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
+	(tree, temp_dir)
+}
+
+// Helper to get snapshot from transaction for testing
+fn get_snapshot_from_transaction(tx: &crate::transaction::Transaction) -> Snapshot {
+	// Access the internal snapshot - it's pub(crate) so we can use it in tests
+	tx.snapshot.as_ref().unwrap().clone()
+}
+
+#[tokio::test]
+async fn test_versioned_range_inclusive() {
+	// Test RangeInclusive (a..=b) - Included start, Included end
+	let (tree, _temp_dir) = setup_versioned_tree();
+	let ts = 100;
+
+	// Insert test data
+	let mut tx = tree.begin().unwrap();
+	tx.set_at_version(b"a", b"value_a", ts).unwrap();
+	tx.set_at_version(b"b", b"value_b", ts).unwrap();
+	tx.set_at_version(b"c", b"value_c", ts).unwrap();
+	tx.commit().await.unwrap();
+
+	// Create snapshot and test RangeInclusive
+	let tx = tree.begin().unwrap();
+	let snapshot = get_snapshot_from_transaction(&tx);
+	let key_range = b"a".to_vec()..=b"b".to_vec();
+	let versioned_iter = snapshot
+		.versioned_range_iter(VersionedRangeQueryParams {
+			key_range: &key_range,
+			start_ts: 0,
+			end_ts: ts,
+			snapshot_seq_num: snapshot.seq_num,
+			limit: None,
+			include_tombstones: false,
+			include_latest_only: true,
+		})
+		.unwrap();
+
+	let results: Vec<_> = versioned_iter.collect();
+	assert_eq!(results.len(), 2);
+	let keys: Vec<_> = results.iter().map(|(k, _)| k.user_key.clone()).collect();
+	assert!(keys.contains(&b"a".to_vec()));
+	assert!(keys.contains(&b"b".to_vec()));
+	assert!(!keys.contains(&b"c".to_vec()));
+}
+
+#[tokio::test]
+async fn test_versioned_range_from() {
+	// Test RangeFrom (a..) - Included start, Unbounded end
+	let (tree, _temp_dir) = setup_versioned_tree();
+	let ts = 100;
+
+	// Insert test data
+	let mut tx = tree.begin().unwrap();
+	tx.set_at_version(b"a", b"value_a", ts).unwrap();
+	tx.set_at_version(b"b", b"value_b", ts).unwrap();
+	tx.set_at_version(b"c", b"value_c", ts).unwrap();
+	tx.commit().await.unwrap();
+
+	// Create snapshot and test RangeFrom
+	let tx = tree.begin().unwrap();
+	let snapshot = get_snapshot_from_transaction(&tx);
+	let key_range = b"b".to_vec()..;
+	let versioned_iter = snapshot
+		.versioned_range_iter(VersionedRangeQueryParams {
+			key_range: &key_range,
+			start_ts: 0,
+			end_ts: ts,
+			snapshot_seq_num: snapshot.seq_num,
+			limit: None,
+			include_tombstones: false,
+			include_latest_only: true,
+		})
+		.unwrap();
+
+	let results: Vec<_> = versioned_iter.collect();
+	assert_eq!(results.len(), 2);
+	let keys: Vec<_> = results.iter().map(|(k, _)| k.user_key.clone()).collect();
+	assert!(keys.contains(&b"b".to_vec()));
+	assert!(keys.contains(&b"c".to_vec()));
+	assert!(!keys.contains(&b"a".to_vec()));
+}
+
+#[tokio::test]
+async fn test_versioned_range_to() {
+	// Test RangeTo (..b) - Unbounded start, Excluded end
+	let (tree, _temp_dir) = setup_versioned_tree();
+	let ts = 100;
+
+	// Insert test data
+	let mut tx = tree.begin().unwrap();
+	tx.set_at_version(b"a", b"value_a", ts).unwrap();
+	tx.set_at_version(b"b", b"value_b", ts).unwrap();
+	tx.set_at_version(b"c", b"value_c", ts).unwrap();
+	tx.commit().await.unwrap();
+
+	// Create snapshot and test RangeTo
+	let tx = tree.begin().unwrap();
+	let snapshot = get_snapshot_from_transaction(&tx);
+	let key_range = ..b"c".to_vec();
+	let versioned_iter = snapshot
+		.versioned_range_iter(VersionedRangeQueryParams {
+			key_range: &key_range,
+			start_ts: 0,
+			end_ts: ts,
+			snapshot_seq_num: snapshot.seq_num,
+			limit: None,
+			include_tombstones: false,
+			include_latest_only: true,
+		})
+		.unwrap();
+
+	let results: Vec<_> = versioned_iter.collect();
+	assert_eq!(results.len(), 2);
+	let keys: Vec<_> = results.iter().map(|(k, _)| k.user_key.clone()).collect();
+	assert!(keys.contains(&b"a".to_vec()));
+	assert!(keys.contains(&b"b".to_vec()));
+	assert!(!keys.contains(&b"c".to_vec()));
+}
+
+#[tokio::test]
+async fn test_versioned_range_full() {
+	// Test RangeFull (..) - Unbounded start, Unbounded end
+	let (tree, _temp_dir) = setup_versioned_tree();
+	let ts = 100;
+
+	// Insert test data
+	let mut tx = tree.begin().unwrap();
+	tx.set_at_version(b"a", b"value_a", ts).unwrap();
+	tx.set_at_version(b"b", b"value_b", ts).unwrap();
+	tx.set_at_version(b"c", b"value_c", ts).unwrap();
+	tx.commit().await.unwrap();
+
+	// Create snapshot and test RangeFull
+	let tx = tree.begin().unwrap();
+	let snapshot = get_snapshot_from_transaction(&tx);
+	let key_range = ..;
+	let versioned_iter = snapshot
+		.versioned_range_iter(VersionedRangeQueryParams {
+			key_range: &key_range,
+			start_ts: 0,
+			end_ts: ts,
+			snapshot_seq_num: snapshot.seq_num,
+			limit: None,
+			include_tombstones: false,
+			include_latest_only: true,
+		})
+		.unwrap();
+
+	let results: Vec<_> = versioned_iter.collect();
+	assert_eq!(results.len(), 3);
+	let keys: Vec<_> = results.iter().map(|(k, _)| k.user_key.clone()).collect();
+	assert!(keys.contains(&b"a".to_vec()));
+	assert!(keys.contains(&b"b".to_vec()));
+	assert!(keys.contains(&b"c".to_vec()));
 }

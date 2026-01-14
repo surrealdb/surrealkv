@@ -465,7 +465,7 @@ mod tests {
 
 		let mut handles = vec![];
 		for i in 0..10 {
-			let pipeline = pipeline.clone();
+			let pipeline = Arc::clone(&pipeline);
 			let handle = tokio::spawn(async move {
 				let mut batch = Batch::new(0);
 				batch
@@ -539,7 +539,7 @@ mod tests {
 
 		let mut handles = vec![];
 		for i in 0..5 {
-			let pipeline = pipeline.clone();
+			let pipeline = Arc::clone(&pipeline);
 			let handle = tokio::spawn(async move {
 				let mut batch = Batch::new(0);
 				batch
@@ -746,7 +746,7 @@ mod tests {
 	#[test]
 	fn test_sync_commit_calls_write_and_apply() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline = CommitPipeline::new(env.clone());
+		let pipeline = CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>);
 
 		let mut batch = Batch::new(0);
 		batch
@@ -771,7 +771,7 @@ mod tests {
 	#[test]
 	fn test_sync_commit_multiple_batches_tracking() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline = CommitPipeline::new(env.clone());
+		let pipeline = CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>);
 
 		// Commit multiple batches
 		for i in 0..3 {
@@ -798,7 +798,7 @@ mod tests {
 	#[test]
 	fn test_sync_commit_concurrent_access() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline_clone = CommitPipeline::new(env.clone());
+		let pipeline_clone = CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>);
 		let pipeline = Arc::new(pipeline_clone);
 
 		// Test concurrent access to sync_commit
@@ -807,8 +807,8 @@ mod tests {
 		let batches_per_thread = 5;
 
 		for thread_id in 0..num_threads {
-			let pipeline = pipeline.clone();
-			let _env = env.clone();
+			let pipeline = Arc::clone(&pipeline);
+			let _env = Arc::clone(&env);
 
 			let handle = std::thread::spawn(move || {
 				for batch_id in 0..batches_per_thread {

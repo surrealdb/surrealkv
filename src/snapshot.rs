@@ -98,14 +98,14 @@ pub(crate) struct IterState {
 
 /// Query parameters for versioned range queries
 #[derive(Debug, Clone)]
-struct VersionedRangeQueryParams<'a, R: RangeBounds<Vec<u8>> + 'a> {
-	key_range: &'a R,
-	start_ts: u64,
-	end_ts: u64,
-	snapshot_seq_num: u64,
-	limit: Option<usize>,
-	include_tombstones: bool,
-	include_latest_only: bool, // When true, only include the latest version of each key
+pub(crate) struct VersionedRangeQueryParams<'a, R: RangeBounds<Vec<u8>> + 'a> {
+	pub(crate) key_range: &'a R,
+	pub(crate) start_ts: u64,
+	pub(crate) end_ts: u64,
+	pub(crate) snapshot_seq_num: u64,
+	pub(crate) limit: Option<usize>,
+	pub(crate) include_tombstones: bool,
+	pub(crate) include_latest_only: bool, // When true, only include the latest version of each key
 }
 
 // ===== Snapshot Implementation =====
@@ -123,7 +123,7 @@ pub(crate) struct Snapshot {
 
 	/// Sequence number defining this snapshot's view of the data
 	/// Only data with seq_num <= this value is visible
-	seq_num: u64,
+	pub(crate) seq_num: u64,
 }
 
 impl Snapshot {
@@ -429,11 +429,58 @@ impl Snapshot {
 		Ok(results)
 	}
 
+	/// Encodes a user key bound into an InternalKey bound, preserving Included/Excluded/Unbounded
+	fn encode_start_bound(
+		bound: Bound<&Vec<u8>>,
+		seq_num: u64,
+		kind: InternalKeyKind,
+		ts: u64,
+	) -> Bound<Vec<u8>> {
+		match bound {
+			Bound::Included(key) => {
+				Bound::Included(InternalKey::new(key.clone(), seq_num, kind, ts).encode())
+			}
+			Bound::Excluded(key) => {
+				Bound::Excluded(InternalKey::new(key.clone(), seq_num, kind, ts).encode())
+			}
+			Bound::Unbounded => Bound::Unbounded,
+		}
+	}
+
+	/// Encodes an end bound for versioned queries
+	fn encode_end_bound(
+		bound: Bound<&Vec<u8>>,
+		seq_num: u64,
+		kind: InternalKeyKind,
+		ts: u64,
+	) -> Bound<Vec<u8>> {
+		match bound {
+			Bound::Included(key) => {
+				Bound::Included(InternalKey::new(key.clone(), seq_num, kind, ts).encode())
+			}
+			Bound::Excluded(key) => {
+				// For excluded bounds, use minimal InternalKey properties so range stops just
+				// before this key
+				Bound::Excluded(InternalKey::new(key.clone(), 0, InternalKeyKind::Set, 0).encode())
+			}
+			Bound::Unbounded => Bound::Unbounded,
+		}
+	}
+
+	/// Converts Bound<Vec<u8>> to Bound<&[u8]> for passing to B+tree
+	fn bound_as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+		match bound {
+			Bound::Included(v) => Bound::Included(v.as_slice()),
+			Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+			Bound::Unbounded => Bound::Unbounded,
+		}
+	}
+
 	/// Creates a versioned range iterator that implements DoubleEndedIterator
 	/// TODO: This is a temporary solution to avoid the complexity of
 	/// implementing a proper streaming double ended iterator, which will be
 	/// fixed in the future.
-	fn versioned_range_iter<R: RangeBounds<Vec<u8>>>(
+	pub(crate) fn versioned_range_iter<R: RangeBounds<Vec<u8>>>(
 		&self,
 		params: VersionedRangeQueryParams<'_, R>,
 	) -> Result<VersionedRangeIterator> {
@@ -446,49 +493,23 @@ impl Snapshot {
 		if let Some(ref versioned_index) = self.core.versioned_index {
 			let index_guard = versioned_index.read();
 
-			// Extract start and end bounds from the RangeBounds
-			let start_bound = params.key_range.start_bound();
-			let end_bound = params.key_range.end_bound();
+			// Step 1: Encode bounds (preserves bound type)
+			let start_bound = Self::encode_start_bound(
+				params.key_range.start_bound(),
+				0,
+				InternalKeyKind::Set,
+				params.start_ts,
+			);
+			let end_bound = Self::encode_end_bound(
+				params.key_range.end_bound(),
+				params.snapshot_seq_num,
+				InternalKeyKind::Max,
+				params.end_ts,
+			);
 
-			// Convert to InternalKey format for the B+ tree query
-			let start_key = match start_bound {
-				Bound::Included(key) => {
-					InternalKey::new(key.clone(), 0, InternalKeyKind::Set, params.start_ts).encode()
-				}
-				Bound::Excluded(key) => {
-					// For excluded bounds, create a key that's lexicographically greater
-					let mut next_key = key.clone();
-					next_key.push(0); // Add null byte to make it greater
-					InternalKey::new(next_key, 0, InternalKeyKind::Set, params.start_ts).encode()
-				}
-				Bound::Unbounded => {
-					InternalKey::new(Key::new(), 0, InternalKeyKind::Set, params.start_ts).encode()
-				}
-			};
-
-			let end_key = match end_bound {
-				Bound::Included(key) => InternalKey::new(
-					key.clone(),
-					params.snapshot_seq_num,
-					InternalKeyKind::Max,
-					params.end_ts,
-				)
-				.encode(),
-				Bound::Excluded(key) => {
-					// For excluded bounds, use minimal InternalKey properties so range stops just
-					// before this key
-					InternalKey::new(key.clone(), 0, InternalKeyKind::Set, 0).encode()
-				}
-				Bound::Unbounded => InternalKey::new(
-					[0xff].to_vec(),
-					params.snapshot_seq_num,
-					InternalKeyKind::Max,
-					params.end_ts,
-				)
-				.encode(),
-			};
-
-			let range_iter = index_guard.range(&start_key, &end_key)?;
+			// Step 2: Convert to slice bounds and call range
+			let range = (Self::bound_as_slice(&start_bound), Self::bound_as_slice(&end_bound));
+			let range_iter = index_guard.range(range)?;
 
 			// Collect all versions by key (already in timestamp order from B+tree)
 			// Store the complete InternalKey to preserve all original information

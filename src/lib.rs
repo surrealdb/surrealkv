@@ -105,16 +105,6 @@ impl IntoBytes for Box<[u8]> {
 	}
 }
 
-// impl<'a> IntoBytes for Cow<'a, [u8]> {
-// 	fn as_slice(&self) -> &[u8] {
-// 		self.as_ref()
-// 	}
-
-// 	fn into_bytes(self) -> Value {
-// 		self.into_owned()
-// 	}
-// }
-
 /// Type alias for iterator results containing key-value pairs
 /// Value is optional to support keys-only iteration without allocating empty
 /// values
@@ -200,6 +190,18 @@ pub struct Options {
 	/// Controls behavior when WAL corruption is detected during recovery.
 	/// Default: TolerateCorruptedWithRepair (attempt repair and continue)
 	pub wal_recovery_mode: WalRecoveryMode,
+
+	// Compaction configuration
+	/// Number of L0 files that trigger compaction
+	/// Default: 4
+	pub level0_max_files: usize,
+	/// Base size for level 1 in bytes
+	/// Default: 256MB
+	pub max_bytes_for_level: u64,
+	/// Multiplier for calculating max bytes for each level
+	/// Level N max bytes = base * multiplier^(N-1)
+	/// Default: 10.0
+	pub level_multiplier: f64,
 }
 
 impl Default for Options {
@@ -233,6 +235,9 @@ impl Default for Options {
 			clock,
 			flush_on_close: true,
 			wal_recovery_mode: WalRecoveryMode::default(),
+			level0_max_files: 4,
+			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
+			level_multiplier: 10.0,
 		}
 	}
 }

@@ -69,6 +69,24 @@ pub(crate) struct ManifestChangeSet {
 	pub log_number: Option<u64>,
 }
 
+/// Data needed to revert an applied changeset
+pub(crate) struct ChangeSetRollback {
+	/// Tables that were deleted (need to be re-added on revert)
+	pub deleted_tables: Vec<(u8, Arc<Table>)>,
+	/// Table IDs that were added (need to be removed on revert)
+	pub added_table_ids: Vec<(u8, u64)>,
+	/// Snapshots that were deleted
+	pub deleted_snapshots: Vec<SnapshotInfo>,
+	/// Snapshot seq_nums that were added
+	pub added_snapshot_seqs: Vec<u64>,
+	/// Previous manifest_format_version if changed
+	pub prev_version: Option<u16>,
+	/// Previous log_number if it was updated
+	pub prev_log_number: Option<u64>,
+	/// Previous last_sequence value
+	pub prev_last_sequence: u64,
+}
+
 mod iter;
 mod level;
 
@@ -359,10 +377,24 @@ impl LevelManifest {
 		}
 	}
 
-	/// Apply a changeset to this manifest
-	pub(crate) fn apply_changeset(&mut self, changeset: &ManifestChangeSet) -> Result<()> {
-		// Apply scalar values if present in changeset
+	/// Apply a changeset to this manifest and return rollback data
+	pub(crate) fn apply_changeset(
+		&mut self,
+		changeset: &ManifestChangeSet,
+	) -> Result<ChangeSetRollback> {
+		let mut rollback = ChangeSetRollback {
+			deleted_tables: Vec::new(),
+			added_table_ids: Vec::new(),
+			deleted_snapshots: Vec::new(),
+			added_snapshot_seqs: Vec::new(),
+			prev_version: None,
+			prev_log_number: None,
+			prev_last_sequence: self.last_sequence,
+		};
+
+		// Capture and apply version change
 		if let Some(version) = changeset.manifest_format_version {
+			rollback.prev_version = Some(self.manifest_format_version);
 			self.manifest_format_version = version;
 		}
 
@@ -371,11 +403,23 @@ impl LevelManifest {
 		// backward
 		if let Some(log_num) = changeset.log_number {
 			if log_num > self.log_number {
+				rollback.prev_log_number = Some(self.log_number);
 				self.log_number = log_num;
 			}
 		}
 
-		// Add new tables to levels
+		// Capture deleted tables BEFORE removing them, then remove
+		for (level, table_id) in &changeset.deleted_tables {
+			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(*level as usize) {
+				// Find and capture the table before removing
+				if let Some(table) = level_ref.tables.iter().find(|t| t.id == *table_id) {
+					rollback.deleted_tables.push((*level, Arc::clone(table)));
+				}
+				Arc::make_mut(level_ref).remove(*table_id);
+			}
+		}
+
+		// Add new tables to levels and track their IDs
 		for (level, table) in &changeset.new_tables {
 			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(*level as usize) {
 				let level_mut = Arc::make_mut(level_ref);
@@ -386,6 +430,7 @@ impl LevelManifest {
 					// Level 1+: sorted by smallest key (tables cannot overlap)
 					level_mut.insert_sorted_by_key(Arc::clone(table));
 				}
+				rollback.added_table_ids.push((*level, table.id));
 			}
 
 			// Update last_sequence if this table has a higher sequence number
@@ -394,22 +439,68 @@ impl LevelManifest {
 			}
 		}
 
-		// Delete tables from levels
-		for (level, table_id) in &changeset.deleted_tables {
-			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(*level as usize) {
-				Arc::make_mut(level_ref).remove(*table_id);
+		// Capture and delete snapshots
+		let deleted: Vec<_> = self
+			.snapshots
+			.iter()
+			.filter(|s| changeset.deleted_snapshots.contains(&s.seq_num))
+			.cloned()
+			.collect();
+		rollback.deleted_snapshots = deleted;
+		self.snapshots.retain(|snapshot| !changeset.deleted_snapshots.contains(&snapshot.seq_num));
+
+		// Add new snapshots and track their seq_nums
+		for snapshot in &changeset.new_snapshots {
+			self.snapshots.push(snapshot.clone());
+			rollback.added_snapshot_seqs.push(snapshot.seq_num);
+		}
+
+		Ok(rollback)
+	}
+
+	/// Revert a previously applied changeset using rollback data
+	pub(crate) fn revert_changeset(&mut self, rollback: ChangeSetRollback) {
+		// Restore last_sequence
+		self.last_sequence = rollback.prev_last_sequence;
+
+		// Restore version if it was changed
+		if let Some(prev_version) = rollback.prev_version {
+			self.manifest_format_version = prev_version;
+		}
+
+		// Restore log_number if it was changed
+		if let Some(prev_log_number) = rollback.prev_log_number {
+			self.log_number = prev_log_number;
+		}
+
+		// Remove tables that were added
+		for (level, table_id) in rollback.added_table_ids {
+			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(level as usize) {
+				Arc::make_mut(level_ref).remove(table_id);
 			}
 		}
 
-		// Delete snapshots
-		self.snapshots.retain(|snapshot| !changeset.deleted_snapshots.contains(&snapshot.seq_num));
-
-		// Add new snapshots
-		for snapshot in &changeset.new_snapshots {
-			self.snapshots.push(snapshot.clone());
+		// Re-add tables that were deleted
+		for (level, table) in rollback.deleted_tables {
+			if let Some(level_ref) = self.levels.get_levels_mut().get_mut(level as usize) {
+				let level_mut = Arc::make_mut(level_ref);
+				if level == 0 {
+					// Level 0: sorted by sequence number (tables can overlap)
+					level_mut.insert(table);
+				} else {
+					// Level 1+: sorted by smallest key (tables cannot overlap)
+					level_mut.insert_sorted_by_key(table);
+				}
+			}
 		}
 
-		Ok(())
+		// Remove snapshots that were added
+		self.snapshots.retain(|s| !rollback.added_snapshot_seqs.contains(&s.seq_num));
+
+		// Re-add snapshots that were deleted
+		for snapshot in rollback.deleted_snapshots {
+			self.snapshots.push(snapshot);
+		}
 	}
 
 	/// Generates the next unique table ID for a new SSTable

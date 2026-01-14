@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::mem::size_of;
+use std::sync::Arc;
 
 use tempdir::TempDir;
 use test_log::test;
@@ -1966,25 +1967,26 @@ async fn test_versioned_queries_with_deletes() {
 	let temp_dir = create_temp_directory();
 	let opts: Options =
 		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
-	let tree = TreeBuilder::with_options(opts.clone()).build().unwrap();
+	let clock = Arc::clone(&opts.clock);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
 
 	// Insert first version
 	let mut tx1 = tree.begin().unwrap();
 	tx1.set(b"key1", b"value1").unwrap();
 	tx1.commit().await.unwrap();
-	let ts1 = opts.clock.now();
+	let ts1 = clock.now();
 
 	// Update with second version
 	let mut tx2 = tree.begin().unwrap();
 	tx2.set(b"key1", b"value2").unwrap();
 	tx2.commit().await.unwrap();
-	let ts2 = opts.clock.now();
+	let ts2 = clock.now();
 
 	// Delete the key
 	let mut tx3 = tree.begin().unwrap();
 	tx3.soft_delete(b"key1").unwrap(); // Hard delete
 	tx3.commit().await.unwrap();
-	let ts3 = opts.clock.now();
+	let ts3 = clock.now();
 
 	// Test regular get (should return None due to delete)
 	let tx = tree.begin().unwrap();
@@ -2360,11 +2362,102 @@ async fn test_range_at_version() {
 }
 
 #[test(tokio::test)]
+async fn test_versioned_range_bounds_edge_cases() {
+	let temp_dir = create_temp_directory();
+	let opts: Options =
+		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
+
+	// Use explicit timestamp for testing
+	let ts = 100;
+
+	// Insert data: keys a, b, c, d, e
+	let mut tx = tree.begin().unwrap();
+	tx.set_at_version(b"a", b"value_a", ts).unwrap();
+	tx.set_at_version(b"b", b"value_b", ts).unwrap();
+	tx.set_at_version(b"c", b"value_c", ts).unwrap();
+	tx.set_at_version(b"d", b"value_d", ts).unwrap();
+	tx.set_at_version(b"e", b"value_e", ts).unwrap();
+	tx.commit().await.unwrap();
+
+	let tx = tree.begin().unwrap();
+
+	// Test 1: Range includes exact start key
+	// range_at_version(b"b", b"e", ts) should include b, c, d (not e)
+	let scan1 = tx
+		.range_at_version(b"b", b"e", ts)
+		.unwrap()
+		.collect::<std::result::Result<Vec<_>, _>>()
+		.unwrap();
+	assert_eq!(scan1.len(), 3);
+	let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+	for (key, _) in &scan1 {
+		found_keys.insert(key.as_ref());
+	}
+	assert!(found_keys.contains(&b"b".as_ref()));
+	assert!(found_keys.contains(&b"c".as_ref()));
+	assert!(found_keys.contains(&b"d".as_ref()));
+	assert!(!found_keys.contains(&b"e".as_ref())); // e is excluded
+
+	// Test 2: Range with start key not in data
+	// range_at_version(b"aa", b"cc", ts) should include b, c
+	let scan2 = tx
+		.range_at_version(b"aa", b"cc", ts)
+		.unwrap()
+		.collect::<std::result::Result<Vec<_>, _>>()
+		.unwrap();
+	assert_eq!(scan2.len(), 2);
+	let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+	for (key, _) in &scan2 {
+		found_keys.insert(key.as_ref());
+	}
+	assert!(found_keys.contains(&b"b".as_ref()));
+	assert!(found_keys.contains(&b"c".as_ref()));
+	assert!(!found_keys.contains(&b"a".as_ref())); // a is before start
+
+	// Test 3: Range with end key not in data
+	// range_at_version(b"b", b"dd", ts) should include b, c, d
+	let scan3 = tx
+		.range_at_version(b"b".as_slice(), b"dd".as_slice(), ts)
+		.unwrap()
+		.collect::<std::result::Result<Vec<_>, _>>()
+		.unwrap();
+	assert_eq!(scan3.len(), 3);
+	let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
+	for (key, _) in &scan3 {
+		found_keys.insert(key.as_ref());
+	}
+	assert!(found_keys.contains(&b"b".as_ref()));
+	assert!(found_keys.contains(&b"c".as_ref()));
+	assert!(found_keys.contains(&b"d".as_ref()));
+
+	// Test 4: Empty range (start >= end)
+	// range_at_version(b"d", b"b", ts) should return empty
+	let scan4 = tx
+		.range_at_version(b"d", b"b", ts)
+		.unwrap()
+		.collect::<std::result::Result<Vec<_>, _>>()
+		.unwrap();
+	assert_eq!(scan4.len(), 0);
+
+	// Test 5: Single key range
+	// range_at_version(b"b", b"c", ts) should include only b
+	let scan5 = tx
+		.range_at_version(b"b", b"c", ts)
+		.unwrap()
+		.collect::<std::result::Result<Vec<_>, _>>()
+		.unwrap();
+	assert_eq!(scan5.len(), 1);
+	assert_eq!(scan5[0].0.as_slice(), b"b");
+}
+
+#[test(tokio::test)]
 async fn test_range_at_version_with_deletes() {
 	let temp_dir = create_temp_directory();
 	let opts: Options =
 		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
-	let tree = TreeBuilder::with_options(opts.clone()).build().unwrap();
+	let clock = Arc::clone(&opts.clock);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
 
 	// Insert data without explicit timestamps (will use auto-generated timestamps)
 	let mut tx1 = tree.begin().unwrap();
@@ -2372,7 +2465,7 @@ async fn test_range_at_version_with_deletes() {
 	tx1.set(b"key2", b"value2").unwrap();
 	tx1.set(b"key3", b"value3").unwrap();
 	tx1.commit().await.unwrap();
-	let ts_after_insert = opts.clock.now();
+	let ts_after_insert = clock.now();
 
 	// Query at this point should show all three keys
 	let tx_before = tree.begin().unwrap();
@@ -2388,7 +2481,7 @@ async fn test_range_at_version_with_deletes() {
 	tx2.delete(b"key2").unwrap();
 	tx2.soft_delete(b"key3").unwrap();
 	tx2.commit().await.unwrap();
-	let ts_after_deletes = opts.clock.now();
+	let ts_after_deletes = clock.now();
 
 	// Test range_at_version at a time after the deletes
 	// Should only return key1 (key2 was hard deleted, key3 was soft deleted)
@@ -2548,7 +2641,8 @@ async fn test_count_at_version_with_deletes() {
 	let temp_dir = create_temp_directory();
 	let opts: Options =
 		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
-	let tree = TreeBuilder::with_options(opts.clone()).build().unwrap();
+	let clock = Arc::clone(&opts.clock);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
 
 	// Insert data without explicit timestamps
 	let mut tx1 = tree.begin().unwrap();
@@ -2556,7 +2650,7 @@ async fn test_count_at_version_with_deletes() {
 	tx1.set(b"key2", b"value2").unwrap();
 	tx1.set(b"key3", b"value3").unwrap();
 	tx1.commit().await.unwrap();
-	let ts_after_insert = opts.clock.now();
+	let ts_after_insert = clock.now();
 
 	// Count at this point should show all three keys
 	let tx_before = tree.begin().unwrap();
@@ -2568,7 +2662,7 @@ async fn test_count_at_version_with_deletes() {
 	tx_delete.delete(b"key2").unwrap(); // Hard delete
 	tx_delete.soft_delete(b"key3").unwrap(); // Soft delete
 	tx_delete.commit().await.unwrap();
-	let ts_after_delete = opts.clock.now();
+	let ts_after_delete = clock.now();
 
 	// Count after deletes
 	let tx_after = tree.begin().unwrap();

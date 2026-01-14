@@ -232,7 +232,7 @@ fn test_many_items() {
 	let mut buffer = Vec::with_capacity(10240); // 10KB initial capacity
 
 	// Create TableWriter
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Number of items to generate
 	let num_items = 10001;
@@ -304,7 +304,7 @@ fn test_iter_items() {
 	let mut buffer = Vec::new();
 
 	// Create TableWriter
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Number of items to generate
 	let num_items = 10001;
@@ -1561,7 +1561,7 @@ fn test_table_with_partitioned_index() {
 	let opts = Arc::new(opts);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 1, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
 
 	// Add enough entries to create multiple data blocks and index partitions
 	for i in 0..100 {
@@ -1639,7 +1639,7 @@ fn test_get_nonexistent_key_returns_none() {
 	// Disable bloom filter so we actually exercise the key comparison logic.
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add only key_bbb to the table
 	let key = b"key_bbb";
@@ -1680,7 +1680,7 @@ fn test_get_same_key_different_sequence_numbers() {
 	// seq_nums sort first)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let user_key = b"my_key";
 
@@ -1733,7 +1733,7 @@ fn test_get_with_lower_sequence_number() {
 	// Snapshot at seq=25 can't see future version at seq=50
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1770,7 +1770,7 @@ fn test_get_with_lower_sequence_number() {
 fn test_get_empty_table() {
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let size = writer.finish().unwrap();
 	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
@@ -1785,7 +1785,7 @@ fn test_get_multiple_keys_with_sequence_variations() {
 	// Ensures fix doesn't cause cross-key contamination with different seq_nums
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_a = InternalKey::new(Vec::from(b"key_a"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_a, b"value_a_100").unwrap();
@@ -1827,7 +1827,7 @@ fn test_get_boundary_conditions() {
 	// Edge cases with sequence number boundaries (seq=0, seq=MAX, seq=1)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1868,7 +1868,7 @@ fn test_get_lookup_higher_than_stored() {
 	// though 25 < 50 numerically)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1901,7 +1901,7 @@ fn test_get_partition_index_sequence_numbers() {
 	// Partition index handles sequence numbers correctly across multiple blocks
 	let opts = Arc::new(Options::new().with_filter_policy(None).with_block_size(512));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	for i in 0..20 {
 		let key = format!("aaa_key_{:03}", i);
@@ -1961,7 +1961,7 @@ fn test_get_nonexistent_key_greater_than_all() {
 	// Key greater than all stored keys should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1986,7 +1986,7 @@ fn test_get_nonexistent_key_between_existing() {
 	// Key between existing keys should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -2011,7 +2011,7 @@ fn test_get_with_tombstone() {
 	// Tombstones should be found and returned
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_other = InternalKey::new(Vec::from(b"key_other"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_other, b"value_other").unwrap();
@@ -2039,7 +2039,7 @@ fn test_get_nonexistent_with_similar_prefix() {
 	// Prefix of existing keys should not match
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key1 = InternalKey::new(Vec::from(b"user_data"), 100, InternalKeyKind::Set, 0);
 	writer.add(key1, b"value1").unwrap();
@@ -2064,7 +2064,7 @@ fn test_get_nonexistent_empty_key() {
 	// Empty key should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -2086,7 +2086,7 @@ fn test_get_nonexistent_with_special_chars() {
 	// Binary keys with special bytes handled correctly
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key1 = InternalKey::new(Vec::from(b"key\x00"), 100, InternalKeyKind::Set, 0);
 	writer.add(key1, b"value0").unwrap();
@@ -2111,7 +2111,7 @@ fn test_get_nonexistent_in_large_table() {
 	// Non-existent key in multi-block table should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None).with_block_size(512));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	for i in 0..100 {
 		if i == 50 {
@@ -2140,7 +2140,7 @@ fn test_get_all_keys_same_prefix_different_suffix() {
 	// Keys with same prefix but different suffix don't match
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key_a = InternalKey::new(Vec::from(b"prefix_a"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_a, b"value_a").unwrap();
@@ -2166,7 +2166,7 @@ fn test_table_iterator_seek_nonexistent_key() {
 	// at the next greater key (correct iterator semantics)
 	let opts = Arc::new(Options::default());
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add only key_bbb to the table
 	let key = b"key_bbb";
@@ -2209,7 +2209,7 @@ fn test_table_iterator_seek_nonexistent_past_end() {
 	// Test that seeking past all keys makes iterator invalid
 	let opts = Arc::new(Options::default());
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key = b"key_bbb";
 	let value = b"value_bbb";
@@ -2233,7 +2233,7 @@ fn test_table_iterator_seek_exact_match() {
 	// Test that seeking to an existing key positions at that key
 	let opts = Arc::new(Options::default());
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let key = b"key_bbb";
 	let value = b"value_bbb";
@@ -3068,7 +3068,7 @@ fn test_get_block_boundary_same_user_key_bug() {
 	);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let user_key = b"test";
 
@@ -3156,7 +3156,7 @@ fn test_iterator_trait_prev_multi_partition_bug() {
 	);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add enough keys to create multiple data blocks, which creates multiple index entries,
 	// which in turn creates multiple index partitions
@@ -3254,7 +3254,7 @@ fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
 	);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add many versions of the SAME user key with decreasing seq_nums
 	// Internal key ordering: user_key ASC, seq_num DESC
@@ -3320,7 +3320,7 @@ fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
 	let query_seq = 30u64;
 	let lookup_key = InternalKey::new(user_key.to_vec(), query_seq, InternalKeyKind::Set, 0);
 
-	let result = table.get(&lookup_key.clone()).unwrap();
+	let result = table.get(&lookup_key).unwrap();
 
 	// The expected result: we should find a version with seq_num <= query_seq
 	// For query_seq=30, we should find (foo, 30) with value "value_at_seq_30"
@@ -3376,7 +3376,7 @@ fn test_table_get_mvcc_correct_version() {
 	// Query at different seq_nums should return correct version
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let user_key = b"my_key";
 
@@ -3424,7 +3424,7 @@ fn test_table_get_returns_none_for_future_version() {
 	// Expected: Should return None (no visible version)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Key only has version at seq=100
 	let key = InternalKey::new(b"future_key".to_vec(), 100, InternalKeyKind::Set, 0);
@@ -3445,7 +3445,7 @@ fn test_table_get_different_user_keys() {
 	// Verify no cross-contamination
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	let keys = ["apple", "banana", "cherry", "date"];
 	for key in &keys {
@@ -3481,7 +3481,7 @@ fn test_table_get_at_block_boundaries() {
 		                                                              * force splits */
 	);
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add enough keys to span multiple blocks
 	for i in 0..20 {
@@ -3518,7 +3518,7 @@ fn test_table_get_tombstone_handling() {
 	// Table::get should still return the tombstone, caller handles it
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Add a set followed by a delete
 	let set_key = InternalKey::new(b"my_key".to_vec(), 100, InternalKeyKind::Set, 0);
@@ -3553,7 +3553,7 @@ fn test_table_get_user_key_mismatch() {
 	// Expected: Should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, opts.clone(), 0);
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
 
 	// Only add "apple" and "cherry", not "banana"
 	let key1 = InternalKey::new(b"apple".to_vec(), 100, InternalKeyKind::Set, 0);
@@ -3685,7 +3685,7 @@ fn test_range_at_exact_block_boundary() {
 		.collect();
 
 	let (src, size) = build_table(data);
-	let table = Arc::new(Table::new(1, opts.clone(), wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
 
 	// Test with bound that might be at a block boundary
 	let iter = table.iter(
@@ -3914,4 +3914,561 @@ fn test_reverse_iteration_empty_range() {
 
 	let result = iter.next_back();
 	assert!(result.is_none(), "Empty range should return None on next_back()");
+}
+
+#[test]
+fn test_table_properties_persistence() {
+	// Test that table properties are correctly persisted through write/load cycle
+	let mut buffer = Vec::new();
+	let table_id = 42;
+	let opts = default_opts();
+
+	// Step 1: Create TableWriter and add entries
+	let mut writer = TableWriter::new(&mut buffer, table_id, Arc::clone(&opts), 0);
+
+	let mut entries = Vec::new();
+	let mut expected_deletions = 0u64;
+	let mut expected_tombstones = 0u64;
+
+	for i in 0..50 {
+		let key = format!("key_{:03}", i).into_bytes();
+		let value = format!("value_{:03}", i).into_bytes();
+		let seq = 1000 + i;
+
+		let kind = match i % 10 {
+			0..=6 => InternalKeyKind::Set,
+			7..=8 => {
+				expected_deletions += 1;
+				expected_tombstones += 1;
+				InternalKeyKind::Delete
+			}
+			9 => {
+				expected_deletions += 1;
+				expected_tombstones += 1; // RangeDelete is also counted as a tombstone
+				InternalKeyKind::RangeDelete
+			}
+			_ => unreachable!(),
+		};
+
+		let internal_key = InternalKey::new(key.clone(), seq, kind, 0);
+
+		let entry_value = match kind {
+			InternalKeyKind::Delete | InternalKeyKind::RangeDelete => vec![],
+			_ => value.clone(),
+		};
+
+		writer.add(internal_key, &entry_value).unwrap();
+		entries.push((key, value, seq, kind));
+	}
+
+	// Step 2: Finish writing to buffer
+	let size = writer.finish().unwrap();
+
+	// Step 3: Create new Table from buffer (load phase)
+	let table = Table::new(table_id, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+	// Step 4: Verify all properties match expected values
+	let meta = &table.meta;
+	let props = &meta.properties;
+
+	// Basic properties
+	assert_eq!(props.id, table_id, "Table ID should match");
+	assert_eq!(props.table_format, TableFormat::LSMV1, "Table format should be LSMV1");
+	assert_eq!(props.num_entries, 50, "Number of entries should be 50");
+	assert_eq!(props.item_count, 50, "Item count should be 50");
+	assert_eq!(props.key_count, 50, "Key count should be 50");
+	assert_eq!(props.num_deletions, expected_deletions, "Number of deletions should match");
+	assert_eq!(props.tombstone_count, expected_tombstones, "Tombstone count should match");
+	assert_eq!(props.global_seq_num, 0, "Global sequence number should be 0");
+	assert!(props.num_data_blocks > 0, "Should have at least one data block");
+	assert!(props.data_size > 0, "Data size should be greater than 0");
+
+	// Index properties
+	assert!(props.index_size > 0, "Index size should be tracked");
+	assert!(props.index_partitions > 0, "Should have at least one index partition");
+	assert!(props.top_level_index_size > 0, "Top-level index size should be tracked");
+
+	// Filter properties
+	assert!(props.filter_size > 0, "Filter size should be tracked");
+
+	// Raw size metrics
+	assert!(props.raw_key_size > 0, "Raw key size should be tracked");
+	assert!(props.raw_value_size > 0, "Raw value size should be tracked");
+	assert_eq!(
+		props.raw_key_size + props.raw_value_size,
+		props.data_size,
+		"Raw sizes should sum to data_size"
+	);
+
+	// Sequence number range
+	assert_eq!(props.seqnos.0, 1000, "Smallest sequence number should be 1000");
+	assert_eq!(props.seqnos.1, 1049, "Largest sequence number should be 1049");
+	assert_eq!(meta.smallest_seq_num, 1000, "Metadata smallest seq num should match");
+	assert_eq!(meta.largest_seq_num, 1049, "Metadata largest seq num should match");
+
+	// Compression
+	assert_eq!(props.compression, crate::CompressionType::None, "Compression should be None");
+
+	// Block properties
+	assert!(props.block_size > 0, "Block size should be tracked");
+	assert!(props.block_count > 0, "Block count should be tracked");
+
+	// Time metrics (timestamps are 0 in this test)
+	assert_eq!(props.oldest_key_time, 0, "Oldest key time should be 0");
+	assert_eq!(props.newest_key_time, 0, "Newest key time should be 0");
+
+	// Range deletion metrics
+	assert_eq!(props.num_range_deletions, 5, "Should have 5 range deletions");
+
+	// Created at timestamp
+	assert!(props.created_at > 0, "Created at timestamp should be set");
+
+	// Verify smallest and largest point keys
+	assert!(meta.smallest_point.is_some(), "Should have smallest point key");
+	assert!(meta.largest_point.is_some(), "Should have largest point key");
+	if let Some(smallest) = &meta.smallest_point {
+		assert_eq!(&smallest.user_key, b"key_000", "Smallest key should be key_000");
+		assert_eq!(smallest.seq_num(), 1000, "Smallest seq num should be 1000");
+	}
+	if let Some(largest) = &meta.largest_point {
+		assert_eq!(&largest.user_key, b"key_049", "Largest key should be key_049");
+		assert_eq!(largest.seq_num(), 1049, "Largest seq num should be 1049");
+	}
+
+	// Verify TableMetadata fields
+	assert_eq!(meta.has_point_keys, Some(true), "Should have point keys");
+}
+
+#[test]
+fn test_table_get_all_keys() {
+	// Test Get operations on table with 100+ blocks
+	let mut opts = default_opts_mut();
+	opts.block_size = 64; // Small block size to create many blocks
+	opts.index_partition_size = 200;
+	let opts = Arc::new(opts);
+
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Add 100 entries to create multiple blocks
+	for i in 0..100 {
+		let key = format!("key_{i:03}");
+		let value = format!("value_{i:03}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, value.as_bytes()).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Get every key individually
+	for i in 0..100 {
+		let key = format!("key_{i:03}");
+		let expected_value = format!("value_{i:03}");
+		let seek_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+
+		let result = table.get(&seek_key).unwrap();
+		assert!(result.is_some(), "Key '{key}' not found");
+
+		if let Some((found_key, found_value)) = result {
+			assert_eq!(
+				std::str::from_utf8(&found_key.user_key).unwrap(),
+				key,
+				"Key mismatch for {key}"
+			);
+			assert_eq!(
+				std::str::from_utf8(found_value.as_ref()).unwrap(),
+				expected_value,
+				"Value mismatch for {key}"
+			);
+		}
+	}
+}
+
+#[test]
+fn test_table_get_nonexistent_keys() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Add some entries
+	for i in 0..10 {
+		let key = format!("key_{i:02}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, b"value").unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Get keys that don't exist
+	let nonexistent_keys = vec!["key_10", "key_99", "aaa", "zzz"];
+	for key_str in &nonexistent_keys {
+		let seek_key = InternalKey::new(key_str.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+		let result = table.get(&seek_key).unwrap();
+		// Should return None for keys that don't exist
+		if result.is_some() {
+			// If found, verify it's a valid key (might find next key)
+			let (found_key, _) = result.unwrap();
+			let found_str = std::str::from_utf8(&found_key.user_key).unwrap();
+			assert!(found_str.starts_with("key_"), "Found key {found_str} should be valid");
+		}
+	}
+}
+
+#[test]
+fn test_table_get_with_compression() {
+	// Test Get with each compression type
+	let compression_types =
+		vec![crate::CompressionType::None, crate::CompressionType::SnappyCompression];
+
+	for compression in compression_types {
+		let opts = default_opts();
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+		// Add entries
+		for i in 0..20 {
+			let key = format!("key_{i:02}");
+			let value = format!("value_{i:02}");
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+			writer.add(internal_key, value.as_bytes()).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+		// Verify Get works with this compression type
+		for i in 0..20 {
+			let key = format!("key_{i:02}");
+			let expected_value = format!("value_{i:02}");
+			let seek_key =
+				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+
+			let result = table.get(&seek_key).unwrap();
+			assert!(result.is_some(), "Should find key {key} with compression {compression:?}");
+
+			if let Some((found_key, found_value)) = result {
+				assert_eq!(
+					std::str::from_utf8(&found_key.user_key).unwrap(),
+					key,
+					"Key mismatch with compression {compression:?}"
+				);
+				assert_eq!(
+					std::str::from_utf8(found_value.as_ref()).unwrap(),
+					expected_value,
+					"Value mismatch with compression {compression:?}"
+				);
+			}
+		}
+	}
+}
+
+#[test]
+fn test_table_iterator_full_scan() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Create table with known data
+	let test_data: Vec<(String, String)> =
+		(0..50).map(|i| (format!("key_{i:03}"), format!("value_{i:03}"))).collect();
+
+	for (i, (key, value)) in test_data.iter().enumerate() {
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, value.as_bytes()).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Full forward scan
+	let mut iter = table.iter(false, None);
+	iter.seek_to_first().unwrap();
+
+	let mut collected = Vec::new();
+	while iter.valid() {
+		let key = iter.key();
+		let value = iter.value();
+		collected.push((
+			std::str::from_utf8(&key.user_key).unwrap().to_string(),
+			std::str::from_utf8(value.as_ref()).unwrap().to_string(),
+		));
+		match iter.next() {
+			Some(Ok(_)) => {}
+			Some(Err(e)) => panic!("Iterator error: {e}"),
+			None => break,
+		}
+	}
+
+	assert_eq!(collected.len(), 50, "Should collect all 50 entries");
+	for (i, (key, value)) in collected.iter().enumerate() {
+		assert_eq!(*key, format!("key_{i:03}"), "Key order mismatch");
+		assert_eq!(*value, format!("value_{i:03}"), "Value mismatch");
+	}
+}
+
+#[test]
+fn test_table_iterator_reverse_scan() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Create table with known data
+	let test_data: Vec<(String, String)> =
+		(0..50).map(|i| (format!("key_{i:03}"), format!("value_{i:03}"))).collect();
+
+	for (i, (key, value)) in test_data.iter().enumerate() {
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, value.as_bytes()).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Full reverse scan
+	let mut iter = table.iter(false, None);
+	iter.seek_to_last().unwrap();
+
+	let mut collected = Vec::new();
+	while iter.valid() {
+		let key = iter.key();
+		let value = iter.value();
+		collected.push((
+			std::str::from_utf8(&key.user_key).unwrap().to_string(),
+			std::str::from_utf8(value.as_ref()).unwrap().to_string(),
+		));
+		if !iter.prev().unwrap() {
+			break;
+		}
+	}
+
+	assert_eq!(collected.len(), 50, "Should collect all 50 entries");
+	// Verify reverse order
+	for (i, (key, value)) in collected.iter().enumerate() {
+		let expected_idx = 49 - i;
+		assert_eq!(*key, format!("key_{expected_idx:03}"), "Reverse key order mismatch");
+		assert_eq!(*value, format!("value_{expected_idx:03}"), "Reverse value mismatch");
+	}
+}
+
+#[test]
+fn test_table_iterator_seek_and_scan() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Create table with known data
+	for i in 0..30 {
+		let key = format!("key_{i:03}");
+		let value = format!("value_{i:03}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, value.as_bytes()).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	let mut iter = table.iter(false, None);
+
+	// Test Seek to various points
+	let seek_points = vec!["key_005", "key_010", "key_015", "key_020", "key_025"];
+
+	for seek_key_str in &seek_points {
+		let seek_key =
+			InternalKey::new(seek_key_str.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+		iter.seek(&seek_key.encode()).unwrap();
+
+		if iter.valid() {
+			let found_key_bytes: &[u8] = &iter.key().user_key;
+			let seek_key_bytes = seek_key_str.as_bytes();
+			// Should find the key or next key
+			assert!(
+				found_key_bytes >= seek_key_bytes,
+				"Found key should be >= seek key {seek_key_str}"
+			);
+		}
+
+		// Test Next from this point
+		let mut count = 0;
+		while iter.valid() && count < 5 {
+			count += 1;
+			match iter.next() {
+				Some(Ok(_)) => {}
+				Some(Err(e)) => panic!("Iterator error: {e}"),
+				None => break,
+			}
+		}
+	}
+
+	// Test SeekForPrev
+	iter.seek_to_last().unwrap();
+	let last_key_bytes = &iter.key().user_key;
+	assert_eq!(std::str::from_utf8(last_key_bytes).unwrap(), "key_029", "Should find last key");
+
+	// Test Prev from last
+	for _ in 0..5 {
+		if !iter.prev().unwrap() {
+			break;
+		}
+	}
+}
+
+#[test]
+fn test_table_iterator_across_partitions() {
+	// Create table that spans multiple index partitions
+	let mut opts = default_opts_mut();
+	opts.index_partition_size = 150; // Small partition size
+	opts.block_size = 500;
+	let opts = Arc::new(opts);
+
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Add enough entries to create multiple partitions
+	for i in 0..100 {
+		let key = format!("key_{i:03}");
+		let value = format!("value_{i:03}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, value.as_bytes()).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Verify we have multiple partitions
+	let crate::sstable::table::IndexType::Partitioned(ref partitioned_index) = table.index_block;
+	assert!(partitioned_index.blocks.len() >= 2, "Should have multiple partitions");
+
+	// Full forward scan across partitions
+	let mut iter = table.iter(false, None);
+	iter.seek_to_first().unwrap();
+
+	let mut count = 0;
+	while iter.valid() {
+		count += 1;
+		match iter.next() {
+			Some(Ok(_)) => {}
+			Some(Err(e)) => panic!("Iterator error: {e}"),
+			None => break,
+		}
+	}
+	assert_eq!(count, 100, "Should iterate all 100 keys across partitions");
+
+	// Full backward scan across partitions
+	iter.seek_to_last().unwrap();
+	let mut count_backward = 0;
+	while iter.valid() {
+		count_backward += 1;
+		if !iter.prev().unwrap() {
+			break;
+		}
+	}
+	assert_eq!(count_backward, 100, "Should iterate all 100 keys backwards across partitions");
+}
+
+#[test]
+fn test_empty_table_operations() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Don't add any entries - create empty table
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Verify Get returns not found
+	let seek_key = InternalKey::new(b"any_key".to_vec(), 1, InternalKeyKind::Set, 0);
+	let result = table.get(&seek_key);
+	assert!(result.is_err(), "Get on empty table should return error");
+
+	// Verify iterator immediately invalid
+	let mut iter = table.iter(false, None);
+	let result = iter.seek_to_first();
+	assert!(result.is_err(), "Get on empty table should return error");
+}
+
+#[test]
+fn test_single_entry_table() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Add exactly one entry
+	let internal_key = InternalKey::new(b"single_key".to_vec(), 1, InternalKeyKind::Set, 0);
+	writer.add(internal_key, b"single_value").unwrap();
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Test Get
+	let seek_key = InternalKey::new(b"single_key".to_vec(), 1, InternalKeyKind::Set, 0);
+	let result = table.get(&seek_key).unwrap();
+	assert!(result.is_some(), "Should find the single key");
+	if let Some((found_key, found_value)) = result {
+		assert_eq!(found_key.user_key, b"single_key");
+		let value_bytes: &[u8] = found_value.as_ref();
+		assert_eq!(value_bytes, b"single_value");
+	}
+
+	// Test iterator
+	let mut iter = table.iter(false, None);
+	iter.seek_to_first().unwrap();
+	assert!(iter.valid(), "Iterator should be valid");
+	assert_eq!(iter.key().user_key, b"single_key");
+	let iter_value = iter.value();
+	let iter_value_bytes: &[u8] = iter_value.as_ref();
+	assert_eq!(iter_value_bytes, b"single_value");
+
+	// Test Next - should invalidate iterator
+	match iter.next() {
+		Some(Ok(_)) => {}
+		Some(Err(e)) => panic!("Iterator error: {e}"),
+		None => {}
+	}
+	assert!(!iter.valid(), "Iterator should be invalid after next()");
+}
+
+#[test]
+fn test_large_values() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Add entries with large values (near size limits)
+	let large_value = vec![b'x'; 10000]; // 10KB value
+	for i in 0..10 {
+		let key = format!("key_{i:02}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, &large_value).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+
+	// Verify all large values are retrieved correctly
+	for i in 0..10 {
+		let key = format!("key_{i:02}");
+		let seek_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+
+		let result = table.get(&seek_key).unwrap();
+		assert!(result.is_some(), "Should find key {key}");
+
+		if let Some((found_key, found_value)) = result {
+			assert_eq!(found_key.user_key, key.as_bytes());
+			let found_bytes: &[u8] = found_value.as_ref();
+			assert_eq!(found_bytes, &large_value[..], "Large value should match");
+			assert_eq!(found_bytes.len(), 10000, "Value size should be 10000");
+		}
+	}
 }

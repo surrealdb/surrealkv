@@ -40,6 +40,7 @@ pub enum Error {
 	WriteStall,
 	FileDescriptorNotFound,
 	TableIDCollision(u64),
+	TableNotFound(u64),
 	PipelineStall,
 	Other(String), // Other errors
 	NoSnapshot,
@@ -49,7 +50,8 @@ pub enum Error {
 	VlogGCAlreadyInProgress,
 	InvalidArgument(String),
 	InvalidTag(String),
-	BPlusTree(String), // B+ tree specific errors
+	BPlusTree(String),    // B+ tree specific errors
+	InterleavedIteration, // Interleaved iteration not supported
 	/// WAL corruption detected during recovery, includes location for repair
 	WalCorruption {
 		segment_id: usize,
@@ -89,8 +91,9 @@ impl fmt::Display for Error {
             Self::KeyNotFound => write!(f, "Key not found"),
             Self::WriteStall => write!(f, "Write stall"),
             Self::FileDescriptorNotFound => write!(f, "File descriptor not found"),
-            Self::TableIDCollision(id) => write!(f, "CRITICAL ERROR: Table ID collision detected. New table ID {id} conflicts with a table ID in the merge list."),
-            Self::PipelineStall => write!(f, "Pipeline stall"),
+			Self::TableIDCollision(id) => write!(f, "CRITICAL ERROR: Table ID collision detected. New table ID {id} conflicts with a table ID in the merge list."),
+			Self::TableNotFound(id) => write!(f, "Table not found: {id}"),
+			Self::PipelineStall => write!(f, "Pipeline stall"),
             Self::Other(err) => write!(f, "Other error: {err}"),
             Self::NoSnapshot => write!(f, "No snapshot available"),
             Self::CommitFail(err) => write!(f, "Commit failed: {err}"),
@@ -100,6 +103,7 @@ impl fmt::Display for Error {
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::BPlusTree(err) => write!(f, "B+ tree error: {err}"),
+            Self::InterleavedIteration => write!(f, "Interleaved iteration not supported: cannot mix next() and next_back() on same iterator"),
             Self::WalCorruption { segment_id, offset, message } => write!(
                 f,
                 "WAL corruption in segment {} at offset {}: {}",
@@ -381,7 +385,7 @@ mod tests {
 
 		// Set a hard error
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "test error"))),
+			Error::Io(Arc::new(std::io::Error::other("test error"))),
 			BackgroundErrorReason::MemtablaFlush,
 		);
 
@@ -398,7 +402,7 @@ mod tests {
 
 		// VLog GC I/O is HardError - stops writes but less severe than FatalError
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "test error"))),
+			Error::Io(Arc::new(std::io::Error::other("test error"))),
 			BackgroundErrorReason::VLogGC,
 		);
 
@@ -413,7 +417,7 @@ mod tests {
 
 		// Set a hard error first (VLog GC I/O)
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "hard error"))),
+			Error::Io(Arc::new(std::io::Error::other("hard error"))),
 			BackgroundErrorReason::VLogGC,
 		);
 
@@ -421,7 +425,7 @@ mod tests {
 
 		// Set a fatal error - should upgrade
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "fatal error"))),
+			Error::Io(Arc::new(std::io::Error::other("fatal error"))),
 			BackgroundErrorReason::MemtablaFlush,
 		);
 
@@ -437,15 +441,15 @@ mod tests {
 
 		// Set a hard error first
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "hard error"))),
+			Error::Io(Arc::new(std::io::Error::other("hard error"))),
 			BackgroundErrorReason::MemtablaFlush,
 		);
 
-		let first_error = handler.get_error().unwrap().error.clone();
+		let first_error = handler.get_error().unwrap().error;
 
 		// Try to set a soft error - should not downgrade
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "soft error"))),
+			Error::Io(Arc::new(std::io::Error::other("soft error"))),
 			BackgroundErrorReason::Compaction,
 		);
 
@@ -459,7 +463,7 @@ mod tests {
 		let handler = BackgroundErrorHandler::new();
 
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::Other, "test error"))),
+			Error::Io(Arc::new(std::io::Error::other("test error"))),
 			BackgroundErrorReason::MemtablaFlush,
 		);
 

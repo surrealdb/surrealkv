@@ -716,6 +716,12 @@ impl BlockIterator {
 					}) = e
 					{
 						// Expected EOF - no previous entry found
+						// Validate invariant: we should have been iterating forward from a restart
+						// point and haven't found an entry where offset >= original
+						debug_assert!(
+							prev_offset < original,
+							"OffsetExceedsRestartOffset should only occur when we haven't found previous entry"
+						);
 						return Ok(false);
 					}
 					// Corruption or other error - propagate it

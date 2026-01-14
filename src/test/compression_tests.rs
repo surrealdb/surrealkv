@@ -449,8 +449,9 @@ fn test_compression_checksum_verification() {
 		Arc::new(opts)
 	};
 
-	let table =
-		Arc::new(Table::new(1, opts.clone(), wrap_buffer(buffer.clone()), size as u64).unwrap());
+	let table = Arc::new(
+		Table::new(1, Arc::clone(&opts), wrap_buffer(buffer.clone()), size as u64).unwrap(),
+	);
 	let mut iter = table.iter(false, None);
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid(), "Uncorrupted table should be valid");
@@ -576,10 +577,10 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 async fn test_lsm_compression_persistence_after_reopen() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
-	let opts = create_compression_test_options(path.clone());
 
 	{
-		let tree = crate::TreeBuilder::with_options(opts.clone()).build().unwrap();
+		let opts = create_compression_test_options(path.clone());
+		let tree = crate::TreeBuilder::with_options(opts).build().unwrap();
 
 		let mut rng = StdRng::seed_from_u64(42);
 		let mut keys = Vec::new();
@@ -616,6 +617,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 
 	{
 		println!("\nPhase 2: Reopening tree and verifying data...");
+		let opts = create_compression_test_options(path.clone());
 		let tree = crate::TreeBuilder::with_options(opts).build().unwrap();
 
 		let mut rng = StdRng::seed_from_u64(42); // Same seed for reproducible keys
@@ -890,7 +892,7 @@ fn test_table_writer_with_level_compression() {
 	let opts = Arc::new(opts);
 
 	{
-		let mut writer = TableWriter::new(&mut buffer, 1, opts.clone(), 0); // L0
+		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0); // L0
 		let data =
 			vec![(b"key1".to_vec(), b"value1".to_vec()), (b"key2".to_vec(), b"value2".to_vec())];
 

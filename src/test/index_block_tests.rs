@@ -96,7 +96,7 @@ fn test_top_level_index_writer_exact_block_size() {
 // fn test_top_level_index() {
 //     let opts = Arc::new(Options::default());
 //     let max_block_size = 10;
-//     let mut writer = TopLevelIndexWriter::new(opts.clone(), max_block_size);
+//     let mut writer = TopLevelIndexWriter::new(Arc::clone(&opts), max_block_size);
 
 //     let key1 = create_internal_key(b"key1".to_vec(), 1);
 //     let handle1 = vec![1, 2, 3];
@@ -132,19 +132,19 @@ fn test_find_block_handle_by_key() {
 			BlockHandleWithKey::new(sep_f.clone(), BlockHandle::new(10, 10)),
 			BlockHandleWithKey::new(sep_j.clone(), BlockHandle::new(20, 10)),
 		],
-		file: f.clone(),
+		file: Arc::clone(&f),
 	};
 
 	// A list of tuples where the first element is the encoded internal key to find,
 	// and the second element is the expected separator key result.
 	let test_cases: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![
 		(create_internal_key(b"a".to_vec(), 1), Some(sep_c.clone())),
-		(create_internal_key(b"c".to_vec(), 1), Some(sep_c.clone())),
+		(create_internal_key(b"c".to_vec(), 1), Some(sep_c)),
 		(create_internal_key(b"d".to_vec(), 1), Some(sep_f.clone())),
 		(create_internal_key(b"e".to_vec(), 1), Some(sep_f.clone())),
-		(create_internal_key(b"f".to_vec(), 1), Some(sep_f.clone())),
+		(create_internal_key(b"f".to_vec(), 1), Some(sep_f)),
 		(create_internal_key(b"g".to_vec(), 1), Some(sep_j.clone())),
-		(create_internal_key(b"j".to_vec(), 1), Some(sep_j.clone())),
+		(create_internal_key(b"j".to_vec(), 1), Some(sep_j)),
 		(create_internal_key(b"z".to_vec(), 1), None),
 	];
 
@@ -164,7 +164,7 @@ fn test_find_block_handle_by_key() {
 fn test_partitioned_index_lookup() {
 	let opts = Arc::new(Options::default());
 	let max_block_size = 50; // Small size to force multiple partitions
-	let mut writer = TopLevelIndexWriter::new(opts.clone(), max_block_size);
+	let mut writer = TopLevelIndexWriter::new(Arc::clone(&opts), max_block_size);
 
 	// Add enough entries to create multiple partitions
 	let entries = vec![
@@ -250,9 +250,9 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 		id: 0,
 		opts,
 		blocks: vec![
-			BlockHandleWithKey::new(sep_foo_60.clone(), BlockHandle::new(0, 100)),
-			BlockHandleWithKey::new(sep_foo_20.clone(), BlockHandle::new(100, 100)),
-			BlockHandleWithKey::new(sep_g.clone(), BlockHandle::new(200, 100)),
+			BlockHandleWithKey::new(sep_foo_60, BlockHandle::new(0, 100)),
+			BlockHandleWithKey::new(sep_foo_20, BlockHandle::new(100, 100)),
+			BlockHandleWithKey::new(sep_g, BlockHandle::new(200, 100)),
 		],
 		file: f,
 	};
@@ -349,9 +349,9 @@ fn test_find_block_handle_by_key_different_user_keys() {
 		id: 0,
 		opts,
 		blocks: vec![
-			BlockHandleWithKey::new(sep_b.clone(), BlockHandle::new(0, 100)),
-			BlockHandleWithKey::new(sep_d.clone(), BlockHandle::new(100, 100)),
-			BlockHandleWithKey::new(sep_e.clone(), BlockHandle::new(200, 100)),
+			BlockHandleWithKey::new(sep_b, BlockHandle::new(0, 100)),
+			BlockHandleWithKey::new(sep_d, BlockHandle::new(100, 100)),
+			BlockHandleWithKey::new(sep_e, BlockHandle::new(200, 100)),
 		],
 		file: f,
 	};
@@ -461,7 +461,7 @@ fn test_partition_lookup_empty_partition_returns_none() {
 	let index = TopLevelIndex {
 		id: 0,
 		opts,
-		blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
+		blocks: vec![BlockHandleWithKey::new(sep, BlockHandle::new(0, 100))],
 		file: f,
 	};
 
@@ -521,9 +521,9 @@ fn test_partition_lookup_exact_separator_match() {
 		id: 0,
 		opts,
 		blocks: vec![
-			BlockHandleWithKey::new(sep_a.clone(), BlockHandle::new(0, 100)),
+			BlockHandleWithKey::new(sep_a, BlockHandle::new(0, 100)),
 			BlockHandleWithKey::new(sep_b.clone(), BlockHandle::new(100, 100)),
-			BlockHandleWithKey::new(sep_c.clone(), BlockHandle::new(200, 100)),
+			BlockHandleWithKey::new(sep_c, BlockHandle::new(200, 100)),
 		],
 		file: f,
 	};
@@ -533,4 +533,364 @@ fn test_partition_lookup_exact_separator_match() {
 	assert!(result.is_some());
 	let (idx, _) = result.unwrap();
 	assert_eq!(idx, 1, "Exact match should return that partition");
+}
+
+#[test]
+fn test_partitioned_index_seek_correctness() {
+	// Test Seek correctness with multiple partitions
+	let opts = Options {
+		index_partition_size: 100, // Small partition size to force multiple partitions
+		block_size: 1700,          // Larger block size to create multiple data blocks
+		..Default::default()
+	};
+	let opts = Arc::new(opts);
+
+	let mut buffer = Vec::new();
+	let mut writer = crate::sstable::table::TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Create keys with prefix length 3, make sure the key/value is big enough to fill one block
+	// Pattern: "0015", "0035", "0054", "0055", "0056", "0057", "0058", "0075", "0076", "0095"
+	let test_keys =
+		vec!["0015", "0035", "0054", "0055", "0056", "0057", "0058", "0075", "0076", "0095"];
+
+	for (seq, key) in test_keys.iter().enumerate() {
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (seq + 1) as u64, InternalKeyKind::Set, 0);
+		let value = format!("v-{key}").into_bytes();
+		writer.add(internal_key, &value).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(
+		crate::sstable::table::Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap(),
+	);
+
+	// Verify we have partitioned index
+	let crate::sstable::table::IndexType::Partitioned(_) = &table.index_block;
+
+	// Test Seek to existing keys
+	for (seq, key) in test_keys.iter().enumerate() {
+		let seek_key =
+			InternalKey::new(key.as_bytes().to_vec(), (seq + 1) as u64, InternalKeyKind::Set, 0);
+		let result = table.get(&seek_key).unwrap();
+		assert!(result.is_some(), "Should find key {key}");
+		if let Some((found_key, found_value)) = result {
+			assert_eq!(
+				std::str::from_utf8(&found_key.user_key).unwrap(),
+				*key,
+				"Key mismatch for {key}"
+			);
+			assert_eq!(
+				std::str::from_utf8(found_value.as_ref()).unwrap(),
+				format!("v-{key}"),
+				"Value mismatch for {key}"
+			);
+		}
+	}
+
+	// Test Seek to non-existing keys (between blocks)
+	let non_existing_keys = vec!["0016", "0036", "0053", "0059", "0074", "0077", "0094"];
+	for key in &non_existing_keys {
+		let seek_key = InternalKey::new(key.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+		let result = table.get(&seek_key).unwrap();
+		// Should either find the next key or return None
+		if let Some((found_key, _)) = result {
+			// If found, verify it's a valid key
+			let found_str = std::str::from_utf8(&found_key.user_key).unwrap();
+			assert!(test_keys.contains(&found_str), "Found key {found_str} should be in test_keys");
+		}
+	}
+
+	// Test SeekForPrev - iterate backwards
+	let mut iter = table.iter(false, None);
+	iter.seek_to_last().unwrap();
+	assert!(iter.valid(), "Iterator should be valid after seek_to_last");
+
+	let mut backward_keys = Vec::new();
+	backward_keys.push(std::str::from_utf8(&iter.key().user_key).unwrap().to_string());
+	while iter.prev().unwrap() {
+		backward_keys.push(std::str::from_utf8(&iter.key().user_key).unwrap().to_string());
+	}
+
+	// Verify backward iteration matches reverse of forward iteration
+	let mut forward_keys: Vec<String> = test_keys.iter().map(|s| (*s).to_string()).collect();
+	forward_keys.reverse();
+	assert_eq!(
+		backward_keys, forward_keys,
+		"Backward iteration should match reverse forward iteration"
+	);
+}
+
+#[test]
+fn test_partitioned_index_boundary_keys() {
+	// Test keys at exact partition boundaries
+	let opts = Options {
+		index_partition_size: 50, // Small partition size to force multiple partitions
+		block_size: 500,
+		..Default::default()
+	};
+
+	let opts = Arc::new(opts);
+
+	let mut buffer = Vec::new();
+	let mut writer = crate::sstable::table::TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	// Create keys that will span multiple partitions
+	// Add enough keys to create at least 3 partitions
+	for i in 0..50 {
+		let key = format!("key_{i:03}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		let value = format!("value_{i:03}").into_bytes();
+		writer.add(internal_key, &value).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(
+		crate::sstable::table::Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap(),
+	);
+
+	let crate::sstable::table::IndexType::Partitioned(ref partitioned_index) = table.index_block;
+
+	assert!(partitioned_index.blocks.len() >= 2, "Should have at least 2 partitions");
+
+	// Test first key in first partition
+	let first_key = InternalKey::new(b"key_000".to_vec(), 1, InternalKeyKind::Set, 0);
+	let result = table.get(&first_key).unwrap();
+	assert!(result.is_some(), "Should find first key");
+
+	// Test last key in last partition
+	let last_key = InternalKey::new(b"key_049".to_vec(), 50, InternalKeyKind::Set, 0);
+	let result = table.get(&last_key).unwrap();
+	assert!(result.is_some(), "Should find last key");
+
+	// Test keys just before/after partition boundaries
+	// Get separator keys to understand boundaries
+	for (idx, block) in partitioned_index.blocks.iter().enumerate() {
+		let sep_key = InternalKey::decode(&block.separator_key);
+		let sep_user_key = std::str::from_utf8(&sep_key.user_key).unwrap();
+
+		// Test key just before separator
+		if idx > 0 {
+			// Try to find a key that should be in previous partition
+			let test_key = InternalKey::new(
+				sep_user_key.as_bytes().to_vec(),
+				sep_key.seq_num() + 1, // Higher seq = earlier in ordering
+				InternalKeyKind::Set,
+				0,
+			);
+			let result = table.get(&test_key).unwrap();
+			// Should find something (might be in previous partition)
+			if result.is_some() {
+				let (found_key, _) = result.unwrap();
+				assert!(found_key.user_key <= sep_key.user_key, "Found key should be <= separator");
+			}
+		}
+	}
+}
+
+#[test]
+fn test_partitioned_index_reseek() {
+	let opts = Options {
+		index_partition_size: 100,
+		block_size: 1700,
+		..Default::default()
+	};
+
+	let opts = Arc::new(opts);
+
+	let mut buffer = Vec::new();
+	let mut writer = crate::sstable::table::TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	let test_keys =
+		vec!["0015", "0035", "0054", "0055", "0056", "0057", "0058", "0075", "0076", "0095"];
+
+	for (seq, key) in test_keys.iter().enumerate() {
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (seq + 1) as u64, InternalKeyKind::Set, 0);
+		let value = format!("v-{key}").into_bytes();
+		writer.add(internal_key, &value).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(
+		crate::sstable::table::Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap(),
+	);
+
+	let mut iter = table.iter(false, None);
+
+	// Seek to middle key
+	let seek_key = InternalKey::new(b"0055".to_vec(), 4, InternalKeyKind::Set, 0);
+	iter.seek(&seek_key.encode()).unwrap();
+	assert!(iter.valid(), "Iterator should be valid after seek");
+	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0055", "Should find key 0055");
+
+	// SeekToLast
+	iter.seek_to_last().unwrap();
+	assert!(iter.valid(), "Iterator should be valid after seek_to_last");
+	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0095", "Should find last key");
+
+	// Reseek to same key - should work correctly
+	iter.seek(&seek_key.encode()).unwrap();
+	assert!(iter.valid(), "Iterator should be valid after reseek");
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		"0055",
+		"Should find key 0055 after reseek"
+	);
+
+	// SeekToLast again
+	iter.seek_to_last().unwrap();
+	assert!(iter.valid(), "Iterator should be valid after second seek_to_last");
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		"0095",
+		"Should find last key again"
+	);
+
+	// Prev twice
+	iter.prev().unwrap();
+	assert!(iter.valid());
+	iter.prev().unwrap();
+	assert!(iter.valid());
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		"0075",
+		"Should find key 0075 after two prev()"
+	);
+
+	// Seek to 0095
+	let seek_key_0095 = InternalKey::new(b"0095".to_vec(), 10, InternalKeyKind::Set, 0);
+	iter.seek(&seek_key_0095.encode()).unwrap();
+	assert!(iter.valid());
+	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0095", "Should find key 0095");
+
+	// Prev twice
+	iter.prev().unwrap();
+	assert!(iter.valid());
+	iter.prev().unwrap();
+	assert!(iter.valid());
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		"0075",
+		"Should find key 0075 after prev from 0095"
+	);
+
+	// SeekToLast
+	iter.seek_to_last().unwrap();
+	assert!(iter.valid());
+	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0095", "Should find last key");
+
+	// Seek to 0095 again
+	iter.seek(&seek_key_0095.encode()).unwrap();
+	assert!(iter.valid());
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		"0095",
+		"Should find key 0095 after reseek"
+	);
+
+	// Prev twice
+	iter.prev().unwrap();
+	assert!(iter.valid());
+	iter.prev().unwrap();
+	assert!(iter.valid());
+	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0075", "Should find key 0075");
+
+	// Seek to 0075
+	let seek_key_0075 = InternalKey::new(b"0075".to_vec(), 8, InternalKeyKind::Set, 0);
+	iter.seek(&seek_key_0075.encode()).unwrap();
+	assert!(iter.valid());
+	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0075", "Should find key 0075");
+
+	// Next twice
+	if let Some(result) = iter.next() {
+		result.unwrap();
+	}
+	assert!(iter.valid());
+	if let Some(result) = iter.next() {
+		result.unwrap();
+	}
+	assert!(iter.valid());
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		"0095",
+		"Should find key 0095 after two next()"
+	);
+
+	// SeekToLast
+	iter.seek_to_last().unwrap();
+	assert!(iter.valid());
+	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0095", "Should find last key");
+}
+
+#[test]
+fn test_partitioned_index_varying_partition_sizes() {
+	// Test with varying partition sizes to ensure all operations work
+	let max_index_keys = 5;
+	let est_max_index_key_value_size = 32;
+	let est_max_index_size = max_index_keys * est_max_index_key_value_size;
+
+	for partition_size in 1..=est_max_index_size + 1 {
+		let opts = Options {
+			index_partition_size: partition_size,
+			block_size: 500,
+			..Default::default()
+		};
+
+		let opts = Arc::new(opts);
+
+		let mut buffer = Vec::new();
+		let mut writer =
+			crate::sstable::table::TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+		// Add enough entries to create multiple partitions
+		for i in 0..20 {
+			let key = format!("key_{i:03}");
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+			let value = format!("value_{i:03}").into_bytes();
+			writer.add(internal_key, &value).unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Arc::new(
+			crate::sstable::table::Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap(),
+		);
+
+		// Test Get operations work at this partition size
+		for i in 0..20 {
+			let key = format!("key_{i:03}");
+			let seek_key =
+				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+			let result = table.get(&seek_key).unwrap();
+			assert!(result.is_some(), "Should find key {key} at partition_size {partition_size}");
+			if let Some((found_key, found_value)) = result {
+				assert_eq!(
+					std::str::from_utf8(&found_key.user_key).unwrap(),
+					key,
+					"Key mismatch at partition_size {partition_size}"
+				);
+				assert_eq!(
+					std::str::from_utf8(found_value.as_ref()).unwrap(),
+					format!("value_{i:03}"),
+					"Value mismatch at partition_size {partition_size}"
+				);
+			}
+		}
+
+		// Test iterator works at this partition size
+		let mut iter = table.iter(false, None);
+		iter.seek_to_first().unwrap();
+		let mut count = 0;
+		while iter.valid() {
+			count += 1;
+			match iter.next() {
+				Some(Ok(_)) => {}
+				Some(Err(e)) => panic!("Iterator error: {e}"),
+				None => break,
+			}
+		}
+		assert_eq!(count, 20, "Should iterate all 20 keys at partition_size {partition_size}");
+	}
 }

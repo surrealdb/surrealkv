@@ -241,8 +241,9 @@ impl CoreInner {
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
 
-		manifest.apply_changeset(&changeset)?;
+		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
+			manifest.revert_changeset(rollback);
 			let error = Error::Other(format!(
 				"Failed to atomically update manifest: table_id={}, log_number={}: {}",
 				table_id,
@@ -561,8 +562,9 @@ impl CoreInner {
 				};
 
 				let mut manifest = self.level_manifest.write()?;
-				manifest.apply_changeset(&changeset)?;
+				let rollback = manifest.apply_changeset(&changeset)?;
 				if let Err(e) = write_manifest_to_disk(&manifest) {
+					manifest.revert_changeset(rollback);
 					let error = Error::Other(format!(
 						"Failed to update manifest log_number after immutable flush: {}",
 						e
@@ -795,7 +797,8 @@ impl CommitEnv for LsmCommitEnv {
 					.encode();
 
 					// Collect and delete all existing entries for this user key
-					let range_iter = versioned_index_guard.range(&start_key, &end_key)?;
+					let range_iter =
+						versioned_index_guard.range(start_key.as_slice()..=end_key.as_slice())?;
 					let mut keys_to_delete = Vec::new();
 					for entry in range_iter {
 						let (key, _) = entry?;
@@ -1028,8 +1031,10 @@ impl Core {
 		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
 
 		// Initialize background task manager
-		let task_manager =
-			Arc::new(TaskManager::new(Arc::clone(&inner) as Arc<dyn CompactionOperations>));
+		let task_manager = Arc::new(TaskManager::new(
+			Arc::clone(&inner) as Arc<dyn CompactionOperations>,
+			Arc::clone(&opts),
+		));
 
 		let commit_env =
 			Arc::new(LsmCommitEnv::new(Arc::clone(&inner), Arc::clone(&task_manager))?);
