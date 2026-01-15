@@ -331,10 +331,8 @@ impl<W: Write> TableWriter<W> {
 			.as_nanos();
 
 		// Copy sequence numbers from metadata to properties for table ordering
-		self.meta.properties.seqnos = (
-			self.meta.smallest_seq_num.unwrap_or(0),
-			self.meta.largest_seq_num.unwrap_or(0),
-		);
+		self.meta.properties.seqnos =
+			(self.meta.smallest_seq_num.unwrap_or(0), self.meta.largest_seq_num.unwrap_or(0));
 
 		// Check if the last data block has entries.
 		if self.data_block.as_ref().is_some_and(|db| db.entries() > 0) {
@@ -447,12 +445,8 @@ impl<W: Write> TableWriter<W> {
 
 		// Track timestamp range
 		let ts = key.timestamp;
-		props.oldest_key_time = Some(
-			props.oldest_key_time.map_or(ts, |t| t.min(ts))
-		);
-		props.newest_key_time = Some(
-			props.newest_key_time.map_or(ts, |t| t.max(ts))
-		);
+		props.oldest_key_time = Some(props.oldest_key_time.map_or(ts, |t| t.min(ts)));
+		props.newest_key_time = Some(props.newest_key_time.map_or(ts, |t| t.max(ts)));
 
 		// Track range deletions
 		if key.kind() == InternalKeyKind::RangeDelete {
@@ -624,8 +618,8 @@ pub struct Table {
 	#[allow(unused)]
 	pub file_size: u64,
 
-	pub(crate) opts: Arc<Options>,  // Shared table options.
-	pub meta: TableMetadata, // Metadata properties of the table.
+	pub(crate) opts: Arc<Options>, // Shared table options.
+	pub meta: TableMetadata,       // Metadata properties of the table.
 
 	pub(crate) index_block: IndexType,
 	pub filter_reader: Option<FilterBlockReader>,

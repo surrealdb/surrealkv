@@ -4552,12 +4552,7 @@ fn test_backward_iter_inclusive_upper_bound_mvcc() {
 	}
 
 	// Should get all 3 versions of key_001
-	assert_eq!(
-		results.len(),
-		3,
-		"Should return all 3 versions of key_001. Got: {:?}",
-		results
-	);
+	assert_eq!(results.len(), 3, "Should return all 3 versions of key_001. Got: {:?}", results);
 
 	// Verify all are key_001
 	for (user_key, _) in &results {
@@ -4596,12 +4591,7 @@ fn test_backward_iter_exclusive_upper_bound_mvcc() {
 	}
 
 	// Should only get key_001 versions (2 of them)
-	assert_eq!(
-		results.len(),
-		2,
-		"Should return only key_001 versions. Got: {:?}",
-		results
-	);
+	assert_eq!(results.len(), 2, "Should return only key_001 versions. Got: {:?}", results);
 
 	// Verify none are key_002
 	for (user_key, _) in &results {
@@ -4648,10 +4638,7 @@ fn test_forward_backward_consistency_mvcc() {
 		backward_results.len(),
 		"Forward and backward should return same count"
 	);
-	assert_eq!(
-		forward_results, backward_results,
-		"Forward and reversed backward should match"
-	);
+	assert_eq!(forward_results, backward_results, "Forward and reversed backward should match");
 }
 
 // =============================================================================
@@ -4671,14 +4658,13 @@ fn test_seq_num_tracking_with_zero_first() {
 	// Add entries with seq_num: 0, 100, 50 (first is 0!)
 	// Keys must be in ascending order for SSTable
 	let entries = vec![
-		("aaa", 0u64),    // First entry has seq_num = 0
-		("bbb", 100u64),  // Larger seq_num
-		("ccc", 50u64),   // Middle seq_num
+		("aaa", 0u64),   // First entry has seq_num = 0
+		("bbb", 100u64), // Larger seq_num
+		("ccc", 50u64),  // Middle seq_num
 	];
 
 	for (key, seq) in &entries {
-		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), *seq, InternalKeyKind::Set, 0);
+		let internal_key = InternalKey::new(key.as_bytes().to_vec(), *seq, InternalKeyKind::Set, 0);
 		writer.add(internal_key, b"value").unwrap();
 	}
 
@@ -4691,11 +4677,7 @@ fn test_seq_num_tracking_with_zero_first() {
 		Some(0),
 		"smallest_seq_num should be 0 (first entry's seq_num)"
 	);
-	assert_eq!(
-		table.meta.largest_seq_num,
-		Some(100),
-		"largest_seq_num should be 100"
-	);
+	assert_eq!(table.meta.largest_seq_num, Some(100), "largest_seq_num should be 100");
 
 	// Also verify properties.seqnos matches
 	assert_eq!(table.meta.properties.seqnos, (0, 100), "seqnos tuple should match");
@@ -4774,14 +4756,13 @@ fn test_timestamp_tracking_with_zero_first() {
 
 	// Add entries with timestamps: 0, 1000, 500 (first is 0!)
 	let entries = vec![
-		("aaa", 0u64),     // First entry has timestamp = 0
-		("bbb", 1000u64),  // Larger timestamp
-		("ccc", 500u64),   // Middle timestamp
+		("aaa", 0u64),    // First entry has timestamp = 0
+		("bbb", 1000u64), // Larger timestamp
+		("ccc", 500u64),  // Middle timestamp
 	];
 
 	for (key, ts) in &entries {
-		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), 1, InternalKeyKind::Set, *ts);
+		let internal_key = InternalKey::new(key.as_bytes().to_vec(), 1, InternalKeyKind::Set, *ts);
 		writer.add(internal_key, b"value").unwrap();
 	}
 
@@ -4794,11 +4775,7 @@ fn test_timestamp_tracking_with_zero_first() {
 		Some(0),
 		"oldest_key_time should be 0 (first entry's timestamp)"
 	);
-	assert_eq!(
-		table.meta.properties.newest_key_time,
-		Some(1000),
-		"newest_key_time should be 1000"
-	);
+	assert_eq!(table.meta.properties.newest_key_time, Some(1000), "newest_key_time should be 1000");
 }
 
 /// Tests timestamp tracking with various insertion orders.
@@ -4931,8 +4908,7 @@ fn test_all_zero_seq_nums() {
 	// All entries have seq_num = 0
 	for i in 0..5 {
 		let key = format!("key_{i:02}");
-		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
+		let internal_key = InternalKey::new(key.as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
 		writer.add(internal_key, b"value").unwrap();
 	}
 

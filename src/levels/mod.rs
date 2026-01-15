@@ -297,15 +297,30 @@ impl LevelManifest {
 	fn validate_table_sequence_numbers(level_idx: u8, tables: &[Arc<Table>]) -> Result<()> {
 		// Basic sanity check for all tables
 		for table in tables {
-			// Ensure smallest_seq_num is not greater than largest_seq_num
-			match (table.meta.smallest_seq_num, table.meta.largest_seq_num) {
-				(Some(smallest), Some(largest)) if smallest > largest => {
-					return Err(Error::LoadManifestFail(format!(
-						"Table {} has invalid sequence numbers: smallest({}) > largest({})",
-						table.id, smallest, largest
-					)));
-				}
-				_ => {}
+			// Ensure both sequence numbers exist (they should always be set together)
+			// and that smallest_seq_num is not greater than largest_seq_num
+			let (smallest, largest) =
+				match (table.meta.smallest_seq_num, table.meta.largest_seq_num) {
+					(Some(s), Some(l)) => (s, l),
+					(None, None) => {
+						return Err(Error::LoadManifestFail(format!(
+							"Table {} has no sequence numbers (possibly corrupted or empty table)",
+							table.id
+						)));
+					}
+					(smallest, largest) => {
+						return Err(Error::LoadManifestFail(format!(
+							"Table {} has inconsistent sequence numbers: smallest={:?}, largest={:?}",
+							table.id, smallest, largest
+						)));
+					}
+				};
+
+			if smallest > largest {
+				return Err(Error::LoadManifestFail(format!(
+					"Table {} has invalid sequence numbers: smallest({}) > largest({})",
+					table.id, smallest, largest
+				)));
 			}
 		}
 
@@ -441,10 +456,9 @@ impl LevelManifest {
 			}
 
 			// Update last_sequence if this table has a higher sequence number
-			if let Some(largest) = table.meta.largest_seq_num {
-				if largest > self.last_sequence {
-					self.last_sequence = largest;
-				}
+			let largest = table.meta.largest_seq_num.expect("table must have largest_seq_num");
+			if largest > self.last_sequence {
+				self.last_sequence = largest;
 			}
 		}
 

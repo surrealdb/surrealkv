@@ -196,12 +196,8 @@ impl TableMetadata {
 	}
 
 	pub(crate) fn update_seq_num(&mut self, seq_num: u64) {
-		self.smallest_seq_num = Some(
-			self.smallest_seq_num.map_or(seq_num, |s| s.min(seq_num))
-		);
-		self.largest_seq_num = Some(
-			self.largest_seq_num.map_or(seq_num, |l| l.max(seq_num))
-		);
+		self.smallest_seq_num = Some(self.smallest_seq_num.map_or(seq_num, |s| s.min(seq_num)));
+		self.largest_seq_num = Some(self.largest_seq_num.map_or(seq_num, |l| l.max(seq_num)));
 	}
 
 	pub(crate) fn encode(&self) -> Vec<u8> {
