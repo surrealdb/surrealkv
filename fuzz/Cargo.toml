@@ -14,6 +14,7 @@ surrealkv = { path = ".." }
 tempfile = "3.23"
 rand = "0.9"
 rand_chacha = "0.9"
+tokio = { version = "1", features = ["rt", "sync"] }
 
 [[bin]]
 name = "block_roundtrip"
@@ -97,6 +98,13 @@ bench = false
 [[bin]]
 name = "bplustree"
 path = "fuzz_targets/bplustree.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "store_ops"
+path = "fuzz_targets/store_ops.rs"
 test = false
 doc = false
 bench = false

@@ -829,6 +829,7 @@ dependencies = [
  "rand_chacha",
  "surrealkv",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
