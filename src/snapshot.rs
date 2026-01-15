@@ -115,62 +115,6 @@ impl Snapshot {
 		})
 	}
 
-	/// Optimized count operation for a key range
-	///
-	/// This method efficiently counts keys in the range [start, end) without:
-	/// - Creating a full iterator
-	/// - Resolving values from the value log
-	/// - Allocating result structures
-	///
-	/// It only counts the latest version of each key and skips tombstones.
-	pub(crate) fn count_in_range(
-		&self,
-		lower: Option<&[u8]>,
-		upper: Option<&[u8]>,
-	) -> Result<usize> {
-		let mut count = 0usize;
-		let mut last_key: Vec<u8> = Vec::new();
-
-		let iter_state = self.collect_iter_state()?;
-		let internal_range = crate::user_range_to_internal_range(
-			lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
-			upper.map(Bound::Excluded).unwrap_or(Bound::Unbounded),
-		);
-
-		let mut merge_iter = KMergeIterator::new_from(iter_state, internal_range);
-		merge_iter.seek_first()?;
-
-		while merge_iter.valid() {
-			let key_ref = merge_iter.key();
-
-			// Skip invisible versions (seq_num > snapshot)
-			if key_ref.seq_num() > self.seq_num {
-				merge_iter.next()?;
-				continue;
-			}
-
-			// Skip older versions of the same key
-			let user_key = key_ref.user_key();
-			if user_key == last_key.as_slice() {
-				merge_iter.next()?;
-				continue;
-			}
-
-			// New user key - remember it
-			last_key.clear();
-			last_key.extend_from_slice(user_key);
-
-			// Only count non-tombstone entries
-			if !key_ref.is_tombstone() {
-				count += 1;
-			}
-
-			merge_iter.next()?;
-		}
-
-		Ok(count)
-	}
-
 	/// Gets a single key from the snapshot.
 	///
 	/// # Read Path in LSM Trees
