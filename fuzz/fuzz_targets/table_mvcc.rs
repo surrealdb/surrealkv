@@ -220,7 +220,6 @@ fuzz_target!(|data: FuzzMultiVersionInput| {
                 );
             }
             (Err(e), _) => {
-                // With valid programmatically constructed data, errors indicate bugs
                 panic!("Unexpected error in get(): {:?}", e);
             }
         }
