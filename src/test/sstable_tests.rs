@@ -65,7 +65,7 @@ fn test_table_builder() {
 	}
 
 	let actual = b.finish().unwrap();
-	assert_eq!(724, actual);
+	assert_eq!(716, actual);
 }
 
 #[test]
@@ -3979,7 +3979,6 @@ fn test_table_properties_persistence() {
 	assert_eq!(props.key_count, 50, "Key count should be 50");
 	assert_eq!(props.num_deletions, expected_deletions, "Number of deletions should match");
 	assert_eq!(props.tombstone_count, expected_tombstones, "Tombstone count should match");
-	assert_eq!(props.global_seq_num, 0, "Global sequence number should be 0");
 	assert!(props.num_data_blocks > 0, "Should have at least one data block");
 	assert!(props.data_size > 0, "Data size should be greater than 0");
 
@@ -4003,8 +4002,8 @@ fn test_table_properties_persistence() {
 	// Sequence number range
 	assert_eq!(props.seqnos.0, 1000, "Smallest sequence number should be 1000");
 	assert_eq!(props.seqnos.1, 1049, "Largest sequence number should be 1049");
-	assert_eq!(meta.smallest_seq_num, 1000, "Metadata smallest seq num should match");
-	assert_eq!(meta.largest_seq_num, 1049, "Metadata largest seq num should match");
+	assert_eq!(meta.smallest_seq_num, Some(1000), "Metadata smallest seq num should match");
+	assert_eq!(meta.largest_seq_num, Some(1049), "Metadata largest seq num should match");
 
 	// Compression
 	assert_eq!(props.compression, crate::CompressionType::None, "Compression should be None");
@@ -4014,8 +4013,8 @@ fn test_table_properties_persistence() {
 	assert!(props.block_count > 0, "Block count should be tracked");
 
 	// Time metrics (timestamps are 0 in this test)
-	assert_eq!(props.oldest_key_time, 0, "Oldest key time should be 0");
-	assert_eq!(props.newest_key_time, 0, "Newest key time should be 0");
+	assert_eq!(props.oldest_key_time, Some(0), "Oldest key time should be 0");
+	assert_eq!(props.newest_key_time, Some(0), "Newest key time should be 0");
 
 	// Range deletion metrics
 	assert_eq!(props.num_range_deletions, 5, "Should have 5 range deletions");
@@ -4471,4 +4470,476 @@ fn test_large_values() {
 			assert_eq!(found_bytes.len(), 10000, "Value size should be 10000");
 		}
 	}
+}
+
+// ============================================================================
+// MVCC Version Handling in Range Iteration Tests
+// ============================================================================
+// These tests verify correct behavior when iterating over keys with multiple
+// MVCC versions, particularly for backward iteration with bounds.
+
+#[test]
+fn test_backward_iter_multiple_versions_same_user_key() {
+	// REGRESSION TEST: When a user key has multiple MVCC versions and we iterate
+	// backward with an inclusive upper bound, all versions should be returned.
+	//
+	// Bug: seek_to_upper_bound() was comparing only user keys, causing it to
+	// position at the FIRST version instead of the LAST version of the key.
+	// This caused prev() to immediately return false, missing other versions.
+	let data = vec![
+		// Two versions of the same key with different seq_nums
+		// Higher seq_num comes first in internal key order
+		("key_000", "value_v2", 200),
+		("key_000", "value_v1", 100),
+	];
+
+	let (src, size) = build_table_with_seq_num(data);
+	let opts = default_opts();
+	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+	// Backward iteration with unbounded range should return ALL versions
+	let mut iter = table.iter(false, None);
+	let mut results: Vec<(String, u64)> = Vec::new();
+
+	while let Some(item) = iter.next_back() {
+		let (key, _) = item.unwrap();
+		let user_key = String::from_utf8(key.user_key.clone()).unwrap();
+		results.push((user_key, key.seq_num()));
+	}
+
+	// Should get both versions
+	assert_eq!(
+		results.len(),
+		2,
+		"Backward iteration should return both MVCC versions. Got: {:?}",
+		results
+	);
+
+	// First result should be lower seq_num (comes later in internal order)
+	assert_eq!(results[0].1, 100, "First backward result should be seq=100");
+	// Second result should be higher seq_num (comes earlier in internal order)
+	assert_eq!(results[1].1, 200, "Second backward result should be seq=200");
+}
+
+#[test]
+fn test_backward_iter_inclusive_upper_bound_mvcc() {
+	// Test inclusive upper bound positioning with multiple MVCC versions
+	let data = vec![
+		("key_001", "v1", 300),
+		("key_001", "v2", 200),
+		("key_001", "v3", 100),
+		("key_002", "v1", 50),
+	];
+
+	let (src, size) = build_table_with_seq_num(data);
+	let opts = default_opts();
+	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+	// Inclusive upper bound at key_001 - should include all versions of key_001
+	let mut iter = table.iter(
+		false,
+		Some(user_range_to_internal_range(
+			Bound::Unbounded,
+			Bound::Included(b"key_001".as_slice()),
+		)),
+	);
+
+	let mut results: Vec<(String, u64)> = Vec::new();
+	while let Some(item) = iter.next_back() {
+		let (key, _) = item.unwrap();
+		let user_key = String::from_utf8(key.user_key.clone()).unwrap();
+		results.push((user_key, key.seq_num()));
+	}
+
+	// Should get all 3 versions of key_001
+	assert_eq!(results.len(), 3, "Should return all 3 versions of key_001. Got: {:?}", results);
+
+	// Verify all are key_001
+	for (user_key, _) in &results {
+		assert_eq!(user_key, "key_001");
+	}
+}
+
+#[test]
+fn test_backward_iter_exclusive_upper_bound_mvcc() {
+	// Test exclusive upper bound - should exclude ALL versions of the bound key
+	let data = vec![
+		("key_001", "v1", 300),
+		("key_001", "v2", 200),
+		("key_002", "v1", 150),
+		("key_002", "v2", 100),
+	];
+
+	let (src, size) = build_table_with_seq_num(data);
+	let opts = default_opts();
+	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+	// Exclusive upper bound at key_002 - should exclude all versions of key_002
+	let mut iter = table.iter(
+		false,
+		Some(user_range_to_internal_range(
+			Bound::Unbounded,
+			Bound::Excluded(b"key_002".as_slice()),
+		)),
+	);
+
+	let mut results: Vec<(String, u64)> = Vec::new();
+	while let Some(item) = iter.next_back() {
+		let (key, _) = item.unwrap();
+		let user_key = String::from_utf8(key.user_key.clone()).unwrap();
+		results.push((user_key, key.seq_num()));
+	}
+
+	// Should only get key_001 versions (2 of them)
+	assert_eq!(results.len(), 2, "Should return only key_001 versions. Got: {:?}", results);
+
+	// Verify none are key_002
+	for (user_key, _) in &results {
+		assert_eq!(user_key, "key_001", "Should not contain key_002");
+	}
+}
+
+#[test]
+fn test_forward_backward_consistency_mvcc() {
+	// Verify forward and backward iteration return same entries (in reverse order)
+	let data = vec![
+		("key_001", "v1", 300),
+		("key_001", "v2", 200),
+		("key_002", "v1", 150),
+		("key_003", "v1", 100),
+	];
+
+	let (src, size) = build_table_with_seq_num(data);
+	let opts = default_opts();
+	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+
+	// Forward iteration
+	let iter_fwd = table.iter(false, None);
+	let forward_results: Vec<(Vec<u8>, u64)> = iter_fwd
+		.map(|r| {
+			let (k, _) = r.unwrap();
+			(k.user_key.clone(), k.seq_num())
+		})
+		.collect();
+
+	// Backward iteration
+	let mut iter_bwd = table.iter(false, None);
+	let mut backward_results: Vec<(Vec<u8>, u64)> = Vec::new();
+	while let Some(item) = iter_bwd.next_back() {
+		let (key, _) = item.unwrap();
+		backward_results.push((key.user_key.clone(), key.seq_num()));
+	}
+
+	// Reverse backward results to compare
+	backward_results.reverse();
+
+	assert_eq!(
+		forward_results.len(),
+		backward_results.len(),
+		"Forward and backward should return same count"
+	);
+	assert_eq!(forward_results, backward_results, "Forward and reversed backward should match");
+}
+
+// =============================================================================
+// Metadata Edge Case Tests
+// These tests verify that seq_num and timestamp tracking work correctly,
+// especially for edge cases like when the first value is 0.
+// =============================================================================
+
+/// Tests that seq_num tracking works correctly when the first entry has seq_num=0.
+/// This was a bug where using 0 as sentinel value caused incorrect tracking.
+#[test]
+fn test_seq_num_tracking_with_zero_first() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+	// Add entries with seq_num: 0, 100, 50 (first is 0!)
+	// Keys must be in ascending order for SSTable
+	let entries = vec![
+		("aaa", 0u64),   // First entry has seq_num = 0
+		("bbb", 100u64), // Larger seq_num
+		("ccc", 50u64),  // Middle seq_num
+	];
+
+	for (key, seq) in &entries {
+		let internal_key = InternalKey::new(key.as_bytes().to_vec(), *seq, InternalKeyKind::Set, 0);
+		writer.add(internal_key, b"value").unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+	// Verify: smallest should be 0 (not overwritten), largest should be 100
+	assert_eq!(
+		table.meta.smallest_seq_num,
+		Some(0),
+		"smallest_seq_num should be 0 (first entry's seq_num)"
+	);
+	assert_eq!(table.meta.largest_seq_num, Some(100), "largest_seq_num should be 100");
+
+	// Also verify properties.seqnos matches
+	assert_eq!(table.meta.properties.seqnos, (0, 100), "seqnos tuple should match");
+}
+
+/// Tests seq_num tracking with various insertion orders.
+#[test]
+fn test_seq_num_tracking_various_orders() {
+	// Test case 1: Ascending order
+	{
+		let opts = default_opts();
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+		for (i, seq) in [1u64, 2, 3].iter().enumerate() {
+			let key = format!("key_{i:02}");
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), *seq, InternalKeyKind::Set, 0);
+			writer.add(internal_key, b"value").unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		assert_eq!(table.meta.smallest_seq_num, Some(1), "Ascending: smallest=1");
+		assert_eq!(table.meta.largest_seq_num, Some(3), "Ascending: largest=3");
+	}
+
+	// Test case 2: Descending order (keys still ascending, but seq_nums descending)
+	{
+		let opts = default_opts();
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+		for (i, seq) in [3u64, 2, 1].iter().enumerate() {
+			let key = format!("key_{i:02}");
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), *seq, InternalKeyKind::Set, 0);
+			writer.add(internal_key, b"value").unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		assert_eq!(table.meta.smallest_seq_num, Some(1), "Descending: smallest=1");
+		assert_eq!(table.meta.largest_seq_num, Some(3), "Descending: largest=3");
+	}
+
+	// Test case 3: Random order
+	{
+		let opts = default_opts();
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+		for (i, seq) in [5u64, 1, 10, 3].iter().enumerate() {
+			let key = format!("key_{i:02}");
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), *seq, InternalKeyKind::Set, 0);
+			writer.add(internal_key, b"value").unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		assert_eq!(table.meta.smallest_seq_num, Some(1), "Random: smallest=1");
+		assert_eq!(table.meta.largest_seq_num, Some(10), "Random: largest=10");
+	}
+}
+
+/// Tests that timestamp tracking works correctly when the first entry has timestamp=0.
+#[test]
+fn test_timestamp_tracking_with_zero_first() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+	// Add entries with timestamps: 0, 1000, 500 (first is 0!)
+	let entries = vec![
+		("aaa", 0u64),    // First entry has timestamp = 0
+		("bbb", 1000u64), // Larger timestamp
+		("ccc", 500u64),  // Middle timestamp
+	];
+
+	for (key, ts) in &entries {
+		let internal_key = InternalKey::new(key.as_bytes().to_vec(), 1, InternalKeyKind::Set, *ts);
+		writer.add(internal_key, b"value").unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+	// Verify: oldest should be 0 (not overwritten), newest should be 1000
+	assert_eq!(
+		table.meta.properties.oldest_key_time,
+		Some(0),
+		"oldest_key_time should be 0 (first entry's timestamp)"
+	);
+	assert_eq!(table.meta.properties.newest_key_time, Some(1000), "newest_key_time should be 1000");
+}
+
+/// Tests timestamp tracking with various insertion orders.
+#[test]
+fn test_timestamp_tracking_various_orders() {
+	// Test case 1: Ascending timestamps
+	{
+		let opts = default_opts();
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+		for (i, ts) in [100u64, 200, 300].iter().enumerate() {
+			let key = format!("key_{i:02}");
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), 1, InternalKeyKind::Set, *ts);
+			writer.add(internal_key, b"value").unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		assert_eq!(table.meta.properties.oldest_key_time, Some(100));
+		assert_eq!(table.meta.properties.newest_key_time, Some(300));
+	}
+
+	// Test case 2: Descending timestamps
+	{
+		let opts = default_opts();
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+		for (i, ts) in [300u64, 200, 100].iter().enumerate() {
+			let key = format!("key_{i:02}");
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), 1, InternalKeyKind::Set, *ts);
+			writer.add(internal_key, b"value").unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		assert_eq!(table.meta.properties.oldest_key_time, Some(100));
+		assert_eq!(table.meta.properties.newest_key_time, Some(300));
+	}
+
+	// Test case 3: Random order with 0
+	{
+		let opts = default_opts();
+		let mut buffer = Vec::new();
+		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+		for (i, ts) in [500u64, 0, 1000, 250].iter().enumerate() {
+			let key = format!("key_{i:02}");
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), 1, InternalKeyKind::Set, *ts);
+			writer.add(internal_key, b"value").unwrap();
+		}
+
+		let size = writer.finish().unwrap();
+		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+		assert_eq!(table.meta.properties.oldest_key_time, Some(0));
+		assert_eq!(table.meta.properties.newest_key_time, Some(1000));
+	}
+}
+
+/// Tests that a single entry correctly sets both smallest=largest and oldest=newest.
+#[test]
+fn test_single_entry_metadata() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+	// Single entry with specific values
+	let internal_key = InternalKey::new(b"only_key".to_vec(), 42, InternalKeyKind::Set, 12345);
+	writer.add(internal_key, b"only_value").unwrap();
+
+	let size = writer.finish().unwrap();
+	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+	// Both smallest and largest should be 42
+	assert_eq!(table.meta.smallest_seq_num, Some(42));
+	assert_eq!(table.meta.largest_seq_num, Some(42));
+	assert_eq!(table.meta.properties.seqnos, (42, 42));
+
+	// Both oldest and newest should be 12345
+	assert_eq!(table.meta.properties.oldest_key_time, Some(12345));
+	assert_eq!(table.meta.properties.newest_key_time, Some(12345));
+}
+
+/// Tests that metadata survives encode/decode roundtrip with edge values.
+#[test]
+fn test_metadata_roundtrip_with_edge_values() {
+	use crate::sstable::meta::TableMetadata;
+
+	// Test case 1: seq_num = 0
+	{
+		let mut meta = TableMetadata::new();
+		meta.update_seq_num(0);
+		meta.update_seq_num(100);
+
+		let encoded = meta.encode();
+		let decoded = TableMetadata::decode(&encoded).unwrap();
+
+		assert_eq!(decoded.smallest_seq_num, Some(0), "Roundtrip should preserve seq_num=0");
+		assert_eq!(decoded.largest_seq_num, Some(100));
+	}
+
+	// Test case 2: Large seq_num values
+	{
+		let mut meta = TableMetadata::new();
+		meta.update_seq_num(1);
+		meta.update_seq_num(u64::MAX - 1); // Near max value
+
+		let encoded = meta.encode();
+		let decoded = TableMetadata::decode(&encoded).unwrap();
+
+		assert_eq!(decoded.smallest_seq_num, Some(1));
+		assert_eq!(decoded.largest_seq_num, Some(u64::MAX - 1));
+	}
+}
+
+/// Tests that all entries having seq_num=0 works correctly.
+#[test]
+fn test_all_zero_seq_nums() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+	// All entries have seq_num = 0
+	for i in 0..5 {
+		let key = format!("key_{i:02}");
+		let internal_key = InternalKey::new(key.as_bytes().to_vec(), 0, InternalKeyKind::Set, 0);
+		writer.add(internal_key, b"value").unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+	// Both should be 0
+	assert_eq!(table.meta.smallest_seq_num, Some(0));
+	assert_eq!(table.meta.largest_seq_num, Some(0));
+	assert_eq!(table.meta.properties.seqnos, (0, 0));
+}
+
+/// Tests that all entries having timestamp=0 works correctly.
+#[test]
+fn test_all_zero_timestamps() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+
+	// All entries have timestamp = 0
+	for i in 0..5 {
+		let key = format!("key_{i:02}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(internal_key, b"value").unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+
+	// Both should be 0
+	assert_eq!(table.meta.properties.oldest_key_time, Some(0));
+	assert_eq!(table.meta.properties.newest_key_time, Some(0));
 }

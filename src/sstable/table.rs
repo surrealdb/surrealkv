@@ -207,6 +207,7 @@ impl<W: Write> TableWriter<W> {
 
 		let mut meta = TableMetadata::new();
 		meta.properties.id = id;
+		meta.properties.compression = compression_selector.select_compression(target_level);
 
 		TableWriter {
 			writer,
@@ -330,7 +331,8 @@ impl<W: Write> TableWriter<W> {
 			.as_nanos();
 
 		// Copy sequence numbers from metadata to properties for table ordering
-		self.meta.properties.seqnos = (self.meta.smallest_seq_num, self.meta.largest_seq_num);
+		self.meta.properties.seqnos =
+			(self.meta.smallest_seq_num.unwrap_or(0), self.meta.largest_seq_num.unwrap_or(0));
 
 		// Check if the last data block has entries.
 		if self.data_block.as_ref().is_some_and(|db| db.entries() > 0) {
@@ -443,12 +445,8 @@ impl<W: Write> TableWriter<W> {
 
 		// Track timestamp range
 		let ts = key.timestamp;
-		if props.oldest_key_time == 0 || ts < props.oldest_key_time {
-			props.oldest_key_time = ts;
-		}
-		if ts > props.newest_key_time {
-			props.newest_key_time = ts;
-		}
+		props.oldest_key_time = Some(props.oldest_key_time.map_or(ts, |t| t.min(ts)));
+		props.newest_key_time = Some(props.newest_key_time.map_or(ts, |t| t.max(ts)));
 
 		// Track range deletions
 		if key.kind() == InternalKeyKind::RangeDelete {
@@ -1007,12 +1005,12 @@ impl TableIterator {
 		Err(Error::from(SSTableError::EmptyBlock))
 	}
 
-	#[cfg(test)]
+	#[allow(unused)]
 	pub(crate) fn key(&self) -> InternalKey {
 		self.current_block.as_ref().unwrap().key()
 	}
 
-	#[cfg(test)]
+	#[allow(unused)]
 	pub(crate) fn value(&self) -> Value {
 		self.current_block.as_ref().unwrap().value()
 	}
@@ -1138,14 +1136,11 @@ impl TableIterator {
 	fn seek_to_upper_bound(&mut self, bound: &Bound<InternalKey>) -> Result<()> {
 		match bound {
 			Bound::Included(internal_key) => {
-				// Seek to find the first key >= upper bound
-				let seek_key = InternalKey::new(
-					internal_key.user_key.clone(),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Max,
-					INTERNAL_KEY_TIMESTAMP_MAX,
-				);
-				self.seek(&seek_key.encode())?;
+				// Seek directly to the bound key
+				// For inclusive upper bound, the bound has seq_num=0 (lowest),
+				// meaning it comes AFTER all versions of the key in internal key order.
+				// Seeking to this key finds the first key >= bound.
+				self.seek(&internal_key.encode())?;
 
 				// If seek went past table end (invalid), start from last key
 				if !self.valid() {
@@ -1153,14 +1148,11 @@ impl TableIterator {
 					return Ok(());
 				}
 
-				// Back up if we're beyond the bound (should only need a few steps)
+				// Back up if we're beyond the bound using FULL internal key comparison
+				let bound_encoded = internal_key.encode();
 				while self.valid() {
-					let current_key = self.current_block.as_ref().unwrap().key();
-					let cmp = self
-						.table
-						.opts
-						.comparator
-						.compare(current_key.user_key.as_slice(), internal_key.user_key.as_slice());
+					let current_key_encoded = self.current_block.as_ref().unwrap().key().encode();
+					let cmp = self.table.internal_cmp.compare(&current_key_encoded, &bound_encoded);
 					if cmp != Ordering::Greater {
 						// Found a key <= bound, we're positioned correctly
 						break;
@@ -1172,28 +1164,22 @@ impl TableIterator {
 				}
 			}
 			Bound::Excluded(internal_key) => {
-				// Seek to find the first key >= upper bound
-				let seek_key = InternalKey::new(
-					internal_key.user_key.clone(),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Max,
-					INTERNAL_KEY_TIMESTAMP_MAX,
-				);
-				self.seek(&seek_key.encode())?;
+				// Seek directly to the bound key
+				// For exclusive upper bound, the bound has seq_num=MAX (highest),
+				// meaning it comes BEFORE all versions of the key in internal key order.
+				self.seek(&internal_key.encode())?;
 
 				// If seek went past table end, start from last key
 				if !self.valid() {
 					self.seek_to_last()?;
 				}
 
-				// Move backward until we find a key < end (strictly less)
+				// Move backward until we find a key < bound (strictly less)
+				// using FULL internal key comparison
+				let bound_encoded = internal_key.encode();
 				while self.valid() {
-					let current_key = self.current_block.as_ref().unwrap().key();
-					let cmp = self
-						.table
-						.opts
-						.comparator
-						.compare(current_key.user_key.as_slice(), internal_key.user_key.as_slice());
+					let current_key_encoded = self.current_block.as_ref().unwrap().key().encode();
+					let cmp = self.table.internal_cmp.compare(&current_key_encoded, &bound_encoded);
 					if cmp == Ordering::Less {
 						break;
 					}

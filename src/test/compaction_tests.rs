@@ -1949,7 +1949,6 @@ fn test_table_properties_population() {
 	assert_eq!(props.num_deletions, expected_deletions);
 	assert_eq!(props.tombstone_count, expected_tombstones);
 	assert_eq!(props.data_size, 2975);
-	assert_eq!(props.global_seq_num, 0);
 	assert_eq!(props.num_data_blocks, 1);
 
 	assert_eq!(props.index_size, 74, "Index size should be tracked");
@@ -1965,8 +1964,8 @@ fn test_table_properties_population() {
 	);
 
 	// Verify time metrics (timestamps are 0 in this test)
-	assert_eq!(props.oldest_key_time, 0, "Oldest key time is 0 in test");
-	assert_eq!(props.newest_key_time, 0, "Newest key time is 0 in test");
+	assert_eq!(props.oldest_key_time, Some(0), "Oldest key time is 0 in test");
+	assert_eq!(props.newest_key_time, Some(0), "Newest key time is 0 in test");
 
 	// Verify range deletion metrics
 	assert_eq!(props.num_range_deletions, 5, "Should have 5 range deletions (every 20th key)");
@@ -1988,8 +1987,8 @@ fn test_table_properties_population() {
 
 	// Verify TableMetadata fields
 	assert_eq!(meta.has_point_keys, Some(true));
-	assert_eq!(meta.smallest_seq_num, 1000);
-	assert_eq!(meta.largest_seq_num, 1099);
+	assert_eq!(meta.smallest_seq_num, Some(1000));
+	assert_eq!(meta.largest_seq_num, Some(1099));
 	assert!(meta.smallest_point.is_some());
 	assert!(meta.largest_point.is_some());
 	if let Some(ref smallest) = meta.smallest_point {
