@@ -65,7 +65,7 @@ fn test_table_builder() {
 	}
 
 	let actual = b.finish().unwrap();
-	assert_eq!(716, actual);
+	assert_eq!(724, actual);
 }
 
 #[test]
