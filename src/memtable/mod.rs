@@ -237,11 +237,11 @@ impl MemTable {
 			let mut comp_iter = CompactionIterator::new(
 				vec![iter],
 				Arc::clone(&lsm_opts.internal_comparator) as Arc<dyn Comparator>,
-				false,                       // not bottom level (L0 flush)
-				None,                        // no vlog access in flush context
-				false,                       // versioning disabled in flush context
-				0,                           // retention period is 0 in flush context
-				Arc::clone(&lsm_opts.clock), // clock is the system clock
+				false,                                   // not bottom level (L0 flush)
+				None,                                    // no vlog access in flush context
+				lsm_opts.enable_versioning,              // versioning disabled in flush context
+				lsm_opts.versioned_history_retention_ns, // retention period is 0 in flush context
+				Arc::clone(&lsm_opts.clock),             // clock is the system clock
 			);
 			for item in comp_iter.by_ref() {
 				let (key, encoded_val) = item?;

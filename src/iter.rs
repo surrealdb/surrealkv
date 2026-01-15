@@ -402,8 +402,11 @@ impl<'a> CompactionIterator<'a> {
 				true
 			} else {
 				// Older version of a SET operation: check retention period
-				if self.enable_versioning && self.retention_period_ns > 0 {
-					// Get current time for retention period check
+				if !self.enable_versioning {
+					// Versioning disabled: mark older versions as stale
+					true
+				} else if self.retention_period_ns > 0 {
+					// Versioning enabled with retention period: check if within retention
 					let current_time = self.clock.now();
 					let key_timestamp = key.timestamp;
 					let age = current_time - key_timestamp;
@@ -411,8 +414,8 @@ impl<'a> CompactionIterator<'a> {
 					// Mark as stale only if NOT within retention period
 					!is_within_retention
 				} else {
-					// If versioning is disabled, mark older versions as stale
-					true
+					// Versioning enabled with retention_period_ns == 0: keep all versions forever
+					false
 				}
 			};
 
