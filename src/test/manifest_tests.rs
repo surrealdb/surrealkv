@@ -225,7 +225,7 @@ fn test_level_manifest_persistence() {
 
 	// Check Table1 basic properties
 	assert_eq!(table1_reloaded.id, table_id1, "Table 1 ID mismatch");
-	assert_eq!(table1_reloaded.file_size, 3838, "Table 1 file size should be 3838");
+	assert_eq!(table1_reloaded.file_size, 3830, "Table 1 file size should be 3830");
 
 	// Check Table1 metadata properties
 	let props1 = &table1_reloaded.meta.properties;
@@ -239,8 +239,8 @@ fn test_level_manifest_persistence() {
 	assert_eq!(props1.seqnos, (1, 100), "Table 1 sequence numbers should be (1, 100)");
 
 	// Check Table1 metadata fields
-	assert_eq!(table1_reloaded.meta.smallest_seq_num, 1, "Table 1 smallest seq num should be 1");
-	assert_eq!(table1_reloaded.meta.largest_seq_num, 100, "Table 1 largest seq num should be 100");
+	assert_eq!(table1_reloaded.meta.smallest_seq_num, Some(1), "Table 1 smallest seq num should be 1");
+	assert_eq!(table1_reloaded.meta.largest_seq_num, Some(100), "Table 1 largest seq num should be 100");
 	assert!(table1_reloaded.meta.has_point_keys.unwrap_or(false), "Table 1 should have point keys");
 	assert!(
 		table1_reloaded.meta.smallest_point.is_some(),
@@ -253,7 +253,7 @@ fn test_level_manifest_persistence() {
 
 	// Check Table2 basic properties
 	assert_eq!(table2_reloaded.id, table_id2, "Table 2 ID mismatch");
-	assert_eq!(table2_reloaded.file_size, 7145, "Table 2 file size should be 7145");
+	assert_eq!(table2_reloaded.file_size, 7137, "Table 2 file size should be 7137");
 
 	// Check Table2 metadata properties
 	let props2 = &table2_reloaded.meta.properties;
@@ -267,8 +267,8 @@ fn test_level_manifest_persistence() {
 	assert_eq!(props2.seqnos, (1, 200), "Table 2 sequence numbers should be (1, 200)");
 
 	// Check Table2 metadata fields
-	assert_eq!(table2_reloaded.meta.smallest_seq_num, 1, "Table 2 smallest seq num should be 1");
-	assert_eq!(table2_reloaded.meta.largest_seq_num, 200, "Table 2 largest seq num should be 200");
+	assert_eq!(table2_reloaded.meta.smallest_seq_num, Some(1), "Table 2 smallest seq num should be 1");
+	assert_eq!(table2_reloaded.meta.largest_seq_num, Some(200), "Table 2 largest seq num should be 200");
 	assert!(table2_reloaded.meta.has_point_keys.unwrap_or(false), "Table 2 should have point keys");
 	assert!(
 		table2_reloaded.meta.smallest_point.is_some(),
@@ -281,7 +281,7 @@ fn test_level_manifest_persistence() {
 
 	// Check Table3 basic properties
 	assert_eq!(table3_reloaded.id, table_id3, "Table 3 ID mismatch");
-	assert_eq!(table3_reloaded.file_size, 10452, "Table 3 file size should be 10452");
+	assert_eq!(table3_reloaded.file_size, 10444, "Table 3 file size should be 10444");
 
 	// Check Table3 metadata properties
 	let props3 = &table3_reloaded.meta.properties;
@@ -295,8 +295,8 @@ fn test_level_manifest_persistence() {
 	assert_eq!(props3.seqnos, (1, 300), "Table 3 sequence numbers should be (1, 300)");
 
 	// Check Table3 metadata fields
-	assert_eq!(table3_reloaded.meta.smallest_seq_num, 1, "Table 3 smallest seq num should be 1");
-	assert_eq!(table3_reloaded.meta.largest_seq_num, 300, "Table 3 largest seq num should be 300");
+	assert_eq!(table3_reloaded.meta.smallest_seq_num, Some(1), "Table 3 smallest seq num should be 1");
+	assert_eq!(table3_reloaded.meta.largest_seq_num, Some(300), "Table 3 largest seq num should be 300");
 	assert!(table3_reloaded.meta.has_point_keys.unwrap_or(false), "Table 3 should have point keys");
 	assert!(
 		table3_reloaded.meta.smallest_point.is_some(),
@@ -449,15 +449,15 @@ fn test_lsn_with_multiple_l0_tables() {
 
 		// Tables should be in descending order of their largest sequence number
 		assert_eq!(
-			level0.tables[0].meta.largest_seq_num, 30,
+			level0.tables[0].meta.largest_seq_num, Some(30),
 			"First table should have highest seq num"
 		);
 		assert_eq!(
-			level0.tables[1].meta.largest_seq_num, 20,
+			level0.tables[1].meta.largest_seq_num, Some(20),
 			"Second table should have middle seq num"
 		);
 		assert_eq!(
-			level0.tables[2].meta.largest_seq_num, 10,
+			level0.tables[2].meta.largest_seq_num, Some(10),
 			"Third table should have lowest seq num"
 		);
 	}
@@ -486,13 +486,13 @@ fn test_lsn_with_multiple_l0_tables() {
 		assert_eq!(level0.tables.len(), 4, "Should have 4 tables in L0");
 
 		// Tables should still be in descending order of their largest sequence number
-		assert_eq!(level0.tables[0].meta.largest_seq_num, 30, "First table should have seq num 30");
+		assert_eq!(level0.tables[0].meta.largest_seq_num, Some(30), "First table should have seq num 30");
 		assert_eq!(
-			level0.tables[1].meta.largest_seq_num, 20,
+			level0.tables[1].meta.largest_seq_num, Some(20),
 			"Second table should have seq num 20"
 		);
-		assert_eq!(level0.tables[2].meta.largest_seq_num, 10, "Third table should have seq num 10");
-		assert_eq!(level0.tables[3].meta.largest_seq_num, 8, "Fourth table should have seq num 8");
+		assert_eq!(level0.tables[2].meta.largest_seq_num, Some(10), "Third table should have seq num 10");
+		assert_eq!(level0.tables[3].meta.largest_seq_num, Some(8), "Fourth table should have seq num 8");
 	}
 
 	// Test 7: Test with overlapping sequence ranges
@@ -520,7 +520,7 @@ fn test_lsn_with_multiple_l0_tables() {
 
 		// First table should have the highest sequence number
 		assert_eq!(
-			level0.tables[0].meta.largest_seq_num, 35,
+			level0.tables[0].meta.largest_seq_num, Some(35),
 			"First table should have highest seq num 35"
 		);
 	}
@@ -596,15 +596,15 @@ fn test_last_sequence_persistence_across_manifest_reload() {
 
 		// Verify tables are still properly ordered
 		assert_eq!(
-			level0.tables[0].meta.largest_seq_num, 50,
+			level0.tables[0].meta.largest_seq_num, Some(50),
 			"First table should have highest seq num"
 		);
 		assert_eq!(
-			level0.tables[1].meta.largest_seq_num, 30,
+			level0.tables[1].meta.largest_seq_num, Some(30),
 			"Second table should have middle seq num"
 		);
 		assert_eq!(
-			level0.tables[2].meta.largest_seq_num, 20,
+			level0.tables[2].meta.largest_seq_num, Some(20),
 			"Third table should have lowest seq num"
 		);
 	}

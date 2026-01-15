@@ -271,7 +271,7 @@ impl LevelManifest {
 		let computed_max_seq = levels_vec
 			.iter()
 			.flat_map(|level| level.tables.iter())
-			.map(|table| table.meta.largest_seq_num)
+			.filter_map(|table| table.meta.largest_seq_num)
 			.max()
 			.unwrap_or(0);
 
@@ -298,11 +298,14 @@ impl LevelManifest {
 		// Basic sanity check for all tables
 		for table in tables {
 			// Ensure smallest_seq_num is not greater than largest_seq_num
-			if table.meta.smallest_seq_num > table.meta.largest_seq_num {
-				return Err(Error::LoadManifestFail(format!(
-					"Table {} has invalid sequence numbers: smallest({}) > largest({})",
-					table.id, table.meta.smallest_seq_num, table.meta.largest_seq_num
-				)));
+			match (table.meta.smallest_seq_num, table.meta.largest_seq_num) {
+				(Some(smallest), Some(largest)) if smallest > largest => {
+					return Err(Error::LoadManifestFail(format!(
+						"Table {} has invalid sequence numbers: smallest({}) > largest({})",
+						table.id, smallest, largest
+					)));
+				}
+				_ => {}
 			}
 		}
 
@@ -313,13 +316,17 @@ impl LevelManifest {
 				let next = &tables[i + 1];
 
 				// Check if sequence numbers maintain continuity
-				if next.meta.smallest_seq_num <= current.meta.largest_seq_num {
-					return Err(Error::LoadManifestFail(format!(
-						"Level {} tables have overlapping sequence numbers: Table {} ({}-{}) and Table {} ({}-{})",
-						level_idx,
-						current.id, current.meta.smallest_seq_num, current.meta.largest_seq_num,
-						next.id, next.meta.smallest_seq_num, next.meta.largest_seq_num
-					)));
+				if let (Some(next_smallest), Some(current_largest)) =
+					(next.meta.smallest_seq_num, current.meta.largest_seq_num)
+				{
+					if next_smallest <= current_largest {
+						return Err(Error::LoadManifestFail(format!(
+							"Level {} tables have overlapping sequence numbers: Table {} ({:?}-{:?}) and Table {} ({:?}-{:?})",
+							level_idx,
+							current.id, current.meta.smallest_seq_num, current.meta.largest_seq_num,
+							next.id, next.meta.smallest_seq_num, next.meta.largest_seq_num
+						)));
+					}
 				}
 			}
 		}
@@ -434,8 +441,10 @@ impl LevelManifest {
 			}
 
 			// Update last_sequence if this table has a higher sequence number
-			if table.meta.largest_seq_num > self.last_sequence {
-				self.last_sequence = table.meta.largest_seq_num;
+			if let Some(largest) = table.meta.largest_seq_num {
+				if largest > self.last_sequence {
+					self.last_sequence = largest;
+				}
 			}
 		}
 

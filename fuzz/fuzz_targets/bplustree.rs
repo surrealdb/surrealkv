@@ -105,7 +105,7 @@ fuzz_target!(|data: FuzzInput| {
             Operation::Insert { key_idx, value_size } => {
                 let key_idx = (*key_idx as usize) % keys.len();
                 let key = &keys[key_idx];
-                
+
                 // Value size: 0 to 64KB (tests both inline and overflow storage)
                 let size = (*value_size as usize) % 65536;
                 let value = make_data(&data.value_seed, size);
@@ -114,7 +114,9 @@ fuzz_target!(|data: FuzzInput| {
                     Ok(()) => {
                         expected.insert(key.clone(), value);
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        panic!("Insert failed for key len={}: {:?}", key.len(), e);
+                    }
                 }
             }
 
@@ -140,7 +142,9 @@ fuzz_target!(|data: FuzzInput| {
                             }
                         }
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        panic!("Get failed for key len={}: {:?}", key.len(), e);
+                    }
                 }
             }
 
@@ -160,7 +164,9 @@ fuzz_target!(|data: FuzzInput| {
                             }
                         }
                     }
-                    Err(_) => {}
+                    Err(e) => {
+                        panic!("Delete failed for key len={}: {:?}", key.len(), e);
+                    }
                 }
             }
         }

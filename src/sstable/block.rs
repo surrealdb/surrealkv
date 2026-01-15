@@ -314,7 +314,7 @@ impl BlockWriter {
 	}
 
 	// Estimates the current size of the block
-	pub(crate) fn size_estimate(&self) -> usize {
+	pub fn size_estimate(&self) -> usize {
 		self.buffer.len() + self.restart_points.len() * 4 + 4
 	}
 
@@ -503,7 +503,7 @@ impl BlockIterator {
 		Ok(())
 	}
 
-	pub(crate) fn reset(&mut self) {
+	pub fn reset(&mut self) {
 		self.offset = 0;
 		self.current_restart_index = 0;
 		self.current_key.clear();

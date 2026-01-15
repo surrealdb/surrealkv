@@ -115,7 +115,7 @@ impl InternalKey {
 		self.user_key.len() + 16 // 8 bytes for timestamp + 8 bytes for trailer
 	}
 
-	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
+	pub fn decode(encoded_key: &[u8]) -> Self {
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
 		let trailer = read_u64_be(encoded_key, n);
 		let timestamp = read_u64_be(encoded_key, n + 8);

@@ -23,6 +23,21 @@ doc = false
 bench = false
 
 [[bin]]
+name = "block_prefix"
+path = "fuzz_targets/block_prefix.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "block_restart_boundary"
+path = "fuzz_targets/block_restart_boundary.rs"
+test = false
+doc = false
+bench = false
+
+
+[[bin]]
 name = "block_iterator"
 path = "fuzz_targets/block_iterator.rs"
 test = false
@@ -37,6 +52,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "index_roundtrip"
+path = "fuzz_targets/index_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "table_roundtrip"
 path = "fuzz_targets/table_roundtrip.rs"
 test = false
@@ -44,11 +66,26 @@ doc = false
 bench = false
 
 [[bin]]
-name = "table_iterator"
-path = "fuzz_targets/table_iterator.rs"
+name = "table_seek"
+path = "fuzz_targets/table_seek.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "table_mvcc"
+path = "fuzz_targets/table_mvcc.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "table_range"
+path = "fuzz_targets/table_range.rs"
+test = false
+doc = false
+bench = false
+
 
 [[bin]]
 name = "bloom_filter"
