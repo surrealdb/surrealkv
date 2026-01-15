@@ -3536,3 +3536,48 @@ mod version_tests {
 		assert_eq!(txn.get(b"key1").unwrap().unwrap().as_slice(), b"final_set_with_delete_value1");
 	}
 }
+
+// ============================================================================
+// Test: Versions survive memtable flush (bug detector)
+// This test catches the bug where versioning=false in memtable flush
+// causes older versions to be dropped.
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_survives_memtable_flush() {
+	let temp_dir = create_temp_directory();
+	let opts = Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
+	let store = TreeBuilder::with_options(opts).build().unwrap();
+
+	// Insert key1 three times with different values
+	for i in 1..=3 {
+		let mut tx = store.begin().unwrap();
+		let value = format!("v{i}");
+		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Verify all 3 versions exist in memtable BEFORE flush
+	{
+		let tx = store.begin().unwrap();
+		let results = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
+		assert_eq!(results.len(), 3, "Should have 3 versions before flush");
+		assert_eq!(results[0].1, b"v1");
+		assert_eq!(results[1].1, b"v2");
+		assert_eq!(results[2].1, b"v3");
+	}
+
+	// FORCE MEMTABLE FLUSH - this is where versions get dropped with the bug!
+	store.flush().unwrap();
+
+	// Query versions AFTER flush - this is the critical test
+	let tx = store.begin().unwrap();
+	let results = tx.scan_all_versions(b"key1", b"key2", None).unwrap();
+
+	// BUG: With versioning=false in flush, only 1 version survives
+	// EXPECTED: All 3 versions should survive
+	assert_eq!(results.len(), 3, "All 3 versions should survive memtable flush");
+	assert_eq!(results[0].1, b"v1");
+	assert_eq!(results[1].1, b"v2");
+	assert_eq!(results[2].1, b"v3");
+}
