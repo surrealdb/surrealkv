@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::comparator::Comparator;
 use crate::error::{Error, Result};
-use crate::sstable::block::{Block, BlockData, BlockHandle, BlockWriter};
+use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
 use crate::sstable::error::SSTableError;
 use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
 use crate::vfs::File;
@@ -183,8 +183,6 @@ pub(crate) struct TopLevelIndex {
 	pub(crate) id: u64,
 	pub(crate) opts: Arc<Options>,
 	pub(crate) blocks: Vec<BlockHandleWithKey>,
-	// TODO: Fix this, as this could be problematic if the file is being shared across without any
-	// mutex
 	pub(crate) file: Arc<dyn File>,
 }
 
@@ -267,26 +265,14 @@ impl TopLevelIndex {
 
 		Ok(block)
 	}
-
-	pub(crate) fn get(&self, target: &[u8]) -> Result<Arc<Block>> {
-		match self.find_block_handle_by_key(target)? {
-			Some((_index, block_handle)) => {
-				let block = self.load_block(block_handle)?;
-				Ok(block)
-			}
-			None => Err(Error::BlockNotFound),
-		}
-	}
 }
-
-use crate::sstable::block::BlockIterator;
 
 /// Iterates over ALL partition index entries across all partition blocks.
 /// This flattens the two-level partition structure (blocks[] + entries within each block)
 /// into a single iterator that can be used as the first level of TwoLevelIterator.
 pub(crate) struct PartitionedIndexIterator<'a> {
 	index: &'a TopLevelIndex,
-	/// Current partition block index (index into blocks[])
+	/// Current partition block index
 	partition_index: usize,
 	/// Iterator within the current partition block
 	partition_iter: Option<BlockIterator>,
@@ -375,7 +361,11 @@ impl<'a> PartitionedIndexIterator<'a> {
 	pub(crate) fn seek(&mut self, target: &[u8]) -> Result<()> {
 		if self.index.blocks.is_empty() {
 			self.partition_iter = None;
-			return Ok(());
+			let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex {
+				table_id: self.index.id,
+			});
+			log::error!("[INDEX] {}", err);
+			return Err(err);
 		}
 
 		// Use find_block_handle_by_key to locate the right partition

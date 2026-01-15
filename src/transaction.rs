@@ -100,8 +100,6 @@ impl WriteOptions {
 /// like get(), range(), and keys().
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReadOptions {
-	/// Whether to return only keys without values (for range operations)
-	pub(crate) keys_only: bool,
 	/// Lower bound for iteration (inclusive), None means unbounded
 	pub(crate) lower_bound: Option<Vec<u8>>,
 	/// Upper bound for iteration (exclusive), None means unbounded
@@ -115,12 +113,6 @@ impl ReadOptions {
 	/// Creates a new ReadOptions with default values
 	pub fn new() -> Self {
 		Self::default()
-	}
-
-	/// Sets whether to return only keys without values
-	pub fn with_keys_only(mut self, keys_only: bool) -> Self {
-		self.keys_only = keys_only;
-		self
 	}
 
 	pub fn set_iterate_lower_bound(&mut self, bound: Option<Vec<u8>>) {
@@ -497,116 +489,6 @@ impl Transaction {
 		}
 	}
 
-	/// Counts keys in a range at the current timestamp.
-	///
-	/// Returns the number of valid (non-deleted) keys in the range [start,
-	/// end). The range is inclusive of the start key, but exclusive of the end
-	/// key.
-	///
-	/// This is more efficient than creating an iterator and counting manually,
-	/// as it doesn't need to allocate or return the actual keys.
-	pub fn count<K>(&self, start: K, end: K) -> Result<usize>
-	where
-		K: IntoBytes,
-	{
-		let mut options = ReadOptions::default();
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.count_with_options(&options)
-	}
-
-	/// Counts keys in a range at a specific timestamp.
-	///
-	/// Returns the number of valid (non-deleted) keys in the range [start, end)
-	/// as they existed at the specified timestamp.
-	/// The range is inclusive of the start key, but exclusive of the end key.
-	///
-	/// This requires versioning to be enabled in the database options.
-	pub fn count_at_version<K>(&self, start: K, end: K, timestamp: u64) -> Result<usize>
-	where
-		K: IntoBytes,
-	{
-		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.count_with_options(&options)
-	}
-
-	/// Counts keys with custom read options.
-	///
-	/// Returns the number of valid (non-deleted) keys that match the provided
-	/// options. The options can specify:
-	/// - Key range bounds (iterate_lower_bound, iterate_upper_bound)
-	/// - Timestamp for versioned queries
-	///
-	/// For versioned queries (when timestamp is specified), this requires
-	/// versioning to be enabled in the database options.
-	///
-	/// This method is optimized to avoid creating full iterators and resolving
-	/// values from the value log, making it much faster than manually counting
-	/// iterator results.
-	pub fn count_with_options(&self, options: &ReadOptions) -> Result<usize> {
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// For versioned queries, use the keys iterator approach
-		// (versioned index has different structure)
-		if let Some(timestamp) = options.timestamp {
-			if !self.core.opts.enable_versioning {
-				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-			}
-
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
-			let keys_iter = self.keys_at_version(start_key, end_key, timestamp)?;
-			return Ok(keys_iter.count());
-		}
-
-		// Fast path: get count from snapshot without creating iterators
-		let mut count = match &self.snapshot {
-			Some(snapshot) => {
-				let lower = options.lower_bound.as_deref();
-				let upper = options.upper_bound.as_deref();
-				snapshot.count_in_range(lower, upper)?
-			}
-			None => return Err(Error::NoSnapshot),
-		};
-
-		// Apply write-set adjustments for uncommitted changes in this transaction
-		for (key, entries) in &self.write_set {
-			// Check if key is in range
-			let in_range = {
-				let lower_ok =
-					options.lower_bound.as_ref().is_none_or(|k| key.as_slice() >= k.as_slice());
-				let upper_ok =
-					options.upper_bound.as_ref().is_none_or(|k| key.as_slice() < k.as_slice());
-				lower_ok && upper_ok
-			};
-			if in_range {
-				if let Some(latest_entry) = entries.last() {
-					// Check what the key's state was in the snapshot
-					let snapshot_had_key =
-						self.snapshot.as_ref().unwrap().get(key.as_ref())?.is_some();
-
-					// Determine current state from write-set
-					let write_set_has_key = !latest_entry.is_tombstone();
-
-					// Adjust count based on state transition
-					match (snapshot_had_key, write_set_has_key) {
-						(false, true) => count += 1,                      // New key added
-						(true, false) => count = count.saturating_sub(1), // Key deleted
-						_ => {}                                           /* No change (update
-						                                                    * or still deleted) */
-					}
-				}
-			}
-		}
-
-		Ok(count)
-	}
-
 	/// Gets keys in a key range at a specific timestamp.
 	///
 	/// The returned iterator is a double ended iterator
@@ -627,28 +509,9 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
-		let mut options =
-			ReadOptions::default().with_keys_only(true).with_timestamp(Some(timestamp));
+		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
 		self.keys_at_version_with_options(&options)
-	}
-
-	/// Gets keys in a key range, with custom read options.
-	///
-	/// Returns a cursor-based iterator with explicit seek/next/prev methods.
-	///
-	/// The iterator iterates over all keys in the range,
-	/// inclusive of the start key, but not the end key.
-	///
-	/// This function is faster than `range()` as it doesn't
-	/// fetch or resolve values from disk.
-	pub fn keys_with_options(&self, options: &ReadOptions) -> Result<TransactionIterator<'_>> {
-		// Force keys_only to true for this method
-		let options = options.clone().with_keys_only(true);
-		let start_key = options.lower_bound.clone().unwrap_or_default();
-		let end_key = options.upper_bound.clone().unwrap_or_default();
-		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key)?;
-		Ok(TransactionIterator::new(inner, Arc::clone(&self.core)))
 	}
 
 	pub fn keys_at_version_with_options(
@@ -706,6 +569,19 @@ impl Transaction {
 		self.range_with_options(&options)
 	}
 
+	/// Gets keys and values in a range, with custom read options.
+	///
+	/// Returns a cursor-based iterator with explicit seek/next/prev methods.
+	///
+	/// The iterator iterates over all keys and values in the
+	/// range, inclusive of the start key, but not the end key.
+	pub fn range_with_options(&self, options: &ReadOptions) -> Result<TransactionIterator<'_>> {
+		let start_key = options.lower_bound.clone().unwrap_or_default();
+		let end_key = options.upper_bound.clone().unwrap_or_default();
+		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key)?;
+		Ok(TransactionIterator::new(inner, Arc::clone(&self.core)))
+	}
+
 	/// Gets keys and values in a range, at a specific timestamp.
 	///
 	/// The returned iterator is a double ended iterator
@@ -726,19 +602,6 @@ impl Transaction {
 		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
 		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
 		self.range_at_version_with_options(&options)
-	}
-
-	/// Gets keys and values in a range, with custom read options.
-	///
-	/// Returns a cursor-based iterator with explicit seek/next/prev methods.
-	///
-	/// The iterator iterates over all keys and values in the
-	/// range, inclusive of the start key, but not the end key.
-	pub fn range_with_options(&self, options: &ReadOptions) -> Result<TransactionIterator<'_>> {
-		let start_key = options.lower_bound.clone().unwrap_or_default();
-		let end_key = options.upper_bound.clone().unwrap_or_default();
-		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key)?;
-		Ok(TransactionIterator::new(inner, Arc::clone(&self.core)))
 	}
 
 	pub fn range_at_version_with_options(

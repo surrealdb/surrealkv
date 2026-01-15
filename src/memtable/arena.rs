@@ -16,12 +16,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum arena size (u32::MAX to fit in offset)
-pub const MAX_ARENA_SIZE: usize = u32::MAX as usize;
+pub(crate) const MAX_ARENA_SIZE: usize = u32::MAX as usize;
 
-pub struct Arena {
+pub(crate) struct Arena {
 	/// Current allocation offset (atomically incremented)
 	n: AtomicU64,
-	/// Pre-allocated buffer - pub(crate) for direct access in hot paths
+	/// Pre-allocated buffer
 	pub(crate) buf: Box<[u8]>,
 }
 
@@ -30,8 +30,7 @@ unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
-	/// Create a new arena with the given capacity.
-	pub fn new(capacity: usize) -> Self {
+	pub(crate) fn new(capacity: usize) -> Self {
 		let capacity = capacity.min(MAX_ARENA_SIZE);
 		let buf = vec![0u8; capacity].into_boxed_slice();
 
@@ -43,7 +42,7 @@ impl Arena {
 	}
 
 	/// Returns the number of bytes allocated.
-	pub fn size(&self) -> usize {
+	pub(crate) fn size(&self) -> usize {
 		let s = self.n.load(Ordering::Relaxed);
 		if s > self.buf.len() as u64 {
 			// Saturate at capacity if last allocation failed
@@ -59,7 +58,7 @@ impl Arena {
 	/// the arena (used for truncated node structures).
 	///
 	/// Returns the offset, or None if arena is full.
-	pub fn alloc(&self, size: u32, alignment: u32, overflow: u32) -> Option<u32> {
+	pub(crate) fn alloc(&self, size: u32, alignment: u32, overflow: u32) -> Option<u32> {
 		debug_assert!(alignment.is_power_of_two());
 
 		// Check if already full
@@ -83,7 +82,7 @@ impl Arena {
 
 	/// Get a byte slice from the arena by offset.
 	#[inline]
-	pub fn get_bytes(&self, offset: u32, size: u32) -> &[u8] {
+	pub(crate) fn get_bytes(&self, offset: u32, size: u32) -> &[u8] {
 		if offset == 0 {
 			return &[];
 		}
@@ -95,7 +94,7 @@ impl Arena {
 	/// # Safety
 	/// Caller must ensure no other references to this region exist.
 	#[inline]
-	pub unsafe fn get_bytes_mut(&self, offset: u32, size: u32) -> &mut [u8] {
+	pub(crate) unsafe fn get_bytes_mut(&self, offset: u32, size: u32) -> &mut [u8] {
 		if offset == 0 {
 			return &mut [];
 		}
@@ -105,7 +104,7 @@ impl Arena {
 
 	/// Convert offset to raw pointer.
 	#[inline]
-	pub fn get_pointer(&self, offset: u32) -> *mut u8 {
+	pub(crate) fn get_pointer(&self, offset: u32) -> *mut u8 {
 		if offset == 0 {
 			std::ptr::null_mut()
 		} else {
@@ -115,7 +114,7 @@ impl Arena {
 
 	/// Convert raw pointer back to offset.
 	#[inline]
-	pub fn get_pointer_offset(&self, ptr: *const u8) -> u32 {
+	pub(crate) fn get_pointer_offset(&self, ptr: *const u8) -> u32 {
 		if ptr.is_null() {
 			0
 		} else {

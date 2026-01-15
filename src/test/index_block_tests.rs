@@ -7,7 +7,7 @@ use crate::sstable::block::BlockHandle;
 use crate::sstable::index_block::{BlockHandleWithKey, TopLevelIndex, TopLevelIndexWriter};
 use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind};
 use crate::vfs::File;
-use crate::{CompressionType, Error, Options};
+use crate::{CompressionType, Options};
 
 fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 	Arc::new(src)
@@ -157,69 +157,6 @@ fn test_find_block_handle_by_key() {
 			}
 			None => assert!(result.is_none(), "Expected None for key {key:?}, but got Some"),
 		}
-	}
-}
-
-#[test]
-fn test_partitioned_index_lookup() {
-	let opts = Arc::new(Options::default());
-	let max_block_size = 50; // Small size to force multiple partitions
-	let mut writer = TopLevelIndexWriter::new(Arc::clone(&opts), max_block_size);
-
-	// Add enough entries to create multiple partitions
-	let entries = vec![
-		("key_001", "handle_001"),
-		("key_002", "handle_002"),
-		("key_003", "handle_003"),
-		("key_004", "handle_004"),
-		("key_005", "handle_005"),
-		("key_006", "handle_006"),
-		("key_007", "handle_007"),
-		("key_008", "handle_008"),
-		("key_009", "handle_009"),
-		("key_010", "handle_010"),
-	];
-
-	for (key, handle) in &entries {
-		let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
-		writer.add(&internal_key, handle.as_bytes()).unwrap();
-	}
-
-	// Write to buffer
-	let mut buffer = Vec::new();
-	let (top_level_handle, _) = writer.finish(&mut buffer, CompressionType::None, 0).unwrap();
-
-	// Now read it back
-	let file = wrap_buffer(buffer);
-	let index = TopLevelIndex::new(0, opts, file, &top_level_handle).unwrap();
-
-	// Test lookups for various keys using encoded internal keys
-	for (key, _) in &entries {
-		let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
-		let block = index.get(&internal_key).unwrap();
-		assert!(block.size() > 0, "Block should not be empty for key {key}");
-
-		// Verify the block contains the expected handle by checking if we can find it
-		let mut block_iter = block.iter().unwrap();
-		block_iter.seek(&internal_key).unwrap();
-		assert!(block_iter.valid(), "Block iterator should be valid for key {key}");
-	}
-
-	// Test lookup for non-existent key before range
-	let key_before = create_internal_key(b"key_000".to_vec(), 1);
-	let block = index.get(&key_before).unwrap();
-	assert!(block.size() > 0, "Should find first block for key before range");
-
-	// Test lookup for non-existent key after range
-	let key_after = create_internal_key(b"key_999".to_vec(), 1);
-	match index.get(&key_after) {
-		Ok(_) => {
-			// This is acceptable - might find the last block
-		}
-		Err(Error::BlockNotFound) => {
-			// This is also acceptable for keys completely out of range
-		}
-		Err(e) => panic!("Unexpected error for key after range: {e:?}"),
 	}
 }
 
