@@ -7,10 +7,10 @@ use crate::sstable::InternalKey;
 use crate::{CompressionType, Result};
 
 #[derive(Debug, Clone)]
-pub(crate) struct Properties {
+pub struct Properties {
 	pub(crate) id: u64,
 	pub(crate) table_format: TableFormat,
-	pub(crate) num_entries: u64,
+	pub num_entries: u64,
 	pub(crate) num_deletions: u64,
 	pub(crate) data_size: u64,
 	pub(crate) global_seq_num: u64,
@@ -170,12 +170,12 @@ impl Properties {
 
 #[derive(Debug, Clone)]
 pub struct TableMetadata {
-	pub(crate) has_point_keys: Option<bool>,
-	pub(crate) smallest_seq_num: Option<u64>,
-	pub(crate) largest_seq_num: Option<u64>,
-	pub(crate) properties: Properties,
-	pub(crate) smallest_point: Option<InternalKey>,
-	pub(crate) largest_point: Option<InternalKey>,
+	pub has_point_keys: Option<bool>,
+	pub smallest_seq_num: Option<u64>,
+	pub largest_seq_num: Option<u64>,
+	pub properties: Properties,
+	pub smallest_point: Option<InternalKey>,
+	pub largest_point: Option<InternalKey>,
 }
 
 impl TableMetadata {

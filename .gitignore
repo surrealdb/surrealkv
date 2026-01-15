@@ -51,12 +51,15 @@ surreal
 history.txt
 test_data/
 crud-bench/
-fuzz/
 
 
 # Added by cargo
 
 /target
 /.cursor
+
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
 
 
