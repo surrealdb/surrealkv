@@ -1949,6 +1949,7 @@ fn test_table_properties_population() {
 	assert_eq!(props.num_deletions, expected_deletions);
 	assert_eq!(props.tombstone_count, expected_tombstones);
 	assert_eq!(props.data_size, 2975);
+	assert_eq!(props.global_seq_num, 0);
 	assert_eq!(props.num_data_blocks, 1);
 
 	assert_eq!(props.index_size, 74, "Index size should be tracked");
