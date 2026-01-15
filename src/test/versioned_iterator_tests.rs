@@ -980,3 +980,260 @@ async fn test_versioned_range_with_btree_index() {
 	assert_eq!(results[0].1, b"v2");
 	assert_eq!(results[1].1, b"v1");
 }
+
+// ============================================================================
+// Test: Versions survive memtable flush (bug detector)
+// This test catches the bug where versioning=false in memtable flush
+// causes older versions to be dropped.
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_survives_memtable_flush() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 three times with different values
+	for i in 1..=3 {
+		let mut tx = store.begin().unwrap();
+		let value = format!("v{i}");
+		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Verify all 3 versions exist in memtable BEFORE flush
+	{
+		let tx = store.begin().unwrap();
+		let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+		let results = collect_versioned_all(&mut iter).unwrap();
+		assert_eq!(results.len(), 3, "Should have 3 versions before flush");
+	}
+
+	// FORCE MEMTABLE FLUSH - this is where versions get dropped with the bug!
+	store.flush().unwrap();
+
+	// Query versions AFTER flush - this is the critical test
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// BUG: With versioning=false in flush, only 1 version survives
+	// EXPECTED: All 3 versions should survive
+	assert_eq!(results.len(), 3, "All 3 versions should survive memtable flush");
+	assert_eq!(results[0].1, b"v3");
+	assert_eq!(results[1].1, b"v2");
+	assert_eq!(results[2].1, b"v1");
+}
+
+// ============================================================================
+// Test: Replace operation cuts off older versions (even with versioning)
+// This is the expected behavior - Replace is a "destructive" operation
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_replace_cuts_off_history_with_versioning() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 with SET operations
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"set_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"set_v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Now use REPLACE - this should cut off the history
+	{
+		let mut tx = store.begin().unwrap();
+		tx.replace_with_options(
+			b"key1",
+			b"replace_v3",
+			&crate::WriteOptions::default().with_timestamp(Some(300)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Before flush - all versions in memtable
+	{
+		let tx = store.begin().unwrap();
+		let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+		let results = collect_versioned_all(&mut iter).unwrap();
+		// In memtable, all versions are still visible
+		assert_eq!(results.len(), 3, "Before flush: all 3 versions visible in memtable");
+	}
+
+	// Force flush - CompactionIterator should apply Replace semantics
+	store.flush().unwrap();
+
+	// After flush - Replace should have cut off older SETs
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// Replace cuts off history - only the Replace version survives
+	assert_eq!(results.len(), 1, "After flush: only Replace version survives");
+	assert_eq!(results[0].1, b"replace_v3");
+	assert_eq!(results[0].2, 300);
+}
+
+// ============================================================================
+// Test: Multiple Replace operations are all preserved with versioning
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_multiple_replaces_preserved_with_versioning() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert with SET first
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"set_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Multiple Replace operations
+	{
+		let mut tx = store.begin().unwrap();
+		tx.replace_with_options(
+			b"key1",
+			b"replace_v2",
+			&crate::WriteOptions::default().with_timestamp(Some(200)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.replace_with_options(
+			b"key1",
+			b"replace_v3",
+			&crate::WriteOptions::default().with_timestamp(Some(300)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.replace_with_options(
+			b"key1",
+			b"replace_v4",
+			&crate::WriteOptions::default().with_timestamp(Some(400)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Force flush
+	store.flush().unwrap();
+
+	// After flush - all Replace versions should survive, but not the original SET
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// All Replace versions are kept (they are valid versions themselves)
+	// Only the initial SET is discarded
+	assert_eq!(results.len(), 3, "All 3 Replace versions should survive");
+	assert_eq!(results[0].1, b"replace_v4");
+	assert_eq!(results[1].1, b"replace_v3");
+	assert_eq!(results[2].1, b"replace_v2");
+}
+
+// ============================================================================
+// Test: Replace after Delete with versioning
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_replace_after_delete_with_versioning() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"set_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Delete key1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.delete(b"key1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Replace key1 (after delete)
+	{
+		let mut tx = store.begin().unwrap();
+		tx.replace_with_options(
+			b"key1",
+			b"replace_v3",
+			&crate::WriteOptions::default().with_timestamp(Some(300)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Force flush
+	store.flush().unwrap();
+
+	// After flush - Replace should survive
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// The Replace should survive (it's the latest non-tombstone)
+	assert_eq!(results.len(), 1, "Replace should survive after flush");
+	assert_eq!(results[0].1, b"replace_v3");
+}
+
+// ============================================================================
+// Test: Versions survive compaction (L0 -> L1)
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versions_survive_compaction() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 with multiple versions
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		let value = format!("v{i}");
+		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// First flush (memtable -> L0)
+	store.flush().unwrap();
+
+	// Verify versions after first flush
+	{
+		let tx = store.begin().unwrap();
+		let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+		let results = collect_versioned_all(&mut iter).unwrap();
+		assert_eq!(results.len(), 5, "All 5 versions should survive L0 flush");
+	}
+
+	// Insert more versions to trigger another flush
+	for i in 6..=10 {
+		let mut tx = store.begin().unwrap();
+		let value = format!("v{i}");
+		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Second flush
+	store.flush().unwrap();
+
+	// Verify all 10 versions exist across L0 files
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 10, "All 10 versions should survive multiple flushes");
+	// Verify order (newest first)
+	assert_eq!(results[0].1, b"v10");
+	assert_eq!(results[9].1, b"v1");
+}
