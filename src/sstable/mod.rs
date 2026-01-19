@@ -287,9 +287,6 @@ impl std::fmt::Debug for InternalKeyRef<'_> {
 use crate::error::Result;
 
 /// Cursor-based iterator for internal key-value pairs.
-/// Replaces Iterator/DoubleEndedIterator with explicit seek/next/prev.
-/// This trait enables zero-allocation iteration by returning references
-/// to data owned by the iterator's underlying storage.
 pub(crate) trait InternalIterator {
 	/// Seek to first key >= target. Returns Ok(true) if valid.
 	/// Target is an encoded internal key.

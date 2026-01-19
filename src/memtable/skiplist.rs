@@ -481,7 +481,6 @@ impl Skiplist {
 					break;
 				}
 
-				// Direct key access - NO PARSING
 				let next_key = unsafe { (*next).get_key_bytes(&self.arena) };
 				let cmp = (self.cmp)(key, next_key);
 
@@ -525,7 +524,6 @@ impl Skiplist {
 				return (prev, next, false);
 			}
 
-			// Direct key access - NO PARSING
 			let next_key = unsafe { (*next).get_key_bytes(&self.arena) };
 			let cmp = (self.cmp)(key, next_key);
 
@@ -556,7 +554,6 @@ impl Skiplist {
 			return false;
 		}
 
-		// Direct key access - NO PARSING
 		let nd_key = unsafe { (*nd).get_key_bytes(&self.arena) };
 		let cmp = (self.cmp)(nd_key, key);
 
