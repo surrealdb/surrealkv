@@ -1,8 +1,8 @@
 use test_log::test;
 
 use crate::batch::{Batch, BATCH_VERSION, MAX_BATCH_SIZE};
-use crate::sstable::InternalKeyKind;
 use crate::vlog::ValuePointer;
+use crate::InternalKeyKind;
 
 #[test]
 fn test_batch_new() {

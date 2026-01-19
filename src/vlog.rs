@@ -14,8 +14,17 @@ use crate::bplustree::tree::DiskBPlusTree;
 use crate::commit::CommitPipeline;
 use crate::discard::DiscardStats;
 use crate::error::{Error, Result};
-use crate::sstable::InternalKey;
-use crate::{vfs, CompressionType, Options, Tree, TreeBuilder, VLogChecksumLevel, Value};
+use crate::{
+	vfs,
+	CompressionType,
+	InternalKey,
+	InternalKeyKind,
+	Options,
+	Tree,
+	TreeBuilder,
+	VLogChecksumLevel,
+	Value,
+};
 
 /// VLog format version
 pub const VLOG_FORMAT_VERSION: u16 = 1;
@@ -1473,7 +1482,7 @@ impl DeleteList {
 			let seq_key = seq_num.to_be_bytes().to_vec();
 			// Store sequence number -> value_size mapping
 			batch.add_record(
-				crate::sstable::InternalKeyKind::Set,
+				InternalKeyKind::Set,
 				seq_key,
 				Some(value_size.to_be_bytes().to_vec()),
 				0,
@@ -1517,7 +1526,7 @@ impl DeleteList {
 		for seq_num in seq_nums {
 			// Convert sequence number to key format
 			let seq_key = seq_num.to_be_bytes().to_vec();
-			batch.add_record(crate::sstable::InternalKeyKind::Delete, seq_key, None, 0)?;
+			batch.add_record(InternalKeyKind::Delete, seq_key, None, 0)?;
 		}
 
 		// Commit the batch to the LSM tree using sync commit

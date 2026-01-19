@@ -9,8 +9,18 @@ use crate::iter::BoxedInternalIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
-use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind, InternalKeyRef};
-use crate::{Comparator, InternalKeyComparator, InternalKeyRange, IntoBytes, Key, Value};
+use crate::{
+	Comparator,
+	InternalIterator,
+	InternalKey,
+	InternalKeyComparator,
+	InternalKeyKind,
+	InternalKeyRange,
+	InternalKeyRef,
+	IntoBytes,
+	Key,
+	Value,
+};
 
 /// Type alias for version scan results
 pub type VersionScanResult = (Key, Value, u64, bool);

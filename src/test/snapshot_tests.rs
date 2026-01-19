@@ -9,7 +9,6 @@ use crate::levels::{Level, Levels};
 use crate::memtable::MemTable;
 use crate::snapshot::{IterState, KMergeIterator, Snapshot, VersionedRangeQueryParams};
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind};
 use crate::test::{
 	collect_all,
 	collect_snapshot_iter,
@@ -17,7 +16,7 @@ use crate::test::{
 	collect_transaction_all,
 };
 use crate::vfs::File;
-use crate::{Options, Tree, TreeBuilder};
+use crate::{InternalIterator, InternalKey, InternalKeyKind, Options, Tree, TreeBuilder};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()

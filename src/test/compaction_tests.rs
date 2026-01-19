@@ -16,9 +16,8 @@ use crate::iter::CompactionIterator;
 use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
 use crate::memtable::ImmutableMemtables;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
-use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind};
 use crate::vlog::ValueLocation;
-use crate::{CompressionType, Key, Options, Value};
+use crate::{CompressionType, InternalIterator, InternalKey, InternalKeyKind, Key, Options, Value};
 
 /// Test environment setup helpers
 struct TestEnv {

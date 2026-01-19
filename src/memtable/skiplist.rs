@@ -21,7 +21,7 @@ use rand::Rng;
 
 use crate::error::Result as CrateResult;
 use crate::memtable::arena::Arena;
-use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
+use crate::{InternalIterator, InternalKey, InternalKeyRef};
 
 const MAX_HEIGHT: usize = 20;
 const P_VALUE: f64 = 1.0 / std::f64::consts::E; // ~0.368

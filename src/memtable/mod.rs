@@ -12,9 +12,16 @@ use crate::batch::Batch;
 use crate::error::Result;
 use crate::iter::{BoxedInternalIterator, CompactionIterator};
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
 use crate::vfs::File;
-use crate::{Comparator, Options, Value};
+use crate::{
+	Comparator,
+	InternalIterator,
+	InternalKey,
+	InternalKeyRef,
+	Options,
+	Value,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+};
 
 /// Entry in the immutable memtables list, tracking both the table ID
 /// and the WAL number that contains this memtable's data.
@@ -105,8 +112,6 @@ impl MemTable {
 	}
 
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
-		use crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX;
-
 		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 		let mut iter = self.skiplist.iter();
 		iter.seek_ge(key);

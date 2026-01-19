@@ -386,7 +386,7 @@ mod tests {
 	use test_log::test;
 
 	use super::*;
-	use crate::sstable::InternalKeyKind;
+	use crate::InternalKeyKind;
 
 	struct MockEnv;
 

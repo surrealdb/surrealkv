@@ -7,10 +7,9 @@ use std::sync::Arc;
 
 use crate::batch::Batch;
 use crate::memtable::MemTable;
-use crate::sstable::InternalIterator;
 use crate::wal::manager::Wal;
 use crate::wal::Options;
-use crate::Tree;
+use crate::{InternalIterator, Tree};
 
 pub struct RecoveryTestHelper;
 

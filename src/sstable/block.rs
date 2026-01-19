@@ -5,8 +5,7 @@ use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::error::SSTableError;
-use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
-use crate::{Comparator, InternalKeyComparator};
+use crate::{Comparator, InternalIterator, InternalKey, InternalKeyComparator, InternalKeyRef};
 
 pub(crate) type BlockData = Vec<u8>;
 

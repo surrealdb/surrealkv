@@ -5,9 +5,16 @@ use test_log::test;
 
 use crate::sstable::block::BlockHandle;
 use crate::sstable::index_block::{BlockHandleWithKey, TopLevelIndex, TopLevelIndexWriter};
-use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind};
 use crate::vfs::File;
-use crate::{CompressionType, Options};
+use crate::{
+	CompressionType,
+	InternalIterator,
+	InternalKey,
+	InternalKeyKind,
+	Options,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+	INTERNAL_KEY_TIMESTAMP_MAX,
+};
 
 fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 	Arc::new(src)
@@ -177,9 +184,9 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 	let sep_foo_20 = create_internal_key(b"foo".to_vec(), 20);
 	let sep_g = InternalKey::new(
 		b"g".to_vec(),
-		crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 
@@ -262,23 +269,23 @@ fn test_find_block_handle_by_key_different_user_keys() {
 	// Partition 2: contains "date" keys, separator = (e, MAX)
 	let sep_b = InternalKey::new(
 		b"b".to_vec(),
-		crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 	let sep_d = InternalKey::new(
 		b"d".to_vec(),
-		crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 	let sep_e = InternalKey::new(
 		b"e".to_vec(),
-		crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 
@@ -301,9 +308,9 @@ fn test_find_block_handle_by_key_different_user_keys() {
 		(
 			InternalKey::new(
 				b"b".to_vec(),
-				crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
-				crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+				INTERNAL_KEY_TIMESTAMP_MAX,
 			)
 			.encode(),
 			Some(0),

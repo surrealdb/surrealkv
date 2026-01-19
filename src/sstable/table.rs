@@ -15,23 +15,21 @@ use crate::sstable::error::SSTableError;
 use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
 use crate::sstable::index_block::{PartitionedIndexIterator, TopLevelIndex, TopLevelIndexWriter};
 use crate::sstable::meta::TableMetadata;
-use crate::sstable::{
-	InternalIterator,
-	InternalKey,
-	InternalKeyKind,
-	InternalKeyRef,
-	INTERNAL_KEY_SEQ_NUM_MAX,
-	INTERNAL_KEY_TIMESTAMP_MAX,
-};
 use crate::vfs::File;
 use crate::{
 	Comparator,
 	CompressionType,
 	FilterPolicy,
+	InternalIterator,
+	InternalKey,
 	InternalKeyComparator,
+	InternalKeyKind,
 	InternalKeyRange,
+	InternalKeyRef,
 	Options,
 	Value,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 
 const TABLE_FOOTER_LENGTH: usize = 42; // 2 + 16 + 16 + 8 (format + checksum + meta + index + magic)

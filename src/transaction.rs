@@ -7,8 +7,18 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{MergeDirection, Snapshot, SnapshotIterator};
-use crate::sstable::{InternalIterator, InternalKeyKind, InternalKeyRef};
-use crate::{IntoBytes, Key, KeysResult, RangeResult, Value, Version};
+use crate::{
+	InternalIterator,
+	InternalKey,
+	InternalKeyKind,
+	InternalKeyRef,
+	IntoBytes,
+	Key,
+	KeysResult,
+	RangeResult,
+	Value,
+	Version,
+};
 
 /// `Mode` is an enumeration representing the different modes a transaction can
 /// have in an MVCC (Multi-Version Concurrency Control) system.
@@ -1203,7 +1213,7 @@ impl InternalIterator for TransactionRangeIterator<'_> {
 		self.snapshot_iter.seek(target)?;
 
 		// Binary search in write-set entries
-		let user_key = crate::sstable::InternalKey::user_key_from_encoded(target);
+		let user_key = InternalKey::user_key_from_encoded(target);
 		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < user_key);
 
 		self.position_to_min()

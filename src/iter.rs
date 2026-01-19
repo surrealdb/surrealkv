@@ -4,9 +4,8 @@ use std::sync::Arc;
 
 use crate::clock::LogicalClock;
 use crate::error::Result;
-use crate::sstable::{InternalIterator, InternalKey, InternalKeyRef};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
-use crate::{Comparator, Value};
+use crate::{Comparator, InternalIterator, InternalKey, InternalKeyRef, Value};
 
 /// Boxed internal iterator type for dynamic dispatch
 pub type BoxedInternalIterator<'a> = Box<dyn InternalIterator + 'a>;

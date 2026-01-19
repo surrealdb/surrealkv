@@ -9,8 +9,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind};
-use crate::{CompressionType, Options};
+use crate::{CompressionType, InternalIterator, InternalKey, InternalKeyKind, Options};
 
 // ========== Helper Functions ==========
 

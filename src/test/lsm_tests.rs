@@ -9,7 +9,7 @@ use crate::compaction::leveled::Strategy;
 use crate::levels::LevelManifest;
 use crate::lsm::{CompactionOperations, Core, CoreInner};
 use crate::test::collect_transaction_all;
-use crate::{Error, Key, Options, Tree, TreeBuilder, Value, WalRecoveryMode};
+use crate::{Error, InternalKeyKind, Key, Options, Tree, TreeBuilder, Value, WalRecoveryMode};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -4369,7 +4369,6 @@ async fn test_wal_incremental_number_after_flush_and_reopen() {
 #[test_log::test(tokio::test)]
 async fn test_recovery_with_manually_created_wal_segments() {
 	use crate::batch::Batch;
-	use crate::sstable::InternalKeyKind;
 	use crate::vlog::ValueLocation;
 	use crate::wal::Wal;
 

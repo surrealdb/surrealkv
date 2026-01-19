@@ -20,7 +20,6 @@ use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
 use crate::oracle::Oracle;
 use crate::snapshot::Counter as SnapshotCounter;
 use crate::sstable::table::Table;
-use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_TIMESTAMP_MAX};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction};
 use crate::vlog::{VLog, VLogGCManager, ValueLocation};
@@ -31,11 +30,15 @@ use crate::{
 	Comparator,
 	Error,
 	FilterPolicy,
+	InternalIterator,
+	InternalKey,
+	InternalKeyKind,
 	Options,
 	TimestampComparator,
 	VLogChecksumLevel,
 	Value,
 	WalRecoveryMode,
+	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 
 // ===== Compaction Operations Trait =====
@@ -1057,9 +1060,7 @@ impl Core {
 
 		// Return the last memtable as the active one
 		let (last_memtable, last_wal_number) = memtables.into_iter().last().unwrap();
-		// Count entries using InternalIterator API
 		let entry_count = {
-			use crate::sstable::InternalIterator;
 			let mut iter = last_memtable.iter();
 			let mut count = 0;
 			if iter.seek_first().unwrap_or(false) {

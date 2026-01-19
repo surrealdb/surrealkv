@@ -6,7 +6,6 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::batch::Batch;
-use crate::sstable::InternalIterator;
 use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
@@ -22,6 +21,7 @@ use crate::wal::{
 	RecordType,
 	SegmentRef,
 };
+use crate::InternalIterator;
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()

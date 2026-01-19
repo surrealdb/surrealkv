@@ -6,9 +6,17 @@ use test_log::test;
 use crate::clock::{LogicalClock, MockLogicalClock};
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::iter::CompactionIterator;
-use crate::sstable::{InternalIterator, InternalKey, InternalKeyKind, InternalKeyRef};
 use crate::vlog::{VLog, ValueLocation};
-use crate::{Options, Result, VLogChecksumLevel, Value};
+use crate::{
+	InternalIterator,
+	InternalKey,
+	InternalKeyKind,
+	InternalKeyRef,
+	Options,
+	Result,
+	VLogChecksumLevel,
+	Value,
+};
 
 fn create_internal_key(user_key: &str, sequence: u64, kind: InternalKeyKind) -> InternalKey {
 	InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, 0)

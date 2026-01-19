@@ -5,10 +5,9 @@
 //! coordination.
 
 use crate::snapshot::SnapshotIterator;
-use crate::sstable::{InternalIterator, InternalKey};
 use crate::transaction::TransactionIterator;
 use crate::vlog::ValueLocation;
-use crate::{Key, Result, Value};
+use crate::{InternalIterator, InternalKey, Key, Result, Value};
 
 #[cfg(test)]
 pub mod batch_tests;
