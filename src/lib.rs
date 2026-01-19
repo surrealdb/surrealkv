@@ -5,7 +5,7 @@ mod checkpoint;
 mod clock;
 mod commit;
 mod compaction;
-mod comparator;
+pub mod comparator;
 mod compression;
 mod discard;
 mod error;
@@ -16,10 +16,10 @@ mod lsm;
 mod memtable;
 mod oracle;
 mod snapshot;
-mod sstable;
+pub mod sstable;
 mod task;
 mod transaction;
-mod vfs;
+pub mod vfs;
 mod vlog;
 mod wal;
 
@@ -151,7 +151,7 @@ pub struct Options {
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
-	pub(crate) internal_comparator: Arc<InternalKeyComparator>,
+	pub internal_comparator: Arc<InternalKeyComparator>,
 	pub compression_per_level: Vec<CompressionType>,
 	pub(crate) block_cache: Arc<cache::BlockCache>,
 	pub path: PathBuf,
@@ -588,9 +588,9 @@ pub trait FilterPolicy: Send + Sync {
 use std::ops::Bound;
 
 /// Type alias for InternalKey range bounds
-pub(crate) type InternalKeyRangeBound = Bound<sstable::InternalKey>;
+pub type InternalKeyRangeBound = Bound<sstable::InternalKey>;
 /// Type alias for InternalKey ranges
-pub(crate) type InternalKeyRange = (InternalKeyRangeBound, InternalKeyRangeBound);
+pub type InternalKeyRange = (InternalKeyRangeBound, InternalKeyRangeBound);
 
 /// Converts user key bounds to InternalKeyRange for efficient iteration.
 pub(crate) fn user_range_to_internal_range(

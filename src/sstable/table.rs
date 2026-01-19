@@ -79,7 +79,7 @@ pub(crate) struct Footer {
 }
 
 impl Footer {
-	pub(crate) fn new(metaix: BlockHandle, index: BlockHandle) -> Footer {
+	pub fn new(metaix: BlockHandle, index: BlockHandle) -> Footer {
 		Footer {
 			meta_index: metaix,
 			index,
@@ -171,13 +171,13 @@ impl Footer {
 
 // Defines a writer for constructing and writing table structures to a storage
 // medium.
-pub(crate) struct TableWriter<W: Write> {
+pub struct TableWriter<W: Write> {
 	writer: W,                                 // Underlying writer to write data to.
 	opts: Arc<Options>,                        // Shared table options.
 	compression_selector: CompressionSelector, // Level-aware compression selector.
 	target_level: u8,                          // Target level this SSTable will be written to.
 
-	pub(crate) meta: TableMetadata, // Metadata properties of the table.
+	pub meta: TableMetadata, // Metadata properties of the table.
 
 	offset: usize, // Current offset in the writer where the next write will happen.
 	prev_block_last_key: Vec<u8>, // Last key of the previous block.
@@ -192,7 +192,7 @@ pub(crate) struct TableWriter<W: Write> {
 
 impl<W: Write> TableWriter<W> {
 	// Constructs a new TableWriter with level-specific compression.
-	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
+	pub fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
 		let fb = {
 			if let Some(policy) = opts.filter_policy.clone() {
 				let mut f = FilterBlockWriter::new(Arc::clone(&policy));
@@ -233,7 +233,7 @@ impl<W: Write> TableWriter<W> {
 	}
 
 	// Adds a key-value pair to the table, ensuring keys are in ascending order.
-	pub(crate) fn add(&mut self, key: InternalKey, val: &[u8]) -> Result<()> {
+	pub fn add(&mut self, key: InternalKey, val: &[u8]) -> Result<()> {
 		// Ensure there's a data block to add to.
 		assert!(self.data_block.is_some());
 		let enc_key = key.encode();
@@ -317,7 +317,7 @@ impl<W: Write> TableWriter<W> {
 
 	// Finalizes the table writing process, writing any pending blocks and the
 	// footer.
-	pub(crate) fn finish(mut self) -> Result<usize> {
+	pub fn finish(mut self) -> Result<usize> {
 		// Before finishing, update final properties
 		self.meta.properties.created_at = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
@@ -612,28 +612,23 @@ pub enum IndexType {
 }
 
 #[derive(Clone)]
-pub(crate) struct Table {
+pub struct Table {
 	pub id: u64,
 	pub file: Arc<dyn File>,
 	#[allow(unused)]
 	pub file_size: u64,
 
-	pub(crate) opts: Arc<Options>,  // Shared table options.
-	pub(crate) meta: TableMetadata, // Metadata properties of the table.
+	pub(crate) opts: Arc<Options>, // Shared table options.
+	pub meta: TableMetadata,       // Metadata properties of the table.
 
 	pub(crate) index_block: IndexType,
-	pub(crate) filter_reader: Option<FilterBlockReader>,
+	pub filter_reader: Option<FilterBlockReader>,
 
 	pub(crate) internal_cmp: Arc<InternalKeyComparator>, // Internal key comparator for the table.
 }
 
 impl Table {
-	pub(crate) fn new(
-		id: u64,
-		opts: Arc<Options>,
-		file: Arc<dyn File>,
-		file_size: u64,
-	) -> Result<Table> {
+	pub fn new(id: u64, opts: Arc<Options>, file: Arc<dyn File>, file_size: u64) -> Result<Table> {
 		// Read in the following order:
 		//    1. Footer
 		//    2. [index block]
@@ -740,7 +735,7 @@ impl Table {
 		Ok(b)
 	}
 
-	pub(crate) fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
+	pub fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
 		// CALL ONCE and store
 		let key_encoded = key.encode();
 
@@ -823,7 +818,7 @@ impl Table {
 		}
 	}
 
-	pub(crate) fn iter(
+	pub fn iter(
 		self: &Arc<Self>,
 		keys_only: bool,
 		range: Option<InternalKeyRange>,
@@ -902,7 +897,7 @@ impl Table {
 	}
 }
 
-pub(crate) struct TableIterator {
+pub struct TableIterator {
 	table: Arc<Table>,
 	current_block: Option<BlockIterator>,
 	current_block_off: usize,
@@ -1005,8 +1000,7 @@ impl TableIterator {
 		Err(Error::from(SSTableError::EmptyBlock))
 	}
 
-	#[allow(unused)]
-	pub(crate) fn key(&self) -> InternalKey {
+	pub fn key(&self) -> InternalKey {
 		self.current_block.as_ref().unwrap().key()
 	}
 
@@ -1028,7 +1022,7 @@ impl TableIterator {
 		self.current_block = None;
 	}
 
-	pub(crate) fn prev(&mut self) -> Result<bool> {
+	pub fn prev(&mut self) -> Result<bool> {
 		if let Some(ref mut block) = self.current_block {
 			if block.prev()? {
 				return Ok(true);
@@ -1348,13 +1342,13 @@ impl DoubleEndedIterator for TableIterator {
 }
 
 impl TableIterator {
-	pub(crate) fn valid(&self) -> bool {
+	pub fn valid(&self) -> bool {
 		!self.exhausted
 			&& self.current_block.is_some()
 			&& self.current_block.as_ref().unwrap().valid()
 	}
 
-	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
+	pub fn seek_to_first(&mut self) -> Result<()> {
 		self.reset_partitioned_state();
 
 		// Get the partitioned index
@@ -1398,7 +1392,7 @@ impl TableIterator {
 		}))
 	}
 
-	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
+	pub fn seek_to_last(&mut self) -> Result<()> {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// For partitioned index, go to the last partition
@@ -1447,7 +1441,7 @@ impl TableIterator {
 		}))
 	}
 
-	pub(crate) fn seek(&mut self, target: &[u8]) -> Result<Option<()>> {
+	pub fn seek(&mut self, target: &[u8]) -> Result<Option<()>> {
 		let IndexType::Partitioned(partitioned_index) = &self.table.index_block;
 
 		// For partitioned index, use full internal key for correct partition lookup
@@ -1531,7 +1525,7 @@ impl TableIterator {
 		Ok(Some(()))
 	}
 
-	pub(crate) fn advance(&mut self) -> Result<bool> {
+	pub fn advance(&mut self) -> Result<bool> {
 		// If exhausted, stay exhausted
 		if self.exhausted {
 			return Ok(false);

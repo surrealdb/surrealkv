@@ -14,7 +14,7 @@ use crate::{CompressionType, Options};
 
 /// Points to a block on file
 #[derive(Clone, Debug)]
-pub(crate) struct BlockHandleWithKey {
+pub struct BlockHandleWithKey {
 	/// Full encoded separator key (internal key with seq_num)
 	pub separator_key: Vec<u8>,
 
@@ -23,8 +23,7 @@ pub(crate) struct BlockHandleWithKey {
 }
 
 impl BlockHandleWithKey {
-	#[cfg(test)]
-	pub(crate) fn new(separator_key: Vec<u8>, handle: BlockHandle) -> BlockHandleWithKey {
+	pub fn new(separator_key: Vec<u8>, handle: BlockHandle) -> BlockHandleWithKey {
 		BlockHandleWithKey {
 			separator_key,
 			handle,
@@ -44,7 +43,7 @@ impl BlockHandleWithKey {
 // ...
 // [index block - partition N]
 // [index block - top-level index]
-pub(crate) struct TopLevelIndexWriter {
+pub struct TopLevelIndexWriter {
 	opts: Arc<Options>,
 	index_blocks: Vec<BlockWriter>,
 	current_block: BlockWriter,
@@ -57,7 +56,7 @@ pub(crate) struct TopLevelIndexWriter {
 }
 
 impl TopLevelIndexWriter {
-	pub(crate) fn new(opts: Arc<Options>, max_block_size: usize) -> TopLevelIndexWriter {
+	pub fn new(opts: Arc<Options>, max_block_size: usize) -> TopLevelIndexWriter {
 		TopLevelIndexWriter {
 			opts: Arc::clone(&opts),
 			index_blocks: Vec::new(),
@@ -74,19 +73,19 @@ impl TopLevelIndexWriter {
 	}
 
 	// Query methods - called after finish()
-	pub(crate) fn index_size(&self) -> u64 {
+	pub fn index_size(&self) -> u64 {
 		self.index_size
 	}
 
-	pub(crate) fn num_partitions(&self) -> u64 {
+	pub fn num_partitions(&self) -> u64 {
 		self.num_partitions
 	}
 
-	pub(crate) fn top_level_index_size(&self) -> u64 {
+	pub fn top_level_index_size(&self) -> u64 {
 		self.top_level_index_size
 	}
 
-	pub(crate) fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<()> {
+	pub fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<()> {
 		if self.current_block.size_estimate() >= self.max_block_size {
 			self.finish_current_block();
 		}
@@ -113,7 +112,7 @@ impl TopLevelIndexWriter {
 		write_block_at_offset(writer, compressed_block, compression_type, offset)
 	}
 
-	pub(crate) fn finish<W: Write>(
+	pub fn finish<W: Write>(
 		&mut self,
 		writer: &mut W,
 		compression_type: CompressionType,
@@ -179,17 +178,17 @@ impl TopLevelIndexWriter {
 
 // TODO: use block_cache to store top-level index blocks
 #[derive(Clone)]
-pub(crate) struct TopLevelIndex {
-	pub(crate) id: u64,
-	pub(crate) opts: Arc<Options>,
-	pub(crate) blocks: Vec<BlockHandleWithKey>,
+pub struct TopLevelIndex {
+	pub id: u64,
+	pub opts: Arc<Options>,
+	pub blocks: Vec<BlockHandleWithKey>,
 	// TODO: Fix this, as this could be problematic if the file is being shared across without any
 	// mutex
-	pub(crate) file: Arc<dyn File>,
+	pub file: Arc<dyn File>,
 }
 
 impl TopLevelIndex {
-	pub(crate) fn new(
+	pub fn new(
 		id: u64,
 		opt: Arc<Options>,
 		f: Arc<dyn File>,
@@ -216,7 +215,7 @@ impl TopLevelIndex {
 		})
 	}
 
-	pub(crate) fn find_block_handle_by_key(
+	pub fn find_block_handle_by_key(
 		&self,
 		target: &[u8],
 	) -> Result<Option<(usize, &BlockHandleWithKey)>> {
@@ -245,7 +244,7 @@ impl TopLevelIndex {
 			.map(|block| (index, block)))
 	}
 
-	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
+	pub fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
 		if let Some(block) = self.opts.block_cache.get_index_block(self.id, block_handle.offset()) {
 			return Ok(block);
 		}
@@ -265,7 +264,7 @@ impl TopLevelIndex {
 		Ok(block)
 	}
 
-	pub(crate) fn get(&self, target: &[u8]) -> Result<Arc<Block>> {
+	pub fn get(&self, target: &[u8]) -> Result<Arc<Block>> {
 		match self.find_block_handle_by_key(target)? {
 			Some((_index, block_handle)) => {
 				let block = self.load_block(block_handle)?;
