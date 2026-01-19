@@ -209,6 +209,7 @@ impl<W: Write> TableWriter<W> {
 
 		let mut meta = TableMetadata::new();
 		meta.properties.id = id;
+		meta.properties.compression = compression_selector.select_compression(target_level);
 
 		TableWriter {
 			writer,
@@ -332,7 +333,8 @@ impl<W: Write> TableWriter<W> {
 			.as_nanos();
 
 		// Copy sequence numbers from metadata to properties for table ordering
-		self.meta.properties.seqnos = (self.meta.smallest_seq_num, self.meta.largest_seq_num);
+		self.meta.properties.seqnos =
+			(self.meta.smallest_seq_num.unwrap_or(0), self.meta.largest_seq_num.unwrap_or(0));
 
 		// Check if the last data block has entries.
 		if self.data_block.as_ref().is_some_and(|db| db.entries() > 0) {
@@ -445,12 +447,8 @@ impl<W: Write> TableWriter<W> {
 
 		// Track timestamp range
 		let ts = key.timestamp;
-		if props.oldest_key_time == 0 || ts < props.oldest_key_time {
-			props.oldest_key_time = ts;
-		}
-		if ts > props.newest_key_time {
-			props.newest_key_time = ts;
-		}
+		props.oldest_key_time = Some(props.oldest_key_time.map_or(ts, |t| t.min(ts)));
+		props.newest_key_time = Some(props.newest_key_time.map_or(ts, |t| t.max(ts)));
 
 		// Track range deletions
 		if key.kind() == InternalKeyKind::RangeDelete {
@@ -1053,20 +1051,19 @@ impl<'a> TwoLevelIterator<'a> {
 			}
 			Bound::Included(ref internal_key) => {
 				// SeekForPrev semantics: find last entry <= bound
+				// For inclusive bound, seek to (user_key, 0) which is the LARGEST
+				// internal key for this user key (since seq_num is sorted descending).
+				// This positions us past all versions of this key, then we back up.
 				let bound_user_key = internal_key.user_key.clone();
-				let seek_key = InternalKey::new(
-					internal_key.user_key.clone(),
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Max,
-					INTERNAL_KEY_TIMESTAMP_MAX,
-				);
+				let seek_key =
+					InternalKey::new(internal_key.user_key.clone(), 0, InternalKeyKind::Set, 0);
 				self.seek_internal(&seek_key.encode())?;
 
 				if !self.is_valid() {
 					// Went past end, position at absolute last
 					self.position_to_absolute_last()?;
 				} else {
-					// Check if we're past the bound
+					// Check if we're past the bound (user_key > bound)
 					let cmp = self
 						.table
 						.opts
