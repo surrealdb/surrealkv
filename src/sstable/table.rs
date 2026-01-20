@@ -81,7 +81,7 @@ use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
 use crate::sstable::error::SSTableError;
 use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
-use crate::sstable::index_block::{IndexIterator, TopLevelIndex, TopLevelIndexWriter};
+use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
 use crate::sstable::meta::TableMetadata;
 use crate::vfs::File;
 use crate::{
@@ -343,7 +343,7 @@ pub(crate) struct TableWriter<W: Write> {
 	data_block: Option<BlockWriter>,
 
 	/// Partitioned index writer
-	partitioned_index: TopLevelIndexWriter,
+	partitioned_index: IndexWriter,
 
 	/// Optional bloom filter writer
 	filter_block: Option<FilterBlockWriter>,
@@ -384,10 +384,7 @@ impl<W: Write> TableWriter<W> {
 				opts.block_restart_interval,
 				Arc::clone(&opts.internal_comparator),
 			)),
-			partitioned_index: TopLevelIndexWriter::new(
-				Arc::clone(&opts),
-				opts.index_partition_size,
-			),
+			partitioned_index: IndexWriter::new(Arc::clone(&opts), opts.index_partition_size),
 			filter_block: fb,
 			internal_cmp: Arc::clone(&opts.internal_comparator) as Arc<dyn Comparator>,
 		}
@@ -797,14 +794,14 @@ fn verify_table_block(block: &[u8], compression_type: u8, want: u32) -> bool {
 
 #[derive(Clone)]
 pub enum IndexType {
-	Partitioned(TopLevelIndex),
+	Partitioned(Index),
 }
 
 /// An immutable SSTable reader.
 ///
 /// ## Opening a Table
 ///
-/// 1. Read footer (last 50 bytes)
+/// 1. Read footer
 /// 2. Load top-level index block
 /// 3. Load meta index block
 /// 4. Extract table metadata and filter block
@@ -852,7 +849,7 @@ impl Table {
 		// Step 2: Load partitioned index
 		let index_block = {
 			let partitioned_index =
-				TopLevelIndex::new(id, Arc::clone(&opts), Arc::clone(&file), &footer.index)?;
+				Index::new(id, Arc::clone(&opts), Arc::clone(&file), &footer.index)?;
 			IndexType::Partitioned(partitioned_index)
 		};
 

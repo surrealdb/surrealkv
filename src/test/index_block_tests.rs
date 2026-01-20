@@ -4,7 +4,7 @@ use std::vec;
 use test_log::test;
 
 use crate::sstable::block::BlockHandle;
-use crate::sstable::index_block::{BlockHandleWithKey, TopLevelIndex, TopLevelIndexWriter};
+use crate::sstable::index_block::{BlockHandleWithKey, Index, IndexWriter};
 use crate::vfs::File;
 use crate::{
 	CompressionType,
@@ -28,7 +28,7 @@ fn create_internal_key(user_key: Vec<u8>, sequence: u64) -> Vec<u8> {
 fn test_top_level_index_writer_basic() {
 	let opts = Arc::new(Options::default());
 	let max_block_size = 100;
-	let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+	let mut writer = IndexWriter::new(opts, max_block_size);
 
 	let key1 = create_internal_key(b"key1".to_vec(), 1);
 	let handle1 = vec![1, 2, 3];
@@ -43,7 +43,7 @@ fn test_top_level_index_writer_basic() {
 fn test_top_level_index_writer_multiple_blocks() {
 	let opts = Arc::new(Options::default());
 	let max_block_size = 50; // Small size to force multiple blocks
-	let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+	let mut writer = IndexWriter::new(opts, max_block_size);
 
 	for i in 0..10 {
 		let key = create_internal_key(format!("key{i}").as_bytes().to_vec(), i as u64);
@@ -61,7 +61,7 @@ fn test_top_level_index_writer_multiple_blocks() {
 // fn test_top_level_index_writer_empty() {
 //     let opts = Arc::new(Options::default());
 //     let max_block_size = 100;
-//     let writer = TopLevelIndexWriter::new(opts, max_block_size);
+//     let writer = IndexWriter::new(opts, max_block_size);
 
 //     let top_level_block = writer.finish().unwrap();
 //     assert_eq!(index_blocks.len(), 0);
@@ -72,7 +72,7 @@ fn test_top_level_index_writer_multiple_blocks() {
 fn test_top_level_index_writer_large_entries() {
 	let opts = Arc::new(Options::default());
 	let max_block_size = 1000;
-	let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+	let mut writer = IndexWriter::new(opts, max_block_size);
 
 	let large_key = create_internal_key(vec![b'a'; 500], 1);
 	let large_handle = vec![b'b'; 500];
@@ -87,7 +87,7 @@ fn test_top_level_index_writer_large_entries() {
 fn test_top_level_index_writer_exact_block_size() {
 	let opts = Arc::new(Options::default());
 	let max_block_size = 100;
-	let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+	let mut writer = IndexWriter::new(opts, max_block_size);
 
 	// Add entries that exactly fill up one block
 	let key = create_internal_key(b"key".to_vec(), 1);
@@ -103,7 +103,7 @@ fn test_top_level_index_writer_exact_block_size() {
 // fn test_top_level_index() {
 //     let opts = Arc::new(Options::default());
 //     let max_block_size = 10;
-//     let mut writer = TopLevelIndexWriter::new(Arc::clone(&opts), max_block_size);
+//     let mut writer = IndexWriter::new(Arc::clone(&opts), max_block_size);
 
 //     let key1 = create_internal_key(b"key1".to_vec(), 1);
 //     let handle1 = vec![1, 2, 3];
@@ -114,7 +114,7 @@ fn test_top_level_index_writer_exact_block_size() {
 // 0).unwrap();     assert!(!top_level_block.0.offset > 0);
 
 //     let f = wrap_buffer(d);
-//     let top_level_index = TopLevelIndex::new(0, opts, f,
+//     let top_level_index = Index::new(0, opts, f,
 // &top_level_block.0).unwrap();     let block =
 // top_level_index.get(&key1).unwrap();     // println!("block: {:?}",
 // block.block); }
@@ -130,8 +130,8 @@ fn test_find_block_handle_by_key() {
 	let sep_f = create_internal_key(b"f".to_vec(), 1);
 	let sep_j = create_internal_key(b"j".to_vec(), 1);
 
-	// Initialize TopLevelIndex with predefined blocks using encoded internal keys
-	let index = TopLevelIndex {
+	// Initialize Index with predefined blocks using encoded internal keys
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![
@@ -190,7 +190,7 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 	)
 	.encode();
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![
@@ -289,7 +289,7 @@ fn test_find_block_handle_by_key_different_user_keys() {
 	)
 	.encode();
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![
@@ -368,7 +368,7 @@ fn test_find_block_handle_returns_correct_partition_index() {
 	let sep_keys: Vec<_> =
 		(0..5).map(|i| create_internal_key(format!("key_{:02}", i).into_bytes(), 100)).collect();
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: sep_keys
@@ -402,7 +402,7 @@ fn test_partition_lookup_empty_partition_returns_none() {
 
 	let sep = create_internal_key(b"zzz".to_vec(), 1);
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep, BlockHandle::new(0, 100))],
@@ -424,7 +424,7 @@ fn test_partition_lookup_single_partition() {
 
 	let sep = create_internal_key(b"middle".to_vec(), 1);
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
@@ -461,7 +461,7 @@ fn test_partition_lookup_exact_separator_match() {
 	let sep_b = create_internal_key(b"bbb".to_vec(), 50);
 	let sep_c = create_internal_key(b"ccc".to_vec(), 50);
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![

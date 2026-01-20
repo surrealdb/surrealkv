@@ -162,7 +162,7 @@ impl BlockHandleWithKey {
 ///     Entry: "cherry" → 0x1000 (P1's last key)
 ///     Entry: "grape"  → 0x1100 (P2's last key)
 /// ```
-pub(crate) struct TopLevelIndexWriter {
+pub(crate) struct IndexWriter {
 	opts: Arc<Options>,
 
 	/// Completed partition blocks waiting to be written
@@ -180,9 +180,9 @@ pub(crate) struct TopLevelIndexWriter {
 	top_level_index_size: u64,
 }
 
-impl TopLevelIndexWriter {
-	pub(crate) fn new(opts: Arc<Options>, max_block_size: usize) -> TopLevelIndexWriter {
-		TopLevelIndexWriter {
+impl IndexWriter {
+	pub(crate) fn new(opts: Arc<Options>, max_block_size: usize) -> IndexWriter {
+		IndexWriter {
 			opts: Arc::clone(&opts),
 			index_blocks: Vec::new(),
 			current_block: BlockWriter::new(
@@ -350,7 +350,7 @@ impl TopLevelIndexWriter {
 /// The `blocks` array is loaded from the top-level index block on disk.
 /// Each entry points to a partition block that can be loaded on demand.
 #[derive(Clone)]
-pub(crate) struct TopLevelIndex {
+pub(crate) struct Index {
 	pub(crate) id: u64,
 	pub(crate) opts: Arc<Options>,
 
@@ -361,7 +361,7 @@ pub(crate) struct TopLevelIndex {
 	pub(crate) file: Arc<dyn File>,
 }
 
-impl TopLevelIndex {
+impl Index {
 	/// Loads the top-level index from disk.
 	///
 	/// ## Process
@@ -397,7 +397,7 @@ impl TopLevelIndex {
 			iter.advance()?;
 		}
 
-		Ok(TopLevelIndex {
+		Ok(Index {
 			id,
 			opts: opt,
 			blocks,
@@ -518,7 +518,7 @@ impl TopLevelIndex {
 ///
 /// ```text
 /// IndexIterator
-/// ├── index: &TopLevelIndex          (for loading partition blocks)
+/// ├── index: &Index          (for loading partition blocks)
 /// ├── partition_index: usize          (current partition block index)
 /// └── partition_iter: BlockIterator   (iterator within current partition)
 /// ```
@@ -541,7 +541,7 @@ impl TopLevelIndex {
 ///              → iterator invalid
 /// ```
 pub(crate) struct IndexIterator<'a> {
-	index: &'a TopLevelIndex,
+	index: &'a Index,
 
 	/// Current partition block index in index.blocks[]
 	partition_index: usize,
@@ -552,7 +552,7 @@ pub(crate) struct IndexIterator<'a> {
 }
 
 impl<'a> IndexIterator<'a> {
-	pub(crate) fn new(index: &'a TopLevelIndex) -> Self {
+	pub(crate) fn new(index: &'a Index) -> Self {
 		Self {
 			index,
 			partition_index: 0,
