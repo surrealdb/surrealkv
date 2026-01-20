@@ -821,7 +821,7 @@ pub enum IndexType {
 ///
 /// ## Range Scan Flow
 ///
-/// Uses TableIterator which coordinates:
+/// Uses TwoLevelIterator which coordinates:
 /// - first_level: IndexIterator (navigates index entries)
 /// - second_level: BlockIterator (navigates data block entries)
 #[derive(Clone)]
@@ -1017,9 +1017,9 @@ impl Table {
 	}
 
 	/// Creates an iterator over the table with optional range bounds.
-	pub(crate) fn iter(&self, range: Option<InternalKeyRange>) -> Result<TableIterator<'_>> {
+	pub(crate) fn iter(&self, range: Option<InternalKeyRange>) -> Result<TwoLevelIterator<'_>> {
 		let range = range.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-		TableIterator::new(self, range)
+		TwoLevelIterator::new(self, range)
 	}
 
 	pub(crate) fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
@@ -1035,38 +1035,117 @@ impl Table {
 				<= Ordering::Equal
 	}
 
+	/// Checks if this table is completely BEFORE the query range.
+	///
+	/// Used to skip tables that can't possibly contain any keys in the range.
+	/// A table is "before" the range if ALL its keys are less than the range start.
+	///
+	/// ## Bound Handling
+	///
+	/// | Range Lower Bound | Condition for "before" | Example |
+	/// |-------------------|------------------------|---------|
+	/// | Unbounded         | Never before           | - |
+	/// | Included(k)       | table.largest < k      | Table ["a","b"], range starts at Included("c") → before |
+	/// | Excluded(k)       | table.largest <= k     | Table ["a","b"], range starts at Excluded("b") → before |
+	///
+	/// ## Why the difference?
+	///
+	/// - `Included(k)`: Range includes k, so table is before only if largest < k
+	/// - `Excluded(k)`: Range starts AFTER k, so table is before if largest <= k (even if largest
+	///   == k, the range doesn't include k)
+	///
+	/// ```text
+	/// Example: Table has keys ["apple", "banana"]  (largest = "banana")
+	///
+	/// is_before(Included("cherry"))?
+	///   "banana" < "cherry"? Yes → table is before range ✓
+	///
+	/// is_before(Included("banana"))?
+	///   "banana" < "banana"? No → table overlaps (has "banana") ✓
+	///
+	/// is_before(Excluded("banana"))?
+	///   "banana" <= "banana"? Yes → table is before range ✓
+	///   (range starts AFTER "banana", table ends AT "banana")
+	///
+	/// is_before(Excluded("apple"))?
+	///   "banana" <= "apple"? No → table overlaps (has keys > "apple") ✓
+	/// ```
 	pub(crate) fn is_before_range(&self, range: &InternalKeyRange) -> bool {
 		let Some(largest) = &self.meta.largest_point else {
-			return false;
+			return false; // No metadata = conservatively assume overlap
 		};
 
 		match &range.0 {
-			Bound::Unbounded => false,
+			// Lower bound
+			Bound::Unbounded => false, // Unbounded range includes everything
 			Bound::Included(k) => {
+				// Range includes k, table is before if largest < k
 				self.opts.comparator.compare(&largest.user_key, &k.user_key) == Ordering::Less
 			}
 			Bound::Excluded(k) => {
+				// Range starts AFTER k, table is before if largest <= k
 				self.opts.comparator.compare(&largest.user_key, &k.user_key) != Ordering::Greater
 			}
 		}
 	}
 
+	/// Checks if this table is completely AFTER the query range.
+	///
+	/// Used to skip tables that can't possibly contain any keys in the range.
+	/// A table is "after" the range if ALL its keys are greater than the range end.
+	///
+	/// ## Bound Handling
+	///
+	/// | Range Upper Bound | Condition for "after" | Example |
+	/// |-------------------|----------------------|---------|
+	/// | Unbounded         | Never after          | - |
+	/// | Included(k)       | table.smallest > k   | Table ["d","e"], range ends at Included("c") → after |
+	/// | Excluded(k)       | table.smallest >= k  | Table ["c","d"], range ends at Excluded("c") → after |
+	///
+	/// ## Why the difference?
+	///
+	/// - `Included(k)`: Range includes k, so table is after only if smallest > k
+	/// - `Excluded(k)`: Range ends BEFORE k, so table is after if smallest >= k (even if smallest
+	///   == k, the range doesn't include k)
+	///
+	/// ```text
+	/// Example: Table has keys ["cherry", "date"]  (smallest = "cherry")
+	///
+	/// is_after(Included("banana"))?
+	///   "cherry" > "banana"? Yes → table is after range ✓
+	///
+	/// is_after(Included("cherry"))?
+	///   "cherry" > "cherry"? No → table overlaps (has "cherry") ✓
+	///
+	/// is_after(Excluded("cherry"))?
+	///   "cherry" >= "cherry"? Yes → table is after range ✓
+	///   (range ends BEFORE "cherry", table starts AT "cherry")
+	///
+	/// is_after(Excluded("date"))?
+	///   "cherry" >= "date"? No → table overlaps (has keys < "date") ✓
+	/// ```
 	pub(crate) fn is_after_range(&self, range: &InternalKeyRange) -> bool {
 		let Some(smallest) = &self.meta.smallest_point else {
-			return false;
+			return false; // No metadata = conservatively assume overlap
 		};
 
 		match &range.1 {
-			Bound::Unbounded => false,
+			// Upper bound
+			Bound::Unbounded => false, // Unbounded range includes everything
 			Bound::Included(k) => {
+				// Range includes k, table is after if smallest > k
 				self.opts.comparator.compare(&smallest.user_key, &k.user_key) == Ordering::Greater
 			}
 			Bound::Excluded(k) => {
+				// Range ends BEFORE k, table is after if smallest >= k
 				self.opts.comparator.compare(&smallest.user_key, &k.user_key) != Ordering::Less
 			}
 		}
 	}
 
+	/// Checks if this table potentially overlaps with the query range.
+	///
+	/// Returns true if the table is neither completely before nor completely after the range.
 	pub(crate) fn overlaps_with_range(&self, range: &InternalKeyRange) -> bool {
 		!self.is_before_range(range) && !self.is_after_range(range)
 	}
@@ -1081,7 +1160,7 @@ impl Table {
 /// ## Architecture
 ///
 /// ```text
-/// TableIterator
+/// TwoLevelIterator
 /// ├── first_level: IndexIterator
 /// │   └── Iterates over index entries: separator_key → data_block_handle
 /// ├── second_level: BlockIterator  
@@ -1119,7 +1198,7 @@ impl Table {
 ///
 /// Without advance_to_valid_entry, the iterator would incorrectly
 /// report no results when "date" and "fig" are valid matches!
-pub(crate) struct TableIterator<'a> {
+pub(crate) struct TwoLevelIterator<'a> {
 	table: &'a Table,
 
 	/// First level: iterates over partition index entries
@@ -1137,7 +1216,7 @@ pub(crate) struct TableIterator<'a> {
 	exhausted: bool,
 }
 
-impl<'a> TableIterator<'a> {
+impl<'a> TwoLevelIterator<'a> {
 	pub(crate) fn new(table: &'a Table, range: InternalKeyRange) -> Result<Self> {
 		let IndexType::Partitioned(ref partitioned_index) = table.index_block;
 
@@ -1223,6 +1302,15 @@ impl<'a> TableIterator<'a> {
 	///
 	/// Result: iterator now at "date" (correct answer for seek("banana"))
 	/// ```
+	///
+	/// ## Name Discussion
+	///
+	/// This function is called `SkipEmptyDataBlocksForward` in RocksDB/LevelDB,
+	/// but that name is misleading because:
+	/// - Data blocks are NEVER empty in practice
+	/// - The real issue is invalid iterator position after seek
+	///
+	/// Better name: `advance_to_valid_entry`
 	fn advance_to_valid_entry(&mut self) -> Result<()> {
 		loop {
 			// Success: current position is valid
@@ -1269,24 +1357,53 @@ impl<'a> TableIterator<'a> {
 		}
 	}
 
+	/// Checks if a user key satisfies the lower bound constraint.
+	///
+	/// ## Bound Semantics
+	///
+	/// | Bound Type | Condition | Example (bound="banana") |
+	/// |------------|-----------|--------------------------|
+	/// | Included   | key >= bound | "banana", "cherry" pass; "apple" fails |
+	/// | Excluded   | key > bound  | "cherry" passes; "apple", "banana" fail |
+	/// | Unbounded  | always true  | all keys pass |
+	///
+	/// ## Why User Key Comparison?
+	///
+	/// We compare USER keys, not internal keys, because:
+	/// - Bounds are specified by users in terms of user keys
+	/// - All versions of a user key should be treated uniformly
+	/// - The seek functions handle version ordering separately
 	fn satisfies_lower_bound(&self, user_key: &[u8]) -> bool {
 		match &self.range.0 {
 			Bound::Included(start) => {
+				// key >= start (not less than)
 				self.table.opts.comparator.compare(user_key, &start.user_key) != Ordering::Less
 			}
 			Bound::Excluded(start) => {
+				// key > start (strictly greater)
 				self.table.opts.comparator.compare(user_key, &start.user_key) == Ordering::Greater
 			}
 			Bound::Unbounded => true,
 		}
 	}
 
+	/// Checks if a user key satisfies the upper bound constraint.
+	///
+	/// ## Bound Semantics
+	///
+	/// | Bound Type | Condition | Example (bound="banana") |
+	/// |------------|-----------|--------------------------|
+	/// | Included   | key <= bound | "apple", "banana" pass; "cherry" fails |
+	/// | Excluded   | key < bound  | "apple" passes; "banana", "cherry" fail |
+	/// | Unbounded  | always true  | all keys pass |
 	fn satisfies_upper_bound(&self, user_key: &[u8]) -> bool {
 		match &self.range.1 {
 			Bound::Included(end) => {
+				// key <= end (not greater than)
 				self.table.opts.comparator.compare(user_key, &end.user_key) != Ordering::Greater
 			}
 			Bound::Excluded(end) => {
+				// key < end (strictly less)
 				self.table.opts.comparator.compare(user_key, &end.user_key) == Ordering::Less
 			}
 			Bound::Unbounded => true,
@@ -1298,6 +1415,56 @@ impl<'a> TableIterator<'a> {
 	}
 
 	/// Seeks to the first entry within bounds.
+	///
+	/// ## Internal Key Ordering Reminder
+	///
+	/// ```text
+	/// For same user_key, seq_num is sorted DESCENDING:
+	///   (user_key, MAX_SEQ) < (user_key, 5) < (user_key, 3) < (user_key, 0)
+	///   ↑ SMALLEST (first)                                   ↑ LARGEST (last)
+	/// ```
+	///
+	/// ## Bound Handling
+	///
+	/// ### Unbounded
+	/// Simply seek to absolute first entry.
+	///
+	/// ### Included(key)
+	/// Goal: Position at first entry with user_key >= bound.user_key
+	///
+	/// The bound's internal_key has seq_num=MAX_SEQ (from user_range_to_internal_range),
+	/// which is the SMALLEST internal key for that user_key.
+	/// Seeking to it lands on the first version of that user_key (or next user_key).
+	///
+	/// ```text
+	/// Example: Included("banana") with data [("apple",5), ("banana",7), ("banana",2)]
+	///
+	/// seek(("banana", MAX_SEQ)):
+	///   ("apple", 5) < ("banana", MAX_SEQ)  → skip
+	///   ("banana", 7) >= ("banana", MAX_SEQ) → land here ✓
+	///
+	/// Result: ("banana", 7) - first entry with user_key >= "banana"
+	/// ```
+	///
+	/// ### Excluded(key)
+	/// Goal: Position at first entry with user_key > bound.user_key
+	///
+	/// We create seek_key with seq_num=0 (LARGEST internal key for that user_key).
+	/// This seeks PAST all versions of the excluded key.
+	///
+	/// ```text
+	/// Example: Excluded("apple") with data [("apple",5), ("apple",3), ("banana",7)]
+	///
+	/// seek(("apple", 0)):
+	///   ("apple", 5) < ("apple", 0)  → skip (5 > 0 descending)
+	///   ("apple", 3) < ("apple", 0)  → skip
+	///   ("banana", 7) >= ("apple", 0) → land here ✓
+	///
+	/// Check: user_key == "apple"? No, it's "banana" → done
+	/// Result: ("banana", 7) - first entry with user_key > "apple"
+	/// ```
+	///
+	/// Edge case: If ("apple", 0) actually exists, we land on it and advance.
 	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
 		self.exhausted = false;
 
@@ -1305,6 +1472,7 @@ impl<'a> TableIterator<'a> {
 
 		match lower_bound {
 			Bound::Unbounded => {
+				// No lower bound: seek to absolute first
 				self.first_level.seek_to_first()?;
 				self.init_data_block()?;
 				if let Some(ref mut iter) = self.second_level {
@@ -1313,22 +1481,29 @@ impl<'a> TableIterator<'a> {
 				self.advance_to_valid_entry()?;
 			}
 			Bound::Included(ref internal_key) => {
+				// internal_key has seq_num=MAX_SEQ (smallest for this user_key)
+				// Seeking to it finds the first version of this user_key
 				self.seek_internal(&internal_key.encode())?;
 			}
 			Bound::Excluded(ref internal_key) => {
-				// Seek to (user_key, seq_num=0) which sorts AFTER all versions
-				let seek_key =
-					InternalKey::new(internal_key.user_key.clone(), 0, InternalKeyKind::Set, 0);
+				// Create seek key with seq_num=0 (LARGEST for this user_key)
+				// This seeks PAST all versions of the excluded key
+				let seek_key = InternalKey::new(
+					internal_key.user_key.clone(),
+					0, // Largest internal key for this user_key
+					InternalKeyKind::Set,
+					0,
+				);
 				self.seek_internal(&seek_key.encode())?;
 
-				// If landed on excluded key, advance
+				// Edge case: if we somehow landed on exactly (user_key, 0), advance past it
 				if self.is_valid() && self.current_user_key() == internal_key.user_key.as_slice() {
 					self.advance_internal()?;
 				}
 			}
 		}
 
-		// Verify within upper bound
+		// Verify we didn't overshoot the upper bound
 		if self.is_valid() && !self.satisfies_upper_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
@@ -1336,6 +1511,55 @@ impl<'a> TableIterator<'a> {
 	}
 
 	/// Seeks to the last entry within bounds.
+	///
+	/// ## SeekForPrev Semantics
+	///
+	/// Unlike seek_to_first (which finds first key >= target), seek_to_last
+	/// implements "SeekForPrev" semantics: find the last key <= target.
+	///
+	/// ## Bound Handling
+	///
+	/// ### Unbounded
+	/// Simply seek to absolute last entry.
+	///
+	/// ### Included(key)
+	/// Goal: Position at last entry with user_key <= bound.user_key
+	///
+	/// Strategy: Seek to (user_key, 0) which is the LARGEST internal key
+	/// for that user_key. This will land on the next user_key (or past end),
+	/// then we back up to get the last version of the included key.
+	///
+	/// ```text
+	/// Example: Included("banana") with data [("apple",3), ("banana",7), ("banana",2), ("cherry",4)]
+	///
+	/// seek(("banana", 0)):
+	///   ("apple", 3) < ("banana", 0)    → skip
+	///   ("banana", 7) < ("banana", 0)   → skip (7 > 0 descending)
+	///   ("banana", 2) < ("banana", 0)   → skip (2 > 0 descending)
+	///   ("cherry", 4) >= ("banana", 0)  → land here
+	///
+	/// Check: "cherry" > "banana"? Yes → prev()
+	/// Result: ("banana", 2) - last entry with user_key <= "banana" ✓
+	/// ```
+	///
+	/// ### Excluded(key)
+	/// Goal: Position at last entry with user_key < bound.user_key
+	///
+	/// Strategy: Seek to (user_key, MAX_SEQ) which is the SMALLEST internal key
+	/// for that user_key. This lands on the first version of the excluded key
+	/// (or past it), then we back up to get entries strictly before it.
+	///
+	/// ```text
+	/// Example: Excluded("banana") with data [("apple",5), ("apple",3), ("banana",7)]
+	///
+	/// seek(("banana", MAX_SEQ)):
+	///   ("apple", 5) < ("banana", MAX_SEQ)  → skip
+	///   ("apple", 3) < ("banana", MAX_SEQ)  → skip
+	///   ("banana", 7) >= ("banana", MAX_SEQ) → land here
+	///
+	/// Check: "banana" < "banana"? No (Equal, not Less) → prev()
+	/// Result: ("apple", 3) - last entry with user_key < "banana" ✓
+	/// ```
 	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
 		self.exhausted = false;
 
@@ -1343,6 +1567,7 @@ impl<'a> TableIterator<'a> {
 
 		match upper_bound {
 			Bound::Unbounded => {
+				// No upper bound: seek to absolute last
 				self.first_level.seek_to_last()?;
 				self.init_data_block()?;
 				if let Some(ref mut iter) = self.second_level {
@@ -1351,25 +1576,34 @@ impl<'a> TableIterator<'a> {
 				self.retreat_to_valid_entry()?;
 			}
 			Bound::Included(ref internal_key) => {
+				// Seek to (user_key, 0) = LARGEST internal key for this user_key
+				// This positions past all versions, then we back up
 				let bound_user_key = internal_key.user_key.clone();
 				let seek_key =
 					InternalKey::new(internal_key.user_key.clone(), 0, InternalKeyKind::Set, 0);
 				self.seek_internal(&seek_key.encode())?;
 
 				if !self.is_valid() {
+					// Seek went past end of table, position at absolute last
 					self.position_to_absolute_last()?;
 				} else {
+					// Check if we landed past the bound (on a later user_key)
 					let cmp = self
 						.table
 						.opts
 						.comparator
 						.compare(self.current_user_key(), bound_user_key.as_slice());
 					if cmp == Ordering::Greater {
+						// We're past the bound, back up one entry
 						self.prev_internal()?;
 					}
+					// If cmp is Equal or Less, we're already on a valid position
+					// (this can happen if (user_key, 0) exists or we landed on earlier key)
 				}
 			}
 			Bound::Excluded(ref internal_key) => {
+				// Seek to (user_key, MAX_SEQ) = SMALLEST internal key for this user_key
+				// This positions at first version of excluded key, then we back up
 				let bound_user_key = internal_key.user_key.clone();
 				let seek_key = InternalKey::new(
 					internal_key.user_key.clone(),
@@ -1380,9 +1614,12 @@ impl<'a> TableIterator<'a> {
 				self.seek_internal(&seek_key.encode())?;
 
 				if !self.is_valid() {
+					// Seek went past end, position at absolute last
 					self.position_to_absolute_last()?;
 				}
 
+				// For Excluded: back up if we're AT or PAST the bound
+				// (we need to be strictly BEFORE it)
 				if self.is_valid() {
 					let cmp = self
 						.table
@@ -1390,13 +1627,14 @@ impl<'a> TableIterator<'a> {
 						.comparator
 						.compare(self.current_user_key(), bound_user_key.as_slice());
 					if cmp != Ordering::Less {
+						// We're on the excluded key or past it, back up
 						self.prev_internal()?;
 					}
 				}
 			}
 		}
 
-		// Verify within lower bound
+		// Verify we didn't back up past the lower bound
 		if self.is_valid() && !self.satisfies_lower_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
@@ -1474,7 +1712,7 @@ impl<'a> TableIterator<'a> {
 	}
 }
 
-impl InternalIterator for TableIterator<'_> {
+impl InternalIterator for TwoLevelIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.exhausted = false;
 		self.seek_internal(target)?;
