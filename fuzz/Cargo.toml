@@ -87,6 +87,12 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "table_latest"
+path = "fuzz_targets/table_latest.rs"
+test = false
+doc = false
+bench = false
 
 [[bin]]
 name = "bloom_filter"
