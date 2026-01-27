@@ -1655,7 +1655,7 @@ impl<'a> TwoLevelIterator<'a> {
 	///      → Seek within data block for key >= "banana"
 	///      → MAY GO PAST ALL ENTRIES if "banana" > all keys!
 	///
-	///   4. advance_to_valid_entry()  ← CRITICAL!
+	///   4. advance_to_valid_entry()
 	///      → If step 3 went past all entries, advance to next block
 	/// ```
 	fn seek_internal(&mut self, target: &[u8]) -> Result<()> {

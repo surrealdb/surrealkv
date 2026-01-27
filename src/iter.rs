@@ -7,7 +7,6 @@ use crate::error::Result;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::{Comparator, InternalIterator, InternalKey, InternalKeyRef, Value};
 
-/// Boxed internal iterator type for dynamic dispatch
 pub type BoxedInternalIterator<'a> = Box<dyn InternalIterator + 'a>;
 
 /// Binary heap
@@ -721,6 +720,733 @@ impl Iterator for CompactionIterator<'_> {
 			Ok(Some(item)) => Some(Ok(item)),
 			Ok(None) => None,
 			Err(e) => Some(Err(e)),
+		}
+	}
+}
+
+// ============================================================================
+// Proptest-based Property Tests
+// ============================================================================
+
+#[cfg(test)]
+mod proptest_tests {
+	use super::*;
+	use proptest::prelude::*;
+	use std::cmp::Ordering;
+
+	// ========================================================================
+	// BinaryHeap Property Tests
+	// ========================================================================
+
+	/// Verify the min-heap invariant: parent <= children for all nodes
+	fn verify_heap_invariant<T, F: Fn(&T, &T) -> Ordering>(heap: &BinaryHeap<T, F>) -> bool {
+		let data = &heap.data;
+		for i in 0..data.len() {
+			let left = 2 * i + 1;
+			let right = 2 * i + 2;
+
+			if left < data.len() && (heap.cmp)(&data[i], &data[left]) == Ordering::Greater {
+				return false;
+			}
+			if right < data.len() && (heap.cmp)(&data[i], &data[right]) == Ordering::Greater {
+				return false;
+			}
+		}
+		true
+	}
+
+	proptest! {
+		/// Property: After any sequence of pushes, the heap invariant holds
+		#[test]
+		fn prop_heap_invariant_after_pushes(values in prop::collection::vec(0i32..1000, 0..100)) {
+			let mut heap = BinaryHeap::with_capacity(values.len(), |a: &i32, b: &i32| a.cmp(b));
+
+			for v in values {
+				heap.push(v);
+				prop_assert!(verify_heap_invariant(&heap), "Heap invariant violated after push");
+			}
+		}
+
+		/// Property: peek() always returns the minimum element
+		#[test]
+		fn prop_peek_returns_minimum(values in prop::collection::vec(0i32..1000, 1..100)) {
+			let mut heap = BinaryHeap::with_capacity(values.len(), |a: &i32, b: &i32| a.cmp(b));
+
+			for v in &values {
+				heap.push(*v);
+			}
+
+			let expected_min = values.iter().min().unwrap();
+			prop_assert_eq!(heap.peek(), Some(expected_min));
+		}
+
+		/// Property: pop() returns elements in ascending order (sorted extraction)
+		#[test]
+		fn prop_pop_returns_sorted(values in prop::collection::vec(0i32..1000, 0..100)) {
+			let mut heap = BinaryHeap::with_capacity(values.len(), |a: &i32, b: &i32| a.cmp(b));
+
+			for v in &values {
+				heap.push(*v);
+			}
+
+			let mut sorted = values.clone();
+			sorted.sort();
+
+			let mut extracted = Vec::new();
+			while let Some(v) = heap.pop() {
+				extracted.push(v);
+				prop_assert!(verify_heap_invariant(&heap), "Heap invariant violated after pop");
+			}
+
+			prop_assert_eq!(extracted, sorted);
+		}
+
+		/// Property: len() correctly tracks the number of elements
+		#[test]
+		fn prop_len_tracks_correctly(
+			pushes in prop::collection::vec(0i32..1000, 0..50),
+			pop_count in 0usize..30
+		) {
+			let mut heap = BinaryHeap::with_capacity(pushes.len(), |a: &i32, b: &i32| a.cmp(b));
+
+			for v in &pushes {
+				heap.push(*v);
+			}
+
+			prop_assert_eq!(heap.len(), pushes.len());
+
+			let actual_pops = pop_count.min(pushes.len());
+			for _ in 0..actual_pops {
+				heap.pop();
+			}
+
+			prop_assert_eq!(heap.len(), pushes.len() - actual_pops);
+		}
+
+		/// Property: After modifying root via peek_mut and calling sift_down_root,
+		/// the heap invariant is restored
+		#[test]
+		fn prop_sift_down_root_restores_invariant(
+			values in prop::collection::vec(0i32..1000, 2..50),
+			new_root in 0i32..2000
+		) {
+			let mut heap = BinaryHeap::with_capacity(values.len(), |a: &i32, b: &i32| a.cmp(b));
+
+			for v in &values {
+				heap.push(*v);
+			}
+
+			if let Some(root) = heap.peek_mut() {
+				*root = new_root;
+			}
+			heap.sift_down_root();
+
+			prop_assert!(verify_heap_invariant(&heap), "Heap invariant violated after sift_down_root");
+		}
+	}
+
+	// ========================================================================
+	// MergingIterator Property Tests
+	// ========================================================================
+
+	/// A simple mock iterator for testing MergingIterator
+	struct PropMockIterator {
+		items: Vec<(Vec<u8>, Vec<u8>)>, // (encoded_key, value)
+		index: Option<usize>,
+	}
+
+	impl PropMockIterator {
+		fn new(mut items: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
+			// Sort by encoded key to simulate a proper iterator
+			items.sort_by(|a, b| a.0.cmp(&b.0));
+			Self { items, index: None }
+		}
+	}
+
+	impl InternalIterator for PropMockIterator {
+		fn seek(&mut self, target: &[u8]) -> Result<bool> {
+			for i in 0..self.items.len() {
+				if self.items[i].0.as_slice() >= target {
+					self.index = Some(i);
+					return Ok(true);
+				}
+			}
+			self.index = None;
+			Ok(false)
+		}
+
+		fn seek_first(&mut self) -> Result<bool> {
+			if self.items.is_empty() {
+				self.index = None;
+				Ok(false)
+			} else {
+				self.index = Some(0);
+				Ok(true)
+			}
+		}
+
+		fn seek_last(&mut self) -> Result<bool> {
+			if self.items.is_empty() {
+				self.index = None;
+				Ok(false)
+			} else {
+				self.index = Some(self.items.len() - 1);
+				Ok(true)
+			}
+		}
+
+		fn next(&mut self) -> Result<bool> {
+			match self.index {
+				Some(i) if i + 1 < self.items.len() => {
+					self.index = Some(i + 1);
+					Ok(true)
+				}
+				_ => {
+					self.index = None;
+					Ok(false)
+				}
+			}
+		}
+
+		fn prev(&mut self) -> Result<bool> {
+			match self.index {
+				Some(i) if i > 0 => {
+					self.index = Some(i - 1);
+					Ok(true)
+				}
+				_ => {
+					self.index = None;
+					Ok(false)
+				}
+			}
+		}
+
+		fn valid(&self) -> bool {
+			self.index.is_some()
+		}
+
+		fn key(&self) -> InternalKeyRef<'_> {
+			debug_assert!(self.valid());
+			InternalKeyRef::from_encoded(&self.items[self.index.unwrap()].0)
+		}
+
+		fn value(&self) -> &[u8] {
+			debug_assert!(self.valid());
+			&self.items[self.index.unwrap()].1
+		}
+	}
+
+	/// Generate a random encoded internal key
+	fn gen_encoded_key(user_key: &[u8], seq: u64) -> Vec<u8> {
+		let key = InternalKey::new(user_key.to_vec(), seq, crate::InternalKeyKind::Set, 0);
+		key.encode()
+	}
+
+	/// Simple comparator for testing
+	#[derive(Clone)]
+	struct TestComparator;
+
+	impl Comparator for TestComparator {
+		fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
+			a.cmp(b)
+		}
+
+		fn separator(&self, from: &[u8], _to: &[u8]) -> Vec<u8> {
+			from.to_vec()
+		}
+
+		fn successor(&self, key: &[u8]) -> Vec<u8> {
+			let mut result = key.to_vec();
+			result.push(0);
+			result
+		}
+
+		fn name(&self) -> &str {
+			"TestComparator"
+		}
+	}
+
+	proptest! {
+		/// Property: MergingIterator outputs keys in sorted order
+		#[test]
+		fn prop_merging_iter_sorted_output(
+			// Generate 1-5 iterators, each with 0-20 keys
+			iter_data in prop::collection::vec(
+				prop::collection::vec(
+					(prop::collection::vec(prop::num::u8::ANY, 1..10), 1u64..1000),
+					0..20
+				),
+				1..5
+			)
+		) {
+			let cmp: Arc<dyn Comparator> = Arc::new(TestComparator);
+
+			// Build mock iterators
+			let iterators: Vec<BoxedInternalIterator<'_>> = iter_data
+				.iter()
+				.map(|items| {
+					let encoded_items: Vec<(Vec<u8>, Vec<u8>)> = items
+						.iter()
+						.map(|(user_key, seq)| {
+							(gen_encoded_key(user_key, *seq), b"value".to_vec())
+						})
+						.collect();
+					Box::new(PropMockIterator::new(encoded_items)) as BoxedInternalIterator<'_>
+				})
+				.collect();
+
+			let mut merge_iter = MergingIterator::new(iterators, Arc::clone(&cmp));
+
+			// Collect all keys
+			let mut keys: Vec<Vec<u8>> = Vec::new();
+			if merge_iter.seek_first().unwrap() {
+				keys.push(merge_iter.current_key().encoded().to_vec());
+				while merge_iter.next().unwrap() {
+					keys.push(merge_iter.current_key().encoded().to_vec());
+				}
+			}
+
+			// Verify sorted order
+			for i in 1..keys.len() {
+				prop_assert!(
+					keys[i - 1] <= keys[i],
+					"Keys not in sorted order at index {}: {:?} > {:?}",
+					i,
+					keys[i - 1],
+					keys[i]
+				);
+			}
+		}
+
+		/// Property: MergingIterator contains all keys from input iterators
+		#[test]
+		fn prop_merging_iter_completeness(
+			iter_data in prop::collection::vec(
+				prop::collection::vec(
+					(prop::collection::vec(prop::num::u8::ANY, 1..5), 1u64..100),
+					0..10
+				),
+				1..4
+			)
+		) {
+			let cmp: Arc<dyn Comparator> = Arc::new(TestComparator);
+
+			// Collect all expected keys
+			let mut all_expected: Vec<Vec<u8>> = iter_data
+				.iter()
+				.flat_map(|items| {
+					items.iter().map(|(user_key, seq)| gen_encoded_key(user_key, *seq))
+				})
+				.collect();
+			all_expected.sort();
+			all_expected.dedup();
+
+			// Build mock iterators
+			let iterators: Vec<BoxedInternalIterator<'_>> = iter_data
+				.iter()
+				.map(|items| {
+					let encoded_items: Vec<(Vec<u8>, Vec<u8>)> = items
+						.iter()
+						.map(|(user_key, seq)| {
+							(gen_encoded_key(user_key, *seq), b"value".to_vec())
+						})
+						.collect();
+					Box::new(PropMockIterator::new(encoded_items)) as BoxedInternalIterator<'_>
+				})
+				.collect();
+
+			let mut merge_iter = MergingIterator::new(iterators, Arc::clone(&cmp));
+
+			// Collect merged keys
+			let mut merged_keys: Vec<Vec<u8>> = Vec::new();
+			if merge_iter.seek_first().unwrap() {
+				merged_keys.push(merge_iter.current_key().encoded().to_vec());
+				while merge_iter.next().unwrap() {
+					merged_keys.push(merge_iter.current_key().encoded().to_vec());
+				}
+			}
+
+			prop_assert_eq!(
+				merged_keys.len(),
+				all_expected.len(),
+				"Merged output has different count than expected"
+			);
+		}
+
+		/// Property: seek(target) positions on first key >= target
+		#[test]
+		fn prop_merging_iter_seek_correctness(
+			keys in prop::collection::vec(
+				prop::collection::vec(prop::num::u8::ANY, 1..5),
+				1..20
+			),
+			target in prop::collection::vec(prop::num::u8::ANY, 0..5)
+		) {
+			let cmp: Arc<dyn Comparator> = Arc::new(TestComparator);
+
+			// Build encoded keys
+			let encoded_items: Vec<(Vec<u8>, Vec<u8>)> = keys
+				.iter()
+				.enumerate()
+				.map(|(i, user_key)| {
+					(gen_encoded_key(user_key, i as u64 + 1), b"value".to_vec())
+				})
+				.collect();
+
+			let encoded_target = gen_encoded_key(&target, 0);
+
+			let iterators: Vec<BoxedInternalIterator<'_>> = vec![
+				Box::new(PropMockIterator::new(encoded_items.clone())) as BoxedInternalIterator<'_>
+			];
+
+			let mut merge_iter = MergingIterator::new(iterators, Arc::clone(&cmp));
+
+			let found = merge_iter.seek(&encoded_target).unwrap();
+
+			if found {
+				let key = merge_iter.current_key().encoded().to_vec();
+				prop_assert!(
+					key >= encoded_target,
+					"seek() positioned on key < target"
+				);
+
+				// Verify it's the first key >= target
+				let mut all_keys: Vec<Vec<u8>> = encoded_items.iter().map(|(k, _)| k.clone()).collect();
+				all_keys.sort();
+				let expected_first = all_keys.iter().find(|k| **k >= encoded_target);
+				prop_assert_eq!(Some(&key), expected_first);
+			} else {
+				// No key >= target exists
+				let all_keys: Vec<Vec<u8>> = encoded_items.iter().map(|(k, _)| k.clone()).collect();
+				let has_ge = all_keys.iter().any(|k| *k >= encoded_target);
+				prop_assert!(!has_ge, "seek() returned false but a key >= target exists");
+			}
+		}
+	}
+
+	// ========================================================================
+	// CompactionIterator Property Tests
+	// ========================================================================
+
+	use crate::clock::MockLogicalClock;
+	use crate::comparator::{BytewiseComparator, InternalKeyComparator};
+
+	/// Generate test entries for CompactionIterator testing
+	fn create_test_entry(user_key: &[u8], seq: u64, is_delete: bool) -> (InternalKey, Vec<u8>) {
+		let kind = if is_delete {
+			crate::InternalKeyKind::Delete
+		} else {
+			crate::InternalKeyKind::Set
+		};
+		let key = InternalKey::new(user_key.to_vec(), seq, kind, 0);
+		let value = if is_delete {
+			Vec::new()
+		} else {
+			format!("value-{seq}").into_bytes()
+		};
+		(key, value)
+	}
+
+	/// MockIterator that works with InternalKey entries
+	struct CompactionMockIterator {
+		items: Vec<(InternalKey, Vec<u8>)>,
+		encoded_keys: Vec<Vec<u8>>,
+		index: Option<usize>,
+	}
+
+	impl CompactionMockIterator {
+		fn new(mut items: Vec<(InternalKey, Vec<u8>)>) -> Self {
+			// Sort by encoded key
+			items.sort_by(|a, b| a.0.encode().cmp(&b.0.encode()));
+			let encoded_keys: Vec<Vec<u8>> = items.iter().map(|(k, _)| k.encode()).collect();
+			Self {
+				items,
+				encoded_keys,
+				index: None,
+			}
+		}
+	}
+
+	impl InternalIterator for CompactionMockIterator {
+		fn seek(&mut self, target: &[u8]) -> Result<bool> {
+			for i in 0..self.encoded_keys.len() {
+				if self.encoded_keys[i].as_slice() >= target {
+					self.index = Some(i);
+					return Ok(true);
+				}
+			}
+			self.index = None;
+			Ok(false)
+		}
+
+		fn seek_first(&mut self) -> Result<bool> {
+			if self.items.is_empty() {
+				self.index = None;
+				Ok(false)
+			} else {
+				self.index = Some(0);
+				Ok(true)
+			}
+		}
+
+		fn seek_last(&mut self) -> Result<bool> {
+			if self.items.is_empty() {
+				self.index = None;
+				Ok(false)
+			} else {
+				self.index = Some(self.items.len() - 1);
+				Ok(true)
+			}
+		}
+
+		fn next(&mut self) -> Result<bool> {
+			match self.index {
+				Some(i) if i + 1 < self.items.len() => {
+					self.index = Some(i + 1);
+					Ok(true)
+				}
+				_ => {
+					self.index = None;
+					Ok(false)
+				}
+			}
+		}
+
+		fn prev(&mut self) -> Result<bool> {
+			match self.index {
+				Some(i) if i > 0 => {
+					self.index = Some(i - 1);
+					Ok(true)
+				}
+				_ => {
+					self.index = None;
+					Ok(false)
+				}
+			}
+		}
+
+		fn valid(&self) -> bool {
+			self.index.is_some()
+		}
+
+		fn key(&self) -> InternalKeyRef<'_> {
+			debug_assert!(self.valid());
+			InternalKeyRef::from_encoded(&self.encoded_keys[self.index.unwrap()])
+		}
+
+		fn value(&self) -> &[u8] {
+			debug_assert!(self.valid());
+			&self.items[self.index.unwrap()].1
+		}
+	}
+
+	fn create_test_comparator() -> Arc<InternalKeyComparator> {
+		Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())))
+	}
+
+	proptest! {
+		/// Property: CompactionIterator output is sorted by user key
+		#[test]
+		fn prop_compaction_iter_sorted_output(
+			// Generate entries: (user_key_suffix, seq_num, is_delete)
+			entries in prop::collection::vec(
+				(0u8..10, 1u64..100, prop::bool::ANY),
+				1..30
+			)
+		) {
+			let items: Vec<(InternalKey, Vec<u8>)> = entries
+				.iter()
+				.map(|(suffix, seq, is_delete)| {
+					let user_key = format!("key-{suffix:02}").into_bytes();
+					create_test_entry(&user_key, *seq, *is_delete)
+				})
+				.collect();
+
+			let iter = Box::new(CompactionMockIterator::new(items)) as BoxedInternalIterator<'_>;
+
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				create_test_comparator(),
+				false,
+				None,
+				false,
+				0,
+				Arc::new(MockLogicalClock::new()),
+			);
+
+			let mut prev_user_key: Option<Vec<u8>> = None;
+			for result in comp_iter.by_ref() {
+				let (key, _) = result.unwrap();
+				if let Some(prev) = &prev_user_key {
+					prop_assert!(
+						*prev <= key.user_key,
+						"Output not sorted: {:?} > {:?}",
+						prev,
+						key.user_key
+					);
+				}
+				prev_user_key = Some(key.user_key);
+			}
+		}
+
+		/// Property: CompactionIterator deduplicates by user key (no duplicate user keys)
+		#[test]
+		fn prop_compaction_iter_deduplication(
+			// Generate entries with potential duplicates
+			entries in prop::collection::vec(
+				(0u8..5, 1u64..50, prop::bool::ANY),
+				1..40
+			)
+		) {
+			let items: Vec<(InternalKey, Vec<u8>)> = entries
+				.iter()
+				.map(|(suffix, seq, is_delete)| {
+					let user_key = format!("key-{suffix:02}").into_bytes();
+					create_test_entry(&user_key, *seq, *is_delete)
+				})
+				.collect();
+
+			let iter = Box::new(CompactionMockIterator::new(items)) as BoxedInternalIterator<'_>;
+
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				create_test_comparator(),
+				false, // non-bottom level
+				None,
+				false, // no versioning
+				0,
+				Arc::new(MockLogicalClock::new()),
+			);
+
+			let mut seen_user_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+			for result in comp_iter.by_ref() {
+				let (key, _) = result.unwrap();
+				prop_assert!(
+					seen_user_keys.insert(key.user_key.clone()),
+					"Duplicate user key in output: {:?}",
+					key.user_key
+				);
+			}
+		}
+
+		/// Property: CompactionIterator returns latest version (highest seq) for each user key
+		#[test]
+		fn prop_compaction_iter_latest_wins(
+			// Generate entries with same user key but different seq nums
+			seqs in prop::collection::vec(1u64..1000, 2..10)
+		) {
+			let user_key = b"test_key".to_vec();
+			let items: Vec<(InternalKey, Vec<u8>)> = seqs
+				.iter()
+				.map(|seq| create_test_entry(&user_key, *seq, false))
+				.collect();
+
+			let expected_max_seq = *seqs.iter().max().unwrap();
+
+			let iter = Box::new(CompactionMockIterator::new(items)) as BoxedInternalIterator<'_>;
+
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				create_test_comparator(),
+				false,
+				None,
+				false,
+				0,
+				Arc::new(MockLogicalClock::new()),
+			);
+
+			let results: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
+
+			prop_assert_eq!(results.len(), 1, "Should have exactly one output for one user key");
+			prop_assert_eq!(
+				results[0].0.seq_num(),
+				expected_max_seq,
+				"Should return the entry with highest sequence number"
+			);
+		}
+
+		/// Property: At bottom level, delete markers are not emitted
+		#[test]
+		fn prop_compaction_iter_bottom_level_deletes(
+			// Generate mix of sets and deletes
+			entries in prop::collection::vec(
+				(0u8..5, 1u64..100),
+				1..20
+			)
+		) {
+			// Create entries where latest is always a delete
+			let items: Vec<(InternalKey, Vec<u8>)> = entries
+				.iter()
+				.flat_map(|(suffix, seq)| {
+					let user_key = format!("key-{suffix:02}").into_bytes();
+					vec![
+						create_test_entry(&user_key, *seq, false),      // SET
+						create_test_entry(&user_key, *seq + 1000, true), // DELETE (higher seq)
+					]
+				})
+				.collect();
+
+			let iter = Box::new(CompactionMockIterator::new(items)) as BoxedInternalIterator<'_>;
+
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				create_test_comparator(),
+				true, // BOTTOM LEVEL
+				None,
+				false,
+				0,
+				Arc::new(MockLogicalClock::new()),
+			);
+
+			let results: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
+
+			// At bottom level with delete as latest, all entries should be filtered out
+			prop_assert_eq!(
+				results.len(),
+				0,
+				"At bottom level, keys with delete as latest should be dropped"
+			);
+		}
+
+		/// Property: At non-bottom level, delete markers ARE emitted
+		#[test]
+		fn prop_compaction_iter_non_bottom_preserves_deletes(
+			user_key_count in 1usize..5
+		) {
+			// Create one delete entry per user key
+			let items: Vec<(InternalKey, Vec<u8>)> = (0..user_key_count)
+				.map(|i| {
+					let user_key = format!("key-{i:02}").into_bytes();
+					create_test_entry(&user_key, 100, true) // DELETE
+				})
+				.collect();
+
+			let iter = Box::new(CompactionMockIterator::new(items)) as BoxedInternalIterator<'_>;
+
+			let mut comp_iter = CompactionIterator::new(
+				vec![iter],
+				create_test_comparator(),
+				false, // NON-BOTTOM LEVEL
+				None,
+				false,
+				0,
+				Arc::new(MockLogicalClock::new()),
+			);
+
+			let results: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
+
+			prop_assert_eq!(
+				results.len(),
+				user_key_count,
+				"At non-bottom level, delete markers should be preserved"
+			);
+
+			for (key, _) in &results {
+				prop_assert!(
+					key.is_hard_delete_marker(),
+					"Expected delete marker in output"
+				);
+			}
 		}
 	}
 }
