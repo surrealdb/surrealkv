@@ -818,7 +818,7 @@ pub enum IndexType {
 ///
 /// ## Range Scan Flow
 ///
-/// Uses TwoLevelIterator which coordinates:
+/// Uses TableIterator which coordinates:
 /// - first_level: IndexIterator (navigates index entries)
 /// - second_level: BlockIterator (navigates data block entries)
 #[derive(Clone)]
@@ -1014,9 +1014,9 @@ impl Table {
 	}
 
 	/// Creates an iterator over the table with optional range bounds.
-	pub(crate) fn iter(&self, range: Option<InternalKeyRange>) -> Result<TwoLevelIterator<'_>> {
+	pub(crate) fn iter(&self, range: Option<InternalKeyRange>) -> Result<TableIterator<'_>> {
 		let range = range.unwrap_or((Bound::Unbounded, Bound::Unbounded));
-		TwoLevelIterator::new(self, range)
+		TableIterator::new(self, range)
 	}
 
 	pub(crate) fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
@@ -1149,15 +1149,15 @@ impl Table {
 }
 
 // =============================================================================
-// TWO-LEVEL ITERATOR
+// Table ITERATOR
 // =============================================================================
 
-/// A two-level iterator for efficient SSTable traversal.
+/// An iterator for efficient SSTable traversal.
 ///
 /// ## Architecture
 ///
 /// ```text
-/// TwoLevelIterator
+/// TableIterator
 /// ├── first_level: IndexIterator
 /// │   └── Iterates over index entries: separator_key → data_block_handle
 /// ├── second_level: BlockIterator  
@@ -1195,7 +1195,7 @@ impl Table {
 ///
 /// Without advance_to_valid_entry, the iterator would incorrectly
 /// report no results when "date" and "fig" are valid matches!
-pub(crate) struct TwoLevelIterator<'a> {
+pub(crate) struct TableIterator<'a> {
 	table: &'a Table,
 
 	/// First level: iterates over partition index entries
@@ -1213,7 +1213,7 @@ pub(crate) struct TwoLevelIterator<'a> {
 	exhausted: bool,
 }
 
-impl<'a> TwoLevelIterator<'a> {
+impl<'a> TableIterator<'a> {
 	pub(crate) fn new(table: &'a Table, range: InternalKeyRange) -> Result<Self> {
 		let IndexType::Partitioned(ref partitioned_index) = table.index_block;
 
@@ -1709,7 +1709,7 @@ impl<'a> TwoLevelIterator<'a> {
 	}
 }
 
-impl InternalIterator for TwoLevelIterator<'_> {
+impl InternalIterator for TableIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.exhausted = false;
 		self.seek_internal(target)?;
