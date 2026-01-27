@@ -9,8 +9,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::{InternalKey, InternalKeyKind};
-use crate::{CompressionType, Options};
+use crate::{CompressionType, InternalIterator, InternalKey, InternalKeyKind, Options};
 
 // ========== Helper Functions ==========
 
@@ -117,18 +116,18 @@ fn test_compression_10k_pairs_roundtrip() {
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
-	let mut iter = table.iter(false, None);
+	let mut iter = table.iter(None).unwrap();
 	let mut count = 0;
 	iter.seek_to_first().unwrap();
 	while iter.valid() {
-		let key = iter.key();
+		let key = iter.key().to_owned();
 		let value = iter.value();
 
-		assert_eq!(key.user_key.as_slice(), &data[count].0[..]);
-		assert_eq!(value.as_slice(), &data[count].1[..]);
+		assert_eq!(key.user_key, &data[count].0[..]);
+		assert_eq!(value, &data[count].1[..]);
 
 		count += 1;
-		iter.advance().unwrap();
+		iter.next().unwrap();
 	}
 	assert_eq!(count, 10_000, "Should iterate through all 10k entries");
 
@@ -137,8 +136,8 @@ fn test_compression_10k_pairs_roundtrip() {
 		let seek_key = InternalKey::new(data[idx].0.clone(), 2, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode()).unwrap();
 		assert!(iter.valid(), "Iterator should be valid after seek");
-		assert_eq!(iter.key().user_key.as_slice(), &data[idx].0[..]);
-		assert_eq!(iter.value().as_slice(), &data[idx].1[..]);
+		assert_eq!(iter.key().user_key(), &data[idx].0[..]);
+		assert_eq!(iter.value(), &data[idx].1[..]);
 	}
 }
 
@@ -201,19 +200,19 @@ fn test_compression_size_reduction() {
 			.unwrap(),
 	);
 
-	let mut iter_uncompressed = table_uncompressed.iter(false, None);
-	let mut iter_compressed = table_compressed.iter(false, None);
+	let mut iter_uncompressed = table_uncompressed.iter(None).unwrap();
+	let mut iter_compressed = table_compressed.iter(None).unwrap();
 
 	iter_uncompressed.seek_to_first().unwrap();
 	iter_compressed.seek_to_first().unwrap();
 
 	let mut count = 0;
 	while iter_uncompressed.valid() && iter_compressed.valid() {
-		assert_eq!(iter_uncompressed.key().user_key, iter_compressed.key().user_key);
+		assert_eq!(iter_uncompressed.key().user_key(), iter_compressed.key().user_key());
 		assert_eq!(iter_uncompressed.value(), iter_compressed.value());
 		count += 1;
-		iter_uncompressed.advance().unwrap();
-		iter_compressed.advance().unwrap();
+		iter_uncompressed.next().unwrap();
+		iter_compressed.next().unwrap();
 	}
 	assert_eq!(count, 10_000, "Both tables should have identical 10k entries");
 }
@@ -261,15 +260,15 @@ fn test_compression_mixed_patterns() {
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
-	let mut iter = table.iter(false, None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	let mut count = 0;
 
 	while iter.valid() {
-		assert_eq!(iter.key().user_key.as_slice(), &data[count].0[..]);
-		assert_eq!(iter.value().as_slice(), &data[count].1[..]);
+		assert_eq!(iter.key().user_key(), &data[count].0[..]);
+		assert_eq!(iter.value(), &data[count].1[..]);
 		count += 1;
-		iter.advance().unwrap();
+		iter.next().unwrap();
 	}
 
 	assert_eq!(count, 10_000, "Should have all 10k mixed pattern entries");
@@ -296,33 +295,33 @@ fn test_compression_iterator_operations() {
 	};
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
-	let mut iter = table.iter(false, None);
+	let mut iter = table.iter(None).unwrap();
 
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_slice(), &data[0].0[..]);
-	assert_eq!(iter.value().as_slice(), &data[0].1[..]);
+	assert_eq!(iter.key().user_key(), &data[0].0[..]);
+	assert_eq!(iter.value(), &data[0].1[..]);
 
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_slice(), &data[9999].0[..]);
-	assert_eq!(iter.value().as_slice(), &data[9999].1[..]);
+	assert_eq!(iter.key().user_key(), &data[9999].0[..]);
+	assert_eq!(iter.value(), &data[9999].1[..]);
 
 	for _ in 0..100 {
 		let idx = rng.random_range(0..10_000);
 		let seek_key = InternalKey::new(data[idx].0.clone(), 2, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode()).unwrap();
 		assert!(iter.valid(), "Should find key at index {}", idx);
-		assert_eq!(iter.key().user_key.as_slice(), &data[idx].0[..]);
-		assert_eq!(iter.value().as_slice(), &data[idx].1[..]);
+		assert_eq!(iter.key().user_key(), &data[idx].0[..]);
+		assert_eq!(iter.value(), &data[idx].1[..]);
 	}
 
 	iter.seek_to_first().unwrap();
 	let mut forward_count = 0;
 	while iter.valid() {
-		assert_eq!(iter.key().user_key.as_slice(), &data[forward_count].0[..]);
+		assert_eq!(iter.key().user_key(), &data[forward_count].0[..]);
 		forward_count += 1;
-		iter.advance().unwrap();
+		iter.next().unwrap();
 	}
 	assert_eq!(forward_count, 10_000);
 
@@ -330,12 +329,12 @@ fn test_compression_iterator_operations() {
 	// movement
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_slice(), &data[9999].0[..]);
+	assert_eq!(iter.key().user_key(), &data[9999].0[..]);
 
 	iter.prev().unwrap();
 	assert!(iter.valid(), "Should be valid after first prev()");
 
-	let prev_key = iter.key().user_key;
+	let prev_key = iter.key().user_key().to_vec();
 	assert!(prev_key < data[9999].0, "Previous key should be less than last key");
 
 	for _ in 0..10 {
@@ -347,24 +346,24 @@ fn test_compression_iterator_operations() {
 
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_slice(), &data[0].0[..]);
+	assert_eq!(iter.key().user_key(), &data[0].0[..]);
 
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
-	iter.advance().unwrap();
-	assert_eq!(iter.key().user_key.as_slice(), &data[1].0[..]);
+	iter.next().unwrap();
+	assert_eq!(iter.key().user_key(), &data[1].0[..]);
 	iter.prev().unwrap();
-	assert_eq!(iter.key().user_key.as_slice(), &data[0].0[..]);
+	assert_eq!(iter.key().user_key(), &data[0].0[..]);
 
 	let mid_key = InternalKey::new(data[5000].0.clone(), 2, InternalKeyKind::Set, 0);
 	iter.seek(&mid_key.encode()).unwrap();
-	assert_eq!(iter.key().user_key.as_slice(), &data[5000].0[..]);
+	assert_eq!(iter.key().user_key(), &data[5000].0[..]);
 
-	iter.advance().unwrap();
-	iter.advance().unwrap();
-	assert_eq!(iter.key().user_key.as_slice(), &data[5002].0[..]);
+	iter.next().unwrap();
+	iter.next().unwrap();
+	assert_eq!(iter.key().user_key(), &data[5002].0[..]);
 	iter.prev().unwrap();
-	assert_eq!(iter.key().user_key.as_slice(), &data[5001].0[..]);
+	assert_eq!(iter.key().user_key(), &data[5001].0[..]);
 }
 
 #[test]
@@ -397,25 +396,20 @@ fn test_compression_large_values() {
 
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
 
-	let mut iter = table.iter(false, None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	let mut count = 0;
 
 	while iter.valid() {
-		let key = iter.key();
+		let key = iter.key().to_owned();
 		let value = iter.value();
 
-		assert_eq!(key.user_key.as_slice(), &data[count].0[..]);
+		assert_eq!(key.user_key, &data[count].0[..]);
 		assert_eq!(value.len(), data[count].1.len(), "Value length mismatch at index {}", count);
-		assert_eq!(
-			value.as_slice(),
-			&data[count].1[..],
-			"Value content mismatch at index {}",
-			count
-		);
+		assert_eq!(value, &data[count].1[..], "Value content mismatch at index {}", count);
 
 		count += 1;
-		iter.advance().unwrap();
+		iter.next().unwrap();
 	}
 
 	assert_eq!(count, 1_000, "Should have all 1000 large value entries");
@@ -425,8 +419,8 @@ fn test_compression_large_values() {
 		let seek_key = InternalKey::new(data[idx].0.clone(), 2, InternalKeyKind::Set, 0);
 		iter.seek(&seek_key.encode()).unwrap();
 		assert!(iter.valid(), "Should find large value at index {}", idx);
-		assert_eq!(iter.key().user_key.as_slice(), &data[idx].0[..]);
-		assert_eq!(iter.value().as_slice(), &data[idx].1[..]);
+		assert_eq!(iter.key().user_key(), &data[idx].0[..]);
+		assert_eq!(iter.value(), &data[idx].1[..]);
 	}
 }
 
@@ -452,7 +446,7 @@ fn test_compression_checksum_verification() {
 	let table = Arc::new(
 		Table::new(1, Arc::clone(&opts), wrap_buffer(buffer.clone()), size as u64).unwrap(),
 	);
-	let mut iter = table.iter(false, None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid(), "Uncorrupted table should be valid");
 
@@ -471,7 +465,7 @@ fn test_compression_checksum_verification() {
 		Ok(corrupted_table) => {
 			// Corruption might be in a data block - try to iterate
 			let corrupted_table = Arc::new(corrupted_table);
-			let mut corrupted_iter = corrupted_table.iter(false, None);
+			let mut corrupted_iter = corrupted_table.iter(None).unwrap();
 			assert!(
 				corrupted_iter.seek_to_first().is_err(),
 				"seek_to_first() on corrupted table should return error"
@@ -528,11 +522,14 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 	let first_key = keys.first().unwrap();
 
 	let mut iter = txn.range(first_key.as_slice(), &[0xFFu8; 100]).unwrap();
+	iter.seek_first().unwrap();
 
 	let mut scanned_count = 0;
 	let mut prev_key: Option<Vec<u8>> = None;
 
-	while let Some(Ok((key, value))) = iter.next() {
+	while iter.valid() {
+		let key = iter.key().to_owned();
+		let value = iter.value().unwrap();
 		if let Some(ref prev) = prev_key {
 			assert!(
 				key.as_slice() > prev.as_slice(),
@@ -540,15 +537,11 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 			);
 		}
 
-		assert!(
-			keys.iter().any(|k| k.as_slice() == key.as_slice()),
-			"Scanned key should be in original key set"
-		);
-
-		assert!(!value.is_empty(), "Value should not be empty");
-
-		prev_key = Some(key.clone());
+		assert!(keys.iter().any(|k| k == &key), "Scanned key should be in original key set");
+		assert!(!value.is_none(), "Value should not be empty");
+		prev_key = Some(key);
 		scanned_count += 1;
+		iter.next().unwrap();
 	}
 
 	assert_eq!(scanned_count, keys.len(), "Range scan should return all keys");
@@ -558,10 +551,12 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 	let start_key = &keys[0];
 	let end_key = &keys[99.min(keys.len() - 1)];
 	let mut partial_iter = txn.range(start_key.as_slice(), end_key.as_slice()).unwrap();
+	partial_iter.seek_first().unwrap();
 
 	let mut partial_count = 0;
-	while let Some(Ok(_)) = partial_iter.next() {
+	while partial_iter.valid() {
 		partial_count += 1;
+		partial_iter.next().unwrap();
 	}
 	assert!(
 		partial_count >= 1,
@@ -674,11 +669,13 @@ async fn test_lsm_compression_persistence_after_reopen() {
 		let txn = tree.begin().unwrap();
 		let first_key = keys.first().unwrap();
 		let mut iter = txn.range(first_key.as_slice(), &[0xFFu8; 100]).unwrap();
+		iter.seek_first().unwrap();
 
 		let mut scanned_count = 0;
 		let mut prev_key: Option<Vec<u8>> = None;
-
-		while let Some(Ok((key, value))) = iter.next() {
+		while iter.valid() {
+			let key = iter.key().to_owned();
+			let value = iter.value().unwrap().unwrap();
 			if let Some(ref prev) = prev_key {
 				assert!(
 					key.as_slice() > prev.as_slice(),
@@ -694,8 +691,9 @@ async fn test_lsm_compression_persistence_after_reopen() {
 			assert!(!value.is_empty(), "Value should not be empty");
 			assert_eq!(value.len(), 250, "Value should be 250 bytes");
 
-			prev_key = Some(key.clone());
+			prev_key = Some(key);
 			scanned_count += 1;
+			iter.next().unwrap();
 		}
 
 		assert_eq!(scanned_count, keys.len(), "Range scan should return all keys after reopen");
@@ -907,11 +905,11 @@ fn test_table_writer_with_level_compression() {
 	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), buffer_len).unwrap());
 
 	// Verify the table was created successfully
-	let mut iter = table.iter(false, None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_slice(), b"key1");
-	assert_eq!(iter.value().as_slice(), b"value1");
+	assert_eq!(iter.key().user_key(), b"key1");
+	assert_eq!(iter.value(), b"value1");
 }
 
 #[test(tokio::test)]
@@ -987,6 +985,7 @@ async fn test_compression_per_level_with_different_levels() {
 	// Insert enough data to potentially create multiple levels
 	let mut keys = Vec::new();
 	for i in 0..5000 {
+		println!("Inserting key {}", i);
 		let key = format!("test_key_{:04}", i).into_bytes();
 		let value = generate_compressible_value(500, b'X');
 		keys.push(key.clone());

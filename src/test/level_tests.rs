@@ -7,16 +7,20 @@ use std::sync::Arc;
 
 use crate::levels::Level;
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::{InternalKey, InternalKeyKind};
-use crate::{InternalKeyRange, Options};
+use crate::{
+	InternalKey,
+	InternalKeyKind,
+	InternalKeyRange,
+	Options,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+	INTERNAL_KEY_TIMESTAMP_MAX,
+};
 
 /// Helper to create an InternalKeyRange
 fn make_range(
 	lower: Option<(&[u8], bool)>, // (key, inclusive)
 	upper: Option<(&[u8], bool)>, // (key, inclusive)
 ) -> InternalKeyRange {
-	use crate::sstable::{INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX};
-
 	let start = match lower {
 		None => Bound::Unbounded,
 		Some((k, true)) => Bound::Included(InternalKey::new(

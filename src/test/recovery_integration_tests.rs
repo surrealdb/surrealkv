@@ -84,7 +84,7 @@ async fn test_recover_with_existing_ssts() {
 
 	{
 		let tree = create_tree(path.clone(), |b| {
-			b.with_max_memtable_size(512) // Small to trigger flush
+			b.with_max_memtable_size(64 * 1024) // Explicit flushes, no size pressure needed
 		});
 
 		// First batch - will be flushed
@@ -297,7 +297,8 @@ async fn test_file_count_after_recovery() {
 	// Write data causing multiple flushes
 	{
 		let tree = create_tree(path.clone(), |b| {
-			b.with_max_memtable_size(512) // Trigger multiple flushes
+			b.with_max_memtable_size(4 * 1024) // Small enough to trigger ~5-6 automatic flushes with 150
+			                          // entries
 		});
 
 		for i in 0..150 {
@@ -396,7 +397,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 	let path = temp_dir.path().to_path_buf();
 
 	{
-		let tree = create_tree(path.clone(), |b| b.with_max_memtable_size(384));
+		let tree = create_tree(path.clone(), |b| b.with_max_memtable_size(64 * 1024)); // Explicit flushes, no size pressure needed
 
 		// Batch A - will be flushed
 		for i in 0..10 {
@@ -500,7 +501,7 @@ async fn test_manifest_log_number_progression() {
 
 	// Cycle 1: Write and flush
 	{
-		let tree = create_tree(path.clone(), |b| b.with_max_memtable_size(400));
+		let tree = create_tree(path.clone(), |b| b.with_max_memtable_size(64 * 1024)); // Explicit flushes, no size pressure needed
 
 		let log_num_initial = RecoveryTestHelper::get_manifest_log_number(&tree);
 

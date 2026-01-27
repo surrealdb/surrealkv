@@ -3,12 +3,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::sstable::{
-	InternalKey,
-	InternalKeyKind,
-	INTERNAL_KEY_SEQ_NUM_MAX,
-	INTERNAL_KEY_TIMESTAMP_MAX,
-};
+use crate::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX};
 
 /// A trait for comparing keys in a key-value store.
 ///
@@ -643,8 +638,6 @@ mod tests {
 	// InternalKeyComparator Tests
 	// ============================================================================
 
-	use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX};
-
 	/// Helper to create an encoded internal key for testing
 	fn ikey(user_key: &[u8], seq: u64, kind: InternalKeyKind) -> Vec<u8> {
 		InternalKey::new(user_key.to_vec(), seq, kind, 0).encode()
@@ -657,7 +650,7 @@ mod tests {
 			user_key.to_vec(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
-			crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+			INTERNAL_KEY_TIMESTAMP_MAX,
 		)
 		.encode()
 	}

@@ -164,7 +164,7 @@ mod tests {
 
 	use super::*;
 	use crate::sstable::bloom::LevelDBBloomFilter;
-	use crate::sstable::{InternalKey, InternalKeyKind};
+	use crate::{InternalKey, InternalKeyKind};
 
 	#[test]
 	fn test_empty() {

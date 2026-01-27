@@ -10,14 +10,14 @@ use crate::clock::MockLogicalClock;
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::leveled::{CompactionPriority, Strategy};
 use crate::compaction::{CompactionChoice, CompactionStrategy};
+use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::CompactionIterator;
 use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
 use crate::memtable::ImmutableMemtables;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
-use crate::sstable::{InternalKey, InternalKeyKind};
 use crate::vlog::ValueLocation;
-use crate::{CompressionType, Key, Options, Value};
+use crate::{CompressionType, InternalIterator, InternalKey, InternalKeyKind, Key, Options, Value};
 
 /// Test environment setup helpers
 struct TestEnv {
@@ -78,6 +78,11 @@ impl TestEnv {
 
 		Ok(Arc::new(table))
 	}
+}
+
+/// Helper function to create a comparator for testing
+fn create_comparator() -> Arc<InternalKeyComparator> {
+	Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())))
 }
 
 /// Helper function to create encoded inline values for testing
@@ -231,12 +236,14 @@ fn verify_keys_after_compaction(
 
 	for level in levels {
 		for table in &level.tables {
-			let iter = table.iter(false, None);
-
-			for result in iter {
-				let (key, value) = result.unwrap();
+			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
+			while iter.valid() {
+				let key = iter.key().to_owned().user_key.clone();
+				let value = iter.value().to_vec();
 				count += 1;
-				all_key_values.insert(key.user_key.clone(), value.clone());
+				all_key_values.insert(key, value);
+				iter.next().unwrap();
 			}
 		}
 	}
@@ -271,10 +278,14 @@ fn verify_all_keys_present(
 	// Collect all keys from all tables across all levels
 	for level in levels {
 		for table in &level.tables {
-			let iter = table.iter(false, None);
-			for result in iter {
-				let (key, value) = result.unwrap();
-				all_key_values.insert(key.user_key.clone(), value.clone());
+			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
+
+			while iter.valid() {
+				let key = iter.key().to_owned().user_key.clone();
+				let value = iter.value().to_vec();
+				all_key_values.insert(key, value);
+				iter.next().unwrap();
 			}
 		}
 	}
@@ -584,9 +595,12 @@ async fn test_simple_merge_compaction() {
 		let mut total_keys = 0;
 		for table in &levels.get_levels()[0].tables {
 			let mut table_keys = 0;
-			let iter = table.iter(false, None);
-			for _ in iter {
+			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
+
+			while iter.valid() {
 				table_keys += 1;
+				iter.next().unwrap();
 			}
 			total_keys += table_keys;
 		}
@@ -884,12 +898,15 @@ async fn test_multi_level_merge_compaction() {
 				let mut min_key = None;
 				let mut max_key = None;
 
-				for item in table.iter(false, None) {
-					let (key, _) = item.unwrap();
+				let mut iter = table.iter(None).unwrap();
+				iter.seek_first().unwrap();
+				while iter.valid() {
+					let key = iter.key().to_owned().user_key.clone();
 					if min_key.is_none() {
-						min_key = Some(key.user_key.clone());
+						min_key = Some(key.clone());
 					}
-					max_key = Some(key.user_key);
+					max_key = Some(key);
+					iter.next().unwrap();
 				}
 
 				if let (Some(min), Some(max)) = (min_key, max_key) {
@@ -1392,15 +1409,16 @@ async fn test_compaction_respects_sequence_numbers() {
 	let mut all_keys = HashMap::new();
 	for level in levels {
 		for table in &level.tables {
-			let iter = table.iter(false, None);
-			for result in iter {
-				let (key, encoded_value) = result.unwrap();
-				// Decode the ValueLocation before comparing
-				let location = ValueLocation::decode(&encoded_value).unwrap();
+			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
+			while iter.valid() {
+				let key = iter.key().to_owned().user_key.clone();
+				let location = ValueLocation::decode(&iter.value().to_vec()).unwrap();
 				if location.is_value_pointer() {
 					panic!("Unexpected VLog pointer in test");
 				}
-				all_keys.insert(key.user_key.clone(), (*location.value).to_vec());
+				all_keys.insert(key, (*location.value).to_vec());
+				iter.next().unwrap();
 			}
 		}
 	}
@@ -1478,12 +1496,15 @@ async fn test_tombstone_propagation() {
 	let mut remaining_keys = Vec::new();
 	for level in levels {
 		for table in &level.tables {
-			for item in table.iter(false, None) {
-				let (key, _) = item.unwrap();
+			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
+			while iter.valid() {
+				let key = iter.key().to_owned();
 				if key.kind() == InternalKeyKind::Set {
 					let key_str = String::from_utf8_lossy(&key.user_key);
 					remaining_keys.push(key_str.to_string());
 				}
+				iter.next().unwrap();
 			}
 		}
 	}
@@ -1574,11 +1595,13 @@ async fn test_l0_overlapping_keys_compaction() {
 	let mut tombstones = HashMap::new();
 	for level in levels {
 		for table in &level.tables {
-			for item in table.iter(false, None) {
-				let (key, encoded_value) = item.unwrap();
+			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
+			while iter.valid() {
+				let key = iter.key().to_owned();
+				let encoded_value = iter.value().to_vec();
 				match key.kind() {
 					InternalKeyKind::Set => {
-						// Decode the ValueLocation
 						let location = ValueLocation::decode(&encoded_value).unwrap();
 						if location.is_value_pointer() {
 							panic!("Unexpected VLog pointer in test");
@@ -1590,6 +1613,7 @@ async fn test_l0_overlapping_keys_compaction() {
 					}
 					_ => {}
 				}
+				iter.next().unwrap();
 			}
 		}
 	}
@@ -1690,16 +1714,19 @@ async fn test_l0_tombstone_propagation_overlapping() {
 	let mut survivors = HashMap::new();
 	for level in levels {
 		for table in &level.tables {
-			for item in table.iter(false, None) {
-				let (key, encoded_value) = item.unwrap();
+			let mut iter = table.iter(None).unwrap();
+			iter.seek_first().unwrap();
+			while iter.valid() {
+				let key = iter.key().to_owned();
+				let encoded_value = iter.value().to_vec();
 				if key.kind() == InternalKeyKind::Set {
-					// Decode the ValueLocation
 					let location = ValueLocation::decode(&encoded_value).unwrap();
 					if location.is_value_pointer() {
 						panic!("Unexpected VLog pointer in test");
 					}
 					survivors.insert(key.user_key.clone(), (*location.value).to_vec());
 				}
+				iter.next().unwrap();
 			}
 		}
 	}
@@ -1813,13 +1840,16 @@ async fn test_tombstone_propagation_through_levels() {
 	let mut tombstones = 0;
 	let mut values = 0;
 	for table in &levels[3].tables {
-		for item in table.iter(false, None) {
-			let (key, _) = item.unwrap();
+		let mut iter = table.iter(None).unwrap();
+		iter.seek_first().unwrap();
+		while iter.valid() {
+			let key = iter.key().to_owned();
 			match key.kind() {
 				InternalKeyKind::Delete => tombstones += 1,
 				InternalKeyKind::Set => values += 1,
 				_ => {}
 			}
+			iter.next().unwrap();
 		}
 	}
 
@@ -1861,11 +1891,12 @@ fn test_tombstone_propagation_journey() {
 
 	// Test non-bottom level compaction
 	let iterators: Vec<_> = vec![
-		Box::new(tombstone_table.iter(false, None)) as Box<dyn DoubleEndedIterator<Item = _>>,
-		Box::new(value_table.iter(false, None)) as Box<dyn DoubleEndedIterator<Item = _>>,
+		Box::new(tombstone_table.iter(None).unwrap()) as Box<dyn InternalIterator>,
+		Box::new(value_table.iter(None).unwrap()) as Box<dyn InternalIterator>,
 	];
 	let mut comp_iter_non_bottom = CompactionIterator::new(
 		iterators,
+		create_comparator(),
 		false,
 		None,
 		false,
@@ -1882,11 +1913,18 @@ fn test_tombstone_propagation_journey() {
 
 	// Test bottom level compaction
 	let iterators: Vec<_> = vec![
-		Box::new(tombstone_table.iter(false, None)) as Box<dyn DoubleEndedIterator<Item = _>>,
-		Box::new(value_table.iter(false, None)) as Box<dyn DoubleEndedIterator<Item = _>>,
+		Box::new(tombstone_table.iter(None).unwrap()) as Box<dyn InternalIterator>,
+		Box::new(value_table.iter(None).unwrap()) as Box<dyn InternalIterator>,
 	];
-	let mut comp_iter_bottom =
-		CompactionIterator::new(iterators, true, None, false, 0, Arc::new(MockLogicalClock::new()));
+	let mut comp_iter_bottom = CompactionIterator::new(
+		iterators,
+		create_comparator(),
+		true,
+		None,
+		false,
+		0,
+		Arc::new(MockLogicalClock::new()),
+	);
 	let bottom_result: Vec<_> = comp_iter_bottom.by_ref().map(|r| r.unwrap()).collect();
 
 	// Bottom level should filter out tombstones
@@ -2086,14 +2124,17 @@ async fn test_soft_delete_compaction_behavior() {
 
 	// Count entries in L1 (bottom level) after compaction
 	for table in &levels[1].tables {
-		for item in table.iter(false, None) {
-			let (key, _) = item.unwrap();
+		let mut iter = table.iter(None).unwrap();
+		iter.seek_first().unwrap();
+		while iter.valid() {
+			let key = iter.key().to_owned();
 			match key.kind() {
 				InternalKeyKind::SoftDelete => soft_deletes += 1,
 				InternalKeyKind::Delete => regular_deletes += 1,
 				InternalKeyKind::Set => values += 1,
 				_ => {}
 			}
+			iter.next().unwrap();
 		}
 	}
 
@@ -2105,8 +2146,11 @@ async fn test_soft_delete_compaction_behavior() {
 	// Verify that values are the latest and correct
 	let mut found_keys = HashSet::new();
 	for table in &levels[1].tables {
-		for item in table.iter(false, None) {
-			let (key, value) = item.unwrap();
+		let mut iter = table.iter(None).unwrap();
+		iter.seek_first().unwrap();
+		while iter.valid() {
+			let key = iter.key().to_owned();
+			let value = iter.value().to_vec();
 			match key.kind() {
 				InternalKeyKind::Set => {
 					let key_str = String::from_utf8(key.user_key.clone()).unwrap();
@@ -2144,6 +2188,7 @@ async fn test_soft_delete_compaction_behavior() {
 				}
 				_ => {}
 			}
+			iter.next().unwrap();
 		}
 	}
 
@@ -2229,13 +2274,16 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 	let mut sets = 0;
 
 	for table in &levels[1].tables {
-		for item in table.iter(false, None) {
-			let (key, _) = item.unwrap();
+		let mut iter = table.iter(None).unwrap();
+		iter.seek_first().unwrap();
+		while iter.valid() {
+			let key = iter.key().to_owned();
 			match key.kind() {
 				InternalKeyKind::SoftDelete => soft_deletes += 1,
 				InternalKeyKind::Set => sets += 1,
 				_ => {}
 			}
+			iter.next().unwrap();
 		}
 	}
 

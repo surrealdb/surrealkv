@@ -9,9 +9,14 @@ use crate::levels::{Level, Levels};
 use crate::memtable::MemTable;
 use crate::snapshot::{IterState, KMergeIterator, Snapshot, VersionedRangeQueryParams};
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::{InternalKey, InternalKeyKind};
+use crate::test::{
+	collect_all,
+	collect_snapshot_iter,
+	collect_snapshot_reverse,
+	collect_transaction_all,
+};
 use crate::vfs::File;
-use crate::{Options, Tree, TreeBuilder};
+use crate::{InternalIterator, InternalKey, InternalKeyKind, Options, Tree, TreeBuilder};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -34,7 +39,7 @@ async fn test_empty_snapshot() {
 	let tx = store.begin().unwrap();
 
 	// Range scan should return empty
-	let range: Vec<_> = tx.range(b"a", b"z").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+	let range = collect_transaction_all(&mut tx.range(b"a", b"z").unwrap()).unwrap();
 
 	assert!(range.is_empty());
 }
@@ -63,8 +68,7 @@ async fn test_basic_snapshot_visibility() {
 	}
 
 	// The read transaction should only see the initial data
-	let range: Vec<_> =
-		read_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+	let range = collect_transaction_all(&mut read_tx.range(b"key0", b"key:").unwrap()).unwrap();
 
 	assert_eq!(range.len(), 2);
 	assert_eq!(range[0].0, b"key1");
@@ -95,21 +99,19 @@ async fn test_snapshot_isolation_with_updates() {
 	}
 
 	// The read transaction should see the old values
-	let range: Vec<_> =
-		read_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+	let range = collect_transaction_all(&mut read_tx.range(b"key0", b"key:").unwrap()).unwrap();
 
 	assert_eq!(range.len(), 2);
-	assert_eq!(range[0].1, b"value1_v1");
-	assert_eq!(range[1].1, b"value2_v1");
+	assert_eq!(range[0].1, Some(b"value1_v1".to_vec()));
+	assert_eq!(range[1].1, Some(b"value2_v1".to_vec()));
 
 	// A new transaction should see the updated values
 	let new_tx = store.begin().unwrap();
-	let range: Vec<_> =
-		new_tx.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+	let range = collect_transaction_all(&mut new_tx.range(b"key0", b"key:").unwrap()).unwrap();
 
 	assert_eq!(range.len(), 2);
-	assert_eq!(range[0].1, b"value1_v2");
-	assert_eq!(range[1].1, b"value2_v2");
+	assert_eq!(range[0].1, Some(b"value1_v2".to_vec()));
+	assert_eq!(range[1].1, Some(b"value2_v2".to_vec()));
 }
 
 #[test(tokio::test)]
@@ -136,8 +138,7 @@ async fn test_tombstone_handling() {
 	}
 
 	// The first read transaction should still see all three keys
-	let range: Vec<_> =
-		read_tx1.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+	let range = collect_transaction_all(&mut read_tx1.range(b"key0", b"key:").unwrap()).unwrap();
 
 	assert_eq!(range.len(), 3);
 	assert_eq!(range[0].0, b"key1");
@@ -146,8 +147,7 @@ async fn test_tombstone_handling() {
 
 	// A new transaction should not see the deleted key
 	let read_tx2 = store.begin().unwrap();
-	let range: Vec<_> =
-		read_tx2.range(b"key0", b"key:").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+	let range = collect_transaction_all(&mut read_tx2.range(b"key0", b"key:").unwrap()).unwrap();
 
 	assert_eq!(range.len(), 2);
 	assert_eq!(range[0].0, b"key1");
@@ -230,20 +230,18 @@ async fn test_range_with_random_operations() {
 	let tx2 = store.begin().unwrap();
 
 	// tx1 should see all original data
-	let range1: Vec<_> =
-		tx1.range(b"key00", b"key99").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+	let range1 = collect_transaction_all(&mut tx1.range(b"key00", b"key99").unwrap()).unwrap();
 
 	assert_eq!(range1.len(), 10);
 	for (i, (key, value)) in range1.iter().enumerate() {
 		let expected_key = format!("key{:02}", i + 1);
 		let expected_value = format!("value{}", i + 1);
 		assert_eq!(key, expected_key.as_bytes());
-		assert_eq!(value, expected_value.as_bytes());
+		assert_eq!(value.as_ref().unwrap(), expected_value.as_bytes());
 	}
 
 	// tx2 should see updated data with deletions
-	let range2: Vec<_> =
-		tx2.range(b"key00", b"key99").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+	let range2 = collect_transaction_all(&mut tx2.range(b"key00", b"key99").unwrap()).unwrap();
 
 	assert_eq!(range2.len(), 7); // 10 - 3 deleted
 
@@ -260,7 +258,7 @@ async fn test_range_with_random_operations() {
 		if let Ok(num) = key_str.trim_start_matches("key").parse::<i32>() {
 			if num % 2 == 0 {
 				let expected_value = format!("value{num}_updated");
-				assert_eq!(value, expected_value.as_bytes());
+				assert_eq!(value.as_ref().unwrap().as_slice(), expected_value.as_bytes());
 			}
 		}
 	}
@@ -327,13 +325,13 @@ async fn test_snapshot_with_complex_key_patterns() {
 	let tx = store.begin().unwrap();
 
 	// Test different range queries
-	let numeric_range: Vec<_> = tx.range(b"000", b"999").unwrap().collect::<Vec<_>>();
+	let numeric_range = collect_transaction_all(&mut tx.range(b"000", b"999").unwrap()).unwrap();
 	assert_eq!(numeric_range.len(), 10);
 
-	let alpha_range: Vec<_> = tx.range(b"a", b"z").unwrap().collect::<Vec<_>>();
+	let alpha_range = collect_transaction_all(&mut tx.range(b"a", b"z").unwrap()).unwrap();
 	assert_eq!(alpha_range.len(), 15); // 10 numeric + 10 alpha + 5 mixed
 
-	let mixed_range: Vec<_> = tx.range(b"mix", b"miy").unwrap().collect::<Vec<_>>();
+	let mixed_range = collect_transaction_all(&mut tx.range(b"mix", b"miy").unwrap()).unwrap();
 	assert_eq!(mixed_range.len(), 5);
 }
 
@@ -355,8 +353,7 @@ async fn test_snapshot_ordering_invariants() {
 	let tx = store.begin().unwrap();
 
 	// Range scan should return keys in sorted order
-	let range: Vec<_> =
-		tx.range(b"key00", b"key99").unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+	let range = collect_transaction_all(&mut tx.range(b"key00", b"key99").unwrap()).unwrap();
 
 	assert_eq!(range.len(), 9);
 
@@ -390,8 +387,11 @@ async fn test_snapshot_keys_only() {
 	let tx = tx.snapshot.as_ref().unwrap();
 
 	// Get keys only ([key1, key6) to include key5)
-	let keys_only_iter = tx.range(Some("key1".as_bytes()), Some("key6".as_bytes()), true).unwrap();
-	let keys_only: Vec<_> = keys_only_iter.collect::<Result<Vec<_>, _>>().unwrap();
+	// Note: keys_only parameter no longer exists, using regular range and mapping to keys
+	let mut keys_only_iter = tx.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+	let keys_only_data = collect_snapshot_iter(&mut keys_only_iter).unwrap();
+	let keys_only: Vec<(Vec<u8>, Option<Vec<u8>>)> =
+		keys_only_data.into_iter().map(|(k, _)| (k.user_key, None)).collect();
 
 	// Verify we got all 5 keys
 	assert_eq!(keys_only.len(), 5);
@@ -406,9 +406,11 @@ async fn test_snapshot_keys_only() {
 	}
 
 	// Compare with regular range scan ([key1, key6) to include key5)
-	let regular_range_iter =
-		tx.range(Some("key1".as_bytes()), Some("key6".as_bytes()), false).unwrap();
-	let regular_range: Vec<_> = regular_range_iter.collect::<Result<Vec<_>, _>>().unwrap();
+	let mut regular_range_iter =
+		tx.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+	let regular_range_data = collect_snapshot_iter(&mut regular_range_iter).unwrap();
+	let regular_range: Vec<_> =
+		regular_range_data.into_iter().map(|(k, v)| (k.user_key, Some(v))).collect();
 
 	assert_eq!(regular_range.len(), keys_only.len());
 
@@ -456,7 +458,7 @@ fn test_range_skips_non_overlapping_tables() {
 	let levels = Levels(vec![Arc::new(level0)]);
 
 	let iter_state = IterState {
-		active: Arc::new(MemTable::new()),
+		active: Arc::new(MemTable::default()),
 		immutable: Vec::new(),
 		levels,
 	};
@@ -466,9 +468,9 @@ fn test_range_skips_non_overlapping_tables() {
 		Bound::Included("z0".as_bytes()),
 		Bound::Excluded("zz".as_bytes()),
 	);
-	let merge_iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let mut merge_iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let items: Vec<_> = merge_iter.map(|r| r.unwrap()).collect();
+	let items = collect_all(&mut merge_iter).unwrap();
 	assert_eq!(items.len(), 2);
 	assert_eq!(items[0].0.user_key.as_slice(), b"z1");
 	assert_eq!(items[1].0.user_key.as_slice(), b"z2");
@@ -494,20 +496,20 @@ async fn test_double_ended_iteration() {
 	let tx = tx.snapshot.as_ref().unwrap();
 
 	// Test forward iteration ([key1, key6) to include key5)
-	let forward_iter = tx.range(Some("key1".as_bytes()), Some("key6".as_bytes()), false).unwrap();
-	let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
+	let mut forward_iter = tx.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+	let forward_items = collect_snapshot_iter(&mut forward_iter).unwrap();
 
 	assert_eq!(forward_items.len(), 5);
-	assert_eq!(&forward_items[0].0, b"key1");
-	assert_eq!(&forward_items[4].0, b"key5");
+	assert_eq!(&forward_items[0].0.user_key, b"key1");
+	assert_eq!(&forward_items[4].0.user_key, b"key5");
 
 	// Test backward iteration ([key1, key6) to include key5)
-	let backward_iter = tx.range(Some("key1".as_bytes()), Some("key6".as_bytes()), false).unwrap();
-	let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
+	let mut backward_iter = tx.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+	let backward_items = collect_snapshot_reverse(&mut backward_iter).unwrap();
 
 	assert_eq!(backward_items.len(), 5);
-	assert_eq!(&backward_items[0].0, b"key5");
-	assert_eq!(&backward_items[4].0, b"key1");
+	assert_eq!(&backward_items[0].0.user_key, b"key5");
+	assert_eq!(&backward_items[4].0.user_key, b"key1");
 
 	// Verify both iterations produce the same items in reverse order
 	for i in 0..5 {
@@ -543,28 +545,28 @@ async fn test_double_ended_iteration_with_tombstones() {
 
 	// Test forward iteration on first snapshot (should see all keys)
 	let tx1_ref = tx1.snapshot.as_ref().unwrap();
-	let forward_iter1 =
-		tx1_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes()), false).unwrap();
-	let forward_items1: Vec<_> = forward_iter1.collect::<Result<Vec<_>, _>>().unwrap();
+	let mut forward_iter1 =
+		tx1_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
+	let forward_items1 = collect_snapshot_iter(&mut forward_iter1).unwrap();
 	assert_eq!(forward_items1.len(), 3);
 
 	// Test backward iteration on first snapshot
-	let backward_iter1 =
-		tx1_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes()), false).unwrap();
-	let backward_items1: Vec<_> = backward_iter1.rev().collect::<Result<Vec<_>, _>>().unwrap();
+	let mut backward_iter1 =
+		tx1_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
+	let backward_items1 = collect_snapshot_reverse(&mut backward_iter1).unwrap();
 	assert_eq!(backward_items1.len(), 3);
 
 	// Test forward iteration on second snapshot (should not see deleted key)
 	let tx2_ref = tx2.snapshot.as_ref().unwrap();
-	let forward_iter2 =
-		tx2_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes()), false).unwrap();
-	let forward_items2: Vec<_> = forward_iter2.collect::<Result<Vec<_>, _>>().unwrap();
+	let mut forward_iter2 =
+		tx2_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
+	let forward_items2 = collect_snapshot_iter(&mut forward_iter2).unwrap();
 	assert_eq!(forward_items2.len(), 2);
 
 	// Test backward iteration on second snapshot
-	let backward_iter2 =
-		tx2_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes()), false).unwrap();
-	let backward_items2: Vec<_> = backward_iter2.rev().collect::<Result<Vec<_>, _>>().unwrap();
+	let mut backward_iter2 =
+		tx2_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
+	let backward_items2 = collect_snapshot_reverse(&mut backward_iter2).unwrap();
 	assert_eq!(backward_items2.len(), 2);
 
 	// Verify both iterations produce the same items in reverse order
@@ -640,27 +642,27 @@ async fn test_soft_delete_snapshot_double_ended_iteration() {
 	// Test forward iteration
 	{
 		let snapshot_ref = tx.snapshot.as_ref().unwrap();
-		let forward_iter =
-			snapshot_ref.range(Some("key1".as_bytes()), Some("key6".as_bytes()), false).unwrap();
-		let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
+		let mut forward_iter =
+			snapshot_ref.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+		let forward_items = collect_snapshot_iter(&mut forward_iter).unwrap();
 
 		assert_eq!(forward_items.len(), 3); // key1, key3, key5
-		assert_eq!(&forward_items[0].0, b"key1");
-		assert_eq!(&forward_items[1].0, b"key3");
-		assert_eq!(&forward_items[2].0, b"key5");
+		assert_eq!(&forward_items[0].0.user_key, b"key1");
+		assert_eq!(&forward_items[1].0.user_key, b"key3");
+		assert_eq!(&forward_items[2].0.user_key, b"key5");
 	}
 
 	// Test backward iteration
 	{
 		let snapshot_ref = tx.snapshot.as_ref().unwrap();
-		let backward_iter =
-			snapshot_ref.range(Some("key1".as_bytes()), Some("key6".as_bytes()), false).unwrap();
-		let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
+		let mut backward_iter =
+			snapshot_ref.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+		let backward_items = collect_snapshot_reverse(&mut backward_iter).unwrap();
 
 		assert_eq!(backward_items.len(), 3); // key5, key3, key1
-		assert_eq!(&backward_items[0].0, b"key5");
-		assert_eq!(&backward_items[1].0, b"key3");
-		assert_eq!(&backward_items[2].0, b"key1");
+		assert_eq!(&backward_items[0].0.user_key, b"key5");
+		assert_eq!(&backward_items[1].0.user_key, b"key3");
+		assert_eq!(&backward_items[2].0.user_key, b"key1");
 	}
 }
 
@@ -695,25 +697,21 @@ async fn test_soft_delete_snapshot_mixed_with_hard_delete() {
 	// First snapshot should see all keys
 	{
 		let tx1_ref = tx1.snapshot.as_ref().unwrap();
-		let range: Vec<_> = tx1_ref
-			.range(Some("key1".as_bytes()), Some("key5".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			tx1_ref.range(Some("key1".as_bytes()), Some("key5".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 		assert_eq!(range.len(), 4);
 	}
 
 	// Second snapshot should not see either deleted key
 	{
 		let tx2_ref = tx2.snapshot.as_ref().unwrap();
-		let range: Vec<_> = tx2_ref
-			.range(Some("key1".as_bytes()), Some("key5".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			tx2_ref.range(Some("key1".as_bytes()), Some("key5".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 		assert_eq!(range.len(), 2); // Only key3 and key4
-		assert_eq!(&range[0].0, b"key3");
-		assert_eq!(&range[1].0, b"key4");
+		assert_eq!(&range[0].0.user_key, b"key3");
+		assert_eq!(&range[1].0.user_key, b"key4");
 	}
 }
 
@@ -737,14 +735,14 @@ async fn test_double_ended_iteration_mixed_operations() {
 
 	// Test forward iteration
 	let snapshot_ref = tx.snapshot.as_ref().unwrap();
-	let forward_iter =
-		snapshot_ref.range(Some("key01".as_bytes()), Some("key11".as_bytes()), false).unwrap();
-	let forward_items: Vec<_> = forward_iter.collect::<Result<Vec<_>, _>>().unwrap();
+	let mut forward_iter =
+		snapshot_ref.range(Some("key01".as_bytes()), Some("key11".as_bytes())).unwrap();
+	let forward_items = collect_snapshot_iter(&mut forward_iter).unwrap();
 
 	// Test backward iteration
-	let backward_iter =
-		snapshot_ref.range(Some("key01".as_bytes()), Some("key11".as_bytes()), false).unwrap();
-	let backward_items: Vec<_> = backward_iter.rev().collect::<Result<Vec<_>, _>>().unwrap();
+	let mut backward_iter =
+		snapshot_ref.range(Some("key01".as_bytes()), Some("key11".as_bytes())).unwrap();
+	let backward_items = collect_snapshot_reverse(&mut backward_iter).unwrap();
 
 	// Both should have 10 items
 	assert_eq!(forward_items.len(), 10);
@@ -753,8 +751,8 @@ async fn test_double_ended_iteration_mixed_operations() {
 	// Verify ordering
 	for i in 1..=10 {
 		let expected_key = format!("key{i:02}");
-		assert_eq!(&forward_items[i - 1].0, expected_key.as_bytes());
-		assert_eq!(&backward_items[10 - i].0, expected_key.as_bytes());
+		assert_eq!(&forward_items[i - 1].0.user_key, expected_key.as_bytes());
+		assert_eq!(&backward_items[10 - i].0.user_key, expected_key.as_bytes());
 	}
 
 	// Verify both iterations produce the same items in reverse order
@@ -849,7 +847,7 @@ fn create_iter_state_with_tables(
 	let levels = Levels(vec![Arc::new(level0), Arc::new(level1), Arc::new(level2)]);
 
 	IterState {
-		active: Arc::new(MemTable::new()),
+		active: Arc::new(MemTable::default()),
 		immutable: vec![],
 		levels,
 	}
@@ -857,9 +855,13 @@ fn create_iter_state_with_tables(
 
 // Helper to count the number of items returned by iterator
 fn count_kmerge_items(mut iter: KMergeIterator) -> usize {
+	iter.seek_first().unwrap();
 	let mut count = 0;
-	while iter.next().is_some() {
+	while iter.valid() {
 		count += 1;
+		if !iter.next().unwrap() {
+			break;
+		}
 	}
 	count
 }
@@ -886,7 +888,7 @@ fn test_level0_tables_before_range_skipped() {
 		Bound::Included(b"j".as_slice()),
 		Bound::Excluded(b"z".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "No tables should be included as all are before range");
@@ -914,7 +916,7 @@ fn test_level0_tables_after_range_skipped() {
 		Bound::Included(b"a".as_slice()),
 		Bound::Excluded(b"k".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "No tables should be included as all are after range");
@@ -942,7 +944,7 @@ fn test_level0_overlapping_tables_included() {
 		Bound::Included(b"d".as_slice()),
 		Bound::Excluded(b"h".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	// All 3 tables should contribute items
@@ -977,7 +979,7 @@ fn test_level0_mixed_overlap_scenarios() {
 		Bound::Included(b"f".as_slice()),
 		Bound::Excluded(b"j".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	// Should have items from multiple overlapping tables
@@ -1012,7 +1014,7 @@ fn test_level1_binary_search_correct_range() {
 		Bound::Included(b"e".as_slice()),
 		Bound::Excluded(b"h".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should have items from L1 tables in range");
@@ -1040,7 +1042,7 @@ fn test_level1_query_before_all_tables() {
 		Bound::Included(b"a".as_slice()),
 		Bound::Excluded(b"c".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "No tables should be included as query is before all L1 tables");
@@ -1068,7 +1070,7 @@ fn test_level1_query_after_all_tables() {
 		Bound::Included(b"m".as_slice()),
 		Bound::Excluded(b"z".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "No tables should be included as query is after all L1 tables");
@@ -1096,7 +1098,7 @@ fn test_level1_query_spans_all_tables() {
 		Bound::Included(b"a".as_slice()),
 		Bound::Excluded(b"z".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should have items from all L1 tables");
@@ -1121,9 +1123,9 @@ fn test_bound_included_start_and_end() {
 		Bound::Included(b"d".as_slice()),
 		Bound::Excluded(b"h".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let mut iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let items: Vec<_> = iter.collect();
+	let items = collect_all(&mut iter).unwrap();
 	assert!(!items.is_empty(), "Should have items in inclusive range");
 }
 
@@ -1147,9 +1149,9 @@ fn test_bound_excluded_start_and_end() {
 		Bound::Included(b"d".as_slice()),
 		Bound::Excluded(b"h".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let mut iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let items: Vec<_> = iter.collect();
+	let items = collect_all(&mut iter).unwrap();
 	// Keys "d1" and "d5" should be included (they're > "d" and < "h")
 	// But exact "d" and exact "h" should not be (though "h" is at the boundary)
 	assert!(items.len() >= 2, "Should have at least d1 and d5");
@@ -1171,7 +1173,7 @@ fn test_bound_unbounded_start() {
 	// Query with unbounded start
 	let internal_range =
 		crate::user_range_to_internal_range(Bound::Unbounded, Bound::Included(b"h".as_slice()));
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should iterate from beginning with unbounded start");
@@ -1193,7 +1195,7 @@ fn test_bound_unbounded_end() {
 	// Query with unbounded end
 	let internal_range =
 		crate::user_range_to_internal_range(Bound::Included(b"d".as_slice()), Bound::Unbounded);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should iterate to end with unbounded end");
@@ -1214,7 +1216,7 @@ fn test_fully_unbounded_range() {
 	let iter_state = create_iter_state_with_tables(vec![table1, table2], vec![], vec![], opts);
 
 	// Query with fully unbounded range
-	let iter = KMergeIterator::new_from(iter_state, (Bound::Unbounded, Bound::Unbounded), false);
+	let iter = KMergeIterator::new_from(iter_state, (Bound::Unbounded, Bound::Unbounded));
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should return all keys with fully unbounded range");
@@ -1236,7 +1238,7 @@ fn test_empty_levels() {
 		Bound::Included("a".as_bytes()),
 		Bound::Excluded("z".as_bytes()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "Iterator with no tables should return no items");
@@ -1260,9 +1262,9 @@ fn test_single_key_range() {
 		Bound::Included(b"a1".as_slice()),
 		Bound::Included(b"a1".as_slice()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let mut iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let items: Vec<_> = iter.map(|r| r.unwrap()).collect();
+	let items = collect_all(&mut iter).unwrap();
 	// Should return at most 1 item
 	for (key, _) in &items {
 		assert_eq!(key.user_key.as_slice(), b"a1");
@@ -1287,7 +1289,7 @@ fn test_inverted_range() {
 		Bound::Included("z".as_bytes()),
 		Bound::Excluded("a".as_bytes()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert_eq!(count, 0, "Inverted range should return no items");
@@ -1315,7 +1317,7 @@ fn test_mixed_level0_and_level1_tables() {
 		Bound::Included("e".as_bytes()),
 		Bound::Excluded("k".as_bytes()),
 	);
-	let iter = KMergeIterator::new_from(iter_state, internal_range, false);
+	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
 	let count = count_kmerge_items(iter);
 	assert!(count > 0, "Should have items from both L0 and L1 tables");
@@ -1329,7 +1331,7 @@ async fn test_cache_effectiveness_with_range_query() {
 	let tree = TreeBuilder::new()
 		.with_path(path)
 		.with_block_cache_capacity(10 * 1024 * 1024) // 10MB cache
-		.with_max_memtable_size(500) // Small memtable to trigger flushes
+		.with_max_memtable_size(1024 * 64) // Small memtable to trigger flushes
 		.build()
 		.unwrap();
 
@@ -1361,11 +1363,8 @@ async fn test_cache_effectiveness_with_range_query() {
 	eprintln!("=== First range query (populating cache) ===");
 	// First range query - this will populate the cache
 	let tx = tree.begin().unwrap();
-	let first_results: Vec<_> = tx
-		.range("key_00000000", "key_00010000")
-		.unwrap()
-		.collect::<crate::Result<Vec<_>>>()
-		.unwrap();
+	let first_results =
+		collect_transaction_all(&mut tx.range("key_00000000", "key_00010000").unwrap()).unwrap();
 
 	let first_stats = tree.core.opts.block_cache.get_stats();
 	eprintln!("First query results: {} items", first_results.len());
@@ -1388,11 +1387,8 @@ async fn test_cache_effectiveness_with_range_query() {
 	eprintln!("=== Second range query (served from cache) ===");
 	// Second range query - should be served mostly from cache
 	let tx = tree.begin().unwrap();
-	let second_results: Vec<_> = tx
-		.range(b"key_00000000", b"key_00010000")
-		.unwrap()
-		.collect::<crate::Result<Vec<_>>>()
-		.unwrap();
+	let second_results =
+		collect_transaction_all(&mut tx.range(b"key_00000000", b"key_00010000").unwrap()).unwrap();
 
 	let second_stats = tree.core.opts.block_cache.get_stats();
 	eprintln!("Second query results: {} items", second_results.len());
@@ -1475,75 +1471,64 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	// Test snapshot1 - should only see key1
 	{
 		let snap_ref = snapshot1.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 1, "Snapshot1 should only see 1 key");
-		assert_eq!(&range[0].0, b"key1");
-		assert_eq!(range[0].1.as_ref().unwrap().as_slice(), b"value1_v1");
+		assert_eq!(&range[0].0.user_key, b"key1");
+		assert_eq!(range[0].1.as_slice(), b"value1_v1");
 	}
 
 	// Test snapshot2 - should see key1 and key2
 	{
 		let snap_ref = snapshot2.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 2, "Snapshot2 should see 2 keys");
-		assert_eq!(&range[0].0, b"key1");
-		assert_eq!(&range[1].0, b"key2");
+		assert_eq!(&range[0].0.user_key, b"key1");
+		assert_eq!(&range[1].0.user_key, b"key2");
 	}
 
 	// Test snapshot3 - should see key1, key2, and key3
 	{
 		let snap_ref = snapshot3.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 3, "Snapshot3 should see 3 keys");
-		assert_eq!(&range[0].0, b"key1");
-		assert_eq!(&range[1].0, b"key2");
-		assert_eq!(&range[2].0, b"key3");
+		assert_eq!(&range[0].0.user_key, b"key1");
+		assert_eq!(&range[1].0.user_key, b"key2");
+		assert_eq!(&range[2].0.user_key, b"key3");
 	}
 
 	// Test snapshot4 - should see all 4 keys
 	{
 		let snap_ref = snapshot4.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 4, "Snapshot4 should see 4 keys");
-		assert_eq!(&range[0].0, b"key1");
-		assert_eq!(&range[1].0, b"key2");
-		assert_eq!(&range[2].0, b"key3");
-		assert_eq!(&range[3].0, b"key4");
+		assert_eq!(&range[0].0.user_key, b"key1");
+		assert_eq!(&range[1].0.user_key, b"key2");
+		assert_eq!(&range[2].0.user_key, b"key3");
+		assert_eq!(&range[3].0.user_key, b"key4");
 	}
 
 	// Test backward iteration on snapshot2
 	{
 		let snap_ref = snapshot2.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.rev()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_reverse(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 2, "Backward iteration should also see 2 keys");
-		assert_eq!(&range[0].0, b"key2");
-		assert_eq!(&range[1].0, b"key1");
+		assert_eq!(&range[0].0.user_key, b"key2");
+		assert_eq!(&range[1].0.user_key, b"key1");
 	}
 }
 
@@ -1584,38 +1569,32 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 	// Each snapshot should see its corresponding version
 	{
 		let snap1_ref = snapshot1.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap1_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap1_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 1);
-		assert_eq!(range[0].1.as_ref().unwrap().as_slice(), b"value_v1");
+		assert_eq!(range[0].1.as_slice(), b"value_v1");
 	}
 
 	{
 		let snap2_ref = snapshot2.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap2_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap2_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 1);
-		assert_eq!(range[0].1.as_ref().unwrap().as_slice(), b"value_v2");
+		assert_eq!(range[0].1.as_slice(), b"value_v2");
 	}
 
 	{
 		let snap3_ref = snapshot3.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap3_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap3_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 1);
-		assert_eq!(range[0].1.as_ref().unwrap().as_slice(), b"value_v3");
+		assert_eq!(range[0].1.as_slice(), b"value_v3");
 	}
 }
 
@@ -1648,46 +1627,39 @@ async fn test_snapshot_iterator_seq_num_with_deletions() {
 	// Snapshot before should see all 3 keys
 	{
 		let snap_ref = snapshot_before.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 3, "Before deletion: should see all 3 keys");
-		assert_eq!(&range[0].0, b"key1");
-		assert_eq!(&range[1].0, b"key2");
-		assert_eq!(&range[2].0, b"key3");
+		assert_eq!(&range[0].0.user_key, b"key1");
+		assert_eq!(&range[1].0.user_key, b"key2");
+		assert_eq!(&range[2].0.user_key, b"key3");
 	}
 
 	// Snapshot after should not see deleted key2
 	{
 		let snap_ref = snapshot_after.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 2, "After deletion: should see only 2 keys");
-		assert_eq!(&range[0].0, b"key1");
-		assert_eq!(&range[1].0, b"key3");
+		assert_eq!(&range[0].0.user_key, b"key1");
+		assert_eq!(&range[1].0.user_key, b"key3");
 		// key2 should not be present
 	}
 
 	// Test backward iteration after deletion
 	{
 		let snap_ref = snapshot_after.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.rev()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_reverse(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 2, "Backward: should see only 2 keys");
-		assert_eq!(&range[0].0, b"key3");
-		assert_eq!(&range[1].0, b"key1");
+		assert_eq!(&range[0].0.user_key, b"key3");
+		assert_eq!(&range[1].0.user_key, b"key1");
 	}
 }
 
@@ -1724,72 +1696,63 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 	// Verify snap1: Should see key1(v1), key2(v2), key3(v3)
 	{
 		let snap_ref = snap1.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 3);
-		assert_eq!(&range[0].0, b"key1");
-		assert_eq!(range[0].1.as_ref().unwrap().as_slice(), b"v1");
-		assert_eq!(&range[1].0, b"key2");
-		assert_eq!(range[1].1.as_ref().unwrap().as_slice(), b"v2");
-		assert_eq!(&range[2].0, b"key3");
+		assert_eq!(&range[0].0.user_key, b"key1");
+		assert_eq!(range[0].1.as_slice(), b"v1");
+		assert_eq!(&range[1].0.user_key, b"key2");
+		assert_eq!(range[1].1.as_slice(), b"v2");
+		assert_eq!(&range[2].0.user_key, b"key3");
 	}
 
 	// Verify snap2: Should see key1(v1), key2(v2_updated), key3(v3), key4(v4)
 	{
 		let snap_ref = snap2.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 4);
-		assert_eq!(&range[0].0, b"key1");
-		assert_eq!(&range[1].0, b"key2");
-		assert_eq!(range[1].1.as_ref().unwrap().as_slice(), b"v2_updated"); // Updated value
-		assert_eq!(&range[2].0, b"key3");
-		assert_eq!(&range[3].0, b"key4");
+		assert_eq!(&range[0].0.user_key, b"key1");
+		assert_eq!(&range[1].0.user_key, b"key2");
+		assert_eq!(range[1].1.as_slice(), b"v2_updated"); // Updated value
+		assert_eq!(&range[2].0.user_key, b"key3");
+		assert_eq!(&range[3].0.user_key, b"key4");
 	}
 
 	// Verify snap3: Should see key2(v2_updated), key3(v3), key4(v4), key5(v5)
 	// key1 should be deleted
 	{
 		let snap_ref = snap3.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 4);
 		// key1 should NOT be present (deleted)
-		assert_eq!(&range[0].0, b"key2");
-		assert_eq!(range[0].1.as_ref().unwrap().as_slice(), b"v2_updated");
-		assert_eq!(&range[1].0, b"key3");
-		assert_eq!(&range[2].0, b"key4");
-		assert_eq!(&range[3].0, b"key5");
+		assert_eq!(&range[0].0.user_key, b"key2");
+		assert_eq!(range[0].1.as_slice(), b"v2_updated");
+		assert_eq!(&range[1].0.user_key, b"key3");
+		assert_eq!(&range[2].0.user_key, b"key4");
+		assert_eq!(&range[3].0.user_key, b"key5");
 	}
 
 	// Verify backward iteration on snap2
 	{
 		let snap_ref = snap2.snapshot.as_ref().unwrap();
-		let range: Vec<_> = snap_ref
-			.range(Some("key0".as_bytes()), Some("key9".as_bytes()), false)
-			.unwrap()
-			.rev()
-			.collect::<Result<Vec<_>, _>>()
-			.unwrap();
+		let mut range_iter =
+			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let range = collect_snapshot_reverse(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 4);
-		assert_eq!(&range[0].0, b"key4");
-		assert_eq!(&range[1].0, b"key3");
-		assert_eq!(&range[2].0, b"key2");
-		assert_eq!(range[2].1.as_ref().unwrap().as_slice(), b"v2_updated");
-		assert_eq!(&range[3].0, b"key1");
+		assert_eq!(&range[0].0.user_key, b"key4");
+		assert_eq!(&range[1].0.user_key, b"key3");
+		assert_eq!(&range[2].0.user_key, b"key2");
+		assert_eq!(range[2].1.as_slice(), b"v2_updated");
+		assert_eq!(&range[3].0.user_key, b"key1");
 	}
 }
 

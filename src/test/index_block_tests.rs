@@ -4,10 +4,17 @@ use std::vec;
 use test_log::test;
 
 use crate::sstable::block::BlockHandle;
-use crate::sstable::index_block::{BlockHandleWithKey, TopLevelIndex, TopLevelIndexWriter};
-use crate::sstable::{InternalKey, InternalKeyKind};
+use crate::sstable::index_block::{BlockHandleWithKey, Index, IndexWriter};
 use crate::vfs::File;
-use crate::{CompressionType, Error, Options};
+use crate::{
+	CompressionType,
+	InternalIterator,
+	InternalKey,
+	InternalKeyKind,
+	Options,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+	INTERNAL_KEY_TIMESTAMP_MAX,
+};
 
 fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 	Arc::new(src)
@@ -21,7 +28,7 @@ fn create_internal_key(user_key: Vec<u8>, sequence: u64) -> Vec<u8> {
 fn test_top_level_index_writer_basic() {
 	let opts = Arc::new(Options::default());
 	let max_block_size = 100;
-	let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+	let mut writer = IndexWriter::new(opts, max_block_size);
 
 	let key1 = create_internal_key(b"key1".to_vec(), 1);
 	let handle1 = vec![1, 2, 3];
@@ -36,7 +43,7 @@ fn test_top_level_index_writer_basic() {
 fn test_top_level_index_writer_multiple_blocks() {
 	let opts = Arc::new(Options::default());
 	let max_block_size = 50; // Small size to force multiple blocks
-	let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+	let mut writer = IndexWriter::new(opts, max_block_size);
 
 	for i in 0..10 {
 		let key = create_internal_key(format!("key{i}").as_bytes().to_vec(), i as u64);
@@ -54,7 +61,7 @@ fn test_top_level_index_writer_multiple_blocks() {
 // fn test_top_level_index_writer_empty() {
 //     let opts = Arc::new(Options::default());
 //     let max_block_size = 100;
-//     let writer = TopLevelIndexWriter::new(opts, max_block_size);
+//     let writer = IndexWriter::new(opts, max_block_size);
 
 //     let top_level_block = writer.finish().unwrap();
 //     assert_eq!(index_blocks.len(), 0);
@@ -65,7 +72,7 @@ fn test_top_level_index_writer_multiple_blocks() {
 fn test_top_level_index_writer_large_entries() {
 	let opts = Arc::new(Options::default());
 	let max_block_size = 1000;
-	let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+	let mut writer = IndexWriter::new(opts, max_block_size);
 
 	let large_key = create_internal_key(vec![b'a'; 500], 1);
 	let large_handle = vec![b'b'; 500];
@@ -80,7 +87,7 @@ fn test_top_level_index_writer_large_entries() {
 fn test_top_level_index_writer_exact_block_size() {
 	let opts = Arc::new(Options::default());
 	let max_block_size = 100;
-	let mut writer = TopLevelIndexWriter::new(opts, max_block_size);
+	let mut writer = IndexWriter::new(opts, max_block_size);
 
 	// Add entries that exactly fill up one block
 	let key = create_internal_key(b"key".to_vec(), 1);
@@ -96,7 +103,7 @@ fn test_top_level_index_writer_exact_block_size() {
 // fn test_top_level_index() {
 //     let opts = Arc::new(Options::default());
 //     let max_block_size = 10;
-//     let mut writer = TopLevelIndexWriter::new(Arc::clone(&opts), max_block_size);
+//     let mut writer = IndexWriter::new(Arc::clone(&opts), max_block_size);
 
 //     let key1 = create_internal_key(b"key1".to_vec(), 1);
 //     let handle1 = vec![1, 2, 3];
@@ -107,7 +114,7 @@ fn test_top_level_index_writer_exact_block_size() {
 // 0).unwrap();     assert!(!top_level_block.0.offset > 0);
 
 //     let f = wrap_buffer(d);
-//     let top_level_index = TopLevelIndex::new(0, opts, f,
+//     let top_level_index = Index::new(0, opts, f,
 // &top_level_block.0).unwrap();     let block =
 // top_level_index.get(&key1).unwrap();     // println!("block: {:?}",
 // block.block); }
@@ -123,8 +130,8 @@ fn test_find_block_handle_by_key() {
 	let sep_f = create_internal_key(b"f".to_vec(), 1);
 	let sep_j = create_internal_key(b"j".to_vec(), 1);
 
-	// Initialize TopLevelIndex with predefined blocks using encoded internal keys
-	let index = TopLevelIndex {
+	// Initialize Index with predefined blocks using encoded internal keys
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![
@@ -161,69 +168,6 @@ fn test_find_block_handle_by_key() {
 }
 
 #[test]
-fn test_partitioned_index_lookup() {
-	let opts = Arc::new(Options::default());
-	let max_block_size = 50; // Small size to force multiple partitions
-	let mut writer = TopLevelIndexWriter::new(Arc::clone(&opts), max_block_size);
-
-	// Add enough entries to create multiple partitions
-	let entries = vec![
-		("key_001", "handle_001"),
-		("key_002", "handle_002"),
-		("key_003", "handle_003"),
-		("key_004", "handle_004"),
-		("key_005", "handle_005"),
-		("key_006", "handle_006"),
-		("key_007", "handle_007"),
-		("key_008", "handle_008"),
-		("key_009", "handle_009"),
-		("key_010", "handle_010"),
-	];
-
-	for (key, handle) in &entries {
-		let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
-		writer.add(&internal_key, handle.as_bytes()).unwrap();
-	}
-
-	// Write to buffer
-	let mut buffer = Vec::new();
-	let (top_level_handle, _) = writer.finish(&mut buffer, CompressionType::None, 0).unwrap();
-
-	// Now read it back
-	let file = wrap_buffer(buffer);
-	let index = TopLevelIndex::new(0, opts, file, &top_level_handle).unwrap();
-
-	// Test lookups for various keys using encoded internal keys
-	for (key, _) in &entries {
-		let internal_key = create_internal_key(key.as_bytes().to_vec(), 1);
-		let block = index.get(&internal_key).unwrap();
-		assert!(block.size() > 0, "Block should not be empty for key {key}");
-
-		// Verify the block contains the expected handle by checking if we can find it
-		let mut block_iter = block.iter(false).unwrap();
-		block_iter.seek(&internal_key).unwrap();
-		assert!(block_iter.valid(), "Block iterator should be valid for key {key}");
-	}
-
-	// Test lookup for non-existent key before range
-	let key_before = create_internal_key(b"key_000".to_vec(), 1);
-	let block = index.get(&key_before).unwrap();
-	assert!(block.size() > 0, "Should find first block for key before range");
-
-	// Test lookup for non-existent key after range
-	let key_after = create_internal_key(b"key_999".to_vec(), 1);
-	match index.get(&key_after) {
-		Ok(_) => {
-			// This is acceptable - might find the last block
-		}
-		Err(Error::BlockNotFound) => {
-			// This is also acceptable for keys completely out of range
-		}
-		Err(e) => panic!("Unexpected error for key after range: {e:?}"),
-	}
-}
-
-#[test]
 fn test_find_block_handle_by_key_with_descending_seq_nums() {
 	// Tests partition lookup with same user key spanning multiple partitions
 	// using the correct descending sequence number ordering:
@@ -240,13 +184,13 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 	let sep_foo_20 = create_internal_key(b"foo".to_vec(), 20);
 	let sep_g = InternalKey::new(
 		b"g".to_vec(),
-		crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![
@@ -325,27 +269,27 @@ fn test_find_block_handle_by_key_different_user_keys() {
 	// Partition 2: contains "date" keys, separator = (e, MAX)
 	let sep_b = InternalKey::new(
 		b"b".to_vec(),
-		crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 	let sep_d = InternalKey::new(
 		b"d".to_vec(),
-		crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 	let sep_e = InternalKey::new(
 		b"e".to_vec(),
-		crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![
@@ -364,9 +308,9 @@ fn test_find_block_handle_by_key_different_user_keys() {
 		(
 			InternalKey::new(
 				b"b".to_vec(),
-				crate::sstable::INTERNAL_KEY_SEQ_NUM_MAX,
+				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
-				crate::sstable::INTERNAL_KEY_TIMESTAMP_MAX,
+				INTERNAL_KEY_TIMESTAMP_MAX,
 			)
 			.encode(),
 			Some(0),
@@ -424,7 +368,7 @@ fn test_find_block_handle_returns_correct_partition_index() {
 	let sep_keys: Vec<_> =
 		(0..5).map(|i| create_internal_key(format!("key_{:02}", i).into_bytes(), 100)).collect();
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: sep_keys
@@ -458,7 +402,7 @@ fn test_partition_lookup_empty_partition_returns_none() {
 
 	let sep = create_internal_key(b"zzz".to_vec(), 1);
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep, BlockHandle::new(0, 100))],
@@ -480,7 +424,7 @@ fn test_partition_lookup_single_partition() {
 
 	let sep = create_internal_key(b"middle".to_vec(), 1);
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
@@ -517,7 +461,7 @@ fn test_partition_lookup_exact_separator_match() {
 	let sep_b = create_internal_key(b"bbb".to_vec(), 50);
 	let sep_c = create_internal_key(b"ccc".to_vec(), 50);
 
-	let index = TopLevelIndex {
+	let index = Index {
 		id: 0,
 		opts,
 		blocks: vec![
@@ -602,14 +546,14 @@ fn test_partitioned_index_seek_correctness() {
 	}
 
 	// Test SeekForPrev - iterate backwards
-	let mut iter = table.iter(false, None);
+	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid(), "Iterator should be valid after seek_to_last");
 
 	let mut backward_keys = Vec::new();
-	backward_keys.push(std::str::from_utf8(&iter.key().user_key).unwrap().to_string());
+	backward_keys.push(std::str::from_utf8(&iter.key().user_key()).unwrap().to_string());
 	while iter.prev().unwrap() {
-		backward_keys.push(std::str::from_utf8(&iter.key().user_key).unwrap().to_string());
+		backward_keys.push(std::str::from_utf8(&iter.key().user_key()).unwrap().to_string());
 	}
 
 	// Verify backward iteration matches reverse of forward iteration
@@ -717,24 +661,32 @@ fn test_partitioned_index_reseek() {
 		crate::sstable::table::Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap(),
 	);
 
-	let mut iter = table.iter(false, None);
+	let mut iter = table.iter(None).unwrap();
 
 	// Seek to middle key
 	let seek_key = InternalKey::new(b"0055".to_vec(), 4, InternalKeyKind::Set, 0);
 	iter.seek(&seek_key.encode()).unwrap();
 	assert!(iter.valid(), "Iterator should be valid after seek");
-	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0055", "Should find key 0055");
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		"0055",
+		"Should find key 0055"
+	);
 
 	// SeekToLast
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid(), "Iterator should be valid after seek_to_last");
-	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0095", "Should find last key");
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		"0095",
+		"Should find last key"
+	);
 
 	// Reseek to same key - should work correctly
 	iter.seek(&seek_key.encode()).unwrap();
 	assert!(iter.valid(), "Iterator should be valid after reseek");
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
 		"0055",
 		"Should find key 0055 after reseek"
 	);
@@ -743,7 +695,7 @@ fn test_partitioned_index_reseek() {
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid(), "Iterator should be valid after second seek_to_last");
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
 		"0095",
 		"Should find last key again"
 	);
@@ -754,7 +706,7 @@ fn test_partitioned_index_reseek() {
 	iter.prev().unwrap();
 	assert!(iter.valid());
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
 		"0075",
 		"Should find key 0075 after two prev()"
 	);
@@ -763,7 +715,11 @@ fn test_partitioned_index_reseek() {
 	let seek_key_0095 = InternalKey::new(b"0095".to_vec(), 10, InternalKeyKind::Set, 0);
 	iter.seek(&seek_key_0095.encode()).unwrap();
 	assert!(iter.valid());
-	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0095", "Should find key 0095");
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		"0095",
+		"Should find key 0095"
+	);
 
 	// Prev twice
 	iter.prev().unwrap();
@@ -771,7 +727,7 @@ fn test_partitioned_index_reseek() {
 	iter.prev().unwrap();
 	assert!(iter.valid());
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
 		"0075",
 		"Should find key 0075 after prev from 0095"
 	);
@@ -779,13 +735,17 @@ fn test_partitioned_index_reseek() {
 	// SeekToLast
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid());
-	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0095", "Should find last key");
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		"0095",
+		"Should find last key"
+	);
 
 	// Seek to 0095 again
 	iter.seek(&seek_key_0095.encode()).unwrap();
 	assert!(iter.valid());
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
 		"0095",
 		"Should find key 0095 after reseek"
 	);
@@ -795,25 +755,29 @@ fn test_partitioned_index_reseek() {
 	assert!(iter.valid());
 	iter.prev().unwrap();
 	assert!(iter.valid());
-	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0075", "Should find key 0075");
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		"0075",
+		"Should find key 0075"
+	);
 
 	// Seek to 0075
 	let seek_key_0075 = InternalKey::new(b"0075".to_vec(), 8, InternalKeyKind::Set, 0);
 	iter.seek(&seek_key_0075.encode()).unwrap();
 	assert!(iter.valid());
-	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0075", "Should find key 0075");
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		"0075",
+		"Should find key 0075"
+	);
 
 	// Next twice
-	if let Some(result) = iter.next() {
-		result.unwrap();
-	}
+	iter.next().unwrap();
 	assert!(iter.valid());
-	if let Some(result) = iter.next() {
-		result.unwrap();
-	}
+	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key).unwrap(),
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
 		"0095",
 		"Should find key 0095 after two next()"
 	);
@@ -821,7 +785,11 @@ fn test_partitioned_index_reseek() {
 	// SeekToLast
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid());
-	assert_eq!(std::str::from_utf8(&iter.key().user_key).unwrap(), "0095", "Should find last key");
+	assert_eq!(
+		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		"0095",
+		"Should find last key"
+	);
 }
 
 #[test]
@@ -880,16 +848,13 @@ fn test_partitioned_index_varying_partition_sizes() {
 		}
 
 		// Test iterator works at this partition size
-		let mut iter = table.iter(false, None);
+		let mut iter = table.iter(None).unwrap();
 		iter.seek_to_first().unwrap();
 		let mut count = 0;
+
 		while iter.valid() {
 			count += 1;
-			match iter.next() {
-				Some(Ok(_)) => {}
-				Some(Err(e)) => panic!("Iterator error: {e}"),
-				None => break,
-			}
+			iter.next().unwrap();
 		}
 		assert_eq!(count, 20, "Should iterate all 20 keys at partition_size {partition_size}");
 	}

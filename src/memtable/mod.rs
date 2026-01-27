@@ -1,16 +1,27 @@
 use std::fs::File as SysFile;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crossbeam_skiplist::SkipMap;
+mod arena;
+mod skiplist;
+
+use arena::Arena;
+use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
 
 use crate::batch::Batch;
 use crate::error::Result;
-use crate::iter::CompactionIterator;
+use crate::iter::{BoxedInternalIterator, CompactionIterator};
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX};
 use crate::vfs::File;
-use crate::{InternalKeyRange, Options, Value};
+use crate::{
+	Comparator,
+	InternalIterator,
+	InternalKey,
+	InternalKeyRef,
+	Options,
+	Value,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+};
 
 /// Entry in the immutable memtables list, tracking both the table ID
 /// and the WAL number that contains this memtable's data.
@@ -53,12 +64,17 @@ impl ImmutableMemtables {
 	pub(crate) fn is_empty(&self) -> bool {
 		self.0.is_empty()
 	}
+
+	/// Returns the oldest (first) immutable memtable entry.
+	/// Entries are sorted by table_id, so the first entry is the oldest.
+	pub(crate) fn first(&self) -> Option<&ImmutableEntry> {
+		self.0.first()
+	}
 }
 
 pub(crate) struct MemTable {
-	map: SkipMap<InternalKey, Value>,
+	skiplist: Skiplist,
 	latest_seq_num: AtomicU64,
-	map_size: AtomicU32,
 	/// WAL number that was current when this memtable started receiving writes.
 	/// Used to determine which WALs can be safely deleted after flush.
 	wal_number: AtomicU64,
@@ -66,17 +82,18 @@ pub(crate) struct MemTable {
 
 impl Default for MemTable {
 	fn default() -> Self {
-		Self::new()
+		Self::new(1024 * 1024)
 	}
 }
 
 impl MemTable {
-	#[allow(unused)]
-	pub(crate) fn new() -> Self {
+	pub(crate) fn new(arena_capacity: usize) -> Self {
+		let arena = Arc::new(Arena::new(arena_capacity));
+		let cmp: Compare = |a, b| a.cmp(b);
+		let skiplist = Skiplist::new(arena.clone(), cmp);
 		MemTable {
-			map: SkipMap::new(),
+			skiplist,
 			latest_seq_num: AtomicU64::new(0),
-			map_size: AtomicU32::new(0),
 			wal_number: AtomicU64::new(0),
 		}
 	}
@@ -95,24 +112,44 @@ impl MemTable {
 	}
 
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
-		let seq_no = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
-		let range = InternalKey::new(
-			key.to_vec(),
-			seq_no,
-			InternalKeyKind::Set, // This field is not checked in the comparator
-			0,                    // This field is not checked in the comparator
-		)..;
+		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
+		let mut iter = self.skiplist.iter();
+		iter.seek_ge(key);
 
-		let mut iter = self.map.range(range).take_while(|entry| &entry.key().user_key[..] == key);
-		iter.next().map(|entry| (entry.key().clone(), entry.value().clone()))
+		// Find the entry with highest sequence number <= max_seq
+		while iter.is_valid() {
+			let found_key = iter.key_bytes();
+			if found_key != key {
+				break; // Moved past our key
+			}
+
+			let found_trailer = iter.trailer();
+			let found_seq = found_trailer >> 8;
+
+			// Check if this entry's sequence number is <= requested seq_no
+			if found_seq <= max_seq {
+				// This is the newest version with seq <= max_seq
+				let internal_key = InternalKey {
+					user_key: found_key.to_vec(),
+					timestamp: 0,
+					trailer: found_trailer,
+				};
+				return Some((internal_key, iter.value_bytes().to_vec()));
+			}
+
+			iter.advance();
+		}
+		None
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
-		self.map.is_empty()
+		let mut iter = self.skiplist.iter();
+		iter.first();
+		!iter.is_valid()
 	}
 
 	pub(crate) fn size(&self) -> usize {
-		self.map_size.load(Ordering::Acquire) as usize
+		self.skiplist.size() as usize
 	}
 
 	/// Adds a batch of operations to the memtable.
@@ -124,18 +161,15 @@ impl MemTable {
 	/// * `batch` - The batch of operations to apply
 	/// * `starting_seq_num` - The starting sequence number for this batch (records get consecutive
 	///   numbers)
-	pub(crate) fn add(&self, batch: &Batch) -> Result<(u32, u32)> {
-		let (record_size, highest_seq_num) = self.apply_batch_to_memtable(batch)?;
-		let size_before = self.update_memtable_size(record_size);
+	pub(crate) fn add(&self, batch: &Batch) -> Result<()> {
+		let highest_seq_num = self.apply_batch_to_memtable(batch)?;
 		self.update_latest_sequence_number(highest_seq_num);
-		Ok((record_size, size_before + record_size))
+		Ok(())
 	}
 
 	/// Applies the batch of operations to the in-memory table (memtable).
 	/// Returns (total_record_size, highest_seq_num_used).
-	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<(u32, u64)> {
-		let mut record_size = 0;
-
+	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<u64> {
 		// Pre-allocate empty value Bytes for delete operations to avoid repeated
 		// allocations
 		let empty_val = Value::new();
@@ -152,26 +186,25 @@ impl MemTable {
 				empty_val.clone()
 			};
 
-			let entry_size = self.insert_into_memtable(&ikey, &val);
-			record_size += entry_size;
+			self.insert_into_memtable(&ikey, &val)?;
 		}
 
 		// Get the highest sequence number used from the batch
 		let highest_seq_num = batch.get_highest_seq_num();
 
-		Ok((record_size, highest_seq_num))
+		Ok(highest_seq_num)
 	}
 
 	/// Inserts a key-value pair into the memtable.
-	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> u32 {
-		self.map.insert(key.clone(), value.clone());
-		key.size() as u32 + value.len() as u32
-	}
+	/// Returns Err(ArenaFull) if there's not enough space.
+	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
+		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
 
-	/// Updates the size of the memtable by adding the size of the newly added
-	/// records.
-	fn update_memtable_size(&self, record_size: u32) -> u32 {
-		self.map_size.fetch_add(record_size, std::sync::atomic::Ordering::AcqRel)
+		match self.skiplist.add(&key.user_key, trailer, key.timestamp, value) {
+			Ok(()) => Ok(()),
+			Err(SkiplistError::RecordExists) => Ok(()), // Duplicate is not an error in memtable
+			Err(SkiplistError::ArenaFull) => Err(crate::Error::ArenaFull),
+		}
 	}
 
 	/// Updates the latest sequence number in the memtable.
@@ -204,10 +237,11 @@ impl MemTable {
 			let file = SysFile::create(&table_file_path)?;
 			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
 
-			let iter = self.iter(false);
-			let iter = Box::new(iter);
+			let iter = self.iter();
+			let iter: BoxedInternalIterator<'_> = Box::new(iter);
 			let mut comp_iter = CompactionIterator::new(
 				vec![iter],
+				Arc::clone(&lsm_opts.internal_comparator) as Arc<dyn Comparator>,
 				false,                                   // not bottom level (L0 flush)
 				None,                                    // no vlog access in flush context
 				lsm_opts.enable_versioning,              // versioning disabled in flush context
@@ -233,34 +267,67 @@ impl MemTable {
 		Ok(created_table)
 	}
 
-	pub(crate) fn iter(
-		&self,
-		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = Result<(InternalKey, Value)>> + '_ {
-		self.map.iter().map(move |entry| {
-			let key = entry.key().clone();
-			let value = if keys_only {
-				Value::new()
-			} else {
-				entry.value().clone()
-			};
-			Ok((key, value))
-		})
+	pub(crate) fn iter(&self) -> MemTableIterator<'_> {
+		self.range(None, None)
 	}
 
+	/// Returns an iterator over keys in [lower, upper)
+	/// Lower is inclusive, upper is exclusive
 	pub(crate) fn range(
 		&self,
-		range: InternalKeyRange,
-		keys_only: bool,
-	) -> impl DoubleEndedIterator<Item = Result<(InternalKey, Value)>> + '_ {
-		self.map.range(range).map(move |entry| {
-			let key = entry.key().clone();
-			let value = if keys_only {
-				Value::new()
-			} else {
-				entry.value().clone()
-			};
-			Ok((key, value))
-		})
+		lower: Option<&[u8]>, // Inclusive, None = unbounded
+		upper: Option<&[u8]>, // Exclusive, None = unbounded
+	) -> MemTableIterator<'_> {
+		let mut iter = self.skiplist.new_iter(lower, upper);
+
+		// Pre-position for forward iteration
+		if let Some(lower_key) = lower {
+			iter.seek_ge(lower_key);
+		} else {
+			iter.first();
+		}
+
+		MemTableIterator {
+			iter,
+		}
+	}
+}
+
+/// Thin wrapper around SkiplistIterator for keys_only optimization
+pub(crate) struct MemTableIterator<'a> {
+	iter: SkiplistIterator<'a>,
+}
+
+impl InternalIterator for MemTableIterator<'_> {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.iter.seek(target)
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		self.iter.seek_first()
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		self.iter.seek_last()
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		self.iter.next()
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		self.iter.prev()
+	}
+
+	fn valid(&self) -> bool {
+		self.iter.valid()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		self.iter.key()
+	}
+
+	fn value(&self) -> &[u8] {
+		self.iter.value()
 	}
 }
