@@ -1369,7 +1369,7 @@ impl<'a> CompactionIterator<'a> {
 					// Check retention period
 					let current_time = self.clock.now();
 					let key_timestamp = key.timestamp;
-					let age = current_time - key_timestamp;
+					let age = current_time.saturating_sub(key_timestamp);
 					let is_within_retention = age <= self.retention_period_ns;
 					// Stale if OUTSIDE retention period
 					!is_within_retention

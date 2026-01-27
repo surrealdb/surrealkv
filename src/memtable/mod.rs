@@ -10,11 +10,9 @@ use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
 
 use crate::batch::Batch;
 use crate::error::Result;
-use crate::iter::{BoxedInternalIterator, CompactionIterator};
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::{
-	Comparator,
 	InternalIterator,
 	InternalKey,
 	InternalKeyRef,
@@ -237,22 +235,11 @@ impl MemTable {
 			let file = SysFile::create(&table_file_path)?;
 			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
 
-			let iter = self.iter();
-			let iter: BoxedInternalIterator<'_> = Box::new(iter);
-			let mut comp_iter = CompactionIterator::new(
-				vec![iter],
-				Arc::clone(&lsm_opts.internal_comparator) as Arc<dyn Comparator>,
-				false,                                   // not bottom level (L0 flush)
-				None,                                    // no vlog access in flush context
-				lsm_opts.enable_versioning,              // versioning disabled in flush context
-				lsm_opts.versioned_history_retention_ns, // retention period is 0 in flush context
-				Arc::clone(&lsm_opts.clock),             // clock is the system clock
-			);
-			for item in comp_iter.by_ref() {
-				let (key, encoded_val) = item?;
-				// The memtable already contains the correct ValueLocation encoding
-				// (either inline or with VLog pointer), so we can use it directly
-				table_writer.add(key, &encoded_val)?;
+			let mut iter = self.iter();
+			iter.seek_first()?;
+			while iter.valid() {
+				table_writer.add(iter.key().to_owned(), iter.value())?;
+				iter.next()?;
 			}
 			// TODO: Check how to fsync this file
 			table_writer.finish()?;
