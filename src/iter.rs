@@ -7,15 +7,93 @@ use crate::error::Result;
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::{Comparator, InternalIterator, InternalKey, InternalKeyRef, Value};
 
+/// Boxed internal iterator type for dynamic dispatch.
+///
+/// This allows us to store different iterator types (MemTable iterators,
+/// SSTable iterators, etc.) in the same collection.
 pub type BoxedInternalIterator<'a> = Box<dyn InternalIterator + 'a>;
 
-/// Binary heap
+// ============================================================================
+// BINARY HEAP
+// ============================================================================
+//
+// A binary heap is a complete binary tree stored in a flat array.
+// We use a custom implementation instead of std::collections::BinaryHeap because:
+//   1. We need custom comparators (not just Ord trait)
+//   2. We need more control of the data structure for future optimisations
+//
+// ## Array-to-Tree Mapping
+//
+// The tree structure is implicit in the array indices:
+//
+// ```
+// Array:   [10, 20, 30, 40, 50]
+// Index:     0   1   2   3   4
+//
+// Tree visualization:
+//
+//               [10]          ← index 0 (root)
+//              /    \
+//           [20]    [30]      ← index 1, 2
+//           /  \
+//        [40]  [50]           ← index 3, 4
+// ```
+//
+// ## Index Formulas
+//
+// For any element at index `i`:
+// - Parent index:      `(i - 1) / 2`  (integer division)
+// - Left child index:  `2 * i + 1`
+// - Right child index: `2 * i + 2`
+//
+// Example calculations:
+// | Index | Value | Parent = (i-1)/2 | Left = 2i+1 | Right = 2i+2 |
+// |-------|-------|------------------|-------------|--------------|
+// |   0   |  10   |  none            |      1      |      2       |
+// |   1   |  20   |  0 (value 10)    |      3      |      4       |
+// |   2   |  30   |  0 (value 10)    |      5      |      6       |
+// |   3   |  40   |  1 (value 20)    |      7      |      8       |
+// |   4   |  50   |  1 (value 20)    |      9      |     10       |
+//
+// ## Min-Heap Property
+//
+// Every parent must be ≤ its children. This ensures the minimum
+// element is always at the root (index 0).
+//
 struct BinaryHeap<T, F> {
+	/// The underlying storage - a Vec that represents the tree structure.
+	///
+	/// The tree is stored level-by-level:
+	/// - Index 0: root (level 0)
+	/// - Index 1-2: level 1
+	/// - Index 3-6: level 2
+	/// - Index 7-14: level 3
+	/// - etc.
 	data: Vec<T>,
+
+	/// Custom comparison function.
+	///
+	/// For a min-heap: returns Ordering::Less if `a` should be closer to root than `b`
+	/// For a max-heap: returns Ordering::Less if `a` should be closer to root than `b`
+	///                 (achieved by reversing the comparison)
 	cmp: F,
 }
 
 impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
+	/// Create a new heap with pre-allocated capacity.
+	///
+	/// # Arguments
+	/// * `capacity` - Initial capacity for the underlying Vec
+	/// * `cmp` - Comparison function that defines heap ordering
+	///
+	/// # Example
+	/// ```
+	/// // Min-heap of integers
+	/// let min_heap = |a: &i32, b: &i32| a.cmp(b);
+	///
+	/// // Max-heap of integers (reverse comparison)
+	/// let max_heap = |a: &i32, b: &i32| b.cmp(a);
+	/// ```
 	fn with_capacity(capacity: usize, cmp: F) -> Self {
 		Self {
 			data: Vec::with_capacity(capacity),
@@ -23,23 +101,124 @@ impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
 		}
 	}
 
+	/// Returns the number of elements in the heap.
 	#[inline]
 	fn len(&self) -> usize {
 		self.data.len()
 	}
 
+	/// Returns true if the heap contains no elements.
 	#[inline]
 	fn is_empty(&self) -> bool {
 		self.data.is_empty()
 	}
 
 	/// Push an item onto the heap.
+	///
+	/// # Algorithm
+	/// 1. Add the new element at the end of the array (last position in tree)
+	/// 2. "Sift up": repeatedly swap with parent until heap property is restored
+	///
+	/// # Example: Push 15 into [10, 20, 30, 40, 50]
+	///
+	/// ```text
+	/// Initial:
+	///               [10]
+	///              /    \
+	///           [20]    [30]
+	///           /  \
+	///        [40]  [50]
+	///
+	/// Step 1: Add 15 at end (index 5)
+	/// Array: [10, 20, 30, 40, 50, 15]
+	///                            ↑ new
+	///
+	///               [10]
+	///              /    \
+	///           [20]    [30]
+	///           /  \    /
+	///        [40] [50] [15] ← new element
+	///
+	/// Step 2: Sift up
+	///   pos = 5, parent = (5-1)/2 = 2
+	///   Compare: 15 < 30? YES → swap!
+	///   
+	/// Array: [10, 20, 15, 40, 50, 30]
+	///                 ↑           ↑ swapped
+	///
+	///               [10]
+	///              /    \
+	///           [20]    [15] ← moved up
+	///           /  \    /
+	///        [40] [50] [30] ← moved down
+	///
+	/// Step 3: Continue sift up
+	///   pos = 2, parent = (2-1)/2 = 0
+	///   Compare: 15 < 10? NO → stop!
+	///
+	/// Final: [10, 20, 15, 40, 50, 30]
+	/// ```
 	fn push(&mut self, item: T) {
 		self.data.push(item);
 		self.sift_up(self.data.len() - 1);
 	}
 
 	/// Remove and return the top (highest priority) item.
+	///
+	/// # Algorithm
+	/// 1. Swap root with last element
+	/// 2. Remove last element (the original root)
+	/// 3. "Sift down": restore heap property by swapping root down
+	///
+	/// # Example: Pop from [10, 20, 15, 40, 50, 30]
+	///
+	/// ```text
+	/// Initial:
+	///               [10] ← minimum (we want to remove this)
+	///              /    \
+	///           [20]    [15]
+	///           /  \    /
+	///        [40] [50] [30]
+	///
+	/// Step 1: Swap root (index 0) with last (index 5)
+	/// Array: [30, 20, 15, 40, 50, 10]
+	///         ↑                   ↑ swapped
+	///
+	///               [30] ← was at end
+	///              /    \
+	///           [20]    [15]
+	///           /  \    /
+	///        [40] [50] [10] ← was root
+	///
+	/// Step 2: Remove last element
+	/// Array: [30, 20, 15, 40, 50]  → returns 10
+	///
+	///               [30] ← violates heap property!
+	///              /    \
+	///           [20]    [15]
+	///           /  \
+	///        [40] [50]
+	///
+	/// Step 3: Sift down
+	///   pos = 0, left = 1, right = 2
+	///   smallest among {30, 20, 15} = 15 (index 2)
+	///   Swap positions 0 and 2:
+	///
+	/// Array: [15, 20, 30, 40, 50]
+	///         ↑       ↑ swapped
+	///
+	///               [15] ← moved up
+	///              /    \
+	///           [20]    [30] ← moved down
+	///           /  \
+	///        [40] [50]
+	///
+	/// Step 4: Continue sift down from pos=2
+	///   left = 5, right = 6 (both out of bounds)
+	///   No children → stop!
+	///
+	/// Final: [15, 20, 30, 40, 50]
+	/// ```
 	fn pop(&mut self) -> Option<T> {
 		if self.data.is_empty() {
 			return None;
@@ -48,28 +227,67 @@ impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
 		if len == 1 {
 			return self.data.pop();
 		}
+		// Swap root with last element
 		self.data.swap(0, len - 1);
+		// Remove last (original root)
 		let result = self.data.pop();
+		// Restore heap property
 		if !self.data.is_empty() {
 			self.sift_down(0);
 		}
 		result
 	}
 
-	/// Get a reference to the top item without removing it. O(1)
+	/// Get a reference to the top item without removing it.
+	///
+	/// For a min-heap, this is the smallest element.
+	/// For a max-heap, this is the largest element.
 	#[inline]
 	fn peek(&self) -> Option<&T> {
 		self.data.first()
 	}
 
-	/// Get a mutable reference to the top item. O(1)
-	/// After modification, call `sift_down_root()` to restore heap property.
+	/// Get a mutable reference to the top item.
+	///
+	/// # IMPORTANT
+	/// After modifying the element, you MUST call `sift_down_root()`
+	/// to restore the heap property!
+	///
+	/// # Why This Exists
+	/// This is a key optimization for the merging iterator. Instead of:
+	/// ```text
+	/// let item = heap.pop();     // O(log N)
+	/// item.advance_iterator();
+	/// heap.push(item);           // O(log N)
+	/// // Total: O(2 log N)
+	/// ```
+	///
+	/// We can do:
+	/// ```text
+	/// let item = heap.peek_mut(); // O(1)
+	/// item.advance_iterator();
+	/// heap.sift_down_root();      // O(log N)
+	/// // Total: O(log N)
+	/// ```
 	#[inline]
 	fn peek_mut(&mut self) -> Option<&mut T> {
 		self.data.first_mut()
 	}
 
 	/// Restore heap property after modifying the root via peek_mut().
+	///
+	/// # Example
+	/// ```text
+	/// Before (heap property violated at root):
+	///               [50] ← modified, too large!
+	///              /    \
+	///           [20]    [30]
+	///
+	/// After sift_down_root():
+	///               [20]
+	///              /    \
+	///           [50]    [30]
+	/// ```
 	fn sift_down_root(&mut self) {
 		if !self.data.is_empty() {
 			self.sift_down(0);
@@ -77,14 +295,30 @@ impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
 	}
 
 	/// Drain all items from the heap, returning them as a Vec.
+	/// The returned Vec is NOT in sorted order - it's the raw heap array.
 	fn drain(&mut self) -> Vec<T> {
 		std::mem::take(&mut self.data)
 	}
 
+	/// Sift up: move element at `pos` towards the root until heap property is satisfied.
+	///
+	/// Used after inserting a new element at the end of the heap.
+	///
+	/// # Algorithm
+	/// ```text
+	/// while pos is not root:
+	///     parent = (pos - 1) / 2
+	///     if element[pos] < element[parent]:  // For min-heap
+	///         swap(pos, parent)
+	///         pos = parent
+	///     else:
+	///         break  // Heap property satisfied
+	/// ```
 	#[inline]
 	fn sift_up(&mut self, mut pos: usize) {
 		while pos > 0 {
 			let parent = (pos - 1) / 2;
+			// If current element should be higher priority than parent, swap
 			if (self.cmp)(&self.data[pos], &self.data[parent]) == Ordering::Less {
 				self.data.swap(pos, parent);
 				pos = parent;
@@ -94,6 +328,42 @@ impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
 		}
 	}
 
+	/// Sift down: move element at `pos` towards the leaves until heap property is satisfied.
+	///
+	/// Used after:
+	/// - Removing the root (pop operation)
+	/// - Modifying the root (via peek_mut + sift_down_root)
+	///
+	/// # Algorithm
+	/// ```text
+	/// loop:
+	///     left = 2 * pos + 1
+	///     right = 2 * pos + 2
+	///     smallest = pos
+	///     
+	///     if left exists and element[left] < element[smallest]:
+	///         smallest = left
+	///     if right exists and element[right] < element[smallest]:
+	///         smallest = right
+	///     
+	///     if smallest != pos:
+	///         swap(pos, smallest)
+	///         pos = smallest
+	///     else:
+	///         break  // Heap property satisfied
+	/// ```
+	///
+	/// # Example: Sift down 30 from root
+	/// ```text
+	/// pos=0:  [30, 20, 15, 40, 50]
+	///         left=1 (20), right=2 (15)
+	///         smallest = 2 (value 15)
+	///         swap(0, 2) → [15, 20, 30, 40, 50]
+	///
+	/// pos=2:  left=5 (none), right=6 (none)
+	///         No children, smallest stays 2
+	///         Done!
+	/// ```
 	#[inline]
 	fn sift_down(&mut self, mut pos: usize) {
 		let len = self.data.len();
@@ -123,54 +393,192 @@ impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
 }
 
 // ============================================================================
-// MergingIterator - k-way merge using binary heap (RocksDB-style)
+// MERGING ITERATOR - K-Way Merge Using Binary Heap
 // ============================================================================
+//
+// ## Problem
+//
+// Given K sorted iterators, produce a single sorted stream of all elements.
+// This is the core operation for LSM-tree reads and compaction.
+//
+// ## Example
+//
+// ```text
+// Input iterators (each sorted):
+//   Iter0: ["apple", "cherry", "fig"]
+//   Iter1: ["banana", "date", "grape"]
+//   Iter2: ["avocado", "coconut"]
+//
+// Output (merged, sorted):
+//   "apple" → "avocado" → "banana" → "cherry" → "coconut" → "date" → "fig" → "grape"
+// ```
+//
+// ## Algorithm (using min-heap)
+//
+// 1. Initialize: Put all iterators in a min-heap, ordered by their current key
+// 2. To get next element: a. The heap root has the iterator with the smallest current key b. Output
+//    that key c. Advance that iterator to its next element d. If iterator is exhausted, remove from
+//    heap e. Otherwise, sift down to restore heap property
+//
+// ## Bidirectional Iteration
+//
+// This implementation supports both forward and backward iteration:
+// - Forward (next): uses min-heap (smallest key at top)
+// - Backward (prev): uses max-heap (largest key at top)
+//
 
 /// Direction of iteration
 #[derive(Clone, Copy, PartialEq)]
 enum Direction {
-	Forward,
-	Backward,
+	Forward,  // Using min-heap, moving towards larger keys
+	Backward, // Using max-heap, moving towards smaller keys
 }
 
-/// Entry in the merge heap - wraps an iterator
+/// Entry in the merge heap - wraps an iterator with metadata.
+///
+/// # Fields
+/// - `iter`: The actual iterator pointing to sorted data
+/// - `level_idx`: Original index for stable ordering when keys are equal
+///
+/// # Why level_idx Matters
+///
+/// In an LSM-tree, lower level numbers contain newer data:
+/// - Level 0 (MemTable): newest writes
+/// - Level 1: older data
+/// - Level 2: even older data
+///
+/// When two iterators have the same key, we want the newer version (lower level).
+/// The `level_idx` serves as a tiebreaker in the heap comparison.
+///
+/// ```text
+/// Example:
+///   Iter0 (level_idx=0): current_key = "apple", seq=100 (newer)
+///   Iter1 (level_idx=1): current_key = "apple", seq=50  (older)
+///   
+/// Heap comparison for same user key:
+///   "apple" vs "apple" → Equal
+///   Tiebreaker: level_idx 0 < 1
+///   Winner: Iter0 (newer version)
+/// ```
 struct HeapEntry<'a> {
 	iter: BoxedInternalIterator<'a>,
-	/// Original index for stable ordering on equal keys
+	/// Original index for stable ordering on equal keys.
+	/// Lower index = higher priority (newer data in LSM-tree).
 	level_idx: usize,
 }
 
-/// K-way merge iterator using binary heaps for operations.
+/// K-way merge iterator using binary heaps for O(log K) operations.
 ///
-/// Uses dual heaps for bidirectional iteration:
-/// - min_heap for forward iteration (smallest key wins)
-/// - max_heap for backward iteration (largest key wins)
+/// ## Architecture
+///
+/// ```text
+/// ┌─────────────────────────────────────────────────────────────┐
+/// │                    MergingIterator                          │
+/// │                                                             │
+/// │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
+/// │  │  min_heap   │  │  max_heap   │  │     exhausted       │ │
+/// │  │ (forward)   │  │ (backward)  │  │  (empty iterators)  │ │
+/// │  │             │  │  (lazy)     │  │                     │ │
+/// │  │ [Iter0]     │  │             │  │ [Iter3, Iter4]      │ │
+/// │  │ [Iter1]     │  │             │  │                     │ │
+/// │  │ [Iter2]     │  │             │  │                     │ │
+/// │  └─────────────┘  └─────────────┘  └─────────────────────┘ │
+/// │                                                             │
+/// │  direction: Forward                                         │
+/// │  cmp: Arc<dyn Comparator>                                   │
+/// └─────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// ## State Transitions
+///
+/// ```text
+/// seek_first() → Forward mode, all valid iters in min_heap
+/// seek_last()  → Backward mode, all valid iters in max_heap
+/// next()       → Advance winner in min_heap (or switch direction)
+/// prev()       → Advance winner in max_heap (or switch direction)
+/// ```
 pub(crate) struct MergingIterator<'a> {
-	/// Entries for forward iteration (min-heap)
+	/// Min-heap for forward iteration.
+	///
+	/// Ordering: smallest key at root (highest priority).
+	///
+	/// Comparator logic:
+	/// ```text
+	/// compare(a, b):
+	///   if a.key < b.key: return Less (a wins)
+	///   if a.key > b.key: return Greater (b wins)
+	///   if a.key == b.key: return a.level_idx.cmp(b.level_idx)
+	///                      (lower level_idx wins = newer data)
+	/// ```
 	min_heap: BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>>,
-	/// Entries for backward iteration (max-heap), lazily initialized
+
+	/// Max-heap for backward iteration, lazily initialized.
+	///
+	/// Ordering: largest key at root (highest priority).
+	///
+	/// Comparator logic (reversed):
+	/// ```text
+	/// compare(a, b):
+	///   if a.key > b.key: return Less (a wins - note reversal!)
+	///   if a.key < b.key: return Greater (b wins)
+	///   if a.key == b.key: return b.level_idx.cmp(a.level_idx)
+	///                      (lower level_idx wins, but reversed comparison)
+	/// ```
 	max_heap:
 		Option<BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>>>,
-	/// Exhausted iterators stored here when not in current heap
+
+	/// Storage for iterators that have been exhausted (no more elements).
+	///
+	/// When an iterator runs out of elements in one direction, it's moved here.
+	/// When switching directions, these iterators are repositioned and may
+	/// become valid again.
 	exhausted: Vec<HeapEntry<'a>>,
-	/// Current direction
+
+	/// Current iteration direction.
 	direction: Direction,
-	/// Comparator for keys
+
+	/// Comparator for comparing user keys.
+	/// Usually lexicographic byte comparison, but could be custom.
 	cmp: Arc<dyn Comparator>,
 }
 
 impl<'a> MergingIterator<'a> {
+	/// Create a new merging iterator from multiple source iterators.
+	///
+	/// # Arguments
+	/// * `iterators` - Source iterators to merge. Each should be sorted.
+	/// * `cmp` - Comparator for ordering keys.
+	///
+	/// # Initial State
+	/// All iterators start in the `exhausted` list because they haven't
+	/// been positioned yet. Call `seek_first()`, `seek_last()`, or `seek()`
+	/// to initialize.
+	///
+	/// # Example
+	/// ```text
+	/// let iters = vec![
+	///     memtable.iter(),      // level_idx = 0 (newest)
+	///     l1_sst.iter(),        // level_idx = 1
+	///     l2_sst.iter(),        // level_idx = 2 (oldest)
+	/// ];
+	/// let merger = MergingIterator::new(iters, comparator);
+	/// merger.seek_first()?;  // Position all at their first elements
+	/// ```
 	pub fn new(iterators: Vec<BoxedInternalIterator<'a>>, cmp: Arc<dyn Comparator>) -> Self {
 		let capacity = iterators.len();
 
-		// Create min-heap comparator (smaller key = higher priority)
+		// Create min-heap comparator (smaller key = higher priority = Less)
+		//
+		// The heap's sift_up/sift_down use `Less` to determine priority,
+		// so we return Less when `a` should be closer to the root.
 		let cmp_clone = Arc::clone(&cmp);
 		let min_cmp: Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering> =
 			Box::new(move |a: &HeapEntry, b: &HeapEntry| {
 				let key_a = a.iter.key().encoded();
 				let key_b = b.iter.key().encoded();
 				match cmp_clone.compare(key_a, key_b) {
-					Ordering::Equal => a.level_idx.cmp(&b.level_idx), // Stable sort by level
+					Ordering::Equal => a.level_idx.cmp(&b.level_idx), // Stable sort: lower
+					// level wins
 					ord => ord,
 				}
 			});
@@ -189,14 +597,29 @@ impl<'a> MergingIterator<'a> {
 
 		Self {
 			min_heap,
-			max_heap: None,
+			max_heap: None, // Lazy initialization
 			exhausted,
 			direction: Direction::Forward,
 			cmp,
 		}
 	}
 
-	/// Create max-heap comparator (larger key = higher priority)
+	/// Create max-heap comparator (larger key = higher priority).
+	///
+	/// For max-heap, we reverse the comparison so that larger keys
+	/// return `Ordering::Less` (which the heap treats as higher priority).
+	///
+	/// # Comparator Logic
+	/// ```text
+	/// For keys: "apple" vs "banana"
+	///   Normal:  "apple" < "banana" → Less
+	///   Reversed: "apple" < "banana" → Greater (so "banana" wins)
+	///
+	/// For equal keys with level_idx:
+	///   level_idx 0 vs 1
+	///   We still want lower level_idx to win, but since we're reversing,
+	///   we compare b.level_idx with a.level_idx
+	/// ```
 	fn create_max_heap(
 		&self,
 		capacity: usize,
@@ -207,19 +630,41 @@ impl<'a> MergingIterator<'a> {
 				let key_a = a.iter.key().encoded();
 				let key_b = b.iter.key().encoded();
 				match cmp_clone.compare(key_a, key_b) {
-					Ordering::Equal => b.level_idx.cmp(&a.level_idx), /* Reverse for max-heap
-					                                                    * stability */
+					Ordering::Equal => a.level_idx.cmp(&b.level_idx),
 					ord => ord.reverse(), // Reverse for max-heap
 				}
 			});
 		BinaryHeap::with_capacity(capacity, max_cmp)
 	}
 
-	/// Initialize for forward iteration
+	/// Initialize for forward iteration - position all iterators at their first element.
+	///
+	/// # Algorithm
+	/// 1. Collect all iterators from min_heap, max_heap, and exhausted
+	/// 2. Call seek_first() on each iterator
+	/// 3. Valid iterators go into min_heap, exhausted ones go to exhausted list
+	///
+	/// # Example
+	/// ```text
+	/// Before:
+	///   min_heap: []
+	///   max_heap: [Iter0("zebra"), Iter1("yak")]  // from backward iteration
+	///   exhausted: [Iter2]
+	///
+	/// After seek_first() on each:
+	///   Iter0.seek_first() → "apple"    ✓
+	///   Iter1.seek_first() → "banana"   ✓
+	///   Iter2.seek_first() → (empty)    ✗
+	///
+	/// After init_forward():
+	///   min_heap: [Iter0("apple"), Iter1("banana")]
+	///   max_heap: []
+	///   exhausted: [Iter2]
+	/// ```
 	fn init_forward(&mut self) -> Result<()> {
 		self.direction = Direction::Forward;
 
-		// Collect all entries from min_heap, max_heap, and exhausted
+		// Collect all entries from everywhere
 		let mut all_entries: Vec<HeapEntry<'a>> = self.min_heap.drain();
 		if let Some(ref mut max_heap) = self.max_heap {
 			all_entries.append(&mut max_heap.drain());
@@ -238,11 +683,26 @@ impl<'a> MergingIterator<'a> {
 		Ok(())
 	}
 
-	/// Initialize for backward iteration
+	/// Initialize for backward iteration - position all iterators at their last element.
+	///
+	/// Similar to init_forward(), but:
+	/// - Uses max_heap instead of min_heap
+	/// - Calls seek_last() instead of seek_first()
+	///
+	/// # Example
+	/// ```text
+	/// Iter0: ["apple", "cherry", "fig"]
+	///                              ↑ seek_last()
+	/// Iter1: ["banana", "date"]
+	///                     ↑ seek_last()
+	///
+	/// max_heap: [Iter0("fig"), Iter1("date")]
+	/// Winner: Iter0 ("fig" > "date")
+	/// ```
 	fn init_backward(&mut self) -> Result<()> {
 		self.direction = Direction::Backward;
 
-		// Ensure max_heap exists
+		// Ensure max_heap exists (lazy initialization)
 		let capacity = self.min_heap.len() + self.exhausted.len();
 		if self.max_heap.is_none() {
 			self.max_heap = Some(self.create_max_heap(capacity));
@@ -250,7 +710,7 @@ impl<'a> MergingIterator<'a> {
 		let max_heap = self.max_heap.as_mut().unwrap();
 
 		// Collect all entries
-		let mut all_entries: Vec<HeapEntry<'a>> = self.min_heap.drain();
+		let mut all_entries: Vec<HeapEntry<'_>> = self.min_heap.drain();
 		all_entries.append(&mut max_heap.drain());
 		all_entries.append(&mut self.exhausted);
 
@@ -266,7 +726,93 @@ impl<'a> MergingIterator<'a> {
 		Ok(())
 	}
 
-	/// Get the current heap based on direction
+	/// Switch from backward to forward iteration, positioning all iterators past target.
+	///
+	/// 1. For each child iterator: seek(target)
+	/// 2. If key == target: next() once to skip past it
+	/// 3. Rebuild the min_heap
+	fn switch_to_forward(&mut self, target: &[u8]) -> Result<()> {
+		self.direction = Direction::Forward;
+
+		// Collect all entries from both heaps and exhausted
+		let mut all_entries: Vec<HeapEntry<'_>> = self.min_heap.drain();
+		if let Some(ref mut max_heap) = self.max_heap {
+			all_entries.append(&mut max_heap.drain());
+		}
+		all_entries.append(&mut self.exhausted);
+
+		// Seek each child to target, then next() if equal
+		for mut entry in all_entries {
+			// seek to first key >= target
+			if entry.iter.seek(target)? {
+				// If positioned exactly at target, advance past it
+				if self.cmp.compare(entry.iter.key().encoded(), target) == Ordering::Equal {
+					if !entry.iter.next()? {
+						self.exhausted.push(entry);
+						continue;
+					}
+				}
+				// key > target, add to heap
+				self.min_heap.push(entry);
+			} else {
+				// No keys >= target in this child
+				self.exhausted.push(entry);
+			}
+		}
+		Ok(())
+	}
+
+	/// Switch from forward to backward iteration, positioning all iterators before target.
+	///
+	/// 1. For each child iterator: seek(target)
+	/// 2. If found: prev() to get last key < target
+	/// 3. If not found (all keys < target): seek_last() to get largest key
+	/// 4. Rebuild the max_heap
+	///
+	/// # Critical Edge Case
+	/// When seek() returns false, the iterator is invalid and prev() would fail.
+	/// We must use seek_last() to get the last (largest) key, which is guaranteed
+	/// to be < target since seek() found no keys >= target.
+	fn switch_to_backward(&mut self, target: &[u8]) -> Result<()> {
+		self.direction = Direction::Backward;
+
+		// Ensure max_heap exists (lazy initialization)
+		let capacity = self.min_heap.len() + self.exhausted.len();
+		if self.max_heap.is_none() {
+			self.max_heap = Some(self.create_max_heap(capacity));
+		}
+		let max_heap = self.max_heap.as_mut().unwrap();
+
+		// Collect all entries
+		let mut all_entries: Vec<HeapEntry<'_>> = self.min_heap.drain();
+		all_entries.append(&mut max_heap.drain());
+		all_entries.append(&mut self.exhausted);
+
+		for mut entry in all_entries {
+			if entry.iter.seek(target)? {
+				// Found key >= target, need to go before it
+				// prev() moves to last key < current position
+				if !entry.iter.prev()? {
+					// No key before current position (exhausted backward)
+					self.exhausted.push(entry);
+					continue;
+				}
+				max_heap.push(entry);
+			} else {
+				// seek() returned false: ALL keys in this child are < target
+				// Use seek_last() to get the largest key (which is < target)
+				if entry.iter.seek_last()? {
+					max_heap.push(entry);
+				} else {
+					// Empty iterator
+					self.exhausted.push(entry);
+				}
+			}
+		}
+		Ok(())
+	}
+
+	/// Get the current heap based on direction.
 	#[inline]
 	fn current_heap(
 		&self,
@@ -277,7 +823,7 @@ impl<'a> MergingIterator<'a> {
 		}
 	}
 
-	/// Get the current heap mutably based on direction
+	/// Get the current heap mutably based on direction.
 	#[inline]
 	fn current_heap_mut(
 		&mut self,
@@ -288,8 +834,38 @@ impl<'a> MergingIterator<'a> {
 		}
 	}
 
-	/// Advance the current
-	fn advance_current(&mut self) -> Result<bool> {
+	/// Advance the current winner iterator.
+	///
+	/// This is the core operation of the merging iterator.
+	///
+	/// # Algorithm
+	/// 1. Get mutable reference to heap root (the winner)
+	/// 2. Advance the winner's iterator (next or prev)
+	/// 3. If still valid: sift_down to restore heap property
+	/// 4. If exhausted: pop from heap, move to exhausted list
+	///
+	/// # Example: Forward iteration
+	/// ```text
+	/// Before:
+	///   min_heap:
+	///         [Iter0 → "apple"]     ← winner (smallest)
+	///        /                \
+	///   [Iter1 → "banana"]  [Iter2 → "cherry"]
+	///
+	/// Step 1: Advance Iter0
+	///   Iter0.next() → now points to "date"
+	///
+	/// Step 2: Heap property violated!
+	///         [Iter0 → "date"]      ← "date" > "banana"!
+	///        /                \
+	///   [Iter1 → "banana"]  [Iter2 → "cherry"]
+	///
+	/// Step 3: sift_down_root()
+	///         [Iter1 → "banana"]    ← restored!
+	///        /                \
+	///   [Iter0 → "date"]    [Iter2 → "cherry"]
+	/// ```
+	fn advance_winner(&mut self) -> Result<bool> {
 		// Copy direction before borrowing heap mutably
 		let direction = self.direction;
 		let heap = self.current_heap_mut();
@@ -316,20 +892,26 @@ impl<'a> MergingIterator<'a> {
 		Ok(!self.current_heap().is_empty())
 	}
 
-	/// Check if iterator is valid
+	/// Check if iterator is valid (positioned on a valid element).
 	#[inline]
 	pub fn is_valid(&self) -> bool {
 		!self.current_heap().is_empty()
 	}
 
-	/// Get current winner's key
+	/// Get current winner's key.
+	///
+	/// # Panics
+	/// Panics if iterator is not valid. Always check `is_valid()` first.
 	#[inline]
 	pub fn current_key(&self) -> InternalKeyRef<'_> {
 		debug_assert!(self.is_valid());
 		self.current_heap().peek().unwrap().iter.key()
 	}
 
-	/// Get current winner's value
+	/// Get current winner's value.
+	///
+	/// # Panics
+	/// Panics if iterator is not valid. Always check `is_valid()` first.
 	#[inline]
 	pub fn current_value(&self) -> &[u8] {
 		debug_assert!(self.is_valid());
@@ -338,6 +920,20 @@ impl<'a> MergingIterator<'a> {
 }
 
 impl InternalIterator for MergingIterator<'_> {
+	/// Seek to the first entry with key >= target.
+	///
+	/// # Example
+	/// ```text
+	/// Iter0: ["apple", "cherry", "fig"]
+	/// Iter1: ["banana", "date"]
+	///
+	/// seek("cat"):
+	///   Iter0.seek("cat") → "cherry" (first >= "cat")
+	///   Iter1.seek("cat") → "date"   (first >= "cat")
+	///   
+	/// min_heap: [Iter0("cherry"), Iter1("date")]
+	/// Result: "cherry"
+	/// ```
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = Direction::Forward;
 
@@ -360,58 +956,57 @@ impl InternalIterator for MergingIterator<'_> {
 		Ok(self.is_valid())
 	}
 
+	/// Position at the first (smallest) key across all iterators.
 	fn seek_first(&mut self) -> Result<bool> {
 		self.init_forward()?;
 		Ok(self.is_valid())
 	}
 
+	/// Position at the last (largest) key across all iterators.
 	fn seek_last(&mut self) -> Result<bool> {
 		self.init_backward()?;
 		Ok(self.is_valid())
 	}
 
+	/// Move to the next entry (in forward direction).
+	///
+	/// If currently in backward mode, this switches direction.
+	///
+	/// # Direction Switch Example
+	/// ```text
+	/// Current state (backward mode):
+	///   Position: "cherry"
+	///   
+	/// User calls next():
+	///   1. Save current key: "cherry"
+	///   2. switch_to_forward("cherry") - seeks all iterators to "cherry", then next()
+	///   3. Result: first entry > "cherry" (e.g., "date")
+	/// ```
 	fn next(&mut self) -> Result<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
-		// Switch direction if needed
 		if self.direction != Direction::Forward {
-			// Save current position, switch to forward, seek to current key
 			let current_key = self.current_key().encoded().to_vec();
-			self.init_forward()?;
-			// Seek past entries <= current_key to avoid duplicates
-			while self.is_valid()
-				&& self.cmp.compare(self.current_key().encoded(), &current_key) != Ordering::Greater
-			{
-				if !self.advance_current()? {
-					break;
-				}
-			}
+			self.switch_to_forward(&current_key)?;
 			return Ok(self.is_valid());
 		}
-		self.advance_current()
+		self.advance_winner()
 	}
 
+	/// Move to the previous entry (in backward direction).
+	///
+	/// If currently in forward mode, this switches direction.
 	fn prev(&mut self) -> Result<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
-		// Switch direction if needed
 		if self.direction != Direction::Backward {
-			// Save current position, switch to backward, seek to current key
 			let current_key = self.current_key().encoded().to_vec();
-			self.init_backward()?;
-			// Seek past entries >= current_key to avoid duplicates
-			while self.is_valid()
-				&& self.cmp.compare(self.current_key().encoded(), &current_key) != Ordering::Less
-			{
-				if !self.advance_current()? {
-					break;
-				}
-			}
+			self.switch_to_backward(&current_key)?;
 			return Ok(self.is_valid());
 		}
-		self.advance_current()
+		self.advance_winner()
 	}
 
 	fn valid(&self) -> bool {
@@ -428,16 +1023,67 @@ impl InternalIterator for MergingIterator<'_> {
 }
 
 // ============================================================================
-// CompactionIterator - Uses MergingIterator for compaction
+// COMPACTION ITERATOR - Deduplication and Garbage Collection
 // ============================================================================
+//
+// ## What is Compaction?
+//
+// Compaction is the background process in LSM-trees that:
+// 1. Merges data from multiple levels
+// 2. Removes old versions of keys (keeps only latest)
+// 3. Removes deleted keys (tombstones) when safe
+// 4. Tracks garbage for Value Log cleanup
+//
+// ## How it Works
+//
+// ```text
+// Input (from MergingIterator):
+//   ("apple", seq=100, PUT, "red")      ← newest
+//   ("apple", seq=50,  PUT, "green")    ← older
+//   ("apple", seq=20,  PUT, "blue")     ← oldest
+//   ("banana", seq=60, PUT, "yellow")
+//   ("cherry", seq=95, DELETE)
+//   ("cherry", seq=40, PUT, "dark")
+//
+// Output (after compaction, versioning=false, bottom_level=true):
+//   ("apple", seq=100, "red")           ← only latest version kept
+//   ("banana", seq=60, "yellow")
+//   // "cherry" completely removed (DELETE at bottom level)
+//
+// Side effects:
+//   - Older versions of "apple" added to delete_list
+//   - All versions of "cherry" added to delete_list
+//   - discard_stats updated for VLog garbage collection
+// ```
+//
+// ## Version Retention
+//
+// With versioning enabled, older versions can be kept based on retention period:
+//
+// ```text
+// versioning=true, retention=1hour:
+//   ("apple", seq=100, age=0)      → keep (latest)
+//   ("apple", seq=50,  age=30min)  → keep (within retention)
+//   ("apple", seq=20,  age=2hours) → discard (outside retention)
+// ```
+//
 
+/// Helper function to collect VLog discard statistics.
+///
+/// When a value is discarded during compaction, we need to track
+/// how much space can be reclaimed from each VLog file.
+///
+/// # Arguments
+/// * `discard_stats` - Map of file_id → bytes_to_discard
+/// * `value` - The value being discarded (may contain VLog pointer)
 fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &[u8]) -> Result<()> {
-	// Skip empty values (e.g., hard delete entries)
+	// Skip empty values (e.g., hard delete entries have no value)
 	if value.is_empty() {
 		return Ok(());
 	}
 
-	// Check if this is a ValueLocation
+	// Check if this is a ValueLocation (pointer to VLog)
+	// Small values are stored inline, large values have pointers
 	let location = ValueLocation::decode(value)?;
 	if location.is_value_pointer() {
 		let pointer = ValuePointer::decode(&location.value)?;
@@ -447,41 +1093,120 @@ fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &[u8
 	Ok(())
 }
 
+/// Compaction iterator that wraps MergingIterator to perform deduplication
+/// and garbage collection tracking.
+///
+/// ## Processing Flow
+///
+/// ```text
+///                      ┌─────────────────────┐
+///                      │  MergingIterator    │
+///                      │  (sorted stream)    │
+///                      └─────────┬───────────┘
+///                                │
+///                                ▼
+///        ┌───────────────────────────────────────────┐
+///        │          CompactionIterator               │
+///        │                                           │
+///        │  1. Group by user_key                     │
+///        │  2. Sort versions by seq_num (desc)       │
+///        │  3. Apply retention/deletion rules        │
+///        │  4. Track garbage for VLog               │
+///        │                                           │
+///        └─────────────────────┬─────────────────────┘
+///                              │
+///                              ▼
+///                    ┌─────────────────────┐
+///                    │   Output versions   │
+///                    │   (deduplicated)    │
+///                    └─────────────────────┘
+/// ```
 pub(crate) struct CompactionIterator<'a> {
+	/// The underlying merge iterator that provides sorted input.
 	merge_iter: MergingIterator<'a>,
+
+	/// Whether this compaction is at the bottom level of the LSM-tree.
+	///
+	/// At the bottom level:
+	/// - DELETE tombstones can be dropped (no older data below)
+	/// - All versions of deleted keys can be removed
+	///
+	/// At non-bottom levels:
+	/// - Tombstones must be preserved to mask data in lower levels
 	is_bottom_level: bool,
 
-	// Track the current key being processed
+	// ========== Current Key Processing ==========
+	/// The user key currently being processed.
+	/// All versions of this key are accumulated before processing.
 	current_user_key: Vec<u8>,
 
-	// Buffer for accumulating all versions of the current key
+	/// Buffer for accumulating all versions of the current key.
+	///
+	/// As the merge iterator produces entries, we collect all entries
+	/// with the same user key here before deciding what to keep.
+	///
+	/// ```text
+	/// MergingIterator produces:
+	///   ("apple", seq=100, PUT)  → accumulate
+	///   ("apple", seq=50, PUT)   → accumulate
+	///   ("banana", seq=60, PUT)  → new key! process "apple", start "banana"
+	/// ```
 	accumulated_versions: Vec<(InternalKey, Value)>,
 
-	// Buffer for outputting the versions of the current key
+	/// Buffer for versions that passed the filter and should be output.
+	///
+	/// After processing accumulated_versions, valid entries are moved here.
+	/// The advance() method drains this buffer before processing more input.
 	output_versions: Vec<(InternalKey, Value)>,
 
-	// Compaction state
-	/// Collected discard statistics: file_id -> total_discarded_bytes
+	// ========== Garbage Collection State ==========
+	/// Collected discard statistics: file_id → total_discarded_bytes.
+	///
+	/// This tells the VLog garbage collector how much space can be
+	/// reclaimed from each VLog file.
 	pub discard_stats: HashMap<u32, i64>,
 
-	/// Reference to VLog for populating delete-list
+	/// Reference to VLog for populating delete-list.
 	vlog: Option<Arc<VLog>>,
 
-	/// Batch of stale entries to add to delete-list: (sequence_number,
-	/// value_size)
+	/// Batch of stale entries to add to delete-list: (sequence_number, value_size).
+	///
+	/// These entries are flushed periodically to the VLog's delete list,
+	/// which is used during garbage collection.
 	pub(crate) delete_list_batch: Vec<(u64, u64)>,
 
-	/// Versioning configuration
+	// ========== Versioning Configuration ==========
+	/// Whether to keep multiple versions of keys.
+	///
+	/// - false: Only keep the latest version (point-in-time database)
+	/// - true: Keep versions based on retention_period_ns
 	enable_versioning: bool,
+
+	/// How long to keep old versions (in nanoseconds).
+	///
+	/// - 0: Keep all versions forever
+	/// - >0: Keep versions newer than (current_time - retention_period_ns)
 	retention_period_ns: u64,
 
-	/// Logical clock for time-based operations
+	/// Logical clock for time-based operations.
+	/// Used to determine if versions are within retention period.
 	clock: Arc<dyn LogicalClock>,
 
+	/// Whether the iterator has been initialized.
 	initialized: bool,
 }
 
 impl<'a> CompactionIterator<'a> {
+	/// Create a new compaction iterator.
+	///
+	/// # Arguments
+	/// * `iterators` - Source iterators to merge (one per level/file)
+	/// * `cmp` - Key comparator
+	/// * `is_bottom_level` - Whether compacting to the bottom level
+	/// * `vlog` - Optional VLog for garbage tracking
+	/// * `enable_versioning` - Whether to keep multiple versions
+	/// * `retention_period_ns` - How long to keep old versions
+	/// * `clock` - Time source for retention calculations
 	pub(crate) fn new(
 		iterators: Vec<BoxedInternalIterator<'a>>,
 		cmp: Arc<dyn Comparator>,
@@ -509,13 +1234,17 @@ impl<'a> CompactionIterator<'a> {
 		}
 	}
 
+	/// Initialize the iterator by seeking to the first entry.
 	fn initialize(&mut self) -> Result<()> {
 		self.merge_iter.seek_first()?;
 		self.initialized = true;
 		Ok(())
 	}
 
-	/// Flushes the batched delete-list entries to the VLog
+	/// Flushes the batched delete-list entries to the VLog.
+	///
+	/// Called periodically during compaction to avoid building up
+	/// too much state in memory.
 	pub(crate) fn flush_delete_list_batch(&mut self) -> Result<()> {
 		if let Some(ref vlog) = self.vlog {
 			if !self.delete_list_batch.is_empty() {
@@ -525,83 +1254,139 @@ impl<'a> CompactionIterator<'a> {
 		Ok(())
 	}
 
-	/// Process all accumulated versions of the current key
-	/// Filters out stale entries and populates output_versions with valid
-	/// entries
+	/// Process all accumulated versions of the current key.
+	///
+	/// This is the heart of compaction logic. It decides:
+	/// - Which versions to keep (output_versions)
+	/// - Which versions to discard (delete_list, discard_stats)
+	///
+	/// # Decision Matrix
+	///
+	/// ```text
+	/// ┌─────────────────┬───────────────┬────────────────┬──────────────────┐
+	/// │ Scenario        │ Bottom Level? │ Versioning?    │ Action           │
+	/// ├─────────────────┼───────────────┼────────────────┼──────────────────┤
+	/// │ Latest PUT      │ any           │ any            │ KEEP             │
+	/// │ Latest DELETE   │ YES           │ any            │ DROP ALL         │
+	/// │ Latest DELETE   │ NO            │ any            │ KEEP (tombstone) │
+	/// │ Latest REPLACE  │ any           │ any            │ KEEP, drop older │
+	/// │ Older PUT       │ any           │ NO             │ DROP             │
+	/// │ Older PUT       │ any           │ YES, in window │ KEEP             │
+	/// │ Older PUT       │ any           │ YES, expired   │ DROP             │
+	/// └─────────────────┴───────────────┴────────────────┴──────────────────┘
+	/// ```
+	///
+	/// # Example: DELETE at Bottom Level
+	///
+	/// ```text
+	/// Input:
+	///   ("key1", seq=100, DELETE)
+	///   ("key1", seq=50,  PUT, "value")
+	///
+	/// At bottom level:
+	///   - Latest is DELETE → can drop everything
+	///   - Output: []
+	///   - delete_list: [seq=100, seq=50]
+	///
+	/// At non-bottom level:
+	///   - Must keep tombstone to mask lower levels
+	///   - Output: [("key1", seq=100, DELETE)]
+	///   - delete_list: [seq=50]
+	/// ```
+	///
+	/// # Example: Versioning with Retention
+	///
+	/// ```text
+	/// Input:
+	///   ("key1", seq=100, PUT, "v3", timestamp=now)
+	///   ("key1", seq=50,  PUT, "v2", timestamp=now-30min)
+	///   ("key1", seq=20,  PUT, "v1", timestamp=now-2hours)
+	///
+	/// With versioning=true, retention=1hour:
+	///   - seq=100: age=0, KEEP (latest)
+	///   - seq=50:  age=30min < 1hour, KEEP (within retention)
+	///   - seq=20:  age=2hours > 1hour, DROP (expired)
+	///   
+	/// Output: [seq=100, seq=50]
+	/// delete_list: [seq=20]
+	/// ```
 	fn process_accumulated_versions(&mut self) {
 		if self.accumulated_versions.is_empty() {
 			return;
 		}
 
 		// Sort by sequence number (descending) to get the latest version first
+		// Higher sequence number = more recent write
 		self.accumulated_versions.sort_by(|a, b| b.0.seq_num().cmp(&a.0.seq_num()));
 
-		// Check if latest version is DELETE at bottom level - if so, discard entire key
+		// Check if latest version is DELETE at bottom level
+		// If so, we can completely remove this key from the database
 		let latest_is_delete_at_bottom = self.is_bottom_level
 			&& !self.accumulated_versions.is_empty()
 			&& self.accumulated_versions[0].0.is_hard_delete_marker();
 
-		// Check if any version is Replace - if so, mark all older versions as stale
+		// Check if any version is REPLACE
+		// REPLACE semantics: delete all older versions regardless of retention
 		let has_set_with_delete = self.accumulated_versions.iter().any(|(key, _)| key.is_replace());
 
-		// Process all versions for delete list and determine which to keep
+		// Process each version
 		for (i, (key, value)) in self.accumulated_versions.iter().enumerate() {
 			let is_hard_delete = key.is_hard_delete_marker();
 			let is_replace = key.is_replace();
 			let is_latest = i == 0;
 
-			// Determine if this entry should be marked as stale in VLog
+			// ===== DETERMINE IF ENTRY SHOULD BE MARKED STALE =====
+			// Stale entries are added to delete_list for VLog garbage collection
+
 			let should_mark_stale = if latest_is_delete_at_bottom {
-				// If latest version is DELETE at bottom level, mark ALL versions as stale
+				// DELETE at bottom level: mark ALL versions as stale
+				// The entire key is being removed from the database
 				true
 			} else if is_latest && !is_hard_delete && !is_replace {
-				// Latest version of a regular SET operation: never mark as stale (it's being
-				// returned)
+				// Latest PUT: never stale (will be output)
 				false
 			} else if is_latest && is_hard_delete && self.is_bottom_level {
-				// Latest version of a DELETE operation at bottom level: mark as stale (not
-				// returned)
+				// Latest DELETE at bottom: stale (won't be output)
 				true
 			} else if is_latest && is_hard_delete && !self.is_bottom_level {
-				// Latest version of a DELETE operation at non-bottom level: don't mark as stale
-				// (it's being returned)
+				// Latest DELETE at non-bottom: not stale (tombstone preserved)
 				false
 			} else if is_latest && is_replace {
-				// Latest version of a Replace operation: don't mark as stale (it's being
-				// returned)
+				// Latest REPLACE: not stale (will be output)
 				false
 			} else if is_hard_delete {
-				// For older DELETE operations (hard delete entries): always mark as stale since
-				// they don't have VLog values
+				// Older DELETE: always stale (only latest tombstone matters)
 				true
 			} else if has_set_with_delete && !is_replace {
-				// If there's a Replace operation, mark all older non-Replace versions as stale
+				// REPLACE found: all older non-REPLACE versions are stale
 				true
 			} else {
-				// Older version of a SET operation: check retention period
+				// Older PUT: check versioning and retention
 				if !self.enable_versioning {
-					// Versioning disabled: mark older versions as stale
+					// No versioning: only latest matters
 					true
 				} else if self.retention_period_ns > 0 {
-					// Versioning enabled with retention period: check if within retention
+					// Check retention period
 					let current_time = self.clock.now();
 					let key_timestamp = key.timestamp;
 					let age = current_time - key_timestamp;
 					let is_within_retention = age <= self.retention_period_ns;
-					// Mark as stale only if NOT within retention period
+					// Stale if OUTSIDE retention period
 					!is_within_retention
 				} else {
-					// Versioning enabled with retention_period_ns == 0: keep all versions forever
+					// retention_period_ns == 0: keep forever
 					false
 				}
 			};
 
-			// Add to delete list and collect discard stats if needed
+			// ===== RECORD STALE ENTRIES FOR GARBAGE COLLECTION =====
+
 			if should_mark_stale && self.vlog.is_some() {
 				if key.is_tombstone() {
-					// Hard Delete: add key size to delete list
+					// Tombstone: record key size
 					self.delete_list_batch.push((key.seq_num(), key.size() as u64));
 				} else {
+					// Regular value: record VLog pointer size
 					let location = ValueLocation::decode(value).unwrap();
 					if location.is_value_pointer() {
 						let pointer = ValuePointer::decode(&location.value).unwrap();
@@ -610,24 +1395,25 @@ impl<'a> CompactionIterator<'a> {
 					}
 				}
 
-				// Collect discard statistics
+				// Update per-file discard statistics
 				if let Err(e) = collect_vlog_discard_stats(&mut self.discard_stats, value) {
 					log::warn!("Error collecting discard stats: {e:?}");
 				}
 			}
 
-			// Determine if this version should be kept for output
+			// ===== DETERMINE IF ENTRY SHOULD BE OUTPUT =====
+
 			let should_output = if latest_is_delete_at_bottom {
-				// If latest version is DELETE at bottom level, output NOTHING for this key
+				// DELETE at bottom: output NOTHING
 				false
 			} else if should_mark_stale {
 				// Stale entries: don't output
 				false
 			} else if self.enable_versioning {
-				// Versioning enabled: output all non-stale versions
+				// Versioning: output all non-stale versions
 				true
 			} else {
-				// Versioning disabled: only output the latest version
+				// No versioning: only output latest
 				is_latest
 			};
 
@@ -640,23 +1426,87 @@ impl<'a> CompactionIterator<'a> {
 		self.accumulated_versions.clear();
 	}
 
-	/// Advance to the next output entry
+	/// Advance to the next output entry.
+	///
+	/// # Algorithm
+	///
+	/// ```text
+	/// loop:
+	///   1. If output_versions is not empty:
+	///      → Return next output entry
+	///      
+	///   2. If merge_iter is exhausted:
+	///      → Process remaining accumulated versions
+	///      → Return next output entry or None
+	///      
+	///   3. Get next entry from merge_iter
+	///   
+	///   4. If new user key:
+	///      → Process accumulated versions of previous key
+	///      → Start accumulating new key
+	///      → Return output if any
+	///      
+	///   5. If same user key:
+	///      → Add to accumulated versions
+	///      → Continue loop
+	/// ```
+	///
+	/// # Example Trace
+	///
+	/// ```text
+	/// MergingIterator produces:
+	///   ("apple", seq=100, PUT)
+	///   ("apple", seq=50, PUT)
+	///   ("banana", seq=60, PUT)
+	///
+	/// advance() call 1:
+	///   - output_versions: []
+	///   - merge_iter → ("apple", 100)
+	///   - new key: accumulate, current_user_key = "apple"
+	///   - merge_iter.next()
+	///   - loop continues...
+	///   
+	/// advance() call 1 (continued):
+	///   - merge_iter → ("apple", 50)
+	///   - same key: accumulate
+	///   - merge_iter.next()
+	///   - loop continues...
+	///   
+	/// advance() call 1 (continued):
+	///   - merge_iter → ("banana", 60)
+	///   - NEW key! Process "apple" accumulated versions
+	///   - output_versions = [("apple", 100)]  // only latest
+	///   - start accumulating "banana"
+	///   - return ("apple", 100)
+	///   
+	/// advance() call 2:
+	///   - output_versions: []
+	///   - merge_iter exhausted
+	///   - process "banana" accumulated versions
+	///   - return ("banana", 60)
+	///   
+	/// advance() call 3:
+	///   - output_versions: []
+	///   - merge_iter exhausted
+	///   - accumulated_versions: []
+	///   - return None
+	/// ```
 	pub fn advance(&mut self) -> Result<Option<(InternalKey, Value)>> {
 		if !self.initialized {
 			self.initialize()?;
 		}
 
 		loop {
-			// First, return any pending output versions
+			// Priority 1: Return any pending output versions
 			if !self.output_versions.is_empty() {
-				// Remove from front to maintain sequence number order (already sorted
-				// descending)
+				// Remove from front to maintain sequence number order
+				// (already sorted descending by seq_num)
 				return Ok(Some(self.output_versions.remove(0)));
 			}
 
-			// Get the next item from the merge iterator
+			// Priority 2: Check if merge iterator is exhausted
 			if !self.merge_iter.is_valid() {
-				// No more items, process any remaining accumulated versions
+				// Process any remaining accumulated versions
 				if !self.accumulated_versions.is_empty() {
 					self.process_accumulated_versions();
 					// Return first output version if any
@@ -667,8 +1517,8 @@ impl<'a> CompactionIterator<'a> {
 				return Ok(None);
 			}
 
-			// Get current key and value from merge iterator (extract to owned to avoid borrow
-			// issues)
+			// Priority 3: Get next entry from merge iterator
+			// Extract to owned values to avoid borrow checker issues
 			let key_owned = self.merge_iter.current_key().to_owned();
 			let user_key_owned = key_owned.user_key.clone();
 			let value_owned = self.merge_iter.current_value().to_vec();
@@ -712,6 +1562,16 @@ impl<'a> CompactionIterator<'a> {
 	}
 }
 
+/// Implement Iterator trait for convenient use in for loops and iterators.
+///
+/// # Example
+/// ```text
+/// let compaction_iter = CompactionIterator::new(...);
+/// for result in compaction_iter {
+///     let (key, value) = result?;
+///     // Write to output SSTable
+/// }
+/// ```
 impl Iterator for CompactionIterator<'_> {
 	type Item = Result<(InternalKey, Value)>;
 
@@ -720,733 +1580,6 @@ impl Iterator for CompactionIterator<'_> {
 			Ok(Some(item)) => Some(Ok(item)),
 			Ok(None) => None,
 			Err(e) => Some(Err(e)),
-		}
-	}
-}
-
-// ============================================================================
-// Proptest-based Property Tests
-// ============================================================================
-
-#[cfg(test)]
-mod proptest_tests {
-	use super::*;
-	use proptest::prelude::*;
-	use std::cmp::Ordering;
-
-	// ========================================================================
-	// BinaryHeap Property Tests
-	// ========================================================================
-
-	/// Verify the min-heap invariant: parent <= children for all nodes
-	fn verify_heap_invariant<T, F: Fn(&T, &T) -> Ordering>(heap: &BinaryHeap<T, F>) -> bool {
-		let data = &heap.data;
-		for i in 0..data.len() {
-			let left = 2 * i + 1;
-			let right = 2 * i + 2;
-
-			if left < data.len() && (heap.cmp)(&data[i], &data[left]) == Ordering::Greater {
-				return false;
-			}
-			if right < data.len() && (heap.cmp)(&data[i], &data[right]) == Ordering::Greater {
-				return false;
-			}
-		}
-		true
-	}
-
-	proptest! {
-		/// Property: After any sequence of pushes, the heap invariant holds
-		#[test]
-		fn prop_heap_invariant_after_pushes(values in prop::collection::vec(0i32..1000, 0..100)) {
-			let mut heap = BinaryHeap::with_capacity(values.len(), |a: &i32, b: &i32| a.cmp(b));
-
-			for v in values {
-				heap.push(v);
-				prop_assert!(verify_heap_invariant(&heap), "Heap invariant violated after push");
-			}
-		}
-
-		/// Property: peek() always returns the minimum element
-		#[test]
-		fn prop_peek_returns_minimum(values in prop::collection::vec(0i32..1000, 1..100)) {
-			let mut heap = BinaryHeap::with_capacity(values.len(), |a: &i32, b: &i32| a.cmp(b));
-
-			for v in &values {
-				heap.push(*v);
-			}
-
-			let expected_min = values.iter().min().unwrap();
-			prop_assert_eq!(heap.peek(), Some(expected_min));
-		}
-
-		/// Property: pop() returns elements in ascending order (sorted extraction)
-		#[test]
-		fn prop_pop_returns_sorted(values in prop::collection::vec(0i32..1000, 0..100)) {
-			let mut heap = BinaryHeap::with_capacity(values.len(), |a: &i32, b: &i32| a.cmp(b));
-
-			for v in &values {
-				heap.push(*v);
-			}
-
-			let mut sorted = values.clone();
-			sorted.sort();
-
-			let mut extracted = Vec::new();
-			while let Some(v) = heap.pop() {
-				extracted.push(v);
-				prop_assert!(verify_heap_invariant(&heap), "Heap invariant violated after pop");
-			}
-
-			prop_assert_eq!(extracted, sorted);
-		}
-
-		/// Property: len() correctly tracks the number of elements
-		#[test]
-		fn prop_len_tracks_correctly(
-			pushes in prop::collection::vec(0i32..1000, 0..50),
-			pop_count in 0usize..30
-		) {
-			let mut heap = BinaryHeap::with_capacity(pushes.len(), |a: &i32, b: &i32| a.cmp(b));
-
-			for v in &pushes {
-				heap.push(*v);
-			}
-
-			prop_assert_eq!(heap.len(), pushes.len());
-
-			let actual_pops = pop_count.min(pushes.len());
-			for _ in 0..actual_pops {
-				heap.pop();
-			}
-
-			prop_assert_eq!(heap.len(), pushes.len() - actual_pops);
-		}
-
-		/// Property: After modifying root via peek_mut and calling sift_down_root,
-		/// the heap invariant is restored
-		#[test]
-		fn prop_sift_down_root_restores_invariant(
-			values in prop::collection::vec(0i32..1000, 2..50),
-			new_root in 0i32..2000
-		) {
-			let mut heap = BinaryHeap::with_capacity(values.len(), |a: &i32, b: &i32| a.cmp(b));
-
-			for v in &values {
-				heap.push(*v);
-			}
-
-			if let Some(root) = heap.peek_mut() {
-				*root = new_root;
-			}
-			heap.sift_down_root();
-
-			prop_assert!(verify_heap_invariant(&heap), "Heap invariant violated after sift_down_root");
-		}
-	}
-
-	// ========================================================================
-	// MergingIterator Property Tests
-	// ========================================================================
-
-	/// A simple mock iterator for testing MergingIterator
-	struct PropMockIterator {
-		items: Vec<(Vec<u8>, Vec<u8>)>, // (encoded_key, value)
-		index: Option<usize>,
-	}
-
-	impl PropMockIterator {
-		fn new(mut items: Vec<(Vec<u8>, Vec<u8>)>) -> Self {
-			// Sort by encoded key to simulate a proper iterator
-			items.sort_by(|a, b| a.0.cmp(&b.0));
-			Self { items, index: None }
-		}
-	}
-
-	impl InternalIterator for PropMockIterator {
-		fn seek(&mut self, target: &[u8]) -> Result<bool> {
-			for i in 0..self.items.len() {
-				if self.items[i].0.as_slice() >= target {
-					self.index = Some(i);
-					return Ok(true);
-				}
-			}
-			self.index = None;
-			Ok(false)
-		}
-
-		fn seek_first(&mut self) -> Result<bool> {
-			if self.items.is_empty() {
-				self.index = None;
-				Ok(false)
-			} else {
-				self.index = Some(0);
-				Ok(true)
-			}
-		}
-
-		fn seek_last(&mut self) -> Result<bool> {
-			if self.items.is_empty() {
-				self.index = None;
-				Ok(false)
-			} else {
-				self.index = Some(self.items.len() - 1);
-				Ok(true)
-			}
-		}
-
-		fn next(&mut self) -> Result<bool> {
-			match self.index {
-				Some(i) if i + 1 < self.items.len() => {
-					self.index = Some(i + 1);
-					Ok(true)
-				}
-				_ => {
-					self.index = None;
-					Ok(false)
-				}
-			}
-		}
-
-		fn prev(&mut self) -> Result<bool> {
-			match self.index {
-				Some(i) if i > 0 => {
-					self.index = Some(i - 1);
-					Ok(true)
-				}
-				_ => {
-					self.index = None;
-					Ok(false)
-				}
-			}
-		}
-
-		fn valid(&self) -> bool {
-			self.index.is_some()
-		}
-
-		fn key(&self) -> InternalKeyRef<'_> {
-			debug_assert!(self.valid());
-			InternalKeyRef::from_encoded(&self.items[self.index.unwrap()].0)
-		}
-
-		fn value(&self) -> &[u8] {
-			debug_assert!(self.valid());
-			&self.items[self.index.unwrap()].1
-		}
-	}
-
-	/// Generate a random encoded internal key
-	fn gen_encoded_key(user_key: &[u8], seq: u64) -> Vec<u8> {
-		let key = InternalKey::new(user_key.to_vec(), seq, crate::InternalKeyKind::Set, 0);
-		key.encode()
-	}
-
-	/// Simple comparator for testing
-	#[derive(Clone)]
-	struct TestComparator;
-
-	impl Comparator for TestComparator {
-		fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-			a.cmp(b)
-		}
-
-		fn separator(&self, from: &[u8], _to: &[u8]) -> Vec<u8> {
-			from.to_vec()
-		}
-
-		fn successor(&self, key: &[u8]) -> Vec<u8> {
-			let mut result = key.to_vec();
-			result.push(0);
-			result
-		}
-
-		fn name(&self) -> &str {
-			"TestComparator"
-		}
-	}
-
-	proptest! {
-		/// Property: MergingIterator outputs keys in sorted order
-		#[test]
-		fn prop_merging_iter_sorted_output(
-			// Generate 1-5 iterators, each with 0-20 keys
-			iter_data in prop::collection::vec(
-				prop::collection::vec(
-					(prop::collection::vec(prop::num::u8::ANY, 1..10), 1u64..1000),
-					0..20
-				),
-				1..5
-			)
-		) {
-			let cmp: Arc<dyn Comparator> = Arc::new(TestComparator);
-
-			// Build mock iterators
-			let iterators: Vec<BoxedInternalIterator<'_>> = iter_data
-				.iter()
-				.map(|items| {
-					let encoded_items: Vec<(Vec<u8>, Vec<u8>)> = items
-						.iter()
-						.map(|(user_key, seq)| {
-							(gen_encoded_key(user_key, *seq), b"value".to_vec())
-						})
-						.collect();
-					Box::new(PropMockIterator::new(encoded_items)) as BoxedInternalIterator<'_>
-				})
-				.collect();
-
-			let mut merge_iter = MergingIterator::new(iterators, Arc::clone(&cmp));
-
-			// Collect all keys
-			let mut keys: Vec<Vec<u8>> = Vec::new();
-			if merge_iter.seek_first().unwrap() {
-				keys.push(merge_iter.current_key().encoded().to_vec());
-				while merge_iter.next().unwrap() {
-					keys.push(merge_iter.current_key().encoded().to_vec());
-				}
-			}
-
-			// Verify sorted order
-			for i in 1..keys.len() {
-				prop_assert!(
-					keys[i - 1] <= keys[i],
-					"Keys not in sorted order at index {}: {:?} > {:?}",
-					i,
-					keys[i - 1],
-					keys[i]
-				);
-			}
-		}
-
-		/// Property: MergingIterator contains all keys from input iterators
-		#[test]
-		fn prop_merging_iter_completeness(
-			iter_data in prop::collection::vec(
-				prop::collection::vec(
-					(prop::collection::vec(prop::num::u8::ANY, 1..5), 1u64..100),
-					0..10
-				),
-				1..4
-			)
-		) {
-			let cmp: Arc<dyn Comparator> = Arc::new(TestComparator);
-
-			// Collect all expected keys
-			let mut all_expected: Vec<Vec<u8>> = iter_data
-				.iter()
-				.flat_map(|items| {
-					items.iter().map(|(user_key, seq)| gen_encoded_key(user_key, *seq))
-				})
-				.collect();
-			all_expected.sort();
-			all_expected.dedup();
-
-			// Build mock iterators
-			let iterators: Vec<BoxedInternalIterator<'_>> = iter_data
-				.iter()
-				.map(|items| {
-					let encoded_items: Vec<(Vec<u8>, Vec<u8>)> = items
-						.iter()
-						.map(|(user_key, seq)| {
-							(gen_encoded_key(user_key, *seq), b"value".to_vec())
-						})
-						.collect();
-					Box::new(PropMockIterator::new(encoded_items)) as BoxedInternalIterator<'_>
-				})
-				.collect();
-
-			let mut merge_iter = MergingIterator::new(iterators, Arc::clone(&cmp));
-
-			// Collect merged keys
-			let mut merged_keys: Vec<Vec<u8>> = Vec::new();
-			if merge_iter.seek_first().unwrap() {
-				merged_keys.push(merge_iter.current_key().encoded().to_vec());
-				while merge_iter.next().unwrap() {
-					merged_keys.push(merge_iter.current_key().encoded().to_vec());
-				}
-			}
-
-			prop_assert_eq!(
-				merged_keys.len(),
-				all_expected.len(),
-				"Merged output has different count than expected"
-			);
-		}
-
-		/// Property: seek(target) positions on first key >= target
-		#[test]
-		fn prop_merging_iter_seek_correctness(
-			keys in prop::collection::vec(
-				prop::collection::vec(prop::num::u8::ANY, 1..5),
-				1..20
-			),
-			target in prop::collection::vec(prop::num::u8::ANY, 0..5)
-		) {
-			let cmp: Arc<dyn Comparator> = Arc::new(TestComparator);
-
-			// Build encoded keys
-			let encoded_items: Vec<(Vec<u8>, Vec<u8>)> = keys
-				.iter()
-				.enumerate()
-				.map(|(i, user_key)| {
-					(gen_encoded_key(user_key, i as u64 + 1), b"value".to_vec())
-				})
-				.collect();
-
-			let encoded_target = gen_encoded_key(&target, 0);
-
-			let iterators: Vec<BoxedInternalIterator<'_>> = vec![
-				Box::new(PropMockIterator::new(encoded_items.clone())) as BoxedInternalIterator<'_>
-			];
-
-			let mut merge_iter = MergingIterator::new(iterators, Arc::clone(&cmp));
-
-			let found = merge_iter.seek(&encoded_target).unwrap();
-
-			if found {
-				let key = merge_iter.current_key().encoded().to_vec();
-				prop_assert!(
-					key >= encoded_target,
-					"seek() positioned on key < target"
-				);
-
-				// Verify it's the first key >= target
-				let mut all_keys: Vec<Vec<u8>> = encoded_items.iter().map(|(k, _)| k.clone()).collect();
-				all_keys.sort();
-				let expected_first = all_keys.iter().find(|k| **k >= encoded_target);
-				prop_assert_eq!(Some(&key), expected_first);
-			} else {
-				// No key >= target exists
-				let all_keys: Vec<Vec<u8>> = encoded_items.iter().map(|(k, _)| k.clone()).collect();
-				let has_ge = all_keys.iter().any(|k| *k >= encoded_target);
-				prop_assert!(!has_ge, "seek() returned false but a key >= target exists");
-			}
-		}
-	}
-
-	// ========================================================================
-	// CompactionIterator Property Tests
-	// ========================================================================
-
-	use crate::clock::MockLogicalClock;
-	use crate::comparator::{BytewiseComparator, InternalKeyComparator};
-
-	/// Generate test entries for CompactionIterator testing
-	fn create_test_entry(user_key: &[u8], seq: u64, is_delete: bool) -> (InternalKey, Vec<u8>) {
-		let kind = if is_delete {
-			crate::InternalKeyKind::Delete
-		} else {
-			crate::InternalKeyKind::Set
-		};
-		let key = InternalKey::new(user_key.to_vec(), seq, kind, 0);
-		let value = if is_delete {
-			Vec::new()
-		} else {
-			format!("value-{seq}").into_bytes()
-		};
-		(key, value)
-	}
-
-	/// MockIterator that works with InternalKey entries
-	struct CompactionMockIterator {
-		items: Vec<(InternalKey, Vec<u8>)>,
-		encoded_keys: Vec<Vec<u8>>,
-		index: Option<usize>,
-	}
-
-	impl CompactionMockIterator {
-		fn new(mut items: Vec<(InternalKey, Vec<u8>)>) -> Self {
-			// Sort by encoded key
-			items.sort_by(|a, b| a.0.encode().cmp(&b.0.encode()));
-			let encoded_keys: Vec<Vec<u8>> = items.iter().map(|(k, _)| k.encode()).collect();
-			Self {
-				items,
-				encoded_keys,
-				index: None,
-			}
-		}
-	}
-
-	impl InternalIterator for CompactionMockIterator {
-		fn seek(&mut self, target: &[u8]) -> Result<bool> {
-			for i in 0..self.encoded_keys.len() {
-				if self.encoded_keys[i].as_slice() >= target {
-					self.index = Some(i);
-					return Ok(true);
-				}
-			}
-			self.index = None;
-			Ok(false)
-		}
-
-		fn seek_first(&mut self) -> Result<bool> {
-			if self.items.is_empty() {
-				self.index = None;
-				Ok(false)
-			} else {
-				self.index = Some(0);
-				Ok(true)
-			}
-		}
-
-		fn seek_last(&mut self) -> Result<bool> {
-			if self.items.is_empty() {
-				self.index = None;
-				Ok(false)
-			} else {
-				self.index = Some(self.items.len() - 1);
-				Ok(true)
-			}
-		}
-
-		fn next(&mut self) -> Result<bool> {
-			match self.index {
-				Some(i) if i + 1 < self.items.len() => {
-					self.index = Some(i + 1);
-					Ok(true)
-				}
-				_ => {
-					self.index = None;
-					Ok(false)
-				}
-			}
-		}
-
-		fn prev(&mut self) -> Result<bool> {
-			match self.index {
-				Some(i) if i > 0 => {
-					self.index = Some(i - 1);
-					Ok(true)
-				}
-				_ => {
-					self.index = None;
-					Ok(false)
-				}
-			}
-		}
-
-		fn valid(&self) -> bool {
-			self.index.is_some()
-		}
-
-		fn key(&self) -> InternalKeyRef<'_> {
-			debug_assert!(self.valid());
-			InternalKeyRef::from_encoded(&self.encoded_keys[self.index.unwrap()])
-		}
-
-		fn value(&self) -> &[u8] {
-			debug_assert!(self.valid());
-			&self.items[self.index.unwrap()].1
-		}
-	}
-
-	fn create_test_comparator() -> Arc<InternalKeyComparator> {
-		Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())))
-	}
-
-	proptest! {
-		/// Property: CompactionIterator output is sorted by user key
-		#[test]
-		fn prop_compaction_iter_sorted_output(
-			// Generate entries: (user_key_suffix, seq_num, is_delete)
-			entries in prop::collection::vec(
-				(0u8..10, 1u64..100, prop::bool::ANY),
-				1..30
-			)
-		) {
-			let items: Vec<(InternalKey, Vec<u8>)> = entries
-				.iter()
-				.map(|(suffix, seq, is_delete)| {
-					let user_key = format!("key-{suffix:02}").into_bytes();
-					create_test_entry(&user_key, *seq, *is_delete)
-				})
-				.collect();
-
-			let iter = Box::new(CompactionMockIterator::new(items)) as BoxedInternalIterator<'_>;
-
-			let mut comp_iter = CompactionIterator::new(
-				vec![iter],
-				create_test_comparator(),
-				false,
-				None,
-				false,
-				0,
-				Arc::new(MockLogicalClock::new()),
-			);
-
-			let mut prev_user_key: Option<Vec<u8>> = None;
-			for result in comp_iter.by_ref() {
-				let (key, _) = result.unwrap();
-				if let Some(prev) = &prev_user_key {
-					prop_assert!(
-						*prev <= key.user_key,
-						"Output not sorted: {:?} > {:?}",
-						prev,
-						key.user_key
-					);
-				}
-				prev_user_key = Some(key.user_key);
-			}
-		}
-
-		/// Property: CompactionIterator deduplicates by user key (no duplicate user keys)
-		#[test]
-		fn prop_compaction_iter_deduplication(
-			// Generate entries with potential duplicates
-			entries in prop::collection::vec(
-				(0u8..5, 1u64..50, prop::bool::ANY),
-				1..40
-			)
-		) {
-			let items: Vec<(InternalKey, Vec<u8>)> = entries
-				.iter()
-				.map(|(suffix, seq, is_delete)| {
-					let user_key = format!("key-{suffix:02}").into_bytes();
-					create_test_entry(&user_key, *seq, *is_delete)
-				})
-				.collect();
-
-			let iter = Box::new(CompactionMockIterator::new(items)) as BoxedInternalIterator<'_>;
-
-			let mut comp_iter = CompactionIterator::new(
-				vec![iter],
-				create_test_comparator(),
-				false, // non-bottom level
-				None,
-				false, // no versioning
-				0,
-				Arc::new(MockLogicalClock::new()),
-			);
-
-			let mut seen_user_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-			for result in comp_iter.by_ref() {
-				let (key, _) = result.unwrap();
-				prop_assert!(
-					seen_user_keys.insert(key.user_key.clone()),
-					"Duplicate user key in output: {:?}",
-					key.user_key
-				);
-			}
-		}
-
-		/// Property: CompactionIterator returns latest version (highest seq) for each user key
-		#[test]
-		fn prop_compaction_iter_latest_wins(
-			// Generate entries with same user key but different seq nums
-			seqs in prop::collection::vec(1u64..1000, 2..10)
-		) {
-			let user_key = b"test_key".to_vec();
-			let items: Vec<(InternalKey, Vec<u8>)> = seqs
-				.iter()
-				.map(|seq| create_test_entry(&user_key, *seq, false))
-				.collect();
-
-			let expected_max_seq = *seqs.iter().max().unwrap();
-
-			let iter = Box::new(CompactionMockIterator::new(items)) as BoxedInternalIterator<'_>;
-
-			let mut comp_iter = CompactionIterator::new(
-				vec![iter],
-				create_test_comparator(),
-				false,
-				None,
-				false,
-				0,
-				Arc::new(MockLogicalClock::new()),
-			);
-
-			let results: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
-
-			prop_assert_eq!(results.len(), 1, "Should have exactly one output for one user key");
-			prop_assert_eq!(
-				results[0].0.seq_num(),
-				expected_max_seq,
-				"Should return the entry with highest sequence number"
-			);
-		}
-
-		/// Property: At bottom level, delete markers are not emitted
-		#[test]
-		fn prop_compaction_iter_bottom_level_deletes(
-			// Generate mix of sets and deletes
-			entries in prop::collection::vec(
-				(0u8..5, 1u64..100),
-				1..20
-			)
-		) {
-			// Create entries where latest is always a delete
-			let items: Vec<(InternalKey, Vec<u8>)> = entries
-				.iter()
-				.flat_map(|(suffix, seq)| {
-					let user_key = format!("key-{suffix:02}").into_bytes();
-					vec![
-						create_test_entry(&user_key, *seq, false),      // SET
-						create_test_entry(&user_key, *seq + 1000, true), // DELETE (higher seq)
-					]
-				})
-				.collect();
-
-			let iter = Box::new(CompactionMockIterator::new(items)) as BoxedInternalIterator<'_>;
-
-			let mut comp_iter = CompactionIterator::new(
-				vec![iter],
-				create_test_comparator(),
-				true, // BOTTOM LEVEL
-				None,
-				false,
-				0,
-				Arc::new(MockLogicalClock::new()),
-			);
-
-			let results: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
-
-			// At bottom level with delete as latest, all entries should be filtered out
-			prop_assert_eq!(
-				results.len(),
-				0,
-				"At bottom level, keys with delete as latest should be dropped"
-			);
-		}
-
-		/// Property: At non-bottom level, delete markers ARE emitted
-		#[test]
-		fn prop_compaction_iter_non_bottom_preserves_deletes(
-			user_key_count in 1usize..5
-		) {
-			// Create one delete entry per user key
-			let items: Vec<(InternalKey, Vec<u8>)> = (0..user_key_count)
-				.map(|i| {
-					let user_key = format!("key-{i:02}").into_bytes();
-					create_test_entry(&user_key, 100, true) // DELETE
-				})
-				.collect();
-
-			let iter = Box::new(CompactionMockIterator::new(items)) as BoxedInternalIterator<'_>;
-
-			let mut comp_iter = CompactionIterator::new(
-				vec![iter],
-				create_test_comparator(),
-				false, // NON-BOTTOM LEVEL
-				None,
-				false,
-				0,
-				Arc::new(MockLogicalClock::new()),
-			);
-
-			let results: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
-
-			prop_assert_eq!(
-				results.len(),
-				user_key_count,
-				"At non-bottom level, delete markers should be preserved"
-			);
-
-			for (key, _) in &results {
-				prop_assert!(
-					key.is_hard_delete_marker(),
-					"Expected delete marker in output"
-				);
-			}
 		}
 	}
 }
