@@ -168,13 +168,13 @@ impl Properties {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct TableMetadata {
-	pub(crate) has_point_keys: Option<bool>,
-	pub(crate) smallest_seq_num: Option<u64>,
-	pub(crate) largest_seq_num: Option<u64>,
-	pub(crate) properties: Properties,
-	pub(crate) smallest_point: Option<InternalKey>,
-	pub(crate) largest_point: Option<InternalKey>,
+pub struct TableMetadata {
+	pub has_point_keys: Option<bool>,
+	pub smallest_seq_num: Option<u64>,
+	pub largest_seq_num: Option<u64>,
+	pub properties: Properties,
+	pub smallest_point: Option<InternalKey>,
+	pub largest_point: Option<InternalKey>,
 }
 
 impl TableMetadata {

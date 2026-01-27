@@ -93,7 +93,7 @@ use crate::sstable::error::SSTableError;
 use crate::{Comparator, InternalIterator, InternalKey, InternalKeyComparator, InternalKeyRef};
 
 /// Raw block data as a byte vector.
-pub(crate) type BlockData = Vec<u8>;
+pub type BlockData = Vec<u8>;
 
 // =============================================================================
 // BLOCK HANDLE
@@ -136,7 +136,7 @@ impl BlockHandle {
 
 	/// Encodes the handle into a byte slice, returns bytes written.
 	#[inline]
-	pub(crate) fn encode_into(&self, dst: &mut [u8]) -> usize {
+	pub fn encode_into(&self, dst: &mut [u8]) -> usize {
 		assert!(dst.len() >= self.offset.required_space() + self.size.required_space());
 
 		let off = self.offset.encode_var(dst);
@@ -154,7 +154,7 @@ impl BlockHandle {
 	}
 
 	/// Decodes a handle from bytes, returns (handle, bytes_read).
-	pub(crate) fn decode(src: &[u8]) -> Result<(Self, usize)> {
+	pub fn decode(src: &[u8]) -> Result<(Self, usize)> {
 		let (off, offsize) = usize::decode_var(src).ok_or(SSTableError::CorruptedBlockHandle)?;
 		let (sz, szsize) =
 			usize::decode_var(&src[offsize..]).ok_or(SSTableError::CorruptedBlockHandle)?;
@@ -193,9 +193,9 @@ impl BlockHandle {
 /// }
 /// ```
 #[derive(Clone)]
-pub(crate) struct Block {
+pub struct Block {
 	/// Raw block data
-	pub(crate) block: BlockData,
+	pub block: BlockData,
 	/// Comparator for key ordering
 	comparator: Arc<InternalKeyComparator>,
 }
@@ -206,7 +206,7 @@ impl Block {
 	/// ## Panics
 	///
 	/// Panics if data is too small (< 4 bytes for restart count).
-	pub(crate) fn new(data: BlockData, comparator: Arc<InternalKeyComparator>) -> Block {
+	pub fn new(data: BlockData, comparator: Arc<InternalKeyComparator>) -> Block {
 		assert!(data.len() > 4);
 		Block {
 			block: data,
@@ -215,11 +215,11 @@ impl Block {
 	}
 
 	/// Creates an iterator over this block.
-	pub(crate) fn iter(&self) -> Result<BlockIterator> {
+	pub fn iter(&self) -> Result<BlockIterator> {
 		BlockIterator::new(Arc::clone(&self.comparator), self.block.clone())
 	}
 
-	pub(crate) fn size(&self) -> usize {
+	pub fn size(&self) -> usize {
 		self.block.len()
 	}
 }
@@ -254,7 +254,7 @@ impl Block {
 ///
 /// Every `restart_interval` entries, compression restarts (shared=0).
 /// This enables binary search within the block.
-pub(crate) struct BlockWriter {
+pub struct BlockWriter {
 	/// How often to create restart points
 	restart_interval: usize,
 	/// Destination buffer for encoded entries
@@ -264,7 +264,7 @@ pub(crate) struct BlockWriter {
 	/// Entries since last restart
 	restart_counter: usize,
 	/// Last key added (for prefix calculation)
-	pub(crate) last_key: Vec<u8>,
+	pub last_key: Vec<u8>,
 	/// Total entries in block
 	num_entries: usize,
 	/// Key comparator
@@ -272,7 +272,7 @@ pub(crate) struct BlockWriter {
 }
 
 impl BlockWriter {
-	pub(crate) fn new(
+	pub fn new(
 		size: usize,
 		restart_interval: usize,
 		internal_cmp: Arc<InternalKeyComparator>,
@@ -333,7 +333,7 @@ impl BlockWriter {
 	///   Encode: [0, 6, 6, "banana", "yellow"]
 	///   buffer=[...66 bytes...], restarts=[0, 44], counter=1
 	/// ```
-	pub(crate) fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
+	pub fn add(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
 		assert!(self.restart_counter <= self.restart_interval);
 
 		// Validate key ordering
@@ -450,7 +450,7 @@ impl BlockWriter {
 	/// ```text
 	/// [entries...] [restart_0: u32] [restart_1: u32] ... [num_restarts: u32]
 	/// ```
-	pub(crate) fn finish(mut self) -> Result<BlockData> {
+	pub fn finish(mut self) -> Result<BlockData> {
 		// Append restart point offsets (fixed 4 bytes each)
 		for &r in self.restart_points.iter() {
 			self.buffer.write_fixedint(r).map_err(|e| {
@@ -470,12 +470,12 @@ impl BlockWriter {
 	}
 
 	/// Estimates the current size including restart array.
-	pub(crate) fn size_estimate(&self) -> usize {
+	pub fn size_estimate(&self) -> usize {
 		self.buffer.len() + self.restart_points.len() * 4 + 4
 	}
 
 	/// Returns the number of entries in the block.
-	pub(crate) fn entries(&self) -> usize {
+	pub fn entries(&self) -> usize {
 		self.num_entries
 	}
 }
@@ -530,7 +530,7 @@ impl BlockWriter {
 ///   current_key.truncate(2) → [ap]
 ///   current_key.extend("ricot") → [apricot]
 /// ```
-pub(crate) struct BlockIterator {
+pub struct BlockIterator {
 	/// Raw block data
 	block: BlockData,
 	/// Decoded restart point offsets
@@ -561,7 +561,7 @@ impl BlockIterator {
 	/// 1. Read number of restarts from last 4 bytes
 	/// 2. Calculate restart array offset
 	/// 3. Decode all restart point offsets
-	pub(crate) fn new(comparator: Arc<InternalKeyComparator>, block: BlockData) -> Result<Self> {
+	pub fn new(comparator: Arc<InternalKeyComparator>, block: BlockData) -> Result<Self> {
 		if block.len() < 4 {
 			let err = Error::from(SSTableError::BlockTooSmall {
 				size: block.len(),
@@ -736,7 +736,7 @@ impl BlockIterator {
 	}
 
 	/// Resets the iterator to initial state.
-	pub(crate) fn reset(&mut self) {
+	pub fn reset(&mut self) {
 		self.offset = 0;
 		self.current_restart_index = 0;
 		self.current_key.clear();
@@ -803,7 +803,7 @@ impl InternalIterator for BlockIterator {
 
 impl BlockIterator {
 	/// Checks if the iterator is positioned on a valid entry.
-	pub(crate) fn is_valid(&self) -> bool {
+	pub fn is_valid(&self) -> bool {
 		!self.current_key.is_empty()
 			&& self.current_value_offset_start != 0
 			&& self.current_value_offset_end != 0
@@ -811,7 +811,7 @@ impl BlockIterator {
 	}
 
 	/// Positions at the first entry.
-	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
+	pub fn seek_to_first(&mut self) -> Result<()> {
 		if self.restart_points.is_empty() {
 			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
 			log::error!("[BLOCK] {}", err);
@@ -834,7 +834,7 @@ impl BlockIterator {
 	///
 	/// 1. Go to last restart point
 	/// 2. Scan forward to find last entry before restart array
-	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
+	pub fn seek_to_last(&mut self) -> Result<()> {
 		if self.restart_points.is_empty() {
 			self.reset();
 			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
@@ -889,7 +889,7 @@ impl BlockIterator {
 	///
 	/// Result: positioned at "date" (first key >= "banana")
 	/// ```
-	pub(crate) fn seek_internal(&mut self, target: &[u8]) -> Result<Option<()>> {
+	pub fn seek_internal(&mut self, target: &[u8]) -> Result<Option<()>> {
 		self.reset();
 
 		if self.restart_points.is_empty() {
@@ -946,7 +946,7 @@ impl BlockIterator {
 	}
 
 	/// Advances to the next entry.
-	pub(crate) fn advance(&mut self) -> Result<bool> {
+	pub fn advance(&mut self) -> Result<bool> {
 		if self.offset >= self.restart_offset {
 			self.reset();
 			return Ok(false);
@@ -976,7 +976,7 @@ impl BlockIterator {
 	/// 2. Scan forward from restart point
 	/// 3. Stop at entry just before original position
 	/// ```
-	pub(crate) fn prev_internal(&mut self) -> Result<bool> {
+	pub fn prev_internal(&mut self) -> Result<bool> {
 		let original = self.current_entry_offset;
 		if original == 0 {
 			self.reset();

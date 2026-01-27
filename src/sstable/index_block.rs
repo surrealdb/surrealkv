@@ -161,7 +161,7 @@ impl BlockHandleWithKey {
 ///     Entry: "cherry" → 0x1000 (P1's last key)
 ///     Entry: "grape"  → 0x1100 (P2's last key)
 /// ```
-pub(crate) struct IndexWriter {
+pub struct IndexWriter {
 	opts: Arc<Options>,
 
 	/// Completed partition blocks waiting to be written
@@ -180,7 +180,7 @@ pub(crate) struct IndexWriter {
 }
 
 impl IndexWriter {
-	pub(crate) fn new(opts: Arc<Options>, max_block_size: usize) -> IndexWriter {
+	pub fn new(opts: Arc<Options>, max_block_size: usize) -> IndexWriter {
 		IndexWriter {
 			opts: Arc::clone(&opts),
 			index_blocks: Vec::new(),
@@ -196,7 +196,7 @@ impl IndexWriter {
 		}
 	}
 
-	pub(crate) fn index_size(&self) -> u64 {
+	pub fn index_size(&self) -> u64 {
 		self.index_size
 	}
 
@@ -214,7 +214,7 @@ impl IndexWriter {
 	///
 	/// - `key`: Separator key (upper bound for keys in the data block)
 	/// - `handle`: Encoded BlockHandle of the data block
-	pub(crate) fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<()> {
+	pub fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<()> {
 		// Start new partition if current one is full
 		if self.current_block.size_estimate() >= self.max_block_size {
 			self.finish_current_block();
@@ -263,7 +263,7 @@ impl IndexWriter {
 	/// - Partition entries are sorted by separator key
 	/// - The last entry's key is the largest in that partition
 	/// - Any key <= last_key might be in this partition
-	pub(crate) fn finish<W: Write>(
+	pub fn finish<W: Write>(
 		&mut self,
 		writer: &mut W,
 		compression_type: CompressionType,
@@ -349,15 +349,15 @@ impl IndexWriter {
 /// The `blocks` array is loaded from the top-level index block on disk.
 /// Each entry points to a partition block that can be loaded on demand.
 #[derive(Clone)]
-pub(crate) struct Index {
-	pub(crate) id: u64,
-	pub(crate) opts: Arc<Options>,
+pub struct Index {
+	pub id: u64,
+	pub opts: Arc<Options>,
 
 	/// Partition block handles with their separator keys
 	/// Sorted by separator key in ascending order
-	pub(crate) blocks: Vec<BlockHandleWithKey>,
+	pub blocks: Vec<BlockHandleWithKey>,
 
-	pub(crate) file: Arc<dyn File>,
+	pub file: Arc<dyn File>,
 }
 
 impl Index {
@@ -369,7 +369,7 @@ impl Index {
 	/// 2. Iterate through all entries
 	/// 3. For each entry: decode (separator_key, partition_handle)
 	/// 4. Store in `blocks` vector for binary search during lookups
-	pub(crate) fn new(
+	pub fn new(
 		id: u64,
 		opt: Arc<Options>,
 		f: Arc<dyn File>,
@@ -439,7 +439,7 @@ impl Index {
 	///
 	/// - `Some((index, handle))`: Partition that could contain the key
 	/// - `None`: Key is beyond all partitions
-	pub(crate) fn find_block_handle_by_key(
+	pub fn find_block_handle_by_key(
 		&self,
 		target: &[u8],
 	) -> Result<Option<(usize, &BlockHandleWithKey)>> {
@@ -539,7 +539,7 @@ impl Index {
 ///   5. next() → partition_iter exhausted, partition_index=2 (past end)
 ///              → iterator invalid
 /// ```
-pub(crate) struct IndexIterator<'a> {
+pub struct IndexIterator<'a> {
 	index: &'a Index,
 
 	/// Current partition block index in index.blocks[]
@@ -551,7 +551,7 @@ pub(crate) struct IndexIterator<'a> {
 }
 
 impl<'a> IndexIterator<'a> {
-	pub(crate) fn new(index: &'a Index) -> Self {
+	pub fn new(index: &'a Index) -> Self {
 		Self {
 			index,
 			partition_index: 0,
@@ -560,7 +560,7 @@ impl<'a> IndexIterator<'a> {
 	}
 
 	/// Returns true if positioned on a valid entry.
-	pub(crate) fn valid(&self) -> bool {
+	pub fn valid(&self) -> bool {
 		self.partition_iter.as_ref().map_or(false, |iter| iter.is_valid())
 	}
 
@@ -767,3 +767,7 @@ impl<'a> IndexIterator<'a> {
 		}
 	}
 }
+
+// Type aliases for backward compatibility
+pub type TopLevelIndex = Index;
+pub type TopLevelIndexWriter = IndexWriter;

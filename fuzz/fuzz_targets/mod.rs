@@ -1,10 +1,10 @@
 // Shared helper module for fuzz targets
 
-use std::sync::Arc;
 use std::cmp::Ordering;
+use std::sync::Arc;
 
 use surrealkv::comparator::{BytewiseComparator, Comparator, InternalKeyComparator};
-use surrealkv::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX};
+use surrealkv::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX};
 
 /// Creates an encoded InternalKey for fuzzing
 pub fn make_internal_key(user_key: &[u8], seq_num: u64, kind: InternalKeyKind) -> Vec<u8> {
@@ -21,35 +21,35 @@ pub struct FuzzEntry {
 }
 
 impl FuzzEntry {
-    pub fn to_internal_key(&self) -> InternalKey {
-        InternalKey::new(
-            self.user_key.clone(),
-            self.seq_num.min(INTERNAL_KEY_SEQ_NUM_MAX),
-            self.kind,
-            0,
-        )
-    }
+	pub fn to_internal_key(&self) -> InternalKey {
+		InternalKey::new(
+			self.user_key.clone(),
+			self.seq_num.min(INTERNAL_KEY_SEQ_NUM_MAX),
+			self.kind,
+			0,
+		)
+	}
 }
 
 /// Sorts and deduplicates entries using InternalKeyComparator
 /// Ensures entries are in ascending order as required by BlockWriter
 pub fn sort_and_deduplicate_entries(entries: &mut Vec<FuzzEntry>) {
-    let user_cmp = Arc::new(BytewiseComparator::default());
-    let internal_cmp = Arc::new(InternalKeyComparator::new(user_cmp));
+	let user_cmp = Arc::new(BytewiseComparator::default());
+	let internal_cmp = Arc::new(InternalKeyComparator::new(user_cmp));
 
-    // Sort using encoded keys (bytes)
-    entries.sort_by(|a, b| {
-        let key_a = a.to_internal_key().encode();
-        let key_b = b.to_internal_key().encode();
-        internal_cmp.compare(&key_a, &key_b)
-    });
+	// Sort using encoded keys (bytes)
+	entries.sort_by(|a, b| {
+		let key_a = a.to_internal_key().encode();
+		let key_b = b.to_internal_key().encode();
+		internal_cmp.compare(&key_a, &key_b)
+	});
 
-    // Deduplicate using dedup_by which is more efficient
-    entries.dedup_by(|a, b| {
-        let key_a = a.to_internal_key().encode();
-        let key_b = b.to_internal_key().encode();
-        internal_cmp.compare(&key_a, &key_b) == Ordering::Equal
-    });
+	// Deduplicate using dedup_by which is more efficient
+	entries.dedup_by(|a, b| {
+		let key_a = a.to_internal_key().encode();
+		let key_b = b.to_internal_key().encode();
+		internal_cmp.compare(&key_a, &key_b) == Ordering::Equal
+	});
 }
 
 /// Converts arbitrary key kind to InternalKeyKind
