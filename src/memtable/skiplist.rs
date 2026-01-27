@@ -12,6 +12,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// This code is based on the original implementation in arenaskl by pebble.
+// https://github.com/cockroachdb/pebble/blob/master/internal/arenaskl/skl.go
 
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
