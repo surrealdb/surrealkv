@@ -10,8 +10,121 @@ use crate::{Comparator, InternalIterator, InternalKey, InternalKeyRef, Value};
 /// Boxed internal iterator type for dynamic dispatch
 pub type BoxedInternalIterator<'a> = Box<dyn InternalIterator + 'a>;
 
+/// Binary heap
+struct BinaryHeap<T, F> {
+	data: Vec<T>,
+	cmp: F,
+}
+
+impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
+	fn with_capacity(capacity: usize, cmp: F) -> Self {
+		Self {
+			data: Vec::with_capacity(capacity),
+			cmp,
+		}
+	}
+
+	#[inline]
+	fn len(&self) -> usize {
+		self.data.len()
+	}
+
+	#[inline]
+	fn is_empty(&self) -> bool {
+		self.data.is_empty()
+	}
+
+	/// Push an item onto the heap.
+	fn push(&mut self, item: T) {
+		self.data.push(item);
+		self.sift_up(self.data.len() - 1);
+	}
+
+	/// Remove and return the top (highest priority) item.
+	fn pop(&mut self) -> Option<T> {
+		if self.data.is_empty() {
+			return None;
+		}
+		let len = self.data.len();
+		if len == 1 {
+			return self.data.pop();
+		}
+		self.data.swap(0, len - 1);
+		let result = self.data.pop();
+		if !self.data.is_empty() {
+			self.sift_down(0);
+		}
+		result
+	}
+
+	/// Get a reference to the top item without removing it. O(1)
+	#[inline]
+	fn peek(&self) -> Option<&T> {
+		self.data.first()
+	}
+
+	/// Get a mutable reference to the top item. O(1)
+	/// After modification, call `sift_down_root()` to restore heap property.
+	#[inline]
+	fn peek_mut(&mut self) -> Option<&mut T> {
+		self.data.first_mut()
+	}
+
+	/// Restore heap property after modifying the root via peek_mut().
+	fn sift_down_root(&mut self) {
+		if !self.data.is_empty() {
+			self.sift_down(0);
+		}
+	}
+
+	/// Drain all items from the heap, returning them as a Vec.
+	fn drain(&mut self) -> Vec<T> {
+		std::mem::take(&mut self.data)
+	}
+
+	#[inline]
+	fn sift_up(&mut self, mut pos: usize) {
+		while pos > 0 {
+			let parent = (pos - 1) / 2;
+			if (self.cmp)(&self.data[pos], &self.data[parent]) == Ordering::Less {
+				self.data.swap(pos, parent);
+				pos = parent;
+			} else {
+				break;
+			}
+		}
+	}
+
+	#[inline]
+	fn sift_down(&mut self, mut pos: usize) {
+		let len = self.data.len();
+		loop {
+			let left = 2 * pos + 1;
+			let right = 2 * pos + 2;
+
+			// Find the smallest among pos, left, right
+			let mut smallest = pos;
+
+			if left < len && (self.cmp)(&self.data[left], &self.data[smallest]) == Ordering::Less {
+				smallest = left;
+			}
+			if right < len && (self.cmp)(&self.data[right], &self.data[smallest]) == Ordering::Less
+			{
+				smallest = right;
+			}
+
+			if smallest != pos {
+				self.data.swap(pos, smallest);
+				pos = smallest;
+			} else {
+				break;
+			}
+		}
+	}
+}
+
 // ============================================================================
-// MergingIterator - Zero-allocation k-way merge using loser tree
+// MergingIterator - k-way merge using binary heap (RocksDB-style)
 // ============================================================================
 
 /// Direction of iteration
@@ -21,189 +134,230 @@ enum Direction {
 	Backward,
 }
 
-/// Merge iterator level - owns iterator, no key caching
-struct MergeLevel<'a> {
+/// Entry in the merge heap - wraps an iterator
+struct HeapEntry<'a> {
 	iter: BoxedInternalIterator<'a>,
-	valid: bool,
+	/// Original index for stable ordering on equal keys
+	level_idx: usize,
 }
 
-/// Loser tree for k-way merge with zero key allocations.
+/// K-way merge iterator using binary heaps for operations.
 ///
-/// During iteration, keys are fetched on-demand from source iterators.
-/// The tree only stores indices, not keys.
+/// Uses dual heaps for bidirectional iteration:
+/// - min_heap for forward iteration (smallest key wins)
+/// - max_heap for backward iteration (largest key wins)
 pub(crate) struct MergingIterator<'a> {
-	levels: Vec<MergeLevel<'a>>,
-	/// Winner index from the last tournament
-	winner: usize,
-	/// Number of active (non-exhausted) levels
-	active_count: usize,
+	/// Entries for forward iteration (min-heap)
+	min_heap: BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>>,
+	/// Entries for backward iteration (max-heap), lazily initialized
+	max_heap:
+		Option<BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>>>,
+	/// Exhausted iterators stored here when not in current heap
+	exhausted: Vec<HeapEntry<'a>>,
+	/// Current direction
+	direction: Direction,
 	/// Comparator for keys
 	cmp: Arc<dyn Comparator>,
-	/// Direction (forward/backward)
-	direction: Direction,
 }
 
 impl<'a> MergingIterator<'a> {
 	pub fn new(iterators: Vec<BoxedInternalIterator<'a>>, cmp: Arc<dyn Comparator>) -> Self {
-		let levels: Vec<_> = iterators
+		let capacity = iterators.len();
+
+		// Create min-heap comparator (smaller key = higher priority)
+		let cmp_clone = Arc::clone(&cmp);
+		let min_cmp: Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering> =
+			Box::new(move |a: &HeapEntry, b: &HeapEntry| {
+				let key_a = a.iter.key().encoded();
+				let key_b = b.iter.key().encoded();
+				match cmp_clone.compare(key_a, key_b) {
+					Ordering::Equal => a.level_idx.cmp(&b.level_idx), // Stable sort by level
+					ord => ord,
+				}
+			});
+
+		let min_heap = BinaryHeap::with_capacity(capacity, min_cmp);
+
+		// Store iterators as exhausted initially (they need seek_first/seek_last)
+		let exhausted: Vec<_> = iterators
 			.into_iter()
-			.map(|iter| MergeLevel {
+			.enumerate()
+			.map(|(idx, iter)| HeapEntry {
 				iter,
-				valid: false,
+				level_idx: idx,
 			})
 			.collect();
 
 		Self {
-			levels,
-			winner: 0,
-			active_count: 0,
-			cmp,
+			min_heap,
+			max_heap: None,
+			exhausted,
 			direction: Direction::Forward,
+			cmp,
 		}
 	}
 
-	/// Compare two levels by their current key (zero-copy)
-	#[inline]
-	fn compare(&self, a: usize, b: usize) -> Ordering {
-		let level_a = &self.levels[a];
-		let level_b = &self.levels[b];
-
-		match (level_a.valid, level_b.valid) {
-			(false, false) => Ordering::Equal,
-			(true, false) => Ordering::Less, // a wins (valid beats invalid)
-			(false, true) => Ordering::Greater, // b wins
-			(true, true) => {
-				// Both valid - compare keys (zero-copy from iterators)
-				let key_a = level_a.iter.key().encoded();
-				let key_b = level_b.iter.key().encoded();
-				let ord = self.cmp.compare(key_a, key_b);
-				if self.direction == Direction::Backward {
-					ord.reverse()
-				} else {
-					ord
+	/// Create max-heap comparator (larger key = higher priority)
+	fn create_max_heap(
+		&self,
+		capacity: usize,
+	) -> BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>> {
+		let cmp_clone = Arc::clone(&self.cmp);
+		let max_cmp: Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering> =
+			Box::new(move |a: &HeapEntry, b: &HeapEntry| {
+				let key_a = a.iter.key().encoded();
+				let key_b = b.iter.key().encoded();
+				match cmp_clone.compare(key_a, key_b) {
+					Ordering::Equal => b.level_idx.cmp(&a.level_idx), /* Reverse for max-heap
+					                                                    * stability */
+					ord => ord.reverse(), // Reverse for max-heap
 				}
-			}
-		}
-	}
-
-	/// Find the minimum (or maximum for backward) among all valid levels
-	fn find_winner(&mut self) {
-		if self.levels.is_empty() || self.active_count == 0 {
-			return;
-		}
-
-		// Simple linear search for the winner
-		let mut best_idx = None;
-		for i in 0..self.levels.len() {
-			if !self.levels[i].valid {
-				continue;
-			}
-			match best_idx {
-				None => best_idx = Some(i),
-				Some(b) => {
-					if self.compare(i, b) == Ordering::Less {
-						best_idx = Some(i);
-					}
-				}
-			}
-		}
-
-		if let Some(idx) = best_idx {
-			self.winner = idx;
-		}
+			});
+		BinaryHeap::with_capacity(capacity, max_cmp)
 	}
 
 	/// Initialize for forward iteration
 	fn init_forward(&mut self) -> Result<()> {
 		self.direction = Direction::Forward;
-		self.active_count = 0;
 
-		// Position all iterators at first
-		for level in &mut self.levels {
-			level.valid = level.iter.seek_first()?;
-			if level.valid {
-				self.active_count += 1;
+		// Collect all entries from min_heap, max_heap, and exhausted
+		let mut all_entries: Vec<HeapEntry<'a>> = self.min_heap.drain();
+		if let Some(ref mut max_heap) = self.max_heap {
+			all_entries.append(&mut max_heap.drain());
+		}
+		all_entries.append(&mut self.exhausted);
+
+		// Position all iterators at first and push valid ones to min_heap
+		for mut entry in all_entries {
+			if entry.iter.seek_first()? {
+				self.min_heap.push(entry);
+			} else {
+				self.exhausted.push(entry);
 			}
 		}
 
-		self.find_winner();
 		Ok(())
 	}
 
 	/// Initialize for backward iteration
 	fn init_backward(&mut self) -> Result<()> {
 		self.direction = Direction::Backward;
-		self.active_count = 0;
 
-		// Position all iterators at last
-		for level in &mut self.levels {
-			level.valid = level.iter.seek_last()?;
-			if level.valid {
-				self.active_count += 1;
+		// Ensure max_heap exists
+		let capacity = self.min_heap.len() + self.exhausted.len();
+		if self.max_heap.is_none() {
+			self.max_heap = Some(self.create_max_heap(capacity));
+		}
+		let max_heap = self.max_heap.as_mut().unwrap();
+
+		// Collect all entries
+		let mut all_entries: Vec<HeapEntry<'a>> = self.min_heap.drain();
+		all_entries.append(&mut max_heap.drain());
+		all_entries.append(&mut self.exhausted);
+
+		// Position all iterators at last and push valid ones to max_heap
+		for mut entry in all_entries {
+			if entry.iter.seek_last()? {
+				max_heap.push(entry);
+			} else {
+				self.exhausted.push(entry);
 			}
 		}
 
-		self.find_winner();
 		Ok(())
 	}
 
-	/// Advance the current winner and find new winner
-	fn advance_winner(&mut self) -> Result<bool> {
-		if self.active_count == 0 {
+	/// Get the current heap based on direction
+	#[inline]
+	fn current_heap(
+		&self,
+	) -> &BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>> {
+		match self.direction {
+			Direction::Forward => &self.min_heap,
+			Direction::Backward => self.max_heap.as_ref().unwrap(),
+		}
+	}
+
+	/// Get the current heap mutably based on direction
+	#[inline]
+	fn current_heap_mut(
+		&mut self,
+	) -> &mut BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>> {
+		match self.direction {
+			Direction::Forward => &mut self.min_heap,
+			Direction::Backward => self.max_heap.as_mut().unwrap(),
+		}
+	}
+
+	/// Advance the current
+	fn advance_current(&mut self) -> Result<bool> {
+		// Copy direction before borrowing heap mutably
+		let direction = self.direction;
+		let heap = self.current_heap_mut();
+		if heap.is_empty() {
 			return Ok(false);
 		}
 
-		let winner_idx = self.winner;
-		let level = &mut self.levels[winner_idx];
-
-		// Advance the winning iterator
-		level.valid = if self.direction == Direction::Forward {
-			level.iter.next()?
-		} else {
-			level.iter.prev()?
+		// Get mutable access to the winner and advance it
+		let winner = heap.peek_mut().unwrap();
+		let still_valid = match direction {
+			Direction::Forward => winner.iter.next()?,
+			Direction::Backward => winner.iter.prev()?,
 		};
 
-		if !level.valid {
-			self.active_count = self.active_count.saturating_sub(1);
+		if still_valid {
+			// Iterator still valid - sift down to restore heap property
+			heap.sift_down_root();
+		} else {
+			// Iterator exhausted - remove from heap
+			let entry = heap.pop().unwrap();
+			self.exhausted.push(entry);
 		}
 
-		// Find new winner
-		self.find_winner();
-
-		Ok(self.active_count > 0 && self.levels[self.winner].valid)
+		Ok(!self.current_heap().is_empty())
 	}
 
 	/// Check if iterator is valid
+	#[inline]
 	pub fn is_valid(&self) -> bool {
-		self.active_count > 0 && self.levels.get(self.winner).map_or(false, |l| l.valid)
+		!self.current_heap().is_empty()
 	}
 
-	/// Get current winner's key (zero-copy)
+	/// Get current winner's key
+	#[inline]
 	pub fn current_key(&self) -> InternalKeyRef<'_> {
 		debug_assert!(self.is_valid());
-		self.levels[self.winner].iter.key()
+		self.current_heap().peek().unwrap().iter.key()
 	}
 
-	/// Get current winner's value (zero-copy)
+	/// Get current winner's value
+	#[inline]
 	pub fn current_value(&self) -> &[u8] {
 		debug_assert!(self.is_valid());
-		self.levels[self.winner].iter.value()
+		self.current_heap().peek().unwrap().iter.value()
 	}
 }
 
 impl InternalIterator for MergingIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = Direction::Forward;
-		self.active_count = 0;
 
-		for level in &mut self.levels {
-			level.valid = level.iter.seek(target)?;
-			if level.valid {
-				self.active_count += 1;
+		// Collect all entries
+		let mut all_entries: Vec<HeapEntry<'_>> = self.min_heap.drain();
+		if let Some(ref mut max_heap) = self.max_heap {
+			all_entries.append(&mut max_heap.drain());
+		}
+		all_entries.append(&mut self.exhausted);
+
+		// Seek all iterators and push valid ones to min_heap
+		for mut entry in all_entries {
+			if entry.iter.seek(target)? {
+				self.min_heap.push(entry);
+			} else {
+				self.exhausted.push(entry);
 			}
 		}
 
-		self.find_winner();
 		Ok(self.is_valid())
 	}
 
@@ -221,19 +375,44 @@ impl InternalIterator for MergingIterator<'_> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
-		self.advance_winner()
+		// Switch direction if needed
+		if self.direction != Direction::Forward {
+			// Save current position, switch to forward, seek to current key
+			let current_key = self.current_key().encoded().to_vec();
+			self.init_forward()?;
+			// Seek past entries <= current_key to avoid duplicates
+			while self.is_valid()
+				&& self.cmp.compare(self.current_key().encoded(), &current_key) != Ordering::Greater
+			{
+				if !self.advance_current()? {
+					break;
+				}
+			}
+			return Ok(self.is_valid());
+		}
+		self.advance_current()
 	}
 
 	fn prev(&mut self) -> Result<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
-		// If we were going forward, need to switch direction
+		// Switch direction if needed
 		if self.direction != Direction::Backward {
-			// For simplicity, re-initialize for backward
-			return self.seek_last();
+			// Save current position, switch to backward, seek to current key
+			let current_key = self.current_key().encoded().to_vec();
+			self.init_backward()?;
+			// Seek past entries >= current_key to avoid duplicates
+			while self.is_valid()
+				&& self.cmp.compare(self.current_key().encoded(), &current_key) != Ordering::Less
+			{
+				if !self.advance_current()? {
+					break;
+				}
+			}
+			return Ok(self.is_valid());
 		}
-		self.advance_winner()
+		self.advance_current()
 	}
 
 	fn valid(&self) -> bool {
