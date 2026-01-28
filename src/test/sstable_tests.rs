@@ -4371,7 +4371,6 @@ fn test_table_iterator_seek_and_scan() {
 		}
 	}
 
-	// Test SeekForPrev
 	iter.seek_to_last().unwrap();
 	let last_key_bytes = iter.key().user_key();
 	assert_eq!(std::str::from_utf8(last_key_bytes).unwrap(), "key_029", "Should find last key");

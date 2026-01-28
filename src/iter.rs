@@ -18,208 +18,86 @@ pub type BoxedInternalIterator<'a> = Box<dyn InternalIterator + 'a>;
 // ============================================================================
 //
 // A binary heap is a complete binary tree stored in a flat array.
-// We use a custom implementation instead of std::collections::BinaryHeap because:
-//   1. We need custom comparators (not just Ord trait)
-//   2. We need more control of the data structure for future optimisations
 //
 // ## Array-to-Tree Mapping
 //
 // The tree structure is implicit in the array indices:
 //
 // ```
-// Array:   [10, 20, 30, 40, 50]
-// Index:     0   1   2   3   4
+// Array:   [0, 2, 1, 3, 4]   (these are indices into children array)
+// Heap idx: 0  1  2  3  4
 //
 // Tree visualization:
 //
-//               [10]          ← index 0 (root)
-//              /    \
-//           [20]    [30]      ← index 1, 2
-//           /  \
-//        [40]  [50]           ← index 3, 4
+//              [0]           ← heap index 0 (root)
+//             /   \
+//          [2]     [1]       ← heap index 1, 2
+//          / \
+//       [3]  [4]             ← heap index 3, 4
 // ```
 //
 // ## Index Formulas
 //
-// For any element at index `i`:
+// For any element at heap index `i`:
 // - Parent index:      `(i - 1) / 2`  (integer division)
 // - Left child index:  `2 * i + 1`
 // - Right child index: `2 * i + 2`
 //
-// Example calculations:
-// | Index | Value | Parent = (i-1)/2 | Left = 2i+1 | Right = 2i+2 |
-// |-------|-------|------------------|-------------|--------------|
-// |   0   |  10   |  none            |      1      |      2       |
-// |   1   |  20   |  0 (value 10)    |      3      |      4       |
-// |   2   |  30   |  0 (value 10)    |      5      |      6       |
-// |   3   |  40   |  1 (value 20)    |      7      |      8       |
-// |   4   |  50   |  1 (value 20)    |      9      |     10       |
+// ## Heap Property
 //
-// ## Min-Heap Property
+// The comparator returns `Ordering::Less` if the first argument should be
+// closer to the root. This means:
+// - Min-heap: smaller elements return Less, so smallest is at root
+// - Max-heap: larger elements return Less (by reversing comparison), so largest is at root
 //
-// Every parent must be ≤ its children. This ensures the minimum
-// element is always at the root (index 0).
-//
-struct BinaryHeap<T, F> {
-	/// The underlying storage - a Vec that represents the tree structure.
-	///
-	/// The tree is stored level-by-level:
-	/// - Index 0: root (level 0)
-	/// - Index 1-2: level 1
-	/// - Index 3-6: level 2
-	/// - Index 7-14: level 3
-	/// - etc.
-	data: Vec<T>,
 
-	/// Custom comparison function.
-	///
-	/// For a min-heap: returns Ordering::Less if `a` should be closer to root than `b`
-	/// For a max-heap: returns Ordering::Less if `a` should be closer to root than `b`
-	///                 (achieved by reversing the comparison)
-	cmp: F,
+struct BinaryHeap<T> {
+	/// The underlying storage representing the tree level-by-level.
+	data: Vec<T>,
 }
 
-impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
-	/// Create a new heap with pre-allocated capacity.
-	///
-	/// # Arguments
-	/// * `capacity` - Initial capacity for the underlying Vec
-	/// * `cmp` - Comparison function that defines heap ordering
-	///
-	/// # Example
-	/// ```
-	/// // Min-heap of integers
-	/// let min_heap = |a: &i32, b: &i32| a.cmp(b);
-	///
-	/// // Max-heap of integers (reverse comparison)
-	/// let max_heap = |a: &i32, b: &i32| b.cmp(a);
-	/// ```
-	fn with_capacity(capacity: usize, cmp: F) -> Self {
+impl<T: Copy> BinaryHeap<T> {
+	fn with_capacity(capacity: usize) -> Self {
 		Self {
 			data: Vec::with_capacity(capacity),
-			cmp,
 		}
 	}
 
-	/// Returns the number of elements in the heap.
-	#[inline]
-	fn len(&self) -> usize {
-		self.data.len()
-	}
-
-	/// Returns true if the heap contains no elements.
 	#[inline]
 	fn is_empty(&self) -> bool {
 		self.data.is_empty()
 	}
 
-	/// Push an item onto the heap.
-	///
-	/// # Algorithm
-	/// 1. Add the new element at the end of the array (last position in tree)
-	/// 2. "Sift up": repeatedly swap with parent until heap property is restored
-	///
-	/// # Example: Push 15 into [10, 20, 30, 40, 50]
-	///
-	/// ```text
-	/// Initial:
-	///               [10]
-	///              /    \
-	///           [20]    [30]
-	///           /  \
-	///        [40]  [50]
-	///
-	/// Step 1: Add 15 at end (index 5)
-	/// Array: [10, 20, 30, 40, 50, 15]
-	///                            ↑ new
-	///
-	///               [10]
-	///              /    \
-	///           [20]    [30]
-	///           /  \    /
-	///        [40] [50] [15] ← new element
-	///
-	/// Step 2: Sift up
-	///   pos = 5, parent = (5-1)/2 = 2
-	///   Compare: 15 < 30? YES → swap!
-	///   
-	/// Array: [10, 20, 15, 40, 50, 30]
-	///                 ↑           ↑ swapped
-	///
-	///               [10]
-	///              /    \
-	///           [20]    [15] ← moved up
-	///           /  \    /
-	///        [40] [50] [30] ← moved down
-	///
-	/// Step 3: Continue sift up
-	///   pos = 2, parent = (2-1)/2 = 0
-	///   Compare: 15 < 10? NO → stop!
-	///
-	/// Final: [10, 20, 15, 40, 50, 30]
-	/// ```
-	fn push(&mut self, item: T) {
-		self.data.push(item);
-		self.sift_up(self.data.len() - 1);
+	#[inline]
+	fn peek(&self) -> Option<T> {
+		self.data.first().copied()
 	}
 
-	/// Remove and return the top (highest priority) item.
+	fn clear(&mut self) {
+		self.data.clear();
+	}
+
+	/// Push an item onto the heap.
 	///
-	/// # Algorithm
+	/// 1. Add element at end of array
+	/// 2. Sift up: swap with parent while heap property is violated
+	fn push<F>(&mut self, item: T, cmp: F)
+	where
+		F: Fn(T, T) -> Ordering,
+	{
+		self.data.push(item);
+		self.sift_up(self.data.len() - 1, cmp);
+	}
+
+	/// Remove and return the root (highest priority) item.
+	///
 	/// 1. Swap root with last element
 	/// 2. Remove last element (the original root)
-	/// 3. "Sift down": restore heap property by swapping root down
-	///
-	/// # Example: Pop from [10, 20, 15, 40, 50, 30]
-	///
-	/// ```text
-	/// Initial:
-	///               [10] ← minimum (we want to remove this)
-	///              /    \
-	///           [20]    [15]
-	///           /  \    /
-	///        [40] [50] [30]
-	///
-	/// Step 1: Swap root (index 0) with last (index 5)
-	/// Array: [30, 20, 15, 40, 50, 10]
-	///         ↑                   ↑ swapped
-	///
-	///               [30] ← was at end
-	///              /    \
-	///           [20]    [15]
-	///           /  \    /
-	///        [40] [50] [10] ← was root
-	///
-	/// Step 2: Remove last element
-	/// Array: [30, 20, 15, 40, 50]  → returns 10
-	///
-	///               [30] ← violates heap property!
-	///              /    \
-	///           [20]    [15]
-	///           /  \
-	///        [40] [50]
-	///
-	/// Step 3: Sift down
-	///   pos = 0, left = 1, right = 2
-	///   smallest among {30, 20, 15} = 15 (index 2)
-	///   Swap positions 0 and 2:
-	///
-	/// Array: [15, 20, 30, 40, 50]
-	///         ↑       ↑ swapped
-	///
-	///               [15] ← moved up
-	///              /    \
-	///           [20]    [30] ← moved down
-	///           /  \
-	///        [40] [50]
-	///
-	/// Step 4: Continue sift down from pos=2
-	///   left = 5, right = 6 (both out of bounds)
-	///   No children → stop!
-	///
-	/// Final: [15, 20, 30, 40, 50]
-	/// ```
-	fn pop(&mut self) -> Option<T> {
+	/// 3. Sift down: restore heap property from root
+	fn pop<F>(&mut self, cmp: F) -> Option<T>
+	where
+		F: Fn(T, T) -> Ordering,
+	{
 		if self.data.is_empty() {
 			return None;
 		}
@@ -227,99 +105,35 @@ impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
 		if len == 1 {
 			return self.data.pop();
 		}
-		// Swap root with last element
 		self.data.swap(0, len - 1);
-		// Remove last (original root)
 		let result = self.data.pop();
-		// Restore heap property
 		if !self.data.is_empty() {
-			self.sift_down(0);
+			self.sift_down(0, cmp);
 		}
 		result
 	}
 
-	/// Get a reference to the top item without removing it.
+	/// Restore heap property after modifying the root element.
 	///
-	/// For a min-heap, this is the smallest element.
-	/// For a max-heap, this is the largest element.
-	#[inline]
-	fn peek(&self) -> Option<&T> {
-		self.data.first()
-	}
-
-	/// Get a mutable reference to the top item.
-	///
-	/// # IMPORTANT
-	/// After modifying the element, you MUST call `sift_down_root()`
-	/// to restore the heap property!
-	///
-	/// # Why This Exists
-	/// This is a key optimization for the merging iterator. Instead of:
-	/// ```text
-	/// let item = heap.pop();     // O(log N)
-	/// item.advance_iterator();
-	/// heap.push(item);           // O(log N)
-	/// // Total: O(2 log N)
-	/// ```
-	///
-	/// We can do:
-	/// ```text
-	/// let item = heap.peek_mut(); // O(1)
-	/// item.advance_iterator();
-	/// heap.sift_down_root();      // O(log N)
-	/// // Total: O(log N)
-	/// ```
-	#[inline]
-	fn peek_mut(&mut self) -> Option<&mut T> {
-		self.data.first_mut()
-	}
-
-	/// Restore heap property after modifying the root via peek_mut().
-	///
-	/// # Example
-	/// ```text
-	/// Before (heap property violated at root):
-	///               [50] ← modified, too large!
-	///              /    \
-	///           [20]    [30]
-	///
-	/// After sift_down_root():
-	///               [20]
-	///              /    \
-	///           [50]    [30]
-	/// ```
-	fn sift_down_root(&mut self) {
+	/// This is an optimization for the merging iterator: instead of pop + push
+	/// (2 × O(log N)), we modify in place + sift_down (1 × O(log N)).
+	fn sift_down_root<F>(&mut self, cmp: F)
+	where
+		F: Fn(T, T) -> Ordering,
+	{
 		if !self.data.is_empty() {
-			self.sift_down(0);
+			self.sift_down(0, cmp);
 		}
 	}
 
-	/// Drain all items from the heap, returning them as a Vec.
-	/// The returned Vec is NOT in sorted order - it's the raw heap array.
-	fn drain(&mut self) -> Vec<T> {
-		std::mem::take(&mut self.data)
-	}
-
-	/// Sift up: move element at `pos` towards the root until heap property is satisfied.
-	///
-	/// Used after inserting a new element at the end of the heap.
-	///
-	/// # Algorithm
-	/// ```text
-	/// while pos is not root:
-	///     parent = (pos - 1) / 2
-	///     if element[pos] < element[parent]:  // For min-heap
-	///         swap(pos, parent)
-	///         pos = parent
-	///     else:
-	///         break  // Heap property satisfied
-	/// ```
-	#[inline]
-	fn sift_up(&mut self, mut pos: usize) {
+	/// Move element at `pos` towards root while it has higher priority than parent.
+	fn sift_up<F>(&mut self, mut pos: usize, cmp: F)
+	where
+		F: Fn(T, T) -> Ordering,
+	{
 		while pos > 0 {
 			let parent = (pos - 1) / 2;
-			// If current element should be higher priority than parent, swap
-			if (self.cmp)(&self.data[pos], &self.data[parent]) == Ordering::Less {
+			if cmp(self.data[pos], self.data[parent]) == Ordering::Less {
 				self.data.swap(pos, parent);
 				pos = parent;
 			} else {
@@ -328,57 +142,21 @@ impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
 		}
 	}
 
-	/// Sift down: move element at `pos` towards the leaves until heap property is satisfied.
-	///
-	/// Used after:
-	/// - Removing the root (pop operation)
-	/// - Modifying the root (via peek_mut + sift_down_root)
-	///
-	/// # Algorithm
-	/// ```text
-	/// loop:
-	///     left = 2 * pos + 1
-	///     right = 2 * pos + 2
-	///     smallest = pos
-	///     
-	///     if left exists and element[left] < element[smallest]:
-	///         smallest = left
-	///     if right exists and element[right] < element[smallest]:
-	///         smallest = right
-	///     
-	///     if smallest != pos:
-	///         swap(pos, smallest)
-	///         pos = smallest
-	///     else:
-	///         break  // Heap property satisfied
-	/// ```
-	///
-	/// # Example: Sift down 30 from root
-	/// ```text
-	/// pos=0:  [30, 20, 15, 40, 50]
-	///         left=1 (20), right=2 (15)
-	///         smallest = 2 (value 15)
-	///         swap(0, 2) → [15, 20, 30, 40, 50]
-	///
-	/// pos=2:  left=5 (none), right=6 (none)
-	///         No children, smallest stays 2
-	///         Done!
-	/// ```
-	#[inline]
-	fn sift_down(&mut self, mut pos: usize) {
+	/// Move element at `pos` towards leaves while children have higher priority.
+	fn sift_down<F>(&mut self, mut pos: usize, cmp: F)
+	where
+		F: Fn(T, T) -> Ordering,
+	{
 		let len = self.data.len();
 		loop {
 			let left = 2 * pos + 1;
 			let right = 2 * pos + 2;
-
-			// Find the smallest among pos, left, right
 			let mut smallest = pos;
 
-			if left < len && (self.cmp)(&self.data[left], &self.data[smallest]) == Ordering::Less {
+			if left < len && cmp(self.data[left], self.data[smallest]) == Ordering::Less {
 				smallest = left;
 			}
-			if right < len && (self.cmp)(&self.data[right], &self.data[smallest]) == Ordering::Less
-			{
+			if right < len && cmp(self.data[right], self.data[smallest]) == Ordering::Less {
 				smallest = right;
 			}
 
@@ -393,200 +171,78 @@ impl<T, F: Fn(&T, &T) -> Ordering> BinaryHeap<T, F> {
 }
 
 // ============================================================================
-// MERGING ITERATOR - K-Way Merge Using Binary Heap
+// MERGING ITERATOR
 // ============================================================================
 //
-// ## Problem
+// K-way merge iterator using binary heaps. This is the core data structure for
+// LSM-tree iteration, merging sorted runs from multiple levels.
 //
-// Given K sorted iterators, produce a single sorted stream of all elements.
-// This is the core operation for LSM-tree reads and compaction.
-//
-// ## Example
-//
-// ```text
-// Input iterators (each sorted):
-//   Iter0: ["apple", "cherry", "fig"]
-//   Iter1: ["banana", "date", "grape"]
-//   Iter2: ["avocado", "coconut"]
-//
-// Output (merged, sorted):
-//   "apple" → "avocado" → "banana" → "cherry" → "coconut" → "date" → "fig" → "grape"
+// ```
+// MergingIterator
+// ├── children: Vec<HeapEntry>     ← Permanent storage for all child iterators
+// ├── min_heap: BinaryHeap<usize>  ← Indices into children (forward iteration)
+// ├── max_heap: BinaryHeap<usize>  ← Indices into children (backward iteration)
+// └── direction: Forward|Backward
 // ```
 //
-// ## Algorithm (using min-heap)
+// ## Ordering and Tiebreaking
 //
-// 1. Initialize: Put all iterators in a min-heap, ordered by their current key
-// 2. To get next element: a. The heap root has the iterator with the smallest current key b. Output
-//    that key c. Advance that iterator to its next element d. If iterator is exhausted, remove from
-//    heap e. Otherwise, sift down to restore heap property
+// When keys are equal, we use `level_idx` as tiebreaker:
+// - Lower level_idx = higher priority (wins the comparison)
+// - This ensures newer data (lower levels in LSM) shadows older data
 //
-// ## Bidirectional Iteration
+// For min-heap (forward iteration):
+// - Smaller keys have higher priority (appear first)
+// - Equal keys: lower level_idx wins
 //
-// This implementation supports both forward and backward iteration:
-// - Forward (next): uses min-heap (smallest key at top)
-// - Backward (prev): uses max-heap (largest key at top)
+// For max-heap (backward iteration):
+// - Larger keys have higher priority (appear first)
+// - Equal keys: lower level_idx wins (same tiebreaker, NOT reversed)
 //
-
-/// Direction of iteration
+// ## Direction Switching
+//
+// When switching directions (e.g., forward to backward), we:
+// 1. Clear the current heap
+// 2. Seek all iterators to the target position
+// 3. Rebuild the appropriate heap with valid iterators
 #[derive(Clone, Copy, PartialEq)]
 enum Direction {
-	Forward,  // Using min-heap, moving towards larger keys
-	Backward, // Using max-heap, moving towards smaller keys
+	Forward,
+	Backward,
 }
 
-/// Entry in the merge heap - wraps an iterator with metadata.
-///
-/// # Fields
-/// - `iter`: The actual iterator pointing to sorted data
-/// - `level_idx`: Original index for stable ordering when keys are equal
-///
-/// # Why level_idx Matters
-///
-/// In an LSM-tree, lower level numbers contain newer data:
-/// - Level 0 (MemTable): newest writes
-/// - Level 1: older data
-/// - Level 2: even older data
-///
-/// When two iterators have the same key, we want the newer version (lower level).
-/// The `level_idx` serves as a tiebreaker in the heap comparison.
-///
-/// ```text
-/// Example:
-///   Iter0 (level_idx=0): current_key = "apple", seq=100 (newer)
-///   Iter1 (level_idx=1): current_key = "apple", seq=50  (older)
-///   
-/// Heap comparison for same user key:
-///   "apple" vs "apple" → Equal
-///   Tiebreaker: level_idx 0 < 1
-///   Winner: Iter0 (newer version)
-/// ```
+/// Entry holding a child iterator and its level index for tiebreaking.
 struct HeapEntry<'a> {
 	iter: BoxedInternalIterator<'a>,
-	/// Original index for stable ordering on equal keys.
-	/// Lower index = higher priority (newer data in LSM-tree).
+	/// Lower level_idx = newer data = higher priority when keys are equal.
 	level_idx: usize,
 }
 
-/// K-way merge iterator using binary heaps for O(log K) operations.
-///
-/// ## Architecture
-///
-/// ```text
-/// ┌─────────────────────────────────────────────────────────────┐
-/// │                    MergingIterator                          │
-/// │                                                             │
-/// │  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-/// │  │  min_heap   │  │  max_heap   │  │     exhausted       │ │
-/// │  │ (forward)   │  │ (backward)  │  │  (empty iterators)  │ │
-/// │  │             │  │  (lazy)     │  │                     │ │
-/// │  │ [Iter0]     │  │             │  │ [Iter3, Iter4]      │ │
-/// │  │ [Iter1]     │  │             │  │                     │ │
-/// │  │ [Iter2]     │  │             │  │                     │ │
-/// │  └─────────────┘  └─────────────┘  └─────────────────────┘ │
-/// │                                                             │
-/// │  direction: Forward                                         │
-/// │  cmp: Arc<dyn Comparator>                                   │
-/// └─────────────────────────────────────────────────────────────┘
-/// ```
-///
-/// ## State Transitions
-///
-/// ```text
-/// seek_first() → Forward mode, all valid iters in min_heap
-/// seek_last()  → Backward mode, all valid iters in max_heap
-/// next()       → Advance winner in min_heap (or switch direction)
-/// prev()       → Advance winner in max_heap (or switch direction)
-/// ```
 pub(crate) struct MergingIterator<'a> {
-	/// Min-heap for forward iteration.
-	///
-	/// Ordering: smallest key at root (highest priority).
-	///
-	/// Comparator logic:
-	/// ```text
-	/// compare(a, b):
-	///   if a.key < b.key: return Less (a wins)
-	///   if a.key > b.key: return Greater (b wins)
-	///   if a.key == b.key: return a.level_idx.cmp(b.level_idx)
-	///                      (lower level_idx wins = newer data)
-	/// ```
-	min_heap: BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>>,
+	/// Permanent storage for all child iterators.
+	/// Iterators stay here for the lifetime of the MergingIterator.
+	children: Vec<HeapEntry<'a>>,
 
-	/// Max-heap for backward iteration, lazily initialized.
-	///
-	/// Ordering: largest key at root (highest priority).
-	///
-	/// Comparator logic (reversed):
-	/// ```text
-	/// compare(a, b):
-	///   if a.key > b.key: return Less (a wins - note reversal!)
-	///   if a.key < b.key: return Greater (b wins)
-	///   if a.key == b.key: return b.level_idx.cmp(a.level_idx)
-	///                      (lower level_idx wins, but reversed comparison)
-	/// ```
-	max_heap:
-		Option<BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>>>,
+	/// Min-heap storing indices into `children` for forward iteration.
+	/// The smallest key is at the root (index 0).
+	min_heap: BinaryHeap<usize>,
 
-	/// Storage for iterators that have been exhausted (no more elements).
-	///
-	/// When an iterator runs out of elements in one direction, it's moved here.
-	/// When switching directions, these iterators are repositioned and may
-	/// become valid again.
-	exhausted: Vec<HeapEntry<'a>>,
+	/// Max-heap storing indices into `children` for backward iteration.
+	/// The largest key is at the root (index 0).
+	/// Lazily initialized on first backward operation.
+	max_heap: Option<BinaryHeap<usize>>,
 
 	/// Current iteration direction.
 	direction: Direction,
 
-	/// Comparator for comparing user keys.
-	/// Usually lexicographic byte comparison, but could be custom.
+	/// User-provided key comparator.
 	cmp: Arc<dyn Comparator>,
 }
 
 impl<'a> MergingIterator<'a> {
-	/// Create a new merging iterator from multiple source iterators.
-	///
-	/// # Arguments
-	/// * `iterators` - Source iterators to merge. Each should be sorted.
-	/// * `cmp` - Comparator for ordering keys.
-	///
-	/// # Initial State
-	/// All iterators start in the `exhausted` list because they haven't
-	/// been positioned yet. Call `seek_first()`, `seek_last()`, or `seek()`
-	/// to initialize.
-	///
-	/// # Example
-	/// ```text
-	/// let iters = vec![
-	///     memtable.iter(),      // level_idx = 0 (newest)
-	///     l1_sst.iter(),        // level_idx = 1
-	///     l2_sst.iter(),        // level_idx = 2 (oldest)
-	/// ];
-	/// let merger = MergingIterator::new(iters, comparator);
-	/// merger.seek_first()?;  // Position all at their first elements
-	/// ```
 	pub fn new(iterators: Vec<BoxedInternalIterator<'a>>, cmp: Arc<dyn Comparator>) -> Self {
 		let capacity = iterators.len();
-
-		// Create min-heap comparator (smaller key = higher priority = Less)
-		//
-		// The heap's sift_up/sift_down use `Less` to determine priority,
-		// so we return Less when `a` should be closer to the root.
-		let cmp_clone = Arc::clone(&cmp);
-		let min_cmp: Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering> =
-			Box::new(move |a: &HeapEntry, b: &HeapEntry| {
-				let key_a = a.iter.key().encoded();
-				let key_b = b.iter.key().encoded();
-				match cmp_clone.compare(key_a, key_b) {
-					Ordering::Equal => a.level_idx.cmp(&b.level_idx), // Stable sort: lower
-					// level wins
-					ord => ord,
-				}
-			});
-
-		let min_heap = BinaryHeap::with_capacity(capacity, min_cmp);
-
-		// Store iterators as exhausted initially (they need seek_first/seek_last)
-		let exhausted: Vec<_> = iterators
+		let children: Vec<_> = iterators
 			.into_iter()
 			.enumerate()
 			.map(|(idx, iter)| HeapEntry {
@@ -596,414 +252,323 @@ impl<'a> MergingIterator<'a> {
 			.collect();
 
 		Self {
-			min_heap,
-			max_heap: None, // Lazy initialization
-			exhausted,
+			children,
+			min_heap: BinaryHeap::with_capacity(capacity),
+			max_heap: None,
 			direction: Direction::Forward,
 			cmp,
 		}
 	}
 
-	/// Create max-heap comparator (larger key = higher priority).
+	// -------------------------------------------------------------------------
+	// Comparison Functions
+	// -------------------------------------------------------------------------
+	//
+	/// Min-heap comparison: smaller key wins, then lower level_idx.
 	///
-	/// For max-heap, we reverse the comparison so that larger keys
-	/// return `Ordering::Less` (which the heap treats as higher priority).
-	///
-	/// # Comparator Logic
-	/// ```text
-	/// For keys: "apple" vs "banana"
-	///   Normal:  "apple" < "banana" → Less
-	///   Reversed: "apple" < "banana" → Greater (so "banana" wins)
-	///
-	/// For equal keys with level_idx:
-	///   level_idx 0 vs 1
-	///   We still want lower level_idx to win, but since we're reversing,
-	///   we compare b.level_idx with a.level_idx
-	/// ```
-	fn create_max_heap(
-		&self,
-		capacity: usize,
-	) -> BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>> {
-		let cmp_clone = Arc::clone(&self.cmp);
-		let max_cmp: Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering> =
-			Box::new(move |a: &HeapEntry, b: &HeapEntry| {
-				let key_a = a.iter.key().encoded();
-				let key_b = b.iter.key().encoded();
-				match cmp_clone.compare(key_a, key_b) {
-					Ordering::Equal => a.level_idx.cmp(&b.level_idx),
-					ord => ord.reverse(), // Reverse for max-heap
-				}
-			});
-		BinaryHeap::with_capacity(capacity, max_cmp)
+	/// Returns `Ordering::Less` if `a` should be closer to root than `b`.
+	/// This means: a.key < b.key, or (a.key == b.key && a.level_idx < b.level_idx)
+	#[inline]
+	fn cmp_min(children: &[HeapEntry<'_>], cmp: &dyn Comparator, a: usize, b: usize) -> Ordering {
+		let key_a = children[a].iter.key().encoded();
+		let key_b = children[b].iter.key().encoded();
+		cmp.compare(key_a, key_b).then_with(|| children[a].level_idx.cmp(&children[b].level_idx))
 	}
 
-	/// Initialize for forward iteration - position all iterators at their first element.
+	/// Max-heap comparison: larger key wins, then lower level_idx.
 	///
-	/// # Algorithm
-	/// 1. Collect all iterators from min_heap, max_heap, and exhausted
-	/// 2. Call seek_first() on each iterator
-	/// 3. Valid iterators go into min_heap, exhausted ones go to exhausted list
+	/// Returns `Ordering::Less` if `a` should be closer to root than `b`.
+	/// This means: a.key > b.key, or (a.key == b.key && a.level_idx < b.level_idx)
 	///
-	/// # Example
-	/// ```text
-	/// Before:
-	///   min_heap: []
-	///   max_heap: [Iter0("zebra"), Iter1("yak")]  // from backward iteration
-	///   exhausted: [Iter2]
-	///
-	/// After seek_first() on each:
-	///   Iter0.seek_first() → "apple"    ✓
-	///   Iter1.seek_first() → "banana"   ✓
-	///   Iter2.seek_first() → (empty)    ✗
-	///
-	/// After init_forward():
-	///   min_heap: [Iter0("apple"), Iter1("banana")]
-	///   max_heap: []
-	///   exhausted: [Iter2]
-	/// ```
+	/// Note: The key comparison is reversed, but the level_idx tiebreaker is NOT.
+	/// This ensures that when iterating backward, newer data (lower level_idx)
+	/// still shadows older data with the same key.
+	#[inline]
+	fn cmp_max(children: &[HeapEntry<'_>], cmp: &dyn Comparator, a: usize, b: usize) -> Ordering {
+		let key_a = children[a].iter.key().encoded();
+		let key_b = children[b].iter.key().encoded();
+		cmp.compare(key_a, key_b)
+			.reverse()
+			.then_with(|| children[a].level_idx.cmp(&children[b].level_idx))
+	}
+
+	/// Lazily initialize max_heap on first backward iteration.
+	fn init_max_heap(&mut self) {
+		if self.max_heap.is_none() {
+			self.max_heap = Some(BinaryHeap::with_capacity(self.children.len()));
+		}
+	}
+
+	/// Clear both heaps (used when switching directions or seeking).
+	fn clear_heaps(&mut self) {
+		self.min_heap.clear();
+		if let Some(ref mut h) = self.max_heap {
+			h.clear();
+		}
+	}
+
+	/// Rebuild min_heap with all currently valid iterators.
+	fn rebuild_min_heap(&mut self) {
+		let children = &self.children;
+		let cmp = self.cmp.as_ref();
+		for i in 0..children.len() {
+			if children[i].iter.valid() {
+				self.min_heap.push(i, |a, b| Self::cmp_min(children, cmp, a, b));
+			}
+		}
+	}
+
+	/// Rebuild max_heap with all currently valid iterators.
+	fn rebuild_max_heap(&mut self) {
+		let children = &self.children;
+		let cmp = self.cmp.as_ref();
+		let max_heap = self.max_heap.as_mut().unwrap();
+		for i in 0..children.len() {
+			if children[i].iter.valid() {
+				max_heap.push(i, |a, b| Self::cmp_max(children, cmp, a, b));
+			}
+		}
+	}
+
+	/// Initialize for forward iteration from the beginning.
 	fn init_forward(&mut self) -> Result<()> {
 		self.direction = Direction::Forward;
+		self.clear_heaps();
 
-		// Collect all entries from everywhere
-		let mut all_entries: Vec<HeapEntry<'a>> = self.min_heap.drain();
-		if let Some(ref mut max_heap) = self.max_heap {
-			all_entries.append(&mut max_heap.drain());
+		for child in &mut self.children {
+			child.iter.seek_first()?;
 		}
-		all_entries.append(&mut self.exhausted);
-
-		// Position all iterators at first and push valid ones to min_heap
-		for mut entry in all_entries {
-			if entry.iter.seek_first()? {
-				self.min_heap.push(entry);
-			} else {
-				self.exhausted.push(entry);
-			}
-		}
-
+		self.rebuild_min_heap();
 		Ok(())
 	}
 
-	/// Initialize for backward iteration - position all iterators at their last element.
-	///
-	/// Similar to init_forward(), but:
-	/// - Uses max_heap instead of min_heap
-	/// - Calls seek_last() instead of seek_first()
-	///
-	/// # Example
-	/// ```text
-	/// Iter0: ["apple", "cherry", "fig"]
-	///                              ↑ seek_last()
-	/// Iter1: ["banana", "date"]
-	///                     ↑ seek_last()
-	///
-	/// max_heap: [Iter0("fig"), Iter1("date")]
-	/// Winner: Iter0 ("fig" > "date")
-	/// ```
+	/// Initialize for backward iteration from the end.
 	fn init_backward(&mut self) -> Result<()> {
 		self.direction = Direction::Backward;
+		self.init_max_heap();
+		self.clear_heaps();
 
-		// Ensure max_heap exists (lazy initialization)
-		let capacity = self.min_heap.len() + self.exhausted.len();
-		if self.max_heap.is_none() {
-			self.max_heap = Some(self.create_max_heap(capacity));
+		for child in &mut self.children {
+			child.iter.seek_last()?;
 		}
-		let max_heap = self.max_heap.as_mut().unwrap();
-
-		// Collect all entries
-		let mut all_entries: Vec<HeapEntry<'_>> = self.min_heap.drain();
-		all_entries.append(&mut max_heap.drain());
-		all_entries.append(&mut self.exhausted);
-
-		// Position all iterators at last and push valid ones to max_heap
-		for mut entry in all_entries {
-			if entry.iter.seek_last()? {
-				max_heap.push(entry);
-			} else {
-				self.exhausted.push(entry);
-			}
-		}
-
+		self.rebuild_max_heap();
 		Ok(())
 	}
 
-	/// Switch from backward to forward iteration, positioning all iterators past target.
+	// -------------------------------------------------------------------------
+	// Direction Switching
+	// -------------------------------------------------------------------------
+
+	/// Switch from backward to forward, positioning just after `target`.
 	///
-	/// 1. For each child iterator: seek(target)
-	/// 2. If key == target: next() once to skip past it
-	/// 3. Rebuild the min_heap
+	/// When switching directions, we need to handle duplicate keys correctly.
+	/// The current iterator (heap top) should simply move forward one position.
+	/// Non-current iterators need to be positioned at a key strictly greater than
+	/// `target` to ensure correct ordering.
 	fn switch_to_forward(&mut self, target: &[u8]) -> Result<()> {
+		let current_idx = self.max_heap.as_ref().and_then(|h| h.peek());
+
 		self.direction = Direction::Forward;
+		self.clear_heaps();
 
-		// Collect all entries from both heaps and exhausted
-		let mut all_entries: Vec<HeapEntry<'_>> = self.min_heap.drain();
-		if let Some(ref mut max_heap) = self.max_heap {
-			all_entries.append(&mut max_heap.drain());
-		}
-		all_entries.append(&mut self.exhausted);
-
-		// Seek each child to target, then next() if equal
-		for mut entry in all_entries {
-			// seek to first key >= target
-			if entry.iter.seek(target)? {
-				// If positioned exactly at target, advance past it
-				if self.cmp.compare(entry.iter.key().encoded(), target) == Ordering::Equal {
-					if !entry.iter.next()? {
-						self.exhausted.push(entry);
-						continue;
+		for (idx, child) in self.children.iter_mut().enumerate() {
+			if Some(idx) == current_idx {
+				// Current iterator: just call next() once
+				child.iter.next()?;
+			} else {
+				// Non-current: position at key strictly > target
+				if child.iter.seek(target)? {
+					// Iterate forward until key > target
+					while child.iter.valid()
+						&& self.cmp.compare(child.iter.key().encoded(), target) != Ordering::Greater
+					{
+						if !child.iter.next()? {
+							break;
+						}
 					}
 				}
-				// key > target, add to heap
-				self.min_heap.push(entry);
-			} else {
-				// No keys >= target in this child
-				self.exhausted.push(entry);
+				// If seek returned false, iterator is exhausted
 			}
 		}
+		self.rebuild_min_heap();
 		Ok(())
 	}
 
-	/// Switch from forward to backward iteration, positioning all iterators before target.
+	/// Switch from forward to backward, positioning just before `target`.
 	///
-	/// 1. For each child iterator: seek(target)
-	/// 2. If found: prev() to get last key < target
-	/// 3. If not found (all keys < target): seek_last() to get largest key
-	/// 4. Rebuild the max_heap
-	///
-	/// # Critical Edge Case
-	/// When seek() returns false, the iterator is invalid and prev() would fail.
-	/// We must use seek_last() to get the last (largest) key, which is guaranteed
-	/// to be < target since seek() found no keys >= target.
+	/// When switching directions, we need to handle duplicate keys correctly.
+	/// The current iterator (heap top) should simply move back one position.
+	/// Non-current iterators need to be positioned at a key strictly less than
+	/// `target` to ensure correct ordering.
 	fn switch_to_backward(&mut self, target: &[u8]) -> Result<()> {
+		let current_idx = self.min_heap.peek();
+
 		self.direction = Direction::Backward;
+		self.init_max_heap();
+		self.clear_heaps();
 
-		// Ensure max_heap exists (lazy initialization)
-		let capacity = self.min_heap.len() + self.exhausted.len();
-		if self.max_heap.is_none() {
-			self.max_heap = Some(self.create_max_heap(capacity));
-		}
-		let max_heap = self.max_heap.as_mut().unwrap();
-
-		// Collect all entries
-		let mut all_entries: Vec<HeapEntry<'_>> = self.min_heap.drain();
-		all_entries.append(&mut max_heap.drain());
-		all_entries.append(&mut self.exhausted);
-
-		for mut entry in all_entries {
-			if entry.iter.seek(target)? {
-				// Found key >= target, need to go before it
-				// prev() moves to last key < current position
-				if !entry.iter.prev()? {
-					// No key before current position (exhausted backward)
-					self.exhausted.push(entry);
-					continue;
-				}
-				max_heap.push(entry);
+		for (idx, child) in self.children.iter_mut().enumerate() {
+			if Some(idx) == current_idx {
+				// Current iterator: just call prev() once
+				child.iter.prev()?;
 			} else {
-				// seek() returned false: ALL keys in this child are < target
-				// Use seek_last() to get the largest key (which is < target)
-				if entry.iter.seek_last()? {
-					max_heap.push(entry);
+				// Non-current: position at key strictly < target
+				if child.iter.seek(target)? {
+					// Iterate backward until key < target
+					while child.iter.valid()
+						&& self.cmp.compare(child.iter.key().encoded(), target) != Ordering::Less
+					{
+						if !child.iter.prev()? {
+							break;
+						}
+					}
 				} else {
-					// Empty iterator
-					self.exhausted.push(entry);
+					// Iterator positioned past all keys, go to last
+					child.iter.seek_last()?;
 				}
 			}
 		}
+		self.rebuild_max_heap();
 		Ok(())
 	}
 
-	/// Get the current heap based on direction.
-	#[inline]
-	fn current_heap(
-		&self,
-	) -> &BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>> {
-		match self.direction {
-			Direction::Forward => &self.min_heap,
-			Direction::Backward => self.max_heap.as_ref().unwrap(),
-		}
-	}
+	// -------------------------------------------------------------------------
+	// Advancing
+	// -------------------------------------------------------------------------
 
-	/// Get the current heap mutably based on direction.
-	#[inline]
-	fn current_heap_mut(
-		&mut self,
-	) -> &mut BinaryHeap<HeapEntry<'a>, Box<dyn Fn(&HeapEntry<'a>, &HeapEntry<'a>) -> Ordering>> {
-		match self.direction {
-			Direction::Forward => &mut self.min_heap,
-			Direction::Backward => self.max_heap.as_mut().unwrap(),
-		}
-	}
-
-	/// Advance the current winner iterator.
+	/// Advance the current winner iterator and restore heap property.
 	///
-	/// This is the core operation of the merging iterator.
-	///
-	/// # Algorithm
-	/// 1. Get mutable reference to heap root (the winner)
-	/// 2. Advance the winner's iterator (next or prev)
-	/// 3. If still valid: sift_down to restore heap property
-	/// 4. If exhausted: pop from heap, move to exhausted list
-	///
-	/// # Example: Forward iteration
-	/// ```text
-	/// Before:
-	///   min_heap:
-	///         [Iter0 → "apple"]     ← winner (smallest)
-	///        /                \
-	///   [Iter1 → "banana"]  [Iter2 → "cherry"]
-	///
-	/// Step 1: Advance Iter0
-	///   Iter0.next() → now points to "date"
-	///
-	/// Step 2: Heap property violated!
-	///         [Iter0 → "date"]      ← "date" > "banana"!
-	///        /                \
-	///   [Iter1 → "banana"]  [Iter2 → "cherry"]
-	///
-	/// Step 3: sift_down_root()
-	///         [Iter1 → "banana"]    ← restored!
-	///        /                \
-	///   [Iter0 → "date"]    [Iter2 → "cherry"]
-	/// ```
+	/// This is the hot path for iteration. After advancing the winner:
+	/// - If still valid: sift_down to restore heap property (O(log K))
+	/// - If exhausted: pop from heap (O(log K))
 	fn advance_winner(&mut self) -> Result<bool> {
-		// Copy direction before borrowing heap mutably
-		let direction = self.direction;
-		let heap = self.current_heap_mut();
-		if heap.is_empty() {
-			return Ok(false);
+		match self.direction {
+			Direction::Forward => {
+				if self.min_heap.is_empty() {
+					return Ok(false);
+				}
+				let winner = self.min_heap.peek().unwrap();
+				let valid = self.children[winner].iter.next()?;
+				let children = &self.children;
+				let cmp = self.cmp.as_ref();
+				if valid {
+					// Winner still valid, restore heap property
+					self.min_heap.sift_down_root(|a, b| Self::cmp_min(children, cmp, a, b));
+				} else {
+					// Winner exhausted, remove from heap
+					self.min_heap.pop(|a, b| Self::cmp_min(children, cmp, a, b));
+				}
+				Ok(!self.min_heap.is_empty())
+			}
+			Direction::Backward => {
+				let max_heap = self.max_heap.as_mut().unwrap();
+				if max_heap.is_empty() {
+					return Ok(false);
+				}
+				let winner = max_heap.peek().unwrap();
+				let valid = self.children[winner].iter.prev()?;
+				let children = &self.children;
+				let cmp = self.cmp.as_ref();
+				if valid {
+					self.max_heap
+						.as_mut()
+						.unwrap()
+						.sift_down_root(|a, b| Self::cmp_max(children, cmp, a, b));
+				} else {
+					self.max_heap.as_mut().unwrap().pop(|a, b| Self::cmp_max(children, cmp, a, b));
+				}
+				Ok(!self.max_heap.as_ref().unwrap().is_empty())
+			}
 		}
-
-		// Get mutable access to the winner and advance it
-		let winner = heap.peek_mut().unwrap();
-		let still_valid = match direction {
-			Direction::Forward => winner.iter.next()?,
-			Direction::Backward => winner.iter.prev()?,
-		};
-
-		if still_valid {
-			// Iterator still valid - sift down to restore heap property
-			heap.sift_down_root();
-		} else {
-			// Iterator exhausted - remove from heap
-			let entry = heap.pop().unwrap();
-			self.exhausted.push(entry);
-		}
-
-		Ok(!self.current_heap().is_empty())
 	}
 
-	/// Check if iterator is valid (positioned on a valid element).
+	// -------------------------------------------------------------------------
+	// Accessors
+	// -------------------------------------------------------------------------
+
 	#[inline]
 	pub fn is_valid(&self) -> bool {
-		!self.current_heap().is_empty()
+		match self.direction {
+			Direction::Forward => !self.min_heap.is_empty(),
+			Direction::Backward => self.max_heap.as_ref().map_or(false, |h| !h.is_empty()),
+		}
 	}
 
-	/// Get current winner's key.
-	///
-	/// # Panics
-	/// Panics if iterator is not valid. Always check `is_valid()` first.
 	#[inline]
 	pub fn current_key(&self) -> InternalKeyRef<'_> {
 		debug_assert!(self.is_valid());
-		self.current_heap().peek().unwrap().iter.key()
+		let idx = match self.direction {
+			Direction::Forward => self.min_heap.peek().unwrap(),
+			Direction::Backward => self.max_heap.as_ref().unwrap().peek().unwrap(),
+		};
+		self.children[idx].iter.key()
 	}
 
-	/// Get current winner's value.
-	///
-	/// # Panics
-	/// Panics if iterator is not valid. Always check `is_valid()` first.
 	#[inline]
 	pub fn current_value(&self) -> &[u8] {
 		debug_assert!(self.is_valid());
-		self.current_heap().peek().unwrap().iter.value()
+		let idx = match self.direction {
+			Direction::Forward => self.min_heap.peek().unwrap(),
+			Direction::Backward => self.max_heap.as_ref().unwrap().peek().unwrap(),
+		};
+		self.children[idx].iter.value()
 	}
 }
 
+// -----------------------------------------------------------------------------
+// InternalIterator Implementation
+// -----------------------------------------------------------------------------
+
 impl InternalIterator for MergingIterator<'_> {
-	/// Seek to the first entry with key >= target.
-	///
-	/// # Example
-	/// ```text
-	/// Iter0: ["apple", "cherry", "fig"]
-	/// Iter1: ["banana", "date"]
-	///
-	/// seek("cat"):
-	///   Iter0.seek("cat") → "cherry" (first >= "cat")
-	///   Iter1.seek("cat") → "date"   (first >= "cat")
-	///   
-	/// min_heap: [Iter0("cherry"), Iter1("date")]
-	/// Result: "cherry"
-	/// ```
+	/// Seek to the first key >= target.
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = Direction::Forward;
+		self.clear_heaps();
 
-		// Collect all entries
-		let mut all_entries: Vec<HeapEntry<'_>> = self.min_heap.drain();
-		if let Some(ref mut max_heap) = self.max_heap {
-			all_entries.append(&mut max_heap.drain());
+		for child in &mut self.children {
+			child.iter.seek(target)?;
 		}
-		all_entries.append(&mut self.exhausted);
-
-		// Seek all iterators and push valid ones to min_heap
-		for mut entry in all_entries {
-			if entry.iter.seek(target)? {
-				self.min_heap.push(entry);
-			} else {
-				self.exhausted.push(entry);
-			}
-		}
-
+		self.rebuild_min_heap();
 		Ok(self.is_valid())
 	}
 
-	/// Position at the first (smallest) key across all iterators.
+	/// Seek to the first key.
 	fn seek_first(&mut self) -> Result<bool> {
 		self.init_forward()?;
 		Ok(self.is_valid())
 	}
 
-	/// Position at the last (largest) key across all iterators.
+	/// Seek to the last key.
 	fn seek_last(&mut self) -> Result<bool> {
 		self.init_backward()?;
 		Ok(self.is_valid())
 	}
 
-	/// Move to the next entry (in forward direction).
+	/// Move to the next key.
 	///
-	/// If currently in backward mode, this switches direction.
-	///
-	/// # Direction Switch Example
-	/// ```text
-	/// Current state (backward mode):
-	///   Position: "cherry"
-	///   
-	/// User calls next():
-	///   1. Save current key: "cherry"
-	///   2. switch_to_forward("cherry") - seeks all iterators to "cherry", then next()
-	///   3. Result: first entry > "cherry" (e.g., "date")
-	/// ```
+	/// If currently iterating backward, switches direction first.
 	fn next(&mut self) -> Result<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
 		if self.direction != Direction::Forward {
-			let current_key = self.current_key().encoded().to_vec();
-			self.switch_to_forward(&current_key)?;
+			let target = self.current_key().encoded().to_vec();
+			self.switch_to_forward(&target)?;
 			return Ok(self.is_valid());
 		}
 		self.advance_winner()
 	}
 
-	/// Move to the previous entry (in backward direction).
+	/// Move to the previous key.
 	///
-	/// If currently in forward mode, this switches direction.
+	/// If currently iterating forward, switches direction first.
 	fn prev(&mut self) -> Result<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
 		if self.direction != Direction::Backward {
-			let current_key = self.current_key().encoded().to_vec();
-			self.switch_to_backward(&current_key)?;
+			let target = self.current_key().encoded().to_vec();
+			self.switch_to_backward(&target)?;
 			return Ok(self.is_valid());
 		}
 		self.advance_winner()
@@ -1369,7 +934,7 @@ impl<'a> CompactionIterator<'a> {
 					// Check retention period
 					let current_time = self.clock.now();
 					let key_timestamp = key.timestamp;
-					let age = current_time - key_timestamp;
+					let age = current_time.saturating_sub(key_timestamp);
 					let is_within_retention = age <= self.retention_period_ns;
 					// Stale if OUTSIDE retention period
 					!is_within_retention
