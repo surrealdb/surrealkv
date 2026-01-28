@@ -488,14 +488,12 @@ impl Transaction {
 			}
 
 			// Query the versioned index through the snapshot
-			return match &self.snapshot {
+			match &self.snapshot {
 				Some(snapshot) => snapshot.get_at_version(key.as_slice(), timestamp),
 				None => Err(Error::NoSnapshot),
-			};
+			}
 		} else {
-			return Err(Error::InvalidArgument(
-				"Timestamp is required for versioned queries".to_string(),
-			));
+			Err(Error::InvalidArgument("Timestamp is required for versioned queries".to_string()))
 		}
 	}
 
@@ -546,9 +544,7 @@ impl Transaction {
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
-			return Err(Error::InvalidArgument(
-				"Timestamp is required for versioned queries".to_string(),
-			));
+			Err(Error::InvalidArgument("Timestamp is required for versioned queries".to_string()))
 		}
 	}
 
@@ -636,9 +632,7 @@ impl Transaction {
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
-			return Err(Error::InvalidArgument(
-				"Timestamp is required for versioned queries".to_string(),
-			));
+			Err(Error::InvalidArgument("Timestamp is required for versioned queries".to_string()))
 		}
 	}
 
@@ -1366,6 +1360,7 @@ impl<'a> TransactionIterator<'a> {
 	}
 
 	/// Move to next entry. Returns true if valid.
+	#[allow(clippy::should_implement_trait)]
 	pub fn next(&mut self) -> Result<bool> {
 		self.inner.next()
 	}

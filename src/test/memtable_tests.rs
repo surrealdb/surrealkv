@@ -739,7 +739,7 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 		let value_bytes = iter.value();
 		let value = value_bytes.to_vec();
 		if key.user_key != b"b" {
-			range_entries.push((key.clone(), value.clone()));
+			range_entries.push((key, value));
 			// Collect remaining entries
 			while iter.next().unwrap_or(false) && iter.valid() {
 				let key = iter.key().to_owned();

@@ -176,12 +176,12 @@ fn test_table_seek() {
 	let key = InternalKey::new(Vec::from(b"bcd"), 2, InternalKeyKind::Set, 0);
 	iter.seek(&key.encode()).unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"bcd"[..], &b"asa"[..]));
+	assert_eq!((iter.key().user_key(), iter.value()), (&b"bcd"[..], &b"asa"[..]));
 
 	let key = InternalKey::new(Vec::from(b"abc"), 2, InternalKeyKind::Set, 0);
 	iter.seek(&key.encode()).unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"abc"[..], &b"def"[..]));
+	assert_eq!((iter.key().user_key(), iter.value()), (&b"abc"[..], &b"def"[..]));
 
 	// Seek-past-last invalidates.
 	let key = InternalKey::new(Vec::from(b"{{{"), 2, InternalKeyKind::Set, 0);
@@ -203,31 +203,31 @@ fn test_table_iter() {
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"abc"[..], &b"def"[..]));
+	assert_eq!((iter.key().user_key(), iter.value()), (&b"abc"[..], &b"def"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"abd"[..], &b"dee"[..]));
+	assert_eq!((iter.key().user_key(), iter.value()), (&b"abd"[..], &b"dee"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"bcd"[..], &b"asa"[..]));
+	assert_eq!((iter.key().user_key(), iter.value()), (&b"bcd"[..], &b"asa"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"bsr"[..], &b"a00"[..]));
+	assert_eq!((iter.key().user_key(), iter.value()), (&b"bsr"[..], &b"a00"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"xyz"[..], &b"xxx"[..]));
+	assert_eq!((iter.key().user_key(), iter.value()), (&b"xyz"[..], &b"xxx"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"xzz"[..], &b"yyy"[..]));
+	assert_eq!((iter.key().user_key(), iter.value()), (&b"xzz"[..], &b"yyy"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value().as_ref()), (&b"zzz"[..], &b"111"[..]));
+	assert_eq!((iter.key().user_key(), iter.value()), (&b"zzz"[..], &b"111"[..]));
 }
 
 #[test]
@@ -352,7 +352,7 @@ fn test_iter_items() {
 		let expected_key = format!("key_{item:05}");
 		let expected_value = format!("value_{item:05}");
 		assert_eq!(std::str::from_utf8(&key.user_key).unwrap(), expected_key);
-		assert_eq!(value.as_ref(), expected_value.as_bytes());
+		assert_eq!(value, expected_value.as_bytes());
 		iter.next().unwrap();
 		item += 1;
 	}
@@ -968,7 +968,7 @@ fn test_table_iterator_no_items_lost() {
 		let key = iter.key().to_owned();
 		let value = iter.value();
 		let key_str = std::str::from_utf8(&key.user_key).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref()).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 		collected_items.push((key_str.to_string(), value_str.to_string()));
 		iter.next().unwrap();
 	}
@@ -1030,7 +1030,7 @@ fn test_table_iterator_does_not_restart_after_exhaustion() {
 		let key = iter.key().to_owned();
 		let value = iter.value();
 		let key_str = std::str::from_utf8(&key.user_key).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref()).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 		seen_keys.push((key_str.to_string(), value_str.to_string()));
 
 		let key_count = seen_keys.iter().filter(|(k, _)| k == key_str).count();
@@ -1081,7 +1081,7 @@ fn test_table_iterator_advance_method_correctness() {
 		assert!(iter.valid(), "Iterator should be valid after advancing to item {expected_index}");
 
 		let current_key = iter.key();
-		let key_str = std::str::from_utf8(&current_key.user_key()).unwrap();
+		let key_str = std::str::from_utf8(current_key.user_key()).unwrap();
 		let expected_key = data[expected_index].0;
 		assert_eq!(
                 key_str, expected_key,
@@ -1202,8 +1202,8 @@ fn test_table_iterator_seek_then_iterate() {
 		while iter.valid() {
 			let current_key = iter.key();
 			let current_value = iter.value();
-			let key_str = std::str::from_utf8(&current_key.user_key()).unwrap();
-			let value_str = std::str::from_utf8(current_value.as_ref()).unwrap();
+			let key_str = std::str::from_utf8(current_key.user_key()).unwrap();
+			let value_str = std::str::from_utf8(current_value).unwrap();
 			remaining_items.push((key_str.to_string(), value_str.to_string()));
 
 			if !iter.next().unwrap() {
@@ -1258,7 +1258,7 @@ fn test_table_iterator_seek_behavior() {
 
 		assert!(iter.valid(), "Iterator should be valid after seeking to existing key");
 		let current_key = iter.key();
-		let found_key = std::str::from_utf8(&current_key.user_key()).unwrap();
+		let found_key = std::str::from_utf8(current_key.user_key()).unwrap();
 		assert_eq!(found_key, "key_005", "Should find the exact key we sought");
 
 		let remaining_collected = collect_iter(&mut iter);
@@ -1292,7 +1292,7 @@ fn test_table_iterator_seek_behavior() {
 
 		assert!(iter.valid(), "Iterator should be valid after seeking to non-existing key");
 		let current_key = iter.key();
-		let found_key = std::str::from_utf8(&current_key.user_key()).unwrap();
+		let found_key = std::str::from_utf8(current_key.user_key()).unwrap();
 		assert_eq!(found_key, "key_005", "Should find next key when seeking non-existing");
 	}
 
@@ -4260,7 +4260,7 @@ fn test_table_iterator_full_scan() {
 		let value = iter.value();
 		collected.push((
 			std::str::from_utf8(key.user_key()).unwrap().to_string(),
-			std::str::from_utf8(value.as_ref()).unwrap().to_string(),
+			std::str::from_utf8(value).unwrap().to_string(),
 		));
 		match iter.next() {
 			Ok(false) => break,
@@ -4305,7 +4305,7 @@ fn test_table_iterator_reverse_scan() {
 		let value = iter.value();
 		collected.push((
 			std::str::from_utf8(key.user_key()).unwrap().to_string(),
-			std::str::from_utf8(value.as_ref()).unwrap().to_string(),
+			std::str::from_utf8(value).unwrap().to_string(),
 		));
 		if !iter.prev().unwrap() {
 			break;
@@ -4487,7 +4487,7 @@ fn test_single_entry_table() {
 	assert!(iter.valid(), "Iterator should be valid");
 	assert_eq!(iter.key().user_key(), b"single_key");
 	let iter_value = iter.value();
-	let iter_value_bytes: &[u8] = iter_value.as_ref();
+	let iter_value_bytes: &[u8] = iter_value;
 	assert_eq!(iter_value_bytes, b"single_value");
 
 	// Test Next - should invalidate iterator

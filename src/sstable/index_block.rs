@@ -562,7 +562,7 @@ impl<'a> IndexIterator<'a> {
 
 	/// Returns true if positioned on a valid entry.
 	pub(crate) fn valid(&self) -> bool {
-		self.partition_iter.as_ref().map_or(false, |iter| iter.is_valid())
+		self.partition_iter.as_ref().is_some_and(|iter| iter.is_valid())
 	}
 
 	/// Returns the current key (separator key from the index entry).

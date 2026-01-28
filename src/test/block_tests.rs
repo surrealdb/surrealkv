@@ -157,7 +157,7 @@ fn test_block_seek() {
 	assert!(block_iter.valid());
 	assert_eq!(
 		Some((block_iter.key().user_key(), block_iter.value(),)),
-		Some(("pkey2".as_bytes().as_ref(), "value".as_bytes().as_ref()))
+		Some(("pkey2".as_bytes(), "value".as_bytes()))
 	);
 
 	let key = InternalKey::new(b"pkey0".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -165,7 +165,7 @@ fn test_block_seek() {
 	assert!(block_iter.valid());
 	assert_eq!(
 		Some((block_iter.key().user_key(), block_iter.value(),)),
-		Some(("pkey1".as_bytes().as_ref(), "value".as_bytes().as_ref()))
+		Some(("pkey1".as_bytes(), "value".as_bytes()))
 	);
 
 	let key = InternalKey::new(b"key1".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -173,7 +173,7 @@ fn test_block_seek() {
 	assert!(block_iter.valid());
 	assert_eq!(
 		Some((block_iter.key().user_key(), block_iter.value(),)),
-		Some(("key1".as_bytes().as_ref(), "value1".as_bytes().as_ref()))
+		Some(("key1".as_bytes(), "value1".as_bytes()))
 	);
 
 	let key = InternalKey::new(b"pkey3".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -181,7 +181,7 @@ fn test_block_seek() {
 	assert!(block_iter.valid());
 	assert_eq!(
 		Some((block_iter.key().user_key(), block_iter.value(),)),
-		Some(("pkey3".as_bytes().as_ref(), "value".as_bytes().as_ref()))
+		Some(("pkey3".as_bytes(), "value".as_bytes()))
 	);
 
 	let key = InternalKey::new(b"pkey8".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -310,7 +310,7 @@ fn test_block_double_ended_iteration() {
 	let mut forward_keys = Vec::new();
 	while forward_iter.valid() {
 		let key = forward_iter.key().to_owned().user_key.clone();
-		forward_keys.push(String::from_utf8(key.to_vec()).unwrap());
+		forward_keys.push(String::from_utf8(key.clone()).unwrap());
 		forward_iter.next().unwrap();
 	}
 	assert_eq!(forward_keys, vec!["key1", "loooongkey1", "medium_key2", "pkey1", "pkey2", "pkey3"]);

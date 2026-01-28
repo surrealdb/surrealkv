@@ -1413,7 +1413,7 @@ async fn test_compaction_respects_sequence_numbers() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
-				let location = ValueLocation::decode(&iter.value().to_vec()).unwrap();
+				let location = ValueLocation::decode(iter.value()).unwrap();
 				if location.is_value_pointer() {
 					panic!("Unexpected VLog pointer in test");
 				}

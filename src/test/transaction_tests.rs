@@ -888,7 +888,7 @@ async fn test_range_write_sequence_order() {
 				.unwrap();
 
 		assert_eq!(range.len(), 1);
-		assert_eq!(range[0].1.as_ref().map(|v| v.as_slice()), Some(b"value3".as_slice())); // Latest value
+		assert_eq!(range[0].1.as_deref(), Some(b"value3".as_slice())); // Latest value
 	}
 }
 

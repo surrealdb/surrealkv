@@ -877,7 +877,7 @@ impl<'a> InternalKeyRef<'a> {
 		is_delete_kind(self.kind())
 	}
 
-	pub fn to_owned(&self) -> InternalKey {
+	pub fn to_owned(self) -> InternalKey {
 		InternalKey::decode(self.encoded)
 	}
 }

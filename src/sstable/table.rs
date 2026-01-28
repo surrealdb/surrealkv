@@ -412,10 +412,12 @@ impl<W: Write> TableWriter<W> {
 		}
 
 		// Initialize filter block on first key if needed
-		if self.filter_block.is_none() && self.opts.filter_policy.is_some() {
-			self.filter_block =
-				Some(FilterBlockWriter::new(Arc::clone(self.opts.filter_policy.as_ref().unwrap())));
-			self.filter_block.as_mut().unwrap().start_block(0);
+		if self.filter_block.is_none() {
+			if let Some(filter_policy) = self.opts.filter_policy.as_ref() {
+				let mut filter_block = FilterBlockWriter::new(Arc::clone(filter_policy));
+				filter_block.start_block(0);
+				self.filter_block = Some(filter_block);
+			}
 		}
 
 		// Update metadata
@@ -1227,7 +1229,7 @@ impl<'a> TableIterator<'a> {
 	}
 
 	fn is_valid(&self) -> bool {
-		!self.exhausted && self.second_level.as_ref().map_or(false, |iter| iter.is_valid())
+		!self.exhausted && self.second_level.as_ref().is_some_and(|iter| iter.is_valid())
 	}
 
 	fn mark_exhausted(&mut self) {
@@ -1311,7 +1313,7 @@ impl<'a> TableIterator<'a> {
 	fn advance_to_valid_entry(&mut self) -> Result<()> {
 		loop {
 			// Success: current position is valid
-			if self.second_level.as_ref().map_or(false, |iter| iter.is_valid()) {
+			if self.second_level.as_ref().is_some_and(|iter| iter.is_valid()) {
 				return Ok(());
 			}
 
@@ -1336,7 +1338,7 @@ impl<'a> TableIterator<'a> {
 	/// Mirror of advance_to_valid_entry for backward iteration.
 	fn retreat_to_valid_entry(&mut self) -> Result<()> {
 		loop {
-			if self.second_level.as_ref().map_or(false, |iter| iter.is_valid()) {
+			if self.second_level.as_ref().is_some_and(|iter| iter.is_valid()) {
 				return Ok(());
 			}
 
@@ -1740,9 +1742,7 @@ impl InternalIterator for TableIterator<'_> {
 
 		self.advance_internal()?;
 
-		if !self.is_valid() {
-			self.mark_exhausted();
-		} else if !self.satisfies_upper_bound(self.current_user_key()) {
+		if !self.is_valid() || !self.satisfies_upper_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
 		Ok(self.is_valid())
@@ -1760,9 +1760,7 @@ impl InternalIterator for TableIterator<'_> {
 
 		self.prev_internal()?;
 
-		if !self.is_valid() {
-			self.mark_exhausted();
-		} else if !self.satisfies_lower_bound(self.current_user_key()) {
+		if !self.is_valid() || !self.satisfies_lower_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
 		Ok(self.is_valid())
