@@ -368,9 +368,6 @@ impl<'a> MergingIterator<'a> {
 	/// The current iterator (heap top) should simply move forward one position.
 	/// Non-current iterators need to be positioned at a key strictly greater than
 	/// `target` to ensure correct ordering.
-	///
-	/// This follows Pebble's approach: for non-current iterators, iterate
-	/// forward until finding a key strictly greater than target.
 	fn switch_to_forward(&mut self, target: &[u8]) -> Result<()> {
 		let current_idx = self.max_heap.as_ref().and_then(|h| h.peek());
 
@@ -406,9 +403,6 @@ impl<'a> MergingIterator<'a> {
 	/// The current iterator (heap top) should simply move back one position.
 	/// Non-current iterators need to be positioned at a key strictly less than
 	/// `target` to ensure correct ordering.
-	///
-	/// This follows Pebble's approach: for non-current iterators, iterate
-	/// backward until finding a key strictly less than target.
 	fn switch_to_backward(&mut self, target: &[u8]) -> Result<()> {
 		let current_idx = self.min_heap.peek();
 
