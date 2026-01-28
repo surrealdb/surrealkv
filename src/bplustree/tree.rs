@@ -137,10 +137,13 @@ const OVERFLOW_PTR_SIZE: usize = 8;
 const OVERFLOW_PAGE_CAPACITY: usize = PAGE_SIZE - 13; // = 4083
 
 // Pre-computed constants (no runtime calculation needed)
-const LEAF_MIN_LOCAL: usize = 486; // ((4075 - 12) * 32 / 255) - 23
-const LEAF_MAX_LOCAL: usize = 996; // ((4075 - 12) * 64 / 255) - 23
-const INTERNAL_MIN_LOCAL: usize = 488; // ((4087 - 12) * 32 / 255) - 23
-const INTERNAL_MAX_LOCAL: usize = 999; // ((4087 - 12) * 64 / 255) - 23
+const LEAF_USABLE: usize = PAGE_SIZE - LEAF_HEADER_SIZE;
+const INTERNAL_USABLE: usize = PAGE_SIZE - INTERNAL_HEADER_SIZE;
+
+const LEAF_MIN_LOCAL: usize = ((LEAF_USABLE - 12) * 32 / 255) - 23;
+const LEAF_MAX_LOCAL: usize = ((LEAF_USABLE - 12) * 64 / 255) - 23;
+const INTERNAL_MIN_LOCAL: usize = ((INTERNAL_USABLE - 12) * 32 / 255) - 23;
+const INTERNAL_MAX_LOCAL: usize = ((INTERNAL_USABLE - 12) * 64 / 255) - 23;
 
 // Helper functions for reading integer types from byte slices without unwrap()
 // These are safe to use when bounds have already been checked

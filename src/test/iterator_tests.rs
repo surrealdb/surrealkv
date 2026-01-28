@@ -1,13 +1,19 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tempfile::TempDir;
 use test_log::test;
 
 use crate::clock::{LogicalClock, MockLogicalClock};
-use crate::iter::CompactionIterator;
-use crate::sstable::{InternalKey, InternalKeyKind};
+use crate::comparator::{BytewiseComparator, InternalKeyComparator};
+use crate::iter::{BoxedInternalIterator, CompactionIterator, MergingIterator};
+use crate::sstable::table::{Table, TableWriter};
+use crate::vfs::File;
 use crate::vlog::{VLog, ValueLocation};
-use crate::{Options, Result, VLogChecksumLevel, Value};
+use crate::{InternalIterator, InternalKey, InternalKeyKind, Options, VLogChecksumLevel, Value};
+
+/// Global counter for generating unique table IDs in tests
+static TEST_TABLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn create_internal_key(user_key: &str, sequence: u64, kind: InternalKeyKind) -> InternalKey {
 	InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, 0)
@@ -42,44 +48,40 @@ fn create_vlog_value(vlog: &Arc<VLog>, key: &[u8], value: &[u8]) -> Value {
 	ValueLocation::with_pointer(pointer).encode()
 }
 
-// Creates a mock iterator with predefined entries
-struct MockIterator {
-	items: Vec<(InternalKey, Value)>,
-	index: usize,
+fn create_comparator() -> Arc<InternalKeyComparator> {
+	Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())))
 }
 
-impl MockIterator {
-	fn new(items: Vec<(InternalKey, Value)>) -> Self {
-		Self {
-			items,
-			index: 0,
-		}
-	}
+/// Wraps a Vec<u8> as a File for in-memory table reading
+fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
+	Arc::new(src)
 }
 
-impl Iterator for MockIterator {
-	type Item = Result<(InternalKey, Value)>;
+/// Builds an in-memory SSTable and returns its iterator.
+/// This uses real SSTable seek behavior with InternalKeyComparator.
+///
+/// Unlike MockIterator, this properly handles internal key ordering
+/// where higher sequence numbers come before lower ones for the same user key.
+fn build_table_iterator(entries: Vec<(InternalKey, Value)>) -> BoxedInternalIterator<'static> {
+	let table_id = TEST_TABLE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
-	fn next(&mut self) -> Option<Self::Item> {
-		if self.index < self.items.len() {
-			let item = self.items[self.index].clone();
-			self.index += 1;
-			Some(Ok(item))
-		} else {
-			None
-		}
-	}
-}
+	let mut buf = Vec::with_capacity(512);
+	let opts = Arc::new(Options::new());
 
-impl DoubleEndedIterator for MockIterator {
-	fn next_back(&mut self) -> Option<Self::Item> {
-		if self.index < self.items.len() {
-			let item = self.items.pop()?;
-			Some(Ok(item))
-		} else {
-			None
+	{
+		let mut writer = TableWriter::new(&mut buf, table_id, Arc::clone(&opts), 0);
+		for (key, value) in entries {
+			writer.add(key, &value).unwrap();
 		}
+		writer.finish().unwrap();
 	}
+
+	let size = buf.len() as u64;
+	let table = Table::new(table_id, opts, wrap_buffer(buf), size).unwrap();
+
+	// Leak the table to get 'static lifetime (acceptable for tests)
+	let table: &'static Table = Box::leak(Box::new(table));
+	Box::new(table.iter(None).unwrap())
 }
 
 #[test]
@@ -104,12 +106,13 @@ fn test_merge_iterator_sequence_ordering() {
 		items2.push((key, value_vec));
 	}
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
 
 	// Create the merge iterator
 	let mut merge_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false,
 		None,
 		false, // versioning disabled
@@ -182,12 +185,13 @@ fn test_compaction_iterator_hard_delete_filtering() {
 		items2.push((key, value_vec));
 	}
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
 
 	// Test non-bottom level (should keep hard delete entries)
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false,
 		None,
 		false,
@@ -255,12 +259,13 @@ fn test_compaction_iterator_hard_delete_filtering() {
 		items2.push((key, value_vec));
 	}
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
 
 	// Use bottom level
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		true, // bottom level
 		None,
 		false,
@@ -309,13 +314,14 @@ async fn test_combined_iterator_returns_latest_version() {
 	let items2 = vec![(key_v2, value_v2)]; // L1 - middle
 	let items3 = vec![(key_v3, value_v3.clone())]; // L2 - newest
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
-	let iter3 = Box::new(MockIterator::new(items3));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
+	let iter3 = build_table_iterator(items3);
 
 	// Create compaction iterator (non-bottom level)
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -366,12 +372,13 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 	let items2 = vec![(key_v2, value_v2)];
 	let items3 = vec![(key_v3, value_v3.clone())];
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
-	let iter3 = Box::new(MockIterator::new(items3));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
+	let iter3 = build_table_iterator(items3);
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -425,11 +432,12 @@ async fn test_hard_delete_at_bottom_level() {
 	let items1 = vec![(hard_delete_key, empty_value)];
 	let items2 = vec![(value_key, actual_value)];
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		true, // bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -468,11 +476,12 @@ async fn test_hard_delete_at_non_bottom_level() {
 	let items1 = vec![(hard_delete_key, empty_value)];
 	let items2 = vec![(value_key, actual_value)];
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -530,12 +539,13 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 	let items2 = vec![(key1_v1, key1_val1), (key3_v1, key3_val1.clone())];
 	let items3 = vec![(key2_v1, key2_val1)];
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
-	let iter3 = Box::new(MockIterator::new(items3));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
+	let iter3 = build_table_iterator(items3);
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -608,11 +618,12 @@ fn test_no_vlog_no_delete_list() {
 	let items1 = vec![(key_v2, value_v2)];
 	let items2 = vec![(key_v1, value_v1)];
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // not bottom level
 		None,  // no vlog
 		false,
@@ -671,12 +682,13 @@ async fn test_sequence_ordering_across_iterators() {
 	let items2 = vec![(key_a_v2, val_a_v2), (key_b_v2, val_b_v2.clone()), (key_c_v2, val_c_v2)];
 	let items3 = vec![(key_a_v1, val_a_v1), (key_c_v1, val_c_v1), (key_d_v1, val_d_v1.clone())];
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
-	let iter3 = Box::new(MockIterator::new(items3));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
+	let iter3 = build_table_iterator(items3);
 
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		false,
@@ -823,14 +835,15 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 		(key3_very_old_set1, val3_very_old1),
 	];
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
-	let iter3 = Box::new(MockIterator::new(items3));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
+	let iter3 = build_table_iterator(items3);
 
 	// Test with versioning enabled and 5-second retention period
 	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // not bottom level
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1003,15 +1016,16 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 		(key4_old_set, val4_old),
 	];
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
-	let iter3 = Box::new(MockIterator::new(items3));
-	let iter4 = Box::new(MockIterator::new(items4));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
+	let iter3 = build_table_iterator(items3);
+	let iter4 = build_table_iterator(items4);
 
 	// Test with versioning enabled, 5-second retention period, and BOTTOM LEVEL
 	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3, iter4],
+		create_comparator(),
 		true, // BOTTOM LEVEL - delete markers should be dropped
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1165,14 +1179,15 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 	];
 	let items3 = vec![(key3_delete, Vec::new())]; // DELETE only
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
-	let iter3 = Box::new(MockIterator::new(items3));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
+	let iter3 = build_table_iterator(items3);
 
 	// Test with versioning DISABLED at NON-BOTTOM level
 	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		false, // NON-BOTTOM LEVEL
 		Some(Arc::clone(&vlog)),
 		false, // VERSIONING DISABLED
@@ -1307,14 +1322,15 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 	];
 	let items3 = vec![(key3_delete, Vec::new())]; // DELETE only
 
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
-	let iter3 = Box::new(MockIterator::new(items3));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
+	let iter3 = build_table_iterator(items3);
 
 	// Test with versioning DISABLED at BOTTOM level
 	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
+		create_comparator(),
 		true, // BOTTOM LEVEL
 		Some(Arc::clone(&vlog)),
 		false, // VERSIONING DISABLED
@@ -1422,10 +1438,11 @@ async fn test_delete_list_logic() {
 
 		let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
 
-		let iter = Box::new(MockIterator::new(items));
+		let iter = build_table_iterator(items);
 		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -1477,10 +1494,11 @@ async fn test_delete_list_logic() {
 
 		let items = vec![(hard_delete_key, empty_value), (old_value_key, actual_value)];
 
-		let iter = Box::new(MockIterator::new(items));
+		let iter = build_table_iterator(items);
 		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -1528,10 +1546,11 @@ async fn test_delete_list_logic() {
 
 		let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
 
-		let iter = Box::new(MockIterator::new(items));
+		let iter = build_table_iterator(items);
 		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			false, // disable versioning
@@ -1582,10 +1601,11 @@ async fn test_delete_list_logic() {
 
 		let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
 
-		let iter = Box::new(MockIterator::new(items));
+		let iter = build_table_iterator(items);
 		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -1620,14 +1640,14 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 	let mut items1 = Vec::new();
 	let mut items2 = Vec::new();
 
-	// Table 1: Regular SET operations
-	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
-	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
-	items1.push((key1, value1));
-
+	// Table 1: Regular SET operations (higher seq first for same user key)
 	let key2 = create_internal_key("test_key", 200, InternalKeyKind::Set);
 	let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
 	items1.push((key2, value2));
+
+	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
+	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+	items1.push((key1, value1));
 
 	// Table 2: Replace operation (newer sequence number)
 	let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
@@ -1635,12 +1655,13 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 	items2.push((key3, value3));
 
 	// Create iterators
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
 
 	// Test non-bottom level compaction (should preserve Replace)
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // non-bottom level
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1677,36 +1698,37 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 	let mut items1 = Vec::new();
 	let mut items2 = Vec::new();
 
-	// Table 1: Multiple regular SET operations
-	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
-	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
-	items1.push((key1, value1));
+	// Table 1: Multiple regular SET operations (higher seq first for same user key)
+	let key3 = create_internal_key("test_key", 250, InternalKeyKind::Set);
+	let value3 = create_vlog_value(&vlog, b"test_key", b"value3");
+	items1.push((key3, value3));
 
 	let key2 = create_internal_key("test_key", 200, InternalKeyKind::Set);
 	let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
 	items1.push((key2, value2));
 
-	let key3 = create_internal_key("test_key", 250, InternalKeyKind::Set);
-	let value3 = create_vlog_value(&vlog, b"test_key", b"value3");
-	items1.push((key3, value3));
+	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
+	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+	items1.push((key1, value1));
 
-	// Table 2: Replace operation (not the latest)
-	let key4 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
-	let value4 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
-	items2.push((key4, value4));
-
-	// Table 3: Regular SET after Replace (latest)
+	// Table 2: Replace operation (not the latest) and Regular SET after Replace (latest)
+	// Higher seq first for same user key
 	let key5 = create_internal_key("test_key", 400, InternalKeyKind::Set);
 	let value5 = create_vlog_value(&vlog, b"test_key", b"final_value");
 	items2.push((key5, value5));
 
+	let key4 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
+	let value4 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
+	items2.push((key4, value4));
+
 	// Create iterators
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
 
 	// Test compaction
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // non-bottom level
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1744,14 +1766,14 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 	let mut items1 = Vec::new();
 	let mut items2 = Vec::new();
 
-	// Table 1: Regular SET operations
-	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
-	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
-	items1.push((key1, value1));
-
+	// Table 1: Regular SET operations (higher seq first for same user key)
 	let key2 = create_internal_key("test_key", 200, InternalKeyKind::Set);
 	let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
 	items1.push((key2, value2));
+
+	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
+	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+	items1.push((key1, value1));
 
 	// Table 2: Replace as the latest version
 	let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
@@ -1759,12 +1781,13 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 	items2.push((key3, value3));
 
 	// Create iterators
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
 
 	// Test compaction
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // non-bottom level
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1800,14 +1823,14 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 	let mut items1 = Vec::new();
 	let mut items2 = Vec::new();
 
-	// Table 1: Regular SET and hard delete
-	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
-	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
-	items1.push((key1, value1));
-
+	// Table 1: Regular SET and hard delete (higher seq first for same user key)
 	let key2 = create_internal_key("test_key", 200, InternalKeyKind::Delete);
 	let value2 = Value::from(vec![]); // Empty value for delete
 	items1.push((key2, value2));
+
+	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
+	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+	items1.push((key1, value1));
 
 	// Table 2: Replace operation
 	let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
@@ -1815,12 +1838,13 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 	items2.push((key3, value3));
 
 	// Create iterators
-	let iter1 = Box::new(MockIterator::new(items1));
-	let iter2 = Box::new(MockIterator::new(items2));
+	let iter1 = build_table_iterator(items1);
+	let iter2 = build_table_iterator(items2);
 
 	// Test non-bottom level compaction
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
+		create_comparator(),
 		false, // non-bottom level
 		Some(Arc::clone(&vlog)),
 		true, // enable versioning
@@ -1858,14 +1882,14 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut items1 = Vec::new();
 		let mut items2 = Vec::new();
 
-		// Table 1: Multiple Replace operations
-		let key1 = create_internal_key("test_key", 100, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key", b"replace_value1");
-		items1.push((key1, value1));
-
+		// Table 1: Multiple Replace operations (higher seq first for same user key)
 		let key2 = create_internal_key("test_key", 200, InternalKeyKind::Replace);
 		let value2 = create_vlog_value(&vlog, b"test_key", b"replace_value2");
 		items1.push((key2, value2));
+
+		let key1 = create_internal_key("test_key", 100, InternalKeyKind::Replace);
+		let value1 = create_vlog_value(&vlog, b"test_key", b"replace_value1");
+		items1.push((key1, value1));
 
 		// Table 2: Another Replace operation (latest)
 		let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
@@ -1873,12 +1897,13 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items2.push((key3, value3));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
 
 		// Test non-bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -1912,14 +1937,14 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut items1 = Vec::new();
 		let mut items2 = Vec::new();
 
-		// Table 1: Multiple Replace operations
-		let key1 = create_internal_key("test_key2", 400, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key2", b"replace_value4");
-		items1.push((key1, value1));
-
+		// Table 1: Multiple Replace operations (higher seq first for same user key)
 		let key2 = create_internal_key("test_key2", 500, InternalKeyKind::Replace);
 		let value2 = create_vlog_value(&vlog, b"test_key2", b"replace_value5");
 		items1.push((key2, value2));
+
+		let key1 = create_internal_key("test_key2", 400, InternalKeyKind::Replace);
+		let value1 = create_vlog_value(&vlog, b"test_key2", b"replace_value4");
+		items1.push((key1, value1));
 
 		// Table 2: Another Replace operation (latest)
 		let key3 = create_internal_key("test_key2", 600, InternalKeyKind::Replace);
@@ -1927,12 +1952,13 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items2.push((key3, value3));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
 
 		// Test bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -1966,18 +1992,18 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut items1 = Vec::new();
 		let mut items2 = Vec::new();
 
-		// Table 1: Multiple regular SET operations
-		let key1 = create_internal_key("test_key3", 700, InternalKeyKind::Set);
-		let value1 = create_vlog_value(&vlog, b"test_key3", b"set_value1");
-		items1.push((key1, value1));
+		// Table 1: Multiple regular SET operations (higher seq first for same user key)
+		let key3 = create_internal_key("test_key3", 850, InternalKeyKind::Set);
+		let value3 = create_vlog_value(&vlog, b"test_key3", b"set_value3");
+		items1.push((key3, value3));
 
 		let key2 = create_internal_key("test_key3", 800, InternalKeyKind::Set);
 		let value2 = create_vlog_value(&vlog, b"test_key3", b"set_value2");
 		items1.push((key2, value2));
 
-		let key3 = create_internal_key("test_key3", 850, InternalKeyKind::Set);
-		let value3 = create_vlog_value(&vlog, b"test_key3", b"set_value3");
-		items1.push((key3, value3));
+		let key1 = create_internal_key("test_key3", 700, InternalKeyKind::Set);
+		let value1 = create_vlog_value(&vlog, b"test_key3", b"set_value1");
+		items1.push((key1, value1));
 
 		// Table 2: Replace operation (latest)
 		let key4 = create_internal_key("test_key3", 900, InternalKeyKind::Replace);
@@ -1985,12 +2011,13 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items2.push((key4, value4));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
 
 		// Test compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2044,12 +2071,13 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items2.push((key4, value4));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
 
 		// Test compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2097,14 +2125,14 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut items2 = Vec::new();
 		let mut items3 = Vec::new();
 
-		// Table 1: Multiple regular SET operations
-		let key1 = create_internal_key("test_key4", 1400, InternalKeyKind::Set);
-		let value1 = create_vlog_value(&vlog, b"test_key4", b"set_value1");
-		items1.push((key1, value1));
-
+		// Table 1: Multiple regular SET operations (higher seq first for same user key)
 		let key2 = create_internal_key("test_key4", 1500, InternalKeyKind::Set);
 		let value2 = create_vlog_value(&vlog, b"test_key4", b"set_value2");
 		items1.push((key2, value2));
+
+		let key1 = create_internal_key("test_key4", 1400, InternalKeyKind::Set);
+		let value1 = create_vlog_value(&vlog, b"test_key4", b"set_value1");
+		items1.push((key1, value1));
 
 		// Table 2: Replace operation
 		let key3 = create_internal_key("test_key4", 1600, InternalKeyKind::Replace);
@@ -2117,13 +2145,14 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items3.push((key4, value4));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
-		let iter3 = Box::new(MockIterator::new(items3));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
+		let iter3 = build_table_iterator(items3);
 
 		// Test compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2, iter3],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2170,12 +2199,13 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items2.push((key2, value2));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
 
 		// Test non-bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2220,12 +2250,13 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items2.push((key2, value2));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
 
 		// Test bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2257,14 +2288,14 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut items2 = Vec::new();
 		let mut items3 = Vec::new();
 
-		// Table 1: Multiple Replace operations
-		let key1 = create_internal_key("test_key7", 2200, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key7", b"replace_value1");
-		items1.push((key1, value1));
-
+		// Table 1: Multiple Replace operations (higher seq first for same user key)
 		let key2 = create_internal_key("test_key7", 2300, InternalKeyKind::Replace);
 		let value2 = create_vlog_value(&vlog, b"test_key7", b"replace_value2");
 		items1.push((key2, value2));
+
+		let key1 = create_internal_key("test_key7", 2200, InternalKeyKind::Replace);
+		let value1 = create_vlog_value(&vlog, b"test_key7", b"replace_value1");
+		items1.push((key1, value1));
 
 		// Table 2: Another Replace operation
 		let key3 = create_internal_key("test_key7", 2400, InternalKeyKind::Replace);
@@ -2277,13 +2308,14 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items3.push((key4, value4));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
-		let iter3 = Box::new(MockIterator::new(items3));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
+		let iter3 = build_table_iterator(items3);
 
 		// Test non-bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2, iter3],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			true, // enable versioning
@@ -2319,14 +2351,14 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut items1 = Vec::new();
 		let mut items2 = Vec::new();
 
-		// Table 1: Multiple Replace operations
-		let key1 = create_internal_key("test_key8", 2600, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key8", b"replace_value1");
-		items1.push((key1, value1));
-
+		// Table 1: Multiple Replace operations (higher seq first for same user key)
 		let key2 = create_internal_key("test_key8", 2700, InternalKeyKind::Replace);
 		let value2 = create_vlog_value(&vlog, b"test_key8", b"replace_value2");
 		items1.push((key2, value2));
+
+		let key1 = create_internal_key("test_key8", 2600, InternalKeyKind::Replace);
+		let value1 = create_vlog_value(&vlog, b"test_key8", b"replace_value1");
+		items1.push((key1, value1));
 
 		// Table 2: Another Replace operation (latest)
 		let key3 = create_internal_key("test_key8", 2800, InternalKeyKind::Replace);
@@ -2334,12 +2366,13 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items2.push((key3, value3));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
 
 		// Test compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
@@ -2390,13 +2423,14 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items3.push((key3, value3));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
-		let iter3 = Box::new(MockIterator::new(items3));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
+		let iter3 = build_table_iterator(items3);
 
 		// Test compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2, iter3],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
@@ -2442,12 +2476,13 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items2.push((key2, value2));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
 
 		// Test non-bottom level compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			false, // non-bottom level
 			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
@@ -2492,12 +2527,13 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		items2.push((key2, value2));
 
 		// Create iterators
-		let iter1 = Box::new(MockIterator::new(items1));
-		let iter2 = Box::new(MockIterator::new(items2));
+		let iter1 = build_table_iterator(items1);
+		let iter2 = build_table_iterator(items2);
 
 		// Test bottom level compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
+			create_comparator(),
 			true, // bottom level
 			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
@@ -2521,4 +2557,184 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Note: Delete at bottom level doesn't get marked as stale since
 		// it's not returned
 	}
+}
+
+// =============================================================================
+// MergingIterator Direction Switching Tests
+// =============================================================================
+
+/// Test that direction switching correctly handles duplicate keys across levels.
+///
+/// This test verifies the fix for a bug where switching from forward to backward
+/// iteration could skip entries when multiple levels have the same user key.
+///
+/// Scenario:
+/// - Child 0 (level 0, newer): keys [1, 3(seq=200), 5]
+/// - Child 1 (level 1, older): keys [2, 3(seq=100), 6]
+///
+/// In internal key ordering, higher seq comes first (smaller), so:
+/// Forward iteration: key-1, key-2, key-3(seq=200), key-3(seq=100), key-5, key-6
+/// When at key-3(seq=100) and calling prev(), we should get key-3(seq=200), NOT key-2.
+#[test]
+fn test_merging_iterator_direction_switch_with_duplicate_keys() {
+	// Create two child iterators with overlapping key "3"
+	// Child 0 (level 0, newer): key-3 with seq=200
+	// Child 1 (level 1, older): key-3 with seq=100
+	// Higher seq = smaller internal key = comes first in forward iteration
+
+	let iter0 = build_table_iterator(vec![
+		(create_internal_key("key-1", 100, InternalKeyKind::Set), Value::from(b"v1".to_vec())),
+		(create_internal_key("key-3", 200, InternalKeyKind::Set), Value::from(b"v3-L0".to_vec())),
+		(create_internal_key("key-5", 100, InternalKeyKind::Set), Value::from(b"v5".to_vec())),
+	]);
+
+	let iter1 = build_table_iterator(vec![
+		(create_internal_key("key-2", 100, InternalKeyKind::Set), Value::from(b"v2".to_vec())),
+		(create_internal_key("key-3", 100, InternalKeyKind::Set), Value::from(b"v3-L1".to_vec())),
+		(create_internal_key("key-6", 100, InternalKeyKind::Set), Value::from(b"v6".to_vec())),
+	]);
+
+	let cmp = create_comparator();
+	let mut merge_iter = MergingIterator::new(vec![iter0, iter1], cmp);
+
+	// Forward iteration to key-3(seq=100)
+	// Expected sequence: key-1, key-2, key-3(seq=200), key-3(seq=100)
+	assert!(merge_iter.seek_first().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-1");
+
+	assert!(merge_iter.next().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-2");
+
+	assert!(merge_iter.next().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 200); // Higher seq comes first
+
+	assert!(merge_iter.next().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 100); // Lower seq comes second
+
+	// Now we're at key-3(seq=100). Call prev().
+	// BUG (before fix): This would return key-2, skipping key-3(seq=200)
+	// EXPECTED (after fix): This should return key-3(seq=200)
+	assert!(merge_iter.prev().unwrap());
+	assert_eq!(
+		String::from_utf8_lossy(merge_iter.current_key().user_key()),
+		"key-3",
+		"After prev() from key-3(seq=100), should be at key-3(seq=200), not key-2"
+	);
+	assert_eq!(merge_iter.current_key().seq_num(), 200);
+
+	// Continue prev() to verify we get key-2 next
+	assert!(merge_iter.prev().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-2");
+
+	// And then key-1
+	assert!(merge_iter.prev().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-1");
+
+	// No more keys
+	assert!(!merge_iter.prev().unwrap());
+}
+
+/// Test direction switching from backward to forward with duplicate keys.
+///
+/// In internal key ordering, higher seq = smaller key, so:
+/// Forward order:  key-1, key-2, key-3(seq=200), key-3(seq=100), key-5, key-6
+/// Backward order: key-6, key-5, key-3(seq=100), key-3(seq=200), key-2, key-1
+#[test]
+fn test_merging_iterator_direction_switch_backward_to_forward() {
+	// Create two child iterators with overlapping key "3"
+	// Child 0 (level 0, newer): key-3 with seq=200
+	// Child 1 (level 1, older): key-3 with seq=100
+
+	let iter0 = build_table_iterator(vec![
+		(create_internal_key("key-1", 100, InternalKeyKind::Set), Value::from(b"v1".to_vec())),
+		(create_internal_key("key-3", 200, InternalKeyKind::Set), Value::from(b"v3-L0".to_vec())),
+		(create_internal_key("key-5", 100, InternalKeyKind::Set), Value::from(b"v5".to_vec())),
+	]);
+
+	let iter1 = build_table_iterator(vec![
+		(create_internal_key("key-2", 100, InternalKeyKind::Set), Value::from(b"v2".to_vec())),
+		(create_internal_key("key-3", 100, InternalKeyKind::Set), Value::from(b"v3-L1".to_vec())),
+		(create_internal_key("key-6", 100, InternalKeyKind::Set), Value::from(b"v6".to_vec())),
+	]);
+
+	let cmp = create_comparator();
+	let mut merge_iter = MergingIterator::new(vec![iter0, iter1], cmp);
+
+	// Start with backward iteration from the end
+	// Backward order: key-6, key-5, key-3(seq=100), key-3(seq=200), key-2, key-1
+	assert!(merge_iter.seek_last().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-6");
+
+	assert!(merge_iter.prev().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-5");
+
+	assert!(merge_iter.prev().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 100); // Lower seq comes first in backward
+
+	// Now we're at key-3(seq=100). Call next() to switch direction.
+	// In forward order, key-3(seq=100) is followed by key-5.
+	// EXPECTED: Should return key-5
+	assert!(merge_iter.next().unwrap());
+	assert_eq!(
+		String::from_utf8_lossy(merge_iter.current_key().user_key()),
+		"key-5",
+		"After next() from key-3(seq=100), should be at key-5"
+	);
+
+	// And then key-6
+	assert!(merge_iter.next().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-6");
+
+	// No more keys
+	assert!(!merge_iter.next().unwrap());
+}
+
+/// Test multiple direction switches with duplicate keys.
+///
+/// Uses different sequence numbers for realistic scenario:
+/// - key-3(seq=200) from L0 (newer)
+/// - key-3(seq=100) from L1 (older)
+#[test]
+fn test_merging_iterator_multiple_direction_switches() {
+	let iter0 = build_table_iterator(vec![
+		(create_internal_key("key-1", 100, InternalKeyKind::Set), Value::from(b"v1".to_vec())),
+		(create_internal_key("key-3", 200, InternalKeyKind::Set), Value::from(b"v3-L0".to_vec())),
+	]);
+
+	let iter1 = build_table_iterator(vec![
+		(create_internal_key("key-2", 100, InternalKeyKind::Set), Value::from(b"v2".to_vec())),
+		(create_internal_key("key-3", 100, InternalKeyKind::Set), Value::from(b"v3-L1".to_vec())),
+	]);
+
+	let cmp = create_comparator();
+	let mut merge_iter = MergingIterator::new(vec![iter0, iter1], cmp);
+
+	// Forward to key-3(seq=200)
+	assert!(merge_iter.seek_first().unwrap()); // key-1
+	assert!(merge_iter.next().unwrap()); // key-2
+	assert!(merge_iter.next().unwrap()); // key-3(seq=200)
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 200);
+
+	// Switch to backward
+	assert!(merge_iter.prev().unwrap()); // Should be key-2
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-2");
+
+	// Switch back to forward
+	assert!(merge_iter.next().unwrap()); // Should be key-3(seq=200)
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 200);
+
+	// Continue forward
+	assert!(merge_iter.next().unwrap()); // Should be key-3(seq=100)
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 100);
+
+	// Switch to backward again
+	assert!(merge_iter.prev().unwrap()); // Should be key-3(seq=200)
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 200);
 }

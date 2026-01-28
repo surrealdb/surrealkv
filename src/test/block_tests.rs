@@ -4,8 +4,7 @@ use std::vec;
 use test_log::test;
 
 use crate::sstable::block::{Block, BlockWriter};
-use crate::sstable::{InternalKey, InternalKeyKind};
-use crate::Options;
+use crate::{InternalIterator, InternalKey, InternalKeyKind, Options};
 
 fn generate_data() -> Vec<(&'static [u8], &'static [u8])> {
 	vec![
@@ -43,8 +42,7 @@ fn test_block_empty() {
 	assert_eq!(blockc.len(), 8);
 	assert_eq!(blockc.as_slice(), &[0, 0, 0, 0, 1, 0, 0, 0]);
 
-	let mut block_iter =
-		Block::new(blockc, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+	let mut block_iter = Block::new(blockc, Arc::clone(&o.internal_comparator)).iter().unwrap();
 
 	let mut i = 0;
 	while block_iter.advance().unwrap() {
@@ -71,11 +69,11 @@ fn test_block_iter() {
 	let block_contents = builder.finish().unwrap();
 
 	let mut block_iter =
-		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
 
 	let mut i = 0;
 	while block_iter.advance().unwrap() {
-		assert_eq!(block_iter.key().user_key.as_slice(), data[i].0);
+		assert_eq!(block_iter.key().user_key(), data[i].0);
 		assert_eq!(block_iter.value(), data[i].1.to_vec());
 		i += 1;
 	}
@@ -98,27 +96,40 @@ fn test_block_iter_reverse() {
 	}
 
 	let block_contents = builder.finish().unwrap();
-	let mut iter =
-		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+	let mut iter = Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
+	iter.seek_to_first().unwrap();
 
-	iter.next().unwrap().unwrap();
-	assert_eq!(iter.key().user_key.as_slice(), "key1".as_bytes());
+	// After seek_to_first, we're at first entry (key1)
+	assert_eq!(iter.key().user_key(), "key1".as_bytes());
 	assert_eq!(iter.value(), b"value1".to_vec());
 
-	iter.next().unwrap().unwrap();
+	// Advance to second entry (loooongkey1)
+	iter.next().unwrap();
 	assert!(iter.valid());
+	assert_eq!(iter.key().user_key(), "loooongkey1".as_bytes());
+	assert_eq!(iter.value(), b"value2".to_vec());
 
+	// Advance to third entry (medium_key2)
+	iter.next().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key().user_key(), "medium_key2".as_bytes());
+
+	// Go back to second entry (loooongkey1)
 	iter.prev().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_slice(), "key1".as_bytes());
-	assert_eq!(iter.value(), b"value1".to_vec());
+	assert_eq!(iter.key().user_key(), "loooongkey1".as_bytes());
+	assert_eq!(iter.value(), b"value2".to_vec());
 
-	// Go to the last entry
-	while iter.advance().unwrap() {}
+	// Go to the last entry using seek_to_last
+	iter.seek_to_last().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key().user_key(), "pkey3".as_bytes());
+	assert_eq!(iter.value(), b"value".to_vec());
 
+	// Move to second-to-last entry (pkey2)
 	iter.prev().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key.as_slice(), "pkey2".as_bytes());
+	assert_eq!(iter.key().user_key(), "pkey2".as_bytes());
 	assert_eq!(iter.value(), b"value".to_vec());
 }
 
@@ -139,38 +150,38 @@ fn test_block_seek() {
 	let block_contents = builder.finish().unwrap();
 
 	let mut block_iter =
-		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
 
 	let key = InternalKey::new(b"pkey2".to_vec(), 1, InternalKeyKind::Set, 0);
 	block_iter.seek(&key.encode()).unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
-		Some((block_iter.key().user_key, block_iter.value(),)),
-		Some(("pkey2".as_bytes().to_vec(), "value".as_bytes().to_vec()))
+		Some((block_iter.key().user_key(), block_iter.value(),)),
+		Some(("pkey2".as_bytes().as_ref(), "value".as_bytes().as_ref()))
 	);
 
 	let key = InternalKey::new(b"pkey0".to_vec(), 1, InternalKeyKind::Set, 0);
 	block_iter.seek(&key.encode()).unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
-		Some((block_iter.key().user_key, block_iter.value(),)),
-		Some(("pkey1".as_bytes().to_vec(), "value".as_bytes().to_vec()))
+		Some((block_iter.key().user_key(), block_iter.value(),)),
+		Some(("pkey1".as_bytes().as_ref(), "value".as_bytes().as_ref()))
 	);
 
 	let key = InternalKey::new(b"key1".to_vec(), 1, InternalKeyKind::Set, 0);
 	block_iter.seek(&key.encode()).unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
-		Some((block_iter.key().user_key, block_iter.value(),)),
-		Some(("key1".as_bytes().to_vec(), "value1".as_bytes().to_vec()))
+		Some((block_iter.key().user_key(), block_iter.value(),)),
+		Some(("key1".as_bytes().as_ref(), "value1".as_bytes().as_ref()))
 	);
 
 	let key = InternalKey::new(b"pkey3".to_vec(), 1, InternalKeyKind::Set, 0);
 	block_iter.seek(&key.encode()).unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
-		Some((block_iter.key().user_key, block_iter.value(),)),
-		Some(("pkey3".as_bytes().to_vec(), "value".as_bytes().to_vec()))
+		Some((block_iter.key().user_key(), block_iter.value(),)),
+		Some(("pkey3".as_bytes().as_ref(), "value".as_bytes().as_ref()))
 	);
 
 	let key = InternalKey::new(b"pkey8".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -197,26 +208,26 @@ fn test_block_seek_to_last() {
 		let block_contents = builder.finish().unwrap();
 
 		let mut block_iter =
-			Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+			Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
 
 		block_iter.seek_to_last().unwrap();
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "pkey3".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "pkey3".as_bytes());
 		assert_eq!(block_iter.value(), b"value".to_vec());
 
 		block_iter.seek_to_first().unwrap();
 		assert!(block_iter.valid());
-		assert_eq!(block_iter.key().user_key.as_slice(), "key1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 		assert_eq!(block_iter.value(), b"value1".to_vec());
 
-		block_iter.next().unwrap().unwrap();
+		block_iter.next().unwrap();
 		assert!(block_iter.valid());
-		block_iter.next().unwrap().unwrap();
+		block_iter.next().unwrap();
 		assert!(block_iter.valid());
-		block_iter.next().unwrap().unwrap();
+		block_iter.next().unwrap();
 		assert!(block_iter.valid());
 
-		assert_eq!(block_iter.key().user_key.as_slice(), "pkey1".as_bytes());
+		assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 		assert_eq!(block_iter.value(), b"value".to_vec());
 	}
 }
@@ -238,37 +249,37 @@ fn test_block_prev() {
 
 	let block_contents = builder.finish().unwrap();
 	let mut block_iter =
-		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
 
 	// Test prev() from the end
 	block_iter.seek_to_last().unwrap();
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "pkey3".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "pkey3".as_bytes());
 
 	// Go backward one step
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "pkey2".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "pkey2".as_bytes());
 
 	// Go backward another step
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "pkey1".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 
 	// Go backward one more step
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "medium_key2".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "medium_key2".as_bytes());
 
 	// Go backward to the beginning
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "loooongkey1".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "loooongkey1".as_bytes());
 
 	// Go backward to the first key
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "key1".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 	// Try to go past the beginning
 	assert!(!block_iter.prev().unwrap());
@@ -293,24 +304,25 @@ fn test_block_double_ended_iteration() {
 	let block_contents = builder.finish().unwrap();
 
 	// Test forward iteration with next()
-	let forward_iter =
-		Block::new(block_contents.clone(), Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+	let mut forward_iter =
+		Block::new(block_contents.clone(), Arc::clone(&o.internal_comparator)).iter().unwrap();
+	forward_iter.seek_to_first().unwrap();
 	let mut forward_keys = Vec::new();
-	for item in forward_iter {
-		let (key, _) = item.unwrap();
-		let internal_key = InternalKey::decode(&key);
-		forward_keys.push(String::from_utf8(internal_key.user_key.clone()).unwrap());
+	while forward_iter.valid() {
+		let key = forward_iter.key().to_owned().user_key.clone();
+		forward_keys.push(String::from_utf8(key.to_vec()).unwrap());
+		forward_iter.next().unwrap();
 	}
 	assert_eq!(forward_keys, vec!["key1", "loooongkey1", "medium_key2", "pkey1", "pkey2", "pkey3"]);
 
 	// Test backward iteration using prev()
 	let mut backward_iter =
-		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
 	backward_iter.seek_to_last().unwrap();
 	let mut backward_keys = Vec::new();
 	while backward_iter.valid() {
-		let key = backward_iter.key().user_key.clone();
-		backward_keys.push(String::from_utf8(key.clone()).unwrap());
+		let key = backward_iter.key().user_key();
+		backward_keys.push(String::from_utf8(key.to_vec()).unwrap());
 		if !backward_iter.prev().unwrap() {
 			break;
 		}
@@ -341,26 +353,26 @@ fn test_block_prev_from_middle() {
 
 	let block_contents = builder.finish().unwrap();
 	let mut block_iter =
-		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
 
 	// Seek to "pkey1"
 	let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
 	block_iter.seek(&seek_key.encode()).unwrap();
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "pkey1".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 
 	// Go backward from here
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "medium_key2".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "medium_key2".as_bytes());
 
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "loooongkey1".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "loooongkey1".as_bytes());
 
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "key1".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 	// Can't go further back
 	assert!(!block_iter.prev().unwrap());
@@ -384,26 +396,26 @@ fn test_block_mixed_next_prev() {
 
 	let block_contents = builder.finish().unwrap();
 	let mut block_iter =
-		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
 
 	// Position at "pkey1"
 	let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
 	block_iter.seek(&seek_key.encode()).unwrap();
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "pkey1".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 
 	// Go backward
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "medium_key2".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "medium_key2".as_bytes());
 
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "loooongkey1".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "loooongkey1".as_bytes());
 
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "key1".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 	// Can't go further
 	assert!(!block_iter.prev().unwrap());
@@ -427,7 +439,7 @@ fn test_block_prev_edge_cases() {
 
 	let block_contents = builder.finish().unwrap();
 	let mut block_iter =
-		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
 
 	// Test prev() on empty block (shouldn't happen but let's test robustness)
 	let empty_block = BlockWriter::new(
@@ -438,14 +450,14 @@ fn test_block_prev_edge_cases() {
 	.finish()
 	.unwrap();
 	let mut empty_iter =
-		Block::new(empty_block, Arc::clone(&o.internal_comparator)).iter(false).unwrap();
+		Block::new(empty_block, Arc::clone(&o.internal_comparator)).iter().unwrap();
 	assert!(!empty_iter.prev().unwrap());
 	assert!(!empty_iter.valid());
 
 	// Test prev() when at first entry
 	block_iter.seek_to_first().unwrap();
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "key1".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 	assert!(!block_iter.prev().unwrap()); // Can't go before first
 	assert!(!block_iter.valid());
@@ -453,12 +465,12 @@ fn test_block_prev_edge_cases() {
 	// Test prev() after seek_to_last()
 	block_iter.seek_to_last().unwrap();
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "pkey3".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "pkey3".as_bytes());
 
 	// Should be able to go backward
 	assert!(block_iter.prev().unwrap());
 	assert!(block_iter.valid());
-	assert_eq!(block_iter.key().user_key.as_slice(), "pkey2".as_bytes());
+	assert_eq!(block_iter.key().user_key(), "pkey2".as_bytes());
 }
 
 #[test]
@@ -482,7 +494,7 @@ fn test_block_seek_key_not_found_past_end() {
 	}
 
 	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
-	let mut iter = block.iter(false).unwrap();
+	let mut iter = block.iter().unwrap();
 
 	// Seek for a key that is greater than all keys
 	let target = InternalKey::new(b"zzz_past_end".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -512,7 +524,7 @@ fn test_block_seek_key_not_found_before_start() {
 	}
 
 	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
-	let mut iter = block.iter(false).unwrap();
+	let mut iter = block.iter().unwrap();
 
 	// Seek for a key that is less than all keys
 	let target = InternalKey::new(b"aaa_before_all".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -520,7 +532,7 @@ fn test_block_seek_key_not_found_before_start() {
 
 	assert!(iter.valid(), "Iterator should be valid");
 	let found_key = iter.key();
-	assert_eq!(found_key.user_key, b"key_00".to_vec(), "Should land on first key");
+	assert_eq!(found_key.user_key(), b"key_00".to_vec(), "Should land on first key");
 }
 
 #[test]
@@ -543,7 +555,7 @@ fn test_block_seek_exact_match() {
 	}
 
 	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
-	let mut iter = block.iter(false).unwrap();
+	let mut iter = block.iter().unwrap();
 
 	// Seek for key_05 which exists
 	let target = InternalKey::new(b"key_05".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -551,7 +563,7 @@ fn test_block_seek_exact_match() {
 
 	assert!(iter.valid());
 	let found_key = iter.key();
-	assert_eq!(found_key.user_key, b"key_05".to_vec());
+	assert_eq!(found_key.user_key(), b"key_05".to_vec());
 }
 
 #[test]
@@ -570,7 +582,7 @@ fn test_block_seek_between_keys() {
 	builder.add(&make_internal_key(b"grape", InternalKeyKind::Set), b"v3").unwrap();
 
 	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
-	let mut iter = block.iter(false).unwrap();
+	let mut iter = block.iter().unwrap();
 
 	// Seek for "banana" which is between "apple" and "cherry"
 	let target = InternalKey::new(b"banana".to_vec(), 1, InternalKeyKind::Set, 0);
@@ -579,7 +591,7 @@ fn test_block_seek_between_keys() {
 	assert!(iter.valid());
 	let found_key = iter.key();
 	assert_eq!(
-		found_key.user_key,
+		found_key.user_key(),
 		b"cherry".to_vec(),
 		"Should land on 'cherry' which is first key >= 'banana'"
 	);
@@ -607,12 +619,12 @@ fn test_block_seek_same_user_key_different_seq_nums() {
 	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
 
 	// Test 1: Seek for seq=80, should find seq=75 (first key >= (foo, 80))
-	let mut iter = block.iter(false).unwrap();
+	let mut iter = block.iter().unwrap();
 	let target = InternalKey::new(b"foo".to_vec(), 80, InternalKeyKind::Set, 0);
 	iter.seek(&target.encode()).unwrap();
 	assert!(iter.valid());
 	let found = iter.key();
-	assert_eq!(found.user_key, b"foo".to_vec());
+	assert_eq!(found.user_key(), b"foo".to_vec());
 	assert_eq!(
 		found.seq_num(),
 		75,
@@ -644,18 +656,18 @@ fn test_block_single_restart_point() {
 	builder.add(&make_internal_key(b"only_key", InternalKeyKind::Set), b"only_value").unwrap();
 
 	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
-	let mut iter = block.iter(false).unwrap();
+	let mut iter = block.iter().unwrap();
 
 	// Seek for the exact key
 	let target = InternalKey::new(b"only_key".to_vec(), 1, InternalKeyKind::Set, 0);
 	iter.seek(&target.encode()).unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key, b"only_key".to_vec());
+	assert_eq!(iter.key().user_key(), b"only_key".to_vec());
 
 	// Seek for key before
 	iter.seek(&InternalKey::new(b"aaa".to_vec(), 1, InternalKeyKind::Set, 0).encode()).unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key().user_key, b"only_key".to_vec());
+	assert_eq!(iter.key().user_key(), b"only_key".to_vec());
 
 	// Seek for key after
 	iter.seek(&InternalKey::new(b"zzz".to_vec(), 1, InternalKeyKind::Set, 0).encode()).unwrap();
@@ -679,7 +691,7 @@ fn test_block_seek_at_restart_point_boundaries() {
 	}
 
 	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
-	let mut iter = block.iter(false).unwrap();
+	let mut iter = block.iter().unwrap();
 
 	// Seek for each restart point key
 	for i in [0, 2, 4] {
@@ -687,7 +699,7 @@ fn test_block_seek_at_restart_point_boundaries() {
 		let target = InternalKey::new(target_key.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
 		iter.seek(&target.encode()).unwrap();
 		assert!(iter.valid(), "Should find key at restart point {}", i);
-		assert_eq!(iter.key().user_key, target_key.as_bytes().to_vec());
+		assert_eq!(iter.key().user_key(), target_key.as_bytes().to_vec());
 	}
 }
 
@@ -711,7 +723,7 @@ fn test_block_iterator_valid_after_exhaustion() {
 	}
 
 	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
-	let mut iter = block.iter(false).unwrap();
+	let mut iter = block.iter().unwrap();
 
 	iter.seek_to_first().unwrap();
 	let mut count = 0;
@@ -735,7 +747,7 @@ fn test_seek_to_last_empty_block() {
 
 	// Create empty block (just restart points, no entries)
 	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
-	let mut iter = block.iter(false).unwrap();
+	let mut iter = block.iter().unwrap();
 
 	iter.seek_to_last().unwrap();
 
@@ -760,13 +772,13 @@ fn test_prev_at_first_entry() {
 	}
 
 	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
-	let mut iter = block.iter(false).unwrap();
+	let mut iter = block.iter().unwrap();
 
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
 
 	let first_key = iter.key();
-	assert_eq!(first_key.user_key, b"key_00".to_vec());
+	assert_eq!(first_key.user_key(), b"key_00".to_vec());
 
 	// prev() at first entry should return false
 	let result = iter.prev().unwrap();

@@ -1,13 +1,11 @@
 use std::fs::File;
 use std::io::Write as IoWrite;
 use std::path::Path;
-use std::sync::Arc;
 
 use tempdir::TempDir;
 use test_log::test;
 
 use crate::batch::Batch;
-use crate::memtable::MemTable;
 use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
@@ -23,6 +21,7 @@ use crate::wal::{
 	RecordType,
 	SegmentRef,
 };
+use crate::InternalIterator;
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -145,15 +144,21 @@ fn test_wal_replay_all_segments() {
 	let segment_ids = list_segment_ids(temp_dir.path(), Some("wal")).unwrap();
 	assert!(segment_ids.len() >= 3, "Expected at least 3 segments, got {}", segment_ids.len());
 
-	// Create a memtable for recovery
-	let memtable = Arc::new(MemTable::default());
-
 	// Replay WAL - should replay all segments
-	let sequence_number_opt = replay_wal(temp_dir.path(), &memtable, 0).unwrap();
+	let arena_size = 1024 * 1024; // 1MB for tests
+	let (sequence_number_opt, memtables) = replay_wal(temp_dir.path(), 0, arena_size).unwrap();
+
 	let sequence_number = sequence_number_opt.unwrap_or(0);
 
-	// Count actual entries in memtable
-	let entry_count = memtable.iter(false).count();
+	// Count actual entries across ALL returned memtables
+	let mut entry_count = 0;
+	for (memtable, _) in memtables {
+		let mut iter = memtable.iter();
+		while iter.valid() {
+			entry_count += 1;
+			iter.next().unwrap();
+		}
+	}
 
 	// Verify sequence number is from the latest segment (304 = 300 + 4)
 	assert_eq!(sequence_number, 304, "Expected max sequence number from all segments");

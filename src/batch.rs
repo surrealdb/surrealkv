@@ -1,9 +1,8 @@
 use integer_encoding::{VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
-use crate::sstable::InternalKeyKind;
 use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
-use crate::{Key, Value};
+use crate::{InternalKeyKind, Key, Value};
 
 pub(crate) const MAX_BATCH_SIZE: u64 = 1 << 32;
 pub(crate) const BATCH_VERSION: u8 = 1;
