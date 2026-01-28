@@ -280,7 +280,6 @@ impl MemTable {
 	}
 }
 
-/// Thin wrapper around SkiplistIterator for keys_only optimization
 pub(crate) struct MemTableIterator<'a> {
 	iter: SkiplistIterator<'a>,
 }
