@@ -18,9 +18,6 @@ pub type BoxedInternalIterator<'a> = Box<dyn InternalIterator + 'a>;
 // ============================================================================
 //
 // A binary heap is a complete binary tree stored in a flat array.
-// We use a custom implementation instead of std::collections::BinaryHeap because:
-//   1. We need custom comparators (not just Ord trait)
-//   2. We need to pass comparator per-operation to avoid self-referential closures
 //
 // ## Array-to-Tree Mapping
 //
