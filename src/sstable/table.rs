@@ -1509,10 +1509,8 @@ impl<'a> TableIterator<'a> {
 
 	/// Seeks to the last entry within bounds.
 	///
-	/// ## SeekForPrev Semantics
-	///
 	/// Unlike seek_to_first (which finds first key >= target), seek_to_last
-	/// implements "SeekForPrev" semantics: find the last key <= target.
+	/// find the last key <= target.
 	///
 	/// ## Bound Handling
 	///

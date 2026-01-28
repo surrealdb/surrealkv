@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tempfile::TempDir;
@@ -5,7 +6,9 @@ use test_log::test;
 
 use crate::clock::{LogicalClock, MockLogicalClock};
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
-use crate::iter::CompactionIterator;
+use crate::iter::{BoxedInternalIterator, CompactionIterator, MergingIterator};
+use crate::sstable::table::{Table, TableWriter};
+use crate::vfs::File;
 use crate::vlog::{VLog, ValueLocation};
 use crate::{
 	InternalIterator,
@@ -17,6 +20,9 @@ use crate::{
 	VLogChecksumLevel,
 	Value,
 };
+
+/// Global counter for generating unique table IDs in tests
+static TEST_TABLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn create_internal_key(user_key: &str, sequence: u64, kind: InternalKeyKind) -> InternalKey {
 	InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, 0)
@@ -55,7 +61,48 @@ fn create_comparator() -> Arc<InternalKeyComparator> {
 	Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())))
 }
 
+/// Wraps a Vec<u8> as a File for in-memory table reading
+fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
+	Arc::new(src)
+}
+
+/// Entry type for building test tables: (user_key, value, seq_num, kind)
+type TestTableEntry<'a> = (&'a str, &'a [u8], u64, InternalKeyKind);
+
+/// Builds an in-memory SSTable and returns its iterator.
+/// This uses real SSTable seek behavior with InternalKeyComparator.
+///
+/// Unlike MockIterator, this properly handles internal key ordering
+/// where higher sequence numbers come before lower ones for the same user key.
+fn build_table_iterator(entries: Vec<TestTableEntry>) -> BoxedInternalIterator<'static> {
+	let table_id = TEST_TABLE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+
+	let mut buf = Vec::with_capacity(512);
+	let opts = Arc::new(Options::new());
+
+	{
+		let mut writer = TableWriter::new(&mut buf, table_id, Arc::clone(&opts), 0);
+		for (key, value, seq, kind) in entries {
+			let ikey = InternalKey::new(key.as_bytes().to_vec(), seq, kind, 0);
+			writer.add(ikey, value).unwrap();
+		}
+		writer.finish().unwrap();
+	}
+
+	let size = buf.len() as u64;
+	let table = Table::new(table_id, opts, wrap_buffer(buf), size).unwrap();
+
+	// Leak the table to get 'static lifetime (acceptable for tests)
+	let table: &'static Table = Box::leak(Box::new(table));
+	Box::new(table.iter(None).unwrap())
+}
+
 // Creates a mock iterator with predefined entries
+//
+// NOTE: MockIterator uses byte-wise comparison in seek() which does NOT match
+// the InternalKeyComparator behavior. For tests that involve seeking with
+// different sequence numbers for the same user key, use build_table_iterator()
+// instead which uses real SSTable seek behavior.
 struct MockIterator {
 	items: Vec<(InternalKey, Value)>,
 	encoded_keys: Vec<Vec<u8>>, // Store encoded keys to avoid temporary references
@@ -2614,4 +2661,184 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		// Note: Delete at bottom level doesn't get marked as stale since
 		// it's not returned
 	}
+}
+
+// =============================================================================
+// MergingIterator Direction Switching Tests
+// =============================================================================
+
+/// Test that direction switching correctly handles duplicate keys across levels.
+///
+/// This test verifies the fix for a bug where switching from forward to backward
+/// iteration could skip entries when multiple levels have the same user key.
+///
+/// Scenario:
+/// - Child 0 (level 0, newer): keys [1, 3(seq=200), 5]
+/// - Child 1 (level 1, older): keys [2, 3(seq=100), 6]
+///
+/// In internal key ordering, higher seq comes first (smaller), so:
+/// Forward iteration: key-1, key-2, key-3(seq=200), key-3(seq=100), key-5, key-6
+/// When at key-3(seq=100) and calling prev(), we should get key-3(seq=200), NOT key-2.
+#[test]
+fn test_merging_iterator_direction_switch_with_duplicate_keys() {
+	// Create two child iterators with overlapping key "3"
+	// Child 0 (level 0, newer): key-3 with seq=200
+	// Child 1 (level 1, older): key-3 with seq=100
+	// Higher seq = smaller internal key = comes first in forward iteration
+
+	let iter0 = build_table_iterator(vec![
+		("key-1", b"v1", 100, InternalKeyKind::Set),
+		("key-3", b"v3-L0", 200, InternalKeyKind::Set),
+		("key-5", b"v5", 100, InternalKeyKind::Set),
+	]);
+
+	let iter1 = build_table_iterator(vec![
+		("key-2", b"v2", 100, InternalKeyKind::Set),
+		("key-3", b"v3-L1", 100, InternalKeyKind::Set),
+		("key-6", b"v6", 100, InternalKeyKind::Set),
+	]);
+
+	let cmp = create_comparator();
+	let mut merge_iter = MergingIterator::new(vec![iter0, iter1], cmp);
+
+	// Forward iteration to key-3(seq=100)
+	// Expected sequence: key-1, key-2, key-3(seq=200), key-3(seq=100)
+	assert!(merge_iter.seek_first().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-1");
+
+	assert!(merge_iter.next().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-2");
+
+	assert!(merge_iter.next().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 200); // Higher seq comes first
+
+	assert!(merge_iter.next().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 100); // Lower seq comes second
+
+	// Now we're at key-3(seq=100). Call prev().
+	// BUG (before fix): This would return key-2, skipping key-3(seq=200)
+	// EXPECTED (after fix): This should return key-3(seq=200)
+	assert!(merge_iter.prev().unwrap());
+	assert_eq!(
+		String::from_utf8_lossy(merge_iter.current_key().user_key()),
+		"key-3",
+		"After prev() from key-3(seq=100), should be at key-3(seq=200), not key-2"
+	);
+	assert_eq!(merge_iter.current_key().seq_num(), 200);
+
+	// Continue prev() to verify we get key-2 next
+	assert!(merge_iter.prev().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-2");
+
+	// And then key-1
+	assert!(merge_iter.prev().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-1");
+
+	// No more keys
+	assert!(!merge_iter.prev().unwrap());
+}
+
+/// Test direction switching from backward to forward with duplicate keys.
+///
+/// In internal key ordering, higher seq = smaller key, so:
+/// Forward order:  key-1, key-2, key-3(seq=200), key-3(seq=100), key-5, key-6
+/// Backward order: key-6, key-5, key-3(seq=100), key-3(seq=200), key-2, key-1
+#[test]
+fn test_merging_iterator_direction_switch_backward_to_forward() {
+	// Create two child iterators with overlapping key "3"
+	// Child 0 (level 0, newer): key-3 with seq=200
+	// Child 1 (level 1, older): key-3 with seq=100
+
+	let iter0 = build_table_iterator(vec![
+		("key-1", b"v1", 100, InternalKeyKind::Set),
+		("key-3", b"v3-L0", 200, InternalKeyKind::Set),
+		("key-5", b"v5", 100, InternalKeyKind::Set),
+	]);
+
+	let iter1 = build_table_iterator(vec![
+		("key-2", b"v2", 100, InternalKeyKind::Set),
+		("key-3", b"v3-L1", 100, InternalKeyKind::Set),
+		("key-6", b"v6", 100, InternalKeyKind::Set),
+	]);
+
+	let cmp = create_comparator();
+	let mut merge_iter = MergingIterator::new(vec![iter0, iter1], cmp);
+
+	// Start with backward iteration from the end
+	// Backward order: key-6, key-5, key-3(seq=100), key-3(seq=200), key-2, key-1
+	assert!(merge_iter.seek_last().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-6");
+
+	assert!(merge_iter.prev().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-5");
+
+	assert!(merge_iter.prev().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 100); // Lower seq comes first in backward
+
+	// Now we're at key-3(seq=100). Call next() to switch direction.
+	// In forward order, key-3(seq=100) is followed by key-5.
+	// EXPECTED: Should return key-5
+	assert!(merge_iter.next().unwrap());
+	assert_eq!(
+		String::from_utf8_lossy(merge_iter.current_key().user_key()),
+		"key-5",
+		"After next() from key-3(seq=100), should be at key-5"
+	);
+
+	// And then key-6
+	assert!(merge_iter.next().unwrap());
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-6");
+
+	// No more keys
+	assert!(!merge_iter.next().unwrap());
+}
+
+/// Test multiple direction switches with duplicate keys.
+///
+/// Uses different sequence numbers for realistic scenario:
+/// - key-3(seq=200) from L0 (newer)
+/// - key-3(seq=100) from L1 (older)
+#[test]
+fn test_merging_iterator_multiple_direction_switches() {
+	let iter0 = build_table_iterator(vec![
+		("key-1", b"v1", 100, InternalKeyKind::Set),
+		("key-3", b"v3-L0", 200, InternalKeyKind::Set),
+	]);
+
+	let iter1 = build_table_iterator(vec![
+		("key-2", b"v2", 100, InternalKeyKind::Set),
+		("key-3", b"v3-L1", 100, InternalKeyKind::Set),
+	]);
+
+	let cmp = create_comparator();
+	let mut merge_iter = MergingIterator::new(vec![iter0, iter1], cmp);
+
+	// Forward to key-3(seq=200)
+	assert!(merge_iter.seek_first().unwrap()); // key-1
+	assert!(merge_iter.next().unwrap()); // key-2
+	assert!(merge_iter.next().unwrap()); // key-3(seq=200)
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 200);
+
+	// Switch to backward
+	assert!(merge_iter.prev().unwrap()); // Should be key-2
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-2");
+
+	// Switch back to forward
+	assert!(merge_iter.next().unwrap()); // Should be key-3(seq=200)
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 200);
+
+	// Continue forward
+	assert!(merge_iter.next().unwrap()); // Should be key-3(seq=100)
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 100);
+
+	// Switch to backward again
+	assert!(merge_iter.prev().unwrap()); // Should be key-3(seq=200)
+	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
+	assert_eq!(merge_iter.current_key().seq_num(), 200);
 }

@@ -545,7 +545,6 @@ fn test_partitioned_index_seek_correctness() {
 		}
 	}
 
-	// Test SeekForPrev - iterate backwards
 	let mut iter = table.iter(None).unwrap();
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid(), "Iterator should be valid after seek_to_last");

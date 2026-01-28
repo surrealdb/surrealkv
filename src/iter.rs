@@ -364,16 +364,36 @@ impl<'a> MergingIterator<'a> {
 
 	/// Switch from backward to forward, positioning just after `target`.
 	///
-	/// Each iterator seeks to `target`, then advances past it if equal.
+	/// When switching directions, we need to handle duplicate keys correctly.
+	/// The current iterator (heap top) should simply move forward one position.
+	/// Non-current iterators need to be positioned at a key strictly greater than
+	/// `target` to ensure correct ordering.
+	///
+	/// This follows Pebble's approach: for non-current iterators, iterate
+	/// forward until finding a key strictly greater than target.
 	fn switch_to_forward(&mut self, target: &[u8]) -> Result<()> {
+		let current_idx = self.max_heap.as_ref().and_then(|h| h.peek());
+
 		self.direction = Direction::Forward;
 		self.clear_heaps();
 
-		for child in &mut self.children {
-			if child.iter.seek(target)? {
-				if self.cmp.compare(child.iter.key().encoded(), target) == Ordering::Equal {
-					child.iter.next()?;
+		for (idx, child) in self.children.iter_mut().enumerate() {
+			if Some(idx) == current_idx {
+				// Current iterator: just call next() once
+				child.iter.next()?;
+			} else {
+				// Non-current: position at key strictly > target
+				if child.iter.seek(target)? {
+					// Iterate forward until key > target
+					while child.iter.valid()
+						&& self.cmp.compare(child.iter.key().encoded(), target) != Ordering::Greater
+					{
+						if !child.iter.next()? {
+							break;
+						}
+					}
 				}
+				// If seek returned false, iterator is exhausted
 			}
 		}
 		self.rebuild_min_heap();
@@ -382,18 +402,39 @@ impl<'a> MergingIterator<'a> {
 
 	/// Switch from forward to backward, positioning just before `target`.
 	///
-	/// Each iterator seeks to `target`, then moves back one position.
+	/// When switching directions, we need to handle duplicate keys correctly.
+	/// The current iterator (heap top) should simply move back one position.
+	/// Non-current iterators need to be positioned at a key strictly less than
+	/// `target` to ensure correct ordering.
+	///
+	/// This follows Pebble's approach: for non-current iterators, iterate
+	/// backward until finding a key strictly less than target.
 	fn switch_to_backward(&mut self, target: &[u8]) -> Result<()> {
+		let current_idx = self.min_heap.peek();
+
 		self.direction = Direction::Backward;
 		self.init_max_heap();
 		self.clear_heaps();
 
-		for child in &mut self.children {
-			if child.iter.seek(target)? {
+		for (idx, child) in self.children.iter_mut().enumerate() {
+			if Some(idx) == current_idx {
+				// Current iterator: just call prev() once
 				child.iter.prev()?;
 			} else {
-				// Iterator positioned past all keys, go to last
-				child.iter.seek_last()?;
+				// Non-current: position at key strictly < target
+				if child.iter.seek(target)? {
+					// Iterate backward until key < target
+					while child.iter.valid()
+						&& self.cmp.compare(child.iter.key().encoded(), target) != Ordering::Less
+					{
+						if !child.iter.prev()? {
+							break;
+						}
+					}
+				} else {
+					// Iterator positioned past all keys, go to last
+					child.iter.seek_last()?;
+				}
 			}
 		}
 		self.rebuild_max_heap();
