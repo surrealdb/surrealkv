@@ -42,6 +42,8 @@ pub mod sstable_tests;
 #[cfg(test)]
 pub mod transaction_tests;
 #[cfg(test)]
+pub mod versioned_iterator_tests;
+#[cfg(test)]
 pub mod vlog_tests;
 #[cfg(test)]
 pub mod wal_tests;

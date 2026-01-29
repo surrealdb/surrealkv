@@ -1439,12 +1439,6 @@ impl VLogGCManager {
 	}
 }
 
-/// Maximum number of entries per batch when adding to DeleteList.
-/// This ensures batches fit within memtable capacity.
-/// Each entry is ~16 bytes (8 byte key + 8 byte value) plus skiplist overhead (~50-80 bytes).
-/// With 10K entries, batch is ~1MB which safely fits in default 100MB memtable.
-const DELETE_LIST_CHUNK_SIZE: usize = 10_000;
-
 /// Global Delete List using B+ Tree
 /// Uses a dedicated B+ tree for tracking stale user keys.
 /// This provides better performance and consistency with the main LSM tree
@@ -1481,27 +1475,24 @@ impl DeleteList {
 			return Ok(());
 		}
 
-		// Process in chunks to avoid overwhelming memtable
-		for chunk in entries.chunks(DELETE_LIST_CHUNK_SIZE) {
-			let mut batch = Batch::new(0);
+		let mut batch = Batch::new(0);
 
-			for (seq_num, value_size) in chunk {
-				// Convert sequence number to a byte array key
-				let seq_key = seq_num.to_be_bytes().to_vec();
-				// Store sequence number -> value_size mapping
-				batch.add_record(
-					InternalKeyKind::Set,
-					seq_key,
-					Some(value_size.to_be_bytes().to_vec()),
-					0,
-				)?;
-			}
-
-			// Commit the batch to the LSM tree using sync commit
-			self.tree
-				.sync_commit(batch, true)
-				.map_err(|e| Error::Other(format!("Failed to add stale entries: {e}")))?;
+		for (seq_num, value_size) in entries {
+			// Convert sequence number to a byte array key
+			let seq_key = seq_num.to_be_bytes().to_vec();
+			// Store sequence number -> value_size mapping
+			batch.add_record(
+				InternalKeyKind::Set,
+				seq_key,
+				Some(value_size.to_be_bytes().to_vec()),
+				0,
+			)?;
 		}
+
+		// Commit the batch to the LSM tree using sync commit
+		self.tree
+			.sync_commit(batch, true)
+			.map_err(|e| Error::Other(format!("Failed to add stale entries: {e}")))?;
 
 		Ok(())
 	}
@@ -1530,23 +1521,18 @@ impl DeleteList {
 			return Ok(());
 		}
 
-		// Process in chunks to avoid overwhelming memtable
-		for chunk in seq_nums.chunks(DELETE_LIST_CHUNK_SIZE) {
-			let mut batch = Batch::new(0);
+		let mut batch = Batch::new(0);
 
-			for seq_num in chunk {
-				// Convert sequence number to key format
-				let seq_key = seq_num.to_be_bytes().to_vec();
-				batch.add_record(InternalKeyKind::Delete, seq_key, None, 0)?;
-			}
-
-			// Commit the batch to the LSM tree using sync commit
-			self.tree
-				.sync_commit(batch, true)
-				.map_err(|e| Error::Other(format!("Failed to delete from delete list: {e}")))?;
+		for seq_num in seq_nums {
+			// Convert sequence number to key format
+			let seq_key = seq_num.to_be_bytes().to_vec();
+			batch.add_record(InternalKeyKind::Delete, seq_key, None, 0)?;
 		}
 
-		Ok(())
+		// Commit the batch to the LSM tree using sync commit
+		self.tree
+			.sync_commit(batch, true)
+			.map_err(|e| Error::Other(format!("Failed to delete from delete list: {e}")))
 	}
 
 	async fn close(&self) -> Result<()> {
