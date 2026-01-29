@@ -1,0 +1,1239 @@
+//! Tests for the LSM-based versioned iterator functionality.
+//!
+//! These tests verify that `TransactionVersionedIterator` correctly returns
+//! all versions of keys from the LSM tree without relying on the B+tree index.
+
+use tempdir::TempDir;
+use test_log::test;
+
+use crate::transaction::{Mode, TransactionVersionedIterator};
+use crate::{Key, Options, Result, TreeBuilder, Value};
+
+fn create_temp_directory() -> TempDir {
+	TempDir::new("test").unwrap()
+}
+
+/// Create a store with versioning enabled but B+tree index disabled
+fn create_versioned_store_no_index() -> (crate::lsm::Tree, TempDir) {
+	let temp_dir = create_temp_directory();
+	let opts = Options::new()
+		.with_path(temp_dir.path().to_path_buf())
+		.with_versioning(true, 0)
+		.with_versioned_index(false); // Test LSM-based iteration without B+tree
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
+	(tree, temp_dir)
+}
+
+/// Create a store with versioning and B+tree index both enabled
+fn create_versioned_store_with_index() -> (crate::lsm::Tree, TempDir) {
+	let temp_dir = create_temp_directory();
+	let opts = Options::new()
+		.with_path(temp_dir.path().to_path_buf())
+		.with_versioning(true, 0)
+		.with_versioned_index(true);
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
+	(tree, temp_dir)
+}
+
+/// Create a store without versioning enabled
+fn create_store_no_versioning() -> (crate::lsm::Tree, TempDir) {
+	let temp_dir = create_temp_directory();
+	let opts = Options::new().with_path(temp_dir.path().to_path_buf());
+	let tree = TreeBuilder::with_options(opts).build().unwrap();
+	(tree, temp_dir)
+}
+
+/// Collects all entries from a TransactionVersionedIterator
+fn collect_versioned_all(
+	iter: &mut TransactionVersionedIterator,
+) -> Result<Vec<(Key, Value, u64, bool)>> {
+	iter.seek_first()?;
+	let mut result = Vec::new();
+	while iter.valid() {
+		let is_tombstone = iter.is_tombstone();
+		// Tombstones have no value, so use empty vec
+		let value = if is_tombstone {
+			Vec::new()
+		} else {
+			iter.value()?
+		};
+		result.push((iter.key(), value, iter.timestamp(), is_tombstone));
+		iter.next()?;
+	}
+	Ok(result)
+}
+
+/// Collects all entries from a TransactionVersionedIterator in reverse
+fn collect_versioned_reverse(
+	iter: &mut TransactionVersionedIterator,
+) -> Result<Vec<(Key, Value, u64, bool)>> {
+	iter.seek_last()?;
+	let mut result = Vec::new();
+	while iter.valid() {
+		let is_tombstone = iter.is_tombstone();
+		// Tombstones have no value, so use empty vec
+		let value = if is_tombstone {
+			Vec::new()
+		} else {
+			iter.value()?
+		};
+		result.push((iter.key(), value, iter.timestamp(), is_tombstone));
+		if !iter.prev()? {
+			break;
+		}
+	}
+	Ok(result)
+}
+
+// ============================================================================
+// Test 1: Multiple Versions Per Key
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_multiple_versions_single_key() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 three times with different values
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1_v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1_v3", 300).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query versioned range
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// Should have all 3 versions, ordered by seq_num descending (newest first)
+	assert_eq!(results.len(), 3, "Should have 3 versions");
+	assert_eq!(results[0].0, b"key1");
+	assert_eq!(results[0].1, b"value1_v3");
+	assert_eq!(results[0].2, 300); // timestamp
+	assert_eq!(results[1].0, b"key1");
+	assert_eq!(results[1].1, b"value1_v2");
+	assert_eq!(results[1].2, 200);
+	assert_eq!(results[2].0, b"key1");
+	assert_eq!(results[2].1, b"value1_v1");
+	assert_eq!(results[2].2, 100);
+}
+
+// ============================================================================
+// Test 2: Multiple Keys with Multiple Versions
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_multiple_keys_multiple_versions() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 (2 versions)
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"key1_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"key1_v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Insert key2 (1 version)
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key2", b"key2_v1", 150).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Insert key3 (3 versions)
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key3", b"key3_v1", 50).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key3", b"key3_v2", 250).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key3", b"key3_v3", 350).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query all keys
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key0", b"key9").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// Should have 6 total versions
+	assert_eq!(results.len(), 6, "Should have 6 total versions");
+
+	// Verify ordering: grouped by key, newest first within each key
+	// key1 should come first (2 versions)
+	assert_eq!(results[0].0, b"key1");
+	assert_eq!(results[0].1, b"key1_v2");
+	assert_eq!(results[1].0, b"key1");
+	assert_eq!(results[1].1, b"key1_v1");
+
+	// key2 (1 version)
+	assert_eq!(results[2].0, b"key2");
+	assert_eq!(results[2].1, b"key2_v1");
+
+	// key3 (3 versions)
+	assert_eq!(results[3].0, b"key3");
+	assert_eq!(results[3].1, b"key3_v3");
+	assert_eq!(results[4].0, b"key3");
+	assert_eq!(results[4].1, b"key3_v2");
+	assert_eq!(results[5].0, b"key3");
+	assert_eq!(results[5].1, b"key3_v1");
+}
+
+// ============================================================================
+// Test 3: Tombstones - Without Include Tombstones
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_excludes_tombstones() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 v1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Delete key1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.delete(b"key1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Insert key2
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key2", b"value2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with versioned_range (excludes tombstones by default)
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key0", b"key9").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// Should NOT include the tombstone
+	assert_eq!(results.len(), 2, "Should have 2 entries (no tombstone)");
+
+	// Verify no tombstones in results
+	for result in &results {
+		assert!(!result.3, "No entry should be a tombstone");
+	}
+
+	// key1 v1 and key2 should be present
+	assert_eq!(results[0].0, b"key1");
+	assert_eq!(results[0].1, b"value1");
+	assert_eq!(results[1].0, b"key2");
+	assert_eq!(results[1].1, b"value2");
+}
+
+// ============================================================================
+// Test 4: Tombstones - With Include Tombstones
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_with_tombstones() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 v1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Delete key1 (creates tombstone)
+	{
+		let mut tx = store.begin().unwrap();
+		tx.delete(b"key1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Insert key2
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key2", b"value2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with versioned_range_with_tombstones (includes tombstones)
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range_with_tombstones(b"key0", b"key9").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// Should include the tombstone
+	assert_eq!(results.len(), 3, "Should have 3 entries (including tombstone)");
+
+	// First entry should be the tombstone (newest for key1)
+	assert_eq!(results[0].0, b"key1");
+	assert!(results[0].3, "First key1 entry should be a tombstone");
+
+	// Second entry should be key1 v1
+	assert_eq!(results[1].0, b"key1");
+	assert!(!results[1].3, "Second key1 entry should not be a tombstone");
+	assert_eq!(results[1].1, b"value1");
+
+	// Third entry should be key2
+	assert_eq!(results[2].0, b"key2");
+	assert!(!results[2].3, "key2 should not be a tombstone");
+}
+
+// ============================================================================
+// Test 5: Replace Operations
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_replace_shows_all_versions() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1=v1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Replace key1=v2
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Replace key1=v3
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"v3", 300).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query all versions
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// All 3 versions should be visible
+	assert_eq!(results.len(), 3, "All 3 replace operations should be visible");
+	assert_eq!(results[0].1, b"v3");
+	assert_eq!(results[1].1, b"v2");
+	assert_eq!(results[2].1, b"v1");
+}
+
+// ============================================================================
+// Test 6: Soft Delete vs Hard Delete
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_soft_delete_vs_hard_delete() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 v1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Soft delete key1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.soft_delete(b"key1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Insert key2
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key2", b"value2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Hard delete key2
+	{
+		let mut tx = store.begin().unwrap();
+		tx.delete(b"key2").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with tombstones
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range_with_tombstones(b"key0", b"key9").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// Should have: key1 tombstone, key1 v1, key2 tombstone
+	assert_eq!(results.len(), 4, "Should have 4 entries");
+
+	// key1 tombstone and value
+	assert_eq!(results[0].0, b"key1");
+	assert!(results[0].3, "key1 first should be tombstone");
+	assert_eq!(results[1].0, b"key1");
+	assert!(!results[1].3, "key1 second should be value");
+
+	// key2 tombstone and value
+	assert_eq!(results[2].0, b"key2");
+	assert!(results[2].3, "key2 first should be tombstone");
+	assert_eq!(results[3].0, b"key2");
+	assert!(!results[3].3, "key2 second should be value");
+}
+
+// ============================================================================
+// Test 7: Bounds - Inclusive Start, Exclusive End
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_bounds() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert keys a through e
+	for key in [b"key_a", b"key_b", b"key_c", b"key_d", b"key_e"] {
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(key, b"value", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query range [key_b, key_d) - should include key_b and key_c, NOT key_d
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key_b", b"key_d").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 2, "Should have 2 entries");
+	assert_eq!(results[0].0, b"key_b");
+	assert_eq!(results[1].0, b"key_c");
+}
+
+// ============================================================================
+// Test 8: Bounds - Empty Range
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_empty_range() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key_a and key_b
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key_a", b"value_a", 100).unwrap();
+		tx.set_at_version(b"key_b", b"value_b", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query range [key_c, key_d) - no matching keys
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key_c", b"key_d").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	assert!(results.is_empty(), "Should have no entries for empty range");
+}
+
+// ============================================================================
+// Test 9: Bounds - Single Key Match
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_single_key_match() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key_a (2 versions)
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key_a", b"v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key_a", b"v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Insert key_b and key_c
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key_b", b"value_b", 150).unwrap();
+		tx.set_at_version(b"key_c", b"value_c", 150).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query range that only matches key_a
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key_a", b"key_b").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// Both versions of key_a should be returned
+	assert_eq!(results.len(), 2, "Should have both versions of key_a");
+	assert_eq!(results[0].0, b"key_a");
+	assert_eq!(results[0].1, b"v2");
+	assert_eq!(results[1].0, b"key_a");
+	assert_eq!(results[1].1, b"v1");
+}
+
+// ============================================================================
+// Test 10: Interleaved Iteration - Forward/Backward
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_interleaved_iteration() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 (2 versions) and key2 (2 versions)
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"key1_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"key1_v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key2", b"key2_v1", 150).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key2", b"key2_v2", 250).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key0", b"key9").unwrap();
+
+	// Test forward iteration
+	iter.seek_first().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key(), b"key1");
+	assert_eq!(iter.value().unwrap(), b"key1_v2");
+
+	iter.next().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key(), b"key1");
+	assert_eq!(iter.value().unwrap(), b"key1_v1");
+
+	iter.next().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key(), b"key2");
+	assert_eq!(iter.value().unwrap(), b"key2_v2");
+
+	iter.next().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key(), b"key2");
+	assert_eq!(iter.value().unwrap(), b"key2_v1");
+
+	// Test backward iteration starting from last
+	iter.seek_last().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key(), b"key2");
+	assert_eq!(iter.value().unwrap(), b"key2_v1");
+
+	iter.prev().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key(), b"key2");
+	assert_eq!(iter.value().unwrap(), b"key2_v2");
+
+	iter.prev().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key(), b"key1");
+	assert_eq!(iter.value().unwrap(), b"key1_v1");
+}
+
+// ============================================================================
+// Test 11: Interleaved Iteration - Seek in Middle
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_seek_middle() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert 5 keys
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		let key = format!("key{i}");
+		let value = format!("value{i}");
+		tx.set_at_version(key.as_bytes(), value.as_bytes(), i as u64 * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key0", b"key9").unwrap();
+
+	// Forward iteration should return keys in order
+	let results = collect_versioned_all(&mut iter).unwrap();
+	assert_eq!(results.len(), 5);
+	assert_eq!(results[0].0, b"key1");
+	assert_eq!(results[1].0, b"key2");
+	assert_eq!(results[2].0, b"key3");
+	assert_eq!(results[3].0, b"key4");
+	assert_eq!(results[4].0, b"key5");
+
+	// Test seek_first after collection
+	iter.seek_first().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key(), b"key1");
+
+	// Navigate forward
+	iter.next().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key(), b"key2");
+
+	iter.next().unwrap();
+	assert!(iter.valid());
+	assert_eq!(iter.key(), b"key3");
+}
+
+// ============================================================================
+// Test 12: Backward Iteration Only
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_backward_iteration() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert multiple keys with multiple versions
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"key1_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"key1_v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key2", b"key2_v1", 150).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key0", b"key9").unwrap();
+	let results = collect_versioned_reverse(&mut iter).unwrap();
+
+	// Should have 3 entries in reverse order
+	assert_eq!(results.len(), 3);
+
+	// Reverse order: key2_v1, key1_v1, key1_v2
+	assert_eq!(results[0].0, b"key2");
+	assert_eq!(results[0].1, b"key2_v1");
+	assert_eq!(results[1].0, b"key1");
+	assert_eq!(results[1].1, b"key1_v1");
+	assert_eq!(results[2].0, b"key1");
+	assert_eq!(results[2].1, b"key1_v2");
+}
+
+// ============================================================================
+// Test 13: Snapshot Isolation - Versions Not Visible to Old Snapshots
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_snapshot_isolation() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 v1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Take snapshot1
+	let tx1 = store.begin().unwrap();
+
+	// Insert key1 v2
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Take snapshot2
+	let tx2 = store.begin().unwrap();
+
+	// snapshot1 should only see v1
+	{
+		let mut iter = tx1.versioned_range(b"key1", b"key2").unwrap();
+		let results = collect_versioned_all(&mut iter).unwrap();
+		assert_eq!(results.len(), 1, "snapshot1 should only see 1 version");
+		assert_eq!(results[0].1, b"v1");
+	}
+
+	// snapshot2 should see both v1 and v2
+	{
+		let mut iter = tx2.versioned_range(b"key1", b"key2").unwrap();
+		let results = collect_versioned_all(&mut iter).unwrap();
+		assert_eq!(results.len(), 2, "snapshot2 should see 2 versions");
+		assert_eq!(results[0].1, b"v2");
+		assert_eq!(results[1].1, b"v1");
+	}
+}
+
+// ============================================================================
+// Test 14: Large Number of Versions
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_many_versions() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert same key 100 times with different values
+	for i in 0..100 {
+		let mut tx = store.begin().unwrap();
+		let value = format!("value_{i:03}");
+		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 10).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query all versions
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// Should have all 100 versions
+	assert_eq!(results.len(), 100, "Should have all 100 versions");
+
+	// Newest first (value_099, value_098, ..., value_000)
+	assert_eq!(results[0].1, b"value_099");
+	assert_eq!(results[99].1, b"value_000");
+}
+
+// ============================================================================
+// Test 15: Mixed Timestamps
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_timestamps() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key with timestamp 100, then 50, then 200
+	// Note: seq_num order != timestamp order
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"ts_100", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"ts_50", 50).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"ts_200", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query versions
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// Should have 3 versions ordered by seq_num (insert order), not timestamp
+	assert_eq!(results.len(), 3);
+
+	// Verify ordering is by seq_num descending (newest insert first)
+	assert_eq!(results[0].1, b"ts_200");
+	assert_eq!(results[0].2, 200); // timestamp
+	assert_eq!(results[1].1, b"ts_50");
+	assert_eq!(results[1].2, 50);
+	assert_eq!(results[2].1, b"ts_100");
+	assert_eq!(results[2].2, 100);
+}
+
+// ============================================================================
+// Test 16: Entry Convenience Method
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_entry_method() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert a key
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Delete the key (create tombstone)
+	{
+		let mut tx = store.begin().unwrap();
+		tx.delete(b"key1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with tombstones
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range_with_tombstones(b"key1", b"key2").unwrap();
+
+	iter.seek_first().unwrap();
+	assert!(iter.valid());
+
+	// Use entry() convenience method
+	let (key, _value, _timestamp, is_tombstone) = iter.entry().unwrap();
+	assert_eq!(key, b"key1");
+	assert!(is_tombstone, "First entry should be tombstone");
+
+	iter.next().unwrap();
+	assert!(iter.valid());
+
+	let (key, value, timestamp, is_tombstone) = iter.entry().unwrap();
+	assert_eq!(key, b"key1");
+	assert_eq!(value, b"value1");
+	assert_eq!(timestamp, 100);
+	assert!(!is_tombstone, "Second entry should not be tombstone");
+}
+
+// ============================================================================
+// Test 17: get_at_version LSM Fallback
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_get_at_version_lsm_fallback() {
+	// Create store with versioning but WITHOUT B+tree index
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key at ts=100
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value_100", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Insert key at ts=200
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value_200", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+
+	// get_at_version(key, 150) should return version at ts=100
+	let result = tx.get_at_version(b"key1", 150).unwrap();
+	assert!(result.is_some());
+	assert_eq!(result.unwrap(), b"value_100");
+
+	// get_at_version(key, 200) should return version at ts=200
+	let result = tx.get_at_version(b"key1", 200).unwrap();
+	assert!(result.is_some());
+	assert_eq!(result.unwrap(), b"value_200");
+
+	// get_at_version(key, 50) should return None (no version at or before ts=50)
+	let result = tx.get_at_version(b"key1", 50).unwrap();
+	assert!(result.is_none());
+
+	// get_at_version(key, 250) should return latest (ts=200)
+	let result = tx.get_at_version(b"key1", 250).unwrap();
+	assert!(result.is_some());
+	assert_eq!(result.unwrap(), b"value_200");
+}
+
+// ============================================================================
+// Test 18: get_at_version with Tombstone in LSM
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_get_at_version_lsm_tombstone() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key at ts=100
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value_100", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Delete at ts=200 (creates tombstone)
+	{
+		let mut tx = store.begin().unwrap();
+		tx.delete(b"key1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Insert at ts=300
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value_300", 300).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+
+	// get_at_version(key, 150) returns value at ts=100
+	let result = tx.get_at_version(b"key1", 150).unwrap();
+	assert!(result.is_some());
+	assert_eq!(result.unwrap(), b"value_100");
+
+	// get_at_version(key, 350) returns value at ts=300
+	let result = tx.get_at_version(b"key1", 350).unwrap();
+	assert!(result.is_some());
+	assert_eq!(result.unwrap(), b"value_300");
+}
+
+// ============================================================================
+// Test 19: Error Handling - Versioning Disabled
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_requires_versioning() {
+	// Create store WITHOUT versioning enabled
+	let (store, _temp_dir) = create_store_no_versioning();
+
+	// Insert some data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Try to call versioned_range - should return error
+	let tx = store.begin().unwrap();
+	let result = tx.versioned_range(b"key0", b"key9");
+
+	assert!(result.is_err(), "versioned_range should fail without versioning enabled");
+}
+
+// ============================================================================
+// Test 20: Error Handling - Transaction States
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_transaction_states() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert some data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Test on closed transaction
+	{
+		let tx = store.begin().unwrap();
+		drop(tx); // Transaction is dropped/closed
+
+		// Cannot test closed transaction directly since drop consumes it
+		// But we can test that a new transaction works fine
+		let tx = store.begin().unwrap();
+		let result = tx.versioned_range(b"key0", b"key9");
+		assert!(result.is_ok(), "Fresh transaction should work");
+	}
+
+	// Test on write-only transaction
+	{
+		let tx = store.begin_with_mode(Mode::WriteOnly).unwrap();
+		let result = tx.versioned_range(b"key0", b"key9");
+		assert!(result.is_err(), "Write-only transaction should not allow versioned_range");
+	}
+}
+
+// ============================================================================
+// Test: Works with B+tree index enabled too
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_with_btree_index() {
+	let (store, _temp_dir) = create_versioned_store_with_index();
+
+	// Insert key1 multiple times
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// versioned_range should still work (uses LSM, not B+tree)
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 2, "Should have 2 versions");
+	assert_eq!(results[0].1, b"v2");
+	assert_eq!(results[1].1, b"v1");
+}
+
+// ============================================================================
+// Test: Versions survive memtable flush (bug detector)
+// This test catches the bug where versioning=false in memtable flush
+// causes older versions to be dropped.
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versioned_range_survives_memtable_flush() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 three times with different values
+	for i in 1..=3 {
+		let mut tx = store.begin().unwrap();
+		let value = format!("v{i}");
+		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Verify all 3 versions exist in memtable BEFORE flush
+	{
+		let tx = store.begin().unwrap();
+		let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+		let results = collect_versioned_all(&mut iter).unwrap();
+		assert_eq!(results.len(), 3, "Should have 3 versions before flush");
+	}
+
+	// FORCE MEMTABLE FLUSH - this is where versions get dropped with the bug!
+	store.flush().unwrap();
+
+	// Query versions AFTER flush - this is the critical test
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// BUG: With versioning=false in flush, only 1 version survives
+	// EXPECTED: All 3 versions should survive
+	assert_eq!(results.len(), 3, "All 3 versions should survive memtable flush");
+	assert_eq!(results[0].1, b"v3");
+	assert_eq!(results[1].1, b"v2");
+	assert_eq!(results[2].1, b"v1");
+}
+
+// ============================================================================
+// Test: Replace operation cuts off older versions (even with versioning)
+// This is the expected behavior - Replace is a "destructive" operation
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_replace_cuts_off_history_with_versioning() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 with SET operations
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"set_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"set_v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Now use REPLACE - this should cut off the history
+	{
+		let mut tx = store.begin().unwrap();
+		tx.replace_with_options(
+			b"key1",
+			b"replace_v3",
+			&crate::WriteOptions::default().with_timestamp(Some(300)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Before flush - all versions in memtable
+	{
+		let tx = store.begin().unwrap();
+		let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+		let results = collect_versioned_all(&mut iter).unwrap();
+		// In memtable, all versions are still visible
+		assert_eq!(results.len(), 3, "Before flush: all 3 versions visible in memtable");
+	}
+
+	// Force flush - CompactionIterator should apply Replace semantics
+	store.flush().unwrap();
+
+	// After flush - Replace should have cut off older SETs
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// Replace cuts off history - only the Replace version survives
+	assert_eq!(results.len(), 1, "After flush: only Replace version survives");
+	assert_eq!(results[0].1, b"replace_v3");
+	assert_eq!(results[0].2, 300);
+}
+
+// ============================================================================
+// Test: Multiple Replace operations are all preserved with versioning
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_multiple_replaces_preserved_with_versioning() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert with SET first
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"set_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Multiple Replace operations
+	{
+		let mut tx = store.begin().unwrap();
+		tx.replace_with_options(
+			b"key1",
+			b"replace_v2",
+			&crate::WriteOptions::default().with_timestamp(Some(200)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.replace_with_options(
+			b"key1",
+			b"replace_v3",
+			&crate::WriteOptions::default().with_timestamp(Some(300)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.replace_with_options(
+			b"key1",
+			b"replace_v4",
+			&crate::WriteOptions::default().with_timestamp(Some(400)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Force flush
+	store.flush().unwrap();
+
+	// After flush - all Replace versions should survive, but not the original SET
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// All Replace versions are kept (they are valid versions themselves)
+	// Only the initial SET is discarded
+	assert_eq!(results.len(), 3, "All 3 Replace versions should survive");
+	assert_eq!(results[0].1, b"replace_v4");
+	assert_eq!(results[1].1, b"replace_v3");
+	assert_eq!(results[2].1, b"replace_v2");
+}
+
+// ============================================================================
+// Test: Replace after Delete with versioning
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_replace_after_delete_with_versioning() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"set_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Delete key1
+	{
+		let mut tx = store.begin().unwrap();
+		tx.delete(b"key1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Replace key1 (after delete)
+	{
+		let mut tx = store.begin().unwrap();
+		tx.replace_with_options(
+			b"key1",
+			b"replace_v3",
+			&crate::WriteOptions::default().with_timestamp(Some(300)),
+		)
+		.unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Force flush
+	store.flush().unwrap();
+
+	// After flush - Replace should survive
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	// The Replace should survive (it's the latest non-tombstone)
+	assert_eq!(results.len(), 1, "Replace should survive after flush");
+	assert_eq!(results[0].1, b"replace_v3");
+}
+
+// ============================================================================
+// Test: Versions survive compaction (L0 -> L1)
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_versions_survive_compaction() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 with multiple versions
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		let value = format!("v{i}");
+		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// First flush (memtable -> L0)
+	store.flush().unwrap();
+
+	// Verify versions after first flush
+	{
+		let tx = store.begin().unwrap();
+		let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+		let results = collect_versioned_all(&mut iter).unwrap();
+		assert_eq!(results.len(), 5, "All 5 versions should survive L0 flush");
+	}
+
+	// Insert more versions to trigger another flush
+	for i in 6..=10 {
+		let mut tx = store.begin().unwrap();
+		let value = format!("v{i}");
+		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Second flush
+	store.flush().unwrap();
+
+	// Verify all 10 versions exist across L0 files
+	let tx = store.begin().unwrap();
+	let mut iter = tx.versioned_range(b"key1", b"key2").unwrap();
+	let results = collect_versioned_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 10, "All 10 versions should survive multiple flushes");
+	// Verify order (newest first)
+	assert_eq!(results[0].1, b"v10");
+	assert_eq!(results[9].1, b"v1");
+}

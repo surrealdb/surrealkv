@@ -120,10 +120,10 @@ fn test_compression_10k_pairs_roundtrip() {
 	let mut count = 0;
 	iter.seek_to_first().unwrap();
 	while iter.valid() {
-		let key = iter.key().to_owned();
+		let key = iter.key();
 		let value = iter.value();
 
-		assert_eq!(key.user_key, &data[count].0[..]);
+		assert_eq!(key.user_key(), &data[count].0[..]);
 		assert_eq!(value, &data[count].1[..]);
 
 		count += 1;
@@ -401,10 +401,10 @@ fn test_compression_large_values() {
 	let mut count = 0;
 
 	while iter.valid() {
-		let key = iter.key().to_owned();
+		let key = iter.key();
 		let value = iter.value();
 
-		assert_eq!(key.user_key, &data[count].0[..]);
+		assert_eq!(key.user_key(), &data[count].0[..]);
 		assert_eq!(value.len(), data[count].1.len(), "Value length mismatch at index {}", count);
 		assert_eq!(value, &data[count].1[..], "Value content mismatch at index {}", count);
 

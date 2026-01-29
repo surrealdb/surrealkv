@@ -414,9 +414,8 @@ impl<W: Write> TableWriter<W> {
 		// Initialize filter block on first key if needed
 		if self.filter_block.is_none() {
 			if let Some(filter_policy) = self.opts.filter_policy.as_ref() {
-				let mut filter_block = FilterBlockWriter::new(Arc::clone(filter_policy));
-				filter_block.start_block(0);
-				self.filter_block = Some(filter_block);
+				self.filter_block = Some(FilterBlockWriter::new(Arc::clone(filter_policy)));
+				self.filter_block.as_mut().unwrap().start_block(0);
 			}
 		}
 
@@ -1301,6 +1300,15 @@ impl<'a> TableIterator<'a> {
 	///
 	/// Result: iterator now at "date" (correct answer for seek("banana"))
 	/// ```
+	///
+	/// ## Name Discussion
+	///
+	/// This function is called `SkipEmptyDataBlocksForward` in RocksDB/LevelDB,
+	/// but that name is misleading because:
+	/// - Data blocks are NEVER empty in practice
+	/// - The real issue is invalid iterator position after seek
+	///
+	/// Better name: `advance_to_valid_entry`
 	fn advance_to_valid_entry(&mut self) -> Result<()> {
 		loop {
 			// Success: current position is valid

@@ -21,7 +21,7 @@ use crate::oracle::Oracle;
 use crate::snapshot::Counter as SnapshotCounter;
 use crate::sstable::table::Table;
 use crate::task::TaskManager;
-use crate::transaction::{Mode, Transaction, TransactionOptions};
+use crate::transaction::{Mode, Transaction};
 use crate::vlog::{VLog, VLogGCManager, ValueLocation};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal};
@@ -169,8 +169,8 @@ impl CoreInner {
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
-		// Initialize versioned index if versioned queries are enabled
-		let versioned_index = if opts.enable_versioning {
+		// Initialize versioned index if B+tree versioned index is enabled
+		let versioned_index = if opts.enable_versioned_index {
 			// Create the versioned index directory if it doesn't exist
 			let versioned_index_dir = opts.versioned_index_dir();
 			let versioned_index_path = versioned_index_dir.join("index.bpt");
@@ -770,7 +770,7 @@ impl CommitEnv for LsmCommitEnv {
 		let mut timestamp_entries = Vec::with_capacity(batch.count() as usize);
 
 		let vlog_threshold = self.core.opts.vlog_value_threshold;
-		let is_versioning_enabled = self.core.opts.enable_versioning;
+		let is_versioned_index_enabled = self.core.opts.enable_versioned_index;
 		let has_vlog = self.core.vlog.is_some();
 
 		for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
@@ -787,7 +787,7 @@ impl CommitEnv for LsmCommitEnv {
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
-					if is_versioning_enabled {
+					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
@@ -799,7 +799,7 @@ impl CommitEnv for LsmCommitEnv {
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
-					if is_versioning_enabled {
+					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
@@ -807,7 +807,7 @@ impl CommitEnv for LsmCommitEnv {
 				}
 				None => {
 					// Delete operation: no value but may need versioned index entry
-					if is_versioning_enabled {
+					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), Vec::new()));
 					}
 					(None, None)
@@ -834,7 +834,7 @@ impl CommitEnv for LsmCommitEnv {
 		}
 
 		// Write to versioned index if present
-		if is_versioning_enabled {
+		if is_versioned_index_enabled {
 			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write();
 
 			// Single pass: process each entry individually
@@ -1385,17 +1385,13 @@ impl Tree {
 
 	/// Transactions provide a consistent, atomic view of the database.
 	pub fn begin(&self) -> Result<Transaction> {
-		self.begin_with_opts(TransactionOptions::new())
+		let txn = Transaction::new(Arc::clone(&self.core), Mode::ReadWrite)?;
+		Ok(txn)
 	}
 
 	/// Begins a new transaction with the specified mode
 	pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
-		self.begin_with_opts(TransactionOptions::new_with_mode(mode))
-	}
-
-	/// Begins a new transaction with the provided options
-	pub fn begin_with_opts(&self, opts: TransactionOptions) -> Result<Transaction> {
-		let txn = Transaction::new(Arc::clone(&self.core), opts)?;
+		let txn = Transaction::new(Arc::clone(&self.core), mode)?;
 		Ok(txn)
 	}
 
@@ -1714,30 +1710,6 @@ impl TreeBuilder {
 	/// Sets the VLog garbage collection discard ratio.
 	pub fn with_vlog_gc_discard_ratio(mut self, ratio: f64) -> Self {
 		self.opts = self.opts.with_vlog_gc_discard_ratio(ratio);
-		self
-	}
-
-	/// Sets the VLog value threshold in bytes.
-	///
-	/// Values smaller than this threshold are stored inline in SSTables.
-	/// Values larger than or equal to this threshold are stored in VLog files.
-	///
-	/// Default: 4096 (4KB)
-	///
-	/// # Example
-	///
-	/// ```no_run
-	/// use surrealkv::TreeBuilder;
-	///
-	/// let tree = TreeBuilder::new()
-	///     .with_path("./data".into())
-	///     .with_enable_vlog(true)
-	///     .with_vlog_value_threshold(8192) // 8KB threshold
-	///     .build()
-	///     .unwrap();
-	/// ```
-	pub fn with_vlog_value_threshold(mut self, value: usize) -> Self {
-		self.opts = self.opts.with_vlog_value_threshold(value);
 		self
 	}
 
