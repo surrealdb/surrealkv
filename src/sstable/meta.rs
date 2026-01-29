@@ -3,8 +3,7 @@ use bytes::{Buf, BufMut, BytesMut};
 use crate::error::Error;
 use crate::sstable::error::SSTableError;
 use crate::sstable::table::TableFormat;
-use crate::sstable::InternalKey;
-use crate::{CompressionType, Result};
+use crate::{CompressionType, InternalKey, Result};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Properties {

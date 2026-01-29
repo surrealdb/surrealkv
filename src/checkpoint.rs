@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::error::{Error, Result};
-use crate::lsm::{CompactionOperations, CoreInner};
+use crate::lsm::CoreInner;
 
 /// Recursively copies a directory and all its contents
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -266,30 +266,17 @@ impl DatabaseCheckpoint {
 
 	/// Flushes all memtables to ensure checkpoint consistency
 	fn flush_all_memtables(&self) -> Result<()> {
-		// Keep calling compact_memtable until all memtables (active + immutable) are
-		// flushed compact_memtable already handles the logic of checking if there's
-		// anything to flush
-		loop {
-			// Check if there are any memtables to flush
-			let has_active = {
-				let active_guard = self.core.active_memtable.read()?;
-				!active_guard.is_empty()
-			};
-
-			let has_immutable = {
-				let immutable_guard = self.core.immutable_memtables.read()?;
-				!immutable_guard.is_empty()
-			};
-
-			if !has_active && !has_immutable {
-				break; // All memtables are flushed
+		// Step 1: Rotate active memtable if it has data
+		{
+			let active = self.core.active_memtable.read()?;
+			if !active.is_empty() {
+				drop(active); // Release read lock before acquiring write lock
+				self.core.rotate_memtable()?;
 			}
-
-			// Flush one memtable (active or immutable)
-			self.core.compact_memtable()?;
 		}
 
-		Ok(())
+		// Step 2: Flush all immutable memtables synchronously
+		self.core.flush_all_immutables_sync()
 	}
 
 	/// Copies all SSTables to the checkpoint directory

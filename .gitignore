@@ -59,4 +59,7 @@ fuzz/
 /target
 /.cursor
 
+/fuzz/artifacts/
+/fuzz/corpus/
+/fuzz/target/
 

@@ -20,15 +20,25 @@ use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
 use crate::oracle::Oracle;
 use crate::snapshot::Counter as SnapshotCounter;
 use crate::sstable::table::Table;
-use crate::sstable::{InternalKey, InternalKeyKind, INTERNAL_KEY_TIMESTAMP_MAX};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vlog::{VLog, VLogGCManager, ValueLocation};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal};
 use crate::{
-	BytewiseComparator, Comparator, Error, FilterPolicy, Options, TimestampComparator,
-	VLogChecksumLevel, Value, WalRecoveryMode,
+	BytewiseComparator,
+	Comparator,
+	Error,
+	FilterPolicy,
+	InternalIterator,
+	InternalKey,
+	InternalKeyKind,
+	Options,
+	TimestampComparator,
+	VLogChecksumLevel,
+	Value,
+	WalRecoveryMode,
+	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 
 // ===== Compaction Operations Trait =====
@@ -48,6 +58,9 @@ pub trait CompactionOperations: Send + Sync {
 
 	/// Returns a reference to the background error handler
 	fn error_handler(&self) -> Arc<BackgroundErrorHandler>;
+
+	/// Returns true if there are immutable memtables pending flush.
+	fn has_pending_immutables(&self) -> bool;
 }
 
 // ===== Core LSM Tree Implementation =====
@@ -150,7 +163,7 @@ impl CoreInner {
 
 		// Initialize active memtable with its WAL number set to the initial WAL
 		// This tracks which WAL the memtable's data belongs to for later flush
-		let initial_memtable = Arc::new(MemTable::new());
+		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size));
 		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
 		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
@@ -260,94 +273,114 @@ impl CoreInner {
 		Ok(table)
 	}
 
-	/// Makes room for new writes by flushing the active memtable if needed.
+	/// Rotates the active memtable to the immutable queue WITHOUT flushing to SST.
+	/// This is a fast operation (no disk I/O) that:
+	/// 1. Rotates WAL to a new file
+	/// 2. Swaps active memtable with a fresh one
+	/// 3. Adds old memtable to immutable queue
 	///
-	/// Triggers a flush operation to make room for new writes.
-	///
-	/// This is called when the active memtable exceeds the configured size
-	/// threshold. The operation proceeds in stages:
-	/// 1. Acquire memtable write lock and check if flushing is needed
-	/// 2. If flushing, rotate WAL while STILL holding memtable lock
-	/// 3. Swap memtable while STILL holding the lock (atomically with WAL rotation)
-	/// 4. Release locks, then flush memtable to SST and update manifest
-	/// 5. Asynchronously clean up old WAL segments
-	fn make_room_for_write(&self, force: bool) -> Result<()> {
+	/// The actual SST flush happens asynchronously via background task.
+	pub(crate) fn rotate_memtable(&self) -> Result<()> {
 		// Step 1: Acquire WRITE lock upfront to prevent race conditions
-		// We need the write lock before checking/rotating/swapping to ensure atomicity
 		let mut active_memtable = self.active_memtable.write()?;
-		let size = active_memtable.size();
 
 		if active_memtable.is_empty() {
 			return Ok(());
 		}
 
-		// Check if memtable actually exceeds threshold
-		// Prevents flushing small memtables from queued notifications
-		// Multiple concurrent writes can each call wake_up_memtable(), creating
-		// a notification queue. This check ensures we only flush when needed.
-		// The 'force' parameter allows bypassing this for explicit flush calls.
-		if !force && size < self.opts.max_memtable_size {
-			log::debug!(
-				"make_room_for_write: memtable size {} below threshold {}, skipping flush",
-				size,
-				self.opts.max_memtable_size
-			);
-			return Ok(());
-		}
-
-		log::debug!("make_room_for_write: flushing memtable size={}", size);
+		log::debug!("rotate_memtable: rotating memtable size={}", active_memtable.size());
 
 		// Step 2: Rotate WAL while STILL holding memtable write lock
-		// We must rotate WAL and swap memtable atomically
-		// to prevent the race condition described above
-		let (flushed_wal_number, new_wal_number, wal_dir) = {
+		let (flushed_wal_number, new_wal_number) = {
 			let mut wal_guard = self.wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
-			let dir = wal_guard.get_dir_path().to_path_buf();
 			wal_guard.rotate().map_err(|e| {
-				Error::Other(format!("Failed to rotate WAL before memtable flush: {}", e))
+				Error::Other(format!("Failed to rotate WAL before memtable rotation: {}", e))
 			})?;
 			let new_log_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
 
 			log::debug!(
-				"WAL rotated before memtable flush: {} -> {}",
+				"WAL rotated during memtable rotation: {} -> {}",
 				old_log_number,
 				new_log_number
 			);
-			(old_log_number, new_log_number, dir)
+			(old_log_number, new_log_number)
 		};
 
 		// Step 3: Swap memtable while STILL holding write lock
-		// Take the memtable data that we will flush
-		let flushed_memtable = std::mem::take(&mut *active_memtable);
+		let flushed_memtable = std::mem::replace(
+			&mut *active_memtable,
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+		);
 
 		// Set the WAL number on the new (empty) active memtable
-		// This tracks which WAL the new memtable's data will belong to
 		active_memtable.set_wal_number(new_wal_number);
 
 		// Get table ID and track immutable memtable with its WAL number
 		let mut immutable_memtables = self.immutable_memtables.write()?;
 		let table_id = self.level_manifest.read()?.next_table_id();
-		// Track the WAL number that contains this memtable's data
-		// (the old WAL before rotation)
 		immutable_memtables.add(table_id, flushed_wal_number, Arc::clone(&flushed_memtable));
 
-		// Now we can release locks - the memtable is safely in immutable_memtables
-		// and no other thread can race us on this specific data
+		// Release locks
 		drop(active_memtable);
 		drop(immutable_memtables);
 
-		// Step 4: Flush the memtable to SST and update manifest (slow I/O operation, no locks held)
-		let _table =
-			self.flush_and_update_manifest(&flushed_memtable, table_id, flushed_wal_number)?;
+		log::debug!(
+			"rotate_memtable: completed rotation, table_id={}, wal_number={}",
+			table_id,
+			flushed_wal_number
+		);
 
-		// Step 5: Async WAL cleanup using values we already have
-		// No need to re-acquire locks - we captured wal_dir and flushed_wal_number
-		// earlier
-		let min_wal_to_keep = flushed_wal_number + 1; // Same as log_number
+		Ok(())
+	}
 
-		log::debug!("Scheduling async WAL cleanup (min_wal_to_keep={})", min_wal_to_keep);
+	/// Flushes the oldest immutable memtable to an SSTable.
+	/// Returns Ok(Some(table)) if a memtable was flushed, Ok(None) if queue was empty.
+	///
+	/// This method:
+	/// 1. Gets the oldest entry from immutable queue (lowest table_id)
+	/// 2. Flushes it to SST via flush_and_update_manifest (which also removes from queue)
+	/// 3. Schedules async WAL cleanup
+	fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
+		// Get the oldest immutable entry (clone to release lock before I/O)
+		let entry = {
+			let guard = self.immutable_memtables.read()?;
+			guard.first().cloned()
+		};
+
+		let entry = match entry {
+			Some(e) => e,
+			None => {
+				log::debug!("flush_oldest_immutable_to_sst: no immutables to flush");
+				return Ok(None);
+			}
+		};
+
+		// Skip empty memtables
+		if entry.memtable.is_empty() {
+			let mut guard = self.immutable_memtables.write()?;
+			guard.remove(entry.table_id);
+			log::debug!(
+				"flush_oldest_immutable_to_sst: skipped empty memtable table_id={}",
+				entry.table_id
+			);
+			return Ok(None);
+		}
+
+		log::debug!(
+			"flush_oldest_immutable_to_sst: flushing table_id={}, wal_number={}",
+			entry.table_id,
+			entry.wal_number
+		);
+
+		// Flush to SST (this also removes from immutable queue and updates manifest)
+		let table =
+			self.flush_and_update_manifest(&entry.memtable, entry.table_id, entry.wal_number)?;
+
+		// Schedule async WAL cleanup
+		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
+		let min_wal_to_keep = entry.wal_number + 1;
 
 		tokio::spawn(async move {
 			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
@@ -358,15 +391,33 @@ impl CoreInner {
 						min_wal_to_keep
 					);
 				}
-				Ok(_) => {
-					log::debug!("No old WAL segments to clean up");
-				}
+				Ok(_) => {}
 				Err(e) => {
 					log::warn!("Failed to clean up old WAL segments: {}", e);
 				}
 			}
 		});
 
+		log::debug!(
+			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
+			table.id,
+			table.file_size
+		);
+
+		Ok(Some(table))
+	}
+
+	/// Flushes ALL immutable memtables synchronously.
+	/// Used by Tree::flush() and checkpoint for forced/sync flush.
+	/// Blocks until all immutables are written to SST.
+	pub(crate) fn flush_all_immutables_sync(&self) -> Result<()> {
+		let mut count = 0;
+		while self.flush_oldest_immutable_to_sst()?.is_some() {
+			count += 1;
+		}
+		if count > 0 {
+			log::debug!("flush_all_immutables_sync: flushed {} immutable memtables", count);
+		}
 		Ok(())
 	}
 
@@ -409,9 +460,18 @@ impl CoreInner {
 
 		let mut immutable_memtables = self.immutable_memtables.write()?;
 
+		// Get the current WAL number for the new memtable
+		let current_wal_number = self.wal.read().get_active_log_number();
+
 		// Swap the active memtable with a new empty one
 		// This allows writes to continue immediately
-		let flushed_memtable = std::mem::take(&mut *active_memtable);
+		let flushed_memtable = std::mem::replace(
+			&mut *active_memtable,
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+		);
+
+		// Set the WAL number on the new active memtable
+		active_memtable.set_wal_number(current_wal_number);
 
 		// Get table ID for the SST file
 		let table_id = self.level_manifest.read()?.next_table_id();
@@ -649,9 +709,10 @@ impl CoreInner {
 }
 
 impl CompactionOperations for CoreInner {
-	/// Triggers a memtable flush to create space for new writes
+	/// Flushes the oldest immutable memtable to SST.
+	/// Called by background task. Returns Ok(()) even if nothing to flush.
 	fn compact_memtable(&self) -> Result<()> {
-		self.make_room_for_write(false) // Don't force, respect threshold
+		self.flush_oldest_immutable_to_sst().map(|_| ())
 	}
 
 	/// Performs compaction to merge SSTables and maintain read performance.
@@ -677,6 +738,10 @@ impl CompactionOperations for CoreInner {
 	/// Returns a reference to the background error handler
 	fn error_handler(&self) -> Arc<BackgroundErrorHandler> {
 		Arc::clone(&self.error_handler)
+	}
+
+	fn has_pending_immutables(&self) -> bool {
+		self.immutable_memtables.read().map(|guard| !guard.is_empty()).unwrap_or(false)
 	}
 }
 
@@ -820,34 +885,33 @@ impl CommitEnv for LsmCommitEnv {
 		Ok(processed_batch)
 	}
 
-	// Apply batch to memtable (can be called concurrently)
+	/// Apply batch to memtable with retry on arena full.
 	fn apply(&self, batch: &Batch) -> Result<()> {
-		// Writes a batch of key-value pairs to the LSM tree.
-		//
-		// Write path in LSM trees:
-		// 1. Write to WAL (Write-Ahead Log) for durability [not shown here]
-		// 2. Insert into active memtable for fast access
-		// 3. Trigger background flush if memtable is full
-		// 4. Apply write stall if too many L0 files accumulate
-		let active_memtable = self.core.active_memtable.read()?;
+		// Try to add to current memtable
+		let result = {
+			let active_memtable = self.core.active_memtable.read()?;
+			active_memtable.add(batch)
+		};
 
-		// Check if memtable needs flushing
-		if active_memtable.size() > self.core.opts.max_memtable_size {
-			log::debug!(
-				"Memtable size {} exceeds threshold {}, triggering background flush",
-				active_memtable.size(),
-				self.core.opts.max_memtable_size
-			);
-			// Wake up background thread to flush memtable
-			if let Some(ref task_manager) = self.task_manager {
-				task_manager.wake_up_memtable();
+		match result {
+			Ok(()) => Ok(()),
+			Err(Error::ArenaFull) => {
+				// Arena is full - rotate memtable and retry
+				log::debug!("apply: arena full, rotating memtable");
+
+				self.core.rotate_memtable()?;
+
+				// Schedule background flush
+				if let Some(ref task_manager) = self.task_manager {
+					task_manager.wake_up_memtable();
+				}
+
+				// Retry on new memtable - must succeed
+				let active_memtable = self.core.active_memtable.read()?;
+				active_memtable.add(batch)
 			}
+			Err(e) => Err(e),
 		}
-
-		// Add the batch to the active memtable
-		active_memtable.add(batch)?;
-
-		Ok(())
 	}
 
 	// Check for background errors before committing
@@ -887,44 +951,35 @@ impl std::ops::Deref for Core {
 }
 
 impl Core {
-	/// Function to replay WAL with configurable recovery behavior on
-	/// corruption.
+	/// Replays WAL with configurable corruption handling.
+	///
+	/// Creates one memtable per WAL segment. Flushes all but the last memtable
+	/// to SST via the provided callback. Returns the last memtable as active.
 	///
 	/// # Arguments
-	///
-	/// * `wal_path` - Path to the WAL directory
-	/// * `min_wal_number` - Minimum WAL number to replay (older segments are skipped)
-	/// * `context` - Context string for error messages (e.g., "Database startup")
-	/// * `recovery_mode` - Controls behavior on corruption:
-	///   - `AbsoluteConsistency`: Fail immediately on any corruption
-	///   - `TolerateCorruptedWithRepair`: Attempt repair and continue (default)
-	/// * `set_recovered_memtable` - Callback to set the recovered memtable
+	/// * `wal_path` - Path to WAL directory
+	/// * `min_wal_number` - Minimum WAL to replay
+	/// * `context` - Context string for error messages
+	/// * `recovery_mode` - How to handle corruption
+	/// * `arena_size` - Size for memtable arenas
+	/// * `flush_memtable` - Callback to flush intermediate memtables to SST
 	///
 	/// # Returns
-	///
-	/// * `Ok(Some(seq_num))` - WAL was replayed successfully
-	/// * `Ok(None)` - WAL was skipped (already flushed) or empty
-	/// * `Err(...)` - Error during replay (corruption in AbsoluteConsistency mode, or unrecoverable
-	///   error)
+	/// * `(Option<max_seq_num>, Option<active_memtable>)`
 	pub(crate) fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		min_wal_number: u64,
 		context: &str,
 		recovery_mode: WalRecoveryMode,
-		mut set_recovered_memtable: F,
-	) -> Result<Option<u64>>
+		arena_size: usize,
+		mut flush_memtable: F,
+	) -> Result<(Option<u64>, Option<Arc<MemTable>>)>
 	where
-		F: FnMut(Arc<MemTable>) -> Result<()>,
+		F: FnMut(Arc<MemTable>, u64) -> Result<()>,
 	{
-		// Create a new empty memtable to recover WAL entries
-		let recovered_memtable = Arc::new(MemTable::default());
-
-		// Replay WAL
-		let wal_seq_num_opt = match replay_wal(wal_path, &recovered_memtable, min_wal_number) {
-			Ok(seq_num_opt) => {
-				// WAL was replayed successfully (or was empty/skipped)
-				seq_num_opt
-			}
+		// Replay WAL - returns memtables per segment
+		let (wal_seq_num_opt, memtables) = match replay_wal(wal_path, min_wal_number, arena_size) {
+			Ok(result) => result,
 			Err(Error::WalCorruption {
 				segment_id,
 				offset,
@@ -933,7 +988,6 @@ impl Core {
 				// Handle corruption based on recovery mode
 				match recovery_mode {
 					WalRecoveryMode::AbsoluteConsistency => {
-						// Fail immediately on any corruption - no repair attempted
 						log::error!(
 							"WAL corruption detected in segment {} at offset {}: {}. \
 							AbsoluteConsistency mode: failing immediately without repair.",
@@ -948,7 +1002,6 @@ impl Core {
 						});
 					}
 					WalRecoveryMode::TolerateCorruptedWithRepair => {
-						// Current behavior: attempt repair and retry
 						log::warn!(
 							"Detected WAL corruption in segment {} at offset {}: {}. Attempting repair...",
 							segment_id,
@@ -956,7 +1009,7 @@ impl Core {
 							message
 						);
 
-						// Attempt to repair the corrupted segment
+						// Attempt repair
 						if let Err(repair_err) = repair_corrupted_wal_segment(wal_path, segment_id)
 						{
 							log::error!("Failed to repair WAL segment: {repair_err}");
@@ -965,34 +1018,19 @@ impl Core {
 							)));
 						}
 
-						// After repair, replay again to recover data from ALL segments.
-						// The initial replay stopped at the corruption point and didn't process
-						// subsequent segments.
-						let retry_memtable = Arc::new(MemTable::default());
-						match replay_wal(wal_path, &retry_memtable, min_wal_number) {
-							Ok(retry_seq_num) => {
-								// Successful replay after repair
-								log::info!(
-									"WAL replay after repair succeeded: {} entries recovered",
-									retry_memtable.iter(true).count()
-								);
-								if !retry_memtable.is_empty() {
-									set_recovered_memtable(retry_memtable)?;
-								}
-								return Ok(retry_seq_num);
-							}
+						// Retry after repair
+						match replay_wal(wal_path, min_wal_number, arena_size) {
+							Ok(result) => result,
 							Err(Error::WalCorruption {
 								segment_id: seg_id,
 								offset: off,
 								message,
 							}) => {
-								// WAL still corrupted after repair - fail
 								return Err(Error::Other(format!(
-									"{context} failed: WAL segment {seg_id} still corrupted at offset {off} after repair with message: {message}"
+									"{context} failed: WAL segment {seg_id} still corrupted at offset {off} after repair: {message}"
 								)));
 							}
 							Err(retry_err) => {
-								// Replay failed after repair - fail
 								return Err(Error::Other(format!(
 									"{context} failed: WAL replay failed after repair. {retry_err}"
 								)));
@@ -1001,19 +1039,45 @@ impl Core {
 					}
 				}
 			}
-			Err(e) => {
-				// Other errors (IO, etc.) - propagate
-				return Err(e);
-			}
+			Err(e) => return Err(e),
 		};
 
-		// Only set recovered_memtable if we didn't go through repair path
-		// (repair path returns early with retry_memtable already set)
-		if !recovered_memtable.is_empty() {
-			set_recovered_memtable(recovered_memtable)?;
+		// If no memtables, nothing was recovered
+		if memtables.is_empty() {
+			return Ok((None, None));
 		}
 
-		Ok(wal_seq_num_opt)
+		// Flush all memtables except the last to SST
+		let memtable_count = memtables.len();
+		if memtable_count > 1 {
+			log::info!("Recovery: flushing {} intermediate memtables to SST", memtable_count - 1);
+			for (memtable, wal_number) in memtables.iter().take(memtable_count - 1) {
+				if !memtable.is_empty() {
+					flush_memtable(Arc::clone(memtable), *wal_number)?;
+				}
+			}
+		}
+
+		// Return the last memtable as the active one
+		let (last_memtable, last_wal_number) = memtables.into_iter().last().unwrap();
+		let entry_count = {
+			let mut iter = last_memtable.iter();
+			let mut count = 0;
+			if iter.seek_first().unwrap_or(false) {
+				count += 1;
+				while iter.next().unwrap_or(false) {
+					count += 1;
+				}
+			}
+			count
+		};
+		log::info!(
+			"Recovery: setting last memtable (wal={}) as active with {} entries",
+			last_wal_number,
+			entry_count
+		);
+
+		Ok((wal_seq_num_opt, Some(last_memtable)))
 	}
 
 	/// Creates a new LSM tree with background task management
@@ -1048,20 +1112,32 @@ impl Core {
 		);
 
 		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
-		let wal_seq_num_opt = Self::replay_wal_with_repair(
+		let (wal_seq_num_opt, recovered_memtable) = Self::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Database startup",
 			opts.wal_recovery_mode,
-			|memtable| {
-				let mut active_memtable = inner.active_memtable.write()?;
-				*active_memtable = memtable;
+			opts.max_memtable_size,
+			|memtable, wal_number| {
+				// Flush intermediate memtable to SST during recovery
+				let table_id = inner.level_manifest.read()?.next_table_id();
+				inner.flush_and_update_manifest(&memtable, table_id, wal_number)?;
+				log::info!(
+					"Recovery: flushed memtable to SST table_id={}, wal_number={}",
+					table_id,
+					wal_number
+				);
 				Ok(())
 			},
 		)?;
 
-		// After WAL replay, ensure the active memtable has the correct WAL number set
-		// This is needed because the recovered memtable replaces the initial one
+		// Set recovered memtable as active (if any)
+		if let Some(memtable) = recovered_memtable {
+			let mut active_memtable = inner.active_memtable.write()?;
+			*active_memtable = memtable;
+		}
+
+		// Ensure the active memtable has the correct WAL number set
 		{
 			let active_memtable = inner.active_memtable.read()?;
 			let current_wal_number = inner.wal.read().get_active_log_number();
@@ -1377,7 +1453,7 @@ impl Tree {
 		// This discards any pending writes, which is correct for restore operations
 		{
 			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable = Arc::new(MemTable::default());
+			*active_memtable = Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size));
 		}
 
 		{
@@ -1401,19 +1477,32 @@ impl Tree {
 		// Replay any WAL entries that were restored
 		let wal_path = self.core.inner.opts.path.join("wal");
 		let min_wal_number = self.core.inner.level_manifest.read()?.get_log_number();
-		let wal_seq_num_opt = Core::replay_wal_with_repair(
+		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Database restore",
 			self.core.inner.opts.wal_recovery_mode,
-			|memtable| {
-				let mut active_memtable = self.core.inner.active_memtable.write()?;
-				*active_memtable = memtable;
+			self.core.inner.opts.max_memtable_size,
+			|memtable, wal_number| {
+				// Flush intermediate memtable to SST during recovery
+				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
+				self.core.inner.flush_and_update_manifest(&memtable, table_id, wal_number)?;
+				log::info!(
+					"Restore: flushed memtable to SST table_id={}, wal_number={}",
+					table_id,
+					wal_number
+				);
 				Ok(())
 			},
 		)?;
 
-		// After WAL replay, ensure the active memtable has the correct WAL number set
+		// Set recovered memtable as active (if any)
+		if let Some(memtable) = recovered_memtable {
+			let mut active_memtable = self.core.inner.active_memtable.write()?;
+			*active_memtable = memtable;
+		}
+
+		// Ensure the active memtable has the correct WAL number set
 		{
 			let active_memtable = self.core.inner.active_memtable.read()?;
 			let current_wal_number = self.core.inner.wal.read().get_active_log_number();
@@ -1463,9 +1552,20 @@ impl Tree {
 		}
 	}
 
-	/// Flushes the active memtable to disk
+	/// Flushes all memtables to disk synchronously.
+	/// This is a blocking operation that ensures all data is persisted before returning.
 	pub fn flush(&self) -> Result<()> {
-		self.core.make_room_for_write(true) // Force flush, bypass threshold
+		// Step 1: Rotate active memtable if it has data
+		{
+			let active = self.core.inner.active_memtable.read()?;
+			if !active.is_empty() {
+				drop(active); // Release read lock before acquiring write lock
+				self.core.inner.rotate_memtable()?;
+			}
+		}
+
+		// Step 2: Flush all immutable memtables synchronously
+		self.core.inner.flush_all_immutables_sync()
 	}
 
 	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {

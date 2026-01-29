@@ -12,9 +12,8 @@ use crate::levels::{
 	MANIFEST_FORMAT_VERSION_V1,
 };
 use crate::sstable::table::{Table, TableWriter};
-use crate::sstable::{InternalKey, InternalKeyKind};
 use crate::vfs::File;
-use crate::{Options, Result};
+use crate::{InternalKey, InternalKeyKind, Options, Result};
 
 // Helper function to create a test table with direct file IO
 fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
