@@ -155,7 +155,7 @@ pub struct Options {
 	pub comparator: Arc<dyn Comparator>,
 	pub internal_comparator: Arc<InternalKeyComparator>,
 	pub compression_per_level: Vec<CompressionType>,
-	pub block_cache: Arc<cache::BlockCache>,
+	pub(crate) block_cache: Arc<cache::BlockCache>,
 	pub path: PathBuf,
 	pub level_count: u8,
 	pub max_memtable_size: usize,
@@ -231,7 +231,7 @@ impl Default for Options {
 			vlog_checksum_verification: VLogChecksumLevel::Disabled,
 			enable_vlog: false,
 			vlog_gc_discard_ratio: 0.5, // 50% default
-			vlog_value_threshold: 4096, // 4KB default
+			vlog_value_threshold: 1024, // 1KB default
 			enable_versioning: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
@@ -376,6 +376,30 @@ impl Options {
 	pub fn with_vlog_gc_discard_ratio(mut self, value: f64) -> Self {
 		assert!((0.0..=1.0).contains(&value), "VLog GC discard ratio must be between 0.0 and 1.0");
 		self.vlog_gc_discard_ratio = value;
+		self
+	}
+
+	/// Sets the VLog value threshold in bytes.
+	///
+	/// Values smaller than this threshold are stored inline in SSTables.
+	/// Values larger than or equal to this threshold are stored in VLog files.
+	///
+	/// Default: 4096 (4KB)
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::TreeBuilder;
+	///
+	/// let tree = TreeBuilder::new()
+	///     .with_path("./data".into())
+	///     .with_enable_vlog(true)
+	///     .with_vlog_value_threshold(8192) // 8KB threshold
+	///     .build()
+	///     .unwrap();
+	/// ```
+	pub const fn with_vlog_value_threshold(mut self, value: usize) -> Self {
+		self.vlog_value_threshold = value;
 		self
 	}
 
@@ -595,10 +619,7 @@ pub type InternalKeyRangeBound = Bound<InternalKey>;
 pub type InternalKeyRange = (InternalKeyRangeBound, InternalKeyRangeBound);
 
 /// Converts user key bounds to InternalKeyRange for efficient iteration.
-pub fn user_range_to_internal_range(
-	lower: Bound<&[u8]>,
-	upper: Bound<&[u8]>,
-) -> InternalKeyRange {
+pub fn user_range_to_internal_range(lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> InternalKeyRange {
 	let start_bound = match lower {
 		Bound::Unbounded => Bound::Unbounded,
 		Bound::Included(key) => Bound::Included(InternalKey::new(

@@ -293,7 +293,7 @@ impl WalTestHelper {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
-				found_keys.push(String::from_utf8(key.to_vec()).unwrap());
+				found_keys.push(String::from_utf8(key.clone()).unwrap());
 				iter.next().unwrap();
 			}
 		}

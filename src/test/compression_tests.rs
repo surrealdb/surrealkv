@@ -528,7 +528,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 	let mut prev_key: Option<Vec<u8>> = None;
 
 	while iter.valid() {
-		let key = iter.key().to_owned();
+		let key = iter.key().clone();
 		let value = iter.value().unwrap();
 		if let Some(ref prev) = prev_key {
 			assert!(
@@ -538,7 +538,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 		}
 
 		assert!(keys.iter().any(|k| k == &key), "Scanned key should be in original key set");
-		assert!(!value.is_none(), "Value should not be empty");
+		assert!(value.is_some(), "Value should not be empty");
 		prev_key = Some(key);
 		scanned_count += 1;
 		iter.next().unwrap();
@@ -674,7 +674,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 		let mut scanned_count = 0;
 		let mut prev_key: Option<Vec<u8>> = None;
 		while iter.valid() {
-			let key = iter.key().to_owned();
+			let key = iter.key().clone();
 			let value = iter.value().unwrap().unwrap();
 			if let Some(ref prev) = prev_key {
 				assert!(

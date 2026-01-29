@@ -41,8 +41,8 @@ fn probabilities() -> &'static [u32; MAX_HEIGHT] {
 	PROBABILITIES.get_or_init(|| {
 		let mut p = [0u32; MAX_HEIGHT];
 		let mut prob = 1.0f64;
-		for i in 0..MAX_HEIGHT {
-			p[i] = (u32::MAX as f64 * prob) as u32;
+		for p_item in p.iter_mut() {
+			*p_item = (u32::MAX as f64 * prob) as u32;
 			prob *= P_VALUE;
 		}
 		p
@@ -457,9 +457,9 @@ impl Skiplist {
 					continue;
 				}
 
-				if spl.prev != self.head && !self.key_is_after_node(spl.prev, key, trailer) {
-					level = list_height as i32;
-				} else if spl.next != self.tail && self.key_is_after_node(spl.next, key, trailer) {
+				if (spl.prev != self.head && !self.key_is_after_node(spl.prev, key, trailer))
+					|| (spl.next != self.tail && self.key_is_after_node(spl.next, key, trailer))
+				{
 					level = list_height as i32;
 				} else {
 					prev = spl.prev;
@@ -693,7 +693,6 @@ impl<'a> SkiplistIterator<'a> {
 				if (self.list.cmp)(upper, key) <= Ordering::Equal {
 					self.upper_node = self.nd;
 					self.nd = self.list.tail;
-					return;
 				}
 			}
 		}
@@ -727,7 +726,6 @@ impl<'a> SkiplistIterator<'a> {
 				if (self.list.cmp)(lower, key) == Ordering::Greater {
 					self.lower_node = self.nd;
 					self.nd = self.list.head;
-					return;
 				}
 			}
 		}
@@ -747,7 +745,6 @@ impl<'a> SkiplistIterator<'a> {
 				if (self.list.cmp)(upper, key) <= Ordering::Equal {
 					self.upper_node = self.nd;
 					self.nd = self.list.tail;
-					return;
 				}
 			}
 		}
@@ -767,7 +764,6 @@ impl<'a> SkiplistIterator<'a> {
 				if (self.list.cmp)(lower, key) == Ordering::Greater {
 					self.lower_node = self.nd;
 					self.nd = self.list.head;
-					return;
 				}
 			}
 		}
@@ -787,7 +783,6 @@ impl<'a> SkiplistIterator<'a> {
 				if (self.list.cmp)(upper, current_key) <= Ordering::Equal {
 					self.upper_node = self.nd;
 					self.nd = self.list.tail;
-					return;
 				}
 			}
 		}

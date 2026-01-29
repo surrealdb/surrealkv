@@ -93,6 +93,7 @@ impl Arena {
 	///
 	/// # Safety
 	/// Caller must ensure no other references to this region exist.
+	#[allow(clippy::mut_from_ref)]
 	#[inline]
 	pub(crate) unsafe fn get_bytes_mut(&self, offset: u32, size: u32) -> &mut [u8] {
 		if offset == 0 {

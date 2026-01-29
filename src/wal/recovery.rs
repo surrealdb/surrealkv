@@ -61,11 +61,13 @@ impl Reporter for DefaultReporter {
 /// * `Ok((Some(max_seq_num), memtables))` - Memtables with their WAL numbers
 /// * `Ok((None, vec![]))` - No data recovered
 /// * `Err(...)` - Error during replay
+type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, u64)>);
+
 pub(crate) fn replay_wal(
 	wal_dir: &Path,
 	min_wal_number: u64,
 	arena_size: usize,
-) -> Result<(Option<u64>, Vec<(Arc<MemTable>, u64)>)> {
+) -> Result<ReplayResult> {
 	log::info!("Starting WAL recovery from directory: {:?}", wal_dir);
 	log::debug!(
 		"WAL recovery parameters: min_wal_number={}, arena_size={}",

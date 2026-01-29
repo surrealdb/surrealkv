@@ -490,7 +490,7 @@ impl<'a> MergingIterator<'a> {
 	pub fn is_valid(&self) -> bool {
 		match self.direction {
 			Direction::Forward => !self.min_heap.is_empty(),
-			Direction::Backward => self.max_heap.as_ref().map_or(false, |h| !h.is_empty()),
+			Direction::Backward => self.max_heap.as_ref().is_some_and(|h| !h.is_empty()),
 		}
 	}
 

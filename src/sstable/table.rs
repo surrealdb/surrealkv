@@ -664,10 +664,7 @@ pub fn write_block_at_offset<W: Write>(
 }
 
 /// Compresses block data using the specified compression type.
-pub fn compress_block(
-	raw_block: BlockData,
-	compression: CompressionType,
-) -> Result<BlockData> {
+pub fn compress_block(raw_block: BlockData, compression: CompressionType) -> Result<BlockData> {
 	match compression {
 		CompressionType::SnappyCompression => {
 			let mut enc = snap::raw::Encoder::new();
@@ -683,10 +680,7 @@ pub fn compress_block(
 }
 
 /// Decompresses block data.
-pub fn decompress_block(
-	compressed_block: &[u8],
-	compression: CompressionType,
-) -> Result<Vec<u8>> {
+pub fn decompress_block(compressed_block: &[u8], compression: CompressionType) -> Result<Vec<u8>> {
 	match compression {
 		CompressionType::SnappyCompression => {
 			let mut dec = snap::raw::Decoder::new();
@@ -792,6 +786,30 @@ fn verify_table_block(block: &[u8], compression_type: u8, want: u32) -> bool {
 // TABLE (SSTable Reader)
 // =============================================================================
 
+/// An immutable SSTable reader.
+///
+/// ## Opening a Table
+///
+/// 1. Read footer
+/// 2. Load top-level index block
+/// 3. Load meta index block
+/// 4. Extract table metadata and filter block
+///
+/// ## Point Lookup Flow
+///
+/// ```text
+/// get("banana"):
+///   1. Bloom filter check (early rejection if definitely not present)
+///   2. Top-level index lookup → find partition block
+///   3. Partition block lookup → find data block handle
+///   4. Data block lookup → find key-value pair
+/// ```
+///
+/// ## Range Scan Flow
+///
+/// Uses TableIterator which coordinates:
+/// - first_level: IndexIterator (navigates index entries)
+/// - second_level: BlockIterator (navigates data block entries)
 #[derive(Clone)]
 pub enum IndexType {
 	Partitioned(Index),
@@ -837,12 +855,7 @@ pub struct Table {
 
 impl Table {
 	/// Opens an SSTable file for reading.
-	pub fn new(
-		id: u64,
-		opts: Arc<Options>,
-		file: Arc<dyn File>,
-		file_size: u64,
-	) -> Result<Table> {
+	pub fn new(id: u64, opts: Arc<Options>, file: Arc<dyn File>, file_size: u64) -> Result<Table> {
 		// Step 1: Read footer
 		let footer = read_footer(Arc::clone(&file), file_size as usize)?;
 
@@ -1299,19 +1312,10 @@ impl<'a> TableIterator<'a> {
 	///
 	/// Result: iterator now at "date" (correct answer for seek("banana"))
 	/// ```
-	///
-	/// ## Name Discussion
-	///
-	/// This function is called `SkipEmptyDataBlocksForward` in RocksDB/LevelDB,
-	/// but that name is misleading because:
-	/// - Data blocks are NEVER empty in practice
-	/// - The real issue is invalid iterator position after seek
-	///
-	/// Better name: `advance_to_valid_entry`
 	fn advance_to_valid_entry(&mut self) -> Result<()> {
 		loop {
 			// Success: current position is valid
-			if self.second_level.as_ref().map_or(false, |iter| iter.is_valid()) {
+			if self.second_level.as_ref().is_some_and(|iter| iter.is_valid()) {
 				return Ok(());
 			}
 
@@ -1336,7 +1340,7 @@ impl<'a> TableIterator<'a> {
 	/// Mirror of advance_to_valid_entry for backward iteration.
 	fn retreat_to_valid_entry(&mut self) -> Result<()> {
 		loop {
-			if self.second_level.as_ref().map_or(false, |iter| iter.is_valid()) {
+			if self.second_level.as_ref().is_some_and(|iter| iter.is_valid()) {
 				return Ok(());
 			}
 
@@ -1740,9 +1744,7 @@ impl InternalIterator for TableIterator<'_> {
 
 		self.advance_internal()?;
 
-		if !self.is_valid() {
-			self.mark_exhausted();
-		} else if !self.satisfies_upper_bound(self.current_user_key()) {
+		if !self.is_valid() || !self.satisfies_upper_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
 		Ok(self.is_valid())
@@ -1760,9 +1762,7 @@ impl InternalIterator for TableIterator<'_> {
 
 		self.prev_internal()?;
 
-		if !self.is_valid() {
-			self.mark_exhausted();
-		} else if !self.satisfies_lower_bound(self.current_user_key()) {
+		if !self.is_valid() || !self.satisfies_lower_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
 		Ok(self.is_valid())

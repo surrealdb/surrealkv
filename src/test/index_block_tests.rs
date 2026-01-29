@@ -550,9 +550,9 @@ fn test_partitioned_index_seek_correctness() {
 	assert!(iter.valid(), "Iterator should be valid after seek_to_last");
 
 	let mut backward_keys = Vec::new();
-	backward_keys.push(std::str::from_utf8(&iter.key().user_key()).unwrap().to_string());
+	backward_keys.push(std::str::from_utf8(iter.key().user_key()).unwrap().to_string());
 	while iter.prev().unwrap() {
-		backward_keys.push(std::str::from_utf8(&iter.key().user_key()).unwrap().to_string());
+		backward_keys.push(std::str::from_utf8(iter.key().user_key()).unwrap().to_string());
 	}
 
 	// Verify backward iteration matches reverse of forward iteration
@@ -666,26 +666,18 @@ fn test_partitioned_index_reseek() {
 	let seek_key = InternalKey::new(b"0055".to_vec(), 4, InternalKeyKind::Set, 0);
 	iter.seek(&seek_key.encode()).unwrap();
 	assert!(iter.valid(), "Iterator should be valid after seek");
-	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
-		"0055",
-		"Should find key 0055"
-	);
+	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0055", "Should find key 0055");
 
 	// SeekToLast
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid(), "Iterator should be valid after seek_to_last");
-	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
-		"0095",
-		"Should find last key"
-	);
+	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0095", "Should find last key");
 
 	// Reseek to same key - should work correctly
 	iter.seek(&seek_key.encode()).unwrap();
 	assert!(iter.valid(), "Iterator should be valid after reseek");
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		std::str::from_utf8(iter.key().user_key()).unwrap(),
 		"0055",
 		"Should find key 0055 after reseek"
 	);
@@ -694,7 +686,7 @@ fn test_partitioned_index_reseek() {
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid(), "Iterator should be valid after second seek_to_last");
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		std::str::from_utf8(iter.key().user_key()).unwrap(),
 		"0095",
 		"Should find last key again"
 	);
@@ -705,7 +697,7 @@ fn test_partitioned_index_reseek() {
 	iter.prev().unwrap();
 	assert!(iter.valid());
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		std::str::from_utf8(iter.key().user_key()).unwrap(),
 		"0075",
 		"Should find key 0075 after two prev()"
 	);
@@ -714,11 +706,7 @@ fn test_partitioned_index_reseek() {
 	let seek_key_0095 = InternalKey::new(b"0095".to_vec(), 10, InternalKeyKind::Set, 0);
 	iter.seek(&seek_key_0095.encode()).unwrap();
 	assert!(iter.valid());
-	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
-		"0095",
-		"Should find key 0095"
-	);
+	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0095", "Should find key 0095");
 
 	// Prev twice
 	iter.prev().unwrap();
@@ -726,7 +714,7 @@ fn test_partitioned_index_reseek() {
 	iter.prev().unwrap();
 	assert!(iter.valid());
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		std::str::from_utf8(iter.key().user_key()).unwrap(),
 		"0075",
 		"Should find key 0075 after prev from 0095"
 	);
@@ -734,17 +722,13 @@ fn test_partitioned_index_reseek() {
 	// SeekToLast
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid());
-	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
-		"0095",
-		"Should find last key"
-	);
+	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0095", "Should find last key");
 
 	// Seek to 0095 again
 	iter.seek(&seek_key_0095.encode()).unwrap();
 	assert!(iter.valid());
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		std::str::from_utf8(iter.key().user_key()).unwrap(),
 		"0095",
 		"Should find key 0095 after reseek"
 	);
@@ -754,21 +738,13 @@ fn test_partitioned_index_reseek() {
 	assert!(iter.valid());
 	iter.prev().unwrap();
 	assert!(iter.valid());
-	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
-		"0075",
-		"Should find key 0075"
-	);
+	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0075", "Should find key 0075");
 
 	// Seek to 0075
 	let seek_key_0075 = InternalKey::new(b"0075".to_vec(), 8, InternalKeyKind::Set, 0);
 	iter.seek(&seek_key_0075.encode()).unwrap();
 	assert!(iter.valid());
-	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
-		"0075",
-		"Should find key 0075"
-	);
+	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0075", "Should find key 0075");
 
 	// Next twice
 	iter.next().unwrap();
@@ -776,7 +752,7 @@ fn test_partitioned_index_reseek() {
 	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
+		std::str::from_utf8(iter.key().user_key()).unwrap(),
 		"0095",
 		"Should find key 0095 after two next()"
 	);
@@ -784,11 +760,7 @@ fn test_partitioned_index_reseek() {
 	// SeekToLast
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid());
-	assert_eq!(
-		std::str::from_utf8(&iter.key().user_key()).unwrap(),
-		"0095",
-		"Should find last key"
-	);
+	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0095", "Should find last key");
 }
 
 #[test]

@@ -65,37 +65,58 @@ pub enum Durability {
 	Immediate,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct TransactionOptions {
+	pub mode: Mode,
+	pub durability: Durability,
+}
+
+impl TransactionOptions {
+	pub fn read_only() -> Self {
+		Self::new_with_mode(Mode::ReadOnly)
+	}
+
+	pub fn write_only() -> Self {
+		Self::new_with_mode(Mode::WriteOnly)
+	}
+
+	pub fn new() -> Self {
+		Self::new_with_mode(Mode::ReadWrite)
+	}
+
+	pub fn new_with_mode(mode: Mode) -> Self {
+		Self {
+			mode,
+			durability: Default::default(),
+		}
+	}
+
+	pub fn with_durability(mut self, durability: Durability) -> Self {
+		self.durability = durability;
+		self
+	}
+}
+
+impl Default for TransactionOptions {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 /// Options for write operations in transactions.
 /// This struct allows configuring various parameters for write operations
 /// like set() and delete().
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Default, Debug, Clone, PartialEq)]
 pub struct WriteOptions {
-	/// Durability level for the write operation
-	pub durability: Durability,
 	/// Optional timestamp for the write operation. If None, uses the current
 	/// timestamp.
 	pub timestamp: Option<u64>,
-}
-
-impl Default for WriteOptions {
-	fn default() -> Self {
-		Self {
-			durability: Durability::Eventual,
-			timestamp: None,
-		}
-	}
 }
 
 impl WriteOptions {
 	/// Creates a new WriteOptions with default values
 	pub fn new() -> Self {
 		Self::default()
-	}
-
-	/// Sets the durability level for write operations
-	pub fn with_durability(mut self, durability: Durability) -> Self {
-		self.durability = durability;
-		self
 	}
 
 	/// Sets the timestamp for write operations
@@ -207,7 +228,12 @@ impl Transaction {
 	}
 
 	/// Prepare a new transaction in the given mode.
-	pub(crate) fn new(core: Arc<Core>, mode: Mode) -> Result<Self> {
+	pub(crate) fn new(core: Arc<Core>, opts: TransactionOptions) -> Result<Self> {
+		let TransactionOptions {
+			mode,
+			durability,
+		} = opts;
+
 		let read_ts = core.seq_num();
 
 		let start_commit_id =
@@ -229,7 +255,7 @@ impl Transaction {
 			snapshot,
 			core,
 			write_set: BTreeMap::new(),
-			durability: Durability::Eventual,
+			durability,
 			closed: false,
 			start_commit_id,
 			savepoints: 0,
@@ -262,19 +288,12 @@ impl Transaction {
 		V: IntoBytes,
 	{
 		let write_seqno = self.next_write_seqno();
-		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key,
-				Some(value),
-				InternalKeyKind::Set,
-				self.savepoints,
-				write_seqno,
-				timestamp,
-			)
-		} else {
-			Entry::new(key, Some(value), InternalKeyKind::Set, self.savepoints, write_seqno)
-		};
-		self.write_with_options(entry, options)?;
+		let ts = options.timestamp.unwrap_or(Entry::COMMIT_TIME);
+
+		let entry =
+			Entry::new(key, Some(value), InternalKeyKind::Set, self.savepoints, write_seqno, ts);
+
+		self.write(entry)?;
 		Ok(())
 	}
 
@@ -293,19 +312,17 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let write_seqno = self.next_write_seqno();
-		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key,
-				None::<&[u8]>,
-				InternalKeyKind::Delete,
-				self.savepoints,
-				write_seqno,
-				timestamp,
-			)
-		} else {
-			Entry::new(key, None::<&[u8]>, InternalKeyKind::Delete, self.savepoints, write_seqno)
-		};
-		self.write_with_options(entry, options)?;
+		let ts = options.timestamp.unwrap_or(Entry::COMMIT_TIME);
+
+		let entry = Entry::new(
+			key,
+			None::<&[u8]>,
+			InternalKeyKind::Delete,
+			self.savepoints,
+			write_seqno,
+			ts,
+		);
+		self.write(entry)?;
 		Ok(())
 	}
 
@@ -333,25 +350,17 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		let write_seqno = self.next_write_seqno();
-		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key,
-				None::<&[u8]>,
-				InternalKeyKind::SoftDelete,
-				self.savepoints,
-				write_seqno,
-				timestamp,
-			)
-		} else {
-			Entry::new(
-				key,
-				None::<&[u8]>,
-				InternalKeyKind::SoftDelete,
-				self.savepoints,
-				write_seqno,
-			)
-		};
-		self.write_with_options(entry, options)?;
+		let ts = options.timestamp.unwrap_or(Entry::COMMIT_TIME);
+
+		let entry = Entry::new(
+			key,
+			None::<&[u8]>,
+			InternalKeyKind::SoftDelete,
+			self.savepoints,
+			write_seqno,
+			ts,
+		);
+		self.write(entry)?;
 		Ok(())
 	}
 
@@ -377,19 +386,18 @@ impl Transaction {
 		V: IntoBytes,
 	{
 		let write_seqno = self.next_write_seqno();
-		let entry = if let Some(timestamp) = options.timestamp {
-			Entry::new_with_timestamp(
-				key,
-				Some(value),
-				InternalKeyKind::Replace,
-				self.savepoints,
-				write_seqno,
-				timestamp,
-			)
-		} else {
-			Entry::new(key, Some(value), InternalKeyKind::Replace, self.savepoints, write_seqno)
-		};
-		self.write_with_options(entry, options)?;
+		let ts = options.timestamp.unwrap_or(Entry::COMMIT_TIME);
+
+		let entry = Entry::new(
+			key,
+			Some(value),
+			InternalKeyKind::Replace,
+			self.savepoints,
+			write_seqno,
+			ts,
+		);
+
+		self.write(entry)?;
 		Ok(())
 	}
 
@@ -488,14 +496,12 @@ impl Transaction {
 			}
 
 			// Query the versioned index through the snapshot
-			return match &self.snapshot {
+			match &self.snapshot {
 				Some(snapshot) => snapshot.get_at_version(key.as_slice(), timestamp),
 				None => Err(Error::NoSnapshot),
-			};
+			}
 		} else {
-			return Err(Error::InvalidArgument(
-				"Timestamp is required for versioned queries".to_string(),
-			));
+			Err(Error::InvalidArgument("Timestamp is required for versioned queries".to_string()))
 		}
 	}
 
@@ -546,9 +552,7 @@ impl Transaction {
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
-			return Err(Error::InvalidArgument(
-				"Timestamp is required for versioned queries".to_string(),
-			));
+			Err(Error::InvalidArgument("Timestamp is required for versioned queries".to_string()))
 		}
 	}
 
@@ -636,9 +640,7 @@ impl Transaction {
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
-			return Err(Error::InvalidArgument(
-				"Timestamp is required for versioned queries".to_string(),
-			));
+			Err(Error::InvalidArgument("Timestamp is required for versioned queries".to_string()))
 		}
 	}
 
@@ -686,7 +688,7 @@ impl Transaction {
 
 	/// Writes a value for a key with custom write options. None is used for
 	/// deletion.
-	fn write_with_options(&mut self, e: Entry, options: &WriteOptions) -> Result<()> {
+	fn write(&mut self, e: Entry) -> Result<()> {
 		// If the transaction mode is not mutable (i.e., it's read-only), return an
 		// error.
 		if !self.mode.mutable() {
@@ -700,8 +702,6 @@ impl Transaction {
 		if e.key.is_empty() {
 			return Err(Error::EmptyKey);
 		}
-
-		self.durability = options.durability;
 
 		// Add the entry to the write set
 		let key = e.key.clone();
@@ -773,7 +773,7 @@ impl Transaction {
 		for entry in latest_writes {
 			// Use the entry's timestamp if it was explicitly set (via set_at_version),
 			// otherwise use the commit timestamp
-			let timestamp = if entry.timestamp != 0 {
+			let timestamp = if entry.timestamp != Entry::COMMIT_TIME {
 				entry.timestamp
 			} else {
 				commit_timestamp
@@ -894,24 +894,9 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
-	fn new<K: IntoBytes, V: IntoBytes>(
-		key: K,
-		value: Option<V>,
-		kind: InternalKeyKind,
-		savepoint_no: u32,
-		seqno: u32,
-	) -> Entry {
-		Entry {
-			key: key.into_bytes(),
-			value: value.map(|v| v.into_bytes()),
-			kind,
-			savepoint_no,
-			seqno,
-			timestamp: 0, // Will be set at commit time
-		}
-	}
+	const COMMIT_TIME: u64 = 0;
 
-	fn new_with_timestamp<K: IntoBytes, V: IntoBytes>(
+	fn new<K: IntoBytes, V: IntoBytes>(
 		key: K,
 		value: Option<V>,
 		kind: InternalKeyKind,
@@ -1366,6 +1351,7 @@ impl<'a> TransactionIterator<'a> {
 	}
 
 	/// Move to next entry. Returns true if valid.
+	#[allow(clippy::should_implement_trait)]
 	pub fn next(&mut self) -> Result<bool> {
 		self.inner.next()
 	}

@@ -88,7 +88,7 @@ impl MemTable {
 	pub(crate) fn new(arena_capacity: usize) -> Self {
 		let arena = Arc::new(Arena::new(arena_capacity));
 		let cmp: Compare = |a, b| a.cmp(b);
-		let skiplist = Skiplist::new(arena.clone(), cmp);
+		let skiplist = Skiplist::new(arena, cmp);
 		MemTable {
 			skiplist,
 			latest_seq_num: AtomicU64::new(0),

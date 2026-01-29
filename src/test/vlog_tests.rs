@@ -1202,3 +1202,74 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 	assert_eq!(scan_at_ts5.len(), 1, "Version at timestamp 6000 should still exist (recent)");
 	assert_eq!(scan_at_ts6.len(), 1, "Version at timestamp 6001 should still exist (recent)");
 }
+
+#[test(tokio::test)]
+async fn test_delete_list_large_batch_chunking() {
+	// This test verifies that large batches are properly chunked to avoid ArenaFull errors.
+	// We use a small memtable size to make it easier to trigger the issue if chunking wasn't
+	// working.
+	let temp_dir = TempDir::new().unwrap();
+
+	let mut opts = Options {
+		vlog_checksum_verification: VLogChecksumLevel::Full,
+		max_memtable_size: 64 * 1024, // 64KB - small memtable to test chunking
+		..Default::default()
+	};
+
+	opts.path = temp_dir.path().to_path_buf();
+
+	// Create vlog subdirectory
+	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
+	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
+
+	let opts = Arc::new(opts);
+	let vlog = VLog::new(opts, None).unwrap();
+
+	// Create a large batch of entries (more than DELETE_LIST_CHUNK_SIZE * 2)
+	// DELETE_LIST_CHUNK_SIZE is 10_000, so 25_000 entries will require 3 chunks
+	const NUM_ENTRIES: usize = 25_000;
+	let mut entries = Vec::with_capacity(NUM_ENTRIES);
+
+	for i in 0..NUM_ENTRIES {
+		// Use sequence numbers starting from 1000 to avoid conflicts
+		let seq_num = 1000 + i as u64;
+		let value_size = (i * 100) as u64; // Varying value sizes
+		entries.push((seq_num, value_size));
+	}
+
+	// Add all entries - this should succeed with chunking
+	vlog.add_batch_to_delete_list(entries.clone()).unwrap();
+
+	// Verify all entries are queryable via is_stale()
+	for (seq_num, _) in &entries {
+		assert!(
+			vlog.is_stale(*seq_num).unwrap(),
+			"Entry with seq_num {} should be marked as stale",
+			seq_num
+		);
+	}
+
+	// Verify entries that weren't added are not stale
+	assert!(
+		!vlog.is_stale(999).unwrap(),
+		"Entry with seq_num 999 should NOT be stale (wasn't added)"
+	);
+	assert!(
+		!vlog.is_stale(1000 + NUM_ENTRIES as u64).unwrap(),
+		"Entry beyond range should NOT be stale"
+	);
+
+	// Test bulk delete - delete all entries
+	let seq_nums: Vec<u64> = entries.iter().map(|(seq_num, _)| *seq_num).collect();
+	vlog.delete_list.delete_entries_batch(seq_nums).unwrap();
+
+	// Verify all entries are no longer stale
+	for (seq_num, _) in &entries {
+		assert!(
+			!vlog.is_stale(*seq_num).unwrap(),
+			"Entry with seq_num {} should NOT be stale after deletion",
+			seq_num
+		);
+	}
+}
