@@ -1301,15 +1301,6 @@ impl<'a> TableIterator<'a> {
 	///
 	/// Result: iterator now at "date" (correct answer for seek("banana"))
 	/// ```
-	///
-	/// ## Name Discussion
-	///
-	/// This function is called `SkipEmptyDataBlocksForward` in RocksDB/LevelDB,
-	/// but that name is misleading because:
-	/// - Data blocks are NEVER empty in practice
-	/// - The real issue is invalid iterator position after seek
-	///
-	/// Better name: `advance_to_valid_entry`
 	fn advance_to_valid_entry(&mut self) -> Result<()> {
 		loop {
 			// Success: current position is valid

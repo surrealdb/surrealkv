@@ -21,7 +21,7 @@ use crate::oracle::Oracle;
 use crate::snapshot::Counter as SnapshotCounter;
 use crate::sstable::table::Table;
 use crate::task::TaskManager;
-use crate::transaction::{Mode, Transaction};
+use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vlog::{VLog, VLogGCManager, ValueLocation};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal};
@@ -1385,13 +1385,17 @@ impl Tree {
 
 	/// Transactions provide a consistent, atomic view of the database.
 	pub fn begin(&self) -> Result<Transaction> {
-		let txn = Transaction::new(Arc::clone(&self.core), Mode::ReadWrite)?;
-		Ok(txn)
+		self.begin_with_opts(TransactionOptions::new())
 	}
 
 	/// Begins a new transaction with the specified mode
 	pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
-		let txn = Transaction::new(Arc::clone(&self.core), mode)?;
+		self.begin_with_opts(TransactionOptions::new_with_mode(mode))
+	}
+
+	/// Begins a new transaction with the provided options
+	pub fn begin_with_opts(&self, opts: TransactionOptions) -> Result<Transaction> {
+		let txn = Transaction::new(Arc::clone(&self.core), opts)?;
 		Ok(txn)
 	}
 
