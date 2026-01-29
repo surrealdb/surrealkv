@@ -1717,6 +1717,30 @@ impl TreeBuilder {
 		self
 	}
 
+	/// Sets the VLog value threshold in bytes.
+	///
+	/// Values smaller than this threshold are stored inline in SSTables.
+	/// Values larger than or equal to this threshold are stored in VLog files.
+	///
+	/// Default: 4096 (4KB)
+	///
+	/// # Example
+	///
+	/// ```no_run
+	/// use surrealkv::TreeBuilder;
+	///
+	/// let tree = TreeBuilder::new()
+	///     .with_path("./data".into())
+	///     .with_enable_vlog(true)
+	///     .with_vlog_value_threshold(8192) // 8KB threshold
+	///     .build()
+	///     .unwrap();
+	/// ```
+	pub fn with_vlog_value_threshold(mut self, value: usize) -> Self {
+		self.opts = self.opts.with_vlog_value_threshold(value);
+		self
+	}
+
 	/// Enables or disables versioned queries with timestamp tracking
 	pub fn with_versioning(mut self, enable: bool, retention_ns: u64) -> Self {
 		self.opts = self.opts.with_versioning(enable, retention_ns);
