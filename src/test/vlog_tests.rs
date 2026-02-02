@@ -6,6 +6,7 @@ use test_log::test;
 
 use crate::clock::LogicalClock;
 use crate::discard::DiscardStats;
+use crate::test::{count_history_versions_in_range, point_in_time_from_history_in_range};
 use crate::vlog::{
 	VLog,
 	VLogFileHeader,
@@ -1086,8 +1087,8 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 	let tx = tree.begin().unwrap();
 	let mut end_key = user_key.to_vec();
 	end_key.push(0);
-	let scan_all = tx.scan_all_versions(user_key.as_ref(), &end_key, None).unwrap();
-	assert_eq!(scan_all.len(), 4, "Should have 4 versions before GC");
+	let version_count = count_history_versions_in_range(&tx, user_key.as_ref(), &end_key).unwrap();
+	assert_eq!(version_count, 4, "Should have 4 versions before GC");
 
 	drop(tx);
 
@@ -1125,54 +1126,37 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 	let tx = tree.begin().unwrap();
 	let mut end_key = user_key.to_vec();
 	end_key.push(0);
-	let scan_after = tx.scan_all_versions(user_key.as_ref(), &end_key, None).unwrap();
+	let version_count_after =
+		count_history_versions_in_range(&tx, user_key.as_ref(), &end_key).unwrap();
 
 	// We should have at least some versions remaining
-	assert!(!scan_after.is_empty(), "Should have at least some versions remaining");
+	assert!(version_count_after > 0, "Should have at least some versions remaining");
 
 	// If GC deleted files, we should have fewer versions
 	if !all_deleted_files.is_empty() {
 		// We should have fewer versions after GC
 		assert!(
-			scan_after.len() < 6,
+			version_count_after < 6,
 			"Should have fewer versions after GC deleted files. Before: 6, After: {}",
-			scan_after.len()
+			version_count_after
 		);
 	}
 
 	// Test specific timestamp queries to verify which versions were deleted
 	let mut end_key = user_key.to_vec();
 	end_key.push(0);
-	let scan_at_ts1 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 1000)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
-	let scan_at_ts2 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 2000)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
-	let scan_at_ts3 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 3000)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
-	let scan_at_ts4 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 4000)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
-	let scan_at_ts5 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 6000)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
-	let scan_at_ts6 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 6001)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
+	let scan_at_ts1 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 1000).unwrap();
+	let scan_at_ts2 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 2000).unwrap();
+	let scan_at_ts3 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 3000).unwrap();
+	let scan_at_ts4 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 4000).unwrap();
+	let scan_at_ts5 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 6000).unwrap();
+	let scan_at_ts6 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 6001).unwrap();
 
 	// The key insight: VLog GC only processes files with high discard ratios
 	// Files 0, 1, 2 had high discard ratios (0.97) and were processed

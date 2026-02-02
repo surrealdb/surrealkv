@@ -736,7 +736,7 @@ fn is_replace_kind(kind: InternalKeyKind) -> bool {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum InternalKeyKind {
 	Delete = 0,
 	SoftDelete = 1,
@@ -840,13 +840,13 @@ impl InternalKey {
 	}
 
 	/// Compares this key with another key using timestamp-based ordering
-	/// First compares by user key, then by timestamp (ascending - older
-	/// timestamps first)
+	/// First compares by user key, then by timestamp (descending - newer
+	/// timestamps first, matching LSM seq_num ordering)
 	pub(crate) fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
 		// First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
-			// If user keys are equal, compare by timestamp (ascending - older timestamps first)
-			Ordering::Equal => self.timestamp.cmp(&other.timestamp),
+			// If user keys are equal, compare by timestamp (descending - newer timestamps first)
+			Ordering::Equal => other.timestamp.cmp(&self.timestamp),
 			ordering => ordering,
 		}
 	}
@@ -855,12 +855,15 @@ impl InternalKey {
 // Used only by memtable, sstable uses internal key comparator
 impl Ord for InternalKey {
 	fn cmp(&self, other: &Self) -> Ordering {
-		// Same as InternalKey: user key, then sequence number, then kind, with
-		// timestamp as final tiebreaker First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
-			// If user keys are equal, compare by sequence number (descending)
-			Ordering::Equal => other.seq_num().cmp(&self.seq_num()),
-			ordering => ordering,
+			Ordering::Equal => match other.seq_num().cmp(&self.seq_num()) {
+				Ordering::Equal => match self.kind().cmp(&other.kind()) {
+					Ordering::Equal => other.timestamp.cmp(&self.timestamp), // DESC for timestamp
+					ord => ord,
+				},
+				ord => ord,
+			},
+			ord => ord,
 		}
 	}
 }
@@ -921,6 +924,16 @@ impl<'a> InternalKeyRef<'a> {
 	#[inline]
 	pub fn is_tombstone(&self) -> bool {
 		is_delete_kind(self.kind())
+	}
+
+	#[inline]
+	pub fn is_hard_delete_marker(&self) -> bool {
+		is_hard_delete_marker(self.kind())
+	}
+
+	#[inline]
+	pub fn is_replace(&self) -> bool {
+		is_replace_kind(self.kind())
 	}
 
 	pub fn to_owned(self) -> InternalKey {

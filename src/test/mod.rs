@@ -4,10 +4,12 @@
 //! including WAL recovery, memtable flush, SST interaction, and manifest
 //! coordination.
 
+use std::collections::HashMap;
+
 use crate::snapshot::SnapshotIterator;
-use crate::transaction::TransactionIterator;
+use crate::transaction::{HistoryOptions, TransactionIterator};
 use crate::vlog::ValueLocation;
-use crate::{InternalIterator, InternalKey, Key, Result, Value};
+use crate::{InternalIterator, InternalKey, Key, Result, TransactionHistoryIterator, Value};
 
 #[cfg(test)]
 pub mod batch_tests;
@@ -141,4 +143,140 @@ fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(Internal
 		}
 	}
 	Ok(result)
+}
+
+/// Type alias for a map of keys to their version information
+/// Each key maps to a vector of (value, timestamp, is_tombstone) tuples
+#[allow(dead_code)]
+type KeyVersionsMap = HashMap<Key, Vec<(Vec<u8>, u64, bool)>>;
+
+/// Collects all entries from a TransactionHistoryIterator
+/// Returns a vector of (key, value, timestamp, is_tombstone) tuples
+#[allow(dead_code)]
+fn collect_history_all(
+	iter: &mut TransactionHistoryIterator,
+) -> crate::Result<Vec<(Key, Value, u64, bool)>> {
+	iter.seek_first()?;
+	let mut result = Vec::new();
+	while iter.valid() {
+		let is_tombstone = iter.is_tombstone();
+		// Tombstones have no value, so use empty vec
+		let value = if is_tombstone {
+			Vec::new()
+		} else {
+			iter.value()?
+		};
+		result.push((iter.key(), value, iter.timestamp(), is_tombstone));
+		iter.next()?;
+	}
+	Ok(result)
+}
+
+/// Gets a point-in-time snapshot of key-values from a history iterator
+/// Returns the latest version of each key at or before the given timestamp
+///
+/// IMPORTANT: The iterator MUST be created with include_tombstones=true for this
+/// function to correctly handle deleted keys. If tombstones are not included,
+/// soft-deleted keys will incorrectly appear in the results.
+#[allow(dead_code)]
+fn point_in_time_from_history(
+	iter: &mut TransactionHistoryIterator,
+	timestamp: u64,
+) -> crate::Result<Vec<(Key, Value)>> {
+	use std::collections::BTreeMap;
+
+	iter.seek_first()?;
+	// Track the latest entry for each key by timestamp (value, timestamp, is_tombstone)
+	let mut latest_entries: BTreeMap<Key, (Option<Value>, u64, bool)> = BTreeMap::new();
+
+	while iter.valid() {
+		let ts = iter.timestamp();
+		let key = iter.key();
+		let is_tombstone = iter.is_tombstone();
+
+		// Only consider versions at or before the requested timestamp
+		if ts <= timestamp {
+			// Check if we need to update this key's entry (higher timestamp wins)
+			let should_update = match latest_entries.get(&key) {
+				None => true,
+				Some((_, existing_ts, _)) => ts > *existing_ts,
+			};
+
+			if should_update {
+				let value = if is_tombstone {
+					None
+				} else {
+					Some(iter.value()?)
+				};
+				latest_entries.insert(key.clone(), (value, ts, is_tombstone));
+			}
+		}
+
+		iter.next()?;
+	}
+
+	// Filter out tombstones - keys whose latest entry is a delete
+	Ok(latest_entries
+		.into_iter()
+		.filter_map(|(k, (v, _, is_tombstone))| {
+			if is_tombstone {
+				None
+			} else {
+				Some((k, v.unwrap()))
+			}
+		})
+		.collect())
+}
+
+/// Helper to count all versions of a key using history() iterator
+fn count_history_versions_in_range(
+	tx: &crate::Transaction,
+	start: &[u8],
+	end: &[u8],
+) -> crate::Result<usize> {
+	let mut iter = tx.history(start, end)?;
+	iter.seek_first()?;
+	let mut count = 0;
+	while iter.valid() {
+		count += 1;
+		iter.next()?;
+	}
+	Ok(count)
+}
+
+/// Helper to get point-in-time snapshot from history iterator
+fn point_in_time_from_history_in_range(
+	tx: &crate::Transaction,
+	start: &[u8],
+	end: &[u8],
+	timestamp: u64,
+) -> crate::Result<Vec<(crate::Key, crate::Value)>> {
+	use std::collections::BTreeMap;
+	let opts = HistoryOptions {
+		include_tombstones: true,
+		..Default::default()
+	};
+	let mut iter = tx.history_with_options(start, end, &opts)?;
+	iter.seek_first()?;
+	let mut result: BTreeMap<crate::Key, (crate::Value, u64)> = BTreeMap::new();
+	while iter.valid() {
+		let ts = iter.timestamp();
+		let key = iter.key();
+		let is_tombstone = iter.is_tombstone();
+		if ts <= timestamp {
+			let should_update = match result.get(&key) {
+				None => true,
+				Some((_, existing_ts)) => ts > *existing_ts,
+			};
+			if should_update {
+				if is_tombstone {
+					result.remove(&key);
+				} else {
+					result.insert(key.clone(), (iter.value()?, ts));
+				}
+			}
+		}
+		iter.next()?;
+	}
+	Ok(result.into_iter().map(|(k, (v, _))| (k, v)).collect())
 }

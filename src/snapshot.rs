@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
-use std::collections::BTreeMap;
 use std::fs::File;
-use std::ops::{Bound, RangeBounds};
+use std::ops::Bound;
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
@@ -21,13 +20,8 @@ use crate::{
 	InternalKeyKind,
 	InternalKeyRange,
 	InternalKeyRef,
-	IntoBytes,
-	Key,
 	Value,
 };
-
-/// Type alias for version scan results
-pub type VersionScanResult = (Key, Value, u64, bool);
 
 // ===== Snapshot Counter =====
 /// Tracks the number of active snapshots in the system.
@@ -69,18 +63,6 @@ pub(crate) struct IterState {
 	pub immutable: Vec<Arc<MemTable>>,
 	/// All levels containing SSTables
 	pub levels: Levels,
-}
-
-/// Query parameters for versioned range queries
-#[derive(Debug, Clone)]
-pub(crate) struct VersionedRangeQueryParams<'a, R: RangeBounds<Vec<u8>> + 'a> {
-	pub(crate) key_range: &'a R,
-	pub(crate) start_ts: u64,
-	pub(crate) end_ts: u64,
-	pub(crate) snapshot_seq_num: u64,
-	pub(crate) limit: Option<usize>,
-	pub(crate) include_tombstones: bool,
-	pub(crate) include_latest_only: bool, // When true, only include the latest version of each key
 }
 
 // ===== Snapshot Implementation =====
@@ -232,31 +214,6 @@ impl Snapshot {
 		SnapshotIterator::new_from(Arc::clone(&self.core), self.seq_num, internal_range)
 	}
 
-	/// Creates an iterator that returns ALL versions of keys in the range
-	/// from the LSM tree directly (memtables + SSTables).
-	/// Unlike `range()` which returns only the latest version per key,
-	/// this returns every visible version in (user_key, seq_num descending) order.
-	///
-	/// This method queries the LSM index directly and does not require the
-	/// B+tree versioned index to be enabled.
-	pub(crate) fn versioned_range(
-		&self,
-		lower: Option<&[u8]>,
-		upper: Option<&[u8]>,
-		include_tombstones: bool,
-	) -> Result<VersionedSnapshotIterator<'_>> {
-		let internal_range = crate::user_range_to_internal_range(
-			lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
-			upper.map(Bound::Excluded).unwrap_or(Bound::Unbounded),
-		);
-		VersionedSnapshotIterator::new_from(
-			Arc::clone(&self.core),
-			self.seq_num,
-			internal_range,
-			include_tombstones,
-		)
-	}
-
 	/// Creates a streaming B+tree iterator for versioned queries.
 	///
 	/// This method returns a true streaming iterator over the B+tree versioned index,
@@ -286,50 +243,62 @@ impl Snapshot {
 		BPlusTreeIteratorWithGuard::new(versioned_index)
 	}
 
+	/// Creates a unified history iterator that works with both LSM and B+tree backends.
+	///
+	/// This method returns a `HistoryIterator` enum that abstracts over the underlying
+	/// storage implementation, providing a single interface for versioned queries.
+	///
+	/// # Arguments
+	/// * `lower` - Optional lower bound key (inclusive)
+	/// * `upper` - Optional upper bound key (exclusive)
+	/// * `include_tombstones` - Whether to include tombstones in the iteration
+	///
+	/// # Errors
+	/// Returns an error if versioning is not enabled.
+	pub(crate) fn history_iter(
+		&self,
+		lower: Option<&[u8]>,
+		upper: Option<&[u8]>,
+		include_tombstones: bool,
+	) -> Result<HistoryIterator<'_>> {
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
+		}
+
+		if self.core.opts.enable_versioned_index {
+			let btree_iter = self.btree_history_iter(lower, upper)?;
+			Ok(HistoryIterator::new_btree(
+				btree_iter,
+				Arc::clone(&self.core),
+				self.seq_num,
+				include_tombstones,
+				lower,
+				upper,
+			))
+		} else {
+			// Create range for KMergeIterator
+			let range = crate::user_range_to_internal_range(
+				lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
+				upper.map(Bound::Excluded).unwrap_or(Bound::Unbounded),
+			);
+			let iter_state = self.collect_iter_state()?;
+			Ok(HistoryIterator::new_lsm(
+				Arc::clone(&self.core),
+				self.seq_num,
+				iter_state,
+				range,
+				include_tombstones,
+			))
+		}
+	}
+
 	/// Queries for a specific key at a specific timestamp.
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num).
 	///
-	/// If the B+tree versioned index is enabled, queries it directly.
-	/// Otherwise, falls back to scanning the LSM tree.
-	pub(crate) fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
-		// Try B+tree first if available
-		if self.core.opts.enable_versioned_index {
-			// Create a range that includes only the specific key
-			let key_range = key.to_vec()..=key.to_vec();
-
-			let mut versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
-				key_range: &key_range,
-				start_ts: 0, // Start from beginning of time
-				end_ts: timestamp,
-				snapshot_seq_num: self.seq_num,
-				limit: None,
-				include_tombstones: false, // Don't include tombstones
-				include_latest_only: true,
-			})?;
-
-			// Get the latest version (should be only one due to include_latest_only: true)
-			if let Some((_internal_key, encoded_value)) = versioned_iter.next() {
-				return Ok(Some(self.core.resolve_value(&encoded_value)?));
-			} else {
-				return Ok(None);
-			}
-		}
-
-		// Fallback to LSM query if versioning is enabled but B+tree index is not
-		if self.core.opts.enable_versioning {
-			return self.get_at_version_from_lsm(key, timestamp);
-		}
-
-		Err(Error::InvalidArgument("Versioning not enabled".to_string()))
-	}
-
-	/// Queries the LSM tree directly for a specific key at a specific timestamp.
-	/// Used as fallback when B+tree index is not available.
-	fn get_at_version_from_lsm(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
-		// Create a range for just this key
-		// We need to find the version with timestamp <= requested timestamp
-		let mut iter = self.versioned_range(Some(key), None, true)?;
-
+	/// Uses the unified `history_iter()` for both B+tree and LSM backends.
+	pub(crate) fn get_at(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
+		// Use unified history iterator for both backends
+		let mut iter = self.history_iter(Some(key), None, true)?;
 		iter.seek_first()?;
 
 		// Track the best match (latest version at or before requested timestamp)
@@ -338,11 +307,16 @@ impl Snapshot {
 
 		while iter.valid() {
 			let entry_key = iter.key();
-			let entry_user_key = entry_key.user_key();
 
 			// Stop if we've moved past our key
-			if entry_user_key != key {
+			if entry_key.user_key() != key {
 				break;
+			}
+
+			// Only consider versions visible to this snapshot
+			if entry_key.seq_num() > self.seq_num {
+				iter.next()?;
+				continue;
 			}
 
 			let entry_ts = entry_key.timestamp();
@@ -352,393 +326,16 @@ impl Snapshot {
 				if entry_key.is_tombstone() {
 					// Key was deleted at this timestamp
 					best_value = None;
-					best_timestamp = entry_ts;
 				} else {
 					best_value = Some(self.core.resolve_value(iter.value())?);
-					best_timestamp = entry_ts;
 				}
+				best_timestamp = entry_ts;
 			}
 
 			iter.next()?;
 		}
 
 		Ok(best_value)
-	}
-
-	/// Gets keys in a key range at a specific timestamp
-	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	/// Range is [start, end) - start is inclusive, end is exclusive.
-	pub(crate) fn keys_at_version<Key: AsRef<[u8]>>(
-		&self,
-		start: Key,
-		end: Key,
-		timestamp: u64,
-	) -> Result<impl DoubleEndedIterator<Item = Vec<u8>> + '_> {
-		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
-		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
-			key_range: &key_range,
-			start_ts: 0,
-			end_ts: timestamp,
-			snapshot_seq_num: self.seq_num,
-			limit: None,
-			include_tombstones: false, // Don't include tombstones
-			include_latest_only: true,
-		})?;
-
-		Ok(KeysAtTimestampIterator {
-			inner: versioned_iter,
-		})
-	}
-
-	/// Scans key-value pairs in a key range at a specific timestamp
-	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	/// Range is [start, end) - start is inclusive, end is exclusive.
-	pub(crate) fn range_at_version<Key: AsRef<[u8]>>(
-		&self,
-		start: Key,
-		end: Key,
-		timestamp: u64,
-	) -> Result<impl DoubleEndedIterator<Item = Result<(Vec<u8>, Value)>> + '_> {
-		let key_range = start.as_ref().to_vec()..end.as_ref().to_vec();
-		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
-			key_range: &key_range,
-			start_ts: 0,
-			end_ts: timestamp,
-			snapshot_seq_num: self.seq_num,
-			limit: None,
-			include_tombstones: false, // Don't include tombstones
-			include_latest_only: true,
-		})?;
-
-		Ok(ScanAtTimestampIterator {
-			inner: versioned_iter,
-			core: Arc::clone(&self.core),
-		})
-	}
-
-	/// Gets all versions of keys in a key range using the B+tree versioned index.
-	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
-	/// Range is [start, end) - start is inclusive, end is exclusive.
-	///
-	/// Note: This method requires the B+tree versioned index to be enabled.
-	/// For LSM-based versioned iteration, use `versioned_range()` instead.
-	///
-	/// # Arguments
-	/// * `start` - Start key (inclusive)
-	/// * `end` - End key (exclusive)
-	/// * `limit` - Optional maximum number of versions to return. If None, returns all versions.
-	pub(crate) fn scan_all_versions<Key: IntoBytes>(
-		&self,
-		start: Key,
-		end: Key,
-		limit: Option<usize>,
-	) -> Result<Vec<VersionScanResult>> {
-		if !self.core.opts.enable_versioned_index {
-			return Err(Error::InvalidArgument(
-				"B+tree versioned index not enabled. Use versioned_range() for LSM-based iteration."
-					.to_string(),
-			));
-		}
-
-		let key_range = start.as_slice().to_vec()..end.as_slice().to_vec();
-		let versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
-			key_range: &key_range,
-			start_ts: 0,
-			end_ts: u64::MAX,
-			snapshot_seq_num: self.seq_num,
-			limit,
-			include_tombstones: true,
-			include_latest_only: false, // Include all versions for scan_all_versions
-		})?;
-
-		let mut results = Vec::new();
-		for (internal_key, encoded_value) in versioned_iter {
-			let is_tombstone = internal_key.is_tombstone();
-			let value = if is_tombstone {
-				Value::default() // Use default value for soft delete markers
-			} else {
-				self.core.resolve_value(&encoded_value)?
-			};
-			results.push((
-				internal_key.user_key.clone(),
-				value,
-				internal_key.timestamp,
-				is_tombstone,
-			));
-		}
-
-		Ok(results)
-	}
-
-	/// Encodes a user key bound into an InternalKey bound, preserving Included/Excluded/Unbounded
-	fn encode_start_bound(
-		bound: Bound<&Vec<u8>>,
-		seq_num: u64,
-		kind: InternalKeyKind,
-		ts: u64,
-	) -> Bound<Vec<u8>> {
-		match bound {
-			Bound::Included(key) => {
-				Bound::Included(InternalKey::new(key.clone(), seq_num, kind, ts).encode())
-			}
-			Bound::Excluded(key) => {
-				Bound::Excluded(InternalKey::new(key.clone(), seq_num, kind, ts).encode())
-			}
-			Bound::Unbounded => Bound::Unbounded,
-		}
-	}
-
-	/// Encodes an end bound for versioned queries
-	fn encode_end_bound(
-		bound: Bound<&Vec<u8>>,
-		seq_num: u64,
-		kind: InternalKeyKind,
-		ts: u64,
-	) -> Bound<Vec<u8>> {
-		match bound {
-			Bound::Included(key) => {
-				Bound::Included(InternalKey::new(key.clone(), seq_num, kind, ts).encode())
-			}
-			Bound::Excluded(key) => {
-				// For excluded bounds, use minimal InternalKey properties so range stops just
-				// before this key
-				Bound::Excluded(InternalKey::new(key.clone(), 0, InternalKeyKind::Set, 0).encode())
-			}
-			Bound::Unbounded => Bound::Unbounded,
-		}
-	}
-
-	/// Converts Bound<Vec<u8>> to Bound<&[u8]> for passing to B+tree
-	fn bound_as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
-		match bound {
-			Bound::Included(v) => Bound::Included(v.as_slice()),
-			Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
-			Bound::Unbounded => Bound::Unbounded,
-		}
-	}
-
-	/// Creates a versioned range iterator that implements DoubleEndedIterator.
-	/// This method queries the B+tree versioned index.
-	///
-	/// Note: This method requires the B+tree versioned index to be enabled.
-	/// For LSM-based versioned iteration, use `versioned_range()` instead.
-	///
-	/// TODO: This is a temporary solution to avoid the complexity of
-	/// implementing a proper streaming double ended iterator, which will be
-	/// fixed in the future.
-	pub(crate) fn versioned_range_iter<R: RangeBounds<Vec<u8>>>(
-		&self,
-		params: VersionedRangeQueryParams<'_, R>,
-	) -> Result<VersionedRangeIterator> {
-		if !self.core.opts.enable_versioned_index {
-			return Err(Error::InvalidArgument("B+tree versioned index not enabled".to_string()));
-		}
-
-		let mut results = Vec::new();
-
-		if let Some(ref versioned_index) = self.core.versioned_index {
-			let index_guard = versioned_index.read();
-
-			// Step 1: Encode bounds (preserves bound type)
-			let start_bound = Self::encode_start_bound(
-				params.key_range.start_bound(),
-				0,
-				InternalKeyKind::Set,
-				params.start_ts,
-			);
-			let end_bound = Self::encode_end_bound(
-				params.key_range.end_bound(),
-				params.snapshot_seq_num,
-				InternalKeyKind::Max,
-				params.end_ts,
-			);
-
-			// Step 2: Convert to slice bounds and call range
-			let range = (Self::bound_as_slice(&start_bound), Self::bound_as_slice(&end_bound));
-			let range_iter = index_guard.range(range)?;
-
-			// Collect all versions by key (already in timestamp order from B+tree)
-			// Store the complete InternalKey to preserve all original information
-			// Use BTreeMap to maintain keys in sorted order
-			let mut key_versions: BTreeMap<Vec<u8>, Vec<(InternalKey, Vec<u8>)>> = BTreeMap::new();
-
-			for entry in range_iter {
-				let (encoded_key, encoded_value) = entry?;
-				let internal_key = InternalKey::decode(&encoded_key);
-				assert!(internal_key.seq_num() <= params.snapshot_seq_num);
-
-				if internal_key.timestamp > params.end_ts {
-					continue;
-				}
-
-				let current_key = internal_key.user_key.clone();
-
-				key_versions
-					.entry(current_key)
-					.or_default()
-					.push((internal_key, encoded_value.to_vec()));
-			}
-
-			// Filter out keys where the latest version is a hard delete
-			key_versions.retain(|_, versions| {
-				let latest_version = versions.last().unwrap();
-				!latest_version.0.is_hard_delete_marker()
-			});
-
-			// Process each key's versions
-			let max_unique_keys = params.limit.unwrap_or(usize::MAX);
-
-			for (unique_key_count, (_user_key, mut versions)) in
-				key_versions.into_iter().enumerate()
-			{
-				// Check if we've reached the limit of unique keys
-				if unique_key_count >= max_unique_keys {
-					break;
-				}
-
-				// If include_latest_only is true, keep only the latest version (highest
-				// timestamp)
-				if params.include_latest_only && !versions.is_empty() {
-					// B+tree already provides entries in timestamp order, so just take the last
-					// element (highest timestamp)
-					let latest_version = versions.pop().unwrap();
-					versions = vec![latest_version];
-				}
-
-				// Determine which versions to output
-				let versions_to_output: Vec<_> = if params.include_tombstones {
-					// For scan_all_versions, include ALL versions (both values and tombstones)
-					versions.into_iter().collect()
-				} else {
-					// Otherwise, only include non-tombstone versions
-					versions.into_iter().filter(|version| !version.0.is_tombstone()).collect()
-				};
-
-				// Collect the filtered versions with original InternalKey preserved
-				for (internal_key, encoded_value) in versions_to_output {
-					results.push((internal_key, encoded_value));
-				}
-			}
-		}
-
-		Ok(VersionedRangeIterator {
-			results,
-			index: 0,
-		})
-	}
-}
-
-/// A DoubleEndedIterator for versioned range queries
-pub(crate) struct VersionedRangeIterator {
-	/// All collected results from the versioned query
-	results: Vec<(InternalKey, Vec<u8>)>,
-	/// Current position in the results (0-based index)
-	index: usize,
-}
-
-impl Iterator for VersionedRangeIterator {
-	type Item = (InternalKey, Vec<u8>);
-
-	fn next(&mut self) -> Option<Self::Item> {
-		if self.index < self.results.len() {
-			let result = self.results[self.index].clone();
-			self.index += 1;
-			Some(result)
-		} else {
-			None
-		}
-	}
-
-	fn size_hint(&self) -> (usize, Option<usize>) {
-		let remaining = self.results.len().saturating_sub(self.index);
-		(remaining, Some(remaining))
-	}
-}
-
-impl DoubleEndedIterator for VersionedRangeIterator {
-	fn next_back(&mut self) -> Option<Self::Item> {
-		if self.index < self.results.len() {
-			let result = self.results[self.results.len() - 1].clone();
-			self.results.pop();
-			Some(result)
-		} else {
-			None
-		}
-	}
-}
-
-impl ExactSizeIterator for VersionedRangeIterator {
-	fn len(&self) -> usize {
-		self.results.len().saturating_sub(self.index)
-	}
-}
-
-/// Iterator for keys at a specific timestamp
-pub(crate) struct KeysAtTimestampIterator {
-	inner: VersionedRangeIterator,
-}
-
-impl Iterator for KeysAtTimestampIterator {
-	type Item = Vec<u8>;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		self.inner.next().map(|(internal_key, _)| internal_key.user_key)
-	}
-
-	fn size_hint(&self) -> (usize, Option<usize>) {
-		self.inner.size_hint()
-	}
-}
-
-impl DoubleEndedIterator for KeysAtTimestampIterator {
-	fn next_back(&mut self) -> Option<Self::Item> {
-		self.inner.next_back().map(|(internal_key, _)| internal_key.user_key)
-	}
-}
-
-impl ExactSizeIterator for KeysAtTimestampIterator {
-	fn len(&self) -> usize {
-		self.inner.len()
-	}
-}
-
-/// Iterator for key-value pairs at a specific timestamp
-pub(crate) struct ScanAtTimestampIterator {
-	inner: VersionedRangeIterator,
-	core: Arc<Core>,
-}
-
-impl Iterator for ScanAtTimestampIterator {
-	type Item = Result<(Vec<u8>, Value)>;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		self.inner.next().map(|(internal_key, encoded_value)| {
-			match self.core.resolve_value(&encoded_value) {
-				Ok(resolved_value) => Ok((internal_key.user_key, resolved_value)),
-				Err(e) => Err(e), // Return the error instead of skipping
-			}
-		})
-	}
-
-	fn size_hint(&self) -> (usize, Option<usize>) {
-		self.inner.size_hint()
-	}
-}
-
-impl DoubleEndedIterator for ScanAtTimestampIterator {
-	fn next_back(&mut self) -> Option<Self::Item> {
-		self.inner.next_back().map(|(internal_key, encoded_value)| {
-			match self.core.resolve_value(&encoded_value) {
-				Ok(resolved_value) => Ok((internal_key.user_key, resolved_value)),
-				Err(e) => Err(e), // Return the error instead of skipping
-			}
-		})
-	}
-}
-
-impl ExactSizeIterator for ScanAtTimestampIterator {
-	fn len(&self) -> usize {
-		self.inner.len()
 	}
 }
 
@@ -1335,192 +932,6 @@ impl Drop for SnapshotIterator<'_> {
 	}
 }
 
-/// A snapshot iterator that returns ALL versions of keys, not just the latest.
-/// Unlike `SnapshotIterator` which deduplicates (returns only latest version per key),
-/// this iterator returns every visible version in (user_key, seq_num descending) order.
-///
-/// Used for versioned range scans over the LSM tree directly.
-pub(crate) struct VersionedSnapshotIterator<'a> {
-	/// The merge iterator over all LSM components
-	merge_iter: KMergeIterator<'a>,
-
-	/// Sequence number for visibility
-	snapshot_seq_num: u64,
-
-	/// Core for resolving values
-	#[allow(dead_code)]
-	core: Arc<Core>,
-
-	/// Whether to include tombstones in the iteration
-	include_tombstones: bool,
-
-	/// Direction of iteration
-	direction: MergeDirection,
-
-	/// Whether the iterator has been initialized
-	initialized: bool,
-}
-
-impl VersionedSnapshotIterator<'_> {
-	/// Creates a new versioned iterator over a specific key range
-	fn new_from(
-		core: Arc<Core>,
-		seq_num: u64,
-		range: crate::InternalKeyRange,
-		include_tombstones: bool,
-	) -> Result<Self> {
-		// Create a temporary snapshot to use the helper method
-		let snapshot = Snapshot {
-			core: Arc::clone(&core),
-			seq_num,
-		};
-		let iter_state = snapshot.collect_iter_state()?;
-
-		if let Some(ref vlog) = core.vlog {
-			vlog.incr_iterator_count();
-		}
-
-		let merge_iter = KMergeIterator::new_from(iter_state, range);
-
-		Ok(Self {
-			merge_iter,
-			snapshot_seq_num: seq_num,
-			core,
-			include_tombstones,
-			direction: MergeDirection::Forward,
-			initialized: false,
-		})
-	}
-
-	#[inline]
-	fn is_visible_ref(&self, key: &InternalKeyRef<'_>) -> bool {
-		key.seq_num() <= self.snapshot_seq_num
-	}
-
-	/// Skip to the next valid entry in forward direction.
-	/// Valid = visible, optionally not a tombstone.
-	/// NOTE: Does NOT deduplicate - returns every visible version.
-	fn skip_to_valid_forward(&mut self) -> Result<bool> {
-		while self.merge_iter.valid() {
-			let key_ref = self.merge_iter.key();
-
-			// Skip invisible versions (seq_num > snapshot)
-			if !self.is_visible_ref(&key_ref) {
-				self.merge_iter.next()?;
-				continue;
-			}
-
-			// Skip tombstones if not included
-			if !self.include_tombstones && key_ref.is_tombstone() {
-				self.merge_iter.next()?;
-				continue;
-			}
-
-			// Found valid entry - no deduplication check!
-			return Ok(true);
-		}
-		Ok(false)
-	}
-
-	/// Skip to the next valid entry in backward direction.
-	/// NOTE: Does NOT deduplicate - returns every visible version.
-	fn skip_to_valid_backward(&mut self) -> Result<bool> {
-		while self.merge_iter.valid() {
-			let key_ref = self.merge_iter.key();
-
-			// Skip invisible versions (seq_num > snapshot)
-			if !self.is_visible_ref(&key_ref) {
-				self.merge_iter.prev()?;
-				continue;
-			}
-
-			// Skip tombstones if not included
-			if !self.include_tombstones && key_ref.is_tombstone() {
-				self.merge_iter.prev()?;
-				continue;
-			}
-
-			// Found valid entry - no deduplication check!
-			return Ok(true);
-		}
-		Ok(false)
-	}
-}
-
-impl InternalIterator for VersionedSnapshotIterator<'_> {
-	fn seek(&mut self, target: &[u8]) -> Result<bool> {
-		self.direction = MergeDirection::Forward;
-		self.merge_iter.seek(target)?;
-		self.initialized = true;
-		self.skip_to_valid_forward()
-	}
-
-	fn seek_first(&mut self) -> Result<bool> {
-		self.direction = MergeDirection::Forward;
-		self.merge_iter.seek_first()?;
-		self.initialized = true;
-		self.skip_to_valid_forward()
-	}
-
-	fn seek_last(&mut self) -> Result<bool> {
-		self.direction = MergeDirection::Backward;
-		self.merge_iter.seek_last()?;
-		self.initialized = true;
-		self.skip_to_valid_backward()
-	}
-
-	fn next(&mut self) -> Result<bool> {
-		if !self.initialized {
-			return self.seek_first();
-		}
-		if !self.merge_iter.valid() {
-			return Ok(false);
-		}
-		self.merge_iter.next()?;
-		self.skip_to_valid_forward()
-	}
-
-	fn prev(&mut self) -> Result<bool> {
-		if !self.initialized {
-			return self.seek_last();
-		}
-		// If we were going forward, switch to backward
-		if self.direction != MergeDirection::Backward {
-			return self.seek_last();
-		}
-		if !self.merge_iter.valid() {
-			return Ok(false);
-		}
-		self.merge_iter.prev()?;
-		self.skip_to_valid_backward()
-	}
-
-	fn valid(&self) -> bool {
-		self.merge_iter.valid()
-	}
-
-	fn key(&self) -> InternalKeyRef<'_> {
-		debug_assert!(self.valid());
-		self.merge_iter.key()
-	}
-
-	fn value(&self) -> &[u8] {
-		debug_assert!(self.valid());
-		self.merge_iter.value()
-	}
-}
-
-impl Drop for VersionedSnapshotIterator<'_> {
-	fn drop(&mut self) {
-		// Decrement VLog iterator count when iterator is dropped
-		if let Some(ref vlog) = self.core.vlog {
-			if let Err(e) = vlog.decr_iterator_count() {
-				log::warn!("Failed to decrement VLog iterator count: {e}");
-			}
-		}
-	}
-}
-
 // ===== B+Tree History Iterator =====
 
 /// A streaming iterator over the B+tree versioned index.
@@ -1598,5 +1009,449 @@ impl InternalIterator for BPlusTreeIteratorWithGuard<'_> {
 
 	fn value(&self) -> &[u8] {
 		self.iter.value()
+	}
+}
+
+// ===== Unified History Iterator =====
+
+/// Internal enum for the underlying iterator type.
+enum HistoryIteratorInner<'a> {
+	/// LSM-based iterator (KMergeIterator handles bounds via InternalKeyRange)
+	Lsm(KMergeIterator<'a>),
+	/// B+tree streaming iterator (bounds checked manually)
+	BTree(BPlusTreeIteratorWithGuard<'a>),
+}
+
+/// Unified history iterator that works with both LSM and B+tree backends.
+///
+/// This struct provides:
+/// - Visibility filtering (seq_num <= snapshot_seq_num)
+/// - Tombstone filtering (optional)
+/// - Bounds checking (for B+tree; LSM handles via KMergeIterator)
+/// - Bidirectional iteration support
+///
+/// The filtering logic is unified for both backends, eliminating the need
+/// for a separate `VersionedSnapshotIterator`.
+pub struct HistoryIterator<'a> {
+	/// The underlying iterator (LSM or B+tree)
+	inner: HistoryIteratorInner<'a>,
+
+	/// Sequence number for visibility filtering
+	snapshot_seq_num: u64,
+
+	/// Whether to include tombstones in iteration
+	include_tombstones: bool,
+
+	/// Current direction of iteration
+	direction: MergeDirection,
+
+	/// Whether the iterator has been initialized (seek called)
+	initialized: bool,
+
+	/// Lower bound for B+tree (LSM handles bounds via KMergeIterator)
+	lower_bound: Option<Vec<u8>>,
+
+	/// Upper bound for B+tree (LSM handles bounds via KMergeIterator)
+	upper_bound: Option<Vec<u8>>,
+
+	/// Core reference for VLog iterator counting
+	core: Arc<Core>,
+
+	// === Tracking fields for REPLACE/DELETE filtering ===
+	/// Current user key being iterated (for detecting key changes)
+	current_user_key: Vec<u8>,
+	/// Whether we've seen the first visible version for current user key
+	first_visible_seen: bool,
+	/// Whether the latest visible version is a hard delete
+	latest_is_hard_delete: bool,
+	/// Whether we've seen a REPLACE operation for current user key
+	seen_replace: bool,
+}
+
+impl<'a> HistoryIterator<'a> {
+	/// Creates a new LSM-based history iterator.
+	///
+	/// The bounds are passed to `KMergeIterator` via `InternalKeyRange`,
+	/// so bounds checking is handled internally by the merge iterator.
+	pub(crate) fn new_lsm(
+		core: Arc<Core>,
+		seq_num: u64,
+		iter_state: IterState,
+		range: InternalKeyRange,
+		include_tombstones: bool,
+	) -> Self {
+		if let Some(ref vlog) = core.vlog {
+			vlog.incr_iterator_count();
+		}
+
+		let merge_iter = KMergeIterator::new_from(iter_state, range);
+
+		Self {
+			inner: HistoryIteratorInner::Lsm(merge_iter),
+			snapshot_seq_num: seq_num,
+			include_tombstones,
+			direction: MergeDirection::Forward,
+			initialized: false,
+			lower_bound: None, // LSM handles bounds via KMergeIterator
+			upper_bound: None,
+			core,
+			current_user_key: Vec::new(),
+			first_visible_seen: false,
+			latest_is_hard_delete: false,
+			seen_replace: false,
+		}
+	}
+
+	/// Creates a new B+tree-based history iterator.
+	///
+	/// Bounds are stored and checked manually since `BPlusTreeIteratorWithGuard`
+	/// doesn't have built-in bounds support.
+	pub(crate) fn new_btree(
+		btree_iter: BPlusTreeIteratorWithGuard<'a>,
+		core: Arc<Core>,
+		seq_num: u64,
+		include_tombstones: bool,
+		lower: Option<&[u8]>,
+		upper: Option<&[u8]>,
+	) -> Self {
+		if let Some(ref vlog) = core.vlog {
+			vlog.incr_iterator_count();
+		}
+
+		Self {
+			inner: HistoryIteratorInner::BTree(btree_iter),
+			snapshot_seq_num: seq_num,
+			include_tombstones,
+			direction: MergeDirection::Forward,
+			initialized: false,
+			lower_bound: lower.map(|b| b.to_vec()),
+			upper_bound: upper.map(|b| b.to_vec()),
+			core,
+			current_user_key: Vec::new(),
+			first_visible_seen: false,
+			latest_is_hard_delete: false,
+			seen_replace: false,
+		}
+	}
+
+	/// Checks if a key is visible to this snapshot.
+	#[inline]
+	fn is_visible(&self, key: &InternalKeyRef<'_>) -> bool {
+		key.seq_num() <= self.snapshot_seq_num
+	}
+
+	/// Checks if current position is within upper bound.
+	/// - LSM: Returns true always (KMergeIterator enforces bounds internally)
+	/// - B+tree: Manually checks upper_bound since BPlusTreeIteratorWithGuard has no bounds support
+	fn within_upper_bound(&self) -> bool {
+		match &self.inner {
+			HistoryIteratorInner::Lsm(_) => {
+				// LSM path: KMergeIterator already enforces bounds via InternalKeyRange
+				true
+			}
+			HistoryIteratorInner::BTree(iter) => {
+				if let Some(ref upper) = self.upper_bound {
+					if iter.valid() {
+						iter.key().user_key() < upper.as_slice()
+					} else {
+						false
+					}
+				} else {
+					true
+				}
+			}
+		}
+	}
+
+	/// Checks if current position is within lower bound (for backward iteration).
+	fn within_lower_bound(&self) -> bool {
+		match &self.inner {
+			HistoryIteratorInner::Lsm(_) => true,
+			HistoryIteratorInner::BTree(iter) => {
+				if let Some(ref lower) = self.lower_bound {
+					if iter.valid() {
+						iter.key().user_key() >= lower.as_slice()
+					} else {
+						false
+					}
+				} else {
+					true
+				}
+			}
+		}
+	}
+
+	/// Returns whether the inner iterator is valid.
+	fn inner_valid(&self) -> bool {
+		match &self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.valid(),
+			HistoryIteratorInner::BTree(iter) => iter.valid(),
+		}
+	}
+
+	/// Gets the key from the inner iterator.
+	fn inner_key(&self) -> InternalKeyRef<'_> {
+		match &self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.key(),
+			HistoryIteratorInner::BTree(iter) => iter.key(),
+		}
+	}
+
+	/// Advances the inner iterator forward.
+	fn inner_next(&mut self) -> Result<bool> {
+		match &mut self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.next(),
+			HistoryIteratorInner::BTree(iter) => iter.next(),
+		}
+	}
+
+	/// Moves the inner iterator backward.
+	fn inner_prev(&mut self) -> Result<bool> {
+		match &mut self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.prev(),
+			HistoryIteratorInner::BTree(iter) => iter.prev(),
+		}
+	}
+
+	/// Skip to the next valid entry in forward direction.
+	/// Handles visibility, tombstones, REPLACE, DELETE filtering, and bounds for BOTH backends.
+	///
+	/// Filtering rules:
+	/// - Hard DELETE as latest visible: skip ALL versions of this key
+	/// - REPLACE seen: skip older non-REPLACE versions, output only REPLACE versions
+	/// - Soft DELETE: affected by include_tombstones flag only
+	/// - Normal SET: output all versions
+	fn skip_to_valid_forward(&mut self) -> Result<bool> {
+		while self.inner_valid() {
+			// Check bounds first (B+tree only, LSM returns true)
+			if !self.within_upper_bound() {
+				return Ok(false);
+			}
+
+			// Extract data before mutations (borrow checker)
+			let (user_key_owned, seq_num, is_hard_delete, is_replace, is_tombstone) = {
+				let key_ref = self.inner_key();
+				(
+					key_ref.user_key().to_vec(),
+					key_ref.seq_num(),
+					key_ref.is_hard_delete_marker(),
+					key_ref.is_replace(),
+					key_ref.is_tombstone(),
+				)
+			};
+
+			// Detect user_key change - reset tracking state
+			let is_new_user_key = user_key_owned != self.current_user_key;
+			if is_new_user_key {
+				self.current_user_key = user_key_owned;
+				self.first_visible_seen = false;
+				self.latest_is_hard_delete = false;
+				self.seen_replace = false;
+			}
+
+			// Skip invisible versions (seq_num > snapshot)
+			if seq_num > self.snapshot_seq_num {
+				self.inner_next()?;
+				continue;
+			}
+
+			// First visible entry - check if it's hard delete
+			if !self.first_visible_seen {
+				self.first_visible_seen = true;
+				if is_hard_delete {
+					self.latest_is_hard_delete = true;
+				}
+			}
+
+			// Hard DELETE as latest: skip ALL versions of this key
+			if self.latest_is_hard_delete {
+				self.inner_next()?;
+				continue;
+			}
+
+			// Track REPLACE
+			if is_replace {
+				self.seen_replace = true;
+			}
+
+			// After REPLACE, skip non-REPLACE versions
+			if self.seen_replace && !is_replace {
+				self.inner_next()?;
+				continue;
+			}
+
+			// Skip older hard deletes (not latest)
+			if is_hard_delete {
+				self.inner_next()?;
+				continue;
+			}
+
+			// Skip soft delete tombstones if not included
+			// (is_tombstone includes both soft and hard deletes, but hard deletes
+			// are already handled above, so this only affects soft deletes)
+			if !self.include_tombstones && is_tombstone {
+				self.inner_next()?;
+				continue;
+			}
+
+			// Found valid entry
+			return Ok(true);
+		}
+		Ok(false)
+	}
+
+	/// Skip to the next valid entry in backward direction.
+	///
+	/// Note: Backward iteration uses simpler filtering (visibility + tombstones only).
+	/// Full REPLACE/DELETE tracking would require looking ahead since versions
+	/// appear in reverse order (oldest first for each user_key).
+	fn skip_to_valid_backward(&mut self) -> Result<bool> {
+		while self.inner_valid() {
+			// Check bounds first (B+tree only, LSM returns true)
+			if !self.within_lower_bound() {
+				return Ok(false);
+			}
+
+			let key_ref = self.inner_key();
+
+			// Skip invisible versions (seq_num > snapshot)
+			if !self.is_visible(&key_ref) {
+				self.inner_prev()?;
+				continue;
+			}
+
+			// Skip tombstones if not included
+			if !self.include_tombstones && key_ref.is_tombstone() {
+				self.inner_prev()?;
+				continue;
+			}
+
+			// Found valid entry
+			return Ok(true);
+		}
+		Ok(false)
+	}
+}
+
+impl InternalIterator for HistoryIterator<'_> {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.direction = MergeDirection::Forward;
+		match &mut self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.seek(target)?,
+			HistoryIteratorInner::BTree(iter) => iter.seek(target)?,
+		};
+		self.initialized = true;
+		self.skip_to_valid_forward()
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Forward;
+		match &mut self.inner {
+			HistoryIteratorInner::Lsm(iter) => {
+				iter.seek_first()?;
+			}
+			HistoryIteratorInner::BTree(iter) => {
+				// Seek to lower bound if present, otherwise start of tree
+				if let Some(ref lower) = self.lower_bound {
+					// B+tree is ordered by (user_key ASC, timestamp DESC)
+					// With DESC order, timestamp=u64::MAX is smallest (comes first)
+					// So we seek with max timestamp to find the first entry for this user_key
+					let seek_key =
+						InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set, u64::MAX);
+					iter.seek(&seek_key.encode())?;
+				} else {
+					iter.seek_first()?;
+				}
+			}
+		}
+		self.initialized = true;
+		self.skip_to_valid_forward()
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Backward;
+		match &mut self.inner {
+			HistoryIteratorInner::Lsm(iter) => {
+				iter.seek_last()?;
+			}
+			HistoryIteratorInner::BTree(iter) => {
+				// For B+tree, we need to seek to end and work backwards
+				// If upper bound exists, seek to it and go back
+				if let Some(ref upper) = self.upper_bound {
+					iter.seek(upper)?;
+					// If we're at or past upper, go back one
+					if iter.valid() && iter.key().user_key() >= upper.as_slice() {
+						iter.prev()?;
+					}
+				} else {
+					iter.seek_last()?;
+				}
+			}
+		}
+		self.initialized = true;
+		self.skip_to_valid_backward()
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		if !self.initialized {
+			return self.seek_first();
+		}
+		if !self.inner_valid() {
+			return Ok(false);
+		}
+		self.inner_next()?;
+		self.skip_to_valid_forward()
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		if !self.initialized {
+			return self.seek_last();
+		}
+		// If we were going forward, need to reset for backward
+		if self.direction != MergeDirection::Backward {
+			self.direction = MergeDirection::Backward;
+		}
+		if !self.inner_valid() {
+			return Ok(false);
+		}
+		self.inner_prev()?;
+		self.skip_to_valid_backward()
+	}
+
+	fn valid(&self) -> bool {
+		if !self.inner_valid() {
+			return false;
+		}
+		// Check bounds based on direction
+		match self.direction {
+			MergeDirection::Forward => self.within_upper_bound(),
+			MergeDirection::Backward => self.within_lower_bound(),
+		}
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		debug_assert!(self.valid());
+		self.inner_key()
+	}
+
+	fn value(&self) -> &[u8] {
+		debug_assert!(self.valid());
+		match &self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.value(),
+			HistoryIteratorInner::BTree(iter) => iter.value(),
+		}
+	}
+}
+
+impl Drop for HistoryIterator<'_> {
+	fn drop(&mut self) {
+		// Decrement VLog iterator count for BOTH paths (both increment in constructor)
+		// B+tree also stores VLog pointers as values, so it needs VLog access
+		if let Some(ref vlog) = self.core.vlog {
+			if let Err(e) = vlog.decr_iterator_count() {
+				log::warn!("Failed to decrement VLog iterator count: {e}");
+			}
+		}
+		// B+tree guard (RwLockReadGuard) is automatically dropped when `inner` is dropped
 	}
 }

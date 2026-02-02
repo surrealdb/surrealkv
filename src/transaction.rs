@@ -6,13 +6,7 @@ use std::sync::Arc;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
-use crate::snapshot::{
-	BPlusTreeIteratorWithGuard,
-	MergeDirection,
-	Snapshot,
-	SnapshotIterator,
-	VersionedSnapshotIterator,
-};
+use crate::snapshot::{HistoryIterator, MergeDirection, Snapshot, SnapshotIterator};
 use crate::{
 	InternalIterator,
 	InternalKey,
@@ -20,10 +14,7 @@ use crate::{
 	InternalKeyRef,
 	IntoBytes,
 	Key,
-	KeysResult,
-	RangeResult,
 	Value,
-	Version,
 };
 
 /// `Mode` is an enumeration representing the different modes a transaction can
@@ -459,14 +450,11 @@ impl Transaction {
 	}
 
 	/// Gets a value for a key at a specific timestamp.
-	pub fn get_at_version<K>(&self, key: K, timestamp: u64) -> Result<Option<Value>>
+	pub fn get_at<K>(&self, key: K, timestamp: u64) -> Result<Option<Value>>
 	where
 		K: IntoBytes,
 	{
-		self.get_at_version_with_options(
-			key,
-			&ReadOptions::default().with_timestamp(Some(timestamp)),
-		)
+		self.get_at_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
 	}
 
 	/// Gets a value for a key, with custom read options.
@@ -515,11 +503,7 @@ impl Transaction {
 		}
 	}
 
-	pub fn get_at_version_with_options<K>(
-		&self,
-		key: K,
-		options: &ReadOptions,
-	) -> Result<Option<Value>>
+	pub fn get_at_with_options<K>(&self, key: K, options: &ReadOptions) -> Result<Option<Value>>
 	where
 		K: IntoBytes,
 	{
@@ -546,7 +530,7 @@ impl Transaction {
 
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
-				Some(snapshot) => snapshot.get_at_version(key.as_slice(), timestamp),
+				Some(snapshot) => snapshot.get_at(key.as_slice(), timestamp),
 				None => Err(Error::NoSnapshot),
 			}
 		} else {
@@ -561,50 +545,6 @@ impl Transaction {
 	/// range in both forward and backward directions.
 	///
 	/// The iterator iterates over all keys in the range,
-	/// inclusive of the start key, but not the end key.
-	///
-	/// This function is faster than `range()` as it doesn't
-	/// fetch or resolve values from disk.
-	pub fn keys_at_version<K>(
-		&self,
-		start: K,
-		end: K,
-		timestamp: u64,
-	) -> Result<impl DoubleEndedIterator<Item = KeysResult> + '_>
-	where
-		K: IntoBytes,
-	{
-		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.keys_at_version_with_options(&options)
-	}
-
-	pub fn keys_at_version_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<Box<dyn DoubleEndedIterator<Item = KeysResult> + '_>> {
-		if let Some(timestamp) = options.timestamp {
-			// Check if versioned queries are enabled
-			if !self.core.opts.enable_versioning {
-				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-			}
-
-			// Get the start and end keys from options
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
-
-			// Query the versioned index through the snapshot
-			match &self.snapshot {
-				Some(snapshot) => {
-					Ok(Box::new(snapshot.keys_at_version(start_key, end_key, timestamp)?.map(Ok)))
-				}
-				None => Err(Error::NoSnapshot),
-			}
-		} else {
-			Err(Error::InvalidArgument("Timestamp is required for versioned queries".to_string()))
-		}
-	}
-
 	/// Gets keys and values in a range, at the current timestamp.
 	///
 	/// Returns a cursor-based iterator with explicit seek/next/prev methods.
@@ -643,194 +583,6 @@ impl Transaction {
 		let end_key = options.upper_bound.clone().unwrap_or_default();
 		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key)?;
 		Ok(TransactionIterator::new(inner, Arc::clone(&self.core)))
-	}
-
-	/// Gets keys and values in a range, at a specific timestamp.
-	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys and values
-	/// in the range in both forward and backward directions.
-	///
-	/// The iterator iterates over all keys and values in the
-	/// range, inclusive of the start key, but not the end key.
-	pub fn range_at_version<K>(
-		&self,
-		start: K,
-		end: K,
-		timestamp: u64,
-	) -> Result<impl DoubleEndedIterator<Item = RangeResult> + '_>
-	where
-		K: IntoBytes,
-	{
-		let mut options = ReadOptions::default().with_timestamp(Some(timestamp));
-		options.set_iterate_bounds(Some(start.into_bytes()), Some(end.into_bytes()));
-		self.range_at_version_with_options(&options)
-	}
-
-	pub fn range_at_version_with_options(
-		&self,
-		options: &ReadOptions,
-	) -> Result<Box<dyn DoubleEndedIterator<Item = RangeResult> + '_>> {
-		if let Some(timestamp) = options.timestamp {
-			// Check if versioned queries are enabled
-			if !self.core.opts.enable_versioning {
-				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-			}
-
-			// Get the start and end keys from options
-			let start_key = options.lower_bound.clone().unwrap_or_default();
-			let end_key = options.upper_bound.clone().unwrap_or_default();
-
-			// Query the versioned index through the snapshot
-			match &self.snapshot {
-				Some(snapshot) => {
-					Ok(Box::new(snapshot.range_at_version(start_key, end_key, timestamp)?))
-				}
-				None => Err(Error::NoSnapshot),
-			}
-		} else {
-			Err(Error::InvalidArgument("Timestamp is required for versioned queries".to_string()))
-		}
-	}
-
-	/// Gets all versions of keys in a range.
-	///
-	/// Returns all historical versions of keys within the specified range,
-	/// including tombstones. Range is [start, end) - start is inclusive, end
-	/// is exclusive.
-	///
-	/// # Arguments
-	/// * `start` - Start key (inclusive)
-	/// * `end` - End key (exclusive)
-	/// * `limit` - Optional maximum number of versions to return. If None, returns all versions.
-	///
-	/// # Returns
-	/// A vector of tuples containing (Key, Value, Version, is_tombstone) for
-	/// each version found.
-	///
-	/// Note: This method requires the B+tree versioned index to be enabled.
-	/// For LSM-based versioned iteration without the B+tree index, use
-	/// `versioned_range_with_tombstones()` instead.
-	pub fn scan_all_versions<K>(
-		&self,
-		start: K,
-		end: K,
-		limit: Option<usize>,
-	) -> Result<Vec<(Key, Value, Version, bool)>>
-	where
-		K: IntoBytes,
-	{
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if B+tree versioned index is enabled
-		if !self.core.opts.enable_versioned_index {
-			return Err(Error::InvalidArgument(
-				"B+tree versioned index not enabled. Use versioned_range_with_tombstones() for LSM-based iteration.".to_string()
-			));
-		}
-
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.scan_all_versions(start, end, limit),
-			None => Err(Error::NoSnapshot),
-		}
-	}
-
-	/// Returns an iterator over ALL versions of keys in the range,
-	/// querying the LSM tree directly (no B+tree index required).
-	///
-	/// Unlike `range()` which returns only the latest version per key,
-	/// this returns every visible version in (user_key, seq_num descending) order.
-	///
-	/// This method requires `enable_versioning` to be true but does NOT require
-	/// the B+tree versioned index (`enable_versioned_index`).
-	///
-	/// Note: This iterator does not include uncommitted writes from the transaction's
-	/// write-set since historical version queries should reflect committed data only.
-	///
-	/// # Arguments
-	/// * `start` - Start key (inclusive)
-	/// * `end` - End key (exclusive)
-	///
-	/// # Example
-	/// ```ignore
-	/// let mut iter = tx.versioned_range(b"a", b"z")?;
-	/// iter.seek_first()?;
-	/// while iter.valid() {
-	///     println!("key={:?} ts={} value={:?}",
-	///         iter.key(), iter.timestamp(), iter.value()?);
-	///     iter.next()?;
-	/// }
-	/// ```
-	pub fn versioned_range<K>(&self, start: K, end: K) -> Result<TransactionVersionedIterator<'_>>
-	where
-		K: IntoBytes,
-	{
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioning is enabled (B+tree index is optional)
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
-		}
-
-		// Get the snapshot iterator
-		let snapshot = self.snapshot.as_ref().ok_or(Error::NoSnapshot)?;
-		let inner = snapshot.versioned_range(
-			Some(start.as_slice()),
-			Some(end.as_slice()),
-			false, // exclude tombstones by default
-		)?;
-
-		Ok(TransactionVersionedIterator::new(inner, Arc::clone(&self.core)))
-	}
-
-	/// Returns an iterator over ALL versions of keys in the range, including tombstones.
-	///
-	/// Same as `versioned_range()` but includes soft-deleted entries (tombstones).
-	/// This is useful for seeing the complete version history including deletions.
-	///
-	/// # Arguments
-	/// * `start` - Start key (inclusive)
-	/// * `end` - End key (exclusive)
-	pub fn versioned_range_with_tombstones<K>(
-		&self,
-		start: K,
-		end: K,
-	) -> Result<TransactionVersionedIterator<'_>>
-	where
-		K: IntoBytes,
-	{
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// Check if versioning is enabled (B+tree index is optional)
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
-		}
-
-		// Get the snapshot iterator
-		let snapshot = self.snapshot.as_ref().ok_or(Error::NoSnapshot)?;
-		let inner = snapshot.versioned_range(
-			Some(start.as_slice()),
-			Some(end.as_slice()),
-			true, // include tombstones
-		)?;
-
-		Ok(TransactionVersionedIterator::new(inner, Arc::clone(&self.core)))
 	}
 
 	/// Returns a unified history iterator over ALL versions of keys in the range.
@@ -894,21 +646,12 @@ impl Transaction {
 
 		let snapshot = self.snapshot.as_ref().ok_or(Error::NoSnapshot)?;
 
-		// Choose the appropriate backend
-		let inner = if self.core.opts.enable_versioned_index {
-			// Use B+tree streaming iterator
-			let btree_iter =
-				snapshot.btree_history_iter(Some(start.as_slice()), Some(end.as_slice()))?;
-			HistoryIterator::BTree(btree_iter)
-		} else {
-			// Use LSM-based versioned iterator
-			let lsm_iter = snapshot.versioned_range(
-				Some(start.as_slice()),
-				Some(end.as_slice()),
-				opts.include_tombstones,
-			)?;
-			HistoryIterator::Lsm(lsm_iter)
-		};
+		// Use unified history_iter() which chooses the appropriate backend
+		let inner = snapshot.history_iter(
+			Some(start.as_slice()),
+			Some(end.as_slice()),
+			opts.include_tombstones,
+		)?;
 
 		Ok(TransactionHistoryIterator::new(inner, Arc::clone(&self.core)))
 	}
@@ -940,10 +683,27 @@ impl Transaction {
 				// savepoint as the value we are about to write, then we can
 				// overwrite it with the new value (same savepoint = same transaction state).
 				// For different savepoints, we add a new entry to support savepoint rollbacks.
+				//
+				// Exception: When using explicit timestamps (set_at_version), entries with
+				// different timestamps should be preserved as separate versions, not replaced.
 				if let Some(last_entry) = entries.last() {
 					if last_entry.savepoint_no == e.savepoint_no {
-						// Same savepoint - replace the last entry
-						*entries.last_mut().unwrap() = e;
+						// Same savepoint - check if timestamps differ
+						// If both have explicit timestamps and they're different,
+						// preserve both as separate versions
+						let last_has_explicit_ts = last_entry.timestamp != Entry::COMMIT_TIME;
+						let new_has_explicit_ts = e.timestamp != Entry::COMMIT_TIME;
+
+						if last_has_explicit_ts
+							&& new_has_explicit_ts
+							&& last_entry.timestamp != e.timestamp
+						{
+							// Different explicit timestamps - keep both versions
+							entries.push(e);
+						} else {
+							// Same timestamp or using commit time - replace
+							*entries.last_mut().unwrap() = e;
+						}
 					} else {
 						// Different savepoint - add new entry
 						entries.push(e);
@@ -1623,226 +1383,7 @@ impl<'a> TransactionIterator<'a> {
 	}
 }
 
-/// Public iterator for scanning ALL versions of keys in a range.
-/// Returns entries in (user_key, seq_num descending) order.
-///
-/// Unlike `TransactionIterator` which returns only the latest version per key,
-/// this iterator returns every visible version from the LSM tree directly.
-///
-/// Note: This iterator does not include uncommitted writes from the transaction's
-/// write-set since historical version queries should reflect committed data only.
-///
-/// # Example
-/// ```ignore
-/// let mut iter = tx.versioned_range(b"a", b"z")?;
-/// iter.seek_first()?;
-/// while iter.valid() {
-///     println!("key={:?} ts={} value={:?}",
-///         iter.key(), iter.timestamp(), iter.value()?);
-///     iter.next()?;
-/// }
-/// ```
-pub struct TransactionVersionedIterator<'a> {
-	inner: VersionedSnapshotIterator<'a>,
-	core: Arc<Core>,
-}
-
-impl<'a> TransactionVersionedIterator<'a> {
-	/// Creates a new versioned iterator
-	pub(crate) fn new(inner: VersionedSnapshotIterator<'a>, core: Arc<Core>) -> Self {
-		Self {
-			inner,
-			core,
-		}
-	}
-
-	/// Seek to first entry. Returns true if valid.
-	pub fn seek_first(&mut self) -> Result<bool> {
-		self.inner.seek_first()
-	}
-
-	/// Seek to last entry. Returns true if valid.
-	pub fn seek_last(&mut self) -> Result<bool> {
-		self.inner.seek_last()
-	}
-
-	/// Seek to first entry >= target. Returns true if valid.
-	pub fn seek<K: AsRef<[u8]>>(&mut self, target: K) -> Result<bool> {
-		// Create a minimal encoded key for seeking
-		let mut encoded = target.as_ref().to_vec();
-		// Add maximum trailer (seq_num=MAX, kind=MAX) and timestamp=MAX to find >= target
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes());
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes());
-		self.inner.seek(&encoded)
-	}
-
-	/// Move to next entry. Returns true if valid.
-	#[allow(clippy::should_implement_trait)]
-	pub fn next(&mut self) -> Result<bool> {
-		self.inner.next()
-	}
-
-	/// Move to previous entry. Returns true if valid.
-	pub fn prev(&mut self) -> Result<bool> {
-		self.inner.prev()
-	}
-
-	/// Check if positioned on valid entry.
-	pub fn valid(&self) -> bool {
-		self.inner.valid()
-	}
-
-	/// Get current user key (allocates). Caller must check valid() first.
-	pub fn key(&self) -> Key {
-		debug_assert!(self.valid());
-		self.inner.key().user_key().to_vec()
-	}
-
-	/// Get the timestamp/version of the current entry. Caller must check valid() first.
-	pub fn timestamp(&self) -> u64 {
-		debug_assert!(self.valid());
-		self.inner.key().timestamp()
-	}
-
-	/// Get the sequence number of the current entry. Caller must check valid() first.
-	pub fn seq_num(&self) -> u64 {
-		debug_assert!(self.valid());
-		self.inner.key().seq_num()
-	}
-
-	/// Check if the current entry is a tombstone. Caller must check valid() first.
-	pub fn is_tombstone(&self) -> bool {
-		debug_assert!(self.valid());
-		self.inner.key().is_tombstone()
-	}
-
-	/// Get current value (may allocate for VLog resolution). Caller must check valid() first.
-	pub fn value(&self) -> Result<Value> {
-		debug_assert!(self.valid());
-		self.core.resolve_value(self.inner.value())
-	}
-
-	/// Get current entry as a tuple (key, value, timestamp, is_tombstone).
-	/// Convenience method for collecting all version information.
-	/// For tombstones, returns an empty value since tombstones have no value.
-	pub fn entry(&self) -> Result<(Key, Value, u64, bool)> {
-		let is_tombstone = self.is_tombstone();
-		// Tombstones have no value, so use empty vec
-		let value = if is_tombstone {
-			Vec::new()
-		} else {
-			self.value()?
-		};
-		Ok((self.key(), value, self.timestamp(), is_tombstone))
-	}
-}
-
-impl InternalIterator for TransactionVersionedIterator<'_> {
-	fn seek(&mut self, target: &[u8]) -> Result<bool> {
-		self.inner.seek(target)
-	}
-
-	fn seek_first(&mut self) -> Result<bool> {
-		self.inner.seek_first()
-	}
-
-	fn seek_last(&mut self) -> Result<bool> {
-		self.inner.seek_last()
-	}
-
-	fn next(&mut self) -> Result<bool> {
-		self.inner.next()
-	}
-
-	fn prev(&mut self) -> Result<bool> {
-		self.inner.prev()
-	}
-
-	fn valid(&self) -> bool {
-		self.inner.valid()
-	}
-
-	fn key(&self) -> InternalKeyRef<'_> {
-		self.inner.key()
-	}
-
-	fn value(&self) -> &[u8] {
-		self.inner.value()
-	}
-}
-
-// ===== Unified History Iterator =====
-
-/// Unified history iterator that works with both LSM and B+tree backends.
-/// Implements `InternalIterator` for a consistent streaming API.
-///
-/// This enum allows the transaction API to return a single iterator type
-/// regardless of whether the underlying storage uses LSM-based versioned
-/// iteration or B+tree index queries.
-pub enum HistoryIterator<'a> {
-	/// LSM-based streaming iterator (no B+tree index)
-	Lsm(VersionedSnapshotIterator<'a>),
-	/// B+tree streaming iterator (holds guard internally)
-	BTree(BPlusTreeIteratorWithGuard<'a>),
-}
-
-impl InternalIterator for HistoryIterator<'_> {
-	fn seek(&mut self, target: &[u8]) -> Result<bool> {
-		match self {
-			Self::Lsm(iter) => iter.seek(target),
-			Self::BTree(iter) => iter.seek(target),
-		}
-	}
-
-	fn seek_first(&mut self) -> Result<bool> {
-		match self {
-			Self::Lsm(iter) => iter.seek_first(),
-			Self::BTree(iter) => iter.seek_first(),
-		}
-	}
-
-	fn seek_last(&mut self) -> Result<bool> {
-		match self {
-			Self::Lsm(iter) => iter.seek_last(),
-			Self::BTree(iter) => iter.seek_last(),
-		}
-	}
-
-	fn next(&mut self) -> Result<bool> {
-		match self {
-			Self::Lsm(iter) => iter.next(),
-			Self::BTree(iter) => iter.next(),
-		}
-	}
-
-	fn prev(&mut self) -> Result<bool> {
-		match self {
-			Self::Lsm(iter) => iter.prev(),
-			Self::BTree(iter) => iter.prev(),
-		}
-	}
-
-	fn valid(&self) -> bool {
-		match self {
-			Self::Lsm(iter) => iter.valid(),
-			Self::BTree(iter) => iter.valid(),
-		}
-	}
-
-	fn key(&self) -> InternalKeyRef<'_> {
-		match self {
-			Self::Lsm(iter) => iter.key(),
-			Self::BTree(iter) => iter.key(),
-		}
-	}
-
-	fn value(&self) -> &[u8] {
-		match self {
-			Self::Lsm(iter) => iter.value(),
-			Self::BTree(iter) => iter.value(),
-		}
-	}
-}
+// ===== Transaction History Iterator =====
 
 /// Public wrapper around `HistoryIterator` that provides convenient methods
 /// for accessing version history with resolved values.
