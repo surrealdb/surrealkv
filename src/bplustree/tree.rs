@@ -3334,14 +3334,13 @@ impl<F: VfsFile> InternalIterator for BPlusTreeIterator<'_, F> {
 				.partition_point(|k| self.tree.compare.compare(k, target) == Ordering::Less);
 
 			// If we're past the end of this leaf, advance to next
-			if self.current_idx >= leaf.keys.len() {
-				if !self
+			if self.current_idx >= leaf.keys.len()
+				&& !self
 					.advance_to_next_leaf()
 					.map_err(|e| crate::error::Error::BPlusTree(e.to_string()))?
-				{
-					self.exhausted = true;
-					return Ok(false);
-				}
+			{
+				self.exhausted = true;
+				return Ok(false);
 			}
 		}
 
@@ -3418,14 +3417,13 @@ impl<F: VfsFile> InternalIterator for BPlusTreeIterator<'_, F> {
 
 		// Check if we need to advance to next leaf
 		if let Some(leaf) = &self.current_leaf {
-			if self.current_idx >= leaf.keys.len() {
-				if !self
+			if self.current_idx >= leaf.keys.len()
+				&& !self
 					.advance_to_next_leaf()
 					.map_err(|e| crate::error::Error::BPlusTree(e.to_string()))?
-				{
-					self.exhausted = true;
-					return Ok(false);
-				}
+			{
+				self.exhausted = true;
+				return Ok(false);
 			}
 		}
 
@@ -5448,7 +5446,7 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"only_key", 1), b"only_value").unwrap();
+		tree.insert(make_internal_key(b"only_key", 1), b"only_value").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
@@ -5462,7 +5460,7 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"only_key", 1), b"only_value").unwrap();
+		tree.insert(make_internal_key(b"only_key", 1), b"only_value").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_last().unwrap());
@@ -5476,7 +5474,7 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"only_key", 1), b"only_value").unwrap();
+		tree.insert(make_internal_key(b"only_key", 1), b"only_value").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
@@ -5492,7 +5490,7 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"only_key", 1), b"only_value").unwrap();
+		tree.insert(make_internal_key(b"only_key", 1), b"only_value").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
@@ -5510,9 +5508,9 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"bbb", 2), b"val2").unwrap();
-		tree.insert(&make_internal_key(b"ccc", 3), b"val3").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"bbb", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"ccc", 3), b"val3").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		let collected = collect_forward(&mut iter);
@@ -5529,10 +5527,10 @@ mod tests {
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
 		// Insert in random order
-		tree.insert(&make_internal_key(b"charlie", 1), b"3").unwrap();
-		tree.insert(&make_internal_key(b"alpha", 2), b"1").unwrap();
-		tree.insert(&make_internal_key(b"delta", 3), b"4").unwrap();
-		tree.insert(&make_internal_key(b"bravo", 4), b"2").unwrap();
+		tree.insert(make_internal_key(b"charlie", 1), b"3").unwrap();
+		tree.insert(make_internal_key(b"alpha", 2), b"1").unwrap();
+		tree.insert(make_internal_key(b"delta", 3), b"4").unwrap();
+		tree.insert(make_internal_key(b"bravo", 4), b"2").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		let collected = collect_forward(&mut iter);
@@ -5552,9 +5550,9 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"bbb", 2), b"val2").unwrap();
-		tree.insert(&make_internal_key(b"ccc", 3), b"val3").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"bbb", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"ccc", 3), b"val3").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		let collected = collect_backward(&mut iter);
@@ -5574,7 +5572,7 @@ mod tests {
 		for i in 0..10 {
 			let key = format!("key{:02}", i);
 			let val = format!("val{:02}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), val.as_bytes()).unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), val.as_bytes()).unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5599,9 +5597,9 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"bbb", 2), b"val2").unwrap();
-		tree.insert(&make_internal_key(b"ccc", 3), b"val3").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"bbb", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"ccc", 3), b"val3").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
@@ -5621,9 +5619,9 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"bbb", 2), b"val2").unwrap();
-		tree.insert(&make_internal_key(b"ccc", 3), b"val3").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"bbb", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"ccc", 3), b"val3").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_last().unwrap());
@@ -5645,7 +5643,7 @@ mod tests {
 
 		for i in 0..5 {
 			let key = format!("key{}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5672,7 +5670,7 @@ mod tests {
 
 		let keys: Vec<String> = (0..10).map(|i| format!("key{:02}", i)).collect();
 		for (i, key) in keys.iter().enumerate() {
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5705,9 +5703,9 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"bbb", 2), b"val2").unwrap();
-		tree.insert(&make_internal_key(b"ccc", 3), b"val3").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"bbb", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"ccc", 3), b"val3").unwrap();
 
 		let mut iter = tree.internal_iterator();
 
@@ -5723,9 +5721,9 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"ccc", 2), b"val3").unwrap();
-		tree.insert(&make_internal_key(b"eee", 3), b"val5").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"ccc", 2), b"val3").unwrap();
+		tree.insert(make_internal_key(b"eee", 3), b"val5").unwrap();
 
 		let mut iter = tree.internal_iterator();
 
@@ -5745,8 +5743,8 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"bbb", 1), b"val2").unwrap();
-		tree.insert(&make_internal_key(b"ccc", 2), b"val3").unwrap();
+		tree.insert(make_internal_key(b"bbb", 1), b"val2").unwrap();
+		tree.insert(make_internal_key(b"ccc", 2), b"val3").unwrap();
 
 		let mut iter = tree.internal_iterator();
 
@@ -5761,8 +5759,8 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"bbb", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"bbb", 2), b"val2").unwrap();
 
 		let mut iter = tree.internal_iterator();
 
@@ -5778,7 +5776,7 @@ mod tests {
 
 		for i in 0..10 {
 			let key = format!("key{:02}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5802,7 +5800,7 @@ mod tests {
 
 		for i in 0..10 {
 			let key = format!("key{:02}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5824,11 +5822,11 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"bbb", 2), b"val2").unwrap();
-		tree.insert(&make_internal_key(b"ccc", 3), b"val3").unwrap();
-		tree.insert(&make_internal_key(b"ddd", 4), b"val4").unwrap();
-		tree.insert(&make_internal_key(b"eee", 5), b"val5").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"bbb", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"ccc", 3), b"val3").unwrap();
+		tree.insert(make_internal_key(b"ddd", 4), b"val4").unwrap();
+		tree.insert(make_internal_key(b"eee", 5), b"val5").unwrap();
 
 		let mut iter = tree.internal_iterator();
 
@@ -5853,8 +5851,8 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"key1", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"key2", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"key1", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"key2", 2), b"val2").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
@@ -5876,8 +5874,8 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"key1", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"key2", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"key1", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"key2", 2), b"val2").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_last().unwrap());
@@ -5899,9 +5897,9 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"bbb", 2), b"val2").unwrap();
-		tree.insert(&make_internal_key(b"ccc", 3), b"val3").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"bbb", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"ccc", 3), b"val3").unwrap();
 
 		let mut iter = tree.internal_iterator();
 
@@ -5921,8 +5919,8 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"bbb", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"bbb", 2), b"val2").unwrap();
 
 		let mut iter = tree.internal_iterator();
 
@@ -5942,8 +5940,8 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"aaa", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"bbb", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"aaa", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"bbb", 2), b"val2").unwrap();
 
 		let mut iter = tree.internal_iterator();
 
@@ -5969,7 +5967,7 @@ mod tests {
 		for i in 0..count {
 			let key = format!("key{:04}", i);
 			let val = format!("val{:04}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), val.as_bytes()).unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), val.as_bytes()).unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5978,9 +5976,9 @@ mod tests {
 		assert_eq!(collected.len(), count);
 
 		// Verify ordering
-		for i in 0..count {
+		for (i, item) in collected.iter().enumerate().take(count) {
 			let expected_key = format!("key{:04}", i);
-			assert_eq!(collected[i].0, expected_key.as_bytes());
+			assert_eq!(item.0, expected_key.as_bytes());
 		}
 	}
 
@@ -5993,7 +5991,7 @@ mod tests {
 		for i in 0..count {
 			let key = format!("key{:04}", i);
 			let val = format!("val{:04}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), val.as_bytes()).unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), val.as_bytes()).unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -6002,9 +6000,9 @@ mod tests {
 		assert_eq!(collected.len(), count);
 
 		// Verify reverse ordering
-		for i in 0..count {
+		for (i, item) in collected.iter().enumerate().take(count) {
 			let expected_key = format!("key{:04}", count - 1 - i);
-			assert_eq!(collected[i].0, expected_key.as_bytes());
+			assert_eq!(item.0, expected_key.as_bytes());
 		}
 	}
 
@@ -6015,7 +6013,7 @@ mod tests {
 
 		for i in 0..50 {
 			let key = format!("key{:04}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -6038,7 +6036,7 @@ mod tests {
 		for i in 0..100 {
 			let key = format!("key{:04}", i);
 			let val = vec![i as u8; 100]; // 100 byte values
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), &val).unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), &val).unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -6069,7 +6067,7 @@ mod tests {
 		for i in 0..50 {
 			let key = format!("key{:04}", i);
 			let val = vec![0u8; 200]; // Large values to force splits
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), &val).unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), &val).unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -6099,8 +6097,8 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"first", 1), b"val1").unwrap();
-		tree.insert(&make_internal_key(b"second", 2), b"val2").unwrap();
+		tree.insert(make_internal_key(b"first", 1), b"val1").unwrap();
+		tree.insert(make_internal_key(b"second", 2), b"val2").unwrap();
 
 		let mut iter = tree.internal_iterator();
 
@@ -6124,9 +6122,9 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"key1", 1), b"value_one").unwrap();
-		tree.insert(&make_internal_key(b"key2", 2), b"value_two").unwrap();
-		tree.insert(&make_internal_key(b"key3", 3), b"value_three").unwrap();
+		tree.insert(make_internal_key(b"key1", 1), b"value_one").unwrap();
+		tree.insert(make_internal_key(b"key2", 2), b"value_two").unwrap();
+		tree.insert(make_internal_key(b"key3", 3), b"value_three").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
@@ -6145,7 +6143,7 @@ mod tests {
 
 		for i in 0..10 {
 			let key = format!("key{:02}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
+			tree.insert(make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		// Create two iterators
