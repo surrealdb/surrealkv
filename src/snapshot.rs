@@ -1,9 +1,13 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::ops::{Bound, RangeBounds};
 use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
+use parking_lot::RwLockReadGuard;
+
+use crate::bplustree::tree::{BPlusTreeIterator, DiskBPlusTree};
 use crate::error::{Error, Result};
 use crate::iter::BoxedInternalIterator;
 use crate::levels::Levels;
@@ -251,6 +255,35 @@ impl Snapshot {
 			internal_range,
 			include_tombstones,
 		)
+	}
+
+	/// Creates a streaming B+tree iterator for versioned queries.
+	///
+	/// This method returns a true streaming iterator over the B+tree versioned index,
+	/// without collecting results into memory. Requires the B+tree versioned index
+	/// to be enabled.
+	///
+	/// # Arguments
+	/// * `lower` - Optional lower bound key (inclusive)
+	/// * `upper` - Optional upper bound key (exclusive)
+	///
+	/// # Errors
+	/// Returns an error if the B+tree versioned index is not enabled.
+	pub(crate) fn btree_history_iter(
+		&self,
+		_lower: Option<&[u8]>,
+		_upper: Option<&[u8]>,
+	) -> Result<BPlusTreeIteratorWithGuard<'_>> {
+		if !self.core.opts.enable_versioned_index {
+			return Err(Error::InvalidArgument("B+tree versioned index not enabled".to_string()));
+		}
+
+		let versioned_index =
+			self.core.versioned_index.as_ref().ok_or_else(|| {
+				Error::InvalidArgument("No versioned index available".to_string())
+			})?;
+
+		BPlusTreeIteratorWithGuard::new(versioned_index)
 	}
 
 	/// Queries for a specific key at a specific timestamp.
@@ -1485,5 +1518,85 @@ impl Drop for VersionedSnapshotIterator<'_> {
 				log::warn!("Failed to decrement VLog iterator count: {e}");
 			}
 		}
+	}
+}
+
+// ===== B+Tree History Iterator =====
+
+/// A streaming iterator over the B+tree versioned index.
+///
+/// This struct holds both the RwLock read guard and the BPlusTreeIterator together,
+/// allowing true streaming iteration without collecting results into memory.
+///
+/// # Safety
+/// This is a self-referential struct. The iterator borrows from the guarded tree.
+/// Field declaration order is critical: `iter` MUST be declared before `_guard`
+/// to ensure the iterator is dropped before the guard.
+pub struct BPlusTreeIteratorWithGuard<'a> {
+	/// The iterator borrowing from the guarded tree.
+	/// MUST be declared before _guard for correct drop order.
+	iter: BPlusTreeIterator<'a, File>,
+
+	/// The read guard that keeps the tree alive.
+	/// Dropped AFTER iter due to field declaration order.
+	#[allow(dead_code)]
+	_guard: RwLockReadGuard<'a, DiskBPlusTree>,
+}
+
+impl<'a> BPlusTreeIteratorWithGuard<'a> {
+	/// Creates a new streaming B+tree iterator.
+	///
+	/// # Safety
+	/// Uses unsafe to create a self-referential struct. This is safe because:
+	/// 1. The guard keeps the tree alive for the lifetime of this struct
+	/// 2. The iterator is dropped before the guard (field declaration order)
+	/// 3. The tree memory is stable (behind Arc<RwLock<>>)
+	pub(crate) fn new(versioned_index: &'a parking_lot::RwLock<DiskBPlusTree>) -> Result<Self> {
+		let guard = versioned_index.read();
+
+		// SAFETY: The guard keeps the tree alive for the lifetime of this struct.
+		// The iterator is dropped before the guard due to field declaration order.
+		let tree_ref: &'a DiskBPlusTree = unsafe { &*(&*guard as *const DiskBPlusTree) };
+
+		let iter = tree_ref.internal_iterator();
+
+		Ok(Self {
+			iter,
+			_guard: guard,
+		})
+	}
+}
+
+impl InternalIterator for BPlusTreeIteratorWithGuard<'_> {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.iter.seek(target)
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		self.iter.seek_first()
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		self.iter.seek_last()
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		self.iter.next()
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		self.iter.prev()
+	}
+
+	fn valid(&self) -> bool {
+		self.iter.valid()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		self.iter.key()
+	}
+
+	fn value(&self) -> &[u8] {
+		self.iter.value()
 	}
 }

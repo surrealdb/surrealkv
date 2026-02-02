@@ -1237,3 +1237,194 @@ async fn test_versions_survive_compaction() {
 	assert_eq!(results[0].1, b"v10");
 	assert_eq!(results[9].1, b"v1");
 }
+
+// ============================================================================
+// Tests for new unified history() API
+// ============================================================================
+
+use crate::transaction::TransactionHistoryIterator;
+
+/// Collects all entries from a TransactionHistoryIterator
+fn collect_history_all(
+	iter: &mut TransactionHistoryIterator,
+) -> Result<Vec<(Key, Value, u64, bool)>> {
+	iter.seek_first()?;
+	let mut result = Vec::new();
+	while iter.valid() {
+		let is_tombstone = iter.is_tombstone();
+		// Tombstones have no value, so use empty vec
+		let value = if is_tombstone {
+			Vec::new()
+		} else {
+			iter.value()?
+		};
+		result.push((iter.key(), value, iter.timestamp(), is_tombstone));
+		iter.next()?;
+	}
+	Ok(result)
+}
+
+/// Collects all entries from a TransactionHistoryIterator in reverse
+fn collect_history_reverse(
+	iter: &mut TransactionHistoryIterator,
+) -> Result<Vec<(Key, Value, u64, bool)>> {
+	iter.seek_last()?;
+	let mut result = Vec::new();
+	while iter.valid() {
+		let is_tombstone = iter.is_tombstone();
+		// Tombstones have no value, so use empty vec
+		let value = if is_tombstone {
+			Vec::new()
+		} else {
+			iter.value()?
+		};
+		result.push((iter.key(), value, iter.timestamp(), is_tombstone));
+		if !iter.prev()? {
+			break;
+		}
+	}
+	Ok(result)
+}
+
+// ============================================================================
+// Test: history() with LSM-based iteration (no B+tree index)
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_history_lsm_multiple_versions() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 three times with different values
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1_v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1_v3", 300).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query using history() API
+	let tx = store.begin().unwrap();
+	let mut iter = tx.history(b"key1", b"key2").unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	// Should have all 3 versions, ordered by seq_num descending (newest first)
+	assert_eq!(results.len(), 3, "Should have 3 versions");
+	assert_eq!(results[0].0, b"key1");
+	assert_eq!(results[0].1, b"value1_v3");
+	assert_eq!(results[0].2, 300); // timestamp
+	assert_eq!(results[1].0, b"key1");
+	assert_eq!(results[1].1, b"value1_v2");
+	assert_eq!(results[1].2, 200);
+	assert_eq!(results[2].0, b"key1");
+	assert_eq!(results[2].1, b"value1_v1");
+	assert_eq!(results[2].2, 100);
+}
+
+// ============================================================================
+// Test: history() with B+tree index enabled
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_history_btree_multiple_versions() {
+	let (store, _temp_dir) = create_versioned_store_with_index();
+
+	// Insert key1 three times with different values
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1_v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"value1_v3", 300).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query using history() API - should use B+tree streaming
+	let tx = store.begin().unwrap();
+	let mut iter = tx.history(b"key1", b"key2").unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	// Should have all 3 versions
+	assert_eq!(results.len(), 3, "Should have 3 versions via B+tree");
+	assert_eq!(results[0].0, b"key1");
+	assert_eq!(results[1].0, b"key1");
+	assert_eq!(results[2].0, b"key1");
+}
+
+// ============================================================================
+// Test: history() forward and backward iteration
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_history_bidirectional_iteration() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert multiple keys with multiple versions
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"key1_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key1", b"key1_v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at_version(b"key2", b"key2_v1", 150).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.history(b"key0", b"key9").unwrap();
+
+	// Test forward iteration
+	let forward_results = collect_history_all(&mut iter).unwrap();
+	assert_eq!(forward_results.len(), 3);
+
+	// Test backward iteration
+	let reverse_results = collect_history_reverse(&mut iter).unwrap();
+	assert_eq!(reverse_results.len(), 3);
+
+	// Forward and reverse should have opposite order
+	assert_eq!(forward_results[0].0, reverse_results[2].0);
+}
+
+// ============================================================================
+// Test: history() requires versioning enabled
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_history_requires_versioning() {
+	// Create store WITHOUT versioning enabled
+	let (store, _temp_dir) = create_store_no_versioning();
+
+	// Insert some data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Try to call history() - should return error
+	let tx = store.begin().unwrap();
+	let result = tx.history(b"key0", b"key9");
+
+	assert!(result.is_err(), "history() should fail without versioning enabled");
+}

@@ -3232,10 +3232,8 @@ impl<'a, F: VfsFile> BPlusTreeIterator<'a, F> {
 			match node.as_ref() {
 				NodeType::Internal(internal) => {
 					// Navigate to rightmost child
-					node_offset = *internal
-						.children
-						.last()
-						.ok_or(BPlusTreeError::InvalidNodeType)?;
+					node_offset =
+						*internal.children.last().ok_or(BPlusTreeError::InvalidNodeType)?;
 				}
 				NodeType::Leaf(leaf) => {
 					self.current_leaf = Some(leaf.clone());
@@ -3327,8 +3325,7 @@ impl<F: VfsFile> InternalIterator for BPlusTreeIterator<'_, F> {
 		self.exhausted = false;
 
 		// Navigate to the leaf that might contain the target
-		self.navigate_to_key(target)
-			.map_err(|e| crate::error::Error::BPlusTree(e.to_string()))?;
+		self.navigate_to_key(target).map_err(|e| crate::error::Error::BPlusTree(e.to_string()))?;
 
 		if let Some(leaf) = &self.current_leaf {
 			// Binary search for first key >= target
@@ -3355,8 +3352,7 @@ impl<F: VfsFile> InternalIterator for BPlusTreeIterator<'_, F> {
 	fn seek_first(&mut self) -> crate::error::Result<bool> {
 		self.exhausted = false;
 
-		self.navigate_to_first_leaf()
-			.map_err(|e| crate::error::Error::BPlusTree(e.to_string()))?;
+		self.navigate_to_first_leaf().map_err(|e| crate::error::Error::BPlusTree(e.to_string()))?;
 		self.current_idx = 0;
 
 		// Handle empty tree or empty first leaf
@@ -3383,8 +3379,7 @@ impl<F: VfsFile> InternalIterator for BPlusTreeIterator<'_, F> {
 	fn seek_last(&mut self) -> crate::error::Result<bool> {
 		self.exhausted = false;
 
-		self.navigate_to_last_leaf()
-			.map_err(|e| crate::error::Error::BPlusTree(e.to_string()))?;
+		self.navigate_to_last_leaf().map_err(|e| crate::error::Error::BPlusTree(e.to_string()))?;
 
 		if let Some(leaf) = &self.current_leaf {
 			if leaf.keys.is_empty() {
@@ -5378,9 +5373,7 @@ mod tests {
 	}
 
 	// Helper to collect all entries from an iterator (forward)
-	fn collect_forward(
-		iter: &mut BPlusTreeIterator<'_, std::fs::File>,
-	) -> Vec<(Vec<u8>, Vec<u8>)> {
+	fn collect_forward(iter: &mut BPlusTreeIterator<'_, std::fs::File>) -> Vec<(Vec<u8>, Vec<u8>)> {
 		let mut result = Vec::new();
 		if !iter.seek_first().unwrap() {
 			return result;
@@ -5455,8 +5448,7 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"only_key", 1), b"only_value")
-			.unwrap();
+		tree.insert(&make_internal_key(b"only_key", 1), b"only_value").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
@@ -5470,8 +5462,7 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"only_key", 1), b"only_value")
-			.unwrap();
+		tree.insert(&make_internal_key(b"only_key", 1), b"only_value").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_last().unwrap());
@@ -5485,8 +5476,7 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"only_key", 1), b"only_value")
-			.unwrap();
+		tree.insert(&make_internal_key(b"only_key", 1), b"only_value").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
@@ -5502,8 +5492,7 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"only_key", 1), b"only_value")
-			.unwrap();
+		tree.insert(&make_internal_key(b"only_key", 1), b"only_value").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
@@ -5585,8 +5574,7 @@ mod tests {
 		for i in 0..10 {
 			let key = format!("key{:02}", i);
 			let val = format!("val{:02}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), val.as_bytes())
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), val.as_bytes()).unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5657,8 +5645,7 @@ mod tests {
 
 		for i in 0..5 {
 			let key = format!("key{}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value")
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5685,8 +5672,7 @@ mod tests {
 
 		let keys: Vec<String> = (0..10).map(|i| format!("key{:02}", i)).collect();
 		for (i, key) in keys.iter().enumerate() {
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value")
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5792,8 +5778,7 @@ mod tests {
 
 		for i in 0..10 {
 			let key = format!("key{:02}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value")
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5817,8 +5802,7 @@ mod tests {
 
 		for i in 0..10 {
 			let key = format!("key{:02}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value")
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -5985,8 +5969,7 @@ mod tests {
 		for i in 0..count {
 			let key = format!("key{:04}", i);
 			let val = format!("val{:04}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), val.as_bytes())
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), val.as_bytes()).unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -6010,8 +5993,7 @@ mod tests {
 		for i in 0..count {
 			let key = format!("key{:04}", i);
 			let val = format!("val{:04}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), val.as_bytes())
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), val.as_bytes()).unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -6033,8 +6015,7 @@ mod tests {
 
 		for i in 0..50 {
 			let key = format!("key{:04}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value")
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -6057,8 +6038,7 @@ mod tests {
 		for i in 0..100 {
 			let key = format!("key{:04}", i);
 			let val = vec![i as u8; 100]; // 100 byte values
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), &val)
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), &val).unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -6089,8 +6069,7 @@ mod tests {
 		for i in 0..50 {
 			let key = format!("key{:04}", i);
 			let val = vec![0u8; 200]; // Large values to force splits
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), &val)
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), &val).unwrap();
 		}
 
 		let mut iter = tree.internal_iterator();
@@ -6145,12 +6124,9 @@ mod tests {
 		let temp_file = NamedTempFile::new().unwrap();
 		let mut tree = BPlusTree::disk(temp_file.path(), Arc::new(TestComparator)).unwrap();
 
-		tree.insert(&make_internal_key(b"key1", 1), b"value_one")
-			.unwrap();
-		tree.insert(&make_internal_key(b"key2", 2), b"value_two")
-			.unwrap();
-		tree.insert(&make_internal_key(b"key3", 3), b"value_three")
-			.unwrap();
+		tree.insert(&make_internal_key(b"key1", 1), b"value_one").unwrap();
+		tree.insert(&make_internal_key(b"key2", 2), b"value_two").unwrap();
+		tree.insert(&make_internal_key(b"key3", 3), b"value_three").unwrap();
 
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
@@ -6169,8 +6145,7 @@ mod tests {
 
 		for i in 0..10 {
 			let key = format!("key{:02}", i);
-			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value")
-				.unwrap();
+			tree.insert(&make_internal_key(key.as_bytes(), i as u64), b"value").unwrap();
 		}
 
 		// Create two iterators

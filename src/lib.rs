@@ -37,7 +37,15 @@ use sstable::bloom::LevelDBBloomFilter;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
+pub use crate::transaction::{
+	Durability,
+	HistoryOptions,
+	Mode,
+	ReadOptions,
+	Transaction,
+	TransactionHistoryIterator,
+	WriteOptions,
+};
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {

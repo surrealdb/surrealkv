@@ -338,7 +338,43 @@ println!("Found {} keys at timestamp 150", count);
 
 ### Retrieving All Versions
 
-Get all historical versions of keys in a range:
+Use the unified `history()` API to iterate over all historical versions of keys in a range.
+This API uses streaming iteration (no memory collection) and works with both LSM and B+tree backends:
+
+```rust
+let tx = tree.begin()?;
+let mut iter = tx.history(b"key1", b"key2")?;
+
+iter.seek_first()?;
+while iter.valid() {
+    let key = iter.key();
+    let timestamp = iter.timestamp();
+
+    if iter.is_tombstone() {
+        println!("Key {:?} deleted at timestamp {}", key, timestamp);
+    } else {
+        let value = iter.value()?;
+        println!("Key {:?} = {:?} at timestamp {}", key, value, timestamp);
+    }
+    iter.next()?;
+}
+```
+
+For more control, use `history_with_options()`:
+
+```rust
+use surrealkv::HistoryOptions;
+
+let tx = tree.begin()?;
+let opts = HistoryOptions::new()
+    .with_tombstones(true)   // Include deleted entries
+    .with_limit(Some(100));  // Limit results
+
+let mut iter = tx.history_with_options(b"key1", b"key2", &opts)?;
+// ... iterate as above
+```
+
+For collecting all versions at once (backwards compatible):
 
 ```rust
 let tx = tree.begin()?;
