@@ -175,6 +175,10 @@ pub struct Options {
 	// Versioned query configuration
 	/// If true, enables versioned queries with timestamp tracking
 	pub enable_versioning: bool,
+	/// If true, creates a B+tree index for timestamp-based queries.
+	/// Requires enable_versioning to be true.
+	/// When false, versioned queries will scan the LSM tree directly.
+	pub enable_versioned_index: bool,
 	/// History retention period in nanoseconds (0 means no retention limit)
 	/// Default: 0 (no retention limit)
 	pub versioned_history_retention_ns: u64,
@@ -233,6 +237,7 @@ impl Default for Options {
 			vlog_gc_discard_ratio: 0.5, // 50% default
 			vlog_value_threshold: 1024, // 1KB default
 			enable_versioning: false,
+			enable_versioned_index: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
 			flush_on_close: true,
@@ -408,6 +413,7 @@ impl Options {
 	/// optimal versioned query support
 	pub fn with_versioning(mut self, value: bool, retention_ns: u64) -> Self {
 		self.enable_versioning = value;
+		self.enable_versioned_index = value; // Default: B+tree enabled when versioning enabled
 		self.versioned_history_retention_ns = retention_ns;
 		if value {
 			// Versioned queries require VLog to be enabled
@@ -415,6 +421,14 @@ impl Options {
 			// All values should go to VLog for versioned queries
 			self.vlog_value_threshold = 0;
 		}
+		self
+	}
+
+	/// Enables or disables the B+tree versioned index for timestamp-based queries.
+	/// When disabled, versioned queries will scan the LSM tree directly.
+	/// Requires `enable_versioning` to be true for this to have any effect.
+	pub const fn with_versioned_index(mut self, value: bool) -> Self {
+		self.enable_versioned_index = value;
 		self
 	}
 

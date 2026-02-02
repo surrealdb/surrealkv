@@ -45,6 +45,8 @@ pub mod transaction_tests;
 pub mod vlog_tests;
 #[cfg(test)]
 pub mod wal_tests;
+#[cfg(test)]
+pub mod version_iterator_tests;
 
 /// Collects all (key, value) pairs from an InternalIterator into a Vec
 /// Assumes iterator is already positioned (e.g., after seek_first or seek)

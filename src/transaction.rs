@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
-use crate::snapshot::{MergeDirection, Snapshot, SnapshotIterator};
+use crate::snapshot::{MergeDirection, Snapshot, SnapshotIterator, VersionedSnapshotIterator};
 use crate::{
 	InternalIterator,
 	InternalKey,
@@ -658,6 +658,10 @@ impl Transaction {
 	/// # Returns
 	/// A vector of tuples containing (Key, Value, Version, is_tombstone) for
 	/// each version found.
+	///
+	/// Note: This method requires the B+tree versioned index to be enabled.
+	/// For LSM-based versioned iteration without the B+tree index, use
+	/// `versioned_range_with_tombstones()` instead.
 	pub fn scan_all_versions<K>(
 		&self,
 		start: K,
@@ -674,9 +678,11 @@ impl Transaction {
 			return Err(Error::TransactionWriteOnly);
 		}
 
-		// Check if versioned queries are enabled
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		// Check if B+tree versioned index is enabled
+		if !self.core.opts.enable_versioned_index {
+			return Err(Error::InvalidArgument(
+				"B+tree versioned index not enabled. Use versioned_range_with_tombstones() for LSM-based iteration.".to_string()
+			));
 		}
 
 		// Query the versioned index through the snapshot
@@ -684,6 +690,98 @@ impl Transaction {
 			Some(snapshot) => snapshot.scan_all_versions(start, end, limit),
 			None => Err(Error::NoSnapshot),
 		}
+	}
+
+	/// Returns an iterator over ALL versions of keys in the range,
+	/// querying the LSM tree directly (no B+tree index required).
+	///
+	/// Unlike `range()` which returns only the latest version per key,
+	/// this returns every visible version in (user_key, seq_num descending) order.
+	///
+	/// This method requires `enable_versioning` to be true but does NOT require
+	/// the B+tree versioned index (`enable_versioned_index`).
+	///
+	/// Note: This iterator does not include uncommitted writes from the transaction's
+	/// write-set since historical version queries should reflect committed data only.
+	///
+	/// # Arguments
+	/// * `start` - Start key (inclusive)
+	/// * `end` - End key (exclusive)
+	///
+	/// # Example
+	/// ```ignore
+	/// let mut iter = tx.versioned_range(b"a", b"z")?;
+	/// iter.seek_first()?;
+	/// while iter.valid() {
+	///     println!("key={:?} ts={} value={:?}",
+	///         iter.key(), iter.timestamp(), iter.value()?);
+	///     iter.next()?;
+	/// }
+	/// ```
+	pub fn versioned_range<K>(&self, start: K, end: K) -> Result<TransactionVersionedIterator<'_>>
+	where
+		K: IntoBytes,
+	{
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioning is enabled (B+tree index is optional)
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
+		}
+
+		// Get the snapshot iterator
+		let snapshot = self.snapshot.as_ref().ok_or(Error::NoSnapshot)?;
+		let inner = snapshot.versioned_range(
+			Some(start.as_slice()),
+			Some(end.as_slice()),
+			false, // exclude tombstones by default
+		)?;
+
+		Ok(TransactionVersionedIterator::new(inner, Arc::clone(&self.core)))
+	}
+
+	/// Returns an iterator over ALL versions of keys in the range, including tombstones.
+	///
+	/// Same as `versioned_range()` but includes soft-deleted entries (tombstones).
+	/// This is useful for seeing the complete version history including deletions.
+	///
+	/// # Arguments
+	/// * `start` - Start key (inclusive)
+	/// * `end` - End key (exclusive)
+	pub fn versioned_range_with_tombstones<K>(
+		&self,
+		start: K,
+		end: K,
+	) -> Result<TransactionVersionedIterator<'_>>
+	where
+		K: IntoBytes,
+	{
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// Check if versioning is enabled (B+tree index is optional)
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
+		}
+
+		// Get the snapshot iterator
+		let snapshot = self.snapshot.as_ref().ok_or(Error::NoSnapshot)?;
+		let inner = snapshot.versioned_range(
+			Some(start.as_slice()),
+			Some(end.as_slice()),
+			true, // include tombstones
+		)?;
+
+		Ok(TransactionVersionedIterator::new(inner, Arc::clone(&self.core)))
 	}
 
 	/// Writes a value for a key with custom write options. None is used for
@@ -1393,5 +1491,119 @@ impl<'a> TransactionIterator<'a> {
 	/// Get current key-value pair (convenience method)
 	pub fn entry(&self) -> Result<(Key, Option<Value>)> {
 		Ok((self.key(), self.value()?))
+	}
+}
+
+/// Public iterator for scanning ALL versions of keys in a range.
+/// Returns entries in (user_key, seq_num descending) order.
+///
+/// Unlike `TransactionIterator` which returns only the latest version per key,
+/// this iterator returns every visible version from the LSM tree directly.
+///
+/// Note: This iterator does not include uncommitted writes from the transaction's
+/// write-set since historical version queries should reflect committed data only.
+///
+/// # Example
+/// ```ignore
+/// let mut iter = tx.versioned_range(b"a", b"z")?;
+/// iter.seek_first()?;
+/// while iter.valid() {
+///     println!("key={:?} ts={} value={:?}",
+///         iter.key(), iter.timestamp(), iter.value()?);
+///     iter.next()?;
+/// }
+/// ```
+pub struct TransactionVersionedIterator<'a> {
+	inner: VersionedSnapshotIterator<'a>,
+	core: Arc<Core>,
+}
+
+impl<'a> TransactionVersionedIterator<'a> {
+	/// Creates a new versioned iterator
+	pub(crate) fn new(inner: VersionedSnapshotIterator<'a>, core: Arc<Core>) -> Self {
+		Self {
+			inner,
+			core,
+		}
+	}
+
+	/// Seek to first entry. Returns true if valid.
+	pub fn seek_first(&mut self) -> Result<bool> {
+		self.inner.seek_first()
+	}
+
+	/// Seek to last entry. Returns true if valid.
+	pub fn seek_last(&mut self) -> Result<bool> {
+		self.inner.seek_last()
+	}
+
+	/// Seek to first entry >= target. Returns true if valid.
+	pub fn seek<K: AsRef<[u8]>>(&mut self, target: K) -> Result<bool> {
+		// Create a minimal encoded key for seeking
+		let mut encoded = target.as_ref().to_vec();
+		// Add maximum trailer (seq_num=MAX, kind=MAX) and timestamp=MAX to find >= target
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes());
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes());
+		self.inner.seek(&encoded)
+	}
+
+	/// Move to next entry. Returns true if valid.
+	#[allow(clippy::should_implement_trait)]
+	pub fn next(&mut self) -> Result<bool> {
+		self.inner.next()
+	}
+
+	/// Move to previous entry. Returns true if valid.
+	pub fn prev(&mut self) -> Result<bool> {
+		self.inner.prev()
+	}
+
+	/// Check if positioned on valid entry.
+	pub fn valid(&self) -> bool {
+		self.inner.valid()
+	}
+
+	/// Get current user key (allocates). Caller must check valid() first.
+	pub fn key(&self) -> Key {
+		debug_assert!(self.valid());
+		self.inner.key().user_key().to_vec()
+	}
+
+	/// Get the timestamp/version of the current entry. Caller must check valid() first.
+	pub fn timestamp(&self) -> u64 {
+		debug_assert!(self.valid());
+		self.inner.key().timestamp()
+	}
+
+	/// Get the sequence number of the current entry. Caller must check valid() first.
+	pub fn seq_num(&self) -> u64 {
+		debug_assert!(self.valid());
+		self.inner.key().seq_num()
+	}
+
+	/// Check if the current entry is a tombstone. Caller must check valid() first.
+	pub fn is_tombstone(&self) -> bool {
+		debug_assert!(self.valid());
+		self.inner.key().is_tombstone()
+	}
+
+	/// Get current value (may allocate for VLog resolution). Caller must check valid() first.
+	pub fn value(&self) -> Result<Value> {
+		debug_assert!(self.valid());
+		self.core.resolve_value(self.inner.value())
+	}
+
+	/// Get current entry as a tuple (key, value, timestamp, is_tombstone).
+	/// Convenience method for collecting all version information.
+	/// For tombstones, returns an empty value since tombstones have no value.
+	pub fn entry(&self) -> Result<(Key, Value, u64, bool)> {
+		let is_tombstone = self.is_tombstone();
+		// Tombstones have no value, so use empty vec
+		let value = if is_tombstone {
+			Vec::new()
+		} else {
+			self.value()?
+		};
+		Ok((self.key(), value, self.timestamp(), is_tombstone))
 	}
 }

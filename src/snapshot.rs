@@ -228,28 +228,108 @@ impl Snapshot {
 		SnapshotIterator::new_from(Arc::clone(&self.core), self.seq_num, internal_range)
 	}
 
-	/// Queries the versioned index for a specific key at a specific timestamp
-	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
+	/// Creates an iterator that returns ALL versions of keys in the range
+	/// from the LSM tree directly (memtables + SSTables).
+	/// Unlike `range()` which returns only the latest version per key,
+	/// this returns every visible version in (user_key, seq_num descending) order.
+	///
+	/// This method queries the LSM index directly and does not require the
+	/// B+tree versioned index to be enabled.
+	pub(crate) fn versioned_range(
+		&self,
+		lower: Option<&[u8]>,
+		upper: Option<&[u8]>,
+		include_tombstones: bool,
+	) -> Result<VersionedSnapshotIterator<'_>> {
+		let internal_range = crate::user_range_to_internal_range(
+			lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
+			upper.map(Bound::Excluded).unwrap_or(Bound::Unbounded),
+		);
+		VersionedSnapshotIterator::new_from(
+			Arc::clone(&self.core),
+			self.seq_num,
+			internal_range,
+			include_tombstones,
+		)
+	}
+
+	/// Queries for a specific key at a specific timestamp.
+	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num).
+	///
+	/// If the B+tree versioned index is enabled, queries it directly.
+	/// Otherwise, falls back to scanning the LSM tree.
 	pub(crate) fn get_at_version(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
-		// Create a range that includes only the specific key
-		let key_range = key.to_vec()..=key.to_vec();
+		// Try B+tree first if available
+		if self.core.opts.enable_versioned_index {
+			// Create a range that includes only the specific key
+			let key_range = key.to_vec()..=key.to_vec();
 
-		let mut versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
-			key_range: &key_range,
-			start_ts: 0, // Start from beginning of time
-			end_ts: timestamp,
-			snapshot_seq_num: self.seq_num,
-			limit: None,
-			include_tombstones: false, // Don't include tombstones
-			include_latest_only: true,
-		})?;
+			let mut versioned_iter = self.versioned_range_iter(VersionedRangeQueryParams {
+				key_range: &key_range,
+				start_ts: 0, // Start from beginning of time
+				end_ts: timestamp,
+				snapshot_seq_num: self.seq_num,
+				limit: None,
+				include_tombstones: false, // Don't include tombstones
+				include_latest_only: true,
+			})?;
 
-		// Get the latest version (should be only one due to include_latest_only: true)
-		if let Some((_internal_key, encoded_value)) = versioned_iter.next() {
-			Ok(Some(self.core.resolve_value(&encoded_value)?))
-		} else {
-			Ok(None)
+			// Get the latest version (should be only one due to include_latest_only: true)
+			if let Some((_internal_key, encoded_value)) = versioned_iter.next() {
+				return Ok(Some(self.core.resolve_value(&encoded_value)?));
+			} else {
+				return Ok(None);
+			}
 		}
+
+		// Fallback to LSM query if versioning is enabled but B+tree index is not
+		if self.core.opts.enable_versioning {
+			return self.get_at_version_from_lsm(key, timestamp);
+		}
+
+		Err(Error::InvalidArgument("Versioning not enabled".to_string()))
+	}
+
+	/// Queries the LSM tree directly for a specific key at a specific timestamp.
+	/// Used as fallback when B+tree index is not available.
+	fn get_at_version_from_lsm(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
+		// Create a range for just this key
+		// We need to find the version with timestamp <= requested timestamp
+		let mut iter = self.versioned_range(Some(key), None, true)?;
+
+		iter.seek_first()?;
+
+		// Track the best match (latest version at or before requested timestamp)
+		let mut best_value: Option<Value> = None;
+		let mut best_timestamp: u64 = 0;
+
+		while iter.valid() {
+			let entry_key = iter.key();
+			let entry_user_key = entry_key.user_key();
+
+			// Stop if we've moved past our key
+			if entry_user_key != key {
+				break;
+			}
+
+			let entry_ts = entry_key.timestamp();
+
+			// Only consider versions at or before the requested timestamp
+			if entry_ts <= timestamp && entry_ts >= best_timestamp {
+				if entry_key.is_tombstone() {
+					// Key was deleted at this timestamp
+					best_value = None;
+					best_timestamp = entry_ts;
+				} else {
+					best_value = Some(self.core.resolve_value(iter.value())?);
+					best_timestamp = entry_ts;
+				}
+			}
+
+			iter.next()?;
+		}
+
+		Ok(best_value)
 	}
 
 	/// Gets keys in a key range at a specific timestamp
@@ -303,9 +383,12 @@ impl Snapshot {
 		})
 	}
 
-	/// Gets all versions of keys in a key range
+	/// Gets all versions of keys in a key range using the B+tree versioned index.
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num)
 	/// Range is [start, end) - start is inclusive, end is exclusive.
+	///
+	/// Note: This method requires the B+tree versioned index to be enabled.
+	/// For LSM-based versioned iteration, use `versioned_range()` instead.
 	///
 	/// # Arguments
 	/// * `start` - Start key (inclusive)
@@ -317,8 +400,11 @@ impl Snapshot {
 		end: Key,
 		limit: Option<usize>,
 	) -> Result<Vec<VersionScanResult>> {
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		if !self.core.opts.enable_versioned_index {
+			return Err(Error::InvalidArgument(
+				"B+tree versioned index not enabled. Use versioned_range() for LSM-based iteration."
+					.to_string(),
+			));
 		}
 
 		let key_range = start.as_slice().to_vec()..end.as_slice().to_vec();
@@ -398,7 +484,12 @@ impl Snapshot {
 		}
 	}
 
-	/// Creates a versioned range iterator that implements DoubleEndedIterator
+	/// Creates a versioned range iterator that implements DoubleEndedIterator.
+	/// This method queries the B+tree versioned index.
+	///
+	/// Note: This method requires the B+tree versioned index to be enabled.
+	/// For LSM-based versioned iteration, use `versioned_range()` instead.
+	///
 	/// TODO: This is a temporary solution to avoid the complexity of
 	/// implementing a proper streaming double ended iterator, which will be
 	/// fixed in the future.
@@ -406,8 +497,8 @@ impl Snapshot {
 		&self,
 		params: VersionedRangeQueryParams<'_, R>,
 	) -> Result<VersionedRangeIterator> {
-		if !self.core.opts.enable_versioning {
-			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		if !self.core.opts.enable_versioned_index {
+			return Err(Error::InvalidArgument("B+tree versioned index not enabled".to_string()));
 		}
 
 		let mut results = Vec::new();
@@ -1201,6 +1292,192 @@ impl InternalIterator for SnapshotIterator<'_> {
 }
 
 impl Drop for SnapshotIterator<'_> {
+	fn drop(&mut self) {
+		// Decrement VLog iterator count when iterator is dropped
+		if let Some(ref vlog) = self.core.vlog {
+			if let Err(e) = vlog.decr_iterator_count() {
+				log::warn!("Failed to decrement VLog iterator count: {e}");
+			}
+		}
+	}
+}
+
+/// A snapshot iterator that returns ALL versions of keys, not just the latest.
+/// Unlike `SnapshotIterator` which deduplicates (returns only latest version per key),
+/// this iterator returns every visible version in (user_key, seq_num descending) order.
+///
+/// Used for versioned range scans over the LSM tree directly.
+pub(crate) struct VersionedSnapshotIterator<'a> {
+	/// The merge iterator over all LSM components
+	merge_iter: KMergeIterator<'a>,
+
+	/// Sequence number for visibility
+	snapshot_seq_num: u64,
+
+	/// Core for resolving values
+	#[allow(dead_code)]
+	core: Arc<Core>,
+
+	/// Whether to include tombstones in the iteration
+	include_tombstones: bool,
+
+	/// Direction of iteration
+	direction: MergeDirection,
+
+	/// Whether the iterator has been initialized
+	initialized: bool,
+}
+
+impl VersionedSnapshotIterator<'_> {
+	/// Creates a new versioned iterator over a specific key range
+	fn new_from(
+		core: Arc<Core>,
+		seq_num: u64,
+		range: crate::InternalKeyRange,
+		include_tombstones: bool,
+	) -> Result<Self> {
+		// Create a temporary snapshot to use the helper method
+		let snapshot = Snapshot {
+			core: Arc::clone(&core),
+			seq_num,
+		};
+		let iter_state = snapshot.collect_iter_state()?;
+
+		if let Some(ref vlog) = core.vlog {
+			vlog.incr_iterator_count();
+		}
+
+		let merge_iter = KMergeIterator::new_from(iter_state, range);
+
+		Ok(Self {
+			merge_iter,
+			snapshot_seq_num: seq_num,
+			core,
+			include_tombstones,
+			direction: MergeDirection::Forward,
+			initialized: false,
+		})
+	}
+
+	#[inline]
+	fn is_visible_ref(&self, key: &InternalKeyRef<'_>) -> bool {
+		key.seq_num() <= self.snapshot_seq_num
+	}
+
+	/// Skip to the next valid entry in forward direction.
+	/// Valid = visible, optionally not a tombstone.
+	/// NOTE: Does NOT deduplicate - returns every visible version.
+	fn skip_to_valid_forward(&mut self) -> Result<bool> {
+		while self.merge_iter.valid() {
+			let key_ref = self.merge_iter.key();
+
+			// Skip invisible versions (seq_num > snapshot)
+			if !self.is_visible_ref(&key_ref) {
+				self.merge_iter.next()?;
+				continue;
+			}
+
+			// Skip tombstones if not included
+			if !self.include_tombstones && key_ref.is_tombstone() {
+				self.merge_iter.next()?;
+				continue;
+			}
+
+			// Found valid entry - no deduplication check!
+			return Ok(true);
+		}
+		Ok(false)
+	}
+
+	/// Skip to the next valid entry in backward direction.
+	/// NOTE: Does NOT deduplicate - returns every visible version.
+	fn skip_to_valid_backward(&mut self) -> Result<bool> {
+		while self.merge_iter.valid() {
+			let key_ref = self.merge_iter.key();
+
+			// Skip invisible versions (seq_num > snapshot)
+			if !self.is_visible_ref(&key_ref) {
+				self.merge_iter.prev()?;
+				continue;
+			}
+
+			// Skip tombstones if not included
+			if !self.include_tombstones && key_ref.is_tombstone() {
+				self.merge_iter.prev()?;
+				continue;
+			}
+
+			// Found valid entry - no deduplication check!
+			return Ok(true);
+		}
+		Ok(false)
+	}
+}
+
+impl InternalIterator for VersionedSnapshotIterator<'_> {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.direction = MergeDirection::Forward;
+		self.merge_iter.seek(target)?;
+		self.initialized = true;
+		self.skip_to_valid_forward()
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Forward;
+		self.merge_iter.seek_first()?;
+		self.initialized = true;
+		self.skip_to_valid_forward()
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Backward;
+		self.merge_iter.seek_last()?;
+		self.initialized = true;
+		self.skip_to_valid_backward()
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		if !self.initialized {
+			return self.seek_first();
+		}
+		if !self.merge_iter.valid() {
+			return Ok(false);
+		}
+		self.merge_iter.next()?;
+		self.skip_to_valid_forward()
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		if !self.initialized {
+			return self.seek_last();
+		}
+		// If we were going forward, switch to backward
+		if self.direction != MergeDirection::Backward {
+			return self.seek_last();
+		}
+		if !self.merge_iter.valid() {
+			return Ok(false);
+		}
+		self.merge_iter.prev()?;
+		self.skip_to_valid_backward()
+	}
+
+	fn valid(&self) -> bool {
+		self.merge_iter.valid()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		debug_assert!(self.valid());
+		self.merge_iter.key()
+	}
+
+	fn value(&self) -> &[u8] {
+		debug_assert!(self.valid());
+		self.merge_iter.value()
+	}
+}
+
+impl Drop for VersionedSnapshotIterator<'_> {
 	fn drop(&mut self) {
 		// Decrement VLog iterator count when iterator is dropped
 		if let Some(ref vlog) = self.core.vlog {

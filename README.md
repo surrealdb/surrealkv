@@ -484,7 +484,7 @@ The new LSM (Log-Structured Merge) tree architecture provides:
 This architectural change enables SurrealKV to handle larger then memory datasets.
 
 ## References
-SurrealKV draws inspiration from design ideas used in [Rocksb](https://github.com/facebook/rocksdb) and [Pebble](https://github.com/cockroachdb/pebble)
+SurrealKV draws inspiration from design ideas used in [RocksDB](https://github.com/facebook/rocksdb) and [Pebble](https://github.com/cockroachdb/pebble)
 
 
 ## License
