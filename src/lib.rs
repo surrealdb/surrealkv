@@ -37,7 +37,15 @@ use sstable::bloom::LevelDBBloomFilter;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
+pub use crate::transaction::{
+	Durability,
+	HistoryOptions,
+	Mode,
+	ReadOptions,
+	Transaction,
+	TransactionHistoryIterator,
+	WriteOptions,
+};
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {
@@ -175,6 +183,10 @@ pub struct Options {
 	// Versioned query configuration
 	/// If true, enables versioned queries with timestamp tracking
 	pub enable_versioning: bool,
+	/// If true, creates a B+tree index for timestamp-based queries.
+	/// Requires enable_versioning to be true.
+	/// When false, versioned queries will scan the LSM tree directly.
+	pub enable_versioned_index: bool,
 	/// History retention period in nanoseconds (0 means no retention limit)
 	/// Default: 0 (no retention limit)
 	pub versioned_history_retention_ns: u64,
@@ -233,6 +245,7 @@ impl Default for Options {
 			vlog_gc_discard_ratio: 0.5, // 50% default
 			vlog_value_threshold: 1024, // 1KB default
 			enable_versioning: false,
+			enable_versioned_index: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
 			flush_on_close: true,
@@ -418,6 +431,14 @@ impl Options {
 		self
 	}
 
+	/// Enables or disables the B+tree versioned index for timestamp-based queries.
+	/// When disabled, versioned queries will scan the LSM tree directly.
+	/// Requires `enable_versioning` to be true for this to have any effect.
+	pub const fn with_versioned_index(mut self, value: bool) -> Self {
+		self.enable_versioned_index = value;
+		self
+	}
+
 	/// Controls whether to flush the active memtable during database shutdown.
 	///
 	/// When enabled, ensures all in-memory data is persisted to SSTables before
@@ -557,6 +578,13 @@ impl Options {
 					"Versioned queries require all values to be stored in VLog. Set vlog_value_threshold to 0.".to_string(),
 				));
 			}
+		}
+
+		// Validate versioned index requires versioning to be enabled
+		if self.enable_versioned_index && !self.enable_versioning {
+			return Err(Error::InvalidArgument(
+				"Versioned index requires versioning to be enabled. Call with_versioning(true, retention_ns) first.".to_string(),
+			));
 		}
 
 		// Validate level count is reasonable
@@ -714,7 +742,7 @@ fn is_replace_kind(kind: InternalKeyKind) -> bool {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum InternalKeyKind {
 	Delete = 0,
 	SoftDelete = 1,
@@ -818,13 +846,13 @@ impl InternalKey {
 	}
 
 	/// Compares this key with another key using timestamp-based ordering
-	/// First compares by user key, then by timestamp (ascending - older
-	/// timestamps first)
+	/// First compares by user key, then by timestamp (descending - newer
+	/// timestamps first, matching LSM seq_num ordering)
 	pub(crate) fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
 		// First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
-			// If user keys are equal, compare by timestamp (ascending - older timestamps first)
-			Ordering::Equal => self.timestamp.cmp(&other.timestamp),
+			// If user keys are equal, compare by timestamp (descending - newer timestamps first)
+			Ordering::Equal => other.timestamp.cmp(&self.timestamp),
 			ordering => ordering,
 		}
 	}
@@ -833,12 +861,15 @@ impl InternalKey {
 // Used only by memtable, sstable uses internal key comparator
 impl Ord for InternalKey {
 	fn cmp(&self, other: &Self) -> Ordering {
-		// Same as InternalKey: user key, then sequence number, then kind, with
-		// timestamp as final tiebreaker First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
-			// If user keys are equal, compare by sequence number (descending)
-			Ordering::Equal => other.seq_num().cmp(&self.seq_num()),
-			ordering => ordering,
+			Ordering::Equal => match other.seq_num().cmp(&self.seq_num()) {
+				Ordering::Equal => match self.kind().cmp(&other.kind()) {
+					Ordering::Equal => other.timestamp.cmp(&self.timestamp), // DESC for timestamp
+					ord => ord,
+				},
+				ord => ord,
+			},
+			ord => ord,
 		}
 	}
 }
@@ -899,6 +930,16 @@ impl<'a> InternalKeyRef<'a> {
 	#[inline]
 	pub fn is_tombstone(&self) -> bool {
 		is_delete_kind(self.kind())
+	}
+
+	#[inline]
+	pub fn is_hard_delete_marker(&self) -> bool {
+		is_hard_delete_marker(self.kind())
+	}
+
+	#[inline]
+	pub fn is_replace(&self) -> bool {
+		is_replace_kind(self.kind())
 	}
 
 	pub fn to_owned(self) -> InternalKey {

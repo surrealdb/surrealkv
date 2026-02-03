@@ -169,8 +169,8 @@ impl CoreInner {
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
-		// Initialize versioned index if versioned queries are enabled
-		let versioned_index = if opts.enable_versioning {
+		// Initialize versioned index if B+tree versioned index is enabled
+		let versioned_index = if opts.enable_versioned_index {
 			// Create the versioned index directory if it doesn't exist
 			let versioned_index_dir = opts.versioned_index_dir();
 			let versioned_index_path = versioned_index_dir.join("index.bpt");
@@ -770,7 +770,7 @@ impl CommitEnv for LsmCommitEnv {
 		let mut timestamp_entries = Vec::with_capacity(batch.count() as usize);
 
 		let vlog_threshold = self.core.opts.vlog_value_threshold;
-		let is_versioning_enabled = self.core.opts.enable_versioning;
+		let is_versioned_index_enabled = self.core.opts.enable_versioned_index;
 		let has_vlog = self.core.vlog.is_some();
 
 		for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
@@ -787,7 +787,7 @@ impl CommitEnv for LsmCommitEnv {
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
-					if is_versioning_enabled {
+					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
@@ -799,7 +799,7 @@ impl CommitEnv for LsmCommitEnv {
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
-					if is_versioning_enabled {
+					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
@@ -807,7 +807,7 @@ impl CommitEnv for LsmCommitEnv {
 				}
 				None => {
 					// Delete operation: no value but may need versioned index entry
-					if is_versioning_enabled {
+					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), Vec::new()));
 					}
 					(None, None)
@@ -834,7 +834,7 @@ impl CommitEnv for LsmCommitEnv {
 		}
 
 		// Write to versioned index if present
-		if is_versioning_enabled {
+		if is_versioned_index_enabled {
 			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write();
 
 			// Single pass: process each entry individually
@@ -1744,6 +1744,14 @@ impl TreeBuilder {
 	/// Enables or disables versioned queries with timestamp tracking
 	pub fn with_versioning(mut self, enable: bool, retention_ns: u64) -> Self {
 		self.opts = self.opts.with_versioning(enable, retention_ns);
+		self
+	}
+
+	/// Enables or disables the B+tree versioned index for timestamp-based queries.
+	/// When disabled, versioned queries will scan the LSM tree directly.
+	/// Requires `with_versioning` to be called first with `enable = true`.
+	pub fn with_versioned_index(mut self, enable: bool) -> Self {
+		self.opts = self.opts.with_versioned_index(enable);
 		self
 	}
 

@@ -326,7 +326,7 @@ impl Skiplist {
 		ins: &mut Inserter,
 	) -> Result<(), Error> {
 		// Find splice
-		if self.find_splice(key, trailer, ins) {
+		if self.find_splice(key, trailer, timestamp, ins) {
 			return Err(Error::RecordExists);
 		}
 
@@ -375,7 +375,8 @@ impl Skiplist {
 				}
 
 				// CAS failed, recompute splice
-				let (new_prev, new_next, found) = self.find_splice_for_level(key, trailer, i, prev);
+				let (new_prev, new_next, found) =
+					self.find_splice_for_level(key, trailer, timestamp, i, prev);
 				if found {
 					if i != 0 {
 						panic!("how can another thread have inserted a node at a non-base level?");
@@ -441,7 +442,7 @@ impl Skiplist {
 	}
 
 	/// Find splice
-	fn find_splice(&self, key: &[u8], trailer: u64, ins: &mut Inserter) -> bool {
+	fn find_splice(&self, key: &[u8], trailer: u64, timestamp: u64, ins: &mut Inserter) -> bool {
 		let list_height = self.height();
 		let mut level: i32;
 		let mut prev = self.head;
@@ -457,8 +458,10 @@ impl Skiplist {
 					continue;
 				}
 
-				if (spl.prev != self.head && !self.key_is_after_node(spl.prev, key, trailer))
-					|| (spl.next != self.tail && self.key_is_after_node(spl.next, key, trailer))
+				if (spl.prev != self.head
+					&& !self.key_is_after_node(spl.prev, key, trailer, timestamp))
+					|| (spl.next != self.tail
+						&& self.key_is_after_node(spl.next, key, trailer, timestamp))
 				{
 					level = list_height as i32;
 				} else {
@@ -493,10 +496,18 @@ impl Skiplist {
 				if cmp == Ordering::Equal {
 					let next_trailer = unsafe { (*next).key_trailer };
 					if trailer == next_trailer {
-						found = true;
-						break;
-					}
-					if trailer > next_trailer {
+						// Trailer equal - check timestamp as tiebreaker
+						let next_timestamp = unsafe { (*next).key_timestamp };
+						if timestamp == next_timestamp {
+							found = true;
+							break;
+						}
+						// Higher timestamp comes first (DESC), so stop if our timestamp > next
+						if timestamp > next_timestamp {
+							break;
+						}
+						// timestamp < next_timestamp, continue searching
+					} else if trailer > next_trailer {
 						break;
 					}
 				}
@@ -515,6 +526,7 @@ impl Skiplist {
 		&self,
 		key: &[u8],
 		trailer: u64,
+		timestamp: u64,
 		level: usize,
 		start: *mut Node,
 	) -> (*mut Node, *mut Node, bool) {
@@ -536,9 +548,17 @@ impl Skiplist {
 			if cmp == Ordering::Equal {
 				let next_trailer = unsafe { (*next).key_trailer };
 				if trailer == next_trailer {
-					return (prev, next, true);
-				}
-				if trailer > next_trailer {
+					// Trailer equal - check timestamp as tiebreaker
+					let next_timestamp = unsafe { (*next).key_timestamp };
+					if timestamp == next_timestamp {
+						return (prev, next, true); // True duplicate
+					}
+					// Higher timestamp comes first (DESC), so stop if our timestamp > next
+					if timestamp > next_timestamp {
+						return (prev, next, false);
+					}
+					// timestamp < next_timestamp, continue searching
+				} else if trailer > next_trailer {
 					return (prev, next, false);
 				}
 			}
@@ -549,7 +569,7 @@ impl Skiplist {
 
 	/// Key comparison
 	#[inline]
-	fn key_is_after_node(&self, nd: *mut Node, key: &[u8], trailer: u64) -> bool {
+	fn key_is_after_node(&self, nd: *mut Node, key: &[u8], trailer: u64, timestamp: u64) -> bool {
 		if nd == self.head {
 			return true;
 		}
@@ -566,7 +586,15 @@ impl Skiplist {
 			Ordering::Equal => {
 				let nd_trailer = unsafe { (*nd).key_trailer };
 				if trailer == nd_trailer {
-					false
+					// Trailer equal - use timestamp as tiebreaker (DESC order)
+					let nd_timestamp = unsafe { (*nd).key_timestamp };
+					if timestamp == nd_timestamp {
+						false // Same key
+					} else {
+						// Higher timestamp comes first, so key is "after" node if timestamp <
+						// nd_timestamp
+						timestamp < nd_timestamp
+					}
 				} else {
 					trailer < nd_trailer
 				}
