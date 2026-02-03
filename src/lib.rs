@@ -421,7 +421,6 @@ impl Options {
 	/// optimal versioned query support
 	pub fn with_versioning(mut self, value: bool, retention_ns: u64) -> Self {
 		self.enable_versioning = value;
-		self.enable_versioned_index = value; // Default: B+tree enabled when versioning enabled
 		self.versioned_history_retention_ns = retention_ns;
 		if value {
 			// Versioned queries require VLog to be enabled
@@ -579,6 +578,13 @@ impl Options {
 					"Versioned queries require all values to be stored in VLog. Set vlog_value_threshold to 0.".to_string(),
 				));
 			}
+		}
+
+		// Validate versioned index requires versioning to be enabled
+		if self.enable_versioned_index && !self.enable_versioning {
+			return Err(Error::InvalidArgument(
+				"Versioned index requires versioning to be enabled. Call with_versioning(true, retention_ns) first.".to_string(),
+			));
 		}
 
 		// Validate level count is reasonable

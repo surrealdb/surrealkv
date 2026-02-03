@@ -1747,6 +1747,14 @@ impl TreeBuilder {
 		self
 	}
 
+	/// Enables or disables the B+tree versioned index for timestamp-based queries.
+	/// When disabled, versioned queries will scan the LSM tree directly.
+	/// Requires `with_versioning` to be called first with `enable = true`.
+	pub fn with_versioned_index(mut self, enable: bool) -> Self {
+		self.opts = self.opts.with_versioned_index(enable);
+		self
+	}
+
 	/// Controls whether to flush the active memtable during database shutdown.
 	pub fn with_flush_on_close(mut self, value: bool) -> Self {
 		self.opts = self.opts.with_flush_on_close(value);
