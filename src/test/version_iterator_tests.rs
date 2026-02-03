@@ -870,7 +870,7 @@ async fn test_get_at_lsm_tombstone() {
 	// Delete at ts=200 (creates tombstone)
 	{
 		let mut tx = store.begin().unwrap();
-		tx.delete(b"key1").unwrap();
+		tx.soft_delete(b"key1").unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -1132,17 +1132,15 @@ async fn test_multiple_replaces_preserved_with_versioning() {
 	// Force flush
 	store.flush().unwrap();
 
-	// After flush - all Replace versions should survive, but not the original SET
+	// After flush - latest Replace version should survive, but not the original SET
 	let tx = store.begin().unwrap();
 	let mut iter = tx.history(b"key1", b"key2").unwrap();
 	let results = collect_history_all(&mut iter).unwrap();
 
-	// All Replace versions are kept (they are valid versions themselves)
+	// Latest Replace version is kept
 	// Only the initial SET is discarded
-	assert_eq!(results.len(), 3, "All 3 Replace versions should survive");
+	assert_eq!(results.len(), 1, "Latest Replace versions should survive");
 	assert_eq!(results[0].1, b"replace_v4");
-	assert_eq!(results[1].1, b"replace_v3");
-	assert_eq!(results[2].1, b"replace_v2");
 }
 
 // ============================================================================

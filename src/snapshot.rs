@@ -1022,57 +1022,34 @@ enum HistoryIteratorInner<'a> {
 	BTree(BPlusTreeIteratorWithGuard<'a>),
 }
 
-/// Unified history iterator that works with both LSM and B+tree backends.
-///
-/// This struct provides:
-/// - Visibility filtering (seq_num <= snapshot_seq_num)
-/// - Tombstone filtering (optional)
-/// - Bounds checking (for B+tree; LSM handles via KMergeIterator)
-/// - Bidirectional iteration support
-///
-/// The filtering logic is unified for both backends, eliminating the need
-/// for a separate `VersionedSnapshotIterator`.
+#[derive(Clone)]
+struct BufferedEntry {
+	key: Vec<u8>,
+	value: Vec<u8>,
+}
+
 pub struct HistoryIterator<'a> {
-	/// The underlying iterator (LSM or B+tree)
 	inner: HistoryIteratorInner<'a>,
-
-	/// Sequence number for visibility filtering
 	snapshot_seq_num: u64,
-
-	/// Whether to include tombstones in iteration
 	include_tombstones: bool,
-
-	/// Current direction of iteration
 	direction: MergeDirection,
-
-	/// Whether the iterator has been initialized (seek called)
 	initialized: bool,
-
-	/// Lower bound for B+tree (LSM handles bounds via KMergeIterator)
 	lower_bound: Option<Vec<u8>>,
-
-	/// Upper bound for B+tree (LSM handles bounds via KMergeIterator)
 	upper_bound: Option<Vec<u8>>,
-
-	/// Core reference for VLog iterator counting
 	core: Arc<Core>,
 
-	// === Tracking fields for REPLACE/DELETE filtering ===
-	/// Current user key being iterated (for detecting key changes)
+	// === Forward iteration state (streaming) ===
 	current_user_key: Vec<u8>,
-	/// Whether we've seen the first visible version for current user key
 	first_visible_seen: bool,
-	/// Whether the latest visible version is a hard delete
 	latest_is_hard_delete: bool,
-	/// Whether we've seen a REPLACE operation for current user key
-	seen_replace: bool,
+	barrier_seen: bool, // True once we hit HARD_DELETE or REPLACE
+
+	// === Backward iteration state (buffered) ===
+	backward_buffer: Vec<BufferedEntry>,
+	backward_buffer_index: Option<usize>,
 }
 
 impl<'a> HistoryIterator<'a> {
-	/// Creates a new LSM-based history iterator.
-	///
-	/// The bounds are passed to `KMergeIterator` via `InternalKeyRange`,
-	/// so bounds checking is handled internally by the merge iterator.
 	pub(crate) fn new_lsm(
 		core: Arc<Core>,
 		seq_num: u64,
@@ -1084,28 +1061,24 @@ impl<'a> HistoryIterator<'a> {
 			vlog.incr_iterator_count();
 		}
 
-		let merge_iter = KMergeIterator::new_from(iter_state, range);
-
 		Self {
-			inner: HistoryIteratorInner::Lsm(merge_iter),
+			inner: HistoryIteratorInner::Lsm(KMergeIterator::new_from(iter_state, range)),
 			snapshot_seq_num: seq_num,
 			include_tombstones,
 			direction: MergeDirection::Forward,
 			initialized: false,
-			lower_bound: None, // LSM handles bounds via KMergeIterator
+			lower_bound: None,
 			upper_bound: None,
 			core,
 			current_user_key: Vec::new(),
 			first_visible_seen: false,
 			latest_is_hard_delete: false,
-			seen_replace: false,
+			barrier_seen: false,
+			backward_buffer: Vec::new(),
+			backward_buffer_index: None,
 		}
 	}
 
-	/// Creates a new B+tree-based history iterator.
-	///
-	/// Bounds are stored and checked manually since `BPlusTreeIteratorWithGuard`
-	/// doesn't have built-in bounds support.
 	pub(crate) fn new_btree(
 		btree_iter: BPlusTreeIteratorWithGuard<'a>,
 		core: Arc<Core>,
@@ -1130,25 +1103,71 @@ impl<'a> HistoryIterator<'a> {
 			current_user_key: Vec::new(),
 			first_visible_seen: false,
 			latest_is_hard_delete: false,
-			seen_replace: false,
+			barrier_seen: false,
+			backward_buffer: Vec::new(),
+			backward_buffer_index: None,
 		}
 	}
 
-	/// Checks if a key is visible to this snapshot.
-	#[inline]
-	fn is_visible(&self, key: &InternalKeyRef<'_>) -> bool {
-		key.seq_num() <= self.snapshot_seq_num
+	fn reset_forward_state(&mut self) {
+		self.current_user_key.clear();
+		self.first_visible_seen = false;
+		self.latest_is_hard_delete = false;
+		self.barrier_seen = false;
 	}
 
-	/// Checks if current position is within upper bound.
-	/// - LSM: Returns true always (KMergeIterator enforces bounds internally)
-	/// - B+tree: Manually checks upper_bound since BPlusTreeIteratorWithGuard has no bounds support
+	fn clear_backward_buffer(&mut self) {
+		self.backward_buffer.clear();
+		self.backward_buffer_index = None;
+	}
+
+	fn reset_all_state(&mut self) {
+		self.reset_forward_state();
+		self.clear_backward_buffer();
+	}
+
+	// --- Inner iterator helpers ---
+
+	fn inner_valid(&self) -> bool {
+		match &self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.valid(),
+			HistoryIteratorInner::BTree(iter) => iter.valid(),
+		}
+	}
+
+	fn inner_key(&self) -> InternalKeyRef<'_> {
+		match &self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.key(),
+			HistoryIteratorInner::BTree(iter) => iter.key(),
+		}
+	}
+
+	fn inner_value(&self) -> &[u8] {
+		match &self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.value(),
+			HistoryIteratorInner::BTree(iter) => iter.value(),
+		}
+	}
+
+	fn inner_next(&mut self) -> Result<bool> {
+		match &mut self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.next(),
+			HistoryIteratorInner::BTree(iter) => iter.next(),
+		}
+	}
+
+	fn inner_prev(&mut self) -> Result<bool> {
+		match &mut self.inner {
+			HistoryIteratorInner::Lsm(iter) => iter.prev(),
+			HistoryIteratorInner::BTree(iter) => iter.prev(),
+		}
+	}
+
+	// --- Bounds checking ---
+
 	fn within_upper_bound(&self) -> bool {
 		match &self.inner {
-			HistoryIteratorInner::Lsm(_) => {
-				// LSM path: KMergeIterator already enforces bounds via InternalKeyRange
-				true
-			}
+			HistoryIteratorInner::Lsm(_) => true,
 			HistoryIteratorInner::BTree(iter) => {
 				if let Some(ref upper) = self.upper_bound {
 					if iter.valid() {
@@ -1163,73 +1182,27 @@ impl<'a> HistoryIterator<'a> {
 		}
 	}
 
-	/// Checks if current position is within lower bound (for backward iteration).
-	fn within_lower_bound(&self) -> bool {
-		match &self.inner {
-			HistoryIteratorInner::Lsm(_) => true,
-			HistoryIteratorInner::BTree(iter) => {
-				if let Some(ref lower) = self.lower_bound {
-					if iter.valid() {
-						iter.key().user_key() >= lower.as_slice()
-					} else {
-						false
-					}
-				} else {
-					true
-				}
-			}
+	fn user_key_within_lower_bound(&self, user_key: &[u8]) -> bool {
+		match &self.lower_bound {
+			Some(lower) => user_key >= lower.as_slice(),
+			None => true,
 		}
 	}
 
-	/// Returns whether the inner iterator is valid.
-	fn inner_valid(&self) -> bool {
-		match &self.inner {
-			HistoryIteratorInner::Lsm(iter) => iter.valid(),
-			HistoryIteratorInner::BTree(iter) => iter.valid(),
-		}
-	}
+	// === FORWARD ITERATION (Streaming) ===
 
-	/// Gets the key from the inner iterator.
-	fn inner_key(&self) -> InternalKeyRef<'_> {
-		match &self.inner {
-			HistoryIteratorInner::Lsm(iter) => iter.key(),
-			HistoryIteratorInner::BTree(iter) => iter.key(),
-		}
-	}
-
-	/// Advances the inner iterator forward.
-	fn inner_next(&mut self) -> Result<bool> {
-		match &mut self.inner {
-			HistoryIteratorInner::Lsm(iter) => iter.next(),
-			HistoryIteratorInner::BTree(iter) => iter.next(),
-		}
-	}
-
-	/// Moves the inner iterator backward.
-	fn inner_prev(&mut self) -> Result<bool> {
-		match &mut self.inner {
-			HistoryIteratorInner::Lsm(iter) => iter.prev(),
-			HistoryIteratorInner::BTree(iter) => iter.prev(),
-		}
-	}
-
-	/// Skip to the next valid entry in forward direction.
-	/// Handles visibility, tombstones, REPLACE, DELETE filtering, and bounds for BOTH backends.
+	/// Skip to next valid entry in forward direction.
 	///
-	/// Filtering rules:
-	/// - Hard DELETE as latest visible: skip ALL versions of this key
-	/// - REPLACE seen: skip older non-REPLACE versions, output only REPLACE versions
-	/// - Soft DELETE: affected by include_tombstones flag only
-	/// - Normal SET: output all versions
+	/// Barriers (first one wins):
+	/// - HARD_DELETE: skip it and everything older
+	/// - REPLACE: output it, skip everything older
 	fn skip_to_valid_forward(&mut self) -> Result<bool> {
 		while self.inner_valid() {
-			// Check bounds first (B+tree only, LSM returns true)
 			if !self.within_upper_bound() {
 				return Ok(false);
 			}
 
-			// Extract data before mutations (borrow checker)
-			let (user_key_owned, seq_num, is_hard_delete, is_replace, is_tombstone) = {
+			let (user_key_vec, seq_num, is_hard_delete, is_replace, is_tombstone) = {
 				let key_ref = self.inner_key();
 				(
 					key_ref.user_key().to_vec(),
@@ -1240,22 +1213,21 @@ impl<'a> HistoryIterator<'a> {
 				)
 			};
 
-			// Detect user_key change - reset tracking state
-			let is_new_user_key = user_key_owned != self.current_user_key;
-			if is_new_user_key {
-				self.current_user_key = user_key_owned;
+			// Detect user_key change → reset state
+			if user_key_vec != self.current_user_key {
+				self.current_user_key = user_key_vec;
 				self.first_visible_seen = false;
 				self.latest_is_hard_delete = false;
-				self.seen_replace = false;
+				self.barrier_seen = false;
 			}
 
-			// Skip invisible versions (seq_num > snapshot)
+			// Skip invisible versions
 			if seq_num > self.snapshot_seq_num {
 				self.inner_next()?;
 				continue;
 			}
 
-			// First visible entry - check if it's hard delete
+			// First visible entry → check for HARD_DELETE as latest
 			if !self.first_visible_seen {
 				self.first_visible_seen = true;
 				if is_hard_delete {
@@ -1263,32 +1235,34 @@ impl<'a> HistoryIterator<'a> {
 				}
 			}
 
-			// Hard DELETE as latest: skip ALL versions of this key
+			// Rule 1: HARD_DELETE as latest → skip entire key
 			if self.latest_is_hard_delete {
 				self.inner_next()?;
 				continue;
 			}
 
-			// Track REPLACE
-			if is_replace {
-				self.seen_replace = true;
-			}
-
-			// After REPLACE, skip non-REPLACE versions
-			if self.seen_replace && !is_replace {
+			// Rule 2: Already past a barrier → skip everything older
+			if self.barrier_seen {
 				self.inner_next()?;
 				continue;
 			}
 
-			// Skip older hard deletes (not latest)
+			// Rule 3: Hit HARD_DELETE barrier (not latest)
+			// Skip this entry and mark barrier
 			if is_hard_delete {
+				self.barrier_seen = true;
 				self.inner_next()?;
 				continue;
 			}
 
-			// Skip soft delete tombstones if not included
-			// (is_tombstone includes both soft and hard deletes, but hard deletes
-			// are already handled above, so this only affects soft deletes)
+			// Rule 4: Hit REPLACE barrier
+			// Output this entry, then mark barrier for older entries
+			if is_replace {
+				self.barrier_seen = true;
+				// Don't skip - fall through to output
+			}
+
+			// Rule 5: Soft DELETE (tombstone) filtering
 			if !self.include_tombstones && is_tombstone {
 				self.inner_next()?;
 				continue;
@@ -1300,42 +1274,155 @@ impl<'a> HistoryIterator<'a> {
 		Ok(false)
 	}
 
-	/// Skip to the next valid entry in backward direction.
-	///
-	/// Note: Backward iteration uses simpler filtering (visibility + tombstones only).
-	/// Full REPLACE/DELETE tracking would require looking ahead since versions
-	/// appear in reverse order (oldest first for each user_key).
-	fn skip_to_valid_backward(&mut self) -> Result<bool> {
-		while self.inner_valid() {
-			// Check bounds first (B+tree only, LSM returns true)
-			if !self.within_lower_bound() {
-				return Ok(false);
-			}
+	// === BACKWARD ITERATION (Buffered) ===
 
+	/// Collect all visible versions of current user key, apply filtering,
+	/// and populate backward_buffer.
+	///
+	/// After this call, inner iterator is at previous user key (or invalid).
+	fn collect_user_key_backward(&mut self) -> Result<bool> {
+		self.backward_buffer.clear();
+
+		if !self.inner_valid() {
+			return Ok(false);
+		}
+
+		let user_key = self.inner_key().user_key().to_vec();
+
+		if !self.user_key_within_lower_bound(&user_key) {
+			return Ok(false);
+		}
+
+		// Collect all visible versions
+		// Backward storage order: (user_key DESC, seq_num ASC) → oldest first
+		struct VersionInfo {
+			is_hard_delete: bool,
+			is_replace: bool,
+			is_tombstone: bool,
+			encoded_key: Vec<u8>,
+			value: Vec<u8>,
+		}
+		let mut versions: Vec<VersionInfo> = Vec::new();
+
+		while self.inner_valid() {
 			let key_ref = self.inner_key();
 
-			// Skip invisible versions (seq_num > snapshot)
-			if !self.is_visible(&key_ref) {
-				self.inner_prev()?;
-				continue;
+			if key_ref.user_key() != user_key.as_slice() {
+				break;
 			}
 
-			// Skip tombstones if not included
-			if !self.include_tombstones && key_ref.is_tombstone() {
-				self.inner_prev()?;
-				continue;
+			let seq_num = key_ref.seq_num();
+
+			if seq_num <= self.snapshot_seq_num {
+				versions.push(VersionInfo {
+					is_hard_delete: key_ref.is_hard_delete_marker(),
+					is_replace: key_ref.is_replace(),
+					is_tombstone: key_ref.is_tombstone(),
+					encoded_key: key_ref.encoded().to_vec(),
+					value: self.inner_value().to_vec(),
+				});
 			}
 
-			// Found valid entry
-			return Ok(true);
+			self.inner_prev()?;
 		}
-		Ok(false)
+
+		if versions.is_empty() {
+			return Ok(false);
+		}
+
+		// versions are in seq_num ASC order (oldest first, newest last)
+		// Latest visible is the LAST element
+		let latest = versions.last().unwrap();
+
+		// Rule 1: HARD_DELETE as latest → skip entire key
+		if latest.is_hard_delete {
+			return Ok(false);
+		}
+
+		// Rule 2: Find first barrier from newest (search from end to start)
+		// Barrier can be HARD_DELETE or REPLACE
+		let mut barrier_idx: Option<usize> = None;
+		let mut barrier_is_hard_delete = false;
+
+		for i in (0..versions.len()).rev() {
+			if versions[i].is_hard_delete {
+				barrier_idx = Some(i);
+				barrier_is_hard_delete = true;
+				break;
+			}
+			if versions[i].is_replace {
+				barrier_idx = Some(i);
+				barrier_is_hard_delete = false;
+				break;
+			}
+		}
+
+		// Determine valid range based on barrier
+		let valid_start_idx = match barrier_idx {
+			Some(idx) if barrier_is_hard_delete => idx + 1, // Exclude HARD_DELETE and older
+			Some(idx) => idx,                               // Include REPLACE, exclude older
+			None => 0,                                      // No barrier, include all
+		};
+
+		// Output versions[valid_start_idx..] in ASC order (oldest first for backward)
+		for v in versions.into_iter().skip(valid_start_idx) {
+			// Skip HARD_DELETE markers (shouldn't happen after valid_start_idx, but be safe)
+			if v.is_hard_delete {
+				continue;
+			}
+
+			// Tombstone filtering
+			if !self.include_tombstones && v.is_tombstone {
+				continue;
+			}
+
+			self.backward_buffer.push(BufferedEntry {
+				key: v.encoded_key,
+				value: v.value,
+			});
+		}
+
+		if self.backward_buffer.is_empty() {
+			return Ok(false);
+		}
+
+		// Start yielding from index 0 (oldest in valid range)
+		self.backward_buffer_index = Some(0);
+		Ok(true)
+	}
+
+	fn advance_backward(&mut self) -> Result<bool> {
+		if let Some(idx) = self.backward_buffer_index {
+			if idx + 1 < self.backward_buffer.len() {
+				self.backward_buffer_index = Some(idx + 1);
+				return Ok(true);
+			}
+		}
+
+		// Buffer exhausted, load previous user key
+		self.collect_user_key_backward()
+	}
+
+	fn buffered_key(&self) -> InternalKeyRef<'_> {
+		let idx = self.backward_buffer_index.unwrap();
+		InternalKeyRef::from_encoded(&self.backward_buffer[idx].key)
+	}
+
+	fn buffered_value(&self) -> &[u8] {
+		let idx = self.backward_buffer_index.unwrap();
+		&self.backward_buffer[idx].value
+	}
+
+	fn has_buffered_entry(&self) -> bool {
+		matches!(self.backward_buffer_index, Some(idx) if idx < self.backward_buffer.len())
 	}
 }
 
 impl InternalIterator for HistoryIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
+		self.reset_all_state();
+
 		match &mut self.inner {
 			HistoryIteratorInner::Lsm(iter) => iter.seek(target)?,
 			HistoryIteratorInner::BTree(iter) => iter.seek(target)?,
@@ -1346,16 +1433,14 @@ impl InternalIterator for HistoryIterator<'_> {
 
 	fn seek_first(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
+		self.reset_all_state();
+
 		match &mut self.inner {
 			HistoryIteratorInner::Lsm(iter) => {
 				iter.seek_first()?;
 			}
 			HistoryIteratorInner::BTree(iter) => {
-				// Seek to lower bound if present, otherwise start of tree
 				if let Some(ref lower) = self.lower_bound {
-					// B+tree is ordered by (user_key ASC, timestamp DESC)
-					// With DESC order, timestamp=u64::MAX is smallest (comes first)
-					// So we seek with max timestamp to find the first entry for this user_key
 					let seek_key =
 						InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set, u64::MAX);
 					iter.seek(&seek_key.encode())?;
@@ -1370,16 +1455,15 @@ impl InternalIterator for HistoryIterator<'_> {
 
 	fn seek_last(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Backward;
+		self.reset_all_state();
+
 		match &mut self.inner {
 			HistoryIteratorInner::Lsm(iter) => {
 				iter.seek_last()?;
 			}
 			HistoryIteratorInner::BTree(iter) => {
-				// For B+tree, we need to seek to end and work backwards
-				// If upper bound exists, seek to it and go back
 				if let Some(ref upper) = self.upper_bound {
 					iter.seek(upper)?;
-					// If we're at or past upper, go back one
 					if iter.valid() && iter.key().user_key() >= upper.as_slice() {
 						iter.prev()?;
 					}
@@ -1389,16 +1473,42 @@ impl InternalIterator for HistoryIterator<'_> {
 			}
 		}
 		self.initialized = true;
-		self.skip_to_valid_backward()
+		self.collect_user_key_backward()
 	}
 
 	fn next(&mut self) -> Result<bool> {
 		if !self.initialized {
 			return self.seek_first();
 		}
+
+		// Direction change: backward → forward
+		if self.direction == MergeDirection::Backward {
+			self.direction = MergeDirection::Forward;
+			self.reset_forward_state();
+
+			if self.has_buffered_entry() {
+				let current_key = self.buffered_key().encoded().to_vec();
+				self.clear_backward_buffer();
+
+				match &mut self.inner {
+					HistoryIteratorInner::Lsm(iter) => iter.seek(&current_key)?,
+					HistoryIteratorInner::BTree(iter) => iter.seek(&current_key)?,
+				};
+
+				if self.inner_valid() {
+					self.inner_next()?;
+				}
+
+				return self.skip_to_valid_forward();
+			}
+
+			return Ok(false);
+		}
+
 		if !self.inner_valid() {
 			return Ok(false);
 		}
+
 		self.inner_next()?;
 		self.skip_to_valid_forward()
 	}
@@ -1407,51 +1517,56 @@ impl InternalIterator for HistoryIterator<'_> {
 		if !self.initialized {
 			return self.seek_last();
 		}
-		// If we were going forward, need to reset for backward
+
+		// Direction change: forward → backward
 		if self.direction != MergeDirection::Backward {
 			self.direction = MergeDirection::Backward;
+
+			if self.inner_valid() {
+				self.inner_prev()?;
+			}
+
+			self.clear_backward_buffer();
+			return self.collect_user_key_backward();
 		}
-		if !self.inner_valid() {
+
+		if !self.has_buffered_entry() && !self.inner_valid() {
 			return Ok(false);
 		}
-		self.inner_prev()?;
-		self.skip_to_valid_backward()
+
+		self.advance_backward()
 	}
 
 	fn valid(&self) -> bool {
-		if !self.inner_valid() {
-			return false;
-		}
-		// Check bounds based on direction
 		match self.direction {
-			MergeDirection::Forward => self.within_upper_bound(),
-			MergeDirection::Backward => self.within_lower_bound(),
+			MergeDirection::Forward => self.inner_valid() && self.within_upper_bound(),
+			MergeDirection::Backward => self.has_buffered_entry(),
 		}
 	}
 
 	fn key(&self) -> InternalKeyRef<'_> {
 		debug_assert!(self.valid());
-		self.inner_key()
+		match self.direction {
+			MergeDirection::Forward => self.inner_key(),
+			MergeDirection::Backward => self.buffered_key(),
+		}
 	}
 
 	fn value(&self) -> &[u8] {
 		debug_assert!(self.valid());
-		match &self.inner {
-			HistoryIteratorInner::Lsm(iter) => iter.value(),
-			HistoryIteratorInner::BTree(iter) => iter.value(),
+		match self.direction {
+			MergeDirection::Forward => self.inner_value(),
+			MergeDirection::Backward => self.buffered_value(),
 		}
 	}
 }
 
 impl Drop for HistoryIterator<'_> {
 	fn drop(&mut self) {
-		// Decrement VLog iterator count for BOTH paths (both increment in constructor)
-		// B+tree also stores VLog pointers as values, so it needs VLog access
 		if let Some(ref vlog) = self.core.vlog {
 			if let Err(e) = vlog.decr_iterator_count() {
 				log::warn!("Failed to decrement VLog iterator count: {e}");
 			}
 		}
-		// B+tree guard (RwLockReadGuard) is automatically dropped when `inner` is dropped
 	}
 }
