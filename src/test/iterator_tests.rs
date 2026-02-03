@@ -118,6 +118,7 @@ fn test_merge_iterator_sequence_ordering() {
 		false, // versioning disabled
 		0,
 		Arc::new(MockLogicalClock::new()),
+		vec![],
 	);
 
 	// Collect all items
@@ -197,6 +198,7 @@ fn test_compaction_iterator_hard_delete_filtering() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
+		vec![],
 	);
 
 	// Collect all items
@@ -271,6 +273,7 @@ fn test_compaction_iterator_hard_delete_filtering() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
+		vec![],
 	);
 
 	// Collect all items
@@ -327,6 +330,7 @@ async fn test_combined_iterator_returns_latest_version() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
+		vec![],
 	);
 
 	// Should return only the latest version (seq=300)
@@ -384,6 +388,7 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
+		vec![],
 	);
 
 	// Consume the iterator
@@ -443,6 +448,7 @@ async fn test_hard_delete_at_bottom_level() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
+		vec![],
 	);
 
 	// At bottom level, hard_delete should NOT be returned
@@ -487,6 +493,7 @@ async fn test_hard_delete_at_non_bottom_level() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
+		vec![],
 	);
 
 	// At non-bottom level, hard_delete SHOULD be returned
@@ -551,6 +558,7 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
+		vec![],
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -629,6 +637,7 @@ fn test_no_vlog_no_delete_list() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
+		vec![],
 	);
 
 	// Should still work and return latest version
@@ -694,6 +703,7 @@ async fn test_sequence_ordering_across_iterators() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
+		vec![],
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -849,6 +859,7 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 		true, // enable versioning
 		retention_period_ns,
 		clock,
+		vec![],
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -1031,6 +1042,7 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 		true, // enable versioning
 		retention_period_ns,
 		clock,
+		vec![],
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -1193,6 +1205,7 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 		false, // VERSIONING DISABLED
 		retention_period_ns,
 		clock,
+		vec![],
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -1336,6 +1349,7 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 		false, // VERSIONING DISABLED
 		retention_period_ns,
 		clock,
+		vec![],
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -1448,6 +1462,7 @@ async fn test_delete_list_logic() {
 			true, // enable versioning
 			retention_period,
 			clock,
+			vec![],
 		);
 
 		// Process the entries
@@ -1504,6 +1519,7 @@ async fn test_delete_list_logic() {
 			true, // enable versioning
 			retention_period,
 			clock,
+			vec![],
 		);
 
 		// Process the entries
@@ -1556,6 +1572,7 @@ async fn test_delete_list_logic() {
 			false, // disable versioning
 			retention_period,
 			clock,
+			vec![],
 		);
 
 		// Process the entries
@@ -1611,6 +1628,7 @@ async fn test_delete_list_logic() {
 			true, // enable versioning
 			retention_period,
 			clock,
+			vec![],
 		);
 
 		// Process the entries
@@ -1667,6 +1685,7 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 		true, // enable versioning
 		1000, // retention period
 		clock,
+		vec![],
 	);
 
 	let mut result = Vec::new();
@@ -1734,6 +1753,7 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 		true, // enable versioning
 		1000, // retention period
 		clock,
+		vec![],
 	);
 
 	let mut result = Vec::new();
@@ -1793,6 +1813,7 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 		true, // enable versioning
 		1000, // retention period
 		clock,
+		vec![],
 	);
 
 	let mut result = Vec::new();
@@ -1850,6 +1871,7 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 		true, // enable versioning
 		1000, // retention period
 		clock,
+		vec![],
 	);
 
 	let mut result = Vec::new();
@@ -1909,6 +1931,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			true, // enable versioning
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -1964,6 +1987,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			true, // enable versioning
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2023,6 +2047,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			true, // enable versioning
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2083,6 +2108,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			true, // enable versioning
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2158,6 +2184,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			true, // enable versioning
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2211,6 +2238,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			true, // enable versioning
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2262,6 +2290,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			true, // enable versioning
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2321,6 +2350,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			true, // enable versioning
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2378,6 +2408,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2436,6 +2467,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2488,6 +2520,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2539,6 +2572,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
 			clock,
+			vec![],
 		);
 
 		let mut result = Vec::new();
@@ -2737,4 +2771,463 @@ fn test_merging_iterator_multiple_direction_switches() {
 	assert!(merge_iter.prev().unwrap()); // Should be key-3(seq=200)
 	assert_eq!(String::from_utf8_lossy(merge_iter.current_key().user_key()), "key-3");
 	assert_eq!(merge_iter.current_key().seq_num(), 200);
+}
+
+// ============================================================================
+// SNAPSHOT-AWARE COMPACTION TESTS
+// ============================================================================
+
+/// Test: No snapshots - only latest version is kept (existing behavior)
+#[test]
+fn test_snapshot_compaction_no_snapshots_keeps_only_latest() {
+	// Create multiple versions of the same key
+	let items = vec![
+		(create_internal_key("key1", 100, InternalKeyKind::Set), b"v3".to_vec()),
+		(create_internal_key("key1", 50, InternalKeyKind::Set), b"v2".to_vec()),
+		(create_internal_key("key1", 20, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let iter = build_table_iterator(items);
+
+	// No snapshots - should only keep latest version
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false, // not bottom level
+		None,
+		false, // versioning disabled
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![], // No snapshots
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num()));
+	}
+
+	// Only the latest version (seq=100) should be kept
+	assert_eq!(result.len(), 1, "Only latest version should be kept with no snapshots");
+	assert_eq!(result[0], ("key1".to_string(), 100));
+}
+
+/// Test: Single snapshot - preserves version visible to snapshot
+#[test]
+fn test_snapshot_compaction_single_snapshot_preserves_visible_version() {
+	// Versions: seq=100 (visible to snapshot 50), seq=30 (visible to snapshot 50)
+	// Snapshot at seq=50 means versions with seq <= 50 are visible to it
+	let items = vec![
+		(create_internal_key("key1", 100, InternalKeyKind::Set), b"v3".to_vec()),
+		(create_internal_key("key1", 30, InternalKeyKind::Set), b"v2".to_vec()),
+		(create_internal_key("key1", 10, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let iter = build_table_iterator(items);
+
+	// Snapshot at seq=50 - version seq=30 is the visible version for this snapshot
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false,
+		None,
+		false, // versioning disabled
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![50], // Snapshot at seq=50
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num()));
+	}
+
+	// seq=100: Latest, keep
+	// seq=30: Visible to snapshot 50, keep
+	// seq=10: Same boundary as seq=30 (both visible to snapshot 50), dropped (hidden by seq=30)
+	assert_eq!(result.len(), 2, "Latest and snapshot-visible version should be kept");
+	assert!(result.contains(&("key1".to_string(), 100)), "Latest should be kept");
+	assert!(result.contains(&("key1".to_string(), 30)), "Snapshot-visible version should be kept");
+}
+
+/// Test: Multiple snapshots - each visibility boundary preserves one version
+#[test]
+fn test_snapshot_compaction_multiple_snapshots_different_boundaries() {
+	// Versions at different seq_nums, two snapshots create different boundaries
+	let items = vec![
+		(create_internal_key("key1", 200, InternalKeyKind::Set), b"v4".to_vec()), /* Newer than
+		                                                                           * all snapshots */
+		(create_internal_key("key1", 120, InternalKeyKind::Set), b"v3".to_vec()), /* Visible to
+		                                                                           * snap 150 */
+		(create_internal_key("key1", 80, InternalKeyKind::Set), b"v2".to_vec()), /* Visible to
+		                                                                          * snap 150 (same
+		                                                                          * boundary as
+		                                                                          * v3) */
+		(create_internal_key("key1", 30, InternalKeyKind::Set), b"v1".to_vec()), /* Visible to
+		                                                                          * snap 50 */
+	];
+
+	let iter = build_table_iterator(items);
+
+	// Snapshots at seq=50 and seq=150
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false,
+		None,
+		false,
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![50, 150], // Two snapshots
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num()));
+	}
+
+	// seq=200: NewerThanAllSnapshots, different boundary from v3, keep
+	// seq=120: BoundedBySnapshot(150), keep
+	// seq=80: BoundedBySnapshot(150), same boundary as seq=120, dropped (hidden by seq=120)
+	// seq=30: BoundedBySnapshot(50), different boundary, keep
+	assert_eq!(result.len(), 3, "Three versions should be kept (one per boundary)");
+	assert!(result.contains(&("key1".to_string(), 200)), "Latest should be kept");
+	assert!(
+		result.contains(&("key1".to_string(), 120)),
+		"Version visible to snap 150 should be kept"
+	);
+	assert!(
+		result.contains(&("key1".to_string(), 30)),
+		"Version visible to snap 50 should be kept"
+	);
+	assert!(
+		!result.contains(&("key1".to_string(), 80)),
+		"Version hidden by newer version in same boundary should be dropped"
+	);
+}
+
+/// Test: Older version in same visibility boundary is dropped when hidden by newer version
+#[test]
+fn test_snapshot_compaction_newer_version_hides_older_in_same_boundary() {
+	// Two versions both visible to the same snapshot - older one should be dropped
+	let items = vec![
+		(create_internal_key("key1", 100, InternalKeyKind::Set), b"v2".to_vec()),
+		(create_internal_key("key1", 50, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let iter = build_table_iterator(items);
+
+	// Snapshot at seq=150 - both versions are visible to it (same boundary)
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false,
+		None,
+		false,
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![150], // Snapshot at seq=150
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num()));
+	}
+
+	// Both seq=100 and seq=50 are visible to snapshot 150 (same boundary)
+	// seq=100 is newer, so seq=50 is dropped (hidden by newer version)
+	assert_eq!(result.len(), 1, "Only newer version in same boundary should be kept");
+	assert_eq!(result[0], ("key1".to_string(), 100));
+}
+
+/// Test: Versions newer than all snapshots can be hidden by newer versions
+#[test]
+fn test_snapshot_compaction_versions_at_tip_hidden_by_newer() {
+	// Multiple versions all newer than the snapshot
+	let items = vec![
+		(create_internal_key("key1", 300, InternalKeyKind::Set), b"v3".to_vec()),
+		(create_internal_key("key1", 200, InternalKeyKind::Set), b"v2".to_vec()),
+		(create_internal_key("key1", 150, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let iter = build_table_iterator(items);
+
+	// Snapshot at seq=50 - all versions are newer than all snapshots (NewerThanAllSnapshots)
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false,
+		None,
+		false,
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![50], // Snapshot at seq=50
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num()));
+	}
+
+	// All versions are NewerThanAllSnapshots (same boundary), only latest kept
+	assert_eq!(result.len(), 1, "Only latest version should be kept when all newer than snapshots");
+	assert_eq!(result[0], ("key1".to_string(), 300));
+}
+
+/// Test: Multiple keys with snapshots
+#[test]
+fn test_snapshot_compaction_multiple_keys() {
+	let items = vec![
+		// Key1: versions at 100, 30
+		(create_internal_key("key1", 100, InternalKeyKind::Set), b"k1v2".to_vec()),
+		(create_internal_key("key1", 30, InternalKeyKind::Set), b"k1v1".to_vec()),
+		// Key2: versions at 80, 40
+		(create_internal_key("key2", 80, InternalKeyKind::Set), b"k2v2".to_vec()),
+		(create_internal_key("key2", 40, InternalKeyKind::Set), b"k2v1".to_vec()),
+	];
+
+	let iter = build_table_iterator(items);
+
+	// Snapshot at seq=50
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false,
+		None,
+		false,
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![50], // Snapshot at seq=50
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num()));
+	}
+
+	// Key1: seq=100 (NewerThanAllSnapshots), seq=30 (BoundedBySnapshot(50)) - different boundaries,
+	// keep both Key2: seq=80 (NewerThanAllSnapshots), seq=40 (BoundedBySnapshot(50)) - different
+	// boundaries, keep both
+	assert_eq!(result.len(), 4, "All versions in different boundaries should be kept");
+}
+
+/// Test: Tombstone with snapshot visibility
+#[test]
+fn test_snapshot_compaction_tombstone_visible_to_snapshot() {
+	// Delete followed by older put - both visible to snapshot
+	let items = vec![
+		(create_internal_key("key1", 100, InternalKeyKind::Delete), b"".to_vec()),
+		(create_internal_key("key1", 50, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let iter = build_table_iterator(items);
+
+	// Snapshot at seq=150 - tombstone is visible to snapshot
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false, // NOT bottom level - tombstone must be preserved
+		None,
+		false,
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![150],
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((
+			String::from_utf8_lossy(&key.user_key).to_string(),
+			key.seq_num(),
+			key.kind(),
+		));
+	}
+
+	// Both in same boundary (BoundedBySnapshot(150))
+	// seq=100 Delete is kept (latest), seq=50 is dropped (hidden by seq=100)
+	assert_eq!(result.len(), 1);
+	assert_eq!(result[0], ("key1".to_string(), 100, InternalKeyKind::Delete));
+}
+
+/// Test: Tombstone at bottom level with snapshot
+#[test]
+fn test_snapshot_compaction_tombstone_at_bottom_with_snapshot() {
+	// Delete at bottom level - even with snapshot, can drop if visible
+	let items = vec![
+		(create_internal_key("key1", 100, InternalKeyKind::Delete), b"".to_vec()),
+		(create_internal_key("key1", 50, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let iter = build_table_iterator(items);
+
+	// Snapshot at seq=150 - both versions visible, but bottom level
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		true, // Bottom level
+		None,
+		false,
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![150],
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num()));
+	}
+
+	// At bottom level with DELETE as latest, all versions can be dropped
+	// (The tombstone doesn't need to mask anything below)
+	assert_eq!(result.len(), 0, "Bottom level delete should drop all versions");
+}
+
+/// Test: Snapshot at exact sequence number
+#[test]
+fn test_snapshot_compaction_exact_sequence_match() {
+	// Version at exact snapshot sequence number
+	let items = vec![
+		(create_internal_key("key1", 100, InternalKeyKind::Set), b"v2".to_vec()),
+		(create_internal_key("key1", 50, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let iter = build_table_iterator(items);
+
+	// Snapshot at seq=50 (exact match with v1)
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false,
+		None,
+		false,
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![50], // Snapshot at exact seq=50
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num()));
+	}
+
+	// seq=100: NewerThanAllSnapshots (> snapshot 50)
+	// seq=50: BoundedBySnapshot(50) - exact match
+	// Different boundaries, both should be kept
+	assert_eq!(result.len(), 2, "Both versions should be kept with exact snapshot match");
+	assert!(result.contains(&("key1".to_string(), 100)));
+	assert!(result.contains(&("key1".to_string(), 50)));
+}
+
+/// Test: Version older than all snapshots
+#[test]
+fn test_snapshot_compaction_version_older_than_all_snapshots() {
+	// Version older than the oldest snapshot
+	let items = vec![
+		(create_internal_key("key1", 200, InternalKeyKind::Set), b"v3".to_vec()),
+		(create_internal_key("key1", 100, InternalKeyKind::Set), b"v2".to_vec()),
+		(create_internal_key("key1", 30, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let iter = build_table_iterator(items);
+
+	// Snapshots at seq=50 and seq=150
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false,
+		None,
+		false,
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![50, 150],
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num()));
+	}
+
+	// seq=200: NewerThanAllSnapshots
+	// seq=100: BoundedBySnapshot(150)
+	// seq=30: BoundedBySnapshot(50)
+	// All in different boundaries, all should be kept
+	assert_eq!(result.len(), 3, "All versions in different boundaries should be kept");
+}
+
+/// Test: SnapshotVisibility enum states
+#[test]
+fn test_snapshot_visibility_states() {
+	// Test NoActiveSnapshots
+	let items = vec![(create_internal_key("key1", 100, InternalKeyKind::Set), b"v1".to_vec())];
+	let iter = build_table_iterator(items);
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false,
+		None,
+		false,
+		0,
+		Arc::new(MockLogicalClock::new()),
+		vec![], // No snapshots
+	);
+
+	// Test via the iterator behavior - with no snapshots, should keep only latest
+	let mut count = 0;
+	for _ in comp_iter.by_ref() {
+		count += 1;
+	}
+	assert_eq!(count, 1);
+}
+
+/// Test: Snapshot-aware compaction with versioning enabled
+#[test]
+fn test_snapshot_compaction_with_versioning_enabled() {
+	let clock = Arc::new(MockLogicalClock::new());
+	clock.set_time(1000); // Current time = 1000
+
+	// Versions with different timestamps
+	let items = vec![
+		(
+			create_internal_key_with_timestamp("key1", 100, InternalKeyKind::Set, 900),
+			b"v3".to_vec(),
+		),
+		(create_internal_key_with_timestamp("key1", 50, InternalKeyKind::Set, 800), b"v2".to_vec()),
+		(create_internal_key_with_timestamp("key1", 20, InternalKeyKind::Set, 500), b"v1".to_vec()),
+	];
+
+	let iter = build_table_iterator(items);
+
+	// Snapshot at seq=60, versioning with 300ns retention
+	let mut comp_iter = CompactionIterator::new(
+		vec![iter],
+		create_comparator(),
+		false,
+		None,
+		true,  // versioning enabled
+		300,   // retention period = 300ns
+		clock, // current time = 1000
+		vec![60],
+	);
+
+	let mut result = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		result.push((String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num()));
+	}
+
+	// seq=100: NewerThanAllSnapshots, keep (latest)
+	// seq=50: BoundedBySnapshot(60), keep (snapshot visible)
+	// seq=20: BoundedBySnapshot(60), same boundary as seq=50, dropped (hidden by seq=50)
+	assert_eq!(result.len(), 2, "Latest and snapshot-visible should be kept");
+	assert!(result.contains(&("key1".to_string(), 100)));
+	assert!(result.contains(&("key1".to_string(), 50)));
 }
