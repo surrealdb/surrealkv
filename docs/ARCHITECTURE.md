@@ -22,55 +22,6 @@ This document provides a comprehensive overview of the internal design, data flo
 
 SurrealKV is organized into four main layers: the Client API, Core Components, Storage Layer, and Background Tasks.
 
-### Mermaid Diagram
-
-```mermaid
-flowchart TB
-    subgraph client [Client Layer]
-        Tree[Tree API]
-        Transaction[Transaction]
-    end
-    
-    subgraph core [Core Components]
-        MemTable[Active MemTable]
-        ImmutableMT[Immutable MemTables]
-        Oracle[Oracle]
-        CommitPipeline[Commit Pipeline]
-        Snapshot[Snapshot]
-    end
-    
-    subgraph storage [Storage Layer]
-        WAL[Write-Ahead Log]
-        SST[SSTables L0...Ln]
-        VLog[Value Log]
-        Manifest[Level Manifest]
-    end
-    
-    subgraph background [Background Tasks]
-        Flush[MemTable Flush]
-        Compaction[Level Compaction]
-        VLogGC[VLog GC]
-    end
-    
-    Tree --> Transaction
-    Transaction -->|writes| MemTable
-    Transaction -->|reads| Snapshot
-    Transaction --> CommitPipeline
-    CommitPipeline --> WAL
-    CommitPipeline --> VLog
-    CommitPipeline --> MemTable
-    Oracle --> CommitPipeline
-    MemTable --> ImmutableMT
-    ImmutableMT --> Flush
-    Flush --> SST
-    SST --> Compaction
-    VLog --> VLogGC
-    Manifest --> SST
-    Snapshot --> MemTable
-    Snapshot --> ImmutableMT
-    Snapshot --> SST
-```
-
 ### ASCII Diagram
 
 ```
@@ -163,59 +114,6 @@ database_path/
 ## Write Path
 
 The write path describes how data flows from a transaction's `set()` call through to durable storage.
-
-### Mermaid Diagram
-
-```mermaid
-flowchart TD
-    subgraph tx [Transaction]
-        Set["txn.set(key, value)"]
-        WriteSet[Add to write_set buffer]
-        Commit["txn.commit()"]
-    end
-    
-    subgraph commit [Commit Phase]
-        Oracle[Oracle: Conflict Detection]
-        SeqNum[Assign Sequence Numbers]
-        Batch[Create Batch]
-    end
-    
-    subgraph pipeline [Commit Pipeline]
-        AcquireLock[Acquire Write Lock]
-        WriteWAL[Write to WAL]
-        ValueCheck{Value > threshold?}
-        WriteVLog[Append to VLog]
-        CreatePointer[Create ValuePointer]
-        InlineValue[Store Inline]
-        ApplyMemTable[Apply to MemTable]
-        Publish[Publish Visibility]
-    end
-    
-    subgraph background [Background]
-        RotateCheck{MemTable Full?}
-        Rotate[Rotate to Immutable]
-        Flush[Flush to L0 SSTable]
-    end
-    
-    Set --> WriteSet
-    WriteSet --> Commit
-    Commit --> Oracle
-    Oracle -->|No Conflict| SeqNum
-    SeqNum --> Batch
-    Batch --> AcquireLock
-    AcquireLock --> WriteWAL
-    WriteWAL --> ValueCheck
-    ValueCheck -->|Yes| WriteVLog
-    WriteVLog --> CreatePointer
-    CreatePointer --> ApplyMemTable
-    ValueCheck -->|No| InlineValue
-    InlineValue --> ApplyMemTable
-    ApplyMemTable --> Publish
-    Publish --> RotateCheck
-    RotateCheck -->|Yes| Rotate
-    Rotate --> Flush
-    RotateCheck -->|No| Done[Complete]
-```
 
 ### ASCII Diagram
 
@@ -319,76 +217,6 @@ flowchart TD
 ## Read Path
 
 The read path describes how data is retrieved from a transaction's `get()` call, traversing all storage layers.
-
-### Mermaid Diagram
-
-```mermaid
-flowchart TD
-    subgraph tx [Transaction Read]
-        Get["txn.get(key)"]
-        CheckWriteSet{Key in write_set?}
-        ReturnWriteSet[Return buffered value]
-    end
-    
-    subgraph snapshot [Snapshot Read]
-        CreateSnapshot[Get Snapshot with seq_num]
-        SearchActive[Search Active MemTable]
-        FoundActive{Found?}
-        SearchImmutable[Search Immutable MemTables]
-        FoundImm{Found?}
-    end
-    
-    subgraph sst [SSTable Search]
-        SearchL0[Search L0 SSTables - all]
-        FoundL0{Found?}
-        SearchLn[Search L1...Ln - binary search]
-        FoundLn{Found?}
-    end
-    
-    subgraph block [Block Access]
-        BloomCheck{Bloom Filter: May contain?}
-        SkipTable[Skip SSTable]
-        IndexLookup[Index Block Lookup]
-        CacheCheck{Block in Cache?}
-        ReadDisk[Read Block from Disk]
-        ReturnCached[Return from Cache]
-    end
-    
-    subgraph vlog [Value Resolution]
-        IsPointer{Value is Pointer?}
-        ReadVLog[Read from VLog]
-        ReturnInline[Return Inline Value]
-    end
-    
-    Get --> CheckWriteSet
-    CheckWriteSet -->|Yes| ReturnWriteSet
-    CheckWriteSet -->|No| CreateSnapshot
-    CreateSnapshot --> SearchActive
-    SearchActive --> FoundActive
-    FoundActive -->|Yes| IsPointer
-    FoundActive -->|No| SearchImmutable
-    SearchImmutable --> FoundImm
-    FoundImm -->|Yes| IsPointer
-    FoundImm -->|No| SearchL0
-    SearchL0 --> FoundL0
-    FoundL0 -->|Yes| IsPointer
-    FoundL0 -->|No| SearchLn
-    SearchLn --> BloomCheck
-    BloomCheck -->|No| SkipTable
-    SkipTable --> SearchLn
-    BloomCheck -->|Yes| IndexLookup
-    IndexLookup --> CacheCheck
-    CacheCheck -->|Yes| ReturnCached
-    CacheCheck -->|No| ReadDisk
-    ReadDisk --> FoundLn
-    ReturnCached --> FoundLn
-    FoundLn -->|Yes| IsPointer
-    FoundLn -->|No| NotFound[Return None]
-    IsPointer -->|Yes| ReadVLog
-    IsPointer -->|No| ReturnInline
-    ReadVLog --> Done[Return Value]
-    ReturnInline --> Done
-```
 
 ### ASCII Diagram
 
@@ -531,33 +359,6 @@ When versioning is enabled (`with_versioning(true, retention_ns)`):
 
 Compaction merges SSTables to reduce read amplification and reclaim space from obsolete versions.
 
-### LSM Tree Structure
-
-```mermaid
-flowchart TD
-    subgraph l0 [Level 0 - Overlapping]
-        SST0A["SST A<br/>keys: a-z"]
-        SST0B["SST B<br/>keys: d-m"]
-        SST0C["SST C<br/>keys: b-k"]
-    end
-    
-    subgraph l1 [Level 1 - Non-overlapping]
-        SST1A["SST 1<br/>keys: a-f"]
-        SST1B["SST 2<br/>keys: g-m"]
-        SST1C["SST 3<br/>keys: n-z"]
-    end
-    
-    subgraph l2 [Level 2 - Non-overlapping, Larger]
-        SST2A["SST 1<br/>keys: a-c"]
-        SST2B["SST 2<br/>keys: d-h"]
-        SST2C["SST 3<br/>keys: i-o"]
-        SST2D["SST 4<br/>keys: p-z"]
-    end
-    
-    l0 -->|"Compaction"| l1
-    l1 -->|"Compaction"| l2
-```
-
 ### ASCII LSM Structure
 
 ```
@@ -590,61 +391,6 @@ flowchart TD
 │  LEVEL N (Bottom level)                                                     │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
-```
-
-### Compaction Flowchart
-
-```mermaid
-flowchart TD
-    subgraph trigger [Trigger]
-        CalcScores[Calculate Compaction Scores]
-        L0Score["L0: max(file_count/trigger, bytes/max)"]
-        LnScore["L1+: level_bytes / target_bytes"]
-        SelectLevel{Score >= 1.0?}
-    end
-    
-    subgraph select [File Selection]
-        SelectFile[Select File by Priority]
-        Priority["ByCompensatedSize<br/>OldestSmallestSeqFirst"]
-        ExpandRange[Expand Overlapping Range]
-        SelectTarget[Select Target Level Files]
-    end
-    
-    subgraph execute [Execution]
-        HideTables[Hide Tables in Manifest]
-        CreateIter[Create Merge Iterator]
-        CompIter[CompactionIterator Process]
-        SnapshotCheck{Visible to Snapshot?}
-        Keep[Keep Version]
-        Drop[Drop Version]
-        WriteSst[Write New SSTable]
-    end
-    
-    subgraph finish [Finish]
-        UpdateManifest[Update Manifest Atomically]
-        CleanupFiles[Delete Old SSTable Files]
-    end
-    
-    CalcScores --> L0Score
-    CalcScores --> LnScore
-    L0Score --> SelectLevel
-    LnScore --> SelectLevel
-    SelectLevel -->|Yes| SelectFile
-    SelectLevel -->|No| Done[Sleep]
-    SelectFile --> Priority
-    Priority --> ExpandRange
-    ExpandRange --> SelectTarget
-    SelectTarget --> HideTables
-    HideTables --> CreateIter
-    CreateIter --> CompIter
-    CompIter --> SnapshotCheck
-    SnapshotCheck -->|Yes| Keep
-    SnapshotCheck -->|No| Drop
-    Keep --> WriteSst
-    Drop --> WriteSst
-    WriteSst --> UpdateManifest
-    UpdateManifest --> CleanupFiles
-    CleanupFiles --> CalcScores
 ```
 
 ### ASCII Compaction Flow
@@ -825,58 +571,6 @@ File rotation when size >= vlog_max_file_size (default: 256MB)
 
 VLog files accumulate stale entries as values are overwritten or deleted. Garbage collection reclaims this space.
 
-### GC Trigger and Flow
-
-```mermaid
-flowchart TD
-    subgraph tracking [During Compaction]
-        DropEntry[Entry Dropped by Compaction]
-        UpdateDiscard[Update Discard Stats]
-        AddDeleteList[Add to DeleteList B+tree]
-    end
-    
-    subgraph trigger [GC Trigger]
-        CheckRatio{discard_ratio >= threshold?}
-        Threshold["threshold default: 0.5 (50%)"]
-        SelectFile[Select Candidate VLog File]
-    end
-    
-    subgraph gc [GC Process]
-        CheckIterators{Active Iterators?}
-        Wait[Wait for Iterators]
-        ScanFile[Scan VLog File Sequentially]
-        CheckEntry{Entry in DeleteList?}
-        Skip[Skip Stale Entry]
-        Copy[Copy Live Entry to New File]
-        NextEntry[Next Entry]
-    end
-    
-    subgraph finish [Finish]
-        ReplaceFile[Atomic File Replacement]
-        DeleteOld[Delete Old VLog File]
-        UpdateStats[Clear Discard Stats]
-    end
-    
-    DropEntry --> UpdateDiscard
-    UpdateDiscard --> AddDeleteList
-    AddDeleteList --> CheckRatio
-    CheckRatio -->|No| Done[Skip GC]
-    CheckRatio -->|Yes| SelectFile
-    SelectFile --> CheckIterators
-    CheckIterators -->|Yes| Wait
-    Wait --> CheckIterators
-    CheckIterators -->|No| ScanFile
-    ScanFile --> CheckEntry
-    CheckEntry -->|Yes| Skip
-    CheckEntry -->|No| Copy
-    Skip --> NextEntry
-    Copy --> NextEntry
-    NextEntry -->|More| CheckEntry
-    NextEntry -->|Done| ReplaceFile
-    ReplaceFile --> DeleteOld
-    DeleteOld --> UpdateStats
-```
-
 ### ASCII GC Flow
 
 ```
@@ -951,57 +645,6 @@ flowchart TD
 ## Recovery
 
 When SurrealKV starts, it recovers the database state from disk by loading the manifest and replaying the WAL.
-
-### Recovery Flowchart
-
-```mermaid
-flowchart TD
-    subgraph init [Initialization]
-        AcquireLock[Acquire Lock File]
-        LoadManifest[Load Level Manifest]
-        GetMinWal[Get min_wal_number from Manifest]
-    end
-    
-    subgraph wal [WAL Replay]
-        ListWal[List WAL segments >= min_wal_number]
-        ReplayLoop[Replay Each Segment]
-        ReadRecord[Read Record from WAL]
-        Corruption{Corruption?}
-        RepairMode{Repair Mode?}
-        Repair[Truncate Corrupted Tail]
-        Fail[Return Error]
-        ApplyRecord[Apply to MemTable]
-        MemTableFull{MemTable Full?}
-        FlushMem[Flush to SSTable]
-    end
-    
-    subgraph finish [Finalization]
-        SetSeqNum[Set visible_seq_num]
-        CleanupOrphans[Cleanup Orphaned Files]
-        StartBackground[Start Background Tasks]
-        Ready[Database Ready]
-    end
-    
-    AcquireLock --> LoadManifest
-    LoadManifest --> GetMinWal
-    GetMinWal --> ListWal
-    ListWal --> ReplayLoop
-    ReplayLoop --> ReadRecord
-    ReadRecord --> Corruption
-    Corruption -->|Yes| RepairMode
-    RepairMode -->|TolerateWithRepair| Repair
-    RepairMode -->|AbsoluteConsistency| Fail
-    Repair --> ApplyRecord
-    Corruption -->|No| ApplyRecord
-    ApplyRecord --> MemTableFull
-    MemTableFull -->|Yes| FlushMem
-    FlushMem --> ReadRecord
-    MemTableFull -->|No| ReadRecord
-    ReadRecord -->|Done| SetSeqNum
-    SetSeqNum --> CleanupOrphans
-    CleanupOrphans --> StartBackground
-    StartBackground --> Ready
-```
 
 ### ASCII Recovery Flow
 
@@ -1089,44 +732,6 @@ flowchart TD
 ## Checkpoint and Restore
 
 Checkpoints create consistent point-in-time snapshots for backup and recovery.
-
-### Checkpoint Creation
-
-```mermaid
-flowchart TD
-    subgraph prep [Preparation]
-        Flush[Flush Active MemTable]
-        WaitFlush[Wait for Immutable Flush]
-        GetSeqNum[Capture Sequence Number]
-    end
-    
-    subgraph copy [Copy Phase]
-        CreateDir[Create Checkpoint Directory]
-        CopySST[Copy All SSTables]
-        CopyWAL[Copy WAL Segments]
-        CopyManifest[Copy Manifest]
-        CopyVLog[Copy VLog Files]
-        CopyDeleteList[Copy DeleteList]
-        CopyDiscardStats[Copy DiscardStats]
-    end
-    
-    subgraph meta [Metadata]
-        WriteMetadata[Write Checkpoint Metadata]
-        Metadata["- timestamp<br/>- sequence_number<br/>- sstable_count<br/>- total_size"]
-    end
-    
-    Flush --> WaitFlush
-    WaitFlush --> GetSeqNum
-    GetSeqNum --> CreateDir
-    CreateDir --> CopySST
-    CopySST --> CopyWAL
-    CopyWAL --> CopyManifest
-    CopyManifest --> CopyVLog
-    CopyVLog --> CopyDeleteList
-    CopyDeleteList --> CopyDiscardStats
-    CopyDiscardStats --> WriteMetadata
-    WriteMetadata --> Metadata
-```
 
 ### ASCII Checkpoint Flow
 
