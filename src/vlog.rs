@@ -1445,12 +1445,12 @@ impl VLogGCManager {
 /// With 10K entries, batch is ~1MB which safely fits in default 100MB memtable.
 const DELETE_LIST_CHUNK_SIZE: usize = 10_000;
 
-/// Global Delete List using B+ Tree
-/// Uses a dedicated B+ tree for tracking stale user keys.
+/// Global Delete List using a dedicated LSM tree.
+/// Uses a separate LSM tree for tracking stale sequence numbers.
 /// This provides better performance and consistency with the main LSM tree
 /// design.
 pub(crate) struct DeleteList {
-	/// B+ tree for storing delete list entries (user_key -> value_size)
+	/// LSM tree for storing delete list entries (seq_num -> value_size)
 	tree: Arc<Tree>,
 }
 
