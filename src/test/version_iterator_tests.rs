@@ -96,17 +96,17 @@ async fn test_history_multiple_versions_single_key() {
 	// Insert key1 three times with different values
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1_v1", 100).unwrap();
+		tx.set_at(b"key1", b"value1_v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1_v2", 200).unwrap();
+		tx.set_at(b"key1", b"value1_v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1_v3", 300).unwrap();
+		tx.set_at(b"key1", b"value1_v3", 300).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -139,36 +139,36 @@ async fn test_history_multiple_keys_multiple_versions() {
 	// Insert key1 (2 versions)
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"key1_v1", 100).unwrap();
+		tx.set_at(b"key1", b"key1_v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"key1_v2", 200).unwrap();
+		tx.set_at(b"key1", b"key1_v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
 	// Insert key2 (1 version)
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key2", b"key2_v1", 150).unwrap();
+		tx.set_at(b"key2", b"key2_v1", 150).unwrap();
 		tx.commit().await.unwrap();
 	}
 
 	// Insert key3 (3 versions)
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key3", b"key3_v1", 50).unwrap();
+		tx.set_at(b"key3", b"key3_v1", 50).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key3", b"key3_v2", 250).unwrap();
+		tx.set_at(b"key3", b"key3_v2", 250).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key3", b"key3_v3", 350).unwrap();
+		tx.set_at(b"key3", b"key3_v3", 350).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -211,7 +211,7 @@ async fn test_history_excludes_tombstones() {
 	// Insert key1 v1
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1", 100).unwrap();
+		tx.set_at(b"key1", b"value1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -225,7 +225,7 @@ async fn test_history_excludes_tombstones() {
 	// Insert key2
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key2", b"value2", 200).unwrap();
+		tx.set_at(b"key2", b"value2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -258,7 +258,7 @@ async fn test_history_with_tombstones() {
 	// Insert key1 v1
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1", 100).unwrap();
+		tx.set_at(b"key1", b"value1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -272,7 +272,7 @@ async fn test_history_with_tombstones() {
 	// Insert key2
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key2", b"value2", 200).unwrap();
+		tx.set_at(b"key2", b"value2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -305,21 +305,21 @@ async fn test_history_replace_shows_all_versions() {
 	// Insert key1=v1
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"v1", 100).unwrap();
+		tx.set_at(b"key1", b"v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
 	// Replace key1=v2
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"v2", 200).unwrap();
+		tx.set_at(b"key1", b"v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
 	// Replace key1=v3
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"v3", 300).unwrap();
+		tx.set_at(b"key1", b"v3", 300).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -346,7 +346,7 @@ async fn test_history_soft_delete_vs_hard_delete() {
 	// Insert key1 v1
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1", 100).unwrap();
+		tx.set_at(b"key1", b"value1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -360,7 +360,7 @@ async fn test_history_soft_delete_vs_hard_delete() {
 	// Insert key2
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key2", b"value2", 200).unwrap();
+		tx.set_at(b"key2", b"value2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -405,7 +405,7 @@ async fn test_history_bounds() {
 	// Insert keys a through e
 	for key in [b"key_a", b"key_b", b"key_c", b"key_d", b"key_e"] {
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(key, b"value", 100).unwrap();
+		tx.set_at(key, b"value", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -430,8 +430,8 @@ async fn test_history_empty_range() {
 	// Insert key_a and key_b
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key_a", b"value_a", 100).unwrap();
-		tx.set_at_version(b"key_b", b"value_b", 100).unwrap();
+		tx.set_at(b"key_a", b"value_a", 100).unwrap();
+		tx.set_at(b"key_b", b"value_b", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -454,20 +454,20 @@ async fn test_history_single_key_match() {
 	// Insert key_a (2 versions)
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key_a", b"v1", 100).unwrap();
+		tx.set_at(b"key_a", b"v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key_a", b"v2", 200).unwrap();
+		tx.set_at(b"key_a", b"v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
 	// Insert key_b and key_c
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key_b", b"value_b", 150).unwrap();
-		tx.set_at_version(b"key_c", b"value_c", 150).unwrap();
+		tx.set_at(b"key_b", b"value_b", 150).unwrap();
+		tx.set_at(b"key_c", b"value_c", 150).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -495,22 +495,22 @@ async fn test_history_interleaved_iteration() {
 	// Insert key1 (2 versions) and key2 (2 versions)
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"key1_v1", 100).unwrap();
+		tx.set_at(b"key1", b"key1_v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"key1_v2", 200).unwrap();
+		tx.set_at(b"key1", b"key1_v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key2", b"key2_v1", 150).unwrap();
+		tx.set_at(b"key2", b"key2_v1", 150).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key2", b"key2_v2", 250).unwrap();
+		tx.set_at(b"key2", b"key2_v2", 250).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -568,7 +568,7 @@ async fn test_history_seek_middle() {
 		let mut tx = store.begin().unwrap();
 		let key = format!("key{i}");
 		let value = format!("value{i}");
-		tx.set_at_version(key.as_bytes(), value.as_bytes(), i as u64 * 100).unwrap();
+		tx.set_at(key.as_bytes(), value.as_bytes(), i as u64 * 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -610,17 +610,17 @@ async fn test_history_backward_iteration() {
 	// Insert multiple keys with multiple versions
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"key1_v1", 100).unwrap();
+		tx.set_at(b"key1", b"key1_v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"key1_v2", 200).unwrap();
+		tx.set_at(b"key1", b"key1_v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key2", b"key2_v1", 150).unwrap();
+		tx.set_at(b"key2", b"key2_v1", 150).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -651,7 +651,7 @@ async fn test_history_snapshot_isolation() {
 	// Insert key1 v1
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"v1", 100).unwrap();
+		tx.set_at(b"key1", b"v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -661,7 +661,7 @@ async fn test_history_snapshot_isolation() {
 	// Insert key1 v2
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"v2", 200).unwrap();
+		tx.set_at(b"key1", b"v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -698,7 +698,7 @@ async fn test_history_many_versions() {
 	for i in 0..100 {
 		let mut tx = store.begin().unwrap();
 		let value = format!("value_{i:03}");
-		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 10).unwrap();
+		tx.set_at(b"key1", value.as_bytes(), i as u64 * 10).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -727,17 +727,17 @@ async fn test_history_timestamps() {
 	// Note: seq_num order != timestamp order
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"ts_100", 100).unwrap();
+		tx.set_at(b"key1", b"ts_100", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"ts_50", 50).unwrap();
+		tx.set_at(b"key1", b"ts_50", 50).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"ts_200", 200).unwrap();
+		tx.set_at(b"key1", b"ts_200", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -770,7 +770,7 @@ async fn test_history_entry_method() {
 	// Insert a key
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1", 100).unwrap();
+		tx.set_at(b"key1", b"value1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -819,14 +819,14 @@ async fn test_get_at_lsm_fallback() {
 	// Insert key at ts=100
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value_100", 100).unwrap();
+		tx.set_at(b"key1", b"value_100", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
 	// Insert key at ts=200
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value_200", 200).unwrap();
+		tx.set_at(b"key1", b"value_200", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -863,7 +863,7 @@ async fn test_get_at_lsm_tombstone() {
 	// Insert key at ts=100
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value_100", 100).unwrap();
+		tx.set_at(b"key1", b"value_100", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -877,7 +877,7 @@ async fn test_get_at_lsm_tombstone() {
 	// Insert at ts=300
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value_300", 300).unwrap();
+		tx.set_at(b"key1", b"value_300", 300).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -928,7 +928,7 @@ async fn test_history_transaction_states() {
 	// Insert some data
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1", 100).unwrap();
+		tx.set_at(b"key1", b"value1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -963,12 +963,12 @@ async fn test_history_with_btree_index() {
 	// Insert key1 multiple times
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"v1", 100).unwrap();
+		tx.set_at(b"key1", b"v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"v2", 200).unwrap();
+		tx.set_at(b"key1", b"v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -996,7 +996,7 @@ async fn test_history_survives_memtable_flush() {
 	for i in 1..=3 {
 		let mut tx = store.begin().unwrap();
 		let value = format!("v{i}");
-		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.set_at(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -1036,12 +1036,12 @@ async fn test_replace_cuts_off_history_with_versioning() {
 	// Insert key1 with SET operations
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"set_v1", 100).unwrap();
+		tx.set_at(b"key1", b"set_v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"set_v2", 200).unwrap();
+		tx.set_at(b"key1", b"set_v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -1093,7 +1093,7 @@ async fn test_multiple_replaces_preserved_with_versioning() {
 	// Insert with SET first
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"set_v1", 100).unwrap();
+		tx.set_at(b"key1", b"set_v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -1154,7 +1154,7 @@ async fn test_replace_after_delete_with_versioning() {
 	// Insert key1
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"set_v1", 100).unwrap();
+		tx.set_at(b"key1", b"set_v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -1202,7 +1202,7 @@ async fn test_versions_survive_compaction() {
 	for i in 1..=5 {
 		let mut tx = store.begin().unwrap();
 		let value = format!("v{i}");
-		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.set_at(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -1221,7 +1221,7 @@ async fn test_versions_survive_compaction() {
 	for i in 6..=10 {
 		let mut tx = store.begin().unwrap();
 		let value = format!("v{i}");
-		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.set_at(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -1250,17 +1250,17 @@ async fn test_history_lsm_multiple_versions() {
 	// Insert key1 three times with different values
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1_v1", 100).unwrap();
+		tx.set_at(b"key1", b"value1_v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1_v2", 200).unwrap();
+		tx.set_at(b"key1", b"value1_v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1_v3", 300).unwrap();
+		tx.set_at(b"key1", b"value1_v3", 300).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -1293,17 +1293,17 @@ async fn test_history_btree_multiple_versions() {
 	// Insert key1 three times with different values
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1_v1", 100).unwrap();
+		tx.set_at(b"key1", b"value1_v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1_v2", 200).unwrap();
+		tx.set_at(b"key1", b"value1_v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"value1_v3", 300).unwrap();
+		tx.set_at(b"key1", b"value1_v3", 300).unwrap();
 		tx.commit().await.unwrap();
 	}
 
@@ -1330,17 +1330,17 @@ async fn test_history_bidirectional_iteration() {
 	// Insert multiple keys with multiple versions
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"key1_v1", 100).unwrap();
+		tx.set_at(b"key1", b"key1_v1", 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key1", b"key1_v2", 200).unwrap();
+		tx.set_at(b"key1", b"key1_v2", 200).unwrap();
 		tx.commit().await.unwrap();
 	}
 	{
 		let mut tx = store.begin().unwrap();
-		tx.set_at_version(b"key2", b"key2_v1", 150).unwrap();
+		tx.set_at(b"key2", b"key2_v1", 150).unwrap();
 		tx.commit().await.unwrap();
 	}
 

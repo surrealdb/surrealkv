@@ -1064,7 +1064,7 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 	for (i, ts) in [1000, 2000, 3000, 4000].iter().enumerate() {
 		let value = format!("value_{}_large_data", i).repeat(50); // Large value to fill VLog
 		let mut tx = tree.begin().unwrap();
-		tx.set_at_version(user_key, value.as_bytes(), *ts).unwrap();
+		tx.set_at(user_key, value.as_bytes(), *ts).unwrap();
 		tx.commit().await.unwrap();
 		tree.flush().unwrap(); // Force flush after each version
 	}
@@ -1072,7 +1072,7 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 	// Insert and delete a different key to create stale entries
 	{
 		let mut tx = tree.begin().unwrap();
-		tx.set_at_version(b"other_key", b"other_value_large_data".repeat(50), 5000).unwrap();
+		tx.set_at(b"other_key", b"other_value_large_data".repeat(50), 5000).unwrap();
 		tx.commit().await.unwrap();
 		tree.flush().unwrap();
 
