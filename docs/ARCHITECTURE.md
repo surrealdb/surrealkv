@@ -131,7 +131,7 @@ database_path/
 │   ├── 00000000000000000001.vlog
 │   └── 00000000000000000002.vlog
 ├── discard_stats/          # VLog discard statistics
-├── delete_list/            # VLog delete tracking (B+tree)
+├── delete_list/            # VLog delete tracking (LSM tree)
 ├── versioned_index/        # B+tree index (if enabled)
 └── LOCK                    # Lock file
 ```
@@ -834,7 +834,7 @@ Over time, VLog files can become mostly garbage, wasting disk space. GC reclaims
 During LSM compaction, when a VLog entry is dropped (either superseded by a newer version or deleted), two things happen:
 
 1. **DiscardStats**: The size of the dropped entry is added to a per-file counter
-2. **DeleteList**: The (seq_num, value_size) pair is recorded in a B+tree
+2. **DeleteList**: The (seq_num, value_size) pair is recorded in a separate LSM tree
 
 This dual tracking enables efficient GC:
 - DiscardStats determines which files are worth GC'ing (cost-benefit analysis)
@@ -847,7 +847,7 @@ This dual tracking enables efficient GC:
 │  When a VLog entry is dropped (superseded or deleted):                      │
 │                                                                             │
 │  1. Update discard_stats[file_id] += entry_size                             │
-│  2. Add (seq_num, value_size) to DeleteList B+tree                          │
+│  2. Add (seq_num, value_size) to DeleteList LSM tree                        │
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
@@ -904,7 +904,7 @@ This dual tracking enables efficient GC:
 | Component | Purpose | Storage |
 |-----------|---------|---------|
 | **DiscardStats** | Tracks discardable bytes per VLog file | `discard_stats/` directory |
-| **DeleteList** | B+tree tracking stale (seq_num, size) pairs | `delete_list/` directory |
+| **DeleteList** | LSM tree tracking stale (seq_num, size) pairs | `delete_list/` directory |
 | **VLogGCManager** | Background task managing GC execution | In-memory |
 
 ### GC Algorithm Details
@@ -1040,10 +1040,6 @@ The WAL uses a block-based format inspired by LevelDB/RocksDB. Each block is 32K
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-**Why 32KB blocks?**
-
-Fixed-size blocks simplify recovery: if corruption is detected, the reader can skip to the next block boundary and continue. This limits data loss to at most one block (32KB) rather than the entire WAL.
-
 **Record Fragmentation:**
 
 Large records that don't fit in the remaining space of a block are split:
@@ -1170,40 +1166,3 @@ A checkpoint must capture a consistent state. The active memtable contains uncom
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Checkpoint Guarantees
-
-| Property | Description |
-|----------|-------------|
-| **Atomic** | Either all files are copied successfully, or the checkpoint fails entirely |
-| **Consistent** | All files represent the exact same point in time (after flush completes) |
-| **Non-blocking** | Reads and writes continue during checkpoint creation |
-| **Immutable** | Checkpoint files are never modified after creation |
-
-### Non-Blocking Checkpoints
-
-Checkpoints don't block database operations because:
-
-1. **SSTables are immutable**: Once written, they never change. The checkpoint copies existing files while new writes go to the memtable.
-2. **Copy-on-write semantics**: If compaction creates new SSTables during checkpoint, both old and new files coexist until checkpoint completes.
-3. **Flush before copy**: By flushing the memtable first, all committed data is in SSTables before copying begins.
-
-### Restore Implications
-
-Restoring from a checkpoint has important implications:
-
-- **Data loss**: All data written after the checkpoint is permanently lost
-- **Sequence number reset**: The database's sequence counter resets to the checkpoint's value
-- **Active transactions fail**: Any in-progress transactions will fail after restore
-- **Connection handling**: Applications should reconnect after restore completes
-
-### Storage Considerations
-
-Checkpoints require significant disk space:
-- Each checkpoint is a complete copy of the database
-- Storage required = current database size + checkpoint size
-- Consider incremental backup strategies for very large databases
-
-For large databases, consider:
-- Hard-linking SSTables instead of copying (same filesystem only)
-- Streaming directly to remote storage during checkpoint
-- Scheduled checkpoints during low-activity periods
