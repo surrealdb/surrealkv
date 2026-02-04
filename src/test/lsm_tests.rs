@@ -1173,7 +1173,6 @@ async fn test_vlog_concurrent_operations() {
 	}
 
 	// Force flush to ensure all data is persisted
-	tree.flush().unwrap();
 	tree.close().await.unwrap();
 
 	let tree = Arc::new(tree);

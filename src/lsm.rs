@@ -1556,7 +1556,8 @@ impl Tree {
 
 	/// Flushes all memtables to disk synchronously.
 	/// This is a blocking operation that ensures all data is persisted before returning.
-	pub fn flush(&self) -> Result<()> {
+	#[cfg(test)]
+	pub(crate) fn flush(&self) -> Result<()> {
 		// Step 1: Rotate active memtable if it has data
 		{
 			let active = self.core.inner.active_memtable.read()?;
