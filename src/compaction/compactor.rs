@@ -9,6 +9,7 @@ use crate::iter::{BoxedInternalIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lsm::CoreInner;
 use crate::memtable::ImmutableMemtables;
+use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::vlog::VLog;
@@ -52,6 +53,12 @@ pub(crate) struct CompactionOptions {
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 	pub(crate) vlog: Option<Arc<VLog>>,
 	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
+	/// Snapshot tracker for snapshot-aware compaction.
+	///
+	/// During compaction, we query this to get the list of active snapshot
+	/// sequence numbers. Versions visible to any active snapshot must be
+	/// preserved (unless hidden by a newer version in the same visibility boundary).
+	pub(crate) snapshot_tracker: SnapshotTracker,
 }
 
 impl CompactionOptions {
@@ -62,6 +69,7 @@ impl CompactionOptions {
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			vlog: tree.vlog.clone(),
 			error_handler: Arc::clone(&tree.error_handler),
+			snapshot_tracker: tree.snapshot_tracker.clone(),
 		}
 	}
 }
@@ -171,7 +179,12 @@ impl Compactor {
 		let mut writer =
 			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
 
-		// Create a compaction iterator that filters tombstones
+		// Get active snapshots for snapshot-aware compaction
+		// This is a snapshot of the snapshot list at the start of compaction.
+		// Any snapshots created during compaction will be handled by the next compaction.
+		let snapshots = self.options.snapshot_tracker.get_all_snapshots();
+
+		// Create a compaction iterator that filters tombstones and respects snapshots
 		let max_level = self.options.lopts.level_count - 1;
 		let is_bottom_level = input.target_level >= max_level;
 		let mut comp_iter = CompactionIterator::new(
@@ -182,6 +195,7 @@ impl Compactor {
 			self.options.lopts.enable_versioning,
 			self.options.lopts.versioned_history_retention_ns,
 			Arc::clone(&self.options.lopts.clock),
+			snapshots,
 		);
 
 		let mut entries = 0;
