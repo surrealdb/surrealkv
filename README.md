@@ -287,12 +287,12 @@ let tree = TreeBuilder::with_options(opts).build()?;
 ```rust
 // Write data with explicit timestamps
 let mut tx = tree.begin()?;
-tx.set_at_version(b"key1", b"value_v1", 100)?;
+tx.set_at(b"key1", b"value_v1", 100)?;
 tx.commit().await?;
 
 // Update with a new version at a later timestamp
 let mut tx = tree.begin()?;
-tx.set_at_version(b"key1", b"value_v2", 200)?;
+tx.set_at(b"key1", b"value_v2", 200)?;
 tx.commit().await?;
 ```
 

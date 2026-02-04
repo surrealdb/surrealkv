@@ -15,6 +15,7 @@ use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::CompactionIterator;
 use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
 use crate::memtable::ImmutableMemtables;
+use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
 use crate::vlog::ValueLocation;
 use crate::{CompressionType, InternalIterator, InternalKey, InternalKeyKind, Key, Options, Value};
@@ -219,6 +220,7 @@ fn create_compaction_options(
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 		vlog: Some(vlog),
 		error_handler: Arc::new(BackgroundErrorHandler::new()),
+		snapshot_tracker: SnapshotTracker::new(),
 	}
 }
 
@@ -1902,6 +1904,7 @@ fn test_tombstone_propagation_journey() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
+		vec![],
 	);
 	let non_bottom_result: Vec<_> = comp_iter_non_bottom.by_ref().map(|r| r.unwrap()).collect();
 
@@ -1924,6 +1927,7 @@ fn test_tombstone_propagation_journey() {
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
+		vec![],
 	);
 	let bottom_result: Vec<_> = comp_iter_bottom.by_ref().map(|r| r.unwrap()).collect();
 

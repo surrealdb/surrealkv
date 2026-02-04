@@ -313,7 +313,7 @@ impl Transaction {
 	}
 
 	/// Inserts a key-value pair at with a specific timestamp.
-	pub fn set_at_version<K, V>(&mut self, key: K, value: V, timestamp: u64) -> Result<()>
+	pub fn set_at<K, V>(&mut self, key: K, value: V, timestamp: u64) -> Result<()>
 	where
 		K: IntoBytes,
 		V: IntoBytes,
@@ -376,7 +376,7 @@ impl Transaction {
 
 	/// Soft deletes a key at a specific timestamp. This will add a tombstone at
 	/// the specified timestamp.
-	pub fn soft_delete_at_version<K>(&mut self, key: K, timestamp: u64) -> Result<()>
+	pub fn soft_delete_at<K>(&mut self, key: K, timestamp: u64) -> Result<()>
 	where
 		K: IntoBytes,
 	{
@@ -684,7 +684,7 @@ impl Transaction {
 				// overwrite it with the new value (same savepoint = same transaction state).
 				// For different savepoints, we add a new entry to support savepoint rollbacks.
 				//
-				// Exception: When using explicit timestamps (set_at_version), entries with
+				// Exception: When using explicit timestamps (set_at), entries with
 				// different timestamps should be preserved as separate versions, not replaced.
 				if let Some(last_entry) = entries.last() {
 					if last_entry.savepoint_no == e.savepoint_no {
@@ -758,7 +758,7 @@ impl Transaction {
 
 		// Add all entries to the batch
 		for entry in latest_writes {
-			// Use the entry's timestamp if it was explicitly set (via set_at_version),
+			// Use the entry's timestamp if it was explicitly set (via set_at),
 			// otherwise use the commit timestamp
 			let timestamp = if entry.timestamp != Entry::COMMIT_TIME {
 				entry.timestamp

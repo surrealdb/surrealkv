@@ -3,9 +3,45 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::clock::LogicalClock;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::{Comparator, InternalIterator, InternalKey, InternalKeyRef, Value};
+
+// ============================================================================
+// SNAPSHOT VISIBILITY
+// ============================================================================
+
+/// Represents the visibility state of a version with respect to active snapshots.
+///
+/// This enum is used during compaction to determine whether a version must be
+/// preserved for snapshot isolation or can be garbage collected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SnapshotVisibility {
+	/// Version is bounded by a specific snapshot boundary.
+	///
+	/// The contained value is the sequence number of the earliest snapshot
+	/// that can see this version. This version is actually visible to ALL
+	/// snapshots >= this value, but the earliest one defines the visibility
+	/// boundary used for compaction grouping.
+	///
+	/// This version must be preserved unless a newer version exists in the
+	/// same visibility boundary (in which case the newer version supersedes it).
+	BoundedBySnapshot(u64),
+
+	/// No active snapshots exist.
+	///
+	/// When there are no snapshots, visibility is determined solely by
+	/// retention rules. Only the latest version needs to be kept (unless
+	/// versioning is enabled).
+	NoActiveSnapshots,
+
+	/// Version has a sequence number higher than all active snapshots.
+	///
+	/// This version was written after all currently active snapshots were created,
+	/// so it is not visible to any existing snapshot. It can be dropped
+	/// if a newer version exists in the same visibility boundary.
+	NewerThanAllSnapshots,
+}
 
 /// Boxed internal iterator type for dynamic dispatch.
 ///
@@ -759,6 +795,14 @@ pub(crate) struct CompactionIterator<'a> {
 
 	/// Whether the iterator has been initialized.
 	initialized: bool,
+
+	// ========== Snapshot-Aware Compaction ==========
+	/// Sorted list of active snapshot sequence numbers.
+	///
+	/// Used to implement snapshot-aware compaction. Versions visible to any
+	/// active snapshot must be preserved. The list is sorted in ascending
+	/// order for efficient binary search.
+	snapshots: Vec<u64>,
 }
 
 impl<'a> CompactionIterator<'a> {
@@ -772,6 +816,8 @@ impl<'a> CompactionIterator<'a> {
 	/// * `enable_versioning` - Whether to keep multiple versions
 	/// * `retention_period_ns` - How long to keep old versions
 	/// * `clock` - Time source for retention calculations
+	/// * `snapshots` - Sorted list of active snapshot sequence numbers
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		iterators: Vec<BoxedInternalIterator<'a>>,
 		cmp: Arc<dyn Comparator>,
@@ -780,6 +826,7 @@ impl<'a> CompactionIterator<'a> {
 		enable_versioning: bool,
 		retention_period_ns: u64,
 		clock: Arc<dyn LogicalClock>,
+		snapshots: Vec<u64>,
 	) -> Self {
 		let merge_iter = MergingIterator::new(iterators, cmp);
 
@@ -796,6 +843,7 @@ impl<'a> CompactionIterator<'a> {
 			retention_period_ns,
 			clock,
 			initialized: false,
+			snapshots,
 		}
 	}
 
@@ -819,11 +867,137 @@ impl<'a> CompactionIterator<'a> {
 		Ok(())
 	}
 
+	// ========== Snapshot Visibility Methods ==========
+
+	/// Find the earliest snapshot that can see a version with the given sequence number.
+	///
+	/// This implements the core snapshot visibility check for snapshot-aware compaction.
+	/// For a version to be visible to a snapshot, its sequence number must be less
+	/// than or equal to the snapshot's sequence number.
+	///
+	/// # Arguments
+	/// * `seq_num` - The sequence number of the version to check
+	///
+	/// # Returns
+	/// * `Ok(SnapshotVisibility::BoundedBySnapshot(snap_seq))` - Version is bounded by snapshot
+	///   `snap_seq` (the earliest snapshot that can see it). The version is actually visible to all
+	///   snapshots >= `snap_seq`, but `snap_seq` defines the visibility boundary.
+	/// * `Ok(SnapshotVisibility::NoActiveSnapshots)` - No snapshots exist
+	/// * `Ok(SnapshotVisibility::NewerThanAllSnapshots)` - Version is newer than all snapshots
+	///
+	/// # Errors
+	/// Returns an error if the sequence number is invalid (zero).
+	fn find_earliest_visible_snapshot(&self, seq_num: u64) -> Result<SnapshotVisibility> {
+		// Fast path: no active snapshots
+		if self.snapshots.is_empty() {
+			return Ok(SnapshotVisibility::NoActiveSnapshots);
+		}
+
+		// Validate seq_num is reasonable (not zero, which is invalid)
+		if seq_num == 0 {
+			return Err(Error::InvalidArgument(
+				"Sequence number 0 is invalid for snapshot visibility check".to_string(),
+			));
+		}
+
+		// Binary search to find earliest snapshot >= seq_num
+		// A snapshot S can see version V if V.seq_num <= S.seq_num
+		// So the earliest snapshot that can see V is the smallest S where S >= V.seq_num
+		match self.snapshots.binary_search(&seq_num) {
+			// Exact match: a snapshot exists at exactly this sequence number.
+			// That snapshot can see this version (since snap.seq >= version.seq).
+			Ok(idx) => Ok(SnapshotVisibility::BoundedBySnapshot(self.snapshots[idx])),
+
+			// No exact match found. Rust's binary_search returns Err(idx) where idx
+			// is the insertion point - the index where seq_num would be inserted
+			// to maintain sorted order. This means:
+			//   - All snapshots before idx have seq < seq_num (can't see this version)
+			//   - All snapshots at/after idx have seq > seq_num (can see this version)
+			Err(idx) => {
+				if idx < self.snapshots.len() {
+					// There's at least one snapshot with seq > seq_num.
+					// The snapshot at idx is the earliest one that can see this version.
+					Ok(SnapshotVisibility::BoundedBySnapshot(self.snapshots[idx]))
+				} else {
+					// idx == len means seq_num is greater than ALL snapshot sequence numbers.
+					// No existing snapshot can see this version.
+					Ok(SnapshotVisibility::NewerThanAllSnapshots)
+				}
+			}
+		}
+	}
+
+	/// Determines if two versions of the same key are in the same visibility boundary.
+	///
+	/// # What is a Visibility Boundary?
+	///
+	/// A visibility boundary groups versions that are indistinguishable from the
+	/// perspective of active snapshots. Two versions in the same boundary are visible
+	/// to exactly the same set of snapshots, meaning:
+	/// - If any snapshot can see the older version, it can also see the newer version
+	/// - Therefore, the newer version "hides" the older one for all observers
+	/// - The older version can be safely dropped during compaction
+	///
+	/// # Visual Example
+	///
+	///
+	/// Snapshots:        S1=50         S2=100        S3=150
+	///                    |             |             |
+	/// Timeline:    ─────┼─────────────┼─────────────┼─────────────>
+	///                    |             |             |
+	/// Versions:    v1=30 |  v2=75      |  v3=120     |  v4=180
+	///                    |             |             |
+	/// Boundaries:  [─────]  [─────────]  [──────────]  [────────>
+	///              visible  visible to   visible to   newer than
+	///              to S1+   S2 & S3      S3 only      all snapshots
+	fn same_visibility_boundary(
+		&self,
+		newer_vis: SnapshotVisibility,
+		older_vis: SnapshotVisibility,
+	) -> bool {
+		match (newer_vis, older_vis) {
+			// Both bounded by the same snapshot boundary - older is superseded by newer
+			(
+				SnapshotVisibility::BoundedBySnapshot(s1),
+				SnapshotVisibility::BoundedBySnapshot(s2),
+			) => s1 == s2,
+
+			// Both newer than all snapshots (no snapshot sees either) - older is hidden
+			(
+				SnapshotVisibility::NewerThanAllSnapshots,
+				SnapshotVisibility::NewerThanAllSnapshots,
+			) => true,
+
+			// No active snapshots - all versions in same "boundary" (only keep latest)
+			(SnapshotVisibility::NoActiveSnapshots, SnapshotVisibility::NoActiveSnapshots) => true,
+
+			// Different visibility states = different boundaries, must keep both
+			_ => false,
+		}
+	}
+
+	/// Check if a version must be preserved due to snapshot visibility.
+	///
+	/// A version must be preserved if it's the visible version for some active
+	/// snapshot (unless hidden by a newer version in the same visibility boundary).
+	#[inline]
+	fn must_preserve_for_snapshot(&self, visibility: SnapshotVisibility) -> bool {
+		matches!(visibility, SnapshotVisibility::BoundedBySnapshot(_))
+	}
+
 	/// Process all accumulated versions of the current key.
 	///
 	/// This is the heart of compaction logic. It decides:
 	/// - Which versions to keep (output_versions)
 	/// - Which versions to discard (delete_list, discard_stats)
+	///
+	/// # Snapshot-Aware Compaction
+	///
+	/// Before applying retention rules, we check snapshot visibility:
+	/// - A version visible to an active snapshot MUST be preserved
+	/// - Exception: A version can be dropped if a newer version exists in the same snapshot
+	///   "boundary" (both visible to the same earliest snapshot). The newer version supersedes the
+	///   older one.
 	///
 	/// # Decision Matrix
 	///
@@ -831,6 +1005,8 @@ impl<'a> CompactionIterator<'a> {
 	/// ┌─────────────────┬───────────────┬────────────────┬──────────────────┐
 	/// │ Scenario        │ Bottom Level? │ Versioning?    │ Action           │
 	/// ├─────────────────┼───────────────┼────────────────┼──────────────────┤
+	/// │ Visible to snap │ any           │ any            │ KEEP (unless hidden) │
+	/// │ Hidden by newer │ any           │ any            │ DROP             │
 	/// │ Latest PUT      │ any           │ any            │ KEEP             │
 	/// │ Latest DELETE   │ YES           │ any            │ DROP ALL         │
 	/// │ Latest DELETE   │ NO            │ any            │ KEEP (tombstone) │
@@ -839,6 +1015,26 @@ impl<'a> CompactionIterator<'a> {
 	/// │ Older PUT       │ any           │ YES, in window │ KEEP             │
 	/// │ Older PUT       │ any           │ YES, expired   │ DROP             │
 	/// └─────────────────┴───────────────┴────────────────┴──────────────────┘
+	/// ```
+	///
+	/// # Example: Snapshot-Aware Compaction
+	///
+	/// ```text
+	/// Snapshots: [50, 150]
+	///
+	/// Input:
+	///   ("key1", seq=200, PUT, "v4")  → NewerThanAllSnapshots
+	///   ("key1", seq=100, PUT, "v3")  → BoundedBySnapshot(150)
+	///   ("key1", seq=80,  PUT, "v2")  → BoundedBySnapshot(150) - same boundary as v3!
+	///   ("key1", seq=30,  PUT, "v1")  → BoundedBySnapshot(50)
+	///
+	/// Snapshot visibility analysis:
+	///   - v4: Latest, keep
+	///   - v3: Bounded by snap 150, different boundary from v4, KEEP
+	///   - v2: Same boundary as v3 (both bounded by 150), DROP (superseded by v3)
+	///   - v1: Bounded by snap 50, different boundary, KEEP
+	///
+	/// Output: [v4, v3, v1]
 	/// ```
 	///
 	/// # Example: DELETE at Bottom Level
@@ -867,7 +1063,7 @@ impl<'a> CompactionIterator<'a> {
 	///   ("key1", seq=50,  PUT, "v2", timestamp=now-30min)
 	///   ("key1", seq=20,  PUT, "v1", timestamp=now-2hours)
 	///
-	/// With versioning=true, retention=1hour:
+	/// With versioning=true, retention=1hour, no snapshots:
 	///   - seq=100: age=0, KEEP (latest)
 	///   - seq=50:  age=30min < 1hour, KEEP (within retention)
 	///   - seq=20:  age=2hours > 1hour, DROP (expired)
@@ -875,9 +1071,9 @@ impl<'a> CompactionIterator<'a> {
 	/// Output: [seq=100, seq=50]
 	/// delete_list: [seq=20]
 	/// ```
-	fn process_accumulated_versions(&mut self) {
+	fn process_accumulated_versions(&mut self) -> Result<()> {
 		if self.accumulated_versions.is_empty() {
-			return;
+			return Ok(());
 		}
 
 		// Sort by sequence number (descending) to get the latest version first
@@ -894,16 +1090,71 @@ impl<'a> CompactionIterator<'a> {
 		// REPLACE semantics: delete all older versions regardless of retention
 		let has_set_with_delete = self.accumulated_versions.iter().any(|(key, _)| key.is_replace());
 
-		// Process each version
-		for (i, (key, value)) in self.accumulated_versions.iter().enumerate() {
+		// Track the visibility of the previous (newer) version we processed.
+		// Used to detect when a newer version supersedes an older one.
+		let mut newer_version_visibility: Option<SnapshotVisibility> = None;
+
+		// We need to iterate with indices to access accumulated_versions
+		let len = self.accumulated_versions.len();
+		for i in 0..len {
+			let (key, value) = &self.accumulated_versions[i];
 			let is_hard_delete = key.is_hard_delete_marker();
 			let is_replace = key.is_replace();
 			let is_latest = i == 0;
+			let seq_num = key.seq_num();
 
-			// ===== DETERMINE IF ENTRY SHOULD BE MARKED STALE =====
+			// ===== SNAPSHOT-AWARE COMPACTION =====
+			//
+			// Goal: Drop old versions that no snapshot needs to see.
+			//
+			// A version is "superseded" when:
+			//   1. A newer version of the same key exists
+			//   2. Both versions have the same visibility boundary (i.e., visible to the same
+			//      earliest snapshot, or both invisible to all snapshots)
+			//   3. Therefore, any snapshot that could see the old version will see the newer one
+			//      instead - the old version is redundant
+			//
+			// Exception: When versioning is enabled and no snapshots exist, we keep
+			// old versions based on retention policy, not snapshot visibility.
+
+			let current_visibility = self.find_earliest_visible_snapshot(seq_num)?;
+
+			// Check if this version is superseded by a newer version
+			let superseded = if let Some(newer_vis) = newer_version_visibility {
+				// Can we drop superseded versions in this scenario?
+				let snapshot_allows_drop = match current_visibility {
+					// Active snapshots exist - use visibility boundaries to decide
+					SnapshotVisibility::BoundedBySnapshot(_) => true,
+					SnapshotVisibility::NewerThanAllSnapshots => true,
+					// No snapshots - only drop if versioning is disabled
+					// (with versioning enabled, retention policy decides instead)
+					SnapshotVisibility::NoActiveSnapshots => !self.enable_versioning,
+				};
+
+				// Superseded = not latest AND in same visibility boundary AND allowed to drop
+				snapshot_allows_drop
+					&& !is_latest && self.same_visibility_boundary(newer_vis, current_visibility)
+			} else {
+				// This is the first (newest) version - can't be superseded
+				false
+			};
+
+			// Is this version required by an active snapshot?
+			// (Only matters if not already superseded by a newer version)
+			let required_by_snapshot =
+				!superseded && self.must_preserve_for_snapshot(current_visibility);
+
+			// ===== DETERMINE IF ENTRY IS STALE =====
 			// Stale entries are added to delete_list for VLog garbage collection
 
-			let should_mark_stale = if latest_is_delete_at_bottom {
+			let should_mark_stale = if superseded {
+				// Superseded: a newer version in the same visibility boundary
+				// makes this version redundant - safe to drop
+				true
+			} else if required_by_snapshot {
+				// Required by snapshot: an active snapshot needs this version - keep it
+				false
+			} else if latest_is_delete_at_bottom {
 				// DELETE at bottom level: mark ALL versions as stale
 				// The entire key is being removed from the database
 				true
@@ -928,18 +1179,18 @@ impl<'a> CompactionIterator<'a> {
 			} else {
 				// Older PUT: check versioning and retention
 				if !self.enable_versioning {
-					// No versioning: only latest matters
+					// No versioning enabled: only the latest version matters,
+					// all older versions are stale
 					true
 				} else if self.retention_period_ns > 0 {
-					// Check retention period
+					// Versioning enabled with retention period:
+					// Keep versions within the retention window, drop older ones
 					let current_time = self.clock.now();
-					let key_timestamp = key.timestamp;
-					let age = current_time.saturating_sub(key_timestamp);
-					let is_within_retention = age <= self.retention_period_ns;
-					// Stale if OUTSIDE retention period
-					!is_within_retention
+					let age = current_time.saturating_sub(key.timestamp);
+					age > self.retention_period_ns
 				} else {
-					// retention_period_ns == 0: keep forever
+					// Versioning enabled, retention_period_ns == 0:
+					// Keep all versions forever
 					false
 				}
 			};
@@ -952,9 +1203,9 @@ impl<'a> CompactionIterator<'a> {
 					self.delete_list_batch.push((key.seq_num(), key.size() as u64));
 				} else {
 					// Regular value: record VLog pointer size
-					let location = ValueLocation::decode(value).unwrap();
+					let location = ValueLocation::decode(value)?;
 					if location.is_value_pointer() {
-						let pointer = ValuePointer::decode(&location.value).unwrap();
+						let pointer = ValuePointer::decode(&location.value)?;
 						let value_size = pointer.total_entry_size();
 						self.delete_list_batch.push((key.seq_num(), value_size));
 					}
@@ -968,27 +1219,34 @@ impl<'a> CompactionIterator<'a> {
 
 			// ===== DETERMINE IF ENTRY SHOULD BE OUTPUT =====
 
-			let should_output = if latest_is_delete_at_bottom {
+			let should_output = if superseded {
+				// Superseded by newer version: don't output
+				false
+			} else if latest_is_delete_at_bottom {
 				// DELETE at bottom: output NOTHING
 				false
 			} else if should_mark_stale {
 				// Stale entries: don't output
 				false
-			} else if self.enable_versioning {
-				// Versioning: output all non-stale versions
+			} else if self.enable_versioning || required_by_snapshot {
+				// Versioning enabled or snapshot requires it: output
 				true
 			} else {
-				// No versioning: only output latest
+				// No versioning, no snapshot requirement: only output latest
 				is_latest
 			};
 
 			if should_output {
 				self.output_versions.push((key.clone(), value.clone()));
 			}
+
+			// Update for next iteration (this version becomes the "newer" one)
+			newer_version_visibility = Some(current_visibility);
 		}
 
 		// Clear accumulated versions for the next key
 		self.accumulated_versions.clear();
+		Ok(())
 	}
 
 	/// Advance to the next output entry.
@@ -1073,7 +1331,7 @@ impl<'a> CompactionIterator<'a> {
 			if !self.merge_iter.is_valid() {
 				// Process any remaining accumulated versions
 				if !self.accumulated_versions.is_empty() {
-					self.process_accumulated_versions();
+					self.process_accumulated_versions()?;
 					// Return first output version if any
 					if !self.output_versions.is_empty() {
 						return Ok(Some(self.output_versions.remove(0)));
@@ -1095,7 +1353,7 @@ impl<'a> CompactionIterator<'a> {
 			if is_new_key {
 				// Process accumulated versions of the previous key
 				if !self.accumulated_versions.is_empty() {
-					self.process_accumulated_versions();
+					self.process_accumulated_versions()?;
 
 					// Start accumulating the new key
 					self.current_user_key = user_key_owned;

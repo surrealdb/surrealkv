@@ -18,7 +18,7 @@ use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lockfile::LockFile;
 use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
 use crate::oracle::Oracle;
-use crate::snapshot::Counter as SnapshotCounter;
+use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::Table;
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
@@ -109,9 +109,11 @@ pub(crate) struct CoreInner {
 	/// Configuration options controlling LSM tree behavior
 	pub opts: Arc<Options>,
 
-	/// Counter tracking active snapshots for MVCC (Multi-Version Concurrency
-	/// Control). Snapshots provide consistent point-in-time views of the data.
-	pub(crate) snapshot_counter: SnapshotCounter,
+	/// Tracker for active snapshot sequence numbers for MVCC (Multi-Version
+	/// Concurrency Control). Snapshots provide consistent point-in-time views
+	/// of the data. The tracker stores actual sequence numbers to enable
+	/// snapshot-aware compaction.
+	pub(crate) snapshot_tracker: SnapshotTracker,
 
 	/// Oracle managing transaction timestamps for MVCC.
 	/// Provides monotonic timestamps for transaction ordering and conflict
@@ -193,7 +195,7 @@ impl CoreInner {
 			active_memtable,
 			immutable_memtables,
 			level_manifest,
-			snapshot_counter: SnapshotCounter::default(),
+			snapshot_tracker: SnapshotTracker::new(),
 			oracle: Arc::new(oracle),
 			vlog,
 			wal: parking_lot::RwLock::new(wal_instance),
@@ -1554,7 +1556,8 @@ impl Tree {
 
 	/// Flushes all memtables to disk synchronously.
 	/// This is a blocking operation that ensures all data is persisted before returning.
-	pub fn flush(&self) -> Result<()> {
+	#[cfg(test)]
+	pub(crate) fn flush(&self) -> Result<()> {
 		// Step 1: Rotate active memtable if it has data
 		{
 			let active = self.core.inner.active_memtable.read()?;

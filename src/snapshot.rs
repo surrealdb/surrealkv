@@ -1,7 +1,7 @@
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::ops::Bound;
-use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 
 use parking_lot::RwLockReadGuard;
@@ -23,34 +23,64 @@ use crate::{
 	Value,
 };
 
-// ===== Snapshot Counter =====
-/// Tracks the number of active snapshots in the system.
+// ===== Snapshot Tracker =====
+/// Tracks active snapshot sequence numbers in the system.
 ///
-/// Important for garbage collection: old versions can only be removed
-/// when no snapshot needs them. This counter helps determine when it's
-/// safe to compact away old versions during compaction.
+/// This tracker maintains the actual sequence numbers of active snapshots,
+/// enabling snapshot-aware compaction. During compaction, versions that are
+/// visible to any active snapshot must be preserved.
 ///
-/// TODO: This check needs to be implemented in the compaction logic.
+/// # Compaction Integration
+///
+/// The compaction iterator uses `get_all_snapshots()` to obtain a sorted list
+/// of active snapshot sequence numbers. For each version being considered for
+/// removal, it checks if the version is visible to any snapshot using binary
+/// search. Versions visible to snapshots are preserved unless hidden by a newer
+/// version in the same visibility boundary.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Counter(Arc<AtomicU32>);
-
-impl std::ops::Deref for Counter {
-	type Target = Arc<AtomicU32>;
-
-	fn deref(&self) -> &Self::Target {
-		&self.0
-	}
+pub(crate) struct SnapshotTracker {
+	/// Active snapshot sequence numbers, stored in a BTreeSet for:
+	/// - O(log n) insert/remove during snapshot lifecycle
+	/// - Automatic sorted order for efficient binary search during compaction
+	snapshots: Arc<parking_lot::RwLock<BTreeSet<u64>>>,
 }
 
-impl Counter {
-	/// Increments when a new snapshot is created
-	pub(crate) fn increment(&self) -> u32 {
-		self.fetch_add(1, std::sync::atomic::Ordering::Release)
+impl SnapshotTracker {
+	/// Creates a new empty snapshot tracker.
+	pub(crate) fn new() -> Self {
+		Self {
+			snapshots: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
+		}
 	}
 
-	/// Decrements when a snapshot is dropped
-	pub(crate) fn decrement(&self) -> u32 {
-		self.fetch_sub(1, std::sync::atomic::Ordering::Release)
+	/// Registers a new snapshot with the given sequence number.
+	///
+	/// Called when a new snapshot is created. The sequence number is added
+	/// to the tracking set, ensuring compaction will preserve versions
+	/// visible to this snapshot.
+	pub(crate) fn register(&self, seq_num: u64) {
+		let mut snapshots = self.snapshots.write();
+		snapshots.insert(seq_num);
+	}
+
+	/// Unregisters a snapshot with the given sequence number.
+	///
+	/// Called when a snapshot is dropped. Once all snapshots at or above
+	/// a certain sequence number are dropped, older versions become eligible
+	/// for garbage collection during compaction.
+	pub(crate) fn unregister(&self, seq_num: u64) {
+		let mut snapshots = self.snapshots.write();
+		snapshots.remove(&seq_num);
+	}
+
+	/// Returns all active snapshots as a sorted vector.
+	///
+	/// This is the primary method used by compaction. The returned vector
+	/// is sorted in ascending order, enabling efficient binary search to
+	/// determine which snapshot "boundary" each version belongs to.
+	pub(crate) fn get_all_snapshots(&self) -> Vec<u64> {
+		let snapshots = self.snapshots.read();
+		snapshots.iter().copied().collect()
 	}
 }
 
@@ -86,8 +116,9 @@ pub(crate) struct Snapshot {
 impl Snapshot {
 	/// Creates a new snapshot at the current sequence number
 	pub(crate) fn new(core: Arc<Core>, seq_num: u64) -> Self {
-		// Increment counter so compaction knows to preserve old versions
-		core.snapshot_counter.increment();
+		// Register this snapshot's sequence number so compaction knows
+		// to preserve versions visible to this snapshot
+		core.snapshot_tracker.register(seq_num);
 		Self {
 			core,
 			seq_num,
@@ -341,8 +372,9 @@ impl Snapshot {
 
 impl Drop for Snapshot {
 	fn drop(&mut self) {
-		// Decrement counter so compaction can clean up old versions
-		self.core.snapshot_counter.decrement();
+		// Unregister this snapshot's sequence number so compaction can
+		// clean up versions no longer visible to any snapshot
+		self.core.snapshot_tracker.unregister(self.seq_num);
 	}
 }
 
