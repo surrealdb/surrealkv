@@ -156,7 +156,7 @@ The design minimizes contention during concurrent writes. The WAL write is kept 
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                           TRANSACTION PHASE                                │
+│                              TRANSACTION PHASE                             │
 │                                                                            │
 │  txn.set(key, value)  ──►  Buffer in write_set  ──►  txn.commit()          │
 │                            (BTreeMap)                                      │
@@ -164,7 +164,7 @@ The design minimizes contention during concurrent writes. The WAL write is kept 
                                        │
                                        ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
-│                            COMMIT PHASE                                    │
+│                                 COMMIT PHASE                               │
 │                                                                            │
 │  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐         │
 │  │     Oracle      │───►│  Assign SeqNum  │───►│  Create Batch   │         │
@@ -504,6 +504,98 @@ By default, compaction drops old versions as soon as they are no longer visible 
 - **Unlimited retention**: Setting `retention_ns = 0` keeps all versions forever
 
 This enables time-travel queries where applications can read the database state at any historical timestamp within the retention window.
+
+### Versioned Storage Architecture
+
+When versioning is enabled, SurrealKV automatically configures the storage layer to support efficient historical queries. The key insight is that all values are stored in the VLog, and indexes (both LSM and optional B+tree) store only value pointers. This architecture enables multiple index structures on top of a single value store.
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                     VERSIONED STORAGE ARCHITECTURE                          │
+│                                                                             │
+│  When versioning is enabled, all values are stored in VLog.                 │
+│  Indexes store only value pointers, enabling multiple index structures.     │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                        INDEX LAYER                                  │    │
+│  │                                                                     │    │
+│  │   ┌───────────────────┐         ┌───────────────────┐               │    │
+│  │   │  LSM Tree Index   │         │  B+Tree Index     │               │    │
+│  │   │  (always present) │         │  (optional)       │               │    │
+│  │   │                   │         │                   │               │    │
+│  │   │  InternalKey ──►  │         │  InternalKey ──►  │               │    │
+│  │   │  ValuePointer     │         │  ValuePointer     │               │    │
+│  │   └─────────┬─────────┘         └─────────┬─────────┘               │    │
+│  │             │                             │                         │    │
+│  │             └──────────────┬──────────────┘                         │    │
+│  │                            │                                        │    │
+│  └────────────────────────────┼────────────────────────────────────────┘    │
+│                               │                                             │
+│                               ▼                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                        VALUE LOG (VLog)                             │    │
+│  │                                                                     │    │
+│  │   All versioned entries stored here (vlog_value_threshold = 0)      │    │
+│  │                                                                     │    │
+│  │   ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐                   │    │
+│  │   │ Entry 1 │ │ Entry 2 │ │ Entry 3 │ │ Entry 4 │ ...               │    │
+│  │   │ v1 of A │ │ v2 of A │ │ v1 of B │ │ v3 of A │                   │    │
+│  │   └─────────┘ └─────────┘ └─────────┘ └─────────┘                   │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Configuration:**
+
+When `with_versioning(true, retention_ns)` is called:
+- VLog is automatically enabled
+- `vlog_value_threshold` is set to 0, so all values go to VLog
+- The LSM tree stores `(InternalKey → ValuePointer)` instead of inline values
+
+**Two Query Modes:**
+
+| Mode | Configuration | Query Method |
+|------|---------------|--------------|
+| LSM-only | `with_versioning(true, retention_ns)` | K-way merge across all LSM components |
+| B+tree indexed | + `with_versioned_index(true)` | Direct B+tree lookup |
+
+**LSM-based Versioned Queries:**
+
+When using LSM-only versioning, the `history()` API uses a `KMergeIterator` that gathers iterators from:
+- Active memtable
+- All immutable memtables (pending flush)
+- All SSTable levels (L0, L1, L2, ...)
+
+These are merged using a k-way merge that returns entries sorted by (user_key, seq_num descending). Finding all versions of a key requires scanning all levels.
+
+**B+tree Versioned Queries:**
+
+When `with_versioned_index(true)` is also enabled, versioned queries go directly to the B+tree which stores all `(InternalKey → ValuePointer)` entries. The B+tree keeps entries sorted, so all versions of a key are contiguous and can be retrieved with a single seek.
+
+The B+tree implementation uses a disk-based page management approach, with the handling of large entries drawing inspiration from SQLite's overflow page design.
+
+**Why Use B+tree Index:**
+
+The motivation for the optional B+tree index:
+- LSM stores keys across multiple SSTables; finding all versions requires checking every level
+- B+tree consolidates all versions in a single sorted structure
+- Single index lookup vs. merging N sources (where N = memtables + SSTables)
+
+**B+tree Trade-offs:**
+
+| Pros | Cons |
+|------|------|
+| Single index lookup instead of k-way merge | Slow insertion (in-place modified tree on disk) |
+| Fast point and range queries for history | Insert performance slows during LSM writes |
+| All versions of a key are contiguous | Every LSM write also updates B+tree |
+
+**Read-after-Write Consistency:**
+
+Currently, the B+tree index is updated synchronously during LSM writes, providing read-after-write consistency for versioned queries. A recently written version is immediately visible via the `history()` API.
+
+**Future Work:**
+
+Async indexing could improve write performance by decoupling B+tree updates from the LSM write path. However, this would require relaxing the read-after-write consistency guarantee (recently written versions may not be immediately visible via B+tree queries). This is a potential optimization for future versions.
 
 ---
 
