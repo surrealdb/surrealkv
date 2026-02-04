@@ -1,4 +1,4 @@
-# SurrealKV Architecture
+# [WIP] SurrealKV Architecture
 
 SurrealKV is a versioned, embedded key-value database built on an LSM (Log-Structured Merge) tree architecture. It is designed specifically for use within SurrealDB, with the goal of reducing dependency on external storage engine (RocksDB). This approach allows the storage layer to evolve in alignment with SurrealDB’s requirements and access patterns.
 
