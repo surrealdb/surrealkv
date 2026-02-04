@@ -1889,11 +1889,11 @@ async fn test_versioned_queries_basic() {
 
 	// Insert data with explicit timestamps
 	let mut tx1 = tree.begin().unwrap();
-	tx1.set_at_version(b"key1", b"value1_v1", ts1).unwrap();
+	tx1.set_at(b"key1", b"value1_v1", ts1).unwrap();
 	tx1.commit().await.unwrap();
 
 	let mut tx2 = tree.begin().unwrap();
-	tx2.set_at_version(b"key1", b"value1_v2", ts2).unwrap();
+	tx2.set_at(b"key1", b"value1_v2", ts2).unwrap();
 	tx2.commit().await.unwrap();
 
 	// Test regular get (should return latest)
@@ -2016,7 +2016,7 @@ async fn test_set_at_timestamp() {
 	// Set a value with a specific timestamp
 	let custom_timestamp = 10;
 	let mut tx = tree.begin().unwrap();
-	tx.set_at_version(b"key1", b"value1", custom_timestamp).unwrap();
+	tx.set_at(b"key1", b"value1", custom_timestamp).unwrap();
 	tx.commit().await.unwrap();
 
 	// Verify we can get the value at that timestamp
@@ -2137,7 +2137,7 @@ async fn test_commit_timestamp_consistency() {
 	let custom_timestamp = 9876543210000000000;
 	let mut tx = tree.begin().unwrap();
 	tx.set(b"key4", b"value4").unwrap(); // Will get commit timestamp
-	tx.set_at_version(b"key5", b"value5", custom_timestamp).unwrap(); // Explicit timestamp
+	tx.set_at(b"key5", b"value5", custom_timestamp).unwrap(); // Explicit timestamp
 	tx.set(b"key6", b"value6").unwrap(); // Will get commit timestamp
 	tx.commit().await.unwrap();
 
@@ -2181,15 +2181,15 @@ async fn test_range_at_version() {
 
 	// Insert data with first timestamp
 	let mut tx1 = tree.begin().unwrap();
-	tx1.set_at_version(b"key1", b"value1", ts1).unwrap();
-	tx1.set_at_version(b"key2", b"value2", ts1).unwrap();
-	tx1.set_at_version(b"key3", b"value3", ts1).unwrap();
+	tx1.set_at(b"key1", b"value1", ts1).unwrap();
+	tx1.set_at(b"key2", b"value2", ts1).unwrap();
+	tx1.set_at(b"key3", b"value3", ts1).unwrap();
 	tx1.commit().await.unwrap();
 
 	// Insert data with second timestamp
 	let mut tx2 = tree.begin().unwrap();
-	tx2.set_at_version(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
-	tx2.set_at_version(b"key4", b"value4", ts2).unwrap(); // Add new key
+	tx2.set_at(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
+	tx2.set_at(b"key4", b"value4", ts2).unwrap(); // Add new key
 	tx2.commit().await.unwrap();
 
 	// Test point-in-time query at first timestamp using history() API
@@ -2259,11 +2259,11 @@ async fn test_versioned_range_bounds_edge_cases() {
 
 	// Insert data: keys a, b, c, d, e
 	let mut tx = tree.begin().unwrap();
-	tx.set_at_version(b"a", b"value_a", ts).unwrap();
-	tx.set_at_version(b"b", b"value_b", ts).unwrap();
-	tx.set_at_version(b"c", b"value_c", ts).unwrap();
-	tx.set_at_version(b"d", b"value_d", ts).unwrap();
-	tx.set_at_version(b"e", b"value_e", ts).unwrap();
+	tx.set_at(b"a", b"value_a", ts).unwrap();
+	tx.set_at(b"b", b"value_b", ts).unwrap();
+	tx.set_at(b"c", b"value_c", ts).unwrap();
+	tx.set_at(b"d", b"value_d", ts).unwrap();
+	tx.set_at(b"e", b"value_e", ts).unwrap();
 	tx.commit().await.unwrap();
 
 	let tx = tree.begin().unwrap();
@@ -2611,7 +2611,7 @@ mod version_tests {
 		for (i, value) in values.iter().enumerate() {
 			let mut txn = store.begin().unwrap();
 			let version = (i + 1) as u64; // Incremental version
-			txn.set_at_version(&key, value, version).unwrap();
+			txn.set_at(&key, value, version).unwrap();
 			txn.commit().await.unwrap();
 		}
 
@@ -2641,7 +2641,7 @@ mod version_tests {
 		for (i, value) in values.iter().enumerate() {
 			let mut txn = store.begin().unwrap();
 			let version = (i + 1) as u64; // Incremental version
-			txn.set_at_version(&key, value, version).unwrap();
+			txn.set_at(&key, value, version).unwrap();
 			txn.commit().await.unwrap();
 		}
 
@@ -2668,7 +2668,7 @@ mod version_tests {
 
 		for key in &keys {
 			let mut txn = store.begin().unwrap();
-			txn.set_at_version(key, &value, 1).unwrap();
+			txn.set_at(key, &value, 1).unwrap();
 			txn.commit().await.unwrap();
 		}
 
@@ -2697,7 +2697,7 @@ mod version_tests {
 			for (i, value) in values.iter().enumerate() {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64;
-				txn.set_at_version(key, value, version).unwrap();
+				txn.set_at(key, value, version).unwrap();
 				txn.commit().await.unwrap();
 			}
 		}
@@ -2733,7 +2733,7 @@ mod version_tests {
 		let value = Vec::from("value1");
 
 		let mut txn = store.begin().unwrap();
-		txn.set_at_version(&key, &value, 1).unwrap();
+		txn.set_at(&key, &value, 1).unwrap();
 		txn.commit().await.unwrap();
 
 		let mut txn = store.begin().unwrap();
@@ -2766,7 +2766,7 @@ mod version_tests {
 
 		for key in &keys {
 			let mut txn = store.begin().unwrap();
-			txn.set_at_version(key, &value, 1).unwrap();
+			txn.set_at(key, &value, 1).unwrap();
 			txn.commit().await.unwrap();
 		}
 
@@ -2809,7 +2809,7 @@ mod version_tests {
 			for (i, value) in values.iter().enumerate() {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64;
-				txn.set_at_version(key, value, version).unwrap();
+				txn.set_at(key, value, version).unwrap();
 				txn.commit().await.unwrap();
 			}
 		}
@@ -2855,7 +2855,7 @@ mod version_tests {
 		let value = Vec::from("value1");
 
 		let mut txn = store.begin().unwrap();
-		txn.set_at_version(&key, &value, 1).unwrap();
+		txn.set_at(&key, &value, 1).unwrap();
 		txn.commit().await.unwrap();
 
 		let mut txn = store.begin().unwrap();
@@ -2882,7 +2882,7 @@ mod version_tests {
 
 		for key in &keys {
 			let mut txn = store.begin().unwrap();
-			txn.set_at_version(key, &value, 1).unwrap();
+			txn.set_at(key, &value, 1).unwrap();
 			txn.commit().await.unwrap();
 		}
 
@@ -2903,7 +2903,7 @@ mod version_tests {
 
 		for key in &keys {
 			let mut txn = store.begin().unwrap();
-			txn.set_at_version(key, &value, 1).unwrap();
+			txn.set_at(key, &value, 1).unwrap();
 			txn.commit().await.unwrap();
 		}
 
@@ -2925,7 +2925,7 @@ mod version_tests {
 		let value = Vec::from("value1");
 
 		let mut txn = store.begin().unwrap();
-		txn.set_at_version(&key, &value, 1).unwrap();
+		txn.set_at(&key, &value, 1).unwrap();
 		txn.commit().await.unwrap();
 
 		let txn = store.begin().unwrap();
@@ -2952,7 +2952,7 @@ mod version_tests {
 			for (i, value) in values.iter().enumerate() {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64;
-				txn.set_at_version(key, value, version).unwrap();
+				txn.set_at(key, value, version).unwrap();
 				txn.commit().await.unwrap();
 			}
 		}
@@ -3006,7 +3006,7 @@ mod version_tests {
 			for (i, value) in values.iter().enumerate() {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64;
-				txn.set_at_version(key, value, version).unwrap();
+				txn.set_at(key, value, version).unwrap();
 				txn.commit().await.unwrap();
 			}
 		}
@@ -3051,13 +3051,13 @@ mod version_tests {
 
 		// Insert test data with multiple versions
 		let mut txn = store.begin().unwrap();
-		txn.set_at_version(b"key1", b"value1", 1).unwrap();
-		txn.set_at_version(b"key1", b"value1_v2", 2).unwrap();
-		txn.set_at_version(b"key2", b"value2", 1).unwrap();
-		txn.set_at_version(b"key2", b"value2_v2", 2).unwrap();
-		txn.set_at_version(b"key3", b"value3", 1).unwrap();
-		txn.set_at_version(b"key4", b"value4", 1).unwrap();
-		txn.set_at_version(b"key5", b"value5", 1).unwrap();
+		txn.set_at(b"key1", b"value1", 1).unwrap();
+		txn.set_at(b"key1", b"value1_v2", 2).unwrap();
+		txn.set_at(b"key2", b"value2", 1).unwrap();
+		txn.set_at(b"key2", b"value2_v2", 2).unwrap();
+		txn.set_at(b"key3", b"value3", 1).unwrap();
+		txn.set_at(b"key4", b"value4", 1).unwrap();
+		txn.set_at(b"key5", b"value5", 1).unwrap();
 
 		txn.commit().await.unwrap();
 
@@ -3109,7 +3109,7 @@ mod version_tests {
 			for (i, value) in key_versions.iter().enumerate() {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64;
-				txn.set_at_version(key, value, version).unwrap();
+				txn.set_at(key, value, version).unwrap();
 				txn.commit().await.unwrap();
 			}
 		}
@@ -3249,7 +3249,7 @@ async fn test_versioned_range_survives_memtable_flush() {
 	for i in 1..=3 {
 		let mut tx = store.begin().unwrap();
 		let value = format!("v{i}");
-		tx.set_at_version(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
+		tx.set_at(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
 		tx.commit().await.unwrap();
 	}
 
