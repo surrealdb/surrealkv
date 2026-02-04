@@ -2,9 +2,9 @@
 
 [![License](https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square)](https://github.com/surrealdb/surrealkv)
 
-> **⚠️ Development Status**: SurrealKV is currently under active development and is not feature complete. The API and implementation may change significantly between versions. Use with caution in production environments.
+SurrealKV is a versioned, embedded key-value store built on an LSM (Log-Structured Merge) tree architecture, with support for time-travel queries.
 
-SurrealKV is a versioned, low-level, persistent, embedded key-value database implemented in Rust using an LSM (Log-Structured Merge) tree architecture with built-in support for time-travel queries.
+It is designed specifically for use within SurrealDB, with the goal of reducing dependency on external storage engine (RocksDB). This approach allows the storage layer to evolve in alignment with SurrealDB’s requirements and access patterns.
 
 ## Features
 
