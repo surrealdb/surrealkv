@@ -1213,7 +1213,8 @@ impl<'a> CompactionIterator<'a> {
 
 				// Update per-file discard statistics
 				if let Err(e) = collect_vlog_discard_stats(&mut self.discard_stats, value) {
-					log::warn!("Error collecting discard stats: {e:?}");
+					log::error!("Error collecting discard stats: {e:?}");
+					return Err(e);
 				}
 			}
 

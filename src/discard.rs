@@ -2,9 +2,9 @@ use std::fs::{File, OpenOptions};
 use std::path::Path;
 
 use memmap2::{MmapMut, MmapOptions};
-use parking_lot::Mutex;
 
 use crate::error::Result;
+use crate::Error;
 
 const DISCARD_STATS_FILENAME: &str = "DISCARD";
 const ENTRY_SIZE: usize = 12; // 4 bytes for file_id + 8 bytes for discard_bytes
@@ -29,7 +29,7 @@ pub(crate) struct DiscardStats {
 	/// File handle
 	file: File,
 	/// Next empty slot index (not byte offset) - protected by mutex
-	next_empty_slot: Mutex<usize>,
+	next_empty_slot: usize,
 }
 
 impl DiscardStats {
@@ -53,7 +53,7 @@ impl DiscardStats {
 		let mut stats = Self {
 			mmap,
 			file,
-			next_empty_slot: Mutex::new(0),
+			next_empty_slot: 0,
 		};
 
 		if !file_exists {
@@ -62,14 +62,27 @@ impl DiscardStats {
 		} else if stats.has_valid_magic() {
 			// Existing file with valid header: read entry count
 			let count = stats.read_entry_count();
-			*stats.next_empty_slot.lock() = count;
+			let max_slots = stats.max_slots();
+
+			// Validate entry count doesn't exceed max slots
+			if count > max_slots {
+				return Err(Error::DiscardCorruptedEntryCount {
+					count,
+					max: max_slots,
+				});
+			}
+
+			stats.next_empty_slot = count;
+
+			// Validate entries for data integrity
+			stats.validate_entries()?;
 		} else {
 			// Invalid/corrupt file: treat as new (no backward compat)
 			stats.write_header(0);
 		}
 
 		// Sort entries to ensure binary search works
-		stats.sort_entries();
+		stats.sort_entries()?;
 
 		Ok(stats)
 	}
@@ -79,27 +92,40 @@ impl DiscardStats {
 		(self.mmap.len() - HEADER_SIZE) / ENTRY_SIZE
 	}
 
-	/// Gets the file ID at the given slot
-	fn get_file_id(&self, slot: usize) -> u32 {
-		let offset = HEADER_SIZE + slot * ENTRY_SIZE;
-		if offset + 4 > self.mmap.len() {
-			return 0;
+	/// Returns the byte offset for the file_id field at the given slot.
+	/// Returns error if slot is out of bounds.
+	fn file_id_offset(&self, slot: usize) -> Result<usize> {
+		let max = self.max_slots();
+		if slot >= max {
+			return Err(Error::DiscardSlotOutOfBounds {
+				slot,
+				max,
+			});
 		}
-		u32::from_be_bytes([
+		Ok(HEADER_SIZE + slot * ENTRY_SIZE)
+	}
+
+	/// Returns the byte offset for the discard_bytes field at the given slot.
+	/// Returns error if slot is out of bounds.
+	fn discard_bytes_offset(&self, slot: usize) -> Result<usize> {
+		Ok(self.file_id_offset(slot)? + 4)
+	}
+
+	/// Gets the file ID at the given slot
+	fn get_file_id(&self, slot: usize) -> Result<u32> {
+		let offset = self.file_id_offset(slot)?;
+		Ok(u32::from_be_bytes([
 			self.mmap[offset],
 			self.mmap[offset + 1],
 			self.mmap[offset + 2],
 			self.mmap[offset + 3],
-		])
+		]))
 	}
 
 	/// Gets the discard bytes at the given slot
-	fn get_discard_bytes(&self, slot: usize) -> u64 {
-		let offset = HEADER_SIZE + slot * ENTRY_SIZE + 4;
-		if offset + 8 > self.mmap.len() {
-			return 0;
-		}
-		u64::from_be_bytes([
+	fn get_discard_bytes(&self, slot: usize) -> Result<u64> {
+		let offset = self.discard_bytes_offset(slot)?;
+		Ok(u64::from_be_bytes([
 			self.mmap[offset],
 			self.mmap[offset + 1],
 			self.mmap[offset + 2],
@@ -108,19 +134,21 @@ impl DiscardStats {
 			self.mmap[offset + 5],
 			self.mmap[offset + 6],
 			self.mmap[offset + 7],
-		])
+		]))
 	}
 
 	/// Sets the file ID at the given slot
-	fn set_file_id(&mut self, slot: usize, file_id: u32) {
-		let offset = HEADER_SIZE + slot * ENTRY_SIZE;
+	fn set_file_id(&mut self, slot: usize, file_id: u32) -> Result<()> {
+		let offset = self.file_id_offset(slot)?;
 		self.mmap[offset..offset + 4].copy_from_slice(&file_id.to_be_bytes());
+		Ok(())
 	}
 
 	/// Sets the discard bytes at the given slot
-	fn set_discard_bytes(&mut self, slot: usize, discard_bytes: u64) {
-		let offset = HEADER_SIZE + slot * ENTRY_SIZE + 4;
+	fn set_discard_bytes(&mut self, slot: usize, discard_bytes: u64) -> Result<()> {
+		let offset = self.discard_bytes_offset(slot)?;
 		self.mmap[offset..offset + 8].copy_from_slice(&discard_bytes.to_be_bytes());
+		Ok(())
 	}
 
 	/// Reads the entry count from the header
@@ -161,15 +189,47 @@ impl DiscardStats {
 		self.write_entry_count(count);
 	}
 
+	/// Validates all entries for data integrity
+	/// Checks that entries are sorted by file_id with no duplicates
+	fn validate_entries(&self) -> Result<()> {
+		if self.next_empty_slot == 0 {
+			return Ok(());
+		}
+
+		let mut prev_file_id: Option<u32> = None;
+
+		for slot in 0..self.next_empty_slot {
+			let file_id = self.get_file_id(slot)?;
+
+			if let Some(prev) = prev_file_id {
+				if file_id <= prev {
+					return Err(Error::DiscardCorruptedData {
+						slot,
+						reason: format!(
+							"entries not sorted or duplicate: file_id {} <= previous {}",
+							file_id, prev
+						),
+					});
+				}
+			}
+
+			prev_file_id = Some(file_id);
+		}
+
+		Ok(())
+	}
+
 	/// Sorts entries by file_id
-	fn sort_entries(&mut self) {
-		let next_empty_slot = *self.next_empty_slot.lock();
+	fn sort_entries(&mut self) -> Result<()> {
+		if self.next_empty_slot == 0 {
+			return Ok(());
+		}
 
 		// Create a vector of (file_id, discard_bytes) tuples
-		let mut entries: Vec<(u32, u64)> = Vec::with_capacity(next_empty_slot);
-		for slot in 0..next_empty_slot {
-			let file_id = self.get_file_id(slot);
-			let discard_bytes = self.get_discard_bytes(slot);
+		let mut entries: Vec<(u32, u64)> = Vec::with_capacity(self.next_empty_slot);
+		for slot in 0..self.next_empty_slot {
+			let file_id = self.get_file_id(slot)?;
+			let discard_bytes = self.get_discard_bytes(slot)?;
 			entries.push((file_id, discard_bytes));
 		}
 
@@ -178,9 +238,11 @@ impl DiscardStats {
 
 		// Write back sorted entries
 		for (slot, (file_id, discard_bytes)) in entries.into_iter().enumerate() {
-			self.set_file_id(slot, file_id);
-			self.set_discard_bytes(slot, discard_bytes);
+			self.set_file_id(slot, file_id)?;
+			self.set_discard_bytes(slot, discard_bytes)?;
 		}
+
+		Ok(())
 	}
 
 	/// Updates the discard statistics for a file
@@ -192,23 +254,24 @@ impl DiscardStats {
 	/// # Returns
 	/// The current discard bytes after the operation
 	pub(crate) fn update(&mut self, file_id: u32, discard_bytes: i64) -> Result<u64> {
-		let next_empty_slot = *self.next_empty_slot.lock();
+		let next_empty_slot = self.next_empty_slot;
 
-		// Try to find existing entry
-		if let Some(slot) = self.binary_search(file_id, next_empty_slot) {
-			let current_discard = self.get_discard_bytes(slot);
+		let (slot, found) = self.binary_search_with_position(file_id, next_empty_slot)?;
+
+		if found {
+			let current_discard = self.get_discard_bytes(slot)?;
 
 			if discard_bytes == 0 {
 				return Ok(current_discard);
 			}
 
 			if discard_bytes < 0 {
-				self.set_discard_bytes(slot, 0);
+				self.set_discard_bytes(slot, 0)?;
 				return Ok(0);
 			}
 
 			let new_discard = current_discard.saturating_add(discard_bytes as u64);
-			self.set_discard_bytes(slot, new_discard);
+			self.set_discard_bytes(slot, new_discard)?;
 			return Ok(new_discard);
 		}
 
@@ -223,95 +286,96 @@ impl DiscardStats {
 			return self.update(file_id, discard_bytes);
 		}
 
-		// Find insertion point to maintain sorted order
-		let insert_pos = self.binary_search_insert_point(file_id, next_empty_slot);
+		let insert_pos = slot;
 
 		// Shift entries right to make room
 		for i in (insert_pos..next_empty_slot).rev() {
-			let fid = self.get_file_id(i);
-			let db = self.get_discard_bytes(i);
-			self.set_file_id(i + 1, fid);
-			self.set_discard_bytes(i + 1, db);
+			let fid = self.get_file_id(i)?;
+			let db = self.get_discard_bytes(i)?;
+			self.set_file_id(i + 1, fid)?;
+			self.set_discard_bytes(i + 1, db)?;
 		}
 
 		// Insert new entry at correct position
-		self.set_file_id(insert_pos, file_id);
-		self.set_discard_bytes(insert_pos, discard_bytes as u64);
+		self.set_file_id(insert_pos, file_id)?;
+		self.set_discard_bytes(insert_pos, discard_bytes as u64)?;
 
 		// Update count in memory and header
 		let new_count = next_empty_slot + 1;
-		*self.next_empty_slot.lock() = new_count;
+		self.next_empty_slot = new_count;
 		self.write_entry_count(new_count);
 
 		Ok(discard_bytes as u64)
 	}
 
-	/// Binary search for insertion point - returns the index where file_id should be inserted
-	/// to maintain sorted order
-	fn binary_search_insert_point(&self, file_id: u32, count: usize) -> usize {
+	/// Unified binary search that returns (position, found)
+	/// - If found: returns (slot_index, true)
+	/// - If not found: returns (insertion_point, false)
+	fn binary_search_with_position(&self, file_id: u32, count: usize) -> Result<(usize, bool)> {
+		if count == 0 {
+			return Ok((0, false));
+		}
+
 		let mut left = 0;
 		let mut right = count;
 
 		while left < right {
 			let mid = left + (right - left) / 2;
-			if self.get_file_id(mid) < file_id {
-				left = mid + 1;
-			} else {
-				right = mid;
+			let mid_id = self.get_file_id(mid)?;
+
+			match mid_id.cmp(&file_id) {
+				std::cmp::Ordering::Less => left = mid + 1,
+				std::cmp::Ordering::Greater => right = mid,
+				std::cmp::Ordering::Equal => return Ok((mid, true)),
 			}
 		}
-		left
+
+		Ok((left, false))
 	}
 
 	/// Binary search for a file_id, returns the slot index if found
-	fn binary_search(&self, file_id: u32, next_empty_slot: usize) -> Option<usize> {
-		if next_empty_slot == 0 {
-			return None;
-		}
-
-		let pos = self.binary_search_insert_point(file_id, next_empty_slot);
-		if pos < next_empty_slot && self.get_file_id(pos) == file_id {
+	fn binary_search(&self, file_id: u32, next_empty_slot: usize) -> Result<Option<usize>> {
+		let (pos, found) = self.binary_search_with_position(file_id, next_empty_slot)?;
+		Ok(if found {
 			Some(pos)
 		} else {
 			None
-		}
+		})
 	}
 
 	/// Expands the memory-mapped file by doubling its size
 	fn expand(&mut self) -> Result<()> {
 		let current_size = self.mmap.len();
-		let new_size = current_size * 2;
 
-		// Flush current mmap
+		// ADDED: Overflow check
+		let new_size = current_size
+			.checked_mul(2)
+			.ok_or_else(|| crate::error::Error::Corruption("mmap size overflow".into()))?;
+
 		self.mmap.flush()?;
+		let mmap_copy: Vec<u8> = self.mmap[..current_size].to_vec();
 
-		// Create a new mmap with double size
-		// First, we need to drop the current mmap
-		let mmap_copy: Vec<u8> = self.mmap.to_vec();
-		drop(std::mem::replace(&mut self.mmap, MmapMut::map_anon(1)?));
+		let temp_mmap = MmapMut::map_anon(1)?;
+		let _ = std::mem::replace(&mut self.mmap, temp_mmap);
 
-		// Resize the file
 		self.file.set_len(new_size as u64)?;
-
-		// Recreate the mmap
 		self.mmap = unsafe { MmapOptions::new().map_mut(&self.file)? };
-
-		// Copy old data
 		self.mmap[..current_size].copy_from_slice(&mmap_copy);
+
+		// ADDED: Zero new region
+		self.mmap[current_size..].fill(0);
 
 		Ok(())
 	}
 
 	/// Returns all files with discard bytes, sorted by discard bytes
 	/// (descending) Returns a vector of (file_id, discard_bytes) tuples
-	pub(crate) fn get_gc_candidates(&self) -> Vec<(u32, u64)> {
-		let next_empty_slot = *self.next_empty_slot.lock();
-
+	pub(crate) fn get_gc_candidates(&self) -> Result<Vec<(u32, u64)>> {
 		let mut candidates = Vec::new();
 
-		for slot in 0..next_empty_slot {
-			let file_id = self.get_file_id(slot);
-			let discard_bytes = self.get_discard_bytes(slot);
+		for slot in 0..self.next_empty_slot {
+			let file_id = self.get_file_id(slot)?;
+			let discard_bytes = self.get_discard_bytes(slot)?;
 
 			if discard_bytes > 0 {
 				candidates.push((file_id, discard_bytes));
@@ -321,42 +385,39 @@ impl DiscardStats {
 		// Sort by discard_bytes in descending order
 		candidates.sort_by(|a, b| b.1.cmp(&a.1));
 
-		candidates
+		Ok(candidates)
 	}
 
 	/// Gets discard bytes for a specific file
-	pub(crate) fn get_file_stats(&self, file_id: u32) -> u64 {
-		let next_empty_slot = *self.next_empty_slot.lock();
-
-		if let Some(slot) = self.binary_search(file_id, next_empty_slot) {
-			self.get_discard_bytes(slot)
-		} else {
-			0
+	/// Returns 0 if file not found
+	pub(crate) fn get_file_stats(&self, file_id: u32) -> Result<u64> {
+		match self.binary_search(file_id, self.next_empty_slot)? {
+			Some(slot) => self.get_discard_bytes(slot),
+			None => Ok(0),
 		}
 	}
 
 	/// Removes statistics for a file
-	pub(crate) fn remove_file(&mut self, file_id: u32) {
-		let (slot_to_remove, next_empty_slot) = {
-			let next_empty_slot_guard = self.next_empty_slot.lock();
-			let next_empty_slot = *next_empty_slot_guard;
-			let slot_to_remove = self.binary_search(file_id, next_empty_slot);
-			(slot_to_remove, next_empty_slot)
-		};
+	/// Returns true if file was found and removed, false if not found
+	pub(crate) fn remove_file(&mut self, file_id: u32) -> Result<bool> {
+		let slot_to_remove = self.binary_search(file_id, self.next_empty_slot)?;
 
 		if let Some(slot) = slot_to_remove {
 			// Shift all entries after this slot to the left
-			for i in slot..next_empty_slot - 1 {
-				let next_file_id = self.get_file_id(i + 1);
-				let next_discard = self.get_discard_bytes(i + 1);
-				self.set_file_id(i, next_file_id);
-				self.set_discard_bytes(i, next_discard);
+			for i in slot..self.next_empty_slot.saturating_sub(1) {
+				let next_file_id = self.get_file_id(i + 1)?;
+				let next_discard = self.get_discard_bytes(i + 1)?;
+				self.set_file_id(i, next_file_id)?;
+				self.set_discard_bytes(i, next_discard)?;
 			}
 
 			// Update count in memory and header
-			let new_count = next_empty_slot - 1;
-			*self.next_empty_slot.lock() = new_count;
+			let new_count = self.next_empty_slot.saturating_sub(1);
+			self.next_empty_slot = new_count;
 			self.write_entry_count(new_count);
+			Ok(true)
+		} else {
+			Ok(false)
 		}
 	}
 
@@ -369,7 +430,7 @@ impl DiscardStats {
 	/// Returns the number of entries (for testing)
 	#[cfg(test)]
 	fn entry_count(&self) -> usize {
-		*self.next_empty_slot.lock()
+		self.next_empty_slot
 	}
 }
 
@@ -403,7 +464,7 @@ mod tests {
 		assert_eq!(stats.update(3, 300).unwrap(), 300);
 
 		// Test max discard
-		let candidates = stats.get_gc_candidates();
+		let candidates = stats.get_gc_candidates().unwrap();
 		let (file_id, discard) = candidates[0];
 		assert_eq!(file_id, 3);
 		assert_eq!(discard, 300);
@@ -425,11 +486,11 @@ mod tests {
 		// Reopen and verify data persisted
 		{
 			let stats = DiscardStats::new(temp_dir.path()).unwrap();
-			assert_eq!(stats.get_file_stats(1), 100);
-			assert_eq!(stats.get_file_stats(2), 200);
-			assert_eq!(stats.get_file_stats(3), 300);
+			assert_eq!(stats.get_file_stats(1).unwrap(), 100);
+			assert_eq!(stats.get_file_stats(2).unwrap(), 200);
+			assert_eq!(stats.get_file_stats(3).unwrap(), 300);
 
-			let candidates = stats.get_gc_candidates();
+			let candidates = stats.get_gc_candidates().unwrap();
 			let (file_id, discard) = candidates[0];
 			assert_eq!(file_id, 3);
 			assert_eq!(discard, 300);
@@ -447,15 +508,16 @@ mod tests {
 		stats.update(3, 300).unwrap();
 
 		// Remove middle entry
-		stats.remove_file(2);
+		assert!(stats.remove_file(2).unwrap());
+		assert!(!stats.remove_file(999).unwrap()); // Not found
 
 		// Verify removal
-		assert_eq!(stats.get_file_stats(1), 100);
-		assert_eq!(stats.get_file_stats(2), 0); // Removed
-		assert_eq!(stats.get_file_stats(3), 300);
+		assert_eq!(stats.get_file_stats(1).unwrap(), 100);
+		assert_eq!(stats.get_file_stats(2).unwrap(), 0); // Removed
+		assert_eq!(stats.get_file_stats(3).unwrap(), 300);
 
 		// Verify max discard updated
-		let candidates = stats.get_gc_candidates();
+		let candidates = stats.get_gc_candidates().unwrap();
 		let (file_id, discard) = candidates[0];
 
 		assert_eq!(file_id, 3);
@@ -477,7 +539,7 @@ mod tests {
 
 		// Verify all entries exist
 		for i in 0..entries_to_add {
-			assert_eq!(stats.get_file_stats(i as u32), 100);
+			assert_eq!(stats.get_file_stats(i as u32).unwrap(), 100);
 		}
 	}
 
@@ -498,14 +560,14 @@ mod tests {
 
 		// Verify all entries including 0
 		assert_eq!(stats.entry_count(), 3);
-		assert_eq!(stats.get_file_stats(0), 500);
-		assert_eq!(stats.get_file_stats(1), 100);
-		assert_eq!(stats.get_file_stats(2), 200);
+		assert_eq!(stats.get_file_stats(0).unwrap(), 500);
+		assert_eq!(stats.get_file_stats(1).unwrap(), 100);
+		assert_eq!(stats.get_file_stats(2).unwrap(), 200);
 
 		// Verify sorted order: 0, 1, 2
-		assert_eq!(stats.get_file_id(0), 0);
-		assert_eq!(stats.get_file_id(1), 1);
-		assert_eq!(stats.get_file_id(2), 2);
+		assert_eq!(stats.get_file_id(0).unwrap(), 0);
+		assert_eq!(stats.get_file_id(1).unwrap(), 1);
+		assert_eq!(stats.get_file_id(2).unwrap(), 2);
 	}
 
 	/// Verify data persists correctly after reload
@@ -525,10 +587,10 @@ mod tests {
 		{
 			let stats = DiscardStats::new(temp_dir.path()).unwrap();
 			assert_eq!(stats.entry_count(), 4);
-			assert_eq!(stats.get_file_stats(0), 50);
-			assert_eq!(stats.get_file_stats(5), 500);
-			assert_eq!(stats.get_file_stats(10), 1000);
-			assert_eq!(stats.get_file_stats(15), 1500);
+			assert_eq!(stats.get_file_stats(0).unwrap(), 50);
+			assert_eq!(stats.get_file_stats(5).unwrap(), 500);
+			assert_eq!(stats.get_file_stats(10).unwrap(), 1000);
+			assert_eq!(stats.get_file_stats(15).unwrap(), 1500);
 		}
 	}
 
@@ -557,9 +619,9 @@ mod tests {
 			assert_eq!(stats.read_version(), VERSION);
 			assert_eq!(stats.read_entry_count(), 3);
 			// Verify data
-			assert_eq!(stats.get_file_stats(0), 100);
-			assert_eq!(stats.get_file_stats(1), 200);
-			assert_eq!(stats.get_file_stats(2), 300);
+			assert_eq!(stats.get_file_stats(0).unwrap(), 100);
+			assert_eq!(stats.get_file_stats(1).unwrap(), 200);
+			assert_eq!(stats.get_file_stats(2).unwrap(), 300);
 		}
 	}
 
@@ -578,7 +640,7 @@ mod tests {
 		// Verify sorted
 		let mut prev = 0;
 		for i in 0..stats.entry_count() {
-			let fid = stats.get_file_id(i);
+			let fid = stats.get_file_id(i).unwrap();
 			assert!(fid > prev, "Not sorted: {} should be > {}", fid, prev);
 			prev = fid;
 		}
@@ -595,12 +657,12 @@ mod tests {
 
 		// Start with a large value
 		stats.update(1, i64::MAX).unwrap();
-		let first_val = stats.get_file_stats(1);
+		let first_val = stats.get_file_stats(1).unwrap();
 		assert_eq!(first_val, i64::MAX as u64);
 
 		// Adding another large value should saturate at u64::MAX
 		stats.update(1, i64::MAX).unwrap();
-		let saturated_val = stats.get_file_stats(1);
+		let saturated_val = stats.get_file_stats(1).unwrap();
 
 		// i64::MAX + i64::MAX = 2 * i64::MAX which is u64::MAX - 1
 		// The saturating_add works on u64, so this tests that overflow is handled
@@ -608,7 +670,7 @@ mod tests {
 
 		// Now test actual saturation at u64::MAX
 		stats.update(1, i64::MAX).unwrap();
-		assert_eq!(stats.get_file_stats(1), u64::MAX);
+		assert_eq!(stats.get_file_stats(1).unwrap(), u64::MAX);
 	}
 
 	#[test]
@@ -617,7 +679,7 @@ mod tests {
 		let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
 
 		stats.update(1, 100).unwrap();
-		stats.remove_file(999);
+		assert!(!stats.remove_file(999).unwrap()); // Should return false
 
 		assert_eq!(stats.entry_count(), 1);
 	}
@@ -627,7 +689,7 @@ mod tests {
 		let temp_dir = TempDir::new().unwrap();
 		let stats = DiscardStats::new(temp_dir.path()).unwrap();
 
-		assert_eq!(stats.get_file_stats(999), 0);
+		assert_eq!(stats.get_file_stats(999).unwrap(), 0);
 	}
 
 	#[test]
@@ -650,9 +712,247 @@ mod tests {
 		stats.update(u32::MAX / 2, 300).unwrap();
 
 		// Verify sorted order: 0, 1, MAX/2, MAX
-		assert_eq!(stats.get_file_id(0), 0);
-		assert_eq!(stats.get_file_id(1), 1);
-		assert_eq!(stats.get_file_id(2), u32::MAX / 2);
-		assert_eq!(stats.get_file_id(3), u32::MAX);
+		assert_eq!(stats.get_file_id(0).unwrap(), 0);
+		assert_eq!(stats.get_file_id(1).unwrap(), 1);
+		assert_eq!(stats.get_file_id(2).unwrap(), u32::MAX / 2);
+		assert_eq!(stats.get_file_id(3).unwrap(), u32::MAX);
+	}
+
+	#[test]
+	fn test_binary_search() {
+		let temp_dir = TempDir::new().unwrap();
+		let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
+
+		stats.update(10, 100).unwrap();
+		stats.update(20, 200).unwrap();
+		stats.update(30, 300).unwrap();
+
+		// Test found cases
+		assert_eq!(stats.binary_search_with_position(10, 3).unwrap(), (0, true));
+		assert_eq!(stats.binary_search_with_position(20, 3).unwrap(), (1, true));
+		assert_eq!(stats.binary_search_with_position(30, 3).unwrap(), (2, true));
+
+		// Test not-found cases (returns insertion point)
+		assert_eq!(stats.binary_search_with_position(5, 3).unwrap(), (0, false));
+		assert_eq!(stats.binary_search_with_position(15, 3).unwrap(), (1, false));
+		assert_eq!(stats.binary_search_with_position(25, 3).unwrap(), (2, false));
+		assert_eq!(stats.binary_search_with_position(35, 3).unwrap(), (3, false));
+	}
+
+	#[test]
+	fn test_expand_zeroes_new_region() {
+		let temp_dir = TempDir::new().unwrap();
+		let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
+
+		let initial_size = stats.mmap.len();
+
+		// Fill to trigger expansion
+		let slots_needed = stats.max_slots() + 1;
+		for i in 0..slots_needed {
+			stats.update(i as u32, 1).unwrap();
+		}
+
+		// Verify expansion happened
+		assert!(stats.mmap.len() > initial_size);
+
+		// Verify unused region is zeroed
+		let used_bytes = HEADER_SIZE + slots_needed * ENTRY_SIZE;
+		for i in used_bytes..stats.mmap.len() {
+			assert_eq!(stats.mmap[i], 0, "Byte {} should be zero", i);
+		}
+	}
+
+	// ========================================================================
+	// ERROR HANDLING TESTS
+	// ========================================================================
+
+	#[test]
+	fn test_slot_out_of_bounds_error() {
+		let temp_dir = TempDir::new().unwrap();
+		let stats = DiscardStats::new(temp_dir.path()).unwrap();
+
+		let max = stats.max_slots();
+
+		// Accessing slot beyond max should return error
+		let result = stats.get_file_id(max);
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			Error::DiscardSlotOutOfBounds {
+				slot,
+				max: m,
+			} => {
+				assert_eq!(slot, max);
+				assert_eq!(m, max);
+			}
+			e => panic!("Expected DiscardSlotOutOfBounds, got {:?}", e),
+		}
+
+		let result = stats.get_discard_bytes(max + 10);
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			Error::DiscardSlotOutOfBounds {
+				slot,
+				max: m,
+			} => {
+				assert_eq!(slot, max + 10);
+				assert_eq!(m, max);
+			}
+			e => panic!("Expected DiscardSlotOutOfBounds, got {:?}", e),
+		}
+	}
+
+	#[test]
+	fn test_corrupted_entry_count_detection() {
+		let temp_dir = TempDir::new().unwrap();
+
+		// Create a valid stats file first
+		{
+			let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
+			stats.update(1, 100).unwrap();
+			stats.update(2, 200).unwrap();
+		}
+
+		// Now corrupt the entry count in the file
+		let path = temp_dir.path().join(DISCARD_STATS_FILENAME);
+		let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+		let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+
+		// Get max_slots for this mmap
+		let max_slots = (mmap.len() - HEADER_SIZE) / ENTRY_SIZE;
+
+		// Set entry count to an invalid value (larger than max_slots)
+		// Count offset is 8 (after 4-byte magic + 4-byte version)
+		let count_offset = 8;
+		let corrupted_count = (max_slots + 100) as u32;
+		mmap[count_offset..count_offset + 4].copy_from_slice(&corrupted_count.to_be_bytes());
+		mmap.flush().unwrap();
+		drop(mmap);
+
+		// Opening should detect corruption
+		let result = DiscardStats::new(temp_dir.path());
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			Error::DiscardCorruptedEntryCount {
+				count,
+				max,
+			} => {
+				assert_eq!(count, corrupted_count as usize);
+				assert_eq!(max, max_slots);
+			}
+			e => panic!("Expected DiscardCorruptedEntryCount, got {:?}", e),
+		}
+	}
+
+	#[test]
+	fn test_corrupted_data_unsorted_detection() {
+		let temp_dir = TempDir::new().unwrap();
+
+		// Create a valid stats file first
+		{
+			let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
+			stats.update(1, 100).unwrap();
+			stats.update(2, 200).unwrap();
+			stats.update(3, 300).unwrap();
+		}
+
+		// Now corrupt the data by making entries unsorted
+		let path = temp_dir.path().join(DISCARD_STATS_FILENAME);
+		let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+		let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+
+		// Swap file_id at slot 0 and slot 2 to break sorted order
+		// Slot 0 has file_id=1, slot 2 has file_id=3
+		// We'll set slot 1 to have file_id=5 (which breaks order: 1, 5, 3)
+		let slot1_offset = HEADER_SIZE + ENTRY_SIZE;
+		let bad_file_id: u32 = 5;
+		mmap[slot1_offset..slot1_offset + 4].copy_from_slice(&bad_file_id.to_be_bytes());
+		mmap.flush().unwrap();
+		drop(mmap);
+
+		// Opening should detect corruption
+		let result = DiscardStats::new(temp_dir.path());
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			Error::DiscardCorruptedData {
+				slot,
+				reason,
+			} => {
+				assert_eq!(slot, 2); // Slot 2 is where the order violation is detected
+				assert!(reason.contains("not sorted"));
+			}
+			e => panic!("Expected DiscardCorruptedData, got {:?}", e),
+		}
+	}
+
+	#[test]
+	fn test_corrupted_data_duplicate_detection() {
+		let temp_dir = TempDir::new().unwrap();
+
+		// Create a valid stats file first
+		{
+			let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
+			stats.update(1, 100).unwrap();
+			stats.update(2, 200).unwrap();
+			stats.update(3, 300).unwrap();
+		}
+
+		// Now corrupt the data by creating duplicate file_ids
+		let path = temp_dir.path().join(DISCARD_STATS_FILENAME);
+		let file = OpenOptions::new().read(true).write(true).open(&path).unwrap();
+		let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file).unwrap() };
+
+		// Set slot 1 to have the same file_id as slot 0 (duplicate: 1, 1, 3)
+		let slot1_offset = HEADER_SIZE + ENTRY_SIZE;
+		let duplicate_file_id: u32 = 1;
+		mmap[slot1_offset..slot1_offset + 4].copy_from_slice(&duplicate_file_id.to_be_bytes());
+		mmap.flush().unwrap();
+		drop(mmap);
+
+		// Opening should detect corruption
+		let result = DiscardStats::new(temp_dir.path());
+		assert!(result.is_err());
+		match result.unwrap_err() {
+			Error::DiscardCorruptedData {
+				slot,
+				reason,
+			} => {
+				assert_eq!(slot, 1); // Duplicate detected at slot 1
+				assert!(reason.contains("duplicate"));
+			}
+			e => panic!("Expected DiscardCorruptedData, got {:?}", e),
+		}
+	}
+
+	#[test]
+	fn test_get_gc_candidates_returns_result() {
+		let temp_dir = TempDir::new().unwrap();
+		let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
+
+		stats.update(1, 100).unwrap();
+		stats.update(2, 200).unwrap();
+
+		// Normal operation should return Ok
+		let candidates = stats.get_gc_candidates().unwrap();
+		assert_eq!(candidates.len(), 2);
+		// Sorted by discard bytes descending
+		assert_eq!(candidates[0], (2, 200));
+		assert_eq!(candidates[1], (1, 100));
+	}
+
+	#[test]
+	fn test_remove_file_returns_result() {
+		let temp_dir = TempDir::new().unwrap();
+		let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
+
+		stats.update(1, 100).unwrap();
+		stats.update(2, 200).unwrap();
+
+		// Remove existing file should return Ok(true)
+		assert!(stats.remove_file(1).unwrap());
+		assert_eq!(stats.entry_count(), 1);
+
+		// Remove non-existing file should return Ok(false)
+		assert!(!stats.remove_file(999).unwrap());
+		assert_eq!(stats.entry_count(), 1);
 	}
 }

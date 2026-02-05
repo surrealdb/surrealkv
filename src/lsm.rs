@@ -1529,7 +1529,7 @@ impl Tree {
 	#[cfg(test)]
 	pub(crate) fn get_all_vlog_stats(&self) -> Vec<(u32, u64, u64, f64)> {
 		match &self.core.vlog {
-			Some(vlog) => vlog.get_all_file_stats(),
+			Some(vlog) => vlog.get_all_file_stats().unwrap(),
 			None => Vec::new(),
 		}
 	}

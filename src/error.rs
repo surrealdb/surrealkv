@@ -60,6 +60,21 @@ pub enum Error {
 		message: String,
 	},
 	SSTable(crate::sstable::error::SSTableError), // SSTable-specific errors
+	/// Discard stats slot access out of bounds
+	DiscardSlotOutOfBounds {
+		slot: usize,
+		max: usize,
+	},
+	/// Discard stats corrupted entry count
+	DiscardCorruptedEntryCount {
+		count: usize,
+		max: usize,
+	},
+	/// Discard stats corrupted data
+	DiscardCorruptedData {
+		slot: usize,
+		reason: String,
+	},
 }
 
 // Implementation of Display trait for Error
@@ -112,6 +127,9 @@ impl fmt::Display for Error {
                 segment_id, offset, message
             ),
             Self::SSTable(err) => write!(f, "SSTable error: {err}"),
+            Self::DiscardSlotOutOfBounds { slot, max } => write!(f, "Discard stats slot {slot} out of bounds (max: {max})"),
+            Self::DiscardCorruptedEntryCount { count, max } => write!(f, "Discard stats corrupted: entry count {count} exceeds max slots {max}"),
+            Self::DiscardCorruptedData { slot, reason } => write!(f, "Discard stats corrupted at slot {slot}: {reason}"),
         }
 	}
 }

@@ -910,7 +910,7 @@ impl VLog {
 		// Get all files with discardable bytes, sorted by discard bytes (descending)
 		let candidates = {
 			let discard_stats = self.discard_stats.lock();
-			discard_stats.get_gc_candidates()
+			discard_stats.get_gc_candidates()?
 		};
 
 		if candidates.is_empty() {
@@ -921,31 +921,33 @@ impl VLog {
 		let active_writer_id = self.active_writer_id.load(Ordering::SeqCst);
 
 		// Find the best candidate to compact (first one that meets all criteria)
-		let candidate_to_compact = candidates.into_iter().find(|(file_id, discard_bytes)| {
+		let mut candidate_to_compact = None;
+		for (file_id, discard_bytes) in candidates {
 			// Skip if no discard bytes
-			if *discard_bytes == 0 {
-				return false;
+			if discard_bytes == 0 {
+				continue;
 			}
 
 			// Check if this file meets the discard ratio threshold
-			let (total_size, _, discard_ratio) = self.get_file_stats(*file_id);
+			let (total_size, _, discard_ratio) = self.get_file_stats(file_id)?;
 			if total_size == 0 || discard_ratio < self.gc_discard_ratio {
-				return false;
+				continue;
 			}
 
 			// Skip if this is the active writer
-			if *file_id == active_writer_id {
-				return false;
+			if file_id == active_writer_id {
+				continue;
 			}
 
 			// Skip if file is already marked for deletion
 			let files_to_delete = self.files_to_be_deleted.read();
-			if files_to_delete.contains(file_id) {
-				return false;
+			if files_to_delete.contains(&file_id) {
+				continue;
 			}
 
-			true
-		});
+			candidate_to_compact = Some((file_id, discard_bytes));
+			break;
+		}
 
 		// If we found a candidate, try to compact it
 		if let Some((file_id, _)) = candidate_to_compact {
@@ -1010,7 +1012,7 @@ impl VLog {
 		}
 
 		// Get current discard statistics for this file
-		let (total_size, expected_discard, _) = self.get_file_stats(file_id);
+		let (total_size, expected_discard, _) = self.get_file_stats(file_id)?;
 
 		if total_size == 0 || expected_discard == 0 {
 			// No point in compacting if there's nothing to discard
@@ -1150,7 +1152,7 @@ impl VLog {
 			// Update discard stats (file will be deleted, so reset stats)
 			{
 				let mut discard_stats = self.discard_stats.lock();
-				discard_stats.remove_file(file_id);
+				discard_stats.remove_file(file_id)?;
 			}
 
 			Ok(true)
@@ -1180,9 +1182,9 @@ impl VLog {
 	}
 
 	/// Gets statistics for a specific file
-	fn get_file_stats(&self, file_id: u32) -> (u64, u64, f64) {
+	fn get_file_stats(&self, file_id: u32) -> Result<(u64, u64, f64)> {
 		let discard_stats = self.discard_stats.lock();
-		let discard_bytes = discard_stats.get_file_stats(file_id);
+		let discard_bytes = discard_stats.get_file_stats(file_id)?;
 
 		// Get file size from filesystem
 		let file_path = self.vlog_file_path(file_id);
@@ -1198,7 +1200,7 @@ impl VLog {
 			0.0
 		};
 
-		(total_size, discard_bytes, discard_ratio)
+		Ok((total_size, discard_bytes, discard_ratio))
 	}
 
 	/// Registers a VLog file in the files map for tracking
@@ -1242,6 +1244,10 @@ impl VLog {
 		for (file_id, discard_bytes) in stats {
 			discard_stats.update(*file_id, *discard_bytes)?;
 		}
+
+		// Syncs discard statistics to disk
+		discard_stats.sync()?;
+
 		Ok(())
 	}
 
@@ -1257,21 +1263,21 @@ impl VLog {
 
 	/// Gets statistics for all VLog files (for debugging)
 	#[allow(unused)]
-	pub(crate) fn get_all_file_stats(&self) -> Vec<(u32, u64, u64, f64)> {
+	pub(crate) fn get_all_file_stats(&self) -> Result<Vec<(u32, u64, u64, f64)>> {
 		let mut all_stats = Vec::new();
 
 		// Check files from 0 to next counter
 		let next_file_id = self.next_file_id.load(std::sync::atomic::Ordering::SeqCst);
 
 		for file_id in 0..next_file_id {
-			let (total_size, discard_bytes, discard_ratio) = self.get_file_stats(file_id);
+			let (total_size, discard_bytes, discard_ratio) = self.get_file_stats(file_id)?;
 			if total_size > 0 {
 				// Only include files that exist
 				all_stats.push((file_id, total_size, discard_bytes, discard_ratio));
 			}
 		}
 
-		all_stats
+		Ok(all_stats)
 	}
 
 	/// Checks if a sequence number is marked as stale in the delete list
