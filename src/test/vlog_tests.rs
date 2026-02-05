@@ -78,14 +78,14 @@ fn test_discard_stats_operations() {
 	let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
 
 	// Add some discardable bytes
-	stats.update(1, 100);
-	stats.update(1, 50);
+	stats.update(1, 100).unwrap();
+	stats.update(1, 50).unwrap();
 
 	let discard_bytes = stats.get_file_stats(1);
 	assert_eq!(discard_bytes, 150);
 
 	// Test another file
-	stats.update(2, 300); // Higher discard
+	stats.update(2, 300).unwrap(); // Higher discard
 
 	let candidates = stats.get_gc_candidates();
 	let (max_file, max_discard) = candidates[0];
@@ -102,13 +102,13 @@ fn test_gc_threshold_with_discard_stats() {
 	let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
 
 	// File 1: Add discardable data
-	stats.update(1, 600);
+	stats.update(1, 600).unwrap();
 
 	let discard_bytes = stats.get_file_stats(1);
 	assert_eq!(discard_bytes, 600);
 
 	// File 2: Lower discard
-	stats.update(2, 200);
+	stats.update(2, 200).unwrap();
 
 	let discard_bytes_2 = stats.get_file_stats(2);
 	assert_eq!(discard_bytes_2, 200);

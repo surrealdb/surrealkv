@@ -1538,7 +1538,7 @@ impl Tree {
 	/// Updates VLog discard statistics if VLog is enabled
 	pub(crate) fn update_vlog_discard_stats(&self, stats: &HashMap<u32, i64>) {
 		if let Some(ref vlog) = self.core.vlog {
-			vlog.update_discard_stats(stats);
+			vlog.update_discard_stats(stats).unwrap();
 		}
 	}
 

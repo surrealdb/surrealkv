@@ -1236,12 +1236,13 @@ impl VLog {
 	/// Updates discard statistics for a file
 	/// This should be called during LSM compaction when outdated VLog pointers
 	/// are found
-	pub(crate) fn update_discard_stats(&self, stats: &HashMap<u32, i64>) {
+	pub(crate) fn update_discard_stats(&self, stats: &HashMap<u32, i64>) -> Result<()> {
 		let mut discard_stats = self.discard_stats.lock();
 
 		for (file_id, discard_bytes) in stats {
-			discard_stats.update(*file_id, *discard_bytes);
+			discard_stats.update(*file_id, *discard_bytes)?;
 		}
+		Ok(())
 	}
 
 	/// Adds multiple stale entries to the global delete list in a batch

@@ -152,16 +152,20 @@ impl Compactor {
 			None
 		};
 
+		// Update discard stats BEFORE manifest commit for clean abort on error.
+		// If this fails, the HiddenTablesGuard will unhide tables on drop,
+		// leaving the system in a consistent state.
+		if !discard_stats.is_empty() {
+			if let Some(ref vlog) = self.options.vlog {
+				vlog.update_discard_stats(&discard_stats)?;
+			}
+		}
+
 		// Update manifest - this will commit the guard on success
 		self.update_manifest(input, new_table, &mut guard)?;
 
 		self.cleanup_old_tables(input);
 
-		if !discard_stats.is_empty() {
-			if let Some(ref vlog) = self.options.vlog {
-				vlog.update_discard_stats(&discard_stats);
-			}
-		}
 		Ok(())
 	}
 
