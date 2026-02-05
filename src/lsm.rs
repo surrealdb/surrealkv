@@ -1529,7 +1529,7 @@ impl Tree {
 	#[cfg(test)]
 	pub(crate) fn get_all_vlog_stats(&self) -> Vec<(u32, u64, u64, f64)> {
 		match &self.core.vlog {
-			Some(vlog) => vlog.get_all_file_stats(),
+			Some(vlog) => vlog.get_all_file_stats().unwrap(),
 			None => Vec::new(),
 		}
 	}
@@ -1538,7 +1538,7 @@ impl Tree {
 	/// Updates VLog discard statistics if VLog is enabled
 	pub(crate) fn update_vlog_discard_stats(&self, stats: &HashMap<u32, i64>) {
 		if let Some(ref vlog) = self.core.vlog {
-			vlog.update_discard_stats(stats);
+			vlog.update_discard_stats(stats).unwrap();
 		}
 	}
 
