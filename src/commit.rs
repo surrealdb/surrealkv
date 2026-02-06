@@ -189,11 +189,13 @@ pub(crate) struct CommitPipeline {
 }
 
 impl CommitPipeline {
-	pub(crate) fn new(env: Arc<dyn CommitEnv>) -> Arc<Self> {
+	/// Creates a new commit pipeline with a shared visible_seq_num.
+	/// The visible_seq_num should be shared with CoreInner for coordinated updates.
+	pub(crate) fn new(env: Arc<dyn CommitEnv>, visible_seq_num: Arc<AtomicU64>) -> Arc<Self> {
 		Arc::new(Self {
 			env,
 			log_seq_num: AtomicU64::new(1),
-			visible_seq_num: Arc::new(AtomicU64::new(0)),
+			visible_seq_num,
 			write_mutex: Mutex::new(()),
 			pending: CommitQueue::new(),
 			commit_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMITS - 1)),
@@ -388,6 +390,10 @@ mod tests {
 	use super::*;
 	use crate::InternalKeyKind;
 
+	fn test_visible_seq_num() -> Arc<AtomicU64> {
+		Arc::new(AtomicU64::new(0))
+	}
+
 	struct MockEnv;
 
 	impl CommitEnv for MockEnv {
@@ -416,7 +422,7 @@ mod tests {
 
 	#[test(tokio::test)]
 	async fn test_single_commit() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		let mut batch = Batch::new(0);
 		batch
@@ -437,7 +443,7 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 	async fn test_sequential_commits() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		// First test sequential commits to verify basic functionality
 		for i in 0..5 {
@@ -461,7 +467,7 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 	async fn test_concurrent_commits() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		let mut handles = vec![];
 		for i in 0..10 {
@@ -535,7 +541,7 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_concurrent_commits_with_delays() {
-		let pipeline = CommitPipeline::new(Arc::new(DelayedMockEnv));
+		let pipeline = CommitPipeline::new(Arc::new(DelayedMockEnv), test_visible_seq_num());
 
 		let mut handles = vec![];
 		for i in 0..5 {
@@ -570,7 +576,7 @@ mod tests {
 
 	#[test]
 	fn test_sync_commit_single() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		let mut batch = Batch::new(0);
 		batch
@@ -588,7 +594,7 @@ mod tests {
 
 	#[test]
 	fn test_sync_commit_multiple_sequential() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		// Test multiple sequential sync commits
 		for i in 0..5 {
@@ -614,7 +620,7 @@ mod tests {
 
 	#[test]
 	fn test_sync_commit_empty_batch() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		let batch = Batch::new(0);
 		let result = pipeline.sync_commit(batch, false);
@@ -628,7 +634,7 @@ mod tests {
 
 	#[test]
 	fn test_sync_commit_with_sync_wal() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		let mut batch = Batch::new(0);
 		batch
@@ -643,7 +649,7 @@ mod tests {
 
 	#[test]
 	fn test_sync_commit_sequence_number_consistency() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		// Set initial sequence number
 		pipeline.set_seq_num(100);
@@ -674,7 +680,7 @@ mod tests {
 
 	#[test]
 	fn test_sync_commit_after_shutdown() {
-		let pipeline = CommitPipeline::new(Arc::new(MockEnv));
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 		pipeline.shutdown();
 
 		let mut batch = Batch::new(0);
@@ -746,7 +752,8 @@ mod tests {
 	#[test]
 	fn test_sync_commit_calls_write_and_apply() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline = CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>);
+		let pipeline =
+			CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>, test_visible_seq_num());
 
 		let mut batch = Batch::new(0);
 		batch
@@ -771,7 +778,8 @@ mod tests {
 	#[test]
 	fn test_sync_commit_multiple_batches_tracking() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline = CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>);
+		let pipeline =
+			CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>, test_visible_seq_num());
 
 		// Commit multiple batches
 		for i in 0..3 {
@@ -798,7 +806,8 @@ mod tests {
 	#[test]
 	fn test_sync_commit_concurrent_access() {
 		let env = Arc::new(TrackingMockEnv::new());
-		let pipeline_clone = CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>);
+		let pipeline_clone =
+			CommitPipeline::new(Arc::clone(&env) as Arc<dyn CommitEnv>, test_visible_seq_num());
 		let pipeline = Arc::new(pipeline_clone);
 
 		// Test concurrent access to sync_commit

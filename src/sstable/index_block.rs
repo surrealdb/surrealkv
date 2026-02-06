@@ -505,11 +505,7 @@ impl Index {
 ///
 /// ## Purpose
 ///
-/// The TwoLevelIterator needs a "first level" iterator that produces
-/// index entries (separator_key → data_block_handle). However, these
-/// entries are spread across multiple partition blocks.
-///
-/// IndexIterator "flattens" this structure by:
+/// IndexIterator does the following:
 /// 1. Iterating through partition blocks sequentially
 /// 2. Within each partition, iterating through entries
 /// 3. Automatically crossing partition boundaries

@@ -237,8 +237,8 @@ pub struct Transaction {
 	/// cannot make any more changes to the data.
 	closed: bool,
 
-	/// Tracks when this transaction started for deadlock detection
-	pub(crate) start_commit_id: u64,
+	/// The sequence number when this transaction started.
+	pub(crate) start_seq_num: u64,
 
 	/// `savepoints` indicates the current number of stacked savepoints; zero
 	/// means none.
@@ -274,20 +274,12 @@ impl Transaction {
 			durability,
 		} = opts;
 
-		let read_ts = core.seq_num();
-
-		let start_commit_id =
-			core.oracle.transaction_commit_id.load(std::sync::atomic::Ordering::Acquire);
-
-		// Only register mutable transactions with the oracle for conflict detection
-		// Read-only transactions don't need conflict detection since they don't write
-		if mode.mutable() {
-			core.oracle.register_txn_start(start_commit_id);
-		}
+		// Get the current visible sequence number as our start point.
+		let start_seq_num = core.seq_num();
 
 		let mut snapshot = None;
 		if !mode.is_write_only() {
-			snapshot = Some(Snapshot::new(Arc::clone(&core), read_ts));
+			snapshot = Some(Snapshot::new(Arc::clone(&core), start_seq_num));
 		}
 
 		Ok(Self {
@@ -297,7 +289,7 @@ impl Transaction {
 			write_set: BTreeMap::new(),
 			durability,
 			closed: false,
-			start_commit_id,
+			start_seq_num,
 			savepoints: 0,
 			write_seqno: 0,
 		})
@@ -738,11 +730,8 @@ impl Transaction {
 			return Ok(());
 		}
 
-		// Prepare for commit - uses the new Oracle method
-		let _ = self.core.oracle.prepare_commit(self)?;
-
-		// Unregister the transaction start point
-		self.core.oracle.unregister_txn_start(self.start_commit_id);
+		// This checks if any key in our write set was modified after we started.
+		self.validate_write_conflicts()?;
 
 		// Create and prepare batch directly
 		let mut batch = Batch::new(0);
@@ -753,7 +742,7 @@ impl Transaction {
 			std::mem::take(&mut self.write_set).into_values().flatten().collect();
 		latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
 
-		// Generate a single timestamp for this commit
+		// Generate a single timestamp for this commit using the oracle
 		let commit_timestamp = self.core.opts.clock.now();
 
 		// Add all entries to the batch
@@ -777,13 +766,25 @@ impl Transaction {
 		Ok(())
 	}
 
-	/// Rolls back the transaction by removing all updated entries.
-	pub fn rollback(&mut self) {
-		// Only unregister mutable transactions since only they get registered
-		if !self.closed && self.mode.mutable() {
-			self.core.oracle.unregister_txn_start(self.start_commit_id);
+	/// Validates that no key in our write set was modified after we started.
+	/// Only checks memtables - returns TransactionRetry if history insufficient.
+	fn validate_write_conflicts(&self) -> Result<()> {
+		// Early check: is memtable history sufficient?
+		// If our transaction started before the oldest memtable was created,
+		// we can't reliably check for conflicts (data may have been flushed to SST).
+		let earliest_memtable_seq = self.core.inner.get_earliest_memtable_seq()?;
+		if self.start_seq_num < earliest_memtable_seq {
+			return Err(Error::TransactionRetry);
 		}
 
+		// Check all keys in one batch
+		self.core
+			.inner
+			.check_keys_conflict(self.write_set.keys().map(|k| k.as_slice()), self.start_seq_num)
+	}
+
+	/// Rolls back the transaction by removing all updated entries.
+	pub fn rollback(&mut self) {
 		self.closed = true;
 		self.write_set.clear();
 		self.snapshot.take();

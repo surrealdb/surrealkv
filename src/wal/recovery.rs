@@ -146,7 +146,9 @@ pub(crate) fn replay_wal(
 		log::debug!("Processing WAL segment #{:020}", segment_id);
 
 		// Create a new memtable for this segment
-		let mut current_memtable = Arc::new(MemTable::new(arena_size));
+		// During recovery, use 0 as earliest_seq since we're replaying committed data.
+		// The proper sequence numbers will be established after recovery completes.
+		let mut current_memtable = Arc::new(MemTable::new(arena_size, 0));
 
 		// Open the segment file
 		let file = File::open(&segment.file_path)?;
@@ -195,7 +197,8 @@ pub(crate) fn replay_wal(
 								segment_id
 							);
 							memtables.push((Arc::clone(&current_memtable), segment_id));
-							current_memtable = Arc::new(MemTable::new(arena_size));
+							// During recovery, use 0 as earliest_seq
+							current_memtable = Arc::new(MemTable::new(arena_size, 0));
 							// Retry on fresh memtable
 							current_memtable.add(&batch)?;
 						}
