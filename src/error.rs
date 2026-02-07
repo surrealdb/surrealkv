@@ -164,18 +164,6 @@ impl From<crate::wal::Error> for Error {
 	}
 }
 
-impl From<async_channel::SendError<std::result::Result<(), Error>>> for Error {
-	fn from(error: async_channel::SendError<std::result::Result<(), Error>>) -> Self {
-		Error::Send(format!("Async channel send error: {error}"))
-	}
-}
-
-impl From<async_channel::RecvError> for Error {
-	fn from(error: async_channel::RecvError) -> Self {
-		Error::Receive(format!("Async channel receive error: {error}"))
-	}
-}
-
 impl From<crate::bplustree::tree::BPlusTreeError> for Error {
 	fn from(err: crate::bplustree::tree::BPlusTreeError) -> Self {
 		Error::BPlusTree(err.to_string())
