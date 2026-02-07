@@ -118,6 +118,7 @@ pub(crate) fn replay_wal(
 
 	// Track statistics
 	let mut max_seq_num: u64 = 0;
+	let mut last_added_max_seq: u64 = 0; // Track highest seq successfully added to memtable
 	let mut total_batches_replayed = 0;
 	let mut segments_processed = 0;
 
@@ -146,9 +147,7 @@ pub(crate) fn replay_wal(
 		log::debug!("Processing WAL segment #{:020}", segment_id);
 
 		// Create a new memtable for this segment
-		// During recovery, use 0 as earliest_seq since we're replaying committed data.
-		// The proper sequence numbers will be established after recovery completes.
-		let mut current_memtable = Arc::new(MemTable::new(arena_size, 0));
+		let mut current_memtable = Arc::new(MemTable::new(arena_size, last_added_max_seq));
 
 		// Open the segment file
 		let file = File::open(&segment.file_path)?;
@@ -182,7 +181,11 @@ pub(crate) fn replay_wal(
 
 					// Apply batch to current memtable with ArenaFull handling
 					match current_memtable.add(&batch) {
-						Ok(()) => {}
+						Ok(()) => {
+							if batch_highest_seq_num > last_added_max_seq {
+								last_added_max_seq = batch_highest_seq_num;
+							}
+						}
 						Err(Error::ArenaFull) => {
 							// Edge case: single segment exceeds memtable capacity
 							if current_memtable.is_empty() {
@@ -197,10 +200,14 @@ pub(crate) fn replay_wal(
 								segment_id
 							);
 							memtables.push((Arc::clone(&current_memtable), segment_id));
-							// During recovery, use 0 as earliest_seq
-							current_memtable = Arc::new(MemTable::new(arena_size, 0));
+							current_memtable =
+								Arc::new(MemTable::new(arena_size, last_added_max_seq));
 							// Retry on fresh memtable
 							current_memtable.add(&batch)?;
+							// Track after successful retry
+							if batch_highest_seq_num > last_added_max_seq {
+								last_added_max_seq = batch_highest_seq_num;
+							}
 						}
 						Err(e) => return Err(e),
 					}

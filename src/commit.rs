@@ -189,8 +189,6 @@ pub(crate) struct CommitPipeline {
 }
 
 impl CommitPipeline {
-	/// Creates a new commit pipeline with a shared visible_seq_num.
-	/// The visible_seq_num should be shared with CoreInner for coordinated updates.
 	pub(crate) fn new(env: Arc<dyn CommitEnv>, visible_seq_num: Arc<AtomicU64>) -> Arc<Self> {
 		Arc::new(Self {
 			env,

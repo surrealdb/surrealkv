@@ -742,7 +742,7 @@ impl Transaction {
 			std::mem::take(&mut self.write_set).into_values().flatten().collect();
 		latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
 
-		// Generate a single timestamp for this commit using the oracle
+		// Generate a single timestamp for this commit
 		let commit_timestamp = self.core.opts.clock.now();
 
 		// Add all entries to the batch
@@ -783,7 +783,6 @@ impl Transaction {
 			.check_keys_conflict(self.write_set.keys().map(|k| k.as_slice()), self.start_seq_num)
 	}
 
-	/// Rolls back the transaction by removing all updated entries.
 	pub fn rollback(&mut self) {
 		self.closed = true;
 		self.write_set.clear();
