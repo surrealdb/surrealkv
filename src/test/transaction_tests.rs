@@ -3283,3 +3283,175 @@ async fn test_versioned_range_survives_memtable_flush() {
 	assert_eq!(results[1].1, b"v2");
 	assert_eq!(results[2].1, b"v3");
 }
+
+#[test(tokio::test)]
+async fn test_conflict_detection_basic() {
+	let (store, _temp_dir) = create_store();
+
+	let key = b"conflict_key";
+	let value1 = b"value1";
+	let value2 = b"value2";
+
+	// Start two transactions
+	let mut txn1 = store.begin().unwrap();
+	let mut txn2 = store.begin().unwrap();
+
+	// Both write to the same key
+	txn1.set(key, value1).unwrap();
+	txn2.set(key, value2).unwrap();
+
+	// First commit succeeds
+	txn1.commit().await.unwrap();
+
+	// Second commit should fail with write conflict
+	let result = txn2.commit().await;
+	assert!(
+		matches!(result, Err(Error::TransactionWriteConflict)),
+		"Expected TransactionWriteConflict, got: {:?}",
+		result
+	);
+}
+
+/// Test that non-overlapping writes don't conflict.
+#[test(tokio::test)]
+async fn test_no_conflict_different_keys() {
+	let (store, _temp_dir) = create_store();
+
+	let key1 = b"key1";
+	let key2 = b"key2";
+	let value = b"value";
+
+	// Start two transactions
+	let mut txn1 = store.begin().unwrap();
+	let mut txn2 = store.begin().unwrap();
+
+	// Write to different keys
+	txn1.set(key1, value).unwrap();
+	txn2.set(key2, value).unwrap();
+
+	// Both should succeed
+	txn1.commit().await.unwrap();
+	txn2.commit().await.unwrap();
+
+	// Verify both writes are visible
+	let txn3 = store.begin().unwrap();
+	assert_eq!(txn3.get(key1).unwrap().unwrap(), value.to_vec());
+	assert_eq!(txn3.get(key2).unwrap().unwrap(), value.to_vec());
+}
+
+/// Test that reading a key doesn't create a conflict for writes to that key.
+/// (We implement write-write conflict detection, not read-write)
+#[test(tokio::test)]
+async fn test_read_write_no_conflict() {
+	let (store, _temp_dir) = create_store();
+
+	let key = b"read_write_key";
+	let value1 = b"value1";
+	let value2 = b"value2";
+
+	// Pre-populate the key
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(key, value1).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Start two transactions
+	let mut txn1 = store.begin().unwrap();
+	let txn2 = store.begin().unwrap();
+
+	// txn1 writes to the key
+	txn1.set(key, value2).unwrap();
+
+	// txn2 only reads the key (read-only transaction doesn't conflict)
+	let read_value = txn2.get(key).unwrap().unwrap();
+	assert_eq!(read_value, value1.to_vec()); // Should see old value (snapshot isolation)
+
+	// txn1 commits successfully
+	txn1.commit().await.unwrap();
+
+	// txn2 can still read its snapshot
+	assert_eq!(txn2.get(key).unwrap().unwrap(), value1.to_vec());
+}
+
+/// Test that a transaction that starts after another commits doesn't conflict.
+#[test(tokio::test)]
+async fn test_sequential_no_conflict() {
+	let (store, _temp_dir) = create_store();
+
+	let key = b"seq_key";
+	let value1 = b"value1";
+	let value2 = b"value2";
+
+	// First transaction
+	{
+		let mut txn1 = store.begin().unwrap();
+		txn1.set(key, value1).unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	// Second transaction starts AFTER first commits - no conflict
+	{
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(key, value2).unwrap();
+		txn2.commit().await.unwrap();
+	}
+
+	// Verify final value
+	let txn3 = store.begin().unwrap();
+	assert_eq!(txn3.get(key).unwrap().unwrap(), value2.to_vec());
+}
+
+/// Test conflict detection with multiple keys where only one conflicts.
+#[test(tokio::test)]
+async fn test_partial_overlap_conflict() {
+	let (store, _temp_dir) = create_store();
+
+	let key1 = b"key1";
+	let key2 = b"key2";
+	let key3 = b"key3";
+	let value = b"value";
+
+	// Start two transactions
+	let mut txn1 = store.begin().unwrap();
+	let mut txn2 = store.begin().unwrap();
+
+	// txn1 writes to key1 and key2
+	txn1.set(key1, value).unwrap();
+	txn1.set(key2, value).unwrap();
+
+	// txn2 writes to key2 and key3 (key2 overlaps)
+	txn2.set(key2, value).unwrap();
+	txn2.set(key3, value).unwrap();
+
+	// First commit succeeds
+	txn1.commit().await.unwrap();
+
+	// Second commit should fail due to key2 conflict
+	let result = txn2.commit().await;
+	assert!(
+		matches!(result, Err(Error::TransactionWriteConflict)),
+		"Expected TransactionWriteConflict, got: {:?}",
+		result
+	);
+}
+
+/// Test that the earliest_seq field on memtables is properly tracked.
+#[test(tokio::test)]
+async fn test_memtable_earliest_seq_tracking() {
+	let (store, _temp_dir) = create_store();
+
+	// Write some data to establish a sequence number
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"key1", b"value1").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// The memtable should now have earliest_seq set
+	// When we start a new transaction, it should get the current visible_seq_num
+	let txn = store.begin().unwrap();
+
+	// The transaction's start_seq_num should be 1
+	assert_eq!(txn.start_seq_num, 1, "Transaction start_seq_num should be 1 after commit");
+}

@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::{create_dir_all, File};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
@@ -17,7 +18,6 @@ use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lockfile::LockFile;
 use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
-use crate::oracle::Oracle;
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::Table;
 use crate::task::TaskManager;
@@ -115,11 +115,6 @@ pub(crate) struct CoreInner {
 	/// snapshot-aware compaction.
 	pub(crate) snapshot_tracker: SnapshotTracker,
 
-	/// Oracle managing transaction timestamps for MVCC.
-	/// Provides monotonic timestamps for transaction ordering and conflict
-	/// resolution.
-	pub(crate) oracle: Arc<Oracle>,
-
 	/// Value Log (VLog)
 	pub(crate) vlog: Option<Arc<VLog>>,
 
@@ -135,6 +130,11 @@ pub(crate) struct CoreInner {
 
 	/// Background error handler
 	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
+
+	/// Visible sequence number - the highest sequence number that is visible to readers.
+	/// Shared with CommitPipeline for coordinated updates.
+	/// Used to set `earliest_seq` when creating new memtables for conflict detection.
+	pub(crate) visible_seq_num: Arc<AtomicU64>,
 }
 
 impl CoreInner {
@@ -148,11 +148,6 @@ impl CoreInner {
 		// Initialize immutable memtables
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
 
-		// TODO: Add a way to recover from the WAL or level manifest
-		// Initialize the transaction oracle for MVCC support
-		// The oracle provides monotonic timestamps for transaction ordering
-		let oracle = Oracle::new(Arc::clone(&opts.clock));
-
 		// Initialize level manifest FIRST to get log_number
 		let manifest = LevelManifest::new(Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
@@ -163,9 +158,12 @@ impl CoreInner {
 		let wal_instance =
 			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
 
+		// Starts at 0 since no commits have happened yet.
+		let visible_seq_num = Arc::new(AtomicU64::new(0));
+
 		// Initialize active memtable with its WAL number set to the initial WAL
 		// This tracks which WAL the memtable's data belongs to for later flush
-		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size));
+		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size, 0));
 		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
 		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
@@ -196,13 +194,64 @@ impl CoreInner {
 			immutable_memtables,
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
-			oracle: Arc::new(oracle),
 			vlog,
 			wal: parking_lot::RwLock::new(wal_instance),
 			versioned_index,
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
+			visible_seq_num,
 		})
+	}
+
+	/// Get the earliest sequence number across all memtables.
+	/// Any key with seq >= this value is guaranteed to be in memtables.
+	/// Keys modified with seq < this value may have been flushed to SST.
+	pub(crate) fn get_earliest_memtable_seq(&self) -> Result<u64> {
+		// Check immutable memtables - the first (oldest by table_id) has the earliest seq
+		let immutables = self.immutable_memtables.read()?;
+		if let Some(oldest) = immutables.first() {
+			return Ok(oldest.memtable.earliest_seq());
+		}
+		drop(immutables);
+
+		// No immutables - use active memtable
+		let memtable = self.active_memtable.read()?;
+		Ok(memtable.earliest_seq())
+	}
+
+	pub(crate) fn check_keys_conflict<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
+	where
+		I: Iterator<Item = &'a [u8]>,
+	{
+		// Acquire locks once for all keys - this is the key optimization
+		let memtable = self.active_memtable.read()?;
+		let immutables = self.immutable_memtables.read()?;
+
+		for key in keys {
+			// Check active memtable first (most recent writes)
+			if let Some((ikey, _)) = memtable.get(key, None) {
+				if ikey.seq_num() > start_seq {
+					return Err(Error::TransactionWriteConflict);
+				}
+				// Key exists but was written before our transaction started - no conflict
+				continue;
+			}
+
+			// Check immutable memtables (newest to oldest by iterating in reverse)
+			for entry in immutables.iter().rev() {
+				if let Some((ikey, _)) = entry.memtable.get(key, None) {
+					if ikey.seq_num() > start_seq {
+						return Err(Error::TransactionWriteConflict);
+					}
+					// Key exists but was written before our transaction started - no conflict
+					break;
+				}
+			}
+			// Key not found in any memtable - no conflict for this key
+		}
+
+		// No conflicts found for any key
+		Ok(())
 	}
 
 	/// Flushes a memtable to SST and atomically updates the manifest.
@@ -311,9 +360,10 @@ impl CoreInner {
 		};
 
 		// Step 3: Swap memtable while STILL holding write lock
+		let earliest_seq = self.visible_seq_num.load(Ordering::Acquire);
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+			Arc::new(MemTable::new(self.opts.max_memtable_size, earliest_seq)),
 		);
 
 		// Set the WAL number on the new (empty) active memtable
@@ -465,11 +515,14 @@ impl CoreInner {
 		// Get the current WAL number for the new memtable
 		let current_wal_number = self.wal.read().get_active_log_number();
 
+		// Get the current visible_seq_num as earliest_seq for the new memtable
+		let earliest_seq = self.visible_seq_num.load(Ordering::Acquire);
+
 		// Swap the active memtable with a new empty one
 		// This allows writes to continue immediately
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+			Arc::new(MemTable::new(self.opts.max_memtable_size, earliest_seq)),
 		);
 
 		// Set the WAL number on the new active memtable
@@ -1098,7 +1151,9 @@ impl Core {
 		let commit_env =
 			Arc::new(LsmCommitEnv::new(Arc::clone(&inner), Arc::clone(&task_manager))?);
 
-		let commit_pipeline = CommitPipeline::new(commit_env);
+		// Pass the shared visible_seq_num from CoreInner to CommitPipeline
+		// Both will use the same atomic for coordinated updates
+		let commit_pipeline = CommitPipeline::new(commit_env, Arc::clone(&inner.visible_seq_num));
 
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
@@ -1454,8 +1509,10 @@ impl Tree {
 		// Clear the current memtables since they would be stale after restore
 		// This discards any pending writes, which is correct for restore operations
 		{
+			let earliest_seq = self.core.inner.visible_seq_num.load(Ordering::Acquire);
 			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable = Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size));
+			*active_memtable =
+				Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size, earliest_seq));
 		}
 
 		{
