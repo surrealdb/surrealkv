@@ -6,6 +6,8 @@ use std::sync::Arc;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
+#[cfg(test)]
+use crate::snapshot::HistoryIteratorStats;
 use crate::snapshot::{HistoryIterator, MergeDirection, Snapshot, SnapshotIterator};
 use crate::{
 	InternalIterator,
@@ -1479,6 +1481,12 @@ impl<'a> TransactionHistoryIterator<'a> {
 			self.value()?
 		};
 		Ok((self.key(), value, self.timestamp(), is_tombstone))
+	}
+
+	/// Returns the iterator stats for testing/debugging
+	#[cfg(test)]
+	pub(crate) fn stats(&self) -> &HistoryIteratorStats {
+		self.inner.stats()
 	}
 }
 
