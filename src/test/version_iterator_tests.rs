@@ -1358,3 +1358,266 @@ async fn test_history_bidirectional_iteration() {
 	// Forward and reverse should have opposite order
 	assert_eq!(forward_results[0].0, reverse_results[2].0);
 }
+
+// ============================================================================
+// Test: ts_range filtering
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_history_ts_range_forward() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 with multiple versions at different timestamps
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v100", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v200", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v300", 300).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v400", 400).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with ts_range [150, 350] - should only return v200 and v300
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_ts_range(150, 350);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 2, "Should have 2 versions in range [150, 350]");
+	assert_eq!(results[0].2, 300); // timestamp
+	assert_eq!(results[1].2, 200);
+}
+
+#[test(tokio::test)]
+async fn test_history_ts_range_backward() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert key1 with multiple versions at different timestamps
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v100", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v200", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v300", 300).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with ts_range [150, 250] - should only return v200
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_ts_range(150, 250);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_reverse(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 1, "Should have 1 version in range [150, 250]");
+	assert_eq!(results[0].2, 200);
+}
+
+#[test(tokio::test)]
+async fn test_history_ts_range_btree() {
+	let (store, _temp_dir) = create_versioned_store_with_index();
+
+	// Insert key1 with multiple versions at different timestamps
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v100", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v200", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v300", 300).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with ts_range [100, 200] - should return v100 and v200
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_ts_range(100, 200);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 2, "Should have 2 versions in range [100, 200]");
+	assert_eq!(results[0].2, 200);
+	assert_eq!(results[1].2, 100);
+}
+
+// ============================================================================
+// Test: limit filtering
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_history_limit_forward() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert multiple versions
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", format!("v{}", i).as_bytes(), i * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with limit of 3
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_limit(3);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 3, "Should have exactly 3 entries due to limit");
+	// Should be the 3 newest versions (highest timestamps first)
+	assert_eq!(results[0].2, 500);
+	assert_eq!(results[1].2, 400);
+	assert_eq!(results[2].2, 300);
+}
+
+#[test(tokio::test)]
+async fn test_history_limit_backward() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert multiple versions
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", format!("v{}", i).as_bytes(), i * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with limit of 2 in reverse
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_limit(2);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_reverse(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 2, "Should have exactly 2 entries due to limit");
+	// Backward iteration starts from oldest, so should get v100 and v200
+	assert_eq!(results[0].2, 100);
+	assert_eq!(results[1].2, 200);
+}
+
+#[test(tokio::test)]
+async fn test_history_limit_multiple_keys() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert versions for multiple keys
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key2", b"v1", 150).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key2", b"v2", 250).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with limit of 3 - should span across keys
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_limit(3);
+	let mut iter = tx.history_with_options(b"key0", b"key9", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 3, "Should have exactly 3 entries across keys");
+}
+
+// ============================================================================
+// Test: ts_range + limit combination
+// ============================================================================
+
+#[test(tokio::test)]
+async fn test_history_ts_range_with_limit() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Insert many versions
+	for i in 1..=10 {
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", format!("v{}", i).as_bytes(), i * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with ts_range [300, 800] and limit 3
+	// Range includes v300, v400, v500, v600, v700, v800 (6 entries)
+	// But limit is 3, so only first 3 should be returned
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_ts_range(300, 800).with_limit(3);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 3, "Should have 3 entries (limited)");
+	// Newest first within range
+	assert_eq!(results[0].2, 800);
+	assert_eq!(results[1].2, 700);
+	assert_eq!(results[2].2, 600);
+}
+
+#[test(tokio::test)]
+async fn test_history_limit_zero() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with limit of 0 - should return nothing
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_limit(0);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 0, "Should have 0 entries with limit 0");
+}
+
+#[test(tokio::test)]
+async fn test_history_ts_range_empty_result() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v100", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v200", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with ts_range that doesn't match any entries
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_ts_range(500, 600);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 0, "Should have 0 entries outside ts_range");
+}

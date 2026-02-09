@@ -283,6 +283,8 @@ impl Snapshot {
 	/// * `lower` - Optional lower bound key (inclusive)
 	/// * `upper` - Optional upper bound key (exclusive)
 	/// * `include_tombstones` - Whether to include tombstones in the iteration
+	/// * `ts_range` - Optional timestamp range filter (start_ts, end_ts) inclusive
+	/// * `limit` - Optional limit on total entries returned
 	///
 	/// # Errors
 	/// Returns an error if versioning is not enabled.
@@ -291,6 +293,8 @@ impl Snapshot {
 		lower: Option<&[u8]>,
 		upper: Option<&[u8]>,
 		include_tombstones: bool,
+		ts_range: Option<(u64, u64)>,
+		limit: Option<usize>,
 	) -> Result<HistoryIterator<'_>> {
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
@@ -305,6 +309,8 @@ impl Snapshot {
 				include_tombstones,
 				lower,
 				upper,
+				ts_range,
+				limit,
 			))
 		} else {
 			// Create range for KMergeIterator
@@ -319,6 +325,8 @@ impl Snapshot {
 				iter_state,
 				range,
 				include_tombstones,
+				ts_range,
+				limit,
 			))
 		}
 	}
@@ -329,7 +337,7 @@ impl Snapshot {
 	/// Uses the unified `history_iter()` for both B+tree and LSM backends.
 	pub(crate) fn get_at(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
 		// Use unified history iterator for both backends
-		let mut iter = self.history_iter(Some(key), None, true)?;
+		let mut iter = self.history_iter(Some(key), None, true, None, None)?;
 		iter.seek_first()?;
 
 		// Track the best match (latest version at or before requested timestamp)
@@ -1079,6 +1087,12 @@ pub struct HistoryIterator<'a> {
 	// === Backward iteration state (buffered) ===
 	backward_buffer: Vec<BufferedEntry>,
 	backward_buffer_index: Option<usize>,
+
+	// === Filtering options ===
+	ts_range: Option<(u64, u64)>, // (start_ts, end_ts) inclusive
+	limit: Option<usize>,
+	entries_returned: usize,
+	limit_reached: bool,
 }
 
 impl<'a> HistoryIterator<'a> {
@@ -1088,6 +1102,8 @@ impl<'a> HistoryIterator<'a> {
 		iter_state: IterState,
 		range: InternalKeyRange,
 		include_tombstones: bool,
+		ts_range: Option<(u64, u64)>,
+		limit: Option<usize>,
 	) -> Self {
 		if let Some(ref vlog) = core.vlog {
 			vlog.incr_iterator_count();
@@ -1108,6 +1124,10 @@ impl<'a> HistoryIterator<'a> {
 			barrier_seen: false,
 			backward_buffer: Vec::new(),
 			backward_buffer_index: None,
+			ts_range,
+			limit,
+			entries_returned: 0,
+			limit_reached: false,
 		}
 	}
 
@@ -1118,6 +1138,8 @@ impl<'a> HistoryIterator<'a> {
 		include_tombstones: bool,
 		lower: Option<&[u8]>,
 		upper: Option<&[u8]>,
+		ts_range: Option<(u64, u64)>,
+		limit: Option<usize>,
 	) -> Self {
 		if let Some(ref vlog) = core.vlog {
 			vlog.incr_iterator_count();
@@ -1138,6 +1160,10 @@ impl<'a> HistoryIterator<'a> {
 			barrier_seen: false,
 			backward_buffer: Vec::new(),
 			backward_buffer_index: None,
+			ts_range,
+			limit,
+			entries_returned: 0,
+			limit_reached: false,
 		}
 	}
 
@@ -1156,6 +1182,8 @@ impl<'a> HistoryIterator<'a> {
 	fn reset_all_state(&mut self) {
 		self.reset_forward_state();
 		self.clear_backward_buffer();
+		self.entries_returned = 0;
+		self.limit_reached = false;
 	}
 
 	// --- Inner iterator helpers ---
@@ -1230,15 +1258,24 @@ impl<'a> HistoryIterator<'a> {
 	/// - REPLACE: output it, skip everything older
 	fn skip_to_valid_forward(&mut self) -> Result<bool> {
 		while self.inner_valid() {
+			// Check limit before returning any entry
+			if let Some(limit) = self.limit {
+				if self.entries_returned >= limit {
+					self.limit_reached = true;
+					return Ok(false);
+				}
+			}
+
 			if !self.within_upper_bound() {
 				return Ok(false);
 			}
 
-			let (user_key_vec, seq_num, is_hard_delete, is_replace, is_tombstone) = {
+			let (user_key_vec, seq_num, timestamp, is_hard_delete, is_replace, is_tombstone) = {
 				let key_ref = self.inner_key();
 				(
 					key_ref.user_key().to_vec(),
 					key_ref.seq_num(),
+					key_ref.timestamp(),
 					key_ref.is_hard_delete_marker(),
 					key_ref.is_replace(),
 					key_ref.is_tombstone(),
@@ -1257,6 +1294,14 @@ impl<'a> HistoryIterator<'a> {
 			if seq_num > self.snapshot_seq_num {
 				self.inner_next()?;
 				continue;
+			}
+
+			// Skip entries outside timestamp range
+			if let Some((ts_start, ts_end)) = self.ts_range {
+				if timestamp < ts_start || timestamp > ts_end {
+					self.inner_next()?;
+					continue;
+				}
 			}
 
 			// First visible entry → check for HARD_DELETE as latest
@@ -1300,7 +1345,8 @@ impl<'a> HistoryIterator<'a> {
 				continue;
 			}
 
-			// Found valid entry
+			// Found valid entry - increment counter
+			self.entries_returned += 1;
 			return Ok(true);
 		}
 		Ok(false)
@@ -1344,8 +1390,16 @@ impl<'a> HistoryIterator<'a> {
 			}
 
 			let seq_num = key_ref.seq_num();
+			let timestamp = key_ref.timestamp();
 
-			if seq_num <= self.snapshot_seq_num {
+			// Check visibility and timestamp range
+			let visible = seq_num <= self.snapshot_seq_num;
+			let in_ts_range = match self.ts_range {
+				Some((ts_start, ts_end)) => timestamp >= ts_start && timestamp <= ts_end,
+				None => true,
+			};
+
+			if visible && in_ts_range {
 				versions.push(VersionInfo {
 					is_hard_delete: key_ref.is_hard_delete_marker(),
 					is_replace: key_ref.is_replace(),
@@ -1417,6 +1471,23 @@ impl<'a> HistoryIterator<'a> {
 		if self.backward_buffer.is_empty() {
 			return Ok(false);
 		}
+
+		// Truncate buffer to respect limit
+		if let Some(limit) = self.limit {
+			let remaining = limit.saturating_sub(self.entries_returned);
+			if remaining == 0 {
+				self.backward_buffer.clear();
+				self.limit_reached = true;
+				return Ok(false);
+			}
+			if self.backward_buffer.len() > remaining {
+				self.backward_buffer.truncate(remaining);
+			}
+		}
+
+		// Pre-increment entries_returned by buffer size
+		// (all buffered entries will be yielded before next collect)
+		self.entries_returned += self.backward_buffer.len();
 
 		// Start yielding from index 0 (oldest in valid range)
 		self.backward_buffer_index = Some(0);
@@ -1570,6 +1641,9 @@ impl InternalIterator for HistoryIterator<'_> {
 	}
 
 	fn valid(&self) -> bool {
+		if self.limit_reached {
+			return false;
+		}
 		match self.direction {
 			MergeDirection::Forward => self.inner_valid() && self.within_upper_bound(),
 			MergeDirection::Backward => self.has_buffered_entry(),

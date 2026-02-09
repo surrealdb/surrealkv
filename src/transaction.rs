@@ -172,12 +172,11 @@ pub struct HistoryOptions {
 	/// Whether to include tombstones (deleted entries) in the iteration.
 	/// Default: false
 	pub include_tombstones: bool,
-	/// Optional timestamp range filter (start_ts, end_ts).
+	/// Optional timestamp range filter (start_ts, end_ts) inclusive.
 	/// Only versions within this range are returned.
-	/// Note: Currently only supported with B+tree index enabled.
 	/// Default: None (no timestamp filtering)
 	pub ts_range: Option<(u64, u64)>,
-	/// Optional limit on the number of unique keys to return.
+	/// Optional limit on the total number of entries/versions to return.
 	/// Default: None (no limit)
 	pub limit: Option<usize>,
 }
@@ -195,13 +194,12 @@ impl HistoryOptions {
 	}
 
 	/// Set a timestamp range filter. Only versions within [start_ts, end_ts] are returned.
-	/// Note: Currently only supported with B+tree index enabled.
 	pub fn with_ts_range(mut self, start_ts: u64, end_ts: u64) -> Self {
 		self.ts_range = Some((start_ts, end_ts));
 		self
 	}
 
-	/// Set a limit on the number of unique keys to return.
+	/// Set a limit on the total number of entries/versions to return.
 	pub fn with_limit(mut self, limit: usize) -> Self {
 		self.limit = Some(limit);
 		self
@@ -643,6 +641,8 @@ impl Transaction {
 			Some(start.as_slice()),
 			Some(end.as_slice()),
 			opts.include_tombstones,
+			opts.ts_range,
+			opts.limit,
 		)?;
 
 		Ok(TransactionHistoryIterator::new(inner, Arc::clone(&self.core)))
