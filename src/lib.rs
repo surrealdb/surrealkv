@@ -14,7 +14,6 @@ mod levels;
 mod lockfile;
 mod lsm;
 mod memtable;
-mod oracle;
 mod snapshot;
 mod sstable;
 mod task;
