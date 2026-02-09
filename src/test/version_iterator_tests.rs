@@ -1621,3 +1621,122 @@ async fn test_history_ts_range_empty_result() {
 
 	assert_eq!(results.len(), 0, "Should have 0 entries outside ts_range");
 }
+
+// ============================================================================
+// Test: Early exit optimization for ts_range
+// ============================================================================
+
+/// Test that ts_range early exit works correctly.
+/// When timestamp < ts_start, we should skip remaining entries for that key
+/// since timestamps are ordered descending within a key.
+#[test(tokio::test)]
+async fn test_history_ts_range_early_exit_lsm() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Create multiple keys, each with versions spanning a wide range
+	// Key1: ts 100, 200, 300, 400, 500
+	// Key2: ts 150, 250, 350, 450, 550
+	// Key3: ts 50, 60, 70, 80, 90 (all below range)
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", format!("v{}", i).as_bytes(), i * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key2", format!("v{}", i).as_bytes(), i * 100 + 50).unwrap();
+		tx.commit().await.unwrap();
+	}
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key3", format!("v{}", i).as_bytes(), i * 10 + 40).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with ts_range [250, 400]
+	// Expected: key1 ts 300, 400; key2 ts 250, 350
+	// key3 has all entries below 250, so early exit should skip it entirely
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_ts_range(250, 400);
+	let mut iter = tx.history_with_options(b"key1", b"key9", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	// Should have 4 entries: key1@400, key1@300, key2@350, key2@250
+	assert_eq!(results.len(), 4, "Should have 4 entries in ts_range");
+
+	// Verify the entries are from the correct keys and timestamps
+	let timestamps: Vec<u64> = results.iter().map(|(_, _, ts, _)| *ts).collect();
+	assert!(timestamps.contains(&400), "Should include key1@400");
+	assert!(timestamps.contains(&300), "Should include key1@300");
+	assert!(timestamps.contains(&350), "Should include key2@350");
+	assert!(timestamps.contains(&250), "Should include key2@250");
+
+	// key3 entries should NOT be included
+	for (key, _, _, _) in &results {
+		assert_ne!(key.as_slice(), b"key3", "key3 should be excluded (all below range)");
+	}
+}
+
+#[test(tokio::test)]
+async fn test_history_ts_range_early_exit_btree() {
+	let (store, _temp_dir) = create_versioned_store_with_index();
+
+	// Same setup as LSM test
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", format!("v{}", i).as_bytes(), i * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key2", format!("v{}", i).as_bytes(), i * 100 + 50).unwrap();
+		tx.commit().await.unwrap();
+	}
+	for i in 1..=5 {
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key3", format!("v{}", i).as_bytes(), i * 10 + 40).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with ts_range [250, 400]
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_ts_range(250, 400);
+	let mut iter = tx.history_with_options(b"key1", b"key9", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	// Should have 4 entries
+	assert_eq!(results.len(), 4, "Should have 4 entries in ts_range");
+
+	// Verify no key3 entries
+	for (key, _, _, _) in &results {
+		assert_ne!(key.as_slice(), b"key3", "key3 should be excluded (all below range)");
+	}
+}
+
+/// Test that B+tree smart seeking skips entries above ts_end efficiently.
+/// This test creates many entries above the ts_range to verify the seek optimization.
+#[test(tokio::test)]
+async fn test_history_btree_smart_seek_skips_above_range() {
+	let (store, _temp_dir) = create_versioned_store_with_index();
+
+	// Create key1 with many versions, most above the ts_range
+	// ts: 100, 200, 300, ..., 1000 (10 versions)
+	for i in 1..=10 {
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", format!("v{}", i).as_bytes(), i * 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Query with ts_range [100, 300] - should only get 3 entries
+	// B+tree should seek directly to ts=300, skipping ts 400-1000
+	let tx = store.begin().unwrap();
+	let opts = HistoryOptions::new().with_ts_range(100, 300);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 3, "Should have 3 entries in ts_range [100, 300]");
+
+	let timestamps: Vec<u64> = results.iter().map(|(_, _, ts, _)| *ts).collect();
+	// Newest first within range
+	assert_eq!(timestamps, vec![300, 200, 100], "Should be ordered newest first");
+}

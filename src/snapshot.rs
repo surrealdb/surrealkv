@@ -13,6 +13,7 @@ use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::{
+	BytewiseComparator,
 	Comparator,
 	InternalIterator,
 	InternalKey,
@@ -20,6 +21,7 @@ use crate::{
 	InternalKeyKind,
 	InternalKeyRange,
 	InternalKeyRef,
+	TimestampComparator,
 	Value,
 };
 
@@ -252,16 +254,11 @@ impl Snapshot {
 	/// to be enabled.
 	///
 	/// # Arguments
-	/// * `lower` - Optional lower bound key (inclusive)
-	/// * `upper` - Optional upper bound key (exclusive)
-	///
 	/// # Errors
 	/// Returns an error if the B+tree versioned index is not enabled.
-	pub(crate) fn btree_history_iter(
-		&self,
-		_lower: Option<&[u8]>,
-		_upper: Option<&[u8]>,
-	) -> Result<BPlusTreeIteratorWithGuard<'_>> {
+	///
+	/// Note: Bounds are handled in `HistoryIterator::seek_first()`, not here.
+	pub(crate) fn btree_history_iter(&self) -> Result<BPlusTreeIteratorWithGuard<'_>> {
 		if !self.core.opts.enable_versioned_index {
 			return Err(Error::InvalidArgument("B+tree versioned index not enabled".to_string()));
 		}
@@ -301,7 +298,7 @@ impl Snapshot {
 		}
 
 		if self.core.opts.enable_versioned_index {
-			let btree_iter = self.btree_history_iter(lower, upper)?;
+			let btree_iter = self.btree_history_iter()?;
 			Ok(HistoryIterator::new_btree(
 				btree_iter,
 				Arc::clone(&self.core),
@@ -419,11 +416,37 @@ pub(crate) struct KMergeIterator<'iter> {
 	initialized: bool,
 
 	/// Comparator for key comparison
-	cmp: Arc<InternalKeyComparator>,
+	cmp: Arc<dyn Comparator>,
 }
 
 impl<'a> KMergeIterator<'a> {
+	/// Creates a new KMergeIterator with InternalKeyComparator (default).
+	/// Use this for normal queries where ordering is by seq_num.
 	pub(crate) fn new_from(iter_state: IterState, internal_range: InternalKeyRange) -> Self {
+		let cmp: Arc<dyn Comparator> =
+			Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())));
+		Self::new_with_comparator(iter_state, internal_range, cmp, None)
+	}
+
+	/// Creates a new KMergeIterator with TimestampComparator for history queries.
+	/// This enables timestamp-based seek optimization when timestamps are monotonic with seq_nums.
+	pub(crate) fn new_for_history(
+		iter_state: IterState,
+		internal_range: InternalKeyRange,
+		ts_range: Option<(u64, u64)>,
+	) -> Self {
+		let cmp: Arc<dyn Comparator> =
+			Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));
+		Self::new_with_comparator(iter_state, internal_range, cmp, ts_range)
+	}
+
+	/// Creates a new KMergeIterator with a configurable comparator.
+	fn new_with_comparator(
+		iter_state: IterState,
+		internal_range: InternalKeyRange,
+		cmp: Arc<dyn Comparator>,
+		ts_range: Option<(u64, u64)>,
+	) -> Self {
 		let boxed_state = Box::new(iter_state);
 
 		let query_range = Arc::new(internal_range);
@@ -469,6 +492,17 @@ impl<'a> KMergeIterator<'a> {
 					if table.is_before_range(&query_range) || table.is_after_range(&query_range) {
 						continue;
 					}
+					// Skip tables outside timestamp range (if specified)
+					if let Some((ts_start, ts_end)) = ts_range {
+						let props = &table.meta.properties;
+						if let (Some(newest), Some(oldest)) =
+							(props.newest_key_time, props.oldest_key_time)
+						{
+							if newest < ts_start || oldest > ts_end {
+								continue;
+							}
+						}
+					}
 					if let Ok(table_iter) = table.iter(Some((*query_range).clone())) {
 						iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
 					}
@@ -479,6 +513,17 @@ impl<'a> KMergeIterator<'a> {
 				let end_idx = level.find_last_overlapping_table(&query_range);
 
 				for table in &level.tables[start_idx..end_idx] {
+					// Skip tables outside timestamp range (if specified)
+					if let Some((ts_start, ts_end)) = ts_range {
+						let props = &table.meta.properties;
+						if let (Some(newest), Some(oldest)) =
+							(props.newest_key_time, props.oldest_key_time)
+						{
+							if newest < ts_start || oldest > ts_end {
+								continue;
+							}
+						}
+					}
 					if let Ok(table_iter) = table.iter(Some((*query_range).clone())) {
 						iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
 					}
@@ -493,9 +538,7 @@ impl<'a> KMergeIterator<'a> {
 			active_count: 0,
 			direction: MergeDirection::Forward,
 			initialized: false,
-			cmp: Arc::new(InternalKeyComparator::new(Arc::new(
-				crate::BytewiseComparator::default(),
-			))),
+			cmp,
 		}
 	}
 
@@ -1109,8 +1152,16 @@ impl<'a> HistoryIterator<'a> {
 			vlog.incr_iterator_count();
 		}
 
+		// Use TimestampComparator for history queries with timestamp range
+		// This enables efficient timestamp-based seeks when timestamps are monotonic with seq_nums
+		let inner = if ts_range.is_some() {
+			HistoryIteratorInner::Lsm(KMergeIterator::new_for_history(iter_state, range, ts_range))
+		} else {
+			HistoryIteratorInner::Lsm(KMergeIterator::new_from(iter_state, range))
+		};
+
 		Self {
-			inner: HistoryIteratorInner::Lsm(KMergeIterator::new_from(iter_state, range)),
+			inner,
 			snapshot_seq_num: seq_num,
 			include_tombstones,
 			direction: MergeDirection::Forward,
@@ -1223,6 +1274,54 @@ impl<'a> HistoryIterator<'a> {
 		}
 	}
 
+	/// Skip all remaining entries for the current user_key.
+	/// Returns true if positioned on a new user_key, false if iterator exhausted.
+	fn skip_to_next_user_key(&mut self) -> Result<bool> {
+		let current = self.current_user_key.clone();
+		while self.inner_valid() {
+			if self.inner_key().user_key() != current.as_slice() {
+				return Ok(true);
+			}
+			self.inner_next()?;
+		}
+		Ok(false)
+	}
+
+	/// For both B+tree and LSM with ts_range, seek to (next_user_key, ts_end) to skip entries above
+	/// range. Without ts_range, uses simple skip.
+	/// Returns true if positioned on a new user_key, false if iterator exhausted.
+	///
+	/// Note: LSM seek optimization requires timestamps to be monotonic with seq_nums.
+	/// When this is true, TimestampComparator seeks work correctly on LSM data.
+	fn advance_to_next_user_key_optimized(&mut self) -> Result<bool> {
+		// Only optimize with ts_range
+		let ts_end = match self.ts_range {
+			Some((_, end)) => end,
+			None => return self.skip_to_next_user_key(),
+		};
+
+		let current = self.current_user_key.clone();
+
+		// Advance to find next user_key
+		while self.inner_valid() {
+			// Clone the key before mutable borrow
+			let next_key_vec = self.inner_key().user_key().to_vec();
+			if next_key_vec != current {
+				// Found next key - seek to (next_key, ts_end) to skip entries above range
+				// Works for both B+tree and LSM (with TimestampComparator)
+				let seek_key =
+					InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set, ts_end);
+				let _ = match &mut self.inner {
+					HistoryIteratorInner::BTree(iter) => iter.seek(&seek_key.encode())?,
+					HistoryIteratorInner::Lsm(iter) => iter.seek(&seek_key.encode())?,
+				};
+				return Ok(self.inner_valid());
+			}
+			self.inner_next()?;
+		}
+		Ok(false)
+	}
+
 	// --- Bounds checking ---
 
 	fn within_upper_bound(&self) -> bool {
@@ -1298,8 +1397,18 @@ impl<'a> HistoryIterator<'a> {
 
 			// Skip entries outside timestamp range
 			if let Some((ts_start, ts_end)) = self.ts_range {
-				if timestamp < ts_start || timestamp > ts_end {
+				if timestamp > ts_end {
+					// Above range - skip, next entries might be in range
 					self.inner_next()?;
+					continue;
+				}
+				if timestamp < ts_start {
+					// Below range - all remaining entries for this key are also below
+					// (timestamps are ordered descending within a key).
+					// Skip to next user_key with optimization for B+tree.
+					if !self.advance_to_next_user_key_optimized()? {
+						return Ok(false);
+					}
 					continue;
 				}
 			}
@@ -1543,9 +1652,11 @@ impl InternalIterator for HistoryIterator<'_> {
 				iter.seek_first()?;
 			}
 			HistoryIteratorInner::BTree(iter) => {
+				// For B+tree, use ts_end to skip entries above the timestamp range
+				let ts = self.ts_range.map(|(_, end)| end).unwrap_or(u64::MAX);
 				if let Some(ref lower) = self.lower_bound {
 					let seek_key =
-						InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set, u64::MAX);
+						InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set, ts);
 					iter.seek(&seek_key.encode())?;
 				} else {
 					iter.seek_first()?;
