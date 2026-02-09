@@ -1137,12 +1137,11 @@ pub struct HistoryIterator<'a> {
 	entries_returned: usize,
 	limit_reached: bool,
 
-	// === Stats for testing (tracks filtering behavior) ===
 	#[cfg(test)]
 	stats: HistoryIteratorStats,
 }
 
-/// Stats for tracking iterator behavior (useful for testing and debugging)
+/// Stats for tracking iterator behavior (for testing)
 #[cfg(test)]
 #[derive(Debug, Default, Clone)]
 pub(crate) struct HistoryIteratorStats {
@@ -1322,12 +1321,12 @@ impl<'a> HistoryIterator<'a> {
 	}
 
 	/// For both B+tree and LSM with ts_range, seek to (next_user_key, ts_end) to skip entries above
-	/// range. Without ts_range, uses simple skip.
+	/// range. Without ts_range.
 	/// Returns true if positioned on a new user_key, false if iterator exhausted.
 	///
 	/// Note: LSM seek optimization requires timestamps to be monotonic with seq_nums.
 	/// When this is true, TimestampComparator seeks work correctly on LSM data.
-	fn advance_to_next_user_key_optimized(&mut self) -> Result<bool> {
+	fn advance_to_next_user_key(&mut self) -> Result<bool> {
 		// Only optimize with ts_range
 		let ts_end = match self.ts_range {
 			Some((_, end)) => end,
@@ -1338,7 +1337,6 @@ impl<'a> HistoryIterator<'a> {
 
 		// Advance to find next user_key
 		while self.inner_valid() {
-			// Clone the key before mutable borrow
 			let next_key_vec = self.inner_key().user_key().to_vec();
 			if next_key_vec != current {
 				// Found next key - seek to (next_key, ts_end) to skip entries above range
@@ -1462,7 +1460,7 @@ impl<'a> HistoryIterator<'a> {
 					{
 						self.stats.early_exits_below_ts_range += 1;
 					}
-					if !self.advance_to_next_user_key_optimized()? {
+					if !self.advance_to_next_user_key()? {
 						return Ok(false);
 					}
 					continue;

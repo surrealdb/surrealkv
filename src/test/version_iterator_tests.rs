@@ -1873,7 +1873,7 @@ async fn fuzz_history_iterator_ts_filtering() {
 		}
 
 		// Compute expected results
-		let expected = compute_expected(&config);
+		let expected = compute_expected(config);
 
 		// Run history iterator with ts_range
 		let tx = store.begin().unwrap();
