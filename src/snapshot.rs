@@ -1207,6 +1207,7 @@ impl<'a> HistoryIterator<'a> {
 		}
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new_btree(
 		btree_iter: BPlusTreeIteratorWithGuard<'a>,
 		core: Arc<Core>,
