@@ -13,6 +13,7 @@ use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::{
+	BytewiseComparator,
 	Comparator,
 	InternalIterator,
 	InternalKey,
@@ -20,6 +21,7 @@ use crate::{
 	InternalKeyKind,
 	InternalKeyRange,
 	InternalKeyRef,
+	TimestampComparator,
 	Value,
 };
 
@@ -252,16 +254,11 @@ impl Snapshot {
 	/// to be enabled.
 	///
 	/// # Arguments
-	/// * `lower` - Optional lower bound key (inclusive)
-	/// * `upper` - Optional upper bound key (exclusive)
-	///
 	/// # Errors
 	/// Returns an error if the B+tree versioned index is not enabled.
-	pub(crate) fn btree_history_iter(
-		&self,
-		_lower: Option<&[u8]>,
-		_upper: Option<&[u8]>,
-	) -> Result<BPlusTreeIteratorWithGuard<'_>> {
+	///
+	/// Note: Bounds are handled in `HistoryIterator::seek_first()`, not here.
+	pub(crate) fn btree_history_iter(&self) -> Result<BPlusTreeIteratorWithGuard<'_>> {
 		if !self.core.opts.enable_versioned_index {
 			return Err(Error::InvalidArgument("B+tree versioned index not enabled".to_string()));
 		}
@@ -283,6 +280,8 @@ impl Snapshot {
 	/// * `lower` - Optional lower bound key (inclusive)
 	/// * `upper` - Optional upper bound key (exclusive)
 	/// * `include_tombstones` - Whether to include tombstones in the iteration
+	/// * `ts_range` - Optional timestamp range filter (start_ts, end_ts) inclusive
+	/// * `limit` - Optional limit on total entries returned
 	///
 	/// # Errors
 	/// Returns an error if versioning is not enabled.
@@ -291,13 +290,15 @@ impl Snapshot {
 		lower: Option<&[u8]>,
 		upper: Option<&[u8]>,
 		include_tombstones: bool,
+		ts_range: Option<(u64, u64)>,
+		limit: Option<usize>,
 	) -> Result<HistoryIterator<'_>> {
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
 		}
 
 		if self.core.opts.enable_versioned_index {
-			let btree_iter = self.btree_history_iter(lower, upper)?;
+			let btree_iter = self.btree_history_iter()?;
 			Ok(HistoryIterator::new_btree(
 				btree_iter,
 				Arc::clone(&self.core),
@@ -305,6 +306,8 @@ impl Snapshot {
 				include_tombstones,
 				lower,
 				upper,
+				ts_range,
+				limit,
 			))
 		} else {
 			// Create range for KMergeIterator
@@ -319,6 +322,8 @@ impl Snapshot {
 				iter_state,
 				range,
 				include_tombstones,
+				ts_range,
+				limit,
 			))
 		}
 	}
@@ -329,7 +334,7 @@ impl Snapshot {
 	/// Uses the unified `history_iter()` for both B+tree and LSM backends.
 	pub(crate) fn get_at(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
 		// Use unified history iterator for both backends
-		let mut iter = self.history_iter(Some(key), None, true)?;
+		let mut iter = self.history_iter(Some(key), None, true, None, None)?;
 		iter.seek_first()?;
 
 		// Track the best match (latest version at or before requested timestamp)
@@ -411,11 +416,37 @@ pub(crate) struct KMergeIterator<'iter> {
 	initialized: bool,
 
 	/// Comparator for key comparison
-	cmp: Arc<InternalKeyComparator>,
+	cmp: Arc<dyn Comparator>,
 }
 
 impl<'a> KMergeIterator<'a> {
+	/// Creates a new KMergeIterator with InternalKeyComparator (default).
+	/// Use this for normal queries where ordering is by seq_num.
 	pub(crate) fn new_from(iter_state: IterState, internal_range: InternalKeyRange) -> Self {
+		let cmp: Arc<dyn Comparator> =
+			Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())));
+		Self::new_with_comparator(iter_state, internal_range, cmp, None)
+	}
+
+	/// Creates a new KMergeIterator with TimestampComparator for history queries.
+	/// This enables timestamp-based seek optimization when timestamps are monotonic with seq_nums.
+	pub(crate) fn new_for_history(
+		iter_state: IterState,
+		internal_range: InternalKeyRange,
+		ts_range: Option<(u64, u64)>,
+	) -> Self {
+		let cmp: Arc<dyn Comparator> =
+			Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));
+		Self::new_with_comparator(iter_state, internal_range, cmp, ts_range)
+	}
+
+	/// Creates a new KMergeIterator with a configurable comparator.
+	fn new_with_comparator(
+		iter_state: IterState,
+		internal_range: InternalKeyRange,
+		cmp: Arc<dyn Comparator>,
+		ts_range: Option<(u64, u64)>,
+	) -> Self {
 		let boxed_state = Box::new(iter_state);
 
 		let query_range = Arc::new(internal_range);
@@ -461,6 +492,17 @@ impl<'a> KMergeIterator<'a> {
 					if table.is_before_range(&query_range) || table.is_after_range(&query_range) {
 						continue;
 					}
+					// Skip tables outside timestamp range (if specified)
+					if let Some((ts_start, ts_end)) = ts_range {
+						let props = &table.meta.properties;
+						if let (Some(newest), Some(oldest)) =
+							(props.newest_key_time, props.oldest_key_time)
+						{
+							if newest < ts_start || oldest > ts_end {
+								continue;
+							}
+						}
+					}
 					if let Ok(table_iter) = table.iter(Some((*query_range).clone())) {
 						iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
 					}
@@ -471,6 +513,17 @@ impl<'a> KMergeIterator<'a> {
 				let end_idx = level.find_last_overlapping_table(&query_range);
 
 				for table in &level.tables[start_idx..end_idx] {
+					// Skip tables outside timestamp range (if specified)
+					if let Some((ts_start, ts_end)) = ts_range {
+						let props = &table.meta.properties;
+						if let (Some(newest), Some(oldest)) =
+							(props.newest_key_time, props.oldest_key_time)
+						{
+							if newest < ts_start || oldest > ts_end {
+								continue;
+							}
+						}
+					}
 					if let Ok(table_iter) = table.iter(Some((*query_range).clone())) {
 						iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
 					}
@@ -485,9 +538,7 @@ impl<'a> KMergeIterator<'a> {
 			active_count: 0,
 			direction: MergeDirection::Forward,
 			initialized: false,
-			cmp: Arc::new(InternalKeyComparator::new(Arc::new(
-				crate::BytewiseComparator::default(),
-			))),
+			cmp,
 		}
 	}
 
@@ -1079,6 +1130,35 @@ pub struct HistoryIterator<'a> {
 	// === Backward iteration state (buffered) ===
 	backward_buffer: Vec<BufferedEntry>,
 	backward_buffer_index: Option<usize>,
+
+	// === Filtering options ===
+	ts_range: Option<(u64, u64)>, // (start_ts, end_ts) inclusive
+	limit: Option<usize>,
+	entries_returned: usize,
+	limit_reached: bool,
+
+	#[cfg(test)]
+	stats: HistoryIteratorStats,
+}
+
+/// Stats for tracking iterator behavior (for testing)
+#[cfg(test)]
+#[derive(Debug, Default, Clone)]
+pub(crate) struct HistoryIteratorStats {
+	/// Number of entries skipped due to seq_num > snapshot_seq_num
+	pub(crate) entries_skipped_invisible: usize,
+	/// Number of entries skipped due to timestamp > ts_end
+	pub(crate) entries_skipped_above_ts_range: usize,
+	/// Number of times we triggered early exit (ts < ts_start)
+	pub(crate) early_exits_below_ts_range: usize,
+	/// Number of seeks performed (timestamp-based optimization)
+	pub(crate) seeks_performed: usize,
+	/// Number of entries skipped due to HARD_DELETE barrier
+	pub(crate) entries_skipped_hard_delete: usize,
+	/// Number of entries skipped due to barrier_seen
+	pub(crate) entries_skipped_past_barrier: usize,
+	/// Total entries examined (before any filtering)
+	pub(crate) total_entries_examined: usize,
 }
 
 impl<'a> HistoryIterator<'a> {
@@ -1088,13 +1168,23 @@ impl<'a> HistoryIterator<'a> {
 		iter_state: IterState,
 		range: InternalKeyRange,
 		include_tombstones: bool,
+		ts_range: Option<(u64, u64)>,
+		limit: Option<usize>,
 	) -> Self {
 		if let Some(ref vlog) = core.vlog {
 			vlog.incr_iterator_count();
 		}
 
+		// Use TimestampComparator for history queries with timestamp range
+		// This enables efficient timestamp-based seeks when timestamps are monotonic with seq_nums
+		let inner = if ts_range.is_some() {
+			HistoryIteratorInner::Lsm(KMergeIterator::new_for_history(iter_state, range, ts_range))
+		} else {
+			HistoryIteratorInner::Lsm(KMergeIterator::new_from(iter_state, range))
+		};
+
 		Self {
-			inner: HistoryIteratorInner::Lsm(KMergeIterator::new_from(iter_state, range)),
+			inner,
 			snapshot_seq_num: seq_num,
 			include_tombstones,
 			direction: MergeDirection::Forward,
@@ -1108,9 +1198,16 @@ impl<'a> HistoryIterator<'a> {
 			barrier_seen: false,
 			backward_buffer: Vec::new(),
 			backward_buffer_index: None,
+			ts_range,
+			limit,
+			entries_returned: 0,
+			limit_reached: false,
+			#[cfg(test)]
+			stats: HistoryIteratorStats::default(),
 		}
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new_btree(
 		btree_iter: BPlusTreeIteratorWithGuard<'a>,
 		core: Arc<Core>,
@@ -1118,6 +1215,8 @@ impl<'a> HistoryIterator<'a> {
 		include_tombstones: bool,
 		lower: Option<&[u8]>,
 		upper: Option<&[u8]>,
+		ts_range: Option<(u64, u64)>,
+		limit: Option<usize>,
 	) -> Self {
 		if let Some(ref vlog) = core.vlog {
 			vlog.incr_iterator_count();
@@ -1138,6 +1237,12 @@ impl<'a> HistoryIterator<'a> {
 			barrier_seen: false,
 			backward_buffer: Vec::new(),
 			backward_buffer_index: None,
+			ts_range,
+			limit,
+			entries_returned: 0,
+			limit_reached: false,
+			#[cfg(test)]
+			stats: HistoryIteratorStats::default(),
 		}
 	}
 
@@ -1156,6 +1261,14 @@ impl<'a> HistoryIterator<'a> {
 	fn reset_all_state(&mut self) {
 		self.reset_forward_state();
 		self.clear_backward_buffer();
+		self.entries_returned = 0;
+		self.limit_reached = false;
+	}
+
+	/// Returns the iterator stats for testing/debugging
+	#[cfg(test)]
+	pub(crate) fn stats(&self) -> &HistoryIteratorStats {
+		&self.stats
 	}
 
 	// --- Inner iterator helpers ---
@@ -1195,6 +1308,57 @@ impl<'a> HistoryIterator<'a> {
 		}
 	}
 
+	/// Skip all remaining entries for the current user_key.
+	/// Returns true if positioned on a new user_key, false if iterator exhausted.
+	fn skip_to_next_user_key(&mut self) -> Result<bool> {
+		let current = self.current_user_key.clone();
+		while self.inner_valid() {
+			if self.inner_key().user_key() != current.as_slice() {
+				return Ok(true);
+			}
+			self.inner_next()?;
+		}
+		Ok(false)
+	}
+
+	/// For both B+tree and LSM with ts_range, seek to (next_user_key, ts_end) to skip entries above
+	/// range. Without ts_range.
+	/// Returns true if positioned on a new user_key, false if iterator exhausted.
+	///
+	/// Note: LSM seek optimization requires timestamps to be monotonic with seq_nums.
+	/// When this is true, TimestampComparator seeks work correctly on LSM data.
+	fn advance_to_next_user_key(&mut self) -> Result<bool> {
+		// Only optimize with ts_range
+		let ts_end = match self.ts_range {
+			Some((_, end)) => end,
+			None => return self.skip_to_next_user_key(),
+		};
+
+		let current = self.current_user_key.clone();
+
+		// Advance to find next user_key
+		while self.inner_valid() {
+			let next_key_vec = self.inner_key().user_key().to_vec();
+			if next_key_vec != current {
+				// Found next key - seek to (next_key, ts_end) to skip entries above range
+				// Works for both B+tree and LSM (with TimestampComparator)
+				let seek_key =
+					InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set, ts_end);
+				let _ = match &mut self.inner {
+					HistoryIteratorInner::BTree(iter) => iter.seek(&seek_key.encode())?,
+					HistoryIteratorInner::Lsm(iter) => iter.seek(&seek_key.encode())?,
+				};
+				#[cfg(test)]
+				{
+					self.stats.seeks_performed += 1;
+				}
+				return Ok(self.inner_valid());
+			}
+			self.inner_next()?;
+		}
+		Ok(false)
+	}
+
 	// --- Bounds checking ---
 
 	fn within_upper_bound(&self) -> bool {
@@ -1230,15 +1394,24 @@ impl<'a> HistoryIterator<'a> {
 	/// - REPLACE: output it, skip everything older
 	fn skip_to_valid_forward(&mut self) -> Result<bool> {
 		while self.inner_valid() {
+			// Check limit before returning any entry
+			if let Some(limit) = self.limit {
+				if self.entries_returned >= limit {
+					self.limit_reached = true;
+					return Ok(false);
+				}
+			}
+
 			if !self.within_upper_bound() {
 				return Ok(false);
 			}
 
-			let (user_key_vec, seq_num, is_hard_delete, is_replace, is_tombstone) = {
+			let (user_key_vec, seq_num, timestamp, is_hard_delete, is_replace, is_tombstone) = {
 				let key_ref = self.inner_key();
 				(
 					key_ref.user_key().to_vec(),
 					key_ref.seq_num(),
+					key_ref.timestamp(),
 					key_ref.is_hard_delete_marker(),
 					key_ref.is_replace(),
 					key_ref.is_tombstone(),
@@ -1253,10 +1426,46 @@ impl<'a> HistoryIterator<'a> {
 				self.barrier_seen = false;
 			}
 
+			// Track total entries examined
+			#[cfg(test)]
+			{
+				self.stats.total_entries_examined += 1;
+			}
+
 			// Skip invisible versions
 			if seq_num > self.snapshot_seq_num {
+				#[cfg(test)]
+				{
+					self.stats.entries_skipped_invisible += 1;
+				}
 				self.inner_next()?;
 				continue;
+			}
+
+			// Skip entries outside timestamp range
+			if let Some((ts_start, ts_end)) = self.ts_range {
+				if timestamp > ts_end {
+					// Above range - skip, next entries might be in range
+					#[cfg(test)]
+					{
+						self.stats.entries_skipped_above_ts_range += 1;
+					}
+					self.inner_next()?;
+					continue;
+				}
+				if timestamp < ts_start {
+					// Below range - all remaining entries for this key are also below
+					// (timestamps are ordered descending within a key).
+					// Skip to next user_key with optimization for B+tree.
+					#[cfg(test)]
+					{
+						self.stats.early_exits_below_ts_range += 1;
+					}
+					if !self.advance_to_next_user_key()? {
+						return Ok(false);
+					}
+					continue;
+				}
 			}
 
 			// First visible entry → check for HARD_DELETE as latest
@@ -1269,12 +1478,20 @@ impl<'a> HistoryIterator<'a> {
 
 			// Rule 1: HARD_DELETE as latest → skip entire key
 			if self.latest_is_hard_delete {
+				#[cfg(test)]
+				{
+					self.stats.entries_skipped_hard_delete += 1;
+				}
 				self.inner_next()?;
 				continue;
 			}
 
 			// Rule 2: Already past a barrier → skip everything older
 			if self.barrier_seen {
+				#[cfg(test)]
+				{
+					self.stats.entries_skipped_past_barrier += 1;
+				}
 				self.inner_next()?;
 				continue;
 			}
@@ -1300,7 +1517,8 @@ impl<'a> HistoryIterator<'a> {
 				continue;
 			}
 
-			// Found valid entry
+			// Found valid entry - increment counter
+			self.entries_returned += 1;
 			return Ok(true);
 		}
 		Ok(false)
@@ -1344,8 +1562,16 @@ impl<'a> HistoryIterator<'a> {
 			}
 
 			let seq_num = key_ref.seq_num();
+			let timestamp = key_ref.timestamp();
 
-			if seq_num <= self.snapshot_seq_num {
+			// Check visibility and timestamp range
+			let visible = seq_num <= self.snapshot_seq_num;
+			let in_ts_range = match self.ts_range {
+				Some((ts_start, ts_end)) => timestamp >= ts_start && timestamp <= ts_end,
+				None => true,
+			};
+
+			if visible && in_ts_range {
 				versions.push(VersionInfo {
 					is_hard_delete: key_ref.is_hard_delete_marker(),
 					is_replace: key_ref.is_replace(),
@@ -1418,6 +1644,23 @@ impl<'a> HistoryIterator<'a> {
 			return Ok(false);
 		}
 
+		// Truncate buffer to respect limit
+		if let Some(limit) = self.limit {
+			let remaining = limit.saturating_sub(self.entries_returned);
+			if remaining == 0 {
+				self.backward_buffer.clear();
+				self.limit_reached = true;
+				return Ok(false);
+			}
+			if self.backward_buffer.len() > remaining {
+				self.backward_buffer.truncate(remaining);
+			}
+		}
+
+		// Pre-increment entries_returned by buffer size
+		// (all buffered entries will be yielded before next collect)
+		self.entries_returned += self.backward_buffer.len();
+
 		// Start yielding from index 0 (oldest in valid range)
 		self.backward_buffer_index = Some(0);
 		Ok(true)
@@ -1467,20 +1710,37 @@ impl InternalIterator for HistoryIterator<'_> {
 		self.direction = MergeDirection::Forward;
 		self.reset_all_state();
 
+		// Upper timestamp bound (or max if no range)
+		let ts = self.ts_range.map(|(_, end)| end).unwrap_or(u64::MAX);
+
+		let lower = self.lower_bound.clone();
+
 		match &mut self.inner {
 			HistoryIteratorInner::Lsm(iter) => {
-				iter.seek_first()?;
+				if self.ts_range.is_some() {
+					// Seek to (lower_bound or empty, ts_end) to skip entries above range
+					let seek_key = InternalKey::new(
+						lower.unwrap_or_default(),
+						u64::MAX,
+						InternalKeyKind::Set,
+						ts,
+					);
+					iter.seek(&seek_key.encode())?;
+				} else {
+					iter.seek_first()?;
+				}
 			}
+
 			HistoryIteratorInner::BTree(iter) => {
-				if let Some(ref lower) = self.lower_bound {
-					let seek_key =
-						InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set, u64::MAX);
+				if let Some(lower) = lower {
+					let seek_key = InternalKey::new(lower, u64::MAX, InternalKeyKind::Set, ts);
 					iter.seek(&seek_key.encode())?;
 				} else {
 					iter.seek_first()?;
 				}
 			}
 		}
+
 		self.initialized = true;
 		self.skip_to_valid_forward()
 	}
@@ -1570,6 +1830,9 @@ impl InternalIterator for HistoryIterator<'_> {
 	}
 
 	fn valid(&self) -> bool {
+		if self.limit_reached {
+			return false;
+		}
 		match self.direction {
 			MergeDirection::Forward => self.inner_valid() && self.within_upper_bound(),
 			MergeDirection::Backward => self.has_buffered_entry(),

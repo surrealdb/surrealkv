@@ -888,7 +888,18 @@ impl CommitEnv for LsmCommitEnv {
 			}
 		}
 
-		// Write to versioned index if present
+		// Write to WAL for durability BEFORE updating versioned index
+		// This ensures the data is persisted before the index reflects it
+		let enc_bytes = processed_batch.encode()?;
+		let mut wal_guard = self.core.wal.write();
+		wal_guard.append(&enc_bytes)?;
+		if sync {
+			wal_guard.sync()?;
+		}
+		drop(wal_guard);
+
+		// Write to versioned index AFTER WAL write succeeds
+		// This ensures the index only reflects data that has been durably persisted
 		if is_versioned_index_enabled {
 			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write();
 
@@ -927,14 +938,6 @@ impl CommitEnv for LsmCommitEnv {
 				// Insert the new entry (whether it's regular Set or SetWithDelete)
 				versioned_index_guard.insert(encoded_key, encoded_value)?;
 			}
-		}
-
-		// Write to WAL for durability
-		let enc_bytes = processed_batch.encode()?;
-		let mut wal_guard = self.core.wal.write();
-		wal_guard.append(&enc_bytes)?;
-		if sync {
-			wal_guard.sync()?;
 		}
 
 		Ok(processed_batch)
