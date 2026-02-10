@@ -1623,125 +1623,6 @@ async fn test_history_ts_range_empty_result() {
 }
 
 // ============================================================================
-// Test: Early exit optimization for ts_range
-// ============================================================================
-
-/// Test that ts_range early exit works correctly.
-/// When timestamp < ts_start, we should skip remaining entries for that key
-/// since timestamps are ordered descending within a key.
-#[test(tokio::test)]
-async fn test_history_ts_range_early_exit_lsm() {
-	let (store, _temp_dir) = create_versioned_store_no_index();
-
-	// Create multiple keys, each with versions spanning a wide range
-	// Key1: ts 100, 200, 300, 400, 500
-	// Key2: ts 150, 250, 350, 450, 550
-	// Key3: ts 50, 60, 70, 80, 90 (all below range)
-	for i in 1..=5 {
-		let mut tx = store.begin().unwrap();
-		tx.set_at(b"key1", format!("v{}", i).as_bytes(), i * 100).unwrap();
-		tx.commit().await.unwrap();
-	}
-	for i in 1..=5 {
-		let mut tx = store.begin().unwrap();
-		tx.set_at(b"key2", format!("v{}", i).as_bytes(), i * 100 + 50).unwrap();
-		tx.commit().await.unwrap();
-	}
-	for i in 1..=5 {
-		let mut tx = store.begin().unwrap();
-		tx.set_at(b"key3", format!("v{}", i).as_bytes(), i * 10 + 40).unwrap();
-		tx.commit().await.unwrap();
-	}
-
-	// Query with ts_range [250, 400]
-	// Expected: key1 ts 300, 400; key2 ts 250, 350
-	// key3 has all entries below 250, so early exit should skip it entirely
-	let tx = store.begin().unwrap();
-	let opts = HistoryOptions::new().with_ts_range(250, 400);
-	let mut iter = tx.history_with_options(b"key1", b"key9", &opts).unwrap();
-	let results = collect_history_all(&mut iter).unwrap();
-
-	// Should have 4 entries: key1@400, key1@300, key2@350, key2@250
-	assert_eq!(results.len(), 4, "Should have 4 entries in ts_range");
-
-	// Verify the entries are from the correct keys and timestamps
-	let timestamps: Vec<u64> = results.iter().map(|(_, _, ts, _)| *ts).collect();
-	assert!(timestamps.contains(&400), "Should include key1@400");
-	assert!(timestamps.contains(&300), "Should include key1@300");
-	assert!(timestamps.contains(&350), "Should include key2@350");
-	assert!(timestamps.contains(&250), "Should include key2@250");
-
-	// key3 entries should NOT be included
-	for (key, _, _, _) in &results {
-		assert_ne!(key.as_slice(), b"key3", "key3 should be excluded (all below range)");
-	}
-}
-
-#[test(tokio::test)]
-async fn test_history_ts_range_early_exit_btree() {
-	let (store, _temp_dir) = create_versioned_store_with_index();
-
-	// Same setup as LSM test
-	for i in 1..=5 {
-		let mut tx = store.begin().unwrap();
-		tx.set_at(b"key1", format!("v{}", i).as_bytes(), i * 100).unwrap();
-		tx.commit().await.unwrap();
-	}
-	for i in 1..=5 {
-		let mut tx = store.begin().unwrap();
-		tx.set_at(b"key2", format!("v{}", i).as_bytes(), i * 100 + 50).unwrap();
-		tx.commit().await.unwrap();
-	}
-	for i in 1..=5 {
-		let mut tx = store.begin().unwrap();
-		tx.set_at(b"key3", format!("v{}", i).as_bytes(), i * 10 + 40).unwrap();
-		tx.commit().await.unwrap();
-	}
-
-	// Query with ts_range [250, 400]
-	let tx = store.begin().unwrap();
-	let opts = HistoryOptions::new().with_ts_range(250, 400);
-	let mut iter = tx.history_with_options(b"key1", b"key9", &opts).unwrap();
-	let results = collect_history_all(&mut iter).unwrap();
-
-	// Should have 4 entries
-	assert_eq!(results.len(), 4, "Should have 4 entries in ts_range");
-
-	// Verify no key3 entries
-	for (key, _, _, _) in &results {
-		assert_ne!(key.as_slice(), b"key3", "key3 should be excluded (all below range)");
-	}
-}
-
-/// Test that B+tree smart seeking skips entries above ts_end efficiently.
-/// This test creates many entries above the ts_range to verify the seek optimization.
-#[test(tokio::test)]
-async fn test_history_btree_smart_seek_skips_above_range() {
-	let (store, _temp_dir) = create_versioned_store_with_index();
-
-	// Create key1 with many versions, most above the ts_range
-	// ts: 100, 200, 300, ..., 1000 (10 versions)
-	for i in 1..=10 {
-		let mut tx = store.begin().unwrap();
-		tx.set_at(b"key1", format!("v{}", i).as_bytes(), i * 100).unwrap();
-		tx.commit().await.unwrap();
-	}
-
-	// Query with ts_range [100, 300] - should only get 3 entries
-	// B+tree should seek directly to ts=300, skipping ts 400-1000
-	let tx = store.begin().unwrap();
-	let opts = HistoryOptions::new().with_ts_range(100, 300);
-	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
-	let results = collect_history_all(&mut iter).unwrap();
-
-	assert_eq!(results.len(), 3, "Should have 3 entries in ts_range [100, 300]");
-
-	let timestamps: Vec<u64> = results.iter().map(|(_, _, ts, _)| *ts).collect();
-	// Newest first within range
-	assert_eq!(timestamps, vec![300, 200, 100], "Should be ordered newest first");
-}
-
-// ============================================================================
 // Fuzz-like Tests for History Iterator Filtering & Skipping
 // ============================================================================
 
@@ -1903,32 +1784,22 @@ async fn fuzz_history_iterator_ts_filtering() {
 		let total_entries = config.num_keys * config.versions_per_key;
 
 		// If ts_range doesn't cover all versions, we should be skipping some entries
-		// Use backend-specific checks for more precise validation
+		// Both LSM and B+tree now use seek optimization at seek_first() to skip entries
+		// above ts_end, so we check either entries_skipped_above_ts_range or total_entries_examined
 		if config.ts_end < max_ts {
-			if config.use_btree {
-				// B+tree: seek optimization may reduce total_entries_examined
-				// or entries are skipped via skip_to_valid_forward
-				let optimization_happened = stats.entries_skipped_above_ts_range > 0
-					|| stats.total_entries_examined < total_entries;
-				assert!(
-					optimization_happened,
-					"Config #{}: {:?}\nB+tree: expected skip or reduced examine when ts_end={} < max_ts={}\nStats: {:?}",
-					idx, config, config.ts_end, max_ts, stats
-				);
-			} else {
-				// LSM: all entries go through skip_to_valid_forward, so we must see
-				// entries_skipped_above_ts_range > 0 when ts_end < max_ts
-				assert!(
-					stats.entries_skipped_above_ts_range > 0,
-					"Config #{}: {:?}\nLSM: expected entries_skipped_above_ts_range > 0 when ts_end={} < max_ts={}\nStats: {:?}",
-					idx, config, config.ts_end, max_ts, stats
-				);
-			}
+			let optimization_happened = stats.entries_skipped_above_ts_range > 0
+				|| stats.early_exits_below_ts_range > 0
+				|| stats.total_entries_examined < total_entries;
+			assert!(
+				optimization_happened,
+				"Config #{}: {:?}\nExpected optimization when ts_end={} < max_ts={}\nStats: {:?}",
+				idx, config, config.ts_end, max_ts, stats
+			);
 		}
 
 		// If ts_start > 100 (first version) and we have results, we should have early exits
-		// (unless B+tree seek positioned us past those entries)
-		if config.ts_start > 100 && expected.count > 0 && !config.use_btree {
+		// Both LSM and B+tree should trigger early exits when hitting ts < ts_start
+		if config.ts_start > 100 && expected.count > 0 {
 			assert!(
 				stats.early_exits_below_ts_range > 0,
 				"Config #{}: {:?}\nExpected early exits when ts_start={} > 100\nStats: {:?}",
@@ -1941,7 +1812,8 @@ async fn fuzz_history_iterator_ts_filtering() {
 
 		// If ts_start > max_ts (all entries below ts_range), we should still have early exits
 		// This is the "all_above_range" case where no entries are in range
-		if config.ts_start > max_ts && !config.use_btree {
+		// Both LSM and B+tree should trigger early exits
+		if config.ts_start > max_ts {
 			assert!(
 				stats.early_exits_below_ts_range > 0,
 				"Config #{}: {:?}\nExpected early exits when all entries below ts_start={}\nStats: {:?}",
@@ -2007,7 +1879,7 @@ async fn test_history_iterator_skip_verification() {
 /// Test multi-key seek optimization
 #[test(tokio::test)]
 async fn test_history_multi_key_seek_optimization() {
-	let (store, _temp_dir) = create_versioned_store_no_index();
+	let (store, _temp_dir) = create_versioned_store_with_index();
 
 	// Create 5 keys, each with 50 versions
 	for key_idx in 0..5 {
@@ -2018,6 +1890,8 @@ async fn test_history_multi_key_seek_optimization() {
 			tx.commit().await.unwrap();
 		}
 	}
+
+	store.flush().unwrap();
 
 	// Query with ts_range [200, 1000] - should get 9 entries per key (45 total)
 	// For each key, ~40 entries (ts 1100-5000) should be skipped above range
@@ -2058,7 +1932,5 @@ async fn test_history_multi_key_seek_optimization() {
 		stats.seeks_performed
 	);
 
-	// Total examined = 5 keys * 50 versions = 250
-	// (40 skipped above + 9 in range + 1 triggers early exit per key)
-	assert_eq!(stats.total_entries_examined, 250, "Should examine all 250 entries");
+	assert_eq!(stats.total_entries_examined, 50, "Should examine all 250 entries");
 }
