@@ -1934,3 +1934,294 @@ async fn test_history_multi_key_seek_optimization() {
 
 	assert!(stats.total_entries_examined < 250, "Should not examine all 250 entries");
 }
+
+// ==================== RYOW (Read Your Own Writes) Tests ====================
+
+/// Test get_at RYOW: uncommitted writes should be visible
+#[test(tokio::test)]
+async fn test_get_at_ryow() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Commit some initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"committed_v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Start a new transaction and write uncommitted data
+	let mut tx = store.begin().unwrap();
+	tx.set_at(b"key1", b"uncommitted_v2", 200).unwrap();
+	tx.set_at(b"key2", b"uncommitted_new", 150).unwrap();
+
+	// RYOW: Should see uncommitted write at matching timestamp
+	let value = tx.get_at(b"key1", 200).unwrap();
+	assert_eq!(value, Some(b"uncommitted_v2".to_vec()), "Should see uncommitted write at ts=200");
+
+	// RYOW: Should see uncommitted write for new key
+	let value = tx.get_at(b"key2", 150).unwrap();
+	assert_eq!(value, Some(b"uncommitted_new".to_vec()), "Should see uncommitted new key");
+
+	// Should see committed data at older timestamp
+	let value = tx.get_at(b"key1", 100).unwrap();
+	assert_eq!(value, Some(b"committed_v1".to_vec()), "Should see committed data at ts=100");
+}
+
+/// Test get_at RYOW: future timestamp writes should not be visible
+#[test(tokio::test)]
+async fn test_get_at_ryow_future_timestamp() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Start a transaction and write with future timestamp
+	let mut tx = store.begin().unwrap();
+	tx.set_at(b"key1", b"future_value", 500).unwrap();
+
+	// Query at earlier timestamp should NOT see the future write
+	let value = tx.get_at(b"key1", 400).unwrap();
+	assert_eq!(value, None, "Should not see future write at ts=400 < write ts=500");
+
+	// Query at same or later timestamp should see it
+	let value = tx.get_at(b"key1", 500).unwrap();
+	assert_eq!(value, Some(b"future_value".to_vec()), "Should see write at ts=500");
+
+	let value = tx.get_at(b"key1", 600).unwrap();
+	assert_eq!(value, Some(b"future_value".to_vec()), "Should see write at ts=600 > write ts=500");
+}
+
+/// Test get_at RYOW with tombstone
+#[test(tokio::test)]
+async fn test_get_at_ryow_tombstone() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Commit initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"initial", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Delete the key in a new transaction (uncommitted)
+	let mut tx = store.begin().unwrap();
+	tx.delete(b"key1").unwrap();
+
+	// The delete timestamp should be after 100, so get_at at delete time should return None
+	// Since delete uses current time, query at a very high timestamp to ensure we see the delete
+	let value = tx.get_at(b"key1", u64::MAX).unwrap();
+	assert_eq!(value, None, "Should see tombstone as None");
+}
+
+/// Test history iterator RYOW: uncommitted writes appear in history
+#[test(tokio::test)]
+async fn test_history_ryow() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Commit some initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"committed_v1", 100).unwrap();
+		tx.set_at(b"key1", b"committed_v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Start a new transaction and write uncommitted data
+	let mut tx = store.begin().unwrap();
+	tx.set_at(b"key1", b"uncommitted_v3", 300).unwrap();
+	tx.set_at(b"key2", b"uncommitted_new", 150).unwrap();
+
+	// Get history - should include uncommitted writes
+	let opts = HistoryOptions::new();
+	let mut iter = tx.history_with_options(b"key1", b"key3", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	// Should have 4 entries: key1@300 (uncommitted), key1@200, key1@100, key2@150 (uncommitted)
+	// Ordered by (key ASC, timestamp DESC)
+	assert_eq!(results.len(), 4, "Should have 4 history entries");
+
+	// key1@300 (uncommitted)
+	assert_eq!(results[0].0, b"key1".to_vec());
+	assert_eq!(results[0].1, b"uncommitted_v3".to_vec());
+	assert_eq!(results[0].2, 300);
+
+	// key1@200 (committed)
+	assert_eq!(results[1].0, b"key1".to_vec());
+	assert_eq!(results[1].1, b"committed_v2".to_vec());
+	assert_eq!(results[1].2, 200);
+
+	// key1@100 (committed)
+	assert_eq!(results[2].0, b"key1".to_vec());
+	assert_eq!(results[2].1, b"committed_v1".to_vec());
+	assert_eq!(results[2].2, 100);
+
+	// key2@150 (uncommitted)
+	assert_eq!(results[3].0, b"key2".to_vec());
+	assert_eq!(results[3].1, b"uncommitted_new".to_vec());
+	assert_eq!(results[3].2, 150);
+}
+
+/// Test history RYOW with timestamp collision: write set wins
+#[test(tokio::test)]
+async fn test_history_ryow_timestamp_collision() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Commit some initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"committed_at_100", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Write uncommitted data with the SAME timestamp
+	let mut tx = store.begin().unwrap();
+	tx.set_at(b"key1", b"uncommitted_at_100", 100).unwrap();
+
+	// Get history - uncommitted write should shadow committed one at same timestamp
+	let opts = HistoryOptions::new();
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	// Should have only 1 entry - the uncommitted one shadows the committed one
+	assert_eq!(results.len(), 1, "Should have 1 entry (uncommitted shadows committed at same ts)");
+	assert_eq!(results[0].0, b"key1".to_vec());
+	assert_eq!(results[0].1, b"uncommitted_at_100".to_vec());
+	assert_eq!(results[0].2, 100);
+}
+
+/// Test history RYOW with timestamp range filtering
+#[test(tokio::test)]
+async fn test_history_ryow_with_ts_range() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Commit initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"committed_100", 100).unwrap();
+		tx.set_at(b"key1", b"committed_200", 200).unwrap();
+		tx.set_at(b"key1", b"committed_300", 300).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Write uncommitted data at various timestamps
+	let mut tx = store.begin().unwrap();
+	tx.set_at(b"key1", b"uncommitted_150", 150).unwrap();
+
+	// Query with ts_range [100, 200] - should include uncommitted at 150
+	let opts = HistoryOptions::new().with_ts_range(100, 200);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	// Should have: key1@200, key1@150 (uncommitted), key1@100
+	assert_eq!(results.len(), 3, "Should have 3 entries in range [100, 200]");
+	assert_eq!(results[0].2, 200);
+	assert_eq!(results[1].2, 150);
+	assert_eq!(results[1].1, b"uncommitted_150".to_vec());
+	assert_eq!(results[2].2, 100);
+}
+
+/// Test history RYOW soft delete (tombstone) handling
+#[test(tokio::test)]
+async fn test_history_ryow_soft_delete() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Commit initial data at ts=100
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v1", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Soft delete key in new transaction (uncommitted)
+	let mut tx = store.begin().unwrap();
+	let write_opts = crate::transaction::WriteOptions {
+		timestamp: Some(200),
+	};
+	tx.soft_delete_with_options(b"key1", &write_opts).unwrap();
+
+	// Query without tombstones - should not see soft delete entry from write set
+	let opts = HistoryOptions::new();
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	// Should only see the committed entry (write set soft delete is filtered out)
+	assert_eq!(results.len(), 1, "Should have 1 entry (soft delete filtered)");
+	assert_eq!(results[0].1, b"v1".to_vec());
+	assert_eq!(results[0].2, 100);
+
+	// Query with tombstones included - should see soft delete entry from write set
+	let opts = HistoryOptions::new().with_tombstones(true);
+	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	// Should see both: the soft delete @200 (uncommitted) and the original value @100
+	assert_eq!(results.len(), 2, "Should have 2 entries with tombstones");
+	// The soft delete should be first (higher timestamp)
+	assert_eq!(results[0].2, 200, "First entry should be ts=200");
+	assert!(results[0].3, "First entry should be tombstone (is_tombstone=true)");
+	// The original value should be second
+	assert_eq!(results[1].2, 100, "Second entry should be ts=100");
+	assert!(!results[1].3, "Second entry should not be tombstone");
+}
+
+/// Test history RYOW hard delete handling - wipes all history
+#[test(tokio::test)]
+async fn test_history_ryow_hard_delete() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Commit initial data at ts=100
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v1", 100).unwrap();
+		tx.set_at(b"key2", b"v2", 100).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Hard delete key1 in new transaction (uncommitted)
+	let mut tx = store.begin().unwrap();
+	tx.delete(b"key1").unwrap();
+
+	// Query history - hard delete should wipe all history for key1
+	let opts = HistoryOptions::new();
+	let mut iter = tx.history_with_options(b"key1", b"key3", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	// Should only see key2, key1's history is wiped by hard delete
+	assert_eq!(results.len(), 1, "Should have 1 entry (key1 wiped by hard delete)");
+	assert_eq!(results[0].0, b"key2".to_vec());
+	assert_eq!(results[0].1, b"v2".to_vec());
+
+	// Even with tombstones=true, hard delete entry itself should not appear
+	// and all history for that key should be gone
+	let opts = HistoryOptions::new().with_tombstones(true);
+	let mut iter = tx.history_with_options(b"key1", b"key3", &opts).unwrap();
+	let results = collect_history_all(&mut iter).unwrap();
+
+	assert_eq!(results.len(), 1, "Hard delete wipes history even with tombstones=true");
+	assert_eq!(results[0].0, b"key2".to_vec());
+}
+
+/// Test get_at RYOW with hard delete - returns None regardless of timestamp
+#[test(tokio::test)]
+async fn test_get_at_ryow_hard_delete() {
+	let (store, _temp_dir) = create_versioned_store_no_index();
+
+	// Commit initial data
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(b"key1", b"v1", 100).unwrap();
+		tx.set_at(b"key1", b"v2", 200).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	// Hard delete the key
+	let mut tx = store.begin().unwrap();
+	tx.delete(b"key1").unwrap();
+
+	// get_at should return None for any timestamp - hard delete wipes all
+	let value = tx.get_at(b"key1", 100).unwrap();
+	assert_eq!(value, None, "Hard delete should wipe ts=100");
+
+	let value = tx.get_at(b"key1", 200).unwrap();
+	assert_eq!(value, None, "Hard delete should wipe ts=200");
+
+	let value = tx.get_at(b"key1", u64::MAX).unwrap();
+	assert_eq!(value, None, "Hard delete should wipe all timestamps");
+}

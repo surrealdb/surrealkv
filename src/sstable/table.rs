@@ -946,8 +946,8 @@ impl Table {
 	/// Reads a data block with a custom comparator.
 	///
 	/// This method bypasses the cache since blocks with different comparators
-	/// cannot be cached together. Use this for specialized iteration patterns
-	/// like history queries with timestamp-based comparators.
+	/// cannot be cached together. Using this for history queries with 
+	/// timestamp-based comparators.
 	pub(crate) fn read_block_with_comparator(
 		&self,
 		location: &BlockHandle,
@@ -1034,9 +1034,6 @@ impl Table {
 	}
 
 	/// Creates an iterator over the table with a custom comparator.
-	///
-	/// This allows specialized iteration patterns like history queries where
-	/// a `TimestampComparator` is used instead of the default `InternalKeyComparator`.
 	pub(crate) fn iter_with_comparator(
 		&self,
 		range: Option<InternalKeyRange>,

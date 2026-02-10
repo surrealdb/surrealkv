@@ -366,15 +366,6 @@ impl Transaction {
 		self.soft_delete_with_options(key, &WriteOptions::default())
 	}
 
-	/// Soft deletes a key at a specific timestamp. This will add a tombstone at
-	/// the specified timestamp.
-	pub fn soft_delete_at<K>(&mut self, key: K, timestamp: u64) -> Result<()>
-	where
-		K: IntoBytes,
-	{
-		self.soft_delete_with_options(key, &WriteOptions::default().with_timestamp(Some(timestamp)))
-	}
-
 	/// Soft delete a key, with custom write options. This will add a tombstone
 	/// at the specified timestamp.
 	pub fn soft_delete_with_options<K>(&mut self, key: K, options: &WriteOptions) -> Result<()>
@@ -520,6 +511,25 @@ impl Transaction {
 				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 			}
 
+			// RYOW: Check write set first for uncommitted writes
+			if let Some(entries) = self.write_set.get(key.as_slice()) {
+				if let Some(entry) = entries.last() {
+					// Hard delete wipes all history - return None regardless of timestamp
+					if entry.is_hard_delete() {
+						return Ok(None);
+					}
+
+					// Write set entry is visible if its timestamp <= query timestamp
+					if entry.timestamp <= timestamp {
+						if entry.is_tombstone() {
+							return Ok(None);
+						}
+						return Ok(entry.value.clone());
+					}
+					// entry.timestamp > timestamp: write is "from the future", check storage
+				}
+			}
+
 			// Query the versioned index through the snapshot
 			match &self.snapshot {
 				Some(snapshot) => snapshot.get_at(key.as_slice(), timestamp),
@@ -647,7 +657,41 @@ impl Transaction {
 			opts.limit,
 		)?;
 
-		Ok(TransactionHistoryIterator::new(inner, Arc::clone(&self.core)))
+		// RYOW: Collect write-set entries in the key range
+		// Hard deletes are tracked separately and skip all snapshot history for that key
+		let mut write_set_entries: Vec<(&Key, &Entry)> = Vec::new();
+		let mut hard_delete_keys: std::collections::HashSet<&[u8]> =
+			std::collections::HashSet::new();
+
+		for (key, entry_list) in
+			self.write_set.range(start.as_slice().to_vec()..end.as_slice().to_vec())
+		{
+			if let Some(entry) = entry_list.last() {
+				// Hard deletes wipe all history - track them separately
+				if entry.is_hard_delete() {
+					hard_delete_keys.insert(key.as_slice());
+					// Hard deletes are never returned (even with include_tombstones)
+					continue;
+				}
+
+				// Filter by timestamp range if specified
+				if let Some((ts_start, ts_end)) = opts.ts_range {
+					if entry.timestamp >= ts_start && entry.timestamp <= ts_end {
+						write_set_entries.push((key, entry));
+					}
+				} else {
+					write_set_entries.push((key, entry));
+				}
+			}
+		}
+
+		Ok(TransactionHistoryIterator::new(
+			inner,
+			Arc::clone(&self.core),
+			write_set_entries,
+			hard_delete_keys,
+			opts.include_tombstones,
+		))
 	}
 
 	/// Writes a value for a key with custom write options. None is used for
@@ -914,6 +958,11 @@ impl Entry {
 		}
 
 		false
+	}
+
+	/// Checks if this entry is a hard delete (wipes all history)
+	fn is_hard_delete(&self) -> bool {
+		self.kind == InternalKeyKind::Delete || self.kind == InternalKeyKind::RangeDelete
 	}
 }
 
@@ -1386,95 +1435,854 @@ impl<'a> TransactionIterator<'a> {
 }
 
 // ===== Transaction History Iterator =====
-
+/// # TransactionHistoryIterator
+///
+/// A merge iterator that combines two sorted sources of key-version pairs:
+///
+/// 1. **Snapshot** (committed data in LSM) - all historical versions
+/// 2. **Write-set** (uncommitted transaction writes) - pending changes
+///
+/// The iterator merges them to provide RYOW (Read Your Own Writes) semantics,
+/// ensuring the transaction sees its own uncommitted writes overlaid on
+/// committed data.
+///
+/// ## Data Model
+///
+/// Each entry is: `(key, timestamp, value)`
+///
+/// - **Key**: the user key (e.g., `"user:1"`)
+/// - **Timestamp**: version number (higher = newer)
+/// - **Value**: the data (or tombstone marker for soft deletes)
+///
+/// ## Ordering
+///
+/// **Forward iteration** (`seek_first`, `next`):
+/// ```text
+/// Primary:   key ASC       (a < b < c)
+/// Secondary: timestamp DESC (100 > 50 > 10) — newer versions first
+/// ```
+///
+/// **Backward iteration** (`seek_last`, `prev`):
+/// ```text
+/// Primary:   key DESC      (c > b > a)
+/// Secondary: timestamp ASC (10 < 50 < 100) — older versions first
+/// ```
+///
+/// ## Example: Basic Merge
+///
+/// ```text
+/// Snapshot (committed):          Write-set (transaction):
+/// ┌─────────┬────┬───────┐       ┌─────────┬────┬───────┐
+/// │ Key     │ TS │ Value │       │ Key     │ TS │ Value │
+/// ├─────────┼────┼───────┤       ├─────────┼────┼───────┤
+/// │ "a"     │ 50 │ "v1"  │       │ "b"     │ 80 │ "v4"  │
+/// │ "a"     │ 30 │ "v0"  │       └─────────┴────┴───────┘
+/// │ "c"     │ 40 │ "v2"  │
+/// └─────────┴────┴───────┘
+///
+/// Forward iteration produces:
+///   ("a",50) ← snap wins, "a" < "b"
+///   ("a",30) ← snap wins, "a" < "b"
+///   ("b",80) ← write-set wins, "b" < "c"
+///   ("c",40) ← snap (write-set exhausted)
+/// ```
+///
 /// Public wrapper around `HistoryIterator` that provides convenient methods
 /// for accessing version history with resolved values.
+///
+/// ## Architecture
+///
+/// ```text
+/// ┌─────────────────────────────────────────────────────────────┐
+/// │              TransactionHistoryIterator                     │
+/// │                                                             │
+/// │   ┌──────────────┐         ┌──────────────────┐             │
+/// │   │   Snapshot   │         │    Write-set     │             │
+/// │   │  (committed) │         │  (uncommitted)   │             │
+/// │   └──────┬───────┘         └────────┬─────────┘             │
+/// │          │                          │                       │
+/// │          ▼                          ▼                       │
+/// │        ┌──────────────────────────────┐                     │
+/// │        │       Merge Logic            │                     │
+/// │        │  • Compare (key, timestamp)  │                     │
+/// │        │  • Pick winner by ordering   │                     │
+/// │        │  • Handle RYOW conflicts     │                     │
+/// │        └──────────────┬───────────────┘                     │
+/// │                       │                                     │
+/// │                       ▼                                     │
+/// │              Merged output stream                           │
+/// └─────────────────────────────────────────────────────────────┘
+/// ```
+///
+/// ## Write-set Position Invariant
+///
+/// The write-set uses two pointers to track the valid range:
+/// ```text
+/// [ws_pos, ws_pos_back) = valid range
+/// ```
+///
+/// **Invariant**: `ws_pos <= ws_pos_back` must always hold.
+///
+/// - Forward iteration advances `ws_pos` upward
+/// - Backward iteration advances `ws_pos_back` downward
+/// - All seek operations reset BOTH pointers to restore the full range
 pub struct TransactionHistoryIterator<'a> {
+	// === Core data sources ===
+	/// History iterator from snapshot - provides committed data.
+	/// Already sorted by (user_key ASC, timestamp DESC).
 	inner: HistoryIterator<'a>,
+
+	/// Core for resolving VLog references to actual values.
 	core: Arc<Core>,
+
+	// === RYOW (Read Your Own Writes) fields ===
+	/// Write-set entries for the range, sorted by key.
+	/// These are the transaction's uncommitted writes that should be
+	/// visible to reads within the same transaction.
+	///
+	/// Assumption: one entry per key (latest write wins within transaction).
+	/// Note: Hard delete entries are excluded (they go to `hard_delete_keys`).
+	write_set_entries: Vec<(&'a Key, &'a Entry)>,
+
+	/// Keys that have hard deletes in write-set.
+	///
+	/// Hard deletes differ from tombstones:
+	/// - **Tombstone**: Marks key as deleted at a specific timestamp. Old versions are still
+	///   visible in history.
+	/// - **Hard delete**: Erases ALL history for the key. The key appears as if it never existed.
+	///
+	/// Example:
+	/// ```text
+	/// Snapshot:                Hard-delete-keys: {"b"}
+	/// ┌─────┬────┬─────┐
+	/// │ "a" │ 50 │ v1  │       After iteration:
+	/// │ "b" │ 40 │ v2  │  →    [("a",50), ("c",60)]
+	/// │ "b" │ 20 │ v0  │       All "b" history erased
+	/// │ "c" │ 60 │ v3  │
+	/// └─────┴────┴─────┘
+	/// ```
+	hard_delete_keys: std::collections::HashSet<&'a [u8]>,
+
+	/// Current position in write-set entries (forward iteration).
+	/// Range: 0..=len, where len means exhausted.
+	///
+	/// Invariant: `ws_pos <= ws_pos_back`
+	ws_pos: usize,
+
+	/// Current position in write-set entries (backward iteration).
+	/// Range: 0..=len, represents one-past-the-end style index.
+	/// The current backward entry is at `ws_pos_back - 1`.
+	///
+	/// Invariant: `ws_pos <= ws_pos_back`
+	ws_pos_back: usize,
+
+	/// Which source provided the current entry.
+	current_source: CurrentSource,
+
+	/// Buffer for encoding write-set key in internal format.
+	/// Used for `InternalIterator::key()` which returns encoded keys.
+	ws_encoded_key_buf: Vec<u8>,
+
+	/// Current iteration direction.
+	direction: MergeDirection,
+
+	/// Whether the iterator has been positioned via seek/next/prev.
+	initialized: bool,
+
+	/// Whether to include tombstone entries in results.
+	///
+	/// - `true`: Tombstones are returned like regular entries (for compaction, etc.)
+	/// - `false`: Tombstones are skipped (for normal reads)
+	///
+	/// Example with `include_tombstones = false`:
+	/// ```text
+	/// Write-set: [("x", 70, TOMBSTONE)]
+	/// Snapshot:  [("x", 50, "alive")]
+	///
+	/// Result: [("x", 50, "alive")]  ← Tombstone skipped
+	/// ```
+	include_tombstones: bool,
 }
 
 impl<'a> TransactionHistoryIterator<'a> {
-	/// Creates a new history iterator
-	pub(crate) fn new(inner: HistoryIterator<'a>, core: Arc<Core>) -> Self {
+	/// Creates a new history iterator with RYOW support.
+	///
+	/// # Arguments
+	///
+	/// * `inner` - The underlying snapshot history iterator
+	/// * `core` - Core for VLog value resolution
+	/// * `write_set_entries` - Transaction's uncommitted writes, sorted by key
+	/// * `hard_delete_keys` - Keys to completely erase from history
+	/// * `include_tombstones` - Whether to return tombstone entries
+	pub(crate) fn new(
+		inner: HistoryIterator<'a>,
+		core: Arc<Core>,
+		write_set_entries: Vec<(&'a Key, &'a Entry)>,
+		hard_delete_keys: std::collections::HashSet<&'a [u8]>,
+		include_tombstones: bool,
+	) -> Self {
+		let ws_len = write_set_entries.len();
 		Self {
 			inner,
 			core,
+			write_set_entries,
+			hard_delete_keys,
+			ws_pos: 0,
+			ws_pos_back: ws_len,
+			current_source: CurrentSource::None,
+			ws_encoded_key_buf: Vec::new(),
+			direction: MergeDirection::Forward,
+			initialized: false,
+			include_tombstones,
 		}
 	}
 
-	/// Seek to first entry. Returns true if valid.
+	// =========================================================================
+	// Write-set position management
+	// =========================================================================
+
+	/// Reset both write-set positions to cover the full range.
+	///
+	/// This MUST be called on any seek operation to maintain the invariant:
+	/// ```text
+	/// ws_pos <= ws_pos_back
+	/// ```
+	/// where `[ws_pos, ws_pos_back)` is the valid range.
+	///
+	/// ## Why This Matters
+	///
+	/// Without resetting both positions, sequences like:
+	/// ```text
+	/// prev() x2 → seek_first()
+	/// ```
+	/// would leave `ws_pos_back` at a truncated position, hiding entries:
+	///
+	/// ```text
+	/// Without this:
+	///   Initial:       ws_pos=0, ws_pos_back=5  [A B C D E]
+	///   prev() x2:     ws_pos=0, ws_pos_back=3  [A B C|D E] ← D,E "consumed"
+	///   seek_first():  ws_pos=0, ws_pos_back=3  [A B C|D E] ← BUG! D,E invisible
+	///
+	/// After this:
+	///   Initial:       ws_pos=0, ws_pos_back=5  [A B C D E]
+	///   prev() x2:     ws_pos=0, ws_pos_back=3  [A B C|D E]
+	///   seek_first():  ws_pos=0, ws_pos_back=5  [A B C D E] ← Full range restored
+	/// ```
+	fn reset_ws_positions(&mut self) {
+		self.ws_pos = 0;
+		self.ws_pos_back = self.write_set_entries.len();
+	}
+
+	// =========================================================================
+	// Write-set helper methods
+	// =========================================================================
+	//
+	// These provide safe access to write-set entries for both forward and
+	// backward iteration. Forward uses `ws_pos`, backward uses `ws_pos_back - 1`.
+
+	/// Check if current write-set position is valid (forward iteration).
+	/// Valid when `ws_pos` hasn't reached `ws_pos_back`.
+	fn ws_valid(&self) -> bool {
+		self.ws_pos < self.ws_pos_back
+	}
+
+	/// Check if current write-set position is valid (backward iteration).
+	/// Valid when `ws_pos_back` hasn't reached `ws_pos`.
+	fn ws_valid_back(&self) -> bool {
+		self.ws_pos_back > self.ws_pos
+	}
+
+	/// Get current write-set key (forward iteration).
+	fn ws_key(&self) -> &[u8] {
+		debug_assert!(self.ws_valid());
+		self.write_set_entries[self.ws_pos].0.as_slice()
+	}
+
+	/// Get current write-set key (backward iteration).
+	/// Note: backward index is `ws_pos_back - 1`.
+	fn ws_key_back(&self) -> &[u8] {
+		debug_assert!(self.ws_valid_back());
+		self.write_set_entries[self.ws_pos_back - 1].0.as_slice()
+	}
+
+	/// Get current write-set timestamp (forward iteration).
+	fn ws_timestamp(&self) -> u64 {
+		debug_assert!(self.ws_valid());
+		self.write_set_entries[self.ws_pos].1.timestamp
+	}
+
+	/// Get current write-set timestamp (backward iteration).
+	fn ws_timestamp_back(&self) -> u64 {
+		debug_assert!(self.ws_valid_back());
+		self.write_set_entries[self.ws_pos_back - 1].1.timestamp
+	}
+
+	/// Check if current write-set entry is a tombstone (forward iteration).
+	fn ws_is_tombstone(&self) -> bool {
+		debug_assert!(self.ws_valid());
+		self.write_set_entries[self.ws_pos].1.is_tombstone()
+	}
+
+	/// Check if current write-set entry is a tombstone (backward iteration).
+	fn ws_is_tombstone_back(&self) -> bool {
+		debug_assert!(self.ws_valid_back());
+		self.write_set_entries[self.ws_pos_back - 1].1.is_tombstone()
+	}
+
+	/// Populate the encoded key buffer for the current write-set entry.
+	///
+	/// This is needed for `InternalIterator::key()` which must return keys
+	/// in the internal encoded format: `[user_key | trailer | timestamp]`
+	///
+	/// The trailer encodes sequence number and entry kind for LSM ordering.
+	fn populate_ws_encoded_key(&mut self) {
+		let (key, entry) = if self.direction == MergeDirection::Forward {
+			if !self.ws_valid() {
+				return;
+			}
+			self.write_set_entries[self.ws_pos]
+		} else {
+			if !self.ws_valid_back() {
+				return;
+			}
+			self.write_set_entries[self.ws_pos_back - 1]
+		};
+
+		self.ws_encoded_key_buf.clear();
+		self.ws_encoded_key_buf.extend_from_slice(key);
+		// Trailer format: (seq_num << 8) | kind
+		let trailer = ((entry.seqno as u64) << 8) | (entry.kind as u64);
+		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
+		self.ws_encoded_key_buf.extend_from_slice(&entry.timestamp.to_be_bytes());
+	}
+
+	// =========================================================================
+	// Core merge logic
+	// =========================================================================
+
+	/// Position to the minimum of snapshot and write-set (forward merge).
+	///
+	/// # Ordering: (user_key ASC, timestamp DESC)
+	///
+	/// Returns the entry that should come first in forward iteration order.
+	///
+	/// ## Merge Algorithm
+	///
+	/// ```text
+	///     Snapshot          Write-set
+	///     ┌───┐             ┌───┐
+	///     │ A │─┐       ┌───│ B │
+	///     └───┘ │       │   └───┘
+	///           ▼       ▼
+	///         ┌───────────┐
+	///         │  Compare  │
+	///         │ Pick MIN  │
+	///         └─────┬─────┘
+	///               │
+	///               ▼
+	///          Return winner
+	///          (advance winner's pointer on next call)
+	/// ```
+	///
+	/// ## Key Comparison Rules
+	///
+	/// ```text
+	/// ┌────────────────────────────────────────────────────────┐
+	/// │ hist_key vs ws_key                                     │
+	/// ├────────────────────────────────────────────────────────┤
+	/// │ hist < ws  → return Snapshot  (hist key comes first)   │
+	/// │ hist > ws  → return WriteSet  (ws key comes first)     │
+	/// │ hist = ws  → compare timestamps (same key, pick newer) │
+	/// │   hist_ts > ws_ts → return Snapshot (hist is newer)    │
+	/// │   hist_ts < ws_ts → return WriteSet (ws is newer)      │
+	/// │   hist_ts = ws_ts → WriteSet wins (RYOW), skip Snapshot│
+	/// └────────────────────────────────────────────────────────┘
+	/// ```
+	///
+	/// ## RYOW (Read Your Own Writes)
+	///
+	/// When both sources have the same (key, timestamp), the write-set
+	/// entry wins and the snapshot entry is skipped. This ensures the
+	/// transaction sees its own writes.
+	///
+	/// ```text
+	/// Snapshot:   ("x", 50, "snap")
+	/// Write-set:  ("x", 50, "ws")
+	///
+	/// Same key, same timestamp → WriteSet wins, skip Snapshot
+	/// Result: [("x", 50, "ws")]  ← Only transaction's version
+	/// ```
+	fn position_to_min(&mut self) -> Result<bool> {
+		loop {
+			let hist_valid = self.inner.valid();
+			let ws_valid = self.ws_valid();
+
+			// Skip snapshot entries for hard-deleted keys.
+			// Hard deletes erase ALL history for a key.
+			if hist_valid {
+				let hist_key = self.inner.key().user_key();
+				if self.hard_delete_keys.contains(hist_key) {
+					self.inner.next()?;
+					continue;
+				}
+			}
+
+			self.current_source = match (hist_valid, ws_valid) {
+				// Both exhausted - iteration complete
+				(false, false) => CurrentSource::None,
+
+				// Only snapshot has entries
+				(true, false) => CurrentSource::Snapshot,
+
+				// Only write-set has entries
+				(false, true) => {
+					// Skip tombstones if not included
+					if !self.include_tombstones && self.ws_is_tombstone() {
+						self.ws_pos += 1;
+						continue;
+					}
+					self.populate_ws_encoded_key();
+					CurrentSource::WriteSet
+				}
+
+				// Both have entries - need to compare and pick minimum
+				(true, true) => {
+					let hist_key = self.inner.key().user_key();
+					let hist_ts = self.inner.key().timestamp();
+					let ws_key = self.ws_key();
+					let ws_ts = self.ws_timestamp();
+
+					match hist_key.cmp(ws_key) {
+						// Snapshot key is smaller - it comes first in ASC order
+						Ordering::Less => CurrentSource::Snapshot,
+
+						// Write-set key is smaller
+						Ordering::Greater => {
+							if !self.include_tombstones && self.ws_is_tombstone() {
+								self.ws_pos += 1;
+								continue;
+							}
+							self.populate_ws_encoded_key();
+							CurrentSource::WriteSet
+						}
+
+						// Same key - compare timestamps (DESC: higher first)
+						Ordering::Equal => {
+							match hist_ts.cmp(&ws_ts) {
+								// Snapshot has higher timestamp - it's newer, return first
+								Ordering::Greater => CurrentSource::Snapshot,
+
+								// Write-set has higher timestamp - it's newer
+								Ordering::Less => {
+									if !self.include_tombstones && self.ws_is_tombstone() {
+										self.ws_pos += 1;
+										continue;
+									}
+									self.populate_ws_encoded_key();
+									CurrentSource::WriteSet
+								}
+
+								// Same timestamp - RYOW: write-set wins, skip snapshot
+								// This ensures transaction sees its own writes
+								Ordering::Equal => {
+									self.inner.next()?; // Skip the shadowed snapshot entry
+									if !self.include_tombstones && self.ws_is_tombstone() {
+										self.ws_pos += 1;
+										continue;
+									}
+									self.populate_ws_encoded_key();
+									CurrentSource::WriteSet
+								}
+							}
+						}
+					}
+				}
+			};
+			return Ok(self.current_source != CurrentSource::None);
+		}
+	}
+
+	/// Position to the maximum of snapshot and write-set (backward merge).
+	///
+	/// # Ordering: (user_key DESC, timestamp ASC)
+	///
+	/// Returns the entry that should come first in backward iteration order.
+	/// This is the mirror of `position_to_min` with reversed comparisons.
+	///
+	/// ## Key Comparison Rules (Backward)
+	///
+	/// ```text
+	/// ┌────────────────────────────────────────────────────────┐
+	/// │ hist_key vs ws_key                                     │
+	/// ├────────────────────────────────────────────────────────┤
+	/// │ hist > ws  → return Snapshot  (hist key comes first)   │
+	/// │ hist < ws  → return WriteSet  (ws key comes first)     │
+	/// │ hist = ws  → compare timestamps (same key, pick older) │
+	/// │   hist_ts < ws_ts → return Snapshot (hist is older)    │
+	/// │   hist_ts > ws_ts → return WriteSet (ws is older)      │
+	/// │   hist_ts = ws_ts → WriteSet wins (RYOW), skip Snapshot│
+	/// └────────────────────────────────────────────────────────┘
+	/// ```
+	fn position_to_max(&mut self) -> Result<bool> {
+		loop {
+			let hist_valid = self.inner.valid();
+			let ws_valid = self.ws_valid_back();
+
+			// Skip snapshot entries for hard-deleted keys
+			if hist_valid {
+				let hist_key = self.inner.key().user_key();
+				if self.hard_delete_keys.contains(hist_key) {
+					self.inner.prev()?;
+					continue;
+				}
+			}
+
+			self.current_source = match (hist_valid, ws_valid) {
+				// Both exhausted
+				(false, false) => CurrentSource::None,
+
+				// Only snapshot has entries
+				(true, false) => CurrentSource::Snapshot,
+
+				// Only write-set has entries
+				(false, true) => {
+					if !self.include_tombstones && self.ws_is_tombstone_back() {
+						self.ws_pos_back -= 1;
+						continue;
+					}
+					self.populate_ws_encoded_key();
+					CurrentSource::WriteSet
+				}
+
+				// Both have entries - compare and pick maximum
+				(true, true) => {
+					let hist_key = self.inner.key().user_key();
+					let hist_ts = self.inner.key().timestamp();
+					let ws_key = self.ws_key_back();
+					let ws_ts = self.ws_timestamp_back();
+
+					match hist_key.cmp(ws_key) {
+						// Snapshot key is larger - it comes first in DESC order
+						Ordering::Greater => CurrentSource::Snapshot,
+
+						// Write-set key is larger
+						Ordering::Less => {
+							if !self.include_tombstones && self.ws_is_tombstone_back() {
+								self.ws_pos_back -= 1;
+								continue;
+							}
+							self.populate_ws_encoded_key();
+							CurrentSource::WriteSet
+						}
+
+						// Same key - compare timestamps (ASC: lower first in backward)
+						Ordering::Equal => {
+							match hist_ts.cmp(&ws_ts) {
+								// Snapshot has lower timestamp - it's older, return first
+								// (backward)
+								Ordering::Less => CurrentSource::Snapshot,
+
+								// Write-set has lower timestamp - it's older
+								Ordering::Greater => {
+									if !self.include_tombstones && self.ws_is_tombstone_back() {
+										self.ws_pos_back -= 1;
+										continue;
+									}
+									self.populate_ws_encoded_key();
+									CurrentSource::WriteSet
+								}
+
+								// Same timestamp - RYOW: write-set wins, skip snapshot
+								Ordering::Equal => {
+									self.inner.prev()?;
+									if !self.include_tombstones && self.ws_is_tombstone_back() {
+										self.ws_pos_back -= 1;
+										continue;
+									}
+									self.populate_ws_encoded_key();
+									CurrentSource::WriteSet
+								}
+							}
+						}
+					}
+				}
+			};
+			return Ok(self.current_source != CurrentSource::None);
+		}
+	}
+
+	/// Seek to the first entry in forward order.
+	///
+	/// Positions the iterator at the entry with the smallest (key, timestamp DESC).
+	/// Returns `true` if a valid entry exists.
+	///
+	/// ## Example
+	///
+	/// ```text
+	/// Data: [("a",50), ("a",30), ("b",40)]
+	/// seek_first() → positions at ("a", 50)
+	/// ```
 	pub fn seek_first(&mut self) -> Result<bool> {
-		self.inner.seek_first()
+		self.direction = MergeDirection::Forward;
+		self.initialized = true;
+
+		// Position snapshot at first entry
+		self.inner.seek_first()?;
+
+		// Reset write-set to full range (critical for correctness after backward iteration)
+		self.reset_ws_positions();
+
+		self.position_to_min()
 	}
 
-	/// Seek to last entry. Returns true if valid.
+	/// Seek to the last entry in backward order.
+	///
+	/// Positions the iterator at the entry with the largest (key, timestamp ASC).
+	/// Returns `true` if a valid entry exists.
+	///
+	/// ## Example
+	///
+	/// ```text
+	/// Data: [("a",50), ("a",30), ("b",40)]
+	/// seek_last() → positions at ("b", 40)
+	/// ```
 	pub fn seek_last(&mut self) -> Result<bool> {
-		self.inner.seek_last()
+		self.direction = MergeDirection::Backward;
+		self.initialized = true;
+
+		// Position snapshot at last entry
+		self.inner.seek_last()?;
+
+		// Reset write-set to full range (critical for correctness after forward iteration)
+		self.reset_ws_positions();
+
+		self.position_to_max()
 	}
 
-	/// Seek to first entry >= target. Returns true if valid.
+	/// Seek to the first entry with key >= target.
+	///
+	/// Uses forward ordering (key ASC, timestamp DESC).
+	/// Returns `true` if a valid entry exists at or after target.
+	///
+	/// ## Example
+	///
+	/// ```text
+	/// Data: [("a",50), ("b",40), ("c",30)]
+	/// seek("b") → positions at ("b", 40)
+	/// seek("bb") → positions at ("c", 30)
+	/// ```
 	pub fn seek<K: AsRef<[u8]>>(&mut self, target: K) -> Result<bool> {
-		// Create a minimal encoded key for seeking
+		self.direction = MergeDirection::Forward;
+		self.initialized = true;
+
+		// Create encoded key with maximum trailer/timestamp for >= seek
+		// This ensures we find entries at or after the target key
 		let mut encoded = target.as_ref().to_vec();
-		// Add maximum trailer (seq_num=MAX, kind=MAX) and timestamp=MAX to find >= target
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes());
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes());
-		self.inner.seek(&encoded)
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
+		self.inner.seek(&encoded)?;
+
+		// Reset write-set to full range first, then position via binary search
+		self.reset_ws_positions();
+		self.ws_pos =
+			self.write_set_entries.partition_point(|(k, _)| k.as_slice() < target.as_ref());
+
+		self.position_to_min()
 	}
 
-	/// Move to next entry. Returns true if valid.
+	/// Move to the next entry in forward order.
+	///
+	/// Advances past the current entry and positions at the next one.
+	/// Returns `true` if a valid entry exists.
+	///
+	/// ## Note on Direction Change
+	///
+	/// If previously iterating backward, this resets to `seek_first()`.
+	/// The iterator does not support seamless direction switching mid-iteration.
 	#[allow(clippy::should_implement_trait)]
 	pub fn next(&mut self) -> Result<bool> {
-		self.inner.next()
+		if !self.initialized {
+			return self.seek_first();
+		}
+
+		// Direction change: reset to beginning
+		if self.direction != MergeDirection::Forward {
+			return self.seek_first();
+		}
+
+		// Advance whichever source provided the current entry
+		match self.current_source {
+			CurrentSource::Snapshot => {
+				self.inner.next()?;
+			}
+			CurrentSource::WriteSet => {
+				self.ws_pos += 1;
+			}
+			CurrentSource::None => return Ok(false),
+		}
+
+		self.position_to_min()
 	}
 
-	/// Move to previous entry. Returns true if valid.
+	/// Move to the previous entry in backward order.
+	///
+	/// Advances backward past the current entry and positions at the previous one.
+	/// Returns `true` if a valid entry exists.
+	///
+	/// ## Note on Direction Change
+	///
+	/// If previously iterating forward, this resets to `seek_last()`.
+	/// The iterator does not support seamless direction switching mid-iteration.
 	pub fn prev(&mut self) -> Result<bool> {
-		self.inner.prev()
+		if !self.initialized {
+			return self.seek_last();
+		}
+
+		// Direction change: reset to end
+		if self.direction != MergeDirection::Backward {
+			return self.seek_last();
+		}
+
+		// Advance whichever source provided the current entry (backward)
+		match self.current_source {
+			CurrentSource::Snapshot => {
+				self.inner.prev()?;
+			}
+			CurrentSource::WriteSet => {
+				self.ws_pos_back -= 1;
+			}
+			CurrentSource::None => return Ok(false),
+		}
+
+		self.position_to_max()
 	}
 
-	/// Check if positioned on valid entry.
+	/// Check if positioned on a valid entry.
+	///
+	/// Must be called before accessing `key()`, `value()`, etc.
 	pub fn valid(&self) -> bool {
-		self.inner.valid()
+		self.current_source != CurrentSource::None
 	}
 
-	/// Get current user key (allocates). Caller must check valid() first.
+	/// Get current user key (allocates).
+	///
+	/// # Panics
+	///
+	/// Panics if `valid()` is false.
 	pub fn key(&self) -> Key {
 		debug_assert!(self.valid());
-		self.inner.key().user_key().to_vec()
+		match self.current_source {
+			CurrentSource::Snapshot => self.inner.key().user_key().to_vec(),
+			CurrentSource::WriteSet => {
+				let (key, _) = if self.direction == MergeDirection::Forward {
+					self.write_set_entries[self.ws_pos]
+				} else {
+					self.write_set_entries[self.ws_pos_back - 1]
+				};
+				key.clone()
+			}
+			CurrentSource::None => panic!("key() called on invalid iterator"),
+		}
 	}
 
-	/// Get the timestamp/version of the current entry. Caller must check valid() first.
+	/// Get the timestamp/version of the current entry.
+	///
+	/// Higher timestamps indicate newer versions.
+	///
+	/// # Panics
+	///
+	/// Panics if `valid()` is false.
 	pub fn timestamp(&self) -> u64 {
 		debug_assert!(self.valid());
-		self.inner.key().timestamp()
+		match self.current_source {
+			CurrentSource::Snapshot => self.inner.key().timestamp(),
+			CurrentSource::WriteSet => {
+				if self.direction == MergeDirection::Forward {
+					self.write_set_entries[self.ws_pos].1.timestamp
+				} else {
+					self.write_set_entries[self.ws_pos_back - 1].1.timestamp
+				}
+			}
+			CurrentSource::None => panic!("timestamp() called on invalid iterator"),
+		}
 	}
 
-	/// Get the sequence number of the current entry. Caller must check valid() first.
+	/// Get the sequence number of the current entry.
+	///
+	/// Sequence numbers provide total ordering within a batch.
+	///
+	/// # Panics
+	///
+	/// Panics if `valid()` is false.
 	pub fn seq_num(&self) -> u64 {
 		debug_assert!(self.valid());
-		self.inner.key().seq_num()
+		match self.current_source {
+			CurrentSource::Snapshot => self.inner.key().seq_num(),
+			CurrentSource::WriteSet => {
+				if self.direction == MergeDirection::Forward {
+					self.write_set_entries[self.ws_pos].1.seqno as u64
+				} else {
+					self.write_set_entries[self.ws_pos_back - 1].1.seqno as u64
+				}
+			}
+			CurrentSource::None => panic!("seq_num() called on invalid iterator"),
+		}
 	}
 
-	/// Check if the current entry is a tombstone. Caller must check valid() first.
+	/// Check if the current entry is a tombstone (soft delete marker).
+	///
+	/// Tombstones indicate the key was deleted at this timestamp.
+	/// Unlike hard deletes, previous versions may still be visible.
+	///
+	/// # Panics
+	///
+	/// Panics if `valid()` is false.
 	pub fn is_tombstone(&self) -> bool {
 		debug_assert!(self.valid());
-		self.inner.key().is_tombstone()
+		match self.current_source {
+			CurrentSource::Snapshot => self.inner.key().is_tombstone(),
+			CurrentSource::WriteSet => {
+				if self.direction == MergeDirection::Forward {
+					self.write_set_entries[self.ws_pos].1.is_tombstone()
+				} else {
+					self.write_set_entries[self.ws_pos_back - 1].1.is_tombstone()
+				}
+			}
+			CurrentSource::None => panic!("is_tombstone() called on invalid iterator"),
+		}
 	}
 
-	/// Get current value (may allocate for VLog resolution). Caller must check valid() first.
+	/// Get current value (may allocate for VLog resolution).
+	///
+	/// For snapshot entries, this may require reading from the value log.
+	/// For write-set entries, returns the in-memory value directly.
+	///
+	/// # Panics
+	///
+	/// Panics if `valid()` is false.
 	pub fn value(&self) -> Result<Value> {
 		debug_assert!(self.valid());
-		self.core.resolve_value(self.inner.value())
+		match self.current_source {
+			CurrentSource::Snapshot => self.core.resolve_value(self.inner.value()),
+			CurrentSource::WriteSet => {
+				let entry = if self.direction == MergeDirection::Forward {
+					self.write_set_entries[self.ws_pos].1
+				} else {
+					self.write_set_entries[self.ws_pos_back - 1].1
+				};
+				// Write-set values are stored directly, not as VLog references
+				Ok(entry.value.clone().unwrap_or_default())
+			}
+			CurrentSource::None => panic!("value() called on invalid iterator"),
+		}
 	}
 
-	/// Get current entry as a tuple (key, value, timestamp, is_tombstone).
+	/// Get current entry as a tuple: (key, value, timestamp, is_tombstone).
+	///
 	/// Convenience method for collecting all version information.
 	/// For tombstones, returns an empty value since tombstones have no value.
 	pub fn entry(&self) -> Result<(Key, Value, u64, bool)> {
 		let is_tombstone = self.is_tombstone();
-		// Tombstones have no value, so use empty vec
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
@@ -1483,43 +2291,89 @@ impl<'a> TransactionHistoryIterator<'a> {
 		Ok((self.key(), value, self.timestamp(), is_tombstone))
 	}
 
-	/// Returns the iterator stats for testing/debugging
+	/// Returns the iterator stats for testing/debugging.
 	#[cfg(test)]
 	pub(crate) fn stats(&self) -> &HistoryIteratorStats {
 		self.inner.stats()
 	}
 }
 
+// =============================================================================
+// InternalIterator implementation
+// =============================================================================
+//
+// This allows TransactionHistoryIterator to be used in places that expect
+// the internal LSM iterator interface with encoded keys.
+
 impl InternalIterator for TransactionHistoryIterator<'_> {
+	/// Seek to encoded target key.
+	///
+	/// The target is in internal format: `[user_key | trailer | timestamp]`.
+	/// Extracts the user key portion for write-set positioning.
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
-		self.inner.seek(target)
+		self.direction = MergeDirection::Forward;
+		self.initialized = true;
+
+		self.inner.seek(target)?;
+
+		// Reset write-set to full range first, then position via binary search
+		self.reset_ws_positions();
+		let user_key = InternalKey::user_key_from_encoded(target);
+		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < user_key);
+
+		self.position_to_min()
 	}
 
 	fn seek_first(&mut self) -> Result<bool> {
-		self.inner.seek_first()
+		TransactionHistoryIterator::seek_first(self)
 	}
 
 	fn seek_last(&mut self) -> Result<bool> {
-		self.inner.seek_last()
+		TransactionHistoryIterator::seek_last(self)
 	}
 
 	fn next(&mut self) -> Result<bool> {
-		self.inner.next()
+		TransactionHistoryIterator::next(self)
 	}
 
 	fn prev(&mut self) -> Result<bool> {
-		self.inner.prev()
+		TransactionHistoryIterator::prev(self)
 	}
 
 	fn valid(&self) -> bool {
-		self.inner.valid()
+		TransactionHistoryIterator::valid(self)
 	}
 
+	/// Returns the current key in internal encoded format.
+	///
+	/// For snapshot entries, delegates to inner iterator.
+	/// For write-set entries, uses the pre-populated encoded key buffer.
 	fn key(&self) -> InternalKeyRef<'_> {
-		self.inner.key()
+		debug_assert!(self.valid());
+		match self.current_source {
+			CurrentSource::Snapshot => self.inner.key(),
+			CurrentSource::WriteSet => InternalKeyRef::from_encoded(&self.ws_encoded_key_buf),
+			CurrentSource::None => panic!("key() called on invalid iterator"),
+		}
 	}
 
+	/// Returns the current value as a byte slice.
+	///
+	/// For snapshot entries, may be a VLog reference requiring resolution.
+	/// For write-set entries, returns the direct value bytes.
 	fn value(&self) -> &[u8] {
-		self.inner.value()
+		debug_assert!(self.valid());
+		match self.current_source {
+			CurrentSource::Snapshot => self.inner.value(),
+			CurrentSource::WriteSet => {
+				let entry = if self.direction == MergeDirection::Forward {
+					self.write_set_entries[self.ws_pos].1
+				} else {
+					self.write_set_entries[self.ws_pos_back - 1].1
+				};
+				entry.value.as_ref().map_or(&[], |v| v.as_slice())
+			}
+			CurrentSource::None => panic!("value() called on invalid iterator"),
+		}
 	}
 }
