@@ -1058,6 +1058,25 @@ impl<'a> TransactionRangeIterator<'a> {
 		self.ws_pos_back > self.ws_pos
 	}
 
+	/// Reset both write-set positions to cover the full range.
+	///
+	/// This MUST be called on any seek operation to maintain the invariant:
+	/// `ws_pos <= ws_pos_back` where `[ws_pos, ws_pos_back)` is the valid range.
+	///
+	/// Without this, direction changes after partial iteration leave stale positions:
+	/// ```text
+	/// Initial:       ws_pos=0, ws_pos_back=5  [A B C D E]
+	/// prev() x2:     ws_pos=0, ws_pos_back=3  [A B C|D E] ← D,E "consumed"
+	/// seek_first():  ws_pos=0, ws_pos_back=3  [A B C|D E] ← BUG! D,E invisible
+	///
+	/// With reset:
+	/// seek_first():  ws_pos=0, ws_pos_back=5  [A B C D E] ← Full range restored
+	/// ```
+	fn reset_ws_positions(&mut self) {
+		self.ws_pos = 0;
+		self.ws_pos_back = self.write_set_entries.len();
+	}
+
 	/// Get current write-set key (forward)
 	fn ws_key(&self) -> &[u8] {
 		debug_assert!(self.ws_valid());
@@ -1235,7 +1254,8 @@ impl InternalIterator for TransactionRangeIterator<'_> {
 		// Seek snapshot
 		self.snapshot_iter.seek(target)?;
 
-		// Binary search in write-set entries
+		// Reset write-set to full range first, then position via binary search
+		self.reset_ws_positions();
 		let user_key = InternalKey::user_key_from_encoded(target);
 		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < user_key);
 
@@ -1249,8 +1269,8 @@ impl InternalIterator for TransactionRangeIterator<'_> {
 		// Seek snapshot to first
 		self.snapshot_iter.seek_first()?;
 
-		// Reset write-set position
-		self.ws_pos = 0;
+		// Reset write-set to full range
+		self.reset_ws_positions();
 
 		self.position_to_min()
 	}
@@ -1262,8 +1282,8 @@ impl InternalIterator for TransactionRangeIterator<'_> {
 		// Seek snapshot to last
 		self.snapshot_iter.seek_last()?;
 
-		// Reset write-set position to end
-		self.ws_pos_back = self.write_set_entries.len();
+		// Reset write-set to full range (critical for correctness after forward iteration)
+		self.reset_ws_positions();
 
 		self.position_to_max()
 	}
@@ -2030,7 +2050,7 @@ impl<'a> TransactionHistoryIterator<'a> {
 		// Position snapshot at first entry
 		self.inner.seek_first()?;
 
-		// Reset write-set to full range (critical for correctness after backward iteration)
+		// Reset write-set to full range
 		self.reset_ws_positions();
 
 		self.position_to_min()
