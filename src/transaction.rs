@@ -1382,9 +1382,10 @@ impl<'a> TransactionIterator<'a> {
 	pub fn seek<K: AsRef<[u8]>>(&mut self, target: K) -> Result<bool> {
 		// Create a minimal encoded key for seeking
 		let mut encoded = target.as_ref().to_vec();
-		// Add minimum trailer (seq_num=0, kind=0) and timestamp=0
-		encoded.extend_from_slice(&0u64.to_be_bytes());
-		encoded.extend_from_slice(&0u64.to_be_bytes());
+		// Add MAXIMUM trailer (seq_num=MAX, kind=MAX) and timestamp=MAX
+		// to position at the FIRST (newest) version of target key
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes());
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes());
 		self.inner.seek(&encoded)
 	}
 

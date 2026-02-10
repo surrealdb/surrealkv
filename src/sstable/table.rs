@@ -946,7 +946,7 @@ impl Table {
 	/// Reads a data block with a custom comparator.
 	///
 	/// This method bypasses the cache since blocks with different comparators
-	/// cannot be cached together. Using this for history queries with 
+	/// cannot be cached together. Using this for history queries with
 	/// timestamp-based comparators.
 	pub(crate) fn read_block_with_comparator(
 		&self,
