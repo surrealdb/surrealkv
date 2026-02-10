@@ -503,7 +503,10 @@ impl<'a> KMergeIterator<'a> {
 							}
 						}
 					}
-					if let Ok(table_iter) = table.iter(Some((*query_range).clone())) {
+					// Use custom comparator for table iteration
+					if let Ok(table_iter) =
+						table.iter_with_comparator(Some((*query_range).clone()), Arc::clone(&cmp))
+					{
 						iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
 					}
 				}
@@ -524,7 +527,10 @@ impl<'a> KMergeIterator<'a> {
 							}
 						}
 					}
-					if let Ok(table_iter) = table.iter(Some((*query_range).clone())) {
+					// Use custom comparator for table iteration
+					if let Ok(table_iter) =
+						table.iter_with_comparator(Some((*query_range).clone()), Arc::clone(&cmp))
+					{
 						iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
 					}
 				}

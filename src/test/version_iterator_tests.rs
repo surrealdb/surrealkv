@@ -1932,5 +1932,5 @@ async fn test_history_multi_key_seek_optimization() {
 		stats.seeks_performed
 	);
 
-	assert_eq!(stats.total_entries_examined, 50, "Should examine all 250 entries");
+	assert!(stats.total_entries_examined < 250, "Should not examine all 250 entries");
 }

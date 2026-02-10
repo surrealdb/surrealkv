@@ -90,7 +90,7 @@ use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::error::SSTableError;
-use crate::{Comparator, InternalIterator, InternalKey, InternalKeyComparator, InternalKeyRef};
+use crate::{Comparator, InternalIterator, InternalKey, InternalKeyRef};
 
 /// Raw block data as a byte vector.
 pub(crate) type BlockData = Vec<u8>;
@@ -197,7 +197,7 @@ pub(crate) struct Block {
 	/// Raw block data
 	pub(crate) block: BlockData,
 	/// Comparator for key ordering
-	comparator: Arc<InternalKeyComparator>,
+	comparator: Arc<dyn Comparator>,
 }
 
 impl Block {
@@ -206,7 +206,7 @@ impl Block {
 	/// ## Panics
 	///
 	/// Panics if data is too small (< 4 bytes for restart count).
-	pub(crate) fn new(data: BlockData, comparator: Arc<InternalKeyComparator>) -> Block {
+	pub(crate) fn new(data: BlockData, comparator: Arc<dyn Comparator>) -> Block {
 		assert!(data.len() > 4);
 		Block {
 			block: data,
@@ -268,14 +268,14 @@ pub(crate) struct BlockWriter {
 	/// Total entries in block
 	num_entries: usize,
 	/// Key comparator
-	internal_cmp: Arc<InternalKeyComparator>,
+	internal_cmp: Arc<dyn Comparator>,
 }
 
 impl BlockWriter {
 	pub(crate) fn new(
 		size: usize,
 		restart_interval: usize,
-		internal_cmp: Arc<InternalKeyComparator>,
+		internal_cmp: Arc<dyn Comparator>,
 	) -> Self {
 		BlockWriter {
 			internal_cmp,
@@ -550,7 +550,7 @@ pub(crate) struct BlockIterator {
 	/// Current value end offset
 	current_value_offset_end: usize,
 	/// Key comparator
-	internal_cmp: Arc<InternalKeyComparator>,
+	internal_cmp: Arc<dyn Comparator>,
 }
 
 impl BlockIterator {
@@ -561,7 +561,7 @@ impl BlockIterator {
 	/// 1. Read number of restarts from last 4 bytes
 	/// 2. Calculate restart array offset
 	/// 3. Decode all restart point offsets
-	pub(crate) fn new(comparator: Arc<InternalKeyComparator>, block: BlockData) -> Result<Self> {
+	pub(crate) fn new(comparator: Arc<dyn Comparator>, block: BlockData) -> Result<Self> {
 		if block.len() < 4 {
 			let err = Error::from(SSTableError::BlockTooSmall {
 				size: block.len(),

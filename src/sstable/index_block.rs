@@ -83,7 +83,6 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::sync::Arc;
 
-use crate::comparator::Comparator;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
 use crate::sstable::error::SSTableError;
