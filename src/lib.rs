@@ -43,6 +43,7 @@ pub use crate::transaction::{
 	ReadOptions,
 	Transaction,
 	TransactionHistoryIterator,
+	TransactionIterator,
 	WriteOptions,
 };
 
