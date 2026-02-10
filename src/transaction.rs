@@ -134,9 +134,6 @@ pub struct ReadOptions {
 	pub(crate) lower_bound: Option<Vec<u8>>,
 	/// Upper bound for iteration (exclusive), None means unbounded
 	pub(crate) upper_bound: Option<Vec<u8>>,
-	/// Optional timestamp for point-in-time reads. If None, reads the latest
-	/// version.
-	pub(crate) timestamp: Option<u64>,
 }
 
 impl ReadOptions {
@@ -158,12 +155,6 @@ impl ReadOptions {
 	pub(crate) fn set_iterate_bounds(&mut self, lower: Option<Vec<u8>>, upper: Option<Vec<u8>>) {
 		self.lower_bound = lower;
 		self.upper_bound = upper;
-	}
-
-	/// Sets the timestamp for point-in-time reads
-	pub fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
-		self.timestamp = timestamp;
-		self
 	}
 }
 
@@ -437,7 +428,50 @@ impl Transaction {
 	where
 		K: IntoBytes,
 	{
-		self.get_at_with_options(key, &ReadOptions::default().with_timestamp(Some(timestamp)))
+		// If the transaction is closed, return an error.
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		// If the key is empty, return an error.
+		if key.as_slice().is_empty() {
+			return Err(Error::EmptyKey);
+		}
+
+		// Do not allow reads if it is a write-only transaction
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		// If a timestamp is provided, use versioned read
+		// Check if versioned queries are enabled
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
+		}
+
+		// RYOW: Check write set first for uncommitted writes
+		if let Some(entries) = self.write_set.get(key.as_slice()) {
+			if let Some(entry) = entries.last() {
+				// Hard delete wipes all history - return None regardless of timestamp
+				if entry.is_hard_delete() {
+					return Ok(None);
+				}
+
+				// Write set entry is visible if its timestamp <= query timestamp
+				if entry.timestamp <= timestamp {
+					if entry.is_tombstone() {
+						return Ok(None);
+					}
+					return Ok(entry.value.clone());
+				}
+				// entry.timestamp > timestamp: write is "from the future", check storage
+			}
+		}
+
+		// Query the versioned index through the snapshot
+		match &self.snapshot {
+			Some(snapshot) => snapshot.get_at(key.as_slice(), timestamp),
+			None => Err(Error::NoSnapshot),
+		}
 	}
 
 	/// Gets a value for a key, with custom read options.
@@ -483,60 +517,6 @@ impl Transaction {
 				Ok(Some(resolved_value))
 			}
 			None => Ok(None),
-		}
-	}
-
-	pub fn get_at_with_options<K>(&self, key: K, options: &ReadOptions) -> Result<Option<Value>>
-	where
-		K: IntoBytes,
-	{
-		// If the transaction is closed, return an error.
-		if self.closed {
-			return Err(Error::TransactionClosed);
-		}
-		// If the key is empty, return an error.
-		if key.as_slice().is_empty() {
-			return Err(Error::EmptyKey);
-		}
-
-		// Do not allow reads if it is a write-only transaction
-		if self.mode.is_write_only() {
-			return Err(Error::TransactionWriteOnly);
-		}
-
-		// If a timestamp is provided, use versioned read
-		if let Some(timestamp) = options.timestamp {
-			// Check if versioned queries are enabled
-			if !self.core.opts.enable_versioning {
-				return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
-			}
-
-			// RYOW: Check write set first for uncommitted writes
-			if let Some(entries) = self.write_set.get(key.as_slice()) {
-				if let Some(entry) = entries.last() {
-					// Hard delete wipes all history - return None regardless of timestamp
-					if entry.is_hard_delete() {
-						return Ok(None);
-					}
-
-					// Write set entry is visible if its timestamp <= query timestamp
-					if entry.timestamp <= timestamp {
-						if entry.is_tombstone() {
-							return Ok(None);
-						}
-						return Ok(entry.value.clone());
-					}
-					// entry.timestamp > timestamp: write is "from the future", check storage
-				}
-			}
-
-			// Query the versioned index through the snapshot
-			match &self.snapshot {
-				Some(snapshot) => snapshot.get_at(key.as_slice(), timestamp),
-				None => Err(Error::NoSnapshot),
-			}
-		} else {
-			Err(Error::InvalidArgument("Timestamp is required for versioned queries".to_string()))
 		}
 	}
 
