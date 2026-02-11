@@ -4556,3 +4556,101 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		tree.close().await.unwrap();
 	}
 }
+
+// Test if flush_wal is concurrent safe and does not block the commit pipeline.
+#[test(tokio::test)]
+async fn test_flush_wal_concurrent_commits() {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use tokio::task::JoinSet;
+
+	let temp_dir = create_temp_directory();
+	let opts = create_test_options(temp_dir.path().to_path_buf(), |opts| {
+		opts.enable_vlog = true;
+		opts.vlog_value_threshold = 50; // Some values will go to VLog
+	});
+
+	let tree = Arc::new(Tree::new(opts).unwrap());
+	let commit_count = Arc::new(AtomicUsize::new(0));
+	let flush_count = Arc::new(AtomicUsize::new(0));
+
+	let num_commit_tasks = 8;
+	let commits_per_task = 25;
+	let num_flush_tasks = 2;
+	let flushes_per_task = 50;
+
+	let mut join_set = JoinSet::new();
+
+	// Spawn commit tasks
+	for task_id in 0..num_commit_tasks {
+		let tree = Arc::clone(&tree);
+		let commit_count = Arc::clone(&commit_count);
+
+		join_set.spawn(async move {
+			for i in 0..commits_per_task {
+				let key = format!("task{}_key{}", task_id, i);
+				let value = if i % 2 == 0 {
+					// Small value (inline)
+					format!("value{}", i)
+				} else {
+					// Large value (VLog)
+					"x".repeat(100)
+				};
+
+				let mut txn = tree.begin().unwrap();
+				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+				txn.commit().await.unwrap();
+				commit_count.fetch_add(1, Ordering::SeqCst);
+			}
+		});
+	}
+
+	// Spawn flush tasks
+	for _ in 0..num_flush_tasks {
+		let tree = Arc::clone(&tree);
+		let flush_count = Arc::clone(&flush_count);
+
+		join_set.spawn(async move {
+			for i in 0..flushes_per_task {
+				// Alternate between flush and sync
+				let sync = i % 2 == 0;
+				let result = tree.flush_wal(sync);
+				assert!(result.is_ok(), "flush_wal should succeed during concurrent commits");
+				flush_count.fetch_add(1, Ordering::SeqCst);
+				// Small yield to allow interleaving
+				tokio::task::yield_now().await;
+			}
+		});
+	}
+
+	// Wait for all tasks to complete
+	while let Some(result) = join_set.join_next().await {
+		result.expect("Task should complete successfully");
+	}
+
+	// Verify counts
+	assert_eq!(
+		commit_count.load(Ordering::SeqCst),
+		num_commit_tasks * commits_per_task,
+		"All commits should complete"
+	);
+	assert_eq!(
+		flush_count.load(Ordering::SeqCst),
+		num_flush_tasks * flushes_per_task,
+		"All flushes should complete"
+	);
+
+	// Verify all data is accessible
+	{
+		let txn = tree.begin().unwrap();
+		for task_id in 0..num_commit_tasks {
+			for i in 0..commits_per_task {
+				let key = format!("task{}_key{}", task_id, i);
+				let result = txn.get(key.as_bytes()).unwrap();
+				assert!(result.is_some(), "Key {} should exist after concurrent operations", key);
+			}
+		}
+	}
+
+	tree.close().await.unwrap();
+}
