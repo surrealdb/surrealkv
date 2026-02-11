@@ -943,17 +943,34 @@ impl Table {
 		Ok(b)
 	}
 
-	/// Reads a data block with a custom comparator.
+	/// Reads a data block with a custom comparator, using the history cache.
 	///
-	/// This method bypasses the cache since blocks with different comparators
-	/// cannot be cached together. Using this for history queries with
-	/// timestamp-based comparators.
+	/// History blocks are cached separately from normal data blocks since they
+	/// use different comparators for iteration.
 	pub(crate) fn read_block_with_comparator(
 		&self,
 		location: &BlockHandle,
 		comparator: Arc<dyn Comparator>,
-	) -> Result<Block> {
-		read_table_block(comparator, Arc::clone(&self.file), location)
+	) -> Result<Arc<Block>> {
+		// Check history cache first
+		if let Some(block) =
+			self.opts.block_cache.get_data_block_history(self.id, location.offset() as u64)
+		{
+			return Ok(block);
+		}
+
+		// Cache miss: read from disk
+		let b = read_table_block(comparator, Arc::clone(&self.file), location)?;
+		let b = Arc::new(b);
+
+		// Insert into history cache
+		self.opts.block_cache.insert_data_block_history(
+			self.id,
+			location.offset() as u64,
+			Arc::clone(&b),
+		);
+
+		Ok(b)
 	}
 
 	/// Point lookup for a single key.
