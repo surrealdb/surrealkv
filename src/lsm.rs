@@ -1273,6 +1273,37 @@ impl Core {
 		self.commit_pipeline.get_visible_seq_num()
 	}
 
+	/// Flushes WAL and VLog buffers to OS cache.
+	///
+	/// If `sync` is true, also fsyncs to disk for durability.
+	/// This is safe to call concurrently with ongoing transactions.
+	///
+	/// # Order of Operations
+	///
+	/// VLog is flushed first (contains data referenced by WAL), then WAL.
+	/// This ensures that if WAL contains a ValuePointer, the referenced
+	/// VLog data is at least as durable.
+	pub(crate) fn flush_wal(&self, sync: bool) -> Result<()> {
+		// Flush VLog first (contains data referenced by WAL)
+		if let Some(ref vlog) = self.vlog {
+			if sync {
+				vlog.sync()?;
+			} else {
+				vlog.flush()?;
+			}
+		}
+
+		// Then flush WAL
+		let mut wal_guard = self.wal.write();
+		if sync {
+			wal_guard.sync()?;
+		} else {
+			wal_guard.flush()?;
+		}
+
+		Ok(())
+	}
+
 	/// Safely closes the LSM tree by shutting down all components in the
 	/// correct order.
 	///
@@ -1633,6 +1664,19 @@ impl Tree {
 
 	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
 		self.core.sync_commit(batch, sync_wal)
+	}
+
+	/// Flushes WAL and VLog buffers to OS cache.
+	///
+	/// If `sync` is true, also fsyncs to disk, guaranteeing durability
+	/// of all previously committed transactions.
+	///
+	/// If `sync` is false, only flushes to OS buffer cache (faster but
+	/// not durable across power loss).
+	///
+	/// This is safe to call concurrently with ongoing transactions.
+	pub fn flush_wal(&self, sync: bool) -> Result<()> {
+		self.core.flush_wal(sync)
 	}
 }
 
