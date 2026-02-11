@@ -294,7 +294,12 @@ impl ValueLocation {
 		if self.is_value_pointer() {
 			if let Some(vlog) = vlog {
 				let pointer = ValuePointer::decode(&self.value)?;
-				vlog.get(&pointer)
+				vlog.get(&pointer).map_err(|e| {
+					Error::Other(format!(
+						"Failed to resolve value from VLog: {e}. ValuePointer: {:?}",
+						pointer
+					))
+				})
 			} else {
 				Err(Error::Other("VLog not available for pointer resolution".to_string()))
 			}
