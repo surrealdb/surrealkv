@@ -988,10 +988,11 @@ impl VLog {
 					}
 				}
 			} else {
-				// There are active iterators, defer deletion
+				// There are active iterators, defer deletion.
+				// Keep file handle in cache - delete_pending_files() will remove it
+				// when the file is actually deleted.
 				let mut files_to_delete = self.files_to_be_deleted.write();
 				files_to_delete.push(file_id);
-				self.file_handles.write().remove(&file_id);
 			}
 		}
 
