@@ -14,7 +14,7 @@ use crate::test::{
 	KeyVersionsMap,
 };
 use crate::transaction::HistoryOptions;
-use crate::{Error, Key, Mode, Options, ReadOptions, TreeBuilder, WriteOptions};
+use crate::{Error, Key, Mode, Options, TreeBuilder, WriteOptions};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -2062,9 +2062,7 @@ async fn test_timestamp_via_write_options() {
 
 	// Verify we can read it at that timestamp
 	let tx = tree.begin().unwrap();
-	let value = tx
-		.get_with_options(b"key1", &ReadOptions::default().with_timestamp(Some(custom_timestamp)))
-		.unwrap();
+	let value = tx.get_at(b"key1", custom_timestamp).unwrap();
 	assert_eq!(value, Some(Vec::from(b"value1")));
 
 	// Test soft_delete_with_options with timestamp
@@ -2080,20 +2078,10 @@ async fn test_timestamp_via_write_options() {
 	// Verify the value exists at the earlier timestamp but not at the delete
 	// timestamp
 	let tx = tree.begin().unwrap();
-	let value_before = tx
-		.get_at_with_options(
-			b"key1",
-			&ReadOptions::default().with_timestamp(Some(custom_timestamp)),
-		)
-		.unwrap();
+	let value_before = tx.get_at(b"key1", custom_timestamp).unwrap();
 	assert_eq!(value_before, Some(Vec::from(b"value1")));
 
-	let value_after = tx
-		.get_at_with_options(
-			b"key1",
-			&ReadOptions::default().with_timestamp(Some(delete_timestamp)),
-		)
-		.unwrap();
+	let value_after = tx.get_at(b"key1", delete_timestamp).unwrap();
 	assert_eq!(value_after, None);
 }
 
