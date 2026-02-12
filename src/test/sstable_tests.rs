@@ -176,12 +176,12 @@ fn test_table_seek() {
 	let key = InternalKey::new(Vec::from(b"bcd"), 2, InternalKeyKind::Set, 0);
 	iter.seek(&key.encode()).unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value()), (&b"bcd"[..], &b"asa"[..]));
+	assert_eq!((iter.key().user_key(), iter.value().unwrap()), (&b"bcd"[..], &b"asa"[..]));
 
 	let key = InternalKey::new(Vec::from(b"abc"), 2, InternalKeyKind::Set, 0);
 	iter.seek(&key.encode()).unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value()), (&b"abc"[..], &b"def"[..]));
+	assert_eq!((iter.key().user_key(), iter.value().unwrap()), (&b"abc"[..], &b"def"[..]));
 
 	// Seek-past-last invalidates.
 	let key = InternalKey::new(Vec::from(b"{{{"), 2, InternalKeyKind::Set, 0);
@@ -203,31 +203,31 @@ fn test_table_iter() {
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value()), (&b"abc"[..], &b"def"[..]));
+	assert_eq!((iter.key().user_key(), iter.value().unwrap()), (&b"abc"[..], &b"def"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value()), (&b"abd"[..], &b"dee"[..]));
+	assert_eq!((iter.key().user_key(), iter.value().unwrap()), (&b"abd"[..], &b"dee"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value()), (&b"bcd"[..], &b"asa"[..]));
+	assert_eq!((iter.key().user_key(), iter.value().unwrap()), (&b"bcd"[..], &b"asa"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value()), (&b"bsr"[..], &b"a00"[..]));
+	assert_eq!((iter.key().user_key(), iter.value().unwrap()), (&b"bsr"[..], &b"a00"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value()), (&b"xyz"[..], &b"xxx"[..]));
+	assert_eq!((iter.key().user_key(), iter.value().unwrap()), (&b"xyz"[..], &b"xxx"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value()), (&b"xzz"[..], &b"yyy"[..]));
+	assert_eq!((iter.key().user_key(), iter.value().unwrap()), (&b"xzz"[..], &b"yyy"[..]));
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!((iter.key().user_key(), iter.value()), (&b"zzz"[..], &b"111"[..]));
+	assert_eq!((iter.key().user_key(), iter.value().unwrap()), (&b"zzz"[..], &b"111"[..]));
 }
 
 #[test]
@@ -348,7 +348,7 @@ fn test_iter_items() {
 	let mut item = 0;
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value = iter.value();
+		let value = iter.value().unwrap();
 		let expected_key = format!("key_{item:05}");
 		let expected_value = format!("value_{item:05}");
 		assert_eq!(std::str::from_utf8(&key.user_key).unwrap(), expected_key);
@@ -966,7 +966,7 @@ fn test_table_iterator_no_items_lost() {
 
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value = iter.value();
+		let value = iter.value().unwrap();
 		let key_str = std::str::from_utf8(&key.user_key).unwrap();
 		let value_str = std::str::from_utf8(value).unwrap();
 		collected_items.push((key_str.to_string(), value_str.to_string()));
@@ -1028,7 +1028,7 @@ fn test_table_iterator_does_not_restart_after_exhaustion() {
 			break;
 		}
 		let key = iter.key().to_owned();
-		let value = iter.value();
+		let value = iter.value().unwrap();
 		let key_str = std::str::from_utf8(&key.user_key).unwrap();
 		let value_str = std::str::from_utf8(value).unwrap();
 		seen_keys.push((key_str.to_string(), value_str.to_string()));
@@ -1201,7 +1201,7 @@ fn test_table_iterator_seek_then_iterate() {
 		let mut remaining_items = Vec::new();
 		while iter.valid() {
 			let current_key = iter.key();
-			let current_value = iter.value();
+			let current_value = iter.value().unwrap();
 			let key_str = std::str::from_utf8(current_key.user_key()).unwrap();
 			let value_str = std::str::from_utf8(current_value).unwrap();
 			remaining_items.push((key_str.to_string(), value_str.to_string()));
@@ -1494,7 +1494,7 @@ fn test_table_iterator_next_vs_advance_consistency() {
 	iter1.seek_to_first().unwrap();
 	let mut collected_via_advance = Vec::new();
 	while iter1.valid() {
-		collected_via_advance.push((iter1.key().to_owned(), iter1.value().to_vec()));
+		collected_via_advance.push((iter1.key().to_owned(), iter1.value().unwrap().to_vec()));
 		if !iter1.next().unwrap() {
 			break;
 		}
@@ -1505,7 +1505,7 @@ fn test_table_iterator_next_vs_advance_consistency() {
 	iter2.seek_to_first().unwrap();
 	let mut collected_via_next = Vec::new();
 	while iter2.valid() {
-		collected_via_next.push((iter2.key().to_owned(), iter2.value().to_vec()));
+		collected_via_next.push((iter2.key().to_owned(), iter2.value().unwrap().to_vec()));
 		if !iter2.next().unwrap() {
 			break;
 		}
@@ -2987,7 +2987,7 @@ fn test_table_iter_both_bounds_excluded_same_key_reverse() {
 	let mut results = Vec::new();
 	iter.seek_last().unwrap();
 	while iter.valid() {
-		results.push((iter.key().to_owned(), iter.value().to_vec()));
+		results.push((iter.key().to_owned(), iter.value().unwrap().to_vec()));
 		if !iter.prev().unwrap() {
 			break;
 		}
@@ -4257,7 +4257,7 @@ fn test_table_iterator_full_scan() {
 	let mut collected = Vec::new();
 	while iter.valid() {
 		let key = iter.key();
-		let value = iter.value();
+		let value = iter.value().unwrap();
 		collected.push((
 			std::str::from_utf8(key.user_key()).unwrap().to_string(),
 			std::str::from_utf8(value).unwrap().to_string(),
@@ -4302,7 +4302,7 @@ fn test_table_iterator_reverse_scan() {
 	let mut collected = Vec::new();
 	while iter.valid() {
 		let key = iter.key();
-		let value = iter.value();
+		let value = iter.value().unwrap();
 		collected.push((
 			std::str::from_utf8(key.user_key()).unwrap().to_string(),
 			std::str::from_utf8(value).unwrap().to_string(),
@@ -4486,7 +4486,7 @@ fn test_single_entry_table() {
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid(), "Iterator should be valid");
 	assert_eq!(iter.key().user_key(), b"single_key");
-	let iter_value = iter.value();
+	let iter_value = iter.value().unwrap();
 	let iter_value_bytes: &[u8] = iter_value;
 	assert_eq!(iter_value_bytes, b"single_value");
 

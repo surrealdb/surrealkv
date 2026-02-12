@@ -370,7 +370,7 @@ impl Snapshot {
 					// Key was deleted at this timestamp
 					best_value = None;
 				} else {
-					best_value = Some(self.core.resolve_value(iter.value())?);
+					best_value = Some(self.core.resolve_value(iter.value()?)?);
 				}
 				best_timestamp = entry_ts;
 			}
@@ -740,7 +740,7 @@ impl InternalIterator for KMergeIterator<'_> {
 		self.iterators[self.winner.unwrap()].key()
 	}
 
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.is_valid());
 		self.iterators[self.winner.unwrap()].value()
 	}
@@ -888,7 +888,7 @@ impl SnapshotIterator<'_> {
 		// If first entry is visible, it's a candidate
 		if self.is_visible_ref(&first_key_ref) {
 			latest_key = Some(first_key_ref.encoded().to_vec());
-			latest_value = Some(self.merge_iter.value().to_vec());
+			latest_value = Some(self.merge_iter.value()?.to_vec());
 		}
 
 		// Keep consuming entries with same user key, looking for newer visible versions
@@ -907,7 +907,7 @@ impl SnapshotIterator<'_> {
 				self.buffered_back_key.clear();
 				self.buffered_back_key.extend_from_slice(key_ref.encoded());
 				self.buffered_back_value.clear();
-				self.buffered_back_value.extend_from_slice(self.merge_iter.value());
+				self.buffered_back_value.extend_from_slice(self.merge_iter.value()?);
 				self.has_buffered_back = true;
 				break;
 			}
@@ -915,7 +915,7 @@ impl SnapshotIterator<'_> {
 			// Same user key - check if this is a newer visible version
 			if self.is_visible_ref(&key_ref) {
 				latest_key = Some(key_ref.encoded().to_vec());
-				latest_value = Some(self.merge_iter.value().to_vec());
+				latest_value = Some(self.merge_iter.value()?.to_vec());
 			}
 		}
 
@@ -1014,10 +1014,10 @@ impl InternalIterator for SnapshotIterator<'_> {
 		}
 	}
 
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		if self.direction == MergeDirection::Backward {
-			&self.current_back_value
+			Ok(&self.current_back_value)
 		} else {
 			self.merge_iter.value()
 		}
@@ -1110,7 +1110,7 @@ impl InternalIterator for BPlusTreeIteratorWithGuard<'_> {
 		self.iter.key()
 	}
 
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> Result<&[u8]> {
 		self.iter.value()
 	}
 }
@@ -1156,29 +1156,6 @@ pub struct HistoryIterator<'a> {
 	limit: Option<usize>,
 	entries_returned: usize,
 	limit_reached: bool,
-
-	#[cfg(test)]
-	stats: HistoryIteratorStats,
-}
-
-/// Stats for tracking iterator behavior (for testing)
-#[cfg(test)]
-#[derive(Debug, Default, Clone)]
-pub(crate) struct HistoryIteratorStats {
-	/// Number of entries skipped due to seq_num > snapshot_seq_num
-	pub(crate) entries_skipped_invisible: usize,
-	/// Number of entries skipped due to timestamp > ts_end
-	pub(crate) entries_skipped_above_ts_range: usize,
-	/// Number of times we triggered early exit (ts < ts_start)
-	pub(crate) early_exits_below_ts_range: usize,
-	/// Number of seeks performed (timestamp-based optimization)
-	pub(crate) seeks_performed: usize,
-	/// Number of entries skipped due to HARD_DELETE barrier
-	pub(crate) entries_skipped_hard_delete: usize,
-	/// Number of entries skipped due to barrier_seen
-	pub(crate) entries_skipped_past_barrier: usize,
-	/// Total entries examined (before any filtering)
-	pub(crate) total_entries_examined: usize,
 }
 
 impl<'a> HistoryIterator<'a> {
@@ -1222,8 +1199,6 @@ impl<'a> HistoryIterator<'a> {
 			limit,
 			entries_returned: 0,
 			limit_reached: false,
-			#[cfg(test)]
-			stats: HistoryIteratorStats::default(),
 		}
 	}
 
@@ -1261,8 +1236,6 @@ impl<'a> HistoryIterator<'a> {
 			limit,
 			entries_returned: 0,
 			limit_reached: false,
-			#[cfg(test)]
-			stats: HistoryIteratorStats::default(),
 		}
 	}
 
@@ -1285,12 +1258,6 @@ impl<'a> HistoryIterator<'a> {
 		self.limit_reached = false;
 	}
 
-	/// Returns the iterator stats for testing/debugging
-	#[cfg(test)]
-	pub(crate) fn stats(&self) -> &HistoryIteratorStats {
-		&self.stats
-	}
-
 	// --- Inner iterator helpers ---
 
 	fn inner_valid(&self) -> bool {
@@ -1307,7 +1274,7 @@ impl<'a> HistoryIterator<'a> {
 		}
 	}
 
-	fn inner_value(&self) -> &[u8] {
+	fn inner_value(&self) -> Result<&[u8]> {
 		match &self.inner {
 			HistoryIteratorInner::Lsm(iter) => iter.value(),
 			HistoryIteratorInner::BTree(iter) => iter.value(),
@@ -1368,10 +1335,6 @@ impl<'a> HistoryIterator<'a> {
 					HistoryIteratorInner::BTree(iter) => iter.seek(&seek_key.encode())?,
 					HistoryIteratorInner::Lsm(iter) => iter.seek(&seek_key.encode())?,
 				};
-				#[cfg(test)]
-				{
-					self.stats.seeks_performed += 1;
-				}
 				return Ok(self.inner_valid());
 			}
 			self.inner_next()?;
@@ -1446,18 +1409,8 @@ impl<'a> HistoryIterator<'a> {
 				self.barrier_seen = false;
 			}
 
-			// Track total entries examined
-			#[cfg(test)]
-			{
-				self.stats.total_entries_examined += 1;
-			}
-
 			// Skip invisible versions
 			if seq_num > self.snapshot_seq_num {
-				#[cfg(test)]
-				{
-					self.stats.entries_skipped_invisible += 1;
-				}
 				self.inner_next()?;
 				continue;
 			}
@@ -1466,10 +1419,6 @@ impl<'a> HistoryIterator<'a> {
 			if let Some((ts_start, ts_end)) = self.ts_range {
 				if timestamp > ts_end {
 					// Above range - skip, next entries might be in range
-					#[cfg(test)]
-					{
-						self.stats.entries_skipped_above_ts_range += 1;
-					}
 					self.inner_next()?;
 					continue;
 				}
@@ -1477,10 +1426,6 @@ impl<'a> HistoryIterator<'a> {
 					// Below range - all remaining entries for this key are also below
 					// (timestamps are ordered descending within a key).
 					// Skip to next user_key with optimization for B+tree.
-					#[cfg(test)]
-					{
-						self.stats.early_exits_below_ts_range += 1;
-					}
 					if !self.advance_to_next_user_key()? {
 						return Ok(false);
 					}
@@ -1498,20 +1443,12 @@ impl<'a> HistoryIterator<'a> {
 
 			// Rule 1: HARD_DELETE as latest → skip entire key
 			if self.latest_is_hard_delete {
-				#[cfg(test)]
-				{
-					self.stats.entries_skipped_hard_delete += 1;
-				}
 				self.inner_next()?;
 				continue;
 			}
 
 			// Rule 2: Already past a barrier → skip everything older
 			if self.barrier_seen {
-				#[cfg(test)]
-				{
-					self.stats.entries_skipped_past_barrier += 1;
-				}
 				self.inner_next()?;
 				continue;
 			}
@@ -1597,7 +1534,7 @@ impl<'a> HistoryIterator<'a> {
 					is_replace: key_ref.is_replace(),
 					is_tombstone: key_ref.is_tombstone(),
 					encoded_key: key_ref.encoded().to_vec(),
-					value: self.inner_value().to_vec(),
+					value: self.inner_value()?.to_vec(),
 				});
 			}
 
@@ -1867,11 +1804,11 @@ impl InternalIterator for HistoryIterator<'_> {
 		}
 	}
 
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		match self.direction {
 			MergeDirection::Forward => self.inner_value(),
-			MergeDirection::Backward => self.buffered_value(),
+			MergeDirection::Backward => Ok(self.buffered_value()),
 		}
 	}
 }

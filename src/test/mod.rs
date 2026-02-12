@@ -7,9 +7,9 @@
 use std::collections::HashMap;
 
 use crate::snapshot::SnapshotIterator;
-use crate::transaction::{HistoryOptions, TransactionIterator};
+use crate::transaction::HistoryOptions;
 use crate::vlog::ValueLocation;
-use crate::{InternalIterator, InternalKey, Key, Result, TransactionHistoryIterator, Value};
+use crate::{InternalIterator, InternalKey, Key, Result, Value};
 
 #[cfg(test)]
 pub mod batch_tests;
@@ -55,7 +55,7 @@ pub mod wal_tests;
 fn collect_iter(iter: &mut impl InternalIterator) -> Vec<(InternalKey, Vec<u8>)> {
 	let mut result = Vec::new();
 	while iter.valid() {
-		result.push((iter.key().to_owned(), iter.value().to_vec()));
+		result.push((iter.key().to_owned(), iter.value().unwrap().to_vec()));
 		if !iter.next().unwrap_or(false) {
 			break;
 		}
@@ -83,29 +83,33 @@ fn count_iter(iter: &mut impl InternalIterator) -> Result<usize> {
 }
 
 /// Collects all entries from a TransactionIterator
-fn collect_transaction_iter(iter: &mut TransactionIterator) -> Result<Vec<(Key, Option<Value>)>> {
+fn collect_transaction_iter(iter: &mut impl InternalIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 	let mut result = Vec::new();
 	while iter.valid() {
-		result.push((iter.key(), iter.value()?));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value_owned()?;
+		result.push((key, value));
 		iter.next()?;
 	}
 	Ok(result)
 }
 
 /// Collects all entries from a TransactionIterator starting from seek_first()
-fn collect_transaction_all(iter: &mut TransactionIterator) -> Result<Vec<(Key, Option<Value>)>> {
+fn collect_transaction_all(iter: &mut impl InternalIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 	iter.seek_first()?;
 	collect_transaction_iter(iter)
 }
 
 /// Collects all entries from a TransactionIterator in reverse order starting from seek_last()
 fn collect_transaction_reverse(
-	iter: &mut TransactionIterator,
-) -> Result<Vec<(Key, Option<Value>)>> {
+	iter: &mut impl InternalIterator,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		result.push((iter.key(), iter.value()?));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value_owned()?;
+		result.push((key, value));
 		if !iter.prev()? {
 			break;
 		}
@@ -119,7 +123,7 @@ fn collect_snapshot_iter(iter: &mut SnapshotIterator) -> Result<Vec<(InternalKey
 	iter.seek_first()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let encoded_value = iter.value();
+		let encoded_value = iter.value()?;
 		let decoded_value = ValueLocation::decode(encoded_value)?.value;
 		result.push((iter.key().to_owned(), decoded_value));
 		if !iter.next()? {
@@ -135,7 +139,7 @@ fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(Internal
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let encoded_value = iter.value();
+		let encoded_value = iter.value()?;
 		let decoded_value = ValueLocation::decode(encoded_value)?.value;
 		result.push((iter.key().to_owned(), decoded_value));
 		if !iter.prev()? {
@@ -150,23 +154,24 @@ fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(Internal
 #[allow(dead_code)]
 type KeyVersionsMap = HashMap<Key, Vec<(Vec<u8>, u64, bool)>>;
 
-/// Collects all entries from a TransactionHistoryIterator
+/// Collects all entries from a history iterator
 /// Returns a vector of (key, value, timestamp, is_tombstone) tuples
 #[allow(dead_code)]
 fn collect_history_all(
-	iter: &mut TransactionHistoryIterator,
+	iter: &mut impl InternalIterator,
 ) -> crate::Result<Vec<(Key, Value, u64, bool)>> {
 	iter.seek_first()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let is_tombstone = iter.is_tombstone();
+		let key_ref = iter.key();
+		let is_tombstone = key_ref.is_tombstone();
 		// Tombstones have no value, so use empty vec
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
-			iter.value()?
+			iter.value_owned()?
 		};
-		result.push((iter.key(), value, iter.timestamp(), is_tombstone));
+		result.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
 		iter.next()?;
 	}
 	Ok(result)
@@ -180,7 +185,7 @@ fn collect_history_all(
 /// soft-deleted keys will incorrectly appear in the results.
 #[allow(dead_code)]
 fn point_in_time_from_history(
-	iter: &mut TransactionHistoryIterator,
+	iter: &mut impl InternalIterator,
 	timestamp: u64,
 ) -> crate::Result<Vec<(Key, Value)>> {
 	use std::collections::BTreeMap;
@@ -190,9 +195,10 @@ fn point_in_time_from_history(
 	let mut latest_entries: BTreeMap<Key, (Option<Value>, u64, bool)> = BTreeMap::new();
 
 	while iter.valid() {
-		let ts = iter.timestamp();
-		let key = iter.key();
-		let is_tombstone = iter.is_tombstone();
+		let key_ref = iter.key();
+		let ts = key_ref.timestamp();
+		let key = key_ref.user_key().to_vec();
+		let is_tombstone = key_ref.is_tombstone();
 
 		// Only consider versions at or before the requested timestamp
 		if ts <= timestamp {
@@ -206,7 +212,7 @@ fn point_in_time_from_history(
 				let value = if is_tombstone {
 					None
 				} else {
-					Some(iter.value()?)
+					Some(iter.value_owned()?)
 				};
 				latest_entries.insert(key.clone(), (value, ts, is_tombstone));
 			}
@@ -260,9 +266,10 @@ fn point_in_time_from_history_in_range(
 	iter.seek_first()?;
 	let mut result: BTreeMap<crate::Key, (crate::Value, u64)> = BTreeMap::new();
 	while iter.valid() {
-		let ts = iter.timestamp();
-		let key = iter.key();
-		let is_tombstone = iter.is_tombstone();
+		let key_ref = iter.key();
+		let ts = key_ref.timestamp();
+		let key = key_ref.user_key().to_vec();
+		let is_tombstone = key_ref.is_tombstone();
 		if ts <= timestamp {
 			let should_update = match result.get(&key) {
 				None => true,
@@ -272,7 +279,7 @@ fn point_in_time_from_history_in_range(
 				if is_tombstone {
 					result.remove(&key);
 				} else {
-					result.insert(key.clone(), (iter.value()?, ts));
+					result.insert(key.clone(), (iter.value_owned()?, ts));
 				}
 			}
 		}

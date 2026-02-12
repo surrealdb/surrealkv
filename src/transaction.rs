@@ -6,18 +6,8 @@ use std::sync::Arc;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
-#[cfg(test)]
-use crate::snapshot::HistoryIteratorStats;
 use crate::snapshot::{HistoryIterator, MergeDirection, Snapshot, SnapshotIterator};
-use crate::{
-	InternalIterator,
-	InternalKey,
-	InternalKeyKind,
-	InternalKeyRef,
-	IntoBytes,
-	Key,
-	Value,
-};
+use crate::{InternalIterator, InternalKeyKind, InternalKeyRef, IntoBytes, Key, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can
 /// have in an MVCC (Multi-Version Concurrency Control) system.
@@ -522,30 +512,30 @@ impl Transaction {
 
 	/// Gets keys in a key range at a specific timestamp.
 	///
-	/// The returned iterator is a double ended iterator
-	/// that can be used to iterate over the keys in the
-	/// range in both forward and backward directions.
-	///
-	/// The iterator iterates over all keys in the range,
 	/// Gets keys and values in a range, at the current timestamp.
 	///
-	/// Returns a cursor-based iterator with explicit seek/next/prev methods.
-	/// Use `seek_first()` to position at the first key, then `next()` to iterate.
+	/// Returns a cursor-based iterator implementing `InternalIterator` with explicit
+	/// seek/next/prev methods. Use `seek_first()` to position at the first key,
+	/// then `next()` to iterate.
 	///
-	/// The iterator iterates over all keys and values in the
-	/// range, inclusive of the start key, but not the end key.
+	/// The iterator iterates over all keys and values in the range, inclusive of
+	/// the start key, but not the end key.
 	///
 	/// # Example
 	/// ```ignore
 	/// let mut iter = tx.range(b"a", b"z")?;
 	/// iter.seek_first()?;
 	/// while iter.valid() {
-	///     let key = iter.key();
-	///     let value = iter.value()?;
+	///     let key = iter.key().user_key();
+	///     let ts = iter.key().timestamp();
+	///     let value = iter.value_owned()?;
 	///     iter.next()?;
 	/// }
+	///
+	/// // Or seek to a specific key:
+	/// iter.seek(b"foo")?;  // Position at first version of "foo"
 	/// ```
-	pub fn range<K>(&self, start: K, end: K) -> Result<TransactionIterator<'_>>
+	pub fn range<K>(&self, start: K, end: K) -> Result<impl InternalIterator + '_>
 	where
 		K: IntoBytes,
 	{
@@ -556,21 +546,21 @@ impl Transaction {
 
 	/// Gets keys and values in a range, with custom read options.
 	///
-	/// Returns a cursor-based iterator with explicit seek/next/prev methods.
+	/// Returns a cursor-based iterator implementing `InternalIterator` with explicit
+	/// seek/next/prev methods.
 	///
 	/// The iterator iterates over all keys and values in the
 	/// range, inclusive of the start key, but not the end key.
-	pub fn range_with_options(&self, options: &ReadOptions) -> Result<TransactionIterator<'_>> {
+	pub fn range_with_options(&self, options: &ReadOptions) -> Result<impl InternalIterator + '_> {
 		let start_key = options.lower_bound.clone().unwrap_or_default();
 		let end_key = options.upper_bound.clone().unwrap_or_default();
-		let inner = TransactionRangeIterator::new_with_options(self, start_key, end_key)?;
-		Ok(TransactionIterator::new(inner, Arc::clone(&self.core)))
+		TransactionRangeIterator::new_with_options(self, Arc::clone(&self.core), start_key, end_key)
 	}
 
 	/// Returns a unified history iterator over ALL versions of keys in the range.
 	///
-	/// This method returns a `TransactionHistoryIterator` that implements `InternalIterator`,
-	/// providing a unified streaming API regardless of whether the B+tree index is enabled.
+	/// Returns an iterator implementing `InternalIterator`, providing a unified
+	/// streaming API regardless of whether the B+tree index is enabled.
 	///
 	/// - If B+tree index is enabled: Uses streaming B+tree iteration
 	/// - If B+tree index is disabled: Uses LSM-based versioned iteration
@@ -584,12 +574,14 @@ impl Transaction {
 	/// let mut iter = tx.history(b"a", b"z")?;
 	/// iter.seek_first()?;
 	/// while iter.valid() {
-	///     println!("key={:?} ts={} value={:?}",
-	///         iter.key(), iter.timestamp(), iter.value()?);
+	///     let key_ref = iter.key();
+	///     println!("key={:?} ts={} is_tombstone={} value={:?}",
+	///         key_ref.user_key(), key_ref.timestamp(), key_ref.is_tombstone(),
+	///         iter.value_owned()?);
 	///     iter.next()?;
 	/// }
 	/// ```
-	pub fn history<K>(&self, start: K, end: K) -> Result<TransactionHistoryIterator<'_>>
+	pub fn history<K>(&self, start: K, end: K) -> Result<impl InternalIterator + '_>
 	where
 		K: IntoBytes,
 	{
@@ -610,7 +602,7 @@ impl Transaction {
 		start: K,
 		end: K,
 		opts: &HistoryOptions,
-	) -> Result<TransactionHistoryIterator<'_>>
+	) -> Result<impl InternalIterator + '_>
 	where
 		K: IntoBytes,
 	{
@@ -960,6 +952,9 @@ pub(crate) struct TransactionRangeIterator<'a> {
 	/// Snapshot iterator (implements InternalIterator)
 	snapshot_iter: SnapshotIterator<'a>,
 
+	/// Core for resolving VLog references to actual values.
+	core: Arc<Core>,
+
 	/// Write-set entries for the range (collected, filtered for tombstones on access)
 	write_set_entries: Vec<(&'a Key, &'a Entry)>,
 
@@ -984,6 +979,7 @@ impl<'a> TransactionRangeIterator<'a> {
 	/// Creates a new range iterator with custom read options
 	pub(crate) fn new_with_options(
 		tx: &'a Transaction,
+		core: Arc<Core>,
 		start_key: Vec<u8>,
 		end_key: Vec<u8>,
 	) -> Result<Self> {
@@ -1018,6 +1014,7 @@ impl<'a> TransactionRangeIterator<'a> {
 
 		Ok(Self {
 			snapshot_iter,
+			core,
 			write_set_entries,
 			ws_pos: 0,
 			ws_pos_back: ws_len,
@@ -1218,12 +1215,6 @@ impl<'a> TransactionRangeIterator<'a> {
 			return Ok(self.current_source != CurrentSource::None);
 		}
 	}
-
-	/// Returns true if the current value is from the write-set (not snapshot)
-	/// Used to skip ValueLocation decode for raw write-set values
-	pub(crate) fn is_write_set_value(&self) -> bool {
-		self.current_source == CurrentSource::WriteSet
-	}
 }
 
 impl InternalIterator for TransactionRangeIterator<'_> {
@@ -1231,13 +1222,16 @@ impl InternalIterator for TransactionRangeIterator<'_> {
 		self.direction = MergeDirection::Forward;
 		self.initialized = true;
 
-		// Seek snapshot
-		self.snapshot_iter.seek(target)?;
+		// Encode user key with MAX trailer/timestamp for >= seek
+		// This positions at the FIRST (newest) version of the target key
+		let mut encoded = target.to_vec();
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
+		self.snapshot_iter.seek(&encoded)?;
 
-		// Reset write-set to full range first, then position via binary search
+		// Position write-set using raw user key (binary search)
 		self.reset_ws_positions();
-		let user_key = InternalKey::user_key_from_encoded(target);
-		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < user_key);
+		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < target);
 
 		self.position_to_min()
 	}
@@ -1324,7 +1318,7 @@ impl InternalIterator for TransactionRangeIterator<'_> {
 		}
 	}
 
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		match self.current_source {
 			CurrentSource::Snapshot => self.snapshot_iter.value(),
@@ -1334,104 +1328,20 @@ impl InternalIterator for TransactionRangeIterator<'_> {
 				} else {
 					self.write_set_entries[self.ws_pos_back - 1].1
 				};
-				entry.value.as_ref().map_or(&[], |v| v.as_slice())
+				Ok(entry.value.as_ref().map_or(&[], |v| v.as_slice()))
 			}
 			CurrentSource::None => panic!("value() called on invalid iterator"),
 		}
 	}
-}
 
-/// Public iterator for range scans over a transaction.
-///
-/// # Example
-/// ```ignore
-/// let mut iter = tx.range(b"a", b"z")?;
-/// iter.seek_first()?;
-/// while iter.valid() {
-///     let key = iter.key();
-///     let value = iter.value()?;
-///     println!("{:?} = {:?}", key, value);
-///     iter.next()?;
-/// }
-/// ```
-pub struct TransactionIterator<'a> {
-	inner: TransactionRangeIterator<'a>,
-	core: Arc<Core>,
-}
-
-impl<'a> TransactionIterator<'a> {
-	/// Creates a new transaction iterator
-	pub(crate) fn new(inner: TransactionRangeIterator<'a>, core: Arc<Core>) -> Self {
-		Self {
-			inner,
-			core,
-		}
-	}
-
-	/// Seek to first entry. Returns true if valid.
-	pub fn seek_first(&mut self) -> Result<bool> {
-		self.inner.seek_first()
-	}
-
-	/// Seek to last entry. Returns true if valid.
-	pub fn seek_last(&mut self) -> Result<bool> {
-		self.inner.seek_last()
-	}
-
-	/// Seek to first entry >= target. Returns true if valid.
-	pub fn seek<K: AsRef<[u8]>>(&mut self, target: K) -> Result<bool> {
-		// Create a minimal encoded key for seeking
-		let mut encoded = target.as_ref().to_vec();
-		// Add MAXIMUM trailer (seq_num=MAX, kind=MAX) and timestamp=MAX
-		// to position at the FIRST (newest) version of target key
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes());
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes());
-		self.inner.seek(&encoded)
-	}
-
-	/// Move to next entry. Returns true if valid.
-	#[allow(clippy::should_implement_trait)]
-	pub fn next(&mut self) -> Result<bool> {
-		self.inner.next()
-	}
-
-	/// Move to previous entry. Returns true if valid.
-	pub fn prev(&mut self) -> Result<bool> {
-		self.inner.prev()
-	}
-
-	/// Check if positioned on valid entry.
-	pub fn valid(&self) -> bool {
-		self.inner.valid()
-	}
-
-	/// Get current key (allocates). Caller must check valid() first.
-	pub fn key(&self) -> Key {
+	fn value_owned(&self) -> Result<Value> {
 		debug_assert!(self.valid());
-		self.inner.key().user_key().to_vec()
-	}
-
-	/// Get current value (may allocate for VLog resolution). Caller must check valid() first.
-	/// Returns None if in keys-only mode.
-	///
-	/// Note: Write-set values are stored RAW. Only persisted values (memtable/SSTable)
-	/// are encoded as ValueLocation. We skip decode for write-set values.
-	pub fn value(&self) -> Result<Option<Value>> {
-		debug_assert!(self.valid());
-		let raw_value = self.inner.value();
-
-		// Write-set values are stored raw (not ValueLocation encoded)
-		// Only persisted values need ValueLocation decode
-		if self.inner.is_write_set_value() {
-			Ok(Some(raw_value.to_vec()))
+		let raw = self.value()?;
+		if self.current_source == CurrentSource::WriteSet {
+			Ok(raw.to_vec())
 		} else {
-			self.core.resolve_value(raw_value).map(Some)
+			self.core.resolve_value(raw)
 		}
-	}
-
-	/// Get current key-value pair (convenience method)
-	pub fn entry(&self) -> Result<(Key, Option<Value>)> {
-		Ok((self.key(), self.value()?))
 	}
 }
 
@@ -1527,7 +1437,7 @@ impl<'a> TransactionIterator<'a> {
 /// - Forward iteration advances `ws_pos` upward
 /// - Backward iteration advances `ws_pos_back` downward
 /// - All seek operations reset BOTH pointers to restore the full range
-pub struct TransactionHistoryIterator<'a> {
+pub(crate) struct TransactionHistoryIterator<'a> {
 	// === Core data sources ===
 	/// History iterator from snapshot - provides committed data.
 	/// Already sorted by (user_key ASC, timestamp DESC).
@@ -2060,37 +1970,6 @@ impl<'a> TransactionHistoryIterator<'a> {
 		self.position_to_max()
 	}
 
-	/// Seek to the first entry with key >= target.
-	///
-	/// Uses forward ordering (key ASC, timestamp DESC).
-	/// Returns `true` if a valid entry exists at or after target.
-	///
-	/// ## Example
-	///
-	/// ```text
-	/// Data: [("a",50), ("b",40), ("c",30)]
-	/// seek("b") → positions at ("b", 40)
-	/// seek("bb") → positions at ("c", 30)
-	/// ```
-	pub fn seek<K: AsRef<[u8]>>(&mut self, target: K) -> Result<bool> {
-		self.direction = MergeDirection::Forward;
-		self.initialized = true;
-
-		// Create encoded key with maximum trailer/timestamp for >= seek
-		// This ensures we find entries at or after the target key
-		let mut encoded = target.as_ref().to_vec();
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
-		self.inner.seek(&encoded)?;
-
-		// Reset write-set to full range first, then position via binary search
-		self.reset_ws_positions();
-		self.ws_pos =
-			self.write_set_entries.partition_point(|(k, _)| k.as_slice() < target.as_ref());
-
-		self.position_to_min()
-	}
-
 	/// Move to the next entry in forward order.
 	///
 	/// Advances past the current entry and positions at the next one.
@@ -2160,142 +2039,9 @@ impl<'a> TransactionHistoryIterator<'a> {
 
 	/// Check if positioned on a valid entry.
 	///
-	/// Must be called before accessing `key()`, `value()`, etc.
+	/// Must be called before accessing iterator methods.
 	pub fn valid(&self) -> bool {
 		self.current_source != CurrentSource::None
-	}
-
-	/// Get current user key (allocates).
-	///
-	/// # Panics
-	///
-	/// Panics if `valid()` is false.
-	pub fn key(&self) -> Key {
-		debug_assert!(self.valid());
-		match self.current_source {
-			CurrentSource::Snapshot => self.inner.key().user_key().to_vec(),
-			CurrentSource::WriteSet => {
-				let (key, _) = if self.direction == MergeDirection::Forward {
-					self.write_set_entries[self.ws_pos]
-				} else {
-					self.write_set_entries[self.ws_pos_back - 1]
-				};
-				key.clone()
-			}
-			CurrentSource::None => panic!("key() called on invalid iterator"),
-		}
-	}
-
-	/// Get the timestamp/version of the current entry.
-	///
-	/// Higher timestamps indicate newer versions.
-	///
-	/// # Panics
-	///
-	/// Panics if `valid()` is false.
-	pub fn timestamp(&self) -> u64 {
-		debug_assert!(self.valid());
-		match self.current_source {
-			CurrentSource::Snapshot => self.inner.key().timestamp(),
-			CurrentSource::WriteSet => {
-				if self.direction == MergeDirection::Forward {
-					self.write_set_entries[self.ws_pos].1.timestamp
-				} else {
-					self.write_set_entries[self.ws_pos_back - 1].1.timestamp
-				}
-			}
-			CurrentSource::None => panic!("timestamp() called on invalid iterator"),
-		}
-	}
-
-	/// Get the sequence number of the current entry.
-	///
-	/// Sequence numbers provide total ordering within a batch.
-	///
-	/// # Panics
-	///
-	/// Panics if `valid()` is false.
-	pub fn seq_num(&self) -> u64 {
-		debug_assert!(self.valid());
-		match self.current_source {
-			CurrentSource::Snapshot => self.inner.key().seq_num(),
-			CurrentSource::WriteSet => {
-				if self.direction == MergeDirection::Forward {
-					self.write_set_entries[self.ws_pos].1.seqno as u64
-				} else {
-					self.write_set_entries[self.ws_pos_back - 1].1.seqno as u64
-				}
-			}
-			CurrentSource::None => panic!("seq_num() called on invalid iterator"),
-		}
-	}
-
-	/// Check if the current entry is a tombstone (soft delete marker).
-	///
-	/// Tombstones indicate the key was deleted at this timestamp.
-	/// Unlike hard deletes, previous versions may still be visible.
-	///
-	/// # Panics
-	///
-	/// Panics if `valid()` is false.
-	pub fn is_tombstone(&self) -> bool {
-		debug_assert!(self.valid());
-		match self.current_source {
-			CurrentSource::Snapshot => self.inner.key().is_tombstone(),
-			CurrentSource::WriteSet => {
-				if self.direction == MergeDirection::Forward {
-					self.write_set_entries[self.ws_pos].1.is_tombstone()
-				} else {
-					self.write_set_entries[self.ws_pos_back - 1].1.is_tombstone()
-				}
-			}
-			CurrentSource::None => panic!("is_tombstone() called on invalid iterator"),
-		}
-	}
-
-	/// Get current value (may allocate for VLog resolution).
-	///
-	/// For snapshot entries, this may require reading from the value log.
-	/// For write-set entries, returns the in-memory value directly.
-	///
-	/// # Panics
-	///
-	/// Panics if `valid()` is false.
-	pub fn value(&self) -> Result<Value> {
-		debug_assert!(self.valid());
-		match self.current_source {
-			CurrentSource::Snapshot => self.core.resolve_value(self.inner.value()),
-			CurrentSource::WriteSet => {
-				let entry = if self.direction == MergeDirection::Forward {
-					self.write_set_entries[self.ws_pos].1
-				} else {
-					self.write_set_entries[self.ws_pos_back - 1].1
-				};
-				// Write-set values are stored directly, not as VLog references
-				Ok(entry.value.clone().unwrap_or_default())
-			}
-			CurrentSource::None => panic!("value() called on invalid iterator"),
-		}
-	}
-
-	/// Get current entry as a tuple: (key, value, timestamp, is_tombstone).
-	///
-	/// Convenience method for collecting all version information.
-	/// For tombstones, returns an empty value since tombstones have no value.
-	pub fn entry(&self) -> Result<(Key, Value, u64, bool)> {
-		let is_tombstone = self.is_tombstone();
-		let value = if is_tombstone {
-			Vec::new()
-		} else {
-			self.value()?
-		};
-		Ok((self.key(), value, self.timestamp(), is_tombstone))
-	}
-
-	/// Returns the iterator stats for testing/debugging.
-	#[cfg(test)]
-	pub(crate) fn stats(&self) -> &HistoryIteratorStats {
-		self.inner.stats()
 	}
 }
 
@@ -2307,20 +2053,24 @@ impl<'a> TransactionHistoryIterator<'a> {
 // the internal LSM iterator interface with encoded keys.
 
 impl InternalIterator for TransactionHistoryIterator<'_> {
-	/// Seek to encoded target key.
+	/// Seek to first entry with key >= target.
 	///
-	/// The target is in internal format: `[user_key | trailer | timestamp]`.
-	/// Extracts the user key portion for write-set positioning.
+	/// The target is a raw user key. It will be encoded internally with
+	/// MAX trailer/timestamp to position at the first (newest) version.
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.initialized = true;
 
-		self.inner.seek(target)?;
+		// Encode user key with MAX trailer/timestamp for >= seek
+		// This positions at the FIRST (newest) version of the target key
+		let mut encoded = target.to_vec();
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
+		self.inner.seek(&encoded)?;
 
-		// Reset write-set to full range first, then position via binary search
+		// Position write-set using raw user key (binary search)
 		self.reset_ws_positions();
-		let user_key = InternalKey::user_key_from_encoded(target);
-		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < user_key);
+		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < target);
 
 		self.position_to_min()
 	}
@@ -2358,11 +2108,11 @@ impl InternalIterator for TransactionHistoryIterator<'_> {
 		}
 	}
 
-	/// Returns the current value as a byte slice.
+	/// Returns the current raw value as a byte slice.
 	///
 	/// For snapshot entries, may be a VLog reference requiring resolution.
 	/// For write-set entries, returns the direct value bytes.
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		match self.current_source {
 			CurrentSource::Snapshot => self.inner.value(),
@@ -2372,9 +2122,19 @@ impl InternalIterator for TransactionHistoryIterator<'_> {
 				} else {
 					self.write_set_entries[self.ws_pos_back - 1].1
 				};
-				entry.value.as_ref().map_or(&[], |v| v.as_slice())
+				Ok(entry.value.as_ref().map_or(&[], |v| v.as_slice()))
 			}
 			CurrentSource::None => panic!("value() called on invalid iterator"),
+		}
+	}
+
+	fn value_owned(&self) -> Result<Value> {
+		debug_assert!(self.valid());
+		let raw = self.value()?;
+		if self.current_source == CurrentSource::WriteSet {
+			Ok(raw.to_vec())
+		} else {
+			self.core.resolve_value(raw)
 		}
 	}
 }

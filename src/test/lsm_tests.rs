@@ -9,7 +9,17 @@ use crate::compaction::leveled::Strategy;
 use crate::levels::LevelManifest;
 use crate::lsm::{CompactionOperations, Core, CoreInner};
 use crate::test::collect_transaction_all;
-use crate::{Error, InternalKeyKind, Key, Options, Tree, TreeBuilder, Value, WalRecoveryMode};
+use crate::{
+	Error,
+	InternalIterator,
+	InternalKeyKind,
+	Key,
+	Options,
+	Tree,
+	TreeBuilder,
+	Value,
+	WalRecoveryMode,
+};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -460,8 +470,8 @@ async fn test_simple_range_seek() {
 	// Verify the keys and values are correct
 	let expected_before = [("a", "a"), ("b", "b"), ("c", "c")];
 	for (idx, (key, value)) in range_before_flush.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 		assert_eq!(key_str, expected_before[idx].0, "Key mismatch at index {idx} before flush");
 		assert_eq!(value_str, expected_before[idx].1, "Value mismatch at index {idx} before flush");
 	}
@@ -479,8 +489,8 @@ async fn test_simple_range_seek() {
 	// Verify the keys and values are still correct after flush
 	let expected_after = [("a", "a"), ("b", "b"), ("c", "c")];
 	for (idx, (key, value)) in range_after_flush.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 		assert_eq!(key_str, expected_after[idx].0, "Key mismatch at index {idx} after flush");
 		assert_eq!(value_str, expected_after[idx].1, "Value mismatch at index {idx} after flush");
 	}
@@ -546,8 +556,8 @@ async fn test_large_range_scan() {
 
 	// Verify each item is correct and in order
 	for (idx, (key, value)) in range_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_key = &expected_items[idx].0;
 		let expected_value = &expected_items[idx].1;
@@ -574,8 +584,8 @@ async fn test_large_range_scan() {
 
 	// Verify each item in partial range
 	for (idx, (key, value)) in partial_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_key = &expected_items[idx].0;
 		let expected_value = &expected_items[idx].1;
@@ -602,8 +612,8 @@ async fn test_large_range_scan() {
 
 	// Verify each item in middle range
 	for (idx, (key, value)) in middle_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 5000 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -630,8 +640,8 @@ async fn test_large_range_scan() {
 
 	// Verify each item in end range
 	for (idx, (key, value)) in end_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 9900 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -658,8 +668,8 @@ async fn test_large_range_scan() {
 	assert_eq!(single_result.len(), 1, "Single item range scan should return 1 item");
 
 	let (key, value) = &single_result[0];
-	let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-	let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+	let key_str = std::str::from_utf8(key).unwrap();
+	let value_str = std::str::from_utf8(value).unwrap();
 
 	assert_eq!(key_str, "key_004567");
 	assert_eq!(value_str, "value_004567_content_data_9134");
@@ -719,7 +729,9 @@ async fn test_range_skip_take() {
 		if !iter.valid() {
 			break;
 		}
-		range_result.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value_owned().unwrap();
+		range_result.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -730,8 +742,8 @@ async fn test_range_skip_take() {
 	);
 
 	for (idx, (key, value)) in range_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 5000 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -807,7 +819,9 @@ async fn test_range_skip_take_alphabetical() {
 		if !iter.valid() {
 			break;
 		}
-		range_result.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value_owned().unwrap();
+		range_result.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -818,8 +832,8 @@ async fn test_range_skip_take_alphabetical() {
 	);
 
 	for (idx, (key, value)) in range_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 5000 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -873,7 +887,9 @@ async fn test_range_limit_functionality() {
 		if !iter.valid() {
 			break;
 		}
-		limited_result.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value_owned().unwrap();
+		limited_result.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -884,8 +900,8 @@ async fn test_range_limit_functionality() {
 	);
 
 	for (idx, (key, value)) in limited_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_key = &expected_items[idx].0;
 		let expected_value = &expected_items[idx].1;
@@ -909,7 +925,9 @@ async fn test_range_limit_functionality() {
 		if !iter.valid() {
 			break;
 		}
-		limited_result_1000.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value_owned().unwrap();
+		limited_result_1000.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -920,8 +938,8 @@ async fn test_range_limit_functionality() {
 	);
 
 	for (idx, (key, value)) in limited_result_1000.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_key = &expected_items[idx].0;
 		let expected_value = &expected_items[idx].1;
@@ -945,7 +963,9 @@ async fn test_range_limit_functionality() {
 		if !iter.valid() {
 			break;
 		}
-		limited_result_large.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value_owned().unwrap();
+		limited_result_large.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -970,14 +990,16 @@ async fn test_range_limit_functionality() {
 	// Take 1 item
 	let mut single_result = Vec::new();
 	if iter.valid() {
-		single_result.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value_owned().unwrap();
+		single_result.push((key, value));
 	}
 
 	assert_eq!(single_result.len(), 1, "Range scan with .take(1) should return exactly 1 item");
 
 	let (key, value) = &single_result[0];
-	let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-	let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+	let key_str = std::str::from_utf8(key).unwrap();
+	let value_str = std::str::from_utf8(value).unwrap();
 
 	assert_eq!(key_str, "key_000000");
 	assert_eq!(value_str, "value_000000_content_data_0");
@@ -1035,7 +1057,9 @@ async fn test_range_limit_with_skip_take() {
 		if !iter.valid() {
 			break;
 		}
-		unlimited_range_result.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value_owned().unwrap();
+		unlimited_range_result.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -1046,8 +1070,8 @@ async fn test_range_limit_with_skip_take() {
 	);
 
 	for (idx, (key, value)) in unlimited_range_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 5000 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -1080,15 +1104,17 @@ async fn test_range_limit_with_skip_take() {
 		if !iter.valid() {
 			break;
 		}
-		res.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value_owned().unwrap();
+		res.push((key, value));
 		iter.next().unwrap();
 	}
 
 	assert_eq!(res.len(), 50, "Range scan followed by skip(5000).take(50) should return 50 items");
 
 	for (idx, (key, value)) in res.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 5000 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -2151,7 +2177,7 @@ async fn test_soft_delete() {
 		// Should contain the other key
 		assert_eq!(range_result.len(), 1);
 		assert_eq!(&range_result[0].0, b"other_key");
-		assert_eq!(range_result[0].1.as_ref().unwrap().as_slice(), b"other_value");
+		assert_eq!(range_result[0].1.as_slice(), b"other_value");
 
 		// Test that we can reinsert the same key after soft delete
 		let mut txn = tree.begin().unwrap();
@@ -4706,7 +4732,7 @@ async fn test_range_key_ordering_correctness() {
 				"Forward iteration: Key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
 			);
 			assert_eq!(
-				value.as_ref().unwrap().as_slice(),
+				value.as_slice(),
 				expected_value.as_bytes(),
 				"Forward iteration: Value mismatch at index {idx}"
 			);
@@ -4763,7 +4789,7 @@ async fn test_range_key_ordering_correctness() {
 				"After flush forward: Key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
 			);
 			assert_eq!(
-				value.as_ref().unwrap().as_slice(),
+				value.as_slice(),
 				expected_value.as_bytes(),
 				"After flush forward: Value mismatch at index {idx}"
 			);
@@ -4850,7 +4876,7 @@ async fn test_range_prefix_differentiation() {
 				key_str
 			);
 			// Verify value is a table record value
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 			assert!(
 				value_str.starts_with("TableRecord"),
 				"Value '{}' should be a TableRecord",
@@ -4885,7 +4911,7 @@ async fn test_range_prefix_differentiation() {
 				key_str
 			);
 			// Verify value is an index record value
-			let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
 			assert!(value_str.starts_with("Index"), "Value '{}' should be an Index", value_str);
 		}
 	}
