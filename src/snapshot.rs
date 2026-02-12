@@ -382,7 +382,7 @@ impl Snapshot {
 					// Key was deleted at this timestamp
 					best_value = None;
 				} else {
-					best_value = Some(self.core.resolve_value(iter.value()?)?);
+					best_value = Some(self.core.resolve_value(iter.raw_value()?)?);
 				}
 				best_timestamp = entry_ts;
 			}
@@ -752,9 +752,9 @@ impl LSMIterator for KMergeIterator<'_> {
 		self.iterators[self.winner.unwrap()].key()
 	}
 
-	fn value(&self) -> Result<&[u8]> {
+	fn raw_value(&self) -> Result<&[u8]> {
 		debug_assert!(self.is_valid());
-		self.iterators[self.winner.unwrap()].value()
+		self.iterators[self.winner.unwrap()].raw_value()
 	}
 }
 
@@ -900,7 +900,7 @@ impl SnapshotIterator<'_> {
 		// If first entry is visible, it's a candidate
 		if self.is_visible_ref(&first_key_ref) {
 			latest_key = Some(first_key_ref.encoded().to_vec());
-			latest_value = Some(self.merge_iter.value()?.to_vec());
+			latest_value = Some(self.merge_iter.raw_value()?.to_vec());
 		}
 
 		// Keep consuming entries with same user key, looking for newer visible versions
@@ -919,7 +919,7 @@ impl SnapshotIterator<'_> {
 				self.buffered_back_key.clear();
 				self.buffered_back_key.extend_from_slice(key_ref.encoded());
 				self.buffered_back_value.clear();
-				self.buffered_back_value.extend_from_slice(self.merge_iter.value()?);
+				self.buffered_back_value.extend_from_slice(self.merge_iter.raw_value()?);
 				self.has_buffered_back = true;
 				break;
 			}
@@ -927,7 +927,7 @@ impl SnapshotIterator<'_> {
 			// Same user key - check if this is a newer visible version
 			if self.is_visible_ref(&key_ref) {
 				latest_key = Some(key_ref.encoded().to_vec());
-				latest_value = Some(self.merge_iter.value()?.to_vec());
+				latest_value = Some(self.merge_iter.raw_value()?.to_vec());
 			}
 		}
 
@@ -1026,12 +1026,12 @@ impl LSMIterator for SnapshotIterator<'_> {
 		}
 	}
 
-	fn value(&self) -> Result<&[u8]> {
+	fn raw_value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		if self.direction == MergeDirection::Backward {
 			Ok(&self.current_back_value)
 		} else {
-			self.merge_iter.value()
+			self.merge_iter.raw_value()
 		}
 	}
 }
@@ -1122,8 +1122,8 @@ impl LSMIterator for BPlusTreeIteratorWithGuard<'_> {
 		self.iter.key()
 	}
 
-	fn value(&self) -> Result<&[u8]> {
-		self.iter.value()
+	fn raw_value(&self) -> Result<&[u8]> {
+		self.iter.raw_value()
 	}
 }
 
@@ -1288,8 +1288,8 @@ impl<'a> HistoryIterator<'a> {
 
 	fn inner_value(&self) -> Result<&[u8]> {
 		match &self.inner {
-			HistoryIteratorInner::Lsm(iter) => iter.value(),
-			HistoryIteratorInner::BTree(iter) => iter.value(),
+			HistoryIteratorInner::Lsm(iter) => iter.raw_value(),
+			HistoryIteratorInner::BTree(iter) => iter.raw_value(),
 		}
 	}
 
@@ -1816,7 +1816,7 @@ impl LSMIterator for HistoryIterator<'_> {
 		}
 	}
 
-	fn value(&self) -> Result<&[u8]> {
+	fn raw_value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		match self.direction {
 			MergeDirection::Forward => self.inner_value(),

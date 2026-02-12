@@ -3471,7 +3471,7 @@ impl<F: VfsFile> LSMIterator for BPlusTreeIterator<'_, F> {
 	}
 
 	/// Get current value (zero-copy).
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn raw_value(&self) -> crate::error::Result<&[u8]> {
 		debug_assert!(self.is_valid());
 		let leaf = self.current_leaf.as_ref().expect("valid() should be true");
 		Ok(&leaf.values[self.current_idx])
@@ -5452,7 +5452,7 @@ mod tests {
 		assert!(iter.seek_first().unwrap());
 		assert!(iter.valid());
 		assert_eq!(iter.key().user_key(), b"only_key");
-		assert_eq!(iter.value().unwrap(), b"only_value");
+		assert_eq!(iter.raw_value().unwrap(), b"only_value");
 	}
 
 	#[test]
@@ -5466,7 +5466,7 @@ mod tests {
 		assert!(iter.seek_last().unwrap());
 		assert!(iter.valid());
 		assert_eq!(iter.key().user_key(), b"only_key");
-		assert_eq!(iter.value().unwrap(), b"only_value");
+		assert_eq!(iter.raw_value().unwrap(), b"only_value");
 	}
 
 	#[test]
@@ -5713,7 +5713,7 @@ mod tests {
 		assert!(iter.seek(&make_internal_key(b"bbb", 0)).unwrap());
 		assert!(iter.valid());
 		assert_eq!(iter.key().user_key(), b"bbb");
-		assert_eq!(iter.value().unwrap(), b"val2");
+		assert_eq!(iter.raw_value().unwrap(), b"val2");
 	}
 
 	#[test]
@@ -6129,11 +6129,11 @@ mod tests {
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
 
-		assert_eq!(iter.value().unwrap(), b"value_one");
+		assert_eq!(iter.raw_value().unwrap(), b"value_one");
 		assert!(iter.next().unwrap());
-		assert_eq!(iter.value().unwrap(), b"value_two");
+		assert_eq!(iter.raw_value().unwrap(), b"value_two");
 		assert!(iter.next().unwrap());
-		assert_eq!(iter.value().unwrap(), b"value_three");
+		assert_eq!(iter.raw_value().unwrap(), b"value_three");
 	}
 
 	#[test]

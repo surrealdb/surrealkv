@@ -242,7 +242,7 @@ fn verify_keys_after_compaction(
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
-				let value = iter.value().unwrap().to_vec();
+				let value = iter.raw_value().unwrap().to_vec();
 				count += 1;
 				all_key_values.insert(key, value);
 				iter.next().unwrap();
@@ -285,7 +285,7 @@ fn verify_all_keys_present(
 
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
-				let value = iter.value().unwrap().to_vec();
+				let value = iter.raw_value().unwrap().to_vec();
 				all_key_values.insert(key, value);
 				iter.next().unwrap();
 			}
@@ -1415,7 +1415,7 @@ async fn test_compaction_respects_sequence_numbers() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
-				let location = ValueLocation::decode(iter.value().unwrap()).unwrap();
+				let location = ValueLocation::decode(iter.raw_value().unwrap()).unwrap();
 				if location.is_value_pointer() {
 					panic!("Unexpected VLog pointer in test");
 				}
@@ -1601,7 +1601,7 @@ async fn test_l0_overlapping_keys_compaction() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned();
-				let encoded_value = iter.value().unwrap().to_vec();
+				let encoded_value = iter.raw_value().unwrap().to_vec();
 				match key.kind() {
 					InternalKeyKind::Set => {
 						let location = ValueLocation::decode(&encoded_value).unwrap();
@@ -1720,7 +1720,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned();
-				let encoded_value = iter.value().unwrap().to_vec();
+				let encoded_value = iter.raw_value().unwrap().to_vec();
 				if key.kind() == InternalKeyKind::Set {
 					let location = ValueLocation::decode(&encoded_value).unwrap();
 					if location.is_value_pointer() {
@@ -2154,7 +2154,7 @@ async fn test_soft_delete_compaction_behavior() {
 		iter.seek_first().unwrap();
 		while iter.valid() {
 			let key = iter.key().to_owned();
-			let value = iter.value().unwrap().to_vec();
+			let value = iter.raw_value().unwrap().to_vec();
 			match key.kind() {
 				InternalKeyKind::Set => {
 					let key_str = String::from_utf8(key.user_key.clone()).unwrap();

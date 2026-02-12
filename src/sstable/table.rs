@@ -738,7 +738,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 	if metaindexiter.is_valid() {
 		let k = metaindexiter.key();
 		assert_eq!(k.user_key(), b"meta");
-		let buf_bytes = metaindexiter.value()?;
+		let buf_bytes = metaindexiter.raw_value()?;
 		return Ok(Some(TableMetadata::decode(buf_bytes)?));
 	}
 	Ok(None)
@@ -898,7 +898,7 @@ impl Table {
 		if metaindexiter.is_valid() {
 			let k = metaindexiter.key();
 			assert_eq!(k.user_key(), filter_name.as_bytes());
-			let val = metaindexiter.value()?;
+			let val = metaindexiter.raw_value()?;
 
 			let fbl = BlockHandle::decode(val);
 			let filter_block_location = match fbl {
@@ -1038,7 +1038,7 @@ impl Table {
 		iter.seek_internal(&key_encoded)?;
 
 		if iter.is_valid() && iter.user_key() == key.user_key.as_slice() {
-			Ok(Some((iter.key().to_owned(), iter.value()?.to_vec())))
+			Ok(Some((iter.key().to_owned(), iter.raw_value()?.to_vec())))
 		} else {
 			Ok(None)
 		}
@@ -1837,7 +1837,7 @@ impl LSMIterator for TableIterator<'_> {
 		InternalKeyRef::from_encoded(self.second_level.as_ref().unwrap().key_bytes())
 	}
 
-	fn value(&self) -> Result<&[u8]> {
+	fn raw_value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		Ok(self.second_level.as_ref().unwrap().value_bytes())
 	}
