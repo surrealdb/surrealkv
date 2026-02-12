@@ -280,17 +280,51 @@ impl CommitPipeline {
 			env.apply(&processed_batch)
 		};
 
-		match apply_result {
-			Ok(_) => {
-				commit_batch.mark_applied();
-				// Phase 3: Publish (multi-consumer)
-				self.publish();
-			}
-			Err(e) => {
-				let err = Error::CommitFail(e.to_string());
-				commit_batch.complete(Err(err.clone()));
-				return Err(err);
-			}
+		// =========================================================================
+		// NOTE: We mark batch as applied and call publish(), even on failure.
+		// =========================================================================
+		//
+		// Issue:
+		//   On apply() failure, we returned early without calling mark_applied()
+		//   or publish(). The batch remained in the queue as a "zombie" but the
+		//   semaphore permit was released. After ~8 failures, zombies
+		//   filled the queue and new enqueues panicked with "queue overflow".
+		//
+		// FIX:
+		//   Always mark_applied() and publish() regardless of success/failure.
+		//   This ensures batches are dequeueable before their permit is released,
+		//   maintaining the condition: batches_in_queue <= permits_held < queue_capacity
+		//
+		// LIMITATION - SEQUENCE NUMBER GAPS:
+		//   Sequence numbers are allocated in prepare() before apply() is called.
+		//   When apply() fails, those sequence numbers are not used but also cannot
+		//   be reclaimed. Example:
+		//
+		//     Batch A: seq 1-3, apply succeeds → entries 1,2,3 exist in memtable
+		//     Batch B: seq 4-6, apply FAILS    → entries 4,5,6 do NOT exist
+		//     Batch C: seq 7-9, apply succeeds → entries 7,8,9 exist in memtable
+		//     visible_seq_num: 3 → 6 → 9
+		//
+		//   Entries for sequence numbers 4,5,6 do not exist in the memtable.
+		// =========================================================================
+
+		commit_batch.mark_applied();
+
+		// If apply failed, send error to waiter now (before publish)
+		let apply_err = if let Err(ref e) = apply_result {
+			let err = Error::CommitFail(e.to_string());
+			commit_batch.complete(Err(err.clone()));
+			Some(err)
+		} else {
+			None
+		};
+
+		// Phase 3: Publish (multi-consumer) - MUST always run to drain queue
+		self.publish();
+
+		// Return error if apply failed
+		if let Some(err) = apply_err {
+			return Err(err);
 		}
 
 		// Wait for completion
@@ -849,6 +883,160 @@ mod tests {
 		// Verify sequence numbers are continuous and correct
 		let final_visible = pipeline.get_visible_seq_num();
 		assert_eq!(final_visible, expected_calls);
+
+		pipeline.shutdown();
+	}
+
+	// ==========================================================================
+	// TESTS FOR QUEUE OVERFLOW BUG FIX
+	// ==========================================================================
+	//
+	// Add these tests to your existing #[cfg(test)] mod tests { ... }
+	//
+	// To verify the bug exists (before fix):
+	//   1. Comment out your fix
+	//   2. Run: cargo test test_queue_overflow --nocapture
+	//   3. Should panic with "commit queue overflow - should not be reached"
+	//
+	// To verify the fix works (after fix):
+	//   1. Apply the fix
+	//   2. Run: cargo test test_queue_overflow
+	//   3. Should pass
+	// ==========================================================================
+
+	struct AlwaysFailApplyEnv;
+
+	impl CommitEnv for AlwaysFailApplyEnv {
+		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
+			let mut new_batch = Batch::new(seq_num);
+			for entry in batch.entries() {
+				new_batch.add_record(
+					entry.kind,
+					entry.key.clone(),
+					entry.value.clone(),
+					entry.timestamp,
+				)?;
+			}
+			Ok(new_batch)
+		}
+
+		fn apply(&self, _batch: &Batch) -> Result<()> {
+			Err(Error::CommitFail("simulated apply failure".into()))
+		}
+
+		fn check_background_error(&self) -> Result<()> {
+			Ok(())
+		}
+	}
+
+	/// Minimal reproduction: all applies fail.
+	///
+	/// WITHOUT FIX: panics at iteration 8 with "commit queue overflow"
+	/// WITH FIX: completes all 20 iterations, returning errors
+	#[test(tokio::test)]
+	async fn test_queue_overflow_all_fail() {
+		let pipeline = CommitPipeline::new(Arc::new(AlwaysFailApplyEnv), test_visible_seq_num());
+
+		for i in 0..20 {
+			let mut batch = Batch::new(0);
+			batch
+				.add_record(
+					InternalKeyKind::Set,
+					format!("key{i}").into_bytes(),
+					Some(b"value".to_vec()),
+					0,
+				)
+				.unwrap();
+
+			let result = pipeline.commit(batch, false).await;
+			assert!(result.is_err(), "Expected error at iteration {i}");
+		}
+
+		pipeline.shutdown();
+	}
+
+	struct FailNTimesEnv {
+		// Track how many calls have been made
+		call_count: std::sync::atomic::AtomicUsize,
+		// Fail the first N calls
+		fail_until: usize,
+	}
+
+	impl FailNTimesEnv {
+		fn new(fail_count: usize) -> Self {
+			Self {
+				call_count: std::sync::atomic::AtomicUsize::new(0),
+				fail_until: fail_count,
+			}
+		}
+	}
+
+	impl CommitEnv for FailNTimesEnv {
+		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
+			let mut new_batch = Batch::new(seq_num);
+			for entry in batch.entries() {
+				new_batch.add_record(
+					entry.kind,
+					entry.key.clone(),
+					entry.value.clone(),
+					entry.timestamp,
+				)?;
+			}
+			Ok(new_batch)
+		}
+
+		fn apply(&self, _batch: &Batch) -> Result<()> {
+			// Increment call count and get previous value
+			let call_num = self.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+			// Fail if we haven't reached fail_until yet
+			if call_num < self.fail_until {
+				Err(Error::CommitFail("simulated failure".into()))
+			} else {
+				Ok(())
+			}
+		}
+
+		fn check_background_error(&self) -> Result<()> {
+			Ok(())
+		}
+	}
+
+	/// Reproduction: first N fail, then succeed.
+	///
+	/// WITHOUT FIX: panics when attempting commit after failures fill queue
+	/// WITH FIX: fails N times, then succeeds
+	#[test(tokio::test)]
+	async fn test_queue_overflow_partial_fail() {
+		let fail_count = 10; // Fail first 10, then succeed
+		let env = Arc::new(FailNTimesEnv::new(fail_count));
+		let pipeline = CommitPipeline::new(env, test_visible_seq_num());
+
+		for i in 0..20 {
+			let mut batch = Batch::new(0);
+			batch
+				.add_record(
+					InternalKeyKind::Set,
+					format!("key{i}").into_bytes(),
+					Some(b"value".to_vec()),
+					i as u64,
+				)
+				.unwrap();
+
+			let result = pipeline.commit(batch, false).await;
+
+			if i < fail_count {
+				assert!(result.is_err(), "Expected error at iteration {i}");
+			} else {
+				assert!(result.is_ok(), "Expected success at iteration {i}, got {result:?}");
+			}
+		}
+
+		// Verify visible_seq_num advanced for successful commits
+		// Successful commits: 10..20, each with 1 entry
+		// Sequence numbers: fails consumed 1-10, successes got 11-20
+		let visible = pipeline.get_visible_seq_num();
+		assert_eq!(visible, 20, "Expected visible_seq_num=20");
 
 		pipeline.shutdown();
 	}
