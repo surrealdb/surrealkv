@@ -39,18 +39,7 @@ use crate::{
 /// removal, it checks if the version is visible to any snapshot using binary
 /// search. Versions visible to snapshots are preserved unless hidden by a newer
 /// version in the same visibility boundary.
-///
-/// # Implementation
-///
-/// Uses `crossbeam_skiplist::SkipSet` for lock-free concurrent access:
-/// - O(log n) lock-free insert/remove during snapshot lifecycle
-/// - Natural sorted order for efficient iteration during compaction
-/// - Zero contention between concurrent transactions
 pub(crate) struct SnapshotTracker {
-	/// Active snapshot sequence numbers, stored in a lock-free SkipSet for:
-	/// - Lock-free O(log n) insert/remove during snapshot lifecycle
-	/// - Natural sorted order for efficient binary search during compaction
-	/// - Zero contention between concurrent transaction operations
 	snapshots: Arc<SkipSet<u64>>,
 }
 
@@ -87,9 +76,6 @@ impl SnapshotTracker {
 	/// Called when a new snapshot is created. The sequence number is added
 	/// to the tracking set, ensuring compaction will preserve versions
 	/// visible to this snapshot.
-	///
-	/// This operation is lock-free and does not block other concurrent
-	/// register/unregister operations.
 	pub(crate) fn register(&self, seq_num: u64) {
 		self.snapshots.insert(seq_num);
 	}
@@ -99,9 +85,6 @@ impl SnapshotTracker {
 	/// Called when a snapshot is dropped. Once all snapshots at or above
 	/// a certain sequence number are dropped, older versions become eligible
 	/// for garbage collection during compaction.
-	///
-	/// This operation is lock-free and does not block other concurrent
-	/// register/unregister operations.
 	pub(crate) fn unregister(&self, seq_num: u64) {
 		self.snapshots.remove(&seq_num);
 	}
@@ -109,9 +92,7 @@ impl SnapshotTracker {
 	/// Returns all active snapshots as a sorted vector.
 	///
 	/// This is the primary method used by compaction. The returned vector
-	/// is sorted in ascending order (naturally, since SkipSet maintains order),
-	/// enabling efficient binary search to determine which snapshot "boundary"
-	/// each version belongs to.
+	/// is sorted in ascending order.
 	pub(crate) fn get_all_snapshots(&self) -> Vec<u64> {
 		self.snapshots.iter().map(|entry| *entry).collect()
 	}
@@ -771,7 +752,7 @@ impl LSMIterator for KMergeIterator<'_> {
 		self.iterators[self.winner.unwrap()].key()
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.is_valid());
 		self.iterators[self.winner.unwrap()].value()
 	}
@@ -1045,7 +1026,7 @@ impl LSMIterator for SnapshotIterator<'_> {
 		}
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		if self.direction == MergeDirection::Backward {
 			Ok(&self.current_back_value)
@@ -1141,7 +1122,7 @@ impl LSMIterator for BPlusTreeIteratorWithGuard<'_> {
 		self.iter.key()
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		self.iter.value()
 	}
 }
@@ -1835,7 +1816,7 @@ impl LSMIterator for HistoryIterator<'_> {
 		}
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		match self.direction {
 			MergeDirection::Forward => self.inner_value(),
