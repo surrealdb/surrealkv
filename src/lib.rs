@@ -766,13 +766,13 @@ impl From<u8> for InternalKeyKind {
 /// This is the owned version of `InternalKeyRef`. It includes the user key,
 /// timestamp, and trailer (containing sequence number and operation kind).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct InternalKey {
+pub(crate) struct InternalKey {
 	/// The application's key bytes.
-	pub user_key: Key,
+	pub(crate) user_key: Key,
 	/// System time in nanoseconds since epoch.
-	pub timestamp: u64,
+	pub(crate) timestamp: u64,
 	/// Trailer containing (seq_num << 8) | kind.
-	pub trailer: u64,
+	pub(crate) trailer: u64,
 }
 
 impl InternalKey {
@@ -954,7 +954,7 @@ impl<'a> InternalKeyRef<'a> {
 		is_replace_kind(self.kind())
 	}
 
-	pub fn to_owned(self) -> InternalKey {
+	pub(crate) fn to_owned(self) -> InternalKey {
 		InternalKey::decode(self.encoded)
 	}
 }

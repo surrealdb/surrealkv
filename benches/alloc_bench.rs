@@ -119,7 +119,7 @@ pub fn seq_range(b: divan::Bencher<'_, '_>, count: usize) {
 			iter.seek_first().unwrap();
 			let mut item_count = 0;
 			while iter.valid() {
-				let key = iter.key().to_owned();
+				let key = iter.key().encoded().to_vec();
 				results.push(key);
 				iter.next().unwrap();
 				item_count += 1;
