@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
-use crate::iter::{BoxedInternalIterator, CompactionIterator};
+use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lsm::CoreInner;
 use crate::memtable::ImmutableMemtables;
@@ -117,10 +117,10 @@ impl Compactor {
 			input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
 
 		// Keep tables alive while iterators borrow from them
-		let iterators: Vec<BoxedInternalIterator<'_>> = to_merge
+		let iterators: Vec<BoxedLSMIterator<'_>> = to_merge
 			.iter()
 			.filter_map(|table| table.iter(None).ok())
-			.map(|iter| Box::new(iter) as BoxedInternalIterator<'_>)
+			.map(|iter| Box::new(iter) as BoxedLSMIterator<'_>)
 			.collect();
 
 		drop(levels);
@@ -176,7 +176,7 @@ impl Compactor {
 		&self,
 		path: &Path,
 		table_id: u64,
-		merge_iter: Vec<BoxedInternalIterator<'_>>,
+		merge_iter: Vec<BoxedLSMIterator<'_>>,
 		input: &CompactionInput,
 	) -> Result<(bool, HashMap<u32, i64>)> {
 		let file = SysFile::create(path)?;

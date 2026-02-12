@@ -6,11 +6,11 @@ use test_log::test;
 
 use crate::clock::{LogicalClock, MockLogicalClock};
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
-use crate::iter::{BoxedInternalIterator, CompactionIterator, MergingIterator};
+use crate::iter::{BoxedLSMIterator, CompactionIterator, MergingIterator};
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::vlog::{VLog, ValueLocation};
-use crate::{InternalIterator, InternalKey, InternalKeyKind, Options, VLogChecksumLevel, Value};
+use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, VLogChecksumLevel, Value};
 
 /// Global counter for generating unique table IDs in tests
 static TEST_TABLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -62,7 +62,7 @@ fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 ///
 /// Unlike MockIterator, this properly handles internal key ordering
 /// where higher sequence numbers come before lower ones for the same user key.
-fn build_table_iterator(entries: Vec<(InternalKey, Value)>) -> BoxedInternalIterator<'static> {
+fn build_table_iterator(entries: Vec<(InternalKey, Value)>) -> BoxedLSMIterator<'static> {
 	let table_id = TEST_TABLE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
 
 	let mut buf = Vec::with_capacity(512);

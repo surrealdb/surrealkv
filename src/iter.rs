@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::clock::LogicalClock;
 use crate::error::{Error, Result};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
-use crate::{Comparator, InternalIterator, InternalKey, InternalKeyRef, Value};
+use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator, Value};
 
 // ============================================================================
 // SNAPSHOT VISIBILITY
@@ -47,7 +47,7 @@ pub(crate) enum SnapshotVisibility {
 ///
 /// This allows us to store different iterator types (MemTable iterators,
 /// SSTable iterators, etc.) in the same collection.
-pub type BoxedInternalIterator<'a> = Box<dyn InternalIterator + 'a>;
+pub type BoxedLSMIterator<'a> = Box<dyn LSMIterator + 'a>;
 
 // ============================================================================
 // BINARY HEAP
@@ -249,7 +249,7 @@ enum Direction {
 
 /// Entry holding a child iterator and its level index for tiebreaking.
 struct HeapEntry<'a> {
-	iter: BoxedInternalIterator<'a>,
+	iter: BoxedLSMIterator<'a>,
 	/// Lower level_idx = newer data = higher priority when keys are equal.
 	level_idx: usize,
 }
@@ -276,7 +276,7 @@ pub(crate) struct MergingIterator<'a> {
 }
 
 impl<'a> MergingIterator<'a> {
-	pub fn new(iterators: Vec<BoxedInternalIterator<'a>>, cmp: Arc<dyn Comparator>) -> Self {
+	pub fn new(iterators: Vec<BoxedLSMIterator<'a>>, cmp: Arc<dyn Comparator>) -> Self {
 		let capacity = iterators.len();
 		let children: Vec<_> = iterators
 			.into_iter()
@@ -552,10 +552,10 @@ impl<'a> MergingIterator<'a> {
 }
 
 // -----------------------------------------------------------------------------
-// InternalIterator Implementation
+// LSMIterator Implementation
 // -----------------------------------------------------------------------------
 
-impl InternalIterator for MergingIterator<'_> {
+impl LSMIterator for MergingIterator<'_> {
 	/// Seek to the first key >= target.
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = Direction::Forward;
@@ -819,7 +819,7 @@ impl<'a> CompactionIterator<'a> {
 	/// * `snapshots` - Sorted list of active snapshot sequence numbers
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
-		iterators: Vec<BoxedInternalIterator<'a>>,
+		iterators: Vec<BoxedLSMIterator<'a>>,
 		cmp: Arc<dyn Comparator>,
 		is_bottom_level: bool,
 		vlog: Option<Arc<VLog>>,

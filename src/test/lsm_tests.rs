@@ -11,9 +11,9 @@ use crate::lsm::{CompactionOperations, Core, CoreInner};
 use crate::test::collect_transaction_all;
 use crate::{
 	Error,
-	InternalIterator,
 	InternalKeyKind,
 	Key,
+	LSMIterator,
 	Options,
 	Tree,
 	TreeBuilder,

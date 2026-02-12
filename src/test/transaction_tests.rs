@@ -14,7 +14,7 @@ use crate::test::{
 	KeyVersionsMap,
 };
 use crate::transaction::HistoryOptions;
-use crate::{Error, InternalIterator, Key, Mode, Options, TreeBuilder, WriteOptions};
+use crate::{Error, Key, LSMIterator, Mode, Options, TreeBuilder, WriteOptions};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()

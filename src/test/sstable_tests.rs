@@ -12,9 +12,9 @@ use crate::test::{collect_all, collect_iter, count_iter};
 use crate::vfs::File;
 use crate::{
 	user_range_to_internal_range,
-	InternalIterator,
 	InternalKey,
 	InternalKeyKind,
+	LSMIterator,
 	Options,
 	Result,
 	INTERNAL_KEY_SEQ_NUM_MAX,

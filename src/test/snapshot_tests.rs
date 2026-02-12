@@ -16,7 +16,7 @@ use crate::test::{
 	collect_transaction_all,
 };
 use crate::vfs::File;
-use crate::{InternalIterator, InternalKey, InternalKeyKind, Options, Tree, TreeBuilder};
+use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Tree, TreeBuilder};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
