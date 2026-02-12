@@ -523,6 +523,7 @@ impl Transaction {
 	///
 	/// # Example
 	/// ```ignore
+	/// 
 	/// let mut iter = tx.range(b"a", b"z")?;
 	/// iter.seek_first()?;
 	/// while iter.valid() {

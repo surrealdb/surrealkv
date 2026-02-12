@@ -1,9 +1,9 @@
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::ops::Bound;
 use std::sync::Arc;
 
+use crossbeam_skiplist::SkipSet;
 use parking_lot::RwLockReadGuard;
 
 use crate::bplustree::tree::{BPlusTreeIterator, DiskBPlusTree};
@@ -39,19 +39,35 @@ use crate::{
 /// removal, it checks if the version is visible to any snapshot using binary
 /// search. Versions visible to snapshots are preserved unless hidden by a newer
 /// version in the same visibility boundary.
-#[derive(Clone, Debug, Default)]
 pub(crate) struct SnapshotTracker {
-	/// Active snapshot sequence numbers, stored in a BTreeSet for:
-	/// - O(log n) insert/remove during snapshot lifecycle
-	/// - Automatic sorted order for efficient binary search during compaction
-	snapshots: Arc<parking_lot::RwLock<BTreeSet<u64>>>,
+	snapshots: Arc<SkipSet<u64>>,
+}
+
+impl Clone for SnapshotTracker {
+	fn clone(&self) -> Self {
+		Self {
+			snapshots: Arc::clone(&self.snapshots),
+		}
+	}
+}
+
+impl Default for SnapshotTracker {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl std::fmt::Debug for SnapshotTracker {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SnapshotTracker").field("snapshots", &self.get_all_snapshots()).finish()
+	}
 }
 
 impl SnapshotTracker {
 	/// Creates a new empty snapshot tracker.
 	pub(crate) fn new() -> Self {
 		Self {
-			snapshots: Arc::new(parking_lot::RwLock::new(BTreeSet::new())),
+			snapshots: Arc::new(SkipSet::new()),
 		}
 	}
 
@@ -61,8 +77,7 @@ impl SnapshotTracker {
 	/// to the tracking set, ensuring compaction will preserve versions
 	/// visible to this snapshot.
 	pub(crate) fn register(&self, seq_num: u64) {
-		let mut snapshots = self.snapshots.write();
-		snapshots.insert(seq_num);
+		self.snapshots.insert(seq_num);
 	}
 
 	/// Unregisters a snapshot with the given sequence number.
@@ -71,18 +86,15 @@ impl SnapshotTracker {
 	/// a certain sequence number are dropped, older versions become eligible
 	/// for garbage collection during compaction.
 	pub(crate) fn unregister(&self, seq_num: u64) {
-		let mut snapshots = self.snapshots.write();
-		snapshots.remove(&seq_num);
+		self.snapshots.remove(&seq_num);
 	}
 
 	/// Returns all active snapshots as a sorted vector.
 	///
 	/// This is the primary method used by compaction. The returned vector
-	/// is sorted in ascending order, enabling efficient binary search to
-	/// determine which snapshot "boundary" each version belongs to.
+	/// is sorted in ascending order.
 	pub(crate) fn get_all_snapshots(&self) -> Vec<u64> {
-		let snapshots = self.snapshots.read();
-		snapshots.iter().copied().collect()
+		self.snapshots.iter().map(|entry| *entry).collect()
 	}
 }
 
@@ -1820,5 +1832,59 @@ impl Drop for HistoryIterator<'_> {
 				log::warn!("Failed to decrement VLog iterator count: {e}");
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::SnapshotTracker;
+
+	#[test]
+	fn test_snapshot_tracker_ordering() {
+		let tracker = SnapshotTracker::new();
+
+		// Insert snapshots in non-sorted order
+		tracker.register(100);
+		tracker.register(50);
+		tracker.register(200);
+		tracker.register(75);
+		tracker.register(150);
+
+		// Verify get_all_snapshots returns sorted order
+		let snapshots = tracker.get_all_snapshots();
+		assert_eq!(snapshots, vec![50, 75, 100, 150, 200]);
+
+		// Unregister some and verify order is maintained
+		tracker.unregister(100);
+		tracker.unregister(50);
+
+		let snapshots = tracker.get_all_snapshots();
+		assert_eq!(snapshots, vec![75, 150, 200]);
+
+		// Add more and verify
+		tracker.register(25);
+		tracker.register(300);
+
+		let snapshots = tracker.get_all_snapshots();
+		assert_eq!(snapshots, vec![25, 75, 150, 200, 300]);
+	}
+
+	#[test]
+	fn test_snapshot_tracker_empty() {
+		let tracker = SnapshotTracker::new();
+		assert!(tracker.get_all_snapshots().is_empty());
+	}
+
+	#[test]
+	fn test_snapshot_tracker_clone_shares_state() {
+		let tracker1 = SnapshotTracker::new();
+		tracker1.register(100);
+
+		let tracker2 = tracker1.clone();
+		tracker2.register(50);
+
+		// Both should see the same snapshots
+		assert_eq!(tracker1.get_all_snapshots(), vec![50, 100]);
+		assert_eq!(tracker2.get_all_snapshots(), vec![50, 100]);
 	}
 }
