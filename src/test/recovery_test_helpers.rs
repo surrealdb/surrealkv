@@ -9,7 +9,7 @@ use crate::batch::Batch;
 use crate::memtable::MemTable;
 use crate::wal::manager::Wal;
 use crate::wal::Options;
-use crate::{InternalIterator, Tree};
+use crate::{LSMIterator, Tree};
 
 pub struct RecoveryTestHelper;
 

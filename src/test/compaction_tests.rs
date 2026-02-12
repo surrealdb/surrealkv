@@ -18,7 +18,7 @@ use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
 use crate::vlog::ValueLocation;
-use crate::{CompressionType, InternalIterator, InternalKey, InternalKeyKind, Key, Options, Value};
+use crate::{CompressionType, InternalKey, InternalKeyKind, Key, LSMIterator, Options, Value};
 
 /// Test environment setup helpers
 struct TestEnv {
@@ -1893,8 +1893,8 @@ fn test_tombstone_propagation_journey() {
 
 	// Test non-bottom level compaction
 	let iterators: Vec<_> = vec![
-		Box::new(tombstone_table.iter(None).unwrap()) as Box<dyn InternalIterator>,
-		Box::new(value_table.iter(None).unwrap()) as Box<dyn InternalIterator>,
+		Box::new(tombstone_table.iter(None).unwrap()) as Box<dyn LSMIterator>,
+		Box::new(value_table.iter(None).unwrap()) as Box<dyn LSMIterator>,
 	];
 	let mut comp_iter_non_bottom = CompactionIterator::new(
 		iterators,
@@ -1916,8 +1916,8 @@ fn test_tombstone_propagation_journey() {
 
 	// Test bottom level compaction
 	let iterators: Vec<_> = vec![
-		Box::new(tombstone_table.iter(None).unwrap()) as Box<dyn InternalIterator>,
-		Box::new(value_table.iter(None).unwrap()) as Box<dyn InternalIterator>,
+		Box::new(tombstone_table.iter(None).unwrap()) as Box<dyn LSMIterator>,
+		Box::new(value_table.iter(None).unwrap()) as Box<dyn LSMIterator>,
 	];
 	let mut comp_iter_bottom = CompactionIterator::new(
 		iterators,

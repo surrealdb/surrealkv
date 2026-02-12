@@ -5,7 +5,7 @@ use test_log::test;
 
 use crate::batch::Batch;
 use crate::memtable::MemTable;
-use crate::{InternalIterator, InternalKeyKind, Value};
+use crate::{InternalKeyKind, LSMIterator, Value};
 
 fn assert_value(encoded_value: &Value, expected_value: &[u8]) {
 	// Skip the tag byte (first byte) and compare the actual value content

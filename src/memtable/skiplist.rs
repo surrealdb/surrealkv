@@ -24,7 +24,7 @@ use rand::Rng;
 
 use crate::error::Result as CrateResult;
 use crate::memtable::arena::Arena;
-use crate::{InternalIterator, InternalKey, InternalKeyRef};
+use crate::{InternalKey, InternalKeyRef, LSMIterator};
 
 const MAX_HEIGHT: usize = 20;
 const P_VALUE: f64 = 1.0 / std::f64::consts::E; // ~0.368
@@ -850,10 +850,10 @@ impl<'a> SkiplistIterator<'a> {
 }
 
 // ============================================================================
-// InternalIterator Implementation
+// LSMIterator Implementation
 // ============================================================================
 
-impl InternalIterator for SkiplistIterator<'_> {
+impl LSMIterator for SkiplistIterator<'_> {
 	/// Seek to first entry >= target.
 	/// Target is an encoded internal key, we extract user_key for comparison.
 	fn seek(&mut self, target: &[u8]) -> CrateResult<bool> {

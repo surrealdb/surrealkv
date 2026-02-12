@@ -8,19 +8,19 @@ use parking_lot::RwLockReadGuard;
 
 use crate::bplustree::tree::{BPlusTreeIterator, DiskBPlusTree};
 use crate::error::{Error, Result};
-use crate::iter::BoxedInternalIterator;
+use crate::iter::BoxedLSMIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::{
 	BytewiseComparator,
 	Comparator,
-	InternalIterator,
 	InternalKey,
 	InternalKeyComparator,
 	InternalKeyKind,
 	InternalKeyRange,
 	InternalKeyRef,
+	LSMIterator,
 	TimestampComparator,
 	Value,
 };
@@ -234,7 +234,7 @@ impl Snapshot {
 	}
 
 	/// Creates an iterator for a range scan within the snapshot
-	/// Returns a SnapshotIterator that implements InternalIterator
+	/// Returns a SnapshotIterator that implements LSMIterator
 	pub(crate) fn range(
 		&self,
 		lower: Option<&[u8]>,
@@ -397,7 +397,7 @@ pub(crate) struct KMergeIterator<'iter> {
 	///
 	/// IMPORTANT: Due to self-referential structs, this must be defined before
 	/// `iter_state` in order to ensure it is dropped before `iter_state`.
-	iterators: Vec<BoxedInternalIterator<'iter>>,
+	iterators: Vec<BoxedLSMIterator<'iter>>,
 
 	// Owned state
 	#[allow(dead_code)]
@@ -453,7 +453,7 @@ impl<'a> KMergeIterator<'a> {
 
 		// Pre-allocate capacity for the iterators.
 		// 1 active memtable + immutable memtables + level tables.
-		let mut iterators: Vec<BoxedInternalIterator<'a>> =
+		let mut iterators: Vec<BoxedLSMIterator<'a>> =
 			Vec::with_capacity(1 + boxed_state.immutable.len() + boxed_state.levels.total_tables());
 
 		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
@@ -473,12 +473,12 @@ impl<'a> KMergeIterator<'a> {
 
 		// Active memtable
 		let active_iter = state_ref.active.range(lower, upper);
-		iterators.push(Box::new(active_iter) as BoxedInternalIterator<'a>);
+		iterators.push(Box::new(active_iter) as BoxedLSMIterator<'a>);
 
 		// Immutable memtables
 		for memtable in &state_ref.immutable {
 			let iter = memtable.range(lower, upper);
-			iterators.push(Box::new(iter) as BoxedInternalIterator<'a>);
+			iterators.push(Box::new(iter) as BoxedLSMIterator<'a>);
 		}
 
 		// Tables - these have native seek support
@@ -507,7 +507,7 @@ impl<'a> KMergeIterator<'a> {
 					if let Ok(table_iter) =
 						table.iter_with_comparator(Some((*query_range).clone()), Arc::clone(&cmp))
 					{
-						iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
+						iterators.push(Box::new(table_iter) as BoxedLSMIterator<'a>);
 					}
 				}
 			} else {
@@ -531,7 +531,7 @@ impl<'a> KMergeIterator<'a> {
 					if let Ok(table_iter) =
 						table.iter_with_comparator(Some((*query_range).clone()), Arc::clone(&cmp))
 					{
-						iterators.push(Box::new(table_iter) as BoxedInternalIterator<'a>);
+						iterators.push(Box::new(table_iter) as BoxedLSMIterator<'a>);
 					}
 				}
 			}
@@ -667,7 +667,7 @@ impl<'a> KMergeIterator<'a> {
 	}
 }
 
-impl InternalIterator for KMergeIterator<'_> {
+impl LSMIterator for KMergeIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.active_count = 0;
@@ -928,7 +928,7 @@ impl SnapshotIterator<'_> {
 	}
 }
 
-impl InternalIterator for SnapshotIterator<'_> {
+impl LSMIterator for SnapshotIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.last_key_fwd.clear();
@@ -1067,7 +1067,7 @@ impl<'a> BPlusTreeIteratorWithGuard<'a> {
 	}
 }
 
-impl InternalIterator for BPlusTreeIteratorWithGuard<'_> {
+impl LSMIterator for BPlusTreeIteratorWithGuard<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.iter.seek(target)
 	}
@@ -1636,7 +1636,7 @@ impl<'a> HistoryIterator<'a> {
 	}
 }
 
-impl InternalIterator for HistoryIterator<'_> {
+impl LSMIterator for HistoryIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.reset_all_state();

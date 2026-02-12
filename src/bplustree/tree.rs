@@ -10,7 +10,7 @@ use quick_cache::sync::Cache;
 use quick_cache::Weighter;
 
 use crate::vfs::File as VfsFile;
-use crate::{Comparator, InternalIterator, InternalKeyRef};
+use crate::{Comparator, InternalKeyRef, LSMIterator};
 
 // These are type aliases for convenience
 pub type DiskBPlusTree = BPlusTree<File>;
@@ -3159,7 +3159,7 @@ impl<F: VfsFile> Iterator for RangeScanIterator<'_, F> {
 	}
 }
 
-/// Cursor-based iterator over a BPlusTree that implements InternalIterator.
+/// Cursor-based iterator over a BPlusTree that implements LSMIterator.
 ///
 /// The BPlusTree stores encoded internal keys directly (when used as versioned index),
 /// so this iterator provides zero-copy access to those keys and values.
@@ -3318,7 +3318,7 @@ impl<'a, F: VfsFile> BPlusTreeIterator<'a, F> {
 	}
 }
 
-impl<F: VfsFile> InternalIterator for BPlusTreeIterator<'_, F> {
+impl<F: VfsFile> LSMIterator for BPlusTreeIterator<'_, F> {
 	/// Seek to first key >= target.
 	/// Target is an encoded internal key.
 	fn seek(&mut self, target: &[u8]) -> crate::error::Result<bool> {
@@ -3479,7 +3479,7 @@ impl<F: VfsFile> InternalIterator for BPlusTreeIterator<'_, F> {
 }
 
 impl<F: VfsFile> BPlusTree<F> {
-	/// Creates a new cursor-based iterator implementing InternalIterator.
+	/// Creates a new cursor-based iterator implementing LSMIterator.
 	/// The iterator starts unpositioned; call seek(), seek_first(), or
 	/// seek_last() to position it.
 	pub fn internal_iterator(&self) -> BPlusTreeIterator<'_, F> {

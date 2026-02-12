@@ -997,7 +997,7 @@ impl std::fmt::Debug for InternalKeyRef<'_> {
 ///     iter.next()?;
 /// }
 /// ```
-pub trait InternalIterator {
+pub trait LSMIterator {
 	/// Seek to first key >= target. Returns Ok(true) if valid.
 	/// Target is an encoded internal key. Use `encode_seek_key()` to encode a user key.
 	fn seek(&mut self, target: &[u8]) -> Result<bool>;
@@ -1044,7 +1044,7 @@ pub trait InternalIterator {
 	}
 }
 
-/// Encodes a user key for use with `InternalIterator::seek()`.
+/// Encodes a user key for use with `LSMIterator::seek()`.
 ///
 /// The encoded key uses MAX trailer and timestamp values to position at the
 /// FIRST (newest) version of the target user key during iteration.

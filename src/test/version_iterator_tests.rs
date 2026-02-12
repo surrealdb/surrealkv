@@ -7,7 +7,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::transaction::{HistoryOptions, Mode};
-use crate::{InternalIterator, Key, Options, Result, TreeBuilder, Value};
+use crate::{Key, LSMIterator, Options, Result, TreeBuilder, Value};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -44,7 +44,7 @@ fn create_store_no_versioning() -> (crate::lsm::Tree, TempDir) {
 }
 
 /// Collects all entries from a history iterator
-fn collect_history_all(iter: &mut impl InternalIterator) -> Result<Vec<(Key, Value, u64, bool)>> {
+fn collect_history_all(iter: &mut impl LSMIterator) -> Result<Vec<(Key, Value, u64, bool)>> {
 	iter.seek_first()?;
 	let mut result = Vec::new();
 	while iter.valid() {
@@ -63,9 +63,7 @@ fn collect_history_all(iter: &mut impl InternalIterator) -> Result<Vec<(Key, Val
 }
 
 /// Collects all entries from a history iterator in reverse
-fn collect_history_reverse(
-	iter: &mut impl InternalIterator,
-) -> Result<Vec<(Key, Value, u64, bool)>> {
+fn collect_history_reverse(iter: &mut impl LSMIterator) -> Result<Vec<(Key, Value, u64, bool)>> {
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
@@ -792,7 +790,7 @@ async fn test_history_entry_method() {
 	iter.seek_first().unwrap();
 	assert!(iter.valid());
 
-	// Use InternalIterator API
+	// Use LSMIterator API
 	let key_ref = iter.key();
 	let is_tombstone = key_ref.is_tombstone();
 	assert_eq!(key_ref.user_key(), b"key1");

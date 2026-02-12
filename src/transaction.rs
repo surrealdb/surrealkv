@@ -7,15 +7,7 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{HistoryIterator, MergeDirection, Snapshot, SnapshotIterator};
-use crate::{
-	InternalIterator,
-	InternalKey,
-	InternalKeyKind,
-	InternalKeyRef,
-	IntoBytes,
-	Key,
-	Value,
-};
+use crate::{InternalKey, InternalKeyKind, InternalKeyRef, IntoBytes, Key, LSMIterator, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can
 /// have in an MVCC (Multi-Version Concurrency Control) system.
@@ -522,7 +514,7 @@ impl Transaction {
 	///
 	/// Gets keys and values in a range, at the current timestamp.
 	///
-	/// Returns a cursor-based iterator implementing `InternalIterator` with explicit
+	/// Returns a cursor-based iterator implementing `LSMIterator` with explicit
 	/// seek/next/prev methods. Use `seek_first()` to position at the first key,
 	/// then `next()` to iterate.
 	///
@@ -545,7 +537,7 @@ impl Transaction {
 	/// // Or seek to a specific key:
 	/// iter.seek(&encode_seek_key(b"foo"))?;
 	/// ```
-	pub fn range<K>(&self, start: K, end: K) -> Result<impl InternalIterator + '_>
+	pub fn range<K>(&self, start: K, end: K) -> Result<impl LSMIterator + '_>
 	where
 		K: IntoBytes,
 	{
@@ -556,12 +548,12 @@ impl Transaction {
 
 	/// Gets keys and values in a range, with custom read options.
 	///
-	/// Returns a cursor-based iterator implementing `InternalIterator` with explicit
+	/// Returns a cursor-based iterator implementing `LSMIterator` with explicit
 	/// seek/next/prev methods.
 	///
 	/// The iterator iterates over all keys and values in the
 	/// range, inclusive of the start key, but not the end key.
-	pub fn range_with_options(&self, options: &ReadOptions) -> Result<impl InternalIterator + '_> {
+	pub fn range_with_options(&self, options: &ReadOptions) -> Result<impl LSMIterator + '_> {
 		let start_key = options.lower_bound.clone().unwrap_or_default();
 		let end_key = options.upper_bound.clone().unwrap_or_default();
 		TransactionRangeIterator::new_with_options(self, Arc::clone(&self.core), start_key, end_key)
@@ -569,7 +561,7 @@ impl Transaction {
 
 	/// Returns a unified history iterator over ALL versions of keys in the range.
 	///
-	/// Returns an iterator implementing `InternalIterator`, providing a unified
+	/// Returns an iterator implementing `LSMIterator`, providing a unified
 	/// streaming API regardless of whether the B+tree index is enabled.
 	///
 	/// - If B+tree index is enabled: Uses streaming B+tree iteration
@@ -591,7 +583,7 @@ impl Transaction {
 	///     iter.next()?;
 	/// }
 	/// ```
-	pub fn history<K>(&self, start: K, end: K) -> Result<impl InternalIterator + '_>
+	pub fn history<K>(&self, start: K, end: K) -> Result<impl LSMIterator + '_>
 	where
 		K: IntoBytes,
 	{
@@ -612,7 +604,7 @@ impl Transaction {
 		start: K,
 		end: K,
 		opts: &HistoryOptions,
-	) -> Result<impl InternalIterator + '_>
+	) -> Result<impl LSMIterator + '_>
 	where
 		K: IntoBytes,
 	{
@@ -957,9 +949,9 @@ enum CurrentSource {
 }
 
 /// An iterator that performs a merging scan over a transaction's snapshot and
-/// write set. Implements InternalIterator for zero-copy iteration.
+/// write set. Implements LSMIterator for zero-copy iteration.
 pub(crate) struct TransactionRangeIterator<'a> {
-	/// Snapshot iterator (implements InternalIterator)
+	/// Snapshot iterator (implements LSMIterator)
 	snapshot_iter: SnapshotIterator<'a>,
 
 	/// Core for resolving VLog references to actual values.
@@ -1227,7 +1219,7 @@ impl<'a> TransactionRangeIterator<'a> {
 	}
 }
 
-impl InternalIterator for TransactionRangeIterator<'_> {
+impl LSMIterator for TransactionRangeIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.initialized = true;
@@ -1509,7 +1501,7 @@ pub(crate) struct TransactionHistoryIterator<'a> {
 	current_source: CurrentSource,
 
 	/// Buffer for encoding write-set key in internal format.
-	/// Used for `InternalIterator::key()` which returns encoded keys.
+	/// Used for `LSMIterator::key()` which returns encoded keys.
 	ws_encoded_key_buf: Vec<u8>,
 
 	/// Current iteration direction.
@@ -1660,7 +1652,7 @@ impl<'a> TransactionHistoryIterator<'a> {
 
 	/// Populate the encoded key buffer for the current write-set entry.
 	///
-	/// This is needed for `InternalIterator::key()` which must return keys
+	/// This is needed for `LSMIterator::key()` which must return keys
 	/// in the internal encoded format: `[user_key | trailer | timestamp]`
 	///
 	/// The trailer encodes sequence number and entry kind for LSM ordering.
@@ -2064,13 +2056,13 @@ impl<'a> TransactionHistoryIterator<'a> {
 }
 
 // =============================================================================
-// InternalIterator implementation
+// LSMIterator implementation
 // =============================================================================
 //
 // This allows TransactionHistoryIterator to be used in places that expect
 // the internal LSM iterator interface with encoded keys.
 
-impl InternalIterator for TransactionHistoryIterator<'_> {
+impl LSMIterator for TransactionHistoryIterator<'_> {
 	/// Seek to encoded target key.
 	///
 	/// The target is in internal format: `[user_key | trailer | timestamp]`.

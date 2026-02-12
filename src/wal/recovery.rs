@@ -378,7 +378,7 @@ mod tests {
 	use super::*;
 	use crate::wal::manager::Wal;
 	use crate::wal::Options;
-	use crate::{InternalIterator, WalRecoveryMode};
+	use crate::{LSMIterator, WalRecoveryMode};
 
 	#[test]
 	fn test_replay_wal_sequence_number_tracking() {

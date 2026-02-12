@@ -90,7 +90,7 @@ use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::error::SSTableError;
-use crate::{Comparator, InternalIterator, InternalKey, InternalKeyRef};
+use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator};
 
 /// Raw block data as a byte vector.
 pub(crate) type BlockData = Vec<u8>;
@@ -749,7 +749,7 @@ impl BlockIterator {
 // INTERNAL ITERATOR IMPLEMENTATION
 // =============================================================================
 
-impl InternalIterator for BlockIterator {
+impl LSMIterator for BlockIterator {
 	/// Seeks to the first entry >= target.
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.seek_internal(target)?;

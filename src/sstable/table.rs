@@ -88,11 +88,11 @@ use crate::{
 	Comparator,
 	CompressionType,
 	FilterPolicy,
-	InternalIterator,
 	InternalKey,
 	InternalKeyKind,
 	InternalKeyRange,
 	InternalKeyRef,
+	LSMIterator,
 	Options,
 	Value,
 	INTERNAL_KEY_SEQ_NUM_MAX,
@@ -1771,7 +1771,7 @@ impl<'a> TableIterator<'a> {
 	}
 }
 
-impl InternalIterator for TableIterator<'_> {
+impl LSMIterator for TableIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.exhausted = false;
 		self.seek_internal(target)?;

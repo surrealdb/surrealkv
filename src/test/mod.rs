@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use crate::snapshot::SnapshotIterator;
 use crate::transaction::HistoryOptions;
 use crate::vlog::ValueLocation;
-use crate::{InternalIterator, InternalKey, Key, Result, Value};
+use crate::{InternalKey, Key, LSMIterator, Result, Value};
 
 #[cfg(test)]
 pub mod batch_tests;
@@ -50,9 +50,9 @@ pub mod vlog_tests;
 #[cfg(test)]
 pub mod wal_tests;
 
-/// Collects all (key, value) pairs from an InternalIterator into a Vec
+/// Collects all (key, value) pairs from an LSMIterator into a Vec
 /// Assumes iterator is already positioned (e.g., after seek_first or seek)
-fn collect_iter(iter: &mut impl InternalIterator) -> Vec<(InternalKey, Vec<u8>)> {
+fn collect_iter(iter: &mut impl LSMIterator) -> Vec<(InternalKey, Vec<u8>)> {
 	let mut result = Vec::new();
 	while iter.valid() {
 		result.push((iter.key().to_owned(), iter.value().unwrap().to_vec()));
@@ -64,13 +64,13 @@ fn collect_iter(iter: &mut impl InternalIterator) -> Vec<(InternalKey, Vec<u8>)>
 }
 
 /// Collects all items from start (seek_first) to end
-fn collect_all(iter: &mut impl InternalIterator) -> Result<Vec<(InternalKey, Vec<u8>)>> {
+fn collect_all(iter: &mut impl LSMIterator) -> Result<Vec<(InternalKey, Vec<u8>)>> {
 	iter.seek_first()?;
 	Ok(collect_iter(iter))
 }
 
 /// Counts entries in an iterator
-fn count_iter(iter: &mut impl InternalIterator) -> Result<usize> {
+fn count_iter(iter: &mut impl LSMIterator) -> Result<usize> {
 	iter.seek_first()?;
 	let mut count = 0;
 	while iter.valid() {
@@ -83,7 +83,7 @@ fn count_iter(iter: &mut impl InternalIterator) -> Result<usize> {
 }
 
 /// Collects all entries from a TransactionIterator
-fn collect_transaction_iter(iter: &mut impl InternalIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+fn collect_transaction_iter(iter: &mut impl LSMIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 	let mut result = Vec::new();
 	while iter.valid() {
 		let key = iter.key().user_key().to_vec();
@@ -95,15 +95,13 @@ fn collect_transaction_iter(iter: &mut impl InternalIterator) -> Result<Vec<(Vec
 }
 
 /// Collects all entries from a TransactionIterator starting from seek_first()
-fn collect_transaction_all(iter: &mut impl InternalIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+fn collect_transaction_all(iter: &mut impl LSMIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 	iter.seek_first()?;
 	collect_transaction_iter(iter)
 }
 
 /// Collects all entries from a TransactionIterator in reverse order starting from seek_last()
-fn collect_transaction_reverse(
-	iter: &mut impl InternalIterator,
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+fn collect_transaction_reverse(iter: &mut impl LSMIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
@@ -157,9 +155,7 @@ type KeyVersionsMap = HashMap<Key, Vec<(Vec<u8>, u64, bool)>>;
 /// Collects all entries from a history iterator
 /// Returns a vector of (key, value, timestamp, is_tombstone) tuples
 #[allow(dead_code)]
-fn collect_history_all(
-	iter: &mut impl InternalIterator,
-) -> crate::Result<Vec<(Key, Value, u64, bool)>> {
+fn collect_history_all(iter: &mut impl LSMIterator) -> crate::Result<Vec<(Key, Value, u64, bool)>> {
 	iter.seek_first()?;
 	let mut result = Vec::new();
 	while iter.valid() {
@@ -185,7 +181,7 @@ fn collect_history_all(
 /// soft-deleted keys will incorrectly appear in the results.
 #[allow(dead_code)]
 fn point_in_time_from_history(
-	iter: &mut impl InternalIterator,
+	iter: &mut impl LSMIterator,
 	timestamp: u64,
 ) -> crate::Result<Vec<(Key, Value)>> {
 	use std::collections::BTreeMap;
