@@ -541,7 +541,7 @@ impl<'a> MergingIterator<'a> {
 	}
 
 	#[inline]
-	pub fn current_value(&self) -> crate::error::Result<&[u8]> {
+	pub fn current_value(&self) -> Result<&[u8]> {
 		debug_assert!(self.is_valid());
 		let idx = match self.direction {
 			Direction::Forward => self.min_heap.peek().unwrap(),
@@ -618,7 +618,7 @@ impl LSMIterator for MergingIterator<'_> {
 		self.current_key()
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		self.current_value()
 	}
 }

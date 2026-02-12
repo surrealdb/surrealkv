@@ -313,7 +313,7 @@ impl LSMIterator for MemTableIterator<'_> {
 		self.iter.key()
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		self.iter.value()
 	}
 }

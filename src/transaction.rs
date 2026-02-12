@@ -7,7 +7,7 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{HistoryIterator, MergeDirection, Snapshot, SnapshotIterator};
-use crate::{InternalKey, InternalKeyKind, InternalKeyRef, IntoBytes, Key, LSMIterator, Value};
+use crate::{InternalKeyKind, InternalKeyRef, IntoBytes, Key, LSMIterator, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can
 /// have in an MVCC (Multi-Version Concurrency Control) system.
@@ -523,8 +523,6 @@ impl Transaction {
 	///
 	/// # Example
 	/// ```ignore
-	/// use surrealkv::encode_seek_key;
-	///
 	/// let mut iter = tx.range(b"a", b"z")?;
 	/// iter.seek_first()?;
 	/// while iter.valid() {
@@ -535,7 +533,7 @@ impl Transaction {
 	/// }
 	///
 	/// // Or seek to a specific key:
-	/// iter.seek(&encode_seek_key(b"foo"))?;
+	/// iter.seek(b"foo")?;  // Position at first version of "foo"
 	/// ```
 	pub fn range<K>(&self, start: K, end: K) -> Result<impl LSMIterator + '_>
 	where
@@ -1224,13 +1222,16 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 		self.direction = MergeDirection::Forward;
 		self.initialized = true;
 
-		// Seek snapshot
-		self.snapshot_iter.seek(target)?;
+		// Encode user key with MAX trailer/timestamp for >= seek
+		// This positions at the FIRST (newest) version of the target key
+		let mut encoded = target.to_vec();
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
+		self.snapshot_iter.seek(&encoded)?;
 
-		// Reset write-set to full range first, then position via binary search
+		// Position write-set using raw user key (binary search)
 		self.reset_ws_positions();
-		let user_key = InternalKey::user_key_from_encoded(target);
-		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < user_key);
+		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < target);
 
 		self.position_to_min()
 	}
@@ -1335,22 +1336,11 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 
 	fn value_owned(&self) -> Result<Value> {
 		debug_assert!(self.valid());
-		match self.current_source {
-			CurrentSource::WriteSet => {
-				// Write-set values are stored raw, just clone
-				let entry = if self.direction == MergeDirection::Forward {
-					self.write_set_entries[self.ws_pos].1
-				} else {
-					self.write_set_entries[self.ws_pos_back - 1].1
-				};
-				Ok(entry.value.clone().unwrap_or_default())
-			}
-			CurrentSource::Snapshot => {
-				// Resolve VLog pointer for snapshot values
-				let raw = self.snapshot_iter.value()?;
-				self.core.resolve_value(raw)
-			}
-			CurrentSource::None => panic!("value_owned() called on invalid iterator"),
+		let raw = self.value()?;
+		if self.current_source == CurrentSource::WriteSet {
+			Ok(raw.to_vec())
+		} else {
+			self.core.resolve_value(raw)
 		}
 	}
 }
@@ -2065,18 +2055,22 @@ impl<'a> TransactionHistoryIterator<'a> {
 impl LSMIterator for TransactionHistoryIterator<'_> {
 	/// Seek to encoded target key.
 	///
-	/// The target is in internal format: `[user_key | trailer | timestamp]`.
-	/// Extracts the user key portion for write-set positioning.
+	/// The target is a raw user key. It will be encoded internally with
+	/// MAX trailer/timestamp to position at the first (newest) version.
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.initialized = true;
 
-		self.inner.seek(target)?;
+		// Encode user key with MAX trailer/timestamp for >= seek
+		// This positions at the FIRST (newest) version of the target key
+		let mut encoded = target.to_vec();
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
+		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
+		self.inner.seek(&encoded)?;
 
-		// Reset write-set to full range first, then position via binary search
+		// Position write-set using raw user key (binary search)
 		self.reset_ws_positions();
-		let user_key = InternalKey::user_key_from_encoded(target);
-		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < user_key);
+		self.ws_pos = self.write_set_entries.partition_point(|(k, _)| k.as_slice() < target);
 
 		self.position_to_min()
 	}
@@ -2136,22 +2130,11 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 
 	fn value_owned(&self) -> Result<Value> {
 		debug_assert!(self.valid());
-		match self.current_source {
-			CurrentSource::WriteSet => {
-				// Write-set values are stored raw, just clone
-				let entry = if self.direction == MergeDirection::Forward {
-					self.write_set_entries[self.ws_pos].1
-				} else {
-					self.write_set_entries[self.ws_pos_back - 1].1
-				};
-				Ok(entry.value.clone().unwrap_or_default())
-			}
-			CurrentSource::Snapshot => {
-				// Resolve VLog pointer for snapshot values
-				let raw = self.inner.value()?;
-				self.core.resolve_value(raw)
-			}
-			CurrentSource::None => panic!("value_owned() called on invalid iterator"),
+		let raw = self.value()?;
+		if self.current_source == CurrentSource::WriteSet {
+			Ok(raw.to_vec())
+		} else {
+			self.core.resolve_value(raw)
 		}
 	}
 }
