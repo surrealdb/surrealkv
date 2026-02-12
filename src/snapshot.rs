@@ -105,7 +105,6 @@ pub(crate) struct IterState {
 /// Snapshots provide consistent reads by fixing a sequence number at creation
 /// time. All reads through the snapshot only see data with sequence numbers
 /// less than or equal to the snapshot's sequence number.
-#[derive(Clone)]
 pub(crate) struct Snapshot {
 	/// Reference to the LSM tree core
 	core: Arc<Core>,
@@ -121,6 +120,14 @@ impl Snapshot {
 		// Register this snapshot's sequence number so compaction knows
 		// to preserve versions visible to this snapshot
 		core.snapshot_tracker.register(seq_num);
+
+		// Protect VLog files from deletion while this snapshot exists.
+		// This prevents VLog GC from deleting files that this snapshot
+		// may need to read from.
+		if let Some(ref vlog) = core.vlog {
+			vlog.incr_iterator_count();
+		}
+
 		Self {
 			core,
 			seq_num,
@@ -380,6 +387,13 @@ impl Drop for Snapshot {
 		// Unregister this snapshot's sequence number so compaction can
 		// clean up versions no longer visible to any snapshot
 		self.core.snapshot_tracker.unregister(self.seq_num);
+
+		// Release VLog protection - may trigger pending file deletions
+		// if this was the last snapshot holding VLog files open
+		if let Some(ref vlog) = self.core.vlog {
+			// Ignore errors during drop - we can't propagate them
+			let _ = vlog.decr_iterator_count();
+		}
 	}
 }
 
