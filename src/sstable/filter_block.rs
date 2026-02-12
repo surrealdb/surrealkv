@@ -10,7 +10,7 @@ const FILTER_META_LENGTH: usize = 5; // 4bytes filter offsets length + 1bytes ba
 
 // A writer for writing filter blocks, which are used to quickly test if a key
 // is present in a set of keys.
-pub(crate) struct FilterBlockWriter {
+pub struct FilterBlockWriter {
 	policy: Arc<dyn FilterPolicy>, // The filter policy used to generate filters.
 	keys: Vec<Vec<u8>>,            // A collection of keys to be added to the filter.
 	filters: Vec<u8>,              // The generated filters.
@@ -19,7 +19,7 @@ pub(crate) struct FilterBlockWriter {
 
 impl FilterBlockWriter {
 	// Constructs a new `FilterBlockWriter` with a given filter policy.
-	pub(crate) fn new(policy: Arc<dyn FilterPolicy>) -> Self {
+	pub fn new(policy: Arc<dyn FilterPolicy>) -> Self {
 		Self {
 			policy,
 			keys: vec![],
@@ -29,14 +29,14 @@ impl FilterBlockWriter {
 	}
 
 	// Adds a key to the list of keys that will be included in the next filter.
-	pub(crate) fn add_key(&mut self, key: &[u8]) {
+	pub fn add_key(&mut self, key: &[u8]) {
 		let key = Vec::from(key);
 		self.keys.push(key);
 	}
 
 	// Starts a new block at a given offset. This may trigger the generation of a
 	// new filter if necessary.
-	pub(crate) fn start_block(&mut self, block_offset: usize) {
+	pub fn start_block(&mut self, block_offset: usize) {
 		let filter_index = block_offset / FILTER_BASE as usize; // Calculate the index of the filter for the current block.
 		let filters_len = self.filter_offsets.len();
 		assert!(filter_index >= filters_len); // Ensure the filter index is not out of bounds.
@@ -61,13 +61,13 @@ impl FilterBlockWriter {
 	}
 
 	// Returns the name of the filter policy.
-	pub(crate) fn filter_name(&self) -> &str {
+	pub fn filter_name(&self) -> &str {
 		self.policy.name()
 	}
 
 	// Finalizes the filter block, returning the complete set of filters and their
 	// offsets.
-	pub(crate) fn finish(mut self) -> Vec<u8> {
+	pub fn finish(mut self) -> Vec<u8> {
 		if !self.keys.is_empty() {
 			self.generate_filter(); // Generate a final filter for any remaining keys.
 		};
@@ -93,7 +93,7 @@ impl FilterBlockWriter {
 }
 
 #[derive(Clone)]
-pub(crate) struct FilterBlockReader {
+pub struct FilterBlockReader {
 	policy: Arc<dyn FilterPolicy>, // The filter policy used for checking keys against filters.
 	data: Vec<u8>,                 // The entire filter block data.
 	filter_offsets: Vec<u32>,      // Offsets for each filter within the `data`.
@@ -103,7 +103,7 @@ pub(crate) struct FilterBlockReader {
 impl FilterBlockReader {
 	// Constructs a new `FilterBlockReader` from the given filter block data and
 	// filter policy.
-	pub(crate) fn new(data: Vec<u8>, policy: Arc<dyn FilterPolicy>) -> Self {
+	pub fn new(data: Vec<u8>, policy: Arc<dyn FilterPolicy>) -> Self {
 		let n = data.len();
 		let base_lg = data[n - 1] as u32; // The last byte is the base log2 value.
 		let num_offset = u32::decode_fixed(&data[n - FILTER_META_LENGTH..n - 1]).unwrap() as usize; // The offsets start 5 bytes from the end.
@@ -132,7 +132,7 @@ impl FilterBlockReader {
 
 	// Checks if a key may be present in the filter block, given a specific block
 	// offset.
-	pub(crate) fn may_contain(&self, key: &[u8], block_offset: usize) -> bool {
+	pub fn may_contain(&self, key: &[u8], block_offset: usize) -> bool {
 		// Directly use the provided block offset as the block index.
 		let block_index = block_offset >> self.base_lg;
 

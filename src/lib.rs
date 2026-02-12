@@ -5,7 +5,7 @@ mod checkpoint;
 mod clock;
 mod commit;
 mod compaction;
-mod comparator;
+pub mod comparator;
 mod compression;
 mod discard;
 mod error;
@@ -15,10 +15,10 @@ mod lockfile;
 mod lsm;
 mod memtable;
 mod snapshot;
-mod sstable;
+pub mod sstable;
 mod task;
 mod transaction;
-mod vfs;
+pub mod vfs;
 mod vlog;
 mod wal;
 
@@ -159,7 +159,7 @@ pub struct Options {
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
-	pub(crate) internal_comparator: Arc<dyn Comparator>,
+	pub internal_comparator: Arc<dyn Comparator>,
 	pub compression_per_level: Vec<CompressionType>,
 	pub(crate) block_cache: Arc<cache::BlockCache>,
 	pub path: PathBuf,
@@ -189,7 +189,7 @@ pub struct Options {
 	/// Default: 0 (no retention limit)
 	pub versioned_history_retention_ns: u64,
 	/// Logical clock for time-based operations
-	pub(crate) clock: Arc<dyn LogicalClock>,
+	pub clock: Arc<dyn LogicalClock>,
 
 	// Shutdown configuration
 	/// If true, flush active memtable to SSTable during shutdown.
@@ -476,60 +476,60 @@ impl Options {
 
 	/// Returns the path for a manifest file with the given ID
 	/// Format: {path}/manifest/{id:020}.manifest
-	pub(crate) fn manifest_file_path(&self, id: u64) -> PathBuf {
+	pub fn manifest_file_path(&self, id: u64) -> PathBuf {
 		self.manifest_dir().join(format!("{id:020}.manifest"))
 	}
 
 	/// Returns the path for an `SSTable` file with the given ID
 	/// Format: {path}/sstables/{id:020}.sst
-	pub(crate) fn sstable_file_path(&self, id: u64) -> PathBuf {
+	pub fn sstable_file_path(&self, id: u64) -> PathBuf {
 		self.sstable_dir().join(format!("{id:020}.sst"))
 	}
 
 	/// Returns the path for a `VLog` file with the given ID
 	/// Format: {path}/vlog/{id:020}.vlog
-	pub(crate) fn vlog_file_path(&self, id: u64) -> PathBuf {
+	pub fn vlog_file_path(&self, id: u64) -> PathBuf {
 		self.vlog_dir().join(format!("{id:020}.vlog"))
 	}
 
 	/// Returns the directory path for WAL files
-	pub(crate) fn wal_dir(&self) -> PathBuf {
+	pub fn wal_dir(&self) -> PathBuf {
 		self.path.join("wal")
 	}
 
 	/// Returns the directory path for `SSTable` files
-	pub(crate) fn sstable_dir(&self) -> PathBuf {
+	pub fn sstable_dir(&self) -> PathBuf {
 		self.path.join("sstables")
 	}
 
 	/// Returns the directory path for `VLog` files
-	pub(crate) fn vlog_dir(&self) -> PathBuf {
+	pub fn vlog_dir(&self) -> PathBuf {
 		self.path.join("vlog")
 	}
 
 	/// Returns the directory path for manifest files
-	pub(crate) fn manifest_dir(&self) -> PathBuf {
+	pub fn manifest_dir(&self) -> PathBuf {
 		self.path.join("manifest")
 	}
 
 	/// Returns the directory path for discard stats files
-	pub(crate) fn discard_stats_dir(&self) -> PathBuf {
+	pub fn discard_stats_dir(&self) -> PathBuf {
 		self.path.join("discard_stats")
 	}
 
 	/// Returns the directory path for delete list files
-	pub(crate) fn delete_list_dir(&self) -> PathBuf {
+	pub fn delete_list_dir(&self) -> PathBuf {
 		self.path.join("delete_list")
 	}
 
 	/// Returns the directory path for versioned index files
-	pub(crate) fn versioned_index_dir(&self) -> PathBuf {
+	pub fn versioned_index_dir(&self) -> PathBuf {
 		self.path.join("versioned_index")
 	}
 
 	/// Checks if a filename matches the `VLog` file naming pattern
 	/// Expected format: 20-digit zero-padded ID + ".vlog" (25 characters total)
-	pub(crate) fn is_vlog_filename(&self, filename: &str) -> bool {
+	pub fn is_vlog_filename(&self, filename: &str) -> bool {
 		filename.len() == 25
 			&& std::path::Path::new(filename)
 				.extension()
@@ -538,7 +538,7 @@ impl Options {
 
 	/// Extracts the file ID from a `VLog` filename
 	/// Returns None if the filename doesn't match the expected pattern
-	pub(crate) fn extract_vlog_file_id(&self, filename: &str) -> Option<u32> {
+	pub fn extract_vlog_file_id(&self, filename: &str) -> Option<u32> {
 		if self.is_vlog_filename(filename) {
 			if let Some(id_part) = filename.strip_suffix(".vlog") {
 				if id_part.len() == 20 && id_part.chars().all(|c| c.is_ascii_digit()) {
@@ -641,15 +641,12 @@ pub trait FilterPolicy: Send + Sync {
 use std::ops::Bound;
 
 /// Type alias for InternalKey range bounds
-pub(crate) type InternalKeyRangeBound = Bound<InternalKey>;
+pub type InternalKeyRangeBound = Bound<InternalKey>;
 /// Type alias for InternalKey ranges
-pub(crate) type InternalKeyRange = (InternalKeyRangeBound, InternalKeyRangeBound);
+pub type InternalKeyRange = (InternalKeyRangeBound, InternalKeyRangeBound);
 
 /// Converts user key bounds to InternalKeyRange for efficient iteration.
-pub(crate) fn user_range_to_internal_range(
-	lower: Bound<&[u8]>,
-	upper: Bound<&[u8]>,
-) -> InternalKeyRange {
+pub fn user_range_to_internal_range(lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> InternalKeyRange {
 	let start_bound = match lower {
 		Bound::Unbounded => Bound::Unbounded,
 		Bound::Included(key) => Bound::Included(InternalKey::new(
@@ -683,8 +680,8 @@ pub(crate) fn user_range_to_internal_range(
 // bits of a 64-bit integer. 1 << 56 shifts the number 1 left by 56 bits,
 // resulting in a binary number with a 1 followed by 56 zeros. Subtracting 1
 // gives a binary number with 56 ones, which is the maximum value for 56 bits.
-pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
-pub(crate) const INTERNAL_KEY_TIMESTAMP_MAX: u64 = u64::MAX;
+pub const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
+pub const INTERNAL_KEY_TIMESTAMP_MAX: u64 = u64::MAX;
 
 // Helper function for reading u64 from byte slices without unwrap()
 // Safe to use when bounds have already been checked
@@ -766,17 +763,14 @@ impl From<u8> for InternalKeyKind {
 /// This is the owned version of `InternalKeyRef`. It includes the user key,
 /// timestamp, and trailer (containing sequence number and operation kind).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct InternalKey {
-	/// The application's key bytes.
-	pub(crate) user_key: Key,
-	/// System time in nanoseconds since epoch.
-	pub(crate) timestamp: u64,
-	/// Trailer containing (seq_num << 8) | kind.
-	pub(crate) trailer: u64,
+pub struct InternalKey {
+	pub user_key: Key,
+	pub timestamp: u64, // System time in nanoseconds since epoch
+	pub trailer: u64,   // (seq_num << 8) | kind
 }
 
 impl InternalKey {
-	pub(crate) fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind, timestamp: u64) -> Self {
+	pub fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind, timestamp: u64) -> Self {
 		Self {
 			user_key,
 			timestamp,
@@ -784,11 +778,11 @@ impl InternalKey {
 		}
 	}
 
-	pub(crate) fn size(&self) -> usize {
+	pub fn size(&self) -> usize {
 		self.user_key.len() + 16 // 8 bytes for timestamp + 8 bytes for trailer
 	}
 
-	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
+	pub fn decode(encoded_key: &[u8]) -> Self {
 		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
 		let trailer = read_u64_be(encoded_key, n);
 		let timestamp = read_u64_be(encoded_key, n + 8);
@@ -803,24 +797,24 @@ impl InternalKey {
 
 	/// Extract user key slice without allocation
 	#[inline]
-	pub(crate) fn user_key_from_encoded(encoded: &[u8]) -> &[u8] {
+	pub fn user_key_from_encoded(encoded: &[u8]) -> &[u8] {
 		&encoded[..encoded.len() - 16]
 	}
 
 	/// Extract trailer (seq_num + kind) without allocation
 	#[inline]
-	pub(crate) fn trailer_from_encoded(encoded: &[u8]) -> u64 {
+	pub fn trailer_from_encoded(encoded: &[u8]) -> u64 {
 		let n = encoded.len() - 16;
 		read_u64_be(encoded, n)
 	}
 
 	/// Extract seq_num from encoded key without allocation
 	#[inline]
-	pub(crate) fn seq_num_from_encoded(encoded: &[u8]) -> u64 {
+	pub fn seq_num_from_encoded(encoded: &[u8]) -> u64 {
 		trailer_to_seq_num(Self::trailer_from_encoded(encoded))
 	}
 
-	pub(crate) fn encode(&self) -> Vec<u8> {
+	pub fn encode(&self) -> Vec<u8> {
 		let mut buf = self.user_key.clone();
 		buf.extend_from_slice(&self.trailer.to_be_bytes());
 		buf.extend_from_slice(&self.timestamp.to_be_bytes());
@@ -828,31 +822,31 @@ impl InternalKey {
 	}
 
 	#[inline]
-	pub(crate) fn seq_num(&self) -> u64 {
+	pub fn seq_num(&self) -> u64 {
 		trailer_to_seq_num(self.trailer)
 	}
 
-	pub(crate) fn kind(&self) -> InternalKeyKind {
+	pub fn kind(&self) -> InternalKeyKind {
 		trailer_to_kind(self.trailer)
 	}
 
 	#[inline]
-	pub(crate) fn is_tombstone(&self) -> bool {
+	pub fn is_tombstone(&self) -> bool {
 		is_delete_kind(self.kind())
 	}
 
-	pub(crate) fn is_hard_delete_marker(&self) -> bool {
+	pub fn is_hard_delete_marker(&self) -> bool {
 		is_hard_delete_marker(self.kind())
 	}
 
-	pub(crate) fn is_replace(&self) -> bool {
+	pub fn is_replace(&self) -> bool {
 		is_replace_kind(self.kind())
 	}
 
 	/// Compares this key with another key using timestamp-based ordering
-	/// First compares by user key, then by timestamp (descending - newer
-	/// timestamps first, matching LSM seq_num ordering)
-	pub(crate) fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
+	/// First compares by user key, then by timestamp (ascending - older
+	/// timestamps first)
+	pub fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
 		// First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
 			// If user keys are equal, compare by timestamp (descending - newer timestamps first)
@@ -954,7 +948,7 @@ impl<'a> InternalKeyRef<'a> {
 		is_replace_kind(self.kind())
 	}
 
-	pub(crate) fn to_owned(self) -> InternalKey {
+	pub fn to_owned(self) -> InternalKey {
 		InternalKey::decode(self.encoded)
 	}
 }

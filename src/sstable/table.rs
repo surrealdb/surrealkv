@@ -132,12 +132,12 @@ const MASK_DELTA: u32 = 0xa282_ead8;
 /// 2. Adds a constant delta
 ///
 /// This prevents checksums of all-zeros or simple patterns from being weak.
-pub(crate) fn mask(crc: u32) -> u32 {
+pub fn mask(crc: u32) -> u32 {
 	crc.rotate_right(15).wrapping_add(MASK_DELTA)
 }
 
 /// Unmasks a previously masked CRC32 checksum.
-pub(crate) fn unmask(masked: u32) -> u32 {
+pub fn unmask(masked: u32) -> u32 {
 	let rot = masked.wrapping_sub(MASK_DELTA);
 	rot.rotate_left(15)
 }
@@ -157,7 +157,7 @@ pub enum TableFormat {
 }
 
 impl TableFormat {
-	pub(crate) fn from_u8(val: u8) -> Result<Self> {
+	pub fn from_u8(val: u8) -> Result<Self> {
 		match val {
 			1 => Ok(TableFormat::LSMV1),
 			_ => Err(Error::InvalidTableFormat),
@@ -191,7 +191,7 @@ impl TableFormat {
 /// 3. Decode block handles
 /// 4. Use handles to read index and meta blocks
 #[derive(Debug, Clone)]
-pub(crate) struct Footer {
+pub struct Footer {
 	pub format: TableFormat,
 	pub checksum: ChecksumType,
 	pub meta_index: BlockHandle, // Points to meta index block
@@ -199,7 +199,7 @@ pub(crate) struct Footer {
 }
 
 impl Footer {
-	pub(crate) fn new(metaix: BlockHandle, index: BlockHandle) -> Footer {
+	pub fn new(metaix: BlockHandle, index: BlockHandle) -> Footer {
 		Footer {
 			meta_index: metaix,
 			index,
@@ -209,7 +209,7 @@ impl Footer {
 	}
 
 	/// Reads the footer bytes from the end of the file.
-	pub(crate) fn read_from(reader: Arc<dyn File>, file_size: usize) -> Result<Vec<u8>> {
+	pub fn read_from(reader: Arc<dyn File>, file_size: usize) -> Result<Vec<u8>> {
 		if file_size < TABLE_FULL_FOOTER_LENGTH {
 			return Err(Error::from(SSTableError::FileTooSmall {
 				file_size,
@@ -225,7 +225,7 @@ impl Footer {
 	}
 
 	/// Decodes a footer from raw bytes.
-	pub(crate) fn decode(buf: &[u8]) -> Result<Footer> {
+	pub fn decode(buf: &[u8]) -> Result<Footer> {
 		// Step 1: Validate magic number (last 8 bytes)
 		let magic = &buf[buf.len() - TABLE_MAGIC_FOOTER_ENCODED.len()..];
 		if magic != TABLE_MAGIC_FOOTER_ENCODED {
@@ -268,7 +268,7 @@ impl Footer {
 	}
 
 	/// Encodes the footer into a byte buffer.
-	pub(crate) fn encode(&self, dst: &mut [u8]) {
+	pub fn encode(&self, dst: &mut [u8]) {
 		match self.format {
 			TableFormat::LSMV1 => {
 				dst[..TABLE_FOOTER_LENGTH].fill(0);
@@ -324,13 +324,13 @@ impl Footer {
 ///
 /// Index entry: separator="b" → DataBlock 1 handle
 /// ```
-pub(crate) struct TableWriter<W: Write> {
+pub struct TableWriter<W: Write> {
 	writer: W,
 	opts: Arc<Options>,
 	compression_selector: CompressionSelector,
 	target_level: u8,
 
-	pub(crate) meta: TableMetadata,
+	pub meta: TableMetadata,
 
 	/// Current write offset in the file
 	offset: usize,
@@ -352,7 +352,7 @@ pub(crate) struct TableWriter<W: Write> {
 }
 
 impl<W: Write> TableWriter<W> {
-	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
+	pub fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
 		let fb = {
 			if let Some(policy) = opts.filter_policy.clone() {
 				let mut f = FilterBlockWriter::new(Arc::clone(&policy));
@@ -400,7 +400,7 @@ impl<W: Write> TableWriter<W> {
 	/// 2. Add to bloom filter (if enabled)
 	/// 3. If current block is full, flush it
 	/// 4. Add key-value to current block
-	pub(crate) fn add(&mut self, key: InternalKey, val: &[u8]) -> Result<()> {
+	pub fn add(&mut self, key: InternalKey, val: &[u8]) -> Result<()> {
 		assert!(self.data_block.is_some());
 		let enc_key = key.encode();
 
@@ -411,12 +411,10 @@ impl<W: Write> TableWriter<W> {
 		}
 
 		// Initialize filter block on first key if needed
-		if self.filter_block.is_none() {
-			if let Some(filter_policy) = self.opts.filter_policy.as_ref() {
-				let mut filter_block = FilterBlockWriter::new(Arc::clone(filter_policy));
-				filter_block.start_block(0);
-				self.filter_block = Some(filter_block);
-			}
+		if self.filter_block.is_none() && self.opts.filter_policy.is_some() {
+			self.filter_block =
+				Some(FilterBlockWriter::new(Arc::clone(self.opts.filter_policy.as_ref().unwrap())));
+			self.filter_block.as_mut().unwrap().start_block(0);
 		}
 
 		// Update metadata
@@ -502,7 +500,7 @@ impl<W: Write> TableWriter<W> {
 	}
 
 	/// Finalizes the SSTable by writing all remaining blocks and the footer.
-	pub(crate) fn finish(mut self) -> Result<usize> {
+	pub fn finish(mut self) -> Result<usize> {
 		// Set creation timestamp
 		self.meta.properties.created_at = SystemTime::now()
 			.duration_since(UNIX_EPOCH)
@@ -647,7 +645,7 @@ impl<W: Write> TableWriter<W> {
 /// | (variable)       | (1 byte)          | (4 bytes)       |
 /// +------------------+-------------------+-----------------+
 /// ```
-pub(crate) fn write_block_at_offset<W: Write>(
+pub fn write_block_at_offset<W: Write>(
 	writer: &mut W,
 	block: BlockData,
 	compression_type: CompressionType,
@@ -665,10 +663,7 @@ pub(crate) fn write_block_at_offset<W: Write>(
 }
 
 /// Compresses block data using the specified compression type.
-pub(crate) fn compress_block(
-	raw_block: BlockData,
-	compression: CompressionType,
-) -> Result<BlockData> {
+pub fn compress_block(raw_block: BlockData, compression: CompressionType) -> Result<BlockData> {
 	match compression {
 		CompressionType::SnappyCompression => {
 			let mut enc = snap::raw::Encoder::new();
@@ -684,10 +679,7 @@ pub(crate) fn compress_block(
 }
 
 /// Decompresses block data.
-pub(crate) fn decompress_block(
-	compressed_block: &[u8],
-	compression: CompressionType,
-) -> Result<Vec<u8>> {
+pub fn decompress_block(compressed_block: &[u8], compression: CompressionType) -> Result<Vec<u8>> {
 	match compression {
 		CompressionType::SnappyCompression => {
 			let mut dec = snap::raw::Decoder::new();
@@ -710,7 +702,7 @@ fn read_bytes(f: Arc<dyn File>, location: &BlockHandle) -> Result<Vec<u8>> {
 }
 
 /// Calculates CRC32 checksum for a block.
-pub(crate) fn calculate_checksum(block: &[u8], compression_type: CompressionType) -> Crc32 {
+pub fn calculate_checksum(block: &[u8], compression_type: CompressionType) -> Crc32 {
 	let mut cksum = Crc32::new();
 	cksum.update(block);
 	cksum.update(&[compression_type as u8; BLOCK_COMPRESS_LEN]);
@@ -718,7 +710,7 @@ pub(crate) fn calculate_checksum(block: &[u8], compression_type: CompressionType
 }
 
 /// Reads a filter block from the file.
-pub(crate) fn read_filter_block(
+pub fn read_filter_block(
 	src: Arc<dyn File>,
 	location: &BlockHandle,
 	policy: Arc<dyn FilterPolicy>,
@@ -745,7 +737,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 }
 
 /// Reads and verifies a table block from the file.
-pub(crate) fn read_table_block(
+pub fn read_table_block(
 	comparator: Arc<dyn Comparator>,
 	f: Arc<dyn File>,
 	location: &BlockHandle,
@@ -793,6 +785,30 @@ fn verify_table_block(block: &[u8], compression_type: u8, want: u32) -> bool {
 // TABLE (SSTable Reader)
 // =============================================================================
 
+/// An immutable SSTable reader.
+///
+/// ## Opening a Table
+///
+/// 1. Read footer
+/// 2. Load top-level index block
+/// 3. Load meta index block
+/// 4. Extract table metadata and filter block
+///
+/// ## Point Lookup Flow
+///
+/// ```text
+/// get("banana"):
+///   1. Bloom filter check (early rejection if definitely not present)
+///   2. Top-level index lookup → find partition block
+///   3. Partition block lookup → find data block handle
+///   4. Data block lookup → find key-value pair
+/// ```
+///
+/// ## Range Scan Flow
+///
+/// Uses TableIterator which coordinates:
+/// - first_level: IndexIterator (navigates index entries)
+/// - second_level: BlockIterator (navigates data block entries)
 #[derive(Clone)]
 pub enum IndexType {
 	Partitioned(Index),
@@ -823,27 +839,22 @@ pub enum IndexType {
 /// - first_level: IndexIterator (navigates index entries)
 /// - second_level: BlockIterator (navigates data block entries)
 #[derive(Clone)]
-pub(crate) struct Table {
+pub struct Table {
 	pub id: u64,
 	pub file: Arc<dyn File>,
 	#[allow(unused)]
 	pub file_size: u64,
 
-	pub(crate) opts: Arc<Options>,
-	pub(crate) meta: TableMetadata,
+	pub opts: Arc<Options>,
+	pub meta: TableMetadata,
 
-	pub(crate) index_block: IndexType,
-	pub(crate) filter_reader: Option<FilterBlockReader>,
+	pub index_block: IndexType,
+	pub filter_reader: Option<FilterBlockReader>,
 }
 
 impl Table {
 	/// Opens an SSTable file for reading.
-	pub(crate) fn new(
-		id: u64,
-		opts: Arc<Options>,
-		file: Arc<dyn File>,
-		file_size: u64,
-	) -> Result<Table> {
+	pub fn new(id: u64, opts: Arc<Options>, file: Arc<dyn File>, file_size: u64) -> Result<Table> {
 		// Step 1: Read footer
 		let footer = read_footer(Arc::clone(&file), file_size as usize)?;
 
@@ -922,7 +933,7 @@ impl Table {
 	}
 
 	/// Reads a data block, using cache if available.
-	pub(crate) fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
+	pub fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		// Check cache first
 		if let Some(block) = self.opts.block_cache.get_data_block(self.id, location.offset() as u64)
 		{
@@ -996,7 +1007,7 @@ impl Table {
 	///   → Seek for "banana"
 	///   → If found and user_key matches → return value
 	/// ```
-	pub(crate) fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
+	pub fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
 		let key_encoded = key.encode();
 
 		// Step 1: Bloom filter for early rejection
@@ -1045,7 +1056,7 @@ impl Table {
 	}
 
 	/// Creates an iterator over the table with optional range bounds.
-	pub(crate) fn iter(&self, range: Option<InternalKeyRange>) -> Result<TableIterator<'_>> {
+	pub fn iter(&self, range: Option<InternalKeyRange>) -> Result<TableIterator<'_>> {
 		let range = range.unwrap_or((Bound::Unbounded, Bound::Unbounded));
 		TableIterator::new(self, range)
 	}
@@ -1060,7 +1071,7 @@ impl Table {
 		TableIterator::new_with_comparator(self, range, comparator)
 	}
 
-	pub(crate) fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
+	pub fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
 		let Some(smallest) = &self.meta.smallest_point else {
 			return true;
 		};
@@ -1108,7 +1119,7 @@ impl Table {
 	/// is_before(Excluded("apple"))?
 	///   "banana" <= "apple"? No → table overlaps (has keys > "apple") ✓
 	/// ```
-	pub(crate) fn is_before_range(&self, range: &InternalKeyRange) -> bool {
+	pub fn is_before_range(&self, range: &InternalKeyRange) -> bool {
 		let Some(largest) = &self.meta.largest_point else {
 			return false; // No metadata = conservatively assume overlap
 		};
@@ -1162,7 +1173,7 @@ impl Table {
 	/// is_after(Excluded("date"))?
 	///   "cherry" >= "date"? No → table overlaps (has keys < "date") ✓
 	/// ```
-	pub(crate) fn is_after_range(&self, range: &InternalKeyRange) -> bool {
+	pub fn is_after_range(&self, range: &InternalKeyRange) -> bool {
 		let Some(smallest) = &self.meta.smallest_point else {
 			return false; // No metadata = conservatively assume overlap
 		};
@@ -1184,7 +1195,7 @@ impl Table {
 	/// Checks if this table potentially overlaps with the query range.
 	///
 	/// Returns true if the table is neither completely before nor completely after the range.
-	pub(crate) fn overlaps_with_range(&self, range: &InternalKeyRange) -> bool {
+	pub fn overlaps_with_range(&self, range: &InternalKeyRange) -> bool {
 		!self.is_before_range(range) && !self.is_after_range(range)
 	}
 }
@@ -1236,7 +1247,7 @@ impl Table {
 ///
 /// Without advance_to_valid_entry, the iterator would incorrectly
 /// report no results when "date" and "fig" are valid matches!
-pub(crate) struct TableIterator<'a> {
+pub struct TableIterator<'a> {
 	table: &'a Table,
 
 	/// First level: iterates over partition index entries
@@ -1260,7 +1271,7 @@ pub(crate) struct TableIterator<'a> {
 }
 
 impl<'a> TableIterator<'a> {
-	pub(crate) fn new(table: &'a Table, range: InternalKeyRange) -> Result<Self> {
+	pub fn new(table: &'a Table, range: InternalKeyRange) -> Result<Self> {
 		let IndexType::Partitioned(ref partitioned_index) = table.index_block;
 
 		Ok(Self {
@@ -1295,7 +1306,7 @@ impl<'a> TableIterator<'a> {
 	}
 
 	fn is_valid(&self) -> bool {
-		!self.exhausted && self.second_level.as_ref().is_some_and(|iter| iter.is_valid())
+		!self.exhausted && self.second_level.as_ref().map_or(false, |iter| iter.is_valid())
 	}
 
 	fn mark_exhausted(&mut self) {
@@ -1526,7 +1537,7 @@ impl<'a> TableIterator<'a> {
 	/// ```
 	///
 	/// Edge case: If ("apple", 0) actually exists, we land on it and advance.
-	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
+	pub fn seek_to_first(&mut self) -> Result<()> {
 		self.exhausted = false;
 
 		let lower_bound = self.range.0.clone();
@@ -1619,7 +1630,7 @@ impl<'a> TableIterator<'a> {
 	/// Check: "banana" < "banana"? No (Equal, not Less) → prev()
 	/// Result: ("apple", 3) - last entry with user_key < "banana" ✓
 	/// ```
-	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
+	pub fn seek_to_last(&mut self) -> Result<()> {
 		self.exhausted = false;
 
 		let upper_bound = self.range.1.clone();
