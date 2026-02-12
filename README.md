@@ -2,9 +2,9 @@
 
 [![License](https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square)](https://github.com/surrealdb/surrealkv)
 
-> **⚠️ Development Status**: SurrealKV is currently under active development and is not feature complete. The API and implementation may change significantly between versions. Use with caution in production environments.
+SurrealKV is a versioned, embedded key-value store built on an LSM (Log-Structured Merge) tree architecture, with support for time-travel queries.
 
-SurrealKV is a versioned, low-level, persistent, embedded key-value database implemented in Rust using an LSM (Log-Structured Merge) tree architecture with built-in support for time-travel queries.
+It is designed specifically for use within SurrealDB, with the goal of reducing dependency on external storage engine (RocksDB). This approach allows the storage layer to evolve in alignment with SurrealDB’s requirements and access patterns.
 
 ## Features
 
@@ -114,19 +114,23 @@ let tree = TreeBuilder::with_options(opts).build()?;
 The Value Log (VLog) separates large values from the LSM tree for more efficient storage and compaction.
 
 ```rust
+use surrealkv::{TreeBuilder, VLogChecksumLevel};
+
 let tree = TreeBuilder::new()
     .with_path("path/to/db".into())
-    .with_enable_vlog(true)                    // Enable VLog
+    .with_enable_vlog(true)                     // Enable VLog
+    .with_vlog_value_threshold(1024)            // Values > 1KB go to VLog
     .with_vlog_max_file_size(256 * 1024 * 1024) // 256MB VLog file size
-    .with_vlog_gc_discard_ratio(0.5)           // Trigger GC at 50% garbage
+    .with_vlog_gc_discard_ratio(0.5)            // Trigger GC at 50% garbage
     .with_vlog_checksum_verification(VLogChecksumLevel::Full)
     .build()?;
 ```
 
 **Options:**
 - `with_enable_vlog()` - Enable/disable Value Log for large value storage
-- `with_vlog_max_file_size()` - Maximum size of VLog files before rotation
-- `with_vlog_gc_discard_ratio()` - Threshold (0.0-1.0) for triggering VLog garbage collection
+- `with_vlog_value_threshold()` - Size threshold in bytes; values larger than this are stored in VLog (default: 1KB)
+- `with_vlog_max_file_size()` - Maximum size of VLog files before rotation (default: 256MB)
+- `with_vlog_gc_discard_ratio()` - Threshold (0.0-1.0) for triggering VLog garbage collection (default: 0.5)
 - `with_vlog_checksum_verification()` - Checksum verification level (`Disabled` or `Full`)
 
 
@@ -205,52 +209,38 @@ let mut txn = tree.begin_with_mode(Mode::WriteOnly)?;
 
 ### Range Operations
 
-Range operations support efficient iteration over key ranges:
+Range operations use a cursor-based iterator API for efficient iteration over key ranges:
 
 ```rust
+let txn = tree.begin()?;
+
 // Range scan between keys (inclusive start, exclusive end)
-let mut txn = tree.begin()?;
-let range: Vec<_> = txn.range(b"key1", b"key5")?
-    .map(|r| r.unwrap())
-    .collect();
+let mut iter = txn.range(b"key1", b"key5")?;
+iter.seek_first()?;
+while iter.valid() {
+    let key = iter.key();
+    let value = iter.value()?;
+    println!("{:?} = {:?}", key, value);
+    iter.next()?;
+}
 
-// Keys-only scan (faster, doesn't fetch values when vlog is enabled)
-let keys: Vec<_> = txn.keys(b"key1", b"key5")?
-    .map(|r| r.unwrap())
-    .collect();
-
-// Range with limit using .take()
-let limited: Vec<_> = txn.range(b"key1", b"key9")?
-    .take(10)
-    .map(|r| r.unwrap())
-    .collect();
+// Backward iteration
+let mut iter = txn.range(b"key1", b"key5")?;
+iter.seek_last()?;
+while iter.valid() {
+    let key = iter.key();
+    let value = iter.value()?;
+    println!("{:?} = {:?}", key, value);
+    iter.prev()?;
+}
 
 // Delete a key
+let mut txn = tree.begin()?;
 txn.delete(b"key1")?;
 txn.commit().await?;
 ```
 
-**Note:** Range iterators are double-ended, supporting both forward and backward iteration.
-
-### Counting Keys
-
-Efficiently count keys in a range without iterating through all values:
-
-```rust
-let mut txn = tree.begin()?;
-
-// Count all keys between "key1" and "key9"
-let count = txn.count(b"key1", b"key9")?;
-println!("Found {} keys", count);
-
-// Count with custom options (bounds, timestamp, etc.)
-let options = ReadOptions::new()
-    .with_iterate_lower_bound(Some(b"a".to_vec()))
-    .with_iterate_upper_bound(Some(b"z".to_vec()));
-let count = txn.count_with_options(&options)?;
-```
-
-**Note:** The `count()` operation is optimized and more efficient than manually counting iterator results, as it doesn't need to fetch or resolve values from the value log.
+**Note:** Range iterators support both forward (`next()`) and backward (`prev()`) iteration using the cursor-based API.
 
 ### Durability Levels
 
@@ -297,12 +287,12 @@ let tree = TreeBuilder::with_options(opts).build()?;
 ```rust
 // Write data with explicit timestamps
 let mut tx = tree.begin()?;
-tx.set_at_version(b"key1", b"value_v1", 100)?;
+tx.set_at(b"key1", b"value_v1", 100)?;
 tx.commit().await?;
 
 // Update with a new version at a later timestamp
 let mut tx = tree.begin()?;
-tx.set_at_version(b"key1", b"value_v2", 200)?;
+tx.set_at(b"key1", b"value_v2", 200)?;
 tx.commit().await?;
 ```
 
@@ -314,42 +304,60 @@ Query data as it existed at a specific timestamp:
 let tx = tree.begin()?;
 
 // Get value at specific timestamp
-let value = tx.get_at_version(b"key1", 100)?;
+let value = tx.get_at(b"key1", 100)?;
 assert_eq!(value.unwrap().as_ref(), b"value_v1");
 
 // Get value at later timestamp
-let value = tx.get_at_version(b"key1", 200)?;
+let value = tx.get_at(b"key1", 200)?;
 assert_eq!(value.unwrap().as_ref(), b"value_v2");
-
-// Range query at specific timestamp
-let range: Vec<_> = tx.range_at_version(b"key1", b"key9", 150, None)?
-    .map(|r| r.unwrap())
-    .collect();
-
-// Keys-only query at timestamp (faster, when vlog enabled)
-let keys: Vec<_> = tx.keys_at_version(b"key1", b"key9", 150, None)?
-    .map(|r| r.unwrap())
-    .collect();
-
-// Count keys at a specific timestamp
-let count = tx.count_at_version(b"key1", b"key9", 150)?;
-println!("Found {} keys at timestamp 150", count);
 ```
 
 ### Retrieving All Versions
 
-Get all historical versions of keys in a range:
+Use the unified `history()` API to iterate over all historical versions of keys in a range.
+This API uses streaming iteration (no memory collection) and works with both LSM and B+tree backends:
 
 ```rust
 let tx = tree.begin()?;
-let versions = tx.scan_all_versions(b"key1", b"key2", None)?;
+let mut iter = tx.history(b"key1", b"key2")?;
 
-for (key, value, timestamp, is_tombstone) in versions {
-    if is_tombstone {
+iter.seek_first()?;
+while iter.valid() {
+    let key = iter.key();
+    let timestamp = iter.timestamp();
+
+    if iter.is_tombstone() {
         println!("Key {:?} deleted at timestamp {}", key, timestamp);
     } else {
+        let value = iter.value()?;
         println!("Key {:?} = {:?} at timestamp {}", key, value, timestamp);
     }
+    iter.next()?;
+}
+```
+
+For more control, use `history_with_options()`:
+
+```rust
+use surrealkv::HistoryOptions;
+
+let tx = tree.begin()?;
+let opts = HistoryOptions::new()
+    .with_tombstones(true)  // Include deleted entries
+    .with_limit(100);       // Limit to 100 unique keys
+
+let mut iter = tx.history_with_options(b"key1", b"key2", &opts)?;
+iter.seek_first()?;
+while iter.valid() {
+    let key = iter.key();
+    let timestamp = iter.timestamp();
+    if iter.is_tombstone() {
+        println!("Key {:?} deleted at timestamp {}", key, timestamp);
+    } else {
+        let value = iter.value()?;
+        println!("Key {:?} = {:?} at timestamp {}", key, value, timestamp);
+    }
+    iter.next()?;
 }
 ```
 
@@ -362,37 +370,27 @@ use surrealkv::ReadOptions;
 
 let tx = tree.begin()?;
 
-// Range query with bounds
-let options = ReadOptions::new()
-    .with_iterate_lower_bound(Some(b"a".to_vec()))
-    .with_iterate_upper_bound(Some(b"z".to_vec()));
+// Range query with bounds using setter methods
+let mut options = ReadOptions::new();
+options.set_iterate_lower_bound(Some(b"a".to_vec()));
+options.set_iterate_upper_bound(Some(b"z".to_vec()));
 
-let results: Vec<_> = tx.range_with_options(&options)?
-    .take(10)  // Use .take() to limit results
-    .map(|r| r.unwrap())
-    .collect();
-
-// Keys-only iteration (faster, doesn't fetch values from disk when vlog is enabled)
-let options = ReadOptions::new()
-    .with_keys_only(true)
-    .with_iterate_lower_bound(Some(b"a".to_vec()))
-    .with_iterate_upper_bound(Some(b"z".to_vec()));
-
-let keys: Vec<_> = tx.keys_with_options(&options)?
-    .take(100)  // Use .take() to limit results
-    .map(|r| r.unwrap())
-    .collect();
+// Use cursor-based iteration
+let mut iter = tx.range_with_options(&options)?;
+iter.seek_first()?;
+while iter.valid() {
+    let key = iter.key();
+    let value = iter.value()?;
+    println!("{:?} = {:?}", key, value);
+    iter.next()?;
+}
 
 // Point-in-time read with options (requires versioning enabled)
 let options = ReadOptions::new()
-    .with_timestamp(Some(12345))
-    .with_iterate_lower_bound(Some(b"a".to_vec()))
-    .with_iterate_upper_bound(Some(b"z".to_vec()));
+    .with_timestamp(Some(12345));
 
-let historical_data: Vec<_> = tx.range_with_options(&options)?
-    .take(50)  // Use .take() to limit results
-    .map(|r| r.unwrap())
-    .collect();
+// Use with get_at_with_options for versioned point lookups
+let value = tx.get_at_with_options(b"key1", &options)?;
 ```
 
 ## Checkpoint and Restore
@@ -478,13 +476,15 @@ The VART-based design had fundamental scalability limitations:
 ### Current Design (LSM Tree)
 The new LSM (Log-Structured Merge) tree architecture provides:
 
-- **Compaction**: Leveled compaction strategy for space utilization
 - **Better Scalability**: Supports datasets much larger than available memory
+- **Leveled Compaction**: Score-based compaction strategy for efficient space utilization
 
-This architectural change enables SurrealKV to handle larger then memory datasets.
+This architectural change enables SurrealKV to handle larger than memory datasets.
+
+For detailed architecture documentation, see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## References
-SurrealKV draws inspiration from design ideas used in [Rocksb](https://github.com/facebook/rocksdb) and [Pebble](https://github.com/cockroachdb/pebble)
+SurrealKV draws inspiration from design ideas used in [RocksDB](https://github.com/facebook/rocksdb) and [Pebble](https://github.com/cockroachdb/pebble)
 
 
 ## License

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use rand::Rng;
-use surrealkv::{BytewiseComparator, TreeBuilder};
+use surrealkv::{BytewiseComparator, LSMIterator, TreeBuilder};
 use tempfile::TempDir;
 use tokio::runtime::{Handle, Runtime};
 
@@ -119,7 +119,8 @@ pub fn seq_range(b: divan::Bencher<'_, '_>, count: usize) {
 			iter.seek_first().unwrap();
 			let mut item_count = 0;
 			while iter.valid() {
-				results.push(iter.key());
+				let key = iter.key().encoded().to_vec();
+				results.push(key);
 				iter.next().unwrap();
 				item_count += 1;
 			}

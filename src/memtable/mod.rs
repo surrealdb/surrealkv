@@ -12,14 +12,7 @@ use crate::batch::Batch;
 use crate::error::Result;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
-use crate::{
-	InternalIterator,
-	InternalKey,
-	InternalKeyRef,
-	Options,
-	Value,
-	INTERNAL_KEY_SEQ_NUM_MAX,
-};
+use crate::{InternalKey, InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX};
 
 /// Entry in the immutable memtables list, tracking both the table ID
 /// and the WAL number that contains this memtable's data.
@@ -73,6 +66,8 @@ impl ImmutableMemtables {
 pub(crate) struct MemTable {
 	skiplist: Skiplist,
 	latest_seq_num: AtomicU64,
+	/// Sequence number when this memtable was created.
+	earliest_seq: u64,
 	/// WAL number that was current when this memtable started receiving writes.
 	/// Used to determine which WALs can be safely deleted after flush.
 	wal_number: AtomicU64,
@@ -80,20 +75,25 @@ pub(crate) struct MemTable {
 
 impl Default for MemTable {
 	fn default() -> Self {
-		Self::new(1024 * 1024)
+		Self::new(1024 * 1024, 0)
 	}
 }
 
 impl MemTable {
-	pub(crate) fn new(arena_capacity: usize) -> Self {
+	pub(crate) fn new(arena_capacity: usize, earliest_seq: u64) -> Self {
 		let arena = Arc::new(Arena::new(arena_capacity));
 		let cmp: Compare = |a, b| a.cmp(b);
 		let skiplist = Skiplist::new(arena, cmp);
 		MemTable {
 			skiplist,
 			latest_seq_num: AtomicU64::new(0),
+			earliest_seq,
 			wal_number: AtomicU64::new(0),
 		}
+	}
+
+	pub(crate) fn earliest_seq(&self) -> u64 {
+		self.earliest_seq
 	}
 
 	/// Sets the WAL number associated with this memtable.
@@ -238,7 +238,7 @@ impl MemTable {
 			let mut iter = self.iter();
 			iter.seek_first()?;
 			while iter.valid() {
-				table_writer.add(iter.key().to_owned(), iter.value())?;
+				table_writer.add(iter.key().to_owned(), iter.value_encoded()?)?;
 				iter.next()?;
 			}
 			// TODO: Check how to fsync this file
@@ -284,7 +284,7 @@ pub(crate) struct MemTableIterator<'a> {
 	iter: SkiplistIterator<'a>,
 }
 
-impl InternalIterator for MemTableIterator<'_> {
+impl LSMIterator for MemTableIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.iter.seek(target)
 	}
@@ -313,7 +313,7 @@ impl InternalIterator for MemTableIterator<'_> {
 		self.iter.key()
 	}
 
-	fn value(&self) -> &[u8] {
-		self.iter.value()
+	fn value_encoded(&self) -> Result<&[u8]> {
+		self.iter.value_encoded()
 	}
 }

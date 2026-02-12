@@ -4,10 +4,12 @@
 //! including WAL recovery, memtable flush, SST interaction, and manifest
 //! coordination.
 
+use std::collections::HashMap;
+
 use crate::snapshot::SnapshotIterator;
-use crate::transaction::TransactionIterator;
+use crate::transaction::HistoryOptions;
 use crate::vlog::ValueLocation;
-use crate::{InternalIterator, InternalKey, Key, Result, Value};
+use crate::{InternalKey, Key, LSMIterator, Result, Value};
 
 #[cfg(test)]
 pub mod batch_tests;
@@ -42,16 +44,18 @@ pub mod sstable_tests;
 #[cfg(test)]
 pub mod transaction_tests;
 #[cfg(test)]
+pub mod version_iterator_tests;
+#[cfg(test)]
 pub mod vlog_tests;
 #[cfg(test)]
 pub mod wal_tests;
 
-/// Collects all (key, value) pairs from an InternalIterator into a Vec
+/// Collects all (key, value) pairs from an LSMIterator into a Vec
 /// Assumes iterator is already positioned (e.g., after seek_first or seek)
-fn collect_iter(iter: &mut impl InternalIterator) -> Vec<(InternalKey, Vec<u8>)> {
+fn collect_iter(iter: &mut impl LSMIterator) -> Vec<(InternalKey, Vec<u8>)> {
 	let mut result = Vec::new();
 	while iter.valid() {
-		result.push((iter.key().to_owned(), iter.value().to_vec()));
+		result.push((iter.key().to_owned(), iter.value_encoded().unwrap().to_vec()));
 		if !iter.next().unwrap_or(false) {
 			break;
 		}
@@ -60,13 +64,13 @@ fn collect_iter(iter: &mut impl InternalIterator) -> Vec<(InternalKey, Vec<u8>)>
 }
 
 /// Collects all items from start (seek_first) to end
-fn collect_all(iter: &mut impl InternalIterator) -> Result<Vec<(InternalKey, Vec<u8>)>> {
+fn collect_all(iter: &mut impl LSMIterator) -> Result<Vec<(InternalKey, Vec<u8>)>> {
 	iter.seek_first()?;
 	Ok(collect_iter(iter))
 }
 
 /// Counts entries in an iterator
-fn count_iter(iter: &mut impl InternalIterator) -> Result<usize> {
+fn count_iter(iter: &mut impl LSMIterator) -> Result<usize> {
 	iter.seek_first()?;
 	let mut count = 0;
 	while iter.valid() {
@@ -79,29 +83,31 @@ fn count_iter(iter: &mut impl InternalIterator) -> Result<usize> {
 }
 
 /// Collects all entries from a TransactionIterator
-fn collect_transaction_iter(iter: &mut TransactionIterator) -> Result<Vec<(Key, Option<Value>)>> {
+fn collect_transaction_iter(iter: &mut impl LSMIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 	let mut result = Vec::new();
 	while iter.valid() {
-		result.push((iter.key(), iter.value()?));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value()?;
+		result.push((key, value));
 		iter.next()?;
 	}
 	Ok(result)
 }
 
 /// Collects all entries from a TransactionIterator starting from seek_first()
-fn collect_transaction_all(iter: &mut TransactionIterator) -> Result<Vec<(Key, Option<Value>)>> {
+fn collect_transaction_all(iter: &mut impl LSMIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 	iter.seek_first()?;
 	collect_transaction_iter(iter)
 }
 
 /// Collects all entries from a TransactionIterator in reverse order starting from seek_last()
-fn collect_transaction_reverse(
-	iter: &mut TransactionIterator,
-) -> Result<Vec<(Key, Option<Value>)>> {
+fn collect_transaction_reverse(iter: &mut impl LSMIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		result.push((iter.key(), iter.value()?));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value()?;
+		result.push((key, value));
 		if !iter.prev()? {
 			break;
 		}
@@ -115,7 +121,7 @@ fn collect_snapshot_iter(iter: &mut SnapshotIterator) -> Result<Vec<(InternalKey
 	iter.seek_first()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let encoded_value = iter.value();
+		let encoded_value = iter.value_encoded()?;
 		let decoded_value = ValueLocation::decode(encoded_value)?.value;
 		result.push((iter.key().to_owned(), decoded_value));
 		if !iter.next()? {
@@ -131,7 +137,7 @@ fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(Internal
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let encoded_value = iter.value();
+		let encoded_value = iter.value_encoded()?;
 		let decoded_value = ValueLocation::decode(encoded_value)?.value;
 		result.push((iter.key().to_owned(), decoded_value));
 		if !iter.prev()? {
@@ -139,4 +145,141 @@ fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(Internal
 		}
 	}
 	Ok(result)
+}
+
+/// Type alias for a map of keys to their version information
+/// Each key maps to a vector of (value, timestamp, is_tombstone) tuples
+#[allow(dead_code)]
+type KeyVersionsMap = HashMap<Key, Vec<(Vec<u8>, u64, bool)>>;
+
+/// Collects all entries from a history iterator
+/// Returns a vector of (key, value, timestamp, is_tombstone) tuples
+#[allow(dead_code)]
+fn collect_history_all(iter: &mut impl LSMIterator) -> crate::Result<Vec<(Key, Value, u64, bool)>> {
+	iter.seek_first()?;
+	let mut result = Vec::new();
+	while iter.valid() {
+		let key_ref = iter.key();
+		let is_tombstone = key_ref.is_tombstone();
+		// Tombstones have no value, so use empty vec
+		let value = if is_tombstone {
+			Vec::new()
+		} else {
+			iter.value()?
+		};
+		result.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
+		iter.next()?;
+	}
+	Ok(result)
+}
+
+/// Gets a point-in-time snapshot of key-values from a history iterator
+/// Returns the latest version of each key at or before the given timestamp
+///
+/// IMPORTANT: The iterator MUST be created with include_tombstones=true for this
+/// function to correctly handle deleted keys. If tombstones are not included,
+/// soft-deleted keys will incorrectly appear in the results.
+#[allow(dead_code)]
+fn point_in_time_from_history(
+	iter: &mut impl LSMIterator,
+	timestamp: u64,
+) -> crate::Result<Vec<(Key, Value)>> {
+	use std::collections::BTreeMap;
+
+	iter.seek_first()?;
+	// Track the latest entry for each key by timestamp (value, timestamp, is_tombstone)
+	let mut latest_entries: BTreeMap<Key, (Option<Value>, u64, bool)> = BTreeMap::new();
+
+	while iter.valid() {
+		let key_ref = iter.key();
+		let ts = key_ref.timestamp();
+		let key = key_ref.user_key().to_vec();
+		let is_tombstone = key_ref.is_tombstone();
+
+		// Only consider versions at or before the requested timestamp
+		if ts <= timestamp {
+			// Check if we need to update this key's entry (higher timestamp wins)
+			let should_update = match latest_entries.get(&key) {
+				None => true,
+				Some((_, existing_ts, _)) => ts > *existing_ts,
+			};
+
+			if should_update {
+				let value = if is_tombstone {
+					None
+				} else {
+					Some(iter.value()?)
+				};
+				latest_entries.insert(key.clone(), (value, ts, is_tombstone));
+			}
+		}
+
+		iter.next()?;
+	}
+
+	// Filter out tombstones - keys whose latest entry is a delete
+	Ok(latest_entries
+		.into_iter()
+		.filter_map(|(k, (v, _, is_tombstone))| {
+			if is_tombstone {
+				None
+			} else {
+				Some((k, v.unwrap()))
+			}
+		})
+		.collect())
+}
+
+/// Helper to count all versions of a key using history() iterator
+fn count_history_versions_in_range(
+	tx: &crate::Transaction,
+	start: &[u8],
+	end: &[u8],
+) -> crate::Result<usize> {
+	let mut iter = tx.history(start, end)?;
+	iter.seek_first()?;
+	let mut count = 0;
+	while iter.valid() {
+		count += 1;
+		iter.next()?;
+	}
+	Ok(count)
+}
+
+/// Helper to get point-in-time snapshot from history iterator
+fn point_in_time_from_history_in_range(
+	tx: &crate::Transaction,
+	start: &[u8],
+	end: &[u8],
+	timestamp: u64,
+) -> crate::Result<Vec<(crate::Key, crate::Value)>> {
+	use std::collections::BTreeMap;
+	let opts = HistoryOptions {
+		include_tombstones: true,
+		..Default::default()
+	};
+	let mut iter = tx.history_with_options(start, end, &opts)?;
+	iter.seek_first()?;
+	let mut result: BTreeMap<crate::Key, (crate::Value, u64)> = BTreeMap::new();
+	while iter.valid() {
+		let key_ref = iter.key();
+		let ts = key_ref.timestamp();
+		let key = key_ref.user_key().to_vec();
+		let is_tombstone = key_ref.is_tombstone();
+		if ts <= timestamp {
+			let should_update = match result.get(&key) {
+				None => true,
+				Some((_, existing_ts)) => ts > *existing_ts,
+			};
+			if should_update {
+				if is_tombstone {
+					result.remove(&key);
+				} else {
+					result.insert(key.clone(), (iter.value()?, ts));
+				}
+			}
+		}
+		iter.next()?;
+	}
+	Ok(result.into_iter().map(|(k, (v, _))| (k, v)).collect())
 }

@@ -31,6 +31,7 @@ pub enum Error {
 	BatchTooLarge,
 	InvalidBatchRecord,
 	TransactionWriteConflict,
+	TransactionRetry,
 	TransactionClosed,
 	EmptyKey,
 	TransactionWriteOnly,
@@ -60,6 +61,21 @@ pub enum Error {
 		message: String,
 	},
 	SSTable(crate::sstable::error::SSTableError), // SSTable-specific errors
+	/// Discard stats slot access out of bounds
+	DiscardSlotOutOfBounds {
+		slot: usize,
+		max: usize,
+	},
+	/// Discard stats corrupted entry count
+	DiscardCorruptedEntryCount {
+		count: usize,
+		max: usize,
+	},
+	/// Discard stats corrupted data
+	DiscardCorruptedData {
+		slot: usize,
+		reason: String,
+	},
 }
 
 // Implementation of Display trait for Error
@@ -84,6 +100,7 @@ impl fmt::Display for Error {
             Self::BatchTooLarge => write!(f, "Batch too large"),
             Self::InvalidBatchRecord => write!(f, "Invalid batch record"),
             Self::TransactionWriteConflict => write!(f, "Transaction write conflict"),
+            Self::TransactionRetry => write!(f, "Transaction retry required: memtable history insufficient for conflict detection"),
             Self::TransactionClosed => write!(f, "Transaction closed"),
             Self::EmptyKey => write!(f, "Empty key"),
             Self::TransactionWriteOnly => write!(f, "Transaction is write-only"),
@@ -112,6 +129,9 @@ impl fmt::Display for Error {
                 segment_id, offset, message
             ),
             Self::SSTable(err) => write!(f, "SSTable error: {err}"),
+            Self::DiscardSlotOutOfBounds { slot, max } => write!(f, "Discard stats slot {slot} out of bounds (max: {max})"),
+            Self::DiscardCorruptedEntryCount { count, max } => write!(f, "Discard stats corrupted: entry count {count} exceeds max slots {max}"),
+            Self::DiscardCorruptedData { slot, reason } => write!(f, "Discard stats corrupted at slot {slot}: {reason}"),
         }
 	}
 }
@@ -141,18 +161,6 @@ impl From<io::Error> for Error {
 impl From<crate::wal::Error> for Error {
 	fn from(err: crate::wal::Error) -> Self {
 		Error::Wal(err.to_string())
-	}
-}
-
-impl From<async_channel::SendError<std::result::Result<(), Error>>> for Error {
-	fn from(error: async_channel::SendError<std::result::Result<(), Error>>) -> Self {
-		Error::Send(format!("Async channel send error: {error}"))
-	}
-}
-
-impl From<async_channel::RecvError> for Error {
-	fn from(error: async_channel::RecvError) -> Self {
-		Error::Receive(format!("Async channel receive error: {error}"))
 	}
 }
 

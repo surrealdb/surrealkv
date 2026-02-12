@@ -21,7 +21,7 @@ use crate::wal::{
 	RecordType,
 	SegmentRef,
 };
-use crate::InternalIterator;
+use crate::LSMIterator;
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()

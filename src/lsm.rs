@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::{create_dir_all, File};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
@@ -17,8 +18,7 @@ use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lockfile::LockFile;
 use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
-use crate::oracle::Oracle;
-use crate::snapshot::Counter as SnapshotCounter;
+use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::Table;
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
@@ -30,9 +30,9 @@ use crate::{
 	Comparator,
 	Error,
 	FilterPolicy,
-	InternalIterator,
 	InternalKey,
 	InternalKeyKind,
+	LSMIterator,
 	Options,
 	TimestampComparator,
 	VLogChecksumLevel,
@@ -109,14 +109,11 @@ pub(crate) struct CoreInner {
 	/// Configuration options controlling LSM tree behavior
 	pub opts: Arc<Options>,
 
-	/// Counter tracking active snapshots for MVCC (Multi-Version Concurrency
-	/// Control). Snapshots provide consistent point-in-time views of the data.
-	pub(crate) snapshot_counter: SnapshotCounter,
-
-	/// Oracle managing transaction timestamps for MVCC.
-	/// Provides monotonic timestamps for transaction ordering and conflict
-	/// resolution.
-	pub(crate) oracle: Arc<Oracle>,
+	/// Tracker for active snapshot sequence numbers for MVCC (Multi-Version
+	/// Concurrency Control). Snapshots provide consistent point-in-time views
+	/// of the data. The tracker stores actual sequence numbers to enable
+	/// snapshot-aware compaction.
+	pub(crate) snapshot_tracker: SnapshotTracker,
 
 	/// Value Log (VLog)
 	pub(crate) vlog: Option<Arc<VLog>>,
@@ -133,6 +130,11 @@ pub(crate) struct CoreInner {
 
 	/// Background error handler
 	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
+
+	/// Visible sequence number - the highest sequence number that is visible to readers.
+	/// Shared with CommitPipeline for coordinated updates.
+	/// Used to set `earliest_seq` when creating new memtables for conflict detection.
+	pub(crate) visible_seq_num: Arc<AtomicU64>,
 }
 
 impl CoreInner {
@@ -146,11 +148,6 @@ impl CoreInner {
 		// Initialize immutable memtables
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
 
-		// TODO: Add a way to recover from the WAL or level manifest
-		// Initialize the transaction oracle for MVCC support
-		// The oracle provides monotonic timestamps for transaction ordering
-		let oracle = Oracle::new(Arc::clone(&opts.clock));
-
 		// Initialize level manifest FIRST to get log_number
 		let manifest = LevelManifest::new(Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
@@ -161,16 +158,19 @@ impl CoreInner {
 		let wal_instance =
 			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
 
+		// Starts at 0 since no commits have happened yet.
+		let visible_seq_num = Arc::new(AtomicU64::new(0));
+
 		// Initialize active memtable with its WAL number set to the initial WAL
 		// This tracks which WAL the memtable's data belongs to for later flush
-		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size));
+		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size, 0));
 		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
 		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
-		// Initialize versioned index if versioned queries are enabled
-		let versioned_index = if opts.enable_versioning {
+		// Initialize versioned index if B+tree versioned index is enabled
+		let versioned_index = if opts.enable_versioned_index {
 			// Create the versioned index directory if it doesn't exist
 			let versioned_index_dir = opts.versioned_index_dir();
 			let versioned_index_path = versioned_index_dir.join("index.bpt");
@@ -193,14 +193,65 @@ impl CoreInner {
 			active_memtable,
 			immutable_memtables,
 			level_manifest,
-			snapshot_counter: SnapshotCounter::default(),
-			oracle: Arc::new(oracle),
+			snapshot_tracker: SnapshotTracker::new(),
 			vlog,
 			wal: parking_lot::RwLock::new(wal_instance),
 			versioned_index,
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
+			visible_seq_num,
 		})
+	}
+
+	/// Get the earliest sequence number across all memtables.
+	/// Any key with seq >= this value is guaranteed to be in memtables.
+	/// Keys modified with seq < this value may have been flushed to SST.
+	pub(crate) fn get_earliest_memtable_seq(&self) -> Result<u64> {
+		// Check immutable memtables - the first (oldest by table_id) has the earliest seq
+		let immutables = self.immutable_memtables.read()?;
+		if let Some(oldest) = immutables.first() {
+			return Ok(oldest.memtable.earliest_seq());
+		}
+		drop(immutables);
+
+		// No immutables - use active memtable
+		let memtable = self.active_memtable.read()?;
+		Ok(memtable.earliest_seq())
+	}
+
+	pub(crate) fn check_keys_conflict<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
+	where
+		I: Iterator<Item = &'a [u8]>,
+	{
+		// Acquire locks once for all keys - this is the key optimization
+		let memtable = self.active_memtable.read()?;
+		let immutables = self.immutable_memtables.read()?;
+
+		for key in keys {
+			// Check active memtable first (most recent writes)
+			if let Some((ikey, _)) = memtable.get(key, None) {
+				if ikey.seq_num() > start_seq {
+					return Err(Error::TransactionWriteConflict);
+				}
+				// Key exists but was written before our transaction started - no conflict
+				continue;
+			}
+
+			// Check immutable memtables (newest to oldest by iterating in reverse)
+			for entry in immutables.iter().rev() {
+				if let Some((ikey, _)) = entry.memtable.get(key, None) {
+					if ikey.seq_num() > start_seq {
+						return Err(Error::TransactionWriteConflict);
+					}
+					// Key exists but was written before our transaction started - no conflict
+					break;
+				}
+			}
+			// Key not found in any memtable - no conflict for this key
+		}
+
+		// No conflicts found for any key
+		Ok(())
 	}
 
 	/// Flushes a memtable to SST and atomically updates the manifest.
@@ -309,9 +360,10 @@ impl CoreInner {
 		};
 
 		// Step 3: Swap memtable while STILL holding write lock
+		let earliest_seq = self.visible_seq_num.load(Ordering::Acquire);
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+			Arc::new(MemTable::new(self.opts.max_memtable_size, earliest_seq)),
 		);
 
 		// Set the WAL number on the new (empty) active memtable
@@ -463,11 +515,14 @@ impl CoreInner {
 		// Get the current WAL number for the new memtable
 		let current_wal_number = self.wal.read().get_active_log_number();
 
+		// Get the current visible_seq_num as earliest_seq for the new memtable
+		let earliest_seq = self.visible_seq_num.load(Ordering::Acquire);
+
 		// Swap the active memtable with a new empty one
 		// This allows writes to continue immediately
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+			Arc::new(MemTable::new(self.opts.max_memtable_size, earliest_seq)),
 		);
 
 		// Set the WAL number on the new active memtable
@@ -770,7 +825,7 @@ impl CommitEnv for LsmCommitEnv {
 		let mut timestamp_entries = Vec::with_capacity(batch.count() as usize);
 
 		let vlog_threshold = self.core.opts.vlog_value_threshold;
-		let is_versioning_enabled = self.core.opts.enable_versioning;
+		let is_versioned_index_enabled = self.core.opts.enable_versioned_index;
 		let has_vlog = self.core.vlog.is_some();
 
 		for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
@@ -787,7 +842,7 @@ impl CommitEnv for LsmCommitEnv {
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
-					if is_versioning_enabled {
+					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
@@ -799,7 +854,7 @@ impl CommitEnv for LsmCommitEnv {
 					let encoded = value_location.encode();
 
 					// Add to versioned index if enabled
-					if is_versioning_enabled {
+					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
@@ -807,7 +862,7 @@ impl CommitEnv for LsmCommitEnv {
 				}
 				None => {
 					// Delete operation: no value but may need versioned index entry
-					if is_versioning_enabled {
+					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), Vec::new()));
 					}
 					(None, None)
@@ -833,8 +888,19 @@ impl CommitEnv for LsmCommitEnv {
 			}
 		}
 
-		// Write to versioned index if present
-		if is_versioning_enabled {
+		// Write to WAL for durability BEFORE updating versioned index
+		// This ensures the data is persisted before the index reflects it
+		let enc_bytes = processed_batch.encode()?;
+		let mut wal_guard = self.core.wal.write();
+		wal_guard.append(&enc_bytes)?;
+		if sync {
+			wal_guard.sync()?;
+		}
+		drop(wal_guard);
+
+		// Write to versioned index AFTER WAL write succeeds
+		// This ensures the index only reflects data that has been durably persisted
+		if is_versioned_index_enabled {
 			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write();
 
 			// Single pass: process each entry individually
@@ -872,14 +938,6 @@ impl CommitEnv for LsmCommitEnv {
 				// Insert the new entry (whether it's regular Set or SetWithDelete)
 				versioned_index_guard.insert(encoded_key, encoded_value)?;
 			}
-		}
-
-		// Write to WAL for durability
-		let enc_bytes = processed_batch.encode()?;
-		let mut wal_guard = self.core.wal.write();
-		wal_guard.append(&enc_bytes)?;
-		if sync {
-			wal_guard.sync()?;
 		}
 
 		Ok(processed_batch)
@@ -1096,7 +1154,9 @@ impl Core {
 		let commit_env =
 			Arc::new(LsmCommitEnv::new(Arc::clone(&inner), Arc::clone(&task_manager))?);
 
-		let commit_pipeline = CommitPipeline::new(commit_env);
+		// Pass the shared visible_seq_num from CoreInner to CommitPipeline
+		// Both will use the same atomic for coordinated updates
+		let commit_pipeline = CommitPipeline::new(commit_env, Arc::clone(&inner.visible_seq_num));
 
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
@@ -1211,6 +1271,37 @@ impl Core {
 
 	pub(crate) fn seq_num(&self) -> u64 {
 		self.commit_pipeline.get_visible_seq_num()
+	}
+
+	/// Flushes WAL and VLog buffers to OS cache.
+	///
+	/// If `sync` is true, also fsyncs to disk for durability.
+	/// This is safe to call concurrently with ongoing transactions.
+	///
+	/// # Order of Operations
+	///
+	/// VLog is flushed first (contains data referenced by WAL), then WAL.
+	/// This ensures that if WAL contains a ValuePointer, the referenced
+	/// VLog data is at least as durable.
+	pub(crate) fn flush_wal(&self, sync: bool) -> Result<()> {
+		// Flush VLog first (contains data referenced by WAL)
+		if let Some(ref vlog) = self.vlog {
+			if sync {
+				vlog.sync()?;
+			} else {
+				vlog.flush()?;
+			}
+		}
+
+		// Then flush WAL
+		let mut wal_guard = self.wal.write();
+		if sync {
+			wal_guard.sync()?;
+		} else {
+			wal_guard.flush()?;
+		}
+
+		Ok(())
 	}
 
 	/// Safely closes the LSM tree by shutting down all components in the
@@ -1452,8 +1543,10 @@ impl Tree {
 		// Clear the current memtables since they would be stale after restore
 		// This discards any pending writes, which is correct for restore operations
 		{
+			let earliest_seq = self.core.inner.visible_seq_num.load(Ordering::Acquire);
 			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable = Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size));
+			*active_memtable =
+				Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size, earliest_seq));
 		}
 
 		{
@@ -1527,7 +1620,7 @@ impl Tree {
 	#[cfg(test)]
 	pub(crate) fn get_all_vlog_stats(&self) -> Vec<(u32, u64, u64, f64)> {
 		match &self.core.vlog {
-			Some(vlog) => vlog.get_all_file_stats(),
+			Some(vlog) => vlog.get_all_file_stats().unwrap(),
 			None => Vec::new(),
 		}
 	}
@@ -1536,7 +1629,7 @@ impl Tree {
 	/// Updates VLog discard statistics if VLog is enabled
 	pub(crate) fn update_vlog_discard_stats(&self, stats: &HashMap<u32, i64>) {
 		if let Some(ref vlog) = self.core.vlog {
-			vlog.update_discard_stats(stats);
+			vlog.update_discard_stats(stats).unwrap();
 		}
 	}
 
@@ -1554,7 +1647,8 @@ impl Tree {
 
 	/// Flushes all memtables to disk synchronously.
 	/// This is a blocking operation that ensures all data is persisted before returning.
-	pub fn flush(&self) -> Result<()> {
+	#[cfg(test)]
+	pub(crate) fn flush(&self) -> Result<()> {
 		// Step 1: Rotate active memtable if it has data
 		{
 			let active = self.core.inner.active_memtable.read()?;
@@ -1570,6 +1664,19 @@ impl Tree {
 
 	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
 		self.core.sync_commit(batch, sync_wal)
+	}
+
+	/// Flushes WAL and VLog buffers to OS cache.
+	///
+	/// If `sync` is true, also fsyncs to disk, guaranteeing durability
+	/// of all previously committed transactions.
+	///
+	/// If `sync` is false, only flushes to OS buffer cache (faster but
+	/// not durable across power loss).
+	///
+	/// This is safe to call concurrently with ongoing transactions.
+	pub fn flush_wal(&self, sync: bool) -> Result<()> {
+		self.core.flush_wal(sync)
 	}
 }
 
@@ -1744,6 +1851,14 @@ impl TreeBuilder {
 	/// Enables or disables versioned queries with timestamp tracking
 	pub fn with_versioning(mut self, enable: bool, retention_ns: u64) -> Self {
 		self.opts = self.opts.with_versioning(enable, retention_ns);
+		self
+	}
+
+	/// Enables or disables the B+tree versioned index for timestamp-based queries.
+	/// When disabled, versioned queries will scan the LSM tree directly.
+	/// Requires `with_versioning` to be called first with `enable = true`.
+	pub fn with_versioned_index(mut self, enable: bool) -> Self {
+		self.opts = self.opts.with_versioned_index(enable);
 		self
 	}
 

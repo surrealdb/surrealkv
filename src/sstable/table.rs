@@ -88,12 +88,11 @@ use crate::{
 	Comparator,
 	CompressionType,
 	FilterPolicy,
-	InternalIterator,
 	InternalKey,
-	InternalKeyComparator,
 	InternalKeyKind,
 	InternalKeyRange,
 	InternalKeyRef,
+	LSMIterator,
 	Options,
 	Value,
 	INTERNAL_KEY_SEQ_NUM_MAX,
@@ -731,7 +730,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 	if metaindexiter.is_valid() {
 		let k = metaindexiter.key();
 		assert_eq!(k.user_key(), b"meta");
-		let buf_bytes = metaindexiter.value();
+		let buf_bytes = metaindexiter.value_encoded()?;
 		return Ok(Some(TableMetadata::decode(buf_bytes)?));
 	}
 	Ok(None)
@@ -739,7 +738,7 @@ fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> 
 
 /// Reads and verifies a table block from the file.
 pub fn read_table_block(
-	comparator: Arc<InternalKeyComparator>,
+	comparator: Arc<dyn Comparator>,
 	f: Arc<dyn File>,
 	location: &BlockHandle,
 ) -> Result<Block> {
@@ -910,7 +909,7 @@ impl Table {
 		if metaindexiter.is_valid() {
 			let k = metaindexiter.key();
 			assert_eq!(k.user_key(), filter_name.as_bytes());
-			let val = metaindexiter.value();
+			let val = metaindexiter.value_encoded()?;
 
 			let fbl = BlockHandle::decode(val);
 			let filter_block_location = match fbl {
@@ -951,6 +950,36 @@ impl Table {
 
 		// Insert into cache
 		self.opts.block_cache.insert_data_block(self.id, location.offset() as u64, Arc::clone(&b));
+
+		Ok(b)
+	}
+
+	/// Reads a data block with a custom comparator, using the history cache.
+	///
+	/// History blocks are cached separately from normal data blocks since they
+	/// use different comparators for iteration.
+	pub(crate) fn read_block_with_comparator(
+		&self,
+		location: &BlockHandle,
+		comparator: Arc<dyn Comparator>,
+	) -> Result<Arc<Block>> {
+		// Check history cache first
+		if let Some(block) =
+			self.opts.block_cache.get_data_block_history(self.id, location.offset() as u64)
+		{
+			return Ok(block);
+		}
+
+		// Cache miss: read from disk
+		let b = read_table_block(comparator, Arc::clone(&self.file), location)?;
+		let b = Arc::new(b);
+
+		// Insert into history cache
+		self.opts.block_cache.insert_data_block_history(
+			self.id,
+			location.offset() as u64,
+			Arc::clone(&b),
+		);
 
 		Ok(b)
 	}
@@ -1020,7 +1049,7 @@ impl Table {
 		iter.seek_internal(&key_encoded)?;
 
 		if iter.is_valid() && iter.user_key() == key.user_key.as_slice() {
-			Ok(Some((iter.key().to_owned(), iter.value().to_vec())))
+			Ok(Some((iter.key().to_owned(), iter.value_encoded()?.to_vec())))
 		} else {
 			Ok(None)
 		}
@@ -1030,6 +1059,16 @@ impl Table {
 	pub fn iter(&self, range: Option<InternalKeyRange>) -> Result<TableIterator<'_>> {
 		let range = range.unwrap_or((Bound::Unbounded, Bound::Unbounded));
 		TableIterator::new(self, range)
+	}
+
+	/// Creates an iterator over the table with a custom comparator.
+	pub(crate) fn iter_with_comparator(
+		&self,
+		range: Option<InternalKeyRange>,
+		comparator: Arc<dyn Comparator>,
+	) -> Result<TableIterator<'_>> {
+		let range = range.unwrap_or((Bound::Unbounded, Bound::Unbounded));
+		TableIterator::new_with_comparator(self, range, comparator)
 	}
 
 	pub fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
@@ -1224,6 +1263,11 @@ pub struct TableIterator<'a> {
 
 	/// Whether the iterator has been exhausted
 	exhausted: bool,
+
+	/// Optional custom comparator for iteration.
+	/// When set, blocks are read with this comparator instead of the default.
+	/// Used for specialized iteration patterns like history queries.
+	custom_comparator: Option<Arc<dyn Comparator>>,
 }
 
 impl<'a> TableIterator<'a> {
@@ -1236,6 +1280,28 @@ impl<'a> TableIterator<'a> {
 			second_level: None,
 			range,
 			exhausted: false,
+			custom_comparator: None,
+		})
+	}
+
+	/// Creates a new TableIterator with a custom comparator.
+	///
+	/// The custom comparator will be used for block iteration, enabling
+	/// specialized iteration patterns like timestamp-based history queries.
+	pub(crate) fn new_with_comparator(
+		table: &'a Table,
+		range: InternalKeyRange,
+		comparator: Arc<dyn Comparator>,
+	) -> Result<Self> {
+		let IndexType::Partitioned(ref partitioned_index) = table.index_block;
+
+		Ok(Self {
+			table,
+			first_level: IndexIterator::new(partitioned_index),
+			second_level: None,
+			range,
+			exhausted: false,
+			custom_comparator: Some(comparator),
 		})
 	}
 
@@ -1263,9 +1329,14 @@ impl<'a> TableIterator<'a> {
 
 		let handle = self.first_level.block_handle()?;
 
-		// Load data block (may come from cache)
-		let block = self.table.read_block(&handle)?;
-		let iter = block.iter()?;
+		// Load data block - use custom comparator if set, otherwise use cached version
+		let iter = if let Some(ref comparator) = self.custom_comparator {
+			let block = self.table.read_block_with_comparator(&handle, Arc::clone(comparator))?;
+			block.iter()?
+		} else {
+			let block = self.table.read_block(&handle)?;
+			block.iter()?
+		};
 		self.second_level = Some(iter);
 		Ok(())
 	}
@@ -1711,7 +1782,7 @@ impl<'a> TableIterator<'a> {
 	}
 }
 
-impl InternalIterator for TableIterator<'_> {
+impl LSMIterator for TableIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.exhausted = false;
 		self.seek_internal(target)?;
@@ -1777,8 +1848,8 @@ impl InternalIterator for TableIterator<'_> {
 		InternalKeyRef::from_encoded(self.second_level.as_ref().unwrap().key_bytes())
 	}
 
-	fn value(&self) -> &[u8] {
+	fn value_encoded(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
-		self.second_level.as_ref().unwrap().value_bytes()
+		Ok(self.second_level.as_ref().unwrap().value_bytes())
 	}
 }

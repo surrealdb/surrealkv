@@ -14,7 +14,6 @@ mod levels;
 mod lockfile;
 mod lsm;
 mod memtable;
-mod oracle;
 mod snapshot;
 pub mod sstable;
 mod task;
@@ -37,7 +36,14 @@ use sstable::bloom::LevelDBBloomFilter;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
-pub use crate::transaction::{Durability, Mode, ReadOptions, Transaction, WriteOptions};
+pub use crate::transaction::{
+	Durability,
+	HistoryOptions,
+	Mode,
+	ReadOptions,
+	Transaction,
+	WriteOptions,
+};
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {
@@ -153,7 +159,7 @@ pub struct Options {
 	pub block_restart_interval: usize,
 	pub filter_policy: Option<Arc<dyn FilterPolicy>>,
 	pub comparator: Arc<dyn Comparator>,
-	pub internal_comparator: Arc<InternalKeyComparator>,
+	pub internal_comparator: Arc<dyn Comparator>,
 	pub compression_per_level: Vec<CompressionType>,
 	pub(crate) block_cache: Arc<cache::BlockCache>,
 	pub path: PathBuf,
@@ -175,6 +181,10 @@ pub struct Options {
 	// Versioned query configuration
 	/// If true, enables versioned queries with timestamp tracking
 	pub enable_versioning: bool,
+	/// If true, creates a B+tree index for timestamp-based queries.
+	/// Requires enable_versioning to be true.
+	/// When false, versioned queries will scan the LSM tree directly.
+	pub enable_versioned_index: bool,
 	/// History retention period in nanoseconds (0 means no retention limit)
 	/// Default: 0 (no retention limit)
 	pub versioned_history_retention_ns: u64,
@@ -213,7 +223,8 @@ impl Default for Options {
 		let clock = Arc::new(DefaultLogicalClock::new());
 
 		let comparator: Arc<dyn Comparator> = Arc::new(crate::BytewiseComparator {});
-		let internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&comparator)));
+		let internal_comparator: Arc<dyn Comparator> =
+			Arc::new(InternalKeyComparator::new(Arc::clone(&comparator)));
 
 		Self {
 			block_size: 64 * 1024, // 64KB
@@ -233,6 +244,7 @@ impl Default for Options {
 			vlog_gc_discard_ratio: 0.5, // 50% default
 			vlog_value_threshold: 1024, // 1KB default
 			enable_versioning: false,
+			enable_versioned_index: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
 			flush_on_close: true,
@@ -418,6 +430,14 @@ impl Options {
 		self
 	}
 
+	/// Enables or disables the B+tree versioned index for timestamp-based queries.
+	/// When disabled, versioned queries will scan the LSM tree directly.
+	/// Requires `enable_versioning` to be true for this to have any effect.
+	pub const fn with_versioned_index(mut self, value: bool) -> Self {
+		self.enable_versioned_index = value;
+		self
+	}
+
 	/// Controls whether to flush the active memtable during database shutdown.
 	///
 	/// When enabled, ensures all in-memory data is persisted to SSTables before
@@ -557,6 +577,13 @@ impl Options {
 					"Versioned queries require all values to be stored in VLog. Set vlog_value_threshold to 0.".to_string(),
 				));
 			}
+		}
+
+		// Validate versioned index requires versioning to be enabled
+		if self.enable_versioned_index && !self.enable_versioning {
+			return Err(Error::InvalidArgument(
+				"Versioned index requires versioning to be enabled. Call with_versioning(true, retention_ns) first.".to_string(),
+			));
 		}
 
 		// Validate level count is reasonable
@@ -711,7 +738,7 @@ fn is_replace_kind(kind: InternalKeyKind) -> bool {
 }
 
 #[repr(u8)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum InternalKeyKind {
 	Delete = 0,
 	SoftDelete = 1,
@@ -731,8 +758,10 @@ impl From<u8> for InternalKeyKind {
 	}
 }
 
-/// InternalKey is the main key type used throughout the LSM tree
-/// It includes a timestamp field for versioned queries
+/// Internal key type used throughout the LSM tree.
+///
+/// This is the owned version of `InternalKeyRef`. It includes the user key,
+/// timestamp, and trailer (containing sequence number and operation kind).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct InternalKey {
 	pub user_key: Key,
@@ -820,8 +849,8 @@ impl InternalKey {
 	pub fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
 		// First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
-			// If user keys are equal, compare by timestamp (ascending - older timestamps first)
-			Ordering::Equal => self.timestamp.cmp(&other.timestamp),
+			// If user keys are equal, compare by timestamp (descending - newer timestamps first)
+			Ordering::Equal => other.timestamp.cmp(&self.timestamp),
 			ordering => ordering,
 		}
 	}
@@ -830,12 +859,15 @@ impl InternalKey {
 // Used only by memtable, sstable uses internal key comparator
 impl Ord for InternalKey {
 	fn cmp(&self, other: &Self) -> Ordering {
-		// Same as InternalKey: user key, then sequence number, then kind, with
-		// timestamp as final tiebreaker First compare by user key (ascending)
 		match self.user_key.cmp(&other.user_key) {
-			// If user keys are equal, compare by sequence number (descending)
-			Ordering::Equal => other.seq_num().cmp(&self.seq_num()),
-			ordering => ordering,
+			Ordering::Equal => match other.seq_num().cmp(&self.seq_num()) {
+				Ordering::Equal => match self.kind().cmp(&other.kind()) {
+					Ordering::Equal => other.timestamp.cmp(&self.timestamp), // DESC for timestamp
+					ord => ord,
+				},
+				ord => ord,
+			},
+			ord => ord,
 		}
 	}
 }
@@ -847,6 +879,14 @@ impl PartialOrd for InternalKey {
 }
 
 /// A zero-copy reference to an internal key.
+/// Zero-copy reference to an internal key.
+///
+/// Provides access to all components of an internal key:
+/// - User key bytes
+/// - Timestamp
+/// - Sequence number
+/// - Operation kind (Set, Delete, etc.)
+///
 /// The data lives in the source buffer (arena, block, etc.)
 #[derive(Clone, Copy)]
 pub struct InternalKeyRef<'a> {
@@ -898,7 +938,17 @@ impl<'a> InternalKeyRef<'a> {
 		is_delete_kind(self.kind())
 	}
 
-	pub fn to_owned(&self) -> InternalKey {
+	#[inline]
+	pub fn is_hard_delete_marker(&self) -> bool {
+		is_hard_delete_marker(self.kind())
+	}
+
+	#[inline]
+	pub fn is_replace(&self) -> bool {
+		is_replace_kind(self.kind())
+	}
+
+	pub fn to_owned(self) -> InternalKey {
 		InternalKey::decode(self.encoded)
 	}
 }
@@ -923,9 +973,27 @@ impl std::fmt::Debug for InternalKeyRef<'_> {
 }
 
 /// Cursor-based iterator for internal key-value pairs.
-pub trait InternalIterator {
+///
+/// This trait provides low-level access to the LSM tree's internal key-value pairs.
+/// Keys are returned as `InternalKeyRef` which includes the user key, timestamp,
+/// sequence number, and operation kind.
+///
+/// # Example
+/// ```ignore
+/// let mut iter = tx.range(b"a", b"z")?;
+/// iter.seek(b"foo")?;  // Position at first version of "foo"
+/// while iter.valid() {
+///     let key_ref = iter.key();
+///     let user_key = key_ref.user_key();
+///     let ts = key_ref.timestamp();
+///     let is_del = key_ref.is_tombstone();
+///     let value = iter.value()?;
+///     iter.next()?;
+/// }
+/// ```
+pub trait LSMIterator {
 	/// Seek to first key >= target. Returns Ok(true) if valid.
-	/// Target is an encoded internal key.
+	/// Target is an encoded internal key. Use `encode_seek_key()` to encode a user key.
 	fn seek(&mut self, target: &[u8]) -> Result<bool>;
 
 	/// Seek to first entry. Returns Ok(true) if valid.
@@ -944,8 +1012,28 @@ pub trait InternalIterator {
 	fn valid(&self) -> bool;
 
 	/// Get current key (zero-copy). Caller must check valid() first.
+	///
+	/// Returns an `InternalKeyRef` which provides access to:
+	/// - `user_key()` - the application's key bytes
+	/// - `timestamp()` - the version timestamp
+	/// - `seq_num()` - the sequence number
+	/// - `kind()` - the operation kind (Set, Delete, etc.)
+	/// - `is_tombstone()` - whether this is a delete marker
 	fn key(&self) -> InternalKeyRef<'_>;
 
-	/// Get current value (zero-copy). Caller must check valid() first.
-	fn value(&self) -> &[u8];
+	/// Get current raw value bytes (zero-copy). Caller must check valid() first.
+	///
+	/// For transaction-level iterators, this returns raw bytes that may be
+	/// VLog-encoded. Use `value()` for resolved values.
+	fn value_encoded(&self) -> Result<&[u8]>;
+
+	/// Get current value as owned bytes with VLog resolution.
+	///
+	/// This method resolves VLog pointers to actual values, returning owned data.
+	/// For iterators without VLog (internal iterators), this clones the raw bytes.
+	///
+	/// Default implementation clones raw bytes from `value()`.
+	fn value(&self) -> Result<Value> {
+		Ok(self.value_encoded()?.to_vec())
+	}
 }

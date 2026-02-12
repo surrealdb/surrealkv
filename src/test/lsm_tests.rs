@@ -9,7 +9,17 @@ use crate::compaction::leveled::Strategy;
 use crate::levels::LevelManifest;
 use crate::lsm::{CompactionOperations, Core, CoreInner};
 use crate::test::collect_transaction_all;
-use crate::{Error, InternalKeyKind, Key, Options, Tree, TreeBuilder, Value, WalRecoveryMode};
+use crate::{
+	Error,
+	InternalKeyKind,
+	Key,
+	LSMIterator,
+	Options,
+	Tree,
+	TreeBuilder,
+	Value,
+	WalRecoveryMode,
+};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -460,8 +470,8 @@ async fn test_simple_range_seek() {
 	// Verify the keys and values are correct
 	let expected_before = [("a", "a"), ("b", "b"), ("c", "c")];
 	for (idx, (key, value)) in range_before_flush.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 		assert_eq!(key_str, expected_before[idx].0, "Key mismatch at index {idx} before flush");
 		assert_eq!(value_str, expected_before[idx].1, "Value mismatch at index {idx} before flush");
 	}
@@ -479,8 +489,8 @@ async fn test_simple_range_seek() {
 	// Verify the keys and values are still correct after flush
 	let expected_after = [("a", "a"), ("b", "b"), ("c", "c")];
 	for (idx, (key, value)) in range_after_flush.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 		assert_eq!(key_str, expected_after[idx].0, "Key mismatch at index {idx} after flush");
 		assert_eq!(value_str, expected_after[idx].1, "Value mismatch at index {idx} after flush");
 	}
@@ -546,8 +556,8 @@ async fn test_large_range_scan() {
 
 	// Verify each item is correct and in order
 	for (idx, (key, value)) in range_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_key = &expected_items[idx].0;
 		let expected_value = &expected_items[idx].1;
@@ -574,8 +584,8 @@ async fn test_large_range_scan() {
 
 	// Verify each item in partial range
 	for (idx, (key, value)) in partial_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_key = &expected_items[idx].0;
 		let expected_value = &expected_items[idx].1;
@@ -602,8 +612,8 @@ async fn test_large_range_scan() {
 
 	// Verify each item in middle range
 	for (idx, (key, value)) in middle_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 5000 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -630,8 +640,8 @@ async fn test_large_range_scan() {
 
 	// Verify each item in end range
 	for (idx, (key, value)) in end_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 9900 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -658,8 +668,8 @@ async fn test_large_range_scan() {
 	assert_eq!(single_result.len(), 1, "Single item range scan should return 1 item");
 
 	let (key, value) = &single_result[0];
-	let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-	let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+	let key_str = std::str::from_utf8(key).unwrap();
+	let value_str = std::str::from_utf8(value).unwrap();
 
 	assert_eq!(key_str, "key_004567");
 	assert_eq!(value_str, "value_004567_content_data_9134");
@@ -719,7 +729,9 @@ async fn test_range_skip_take() {
 		if !iter.valid() {
 			break;
 		}
-		range_result.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value().unwrap();
+		range_result.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -730,8 +742,8 @@ async fn test_range_skip_take() {
 	);
 
 	for (idx, (key, value)) in range_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 5000 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -807,7 +819,9 @@ async fn test_range_skip_take_alphabetical() {
 		if !iter.valid() {
 			break;
 		}
-		range_result.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value().unwrap();
+		range_result.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -818,8 +832,8 @@ async fn test_range_skip_take_alphabetical() {
 	);
 
 	for (idx, (key, value)) in range_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 5000 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -873,7 +887,9 @@ async fn test_range_limit_functionality() {
 		if !iter.valid() {
 			break;
 		}
-		limited_result.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value().unwrap();
+		limited_result.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -884,8 +900,8 @@ async fn test_range_limit_functionality() {
 	);
 
 	for (idx, (key, value)) in limited_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_key = &expected_items[idx].0;
 		let expected_value = &expected_items[idx].1;
@@ -909,7 +925,9 @@ async fn test_range_limit_functionality() {
 		if !iter.valid() {
 			break;
 		}
-		limited_result_1000.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value().unwrap();
+		limited_result_1000.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -920,8 +938,8 @@ async fn test_range_limit_functionality() {
 	);
 
 	for (idx, (key, value)) in limited_result_1000.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_key = &expected_items[idx].0;
 		let expected_value = &expected_items[idx].1;
@@ -945,7 +963,9 @@ async fn test_range_limit_functionality() {
 		if !iter.valid() {
 			break;
 		}
-		limited_result_large.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value().unwrap();
+		limited_result_large.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -970,14 +990,16 @@ async fn test_range_limit_functionality() {
 	// Take 1 item
 	let mut single_result = Vec::new();
 	if iter.valid() {
-		single_result.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value().unwrap();
+		single_result.push((key, value));
 	}
 
 	assert_eq!(single_result.len(), 1, "Range scan with .take(1) should return exactly 1 item");
 
 	let (key, value) = &single_result[0];
-	let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-	let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+	let key_str = std::str::from_utf8(key).unwrap();
+	let value_str = std::str::from_utf8(value).unwrap();
 
 	assert_eq!(key_str, "key_000000");
 	assert_eq!(value_str, "value_000000_content_data_0");
@@ -1035,7 +1057,9 @@ async fn test_range_limit_with_skip_take() {
 		if !iter.valid() {
 			break;
 		}
-		unlimited_range_result.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value().unwrap();
+		unlimited_range_result.push((key, value));
 		iter.next().unwrap();
 	}
 
@@ -1046,8 +1070,8 @@ async fn test_range_limit_with_skip_take() {
 	);
 
 	for (idx, (key, value)) in unlimited_range_result.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 5000 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -1080,15 +1104,17 @@ async fn test_range_limit_with_skip_take() {
 		if !iter.valid() {
 			break;
 		}
-		res.push((iter.key(), iter.value().unwrap()));
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value().unwrap();
+		res.push((key, value));
 		iter.next().unwrap();
 	}
 
 	assert_eq!(res.len(), 50, "Range scan followed by skip(5000).take(50) should return 50 items");
 
 	for (idx, (key, value)) in res.iter().enumerate() {
-		let key_str = std::str::from_utf8(key.as_ref()).unwrap();
-		let value_str = std::str::from_utf8(value.as_ref().unwrap().as_ref()).unwrap();
+		let key_str = std::str::from_utf8(key).unwrap();
+		let value_str = std::str::from_utf8(value).unwrap();
 
 		let expected_idx = 5000 + idx;
 		let expected_key = &expected_items[expected_idx].0;
@@ -1173,7 +1199,6 @@ async fn test_vlog_concurrent_operations() {
 	}
 
 	// Force flush to ensure all data is persisted
-	tree.flush().unwrap();
 	tree.close().await.unwrap();
 
 	let tree = Arc::new(tree);
@@ -2152,7 +2177,7 @@ async fn test_soft_delete() {
 		// Should contain the other key
 		assert_eq!(range_result.len(), 1);
 		assert_eq!(&range_result[0].0, b"other_key");
-		assert_eq!(range_result[0].1.as_ref().unwrap().as_slice(), b"other_value");
+		assert_eq!(range_result[0].1.as_slice(), b"other_value");
 
 		// Test that we can reinsert the same key after soft delete
 		let mut txn = tree.begin().unwrap();
@@ -4555,5 +4580,602 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		log::info!("Phase 4: All data verified - no data loss!");
 
 		tree.close().await.unwrap();
+	}
+}
+
+// Test if flush_wal is concurrent safe and does not block the commit pipeline.
+#[test(tokio::test)]
+async fn test_flush_wal_concurrent_commits() {
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	use tokio::task::JoinSet;
+
+	let temp_dir = create_temp_directory();
+	let opts = create_test_options(temp_dir.path().to_path_buf(), |opts| {
+		opts.enable_vlog = true;
+		opts.vlog_value_threshold = 50; // Some values will go to VLog
+	});
+
+	let tree = Arc::new(Tree::new(opts).unwrap());
+	let commit_count = Arc::new(AtomicUsize::new(0));
+	let flush_count = Arc::new(AtomicUsize::new(0));
+
+	let num_commit_tasks = 8;
+	let commits_per_task = 25;
+	let num_flush_tasks = 2;
+	let flushes_per_task = 50;
+
+	let mut join_set = JoinSet::new();
+
+	// Spawn commit tasks
+	for task_id in 0..num_commit_tasks {
+		let tree = Arc::clone(&tree);
+		let commit_count = Arc::clone(&commit_count);
+
+		join_set.spawn(async move {
+			for i in 0..commits_per_task {
+				let key = format!("task{}_key{}", task_id, i);
+				let value = if i % 2 == 0 {
+					// Small value (inline)
+					format!("value{}", i)
+				} else {
+					// Large value (VLog)
+					"x".repeat(100)
+				};
+
+				let mut txn = tree.begin().unwrap();
+				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+				txn.commit().await.unwrap();
+				commit_count.fetch_add(1, Ordering::SeqCst);
+			}
+		});
+	}
+
+	// Spawn flush tasks
+	for _ in 0..num_flush_tasks {
+		let tree = Arc::clone(&tree);
+		let flush_count = Arc::clone(&flush_count);
+
+		join_set.spawn(async move {
+			for i in 0..flushes_per_task {
+				// Alternate between flush and sync
+				let sync = i % 2 == 0;
+				let result = tree.flush_wal(sync);
+				assert!(result.is_ok(), "flush_wal should succeed during concurrent commits");
+				flush_count.fetch_add(1, Ordering::SeqCst);
+				// Small yield to allow interleaving
+				tokio::task::yield_now().await;
+			}
+		});
+	}
+
+	// Wait for all tasks to complete
+	while let Some(result) = join_set.join_next().await {
+		result.expect("Task should complete successfully");
+	}
+
+	// Verify counts
+	assert_eq!(
+		commit_count.load(Ordering::SeqCst),
+		num_commit_tasks * commits_per_task,
+		"All commits should complete"
+	);
+	assert_eq!(
+		flush_count.load(Ordering::SeqCst),
+		num_flush_tasks * flushes_per_task,
+		"All flushes should complete"
+	);
+
+	// Verify all data is accessible
+	{
+		let txn = tree.begin().unwrap();
+		for task_id in 0..num_commit_tasks {
+			for i in 0..commits_per_task {
+				let key = format!("task{}_key{}", task_id, i);
+				let result = txn.get(key.as_bytes()).unwrap();
+				assert!(result.is_some(), "Key {} should exist after concurrent operations", key);
+			}
+		}
+	}
+
+	tree.close().await.unwrap();
+}
+
+/// Test that verifies lexicographic byte ordering with keys of varying lengths.
+/// This ensures that keys like "a" < "b" < "ba" < "baaa" < "baaaaaaaaaaaaaaaaaa1" < "c"
+/// are correctly ordered during range scans, both before and after flush.
+#[test(tokio::test)]
+async fn test_range_key_ordering_correctness() {
+	use crate::test::collect_transaction_reverse;
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_small_memtable_options(path.clone());
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Keys in expected lexicographic sorted order
+	let keys_in_order = ["a", "b", "ba", "baaa", "baaaaaaaaaaaaaaaaaa1", "c"];
+
+	// Insert keys in random order to ensure sorting is done by the system
+	let insert_order = ["baaa", "c", "a", "baaaaaaaaaaaaaaaaaa1", "b", "ba"];
+	for key in insert_order.iter() {
+		let mut txn = tree.begin().unwrap();
+		let value = format!("value_for_{}", key);
+		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Test BEFORE flush (memtable path)
+	{
+		let txn = tree.begin().unwrap();
+
+		// Forward iteration
+		let range_result = collect_transaction_all(&mut txn.range(b"a", b"d").unwrap()).unwrap();
+
+		assert_eq!(
+			range_result.len(),
+			keys_in_order.len(),
+			"Should return all {} keys",
+			keys_in_order.len()
+		);
+
+		// Verify forward order
+		for (idx, (key, value)) in range_result.iter().enumerate() {
+			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+			let expected_key = keys_in_order[idx];
+			let expected_value = format!("value_for_{}", expected_key);
+
+			assert_eq!(
+				key_str, expected_key,
+				"Forward iteration: Key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
+			);
+			assert_eq!(
+				value.as_slice(),
+				expected_value.as_bytes(),
+				"Forward iteration: Value mismatch at index {idx}"
+			);
+		}
+
+		// Reverse iteration
+		let reverse_result =
+			collect_transaction_reverse(&mut txn.range(b"a", b"d").unwrap()).unwrap();
+
+		assert_eq!(
+			reverse_result.len(),
+			keys_in_order.len(),
+			"Reverse should return all {} keys",
+			keys_in_order.len()
+		);
+
+		// Verify reverse order
+		for (idx, (key, _value)) in reverse_result.iter().enumerate() {
+			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+			let expected_key = keys_in_order[keys_in_order.len() - 1 - idx];
+
+			assert_eq!(
+				key_str, expected_key,
+				"Reverse iteration: Key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
+			);
+		}
+	}
+
+	// Flush to disk
+	tree.flush().unwrap();
+
+	// Test AFTER flush (SSTable path)
+	{
+		let txn = tree.begin().unwrap();
+
+		// Forward iteration
+		let range_result = collect_transaction_all(&mut txn.range(b"a", b"d").unwrap()).unwrap();
+
+		assert_eq!(
+			range_result.len(),
+			keys_in_order.len(),
+			"After flush: Should return all {} keys",
+			keys_in_order.len()
+		);
+
+		// Verify forward order after flush
+		for (idx, (key, value)) in range_result.iter().enumerate() {
+			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+			let expected_key = keys_in_order[idx];
+			let expected_value = format!("value_for_{}", expected_key);
+
+			assert_eq!(
+				key_str, expected_key,
+				"After flush forward: Key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
+			);
+			assert_eq!(
+				value.as_slice(),
+				expected_value.as_bytes(),
+				"After flush forward: Value mismatch at index {idx}"
+			);
+		}
+
+		// Reverse iteration after flush
+		let reverse_result =
+			collect_transaction_reverse(&mut txn.range(b"a", b"d").unwrap()).unwrap();
+
+		for (idx, (key, _value)) in reverse_result.iter().enumerate() {
+			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+			let expected_key = keys_in_order[keys_in_order.len() - 1 - idx];
+
+			assert_eq!(
+				key_str, expected_key,
+				"After flush reverse: Key mismatch at index {idx}: expected '{expected_key}', found '{key_str}'"
+			);
+		}
+	}
+}
+
+/// Test that keys with common prefixes are correctly differentiated.
+/// This tests SurrealDB-like namespace patterns where table records and index records
+/// share a common prefix but should be distinguishable by range scans.
+///
+/// If partial prefix matching incorrectly includes wrong records, deserializing
+/// an index record as a table record (or vice versa) would cause errors.
+#[test(tokio::test)]
+async fn test_range_prefix_differentiation() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_small_memtable_options(path.clone());
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Table records: /ns/db/tb/<id>
+	// Index records: /ns/db/ix/<name>
+	let table_records = [
+		("/ns/db/tb/1", "TableRecord1"),
+		("/ns/db/tb/2", "TableRecord2"),
+		("/ns/db/tb/10", "TableRecord10"),
+		("/ns/db/tb/100", "TableRecord100"),
+	];
+
+	let index_records =
+		[("/ns/db/ix/a", "IndexA"), ("/ns/db/ix/b", "IndexB"), ("/ns/db/ix/name_idx", "IndexName")];
+
+	// Insert all records
+	for (key, value) in table_records.iter().chain(index_records.iter()) {
+		let mut txn = tree.begin().unwrap();
+		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Test before flush
+	{
+		let txn = tree.begin().unwrap();
+
+		// Range scan for table records only: [/ns/db/tb/, /ns/db/tb0)
+		let table_range =
+			collect_transaction_all(&mut txn.range(b"/ns/db/tb/", b"/ns/db/tb0").unwrap()).unwrap();
+
+		assert_eq!(
+			table_range.len(),
+			table_records.len(),
+			"Table range should return exactly {} table records, got {}",
+			table_records.len(),
+			table_range.len()
+		);
+
+		// Verify all returned keys are table records
+		for (key, value) in table_range.iter() {
+			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+			assert!(
+				key_str.starts_with("/ns/db/tb/"),
+				"Key '{}' should be a table record (start with /ns/db/tb/)",
+				key_str
+			);
+			// Verify it's NOT an index record
+			assert!(
+				!key_str.starts_with("/ns/db/ix/"),
+				"Table range should NOT contain index record '{}'",
+				key_str
+			);
+			// Verify value is a table record value
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
+			assert!(
+				value_str.starts_with("TableRecord"),
+				"Value '{}' should be a TableRecord",
+				value_str
+			);
+		}
+
+		// Range scan for index records only: [/ns/db/ix/, /ns/db/ix0)
+		let index_range =
+			collect_transaction_all(&mut txn.range(b"/ns/db/ix/", b"/ns/db/ix0").unwrap()).unwrap();
+
+		assert_eq!(
+			index_range.len(),
+			index_records.len(),
+			"Index range should return exactly {} index records, got {}",
+			index_records.len(),
+			index_range.len()
+		);
+
+		// Verify all returned keys are index records
+		for (key, value) in index_range.iter() {
+			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+			assert!(
+				key_str.starts_with("/ns/db/ix/"),
+				"Key '{}' should be an index record (start with /ns/db/ix/)",
+				key_str
+			);
+			// Verify it's NOT a table record
+			assert!(
+				!key_str.starts_with("/ns/db/tb/"),
+				"Index range should NOT contain table record '{}'",
+				key_str
+			);
+			// Verify value is an index record value
+			let value_str = std::str::from_utf8(value.as_ref()).unwrap();
+			assert!(value_str.starts_with("Index"), "Value '{}' should be an Index", value_str);
+		}
+	}
+
+	// Flush and test after flush
+	tree.flush().unwrap();
+
+	{
+		let txn = tree.begin().unwrap();
+
+		// Same tests after flush
+		let table_range =
+			collect_transaction_all(&mut txn.range(b"/ns/db/tb/", b"/ns/db/tb0").unwrap()).unwrap();
+
+		assert_eq!(
+			table_range.len(),
+			table_records.len(),
+			"After flush: Table range should return exactly {} table records",
+			table_records.len()
+		);
+
+		for (key, _value) in table_range.iter() {
+			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+			assert!(
+				key_str.starts_with("/ns/db/tb/"),
+				"After flush: Key '{}' should be a table record",
+				key_str
+			);
+		}
+
+		let index_range =
+			collect_transaction_all(&mut txn.range(b"/ns/db/ix/", b"/ns/db/ix0").unwrap()).unwrap();
+
+		assert_eq!(
+			index_range.len(),
+			index_records.len(),
+			"After flush: Index range should return exactly {} index records",
+			index_records.len()
+		);
+
+		for (key, _value) in index_range.iter() {
+			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
+			assert!(
+				key_str.starts_with("/ns/db/ix/"),
+				"After flush: Key '{}' should be an index record",
+				key_str
+			);
+		}
+	}
+}
+
+/// Test that exclusive upper bounds work correctly.
+/// The range API uses [start, end) semantics - inclusive start, exclusive end.
+#[test(tokio::test)]
+async fn test_range_exclusive_boundaries() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_small_memtable_options(path.clone());
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Insert keys: a, b, c, d
+	let keys = ["a", "b", "c", "d"];
+	for key in keys.iter() {
+		let mut txn = tree.begin().unwrap();
+		txn.set(key.as_bytes(), format!("value_{}", key).as_bytes()).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Test before flush
+	{
+		let txn = tree.begin().unwrap();
+
+		// Range [a, c) should include a, b but NOT c
+		let range_result = collect_transaction_all(&mut txn.range(b"a", b"c").unwrap()).unwrap();
+
+		assert_eq!(range_result.len(), 2, "Range [a, c) should return 2 keys (a and b)");
+
+		let result_keys: Vec<String> = range_result
+			.iter()
+			.map(|(k, _)| std::str::from_utf8(k.as_ref()).unwrap().to_string())
+			.collect();
+
+		assert!(result_keys.contains(&"a".to_string()), "Range [a, c) should include 'a'");
+		assert!(result_keys.contains(&"b".to_string()), "Range [a, c) should include 'b'");
+		assert!(!result_keys.contains(&"c".to_string()), "Range [a, c) should NOT include 'c'");
+		assert!(!result_keys.contains(&"d".to_string()), "Range [a, c) should NOT include 'd'");
+
+		// Range [b, d) should include b, c but NOT d
+		let range_result2 = collect_transaction_all(&mut txn.range(b"b", b"d").unwrap()).unwrap();
+
+		assert_eq!(range_result2.len(), 2, "Range [b, d) should return 2 keys (b and c)");
+
+		let result_keys2: Vec<String> = range_result2
+			.iter()
+			.map(|(k, _)| std::str::from_utf8(k.as_ref()).unwrap().to_string())
+			.collect();
+
+		assert!(!result_keys2.contains(&"a".to_string()), "Range [b, d) should NOT include 'a'");
+		assert!(result_keys2.contains(&"b".to_string()), "Range [b, d) should include 'b'");
+		assert!(result_keys2.contains(&"c".to_string()), "Range [b, d) should include 'c'");
+		assert!(!result_keys2.contains(&"d".to_string()), "Range [b, d) should NOT include 'd'");
+
+		// Range starting at exact key boundary
+		let range_result3 = collect_transaction_all(&mut txn.range(b"c", b"e").unwrap()).unwrap();
+
+		assert_eq!(range_result3.len(), 2, "Range [c, e) should return 2 keys (c and d)");
+
+		let result_keys3: Vec<String> = range_result3
+			.iter()
+			.map(|(k, _)| std::str::from_utf8(k.as_ref()).unwrap().to_string())
+			.collect();
+
+		assert!(result_keys3.contains(&"c".to_string()), "Range [c, e) should include 'c'");
+		assert!(result_keys3.contains(&"d".to_string()), "Range [c, e) should include 'd'");
+	}
+
+	// Flush and test after flush
+	tree.flush().unwrap();
+
+	{
+		let txn = tree.begin().unwrap();
+
+		// Same tests after flush
+		let range_result = collect_transaction_all(&mut txn.range(b"a", b"c").unwrap()).unwrap();
+
+		assert_eq!(range_result.len(), 2, "After flush: Range [a, c) should return 2 keys");
+
+		let result_keys: Vec<String> = range_result
+			.iter()
+			.map(|(k, _)| std::str::from_utf8(k.as_ref()).unwrap().to_string())
+			.collect();
+
+		assert!(
+			result_keys.contains(&"a".to_string()),
+			"After flush: Range [a, c) should include 'a'"
+		);
+		assert!(
+			result_keys.contains(&"b".to_string()),
+			"After flush: Range [a, c) should include 'b'"
+		);
+		assert!(
+			!result_keys.contains(&"c".to_string()),
+			"After flush: Range [a, c) should NOT include 'c'"
+		);
+	}
+}
+
+/// Test edge cases with keys at boundaries, especially keys that are proper prefixes of each other.
+/// This tests scenarios like: aa < aaa < aaaa < ab < b
+/// Range [aa, ab) should return aa, aaa, aaaa but NOT ab
+#[test(tokio::test)]
+async fn test_range_boundary_edge_cases() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_small_memtable_options(path.clone());
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Keys where some are proper prefixes of others
+	let keys = ["aa", "aaa", "aaaa", "aaaab", "ab", "b"];
+	for key in keys.iter() {
+		let mut txn = tree.begin().unwrap();
+		txn.set(key.as_bytes(), format!("value_{}", key).as_bytes()).unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Test before flush
+	{
+		let txn = tree.begin().unwrap();
+
+		// Range [aa, ab) should return aa, aaa, aaaa, aaaab but NOT ab, b
+		let range_result = collect_transaction_all(&mut txn.range(b"aa", b"ab").unwrap()).unwrap();
+
+		let result_keys: Vec<String> = range_result
+			.iter()
+			.map(|(k, _)| std::str::from_utf8(k.as_ref()).unwrap().to_string())
+			.collect();
+
+		assert_eq!(
+			range_result.len(),
+			4,
+			"Range [aa, ab) should return 4 keys (aa, aaa, aaaa, aaaab), got: {:?}",
+			result_keys
+		);
+
+		assert!(result_keys.contains(&"aa".to_string()), "Should include 'aa'");
+		assert!(result_keys.contains(&"aaa".to_string()), "Should include 'aaa'");
+		assert!(result_keys.contains(&"aaaa".to_string()), "Should include 'aaaa'");
+		assert!(result_keys.contains(&"aaaab".to_string()), "Should include 'aaaab'");
+		assert!(!result_keys.contains(&"ab".to_string()), "Should NOT include 'ab' (upper bound)");
+		assert!(!result_keys.contains(&"b".to_string()), "Should NOT include 'b'");
+
+		// Verify ordering within the result
+		assert_eq!(result_keys[0], "aa", "First key should be 'aa'");
+		assert_eq!(result_keys[1], "aaa", "Second key should be 'aaa'");
+		assert_eq!(result_keys[2], "aaaa", "Third key should be 'aaaa'");
+		assert_eq!(result_keys[3], "aaaab", "Fourth key should be 'aaaab'");
+
+		// Range [aaa, aaaa) - very narrow range between prefixes
+		let narrow_range =
+			collect_transaction_all(&mut txn.range("aaa".as_bytes(), "aaaa".as_bytes()).unwrap())
+				.unwrap();
+
+		let narrow_keys: Vec<String> = narrow_range
+			.iter()
+			.map(|(k, _)| std::str::from_utf8(k.as_ref()).unwrap().to_string())
+			.collect();
+
+		assert_eq!(
+			narrow_range.len(),
+			1,
+			"Range [aaa, aaaa) should return only 'aaa', got: {:?}",
+			narrow_keys
+		);
+		assert_eq!(narrow_keys[0], "aaa", "Only key should be 'aaa'");
+
+		// Range [aaaa, ab) - starts exactly at 'aaaa'
+		let exact_start =
+			collect_transaction_all(&mut txn.range("aaaa".as_bytes(), "ab".as_bytes()).unwrap())
+				.unwrap();
+
+		let exact_keys: Vec<String> = exact_start
+			.iter()
+			.map(|(k, _)| std::str::from_utf8(k.as_ref()).unwrap().to_string())
+			.collect();
+
+		assert_eq!(
+			exact_start.len(),
+			2,
+			"Range [aaaa, ab) should return 'aaaa' and 'aaaab', got: {:?}",
+			exact_keys
+		);
+		assert!(exact_keys.contains(&"aaaa".to_string()), "Should include 'aaaa'");
+		assert!(exact_keys.contains(&"aaaab".to_string()), "Should include 'aaaab'");
+	}
+
+	// Flush and test after flush
+	tree.flush().unwrap();
+
+	{
+		let txn = tree.begin().unwrap();
+
+		// Same primary test after flush
+		let range_result = collect_transaction_all(&mut txn.range(b"aa", b"ab").unwrap()).unwrap();
+
+		let result_keys: Vec<String> = range_result
+			.iter()
+			.map(|(k, _)| std::str::from_utf8(k.as_ref()).unwrap().to_string())
+			.collect();
+
+		assert_eq!(
+			range_result.len(),
+			4,
+			"After flush: Range [aa, ab) should return 4 keys, got: {:?}",
+			result_keys
+		);
+
+		// Verify ordering is maintained after flush
+		assert_eq!(result_keys[0], "aa", "After flush: First key should be 'aa'");
+		assert_eq!(result_keys[1], "aaa", "After flush: Second key should be 'aaa'");
+		assert_eq!(result_keys[2], "aaaa", "After flush: Third key should be 'aaaa'");
+		assert_eq!(result_keys[3], "aaaab", "After flush: Fourth key should be 'aaaab'");
 	}
 }

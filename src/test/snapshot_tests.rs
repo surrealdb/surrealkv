@@ -7,7 +7,7 @@ use test_log::test;
 
 use crate::levels::{Level, Levels};
 use crate::memtable::MemTable;
-use crate::snapshot::{IterState, KMergeIterator, Snapshot, VersionedRangeQueryParams};
+use crate::snapshot::{IterState, KMergeIterator};
 use crate::sstable::table::{Table, TableWriter};
 use crate::test::{
 	collect_all,
@@ -16,7 +16,7 @@ use crate::test::{
 	collect_transaction_all,
 };
 use crate::vfs::File;
-use crate::{InternalIterator, InternalKey, InternalKeyKind, Options, Tree, TreeBuilder};
+use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Tree, TreeBuilder};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -102,16 +102,16 @@ async fn test_snapshot_isolation_with_updates() {
 	let range = collect_transaction_all(&mut read_tx.range(b"key0", b"key:").unwrap()).unwrap();
 
 	assert_eq!(range.len(), 2);
-	assert_eq!(range[0].1, Some(b"value1_v1".to_vec()));
-	assert_eq!(range[1].1, Some(b"value2_v1".to_vec()));
+	assert_eq!(range[0].1, b"value1_v1".to_vec());
+	assert_eq!(range[1].1, b"value2_v1".to_vec());
 
 	// A new transaction should see the updated values
 	let new_tx = store.begin().unwrap();
 	let range = collect_transaction_all(&mut new_tx.range(b"key0", b"key:").unwrap()).unwrap();
 
 	assert_eq!(range.len(), 2);
-	assert_eq!(range[0].1, Some(b"value1_v2".to_vec()));
-	assert_eq!(range[1].1, Some(b"value2_v2".to_vec()));
+	assert_eq!(range[0].1, b"value1_v2".to_vec());
+	assert_eq!(range[1].1, b"value2_v2".to_vec());
 }
 
 #[test(tokio::test)]
@@ -237,7 +237,7 @@ async fn test_range_with_random_operations() {
 		let expected_key = format!("key{:02}", i + 1);
 		let expected_value = format!("value{}", i + 1);
 		assert_eq!(key, expected_key.as_bytes());
-		assert_eq!(value.as_ref().unwrap(), expected_value.as_bytes());
+		assert_eq!(value.as_slice(), expected_value.as_bytes());
 	}
 
 	// tx2 should see updated data with deletions
@@ -258,7 +258,7 @@ async fn test_range_with_random_operations() {
 		if let Ok(num) = key_str.trim_start_matches("key").parse::<i32>() {
 			if num % 2 == 0 {
 				let expected_value = format!("value{num}_updated");
-				assert_eq!(value.as_ref().unwrap().as_slice(), expected_value.as_bytes());
+				assert_eq!(value.as_slice(), expected_value.as_bytes());
 			}
 		}
 	}
@@ -1754,166 +1754,4 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 		assert_eq!(range[2].1.as_slice(), b"v2_updated");
 		assert_eq!(&range[3].0.user_key, b"key1");
 	}
-}
-
-fn setup_versioned_tree() -> (crate::lsm::Tree, TempDir) {
-	let temp_dir = create_temp_directory();
-	let opts: Options =
-		Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
-	let tree = TreeBuilder::with_options(opts).build().unwrap();
-	(tree, temp_dir)
-}
-
-// Helper to get snapshot from transaction for testing
-fn get_snapshot_from_transaction(tx: &crate::transaction::Transaction) -> Snapshot {
-	// Access the internal snapshot - it's pub(crate) so we can use it in tests
-	tx.snapshot.as_ref().unwrap().clone()
-}
-
-#[tokio::test]
-async fn test_versioned_range_inclusive() {
-	// Test RangeInclusive (a..=b) - Included start, Included end
-	let (tree, _temp_dir) = setup_versioned_tree();
-	let ts = 100;
-
-	// Insert test data
-	let mut tx = tree.begin().unwrap();
-	tx.set_at_version(b"a", b"value_a", ts).unwrap();
-	tx.set_at_version(b"b", b"value_b", ts).unwrap();
-	tx.set_at_version(b"c", b"value_c", ts).unwrap();
-	tx.commit().await.unwrap();
-
-	// Create snapshot and test RangeInclusive
-	let tx = tree.begin().unwrap();
-	let snapshot = get_snapshot_from_transaction(&tx);
-	let key_range = b"a".to_vec()..=b"b".to_vec();
-	let versioned_iter = snapshot
-		.versioned_range_iter(VersionedRangeQueryParams {
-			key_range: &key_range,
-			start_ts: 0,
-			end_ts: ts,
-			snapshot_seq_num: snapshot.seq_num,
-			limit: None,
-			include_tombstones: false,
-			include_latest_only: true,
-		})
-		.unwrap();
-
-	let results: Vec<_> = versioned_iter.collect();
-	assert_eq!(results.len(), 2);
-	let keys: Vec<_> = results.iter().map(|(k, _)| k.user_key.clone()).collect();
-	assert!(keys.contains(&b"a".to_vec()));
-	assert!(keys.contains(&b"b".to_vec()));
-	assert!(!keys.contains(&b"c".to_vec()));
-}
-
-#[tokio::test]
-async fn test_versioned_range_from() {
-	// Test RangeFrom (a..) - Included start, Unbounded end
-	let (tree, _temp_dir) = setup_versioned_tree();
-	let ts = 100;
-
-	// Insert test data
-	let mut tx = tree.begin().unwrap();
-	tx.set_at_version(b"a", b"value_a", ts).unwrap();
-	tx.set_at_version(b"b", b"value_b", ts).unwrap();
-	tx.set_at_version(b"c", b"value_c", ts).unwrap();
-	tx.commit().await.unwrap();
-
-	// Create snapshot and test RangeFrom
-	let tx = tree.begin().unwrap();
-	let snapshot = get_snapshot_from_transaction(&tx);
-	let key_range = b"b".to_vec()..;
-	let versioned_iter = snapshot
-		.versioned_range_iter(VersionedRangeQueryParams {
-			key_range: &key_range,
-			start_ts: 0,
-			end_ts: ts,
-			snapshot_seq_num: snapshot.seq_num,
-			limit: None,
-			include_tombstones: false,
-			include_latest_only: true,
-		})
-		.unwrap();
-
-	let results: Vec<_> = versioned_iter.collect();
-	assert_eq!(results.len(), 2);
-	let keys: Vec<_> = results.iter().map(|(k, _)| k.user_key.clone()).collect();
-	assert!(keys.contains(&b"b".to_vec()));
-	assert!(keys.contains(&b"c".to_vec()));
-	assert!(!keys.contains(&b"a".to_vec()));
-}
-
-#[tokio::test]
-async fn test_versioned_range_to() {
-	// Test RangeTo (..b) - Unbounded start, Excluded end
-	let (tree, _temp_dir) = setup_versioned_tree();
-	let ts = 100;
-
-	// Insert test data
-	let mut tx = tree.begin().unwrap();
-	tx.set_at_version(b"a", b"value_a", ts).unwrap();
-	tx.set_at_version(b"b", b"value_b", ts).unwrap();
-	tx.set_at_version(b"c", b"value_c", ts).unwrap();
-	tx.commit().await.unwrap();
-
-	// Create snapshot and test RangeTo
-	let tx = tree.begin().unwrap();
-	let snapshot = get_snapshot_from_transaction(&tx);
-	let key_range = ..b"c".to_vec();
-	let versioned_iter = snapshot
-		.versioned_range_iter(VersionedRangeQueryParams {
-			key_range: &key_range,
-			start_ts: 0,
-			end_ts: ts,
-			snapshot_seq_num: snapshot.seq_num,
-			limit: None,
-			include_tombstones: false,
-			include_latest_only: true,
-		})
-		.unwrap();
-
-	let results: Vec<_> = versioned_iter.collect();
-	assert_eq!(results.len(), 2);
-	let keys: Vec<_> = results.iter().map(|(k, _)| k.user_key.clone()).collect();
-	assert!(keys.contains(&b"a".to_vec()));
-	assert!(keys.contains(&b"b".to_vec()));
-	assert!(!keys.contains(&b"c".to_vec()));
-}
-
-#[tokio::test]
-async fn test_versioned_range_full() {
-	// Test RangeFull (..) - Unbounded start, Unbounded end
-	let (tree, _temp_dir) = setup_versioned_tree();
-	let ts = 100;
-
-	// Insert test data
-	let mut tx = tree.begin().unwrap();
-	tx.set_at_version(b"a", b"value_a", ts).unwrap();
-	tx.set_at_version(b"b", b"value_b", ts).unwrap();
-	tx.set_at_version(b"c", b"value_c", ts).unwrap();
-	tx.commit().await.unwrap();
-
-	// Create snapshot and test RangeFull
-	let tx = tree.begin().unwrap();
-	let snapshot = get_snapshot_from_transaction(&tx);
-	let key_range = ..;
-	let versioned_iter = snapshot
-		.versioned_range_iter(VersionedRangeQueryParams {
-			key_range: &key_range,
-			start_ts: 0,
-			end_ts: ts,
-			snapshot_seq_num: snapshot.seq_num,
-			limit: None,
-			include_tombstones: false,
-			include_latest_only: true,
-		})
-		.unwrap();
-
-	let results: Vec<_> = versioned_iter.collect();
-	assert_eq!(results.len(), 3);
-	let keys: Vec<_> = results.iter().map(|(k, _)| k.user_key.clone()).collect();
-	assert!(keys.contains(&b"a".to_vec()));
-	assert!(keys.contains(&b"b".to_vec()));
-	assert!(keys.contains(&b"c".to_vec()));
 }

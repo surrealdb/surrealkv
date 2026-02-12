@@ -5,10 +5,11 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
-use crate::iter::{BoxedInternalIterator, CompactionIterator};
+use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lsm::CoreInner;
 use crate::memtable::ImmutableMemtables;
+use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::vlog::VLog;
@@ -52,6 +53,12 @@ pub(crate) struct CompactionOptions {
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 	pub(crate) vlog: Option<Arc<VLog>>,
 	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
+	/// Snapshot tracker for snapshot-aware compaction.
+	///
+	/// During compaction, we query this to get the list of active snapshot
+	/// sequence numbers. Versions visible to any active snapshot must be
+	/// preserved (unless hidden by a newer version in the same visibility boundary).
+	pub(crate) snapshot_tracker: SnapshotTracker,
 }
 
 impl CompactionOptions {
@@ -62,6 +69,7 @@ impl CompactionOptions {
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			vlog: tree.vlog.clone(),
 			error_handler: Arc::clone(&tree.error_handler),
+			snapshot_tracker: tree.snapshot_tracker.clone(),
 		}
 	}
 }
@@ -109,10 +117,10 @@ impl Compactor {
 			input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
 
 		// Keep tables alive while iterators borrow from them
-		let iterators: Vec<BoxedInternalIterator<'_>> = to_merge
+		let iterators: Vec<BoxedLSMIterator<'_>> = to_merge
 			.iter()
 			.filter_map(|table| table.iter(None).ok())
-			.map(|iter| Box::new(iter) as BoxedInternalIterator<'_>)
+			.map(|iter| Box::new(iter) as BoxedLSMIterator<'_>)
 			.collect();
 
 		drop(levels);
@@ -144,16 +152,20 @@ impl Compactor {
 			None
 		};
 
+		// Update discard stats BEFORE manifest commit for clean abort on error.
+		// If this fails, the HiddenTablesGuard will unhide tables on drop,
+		// leaving the system in a consistent state.
+		if !discard_stats.is_empty() {
+			if let Some(ref vlog) = self.options.vlog {
+				vlog.update_discard_stats(&discard_stats)?;
+			}
+		}
+
 		// Update manifest - this will commit the guard on success
 		self.update_manifest(input, new_table, &mut guard)?;
 
 		self.cleanup_old_tables(input);
 
-		if !discard_stats.is_empty() {
-			if let Some(ref vlog) = self.options.vlog {
-				vlog.update_discard_stats(&discard_stats);
-			}
-		}
 		Ok(())
 	}
 
@@ -164,14 +176,19 @@ impl Compactor {
 		&self,
 		path: &Path,
 		table_id: u64,
-		merge_iter: Vec<BoxedInternalIterator<'_>>,
+		merge_iter: Vec<BoxedLSMIterator<'_>>,
 		input: &CompactionInput,
 	) -> Result<(bool, HashMap<u32, i64>)> {
 		let file = SysFile::create(path)?;
 		let mut writer =
 			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
 
-		// Create a compaction iterator that filters tombstones
+		// Get active snapshots for snapshot-aware compaction
+		// This is a snapshot of the snapshot list at the start of compaction.
+		// Any snapshots created during compaction will be handled by the next compaction.
+		let snapshots = self.options.snapshot_tracker.get_all_snapshots();
+
+		// Create a compaction iterator that filters tombstones and respects snapshots
 		let max_level = self.options.lopts.level_count - 1;
 		let is_bottom_level = input.target_level >= max_level;
 		let mut comp_iter = CompactionIterator::new(
@@ -182,6 +199,7 @@ impl Compactor {
 			self.options.lopts.enable_versioning,
 			self.options.lopts.versioned_history_retention_ns,
 			Arc::clone(&self.options.lopts.clock),
+			snapshots,
 		);
 
 		let mut entries = 0;

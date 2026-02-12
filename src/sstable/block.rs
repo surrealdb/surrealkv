@@ -90,7 +90,7 @@ use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
 use crate::sstable::error::SSTableError;
-use crate::{Comparator, InternalIterator, InternalKey, InternalKeyComparator, InternalKeyRef};
+use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator};
 
 /// Raw block data as a byte vector.
 pub type BlockData = Vec<u8>;
@@ -197,7 +197,7 @@ pub struct Block {
 	/// Raw block data
 	pub block: BlockData,
 	/// Comparator for key ordering
-	comparator: Arc<InternalKeyComparator>,
+	comparator: Arc<dyn Comparator>,
 }
 
 impl Block {
@@ -206,7 +206,7 @@ impl Block {
 	/// ## Panics
 	///
 	/// Panics if data is too small (< 4 bytes for restart count).
-	pub fn new(data: BlockData, comparator: Arc<InternalKeyComparator>) -> Block {
+	pub fn new(data: BlockData, comparator: Arc<dyn Comparator>) -> Block {
 		assert!(data.len() > 4);
 		Block {
 			block: data,
@@ -268,15 +268,11 @@ pub struct BlockWriter {
 	/// Total entries in block
 	num_entries: usize,
 	/// Key comparator
-	internal_cmp: Arc<InternalKeyComparator>,
+	internal_cmp: Arc<dyn Comparator>,
 }
 
 impl BlockWriter {
-	pub fn new(
-		size: usize,
-		restart_interval: usize,
-		internal_cmp: Arc<InternalKeyComparator>,
-	) -> Self {
+	pub fn new(size: usize, restart_interval: usize, internal_cmp: Arc<dyn Comparator>) -> Self {
 		BlockWriter {
 			internal_cmp,
 			buffer: Vec::with_capacity(size),
@@ -550,7 +546,7 @@ pub struct BlockIterator {
 	/// Current value end offset
 	current_value_offset_end: usize,
 	/// Key comparator
-	internal_cmp: Arc<InternalKeyComparator>,
+	internal_cmp: Arc<dyn Comparator>,
 }
 
 impl BlockIterator {
@@ -561,7 +557,7 @@ impl BlockIterator {
 	/// 1. Read number of restarts from last 4 bytes
 	/// 2. Calculate restart array offset
 	/// 3. Decode all restart point offsets
-	pub fn new(comparator: Arc<InternalKeyComparator>, block: BlockData) -> Result<Self> {
+	pub fn new(comparator: Arc<dyn Comparator>, block: BlockData) -> Result<Self> {
 		if block.len() < 4 {
 			let err = Error::from(SSTableError::BlockTooSmall {
 				size: block.len(),
@@ -749,7 +745,7 @@ impl BlockIterator {
 // INTERNAL ITERATOR IMPLEMENTATION
 // =============================================================================
 
-impl InternalIterator for BlockIterator {
+impl LSMIterator for BlockIterator {
 	/// Seeks to the first entry >= target.
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.seek_internal(target)?;
@@ -795,9 +791,9 @@ impl InternalIterator for BlockIterator {
 	}
 
 	/// Returns the current value.
-	fn value(&self) -> &[u8] {
+	fn value_encoded(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
-		&self.block[self.current_value_offset_start..self.current_value_offset_end]
+		Ok(&self.block[self.current_value_offset_start..self.current_value_offset_end])
 	}
 }
 

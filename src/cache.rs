@@ -12,6 +12,7 @@ use crate::Value;
 const KIND_DATA: u8 = 0;
 const KIND_INDEX: u8 = 1;
 const KIND_VLOG: u8 = 2;
+const KIND_DATA_HISTORY: u8 = 3;
 
 #[derive(Clone)]
 pub(crate) enum Item {
@@ -75,6 +76,10 @@ pub(crate) struct BlockCache {
 	vlog_hits: AtomicU64,
 	#[cfg(test)]
 	vlog_misses: AtomicU64,
+	#[cfg(test)]
+	data_history_hits: AtomicU64,
+	#[cfg(test)]
+	data_history_misses: AtomicU64,
 }
 
 impl BlockCache {
@@ -93,12 +98,21 @@ impl BlockCache {
 			vlog_hits: AtomicU64::new(0),
 			#[cfg(test)]
 			vlog_misses: AtomicU64::new(0),
+			#[cfg(test)]
+			data_history_hits: AtomicU64::new(0),
+			#[cfg(test)]
+			data_history_misses: AtomicU64::new(0),
 		}
 	}
 
 	/// Inserts a data block into the cache.
 	pub(crate) fn insert_data_block(&self, table_id: u64, offset: u64, block: Arc<Block>) {
 		self.data.insert((KIND_DATA, table_id, offset).into(), Item::Data(block));
+	}
+
+	/// Inserts a history data block (with custom comparator) into the cache.
+	pub(crate) fn insert_data_block_history(&self, table_id: u64, offset: u64, block: Arc<Block>) {
+		self.data.insert((KIND_DATA_HISTORY, table_id, offset).into(), Item::Data(block));
 	}
 
 	/// Inserts an index block into the cache.
@@ -122,6 +136,26 @@ impl BlockCache {
 				self.data_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 			} else {
 				self.data_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			}
+		}
+
+		match item.as_ref()? {
+			Item::Data(block) => Some(Arc::clone(block)),
+			_ => None,
+		}
+	}
+
+	/// Retrieves a history data block from the cache.
+	pub(crate) fn get_data_block_history(&self, table_id: u64, offset: u64) -> Option<Arc<Block>> {
+		let key = (KIND_DATA_HISTORY, table_id, &offset);
+		let item = self.data.get(&key);
+
+		#[cfg(test)]
+		{
+			if item.is_some() {
+				self.data_history_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			} else {
+				self.data_history_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 			}
 		}
 
@@ -181,6 +215,10 @@ impl BlockCache {
 			index_misses: self.index_misses.load(std::sync::atomic::Ordering::Relaxed),
 			vlog_hits: self.vlog_hits.load(std::sync::atomic::Ordering::Relaxed),
 			vlog_misses: self.vlog_misses.load(std::sync::atomic::Ordering::Relaxed),
+			data_history_hits: self.data_history_hits.load(std::sync::atomic::Ordering::Relaxed),
+			data_history_misses: self
+				.data_history_misses
+				.load(std::sync::atomic::Ordering::Relaxed),
 		}
 	}
 
@@ -193,6 +231,8 @@ impl BlockCache {
 		self.index_misses.store(0, std::sync::atomic::Ordering::Relaxed);
 		self.vlog_hits.store(0, std::sync::atomic::Ordering::Relaxed);
 		self.vlog_misses.store(0, std::sync::atomic::Ordering::Relaxed);
+		self.data_history_hits.store(0, std::sync::atomic::Ordering::Relaxed);
+		self.data_history_misses.store(0, std::sync::atomic::Ordering::Relaxed);
 	}
 }
 
@@ -206,16 +246,18 @@ pub(crate) struct CacheStats {
 	pub index_misses: u64,
 	pub vlog_hits: u64,
 	pub vlog_misses: u64,
+	pub data_history_hits: u64,
+	pub data_history_misses: u64,
 }
 
 #[cfg(test)]
 impl CacheStats {
 	pub fn total_hits(&self) -> u64 {
-		self.data_hits + self.index_hits + self.vlog_hits
+		self.data_hits + self.index_hits + self.vlog_hits + self.data_history_hits
 	}
 
 	pub fn total_misses(&self) -> u64 {
-		self.data_misses + self.index_misses + self.vlog_misses
+		self.data_misses + self.index_misses + self.vlog_misses + self.data_history_misses
 	}
 
 	pub fn total_accesses(&self) -> u64 {

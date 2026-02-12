@@ -343,6 +343,15 @@ impl Wal {
 		self.active_writer.sync()
 	}
 
+	/// Flushes buffered WAL data to OS cache (not to disk).
+	/// For durability, call sync() instead.
+	pub(crate) fn flush(&mut self) -> Result<()> {
+		if self.closed {
+			return Ok(());
+		}
+		self.active_writer.write_buffer()
+	}
+
 	pub(crate) fn close(&mut self) -> Result<()> {
 		if self.closed {
 			return Ok(());

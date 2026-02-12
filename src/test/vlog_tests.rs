@@ -6,6 +6,7 @@ use test_log::test;
 
 use crate::clock::LogicalClock;
 use crate::discard::DiscardStats;
+use crate::test::{count_history_versions_in_range, point_in_time_from_history_in_range};
 use crate::vlog::{
 	VLog,
 	VLogFileHeader,
@@ -77,16 +78,16 @@ fn test_discard_stats_operations() {
 	let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
 
 	// Add some discardable bytes
-	stats.update(1, 100);
-	stats.update(1, 50);
+	stats.update(1, 100).unwrap();
+	stats.update(1, 50).unwrap();
 
-	let discard_bytes = stats.get_file_stats(1);
+	let discard_bytes = stats.get_file_stats(1).unwrap();
 	assert_eq!(discard_bytes, 150);
 
 	// Test another file
-	stats.update(2, 300); // Higher discard
+	stats.update(2, 300).unwrap(); // Higher discard
 
-	let candidates = stats.get_gc_candidates();
+	let candidates = stats.get_gc_candidates().unwrap();
 	let (max_file, max_discard) = candidates[0];
 	assert_eq!(max_file, 2);
 	assert_eq!(max_discard, 300);
@@ -101,19 +102,19 @@ fn test_gc_threshold_with_discard_stats() {
 	let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
 
 	// File 1: Add discardable data
-	stats.update(1, 600);
+	stats.update(1, 600).unwrap();
 
-	let discard_bytes = stats.get_file_stats(1);
+	let discard_bytes = stats.get_file_stats(1).unwrap();
 	assert_eq!(discard_bytes, 600);
 
 	// File 2: Lower discard
-	stats.update(2, 200);
+	stats.update(2, 200).unwrap();
 
-	let discard_bytes_2 = stats.get_file_stats(2);
+	let discard_bytes_2 = stats.get_file_stats(2).unwrap();
 	assert_eq!(discard_bytes_2, 200);
 
 	// Test max discard selection (used by conservative GC)
-	let candidates = stats.get_gc_candidates();
+	let candidates = stats.get_gc_candidates().unwrap();
 	let (max_file, max_discard) = candidates[0];
 	assert_eq!(max_file, 1, "File 1 should have maximum discard bytes");
 	assert_eq!(max_discard, 600);
@@ -1063,7 +1064,7 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 	for (i, ts) in [1000, 2000, 3000, 4000].iter().enumerate() {
 		let value = format!("value_{}_large_data", i).repeat(50); // Large value to fill VLog
 		let mut tx = tree.begin().unwrap();
-		tx.set_at_version(user_key, value.as_bytes(), *ts).unwrap();
+		tx.set_at(user_key, value.as_bytes(), *ts).unwrap();
 		tx.commit().await.unwrap();
 		tree.flush().unwrap(); // Force flush after each version
 	}
@@ -1071,7 +1072,7 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 	// Insert and delete a different key to create stale entries
 	{
 		let mut tx = tree.begin().unwrap();
-		tx.set_at_version(b"other_key", b"other_value_large_data".repeat(50), 5000).unwrap();
+		tx.set_at(b"other_key", b"other_value_large_data".repeat(50), 5000).unwrap();
 		tx.commit().await.unwrap();
 		tree.flush().unwrap();
 
@@ -1086,8 +1087,8 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 	let tx = tree.begin().unwrap();
 	let mut end_key = user_key.to_vec();
 	end_key.push(0);
-	let scan_all = tx.scan_all_versions(user_key.as_ref(), &end_key, None).unwrap();
-	assert_eq!(scan_all.len(), 4, "Should have 4 versions before GC");
+	let version_count = count_history_versions_in_range(&tx, user_key.as_ref(), &end_key).unwrap();
+	assert_eq!(version_count, 4, "Should have 4 versions before GC");
 
 	drop(tx);
 
@@ -1100,7 +1101,7 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 
 	// Check VLog file stats before GC
 	if let Some(vlog) = &tree.core.vlog {
-		let stats = vlog.get_all_file_stats();
+		let stats = vlog.get_all_file_stats().unwrap();
 		for (file_id, total_size, discard_bytes, ratio) in stats {
 			println!(
 				"  File {}: total={}, discard={}, ratio={:.2}",
@@ -1125,54 +1126,37 @@ async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
 	let tx = tree.begin().unwrap();
 	let mut end_key = user_key.to_vec();
 	end_key.push(0);
-	let scan_after = tx.scan_all_versions(user_key.as_ref(), &end_key, None).unwrap();
+	let version_count_after =
+		count_history_versions_in_range(&tx, user_key.as_ref(), &end_key).unwrap();
 
 	// We should have at least some versions remaining
-	assert!(!scan_after.is_empty(), "Should have at least some versions remaining");
+	assert!(version_count_after > 0, "Should have at least some versions remaining");
 
 	// If GC deleted files, we should have fewer versions
 	if !all_deleted_files.is_empty() {
 		// We should have fewer versions after GC
 		assert!(
-			scan_after.len() < 6,
+			version_count_after < 6,
 			"Should have fewer versions after GC deleted files. Before: 6, After: {}",
-			scan_after.len()
+			version_count_after
 		);
 	}
 
 	// Test specific timestamp queries to verify which versions were deleted
 	let mut end_key = user_key.to_vec();
 	end_key.push(0);
-	let scan_at_ts1 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 1000)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
-	let scan_at_ts2 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 2000)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
-	let scan_at_ts3 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 3000)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
-	let scan_at_ts4 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 4000)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
-	let scan_at_ts5 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 6000)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
-	let scan_at_ts6 = tx
-		.range_at_version(user_key.as_ref(), &end_key, 6001)
-		.unwrap()
-		.collect::<std::result::Result<Vec<_>, _>>()
-		.unwrap();
+	let scan_at_ts1 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 1000).unwrap();
+	let scan_at_ts2 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 2000).unwrap();
+	let scan_at_ts3 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 3000).unwrap();
+	let scan_at_ts4 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 4000).unwrap();
+	let scan_at_ts5 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 6000).unwrap();
+	let scan_at_ts6 =
+		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 6001).unwrap();
 
 	// The key insight: VLog GC only processes files with high discard ratios
 	// Files 0, 1, 2 had high discard ratios (0.97) and were processed

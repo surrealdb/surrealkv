@@ -107,7 +107,11 @@ impl VLogFileHeader {
 
 	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
 		if data.len() != Self::SIZE {
-			return Err(Error::Corruption("Invalid header size".to_string()));
+			return Err(Error::Corruption(format!(
+				"Invalid VLog header size: expected {} bytes, got {} bytes",
+				Self::SIZE,
+				data.len()
+			)));
 		}
 
 		let mut offset = 0;
@@ -122,7 +126,11 @@ impl VLogFileHeader {
 		offset += 4;
 
 		if magic != Self::MAGIC {
-			return Err(Error::Corruption("Invalid magic number".to_string()));
+			return Err(Error::Corruption(format!(
+				"Invalid VLog magic number: expected 0x{:08X}, got 0x{:08X}",
+				Self::MAGIC,
+				magic
+			)));
 		}
 
 		// Version (2 bytes)
@@ -294,7 +302,12 @@ impl ValueLocation {
 		if self.is_value_pointer() {
 			if let Some(vlog) = vlog {
 				let pointer = ValuePointer::decode(&self.value)?;
-				vlog.get(&pointer)
+				vlog.get(&pointer).map_err(|e| {
+					Error::Other(format!(
+						"Failed to resolve value from VLog: {e}. ValuePointer: {:?}",
+						pointer
+					))
+				})
 			} else {
 				Err(Error::Other("VLog not available for pointer resolution".to_string()))
 			}
@@ -356,7 +369,11 @@ impl ValuePointer {
 	/// Decodes a pointer from bytes
 	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
 		if data.len() != VALUE_POINTER_SIZE {
-			return Err(Error::Corruption("Invalid ValuePointer size".to_string()));
+			return Err(Error::Corruption(format!(
+				"Invalid ValuePointer size: expected {} bytes, got {} bytes",
+				VALUE_POINTER_SIZE,
+				data.len()
+			)));
 		}
 
 		let version = data[0];
@@ -733,25 +750,89 @@ impl VLog {
 
 		// Open and validate the file
 		let file_path = self.vlog_file_path(file_id);
-		let file = File::open(&file_path)?;
+		let file = File::open(&file_path).map_err(|e| {
+			log::error!(
+				"Failed to open VLog file: file_id={}, path={:?}, error={}",
+				file_id,
+				file_path,
+				e
+			);
+			Error::Other(format!(
+				"Failed to open VLog file (file_id={}, path={:?}): {}",
+				file_id, file_path, e
+			))
+		})?;
 
 		// Validate file header for existing files
-		let file_size = file.metadata()?.len();
+		let file_size = file
+			.metadata()
+			.map_err(|e| {
+				log::error!(
+					"Failed to get VLog file metadata: file_id={}, path={:?}, error={}",
+					file_id,
+					file_path,
+					e
+				);
+				Error::Other(format!(
+					"Failed to get VLog file metadata (file_id={}, path={:?}): {}",
+					file_id, file_path, e
+				))
+			})?
+			.len();
+
 		if file_size > 0 {
 			// Only validate header if file has content (not a new empty file)
 			let mut header_data = vec![0u8; VLogFileHeader::SIZE];
-			vfs::File::read_at(&file, 0, &mut header_data)?;
+			vfs::File::read_at(&file, 0, &mut header_data).map_err(|e| {
+				log::error!(
+					"Failed to read VLog header: file_id={}, path={:?}, error={}",
+					file_id,
+					file_path,
+					e
+				);
+				Error::Other(format!(
+					"Failed to read VLog header (file_id={}, path={:?}): {}",
+					file_id, file_path, e
+				))
+			})?;
 
-			let header = VLogFileHeader::decode(&header_data)?;
+			let header = VLogFileHeader::decode(&header_data).map_err(|e| {
+				log::error!(
+					"Failed to decode VLog header: file_id={}, path={:?}, error={}",
+					file_id,
+					file_path,
+					e
+				);
+				Error::Other(format!(
+					"Failed to decode VLog header (file_id={}, path={:?}): {}",
+					file_id, file_path, e
+				))
+			})?;
+
 			if !header.is_compatible() {
+				log::error!(
+					"Incompatible VLog file version: file_id={}, path={:?}, version={} (expected {})",
+					file_id, file_path, header.version, VLOG_FORMAT_VERSION
+				);
 				return Err(Error::Corruption(format!(
-					"Incompatible VLog file version: {} (expected {})",
-					header.version, VLOG_FORMAT_VERSION
+					"Incompatible VLog file version (file_id={}, path={:?}): {} (expected {})",
+					file_id, file_path, header.version, VLOG_FORMAT_VERSION
 				)));
 			}
 
 			// Validate header against current options
-			header.validate(file_id)?;
+			header.validate(file_id).map_err(|e| {
+				log::error!(
+					"VLog header validation failed: file_id={}, path={:?}, error={}",
+					file_id,
+					file_path,
+					e
+				);
+				Error::Other(format!(
+					"VLog header validation failed (file_id={}, path={:?}): {}",
+					file_id, file_path, e
+				))
+			})?;
 		}
 
 		let handle = Arc::new(file);
@@ -778,7 +859,13 @@ impl VLog {
 		let total_size = pointer.total_entry_size();
 
 		let mut entry_data_vec = vec![0u8; total_size as usize];
-		vfs::File::read_at(&*file, pointer.offset, &mut entry_data_vec)?;
+		vfs::File::read_at(&*file, pointer.offset, &mut entry_data_vec).map_err(|e| {
+			log::error!("Failed to read VLog entry: pointer={:?}, error={}", pointer, e);
+			Error::Other(format!(
+				"Failed to read VLog entry (file_id={}, offset={}, key_size={}, value_size={}): {}",
+				pointer.file_id, pointer.offset, pointer.key_size, pointer.value_size, e
+			))
+		})?;
 
 		// Verify header sizes
 		let header_key_len = u32::from_be_bytes([
@@ -795,9 +882,16 @@ impl VLog {
 		]);
 
 		if header_key_len != key_len || header_value_len != value_len {
+			log::error!(
+				"VLog header size mismatch: pointer={:?}, header_key_len={}, header_value_len={}",
+				pointer,
+				header_key_len,
+				header_value_len
+			);
 			return Err(Error::Corruption(format!(
-                "Header size mismatch: expected key {key_len} value {value_len}, got key {header_key_len} value {header_value_len}"
-            )));
+				"Header size mismatch (file_id={}, offset={}): expected key {} value {}, got key {} value {}",
+				pointer.file_id, pointer.offset, key_len, value_len, header_key_len, header_value_len
+			)));
 		}
 
 		// Parse offsets from the buffer
@@ -814,9 +908,14 @@ impl VLog {
 
 		// Checksum verification
 		if self.checksum_level != VLogChecksumLevel::Disabled && stored_crc32 != pointer.checksum {
+			log::error!(
+				"VLog CRC32 mismatch (stored vs pointer): pointer={:?}, stored_crc32={}",
+				pointer,
+				stored_crc32
+			);
 			return Err(Error::Corruption(format!(
-				"CRC32 mismatch: expected {}, got {}",
-				pointer.checksum, stored_crc32
+				"CRC32 mismatch (file_id={}, offset={}): expected {}, got {} (stored in file)",
+				pointer.file_id, pointer.offset, pointer.checksum, stored_crc32
 			)));
 		}
 
@@ -828,9 +927,14 @@ impl VLog {
 			hasher.update(value);
 			let calculated_crc32 = hasher.finalize();
 			if calculated_crc32 != pointer.checksum {
+				log::error!(
+					"VLog Key+Value CRC32 mismatch: pointer={:?}, calculated_crc32={}",
+					pointer,
+					calculated_crc32
+				);
 				return Err(Error::Corruption(format!(
-					"Key+Value CRC32 mismatch: expected {}, got {}",
-					pointer.checksum, calculated_crc32
+					"Key+Value CRC32 mismatch (file_id={}, offset={}): expected {}, calculated {}",
+					pointer.file_id, pointer.offset, pointer.checksum, calculated_crc32
 				)));
 			}
 		}
@@ -878,8 +982,16 @@ impl VLog {
 			file_handles.remove(&file_id);
 			if let Some(vlog_file) = files_map.remove(&file_id) {
 				if let Err(e) = std::fs::remove_file(&vlog_file.path) {
-					log::error!("Failed to delete VLog file {:?}: {}", vlog_file.path, e);
-					return Err(Error::Io(Arc::new(e)));
+					log::error!(
+						"Failed to delete VLog file: file_id={}, path={:?}, error={}",
+						file_id,
+						vlog_file.path,
+						e
+					);
+					return Err(Error::Other(format!(
+						"Failed to delete VLog file (file_id={}, path={:?}): {}",
+						file_id, vlog_file.path, e
+					)));
 				}
 			}
 		}
@@ -910,7 +1022,7 @@ impl VLog {
 		// Get all files with discardable bytes, sorted by discard bytes (descending)
 		let candidates = {
 			let discard_stats = self.discard_stats.lock();
-			discard_stats.get_gc_candidates()
+			discard_stats.get_gc_candidates()?
 		};
 
 		if candidates.is_empty() {
@@ -921,31 +1033,33 @@ impl VLog {
 		let active_writer_id = self.active_writer_id.load(Ordering::SeqCst);
 
 		// Find the best candidate to compact (first one that meets all criteria)
-		let candidate_to_compact = candidates.into_iter().find(|(file_id, discard_bytes)| {
+		let mut candidate_to_compact = None;
+		for (file_id, discard_bytes) in candidates {
 			// Skip if no discard bytes
-			if *discard_bytes == 0 {
-				return false;
+			if discard_bytes == 0 {
+				continue;
 			}
 
 			// Check if this file meets the discard ratio threshold
-			let (total_size, _, discard_ratio) = self.get_file_stats(*file_id);
+			let (total_size, _, discard_ratio) = self.get_file_stats(file_id)?;
 			if total_size == 0 || discard_ratio < self.gc_discard_ratio {
-				return false;
+				continue;
 			}
 
 			// Skip if this is the active writer
-			if *file_id == active_writer_id {
-				return false;
+			if file_id == active_writer_id {
+				continue;
 			}
 
 			// Skip if file is already marked for deletion
 			let files_to_delete = self.files_to_be_deleted.read();
-			if files_to_delete.contains(file_id) {
-				return false;
+			if files_to_delete.contains(&file_id) {
+				continue;
 			}
 
-			true
-		});
+			candidate_to_compact = Some((file_id, discard_bytes));
+			break;
+		}
 
 		// If we found a candidate, try to compact it
 		if let Some((file_id, _)) = candidate_to_compact {
@@ -981,15 +1095,24 @@ impl VLog {
 				file_handles.remove(&file_id);
 				if let Some(vlog_file) = files_map.remove(&file_id) {
 					if let Err(e) = std::fs::remove_file(&vlog_file.path) {
-						log::error!("Failed to delete VLog file {:?}: {}", vlog_file.path, e);
-						return Err(Error::Io(Arc::new(e)));
+						log::error!(
+							"Failed to delete compacted VLog file: file_id={}, path={:?}, error={}",
+							file_id,
+							vlog_file.path,
+							e
+						);
+						return Err(Error::Other(format!(
+							"Failed to delete compacted VLog file (file_id={}, path={:?}): {}",
+							file_id, vlog_file.path, e
+						)));
 					}
 				}
 			} else {
-				// There are active iterators, defer deletion
+				// There are active iterators, defer deletion.
+				// Keep file handle in cache - delete_pending_files() will remove it
+				// when the file is actually deleted.
 				let mut files_to_delete = self.files_to_be_deleted.write();
 				files_to_delete.push(file_id);
-				self.file_handles.write().remove(&file_id);
 			}
 		}
 
@@ -1010,7 +1133,7 @@ impl VLog {
 		}
 
 		// Get current discard statistics for this file
-		let (total_size, expected_discard, _) = self.get_file_stats(file_id);
+		let (total_size, expected_discard, _) = self.get_file_stats(file_id)?;
 
 		if total_size == 0 || expected_discard == 0 {
 			// No point in compacting if there's nothing to discard
@@ -1018,7 +1141,18 @@ impl VLog {
 		}
 
 		// Open source file
-		let mut source_file = BufReader::new(File::open(&source_path)?);
+		let mut source_file = BufReader::new(File::open(&source_path).map_err(|e| {
+			log::error!(
+				"Failed to open VLog file for compaction: file_id={}, path={:?}, error={}",
+				file_id,
+				source_path,
+				e
+			);
+			Error::Other(format!(
+				"Failed to open VLog file for compaction (file_id={}, path={:?}): {}",
+				file_id, source_path, e
+			))
+		})?);
 
 		// Start reading after the file header
 		let mut offset = VLogFileHeader::SIZE as u64;
@@ -1034,33 +1168,89 @@ impl VLog {
 		// Read the file and process entries
 		loop {
 			// Try to read header: [key_len: 4 bytes][value_len: 4 bytes]
-			source_file.seek(SeekFrom::Start(offset))?;
+			source_file.seek(SeekFrom::Start(offset)).map_err(|e| {
+				log::error!(
+					"Failed to seek in VLog file during compaction: file_id={}, offset={}, error={}",
+					file_id, offset, e
+				);
+				Error::Other(format!(
+					"Failed to seek in VLog file during compaction (file_id={}, offset={}): {}",
+					file_id, offset, e
+				))
+			})?;
 			let mut key_len_buf = [0u8; 4];
 			match source_file.read_exact(&mut key_len_buf) {
 				Ok(()) => {}
 				Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
 					break;
 				}
-				Err(e) => return Err(e.into()),
+				Err(e) => {
+					log::error!(
+						"Failed to read key length during VLog compaction: file_id={}, offset={}, error={}",
+						file_id, offset, e
+					);
+					return Err(Error::Other(format!(
+						"Failed to read key length during VLog compaction (file_id={}, offset={}): {}",
+						file_id, offset, e
+					)));
+				}
 			}
 
 			let key_len = u32::from_be_bytes(key_len_buf);
 
 			let mut value_len_buf = [0u8; 4];
-			source_file.read_exact(&mut value_len_buf)?;
+			source_file.read_exact(&mut value_len_buf).map_err(|e| {
+				log::error!(
+					"Failed to read value length during VLog compaction: file_id={}, offset={}, error={}",
+					file_id, offset, e
+				);
+				Error::Other(format!(
+					"Failed to read value length during VLog compaction (file_id={}, offset={}): {}",
+					file_id, offset, e
+				))
+			})?;
 			let value_len = u32::from_be_bytes(value_len_buf);
 
 			// Read key
 			let mut key = vec![0u8; key_len as usize];
-			source_file.read_exact(&mut key)?;
+			source_file.read_exact(&mut key).map_err(|e| {
+				log::error!(
+					"Failed to read key during VLog compaction: file_id={}, offset={}, key_len={}, error={}",
+					file_id, offset, key_len, e
+				);
+				Error::Other(format!(
+					"Failed to read key during VLog compaction (file_id={}, offset={}, key_len={}): {}",
+					file_id, offset, key_len, e
+				))
+			})?;
 
 			// Read value
 			let mut value = vec![0u8; value_len as usize];
-			source_file.read_exact(&mut value)?;
+			source_file.read_exact(&mut value).map_err(|e| {
+				log::error!(
+					"Failed to read value during VLog compaction: file_id={}, offset={}, value_len={}, error={}",
+					file_id, offset, value_len, e
+				);
+				Error::Other(format!(
+					"Failed to read value during VLog compaction (file_id={}, offset={}, value_len={}): {}",
+					file_id, offset, value_len, e
+				))
+			})?;
 
 			// Read CRC32
 			let mut crc32_buf = [0u8; 4];
-			source_file.read_exact(&mut crc32_buf)?;
+			source_file.read_exact(&mut crc32_buf).map_err(|e| {
+				log::error!(
+					"Failed to read CRC32 during VLog compaction: file_id={}, offset={}, error={}",
+					file_id,
+					offset,
+					e
+				);
+				Error::Other(format!(
+					"Failed to read CRC32 during VLog compaction (file_id={}, offset={}): {}",
+					file_id, offset, e
+				))
+			})?;
 			let _crc32 = u32::from_be_bytes(crc32_buf);
 
 			let entry_size = 8 + key_len as u64 + value_len as u64 + 4; // header + key + value + crc32
@@ -1150,7 +1340,7 @@ impl VLog {
 			// Update discard stats (file will be deleted, so reset stats)
 			{
 				let mut discard_stats = self.discard_stats.lock();
-				discard_stats.remove_file(file_id);
+				discard_stats.remove_file(file_id)?;
 			}
 
 			Ok(true)
@@ -1180,9 +1370,9 @@ impl VLog {
 	}
 
 	/// Gets statistics for a specific file
-	fn get_file_stats(&self, file_id: u32) -> (u64, u64, f64) {
+	fn get_file_stats(&self, file_id: u32) -> Result<(u64, u64, f64)> {
 		let discard_stats = self.discard_stats.lock();
-		let discard_bytes = discard_stats.get_file_stats(file_id);
+		let discard_bytes = discard_stats.get_file_stats(file_id)?;
 
 		// Get file size from filesystem
 		let file_path = self.vlog_file_path(file_id);
@@ -1198,7 +1388,7 @@ impl VLog {
 			0.0
 		};
 
-		(total_size, discard_bytes, discard_ratio)
+		Ok((total_size, discard_bytes, discard_ratio))
 	}
 
 	/// Registers a VLog file in the files map for tracking
@@ -1236,12 +1426,17 @@ impl VLog {
 	/// Updates discard statistics for a file
 	/// This should be called during LSM compaction when outdated VLog pointers
 	/// are found
-	pub(crate) fn update_discard_stats(&self, stats: &HashMap<u32, i64>) {
+	pub(crate) fn update_discard_stats(&self, stats: &HashMap<u32, i64>) -> Result<()> {
 		let mut discard_stats = self.discard_stats.lock();
 
 		for (file_id, discard_bytes) in stats {
-			discard_stats.update(*file_id, *discard_bytes);
+			discard_stats.update(*file_id, *discard_bytes)?;
 		}
+
+		// Syncs discard statistics to disk
+		discard_stats.sync()?;
+
+		Ok(())
 	}
 
 	/// Adds multiple stale entries to the global delete list in a batch
@@ -1256,21 +1451,21 @@ impl VLog {
 
 	/// Gets statistics for all VLog files (for debugging)
 	#[allow(unused)]
-	pub(crate) fn get_all_file_stats(&self) -> Vec<(u32, u64, u64, f64)> {
+	pub(crate) fn get_all_file_stats(&self) -> Result<Vec<(u32, u64, u64, f64)>> {
 		let mut all_stats = Vec::new();
 
 		// Check files from 0 to next counter
 		let next_file_id = self.next_file_id.load(std::sync::atomic::Ordering::SeqCst);
 
 		for file_id in 0..next_file_id {
-			let (total_size, discard_bytes, discard_ratio) = self.get_file_stats(file_id);
+			let (total_size, discard_bytes, discard_ratio) = self.get_file_stats(file_id)?;
 			if total_size > 0 {
 				// Only include files that exist
 				all_stats.push((file_id, total_size, discard_bytes, discard_ratio));
 			}
 		}
 
-		all_stats
+		Ok(all_stats)
 	}
 
 	/// Checks if a sequence number is marked as stale in the delete list
@@ -1298,7 +1493,10 @@ impl VLog {
 				let encoded_key = internal_key.encode();
 
 				if let Err(e) = write_index.delete(&encoded_key) {
-					log::error!("Failed to delete versioned key: {}", e);
+					log::error!(
+						"Failed to delete versioned key: user_key={:?}, seq_num={}, timestamp={}, kind={:?}, error={}",
+						internal_key.user_key, internal_key.seq_num(), internal_key.timestamp, internal_key.kind(), e
+					);
 					return Err(e.into());
 				} else {
 					total_deleted += 1;
@@ -1445,12 +1643,12 @@ impl VLogGCManager {
 /// With 10K entries, batch is ~1MB which safely fits in default 100MB memtable.
 const DELETE_LIST_CHUNK_SIZE: usize = 10_000;
 
-/// Global Delete List using B+ Tree
-/// Uses a dedicated B+ tree for tracking stale user keys.
+/// Global Delete List using a dedicated LSM tree.
+/// Uses a separate LSM tree for tracking stale sequence numbers.
 /// This provides better performance and consistency with the main LSM tree
 /// design.
 pub(crate) struct DeleteList {
-	/// B+ tree for storing delete list entries (user_key -> value_size)
+	/// LSM tree for storing delete list entries (seq_num -> value_size)
 	tree: Arc<Tree>,
 }
 
