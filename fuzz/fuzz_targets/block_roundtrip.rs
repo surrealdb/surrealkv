@@ -85,7 +85,7 @@ fuzz_target!(|data: FuzzBlockInput| {
 	let internal_cmp = Arc::new(InternalKeyComparator::new(user_cmp.clone()));
 
 	// Build block
-	let mut builder = BlockWriter::new(4096, restart_interval, Arc::clone(&internal_cmp));
+	let mut builder = BlockWriter::new(4096, restart_interval, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 
 	for entry in &entries {
 		let internal_key = entry.to_internal_key().encode();
@@ -99,7 +99,7 @@ fuzz_target!(|data: FuzzBlockInput| {
 		Err(_) => return,
 	};
 
-	let block = Block::new(block_data, Arc::clone(&internal_cmp));
+	let block = Block::new(block_data, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 
 	// ========================================
 	// TEST 1: Forward iteration roundtrip
@@ -404,10 +404,10 @@ fn test_empty_block() {
 	let user_cmp = Arc::new(BytewiseComparator::default());
 	let internal_cmp = Arc::new(InternalKeyComparator::new(user_cmp));
 
-	let builder = BlockWriter::new(4096, 16, Arc::clone(&internal_cmp));
+	let builder = BlockWriter::new(4096, 16, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 	let block_data = builder.finish().expect("Empty block should finish");
 
-	let block = Block::new(block_data, Arc::clone(&internal_cmp));
+	let block = Block::new(block_data, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 	let mut iter = block.iter().expect("Should create iterator");
 
 	iter.seek_to_first().ok();

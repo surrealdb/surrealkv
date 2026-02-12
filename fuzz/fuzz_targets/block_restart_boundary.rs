@@ -5,7 +5,7 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use surrealkv::comparator::{BytewiseComparator, Comparator, InternalKeyComparator};
 use surrealkv::sstable::block::{Block, BlockWriter};
-use surrealkv::InternalIterator;
+use surrealkv::LSMIterator;
 
 #[path = "mod.rs"]
 mod helpers;
@@ -124,7 +124,7 @@ fuzz_target!(|data: RestartBoundaryInput| {
 	let user_cmp = Arc::new(BytewiseComparator::default());
 	let internal_cmp = Arc::new(InternalKeyComparator::new(user_cmp.clone()));
 
-	let mut builder = BlockWriter::new(65536, restart_interval, Arc::clone(&internal_cmp));
+	let mut builder = BlockWriter::new(65536, restart_interval, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 
 	for (key, value) in &entry_data {
 		if builder.add(key, value).is_err() {
@@ -137,7 +137,7 @@ fuzz_target!(|data: RestartBoundaryInput| {
 		Err(_) => return,
 	};
 
-	let block = Block::new(block_data, Arc::clone(&internal_cmp));
+	let block = Block::new(block_data, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 	let mut iter = block.iter().expect("Should create iterator");
 
 	// Calculate restart point positions

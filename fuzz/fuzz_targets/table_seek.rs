@@ -7,7 +7,7 @@ use libfuzzer_sys::fuzz_target;
 use surrealkv::comparator::{BytewiseComparator, Comparator, InternalKeyComparator};
 use surrealkv::sstable::table::{Table, TableWriter};
 use surrealkv::{
-	InternalIterator,
+	LSMIterator,
 	InternalKey,
 	InternalKeyKind,
 	Options,

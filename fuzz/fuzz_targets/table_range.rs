@@ -8,7 +8,7 @@ use libfuzzer_sys::fuzz_target;
 use surrealkv::comparator::{BytewiseComparator, Comparator, InternalKeyComparator};
 use surrealkv::sstable::table::{Table, TableWriter};
 use surrealkv::{
-	InternalIterator,
+	LSMIterator,
 	InternalKey,
 	InternalKeyKind,
 	InternalKeyRange,
@@ -267,7 +267,7 @@ fuzz_target!(|data: FuzzRangeIterInput| {
 
 			while iter.valid() {
 				let key = iter.key().to_owned();
-				let value = iter.value().to_vec();
+				let value = iter.value().expect("iterator value");
 				results.push((key, value));
 
 				if !iter.next().unwrap_or(false) {
@@ -327,7 +327,7 @@ fuzz_target!(|data: FuzzRangeIterInput| {
 
 			while iter.valid() {
 				let key = iter.key().to_owned();
-				let value = iter.value().to_vec();
+				let value = iter.value().expect("iterator value");
 				results.push((key, value));
 
 				if !iter.prev().unwrap_or(false) {

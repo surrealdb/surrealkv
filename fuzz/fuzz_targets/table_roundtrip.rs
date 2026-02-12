@@ -10,7 +10,7 @@ use surrealkv::sstable::bloom::LevelDBBloomFilter;
 use surrealkv::sstable::table::{Table, TableWriter};
 use surrealkv::{
 	CompressionType,
-	InternalIterator,
+	LSMIterator,
 	InternalKey,
 	InternalKeyKind,
 	Options,
@@ -381,7 +381,7 @@ fn verify_forward_iteration(
 
 	while iter.valid() {
 		let key = iter.key();
-		let value = iter.value();
+		let value = iter.value().expect("iterator value");
 		let encoded = key.encoded().to_vec();
 
 		// INVARIANT: Keys must be strictly increasing
@@ -402,7 +402,7 @@ fn verify_forward_iteration(
 		);
 
 		assert_eq!(
-			value,
+			value.as_slice(),
 			expected.0.value.as_slice(),
 			"Forward iteration value mismatch at index {}",
 			count
@@ -445,7 +445,7 @@ fn verify_backward_iteration(
 
 	while iter.valid() {
 		let key = iter.key();
-		let value = iter.value();
+		let value = iter.value().expect("iterator value");
 		let encoded = key.encoded().to_vec();
 
 		// INVARIANT: Keys must be strictly decreasing
@@ -468,7 +468,7 @@ fn verify_backward_iteration(
 		);
 
 		assert_eq!(
-			value,
+			value.as_slice(),
 			expected.0.value.as_slice(),
 			"Backward iteration value mismatch at reverse index {}",
 			count

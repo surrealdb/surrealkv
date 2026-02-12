@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
-use surrealkv::TreeBuilder;
+use surrealkv::{LSMIterator, TreeBuilder};
 use tempfile::TempDir;
 
 #[derive(Arbitrary, Debug)]
@@ -159,7 +159,7 @@ async fn run_fuzz_test(
 					}
 
 					// Flush
-					if let Err(e) = tree.flush() {
+					if let Err(e) = tree.flush_wal(true) {
 						panic!("Flush failed: {:?}", e);
 					}
 
@@ -258,11 +258,8 @@ async fn run_fuzz_test(
 				if iter.seek_first().unwrap_or(false) {
 					while iter.valid() {
 						match iter.value() {
-							Ok(Some(value)) => {
-								results.push((iter.key().to_vec(), value));
-							}
-							Ok(None) => {
-								// Tombstone, skip
+							Ok(value) => {
+								results.push((iter.key().user_key().to_vec(), value));
 							}
 							Err(_) => break,
 						}
@@ -335,11 +332,8 @@ async fn run_fuzz_test(
 				if iter.seek_last().unwrap_or(false) {
 					while iter.valid() {
 						match iter.value() {
-							Ok(Some(value)) => {
-								results.push((iter.key().to_vec(), value));
-							}
-							Ok(None) => {
-								// Tombstone, skip
+							Ok(value) => {
+								results.push((iter.key().user_key().to_vec(), value));
 							}
 							Err(_) => break,
 						}
@@ -396,7 +390,7 @@ async fn run_fuzz_test(
 				}
 
 				// Flush memtable to SSTable
-				if let Err(e) = tree.flush() {
+				if let Err(e) = tree.flush_wal(true) {
 					panic!("Flush failed: {:?}", e);
 				}
 

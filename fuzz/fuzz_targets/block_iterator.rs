@@ -73,7 +73,7 @@ fuzz_target!(|data: FuzzIteratorInput| {
 	let internal_cmp = Arc::new(InternalKeyComparator::new(user_cmp.clone()));
 
 	let mut builder =
-		BlockWriter::new(opts.block_size, restart_interval, Arc::clone(&internal_cmp));
+		BlockWriter::new(opts.block_size, restart_interval, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 
 	for (key, value) in &entry_data {
 		if builder.add(key, value).is_err() {
@@ -86,7 +86,7 @@ fuzz_target!(|data: FuzzIteratorInput| {
 		Err(_) => return,
 	};
 
-	let block = Block::new(block_data, Arc::clone(&internal_cmp));
+	let block = Block::new(block_data, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 	let mut iter = match block.iter() {
 		Ok(it) => it,
 		Err(_) => return,
@@ -235,10 +235,10 @@ fn test_empty_block() {
 	let user_cmp = Arc::new(BytewiseComparator::default());
 	let internal_cmp = Arc::new(InternalKeyComparator::new(user_cmp));
 
-	let builder = BlockWriter::new(4096, 16, Arc::clone(&internal_cmp));
+	let builder = BlockWriter::new(4096, 16, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 	let block_data = builder.finish().expect("Empty block should finish");
 
-	let block = Block::new(block_data, Arc::clone(&internal_cmp));
+	let block = Block::new(block_data, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 	let mut iter = block.iter().expect("Should create iterator");
 
 	let _ = iter.seek_to_first();

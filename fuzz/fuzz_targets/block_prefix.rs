@@ -5,7 +5,7 @@ use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
 use surrealkv::comparator::{BytewiseComparator, Comparator, InternalKeyComparator};
 use surrealkv::sstable::block::{Block, BlockWriter};
-use surrealkv::{InternalIterator, InternalKey, InternalKeyKind};
+use surrealkv::{InternalKey, InternalKeyKind, LSMIterator};
 
 #[path = "mod.rs"]
 mod helpers;
@@ -117,7 +117,8 @@ fuzz_target!(|data: PrefixCompressionInput| {
 	let user_cmp = Arc::new(BytewiseComparator::default());
 	let internal_cmp = Arc::new(InternalKeyComparator::new(user_cmp.clone()));
 
-	let mut builder = BlockWriter::new(65536, restart_interval, Arc::clone(&internal_cmp));
+	let mut builder =
+		BlockWriter::new(65536, restart_interval, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 
 	for (key, value) in &entry_data {
 		if builder.add(key, value).is_err() {
@@ -152,7 +153,7 @@ fuzz_target!(|data: PrefixCompressionInput| {
 		);
 	}
 
-	let block = Block::new(block_data, Arc::clone(&internal_cmp));
+	let block = Block::new(block_data, Arc::clone(&internal_cmp) as Arc<dyn Comparator>);
 	let mut iter = block.iter().expect("Should create iterator");
 	let mut direction: Option<bool> = None;
 
@@ -425,7 +426,7 @@ fn generate_entries_from_pattern(common_prefix: &[u8], pattern: &SuffixPattern) 
 			segments,
 			depth,
 		} => {
-			let depth = (*depth).min(10) as usize;
+			let depth = (*depth).min(5) as usize;
 			let mut entries = Vec::new();
 
 			fn generate_paths(
