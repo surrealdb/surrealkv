@@ -1837,7 +1837,7 @@ impl InternalIterator for TableIterator<'_> {
 		InternalKeyRef::from_encoded(self.second_level.as_ref().unwrap().key_bytes())
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		Ok(self.second_level.as_ref().unwrap().value_bytes())
 	}

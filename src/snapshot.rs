@@ -740,7 +740,7 @@ impl InternalIterator for KMergeIterator<'_> {
 		self.iterators[self.winner.unwrap()].key()
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.is_valid());
 		self.iterators[self.winner.unwrap()].value()
 	}
@@ -1014,7 +1014,7 @@ impl InternalIterator for SnapshotIterator<'_> {
 		}
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		if self.direction == MergeDirection::Backward {
 			Ok(&self.current_back_value)
@@ -1110,7 +1110,7 @@ impl InternalIterator for BPlusTreeIteratorWithGuard<'_> {
 		self.iter.key()
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		self.iter.value()
 	}
 }
@@ -1804,7 +1804,7 @@ impl InternalIterator for HistoryIterator<'_> {
 		}
 	}
 
-	fn value(&self) -> crate::error::Result<&[u8]> {
+	fn value(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		match self.direction {
 			MergeDirection::Forward => self.inner_value(),
