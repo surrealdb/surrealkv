@@ -987,7 +987,7 @@ impl std::fmt::Debug for InternalKeyRef<'_> {
 /// # Example
 /// ```ignore
 /// let mut iter = tx.range(b"a", b"z")?;
-/// iter.seek(&encode_seek_key(b"foo"))?;
+/// iter.seek(b"foo")?;  // Position at first version of "foo"
 /// while iter.valid() {
 ///     let key_ref = iter.key();
 ///     let user_key = key_ref.user_key();
@@ -998,8 +998,10 @@ impl std::fmt::Debug for InternalKeyRef<'_> {
 /// }
 /// ```
 pub trait InternalIterator {
-	/// Seek to first key >= target. Returns Ok(true) if valid.
-	/// Target is an encoded internal key. Use `encode_seek_key()` to encode a user key.
+	/// Seek to first key >= target user key. Returns Ok(true) if valid.
+	///
+	/// For transaction-level iterators, the target is a raw user key which
+	/// will be encoded internally to position at the newest version.
 	fn seek(&mut self, target: &[u8]) -> Result<bool>;
 
 	/// Seek to first entry. Returns Ok(true) if valid.
@@ -1042,22 +1044,4 @@ pub trait InternalIterator {
 	fn value_owned(&self) -> Result<Value> {
 		Ok(self.value()?.to_vec())
 	}
-}
-
-/// Encodes a user key for use with `InternalIterator::seek()`.
-///
-/// The encoded key uses MAX trailer and timestamp values to position at the
-/// FIRST (newest) version of the target user key during iteration.
-///
-/// # Example
-/// ```ignore
-/// let mut iter = tx.range(b"a", b"z")?;
-/// iter.seek(&encode_seek_key(b"foo"))?;  // Position at first version of "foo"
-/// ```
-#[inline]
-pub fn encode_seek_key(user_key: &[u8]) -> Vec<u8> {
-	let mut encoded = user_key.to_vec();
-	encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
-	encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
-	encoded
 }
