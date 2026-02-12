@@ -74,7 +74,7 @@ fn test_block_iter() {
 	let mut i = 0;
 	while block_iter.advance().unwrap() {
 		assert_eq!(block_iter.key().user_key(), data[i].0);
-		assert_eq!(block_iter.raw_value().unwrap(), data[i].1.to_vec());
+		assert_eq!(block_iter.value_encoded().unwrap(), data[i].1.to_vec());
 		i += 1;
 	}
 
@@ -101,13 +101,13 @@ fn test_block_iter_reverse() {
 
 	// After seek_to_first, we're at first entry (key1)
 	assert_eq!(iter.key().user_key(), "key1".as_bytes());
-	assert_eq!(iter.raw_value().unwrap(), b"value1".to_vec());
+	assert_eq!(iter.value_encoded().unwrap(), b"value1".to_vec());
 
 	// Advance to second entry (loooongkey1)
 	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), "loooongkey1".as_bytes());
-	assert_eq!(iter.raw_value().unwrap(), b"value2".to_vec());
+	assert_eq!(iter.value_encoded().unwrap(), b"value2".to_vec());
 
 	// Advance to third entry (medium_key2)
 	iter.next().unwrap();
@@ -118,19 +118,19 @@ fn test_block_iter_reverse() {
 	iter.prev().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), "loooongkey1".as_bytes());
-	assert_eq!(iter.raw_value().unwrap(), b"value2".to_vec());
+	assert_eq!(iter.value_encoded().unwrap(), b"value2".to_vec());
 
 	// Go to the last entry using seek_to_last
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), "pkey3".as_bytes());
-	assert_eq!(iter.raw_value().unwrap(), b"value".to_vec());
+	assert_eq!(iter.value_encoded().unwrap(), b"value".to_vec());
 
 	// Move to second-to-last entry (pkey2)
 	iter.prev().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), "pkey2".as_bytes());
-	assert_eq!(iter.raw_value().unwrap(), b"value".to_vec());
+	assert_eq!(iter.value_encoded().unwrap(), b"value".to_vec());
 }
 
 #[test]
@@ -156,7 +156,7 @@ fn test_block_seek() {
 	block_iter.seek(&key.encode()).unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
-		Some((block_iter.key().user_key(), block_iter.raw_value().unwrap(),)),
+		Some((block_iter.key().user_key(), block_iter.value_encoded().unwrap(),)),
 		Some(("pkey2".as_bytes(), "value".as_bytes()))
 	);
 
@@ -164,7 +164,7 @@ fn test_block_seek() {
 	block_iter.seek(&key.encode()).unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
-		Some((block_iter.key().user_key(), block_iter.raw_value().unwrap(),)),
+		Some((block_iter.key().user_key(), block_iter.value_encoded().unwrap(),)),
 		Some(("pkey1".as_bytes(), "value".as_bytes()))
 	);
 
@@ -172,7 +172,7 @@ fn test_block_seek() {
 	block_iter.seek(&key.encode()).unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
-		Some((block_iter.key().user_key(), block_iter.raw_value().unwrap(),)),
+		Some((block_iter.key().user_key(), block_iter.value_encoded().unwrap(),)),
 		Some(("key1".as_bytes(), "value1".as_bytes()))
 	);
 
@@ -180,7 +180,7 @@ fn test_block_seek() {
 	block_iter.seek(&key.encode()).unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
-		Some((block_iter.key().user_key(), block_iter.raw_value().unwrap(),)),
+		Some((block_iter.key().user_key(), block_iter.value_encoded().unwrap(),)),
 		Some(("pkey3".as_bytes(), "value".as_bytes()))
 	);
 
@@ -213,12 +213,12 @@ fn test_block_seek_to_last() {
 		block_iter.seek_to_last().unwrap();
 		assert!(block_iter.valid());
 		assert_eq!(block_iter.key().user_key(), "pkey3".as_bytes());
-		assert_eq!(block_iter.raw_value().unwrap(), b"value".to_vec());
+		assert_eq!(block_iter.value_encoded().unwrap(), b"value".to_vec());
 
 		block_iter.seek_to_first().unwrap();
 		assert!(block_iter.valid());
 		assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
-		assert_eq!(block_iter.raw_value().unwrap(), b"value1".to_vec());
+		assert_eq!(block_iter.value_encoded().unwrap(), b"value1".to_vec());
 
 		block_iter.next().unwrap();
 		assert!(block_iter.valid());
@@ -228,7 +228,7 @@ fn test_block_seek_to_last() {
 		assert!(block_iter.valid());
 
 		assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
-		assert_eq!(block_iter.raw_value().unwrap(), b"value".to_vec());
+		assert_eq!(block_iter.value_encoded().unwrap(), b"value".to_vec());
 	}
 }
 

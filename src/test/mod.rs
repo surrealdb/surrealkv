@@ -55,7 +55,7 @@ pub mod wal_tests;
 fn collect_iter(iter: &mut impl LSMIterator) -> Vec<(InternalKey, Vec<u8>)> {
 	let mut result = Vec::new();
 	while iter.valid() {
-		result.push((iter.key().to_owned(), iter.raw_value().unwrap().to_vec()));
+		result.push((iter.key().to_owned(), iter.value_encoded().unwrap().to_vec()));
 		if !iter.next().unwrap_or(false) {
 			break;
 		}
@@ -121,7 +121,7 @@ fn collect_snapshot_iter(iter: &mut SnapshotIterator) -> Result<Vec<(InternalKey
 	iter.seek_first()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let encoded_value = iter.raw_value()?;
+		let encoded_value = iter.value_encoded()?;
 		let decoded_value = ValueLocation::decode(encoded_value)?.value;
 		result.push((iter.key().to_owned(), decoded_value));
 		if !iter.next()? {
@@ -137,7 +137,7 @@ fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(Internal
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let encoded_value = iter.raw_value()?;
+		let encoded_value = iter.value_encoded()?;
 		let decoded_value = ValueLocation::decode(encoded_value)?.value;
 		result.push((iter.key().to_owned(), decoded_value));
 		if !iter.prev()? {

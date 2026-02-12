@@ -242,7 +242,7 @@ fn verify_keys_after_compaction(
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
-				let value = iter.raw_value().unwrap().to_vec();
+				let value = iter.value_encoded().unwrap().to_vec();
 				count += 1;
 				all_key_values.insert(key, value);
 				iter.next().unwrap();
@@ -285,7 +285,7 @@ fn verify_all_keys_present(
 
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
-				let value = iter.raw_value().unwrap().to_vec();
+				let value = iter.value_encoded().unwrap().to_vec();
 				all_key_values.insert(key, value);
 				iter.next().unwrap();
 			}
@@ -1355,8 +1355,8 @@ async fn test_compaction_respects_sequence_numbers() {
 		for j in 0..10 {
 			let key = format!("key-{j:03}").into_bytes();
 			let key_bytes = key;
-			let raw_value = format!("value-from-table-{}-seq-{}", i, base_seq + j).into_bytes();
-			let encoded_value = create_inline_value(&raw_value);
+			let value_encoded = format!("value-from-table-{}-seq-{}", i, base_seq + j).into_bytes();
+			let encoded_value = create_inline_value(&value_encoded);
 
 			let internal_key =
 				InternalKey::new(key_bytes.clone(), (base_seq + j) as u64, InternalKeyKind::Set, 0);
@@ -1366,7 +1366,7 @@ async fn test_compaction_respects_sequence_numbers() {
 			// Update expected value if this is a higher sequence number
 			if i == 0 {
 				// First table has highest sequence numbers, so these should win
-				expected_final_values.insert(key_bytes, raw_value);
+				expected_final_values.insert(key_bytes, value_encoded);
 			}
 		}
 
@@ -1415,7 +1415,7 @@ async fn test_compaction_respects_sequence_numbers() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
-				let location = ValueLocation::decode(iter.raw_value().unwrap()).unwrap();
+				let location = ValueLocation::decode(iter.value_encoded().unwrap()).unwrap();
 				if location.is_value_pointer() {
 					panic!("Unexpected VLog pointer in test");
 				}
@@ -1458,8 +1458,8 @@ async fn test_tombstone_propagation() {
 		}
 
 		// Add value second (lower sequence number)
-		let raw_value = format!("original-value-{i}").into_bytes();
-		let encoded_value = create_inline_value(&raw_value);
+		let value_encoded = format!("original-value-{i}").into_bytes();
+		let encoded_value = create_inline_value(&value_encoded);
 
 		let set_key = InternalKey::new(key_bytes, 100 + i, InternalKeyKind::Set, 0);
 		all_entries.push((set_key, encoded_value));
@@ -1526,8 +1526,8 @@ async fn test_l0_overlapping_keys_compaction() {
 	let mut entries1 = Vec::new();
 	for i in 5..=15 {
 		let key = format!("key-{i:03}").into_bytes();
-		let raw_value = format!("value-from-table1-{i}").into_bytes();
-		let encoded_value = create_inline_value(&raw_value);
+		let value_encoded = format!("value-from-table1-{i}").into_bytes();
+		let encoded_value = create_inline_value(&value_encoded);
 
 		let internal_key = InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0);
 		entries1.push((internal_key, encoded_value));
@@ -1537,8 +1537,8 @@ async fn test_l0_overlapping_keys_compaction() {
 	let mut entries2 = Vec::new();
 	for i in 10..=20 {
 		let key = format!("key-{i:03}").into_bytes();
-		let raw_value = format!("value-from-table2-{i}").into_bytes();
-		let encoded_value = create_inline_value(&raw_value);
+		let value_encoded = format!("value-from-table2-{i}").into_bytes();
+		let encoded_value = create_inline_value(&value_encoded);
 
 		let internal_key = InternalKey::new(key, 150 + i - 10, InternalKeyKind::Set, 0);
 		entries2.push((internal_key, encoded_value));
@@ -1548,8 +1548,8 @@ async fn test_l0_overlapping_keys_compaction() {
 	let mut entries3 = Vec::new();
 	for i in 8..=12 {
 		let key = format!("key-{i:03}").into_bytes();
-		let raw_value = format!("value-from-table3-{i}").into_bytes();
-		let encoded_value = create_inline_value(&raw_value);
+		let value_encoded = format!("value-from-table3-{i}").into_bytes();
+		let encoded_value = create_inline_value(&value_encoded);
 
 		let internal_key = InternalKey::new(key, 200 + i - 8, InternalKeyKind::Set, 0);
 		entries3.push((internal_key, encoded_value));
@@ -1601,7 +1601,7 @@ async fn test_l0_overlapping_keys_compaction() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned();
-				let encoded_value = iter.raw_value().unwrap().to_vec();
+				let encoded_value = iter.value_encoded().unwrap().to_vec();
 				match key.kind() {
 					InternalKeyKind::Set => {
 						let location = ValueLocation::decode(&encoded_value).unwrap();
@@ -1654,8 +1654,8 @@ async fn test_l0_tombstone_propagation_overlapping() {
 	let mut entries1 = Vec::new();
 	for i in 0..20 {
 		let key = format!("key-{i:03}").into_bytes();
-		let raw_value = format!("original-value-{i}").into_bytes();
-		let encoded_value = create_inline_value(&raw_value);
+		let value_encoded = format!("original-value-{i}").into_bytes();
+		let encoded_value = create_inline_value(&value_encoded);
 
 		entries1.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
 	}
@@ -1667,8 +1667,8 @@ async fn test_l0_tombstone_propagation_overlapping() {
 		let (kind, value) = if i % 3 == 0 {
 			(InternalKeyKind::Delete, vec![]) // Every 3rd key becomes tombstone
 		} else {
-			let raw_value = format!("updated-value-{i}").into_bytes();
-			let encoded_value = create_inline_value(&raw_value);
+			let value_encoded = format!("updated-value-{i}").into_bytes();
+			let encoded_value = create_inline_value(&value_encoded);
 
 			(InternalKeyKind::Set, encoded_value)
 		};
@@ -1720,7 +1720,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned();
-				let encoded_value = iter.raw_value().unwrap().to_vec();
+				let encoded_value = iter.value_encoded().unwrap().to_vec();
 				if key.kind() == InternalKeyKind::Set {
 					let location = ValueLocation::decode(&encoded_value).unwrap();
 					if location.is_value_pointer() {
@@ -1786,8 +1786,8 @@ async fn test_tombstone_propagation_through_levels() {
 			let (seq, kind, value) = if i % 2 == 0 {
 				(200 + i, InternalKeyKind::Delete, vec![]) // Even keys = tombstones
 			} else {
-				let raw_value = format!("l2-value-{i}").into_bytes();
-				let encoded_value = create_inline_value(&raw_value);
+				let value_encoded = format!("l2-value-{i}").into_bytes();
+				let encoded_value = create_inline_value(&value_encoded);
 
 				(200 + i, InternalKeyKind::Set, encoded_value) // Odd keys = values
 			};
@@ -1801,8 +1801,8 @@ async fn test_tombstone_propagation_through_levels() {
 	let mut l3_entries = Vec::new();
 	for i in 0..12 {
 		let key = format!("key-{i:03}").into_bytes();
-		let raw_value = format!("l3-old-value-{i}").into_bytes();
-		let encoded_value = create_inline_value(&raw_value);
+		let value_encoded = format!("l3-old-value-{i}").into_bytes();
+		let encoded_value = create_inline_value(&value_encoded);
 
 		l3_entries.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
 	}
@@ -1885,8 +1885,8 @@ fn test_tombstone_propagation_journey() {
 	let mut value_entries = Vec::new();
 	let value_key = InternalKey::new(key_bytes, 50, InternalKeyKind::Set, 0);
 
-	let raw_value = b"old-value".to_vec();
-	let encoded_value = create_inline_value(&raw_value);
+	let value_encoded = b"old-value".to_vec();
+	let encoded_value = create_inline_value(&value_encoded);
 
 	value_entries.push((value_key, encoded_value));
 	let value_table = env.create_test_table(101, value_entries).unwrap();
@@ -2072,8 +2072,8 @@ async fn test_soft_delete_compaction_behavior() {
 				(200 + i, InternalKeyKind::Delete, vec![])
 			} else {
 				// Every 3rd+2 key = set value
-				let raw_value = format!("l0-value-{i}").into_bytes();
-				let encoded_value = create_inline_value(&raw_value);
+				let value_encoded = format!("l0-value-{i}").into_bytes();
+				let encoded_value = create_inline_value(&value_encoded);
 				(200 + i, InternalKeyKind::Set, encoded_value)
 			};
 			l0_entries.push((InternalKey::new(key, seq, kind, 0), value));
@@ -2086,8 +2086,8 @@ async fn test_soft_delete_compaction_behavior() {
 	let mut l1_entries = Vec::new();
 	for i in 0..12 {
 		let key = format!("key-{i:03}").into_bytes();
-		let raw_value = format!("l1-old-value-{i}").into_bytes();
-		let encoded_value = create_inline_value(&raw_value);
+		let value_encoded = format!("l1-old-value-{i}").into_bytes();
+		let encoded_value = create_inline_value(&value_encoded);
 
 		l1_entries.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
 	}
@@ -2154,7 +2154,7 @@ async fn test_soft_delete_compaction_behavior() {
 		iter.seek_first().unwrap();
 		while iter.valid() {
 			let key = iter.key().to_owned();
-			let value = iter.raw_value().unwrap().to_vec();
+			let value = iter.value_encoded().unwrap().to_vec();
 			match key.kind() {
 				InternalKeyKind::Set => {
 					let key_str = String::from_utf8(key.user_key.clone()).unwrap();
@@ -2233,8 +2233,8 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 	Arc::make_mut(&mut levels.get_levels_mut()[0]).insert(l0_table);
 
 	// Create L1 table with older Set (seq 200) and oldest SoftDelete (seq 100)
-	let raw_value = b"some-value".to_vec();
-	let encoded_value = create_inline_value(&raw_value);
+	let value_encoded = b"some-value".to_vec();
+	let encoded_value = create_inline_value(&value_encoded);
 	let l1_entries = vec![
 		(InternalKey::new(key.clone(), 200, InternalKeyKind::Set, 0), encoded_value),
 		(

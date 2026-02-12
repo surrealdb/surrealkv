@@ -1319,10 +1319,10 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 		}
 	}
 
-	fn raw_value(&self) -> Result<&[u8]> {
+	fn value_encoded(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		match self.current_source {
-			CurrentSource::Snapshot => self.snapshot_iter.raw_value(),
+			CurrentSource::Snapshot => self.snapshot_iter.value_encoded(),
 			CurrentSource::WriteSet => {
 				let entry = if self.direction == MergeDirection::Forward {
 					self.write_set_entries[self.ws_pos].1
@@ -1337,7 +1337,7 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 
 	fn value(&self) -> Result<Value> {
 		debug_assert!(self.valid());
-		let raw = self.raw_value()?;
+		let raw = self.value_encoded()?;
 		if self.current_source == CurrentSource::WriteSet {
 			Ok(raw.to_vec())
 		} else {
@@ -2113,10 +2113,10 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 	///
 	/// For snapshot entries, may be a VLog reference requiring resolution.
 	/// For write-set entries, returns the direct value bytes.
-	fn raw_value(&self) -> Result<&[u8]> {
+	fn value_encoded(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		match self.current_source {
-			CurrentSource::Snapshot => self.inner.raw_value(),
+			CurrentSource::Snapshot => self.inner.value_encoded(),
 			CurrentSource::WriteSet => {
 				let entry = if self.direction == MergeDirection::Forward {
 					self.write_set_entries[self.ws_pos].1
@@ -2131,7 +2131,7 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 
 	fn value(&self) -> Result<Value> {
 		debug_assert!(self.valid());
-		let raw = self.raw_value()?;
+		let raw = self.value_encoded()?;
 		if self.current_source == CurrentSource::WriteSet {
 			Ok(raw.to_vec())
 		} else {

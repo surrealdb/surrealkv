@@ -238,7 +238,7 @@ impl MemTable {
 			let mut iter = self.iter();
 			iter.seek_first()?;
 			while iter.valid() {
-				table_writer.add(iter.key().to_owned(), iter.raw_value()?)?;
+				table_writer.add(iter.key().to_owned(), iter.value_encoded()?)?;
 				iter.next()?;
 			}
 			// TODO: Check how to fsync this file
@@ -313,7 +313,7 @@ impl LSMIterator for MemTableIterator<'_> {
 		self.iter.key()
 	}
 
-	fn raw_value(&self) -> Result<&[u8]> {
-		self.iter.raw_value()
+	fn value_encoded(&self) -> Result<&[u8]> {
+		self.iter.value_encoded()
 	}
 }

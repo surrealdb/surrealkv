@@ -547,7 +547,7 @@ impl<'a> MergingIterator<'a> {
 			Direction::Forward => self.min_heap.peek().unwrap(),
 			Direction::Backward => self.max_heap.as_ref().unwrap().peek().unwrap(),
 		};
-		self.children[idx].iter.raw_value()
+		self.children[idx].iter.value_encoded()
 	}
 }
 
@@ -618,7 +618,7 @@ impl LSMIterator for MergingIterator<'_> {
 		self.current_key()
 	}
 
-	fn raw_value(&self) -> Result<&[u8]> {
+	fn value_encoded(&self) -> Result<&[u8]> {
 		self.current_value()
 	}
 }

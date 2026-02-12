@@ -1031,7 +1031,7 @@ pub trait LSMIterator {
 	///
 	/// For transaction-level iterators, this returns raw bytes that may be
 	/// VLog-encoded. Use `value()` for resolved values.
-	fn raw_value(&self) -> Result<&[u8]>;
+	fn value_encoded(&self) -> Result<&[u8]>;
 
 	/// Get current value as owned bytes with VLog resolution.
 	///
@@ -1040,6 +1040,6 @@ pub trait LSMIterator {
 	///
 	/// Default implementation clones raw bytes from `value()`.
 	fn value(&self) -> Result<Value> {
-		Ok(self.raw_value()?.to_vec())
+		Ok(self.value_encoded()?.to_vec())
 	}
 }
