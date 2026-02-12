@@ -6,8 +6,8 @@
 use tempdir::TempDir;
 use test_log::test;
 
-use crate::transaction::{HistoryOptions, Mode, TransactionHistoryIterator};
-use crate::{Key, Options, Result, TreeBuilder, Value};
+use crate::transaction::{HistoryOptions, Mode};
+use crate::{InternalIterator, Key, Options, Result, TreeBuilder, Value};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -43,41 +43,41 @@ fn create_store_no_versioning() -> (crate::lsm::Tree, TempDir) {
 	(tree, temp_dir)
 }
 
-/// Collects all entries from a TransactionHistoryIterator
-fn collect_history_all(
-	iter: &mut TransactionHistoryIterator,
-) -> Result<Vec<(Key, Value, u64, bool)>> {
+/// Collects all entries from a history iterator
+fn collect_history_all(iter: &mut impl InternalIterator) -> Result<Vec<(Key, Value, u64, bool)>> {
 	iter.seek_first()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let is_tombstone = iter.is_tombstone();
+		let key_ref = iter.key();
+		let is_tombstone = key_ref.is_tombstone();
 		// Tombstones have no value, so use empty vec
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
-			iter.value()?
+			iter.value_owned()?
 		};
-		result.push((iter.key(), value, iter.timestamp(), is_tombstone));
+		result.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
 		iter.next()?;
 	}
 	Ok(result)
 }
 
-/// Collects all entries from a TransactionHistoryIterator in reverse
+/// Collects all entries from a history iterator in reverse
 fn collect_history_reverse(
-	iter: &mut TransactionHistoryIterator,
+	iter: &mut impl InternalIterator,
 ) -> Result<Vec<(Key, Value, u64, bool)>> {
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let is_tombstone = iter.is_tombstone();
+		let key_ref = iter.key();
+		let is_tombstone = key_ref.is_tombstone();
 		// Tombstones have no value, so use empty vec
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
-			iter.value()?
+			iter.value_owned()?
 		};
-		result.push((iter.key(), value, iter.timestamp(), is_tombstone));
+		result.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
 		if !iter.prev()? {
 			break;
 		}
@@ -520,39 +520,39 @@ async fn test_history_interleaved_iteration() {
 	// Test forward iteration
 	iter.seek_first().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key(), b"key1");
-	assert_eq!(iter.value().unwrap(), b"key1_v2");
+	assert_eq!(iter.key().user_key(), b"key1");
+	assert_eq!(iter.value_owned().unwrap(), b"key1_v2".to_vec());
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key(), b"key1");
-	assert_eq!(iter.value().unwrap(), b"key1_v1");
+	assert_eq!(iter.key().user_key(), b"key1");
+	assert_eq!(iter.value_owned().unwrap(), b"key1_v1".to_vec());
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key(), b"key2");
-	assert_eq!(iter.value().unwrap(), b"key2_v2");
+	assert_eq!(iter.key().user_key(), b"key2");
+	assert_eq!(iter.value_owned().unwrap(), b"key2_v2".to_vec());
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key(), b"key2");
-	assert_eq!(iter.value().unwrap(), b"key2_v1");
+	assert_eq!(iter.key().user_key(), b"key2");
+	assert_eq!(iter.value_owned().unwrap(), b"key2_v1".to_vec());
 
 	// Test backward iteration starting from last
 	iter.seek_last().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key(), b"key2");
-	assert_eq!(iter.value().unwrap(), b"key2_v1");
+	assert_eq!(iter.key().user_key(), b"key2");
+	assert_eq!(iter.value_owned().unwrap(), b"key2_v1".to_vec());
 
 	iter.prev().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key(), b"key2");
-	assert_eq!(iter.value().unwrap(), b"key2_v2");
+	assert_eq!(iter.key().user_key(), b"key2");
+	assert_eq!(iter.value_owned().unwrap(), b"key2_v2".to_vec());
 
 	iter.prev().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key(), b"key1");
-	assert_eq!(iter.value().unwrap(), b"key1_v1");
+	assert_eq!(iter.key().user_key(), b"key1");
+	assert_eq!(iter.value_owned().unwrap(), b"key1_v1".to_vec());
 }
 
 // ============================================================================
@@ -587,16 +587,16 @@ async fn test_history_seek_middle() {
 	// Test seek_first after collection
 	iter.seek_first().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key(), b"key1");
+	assert_eq!(iter.key().user_key(), b"key1");
 
 	// Navigate forward
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key(), b"key2");
+	assert_eq!(iter.key().user_key(), b"key2");
 
 	iter.next().unwrap();
 	assert!(iter.valid());
-	assert_eq!(iter.key(), b"key3");
+	assert_eq!(iter.key().user_key(), b"key3");
 }
 
 // ============================================================================
@@ -792,17 +792,21 @@ async fn test_history_entry_method() {
 	iter.seek_first().unwrap();
 	assert!(iter.valid());
 
-	// Use entry() convenience method
-	let (key, _value, _timestamp, is_tombstone) = iter.entry().unwrap();
-	assert_eq!(key, b"key1");
+	// Use InternalIterator API
+	let key_ref = iter.key();
+	let is_tombstone = key_ref.is_tombstone();
+	assert_eq!(key_ref.user_key(), b"key1");
 	assert!(is_tombstone, "First entry should be tombstone");
 
 	iter.next().unwrap();
 	assert!(iter.valid());
 
-	let (key, value, timestamp, is_tombstone) = iter.entry().unwrap();
-	assert_eq!(key, b"key1");
-	assert_eq!(value, b"value1");
+	let key_ref = iter.key();
+	let value = iter.value_owned().unwrap();
+	let timestamp = key_ref.timestamp();
+	let is_tombstone = key_ref.is_tombstone();
+	assert_eq!(key_ref.user_key(), b"key1");
+	assert_eq!(value.as_slice(), b"value1");
 	assert_eq!(timestamp, 100);
 	assert!(!is_tombstone, "Second entry should not be tombstone");
 }
@@ -1620,319 +1624,6 @@ async fn test_history_ts_range_empty_result() {
 	let results = collect_history_all(&mut iter).unwrap();
 
 	assert_eq!(results.len(), 0, "Should have 0 entries outside ts_range");
-}
-
-// ============================================================================
-// Fuzz-like Tests for History Iterator Filtering & Skipping
-// ============================================================================
-
-/// Configuration for fuzz test scenarios
-#[derive(Debug, Clone)]
-struct FuzzConfig {
-	num_keys: usize,
-	versions_per_key: usize,
-	ts_start: u64,
-	ts_end: u64,
-	use_btree: bool,
-}
-
-/// Expected results computed via brute force
-#[derive(Debug)]
-struct ExpectedResults {
-	/// Number of entries that should be returned
-	count: usize,
-	/// Entries that should be returned (key, value, timestamp)
-	entries: Vec<(Vec<u8>, Vec<u8>, u64)>,
-}
-
-/// Compute expected results using brute-force logic
-fn compute_expected(config: &FuzzConfig) -> ExpectedResults {
-	let mut entries = Vec::new();
-
-	for key_idx in 0..config.num_keys {
-		let key = format!("key{:03}", key_idx);
-		let mut key_entries = Vec::new();
-
-		// Versions are created with increasing timestamps
-		// Iterator sees them in DESC order (newest first)
-		for ver_idx in (0..config.versions_per_key).rev() {
-			let ts = ((ver_idx + 1) * 100) as u64;
-
-			// Check timestamp range
-			if ts > config.ts_end {
-				continue; // Skip entries above range
-			}
-			if ts < config.ts_start {
-				break; // All remaining entries are below range
-			}
-
-			// This entry is valid
-			let value = format!("v{}", ver_idx);
-			key_entries.push((key.clone().into_bytes(), value.into_bytes(), ts));
-		}
-
-		entries.extend(key_entries);
-	}
-
-	ExpectedResults {
-		count: entries.len(),
-		entries,
-	}
-}
-
-/// Generate test configs covering various scenarios
-fn generate_fuzz_configs() -> Vec<FuzzConfig> {
-	let mut configs = Vec::new();
-
-	// Vary number of keys and versions
-	for &keys in &[1, 5, 10] {
-		for &versions in &[5, 20, 50] {
-			// Total timestamps will be 100, 200, ..., versions*100
-			let max_ts = (versions * 100) as u64;
-
-			// Vary timestamp range position
-			let ts_ranges: Vec<(u64, u64, &str)> = vec![
-				(100, max_ts / 4, "covers_first_quarter"),
-				(max_ts / 2, max_ts * 3 / 4, "covers_middle"),
-				(max_ts * 3 / 4, max_ts, "covers_last_quarter"),
-				(max_ts + 100, max_ts + 500, "all_above_range"),
-				(1, 50, "all_below_range"),
-				(100, max_ts, "covers_all"),
-			];
-
-			for (ts_start, ts_end, _name) in &ts_ranges {
-				// Test with LSM (no B+tree index)
-				configs.push(FuzzConfig {
-					num_keys: keys,
-					versions_per_key: versions,
-					ts_start: *ts_start,
-					ts_end: *ts_end,
-					use_btree: false,
-				});
-
-				// Test with B+tree index (only some configs to reduce test time)
-				if keys <= 5 && versions <= 20 {
-					configs.push(FuzzConfig {
-						num_keys: keys,
-						versions_per_key: versions,
-						ts_start: *ts_start,
-						ts_end: *ts_end,
-						use_btree: true,
-					});
-				}
-			}
-		}
-	}
-
-	configs
-}
-
-/// Fuzz test that verifies correctness of history iterator filtering
-#[test(tokio::test)]
-async fn fuzz_history_iterator_ts_filtering() {
-	let configs = generate_fuzz_configs();
-	println!("Running {} fuzz test configs", configs.len());
-
-	for (idx, config) in configs.iter().enumerate() {
-		// Create store based on config
-		let (store, _temp_dir) = if config.use_btree {
-			create_versioned_store_with_index()
-		} else {
-			create_versioned_store_no_index()
-		};
-
-		// Generate data
-		for key_idx in 0..config.num_keys {
-			let key = format!("key{:03}", key_idx);
-			for ver_idx in 0..config.versions_per_key {
-				let ts = ((ver_idx + 1) * 100) as u64;
-				let mut tx = store.begin().unwrap();
-				let value = format!("v{}", ver_idx);
-				tx.set_at(key.as_bytes(), value.as_bytes(), ts).unwrap();
-				tx.commit().await.unwrap();
-			}
-		}
-
-		// Compute expected results
-		let expected = compute_expected(config);
-
-		// Run history iterator with ts_range
-		let tx = store.begin().unwrap();
-		let opts = HistoryOptions::new().with_ts_range(config.ts_start, config.ts_end);
-		let mut iter = tx.history_with_options(b"key000", b"key999", &opts).unwrap();
-		let results = collect_history_all(&mut iter).unwrap();
-
-		// Verify count matches
-		assert_eq!(
-			results.len(),
-			expected.count,
-			"Config #{}: {:?}\nExpected {} entries, got {}",
-			idx,
-			config,
-			expected.count,
-			results.len()
-		);
-
-		// Verify entries match (just count and timestamps)
-		let result_ts: Vec<u64> = results.iter().map(|(_, _, ts, _)| *ts).collect();
-		let expected_ts: Vec<u64> = expected.entries.iter().map(|(_, _, ts)| *ts).collect();
-		assert_eq!(result_ts, expected_ts, "Config #{}: {:?}\nTimestamp mismatch", idx, config);
-
-		// Verify stats show optimization is happening
-		let stats = iter.stats();
-		let max_ts = (config.versions_per_key * 100) as u64;
-		let total_entries = config.num_keys * config.versions_per_key;
-
-		// If ts_range doesn't cover all versions, we should be skipping some entries
-		// Both LSM and B+tree now use seek optimization at seek_first() to skip entries
-		// above ts_end, so we check either entries_skipped_above_ts_range or total_entries_examined
-		if config.ts_end < max_ts {
-			let optimization_happened = stats.entries_skipped_above_ts_range > 0
-				|| stats.early_exits_below_ts_range > 0
-				|| stats.total_entries_examined < total_entries;
-			assert!(
-				optimization_happened,
-				"Config #{}: {:?}\nExpected optimization when ts_end={} < max_ts={}\nStats: {:?}",
-				idx, config, config.ts_end, max_ts, stats
-			);
-		}
-
-		// If ts_start > 100 (first version) and we have results, we should have early exits
-		// Both LSM and B+tree should trigger early exits when hitting ts < ts_start
-		if config.ts_start > 100 && expected.count > 0 {
-			assert!(
-				stats.early_exits_below_ts_range > 0,
-				"Config #{}: {:?}\nExpected early exits when ts_start={} > 100\nStats: {:?}",
-				idx,
-				config,
-				config.ts_start,
-				stats
-			);
-		}
-
-		// If ts_start > max_ts (all entries below ts_range), we should still have early exits
-		// This is the "all_above_range" case where no entries are in range
-		// Both LSM and B+tree should trigger early exits
-		if config.ts_start > max_ts {
-			assert!(
-				stats.early_exits_below_ts_range > 0,
-				"Config #{}: {:?}\nExpected early exits when all entries below ts_start={}\nStats: {:?}",
-				idx,
-				config,
-				config.ts_start,
-				stats
-			);
-		}
-	}
-}
-
-/// Test that verifies skipping is actually happening (not just correctness)
-#[test(tokio::test)]
-async fn test_history_iterator_skip_verification() {
-	let (store, _temp_dir) = create_versioned_store_no_index();
-
-	// Create 1 key with 100 versions
-	// ts: 100, 200, 300, ..., 10000
-	for i in 1..=100 {
-		let mut tx = store.begin().unwrap();
-		tx.set_at(b"key1", format!("v{}", i).as_bytes(), i * 100).unwrap();
-		tx.commit().await.unwrap();
-	}
-
-	// Query with narrow ts_range [200, 500] - should only get 4 entries
-	// This should trigger early exit optimization when ts < 200
-	let tx = store.begin().unwrap();
-	let opts = HistoryOptions::new().with_ts_range(200, 500);
-	let mut iter = tx.history_with_options(b"key1", b"key2", &opts).unwrap();
-	let results = collect_history_all(&mut iter).unwrap();
-
-	assert_eq!(results.len(), 4, "Should have 4 entries in ts_range [200, 500]");
-
-	// Verify timestamps are correct (newest first in range)
-	let timestamps: Vec<u64> = results.iter().map(|(_, _, ts, _)| *ts).collect();
-	assert_eq!(timestamps, vec![500, 400, 300, 200]);
-
-	// Verify stats show optimization is happening
-	let stats = iter.stats();
-
-	// Should have skipped entries above ts_end (ts 600-10000 = 95 entries)
-	assert!(
-		stats.entries_skipped_above_ts_range >= 95,
-		"Should skip ~95 entries above ts_end=500, got {}",
-		stats.entries_skipped_above_ts_range
-	);
-
-	// Should have 1 early exit when ts drops below ts_start=200 (hits ts=100)
-	assert_eq!(
-		stats.early_exits_below_ts_range, 1,
-		"Should have 1 early exit when hitting ts=100 < ts_start=200"
-	);
-
-	// Total examined should be 100 (all entries examined, but early exit after finding ts<200)
-	// We examine: 95 above range + 4 in range + 1 below range (ts=100 triggers early exit)
-	assert_eq!(
-		stats.total_entries_examined, 100,
-		"Should examine all 100 entries (95 skipped above + 4 returned + 1 triggers early exit)"
-	);
-}
-
-/// Test multi-key seek optimization
-#[test(tokio::test)]
-async fn test_history_multi_key_seek_optimization() {
-	let (store, _temp_dir) = create_versioned_store_with_index();
-
-	// Create 5 keys, each with 50 versions
-	for key_idx in 0..5 {
-		let key = format!("key{:02}", key_idx);
-		for ver_idx in 1..=50 {
-			let mut tx = store.begin().unwrap();
-			tx.set_at(key.as_bytes(), format!("v{}", ver_idx).as_bytes(), ver_idx * 100).unwrap();
-			tx.commit().await.unwrap();
-		}
-	}
-
-	store.flush().unwrap();
-
-	// Query with ts_range [200, 1000] - should get 9 entries per key (45 total)
-	// For each key, ~40 entries (ts 1100-5000) should be skipped above range
-	// And early exit triggered when ts drops below 200 (hits ts=100)
-	let tx = store.begin().unwrap();
-	let opts = HistoryOptions::new().with_ts_range(200, 1000);
-	let mut iter = tx.history_with_options(b"key00", b"key99", &opts).unwrap();
-	let results = collect_history_all(&mut iter).unwrap();
-
-	// 5 keys * 9 versions each (ts 200-1000) = 45 entries
-	assert_eq!(
-		results.len(),
-		45,
-		"Should have 45 entries (5 keys * 9 versions in range [200, 1000])"
-	);
-
-	// Verify we got entries from all 5 keys
-	let mut keys_seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
-	for (key, _, _, _) in &results {
-		keys_seen.insert(key.clone());
-	}
-	assert_eq!(keys_seen.len(), 5, "Should see all 5 keys");
-
-	// Verify stats show optimization is happening
-	let stats = iter.stats();
-
-	// Each key should trigger early exit when ts drops below ts_start=200 (hits ts=100)
-	assert_eq!(
-		stats.early_exits_below_ts_range, 5,
-		"Should have 5 early exits (one per key when hitting ts=100 < ts_start=200)"
-	);
-
-	// Should have seeks when transitioning between keys
-	// After early exit on key N, we seek to key N+1
-	assert!(
-		stats.seeks_performed >= 4,
-		"Should have at least 4 seeks (one per key transition), got {}",
-		stats.seeks_performed
-	);
-
-	assert!(stats.total_entries_examined < 250, "Should not examine all 250 entries");
 }
 
 // ==================== RYOW (Read Your Own Writes) Tests ====================

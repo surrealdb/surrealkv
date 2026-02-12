@@ -245,7 +245,7 @@ impl MemTable {
 			let mut iter = self.iter();
 			iter.seek_first()?;
 			while iter.valid() {
-				table_writer.add(iter.key().to_owned(), iter.value())?;
+				table_writer.add(iter.key().to_owned(), iter.value()?)?;
 				iter.next()?;
 			}
 			// TODO: Check how to fsync this file
@@ -320,7 +320,7 @@ impl InternalIterator for MemTableIterator<'_> {
 		self.iter.key()
 	}
 
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> crate::error::Result<&[u8]> {
 		self.iter.value()
 	}
 }

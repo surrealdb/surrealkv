@@ -795,9 +795,9 @@ impl InternalIterator for BlockIterator {
 	}
 
 	/// Returns the current value.
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> crate::error::Result<&[u8]> {
 		debug_assert!(self.valid());
-		&self.block[self.current_value_offset_start..self.current_value_offset_end]
+		Ok(&self.block[self.current_value_offset_start..self.current_value_offset_end])
 	}
 }
 

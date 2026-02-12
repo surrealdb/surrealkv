@@ -121,7 +121,7 @@ fn test_compression_10k_pairs_roundtrip() {
 	iter.seek_to_first().unwrap();
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value = iter.value();
+		let value = iter.value().unwrap();
 
 		assert_eq!(key.user_key, &data[count].0[..]);
 		assert_eq!(value, &data[count].1[..]);
@@ -137,7 +137,7 @@ fn test_compression_10k_pairs_roundtrip() {
 		iter.seek(&seek_key.encode()).unwrap();
 		assert!(iter.valid(), "Iterator should be valid after seek");
 		assert_eq!(iter.key().user_key(), &data[idx].0[..]);
-		assert_eq!(iter.value(), &data[idx].1[..]);
+		assert_eq!(iter.value().unwrap(), &data[idx].1[..]);
 	}
 }
 
@@ -209,7 +209,7 @@ fn test_compression_size_reduction() {
 	let mut count = 0;
 	while iter_uncompressed.valid() && iter_compressed.valid() {
 		assert_eq!(iter_uncompressed.key().user_key(), iter_compressed.key().user_key());
-		assert_eq!(iter_uncompressed.value(), iter_compressed.value());
+		assert_eq!(iter_uncompressed.value().unwrap(), iter_compressed.value().unwrap());
 		count += 1;
 		iter_uncompressed.next().unwrap();
 		iter_compressed.next().unwrap();
@@ -266,7 +266,7 @@ fn test_compression_mixed_patterns() {
 
 	while iter.valid() {
 		assert_eq!(iter.key().user_key(), &data[count].0[..]);
-		assert_eq!(iter.value(), &data[count].1[..]);
+		assert_eq!(iter.value().unwrap(), &data[count].1[..]);
 		count += 1;
 		iter.next().unwrap();
 	}
@@ -300,12 +300,12 @@ fn test_compression_iterator_operations() {
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), &data[0].0[..]);
-	assert_eq!(iter.value(), &data[0].1[..]);
+	assert_eq!(iter.value().unwrap(), &data[0].1[..]);
 
 	iter.seek_to_last().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), &data[9999].0[..]);
-	assert_eq!(iter.value(), &data[9999].1[..]);
+	assert_eq!(iter.value().unwrap(), &data[9999].1[..]);
 
 	for _ in 0..100 {
 		let idx = rng.random_range(0..10_000);
@@ -313,7 +313,7 @@ fn test_compression_iterator_operations() {
 		iter.seek(&seek_key.encode()).unwrap();
 		assert!(iter.valid(), "Should find key at index {}", idx);
 		assert_eq!(iter.key().user_key(), &data[idx].0[..]);
-		assert_eq!(iter.value(), &data[idx].1[..]);
+		assert_eq!(iter.value().unwrap(), &data[idx].1[..]);
 	}
 
 	iter.seek_to_first().unwrap();
@@ -402,7 +402,7 @@ fn test_compression_large_values() {
 
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value = iter.value();
+		let value = iter.value().unwrap();
 
 		assert_eq!(key.user_key, &data[count].0[..]);
 		assert_eq!(value.len(), data[count].1.len(), "Value length mismatch at index {}", count);
@@ -420,7 +420,7 @@ fn test_compression_large_values() {
 		iter.seek(&seek_key.encode()).unwrap();
 		assert!(iter.valid(), "Should find large value at index {}", idx);
 		assert_eq!(iter.key().user_key(), &data[idx].0[..]);
-		assert_eq!(iter.value(), &data[idx].1[..]);
+		assert_eq!(iter.value().unwrap(), &data[idx].1[..]);
 	}
 }
 
@@ -528,8 +528,8 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 	let mut prev_key: Option<Vec<u8>> = None;
 
 	while iter.valid() {
-		let key = iter.key().clone();
-		let value = iter.value().unwrap();
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value();
 		if let Some(ref prev) = prev_key {
 			assert!(
 				key.as_slice() > prev.as_slice(),
@@ -538,7 +538,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 		}
 
 		assert!(keys.iter().any(|k| k == &key), "Scanned key should be in original key set");
-		assert!(value.is_some(), "Value should not be empty");
+		assert!(!value.unwrap().is_empty(), "Value should not be empty");
 		prev_key = Some(key);
 		scanned_count += 1;
 		iter.next().unwrap();
@@ -674,8 +674,8 @@ async fn test_lsm_compression_persistence_after_reopen() {
 		let mut scanned_count = 0;
 		let mut prev_key: Option<Vec<u8>> = None;
 		while iter.valid() {
-			let key = iter.key().clone();
-			let value = iter.value().unwrap().unwrap();
+			let key = iter.key().user_key().to_vec();
+			let value = iter.value_owned().unwrap();
 			if let Some(ref prev) = prev_key {
 				assert!(
 					key.as_slice() > prev.as_slice(),
@@ -909,7 +909,7 @@ fn test_table_writer_with_level_compression() {
 	iter.seek_to_first().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"key1");
-	assert_eq!(iter.value(), b"value1");
+	assert_eq!(iter.value().unwrap(), b"value1");
 }
 
 #[test(tokio::test)]

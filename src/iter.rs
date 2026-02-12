@@ -541,7 +541,7 @@ impl<'a> MergingIterator<'a> {
 	}
 
 	#[inline]
-	pub fn current_value(&self) -> &[u8] {
+	pub fn current_value(&self) -> crate::error::Result<&[u8]> {
 		debug_assert!(self.is_valid());
 		let idx = match self.direction {
 			Direction::Forward => self.min_heap.peek().unwrap(),
@@ -618,7 +618,7 @@ impl InternalIterator for MergingIterator<'_> {
 		self.current_key()
 	}
 
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> crate::error::Result<&[u8]> {
 		self.current_value()
 	}
 }
@@ -1345,7 +1345,7 @@ impl<'a> CompactionIterator<'a> {
 			// Extract to owned values to avoid borrow checker issues
 			let key_owned = self.merge_iter.current_key().to_owned();
 			let user_key_owned = key_owned.user_key.clone();
-			let value_owned = self.merge_iter.current_value().to_vec();
+			let value_owned = self.merge_iter.current_value()?.to_vec();
 
 			// Check if this is a new user key
 			let is_new_key =

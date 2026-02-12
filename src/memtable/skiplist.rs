@@ -909,8 +909,8 @@ impl InternalIterator for SkiplistIterator<'_> {
 	}
 
 	/// Get current value as zero-copy reference.
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> crate::error::Result<&[u8]> {
 		debug_assert!(self.is_valid());
-		self.value_bytes()
+		Ok(self.value_bytes())
 	}
 }

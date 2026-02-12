@@ -3471,10 +3471,10 @@ impl<F: VfsFile> InternalIterator for BPlusTreeIterator<'_, F> {
 	}
 
 	/// Get current value (zero-copy).
-	fn value(&self) -> &[u8] {
+	fn value(&self) -> crate::error::Result<&[u8]> {
 		debug_assert!(self.is_valid());
 		let leaf = self.current_leaf.as_ref().expect("valid() should be true");
-		&leaf.values[self.current_idx]
+		Ok(&leaf.values[self.current_idx])
 	}
 }
 
@@ -5377,7 +5377,7 @@ mod tests {
 			return result;
 		}
 		while iter.valid() {
-			result.push((iter.key().user_key().to_vec(), iter.value().to_vec()));
+			result.push((iter.key().user_key().to_vec(), iter.value_owned().unwrap()));
 			if !iter.next().unwrap() {
 				break;
 			}
@@ -5394,7 +5394,7 @@ mod tests {
 			return result;
 		}
 		while iter.valid() {
-			result.push((iter.key().user_key().to_vec(), iter.value().to_vec()));
+			result.push((iter.key().user_key().to_vec(), iter.value_owned().unwrap()));
 			if !iter.prev().unwrap() {
 				break;
 			}
@@ -5452,7 +5452,7 @@ mod tests {
 		assert!(iter.seek_first().unwrap());
 		assert!(iter.valid());
 		assert_eq!(iter.key().user_key(), b"only_key");
-		assert_eq!(iter.value(), b"only_value");
+		assert_eq!(iter.value().unwrap(), b"only_value");
 	}
 
 	#[test]
@@ -5466,7 +5466,7 @@ mod tests {
 		assert!(iter.seek_last().unwrap());
 		assert!(iter.valid());
 		assert_eq!(iter.key().user_key(), b"only_key");
-		assert_eq!(iter.value(), b"only_value");
+		assert_eq!(iter.value().unwrap(), b"only_value");
 	}
 
 	#[test]
@@ -5713,7 +5713,7 @@ mod tests {
 		assert!(iter.seek(&make_internal_key(b"bbb", 0)).unwrap());
 		assert!(iter.valid());
 		assert_eq!(iter.key().user_key(), b"bbb");
-		assert_eq!(iter.value(), b"val2");
+		assert_eq!(iter.value().unwrap(), b"val2");
 	}
 
 	#[test]
@@ -6129,11 +6129,11 @@ mod tests {
 		let mut iter = tree.internal_iterator();
 		assert!(iter.seek_first().unwrap());
 
-		assert_eq!(iter.value(), b"value_one");
+		assert_eq!(iter.value().unwrap(), b"value_one");
 		assert!(iter.next().unwrap());
-		assert_eq!(iter.value(), b"value_two");
+		assert_eq!(iter.value().unwrap(), b"value_two");
 		assert!(iter.next().unwrap());
-		assert_eq!(iter.value(), b"value_three");
+		assert_eq!(iter.value().unwrap(), b"value_three");
 	}
 
 	#[test]

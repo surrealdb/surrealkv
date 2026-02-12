@@ -42,8 +42,6 @@ pub use crate::transaction::{
 	Mode,
 	ReadOptions,
 	Transaction,
-	TransactionHistoryIterator,
-	TransactionIterator,
 	WriteOptions,
 };
 
@@ -763,13 +761,18 @@ impl From<u8> for InternalKeyKind {
 	}
 }
 
-/// InternalKey is the main key type used throughout the LSM tree
-/// It includes a timestamp field for versioned queries
+/// Internal key type used throughout the LSM tree.
+///
+/// This is the owned version of `InternalKeyRef`. It includes the user key,
+/// timestamp, and trailer (containing sequence number and operation kind).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct InternalKey {
-	pub(crate) user_key: Key,
-	pub(crate) timestamp: u64, // System time in nanoseconds since epoch
-	pub(crate) trailer: u64,   // (seq_num << 8) | kind
+pub struct InternalKey {
+	/// The application's key bytes.
+	pub user_key: Key,
+	/// System time in nanoseconds since epoch.
+	pub timestamp: u64,
+	/// Trailer containing (seq_num << 8) | kind.
+	pub trailer: u64,
 }
 
 impl InternalKey {
@@ -882,9 +885,17 @@ impl PartialOrd for InternalKey {
 }
 
 /// A zero-copy reference to an internal key.
+/// Zero-copy reference to an internal key.
+///
+/// Provides access to all components of an internal key:
+/// - User key bytes
+/// - Timestamp
+/// - Sequence number
+/// - Operation kind (Set, Delete, etc.)
+///
 /// The data lives in the source buffer (arena, block, etc.)
 #[derive(Clone, Copy)]
-pub(crate) struct InternalKeyRef<'a> {
+pub struct InternalKeyRef<'a> {
 	encoded: &'a [u8],
 }
 
@@ -968,9 +979,27 @@ impl std::fmt::Debug for InternalKeyRef<'_> {
 }
 
 /// Cursor-based iterator for internal key-value pairs.
-pub(crate) trait InternalIterator {
+///
+/// This trait provides low-level access to the LSM tree's internal key-value pairs.
+/// Keys are returned as `InternalKeyRef` which includes the user key, timestamp,
+/// sequence number, and operation kind.
+///
+/// # Example
+/// ```ignore
+/// let mut iter = tx.range(b"a", b"z")?;
+/// iter.seek(&encode_seek_key(b"foo"))?;
+/// while iter.valid() {
+///     let key_ref = iter.key();
+///     let user_key = key_ref.user_key();
+///     let ts = key_ref.timestamp();
+///     let is_del = key_ref.is_tombstone();
+///     let value = iter.value_owned()?;
+///     iter.next()?;
+/// }
+/// ```
+pub trait InternalIterator {
 	/// Seek to first key >= target. Returns Ok(true) if valid.
-	/// Target is an encoded internal key.
+	/// Target is an encoded internal key. Use `encode_seek_key()` to encode a user key.
 	fn seek(&mut self, target: &[u8]) -> Result<bool>;
 
 	/// Seek to first entry. Returns Ok(true) if valid.
@@ -989,8 +1018,46 @@ pub(crate) trait InternalIterator {
 	fn valid(&self) -> bool;
 
 	/// Get current key (zero-copy). Caller must check valid() first.
+	///
+	/// Returns an `InternalKeyRef` which provides access to:
+	/// - `user_key()` - the application's key bytes
+	/// - `timestamp()` - the version timestamp
+	/// - `seq_num()` - the sequence number
+	/// - `kind()` - the operation kind (Set, Delete, etc.)
+	/// - `is_tombstone()` - whether this is a delete marker
 	fn key(&self) -> InternalKeyRef<'_>;
 
-	/// Get current value (zero-copy). Caller must check valid() first.
-	fn value(&self) -> &[u8];
+	/// Get current raw value bytes (zero-copy). Caller must check valid() first.
+	///
+	/// For transaction-level iterators, this returns raw bytes that may be
+	/// VLog-encoded. Use `value_owned()` for resolved values.
+	fn value(&self) -> Result<&[u8]>;
+
+	/// Get current value as owned bytes with VLog resolution.
+	///
+	/// This method resolves VLog pointers to actual values, returning owned data.
+	/// For iterators without VLog (internal iterators), this clones the raw bytes.
+	///
+	/// Default implementation clones raw bytes from `value()`.
+	fn value_owned(&self) -> Result<Value> {
+		Ok(self.value()?.to_vec())
+	}
+}
+
+/// Encodes a user key for use with `InternalIterator::seek()`.
+///
+/// The encoded key uses MAX trailer and timestamp values to position at the
+/// FIRST (newest) version of the target user key during iteration.
+///
+/// # Example
+/// ```ignore
+/// let mut iter = tx.range(b"a", b"z")?;
+/// iter.seek(&encode_seek_key(b"foo"))?;  // Position at first version of "foo"
+/// ```
+#[inline]
+pub fn encode_seek_key(user_key: &[u8]) -> Vec<u8> {
+	let mut encoded = user_key.to_vec();
+	encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
+	encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
+	encoded
 }

@@ -14,7 +14,7 @@ use crate::test::{
 	KeyVersionsMap,
 };
 use crate::transaction::HistoryOptions;
-use crate::{Error, Key, Mode, Options, TreeBuilder, WriteOptions};
+use crate::{Error, InternalIterator, Key, Mode, Options, TreeBuilder, WriteOptions};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -619,9 +619,9 @@ async fn test_range_basic_functionality() {
 
 		assert_eq!(range.len(), 2); // key2, key3 (key4 is exclusive)
 		assert_eq!(&range[0].0, b"key2");
-		assert_eq!(&range[0].1.as_ref().unwrap().as_slice(), b"value2");
+		assert_eq!(&range[0].1.as_slice(), b"value2");
 		assert_eq!(&range[1].0, b"key3");
-		assert_eq!(&range[1].1.as_ref().unwrap().as_slice(), b"value3");
+		assert_eq!(&range[1].1.as_slice(), b"value3");
 	}
 }
 
@@ -718,11 +718,11 @@ async fn test_range_read_your_own_writes() {
 		let range = collect_transaction_all(&mut tx.range(b"a", b"f").unwrap()).unwrap();
 
 		assert_eq!(range.len(), 5);
-		assert_eq!(range[0], (Vec::from(b"a"), Some(Vec::from(b"1"))));
-		assert_eq!(range[1], (Vec::from(b"b"), Some(Vec::from(b"2"))));
-		assert_eq!(range[2], (Vec::from(b"c"), Some(Vec::from(b"3_modified"))));
-		assert_eq!(range[3], (Vec::from(b"d"), Some(Vec::from(b"4"))));
-		assert_eq!(range[4], (Vec::from(b"e"), Some(Vec::from(b"5"))));
+		assert_eq!(range[0], (Vec::from(b"a"), Vec::from(b"1")));
+		assert_eq!(range[1], (Vec::from(b"b"), Vec::from(b"2")));
+		assert_eq!(range[2], (Vec::from(b"c"), Vec::from(b"3_modified")));
+		assert_eq!(range[3], (Vec::from(b"d"), Vec::from(b"4")));
+		assert_eq!(range[4], (Vec::from(b"e"), Vec::from(b"5")));
 	}
 }
 
@@ -784,7 +784,7 @@ async fn test_range_delete_then_set() {
 		let range = collect_transaction_all(&mut tx.range(b"key1", b"key4").unwrap()).unwrap();
 
 		assert_eq!(range.len(), 3);
-		assert_eq!(range[1], (Vec::from(b"key2"), Some(Vec::from(b"new_value2"))));
+		assert_eq!(range[1], (Vec::from(b"key2"), Vec::from(b"new_value2")));
 	}
 }
 
@@ -890,7 +890,7 @@ async fn test_range_write_sequence_order() {
 				.unwrap();
 
 		assert_eq!(range.len(), 1);
-		assert_eq!(range[0].1.as_deref(), Some(b"value3".as_slice())); // Latest value
+		assert_eq!(range[0].1.as_slice(), b"value3"); // Latest value
 	}
 }
 
@@ -943,14 +943,14 @@ async fn test_keys_method() {
 			if i < 5 {
 				// For keys from storage, check regular values are correct
 				assert_eq!(
-					regular_range[i].1.as_ref().unwrap().as_slice(),
+					regular_range[i].1.as_slice(),
 					format!("value{}", i + 1).as_bytes(),
 					"Regular range should have correct values from storage"
 				);
 			} else {
 				// For the key from write set
 				assert_eq!(
-					regular_range[i].1.as_ref().unwrap().as_slice(),
+					regular_range[i].1.as_slice(),
 					b"value6",
 					"Regular range should have correct value from write set"
 				);
@@ -1062,7 +1062,7 @@ async fn test_range_value_pointer_resolution_bug() {
 
 			// The returned value should be the actual value, not a value pointer
 			assert_eq!(
-				returned_value.as_ref().unwrap().as_slice(),
+				returned_value.as_slice(),
 				expected_value.as_bytes(),
 				"Range should return resolved values, not value pointers. \
                      Expected actual value of {} bytes, but got a different value",
@@ -1519,7 +1519,7 @@ mod savepoint_tests {
 		let range = collect_transaction_all(&mut txn1.range(b"k1", b"k3").unwrap()).unwrap();
 		assert_eq!(range.len(), 1);
 		assert_eq!(&range[0].0, &k1);
-		assert_eq!(range[0].1.as_ref().unwrap(), &value);
+		assert_eq!(&range[0].1, &value);
 	}
 
 	#[test(tokio::test)]
@@ -1963,13 +1963,16 @@ async fn test_versioned_queries_with_deletes() {
 	iter.seek_first().unwrap();
 	let mut all_versions = Vec::new();
 	while iter.valid() {
-		let is_tombstone = iter.is_tombstone();
+		let key_ref = iter.key();
+		let is_tombstone = key_ref.is_tombstone();
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
-			iter.value().unwrap()
+			iter.value_owned().unwrap()
 		};
-		all_versions.push((iter.key(), value, iter.timestamp(), is_tombstone));
+		let key = key_ref.user_key().to_vec();
+		let ts = key_ref.timestamp();
+		all_versions.push((key, value, ts, is_tombstone));
 		iter.next().unwrap();
 	}
 	// Sort by timestamp ascending
@@ -2478,13 +2481,16 @@ async fn test_scan_all_versions_with_deletes() {
 	iter.seek_first().unwrap();
 	let mut all_versions = Vec::new();
 	while iter.valid() {
-		let is_tombstone = iter.is_tombstone();
+		let key_ref = iter.key();
+		let is_tombstone = key_ref.is_tombstone();
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
-			iter.value().unwrap()
+			iter.value_owned().unwrap()
 		};
-		all_versions.push((iter.key(), value, iter.timestamp(), is_tombstone));
+		let key = key_ref.user_key().to_vec();
+		let ts = key_ref.timestamp();
+		all_versions.push((key, value, ts, is_tombstone));
 		iter.next().unwrap();
 	}
 
@@ -2571,13 +2577,14 @@ mod version_tests {
 		iter.seek_first()?;
 		let mut results = Vec::new();
 		while iter.valid() {
-			let is_tombstone = iter.is_tombstone();
+			let key_ref = iter.key();
+			let is_tombstone = key_ref.is_tombstone();
 			let value = if is_tombstone {
 				Vec::new()
 			} else {
-				iter.value()?
+				iter.value_owned()?
 			};
-			results.push((iter.key(), value, iter.timestamp(), is_tombstone));
+			results.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
 			iter.next()?;
 		}
 		// Sort by (key, timestamp) ascending to match old scan_all_versions behavior

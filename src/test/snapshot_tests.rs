@@ -102,16 +102,16 @@ async fn test_snapshot_isolation_with_updates() {
 	let range = collect_transaction_all(&mut read_tx.range(b"key0", b"key:").unwrap()).unwrap();
 
 	assert_eq!(range.len(), 2);
-	assert_eq!(range[0].1, Some(b"value1_v1".to_vec()));
-	assert_eq!(range[1].1, Some(b"value2_v1".to_vec()));
+	assert_eq!(range[0].1, b"value1_v1".to_vec());
+	assert_eq!(range[1].1, b"value2_v1".to_vec());
 
 	// A new transaction should see the updated values
 	let new_tx = store.begin().unwrap();
 	let range = collect_transaction_all(&mut new_tx.range(b"key0", b"key:").unwrap()).unwrap();
 
 	assert_eq!(range.len(), 2);
-	assert_eq!(range[0].1, Some(b"value1_v2".to_vec()));
-	assert_eq!(range[1].1, Some(b"value2_v2".to_vec()));
+	assert_eq!(range[0].1, b"value1_v2".to_vec());
+	assert_eq!(range[1].1, b"value2_v2".to_vec());
 }
 
 #[test(tokio::test)]
@@ -237,7 +237,7 @@ async fn test_range_with_random_operations() {
 		let expected_key = format!("key{:02}", i + 1);
 		let expected_value = format!("value{}", i + 1);
 		assert_eq!(key, expected_key.as_bytes());
-		assert_eq!(value.as_ref().unwrap(), expected_value.as_bytes());
+		assert_eq!(value.as_slice(), expected_value.as_bytes());
 	}
 
 	// tx2 should see updated data with deletions
@@ -258,7 +258,7 @@ async fn test_range_with_random_operations() {
 		if let Ok(num) = key_str.trim_start_matches("key").parse::<i32>() {
 			if num % 2 == 0 {
 				let expected_value = format!("value{num}_updated");
-				assert_eq!(value.as_ref().unwrap().as_slice(), expected_value.as_bytes());
+				assert_eq!(value.as_slice(), expected_value.as_bytes());
 			}
 		}
 	}

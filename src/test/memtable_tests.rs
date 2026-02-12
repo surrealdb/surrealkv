@@ -209,7 +209,7 @@ fn test_single_key() {
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value();
-		let value = value_bytes.to_vec();
+		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
 			break;
@@ -247,7 +247,7 @@ fn test_multiple_keys() {
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value();
-		let value = value_bytes.to_vec();
+		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
 			break;
@@ -288,7 +288,7 @@ fn test_sequence_number_ordering() {
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value();
-		let value = value_bytes.to_vec();
+		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
 			break;
@@ -362,7 +362,7 @@ fn test_tombstones() {
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value();
-		let value = value_bytes.to_vec();
+		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
 			break;
@@ -398,7 +398,7 @@ fn test_key_kinds() {
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value();
-		let value = value_bytes.to_vec();
+		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
 			break;
@@ -467,7 +467,7 @@ fn test_range_query() {
 	while range_iter.valid() {
 		let key = range_iter.key().to_owned();
 		let value_bytes = range_iter.value();
-		let value = value_bytes.to_vec();
+		let value = value_bytes.unwrap().to_vec();
 		range_entries.push((key, value));
 		if !range_iter.next().unwrap_or(false) {
 			break;
@@ -494,7 +494,7 @@ fn test_range_query() {
 	while range_iter.valid() {
 		let key = range_iter.key().to_owned();
 		let value_bytes = range_iter.value();
-		let value = value_bytes.to_vec();
+		let value = value_bytes.unwrap().to_vec();
 		range_entries.push((key, value));
 		if !range_iter.next().unwrap_or(false) {
 			break;
@@ -531,7 +531,7 @@ fn test_range_query_with_sequence_numbers() {
 	while range_iter.valid() {
 		let key = range_iter.key().to_owned();
 		let value_bytes = range_iter.value();
-		let value = value_bytes.to_vec();
+		let value = value_bytes.unwrap().to_vec();
 		range_entries.push((key, value));
 		if !range_iter.next().unwrap_or(false) {
 			break;
@@ -588,7 +588,7 @@ fn test_binary_keys() {
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value();
-		let value = value_bytes.to_vec();
+		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
 			break;
@@ -737,14 +737,14 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value();
-		let value = value_bytes.to_vec();
+		let value = value_bytes.unwrap().to_vec();
 		if key.user_key != b"b" {
 			range_entries.push((key, value));
 			// Collect remaining entries
 			while iter.next().unwrap_or(false) && iter.valid() {
 				let key = iter.key().to_owned();
 				let value_bytes = iter.value();
-				let value = value_bytes.to_vec();
+				let value = value_bytes.unwrap().to_vec();
 				range_entries.push((key, value));
 			}
 			break;
