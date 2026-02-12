@@ -208,7 +208,7 @@ fn test_single_key() {
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value_bytes = iter.value();
+		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
@@ -246,7 +246,7 @@ fn test_multiple_keys() {
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value_bytes = iter.value();
+		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
@@ -287,7 +287,7 @@ fn test_sequence_number_ordering() {
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value_bytes = iter.value();
+		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
@@ -361,7 +361,7 @@ fn test_tombstones() {
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value_bytes = iter.value();
+		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
@@ -397,7 +397,7 @@ fn test_key_kinds() {
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value_bytes = iter.value();
+		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
@@ -466,7 +466,7 @@ fn test_range_query() {
 	let mut range_entries = Vec::new();
 	while range_iter.valid() {
 		let key = range_iter.key().to_owned();
-		let value_bytes = range_iter.value();
+		let value_bytes = range_iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		range_entries.push((key, value));
 		if !range_iter.next().unwrap_or(false) {
@@ -493,7 +493,7 @@ fn test_range_query() {
 	let mut range_entries = Vec::new();
 	while range_iter.valid() {
 		let key = range_iter.key().to_owned();
-		let value_bytes = range_iter.value();
+		let value_bytes = range_iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		range_entries.push((key, value));
 		if !range_iter.next().unwrap_or(false) {
@@ -530,7 +530,7 @@ fn test_range_query_with_sequence_numbers() {
 	let mut range_entries = Vec::new();
 	while range_iter.valid() {
 		let key = range_iter.key().to_owned();
-		let value_bytes = range_iter.value();
+		let value_bytes = range_iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		range_entries.push((key, value));
 		if !range_iter.next().unwrap_or(false) {
@@ -587,7 +587,7 @@ fn test_binary_keys() {
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value_bytes = iter.value();
+		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
 		if !iter.next().unwrap_or(false) {
@@ -736,14 +736,14 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 	let mut range_entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
-		let value_bytes = iter.value();
+		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		if key.user_key != b"b" {
 			range_entries.push((key, value));
 			// Collect remaining entries
 			while iter.next().unwrap_or(false) && iter.valid() {
 				let key = iter.key().to_owned();
-				let value_bytes = iter.value();
+				let value_bytes = iter.value_encoded();
 				let value = value_bytes.unwrap().to_vec();
 				range_entries.push((key, value));
 			}

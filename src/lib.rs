@@ -993,7 +993,7 @@ impl std::fmt::Debug for InternalKeyRef<'_> {
 ///     let user_key = key_ref.user_key();
 ///     let ts = key_ref.timestamp();
 ///     let is_del = key_ref.is_tombstone();
-///     let value = iter.value_owned()?;
+///     let value = iter.value()?;
 ///     iter.next()?;
 /// }
 /// ```
@@ -1030,8 +1030,8 @@ pub trait LSMIterator {
 	/// Get current raw value bytes (zero-copy). Caller must check valid() first.
 	///
 	/// For transaction-level iterators, this returns raw bytes that may be
-	/// VLog-encoded. Use `value_owned()` for resolved values.
-	fn value(&self) -> Result<&[u8]>;
+	/// VLog-encoded. Use `value()` for resolved values.
+	fn value_encoded(&self) -> Result<&[u8]>;
 
 	/// Get current value as owned bytes with VLog resolution.
 	///
@@ -1039,7 +1039,7 @@ pub trait LSMIterator {
 	/// For iterators without VLog (internal iterators), this clones the raw bytes.
 	///
 	/// Default implementation clones raw bytes from `value()`.
-	fn value_owned(&self) -> Result<Value> {
-		Ok(self.value()?.to_vec())
+	fn value(&self) -> Result<Value> {
+		Ok(self.value_encoded()?.to_vec())
 	}
 }

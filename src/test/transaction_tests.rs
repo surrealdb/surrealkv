@@ -1968,7 +1968,7 @@ async fn test_versioned_queries_with_deletes() {
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
-			iter.value_owned().unwrap()
+			iter.value().unwrap()
 		};
 		let key = key_ref.user_key().to_vec();
 		let ts = key_ref.timestamp();
@@ -2486,7 +2486,7 @@ async fn test_scan_all_versions_with_deletes() {
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
-			iter.value_owned().unwrap()
+			iter.value().unwrap()
 		};
 		let key = key_ref.user_key().to_vec();
 		let ts = key_ref.timestamp();
@@ -2582,7 +2582,7 @@ mod version_tests {
 			let value = if is_tombstone {
 				Vec::new()
 			} else {
-				iter.value_owned()?
+				iter.value()?
 			};
 			results.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
 			iter.next()?;

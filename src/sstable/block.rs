@@ -795,7 +795,7 @@ impl LSMIterator for BlockIterator {
 	}
 
 	/// Returns the current value.
-	fn value(&self) -> Result<&[u8]> {
+	fn value_encoded(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
 		Ok(&self.block[self.current_value_offset_start..self.current_value_offset_end])
 	}

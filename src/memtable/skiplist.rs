@@ -909,7 +909,7 @@ impl LSMIterator for SkiplistIterator<'_> {
 	}
 
 	/// Get current value as zero-copy reference.
-	fn value(&self) -> CrateResult<&[u8]> {
+	fn value_encoded(&self) -> CrateResult<&[u8]> {
 		debug_assert!(self.is_valid());
 		Ok(self.value_bytes())
 	}

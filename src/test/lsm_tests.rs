@@ -730,7 +730,7 @@ async fn test_range_skip_take() {
 			break;
 		}
 		let key = iter.key().user_key().to_vec();
-		let value = iter.value_owned().unwrap();
+		let value = iter.value().unwrap();
 		range_result.push((key, value));
 		iter.next().unwrap();
 	}
@@ -820,7 +820,7 @@ async fn test_range_skip_take_alphabetical() {
 			break;
 		}
 		let key = iter.key().user_key().to_vec();
-		let value = iter.value_owned().unwrap();
+		let value = iter.value().unwrap();
 		range_result.push((key, value));
 		iter.next().unwrap();
 	}
@@ -888,7 +888,7 @@ async fn test_range_limit_functionality() {
 			break;
 		}
 		let key = iter.key().user_key().to_vec();
-		let value = iter.value_owned().unwrap();
+		let value = iter.value().unwrap();
 		limited_result.push((key, value));
 		iter.next().unwrap();
 	}
@@ -926,7 +926,7 @@ async fn test_range_limit_functionality() {
 			break;
 		}
 		let key = iter.key().user_key().to_vec();
-		let value = iter.value_owned().unwrap();
+		let value = iter.value().unwrap();
 		limited_result_1000.push((key, value));
 		iter.next().unwrap();
 	}
@@ -964,7 +964,7 @@ async fn test_range_limit_functionality() {
 			break;
 		}
 		let key = iter.key().user_key().to_vec();
-		let value = iter.value_owned().unwrap();
+		let value = iter.value().unwrap();
 		limited_result_large.push((key, value));
 		iter.next().unwrap();
 	}
@@ -991,7 +991,7 @@ async fn test_range_limit_functionality() {
 	let mut single_result = Vec::new();
 	if iter.valid() {
 		let key = iter.key().user_key().to_vec();
-		let value = iter.value_owned().unwrap();
+		let value = iter.value().unwrap();
 		single_result.push((key, value));
 	}
 
@@ -1058,7 +1058,7 @@ async fn test_range_limit_with_skip_take() {
 			break;
 		}
 		let key = iter.key().user_key().to_vec();
-		let value = iter.value_owned().unwrap();
+		let value = iter.value().unwrap();
 		unlimited_range_result.push((key, value));
 		iter.next().unwrap();
 	}
@@ -1105,7 +1105,7 @@ async fn test_range_limit_with_skip_take() {
 			break;
 		}
 		let key = iter.key().user_key().to_vec();
-		let value = iter.value_owned().unwrap();
+		let value = iter.value().unwrap();
 		res.push((key, value));
 		iter.next().unwrap();
 	}

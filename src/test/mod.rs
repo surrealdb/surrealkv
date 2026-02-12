@@ -55,7 +55,7 @@ pub mod wal_tests;
 fn collect_iter(iter: &mut impl LSMIterator) -> Vec<(InternalKey, Vec<u8>)> {
 	let mut result = Vec::new();
 	while iter.valid() {
-		result.push((iter.key().to_owned(), iter.value().unwrap().to_vec()));
+		result.push((iter.key().to_owned(), iter.value_encoded().unwrap().to_vec()));
 		if !iter.next().unwrap_or(false) {
 			break;
 		}
@@ -87,7 +87,7 @@ fn collect_transaction_iter(iter: &mut impl LSMIterator) -> Result<Vec<(Vec<u8>,
 	let mut result = Vec::new();
 	while iter.valid() {
 		let key = iter.key().user_key().to_vec();
-		let value = iter.value_owned()?;
+		let value = iter.value()?;
 		result.push((key, value));
 		iter.next()?;
 	}
@@ -106,7 +106,7 @@ fn collect_transaction_reverse(iter: &mut impl LSMIterator) -> Result<Vec<(Vec<u
 	let mut result = Vec::new();
 	while iter.valid() {
 		let key = iter.key().user_key().to_vec();
-		let value = iter.value_owned()?;
+		let value = iter.value()?;
 		result.push((key, value));
 		if !iter.prev()? {
 			break;
@@ -121,7 +121,7 @@ fn collect_snapshot_iter(iter: &mut SnapshotIterator) -> Result<Vec<(InternalKey
 	iter.seek_first()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let encoded_value = iter.value()?;
+		let encoded_value = iter.value_encoded()?;
 		let decoded_value = ValueLocation::decode(encoded_value)?.value;
 		result.push((iter.key().to_owned(), decoded_value));
 		if !iter.next()? {
@@ -137,7 +137,7 @@ fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(Internal
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let encoded_value = iter.value()?;
+		let encoded_value = iter.value_encoded()?;
 		let decoded_value = ValueLocation::decode(encoded_value)?.value;
 		result.push((iter.key().to_owned(), decoded_value));
 		if !iter.prev()? {
@@ -165,7 +165,7 @@ fn collect_history_all(iter: &mut impl LSMIterator) -> crate::Result<Vec<(Key, V
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
-			iter.value_owned()?
+			iter.value()?
 		};
 		result.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
 		iter.next()?;
@@ -208,7 +208,7 @@ fn point_in_time_from_history(
 				let value = if is_tombstone {
 					None
 				} else {
-					Some(iter.value_owned()?)
+					Some(iter.value()?)
 				};
 				latest_entries.insert(key.clone(), (value, ts, is_tombstone));
 			}
@@ -275,7 +275,7 @@ fn point_in_time_from_history_in_range(
 				if is_tombstone {
 					result.remove(&key);
 				} else {
-					result.insert(key.clone(), (iter.value_owned()?, ts));
+					result.insert(key.clone(), (iter.value()?, ts));
 				}
 			}
 		}

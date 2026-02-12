@@ -54,7 +54,7 @@ fn collect_history_all(iter: &mut impl LSMIterator) -> Result<Vec<(Key, Value, u
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
-			iter.value_owned()?
+			iter.value()?
 		};
 		result.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
 		iter.next()?;
@@ -73,7 +73,7 @@ fn collect_history_reverse(iter: &mut impl LSMIterator) -> Result<Vec<(Key, Valu
 		let value = if is_tombstone {
 			Vec::new()
 		} else {
-			iter.value_owned()?
+			iter.value()?
 		};
 		result.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
 		if !iter.prev()? {
@@ -519,38 +519,38 @@ async fn test_history_interleaved_iteration() {
 	iter.seek_first().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"key1");
-	assert_eq!(iter.value_owned().unwrap(), b"key1_v2".to_vec());
+	assert_eq!(iter.value().unwrap(), b"key1_v2".to_vec());
 
 	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"key1");
-	assert_eq!(iter.value_owned().unwrap(), b"key1_v1".to_vec());
+	assert_eq!(iter.value().unwrap(), b"key1_v1".to_vec());
 
 	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"key2");
-	assert_eq!(iter.value_owned().unwrap(), b"key2_v2".to_vec());
+	assert_eq!(iter.value().unwrap(), b"key2_v2".to_vec());
 
 	iter.next().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"key2");
-	assert_eq!(iter.value_owned().unwrap(), b"key2_v1".to_vec());
+	assert_eq!(iter.value().unwrap(), b"key2_v1".to_vec());
 
 	// Test backward iteration starting from last
 	iter.seek_last().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"key2");
-	assert_eq!(iter.value_owned().unwrap(), b"key2_v1".to_vec());
+	assert_eq!(iter.value().unwrap(), b"key2_v1".to_vec());
 
 	iter.prev().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"key2");
-	assert_eq!(iter.value_owned().unwrap(), b"key2_v2".to_vec());
+	assert_eq!(iter.value().unwrap(), b"key2_v2".to_vec());
 
 	iter.prev().unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"key1");
-	assert_eq!(iter.value_owned().unwrap(), b"key1_v1".to_vec());
+	assert_eq!(iter.value().unwrap(), b"key1_v1".to_vec());
 }
 
 // ============================================================================
@@ -800,7 +800,7 @@ async fn test_history_entry_method() {
 	assert!(iter.valid());
 
 	let key_ref = iter.key();
-	let value = iter.value_owned().unwrap();
+	let value = iter.value().unwrap();
 	let timestamp = key_ref.timestamp();
 	let is_tombstone = key_ref.is_tombstone();
 	assert_eq!(key_ref.user_key(), b"key1");
