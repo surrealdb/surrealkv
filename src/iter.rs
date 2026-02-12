@@ -1345,7 +1345,7 @@ impl<'a> CompactionIterator<'a> {
 			// Extract to owned values to avoid borrow checker issues
 			let key_owned = self.merge_iter.current_key().to_owned();
 			let user_key_owned = key_owned.user_key.clone();
-			let value_owned = self.merge_iter.current_value()?.to_vec();
+			let value = self.merge_iter.current_value()?.to_vec();
 
 			// Check if this is a new user key
 			let is_new_key =
@@ -1358,7 +1358,7 @@ impl<'a> CompactionIterator<'a> {
 
 					// Start accumulating the new key
 					self.current_user_key = user_key_owned;
-					self.accumulated_versions.push((key_owned, value_owned));
+					self.accumulated_versions.push((key_owned, value));
 
 					// Advance merge iterator for next iteration
 					self.merge_iter.next()?;
@@ -1370,14 +1370,14 @@ impl<'a> CompactionIterator<'a> {
 				} else {
 					// First key - start accumulating
 					self.current_user_key = user_key_owned;
-					self.accumulated_versions.push((key_owned, value_owned));
+					self.accumulated_versions.push((key_owned, value));
 
 					// Advance merge iterator for next iteration
 					self.merge_iter.next()?;
 				}
 			} else {
 				// Same user key - add to accumulated versions
-				self.accumulated_versions.push((key_owned, value_owned));
+				self.accumulated_versions.push((key_owned, value));
 
 				// Advance merge iterator for next iteration
 				self.merge_iter.next()?;

@@ -529,7 +529,7 @@ impl Transaction {
 	/// while iter.valid() {
 	///     let key = iter.key().user_key();
 	///     let ts = iter.key().timestamp();
-	///     let value = iter.value_owned()?;
+	///     let value = iter.value()?;
 	///     iter.next()?;
 	/// }
 	///
@@ -578,7 +578,7 @@ impl Transaction {
 	///     let key_ref = iter.key();
 	///     println!("key={:?} ts={} is_tombstone={} value={:?}",
 	///         key_ref.user_key(), key_ref.timestamp(), key_ref.is_tombstone(),
-	///         iter.value_owned()?);
+	///         iter.value()?);
 	///     iter.next()?;
 	/// }
 	/// ```
@@ -1335,7 +1335,7 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 		}
 	}
 
-	fn value_owned(&self) -> Result<Value> {
+	fn value(&self) -> Result<Value> {
 		debug_assert!(self.valid());
 		let raw = self.raw_value()?;
 		if self.current_source == CurrentSource::WriteSet {
@@ -2129,7 +2129,7 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 		}
 	}
 
-	fn value_owned(&self) -> Result<Value> {
+	fn value(&self) -> Result<Value> {
 		debug_assert!(self.valid());
 		let raw = self.raw_value()?;
 		if self.current_source == CurrentSource::WriteSet {

@@ -5377,7 +5377,7 @@ mod tests {
 			return result;
 		}
 		while iter.valid() {
-			result.push((iter.key().user_key().to_vec(), iter.value_owned().unwrap()));
+			result.push((iter.key().user_key().to_vec(), iter.value().unwrap()));
 			if !iter.next().unwrap() {
 				break;
 			}
@@ -5394,7 +5394,7 @@ mod tests {
 			return result;
 		}
 		while iter.valid() {
-			result.push((iter.key().user_key().to_vec(), iter.value_owned().unwrap()));
+			result.push((iter.key().user_key().to_vec(), iter.value().unwrap()));
 			if !iter.prev().unwrap() {
 				break;
 			}

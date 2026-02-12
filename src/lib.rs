@@ -993,7 +993,7 @@ impl std::fmt::Debug for InternalKeyRef<'_> {
 ///     let user_key = key_ref.user_key();
 ///     let ts = key_ref.timestamp();
 ///     let is_del = key_ref.is_tombstone();
-///     let value = iter.value_owned()?;
+///     let value = iter.value()?;
 ///     iter.next()?;
 /// }
 /// ```
@@ -1039,7 +1039,7 @@ pub trait LSMIterator {
 	/// For iterators without VLog (internal iterators), this clones the raw bytes.
 	///
 	/// Default implementation clones raw bytes from `value()`.
-	fn value_owned(&self) -> Result<Value> {
+	fn value(&self) -> Result<Value> {
 		Ok(self.raw_value()?.to_vec())
 	}
 }

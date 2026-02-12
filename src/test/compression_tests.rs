@@ -675,7 +675,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 		let mut prev_key: Option<Vec<u8>> = None;
 		while iter.valid() {
 			let key = iter.key().user_key().to_vec();
-			let value = iter.value_owned().unwrap();
+			let value = iter.value().unwrap();
 			if let Some(ref prev) = prev_key {
 				assert!(
 					key.as_slice() > prev.as_slice(),
