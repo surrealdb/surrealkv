@@ -1011,7 +1011,7 @@ impl<'a> CompactionIterator<'a> {
 
 		// Sort by sequence number (descending) to get the latest version first
 		// Higher sequence number = more recent write
-		self.accumulated_versions.sort_by(|a, b| b.0.seq_num().cmp(&a.0.seq_num()));
+		self.accumulated_versions.sort_by_key(|b| std::cmp::Reverse(b.0.seq_num()));
 
 		// Check if latest version is DELETE at bottom level
 		// If so, we can completely remove this key from the database

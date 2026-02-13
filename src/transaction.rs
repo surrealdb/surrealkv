@@ -759,7 +759,7 @@ impl Transaction {
 		// respecting the insertion order recorded with Entry::seqno.
 		let mut latest_writes: Vec<Entry> =
 			std::mem::take(&mut self.write_set).into_values().flatten().collect();
-		latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
+		latest_writes.sort_by_key(|a| a.seqno);
 
 		// Generate a single timestamp for this commit
 		let commit_timestamp = self.core.opts.clock.now();

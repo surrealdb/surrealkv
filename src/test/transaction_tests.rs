@@ -1976,7 +1976,7 @@ async fn test_versioned_queries_with_deletes() {
 		iter.next().unwrap();
 	}
 	// Sort by timestamp ascending
-	all_versions.sort_by(|a, b| a.2.cmp(&b.2));
+	all_versions.sort_by_key(|a| a.2);
 	assert_eq!(all_versions.len(), 3);
 
 	// Check values by timestamp
@@ -2415,7 +2415,7 @@ async fn test_scan_all_versions() {
 	let key1_versions = key_versions.get_mut(&Vec::from(b"key1")).unwrap();
 	assert_eq!(key1_versions.len(), 2);
 	// Sort by timestamp to get chronological order
-	key1_versions.sort_by(|a, b| a.1.cmp(&b.1));
+	key1_versions.sort_by_key(|a| a.1);
 	assert_eq!(key1_versions[0].0, b"value1_v1");
 	assert_eq!(key1_versions[1].0, b"value1_v2");
 	assert!(!key1_versions[0].2); // Not tombstone
@@ -2424,7 +2424,7 @@ async fn test_scan_all_versions() {
 	// Verify key2 has 2 versions
 	let key2_versions = key_versions.get_mut(&Vec::from(b"key2")).unwrap();
 	assert_eq!(key2_versions.len(), 2);
-	key2_versions.sort_by(|a, b| a.1.cmp(&b.1));
+	key2_versions.sort_by_key(|a| a.1);
 	assert_eq!(key2_versions[0].0, b"value2_v1");
 	assert_eq!(key2_versions[1].0, b"value2_v2");
 	assert!(!key2_versions[0].2); // Not tombstone
@@ -2509,7 +2509,7 @@ async fn test_scan_all_versions_with_deletes() {
 	// Verify key2 has 3 versions (2 regular values + 1 soft delete marker)
 	let key2_versions = key_versions.get_mut(&Vec::from(b"key2")).unwrap();
 	assert_eq!(key2_versions.len(), 3);
-	key2_versions.sort_by(|a, b| a.1.cmp(&b.1));
+	key2_versions.sort_by_key(|a| a.1);
 	assert_eq!(key2_versions[0].0, b"value2_v1");
 	assert!(!key2_versions[0].2); // Not tombstone
 	assert_eq!(key2_versions[1].0, b"value2_v2");
@@ -3254,7 +3254,7 @@ async fn test_versioned_range_survives_memtable_flush() {
 		let mut iter = tx.history(b"key1", b"key2").unwrap();
 		let mut results = collect_history_all(&mut iter).unwrap();
 		// Sort by timestamp ascending to match expected order
-		results.sort_by(|a, b| a.2.cmp(&b.2));
+		results.sort_by_key(|a| a.2);
 		assert_eq!(results.len(), 3, "Should have 3 versions before flush");
 		assert_eq!(results[0].1, b"v1");
 		assert_eq!(results[1].1, b"v2");
@@ -3269,7 +3269,7 @@ async fn test_versioned_range_survives_memtable_flush() {
 	let mut iter = tx.history(b"key1", b"key2").unwrap();
 	let mut results = collect_history_all(&mut iter).unwrap();
 	// Sort by timestamp ascending to match expected order
-	results.sort_by(|a, b| a.2.cmp(&b.2));
+	results.sort_by_key(|a| a.2);
 
 	// BUG: With versioning=false in flush, only 1 version survives
 	// EXPECTED: All 3 versions should survive
