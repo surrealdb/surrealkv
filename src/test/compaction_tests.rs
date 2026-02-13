@@ -219,6 +219,7 @@ fn create_compaction_options(
 		vlog: Some(vlog),
 		error_handler: Arc::new(BackgroundErrorHandler::new()),
 		snapshot_tracker: SnapshotTracker::new(),
+		versioned_index: None,
 	}
 }
 

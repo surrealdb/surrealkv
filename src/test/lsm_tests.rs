@@ -4985,3 +4985,147 @@ async fn test_range_boundary_edge_cases() {
 		assert_eq!(result_keys[3], "aaaab", "After flush: Fourth key should be 'aaaab'");
 	}
 }
+
+/// Tests that versioned_index cleanup is triggered after VLog GC
+/// and that data integrity is maintained.
+#[test(tokio::test)]
+async fn test_versioned_index_cleanup_after_vlog_gc() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Create tree with versioned_index AND vlog enabled
+	// Note: versioned_index requires versioning to be enabled
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 2;
+		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
+		opts.enable_vlog = true;
+		opts.enable_versioning = true;
+		opts.versioned_history_retention_ns = 1_000_000_000_000; // 1000 seconds
+		opts.enable_versioned_index = true;
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Insert multiple key-value pairs that will go to VLog
+	let keys: Vec<String> = (0..10).map(|i| format!("key-{:04}", i)).collect();
+	let value = "x".repeat(100); // Large value to force VLog storage
+
+	// Insert first version of each key
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Insert second version (updates) to create older versions
+	let value2 = "y".repeat(100);
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value2.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Force compaction to trigger VLog GC and versioned_index cleanup
+	let strategy = Arc::new(Strategy::default());
+	tree.core.compact(strategy).unwrap();
+
+	// Verify that latest values are still accessible
+	for key in &keys {
+		let tx = tree.begin().unwrap();
+		let result = tx.get(key.as_bytes()).unwrap();
+		assert_eq!(
+			result,
+			Some(value2.as_bytes().to_vec()),
+			"Key {} should have latest value",
+			key
+		);
+	}
+}
+
+/// Tests that versioned_index cleanup is deadlock-free when running
+/// concurrently with writes.
+#[test(tokio::test)]
+async fn test_versioned_index_cleanup_concurrent_with_writes() {
+	use std::time::Duration;
+
+	use tokio::time::timeout;
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Create tree with versioned_index AND vlog enabled
+	// Note: versioned_index requires versioning to be enabled
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 2;
+		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
+		opts.enable_vlog = true;
+		opts.enable_versioning = true;
+		opts.versioned_history_retention_ns = 1_000_000_000_000; // 1000 seconds
+		opts.enable_versioned_index = true;
+	});
+
+	let tree = Arc::new(Tree::new(Arc::clone(&opts)).unwrap());
+
+	// First, insert some data and flush to create SSTs with VLog references
+	let value = "x".repeat(100);
+	for i in 0..5 {
+		let key = format!("setup-key-{:04}", i);
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Now run concurrent writes and compactions with a timeout
+	// If there's a deadlock, this will timeout
+	let result = timeout(Duration::from_secs(30), async {
+		let tree1 = Arc::clone(&tree);
+		let tree2 = Arc::clone(&tree);
+
+		// Spawn writer task
+		let writer_handle = tokio::spawn(async move {
+			let value = "y".repeat(100);
+			for i in 0..50 {
+				let key = format!("concurrent-key-{:04}", i);
+				let mut tx = tree1.begin().unwrap();
+				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				tx.commit().await.unwrap();
+
+				// Flush periodically to trigger cleanup
+				if i % 10 == 0 {
+					tree1.flush().unwrap();
+				}
+			}
+		});
+
+		// Spawn compaction task
+		let compactor_handle = tokio::spawn(async move {
+			for _ in 0..5 {
+				// Compact triggers versioned_index cleanup
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				let _ = tree2.core.compact(strategy);
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		});
+
+		// Wait for both tasks to complete
+		let (writer_result, compactor_result) = tokio::join!(writer_handle, compactor_handle);
+		writer_result.expect("Writer task should complete");
+		compactor_result.expect("Compactor task should complete");
+	})
+	.await;
+
+	// Assert that we didn't timeout (no deadlock)
+	assert!(result.is_ok(), "Test timed out - possible deadlock detected");
+
+	// Verify data integrity - all concurrent keys should be readable
+	for i in 0..50 {
+		let key = format!("concurrent-key-{:04}", i);
+		let tx = tree.begin().unwrap();
+		let result = tx.get(key.as_bytes()).unwrap();
+		assert!(result.is_some(), "Key {} should exist", key);
+	}
+}

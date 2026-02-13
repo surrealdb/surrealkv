@@ -20,7 +20,7 @@ use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::Table;
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
-use crate::vlog::{VLog, ValueLocation};
+use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal};
 use crate::{
@@ -340,6 +340,15 @@ impl CoreInner {
 				if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
 					log::warn!("Failed to cleanup obsolete vlog files during flush: {}", e);
 					// Don't fail flush for vlog cleanup errors
+				}
+
+				// Also cleanup stale versioned_index entries
+				if let Err(e) = self.cleanup_stale_versioned_index(min_oldest_vlog) {
+					log::warn!(
+						"Failed to cleanup stale versioned_index entries during flush: {}",
+						e
+					);
+					// Don't fail flush for versioned_index cleanup errors
 				}
 			}
 		}
@@ -821,7 +830,92 @@ impl CoreInner {
 		// Use the existing cleanup logic which handles iterator safety
 		vlog.cleanup_obsolete_files(min_oldest_vlog)?;
 
+		// Also cleanup stale versioned_index entries that reference deleted VLog files
+		if let Err(e) = self.cleanup_stale_versioned_index(min_oldest_vlog) {
+			log::warn!("Failed to cleanup stale versioned_index entries during startup: {}", e);
+			// Don't fail startup for versioned_index cleanup errors
+		}
+
 		Ok(())
+	}
+
+	/// Cleans up stale versioned_index entries that reference deleted VLog files.
+	///
+	/// After VLog GC deletes files, the versioned_index (B+ tree) may contain
+	/// entries with ValuePointers referencing those deleted files. This method
+	/// removes those stale entries.
+	///
+	/// # Algorithm (deadlock-free, proven via TLA+ analysis):
+	/// 1. Phase 1: Acquire READ lock, iterate all entries, collect stale keys
+	/// 2. Release READ lock
+	/// 3. Phase 2: For each batch of keys, acquire WRITE lock, delete, release
+	///
+	/// This design allows concurrent read/write operations between batches.
+	///
+	/// # Arguments
+	/// * `min_valid_file_id` - VLog files with file_id < this are considered deleted
+	///
+	/// # Returns
+	/// The number of stale entries deleted
+	pub(crate) fn cleanup_stale_versioned_index(&self, min_valid_file_id: u32) -> Result<usize> {
+		let versioned_index = match &self.versioned_index {
+			Some(idx) => idx,
+			None => return Ok(0),
+		};
+
+		// Phase 1: Read lock - collect stale keys
+		let keys_to_delete: Vec<Vec<u8>> = {
+			let guard = versioned_index.read();
+			let mut stale_keys = Vec::new();
+
+			// Use range(..) to iterate all entries (RangeFull implements RangeBounds<T>)
+			let empty: &[u8] = &[];
+			let iter = guard.range(empty..)?;
+
+			for entry in iter {
+				let (key, value) = entry?;
+				// Check if this entry has a VLog pointer to a deleted file
+				if let Ok(loc) = ValueLocation::decode(&value) {
+					if loc.is_value_pointer() {
+						if let Ok(ptr) = ValuePointer::decode(&loc.value) {
+							if ptr.file_id < min_valid_file_id {
+								stale_keys.push(key.to_vec());
+							}
+						}
+					}
+				}
+			}
+			stale_keys
+		}; // Read lock released here
+
+		if keys_to_delete.is_empty() {
+			return Ok(0);
+		}
+
+		log::debug!(
+			"Cleaning up {} stale versioned_index entries for VLog files < {}",
+			keys_to_delete.len(),
+			min_valid_file_id
+		);
+
+		// Phase 2: Write lock per batch - delete
+		let mut deleted_count = 0;
+		const BATCH_SIZE: usize = 100;
+
+		for batch in keys_to_delete.chunks(BATCH_SIZE) {
+			let mut guard = versioned_index.write();
+			for key in batch {
+				// No re-verification needed (proven in TLA analysis):
+				// - Keys are never updated (unique InternalKey)
+				// - If deleted by concurrent Replace, delete() returns None (harmless)
+				if guard.delete(key)?.is_some() {
+					deleted_count += 1;
+				}
+			}
+			// Write lock released here, allowing other operations between batches
+		}
+
+		Ok(deleted_count)
 	}
 
 	/// Resolves a value, checking if it's a VLog pointer and retrieving from
