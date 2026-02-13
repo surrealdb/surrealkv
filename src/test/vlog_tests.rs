@@ -4,8 +4,6 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
-use crate::clock::LogicalClock;
-use crate::test::{count_history_versions_in_range, point_in_time_from_history_in_range};
 use crate::vlog::{
 	VLog,
 	VLogFileHeader,
@@ -529,11 +527,11 @@ async fn test_vlog_restart_continues_last_file() {
 	{
 		let vlog2 = VLog::new(Arc::clone(&opts)).unwrap();
 
-		// Check that active_writer_id is set to the last file (file 0)
+		// Check that active_writer_id is set to the last file (file 1)
 		let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
 		assert_eq!(
-			active_writer_id, 0,
-			"After restart, active writer ID should be set to the last file (0)"
+			active_writer_id, 1,
+			"After restart, active writer ID should be set to the last file (1)"
 		);
 
 		// Check that writer is set up
@@ -545,8 +543,8 @@ async fn test_vlog_restart_continues_last_file() {
 		// Check that next_file_id is correct
 		let next_file_id = vlog2.next_file_id.load(Ordering::SeqCst);
 		assert_eq!(
-			next_file_id, 1,
-			"Next file ID should be 1 (one past the highest existing file)"
+			next_file_id, 2,
+			"Next file ID should be 2 (one past the highest existing file)"
 		);
 
 		// Verify all previous data can still be read
@@ -564,9 +562,9 @@ async fn test_vlog_restart_continues_last_file() {
 		let new_pointer = vlog2.append(new_key, &new_value).unwrap();
 		vlog2.sync().unwrap();
 
-		// New data should go to the same file (file 0) since it has space
+		// New data should go to the same file (file 1) since it has space
 		assert_eq!(
-			new_pointer.file_id, 0,
+			new_pointer.file_id, 1,
 			"New data after restart should go to the existing file with space"
 		);
 
@@ -592,7 +590,7 @@ async fn test_vlog_restart_continues_last_file() {
 		if has_file_1 {
 			// If we created file 1, verify the active writer ID updated
 			let final_active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
-			assert_eq!(final_active_writer_id, 1, "Active writer ID should update to the new file");
+			assert_eq!(final_active_writer_id, 2, "Active writer ID should update to the new file");
 		}
 
 		// Verify all data (old and new) can still be read
@@ -967,161 +965,3 @@ async fn test_vlog_writer_reopen_append_only_behavior() {
 		);
 	}
 }
-
-// #[test(tokio::test)]
-// async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
-// 	use crate::clock::MockLogicalClock;
-// 	use crate::compaction::leveled::Strategy;
-// 	use crate::lsm::{CompactionOperations, TreeBuilder};
-
-// 	// Create test environment
-// 	let temp_dir = TempDir::new().unwrap();
-
-// 	// Set up mock clock and retention period
-// 	let mock_clock = Arc::new(MockLogicalClock::with_timestamp(1000));
-// 	let retention_ns = 2000; // 2 seconds retention - very short for testing
-
-// 	let opts = Options {
-// 		clock: Arc::clone(&mock_clock) as Arc<dyn LogicalClock>,
-// 		vlog_max_file_size: 950, /* Small files to force frequent rotations (like VLog
-// 		                          * compaction test) */
-// 		level_count: 2,             // Two levels for compaction strategy
-// 		..Options::default()
-// 	};
-
-// 	// Create Tree with versioning enabled
-// 	let tree = TreeBuilder::with_options(opts)
-// 		.with_path(temp_dir.path().to_path_buf())
-// 		.with_versioning(true, retention_ns)
-// 		.build()
-// 		.unwrap();
-
-// 	// Insert multiple versions of the same key with LARGE values to fill VLog files
-// 	let user_key = b"test_key";
-
-// 	// Insert versions with large values to fill VLog files quickly
-// 	for (i, ts) in [1000, 2000, 3000, 4000].iter().enumerate() {
-// 		let value = format!("value_{}_large_data", i).repeat(50); // Large value to fill VLog
-// 		let mut tx = tree.begin().unwrap();
-// 		tx.set_at(user_key, value.as_bytes(), *ts).unwrap();
-// 		tx.commit().await.unwrap();
-// 		tree.flush().unwrap(); // Force flush after each version
-// 	}
-
-// 	// Insert and delete a different key to create stale entries
-// 	{
-// 		let mut tx = tree.begin().unwrap();
-// 		tx.set_at(b"other_key", b"other_value_large_data".repeat(50), 5000).unwrap();
-// 		tx.commit().await.unwrap();
-// 		tree.flush().unwrap();
-
-// 		// Delete other_key to make it stale
-// 		let mut tx = tree.begin().unwrap();
-// 		tx.delete(b"other_key").unwrap();
-// 		tx.commit().await.unwrap();
-// 		tree.flush().unwrap();
-// 	}
-
-// 	// Verify all versions exist using the public API
-// 	let tx = tree.begin().unwrap();
-// 	let mut end_key = user_key.to_vec();
-// 	end_key.push(0);
-// 	let version_count = count_history_versions_in_range(&tx, user_key.as_ref(), &end_key).unwrap();
-// 	assert_eq!(version_count, 4, "Should have 4 versions before GC");
-
-// 	drop(tx);
-
-// 	// Advance time to make some versions expire
-// 	mock_clock.set_time(6000);
-
-// 	// Trigger LSM compaction first
-// 	let strategy = Arc::new(Strategy::default());
-// 	tree.core.compact(strategy).unwrap();
-
-// 	// Check VLog file stats before GC
-// 	if let Some(vlog) = &tree.core.vlog {
-// 		let stats = vlog.get_all_file_stats().unwrap();
-// 		for (file_id, total_size, discard_bytes, ratio) in stats {
-// 			println!(
-// 				"  File {}: total={}, discard={}, ratio={:.2}",
-// 				file_id, total_size, discard_bytes, ratio
-// 			);
-// 		}
-// 	}
-
-// 	// Now run VLog garbage collection multiple times to process all files
-// 	let mut all_deleted_files = Vec::new();
-
-// 	loop {
-// 		let deleted_files = tree.garbage_collect_vlog().await.unwrap();
-// 		if deleted_files.is_empty() {
-// 			break;
-// 		}
-
-// 		all_deleted_files.extend(deleted_files);
-// 	}
-
-// 	// Verify that some versions were cleaned up using the public API
-// 	let tx = tree.begin().unwrap();
-// 	let mut end_key = user_key.to_vec();
-// 	end_key.push(0);
-// 	let version_count_after =
-// 		count_history_versions_in_range(&tx, user_key.as_ref(), &end_key).unwrap();
-
-// 	// We should have at least some versions remaining
-// 	assert!(version_count_after > 0, "Should have at least some versions remaining");
-
-// 	// If GC deleted files, we should have fewer versions
-// 	if !all_deleted_files.is_empty() {
-// 		// We should have fewer versions after GC
-// 		assert!(
-// 			version_count_after < 6,
-// 			"Should have fewer versions after GC deleted files. Before: 6, After: {}",
-// 			version_count_after
-// 		);
-// 	}
-
-// 	// Test specific timestamp queries to verify which versions were deleted
-// 	let mut end_key = user_key.to_vec();
-// 	end_key.push(0);
-// 	let scan_at_ts1 =
-// 		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 1000).unwrap();
-// 	let scan_at_ts2 =
-// 		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 2000).unwrap();
-// 	let scan_at_ts3 =
-// 		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 3000).unwrap();
-// 	let scan_at_ts4 =
-// 		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 4000).unwrap();
-// 	let scan_at_ts5 =
-// 		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 6000).unwrap();
-// 	let scan_at_ts6 =
-// 		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 6001).unwrap();
-
-// 	// The key insight: VLog GC only processes files with high discard ratios
-// 	// Files 0, 1, 2 had high discard ratios (0.97) and were processed
-// 	// Files 3, 4, 5, 6 had zero discard ratios (0.00) and were NOT processed
-// 	// This means versions in files 0, 1, 2 were cleaned up, but versions in files
-// 	// 3+ were not
-
-// 	// Verify that versions in processed files (1000, 2000, 3000) are NOT accessible
-// 	assert_eq!(
-// 		scan_at_ts1.len(),
-// 		0,
-// 		"Version at timestamp 1000 should be deleted (was in processed file)"
-// 	);
-// 	assert_eq!(
-// 		scan_at_ts2.len(),
-// 		0,
-// 		"Version at timestamp 2000 should be deleted (was in processed file)"
-// 	);
-// 	assert_eq!(
-// 		scan_at_ts3.len(),
-// 		0,
-// 		"Version at timestamp 3000 should be deleted (was in processed file)"
-// 	);
-
-// 	// Verify that recent versions (6000, 6001) are still accessible
-// 	assert_eq!(scan_at_ts4.len(), 1, "Version at timestamp 4000 should still exist (recent)");
-// 	assert_eq!(scan_at_ts5.len(), 1, "Version at timestamp 6000 should still exist (recent)");
-// 	assert_eq!(scan_at_ts6.len(), 1, "Version at timestamp 6001 should still exist (recent)");
-// }

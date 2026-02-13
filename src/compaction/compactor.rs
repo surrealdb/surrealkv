@@ -261,31 +261,19 @@ impl Compactor {
 		guard.commit();
 
 		// After successful manifest commit, cleanup obsolete vlog files
-		// Compute minimum oldest_vlog_file_id across all live SSTs
 		if let Some(ref vlog) = self.options.vlog {
-			let min_oldest_vlog = manifest
-				.iter()
-				.filter_map(|sst| {
-					let oldest = sst.meta.properties.oldest_vlog_file_id;
-					if oldest > 0 {
-						Some(oldest as u32)
-					} else {
-						None
-					}
-				})
-				.min()
-				.unwrap_or(u32::MAX);
+			let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
 
 			// Only cleanup if there are SSTs with vlog references
-			if min_oldest_vlog != u32::MAX {
+			if min_oldest_vlog != 0 {
 				if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
-					log::warn!("Failed to cleanup obsolete vlog files: {}", e);
+					log::error!("Failed to cleanup obsolete vlog files: {}", e);
 					// Don't fail compaction for vlog cleanup errors
 				}
 
 				// Also cleanup stale versioned_index entries
 				if let Err(e) = self.cleanup_stale_versioned_index(min_oldest_vlog) {
-					log::warn!("Failed to cleanup stale versioned_index entries: {}", e);
+					log::error!("Failed to cleanup stale versioned_index entries: {}", e);
 					// Don't fail compaction for versioned_index cleanup errors
 				}
 			}

@@ -320,23 +320,11 @@ impl CoreInner {
 		);
 
 		// After successful manifest commit, cleanup obsolete vlog files
-		// Compute minimum oldest_vlog_file_id across all live SSTs
 		if let Some(ref vlog) = self.vlog {
-			let min_oldest_vlog = manifest
-				.iter()
-				.filter_map(|sst| {
-					let oldest = sst.meta.properties.oldest_vlog_file_id;
-					if oldest > 0 {
-						Some(oldest as u32)
-					} else {
-						None
-					}
-				})
-				.min()
-				.unwrap_or(u32::MAX);
+			let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
 
 			// Only cleanup if there are SSTs with vlog references
-			if min_oldest_vlog != u32::MAX {
+			if min_oldest_vlog != 0 {
 				if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
 					log::warn!("Failed to cleanup obsolete vlog files during flush: {}", e);
 					// Don't fail flush for vlog cleanup errors
@@ -803,24 +791,12 @@ impl CoreInner {
 			None => return Ok(()), // No VLog, nothing to clean up
 		};
 
-		// Compute minimum oldest_vlog_file_id across all live SSTs
 		let manifest = self.level_manifest.read()?;
-		let min_oldest_vlog = manifest
-			.iter()
-			.filter_map(|sst| {
-				let oldest = sst.meta.properties.oldest_vlog_file_id;
-				if oldest > 0 {
-					Some(oldest as u32)
-				} else {
-					None
-				}
-			})
-			.min()
-			.unwrap_or(u32::MAX);
+		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
 
 		// If no SSTs reference VLog files yet, keep all files
 		// (This handles the fresh database case)
-		if min_oldest_vlog == u32::MAX {
+		if min_oldest_vlog == 0 {
 			log::debug!("No SSTs with VLog references found, skipping VLog orphan cleanup");
 			return Ok(());
 		}
@@ -1480,6 +1456,20 @@ impl Core {
 			log::debug!("Stopping background task manager...");
 			task_manager.stop().await;
 			log::debug!("Background task manager stopped");
+		}
+
+		// Close the VLog if present
+		if let Some(ref vlog) = self.inner.vlog {
+			log::debug!("Closing VLog...");
+			vlog.close()?;
+			log::debug!("VLog closed");
+		}
+
+		// Close the versioned index if present
+		if let Some(ref versioned_index) = self.inner.versioned_index {
+			log::debug!("Closing versioned index...");
+			versioned_index.write().close()?;
+			log::debug!("Versioned index closed");
 		}
 
 		// Step 3: Conditionally flush ALL memtables based on flush_on_close option

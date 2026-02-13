@@ -5129,3 +5129,152 @@ async fn test_versioned_index_cleanup_concurrent_with_writes() {
 		assert!(result.is_some(), "Key {} should exist", key);
 	}
 }
+
+/// Tests that stale entries are actually deleted from the versioned_index (B+ tree)
+/// after VLog GC by directly inspecting the B+ tree contents.
+#[test(tokio::test)]
+async fn test_versioned_index_entries_deleted_after_gc() {
+	use crate::vlog::{ValueLocation, ValuePointer};
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Create tree with versioned_index AND vlog enabled
+	// Use a very short retention period so old versions get dropped during compaction
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 2;
+		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
+		opts.enable_vlog = true;
+		opts.enable_versioning = true;
+		opts.versioned_history_retention_ns = 1; // 1 nanosecond - immediately expire old versions
+		opts.enable_versioned_index = true;
+		opts.level0_max_files = 1; // Trigger compaction after each flush
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Phase 1: Insert initial data - these will go to VLog file 1
+	let keys: Vec<String> = (0..5).map(|i| format!("gc-test-key-{:04}", i)).collect();
+	let value1 = "x".repeat(100); // Large value to force VLog storage
+
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value1.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Small delay to ensure timestamps differ
+	tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+	// Phase 2: Update data - these will go to VLog file 2
+	let value2 = "y".repeat(100);
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value2.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Phase 3: Capture pre-GC state - count entries and VLog file IDs in B+ tree
+	let (pre_gc_count, pre_gc_file_ids) = {
+		let versioned_index = tree.core.inner.versioned_index.as_ref().unwrap();
+		let guard = versioned_index.read();
+
+		let empty: &[u8] = &[];
+		let mut count = 0;
+		let mut file_ids = std::collections::HashSet::new();
+
+		for entry in guard.range(empty..).unwrap() {
+			let (_, value) = entry.unwrap();
+			count += 1;
+
+			if let Ok(loc) = ValueLocation::decode(&value) {
+				if loc.is_value_pointer() {
+					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
+						file_ids.insert(ptr.file_id);
+					}
+				}
+			}
+		}
+
+		(count, file_ids)
+	};
+
+	// Should have entries from multiple VLog files (at least 2)
+	assert!(
+		pre_gc_file_ids.len() >= 2,
+		"Pre-GC should have entries from at least 2 VLog files, found: {:?}",
+		pre_gc_file_ids
+	);
+
+	// Phase 4: Trigger GC via compaction - use strategy with our options
+	let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+		Arc::new(Strategy::from_options(Arc::clone(&opts)));
+	tree.core.compact(Arc::clone(&strategy)).unwrap();
+
+	// Phase 5: Verify entries deleted - count should be less and no stale file IDs
+	let (post_gc_count, post_gc_file_ids, min_file_id) = {
+		let versioned_index = tree.core.inner.versioned_index.as_ref().unwrap();
+		let guard = versioned_index.read();
+
+		let empty: &[u8] = &[];
+		let mut count = 0;
+		let mut file_ids = std::collections::HashSet::new();
+		let mut min_id = u32::MAX;
+
+		for entry in guard.range(empty..).unwrap() {
+			let (_, value) = entry.unwrap();
+			count += 1;
+
+			if let Ok(loc) = ValueLocation::decode(&value) {
+				if loc.is_value_pointer() {
+					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
+						file_ids.insert(ptr.file_id);
+						min_id = min_id.min(ptr.file_id);
+					}
+				}
+			}
+		}
+
+		(count, file_ids, min_id)
+	};
+
+	// Entry count should be reduced (stale entries deleted)
+	assert!(
+		post_gc_count < pre_gc_count,
+		"Entry count should decrease after GC: pre={}, post={}",
+		pre_gc_count,
+		post_gc_count
+	);
+
+	// Should have fewer unique VLog file IDs (old files deleted)
+	assert!(
+		post_gc_file_ids.len() < pre_gc_file_ids.len(),
+		"Should have fewer VLog file references after GC: pre={:?}, post={:?}",
+		pre_gc_file_ids,
+		post_gc_file_ids
+	);
+
+	// All remaining file IDs should be >= min valid (no stale references)
+	for file_id in &post_gc_file_ids {
+		assert!(
+			*file_id >= min_file_id,
+			"Found stale file_id {} < min_valid {}",
+			file_id,
+			min_file_id
+		);
+	}
+
+	// Verify data integrity - latest values should still be accessible
+	for key in &keys {
+		let tx = tree.begin().unwrap();
+		let result = tx.get(key.as_bytes()).unwrap();
+		assert_eq!(
+			result,
+			Some(value2.as_bytes().to_vec()),
+			"Key {} should have latest value after GC",
+			key
+		);
+	}
+}

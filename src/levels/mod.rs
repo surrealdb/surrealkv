@@ -377,6 +377,22 @@ impl LevelManifest {
 		LevelManifestIterator::new(self)
 	}
 
+	/// Returns the minimum oldest_vlog_file_id across all live SSTs.
+	/// Returns 0 if no SSTs reference VLog files.
+	pub(crate) fn min_oldest_vlog_file_id(&self) -> u32 {
+		self.iter()
+			.filter_map(|sst| {
+				let oldest = sst.meta.properties.oldest_vlog_file_id;
+				if oldest > 0 {
+					Some(oldest as u32)
+				} else {
+					None
+				}
+			})
+			.min()
+			.unwrap_or(0)
+	}
+
 	pub(crate) fn get_all_tables(&self) -> HashMap<u64, Arc<Table>> {
 		let mut output = HashMap::new();
 
