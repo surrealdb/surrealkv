@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs::File as SysFile;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
@@ -129,8 +128,8 @@ impl Compactor {
 		let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
 		let new_table_path = self.get_table_path(new_table_id);
 
-		// Write merged data - returns (table_created, discard_stats)
-		let (table_created, discard_stats) =
+		// Write merged data
+		let table_created =
 			match self.write_merged_table(&new_table_path, new_table_id, iterators, input) {
 				Ok(result) => result,
 				Err(e) => {
@@ -152,15 +151,6 @@ impl Compactor {
 			None
 		};
 
-		// Update discard stats BEFORE manifest commit for clean abort on error.
-		// If this fails, the HiddenTablesGuard will unhide tables on drop,
-		// leaving the system in a consistent state.
-		if !discard_stats.is_empty() {
-			if let Some(ref vlog) = self.options.vlog {
-				vlog.update_discard_stats(&discard_stats)?;
-			}
-		}
-
 		// Update manifest - this will commit the guard on success
 		self.update_manifest(input, new_table, &mut guard)?;
 
@@ -169,16 +159,14 @@ impl Compactor {
 		Ok(())
 	}
 
-	/// Returns (table_created, discard_stats)
-	/// table_created: true if a table file was created and finished, false otherwise
-	/// discard_stats: always populated (even when no table created) for VLog GC
+	/// Returns true if a table file was created and finished, false otherwise
 	fn write_merged_table(
 		&self,
 		path: &Path,
 		table_id: u64,
 		merge_iter: Vec<BoxedLSMIterator<'_>>,
 		input: &CompactionInput,
-	) -> Result<(bool, HashMap<u32, i64>)> {
+	) -> Result<bool> {
 		let file = SysFile::create(path)?;
 		let mut writer =
 			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
@@ -195,7 +183,6 @@ impl Compactor {
 			merge_iter,
 			Arc::clone(&self.options.lopts.internal_comparator) as Arc<dyn Comparator>,
 			is_bottom_level,
-			self.options.vlog.clone(),
 			self.options.lopts.enable_versioning,
 			self.options.lopts.versioned_history_retention_ns,
 			Arc::clone(&self.options.lopts.clock),
@@ -209,21 +196,15 @@ impl Compactor {
 			entries += 1;
 		}
 
-		// Always flush delete-list for VLog cleanup (critical for GC)
-		comp_iter.flush_delete_list_batch()?;
-
-		// Capture discard_stats - these are populated even when entries == 0
-		let discard_stats = comp_iter.discard_stats;
-
 		if entries == 0 {
 			// No entries - drop writer and remove empty file
 			drop(writer);
 			let _ = std::fs::remove_file(path);
-			return Ok((false, discard_stats));
+			return Ok(false);
 		}
 
 		writer.finish()?;
-		Ok((true, discard_stats))
+		Ok(true)
 	}
 
 	fn update_manifest(
@@ -274,6 +255,31 @@ impl Compactor {
 
 		// Commit guard - tables are now properly handled in manifest
 		guard.commit();
+
+		// After successful manifest commit, cleanup obsolete vlog files
+		// Compute minimum oldest_vlog_file_id across all live SSTs
+		if let Some(ref vlog) = self.options.vlog {
+			let min_oldest_vlog = manifest
+				.iter()
+				.filter_map(|sst| {
+					let oldest = sst.meta.properties.oldest_vlog_file_id;
+					if oldest > 0 {
+						Some(oldest as u32)
+					} else {
+						None
+					}
+				})
+				.min()
+				.unwrap_or(u32::MAX);
+
+			// Only cleanup if there are SSTs with vlog references
+			if min_oldest_vlog != u32::MAX {
+				if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
+					log::warn!("Failed to cleanup obsolete vlog files: {}", e);
+					// Don't fail compaction for vlog cleanup errors
+				}
+			}
+		}
 
 		Ok(())
 	}

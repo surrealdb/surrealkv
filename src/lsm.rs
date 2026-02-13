@@ -1,5 +1,3 @@
-#[cfg(test)]
-use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::{create_dir_all, File};
 use std::path::Path;
@@ -22,7 +20,7 @@ use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::Table;
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
-use crate::vlog::{VLog, VLogGCManager, ValueLocation};
+use crate::vlog::{VLog, ValueLocation};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal};
 use crate::{
@@ -183,7 +181,7 @@ impl CoreInner {
 		};
 
 		let vlog = if opts.enable_vlog {
-			Some(Arc::new(VLog::new(Arc::clone(&opts), versioned_index.clone())?))
+			Some(Arc::new(VLog::new(Arc::clone(&opts))?))
 		} else {
 			None
 		};
@@ -320,6 +318,31 @@ impl CoreInner {
 			wal_number + 1,
 			manifest.get_last_sequence()
 		);
+
+		// After successful manifest commit, cleanup obsolete vlog files
+		// Compute minimum oldest_vlog_file_id across all live SSTs
+		if let Some(ref vlog) = self.vlog {
+			let min_oldest_vlog = manifest
+				.iter()
+				.filter_map(|sst| {
+					let oldest = sst.meta.properties.oldest_vlog_file_id;
+					if oldest > 0 {
+						Some(oldest as u32)
+					} else {
+						None
+					}
+				})
+				.min()
+				.unwrap_or(u32::MAX);
+
+			// Only cleanup if there are SSTs with vlog references
+			if min_oldest_vlog != u32::MAX {
+				if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
+					log::warn!("Failed to cleanup obsolete vlog files during flush: {}", e);
+					// Don't fail flush for vlog cleanup errors
+				}
+			}
+		}
 
 		Ok(table)
 	}
@@ -755,6 +778,52 @@ impl CoreInner {
 		Ok(())
 	}
 
+	/// Cleans up orphaned VLog files that are not referenced by any SST.
+	///
+	/// After a crash, there may be VLog files that:
+	/// 1. Were written but never referenced by an SST (write crashed before flush)
+	/// 2. Are no longer referenced because all referencing SSTs were compacted away
+	///
+	/// This method computes the minimum oldest_vlog_file_id across all live SSTs
+	/// and removes any VLog files below that threshold.
+	///
+	/// SAFETY: This must be called after manifest is loaded and SSTs are known.
+	fn cleanup_orphaned_vlog_files(&self) -> Result<()> {
+		let vlog = match &self.vlog {
+			Some(vlog) => vlog,
+			None => return Ok(()), // No VLog, nothing to clean up
+		};
+
+		// Compute minimum oldest_vlog_file_id across all live SSTs
+		let manifest = self.level_manifest.read()?;
+		let min_oldest_vlog = manifest
+			.iter()
+			.filter_map(|sst| {
+				let oldest = sst.meta.properties.oldest_vlog_file_id;
+				if oldest > 0 {
+					Some(oldest as u32)
+				} else {
+					None
+				}
+			})
+			.min()
+			.unwrap_or(u32::MAX);
+
+		// If no SSTs reference VLog files yet, keep all files
+		// (This handles the fresh database case)
+		if min_oldest_vlog == u32::MAX {
+			log::debug!("No SSTs with VLog references found, skipping VLog orphan cleanup");
+			return Ok(());
+		}
+
+		log::info!("Cleaning up orphaned VLog files below min_oldest_vlog={}", min_oldest_vlog);
+
+		// Use the existing cleanup logic which handles iterator safety
+		vlog.cleanup_obsolete_files(min_oldest_vlog)?;
+
+		Ok(())
+	}
+
 	/// Resolves a value, checking if it's a VLog pointer and retrieving from
 	/// VLog if needed
 	pub(crate) fn resolve_value(&self, value: &[u8]) -> Result<Value> {
@@ -995,9 +1064,6 @@ pub(crate) struct Core {
 	/// Task manager for background operations (stored in Option so we can take
 	/// it for shutdown)
 	pub(crate) task_manager: Mutex<Option<Arc<TaskManager>>>,
-
-	/// VLog garbage collection manager
-	pub(crate) vlog_gc_manager: Mutex<Option<VLogGCManager>>,
 }
 
 impl std::ops::Deref for Core {
@@ -1235,24 +1301,15 @@ impl Core {
 		// but BEFORE any new flushes that might create new SSTs
 		inner.cleanup_orphaned_sst_files()?;
 
+		// Clean up any orphaned VLog files that are no longer referenced by any SST
+		// SAFETY: This must happen AFTER manifest is loaded so we know which SSTs exist
+		inner.cleanup_orphaned_vlog_files()?;
+
 		let core = Self {
 			inner: Arc::clone(&inner),
 			commit_pipeline: Arc::clone(&commit_pipeline),
 			task_manager: Mutex::new(Some(task_manager)),
-			vlog_gc_manager: Mutex::new(None),
 		};
-
-		// Initialize VLog GC manager only if VLog is enabled
-		if let Some(ref vlog) = inner.vlog {
-			let vlog_gc_manager = VLogGCManager::new(
-				Arc::clone(vlog),
-				Arc::clone(&commit_pipeline),
-				Arc::clone(&inner.error_handler),
-			);
-			vlog_gc_manager.start();
-			*core.vlog_gc_manager.lock().unwrap() = Some(vlog_gc_manager);
-			log::debug!("VLog GC manager started");
-		}
 
 		log::info!("=== LSM tree initialization complete ===");
 
@@ -1262,11 +1319,6 @@ impl Core {
 	pub(crate) async fn commit(&self, batch: Batch, sync: bool) -> Result<()> {
 		// Commit the batch using the commit pipeline
 		self.commit_pipeline.commit(batch, sync).await
-	}
-
-	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
-		// Use the synchronous commit path
-		self.commit_pipeline.sync_commit(batch, sync_wal)
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {
@@ -1334,14 +1386,6 @@ impl Core {
 			log::debug!("Stopping background task manager...");
 			task_manager.stop().await;
 			log::debug!("Background task manager stopped");
-		}
-
-		// Stop VLog GC manager if it exists
-		let vlog_gc_manager = self.vlog_gc_manager.lock().unwrap().take();
-		if let Some(vlog_gc_manager) = vlog_gc_manager {
-			log::debug!("Stopping VLog GC manager...");
-			vlog_gc_manager.stop().await?;
-			log::debug!("VLog GC manager stopped");
 		}
 
 		// Step 3: Conditionally flush ALL memtables based on flush_on_close option
@@ -1463,8 +1507,6 @@ impl Tree {
 		// Create VLog directories
 		if opts.enable_vlog {
 			create_dir_all(opts.vlog_dir())?;
-			create_dir_all(opts.discard_stats_dir())?;
-			create_dir_all(opts.delete_list_dir())?;
 		}
 
 		if opts.enable_versioning {
@@ -1617,32 +1659,8 @@ impl Tree {
 		Ok(metadata)
 	}
 
-	#[cfg(test)]
-	pub(crate) fn get_all_vlog_stats(&self) -> Vec<(u32, u64, u64, f64)> {
-		match &self.core.vlog {
-			Some(vlog) => vlog.get_all_file_stats().unwrap(),
-			None => Vec::new(),
-		}
-	}
-
-	#[cfg(test)]
-	/// Updates VLog discard statistics if VLog is enabled
-	pub(crate) fn update_vlog_discard_stats(&self, stats: &HashMap<u32, i64>) {
-		if let Some(ref vlog) = self.core.vlog {
-			vlog.update_discard_stats(stats).unwrap();
-		}
-	}
-
 	pub async fn close(&self) -> Result<()> {
 		self.core.close().await
-	}
-
-	/// Triggers VLog garbage collection manually
-	pub async fn garbage_collect_vlog(&self) -> Result<Vec<u32>> {
-		match &self.core.vlog {
-			Some(vlog) => vlog.garbage_collect(Arc::clone(&self.core.commit_pipeline)).await,
-			None => Ok(Vec::new()),
-		}
 	}
 
 	/// Flushes all memtables to disk synchronously.
@@ -1660,10 +1678,6 @@ impl Tree {
 
 		// Step 2: Flush all immutable memtables synchronously
 		self.core.inner.flush_all_immutables_sync()
-	}
-
-	pub(crate) fn sync_commit(&self, batch: Batch, sync_wal: bool) -> Result<()> {
-		self.core.sync_commit(batch, sync_wal)
 	}
 
 	/// Flushes WAL and VLog buffers to OS cache.
@@ -1818,12 +1832,6 @@ impl TreeBuilder {
 		self
 	}
 
-	/// Sets the VLog garbage collection discard ratio.
-	pub fn with_vlog_gc_discard_ratio(mut self, ratio: f64) -> Self {
-		self.opts = self.opts.with_vlog_gc_discard_ratio(ratio);
-		self
-	}
-
 	/// Sets the VLog value threshold in bytes.
 	///
 	/// Values smaller than this threshold are stored inline in SSTables.
@@ -1936,22 +1944,6 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 			Error::Other(format!(
 				"Failed to sync VLog directory '{}': {}",
 				opts.vlog_dir().display(),
-				e
-			))
-		})?;
-
-		fsync_directory(opts.discard_stats_dir()).map_err(|e| {
-			Error::Other(format!(
-				"Failed to sync discard stats directory '{}': {}",
-				opts.discard_stats_dir().display(),
-				e
-			))
-		})?;
-
-		fsync_directory(opts.delete_list_dir()).map_err(|e| {
-			Error::Other(format!(
-				"Failed to sync delete list directory '{}': {}",
-				opts.delete_list_dir().display(),
 				e
 			))
 		})?;

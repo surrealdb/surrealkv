@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -58,7 +57,6 @@ fn create_vlog_compaction_options(path: PathBuf) -> Arc<Options> {
 	create_test_options(path, |opts| {
 		opts.max_memtable_size = 64 * 1024; // 64KB
 		opts.vlog_max_file_size = 950; // Small size to force frequent rotations
-		opts.vlog_gc_discard_ratio = 0.0; // Disable discard ratio to preserve all values
 		opts.level_count = 2; // Two levels for compaction strategy
 	})
 }
@@ -1288,114 +1286,6 @@ async fn test_vlog_file_rotation() {
 }
 
 #[test(tokio::test)]
-async fn test_discard_file_directory_structure() {
-	// Test to verify that the DISCARD file lives in the main database directory,
-	// not in the VLog subdirectory
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.vlog_max_file_size = 1024;
-		opts.max_memtable_size = 1024;
-		opts.enable_vlog = true;
-	});
-
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-	// Insert some data to ensure VLog and discard stats are created
-	let large_value = vec![1u8; 200]; // Large enough for VLog
-	for i in 0..5 {
-		let key = format!("key_{i}");
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), &large_value).unwrap();
-		txn.commit().await.unwrap();
-	}
-
-	// Force flush to create VLog files and initialize discard stats
-	tree.flush().unwrap();
-
-	// Update some keys to create discard statistics
-	let mut discard_updates = HashMap::new();
-	let stats = tree.get_all_vlog_stats();
-	for (file_id, total_size, _discard_bytes, _ratio) in &stats {
-		if *total_size > 0 {
-			discard_updates.insert(*file_id, (*total_size as f64 * 0.3) as i64);
-		}
-	}
-	tree.update_vlog_discard_stats(&discard_updates);
-
-	// Verify directory structure
-	let main_db_dir = &path;
-	let vlog_dir = path.join("vlog");
-	let sstables_dir = path.join("sstables");
-	let wal_dir = path.join("wal");
-	let discard_stats_dir = path.join("discard_stats");
-	let delete_list_dir = path.join("delete_list");
-
-	// Check that all expected directories exist
-	assert!(main_db_dir.exists(), "Main database directory should exist");
-	assert!(vlog_dir.exists(), "VLog directory should exist");
-	assert!(sstables_dir.exists(), "SSTables directory should exist");
-	assert!(wal_dir.exists(), "WAL directory should exist");
-	assert!(discard_stats_dir.exists(), "Discard stats directory should exist");
-	assert!(delete_list_dir.exists(), "Delete list directory should exist");
-
-	// Check that DISCARD file is in the main database directory
-	let discard_file_in_main = discard_stats_dir.join("DISCARD");
-	let discard_file_in_vlog = vlog_dir.join("DISCARD");
-
-	assert!(
-		discard_file_in_main.exists(),
-		"DISCARD file should exist in main database directory: {discard_file_in_main:?}"
-	);
-	assert!(
-		!discard_file_in_vlog.exists(),
-		"DISCARD file should NOT exist in VLog directory: {discard_file_in_vlog:?}"
-	);
-
-	// Verify that VLog files are in the VLog directory
-	let vlog_entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = vlog_entries
-		.filter_map(|entry| {
-			let entry = entry.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert!(!vlog_files.is_empty(), "Should have VLog files in the VLog directory");
-
-	// Verify that the DISCARD file is separate from VLog files
-	for vlog_file in &vlog_files {
-		assert_ne!(vlog_file, "DISCARD", "DISCARD should not be mistaken for a VLog file");
-	}
-
-	// Verify other expected files are in the main directory
-	let manifest_dir = main_db_dir.join("manifest");
-	assert!(
-		manifest_dir.exists(),
-		"manifest directory should be in main directory alongside DISCARD"
-	);
-
-	println!("✓ Directory structure verification passed:");
-	println!("  Main DB dir: {main_db_dir:?}");
-	println!(
-		"  DISCARD file: {:?} (exists: {})",
-		discard_file_in_main,
-		discard_file_in_main.exists()
-	);
-	println!("  VLog dir: {vlog_dir:?}");
-	println!("  Discard stats dir: {discard_stats_dir:?}");
-	println!("  Delete list dir: {delete_list_dir:?}");
-	println!("  VLog files: {vlog_files:?}");
-	println!("  manifest dir: {:?} (exists: {})", manifest_dir, manifest_dir.exists());
-}
-
-#[test(tokio::test)]
 async fn test_compaction_with_updates_and_delete() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
@@ -1447,16 +1337,9 @@ async fn test_compaction_with_updates_and_delete() {
 	// Flush memtable
 	tree.flush().unwrap();
 
-	// Force compaction
+	// Force compaction - this triggers automatic VLog cleanup via global-min approach
 	let strategy = Arc::new(Strategy::default());
 	tree.core.compact(strategy).unwrap();
-
-	// There could be multiple VLog files, need to garbage collect them all but
-	// only one should remain because the active VLog file does not get garbage
-	// collected
-	for _ in 0..6 {
-		tree.garbage_collect_vlog().await.unwrap();
-	}
 
 	// Verify all keys are gone after compaction
 	for key in keys.iter() {
@@ -1464,27 +1347,6 @@ async fn test_compaction_with_updates_and_delete() {
 		let result = tx.get(*key).unwrap();
 		assert_eq!(result, None);
 	}
-
-	// Verify that only one VLog file remains after garbage collection
-	let vlog_dir = path.join("vlog");
-	let entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = entries
-		.filter_map(|e| {
-			let entry = e.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert_eq!(
-		vlog_files.len(),
-		1,
-		"Should have exactly one VLog file after garbage collection, found: {vlog_files:?}"
-	);
 }
 
 #[test(tokio::test)]
@@ -1556,16 +1418,9 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 	// Flush memtable
 	tree.flush().unwrap();
 
-	// Force compaction
+	// Force compaction - this triggers automatic VLog cleanup via global-min approach
 	let strategy = Arc::new(Strategy::default());
 	tree.core.compact(strategy).unwrap();
-
-	// There could be multiple VLog files, need to garbage collect them all but
-	// only one should remain because the active VLog file does not get garbage
-	// collected
-	for _ in 0..6 {
-		tree.garbage_collect_vlog().await.unwrap();
-	}
 
 	// Verify all keys are gone after compaction
 	for key in keys.iter() {
@@ -1573,27 +1428,6 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let result = tx.get(*key).unwrap();
 		assert_eq!(result, None);
 	}
-
-	// Verify that only one VLog file remains after garbage collection
-	let vlog_dir = path.join("vlog");
-	let entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = entries
-		.filter_map(|e| {
-			let entry = e.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert_eq!(
-		vlog_files.len(),
-		1,
-		"Should have exactly one VLog file after garbage collection, found: {vlog_files:?}"
-	);
 }
 
 #[test(tokio::test)]
@@ -1668,27 +1502,23 @@ async fn test_vlog_compaction_preserves_sequence_numbers() {
 		assert_eq!(&value, "final_value_key1".repeat(10).as_bytes());
 	}
 
-	// --- Step 7: Trigger manual compaction of the LSM tree ---
+	// --- Step 7: Trigger manual compaction of the LSM tree (also triggers VLog cleanup via
+	// global-min approach) ---
 	let strategy = Arc::new(Strategy::default());
 	tree.core.compact(strategy).unwrap();
 
-	// --- Step 8: Run VLog garbage collection (which internally can trigger file
-	// compaction) ---
-	tree.garbage_collect_vlog().await.unwrap();
-
-	// --- Step 9: Verify key1 still returns the correct latest value after
-	// compaction ---
+	// --- Step 8: Verify key1 still returns the correct latest value after compaction ---
 	{
 		let tx = tree.begin().unwrap();
 		let value = tx.get(&key1).unwrap().unwrap();
 		assert_eq!(
-                &value,
-                "final_value_key1".repeat(10).as_bytes(),
-                "After VLog compaction, key1 returned incorrect value. The sequence number was not preserved during compaction."
-            );
+			&value,
+			"final_value_key1".repeat(10).as_bytes(),
+			"After compaction, key1 returned incorrect value. The sequence number was not preserved during compaction."
+		);
 	}
 
-	// --- Step 10: Clean shutdown ---
+	// --- Step 9: Clean shutdown ---
 	tree.close().await.unwrap();
 }
 
@@ -2207,7 +2037,7 @@ async fn test_checkpoint_with_vlog() {
 	// Create initial data with VLog enabled
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-	// Insert some data to ensure VLog and discard stats are created
+	// Insert some data to ensure VLog files are created
 	let large_value = vec![1u8; 200]; // Large enough for VLog
 	for i in 0..5 {
 		let key = format!("key_{i}");
@@ -2216,18 +2046,8 @@ async fn test_checkpoint_with_vlog() {
 		txn.commit().await.unwrap();
 	}
 
-	// Force flush to create VLog files and initialize discard stats
+	// Force flush to create VLog files
 	tree.flush().unwrap();
-
-	// Update some keys to create discard statistics
-	let mut discard_updates = HashMap::new();
-	let stats = tree.get_all_vlog_stats();
-	for (file_id, total_size, _discard_bytes, _ratio) in &stats {
-		if *total_size > 0 {
-			discard_updates.insert(*file_id, (*total_size as f64 * 0.3) as i64);
-		}
-	}
-	tree.update_vlog_discard_stats(&discard_updates);
 
 	// Create checkpoint
 	let checkpoint_dir = temp_dir.path().join("checkpoint");
@@ -2243,8 +2063,6 @@ async fn test_checkpoint_with_vlog() {
 	assert!(checkpoint_dir.join("wal").exists());
 	assert!(checkpoint_dir.join("manifest").exists());
 	assert!(checkpoint_dir.join("vlog").exists());
-	assert!(checkpoint_dir.join("discard_stats").exists());
-	assert!(checkpoint_dir.join("delete_list").exists());
 	assert!(checkpoint_dir.join("CHECKPOINT_METADATA").exists());
 
 	// Verify VLog files are in the checkpoint
@@ -2263,11 +2081,6 @@ async fn test_checkpoint_with_vlog() {
 		.collect();
 
 	assert!(!vlog_files.is_empty(), "Should have VLog files in the checkpoint");
-
-	// Verify discard stats file exists
-	let discard_stats_checkpoint_dir = checkpoint_dir.join("discard_stats");
-	assert!(discard_stats_checkpoint_dir.exists());
-	assert!(discard_stats_checkpoint_dir.join("DISCARD").exists());
 
 	// Insert more data after checkpoint
 	for i in 5..10 {
@@ -2308,14 +2121,10 @@ async fn test_checkpoint_with_vlog() {
 		assert!(result.is_none(), "Key '{key}' should not exist after restore");
 	}
 
-	// Verify VLog directories are restored
+	// Verify VLog directory is restored
 	let vlog_dir = opts.vlog_dir();
-	let discard_stats_dir = opts.discard_stats_dir();
-	let delete_list_dir = opts.delete_list_dir();
 
 	assert!(vlog_dir.exists(), "VLog directory should exist after restore");
-	assert!(discard_stats_dir.exists(), "Discard stats directory should exist after restore");
-	assert!(delete_list_dir.exists(), "Delete list directory should exist after restore");
 
 	// Verify VLog files are restored
 	let vlog_entries = std::fs::read_dir(&vlog_dir).unwrap();
@@ -2332,9 +2141,6 @@ async fn test_checkpoint_with_vlog() {
 		.collect();
 
 	assert!(!vlog_files.is_empty(), "Should have VLog files after restore");
-
-	// Verify discard stats file is restored
-	assert!(discard_stats_dir.join("DISCARD").exists(), "DISCARD file should exist after restore");
 }
 
 #[test_log::test(tokio::test)]

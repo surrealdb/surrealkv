@@ -84,6 +84,7 @@ use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
 use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
 use crate::sstable::meta::TableMetadata;
 use crate::vfs::File;
+use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{
 	Comparator,
 	CompressionType,
@@ -349,6 +350,11 @@ pub(crate) struct TableWriter<W: Write> {
 
 	/// Comparator for internal keys
 	internal_cmp: Arc<dyn Comparator>,
+
+	/// Minimum vlog file_id seen across all ValuePointers in this SST.
+	/// Used to track which vlog files this SST references.
+	/// None if no vlog pointers have been seen yet.
+	min_vlog_file_id: Option<u32>,
 }
 
 impl<W: Write> TableWriter<W> {
@@ -386,6 +392,7 @@ impl<W: Write> TableWriter<W> {
 			partitioned_index: IndexWriter::new(Arc::clone(&opts), opts.index_partition_size),
 			filter_block: fb,
 			internal_cmp: Arc::clone(&opts.internal_comparator) as Arc<dyn Comparator>,
+			min_vlog_file_id: None,
 		}
 	}
 
@@ -416,6 +423,17 @@ impl<W: Write> TableWriter<W> {
 				let mut filter_block = FilterBlockWriter::new(Arc::clone(filter_policy));
 				filter_block.start_block(0);
 				self.filter_block = Some(filter_block);
+			}
+		}
+
+		// Track minimum vlog file_id if value is a vlog pointer
+		if let Ok(location) = ValueLocation::decode(val) {
+			if location.is_value_pointer() {
+				if let Ok(pointer) = ValuePointer::decode(&location.value) {
+					let file_id = pointer.file_id;
+					self.min_vlog_file_id =
+						Some(self.min_vlog_file_id.map_or(file_id, |min| min.min(file_id)));
+				}
 			}
 		}
 
@@ -517,6 +535,10 @@ impl<W: Write> TableWriter<W> {
 
 		self.meta.properties.seqnos =
 			(self.meta.smallest_seq_num.unwrap_or(0), self.meta.largest_seq_num.unwrap_or(0));
+
+		// Store the minimum vlog file_id referenced by this SST.
+		// 0 means no vlog references (sentinel value).
+		self.meta.properties.oldest_vlog_file_id = self.min_vlog_file_id.unwrap_or(0) as u64;
 
 		// Flush last data block if it has entries
 		if self.data_block.as_ref().is_some_and(|db| db.entries() > 0) {
