@@ -1084,13 +1084,13 @@ impl<'a> CompactionIterator<'a> {
 				// Superseded: a newer version in the same visibility boundary
 				// makes this version redundant - safe to drop
 				true
-			} else if required_by_snapshot {
-				// Required by snapshot: an active snapshot needs this version - keep it
-				false
 			} else if latest_is_delete_at_bottom {
 				// DELETE at bottom level: mark ALL versions as stale
 				// The entire key is being removed from the database
 				true
+			} else if required_by_snapshot {
+				// Required by snapshot: an active snapshot needs this version - keep it
+				false
 			} else if is_latest && !is_hard_delete && !is_replace {
 				// Latest PUT: never stale (will be output)
 				false
