@@ -121,7 +121,6 @@ let tree = TreeBuilder::new()
     .with_enable_vlog(true)                     // Enable VLog
     .with_vlog_value_threshold(1024)            // Values > 1KB go to VLog
     .with_vlog_max_file_size(256 * 1024 * 1024) // 256MB VLog file size
-    .with_vlog_gc_discard_ratio(0.5)            // Trigger GC at 50% garbage
     .with_vlog_checksum_verification(VLogChecksumLevel::Full)
     .build()?;
 ```
@@ -130,7 +129,6 @@ let tree = TreeBuilder::new()
 - `with_enable_vlog()` - Enable/disable Value Log for large value storage
 - `with_vlog_value_threshold()` - Size threshold in bytes; values larger than this are stored in VLog (default: 1KB)
 - `with_vlog_max_file_size()` - Maximum size of VLog files before rotation (default: 256MB)
-- `with_vlog_gc_discard_ratio()` - Threshold (0.0-1.0) for triggering VLog garbage collection (default: 0.5)
 - `with_vlog_checksum_verification()` - Checksum verification level (`Disabled` or `Full`)
 
 
@@ -385,12 +383,8 @@ while iter.valid() {
     iter.next()?;
 }
 
-// Point-in-time read with options (requires versioning enabled)
-let options = ReadOptions::new()
-    .with_timestamp(Some(12345));
-
-// Use with get_at_with_options for versioned point lookups
-let value = tx.get_at_with_options(b"key1", &options)?;
+// Point-in-time read (requires versioning enabled)
+let value = tx.get_at(b"key1", 12345)?;
 ```
 
 ## Checkpoint and Restore
