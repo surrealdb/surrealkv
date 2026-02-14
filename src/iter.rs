@@ -1129,18 +1129,37 @@ impl<'a> CompactionIterator<'a> {
 			};
 
 			// ===== DETERMINE IF ENTRY SHOULD BE OUTPUT =====
+			// Priority order:
+			//   1. Superseded → always drop (newer version covers all readers)
+			//   2. DELETE tombstone at bottom level → drop (absence = deletion here)
+			//   3. Required by snapshot → must keep (snapshot isolation guarantee)
+			//   4. Older version when latest is DELETE at bottom → drop (no snapshot needs it)
+			//   5. Stale by retention/versioning rules → drop
+			//   6. Versioning or snapshot requires it → keep
+			//   7. Otherwise → only keep if latest
 
 			let should_output = if superseded {
-				// Superseded by newer version: don't output
+				// Superseded by newer version in same visibility boundary: don't output
 				false
+			} else if latest_is_delete_at_bottom && is_latest {
+				// The DELETE tombstone itself at bottom level: safe to drop.
+				// At bottom level there's no lower-level data to mask, so
+				// "deleted" and "not found" are semantically equivalent.
+				false
+			} else if required_by_snapshot {
+				// An active snapshot needs this version: MUST preserve.
+				// This correctly handles the case where a DELETE is newer than
+				// all snapshots but an older PUT is visible to a snapshot.
+				true
 			} else if latest_is_delete_at_bottom {
-				// DELETE at bottom: output NOTHING
+				// Older versions when latest is DELETE at bottom and no snapshot
+				// needs them: safe to drop.
 				false
 			} else if should_mark_stale {
-				// Stale entries: don't output
+				// Stale entries (expired retention, no versioning, etc.): don't output
 				false
-			} else if self.enable_versioning || required_by_snapshot {
-				// Versioning enabled or snapshot requires it: output
+			} else if self.enable_versioning {
+				// Versioning enabled: output non-stale versions
 				true
 			} else {
 				// No versioning, no snapshot requirement: only output latest
