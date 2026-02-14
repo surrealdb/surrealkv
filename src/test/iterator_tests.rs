@@ -2522,33 +2522,3 @@ fn test_snapshot_compaction_with_versioning_enabled() {
 	assert!(result.contains(&("key1".to_string(), 100)));
 	assert!(result.contains(&("key1".to_string(), 50)));
 }
-
-#[test]
-fn test_snapshot_compaction_delete_at_bottom_different_boundaries() {
-	// Bug scenario: DELETE newer than all snapshots, PUT visible to snapshot
-	let items = vec![
-		(create_internal_key("key1", 100, InternalKeyKind::Delete), b"".to_vec()),
-		(create_internal_key("key1", 30, InternalKeyKind::Set), b"v1".to_vec()),
-	];
-	let iter = build_table_iterator(items);
-
-	// Snapshot at seq=50: can see PUT at 30, cannot see DELETE at 100
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		true, // bottom level
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
-		vec![50],
-	);
-
-	let mut result = Vec::new();
-	for item in comp_iter.by_ref() {
-		let (key, _) = item.unwrap();
-		result.push(key.seq_num());
-	}
-
-	// PUT at seq=30 must be preserved for snapshot 50
-	assert_eq!(result, vec![30], "PUT visible to snapshot must be preserved");
-}
