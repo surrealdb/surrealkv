@@ -133,13 +133,6 @@ impl Snapshot {
 		// to preserve versions visible to this snapshot
 		core.snapshot_tracker.register(seq_num);
 
-		// Protect VLog files from deletion while this snapshot exists.
-		// This prevents VLog GC from deleting files that this snapshot
-		// may need to read from.
-		if let Some(ref vlog) = core.vlog {
-			vlog.incr_iterator_count();
-		}
-
 		Self {
 			core,
 			seq_num,
@@ -397,11 +390,6 @@ impl Drop for Snapshot {
 		// Unregister this snapshot's sequence number so compaction can
 		// clean up versions no longer visible to any snapshot
 		self.core.snapshot_tracker.unregister(self.seq_num);
-
-		// Release VLog iterator count - this snapshot no longer needs VLog files
-		if let Some(ref vlog) = self.core.vlog {
-			vlog.decr_iterator_count();
-		}
 	}
 }
 

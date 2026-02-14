@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
@@ -530,9 +530,6 @@ pub(crate) struct VLog {
 	/// Writer for the current active file
 	pub(crate) writer: RwLock<Option<VLogWriter>>,
 
-	/// Number of active iterators (for GC safety)
-	num_active_iterators: AtomicI32,
-
 	/// Maps file_id to VLogFile metadata
 	files_map: RwLock<HashMap<u32, Arc<VLogFile>>>,
 
@@ -558,7 +555,6 @@ impl VLog {
 			next_file_id: AtomicU32::new(1),
 			active_writer_id: AtomicU32::new(0),
 			writer: RwLock::new(None),
-			num_active_iterators: AtomicI32::new(0),
 			files_map: RwLock::new(HashMap::new()),
 			file_handles: RwLock::new(HashMap::new()),
 			opts,
@@ -900,21 +896,6 @@ impl VLog {
 		Ok(value_bytes)
 	}
 
-	/// Increments the active iterator count when a transaction/iterator starts
-	pub(crate) fn incr_iterator_count(&self) {
-		self.num_active_iterators.fetch_add(1, Ordering::SeqCst);
-	}
-
-	/// Decrements the active iterator count when a transaction/iterator ends
-	pub(crate) fn decr_iterator_count(&self) {
-		self.num_active_iterators.fetch_sub(1, Ordering::SeqCst);
-	}
-
-	/// Gets the current number of active iterators  
-	pub(crate) fn iterator_count(&self) -> i32 {
-		self.num_active_iterators.load(Ordering::SeqCst)
-	}
-
 	/// Cleans up obsolete vlog files based on the global minimum oldest_vlog_file_id.
 	///
 	/// A vlog file is safe to delete when:
@@ -926,12 +907,6 @@ impl VLog {
 	/// once no SST can possibly reference them. If iterators are active, cleanup
 	/// is skipped and will be retried on the next GC trigger.
 	pub(crate) fn cleanup_obsolete_files(&self, min_oldest_vlog: u32) -> Result<()> {
-		// Skip cleanup if iterators are active - will be cleaned up on next GC
-		if self.iterator_count() > 0 {
-			log::debug!("Skipping VLog cleanup: {} active iterators", self.iterator_count());
-			return Ok(());
-		}
-
 		let active = self.active_writer_id.load(Ordering::SeqCst);
 
 		// Collect files that are safe to delete
