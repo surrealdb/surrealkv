@@ -319,27 +319,9 @@ impl CoreInner {
 			manifest.get_last_sequence()
 		);
 
-		// After successful manifest commit, cleanup obsolete vlog files
-		if let Some(ref vlog) = self.vlog {
-			let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-
-			// Only cleanup if there are SSTs with vlog references
-			if min_oldest_vlog != 0 {
-				if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
-					log::warn!("Failed to cleanup obsolete vlog files during flush: {}", e);
-					// Don't fail flush for vlog cleanup errors
-				}
-
-				// Also cleanup stale versioned_index entries
-				if let Err(e) = self.cleanup_stale_versioned_index(min_oldest_vlog) {
-					log::warn!(
-						"Failed to cleanup stale versioned_index entries during flush: {}",
-						e
-					);
-					// Don't fail flush for versioned_index cleanup errors
-				}
-			}
-		}
+		// After successful manifest commit, cleanup obsolete vlog files and stale index entries
+		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
+		cleanup_vlog_and_index(&self.vlog, &self.versioned_index, min_oldest_vlog, "flush");
 
 		Ok(table)
 	}
@@ -786,10 +768,9 @@ impl CoreInner {
 	///
 	/// SAFETY: This must be called after manifest is loaded and SSTs are known.
 	fn cleanup_orphaned_vlog_files(&self) -> Result<()> {
-		let vlog = match &self.vlog {
-			Some(vlog) => vlog,
-			None => return Ok(()), // No VLog, nothing to clean up
-		};
+		if self.vlog.is_none() {
+			return Ok(()); // No VLog, nothing to clean up
+		}
 
 		let manifest = self.level_manifest.read()?;
 		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
@@ -803,95 +784,10 @@ impl CoreInner {
 
 		log::info!("Cleaning up orphaned VLog files below min_oldest_vlog={}", min_oldest_vlog);
 
-		// Use the existing cleanup logic which handles iterator safety
-		vlog.cleanup_obsolete_files(min_oldest_vlog)?;
-
-		// Also cleanup stale versioned_index entries that reference deleted VLog files
-		if let Err(e) = self.cleanup_stale_versioned_index(min_oldest_vlog) {
-			log::warn!("Failed to cleanup stale versioned_index entries during startup: {}", e);
-			// Don't fail startup for versioned_index cleanup errors
-		}
+		// Use the consolidated cleanup helper
+		cleanup_vlog_and_index(&self.vlog, &self.versioned_index, min_oldest_vlog, "startup");
 
 		Ok(())
-	}
-
-	/// Cleans up stale versioned_index entries that reference deleted VLog files.
-	///
-	/// After VLog GC deletes files, the versioned_index (B+ tree) may contain
-	/// entries with ValuePointers referencing those deleted files. This method
-	/// removes those stale entries.
-	///
-	/// # Algorithm:
-	/// 1. Phase 1: Acquire READ lock, iterate all entries, collect stale keys
-	/// 2. Release READ lock
-	/// 3. Phase 2: For each batch of keys, acquire WRITE lock, delete, release
-	///
-	/// This design allows concurrent read/write operations between batches.
-	///
-	/// # Arguments
-	/// * `min_valid_file_id` - VLog files with file_id < this are considered deleted
-	///
-	/// # Returns
-	/// The number of stale entries deleted
-	pub(crate) fn cleanup_stale_versioned_index(&self, min_valid_file_id: u32) -> Result<usize> {
-		let versioned_index = match &self.versioned_index {
-			Some(idx) => idx,
-			None => return Ok(0),
-		};
-
-		// Phase 1: Read lock - collect stale keys
-		let keys_to_delete: Vec<Vec<u8>> = {
-			let guard = versioned_index.read();
-			let mut stale_keys = Vec::new();
-
-			// Use range(..) to iterate all entries (RangeFull implements RangeBounds<T>)
-			let empty: &[u8] = &[];
-			let iter = guard.range(empty..)?;
-
-			for entry in iter {
-				let (key, value) = entry?;
-				// Check if this entry has a VLog pointer to a deleted file
-				if let Ok(loc) = ValueLocation::decode(&value) {
-					if loc.is_value_pointer() {
-						if let Ok(ptr) = ValuePointer::decode(&loc.value) {
-							if ptr.file_id < min_valid_file_id {
-								stale_keys.push(key.to_vec());
-							}
-						}
-					}
-				}
-			}
-			stale_keys
-		}; // Read lock released here
-
-		if keys_to_delete.is_empty() {
-			return Ok(0);
-		}
-
-		log::debug!(
-			"Cleaning up {} stale versioned_index entries for VLog files < {}",
-			keys_to_delete.len(),
-			min_valid_file_id
-		);
-
-		// Phase 2: Write lock per batch - delete
-		let mut deleted_count = 0;
-		const BATCH_SIZE: usize = 100;
-
-		for batch in keys_to_delete.chunks(BATCH_SIZE) {
-			let mut guard = versioned_index.write();
-			for key in batch {
-				// No re-verification needed:
-				// - Keys are never updated (unique InternalKey)
-				// - If deleted by concurrent Replace, delete() returns None (harmless)
-				if guard.delete(key)?.is_some() {
-					deleted_count += 1;
-				}
-			}
-			// Write lock released here, allowing other operations between batches
-		}
-
-		Ok(deleted_count)
 	}
 
 	/// Resolves a value, checking if it's a VLog pointer and retrieving from
@@ -2048,4 +1944,127 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 	})?;
 
 	Ok(())
+}
+
+// ===== VLog and Versioned Index Cleanup Helpers =====
+
+/// Cleans up stale versioned_index entries that reference deleted VLog files.
+///
+/// After VLog GC deletes files, the versioned_index (B+ tree) may contain
+/// entries with ValuePointers referencing those deleted files. This function
+/// removes those stale entries.
+///
+/// # Algorithm:
+/// 1. Phase 1: Acquire READ lock, iterate all entries, collect stale keys
+/// 2. Release READ lock
+/// 3. Phase 2: For each batch of keys, acquire WRITE lock, delete, release
+///
+/// This design allows concurrent read/write operations between batches.
+///
+/// # Arguments
+/// * `versioned_index` - The versioned B+ tree index
+/// * `min_valid_file_id` - VLog files with file_id < this are considered deleted
+///
+/// # Returns
+/// The number of stale entries deleted
+pub(crate) fn cleanup_stale_versioned_index(
+	versioned_index: &Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
+	min_valid_file_id: u32,
+) -> Result<usize> {
+	let versioned_index = match versioned_index {
+		Some(idx) => idx,
+		None => return Ok(0),
+	};
+
+	// Phase 1: Read lock - collect stale keys
+	let keys_to_delete: Vec<Vec<u8>> = {
+		let guard = versioned_index.read();
+		let mut stale_keys = Vec::new();
+
+		// Use range(..) to iterate all entries (RangeFull implements RangeBounds<T>)
+		let empty: &[u8] = &[];
+		let iter = guard.range(empty..)?;
+
+		for entry in iter {
+			let (key, value) = entry?;
+			// Check if this entry has a VLog pointer to a deleted file
+			if let Ok(loc) = ValueLocation::decode(&value) {
+				if loc.is_value_pointer() {
+					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
+						if ptr.file_id < min_valid_file_id {
+							stale_keys.push(key.to_vec());
+						}
+					}
+				}
+			}
+		}
+		stale_keys
+	}; // Read lock released here
+
+	if keys_to_delete.is_empty() {
+		return Ok(0);
+	}
+
+	log::debug!(
+		"Cleaning up {} stale versioned_index entries for VLog files < {}",
+		keys_to_delete.len(),
+		min_valid_file_id
+	);
+
+	// Phase 2: Write lock per batch - delete
+	let mut deleted_count = 0;
+	const BATCH_SIZE: usize = 100;
+
+	for batch in keys_to_delete.chunks(BATCH_SIZE) {
+		let mut guard = versioned_index.write();
+		for key in batch {
+			// No re-verification needed:
+			// - Keys are never updated (unique InternalKey)
+			// - If deleted by concurrent Replace, delete() returns None (harmless)
+			if guard.delete(key)?.is_some() {
+				deleted_count += 1;
+			}
+		}
+		// Write lock released here, allowing other operations between batches
+	}
+
+	Ok(deleted_count)
+}
+
+/// Cleans up obsolete VLog files and stale versioned_index entries.
+///
+/// This is the consolidated cleanup function that should be called after
+/// compaction, flush, or during startup recovery. It:
+/// 1. Removes VLog files that are no longer referenced by any SST
+/// 2. Removes versioned_index entries pointing to deleted VLog files
+///
+/// # Arguments
+/// * `vlog` - The VLog instance (if value separation is enabled)
+/// * `versioned_index` - The versioned B+ tree index (if versioned reads are enabled)
+/// * `min_oldest_vlog` - Minimum oldest_vlog_file_id across all live SSTs
+/// * `context` - Description of the calling context (e.g., "flush", "compaction", "startup")
+pub(crate) fn cleanup_vlog_and_index(
+	vlog: &Option<Arc<VLog>>,
+	versioned_index: &Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
+	min_oldest_vlog: u32,
+	context: &str,
+) {
+	// Skip cleanup if no SSTs reference VLog files yet (fresh database case)
+	if min_oldest_vlog == 0 {
+		return;
+	}
+
+	// Cleanup obsolete VLog files
+	if let Some(ref vlog) = vlog {
+		if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
+			log::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);
+			// Don't propagate error - cleanup failures shouldn't fail the primary operation
+		}
+	}
+
+	// Cleanup stale versioned_index entries
+	if let Err(e) = cleanup_stale_versioned_index(versioned_index, min_oldest_vlog) {
+		log::warn!("Failed to cleanup stale versioned_index entries during {}: {}", context, e);
+		// Don't propagate error - cleanup failures shouldn't fail the primary operation
+	}
 }
