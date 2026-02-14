@@ -539,9 +539,6 @@ pub(crate) struct VLog {
 	/// Cached open file handles for reading
 	pub(crate) file_handles: RwLock<HashMap<u32, Arc<File>>>,
 
-	/// Files marked for deletion but waiting for iterators to finish
-	files_to_be_deleted: RwLock<Vec<u32>>,
-
 	/// Options for VLog configuration
 	pub(crate) opts: Arc<Options>,
 }
@@ -564,15 +561,11 @@ impl VLog {
 			num_active_iterators: AtomicI32::new(0),
 			files_map: RwLock::new(HashMap::new()),
 			file_handles: RwLock::new(HashMap::new()),
-			files_to_be_deleted: RwLock::new(Vec::new()),
 			opts,
 		};
 
 		// PRE-FILL ALL EXISTING FILE HANDLES ON STARTUP
 		vlog.prefill_file_handles()?;
-
-		// Clean up any leftover temporary files from previous interrupted compactions
-		vlog.cleanup_temp_files()?;
 
 		Ok(vlog)
 	}
@@ -913,16 +906,8 @@ impl VLog {
 	}
 
 	/// Decrements the active iterator count when a transaction/iterator ends
-	/// If count reaches zero, processes deferred file deletions
-	pub(crate) fn decr_iterator_count(&self) -> Result<()> {
-		let count = self.num_active_iterators.fetch_sub(1, Ordering::SeqCst);
-
-		if count == 1 {
-			// We were the last iterator, safe to delete pending files
-			self.delete_pending_files()?;
-		}
-
-		Ok(())
+	pub(crate) fn decr_iterator_count(&self) {
+		self.num_active_iterators.fetch_sub(1, Ordering::SeqCst);
 	}
 
 	/// Gets the current number of active iterators  
@@ -930,44 +915,23 @@ impl VLog {
 		self.num_active_iterators.load(Ordering::SeqCst)
 	}
 
-	/// Deletes files that were marked for deletion when no iterators were
-	/// active
-	fn delete_pending_files(&self) -> Result<()> {
-		let mut files_to_delete = self.files_to_be_deleted.write();
-		let mut files_map = self.files_map.write();
-		let mut file_handles = self.file_handles.write();
-
-		for file_id in files_to_delete.drain(..) {
-			file_handles.remove(&file_id);
-			if let Some(vlog_file) = files_map.remove(&file_id) {
-				if let Err(e) = std::fs::remove_file(&vlog_file.path) {
-					log::error!(
-						"Failed to delete VLog file: file_id={}, path={:?}, error={}",
-						file_id,
-						vlog_file.path,
-						e
-					);
-					return Err(Error::Other(format!(
-						"Failed to delete VLog file (file_id={}, path={:?}): {}",
-						file_id, vlog_file.path, e
-					)));
-				}
-			}
-		}
-
-		Ok(())
-	}
-
 	/// Cleans up obsolete vlog files based on the global minimum oldest_vlog_file_id.
 	///
 	/// A vlog file is safe to delete when:
 	/// - Its file_id < min_oldest_vlog (no SST references values in it)
 	/// - It is not the active writer
-	/// - Either no iterators are active (delete immediately) or we defer deletion
+	/// - No iterators are active
 	///
 	/// This implements the "global minimum" GC approach where files are deleted
-	/// once no SST can possibly reference them.
+	/// once no SST can possibly reference them. If iterators are active, cleanup
+	/// is skipped and will be retried on the next GC trigger.
 	pub(crate) fn cleanup_obsolete_files(&self, min_oldest_vlog: u32) -> Result<()> {
+		// Skip cleanup if iterators are active - will be cleaned up on next GC
+		if self.iterator_count() > 0 {
+			log::debug!("Skipping VLog cleanup: {} active iterators", self.iterator_count());
+			return Ok(());
+		}
+
 		let active = self.active_writer_id.load(Ordering::SeqCst);
 
 		// Collect files that are safe to delete
@@ -980,38 +944,27 @@ impl VLog {
 			return Ok(());
 		}
 
-		// Delete with iterator safety
-		if self.iterator_count() == 0 {
-			// No active iterators, safe to delete immediately
-			let mut files_map = self.files_map.write();
-			let mut file_handles = self.file_handles.write();
+		// No active iterators, safe to delete
+		let mut files_map = self.files_map.write();
+		let mut file_handles = self.file_handles.write();
 
-			for file_id in to_delete {
-				file_handles.remove(&file_id);
-				if let Some(vlog_file) = files_map.remove(&file_id) {
-					if let Err(e) = std::fs::remove_file(&vlog_file.path) {
-						log::error!(
-							"Failed to delete obsolete VLog file: file_id={}, path={:?}, error={}",
-							file_id,
-							vlog_file.path,
-							e
-						);
-						// Continue with other files, don't fail the entire cleanup
-					} else {
-						log::info!(
-							"Deleted obsolete VLog file: file_id={}, path={:?}",
-							file_id,
-							vlog_file.path
-						);
-					}
-				}
-			}
-		} else {
-			// Iterators are active, defer deletion
-			let mut pending = self.files_to_be_deleted.write();
-			for file_id in to_delete {
-				if !pending.contains(&file_id) {
-					pending.push(file_id);
+		for file_id in to_delete {
+			file_handles.remove(&file_id);
+			if let Some(vlog_file) = files_map.remove(&file_id) {
+				if let Err(e) = std::fs::remove_file(&vlog_file.path) {
+					log::error!(
+						"Failed to delete obsolete VLog file: file_id={}, path={:?}, error={}",
+						file_id,
+						vlog_file.path,
+						e
+					);
+					// Continue with other files, don't fail the entire cleanup
+				} else {
+					log::info!(
+						"Deleted obsolete VLog file: file_id={}, path={:?}",
+						file_id,
+						vlog_file.path
+					);
 				}
 			}
 		}
@@ -1039,32 +992,6 @@ impl VLog {
 	fn register_vlog_file(&self, file_id: u32, path: PathBuf, size: u64) {
 		let mut files_map = self.files_map.write();
 		files_map.insert(file_id, Arc::new(VLogFile::new(file_id, path, size)));
-	}
-
-	/// Cleans up any leftover temporary files from interrupted compactions
-	fn cleanup_temp_files(&self) -> Result<()> {
-		let entries = match std::fs::read_dir(&self.path) {
-			Ok(entries) => entries,
-			Err(_) => return Ok(()), // Directory doesn't exist yet
-		};
-
-		for entry in entries {
-			let entry = entry?;
-			let file_name = entry.file_name();
-			let file_name_str = file_name.to_string_lossy();
-
-			// Look for .tmp files that match our VLog pattern
-			if file_name_str.len() == 28 && file_name_str.ends_with(".log.tmp") {
-				let temp_path = entry.path();
-
-				// Try to remove the temporary file
-				if let Err(e) = std::fs::remove_file(&temp_path) {
-					log::warn!("Failed to cleanup temp file {temp_path:?}: {e}");
-				}
-			}
-		}
-
-		Ok(())
 	}
 
 	pub(crate) fn close(&self) -> Result<()> {

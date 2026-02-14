@@ -310,7 +310,7 @@ impl Compactor {
 	/// entries with ValuePointers referencing those deleted files. This method
 	/// removes those stale entries.
 	///
-	/// # Algorithm (deadlock-free, proven via TLA+ analysis):
+	/// # Algorithm:
 	/// 1. Phase 1: Acquire READ lock, iterate all entries, collect stale keys
 	/// 2. Release READ lock
 	/// 3. Phase 2: For each batch of keys, acquire WRITE lock, delete, release
@@ -362,7 +362,7 @@ impl Compactor {
 		for batch in keys_to_delete.chunks(BATCH_SIZE) {
 			let mut guard = versioned_index.write();
 			for key in batch {
-				// No re-verification needed (proven in TLA analysis):
+				// No re-verification needed:
 				// - Keys are never updated (unique InternalKey)
 				// - If deleted by concurrent Replace, delete() returns None (harmless)
 				if guard.delete(key)?.is_some() {

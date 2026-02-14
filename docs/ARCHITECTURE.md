@@ -908,7 +908,7 @@ VLog files are managed as follows:
 
 ## VLog Garbage Collection
 
-VLog files accumulate stale entries as values are overwritten or deleted. SurrealKV uses a **Global Minimum approach** inspired by RocksDB's BlobDB to determine when VLog files are safe to delete.
+VLog files accumulate stale entries as values are overwritten or deleted.
 
 ### The Garbage Problem
 
@@ -919,7 +919,7 @@ When a key is updated or deleted:
 
 Over time, old VLog files may contain only stale entries that are no longer referenced by any SSTable. These files can be safely deleted to reclaim disk space.
 
-### Global Minimum Approach
+### How Garbage is Tracked
 
 The key insight is that a VLog file is safe to delete when **no live SSTable references it**. SurrealKV tracks this using the `oldest_vlog_file_id` metadata in each SSTable:
 
@@ -1035,14 +1035,6 @@ When the optional B+tree versioned index is enabled, it stores `(InternalKey →
 2. **Delete Phase**: Remove collected keys in batches under brief write locks
 
 This two-phase approach avoids holding locks during the full scan, allowing concurrent writes.
-
-**Comparison to RocksDB BlobDB:**
-
-SurrealKV's approach is similar to RocksDB's BlobDB:
-- Both track `oldest_blob_file_number` / `oldest_vlog_file_id` per SST
-- Both compute a global minimum to determine safe-to-delete files
-- SurrealKV adds `iterator_count` as an additional safety mechanism
-- SurrealKV integrates cleanup with the optional versioned B+tree index
 
 ---
 

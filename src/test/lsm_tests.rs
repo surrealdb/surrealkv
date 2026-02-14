@@ -5278,3 +5278,174 @@ async fn test_versioned_index_entries_deleted_after_gc() {
 		);
 	}
 }
+
+/// Tests that VLog files persist correctly across shutdown/restart.
+/// This validates that the VLog GC mechanism doesn't incorrectly delete
+/// files that are still referenced by SSTs.
+#[test(tokio::test)]
+async fn test_vlog_files_persist_across_restart() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.vlog_max_file_size = 512; // Very small to force many file rotations
+		opts.enable_vlog = true;
+	});
+
+	let num_records = 1000;
+	let mut keys_and_values = Vec::with_capacity(num_records);
+
+	// Phase 1: Insert data and verify VLog files are created
+	let vlog_files_before_shutdown: Vec<String>;
+	{
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Insert 1000 records with ~100 byte values each
+		for i in 0..num_records {
+			let key = format!("persist_key_{i:04}");
+			let value = format!("persist_value_{i}_padding_{}", "X".repeat(80));
+			keys_and_values.push((key.clone(), value.clone()));
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		// Flush to ensure data is persisted to SST (so VLog files are referenced)
+		tree.flush().unwrap();
+
+		// Count VLog files before shutdown
+		let vlog_dir = path.join("vlog");
+		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		vlog_files_before_shutdown = entries
+			.filter_map(|e| {
+				let entry = e.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		// Should have multiple VLog files due to small file size
+		assert!(
+			vlog_files_before_shutdown.len() > 10,
+			"Expected more than 10 VLog files due to small file size, got {}",
+			vlog_files_before_shutdown.len()
+		);
+
+		log::info!("VLog files before shutdown: {} files", vlog_files_before_shutdown.len());
+
+		// Close the tree
+		tree.close().await.unwrap();
+	}
+
+	// Phase 2: Reopen, add 10 new entries, flush, and verify all records (repeat 5 times)
+	// Track VLog file count - should only grow or stay same, never decrease
+	let mut previous_vlog_count = vlog_files_before_shutdown.len();
+
+	for iteration in 1..=5 {
+		log::info!("=== Restart iteration {}/5 ===", iteration);
+
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Count VLog files after restart (before adding new entries)
+		let vlog_dir = path.join("vlog");
+		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		let vlog_files_after_restart: Vec<String> = entries
+			.filter_map(|e| {
+				let entry = e.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		log::info!(
+			"VLog files after restart {}: {} files (previous: {})",
+			iteration,
+			vlog_files_after_restart.len(),
+			previous_vlog_count
+		);
+
+		// VLog file count should not decrease (GC should not delete referenced files)
+		assert!(
+			vlog_files_after_restart.len() >= previous_vlog_count,
+			"VLog file count decreased after restart {}: previous={}, after={}",
+			iteration,
+			previous_vlog_count,
+			vlog_files_after_restart.len()
+		);
+
+		// Add 10 new entries
+		let new_entries_start = num_records + (iteration - 1) * 10;
+		for i in 0..10 {
+			let idx = new_entries_start + i;
+			let key = format!("persist_key_{idx:04}");
+			let value = format!("persist_value_{idx}_padding_{}", "X".repeat(80));
+			keys_and_values.push((key.clone(), value.clone()));
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		log::info!("Added 10 new entries (total records: {})", keys_and_values.len());
+
+		// Flush to persist new entries
+		tree.flush().unwrap();
+
+		// Count VLog files after flush
+		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		let vlog_files_after_flush: Vec<String> = entries
+			.filter_map(|e| {
+				let entry = e.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		log::info!("VLog files after flush {}: {} files", iteration, vlog_files_after_flush.len());
+
+		// Update previous count for next iteration
+		previous_vlog_count = vlog_files_after_flush.len();
+
+		// Verify ALL records are readable (original 1000 + all newly added)
+		for (key, expected_value) in &keys_and_values {
+			let txn = tree.begin().unwrap();
+			let result = txn.get(key.as_bytes()).unwrap();
+			assert_eq!(
+				result,
+				Some(expected_value.as_bytes().to_vec()),
+				"Key {} has incorrect value after restart {}",
+				key,
+				iteration
+			);
+		}
+
+		log::info!("Verified all {} records after restart {}", keys_and_values.len(), iteration);
+
+		tree.close().await.unwrap();
+	}
+
+	// Final verification: 1000 + 5*10 = 1050 records
+	assert_eq!(
+		keys_and_values.len(),
+		1050,
+		"Expected 1050 total records (1000 initial + 5*10 added)"
+	);
+
+	log::info!(
+		"All 5 restart iterations passed successfully with {} total records",
+		keys_and_values.len()
+	);
+}
