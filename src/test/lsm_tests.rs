@@ -5449,3 +5449,622 @@ async fn test_vlog_files_persist_across_restart() {
 		keys_and_values.len()
 	);
 }
+
+#[test(tokio::test)]
+async fn test_vlog_gc_non_versioned_surrealdb_style_keys() {
+	// This test tries to mimics the SurrealDB bug scenario:
+	//
+	// https://github.com/surrealdb/surrealdb/issues/6872
+	//
+	//
+	// Timeline from user report:
+	// - Feb 11: Fresh import, everything working
+	// - Feb 11-12: Normal daemon operation (~24h), no issues
+	// - Feb 12 evening: macOS reboot → SIGTERM shutdown
+	// - Feb 13 morning: Server restarts clean, corruption present
+	// - Progressive corruption: queries that worked start failing as more data written
+	//
+	// Test structure:
+	// 1. Phase 1: 500 update rounds + periodic GC (simulates ~24h operation)
+	// 2. Close + reopen database (simulates SIGTERM + restart)
+	// 3. Phase 2: 500 more update rounds + periodic GC (simulates post-restart)
+	// 4. Verify ALL 200 keys accessible (catches progressive corruption)
+
+	// Helper to print VLog files and SSTables
+	fn print_storage_state(path: &std::path::Path, tree: &Tree, phase: &str, round: usize) {
+		// List VLog files
+		let vlog_dir = path.join("vlog");
+		let vlog_files: Vec<String> = if vlog_dir.exists() {
+			std::fs::read_dir(&vlog_dir)
+				.unwrap()
+				.filter_map(|e| {
+					let entry = e.ok()?;
+					let name = entry.file_name().to_string_lossy().to_string();
+					if name.ends_with(".vlog") {
+						Some(name)
+					} else {
+						None
+					}
+				})
+				.collect()
+		} else {
+			vec![]
+		};
+
+		// List SSTable files
+		let sstables_dir = path.join("sstables");
+		let sstable_files: Vec<String> = if sstables_dir.exists() {
+			std::fs::read_dir(&sstables_dir)
+				.unwrap()
+				.filter_map(|e| {
+					let entry = e.ok()?;
+					let name = entry.file_name().to_string_lossy().to_string();
+					if name.ends_with(".sst") {
+						Some(name)
+					} else {
+						None
+					}
+				})
+				.collect()
+		} else {
+			vec![]
+		};
+
+		// Get SSTable counts per level from manifest
+		let manifest = tree.core.level_manifest.read().unwrap();
+		let levels = manifest.levels.get_levels();
+		let level_counts: Vec<usize> = levels.iter().map(|l| l.tables.len()).collect();
+
+		println!("[{} round {}] VLog files ({}): {:?}", phase, round, vlog_files.len(), vlog_files);
+		println!(
+			"[{} round {}] SSTable files ({}): {:?}",
+			phase,
+			round,
+			sstable_files.len(),
+			sstable_files
+		);
+		println!("[{} round {}] SSTables per level: {:?}", phase, round, level_counts);
+		println!("---");
+	}
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 1; // Only L0 - always bottom level for stale marking
+		opts.enable_vlog = true;
+		opts.vlog_max_file_size = 128 * 1024; // 128KB files - larger to reduce file count
+	});
+
+	// SurrealDB-style: 50 records, each with 4 fields
+	// Key format: /ns/db/tb/record_NNN:fieldN
+	const NUM_RECORDS: usize = 50;
+	const FIELDS: [&str; 4] = ["field1", "field2", "field3", "field4"];
+	const ROUNDS_PER_PHASE: usize = 100;
+	const GC_INTERVAL: usize = 10;
+
+	// ========== PHASE 1: Normal operation (simulates ~24h daemon) ==========
+	{
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		for round in 0..ROUNDS_PER_PHASE {
+			// Update all 50 records
+			let mut tx = tree.begin().unwrap();
+			for record_id in 0..NUM_RECORDS {
+				for field in &FIELDS {
+					let key = format!("/ns/db/tb/record_{:03}:{}", record_id, field);
+					let value =
+						format!("phase1_record_{}_{}_{}", record_id, field, round).repeat(10);
+					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				}
+			}
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			// Periodic compaction + VLog GC
+			if round > 0 && round % GC_INTERVAL == 0 {
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				for _ in 0..6 {
+					tree.core.compact(Arc::clone(&strategy)).unwrap();
+				}
+				print_storage_state(&path, &tree, "Phase1", round);
+			}
+		}
+
+		// Final GC before "shutdown"
+		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+			Arc::new(Strategy::default());
+		tree.core.compact(strategy).unwrap();
+		print_storage_state(&path, &tree, "Phase1-Final", ROUNDS_PER_PHASE);
+
+		// Simulate SIGTERM shutdown
+		tree.close().await.unwrap();
+	}
+
+	// ========== PHASE 2: Post-restart operation ==========
+	{
+		// Reopen database (simulates server restart after SIGTERM)
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		for round in 0..ROUNDS_PER_PHASE {
+			// Update all 50 records (post-restart)
+			let mut tx = tree.begin().unwrap();
+			for record_id in 0..NUM_RECORDS {
+				for field in &FIELDS {
+					let key = format!("/ns/db/tb/record_{:03}:{}", record_id, field);
+					let value =
+						format!("phase2_record_{}_{}_{}", record_id, field, round).repeat(10);
+					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				}
+			}
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			// Periodic compaction + VLog GC (this is where progressive corruption would appear)
+			if round > 0 && round % GC_INTERVAL == 0 {
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				for _ in 0..6 {
+					tree.core.compact(Arc::clone(&strategy)).unwrap();
+				}
+				print_storage_state(&path, &tree, "Phase2", round);
+			}
+		}
+
+		// Final GC pass
+		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+			Arc::new(Strategy::default());
+		tree.core.compact(strategy).unwrap();
+		print_storage_state(&path, &tree, "Phase2-Final", ROUNDS_PER_PHASE);
+
+		// ========== VERIFY: All records accessible (no "file not found" errors) ==========
+		// This catches the progressive corruption scenario where queries start failing
+		// as more data accumulates post-restart
+		// NOTE: We check ALL records, not LIMIT 1 (which would hide the bug)
+		let tx = tree.begin().unwrap();
+		for record_id in 0..NUM_RECORDS {
+			for field in &FIELDS {
+				let key = format!("/ns/db/tb/record_{:03}:{}", record_id, field);
+				let result = tx.get(key.as_bytes()).unwrap();
+				assert!(
+					result.is_some(),
+					"Record {} field {} should exist - got 'file not found' IO error",
+					record_id,
+					field
+				);
+
+				let expected =
+					format!("phase2_record_{}_{}_{}", record_id, field, ROUNDS_PER_PHASE - 1)
+						.repeat(10);
+				assert_eq!(
+					result.unwrap(),
+					expected.as_bytes(),
+					"Record {} field {} should have latest phase2 value",
+					record_id,
+					field
+				);
+			}
+		}
+
+		tree.close().await.unwrap();
+	}
+}
+
+#[test(tokio::test)]
+async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
+	// This test comprehensively tests VLog GC with a realistic workload pattern:
+	//
+	// Pattern: Updates → Deletes → Re-updates (same keys)
+	//
+	// This tests the critical scenarios:
+	// 1. Values written to VLog, then updated (old versions become stale)
+	// 2. Records deleted (tombstones written, values become stale)
+	// 3. Same keys re-inserted (new values written, tombstones superseded)
+	// 4. Compaction + VLog GC must correctly handle all these state transitions
+	// 5. Restart and verify no corruption
+	//
+	// The bug scenario: VLog GC may incorrectly delete VLog files that still
+	// contain live data if the delete_list or discard_stats are inconsistent.
+
+	fn print_storage_state(path: &std::path::Path, tree: &Tree, phase: &str, round: usize) {
+		let vlog_dir = path.join("vlog");
+		let vlog_files: Vec<String> = if vlog_dir.exists() {
+			std::fs::read_dir(&vlog_dir)
+				.unwrap()
+				.filter_map(|e| {
+					let entry = e.ok()?;
+					let name = entry.file_name().to_string_lossy().to_string();
+					if name.ends_with(".vlog") {
+						Some(name)
+					} else {
+						None
+					}
+				})
+				.collect()
+		} else {
+			vec![]
+		};
+
+		let sstables_dir = path.join("sstables");
+		let sstable_files: Vec<String> = if sstables_dir.exists() {
+			std::fs::read_dir(&sstables_dir)
+				.unwrap()
+				.filter_map(|e| {
+					let entry = e.ok()?;
+					let name = entry.file_name().to_string_lossy().to_string();
+					if name.ends_with(".sst") {
+						Some(name)
+					} else {
+						None
+					}
+				})
+				.collect()
+		} else {
+			vec![]
+		};
+
+		let manifest = tree.core.level_manifest.read().unwrap();
+		let levels = manifest.levels.get_levels();
+		let level_counts: Vec<usize> = levels.iter().map(|l| l.tables.len()).collect();
+
+		println!("[{} round {}] VLog files ({}): {:?}", phase, round, vlog_files.len(), vlog_files);
+		println!(
+			"[{} round {}] SSTable files ({}): {:?}",
+			phase,
+			round,
+			sstable_files.len(),
+			sstable_files
+		);
+		println!("[{} round {}] SSTables per level: {:?}", phase, round, level_counts);
+		println!("---");
+	}
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 1; // Only L0 - always bottom level for stale marking
+		opts.enable_vlog = true;
+		opts.vlog_max_file_size = 128 * 1024; // 128KB files - smaller to create more files
+	});
+
+	const NUM_RECORDS: usize = 100;
+	const FIELDS: [&str; 3] = ["data", "metadata", "content"];
+	const ROUNDS: usize = 50;
+	const GC_INTERVAL: usize = 5;
+
+	// Track which records are currently "deleted" vs "live"
+	// Even records (0, 2, 4, ...) will be deleted and re-inserted
+	// Odd records (1, 3, 5, ...) will just be updated
+
+	// ========== PHASE 1: Initial data + mixed updates/deletes ==========
+	{
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Initial insert of all records
+		println!("=== PHASE 1: Initial insert ===");
+		{
+			let mut tx = tree.begin().unwrap();
+			for record_id in 0..NUM_RECORDS {
+				for field in &FIELDS {
+					let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+					let value = format!("initial_value_{}_{}", record_id, field).repeat(20);
+					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				}
+			}
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+		}
+
+		// Run compaction + GC
+		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+			Arc::new(Strategy::default());
+		for _ in 0..3 {
+			tree.core.compact(Arc::clone(&strategy)).unwrap();
+		}
+		print_storage_state(&path, &tree, "Phase1-Initial", 0);
+
+		// Mixed workload: updates + deletes + re-inserts
+		for round in 0..ROUNDS {
+			let mut tx = tree.begin().unwrap();
+
+			for record_id in 0..NUM_RECORDS {
+				let is_even = record_id % 2 == 0;
+				let delete_this_round = is_even && (round % 3 == 0); // Delete every 3rd round
+				let reinsert_this_round = is_even && (round % 3 == 1); // Re-insert next round
+
+				if delete_this_round {
+					// DELETE even records every 3rd round
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						tx.delete(key.as_bytes()).unwrap();
+					}
+				} else if reinsert_this_round {
+					// RE-INSERT previously deleted records
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						let value =
+							format!("reinserted_round{}_{}_{}", round, record_id, field).repeat(20);
+						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+					}
+				} else {
+					// UPDATE (both even and odd records when not deleting/reinserting)
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						let value =
+							format!("updated_round{}_{}_{}", round, record_id, field).repeat(20);
+						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+					}
+				}
+			}
+
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			// Periodic compaction + VLog GC
+			if round > 0 && round % GC_INTERVAL == 0 {
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				for _ in 0..4 {
+					tree.core.compact(Arc::clone(&strategy)).unwrap();
+				}
+				print_storage_state(&path, &tree, "Phase1-Mixed", round);
+			}
+		}
+
+		// Final compaction + GC before shutdown
+		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+			Arc::new(Strategy::default());
+		for _ in 0..5 {
+			tree.core.compact(Arc::clone(&strategy)).unwrap();
+		}
+		print_storage_state(&path, &tree, "Phase1-Final", ROUNDS);
+
+		// Verify all records before shutdown
+		println!("=== Verifying Phase 1 data before shutdown ===");
+		let tx = tree.begin().unwrap();
+		for record_id in 0..NUM_RECORDS {
+			for field in &FIELDS {
+				let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+				let result = tx.get(key.as_bytes());
+				assert!(
+					result.is_ok(),
+					"Phase1: Record {} field {} get() should not error",
+					record_id,
+					field
+				);
+				// All records should exist (even ones were re-inserted)
+				assert!(
+					result.unwrap().is_some(),
+					"Phase1: Record {} field {} should exist",
+					record_id,
+					field
+				);
+			}
+		}
+
+		// Simulate SIGTERM shutdown
+		tree.close().await.unwrap();
+	}
+
+	// ========== PHASE 2: Post-restart - more mixed operations ==========
+	{
+		println!("=== PHASE 2: Post-restart ===");
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Verify all records accessible after restart (before any new writes)
+		println!("=== Verifying data after restart ===");
+		{
+			let tx = tree.begin().unwrap();
+			for record_id in 0..NUM_RECORDS {
+				for field in &FIELDS {
+					let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+					let result = tx.get(key.as_bytes());
+					assert!(
+						result.is_ok(),
+						"Post-restart: Record {} field {} get() should not error - got {:?}",
+						record_id,
+						field,
+						result.err()
+					);
+					assert!(
+						result.unwrap().is_some(),
+						"Post-restart: Record {} field {} should exist",
+						record_id,
+						field
+					);
+				}
+			}
+		}
+
+		// More mixed operations post-restart
+		for round in 0..ROUNDS {
+			let mut tx = tree.begin().unwrap();
+
+			for record_id in 0..NUM_RECORDS {
+				let is_odd = record_id % 2 == 1;
+				let delete_this_round = is_odd && (round % 4 == 0); // Delete odd records every 4th round
+				let reinsert_this_round = is_odd && (round % 4 == 2); // Re-insert 2 rounds later
+
+				if delete_this_round {
+					// DELETE odd records
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						tx.delete(key.as_bytes()).unwrap();
+					}
+				} else if reinsert_this_round {
+					// RE-INSERT previously deleted odd records
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						let value =
+							format!("phase2_reinsert_round{}_{}_{}", round, record_id, field)
+								.repeat(20);
+						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+					}
+				} else {
+					// UPDATE all records
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						let value = format!("phase2_update_round{}_{}_{}", round, record_id, field)
+							.repeat(20);
+						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+					}
+				}
+			}
+
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			// Periodic compaction + VLog GC
+			if round > 0 && round % GC_INTERVAL == 0 {
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				for _ in 0..4 {
+					tree.core.compact(Arc::clone(&strategy)).unwrap();
+				}
+				print_storage_state(&path, &tree, "Phase2-Mixed", round);
+
+				// Verify records accessible after each GC cycle (catches progressive corruption)
+				let verify_tx = tree.begin().unwrap();
+				for record_id in 0..NUM_RECORDS {
+					// Determine expected state for this record at this round
+					let is_odd = record_id % 2 == 1;
+					let was_deleted_this_round = is_odd && (round % 4 == 0);
+					let was_reinserted_this_round = is_odd && (round % 4 == 2);
+
+					// Record should exist unless it was deleted this round and not reinserted
+					let should_exist = !was_deleted_this_round || was_reinserted_this_round;
+					// Note: even records are always updated (never deleted in phase 2)
+					// Odd records: deleted at round%4==0, reinserted at round%4==2
+					// At round 20: 20%4==0, so odd records are deleted → should NOT exist
+					// At round 10: 10%4==2, so odd records are reinserted → should exist
+
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						let result = verify_tx.get(key.as_bytes());
+						assert!(
+							result.is_ok(),
+							"Phase2 round {}: Record {} field {} get() error: {:?}",
+							round,
+							record_id,
+							field,
+							result.err()
+						);
+
+						let value = result.unwrap();
+						if should_exist {
+							assert!(
+								value.is_some(),
+								"Phase2 round {}: Record {} field {} should exist but is None (VLog corruption?)",
+								round,
+								record_id,
+								field
+							);
+						} else {
+							assert!(
+								value.is_none(),
+								"Phase2 round {}: Record {} field {} should be deleted but still exists",
+								round,
+								record_id,
+								field
+							);
+						}
+					}
+				}
+			}
+		}
+
+		// Final compaction + GC
+		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+			Arc::new(Strategy::default());
+		tree.core.compact(strategy).unwrap();
+		print_storage_state(&path, &tree, "Phase2-Final", ROUNDS);
+
+		// Final verification
+		println!("=== Final verification ===");
+		let tx = tree.begin().unwrap();
+		for record_id in 0..NUM_RECORDS {
+			for field in &FIELDS {
+				let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+				let result = tx.get(key.as_bytes());
+				assert!(
+					result.is_ok(),
+					"Final: Record {} field {} get() error: {:?}",
+					record_id,
+					field,
+					result.err()
+				);
+				let value = result.unwrap();
+				assert!(
+					value.is_some(),
+					"Final: Record {} field {} missing - VLog file may have been incorrectly deleted",
+					record_id,
+					field
+				);
+			}
+		}
+
+		tree.close().await.unwrap();
+	}
+
+	// ========== PHASE 3: Another restart cycle to catch delayed corruption ==========
+	{
+		println!("=== PHASE 3: Second restart verification ===");
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Full scan of all records
+		// After round 49 (last round), all records were updated, so all should exist
+		// Last round: 49 % 4 == 1 → UPDATE all records (not delete/reinsert)
+		let tx = tree.begin().unwrap();
+		let mut accessible_count = 0;
+		let mut io_error_count = 0;
+		let mut none_count = 0;
+
+		for record_id in 0..NUM_RECORDS {
+			for field in &FIELDS {
+				let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+				match tx.get(key.as_bytes()) {
+					Ok(Some(_)) => accessible_count += 1,
+					Ok(None) => {
+						// After round 49, all records should exist
+						println!(
+							"ERROR: Record {} field {} is None (should exist after round 49 update)",
+							record_id, field
+						);
+						none_count += 1;
+					}
+					Err(e) => {
+						println!(
+							"ERROR: Record {} field {} - IO error (VLog corruption): {:?}",
+							record_id, field, e
+						);
+						io_error_count += 1;
+					}
+				}
+			}
+		}
+
+		println!(
+			"=== Results: {} accessible, {} None, {} IO errors out of {} total ===",
+			accessible_count,
+			none_count,
+			io_error_count,
+			NUM_RECORDS * FIELDS.len()
+		);
+
+		assert_eq!(
+			io_error_count, 0,
+			"Found {} records with IO errors - VLog corruption detected!",
+			io_error_count
+		);
+		assert_eq!(
+			none_count, 0,
+			"Found {} records unexpectedly None - data loss detected!",
+			none_count
+		);
+		assert_eq!(accessible_count, NUM_RECORDS * FIELDS.len(), "Not all records accessible");
+
+		tree.close().await.unwrap();
+	}
+}

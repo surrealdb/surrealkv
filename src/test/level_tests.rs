@@ -517,7 +517,7 @@ fn create_test_table_with_vlog_id(
 
 /// Creates a LevelManifest from a list of levels without disk I/O
 fn create_test_manifest(levels: Vec<Level>) -> LevelManifest {
-	let levels = Levels(levels.into_iter().map(|l| Arc::new(l)).collect());
+	let levels = Levels(levels.into_iter().map(Arc::new).collect());
 	LevelManifest {
 		path: PathBuf::new(),
 		levels,
