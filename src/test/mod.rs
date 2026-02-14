@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 
 use crate::snapshot::SnapshotIterator;
-use crate::transaction::HistoryOptions;
 use crate::vlog::ValueLocation;
 use crate::{InternalKey, Key, LSMIterator, Result, Value};
 
@@ -228,58 +227,4 @@ fn point_in_time_from_history(
 			}
 		})
 		.collect())
-}
-
-/// Helper to count all versions of a key using history() iterator
-fn count_history_versions_in_range(
-	tx: &crate::Transaction,
-	start: &[u8],
-	end: &[u8],
-) -> crate::Result<usize> {
-	let mut iter = tx.history(start, end)?;
-	iter.seek_first()?;
-	let mut count = 0;
-	while iter.valid() {
-		count += 1;
-		iter.next()?;
-	}
-	Ok(count)
-}
-
-/// Helper to get point-in-time snapshot from history iterator
-fn point_in_time_from_history_in_range(
-	tx: &crate::Transaction,
-	start: &[u8],
-	end: &[u8],
-	timestamp: u64,
-) -> crate::Result<Vec<(crate::Key, crate::Value)>> {
-	use std::collections::BTreeMap;
-	let opts = HistoryOptions {
-		include_tombstones: true,
-		..Default::default()
-	};
-	let mut iter = tx.history_with_options(start, end, &opts)?;
-	iter.seek_first()?;
-	let mut result: BTreeMap<crate::Key, (crate::Value, u64)> = BTreeMap::new();
-	while iter.valid() {
-		let key_ref = iter.key();
-		let ts = key_ref.timestamp();
-		let key = key_ref.user_key().to_vec();
-		let is_tombstone = key_ref.is_tombstone();
-		if ts <= timestamp {
-			let should_update = match result.get(&key) {
-				None => true,
-				Some((_, existing_ts)) => ts > *existing_ts,
-			};
-			if should_update {
-				if is_tombstone {
-					result.remove(&key);
-				} else {
-					result.insert(key.clone(), (iter.value()?, ts));
-				}
-			}
-		}
-		iter.next()?;
-	}
-	Ok(result.into_iter().map(|(k, (v, _))| (k, v)).collect())
 }

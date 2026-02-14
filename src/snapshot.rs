@@ -320,7 +320,6 @@ impl Snapshot {
 			let btree_iter = self.btree_history_iter()?;
 			Ok(HistoryIterator::new_btree(
 				btree_iter,
-				Arc::clone(&self.core),
 				self.seq_num,
 				include_tombstones,
 				lower,
@@ -336,7 +335,6 @@ impl Snapshot {
 			);
 			let iter_state = self.collect_iter_state()?;
 			Ok(HistoryIterator::new_lsm(
-				Arc::clone(&self.core),
 				self.seq_num,
 				iter_state,
 				range,
@@ -400,11 +398,9 @@ impl Drop for Snapshot {
 		// clean up versions no longer visible to any snapshot
 		self.core.snapshot_tracker.unregister(self.seq_num);
 
-		// Release VLog protection - may trigger pending file deletions
-		// if this was the last snapshot holding VLog files open
+		// Release VLog iterator count - this snapshot no longer needs VLog files
 		if let Some(ref vlog) = self.core.vlog {
-			// Ignore errors during drop - we can't propagate them
-			let _ = vlog.decr_iterator_count();
+			vlog.decr_iterator_count();
 		}
 	}
 }
@@ -800,10 +796,6 @@ impl SnapshotIterator<'_> {
 		};
 		let iter_state = snapshot.collect_iter_state()?;
 
-		if let Some(ref vlog) = core.vlog {
-			vlog.incr_iterator_count();
-		}
-
 		let merge_iter = KMergeIterator::new_from(iter_state, range);
 
 		Ok(Self {
@@ -1036,17 +1028,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 	}
 }
 
-impl Drop for SnapshotIterator<'_> {
-	fn drop(&mut self) {
-		// Decrement VLog iterator count when iterator is dropped
-		if let Some(ref vlog) = self.core.vlog {
-			if let Err(e) = vlog.decr_iterator_count() {
-				log::warn!("Failed to decrement VLog iterator count: {e}");
-			}
-		}
-	}
-}
-
 // ===== B+Tree History Iterator =====
 
 /// A streaming iterator over the B+tree versioned index.
@@ -1151,8 +1132,6 @@ pub struct HistoryIterator<'a> {
 	initialized: bool,
 	lower_bound: Option<Vec<u8>>,
 	upper_bound: Option<Vec<u8>>,
-	core: Arc<Core>,
-
 	// === Forward iteration state (streaming) ===
 	current_user_key: Vec<u8>,
 	first_visible_seen: bool,
@@ -1172,7 +1151,6 @@ pub struct HistoryIterator<'a> {
 
 impl<'a> HistoryIterator<'a> {
 	pub(crate) fn new_lsm(
-		core: Arc<Core>,
 		seq_num: u64,
 		iter_state: IterState,
 		range: InternalKeyRange,
@@ -1180,10 +1158,6 @@ impl<'a> HistoryIterator<'a> {
 		ts_range: Option<(u64, u64)>,
 		limit: Option<usize>,
 	) -> Self {
-		if let Some(ref vlog) = core.vlog {
-			vlog.incr_iterator_count();
-		}
-
 		// Use TimestampComparator for history queries with timestamp range
 		// This enables efficient timestamp-based seeks when timestamps are monotonic with seq_nums
 		let inner = if ts_range.is_some() {
@@ -1200,7 +1174,6 @@ impl<'a> HistoryIterator<'a> {
 			initialized: false,
 			lower_bound: None,
 			upper_bound: None,
-			core,
 			current_user_key: Vec::new(),
 			first_visible_seen: false,
 			latest_is_hard_delete: false,
@@ -1217,7 +1190,6 @@ impl<'a> HistoryIterator<'a> {
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new_btree(
 		btree_iter: BPlusTreeIteratorWithGuard<'a>,
-		core: Arc<Core>,
 		seq_num: u64,
 		include_tombstones: bool,
 		lower: Option<&[u8]>,
@@ -1225,10 +1197,6 @@ impl<'a> HistoryIterator<'a> {
 		ts_range: Option<(u64, u64)>,
 		limit: Option<usize>,
 	) -> Self {
-		if let Some(ref vlog) = core.vlog {
-			vlog.incr_iterator_count();
-		}
-
 		Self {
 			inner: HistoryIteratorInner::BTree(btree_iter),
 			snapshot_seq_num: seq_num,
@@ -1237,7 +1205,6 @@ impl<'a> HistoryIterator<'a> {
 			initialized: false,
 			lower_bound: lower.map(|b| b.to_vec()),
 			upper_bound: upper.map(|b| b.to_vec()),
-			core,
 			current_user_key: Vec::new(),
 			first_visible_seen: false,
 			latest_is_hard_delete: false,
@@ -1821,16 +1788,6 @@ impl LSMIterator for HistoryIterator<'_> {
 		match self.direction {
 			MergeDirection::Forward => self.inner_value(),
 			MergeDirection::Backward => Ok(self.buffered_value()),
-		}
-	}
-}
-
-impl Drop for HistoryIterator<'_> {
-	fn drop(&mut self) {
-		if let Some(ref vlog) = self.core.vlog {
-			if let Err(e) = vlog.decr_iterator_count() {
-				log::warn!("Failed to decrement VLog iterator count: {e}");
-			}
 		}
 	}
 }

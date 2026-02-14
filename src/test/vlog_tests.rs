@@ -4,9 +4,6 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
-use crate::clock::LogicalClock;
-use crate::discard::DiscardStats;
-use crate::test::{count_history_versions_in_range, point_in_time_from_history_in_range};
 use crate::vlog::{
 	VLog,
 	VLogFileHeader,
@@ -32,12 +29,10 @@ fn create_test_vlog(opts: Option<Options>) -> (VLog, TempDir, Arc<Options>) {
 
 	// Create vlog subdirectory
 	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
-	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
 	let opts = Arc::new(opts);
 	let opts_clone = Arc::clone(&opts);
-	let vlog = VLog::new(opts, None).unwrap();
+	let vlog = VLog::new(opts).unwrap();
 	(vlog, temp_dir, opts_clone)
 }
 
@@ -67,57 +62,6 @@ fn test_value_pointer_utility_methods() {
 	// With random data, decode might work but produce a nonsense pointer
 	// We just check it doesn't crash
 	let _ = ValuePointer::decode(&random_data);
-}
-
-#[test]
-fn test_discard_stats_operations() {
-	let temp_dir = TempDir::new().unwrap();
-	// Create a vlog subdirectory and use its parent for discard stats
-	let vlog_dir = temp_dir.path().join("vlog");
-	std::fs::create_dir_all(&vlog_dir).unwrap();
-	let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
-
-	// Add some discardable bytes
-	stats.update(1, 100).unwrap();
-	stats.update(1, 50).unwrap();
-
-	let discard_bytes = stats.get_file_stats(1).unwrap();
-	assert_eq!(discard_bytes, 150);
-
-	// Test another file
-	stats.update(2, 300).unwrap(); // Higher discard
-
-	let candidates = stats.get_gc_candidates().unwrap();
-	let (max_file, max_discard) = candidates[0];
-	assert_eq!(max_file, 2);
-	assert_eq!(max_discard, 300);
-}
-
-#[test]
-fn test_gc_threshold_with_discard_stats() {
-	let temp_dir = TempDir::new().unwrap();
-	// Create a vlog subdirectory and use its parent for discard stats
-	let vlog_dir = temp_dir.path().join("vlog");
-	std::fs::create_dir_all(&vlog_dir).unwrap();
-	let mut stats = DiscardStats::new(temp_dir.path()).unwrap();
-
-	// File 1: Add discardable data
-	stats.update(1, 600).unwrap();
-
-	let discard_bytes = stats.get_file_stats(1).unwrap();
-	assert_eq!(discard_bytes, 600);
-
-	// File 2: Lower discard
-	stats.update(2, 200).unwrap();
-
-	let discard_bytes_2 = stats.get_file_stats(2).unwrap();
-	assert_eq!(discard_bytes_2, 200);
-
-	// Test max discard selection (used by conservative GC)
-	let candidates = stats.get_gc_candidates().unwrap();
-	let (max_file, max_discard) = candidates[0];
-	assert_eq!(max_file, 1, "File 1 should have maximum discard bytes");
-	assert_eq!(max_discard, 600);
 }
 
 #[test(tokio::test)]
@@ -205,10 +149,10 @@ async fn test_prefill_file_handles() {
 	);
 
 	// Drop the first VLog to close all file handles
-	vlog1.close().await.unwrap();
+	vlog1.close().unwrap();
 
 	// Create a new VLog instance - this should trigger prefill_file_handles
-	let vlog2 = VLog::new(opts, None).unwrap();
+	let vlog2 = VLog::new(opts).unwrap();
 
 	// Verify that all existing files can be read
 	for (i, pointer) in pointers.iter().enumerate() {
@@ -533,8 +477,6 @@ async fn test_vlog_restart_continues_last_file() {
 
 	// Create vlog subdirectory
 	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
-	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
 	let opts = Arc::new(opts);
 
@@ -543,7 +485,7 @@ async fn test_vlog_restart_continues_last_file() {
 	// Phase 1: Create initial VLog and add some data (but not enough to fill the
 	// file)
 	{
-		let vlog1 = VLog::new(Arc::clone(&opts), None).unwrap();
+		let vlog1 = VLog::new(Arc::clone(&opts)).unwrap();
 
 		// Add some data to the first file
 		for i in 0..3 {
@@ -554,9 +496,9 @@ async fn test_vlog_restart_continues_last_file() {
 		}
 		vlog1.sync().unwrap();
 
-		// Verify we're writing to file 0
+		// Verify we're writing to file 1
 		let first_file_id = pointers[0].0.file_id;
-		assert_eq!(first_file_id, 0, "First data should go to file 0");
+		assert_eq!(first_file_id, 1, "First data should go to file 1");
 
 		// All data should be in the same file since we're not filling it
 		assert!(
@@ -578,18 +520,18 @@ async fn test_vlog_restart_continues_last_file() {
 
 		// Verify writer is set up
 		assert!(vlog1.writer.read().is_some(), "Writer should be set up");
-		vlog1.close().await.unwrap();
+		vlog1.close().unwrap();
 	}
 
 	// Phase 2: Restart VLog and verify it continues with the last file
 	{
-		let vlog2 = VLog::new(Arc::clone(&opts), None).unwrap();
+		let vlog2 = VLog::new(Arc::clone(&opts)).unwrap();
 
-		// Check that active_writer_id is set to the last file (file 0)
+		// Check that active_writer_id is set to the last file (file 1)
 		let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
 		assert_eq!(
-			active_writer_id, 0,
-			"After restart, active writer ID should be set to the last file (0)"
+			active_writer_id, 1,
+			"After restart, active writer ID should be set to the last file (1)"
 		);
 
 		// Check that writer is set up
@@ -601,8 +543,8 @@ async fn test_vlog_restart_continues_last_file() {
 		// Check that next_file_id is correct
 		let next_file_id = vlog2.next_file_id.load(Ordering::SeqCst);
 		assert_eq!(
-			next_file_id, 1,
-			"Next file ID should be 1 (one past the highest existing file)"
+			next_file_id, 2,
+			"Next file ID should be 2 (one past the highest existing file)"
 		);
 
 		// Verify all previous data can still be read
@@ -620,9 +562,9 @@ async fn test_vlog_restart_continues_last_file() {
 		let new_pointer = vlog2.append(new_key, &new_value).unwrap();
 		vlog2.sync().unwrap();
 
-		// New data should go to the same file (file 0) since it has space
+		// New data should go to the same file (file 1) since it has space
 		assert_eq!(
-			new_pointer.file_id, 0,
+			new_pointer.file_id, 1,
 			"New data after restart should go to the existing file with space"
 		);
 
@@ -648,7 +590,7 @@ async fn test_vlog_restart_continues_last_file() {
 		if has_file_1 {
 			// If we created file 1, verify the active writer ID updated
 			let final_active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
-			assert_eq!(final_active_writer_id, 1, "Active writer ID should update to the new file");
+			assert_eq!(final_active_writer_id, 2, "Active writer ID should update to the new file");
 		}
 
 		// Verify all data (old and new) can still be read
@@ -675,8 +617,6 @@ async fn test_vlog_restart_with_multiple_files() {
 
 	// Create vlog subdirectory
 	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
-	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
 	let opts = Arc::new(opts);
 
@@ -685,7 +625,7 @@ async fn test_vlog_restart_with_multiple_files() {
 
 	// Phase 1: Create VLog and add enough data to create 5+ files
 	{
-		let vlog1 = VLog::new(Arc::clone(&opts), None).unwrap();
+		let vlog1 = VLog::new(Arc::clone(&opts)).unwrap();
 
 		// Add enough data to create at least 5 VLog files
 		for i in 0..50 {
@@ -714,12 +654,12 @@ async fn test_vlog_restart_with_multiple_files() {
 		highest_file_id = highest_file_id.max(final_pointer.file_id);
 
 		vlog1.sync().unwrap();
-		vlog1.close().await.unwrap();
+		vlog1.close().unwrap();
 	}
 
 	// Phase 2: Restart VLog and verify it picks up the correct active writer
 	{
-		let vlog2 = VLog::new(Arc::clone(&opts), None).unwrap();
+		let vlog2 = VLog::new(Arc::clone(&opts)).unwrap();
 
 		// Check that active_writer_id is set to the highest file ID
 		let active_writer_id = vlog2.active_writer_id.load(Ordering::SeqCst);
@@ -825,8 +765,6 @@ async fn test_vlog_writer_reopen_append_only_behavior() {
 		vlog_checksum_verification: VLogChecksumLevel::Full,
 		..Default::default()
 	});
-	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
-	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
 	// Create a test file path
 	let test_file_path = temp_dir.path().join("vlog_writer_test.log");
@@ -944,7 +882,7 @@ async fn test_vlog_writer_reopen_append_only_behavior() {
 		let vlog_file_path = opts.vlog_file_path(file_id as u64);
 		std::fs::copy(&test_file_path, &vlog_file_path).unwrap();
 
-		let vlog = VLog::new(opts, None).unwrap();
+		let vlog = VLog::new(opts).unwrap();
 
 		// Verify ALL phase 1 data can still be read (proving no overwrite occurred)
 		for (i, (pointer, (_, expected_value))) in
@@ -1024,236 +962,6 @@ async fn test_vlog_writer_reopen_append_only_behavior() {
 			all_offsets[i],
 			i - 1,
 			all_offsets[i - 1]
-		);
-	}
-}
-
-#[test(tokio::test)]
-async fn test_vlog_gc_with_versioned_index_cleanup_integration() {
-	use crate::clock::MockLogicalClock;
-	use crate::compaction::leveled::Strategy;
-	use crate::lsm::{CompactionOperations, TreeBuilder};
-
-	// Create test environment
-	let temp_dir = TempDir::new().unwrap();
-
-	// Set up mock clock and retention period
-	let mock_clock = Arc::new(MockLogicalClock::with_timestamp(1000));
-	let retention_ns = 2000; // 2 seconds retention - very short for testing
-
-	let opts = Options {
-		clock: Arc::clone(&mock_clock) as Arc<dyn LogicalClock>,
-		vlog_max_file_size: 950, /* Small files to force frequent rotations (like VLog
-		                          * compaction test) */
-		vlog_gc_discard_ratio: 0.0, // Disable discard ratio to preserve all values initially
-		level_count: 2,             // Two levels for compaction strategy
-		..Options::default()
-	};
-
-	// Create Tree with versioning enabled
-	let tree = TreeBuilder::with_options(opts)
-		.with_path(temp_dir.path().to_path_buf())
-		.with_versioning(true, retention_ns)
-		.build()
-		.unwrap();
-
-	// Insert multiple versions of the same key with LARGE values to fill VLog files
-	let user_key = b"test_key";
-
-	// Insert versions with large values to fill VLog files quickly
-	for (i, ts) in [1000, 2000, 3000, 4000].iter().enumerate() {
-		let value = format!("value_{}_large_data", i).repeat(50); // Large value to fill VLog
-		let mut tx = tree.begin().unwrap();
-		tx.set_at(user_key, value.as_bytes(), *ts).unwrap();
-		tx.commit().await.unwrap();
-		tree.flush().unwrap(); // Force flush after each version
-	}
-
-	// Insert and delete a different key to create stale entries
-	{
-		let mut tx = tree.begin().unwrap();
-		tx.set_at(b"other_key", b"other_value_large_data".repeat(50), 5000).unwrap();
-		tx.commit().await.unwrap();
-		tree.flush().unwrap();
-
-		// Delete other_key to make it stale
-		let mut tx = tree.begin().unwrap();
-		tx.delete(b"other_key").unwrap();
-		tx.commit().await.unwrap();
-		tree.flush().unwrap();
-	}
-
-	// Verify all versions exist using the public API
-	let tx = tree.begin().unwrap();
-	let mut end_key = user_key.to_vec();
-	end_key.push(0);
-	let version_count = count_history_versions_in_range(&tx, user_key.as_ref(), &end_key).unwrap();
-	assert_eq!(version_count, 4, "Should have 4 versions before GC");
-
-	drop(tx);
-
-	// Advance time to make some versions expire
-	mock_clock.set_time(6000);
-
-	// Trigger LSM compaction first
-	let strategy = Arc::new(Strategy::default());
-	tree.core.compact(strategy).unwrap();
-
-	// Check VLog file stats before GC
-	if let Some(vlog) = &tree.core.vlog {
-		let stats = vlog.get_all_file_stats().unwrap();
-		for (file_id, total_size, discard_bytes, ratio) in stats {
-			println!(
-				"  File {}: total={}, discard={}, ratio={:.2}",
-				file_id, total_size, discard_bytes, ratio
-			);
-		}
-	}
-
-	// Now run VLog garbage collection multiple times to process all files
-	let mut all_deleted_files = Vec::new();
-
-	loop {
-		let deleted_files = tree.garbage_collect_vlog().await.unwrap();
-		if deleted_files.is_empty() {
-			break;
-		}
-
-		all_deleted_files.extend(deleted_files);
-	}
-
-	// Verify that some versions were cleaned up using the public API
-	let tx = tree.begin().unwrap();
-	let mut end_key = user_key.to_vec();
-	end_key.push(0);
-	let version_count_after =
-		count_history_versions_in_range(&tx, user_key.as_ref(), &end_key).unwrap();
-
-	// We should have at least some versions remaining
-	assert!(version_count_after > 0, "Should have at least some versions remaining");
-
-	// If GC deleted files, we should have fewer versions
-	if !all_deleted_files.is_empty() {
-		// We should have fewer versions after GC
-		assert!(
-			version_count_after < 6,
-			"Should have fewer versions after GC deleted files. Before: 6, After: {}",
-			version_count_after
-		);
-	}
-
-	// Test specific timestamp queries to verify which versions were deleted
-	let mut end_key = user_key.to_vec();
-	end_key.push(0);
-	let scan_at_ts1 =
-		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 1000).unwrap();
-	let scan_at_ts2 =
-		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 2000).unwrap();
-	let scan_at_ts3 =
-		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 3000).unwrap();
-	let scan_at_ts4 =
-		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 4000).unwrap();
-	let scan_at_ts5 =
-		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 6000).unwrap();
-	let scan_at_ts6 =
-		point_in_time_from_history_in_range(&tx, user_key.as_ref(), &end_key, 6001).unwrap();
-
-	// The key insight: VLog GC only processes files with high discard ratios
-	// Files 0, 1, 2 had high discard ratios (0.97) and were processed
-	// Files 3, 4, 5, 6 had zero discard ratios (0.00) and were NOT processed
-	// This means versions in files 0, 1, 2 were cleaned up, but versions in files
-	// 3+ were not
-
-	// Verify that versions in processed files (1000, 2000, 3000) are NOT accessible
-	assert_eq!(
-		scan_at_ts1.len(),
-		0,
-		"Version at timestamp 1000 should be deleted (was in processed file)"
-	);
-	assert_eq!(
-		scan_at_ts2.len(),
-		0,
-		"Version at timestamp 2000 should be deleted (was in processed file)"
-	);
-	assert_eq!(
-		scan_at_ts3.len(),
-		0,
-		"Version at timestamp 3000 should be deleted (was in processed file)"
-	);
-
-	// Verify that recent versions (6000, 6001) are still accessible
-	assert_eq!(scan_at_ts4.len(), 1, "Version at timestamp 4000 should still exist (recent)");
-	assert_eq!(scan_at_ts5.len(), 1, "Version at timestamp 6000 should still exist (recent)");
-	assert_eq!(scan_at_ts6.len(), 1, "Version at timestamp 6001 should still exist (recent)");
-}
-
-#[test(tokio::test)]
-async fn test_delete_list_large_batch_chunking() {
-	// This test verifies that large batches are properly chunked to avoid ArenaFull errors.
-	// We use a small memtable size to make it easier to trigger the issue if chunking wasn't
-	// working.
-	let temp_dir = TempDir::new().unwrap();
-
-	let mut opts = Options {
-		vlog_checksum_verification: VLogChecksumLevel::Full,
-		max_memtable_size: 64 * 1024, // 64KB - small memtable to test chunking
-		..Default::default()
-	};
-
-	opts.path = temp_dir.path().to_path_buf();
-
-	// Create vlog subdirectory
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
-	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
-
-	let opts = Arc::new(opts);
-	let vlog = VLog::new(opts, None).unwrap();
-
-	// Create a large batch of entries (more than DELETE_LIST_CHUNK_SIZE * 2)
-	// DELETE_LIST_CHUNK_SIZE is 10_000, so 25_000 entries will require 3 chunks
-	const NUM_ENTRIES: usize = 25_000;
-	let mut entries = Vec::with_capacity(NUM_ENTRIES);
-
-	for i in 0..NUM_ENTRIES {
-		// Use sequence numbers starting from 1000 to avoid conflicts
-		let seq_num = 1000 + i as u64;
-		let value_size = (i * 100) as u64; // Varying value sizes
-		entries.push((seq_num, value_size));
-	}
-
-	// Add all entries - this should succeed with chunking
-	vlog.add_batch_to_delete_list(entries.clone()).unwrap();
-
-	// Verify all entries are queryable via is_stale()
-	for (seq_num, _) in &entries {
-		assert!(
-			vlog.is_stale(*seq_num).unwrap(),
-			"Entry with seq_num {} should be marked as stale",
-			seq_num
-		);
-	}
-
-	// Verify entries that weren't added are not stale
-	assert!(
-		!vlog.is_stale(999).unwrap(),
-		"Entry with seq_num 999 should NOT be stale (wasn't added)"
-	);
-	assert!(
-		!vlog.is_stale(1000 + NUM_ENTRIES as u64).unwrap(),
-		"Entry beyond range should NOT be stale"
-	);
-
-	// Test bulk delete - delete all entries
-	let seq_nums: Vec<u64> = entries.iter().map(|(seq_num, _)| *seq_num).collect();
-	vlog.delete_list.delete_entries_batch(seq_nums).unwrap();
-
-	// Verify all entries are no longer stale
-	for (seq_num, _) in &entries {
-		assert!(
-			!vlog.is_stale(*seq_num).unwrap(),
-			"Entry with seq_num {} should NOT be stale after deletion",
-			seq_num
 		);
 	}
 }

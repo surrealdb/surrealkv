@@ -1,10 +1,8 @@
 use std::cmp::Ordering;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::clock::LogicalClock;
 use crate::error::{Error, Result};
-use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator, Value};
 
 // ============================================================================
@@ -650,11 +648,6 @@ impl LSMIterator for MergingIterator<'_> {
 //   ("apple", seq=100, "red")           ← only latest version kept
 //   ("banana", seq=60, "yellow")
 //   // "cherry" completely removed (DELETE at bottom level)
-//
-// Side effects:
-//   - Older versions of "apple" added to delete_list
-//   - All versions of "cherry" added to delete_list
-//   - discard_stats updated for VLog garbage collection
 // ```
 //
 // ## Version Retention
@@ -668,31 +661,6 @@ impl LSMIterator for MergingIterator<'_> {
 //   ("apple", seq=20,  age=2hours) → discard (outside retention)
 // ```
 //
-
-/// Helper function to collect VLog discard statistics.
-///
-/// When a value is discarded during compaction, we need to track
-/// how much space can be reclaimed from each VLog file.
-///
-/// # Arguments
-/// * `discard_stats` - Map of file_id → bytes_to_discard
-/// * `value` - The value being discarded (may contain VLog pointer)
-fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &[u8]) -> Result<()> {
-	// Skip empty values (e.g., hard delete entries have no value)
-	if value.is_empty() {
-		return Ok(());
-	}
-
-	// Check if this is a ValueLocation (pointer to VLog)
-	// Small values are stored inline, large values have pointers
-	let location = ValueLocation::decode(value)?;
-	if location.is_value_pointer() {
-		let pointer = ValuePointer::decode(&location.value)?;
-		let value_data_size = pointer.total_entry_size() as i64;
-		*discard_stats.entry(pointer.file_id).or_insert(0) += value_data_size;
-	}
-	Ok(())
-}
 
 /// Compaction iterator that wraps MergingIterator to perform deduplication
 /// and garbage collection tracking.
@@ -712,7 +680,6 @@ fn collect_vlog_discard_stats(discard_stats: &mut HashMap<u32, i64>, value: &[u8
 ///        │  1. Group by user_key                     │
 ///        │  2. Sort versions by seq_num (desc)       │
 ///        │  3. Apply retention/deletion rules        │
-///        │  4. Track garbage for VLog               │
 ///        │                                           │
 ///        └─────────────────────┬─────────────────────┘
 ///                              │
@@ -760,22 +727,6 @@ pub(crate) struct CompactionIterator<'a> {
 	/// The advance() method drains this buffer before processing more input.
 	output_versions: Vec<(InternalKey, Value)>,
 
-	// ========== Garbage Collection State ==========
-	/// Collected discard statistics: file_id → total_discarded_bytes.
-	///
-	/// This tells the VLog garbage collector how much space can be
-	/// reclaimed from each VLog file.
-	pub discard_stats: HashMap<u32, i64>,
-
-	/// Reference to VLog for populating delete-list.
-	vlog: Option<Arc<VLog>>,
-
-	/// Batch of stale entries to add to delete-list: (sequence_number, value_size).
-	///
-	/// These entries are flushed periodically to the VLog's delete list,
-	/// which is used during garbage collection.
-	pub(crate) delete_list_batch: Vec<(u64, u64)>,
-
 	// ========== Versioning Configuration ==========
 	/// Whether to keep multiple versions of keys.
 	///
@@ -812,7 +763,6 @@ impl<'a> CompactionIterator<'a> {
 	/// * `iterators` - Source iterators to merge (one per level/file)
 	/// * `cmp` - Key comparator
 	/// * `is_bottom_level` - Whether compacting to the bottom level
-	/// * `vlog` - Optional VLog for garbage tracking
 	/// * `enable_versioning` - Whether to keep multiple versions
 	/// * `retention_period_ns` - How long to keep old versions
 	/// * `clock` - Time source for retention calculations
@@ -822,7 +772,6 @@ impl<'a> CompactionIterator<'a> {
 		iterators: Vec<BoxedLSMIterator<'a>>,
 		cmp: Arc<dyn Comparator>,
 		is_bottom_level: bool,
-		vlog: Option<Arc<VLog>>,
 		enable_versioning: bool,
 		retention_period_ns: u64,
 		clock: Arc<dyn LogicalClock>,
@@ -836,9 +785,6 @@ impl<'a> CompactionIterator<'a> {
 			current_user_key: Vec::new(),
 			accumulated_versions: Vec::new(),
 			output_versions: Vec::new(),
-			discard_stats: HashMap::new(),
-			vlog,
-			delete_list_batch: Vec::new(),
 			enable_versioning,
 			retention_period_ns,
 			clock,
@@ -851,19 +797,6 @@ impl<'a> CompactionIterator<'a> {
 	fn initialize(&mut self) -> Result<()> {
 		self.merge_iter.seek_first()?;
 		self.initialized = true;
-		Ok(())
-	}
-
-	/// Flushes the batched delete-list entries to the VLog.
-	///
-	/// Called periodically during compaction to avoid building up
-	/// too much state in memory.
-	pub(crate) fn flush_delete_list_batch(&mut self) -> Result<()> {
-		if let Some(ref vlog) = self.vlog {
-			if !self.delete_list_batch.is_empty() {
-				vlog.add_batch_to_delete_list(std::mem::take(&mut self.delete_list_batch))?;
-			}
-		}
 		Ok(())
 	}
 
@@ -1078,7 +1011,7 @@ impl<'a> CompactionIterator<'a> {
 
 		// Sort by sequence number (descending) to get the latest version first
 		// Higher sequence number = more recent write
-		self.accumulated_versions.sort_by(|a, b| b.0.seq_num().cmp(&a.0.seq_num()));
+		self.accumulated_versions.sort_by_key(|b| std::cmp::Reverse(b.0.seq_num()));
 
 		// Check if latest version is DELETE at bottom level
 		// If so, we can completely remove this key from the database
@@ -1145,7 +1078,7 @@ impl<'a> CompactionIterator<'a> {
 				!superseded && self.must_preserve_for_snapshot(current_visibility);
 
 			// ===== DETERMINE IF ENTRY IS STALE =====
-			// Stale entries are added to delete_list for VLog garbage collection
+			// Stale entries are filtered out during compaction
 
 			let should_mark_stale = if superseded {
 				// Superseded: a newer version in the same visibility boundary
@@ -1194,29 +1127,6 @@ impl<'a> CompactionIterator<'a> {
 					false
 				}
 			};
-
-			// ===== RECORD STALE ENTRIES FOR GARBAGE COLLECTION =====
-
-			if should_mark_stale && self.vlog.is_some() {
-				if key.is_tombstone() {
-					// Tombstone: record key size
-					self.delete_list_batch.push((key.seq_num(), key.size() as u64));
-				} else {
-					// Regular value: record VLog pointer size
-					let location = ValueLocation::decode(value)?;
-					if location.is_value_pointer() {
-						let pointer = ValuePointer::decode(&location.value)?;
-						let value_size = pointer.total_entry_size();
-						self.delete_list_batch.push((key.seq_num(), value_size));
-					}
-				}
-
-				// Update per-file discard statistics
-				if let Err(e) = collect_vlog_discard_stats(&mut self.discard_stats, value) {
-					log::error!("Error collecting discard stats: {e:?}");
-					return Err(e);
-				}
-			}
 
 			// ===== DETERMINE IF ENTRY SHOULD BE OUTPUT =====
 

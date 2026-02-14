@@ -1,30 +1,16 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::RwLock;
 
-use crate::batch::Batch;
-use crate::bplustree::tree::DiskBPlusTree;
-use crate::commit::CommitPipeline;
-use crate::discard::DiscardStats;
 use crate::error::{Error, Result};
-use crate::{
-	vfs,
-	CompressionType,
-	InternalKey,
-	InternalKeyKind,
-	Options,
-	Tree,
-	TreeBuilder,
-	VLogChecksumLevel,
-	Value,
-};
+use crate::{vfs, CompressionType, Options, VLogChecksumLevel, Value};
 
 /// VLog format version
 pub const VLOG_FORMAT_VERSION: u16 = 1;
@@ -535,9 +521,6 @@ pub(crate) struct VLog {
 	/// Checksum verification level
 	checksum_level: VLogChecksumLevel,
 
-	/// Discard ratio threshold for triggering garbage collection (0.0 - 1.0)
-	gc_discard_ratio: f64,
-
 	/// Next file ID to be assigned
 	pub(crate) next_file_id: AtomicU32,
 
@@ -556,24 +539,8 @@ pub(crate) struct VLog {
 	/// Cached open file handles for reading
 	pub(crate) file_handles: RwLock<HashMap<u32, Arc<File>>>,
 
-	/// Files marked for deletion but waiting for iterators to finish
-	files_to_be_deleted: RwLock<Vec<u32>>,
-
-	/// Prevents concurrent garbage collection
-	gc_in_progress: AtomicBool,
-
-	/// Discard statistics for GC candidate selection
-	discard_stats: Mutex<DiscardStats>,
-
-	/// Global delete list LSM tree: tracks <stale_seqno, value_size> pairs
-	/// across all segments
-	pub(crate) delete_list: Arc<DeleteList>,
-
 	/// Options for VLog configuration
 	pub(crate) opts: Arc<Options>,
-
-	/// Reference to versioned index for atomic cleanup during GC
-	versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
 }
 
 impl VLog {
@@ -583,37 +550,22 @@ impl VLog {
 	}
 
 	/// Creates a new VLog instance
-	pub(crate) fn new(
-		opts: Arc<Options>,
-		versioned_index: Option<Arc<RwLock<DiskBPlusTree>>>,
-	) -> Result<Self> {
-		// Initialize the global delete list tree
-		let delete_list = Arc::new(DeleteList::new(opts.delete_list_dir())?);
-
+	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		let vlog = Self {
 			path: opts.vlog_dir(),
 			max_file_size: opts.vlog_max_file_size,
 			checksum_level: opts.vlog_checksum_verification,
-			gc_discard_ratio: opts.vlog_gc_discard_ratio,
-			next_file_id: AtomicU32::new(0),
+			next_file_id: AtomicU32::new(1),
 			active_writer_id: AtomicU32::new(0),
 			writer: RwLock::new(None),
 			num_active_iterators: AtomicI32::new(0),
 			files_map: RwLock::new(HashMap::new()),
 			file_handles: RwLock::new(HashMap::new()),
-			files_to_be_deleted: RwLock::new(Vec::new()),
-			gc_in_progress: AtomicBool::new(false),
-			discard_stats: Mutex::new(DiscardStats::new(opts.discard_stats_dir())?),
-			delete_list,
 			opts,
-			versioned_index,
 		};
 
 		// PRE-FILL ALL EXISTING FILE HANDLES ON STARTUP
 		vlog.prefill_file_handles()?;
-
-		// Clean up any leftover temporary files from previous interrupted compactions
-		vlog.cleanup_temp_files()?;
 
 		Ok(vlog)
 	}
@@ -954,16 +906,8 @@ impl VLog {
 	}
 
 	/// Decrements the active iterator count when a transaction/iterator ends
-	/// If count reaches zero, processes deferred file deletions
-	pub(crate) fn decr_iterator_count(&self) -> Result<()> {
-		let count = self.num_active_iterators.fetch_sub(1, Ordering::SeqCst);
-
-		if count == 1 {
-			// We were the last iterator, safe to delete pending files
-			self.delete_pending_files()?;
-		}
-
-		Ok(())
+	pub(crate) fn decr_iterator_count(&self) {
+		self.num_active_iterators.fetch_sub(1, Ordering::SeqCst);
 	}
 
 	/// Gets the current number of active iterators  
@@ -971,27 +915,56 @@ impl VLog {
 		self.num_active_iterators.load(Ordering::SeqCst)
 	}
 
-	/// Deletes files that were marked for deletion when no iterators were
-	/// active
-	fn delete_pending_files(&self) -> Result<()> {
-		let mut files_to_delete = self.files_to_be_deleted.write();
+	/// Cleans up obsolete vlog files based on the global minimum oldest_vlog_file_id.
+	///
+	/// A vlog file is safe to delete when:
+	/// - Its file_id < min_oldest_vlog (no SST references values in it)
+	/// - It is not the active writer
+	/// - No iterators are active
+	///
+	/// This implements the "global minimum" GC approach where files are deleted
+	/// once no SST can possibly reference them. If iterators are active, cleanup
+	/// is skipped and will be retried on the next GC trigger.
+	pub(crate) fn cleanup_obsolete_files(&self, min_oldest_vlog: u32) -> Result<()> {
+		// Skip cleanup if iterators are active - will be cleaned up on next GC
+		if self.iterator_count() > 0 {
+			log::debug!("Skipping VLog cleanup: {} active iterators", self.iterator_count());
+			return Ok(());
+		}
+
+		let active = self.active_writer_id.load(Ordering::SeqCst);
+
+		// Collect files that are safe to delete
+		let to_delete: Vec<u32> = {
+			let files_map = self.files_map.read();
+			files_map.keys().filter(|&&id| id < min_oldest_vlog && id != active).copied().collect()
+		};
+
+		if to_delete.is_empty() {
+			return Ok(());
+		}
+
+		// No active iterators, safe to delete
 		let mut files_map = self.files_map.write();
 		let mut file_handles = self.file_handles.write();
 
-		for file_id in files_to_delete.drain(..) {
+		for file_id in to_delete {
 			file_handles.remove(&file_id);
 			if let Some(vlog_file) = files_map.remove(&file_id) {
 				if let Err(e) = std::fs::remove_file(&vlog_file.path) {
 					log::error!(
-						"Failed to delete VLog file: file_id={}, path={:?}, error={}",
+						"Failed to delete obsolete VLog file: file_id={}, path={:?}, error={}",
 						file_id,
 						vlog_file.path,
 						e
 					);
-					return Err(Error::Other(format!(
-						"Failed to delete VLog file (file_id={}, path={:?}): {}",
-						file_id, vlog_file.path, e
-					)));
+					// Continue with other files, don't fail the entire cleanup
+				} else {
+					log::info!(
+						"Deleted obsolete VLog file: file_id={}, path={:?}",
+						file_id,
+						vlog_file.path
+					);
 				}
 			}
 		}
@@ -999,365 +972,11 @@ impl VLog {
 		Ok(())
 	}
 
-	/// Selects files based on discard statistics and compacts them
-	/// Attempts to compact the best candidate file (highest discard bytes that
-	/// meets criteria) Only processes one file per invocation
-	pub async fn garbage_collect(&self, commit_pipeline: Arc<CommitPipeline>) -> Result<Vec<u32>> {
-		// Try to set the gc_in_progress flag to true, if it's already true, return
-		// error
-		if self
-			.gc_in_progress
-			.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-			.is_err()
-		{
-			// GC already in progress
-			return Err(Error::VlogGCAlreadyInProgress);
-		}
-
-		// Make sure we reset the flag when we're done
-		let _guard = scopeguard::guard((), |_| {
-			self.gc_in_progress.store(false, Ordering::SeqCst);
-		});
-
-		// Get all files with discardable bytes, sorted by discard bytes (descending)
-		let candidates = {
-			let discard_stats = self.discard_stats.lock();
-			discard_stats.get_gc_candidates()?
-		};
-
-		if candidates.is_empty() {
-			return Ok(vec![]);
-		}
-
-		// Get active writer ID once
-		let active_writer_id = self.active_writer_id.load(Ordering::SeqCst);
-
-		// Find the best candidate to compact (first one that meets all criteria)
-		let mut candidate_to_compact = None;
-		for (file_id, discard_bytes) in candidates {
-			// Skip if no discard bytes
-			if discard_bytes == 0 {
-				continue;
-			}
-
-			// Check if this file meets the discard ratio threshold
-			let (total_size, _, discard_ratio) = self.get_file_stats(file_id)?;
-			if total_size == 0 || discard_ratio < self.gc_discard_ratio {
-				continue;
-			}
-
-			// Skip if this is the active writer
-			if file_id == active_writer_id {
-				continue;
-			}
-
-			// Skip if file is already marked for deletion
-			let files_to_delete = self.files_to_be_deleted.read();
-			if files_to_delete.contains(&file_id) {
-				continue;
-			}
-
-			candidate_to_compact = Some((file_id, discard_bytes));
-			break;
-		}
-
-		// If we found a candidate, try to compact it
-		if let Some((file_id, _)) = candidate_to_compact {
-			let compacted =
-				self.compact_vlog_file_safe(file_id, Arc::clone(&commit_pipeline)).await?;
-
-			if compacted {
-				Ok(vec![file_id])
-			} else {
-				Ok(vec![])
-			}
-		} else {
-			// No suitable candidate found
-			Ok(vec![])
-		}
-	}
-
-	/// Compacts a single value log file
-	async fn compact_vlog_file_safe(
-		&self,
-		file_id: u32,
-		commit_pipeline: Arc<CommitPipeline>,
-	) -> Result<bool> {
-		// Perform the actual compaction
-		let compacted = self.compact_vlog_file(file_id, Arc::clone(&commit_pipeline)).await?;
-
-		if compacted {
-			// Schedule for safe deletion based on iterator count
-			if self.iterator_count() == 0 {
-				// No active iterators, safe to delete immediately
-				let mut files_map = self.files_map.write();
-				let mut file_handles = self.file_handles.write();
-				file_handles.remove(&file_id);
-				if let Some(vlog_file) = files_map.remove(&file_id) {
-					if let Err(e) = std::fs::remove_file(&vlog_file.path) {
-						log::error!(
-							"Failed to delete compacted VLog file: file_id={}, path={:?}, error={}",
-							file_id,
-							vlog_file.path,
-							e
-						);
-						return Err(Error::Other(format!(
-							"Failed to delete compacted VLog file (file_id={}, path={:?}): {}",
-							file_id, vlog_file.path, e
-						)));
-					}
-				}
-			} else {
-				// There are active iterators, defer deletion.
-				// Keep file handle in cache - delete_pending_files() will remove it
-				// when the file is actually deleted.
-				let mut files_to_delete = self.files_to_be_deleted.write();
-				files_to_delete.push(file_id);
-			}
-		}
-
-		Ok(compacted)
-	}
-
-	/// Compacts a single value log file, copying only live values
-	async fn compact_vlog_file(
-		&self,
-		file_id: u32,
-		commit_pipeline: Arc<CommitPipeline>,
-	) -> Result<bool> {
-		let source_path = self.vlog_file_path(file_id);
-
-		// Check if file exists
-		if !source_path.exists() {
-			return Ok(false);
-		}
-
-		// Get current discard statistics for this file
-		let (total_size, expected_discard, _) = self.get_file_stats(file_id)?;
-
-		if total_size == 0 || expected_discard == 0 {
-			// No point in compacting if there's nothing to discard
-			return Ok(false);
-		}
-
-		// Open source file
-		let mut source_file = BufReader::new(File::open(&source_path).map_err(|e| {
-			log::error!(
-				"Failed to open VLog file for compaction: file_id={}, path={:?}, error={}",
-				file_id,
-				source_path,
-				e
-			);
-			Error::Other(format!(
-				"Failed to open VLog file for compaction (file_id={}, path={:?}): {}",
-				file_id, source_path, e
-			))
-		})?);
-
-		// Start reading after the file header
-		let mut offset = VLogFileHeader::SIZE as u64;
-		let mut values_skipped = 0;
-		let mut stale_seq_nums: Vec<u64> = Vec::new();
-		let mut stale_internal_keys: Vec<InternalKey> = Vec::new();
-
-		let mut batch = Batch::default();
-		let mut batch_size = 0;
-		const MAX_BATCH_SIZE: usize = 4 * 1024 * 1024; // 4MB batch size limit
-		const MAX_BATCH_COUNT: usize = 1000; // Maximum entries per batch
-
-		// Read the file and process entries
-		loop {
-			// Try to read header: [key_len: 4 bytes][value_len: 4 bytes]
-			source_file.seek(SeekFrom::Start(offset)).map_err(|e| {
-				log::error!(
-					"Failed to seek in VLog file during compaction: file_id={}, offset={}, error={}",
-					file_id, offset, e
-				);
-				Error::Other(format!(
-					"Failed to seek in VLog file during compaction (file_id={}, offset={}): {}",
-					file_id, offset, e
-				))
-			})?;
-			let mut key_len_buf = [0u8; 4];
-			match source_file.read_exact(&mut key_len_buf) {
-				Ok(()) => {}
-				Err(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-					break;
-				}
-				Err(e) => {
-					log::error!(
-						"Failed to read key length during VLog compaction: file_id={}, offset={}, error={}",
-						file_id, offset, e
-					);
-					return Err(Error::Other(format!(
-						"Failed to read key length during VLog compaction (file_id={}, offset={}): {}",
-						file_id, offset, e
-					)));
-				}
-			}
-
-			let key_len = u32::from_be_bytes(key_len_buf);
-
-			let mut value_len_buf = [0u8; 4];
-			source_file.read_exact(&mut value_len_buf).map_err(|e| {
-				log::error!(
-					"Failed to read value length during VLog compaction: file_id={}, offset={}, error={}",
-					file_id, offset, e
-				);
-				Error::Other(format!(
-					"Failed to read value length during VLog compaction (file_id={}, offset={}): {}",
-					file_id, offset, e
-				))
-			})?;
-			let value_len = u32::from_be_bytes(value_len_buf);
-
-			// Read key
-			let mut key = vec![0u8; key_len as usize];
-			source_file.read_exact(&mut key).map_err(|e| {
-				log::error!(
-					"Failed to read key during VLog compaction: file_id={}, offset={}, key_len={}, error={}",
-					file_id, offset, key_len, e
-				);
-				Error::Other(format!(
-					"Failed to read key during VLog compaction (file_id={}, offset={}, key_len={}): {}",
-					file_id, offset, key_len, e
-				))
-			})?;
-
-			// Read value
-			let mut value = vec![0u8; value_len as usize];
-			source_file.read_exact(&mut value).map_err(|e| {
-				log::error!(
-					"Failed to read value during VLog compaction: file_id={}, offset={}, value_len={}, error={}",
-					file_id, offset, value_len, e
-				);
-				Error::Other(format!(
-					"Failed to read value during VLog compaction (file_id={}, offset={}, value_len={}): {}",
-					file_id, offset, value_len, e
-				))
-			})?;
-
-			// Read CRC32
-			let mut crc32_buf = [0u8; 4];
-			source_file.read_exact(&mut crc32_buf).map_err(|e| {
-				log::error!(
-					"Failed to read CRC32 during VLog compaction: file_id={}, offset={}, error={}",
-					file_id,
-					offset,
-					e
-				);
-				Error::Other(format!(
-					"Failed to read CRC32 during VLog compaction (file_id={}, offset={}): {}",
-					file_id, offset, e
-				))
-			})?;
-			let _crc32 = u32::from_be_bytes(crc32_buf);
-
-			let entry_size = 8 + key_len as u64 + value_len as u64 + 4; // header + key + value + crc32
-
-			let internal_key = InternalKey::decode(&key);
-
-			// Check if this user key is stale using the global delete list
-			let is_stale = match self.delete_list.is_stale(internal_key.seq_num()) {
-				Ok(stale) => stale,
-				Err(e) => {
-					let user_key = internal_key.user_key.clone();
-					log::error!("Failed to check delete list for user key {user_key:?}: {e}");
-					return Err(e);
-				}
-			};
-
-			if is_stale {
-				// Skip this entry (it's stale)
-				values_skipped += 1;
-				stale_seq_nums.push(internal_key.seq_num());
-				stale_internal_keys.push(internal_key.clone());
-			} else {
-				// Add this entry to the batch to be rewritten with the correct operation type
-				// This preserves the original operation (Set, Delete, Merge, etc.)
-				// This will cause the value to be written to the active VLog file
-				// and a new pointer to be stored in the LSM
-
-				let size = internal_key.user_key.len() + value.len();
-				let val = if value.is_empty() {
-					None
-				} else {
-					Some(value.clone())
-				};
-
-				batch.add_record(
-					internal_key.kind(),
-					internal_key.user_key,
-					val,
-					internal_key.timestamp,
-				)?;
-
-				// Update batch size tracking
-				batch_size += size;
-
-				// If batch is full, commit it
-				if batch.count() >= MAX_BATCH_COUNT as u32 || batch_size >= MAX_BATCH_SIZE {
-					// Commit the batch to LSM (and VLog for large values)
-					commit_pipeline.commit(batch, true).await?;
-
-					// Reset batch
-					batch = Batch::default();
-					batch_size = 0;
-				}
-			}
-
-			offset += entry_size;
-		}
-
-		// Commit any remaining entries in the batch
-		if !batch.is_empty() {
-			commit_pipeline.commit(batch, true).await?;
-		}
-
-		// Clean up versioned index BEFORE cleaning delete list
-		// This ensures that when VLog entries are deleted, B+ tree entries are also
-		// cleaned up
-		if !stale_internal_keys.is_empty() {
-			if let Err(e) = self.cleanup_versioned_index_for_keys(&stale_internal_keys) {
-				log::error!("Failed to clean up versioned index during VLog GC: {e}");
-				return Err(e);
-			}
-		}
-
-		// Clean up delete list entries for merged stale data
-		if !stale_seq_nums.is_empty() {
-			if let Err(e) = self.delete_list.delete_entries_batch(stale_seq_nums) {
-				log::error!("Failed to clean up delete list after merge: {e}");
-				return Err(e);
-			}
-		}
-
-		// Only consider the file compacted if we skipped some values
-		if values_skipped > 0 {
-			// Schedule the old file for deletion
-			// The actual file will be deleted when there are no active iterators
-
-			// Update discard stats (file will be deleted, so reset stats)
-			{
-				let mut discard_stats = self.discard_stats.lock();
-				discard_stats.remove_file(file_id)?;
-			}
-
-			Ok(true)
-		} else {
-			// No stale data found, nothing to do
-			Ok(false)
-		}
-	}
-
 	/// Syncs all data to disk
 	pub(crate) fn sync(&self) -> Result<()> {
 		if let Some(ref mut writer) = *self.writer.write() {
 			writer.sync()?;
 		}
-
-		self.discard_stats.lock().sync()?;
-
 		Ok(())
 	}
 
@@ -1369,388 +988,14 @@ impl VLog {
 		Ok(())
 	}
 
-	/// Gets statistics for a specific file
-	fn get_file_stats(&self, file_id: u32) -> Result<(u64, u64, f64)> {
-		let discard_stats = self.discard_stats.lock();
-		let discard_bytes = discard_stats.get_file_stats(file_id)?;
-
-		// Get file size from filesystem
-		let file_path = self.vlog_file_path(file_id);
-		let total_size = if let Ok(metadata) = std::fs::metadata(file_path) {
-			metadata.len()
-		} else {
-			0
-		};
-
-		let discard_ratio = if total_size > 0 {
-			discard_bytes as f64 / total_size as f64
-		} else {
-			0.0
-		};
-
-		Ok((total_size, discard_bytes, discard_ratio))
-	}
-
 	/// Registers a VLog file in the files map for tracking
 	fn register_vlog_file(&self, file_id: u32, path: PathBuf, size: u64) {
 		let mut files_map = self.files_map.write();
 		files_map.insert(file_id, Arc::new(VLogFile::new(file_id, path, size)));
 	}
 
-	/// Cleans up any leftover temporary files from interrupted compactions
-	fn cleanup_temp_files(&self) -> Result<()> {
-		let entries = match std::fs::read_dir(&self.path) {
-			Ok(entries) => entries,
-			Err(_) => return Ok(()), // Directory doesn't exist yet
-		};
-
-		for entry in entries {
-			let entry = entry?;
-			let file_name = entry.file_name();
-			let file_name_str = file_name.to_string_lossy();
-
-			// Look for .tmp files that match our VLog pattern
-			if file_name_str.len() == 28 && file_name_str.ends_with(".log.tmp") {
-				let temp_path = entry.path();
-
-				// Try to remove the temporary file
-				if let Err(e) = std::fs::remove_file(&temp_path) {
-					log::warn!("Failed to cleanup temp file {temp_path:?}: {e}");
-				}
-			}
-		}
-
-		Ok(())
-	}
-
-	/// Updates discard statistics for a file
-	/// This should be called during LSM compaction when outdated VLog pointers
-	/// are found
-	pub(crate) fn update_discard_stats(&self, stats: &HashMap<u32, i64>) -> Result<()> {
-		let mut discard_stats = self.discard_stats.lock();
-
-		for (file_id, discard_bytes) in stats {
-			discard_stats.update(*file_id, *discard_bytes)?;
-		}
-
-		// Syncs discard statistics to disk
-		discard_stats.sync()?;
-
-		Ok(())
-	}
-
-	/// Adds multiple stale entries to the global delete list in a batch
-	pub(crate) fn add_batch_to_delete_list(&self, entries: Vec<(u64, u64)>) -> Result<()> {
-		if entries.is_empty() {
-			return Ok(());
-		}
-
-		// Call the synchronous method directly - no async needed
-		self.delete_list.add_stale_entries_batch(entries)
-	}
-
-	/// Gets statistics for all VLog files (for debugging)
-	#[allow(unused)]
-	pub(crate) fn get_all_file_stats(&self) -> Result<Vec<(u32, u64, u64, f64)>> {
-		let mut all_stats = Vec::new();
-
-		// Check files from 0 to next counter
-		let next_file_id = self.next_file_id.load(std::sync::atomic::Ordering::SeqCst);
-
-		for file_id in 0..next_file_id {
-			let (total_size, discard_bytes, discard_ratio) = self.get_file_stats(file_id)?;
-			if total_size > 0 {
-				// Only include files that exist
-				all_stats.push((file_id, total_size, discard_bytes, discard_ratio));
-			}
-		}
-
-		Ok(all_stats)
-	}
-
-	/// Checks if a sequence number is marked as stale in the delete list
-	/// This is primarily used for testing to verify delete list behavior
-	#[allow(unused)]
-	pub(crate) fn is_stale(&self, seq_num: u64) -> Result<bool> {
-		self.delete_list.is_stale(seq_num)
-	}
-
-	/// Cleans up deleted keys from the versioned index atomically during VLog
-	/// GC This ensures that when VLog entries are deleted, corresponding B+
-	/// tree entries are also cleaned up
-	fn cleanup_versioned_index_for_keys(&self, deleted_keys: &[InternalKey]) -> Result<()> {
-		if !self.opts.enable_versioning || deleted_keys.is_empty() {
-			return Ok(());
-		}
-
-		if let Some(ref versioned_index) = self.versioned_index {
-			// Take write lock and delete the specific versions
-			let mut write_index = versioned_index.write();
-			let mut total_deleted = 0;
-
-			for internal_key in deleted_keys {
-				// Encode the specific internal key to delete
-				let encoded_key = internal_key.encode();
-
-				if let Err(e) = write_index.delete(&encoded_key) {
-					log::error!(
-						"Failed to delete versioned key: user_key={:?}, seq_num={}, timestamp={}, kind={:?}, error={}",
-						internal_key.user_key, internal_key.seq_num(), internal_key.timestamp, internal_key.kind(), e
-					);
-					return Err(e.into());
-				} else {
-					total_deleted += 1;
-				}
-			}
-
-			if total_deleted > 0 {
-				log::info!("VLog GC: Cleaned up {} versioned index entries", total_deleted);
-			}
-		}
-
-		Ok(())
-	}
-
-	pub(crate) async fn close(&self) -> Result<()> {
+	pub(crate) fn close(&self) -> Result<()> {
 		self.sync()?;
-		self.delete_list.close().await?;
 		Ok(())
-	}
-}
-
-// ===== VLog GC Manager =====
-/// Manages VLog garbage collection as an independent task
-pub(crate) struct VLogGCManager {
-	/// Reference to the VLog
-	vlog: Arc<VLog>,
-
-	/// Reference to the commit pipeline for coordinating writes during GC
-	commit_pipeline: Arc<CommitPipeline>,
-
-	/// Background error handler for reporting GC errors
-	error_handler: Arc<crate::error::BackgroundErrorHandler>,
-
-	/// Flag to signal the GC task to stop
-	stop_flag: Arc<std::sync::atomic::AtomicBool>,
-
-	/// Flag indicating if GC is running
-	running: Arc<std::sync::atomic::AtomicBool>,
-
-	/// Notification for GC task
-	notify: Arc<tokio::sync::Notify>,
-
-	/// Task handle for cleanup
-	task_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
-}
-
-impl VLogGCManager {
-	/// Creates a new VLog GC manager
-	pub(crate) fn new(
-		vlog: Arc<VLog>,
-		commit_pipeline: Arc<CommitPipeline>,
-		error_handler: Arc<crate::error::BackgroundErrorHandler>,
-	) -> Self {
-		let stop_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-		let running = Arc::new(std::sync::atomic::AtomicBool::new(false));
-		let notify = Arc::new(tokio::sync::Notify::new());
-		let task_handle = Mutex::new(None);
-
-		Self {
-			vlog,
-			commit_pipeline,
-			error_handler,
-			stop_flag,
-			running,
-			notify,
-			task_handle,
-		}
-	}
-
-	/// Starts the VLog GC background task
-	pub(crate) fn start(&self) {
-		let vlog = Arc::clone(&self.vlog);
-		let commit_pipeline = Arc::clone(&self.commit_pipeline);
-		let error_handler = Arc::clone(&self.error_handler);
-		let stop_flag = Arc::clone(&self.stop_flag);
-		let notify = Arc::clone(&self.notify);
-		let running = Arc::clone(&self.running);
-
-		let handle = tokio::spawn(async move {
-			loop {
-				// Wait for notification OR timeout for periodic checks (every 5 minutes)
-				tokio::select! {
-					_ = notify.notified() => {},
-					_ = tokio::time::sleep(tokio::time::Duration::from_secs(300)) => {},
-				}
-
-				if stop_flag.load(Ordering::SeqCst) {
-					break;
-				}
-
-				running.store(true, Ordering::SeqCst);
-				if let Err(e) = vlog.garbage_collect(Arc::clone(&commit_pipeline)).await {
-					log::error!("Error in VLog GC: {e:?}");
-					error_handler.set_error(e, crate::error::BackgroundErrorReason::VLogGC);
-				}
-				running.store(false, Ordering::SeqCst);
-			}
-		});
-
-		*self.task_handle.lock() = Some(handle);
-	}
-
-	/// Stops the VLog GC background task
-	pub(crate) async fn stop(&self) -> Result<()> {
-		// Set the stop flag to prevent new operations from starting
-		self.stop_flag.store(true, Ordering::SeqCst);
-
-		// Wake up any waiting tasks so they can check the stop flag and exit
-		self.notify.notify_one();
-
-		// Wait for any in-progress GC to complete
-		while self.running.load(Ordering::Acquire) {
-			// Yield to other tasks and wait a short time before checking again
-			tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-		}
-
-		// Now it's safe to wait for the task to complete
-		// Get the handle outside the await to avoid holding the lock across await
-		let handle_opt = {
-			let mut lock = self.task_handle.lock();
-			lock.take()
-		};
-
-		if let Some(handle) = handle_opt {
-			if let Err(e) = handle.await {
-				log::error!("Error shutting down VLog GC task: {e:?}");
-				// Continue to close the VLog
-			}
-		}
-
-		// Close the VLog
-		if let Err(e) = self.vlog.close().await {
-			log::error!("Error closing VLog: {e:?}");
-			return Err(e);
-		}
-
-		Ok(())
-	}
-}
-
-/// Maximum number of entries per batch when adding to DeleteList.
-/// This ensures batches fit within memtable capacity.
-/// Each entry is ~16 bytes (8 byte key + 8 byte value) plus skiplist overhead (~50-80 bytes).
-/// With 10K entries, batch is ~1MB which safely fits in default 100MB memtable.
-const DELETE_LIST_CHUNK_SIZE: usize = 10_000;
-
-/// Global Delete List using a dedicated LSM tree.
-/// Uses a separate LSM tree for tracking stale sequence numbers.
-/// This provides better performance and consistency with the main LSM tree
-/// design.
-pub(crate) struct DeleteList {
-	/// LSM tree for storing delete list entries (seq_num -> value_size)
-	tree: Arc<Tree>,
-}
-
-impl DeleteList {
-	pub(crate) fn new(delete_list_dir: PathBuf) -> Result<Self> {
-		// Create a dedicated LSM tree for the delete list
-		let delete_list_opts = Options {
-			path: delete_list_dir,
-			// Disable VLog for the delete list to avoid circular dependency
-			enable_vlog: false,
-			..Default::default()
-		};
-
-		let delete_list_tree =
-			Arc::new(TreeBuilder::with_options(delete_list_opts).build().map_err(|e| {
-				Error::Other(format!("Failed to create global delete list LSM: {e}"))
-			})?);
-
-		Ok(Self {
-			tree: delete_list_tree,
-		})
-	}
-
-	/// Adds multiple stale entries in batch (synchronous)
-	/// This is called from CompactionIterator during LSM compaction
-	pub(crate) fn add_stale_entries_batch(&self, entries: Vec<(u64, u64)>) -> Result<()> {
-		if entries.is_empty() {
-			return Ok(());
-		}
-
-		// Process in chunks to avoid overwhelming memtable
-		for chunk in entries.chunks(DELETE_LIST_CHUNK_SIZE) {
-			let mut batch = Batch::new(0);
-
-			for (seq_num, value_size) in chunk {
-				// Convert sequence number to a byte array key
-				let seq_key = seq_num.to_be_bytes().to_vec();
-				// Store sequence number -> value_size mapping
-				batch.add_record(
-					InternalKeyKind::Set,
-					seq_key,
-					Some(value_size.to_be_bytes().to_vec()),
-					0,
-				)?;
-			}
-
-			// Commit the batch to the LSM tree using sync commit
-			self.tree
-				.sync_commit(batch, true)
-				.map_err(|e| Error::Other(format!("Failed to add stale entries: {e}")))?;
-		}
-
-		Ok(())
-	}
-
-	/// Checks if a sequence number is in the delete list (stale)
-	pub(crate) fn is_stale(&self, seq_num: u64) -> Result<bool> {
-		let tx = self
-			.tree
-			.begin_with_mode(crate::Mode::ReadOnly)
-			.map_err(|e| Error::Other(format!("Failed to begin transaction: {e}")))?;
-
-		// Convert sequence number to bytes for lookup
-		let seq_key = seq_num.to_be_bytes().to_vec();
-
-		match tx.get(&seq_key) {
-			Ok(Some(_)) => Ok(true),
-			Ok(None) => Ok(false),
-			Err(e) => Err(Error::Other(format!("Failed to search delete list: {e}"))),
-		}
-	}
-
-	/// Deletes multiple entries from the delete list in batch
-	/// This is called after successful compaction to clean up the delete list
-	pub(crate) fn delete_entries_batch(&self, seq_nums: Vec<u64>) -> Result<()> {
-		if seq_nums.is_empty() {
-			return Ok(());
-		}
-
-		// Process in chunks to avoid overwhelming memtable
-		for chunk in seq_nums.chunks(DELETE_LIST_CHUNK_SIZE) {
-			let mut batch = Batch::new(0);
-
-			for seq_num in chunk {
-				// Convert sequence number to key format
-				let seq_key = seq_num.to_be_bytes().to_vec();
-				batch.add_record(InternalKeyKind::Delete, seq_key, None, 0)?;
-			}
-
-			// Commit the batch to the LSM tree using sync commit
-			self.tree
-				.sync_commit(batch, true)
-				.map_err(|e| Error::Other(format!("Failed to delete from delete list: {e}")))?;
-		}
-
-		Ok(())
-	}
-
-	async fn close(&self) -> Result<()> {
-		// Close the delete list tree (uses Box::pin to avoid async recursion)
-		// The delete list has its own Tree with enable_vlog: false, so no actual
-		// infinite recursion
-		Box::pin(self.tree.close()).await
 	}
 }

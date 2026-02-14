@@ -209,10 +209,8 @@ fn create_compaction_options(
 	manifest: Arc<RwLock<LevelManifest>>,
 ) -> CompactionOptions {
 	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
-	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
-	let vlog = Arc::new(crate::vlog::VLog::new(Arc::clone(&opts), None).unwrap());
+	let vlog = Arc::new(crate::vlog::VLog::new(Arc::clone(&opts)).unwrap());
 
 	CompactionOptions {
 		lopts: opts,
@@ -221,6 +219,7 @@ fn create_compaction_options(
 		vlog: Some(vlog),
 		error_handler: Arc::new(BackgroundErrorHandler::new()),
 		snapshot_tracker: SnapshotTracker::new(),
+		versioned_index: None,
 	}
 }
 
@@ -1900,7 +1899,6 @@ fn test_tombstone_propagation_journey() {
 		iterators,
 		create_comparator(),
 		false,
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -1923,7 +1921,6 @@ fn test_tombstone_propagation_journey() {
 		iterators,
 		create_comparator(),
 		true,
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -1991,7 +1988,7 @@ fn test_table_properties_population() {
 	assert_eq!(props.num_deletions, expected_deletions);
 	assert_eq!(props.tombstone_count, expected_tombstones);
 	assert_eq!(props.data_size, 2975);
-	assert_eq!(props.global_seq_num, 0);
+	assert_eq!(props.oldest_vlog_file_id, 0);
 	assert_eq!(props.num_data_blocks, 1);
 
 	assert_eq!(props.index_size, 74, "Index size should be tracked");

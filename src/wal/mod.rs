@@ -429,7 +429,7 @@ impl SegmentRef {
 			}
 		}
 
-		segment_refs.sort_by(|a, b| a.id.cmp(&b.id));
+		segment_refs.sort_by_key(|a| a.id);
 		Ok(segment_refs)
 	}
 }

@@ -2,10 +2,13 @@
 //!
 //! Add this to src/test/level_range_tests.rs and include in src/test/mod.rs
 
+use std::collections::HashSet;
 use std::ops::Bound;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use crate::levels::Level;
+use crate::levels::{Level, LevelManifest, Levels, MANIFEST_FORMAT_VERSION_V1};
 use crate::sstable::table::{Table, TableWriter};
 use crate::{
 	InternalKey,
@@ -482,4 +485,165 @@ fn single_table_level() {
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
 	assert_eq!(start, end);
+}
+
+// ============================================================================
+// TESTS FOR min_oldest_vlog_file_id
+// ============================================================================
+
+/// Creates a test table with a specific oldest_vlog_file_id
+fn create_test_table_with_vlog_id(
+	id: u64,
+	keys: &[&str],
+	opts: Arc<Options>,
+	vlog_file_id: u64,
+) -> Arc<Table> {
+	let mut buf = Vec::new();
+	let mut writer = TableWriter::new(&mut buf, id, Arc::clone(&opts), 0);
+
+	for (i, key) in keys.iter().enumerate() {
+		let ikey =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+		writer.add(ikey, b"value").unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+
+	let file: Arc<dyn crate::vfs::File> = Arc::new(buf);
+	let mut table = Table::new(id, opts, file, size as u64).unwrap();
+	table.meta.properties.oldest_vlog_file_id = vlog_file_id;
+	Arc::new(table)
+}
+
+/// Creates a LevelManifest from a list of levels without disk I/O
+fn create_test_manifest(levels: Vec<Level>) -> LevelManifest {
+	let levels = Levels(levels.into_iter().map(|l| Arc::new(l)).collect());
+	LevelManifest {
+		path: PathBuf::new(),
+		levels,
+		hidden_set: HashSet::new(),
+		next_table_id: Arc::new(AtomicU64::new(1)),
+		manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
+		snapshots: Vec::new(),
+		log_number: 0,
+		last_sequence: 0,
+	}
+}
+
+mod min_oldest_vlog_file_id_tests {
+	use super::*;
+
+	#[test]
+	fn empty_manifest_returns_zero() {
+		let manifest = create_test_manifest(vec![Level::default()]);
+		assert_eq!(manifest.min_oldest_vlog_file_id(), 0);
+	}
+
+	#[test]
+	fn all_tables_have_zero_vlog_id() {
+		let opts = Arc::new(Options::default());
+		// Tables with default vlog_file_id = 0 (no vlog references)
+		let level = Level {
+			tables: vec![
+				create_test_table_with_vlog_id(1, &["a", "b"], Arc::clone(&opts), 0),
+				create_test_table_with_vlog_id(2, &["c", "d"], Arc::clone(&opts), 0),
+			],
+		};
+		let manifest = create_test_manifest(vec![level]);
+		assert_eq!(manifest.min_oldest_vlog_file_id(), 0);
+	}
+
+	#[test]
+	fn single_table_with_vlog_id() {
+		let opts = Arc::new(Options::default());
+		let level = Level {
+			tables: vec![create_test_table_with_vlog_id(1, &["a", "b"], Arc::clone(&opts), 5)],
+		};
+		let manifest = create_test_manifest(vec![level]);
+		assert_eq!(manifest.min_oldest_vlog_file_id(), 5);
+	}
+
+	#[test]
+	fn returns_minimum_across_tables() {
+		let opts = Arc::new(Options::default());
+		let level = Level {
+			tables: vec![
+				create_test_table_with_vlog_id(1, &["a", "b"], Arc::clone(&opts), 10),
+				create_test_table_with_vlog_id(2, &["c", "d"], Arc::clone(&opts), 3),
+				create_test_table_with_vlog_id(3, &["e", "f"], Arc::clone(&opts), 7),
+			],
+		};
+		let manifest = create_test_manifest(vec![level]);
+		assert_eq!(manifest.min_oldest_vlog_file_id(), 3);
+	}
+
+	#[test]
+	fn ignores_zero_vlog_ids() {
+		let opts = Arc::new(Options::default());
+		// Mix of zero and non-zero vlog_file_ids
+		let level = Level {
+			tables: vec![
+				create_test_table_with_vlog_id(1, &["a", "b"], Arc::clone(&opts), 0),
+				create_test_table_with_vlog_id(2, &["c", "d"], Arc::clone(&opts), 5),
+				create_test_table_with_vlog_id(3, &["e", "f"], Arc::clone(&opts), 0),
+				create_test_table_with_vlog_id(4, &["g", "h"], Arc::clone(&opts), 2),
+			],
+		};
+		let manifest = create_test_manifest(vec![level]);
+		assert_eq!(manifest.min_oldest_vlog_file_id(), 2);
+	}
+
+	#[test]
+	fn tables_across_multiple_levels() {
+		let opts = Arc::new(Options::default());
+		let level0 = Level {
+			tables: vec![
+				create_test_table_with_vlog_id(1, &["a", "b"], Arc::clone(&opts), 10),
+				create_test_table_with_vlog_id(2, &["c", "d"], Arc::clone(&opts), 8),
+			],
+		};
+		let level1 = Level {
+			tables: vec![
+				create_test_table_with_vlog_id(3, &["e", "f"], Arc::clone(&opts), 15),
+				create_test_table_with_vlog_id(4, &["g", "h"], Arc::clone(&opts), 4),
+			],
+		};
+		let manifest = create_test_manifest(vec![level0, level1]);
+		// Minimum across all levels: 4
+		assert_eq!(manifest.min_oldest_vlog_file_id(), 4);
+	}
+
+	#[test]
+	fn all_tables_same_nonzero_vlog_id() {
+		let opts = Arc::new(Options::default());
+		let level = Level {
+			tables: vec![
+				create_test_table_with_vlog_id(1, &["a", "b"], Arc::clone(&opts), 42),
+				create_test_table_with_vlog_id(2, &["c", "d"], Arc::clone(&opts), 42),
+				create_test_table_with_vlog_id(3, &["e", "f"], Arc::clone(&opts), 42),
+			],
+		};
+		let manifest = create_test_manifest(vec![level]);
+		assert_eq!(manifest.min_oldest_vlog_file_id(), 42);
+	}
+
+	#[test]
+	fn tables_unordered() {
+		let opts = Arc::new(Options::default());
+		let level0 = Level {
+			tables: vec![
+				create_test_table_with_vlog_id(1, &["a", "b"], Arc::clone(&opts), 8),
+				create_test_table_with_vlog_id(2, &["c", "d"], Arc::clone(&opts), 10),
+			],
+		};
+		let level1 = Level {
+			tables: vec![
+				create_test_table_with_vlog_id(3, &["e", "f"], Arc::clone(&opts), 4),
+				create_test_table_with_vlog_id(4, &["g", "h"], Arc::clone(&opts), 15),
+			],
+		};
+		let manifest = create_test_manifest(vec![level0, level1]);
+		// Minimum across all levels: 4
+		assert_eq!(manifest.min_oldest_vlog_file_id(), 4);
+	}
 }

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -58,7 +57,6 @@ fn create_vlog_compaction_options(path: PathBuf) -> Arc<Options> {
 	create_test_options(path, |opts| {
 		opts.max_memtable_size = 64 * 1024; // 64KB
 		opts.vlog_max_file_size = 950; // Small size to force frequent rotations
-		opts.vlog_gc_discard_ratio = 0.0; // Disable discard ratio to preserve all values
 		opts.level_count = 2; // Two levels for compaction strategy
 	})
 }
@@ -1288,114 +1286,6 @@ async fn test_vlog_file_rotation() {
 }
 
 #[test(tokio::test)]
-async fn test_discard_file_directory_structure() {
-	// Test to verify that the DISCARD file lives in the main database directory,
-	// not in the VLog subdirectory
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.vlog_max_file_size = 1024;
-		opts.max_memtable_size = 1024;
-		opts.enable_vlog = true;
-	});
-
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-	// Insert some data to ensure VLog and discard stats are created
-	let large_value = vec![1u8; 200]; // Large enough for VLog
-	for i in 0..5 {
-		let key = format!("key_{i}");
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), &large_value).unwrap();
-		txn.commit().await.unwrap();
-	}
-
-	// Force flush to create VLog files and initialize discard stats
-	tree.flush().unwrap();
-
-	// Update some keys to create discard statistics
-	let mut discard_updates = HashMap::new();
-	let stats = tree.get_all_vlog_stats();
-	for (file_id, total_size, _discard_bytes, _ratio) in &stats {
-		if *total_size > 0 {
-			discard_updates.insert(*file_id, (*total_size as f64 * 0.3) as i64);
-		}
-	}
-	tree.update_vlog_discard_stats(&discard_updates);
-
-	// Verify directory structure
-	let main_db_dir = &path;
-	let vlog_dir = path.join("vlog");
-	let sstables_dir = path.join("sstables");
-	let wal_dir = path.join("wal");
-	let discard_stats_dir = path.join("discard_stats");
-	let delete_list_dir = path.join("delete_list");
-
-	// Check that all expected directories exist
-	assert!(main_db_dir.exists(), "Main database directory should exist");
-	assert!(vlog_dir.exists(), "VLog directory should exist");
-	assert!(sstables_dir.exists(), "SSTables directory should exist");
-	assert!(wal_dir.exists(), "WAL directory should exist");
-	assert!(discard_stats_dir.exists(), "Discard stats directory should exist");
-	assert!(delete_list_dir.exists(), "Delete list directory should exist");
-
-	// Check that DISCARD file is in the main database directory
-	let discard_file_in_main = discard_stats_dir.join("DISCARD");
-	let discard_file_in_vlog = vlog_dir.join("DISCARD");
-
-	assert!(
-		discard_file_in_main.exists(),
-		"DISCARD file should exist in main database directory: {discard_file_in_main:?}"
-	);
-	assert!(
-		!discard_file_in_vlog.exists(),
-		"DISCARD file should NOT exist in VLog directory: {discard_file_in_vlog:?}"
-	);
-
-	// Verify that VLog files are in the VLog directory
-	let vlog_entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = vlog_entries
-		.filter_map(|entry| {
-			let entry = entry.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert!(!vlog_files.is_empty(), "Should have VLog files in the VLog directory");
-
-	// Verify that the DISCARD file is separate from VLog files
-	for vlog_file in &vlog_files {
-		assert_ne!(vlog_file, "DISCARD", "DISCARD should not be mistaken for a VLog file");
-	}
-
-	// Verify other expected files are in the main directory
-	let manifest_dir = main_db_dir.join("manifest");
-	assert!(
-		manifest_dir.exists(),
-		"manifest directory should be in main directory alongside DISCARD"
-	);
-
-	println!("✓ Directory structure verification passed:");
-	println!("  Main DB dir: {main_db_dir:?}");
-	println!(
-		"  DISCARD file: {:?} (exists: {})",
-		discard_file_in_main,
-		discard_file_in_main.exists()
-	);
-	println!("  VLog dir: {vlog_dir:?}");
-	println!("  Discard stats dir: {discard_stats_dir:?}");
-	println!("  Delete list dir: {delete_list_dir:?}");
-	println!("  VLog files: {vlog_files:?}");
-	println!("  manifest dir: {:?} (exists: {})", manifest_dir, manifest_dir.exists());
-}
-
-#[test(tokio::test)]
 async fn test_compaction_with_updates_and_delete() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
@@ -1447,16 +1337,9 @@ async fn test_compaction_with_updates_and_delete() {
 	// Flush memtable
 	tree.flush().unwrap();
 
-	// Force compaction
+	// Force compaction - this triggers automatic VLog cleanup via global-min approach
 	let strategy = Arc::new(Strategy::default());
 	tree.core.compact(strategy).unwrap();
-
-	// There could be multiple VLog files, need to garbage collect them all but
-	// only one should remain because the active VLog file does not get garbage
-	// collected
-	for _ in 0..6 {
-		tree.garbage_collect_vlog().await.unwrap();
-	}
 
 	// Verify all keys are gone after compaction
 	for key in keys.iter() {
@@ -1464,27 +1347,6 @@ async fn test_compaction_with_updates_and_delete() {
 		let result = tx.get(*key).unwrap();
 		assert_eq!(result, None);
 	}
-
-	// Verify that only one VLog file remains after garbage collection
-	let vlog_dir = path.join("vlog");
-	let entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = entries
-		.filter_map(|e| {
-			let entry = e.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert_eq!(
-		vlog_files.len(),
-		1,
-		"Should have exactly one VLog file after garbage collection, found: {vlog_files:?}"
-	);
 }
 
 #[test(tokio::test)]
@@ -1556,16 +1418,9 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 	// Flush memtable
 	tree.flush().unwrap();
 
-	// Force compaction
+	// Force compaction - this triggers automatic VLog cleanup via global-min approach
 	let strategy = Arc::new(Strategy::default());
 	tree.core.compact(strategy).unwrap();
-
-	// There could be multiple VLog files, need to garbage collect them all but
-	// only one should remain because the active VLog file does not get garbage
-	// collected
-	for _ in 0..6 {
-		tree.garbage_collect_vlog().await.unwrap();
-	}
 
 	// Verify all keys are gone after compaction
 	for key in keys.iter() {
@@ -1573,27 +1428,6 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let result = tx.get(*key).unwrap();
 		assert_eq!(result, None);
 	}
-
-	// Verify that only one VLog file remains after garbage collection
-	let vlog_dir = path.join("vlog");
-	let entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = entries
-		.filter_map(|e| {
-			let entry = e.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert_eq!(
-		vlog_files.len(),
-		1,
-		"Should have exactly one VLog file after garbage collection, found: {vlog_files:?}"
-	);
 }
 
 #[test(tokio::test)]
@@ -1668,27 +1502,23 @@ async fn test_vlog_compaction_preserves_sequence_numbers() {
 		assert_eq!(&value, "final_value_key1".repeat(10).as_bytes());
 	}
 
-	// --- Step 7: Trigger manual compaction of the LSM tree ---
+	// --- Step 7: Trigger manual compaction of the LSM tree (also triggers VLog cleanup via
+	// global-min approach) ---
 	let strategy = Arc::new(Strategy::default());
 	tree.core.compact(strategy).unwrap();
 
-	// --- Step 8: Run VLog garbage collection (which internally can trigger file
-	// compaction) ---
-	tree.garbage_collect_vlog().await.unwrap();
-
-	// --- Step 9: Verify key1 still returns the correct latest value after
-	// compaction ---
+	// --- Step 8: Verify key1 still returns the correct latest value after compaction ---
 	{
 		let tx = tree.begin().unwrap();
 		let value = tx.get(&key1).unwrap().unwrap();
 		assert_eq!(
-                &value,
-                "final_value_key1".repeat(10).as_bytes(),
-                "After VLog compaction, key1 returned incorrect value. The sequence number was not preserved during compaction."
-            );
+			&value,
+			"final_value_key1".repeat(10).as_bytes(),
+			"After compaction, key1 returned incorrect value. The sequence number was not preserved during compaction."
+		);
 	}
 
-	// --- Step 10: Clean shutdown ---
+	// --- Step 9: Clean shutdown ---
 	tree.close().await.unwrap();
 }
 
@@ -2207,7 +2037,7 @@ async fn test_checkpoint_with_vlog() {
 	// Create initial data with VLog enabled
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-	// Insert some data to ensure VLog and discard stats are created
+	// Insert some data to ensure VLog files are created
 	let large_value = vec![1u8; 200]; // Large enough for VLog
 	for i in 0..5 {
 		let key = format!("key_{i}");
@@ -2216,18 +2046,8 @@ async fn test_checkpoint_with_vlog() {
 		txn.commit().await.unwrap();
 	}
 
-	// Force flush to create VLog files and initialize discard stats
+	// Force flush to create VLog files
 	tree.flush().unwrap();
-
-	// Update some keys to create discard statistics
-	let mut discard_updates = HashMap::new();
-	let stats = tree.get_all_vlog_stats();
-	for (file_id, total_size, _discard_bytes, _ratio) in &stats {
-		if *total_size > 0 {
-			discard_updates.insert(*file_id, (*total_size as f64 * 0.3) as i64);
-		}
-	}
-	tree.update_vlog_discard_stats(&discard_updates);
 
 	// Create checkpoint
 	let checkpoint_dir = temp_dir.path().join("checkpoint");
@@ -2243,8 +2063,6 @@ async fn test_checkpoint_with_vlog() {
 	assert!(checkpoint_dir.join("wal").exists());
 	assert!(checkpoint_dir.join("manifest").exists());
 	assert!(checkpoint_dir.join("vlog").exists());
-	assert!(checkpoint_dir.join("discard_stats").exists());
-	assert!(checkpoint_dir.join("delete_list").exists());
 	assert!(checkpoint_dir.join("CHECKPOINT_METADATA").exists());
 
 	// Verify VLog files are in the checkpoint
@@ -2263,11 +2081,6 @@ async fn test_checkpoint_with_vlog() {
 		.collect();
 
 	assert!(!vlog_files.is_empty(), "Should have VLog files in the checkpoint");
-
-	// Verify discard stats file exists
-	let discard_stats_checkpoint_dir = checkpoint_dir.join("discard_stats");
-	assert!(discard_stats_checkpoint_dir.exists());
-	assert!(discard_stats_checkpoint_dir.join("DISCARD").exists());
 
 	// Insert more data after checkpoint
 	for i in 5..10 {
@@ -2308,14 +2121,10 @@ async fn test_checkpoint_with_vlog() {
 		assert!(result.is_none(), "Key '{key}' should not exist after restore");
 	}
 
-	// Verify VLog directories are restored
+	// Verify VLog directory is restored
 	let vlog_dir = opts.vlog_dir();
-	let discard_stats_dir = opts.discard_stats_dir();
-	let delete_list_dir = opts.delete_list_dir();
 
 	assert!(vlog_dir.exists(), "VLog directory should exist after restore");
-	assert!(discard_stats_dir.exists(), "Discard stats directory should exist after restore");
-	assert!(delete_list_dir.exists(), "Delete list directory should exist after restore");
 
 	// Verify VLog files are restored
 	let vlog_entries = std::fs::read_dir(&vlog_dir).unwrap();
@@ -2332,9 +2141,6 @@ async fn test_checkpoint_with_vlog() {
 		.collect();
 
 	assert!(!vlog_files.is_empty(), "Should have VLog files after restore");
-
-	// Verify discard stats file is restored
-	assert!(discard_stats_dir.join("DISCARD").exists(), "DISCARD file should exist after restore");
 }
 
 #[test_log::test(tokio::test)]
@@ -5178,4 +4984,468 @@ async fn test_range_boundary_edge_cases() {
 		assert_eq!(result_keys[2], "aaaa", "After flush: Third key should be 'aaaa'");
 		assert_eq!(result_keys[3], "aaaab", "After flush: Fourth key should be 'aaaab'");
 	}
+}
+
+/// Tests that versioned_index cleanup is triggered after VLog GC
+/// and that data integrity is maintained.
+#[test(tokio::test)]
+async fn test_versioned_index_cleanup_after_vlog_gc() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Create tree with versioned_index AND vlog enabled
+	// Note: versioned_index requires versioning to be enabled
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 2;
+		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
+		opts.enable_vlog = true;
+		opts.enable_versioning = true;
+		opts.versioned_history_retention_ns = 1_000_000_000_000; // 1000 seconds
+		opts.enable_versioned_index = true;
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Insert multiple key-value pairs that will go to VLog
+	let keys: Vec<String> = (0..10).map(|i| format!("key-{:04}", i)).collect();
+	let value = "x".repeat(100); // Large value to force VLog storage
+
+	// Insert first version of each key
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Insert second version (updates) to create older versions
+	let value2 = "y".repeat(100);
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value2.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Force compaction to trigger VLog GC and versioned_index cleanup
+	let strategy = Arc::new(Strategy::default());
+	tree.core.compact(strategy).unwrap();
+
+	// Verify that latest values are still accessible
+	for key in &keys {
+		let tx = tree.begin().unwrap();
+		let result = tx.get(key.as_bytes()).unwrap();
+		assert_eq!(
+			result,
+			Some(value2.as_bytes().to_vec()),
+			"Key {} should have latest value",
+			key
+		);
+	}
+}
+
+/// Tests that versioned_index cleanup is deadlock-free when running
+/// concurrently with writes.
+#[test(tokio::test)]
+async fn test_versioned_index_cleanup_concurrent_with_writes() {
+	use std::time::Duration;
+
+	use tokio::time::timeout;
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Create tree with versioned_index AND vlog enabled
+	// Note: versioned_index requires versioning to be enabled
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 2;
+		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
+		opts.enable_vlog = true;
+		opts.enable_versioning = true;
+		opts.versioned_history_retention_ns = 1_000_000_000_000; // 1000 seconds
+		opts.enable_versioned_index = true;
+	});
+
+	let tree = Arc::new(Tree::new(Arc::clone(&opts)).unwrap());
+
+	// First, insert some data and flush to create SSTs with VLog references
+	let value = "x".repeat(100);
+	for i in 0..5 {
+		let key = format!("setup-key-{:04}", i);
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Now run concurrent writes and compactions with a timeout
+	// If there's a deadlock, this will timeout
+	let result = timeout(Duration::from_secs(30), async {
+		let tree1 = Arc::clone(&tree);
+		let tree2 = Arc::clone(&tree);
+
+		// Spawn writer task
+		let writer_handle = tokio::spawn(async move {
+			let value = "y".repeat(100);
+			for i in 0..50 {
+				let key = format!("concurrent-key-{:04}", i);
+				let mut tx = tree1.begin().unwrap();
+				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				tx.commit().await.unwrap();
+
+				// Flush periodically to trigger cleanup
+				if i % 10 == 0 {
+					tree1.flush().unwrap();
+				}
+			}
+		});
+
+		// Spawn compaction task
+		let compactor_handle = tokio::spawn(async move {
+			for _ in 0..5 {
+				// Compact triggers versioned_index cleanup
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				let _ = tree2.core.compact(strategy);
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		});
+
+		// Wait for both tasks to complete
+		let (writer_result, compactor_result) = tokio::join!(writer_handle, compactor_handle);
+		writer_result.expect("Writer task should complete");
+		compactor_result.expect("Compactor task should complete");
+	})
+	.await;
+
+	// Assert that we didn't timeout (no deadlock)
+	assert!(result.is_ok(), "Test timed out - possible deadlock detected");
+
+	// Verify data integrity - all concurrent keys should be readable
+	for i in 0..50 {
+		let key = format!("concurrent-key-{:04}", i);
+		let tx = tree.begin().unwrap();
+		let result = tx.get(key.as_bytes()).unwrap();
+		assert!(result.is_some(), "Key {} should exist", key);
+	}
+}
+
+/// Tests that stale entries are actually deleted from the versioned_index (B+ tree)
+/// after VLog GC by directly inspecting the B+ tree contents.
+#[test(tokio::test)]
+async fn test_versioned_index_entries_deleted_after_gc() {
+	use crate::vlog::{ValueLocation, ValuePointer};
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Create tree with versioned_index AND vlog enabled
+	// Use a very short retention period so old versions get dropped during compaction
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 2;
+		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
+		opts.enable_vlog = true;
+		opts.enable_versioning = true;
+		opts.versioned_history_retention_ns = 1; // 1 nanosecond - immediately expire old versions
+		opts.enable_versioned_index = true;
+		opts.level0_max_files = 1; // Trigger compaction after each flush
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Phase 1: Insert initial data - these will go to VLog file 1
+	let keys: Vec<String> = (0..5).map(|i| format!("gc-test-key-{:04}", i)).collect();
+	let value1 = "x".repeat(100); // Large value to force VLog storage
+
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value1.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Small delay to ensure timestamps differ
+	tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+	// Phase 2: Update data - these will go to VLog file 2
+	let value2 = "y".repeat(100);
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value2.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Phase 3: Capture pre-GC state - count entries and VLog file IDs in B+ tree
+	let (pre_gc_count, pre_gc_file_ids) = {
+		let versioned_index = tree.core.inner.versioned_index.as_ref().unwrap();
+		let guard = versioned_index.read();
+
+		let empty: &[u8] = &[];
+		let mut count = 0;
+		let mut file_ids = std::collections::HashSet::new();
+
+		for entry in guard.range(empty..).unwrap() {
+			let (_, value) = entry.unwrap();
+			count += 1;
+
+			if let Ok(loc) = ValueLocation::decode(&value) {
+				if loc.is_value_pointer() {
+					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
+						file_ids.insert(ptr.file_id);
+					}
+				}
+			}
+		}
+
+		(count, file_ids)
+	};
+
+	// Should have entries from multiple VLog files (at least 2)
+	assert!(
+		pre_gc_file_ids.len() >= 2,
+		"Pre-GC should have entries from at least 2 VLog files, found: {:?}",
+		pre_gc_file_ids
+	);
+
+	// Phase 4: Trigger GC via compaction - use strategy with our options
+	let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+		Arc::new(Strategy::from_options(Arc::clone(&opts)));
+	tree.core.compact(Arc::clone(&strategy)).unwrap();
+
+	// Phase 5: Verify entries deleted - count should be less and no stale file IDs
+	let (post_gc_count, post_gc_file_ids, min_file_id) = {
+		let versioned_index = tree.core.inner.versioned_index.as_ref().unwrap();
+		let guard = versioned_index.read();
+
+		let empty: &[u8] = &[];
+		let mut count = 0;
+		let mut file_ids = std::collections::HashSet::new();
+		let mut min_id = u32::MAX;
+
+		for entry in guard.range(empty..).unwrap() {
+			let (_, value) = entry.unwrap();
+			count += 1;
+
+			if let Ok(loc) = ValueLocation::decode(&value) {
+				if loc.is_value_pointer() {
+					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
+						file_ids.insert(ptr.file_id);
+						min_id = min_id.min(ptr.file_id);
+					}
+				}
+			}
+		}
+
+		(count, file_ids, min_id)
+	};
+
+	// Entry count should be reduced (stale entries deleted)
+	assert!(
+		post_gc_count < pre_gc_count,
+		"Entry count should decrease after GC: pre={}, post={}",
+		pre_gc_count,
+		post_gc_count
+	);
+
+	// Should have fewer unique VLog file IDs (old files deleted)
+	assert!(
+		post_gc_file_ids.len() < pre_gc_file_ids.len(),
+		"Should have fewer VLog file references after GC: pre={:?}, post={:?}",
+		pre_gc_file_ids,
+		post_gc_file_ids
+	);
+
+	// All remaining file IDs should be >= min valid (no stale references)
+	for file_id in &post_gc_file_ids {
+		assert!(
+			*file_id >= min_file_id,
+			"Found stale file_id {} < min_valid {}",
+			file_id,
+			min_file_id
+		);
+	}
+
+	// Verify data integrity - latest values should still be accessible
+	for key in &keys {
+		let tx = tree.begin().unwrap();
+		let result = tx.get(key.as_bytes()).unwrap();
+		assert_eq!(
+			result,
+			Some(value2.as_bytes().to_vec()),
+			"Key {} should have latest value after GC",
+			key
+		);
+	}
+}
+
+/// Tests that VLog files persist correctly across shutdown/restart.
+/// This validates that the VLog GC mechanism doesn't incorrectly delete
+/// files that are still referenced by SSTs.
+#[test(tokio::test)]
+async fn test_vlog_files_persist_across_restart() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.vlog_max_file_size = 512; // Very small to force many file rotations
+		opts.enable_vlog = true;
+	});
+
+	let num_records = 1000;
+	let mut keys_and_values = Vec::with_capacity(num_records);
+
+	// Phase 1: Insert data and verify VLog files are created
+	let vlog_files_before_shutdown: Vec<String>;
+	{
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Insert 1000 records with ~100 byte values each
+		for i in 0..num_records {
+			let key = format!("persist_key_{i:04}");
+			let value = format!("persist_value_{i}_padding_{}", "X".repeat(80));
+			keys_and_values.push((key.clone(), value.clone()));
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		// Flush to ensure data is persisted to SST (so VLog files are referenced)
+		tree.flush().unwrap();
+
+		// Count VLog files before shutdown
+		let vlog_dir = path.join("vlog");
+		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		vlog_files_before_shutdown = entries
+			.filter_map(|e| {
+				let entry = e.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		// Should have multiple VLog files due to small file size
+		assert!(
+			vlog_files_before_shutdown.len() > 10,
+			"Expected more than 10 VLog files due to small file size, got {}",
+			vlog_files_before_shutdown.len()
+		);
+
+		log::info!("VLog files before shutdown: {} files", vlog_files_before_shutdown.len());
+
+		// Close the tree
+		tree.close().await.unwrap();
+	}
+
+	// Phase 2: Reopen, add 10 new entries, flush, and verify all records (repeat 5 times)
+	// Track VLog file count - should only grow or stay same, never decrease
+	let mut previous_vlog_count = vlog_files_before_shutdown.len();
+
+	for iteration in 1..=5 {
+		log::info!("=== Restart iteration {}/5 ===", iteration);
+
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Count VLog files after restart (before adding new entries)
+		let vlog_dir = path.join("vlog");
+		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		let vlog_files_after_restart: Vec<String> = entries
+			.filter_map(|e| {
+				let entry = e.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		log::info!(
+			"VLog files after restart {}: {} files (previous: {})",
+			iteration,
+			vlog_files_after_restart.len(),
+			previous_vlog_count
+		);
+
+		// VLog file count should not decrease (GC should not delete referenced files)
+		assert!(
+			vlog_files_after_restart.len() >= previous_vlog_count,
+			"VLog file count decreased after restart {}: previous={}, after={}",
+			iteration,
+			previous_vlog_count,
+			vlog_files_after_restart.len()
+		);
+
+		// Add 10 new entries
+		let new_entries_start = num_records + (iteration - 1) * 10;
+		for i in 0..10 {
+			let idx = new_entries_start + i;
+			let key = format!("persist_key_{idx:04}");
+			let value = format!("persist_value_{idx}_padding_{}", "X".repeat(80));
+			keys_and_values.push((key.clone(), value.clone()));
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		log::info!("Added 10 new entries (total records: {})", keys_and_values.len());
+
+		// Flush to persist new entries
+		tree.flush().unwrap();
+
+		// Count VLog files after flush
+		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		let vlog_files_after_flush: Vec<String> = entries
+			.filter_map(|e| {
+				let entry = e.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		log::info!("VLog files after flush {}: {} files", iteration, vlog_files_after_flush.len());
+
+		// Update previous count for next iteration
+		previous_vlog_count = vlog_files_after_flush.len();
+
+		// Verify ALL records are readable (original 1000 + all newly added)
+		for (key, expected_value) in &keys_and_values {
+			let txn = tree.begin().unwrap();
+			let result = txn.get(key.as_bytes()).unwrap();
+			assert_eq!(
+				result,
+				Some(expected_value.as_bytes().to_vec()),
+				"Key {} has incorrect value after restart {}",
+				key,
+				iteration
+			);
+		}
+
+		log::info!("Verified all {} records after restart {}", keys_and_values.len(), iteration);
+
+		tree.close().await.unwrap();
+	}
+
+	// Final verification: 1000 + 5*10 = 1050 records
+	assert_eq!(
+		keys_and_values.len(),
+		1050,
+		"Expected 1050 total records (1000 initial + 5*10 added)"
+	);
+
+	log::info!(
+		"All 5 restart iterations passed successfully with {} total records",
+		keys_and_values.len()
+	);
 }

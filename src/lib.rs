@@ -7,7 +7,6 @@ mod commit;
 mod compaction;
 mod comparator;
 mod compression;
-mod discard;
 mod error;
 mod iter;
 mod levels;
@@ -172,9 +171,6 @@ pub struct Options {
 	pub vlog_checksum_verification: VLogChecksumLevel,
 	/// If true, disables `VLog` creation entirely
 	pub enable_vlog: bool,
-	/// Discard ratio threshold for triggering `VLog` garbage collection (0.0 -
-	/// 1.0) Default: 0.5 (50% discardable data triggers GC)
-	pub vlog_gc_discard_ratio: f64,
 	/// If value size is less than this, it will be stored inline in `SSTable`
 	pub vlog_value_threshold: usize,
 
@@ -241,7 +237,6 @@ impl Default for Options {
 			vlog_max_file_size: 256 * 1024 * 1024, // 256MB
 			vlog_checksum_verification: VLogChecksumLevel::Disabled,
 			enable_vlog: false,
-			vlog_gc_discard_ratio: 0.5, // 50% default
 			vlog_value_threshold: 1024, // 1KB default
 			enable_versioning: false,
 			enable_versioned_index: false,
@@ -380,17 +375,6 @@ impl Options {
 		self
 	}
 
-	/// Sets the `VLog` garbage collection discard ratio.
-	///
-	/// # Panics
-	///
-	/// Panics if the value is not between 0.0 and 1.0 (inclusive).
-	pub fn with_vlog_gc_discard_ratio(mut self, value: f64) -> Self {
-		assert!((0.0..=1.0).contains(&value), "VLog GC discard ratio must be between 0.0 and 1.0");
-		self.vlog_gc_discard_ratio = value;
-		self
-	}
-
 	/// Sets the VLog value threshold in bytes.
 	///
 	/// Values smaller than this threshold are stored inline in SSTables.
@@ -512,16 +496,6 @@ impl Options {
 		self.path.join("manifest")
 	}
 
-	/// Returns the directory path for discard stats files
-	pub(crate) fn discard_stats_dir(&self) -> PathBuf {
-		self.path.join("discard_stats")
-	}
-
-	/// Returns the directory path for delete list files
-	pub(crate) fn delete_list_dir(&self) -> PathBuf {
-		self.path.join("delete_list")
-	}
-
 	/// Returns the directory path for versioned index files
 	pub(crate) fn versioned_index_dir(&self) -> PathBuf {
 		self.path.join("versioned_index")
@@ -553,13 +527,6 @@ impl Options {
 	/// This should be called when the store starts to catch configuration
 	/// errors early
 	pub fn validate(&self) -> Result<()> {
-		// Validate VLog GC discard ratio
-		if !(0.0..=1.0).contains(&self.vlog_gc_discard_ratio) {
-			return Err(Error::InvalidArgument(
-				"VLog GC discard ratio must be between 0.0 and 1.0".to_string(),
-			));
-		}
-
 		// Validate versioned queries configuration
 		if self.enable_versioning {
 			// Versioned queries require VLog to be enabled

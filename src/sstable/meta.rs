@@ -12,7 +12,7 @@ pub(crate) struct Properties {
 	pub(crate) num_entries: u64,
 	pub(crate) num_deletions: u64,
 	pub(crate) data_size: u64,
-	pub(crate) global_seq_num: u64,
+	pub(crate) oldest_vlog_file_id: u64,
 	pub(crate) num_data_blocks: u64,
 
 	// Index metrics
@@ -54,7 +54,7 @@ impl Properties {
 			num_entries: 0,
 			num_deletions: 0,
 			data_size: 0,
-			global_seq_num: 0,
+			oldest_vlog_file_id: 0,
 			num_data_blocks: 0,
 			index_size: 0,
 			index_partitions: 0,
@@ -84,7 +84,7 @@ impl Properties {
 		buf.put_u64(self.num_entries);
 		buf.put_u64(self.num_deletions);
 		buf.put_u64(self.data_size);
-		buf.put_u64(self.global_seq_num);
+		buf.put_u64(self.oldest_vlog_file_id);
 		buf.put_u64(self.num_data_blocks);
 		buf.put_u64(self.index_size);
 		buf.put_u64(self.index_partitions);
@@ -115,7 +115,7 @@ impl Properties {
 		let num_entries = buf.get_u64();
 		let num_deletions = buf.get_u64();
 		let data_size = buf.get_u64();
-		let global_seq_num = buf.get_u64();
+		let oldest_vlog_file_id = buf.get_u64();
 		let num_data_blocks = buf.get_u64();
 		let index_size = buf.get_u64();
 		let index_partitions = buf.get_u64();
@@ -143,7 +143,7 @@ impl Properties {
 			num_entries,
 			num_deletions,
 			data_size,
-			global_seq_num,
+			oldest_vlog_file_id,
 			num_data_blocks,
 			index_size,
 			index_partitions,

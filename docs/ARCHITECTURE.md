@@ -130,8 +130,6 @@ database_path/
 ├── vlog/                   # Value log files (if enabled)
 │   ├── 00000000000000000001.vlog
 │   └── 00000000000000000002.vlog
-├── discard_stats/          # VLog discard statistics
-├── delete_list/            # VLog delete tracking (LSM tree)
 ├── versioned_index/        # B+tree index (if enabled)
 └── LOCK                    # Lock file
 ```
@@ -910,120 +908,133 @@ VLog files are managed as follows:
 
 ## VLog Garbage Collection
 
-VLog files accumulate stale entries as values are overwritten or deleted. LSM compaction removes obsolete data from SSTables, but VLog requires explicit garbage collection because values are not rewritten during compaction.
+VLog files accumulate stale entries as values are overwritten or deleted.
 
 ### The Garbage Problem
 
 When a key is updated or deleted:
-1. The old value remains in the VLog (values are never overwritten)
-2. Only the LSM tree's pointer is updated/removed
-3. The old VLog entry becomes "garbage" that wastes space
+1. The new value is written to a new VLog file (values are append-only)
+2. The LSM tree's pointer is updated to reference the new location
+3. The old VLog entry becomes unreferenced
 
-Over time, VLog files can become mostly garbage, wasting disk space. GC reclaims this space by copying live entries to new files and deleting the old ones.
+Over time, old VLog files may contain only stale entries that are no longer referenced by any SSTable. These files can be safely deleted to reclaim disk space.
 
 ### How Garbage is Tracked
 
-During LSM compaction, when a VLog entry is dropped (either superseded by a newer version or deleted), two things happen:
+The key insight is that a VLog file is safe to delete when **no live SSTable references it**. SurrealKV tracks this using the `oldest_vlog_file_id` metadata in each SSTable:
 
-1. **DiscardStats**: The size of the dropped entry is added to a per-file counter
-2. **DeleteList**: The (seq_num, value_size) pair is recorded in a separate LSM tree
+**During SSTable Creation:**
 
-This dual tracking enables efficient GC:
-- DiscardStats determines which files are worth GC'ing (cost-benefit analysis)
-- DeleteList determines which entries within a file are stale (during GC scan)
+When writing an SSTable (during flush or compaction), the `TableWriter` tracks the minimum VLog file ID referenced by any value pointer in that SSTable. This is stored in the SSTable's properties as `oldest_vlog_file_id`.
+
+**Computing the Global Minimum:**
+
+The `LevelManifest.min_oldest_vlog_file_id()` method computes the minimum `oldest_vlog_file_id` across all live SSTables:
+
+```rust
+// Pseudocode
+min_oldest_vlog = manifest
+    .iter()
+    .filter(|sst| sst.oldest_vlog_file_id > 0)
+    .map(|sst| sst.oldest_vlog_file_id)
+    .min()
+    .unwrap_or(0)
+```
+
+Any VLog file with `file_id < min_oldest_vlog` is safe to delete because no SSTable references it.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                             DURING LSM COMPACTION                           │
+│                          SST METADATA TRACKING                              │
 │                                                                             │
-│  When a VLog entry is dropped (superseded or deleted):                      │
+│  During SSTable creation (flush or compaction):                             │
 │                                                                             │
-│  1. Update discard_stats[file_id] += entry_size                             │
-│  2. Add (seq_num, value_size) to DeleteList LSM tree                        │
+│  For each key-value pair:                                                   │
+│    if value is a VLog pointer:                                              │
+│      min_vlog_file_id = min(min_vlog_file_id, pointer.file_id)              │
+│                                                                             │
+│  Store min_vlog_file_id as oldest_vlog_file_id in SST properties            │
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                               GC TRIGGER CHECK                              │
+│                    AFTER FLUSH OR COMPACTION                                │
 │                                                                             │
-│  For each VLog file:                                                        │
-│    discard_ratio = discarded_bytes / total_file_size                        │
+│  1. Compute global minimum:                                                 │
+│     min_oldest_vlog = manifest.min_oldest_vlog_file_id()                    │
 │                                                                             │
-│    if discard_ratio >= vlog_gc_discard_ratio (default: 0.5):                │
-│      → Candidate for garbage collection                                     │
+│  2. If min_oldest_vlog == 0: No SSTs reference VLog, skip cleanup           │
+│                                                                             │
+│  3. Otherwise: Delete VLog files with file_id < min_oldest_vlog             │
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              ITERATOR SAFETY CHECK                          │
+│                              ITERATOR SAFETY                                │
 │                                                                             │
-│  VLog files maintain a reference count of active iterators.                 │
-│  GC waits until ref_count == 0 to prevent reading deleted data.             │
+│  Before deleting a VLog file, check iterator_count:                         │
+│    - If iterator_count > 0: Defer deletion (readers may access file)        │
+│    - If iterator_count == 0: Safe to delete immediately                     │
+│                                                                             │
+│  This prevents deleting files that in-flight reads may access.              │
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                                 GC EXECUTION                                │
+│                         VERSIONED INDEX CLEANUP                             │
 │                                                                             │
-│  ┌───────────────────────────────────────────────────────────────────────┐  │
-│  │  For each entry in VLog file (sequential scan):                       │  │
-│  │                                                                       │  │
-│  │    1. Read entry (key, value, seq_num)                                │  │
-│  │                                                                       │  │
-│  │    2. Check DeleteList: Is seq_num marked as deleted?                 │  │
-│  │                                                                       │  │
-│  │    3. If YES (stale) → Skip entry                                     │  │
-│  │       If NO (live)  → Copy to new VLog file                           │  │
-│  │                                                                       │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                                                             │
-│  Result: New VLog file with only live entries                               │
-└─────────────────────────────────────────────────────────────────────────────┘
-                                       │
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                                 FINALIZATION                                │
-│                                                                             │
-│  1. Atomically replace old file with new file                               │
-│  2. Delete old VLog file                                                    │
-│  3. Clear discard stats for this file                                       │
-│  4. Update DeleteList to remove processed entries                           │
+│  If versioned_index (B+tree) is enabled:                                    │
+│    - Scan B+tree entries for stale VLog pointers                            │
+│    - Remove entries where pointer.file_id < min_oldest_vlog                 │
+│    - Uses read-scan + batched-write-delete for concurrency safety           │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### GC Components
 
-| Component | Purpose | Storage |
-|-----------|---------|---------|
-| **DiscardStats** | Tracks discardable bytes per VLog file | `discard_stats/` directory |
-| **DeleteList** | LSM tree tracking stale (seq_num, size) pairs | `delete_list/` directory |
-| **VLogGCManager** | Background task managing GC execution | In-memory |
+| Component | Purpose | Location |
+|-----------|---------|----------|
+| **oldest_vlog_file_id** | SST metadata tracking oldest VLog file referenced | SST properties |
+| **min_oldest_vlog_file_id()** | Computes global minimum across all SSTs | `LevelManifest` method |
+| **iterator_count** | Safety counter for active readers | `VLog` struct |
+| **cleanup_stale_versioned_index()** | Removes stale B+tree entries | `CoreInner` method |
 
-### GC Algorithm Details
+### GC Trigger Points
 
-**Cost-Benefit Analysis:**
+VLog garbage collection runs automatically at two points:
 
-GC only runs when the expected benefit (space reclaimed) exceeds the cost (I/O to copy live entries):
-```
-discard_ratio = discarded_bytes / file_size
-if discard_ratio >= vlog_gc_discard_ratio (default: 0.5):
-    file is a GC candidate
-```
+1. **After Flush**: When a memtable is flushed to an L0 SSTable
+2. **After Compaction**: When SSTables are merged during compaction
 
-A ratio of 0.5 means GC triggers when at least half the file is garbage. Lower thresholds reclaim space more aggressively but increase write amplification.
+Both paths call `vlog.cleanup_obsolete_files(min_oldest_vlog)` after successfully updating the manifest.
+
+### Algorithm Details
+
+**Why Global Minimum Works:**
+
+The global minimum approach is correct because:
+- VLog file IDs are monotonically increasing
+- Each SSTable records the oldest VLog file it references
+- If `min_oldest_vlog = N`, then all live SSTables reference only VLog files >= N
+- Therefore, VLog files < N have no live references and can be deleted
 
 **Iterator Safety:**
 
-VLog files cannot be deleted while readers might access them. Each file maintains a reference count:
-- Incremented when an iterator opens the file
-- Decremented when the iterator closes
-- GC waits until `ref_count == 0` before proceeding
+VLog files cannot be deleted while readers might access them. The `iterator_count` provides a safety net:
+- Incremented when a snapshot/iterator is created
+- Decremented when the snapshot/iterator is dropped
+- If `iterator_count > 0`, deletion is deferred to startup cleanup
 
 This prevents the race condition where GC deletes a file that an in-flight read is about to access.
 
-**GC Write Amplification:**
+**Versioned Index Cleanup:**
 
-VLog GC has its own write amplification: live entries are copied from old files to new files. With a 0.5 discard ratio threshold, the worst-case write amplification is 2x (copying 50% of data that survives).
+When the optional B+tree versioned index is enabled, it stores `(InternalKey → ValuePointer)` entries. After VLog files are deleted, stale entries pointing to those files must be removed:
+
+1. **Read Phase**: Scan the B+tree under a read lock, collecting keys with `pointer.file_id < min_oldest_vlog`
+2. **Delete Phase**: Remove collected keys in batches under brief write locks
+
+This two-phase approach avoids holding locks during the full scan, allowing concurrent writes.
 
 ---
 
