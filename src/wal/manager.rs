@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::writer::Writer;
 use super::{
@@ -21,6 +22,10 @@ use super::{
 pub struct Wal {
 	/// The currently active Writer for writing records.
 	active_writer: Writer,
+
+	/// Cloned file descriptor for the active WAL file, used to perform
+	/// fsync outside the write lock so concurrent appends are not blocked.
+	sync_fd: Arc<File>,
 
 	/// The log number of the currently active Writer.
 	active_log_number: u64,
@@ -50,11 +55,12 @@ impl Wal {
 		// Determine the active log number
 		let active_log_number = Self::calculate_active_log_number(dir)?;
 
-		// Create the active Writer
-		let active_writer = Self::create_writer(dir, active_log_number, &opts)?;
+		// Create the active Writer and sync fd
+		let (active_writer, sync_fd) = Self::create_writer(dir, active_log_number, &opts)?;
 
 		Ok(Self {
 			active_writer,
+			sync_fd,
 			active_log_number,
 			dir: dir.to_path_buf(),
 			opts,
@@ -112,11 +118,12 @@ impl Wal {
 			);
 		}
 
-		// Create the active Writer at the calculated log number
-		let active_writer = Self::create_writer(dir, active_log_number, &opts)?;
+		// Create the active Writer and sync fd at the calculated log number
+		let (active_writer, sync_fd) = Self::create_writer(dir, active_log_number, &opts)?;
 
 		Ok(Self {
 			active_writer,
+			sync_fd,
 			active_log_number,
 			dir: dir.to_path_buf(),
 			opts,
@@ -124,16 +131,25 @@ impl Wal {
 		})
 	}
 
-	/// Creates a new Writer for the given log number.
+	/// Creates a new Writer and sync fd for the given log number.
 	/// If the segment file already exists, appends to it instead of
 	/// overwriting.
-	fn create_writer(dir: &Path, log_number: u64, opts: &Options) -> Result<Writer> {
+	///
+	/// Returns the Writer and an `Arc<File>` cloned from the same underlying
+	/// file. The sync fd can be used to perform fsync outside the WAL write
+	/// lock, allowing concurrent appends to proceed during the slow fsync.
+	fn create_writer(dir: &Path, log_number: u64, opts: &Options) -> Result<(Writer, Arc<File>)> {
 		let extension = opts.file_extension.as_deref().unwrap_or("wal");
 		let file_name = segment_name(log_number, extension);
 		let file_path = dir.join(&file_name);
 
 		// Open or create the file (append mode ensures writes go to end)
 		let file = Self::open_wal_file(&file_path, opts)?;
+
+		// Clone the fd before BufWriter consumes ownership. This cloned fd
+		// points to the same inode, so sync_all() on it will fsync all dirty
+		// pages for this file regardless of which fd wrote them.
+		let sync_fd = Arc::new(file.try_clone()?);
 
 		// Get file size from the opened file handle
 		let existing_size = file.metadata()?.len();
@@ -150,7 +166,7 @@ impl Wal {
 			// Create buffered file writer
 			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-			Ok(Writer::new(buffered_writer, false, detected_compression, block_offset))
+			Ok((Writer::new(buffered_writer, false, detected_compression, block_offset), sync_fd))
 		} else {
 			// New file - use compression type from options
 			let compression_type = opts.compression_type;
@@ -162,7 +178,7 @@ impl Wal {
 			if compression_type != CompressionType::None {
 				writer.add_compression_type_record()?;
 			}
-			Ok(writer)
+			Ok((writer, sync_fd))
 		}
 	}
 
@@ -352,6 +368,16 @@ impl Wal {
 		self.active_writer.write_buffer()
 	}
 
+	/// Returns a clone of the sync file descriptor Arc.
+	///
+	/// The caller can use this to perform `sync_all()` outside the WAL write
+	/// lock, allowing concurrent appends to proceed during the slow fsync.
+	/// This is safe because fsync operates on the inode — all dirty pages
+	/// from any fd pointing to the same file are persisted.
+	pub(crate) fn sync_fd(&self) -> Arc<File> {
+		Arc::clone(&self.sync_fd)
+	}
+
 	pub(crate) fn close(&mut self) -> Result<()> {
 		if self.closed {
 			return Ok(());
@@ -394,9 +420,11 @@ impl Wal {
 
 		log::debug!("WAL rotating: {:020} -> {:020}", old_log_number, self.active_log_number);
 
-		// Create a new Writer for the new log number
-		let new_writer = Self::create_writer(&self.dir, self.active_log_number, &self.opts)?;
+		// Create a new Writer and sync fd for the new log number
+		let (new_writer, new_sync_fd) =
+			Self::create_writer(&self.dir, self.active_log_number, &self.opts)?;
 		self.active_writer = new_writer;
+		self.sync_fd = new_sync_fd;
 
 		// Fsync the directory to ensure new file is visible after crash
 		crate::lsm::fsync_directory(&self.dir)
