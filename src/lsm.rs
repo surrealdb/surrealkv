@@ -22,7 +22,7 @@ use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
-use crate::wal::{self, cleanup_old_segments, Wal};
+use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
 use crate::{
 	BytewiseComparator,
 	Comparator,
@@ -117,7 +117,7 @@ pub(crate) struct CoreInner {
 	pub(crate) vlog: Option<Arc<VLog>>,
 
 	/// Write-Ahead Log (WAL) for durability
-	pub(crate) wal: parking_lot::RwLock<Wal>,
+	pub(crate) wal: WalManager,
 
 	/// Versioned B+ tree index for timestamp-based queries
 	/// Maps InternalKey -> Value for time-range queries
@@ -193,7 +193,7 @@ impl CoreInner {
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
 			vlog,
-			wal: parking_lot::RwLock::new(wal_instance),
+			wal: WalManager::new(wal_instance),
 			versioned_index,
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
@@ -1296,14 +1296,6 @@ impl Core {
 	/// If `sync` is true, also fsyncs to disk for durability.
 	/// This is safe to call concurrently with ongoing transactions.
 	///
-	/// # Lock Contention Optimization
-	///
-	/// When sync is true, the WAL write lock is held only for the BufWriter
-	/// flush (draining internal buffer to OS page cache, ~microseconds). The
-	/// expensive fsync (~10-100ms on real disks) is performed outside the lock
-	/// using a pre-cloned file descriptor. This allows concurrent WAL appends
-	/// from the commit pipeline to proceed while the fsync is in progress.
-	///
 	/// # Order of Operations
 	///
 	/// VLog is flushed first (contains data referenced by WAL), then WAL.
@@ -1319,26 +1311,11 @@ impl Core {
 			}
 		}
 
+		// Then flush/sync WAL
 		if sync {
-			// Phase 1: Under write lock, flush BufWriter to OS page cache (fast)
-			// and grab the sync fd for phase 2.
-			let sync_fd = {
-				let mut wal_guard = self.wal.write();
-				wal_guard.flush()?;
-				wal_guard.sync_fd()
-				// write lock released here
-			};
-
-			// Phase 2: Outside the lock, fsync to disk (slow).
-			// Concurrent appends can proceed because they write into BufWriter's
-			// internal buffer (userspace), which is not affected by this fsync.
-			// If WAL rotation happens between phase 1 and here, the old fd is
-			// still valid and syncs the old file; new data will be synced next call.
-			sync_fd.sync_all()?;
+			self.wal.sync()?;
 		} else {
-			// Just flush buffer to OS cache (no fsync needed)
-			let mut wal_guard = self.wal.write();
-			wal_guard.flush()?;
+			self.wal.flush()?;
 		}
 
 		Ok(())

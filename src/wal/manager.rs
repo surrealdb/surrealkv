@@ -449,6 +449,54 @@ impl Drop for Wal {
 	}
 }
 
+/// Thread-safe WAL handle that encapsulates lock management.
+///
+/// Provides `sync()` and `flush()` methods that manage the internal
+/// RwLock, matching VLog's pattern. The expensive fsync in `sync()`
+/// is performed outside the write lock using a pre-cloned file
+/// descriptor, allowing concurrent WAL appends to proceed.
+pub(crate) struct WalManager {
+	inner: parking_lot::RwLock<Wal>,
+}
+
+impl WalManager {
+	pub(crate) fn new(wal: Wal) -> Self {
+		Self {
+			inner: parking_lot::RwLock::new(wal),
+		}
+	}
+
+	/// Syncs WAL data to disk using two-phase pattern:
+	/// 1. Under write lock: flush BufWriter to OS page cache
+	/// 2. Outside lock: fsync to disk via pre-cloned fd
+	pub(crate) fn sync(&self) -> Result<()> {
+		let sync_fd = {
+			let mut wal = self.inner.write();
+			wal.flush()?;
+			wal.sync_fd()
+		};
+		sync_fd.sync_all().map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
+		Ok(())
+	}
+
+	/// Flushes WAL buffer to OS page cache (no fsync).
+	pub(crate) fn flush(&self) -> Result<()> {
+		let mut wal = self.inner.write();
+		wal.flush()?;
+		Ok(())
+	}
+
+	/// Returns a write guard for direct WAL access (append, rotate, close).
+	pub(crate) fn write(&self) -> parking_lot::RwLockWriteGuard<'_, Wal> {
+		self.inner.write()
+	}
+
+	/// Returns a read guard for read-only WAL access.
+	pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, Wal> {
+		self.inner.read()
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use tempdir::TempDir;
