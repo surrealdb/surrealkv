@@ -374,11 +374,27 @@ impl Transaction {
 		K: IntoBytes,
 		V: IntoBytes,
 	{
-		self.replace_with_options(key, value, &WriteOptions::default())
+		let write_seqno = self.next_write_seqno();
+
+		let entry = Entry::new(
+			key,
+			Some(value),
+			InternalKeyKind::Replace,
+			self.savepoints,
+			write_seqno,
+			Entry::COMMIT_TIME,
+		);
+
+		self.write(entry)?;
+		Ok(())
 	}
 
 	/// Inserts a key-value pair, removing all previous versions, with custom
 	/// write options.
+	#[deprecated(
+		since = "0.20.1",
+		note = "Use `replace` instead because setting the timestamp should not done on replace"
+	)]
 	pub fn replace_with_options<K, V>(
 		&mut self,
 		key: K,
@@ -900,7 +916,9 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
-	const COMMIT_TIME: u64 = 0;
+	/// Sentinel value indicating "use commit timestamp".
+	/// Using MAX avoids collision with explicit timestamp 0 from set_at().
+	const COMMIT_TIME: u64 = u64::MAX;
 
 	fn new<K: IntoBytes, V: IntoBytes>(
 		key: K,
