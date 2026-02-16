@@ -989,14 +989,6 @@ impl VLog {
 		Ok(())
 	}
 
-	pub(crate) fn flush(&self) -> Result<()> {
-		if let Some(ref mut writer) = *self.writer.write() {
-			writer.flush()?;
-		}
-
-		Ok(())
-	}
-
 	/// Registers a VLog file in the files map for tracking
 	fn register_vlog_file(&self, file_id: u32, path: PathBuf, size: u64) {
 		let mut files_map = self.files_map.write();

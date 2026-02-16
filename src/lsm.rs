@@ -28,15 +28,12 @@ use crate::{
 	Comparator,
 	Error,
 	FilterPolicy,
-	InternalKey,
-	InternalKeyKind,
 	LSMIterator,
 	Options,
 	TimestampComparator,
 	VLogChecksumLevel,
 	Value,
 	WalRecoveryMode,
-	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 
 // ===== Compaction Operations Trait =====
@@ -273,13 +270,17 @@ impl CoreInner {
 		table_id: u64,
 		wal_number: u64,
 	) -> Result<Arc<Table>> {
+		let collect_bptree = self.versioned_index.is_some();
+
 		// Step 1: Flush memtable to SST (with VLog separation for large values)
-		let table = memtable
+		// Also collects entries for B+tree versioned index if enabled
+		let (table, bptree_entries) = memtable
 			.flush(
 				table_id,
 				Arc::clone(&self.opts),
 				self.vlog.as_ref(),
 				self.opts.vlog_value_threshold,
+				collect_bptree,
 			)
 			.map_err(|e| {
 				Error::Other(format!(
@@ -290,7 +291,27 @@ impl CoreInner {
 
 		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
-		// Step 2: Prepare atomic changeset
+		// Step 2: Write to versioned index (B+tree) with vlog-separated values
+		// Note: Replace entries are NOT cleaned up here. The HistoryIterator uses
+		// barrier logic (barrier_seen) to skip older entries when it encounters a
+		// Replace — same as how hard deletes work. Stale entries are eventually
+		// removed by cleanup_stale_versioned_index when their vlog files are cleaned.
+		if let Some(ref versioned_index) = self.versioned_index {
+			let mut vi_guard = versioned_index.write();
+
+			for (encoded_key, encoded_value) in &bptree_entries {
+				vi_guard.insert(encoded_key.clone(), encoded_value.clone())?;
+			}
+
+			vi_guard.sync()?;
+			log::debug!(
+				"Versioned index updated: {} entries written for table_id={}",
+				bptree_entries.len(),
+				table_id
+			);
+		}
+
+		// Step 3: Prepare atomic changeset
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&table)));
 		changeset.log_number = Some(wal_number + 1);
@@ -302,7 +323,7 @@ impl CoreInner {
 			wal_number
 		);
 
-		// Step 3: Apply changeset atomically
+		// Step 4: Apply changeset atomically
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
 
@@ -864,36 +885,20 @@ impl LsmCommitEnv {
 
 impl CommitEnv for LsmCommitEnv {
 	// Write batch to WAL with inline values (synchronous operation).
-	// VLog separation is deferred to memtable flush time (RocksDB BlobDB pattern).
+	// VLog separation is deferred to memtable flush time.
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
 		let mut processed_batch = Batch::new(seq_num);
-		let mut timestamp_entries = Vec::with_capacity(batch.count() as usize);
 
-		let is_versioned_index_enabled = self.core.opts.enable_versioned_index;
-
-		for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
-			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
-			let encoded_key = ikey.encode();
-
-			// Always store values inline — VLog separation deferred to flush
+		for (_, entry, _current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
+			// Always store values inline — VLog separation deferred to flush.
+			// Versioned index (B+tree) writes are also deferred to flush time,
+			// so the B+tree stores value pointers (consistent with SSTables).
 			let encoded_value = match &entry.value {
 				Some(value) => {
 					let value_location = ValueLocation::with_inline_value(value.clone());
-					let encoded = value_location.encode();
-
-					if is_versioned_index_enabled {
-						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
-					}
-
-					Some(encoded)
+					Some(value_location.encode())
 				}
-				None => {
-					// Delete operation: no value but may need versioned index entry
-					if is_versioned_index_enabled {
-						timestamp_entries.push((encoded_key.clone(), Vec::new()));
-					}
-					None
-				}
+				None => None,
 			};
 
 			processed_batch.add_record_with_valueptr(
@@ -905,8 +910,7 @@ impl CommitEnv for LsmCommitEnv {
 			)?;
 		}
 
-		// Write to WAL for durability BEFORE updating versioned index
-		// This ensures the data is persisted before the index reflects it
+		// Write to WAL for durability
 		let enc_bytes = processed_batch.encode()?;
 		let mut wal_guard = self.core.wal.write();
 		wal_guard.append(&enc_bytes)?;
@@ -914,48 +918,6 @@ impl CommitEnv for LsmCommitEnv {
 			wal_guard.sync()?;
 		}
 		drop(wal_guard);
-
-		// Write to versioned index AFTER WAL write succeeds
-		// This ensures the index only reflects data that has been durably persisted
-		if is_versioned_index_enabled {
-			let mut versioned_index_guard = self.core.versioned_index.as_ref().unwrap().write();
-
-			// Single pass: process each entry individually
-			for (encoded_key, encoded_value) in timestamp_entries {
-				let ikey = InternalKey::decode(&encoded_key);
-
-				if ikey.is_replace() {
-					// For Replace: first delete all existing entries for this user key
-					let user_key = ikey.user_key.clone();
-					let start_key =
-						InternalKey::new(user_key.clone(), 0, InternalKeyKind::Set, 0).encode();
-					let end_key = InternalKey::new(
-						user_key,
-						seq_num,
-						InternalKeyKind::Max,
-						INTERNAL_KEY_TIMESTAMP_MAX,
-					)
-					.encode();
-
-					// Collect and delete all existing entries for this user key
-					let range_iter =
-						versioned_index_guard.range(start_key.as_slice()..=end_key.as_slice())?;
-					let mut keys_to_delete = Vec::new();
-					for entry in range_iter {
-						let (key, _) = entry?;
-						keys_to_delete.push(key);
-					}
-
-					// Delete all existing entries
-					for key in keys_to_delete {
-						versioned_index_guard.delete(&key)?;
-					}
-				}
-
-				// Insert the new entry (whether it's regular Set or SetWithDelete)
-				versioned_index_guard.insert(encoded_key, encoded_value)?;
-			}
-		}
 
 		Ok(processed_batch)
 	}
@@ -2025,17 +1987,19 @@ pub(crate) fn cleanup_vlog_and_index(
 		return;
 	}
 
-	// Cleanup obsolete VLog files
+	// Clean stale versioned_index entries FIRST — remove references to
+	// soon-to-be-deleted vlog files before actually deleting them, so
+	// no history query can hit a dangling vlog pointer.
+	if let Err(e) = cleanup_stale_versioned_index(versioned_index, min_oldest_vlog) {
+		log::warn!("Failed to cleanup stale versioned_index entries during {}: {}", context, e);
+		// Don't propagate error - cleanup failures shouldn't fail the primary operation
+	}
+
+	// THEN delete obsolete VLog files (safe: no live bplustree references remain)
 	if let Some(ref vlog) = vlog {
 		if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
 			log::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);
 			// Don't propagate error - cleanup failures shouldn't fail the primary operation
 		}
-	}
-
-	// Cleanup stale versioned_index entries
-	if let Err(e) = cleanup_stale_versioned_index(versioned_index, min_oldest_vlog) {
-		log::warn!("Failed to cleanup stale versioned_index entries during {}: {}", context, e);
-		// Don't propagate error - cleanup failures shouldn't fail the primary operation
 	}
 }

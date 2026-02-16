@@ -15,6 +15,9 @@ use crate::vfs::File;
 use crate::vlog::{VLog, ValueLocation};
 use crate::{InternalKey, InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX};
 
+/// Encoded bplustree entries: Vec of (encoded_key, encoded_value) pairs.
+pub(crate) type BPTreeEntries = Vec<(Vec<u8>, Vec<u8>)>;
+
 /// Entry in the immutable memtables list, tracking both the table ID
 /// and the WAL number that contains this memtable's data.
 #[derive(Clone)]
@@ -235,8 +238,10 @@ impl MemTable {
 		lsm_opts: Arc<Options>,
 		vlog: Option<&Arc<VLog>>,
 		vlog_threshold: usize,
-	) -> Result<Arc<Table>> {
+		collect_bptree_entries: bool,
+	) -> Result<(Arc<Table>, BPTreeEntries)> {
 		let table_file_path = lsm_opts.sstable_file_path(table_id);
+		let mut bptree_entries = Vec::new();
 
 		{
 			let file = SysFile::create(&table_file_path)?;
@@ -250,6 +255,10 @@ impl MemTable {
 
 				// Separate large values to VLog during flush
 				let sst_value = maybe_separate_to_vlog(raw_encoded, &key, vlog, vlog_threshold)?;
+
+				if collect_bptree_entries {
+					bptree_entries.push((key.encode(), sst_value.clone()));
+				}
 
 				table_writer.add(key, &sst_value)?;
 				iter.next()?;
@@ -268,7 +277,7 @@ impl MemTable {
 		let file_size = file.size()?;
 
 		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);
-		Ok(created_table)
+		Ok((created_table, bptree_entries))
 	}
 
 	pub(crate) fn iter(&self) -> MemTableIterator<'_> {
