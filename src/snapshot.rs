@@ -297,8 +297,7 @@ impl Snapshot {
 
 		if self.core.opts.enable_versioned_index {
 			// Merge memtables (unflushed) + B+tree (flushed with value pointers)
-			let merge_iter =
-				KMergeIterator::new_for_history_with_btree(iter_state, range, ts_range)?;
+			let merge_iter = KMergeIterator::new_for_history_with_btree(iter_state, range)?;
 			Ok(HistoryIterator::new(
 				merge_iter,
 				self.seq_num,
@@ -440,7 +439,6 @@ impl<'a> KMergeIterator<'a> {
 	pub(crate) fn new_for_history_with_btree(
 		iter_state: IterState,
 		internal_range: InternalKeyRange,
-		_ts_range: Option<(u64, u64)>,
 	) -> Result<Self> {
 		let cmp: Arc<dyn Comparator> =
 			Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));

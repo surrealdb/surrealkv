@@ -974,7 +974,10 @@ async fn test_history_with_btree_index() {
 		tx.commit().await.unwrap();
 	}
 
-	// history should still work (uses LSM, not B+tree)
+	// Flush to populate bplustree (writes happen at flush time)
+	store.flush().unwrap();
+
+	// history should use merged bplustree + memtable iterators
 	let tx = store.begin().unwrap();
 	let mut iter = tx.history(b"key1", b"key2").unwrap();
 	let results = collect_history_all(&mut iter).unwrap();
@@ -1309,7 +1312,10 @@ async fn test_history_btree_multiple_versions() {
 		tx.commit().await.unwrap();
 	}
 
-	// Query using history() API - should use B+tree streaming
+	// Flush to populate bplustree (writes happen at flush time)
+	store.flush().unwrap();
+
+	// Query using history() API - should use merged bplustree + memtable iterators
 	let tx = store.begin().unwrap();
 	let mut iter = tx.history(b"key1", b"key2").unwrap();
 	let results = collect_history_all(&mut iter).unwrap();
@@ -1453,6 +1459,9 @@ async fn test_history_ts_range_btree() {
 		tx.set_at(b"key1", b"v300", 300).unwrap();
 		tx.commit().await.unwrap();
 	}
+
+	// Flush to populate bplustree (writes happen at flush time)
+	store.flush().unwrap();
 
 	// Query with ts_range [100, 200] - should return v100 and v200
 	let tx = store.begin().unwrap();

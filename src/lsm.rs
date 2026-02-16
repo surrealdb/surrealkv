@@ -901,13 +901,7 @@ impl CommitEnv for LsmCommitEnv {
 				None => None,
 			};
 
-			processed_batch.add_record_with_valueptr(
-				entry.kind,
-				entry.key.clone(),
-				encoded_value,
-				None,
-				timestamp,
-			)?;
+			processed_batch.add_record(entry.kind, entry.key.clone(), encoded_value, timestamp)?;
 		}
 
 		// Write to WAL for durability

@@ -1,7 +1,6 @@
 use test_log::test;
 
 use crate::batch::{Batch, BATCH_VERSION, MAX_BATCH_SIZE};
-use crate::vlog::ValuePointer;
 use crate::InternalKeyKind;
 
 #[test]
@@ -381,25 +380,11 @@ fn test_batch_encode_decode() {
 		.add_record(InternalKeyKind::Merge, b"key3".to_vec(), Some(b"merge_value".to_vec()), 3)
 		.unwrap();
 
-	// Add records with value pointers (simulating VLog pointers)
-	let valueptr1 = ValuePointer::new(100, 200, 10, 20, 30);
-	let valueptr2 = ValuePointer::new(400, 500, 15, 25, 35);
-
 	batch
-		.add_record_with_valueptr(
-			InternalKeyKind::Set,
-			b"key4".to_vec(),
-			Some(b"large_value".to_vec()),
-			Some(valueptr1),
-			4,
-		)
+		.add_record(InternalKeyKind::Set, b"key4".to_vec(), Some(b"large_value".to_vec()), 4)
 		.unwrap();
-	batch
-		.add_record_with_valueptr(InternalKeyKind::Set, b"key5".to_vec(), None, Some(valueptr2), 5)
-		.unwrap();
-	batch
-		.add_record_with_valueptr(InternalKeyKind::Delete, b"key6".to_vec(), None, None, 6)
-		.unwrap();
+	batch.add_record(InternalKeyKind::Set, b"key5".to_vec(), None, 5).unwrap();
+	batch.add_record(InternalKeyKind::Delete, b"key6".to_vec(), None, 6).unwrap();
 
 	// Add some edge cases
 	batch
