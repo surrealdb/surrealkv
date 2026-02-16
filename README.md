@@ -148,6 +148,10 @@ let tree = TreeBuilder::with_options(opts).build()?;
 
 **Note:** Versioning requires VLog to be enabled. When you call `with_versioning(true, retention_ns)`, VLog is automatically enabled and configured appropriately.
 
+**Important:** When versioning is enabled without the B+tree index, timestamps inserted "back in time" (earlier than existing timestamps) will not be read correctly. This is because the LSM tree orders entries by user key ascending and sequence number descending, not by timestamp.
+
+If you need to insert historical data with earlier timestamps, enable the B+tree versioned index with `with_versioned_index(true)`. The B+tree allows in-place updates and correctly handles out-of-order timestamp inserts.
+
 ## Transaction Operations
 
 ### Basic Operations

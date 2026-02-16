@@ -3154,7 +3154,7 @@ mod version_tests {
 
 		// Test Replace with options
 		let mut txn = store.begin().unwrap();
-		txn.replace_with_options(b"test_key2", b"test_value2", &WriteOptions::default()).unwrap();
+		txn.replace(b"test_key2", b"test_value2").unwrap();
 		txn.commit().await.unwrap();
 
 		// Verify the second value exists

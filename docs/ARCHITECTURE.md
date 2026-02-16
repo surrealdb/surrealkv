@@ -587,6 +587,15 @@ The motivation for the optional B+tree index:
 | Fast point and range queries for history | Insert performance slows during LSM writes |
 | All versions of a key are contiguous | Every LSM write also updates B+tree |
 
+**Timestamp Ordering Limitation:**
+
+When using LSM-only versioning (without B+tree index), timestamps inserted "back in time" will not be read correctly. This occurs because:
+- LSM orders entries by `(user_key ASC, seq_num DESC)`
+- Point-in-time queries (`get_at`) find the first entry with `seq_num <= snapshot_seq` where `timestamp <= query_timestamp`
+- A later-inserted entry with an earlier timestamp will have a higher sequence number, causing it to be returned instead of the correct historical value
+
+To support out-of-order timestamp inserts, enable the B+tree index with `with_versioned_index(true)`. The B+tree stores entries sorted by `(user_key, timestamp)` and supports in-place updates, correctly handling historical data insertion.
+
 **Read-after-Write Consistency:**
 
 Currently, the B+tree index is updated synchronously during LSM writes, providing read-after-write consistency for versioned queries. A recently written version is immediately visible via the `history()` API.
