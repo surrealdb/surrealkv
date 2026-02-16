@@ -12,6 +12,7 @@ use crate::batch::Batch;
 use crate::error::Result;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
+use crate::vlog::{VLog, ValueLocation};
 use crate::{InternalKey, InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX};
 
 /// Entry in the immutable memtables list, tracking both the table ID
@@ -228,7 +229,13 @@ impl MemTable {
 		self.latest_seq_num.load(Ordering::Acquire)
 	}
 
-	pub(crate) fn flush(&self, table_id: u64, lsm_opts: Arc<Options>) -> Result<Arc<Table>> {
+	pub(crate) fn flush(
+		&self,
+		table_id: u64,
+		lsm_opts: Arc<Options>,
+		vlog: Option<&Arc<VLog>>,
+		vlog_threshold: usize,
+	) -> Result<Arc<Table>> {
 		let table_file_path = lsm_opts.sstable_file_path(table_id);
 
 		{
@@ -238,11 +245,21 @@ impl MemTable {
 			let mut iter = self.iter();
 			iter.seek_first()?;
 			while iter.valid() {
-				table_writer.add(iter.key().to_owned(), iter.value_encoded()?)?;
+				let key = iter.key().to_owned();
+				let raw_encoded = iter.value_encoded()?;
+
+				// Separate large values to VLog during flush
+				let sst_value = maybe_separate_to_vlog(raw_encoded, &key, vlog, vlog_threshold)?;
+
+				table_writer.add(key, &sst_value)?;
 				iter.next()?;
 			}
-			// TODO: Check how to fsync this file
 			table_writer.finish()?;
+		}
+
+		// Sync VLog after all entries written (one fsync for the entire flush)
+		if let Some(vlog) = vlog {
+			vlog.sync()?;
 		}
 
 		let file = SysFile::open(&table_file_path)?;
@@ -278,6 +295,39 @@ impl MemTable {
 			iter,
 		}
 	}
+}
+
+/// During flush, decide whether to separate a value to VLog or keep inline in SST.
+/// Handles backward compat: entries already containing VLog pointers pass through.
+fn maybe_separate_to_vlog(
+	encoded_value: &[u8],
+	key: &InternalKey,
+	vlog: Option<&Arc<VLog>>,
+	vlog_threshold: usize,
+) -> Result<Vec<u8>> {
+	if encoded_value.is_empty() {
+		return Ok(encoded_value.to_vec());
+	}
+
+	let location = ValueLocation::decode(encoded_value)?;
+
+	// Already a VLog pointer (e.g. from pre-upgrade WAL recovery) — pass through
+	if location.is_value_pointer() {
+		return Ok(encoded_value.to_vec());
+	}
+
+	// Separate large values to VLog
+	let value = &location.value;
+	if let Some(vlog) = vlog {
+		if value.len() > vlog_threshold {
+			let encoded_key = key.encode();
+			let pointer = vlog.append(&encoded_key, value)?;
+			return Ok(ValueLocation::with_pointer(pointer).encode());
+		}
+	}
+
+	// Keep inline
+	Ok(encoded_value.to_vec())
 }
 
 pub(crate) struct MemTableIterator<'a> {

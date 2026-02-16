@@ -273,10 +273,20 @@ impl CoreInner {
 		table_id: u64,
 		wal_number: u64,
 	) -> Result<Arc<Table>> {
-		// Step 1: Flush memtable to SST
-		let table = memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
-			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
-		})?;
+		// Step 1: Flush memtable to SST (with VLog separation for large values)
+		let table = memtable
+			.flush(
+				table_id,
+				Arc::clone(&self.opts),
+				self.vlog.as_ref(),
+				self.opts.vlog_value_threshold,
+			)
+			.map_err(|e| {
+				Error::Other(format!(
+					"Failed to flush memtable to SST table_id={}: {}",
+					table_id, e
+				))
+			})?;
 
 		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
@@ -853,74 +863,46 @@ impl LsmCommitEnv {
 }
 
 impl CommitEnv for LsmCommitEnv {
-	// Write batch to WAL and process VLog entries (synchronous operation)
-	// Returns a new batch with VLog pointers, and pre-encoded ValueLocations
+	// Write batch to WAL with inline values (synchronous operation).
+	// VLog separation is deferred to memtable flush time (RocksDB BlobDB pattern).
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
 		let mut processed_batch = Batch::new(seq_num);
 		let mut timestamp_entries = Vec::with_capacity(batch.count() as usize);
 
-		let vlog_threshold = self.core.opts.vlog_value_threshold;
 		let is_versioned_index_enabled = self.core.opts.enable_versioned_index;
-		let has_vlog = self.core.vlog.is_some();
 
 		for (_, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
 			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
 			let encoded_key = ikey.encode();
 
-			// Process value based on whether VLog is available and value size
-			let (valueptr, encoded_value) = match &entry.value {
-				Some(value) if has_vlog && value.len() > vlog_threshold => {
-					// Large value: store in VLog and create pointer
-					let vlog = self.core.vlog.as_ref().unwrap();
-					let pointer = vlog.append(&encoded_key, value)?;
-					let value_location = ValueLocation::with_pointer(pointer.clone());
-					let encoded = value_location.encode();
-
-					// Add to versioned index if enabled
-					if is_versioned_index_enabled {
-						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
-					}
-
-					(Some(pointer), Some(encoded))
-				}
+			// Always store values inline — VLog separation deferred to flush
+			let encoded_value = match &entry.value {
 				Some(value) => {
-					// Small value or no VLog: store inline
 					let value_location = ValueLocation::with_inline_value(value.clone());
 					let encoded = value_location.encode();
 
-					// Add to versioned index if enabled
 					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), encoded.clone()));
 					}
 
-					(None, Some(encoded))
+					Some(encoded)
 				}
 				None => {
 					// Delete operation: no value but may need versioned index entry
 					if is_versioned_index_enabled {
 						timestamp_entries.push((encoded_key.clone(), Vec::new()));
 					}
-					(None, None)
+					None
 				}
 			};
 
-			// Add processed entry to batch
 			processed_batch.add_record_with_valueptr(
 				entry.kind,
 				entry.key.clone(),
 				encoded_value,
-				valueptr,
+				None,
 				timestamp,
 			)?;
-		}
-
-		// Flush VLog if present
-		if let Some(ref vlog) = self.core.vlog {
-			if sync {
-				vlog.sync()?;
-			} else {
-				vlog.flush()?;
-			}
 		}
 
 		// Write to WAL for durability BEFORE updating versioned index
@@ -1302,22 +1284,12 @@ impl Core {
 	/// This ensures that if WAL contains a ValuePointer, the referenced
 	/// VLog data is at least as durable.
 	pub(crate) fn flush_wal(&self, sync: bool) -> Result<()> {
-		// Flush VLog first (contains data referenced by WAL)
-		if let Some(ref vlog) = self.vlog {
-			if sync {
-				vlog.sync()?;
-			} else {
-				vlog.flush()?;
-			}
-		}
-
-		// Then flush/sync WAL
+		// VLog is NOT synced here — VLog writes are deferred to memtable flush.
 		if sync {
 			self.wal.sync()?;
 		} else {
 			self.wal.flush()?;
 		}
-
 		Ok(())
 	}
 
