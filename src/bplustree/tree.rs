@@ -3498,7 +3498,7 @@ mod tests {
 	use test_log::test;
 
 	use super::*;
-	use crate::{InternalKey, InternalKeyKind};
+	use crate::{BytewiseComparator, InternalKey, InternalKeyKind, TimestampComparator};
 
 	#[derive(Clone)]
 	struct TestComparator;
@@ -6165,5 +6165,52 @@ mod tests {
 		assert!(iter2.prev().unwrap());
 		assert_eq!(iter2.key().user_key(), b"key08");
 		assert_eq!(iter1.key().user_key(), b"key01"); // Unchanged
+	}
+
+	#[test]
+	fn test_full_range_scan_with_timestamp_comparator() {
+		let file = NamedTempFile::new().unwrap();
+		let cmp = Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));
+		let mut tree = BPlusTree::disk(file.path(), cmp).unwrap();
+
+		// Insert entries out of timestamp order to prove the comparator sorts correctly.
+		// TimestampComparator orders: user_key ASC, timestamp DESC.
+		let entries = [
+			(b"alpha".to_vec(), 300u64),
+			(b"alpha".to_vec(), 100),
+			(b"alpha".to_vec(), 200),
+			(b"beta".to_vec(), 500),
+			(b"beta".to_vec(), 400),
+			(b"gamma".to_vec(), 600),
+		];
+
+		for (user_key, ts) in &entries {
+			let key = InternalKey::new(user_key.clone(), *ts, InternalKeyKind::Set, *ts).encode();
+			tree.insert(key, format!("{}-{}", String::from_utf8_lossy(user_key), ts).into_bytes())
+				.unwrap();
+		}
+
+		// Full range scan using the empty-slice pattern
+		let empty: &[u8] = &[];
+		let iter = tree.range(empty..).unwrap();
+		let results: Vec<(Vec<u8>, u64)> = iter
+			.map(|entry| {
+				let (k, _v) = entry.unwrap();
+				let ikey = InternalKey::decode(&k);
+				(ikey.user_key.clone(), ikey.timestamp)
+			})
+			.collect();
+
+		// Expected: user_key ASC, timestamp DESC within each user_key
+		let expected: Vec<(Vec<u8>, u64)> = vec![
+			(b"alpha".to_vec(), 300),
+			(b"alpha".to_vec(), 200),
+			(b"alpha".to_vec(), 100),
+			(b"beta".to_vec(), 500),
+			(b"beta".to_vec(), 400),
+			(b"gamma".to_vec(), 600),
+		];
+
+		assert_eq!(results, expected);
 	}
 }
