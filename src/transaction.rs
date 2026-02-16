@@ -916,9 +916,7 @@ pub(crate) struct Entry {
 }
 
 impl Entry {
-	/// Sentinel value indicating "use commit timestamp".
-	/// Using MAX avoids collision with explicit timestamp 0 from set_at().
-	const COMMIT_TIME: u64 = u64::MAX;
+	const COMMIT_TIME: u64 = 0;
 
 	fn new<K: IntoBytes, V: IntoBytes>(
 		key: K,

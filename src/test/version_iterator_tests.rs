@@ -760,7 +760,7 @@ async fn test_history_many_versions() {
 		let (store, _temp_dir) = create_versioned_store(with_index);
 
 		// Insert same key 100 times with different values
-		for i in 0..100 {
+		for i in 1..=100 {
 			let mut tx = store.begin().unwrap();
 			let value = format!("value_{i:03}");
 			tx.set_at(b"key1", value.as_bytes(), i as u64 * 10).unwrap();
@@ -777,49 +777,9 @@ async fn test_history_many_versions() {
 			let mut iter = tx.history(b"key1", b"key2").unwrap();
 			let results = collect_history_all(&mut iter).unwrap();
 
-			// #region agent log
-			{
-				use std::io::Write;
-				let log_path = "/Users/kfarhan/workspace/surrealdb/surrealkv/.cursor/debug.log";
-				if let Ok(mut file) =
-					std::fs::OpenOptions::new().create(true).append(true).open(log_path)
-				{
-					let first_val_bytes = results.first().map(|r| r.1.clone()).unwrap_or_default();
-					let first_val = String::from_utf8_lossy(&first_val_bytes);
-					let first_ts = results.first().map(|r| r.2).unwrap_or(0);
-					let second_val_bytes = results.get(1).map(|r| r.1.clone()).unwrap_or_default();
-					let second_val = String::from_utf8_lossy(&second_val_bytes);
-					let second_ts = results.get(1).map(|r| r.2).unwrap_or(0);
-					let last_val_bytes = results
-						.get(results.len().saturating_sub(1))
-						.map(|r| r.1.clone())
-						.unwrap_or_default();
-					let last_val = String::from_utf8_lossy(&last_val_bytes);
-					let last_ts =
-						results.get(results.len().saturating_sub(1)).map(|r| r.2).unwrap_or(0);
-					let _ = writeln!(
-						file,
-						r#"{{"hypothesisId":"A,B,C","location":"test_history_many_versions","message":"history results","data":{{"with_index":{},"results_len":{},"first_val":"{}","first_ts":{},"second_val":"{}","second_ts":{},"last_val":"{}","last_ts":{}}},"timestamp":{}}}"#,
-						with_index,
-						results.len(),
-						first_val,
-						first_ts,
-						second_val,
-						second_ts,
-						last_val,
-						last_ts,
-						std::time::SystemTime::now()
-							.duration_since(std::time::UNIX_EPOCH)
-							.unwrap()
-							.as_millis()
-					);
-				}
-			}
-			// #endregion
-
 			assert_eq!(results.len(), 100, "with_index={with_index}: Should have all 100 versions");
-			assert_eq!(results[0].1, b"value_099");
-			assert_eq!(results[99].1, b"value_000");
+			assert_eq!(results[0].1, b"value_100");
+			assert_eq!(results[99].1, b"value_001");
 		}
 		store.close().await.unwrap();
 	}
