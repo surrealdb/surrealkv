@@ -22,7 +22,7 @@ use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
-use crate::wal::{self, cleanup_old_segments, Wal};
+use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
 use crate::{
 	BytewiseComparator,
 	Comparator,
@@ -117,7 +117,7 @@ pub(crate) struct CoreInner {
 	pub(crate) vlog: Option<Arc<VLog>>,
 
 	/// Write-Ahead Log (WAL) for durability
-	pub(crate) wal: parking_lot::RwLock<Wal>,
+	pub(crate) wal: WalManager,
 
 	/// Versioned B+ tree index for timestamp-based queries
 	/// Maps InternalKey -> Value for time-range queries
@@ -193,7 +193,7 @@ impl CoreInner {
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
 			vlog,
-			wal: parking_lot::RwLock::new(wal_instance),
+			wal: WalManager::new(wal_instance),
 			versioned_index,
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
@@ -1311,12 +1311,11 @@ impl Core {
 			}
 		}
 
-		// Then flush WAL
-		let mut wal_guard = self.wal.write();
+		// Then flush/sync WAL
 		if sync {
-			wal_guard.sync()?;
+			self.wal.sync()?;
 		} else {
-			wal_guard.flush()?;
+			self.wal.flush()?;
 		}
 
 		Ok(())

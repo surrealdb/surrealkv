@@ -406,6 +406,9 @@ impl VLogFile {
 pub(crate) struct VLogWriter {
 	/// Buffered writer for the file
 	writer: BufWriter<File>,
+	/// Cloned file descriptor for fsync outside the write lock.
+	/// Points to the same inode as the BufWriter's file.
+	sync_fd: Arc<File>,
 	/// Current offset in the file
 	pub(crate) current_offset: u64,
 	/// ID of this VLog file
@@ -424,6 +427,10 @@ impl VLogWriter {
 	) -> Result<Self> {
 		let file_exists = path.exists();
 		let file = OpenOptions::new().create(true).append(true).open(path)?;
+
+		// Clone the fd before BufWriter consumes ownership. This cloned fd
+		// is used to perform fsync outside the write lock.
+		let sync_fd = Arc::new(file.try_clone()?);
 
 		let current_offset = file.metadata()?.len();
 		let mut writer = BufWriter::new(file);
@@ -445,6 +452,7 @@ impl VLogWriter {
 
 		Ok(Self {
 			writer,
+			sync_fd,
 			current_offset,
 			file_id,
 			bytes_written: current_offset,
@@ -486,16 +494,24 @@ impl VLogWriter {
 		Ok(ValuePointer::new(self.file_id, offset, key_len, value_len, crc32))
 	}
 
-	/// Flushes and syncs the writer
+	/// Flushes and syncs the writer (flush to OS cache + fsync to disk).
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn sync(&mut self) -> Result<()> {
 		self.writer.flush()?;
 		self.writer.get_ref().sync_all()?;
 		Ok(())
 	}
 
-	fn flush(&mut self) -> Result<()> {
+	/// Flushes buffered data to OS cache (not to disk).
+	pub(crate) fn flush(&mut self) -> Result<()> {
 		self.writer.flush()?;
 		Ok(())
+	}
+
+	/// Returns a clone of the sync file descriptor Arc for
+	/// performing fsync outside the write lock.
+	pub(crate) fn sync_fd(&self) -> Arc<File> {
+		Arc::clone(&self.sync_fd)
 	}
 
 	/// Gets the current size of the file
@@ -947,10 +963,28 @@ impl VLog {
 		Ok(())
 	}
 
-	/// Syncs all data to disk
+	/// Syncs all data to disk.
+	///
+	/// The write lock is held only for the BufWriter flush (draining the
+	/// internal buffer to OS page cache, ~microseconds). The expensive
+	/// fsync is performed outside the lock using a pre-cloned file
+	/// descriptor, allowing concurrent VLog appends to proceed.
 	pub(crate) fn sync(&self) -> Result<()> {
-		if let Some(ref mut writer) = *self.writer.write() {
-			writer.sync()?;
+		// Phase 1: Under write lock — flush BufWriter and grab sync fd
+		let sync_fd = {
+			let mut guard = self.writer.write();
+			if let Some(ref mut writer) = *guard {
+				writer.flush()?;
+				Some(writer.sync_fd())
+			} else {
+				None
+			}
+			// write lock released here
+		};
+
+		// Phase 2: Outside lock — fsync to disk (slow, doesn't block appends)
+		if let Some(fd) = sync_fd {
+			fd.sync_all()?;
 		}
 		Ok(())
 	}
