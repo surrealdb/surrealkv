@@ -130,6 +130,13 @@ pub(crate) struct CoreInner {
 	/// Shared with CommitPipeline for coordinated updates.
 	/// Used to set `earliest_seq` when creating new memtables for conflict detection.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
+
+	/// Most recently flushed memtable kept for conflict detection.
+	/// When a memtable is flushed to SST, it's moved here so that long-running
+	/// transactions can still detect conflicts against recently flushed data.
+	/// This prevents spurious TransactionRetry errors when immutable_memtables
+	/// becomes empty after a flush.
+	pub(crate) flushed_history: Arc<RwLock<Option<Arc<MemTable>>>>,
 }
 
 impl CoreInner {
@@ -195,21 +202,36 @@ impl CoreInner {
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
+			flushed_history: Arc::new(RwLock::new(None)),
 		})
 	}
 
-	/// Get the earliest sequence number across all memtables.
-	/// Any key with seq >= this value is guaranteed to be in memtables.
-	/// Keys modified with seq < this value may have been flushed to SST.
+	/// Get the earliest sequence number across all memtables (including flushed history).
+	/// Any key with seq >= this value is guaranteed to be in memtables or flushed history.
+	/// Keys modified with seq < this value may have been flushed to SST and evicted from history.
 	pub(crate) fn get_earliest_memtable_seq(&self) -> Result<u64> {
-		// Check immutable memtables - the first (oldest by table_id) has the earliest seq
+		// Lock order: immutables → history (consistent with flush_and_update_manifest)
 		let immutables = self.immutable_memtables.read()?;
+		let history = self.flushed_history.read()?;
+
+		// Check flushed history first (has oldest data)
+		if let Some(ref oldest) = *history {
+			return Ok(oldest.earliest_seq());
+		}
+
+		// Then check immutable memtables
 		if let Some(oldest) = immutables.first() {
 			return Ok(oldest.memtable.earliest_seq());
 		}
-		drop(immutables);
 
-		// No immutables - use active memtable
+		// If both history and immutables are empty, no rotations/flushes have happened yet.
+		// This means all data is in the active memtable and its earliest_seq is reliable.
+		// Fall back to active memtable - this is safe because:
+		// 1. No rotations have happened, so earliest_seq hasn't jumped
+		// 2. After the first rotation, there will be an immutable
+		// 3. After the first flush, there will be history
+		drop(immutables);
+		drop(history);
 		let memtable = self.active_memtable.read()?;
 		Ok(memtable.earliest_seq())
 	}
@@ -219,8 +241,10 @@ impl CoreInner {
 		I: Iterator<Item = &'a [u8]>,
 	{
 		// Acquire locks once for all keys - this is the key optimization
+		// Lock order: active → immutables → history (consistent with other operations)
 		let memtable = self.active_memtable.read()?;
 		let immutables = self.immutable_memtables.read()?;
+		let history = self.flushed_history.read()?;
 
 		for key in keys {
 			// Check active memtable first (most recent writes)
@@ -233,16 +257,31 @@ impl CoreInner {
 			}
 
 			// Check immutable memtables (newest to oldest by iterating in reverse)
+			let mut found_in_immutable = false;
 			for entry in immutables.iter().rev() {
 				if let Some((ikey, _)) = entry.memtable.get(key, None) {
 					if ikey.seq_num() > start_seq {
 						return Err(Error::TransactionWriteConflict);
 					}
 					// Key exists but was written before our transaction started - no conflict
+					found_in_immutable = true;
 					break;
 				}
 			}
-			// Key not found in any memtable - no conflict for this key
+			if found_in_immutable {
+				continue;
+			}
+
+			// Check flushed history
+			if let Some(ref flushed) = *history {
+				if let Some((ikey, _)) = flushed.get(key, None) {
+					if ikey.seq_num() > start_seq {
+						return Err(Error::TransactionWriteConflict);
+					}
+					// Key exists but was written before our transaction started - no conflict
+				}
+			}
+			// Key not found in any memtable or history - no conflict for this key
 		}
 
 		// No conflicts found for any key
@@ -266,7 +305,7 @@ impl CoreInner {
 	/// The flushed SSTable
 	fn flush_and_update_manifest(
 		&self,
-		memtable: &MemTable,
+		memtable: Arc<MemTable>,
 		table_id: u64,
 		wal_number: u64,
 	) -> Result<Arc<Table>> {
@@ -324,8 +363,10 @@ impl CoreInner {
 		);
 
 		// Step 4: Apply changeset atomically
+		// Lock order: level_manifest → immutable_memtables → flushed_history
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
+		let mut history_lock = self.flushed_history.write()?;
 
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
@@ -340,8 +381,12 @@ impl CoreInner {
 			return Err(error);
 		}
 
-		// Remove successfully flushed memtable from tracking
+		// Remove successfully flushed memtable from immutables tracking
 		memtable_lock.remove(table_id);
+
+		// Atomically add to flushed history for conflict detection
+		// This ensures no visibility gap where memtable is in neither collection
+		*history_lock = Some(memtable);
 
 		log::info!(
 			"Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
@@ -460,8 +505,11 @@ impl CoreInner {
 		);
 
 		// Flush to SST (this also removes from immutable queue and updates manifest)
-		let table =
-			self.flush_and_update_manifest(&entry.memtable, entry.table_id, entry.wal_number)?;
+		let table = self.flush_and_update_manifest(
+			Arc::clone(&entry.memtable),
+			entry.table_id,
+			entry.wal_number,
+		)?;
 
 		// Schedule async WAL cleanup
 		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
@@ -586,8 +634,11 @@ impl CoreInner {
 		};
 
 		// Step 3: Flush the immutable memtable to disk and update manifest
-		let table =
-			self.flush_and_update_manifest(&flushed_memtable, table_id, wal_that_was_flushed)?;
+		let table = self.flush_and_update_manifest(
+			Arc::clone(&flushed_memtable),
+			table_id,
+			wal_that_was_flushed,
+		)?;
 
 		Ok(Some(table))
 	}
@@ -648,7 +699,11 @@ impl CoreInner {
 
 			// Fail-fast: return immediately on error
 			// WAL replay will recover this and subsequent memtables on restart
-			self.flush_and_update_manifest(&entry.memtable, entry.table_id, entry.wal_number)?;
+			self.flush_and_update_manifest(
+				Arc::clone(&entry.memtable),
+				entry.table_id,
+				entry.wal_number,
+			)?;
 
 			flushed_count += 1;
 			log::debug!(
@@ -1151,7 +1206,7 @@ impl Core {
 			|memtable, wal_number| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = inner.level_manifest.read()?.next_table_id();
-				inner.flush_and_update_manifest(&memtable, table_id, wal_number)?;
+				inner.flush_and_update_manifest(Arc::clone(&memtable), table_id, wal_number)?;
 				log::info!(
 					"Recovery: flushed memtable to SST table_id={}, wal_number={}",
 					table_id,
@@ -1528,7 +1583,11 @@ impl Tree {
 			|memtable, wal_number| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
-				self.core.inner.flush_and_update_manifest(&memtable, table_id, wal_number)?;
+				self.core.inner.flush_and_update_manifest(
+					Arc::clone(&memtable),
+					table_id,
+					wal_number,
+				)?;
 				log::info!(
 					"Restore: flushed memtable to SST table_id={}, wal_number={}",
 					table_id,
