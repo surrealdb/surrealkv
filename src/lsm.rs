@@ -76,6 +76,18 @@ pub trait CompactionOperations: Send + Sync {
 ///   progressively larger SSTables with non-overlapping key ranges (except L0).
 /// - **Compaction**: Background process that merges SSTables to maintain read performance and
 ///   remove deleted entries.
+///
+/// # Lock Ordering
+///
+/// To prevent deadlocks, locks must be acquired in this order:
+/// 1. `active_memtable` - serializes writes
+/// 2. `level_manifest` - SST metadata and table IDs
+/// 3. `immutable_memtables` - pending flush queue
+/// 4. `flushed_history` - conflict detection history
+///
+/// Read locks and write locks follow the same ordering.
+/// If a function needs multiple locks, it must acquire them in this order.
+/// See `rotate_memtable()`, `flush_immutable_to_sst()` for examples.
 pub(crate) struct CoreInner {
 	/// The active memtable (write buffer) that receives all new writes.
 	///
@@ -92,6 +104,13 @@ pub(crate) struct CoreInner {
 	/// memtables continue serving reads while waiting for background threads
 	/// to flush them to disk as SSTables.
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
+
+	/// Most recently flushed memtable kept for conflict detection.
+	/// When a memtable is flushed to SST, it's moved here so that long-running
+	/// transactions can still detect conflicts against recently flushed data.
+	/// This prevents spurious TransactionRetry errors when immutable_memtables
+	/// becomes empty after a flush.
+	pub(crate) flushed_history: Arc<RwLock<Option<Arc<MemTable>>>>,
 
 	/// The level structure managing all SSTables on disk.
 	///
@@ -195,21 +214,30 @@ impl CoreInner {
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
+			flushed_history: Arc::new(RwLock::new(None)),
 		})
 	}
 
 	/// Get the earliest sequence number across all memtables.
-	/// Any key with seq >= this value is guaranteed to be in memtables.
-	/// Keys modified with seq < this value may have been flushed to SST.
+	/// Any key with seq >= this value is guaranteed to be in memtables or flushed history.
 	pub(crate) fn get_earliest_memtable_seq(&self) -> Result<u64> {
-		// Check immutable memtables - the first (oldest by table_id) has the earliest seq
-		let immutables = self.immutable_memtables.read()?;
-		if let Some(oldest) = immutables.first() {
-			return Ok(oldest.memtable.earliest_seq());
+		// Check flushed history first (has oldest data)
+		{
+			let history = self.flushed_history.read()?;
+			if let Some(ref oldest) = *history {
+				return Ok(oldest.earliest_seq());
+			}
 		}
-		drop(immutables);
 
-		// No immutables - use active memtable
+		// Then check immutable memtables
+		{
+			let immutables = self.immutable_memtables.read()?;
+			if let Some(oldest) = immutables.first() {
+				return Ok(oldest.memtable.earliest_seq());
+			}
+		}
+
+		// Fall back to active memtable
 		let memtable = self.active_memtable.read()?;
 		Ok(memtable.earliest_seq())
 	}
@@ -218,9 +246,10 @@ impl CoreInner {
 	where
 		I: Iterator<Item = &'a [u8]>,
 	{
-		// Acquire locks once for all keys - this is the key optimization
+		// Lock order: active → immutables → history
 		let memtable = self.active_memtable.read()?;
 		let immutables = self.immutable_memtables.read()?;
+		let history = self.flushed_history.read()?;
 
 		for key in keys {
 			// Check active memtable first (most recent writes)
@@ -233,16 +262,31 @@ impl CoreInner {
 			}
 
 			// Check immutable memtables (newest to oldest by iterating in reverse)
+			let mut found_in_immutable = false;
 			for entry in immutables.iter().rev() {
 				if let Some((ikey, _)) = entry.memtable.get(key, None) {
 					if ikey.seq_num() > start_seq {
 						return Err(Error::TransactionWriteConflict);
 					}
 					// Key exists but was written before our transaction started - no conflict
+					found_in_immutable = true;
 					break;
 				}
 			}
-			// Key not found in any memtable - no conflict for this key
+			if found_in_immutable {
+				continue;
+			}
+
+			// Check flushed history
+			if let Some(ref flushed) = *history {
+				if let Some((ikey, _)) = flushed.get(key, None) {
+					if ikey.seq_num() > start_seq {
+						return Err(Error::TransactionWriteConflict);
+					}
+					// Key exists but was written before our transaction started - no conflict
+				}
+			}
+			// Key not found in any memtable or history - no conflict for this key
 		}
 
 		// No conflicts found for any key
@@ -264,9 +308,9 @@ impl CoreInner {
 	///
 	/// # Returns
 	/// The flushed SSTable
-	fn flush_and_update_manifest(
+	fn flush_immutable_to_sst(
 		&self,
-		memtable: &MemTable,
+		memtable: Arc<MemTable>,
 		table_id: u64,
 		wal_number: u64,
 	) -> Result<Arc<Table>> {
@@ -324,8 +368,10 @@ impl CoreInner {
 		);
 
 		// Step 4: Apply changeset atomically
+		// Lock order: level_manifest → immutable_memtables → flushed_history
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
+		let mut history_lock = self.flushed_history.write()?;
 
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
@@ -340,8 +386,12 @@ impl CoreInner {
 			return Err(error);
 		}
 
-		// Remove successfully flushed memtable from tracking
+		// Remove successfully flushed memtable from immutables tracking
 		memtable_lock.remove(table_id);
+
+		// Atomically add to flushed history for conflict detection
+		// This ensures no visibility gap where memtable is in neither collection
+		*history_lock = Some(memtable);
 
 		log::info!(
 			"Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
@@ -402,9 +452,16 @@ impl CoreInner {
 		// Set the WAL number on the new (empty) active memtable
 		active_memtable.set_wal_number(new_wal_number);
 
-		// Get table ID and track immutable memtable with its WAL number
-		let mut immutable_memtables = self.immutable_memtables.write()?;
+		// LOCK ORDER: Get table_id from manifest BEFORE acquiring immutable_memtables lock.
+		// This maintains consistent ordering: level_manifest -> immutable_memtables
+		// which matches flush_immutable_to_sst() and prevents deadlock.
+		//
+		// Deadlock scenario prevented:
+		//   Thread A (rotate): holds imm.write, waits manifest.read
+		//   Thread B (flush):  holds manifest.write, waits imm.write
+		// By acquiring manifest.read first, we ensure no circular wait.
 		let table_id = self.level_manifest.read()?.next_table_id();
+		let mut immutable_memtables = self.immutable_memtables.write()?;
 		immutable_memtables.add(table_id, flushed_wal_number, Arc::clone(&flushed_memtable));
 
 		// Release locks
@@ -425,7 +482,7 @@ impl CoreInner {
 	///
 	/// This method:
 	/// 1. Gets the oldest entry from immutable queue (lowest table_id)
-	/// 2. Flushes it to SST via flush_and_update_manifest (which also removes from queue)
+	/// 2. Flushes it to SST via flush_immutable_to_sst (which also removes from queue)
 	/// 3. Schedules async WAL cleanup
 	fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
 		// Get the oldest immutable entry (clone to release lock before I/O)
@@ -460,8 +517,11 @@ impl CoreInner {
 		);
 
 		// Flush to SST (this also removes from immutable queue and updates manifest)
-		let table =
-			self.flush_and_update_manifest(&entry.memtable, entry.table_id, entry.wal_number)?;
+		let table = self.flush_immutable_to_sst(
+			Arc::clone(&entry.memtable),
+			entry.table_id,
+			entry.wal_number,
+		)?;
 
 		// Schedule async WAL cleanup
 		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
@@ -543,6 +603,11 @@ impl CoreInner {
 			return Ok(None);
 		}
 
+		// LOCK ORDER: Get table_id from manifest BEFORE acquiring immutable_memtables lock.
+		// This maintains consistent ordering: active -> level_manifest -> immutable_memtables
+		// which matches flush_immutable_to_sst() and prevents deadlock with background flush.
+		let table_id = self.level_manifest.read()?.next_table_id();
+
 		let mut immutable_memtables = self.immutable_memtables.write()?;
 
 		// Get the current WAL number for the new memtable
@@ -560,9 +625,6 @@ impl CoreInner {
 
 		// Set the WAL number on the new active memtable
 		active_memtable.set_wal_number(current_wal_number);
-
-		// Get table ID for the SST file
-		let table_id = self.level_manifest.read()?.next_table_id();
 
 		// Get the WAL number from the memtable (set when it started receiving writes)
 		// or use the current WAL if not set
@@ -586,8 +648,11 @@ impl CoreInner {
 		};
 
 		// Step 3: Flush the immutable memtable to disk and update manifest
-		let table =
-			self.flush_and_update_manifest(&flushed_memtable, table_id, wal_that_was_flushed)?;
+		let table = self.flush_immutable_to_sst(
+			Arc::clone(&flushed_memtable),
+			table_id,
+			wal_that_was_flushed,
+		)?;
 
 		Ok(Some(table))
 	}
@@ -648,7 +713,11 @@ impl CoreInner {
 
 			// Fail-fast: return immediately on error
 			// WAL replay will recover this and subsequent memtables on restart
-			self.flush_and_update_manifest(&entry.memtable, entry.table_id, entry.wal_number)?;
+			self.flush_immutable_to_sst(
+				Arc::clone(&entry.memtable),
+				entry.table_id,
+				entry.wal_number,
+			)?;
 
 			flushed_count += 1;
 			log::debug!(
@@ -1151,7 +1220,7 @@ impl Core {
 			|memtable, wal_number| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = inner.level_manifest.read()?.next_table_id();
-				inner.flush_and_update_manifest(&memtable, table_id, wal_number)?;
+				inner.flush_immutable_to_sst(Arc::clone(&memtable), table_id, wal_number)?;
 				log::info!(
 					"Recovery: flushed memtable to SST table_id={}, wal_number={}",
 					table_id,
@@ -1528,7 +1597,11 @@ impl Tree {
 			|memtable, wal_number| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
-				self.core.inner.flush_and_update_manifest(&memtable, table_id, wal_number)?;
+				self.core.inner.flush_immutable_to_sst(
+					Arc::clone(&memtable),
+					table_id,
+					wal_number,
+				)?;
 				log::info!(
 					"Restore: flushed memtable to SST table_id={}, wal_number={}",
 					table_id,
