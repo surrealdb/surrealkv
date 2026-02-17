@@ -12,6 +12,7 @@ pub mod recovery;
 pub mod writer;
 
 pub use manager::Wal;
+pub(crate) use manager::WalManager;
 
 // ===== Format Constants and Types =====
 
@@ -429,7 +430,7 @@ impl SegmentRef {
 			}
 		}
 
-		segment_refs.sort_by(|a, b| a.id.cmp(&b.id));
+		segment_refs.sort_by_key(|a| a.id);
 		Ok(segment_refs)
 	}
 }

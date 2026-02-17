@@ -369,24 +369,6 @@ impl DatabaseCheckpoint {
 			total_size += Self::calculate_directory_size(&vlog_dest)?;
 		}
 
-		// Copy discard stats directory
-		let discard_stats_source = self.core.opts.discard_stats_dir();
-		let discard_stats_dest = dest_dir.join("discard_stats");
-		if discard_stats_source.exists() {
-			copy_dir_all(&discard_stats_source, &discard_stats_dest)
-				.map_err(|e| Error::Io(Arc::new(e)))?;
-			total_size += Self::calculate_directory_size(&discard_stats_dest)?;
-		}
-
-		// Copy delete list directory
-		let delete_list_source = self.core.opts.delete_list_dir();
-		let delete_list_dest = dest_dir.join("delete_list");
-		if delete_list_source.exists() {
-			copy_dir_all(&delete_list_source, &delete_list_dest)
-				.map_err(|e| Error::Io(Arc::new(e)))?;
-			total_size += Self::calculate_directory_size(&delete_list_dest)?;
-		}
-
 		Ok(total_size)
 	}
 
@@ -420,28 +402,6 @@ impl DatabaseCheckpoint {
 				fs::remove_dir_all(&vlog_dest).map_err(|e| Error::Io(Arc::new(e)))?;
 			}
 			copy_dir_all(&vlog_source, &vlog_dest).map_err(|e| Error::Io(Arc::new(e)))?;
-		}
-
-		// Restore discard stats directory
-		let discard_stats_source = checkpoint_path.join("discard_stats");
-		let discard_stats_dest = self.core.opts.discard_stats_dir();
-		if discard_stats_source.exists() {
-			if discard_stats_dest.exists() {
-				fs::remove_dir_all(&discard_stats_dest).map_err(|e| Error::Io(Arc::new(e)))?;
-			}
-			copy_dir_all(&discard_stats_source, &discard_stats_dest)
-				.map_err(|e| Error::Io(Arc::new(e)))?;
-		}
-
-		// Restore delete list directory
-		let delete_list_source = checkpoint_path.join("delete_list");
-		let delete_list_dest = self.core.opts.delete_list_dir();
-		if delete_list_source.exists() {
-			if delete_list_dest.exists() {
-				fs::remove_dir_all(&delete_list_dest).map_err(|e| Error::Io(Arc::new(e)))?;
-			}
-			copy_dir_all(&delete_list_source, &delete_list_dest)
-				.map_err(|e| Error::Io(Arc::new(e)))?;
 		}
 
 		Ok(())
@@ -525,21 +485,11 @@ impl DatabaseCheckpoint {
 			fs::remove_dir_all(&manifest_path).map_err(|e| Error::Io(Arc::new(e)))?;
 		}
 
-		// Clear VLog directories if VLog is enabled
+		// Clear VLog directory if VLog is enabled
 		if self.core.opts.enable_vlog {
 			let vlog_dir = self.core.opts.vlog_dir();
 			if vlog_dir.exists() {
 				fs::remove_dir_all(&vlog_dir).map_err(|e| Error::Io(Arc::new(e)))?;
-			}
-
-			let discard_stats_dir = self.core.opts.discard_stats_dir();
-			if discard_stats_dir.exists() {
-				fs::remove_dir_all(&discard_stats_dir).map_err(|e| Error::Io(Arc::new(e)))?;
-			}
-
-			let delete_list_dir = self.core.opts.delete_list_dir();
-			if delete_list_dir.exists() {
-				fs::remove_dir_all(&delete_list_dir).map_err(|e| Error::Io(Arc::new(e)))?;
 			}
 		}
 

@@ -374,15 +374,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "memmap2"
-version = "0.9.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "744133e4a0e0a658e1374cf3bf8e415c4052a15a111acd372764c55b4177d490"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "num-traits"
 version = "0.2.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -565,7 +556,7 @@ checksum = "1b6b67fb9a61334225b5b790716f609cd58395f895b3fe8b328786812a40bc3b"
 
 [[package]]
 name = "surrealkv"
-version = "0.18.1"
+version = "0.20.1"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -580,7 +571,6 @@ dependencies = [
  "integer-encoding",
  "log",
  "lz4_flex",
- "memmap2",
  "parking_lot",
  "quick_cache",
  "rand",

@@ -49,7 +49,6 @@ pub enum Error {
 	CommitFail(String),
 	LoadManifestFail(String),
 	Corruption(String), // Data corruption detected
-	VlogGCAlreadyInProgress,
 	InvalidArgument(String),
 	InvalidTag(String),
 	BPlusTree(String),    // B+ tree specific errors
@@ -61,21 +60,6 @@ pub enum Error {
 		message: String,
 	},
 	SSTable(crate::sstable::error::SSTableError), // SSTable-specific errors
-	/// Discard stats slot access out of bounds
-	DiscardSlotOutOfBounds {
-		slot: usize,
-		max: usize,
-	},
-	/// Discard stats corrupted entry count
-	DiscardCorruptedEntryCount {
-		count: usize,
-		max: usize,
-	},
-	/// Discard stats corrupted data
-	DiscardCorruptedData {
-		slot: usize,
-		reason: String,
-	},
 }
 
 // Implementation of Display trait for Error
@@ -118,7 +102,6 @@ impl fmt::Display for Error {
             Self::CommitFail(err) => write!(f, "Commit failed: {err}"),
             Self::LoadManifestFail(err) => write!(f, "Failed to load manifest: {err}"),
             Self::Corruption(err) => write!(f, "Data corruption detected: {err}"),
-            Self::VlogGCAlreadyInProgress => write!(f, "Vlog garbage collection already in progress"),
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::BPlusTree(err) => write!(f, "B+ tree error: {err}"),
@@ -129,9 +112,6 @@ impl fmt::Display for Error {
                 segment_id, offset, message
             ),
             Self::SSTable(err) => write!(f, "SSTable error: {err}"),
-            Self::DiscardSlotOutOfBounds { slot, max } => write!(f, "Discard stats slot {slot} out of bounds (max: {max})"),
-            Self::DiscardCorruptedEntryCount { count, max } => write!(f, "Discard stats corrupted: entry count {count} exceeds max slots {max}"),
-            Self::DiscardCorruptedData { slot, reason } => write!(f, "Discard stats corrupted at slot {slot}: {reason}"),
         }
 	}
 }
@@ -205,7 +185,6 @@ pub enum BackgroundErrorReason {
 	MemtablaFlush,
 	Compaction,
 	ManifestWrite,
-	VLogGC,
 }
 
 /// Represents a background error with its severity and context
@@ -257,9 +236,6 @@ impl BackgroundErrorHandler {
 
 			// Manifest write I/O is fatal
 			(BackgroundErrorReason::ManifestWrite, Error::Io(_)) => ErrorSeverity::FatalError,
-
-			// VLog GC I/O is hard error (can retry, but stops writes for safety)
-			(BackgroundErrorReason::VLogGC, Error::Io(_)) => ErrorSeverity::HardError,
 
 			// Default: treat as hard error for safety
 			_ => ErrorSeverity::HardError,
@@ -405,30 +381,13 @@ mod tests {
 	}
 
 	#[test]
-	fn test_soft_error_does_not_stop_db() {
-		let handler = BackgroundErrorHandler::new();
-
-		// This test is kept to verify HardError behavior.
-
-		// VLog GC I/O is HardError - stops writes but less severe than FatalError
-		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::other("test error"))),
-			BackgroundErrorReason::VLogGC,
-		);
-
-		// Hard errors stop the database
-		assert!(handler.is_db_stopped());
-		assert!(handler.check_error().is_err());
-	}
-
-	#[test]
 	fn test_error_severity_upgrade() {
 		let handler = BackgroundErrorHandler::new();
 
-		// Set a hard error first (VLog GC I/O)
+		// Set a hard error first
 		handler.set_error(
 			Error::Io(Arc::new(std::io::Error::other("hard error"))),
-			BackgroundErrorReason::VLogGC,
+			BackgroundErrorReason::ManifestWrite,
 		);
 
 		assert!(handler.is_db_stopped());

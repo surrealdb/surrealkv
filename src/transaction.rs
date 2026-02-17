@@ -374,11 +374,27 @@ impl Transaction {
 		K: IntoBytes,
 		V: IntoBytes,
 	{
-		self.replace_with_options(key, value, &WriteOptions::default())
+		let write_seqno = self.next_write_seqno();
+
+		let entry = Entry::new(
+			key,
+			Some(value),
+			InternalKeyKind::Replace,
+			self.savepoints,
+			write_seqno,
+			Entry::COMMIT_TIME,
+		);
+
+		self.write(entry)?;
+		Ok(())
 	}
 
 	/// Inserts a key-value pair, removing all previous versions, with custom
 	/// write options.
+	#[deprecated(
+		since = "0.20.1",
+		note = "Use `replace` instead because setting the timestamp should not done on replace"
+	)]
 	pub fn replace_with_options<K, V>(
 		&mut self,
 		key: K,
@@ -759,7 +775,7 @@ impl Transaction {
 		// respecting the insertion order recorded with Entry::seqno.
 		let mut latest_writes: Vec<Entry> =
 			std::mem::take(&mut self.write_set).into_values().flatten().collect();
-		latest_writes.sort_by(|a, b| a.seqno.cmp(&b.seqno));
+		latest_writes.sort_by_key(|a| a.seqno);
 
 		// Generate a single timestamp for this commit
 		let commit_timestamp = self.core.opts.clock.now();

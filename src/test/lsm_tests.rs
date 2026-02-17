@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -58,7 +57,6 @@ fn create_vlog_compaction_options(path: PathBuf) -> Arc<Options> {
 	create_test_options(path, |opts| {
 		opts.max_memtable_size = 64 * 1024; // 64KB
 		opts.vlog_max_file_size = 950; // Small size to force frequent rotations
-		opts.vlog_gc_discard_ratio = 0.0; // Disable discard ratio to preserve all values
 		opts.level_count = 2; // Two levels for compaction strategy
 	})
 }
@@ -1288,114 +1286,6 @@ async fn test_vlog_file_rotation() {
 }
 
 #[test(tokio::test)]
-async fn test_discard_file_directory_structure() {
-	// Test to verify that the DISCARD file lives in the main database directory,
-	// not in the VLog subdirectory
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.vlog_max_file_size = 1024;
-		opts.max_memtable_size = 1024;
-		opts.enable_vlog = true;
-	});
-
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-	// Insert some data to ensure VLog and discard stats are created
-	let large_value = vec![1u8; 200]; // Large enough for VLog
-	for i in 0..5 {
-		let key = format!("key_{i}");
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), &large_value).unwrap();
-		txn.commit().await.unwrap();
-	}
-
-	// Force flush to create VLog files and initialize discard stats
-	tree.flush().unwrap();
-
-	// Update some keys to create discard statistics
-	let mut discard_updates = HashMap::new();
-	let stats = tree.get_all_vlog_stats();
-	for (file_id, total_size, _discard_bytes, _ratio) in &stats {
-		if *total_size > 0 {
-			discard_updates.insert(*file_id, (*total_size as f64 * 0.3) as i64);
-		}
-	}
-	tree.update_vlog_discard_stats(&discard_updates);
-
-	// Verify directory structure
-	let main_db_dir = &path;
-	let vlog_dir = path.join("vlog");
-	let sstables_dir = path.join("sstables");
-	let wal_dir = path.join("wal");
-	let discard_stats_dir = path.join("discard_stats");
-	let delete_list_dir = path.join("delete_list");
-
-	// Check that all expected directories exist
-	assert!(main_db_dir.exists(), "Main database directory should exist");
-	assert!(vlog_dir.exists(), "VLog directory should exist");
-	assert!(sstables_dir.exists(), "SSTables directory should exist");
-	assert!(wal_dir.exists(), "WAL directory should exist");
-	assert!(discard_stats_dir.exists(), "Discard stats directory should exist");
-	assert!(delete_list_dir.exists(), "Delete list directory should exist");
-
-	// Check that DISCARD file is in the main database directory
-	let discard_file_in_main = discard_stats_dir.join("DISCARD");
-	let discard_file_in_vlog = vlog_dir.join("DISCARD");
-
-	assert!(
-		discard_file_in_main.exists(),
-		"DISCARD file should exist in main database directory: {discard_file_in_main:?}"
-	);
-	assert!(
-		!discard_file_in_vlog.exists(),
-		"DISCARD file should NOT exist in VLog directory: {discard_file_in_vlog:?}"
-	);
-
-	// Verify that VLog files are in the VLog directory
-	let vlog_entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = vlog_entries
-		.filter_map(|entry| {
-			let entry = entry.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert!(!vlog_files.is_empty(), "Should have VLog files in the VLog directory");
-
-	// Verify that the DISCARD file is separate from VLog files
-	for vlog_file in &vlog_files {
-		assert_ne!(vlog_file, "DISCARD", "DISCARD should not be mistaken for a VLog file");
-	}
-
-	// Verify other expected files are in the main directory
-	let manifest_dir = main_db_dir.join("manifest");
-	assert!(
-		manifest_dir.exists(),
-		"manifest directory should be in main directory alongside DISCARD"
-	);
-
-	println!("✓ Directory structure verification passed:");
-	println!("  Main DB dir: {main_db_dir:?}");
-	println!(
-		"  DISCARD file: {:?} (exists: {})",
-		discard_file_in_main,
-		discard_file_in_main.exists()
-	);
-	println!("  VLog dir: {vlog_dir:?}");
-	println!("  Discard stats dir: {discard_stats_dir:?}");
-	println!("  Delete list dir: {delete_list_dir:?}");
-	println!("  VLog files: {vlog_files:?}");
-	println!("  manifest dir: {:?} (exists: {})", manifest_dir, manifest_dir.exists());
-}
-
-#[test(tokio::test)]
 async fn test_compaction_with_updates_and_delete() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
@@ -1447,16 +1337,9 @@ async fn test_compaction_with_updates_and_delete() {
 	// Flush memtable
 	tree.flush().unwrap();
 
-	// Force compaction
+	// Force compaction - this triggers automatic VLog cleanup via global-min approach
 	let strategy = Arc::new(Strategy::default());
 	tree.core.compact(strategy).unwrap();
-
-	// There could be multiple VLog files, need to garbage collect them all but
-	// only one should remain because the active VLog file does not get garbage
-	// collected
-	for _ in 0..6 {
-		tree.garbage_collect_vlog().await.unwrap();
-	}
 
 	// Verify all keys are gone after compaction
 	for key in keys.iter() {
@@ -1464,27 +1347,6 @@ async fn test_compaction_with_updates_and_delete() {
 		let result = tx.get(*key).unwrap();
 		assert_eq!(result, None);
 	}
-
-	// Verify that only one VLog file remains after garbage collection
-	let vlog_dir = path.join("vlog");
-	let entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = entries
-		.filter_map(|e| {
-			let entry = e.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert_eq!(
-		vlog_files.len(),
-		1,
-		"Should have exactly one VLog file after garbage collection, found: {vlog_files:?}"
-	);
 }
 
 #[test(tokio::test)]
@@ -1556,16 +1418,9 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 	// Flush memtable
 	tree.flush().unwrap();
 
-	// Force compaction
+	// Force compaction - this triggers automatic VLog cleanup via global-min approach
 	let strategy = Arc::new(Strategy::default());
 	tree.core.compact(strategy).unwrap();
-
-	// There could be multiple VLog files, need to garbage collect them all but
-	// only one should remain because the active VLog file does not get garbage
-	// collected
-	for _ in 0..6 {
-		tree.garbage_collect_vlog().await.unwrap();
-	}
 
 	// Verify all keys are gone after compaction
 	for key in keys.iter() {
@@ -1573,27 +1428,6 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let result = tx.get(*key).unwrap();
 		assert_eq!(result, None);
 	}
-
-	// Verify that only one VLog file remains after garbage collection
-	let vlog_dir = path.join("vlog");
-	let entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = entries
-		.filter_map(|e| {
-			let entry = e.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert_eq!(
-		vlog_files.len(),
-		1,
-		"Should have exactly one VLog file after garbage collection, found: {vlog_files:?}"
-	);
 }
 
 #[test(tokio::test)]
@@ -1668,27 +1502,23 @@ async fn test_vlog_compaction_preserves_sequence_numbers() {
 		assert_eq!(&value, "final_value_key1".repeat(10).as_bytes());
 	}
 
-	// --- Step 7: Trigger manual compaction of the LSM tree ---
+	// --- Step 7: Trigger manual compaction of the LSM tree (also triggers VLog cleanup via
+	// global-min approach) ---
 	let strategy = Arc::new(Strategy::default());
 	tree.core.compact(strategy).unwrap();
 
-	// --- Step 8: Run VLog garbage collection (which internally can trigger file
-	// compaction) ---
-	tree.garbage_collect_vlog().await.unwrap();
-
-	// --- Step 9: Verify key1 still returns the correct latest value after
-	// compaction ---
+	// --- Step 8: Verify key1 still returns the correct latest value after compaction ---
 	{
 		let tx = tree.begin().unwrap();
 		let value = tx.get(&key1).unwrap().unwrap();
 		assert_eq!(
-                &value,
-                "final_value_key1".repeat(10).as_bytes(),
-                "After VLog compaction, key1 returned incorrect value. The sequence number was not preserved during compaction."
-            );
+			&value,
+			"final_value_key1".repeat(10).as_bytes(),
+			"After compaction, key1 returned incorrect value. The sequence number was not preserved during compaction."
+		);
 	}
 
-	// --- Step 10: Clean shutdown ---
+	// --- Step 9: Clean shutdown ---
 	tree.close().await.unwrap();
 }
 
@@ -2207,7 +2037,7 @@ async fn test_checkpoint_with_vlog() {
 	// Create initial data with VLog enabled
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-	// Insert some data to ensure VLog and discard stats are created
+	// Insert some data to ensure VLog files are created
 	let large_value = vec![1u8; 200]; // Large enough for VLog
 	for i in 0..5 {
 		let key = format!("key_{i}");
@@ -2216,18 +2046,8 @@ async fn test_checkpoint_with_vlog() {
 		txn.commit().await.unwrap();
 	}
 
-	// Force flush to create VLog files and initialize discard stats
+	// Force flush to create VLog files
 	tree.flush().unwrap();
-
-	// Update some keys to create discard statistics
-	let mut discard_updates = HashMap::new();
-	let stats = tree.get_all_vlog_stats();
-	for (file_id, total_size, _discard_bytes, _ratio) in &stats {
-		if *total_size > 0 {
-			discard_updates.insert(*file_id, (*total_size as f64 * 0.3) as i64);
-		}
-	}
-	tree.update_vlog_discard_stats(&discard_updates);
 
 	// Create checkpoint
 	let checkpoint_dir = temp_dir.path().join("checkpoint");
@@ -2243,8 +2063,6 @@ async fn test_checkpoint_with_vlog() {
 	assert!(checkpoint_dir.join("wal").exists());
 	assert!(checkpoint_dir.join("manifest").exists());
 	assert!(checkpoint_dir.join("vlog").exists());
-	assert!(checkpoint_dir.join("discard_stats").exists());
-	assert!(checkpoint_dir.join("delete_list").exists());
 	assert!(checkpoint_dir.join("CHECKPOINT_METADATA").exists());
 
 	// Verify VLog files are in the checkpoint
@@ -2263,11 +2081,6 @@ async fn test_checkpoint_with_vlog() {
 		.collect();
 
 	assert!(!vlog_files.is_empty(), "Should have VLog files in the checkpoint");
-
-	// Verify discard stats file exists
-	let discard_stats_checkpoint_dir = checkpoint_dir.join("discard_stats");
-	assert!(discard_stats_checkpoint_dir.exists());
-	assert!(discard_stats_checkpoint_dir.join("DISCARD").exists());
 
 	// Insert more data after checkpoint
 	for i in 5..10 {
@@ -2308,14 +2121,10 @@ async fn test_checkpoint_with_vlog() {
 		assert!(result.is_none(), "Key '{key}' should not exist after restore");
 	}
 
-	// Verify VLog directories are restored
+	// Verify VLog directory is restored
 	let vlog_dir = opts.vlog_dir();
-	let discard_stats_dir = opts.discard_stats_dir();
-	let delete_list_dir = opts.delete_list_dir();
 
 	assert!(vlog_dir.exists(), "VLog directory should exist after restore");
-	assert!(discard_stats_dir.exists(), "Discard stats directory should exist after restore");
-	assert!(delete_list_dir.exists(), "Delete list directory should exist after restore");
 
 	// Verify VLog files are restored
 	let vlog_entries = std::fs::read_dir(&vlog_dir).unwrap();
@@ -2332,9 +2141,6 @@ async fn test_checkpoint_with_vlog() {
 		.collect();
 
 	assert!(!vlog_files.is_empty(), "Should have VLog files after restore");
-
-	// Verify discard stats file is restored
-	assert!(discard_stats_dir.join("DISCARD").exists(), "DISCARD file should exist after restore");
 }
 
 #[test_log::test(tokio::test)]
@@ -5177,5 +4983,1088 @@ async fn test_range_boundary_edge_cases() {
 		assert_eq!(result_keys[1], "aaa", "After flush: Second key should be 'aaa'");
 		assert_eq!(result_keys[2], "aaaa", "After flush: Third key should be 'aaaa'");
 		assert_eq!(result_keys[3], "aaaab", "After flush: Fourth key should be 'aaaab'");
+	}
+}
+
+/// Tests that versioned_index cleanup is triggered after VLog GC
+/// and that data integrity is maintained.
+#[test(tokio::test)]
+async fn test_versioned_index_cleanup_after_vlog_gc() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Create tree with versioned_index AND vlog enabled
+	// Note: versioned_index requires versioning to be enabled
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 2;
+		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
+		opts.enable_vlog = true;
+		opts.enable_versioning = true;
+		opts.versioned_history_retention_ns = 1_000_000_000_000; // 1000 seconds
+		opts.enable_versioned_index = true;
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Insert multiple key-value pairs that will go to VLog
+	let keys: Vec<String> = (0..10).map(|i| format!("key-{:04}", i)).collect();
+	let value = "x".repeat(100); // Large value to force VLog storage
+
+	// Insert first version of each key
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Insert second version (updates) to create older versions
+	let value2 = "y".repeat(100);
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value2.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Force compaction to trigger VLog GC and versioned_index cleanup
+	let strategy = Arc::new(Strategy::default());
+	tree.core.compact(strategy).unwrap();
+
+	// Verify that latest values are still accessible
+	for key in &keys {
+		let tx = tree.begin().unwrap();
+		let result = tx.get(key.as_bytes()).unwrap();
+		assert_eq!(
+			result,
+			Some(value2.as_bytes().to_vec()),
+			"Key {} should have latest value",
+			key
+		);
+	}
+}
+
+/// Tests that versioned_index cleanup is deadlock-free when running
+/// concurrently with writes.
+#[test(tokio::test)]
+async fn test_versioned_index_cleanup_concurrent_with_writes() {
+	use std::time::Duration;
+
+	use tokio::time::timeout;
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Create tree with versioned_index AND vlog enabled
+	// Note: versioned_index requires versioning to be enabled
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 2;
+		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
+		opts.enable_vlog = true;
+		opts.enable_versioning = true;
+		opts.versioned_history_retention_ns = 1_000_000_000_000; // 1000 seconds
+		opts.enable_versioned_index = true;
+	});
+
+	let tree = Arc::new(Tree::new(Arc::clone(&opts)).unwrap());
+
+	// First, insert some data and flush to create SSTs with VLog references
+	let value = "x".repeat(100);
+	for i in 0..5 {
+		let key = format!("setup-key-{:04}", i);
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Now run concurrent writes and compactions with a timeout
+	// If there's a deadlock, this will timeout
+	let result = timeout(Duration::from_secs(30), async {
+		let tree1 = Arc::clone(&tree);
+		let tree2 = Arc::clone(&tree);
+
+		// Spawn writer task
+		let writer_handle = tokio::spawn(async move {
+			let value = "y".repeat(100);
+			for i in 0..50 {
+				let key = format!("concurrent-key-{:04}", i);
+				let mut tx = tree1.begin().unwrap();
+				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				tx.commit().await.unwrap();
+
+				// Flush periodically to trigger cleanup
+				if i % 10 == 0 {
+					tree1.flush().unwrap();
+				}
+			}
+		});
+
+		// Spawn compaction task
+		let compactor_handle = tokio::spawn(async move {
+			for _ in 0..5 {
+				// Compact triggers versioned_index cleanup
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				let _ = tree2.core.compact(strategy);
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		});
+
+		// Wait for both tasks to complete
+		let (writer_result, compactor_result) = tokio::join!(writer_handle, compactor_handle);
+		writer_result.expect("Writer task should complete");
+		compactor_result.expect("Compactor task should complete");
+	})
+	.await;
+
+	// Assert that we didn't timeout (no deadlock)
+	assert!(result.is_ok(), "Test timed out - possible deadlock detected");
+
+	// Verify data integrity - all concurrent keys should be readable
+	for i in 0..50 {
+		let key = format!("concurrent-key-{:04}", i);
+		let tx = tree.begin().unwrap();
+		let result = tx.get(key.as_bytes()).unwrap();
+		assert!(result.is_some(), "Key {} should exist", key);
+	}
+}
+
+/// Tests that stale entries are actually deleted from the versioned_index (B+ tree)
+/// after VLog GC by directly inspecting the B+ tree contents.
+#[test(tokio::test)]
+async fn test_versioned_index_entries_deleted_after_gc() {
+	use crate::vlog::{ValueLocation, ValuePointer};
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Create tree with versioned_index AND vlog enabled
+	// Use a very short retention period so old versions get dropped during compaction
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 2;
+		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
+		opts.enable_vlog = true;
+		opts.enable_versioning = true;
+		opts.versioned_history_retention_ns = 1; // 1 nanosecond - immediately expire old versions
+		opts.enable_versioned_index = true;
+		opts.level0_max_files = 1; // Trigger compaction after each flush
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	// Phase 1: Insert initial data - these will go to VLog file 1
+	let keys: Vec<String> = (0..5).map(|i| format!("gc-test-key-{:04}", i)).collect();
+	let value1 = "x".repeat(100); // Large value to force VLog storage
+
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value1.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Small delay to ensure timestamps differ
+	tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+	// Phase 2: Update data - these will go to VLog file 2
+	let value2 = "y".repeat(100);
+	for key in &keys {
+		let mut tx = tree.begin().unwrap();
+		tx.set(key.as_bytes(), value2.as_bytes()).unwrap();
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Phase 3: Capture pre-GC state - count entries and VLog file IDs in B+ tree
+	let (pre_gc_count, pre_gc_file_ids) = {
+		let versioned_index = tree.core.inner.versioned_index.as_ref().unwrap();
+		let guard = versioned_index.read();
+
+		let empty: &[u8] = &[];
+		let mut count = 0;
+		let mut file_ids = std::collections::HashSet::new();
+
+		for entry in guard.range(empty..).unwrap() {
+			let (_, value) = entry.unwrap();
+			count += 1;
+
+			if let Ok(loc) = ValueLocation::decode(&value) {
+				if loc.is_value_pointer() {
+					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
+						file_ids.insert(ptr.file_id);
+					}
+				}
+			}
+		}
+
+		(count, file_ids)
+	};
+
+	// Should have entries from multiple VLog files (at least 2)
+	assert!(
+		pre_gc_file_ids.len() >= 2,
+		"Pre-GC should have entries from at least 2 VLog files, found: {:?}",
+		pre_gc_file_ids
+	);
+
+	// Phase 4: Trigger GC via compaction - use strategy with our options
+	let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+		Arc::new(Strategy::from_options(Arc::clone(&opts)));
+	tree.core.compact(Arc::clone(&strategy)).unwrap();
+
+	// Phase 5: Verify entries deleted - count should be less and no stale file IDs
+	let (post_gc_count, post_gc_file_ids, min_file_id) = {
+		let versioned_index = tree.core.inner.versioned_index.as_ref().unwrap();
+		let guard = versioned_index.read();
+
+		let empty: &[u8] = &[];
+		let mut count = 0;
+		let mut file_ids = std::collections::HashSet::new();
+		let mut min_id = u32::MAX;
+
+		for entry in guard.range(empty..).unwrap() {
+			let (_, value) = entry.unwrap();
+			count += 1;
+
+			if let Ok(loc) = ValueLocation::decode(&value) {
+				if loc.is_value_pointer() {
+					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
+						file_ids.insert(ptr.file_id);
+						min_id = min_id.min(ptr.file_id);
+					}
+				}
+			}
+		}
+
+		(count, file_ids, min_id)
+	};
+
+	// Entry count should be reduced (stale entries deleted)
+	assert!(
+		post_gc_count < pre_gc_count,
+		"Entry count should decrease after GC: pre={}, post={}",
+		pre_gc_count,
+		post_gc_count
+	);
+
+	// Should have fewer unique VLog file IDs (old files deleted)
+	assert!(
+		post_gc_file_ids.len() < pre_gc_file_ids.len(),
+		"Should have fewer VLog file references after GC: pre={:?}, post={:?}",
+		pre_gc_file_ids,
+		post_gc_file_ids
+	);
+
+	// All remaining file IDs should be >= min valid (no stale references)
+	for file_id in &post_gc_file_ids {
+		assert!(
+			*file_id >= min_file_id,
+			"Found stale file_id {} < min_valid {}",
+			file_id,
+			min_file_id
+		);
+	}
+
+	// Verify data integrity - latest values should still be accessible
+	for key in &keys {
+		let tx = tree.begin().unwrap();
+		let result = tx.get(key.as_bytes()).unwrap();
+		assert_eq!(
+			result,
+			Some(value2.as_bytes().to_vec()),
+			"Key {} should have latest value after GC",
+			key
+		);
+	}
+}
+
+/// Tests that VLog files persist correctly across shutdown/restart.
+/// This validates that the VLog GC mechanism doesn't incorrectly delete
+/// files that are still referenced by SSTs.
+#[test(tokio::test)]
+async fn test_vlog_files_persist_across_restart() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.vlog_max_file_size = 512; // Very small to force many file rotations
+		opts.enable_vlog = true;
+	});
+
+	let num_records = 1000;
+	let mut keys_and_values = Vec::with_capacity(num_records);
+
+	// Phase 1: Insert data and verify VLog files are created
+	let vlog_files_before_shutdown: Vec<String>;
+	{
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Insert 1000 records with ~100 byte values each
+		for i in 0..num_records {
+			let key = format!("persist_key_{i:04}");
+			let value = format!("persist_value_{i}_padding_{}", "X".repeat(80));
+			keys_and_values.push((key.clone(), value.clone()));
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		// Flush to ensure data is persisted to SST (so VLog files are referenced)
+		tree.flush().unwrap();
+
+		// Count VLog files before shutdown
+		let vlog_dir = path.join("vlog");
+		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		vlog_files_before_shutdown = entries
+			.filter_map(|e| {
+				let entry = e.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		// Should have multiple VLog files due to small file size
+		assert!(
+			vlog_files_before_shutdown.len() > 10,
+			"Expected more than 10 VLog files due to small file size, got {}",
+			vlog_files_before_shutdown.len()
+		);
+
+		log::info!("VLog files before shutdown: {} files", vlog_files_before_shutdown.len());
+
+		// Close the tree
+		tree.close().await.unwrap();
+	}
+
+	// Phase 2: Reopen, add 10 new entries, flush, and verify all records (repeat 5 times)
+	// Track VLog file count - should only grow or stay same, never decrease
+	let mut previous_vlog_count = vlog_files_before_shutdown.len();
+
+	for iteration in 1..=5 {
+		log::info!("=== Restart iteration {}/5 ===", iteration);
+
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Count VLog files after restart (before adding new entries)
+		let vlog_dir = path.join("vlog");
+		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		let vlog_files_after_restart: Vec<String> = entries
+			.filter_map(|e| {
+				let entry = e.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		log::info!(
+			"VLog files after restart {}: {} files (previous: {})",
+			iteration,
+			vlog_files_after_restart.len(),
+			previous_vlog_count
+		);
+
+		// VLog file count should not decrease (GC should not delete referenced files)
+		assert!(
+			vlog_files_after_restart.len() >= previous_vlog_count,
+			"VLog file count decreased after restart {}: previous={}, after={}",
+			iteration,
+			previous_vlog_count,
+			vlog_files_after_restart.len()
+		);
+
+		// Add 10 new entries
+		let new_entries_start = num_records + (iteration - 1) * 10;
+		for i in 0..10 {
+			let idx = new_entries_start + i;
+			let key = format!("persist_key_{idx:04}");
+			let value = format!("persist_value_{idx}_padding_{}", "X".repeat(80));
+			keys_and_values.push((key.clone(), value.clone()));
+
+			let mut txn = tree.begin().unwrap();
+			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		log::info!("Added 10 new entries (total records: {})", keys_and_values.len());
+
+		// Flush to persist new entries
+		tree.flush().unwrap();
+
+		// Count VLog files after flush
+		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		let vlog_files_after_flush: Vec<String> = entries
+			.filter_map(|e| {
+				let entry = e.ok()?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if opts.is_vlog_filename(&name) {
+					Some(name)
+				} else {
+					None
+				}
+			})
+			.collect();
+
+		log::info!("VLog files after flush {}: {} files", iteration, vlog_files_after_flush.len());
+
+		// Update previous count for next iteration
+		previous_vlog_count = vlog_files_after_flush.len();
+
+		// Verify ALL records are readable (original 1000 + all newly added)
+		for (key, expected_value) in &keys_and_values {
+			let txn = tree.begin().unwrap();
+			let result = txn.get(key.as_bytes()).unwrap();
+			assert_eq!(
+				result,
+				Some(expected_value.as_bytes().to_vec()),
+				"Key {} has incorrect value after restart {}",
+				key,
+				iteration
+			);
+		}
+
+		log::info!("Verified all {} records after restart {}", keys_and_values.len(), iteration);
+
+		tree.close().await.unwrap();
+	}
+
+	// Final verification: 1000 + 5*10 = 1050 records
+	assert_eq!(
+		keys_and_values.len(),
+		1050,
+		"Expected 1050 total records (1000 initial + 5*10 added)"
+	);
+
+	log::info!(
+		"All 5 restart iterations passed successfully with {} total records",
+		keys_and_values.len()
+	);
+}
+
+#[test(tokio::test)]
+async fn test_vlog_gc_non_versioned_surrealdb_style_keys() {
+	// This test tries to mimics the SurrealDB bug scenario:
+	//
+	// https://github.com/surrealdb/surrealdb/issues/6872
+	//
+	//
+	// Timeline from user report:
+	// - Feb 11: Fresh import, everything working
+	// - Feb 11-12: Normal daemon operation (~24h), no issues
+	// - Feb 12 evening: macOS reboot → SIGTERM shutdown
+	// - Feb 13 morning: Server restarts clean, corruption present
+	// - Progressive corruption: queries that worked start failing as more data written
+	//
+	// Test structure:
+	// 1. Phase 1: 500 update rounds + periodic GC (simulates ~24h operation)
+	// 2. Close + reopen database (simulates SIGTERM + restart)
+	// 3. Phase 2: 500 more update rounds + periodic GC (simulates post-restart)
+	// 4. Verify ALL 200 keys accessible (catches progressive corruption)
+
+	// Helper to print VLog files and SSTables
+	fn print_storage_state(path: &std::path::Path, tree: &Tree, phase: &str, round: usize) {
+		// List VLog files
+		let vlog_dir = path.join("vlog");
+		let vlog_files: Vec<String> = if vlog_dir.exists() {
+			std::fs::read_dir(&vlog_dir)
+				.unwrap()
+				.filter_map(|e| {
+					let entry = e.ok()?;
+					let name = entry.file_name().to_string_lossy().to_string();
+					if name.ends_with(".vlog") {
+						Some(name)
+					} else {
+						None
+					}
+				})
+				.collect()
+		} else {
+			vec![]
+		};
+
+		// List SSTable files
+		let sstables_dir = path.join("sstables");
+		let sstable_files: Vec<String> = if sstables_dir.exists() {
+			std::fs::read_dir(&sstables_dir)
+				.unwrap()
+				.filter_map(|e| {
+					let entry = e.ok()?;
+					let name = entry.file_name().to_string_lossy().to_string();
+					if name.ends_with(".sst") {
+						Some(name)
+					} else {
+						None
+					}
+				})
+				.collect()
+		} else {
+			vec![]
+		};
+
+		// Get SSTable counts per level from manifest
+		let manifest = tree.core.level_manifest.read().unwrap();
+		let levels = manifest.levels.get_levels();
+		let level_counts: Vec<usize> = levels.iter().map(|l| l.tables.len()).collect();
+
+		println!("[{} round {}] VLog files ({}): {:?}", phase, round, vlog_files.len(), vlog_files);
+		println!(
+			"[{} round {}] SSTable files ({}): {:?}",
+			phase,
+			round,
+			sstable_files.len(),
+			sstable_files
+		);
+		println!("[{} round {}] SSTables per level: {:?}", phase, round, level_counts);
+		println!("---");
+	}
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 1; // Only L0 - always bottom level for stale marking
+		opts.enable_vlog = true;
+		opts.vlog_max_file_size = 128 * 1024; // 128KB files - larger to reduce file count
+	});
+
+	// SurrealDB-style: 50 records, each with 4 fields
+	// Key format: /ns/db/tb/record_NNN:fieldN
+	const NUM_RECORDS: usize = 50;
+	const FIELDS: [&str; 4] = ["field1", "field2", "field3", "field4"];
+	const ROUNDS_PER_PHASE: usize = 100;
+	const GC_INTERVAL: usize = 10;
+
+	// ========== PHASE 1: Normal operation (simulates ~24h daemon) ==========
+	{
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		for round in 0..ROUNDS_PER_PHASE {
+			// Update all 50 records
+			let mut tx = tree.begin().unwrap();
+			for record_id in 0..NUM_RECORDS {
+				for field in &FIELDS {
+					let key = format!("/ns/db/tb/record_{:03}:{}", record_id, field);
+					let value =
+						format!("phase1_record_{}_{}_{}", record_id, field, round).repeat(10);
+					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				}
+			}
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			// Periodic compaction + VLog GC
+			if round > 0 && round % GC_INTERVAL == 0 {
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				for _ in 0..6 {
+					tree.core.compact(Arc::clone(&strategy)).unwrap();
+				}
+				print_storage_state(&path, &tree, "Phase1", round);
+			}
+		}
+
+		// Final GC before "shutdown"
+		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+			Arc::new(Strategy::default());
+		tree.core.compact(strategy).unwrap();
+		print_storage_state(&path, &tree, "Phase1-Final", ROUNDS_PER_PHASE);
+
+		// Simulate SIGTERM shutdown
+		tree.close().await.unwrap();
+	}
+
+	// ========== PHASE 2: Post-restart operation ==========
+	{
+		// Reopen database (simulates server restart after SIGTERM)
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		for round in 0..ROUNDS_PER_PHASE {
+			// Update all 50 records (post-restart)
+			let mut tx = tree.begin().unwrap();
+			for record_id in 0..NUM_RECORDS {
+				for field in &FIELDS {
+					let key = format!("/ns/db/tb/record_{:03}:{}", record_id, field);
+					let value =
+						format!("phase2_record_{}_{}_{}", record_id, field, round).repeat(10);
+					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				}
+			}
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			// Periodic compaction + VLog GC (this is where progressive corruption would appear)
+			if round > 0 && round % GC_INTERVAL == 0 {
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				for _ in 0..6 {
+					tree.core.compact(Arc::clone(&strategy)).unwrap();
+				}
+				print_storage_state(&path, &tree, "Phase2", round);
+			}
+		}
+
+		// Final GC pass
+		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+			Arc::new(Strategy::default());
+		tree.core.compact(strategy).unwrap();
+		print_storage_state(&path, &tree, "Phase2-Final", ROUNDS_PER_PHASE);
+
+		// ========== VERIFY: All records accessible (no "file not found" errors) ==========
+		// This catches the progressive corruption scenario where queries start failing
+		// as more data accumulates post-restart
+		// NOTE: We check ALL records, not LIMIT 1 (which would hide the bug)
+		let tx = tree.begin().unwrap();
+		for record_id in 0..NUM_RECORDS {
+			for field in &FIELDS {
+				let key = format!("/ns/db/tb/record_{:03}:{}", record_id, field);
+				let result = tx.get(key.as_bytes()).unwrap();
+				assert!(
+					result.is_some(),
+					"Record {} field {} should exist - got 'file not found' IO error",
+					record_id,
+					field
+				);
+
+				let expected =
+					format!("phase2_record_{}_{}_{}", record_id, field, ROUNDS_PER_PHASE - 1)
+						.repeat(10);
+				assert_eq!(
+					result.unwrap(),
+					expected.as_bytes(),
+					"Record {} field {} should have latest phase2 value",
+					record_id,
+					field
+				);
+			}
+		}
+
+		tree.close().await.unwrap();
+	}
+}
+
+#[test(tokio::test)]
+async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
+	// This test comprehensively tests VLog GC with a realistic workload pattern:
+	//
+	// Pattern: Updates → Deletes → Re-updates (same keys)
+	//
+	// This tests the critical scenarios:
+	// 1. Values written to VLog, then updated (old versions become stale)
+	// 2. Records deleted (tombstones written, values become stale)
+	// 3. Same keys re-inserted (new values written, tombstones superseded)
+	// 4. Compaction + VLog GC must correctly handle all these state transitions
+	// 5. Restart and verify no corruption
+	//
+	// The bug scenario: VLog GC may incorrectly delete VLog files that still
+	// contain live data if the delete_list or discard_stats are inconsistent.
+
+	fn print_storage_state(path: &std::path::Path, tree: &Tree, phase: &str, round: usize) {
+		let vlog_dir = path.join("vlog");
+		let vlog_files: Vec<String> = if vlog_dir.exists() {
+			std::fs::read_dir(&vlog_dir)
+				.unwrap()
+				.filter_map(|e| {
+					let entry = e.ok()?;
+					let name = entry.file_name().to_string_lossy().to_string();
+					if name.ends_with(".vlog") {
+						Some(name)
+					} else {
+						None
+					}
+				})
+				.collect()
+		} else {
+			vec![]
+		};
+
+		let sstables_dir = path.join("sstables");
+		let sstable_files: Vec<String> = if sstables_dir.exists() {
+			std::fs::read_dir(&sstables_dir)
+				.unwrap()
+				.filter_map(|e| {
+					let entry = e.ok()?;
+					let name = entry.file_name().to_string_lossy().to_string();
+					if name.ends_with(".sst") {
+						Some(name)
+					} else {
+						None
+					}
+				})
+				.collect()
+		} else {
+			vec![]
+		};
+
+		let manifest = tree.core.level_manifest.read().unwrap();
+		let levels = manifest.levels.get_levels();
+		let level_counts: Vec<usize> = levels.iter().map(|l| l.tables.len()).collect();
+
+		println!("[{} round {}] VLog files ({}): {:?}", phase, round, vlog_files.len(), vlog_files);
+		println!(
+			"[{} round {}] SSTable files ({}): {:?}",
+			phase,
+			round,
+			sstable_files.len(),
+			sstable_files
+		);
+		println!("[{} round {}] SSTables per level: {:?}", phase, round, level_counts);
+		println!("---");
+	}
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	let opts = create_test_options(path.clone(), |opts| {
+		opts.level_count = 1; // Only L0 - always bottom level for stale marking
+		opts.enable_vlog = true;
+		opts.vlog_max_file_size = 128 * 1024; // 128KB files - smaller to create more files
+	});
+
+	const NUM_RECORDS: usize = 100;
+	const FIELDS: [&str; 3] = ["data", "metadata", "content"];
+	const ROUNDS: usize = 50;
+	const GC_INTERVAL: usize = 5;
+
+	// Track which records are currently "deleted" vs "live"
+	// Even records (0, 2, 4, ...) will be deleted and re-inserted
+	// Odd records (1, 3, 5, ...) will just be updated
+
+	// ========== PHASE 1: Initial data + mixed updates/deletes ==========
+	{
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Initial insert of all records
+		println!("=== PHASE 1: Initial insert ===");
+		{
+			let mut tx = tree.begin().unwrap();
+			for record_id in 0..NUM_RECORDS {
+				for field in &FIELDS {
+					let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+					let value = format!("initial_value_{}_{}", record_id, field).repeat(20);
+					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+				}
+			}
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+		}
+
+		// Run compaction + GC
+		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+			Arc::new(Strategy::default());
+		for _ in 0..3 {
+			tree.core.compact(Arc::clone(&strategy)).unwrap();
+		}
+		print_storage_state(&path, &tree, "Phase1-Initial", 0);
+
+		// Mixed workload: updates + deletes + re-inserts
+		for round in 0..ROUNDS {
+			let mut tx = tree.begin().unwrap();
+
+			for record_id in 0..NUM_RECORDS {
+				let is_even = record_id % 2 == 0;
+				let delete_this_round = is_even && (round % 3 == 0); // Delete every 3rd round
+				let reinsert_this_round = is_even && (round % 3 == 1); // Re-insert next round
+
+				if delete_this_round {
+					// DELETE even records every 3rd round
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						tx.delete(key.as_bytes()).unwrap();
+					}
+				} else if reinsert_this_round {
+					// RE-INSERT previously deleted records
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						let value =
+							format!("reinserted_round{}_{}_{}", round, record_id, field).repeat(20);
+						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+					}
+				} else {
+					// UPDATE (both even and odd records when not deleting/reinserting)
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						let value =
+							format!("updated_round{}_{}_{}", round, record_id, field).repeat(20);
+						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+					}
+				}
+			}
+
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			// Periodic compaction + VLog GC
+			if round > 0 && round % GC_INTERVAL == 0 {
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				for _ in 0..4 {
+					tree.core.compact(Arc::clone(&strategy)).unwrap();
+				}
+				print_storage_state(&path, &tree, "Phase1-Mixed", round);
+			}
+		}
+
+		// Final compaction + GC before shutdown
+		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+			Arc::new(Strategy::default());
+		for _ in 0..5 {
+			tree.core.compact(Arc::clone(&strategy)).unwrap();
+		}
+		print_storage_state(&path, &tree, "Phase1-Final", ROUNDS);
+
+		// Verify all records before shutdown
+		println!("=== Verifying Phase 1 data before shutdown ===");
+		let tx = tree.begin().unwrap();
+		for record_id in 0..NUM_RECORDS {
+			for field in &FIELDS {
+				let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+				let result = tx.get(key.as_bytes());
+				assert!(
+					result.is_ok(),
+					"Phase1: Record {} field {} get() should not error",
+					record_id,
+					field
+				);
+				// All records should exist (even ones were re-inserted)
+				assert!(
+					result.unwrap().is_some(),
+					"Phase1: Record {} field {} should exist",
+					record_id,
+					field
+				);
+			}
+		}
+
+		// Simulate SIGTERM shutdown
+		tree.close().await.unwrap();
+	}
+
+	// ========== PHASE 2: Post-restart - more mixed operations ==========
+	{
+		println!("=== PHASE 2: Post-restart ===");
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Verify all records accessible after restart (before any new writes)
+		println!("=== Verifying data after restart ===");
+		{
+			let tx = tree.begin().unwrap();
+			for record_id in 0..NUM_RECORDS {
+				for field in &FIELDS {
+					let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+					let result = tx.get(key.as_bytes());
+					assert!(
+						result.is_ok(),
+						"Post-restart: Record {} field {} get() should not error - got {:?}",
+						record_id,
+						field,
+						result.err()
+					);
+					assert!(
+						result.unwrap().is_some(),
+						"Post-restart: Record {} field {} should exist",
+						record_id,
+						field
+					);
+				}
+			}
+		}
+
+		// More mixed operations post-restart
+		for round in 0..ROUNDS {
+			let mut tx = tree.begin().unwrap();
+
+			for record_id in 0..NUM_RECORDS {
+				let is_odd = record_id % 2 == 1;
+				let delete_this_round = is_odd && (round % 4 == 0); // Delete odd records every 4th round
+				let reinsert_this_round = is_odd && (round % 4 == 2); // Re-insert 2 rounds later
+
+				if delete_this_round {
+					// DELETE odd records
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						tx.delete(key.as_bytes()).unwrap();
+					}
+				} else if reinsert_this_round {
+					// RE-INSERT previously deleted odd records
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						let value =
+							format!("phase2_reinsert_round{}_{}_{}", round, record_id, field)
+								.repeat(20);
+						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+					}
+				} else {
+					// UPDATE all records
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						let value = format!("phase2_update_round{}_{}_{}", round, record_id, field)
+							.repeat(20);
+						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+					}
+				}
+			}
+
+			tx.commit().await.unwrap();
+			tree.flush().unwrap();
+
+			// Periodic compaction + VLog GC
+			if round > 0 && round % GC_INTERVAL == 0 {
+				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+					Arc::new(Strategy::default());
+				for _ in 0..4 {
+					tree.core.compact(Arc::clone(&strategy)).unwrap();
+				}
+				print_storage_state(&path, &tree, "Phase2-Mixed", round);
+
+				// Verify records accessible after each GC cycle (catches progressive corruption)
+				let verify_tx = tree.begin().unwrap();
+				for record_id in 0..NUM_RECORDS {
+					// Determine expected state for this record at this round
+					let is_odd = record_id % 2 == 1;
+					let was_deleted_this_round = is_odd && (round % 4 == 0);
+					let was_reinserted_this_round = is_odd && (round % 4 == 2);
+
+					// Record should exist unless it was deleted this round and not reinserted
+					let should_exist = !was_deleted_this_round || was_reinserted_this_round;
+					// Note: even records are always updated (never deleted in phase 2)
+					// Odd records: deleted at round%4==0, reinserted at round%4==2
+					// At round 20: 20%4==0, so odd records are deleted → should NOT exist
+					// At round 10: 10%4==2, so odd records are reinserted → should exist
+
+					for field in &FIELDS {
+						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+						let result = verify_tx.get(key.as_bytes());
+						assert!(
+							result.is_ok(),
+							"Phase2 round {}: Record {} field {} get() error: {:?}",
+							round,
+							record_id,
+							field,
+							result.err()
+						);
+
+						let value = result.unwrap();
+						if should_exist {
+							assert!(
+								value.is_some(),
+								"Phase2 round {}: Record {} field {} should exist but is None (VLog corruption?)",
+								round,
+								record_id,
+								field
+							);
+						} else {
+							assert!(
+								value.is_none(),
+								"Phase2 round {}: Record {} field {} should be deleted but still exists",
+								round,
+								record_id,
+								field
+							);
+						}
+					}
+				}
+			}
+		}
+
+		// Final compaction + GC
+		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
+			Arc::new(Strategy::default());
+		tree.core.compact(strategy).unwrap();
+		print_storage_state(&path, &tree, "Phase2-Final", ROUNDS);
+
+		// Final verification
+		println!("=== Final verification ===");
+		let tx = tree.begin().unwrap();
+		for record_id in 0..NUM_RECORDS {
+			for field in &FIELDS {
+				let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+				let result = tx.get(key.as_bytes());
+				assert!(
+					result.is_ok(),
+					"Final: Record {} field {} get() error: {:?}",
+					record_id,
+					field,
+					result.err()
+				);
+				let value = result.unwrap();
+				assert!(
+					value.is_some(),
+					"Final: Record {} field {} missing - VLog file may have been incorrectly deleted",
+					record_id,
+					field
+				);
+			}
+		}
+
+		tree.close().await.unwrap();
+	}
+
+	// ========== PHASE 3: Another restart cycle to catch delayed corruption ==========
+	{
+		println!("=== PHASE 3: Second restart verification ===");
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Full scan of all records
+		// After round 49 (last round), all records were updated, so all should exist
+		// Last round: 49 % 4 == 1 → UPDATE all records (not delete/reinsert)
+		let tx = tree.begin().unwrap();
+		let mut accessible_count = 0;
+		let mut io_error_count = 0;
+		let mut none_count = 0;
+
+		for record_id in 0..NUM_RECORDS {
+			for field in &FIELDS {
+				let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
+				match tx.get(key.as_bytes()) {
+					Ok(Some(_)) => accessible_count += 1,
+					Ok(None) => {
+						// After round 49, all records should exist
+						println!(
+							"ERROR: Record {} field {} is None (should exist after round 49 update)",
+							record_id, field
+						);
+						none_count += 1;
+					}
+					Err(e) => {
+						println!(
+							"ERROR: Record {} field {} - IO error (VLog corruption): {:?}",
+							record_id, field, e
+						);
+						io_error_count += 1;
+					}
+				}
+			}
+		}
+
+		println!(
+			"=== Results: {} accessible, {} None, {} IO errors out of {} total ===",
+			accessible_count,
+			none_count,
+			io_error_count,
+			NUM_RECORDS * FIELDS.len()
+		);
+
+		assert_eq!(
+			io_error_count, 0,
+			"Found {} records with IO errors - VLog corruption detected!",
+			io_error_count
+		);
+		assert_eq!(
+			none_count, 0,
+			"Found {} records unexpectedly None - data loss detected!",
+			none_count
+		);
+		assert_eq!(accessible_count, NUM_RECORDS * FIELDS.len(), "Not all records accessible");
+
+		tree.close().await.unwrap();
 	}
 }

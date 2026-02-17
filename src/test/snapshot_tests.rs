@@ -461,6 +461,7 @@ fn test_range_skips_non_overlapping_tables() {
 		active: Arc::new(MemTable::default()),
 		immutable: Vec::new(),
 		levels,
+		versioned_index: None,
 	};
 
 	// Range that only overlaps with table2
@@ -850,6 +851,7 @@ fn create_iter_state_with_tables(
 		active: Arc::new(MemTable::default()),
 		immutable: vec![],
 		levels,
+		versioned_index: None,
 	}
 }
 

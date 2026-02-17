@@ -156,17 +156,6 @@ impl Batch {
 		self.add_record_internal(kind, key, value, None, timestamp)
 	}
 
-	pub(crate) fn add_record_with_valueptr(
-		&mut self,
-		kind: InternalKeyKind,
-		key: Key,
-		value: Option<Value>,
-		valueptr: Option<ValuePointer>,
-		timestamp: u64,
-	) -> Result<()> {
-		self.add_record_internal(kind, key, value, valueptr, timestamp)
-	}
-
 	pub(crate) fn count(&self) -> u32 {
 		self.entries.len() as u32
 	}

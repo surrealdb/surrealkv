@@ -36,10 +36,8 @@ fn create_test_vlog() -> (Arc<VLog>, TempDir) {
 		..Default::default()
 	};
 	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-	std::fs::create_dir_all(opts.discard_stats_dir()).unwrap();
-	std::fs::create_dir_all(opts.delete_list_dir()).unwrap();
 
-	let vlog = Arc::new(VLog::new(Arc::new(opts), None).unwrap());
+	let vlog = Arc::new(VLog::new(Arc::new(opts)).unwrap());
 	(vlog, temp_dir)
 }
 
@@ -114,7 +112,6 @@ fn test_merge_iterator_sequence_ordering() {
 		vec![iter1, iter2],
 		create_comparator(),
 		false,
-		None,
 		false, // versioning disabled
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -194,7 +191,6 @@ fn test_compaction_iterator_hard_delete_filtering() {
 		vec![iter1, iter2],
 		create_comparator(),
 		false,
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -269,7 +265,6 @@ fn test_compaction_iterator_hard_delete_filtering() {
 		vec![iter1, iter2],
 		create_comparator(),
 		true, // bottom level
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -326,7 +321,6 @@ async fn test_combined_iterator_returns_latest_version() {
 		vec![iter1, iter2, iter3],
 		create_comparator(),
 		false, // not bottom level
-		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -345,17 +339,6 @@ async fn test_combined_iterator_returns_latest_version() {
 	assert_eq!(
 		returned_value, &value_v3,
 		"Should return the value corresponding to the latest version (seq=300)"
-	);
-
-	// Flush any remaining delete list batch
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Verify that older versions are marked as stale, but latest is not
-	assert!(vlog.is_stale(100).unwrap(), "Older version (seq=100) should be marked as stale");
-	assert!(vlog.is_stale(200).unwrap(), "Older version (seq=200) should be marked as stale");
-	assert!(
-		!vlog.is_stale(300).unwrap(),
-		"Latest version (seq=300) should NOT be marked as stale since it was returned"
 	);
 }
 
@@ -384,7 +367,6 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 		vec![iter1, iter2, iter3],
 		create_comparator(),
 		false, // not bottom level
-		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -401,25 +383,6 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 	assert_eq!(
 		returned_value, &value_v3,
 		"Should return the value corresponding to the latest version (seq=300)"
-	);
-
-	// Flush delete list batch to VLog
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Verify that the delete list batch was properly flushed
-	assert_eq!(
-		comp_iter.delete_list_batch.len(),
-		0,
-		"Delete list batch should be empty after flush"
-	);
-
-	// Verify that older versions are marked as stale
-	assert!(vlog.is_stale(100).unwrap(), "Older version (seq=100) should be marked as stale");
-	assert!(vlog.is_stale(200).unwrap(), "Older version (seq=200) should be marked as stale");
-	// Latest version (seq=300) should NOT be marked as stale since it was returned
-	assert!(
-		!vlog.is_stale(300).unwrap(),
-		"Latest version (seq=300) should NOT be marked as stale since it was returned"
 	);
 }
 
@@ -444,7 +407,6 @@ async fn test_hard_delete_at_bottom_level() {
 		vec![iter1, iter2],
 		create_comparator(),
 		true, // bottom level
-		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -454,18 +416,6 @@ async fn test_hard_delete_at_bottom_level() {
 	// At bottom level, hard_delete should NOT be returned
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 	assert_eq!(result.len(), 0, "At bottom level, hard_delete should not be returned");
-
-	// Flush delete list batch
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Both hard_delete and older value should be added to delete list
-	// At bottom level, both the hard_delete and the older value should be marked as
-	// stale
-	assert!(
-		vlog.is_stale(200).unwrap(),
-		"hard_delete (seq=200) should be marked as stale at bottom level"
-	);
-	assert!(vlog.is_stale(100).unwrap(), "Older value (seq=100) should be marked as stale");
 }
 
 #[test(tokio::test)]
@@ -489,7 +439,6 @@ async fn test_hard_delete_at_non_bottom_level() {
 		vec![iter1, iter2],
 		create_comparator(),
 		false, // not bottom level
-		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -506,19 +455,6 @@ async fn test_hard_delete_at_non_bottom_level() {
 	assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
 	// Verify hard_delete has empty value
 	assert_eq!(returned_value.len(), 0, "hard_delete should have empty value");
-
-	// Flush delete list batch
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Only the older value should be added to delete list (not the hard_delete)
-	// Check that the older value (seq=100) is marked as stale
-	assert!(vlog.is_stale(100).unwrap(), "Older value (seq=100) should be marked as stale");
-	// Check that the hard_delete (seq=200) is NOT marked as stale (since it was
-	// returned)
-	assert!(
-		!vlog.is_stale(200).unwrap(),
-		"hard_delete (seq=200) should NOT be marked as stale since it was returned"
-	);
 }
 
 #[test(tokio::test)]
@@ -554,7 +490,6 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 		vec![iter1, iter2, iter3],
 		create_comparator(),
 		false, // not bottom level
-		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -585,31 +520,6 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 	assert_eq!(result[0].1, key1_val2, "key1 should have the latest value (key1_val2)");
 	assert_eq!(result[1].1.len(), 0, "key2 hard_delete should have empty value");
 	assert_eq!(result[2].1, key3_val1, "key3 should have its only value (key3_val1)");
-
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Verify delete list behavior for complex scenario:
-	// Key1: seq=100 should be stale (older version), seq=200 should NOT be stale
-	// (latest, returned)
-	assert!(vlog.is_stale(100).unwrap(), "Key1 older version (seq=100) should be marked as stale");
-	assert!(
-		!vlog.is_stale(200).unwrap(),
-		"Key1 latest version (seq=200) should NOT be marked as stale since it was returned"
-	);
-
-	// Key2: seq=110 should be stale (older version), seq=210 should NOT be stale
-	// (latest hard_delete, returned)
-	assert!(vlog.is_stale(110).unwrap(), "Key2 older version (seq=110) should be marked as stale");
-	assert!(
-		!vlog.is_stale(210).unwrap(),
-		"Key2 latest hard_delete (seq=210) should NOT be marked as stale since it was returned"
-	);
-
-	// Key3: seq=150 should NOT be stale (only version, returned)
-	assert!(
-		!vlog.is_stale(150).unwrap(),
-		"Key3 only version (seq=150) should NOT be marked as stale since it was returned"
-	);
 }
 
 #[test]
@@ -633,7 +543,6 @@ fn test_no_vlog_no_delete_list() {
 		vec![iter1, iter2],
 		create_comparator(),
 		false, // not bottom level
-		None,  // no vlog
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -653,9 +562,6 @@ fn test_no_vlog_no_delete_list() {
 		b"value2",
 		"Should return the value corresponding to the latest version (seq=200)"
 	);
-
-	// Delete list batch should be empty since no VLog
-	assert_eq!(comp_iter.delete_list_batch.len(), 0);
 }
 
 #[test(tokio::test)]
@@ -699,7 +605,6 @@ async fn test_sequence_ordering_across_iterators() {
 		vec![iter1, iter2, iter3],
 		create_comparator(),
 		false, // not bottom level
-		Some(Arc::clone(&vlog)),
 		false,
 		0,
 		Arc::new(MockLogicalClock::default()),
@@ -732,51 +637,6 @@ async fn test_sequence_ordering_across_iterators() {
 	assert_eq!(result[1].1, val_b_v2, "key_b should have its only value (val_b_v2)");
 	assert_eq!(result[2].1.len(), 0, "key_c hard_delete should have empty value");
 	assert_eq!(result[3].1, val_d_v1, "key_d should have its only value (val_d_v1)");
-
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Verify delete list behavior for sequence ordering test:
-	// key_a: seq=100,200 should be stale (older versions), seq=300 should NOT be
-	// stale (latest, returned)
-	assert!(
-		vlog.is_stale(100).unwrap(),
-		"key_a oldest version (seq=100) should be marked as stale"
-	);
-	assert!(
-		vlog.is_stale(200).unwrap(),
-		"key_a middle version (seq=200) should be marked as stale"
-	);
-	assert!(
-		!vlog.is_stale(300).unwrap(),
-		"key_a latest version (seq=300) should NOT be marked as stale since it was returned"
-	);
-
-	// key_b: seq=250 should NOT be stale (only version, returned)
-	assert!(
-		!vlog.is_stale(250).unwrap(),
-		"key_b only version (seq=250) should NOT be marked as stale since it was returned"
-	);
-
-	// key_c: seq=120,220 should be stale (older versions), seq=350 should NOT be
-	// stale (latest hard_delete, returned)
-	assert!(
-		vlog.is_stale(120).unwrap(),
-		"key_c oldest version (seq=120) should be marked as stale"
-	);
-	assert!(
-		vlog.is_stale(220).unwrap(),
-		"key_c middle version (seq=220) should be marked as stale"
-	);
-	assert!(
-		!vlog.is_stale(350).unwrap(),
-		"key_c latest hard_delete (seq=350) should NOT be marked as stale since it was returned"
-	);
-
-	// key_d: seq=150 should NOT be stale (only version, returned)
-	assert!(
-		!vlog.is_stale(150).unwrap(),
-		"key_d only version (seq=150) should NOT be marked as stale since it was returned"
-	);
 }
 
 #[test(tokio::test)]
@@ -855,8 +715,7 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 		vec![iter1, iter2, iter3],
 		create_comparator(),
 		false, // not bottom level
-		Some(Arc::clone(&vlog)),
-		true, // enable versioning
+		true,  // enable versioning
 		retention_period_ns,
 		clock,
 		vec![],
@@ -900,59 +759,6 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 
 	// Verify sequence number for key3 (only recent version)
 	assert_eq!(key3_versions[0].0.seq_num(), 900); // Recent SET only
-
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Verify retention behavior for key1:
-	// - Recent DELETE (seq=300): NOT stale (latest, returned)
-	// - Old SET (seq=200): NOT stale (within retention)
-	// - Recent SET (seq=100): NOT stale (within retention)
-	assert!(
-		!vlog.is_stale(300).unwrap(),
-		"key1 recent DELETE (seq=300) should NOT be marked as stale (latest, returned)"
-	);
-	assert!(
-		!vlog.is_stale(200).unwrap(),
-		"key1 old SET (seq=200) should NOT be marked as stale (within retention)"
-	);
-	assert!(
-		!vlog.is_stale(100).unwrap(),
-		"key1 recent SET (seq=100) should NOT be marked as stale (within retention)"
-	);
-
-	// Verify retention behavior for key2:
-	// - Recent SET (seq=500): NOT stale (latest, returned)
-	// - Old SET (seq=400): NOT stale (within retention)
-	// - Old DELETE (seq=600): NOT stale (within retention)
-	assert!(
-		!vlog.is_stale(500).unwrap(),
-		"key2 recent SET (seq=500) should NOT be marked as stale (latest, returned)"
-	);
-	assert!(
-		!vlog.is_stale(400).unwrap(),
-		"key2 old SET (seq=400) should NOT be marked as stale (within retention)"
-	);
-	assert!(
-		!vlog.is_stale(600).unwrap(),
-		"key2 old DELETE (seq=600) should NOT be marked as stale (within retention)"
-	);
-
-	// Verify retention behavior for key3:
-	// - Recent SET (seq=900): NOT stale (latest, returned)
-	// - Very old SET (seq=800): STALE (outside retention period)
-	// - Very old SET (seq=700): STALE (outside retention period)
-	assert!(
-		!vlog.is_stale(900).unwrap(),
-		"key3 recent SET (seq=900) should NOT be marked as stale (latest, returned)"
-	);
-	assert!(
-		vlog.is_stale(800).unwrap(),
-		"key3 very old SET (seq=800) SHOULD be marked as stale (outside retention period)"
-	);
-	assert!(
-		vlog.is_stale(700).unwrap(),
-		"key3 very old SET (seq=700) SHOULD be marked as stale (outside retention period)"
-	);
 }
 
 #[test(tokio::test)]
@@ -1038,7 +844,6 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 		vec![iter1, iter2, iter3, iter4],
 		create_comparator(),
 		true, // BOTTOM LEVEL - delete markers should be dropped
-		Some(Arc::clone(&vlog)),
 		true, // enable versioning
 		retention_period_ns,
 		clock,
@@ -1082,56 +887,6 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 		key4_versions.len(),
 		0,
 		"key4 should have 0 versions (DELETE is latest at bottom level, entire key discarded)"
-	);
-
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Verify staleness behavior:
-
-	// key1: DELETE is latest at bottom level, so ALL versions should be marked as
-	// stale
-	assert!(
-		vlog.is_stale(300).unwrap(),
-		"key1 DELETE (seq=300) SHOULD be marked as stale (latest DELETE at bottom level)"
-	);
-	assert!(
-		vlog.is_stale(200).unwrap(),
-		"key1 old SET (seq=200) SHOULD be marked as stale (entire key discarded)"
-	);
-	assert!(
-		vlog.is_stale(100).unwrap(),
-		"key1 recent SET (seq=100) SHOULD be marked as stale (entire key discarded)"
-	);
-
-	// key2: DELETE (seq=400) should be marked as stale (dropped at bottom level)
-	assert!(
-		vlog.is_stale(400).unwrap(),
-		"key2 DELETE (seq=400) SHOULD be marked as stale (dropped at bottom level)"
-	);
-
-	// key3: Recent version NOT stale, very old versions STALE
-	assert!(
-		!vlog.is_stale(700).unwrap(),
-		"key3 recent SET (seq=700) should NOT be marked as stale (latest, returned)"
-	);
-	assert!(
-		vlog.is_stale(600).unwrap(),
-		"key3 very old SET (seq=600) SHOULD be marked as stale (outside retention period)"
-	);
-	assert!(
-		vlog.is_stale(500).unwrap(),
-		"key3 very old SET (seq=500) SHOULD be marked as stale (outside retention period)"
-	);
-
-	// key4: DELETE is latest at bottom level, so ALL versions should be marked as
-	// stale
-	assert!(
-		vlog.is_stale(900).unwrap(),
-		"key4 very old DELETE (seq=900) SHOULD be marked as stale (latest DELETE at bottom level)"
-	);
-	assert!(
-		vlog.is_stale(800).unwrap(),
-		"key4 old SET (seq=800) SHOULD be marked as stale (entire key discarded)"
 	);
 }
 
@@ -1201,7 +956,6 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 		vec![iter1, iter2, iter3],
 		create_comparator(),
 		false, // NON-BOTTOM LEVEL
-		Some(Arc::clone(&vlog)),
 		false, // VERSIONING DISABLED
 		retention_period_ns,
 		clock,
@@ -1239,44 +993,6 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 	let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
 	assert_eq!(key3_versions.len(), 1, "key3 should have only 1 version (DELETE)");
 	assert_eq!(key3_versions[0].0.seq_num(), 700); // DELETE
-
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Verify staleness behavior:
-
-	// key1: Latest SET (seq=300) NOT stale, older versions STALE
-	assert!(
-		!vlog.is_stale(300).unwrap(),
-		"key1 latest SET (seq=300) should NOT be marked as stale (returned)"
-	);
-	assert!(
-		vlog.is_stale(200).unwrap(),
-		"key1 old SET (seq=200) SHOULD be marked as stale (older version)"
-	);
-	assert!(
-		vlog.is_stale(100).unwrap(),
-		"key1 very old SET (seq=100) SHOULD be marked as stale (older version)"
-	);
-
-	// key2: Latest DELETE (seq=600) NOT stale (returned), older SETs STALE
-	assert!(
-		!vlog.is_stale(600).unwrap(),
-		"key2 DELETE (seq=600) should NOT be marked as stale (returned at non-bottom level)"
-	);
-	assert!(
-		vlog.is_stale(500).unwrap(),
-		"key2 recent SET (seq=500) SHOULD be marked as stale (older version)"
-	);
-	assert!(
-		vlog.is_stale(400).unwrap(),
-		"key2 old SET (seq=400) SHOULD be marked as stale (older version)"
-	);
-
-	// key3: DELETE (seq=700) NOT stale (returned at non-bottom level)
-	assert!(
-		!vlog.is_stale(700).unwrap(),
-		"key3 DELETE (seq=700) should NOT be marked as stale (returned at non-bottom level)"
-	);
 }
 
 #[test(tokio::test)]
@@ -1344,8 +1060,7 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		create_comparator(),
-		true, // BOTTOM LEVEL
-		Some(Arc::clone(&vlog)),
+		true,  // BOTTOM LEVEL
 		false, // VERSIONING DISABLED
 		retention_period_ns,
 		clock,
@@ -1380,273 +1095,6 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 	// Verify key3: Entire key discarded (DELETE-only at bottom level)
 	let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
 	assert_eq!(key3_versions.len(), 0, "key3 should have 0 versions (DELETE-only at bottom level)");
-
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Verify staleness behavior:
-
-	// key1: Latest SET (seq=300) NOT stale, older versions STALE
-	assert!(
-		!vlog.is_stale(300).unwrap(),
-		"key1 latest SET (seq=300) should NOT be marked as stale (returned)"
-	);
-	assert!(
-		vlog.is_stale(200).unwrap(),
-		"key1 old SET (seq=200) SHOULD be marked as stale (older version)"
-	);
-	assert!(
-		vlog.is_stale(100).unwrap(),
-		"key1 very old SET (seq=100) SHOULD be marked as stale (older version)"
-	);
-
-	// key2: DELETE is latest at bottom level, ALL versions should be marked as
-	// stale
-	assert!(
-		vlog.is_stale(600).unwrap(),
-		"key2 DELETE (seq=600) SHOULD be marked as stale (latest DELETE at bottom level)"
-	);
-	assert!(
-		vlog.is_stale(500).unwrap(),
-		"key2 recent SET (seq=500) SHOULD be marked as stale (entire key discarded)"
-	);
-	assert!(
-		vlog.is_stale(400).unwrap(),
-		"key2 old SET (seq=400) SHOULD be marked as stale (entire key discarded)"
-	);
-
-	// key3: DELETE marked as stale (dropped at bottom level)
-	assert!(
-		vlog.is_stale(700).unwrap(),
-		"key3 DELETE (seq=700) SHOULD be marked as stale (dropped at bottom level)"
-	);
-}
-
-#[test(tokio::test)]
-async fn test_delete_list_logic() {
-	let current_time = 1000000000000; // Fixed current time for testing
-	let retention_period = 1000000; // 1 millisecond
-
-	// Test case 1: Soft delete should respect retention period
-	{
-		let (vlog, _temp_dir) = create_test_vlog();
-		let user_key = "soft_delete_key";
-
-		// Create a soft delete within retention period
-		let soft_delete_key = create_internal_key_with_timestamp(
-			user_key,
-			200,
-			InternalKeyKind::SoftDelete,
-			current_time,
-		);
-
-		// Create old value with timestamp beyond retention
-		let old_value_key = create_internal_key_with_timestamp(
-			user_key,
-			100,
-			InternalKeyKind::Set,
-			current_time - retention_period - 1,
-		);
-
-		let empty_value: Vec<u8> = Vec::new();
-		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
-
-		let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
-
-		let iter = build_table_iterator(items);
-		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
-		let mut comp_iter = CompactionIterator::new(
-			vec![iter],
-			create_comparator(),
-			true, // bottom level
-			Some(Arc::clone(&vlog)),
-			true, // enable versioning
-			retention_period,
-			clock,
-			vec![],
-		);
-
-		// Process the entries
-		let _result: Vec<_> = comp_iter.by_ref().collect();
-		comp_iter.flush_delete_list_batch().unwrap();
-
-		// Soft delete should NOT be marked as stale (it's not a hard delete marker)
-		assert!(
-			!vlog.is_stale(200).unwrap(),
-			"Soft delete (seq=200) should NOT be marked as stale - it respects retention period"
-		);
-
-		// Old value should be marked as stale (older version, respects retention
-		// period)
-		assert!(
-			vlog.is_stale(100).unwrap(),
-			"Old value (seq=100) should be marked as stale - older version beyond retention period"
-		);
-	}
-
-	// Test case 2: Hard delete should always be marked as stale
-	{
-		let (vlog, _temp_dir) = create_test_vlog();
-		let user_key = "hard_delete_key";
-
-		// Create a hard delete
-		let hard_delete_key = create_internal_key_with_timestamp(
-			user_key,
-			200,
-			InternalKeyKind::Delete,
-			current_time,
-		);
-
-		// Create old value with timestamp beyond retention
-		let old_value_key = create_internal_key_with_timestamp(
-			user_key,
-			100,
-			InternalKeyKind::Set,
-			current_time - retention_period - 1,
-		);
-
-		let empty_value: Vec<u8> = Vec::new();
-		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
-
-		let items = vec![(hard_delete_key, empty_value), (old_value_key, actual_value)];
-
-		let iter = build_table_iterator(items);
-		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
-		let mut comp_iter = CompactionIterator::new(
-			vec![iter],
-			create_comparator(),
-			true, // bottom level
-			Some(Arc::clone(&vlog)),
-			true, // enable versioning
-			retention_period,
-			clock,
-			vec![],
-		);
-
-		// Process the entries
-		let _result: Vec<_> = comp_iter.by_ref().collect();
-		comp_iter.flush_delete_list_batch().unwrap();
-
-		// Hard delete should be marked as stale (it's a hard delete marker)
-		assert!(
-			vlog.is_stale(200).unwrap(),
-			"Hard delete (seq=200) should be marked as stale - it's a hard delete marker"
-		);
-
-		// Old value should be marked as stale (older version)
-		assert!(vlog.is_stale(100).unwrap(), "Old value (seq=100) should be marked as stale");
-	}
-
-	// Test case 3: Soft delete with versioning disabled
-	{
-		let (vlog, _temp_dir) = create_test_vlog();
-		let user_key = "soft_delete_no_versioning";
-
-		// Create a soft delete
-		let soft_delete_key = create_internal_key_with_timestamp(
-			user_key,
-			200,
-			InternalKeyKind::SoftDelete,
-			current_time,
-		);
-
-		// Create old value with timestamp beyond retention
-		let old_value_key = create_internal_key_with_timestamp(
-			user_key,
-			100,
-			InternalKeyKind::Set,
-			current_time - retention_period - 1,
-		);
-
-		let empty_value: Vec<u8> = Vec::new();
-		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
-
-		let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
-
-		let iter = build_table_iterator(items);
-		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
-		let mut comp_iter = CompactionIterator::new(
-			vec![iter],
-			create_comparator(),
-			true, // bottom level
-			Some(Arc::clone(&vlog)),
-			false, // disable versioning
-			retention_period,
-			clock,
-			vec![],
-		);
-
-		// Process the entries
-		let _result: Vec<_> = comp_iter.by_ref().collect();
-		comp_iter.flush_delete_list_batch().unwrap();
-
-		// Soft delete should NOT be marked as stale (it's the latest version)
-		assert!(
-			!vlog.is_stale(200).unwrap(),
-			"Soft delete (seq=200) should NOT be marked as stale - it's the latest version"
-		);
-
-		// Old value should be marked as stale (older version, versioning disabled)
-		assert!(
-			vlog.is_stale(100).unwrap(),
-			"Old value (seq=100) should be marked as stale when versioning is disabled"
-		);
-	}
-
-	// Test case 4: Soft delete beyond retention period
-	{
-		let (vlog, _temp_dir) = create_test_vlog();
-		let user_key = "soft_delete_old";
-
-		// Create a soft delete with old timestamp (beyond retention)
-		let soft_delete_key = create_internal_key_with_timestamp(
-			user_key,
-			200,
-			InternalKeyKind::SoftDelete,
-			current_time - retention_period - 1,
-		);
-
-		// Create old value with timestamp within retention
-		let old_value_key = create_internal_key_with_timestamp(
-			user_key,
-			100,
-			InternalKeyKind::Set,
-			current_time - retention_period + 1,
-		);
-
-		let empty_value: Vec<u8> = Vec::new();
-		let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
-
-		let items = vec![(soft_delete_key, empty_value), (old_value_key, actual_value)];
-
-		let iter = build_table_iterator(items);
-		let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
-		let mut comp_iter = CompactionIterator::new(
-			vec![iter],
-			create_comparator(),
-			true, // bottom level
-			Some(Arc::clone(&vlog)),
-			true, // enable versioning
-			retention_period,
-			clock,
-			vec![],
-		);
-
-		// Process the entries
-		let _result: Vec<_> = comp_iter.by_ref().collect();
-		comp_iter.flush_delete_list_batch().unwrap();
-
-		// Soft delete should NOT be marked as stale (it's the latest version)
-		assert!(
-			!vlog.is_stale(200).unwrap(),
-			"Soft delete (seq=200) should NOT be marked as stale - it's the latest version"
-		);
-
-		// Old value should NOT be marked as stale (within retention period)
-		assert!(
-			!vlog.is_stale(100).unwrap(),
-			"Old value (seq=100) should NOT be marked as stale - within retention period"
-		);
-	}
 }
 
 #[test(tokio::test)]
@@ -1681,9 +1129,8 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 		vec![iter1, iter2],
 		create_comparator(),
 		false, // non-bottom level
-		Some(Arc::clone(&vlog)),
-		true, // enable versioning
-		1000, // retention period
+		true,  // enable versioning
+		1000,  // retention period
 		clock,
 		vec![],
 	);
@@ -1698,14 +1145,6 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 	let (returned_key, _) = &result[0];
 	assert_eq!(returned_key.seq_num(), 300);
 	assert!(returned_key.is_replace());
-
-	// Flush the delete list batch to actually mark entries as stale
-	comp_iter.flush_delete_list_batch().unwrap();
-
-	// Verify that older versions were marked as stale in VLog
-	assert!(vlog.is_stale(100).unwrap());
-	assert!(vlog.is_stale(200).unwrap());
-	assert!(!vlog.is_stale(300).unwrap());
 }
 
 #[test(tokio::test)]
@@ -1749,9 +1188,8 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 		vec![iter1, iter2],
 		create_comparator(),
 		false, // non-bottom level
-		Some(Arc::clone(&vlog)),
-		true, // enable versioning
-		1000, // retention period
+		true,  // enable versioning
+		1000,  // retention period
 		clock,
 		vec![],
 	);
@@ -1761,20 +1199,11 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 		result.push(item.unwrap());
 	}
 
-	comp_iter.flush_delete_list_batch().unwrap();
-
 	// Should return only the latest version (regular SET, not Replace)
 	assert_eq!(result.len(), 1);
 	let (returned_key, _) = &result[0];
 	assert_eq!(returned_key.seq_num(), 400);
 	assert!(!returned_key.is_replace());
-
-	// The Replace and all older regular SET versions should be marked as stale
-	assert!(vlog.is_stale(100).unwrap());
-	assert!(vlog.is_stale(200).unwrap());
-	assert!(vlog.is_stale(250).unwrap());
-	assert!(vlog.is_stale(300).unwrap());
-	assert!(!vlog.is_stale(400).unwrap());
 }
 
 #[test(tokio::test)]
@@ -1809,9 +1238,8 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 		vec![iter1, iter2],
 		create_comparator(),
 		false, // non-bottom level
-		Some(Arc::clone(&vlog)),
-		true, // enable versioning
-		1000, // retention period
+		true,  // enable versioning
+		1000,  // retention period
 		clock,
 		vec![],
 	);
@@ -1821,18 +1249,11 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 		result.push(item.unwrap());
 	}
 
-	comp_iter.flush_delete_list_batch().unwrap();
-
 	// Should return the Replace version (latest)
 	assert_eq!(result.len(), 1);
 	let (returned_key, _) = &result[0];
 	assert_eq!(returned_key.seq_num(), 300);
 	assert!(returned_key.is_replace());
-
-	// All older regular SET versions should be marked as stale
-	assert!(vlog.is_stale(100).unwrap());
-	assert!(vlog.is_stale(200).unwrap());
-	assert!(!vlog.is_stale(300).unwrap());
 }
 
 #[test(tokio::test)]
@@ -1867,9 +1288,8 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 		vec![iter1, iter2],
 		create_comparator(),
 		false, // non-bottom level
-		Some(Arc::clone(&vlog)),
-		true, // enable versioning
-		1000, // retention period
+		true,  // enable versioning
+		1000,  // retention period
 		clock,
 		vec![],
 	);
@@ -1879,18 +1299,11 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 		result.push(item.unwrap());
 	}
 
-	comp_iter.flush_delete_list_batch().unwrap();
-
 	// Should return the Replace version (latest)
 	assert_eq!(result.len(), 1);
 	let (returned_key, _) = &result[0];
 	assert_eq!(returned_key.seq_num(), 300);
 	assert!(returned_key.is_replace());
-
-	// The hard delete and regular SET should be marked as stale
-	assert!(vlog.is_stale(100).unwrap());
-	assert!(vlog.is_stale(200).unwrap());
-	assert!(!vlog.is_stale(300).unwrap());
 }
 
 #[test(tokio::test)]
@@ -1927,9 +1340,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2],
 			create_comparator(),
 			false, // non-bottom level
-			Some(Arc::clone(&vlog)),
-			true, // enable versioning
-			1000, // retention period
+			true,  // enable versioning
+			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
 		);
@@ -1939,19 +1351,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return only the latest Replace version
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 300);
 		assert!(returned_key.is_replace());
-
-		// Older Replace versions should be marked as stale
-		assert!(vlog.is_stale(100).unwrap());
-		assert!(vlog.is_stale(200).unwrap());
-		assert!(!vlog.is_stale(300).unwrap());
 	}
 
 	// Test case 2: Multiple Replace operations at bottom level
@@ -1983,7 +1387,6 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2],
 			create_comparator(),
 			true, // bottom level
-			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
@@ -1995,19 +1398,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return only the latest Replace version
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 600);
 		assert!(returned_key.is_replace());
-
-		// Older Replace versions should be marked as stale
-		assert!(vlog.is_stale(400).unwrap());
-		assert!(vlog.is_stale(500).unwrap());
-		assert!(!vlog.is_stale(600).unwrap());
 	}
 
 	// Test case 3: Multiple SET operations followed by Replace
@@ -2043,9 +1438,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2],
 			create_comparator(),
 			false, // non-bottom level
-			Some(Arc::clone(&vlog)),
-			true, // enable versioning
-			1000, // retention period
+			true,  // enable versioning
+			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
 		);
@@ -2055,20 +1449,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return only the Replace version
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 900);
 		assert!(returned_key.is_replace());
-
-		// All older SET versions should be marked as stale
-		assert!(vlog.is_stale(700).unwrap());
-		assert!(vlog.is_stale(800).unwrap());
-		assert!(vlog.is_stale(850).unwrap());
-		assert!(!vlog.is_stale(900).unwrap());
 	}
 
 	// Test case 4: Multiple Replace operations for different keys
@@ -2104,9 +1489,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2],
 			create_comparator(),
 			false, // non-bottom level
-			Some(Arc::clone(&vlog)),
-			true, // enable versioning
-			1000, // retention period
+			true,  // enable versioning
+			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
 		);
@@ -2115,9 +1499,6 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		for item in comp_iter.by_ref() {
 			result.push(item.unwrap());
 		}
-
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
 
 		// Should return 2 entries (one for each key)
 		assert_eq!(result.len(), 2);
@@ -2136,12 +1517,6 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		assert_eq!(&returned_key_b.user_key, b"key_b");
 		assert_eq!(returned_key_b.seq_num(), 1300);
 		assert!(returned_key_b.is_replace());
-
-		// Older versions should be marked as stale
-		assert!(vlog.is_stale(1000).unwrap());
-		assert!(vlog.is_stale(1100).unwrap());
-		assert!(!vlog.is_stale(1200).unwrap());
-		assert!(!vlog.is_stale(1300).unwrap());
 	}
 
 	// Test case 5: Multiple SET operations followed by Replace followed by SET
@@ -2180,9 +1555,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2, iter3],
 			create_comparator(),
 			false, // non-bottom level
-			Some(Arc::clone(&vlog)),
-			true, // enable versioning
-			1000, // retention period
+			true,  // enable versioning
+			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
 		);
@@ -2192,21 +1566,12 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return only the final SET version
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 1700);
 		assert!(!returned_key.is_replace());
 		assert_eq!(returned_key.kind(), InternalKeyKind::Set);
-
-		// All older versions (SET and Replace) should be marked as stale
-		assert!(vlog.is_stale(1400).unwrap());
-		assert!(vlog.is_stale(1500).unwrap());
-		assert!(vlog.is_stale(1600).unwrap());
-		assert!(!vlog.is_stale(1700).unwrap());
 	}
 
 	// Test case 6: Replace followed by Delete (non-bottom level)
@@ -2234,9 +1599,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2],
 			create_comparator(),
 			false, // non-bottom level
-			Some(Arc::clone(&vlog)),
-			true, // enable versioning
-			1000, // retention period
+			true,  // enable versioning
+			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
 		);
@@ -2246,19 +1610,12 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return only the Delete version
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 1900);
 		assert!(returned_key.is_hard_delete_marker());
 		assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
-
-		// The Replace should be marked as stale
-		assert!(vlog.is_stale(1800).unwrap());
-		assert!(!vlog.is_stale(1900).unwrap());
 	}
 
 	// Test case 7: Replace followed by Delete (bottom level)
@@ -2286,7 +1643,6 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2],
 			create_comparator(),
 			true, // bottom level
-			Some(Arc::clone(&vlog)),
 			true, // enable versioning
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
@@ -2298,16 +1654,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return nothing (Delete at bottom level discards everything)
 		assert_eq!(result.len(), 0);
-
-		// The Replace should be marked as stale
-		assert!(vlog.is_stale(2000).unwrap());
-		// Note: Delete at bottom level doesn't get marked as stale since
-		// it's not returned
 	}
 
 	// Test case 8: Multiple Replace operations followed by Delete
@@ -2346,9 +1694,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2, iter3],
 			create_comparator(),
 			false, // non-bottom level
-			Some(Arc::clone(&vlog)),
-			true, // enable versioning
-			1000, // retention period
+			true,  // enable versioning
+			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
 		);
@@ -2358,21 +1705,12 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return only the Delete version
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 2500);
 		assert!(returned_key.is_hard_delete_marker());
 		assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
-
-		// All Replace versions should be marked as stale
-		assert!(vlog.is_stale(2200).unwrap());
-		assert!(vlog.is_stale(2300).unwrap());
-		assert!(vlog.is_stale(2400).unwrap());
-		assert!(!vlog.is_stale(2500).unwrap());
 	}
 
 	// Test case 9: Multiple Replace operations without versioning enabled
@@ -2404,7 +1742,6 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2],
 			create_comparator(),
 			false, // non-bottom level
-			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
@@ -2416,19 +1753,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return only the latest Replace version
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 2800);
 		assert!(returned_key.is_replace());
-
-		// Older Replace versions should be marked as stale
-		assert!(vlog.is_stale(2600).unwrap());
-		assert!(vlog.is_stale(2700).unwrap());
-		assert!(!vlog.is_stale(2800).unwrap());
 	}
 
 	// Test case 10: SET -> Replace -> SET without versioning
@@ -2463,7 +1792,6 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2, iter3],
 			create_comparator(),
 			false, // non-bottom level
-			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
@@ -2475,20 +1803,12 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return only the latest SET version
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 3100);
 		assert!(!returned_key.is_replace());
 		assert_eq!(returned_key.kind(), InternalKeyKind::Set);
-
-		// All older versions should be marked as stale
-		assert!(vlog.is_stale(2900).unwrap());
-		assert!(vlog.is_stale(3000).unwrap());
-		assert!(!vlog.is_stale(3100).unwrap());
 	}
 
 	// Test case 11: Replace -> Delete without versioning
@@ -2516,7 +1836,6 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			vec![iter1, iter2],
 			create_comparator(),
 			false, // non-bottom level
-			Some(Arc::clone(&vlog)),
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
@@ -2528,19 +1847,12 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return only the Delete version
 		assert_eq!(result.len(), 1);
 		let (returned_key, _) = &result[0];
 		assert_eq!(returned_key.seq_num(), 3300);
 		assert!(returned_key.is_hard_delete_marker());
 		assert_eq!(returned_key.kind(), InternalKeyKind::Delete);
-
-		// The Replace should be marked as stale
-		assert!(vlog.is_stale(3200).unwrap());
-		assert!(!vlog.is_stale(3300).unwrap());
 	}
 
 	// Test case 12: Replace -> Delete at bottom level without versioning
@@ -2567,8 +1879,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let mut comp_iter = CompactionIterator::new(
 			vec![iter1, iter2],
 			create_comparator(),
-			true, // bottom level
-			Some(Arc::clone(&vlog)),
+			true,  // bottom level
 			false, // versioning disabled
 			1000,  // retention period (ignored when versioning is disabled)
 			clock,
@@ -2580,16 +1891,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			result.push(item.unwrap());
 		}
 
-		// Flush to mark entries as stale
-		comp_iter.flush_delete_list_batch().unwrap();
-
 		// Should return nothing (Delete at bottom level discards everything)
 		assert_eq!(result.len(), 0);
-
-		// The Replace should be marked as stale
-		assert!(vlog.is_stale(3400).unwrap());
-		// Note: Delete at bottom level doesn't get marked as stale since
-		// it's not returned
 	}
 }
 
@@ -2794,7 +2097,6 @@ fn test_snapshot_compaction_no_snapshots_keeps_only_latest() {
 		vec![iter],
 		create_comparator(),
 		false, // not bottom level
-		None,
 		false, // versioning disabled
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -2830,7 +2132,6 @@ fn test_snapshot_compaction_single_snapshot_preserves_visible_version() {
 		vec![iter],
 		create_comparator(),
 		false,
-		None,
 		false, // versioning disabled
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -2875,7 +2176,6 @@ fn test_snapshot_compaction_multiple_snapshots_different_boundaries() {
 		vec![iter],
 		create_comparator(),
 		false,
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -2924,7 +2224,6 @@ fn test_snapshot_compaction_newer_version_hides_older_in_same_boundary() {
 		vec![iter],
 		create_comparator(),
 		false,
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -2960,7 +2259,6 @@ fn test_snapshot_compaction_versions_at_tip_hidden_by_newer() {
 		vec![iter],
 		create_comparator(),
 		false,
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -2997,7 +2295,6 @@ fn test_snapshot_compaction_multiple_keys() {
 		vec![iter],
 		create_comparator(),
 		false,
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -3032,7 +2329,6 @@ fn test_snapshot_compaction_tombstone_visible_to_snapshot() {
 		vec![iter],
 		create_comparator(),
 		false, // NOT bottom level - tombstone must be preserved
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -3071,7 +2367,6 @@ fn test_snapshot_compaction_tombstone_at_bottom_with_snapshot() {
 		vec![iter],
 		create_comparator(),
 		true, // Bottom level
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -3105,7 +2400,6 @@ fn test_snapshot_compaction_exact_sequence_match() {
 		vec![iter],
 		create_comparator(),
 		false,
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -3143,7 +2437,6 @@ fn test_snapshot_compaction_version_older_than_all_snapshots() {
 		vec![iter],
 		create_comparator(),
 		false,
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -3173,7 +2466,6 @@ fn test_snapshot_visibility_states() {
 		vec![iter],
 		create_comparator(),
 		false,
-		None,
 		false,
 		0,
 		Arc::new(MockLogicalClock::new()),
@@ -3211,7 +2503,6 @@ fn test_snapshot_compaction_with_versioning_enabled() {
 		vec![iter],
 		create_comparator(),
 		false,
-		None,
 		true,  // versioning enabled
 		300,   // retention period = 300ns
 		clock, // current time = 1000
