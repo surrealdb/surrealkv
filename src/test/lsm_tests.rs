@@ -6068,3 +6068,110 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 		tree.close().await.unwrap();
 	}
 }
+
+/// Tests that recovery detects and rejects corrupted manifest log_number.
+/// This prevents silent data loss when log_number exceeds actual WAL segments.
+#[test_log::test(tokio::test)]
+async fn test_recovery_detects_corrupt_log_number() {
+	use byteorder::{BigEndian, WriteBytesExt};
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Phase 1: Create a database with some data and WAL segments
+	// Disable flush_on_close so WAL segments remain on disk
+	{
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.flush_on_close = false;
+		});
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Write some data (creates WAL entries)
+		for i in 0..10 {
+			let mut txn = tree.begin().unwrap();
+			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		// Close without flushing (data is only in WAL)
+		tree.close().await.unwrap();
+	}
+
+	// Phase 2: Corrupt the manifest by setting log_number to a very high value
+	{
+		// Manifest format is: {path}/manifest/{id:020}.manifest
+		let manifest_path = path.join("manifest").join("00000000000000000000.manifest");
+
+		// Read the existing manifest
+		let data = std::fs::read(&manifest_path).expect("Failed to read manifest");
+
+		// Create corrupted manifest with log_number = 999999 (way beyond any WAL)
+		let mut corrupted = Vec::new();
+		// Copy version (u16)
+		corrupted.extend_from_slice(&data[0..2]);
+		// Copy next_table_id (u64)
+		corrupted.extend_from_slice(&data[2..10]);
+		// Write corrupted log_number (u64) - set to 999999
+		corrupted.write_u64::<BigEndian>(999999).unwrap();
+		// Copy rest of the file (last_sequence and beyond)
+		corrupted.extend_from_slice(&data[18..]);
+
+		// Write corrupted manifest
+		std::fs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
+	}
+
+	// Phase 3: Try to open the database - should fail with ManifestCorruption
+	{
+		let opts = create_test_options(path.clone(), |_| {});
+		let result = Tree::new(Arc::clone(&opts));
+
+		match result {
+			Ok(_) => panic!("Expected error when opening with corrupted manifest"),
+			Err(Error::ManifestCorruption(msg)) => {
+				assert!(
+					msg.contains("log_number") && msg.contains("exceeds WAL segments"),
+					"Error message should mention log_number exceeds WAL segments, got: {}",
+					msg
+				);
+			}
+			Err(other) => panic!("Expected ManifestCorruption error, got: {}", other),
+		}
+	}
+}
+
+/// Tests that recovery succeeds when log_number is valid (within WAL range).
+#[test_log::test(tokio::test)]
+async fn test_recovery_valid_log_number() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Phase 1: Create a database with some data
+	{
+		let opts = create_test_options(path.clone(), |_| {});
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Write some data
+		for i in 0..10 {
+			let mut txn = tree.begin().unwrap();
+			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		tree.close().await.unwrap();
+	}
+
+	// Phase 2: Reopen database - should succeed with valid log_number
+	{
+		let opts = create_test_options(path.clone(), |_| {});
+		let tree = Tree::new(Arc::clone(&opts)).expect("Should succeed with valid log_number");
+
+		// Verify data is accessible
+		let txn = tree.begin().unwrap();
+		for i in 0..10 {
+			let result = txn.get(format!("key{}", i).as_bytes()).unwrap();
+			assert!(result.is_some(), "Key {} should be accessible after recovery", i);
+		}
+
+		tree.close().await.unwrap();
+	}
+}
