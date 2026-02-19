@@ -48,7 +48,9 @@ pub enum Error {
 	NoSnapshot,
 	CommitFail(String),
 	LoadManifestFail(String),
-	Corruption(String), // Data corruption detected
+	Corruption(String),         // Data corruption detected
+	ManifestCorruption(String), /* Manifest inconsistency detected (e.g., log_number exceeds
+	                             * WAL segments) */
 	InvalidArgument(String),
 	InvalidTag(String),
 	BPlusTree(String),    // B+ tree specific errors
@@ -102,6 +104,7 @@ impl fmt::Display for Error {
             Self::CommitFail(err) => write!(f, "Commit failed: {err}"),
             Self::LoadManifestFail(err) => write!(f, "Failed to load manifest: {err}"),
             Self::Corruption(err) => write!(f, "Data corruption detected: {err}"),
+            Self::ManifestCorruption(err) => write!(f, "Manifest corruption detected: {err}"),
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::BPlusTree(err) => write!(f, "B+ tree error: {err}"),
@@ -220,7 +223,9 @@ impl BackgroundErrorHandler {
 	fn classify_error(error: &Error, reason: BackgroundErrorReason) -> ErrorSeverity {
 		match (reason, error) {
 			// Corruption errors are unrecoverable
-			(_, Error::Corruption(_) | Error::CorruptedBlock(_)) => ErrorSeverity::Unrecoverable,
+			(_, Error::Corruption(_) | Error::CorruptedBlock(_) | Error::ManifestCorruption(_)) => {
+				ErrorSeverity::Unrecoverable
+			}
 
 			// Table ID collision is a critical consistency error
 			(_, Error::TableIDCollision(_)) => ErrorSeverity::Unrecoverable,
