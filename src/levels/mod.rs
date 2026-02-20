@@ -590,9 +590,13 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 		return Err(e);
 	}
 
-	// Optionally, open and sync the updated file to ensure all changes are flushed
-	// to disk.
-	let updated_file = SysFile::open(target_path)?;
+	// Open with write access because on Windows, FlushFileBuffers (called by
+	// sync_all) requires GENERIC_WRITE — a read-only handle returns
+	// ERROR_ACCESS_DENIED (os error 5).
+	let updated_file = std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(target_path)?;
 	updated_file.sync_all()?;
 
 	Ok(())

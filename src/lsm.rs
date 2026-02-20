@@ -1,5 +1,7 @@
 use std::collections::HashSet;
-use std::fs::{create_dir_all, File};
+use std::fs::create_dir_all;
+#[cfg(not(target_os = "windows"))]
+use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1889,9 +1891,18 @@ pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 		return Ok(());
 	}
 
-	let file = File::open(path)?;
-	debug_assert!(file.metadata()?.is_dir());
-	file.sync_all()
+	// On Windows, calling sync_all() on a directory handle returns
+	// ERROR_ACCESS_DENIED (os error 5) because FlushFileBuffers requires
+	// GENERIC_WRITE, which is not available for directories. NTFS journals
+	// directory metadata automatically, so this is safe to skip.
+	#[cfg(not(target_os = "windows"))]
+	{
+		let file = File::open(path)?;
+		debug_assert!(file.metadata()?.is_dir());
+		file.sync_all()?;
+	}
+
+	Ok(())
 }
 
 /// Syncs all directory structures for the LSM store to ensure durability

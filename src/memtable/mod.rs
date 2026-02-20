@@ -271,7 +271,13 @@ impl MemTable {
 			vlog.sync()?;
 		}
 
-		let file = SysFile::open(&table_file_path)?;
+		// Open with write access because on Windows, FlushFileBuffers (called by
+		// sync_all) requires GENERIC_WRITE — a read-only handle returns
+		// ERROR_ACCESS_DENIED (os error 5).
+		let file = std::fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.open(&table_file_path)?;
 		file.sync_all()?;
 		let file: Arc<dyn File> = Arc::new(file);
 		let file_size = file.size()?;
