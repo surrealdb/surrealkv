@@ -234,24 +234,16 @@ impl Wal {
 		Ok(open_options.open(file_path)?)
 	}
 
-	fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
+	fn prepare_directory(_dir: &Path, _opts: &Options) -> Result<()> {
 		// Directory should already be created by Tree::new()
-		// Just set permissions if needed
-		if let Ok(metadata) = fs::metadata(dir) {
+		// Set permissions on Unix only; Windows NTFS uses ACLs and
+		// set_permissions on directories can fail with ERROR_ACCESS_DENIED.
+		#[cfg(unix)]
+		if let Ok(metadata) = fs::metadata(_dir) {
 			let mut permissions = metadata.permissions();
-
-			#[cfg(unix)]
-			{
-				use std::os::unix::fs::PermissionsExt;
-				permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
-			}
-
-			#[cfg(windows)]
-			{
-				permissions.set_readonly(false);
-			}
-
-			fs::set_permissions(dir, permissions)?;
+			use std::os::unix::fs::PermissionsExt;
+			permissions.set_mode(_opts.dir_mode.unwrap_or(0o750));
+			fs::set_permissions(_dir, permissions)?;
 		}
 
 		Ok(())
