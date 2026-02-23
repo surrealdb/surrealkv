@@ -590,15 +590,7 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 		return Err(e);
 	}
 
-	// On Windows, FlushFileBuffers (called by sync_all) requires GENERIC_WRITE,
-	// so we must open with write access. On Unix, read-only is sufficient.
-	#[cfg(target_os = "windows")]
-	let updated_file = std::fs::OpenOptions::new()
-		.read(true)
-		.write(true)
-		.open(target_path)?;
-	#[cfg(not(target_os = "windows"))]
-	let updated_file = SysFile::open(target_path)?;
+	let updated_file = crate::vfs::open_for_sync(target_path)?;
 	updated_file.sync_all()?;
 
 	Ok(())
