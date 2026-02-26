@@ -236,10 +236,7 @@ impl File for SysFile {
 pub fn open_for_sync<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<SysFile> {
 	#[cfg(target_os = "windows")]
 	{
-		std::fs::OpenOptions::new()
-			.read(true)
-			.write(true)
-			.open(path)
+		std::fs::OpenOptions::new().read(true).write(true).open(path)
 	}
 	#[cfg(not(target_os = "windows"))]
 	{
