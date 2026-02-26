@@ -687,6 +687,87 @@ impl<'a> KMergeIterator<'a> {
 		Ok(())
 	}
 
+	/// Switch from backward to forward, positioning just after `target`.
+	///
+	/// When switching directions, the current iterator just moves forward once.
+	/// Non-current iterators need to be positioned at a key strictly greater than
+	/// `target` to ensure correct ordering.
+	fn switch_to_forward(&mut self, target: &[u8]) -> Result<()> {
+		let current_idx = self.winner;
+		self.direction = MergeDirection::Forward;
+		self.active_count = 0;
+
+		for (idx, iter) in self.iterators.iter_mut().enumerate() {
+			if Some(idx) == current_idx {
+				// Current iterator: just call next() once
+				if iter.next()? {
+					self.active_count += 1;
+				}
+			} else {
+				// Non-current: seek to target, then advance past it
+				if iter.seek(target)? {
+					// Advance while key <= target (need to be strictly greater)
+					while iter.valid()
+						&& self.cmp.compare(iter.key().encoded(), target) != Ordering::Greater
+					{
+						if !iter.next()? {
+							break;
+						}
+					}
+					if iter.valid() {
+						self.active_count += 1;
+					}
+				}
+			}
+		}
+
+		self.find_winner();
+		Ok(())
+	}
+
+	/// Switch from forward to backward, positioning just before `target`.
+	///
+	/// When switching directions, the current iterator just moves backward once.
+	/// Non-current iterators need to be positioned at a key strictly less than
+	/// `target` to ensure correct ordering.
+	fn switch_to_backward(&mut self, target: &[u8]) -> Result<()> {
+		let current_idx = self.winner;
+		self.direction = MergeDirection::Backward;
+		self.active_count = 0;
+
+		for (idx, iter) in self.iterators.iter_mut().enumerate() {
+			if Some(idx) == current_idx {
+				// Current iterator: just call prev() once
+				if iter.prev()? {
+					self.active_count += 1;
+				}
+			} else {
+				// Non-current: seek to target, then move before it
+				if iter.seek(target)? {
+					// Move backward while key >= target (need to be strictly less)
+					while iter.valid()
+						&& self.cmp.compare(iter.key().encoded(), target) != Ordering::Less
+					{
+						if !iter.prev()? {
+							break;
+						}
+					}
+					if iter.valid() {
+						self.active_count += 1;
+					}
+				} else {
+					// Iterator positioned past all keys, go to last
+					if iter.seek_last()? {
+						self.active_count += 1;
+					}
+				}
+			}
+		}
+
+		self.find_winner();
+		Ok(())
+	}
+
 	/// Advance the current winner and find new winner
 	fn advance_winner(&mut self) -> Result<bool> {
 		if self.active_count == 0 || self.winner.is_none() {
@@ -753,6 +834,12 @@ impl LSMIterator for KMergeIterator<'_> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
+		// If we were going backward, switch to forward
+		if self.direction != MergeDirection::Forward {
+			let target = self.key().encoded().to_vec();
+			self.switch_to_forward(&target)?;
+			return Ok(self.is_valid());
+		}
 		self.advance_winner()
 	}
 
@@ -765,7 +852,9 @@ impl LSMIterator for KMergeIterator<'_> {
 		}
 		// If we were going forward, switch to backward
 		if self.direction != MergeDirection::Backward {
-			return self.seek_last();
+			let target = self.key().encoded().to_vec();
+			self.switch_to_backward(&target)?;
+			return Ok(self.is_valid());
 		}
 		self.advance_winner()
 	}
@@ -975,6 +1064,60 @@ impl SnapshotIterator<'_> {
 		self.has_current_back = false;
 		self.skip_to_valid_backward()
 	}
+
+	/// Switch from backward to forward direction.
+	/// Based on RocksDB's DBIter::ReverseToForward().
+	fn reverse_to_forward(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Forward;
+
+		// Get current user key from backward state (equivalent to saved_key_)
+		let current_user_key = if self.has_current_back {
+			InternalKeyRef::from_encoded(&self.current_back_key).user_key().to_vec()
+		} else {
+			// No current position in backward mode
+			self.has_buffered_back = false;
+			return Ok(false);
+		};
+
+		// Clear backward state
+		self.has_current_back = false;
+		self.has_buffered_back = false;
+
+		// Set last_key_fwd so skip_to_valid_forward() will skip this user key
+		// (equivalent to FindNextUserEntry(skipping_saved_key=true))
+		self.last_key_fwd.clear();
+		self.last_key_fwd.extend_from_slice(&current_user_key);
+
+		// Seek to first entry >= current user key
+		// Using (user_key, MAX_SEQ) positions at the start of this user key's entries
+		let seek_key = InternalKey::new(current_user_key, u64::MAX, InternalKeyKind::Set, u64::MAX);
+		self.merge_iter.seek(&seek_key.encode())?;
+
+		// skip_to_valid_forward() will skip entries with user_key == last_key_fwd
+		// and return the first visible entry with a DIFFERENT user key
+		self.skip_to_valid_forward()
+	}
+
+	/// Switch from forward to backward direction.
+	/// Based on RocksDB's DBIter::ReverseToBackward().
+	fn forward_to_backward(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Backward;
+
+		// Clear backward buffers
+		self.has_buffered_back = false;
+		self.has_current_back = false;
+
+		// In forward mode, merge_iter is positioned at the current entry
+		// We need to move to the previous user key
+		if self.merge_iter.valid() {
+			// Move backward from current position
+			self.merge_iter.prev()?;
+		}
+
+		// find_latest_visible_backward will scan this user key's entries
+		// to find the latest visible version, then buffer the next user key
+		self.skip_to_valid_backward()
+	}
 }
 
 impl LSMIterator for SnapshotIterator<'_> {
@@ -1011,6 +1154,13 @@ impl LSMIterator for SnapshotIterator<'_> {
 		if !self.initialized {
 			return self.seek_first();
 		}
+
+		// Direction change: backward → forward (ReverseToForward)
+		if self.direction == MergeDirection::Backward {
+			return self.reverse_to_forward();
+		}
+
+		// Normal forward iteration
 		if !self.merge_iter.valid() {
 			return Ok(false);
 		}
@@ -1022,13 +1172,17 @@ impl LSMIterator for SnapshotIterator<'_> {
 		if !self.initialized {
 			return self.seek_last();
 		}
-		// For backward iteration, we can continue if we have a buffered next entry
-		// or if the merge_iter is still valid
+
+		// Direction change: forward → backward (ReverseToBackward)
+		if self.direction != MergeDirection::Backward {
+			return self.forward_to_backward();
+		}
+
+		// Normal backward iteration
 		if !self.merge_iter.valid() && !self.has_buffered_back {
 			self.has_current_back = false;
 			return Ok(false);
 		}
-		// For backward, skip_to_valid_backward handles the logic
 		self.skip_to_valid_backward()
 	}
 

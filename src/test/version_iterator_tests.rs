@@ -2247,6 +2247,139 @@ async fn test_history_bounds_with_timestamp_range() {
 	}
 }
 
+/// Test direction switching (forward to backward) respects bounds.
+#[test(tokio::test)]
+async fn test_history_bounds_direction_switch_forward_to_backward() {
+	for with_index in [false] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Keys: before range, in range (3 keys), after range
+		let keys: [&[u8]; 5] = [b"aa_before", b"mm_in1", b"mm_in2", b"mm_in3", b"zz_after"];
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			for key in keys {
+				tx.set_at(key, b"value", 1).unwrap();
+			}
+			tx.commit().await.unwrap();
+		}
+
+		if with_index {
+			store.flush().unwrap();
+		}
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let lower: &[u8] = b"m";
+		let upper: &[u8] = b"z";
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		// Forward: get first key
+		iter.seek_first().unwrap();
+		assert!(iter.valid(), "with_index={with_index}: Should be valid after seek_first");
+		let first_key = iter.key().user_key().to_vec();
+		assert_eq!(
+			first_key,
+			b"mm_in1".to_vec(),
+			"with_index={with_index}: First key should be mm_in1"
+		);
+
+		// Move forward one more
+		iter.next().unwrap();
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"mm_in2",
+			"with_index={with_index}: Second should be mm_in2"
+		);
+
+		// Switch direction: go backward
+		iter.prev().unwrap();
+		assert!(iter.valid());
+		let back_key = iter.key().user_key().to_vec();
+		assert_eq!(
+			back_key,
+			b"mm_in1".to_vec(),
+			"with_index={with_index}: After prev should be mm_in1"
+		);
+
+		// Continue backward - should become invalid (no more in-range keys)
+		let has_more = iter.prev().unwrap();
+		assert!(
+			!has_more || !iter.valid(),
+			"with_index={with_index}: Should have no more keys before mm_in1"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test direction switching (backward to forward) respects bounds.
+#[test(tokio::test)]
+async fn test_history_bounds_direction_switch_backward_to_forward() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		let keys: [&[u8]; 5] = [b"aa_before", b"mm_in1", b"mm_in2", b"mm_in3", b"zz_after"];
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			for key in keys {
+				tx.set_at(key, b"value", 1).unwrap();
+			}
+			tx.commit().await.unwrap();
+		}
+
+		if with_index {
+			store.flush().unwrap();
+		}
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let lower: &[u8] = b"m";
+		let upper: &[u8] = b"z";
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		// Backward: get last key in range
+		iter.seek_last().unwrap();
+		assert!(iter.valid(), "with_index={with_index}: Should be valid after seek_last");
+		let last_key = iter.key().user_key().to_vec();
+		assert_eq!(
+			last_key,
+			b"mm_in3".to_vec(),
+			"with_index={with_index}: Last key should be mm_in3"
+		);
+
+		// Move backward one
+		iter.prev().unwrap();
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"mm_in2",
+			"with_index={with_index}: Should be at mm_in2"
+		);
+
+		// Switch direction: go forward
+		iter.next().unwrap();
+		assert!(iter.valid());
+		let fwd_key = iter.key().user_key().to_vec();
+		assert_eq!(
+			fwd_key,
+			b"mm_in3".to_vec(),
+			"with_index={with_index}: After next should be mm_in3"
+		);
+
+		// Continue forward - should become invalid (no more in-range keys)
+		let has_more = iter.next().unwrap();
+		assert!(
+			!has_more || !iter.valid(),
+			"with_index={with_index}: Should have no more keys after mm_in3"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
 /// Test seeking to a key below lower_bound.
 #[test(tokio::test)]
 async fn test_history_seek_outside_lower_bound() {
