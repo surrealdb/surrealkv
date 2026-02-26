@@ -99,9 +99,7 @@ async fn test_history_multiple_versions_single_key() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query versioned range
 		let tx = store.begin().unwrap();
@@ -167,9 +165,7 @@ async fn test_history_multiple_keys_multiple_versions() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query all keys
 		let tx = store.begin().unwrap();
@@ -225,9 +221,7 @@ async fn test_history_excludes_tombstones() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query with history (excludes tombstones by default)
 		let tx = store.begin().unwrap();
@@ -276,9 +270,7 @@ async fn test_history_with_tombstones() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query with history_with_options (includes tombstones)
 		let tx = store.begin().unwrap();
@@ -326,9 +318,7 @@ async fn test_history_replace_shows_all_versions() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query all versions
 		let tx = store.begin().unwrap();
@@ -379,9 +369,7 @@ async fn test_history_soft_delete_vs_hard_delete() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query with tombstones
@@ -422,9 +410,7 @@ async fn test_history_bounds() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query range [key_b, key_d) - should include key_b and key_c, NOT key_d
@@ -457,9 +443,7 @@ async fn test_history_empty_range() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query range [key_c, key_d) - no matching keys
@@ -502,9 +486,7 @@ async fn test_history_single_key_match() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query range that only matches key_a
 		let tx = store.begin().unwrap();
@@ -550,9 +532,7 @@ async fn test_history_interleaved_iteration() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin().unwrap();
 		let mut iter = tx.history(b"key0", b"key9").unwrap();
@@ -614,9 +594,7 @@ async fn test_history_seek_middle() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin().unwrap();
 		let mut iter = tx.history(b"key0", b"key9").unwrap();
@@ -672,9 +650,7 @@ async fn test_history_backward_iteration() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin().unwrap();
 		let mut iter = tx.history(b"key0", b"key9").unwrap();
@@ -718,9 +694,7 @@ async fn test_history_snapshot_isolation() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Take snapshot2
 		let tx2 = store.begin().unwrap();
@@ -767,9 +741,7 @@ async fn test_history_many_versions() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query all versions
@@ -813,9 +785,7 @@ async fn test_history_timestamps() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query versions
@@ -861,9 +831,7 @@ async fn test_history_entry_method() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query with tombstones
 		let tx = store.begin().unwrap();
@@ -918,9 +886,7 @@ async fn test_get_at_fallback() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin().unwrap();
 
@@ -972,9 +938,7 @@ async fn test_get_at_tombstone() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin().unwrap();
 
@@ -1339,9 +1303,7 @@ async fn test_history_bidirectional_iteration() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1389,9 +1351,7 @@ async fn test_history_ts_range_forward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query with ts_range [150, 350] - should only return v200 and v300
@@ -1433,9 +1393,7 @@ async fn test_history_ts_range_backward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query with ts_range [150, 250] - should only return v200
@@ -1466,9 +1424,7 @@ async fn test_history_limit_forward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1496,9 +1452,7 @@ async fn test_history_limit_backward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1540,9 +1494,7 @@ async fn test_history_limit_multiple_keys() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1575,9 +1527,7 @@ async fn test_history_ts_range_with_limit() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1609,9 +1559,7 @@ async fn test_history_limit_zero() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1641,9 +1589,7 @@ async fn test_history_ts_range_empty_result() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1673,9 +1619,7 @@ async fn test_get_at_ryow() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Start a new transaction and write uncommitted data
 		let mut tx = store.begin().unwrap();
@@ -1727,9 +1671,7 @@ async fn test_get_at_ryow_tombstone() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Delete the key in a new transaction (uncommitted)
 		let mut tx = store.begin().unwrap();
@@ -1755,9 +1697,7 @@ async fn test_history_ryow() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Start a new transaction and write uncommitted data
@@ -1803,9 +1743,7 @@ async fn test_history_ryow_timestamp_collision() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Write uncommitted data with the SAME timestamp
@@ -1839,9 +1777,7 @@ async fn test_history_ryow_with_ts_range() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1874,9 +1810,7 @@ async fn test_history_ryow_soft_delete() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Soft delete key in new transaction (uncommitted)
@@ -1923,9 +1857,7 @@ async fn test_history_ryow_hard_delete() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Hard delete key1 in new transaction (uncommitted)
@@ -1970,9 +1902,7 @@ async fn test_get_at_ryow_hard_delete() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let mut tx = store.begin().unwrap();
 		tx.delete(b"key1").unwrap();
@@ -2025,9 +1955,7 @@ async fn test_history_forward_respects_lower_bound() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 
@@ -2076,9 +2004,7 @@ async fn test_history_backward_respects_upper_bound() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 
@@ -2144,9 +2070,7 @@ async fn test_history_respects_both_bounds() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 
@@ -2220,9 +2144,7 @@ async fn test_history_bounds_with_timestamp_range() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 
@@ -2264,9 +2186,7 @@ async fn test_history_bounds_direction_switch_forward_to_backward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2330,9 +2250,7 @@ async fn test_history_bounds_direction_switch_backward_to_forward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2380,6 +2298,120 @@ async fn test_history_bounds_direction_switch_backward_to_forward() {
 	}
 }
 
+/// Test direction switching with keys that have many versions.
+/// Verifies that prev/next correctly navigate across multi-version keys.
+#[test(tokio::test)]
+async fn test_history_direction_switch_multi_version_keys() {
+	const VERSIONS_PER_KEY: u64 = 5;
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Create 3 keys, each with many versions
+		for key in [b"key_a", b"key_b", b"key_c"] {
+			for v in 1..=VERSIONS_PER_KEY {
+				let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+				tx.set_at(
+					key,
+					format!("{}_v{}", std::str::from_utf8(key).unwrap(), v).as_bytes(),
+					v * 100,
+				)
+				.unwrap();
+				tx.commit().await.unwrap();
+			}
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"key_a", b"key_d", &opts).unwrap();
+
+		// --- Forward: advance past key_a (5 versions) to key_b
+		iter.seek_first().unwrap();
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_a",
+			"with_index={with_index}: First should be key_a"
+		);
+		for _ in 0..VERSIONS_PER_KEY {
+			iter.next().unwrap();
+		}
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_b",
+			"with_index={with_index}: After key_a versions should be key_b"
+		);
+
+		// --- Switch backward: prev should go to last version of key_a
+		iter.prev().unwrap();
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_a",
+			"with_index={with_index}: After prev from key_b should be key_a"
+		);
+		assert_eq!(
+			iter.value().unwrap(),
+			b"key_a_v1",
+			"with_index={with_index}: Should be oldest key_a"
+		);
+
+		// --- Switch forward: next advances one entry (key_a v1 -> v2). Advance through key_a to
+		// key_b.
+		for _ in 0..VERSIONS_PER_KEY {
+			iter.next().unwrap();
+		}
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_b",
+			"with_index={with_index}: After advancing through key_a versions should be key_b"
+		);
+
+		// --- Forward: advance through key_b to key_c
+		for _ in 0..VERSIONS_PER_KEY {
+			iter.next().unwrap();
+		}
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_c",
+			"with_index={with_index}: After key_b versions should be key_c"
+		);
+
+		// --- Backward: seek_last, then prev through key_c to key_b
+		iter.seek_last().unwrap();
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_c",
+			"with_index={with_index}: Last should be key_c"
+		);
+		for _ in 0..VERSIONS_PER_KEY {
+			iter.prev().unwrap();
+		}
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_b",
+			"with_index={with_index}: After key_c versions should be key_b"
+		);
+
+		// --- Switch forward: next advances one entry. Advance through key_b to key_c.
+		for _ in 0..VERSIONS_PER_KEY {
+			iter.next().unwrap();
+		}
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_c",
+			"with_index={with_index}: After advancing through key_b versions should be key_c"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
 /// Test seeking to a key below lower_bound.
 #[test(tokio::test)]
 async fn test_history_seek_outside_lower_bound() {
@@ -2394,9 +2426,7 @@ async fn test_history_seek_outside_lower_bound() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2431,9 +2461,7 @@ async fn test_history_seek_outside_upper_bound() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2472,9 +2500,7 @@ async fn test_history_seek_to_exact_bounds() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2509,9 +2535,7 @@ async fn test_history_key_at_exact_lower_bound() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2540,9 +2564,7 @@ async fn test_history_key_at_exact_upper_bound() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2583,9 +2605,7 @@ async fn test_history_adjacent_byte_boundaries() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2641,9 +2661,7 @@ async fn test_history_tombstone_at_lower_bound() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 
@@ -2704,9 +2722,7 @@ async fn test_history_hard_delete_at_boundary() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2746,9 +2762,7 @@ async fn test_history_replace_at_boundary() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2781,9 +2795,7 @@ async fn test_history_bounds_equal_lower_upper() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2815,9 +2827,7 @@ async fn test_history_bounds_inverted() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2847,9 +2857,7 @@ async fn test_history_single_key_in_range() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2889,9 +2897,7 @@ async fn test_history_all_keys_outside_range() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -2934,9 +2940,7 @@ async fn test_history_bounds_with_limit() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true).with_limit(3);
@@ -2975,9 +2979,7 @@ async fn test_history_bounds_with_limit_backward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true).with_limit(3);
@@ -3039,9 +3041,7 @@ async fn test_history_bounds_ts_range_and_limit() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		// All three constraints: key bounds [key, key_z), ts_range [5,5], limit 3
@@ -3091,9 +3091,7 @@ async fn test_history_bounds_prefix_pattern() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -3137,9 +3135,7 @@ async fn test_history_bounds_null_bytes() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);
@@ -3189,9 +3185,7 @@ async fn test_history_bounds_max_byte_values() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 		let opts = HistoryOptions::new().with_tombstones(true);

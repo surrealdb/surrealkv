@@ -1066,7 +1066,6 @@ impl SnapshotIterator<'_> {
 	}
 
 	/// Switch from backward to forward direction.
-	/// Based on RocksDB's DBIter::ReverseToForward().
 	fn reverse_to_forward(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 
@@ -1099,7 +1098,6 @@ impl SnapshotIterator<'_> {
 	}
 
 	/// Switch from forward to backward direction.
-	/// Based on RocksDB's DBIter::ReverseToBackward().
 	fn forward_to_backward(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Backward;
 
