@@ -1988,3 +1988,257 @@ async fn test_get_at_ryow_hard_delete() {
 		store.close().await.unwrap();
 	}
 }
+
+// ============================================================================
+// History Iterator Bounds Tests
+// ============================================================================
+
+/// Test that forward iteration respects lower bound when keys exist before the range.
+/// Regression test: keys with user_key lexicographically before lower bound should not be returned.
+#[test(tokio::test)]
+async fn test_history_forward_respects_lower_bound() {
+	for with_index in [false,true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Key starting with '#' (ASCII 35) comes before '@' (ASCII 64)
+		let sync_key = b"#@prefix:sync\x00\x00\x00\x00\x00\x00\x00\x02****************";
+		let table_key = b"@prefix:tbentity\x00\x00\x00\x00\x00\x00\x00\x00\x10cccccccccccccccc";
+		let before_key = b"@prefix:tbentity\x00\x00\x00\x00\x00\x00\x00\x00\x10kkkkkkkkkkkkkkkk";
+		let after_key = b"@prefix:tbentity\x00\x00\x00\x00\x00\x00\x00\x00\x10MMMMMMMMMMMMMMMM";
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(before_key, b"value", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(sync_key, b"value", 2).unwrap();
+			tx.set_at(table_key, b"value", 2).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(after_key, b"value", 3).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		if with_index {
+			store.flush().unwrap();
+		}
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+
+		// Query range starting with '@' should NOT return '#@prefix:sync'
+		let lower = b"@prefix:\x00";
+		let upper = b"@prefix:\xFF";
+		let opts = HistoryOptions::new().with_tombstones(true).with_ts_range(2, 2);
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+
+		// Only table_key should be returned (it's the only key within range at ts=2)
+		assert_eq!(
+			results.len(),
+			1,
+			"with_index={with_index}: Only keys within range should be returned, got: {:?}",
+			results.iter().map(|(k, _, _, _)| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+		);
+		assert!(
+			results[0].0.starts_with(b"@prefix:"),
+			"with_index={with_index}: Key should start with @prefix:"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test that backward iteration respects upper bound when keys exist after the range.
+/// Regression test: keys with user_key lexicographically after upper bound should not be returned.
+#[test(tokio::test)]
+async fn test_history_backward_respects_upper_bound() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Keys in range
+		let key_a = b"key_a";
+		let key_b = b"key_b";
+		// Key after upper bound
+		let key_z = b"key_z";
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(key_a, b"value_a", 1).unwrap();
+			tx.set_at(key_b, b"value_b", 1).unwrap();
+			tx.set_at(key_z, b"value_z", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		if with_index {
+			store.flush().unwrap();
+		}
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+
+		// Query range [key_a, key_c) should NOT return key_z
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"key_a", b"key_c", &opts).unwrap();
+
+		// Iterate backward from the end
+		iter.seek_last().unwrap();
+		let mut results = Vec::new();
+		while iter.valid() {
+			let key_ref = iter.key();
+			results.push(key_ref.user_key().to_vec());
+			if !iter.prev().unwrap() {
+				break;
+			}
+		}
+
+		assert_eq!(
+			results.len(),
+			2,
+			"with_index={with_index}: Only keys within range should be returned, got: {:?}",
+			results.iter().map(|k| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+		);
+		// Backward iteration returns newest first, so key_b then key_a
+		assert_eq!(results[0], b"key_b".to_vec(), "with_index={with_index}: First should be key_b");
+		assert_eq!(results[1], b"key_a".to_vec(), "with_index={with_index}: Second should be key_a");
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test that both bounds are respected with keys outside both ends of the range.
+#[test(tokio::test)]
+async fn test_history_respects_both_bounds() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Keys before range
+		let key_aa = b"aa_before";
+		let key_ab = b"ab_before";
+		// Keys in range
+		let key_ma = b"ma_inside";
+		let key_mb = b"mb_inside";
+		let key_mc = b"mc_inside";
+		// Keys after range
+		let key_za = b"za_after";
+		let key_zb = b"zb_after";
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(key_aa, b"v", 1).unwrap();
+			tx.set_at(key_ab, b"v", 1).unwrap();
+			tx.set_at(key_ma, b"v", 1).unwrap();
+			tx.set_at(key_mb, b"v", 1).unwrap();
+			tx.set_at(key_mc, b"v", 1).unwrap();
+			tx.set_at(key_za, b"v", 1).unwrap();
+			tx.set_at(key_zb, b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		if with_index {
+			store.flush().unwrap();
+		}
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+
+		// Query range [m, z) should only return keys starting with 'm'
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"m", b"z", &opts).unwrap();
+
+		// Test forward iteration
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(
+			results.len(),
+			3,
+			"with_index={with_index}: Forward should return 3 keys in range, got: {:?}",
+			results.iter().map(|(k, _, _, _)| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+		);
+		for (key, _, _, _) in &results {
+			assert!(
+				key.as_slice() >= b"m".as_slice() && key.as_slice() < b"z".as_slice(),
+				"with_index={with_index}: Key {:?} should be in range [m, z)",
+				String::from_utf8_lossy(key)
+			);
+		}
+
+		// Test backward iteration
+		let mut iter = tx.history_with_options(b"m", b"z", &opts).unwrap();
+		iter.seek_last().unwrap();
+		let mut backward_results = Vec::new();
+		while iter.valid() {
+			backward_results.push(iter.key().user_key().to_vec());
+			if !iter.prev().unwrap() {
+				break;
+			}
+		}
+		assert_eq!(
+			backward_results.len(),
+			3,
+			"with_index={with_index}: Backward should return 3 keys in range, got: {:?}",
+			backward_results.iter().map(|k| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+		);
+		for key in &backward_results {
+			assert!(
+				key.as_slice() >= b"m".as_slice() && key.as_slice() < b"z".as_slice(),
+				"with_index={with_index}: Key {:?} should be in range [m, z)",
+				String::from_utf8_lossy(key)
+			);
+		}
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test bounds with timestamp ranges - keys outside range but within timestamp should be excluded.
+#[test(tokio::test)]
+async fn test_history_bounds_with_timestamp_range() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Key before range at target timestamp
+		let key_before = b"aaa_before";
+		// Key in range at target timestamp
+		let key_inside = b"mmm_inside";
+		// Key after range at target timestamp
+		let key_after = b"zzz_after";
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			// All keys at timestamp 5
+			tx.set_at(key_before, b"v", 5).unwrap();
+			tx.set_at(key_inside, b"v", 5).unwrap();
+			tx.set_at(key_after, b"v", 5).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		if with_index {
+			store.flush().unwrap();
+		}
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+
+		// Query with timestamp filter - should still respect bounds
+		let opts = HistoryOptions::new().with_tombstones(true).with_ts_range(5, 5);
+		let mut iter = tx.history_with_options(b"m", b"z", &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(
+			results.len(),
+			1,
+			"with_index={with_index}: Only key_inside should be returned, got: {:?}",
+			results.iter().map(|(k, _, _, _)| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+		);
+		assert_eq!(
+			results[0].0,
+			key_inside.to_vec(),
+			"with_index={with_index}: Should return mmm_inside"
+		);
+
+		store.close().await.unwrap();
+	}
+}

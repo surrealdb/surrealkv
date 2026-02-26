@@ -1360,7 +1360,7 @@ impl Core {
 		// Close the versioned index if present
 		if let Some(ref versioned_index) = self.inner.versioned_index {
 			log::debug!("Closing versioned index...");
-			versioned_index.write().close()?;
+			versioned_index.read().close()?;
 			log::debug!("Versioned index closed");
 		}
 
@@ -1412,14 +1412,7 @@ impl Core {
 			}
 		}
 
-		// Step 5: Close the versioned index if present
-		if let Some(ref versioned_index) = self.inner.versioned_index {
-			log::debug!("Closing versioned index...");
-			versioned_index.write().close()?;
-			log::debug!("Versioned index closed");
-		}
-
-		// Step 6: Flush all directories to ensure durability
+		// Step 5: Flush all directories to ensure durability
 		log::debug!("Syncing directory structure...");
 		sync_directory_structure(&self.inner.opts).map_err(|e| {
 			Error::Other(format!("Failed to sync directories during shutdown: {}", e))

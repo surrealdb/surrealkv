@@ -316,6 +316,8 @@ impl Snapshot {
 				include_tombstones,
 				ts_range,
 				limit,
+				lower,
+				upper,
 			))
 		}
 	}
@@ -1212,6 +1214,8 @@ impl<'a> HistoryIterator<'a> {
 		include_tombstones: bool,
 		ts_range: Option<(u64, u64)>,
 		limit: Option<usize>,
+		lower: Option<&[u8]>,
+		upper: Option<&[u8]>,
 	) -> Self {
 		// Use TimestampComparator for history queries with timestamp range
 		// This enables efficient timestamp-based seeks when timestamps are monotonic with seq_nums
@@ -1221,7 +1225,7 @@ impl<'a> HistoryIterator<'a> {
 			KMergeIterator::new_from(iter_state, range)
 		};
 
-		Self::new(inner, seq_num, include_tombstones, None, None, ts_range, limit)
+		Self::new(inner, seq_num, include_tombstones, lower, upper, ts_range, limit)
 	}
 
 	fn reset_forward_state(&mut self) {
@@ -1325,6 +1329,13 @@ impl<'a> HistoryIterator<'a> {
 	fn user_key_within_lower_bound(&self, user_key: &[u8]) -> bool {
 		match &self.lower_bound {
 			Some(lower) => user_key >= lower.as_slice(),
+			None => true,
+		}
+	}
+
+	fn user_key_within_upper_bound(&self, user_key: &[u8]) -> bool {
+		match &self.upper_bound {
+			Some(upper) => user_key < upper.as_slice(),
 			None => true,
 		}
 	}
@@ -1459,6 +1470,13 @@ impl<'a> HistoryIterator<'a> {
 
 		if !self.user_key_within_lower_bound(&user_key) {
 			return Ok(false);
+		}
+
+		if !self.user_key_within_upper_bound(&user_key) {
+			while self.inner_valid() && self.inner_key().user_key() == user_key.as_slice() {
+				self.inner_prev()?;
+			}
+			return self.collect_user_key_backward();
 		}
 
 		// Collect all visible versions
