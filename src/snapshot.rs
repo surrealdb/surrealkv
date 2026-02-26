@@ -1373,6 +1373,12 @@ impl<'a> HistoryIterator<'a> {
 				)
 			};
 
+			// Skip keys below lower_bound
+			if !self.user_key_within_lower_bound(&user_key_vec) {
+				self.inner_next()?;
+				continue;
+			}
+
 			// Detect user_key change → reset state
 			if user_key_vec != self.current_user_key {
 				self.current_user_key = user_key_vec;
