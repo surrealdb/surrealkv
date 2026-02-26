@@ -2742,10 +2742,7 @@ async fn test_history_replace_at_boundary() {
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
-			let write_opts = crate::transaction::WriteOptions {
-				timestamp: Some(3),
-			};
-			tx.replace_with_options(b"key_a", b"v3", &write_opts).unwrap();
+			tx.replace(b"key_a", b"v3").unwrap();
 			tx.commit().await.unwrap();
 		}
 

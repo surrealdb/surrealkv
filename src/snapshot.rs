@@ -1759,6 +1759,7 @@ impl<'a> HistoryIterator<'a> {
 
 		// Start yielding from index 0 (oldest in valid range)
 		self.backward_buffer_index = Some(0);
+
 		Ok(true)
 	}
 
@@ -1786,6 +1787,56 @@ impl<'a> HistoryIterator<'a> {
 
 	fn has_buffered_entry(&self) -> bool {
 		matches!(self.backward_buffer_index, Some(idx) if idx < self.backward_buffer.len())
+	}
+
+	/// Switch from backward to forward direction.
+	/// Uses seek-based repositioning to avoid KMergeIterator direction-switch complexity.
+	fn reverse_to_forward(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Forward;
+		self.reset_forward_state();
+
+		if !self.has_buffered_entry() {
+			self.clear_backward_buffer();
+			return Ok(false);
+		}
+
+		// Get current position from backward buffer
+		let current_internal_key = self.buffered_key().encoded().to_vec();
+		self.clear_backward_buffer();
+
+		// Seek to current position - this resets KMergeIterator to Forward mode
+		self.inner.seek(&current_internal_key)?;
+
+		if !self.inner_valid() {
+			return Ok(false);
+		}
+
+		// Move past current entry to get the NEXT entry in forward direction
+		self.inner_next()?;
+
+		// Find next valid entry
+		self.skip_to_valid_forward()
+	}
+
+	/// Switch from forward to backward direction.
+	///
+	/// In forward mode, inner is positioned at the current entry. We call prev() to move
+	/// to the previous user key, then collect that key's versions for backward iteration.
+	/// This matches SnapshotIterator's forward_to_backward behavior.
+	fn forward_to_backward(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Backward;
+		self.clear_backward_buffer();
+
+		if !self.inner_valid() {
+			return Ok(false);
+		}
+
+		// Move backward from current position to previous user key.
+		// SnapshotIterator does the same: merge_iter.prev() from current position.
+		self.inner_prev()?;
+
+		// Collect user key at new position
+		self.collect_user_key_backward()
 	}
 }
 
@@ -1841,25 +1892,10 @@ impl LSMIterator for HistoryIterator<'_> {
 
 		// Direction change: backward → forward
 		if self.direction == MergeDirection::Backward {
-			self.direction = MergeDirection::Forward;
-			self.reset_forward_state();
-
-			if self.has_buffered_entry() {
-				let current_key = self.buffered_key().encoded().to_vec();
-				self.clear_backward_buffer();
-
-				self.inner.seek(&current_key)?;
-
-				if self.inner_valid() {
-					self.inner_next()?;
-				}
-
-				return self.skip_to_valid_forward();
-			}
-
-			return Ok(false);
+			return self.reverse_to_forward();
 		}
 
+		// Normal forward iteration
 		if !self.inner_valid() {
 			return Ok(false);
 		}
@@ -1875,16 +1911,10 @@ impl LSMIterator for HistoryIterator<'_> {
 
 		// Direction change: forward → backward
 		if self.direction != MergeDirection::Backward {
-			self.direction = MergeDirection::Backward;
-
-			if self.inner_valid() {
-				self.inner_prev()?;
-			}
-
-			self.clear_backward_buffer();
-			return self.collect_user_key_backward();
+			return self.forward_to_backward();
 		}
 
+		// Normal backward iteration
 		if !self.has_buffered_entry() && !self.inner_valid() {
 			return Ok(false);
 		}
