@@ -48,9 +48,9 @@ pub enum Error {
 	NoSnapshot,
 	CommitFail(String),
 	LoadManifestFail(String),
-	Corruption(String),         // Data corruption detected
+	Corruption(String), // Data corruption detected
 	ManifestCorruption(String), /* Manifest inconsistency detected (e.g., log_number exceeds
-	                             * WAL segments) */
+	                     * WAL segments) */
 	InvalidArgument(String),
 	InvalidTag(String),
 	BPlusTree(String),    // B+ tree specific errors
