@@ -169,8 +169,8 @@ impl CoreInner {
 		let manifest_log_number = manifest.get_log_number();
 
 		// Initialize WAL starting from manifest.log_number
-		// This avoids creating intermediate empty WAL files
 		let wal_path = opts.wal_dir();
+		// This avoids creating intermediate empty WAL files
 		let wal_instance =
 			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
 
@@ -1575,10 +1575,11 @@ impl Tree {
 		}
 
 		// Reopen the WAL from the restored directory
+		let wal_path = self.core.inner.opts.path.join("wal");
+		let manifest_log_number = self.core.inner.level_manifest.read()?.get_log_number();
+
 		{
-			let manifest_log_number = self.core.inner.level_manifest.read()?.get_log_number();
 			let mut wal_guard = self.core.inner.wal.write();
-			let wal_path = self.core.inner.opts.path.join("wal");
 			let new_wal = Wal::open_with_min_log_number(
 				&wal_path,
 				manifest_log_number,
@@ -1588,11 +1589,9 @@ impl Tree {
 		}
 
 		// Replay any WAL entries that were restored
-		let wal_path = self.core.inner.opts.path.join("wal");
-		let min_wal_number = self.core.inner.level_manifest.read()?.get_log_number();
 		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_with_repair(
 			&wal_path,
-			min_wal_number,
+			manifest_log_number,
 			"Database restore",
 			self.core.inner.opts.wal_recovery_mode,
 			self.core.inner.opts.max_memtable_size,

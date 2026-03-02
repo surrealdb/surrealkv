@@ -5,9 +5,10 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::compaction::leveled::Strategy;
-use crate::levels::LevelManifest;
+use crate::levels::{validate_wal_log_number, LevelManifest};
 use crate::lsm::{CompactionOperations, Core, CoreInner};
 use crate::test::collect_transaction_all;
+use crate::wal::list_segment_ids;
 use crate::{
 	Error,
 	InternalKeyKind,
@@ -6066,5 +6067,189 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 		assert_eq!(accessible_count, NUM_RECORDS * FIELDS.len(), "Not all records accessible");
 
 		tree.close().await.unwrap();
+	}
+}
+
+/// Tests that recovery detects and rejects corrupted manifest log_number.
+/// This prevents silent data loss when log_number exceeds actual WAL segments.
+#[test_log::test(tokio::test)]
+async fn test_recovery_detects_corrupt_log_number() {
+	use byteorder::{BigEndian, WriteBytesExt};
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Phase 1: Create a database with some data and WAL segments
+	// Disable flush_on_close so WAL segments remain on disk
+	{
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.flush_on_close = false;
+		});
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Write some data (creates WAL entries)
+		for i in 0..10 {
+			let mut txn = tree.begin().unwrap();
+			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		// Close without flushing (data is only in WAL)
+		tree.close().await.unwrap();
+	}
+
+	// Phase 2: Corrupt the manifest by setting log_number to a very high value
+	{
+		// Manifest format is: {path}/manifest/{id:020}.manifest
+		let manifest_path = path.join("manifest").join("00000000000000000000.manifest");
+
+		// Read the existing manifest
+		let data = std::fs::read(&manifest_path).expect("Failed to read manifest");
+
+		// Create corrupted manifest with log_number = 999999 (way beyond any WAL)
+		let mut corrupted = Vec::new();
+		// Copy version (u16)
+		corrupted.extend_from_slice(&data[0..2]);
+		// Copy next_table_id (u64)
+		corrupted.extend_from_slice(&data[2..10]);
+		// Write corrupted log_number (u64) - set to 999999
+		corrupted.write_u64::<BigEndian>(999999).unwrap();
+		// Copy rest of the file (last_sequence and beyond)
+		corrupted.extend_from_slice(&data[18..]);
+
+		// Write corrupted manifest
+		std::fs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
+	}
+
+	// Phase 3: Try to open the database - should fail with ManifestCorruption
+	{
+		let opts = create_test_options(path.clone(), |_| {});
+		let result = Tree::new(Arc::clone(&opts));
+
+		match result {
+			Ok(_) => panic!("Expected error when opening with corrupted manifest"),
+			Err(Error::ManifestCorruption(msg)) => {
+				println!("Error message: {}", msg);
+				assert!(
+					msg.contains("log_number") && msg.contains("exceeds WAL segments"),
+					"Error message should mention log_number exceeds WAL segments, got: {}",
+					msg
+				);
+			}
+			Err(other) => panic!("Expected ManifestCorruption error, got: {}", other),
+		}
+	}
+}
+
+/// Unit test for validate_wal_log_number with multiple WAL segments.
+/// Directly tests the validation function without actual file corruption.
+#[test_log::test(tokio::test)]
+async fn test_validate_wal_log_number_multiple_wals() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Phase 1: Create database with multiple WAL segments
+	{
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 1024; // 1KB - triggers frequent rotations
+			opts.flush_on_close = false;
+		});
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		// Write enough data to trigger multiple WAL rotations
+		for i in 0..100 {
+			let mut txn = tree.begin().unwrap();
+			let value = vec![b'x'; 100]; // 100 bytes per entry
+			txn.set(format!("key{:04}", i).as_bytes(), &value).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		tree.close().await.unwrap();
+	}
+
+	// Phase 2: Verify multiple WAL segments exist
+	let wal_path = path.join("wal");
+	let segment_ids = list_segment_ids(&wal_path, Some("wal")).unwrap();
+	assert!(segment_ids.len() > 1, "Expected multiple WAL segments, got {}", segment_ids.len());
+	let max_wal = *segment_ids.last().unwrap();
+
+	// Phase 3: Test validation detects corruption
+	let result = validate_wal_log_number(&wal_path, max_wal + 10);
+	match result {
+		Ok(_) => panic!("Expected error for log_number exceeding max WAL segment"),
+		Err(Error::ManifestCorruption(msg)) => {
+			assert!(msg.contains("log_number") && msg.contains("exceeds WAL segments"));
+		}
+		Err(other) => panic!("Expected ManifestCorruption, got: {}", other),
+	}
+
+	// Phase 4: Verify valid log_number passes
+	let valid_result = validate_wal_log_number(&wal_path, max_wal + 1);
+	assert!(valid_result.is_ok(), "log_number = max_wal + 1 should be valid");
+}
+
+/// Integration test: corrupts manifest and verifies Tree::new() detects it.
+/// Tests the full recovery flow with multiple WAL segments.
+#[test_log::test(tokio::test)]
+async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
+	use byteorder::{BigEndian, WriteBytesExt};
+
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// Phase 1: Create database with multiple WAL segments
+	{
+		let opts = create_test_options(path.clone(), |opts| {
+			opts.max_memtable_size = 1024; // 1KB - triggers frequent rotations
+			opts.flush_on_close = false;
+		});
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+		for i in 0..100 {
+			let mut txn = tree.begin().unwrap();
+			let value = vec![b'x'; 100];
+			txn.set(format!("key{:04}", i).as_bytes(), &value).unwrap();
+			txn.commit().await.unwrap();
+		}
+
+		tree.close().await.unwrap();
+	}
+
+	// Phase 2: Verify multiple WAL segments exist
+	let wal_path = path.join("wal");
+	let segment_ids = list_segment_ids(&wal_path, Some("wal")).unwrap();
+	assert!(segment_ids.len() > 1, "Expected multiple WAL segments, got {}", segment_ids.len());
+	let max_wal = *segment_ids.last().unwrap();
+
+	// Phase 3: Corrupt the manifest file
+	{
+		let manifest_path = path.join("manifest").join("00000000000000000000.manifest");
+		let data = std::fs::read(&manifest_path).expect("Failed to read manifest");
+
+		let mut corrupted = Vec::new();
+		corrupted.extend_from_slice(&data[0..2]); // version (u16)
+		corrupted.extend_from_slice(&data[2..10]); // next_table_id (u64)
+		corrupted.write_u64::<BigEndian>(max_wal + 100).unwrap(); // corrupted log_number
+		corrupted.extend_from_slice(&data[18..]); // rest of file
+
+		std::fs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
+	}
+
+	// Phase 4: Try to open - should fail with ManifestCorruption
+	{
+		let opts = create_test_options(path.clone(), |_| {});
+		let result = Tree::new(Arc::clone(&opts));
+
+		match result {
+			Ok(_) => panic!("Expected error when opening with corrupted manifest"),
+			Err(Error::ManifestCorruption(msg)) => {
+				assert!(
+					msg.contains("log_number") && msg.contains("exceeds WAL segments"),
+					"Error message should mention log_number exceeds WAL segments, got: {}",
+					msg
+				);
+			}
+			Err(other) => panic!("Expected ManifestCorruption error, got: {}", other),
+		}
 	}
 }
