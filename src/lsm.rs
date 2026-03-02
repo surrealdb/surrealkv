@@ -24,7 +24,7 @@ use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
-use crate::wal::{self, cleanup_old_segments, list_segment_ids, Wal, WalManager};
+use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
 use crate::{
 	BytewiseComparator,
 	Comparator,
@@ -168,25 +168,8 @@ impl CoreInner {
 		let manifest = LevelManifest::new(Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
 
-		// Validate log_number against actual WAL segments BEFORE opening WAL
-		// This detects manifest corruption that could cause silent data loss
-		let wal_path = opts.wal_dir();
-		if let Ok(segment_ids) = list_segment_ids(&wal_path, Some("wal")) {
-			// Only validate if there are actual WAL segments on disk.
-			// If no segments exist (all flushed and cleaned up), skip validation.
-			if !segment_ids.is_empty() {
-				let last_wal = *segment_ids.last().unwrap();
-				if manifest_log_number > last_wal + 1 {
-					return Err(Error::ManifestCorruption(format!(
-						"log_number {} exceeds WAL segments (max={}). \
-						 Possible manifest corruption or incomplete backup restoration.",
-						manifest_log_number, last_wal
-					)));
-				}
-			}
-		}
-
 		// Initialize WAL starting from manifest.log_number
+		let wal_path = opts.wal_dir();
 		// This avoids creating intermediate empty WAL files
 		let wal_instance =
 			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
@@ -1591,26 +1574,9 @@ impl Tree {
 			*immutable_memtables = ImmutableMemtables::default();
 		}
 
-		// Validate and reopen the WAL from the restored directory
+		// Reopen the WAL from the restored directory
 		let wal_path = self.core.inner.opts.path.join("wal");
 		let manifest_log_number = self.core.inner.level_manifest.read()?.get_log_number();
-
-		// Validate log_number against actual WAL segments BEFORE opening WAL
-		// This detects manifest corruption that could cause silent data loss
-		if let Ok(segment_ids) = list_segment_ids(&wal_path, Some("wal")) {
-			// Only validate if there are actual WAL segments on disk.
-			// If no segments exist (all flushed and cleaned up), skip validation.
-			if !segment_ids.is_empty() {
-				let last_wal = *segment_ids.last().unwrap();
-				if manifest_log_number > last_wal + 1 {
-					return Err(Error::ManifestCorruption(format!(
-						"log_number {} exceeds WAL segments (max={}). \
-						 Possible manifest corruption or incomplete backup restoration.",
-						manifest_log_number, last_wal
-					)));
-				}
-			}
-		}
 
 		{
 			let mut wal_guard = self.core.inner.wal.write();
