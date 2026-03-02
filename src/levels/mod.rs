@@ -590,9 +590,7 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 		return Err(e);
 	}
 
-	// Optionally, open and sync the updated file to ensure all changes are flushed
-	// to disk.
-	let updated_file = SysFile::open(target_path)?;
+	let updated_file = crate::vfs::open_for_sync(target_path)?;
 	updated_file.sync_all()?;
 
 	Ok(())
