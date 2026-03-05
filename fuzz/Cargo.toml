@@ -114,3 +114,10 @@ path = "fuzz_targets/store_ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "store_bidir_iter"
+path = "fuzz_targets/store_bidir_iter.rs"
+test = false
+doc = false
+bench = false
