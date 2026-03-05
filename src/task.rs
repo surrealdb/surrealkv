@@ -82,8 +82,6 @@ impl TaskManager {
 							Ok(()) => {
 								flush_count += 1;
 								write_stall.signal_work_done();
-								// Yield to allow stalled writers to run immediately
-								tokio::task::yield_now().await;
 								// Check if there are more immutables to flush
 								if !core.has_pending_immutables() {
 									break;
@@ -93,6 +91,7 @@ impl TaskManager {
 								log::error!("Memtable compaction task error: {e:?}");
 								core.error_handler()
 									.set_error(e, BackgroundErrorReason::MemtablaFlush);
+								write_stall.signal_shutdown();
 								break;
 							}
 						}
@@ -141,6 +140,7 @@ impl TaskManager {
 					if let Err(e) = core.compact(strategy) {
 						log::error!("Level compaction task error: {e:?}");
 						core.error_handler().set_error(e, BackgroundErrorReason::Compaction);
+						write_stall.signal_shutdown();
 					} else {
 						log::debug!("Level compaction completed successfully");
 						write_stall.signal_work_done();
@@ -656,6 +656,137 @@ mod tests {
 		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 1);
 
 		// Task should still be responsive after error
+		task_manager.stop().await;
+	}
+
+	struct AboveThresholdProvider {
+		l0_files: usize,
+	}
+
+	impl WriteStallCountProvider for AboveThresholdProvider {
+		fn get_stall_counts(&self) -> StallCounts {
+			StallCounts {
+				immutable_memtables: 0,
+				l0_files: self.l0_files,
+			}
+		}
+	}
+
+	fn stalled_write_stall(l0_files: usize) -> Arc<WriteStallController> {
+		let provider: Arc<dyn WriteStallCountProvider> = Arc::new(AboveThresholdProvider {
+			l0_files,
+		});
+		let thresholds = StallThresholds {
+			memtable_limit: 2,
+			l0_file_limit: 12,
+		};
+		Arc::new(WriteStallController::new(provider, thresholds))
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_stalled_writer_unblocked_on_level_compaction_failure() {
+		let write_stall = stalled_write_stall(20);
+		let core = Arc::new(MockCoreInner::new());
+		core.fail_level.store(true, Ordering::SeqCst);
+
+		let opts = Arc::new(Options::default());
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			Arc::clone(&write_stall),
+		);
+
+		let stall_clone = Arc::clone(&write_stall);
+		let writer_handle = tokio::spawn(async move { stall_clone.check().await });
+
+		// Let the writer enter the stall loop
+		time::sleep(Duration::from_millis(50)).await;
+
+		// Trigger level compaction that will fail, which should call signal_shutdown()
+		task_manager.wake_up_level();
+
+		let result = time::timeout(Duration::from_secs(2), writer_handle).await;
+		let writer_result = result
+			.expect("Writer should not timeout (was it unblocked?)")
+			.expect("Writer task should not panic");
+
+		assert!(
+			writer_result.is_err(),
+			"Stalled writer should return Err(PipelineStall) after compaction failure"
+		);
+
+		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_stalled_writer_unblocked_on_memtable_flush_failure() {
+		let write_stall = stalled_write_stall(20);
+		let core = Arc::new(MockCoreInner::new());
+		core.fail_memtable.store(true, Ordering::SeqCst);
+
+		let opts = Arc::new(Options::default());
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			Arc::clone(&write_stall),
+		);
+
+		let stall_clone = Arc::clone(&write_stall);
+		let writer_handle = tokio::spawn(async move { stall_clone.check().await });
+
+		// Let the writer enter the stall loop
+		time::sleep(Duration::from_millis(50)).await;
+
+		// Trigger memtable flush that will fail, which should call signal_shutdown()
+		task_manager.wake_up_memtable();
+
+		let result = time::timeout(Duration::from_secs(2), writer_handle).await;
+		let writer_result = result
+			.expect("Writer should not timeout (was it unblocked?)")
+			.expect("Writer task should not panic");
+
+		assert!(
+			writer_result.is_err(),
+			"Stalled writer should return Err(PipelineStall) after flush failure"
+		);
+
+		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_multiple_stalled_writers_unblocked_on_failure() {
+		let write_stall = stalled_write_stall(20);
+		let core = Arc::new(MockCoreInner::new());
+		core.fail_level.store(true, Ordering::SeqCst);
+
+		let opts = Arc::new(Options::default());
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			Arc::clone(&write_stall),
+		);
+
+		let mut writer_handles = Vec::new();
+		for _ in 0..5 {
+			let stall_clone = Arc::clone(&write_stall);
+			writer_handles.push(tokio::spawn(async move { stall_clone.check().await }));
+		}
+
+		// Let all writers enter the stall loop
+		time::sleep(Duration::from_millis(50)).await;
+
+		// Trigger level compaction failure — signal_shutdown uses notify_waiters
+		// which must wake ALL 5 writers, not just one
+		task_manager.wake_up_level();
+
+		for (i, handle) in writer_handles.into_iter().enumerate() {
+			let result = time::timeout(Duration::from_secs(2), handle).await;
+			let writer_result = result
+				.unwrap_or_else(|_| panic!("Writer {i} timed out (not unblocked)"))
+				.unwrap_or_else(|e| panic!("Writer {i} panicked: {e}"));
+			assert!(writer_result.is_err(), "Writer {i} should return Err(PipelineStall)");
+		}
+
 		task_manager.stop().await;
 	}
 }
