@@ -8,6 +8,7 @@ use crate::compaction::leveled::Strategy;
 use crate::compaction::CompactionStrategy;
 use crate::error::BackgroundErrorReason;
 use crate::lsm::CompactionOperations;
+use crate::stall::WriteStallController;
 use crate::Options;
 
 /// Manages background tasks for the LSM tree
@@ -41,7 +42,11 @@ impl fmt::Debug for TaskManager {
 }
 
 impl TaskManager {
-	pub(crate) fn new(core: Arc<dyn CompactionOperations>, opts: Arc<Options>) -> Self {
+	pub(crate) fn new(
+		core: Arc<dyn CompactionOperations>,
+		opts: Arc<Options>,
+		write_stall: Arc<WriteStallController>,
+	) -> Self {
 		let stop_flag = Arc::new(AtomicBool::new(false));
 		let memtable_notify = Arc::new(Notify::new());
 		let level_notify = Arc::new(Notify::new());
@@ -56,6 +61,7 @@ impl TaskManager {
 			let notify = Arc::clone(&memtable_notify);
 			let running = Arc::clone(&memtable_running);
 			let level_notify = Arc::clone(&level_notify);
+			let write_stall = Arc::clone(&write_stall);
 
 			let handle = tokio::spawn(async move {
 				loop {
@@ -75,6 +81,7 @@ impl TaskManager {
 						match core.compact_memtable() {
 							Ok(()) => {
 								flush_count += 1;
+								write_stall.signal_work_done();
 								// Check if there are more immutables to flush
 								if !core.has_pending_immutables() {
 									break;
@@ -84,6 +91,7 @@ impl TaskManager {
 								log::error!("Memtable compaction task error: {e:?}");
 								core.error_handler()
 									.set_error(e, BackgroundErrorReason::MemtablaFlush);
+								write_stall.signal_shutdown();
 								break;
 							}
 						}
@@ -112,6 +120,7 @@ impl TaskManager {
 			let stop_flag = Arc::clone(&stop_flag);
 			let notify = Arc::clone(&level_notify);
 			let running = Arc::clone(&level_running);
+			let write_stall = Arc::clone(&write_stall);
 
 			let handle = tokio::spawn(async move {
 				loop {
@@ -131,8 +140,10 @@ impl TaskManager {
 					if let Err(e) = core.compact(strategy) {
 						log::error!("Level compaction task error: {e:?}");
 						core.error_handler().set_error(e, BackgroundErrorReason::Compaction);
+						write_stall.signal_shutdown();
 					} else {
 						log::debug!("Level compaction completed successfully");
+						write_stall.signal_work_done();
 					}
 					running.store(false, Ordering::SeqCst);
 				}
@@ -157,7 +168,6 @@ impl TaskManager {
 		}
 	}
 
-	#[cfg(test)]
 	pub(crate) fn wake_up_level(&self) {
 		// Only notify if not already running
 		if !self.level_running.load(Ordering::Acquire) {
@@ -204,8 +214,34 @@ mod tests {
 	use crate::compaction::CompactionStrategy;
 	use crate::error::{BackgroundErrorHandler, Result};
 	use crate::lsm::CompactionOperations;
+	use crate::stall::{
+		StallCounts,
+		StallThresholds,
+		WriteStallController,
+		WriteStallCountProvider,
+	};
 	use crate::task::TaskManager;
 	use crate::{Error, Options};
+
+	struct NoopStallProvider;
+
+	impl WriteStallCountProvider for NoopStallProvider {
+		fn get_stall_counts(&self) -> StallCounts {
+			StallCounts {
+				immutable_memtables: 0,
+				l0_files: 0,
+			}
+		}
+	}
+
+	fn test_write_stall() -> Arc<WriteStallController> {
+		let provider: Arc<dyn WriteStallCountProvider> = Arc::new(NoopStallProvider);
+		let thresholds = StallThresholds {
+			memtable_limit: 2,
+			l0_file_limit: 12,
+		};
+		Arc::new(WriteStallController::new(provider, thresholds))
+	}
 
 	// Mock CoreInner for testing
 	struct MockCoreInner {
@@ -288,8 +324,11 @@ mod tests {
 	async fn test_wake_up_memtable() {
 		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager =
-			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			test_write_stall(),
+		);
 
 		task_manager.wake_up_memtable();
 		time::sleep(Duration::from_millis(100)).await; // Allow time for task to complete
@@ -304,8 +343,11 @@ mod tests {
 	async fn test_multiple_wake_up_memtable() {
 		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager =
-			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			test_write_stall(),
+		);
 
 		for _ in 0..3 {
 			task_manager.wake_up_memtable();
@@ -326,8 +368,11 @@ mod tests {
 	async fn test_wake_up_level() {
 		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager =
-			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			test_write_stall(),
+		);
 
 		task_manager.wake_up_level();
 		time::sleep(Duration::from_millis(100)).await; // Allow time for task to complete
@@ -342,8 +387,11 @@ mod tests {
 	async fn test_multiple_wake_up_level() {
 		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager =
-			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			test_write_stall(),
+		);
 
 		for _ in 0..3 {
 			task_manager.wake_up_level();
@@ -364,8 +412,11 @@ mod tests {
 	async fn test_alternating_compactions() {
 		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager =
-			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			test_write_stall(),
+		);
 
 		// Alternating between memtable and level compactions
 		for i in 0..4 {
@@ -394,8 +445,11 @@ mod tests {
 		// Create core with longer delays to ensure tasks are still running when we try
 		// to wake them again
 		let core = Arc::new(MockCoreInner::with_delays(100, 100));
-		let task_manager =
-			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			test_write_stall(),
+		);
 
 		// Wake up memtable and immediately try again while it's still running
 		task_manager.wake_up_memtable();
@@ -425,8 +479,11 @@ mod tests {
 	async fn test_concurrent_wake_up_memtable() {
 		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager =
-			Arc::new(TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts));
+		let task_manager = Arc::new(TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			test_write_stall(),
+		));
 
 		let mut handles = vec![];
 		for _ in 0..10 {
@@ -456,8 +513,11 @@ mod tests {
 	async fn test_concurrent_wake_up_level() {
 		let opts = Arc::new(Options::default());
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager =
-			Arc::new(TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts));
+		let task_manager = Arc::new(TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			test_write_stall(),
+		));
 
 		let mut handles = vec![];
 		for _ in 0..5 {
@@ -508,8 +568,11 @@ mod tests {
 
 		// Now create the task manager and run the actual test
 		let opts = Arc::new(Options::default());
-		let task_manager =
-			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			test_write_stall(),
+		);
 
 		// Trigger memtable compaction that will fail
 		task_manager.wake_up_memtable();
@@ -567,8 +630,11 @@ mod tests {
 		// Create a core that will fail on the first attempt but succeed on subsequent
 		// attempts
 		let core = Arc::new(MockCoreInner::new());
-		let task_manager =
-			TaskManager::new(Arc::clone(&core) as Arc<dyn CompactionOperations>, opts);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			test_write_stall(),
+		);
 
 		// Make first memtable compaction fail
 		core.fail_memtable.store(true, Ordering::SeqCst);
@@ -590,6 +656,137 @@ mod tests {
 		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 1);
 
 		// Task should still be responsive after error
+		task_manager.stop().await;
+	}
+
+	struct AboveThresholdProvider {
+		l0_files: usize,
+	}
+
+	impl WriteStallCountProvider for AboveThresholdProvider {
+		fn get_stall_counts(&self) -> StallCounts {
+			StallCounts {
+				immutable_memtables: 0,
+				l0_files: self.l0_files,
+			}
+		}
+	}
+
+	fn stalled_write_stall(l0_files: usize) -> Arc<WriteStallController> {
+		let provider: Arc<dyn WriteStallCountProvider> = Arc::new(AboveThresholdProvider {
+			l0_files,
+		});
+		let thresholds = StallThresholds {
+			memtable_limit: 2,
+			l0_file_limit: 12,
+		};
+		Arc::new(WriteStallController::new(provider, thresholds))
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_stalled_writer_unblocked_on_level_compaction_failure() {
+		let write_stall = stalled_write_stall(20);
+		let core = Arc::new(MockCoreInner::new());
+		core.fail_level.store(true, Ordering::SeqCst);
+
+		let opts = Arc::new(Options::default());
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			Arc::clone(&write_stall),
+		);
+
+		let stall_clone = Arc::clone(&write_stall);
+		let writer_handle = tokio::spawn(async move { stall_clone.check().await });
+
+		// Let the writer enter the stall loop
+		time::sleep(Duration::from_millis(50)).await;
+
+		// Trigger level compaction that will fail, which should call signal_shutdown()
+		task_manager.wake_up_level();
+
+		let result = time::timeout(Duration::from_secs(2), writer_handle).await;
+		let writer_result = result
+			.expect("Writer should not timeout (was it unblocked?)")
+			.expect("Writer task should not panic");
+
+		assert!(
+			writer_result.is_err(),
+			"Stalled writer should return Err(PipelineStall) after compaction failure"
+		);
+
+		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_stalled_writer_unblocked_on_memtable_flush_failure() {
+		let write_stall = stalled_write_stall(20);
+		let core = Arc::new(MockCoreInner::new());
+		core.fail_memtable.store(true, Ordering::SeqCst);
+
+		let opts = Arc::new(Options::default());
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			Arc::clone(&write_stall),
+		);
+
+		let stall_clone = Arc::clone(&write_stall);
+		let writer_handle = tokio::spawn(async move { stall_clone.check().await });
+
+		// Let the writer enter the stall loop
+		time::sleep(Duration::from_millis(50)).await;
+
+		// Trigger memtable flush that will fail, which should call signal_shutdown()
+		task_manager.wake_up_memtable();
+
+		let result = time::timeout(Duration::from_secs(2), writer_handle).await;
+		let writer_result = result
+			.expect("Writer should not timeout (was it unblocked?)")
+			.expect("Writer task should not panic");
+
+		assert!(
+			writer_result.is_err(),
+			"Stalled writer should return Err(PipelineStall) after flush failure"
+		);
+
+		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_multiple_stalled_writers_unblocked_on_failure() {
+		let write_stall = stalled_write_stall(20);
+		let core = Arc::new(MockCoreInner::new());
+		core.fail_level.store(true, Ordering::SeqCst);
+
+		let opts = Arc::new(Options::default());
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			opts,
+			Arc::clone(&write_stall),
+		);
+
+		let mut writer_handles = Vec::new();
+		for _ in 0..5 {
+			let stall_clone = Arc::clone(&write_stall);
+			writer_handles.push(tokio::spawn(async move { stall_clone.check().await }));
+		}
+
+		// Let all writers enter the stall loop
+		time::sleep(Duration::from_millis(50)).await;
+
+		// Trigger level compaction failure — signal_shutdown uses notify_waiters
+		// which must wake ALL 5 writers, not just one
+		task_manager.wake_up_level();
+
+		for (i, handle) in writer_handles.into_iter().enumerate() {
+			let result = time::timeout(Duration::from_secs(2), handle).await;
+			let writer_result = result
+				.unwrap_or_else(|_| panic!("Writer {i} timed out (not unblocked)"))
+				.unwrap_or_else(|e| panic!("Writer {i} panicked: {e}"));
+			assert!(writer_result.is_err(), "Writer {i} should return Err(PipelineStall)");
+		}
+
 		task_manager.stop().await;
 	}
 }
