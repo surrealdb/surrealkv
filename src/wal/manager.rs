@@ -219,6 +219,7 @@ impl Wal {
 		Ok(CompressionType::None)
 	}
 
+	#[allow(unused_variables)] // opts used on Unix via #[cfg(unix)] below
 	fn open_wal_file(file_path: &Path, opts: &Options) -> Result<File> {
 		let mut open_options = OpenOptions::new();
 		open_options.read(true).write(true).create(true).append(true);
@@ -234,23 +235,16 @@ impl Wal {
 		Ok(open_options.open(file_path)?)
 	}
 
+	#[allow(unused_variables)] // Parameters used on Unix via #[cfg(unix)] below
 	fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
 		// Directory should already be created by Tree::new()
-		// Just set permissions if needed
+		// Set permissions on Unix only; Windows NTFS uses ACLs and
+		// set_permissions on directories can fail with ERROR_ACCESS_DENIED.
+		#[cfg(unix)]
 		if let Ok(metadata) = fs::metadata(dir) {
 			let mut permissions = metadata.permissions();
-
-			#[cfg(unix)]
-			{
-				use std::os::unix::fs::PermissionsExt;
-				permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
-			}
-
-			#[cfg(windows)]
-			{
-				permissions.set_readonly(false);
-			}
-
+			use std::os::unix::fs::PermissionsExt;
+			permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
 			fs::set_permissions(dir, permissions)?;
 		}
 

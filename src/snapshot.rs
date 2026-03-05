@@ -1359,6 +1359,7 @@ impl<'a> HistoryIterator<'a> {
 		}
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new_lsm(
 		seq_num: u64,
 		iter_state: IterState,

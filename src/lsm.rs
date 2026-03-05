@@ -1,10 +1,10 @@
 use std::collections::HashSet;
-use std::fs::{create_dir_all, File};
+use std::fs::create_dir_all;
+#[cfg(not(target_os = "windows"))]
+use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-
-use async_trait::async_trait;
 
 use crate::batch::Batch;
 use crate::bplustree::tree::DiskBPlusTree;
@@ -18,6 +18,7 @@ use crate::lockfile::LockFile;
 use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::Table;
+use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
@@ -40,7 +41,6 @@ use crate::{
 /// Defines the compaction operations that can be performed on an LSM tree.
 /// Compaction is essential for maintaining read performance by merging
 /// overlapping SSTables and removing deleted entries.
-#[async_trait]
 pub trait CompactionOperations: Send + Sync {
 	/// Flushes the active memtable to disk, converting it into an immutable
 	/// SSTable. This is the first step in the LSM tree's write path.
@@ -167,8 +167,8 @@ impl CoreInner {
 		let manifest_log_number = manifest.get_log_number();
 
 		// Initialize WAL starting from manifest.log_number
-		// This avoids creating intermediate empty WAL files
 		let wal_path = opts.wal_dir();
+		// This avoids creating intermediate empty WAL files
 		let wal_instance =
 			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
 
@@ -240,6 +240,17 @@ impl CoreInner {
 		// Fall back to active memtable
 		let memtable = self.active_memtable.read()?;
 		Ok(memtable.earliest_seq())
+	}
+
+	pub(crate) fn immutable_count(&self) -> usize {
+		self.immutable_memtables.read().map(|imm| imm.iter().count()).unwrap_or(0)
+	}
+
+	pub(crate) fn l0_file_count(&self) -> usize {
+		self.level_manifest
+			.read()
+			.map(|m| m.levels.get_levels().first().map(|l| l.tables.len()).unwrap_or(0))
+			.unwrap_or(0)
 	}
 
 	pub(crate) fn check_keys_conflict<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
@@ -935,6 +946,15 @@ impl CompactionOperations for CoreInner {
 	}
 }
 
+impl WriteStallCountProvider for CoreInner {
+	fn get_stall_counts(&self) -> StallCounts {
+		StallCounts {
+			immutable_memtables: self.immutable_count(),
+			l0_files: self.l0_file_count(),
+		}
+	}
+}
+
 struct LsmCommitEnv {
 	core: Arc<CoreInner>,
 
@@ -1037,6 +1057,9 @@ pub(crate) struct Core {
 	/// Task manager for background operations (stored in Option so we can take
 	/// it for shutdown)
 	pub(crate) task_manager: Mutex<Option<Arc<TaskManager>>>,
+
+	/// Write stall controller for backpressure management
+	pub(crate) write_stall: Arc<crate::stall::WriteStallController>,
 }
 
 impl std::ops::Deref for Core {
@@ -1184,10 +1207,21 @@ impl Core {
 
 		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
 
+		// Create the write stall controller with the provider and thresholds
+		let thresholds = StallThresholds {
+			memtable_limit: opts.memtable_stall_threshold,
+			l0_file_limit: opts.l0_stall_threshold,
+		};
+		let write_stall = Arc::new(crate::stall::WriteStallController::new(
+			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
+			thresholds,
+		));
+
 		// Initialize background task manager
 		let task_manager = Arc::new(TaskManager::new(
 			Arc::clone(&inner) as Arc<dyn CompactionOperations>,
 			Arc::clone(&opts),
+			Arc::clone(&write_stall),
 		));
 
 		let commit_env =
@@ -1195,7 +1229,11 @@ impl Core {
 
 		// Pass the shared visible_seq_num from CoreInner to CommitPipeline
 		// Both will use the same atomic for coordinated updates
-		let commit_pipeline = CommitPipeline::new(commit_env, Arc::clone(&inner.visible_seq_num));
+		let commit_pipeline = CommitPipeline::new(
+			commit_env,
+			Arc::clone(&inner.visible_seq_num),
+			Arc::clone(&write_stall),
+		);
 
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
@@ -1278,10 +1316,14 @@ impl Core {
 		// SAFETY: This must happen AFTER manifest is loaded so we know which SSTs exist
 		inner.cleanup_orphaned_vlog_files()?;
 
+		// Trigger level compaction check at startup
+		task_manager.wake_up_level();
+
 		let core = Self {
 			inner: Arc::clone(&inner),
 			commit_pipeline: Arc::clone(&commit_pipeline),
 			task_manager: Mutex::new(Some(task_manager)),
+			write_stall,
 		};
 
 		log::info!("=== LSM tree initialization complete ===");
@@ -1342,7 +1384,11 @@ impl Core {
 		self.commit_pipeline.shutdown();
 		log::debug!("Commit pipeline shutdown complete");
 
-		// Step 2: Wait for and stop all background tasks
+		// Step 2: Signal write stall controller - wake any stalled writers
+		self.write_stall.signal_shutdown();
+		log::debug!("Write stall shutdown signal sent");
+
+		// Step 3: Wait for and stop all background tasks
 		let task_manager = self.task_manager.lock().unwrap().take();
 		if let Some(task_manager) = task_manager {
 			log::debug!("Stopping background task manager...");
@@ -1566,10 +1612,11 @@ impl Tree {
 		}
 
 		// Reopen the WAL from the restored directory
+		let wal_path = self.core.inner.opts.path.join("wal");
+		let manifest_log_number = self.core.inner.level_manifest.read()?.get_log_number();
+
 		{
-			let manifest_log_number = self.core.inner.level_manifest.read()?.get_log_number();
 			let mut wal_guard = self.core.inner.wal.write();
-			let wal_path = self.core.inner.opts.path.join("wal");
 			let new_wal = Wal::open_with_min_log_number(
 				&wal_path,
 				manifest_log_number,
@@ -1579,11 +1626,9 @@ impl Tree {
 		}
 
 		// Replay any WAL entries that were restored
-		let wal_path = self.core.inner.opts.path.join("wal");
-		let min_wal_number = self.core.inner.level_manifest.read()?.get_log_number();
 		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_with_repair(
 			&wal_path,
-			min_wal_number,
+			manifest_log_number,
 			"Database restore",
 			self.core.inner.opts.wal_recovery_mode,
 			self.core.inner.opts.max_memtable_size,
@@ -1650,7 +1695,19 @@ impl Tree {
 		}
 
 		// Step 2: Flush all immutable memtables synchronously
-		self.core.inner.flush_all_immutables_sync()
+		self.core.inner.flush_all_immutables_sync()?;
+
+		// Step 3: Signal stall controller that work completed
+		self.core.write_stall.signal_work_done();
+
+		Ok(())
+	}
+
+	#[cfg(test)]
+	pub(crate) fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+		self.core.inner.compact(strategy)?;
+		self.core.write_stall.signal_work_done();
+		Ok(())
 	}
 
 	/// Flushes WAL and VLog buffers to OS cache.
@@ -1849,6 +1906,18 @@ impl TreeBuilder {
 		self
 	}
 
+	/// Set the memtable stall threshold.
+	pub fn with_memtable_stall_threshold(mut self, value: usize) -> Self {
+		self.opts = self.opts.with_memtable_stall_threshold(value);
+		self
+	}
+
+	/// Set the L0 stall threshold.
+	pub fn with_l0_stall_threshold(mut self, value: usize) -> Self {
+		self.opts = self.opts.with_l0_stall_threshold(value);
+		self
+	}
+
 	/// Builds the LSM tree with the configured options.
 	///
 	/// This method ensures type safety by using the same key type K
@@ -1882,9 +1951,18 @@ pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 		return Ok(());
 	}
 
-	let file = File::open(path)?;
-	debug_assert!(file.metadata()?.is_dir());
-	file.sync_all()
+	// On Windows, calling sync_all() on a directory handle returns
+	// ERROR_ACCESS_DENIED (os error 5) because FlushFileBuffers requires
+	// GENERIC_WRITE, which is not available for directories. NTFS journals
+	// directory metadata automatically, so this is safe to skip.
+	#[cfg(not(target_os = "windows"))]
+	{
+		let file = File::open(path)?;
+		debug_assert!(file.metadata()?.is_dir());
+		file.sync_all()?;
+	}
+
+	Ok(())
 }
 
 /// Syncs all directory structures for the LSM store to ensure durability

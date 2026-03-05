@@ -271,7 +271,7 @@ impl MemTable {
 			vlog.sync()?;
 		}
 
-		let file = SysFile::open(&table_file_path)?;
+		let file = crate::vfs::open_for_sync(&table_file_path)?;
 		file.sync_all()?;
 		let file: Arc<dyn File> = Arc::new(file);
 		let file_size = file.size()?;

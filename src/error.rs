@@ -38,7 +38,9 @@ pub enum Error {
 	TransactionReadOnly,
 	TransactionWithoutSavepoint,
 	KeyNotFound,
-	WriteStall,
+	WriteStall {
+		reason: WriteStallReason,
+	},
 	ArenaFull, // Memtable arena is full, need rotation
 	FileDescriptorNotFound,
 	TableIDCollision(u64),
@@ -49,6 +51,8 @@ pub enum Error {
 	CommitFail(String),
 	LoadManifestFail(String),
 	Corruption(String), // Data corruption detected
+	ManifestCorruption(String), /* Manifest inconsistency detected (e.g., log_number exceeds
+	                     * WAL segments) */
 	InvalidArgument(String),
 	InvalidTag(String),
 	BPlusTree(String),    // B+ tree specific errors
@@ -91,7 +95,7 @@ impl fmt::Display for Error {
             Self::TransactionReadOnly => write!(f, "Transaction is read-only"),
             Self::TransactionWithoutSavepoint => write!(f, "Transaction has no savepoint to rollback to"),
             Self::KeyNotFound => write!(f, "Key not found"),
-            Self::WriteStall => write!(f, "Write stall"),
+            Self::WriteStall { reason } => write!(f, "Write stall: {:?}", reason),
             Self::ArenaFull => write!(f, "Memtable arena is full"),
             Self::FileDescriptorNotFound => write!(f, "File descriptor not found"),
 			Self::TableIDCollision(id) => write!(f, "CRITICAL ERROR: Table ID collision detected. New table ID {id} conflicts with a table ID in the merge list."),
@@ -102,6 +106,7 @@ impl fmt::Display for Error {
             Self::CommitFail(err) => write!(f, "Commit failed: {err}"),
             Self::LoadManifestFail(err) => write!(f, "Failed to load manifest: {err}"),
             Self::Corruption(err) => write!(f, "Data corruption detected: {err}"),
+            Self::ManifestCorruption(err) => write!(f, "Manifest corruption detected: {err}"),
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::BPlusTree(err) => write!(f, "B+ tree error: {err}"),
@@ -187,6 +192,15 @@ pub enum BackgroundErrorReason {
 	ManifestWrite,
 }
 
+/// Reason for write stall - used for logging and metrics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteStallReason {
+	/// Too many immutable memtables queued for flush
+	MemtableLimit,
+	/// Too many L0 files awaiting compaction
+	L0FileLimit,
+}
+
 /// Represents a background error with its severity and context
 #[derive(Debug, Clone)]
 pub struct BackgroundError {
@@ -220,7 +234,9 @@ impl BackgroundErrorHandler {
 	fn classify_error(error: &Error, reason: BackgroundErrorReason) -> ErrorSeverity {
 		match (reason, error) {
 			// Corruption errors are unrecoverable
-			(_, Error::Corruption(_) | Error::CorruptedBlock(_)) => ErrorSeverity::Unrecoverable,
+			(_, Error::Corruption(_) | Error::CorruptedBlock(_) | Error::ManifestCorruption(_)) => {
+				ErrorSeverity::Unrecoverable
+			}
 
 			// Table ID collision is a critical consistency error
 			(_, Error::TableIDCollision(_)) => ErrorSeverity::Unrecoverable,

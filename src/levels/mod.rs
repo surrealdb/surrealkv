@@ -14,7 +14,26 @@ use rand::Rng;
 use crate::error::Error;
 use crate::sstable::table::Table;
 use crate::vfs::File;
+use crate::wal::list_segment_ids;
 use crate::{Options, Result};
+
+/// Validates that the manifest's log_number doesn't exceed actual WAL segments on disk.
+/// This detects manifest corruption that could cause silent data loss.
+pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64) -> Result<()> {
+	if let Ok(segment_ids) = list_segment_ids(wal_path, Some("wal")) {
+		if !segment_ids.is_empty() {
+			let last_wal = *segment_ids.last().unwrap();
+			if manifest_log_number > last_wal + 1 {
+				return Err(Error::ManifestCorruption(format!(
+					"log_number {} exceeds WAL segments (max={}). \
+					 Possible manifest corruption or incomplete backup restoration.",
+					manifest_log_number, last_wal
+				)));
+			}
+		}
+	}
+	Ok(())
+}
 
 /// Current manifest format version
 pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
@@ -208,6 +227,9 @@ impl LevelManifest {
 			log_number,
 			last_sequence
 		);
+
+		// Validate log_number against actual WAL segments BEFORE proceeding
+		validate_wal_log_number(&opts.wal_dir(), log_number)?;
 
 		// Read levels data
 		let level_data = Levels::decode(&mut level_manifest)?;
@@ -590,9 +612,7 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 		return Err(e);
 	}
 
-	// Optionally, open and sync the updated file to ensure all changes are flushed
-	// to disk.
-	let updated_file = SysFile::open(target_path)?;
+	let updated_file = crate::vfs::open_for_sync(target_path)?;
 	updated_file.sync_all()?;
 
 	Ok(())
