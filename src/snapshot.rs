@@ -316,6 +316,8 @@ impl Snapshot {
 				include_tombstones,
 				ts_range,
 				limit,
+				lower,
+				upper,
 			))
 		}
 	}
@@ -685,6 +687,87 @@ impl<'a> KMergeIterator<'a> {
 		Ok(())
 	}
 
+	/// Switch from backward to forward, positioning just after `target`.
+	///
+	/// When switching directions, the current iterator just moves forward once.
+	/// Non-current iterators need to be positioned at a key strictly greater than
+	/// `target` to ensure correct ordering.
+	fn switch_to_forward(&mut self, target: &[u8]) -> Result<()> {
+		let current_idx = self.winner;
+		self.direction = MergeDirection::Forward;
+		self.active_count = 0;
+
+		for (idx, iter) in self.iterators.iter_mut().enumerate() {
+			if Some(idx) == current_idx {
+				// Current iterator: just call next() once
+				if iter.next()? {
+					self.active_count += 1;
+				}
+			} else {
+				// Non-current: seek to target, then advance past it
+				if iter.seek(target)? {
+					// Advance while key <= target (need to be strictly greater)
+					while iter.valid()
+						&& self.cmp.compare(iter.key().encoded(), target) != Ordering::Greater
+					{
+						if !iter.next()? {
+							break;
+						}
+					}
+					if iter.valid() {
+						self.active_count += 1;
+					}
+				}
+			}
+		}
+
+		self.find_winner();
+		Ok(())
+	}
+
+	/// Switch from forward to backward, positioning just before `target`.
+	///
+	/// When switching directions, the current iterator just moves backward once.
+	/// Non-current iterators need to be positioned at a key strictly less than
+	/// `target` to ensure correct ordering.
+	fn switch_to_backward(&mut self, target: &[u8]) -> Result<()> {
+		let current_idx = self.winner;
+		self.direction = MergeDirection::Backward;
+		self.active_count = 0;
+
+		for (idx, iter) in self.iterators.iter_mut().enumerate() {
+			if Some(idx) == current_idx {
+				// Current iterator: just call prev() once
+				if iter.prev()? {
+					self.active_count += 1;
+				}
+			} else {
+				// Non-current: seek to target, then move before it
+				if iter.seek(target)? {
+					// Move backward while key >= target (need to be strictly less)
+					while iter.valid()
+						&& self.cmp.compare(iter.key().encoded(), target) != Ordering::Less
+					{
+						if !iter.prev()? {
+							break;
+						}
+					}
+					if iter.valid() {
+						self.active_count += 1;
+					}
+				} else {
+					// Iterator positioned past all keys, go to last
+					if iter.seek_last()? {
+						self.active_count += 1;
+					}
+				}
+			}
+		}
+
+		self.find_winner();
+		Ok(())
+	}
+
 	/// Advance the current winner and find new winner
 	fn advance_winner(&mut self) -> Result<bool> {
 		if self.active_count == 0 || self.winner.is_none() {
@@ -751,6 +834,12 @@ impl LSMIterator for KMergeIterator<'_> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
+		// If we were going backward, switch to forward
+		if self.direction != MergeDirection::Forward {
+			let target = self.key().encoded().to_vec();
+			self.switch_to_forward(&target)?;
+			return Ok(self.is_valid());
+		}
 		self.advance_winner()
 	}
 
@@ -763,7 +852,9 @@ impl LSMIterator for KMergeIterator<'_> {
 		}
 		// If we were going forward, switch to backward
 		if self.direction != MergeDirection::Backward {
-			return self.seek_last();
+			let target = self.key().encoded().to_vec();
+			self.switch_to_backward(&target)?;
+			return Ok(self.is_valid());
 		}
 		self.advance_winner()
 	}
@@ -973,6 +1064,58 @@ impl SnapshotIterator<'_> {
 		self.has_current_back = false;
 		self.skip_to_valid_backward()
 	}
+
+	/// Switch from backward to forward direction.
+	fn reverse_to_forward(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Forward;
+
+		// Get current user key from backward state (equivalent to saved_key_)
+		let current_user_key = if self.has_current_back {
+			InternalKeyRef::from_encoded(&self.current_back_key).user_key().to_vec()
+		} else {
+			// No current position in backward mode
+			self.has_buffered_back = false;
+			return Ok(false);
+		};
+
+		// Clear backward state
+		self.has_current_back = false;
+		self.has_buffered_back = false;
+
+		// Set last_key_fwd so skip_to_valid_forward() will skip this user key
+		// (equivalent to FindNextUserEntry(skipping_saved_key=true))
+		self.last_key_fwd.clear();
+		self.last_key_fwd.extend_from_slice(&current_user_key);
+
+		// Seek to first entry >= current user key
+		// Using (user_key, MAX_SEQ) positions at the start of this user key's entries
+		let seek_key = InternalKey::new(current_user_key, u64::MAX, InternalKeyKind::Set, u64::MAX);
+		self.merge_iter.seek(&seek_key.encode())?;
+
+		// skip_to_valid_forward() will skip entries with user_key == last_key_fwd
+		// and return the first visible entry with a DIFFERENT user key
+		self.skip_to_valid_forward()
+	}
+
+	/// Switch from forward to backward direction.
+	fn forward_to_backward(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Backward;
+
+		// Clear backward buffers
+		self.has_buffered_back = false;
+		self.has_current_back = false;
+
+		// In forward mode, merge_iter is positioned at the current entry
+		// We need to move to the previous user key
+		if self.merge_iter.valid() {
+			// Move backward from current position
+			self.merge_iter.prev()?;
+		}
+
+		// find_latest_visible_backward will scan this user key's entries
+		// to find the latest visible version, then buffer the next user key
+		self.skip_to_valid_backward()
+	}
 }
 
 impl LSMIterator for SnapshotIterator<'_> {
@@ -1009,6 +1152,13 @@ impl LSMIterator for SnapshotIterator<'_> {
 		if !self.initialized {
 			return self.seek_first();
 		}
+
+		// Direction change: backward → forward (ReverseToForward)
+		if self.direction == MergeDirection::Backward {
+			return self.reverse_to_forward();
+		}
+
+		// Normal forward iteration
 		if !self.merge_iter.valid() {
 			return Ok(false);
 		}
@@ -1020,13 +1170,17 @@ impl LSMIterator for SnapshotIterator<'_> {
 		if !self.initialized {
 			return self.seek_last();
 		}
-		// For backward iteration, we can continue if we have a buffered next entry
-		// or if the merge_iter is still valid
+
+		// Direction change: forward → backward (ReverseToBackward)
+		if self.direction != MergeDirection::Backward {
+			return self.forward_to_backward();
+		}
+
+		// Normal backward iteration
 		if !self.merge_iter.valid() && !self.has_buffered_back {
 			self.has_current_back = false;
 			return Ok(false);
 		}
-		// For backward, skip_to_valid_backward handles the logic
 		self.skip_to_valid_backward()
 	}
 
@@ -1205,6 +1359,7 @@ impl<'a> HistoryIterator<'a> {
 		}
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new_lsm(
 		seq_num: u64,
 		iter_state: IterState,
@@ -1212,6 +1367,8 @@ impl<'a> HistoryIterator<'a> {
 		include_tombstones: bool,
 		ts_range: Option<(u64, u64)>,
 		limit: Option<usize>,
+		lower: Option<&[u8]>,
+		upper: Option<&[u8]>,
 	) -> Self {
 		// Use TimestampComparator for history queries with timestamp range
 		// This enables efficient timestamp-based seeks when timestamps are monotonic with seq_nums
@@ -1221,7 +1378,7 @@ impl<'a> HistoryIterator<'a> {
 			KMergeIterator::new_from(iter_state, range)
 		};
 
-		Self::new(inner, seq_num, include_tombstones, None, None, ts_range, limit)
+		Self::new(inner, seq_num, include_tombstones, lower, upper, ts_range, limit)
 	}
 
 	fn reset_forward_state(&mut self) {
@@ -1329,6 +1486,13 @@ impl<'a> HistoryIterator<'a> {
 		}
 	}
 
+	fn user_key_within_upper_bound(&self, user_key: &[u8]) -> bool {
+		match &self.upper_bound {
+			Some(upper) => user_key < upper.as_slice(),
+			None => true,
+		}
+	}
+
 	// === FORWARD ITERATION (Streaming) ===
 
 	/// Skip to next valid entry in forward direction.
@@ -1361,6 +1525,12 @@ impl<'a> HistoryIterator<'a> {
 					key_ref.is_tombstone(),
 				)
 			};
+
+			// Skip keys below lower_bound
+			if !self.user_key_within_lower_bound(&user_key_vec) {
+				self.inner_next()?;
+				continue;
+			}
 
 			// Detect user_key change → reset state
 			if user_key_vec != self.current_user_key {
@@ -1459,6 +1629,13 @@ impl<'a> HistoryIterator<'a> {
 
 		if !self.user_key_within_lower_bound(&user_key) {
 			return Ok(false);
+		}
+
+		if !self.user_key_within_upper_bound(&user_key) {
+			while self.inner_valid() && self.inner_key().user_key() == user_key.as_slice() {
+				self.inner_prev()?;
+			}
+			return self.collect_user_key_backward();
 		}
 
 		// Collect all visible versions
@@ -1581,6 +1758,7 @@ impl<'a> HistoryIterator<'a> {
 
 		// Start yielding from index 0 (oldest in valid range)
 		self.backward_buffer_index = Some(0);
+
 		Ok(true)
 	}
 
@@ -1608,6 +1786,56 @@ impl<'a> HistoryIterator<'a> {
 
 	fn has_buffered_entry(&self) -> bool {
 		matches!(self.backward_buffer_index, Some(idx) if idx < self.backward_buffer.len())
+	}
+
+	/// Switch from backward to forward direction.
+	/// Uses seek-based repositioning to avoid KMergeIterator direction-switch complexity.
+	fn reverse_to_forward(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Forward;
+		self.reset_forward_state();
+
+		if !self.has_buffered_entry() {
+			self.clear_backward_buffer();
+			return Ok(false);
+		}
+
+		// Get current position from backward buffer
+		let current_internal_key = self.buffered_key().encoded().to_vec();
+		self.clear_backward_buffer();
+
+		// Seek to current position - this resets KMergeIterator to Forward mode
+		self.inner.seek(&current_internal_key)?;
+
+		if !self.inner_valid() {
+			return Ok(false);
+		}
+
+		// Move past current entry to get the NEXT entry in forward direction
+		self.inner_next()?;
+
+		// Find next valid entry
+		self.skip_to_valid_forward()
+	}
+
+	/// Switch from forward to backward direction.
+	///
+	/// In forward mode, inner is positioned at the current entry. We call prev() to move
+	/// to the previous user key, then collect that key's versions for backward iteration.
+	/// This matches SnapshotIterator's forward_to_backward behavior.
+	fn forward_to_backward(&mut self) -> Result<bool> {
+		self.direction = MergeDirection::Backward;
+		self.clear_backward_buffer();
+
+		if !self.inner_valid() {
+			return Ok(false);
+		}
+
+		// Move backward from current position to previous user key.
+		// SnapshotIterator does the same: merge_iter.prev() from current position.
+		self.inner_prev()?;
+
+		// Collect user key at new position
+		self.collect_user_key_backward()
 	}
 }
 
@@ -1663,25 +1891,10 @@ impl LSMIterator for HistoryIterator<'_> {
 
 		// Direction change: backward → forward
 		if self.direction == MergeDirection::Backward {
-			self.direction = MergeDirection::Forward;
-			self.reset_forward_state();
-
-			if self.has_buffered_entry() {
-				let current_key = self.buffered_key().encoded().to_vec();
-				self.clear_backward_buffer();
-
-				self.inner.seek(&current_key)?;
-
-				if self.inner_valid() {
-					self.inner_next()?;
-				}
-
-				return self.skip_to_valid_forward();
-			}
-
-			return Ok(false);
+			return self.reverse_to_forward();
 		}
 
+		// Normal forward iteration
 		if !self.inner_valid() {
 			return Ok(false);
 		}
@@ -1697,16 +1910,10 @@ impl LSMIterator for HistoryIterator<'_> {
 
 		// Direction change: forward → backward
 		if self.direction != MergeDirection::Backward {
-			self.direction = MergeDirection::Backward;
-
-			if self.inner_valid() {
-				self.inner_prev()?;
-			}
-
-			self.clear_backward_buffer();
-			return self.collect_user_key_backward();
+			return self.forward_to_backward();
 		}
 
+		// Normal backward iteration
 		if !self.has_buffered_entry() && !self.inner_valid() {
 			return Ok(false);
 		}

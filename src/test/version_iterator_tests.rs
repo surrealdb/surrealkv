@@ -99,9 +99,7 @@ async fn test_history_multiple_versions_single_key() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query versioned range
 		let tx = store.begin().unwrap();
@@ -167,9 +165,7 @@ async fn test_history_multiple_keys_multiple_versions() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query all keys
 		let tx = store.begin().unwrap();
@@ -225,9 +221,7 @@ async fn test_history_excludes_tombstones() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query with history (excludes tombstones by default)
 		let tx = store.begin().unwrap();
@@ -276,9 +270,7 @@ async fn test_history_with_tombstones() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query with history_with_options (includes tombstones)
 		let tx = store.begin().unwrap();
@@ -326,9 +318,7 @@ async fn test_history_replace_shows_all_versions() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query all versions
 		let tx = store.begin().unwrap();
@@ -379,9 +369,7 @@ async fn test_history_soft_delete_vs_hard_delete() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query with tombstones
@@ -422,9 +410,7 @@ async fn test_history_bounds() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query range [key_b, key_d) - should include key_b and key_c, NOT key_d
@@ -457,9 +443,7 @@ async fn test_history_empty_range() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query range [key_c, key_d) - no matching keys
@@ -502,9 +486,7 @@ async fn test_history_single_key_match() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query range that only matches key_a
 		let tx = store.begin().unwrap();
@@ -550,9 +532,7 @@ async fn test_history_interleaved_iteration() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin().unwrap();
 		let mut iter = tx.history(b"key0", b"key9").unwrap();
@@ -614,9 +594,7 @@ async fn test_history_seek_middle() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin().unwrap();
 		let mut iter = tx.history(b"key0", b"key9").unwrap();
@@ -672,9 +650,7 @@ async fn test_history_backward_iteration() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin().unwrap();
 		let mut iter = tx.history(b"key0", b"key9").unwrap();
@@ -718,9 +694,7 @@ async fn test_history_snapshot_isolation() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Take snapshot2
 		let tx2 = store.begin().unwrap();
@@ -767,9 +741,7 @@ async fn test_history_many_versions() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query all versions
@@ -813,9 +785,7 @@ async fn test_history_timestamps() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query versions
@@ -861,9 +831,7 @@ async fn test_history_entry_method() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Query with tombstones
 		let tx = store.begin().unwrap();
@@ -918,9 +886,7 @@ async fn test_get_at_fallback() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin().unwrap();
 
@@ -972,9 +938,7 @@ async fn test_get_at_tombstone() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let tx = store.begin().unwrap();
 
@@ -1339,9 +1303,7 @@ async fn test_history_bidirectional_iteration() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1389,9 +1351,7 @@ async fn test_history_ts_range_forward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query with ts_range [150, 350] - should only return v200 and v300
@@ -1433,9 +1393,7 @@ async fn test_history_ts_range_backward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Query with ts_range [150, 250] - should only return v200
@@ -1466,9 +1424,7 @@ async fn test_history_limit_forward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1496,9 +1452,7 @@ async fn test_history_limit_backward() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1540,9 +1494,7 @@ async fn test_history_limit_multiple_keys() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1575,9 +1527,7 @@ async fn test_history_ts_range_with_limit() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1609,9 +1559,7 @@ async fn test_history_limit_zero() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1641,9 +1589,7 @@ async fn test_history_ts_range_empty_result() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let tx = store.begin().unwrap();
@@ -1673,9 +1619,7 @@ async fn test_get_at_ryow() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Start a new transaction and write uncommitted data
 		let mut tx = store.begin().unwrap();
@@ -1727,9 +1671,7 @@ async fn test_get_at_ryow_tombstone() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		// Delete the key in a new transaction (uncommitted)
 		let mut tx = store.begin().unwrap();
@@ -1755,9 +1697,7 @@ async fn test_history_ryow() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Start a new transaction and write uncommitted data
@@ -1803,9 +1743,7 @@ async fn test_history_ryow_timestamp_collision() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Write uncommitted data with the SAME timestamp
@@ -1839,9 +1777,7 @@ async fn test_history_ryow_with_ts_range() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1874,9 +1810,7 @@ async fn test_history_ryow_soft_delete() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Soft delete key in new transaction (uncommitted)
@@ -1923,9 +1857,7 @@ async fn test_history_ryow_hard_delete() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		{
 			// Hard delete key1 in new transaction (uncommitted)
@@ -1970,9 +1902,7 @@ async fn test_get_at_ryow_hard_delete() {
 			tx.commit().await.unwrap();
 		}
 
-		if with_index {
-			store.flush().unwrap();
-		}
+		store.flush().unwrap();
 
 		let mut tx = store.begin().unwrap();
 		tx.delete(b"key1").unwrap();
@@ -1985,6 +1915,1300 @@ async fn test_get_at_ryow_hard_delete() {
 
 		let value = tx.get_at(b"key1", u64::MAX).unwrap();
 		assert_eq!(value, None, "with_index={with_index}: Hard delete should wipe all");
+		store.close().await.unwrap();
+	}
+}
+
+// ============================================================================
+// History Iterator Bounds Tests
+// ============================================================================
+
+/// Test that forward iteration respects lower bound when keys exist before the range.
+/// Regression test: keys with user_key lexicographically before lower bound should not be returned.
+#[test(tokio::test)]
+async fn test_history_forward_respects_lower_bound() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Key starting with '#' (ASCII 35) comes before '@' (ASCII 64)
+		let sync_key = b"#@prefix:sync\x00\x00\x00\x00\x00\x00\x00\x02****************";
+		let table_key = b"@prefix:tbentity\x00\x00\x00\x00\x00\x00\x00\x00\x10cccccccccccccccc";
+		let before_key = b"@prefix:tbentity\x00\x00\x00\x00\x00\x00\x00\x00\x10kkkkkkkkkkkkkkkk";
+		let after_key = b"@prefix:tbentity\x00\x00\x00\x00\x00\x00\x00\x00\x10MMMMMMMMMMMMMMMM";
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(before_key, b"value", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(sync_key, b"value", 2).unwrap();
+			tx.set_at(table_key, b"value", 2).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(after_key, b"value", 3).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+
+		// Query range starting with '@' should NOT return '#@prefix:sync'
+		let lower = b"@prefix:\x00";
+		let upper = b"@prefix:\xFF";
+		let opts = HistoryOptions::new().with_tombstones(true).with_ts_range(2, 2);
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+
+		// Only table_key should be returned (it's the only key within range at ts=2)
+		assert_eq!(
+			results.len(),
+			1,
+			"with_index={with_index}: Only keys within range should be returned, got: {:?}",
+			results.iter().map(|(k, _, _, _)| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+		);
+		assert!(
+			results[0].0.starts_with(b"@prefix:"),
+			"with_index={with_index}: Key should start with @prefix:"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test that backward iteration respects upper bound when keys exist after the range.
+/// Regression test: keys with user_key lexicographically after upper bound should not be returned.
+#[test(tokio::test)]
+async fn test_history_backward_respects_upper_bound() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Keys in range
+		let key_a = b"key_a";
+		let key_b = b"key_b";
+		// Key after upper bound
+		let key_z = b"key_z";
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(key_a, b"value_a", 1).unwrap();
+			tx.set_at(key_b, b"value_b", 1).unwrap();
+			tx.set_at(key_z, b"value_z", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+
+		// Query range [key_a, key_c) should NOT return key_z
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"key_a", b"key_c", &opts).unwrap();
+
+		// Iterate backward from the end
+		iter.seek_last().unwrap();
+		let mut results = Vec::new();
+		while iter.valid() {
+			let key_ref = iter.key();
+			results.push(key_ref.user_key().to_vec());
+			if !iter.prev().unwrap() {
+				break;
+			}
+		}
+
+		assert_eq!(
+			results.len(),
+			2,
+			"with_index={with_index}: Only keys within range should be returned, got: {:?}",
+			results.iter().map(|k| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+		);
+		// Backward iteration returns newest first, so key_b then key_a
+		assert_eq!(results[0], b"key_b".to_vec(), "with_index={with_index}: First should be key_b");
+		assert_eq!(
+			results[1],
+			b"key_a".to_vec(),
+			"with_index={with_index}: Second should be key_a"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test that both bounds are respected with keys outside both ends of the range.
+#[test(tokio::test)]
+async fn test_history_respects_both_bounds() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Keys before range
+		let key_aa = b"aa_before";
+		let key_ab = b"ab_before";
+		// Keys in range
+		let key_ma = b"ma_inside";
+		let key_mb = b"mb_inside";
+		let key_mc = b"mc_inside";
+		// Keys after range
+		let key_za = b"za_after";
+		let key_zb = b"zb_after";
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(key_aa, b"v", 1).unwrap();
+			tx.set_at(key_ab, b"v", 1).unwrap();
+			tx.set_at(key_ma, b"v", 1).unwrap();
+			tx.set_at(key_mb, b"v", 1).unwrap();
+			tx.set_at(key_mc, b"v", 1).unwrap();
+			tx.set_at(key_za, b"v", 1).unwrap();
+			tx.set_at(key_zb, b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+
+		// Query range [m, z) should only return keys starting with 'm'
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"m", b"z", &opts).unwrap();
+
+		// Test forward iteration
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(
+			results.len(),
+			3,
+			"with_index={with_index}: Forward should return 3 keys in range, got: {:?}",
+			results.iter().map(|(k, _, _, _)| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+		);
+		for (key, _, _, _) in &results {
+			assert!(
+				key.as_slice() >= b"m".as_slice() && key.as_slice() < b"z".as_slice(),
+				"with_index={with_index}: Key {:?} should be in range [m, z)",
+				String::from_utf8_lossy(key)
+			);
+		}
+
+		// Test backward iteration
+		let mut iter = tx.history_with_options(b"m", b"z", &opts).unwrap();
+		iter.seek_last().unwrap();
+		let mut backward_results = Vec::new();
+		while iter.valid() {
+			backward_results.push(iter.key().user_key().to_vec());
+			if !iter.prev().unwrap() {
+				break;
+			}
+		}
+		assert_eq!(
+			backward_results.len(),
+			3,
+			"with_index={with_index}: Backward should return 3 keys in range, got: {:?}",
+			backward_results.iter().map(|k| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+		);
+		for key in &backward_results {
+			assert!(
+				key.as_slice() >= b"m".as_slice() && key.as_slice() < b"z".as_slice(),
+				"with_index={with_index}: Key {:?} should be in range [m, z)",
+				String::from_utf8_lossy(key)
+			);
+		}
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test bounds with timestamp ranges - keys outside range but within timestamp should be excluded.
+#[test(tokio::test)]
+async fn test_history_bounds_with_timestamp_range() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Key before range at target timestamp
+		let key_before = b"aaa_before";
+		// Key in range at target timestamp
+		let key_inside = b"mmm_inside";
+		// Key after range at target timestamp
+		let key_after = b"zzz_after";
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			// All keys at timestamp 5
+			tx.set_at(key_before, b"v", 5).unwrap();
+			tx.set_at(key_inside, b"v", 5).unwrap();
+			tx.set_at(key_after, b"v", 5).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+
+		// Query with timestamp filter - should still respect bounds
+		let opts = HistoryOptions::new().with_tombstones(true).with_ts_range(5, 5);
+		let mut iter = tx.history_with_options(b"m", b"z", &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(
+			results.len(),
+			1,
+			"with_index={with_index}: Only key_inside should be returned, got: {:?}",
+			results.iter().map(|(k, _, _, _)| String::from_utf8_lossy(k)).collect::<Vec<_>>()
+		);
+		assert_eq!(
+			results[0].0,
+			key_inside.to_vec(),
+			"with_index={with_index}: Should return mmm_inside"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test direction switching (forward to backward) respects bounds.
+#[test(tokio::test)]
+async fn test_history_bounds_direction_switch_forward_to_backward() {
+	for with_index in [false] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Keys: before range, in range (3 keys), after range
+		let keys: [&[u8]; 5] = [b"aa_before", b"mm_in1", b"mm_in2", b"mm_in3", b"zz_after"];
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			for key in keys {
+				tx.set_at(key, b"value", 1).unwrap();
+			}
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let lower: &[u8] = b"m";
+		let upper: &[u8] = b"z";
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		// Forward: get first key
+		iter.seek_first().unwrap();
+		assert!(iter.valid(), "with_index={with_index}: Should be valid after seek_first");
+		let first_key = iter.key().user_key().to_vec();
+		assert_eq!(
+			first_key,
+			b"mm_in1".to_vec(),
+			"with_index={with_index}: First key should be mm_in1"
+		);
+
+		// Move forward one more
+		iter.next().unwrap();
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"mm_in2",
+			"with_index={with_index}: Second should be mm_in2"
+		);
+
+		// Switch direction: go backward
+		iter.prev().unwrap();
+		assert!(iter.valid());
+		let back_key = iter.key().user_key().to_vec();
+		assert_eq!(
+			back_key,
+			b"mm_in1".to_vec(),
+			"with_index={with_index}: After prev should be mm_in1"
+		);
+
+		// Continue backward - should become invalid (no more in-range keys)
+		let has_more = iter.prev().unwrap();
+		assert!(
+			!has_more || !iter.valid(),
+			"with_index={with_index}: Should have no more keys before mm_in1"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test direction switching (backward to forward) respects bounds.
+#[test(tokio::test)]
+async fn test_history_bounds_direction_switch_backward_to_forward() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		let keys: [&[u8]; 5] = [b"aa_before", b"mm_in1", b"mm_in2", b"mm_in3", b"zz_after"];
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			for key in keys {
+				tx.set_at(key, b"value", 1).unwrap();
+			}
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let lower: &[u8] = b"m";
+		let upper: &[u8] = b"z";
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		// Backward: get last key in range
+		iter.seek_last().unwrap();
+		assert!(iter.valid(), "with_index={with_index}: Should be valid after seek_last");
+		let last_key = iter.key().user_key().to_vec();
+		assert_eq!(
+			last_key,
+			b"mm_in3".to_vec(),
+			"with_index={with_index}: Last key should be mm_in3"
+		);
+
+		// Move backward one
+		iter.prev().unwrap();
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"mm_in2",
+			"with_index={with_index}: Should be at mm_in2"
+		);
+
+		// Switch direction: go forward
+		iter.next().unwrap();
+		assert!(iter.valid());
+		let fwd_key = iter.key().user_key().to_vec();
+		assert_eq!(
+			fwd_key,
+			b"mm_in3".to_vec(),
+			"with_index={with_index}: After next should be mm_in3"
+		);
+
+		// Continue forward - should become invalid (no more in-range keys)
+		let has_more = iter.next().unwrap();
+		assert!(
+			!has_more || !iter.valid(),
+			"with_index={with_index}: Should have no more keys after mm_in3"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test direction switching with keys that have many versions.
+/// Verifies that prev/next correctly navigate across multi-version keys.
+#[test(tokio::test)]
+async fn test_history_direction_switch_multi_version_keys() {
+	const VERSIONS_PER_KEY: u64 = 5;
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Create 3 keys, each with many versions
+		for key in [b"key_a", b"key_b", b"key_c"] {
+			for v in 1..=VERSIONS_PER_KEY {
+				let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+				tx.set_at(
+					key,
+					format!("{}_v{}", std::str::from_utf8(key).unwrap(), v).as_bytes(),
+					v * 100,
+				)
+				.unwrap();
+				tx.commit().await.unwrap();
+			}
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"key_a", b"key_d", &opts).unwrap();
+
+		// --- Forward: advance past key_a (5 versions) to key_b
+		iter.seek_first().unwrap();
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_a",
+			"with_index={with_index}: First should be key_a"
+		);
+		for _ in 0..VERSIONS_PER_KEY {
+			iter.next().unwrap();
+		}
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_b",
+			"with_index={with_index}: After key_a versions should be key_b"
+		);
+
+		// --- Switch backward: prev should go to last version of key_a
+		iter.prev().unwrap();
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_a",
+			"with_index={with_index}: After prev from key_b should be key_a"
+		);
+		assert_eq!(
+			iter.value().unwrap(),
+			b"key_a_v1",
+			"with_index={with_index}: Should be oldest key_a"
+		);
+
+		// --- Switch forward: next advances one entry (key_a v1 -> v2). Advance through key_a to
+		// key_b.
+		for _ in 0..VERSIONS_PER_KEY {
+			iter.next().unwrap();
+		}
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_b",
+			"with_index={with_index}: After advancing through key_a versions should be key_b"
+		);
+
+		// --- Forward: advance through key_b to key_c
+		for _ in 0..VERSIONS_PER_KEY {
+			iter.next().unwrap();
+		}
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_c",
+			"with_index={with_index}: After key_b versions should be key_c"
+		);
+
+		// --- Backward: seek_last, then prev through key_c to key_b
+		iter.seek_last().unwrap();
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_c",
+			"with_index={with_index}: Last should be key_c"
+		);
+		for _ in 0..VERSIONS_PER_KEY {
+			iter.prev().unwrap();
+		}
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_b",
+			"with_index={with_index}: After key_c versions should be key_b"
+		);
+
+		// --- Switch forward: next advances one entry. Advance through key_b to key_c.
+		for _ in 0..VERSIONS_PER_KEY {
+			iter.next().unwrap();
+		}
+		assert!(iter.valid());
+		assert_eq!(
+			iter.key().user_key(),
+			b"key_c",
+			"with_index={with_index}: After advancing through key_b versions should be key_c"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test seeking to a key below lower_bound.
+#[test(tokio::test)]
+async fn test_history_seek_outside_lower_bound() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"aaa", b"v", 1).unwrap();
+			tx.set_at(b"mmm", b"v", 1).unwrap();
+			tx.set_at(b"zzz", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"m", b"z", &opts).unwrap();
+
+		// Seek to key below lower_bound - should position at first in-range key or become invalid
+		iter.seek(b"aaa").unwrap();
+		if iter.valid() {
+			let key = iter.key().user_key();
+			assert!(
+				key >= b"m".as_slice(),
+				"with_index={with_index}: After seek below lower, key should be >= lower_bound, got: {:?}",
+				String::from_utf8_lossy(key)
+			);
+		}
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test seeking to a key at or above upper_bound.
+#[test(tokio::test)]
+async fn test_history_seek_outside_upper_bound() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"aaa", b"v", 1).unwrap();
+			tx.set_at(b"mmm", b"v", 1).unwrap();
+			tx.set_at(b"zzz", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"m", b"z", &opts).unwrap();
+
+		// Seek to key at upper_bound - should be invalid (upper is exclusive)
+		iter.seek(b"z").unwrap();
+		assert!(
+			!iter.valid(),
+			"with_index={with_index}: Seek to upper_bound should make iterator invalid"
+		);
+
+		// Seek to key above upper_bound
+		let mut iter = tx.history_with_options(b"m", b"z", &opts).unwrap();
+		iter.seek(b"zzz").unwrap();
+		assert!(
+			!iter.valid(),
+			"with_index={with_index}: Seek above upper_bound should make iterator invalid"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test seeking to exact bound values.
+#[test(tokio::test)]
+async fn test_history_seek_to_exact_bounds() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"key_a", b"v", 1).unwrap();
+			tx.set_at(b"key_m", b"v", 1).unwrap();
+			tx.set_at(b"key_z", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+
+		// Seek to exact lower_bound where key exists
+		let mut iter = tx.history_with_options(b"key_m", b"key_z", &opts).unwrap();
+		iter.seek(b"key_m").unwrap();
+		assert!(iter.valid(), "with_index={with_index}: Seek to lower_bound should be valid");
+		assert_eq!(iter.key().user_key(), b"key_m", "with_index={with_index}: Should be at key_m");
+
+		// Seek to exact upper_bound - should be invalid (exclusive)
+		iter.seek(b"key_z").unwrap();
+		assert!(
+			!iter.valid(),
+			"with_index={with_index}: Seek to upper_bound should be invalid (exclusive)"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test key exactly at lower_bound is included (inclusive).
+#[test(tokio::test)]
+async fn test_history_key_at_exact_lower_bound() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"lower", b"v", 1).unwrap();
+			tx.set_at(b"middle", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"lower", b"upper", &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+		assert!(
+			results.iter().any(|(k, _, _, _)| k == b"lower"),
+			"with_index={with_index}: Key exactly at lower_bound should be included"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test key exactly at upper_bound is excluded (exclusive).
+#[test(tokio::test)]
+async fn test_history_key_at_exact_upper_bound() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"middle", b"v", 1).unwrap();
+			tx.set_at(b"upper", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"lower", b"upper", &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+		assert!(
+			!results.iter().any(|(k, _, _, _)| k == b"upper"),
+			"with_index={with_index}: Key exactly at upper_bound should be excluded"
+		);
+		assert!(
+			results.iter().any(|(k, _, _, _)| k == b"middle"),
+			"with_index={with_index}: Key before upper_bound should be included"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test adjacent byte boundaries with special byte values.
+#[test(tokio::test)]
+async fn test_history_adjacent_byte_boundaries() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		// Keys with adjacent byte values
+		let key_before = b"key";
+		let key_at_lower = b"key\x00";
+		let key_in_range = b"key\x01";
+		let key_at_upper = b"key\x10";
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(key_before, b"v", 1).unwrap();
+			tx.set_at(key_at_lower, b"v", 1).unwrap();
+			tx.set_at(key_in_range, b"v", 1).unwrap();
+			tx.set_at(key_at_upper, b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		// Range: [key\x00, key\x10)
+		let mut iter = tx.history_with_options(b"key\x00", b"key\x10", &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+
+		// key\x00 should be included (at lower bound, inclusive)
+		assert!(
+			results.iter().any(|(k, _, _, _)| k == key_at_lower),
+			"with_index={with_index}: Key at lower bound should be included"
+		);
+		// key\x01 should be included (in range)
+		assert!(
+			results.iter().any(|(k, _, _, _)| k == key_in_range),
+			"with_index={with_index}: Key in range should be included"
+		);
+		// key (without suffix) should be excluded (before lower)
+		assert!(
+			!results.iter().any(|(k, _, _, _)| k == key_before),
+			"with_index={with_index}: Key before lower bound should be excluded"
+		);
+		// key\x10 should be excluded (at upper, exclusive)
+		assert!(
+			!results.iter().any(|(k, _, _, _)| k == key_at_upper),
+			"with_index={with_index}: Key at upper bound should be excluded"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test tombstone (soft delete) at lower bound.
+#[test(tokio::test)]
+async fn test_history_tombstone_at_lower_bound() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"key_a", b"v", 1).unwrap();
+			tx.set_at(b"key_b", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			let write_opts = crate::transaction::WriteOptions {
+				timestamp: Some(2),
+			};
+			tx.soft_delete_with_options(b"key_a", &write_opts).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+
+		// Without tombstones - key_a's older version (ts=1) should still appear,
+		// but the tombstone at ts=2 should NOT appear
+		let opts = HistoryOptions::new().with_tombstones(false);
+		let mut iter = tx.history_with_options(b"key_a", b"key_z", &opts).unwrap();
+		let results = collect_history_all(&mut iter).unwrap();
+		// The value at ts=1 should appear
+		assert!(
+			results.iter().any(|(k, _, ts, is_tomb)| k == b"key_a" && *ts == 1 && !is_tomb),
+			"with_index={with_index}: Without tombstones flag, older value version should still appear"
+		);
+		// The tombstone at ts=2 should NOT appear
+		assert!(
+			!results.iter().any(|(k, _, ts, is_tomb)| k == b"key_a" && *ts == 2 && *is_tomb),
+			"with_index={with_index}: Without tombstones flag, tombstone should be filtered out"
+		);
+
+		// With tombstones - both versions of key_a should appear
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"key_a", b"key_z", &opts).unwrap();
+		let results = collect_history_all(&mut iter).unwrap();
+		// The tombstone at ts=2 should appear
+		assert!(
+			results.iter().any(|(k, _, ts, is_tomb)| k == b"key_a" && *ts == 2 && *is_tomb),
+			"with_index={with_index}: With tombstones flag, tombstone at lower bound should appear"
+		);
+		// The value at ts=1 should also appear
+		assert!(
+			results.iter().any(|(k, _, ts, is_tomb)| k == b"key_a" && *ts == 1 && !is_tomb),
+			"with_index={with_index}: With tombstones flag, older value should also appear"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test hard delete at boundary.
+#[test(tokio::test)]
+async fn test_history_hard_delete_at_boundary() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"key_a", b"v1", 1).unwrap();
+			tx.set_at(b"key_b", b"v1", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			let write_opts = crate::transaction::WriteOptions {
+				timestamp: Some(2),
+			};
+			tx.delete_with_options(b"key_a", &write_opts).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"key_a", b"key_z", &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+		// Hard delete should completely remove the key from history
+		assert!(
+			!results.iter().any(|(k, _, _, _)| k == b"key_a"),
+			"with_index={with_index}: Hard deleted key at boundary should not appear"
+		);
+		assert!(
+			results.iter().any(|(k, _, _, _)| k == b"key_b"),
+			"with_index={with_index}: Other keys should still appear"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test replace operation at boundary.
+#[test(tokio::test)]
+async fn test_history_replace_at_boundary() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"key_a", b"v1", 1).unwrap();
+			tx.set_at(b"key_a", b"v2", 2).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.replace(b"key_a", b"v3").unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let mut iter = tx.history_with_options(b"key_a", b"key_z", &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+		let key_a_versions: Vec<_> = results.iter().filter(|(k, _, _, _)| k == b"key_a").collect();
+
+		// Replace cuts off history - should only see v3 (the replace)
+		assert_eq!(
+			key_a_versions.len(),
+			1,
+			"with_index={with_index}: Replace should cut off history, only showing the replace version"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test equal lower and upper bounds (empty range).
+#[test(tokio::test)]
+async fn test_history_bounds_equal_lower_upper() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"key_a", b"v", 1).unwrap();
+			tx.set_at(b"key_b", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		// Range [key_a, key_a) is empty since upper is exclusive
+		let mut iter = tx.history_with_options(b"key_a", b"key_a", &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(
+			results.len(),
+			0,
+			"with_index={with_index}: Equal lower and upper bounds should return empty"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test inverted bounds (lower > upper).
+#[test(tokio::test)]
+async fn test_history_bounds_inverted() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"key_a", b"v", 1).unwrap();
+			tx.set_at(b"key_b", b"v", 1).unwrap();
+			tx.set_at(b"key_c", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		// Range [key_z, key_a) is inverted
+		let mut iter = tx.history_with_options(b"key_z", b"key_a", &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(
+			results.len(),
+			0,
+			"with_index={with_index}: Inverted bounds should return empty"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test single key in range.
+#[test(tokio::test)]
+async fn test_history_single_key_in_range() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"only_key", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		let lower: &[u8] = b"only";
+		let upper: &[u8] = b"only_z";
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		// Forward
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(results.len(), 1, "with_index={with_index}: Should have exactly 1 key");
+		assert_eq!(results[0].0, b"only_key".to_vec());
+
+		// Backward
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+		iter.seek_last().unwrap();
+		assert!(iter.valid(), "with_index={with_index}: seek_last should be valid");
+		assert_eq!(iter.key().user_key(), b"only_key");
+
+		let has_more = iter.prev().unwrap();
+		assert!(!has_more, "with_index={with_index}: Should have no more keys");
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test all keys outside range.
+#[test(tokio::test)]
+async fn test_history_all_keys_outside_range() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"aaa", b"v", 1).unwrap();
+			tx.set_at(b"bbb", b"v", 1).unwrap();
+			tx.set_at(b"zzz", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		// Range [m, n) has no keys
+		let mut iter = tx.history_with_options(b"m", b"n", &opts).unwrap();
+
+		// Forward
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(results.len(), 0, "with_index={with_index}: Forward should return empty");
+
+		// Backward
+		let mut iter = tx.history_with_options(b"m", b"n", &opts).unwrap();
+		iter.seek_last().unwrap();
+		assert!(
+			!iter.valid(),
+			"with_index={with_index}: seek_last should be invalid for empty range"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test bounds with limit (forward).
+#[test(tokio::test)]
+async fn test_history_bounds_with_limit() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			// 5 keys in range
+			tx.set_at(b"key_1", b"v", 1).unwrap();
+			tx.set_at(b"key_2", b"v", 1).unwrap();
+			tx.set_at(b"key_3", b"v", 1).unwrap();
+			tx.set_at(b"key_4", b"v", 1).unwrap();
+			tx.set_at(b"key_5", b"v", 1).unwrap();
+			// Keys outside range
+			tx.set_at(b"aaa", b"v", 1).unwrap();
+			tx.set_at(b"zzz", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true).with_limit(3);
+		let lower: &[u8] = b"key";
+		let upper: &[u8] = b"key_z";
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(results.len(), 3, "with_index={with_index}: Limit should cap results to 3");
+		// Verify results are in range
+		for (key, _, _, _) in &results {
+			assert!(
+				key.as_slice() >= lower && key.as_slice() < upper,
+				"with_index={with_index}: All keys should be in range"
+			);
+		}
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test bounds with limit (backward).
+#[test(tokio::test)]
+async fn test_history_bounds_with_limit_backward() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"key_1", b"v", 1).unwrap();
+			tx.set_at(b"key_2", b"v", 1).unwrap();
+			tx.set_at(b"key_3", b"v", 1).unwrap();
+			tx.set_at(b"key_4", b"v", 1).unwrap();
+			tx.set_at(b"key_5", b"v", 1).unwrap();
+			tx.set_at(b"zzz", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true).with_limit(3);
+		let lower: &[u8] = b"key";
+		let upper: &[u8] = b"key_z";
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		// Backward iteration with limit
+		iter.seek_last().unwrap();
+		let mut results = Vec::new();
+		while iter.valid() && results.len() < 3 {
+			let key = iter.key().user_key().to_vec();
+			assert!(
+				key.as_slice() >= lower && key.as_slice() < upper,
+				"with_index={with_index}: Key should be in range, got: {:?}",
+				String::from_utf8_lossy(&key)
+			);
+			results.push(key);
+			if !iter.prev().unwrap() {
+				break;
+			}
+		}
+
+		assert!(results.len() <= 3, "with_index={with_index}: Should respect limit");
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test bounds with timestamp range and limit combined.
+#[test(tokio::test)]
+async fn test_history_bounds_ts_range_and_limit() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			// Keys at different timestamps
+			tx.set_at(b"key_a", b"v_ts1", 1).unwrap();
+			tx.set_at(b"key_b", b"v_ts1", 1).unwrap();
+			tx.set_at(b"key_c", b"v_ts1", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"key_a", b"v_ts5", 5).unwrap();
+			tx.set_at(b"key_b", b"v_ts5", 5).unwrap();
+			tx.set_at(b"key_c", b"v_ts5", 5).unwrap();
+			tx.set_at(b"key_d", b"v_ts5", 5).unwrap();
+			tx.set_at(b"key_e", b"v_ts5", 5).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		// Key outside range
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"zzz", b"v_ts5", 5).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		// All three constraints: key bounds [key, key_z), ts_range [5,5], limit 3
+		let opts = HistoryOptions::new().with_tombstones(true).with_ts_range(5, 5).with_limit(3);
+		let lower: &[u8] = b"key";
+		let upper: &[u8] = b"key_z";
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+
+		// Should have at most 3 results
+		assert!(
+			results.len() <= 3,
+			"with_index={with_index}: Limit should be respected, got {}",
+			results.len()
+		);
+
+		// All results should be in key range and ts range
+		for (key, _, ts, _) in &results {
+			assert!(
+				key.as_slice() >= lower && key.as_slice() < upper,
+				"with_index={with_index}: Key should be in range"
+			);
+			assert_eq!(*ts, 5, "with_index={with_index}: Timestamp should be 5");
+		}
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test prefix pattern iteration (common use case).
+#[test(tokio::test)]
+async fn test_history_bounds_prefix_pattern() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			// Keys with prefix "user:"
+			tx.set_at(b"user:alice", b"v", 1).unwrap();
+			tx.set_at(b"user:bob", b"v", 1).unwrap();
+			tx.set_at(b"user:charlie", b"v", 1).unwrap();
+			// Keys without prefix
+			tx.set_at(b"admin:root", b"v", 1).unwrap();
+			tx.set_at(b"users_count", b"v", 1).unwrap(); // starts with "user" but not "user:"
+			tx.set_at(b"userz", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		// Range for prefix "user:" is [user:, user;) since ';' is byte after ':'
+		let mut iter = tx.history_with_options(b"user:", b"user;", &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+		assert_eq!(
+			results.len(),
+			3,
+			"with_index={with_index}: Should have 3 keys with prefix 'user:'"
+		);
+
+		for (key, _, _, _) in &results {
+			assert!(
+				key.starts_with(b"user:"),
+				"with_index={with_index}: All keys should start with 'user:', got: {:?}",
+				String::from_utf8_lossy(key)
+			);
+		}
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test keys and bounds containing null bytes.
+#[test(tokio::test)]
+async fn test_history_bounds_null_bytes() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			// Keys with embedded null bytes
+			tx.set_at(b"key\x00a", b"v", 1).unwrap();
+			tx.set_at(b"key\x00b", b"v", 1).unwrap();
+			tx.set_at(b"key\x00c", b"v", 1).unwrap();
+			// Key without null byte
+			tx.set_at(b"key", b"v", 1).unwrap();
+			tx.set_at(b"key\x01", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		// Range with null byte bounds: [key\x00, key\x01)
+		let lower: &[u8] = b"key\x00";
+		let upper: &[u8] = b"key\x01";
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+
+		// Should include key\x00a, key\x00b, key\x00c but not "key" or "key\x01"
+		assert_eq!(
+			results.len(),
+			3,
+			"with_index={with_index}: Should have 3 keys in null byte range"
+		);
+
+		for (key, _, _, _) in &results {
+			assert!(
+				key.starts_with(b"key\x00"),
+				"with_index={with_index}: All keys should start with 'key\\x00'"
+			);
+		}
+
+		// Verify "key" (without null) is not included
+		assert!(
+			!results.iter().any(|(k, _, _, _)| k == b"key"),
+			"with_index={with_index}: 'key' without null should not be included"
+		);
+
+		store.close().await.unwrap();
+	}
+}
+
+/// Test bounds with maximum byte values (0xFF).
+#[test(tokio::test)]
+async fn test_history_bounds_max_byte_values() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		{
+			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
+			tx.set_at(b"key\xfe", b"v", 1).unwrap();
+			tx.set_at(b"key\xff", b"v", 1).unwrap();
+			tx.set_at(b"key\xff\x00", b"v", 1).unwrap();
+			tx.set_at(b"kez", b"v", 1).unwrap();
+			tx.commit().await.unwrap();
+		}
+
+		store.flush().unwrap();
+
+		let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		let opts = HistoryOptions::new().with_tombstones(true);
+		// Range [key\xff, key\xff\xff) - keys starting with key\xff
+		let lower: &[u8] = b"key\xff";
+		let upper: &[u8] = b"key\xff\xff";
+		let mut iter = tx.history_with_options(lower, upper, &opts).unwrap();
+
+		let results = collect_history_all(&mut iter).unwrap();
+
+		// Should include key\xff and key\xff\x00
+		assert_eq!(
+			results.len(),
+			2,
+			"with_index={with_index}: Should have 2 keys starting with 0xFF"
+		);
+
+		// Verify key\xfe is not included
+		assert!(
+			!results.iter().any(|(k, _, _, _)| k == b"key\xfe"),
+			"with_index={with_index}: key\\xfe should not be included"
+		);
+
 		store.close().await.unwrap();
 	}
 }

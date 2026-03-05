@@ -6170,7 +6170,7 @@ async fn test_validate_wal_log_number_multiple_wals() {
 	// Phase 2: Verify multiple WAL segments exist
 	let wal_path = path.join("wal");
 	let segment_ids = list_segment_ids(&wal_path, Some("wal")).unwrap();
-	assert!(segment_ids.len() > 0, "Expected WAL segments, got {}", segment_ids.len());
+	assert!(!segment_ids.is_empty(), "Expected WAL segments, got {}", segment_ids.len());
 	let max_wal = *segment_ids.last().unwrap();
 
 	// Phase 3: Test validation detects corruption
@@ -6218,7 +6218,7 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 	// Phase 2: Verify multiple WAL segments exist
 	let wal_path = path.join("wal");
 	let segment_ids = list_segment_ids(&wal_path, Some("wal")).unwrap();
-	assert!(segment_ids.len() > 0, "Expected WAL segments, got {}", segment_ids.len());
+	assert!(!segment_ids.is_empty(), "Expected WAL segments, got {}", segment_ids.len());
 	let max_wal = *segment_ids.last().unwrap();
 
 	// Phase 3: Corrupt the manifest file

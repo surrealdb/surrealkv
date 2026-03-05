@@ -1992,19 +1992,26 @@ impl<'a> TransactionHistoryIterator<'a> {
 	/// Advances past the current entry and positions at the next one.
 	/// Returns `true` if a valid entry exists.
 	///
-	/// ## Note on Direction Change
+	/// ## Direction Change (backward → forward)
 	///
-	/// If previously iterating backward, this resets to `seek_first()`.
-	/// The iterator does not support seamless direction switching mid-iteration.
+	/// When switching from backward to forward, delegates to the inner HistoryIterator's
+	/// next(), which performs reverse_to_forward and returns the next key. The write-set
+	/// positions are reset so position_to_min() can correctly merge.
 	#[allow(clippy::should_implement_trait)]
 	pub fn next(&mut self) -> Result<bool> {
 		if !self.initialized {
 			return self.seek_first();
 		}
 
-		// Direction change: reset to beginning
+		// Direction change: backward → forward
+		// Delegate to inner.next() which does reverse_to_forward (returns next key).
+		// Reset write-set so position_to_min() merges correctly.
 		if self.direction != MergeDirection::Forward {
-			return self.seek_first();
+			self.direction = MergeDirection::Forward;
+			self.reset_ws_positions();
+			// inner.next() handles reverse_to_forward and returns next key
+			self.inner.next()?;
+			return self.position_to_min();
 		}
 
 		// Advance whichever source provided the current entry
@@ -2026,18 +2033,25 @@ impl<'a> TransactionHistoryIterator<'a> {
 	/// Advances backward past the current entry and positions at the previous one.
 	/// Returns `true` if a valid entry exists.
 	///
-	/// ## Note on Direction Change
+	/// ## Direction Change (forward → backward)
 	///
-	/// If previously iterating forward, this resets to `seek_last()`.
-	/// The iterator does not support seamless direction switching mid-iteration.
+	/// When switching from forward to backward, delegates to the inner HistoryIterator's
+	/// prev(), which performs forward_to_backward and returns the previous key. The
+	/// write-set positions are reset so position_to_max() can correctly merge.
 	pub fn prev(&mut self) -> Result<bool> {
 		if !self.initialized {
 			return self.seek_last();
 		}
 
-		// Direction change: reset to end
+		// Direction change: forward → backward
+		// Delegate to inner.prev() which does forward_to_backward (returns previous key).
+		// Reset write-set so position_to_max() merges correctly.
 		if self.direction != MergeDirection::Backward {
-			return self.seek_last();
+			self.direction = MergeDirection::Backward;
+			self.reset_ws_positions();
+			// inner.prev() handles forward_to_backward and returns previous key
+			self.inner.prev()?;
+			return self.position_to_max();
 		}
 
 		// Advance whichever source provided the current entry (backward)
