@@ -576,6 +576,98 @@ async fn test_double_ended_iteration_with_tombstones() {
 	}
 }
 
+/// Test direction switching (forward to backward) on SnapshotIterator.
+/// This tests if calling prev() after next() correctly returns the previous key.
+#[test(tokio::test)]
+async fn test_snapshot_iterator_direction_switch_forward_to_backward() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert 5 keys
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.set(b"key4", b"value4").unwrap();
+		tx.set(b"key5", b"value5").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let tx_ref = tx.snapshot.as_ref().unwrap();
+	let mut iter = tx_ref.range(Some(b"key1".as_slice()), Some(b"key6".as_slice())).unwrap();
+
+	// Forward: seek to first, move to second
+	iter.seek_first().unwrap();
+	assert!(iter.valid(), "Should be valid after seek_first");
+	assert_eq!(iter.key().user_key(), b"key1", "First key should be key1");
+
+	iter.next().unwrap();
+	assert!(iter.valid(), "Should be valid after next");
+	assert_eq!(iter.key().user_key(), b"key2", "Second key should be key2");
+
+	// Switch direction: go backward
+	// After being at key2 and calling prev(), we should get key1
+	iter.prev().unwrap();
+	assert!(iter.valid(), "Should be valid after prev");
+	assert_eq!(
+		iter.key().user_key(),
+		b"key1",
+		"After prev from key2, should be at key1, got: {:?}",
+		String::from_utf8_lossy(iter.key().user_key())
+	);
+
+	// Continue backward - should become invalid (no more keys)
+	let has_more = iter.prev().unwrap();
+	assert!(!has_more || !iter.valid(), "Should have no more keys before key1");
+}
+
+/// Test direction switching (backward to forward) on SnapshotIterator.
+/// This tests if calling next() after prev() correctly returns the next key.
+#[test(tokio::test)]
+async fn test_snapshot_iterator_direction_switch_backward_to_forward() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert 5 keys
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"key1", b"value1").unwrap();
+		tx.set(b"key2", b"value2").unwrap();
+		tx.set(b"key3", b"value3").unwrap();
+		tx.set(b"key4", b"value4").unwrap();
+		tx.set(b"key5", b"value5").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let tx_ref = tx.snapshot.as_ref().unwrap();
+	let mut iter = tx_ref.range(Some(b"key1".as_slice()), Some(b"key6".as_slice())).unwrap();
+
+	// Backward: seek to last, move to previous
+	iter.seek_last().unwrap();
+	assert!(iter.valid(), "Should be valid after seek_last");
+	assert_eq!(iter.key().user_key(), b"key5", "Last key should be key5");
+
+	iter.prev().unwrap();
+	assert!(iter.valid(), "Should be valid after prev");
+	assert_eq!(iter.key().user_key(), b"key4", "Should be at key4");
+
+	// Switch direction: go forward
+	// After being at key4 and calling next(), we should get key5
+	iter.next().unwrap();
+	assert!(iter.valid(), "Should be valid after next");
+	assert_eq!(
+		iter.key().user_key(),
+		b"key5",
+		"After next from key4, should be at key5, got: {:?}",
+		String::from_utf8_lossy(iter.key().user_key())
+	);
+
+	// Continue forward - should become invalid (no more keys)
+	let has_more = iter.next().unwrap();
+	assert!(!has_more || !iter.valid(), "Should have no more keys after key5");
+}
+
 #[test(tokio::test)]
 async fn test_soft_delete_snapshot_individual_get() {
 	let (store, _temp_dir) = create_store();
@@ -1756,4 +1848,172 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 		assert_eq!(range[2].1.as_slice(), b"v2_updated");
 		assert_eq!(&range[3].0.user_key, b"key1");
 	}
+}
+
+/// Test multiple direction switches in sequence.
+/// This ensures the iterator maintains correct state through repeated direction changes.
+#[test(tokio::test)]
+async fn test_snapshot_iterator_multiple_direction_switches() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys
+	{
+		let mut tx = store.begin().unwrap();
+		for i in 1..=7 {
+			tx.set(format!("key{}", i).as_bytes(), format!("value{}", i).as_bytes()).unwrap();
+		}
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let tx_ref = tx.snapshot.as_ref().unwrap();
+	let mut iter = tx_ref.range(Some(b"key1".as_slice()), Some(b"key8".as_slice())).unwrap();
+
+	// Start forward
+	iter.seek_first().unwrap();
+	assert_eq!(iter.key().user_key(), b"key1");
+
+	// Forward to key3
+	iter.next().unwrap();
+	assert_eq!(iter.key().user_key(), b"key2");
+	iter.next().unwrap();
+	assert_eq!(iter.key().user_key(), b"key3");
+
+	// Switch backward (key3 -> key2)
+	iter.prev().unwrap();
+	assert_eq!(
+		iter.key().user_key(),
+		b"key2",
+		"After prev from key3, expected key2, got: {:?}",
+		String::from_utf8_lossy(iter.key().user_key())
+	);
+
+	// Switch forward again (key2 -> key3)
+	iter.next().unwrap();
+	assert_eq!(
+		iter.key().user_key(),
+		b"key3",
+		"After next from key2, expected key3, got: {:?}",
+		String::from_utf8_lossy(iter.key().user_key())
+	);
+
+	// Continue forward
+	iter.next().unwrap();
+	assert_eq!(iter.key().user_key(), b"key4");
+
+	// Switch backward again (key4 -> key3)
+	iter.prev().unwrap();
+	assert_eq!(
+		iter.key().user_key(),
+		b"key3",
+		"After prev from key4, expected key3, got: {:?}",
+		String::from_utf8_lossy(iter.key().user_key())
+	);
+
+	// Continue backward
+	iter.prev().unwrap();
+	assert_eq!(iter.key().user_key(), b"key2");
+	iter.prev().unwrap();
+	assert_eq!(iter.key().user_key(), b"key1");
+}
+
+/// Test direction switching at range boundaries.
+/// This ensures direction switching works correctly near the start/end of iteration ranges.
+#[test(tokio::test)]
+async fn test_snapshot_iterator_direction_switch_at_bounds() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set(b"aaa", b"v1").unwrap();
+		tx.set(b"bbb", b"v2").unwrap();
+		tx.set(b"ccc", b"v3").unwrap();
+		tx.set(b"ddd", b"v4").unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let tx_ref = tx.snapshot.as_ref().unwrap();
+	let mut iter = tx_ref.range(Some(b"aaa".as_slice()), Some(b"eee".as_slice())).unwrap();
+
+	// Test at lower bound: seek first, try prev (should fail/invalid), then next
+	iter.seek_first().unwrap();
+	assert_eq!(iter.key().user_key(), b"aaa");
+
+	// Try to go backward at lower bound
+	let has_prev = iter.prev().unwrap();
+	// Either returns false or becomes invalid - both are acceptable
+	if has_prev && iter.valid() {
+		panic!(
+			"Should not have valid entry before lower bound, got: {:?}",
+			String::from_utf8_lossy(iter.key().user_key())
+		);
+	}
+
+	// Re-seek and test at upper bound
+	iter.seek_last().unwrap();
+	assert_eq!(iter.key().user_key(), b"ddd");
+
+	// Try to go forward at upper bound
+	let has_next = iter.next().unwrap();
+	// Either returns false or becomes invalid - both are acceptable
+	if has_next && iter.valid() {
+		panic!(
+			"Should not have valid entry after upper bound, got: {:?}",
+			String::from_utf8_lossy(iter.key().user_key())
+		);
+	}
+}
+
+/// Test direction switching in the middle of the range with a fresh direction switch.
+#[test(tokio::test)]
+async fn test_snapshot_iterator_direction_switch_mid_range() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert 10 keys
+	{
+		let mut tx = store.begin().unwrap();
+		for i in 0..10 {
+			let key = format!("k{:02}", i);
+			let val = format!("v{:02}", i);
+			tx.set(key.as_bytes(), val.as_bytes()).unwrap();
+		}
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let tx_ref = tx.snapshot.as_ref().unwrap();
+	let mut iter = tx_ref.range(Some(b"k00".as_slice()), Some(b"k99".as_slice())).unwrap();
+
+	// Go to middle (k05) via forward iteration
+	iter.seek_first().unwrap();
+	for _ in 0..5 {
+		iter.next().unwrap();
+	}
+	assert_eq!(iter.key().user_key(), b"k05");
+
+	// Switch to backward
+	iter.prev().unwrap();
+	assert_eq!(
+		iter.key().user_key(),
+		b"k04",
+		"After prev from k05, expected k04, got: {:?}",
+		String::from_utf8_lossy(iter.key().user_key())
+	);
+
+	// Go backward two more times
+	iter.prev().unwrap();
+	assert_eq!(iter.key().user_key(), b"k03");
+	iter.prev().unwrap();
+	assert_eq!(iter.key().user_key(), b"k02");
+
+	// Switch to forward again
+	iter.next().unwrap();
+	assert_eq!(
+		iter.key().user_key(),
+		b"k03",
+		"After next from k02, expected k03, got: {:?}",
+		String::from_utf8_lossy(iter.key().user_key())
+	);
 }
