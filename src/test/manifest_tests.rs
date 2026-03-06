@@ -9,7 +9,7 @@ use crate::levels::{
 	LevelManifest,
 	ManifestChangeSet,
 	SnapshotInfo,
-	MANIFEST_FORMAT_VERSION_V1,
+	MANIFEST_FORMAT_VERSION_V2,
 };
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
@@ -133,7 +133,7 @@ fn test_level_manifest_persistence() {
 		"Next table ID not persisted correctly"
 	);
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
 		"Manifest version not persisted correctly"
 	);
 	assert_eq!(loaded_manifest.snapshots.len(), 2, "Snapshots not persisted correctly");
@@ -184,7 +184,7 @@ fn test_level_manifest_persistence() {
 		"Next table ID not loaded correctly in new manifest"
 	);
 	assert_eq!(
-		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
+		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
 		"Manifest version not loaded correctly"
 	);
 	assert_eq!(new_manifest.snapshots.len(), 2, "Snapshots not loaded correctly");
@@ -695,7 +695,7 @@ fn test_manifest_v1_with_log_number_and_last_sequence() {
 
 	// Verify format version is still V1
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
 		"Should be V1 format"
 	);
 

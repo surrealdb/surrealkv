@@ -69,6 +69,7 @@
 use std::cmp::Ordering;
 use std::io::Write;
 use std::ops::Bound;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -822,7 +823,6 @@ pub enum IndexType {
 /// Uses TableIterator which coordinates:
 /// - first_level: IndexIterator (navigates index entries)
 /// - second_level: BlockIterator (navigates data block entries)
-#[derive(Clone)]
 pub(crate) struct Table {
 	pub id: u64,
 	pub file: Arc<dyn File>,
@@ -834,9 +834,60 @@ pub(crate) struct Table {
 
 	pub(crate) index_block: IndexType,
 	pub(crate) filter_reader: Option<FilterBlockReader>,
+
+	/// Compaction-epoch visibility: earliest snapshot that can see this table.
+	/// Default 0 (visible to all). Set to `op_min + half_bar` for compaction outputs.
+	pub(crate) snapshot_min: AtomicU64,
+	/// Compaction-epoch visibility: latest snapshot that can see this table.
+	/// Default u64::MAX (visible to all). Set to `op_min + half_bar - 1` when
+	/// table becomes a compaction input.
+	pub(crate) snapshot_max: AtomicU64,
+}
+
+impl Clone for Table {
+	fn clone(&self) -> Self {
+		Self {
+			id: self.id,
+			file: Arc::clone(&self.file),
+			file_size: self.file_size,
+			opts: Arc::clone(&self.opts),
+			meta: self.meta.clone(),
+			index_block: self.index_block.clone(),
+			filter_reader: self.filter_reader.clone(),
+			snapshot_min: AtomicU64::new(self.snapshot_min.load(AtomicOrdering::Relaxed)),
+			snapshot_max: AtomicU64::new(self.snapshot_max.load(AtomicOrdering::Relaxed)),
+		}
+	}
 }
 
 impl Table {
+	/// Sentinel value for snapshot_max: visible to all future snapshots.
+	pub const SNAPSHOT_MAX_DEFAULT: u64 = u64::MAX;
+
+	#[inline]
+	pub fn snapshot_min(&self) -> u64 {
+		self.snapshot_min.load(AtomicOrdering::Relaxed)
+	}
+
+	#[inline]
+	pub fn snapshot_max(&self) -> u64 {
+		self.snapshot_max.load(AtomicOrdering::Relaxed)
+	}
+
+	pub fn set_snapshot_min(&self, val: u64) {
+		self.snapshot_min.store(val, AtomicOrdering::Relaxed);
+	}
+
+	pub fn set_snapshot_max(&self, val: u64) {
+		self.snapshot_max.store(val, AtomicOrdering::Relaxed);
+	}
+
+	/// Returns true if this table is visible to the given snapshot.
+	#[inline]
+	pub fn visible(&self, snapshot: u64) -> bool {
+		self.snapshot_min() <= snapshot && snapshot <= self.snapshot_max()
+	}
+
 	/// Opens an SSTable file for reading.
 	pub(crate) fn new(
 		id: u64,
@@ -880,6 +931,8 @@ impl Table {
 			filter_reader,
 			index_block,
 			meta: writer_metadata,
+			snapshot_min: AtomicU64::new(0),
+			snapshot_max: AtomicU64::new(Self::SNAPSHOT_MAX_DEFAULT),
 		})
 	}
 

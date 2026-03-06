@@ -35,8 +35,8 @@ pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64)
 	Ok(())
 }
 
-/// Current manifest format version
-pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
+/// Manifest format version V2: table_id + snapshot_min + snapshot_max per table
+pub const MANIFEST_FORMAT_VERSION_V2: u16 = 2;
 
 /// Snapshot information stored in the manifest
 #[derive(Debug, Clone)]
@@ -167,7 +167,7 @@ impl LevelManifest {
 			levels,
 			hidden_set: HashSet::with_capacity(10),
 			next_table_id,
-			manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
+			manifest_format_version: MANIFEST_FORMAT_VERSION_V2,
 			snapshots: Vec::new(),
 			log_number: 0,
 			last_sequence: 0,
@@ -209,7 +209,7 @@ impl LevelManifest {
 
 		// Read versioned manifest format
 		let version = level_manifest.read_u16::<BigEndian>()?;
-		if version != MANIFEST_FORMAT_VERSION_V1 {
+		if version != MANIFEST_FORMAT_VERSION_V2 {
 			return Err(Error::LoadManifestFail(format!(
 				"Unsupported manifest format version: {}",
 				version
@@ -251,13 +251,17 @@ impl LevelManifest {
 		let mut levels_vec = Vec::with_capacity(level_data.len());
 
 		// Load all levels that exist in the manifest
-		for (level_idx, table_ids) in level_data.iter().enumerate() {
-			let mut tables = Vec::with_capacity(table_ids.len());
+		for (level_idx, table_entries) in level_data.iter().enumerate() {
+			let mut tables = Vec::with_capacity(table_entries.len());
 
-			for &table_id in table_ids {
+			for &(table_id, snapshot_min, snapshot_max) in table_entries {
 				// Load the actual table from disk
 				match Self::load_table(table_id, Arc::clone(&opts)) {
-					Ok(table) => tables.push(table),
+					Ok(table) => {
+						table.set_snapshot_min(snapshot_min);
+						table.set_snapshot_max(snapshot_max);
+						tables.push(table);
+					}
 					Err(err) => {
 						log::error!("Error loading table {table_id}: {err:?}");
 						return Err(Error::LoadManifestFail(err.to_string()));

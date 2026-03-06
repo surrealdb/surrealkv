@@ -72,15 +72,118 @@ pub trait CompactionStrategy: Send + Sync {
 pub const DEFAULT_BEATS_PER_BAR: u64 = 32;
 
 // ============================================================================
+// CompactionStage: explicit state machine for LiveCompaction lifecycle
+// ============================================================================
+
+/// Lifecycle stage of a LiveCompaction.
+///
+/// Transition diagram:
+/// ```text
+///   Commenced ──► Paused ──► Completed
+///       │           ▲  │         ▲
+///       │           └──┘         │
+///       └────────────────────────┘
+/// ```
+///
+/// - `Commenced`: initial state after `begin()`, no entries processed yet
+/// - `Paused`: beat quota consumed, entries remain, waiting for next beat
+/// - `Completed`: iterator exhausted, table file finalized, waiting for `commit()`
+///
+/// Note: There is no `Beat` variant. Since SurrealKV's compaction is synchronous
+/// (no async I/O pipeline), the "actively processing" state is transient within
+/// `advance()` and never observed externally. TigerBeetle needs `beat` and
+/// `beat_quota_done` stages for async I/O draining; we don't.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionStage {
+	/// Initial state after begin(). Tables selected, iterator+writer created, no entries
+	/// processed.
+	Commenced,
+	/// Beat quota consumed, entries remain. Waiting for next beat.
+	Paused,
+	/// Iterator exhausted, table file finalized. Waiting for commit() at half-bar end.
+	Completed,
+}
+
+// ============================================================================
+// CompactionQuotas: pacing state for beat/bar quota tracking
+// ============================================================================
+
+/// Tracks compaction progress for quota-based pacing.
+///
+/// At the start of a half-bar, `bar` is set to the total estimated entries.
+/// Each beat, `commence_beat()` divides remaining work by remaining beats.
+/// `record_entry()` increments both beat and bar counters per entry processed.
+#[derive(Debug)]
+struct CompactionQuotas {
+	/// Total estimated entries for the entire half-bar (from table metadata sum).
+	bar: u64,
+	/// Entries processed so far across all beats in this half-bar.
+	bar_done: u64,
+	/// Budget for the current beat (set by `commence_beat()`).
+	beat: u64,
+	/// Entries processed in the current beat.
+	beat_done: u64,
+}
+
+impl CompactionQuotas {
+	fn new(bar: u64) -> Self {
+		Self {
+			bar,
+			bar_done: 0,
+			beat: 0,
+			beat_done: 0,
+		}
+	}
+
+	/// Whether the current beat's quota has been consumed.
+	fn beat_exhausted(&self) -> bool {
+		debug_assert!(
+			self.bar_done <= self.bar || self.bar_done > self.bar,
+			"bar_done tracking is consistent"
+		);
+		self.beat_done >= self.beat
+	}
+
+	/// Whether the entire bar's estimated quota has been consumed.
+	/// Note: the iterator may still have entries beyond the estimate.
+	fn bar_exhausted(&self) -> bool {
+		self.bar_done >= self.bar
+	}
+
+	/// Set up the beat quota based on remaining work and remaining beats.
+	fn commence_beat(&mut self, beats_remaining: u64) {
+		debug_assert!(beats_remaining > 0, "cannot commence beat with zero beats remaining");
+		let remaining = self.bar.saturating_sub(self.bar_done);
+		self.beat = remaining.div_ceil(beats_remaining);
+		self.beat_done = 0;
+	}
+
+	/// Record one entry processed.
+	fn record_entry(&mut self) {
+		self.beat_done += 1;
+		self.bar_done += 1;
+	}
+
+	/// Returns true if any entries were written.
+	fn has_output(&self) -> bool {
+		self.bar_done > 0
+	}
+}
+
+// ============================================================================
 // LiveCompaction: state for a merge compaction spread across beats
 // ============================================================================
 
 /// A compaction in progress, spread across multiple beats within a half-bar.
 ///
-/// - Created at half-bar start (bar_commence)
-/// - Advanced by quota each beat (beat_commence + merge work)
-/// - Committed at half-bar end (bar_complete)
+/// - Created at half-bar start (bar_commence) in `Commenced` stage
+/// - Advanced by quota each beat — transitions through `Paused`/`Completed`
+/// - Committed at half-bar end (bar_complete) — consumes self
 struct LiveCompaction {
+	/// Lifecycle stage — replaces merge_done / write_done booleans.
+	stage: CompactionStage,
+	/// Quota tracking — replaces quota_bar / quota_bar_done fields.
+	quotas: CompactionQuotas,
 	/// Owned compaction iterator — no external borrows, persists across beats.
 	iterator: CompactionIterator<'static>,
 	/// Table writer — data blocks flush to disk during add(), finish() writes index+footer.
@@ -96,14 +199,6 @@ struct LiveCompaction {
 	guard: HiddenTablesGuard,
 	/// Keeps source tables alive for the owned iterators
 	_tables: Vec<Arc<Table>>,
-	/// Bar quota: total estimated entries for this compaction (from table metadata)
-	quota_bar: u64,
-	/// Entries processed so far across all beats
-	quota_bar_done: u64,
-	/// Whether the merge iterator is exhausted
-	merge_done: bool,
-	/// Whether writer.finish() has been called (table file is complete)
-	write_done: bool,
 }
 
 // SAFETY: All fields of LiveCompaction are Send:
@@ -118,9 +213,15 @@ struct LiveCompaction {
 unsafe impl Send for LiveCompaction {}
 
 impl LiveCompaction {
+	/// Whether this compaction has finished merging and is waiting for commit.
+	fn is_completed(&self) -> bool {
+		self.stage == CompactionStage::Completed
+	}
+
 	/// bar_commence equivalent: select tables, create iterator + writer, calculate quota.
 	///
 	/// Returns None if the level doesn't need compaction (strategy returns Skip).
+	/// The returned LiveCompaction starts in `Commenced` stage.
 	fn begin(opts: &CompactionOptions, source_level: u8, target_level: u8) -> Result<Option<Self>> {
 		let strategy = Strategy::with_target_level(Arc::clone(&opts.lopts), source_level);
 
@@ -180,6 +281,8 @@ impl LiveCompaction {
 		let writer = TableWriter::new(file, new_table_id, Arc::clone(&opts.lopts), target_level);
 
 		Ok(Some(Self {
+			stage: CompactionStage::Commenced,
+			quotas: CompactionQuotas::new(quota_bar),
 			iterator,
 			writer: Some(writer),
 			new_table_path,
@@ -187,73 +290,86 @@ impl LiveCompaction {
 			input,
 			guard,
 			_tables: tables,
-			quota_bar,
-			quota_bar_done: 0,
-			merge_done: false,
-			write_done: false,
 		}))
 	}
 
-	/// Process up to `beat_quota` entries from the merge iterator.
+	/// Process one beat of compaction work.
 	///
-	/// Each entry is fed to the TableWriter, which flushes data blocks to disk
-	/// incrementally as they fill up. When the iterator is exhausted,
-	/// the table file is finalized (index + footer written).
-	fn advance(&mut self, beat_quota: u64) -> Result<()> {
-		if self.merge_done {
+	/// State transitions:
+	///   Commenced/Paused → Paused     (beat quota consumed, entries remain)
+	///   Commenced/Paused → Completed  (iterator exhausted)
+	///   Completed        → Completed  (no-op)
+	fn advance(&mut self, beats_remaining: u64) -> Result<()> {
+		if self.stage == CompactionStage::Completed {
 			return Ok(());
 		}
 
-		let quota = beat_quota.min(self.quota_bar.saturating_sub(self.quota_bar_done));
+		debug_assert!(
+			self.stage == CompactionStage::Commenced || self.stage == CompactionStage::Paused,
+			"advance() called in invalid stage: {:?}",
+			self.stage
+		);
 
-		for _ in 0..quota {
+		// Set up beat quota
+		self.quotas.commence_beat(beats_remaining);
+
+		// Process entries up to beat quota
+		while !self.quotas.beat_exhausted() {
 			match self.iterator.next() {
 				Some(Ok((key, value))) => {
 					if let Some(ref mut writer) = self.writer {
 						writer.add(key, &value)?;
 					}
-					self.quota_bar_done += 1;
+					self.quotas.record_entry();
 				}
 				Some(Err(e)) => return Err(e),
 				None => {
-					self.merge_done = true;
-					break;
+					self.finalize_table()?;
+					self.stage = CompactionStage::Completed;
+					return Ok(());
 				}
 			}
 		}
 
-		// If we've hit the bar quota limit, drain the rest
-		if !self.merge_done && self.quota_bar_done >= self.quota_bar {
-			// The estimate was an upper bound; continue until iterator is actually done
-			loop {
-				match self.iterator.next() {
-					Some(Ok((key, value))) => {
-						if let Some(ref mut writer) = self.writer {
-							writer.add(key, &value)?;
-						}
-						self.quota_bar_done += 1;
+		// Beat quota consumed. Check if bar quota also exhausted.
+		if self.quotas.bar_exhausted() {
+			// Estimate may be imprecise — drain any remaining entries
+			self.drain_remaining()?;
+			self.finalize_table()?;
+			self.stage = CompactionStage::Completed;
+		} else {
+			self.stage = CompactionStage::Paused;
+		}
+
+		Ok(())
+	}
+
+	/// Drain any remaining entries after bar quota is exhausted.
+	fn drain_remaining(&mut self) -> Result<()> {
+		loop {
+			match self.iterator.next() {
+				Some(Ok((key, value))) => {
+					if let Some(ref mut writer) = self.writer {
+						writer.add(key, &value)?;
 					}
-					Some(Err(e)) => return Err(e),
-					None => {
-						self.merge_done = true;
-						break;
-					}
+					self.quotas.record_entry();
 				}
+				Some(Err(e)) => return Err(e),
+				None => break,
 			}
 		}
+		Ok(())
+	}
 
-		// Finalize table file when iterator exhausted
-		if self.merge_done && !self.write_done {
-			if self.quota_bar_done == 0 {
-				// No entries — drop writer and remove empty file
-				self.writer.take();
-				let _ = std::fs::remove_file(&self.new_table_path);
-			} else if let Some(writer) = self.writer.take() {
-				writer.finish()?;
-			}
-			self.write_done = true;
+	/// Finalize the table file: call writer.finish() or clean up empty file.
+	fn finalize_table(&mut self) -> Result<()> {
+		if !self.quotas.has_output() {
+			// No entries — drop writer and remove empty file
+			self.writer.take();
+			let _ = std::fs::remove_file(&self.new_table_path);
+		} else if let Some(writer) = self.writer.take() {
+			writer.finish()?;
 		}
-
 		Ok(())
 	}
 
@@ -261,35 +377,18 @@ impl LiveCompaction {
 	///
 	/// Called at half-bar end. Consumes self.
 	fn commit(mut self, opts: &CompactionOptions) -> Result<()> {
-		// If merge isn't done yet (shouldn't happen with correct quota), finish it
-		if !self.merge_done {
-			// Drain remaining entries
-			loop {
-				match self.iterator.next() {
-					Some(Ok((key, value))) => {
-						if let Some(ref mut writer) = self.writer {
-							writer.add(key, &value)?;
-						}
-						self.quota_bar_done += 1;
-					}
-					Some(Err(e)) => return Err(e),
-					None => {
-						self.merge_done = true;
-						break;
-					}
-				}
-			}
-			if self.quota_bar_done == 0 {
-				self.writer.take();
-				let _ = std::fs::remove_file(&self.new_table_path);
-			} else if let Some(writer) = self.writer.take() {
-				writer.finish()?;
-			}
-			self.write_done = true;
+		// If not yet completed, drain and finalize (safety net for imprecise estimates)
+		if self.stage != CompactionStage::Completed {
+			log::warn!("commit() called in {:?} stage — draining remaining entries", self.stage);
+			self.drain_remaining()?;
+			self.finalize_table()?;
+			self.stage = CompactionStage::Completed;
 		}
 
+		debug_assert_eq!(self.stage, CompactionStage::Completed);
+
 		// Open the new table (if entries were written)
-		let new_table = if self.quota_bar_done > 0 {
+		let new_table = if self.quotas.has_output() {
 			Some(open_table(&opts.lopts, self.new_table_id, &self.new_table_path)?)
 		} else {
 			None
@@ -417,12 +516,10 @@ impl CompactionScheduler {
 		// ── beat_commence + merge: every beat, advance each compaction by quota ──
 		let beats_remaining = self.half_bar - half_bar_beat;
 		for compaction in &mut self.active_compactions {
-			if compaction.merge_done {
+			if compaction.is_completed() {
 				continue;
 			}
-			let remaining = compaction.quota_bar.saturating_sub(compaction.quota_bar_done);
-			let beat_quota = remaining.div_ceil(beats_remaining);
-			compaction.advance(beat_quota)?;
+			compaction.advance(beats_remaining)?;
 		}
 
 		// ── bar_complete: at half-bar end, commit all manifest changes at once ──
@@ -441,6 +538,12 @@ impl CompactionScheduler {
 	/// - Move → defer to pending_manifest_ops (applied at half-bar end)
 	/// - Skip → no work needed
 	fn begin_half_bar(&mut self, beat: u64) -> Result<()> {
+		debug_assert!(
+			self.active_compactions.is_empty(),
+			"begin_half_bar called with {} active compactions still present",
+			self.active_compactions.len()
+		);
+
 		let opts = self.compaction_opts();
 		let level_count = self.opts.level_count;
 
@@ -512,6 +615,12 @@ impl CompactionScheduler {
 		// Commit all active merge compactions
 		let compactions = std::mem::take(&mut self.active_compactions);
 		for compaction in compactions {
+			debug_assert!(
+				compaction.stage == CompactionStage::Completed
+					|| compaction.stage == CompactionStage::Paused,
+				"complete_half_bar: unexpected stage {:?}",
+				compaction.stage
+			);
 			if let Err(e) = compaction.commit(&opts) {
 				log::error!("Failed to commit compaction: {:?}", e);
 				self.error_handler
