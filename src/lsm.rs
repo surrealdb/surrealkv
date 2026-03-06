@@ -218,30 +218,6 @@ impl CoreInner {
 		})
 	}
 
-	/// Get the earliest sequence number across all memtables.
-	/// Any key with seq >= this value is guaranteed to be in memtables or flushed history.
-	pub(crate) fn get_earliest_memtable_seq(&self) -> Result<u64> {
-		// Check flushed history first (has oldest data)
-		{
-			let history = self.flushed_history.read()?;
-			if let Some(ref oldest) = *history {
-				return Ok(oldest.earliest_seq());
-			}
-		}
-
-		// Then check immutable memtables
-		{
-			let immutables = self.immutable_memtables.read()?;
-			if let Some(oldest) = immutables.first() {
-				return Ok(oldest.memtable.earliest_seq());
-			}
-		}
-
-		// Fall back to active memtable
-		let memtable = self.active_memtable.read()?;
-		Ok(memtable.earliest_seq())
-	}
-
 	pub(crate) fn immutable_count(&self) -> usize {
 		self.immutable_memtables.read().map(|imm| imm.iter().count()).unwrap_or(0)
 	}
@@ -258,9 +234,26 @@ impl CoreInner {
 		I: Iterator<Item = &'a [u8]>,
 	{
 		// Lock order: active → immutables → history
+		// All three locks are held for the duration of both the earliest_seq check
+		// and the conflict detection to prevent races with background flushes.
 		let memtable = self.active_memtable.read()?;
 		let immutables = self.immutable_memtables.read()?;
 		let history = self.flushed_history.read()?;
+
+		// Check if memtable history is sufficient for conflict detection.
+		// This must be done while holding all locks to prevent a race where
+		// flushed_history is replaced between this check and the conflict scan.
+		let earliest_seq = if let Some(ref h) = *history {
+			h.earliest_seq()
+		} else if let Some(oldest) = immutables.first() {
+			oldest.memtable.earliest_seq()
+		} else {
+			memtable.earliest_seq()
+		};
+
+		if start_seq < earliest_seq {
+			return Err(Error::TransactionRetry);
+		}
 
 		for key in keys {
 			// Check active memtable first (most recent writes)
