@@ -35,7 +35,7 @@ fn test_batch_get_count() {
 
 #[test]
 fn test_batchreader_new() {
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(100);
 	batch.set_at(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
 	let encoded = batch.encode().unwrap();
 	let reader = Batch::decode(&encoded).unwrap();
@@ -44,7 +44,7 @@ fn test_batchreader_new() {
 
 #[test]
 fn test_batchreader_get_seq_num() {
-	let batch = Batch::new();
+	let batch = Batch::new_with_seq(100);
 	let encoded = batch.encode().unwrap();
 	let reader = Batch::decode(&encoded).unwrap();
 	assert_eq!(reader.starting_seq_num, 100);
@@ -52,7 +52,7 @@ fn test_batchreader_get_seq_num() {
 
 #[test]
 fn test_batch_read_record() {
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(1);
 	batch.set_at(b"key1".to_vec(), b"value1".to_vec(), 1).unwrap();
 	let encoded = batch.encode().unwrap();
 	let decoded_batch = Batch::decode(&encoded).unwrap();
@@ -68,7 +68,7 @@ fn test_batch_read_record() {
 
 #[test]
 fn test_batch_empty() {
-	let batch = Batch::new();
+	let batch = Batch::new_with_seq(1);
 	let encoded = batch.encode().unwrap();
 	let decoded_batch = Batch::decode(&encoded).unwrap();
 	assert_eq!(decoded_batch.starting_seq_num, 1);
@@ -77,7 +77,7 @@ fn test_batch_empty() {
 
 #[test]
 fn test_batch_multiple_operations() {
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(1);
 	batch.set_at(b"key1".to_vec(), b"value1".to_vec(), 1).unwrap();
 	batch.delete_at(b"key2".to_vec(), 2).unwrap();
 	batch.set_at(b"key3".to_vec(), b"value3".to_vec(), 3).unwrap();
@@ -112,7 +112,7 @@ fn test_batch_large_key_value() {
 	let large_key = vec![b'a'; 1000000];
 	let large_value = vec![b'b'; 1000000];
 
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(1);
 	batch.set_at(large_key.clone(), large_value.clone(), 1).unwrap();
 
 	let encoded = batch.encode().unwrap();
@@ -139,7 +139,7 @@ fn test_batch_max_size() {
 
 #[test]
 fn test_batch_iteration() {
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(1);
 	batch.set_at(b"key1".to_vec(), b"value1".to_vec(), 1).unwrap();
 	batch.delete_at(b"key2".to_vec(), 2).unwrap();
 	batch.set_at(b"key3".to_vec(), b"value3".to_vec(), 3).unwrap();
@@ -175,7 +175,7 @@ fn test_batch_invalid_data() {
 
 #[test]
 fn test_batch_empty_key_and_value() {
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(1);
 	batch.set_at(b"".to_vec(), b"".to_vec(), 0).unwrap();
 	batch.delete_at(b"".to_vec(), 0).unwrap();
 
@@ -197,7 +197,7 @@ fn test_batch_empty_key_and_value() {
 
 #[test]
 fn test_batch_unicode_keys_and_values() {
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(1);
 	batch.set_at("🔑".as_bytes().to_vec(), "🗝️".as_bytes().to_vec(), 1).unwrap();
 	batch.set_at("こんにちは".as_bytes().to_vec(), "世界".as_bytes().to_vec(), 2).unwrap();
 
@@ -221,7 +221,7 @@ fn test_batch_unicode_keys_and_values() {
 
 #[test]
 fn test_batch_sequence_numbers() {
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(100);
 	batch.set_at(b"key1".to_vec(), b"value1".to_vec(), 1).unwrap();
 	batch.set_at(b"key2".to_vec(), b"value2".to_vec(), 2).unwrap();
 
@@ -234,7 +234,7 @@ fn test_batch_sequence_numbers() {
 #[test]
 fn test_batch_large_number_of_records() {
 	const NUM_RECORDS: usize = 10000;
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(1);
 
 	for i in 0..NUM_RECORDS {
 		let key = format!("key{i}");
@@ -273,7 +273,7 @@ fn test_batch_large_number_of_records() {
 
 #[test]
 fn test_batch_version() {
-	let batch = Batch::new();
+	let batch = Batch::new_with_seq(1);
 	assert_eq!(batch.version, BATCH_VERSION);
 
 	let encoded = batch.encode().unwrap();
@@ -282,7 +282,7 @@ fn test_batch_version() {
 	assert_eq!(decoded_batch.version, BATCH_VERSION);
 
 	// Test with a batch that has data
-	let mut batch_with_data = Batch::new();
+	let mut batch_with_data = Batch::new_with_seq(100);
 	batch_with_data.set_at(b"key".to_vec(), b"value".to_vec(), 1).unwrap();
 	let encoded = batch_with_data.encode().unwrap();
 	let decoded_batch = Batch::decode(&encoded).unwrap();
@@ -293,10 +293,10 @@ fn test_batch_version() {
 #[test]
 fn test_add_record_consistent_encoding() {
 	// Test that None and Some(&[]) now encode identically (both as value_len=0)
-	let mut batch_none = Batch::new();
+	let mut batch_none = Batch::new_with_seq(100);
 	batch_none.add_record(InternalKeyKind::Delete, b"test_key".to_vec(), None, 100).unwrap();
 
-	let mut batch_empty = Batch::new();
+	let mut batch_empty = Batch::new_with_seq(100);
 	batch_empty
 		.add_record(InternalKeyKind::Delete, b"test_key".to_vec(), Some(vec![]), 100)
 		.unwrap();
@@ -331,7 +331,7 @@ fn test_add_record_consistent_encoding() {
 	assert_eq!(entries_empty[0].timestamp, 100);
 
 	// Test with different operation types to ensure they all work
-	let mut batch_merge = Batch::new();
+	let mut batch_merge = Batch::new_with_seq(300);
 	batch_merge
 		.add_record(
 			InternalKeyKind::Merge,
@@ -352,7 +352,7 @@ fn test_add_record_consistent_encoding() {
 	assert_eq!(entries_merge[0].timestamp, 300);
 
 	// Test with Set operations (should still work as before)
-	let mut batch_set = Batch::new();
+	let mut batch_set = Batch::new_with_seq(400);
 	batch_set
 		.add_record(InternalKeyKind::Set, b"set_key".to_vec(), Some(b"set_data".to_vec()), 400)
 		.unwrap();
@@ -371,7 +371,7 @@ fn test_add_record_consistent_encoding() {
 #[test]
 fn test_batch_encode_decode() {
 	// Create a batch with all possible variations
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(12345);
 
 	// Add various types of records with different value pointer scenarios
 	batch.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 1).unwrap();

@@ -394,14 +394,14 @@ mod tests {
 		// This verifies that ALL segments are replayed, not just the latest
 
 		// Batch 1: Starting at 100, with 3 entries (100, 101, 102)
-		let mut batch1 = Batch::new();
+		let mut batch1 = Batch::new_with_seq(100);
 		batch1.set(b"key1".to_vec(), b"value1".to_vec()).unwrap(); // seq_num 100
 		batch1.set(b"key2".to_vec(), b"value2".to_vec()).unwrap(); // seq_num 101
 		batch1.set(b"key3".to_vec(), b"value3".to_vec()).unwrap(); // seq_num 102
 															 // Highest sequence number should be 102
 
 		// Batch 2: Starting at 200, with 4 entries (200, 201, 202, 203)
-		let mut batch2 = Batch::new();
+		let mut batch2 = Batch::new_with_seq(200);
 		batch2.set(b"key4".to_vec(), b"value4".to_vec()).unwrap(); // seq_num 200
 		batch2.set(b"key5".to_vec(), b"value5".to_vec()).unwrap(); // seq_num 201
 		batch2.delete(b"key6".to_vec()).unwrap(); // seq_num 202
@@ -467,13 +467,13 @@ mod tests {
 
 		// Test with multiple single-entry batches across 3 WAL segments
 		// This tests that ALL segments are replayed, not just the latest
-		let mut batch1 = Batch::new();
+		let mut batch1 = Batch::new_with_seq(500);
 		batch1.set(b"key1".to_vec(), b"value1".to_vec()).unwrap(); // seq_num 500
 
-		let mut batch2 = Batch::new();
+		let mut batch2 = Batch::new_with_seq(600);
 		batch2.set(b"key2".to_vec(), b"value2".to_vec()).unwrap(); // seq_num 600
 
-		let mut batch3 = Batch::new();
+		let mut batch3 = Batch::new_with_seq(700);
 		batch3.set(b"key3".to_vec(), b"value3".to_vec()).unwrap(); // seq_num 700
 
 		// Create WAL for all batches (use rotation to create three segments)
@@ -525,12 +525,12 @@ mod tests {
 
 		// Test case: Multiple batches across 2 WAL segments
 		// This ensures ALL segments are replayed and max tracking works correctly
-		let mut batch1 = Batch::new(); // Starting sequence number 200
+		let mut batch1 = Batch::new_with_seq(200); // Starting sequence number 200
 		batch1.set(b"key1".to_vec(), b"value1".to_vec()).unwrap(); // seq_num 200
 		batch1.set(b"key2".to_vec(), b"value2".to_vec()).unwrap(); // seq_num 201
 															 // Highest sequence number should be 201
 
-		let mut batch2 = Batch::new(); // Starting sequence number 300
+		let mut batch2 = Batch::new_with_seq(300); // Starting sequence number 300
 		batch2.set(b"key3".to_vec(), b"value3".to_vec()).unwrap(); // seq_num 300
 		batch2.set(b"key4".to_vec(), b"value4".to_vec()).unwrap(); // seq_num 301
 															 // Highest sequence number should be 301
@@ -654,15 +654,15 @@ mod tests {
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 		// Create three batches with different sequence numbers
-		let mut batch1 = Batch::new();
+		let mut batch1 = Batch::new_with_seq(100);
 		batch1.set(b"key1".to_vec(), b"value1".to_vec()).unwrap();
 		batch1.set(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 
-		let mut batch2 = Batch::new();
+		let mut batch2 = Batch::new_with_seq(200);
 		batch2.set(b"key3".to_vec(), b"value3".to_vec()).unwrap();
 		batch2.set(b"key4".to_vec(), b"value4".to_vec()).unwrap();
 
-		let mut batch3 = Batch::new();
+		let mut batch3 = Batch::new_with_seq(300);
 		batch3.set(b"key5".to_vec(), b"value5".to_vec()).unwrap();
 		batch3.set(b"key6".to_vec(), b"value6".to_vec()).unwrap();
 
@@ -818,7 +818,7 @@ mod tests {
 		let opts = Options::default();
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
-		let mut batch = Batch::new();
+		let mut batch = Batch::new_with_seq(100);
 		batch.set(b"key".to_vec(), b"value".to_vec()).unwrap();
 		wal.append(&batch.encode().unwrap()).unwrap();
 		wal.close().unwrap();
@@ -844,7 +844,7 @@ mod tests {
 		// This is the critical bug scenario that was causing data loss
 
 		// Create first batch in WAL segment 0
-		let mut batch1 = Batch::new();
+		let mut batch1 = Batch::new_with_seq(100);
 		batch1.set(b"key1".to_vec(), b"value1".to_vec()).unwrap();
 		batch1.set(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 
@@ -856,7 +856,7 @@ mod tests {
 		wal.rotate().unwrap();
 
 		// Create second batch in WAL segment 1
-		let mut batch2 = Batch::new();
+		let mut batch2 = Batch::new_with_seq(200);
 		batch2.set(b"key3".to_vec(), b"value3".to_vec()).unwrap();
 		batch2.set(b"key4".to_vec(), b"value4".to_vec()).unwrap();
 
@@ -976,19 +976,19 @@ mod tests {
 		let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 		// Segment 0
-		let mut batch0 = Batch::new();
+		let mut batch0 = Batch::new_with_seq(100);
 		batch0.set(b"key0".to_vec(), b"value0".to_vec()).unwrap();
 		wal.append(&batch0.encode().unwrap()).unwrap();
 		wal.rotate().unwrap();
 
 		// Segment 1
-		let mut batch1 = Batch::new();
+		let mut batch1 = Batch::new_with_seq(200);
 		batch1.set(b"key1".to_vec(), b"value1".to_vec()).unwrap();
 		wal.append(&batch1.encode().unwrap()).unwrap();
 		wal.rotate().unwrap();
 
 		// Segment 2
-		let mut batch2 = Batch::new();
+		let mut batch2 = Batch::new_with_seq(300);
 		batch2.set(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 		wal.append(&batch2.encode().unwrap()).unwrap();
 		wal.close().unwrap();

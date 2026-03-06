@@ -579,7 +579,7 @@ mod tests {
 	struct AlwaysFailApplyEnv;
 
 	impl CommitEnv for AlwaysFailApplyEnv {
-		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
+		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
 			let mut new_batch = Batch::new();
 			for entry in batch.entries() {
 				new_batch.add_record(
@@ -644,7 +644,7 @@ mod tests {
 	}
 
 	impl CommitEnv for FailNTimesEnv {
-		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
+		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
 			let mut new_batch = Batch::new();
 			for entry in batch.entries() {
 				new_batch.add_record(

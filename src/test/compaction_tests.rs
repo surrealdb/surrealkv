@@ -341,7 +341,7 @@ fn test_level_selection() {
 
 	// Verify L0 was selected for compaction (as it exceeds its limit)
 	match choice {
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			assert_eq!(input.source_level, 0, "L0 should be selected as source level");
 			assert_eq!(input.target_level, 1, "L1 should be selected as target level");
 
@@ -385,7 +385,7 @@ fn test_compaction_edge_cases() {
 	// Strategy should skip compaction when L0 is empty
 	match choice {
 		CompactionChoice::Skip => { /* Expected */ }
-		CompactionChoice::Merge(_) => {
+		CompactionChoice::Merge(_) | CompactionChoice::Move(_) => {
 			panic!("Compaction should be skipped when L0 is empty");
 		}
 	}
@@ -415,7 +415,7 @@ fn test_compaction_edge_cases() {
 		CompactionChoice::Skip => {
 			// Skip is OK if last level doesn't exceed byte limit
 		}
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			// If compaction is selected, it should be same-level compaction
 			if input.source_level == 3 {
 				assert_eq!(input.target_level, 3, "Bottom level should compact to itself");
@@ -490,7 +490,7 @@ fn test_level_selection_score_based() {
 	let choice = strategy.pick_levels(&manifest_guard).unwrap();
 
 	match choice {
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			// Since l2_bytes > l1_bytes, l2_score > l1_score
 			// And l2_score should be >= 1.0 (since we set base to make L1 ~0.5)
 			if l2_score > l1_score && l2_score >= 1.0 {
@@ -2294,7 +2294,7 @@ fn test_score_based_level_selection() {
 	// Score-based selection should pick the level with highest score
 	let choice = strategy.pick_levels(&manifest).unwrap();
 	match choice {
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			// Should pick a level that needs compaction (score >= 1.0)
 			assert!(input.source_level <= 1, "Should pick L0 or L1");
 		}
@@ -2327,7 +2327,7 @@ fn test_bytes_based_level_limits() {
 	// Check that L1 can be selected if it exceeds limit
 	let choice = strategy.pick_levels(&manifest).unwrap();
 	match choice {
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			// Should pick a level that needs compaction
 			assert!(input.source_level <= 2, "Should pick a valid level");
 		}
@@ -2362,7 +2362,7 @@ fn test_bottom_level_compaction() {
 	// Note: This will only trigger if L2 exceeds its byte limit
 	let choice = strategy.pick_levels(&manifest).unwrap();
 	match choice {
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			// If L2 is selected, it should compact to same level
 			if input.source_level == 2 {
 				assert_eq!(

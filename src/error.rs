@@ -30,13 +30,7 @@ pub enum Error {
 	BlockNotFound,
 	BatchTooLarge,
 	InvalidBatchRecord,
-	TransactionWriteConflict,
-	TransactionRetry,
-	TransactionClosed,
 	EmptyKey,
-	TransactionWriteOnly,
-	TransactionReadOnly,
-	TransactionWithoutSavepoint,
 	KeyNotFound,
 	ArenaFull, // Memtable arena is full, need rotation
 	FileDescriptorNotFound,
@@ -84,13 +78,7 @@ impl fmt::Display for Error {
             Self::BlockNotFound => write!(f, "Block not found"),
             Self::BatchTooLarge => write!(f, "Batch too large"),
             Self::InvalidBatchRecord => write!(f, "Invalid batch record"),
-            Self::TransactionWriteConflict => write!(f, "Transaction write conflict"),
-            Self::TransactionRetry => write!(f, "Transaction retry required: memtable history insufficient for conflict detection"),
-            Self::TransactionClosed => write!(f, "Transaction closed"),
             Self::EmptyKey => write!(f, "Empty key"),
-            Self::TransactionWriteOnly => write!(f, "Transaction is write-only"),
-            Self::TransactionReadOnly => write!(f, "Transaction is read-only"),
-            Self::TransactionWithoutSavepoint => write!(f, "Transaction has no savepoint to rollback to"),
             Self::KeyNotFound => write!(f, "Key not found"),
             Self::ArenaFull => write!(f, "Memtable arena is full"),
             Self::FileDescriptorNotFound => write!(f, "File descriptor not found"),
@@ -177,7 +165,6 @@ pub enum ErrorSeverity {
 /// Reason for background error (for classification)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackgroundErrorReason {
-	MemtablaFlush,
 	Compaction,
 	ManifestWrite,
 }
@@ -224,9 +211,6 @@ impl BackgroundErrorHandler {
 
 			// Corrupted table metadata is unrecoverable
 			(_, Error::CorruptedTableMetadata(_)) => ErrorSeverity::Unrecoverable,
-
-			// I/O errors during memtable flush are fatal
-			(BackgroundErrorReason::MemtablaFlush, Error::Io(_)) => ErrorSeverity::FatalError,
 
 			// I/O errors during compaction are fatal
 			(BackgroundErrorReason::Compaction, Error::Io(_)) => ErrorSeverity::FatalError,
@@ -369,7 +353,7 @@ mod tests {
 		// Set a hard error
 		handler.set_error(
 			Error::Io(Arc::new(std::io::Error::other("test error"))),
-			BackgroundErrorReason::MemtablaFlush,
+			BackgroundErrorReason::Compaction,
 		);
 
 		assert!(handler.is_db_stopped());
@@ -392,7 +376,7 @@ mod tests {
 		// Set a fatal error - should upgrade
 		handler.set_error(
 			Error::Io(Arc::new(std::io::Error::other("fatal error"))),
-			BackgroundErrorReason::MemtablaFlush,
+			BackgroundErrorReason::Compaction,
 		);
 
 		assert!(handler.is_db_stopped());
@@ -408,7 +392,7 @@ mod tests {
 		// Set a hard error first
 		handler.set_error(
 			Error::Io(Arc::new(std::io::Error::other("hard error"))),
-			BackgroundErrorReason::MemtablaFlush,
+			BackgroundErrorReason::Compaction,
 		);
 
 		let first_error = handler.get_error().unwrap().error;
@@ -430,7 +414,7 @@ mod tests {
 
 		handler.set_error(
 			Error::Io(Arc::new(std::io::Error::other("test error"))),
-			BackgroundErrorReason::MemtablaFlush,
+			BackgroundErrorReason::Compaction,
 		);
 
 		assert!(handler.is_db_stopped());

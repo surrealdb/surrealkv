@@ -502,9 +502,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 
 	for (idx, key) in keys.iter().enumerate() {
 		let value = generate_compressible_value(200, (idx % 256) as u8);
-		let mut txn = tree.begin().unwrap();
-		txn.set(key, &value).unwrap();
-		txn.commit().await.unwrap();
+		tree.set(key, &value).await.unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -513,18 +511,17 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 
 	let mut found_count = 0;
 	for key in keys.iter() {
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key).unwrap();
+		let result = tree.get(key).unwrap();
 		assert!(result.is_some(), "Key should exist: {:?}", String::from_utf8_lossy(key));
 		found_count += 1;
 	}
 	assert_eq!(found_count, keys.len(), "All keys should be found");
 	println!("Verified all {} keys exist", found_count);
 
-	let txn = tree.begin().unwrap();
+	let snap = tree.new_snapshot();
 	let first_key = keys.first().unwrap();
 
-	let mut iter = txn.range(first_key.as_slice(), &[0xFFu8; 100]).unwrap();
+	let mut iter = snap.range(Some(first_key.as_slice()), None).unwrap();
 	iter.seek_first().unwrap();
 
 	let mut scanned_count = 0;
@@ -550,10 +547,11 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 	assert_eq!(scanned_count, keys.len(), "Range scan should return all keys");
 	println!("Range scan successfully iterated through all {} keys", scanned_count);
 
-	let txn = tree.begin().unwrap();
+	let snap = tree.new_snapshot();
 	let start_key = &keys[0];
 	let end_key = &keys[99.min(keys.len() - 1)];
-	let mut partial_iter = txn.range(start_key.as_slice(), end_key.as_slice()).unwrap();
+	let mut partial_iter =
+		snap.range(Some(start_key.as_slice()), Some(end_key.as_slice())).unwrap();
 	partial_iter.seek_first().unwrap();
 
 	let mut partial_count = 0;
@@ -596,9 +594,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 
 		for (idx, key) in keys.iter().enumerate() {
 			let value = generate_compressible_value(250, (idx % 256) as u8);
-			let mut txn = tree.begin().unwrap();
-			txn.set(key, &value).unwrap();
-			txn.commit().await.unwrap();
+			tree.set(key, &value).await.unwrap();
 
 			if idx % 2000 == 0 && idx > 0 {
 				println!("  Inserted {} keys", idx);
@@ -634,8 +630,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 
 		let mut found_count = 0;
 		for (idx, key) in keys.iter().enumerate() {
-			let txn = tree.begin().unwrap();
-			let result = txn.get(key).unwrap();
+			let result = tree.get(key).unwrap();
 			assert!(
 				result.is_some(),
 				"Key at index {} should exist after reopen: {:?}",
@@ -669,9 +664,9 @@ async fn test_lsm_compression_persistence_after_reopen() {
 		println!("All {} keys verified successfully", found_count);
 
 		println!("Testing range scan after reopen...");
-		let txn = tree.begin().unwrap();
+		let snap = tree.new_snapshot();
 		let first_key = keys.first().unwrap();
-		let mut iter = txn.range(first_key.as_slice(), &[0xFFu8; 100]).unwrap();
+		let mut iter = snap.range(Some(first_key.as_slice()), None).unwrap();
 		iter.seek_first().unwrap();
 
 		let mut scanned_count = 0;
@@ -742,9 +737,7 @@ async fn test_lsm_compression_disk_size_comparison() {
 	println!("Inserting 10k keys into compressed tree...");
 	for (idx, key) in keys.iter().enumerate() {
 		let value = generate_compressible_value(500, b'A');
-		let mut txn = tree_compressed.begin().unwrap();
-		txn.set(key, &value).unwrap();
-		txn.commit().await.unwrap();
+		tree_compressed.set(key, &value).await.unwrap();
 
 		if idx % 1000 == 0 && idx > 0 {
 			println!("  Inserted {} keys", idx);
@@ -754,9 +747,7 @@ async fn test_lsm_compression_disk_size_comparison() {
 	println!("Inserting 10k keys into uncompressed tree...");
 	for (idx, key) in keys.iter().enumerate() {
 		let value = generate_compressible_value(500, b'A');
-		let mut txn = tree_uncompressed.begin().unwrap();
-		txn.set(key, &value).unwrap();
-		txn.commit().await.unwrap();
+		tree_uncompressed.set(key, &value).await.unwrap();
 
 		if idx % 1000 == 0 && idx > 0 {
 			println!("  Inserted {} keys", idx);
@@ -813,8 +804,7 @@ async fn test_lsm_compression_disk_size_comparison() {
 	let tree_compressed = crate::TreeBuilder::with_options(opts_compressed).build().unwrap();
 	for i in [0, 5000, 9999].iter() {
 		let key = format!("testkey_{:08}", i).into_bytes();
-		let txn = tree_compressed.begin().unwrap();
-		let result = txn.get(&key).unwrap();
+		let result = tree_compressed.get(&key).unwrap();
 		assert!(result.is_some(), "Key {} should exist after reopening compressed tree", i);
 	}
 	tree_compressed.close().await.unwrap();
@@ -935,9 +925,7 @@ async fn test_compression_per_level_sstable_creation() {
 		let value = generate_compressible_value(1000, b'A'); // Highly compressible
 		keys.push(key.clone());
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(&key, &value).unwrap();
-		txn.commit().await.unwrap();
+		tree.set(&key, &value).await.unwrap();
 	}
 
 	// Force flush to create L0 SSTable
@@ -945,8 +933,7 @@ async fn test_compression_per_level_sstable_creation() {
 
 	// Verify data can be read back
 	for key in &keys {
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key).unwrap();
+		let result = tree.get(key).unwrap();
 		assert!(result.is_some(), "Key {:?} should exist", String::from_utf8_lossy(key));
 		let value = result.unwrap();
 		assert_eq!(value.len(), 1000);
@@ -993,9 +980,7 @@ async fn test_compression_per_level_with_different_levels() {
 		let value = generate_compressible_value(500, b'X');
 		keys.push(key.clone());
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(&key, &value).unwrap();
-		txn.commit().await.unwrap();
+		tree.set(&key, &value).await.unwrap();
 	}
 
 	// Force flush and compaction
@@ -1005,8 +990,7 @@ async fn test_compression_per_level_with_different_levels() {
 	// compression In a real LSM tree, we'd need to trigger compaction to higher
 	// levels to fully test
 
-	let txn = tree.begin().unwrap();
-	let result = txn.get(&keys[0]).unwrap();
+	let result = tree.get(&keys[0]).unwrap();
 	assert!(result.is_some(), "Should be able to read data after flush");
 
 	tree.close().await.unwrap();

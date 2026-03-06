@@ -49,7 +49,7 @@ fn memtable_lsn() {
 	let value = b"value".to_vec();
 	let seq_num = 100;
 
-	let mut batch = Batch::new();
+	let mut batch = Batch::new_with_seq(seq_num);
 	batch.set(key, value).unwrap();
 
 	memtable.add(&batch).unwrap();
@@ -91,15 +91,15 @@ fn memtable_get_latest_seq_no() {
 	let value2 = b"value2".to_vec();
 	let value3 = b"value3".to_vec();
 
-	let mut batch1 = Batch::new();
+	let mut batch1 = Batch::new_with_seq(1);
 	batch1.set(key1.clone(), value1).unwrap();
 	memtable.add(&batch1).unwrap();
 
-	let mut batch2 = Batch::new();
+	let mut batch2 = Batch::new_with_seq(2);
 	batch2.set(key1.clone(), value2).unwrap();
 	memtable.add(&batch2).unwrap();
 
-	let mut batch3 = Batch::new();
+	let mut batch3 = Batch::new_with_seq(3);
 	batch3.set(key1, value3.clone()).unwrap();
 	memtable.add(&batch3).unwrap();
 
@@ -149,7 +149,7 @@ fn create_test_memtable(entries: Vec<TestEntry>) -> (Arc<MemTable>, u64) {
 
 		// Create a single-entry batch for each record to ensure exact sequence number
 		// assignment
-		let mut batch = Batch::new();
+		let mut batch = Batch::new_with_seq(seq_num);
 		match kind {
 			InternalKeyKind::Set => {
 				batch.set(key.clone(), value.clone()).unwrap();
@@ -680,19 +680,19 @@ fn test_latest_sequence_number() {
 	assert_eq!(memtable.lsn(), 0);
 
 	// Add batch with seq_num 10
-	let mut batch1 = Batch::new();
+	let mut batch1 = Batch::new_with_seq(10);
 	batch1.set(b"key1".to_vec(), b"value1".to_vec()).unwrap();
 	memtable.add(&batch1).unwrap();
 	assert_eq!(memtable.lsn(), 10);
 
 	// Add batch with lower seq_num - should not update
-	let mut batch2 = Batch::new();
+	let mut batch2 = Batch::new_with_seq(5);
 	batch2.set(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 	memtable.add(&batch2).unwrap();
 	assert_eq!(memtable.lsn(), 10); // Should still be 10
 
 	// Add batch with higher seq_num
-	let mut batch3 = Batch::new();
+	let mut batch3 = Batch::new_with_seq(20);
 	batch3.set(b"key3".to_vec(), b"value3".to_vec()).unwrap();
 	memtable.add(&batch3).unwrap();
 	assert_eq!(memtable.lsn(), 20);
@@ -700,8 +700,9 @@ fn test_latest_sequence_number() {
 
 #[test]
 fn test_get_highest_seq_num() {
-	// Add a batch with 5 entries
-	let mut batch = Batch::new();
+	// Add a batch with 5 entries, starting at seq 10
+	// Highest seq will be 10 + (5-1) = 14
+	let mut batch = Batch::new_with_seq(10);
 	batch.set(b"key1".to_vec(), b"value1".to_vec()).unwrap();
 	batch.set(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 	batch.set(b"key3".to_vec(), b"value3".to_vec()).unwrap();
