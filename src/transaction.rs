@@ -804,15 +804,6 @@ impl Transaction {
 	/// Validates that no key in our write set was modified after we started.
 	/// Only checks memtables - returns TransactionRetry if history insufficient.
 	fn validate_write_conflicts(&self) -> Result<()> {
-		// Early check: is memtable history sufficient?
-		// If our transaction started before the oldest memtable was created,
-		// we can't reliably check for conflicts (data may have been flushed to SST).
-		let earliest_memtable_seq = self.core.inner.get_earliest_memtable_seq()?;
-		if self.start_seq_num < earliest_memtable_seq {
-			return Err(Error::TransactionRetry);
-		}
-
-		// Check all keys in one batch
 		self.core
 			.inner
 			.check_keys_conflict(self.write_set.keys().map(|k| k.as_slice()), self.start_seq_num)
