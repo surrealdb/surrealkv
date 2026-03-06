@@ -364,6 +364,7 @@ impl CommitPipeline {
 		}
 	}
 
+	#[cfg(test)]
 	pub(crate) fn get_visible_seq_num(&self) -> u64 {
 		self.visible_seq_num.load(Ordering::Acquire)
 	}
@@ -417,7 +418,7 @@ mod tests {
 	impl CommitEnv for MockEnv {
 		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
 			// Create a copy of the batch for testing
-			let mut new_batch = Batch::new(_seq_num);
+			let mut new_batch = Batch::new();
 			for entry in batch.entries() {
 				new_batch.add_record(
 					entry.kind,
@@ -443,7 +444,7 @@ mod tests {
 		let pipeline =
 			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
 
-		let mut batch = Batch::new(0);
+		let mut batch = Batch::new();
 		batch
 			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
 			.unwrap();
@@ -467,7 +468,7 @@ mod tests {
 
 		// First test sequential commits to verify basic functionality
 		for i in 0..5 {
-			let mut batch = Batch::new(0);
+			let mut batch = Batch::new();
 			batch
 				.add_record(
 					InternalKeyKind::Set,
@@ -494,7 +495,7 @@ mod tests {
 		for i in 0..10 {
 			let pipeline = Arc::clone(&pipeline);
 			let handle = tokio::spawn(async move {
-				let mut batch = Batch::new(0);
+				let mut batch = Batch::new();
 				batch
 					.add_record(
 						InternalKeyKind::Set,
@@ -535,7 +536,7 @@ mod tests {
 				std::hint::spin_loop();
 			}
 			// Create a copy of the batch for testing
-			let mut new_batch = Batch::new(_seq_num);
+			let mut new_batch = Batch::new();
 			for entry in batch.entries() {
 				new_batch.add_record(
 					entry.kind,
@@ -572,7 +573,7 @@ mod tests {
 		for i in 0..5 {
 			let pipeline = Arc::clone(&pipeline);
 			let handle = tokio::spawn(async move {
-				let mut batch = Batch::new(0);
+				let mut batch = Batch::new();
 				batch
 					.add_record(
 						InternalKeyKind::Set,
@@ -618,7 +619,7 @@ mod tests {
 
 	impl CommitEnv for AlwaysFailApplyEnv {
 		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
-			let mut new_batch = Batch::new(seq_num);
+			let mut new_batch = Batch::new();
 			for entry in batch.entries() {
 				new_batch.add_record(
 					entry.kind,
@@ -652,7 +653,7 @@ mod tests {
 		);
 
 		for i in 0..20 {
-			let mut batch = Batch::new(0);
+			let mut batch = Batch::new();
 			batch
 				.add_record(
 					InternalKeyKind::Set,
@@ -687,7 +688,7 @@ mod tests {
 
 	impl CommitEnv for FailNTimesEnv {
 		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
-			let mut new_batch = Batch::new(seq_num);
+			let mut new_batch = Batch::new();
 			for entry in batch.entries() {
 				new_batch.add_record(
 					entry.kind,
@@ -727,7 +728,7 @@ mod tests {
 		let pipeline = CommitPipeline::new(env, test_visible_seq_num(), test_write_stall());
 
 		for i in 0..20 {
-			let mut batch = Batch::new(0);
+			let mut batch = Batch::new();
 			batch
 				.add_record(
 					InternalKeyKind::Set,

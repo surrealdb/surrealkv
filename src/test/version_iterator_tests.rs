@@ -1,8 +1,6 @@
 //! Tests for the versioned iterator functionality.
 //!
-//! Each test runs with both `versioned_index=false` (LSM-only iteration) and
-//! `versioned_index=true` (merged B+tree + memtable iteration) to ensure both
-//! paths produce identical results.
+//! Tests run with LSM-only iteration to verify versioned query behavior.
 
 use tempdir::TempDir;
 use test_log::test;
@@ -14,13 +12,10 @@ fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
 }
 
-/// Create a store with versioning enabled and configurable B+tree index
-fn create_versioned_store(with_index: bool) -> (crate::lsm::Tree, TempDir) {
+/// Create a store with versioning enabled
+fn create_versioned_store() -> (crate::lsm::Tree, TempDir) {
 	let temp_dir = create_temp_directory();
-	let opts = Options::new()
-		.with_path(temp_dir.path().to_path_buf())
-		.with_versioning(true, 0)
-		.with_versioned_index(with_index);
+	let opts = Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
 	let tree = TreeBuilder::with_options(opts).build().unwrap();
 	(tree, temp_dir)
 }
@@ -79,8 +74,8 @@ fn collect_history_reverse(iter: &mut impl LSMIterator) -> Result<Vec<(Key, Valu
 
 #[test(tokio::test)]
 async fn test_history_multiple_versions_single_key() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1 three times with different values
 		{
@@ -126,8 +121,8 @@ async fn test_history_multiple_versions_single_key() {
 
 #[test(tokio::test)]
 async fn test_history_multiple_keys_multiple_versions() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1 (2 versions)
 		{
@@ -197,8 +192,8 @@ async fn test_history_multiple_keys_multiple_versions() {
 
 #[test(tokio::test)]
 async fn test_history_excludes_tombstones() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1 v1
 		{
@@ -246,8 +241,8 @@ async fn test_history_excludes_tombstones() {
 
 #[test(tokio::test)]
 async fn test_history_with_tombstones() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1 v1
 		{
@@ -294,8 +289,8 @@ async fn test_history_with_tombstones() {
 
 #[test(tokio::test)]
 async fn test_history_replace_shows_all_versions() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1=v1
 		{
@@ -338,8 +333,8 @@ async fn test_history_replace_shows_all_versions() {
 
 #[test(tokio::test)]
 async fn test_history_soft_delete_vs_hard_delete() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1 v1
 		{
@@ -400,8 +395,8 @@ async fn test_history_soft_delete_vs_hard_delete() {
 
 #[test(tokio::test)]
 async fn test_history_bounds() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert keys a through e
 		for key in [b"key_a", b"key_b", b"key_c", b"key_d", b"key_e"] {
@@ -432,8 +427,8 @@ async fn test_history_bounds() {
 
 #[test(tokio::test)]
 async fn test_history_empty_range() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key_a and key_b
 		{
@@ -463,8 +458,8 @@ async fn test_history_empty_range() {
 
 #[test(tokio::test)]
 async fn test_history_single_key_match() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key_a (2 versions)
 		{
@@ -507,8 +502,8 @@ async fn test_history_single_key_match() {
 
 #[test(tokio::test)]
 async fn test_history_interleaved_iteration() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1 (2 versions) and key2 (2 versions)
 		{
@@ -582,8 +577,8 @@ async fn test_history_interleaved_iteration() {
 
 #[test(tokio::test)]
 async fn test_history_seek_middle() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert 5 keys
 		for i in 1..=5 {
@@ -630,8 +625,8 @@ async fn test_history_seek_middle() {
 
 #[test(tokio::test)]
 async fn test_history_backward_iteration() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert multiple keys with multiple versions
 		{
@@ -674,8 +669,8 @@ async fn test_history_backward_iteration() {
 
 #[test(tokio::test)]
 async fn test_history_snapshot_isolation() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1 v1
 		{
@@ -729,9 +724,9 @@ async fn test_history_snapshot_isolation() {
 
 #[test(tokio::test)]
 async fn test_history_many_versions() {
-	for with_index in [false, true] {
+	{
 		println!("test_history_many_versions with_index={with_index}");
-		let (store, _temp_dir) = create_versioned_store(with_index);
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert same key 100 times with different values
 		for i in 1..=100 {
@@ -763,8 +758,8 @@ async fn test_history_many_versions() {
 
 #[test(tokio::test)]
 async fn test_history_timestamps() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key with timestamp 50, then 100, then 200
 		// Note: seq_num order != timestamp order
@@ -814,8 +809,8 @@ async fn test_history_timestamps() {
 
 #[test(tokio::test)]
 async fn test_history_entry_method() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert a key
 		{
@@ -869,8 +864,8 @@ async fn test_history_entry_method() {
 
 #[test(tokio::test)]
 async fn test_get_at_fallback() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key at ts=100
 		{
@@ -914,8 +909,8 @@ async fn test_get_at_fallback() {
 
 #[test(tokio::test)]
 async fn test_get_at_tombstone() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key at ts=100
 		{
@@ -1017,8 +1012,8 @@ async fn test_history_transaction_states() {
 
 #[test(tokio::test)]
 async fn test_history_survives_memtable_flush() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1 three times with different values
 		for i in 1..=3 {
@@ -1068,8 +1063,8 @@ async fn test_history_survives_memtable_flush() {
 
 #[test(tokio::test)]
 async fn test_replace_cuts_off_history_with_versioning() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1 with SET operations
 		{
@@ -1129,8 +1124,8 @@ async fn test_replace_cuts_off_history_with_versioning() {
 
 #[test(tokio::test)]
 async fn test_multiple_replaces_preserved_with_versioning() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert with SET first
 		{
@@ -1177,8 +1172,8 @@ async fn test_multiple_replaces_preserved_with_versioning() {
 
 #[test(tokio::test)]
 async fn test_replace_after_delete_with_versioning() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1
 		{
@@ -1222,8 +1217,8 @@ async fn test_replace_after_delete_with_versioning() {
 
 #[test(tokio::test)]
 async fn test_versions_survive_compaction() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert key1 with multiple versions
 		for i in 1..=5 {
@@ -1283,8 +1278,8 @@ async fn test_versions_survive_compaction() {
 
 #[test(tokio::test)]
 async fn test_history_bidirectional_iteration() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Insert multiple keys with multiple versions
 		{
@@ -1327,8 +1322,8 @@ async fn test_history_bidirectional_iteration() {
 
 #[test(tokio::test)]
 async fn test_history_ts_range_forward() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1374,8 +1369,8 @@ async fn test_history_ts_range_forward() {
 
 #[test(tokio::test)]
 async fn test_history_ts_range_backward() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1415,8 +1410,8 @@ async fn test_history_ts_range_backward() {
 
 #[test(tokio::test)]
 async fn test_history_limit_forward() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		for i in 1..=5 {
 			let mut tx = store.begin().unwrap();
@@ -1443,8 +1438,8 @@ async fn test_history_limit_forward() {
 
 #[test(tokio::test)]
 async fn test_history_limit_backward() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		for i in 1..=5 {
 			let mut tx = store.begin().unwrap();
@@ -1470,8 +1465,8 @@ async fn test_history_limit_backward() {
 
 #[test(tokio::test)]
 async fn test_history_limit_multiple_keys() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1518,8 +1513,8 @@ async fn test_history_limit_multiple_keys() {
 
 #[test(tokio::test)]
 async fn test_history_ts_range_with_limit() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		for i in 1..=10 {
 			let mut tx = store.begin().unwrap();
@@ -1550,8 +1545,8 @@ async fn test_history_ts_range_with_limit() {
 
 #[test(tokio::test)]
 async fn test_history_limit_zero() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1575,8 +1570,8 @@ async fn test_history_limit_zero() {
 
 #[test(tokio::test)]
 async fn test_history_ts_range_empty_result() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1609,8 +1604,8 @@ async fn test_history_ts_range_empty_result() {
 /// Test get_at RYOW: uncommitted writes should be visible
 #[test(tokio::test)]
 async fn test_get_at_ryow() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Commit some initial data
 		{
@@ -1640,8 +1635,8 @@ async fn test_get_at_ryow() {
 /// Test get_at RYOW: future timestamp writes should not be visible
 #[test(tokio::test)]
 async fn test_get_at_ryow_future_timestamp() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		let mut tx = store.begin().unwrap();
 		tx.set_at(b"key1", b"future_value", 500).unwrap();
@@ -1661,8 +1656,8 @@ async fn test_get_at_ryow_future_timestamp() {
 /// Test get_at RYOW with tombstone
 #[test(tokio::test)]
 async fn test_get_at_ryow_tombstone() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Commit initial data
 		{
@@ -1686,8 +1681,8 @@ async fn test_get_at_ryow_tombstone() {
 /// Test history iterator RYOW: uncommitted writes appear in history
 #[test(tokio::test)]
 async fn test_history_ryow() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Commit some initial data
 		{
@@ -1734,8 +1729,8 @@ async fn test_history_ryow() {
 /// Test history RYOW with timestamp collision: write set wins
 #[test(tokio::test)]
 async fn test_history_ryow_timestamp_collision() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1766,8 +1761,8 @@ async fn test_history_ryow_timestamp_collision() {
 /// Test history RYOW with timestamp range filtering
 #[test(tokio::test)]
 async fn test_history_ryow_with_ts_range() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1801,8 +1796,8 @@ async fn test_history_ryow_with_ts_range() {
 /// Test history RYOW soft delete (tombstone) handling
 #[test(tokio::test)]
 async fn test_history_ryow_soft_delete() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1847,8 +1842,8 @@ async fn test_history_ryow_soft_delete() {
 /// Test history RYOW hard delete handling - wipes all history
 #[test(tokio::test)]
 async fn test_history_ryow_hard_delete() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1892,8 +1887,8 @@ async fn test_history_ryow_hard_delete() {
 /// Test get_at RYOW with hard delete - returns None regardless of timestamp
 #[test(tokio::test)]
 async fn test_get_at_ryow_hard_delete() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin().unwrap();
@@ -1927,8 +1922,8 @@ async fn test_get_at_ryow_hard_delete() {
 /// Regression test: keys with user_key lexicographically before lower bound should not be returned.
 #[test(tokio::test)]
 async fn test_history_forward_respects_lower_bound() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Key starting with '#' (ASCII 35) comes before '@' (ASCII 64)
 		let sync_key = b"#@prefix:sync\x00\x00\x00\x00\x00\x00\x00\x02****************";
@@ -1987,8 +1982,8 @@ async fn test_history_forward_respects_lower_bound() {
 /// Regression test: keys with user_key lexicographically after upper bound should not be returned.
 #[test(tokio::test)]
 async fn test_history_backward_respects_upper_bound() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Keys in range
 		let key_a = b"key_a";
@@ -2044,8 +2039,8 @@ async fn test_history_backward_respects_upper_bound() {
 /// Test that both bounds are respected with keys outside both ends of the range.
 #[test(tokio::test)]
 async fn test_history_respects_both_bounds() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Keys before range
 		let key_aa = b"aa_before";
@@ -2125,8 +2120,8 @@ async fn test_history_respects_both_bounds() {
 /// Test bounds with timestamp ranges - keys outside range but within timestamp should be excluded.
 #[test(tokio::test)]
 async fn test_history_bounds_with_timestamp_range() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Key before range at target timestamp
 		let key_before = b"aaa_before";
@@ -2173,7 +2168,7 @@ async fn test_history_bounds_with_timestamp_range() {
 #[test(tokio::test)]
 async fn test_history_bounds_direction_switch_forward_to_backward() {
 	for with_index in [false] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Keys: before range, in range (3 keys), after range
 		let keys: [&[u8]; 5] = [b"aa_before", b"mm_in1", b"mm_in2", b"mm_in3", b"zz_after"];
@@ -2237,8 +2232,8 @@ async fn test_history_bounds_direction_switch_forward_to_backward() {
 /// Test direction switching (backward to forward) respects bounds.
 #[test(tokio::test)]
 async fn test_history_bounds_direction_switch_backward_to_forward() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		let keys: [&[u8]; 5] = [b"aa_before", b"mm_in1", b"mm_in2", b"mm_in3", b"zz_after"];
 
@@ -2303,8 +2298,8 @@ async fn test_history_bounds_direction_switch_backward_to_forward() {
 #[test(tokio::test)]
 async fn test_history_direction_switch_multi_version_keys() {
 	const VERSIONS_PER_KEY: u64 = 5;
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Create 3 keys, each with many versions
 		for key in [b"key_a", b"key_b", b"key_c"] {
@@ -2415,8 +2410,8 @@ async fn test_history_direction_switch_multi_version_keys() {
 /// Test seeking to a key below lower_bound.
 #[test(tokio::test)]
 async fn test_history_seek_outside_lower_bound() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2450,8 +2445,8 @@ async fn test_history_seek_outside_lower_bound() {
 /// Test seeking to a key at or above upper_bound.
 #[test(tokio::test)]
 async fn test_history_seek_outside_upper_bound() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2489,8 +2484,8 @@ async fn test_history_seek_outside_upper_bound() {
 /// Test seeking to exact bound values.
 #[test(tokio::test)]
 async fn test_history_seek_to_exact_bounds() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2525,8 +2520,8 @@ async fn test_history_seek_to_exact_bounds() {
 /// Test key exactly at lower_bound is included (inclusive).
 #[test(tokio::test)]
 async fn test_history_key_at_exact_lower_bound() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2554,8 +2549,8 @@ async fn test_history_key_at_exact_lower_bound() {
 /// Test key exactly at upper_bound is excluded (exclusive).
 #[test(tokio::test)]
 async fn test_history_key_at_exact_upper_bound() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2587,8 +2582,8 @@ async fn test_history_key_at_exact_upper_bound() {
 /// Test adjacent byte boundaries with special byte values.
 #[test(tokio::test)]
 async fn test_history_adjacent_byte_boundaries() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		// Keys with adjacent byte values
 		let key_before = b"key";
@@ -2642,8 +2637,8 @@ async fn test_history_adjacent_byte_boundaries() {
 /// Test tombstone (soft delete) at lower bound.
 #[test(tokio::test)]
 async fn test_history_tombstone_at_lower_bound() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2703,8 +2698,8 @@ async fn test_history_tombstone_at_lower_bound() {
 /// Test hard delete at boundary.
 #[test(tokio::test)]
 async fn test_history_hard_delete_at_boundary() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2746,8 +2741,8 @@ async fn test_history_hard_delete_at_boundary() {
 /// Test replace operation at boundary.
 #[test(tokio::test)]
 async fn test_history_replace_at_boundary() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2785,8 +2780,8 @@ async fn test_history_replace_at_boundary() {
 /// Test equal lower and upper bounds (empty range).
 #[test(tokio::test)]
 async fn test_history_bounds_equal_lower_upper() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2816,8 +2811,8 @@ async fn test_history_bounds_equal_lower_upper() {
 /// Test inverted bounds (lower > upper).
 #[test(tokio::test)]
 async fn test_history_bounds_inverted() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2848,8 +2843,8 @@ async fn test_history_bounds_inverted() {
 /// Test single key in range.
 #[test(tokio::test)]
 async fn test_history_single_key_in_range() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2886,8 +2881,8 @@ async fn test_history_single_key_in_range() {
 /// Test all keys outside range.
 #[test(tokio::test)]
 async fn test_history_all_keys_outside_range() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2923,8 +2918,8 @@ async fn test_history_all_keys_outside_range() {
 /// Test bounds with limit (forward).
 #[test(tokio::test)]
 async fn test_history_bounds_with_limit() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -2965,8 +2960,8 @@ async fn test_history_bounds_with_limit() {
 /// Test bounds with limit (backward).
 #[test(tokio::test)]
 async fn test_history_bounds_with_limit_backward() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -3012,8 +3007,8 @@ async fn test_history_bounds_with_limit_backward() {
 /// Test bounds with timestamp range and limit combined.
 #[test(tokio::test)]
 async fn test_history_bounds_ts_range_and_limit() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -3075,8 +3070,8 @@ async fn test_history_bounds_ts_range_and_limit() {
 /// Test prefix pattern iteration (common use case).
 #[test(tokio::test)]
 async fn test_history_bounds_prefix_pattern() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -3120,8 +3115,8 @@ async fn test_history_bounds_prefix_pattern() {
 /// Test keys and bounds containing null bytes.
 #[test(tokio::test)]
 async fn test_history_bounds_null_bytes() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();
@@ -3173,8 +3168,8 @@ async fn test_history_bounds_null_bytes() {
 /// Test bounds with maximum byte values (0xFF).
 #[test(tokio::test)]
 async fn test_history_bounds_max_byte_values() {
-	for with_index in [false, true] {
-		let (store, _temp_dir) = create_versioned_store(with_index);
+	{
+		let (store, _temp_dir) = create_versioned_store();
 
 		{
 			let mut tx = store.begin_with_mode(Mode::ReadWrite).unwrap();

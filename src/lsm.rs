@@ -3,11 +3,10 @@ use std::fs::create_dir_all;
 #[cfg(not(target_os = "windows"))]
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::Batch;
-use crate::bplustree::tree::DiskBPlusTree;
 use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
 use crate::commit::{CommitEnv, CommitPipeline};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
@@ -16,26 +15,13 @@ use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lockfile::LockFile;
 use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
-use crate::snapshot::SnapshotTracker;
+use crate::snapshot::{Snapshot, SnapshotTracker};
 use crate::sstable::table::Table;
 use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
-use crate::transaction::{Mode, Transaction, TransactionOptions};
-use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
-use crate::{
-	BytewiseComparator,
-	Comparator,
-	Error,
-	FilterPolicy,
-	LSMIterator,
-	Options,
-	TimestampComparator,
-	VLogChecksumLevel,
-	Value,
-	WalRecoveryMode,
-};
+use crate::{Comparator, Error, FilterPolicy, LSMIterator, Options, Value, WalRecoveryMode};
 
 // ===== Compaction Operations Trait =====
 /// Defines the compaction operations that can be performed on an LSM tree.
@@ -83,7 +69,6 @@ pub trait CompactionOperations: Send + Sync {
 /// 1. `active_memtable` - serializes writes
 /// 2. `level_manifest` - SST metadata and table IDs
 /// 3. `immutable_memtables` - pending flush queue
-/// 4. `flushed_history` - conflict detection history
 ///
 /// Read locks and write locks follow the same ordering.
 /// If a function needs multiple locks, it must acquire them in this order.
@@ -105,13 +90,6 @@ pub(crate) struct CoreInner {
 	/// to flush them to disk as SSTables.
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 
-	/// Most recently flushed memtable kept for conflict detection.
-	/// When a memtable is flushed to SST, it's moved here so that long-running
-	/// transactions can still detect conflicts against recently flushed data.
-	/// This prevents spurious TransactionRetry errors when immutable_memtables
-	/// becomes empty after a flush.
-	pub(crate) flushed_history: Arc<RwLock<Option<Arc<MemTable>>>>,
-
 	/// The level structure managing all SSTables on disk.
 	///
 	/// LSM trees organize SSTables into levels:
@@ -129,15 +107,8 @@ pub(crate) struct CoreInner {
 	/// snapshot-aware compaction.
 	pub(crate) snapshot_tracker: SnapshotTracker,
 
-	/// Value Log (VLog)
-	pub(crate) vlog: Option<Arc<VLog>>,
-
 	/// Write-Ahead Log (WAL) for durability
 	pub(crate) wal: WalManager,
-
-	/// Versioned B+ tree index for timestamp-based queries
-	/// Maps InternalKey -> Value for time-range queries
-	pub(crate) versioned_index: Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
 
 	/// Lock file to prevent multiple processes from opening the same database
 	pub(crate) lockfile: Mutex<LockFile>,
@@ -147,7 +118,6 @@ pub(crate) struct CoreInner {
 
 	/// Visible sequence number - the highest sequence number that is visible to readers.
 	/// Shared with CommitPipeline for coordinated updates.
-	/// Used to set `earliest_seq` when creating new memtables for conflict detection.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
 }
 
@@ -177,30 +147,11 @@ impl CoreInner {
 
 		// Initialize active memtable with its WAL number set to the initial WAL
 		// This tracks which WAL the memtable's data belongs to for later flush
-		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size, 0));
+		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size));
 		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
 		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
-
-		// Initialize versioned index if B+tree versioned index is enabled
-		let versioned_index = if opts.enable_versioned_index {
-			// Create the versioned index directory if it doesn't exist
-			let versioned_index_dir = opts.versioned_index_dir();
-			let versioned_index_path = versioned_index_dir.join("index.bpt");
-			let comparator =
-				Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));
-			let tree = DiskBPlusTree::disk(&versioned_index_path, comparator)?;
-			Some(Arc::new(parking_lot::RwLock::new(tree)))
-		} else {
-			None
-		};
-
-		let vlog = if opts.enable_vlog {
-			Some(Arc::new(VLog::new(Arc::clone(&opts))?))
-		} else {
-			None
-		};
 
 		Ok(Self {
 			opts,
@@ -208,13 +159,10 @@ impl CoreInner {
 			immutable_memtables,
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
-			vlog,
 			wal: WalManager::new(wal_instance),
-			versioned_index,
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
-			flushed_history: Arc::new(RwLock::new(None)),
 		})
 	}
 
@@ -227,74 +175,6 @@ impl CoreInner {
 			.read()
 			.map(|m| m.levels.get_levels().first().map(|l| l.tables.len()).unwrap_or(0))
 			.unwrap_or(0)
-	}
-
-	pub(crate) fn check_keys_conflict<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
-	where
-		I: Iterator<Item = &'a [u8]>,
-	{
-		// Lock order: active → immutables → history
-		// All three locks are held for the duration of both the earliest_seq check
-		// and the conflict detection to prevent races with background flushes.
-		let memtable = self.active_memtable.read()?;
-		let immutables = self.immutable_memtables.read()?;
-		let history = self.flushed_history.read()?;
-
-		// Check if memtable history is sufficient for conflict detection.
-		// This must be done while holding all locks to prevent a race where
-		// flushed_history is replaced between this check and the conflict scan.
-		let earliest_seq = if let Some(ref h) = *history {
-			h.earliest_seq()
-		} else if let Some(oldest) = immutables.first() {
-			oldest.memtable.earliest_seq()
-		} else {
-			memtable.earliest_seq()
-		};
-
-		if start_seq < earliest_seq {
-			return Err(Error::TransactionRetry);
-		}
-
-		for key in keys {
-			// Check active memtable first (most recent writes)
-			if let Some((ikey, _)) = memtable.get(key, None) {
-				if ikey.seq_num() > start_seq {
-					return Err(Error::TransactionWriteConflict);
-				}
-				// Key exists but was written before our transaction started - no conflict
-				continue;
-			}
-
-			// Check immutable memtables (newest to oldest by iterating in reverse)
-			let mut found_in_immutable = false;
-			for entry in immutables.iter().rev() {
-				if let Some((ikey, _)) = entry.memtable.get(key, None) {
-					if ikey.seq_num() > start_seq {
-						return Err(Error::TransactionWriteConflict);
-					}
-					// Key exists but was written before our transaction started - no conflict
-					found_in_immutable = true;
-					break;
-				}
-			}
-			if found_in_immutable {
-				continue;
-			}
-
-			// Check flushed history
-			if let Some(ref flushed) = *history {
-				if let Some((ikey, _)) = flushed.get(key, None) {
-					if ikey.seq_num() > start_seq {
-						return Err(Error::TransactionWriteConflict);
-					}
-					// Key exists but was written before our transaction started - no conflict
-				}
-			}
-			// Key not found in any memtable or history - no conflict for this key
-		}
-
-		// No conflicts found for any key
-		Ok(())
 	}
 
 	/// Flushes a memtable to SST and atomically updates the manifest.
@@ -318,48 +198,13 @@ impl CoreInner {
 		table_id: u64,
 		wal_number: u64,
 	) -> Result<Arc<Table>> {
-		let collect_bptree = self.versioned_index.is_some();
-
-		// Step 1: Flush memtable to SST (with VLog separation for large values)
-		// Also collects entries for B+tree versioned index if enabled
-		let (table, bptree_entries) = memtable
-			.flush(
-				table_id,
-				Arc::clone(&self.opts),
-				self.vlog.as_ref(),
-				self.opts.vlog_value_threshold,
-				collect_bptree,
-			)
-			.map_err(|e| {
-				Error::Other(format!(
-					"Failed to flush memtable to SST table_id={}: {}",
-					table_id, e
-				))
-			})?;
+		let table = memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
+			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
+		})?;
 
 		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
-		// Step 2: Write to versioned index (B+tree) with vlog-separated values
-		// Note: Replace entries are NOT cleaned up here. The HistoryIterator uses
-		// barrier logic (barrier_seen) to skip older entries when it encounters a
-		// Replace — same as how hard deletes work. Stale entries are eventually
-		// removed by cleanup_stale_versioned_index when their vlog files are cleaned.
-		if let Some(ref versioned_index) = self.versioned_index {
-			let mut vi_guard = versioned_index.write();
-
-			for (encoded_key, encoded_value) in &bptree_entries {
-				vi_guard.insert(encoded_key.clone(), encoded_value.clone())?;
-			}
-
-			vi_guard.sync()?;
-			log::debug!(
-				"Versioned index updated: {} entries written for table_id={}",
-				bptree_entries.len(),
-				table_id
-			);
-		}
-
-		// Step 3: Prepare atomic changeset
+		// Prepare atomic changeset
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&table)));
 		changeset.log_number = Some(wal_number + 1);
@@ -372,10 +217,9 @@ impl CoreInner {
 		);
 
 		// Step 4: Apply changeset atomically
-		// Lock order: level_manifest → immutable_memtables → flushed_history
+		// Lock order: level_manifest → immutable_memtables
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
-		let mut history_lock = self.flushed_history.write()?;
 
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
@@ -393,20 +237,12 @@ impl CoreInner {
 		// Remove successfully flushed memtable from immutables tracking
 		memtable_lock.remove(table_id);
 
-		// Atomically add to flushed history for conflict detection
-		// This ensures no visibility gap where memtable is in neither collection
-		*history_lock = Some(memtable);
-
 		log::info!(
 			"Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
 			table_id,
 			wal_number + 1,
 			manifest.get_last_sequence()
 		);
-
-		// After successful manifest commit, cleanup obsolete vlog files and stale index entries
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-		cleanup_vlog_and_index(&self.vlog, &self.versioned_index, min_oldest_vlog, "flush");
 
 		Ok(table)
 	}
@@ -447,10 +283,9 @@ impl CoreInner {
 		};
 
 		// Step 3: Swap memtable while STILL holding write lock
-		let earliest_seq = self.visible_seq_num.load(Ordering::Acquire);
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size, earliest_seq)),
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
 		);
 
 		// Set the WAL number on the new (empty) active memtable
@@ -617,14 +452,11 @@ impl CoreInner {
 		// Get the current WAL number for the new memtable
 		let current_wal_number = self.wal.read().get_active_log_number();
 
-		// Get the current visible_seq_num as earliest_seq for the new memtable
-		let earliest_seq = self.visible_seq_num.load(Ordering::Acquire);
-
 		// Swap the active memtable with a new empty one
 		// This allows writes to continue immediately
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size, earliest_seq)),
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
 		);
 
 		// Set the WAL number on the new active memtable
@@ -860,46 +692,6 @@ impl CoreInner {
 
 		Ok(())
 	}
-
-	/// Cleans up orphaned VLog files that are not referenced by any SST.
-	///
-	/// After a crash, there may be VLog files that:
-	/// 1. Were written but never referenced by an SST (write crashed before flush)
-	/// 2. Are no longer referenced because all referencing SSTs were compacted away
-	///
-	/// This method computes the minimum oldest_vlog_file_id across all live SSTs
-	/// and removes any VLog files below that threshold.
-	///
-	/// SAFETY: This must be called after manifest is loaded and SSTs are known.
-	fn cleanup_orphaned_vlog_files(&self) -> Result<()> {
-		if self.vlog.is_none() {
-			return Ok(()); // No VLog, nothing to clean up
-		}
-
-		let manifest = self.level_manifest.read()?;
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-
-		// If no SSTs reference VLog files yet, keep all files
-		// (This handles the fresh database case)
-		if min_oldest_vlog == 0 {
-			log::debug!("No SSTs with VLog references found, skipping VLog orphan cleanup");
-			return Ok(());
-		}
-
-		log::info!("Cleaning up orphaned VLog files below min_oldest_vlog={}", min_oldest_vlog);
-
-		// Use the consolidated cleanup helper
-		cleanup_vlog_and_index(&self.vlog, &self.versioned_index, min_oldest_vlog, "startup");
-
-		Ok(())
-	}
-
-	/// Resolves a value, checking if it's a VLog pointer and retrieving from
-	/// VLog if needed
-	pub(crate) fn resolve_value(&self, value: &[u8]) -> Result<Value> {
-		let location = ValueLocation::decode(value)?;
-		location.resolve_value(self.vlog.as_ref())
-	}
 }
 
 impl CompactionOperations for CoreInner {
@@ -966,24 +758,17 @@ impl LsmCommitEnv {
 }
 
 impl CommitEnv for LsmCommitEnv {
-	// Write batch to WAL with inline values (synchronous operation).
-	// VLog separation is deferred to memtable flush time.
+	// Write batch to WAL (synchronous operation).
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
-		let mut processed_batch = Batch::new(seq_num);
+		let mut processed_batch = Batch::new_with_seq(seq_num);
 
 		for (_, entry, _current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
-			// Always store values inline — VLog separation deferred to flush.
-			// Versioned index (B+tree) writes are also deferred to flush time,
-			// so the B+tree stores value pointers (consistent with SSTables).
-			let encoded_value = match &entry.value {
-				Some(value) => {
-					let value_location = ValueLocation::with_inline_value(value.clone());
-					Some(value_location.encode())
-				}
-				None => None,
-			};
-
-			processed_batch.add_record(entry.kind, entry.key.clone(), encoded_value, timestamp)?;
+			processed_batch.add_record(
+				entry.kind,
+				entry.key.clone(),
+				entry.value.clone(),
+				timestamp,
+			)?;
 		}
 
 		// Write to WAL for durability
@@ -1305,10 +1090,6 @@ impl Core {
 		// but BEFORE any new flushes that might create new SSTs
 		inner.cleanup_orphaned_sst_files()?;
 
-		// Clean up any orphaned VLog files that are no longer referenced by any SST
-		// SAFETY: This must happen AFTER manifest is loaded so we know which SSTs exist
-		inner.cleanup_orphaned_vlog_files()?;
-
 		// Trigger level compaction check at startup
 		task_manager.wake_up_level();
 
@@ -1329,22 +1110,11 @@ impl Core {
 		self.commit_pipeline.commit(batch, sync).await
 	}
 
-	pub(crate) fn seq_num(&self) -> u64 {
-		self.commit_pipeline.get_visible_seq_num()
-	}
-
-	/// Flushes WAL and VLog buffers to OS cache.
+	/// Flushes WAL buffers to OS cache.
 	///
 	/// If `sync` is true, also fsyncs to disk for durability.
-	/// This is safe to call concurrently with ongoing transactions.
-	///
-	/// # Order of Operations
-	///
-	/// VLog is flushed first (contains data referenced by WAL), then WAL.
-	/// This ensures that if WAL contains a ValuePointer, the referenced
-	/// VLog data is at least as durable.
+	/// This is safe to call concurrently with ongoing operations.
 	pub(crate) fn flush_wal(&self, sync: bool) -> Result<()> {
-		// VLog is NOT synced here — VLog writes are deferred to memtable flush.
 		if sync {
 			self.wal.sync()?;
 		} else {
@@ -1387,20 +1157,6 @@ impl Core {
 			log::debug!("Stopping background task manager...");
 			task_manager.stop().await;
 			log::debug!("Background task manager stopped");
-		}
-
-		// Close the VLog if present
-		if let Some(ref vlog) = self.inner.vlog {
-			log::debug!("Closing VLog...");
-			vlog.close()?;
-			log::debug!("VLog closed");
-		}
-
-		// Close the versioned index if present
-		if let Some(ref versioned_index) = self.inner.versioned_index {
-			log::debug!("Closing versioned index...");
-			versioned_index.read().close()?;
-			log::debug!("Versioned index closed");
 		}
 
 		// Step 3: Conditionally flush ALL memtables based on flush_on_close option
@@ -1474,25 +1230,27 @@ impl Core {
 	}
 }
 
+/// A simple key-value store with Pebble-style API.
+///
+/// Provides direct access to get/set/delete operations without transactions.
+/// For batch writes, use `new_batch()` and `apply()`.
+/// For consistent reads, use `new_snapshot()`.
 #[derive(Clone)]
-pub struct Tree {
+pub struct Store {
 	pub(crate) core: Arc<Core>,
 }
 
-impl Tree {
-	/// Creates a new LSM tree with the specified options
+impl Store {
+	/// Creates a new Store with the specified options
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
-		// Validate options before creating the tree
+		// Validate options before creating the store
 		opts.validate()?;
 
 		// Create all required directory structure
 		Self::create_directory_structure(&opts)?;
 
-		// Create the core LSM tree components
+		// Create the core LSM components
 		let core = Core::new(Arc::clone(&opts))?;
-
-		// TODO: Add file to write options manifest
-		// TODO: Add version header in file similar to table in WAL
 
 		// Ensure directory changes are persisted
 		sync_directory_structure(&opts)?;
@@ -1502,7 +1260,7 @@ impl Tree {
 		})
 	}
 
-	/// Creates all required directory structure for the LSM tree
+	/// Creates all required directory structure for the store
 	fn create_directory_structure(opts: &Options) -> Result<()> {
 		// Create base directory
 		create_dir_all(&opts.path)?;
@@ -1512,41 +1270,73 @@ impl Tree {
 		create_dir_all(opts.wal_dir())?;
 		create_dir_all(opts.manifest_dir())?;
 
-		// Create VLog directories
-		if opts.enable_vlog {
-			create_dir_all(opts.vlog_dir())?;
-		}
-
-		if opts.enable_versioning {
-			create_dir_all(opts.versioned_index_dir())?;
-		}
-
 		Ok(())
 	}
 
-	/// Transactions provide a consistent, atomic view of the database.
-	pub fn begin(&self) -> Result<Transaction> {
-		self.begin_with_opts(TransactionOptions::new())
+	// ===== Direct Single-Key Operations =====
+
+	/// Gets the value for a key at the current visible sequence number.
+	pub fn get(&self, key: &[u8]) -> Result<Option<Value>> {
+		let snapshot = self.new_snapshot();
+		snapshot.get(key).map(|opt| opt.map(|(v, _)| v))
 	}
 
-	/// Begins a new transaction with the specified mode
-	pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
-		self.begin_with_opts(TransactionOptions::new_with_mode(mode))
+	/// Sets a key-value pair (creates a single-entry batch and applies it).
+	pub async fn set(&self, key: &[u8], value: &[u8]) -> Result<()> {
+		let mut batch = self.new_batch();
+		batch.set(key, value)?;
+		self.apply(batch, false).await
 	}
 
-	/// Begins a new transaction with the provided options
-	pub fn begin_with_opts(&self, opts: TransactionOptions) -> Result<Transaction> {
-		let txn = Transaction::new(Arc::clone(&self.core), opts)?;
-		Ok(txn)
+	/// Sets a key-value pair with a specific timestamp.
+	pub async fn set_at(&self, key: &[u8], value: &[u8], timestamp: u64) -> Result<()> {
+		let mut batch = self.new_batch();
+		batch.set_at(key, value, timestamp)?;
+		self.apply(batch, false).await
 	}
 
-	/// Executes a read-only operation in a consistent snapshot.
+	/// Deletes a key (creates a single-entry batch and applies it).
+	pub async fn delete(&self, key: &[u8]) -> Result<()> {
+		let mut batch = self.new_batch();
+		batch.delete(key)?;
+		self.apply(batch, false).await
+	}
+
+	// ===== Batch Operations =====
+
+	/// Creates a new empty batch for buffering writes.
+	pub fn new_batch(&self) -> Batch {
+		Batch::new()
+	}
+
+	/// Applies a batch of writes to the store.
 	///
-	/// This provides a consistent view of the database without blocking writes.
-	pub fn view(&self, f: impl FnOnce(&mut Transaction) -> Result<()>) -> Result<()> {
-		let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
-		f(&mut txn)?;
-		Ok(())
+	/// # Arguments
+	/// * `batch` - The batch of writes to apply
+	/// * `sync` - If true, wait for WAL sync before returning
+	pub async fn apply(&self, batch: Batch, sync: bool) -> Result<()> {
+		if batch.is_empty() {
+			return Ok(());
+		}
+
+		// Get the current timestamp for entries without explicit timestamps
+		let timestamp = self.core.inner.opts.clock.now();
+
+		// Assign commit timestamp and sequence numbers to batch entries
+		let mut committed_batch = batch;
+		committed_batch.assign_commit_info(timestamp);
+
+		// Commit through the pipeline
+		self.core.commit(committed_batch, sync).await
+	}
+
+	// ===== Snapshot Operations =====
+
+	/// Creates a new snapshot at the current visible sequence number.
+	///
+	/// Snapshots provide consistent point-in-time reads.
+	pub fn new_snapshot(&self) -> Snapshot {
+		Snapshot::new(Arc::clone(&self.core))
 	}
 
 	/// Creates a database checkpoint at the specified directory.
@@ -1593,10 +1383,8 @@ impl Tree {
 		// Clear the current memtables since they would be stale after restore
 		// This discards any pending writes, which is correct for restore operations
 		{
-			let earliest_seq = self.core.inner.visible_seq_num.load(Ordering::Acquire);
 			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable =
-				Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size, earliest_seq));
+			*active_memtable = Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size));
 		}
 
 		{
@@ -1703,21 +1491,19 @@ impl Tree {
 		Ok(())
 	}
 
-	/// Flushes WAL and VLog buffers to OS cache.
+	/// Flushes WAL buffers to OS cache.
 	///
-	/// If `sync` is true, also fsyncs to disk, guaranteeing durability
-	/// of all previously committed transactions.
-	///
+	/// If `sync` is true, also fsyncs to disk, guaranteeing durability.
 	/// If `sync` is false, only flushes to OS buffer cache (faster but
 	/// not durable across power loss).
 	///
-	/// This is safe to call concurrently with ongoing transactions.
+	/// This is safe to call concurrently with ongoing operations.
 	pub fn flush_wal(&self, sync: bool) -> Result<()> {
 		self.core.flush_wal(sync)
 	}
 }
 
-impl Drop for Tree {
+impl Drop for Store {
 	fn drop(&mut self) {
 		#[cfg(not(target_arch = "wasm32"))]
 		{
@@ -1737,24 +1523,20 @@ impl Drop for Tree {
 	}
 }
 
-/// A builder for creating LSM trees with type-safe configuration.
-pub struct TreeBuilder {
+/// A builder for creating stores with type-safe configuration.
+pub struct StoreBuilder {
 	opts: Options,
 }
 
-impl TreeBuilder {
-	/// Creates a new TreeBuilder with default options for the specified key
-	/// type.
+impl StoreBuilder {
+	/// Creates a new StoreBuilder with default options.
 	pub fn new() -> Self {
 		Self {
 			opts: Options::default(),
 		}
 	}
 
-	/// Creates a new TreeBuilder with the specified options.
-	///
-	/// This method ensures type safety by requiring the options to use the same
-	/// key type.
+	/// Creates a new StoreBuilder with the specified options.
 	pub fn with_options(opts: Options) -> Self {
 		Self {
 			opts,
@@ -1824,8 +1606,7 @@ impl TreeBuilder {
 		self
 	}
 
-	/// Sets the unified block cache capacity (includes data blocks, index
-	/// blocks, and VLog values).
+	/// Sets the unified block cache capacity (includes data blocks and index blocks).
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
 		self.opts = self.opts.with_block_cache_capacity(capacity_bytes);
 		self
@@ -1837,59 +1618,9 @@ impl TreeBuilder {
 		self
 	}
 
-	/// Sets the VLog maximum file size.
-	pub fn with_vlog_max_file_size(mut self, size: u64) -> Self {
-		self.opts = self.opts.with_vlog_max_file_size(size);
-		self
-	}
-
-	/// Sets the VLog checksum verification level.
-	pub fn with_vlog_checksum_verification(mut self, level: VLogChecksumLevel) -> Self {
-		self.opts = self.opts.with_vlog_checksum_verification(level);
-		self
-	}
-
-	/// Enables or disables VLog.
-	pub fn with_enable_vlog(mut self, enable: bool) -> Self {
-		self.opts = self.opts.with_enable_vlog(enable);
-		self
-	}
-
-	/// Sets the VLog value threshold in bytes.
-	///
-	/// Values smaller than this threshold are stored inline in SSTables.
-	/// Values larger than or equal to this threshold are stored in VLog files.
-	///
-	/// Default: 4096 (4KB)
-	///
-	/// # Example
-	///
-	/// ```no_run
-	/// use surrealkv::TreeBuilder;
-	///
-	/// let tree = TreeBuilder::new()
-	///     .with_path("./data".into())
-	///     .with_enable_vlog(true)
-	///     .with_vlog_value_threshold(8192) // 8KB threshold
-	///     .build()
-	///     .unwrap();
-	/// ```
-	pub fn with_vlog_value_threshold(mut self, value: usize) -> Self {
-		self.opts = self.opts.with_vlog_value_threshold(value);
-		self
-	}
-
 	/// Enables or disables versioned queries with timestamp tracking
 	pub fn with_versioning(mut self, enable: bool, retention_ns: u64) -> Self {
 		self.opts = self.opts.with_versioning(enable, retention_ns);
-		self
-	}
-
-	/// Enables or disables the B+tree versioned index for timestamp-based queries.
-	/// When disabled, versioned queries will scan the LSM tree directly.
-	/// Requires `with_versioning` to be called first with `enable = true`.
-	pub fn with_versioned_index(mut self, enable: bool) -> Self {
-		self.opts = self.opts.with_versioned_index(enable);
 		self
 	}
 
@@ -1911,26 +1642,23 @@ impl TreeBuilder {
 		self
 	}
 
-	/// Builds the LSM tree with the configured options.
-	///
-	/// This method ensures type safety by using the same key type K
-	/// for both the builder and the resulting tree.
-	pub fn build(self) -> Result<Tree> {
-		Tree::new(Arc::new(self.opts))
+	/// Builds the store with the configured options.
+	pub fn build(self) -> Result<Store> {
+		Store::new(Arc::new(self.opts))
 	}
 
-	/// Builds the LSM tree and returns both the tree and the options.
+	/// Builds the store and returns both the store and the options.
 	///
 	/// This is useful when you need to keep a reference to the options
-	/// after creating the tree.
-	pub fn build_with_options(self) -> Result<(Tree, Arc<Options>)> {
+	/// after creating the store.
+	pub fn build_with_options(self) -> Result<(Store, Arc<Options>)> {
 		let opts = Arc::new(self.opts);
-		let tree = Tree::new(Arc::clone(&opts))?;
-		Ok((tree, opts))
+		let store = Store::new(Arc::clone(&opts))?;
+		Ok((store, opts))
 	}
 }
 
-impl Default for TreeBuilder {
+impl Default for StoreBuilder {
 	fn default() -> Self {
 		Self::new()
 	}
@@ -1982,155 +1710,9 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 		))
 	})?;
 
-	// Sync VLog directories
-	if opts.enable_vlog {
-		fsync_directory(opts.vlog_dir()).map_err(|e| {
-			Error::Other(format!(
-				"Failed to sync VLog directory '{}': {}",
-				opts.vlog_dir().display(),
-				e
-			))
-		})?;
-	}
-
-	if opts.enable_versioning {
-		fsync_directory(opts.versioned_index_dir()).map_err(|e| {
-			Error::Other(format!(
-				"Failed to sync versioned index directory '{}': {}",
-				opts.versioned_index_dir().display(),
-				e
-			))
-		})?;
-	}
-
 	fsync_directory(&opts.path).map_err(|e| {
 		Error::Other(format!("Failed to sync base directory '{}': {}", opts.path.display(), e))
 	})?;
 
 	Ok(())
-}
-
-// ===== VLog and Versioned Index Cleanup Helpers =====
-
-/// Cleans up stale versioned_index entries that reference deleted VLog files.
-///
-/// After VLog GC deletes files, the versioned_index (B+ tree) may contain
-/// entries with ValuePointers referencing those deleted files. This function
-/// removes those stale entries.
-///
-/// # Algorithm:
-/// 1. Phase 1: Acquire READ lock, iterate all entries, collect stale keys
-/// 2. Release READ lock
-/// 3. Phase 2: For each batch of keys, acquire WRITE lock, delete, release
-///
-/// This design allows concurrent read/write operations between batches.
-///
-/// # Arguments
-/// * `versioned_index` - The versioned B+ tree index
-/// * `min_valid_file_id` - VLog files with file_id < this are considered deleted
-///
-/// # Returns
-/// The number of stale entries deleted
-pub(crate) fn cleanup_stale_versioned_index(
-	versioned_index: &Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
-	min_valid_file_id: u32,
-) -> Result<usize> {
-	let versioned_index = match versioned_index {
-		Some(idx) => idx,
-		None => return Ok(0),
-	};
-
-	// Phase 1: Read lock - collect stale keys
-	let keys_to_delete: Vec<Vec<u8>> = {
-		let guard = versioned_index.read();
-		let mut stale_keys = Vec::new();
-
-		// Use range(..) to iterate all entries (RangeFull implements RangeBounds<T>)
-		let empty: &[u8] = &[];
-		let iter = guard.range(empty..)?;
-
-		for entry in iter {
-			let (key, value) = entry?;
-			// Check if this entry has a VLog pointer to a deleted file
-			if let Ok(loc) = ValueLocation::decode(&value) {
-				if loc.is_value_pointer() {
-					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
-						if ptr.file_id < min_valid_file_id {
-							stale_keys.push(key.to_vec());
-						}
-					}
-				}
-			}
-		}
-		stale_keys
-	}; // Read lock released here
-
-	if keys_to_delete.is_empty() {
-		return Ok(0);
-	}
-
-	log::debug!(
-		"Cleaning up {} stale versioned_index entries for VLog files < {}",
-		keys_to_delete.len(),
-		min_valid_file_id
-	);
-
-	// Phase 2: Write lock per batch - delete
-	let mut deleted_count = 0;
-	const BATCH_SIZE: usize = 100;
-
-	for batch in keys_to_delete.chunks(BATCH_SIZE) {
-		let mut guard = versioned_index.write();
-		for key in batch {
-			// No re-verification needed:
-			// - Keys are never updated (unique InternalKey)
-			// - If deleted by concurrent Replace, delete() returns None (harmless)
-			if guard.delete(key)?.is_some() {
-				deleted_count += 1;
-			}
-		}
-		// Write lock released here, allowing other operations between batches
-	}
-
-	Ok(deleted_count)
-}
-
-/// Cleans up obsolete VLog files and stale versioned_index entries.
-///
-/// This is the consolidated cleanup function that should be called after
-/// compaction, flush, or during startup recovery. It:
-/// 1. Removes VLog files that are no longer referenced by any SST
-/// 2. Removes versioned_index entries pointing to deleted VLog files
-///
-/// # Arguments
-/// * `vlog` - The VLog instance (if value separation is enabled)
-/// * `versioned_index` - The versioned B+ tree index (if versioned reads are enabled)
-/// * `min_oldest_vlog` - Minimum oldest_vlog_file_id across all live SSTs
-/// * `context` - Description of the calling context (e.g., "flush", "compaction", "startup")
-pub(crate) fn cleanup_vlog_and_index(
-	vlog: &Option<Arc<VLog>>,
-	versioned_index: &Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
-	min_oldest_vlog: u32,
-	context: &str,
-) {
-	// Skip cleanup if no SSTs reference VLog files yet (fresh database case)
-	if min_oldest_vlog == 0 {
-		return;
-	}
-
-	// Clean stale versioned_index entries FIRST — remove references to
-	// soon-to-be-deleted vlog files before actually deleting them, so
-	// no history query can hit a dangling vlog pointer.
-	if let Err(e) = cleanup_stale_versioned_index(versioned_index, min_oldest_vlog) {
-		log::warn!("Failed to cleanup stale versioned_index entries during {}: {}", context, e);
-		// Don't propagate error - cleanup failures shouldn't fail the primary operation
-	}
-
-	// THEN delete obsolete VLog files (safe: no live bplustree references remain)
-	if let Some(ref vlog) = vlog {
-		if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
-			log::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);
-			// Don't propagate error - cleanup failures shouldn't fail the primary operation
-		}
-	}
 }

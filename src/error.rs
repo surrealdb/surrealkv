@@ -149,12 +149,6 @@ impl From<crate::wal::Error> for Error {
 	}
 }
 
-impl From<crate::bplustree::tree::BPlusTreeError> for Error {
-	fn from(err: crate::bplustree::tree::BPlusTreeError) -> Self {
-		Error::BPlusTree(err.to_string())
-	}
-}
-
 impl From<crate::sstable::error::SSTableError> for Error {
 	fn from(err: crate::sstable::error::SSTableError) -> Self {
 		Error::SSTable(err)

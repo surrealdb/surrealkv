@@ -135,7 +135,7 @@ mod tests {
 
 	use super::*;
 	use crate::error::Error;
-	use crate::lsm::TreeBuilder;
+	use crate::lsm::StoreBuilder;
 
 	#[test]
 	fn test_lock_acquisition_and_release() {
@@ -235,13 +235,13 @@ mod tests {
 		let temp_path = temp_dir.path().to_path_buf();
 
 		// First instance should succeed
-		let tree1 = TreeBuilder::new()
+		let tree1 = StoreBuilder::new()
 			.with_path(temp_path.clone())
 			.build()
 			.expect("First tree should be created successfully");
 
 		// Second instance should fail with lock error
-		let result = TreeBuilder::new().with_path(temp_path.clone()).build();
+		let result = StoreBuilder::new().with_path(temp_path.clone()).build();
 
 		assert!(result.is_err(), "Second tree should fail to acquire lock");
 		if let Err(Error::Other(msg)) = result {
@@ -253,7 +253,7 @@ mod tests {
 		// After closing the first tree, we should be able to open again
 		tree1.close().await.unwrap();
 
-		let tree2 = TreeBuilder::new()
+		let tree2 = StoreBuilder::new()
 			.with_path(temp_path)
 			.build()
 			.expect("After closing first tree, second should succeed");
@@ -281,7 +281,7 @@ mod tests {
 				thread_barrier.wait();
 
 				// Try to open the database
-				let result = TreeBuilder::new().with_path(path).build();
+				let result = StoreBuilder::new().with_path(path).build();
 
 				(i, result)
 			});
@@ -327,7 +327,7 @@ mod tests {
 
 	// 			// Try to open the database (with VLog disabled to avoid async issues)
 	// 			let result =
-	// TreeBuilder::new().with_path(path).with_enable_vlog(false).build();
+	// StoreBuilder::new().with_path(path).with_enable_vlog(false).build();
 
 	// 			(i, result)
 	// 		});

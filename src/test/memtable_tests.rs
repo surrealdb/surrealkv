@@ -19,8 +19,8 @@ fn memtable_get() {
 	let key = b"foo".to_vec();
 	let value = b"value".to_vec();
 
-	let mut batch = Batch::new(1);
-	batch.set(key, value.clone(), 0).unwrap();
+	let mut batch = Batch::new();
+	batch.set(key, value.clone()).unwrap();
 
 	memtable.add(&batch).unwrap();
 
@@ -34,8 +34,8 @@ fn memtable_size() {
 	let key = b"foo".to_vec();
 	let value = b"value".to_vec();
 
-	let mut batch = Batch::new(1);
-	batch.set(key, value, 0).unwrap();
+	let mut batch = Batch::new();
+	batch.set(key, value).unwrap();
 
 	memtable.add(&batch).unwrap();
 
@@ -49,8 +49,8 @@ fn memtable_lsn() {
 	let value = b"value".to_vec();
 	let seq_num = 100;
 
-	let mut batch = Batch::new(seq_num);
-	batch.set(key, value, 0).unwrap();
+	let mut batch = Batch::new();
+	batch.set(key, value).unwrap();
 
 	memtable.add(&batch).unwrap();
 
@@ -63,16 +63,16 @@ fn memtable_add_and_get() {
 	let key1 = b"key1".to_vec();
 	let value1 = b"value1".to_vec();
 
-	let mut batch1 = Batch::new(1);
-	batch1.set(key1, value1.clone(), 0).unwrap();
+	let mut batch1 = Batch::new();
+	batch1.set(key1, value1.clone()).unwrap();
 
 	memtable.add(&batch1).unwrap();
 
 	let key2 = b"key2".to_vec();
 	let value2 = b"value2".to_vec();
 
-	let mut batch2 = Batch::new(2);
-	batch2.set(key2, value2.clone(), 0).unwrap();
+	let mut batch2 = Batch::new();
+	batch2.set(key2, value2.clone()).unwrap();
 
 	memtable.add(&batch2).unwrap();
 
@@ -91,16 +91,16 @@ fn memtable_get_latest_seq_no() {
 	let value2 = b"value2".to_vec();
 	let value3 = b"value3".to_vec();
 
-	let mut batch1 = Batch::new(1);
-	batch1.set(key1.clone(), value1, 0).unwrap();
+	let mut batch1 = Batch::new();
+	batch1.set(key1.clone(), value1).unwrap();
 	memtable.add(&batch1).unwrap();
 
-	let mut batch2 = Batch::new(2);
-	batch2.set(key1.clone(), value2, 0).unwrap();
+	let mut batch2 = Batch::new();
+	batch2.set(key1.clone(), value2).unwrap();
 	memtable.add(&batch2).unwrap();
 
-	let mut batch3 = Batch::new(3);
-	batch3.set(key1, value3.clone(), 0).unwrap();
+	let mut batch3 = Batch::new();
+	batch3.set(key1, value3.clone()).unwrap();
 	memtable.add(&batch3).unwrap();
 
 	let res = memtable.get(b"key1", None).unwrap();
@@ -116,12 +116,12 @@ fn memtable_prefix() {
 	let key2 = b"foo1".to_vec();
 	let value2 = b"value2".to_vec();
 
-	let mut batch1 = Batch::new(0);
-	batch1.set(key1, value1.clone(), 0).unwrap();
+	let mut batch1 = Batch::new();
+	batch1.set(key1, value1.clone()).unwrap();
 	memtable.add(&batch1).unwrap();
 
-	let mut batch2 = Batch::new(1);
-	batch2.set(key2, value2.clone(), 0).unwrap();
+	let mut batch2 = Batch::new();
+	batch2.set(key2, value2.clone()).unwrap();
 	memtable.add(&batch2).unwrap();
 
 	let res = memtable.get(b"foo", None).unwrap();
@@ -149,13 +149,13 @@ fn create_test_memtable(entries: Vec<TestEntry>) -> (Arc<MemTable>, u64) {
 
 		// Create a single-entry batch for each record to ensure exact sequence number
 		// assignment
-		let mut batch = Batch::new(seq_num);
+		let mut batch = Batch::new();
 		match kind {
 			InternalKeyKind::Set => {
-				batch.set(key.clone(), value.clone(), 0).unwrap();
+				batch.set(key.clone(), value.clone()).unwrap();
 			}
 			InternalKeyKind::Delete => {
-				batch.delete(key.clone(), 0).unwrap();
+				batch.delete(key.clone()).unwrap();
 			}
 			_ => {
 				// For other kinds, use add_record directly
@@ -655,17 +655,17 @@ fn test_memtable_size_tracking() {
 	let memtable = Arc::new(MemTable::default());
 
 	// Add some data
-	let mut batch = Batch::new(1);
-	batch.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
-	batch.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+	let mut batch = Batch::new();
+	batch.set(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+	batch.set(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 
 	memtable.add(&batch).unwrap();
 	let size1 = memtable.size();
 	assert!(size1 > 0);
 
 	// Add more data
-	let mut batch2 = Batch::new(2);
-	batch2.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
+	let mut batch2 = Batch::new();
+	batch2.set(b"key3".to_vec(), b"value3".to_vec()).unwrap();
 
 	memtable.add(&batch2).unwrap();
 	let size2 = memtable.size();
@@ -680,20 +680,20 @@ fn test_latest_sequence_number() {
 	assert_eq!(memtable.lsn(), 0);
 
 	// Add batch with seq_num 10
-	let mut batch1 = Batch::new(10);
-	batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
+	let mut batch1 = Batch::new();
+	batch1.set(b"key1".to_vec(), b"value1".to_vec()).unwrap();
 	memtable.add(&batch1).unwrap();
 	assert_eq!(memtable.lsn(), 10);
 
 	// Add batch with lower seq_num - should not update
-	let mut batch2 = Batch::new(5);
-	batch2.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
+	let mut batch2 = Batch::new();
+	batch2.set(b"key2".to_vec(), b"value2".to_vec()).unwrap();
 	memtable.add(&batch2).unwrap();
 	assert_eq!(memtable.lsn(), 10); // Should still be 10
 
 	// Add batch with higher seq_num
-	let mut batch3 = Batch::new(20);
-	batch3.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
+	let mut batch3 = Batch::new();
+	batch3.set(b"key3".to_vec(), b"value3".to_vec()).unwrap();
 	memtable.add(&batch3).unwrap();
 	assert_eq!(memtable.lsn(), 20);
 }
@@ -701,12 +701,12 @@ fn test_latest_sequence_number() {
 #[test]
 fn test_get_highest_seq_num() {
 	// Add a batch with 5 entries
-	let mut batch = Batch::new(10);
-	batch.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap();
-	batch.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap();
-	batch.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap();
-	batch.set(b"key4".to_vec(), b"value4".to_vec(), 0).unwrap();
-	batch.set(b"key5".to_vec(), b"value5".to_vec(), 0).unwrap();
+	let mut batch = Batch::new();
+	batch.set(b"key1".to_vec(), b"value1".to_vec()).unwrap();
+	batch.set(b"key2".to_vec(), b"value2".to_vec()).unwrap();
+	batch.set(b"key3".to_vec(), b"value3".to_vec()).unwrap();
+	batch.set(b"key4".to_vec(), b"value4".to_vec()).unwrap();
+	batch.set(b"key5".to_vec(), b"value5".to_vec()).unwrap();
 
 	assert_eq!(batch.get_highest_seq_num(), 14);
 }

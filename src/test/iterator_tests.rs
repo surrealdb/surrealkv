@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use tempfile::TempDir;
 use test_log::test;
 
 use crate::clock::{LogicalClock, MockLogicalClock};
@@ -9,8 +8,7 @@ use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::iter::{BoxedLSMIterator, CompactionIterator, MergingIterator};
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
-use crate::vlog::{VLog, ValueLocation};
-use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, VLogChecksumLevel, Value};
+use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Value};
 
 /// Global counter for generating unique table IDs in tests
 static TEST_TABLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -28,22 +26,8 @@ fn create_internal_key_with_timestamp(
 	InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, timestamp)
 }
 
-fn create_test_vlog() -> (Arc<VLog>, TempDir) {
-	let temp_dir = TempDir::new().unwrap();
-	let opts = Options {
-		vlog_checksum_verification: VLogChecksumLevel::Full,
-		path: temp_dir.path().to_path_buf(),
-		..Default::default()
-	};
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-
-	let vlog = Arc::new(VLog::new(Arc::new(opts)).unwrap());
-	(vlog, temp_dir)
-}
-
-fn create_vlog_value(vlog: &Arc<VLog>, key: &[u8], value: &[u8]) -> Value {
-	let pointer = vlog.append(key, value).unwrap();
-	ValueLocation::with_pointer(pointer).encode()
+fn create_test_value(value: &[u8]) -> Value {
+	value.to_vec()
 }
 
 fn create_comparator() -> Arc<InternalKeyComparator> {
@@ -295,17 +279,15 @@ fn test_compaction_iterator_hard_delete_filtering() {
 
 #[test(tokio::test)]
 async fn test_combined_iterator_returns_latest_version() {
-	let (vlog, _temp_dir) = create_test_vlog();
-
 	// Create multiple versions of the same key with different sequence numbers
 	let user_key = "key1";
 	let key_v1 = create_internal_key(user_key, 100, InternalKeyKind::Set);
 	let key_v2 = create_internal_key(user_key, 200, InternalKeyKind::Set);
 	let key_v3 = create_internal_key(user_key, 300, InternalKeyKind::Set);
 
-	let value_v1 = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
-	let value_v2 = create_vlog_value(&vlog, user_key.as_bytes(), b"value2");
-	let value_v3 = create_vlog_value(&vlog, user_key.as_bytes(), b"value3");
+	let value_v1 = create_test_value(b"value1");
+	let value_v2 = create_test_value(b"value2");
+	let value_v3 = create_test_value(b"value3");
 
 	// Put them in different iterators to test different levels
 	let items1 = vec![(key_v1, value_v1)]; // L0 - oldest
@@ -344,16 +326,14 @@ async fn test_combined_iterator_returns_latest_version() {
 
 #[test(tokio::test)]
 async fn test_combined_iterator_adds_older_versions_to_delete_list() {
-	let (vlog, _temp_dir) = create_test_vlog();
-
 	let user_key = "key1";
 	let key_v1 = create_internal_key(user_key, 100, InternalKeyKind::Set);
 	let key_v2 = create_internal_key(user_key, 200, InternalKeyKind::Set);
 	let key_v3 = create_internal_key(user_key, 300, InternalKeyKind::Set);
 
-	let value_v1 = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
-	let value_v2 = create_vlog_value(&vlog, user_key.as_bytes(), b"value2");
-	let value_v3 = create_vlog_value(&vlog, user_key.as_bytes(), b"value3");
+	let value_v1 = create_test_value(b"value1");
+	let value_v2 = create_test_value(b"value2");
+	let value_v3 = create_test_value(b"value3");
 
 	let items1 = vec![(key_v1, value_v1)];
 	let items2 = vec![(key_v2, value_v2)];
@@ -388,14 +368,12 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 
 #[test(tokio::test)]
 async fn test_hard_delete_at_bottom_level() {
-	let (vlog, _temp_dir) = create_test_vlog();
-
 	let user_key = "key1";
 	let hard_delete_key = create_internal_key(user_key, 200, InternalKeyKind::Delete);
 	let value_key = create_internal_key(user_key, 100, InternalKeyKind::Set);
 
 	let empty_value: Vec<u8> = Vec::new();
-	let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+	let actual_value = create_test_value(b"value1");
 
 	let items1 = vec![(hard_delete_key, empty_value)];
 	let items2 = vec![(value_key, actual_value)];
@@ -420,14 +398,12 @@ async fn test_hard_delete_at_bottom_level() {
 
 #[test(tokio::test)]
 async fn test_hard_delete_at_non_bottom_level() {
-	let (vlog, _temp_dir) = create_test_vlog();
-
 	let user_key = "key1";
 	let hard_delete_key = create_internal_key(user_key, 200, InternalKeyKind::Delete);
 	let value_key = create_internal_key(user_key, 100, InternalKeyKind::Set);
 
 	let empty_value: Vec<u8> = Vec::new();
-	let actual_value = create_vlog_value(&vlog, user_key.as_bytes(), b"value1");
+	let actual_value = create_test_value(b"value1");
 
 	let items1 = vec![(hard_delete_key, empty_value)];
 	let items2 = vec![(value_key, actual_value)];
@@ -459,23 +435,21 @@ async fn test_hard_delete_at_non_bottom_level() {
 
 #[test(tokio::test)]
 async fn test_multiple_keys_with_mixed_scenarios() {
-	let (vlog, _temp_dir) = create_test_vlog();
-
 	// Key1: Multiple versions (latest is value)
 	let key1_v1 = create_internal_key("key1", 100, InternalKeyKind::Set);
 	let key1_v2 = create_internal_key("key1", 200, InternalKeyKind::Set);
-	let key1_val1 = create_vlog_value(&vlog, b"key1", b"value1_old");
-	let key1_val2 = create_vlog_value(&vlog, b"key1", b"value1_new");
+	let key1_val1 = create_test_value(b"value1_old");
+	let key1_val2 = create_test_value(b"value1_new");
 
 	// Key2: Multiple versions (latest is hard_delete)
 	let key2_v1 = create_internal_key("key2", 110, InternalKeyKind::Set);
 	let key2_v2 = create_internal_key("key2", 210, InternalKeyKind::Delete);
-	let key2_val1 = create_vlog_value(&vlog, b"key2", b"value2");
+	let key2_val1 = create_test_value(b"value2");
 	let key2_val2: Vec<u8> = Vec::new();
 
 	// Key3: Single version (value)
 	let key3_v1 = create_internal_key("key3", 150, InternalKeyKind::Set);
-	let key3_val1 = create_vlog_value(&vlog, b"key3", b"value3");
+	let key3_val1 = create_test_value(b"value3");
 
 	// Distribute across multiple iterators
 	let items1 = vec![(key1_v2, key1_val2.clone()), (key2_v2, key2_val2)];
@@ -523,8 +497,8 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 }
 
 #[test]
-fn test_no_vlog_no_delete_list() {
-	// Test CompactionIterator without VLog - should work but not track delete list
+fn test_no_delete_list() {
+	// Test CompactionIterator without delete list tracking
 
 	let user_key = "key1";
 	let key_v1 = create_internal_key(user_key, 100, InternalKeyKind::Set);
@@ -566,32 +540,30 @@ fn test_no_vlog_no_delete_list() {
 
 #[test(tokio::test)]
 async fn test_sequence_ordering_across_iterators() {
-	let (vlog, _temp_dir) = create_test_vlog();
-
 	// Create entries across multiple iterators with overlapping keys
 	// and verify they are merged in correct order
 
 	// Iterator 1 (L0): Latest versions
 	let key_a_v3 = create_internal_key("key_a", 300, InternalKeyKind::Set);
 	let key_c_v3 = create_internal_key("key_c", 350, InternalKeyKind::Delete);
-	let val_a_v3 = create_vlog_value(&vlog, b"key_a", b"value_a_latest");
+	let val_a_v3 = create_test_value(b"value_a_latest");
 	let val_c_v3: Vec<u8> = Vec::new();
 
 	// Iterator 2 (L1): Middle versions
 	let key_a_v2 = create_internal_key("key_a", 200, InternalKeyKind::Set);
 	let key_b_v2 = create_internal_key("key_b", 250, InternalKeyKind::Set);
 	let key_c_v2 = create_internal_key("key_c", 220, InternalKeyKind::Set);
-	let val_a_v2 = create_vlog_value(&vlog, b"key_a", b"value_a_middle");
-	let val_b_v2 = create_vlog_value(&vlog, b"key_b", b"value_b");
-	let val_c_v2 = create_vlog_value(&vlog, b"key_c", b"value_c_middle");
+	let val_a_v2 = create_test_value(b"value_a_middle");
+	let val_b_v2 = create_test_value(b"value_b");
+	let val_c_v2 = create_test_value(b"value_c_middle");
 
 	// Iterator 3 (L2): Oldest versions
 	let key_a_v1 = create_internal_key("key_a", 100, InternalKeyKind::Set);
 	let key_c_v1 = create_internal_key("key_c", 120, InternalKeyKind::Set);
 	let key_d_v1 = create_internal_key("key_d", 150, InternalKeyKind::Set);
-	let val_a_v1 = create_vlog_value(&vlog, b"key_a", b"value_a_oldest");
-	let val_c_v1 = create_vlog_value(&vlog, b"key_c", b"value_c_oldest");
-	let val_d_v1 = create_vlog_value(&vlog, b"key_d", b"value_d");
+	let val_a_v1 = create_test_value(b"value_a_oldest");
+	let val_c_v1 = create_test_value(b"value_c_oldest");
+	let val_d_v1 = create_test_value(b"value_d");
 
 	let items1 = vec![(key_a_v3, val_a_v3.clone()), (key_c_v3, val_c_v3)];
 	let items2 = vec![(key_a_v2, val_a_v2), (key_b_v2, val_b_v2.clone()), (key_c_v2, val_c_v2)];
@@ -641,8 +613,7 @@ async fn test_sequence_ordering_across_iterators() {
 
 #[test(tokio::test)]
 async fn test_compaction_iterator_versioning_retention_logic() {
-	// Create test VLog
-	let (vlog, _temp_dir) = create_test_vlog();
+	// Create test values
 
 	// Use fixed current time for consistent testing
 	let current_time = 1000000000000; // Fixed current time
@@ -680,13 +651,13 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 	let key3_recent_set =
 		create_internal_key_with_timestamp("key3", 900, InternalKeyKind::Set, recent_time);
 
-	let val1_recent = create_vlog_value(&vlog, b"key1", b"value1_recent");
-	let val1_old = create_vlog_value(&vlog, b"key1", b"value1_old");
-	let val2_old = create_vlog_value(&vlog, b"key2", b"value2_old");
-	let val2_recent = create_vlog_value(&vlog, b"key2", b"value2_recent");
-	let val3_very_old1 = create_vlog_value(&vlog, b"key3", b"value3_very_old1");
-	let val3_very_old2 = create_vlog_value(&vlog, b"key3", b"value3_very_old2");
-	let val3_recent = create_vlog_value(&vlog, b"key3", b"value3_recent");
+	let val1_recent = create_test_value(b"value1_recent");
+	let val1_old = create_test_value(b"value1_old");
+	let val2_old = create_test_value(b"value2_old");
+	let val2_recent = create_test_value(b"value2_recent");
+	let val3_very_old1 = create_test_value(b"value3_very_old1");
+	let val3_very_old2 = create_test_value(b"value3_very_old2");
+	let val3_recent = create_test_value(b"value3_recent");
 
 	// Create items for testing
 	let items1 = vec![
@@ -763,8 +734,7 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 
 #[test(tokio::test)]
 async fn test_compaction_iterator_versioning_retention_bottom_level() {
-	// Create test VLog
-	let (vlog, _temp_dir) = create_test_vlog();
+	// Create test values
 
 	// Use fixed current time for consistent testing
 	let current_time = 1000000000000; // Fixed current time
@@ -807,12 +777,12 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 	let key4_very_old_delete =
 		create_internal_key_with_timestamp("key4", 900, InternalKeyKind::Delete, very_old_time);
 
-	let val1_recent = create_vlog_value(&vlog, b"key1", b"value1_recent");
-	let val1_old = create_vlog_value(&vlog, b"key1", b"value1_old");
-	let val3_very_old1 = create_vlog_value(&vlog, b"key3", b"value3_very_old1");
-	let val3_very_old2 = create_vlog_value(&vlog, b"key3", b"value3_very_old2");
-	let val3_recent = create_vlog_value(&vlog, b"key3", b"value3_recent");
-	let val4_old = create_vlog_value(&vlog, b"key4", b"value4_old");
+	let val1_recent = create_test_value(b"value1_recent");
+	let val1_old = create_test_value(b"value1_old");
+	let val3_very_old1 = create_test_value(b"value3_very_old1");
+	let val3_very_old2 = create_test_value(b"value3_very_old2");
+	let val3_recent = create_test_value(b"value3_recent");
+	let val4_old = create_test_value(b"value4_old");
 
 	// Create items for testing
 	let items1 = vec![
@@ -892,8 +862,7 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 
 #[test(tokio::test)]
 async fn test_compaction_iterator_no_versioning_non_bottom_level() {
-	// Create test VLog
-	let (vlog, _temp_dir) = create_test_vlog();
+	// Create test values
 
 	// Use fixed current time for consistent testing
 	let current_time = 1000000000000; // Fixed current time
@@ -927,11 +896,11 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 	let key3_delete =
 		create_internal_key_with_timestamp("key3", 700, InternalKeyKind::Delete, recent_time);
 
-	let val1_very_old = create_vlog_value(&vlog, b"key1", b"value1_very_old");
-	let val1_old = create_vlog_value(&vlog, b"key1", b"value1_old");
-	let val1_recent = create_vlog_value(&vlog, b"key1", b"value1_recent");
-	let val2_old = create_vlog_value(&vlog, b"key2", b"value2_old");
-	let val2_recent = create_vlog_value(&vlog, b"key2", b"value2_recent");
+	let val1_very_old = create_test_value(b"value1_very_old");
+	let val1_old = create_test_value(b"value1_old");
+	let val1_recent = create_test_value(b"value1_recent");
+	let val2_old = create_test_value(b"value2_old");
+	let val2_recent = create_test_value(b"value2_recent");
 
 	// Create items for testing
 	let items1 = vec![
@@ -997,8 +966,7 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 
 #[test(tokio::test)]
 async fn test_compaction_iterator_no_versioning_bottom_level() {
-	// Create test VLog
-	let (vlog, _temp_dir) = create_test_vlog();
+	// Create test values
 
 	// Use fixed current time for consistent testing
 	let current_time = 1000000000000; // Fixed current time
@@ -1032,11 +1000,11 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 	let key3_delete =
 		create_internal_key_with_timestamp("key3", 700, InternalKeyKind::Delete, recent_time);
 
-	let val1_very_old = create_vlog_value(&vlog, b"key1", b"value1_very_old");
-	let val1_old = create_vlog_value(&vlog, b"key1", b"value1_old");
-	let val1_recent = create_vlog_value(&vlog, b"key1", b"value1_recent");
-	let val2_old = create_vlog_value(&vlog, b"key2", b"value2_old");
-	let val2_recent = create_vlog_value(&vlog, b"key2", b"value2_recent");
+	let val1_very_old = create_test_value(b"value1_very_old");
+	let val1_old = create_test_value(b"value1_old");
+	let val1_recent = create_test_value(b"value1_recent");
+	let val2_old = create_test_value(b"value2_old");
+	let val2_recent = create_test_value(b"value2_recent");
 
 	// Create items for testing
 	let items1 = vec![
@@ -1099,7 +1067,6 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 
 #[test(tokio::test)]
 async fn test_compaction_iterator_set_with_delete_behavior() {
-	let (vlog, _tmp_dir) = create_test_vlog();
 	let clock = Arc::new(MockLogicalClock::new());
 
 	// Create test data with Replace operations
@@ -1108,16 +1075,16 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 
 	// Table 1: Regular SET operations (higher seq first for same user key)
 	let key2 = create_internal_key("test_key", 200, InternalKeyKind::Set);
-	let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
+	let value2 = create_test_value(b"value2");
 	items1.push((key2, value2));
 
 	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
-	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+	let value1 = create_test_value(b"value1");
 	items1.push((key1, value1));
 
 	// Table 2: Replace operation (newer sequence number)
 	let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
-	let value3 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
+	let value3 = create_test_value(b"set_with_delete_value");
 	items2.push((key3, value3));
 
 	// Create iterators
@@ -1149,7 +1116,6 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 
 #[test(tokio::test)]
 async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
-	let (vlog, _tmp_dir) = create_test_vlog();
 	let clock = Arc::new(MockLogicalClock::new());
 
 	// Create test data with multiple versions and Replace
@@ -1158,25 +1124,25 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 
 	// Table 1: Multiple regular SET operations (higher seq first for same user key)
 	let key3 = create_internal_key("test_key", 250, InternalKeyKind::Set);
-	let value3 = create_vlog_value(&vlog, b"test_key", b"value3");
+	let value3 = create_test_value(b"value3");
 	items1.push((key3, value3));
 
 	let key2 = create_internal_key("test_key", 200, InternalKeyKind::Set);
-	let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
+	let value2 = create_test_value(b"value2");
 	items1.push((key2, value2));
 
 	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
-	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+	let value1 = create_test_value(b"value1");
 	items1.push((key1, value1));
 
 	// Table 2: Replace operation (not the latest) and Regular SET after Replace (latest)
 	// Higher seq first for same user key
 	let key5 = create_internal_key("test_key", 400, InternalKeyKind::Set);
-	let value5 = create_vlog_value(&vlog, b"test_key", b"final_value");
+	let value5 = create_test_value(b"final_value");
 	items2.push((key5, value5));
 
 	let key4 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
-	let value4 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
+	let value4 = create_test_value(b"set_with_delete_value");
 	items2.push((key4, value4));
 
 	// Create iterators
@@ -1208,7 +1174,6 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 
 #[test(tokio::test)]
 async fn test_compaction_iterator_set_with_delete_latest_version() {
-	let (vlog, _tmp_dir) = create_test_vlog();
 	let clock = Arc::new(MockLogicalClock::new());
 
 	// Create test data where Replace is the latest version
@@ -1217,16 +1182,16 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 
 	// Table 1: Regular SET operations (higher seq first for same user key)
 	let key2 = create_internal_key("test_key", 200, InternalKeyKind::Set);
-	let value2 = create_vlog_value(&vlog, b"test_key", b"value2");
+	let value2 = create_test_value(b"value2");
 	items1.push((key2, value2));
 
 	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
-	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+	let value1 = create_test_value(b"value1");
 	items1.push((key1, value1));
 
 	// Table 2: Replace as the latest version
 	let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
-	let value3 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_final");
+	let value3 = create_test_value(b"set_with_delete_final");
 	items2.push((key3, value3));
 
 	// Create iterators
@@ -1258,7 +1223,6 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 
 #[test(tokio::test)]
 async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
-	let (vlog, _tmp_dir) = create_test_vlog();
 	let clock = Arc::new(MockLogicalClock::new());
 
 	// Create test data with Replace and hard delete operations
@@ -1271,12 +1235,12 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 	items1.push((key2, value2));
 
 	let key1 = create_internal_key("test_key", 100, InternalKeyKind::Set);
-	let value1 = create_vlog_value(&vlog, b"test_key", b"value1");
+	let value1 = create_test_value(b"value1");
 	items1.push((key1, value1));
 
 	// Table 2: Replace operation
 	let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
-	let value3 = create_vlog_value(&vlog, b"test_key", b"set_with_delete_value");
+	let value3 = create_test_value(b"set_with_delete_value");
 	items2.push((key3, value3));
 
 	// Create iterators
@@ -1308,7 +1272,6 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 
 #[test(tokio::test)]
 async fn test_compaction_iterator_multiple_replace_operations() {
-	let (vlog, _tmp_dir) = create_test_vlog();
 	let clock = Arc::new(MockLogicalClock::new());
 
 	// Test case 1: Multiple Replace operations for the same key
@@ -1319,16 +1282,16 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Multiple Replace operations (higher seq first for same user key)
 		let key2 = create_internal_key("test_key", 200, InternalKeyKind::Replace);
-		let value2 = create_vlog_value(&vlog, b"test_key", b"replace_value2");
+		let value2 = create_test_value(b"replace_value2");
 		items1.push((key2, value2));
 
 		let key1 = create_internal_key("test_key", 100, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key", b"replace_value1");
+		let value1 = create_test_value(b"replace_value1");
 		items1.push((key1, value1));
 
 		// Table 2: Another Replace operation (latest)
 		let key3 = create_internal_key("test_key", 300, InternalKeyKind::Replace);
-		let value3 = create_vlog_value(&vlog, b"test_key", b"replace_value3");
+		let value3 = create_test_value(b"replace_value3");
 		items2.push((key3, value3));
 
 		// Create iterators
@@ -1366,16 +1329,16 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Multiple Replace operations (higher seq first for same user key)
 		let key2 = create_internal_key("test_key2", 500, InternalKeyKind::Replace);
-		let value2 = create_vlog_value(&vlog, b"test_key2", b"replace_value5");
+		let value2 = create_test_value(b"replace_value5");
 		items1.push((key2, value2));
 
 		let key1 = create_internal_key("test_key2", 400, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key2", b"replace_value4");
+		let value1 = create_test_value(b"replace_value4");
 		items1.push((key1, value1));
 
 		// Table 2: Another Replace operation (latest)
 		let key3 = create_internal_key("test_key2", 600, InternalKeyKind::Replace);
-		let value3 = create_vlog_value(&vlog, b"test_key2", b"replace_value6");
+		let value3 = create_test_value(b"replace_value6");
 		items2.push((key3, value3));
 
 		// Create iterators
@@ -1413,20 +1376,20 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Multiple regular SET operations (higher seq first for same user key)
 		let key3 = create_internal_key("test_key3", 850, InternalKeyKind::Set);
-		let value3 = create_vlog_value(&vlog, b"test_key3", b"set_value3");
+		let value3 = create_test_value(b"set_value3");
 		items1.push((key3, value3));
 
 		let key2 = create_internal_key("test_key3", 800, InternalKeyKind::Set);
-		let value2 = create_vlog_value(&vlog, b"test_key3", b"set_value2");
+		let value2 = create_test_value(b"set_value2");
 		items1.push((key2, value2));
 
 		let key1 = create_internal_key("test_key3", 700, InternalKeyKind::Set);
-		let value1 = create_vlog_value(&vlog, b"test_key3", b"set_value1");
+		let value1 = create_test_value(b"set_value1");
 		items1.push((key1, value1));
 
 		// Table 2: Replace operation (latest)
 		let key4 = create_internal_key("test_key3", 900, InternalKeyKind::Replace);
-		let value4 = create_vlog_value(&vlog, b"test_key3", b"replace_value7");
+		let value4 = create_test_value(b"replace_value7");
 		items2.push((key4, value4));
 
 		// Create iterators
@@ -1464,20 +1427,20 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Replace operations for different keys
 		let key1 = create_internal_key("key_a", 1000, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"key_a", b"replace_a1");
+		let value1 = create_test_value(b"replace_a1");
 		items1.push((key1, value1));
 
 		let key2 = create_internal_key("key_b", 1100, InternalKeyKind::Replace);
-		let value2 = create_vlog_value(&vlog, b"key_b", b"replace_b1");
+		let value2 = create_test_value(b"replace_b1");
 		items1.push((key2, value2));
 
 		// Table 2: Newer Replace operations for the same keys
 		let key3 = create_internal_key("key_a", 1200, InternalKeyKind::Replace);
-		let value3 = create_vlog_value(&vlog, b"key_a", b"replace_a2");
+		let value3 = create_test_value(b"replace_a2");
 		items2.push((key3, value3));
 
 		let key4 = create_internal_key("key_b", 1300, InternalKeyKind::Replace);
-		let value4 = create_vlog_value(&vlog, b"key_b", b"replace_b2");
+		let value4 = create_test_value(b"replace_b2");
 		items2.push((key4, value4));
 
 		// Create iterators
@@ -1528,21 +1491,21 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Multiple regular SET operations (higher seq first for same user key)
 		let key2 = create_internal_key("test_key4", 1500, InternalKeyKind::Set);
-		let value2 = create_vlog_value(&vlog, b"test_key4", b"set_value2");
+		let value2 = create_test_value(b"set_value2");
 		items1.push((key2, value2));
 
 		let key1 = create_internal_key("test_key4", 1400, InternalKeyKind::Set);
-		let value1 = create_vlog_value(&vlog, b"test_key4", b"set_value1");
+		let value1 = create_test_value(b"set_value1");
 		items1.push((key1, value1));
 
 		// Table 2: Replace operation
 		let key3 = create_internal_key("test_key4", 1600, InternalKeyKind::Replace);
-		let value3 = create_vlog_value(&vlog, b"test_key4", b"replace_value");
+		let value3 = create_test_value(b"replace_value");
 		items2.push((key3, value3));
 
 		// Table 3: Final SET operation (latest)
 		let key4 = create_internal_key("test_key4", 1700, InternalKeyKind::Set);
-		let value4 = create_vlog_value(&vlog, b"test_key4", b"final_set_value");
+		let value4 = create_test_value(b"final_set_value");
 		items3.push((key4, value4));
 
 		// Create iterators
@@ -1582,7 +1545,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Replace operation
 		let key1 = create_internal_key("test_key5", 1800, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key5", b"replace_value");
+		let value1 = create_test_value(b"replace_value");
 		items1.push((key1, value1));
 
 		// Table 2: Delete operation (latest)
@@ -1626,7 +1589,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Replace operation
 		let key1 = create_internal_key("test_key6", 2000, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key6", b"replace_value");
+		let value1 = create_test_value(b"replace_value");
 		items1.push((key1, value1));
 
 		// Table 2: Delete operation (latest)
@@ -1667,16 +1630,16 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Multiple Replace operations (higher seq first for same user key)
 		let key2 = create_internal_key("test_key7", 2300, InternalKeyKind::Replace);
-		let value2 = create_vlog_value(&vlog, b"test_key7", b"replace_value2");
+		let value2 = create_test_value(b"replace_value2");
 		items1.push((key2, value2));
 
 		let key1 = create_internal_key("test_key7", 2200, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key7", b"replace_value1");
+		let value1 = create_test_value(b"replace_value1");
 		items1.push((key1, value1));
 
 		// Table 2: Another Replace operation
 		let key3 = create_internal_key("test_key7", 2400, InternalKeyKind::Replace);
-		let value3 = create_vlog_value(&vlog, b"test_key7", b"replace_value3");
+		let value3 = create_test_value(b"replace_value3");
 		items2.push((key3, value3));
 
 		// Table 3: Delete operation (latest)
@@ -1721,16 +1684,16 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Multiple Replace operations (higher seq first for same user key)
 		let key2 = create_internal_key("test_key8", 2700, InternalKeyKind::Replace);
-		let value2 = create_vlog_value(&vlog, b"test_key8", b"replace_value2");
+		let value2 = create_test_value(b"replace_value2");
 		items1.push((key2, value2));
 
 		let key1 = create_internal_key("test_key8", 2600, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key8", b"replace_value1");
+		let value1 = create_test_value(b"replace_value1");
 		items1.push((key1, value1));
 
 		// Table 2: Another Replace operation (latest)
 		let key3 = create_internal_key("test_key8", 2800, InternalKeyKind::Replace);
-		let value3 = create_vlog_value(&vlog, b"test_key8", b"replace_value3");
+		let value3 = create_test_value(b"replace_value3");
 		items2.push((key3, value3));
 
 		// Create iterators
@@ -1769,17 +1732,17 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: SET operation
 		let key1 = create_internal_key("test_key9", 2900, InternalKeyKind::Set);
-		let value1 = create_vlog_value(&vlog, b"test_key9", b"set_value1");
+		let value1 = create_test_value(b"set_value1");
 		items1.push((key1, value1));
 
 		// Table 2: Replace operation
 		let key2 = create_internal_key("test_key9", 3000, InternalKeyKind::Replace);
-		let value2 = create_vlog_value(&vlog, b"test_key9", b"replace_value");
+		let value2 = create_test_value(b"replace_value");
 		items2.push((key2, value2));
 
 		// Table 3: Final SET operation (latest)
 		let key3 = create_internal_key("test_key9", 3100, InternalKeyKind::Set);
-		let value3 = create_vlog_value(&vlog, b"test_key9", b"final_set_value");
+		let value3 = create_test_value(b"final_set_value");
 		items3.push((key3, value3));
 
 		// Create iterators
@@ -1819,7 +1782,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Replace operation
 		let key1 = create_internal_key("test_key10", 3200, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key10", b"replace_value");
+		let value1 = create_test_value(b"replace_value");
 		items1.push((key1, value1));
 
 		// Table 2: Delete operation (latest)
@@ -1863,7 +1826,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Table 1: Replace operation
 		let key1 = create_internal_key("test_key11", 3400, InternalKeyKind::Replace);
-		let value1 = create_vlog_value(&vlog, b"test_key11", b"replace_value");
+		let value1 = create_test_value(b"replace_value");
 		items1.push((key1, value1));
 
 		// Table 2: Delete operation (latest)
