@@ -389,38 +389,6 @@ impl Transaction {
 		Ok(())
 	}
 
-	/// Inserts a key-value pair, removing all previous versions, with custom
-	/// write options.
-	#[deprecated(
-		since = "0.20.1",
-		note = "Use `replace` instead because setting the timestamp should not done on replace"
-	)]
-	pub fn replace_with_options<K, V>(
-		&mut self,
-		key: K,
-		value: V,
-		options: &WriteOptions,
-	) -> Result<()>
-	where
-		K: IntoBytes,
-		V: IntoBytes,
-	{
-		let write_seqno = self.next_write_seqno();
-		let ts = options.timestamp.unwrap_or(Entry::COMMIT_TIME);
-
-		let entry = Entry::new(
-			key,
-			Some(value),
-			InternalKeyKind::Replace,
-			self.savepoints,
-			write_seqno,
-			ts,
-		);
-
-		self.write(entry)?;
-		Ok(())
-	}
-
 	/// Gets a value for a key if it exists.
 	pub fn get<K>(&self, key: K) -> Result<Option<Value>>
 	where
