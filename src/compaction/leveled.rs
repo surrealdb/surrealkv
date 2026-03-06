@@ -56,6 +56,15 @@ impl Strategy {
 		}
 	}
 
+	/// Create a Strategy that only compacts from a specific source level.
+	/// Used by the beat/bar scheduler to target individual levels per half-bar.
+	pub(crate) fn with_target_level(opts: Arc<Options>, source_level: u8) -> TargetedStrategy {
+		TargetedStrategy {
+			source_level,
+			inner: Self::from_options(opts),
+		}
+	}
+
 	/// Create a Strategy from Options with a specific compaction priority
 	#[cfg(test)]
 	pub(crate) fn from_options_with_priority(
@@ -444,6 +453,82 @@ impl CompactionStrategy for Strategy {
 
 		if tables_to_merge.is_empty() {
 			return Ok(CompactionChoice::Skip);
+		}
+
+		Ok(CompactionChoice::Merge(CompactionInput {
+			tables_to_merge,
+			source_level,
+			target_level,
+		}))
+	}
+}
+
+/// A strategy that only compacts from a specific source level.
+/// Used by the beat/bar scheduler to target individual levels per half-bar,
+/// mirroring TigerBeetle's per-level compaction in `forest.zig`.
+pub(crate) struct TargetedStrategy {
+	source_level: u8,
+	inner: Strategy,
+}
+
+impl CompactionStrategy for TargetedStrategy {
+	fn pick_levels(&self, manifest: &LevelManifest) -> Result<CompactionChoice> {
+		let levels = manifest.levels.get_levels();
+		let source_level = self.source_level;
+
+		if source_level as usize >= levels.len() {
+			return Ok(CompactionChoice::Skip);
+		}
+
+		// Check if this level needs compaction
+		let needs_compaction = if source_level == 0 {
+			// L0: trigger based on file count
+			levels[0].tables.len() >= self.inner.level0_file_num_trigger
+		} else {
+			// L1+: trigger based on size ratio
+			let bytes = Strategy::level_bytes(&levels[source_level as usize]);
+			let target = self.inner.target_bytes_for_level(source_level);
+			target > 0 && bytes as f64 / target as f64 >= 1.0
+		};
+
+		if !needs_compaction {
+			return Ok(CompactionChoice::Skip);
+		}
+
+		// Allow same-level compaction at the bottom level for tombstone cleanup
+		let target_level = if source_level >= manifest.last_level_index() {
+			source_level
+		} else {
+			source_level + 1
+		};
+
+		let tables_to_merge = self.inner.select_tables_for_compaction(
+			&levels[source_level as usize],
+			&levels[target_level as usize],
+			source_level,
+		)?;
+
+		if tables_to_merge.is_empty() {
+			return Ok(CompactionChoice::Skip);
+		}
+
+		// Check for move-table optimization (TigerBeetle: zero overlap → just move metadata).
+		// For L1+ with a single selected source table, if all tables_to_merge are from the
+		// source level only (no target-level overlap), we can just move the table metadata.
+		if source_level > 0 && source_level != target_level {
+			let best_table =
+				self.inner.select_best_table_for_compaction(&levels[source_level as usize]);
+			if let Some(table_id) = best_table {
+				// If the only table in tables_to_merge is the source table itself,
+				// it means there's no overlap in the target level
+				if tables_to_merge.len() == 1 && tables_to_merge[0] == table_id {
+					return Ok(CompactionChoice::Move(CompactionInput {
+						tables_to_merge: vec![table_id],
+						source_level,
+						target_level,
+					}));
+				}
+			}
 		}
 
 		Ok(CompactionChoice::Merge(CompactionInput {

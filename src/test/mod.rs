@@ -40,8 +40,6 @@ pub mod snapshot_tests;
 #[cfg(test)]
 pub mod sstable_tests;
 #[cfg(test)]
-pub mod stall_tests;
-#[cfg(test)]
 pub mod transaction_tests;
 #[cfg(test)]
 pub mod version_iterator_tests;

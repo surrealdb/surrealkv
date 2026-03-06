@@ -38,9 +38,6 @@ pub enum Error {
 	TransactionReadOnly,
 	TransactionWithoutSavepoint,
 	KeyNotFound,
-	WriteStall {
-		reason: WriteStallReason,
-	},
 	ArenaFull, // Memtable arena is full, need rotation
 	FileDescriptorNotFound,
 	TableIDCollision(u64),
@@ -95,7 +92,6 @@ impl fmt::Display for Error {
             Self::TransactionReadOnly => write!(f, "Transaction is read-only"),
             Self::TransactionWithoutSavepoint => write!(f, "Transaction has no savepoint to rollback to"),
             Self::KeyNotFound => write!(f, "Key not found"),
-            Self::WriteStall { reason } => write!(f, "Write stall: {:?}", reason),
             Self::ArenaFull => write!(f, "Memtable arena is full"),
             Self::FileDescriptorNotFound => write!(f, "File descriptor not found"),
 			Self::TableIDCollision(id) => write!(f, "CRITICAL ERROR: Table ID collision detected. New table ID {id} conflicts with a table ID in the merge list."),
@@ -184,15 +180,6 @@ pub enum BackgroundErrorReason {
 	MemtablaFlush,
 	Compaction,
 	ManifestWrite,
-}
-
-/// Reason for write stall - used for logging and metrics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum WriteStallReason {
-	/// Too many immutable memtables queued for flush
-	MemtableLimit,
-	/// Too many L0 files awaiting compaction
-	L0FileLimit,
 }
 
 /// Represents a background error with its severity and context

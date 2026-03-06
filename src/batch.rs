@@ -95,6 +95,10 @@ impl Batch {
 		)
 	}
 
+	pub fn delete_at(&mut self, key: impl AsRef<[u8]>, timestamp: u64) -> Result<()> {
+		self.add_record(InternalKeyKind::Delete, key.as_ref().to_vec(), None, timestamp)
+	}
+
 	/// Returns the number of entries in the batch.
 	pub fn len(&self) -> usize {
 		self.entries.len()

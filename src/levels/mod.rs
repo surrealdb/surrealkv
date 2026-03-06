@@ -553,6 +553,44 @@ impl LevelManifest {
 	pub(crate) fn next_table_id(&self) -> u64 {
 		self.next_table_id.fetch_add(1, std::sync::atomic::Ordering::Release)
 	}
+
+	/// Move a table from source level to target level without merge.
+	/// This is the move-table optimization from TigerBeetle (zero overlap case).
+	/// The table metadata is simply relocated between levels.
+	pub(crate) fn move_table(
+		&mut self,
+		source_level: u8,
+		target_level: u8,
+		table_id: u64,
+	) -> crate::Result<()> {
+		let levels = self.levels.get_levels_mut();
+
+		// Find and remove the table from source level
+		let source = levels.get_mut(source_level as usize).ok_or_else(|| {
+			crate::error::Error::Other(format!("Invalid source level: {}", source_level))
+		})?;
+		let source_mut = Arc::make_mut(source);
+		let table = source_mut
+			.tables
+			.iter()
+			.find(|t| t.id == table_id)
+			.cloned()
+			.ok_or(crate::error::Error::TableNotFound(table_id))?;
+		source_mut.remove(table_id);
+
+		// Insert into target level
+		let target = levels.get_mut(target_level as usize).ok_or_else(|| {
+			crate::error::Error::Other(format!("Invalid target level: {}", target_level))
+		})?;
+		let target_mut = Arc::make_mut(target);
+		if target_level == 0 {
+			target_mut.insert(table);
+		} else {
+			target_mut.insert_sorted_by_key(table);
+		}
+
+		Ok(())
+	}
 }
 
 /// Safely updates a file's content.

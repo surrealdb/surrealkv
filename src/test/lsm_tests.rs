@@ -6,7 +6,7 @@ use test_log::test;
 
 use crate::compaction::leveled::Strategy;
 use crate::levels::{validate_wal_log_number, LevelManifest};
-use crate::lsm::{CompactionOperations, Core, CoreInner};
+use crate::lsm::{Core, CoreInner};
 use crate::test::collect_transaction_all;
 use crate::wal::list_segment_ids;
 use crate::{

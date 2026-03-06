@@ -6,7 +6,6 @@ use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
-use crate::lsm::CoreInner;
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
@@ -58,18 +57,6 @@ pub(crate) struct CompactionOptions {
 	pub(crate) snapshot_tracker: SnapshotTracker,
 }
 
-impl CompactionOptions {
-	pub(crate) fn from(tree: &CoreInner) -> Self {
-		Self {
-			lopts: Arc::clone(&tree.opts),
-			level_manifest: Arc::clone(&tree.level_manifest),
-			immutable_memtables: Arc::clone(&tree.immutable_memtables),
-			error_handler: Arc::clone(&tree.error_handler),
-			snapshot_tracker: tree.snapshot_tracker.clone(),
-		}
-	}
-}
-
 /// Handles the compaction state and operations
 pub(crate) struct Compactor {
 	pub(crate) options: CompactionOptions,
@@ -85,11 +72,28 @@ impl Compactor {
 	}
 
 	pub(crate) fn compact(&self) -> Result<()> {
-		let levels_guard = self.options.level_manifest.write()?;
+		let mut levels_guard = self.options.level_manifest.write()?;
 		let choice = self.strategy.pick_levels(&levels_guard)?;
 
 		match choice {
 			CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input),
+			CompactionChoice::Move(input) => {
+				// Move-table optimization: just relocate metadata, no merge needed.
+				// Mirrors TigerBeetle's move_to_level_b operation.
+				assert_eq!(input.tables_to_merge.len(), 1, "Move expects exactly one table");
+				let table_id = input.tables_to_merge[0];
+
+				levels_guard.move_table(input.source_level, input.target_level, table_id)?;
+				write_manifest_to_disk(&levels_guard)?;
+
+				log::debug!(
+					"Move-table: L{} → L{}, table_id={}",
+					input.source_level,
+					input.target_level,
+					table_id
+				);
+				Ok(())
+			}
 			CompactionChoice::Skip => Ok(()),
 		}
 	}

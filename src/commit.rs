@@ -8,7 +8,6 @@ use tokio::sync::{oneshot, Semaphore};
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
-use crate::stall::WriteStallController;
 
 const MAX_CONCURRENT_COMMITS: usize = 8;
 const DEQUEUE_BITS: u32 = 32;
@@ -187,16 +186,10 @@ pub(crate) struct CommitPipeline {
 	// Semaphore for flow control
 	commit_sem: Arc<Semaphore>,
 	shutdown: AtomicBool,
-	// Write stall controller - checked before acquiring write_mutex
-	write_stall: Arc<WriteStallController>,
 }
 
 impl CommitPipeline {
-	pub(crate) fn new(
-		env: Arc<dyn CommitEnv>,
-		visible_seq_num: Arc<AtomicU64>,
-		write_stall: Arc<WriteStallController>,
-	) -> Arc<Self> {
+	pub(crate) fn new(env: Arc<dyn CommitEnv>, visible_seq_num: Arc<AtomicU64>) -> Arc<Self> {
 		Arc::new(Self {
 			env,
 			log_seq_num: AtomicU64::new(1),
@@ -205,7 +198,6 @@ impl CommitPipeline {
 			pending: CommitQueue::new(),
 			commit_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMITS - 1)),
 			shutdown: AtomicBool::new(false),
-			write_stall,
 		})
 	}
 
@@ -227,10 +219,6 @@ impl CommitPipeline {
 		if batch.is_empty() {
 			return Ok(());
 		}
-
-		// Check write stall BEFORE acquiring any locks.
-		// This ensures stalled writers wait here without blocking others.
-		self.write_stall.check().await?;
 
 		// Acquire permit for flow control
 		let _permit = self.commit_sem.acquire().await.map_err(|_| Error::PipelineStall)?;
@@ -393,26 +381,6 @@ mod tests {
 		Arc::new(AtomicU64::new(0))
 	}
 
-	struct MockStallProvider;
-
-	impl crate::stall::WriteStallCountProvider for MockStallProvider {
-		fn get_stall_counts(&self) -> crate::stall::StallCounts {
-			crate::stall::StallCounts {
-				immutable_memtables: 0,
-				l0_files: 0,
-			}
-		}
-	}
-
-	fn test_write_stall() -> Arc<crate::stall::WriteStallController> {
-		let provider: Arc<dyn crate::stall::WriteStallCountProvider> = Arc::new(MockStallProvider);
-		let thresholds = crate::stall::StallThresholds {
-			memtable_limit: 2,
-			l0_file_limit: 12,
-		};
-		Arc::new(crate::stall::WriteStallController::new(provider, thresholds))
-	}
-
 	struct MockEnv;
 
 	impl CommitEnv for MockEnv {
@@ -441,8 +409,7 @@ mod tests {
 
 	#[test(tokio::test)]
 	async fn test_single_commit() {
-		let pipeline =
-			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		let mut batch = Batch::new();
 		batch
@@ -463,8 +430,7 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 	async fn test_sequential_commits() {
-		let pipeline =
-			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		// First test sequential commits to verify basic functionality
 		for i in 0..5 {
@@ -488,8 +454,7 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 	async fn test_concurrent_commits() {
-		let pipeline =
-			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num());
 
 		let mut handles = vec![];
 		for i in 0..10 {
@@ -563,11 +528,7 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_concurrent_commits_with_delays() {
-		let pipeline = CommitPipeline::new(
-			Arc::new(DelayedMockEnv),
-			test_visible_seq_num(),
-			test_write_stall(),
-		);
+		let pipeline = CommitPipeline::new(Arc::new(DelayedMockEnv), test_visible_seq_num());
 
 		let mut handles = vec![];
 		for i in 0..5 {
@@ -646,11 +607,7 @@ mod tests {
 	/// WITH FIX: completes all 20 iterations, returning errors
 	#[test(tokio::test)]
 	async fn test_queue_overflow_all_fail() {
-		let pipeline = CommitPipeline::new(
-			Arc::new(AlwaysFailApplyEnv),
-			test_visible_seq_num(),
-			test_write_stall(),
-		);
+		let pipeline = CommitPipeline::new(Arc::new(AlwaysFailApplyEnv), test_visible_seq_num());
 
 		for i in 0..20 {
 			let mut batch = Batch::new();
@@ -725,7 +682,7 @@ mod tests {
 	async fn test_queue_overflow_partial_fail() {
 		let fail_count = 10; // Fail first 10, then succeed
 		let env = Arc::new(FailNTimesEnv::new(fail_count));
-		let pipeline = CommitPipeline::new(env, test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(env, test_visible_seq_num());
 
 		for i in 0..20 {
 			let mut batch = Batch::new();

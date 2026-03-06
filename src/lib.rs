@@ -14,8 +14,8 @@ mod lsm;
 mod memtable;
 mod snapshot;
 mod sstable;
-mod stall;
-mod task;
+// stall and task modules removed: compaction now runs on the commit path
+// (TigerBeetle beat/bar model) instead of background tasks with write stalling.
 mod vfs;
 mod wal;
 
@@ -187,15 +187,11 @@ pub struct Options {
 	/// Default: 10.0
 	pub level_multiplier: f64,
 
-	/// Number of immutable memtables that triggers write stall.
-	/// When immutable memtable count >= this threshold, writes block until flushes complete.
-	/// Default: 2
-	pub memtable_stall_threshold: usize,
-	/// Number of L0 files that triggers write stall.
-	/// When L0 file count >= this threshold, writes block until compactions complete.
-	/// Should be >= level0_max_files (compaction trigger).
-	/// Default: 12 (3x level0_max_files)
-	pub l0_stall_threshold: usize,
+	/// Number of beats per compaction bar (TigerBeetle default: 32).
+	/// Each commit advances one beat. A bar is one full compaction cycle.
+	/// Levels alternate between half-bars: odd targets in first half, even in second.
+	/// Default: 32
+	pub compaction_beats_per_bar: u64,
 }
 
 impl Default for Options {
@@ -228,8 +224,7 @@ impl Default for Options {
 			level0_max_files: 4,
 			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
 			level_multiplier: 10.0,
-			memtable_stall_threshold: 2,
-			l0_stall_threshold: 12,
+			compaction_beats_per_bar: crate::compaction::DEFAULT_BEATS_PER_BAR,
 		}
 	}
 }
@@ -385,18 +380,6 @@ impl Options {
 		self
 	}
 
-	/// Sets the number of immutable memtables that triggers write stall.
-	pub const fn with_memtable_stall_threshold(mut self, value: usize) -> Self {
-		self.memtable_stall_threshold = value;
-		self
-	}
-
-	/// Sets the number of L0 files that triggers write stall.
-	pub const fn with_l0_stall_threshold(mut self, value: usize) -> Self {
-		self.l0_stall_threshold = value;
-		self
-	}
-
 	/// Returns the path for a manifest file with the given ID
 	/// Format: {path}/manifest/{id:020}.manifest
 	pub(crate) fn manifest_file_path(&self, id: u64) -> PathBuf {
@@ -431,19 +414,6 @@ impl Options {
 		// Validate level count is reasonable
 		if self.level_count == 0 {
 			return Err(Error::InvalidArgument("Level count must be at least 1".to_string()));
-		}
-
-		// Validate write stall configuration
-		if self.memtable_stall_threshold < 2 {
-			return Err(Error::InvalidArgument(
-				"memtable_stall_threshold must be >= 2".to_string(),
-			));
-		}
-		if self.l0_stall_threshold < self.level0_max_files {
-			return Err(Error::InvalidArgument(format!(
-				"l0_stall_threshold ({}) must be >= level0_max_files ({})",
-				self.l0_stall_threshold, self.level0_max_files
-			)));
 		}
 
 		Ok(())
