@@ -3212,3 +3212,63 @@ async fn test_history_bounds_max_byte_values() {
 		store.close().await.unwrap();
 	}
 }
+
+// Test for https://github.com/surrealdb/surrealkv/issues/364
+#[tokio::test(flavor = "current_thread")]
+async fn repro() {
+	let tmp = tempfile::Builder::new().prefix("tc-").tempdir().unwrap();
+
+	let dir = std::path::PathBuf::from(tmp.path());
+
+	let opts = Options::new().with_path(dir).with_versioning(true, 0).with_l0_no_compression();
+
+	let store = TreeBuilder::with_options(opts).build().unwrap();
+
+	let sync_key = b"#@prefix:sync\x00\x00\x00\x00\x00\x00\x00\x02****************";
+	let table_key = b"@prefix:tbentity\x00\x00\x00\x00\x00\x00\x00\x00\x10cccccccccccccccc";
+	let before_key = b"@prefix:tbentity\x00\x00\x00\x00\x00\x00\x00\x00\x10kkkkkkkkkkkkkkkk";
+	let after_key = b"@prefix:tbentity\x00\x00\x00\x00\x00\x00\x00\x00\x10MMMMMMMMMMMMMMMM";
+
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(before_key, b"value", 1).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(sync_key, b"value", 2).unwrap();
+		tx.set_at(table_key, b"value", 2).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	{
+		let mut tx = store.begin().unwrap();
+		tx.set_at(after_key, b"value", 3).unwrap();
+		tx.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+
+	let lower = b"@prefix:\x00";
+	let upper = b"@prefix:\xFF";
+	let opts = HistoryOptions::new().with_tombstones(true).with_ts_range(2, 2);
+	let mut it = tx.history_with_options(lower, upper, &opts).unwrap();
+
+	let mut seen = vec![];
+
+	if it.seek_first().unwrap() {
+		while it.valid() {
+			let key = it.key();
+			let user_key = String::from_utf8_lossy(key.user_key()).to_string();
+			eprintln!("\t{}: {}", key.timestamp(), user_key);
+			seen.push(user_key);
+
+			it.next().unwrap();
+		}
+	}
+
+	// Expected: only the @prefix key should be returned for this range.
+	// Current behavior: this also returns #@prefix:* and reproduces the bug.
+	assert_eq!(seen.len(), 1, "unexpected keys at ts=2 in scope range: {seen:?}");
+}
