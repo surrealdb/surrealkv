@@ -2626,6 +2626,41 @@ mod version_tests {
 	}
 
 	#[test(tokio::test)]
+	async fn test_same_key_multiple_sets_in_single_transaction_deduplicates() {
+		// Reproduces fuzz crash: store_bidir_iter/crash-11d1f55f8f714e5266691bb8bd2f5ff3e17a30c5
+		// When same key is set multiple times in one transaction without explicit timestamps,
+		// only the last value should be stored (deduplication behavior).
+		let (store, _tmp_dir) = create_tree();
+		let key = vec![218u8];
+
+		// Single transaction: set same key twice with different values
+		{
+			let mut txn = store.begin().unwrap();
+			txn.set(&key, &[254u8]).unwrap(); // First set
+			txn.set(&key, &[]).unwrap(); // Second set (should replace first)
+			txn.commit().await.unwrap();
+		}
+
+		// Read back with history iterator
+		let txn = store.begin().unwrap();
+		let mut end_key = key.clone();
+		end_key.push(0);
+
+		// Forward iteration: should see exactly one version
+		let results = scan_all_versions_via_history(&txn, &key, &end_key).unwrap();
+		assert_eq!(results.len(), 1, "Expected exactly one version after deduplication");
+		assert_eq!(results[0].0, key, "Key mismatch");
+		assert_eq!(results[0].1, Vec::<u8>::new(), "Value should be empty (last write)");
+
+		// Backward iteration (the exact scenario from fuzz failure)
+		let mut iter = txn.history(&key, &end_key).unwrap();
+		assert!(iter.prev().unwrap(), "prev() on fresh iterator should find last entry");
+		assert!(iter.valid(), "Iterator should be valid");
+		let value = iter.value().unwrap();
+		assert_eq!(value, Vec::<u8>::new(), "Value via prev() should be empty (last write)");
+	}
+
+	#[test(tokio::test)]
 	async fn test_scan_all_versions_single_key_multiple_versions() {
 		let (store, _tmp_dir) = create_tree();
 		let key = Vec::from("key1");
@@ -3449,4 +3484,259 @@ async fn test_memtable_earliest_seq_tracking() {
 
 	// The transaction's start_seq_num should be 1
 	assert_eq!(txn.start_seq_num, 1, "Transaction start_seq_num should be 1 after commit");
+}
+
+// =============================================================================
+// TransactionRangeIterator Direction-Switching Tests
+// =============================================================================
+// These tests verify the behavior of direction switching (forward <-> backward)
+// in TransactionRangeIterator. The expected behavior is that switching direction
+// should move to the element immediately before/after the current position,
+// NOT reset to the absolute first/last element.
+
+/// Test 1: Forward-to-backward direction switch with empty write-set
+/// When iterating forward to "c" and calling prev(), should return "b", not "e"
+#[test(tokio::test)]
+async fn test_direction_switch_forward_to_backward_empty_writeset() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys ["a", "b", "c", "d", "e"] via committed transaction
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a").unwrap();
+		txn.set(b"b", b"val_b").unwrap();
+		txn.set(b"c", b"val_c").unwrap();
+		txn.set(b"d", b"val_d").unwrap();
+		txn.set(b"e", b"val_e").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Start new read-only transaction (empty write-set)
+	let tx = store.begin().unwrap();
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Forward iterate to "c": seek_first() -> next() -> next()
+	assert!(iter.seek_first().unwrap(), "seek_first should succeed");
+	assert_eq!(iter.key().user_key(), b"a", "Should be at 'a' after seek_first");
+
+	assert!(iter.next().unwrap(), "next to 'b' should succeed");
+	assert_eq!(iter.key().user_key(), b"b", "Should be at 'b' after first next");
+
+	assert!(iter.next().unwrap(), "next to 'c' should succeed");
+	assert_eq!(iter.key().user_key(), b"c", "Should be at 'c' after second next");
+
+	// Call prev() - EXPECTED: should return "b"
+	// CURRENT BUG: returns "e" (calls seek_last() instead of moving backward)
+	assert!(iter.prev().unwrap(), "prev from 'c' should succeed");
+	assert_eq!(iter.key().user_key(), b"b", "After prev() from 'c', should be at 'b', not 'e'");
+
+	// Continue backward to verify correct behavior
+	assert!(iter.prev().unwrap(), "prev from 'b' should succeed");
+	assert_eq!(iter.key().user_key(), b"a", "Should be at 'a'");
+
+	// No more elements backward
+	assert!(!iter.prev().unwrap(), "prev from 'a' should return false (no more elements)");
+}
+
+/// Test 2: Forward-to-backward at end of range
+/// When at last element "e" and calling prev(), should return "d"
+#[test(tokio::test)]
+async fn test_direction_switch_forward_to_backward_at_end() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a").unwrap();
+		txn.set(b"b", b"val_b").unwrap();
+		txn.set(b"c", b"val_c").unwrap();
+		txn.set(b"d", b"val_d").unwrap();
+		txn.set(b"e", b"val_e").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Forward iterate to the last element "e"
+	iter.seek_first().unwrap();
+	while iter.valid() && iter.key().user_key() != b"e" {
+		iter.next().unwrap();
+	}
+	assert_eq!(iter.key().user_key(), b"e", "Should be at 'e'");
+
+	// Call prev() - should return "d", not stay at "e" or behave incorrectly
+	assert!(iter.prev().unwrap(), "prev from 'e' should succeed");
+	assert_eq!(iter.key().user_key(), b"d", "After prev() from 'e', should be at 'd'");
+}
+
+/// Test 3: Backward-to-forward direction switch
+/// When iterating backward to "c" and calling next(), should return "d"
+#[test(tokio::test)]
+async fn test_direction_switch_backward_to_forward() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a").unwrap();
+		txn.set(b"b", b"val_b").unwrap();
+		txn.set(b"c", b"val_c").unwrap();
+		txn.set(b"d", b"val_d").unwrap();
+		txn.set(b"e", b"val_e").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Backward iterate: seek_last() to "e", then prev() -> prev() to reach "c"
+	assert!(iter.seek_last().unwrap(), "seek_last should succeed");
+	assert_eq!(iter.key().user_key(), b"e", "Should be at 'e' after seek_last");
+
+	assert!(iter.prev().unwrap(), "prev to 'd' should succeed");
+	assert_eq!(iter.key().user_key(), b"d", "Should be at 'd'");
+
+	assert!(iter.prev().unwrap(), "prev to 'c' should succeed");
+	assert_eq!(iter.key().user_key(), b"c", "Should be at 'c'");
+
+	// Call next() - EXPECTED: should return "d"
+	// Potential bug: next() might not handle direction switching correctly
+	assert!(iter.next().unwrap(), "next from 'c' should succeed");
+	assert_eq!(
+		iter.key().user_key(),
+		b"d",
+		"After next() from 'c' (backward mode), should be at 'd'"
+	);
+
+	// Continue forward to verify
+	assert!(iter.next().unwrap(), "next to 'e' should succeed");
+	assert_eq!(iter.key().user_key(), b"e", "Should be at 'e'");
+
+	// No more elements forward
+	assert!(!iter.next().unwrap(), "next from 'e' should return false");
+}
+
+/// Test 4: Direction switch with RYOW (non-empty write-set)
+/// Tests the complex case where snapshot was advanced past the logical position due to RYOW
+#[test(tokio::test)]
+async fn test_direction_switch_with_ryow() {
+	let (store, _temp_dir) = create_store();
+
+	// Commit keys ["a", "c", "e"]
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a_committed").unwrap();
+		txn.set(b"c", b"val_c_committed").unwrap();
+		txn.set(b"e", b"val_e_committed").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	// Start write transaction, add key "b" (uncommitted - in write-set)
+	let mut tx = store.begin().unwrap();
+	tx.set(b"b", b"val_b_uncommitted").unwrap();
+
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Forward iterate: a -> b -> c
+	assert!(iter.seek_first().unwrap());
+	assert_eq!(iter.key().user_key(), b"a");
+
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"b", "Should see uncommitted 'b' from write-set");
+
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"c");
+
+	// Now at "c", call prev() - should return "b"
+	assert!(iter.prev().unwrap(), "prev from 'c' should succeed");
+	assert_eq!(
+		iter.key().user_key(),
+		b"b",
+		"After prev() from 'c', should be at 'b' (from write-set)"
+	);
+
+	// Continue backward to "a"
+	assert!(iter.prev().unwrap(), "prev from 'b' should succeed");
+	assert_eq!(iter.key().user_key(), b"a");
+}
+
+/// Test 5: Multiple direction switches
+/// Iterate forward, switch to backward, switch to forward again
+#[test(tokio::test)]
+async fn test_multiple_direction_switches() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a").unwrap();
+		txn.set(b"b", b"val_b").unwrap();
+		txn.set(b"c", b"val_c").unwrap();
+		txn.set(b"d", b"val_d").unwrap();
+		txn.set(b"e", b"val_e").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Forward: a -> b -> c
+	iter.seek_first().unwrap();
+	assert_eq!(iter.key().user_key(), b"a");
+	iter.next().unwrap();
+	assert_eq!(iter.key().user_key(), b"b");
+	iter.next().unwrap();
+	assert_eq!(iter.key().user_key(), b"c");
+
+	// Switch to backward: c -> b
+	assert!(iter.prev().unwrap());
+	assert_eq!(iter.key().user_key(), b"b", "First backward: should be at 'b'");
+
+	// Switch to forward again: b -> c
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"c", "Forward again: should be at 'c'");
+
+	// Continue forward: c -> d -> e
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"d");
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"e");
+
+	// Switch to backward again: e -> d
+	assert!(iter.prev().unwrap());
+	assert_eq!(iter.key().user_key(), b"d", "Second backward: should be at 'd'");
+
+	// And back to forward: d -> e
+	assert!(iter.next().unwrap());
+	assert_eq!(iter.key().user_key(), b"e", "Forward from 'd': should be at 'e'");
+}
+
+/// Test 6: Direction switch after seek (not seek_first/seek_last)
+/// Tests that seek() followed by prev() works correctly
+#[test(tokio::test)]
+async fn test_direction_switch_after_seek() {
+	let (store, _temp_dir) = create_store();
+
+	// Insert keys
+	{
+		let mut txn = store.begin().unwrap();
+		txn.set(b"a", b"val_a").unwrap();
+		txn.set(b"b", b"val_b").unwrap();
+		txn.set(b"c", b"val_c").unwrap();
+		txn.set(b"d", b"val_d").unwrap();
+		txn.set(b"e", b"val_e").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let tx = store.begin().unwrap();
+	let mut iter = tx.range(b"a", b"f").unwrap();
+
+	// Seek directly to "c"
+	assert!(iter.seek(b"c").unwrap(), "seek to 'c' should succeed");
+	assert_eq!(iter.key().user_key(), b"c", "Should be at 'c' after seek");
+
+	// Call prev() - should return "b", not "e"
+	assert!(iter.prev().unwrap(), "prev from 'c' should succeed");
+	assert_eq!(iter.key().user_key(), b"b", "After prev() from seek('c'), should be at 'b'");
 }
