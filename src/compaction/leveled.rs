@@ -464,8 +464,7 @@ impl CompactionStrategy for Strategy {
 }
 
 /// A strategy that only compacts from a specific source level.
-/// Used by the beat/bar scheduler to target individual levels per half-bar,
-/// mirroring TigerBeetle's per-level compaction in `forest.zig`.
+/// Used by the beat/bar scheduler to target individual levels per half-bar
 pub(crate) struct TargetedStrategy {
 	source_level: u8,
 	inner: Strategy,
@@ -512,7 +511,7 @@ impl CompactionStrategy for TargetedStrategy {
 			return Ok(CompactionChoice::Skip);
 		}
 
-		// Check for move-table optimization (TigerBeetle: zero overlap → just move metadata).
+		// Check for move-table optimization.
 		// For L1+ with a single selected source table, if all tables_to_merge are from the
 		// source level only (no target-level overlap), we can just move the table metadata.
 		if source_level > 0 && source_level != target_level {

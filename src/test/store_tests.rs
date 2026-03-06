@@ -708,7 +708,7 @@ async fn test_timestamp_via_batch_set_at() {
 	let value = snap.get_at(b"key1", custom_timestamp).unwrap();
 	assert_eq!(value, Some(Vec::from(b"value1")));
 
-	// Test delete_at with timestamp
+	// Test delete_at with timestamp (uses hard delete)
 	let delete_timestamp = 200;
 	{
 		let mut batch = tree.new_batch();
@@ -716,10 +716,11 @@ async fn test_timestamp_via_batch_set_at() {
 		tree.apply(batch, false).await.unwrap();
 	}
 
-	// Verify the value exists at the earlier timestamp but not at the delete timestamp
+	// With HARD_DELETE barrier semantics, all historical versions become inaccessible
+	// after a hard delete. Both queries should return None.
 	let snap = tree.new_snapshot();
 	let value_before = snap.get_at(b"key1", custom_timestamp).unwrap();
-	assert_eq!(value_before, Some(Vec::from(b"value1")));
+	assert_eq!(value_before, None); // Key was hard-deleted, all versions inaccessible
 
 	let value_after = snap.get_at(b"key1", delete_timestamp).unwrap();
 	assert_eq!(value_after, None);

@@ -98,7 +98,7 @@ pub(crate) struct CoreInner {
 	/// Shared with CommitPipeline for coordinated updates.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
 
-	/// Compaction scheduler driven from the commit path (TigerBeetle beat/bar model).
+	/// Compaction scheduler driven from the commit path
 	/// Protected by Mutex since compact_beat() needs &mut self.
 	pub(crate) compaction_scheduler: Mutex<CompactionScheduler>,
 }
@@ -750,7 +750,7 @@ impl CommitEnv for LsmCommitEnv {
 				// Flush immutable memtables synchronously (commit-path compaction)
 				self.core.flush_all_immutables_sync()?;
 
-				// Run one beat of compaction (TigerBeetle-style commit-path compaction)
+				// Run one beat of compaction
 				{
 					let mut scheduler = self.core.compaction_scheduler.lock()?;
 					scheduler.compact_beat()?;

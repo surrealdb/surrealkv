@@ -555,7 +555,6 @@ impl LevelManifest {
 	}
 
 	/// Move a table from source level to target level without merge.
-	/// This is the move-table optimization from TigerBeetle (zero overlap case).
 	/// The table metadata is simply relocated between levels.
 	pub(crate) fn move_table(
 		&mut self,

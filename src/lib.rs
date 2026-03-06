@@ -14,8 +14,6 @@ mod lsm;
 mod memtable;
 mod snapshot;
 mod sstable;
-// stall and task modules removed: compaction now runs on the commit path
-// (TigerBeetle beat/bar model) instead of background tasks with write stalling.
 mod vfs;
 mod wal;
 
@@ -187,7 +185,7 @@ pub struct Options {
 	/// Default: 10.0
 	pub level_multiplier: f64,
 
-	/// Number of beats per compaction bar (TigerBeetle default: 32).
+	/// Number of beats per compaction bar.
 	/// Each commit advances one beat. A bar is one full compaction cycle.
 	/// Levels alternate between half-bars: odd targets in first half, even in second.
 	/// Default: 32

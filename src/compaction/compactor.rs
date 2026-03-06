@@ -1,26 +1,35 @@
 use std::fs::File as SysFile;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::path::Path;
+#[cfg(test)]
+use std::sync::RwLockWriteGuard;
+use std::sync::{Arc, RwLock};
 
-use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
+use crate::compaction::CompactionInput;
+#[cfg(test)]
+use crate::compaction::{CompactionChoice, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
+#[cfg(test)]
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
-use crate::sstable::table::{Table, TableWriter};
+use crate::sstable::table::Table;
+#[cfg(test)]
+use crate::sstable::table::TableWriter;
 use crate::vfs::File;
-use crate::{Comparator, Options as LSMOptions};
+#[cfg(test)]
+use crate::Comparator;
+use crate::Options as LSMOptions;
 
 /// RAII guard to ensure tables are unhidden if compaction fails
-struct HiddenTablesGuard {
+pub(crate) struct HiddenTablesGuard {
 	level_manifest: Arc<RwLock<LevelManifest>>,
 	table_ids: Vec<u64>,
 	committed: bool,
 }
 
 impl HiddenTablesGuard {
-	fn new(level_manifest: Arc<RwLock<LevelManifest>>, table_ids: &[u64]) -> Self {
+	pub(crate) fn new(level_manifest: Arc<RwLock<LevelManifest>>, table_ids: &[u64]) -> Self {
 		Self {
 			level_manifest,
 			table_ids: table_ids.to_vec(),
@@ -28,7 +37,7 @@ impl HiddenTablesGuard {
 		}
 	}
 
-	fn commit(&mut self) {
+	pub(crate) fn commit(&mut self) {
 		self.committed = true;
 	}
 }
@@ -57,12 +66,95 @@ pub(crate) struct CompactionOptions {
 	pub(crate) snapshot_tracker: SnapshotTracker,
 }
 
-/// Handles the compaction state and operations
+// ============================================================================
+// Shared helpers used by both Compactor (run-to-completion) and LiveCompaction
+// (beat-spread). These are free functions to avoid coupling to either struct.
+// ============================================================================
+
+/// Open a table file and create a Table instance.
+pub(crate) fn open_table(
+	lopts: &Arc<LSMOptions>,
+	table_id: u64,
+	table_path: &Path,
+) -> Result<Arc<Table>> {
+	let file = SysFile::open(table_path)?;
+	let file: Arc<dyn File> = Arc::new(file);
+	let file_size = file.size()?;
+
+	Ok(Arc::new(Table::new(table_id, Arc::clone(lopts), file, file_size)?))
+}
+
+/// Update the manifest with a completed compaction: delete old tables, add new table.
+/// Commits the hidden tables guard on success.
+pub(crate) fn update_manifest(
+	opts: &CompactionOptions,
+	input: &CompactionInput,
+	new_table: Option<Arc<Table>>,
+	guard: &mut HiddenTablesGuard,
+) -> Result<()> {
+	let mut manifest = opts.level_manifest.write()?;
+	let _imm_guard = opts.immutable_memtables.write();
+
+	// Check for table ID collision if adding a new table
+	if let Some(ref table) = new_table {
+		if input.tables_to_merge.contains(&table.id) {
+			return Err(crate::error::Error::TableIDCollision(table.id));
+		}
+	}
+
+	let mut changeset = ManifestChangeSet::default();
+
+	// Delete old tables
+	for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
+		for &table_id in &input.tables_to_merge {
+			if level.tables.iter().any(|t| t.id == table_id) {
+				changeset.deleted_tables.insert((level_idx as u8, table_id));
+			}
+		}
+	}
+
+	// Add new table if present
+	if let Some(table) = new_table {
+		changeset.new_tables.push((input.target_level, table));
+	}
+
+	let rollback = manifest.apply_changeset(&changeset)?;
+
+	// Write manifest to disk - if this fails, revert in-memory state
+	if let Err(e) = write_manifest_to_disk(&manifest) {
+		manifest.revert_changeset(rollback);
+		opts.error_handler.set_error(e.clone(), crate::error::BackgroundErrorReason::ManifestWrite);
+		return Err(e);
+	}
+
+	// Unhide tables before committing guard (they'll be removed from manifest anyway)
+	manifest.unhide_tables(&input.tables_to_merge);
+
+	// Commit guard - tables are now properly handled in manifest
+	guard.commit();
+
+	Ok(())
+}
+
+/// Remove old table files from disk after successful manifest update.
+pub(crate) fn cleanup_old_tables(lopts: &Arc<LSMOptions>, input: &CompactionInput) {
+	for &table_id in &input.tables_to_merge {
+		let path = lopts.sstable_file_path(table_id);
+		if let Err(e) = std::fs::remove_file(path) {
+			log::warn!("Failed to remove old table file: {e}");
+		}
+	}
+}
+
+/// Handles the compaction state and operations (run-to-completion mode).
+/// Used by tests for direct compaction without beat scheduling.
+#[cfg(test)]
 pub(crate) struct Compactor {
 	pub(crate) options: CompactionOptions,
 	pub(crate) strategy: Arc<dyn CompactionStrategy>,
 }
 
+#[cfg(test)]
 impl Compactor {
 	pub(crate) fn new(options: CompactionOptions, strategy: Arc<dyn CompactionStrategy>) -> Self {
 		Self {
@@ -79,7 +171,6 @@ impl Compactor {
 			CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input),
 			CompactionChoice::Move(input) => {
 				// Move-table optimization: just relocate metadata, no merge needed.
-				// Mirrors TigerBeetle's move_to_level_b operation.
 				assert_eq!(input.tables_to_merge.len(), 1, "Move expects exactly one table");
 				let table_id = input.tables_to_merge[0];
 
@@ -127,7 +218,7 @@ impl Compactor {
 
 		// Create new table
 		let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
-		let new_table_path = self.get_table_path(new_table_id);
+		let new_table_path = self.options.lopts.sstable_file_path(new_table_id);
 
 		// Write merged data
 		let table_created =
@@ -141,7 +232,7 @@ impl Compactor {
 
 		// Open table only if one was created
 		let new_table = if table_created {
-			match self.open_table(new_table_id, &new_table_path) {
+			match open_table(&self.options.lopts, new_table_id, &new_table_path) {
 				Ok(table) => Some(table),
 				Err(e) => {
 					// Guard will unhide tables on drop
@@ -153,9 +244,9 @@ impl Compactor {
 		};
 
 		// Update manifest - this will commit the guard on success
-		self.update_manifest(input, new_table, &mut guard)?;
+		update_manifest(&self.options, input, new_table, &mut guard)?;
 
-		self.cleanup_old_tables(input);
+		cleanup_old_tables(&self.options.lopts, input);
 
 		Ok(())
 	}
@@ -206,79 +297,5 @@ impl Compactor {
 
 		writer.finish()?;
 		Ok(true)
-	}
-
-	fn update_manifest(
-		&self,
-		input: &CompactionInput,
-		new_table: Option<Arc<Table>>,
-		guard: &mut HiddenTablesGuard,
-	) -> Result<()> {
-		let mut manifest = self.options.level_manifest.write()?;
-		let _imm_guard = self.options.immutable_memtables.write();
-
-		// Check for table ID collision if adding a new table
-		if let Some(ref table) = new_table {
-			if input.tables_to_merge.contains(&table.id) {
-				return Err(crate::error::Error::TableIDCollision(table.id));
-			}
-		}
-
-		let mut changeset = ManifestChangeSet::default();
-
-		// Delete old tables
-		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
-			for &table_id in &input.tables_to_merge {
-				if level.tables.iter().any(|t| t.id == table_id) {
-					changeset.deleted_tables.insert((level_idx as u8, table_id));
-				}
-			}
-		}
-
-		// Add new table if present
-		if let Some(table) = new_table {
-			changeset.new_tables.push((input.target_level, table));
-		}
-
-		let rollback = manifest.apply_changeset(&changeset)?;
-
-		// Write manifest to disk - if this fails, revert in-memory state
-		if let Err(e) = write_manifest_to_disk(&manifest) {
-			manifest.revert_changeset(rollback);
-			self.options
-				.error_handler
-				.set_error(e.clone(), crate::error::BackgroundErrorReason::ManifestWrite);
-			return Err(e);
-		}
-
-		// Unhide tables before committing guard (they'll be removed from manifest anyway)
-		manifest.unhide_tables(&input.tables_to_merge);
-
-		// Commit guard - tables are now properly handled in manifest
-		guard.commit();
-
-		Ok(())
-	}
-
-	fn get_table_path(&self, table_id: u64) -> PathBuf {
-		self.options.lopts.sstable_file_path(table_id)
-	}
-
-	fn cleanup_old_tables(&self, input: &CompactionInput) {
-		for &table_id in &input.tables_to_merge {
-			let path = self.options.lopts.sstable_file_path(table_id);
-			if let Err(e) = std::fs::remove_file(path) {
-				// Log error but continue with cleanup
-				log::warn!("Failed to remove old table file: {e}");
-			}
-		}
-	}
-
-	fn open_table(&self, table_id: u64, table_path: &Path) -> Result<Arc<Table>> {
-		let file = SysFile::open(table_path)?;
-		let file: Arc<dyn File> = Arc::new(file);
-		let file_size = file.size()?;
-
-		Ok(Arc::new(Table::new(table_id, Arc::clone(&self.options.lopts), file, file_size)?))
 	}
 }

@@ -360,40 +360,28 @@ impl Snapshot {
 
 	/// Queries for a specific key at a specific timestamp.
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num).
+	///
+	/// Note: This uses HistoryIterator which respects HARD_DELETE barriers.
+	/// If a key has been hard-deleted, all historical versions are inaccessible.
 	pub fn get_at(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
 		if !self.core.opts.enable_versioning {
 			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
 		}
 
-		// Use the underlying range query to get all versions of the key
-		// Then filter for the best match at or before the requested timestamp
-		let iter_state = self.collect_iter_state()?;
-
-		// Create a range for just this key
-		let seek_key = InternalKey::new(key.to_vec(), u64::MAX, InternalKeyKind::Set, u64::MAX);
-		let end_key = InternalKey::new(key.to_vec(), 0, InternalKeyKind::Set, 0);
-
-		let range = (std::ops::Bound::Included(seek_key), std::ops::Bound::Included(end_key));
-
-		let mut merge_iter = KMergeIterator::new_from(iter_state, range);
-		merge_iter.seek_first()?;
+		// Use history iterator - respects HARD_DELETE barriers
+		let mut iter = self.history_iter(Some(key), None, true, None, None)?;
+		iter.seek_first()?;
 
 		// Track the best match (latest version at or before requested timestamp)
 		let mut best_value: Option<Value> = None;
 		let mut best_timestamp: u64 = 0;
 
-		while merge_iter.valid() {
-			let entry_key = merge_iter.key();
+		while iter.valid() {
+			let entry_key = iter.key();
 
 			// Stop if we've moved past our key
 			if entry_key.user_key() != key {
 				break;
-			}
-
-			// Only consider versions visible to this snapshot
-			if entry_key.seq_num() > self.seq_num {
-				merge_iter.next()?;
-				continue;
 			}
 
 			let entry_ts = entry_key.timestamp();
@@ -401,15 +389,14 @@ impl Snapshot {
 			// Only consider versions at or before the requested timestamp
 			if entry_ts <= timestamp && entry_ts >= best_timestamp {
 				if entry_key.is_tombstone() {
-					// Key was deleted at this timestamp
 					best_value = None;
 				} else {
-					best_value = Some(merge_iter.value_encoded()?.to_vec());
+					best_value = Some(iter.value_encoded()?.to_vec());
 				}
 				best_timestamp = entry_ts;
 			}
 
-			merge_iter.next()?;
+			iter.next()?;
 		}
 
 		Ok(best_value)

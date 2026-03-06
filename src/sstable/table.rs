@@ -1842,3 +1842,66 @@ impl LSMIterator for TableIterator<'_> {
 		Ok(self.second_level.as_ref().unwrap().value_bytes())
 	}
 }
+
+/// An owned table iterator that holds `Arc<Table>` internally,
+/// allowing it to be stored across beat boundaries without lifetime constraints.
+///
+/// This uses the standard self-referential pattern: the `iter` field borrows from
+/// the `Table` inside `_table`. Field drop order (declaration order) ensures `iter`
+/// is dropped before `_table`.
+pub(crate) struct OwnedTableIter {
+	// SAFETY: `iter` borrows from the Table inside `_table`.
+	// Declared first → dropped first, before the Arc<Table>.
+	iter: TableIterator<'static>,
+	// Arc<Table> keeps the Table data alive for the iterator's lifetime.
+	_table: Arc<Table>,
+}
+
+impl OwnedTableIter {
+	pub(crate) fn new(table: Arc<Table>, range: Option<InternalKeyRange>) -> Result<Self> {
+		let range = range.unwrap_or((std::ops::Bound::Unbounded, std::ops::Bound::Unbounded));
+		let iter = table.iter(Some(range))?;
+		// SAFETY: We own the Arc<Table> in this struct and it will outlive the iterator
+		// because `iter` (declared first) is dropped before `_table` (declared second).
+		// The Arc guarantees the Table data stays alive until the last Arc is dropped.
+		let iter: TableIterator<'static> = unsafe { std::mem::transmute(iter) };
+		Ok(Self {
+			iter,
+			_table: table,
+		})
+	}
+}
+
+impl LSMIterator for OwnedTableIter {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.iter.seek(target)
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		self.iter.seek_first()
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		self.iter.seek_last()
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		self.iter.next()
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		self.iter.prev()
+	}
+
+	fn valid(&self) -> bool {
+		self.iter.valid()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		self.iter.key()
+	}
+
+	fn value_encoded(&self) -> Result<&[u8]> {
+		self.iter.value_encoded()
+	}
+}
