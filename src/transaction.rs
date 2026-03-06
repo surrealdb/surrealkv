@@ -1282,9 +1282,7 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 			self.direction = MergeDirection::Forward;
 			self.is_key_equal = false;
 
-			if !self.snapshot_iter.valid() {
-				self.seek_ws_first();
-			} else if !self.ws_valid() {
+			if !self.snapshot_iter.valid() || !self.ws_valid() {
 				self.seek_ws_first();
 			} else if self.current_source == CurrentSource::Snapshot {
 				self.advance_ws();
@@ -1331,9 +1329,7 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 			self.direction = MergeDirection::Backward;
 			self.is_key_equal = false;
 
-			if !self.snapshot_iter.valid() {
-				self.seek_ws_last();
-			} else if !self.ws_valid() {
+			if !self.snapshot_iter.valid() || !self.ws_valid() {
 				self.seek_ws_last();
 			} else if self.current_source == CurrentSource::Snapshot {
 				self.advance_ws();
@@ -1982,9 +1978,7 @@ impl<'a> TransactionHistoryIterator<'a> {
 			self.direction = MergeDirection::Forward;
 			self.is_key_equal = false;
 
-			if !self.inner.valid() {
-				self.seek_ws_first();
-			} else if !self.ws_valid() {
+			if !self.inner.valid() || !self.ws_valid() {
 				self.seek_ws_first();
 			} else if self.current_source == CurrentSource::Snapshot {
 				self.advance_ws();
@@ -2036,9 +2030,7 @@ impl<'a> TransactionHistoryIterator<'a> {
 			self.direction = MergeDirection::Backward;
 			self.is_key_equal = false;
 
-			if !self.inner.valid() {
-				self.seek_ws_last();
-			} else if !self.ws_valid() {
+			if !self.inner.valid() || !self.ws_valid() {
 				self.seek_ws_last();
 			} else if self.current_source == CurrentSource::Snapshot {
 				self.advance_ws();
