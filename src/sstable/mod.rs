@@ -1,7 +1,7 @@
-pub(crate) mod block;
-pub(crate) mod bloom;
-pub(crate) mod error;
-pub(crate) mod filter_block;
-pub(crate) mod index_block;
-pub(crate) mod meta;
-pub(crate) mod table;
+pub mod block;
+pub mod bloom;
+pub mod error;
+pub mod filter_block;
+pub mod index_block;
+pub mod meta;
+pub mod table;
