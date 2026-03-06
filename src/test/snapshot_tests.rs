@@ -16,30 +16,31 @@ use crate::test::{
 	collect_transaction_all,
 };
 use crate::vfs::File;
-use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Tree, TreeBuilder};
+use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Store, StoreBuilder};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
 }
 
 // Common setup logic for creating a store
-fn create_store() -> (Tree, TempDir) {
+fn create_store() -> (Store, TempDir) {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
-	let tree = TreeBuilder::new().with_path(path).build().unwrap();
-	(tree, temp_dir)
+	let store = StoreBuilder::new().with_path(path).build().unwrap();
+	(store, temp_dir)
 }
 
 #[test(tokio::test)]
 async fn test_empty_snapshot() {
 	let (store, _temp_dir) = create_store();
 
-	// Create a transaction without any data
-	let tx = store.begin().unwrap();
+	// Create a snapshot without any data
+	let snapshot = store.new_snapshot();
 
 	// Range scan should return empty
-	let range = collect_transaction_all(&mut tx.range(b"a", b"z").unwrap()).unwrap();
+	let range =
+		collect_transaction_all(&mut snapshot.range(Some(b"a"), Some(b"z")).unwrap()).unwrap();
 
 	assert!(range.is_empty());
 }
@@ -50,25 +51,26 @@ async fn test_basic_snapshot_visibility() {
 
 	// Insert initial data
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1").unwrap();
-		tx.set(b"key2", b"value2").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	// Start a read transaction (captures snapshot)
-	let read_tx = store.begin().unwrap();
+	// Capture snapshot after initial data
+	let snapshot = store.new_snapshot();
 
-	// Insert more data in a new transaction
+	// Insert more data
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key3", b"value3").unwrap();
-		tx.set(b"key4", b"value4").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key3", b"value3").unwrap();
+		batch.set(b"key4", b"value4").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	// The read transaction should only see the initial data
-	let range = collect_transaction_all(&mut read_tx.range(b"key0", b"key:").unwrap()).unwrap();
+	// The snapshot should only see the initial data
+	let range = collect_transaction_all(&mut snapshot.range(Some(b"key0"), Some(b"key:")).unwrap())
+		.unwrap();
 
 	assert_eq!(range.len(), 2);
 	assert_eq!(range[0].0, b"key1");
@@ -81,33 +83,36 @@ async fn test_snapshot_isolation_with_updates() {
 
 	// Insert initial data
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1_v1").unwrap();
-		tx.set(b"key2", b"value2_v1").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1_v1").unwrap();
+		batch.set(b"key2", b"value2_v1").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	// Start a read transaction
-	let read_tx = store.begin().unwrap();
+	// Capture snapshot before updates
+	let snapshot = store.new_snapshot();
 
-	// Update the data in a new transaction
+	// Update the data
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1_v2").unwrap();
-		tx.set(b"key2", b"value2_v2").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1_v2").unwrap();
+		batch.set(b"key2", b"value2_v2").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	// The read transaction should see the old values
-	let range = collect_transaction_all(&mut read_tx.range(b"key0", b"key:").unwrap()).unwrap();
+	// The old snapshot should see the old values
+	let range = collect_transaction_all(&mut snapshot.range(Some(b"key0"), Some(b"key:")).unwrap())
+		.unwrap();
 
 	assert_eq!(range.len(), 2);
 	assert_eq!(range[0].1, b"value1_v1".to_vec());
 	assert_eq!(range[1].1, b"value2_v1".to_vec());
 
-	// A new transaction should see the updated values
-	let new_tx = store.begin().unwrap();
-	let range = collect_transaction_all(&mut new_tx.range(b"key0", b"key:").unwrap()).unwrap();
+	// A new snapshot should see the updated values
+	let new_snapshot = store.new_snapshot();
+	let range =
+		collect_transaction_all(&mut new_snapshot.range(Some(b"key0"), Some(b"key:")).unwrap())
+			.unwrap();
 
 	assert_eq!(range.len(), 2);
 	assert_eq!(range[0].1, b"value1_v2".to_vec());
@@ -120,34 +125,38 @@ async fn test_tombstone_handling() {
 
 	// Insert initial data
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1").unwrap();
-		tx.set(b"key2", b"value2").unwrap();
-		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		batch.set(b"key3", b"value3").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	// Start a read transaction
-	let read_tx1 = store.begin().unwrap();
+	// Capture snapshot before delete
+	let snapshot1 = store.new_snapshot();
 
 	// Delete key2
 	{
-		let mut tx = store.begin().unwrap();
-		tx.delete(b"key2").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.delete(b"key2").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	// The first read transaction should still see all three keys
-	let range = collect_transaction_all(&mut read_tx1.range(b"key0", b"key:").unwrap()).unwrap();
+	// The first snapshot should still see all three keys
+	let range =
+		collect_transaction_all(&mut snapshot1.range(Some(b"key0"), Some(b"key:")).unwrap())
+			.unwrap();
 
 	assert_eq!(range.len(), 3);
 	assert_eq!(range[0].0, b"key1");
 	assert_eq!(range[1].0, b"key2");
 	assert_eq!(range[2].0, b"key3");
 
-	// A new transaction should not see the deleted key
-	let read_tx2 = store.begin().unwrap();
-	let range = collect_transaction_all(&mut read_tx2.range(b"key0", b"key:").unwrap()).unwrap();
+	// A new snapshot should not see the deleted key
+	let snapshot2 = store.new_snapshot();
+	let range =
+		collect_transaction_all(&mut snapshot2.range(Some(b"key0"), Some(b"key:")).unwrap())
+			.unwrap();
 
 	assert_eq!(range.len(), 2);
 	assert_eq!(range[0].0, b"key1");
@@ -158,39 +167,29 @@ async fn test_tombstone_handling() {
 async fn test_version_resolution() {
 	let (store, _temp_dir) = create_store();
 
-	// Insert multiple versions of the same key
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"version1").unwrap();
-		tx.commit().await.unwrap();
-	}
+	// Insert first version
+	store.set(b"key1", b"version1").await.unwrap();
 
-	let tx1 = store.begin().unwrap();
+	let snapshot1 = store.new_snapshot();
 
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"version2").unwrap();
-		tx.commit().await.unwrap();
-	}
+	// Insert second version
+	store.set(b"key1", b"version2").await.unwrap();
 
-	let tx2 = store.begin().unwrap();
+	let snapshot2 = store.new_snapshot();
 
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"version3").unwrap();
-		tx.commit().await.unwrap();
-	}
+	// Insert third version
+	store.set(b"key1", b"version3").await.unwrap();
 
-	let tx3 = store.begin().unwrap();
+	let snapshot3 = store.new_snapshot();
 
 	// Each snapshot should see its corresponding version
-	let value1 = tx1.get(b"key1").unwrap().unwrap();
+	let value1 = snapshot1.get(b"key1").unwrap().unwrap().0;
 	assert_eq!(value1, b"version1");
 
-	let value2 = tx2.get(b"key1").unwrap().unwrap();
+	let value2 = snapshot2.get(b"key1").unwrap().unwrap().0;
 	assert_eq!(value2, b"version2");
 
-	let value3 = tx3.get(b"key1").unwrap().unwrap();
+	let value3 = snapshot3.get(b"key1").unwrap().unwrap().0;
 	assert_eq!(value3, b"version3");
 }
 
@@ -200,37 +199,39 @@ async fn test_range_with_random_operations() {
 
 	// Initial data
 	{
-		let mut tx = store.begin().unwrap();
+		let mut batch = store.new_batch();
 		for i in 1..=10 {
 			let key = format!("key{i:02}");
 			let value = format!("value{i}");
-			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			batch.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	let tx1 = store.begin().unwrap();
+	let snapshot1 = store.new_snapshot();
 
 	// Update some keys and delete others
 	{
-		let mut tx = store.begin().unwrap();
+		let mut batch = store.new_batch();
 		// Update even keys
 		for i in (2..=10).step_by(2) {
 			let key = format!("key{i:02}");
 			let value = format!("value{i}_updated");
-			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			batch.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
 		// Delete keys 3, 6, 9
-		tx.delete(b"key03").unwrap();
-		tx.delete(b"key06").unwrap();
-		tx.delete(b"key09").unwrap();
-		tx.commit().await.unwrap();
+		batch.delete(b"key03").unwrap();
+		batch.delete(b"key06").unwrap();
+		batch.delete(b"key09").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	let tx2 = store.begin().unwrap();
+	let snapshot2 = store.new_snapshot();
 
-	// tx1 should see all original data
-	let range1 = collect_transaction_all(&mut tx1.range(b"key00", b"key99").unwrap()).unwrap();
+	// snapshot1 should see all original data
+	let range1 =
+		collect_transaction_all(&mut snapshot1.range(Some(b"key00"), Some(b"key99")).unwrap())
+			.unwrap();
 
 	assert_eq!(range1.len(), 10);
 	for (i, (key, value)) in range1.iter().enumerate() {
@@ -240,8 +241,10 @@ async fn test_range_with_random_operations() {
 		assert_eq!(value.as_slice(), expected_value.as_bytes());
 	}
 
-	// tx2 should see updated data with deletions
-	let range2 = collect_transaction_all(&mut tx2.range(b"key00", b"key99").unwrap()).unwrap();
+	// snapshot2 should see updated data with deletions
+	let range2 =
+		collect_transaction_all(&mut snapshot2.range(Some(b"key00"), Some(b"key99")).unwrap())
+			.unwrap();
 
 	assert_eq!(range2.len(), 7); // 10 - 3 deleted
 
@@ -269,30 +272,22 @@ async fn test_concurrent_snapshots() {
 	let (store, _temp_dir) = create_store();
 
 	// Initial state
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"counter", b"0").unwrap();
-		tx.commit().await.unwrap();
-	}
+	store.set(b"counter", b"0").await.unwrap();
 
 	// Create multiple snapshots at different points
 	let mut snapshots = Vec::new();
 
 	for i in 1..=5 {
 		// Take a snapshot
-		snapshots.push(store.begin().unwrap());
+		snapshots.push(store.new_snapshot());
 
 		// Update the counter
-		{
-			let mut tx = store.begin().unwrap();
-			tx.set(b"counter", i.to_string().as_bytes()).unwrap();
-			tx.commit().await.unwrap();
-		}
+		store.set(b"counter", i.to_string().as_bytes()).await.unwrap();
 	}
 
 	// Each snapshot should see its corresponding counter value
 	for (i, snapshot) in snapshots.iter().enumerate() {
-		let value = snapshot.get(b"counter").unwrap().unwrap();
+		let value = snapshot.get(b"counter").unwrap().unwrap().0;
 		let expected = i.to_string();
 		assert_eq!(value, expected.as_bytes());
 	}
@@ -304,34 +299,37 @@ async fn test_snapshot_with_complex_key_patterns() {
 
 	// Insert data with different key patterns
 	{
-		let mut tx = store.begin().unwrap();
+		let mut batch = store.new_batch();
 		// Numeric keys
 		for i in 0..10 {
 			let key = format!("{i:03}");
-			tx.set(key.as_bytes(), b"numeric").unwrap();
+			batch.set(key.as_bytes(), b"numeric").unwrap();
 		}
 		// Alpha keys
 		for c in 'a'..='j' {
-			tx.set(c.to_string().as_bytes(), b"alpha").unwrap();
+			batch.set(c.to_string().as_bytes(), b"alpha").unwrap();
 		}
 		// Mixed keys
 		for i in 0..5 {
 			let key = format!("mix{i}key");
-			tx.set(key.as_bytes(), b"mixed").unwrap();
+			batch.set(key.as_bytes(), b"mixed").unwrap();
 		}
-		tx.commit().await.unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	let tx = store.begin().unwrap();
+	let snapshot = store.new_snapshot();
 
 	// Test different range queries
-	let numeric_range = collect_transaction_all(&mut tx.range(b"000", b"999").unwrap()).unwrap();
+	let numeric_range =
+		collect_transaction_all(&mut snapshot.range(Some(b"000"), Some(b"999")).unwrap()).unwrap();
 	assert_eq!(numeric_range.len(), 10);
 
-	let alpha_range = collect_transaction_all(&mut tx.range(b"a", b"z").unwrap()).unwrap();
+	let alpha_range =
+		collect_transaction_all(&mut snapshot.range(Some(b"a"), Some(b"z")).unwrap()).unwrap();
 	assert_eq!(alpha_range.len(), 15); // 10 numeric + 10 alpha + 5 mixed
 
-	let mixed_range = collect_transaction_all(&mut tx.range(b"mix", b"miy").unwrap()).unwrap();
+	let mixed_range =
+		collect_transaction_all(&mut snapshot.range(Some(b"mix"), Some(b"miy")).unwrap()).unwrap();
 	assert_eq!(mixed_range.len(), 5);
 }
 
@@ -341,19 +339,21 @@ async fn test_snapshot_ordering_invariants() {
 
 	// Insert data in random order
 	{
-		let mut tx = store.begin().unwrap();
+		let mut batch = store.new_batch();
 		let keys =
 			vec!["key05", "key01", "key09", "key03", "key07", "key02", "key08", "key04", "key06"];
 		for key in keys {
-			tx.set(key.as_bytes(), key.as_bytes()).unwrap();
+			batch.set(key.as_bytes(), key.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	let tx = store.begin().unwrap();
+	let snapshot = store.new_snapshot();
 
 	// Range scan should return keys in sorted order
-	let range = collect_transaction_all(&mut tx.range(b"key00", b"key99").unwrap()).unwrap();
+	let range =
+		collect_transaction_all(&mut snapshot.range(Some(b"key00"), Some(b"key99")).unwrap())
+			.unwrap();
 
 	assert_eq!(range.len(), 9);
 
@@ -373,22 +373,22 @@ async fn test_snapshot_keys_only() {
 
 	// Insert test data
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1").unwrap();
-		tx.set(b"key2", b"value2").unwrap();
-		tx.set(b"key3", b"value3").unwrap();
-		tx.set(b"key4", b"value4").unwrap();
-		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		batch.set(b"key3", b"value3").unwrap();
+		batch.set(b"key4", b"value4").unwrap();
+		batch.set(b"key5", b"value5").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	// Create snapshot via transaction
-	let tx = store.begin().unwrap();
-	let tx = tx.snapshot.as_ref().unwrap();
+	// Create snapshot
+	let snapshot = store.new_snapshot();
 
 	// Get keys only ([key1, key6) to include key5)
 	// Note: keys_only parameter no longer exists, using regular range and mapping to keys
-	let mut keys_only_iter = tx.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+	let mut keys_only_iter =
+		snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
 	let keys_only_data = collect_snapshot_iter(&mut keys_only_iter).unwrap();
 	let keys_only: Vec<(Vec<u8>, Option<Vec<u8>>)> =
 		keys_only_data.into_iter().map(|(k, _)| (k.user_key, None)).collect();
@@ -407,7 +407,7 @@ async fn test_snapshot_keys_only() {
 
 	// Compare with regular range scan ([key1, key6) to include key5)
 	let mut regular_range_iter =
-		tx.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+		snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
 	let regular_range_data = collect_snapshot_iter(&mut regular_range_iter).unwrap();
 	let regular_range: Vec<_> =
 		regular_range_data.into_iter().map(|(k, v)| (k.user_key, Some(v))).collect();
@@ -461,7 +461,6 @@ fn test_range_skips_non_overlapping_tables() {
 		active: Arc::new(MemTable::default()),
 		immutable: Vec::new(),
 		levels,
-		versioned_index: None,
 	};
 
 	// Range that only overlaps with table2
@@ -483,21 +482,21 @@ async fn test_double_ended_iteration() {
 
 	// Insert test data
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1").unwrap();
-		tx.set(b"key2", b"value2").unwrap();
-		tx.set(b"key3", b"value3").unwrap();
-		tx.set(b"key4", b"value4").unwrap();
-		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		batch.set(b"key3", b"value3").unwrap();
+		batch.set(b"key4", b"value4").unwrap();
+		batch.set(b"key5", b"value5").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	// Create snapshot via transaction
-	let tx = store.begin().unwrap();
-	let tx = tx.snapshot.as_ref().unwrap();
+	// Create snapshot
+	let snapshot = store.new_snapshot();
 
 	// Test forward iteration ([key1, key6) to include key5)
-	let mut forward_iter = tx.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+	let mut forward_iter =
+		snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
 	let forward_items = collect_snapshot_iter(&mut forward_iter).unwrap();
 
 	assert_eq!(forward_items.len(), 5);
@@ -505,7 +504,8 @@ async fn test_double_ended_iteration() {
 	assert_eq!(&forward_items[4].0.user_key, b"key5");
 
 	// Test backward iteration ([key1, key6) to include key5)
-	let mut backward_iter = tx.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+	let mut backward_iter =
+		snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
 	let backward_items = collect_snapshot_reverse(&mut backward_iter).unwrap();
 
 	assert_eq!(backward_items.len(), 5);
@@ -524,49 +524,47 @@ async fn test_double_ended_iteration_with_tombstones() {
 
 	// Insert initial data
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1").unwrap();
-		tx.set(b"key2", b"value2").unwrap();
-		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		batch.set(b"key3", b"value3").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
 	// Take a snapshot before deletion
-	let tx1 = store.begin().unwrap();
+	let snapshot1 = store.new_snapshot();
 
 	// Delete key2
 	{
-		let mut tx = store.begin().unwrap();
-		tx.delete(b"key2").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.delete(b"key2").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
 	// Take another snapshot after deletion
-	let tx2 = store.begin().unwrap();
+	let snapshot2 = store.new_snapshot();
 
 	// Test forward iteration on first snapshot (should see all keys)
-	let tx1_ref = tx1.snapshot.as_ref().unwrap();
 	let mut forward_iter1 =
-		tx1_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
+		snapshot1.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
 	let forward_items1 = collect_snapshot_iter(&mut forward_iter1).unwrap();
 	assert_eq!(forward_items1.len(), 3);
 
 	// Test backward iteration on first snapshot
 	let mut backward_iter1 =
-		tx1_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
+		snapshot1.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
 	let backward_items1 = collect_snapshot_reverse(&mut backward_iter1).unwrap();
 	assert_eq!(backward_items1.len(), 3);
 
 	// Test forward iteration on second snapshot (should not see deleted key)
-	let tx2_ref = tx2.snapshot.as_ref().unwrap();
 	let mut forward_iter2 =
-		tx2_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
+		snapshot2.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
 	let forward_items2 = collect_snapshot_iter(&mut forward_iter2).unwrap();
 	assert_eq!(forward_items2.len(), 2);
 
 	// Test backward iteration on second snapshot
 	let mut backward_iter2 =
-		tx2_ref.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
+		snapshot2.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
 	let backward_items2 = collect_snapshot_reverse(&mut backward_iter2).unwrap();
 	assert_eq!(backward_items2.len(), 2);
 
@@ -584,18 +582,17 @@ async fn test_snapshot_iterator_direction_switch_forward_to_backward() {
 
 	// Insert 5 keys
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1").unwrap();
-		tx.set(b"key2", b"value2").unwrap();
-		tx.set(b"key3", b"value3").unwrap();
-		tx.set(b"key4", b"value4").unwrap();
-		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		batch.set(b"key3", b"value3").unwrap();
+		batch.set(b"key4", b"value4").unwrap();
+		batch.set(b"key5", b"value5").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	let tx = store.begin().unwrap();
-	let tx_ref = tx.snapshot.as_ref().unwrap();
-	let mut iter = tx_ref.range(Some(b"key1".as_slice()), Some(b"key6".as_slice())).unwrap();
+	let snapshot = store.new_snapshot();
+	let mut iter = snapshot.range(Some(b"key1".as_slice()), Some(b"key6".as_slice())).unwrap();
 
 	// Forward: seek to first, move to second
 	iter.seek_first().unwrap();
@@ -630,18 +627,17 @@ async fn test_snapshot_iterator_direction_switch_backward_to_forward() {
 
 	// Insert 5 keys
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1").unwrap();
-		tx.set(b"key2", b"value2").unwrap();
-		tx.set(b"key3", b"value3").unwrap();
-		tx.set(b"key4", b"value4").unwrap();
-		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		batch.set(b"key3", b"value3").unwrap();
+		batch.set(b"key4", b"value4").unwrap();
+		batch.set(b"key5", b"value5").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	let tx = store.begin().unwrap();
-	let tx_ref = tx.snapshot.as_ref().unwrap();
-	let mut iter = tx_ref.range(Some(b"key1".as_slice()), Some(b"key6".as_slice())).unwrap();
+	let snapshot = store.new_snapshot();
+	let mut iter = snapshot.range(Some(b"key1".as_slice()), Some(b"key6".as_slice())).unwrap();
 
 	// Backward: seek to last, move to previous
 	iter.seek_last().unwrap();
@@ -674,35 +670,35 @@ async fn test_soft_delete_snapshot_individual_get() {
 
 	// Insert initial data
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1").unwrap();
-		tx.set(b"key2", b"value2").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
 	// Take a snapshot before soft delete
-	let tx1 = store.begin().unwrap();
+	let snapshot1 = store.new_snapshot();
 
 	// Soft delete key2
 	{
-		let mut tx = store.begin().unwrap();
-		tx.soft_delete(b"key2").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.soft_delete(b"key2").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
 	// Take another snapshot after soft delete
-	let tx2 = store.begin().unwrap();
+	let snapshot2 = store.new_snapshot();
 
 	// First snapshot should see both keys
 	{
-		assert_eq!(&tx1.get(b"key1").unwrap().unwrap(), b"value1");
-		assert_eq!(&tx1.get(b"key2").unwrap().unwrap(), b"value2");
+		assert_eq!(&snapshot1.get(b"key1").unwrap().unwrap().0, b"value1");
+		assert_eq!(&snapshot1.get(b"key2").unwrap().unwrap().0, b"value2");
 	}
 
 	// Second snapshot should not see the soft deleted key
 	{
-		assert_eq!(&tx2.get(b"key1").unwrap().unwrap(), b"value1");
-		assert!(tx2.get(b"key2").unwrap().is_none());
+		assert_eq!(&snapshot2.get(b"key1").unwrap().unwrap().0, b"value1");
+		assert!(snapshot2.get(b"key2").unwrap().is_none());
 	}
 }
 
@@ -712,31 +708,30 @@ async fn test_soft_delete_snapshot_double_ended_iteration() {
 
 	// Insert initial data
 	{
-		let mut tx = store.begin().unwrap();
+		let mut batch = store.new_batch();
 		for i in 1..=5 {
 			let key = format!("key{i}");
 			let value = format!("value{i}");
-			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			batch.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
 	// Soft delete key2 and key4
 	{
-		let mut tx = store.begin().unwrap();
-		tx.soft_delete(b"key2").unwrap();
-		tx.soft_delete(b"key4").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.soft_delete(b"key2").unwrap();
+		batch.soft_delete(b"key4").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
 	// Take snapshot after soft delete
-	let tx = store.begin().unwrap();
+	let snapshot = store.new_snapshot();
 
 	// Test forward iteration
 	{
-		let snapshot_ref = tx.snapshot.as_ref().unwrap();
 		let mut forward_iter =
-			snapshot_ref.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+			snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
 		let forward_items = collect_snapshot_iter(&mut forward_iter).unwrap();
 
 		assert_eq!(forward_items.len(), 3); // key1, key3, key5
@@ -747,9 +742,8 @@ async fn test_soft_delete_snapshot_double_ended_iteration() {
 
 	// Test backward iteration
 	{
-		let snapshot_ref = tx.snapshot.as_ref().unwrap();
 		let mut backward_iter =
-			snapshot_ref.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
+			snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
 		let backward_items = collect_snapshot_reverse(&mut backward_iter).unwrap();
 
 		assert_eq!(backward_items.len(), 3); // key5, key3, key1
@@ -765,42 +759,40 @@ async fn test_soft_delete_snapshot_mixed_with_hard_delete() {
 
 	// Insert initial data
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1").unwrap();
-		tx.set(b"key2", b"value2").unwrap();
-		tx.set(b"key3", b"value3").unwrap();
-		tx.set(b"key4", b"value4").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		batch.set(b"key3", b"value3").unwrap();
+		batch.set(b"key4", b"value4").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
 	// Take snapshot before any deletes
-	let tx1 = store.begin().unwrap();
+	let snapshot1 = store.new_snapshot();
 
 	// Mix of soft delete and hard delete
 	{
-		let mut tx = store.begin().unwrap();
-		tx.soft_delete(b"key1").unwrap(); // Soft delete
-		tx.delete(b"key2").unwrap(); // Hard delete
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.soft_delete(b"key1").unwrap(); // Soft delete
+		batch.delete(b"key2").unwrap(); // Hard delete
+		store.apply(batch, false).await.unwrap();
 	}
 
 	// Take snapshot after deletes
-	let tx2 = store.begin().unwrap();
+	let snapshot2 = store.new_snapshot();
 
 	// First snapshot should see all keys
 	{
-		let tx1_ref = tx1.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			tx1_ref.range(Some("key1".as_bytes()), Some("key5".as_bytes())).unwrap();
+			snapshot1.range(Some("key1".as_bytes()), Some("key5".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 		assert_eq!(range.len(), 4);
 	}
 
 	// Second snapshot should not see either deleted key
 	{
-		let tx2_ref = tx2.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			tx2_ref.range(Some("key1".as_bytes()), Some("key5".as_bytes())).unwrap();
+			snapshot2.range(Some("key1".as_bytes()), Some("key5".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 		assert_eq!(range.len(), 2); // Only key3 and key4
 		assert_eq!(&range[0].0.user_key, b"key3");
@@ -814,27 +806,26 @@ async fn test_double_ended_iteration_mixed_operations() {
 
 	// Insert initial data
 	{
-		let mut tx = store.begin().unwrap();
+		let mut batch = store.new_batch();
 		for i in 1..=10 {
 			let key = format!("key{i:02}");
 			let value = format!("value{i}");
-			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+			batch.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
 	// Take a snapshot
-	let tx = store.begin().unwrap();
+	let snapshot = store.new_snapshot();
 
 	// Test forward iteration
-	let snapshot_ref = tx.snapshot.as_ref().unwrap();
 	let mut forward_iter =
-		snapshot_ref.range(Some("key01".as_bytes()), Some("key11".as_bytes())).unwrap();
+		snapshot.range(Some("key01".as_bytes()), Some("key11".as_bytes())).unwrap();
 	let forward_items = collect_snapshot_iter(&mut forward_iter).unwrap();
 
 	// Test backward iteration
 	let mut backward_iter =
-		snapshot_ref.range(Some("key01".as_bytes()), Some("key11".as_bytes())).unwrap();
+		snapshot.range(Some("key01".as_bytes()), Some("key11".as_bytes())).unwrap();
 	let backward_items = collect_snapshot_reverse(&mut backward_iter).unwrap();
 
 	// Both should have 10 items
@@ -943,7 +934,6 @@ fn create_iter_state_with_tables(
 		active: Arc::new(MemTable::default()),
 		immutable: vec![],
 		levels,
-		versioned_index: None,
 	}
 }
 
@@ -1422,7 +1412,7 @@ async fn test_cache_effectiveness_with_range_query() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
-	let tree = TreeBuilder::new()
+	let store = StoreBuilder::new()
 		.with_path(path)
 		.with_block_cache_capacity(10 * 1024 * 1024) // 10MB cache
 		.with_max_memtable_size(1024 * 64) // Small memtable to trigger flushes
@@ -1436,31 +1426,31 @@ async fn test_cache_effectiveness_with_range_query() {
 		let key = format!("key_{:08}", i);
 		let value = format!("value_{}", i);
 
-		let mut tx = tree.begin().unwrap();
-		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		store.set(key.as_bytes(), value.as_bytes()).await.unwrap();
 
 		// Flush every 1,000 keys to create multiple SSTables
 		if (i + 1) % 1_000 == 0 {
-			tree.flush().unwrap();
+			store.flush().unwrap();
 			eprintln!("Flushed after {} keys", i + 1);
 		}
 	}
 
 	// Final flush to ensure all data is on disk
-	tree.flush().unwrap();
+	store.flush().unwrap();
 	eprintln!("Final flush completed\n");
 
 	// Reset cache statistics before first query
-	tree.core.opts.block_cache.reset_stats();
+	store.core.inner.opts.block_cache.reset_stats();
 
 	eprintln!("=== First range query (populating cache) ===");
 	// First range query - this will populate the cache
-	let tx = tree.begin().unwrap();
-	let first_results =
-		collect_transaction_all(&mut tx.range("key_00000000", "key_00010000").unwrap()).unwrap();
+	let snapshot = store.new_snapshot();
+	let first_results = collect_transaction_all(
+		&mut snapshot.range(Some(b"key_00000000"), Some(b"key_00010000")).unwrap(),
+	)
+	.unwrap();
 
-	let first_stats = tree.core.opts.block_cache.get_stats();
+	let first_stats = store.core.inner.opts.block_cache.get_stats();
 	eprintln!("First query results: {} items", first_results.len());
 	eprintln!("First query cache stats:");
 	eprintln!("  Data hits: {}, Data misses: {}", first_stats.data_hits, first_stats.data_misses);
@@ -1476,15 +1466,17 @@ async fn test_cache_effectiveness_with_range_query() {
 	eprintln!("  Hit ratio: {:.2}%\n", first_stats.hit_ratio() * 100.0);
 
 	// Reset cache statistics before second query
-	tree.core.opts.block_cache.reset_stats();
+	store.core.inner.opts.block_cache.reset_stats();
 
 	eprintln!("=== Second range query (served from cache) ===");
 	// Second range query - should be served mostly from cache
-	let tx = tree.begin().unwrap();
-	let second_results =
-		collect_transaction_all(&mut tx.range(b"key_00000000", b"key_00010000").unwrap()).unwrap();
+	let snapshot = store.new_snapshot();
+	let second_results = collect_transaction_all(
+		&mut snapshot.range(Some(b"key_00000000"), Some(b"key_00010000")).unwrap(),
+	)
+	.unwrap();
 
-	let second_stats = tree.core.opts.block_cache.get_stats();
+	let second_stats = store.core.inner.opts.block_cache.get_stats();
 	eprintln!("Second query results: {} items", second_results.len());
 	eprintln!("Second query cache stats:");
 	eprintln!("  Data hits: {}, Data misses: {}", second_stats.data_hits, second_stats.data_misses);
@@ -1515,58 +1507,41 @@ async fn test_cache_effectiveness_with_range_query() {
 		second_stats.hit_ratio() * 100.0
 	);
 
-	tree.close().await.unwrap();
+	store.close().await.unwrap();
 }
 
 #[test(tokio::test)]
 async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	let (store, _temp_dir) = create_store();
 
-	// Insert key1 at seq_num ~1
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1_v1").unwrap();
-		tx.commit().await.unwrap();
-	}
+	// Insert key1
+	store.set(b"key1", b"value1_v1").await.unwrap();
 
 	// Capture snapshot after key1 insert (should see only key1)
-	let snapshot1 = store.begin().unwrap();
+	let snapshot1 = store.new_snapshot();
 
-	// Insert key2 at seq_num ~2
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key2", b"value2_v1").unwrap();
-		tx.commit().await.unwrap();
-	}
+	// Insert key2
+	store.set(b"key2", b"value2_v1").await.unwrap();
 
 	// Capture snapshot after key2 insert (should see key1 and key2)
-	let snapshot2 = store.begin().unwrap();
+	let snapshot2 = store.new_snapshot();
 
-	// Insert key3 at seq_num ~3
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key3", b"value3_v1").unwrap();
-		tx.commit().await.unwrap();
-	}
+	// Insert key3
+	store.set(b"key3", b"value3_v1").await.unwrap();
 
 	// Capture snapshot after key3 insert (should see key1, key2, and key3)
-	let snapshot3 = store.begin().unwrap();
+	let snapshot3 = store.new_snapshot();
 
-	// Insert key4 at seq_num ~4
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key4", b"value4_v1").unwrap();
-		tx.commit().await.unwrap();
-	}
+	// Insert key4
+	store.set(b"key4", b"value4_v1").await.unwrap();
 
 	// Capture snapshot after key4 insert (should see all keys)
-	let snapshot4 = store.begin().unwrap();
+	let snapshot4 = store.new_snapshot();
 
 	// Test snapshot1 - should only see key1
 	{
-		let snap_ref = snapshot1.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot1.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 1, "Snapshot1 should only see 1 key");
@@ -1576,9 +1551,8 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 
 	// Test snapshot2 - should see key1 and key2
 	{
-		let snap_ref = snapshot2.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot2.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 2, "Snapshot2 should see 2 keys");
@@ -1588,9 +1562,8 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 
 	// Test snapshot3 - should see key1, key2, and key3
 	{
-		let snap_ref = snapshot3.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot3.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 3, "Snapshot3 should see 3 keys");
@@ -1601,9 +1574,8 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 
 	// Test snapshot4 - should see all 4 keys
 	{
-		let snap_ref = snapshot4.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot4.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 4, "Snapshot4 should see 4 keys");
@@ -1615,9 +1587,8 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 
 	// Test backward iteration on snapshot2
 	{
-		let snap_ref = snapshot2.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot2.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_reverse(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 2, "Backward iteration should also see 2 keys");
@@ -1631,40 +1602,27 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 	let (store, _temp_dir) = create_store();
 
 	// Insert initial value for key1
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value_v1").unwrap();
-		tx.commit().await.unwrap();
-	}
+	store.set(b"key1", b"value_v1").await.unwrap();
 
 	// Snapshot after v1
-	let snapshot1 = store.begin().unwrap();
+	let snapshot1 = store.new_snapshot();
 
 	// Update key1 to v2
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value_v2").unwrap();
-		tx.commit().await.unwrap();
-	}
+	store.set(b"key1", b"value_v2").await.unwrap();
 
 	// Snapshot after v2
-	let snapshot2 = store.begin().unwrap();
+	let snapshot2 = store.new_snapshot();
 
 	// Update key1 to v3
-	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value_v3").unwrap();
-		tx.commit().await.unwrap();
-	}
+	store.set(b"key1", b"value_v3").await.unwrap();
 
 	// Snapshot after v3
-	let snapshot3 = store.begin().unwrap();
+	let snapshot3 = store.new_snapshot();
 
 	// Each snapshot should see its corresponding version
 	{
-		let snap1_ref = snapshot1.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap1_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot1.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 1);
@@ -1672,9 +1630,8 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 	}
 
 	{
-		let snap2_ref = snapshot2.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap2_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot2.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 1);
@@ -1682,9 +1639,8 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 	}
 
 	{
-		let snap3_ref = snapshot3.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap3_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot3.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 1);
@@ -1698,31 +1654,26 @@ async fn test_snapshot_iterator_seq_num_with_deletions() {
 
 	// Insert keys 1, 2, 3
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"key1", b"value1").unwrap();
-		tx.set(b"key2", b"value2").unwrap();
-		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		batch.set(b"key3", b"value3").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
 	// Snapshot before deletion
-	let snapshot_before = store.begin().unwrap();
+	let snapshot_before = store.new_snapshot();
 
 	// Delete key2
-	{
-		let mut tx = store.begin().unwrap();
-		tx.delete(b"key2").unwrap();
-		tx.commit().await.unwrap();
-	}
+	store.delete(b"key2").await.unwrap();
 
 	// Snapshot after deletion
-	let snapshot_after = store.begin().unwrap();
+	let snapshot_after = store.new_snapshot();
 
 	// Snapshot before should see all 3 keys
 	{
-		let snap_ref = snapshot_before.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot_before.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 3, "Before deletion: should see all 3 keys");
@@ -1733,9 +1684,8 @@ async fn test_snapshot_iterator_seq_num_with_deletions() {
 
 	// Snapshot after should not see deleted key2
 	{
-		let snap_ref = snapshot_after.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot_after.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 2, "After deletion: should see only 2 keys");
@@ -1746,9 +1696,8 @@ async fn test_snapshot_iterator_seq_num_with_deletions() {
 
 	// Test backward iteration after deletion
 	{
-		let snap_ref = snapshot_after.snapshot.as_ref().unwrap();
 		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+			snapshot_after.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_reverse(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 2, "Backward: should see only 2 keys");
@@ -1763,35 +1712,39 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 
 	// Timeline:
 	// 1. Insert key1, key2, key3
-	let mut tx = store.begin().unwrap();
-	tx.set(b"key1", b"v1").unwrap();
-	tx.set(b"key2", b"v2").unwrap();
-	tx.set(b"key3", b"v3").unwrap();
-	tx.commit().await.unwrap();
+	{
+		let mut batch = store.new_batch();
+		batch.set(b"key1", b"v1").unwrap();
+		batch.set(b"key2", b"v2").unwrap();
+		batch.set(b"key3", b"v3").unwrap();
+		store.apply(batch, false).await.unwrap();
+	}
 
-	let snap1 = store.begin().unwrap();
+	let snap1 = store.new_snapshot();
 
 	// 2. Update key2, insert key4
-	let mut tx = store.begin().unwrap();
-	tx.set(b"key2", b"v2_updated").unwrap();
-	tx.set(b"key4", b"v4").unwrap();
-	tx.commit().await.unwrap();
+	{
+		let mut batch = store.new_batch();
+		batch.set(b"key2", b"v2_updated").unwrap();
+		batch.set(b"key4", b"v4").unwrap();
+		store.apply(batch, false).await.unwrap();
+	}
 
-	let snap2 = store.begin().unwrap();
+	let snap2 = store.new_snapshot();
 
 	// 3. Delete key1, insert key5
-	let mut tx = store.begin().unwrap();
-	tx.delete(b"key1").unwrap();
-	tx.set(b"key5", b"v5").unwrap();
-	tx.commit().await.unwrap();
+	{
+		let mut batch = store.new_batch();
+		batch.delete(b"key1").unwrap();
+		batch.set(b"key5", b"v5").unwrap();
+		store.apply(batch, false).await.unwrap();
+	}
 
-	let snap3 = store.begin().unwrap();
+	let snap3 = store.new_snapshot();
 
 	// Verify snap1: Should see key1(v1), key2(v2), key3(v3)
 	{
-		let snap_ref = snap1.snapshot.as_ref().unwrap();
-		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let mut range_iter = snap1.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 3);
@@ -1804,9 +1757,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 
 	// Verify snap2: Should see key1(v1), key2(v2_updated), key3(v3), key4(v4)
 	{
-		let snap_ref = snap2.snapshot.as_ref().unwrap();
-		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let mut range_iter = snap2.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 4);
@@ -1820,9 +1771,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 	// Verify snap3: Should see key2(v2_updated), key3(v3), key4(v4), key5(v5)
 	// key1 should be deleted
 	{
-		let snap_ref = snap3.snapshot.as_ref().unwrap();
-		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let mut range_iter = snap3.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_iter(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 4);
@@ -1836,9 +1785,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 
 	// Verify backward iteration on snap2
 	{
-		let snap_ref = snap2.snapshot.as_ref().unwrap();
-		let mut range_iter =
-			snap_ref.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
+		let mut range_iter = snap2.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
 		let range = collect_snapshot_reverse(&mut range_iter).unwrap();
 
 		assert_eq!(range.len(), 4);
@@ -1858,16 +1805,15 @@ async fn test_snapshot_iterator_multiple_direction_switches() {
 
 	// Insert keys
 	{
-		let mut tx = store.begin().unwrap();
+		let mut batch = store.new_batch();
 		for i in 1..=7 {
-			tx.set(format!("key{}", i).as_bytes(), format!("value{}", i).as_bytes()).unwrap();
+			batch.set(format!("key{}", i).as_bytes(), format!("value{}", i).as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	let tx = store.begin().unwrap();
-	let tx_ref = tx.snapshot.as_ref().unwrap();
-	let mut iter = tx_ref.range(Some(b"key1".as_slice()), Some(b"key8".as_slice())).unwrap();
+	let snapshot = store.new_snapshot();
+	let mut iter = snapshot.range(Some(b"key1".as_slice()), Some(b"key8".as_slice())).unwrap();
 
 	// Start forward
 	iter.seek_first().unwrap();
@@ -1925,17 +1871,16 @@ async fn test_snapshot_iterator_direction_switch_at_bounds() {
 
 	// Insert keys
 	{
-		let mut tx = store.begin().unwrap();
-		tx.set(b"aaa", b"v1").unwrap();
-		tx.set(b"bbb", b"v2").unwrap();
-		tx.set(b"ccc", b"v3").unwrap();
-		tx.set(b"ddd", b"v4").unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = store.new_batch();
+		batch.set(b"aaa", b"v1").unwrap();
+		batch.set(b"bbb", b"v2").unwrap();
+		batch.set(b"ccc", b"v3").unwrap();
+		batch.set(b"ddd", b"v4").unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	let tx = store.begin().unwrap();
-	let tx_ref = tx.snapshot.as_ref().unwrap();
-	let mut iter = tx_ref.range(Some(b"aaa".as_slice()), Some(b"eee".as_slice())).unwrap();
+	let snapshot = store.new_snapshot();
+	let mut iter = snapshot.range(Some(b"aaa".as_slice()), Some(b"eee".as_slice())).unwrap();
 
 	// Test at lower bound: seek first, try prev (should fail/invalid), then next
 	iter.seek_first().unwrap();
@@ -1973,18 +1918,17 @@ async fn test_snapshot_iterator_direction_switch_mid_range() {
 
 	// Insert 10 keys
 	{
-		let mut tx = store.begin().unwrap();
+		let mut batch = store.new_batch();
 		for i in 0..10 {
 			let key = format!("k{:02}", i);
 			let val = format!("v{:02}", i);
-			tx.set(key.as_bytes(), val.as_bytes()).unwrap();
+			batch.set(key.as_bytes(), val.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		store.apply(batch, false).await.unwrap();
 	}
 
-	let tx = store.begin().unwrap();
-	let tx_ref = tx.snapshot.as_ref().unwrap();
-	let mut iter = tx_ref.range(Some(b"k00".as_slice()), Some(b"k99".as_slice())).unwrap();
+	let snapshot = store.new_snapshot();
+	let mut iter = snapshot.range(Some(b"k00".as_slice()), Some(b"k99".as_slice())).unwrap();
 
 	// Go to middle (k05) via forward iteration
 	iter.seek_first().unwrap();

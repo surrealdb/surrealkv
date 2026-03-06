@@ -180,9 +180,5 @@ unused_async = "allow"
 unwrap_used = "allow"
 
 [[bench]]
-name = "bplustree_bench"
-harness = false
-
-[[bench]]
 name = "alloc_bench"
 harness = false

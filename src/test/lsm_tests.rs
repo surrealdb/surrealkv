@@ -6,7 +6,7 @@ use test_log::test;
 
 use crate::compaction::leveled::Strategy;
 use crate::levels::{validate_wal_log_number, LevelManifest};
-use crate::lsm::{CompactionOperations, Core, CoreInner};
+use crate::lsm::{Core, CoreInner};
 use crate::test::collect_transaction_all;
 use crate::wal::list_segment_ids;
 use crate::{
@@ -30,7 +30,6 @@ fn create_temp_directory() -> TempDir {
 fn create_test_options(path: PathBuf, customizations: impl FnOnce(&mut Options)) -> Arc<Options> {
 	let mut opts = Options {
 		path,
-		vlog_value_threshold: 0,
 		..Default::default()
 	};
 	customizations(&mut opts);
@@ -45,23 +44,6 @@ fn create_small_memtable_options(path: PathBuf) -> Arc<Options> {
 	})
 }
 
-/// Creates test options optimized for VLog testing
-fn create_vlog_test_options(path: PathBuf) -> Arc<Options> {
-	create_test_options(path, |opts| {
-		opts.max_memtable_size = 64 * 1024; // 64KB
-		opts.vlog_max_file_size = 1024 * 1024; // 1MB
-	})
-}
-
-/// Creates test options optimized for VLog compaction testing
-fn create_vlog_compaction_options(path: PathBuf) -> Arc<Options> {
-	create_test_options(path, |opts| {
-		opts.max_memtable_size = 64 * 1024; // 64KB
-		opts.vlog_max_file_size = 950; // Small size to force frequent rotations
-		opts.level_count = 2; // Two levels for compaction strategy
-	})
-}
-
 #[test(tokio::test)]
 async fn test_tree_basic() {
 	let temp_dir = create_temp_directory();
@@ -72,13 +54,13 @@ async fn test_tree_basic() {
 	// Insert a key-value pair
 	let key = "hello";
 	let value = "world";
-	let mut txn = tree.begin().unwrap();
-	txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-	txn.commit().await.unwrap();
+	let mut batch = tree.new_batch();
+	batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+	tree.apply(batch, false).await.unwrap();
 
 	// Read back the key-value pair
-	let txn = tree.begin().unwrap();
-	let result = txn.get(key.as_bytes()).unwrap().unwrap();
+
+	let result = tree.get(key.as_bytes()).unwrap().unwrap();
 	assert_eq!(result, value.as_bytes().to_vec());
 }
 
@@ -97,9 +79,9 @@ async fn test_memtable_flush() {
 	// Insert the same key multiple times with different values
 	for value in values.iter() {
 		// Insert key-value pair in a new transaction
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Ensure the active memtable is flushed to disk
@@ -107,8 +89,8 @@ async fn test_memtable_flush() {
 
 	{
 		// Read back the key-value pair
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap().unwrap();
+
+		let result = tree.get(key.as_bytes()).unwrap().unwrap();
 		let expected_value = values.last().unwrap();
 		assert_eq!(result, expected_value.as_bytes().to_vec());
 	}
@@ -129,16 +111,16 @@ async fn test_memtable_flush_with_delete() {
 	// Insert the same key multiple times with different values
 	for value in values.iter() {
 		// Insert key-value pair in a new transaction
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Delete the key
 	{
-		let mut txn = tree.begin().unwrap();
-		txn.delete(key.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.delete(key.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Ensure the active memtable is flushed to disk
@@ -146,8 +128,8 @@ async fn test_memtable_flush_with_delete() {
 
 	{
 		// Read back the key-value pair
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap();
+
+		let result = tree.get(key.as_bytes()).unwrap();
 		assert!(result.is_none(), "Expected key to be deleted");
 	}
 }
@@ -182,9 +164,9 @@ async fn test_memtable_flush_with_multiple_keys_and_updates() {
 			}
 
 			// Insert in a new transaction
-			let mut txn = tree.begin().unwrap();
-			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 	}
 
@@ -193,8 +175,7 @@ async fn test_memtable_flush_with_multiple_keys_and_updates() {
 
 	// Verify all keys have their final values
 	for (key, expected_value) in expected_values {
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap().unwrap();
+		let result = tree.get(key.as_bytes()).unwrap().unwrap();
 		assert_eq!(
 			result,
 			expected_value.as_bytes().to_vec(),
@@ -213,9 +194,7 @@ async fn test_persistence() {
 	let path = temp_dir.path().to_path_buf();
 
 	// Set a reasonable memtable size to trigger multiple flushes
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.vlog_max_file_size = 10;
-	});
+	let opts = create_test_options(path.clone(), |_opts| {});
 
 	// Number of keys to insert
 	const KEY_COUNT: usize = 100;
@@ -242,9 +221,9 @@ async fn test_persistence() {
 				}
 
 				// Insert in a new transaction
-				let mut txn = tree.begin().unwrap();
-				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				let mut batch = tree.new_batch();
+				batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+				tree.apply(batch, false).await.unwrap();
 			}
 		}
 
@@ -272,8 +251,7 @@ async fn test_persistence() {
 
 		// Verify all keys have their final values
 		for (key, expected_value) in expected_values.iter() {
-			let txn = tree.begin().unwrap();
-			let result = txn.get(key.as_bytes()).unwrap();
+			let result = tree.get(key.as_bytes()).unwrap();
 
 			assert!(result.is_some(), "Key '{key}' not found after reopening store");
 
@@ -305,9 +283,9 @@ async fn test_checkpoint_functionality() {
 		let key = format!("key_{i:03}");
 		let value = format!("value_{i:03}");
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Force flush to ensure data is on disk
@@ -334,9 +312,9 @@ async fn test_checkpoint_functionality() {
 		let key = format!("key_{i:03}");
 		let value = format!("value_{i:03}");
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Force flush to ensure the new data is also on disk
@@ -345,8 +323,8 @@ async fn test_checkpoint_functionality() {
 	// Verify all data exists before restore
 	for i in 0..15 {
 		let key = format!("key_{i:03}");
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap();
+
+		let result = tree.get(key.as_bytes()).unwrap();
 		assert!(result.is_some(), "Key '{key}' should exist before restore");
 	}
 
@@ -358,8 +336,7 @@ async fn test_checkpoint_functionality() {
 		let key = format!("key_{i:03}");
 		let expected_value = format!("value_{i:03}");
 
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap();
+		let result = tree.get(key.as_bytes()).unwrap();
 		assert!(result.is_some(), "Key '{key}' should exist after restore");
 		assert_eq!(result.unwrap(), expected_value.as_bytes().to_vec());
 	}
@@ -368,8 +345,7 @@ async fn test_checkpoint_functionality() {
 	for i in 10..15 {
 		let key = format!("key_{i:03}");
 
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap();
+		let result = tree.get(key.as_bytes()).unwrap();
 		assert!(result.is_none(), "Key '{key}' should not exist after restore");
 	}
 }
@@ -389,9 +365,9 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 		let key = format!("key_{i:03}");
 		let value = format!("checkpoint_value_{i:03}");
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Force flush to ensure data is on disk
@@ -407,16 +383,16 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 		let key = format!("key_{i:03}");
 		let value = format!("pending_value_{i:03}"); // Different values
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Verify the pending writes are in memory but not yet flushed
 	for i in 0..5 {
 		let key = format!("key_{i:03}");
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap().unwrap();
+
+		let result = tree.get(key.as_bytes()).unwrap().unwrap();
 		assert_eq!(
 			result,
 			format!("pending_value_{i:03}").as_bytes().to_vec(),
@@ -432,8 +408,7 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 		let key = format!("key_{i:03}");
 		let expected_value = format!("checkpoint_value_{i:03}");
 
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap().unwrap();
+		let result = tree.get(key.as_bytes()).unwrap().unwrap();
 		assert_eq!(
 			result,
 			expected_value.as_bytes().to_vec(),
@@ -454,14 +429,17 @@ async fn test_simple_range_seek() {
 	// Insert simple keys
 	let keys = ["a", "b", "c", "d", "e"];
 	for key in keys.iter() {
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), key.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), key.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Test range scan BEFORE flushing (should work from memtables)
-	let txn = tree.begin().unwrap();
-	let range_before_flush = collect_transaction_all(&mut txn.range(b"a", b"d").unwrap()).unwrap();
+
+	let range_before_flush = collect_transaction_all(
+		&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
+	)
+	.unwrap();
 
 	// Should return keys "a", "b", "c" ([a, d) range)
 	assert_eq!(range_before_flush.len(), 3, "Range scan before flush should return 3 items");
@@ -479,8 +457,11 @@ async fn test_simple_range_seek() {
 	tree.flush().unwrap();
 
 	// Test range scan AFTER flushing (should work from SSTables)
-	let txn = tree.begin().unwrap();
-	let range_after_flush = collect_transaction_all(&mut txn.range(b"a", b"d").unwrap()).unwrap();
+
+	let range_after_flush = collect_transaction_all(
+		&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
+	)
+	.unwrap();
 
 	// Should return the same keys after flush
 	assert_eq!(range_after_flush.len(), 3, "Range scan after flush should return 3 items");
@@ -496,8 +477,7 @@ async fn test_simple_range_seek() {
 
 	// Test individual gets
 	for key in ["a", "b", "c"].iter() {
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap();
+		let result = tree.get(key.as_bytes()).unwrap();
 
 		assert!(result.is_some(), "Key '{key}' should be found");
 		let value = result.unwrap();
@@ -531,9 +511,9 @@ async fn test_large_range_scan() {
 
 		expected_items.push((key.clone(), value.clone()));
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Force flush to ensure all data is on disk
@@ -543,9 +523,10 @@ async fn test_large_range_scan() {
 	let start_key = "key_000000".as_bytes();
 	let end_key = "key_999999".as_bytes();
 
-	let txn = tree.begin().unwrap();
-	let range_result =
-		collect_transaction_all(&mut txn.range(start_key, end_key).unwrap()).unwrap();
+	let range_result = collect_transaction_all(
+		&mut tree.new_snapshot().range(Some(start_key), Some(end_key)).unwrap(),
+	)
+	.unwrap();
 
 	assert_eq!(
 		range_result.len(),
@@ -575,9 +556,10 @@ async fn test_large_range_scan() {
 	let partial_start = "key_000000".as_bytes();
 	let partial_end = "key_000100".as_bytes();
 
-	let txn = tree.begin().unwrap();
-	let partial_result =
-		collect_transaction_all(&mut txn.range(partial_start, partial_end).unwrap()).unwrap();
+	let partial_result = collect_transaction_all(
+		&mut tree.new_snapshot().range(Some(partial_start), Some(partial_end)).unwrap(),
+	)
+	.unwrap();
 
 	assert_eq!(partial_result.len(), 100, "Partial range scan should return 100 items");
 
@@ -603,9 +585,10 @@ async fn test_large_range_scan() {
 	let middle_start = "key_005000".as_bytes();
 	let middle_end = "key_005100".as_bytes();
 
-	let txn = tree.begin().unwrap();
-	let middle_result =
-		collect_transaction_all(&mut txn.range(middle_start, middle_end).unwrap()).unwrap();
+	let middle_result = collect_transaction_all(
+		&mut tree.new_snapshot().range(Some(middle_start), Some(middle_end)).unwrap(),
+	)
+	.unwrap();
 
 	assert_eq!(middle_result.len(), 100, "Middle range scan should return 100 items");
 
@@ -632,8 +615,10 @@ async fn test_large_range_scan() {
 	let end_start = "key_009900".as_bytes();
 	let end_end = "key_010000".as_bytes();
 
-	let txn = tree.begin().unwrap();
-	let end_result = collect_transaction_all(&mut txn.range(end_start, end_end).unwrap()).unwrap();
+	let end_result = collect_transaction_all(
+		&mut tree.new_snapshot().range(Some(end_start), Some(end_end)).unwrap(),
+	)
+	.unwrap();
 
 	assert_eq!(end_result.len(), 100, "End range scan should return 100 items");
 
@@ -660,9 +645,10 @@ async fn test_large_range_scan() {
 	let single_start = "key_004567".as_bytes();
 	let single_end = "key_004568".as_bytes();
 
-	let txn = tree.begin().unwrap();
-	let single_result =
-		collect_transaction_all(&mut txn.range(single_start, single_end).unwrap()).unwrap();
+	let single_result = collect_transaction_all(
+		&mut tree.new_snapshot().range(Some(single_start), Some(single_end)).unwrap(),
+	)
+	.unwrap();
 
 	assert_eq!(single_result.len(), 1, "Single item range scan should return 1 item");
 
@@ -677,9 +663,10 @@ async fn test_large_range_scan() {
 	let empty_start = "key_999999".as_bytes();
 	let empty_end = "key_888888".as_bytes(); // end < start, should be empty
 
-	let txn = tree.begin().unwrap();
-	let empty_result =
-		collect_transaction_all(&mut txn.range(empty_start, empty_end).unwrap()).unwrap();
+	let empty_result = collect_transaction_all(
+		&mut tree.new_snapshot().range(Some(empty_start), Some(empty_end)).unwrap(),
+	)
+	.unwrap();
 
 	assert_eq!(empty_result.len(), 0, "Empty range scan should return 0 items");
 }
@@ -702,9 +689,9 @@ async fn test_range_skip_take() {
 
 		expected_items.push((key.clone(), value.clone()));
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -712,8 +699,8 @@ async fn test_range_skip_take() {
 	let start_key = "key_000000".as_bytes();
 	let end_key = "key_999999".as_bytes();
 
-	let txn = tree.begin().unwrap();
-	let mut iter = txn.range(start_key, end_key).unwrap();
+	let snapshot = tree.new_snapshot();
+	let mut iter = snapshot.range(Some(start_key), Some(end_key)).unwrap();
 	iter.seek_first().unwrap();
 	// Skip 5000 items
 	for _ in 0..5000 {
@@ -790,9 +777,9 @@ async fn test_range_skip_take_alphabetical() {
 
 		expected_items.push((key.clone(), value.clone()));
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -802,8 +789,8 @@ async fn test_range_skip_take_alphabetical() {
 	let beg = [0u8].to_vec();
 	let end = [255u8].to_vec();
 
-	let txn = tree.begin().unwrap();
-	let mut iter = txn.range(&beg, &end).unwrap();
+	let snapshot = tree.new_snapshot();
+	let mut iter = snapshot.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
 	iter.seek_first().unwrap();
 	// Skip 5000 items
 	for _ in 0..5000 {
@@ -867,9 +854,9 @@ async fn test_range_limit_functionality() {
 
 		expected_items.push((key.clone(), value.clone()));
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -877,8 +864,8 @@ async fn test_range_limit_functionality() {
 	let beg = [0u8].to_vec();
 	let end = [255u8].to_vec();
 
-	let txn = tree.begin().unwrap();
-	let mut iter = txn.range(&beg, &end).unwrap();
+	let snapshot = tree.new_snapshot();
+	let mut iter = snapshot.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
 	iter.seek_first().unwrap();
 	// Take 100 items
 	let mut limited_result = Vec::new();
@@ -915,8 +902,8 @@ async fn test_range_limit_functionality() {
             );
 	}
 
-	let txn = tree.begin().unwrap();
-	let mut iter = txn.range(&beg, &end).unwrap();
+	let snapshot2 = tree.new_snapshot();
+	let mut iter = snapshot2.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
 	iter.seek_first().unwrap();
 	// Take 1000 items
 	let mut limited_result_1000 = Vec::new();
@@ -953,8 +940,8 @@ async fn test_range_limit_functionality() {
             );
 	}
 
-	let txn = tree.begin().unwrap();
-	let mut iter = txn.range(&beg, &end).unwrap();
+	let snapshot3 = tree.new_snapshot();
+	let mut iter = snapshot3.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
 	iter.seek_first().unwrap();
 	// Take 15000 items
 	let mut limited_result_large = Vec::new();
@@ -974,8 +961,10 @@ async fn test_range_limit_functionality() {
 		"Range scan with .take(15000) should return all {TOTAL_ITEMS} items"
 	);
 
-	let txn = tree.begin().unwrap();
-	let unlimited_result = collect_transaction_all(&mut txn.range(&beg, &end).unwrap()).unwrap();
+	let unlimited_result = collect_transaction_all(
+		&mut tree.new_snapshot().range(Some(beg.as_slice()), Some(end.as_slice())).unwrap(),
+	)
+	.unwrap();
 
 	assert_eq!(
 		unlimited_result.len(),
@@ -983,8 +972,8 @@ async fn test_range_limit_functionality() {
 		"Range scan with no limit should return all {TOTAL_ITEMS} items"
 	);
 
-	let txn = tree.begin().unwrap();
-	let mut iter = txn.range(&beg, &end).unwrap();
+	let snapshot4 = tree.new_snapshot();
+	let mut iter = snapshot4.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
 	iter.seek_first().unwrap();
 	// Take 1 item
 	let mut single_result = Vec::new();
@@ -1003,8 +992,8 @@ async fn test_range_limit_functionality() {
 	assert_eq!(key_str, "key_000000");
 	assert_eq!(value_str, "value_000000_content_data_0");
 
-	let txn = tree.begin().unwrap();
-	let mut iter = txn.range(&beg, &end).unwrap();
+	let snapshot5 = tree.new_snapshot();
+	let mut iter = snapshot5.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
 	iter.seek_first().unwrap();
 	// Take 0 items (don't collect anything)
 	let zero_result: Vec<(Key, Option<Value>)> = Vec::new();
@@ -1030,9 +1019,9 @@ async fn test_range_limit_with_skip_take() {
 
 		expected_items.push((key.clone(), value.clone()));
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -1040,8 +1029,8 @@ async fn test_range_limit_with_skip_take() {
 	let beg = [0u8].to_vec();
 	let end = [255u8].to_vec();
 
-	let txn = tree.begin().unwrap();
-	let mut iter = txn.range(&beg, &end).unwrap();
+	let snapshot = tree.new_snapshot();
+	let mut iter = snapshot.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
 	iter.seek_first().unwrap();
 	// Skip 5000 items
 	for _ in 0..5000 {
@@ -1087,8 +1076,9 @@ async fn test_range_limit_with_skip_take() {
 	}
 
 	// Case: Test another skip position with take
-	let txn = tree.begin().unwrap();
-	let mut iter = txn.range(&beg, &end).unwrap();
+
+	let snapshot2 = tree.new_snapshot();
+	let mut iter = snapshot2.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
 	iter.seek_first().unwrap();
 	// Skip 5000 items
 	for _ in 0..5000 {
@@ -1131,170 +1121,12 @@ async fn test_range_limit_with_skip_take() {
 }
 
 #[test(tokio::test)]
-async fn test_vlog_basic() {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_vlog_test_options(path.clone());
-
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-	// Test 1: Values should be stored in VLog
-	let small_key = "small_key";
-	let small_value = "small_value"; // < 100 bytes
-
-	let mut txn = tree.begin().unwrap();
-	txn.set(small_key.as_bytes(), small_value.as_bytes()).unwrap();
-	txn.commit().await.unwrap();
-
-	// Test 2: Large values should be stored in VLog
-	let large_key = "large_key";
-	let large_value = "X".repeat(200); // >= 100 bytes
-
-	let mut txn = tree.begin().unwrap();
-	txn.set(large_key.as_bytes(), large_value.as_bytes()).unwrap();
-	txn.commit().await.unwrap();
-
-	// Force memtable flush to persist to SSTables
-	tree.flush().unwrap();
-
-	// Verify both values can be read correctly
-	let txn = tree.begin().unwrap();
-
-	let retrieved_small = txn.get(small_key.as_bytes()).unwrap().unwrap();
-	assert_eq!(retrieved_small, small_value.as_bytes().to_vec());
-
-	let retrieved_large = txn.get(large_key.as_bytes()).unwrap().unwrap();
-	assert_eq!(retrieved_large, large_value.as_bytes().to_vec());
-}
-
-#[test(tokio::test(flavor = "multi_thread"))]
-async fn test_vlog_concurrent_operations() {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.vlog_max_file_size = 512 * 1024;
-		opts.max_memtable_size = 32 * 1024;
-	});
-
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-	let mut expected_values = Vec::new();
-
-	for i in 0..1000 {
-		let key = format!("key_{i:04}");
-		let value = if i % 2 == 0 {
-			format!("small_value_{i}")
-		} else {
-			format!("large_value_{}_with_padding_{}", i, "X".repeat(100))
-		};
-
-		expected_values.push((key.clone(), value.clone()));
-
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
-	}
-
-	// Force flush to ensure all data is persisted
-	tree.close().await.unwrap();
-
-	let tree = Arc::new(tree);
-
-	// Concurrent reads
-	let read_handles: Vec<_> = (0..5)
-		.map(|reader_id| {
-			let tree = Arc::clone(&tree);
-			let expected_values = expected_values.clone();
-			tokio::spawn(async move {
-				for (key, expected_value) in expected_values {
-					let txn = tree.begin().unwrap();
-					let retrieved = txn.get(key.as_bytes()).unwrap().unwrap();
-					assert_eq!(
-						retrieved,
-						expected_value.as_bytes().to_vec(),
-						"Reader {reader_id} failed to get correct value for key {key}"
-					);
-				}
-			})
-		})
-		.collect();
-
-	// Wait for all reads to complete
-	for handle in read_handles {
-		handle.await.unwrap();
-	}
-
-	// Explicitly close the tree to ensure proper cleanup
-	tree.close().await.unwrap();
-}
-
-#[test(tokio::test)]
-async fn test_vlog_file_rotation() {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.vlog_max_file_size = 2048; // 2KB files to force frequent rotation
-		opts.enable_vlog = true;
-	});
-
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-	// Insert enough data to force multiple file rotations
-	let mut keys_and_values = Vec::new();
-	for i in 0..50 {
-		let key = format!("rotation_key_{i:03}");
-		let value = format!("rotation_value_{}_with_lots_of_padding_{}", i, "Z".repeat(200));
-		keys_and_values.push((key.clone(), value.clone()));
-
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
-	}
-
-	// Force flush
-	tree.flush().unwrap();
-
-	// Check that multiple VLog files were created
-	let vlog_dir = path.join("vlog");
-	let entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = entries
-		.filter_map(|e| {
-			let entry = e.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert!(vlog_files.len() > 1, "Expected multiple VLog files due to rotation");
-
-	// Verify all data is still accessible across multiple files
-	for (key, expected_value) in keys_and_values {
-		let txn = tree.begin().unwrap();
-		let retrieved = txn.get(key.as_bytes()).unwrap().unwrap();
-		assert_eq!(
-			retrieved,
-			expected_value.as_bytes().to_vec(),
-			"Key {key} has incorrect value across file rotation"
-		);
-	}
-}
-
-#[test(tokio::test)]
 async fn test_compaction_with_updates_and_delete() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
 		opts.level_count = 2;
-		opts.vlog_max_file_size = 20;
-		opts.enable_vlog = true;
 	});
 
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
@@ -1305,47 +1137,45 @@ async fn test_compaction_with_updates_and_delete() {
 	// Insert first version of each key
 	for (i, key) in keys.iter().enumerate() {
 		let value = format!("value-{}-v1", i + 1);
-		let mut tx = tree.begin().unwrap();
-		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(*key, value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.flush().unwrap();
 	}
 
 	// Insert second version of each key
 	for (i, key) in keys.iter().enumerate() {
 		let value = format!("value-{}-v2", i + 1);
-		let mut tx = tree.begin().unwrap();
-		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(*key, value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.flush().unwrap();
 	}
 
 	// Verify the latest values before delete
 	for (i, key) in keys.iter().enumerate() {
-		let tx = tree.begin().unwrap();
-		let result = tx.get(*key).unwrap();
+		let result = tree.get(*key).unwrap();
 		let expected = format!("value-{}-v2", i + 1);
 		assert_eq!(result, Some(expected.as_bytes().to_vec()));
 	}
 
 	// Delete all keys
 	for key in keys.iter() {
-		let mut tx = tree.begin().unwrap();
-		tx.delete(*key).unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.delete(*key).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Flush memtable
 	tree.flush().unwrap();
 
-	// Force compaction - this triggers automatic VLog cleanup via global-min approach
+	// Force compaction
 	let strategy = Arc::new(Strategy::default());
 	tree.compact(strategy).unwrap();
 
 	// Verify all keys are gone after compaction
 	for key in keys.iter() {
-		let tx = tree.begin().unwrap();
-		let result = tx.get(*key).unwrap();
+		let result = tree.get(*key).unwrap();
 		assert_eq!(result, None);
 	}
 }
@@ -1357,8 +1187,6 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 
 	let opts = create_test_options(path.clone(), |opts| {
 		opts.level_count = 2;
-		opts.vlog_max_file_size = 20;
-		opts.enable_vlog = true;
 	});
 
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
@@ -1369,158 +1197,64 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 	// Insert first version of each key
 	for (i, key) in keys.iter().enumerate() {
 		let value = format!("value-{}-v1", i + 1);
-		let mut tx = tree.begin().unwrap();
-		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(*key, value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.flush().unwrap();
 	}
 
 	// Insert second version of each key
 	for (i, key) in keys.iter().enumerate() {
 		let value = format!("value-{}-v2", i + 1);
-		let mut tx = tree.begin().unwrap();
-		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(*key, value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.flush().unwrap();
 	}
 
 	// Insert third version of each key
 	for (i, key) in keys.iter().enumerate() {
 		let value = format!("value-{}-v3", i + 1);
-		let mut tx = tree.begin().unwrap();
-		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(*key, value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.flush().unwrap();
 	}
 
 	// Insert fourth version of each key
 	for (i, key) in keys.iter().enumerate() {
 		let value = format!("value-{}-v4", i + 1);
-		let mut tx = tree.begin().unwrap();
-		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(*key, value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.flush().unwrap();
 	}
 
 	// Verify the latest values before delete
 	for (i, key) in keys.iter().enumerate() {
-		let tx = tree.begin().unwrap();
-		let result = tx.get(*key).unwrap();
+		let result = tree.get(*key).unwrap();
 		assert_eq!(result, Some(format!("value-{}-v4", i + 1).as_bytes().to_vec()));
 	}
 
 	// Delete all keys
 	for key in keys.iter() {
-		let mut tx = tree.begin().unwrap();
-		tx.delete(*key).unwrap();
-		tx.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.delete(*key).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Flush memtable
 	tree.flush().unwrap();
 
-	// Force compaction - this triggers automatic VLog cleanup via global-min approach
+	// Force compaction
 	let strategy = Arc::new(Strategy::default());
 	tree.compact(strategy).unwrap();
 
 	// Verify all keys are gone after compaction
 	for key in keys.iter() {
-		let tx = tree.begin().unwrap();
-		let result = tx.get(*key).unwrap();
+		let result = tree.get(*key).unwrap();
 		assert_eq!(result, None);
 	}
-}
-
-#[test(tokio::test)]
-async fn test_vlog_compaction_preserves_sequence_numbers() {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_vlog_compaction_options(path.clone());
-
-	// Open the Tree (database instance)
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-	// Define keys used throughout the test
-	let key1 = b"test_key_1".to_vec();
-	let key2 = b"test_key_2".to_vec();
-	let key3 = b"test_key_3".to_vec();
-
-	// --- Step 1: Insert multiple versions of key1 to fill the first VLog file ---
-	for i in 0..3 {
-		let value = format!("value1_version_{i}").repeat(10); // Large value to fill VLog
-		let mut tx = tree.begin().unwrap();
-		tx.set(&key1, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
-		tree.flush().unwrap();
-	}
-
-	// --- Step 2: Insert and delete key2 ---
-	// We are doing this to make sure there are deleted keys in the VLog file
-	{
-		// Insert key2
-		let mut tx = tree.begin().unwrap();
-		tx.set(&key2, b"value2").unwrap();
-		tx.commit().await.unwrap();
-		tree.flush().unwrap();
-
-		// Delete key2
-		let mut tx = tree.begin().unwrap();
-		tx.delete(&key2).unwrap();
-		tx.commit().await.unwrap();
-		tree.flush().unwrap();
-	}
-
-	// --- Step 3: Validate current value of key1 (should be last inserted version)
-	// ---
-	{
-		let tx = tree.begin().unwrap();
-		let current_value = tx.get(&key1).unwrap().unwrap();
-		assert_eq!(&current_value, "value1_version_2".to_string().repeat(10).as_bytes());
-	}
-
-	// --- Step 4: Insert key3 values which will rotate VLog file ---
-	for i in 0..2 {
-		let value = format!("value2_version_{i}").repeat(10); // Large values
-		let mut tx = tree.begin().unwrap();
-		tx.set(&key3, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
-		tree.flush().unwrap();
-	}
-
-	// --- Step 5: Update key1 with a final value ---
-	{
-		let mut tx = tree.begin().unwrap();
-		tx.set(&key1, "final_value_key1".repeat(10).as_bytes()).unwrap();
-		tx.commit().await.unwrap();
-	}
-	tree.flush().unwrap();
-
-	// --- Step 6: Verify latest value of key1 before compaction ---
-	{
-		let tx = tree.begin().unwrap();
-		let value = tx.get(&key1).unwrap().unwrap();
-		assert_eq!(&value, "final_value_key1".repeat(10).as_bytes());
-	}
-
-	// --- Step 7: Trigger manual compaction of the LSM tree (also triggers VLog cleanup via
-	// global-min approach) ---
-	let strategy = Arc::new(Strategy::default());
-	tree.compact(strategy).unwrap();
-
-	// --- Step 8: Verify key1 still returns the correct latest value after compaction ---
-	{
-		let tx = tree.begin().unwrap();
-		let value = tx.get(&key1).unwrap().unwrap();
-		assert_eq!(
-			&value,
-			"final_value_key1".repeat(10).as_bytes(),
-			"After compaction, key1 returned incorrect value. The sequence number was not preserved during compaction."
-		);
-	}
-
-	// --- Step 9: Clean shutdown ---
-	tree.close().await.unwrap();
 }
 
 #[test(tokio::test)]
@@ -1542,9 +1276,9 @@ async fn test_sstable_lsn_bug() {
 			let key = format!("batch_0_key_{:03}", i);
 			let value = format!("batch_0_value_{:03}", i);
 
-			let mut txn = tree.begin().unwrap();
-			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Force first flush
@@ -1555,9 +1289,9 @@ async fn test_sstable_lsn_bug() {
 			let key = format!("batch_1_key_{:03}", i);
 			let value = format!("batch_1_value_{:03}", i);
 
-			let mut txn = tree.begin().unwrap();
-			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Force second flush
@@ -1569,8 +1303,7 @@ async fn test_sstable_lsn_bug() {
 				let key = format!("batch_{}_key_{:03}", batch, i);
 				let expected_value = format!("batch_{}_value_{:03}", batch, i);
 
-				let txn = tree.begin().unwrap();
-				let result = txn.get(key.as_bytes()).unwrap();
+				let result = tree.get(key.as_bytes()).unwrap();
 				assert!(result.is_some(), "Key '{}' should exist immediately after flush", key);
 				assert_eq!(&result.unwrap(), expected_value.as_bytes());
 			}
@@ -1590,8 +1323,7 @@ async fn test_sstable_lsn_bug() {
 				let key = format!("batch_{}_key_{:03}", batch, i);
 				let expected_value = format!("batch_{}_value_{:03}", batch, i);
 
-				let txn = tree.begin().unwrap();
-				let result = txn.get(key.as_bytes()).unwrap();
+				let result = tree.get(key.as_bytes()).unwrap();
 				assert!(result.is_some(), "Key '{}' should exist after restart", key);
 				assert_eq!(&result.unwrap(), expected_value.as_bytes());
 			}
@@ -1621,9 +1353,9 @@ async fn test_table_id_assignment_across_restart() {
 			let key = format!("batch_0_key_{:03}", i);
 			let value = format!("batch_0_value_{:03}", i);
 
-			let mut txn = tree.begin().unwrap();
-			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Force first flush to create first table
@@ -1634,9 +1366,9 @@ async fn test_table_id_assignment_across_restart() {
 			let key = format!("batch_1_key_{:03}", i);
 			let value = format!("batch_1_value_{:03}", i);
 
-			let mut txn = tree.begin().unwrap();
-			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Force second flush to create second table
@@ -1701,9 +1433,9 @@ async fn test_table_id_assignment_across_restart() {
 			let key = format!("batch_2_key_{:03}", i);
 			let value = format!("batch_2_value_{:03}", i);
 
-			let mut txn = tree.begin().unwrap();
-			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Force flush to create the 3rd table
@@ -1743,8 +1475,7 @@ async fn test_table_id_assignment_across_restart() {
 				let key = format!("batch_{}_key_{:03}", batch, i);
 				let expected_value = format!("batch_{}_value_{:03}", batch, i);
 
-				let txn = tree.begin().unwrap();
-				let result = txn.get(key.as_bytes()).unwrap();
+				let result = tree.get(key.as_bytes()).unwrap();
 				assert!(result.is_some(), "Key '{}' should exist after restart", key);
 				assert_eq!(&result.unwrap(), expected_value.as_bytes());
 			}
@@ -1783,99 +1514,10 @@ async fn test_table_id_assignment_across_restart() {
 		);
 
 		// Verify that we can read some data (simplified check)
-		let txn = tree.begin().unwrap();
-		let result = txn.get("batch_0_key_000".as_bytes()).unwrap();
+
+		let result = tree.get("batch_0_key_000".as_bytes()).unwrap();
 		assert!(result.is_some(), "Should be able to read at least one key");
 	}
-}
-
-#[test(tokio::test(flavor = "multi_thread"))]
-async fn test_vlog_prefill_on_reopen() {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.vlog_max_file_size = 10; // Very small to force multiple files
-		opts.enable_vlog = true;
-	});
-
-	// Create initial database and add data to create multiple VLog files
-	let tree1 = Tree::new(Arc::clone(&opts)).unwrap();
-
-	// Verify VLog is enabled
-	assert!(tree1.core.vlog.is_some(), "VLog should be enabled");
-
-	// Add data to create multiple VLog files
-	for i in 0..10 {
-		let key = format!("key_{i}");
-		let value = format!("value_{i}_large_data_that_should_force_vlog_storage");
-
-		let mut tx = tree1.begin().unwrap();
-		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
-
-		// Verify the data was written immediately
-		let tx = tree1.begin().unwrap();
-		let result = tx.get(key.as_bytes()).unwrap();
-		assert!(result.is_some(), "Key '{key}' should exist immediately after write");
-	}
-
-	// Verify all data exists in the first database
-	for i in 0..10 {
-		let key = format!("key_{i}");
-		let expected_value = format!("value_{i}_large_data_that_should_force_vlog_storage");
-
-		let tx = tree1.begin().unwrap();
-		let result = tx.get(key.as_bytes()).unwrap();
-		assert!(result.is_some(), "Key '{key}' should exist in first database");
-		assert_eq!(&result.unwrap(), expected_value.as_bytes());
-	}
-
-	// Drop the first database (this will close it)
-	tree1.close().await.unwrap();
-
-	// Create a new database instance - this should trigger VLog prefill
-	let tree2 = Tree::new(Arc::clone(&opts)).unwrap();
-	assert!(tree2.core.vlog.is_some(), "VLog should be enabled in second database");
-
-	// Verify that all existing data can still be read
-	for i in 0..10 {
-		let key = format!("key_{i}");
-		let expected_value = format!("value_{i}_large_data_that_should_force_vlog_storage");
-
-		let tx = tree2.begin().unwrap();
-		let result = tx.get(key.as_bytes()).unwrap();
-		assert!(result.is_some(), "Key '{key}' should exist after reopen");
-		assert_eq!(&result.unwrap(), expected_value.as_bytes());
-	}
-
-	// Add new data and verify it goes to the correct active file
-	let new_key = "new_key";
-	let new_value = "new_value_large_data_that_should_force_vlog_storage";
-
-	let mut tx = tree2.begin().unwrap();
-	tx.set(new_key.as_bytes(), new_value.as_bytes()).unwrap();
-	tx.commit().await.unwrap();
-
-	// Verify the new data can be read
-	let tx = tree2.begin().unwrap();
-	let result = tx.get(new_key.as_bytes()).unwrap();
-	assert!(result.is_some(), "New key should exist after write");
-	assert_eq!(&result.unwrap(), new_value.as_bytes());
-
-	// Verify we can still read from old data after adding new data
-	for i in 0..10 {
-		let key = format!("key_{i}");
-		let expected_value = format!("value_{i}_large_data_that_should_force_vlog_storage");
-
-		let tx = tree2.begin().unwrap();
-		let result = tx.get(key.as_bytes()).unwrap();
-		assert!(result.is_some(), "Old key '{key}' should still exist");
-		assert_eq!(&result.unwrap(), expected_value.as_bytes());
-	}
-
-	// Clean shutdown (drop will close it)
-	tree2.close().await.unwrap();
 }
 
 #[test(tokio::test)]
@@ -1887,18 +1529,15 @@ async fn test_tree_builder() {
 	let tree = TreeBuilder::new()
 		.with_path(path.clone())
 		.with_max_memtable_size(64 * 1024)
-		.with_enable_vlog(true)
-		.with_vlog_max_file_size(1024 * 1024)
 		.build()
 		.unwrap();
 
 	// Test basic operations
-	let mut txn = tree.begin().unwrap();
-	txn.set(b"test_key", b"test_value").unwrap();
-	txn.commit().await.unwrap();
+	let mut batch = tree.new_batch();
+	batch.set(b"test_key", b"test_value").unwrap();
+	tree.apply(batch, false).await.unwrap();
 
-	let txn = tree.begin().unwrap();
-	let result = txn.get(b"test_key").unwrap().unwrap();
+	let result = tree.get(b"test_key").unwrap().unwrap();
 	assert_eq!(result, b"test_value".to_vec());
 
 	// Test build_with_options
@@ -1909,239 +1548,12 @@ async fn test_tree_builder() {
 	assert_eq!(opts.path, temp_dir.path().join("tree2"));
 
 	// Test basic operations on the second tree
-	let mut txn = tree2.begin().unwrap();
-	txn.set(b"key2", b"value2").unwrap();
-	txn.commit().await.unwrap();
+	let mut batch2 = tree2.new_batch();
+	batch2.set(b"key2", b"value2").unwrap();
+	tree2.apply(batch2, false).await.unwrap();
 
-	let txn = tree2.begin().unwrap();
-	let result = txn.get(b"key2").unwrap().unwrap();
+	let result = tree2.get(b"key2").unwrap().unwrap();
 	assert_eq!(result, b"value2".to_vec());
-}
-
-#[test(tokio::test)]
-async fn test_soft_delete() {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 64 * 1024; // Small memtable to force flushes
-	});
-
-	// Step 1: Create multiple versions of a key across separate transactions
-	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-		// Create 5 different versions of the same key
-		for version in 1..=5 {
-			let value = format!("value_v{}", version);
-			let mut txn = tree.begin().unwrap();
-			txn.set(b"test_key", value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
-		}
-
-		// Verify the latest version exists
-		let txn = tree.begin().unwrap();
-		let result = txn.get(b"test_key").unwrap().unwrap();
-		assert_eq!(&result, b"value_v5");
-
-		// Soft delete the key
-		let mut txn = tree.begin().unwrap();
-		txn.soft_delete(b"test_key").unwrap();
-		txn.commit().await.unwrap();
-
-		// Verify the key is now invisible (soft deleted)
-		let txn = tree.begin().unwrap();
-		let result = txn.get(b"test_key").unwrap();
-		assert!(result.is_none(), "Soft deleted key should not be visible");
-
-		// Add a new different key
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"other_key", b"other_value").unwrap();
-		txn.commit().await.unwrap();
-
-		// Verify the new key exists
-		let txn = tree.begin().unwrap();
-		let result = txn.get(b"other_key").unwrap().unwrap();
-		assert_eq!(&result, b"other_value");
-
-		// Force flush to persist all changes to disk
-		tree.flush().unwrap();
-
-		// Close the database
-		tree.close().await.unwrap();
-	}
-
-	// Step 2: Reopen the database and verify soft deleted key is still invisible
-	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-		// Verify the soft deleted key is still invisible after restart
-		let txn = tree.begin().unwrap();
-		let result = txn.get(b"test_key").unwrap();
-		assert!(
-			result.is_none(),
-			"Soft deleted key should remain invisible after database restart"
-		);
-
-		// Verify the other key still exists
-		let txn = tree.begin().unwrap();
-		let result = txn.get(b"other_key").unwrap().unwrap();
-		assert_eq!(&result, b"other_value");
-
-		// Test range scan to ensure soft deleted key doesn't appear
-		let txn = tree.begin().unwrap();
-		let range_result = collect_transaction_all(
-			&mut txn.range(b"test".as_slice(), b"testz".as_slice()).unwrap(),
-		)
-		.unwrap();
-
-		// Should be empty since test_key is soft deleted
-		assert!(range_result.is_empty(), "Range scan should not include soft deleted keys");
-
-		// Test range scan that includes the other key
-		let txn = tree.begin().unwrap();
-		let range_result = collect_transaction_all(
-			&mut txn.range(b"other".as_slice(), b"otherz".as_slice()).unwrap(),
-		)
-		.unwrap();
-
-		// Should contain the other key
-		assert_eq!(range_result.len(), 1);
-		assert_eq!(&range_result[0].0, b"other_key");
-		assert_eq!(range_result[0].1.as_slice(), b"other_value");
-
-		// Test that we can reinsert the same key after soft delete
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"test_key", b"new_value_after_soft_delete").unwrap();
-		txn.commit().await.unwrap();
-
-		// Verify the new value is visible
-		let txn = tree.begin().unwrap();
-		let result = txn.get(b"test_key").unwrap().unwrap();
-		assert_eq!(&result, b"new_value_after_soft_delete");
-
-		tree.close().await.unwrap();
-	}
-}
-
-#[test(tokio::test)]
-async fn test_checkpoint_with_vlog() {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.vlog_max_file_size = 1024;
-		opts.max_memtable_size = 1024;
-		opts.enable_vlog = true;
-	});
-
-	// Create initial data with VLog enabled
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-	// Insert some data to ensure VLog files are created
-	let large_value = vec![1u8; 200]; // Large enough for VLog
-	for i in 0..5 {
-		let key = format!("key_{i}");
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), &large_value).unwrap();
-		txn.commit().await.unwrap();
-	}
-
-	// Force flush to create VLog files
-	tree.flush().unwrap();
-
-	// Create checkpoint
-	let checkpoint_dir = temp_dir.path().join("checkpoint");
-	let metadata = tree.create_checkpoint(&checkpoint_dir).unwrap();
-
-	// Verify checkpoint metadata
-	assert!(metadata.timestamp > 0);
-	assert!(metadata.total_size > 0);
-
-	// Verify all expected directories exist in checkpoint
-	assert!(checkpoint_dir.exists());
-	assert!(checkpoint_dir.join("sstables").exists());
-	assert!(checkpoint_dir.join("wal").exists());
-	assert!(checkpoint_dir.join("manifest").exists());
-	assert!(checkpoint_dir.join("vlog").exists());
-	assert!(checkpoint_dir.join("CHECKPOINT_METADATA").exists());
-
-	// Verify VLog files are in the checkpoint
-	let vlog_checkpoint_dir = checkpoint_dir.join("vlog");
-	let vlog_entries = std::fs::read_dir(&vlog_checkpoint_dir).unwrap();
-	let vlog_files: Vec<_> = vlog_entries
-		.filter_map(|entry| {
-			let entry = entry.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert!(!vlog_files.is_empty(), "Should have VLog files in the checkpoint");
-
-	// Insert more data after checkpoint
-	for i in 5..10 {
-		let key = format!("key_{i}");
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), &large_value).unwrap();
-		txn.commit().await.unwrap();
-	}
-
-	// Force flush to ensure the new data is also on disk
-	tree.flush().unwrap();
-
-	// Verify all data exists before restore
-	for i in 0..10 {
-		let key = format!("key_{i}");
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap();
-		assert!(result.is_some(), "Key '{key}' should exist before restore");
-	}
-
-	// Restore from checkpoint
-	tree.restore_from_checkpoint(&checkpoint_dir).unwrap();
-
-	// Verify data is restored to checkpoint state (keys 0-4 exist, 5-9 don't)
-	for i in 0..5 {
-		let key = format!("key_{i}");
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap();
-		assert!(result.is_some(), "Key '{key}' should exist after restore");
-		assert_eq!(&result.unwrap(), &large_value);
-	}
-
-	// Verify the newer keys don't exist after restore
-	for i in 5..10 {
-		let key = format!("key_{i}");
-		let txn = tree.begin().unwrap();
-		let result = txn.get(key.as_bytes()).unwrap();
-		assert!(result.is_none(), "Key '{key}' should not exist after restore");
-	}
-
-	// Verify VLog directory is restored
-	let vlog_dir = opts.vlog_dir();
-
-	assert!(vlog_dir.exists(), "VLog directory should exist after restore");
-
-	// Verify VLog files are restored
-	let vlog_entries = std::fs::read_dir(&vlog_dir).unwrap();
-	let vlog_files: Vec<_> = vlog_entries
-		.filter_map(|entry| {
-			let entry = entry.ok()?;
-			let name = entry.file_name().to_string_lossy().to_string();
-			if opts.is_vlog_filename(&name) {
-				Some(name)
-			} else {
-				None
-			}
-		})
-		.collect();
-
-	assert!(!vlog_files.is_empty(), "Should have VLog files after restore");
 }
 
 #[test_log::test(tokio::test)]
@@ -2159,9 +1571,9 @@ async fn test_clean_shutdown_actually_skips_wal() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"test_key", b"test_value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"test_key", b"test_value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		// Clean shutdown - should flush to SST
 		tree.close().await.unwrap();
@@ -2223,9 +1635,9 @@ async fn test_crash_before_flush_replays_wal() {
 	// Phase 1: Write data and simulate crash (no clean shutdown)
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"crash_key", b"crash_value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"crash_key", b"crash_value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		// Simulate crash: drop tree without calling close()
 		// This leaves data in WAL but not flushed to SST
@@ -2242,8 +1654,8 @@ async fn test_crash_before_flush_replays_wal() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Data should be available (recovered from WAL)
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"crash_key").unwrap(), Some(b"crash_value".to_vec()));
+
+		assert_eq!(tree.get(b"crash_key").unwrap(), Some(b"crash_value".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -2265,9 +1677,9 @@ async fn test_log_number_advances_with_flushes() {
 
 	// Write data to trigger flush #1
 	for i in 0..100 {
-		let mut txn = tree.begin().unwrap();
-		txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(format!("key_{i}").as_bytes(), b"value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Force flush
@@ -2277,9 +1689,9 @@ async fn test_log_number_advances_with_flushes() {
 
 	// Write more data, trigger flush #2
 	for i in 100..200 {
-		let mut txn = tree.begin().unwrap();
-		txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(format!("key_{i}").as_bytes(), b"value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -2306,9 +1718,9 @@ async fn test_last_sequence_persists_across_restart() {
 
 		// Write data
 		for i in 0..50 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("key_{i}").as_bytes(), b"value").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Force flush to persist
@@ -2349,9 +1761,9 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 	// Phase 1: Write data and clean shutdown (no flush, just close)
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		// Don't flush, just close - this will flush memtable on shutdown
 		tree.close().await.unwrap();
@@ -2364,9 +1776,9 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 	// Phase 2: Write more data but crash (no flush, no close)
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key2", b"value2").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		// Crash: drop without close, release lock manually
 		{
@@ -2381,7 +1793,8 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// In-memory sequence should be updated from WAL (key2 recovery)
-		let in_memory_seq = tree.core.seq_num();
+		let in_memory_seq =
+			tree.core.inner.visible_seq_num.load(std::sync::atomic::Ordering::Acquire);
 
 		// Manifest sequence should still be from Phase 1
 		let manifest_seq = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
@@ -2428,16 +1841,16 @@ async fn test_clean_shutdown_no_empty_wal() {
 		// Write data and trigger flush
 		// make_room_for_write rotates WAL, creating a new WAL for subsequent writes
 		for i in 0..100 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("key_{i}").as_bytes(), b"value").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 		tree.flush().unwrap();
 
 		// Write a bit more data to the new WAL
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"extra", b"data").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"extra", b"data").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		// Clean shutdown (should flush the extra data, update log_number, close WAL)
 		tree.close().await.unwrap();
@@ -2461,9 +1874,9 @@ async fn test_clean_shutdown_no_empty_wal() {
 	// Verify restart works and data is accessible
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"key_0").unwrap(), Some(b"value".to_vec()));
-		assert_eq!(txn.get(b"extra").unwrap(), Some(b"data".to_vec()));
+
+		assert_eq!(tree.get(b"key_0").unwrap(), Some(b"value".to_vec()));
+		assert_eq!(tree.get(b"extra").unwrap(), Some(b"data".to_vec()));
 		tree.close().await.unwrap();
 	}
 }
@@ -2482,27 +1895,27 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 
 		// Flush cycle 1
 		for i in 0..50 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("batch1_key_{i}").as_bytes(), b"value1").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("batch1_key_{i}").as_bytes(), b"value1").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 		tree.flush().unwrap();
 		let log_num_1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 
 		// Flush cycle 2
 		for i in 0..50 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("batch2_key_{i}").as_bytes(), b"value2").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("batch2_key_{i}").as_bytes(), b"value2").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 		tree.flush().unwrap();
 		let log_num_2 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 
 		// Flush cycle 3
 		for i in 0..50 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("batch3_key_{i}").as_bytes(), b"value3").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("batch3_key_{i}").as_bytes(), b"value3").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 		tree.flush().unwrap();
 		let log_num_3 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -2516,12 +1929,11 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 	// Restart and verify all data accessible from SSTables
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let txn = tree.begin().unwrap();
 
 		// All batches should be accessible (reading doesn't need mut)
-		assert_eq!(txn.get(b"batch1_key_0").unwrap(), Some(b"value1".to_vec()));
-		assert_eq!(txn.get(b"batch2_key_0").unwrap(), Some(b"value2".to_vec()));
-		assert_eq!(txn.get(b"batch3_key_0").unwrap(), Some(b"value3".to_vec()));
+		assert_eq!(tree.get(b"batch1_key_0").unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"batch2_key_0").unwrap(), Some(b"value2".to_vec()));
+		assert_eq!(tree.get(b"batch3_key_0").unwrap(), Some(b"value3".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -2538,9 +1950,9 @@ async fn test_shutdown_with_empty_memtable() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Write and flush everything
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key", b"value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key", b"value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.flush().unwrap();
 
 		// Get manifest state
@@ -2559,8 +1971,8 @@ async fn test_shutdown_with_empty_memtable() {
 	// Restart successfully
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"key").unwrap(), Some(b"value".to_vec()));
+
+		assert_eq!(tree.get(b"key").unwrap(), Some(b"value".to_vec()));
 		tree.close().await.unwrap();
 	}
 }
@@ -2578,9 +1990,9 @@ async fn test_full_crash_recovery_scenario() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		for i in 0..50 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("batch_a_{i}").as_bytes(), b"value_a").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("batch_a_{i}").as_bytes(), b"value_a").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 		tree.flush().unwrap();
 		tree.close().await.unwrap();
@@ -2590,9 +2002,9 @@ async fn test_full_crash_recovery_scenario() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		for i in 0..50 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("batch_b_{i}").as_bytes(), b"value_b").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("batch_b_{i}").as_bytes(), b"value_b").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 		tree.flush().unwrap();
 
@@ -2610,9 +2022,9 @@ async fn test_full_crash_recovery_scenario() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		for i in 0..20 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("batch_c_{i}").as_bytes(), b"value_c").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("batch_c_{i}").as_bytes(), b"value_c").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Simulate crash: drop without close
@@ -2629,11 +2041,11 @@ async fn test_full_crash_recovery_scenario() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// All data should be accessible
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"batch_a_0").unwrap(), Some(b"value_a".to_vec()));
-		assert_eq!(txn.get(b"batch_b_0").unwrap(), Some(b"value_b".to_vec()));
+
+		assert_eq!(tree.get(b"batch_a_0").unwrap(), Some(b"value_a".to_vec()));
+		assert_eq!(tree.get(b"batch_b_0").unwrap(), Some(b"value_b".to_vec()));
 		assert_eq!(
-			txn.get(b"batch_c_0").unwrap(),
+			tree.get(b"batch_c_0").unwrap(),
 			Some(b"value_c".to_vec()),
 			"Batch C should be recovered from WAL"
 		);
@@ -2655,16 +2067,15 @@ async fn test_concurrent_flush_after_rotation() {
 
 	// Write data
 	for i in 0..100 {
-		let mut txn = tree.begin().unwrap();
-		txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(format!("key_{i}").as_bytes(), b"value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Verify data is accessible before flush
 	{
-		let txn = tree.begin().unwrap();
 		assert_eq!(
-			txn.get(b"key_0").unwrap(),
+			tree.get(b"key_0").unwrap(),
 			Some(b"value".to_vec()),
 			"Data should be accessible before flush"
 		);
@@ -2678,34 +2089,30 @@ async fn test_concurrent_flush_after_rotation() {
 
 	// Verify data is still accessible after flush
 	{
-		let txn = tree.begin().unwrap();
 		assert_eq!(
-			txn.get(b"key_0").unwrap(),
+			tree.get(b"key_0").unwrap(),
 			Some(b"value".to_vec()),
 			"Data should be accessible after flush"
 		);
 	}
 
 	// Verify no errors and system continues
-	let mut txn = tree.begin().unwrap();
-	txn.set(b"after_flush", b"value").unwrap();
-	txn.commit().await.unwrap();
-	drop(txn);
+	let mut batch = tree.new_batch();
+	batch.set(b"after_flush", b"value").unwrap();
+	tree.apply(batch, false).await.unwrap();
 
 	// Verify both old and new data are accessible
 	{
-		let txn = tree.begin().unwrap();
 		assert_eq!(
-			txn.get(b"key_0").unwrap(),
+			tree.get(b"key_0").unwrap(),
 			Some(b"value".to_vec()),
 			"Old data should still be accessible"
 		);
 		assert_eq!(
-			txn.get(b"after_flush").unwrap(),
+			tree.get(b"after_flush").unwrap(),
 			Some(b"value".to_vec()),
 			"New data after flush should be accessible"
 		);
-		drop(txn);
 	}
 
 	tree.close().await.unwrap();
@@ -2723,9 +2130,9 @@ async fn test_wal_file_reuse_across_restarts() {
 	// Phase 1: Open database, write one transaction, close
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -2735,9 +2142,9 @@ async fn test_wal_file_reuse_across_restarts() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Write another transaction
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key2", b"value2").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -2745,11 +2152,10 @@ async fn test_wal_file_reuse_across_restarts() {
 	// Phase 3: Verify recovery
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let txn = tree.begin().unwrap();
 
 		// Both keys should be accessible
-		let key1_present = txn.get(b"key1").unwrap().is_some();
-		let key2_present = txn.get(b"key2").unwrap().is_some();
+		let key1_present = tree.get(b"key1").unwrap().is_some();
+		let key2_present = tree.get(b"key2").unwrap().is_some();
 
 		assert!(key1_present && key2_present, "Both keys should be recovered");
 
@@ -2771,9 +2177,9 @@ async fn test_wal_append_after_crash_recovery() {
 	// Phase 1: Write data and simulate crash (no clean shutdown)
 	let manifest_log = {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		let manifest_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 
@@ -2801,9 +2207,9 @@ async fn test_wal_append_after_crash_recovery() {
 		assert_eq!(wal_num_after_reopen, 0, "WAL should reuse existing file #0 since log_number=0");
 
 		// Write another transaction to same WAL
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key2", b"value2").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		let wal_num_after_write = tree.core.inner.wal.read().get_active_log_number();
 
@@ -2848,9 +2254,9 @@ async fn test_flush_on_close_creates_sst() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Write data to memtable (no manual flush)
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"test_key", b"test_value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"test_key", b"test_value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		let sst_count_before_close = count_ssts();
 
@@ -2873,8 +2279,8 @@ async fn test_flush_on_close_creates_sst() {
 
 		// Memtable should be empty (data in SST)
 		// Data should still be accessible
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"test_key").unwrap(), Some(b"test_value".to_vec()));
+
+		assert_eq!(tree.get(b"test_key").unwrap(), Some(b"test_value".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -2910,9 +2316,9 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		for i in 0..50 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("cycle1_key_{}", i).as_bytes(), b"value1").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("cycle1_key_{}", i).as_bytes(), b"value1").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		let sst_before = count_ssts();
@@ -2937,14 +2343,13 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Verify cycle 1 data is accessible
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
-		drop(txn);
+
+		assert_eq!(tree.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
 
 		for i in 0..50 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("cycle2_key_{}", i).as_bytes(), b"value2").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("cycle2_key_{}", i).as_bytes(), b"value2").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		let sst_before = count_ssts();
@@ -2972,15 +2377,14 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		let tree = Tree::new(opts_with_flush).unwrap();
 
 		// Verify both previous cycles' data
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
-		assert_eq!(txn.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec()));
-		drop(txn);
+
+		assert_eq!(tree.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec()));
 
 		for i in 0..50 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("cycle3_key_{}", i).as_bytes(), b"value3").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("cycle3_key_{}", i).as_bytes(), b"value3").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		let sst_before_close = count_ssts();
@@ -3001,10 +2405,9 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
-		assert_eq!(txn.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec()));
-		assert_eq!(txn.get(b"cycle3_key_0").unwrap(), Some(b"value3".to_vec()));
+		assert_eq!(tree.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec()));
+		assert_eq!(tree.get(b"cycle3_key_0").unwrap(), Some(b"value3".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -3026,9 +2429,9 @@ async fn test_close_without_flush() {
 
 		// Write some data that won't trigger auto-flush
 		for i in 0..10 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Count SSTs before close
@@ -3049,8 +2452,8 @@ async fn test_close_without_flush() {
 		);
 
 		// Data should still be accessible via WAL recovery
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"key_0").unwrap(), Some(b"value".to_vec()));
+
+		assert_eq!(tree.get(b"key_0").unwrap(), Some(b"value".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -3068,9 +2471,9 @@ async fn test_flush_on_close_option_comparison() {
 		let sst_before;
 		{
 			let tree = Tree::new(Arc::clone(&opts)).unwrap();
-			let mut txn = tree.begin().unwrap();
-			txn.set(b"test", b"data").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(b"test", b"data").unwrap();
+			tree.apply(batch, false).await.unwrap();
 
 			sst_before = tree.core.inner.level_manifest.read().unwrap().iter().count();
 
@@ -3094,9 +2497,9 @@ async fn test_flush_on_close_option_comparison() {
 		let sst_before;
 		{
 			let tree = Tree::new(Arc::clone(&opts)).unwrap();
-			let mut txn = tree.begin().unwrap();
-			txn.set(b"test", b"data").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(b"test", b"data").unwrap();
+			tree.apply(batch, false).await.unwrap();
 
 			sst_before = tree.core.inner.level_manifest.read().unwrap().iter().count();
 
@@ -3109,8 +2512,8 @@ async fn test_flush_on_close_option_comparison() {
 		assert_eq!(sst_after, sst_before, "flush_on_close=false should NOT create SST");
 
 		// But data should still be accessible via WAL
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"test").unwrap(), Some(b"data".to_vec()));
+
+		assert_eq!(tree.get(b"test").unwrap(), Some(b"data".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -3152,9 +2555,9 @@ async fn test_flush_all_memtables_on_close_ordering() {
 		// Write enough data to trigger multiple memtable flushes
 		// This creates immutable memtables in the background
 		for i in 0..50 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("key_{:04}", i).as_bytes(), b"value_data_here").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("key_{:04}", i).as_bytes(), b"value_data_here").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Wait a bit for background flushes to start
@@ -3164,9 +2567,9 @@ async fn test_flush_all_memtables_on_close_ordering() {
 		log::info!("SST count before close: {}", sst_count_before_close);
 
 		// Write one more entry to ensure active memtable has data
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"final_key", b"final_value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"final_key", b"final_value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		// Close - should flush all remaining memtables
 		tree.close().await.unwrap();
@@ -3187,16 +2590,15 @@ async fn test_flush_all_memtables_on_close_ordering() {
 
 		// Verify data from all writes
 		for i in 0..50 {
-			let txn = tree.begin().unwrap();
 			let key = format!("key_{:04}", i);
-			let value = txn.get(key.as_bytes()).unwrap();
+			let value = tree.get(key.as_bytes()).unwrap();
 			assert!(value.is_some(), "Key {} should exist after close/reopen", key);
 		}
 
 		// Verify final key
-		let txn = tree.begin().unwrap();
+
 		assert_eq!(
-			txn.get(b"final_key").unwrap(),
+			tree.get(b"final_key").unwrap(),
 			Some(b"final_value".to_vec()),
 			"Final key should exist after close/reopen"
 		);
@@ -3222,9 +2624,9 @@ async fn test_flush_immutable_memtables_with_empty_active() {
 
 		// Write data to trigger a memtable flush (creates immutable memtable)
 		for i in 0..20 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("key_{}", i).as_bytes(), b"value_data").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("key_{}", i).as_bytes(), b"value_data").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Wait for background flush to complete
@@ -3240,9 +2642,8 @@ async fn test_flush_immutable_memtables_with_empty_active() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		for i in 0..20 {
-			let txn = tree.begin().unwrap();
 			let key = format!("key_{}", i);
-			assert!(txn.get(key.as_bytes()).unwrap().is_some(), "Key {} should exist", key);
+			assert!(tree.get(key.as_bytes()).unwrap().is_some(), "Key {} should exist", key);
 		}
 
 		tree.close().await.unwrap();
@@ -3266,9 +2667,9 @@ async fn test_sst_table_ids_ordered_correctly_on_close() {
 
 		// Write data - will be flushed on close
 		for i in 0..5 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Get initial table count
@@ -3326,9 +2727,9 @@ async fn test_wal_number_tracking_on_flush() {
 	);
 
 	// Write some data
-	let mut txn = tree.begin().unwrap();
-	txn.set(b"key1", b"value1").unwrap();
-	txn.commit().await.unwrap();
+	let mut batch = tree.new_batch();
+	batch.set(b"key1", b"value1").unwrap();
+	tree.apply(batch, false).await.unwrap();
 
 	// Explicitly flush
 	tree.flush().unwrap();
@@ -3356,9 +2757,9 @@ async fn test_wal_number_tracking_on_flush() {
 	);
 
 	// Second write + flush cycle
-	let mut txn = tree.begin().unwrap();
-	txn.set(b"key2", b"value2").unwrap();
-	txn.commit().await.unwrap();
+	let mut batch = tree.new_batch();
+	batch.set(b"key2", b"value2").unwrap();
+	tree.apply(batch, false).await.unwrap();
 
 	tree.flush().unwrap();
 
@@ -3375,14 +2776,13 @@ async fn test_wal_number_tracking_on_flush() {
 
 	let tree2 = Tree::new(Arc::clone(&opts)).unwrap();
 
-	let txn = tree2.begin().unwrap();
 	assert_eq!(
-		txn.get(b"key1").unwrap(),
+		tree2.get(b"key1").unwrap(),
 		Some(b"value1".to_vec()),
 		"key1 should exist after reopen"
 	);
 	assert_eq!(
-		txn.get(b"key2").unwrap(),
+		tree2.get(b"key2").unwrap(),
 		Some(b"value2".to_vec()),
 		"key2 should exist after reopen"
 	);
@@ -3408,9 +2808,9 @@ async fn test_memtable_wal_number_after_swap() {
 	log::info!("Initial WAL number: {}", wal_1);
 
 	// Write data and flush
-	let mut txn = tree.begin().unwrap();
-	txn.set(b"key1", b"value1").unwrap();
-	txn.commit().await.unwrap();
+	let mut batch = tree.new_batch();
+	batch.set(b"key1", b"value1").unwrap();
+	tree.apply(batch, false).await.unwrap();
 
 	tree.flush().unwrap();
 
@@ -3419,9 +2819,9 @@ async fn test_memtable_wal_number_after_swap() {
 	assert!(wal_2 > wal_1, "WAL number should increase after flush: {} > {}", wal_2, wal_1);
 
 	// Write more and flush again
-	let mut txn = tree.begin().unwrap();
-	txn.set(b"key2", b"value2").unwrap();
-	txn.commit().await.unwrap();
+	let mut batch = tree.new_batch();
+	batch.set(b"key2", b"value2").unwrap();
+	tree.apply(batch, false).await.unwrap();
 
 	tree.flush().unwrap();
 
@@ -3434,14 +2834,13 @@ async fn test_memtable_wal_number_after_swap() {
 
 	let tree2 = Tree::new(Arc::clone(&opts)).unwrap();
 
-	let txn = tree2.begin().unwrap();
 	assert_eq!(
-		txn.get(b"key1").unwrap(),
+		tree2.get(b"key1").unwrap(),
 		Some(b"value1".to_vec()),
 		"key1 should exist after reopen"
 	);
 	assert_eq!(
-		txn.get(b"key2").unwrap(),
+		tree2.get(b"key2").unwrap(),
 		Some(b"value2".to_vec()),
 		"key2 should exist after reopen"
 	);
@@ -3473,9 +2872,9 @@ async fn test_wal_number_correct_after_reopen() {
 			// Get the WAL number before flush - this WAL will be flushed
 			current_wal = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
 
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("key{}", i).as_bytes(), b"value").unwrap();
+			tree.apply(batch, false).await.unwrap();
 			tree.flush().unwrap();
 
 			log::info!(
@@ -3565,9 +2964,9 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 
 			// Write 100 entries
 			for i in 0..100 {
-				let mut txn = tree.begin().unwrap();
-				txn.set(format!("cycle{}_key_{}", cycle, i).as_bytes(), b"value").unwrap();
-				txn.commit().await.unwrap();
+				let mut batch = tree.new_batch();
+				batch.set(format!("cycle{}_key_{}", cycle, i).as_bytes(), b"value").unwrap();
+				tree.apply(batch, false).await.unwrap();
 			}
 
 			// Close (should flush)
@@ -3585,11 +2984,10 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 		// Verify data from this cycle is accessible
 		{
 			let tree = Tree::new(Arc::clone(&opts)).unwrap();
-			let txn = tree.begin().unwrap();
 
 			// Check data from current cycle
 			assert_eq!(
-				txn.get(format!("cycle{}_key_0", cycle).as_bytes()).unwrap(),
+				tree.get(format!("cycle{}_key_0", cycle).as_bytes()).unwrap(),
 				Some(b"value".to_vec()),
 				"Data from cycle {} should be recoverable",
 				cycle
@@ -3598,14 +2996,13 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 			// Check data from all previous cycles is still accessible
 			for prev_cycle in 1..cycle {
 				assert_eq!(
-					txn.get(format!("cycle{}_key_0", prev_cycle).as_bytes()).unwrap(),
+					tree.get(format!("cycle{}_key_0", prev_cycle).as_bytes()).unwrap(),
 					Some(b"value".to_vec()),
 					"Data from previous cycle {} should still be accessible",
 					prev_cycle
 				);
 			}
 
-			drop(txn);
 			tree.close().await.unwrap();
 		}
 	}
@@ -3616,18 +3013,16 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 	// Verify all data is still accessible after all cycles
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let txn = tree.begin().unwrap();
 
 		for cycle in 1..=3 {
 			assert_eq!(
-				txn.get(format!("cycle{}_key_0", cycle).as_bytes()).unwrap(),
+				tree.get(format!("cycle{}_key_0", cycle).as_bytes()).unwrap(),
 				Some(b"value".to_vec()),
 				"Data from cycle {} should be accessible in final check",
 				cycle
 			);
 		}
 
-		drop(txn);
 		tree.close().await.unwrap();
 	}
 }
@@ -3641,9 +3036,9 @@ async fn test_cleanup_orphaned_sst_files() {
 	// Create initial tree and add some data
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.flush().unwrap();
 		tree.close().await.unwrap();
 	}
@@ -3664,8 +3059,8 @@ async fn test_cleanup_orphaned_sst_files() {
 		assert!(!orphaned_path.exists(), "Orphaned SST should be cleaned up");
 
 		// Verify real data still accessible
-		let txn = tree.begin().unwrap();
-		let result = txn.get(b"key1").unwrap().unwrap();
+
+		let result = tree.get(b"key1").unwrap().unwrap();
 		assert_eq!(result, b"value1".to_vec());
 
 		tree.close().await.unwrap();
@@ -3692,9 +3087,9 @@ async fn test_manifest_atomic_sst_and_log_number() {
 
 	// Add data
 	for i in 0..100 {
-		let mut txn = tree.begin().unwrap();
-		txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(format!("key{}", i).as_bytes(), b"value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Explicitly trigger flush to ensure test reliability
@@ -3731,16 +3126,13 @@ async fn test_no_spurious_small_flush() {
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 	// Add small amount of data (way below threshold)
-	let mut txn = tree.begin().unwrap();
-	txn.set(b"key1", b"value1").unwrap();
-	txn.commit().await.unwrap();
+	let mut batch = tree.new_batch();
+	batch.set(b"key1", b"value1").unwrap();
+	tree.apply(batch, false).await.unwrap();
 
-	// Manually trigger wake_up (simulating spurious notification)
-	if let Some(ref task_manager) = *tree.core.task_manager.lock().unwrap() {
-		task_manager.wake_up_memtable();
-	}
-
-	// Wait a bit
+	// Note: TaskManager no longer exists; spurious flush prevention is now
+	// handled internally by the compaction scheduler. This test verifies
+	// that small memtables are not flushed unnecessarily.
 	tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
 	// Verify no flush occurred (data still in active memtable, not in L0)
@@ -3765,9 +3157,9 @@ async fn test_crash_recovery_with_orphaned_sst() {
 	// Phase 1: Write data and flush
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"committed_key", b"committed_value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"committed_key", b"committed_value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.flush().unwrap();
 		tree.close().await.unwrap();
 	}
@@ -3780,9 +3172,9 @@ async fn test_crash_recovery_with_orphaned_sst() {
 	// Add more data that would be in WAL
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"wal_key", b"wal_value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"wal_key", b"wal_value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 		// Don't flush - keep in WAL
 		tree.close().await.unwrap();
 	}
@@ -3795,12 +3187,12 @@ async fn test_crash_recovery_with_orphaned_sst() {
 		assert!(!orphaned_sst_path.exists(), "Orphaned SST should be removed");
 
 		// Verify WAL data was recovered
-		let txn = tree.begin().unwrap();
-		let result = txn.get(b"wal_key").unwrap().unwrap();
+
+		let result = tree.get(b"wal_key").unwrap().unwrap();
 		assert_eq!(result, b"wal_value".to_vec());
 
 		// Verify committed data still accessible
-		let result = txn.get(b"committed_key").unwrap().unwrap();
+		let result = tree.get(b"committed_key").unwrap().unwrap();
 		assert_eq!(result, b"committed_value".to_vec());
 
 		tree.close().await.unwrap();
@@ -3816,9 +3208,9 @@ async fn test_cleanup_multiple_orphaned_ssts() {
 	// Create initial database
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.close().await.unwrap();
 	}
 
@@ -3862,9 +3254,9 @@ async fn test_valid_ssts_not_deleted_during_cleanup() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		for i in 0..200 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("key{}", i).as_bytes(), b"value").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -3902,8 +3294,8 @@ async fn test_valid_ssts_not_deleted_during_cleanup() {
 		}
 
 		// Verify data still accessible
-		let txn = tree.begin().unwrap();
-		let result = txn.get(b"key1").unwrap().unwrap();
+
+		let result = tree.get(b"key1").unwrap().unwrap();
 		assert_eq!(result, b"value".to_vec());
 
 		tree.close().await.unwrap();
@@ -3931,9 +3323,9 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 				let value = format!("batch{}_value{}", batch_num, i);
 				expected_keys.push(key.clone());
 
-				let mut txn = tree.begin().unwrap();
-				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				let mut batch = tree.new_batch();
+				batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+				tree.apply(batch, false).await.unwrap();
 			}
 			// Force flush after each batch
 			tree.flush().unwrap();
@@ -4002,17 +3394,16 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 
 		// Verify ALL data is still accessible
 		for key in &expected_keys {
-			let txn = tree.begin().unwrap();
-			let result = txn.get(key.as_bytes()).unwrap();
+			let result = tree.get(key.as_bytes()).unwrap();
 			assert!(result.is_some(), "Key {} should be accessible", key);
 		}
 
 		// Spot check a few specific values
-		let txn = tree.begin().unwrap();
-		let result = txn.get(b"batch0_key0").unwrap().unwrap();
+
+		let result = tree.get(b"batch0_key0").unwrap().unwrap();
 		assert_eq!(result, b"batch0_value0".to_vec());
 
-		let result = txn.get(b"batch4_key49").unwrap().unwrap();
+		let result = tree.get(b"batch4_key49").unwrap().unwrap();
 		assert_eq!(result, b"batch4_value49".to_vec());
 
 		tree.close().await.unwrap();
@@ -4034,10 +3425,10 @@ async fn test_wal_recovery_mode_absolute_consistency_fails_on_corruption() {
 		});
 
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key1", b"value1").unwrap();
-		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		// Close without flush - data only in WAL
 		tree.close().await.unwrap();
@@ -4090,10 +3481,10 @@ async fn test_wal_recovery_mode_tolerate_with_repair_succeeds_on_corruption() {
 		});
 
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key1", b"value1").unwrap();
-		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key1", b"value1").unwrap();
+		batch.set(b"key2", b"value2").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		// Close without flush - data only in WAL
 		tree.close().await.unwrap();
@@ -4124,9 +3515,9 @@ async fn test_wal_recovery_mode_tolerate_with_repair_succeeds_on_corruption() {
 		};
 
 		// Verify data was recovered
-		let txn = tree.begin().unwrap();
-		assert_eq!(txn.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-		assert_eq!(txn.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+
+		assert_eq!(tree.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"key2").unwrap(), Some(b"value2".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -4160,9 +3551,9 @@ async fn test_wal_incremental_number_after_flush_and_reopen() {
 		let wal_num_before = tree.core.inner.wal.read().get_active_log_number();
 		assert_eq!(wal_num_before, 0, "Fresh database should start at WAL #0");
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"test_key", b"test_value").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"test_key", b"test_value").unwrap();
+		tree.apply(batch, false).await.unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -4201,7 +3592,6 @@ async fn test_wal_incremental_number_after_flush_and_reopen() {
 #[test_log::test(tokio::test)]
 async fn test_recovery_with_manually_created_wal_segments() {
 	use crate::batch::Batch;
-	use crate::vlog::ValueLocation;
 	use crate::wal::Wal;
 
 	let temp_dir = TempDir::new("test").unwrap();
@@ -4221,9 +3611,9 @@ async fn test_recovery_with_manually_created_wal_segments() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key1", b"value1_from_sst").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key1", b"value1_from_sst").unwrap();
+		tree.apply(batch, false).await.unwrap();
 		tree.flush().unwrap();
 
 		log_number_after_phase1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -4262,9 +3652,8 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		let segment_for_key2 = highest_existing + 1;
 		let next_seq = last_seq_after_phase1 + 1;
 		{
-			let mut batch = Batch::new(next_seq);
-			let encoded_value =
-				ValueLocation::with_inline_value(b"value2_from_wal".to_vec()).encode();
+			let mut batch = Batch::new_with_seq(next_seq);
+			let encoded_value = b"value2_from_wal".to_vec();
 			batch
 				.add_record(InternalKeyKind::Set, b"key2".to_vec(), Some(encoded_value), 0)
 				.unwrap();
@@ -4284,9 +3673,8 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		// Create segment for key3
 		let segment_for_key3 = segment_for_key2 + 1;
 		{
-			let mut batch = Batch::new(next_seq + 1);
-			let encoded_value =
-				ValueLocation::with_inline_value(b"value3_from_wal".to_vec()).encode();
+			let mut batch = Batch::new_with_seq(next_seq + 1);
+			let encoded_value = b"value3_from_wal".to_vec();
 			batch
 				.add_record(InternalKeyKind::Set, b"key3".to_vec(), Some(encoded_value), 0)
 				.unwrap();
@@ -4331,16 +3719,15 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		);
 
 		// Verify initial recovery worked
-		let txn = tree.begin().unwrap();
-		assert!(txn.get(b"key1").unwrap().is_some(), "key1 should exist");
-		assert!(txn.get(b"key2").unwrap().is_some(), "key2 should exist");
-		assert!(txn.get(b"key3").unwrap().is_some(), "key3 should exist");
-		drop(txn);
+
+		assert!(tree.get(b"key1").unwrap().is_some(), "key1 should exist");
+		assert!(tree.get(b"key2").unwrap().is_some(), "key2 should exist");
+		assert!(tree.get(b"key3").unwrap().is_some(), "key3 should exist");
 
 		// Write NEW data after recovery - this is the data that could be lost
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key4_new_after_recovery", b"value4").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key4_new_after_recovery", b"value4").unwrap();
+		tree.apply(batch, false).await.unwrap();
 		log::info!("Phase 3: Wrote key4 to WAL segment {}", active_wal_after_recovery);
 
 		// Flush - this updates log_number
@@ -4350,9 +3737,9 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		log::info!("Phase 3: After flush, log_number={}", log_number_after_flush);
 
 		// Write more data that stays in WAL (not flushed)
-		let mut txn = tree.begin().unwrap();
-		txn.set(b"key5_unflushed", b"value5").unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(b"key5_unflushed", b"value5").unwrap();
+		tree.apply(batch, false).await.unwrap();
 		log::info!("Phase 3: Wrote key5 (unflushed)");
 
 		// Close without flush (simulating crash)
@@ -4365,15 +3752,13 @@ async fn test_recovery_with_manually_created_wal_segments() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-		let txn = tree.begin().unwrap();
-
 		// Original data should still exist
-		assert!(txn.get(b"key1").unwrap().is_some(), "key1 should persist");
-		assert!(txn.get(b"key2").unwrap().is_some(), "key2 should persist");
-		assert!(txn.get(b"key3").unwrap().is_some(), "key3 should persist");
+		assert!(tree.get(b"key1").unwrap().is_some(), "key1 should persist");
+		assert!(tree.get(b"key2").unwrap().is_some(), "key2 should persist");
+		assert!(tree.get(b"key3").unwrap().is_some(), "key3 should persist");
 
 		// CRITICAL: New data written after recovery should NOT be lost
-		let key4 = txn.get(b"key4_new_after_recovery").unwrap();
+		let key4 = tree.get(b"key4_new_after_recovery").unwrap();
 		assert_eq!(
 			key4,
 			Some(b"value4".to_vec()),
@@ -4381,7 +3766,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 				 This happens when WAL opens at log_number instead of highest segment."
 		);
 
-		let key5 = txn.get(b"key5_unflushed").unwrap();
+		let key5 = tree.get(b"key5_unflushed").unwrap();
 		assert_eq!(key5, Some(b"value5".to_vec()), "DATA LOSS BUG: key5 (unflushed) was lost!");
 
 		log::info!("Phase 4: All data verified - no data loss!");
@@ -4398,10 +3783,7 @@ async fn test_flush_wal_concurrent_commits() {
 	use tokio::task::JoinSet;
 
 	let temp_dir = create_temp_directory();
-	let opts = create_test_options(temp_dir.path().to_path_buf(), |opts| {
-		opts.enable_vlog = true;
-		opts.vlog_value_threshold = 50; // Some values will go to VLog
-	});
+	let opts = create_test_options(temp_dir.path().to_path_buf(), |_opts| {});
 
 	let tree = Arc::new(Tree::new(opts).unwrap());
 	let commit_count = Arc::new(AtomicUsize::new(0));
@@ -4423,16 +3805,16 @@ async fn test_flush_wal_concurrent_commits() {
 			for i in 0..commits_per_task {
 				let key = format!("task{}_key{}", task_id, i);
 				let value = if i % 2 == 0 {
-					// Small value (inline)
+					// Small value
 					format!("value{}", i)
 				} else {
-					// Large value (VLog)
+					// Large value
 					"x".repeat(100)
 				};
 
-				let mut txn = tree.begin().unwrap();
-				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				let mut batch = tree.new_batch();
+				batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+				tree.apply(batch, false).await.unwrap();
 				commit_count.fetch_add(1, Ordering::SeqCst);
 			}
 		});
@@ -4475,11 +3857,10 @@ async fn test_flush_wal_concurrent_commits() {
 
 	// Verify all data is accessible
 	{
-		let txn = tree.begin().unwrap();
 		for task_id in 0..num_commit_tasks {
 			for i in 0..commits_per_task {
 				let key = format!("task{}_key{}", task_id, i);
-				let result = txn.get(key.as_bytes()).unwrap();
+				let result = tree.get(key.as_bytes()).unwrap();
 				assert!(result.is_some(), "Key {} should exist after concurrent operations", key);
 			}
 		}
@@ -4508,18 +3889,19 @@ async fn test_range_key_ordering_correctness() {
 	// Insert keys in random order to ensure sorting is done by the system
 	let insert_order = ["baaa", "c", "a", "baaaaaaaaaaaaaaaaaa1", "b", "ba"];
 	for key in insert_order.iter() {
-		let mut txn = tree.begin().unwrap();
+		let mut batch = tree.new_batch();
 		let value = format!("value_for_{}", key);
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Test BEFORE flush (memtable path)
 	{
-		let txn = tree.begin().unwrap();
-
 		// Forward iteration
-		let range_result = collect_transaction_all(&mut txn.range(b"a", b"d").unwrap()).unwrap();
+		let range_result = collect_transaction_all(
+			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(
 			range_result.len(),
@@ -4546,8 +3928,10 @@ async fn test_range_key_ordering_correctness() {
 		}
 
 		// Reverse iteration
-		let reverse_result =
-			collect_transaction_reverse(&mut txn.range(b"a", b"d").unwrap()).unwrap();
+		let reverse_result = collect_transaction_reverse(
+			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(
 			reverse_result.len(),
@@ -4573,10 +3957,11 @@ async fn test_range_key_ordering_correctness() {
 
 	// Test AFTER flush (SSTable path)
 	{
-		let txn = tree.begin().unwrap();
-
 		// Forward iteration
-		let range_result = collect_transaction_all(&mut txn.range(b"a", b"d").unwrap()).unwrap();
+		let range_result = collect_transaction_all(
+			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(
 			range_result.len(),
@@ -4603,8 +3988,10 @@ async fn test_range_key_ordering_correctness() {
 		}
 
 		// Reverse iteration after flush
-		let reverse_result =
-			collect_transaction_reverse(&mut txn.range(b"a", b"d").unwrap()).unwrap();
+		let reverse_result = collect_transaction_reverse(
+			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
+		)
+		.unwrap();
 
 		for (idx, (key, _value)) in reverse_result.iter().enumerate() {
 			let key_str = std::str::from_utf8(key.as_ref()).unwrap();
@@ -4647,18 +4034,21 @@ async fn test_range_prefix_differentiation() {
 
 	// Insert all records
 	for (key, value) in table_records.iter().chain(index_records.iter()) {
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Test before flush
 	{
-		let txn = tree.begin().unwrap();
-
 		// Range scan for table records only: [/ns/db/tb/, /ns/db/tb0)
-		let table_range =
-			collect_transaction_all(&mut txn.range(b"/ns/db/tb/", b"/ns/db/tb0").unwrap()).unwrap();
+		let table_range = collect_transaction_all(
+			&mut tree
+				.new_snapshot()
+				.range(Some(b"/ns/db/tb/".as_slice()), Some(b"/ns/db/tb0".as_slice()))
+				.unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(
 			table_range.len(),
@@ -4692,8 +4082,13 @@ async fn test_range_prefix_differentiation() {
 		}
 
 		// Range scan for index records only: [/ns/db/ix/, /ns/db/ix0)
-		let index_range =
-			collect_transaction_all(&mut txn.range(b"/ns/db/ix/", b"/ns/db/ix0").unwrap()).unwrap();
+		let index_range = collect_transaction_all(
+			&mut tree
+				.new_snapshot()
+				.range(Some(b"/ns/db/ix/".as_slice()), Some(b"/ns/db/ix0".as_slice()))
+				.unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(
 			index_range.len(),
@@ -4727,11 +4122,14 @@ async fn test_range_prefix_differentiation() {
 	tree.flush().unwrap();
 
 	{
-		let txn = tree.begin().unwrap();
-
 		// Same tests after flush
-		let table_range =
-			collect_transaction_all(&mut txn.range(b"/ns/db/tb/", b"/ns/db/tb0").unwrap()).unwrap();
+		let table_range = collect_transaction_all(
+			&mut tree
+				.new_snapshot()
+				.range(Some(b"/ns/db/tb/".as_slice()), Some(b"/ns/db/tb0".as_slice()))
+				.unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(
 			table_range.len(),
@@ -4749,8 +4147,13 @@ async fn test_range_prefix_differentiation() {
 			);
 		}
 
-		let index_range =
-			collect_transaction_all(&mut txn.range(b"/ns/db/ix/", b"/ns/db/ix0").unwrap()).unwrap();
+		let index_range = collect_transaction_all(
+			&mut tree
+				.new_snapshot()
+				.range(Some(b"/ns/db/ix/".as_slice()), Some(b"/ns/db/ix0".as_slice()))
+				.unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(
 			index_range.len(),
@@ -4784,17 +4187,18 @@ async fn test_range_exclusive_boundaries() {
 	// Insert keys: a, b, c, d
 	let keys = ["a", "b", "c", "d"];
 	for key in keys.iter() {
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), format!("value_{}", key).as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), format!("value_{}", key).as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Test before flush
 	{
-		let txn = tree.begin().unwrap();
-
 		// Range [a, c) should include a, b but NOT c
-		let range_result = collect_transaction_all(&mut txn.range(b"a", b"c").unwrap()).unwrap();
+		let range_result = collect_transaction_all(
+			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"c".as_slice())).unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(range_result.len(), 2, "Range [a, c) should return 2 keys (a and b)");
 
@@ -4809,7 +4213,10 @@ async fn test_range_exclusive_boundaries() {
 		assert!(!result_keys.contains(&"d".to_string()), "Range [a, c) should NOT include 'd'");
 
 		// Range [b, d) should include b, c but NOT d
-		let range_result2 = collect_transaction_all(&mut txn.range(b"b", b"d").unwrap()).unwrap();
+		let range_result2 = collect_transaction_all(
+			&mut tree.new_snapshot().range(Some(b"b".as_slice()), Some(b"d".as_slice())).unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(range_result2.len(), 2, "Range [b, d) should return 2 keys (b and c)");
 
@@ -4824,7 +4231,10 @@ async fn test_range_exclusive_boundaries() {
 		assert!(!result_keys2.contains(&"d".to_string()), "Range [b, d) should NOT include 'd'");
 
 		// Range starting at exact key boundary
-		let range_result3 = collect_transaction_all(&mut txn.range(b"c", b"e").unwrap()).unwrap();
+		let range_result3 = collect_transaction_all(
+			&mut tree.new_snapshot().range(Some(b"c".as_slice()), Some(b"e".as_slice())).unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(range_result3.len(), 2, "Range [c, e) should return 2 keys (c and d)");
 
@@ -4841,10 +4251,11 @@ async fn test_range_exclusive_boundaries() {
 	tree.flush().unwrap();
 
 	{
-		let txn = tree.begin().unwrap();
-
 		// Same tests after flush
-		let range_result = collect_transaction_all(&mut txn.range(b"a", b"c").unwrap()).unwrap();
+		let range_result = collect_transaction_all(
+			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"c".as_slice())).unwrap(),
+		)
+		.unwrap();
 
 		assert_eq!(range_result.len(), 2, "After flush: Range [a, c) should return 2 keys");
 
@@ -4883,17 +4294,18 @@ async fn test_range_boundary_edge_cases() {
 	// Keys where some are proper prefixes of others
 	let keys = ["aa", "aaa", "aaaa", "aaaab", "ab", "b"];
 	for key in keys.iter() {
-		let mut txn = tree.begin().unwrap();
-		txn.set(key.as_bytes(), format!("value_{}", key).as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		let mut batch = tree.new_batch();
+		batch.set(key.as_bytes(), format!("value_{}", key).as_bytes()).unwrap();
+		tree.apply(batch, false).await.unwrap();
 	}
 
 	// Test before flush
 	{
-		let txn = tree.begin().unwrap();
-
 		// Range [aa, ab) should return aa, aaa, aaaa, aaaab but NOT ab, b
-		let range_result = collect_transaction_all(&mut txn.range(b"aa", b"ab").unwrap()).unwrap();
+		let range_result = collect_transaction_all(
+			&mut tree.new_snapshot().range(Some(b"aa".as_slice()), Some(b"ab".as_slice())).unwrap(),
+		)
+		.unwrap();
 
 		let result_keys: Vec<String> = range_result
 			.iter()
@@ -4921,9 +4333,13 @@ async fn test_range_boundary_edge_cases() {
 		assert_eq!(result_keys[3], "aaaab", "Fourth key should be 'aaaab'");
 
 		// Range [aaa, aaaa) - very narrow range between prefixes
-		let narrow_range =
-			collect_transaction_all(&mut txn.range("aaa".as_bytes(), "aaaa".as_bytes()).unwrap())
-				.unwrap();
+		let narrow_range = collect_transaction_all(
+			&mut tree
+				.new_snapshot()
+				.range(Some("aaa".as_bytes()), Some("aaaa".as_bytes()))
+				.unwrap(),
+		)
+		.unwrap();
 
 		let narrow_keys: Vec<String> = narrow_range
 			.iter()
@@ -4939,9 +4355,10 @@ async fn test_range_boundary_edge_cases() {
 		assert_eq!(narrow_keys[0], "aaa", "Only key should be 'aaa'");
 
 		// Range [aaaa, ab) - starts exactly at 'aaaa'
-		let exact_start =
-			collect_transaction_all(&mut txn.range("aaaa".as_bytes(), "ab".as_bytes()).unwrap())
-				.unwrap();
+		let exact_start = collect_transaction_all(
+			&mut tree.new_snapshot().range(Some("aaaa".as_bytes()), Some("ab".as_bytes())).unwrap(),
+		)
+		.unwrap();
 
 		let exact_keys: Vec<String> = exact_start
 			.iter()
@@ -4962,10 +4379,11 @@ async fn test_range_boundary_edge_cases() {
 	tree.flush().unwrap();
 
 	{
-		let txn = tree.begin().unwrap();
-
 		// Same primary test after flush
-		let range_result = collect_transaction_all(&mut txn.range(b"aa", b"ab").unwrap()).unwrap();
+		let range_result = collect_transaction_all(
+			&mut tree.new_snapshot().range(Some(b"aa".as_slice()), Some(b"ab".as_slice())).unwrap(),
+		)
+		.unwrap();
 
 		let result_keys: Vec<String> = range_result
 			.iter()
@@ -4984,1089 +4402,6 @@ async fn test_range_boundary_edge_cases() {
 		assert_eq!(result_keys[1], "aaa", "After flush: Second key should be 'aaa'");
 		assert_eq!(result_keys[2], "aaaa", "After flush: Third key should be 'aaaa'");
 		assert_eq!(result_keys[3], "aaaab", "After flush: Fourth key should be 'aaaab'");
-	}
-}
-
-/// Tests that versioned_index cleanup is triggered after VLog GC
-/// and that data integrity is maintained.
-#[test(tokio::test)]
-async fn test_versioned_index_cleanup_after_vlog_gc() {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	// Create tree with versioned_index AND vlog enabled
-	// Note: versioned_index requires versioning to be enabled
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.level_count = 2;
-		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
-		opts.enable_vlog = true;
-		opts.enable_versioning = true;
-		opts.versioned_history_retention_ns = 1_000_000_000_000; // 1000 seconds
-		opts.enable_versioned_index = true;
-	});
-
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-	// Insert multiple key-value pairs that will go to VLog
-	let keys: Vec<String> = (0..10).map(|i| format!("key-{:04}", i)).collect();
-	let value = "x".repeat(100); // Large value to force VLog storage
-
-	// Insert first version of each key
-	for key in &keys {
-		let mut tx = tree.begin().unwrap();
-		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
-	}
-	tree.flush().unwrap();
-
-	// Insert second version (updates) to create older versions
-	let value2 = "y".repeat(100);
-	for key in &keys {
-		let mut tx = tree.begin().unwrap();
-		tx.set(key.as_bytes(), value2.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
-	}
-	tree.flush().unwrap();
-
-	// Force compaction to trigger VLog GC and versioned_index cleanup
-	let strategy = Arc::new(Strategy::default());
-	tree.compact(strategy).unwrap();
-
-	// Verify that latest values are still accessible
-	for key in &keys {
-		let tx = tree.begin().unwrap();
-		let result = tx.get(key.as_bytes()).unwrap();
-		assert_eq!(
-			result,
-			Some(value2.as_bytes().to_vec()),
-			"Key {} should have latest value",
-			key
-		);
-	}
-}
-
-/// Tests that versioned_index cleanup is deadlock-free when running
-/// concurrently with writes.
-#[test(tokio::test)]
-async fn test_versioned_index_cleanup_concurrent_with_writes() {
-	use std::time::Duration;
-
-	use tokio::time::timeout;
-
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	// Create tree with versioned_index AND vlog enabled
-	// Note: versioned_index requires versioning to be enabled
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.level_count = 2;
-		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
-		opts.enable_vlog = true;
-		opts.enable_versioning = true;
-		opts.versioned_history_retention_ns = 1_000_000_000_000; // 1000 seconds
-		opts.enable_versioned_index = true;
-	});
-
-	let tree = Arc::new(Tree::new(Arc::clone(&opts)).unwrap());
-
-	// First, insert some data and flush to create SSTs with VLog references
-	let value = "x".repeat(100);
-	for i in 0..5 {
-		let key = format!("setup-key-{:04}", i);
-		let mut tx = tree.begin().unwrap();
-		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
-	}
-	tree.flush().unwrap();
-
-	// Now run concurrent writes and compactions with a timeout
-	// If there's a deadlock, this will timeout
-	let result = timeout(Duration::from_secs(30), async {
-		let tree1 = Arc::clone(&tree);
-		let tree2 = Arc::clone(&tree);
-
-		// Spawn writer task
-		let writer_handle = tokio::spawn(async move {
-			let value = "y".repeat(100);
-			for i in 0..50 {
-				let key = format!("concurrent-key-{:04}", i);
-				let mut tx = tree1.begin().unwrap();
-				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-				tx.commit().await.unwrap();
-
-				// Flush periodically to trigger cleanup
-				if i % 10 == 0 {
-					tree1.flush().unwrap();
-				}
-			}
-		});
-
-		// Spawn compaction task
-		let compactor_handle = tokio::spawn(async move {
-			for _ in 0..5 {
-				// Compact triggers versioned_index cleanup
-				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-					Arc::new(Strategy::default());
-				let _ = tree2.core.compact(strategy);
-				tokio::time::sleep(Duration::from_millis(10)).await;
-			}
-		});
-
-		// Wait for both tasks to complete
-		let (writer_result, compactor_result) = tokio::join!(writer_handle, compactor_handle);
-		writer_result.expect("Writer task should complete");
-		compactor_result.expect("Compactor task should complete");
-	})
-	.await;
-
-	// Assert that we didn't timeout (no deadlock)
-	assert!(result.is_ok(), "Test timed out - possible deadlock detected");
-
-	// Verify data integrity - all concurrent keys should be readable
-	for i in 0..50 {
-		let key = format!("concurrent-key-{:04}", i);
-		let tx = tree.begin().unwrap();
-		let result = tx.get(key.as_bytes()).unwrap();
-		assert!(result.is_some(), "Key {} should exist", key);
-	}
-}
-
-/// Tests that stale entries are actually deleted from the versioned_index (B+ tree)
-/// after VLog GC by directly inspecting the B+ tree contents.
-#[test(tokio::test)]
-async fn test_versioned_index_entries_deleted_after_gc() {
-	use crate::vlog::{ValueLocation, ValuePointer};
-
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	// Create tree with versioned_index AND vlog enabled
-	// Use a very short retention period so old versions get dropped during compaction
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.level_count = 2;
-		opts.vlog_max_file_size = 50; // Very small to force multiple VLog files
-		opts.enable_vlog = true;
-		opts.enable_versioning = true;
-		opts.versioned_history_retention_ns = 1; // 1 nanosecond - immediately expire old versions
-		opts.enable_versioned_index = true;
-		opts.level0_max_files = 1; // Trigger compaction after each flush
-	});
-
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-	// Phase 1: Insert initial data - these will go to VLog file 1
-	let keys: Vec<String> = (0..5).map(|i| format!("gc-test-key-{:04}", i)).collect();
-	let value1 = "x".repeat(100); // Large value to force VLog storage
-
-	for key in &keys {
-		let mut tx = tree.begin().unwrap();
-		tx.set(key.as_bytes(), value1.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
-	}
-	tree.flush().unwrap();
-
-	// Small delay to ensure timestamps differ
-	tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-	// Phase 2: Update data - these will go to VLog file 2
-	let value2 = "y".repeat(100);
-	for key in &keys {
-		let mut tx = tree.begin().unwrap();
-		tx.set(key.as_bytes(), value2.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
-	}
-	tree.flush().unwrap();
-
-	// Phase 3: Capture pre-GC state - count entries and VLog file IDs in B+ tree
-	let (pre_gc_count, pre_gc_file_ids) = {
-		let versioned_index = tree.core.inner.versioned_index.as_ref().unwrap();
-		let guard = versioned_index.read();
-
-		let empty: &[u8] = &[];
-		let mut count = 0;
-		let mut file_ids = std::collections::HashSet::new();
-
-		for entry in guard.range(empty..).unwrap() {
-			let (_, value) = entry.unwrap();
-			count += 1;
-
-			if let Ok(loc) = ValueLocation::decode(&value) {
-				if loc.is_value_pointer() {
-					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
-						file_ids.insert(ptr.file_id);
-					}
-				}
-			}
-		}
-
-		(count, file_ids)
-	};
-
-	// Should have entries from multiple VLog files (at least 2)
-	assert!(
-		pre_gc_file_ids.len() >= 2,
-		"Pre-GC should have entries from at least 2 VLog files, found: {:?}",
-		pre_gc_file_ids
-	);
-
-	// Phase 4: Trigger GC via compaction - use strategy with our options
-	let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-		Arc::new(Strategy::from_options(Arc::clone(&opts)));
-	tree.compact(Arc::clone(&strategy)).unwrap();
-
-	// Phase 5: Verify entries deleted - count should be less and no stale file IDs
-	let (post_gc_count, post_gc_file_ids, min_file_id) = {
-		let versioned_index = tree.core.inner.versioned_index.as_ref().unwrap();
-		let guard = versioned_index.read();
-
-		let empty: &[u8] = &[];
-		let mut count = 0;
-		let mut file_ids = std::collections::HashSet::new();
-		let mut min_id = u32::MAX;
-
-		for entry in guard.range(empty..).unwrap() {
-			let (_, value) = entry.unwrap();
-			count += 1;
-
-			if let Ok(loc) = ValueLocation::decode(&value) {
-				if loc.is_value_pointer() {
-					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
-						file_ids.insert(ptr.file_id);
-						min_id = min_id.min(ptr.file_id);
-					}
-				}
-			}
-		}
-
-		(count, file_ids, min_id)
-	};
-
-	// Entry count should be reduced (stale entries deleted)
-	assert!(
-		post_gc_count < pre_gc_count,
-		"Entry count should decrease after GC: pre={}, post={}",
-		pre_gc_count,
-		post_gc_count
-	);
-
-	// Should have fewer unique VLog file IDs (old files deleted)
-	assert!(
-		post_gc_file_ids.len() < pre_gc_file_ids.len(),
-		"Should have fewer VLog file references after GC: pre={:?}, post={:?}",
-		pre_gc_file_ids,
-		post_gc_file_ids
-	);
-
-	// All remaining file IDs should be >= min valid (no stale references)
-	for file_id in &post_gc_file_ids {
-		assert!(
-			*file_id >= min_file_id,
-			"Found stale file_id {} < min_valid {}",
-			file_id,
-			min_file_id
-		);
-	}
-
-	// Verify data integrity - latest values should still be accessible
-	for key in &keys {
-		let tx = tree.begin().unwrap();
-		let result = tx.get(key.as_bytes()).unwrap();
-		assert_eq!(
-			result,
-			Some(value2.as_bytes().to_vec()),
-			"Key {} should have latest value after GC",
-			key
-		);
-	}
-}
-
-/// Tests that VLog files persist correctly across shutdown/restart.
-/// This validates that the VLog GC mechanism doesn't incorrectly delete
-/// files that are still referenced by SSTs.
-#[test(tokio::test)]
-async fn test_vlog_files_persist_across_restart() {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.vlog_max_file_size = 512; // Very small to force many file rotations
-		opts.enable_vlog = true;
-	});
-
-	let num_records = 1000;
-	let mut keys_and_values = Vec::with_capacity(num_records);
-
-	// Phase 1: Insert data and verify VLog files are created
-	let vlog_files_before_shutdown: Vec<String>;
-	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-		// Insert 1000 records with ~100 byte values each
-		for i in 0..num_records {
-			let key = format!("persist_key_{i:04}");
-			let value = format!("persist_value_{i}_padding_{}", "X".repeat(80));
-			keys_and_values.push((key.clone(), value.clone()));
-
-			let mut txn = tree.begin().unwrap();
-			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
-		}
-
-		// Flush to ensure data is persisted to SST (so VLog files are referenced)
-		tree.flush().unwrap();
-
-		// Count VLog files before shutdown
-		let vlog_dir = path.join("vlog");
-		let entries = std::fs::read_dir(&vlog_dir).unwrap();
-		vlog_files_before_shutdown = entries
-			.filter_map(|e| {
-				let entry = e.ok()?;
-				let name = entry.file_name().to_string_lossy().to_string();
-				if opts.is_vlog_filename(&name) {
-					Some(name)
-				} else {
-					None
-				}
-			})
-			.collect();
-
-		// Should have multiple VLog files due to small file size
-		assert!(
-			vlog_files_before_shutdown.len() > 10,
-			"Expected more than 10 VLog files due to small file size, got {}",
-			vlog_files_before_shutdown.len()
-		);
-
-		log::info!("VLog files before shutdown: {} files", vlog_files_before_shutdown.len());
-
-		// Close the tree
-		tree.close().await.unwrap();
-	}
-
-	// Phase 2: Reopen, add 10 new entries, flush, and verify all records (repeat 5 times)
-	// Track VLog file count - should only grow or stay same, never decrease
-	let mut previous_vlog_count = vlog_files_before_shutdown.len();
-
-	for iteration in 1..=5 {
-		log::info!("=== Restart iteration {}/5 ===", iteration);
-
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-		// Count VLog files after restart (before adding new entries)
-		let vlog_dir = path.join("vlog");
-		let entries = std::fs::read_dir(&vlog_dir).unwrap();
-		let vlog_files_after_restart: Vec<String> = entries
-			.filter_map(|e| {
-				let entry = e.ok()?;
-				let name = entry.file_name().to_string_lossy().to_string();
-				if opts.is_vlog_filename(&name) {
-					Some(name)
-				} else {
-					None
-				}
-			})
-			.collect();
-
-		log::info!(
-			"VLog files after restart {}: {} files (previous: {})",
-			iteration,
-			vlog_files_after_restart.len(),
-			previous_vlog_count
-		);
-
-		// VLog file count should not decrease (GC should not delete referenced files)
-		assert!(
-			vlog_files_after_restart.len() >= previous_vlog_count,
-			"VLog file count decreased after restart {}: previous={}, after={}",
-			iteration,
-			previous_vlog_count,
-			vlog_files_after_restart.len()
-		);
-
-		// Add 10 new entries
-		let new_entries_start = num_records + (iteration - 1) * 10;
-		for i in 0..10 {
-			let idx = new_entries_start + i;
-			let key = format!("persist_key_{idx:04}");
-			let value = format!("persist_value_{idx}_padding_{}", "X".repeat(80));
-			keys_and_values.push((key.clone(), value.clone()));
-
-			let mut txn = tree.begin().unwrap();
-			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
-		}
-
-		log::info!("Added 10 new entries (total records: {})", keys_and_values.len());
-
-		// Flush to persist new entries
-		tree.flush().unwrap();
-
-		// Count VLog files after flush
-		let entries = std::fs::read_dir(&vlog_dir).unwrap();
-		let vlog_files_after_flush: Vec<String> = entries
-			.filter_map(|e| {
-				let entry = e.ok()?;
-				let name = entry.file_name().to_string_lossy().to_string();
-				if opts.is_vlog_filename(&name) {
-					Some(name)
-				} else {
-					None
-				}
-			})
-			.collect();
-
-		log::info!("VLog files after flush {}: {} files", iteration, vlog_files_after_flush.len());
-
-		// Update previous count for next iteration
-		previous_vlog_count = vlog_files_after_flush.len();
-
-		// Verify ALL records are readable (original 1000 + all newly added)
-		for (key, expected_value) in &keys_and_values {
-			let txn = tree.begin().unwrap();
-			let result = txn.get(key.as_bytes()).unwrap();
-			assert_eq!(
-				result,
-				Some(expected_value.as_bytes().to_vec()),
-				"Key {} has incorrect value after restart {}",
-				key,
-				iteration
-			);
-		}
-
-		log::info!("Verified all {} records after restart {}", keys_and_values.len(), iteration);
-
-		tree.close().await.unwrap();
-	}
-
-	// Final verification: 1000 + 5*10 = 1050 records
-	assert_eq!(
-		keys_and_values.len(),
-		1050,
-		"Expected 1050 total records (1000 initial + 5*10 added)"
-	);
-
-	log::info!(
-		"All 5 restart iterations passed successfully with {} total records",
-		keys_and_values.len()
-	);
-}
-
-#[test(tokio::test)]
-async fn test_vlog_gc_non_versioned_surrealdb_style_keys() {
-	// This test tries to mimics the SurrealDB bug scenario:
-	//
-	// https://github.com/surrealdb/surrealdb/issues/6872
-	//
-	//
-	// Timeline from user report:
-	// - Feb 11: Fresh import, everything working
-	// - Feb 11-12: Normal daemon operation (~24h), no issues
-	// - Feb 12 evening: macOS reboot → SIGTERM shutdown
-	// - Feb 13 morning: Server restarts clean, corruption present
-	// - Progressive corruption: queries that worked start failing as more data written
-	//
-	// Test structure:
-	// 1. Phase 1: 500 update rounds + periodic GC (simulates ~24h operation)
-	// 2. Close + reopen database (simulates SIGTERM + restart)
-	// 3. Phase 2: 500 more update rounds + periodic GC (simulates post-restart)
-	// 4. Verify ALL 200 keys accessible (catches progressive corruption)
-
-	// Helper to print VLog files and SSTables
-	fn print_storage_state(path: &std::path::Path, tree: &Tree, phase: &str, round: usize) {
-		// List VLog files
-		let vlog_dir = path.join("vlog");
-		let vlog_files: Vec<String> = if vlog_dir.exists() {
-			std::fs::read_dir(&vlog_dir)
-				.unwrap()
-				.filter_map(|e| {
-					let entry = e.ok()?;
-					let name = entry.file_name().to_string_lossy().to_string();
-					if name.ends_with(".vlog") {
-						Some(name)
-					} else {
-						None
-					}
-				})
-				.collect()
-		} else {
-			vec![]
-		};
-
-		// List SSTable files
-		let sstables_dir = path.join("sstables");
-		let sstable_files: Vec<String> = if sstables_dir.exists() {
-			std::fs::read_dir(&sstables_dir)
-				.unwrap()
-				.filter_map(|e| {
-					let entry = e.ok()?;
-					let name = entry.file_name().to_string_lossy().to_string();
-					if name.ends_with(".sst") {
-						Some(name)
-					} else {
-						None
-					}
-				})
-				.collect()
-		} else {
-			vec![]
-		};
-
-		// Get SSTable counts per level from manifest
-		let manifest = tree.core.level_manifest.read().unwrap();
-		let levels = manifest.levels.get_levels();
-		let level_counts: Vec<usize> = levels.iter().map(|l| l.tables.len()).collect();
-
-		println!("[{} round {}] VLog files ({}): {:?}", phase, round, vlog_files.len(), vlog_files);
-		println!(
-			"[{} round {}] SSTable files ({}): {:?}",
-			phase,
-			round,
-			sstable_files.len(),
-			sstable_files
-		);
-		println!("[{} round {}] SSTables per level: {:?}", phase, round, level_counts);
-		println!("---");
-	}
-
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.level_count = 1; // Only L0 - always bottom level for stale marking
-		opts.enable_vlog = true;
-		opts.vlog_max_file_size = 128 * 1024; // 128KB files - larger to reduce file count
-	});
-
-	// SurrealDB-style: 50 records, each with 4 fields
-	// Key format: /ns/db/tb/record_NNN:fieldN
-	const NUM_RECORDS: usize = 50;
-	const FIELDS: [&str; 4] = ["field1", "field2", "field3", "field4"];
-	const ROUNDS_PER_PHASE: usize = 100;
-	const GC_INTERVAL: usize = 10;
-
-	// ========== PHASE 1: Normal operation (simulates ~24h daemon) ==========
-	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-		for round in 0..ROUNDS_PER_PHASE {
-			// Update all 50 records
-			let mut tx = tree.begin().unwrap();
-			for record_id in 0..NUM_RECORDS {
-				for field in &FIELDS {
-					let key = format!("/ns/db/tb/record_{:03}:{}", record_id, field);
-					let value =
-						format!("phase1_record_{}_{}_{}", record_id, field, round).repeat(10);
-					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-				}
-			}
-			tx.commit().await.unwrap();
-			tree.flush().unwrap();
-
-			// Periodic compaction + VLog GC
-			if round > 0 && round % GC_INTERVAL == 0 {
-				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-					Arc::new(Strategy::default());
-				for _ in 0..6 {
-					tree.compact(Arc::clone(&strategy)).unwrap();
-				}
-				print_storage_state(&path, &tree, "Phase1", round);
-			}
-		}
-
-		// Final GC before "shutdown"
-		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-			Arc::new(Strategy::default());
-		tree.compact(strategy).unwrap();
-		print_storage_state(&path, &tree, "Phase1-Final", ROUNDS_PER_PHASE);
-
-		// Simulate SIGTERM shutdown
-		tree.close().await.unwrap();
-	}
-
-	// ========== PHASE 2: Post-restart operation ==========
-	{
-		// Reopen database (simulates server restart after SIGTERM)
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-		for round in 0..ROUNDS_PER_PHASE {
-			// Update all 50 records (post-restart)
-			let mut tx = tree.begin().unwrap();
-			for record_id in 0..NUM_RECORDS {
-				for field in &FIELDS {
-					let key = format!("/ns/db/tb/record_{:03}:{}", record_id, field);
-					let value =
-						format!("phase2_record_{}_{}_{}", record_id, field, round).repeat(10);
-					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-				}
-			}
-			tx.commit().await.unwrap();
-			tree.flush().unwrap();
-
-			// Periodic compaction + VLog GC (this is where progressive corruption would appear)
-			if round > 0 && round % GC_INTERVAL == 0 {
-				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-					Arc::new(Strategy::default());
-				for _ in 0..6 {
-					tree.compact(Arc::clone(&strategy)).unwrap();
-				}
-				print_storage_state(&path, &tree, "Phase2", round);
-			}
-		}
-
-		// Final GC pass
-		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-			Arc::new(Strategy::default());
-		tree.compact(strategy).unwrap();
-		print_storage_state(&path, &tree, "Phase2-Final", ROUNDS_PER_PHASE);
-
-		// ========== VERIFY: All records accessible (no "file not found" errors) ==========
-		// This catches the progressive corruption scenario where queries start failing
-		// as more data accumulates post-restart
-		// NOTE: We check ALL records, not LIMIT 1 (which would hide the bug)
-		let tx = tree.begin().unwrap();
-		for record_id in 0..NUM_RECORDS {
-			for field in &FIELDS {
-				let key = format!("/ns/db/tb/record_{:03}:{}", record_id, field);
-				let result = tx.get(key.as_bytes()).unwrap();
-				assert!(
-					result.is_some(),
-					"Record {} field {} should exist - got 'file not found' IO error",
-					record_id,
-					field
-				);
-
-				let expected =
-					format!("phase2_record_{}_{}_{}", record_id, field, ROUNDS_PER_PHASE - 1)
-						.repeat(10);
-				assert_eq!(
-					result.unwrap(),
-					expected.as_bytes(),
-					"Record {} field {} should have latest phase2 value",
-					record_id,
-					field
-				);
-			}
-		}
-
-		tree.close().await.unwrap();
-	}
-}
-
-#[test(tokio::test)]
-async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
-	// This test comprehensively tests VLog GC with a realistic workload pattern:
-	//
-	// Pattern: Updates → Deletes → Re-updates (same keys)
-	//
-	// This tests the critical scenarios:
-	// 1. Values written to VLog, then updated (old versions become stale)
-	// 2. Records deleted (tombstones written, values become stale)
-	// 3. Same keys re-inserted (new values written, tombstones superseded)
-	// 4. Compaction + VLog GC must correctly handle all these state transitions
-	// 5. Restart and verify no corruption
-	//
-	// The bug scenario: VLog GC may incorrectly delete VLog files that still
-	// contain live data if the delete_list or discard_stats are inconsistent.
-
-	fn print_storage_state(path: &std::path::Path, tree: &Tree, phase: &str, round: usize) {
-		let vlog_dir = path.join("vlog");
-		let vlog_files: Vec<String> = if vlog_dir.exists() {
-			std::fs::read_dir(&vlog_dir)
-				.unwrap()
-				.filter_map(|e| {
-					let entry = e.ok()?;
-					let name = entry.file_name().to_string_lossy().to_string();
-					if name.ends_with(".vlog") {
-						Some(name)
-					} else {
-						None
-					}
-				})
-				.collect()
-		} else {
-			vec![]
-		};
-
-		let sstables_dir = path.join("sstables");
-		let sstable_files: Vec<String> = if sstables_dir.exists() {
-			std::fs::read_dir(&sstables_dir)
-				.unwrap()
-				.filter_map(|e| {
-					let entry = e.ok()?;
-					let name = entry.file_name().to_string_lossy().to_string();
-					if name.ends_with(".sst") {
-						Some(name)
-					} else {
-						None
-					}
-				})
-				.collect()
-		} else {
-			vec![]
-		};
-
-		let manifest = tree.core.level_manifest.read().unwrap();
-		let levels = manifest.levels.get_levels();
-		let level_counts: Vec<usize> = levels.iter().map(|l| l.tables.len()).collect();
-
-		println!("[{} round {}] VLog files ({}): {:?}", phase, round, vlog_files.len(), vlog_files);
-		println!(
-			"[{} round {}] SSTable files ({}): {:?}",
-			phase,
-			round,
-			sstable_files.len(),
-			sstable_files
-		);
-		println!("[{} round {}] SSTables per level: {:?}", phase, round, level_counts);
-		println!("---");
-	}
-
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let opts = create_test_options(path.clone(), |opts| {
-		opts.level_count = 1; // Only L0 - always bottom level for stale marking
-		opts.enable_vlog = true;
-		opts.vlog_max_file_size = 128 * 1024; // 128KB files - smaller to create more files
-	});
-
-	const NUM_RECORDS: usize = 100;
-	const FIELDS: [&str; 3] = ["data", "metadata", "content"];
-	const ROUNDS: usize = 50;
-	const GC_INTERVAL: usize = 5;
-
-	// Track which records are currently "deleted" vs "live"
-	// Even records (0, 2, 4, ...) will be deleted and re-inserted
-	// Odd records (1, 3, 5, ...) will just be updated
-
-	// ========== PHASE 1: Initial data + mixed updates/deletes ==========
-	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-		// Initial insert of all records
-		println!("=== PHASE 1: Initial insert ===");
-		{
-			let mut tx = tree.begin().unwrap();
-			for record_id in 0..NUM_RECORDS {
-				for field in &FIELDS {
-					let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-					let value = format!("initial_value_{}_{}", record_id, field).repeat(20);
-					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-				}
-			}
-			tx.commit().await.unwrap();
-			tree.flush().unwrap();
-		}
-
-		// Run compaction + GC
-		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-			Arc::new(Strategy::default());
-		for _ in 0..3 {
-			tree.compact(Arc::clone(&strategy)).unwrap();
-		}
-		print_storage_state(&path, &tree, "Phase1-Initial", 0);
-
-		// Mixed workload: updates + deletes + re-inserts
-		for round in 0..ROUNDS {
-			let mut tx = tree.begin().unwrap();
-
-			for record_id in 0..NUM_RECORDS {
-				let is_even = record_id % 2 == 0;
-				let delete_this_round = is_even && (round % 3 == 0); // Delete every 3rd round
-				let reinsert_this_round = is_even && (round % 3 == 1); // Re-insert next round
-
-				if delete_this_round {
-					// DELETE even records every 3rd round
-					for field in &FIELDS {
-						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-						tx.delete(key.as_bytes()).unwrap();
-					}
-				} else if reinsert_this_round {
-					// RE-INSERT previously deleted records
-					for field in &FIELDS {
-						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-						let value =
-							format!("reinserted_round{}_{}_{}", round, record_id, field).repeat(20);
-						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-					}
-				} else {
-					// UPDATE (both even and odd records when not deleting/reinserting)
-					for field in &FIELDS {
-						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-						let value =
-							format!("updated_round{}_{}_{}", round, record_id, field).repeat(20);
-						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-					}
-				}
-			}
-
-			tx.commit().await.unwrap();
-			tree.flush().unwrap();
-
-			// Periodic compaction + VLog GC
-			if round > 0 && round % GC_INTERVAL == 0 {
-				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-					Arc::new(Strategy::default());
-				for _ in 0..4 {
-					tree.compact(Arc::clone(&strategy)).unwrap();
-				}
-				print_storage_state(&path, &tree, "Phase1-Mixed", round);
-			}
-		}
-
-		// Final compaction + GC before shutdown
-		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-			Arc::new(Strategy::default());
-		for _ in 0..5 {
-			tree.compact(Arc::clone(&strategy)).unwrap();
-		}
-		print_storage_state(&path, &tree, "Phase1-Final", ROUNDS);
-
-		// Verify all records before shutdown
-		println!("=== Verifying Phase 1 data before shutdown ===");
-		let tx = tree.begin().unwrap();
-		for record_id in 0..NUM_RECORDS {
-			for field in &FIELDS {
-				let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-				let result = tx.get(key.as_bytes());
-				assert!(
-					result.is_ok(),
-					"Phase1: Record {} field {} get() should not error",
-					record_id,
-					field
-				);
-				// All records should exist (even ones were re-inserted)
-				assert!(
-					result.unwrap().is_some(),
-					"Phase1: Record {} field {} should exist",
-					record_id,
-					field
-				);
-			}
-		}
-
-		// Simulate SIGTERM shutdown
-		tree.close().await.unwrap();
-	}
-
-	// ========== PHASE 2: Post-restart - more mixed operations ==========
-	{
-		println!("=== PHASE 2: Post-restart ===");
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-		// Verify all records accessible after restart (before any new writes)
-		println!("=== Verifying data after restart ===");
-		{
-			let tx = tree.begin().unwrap();
-			for record_id in 0..NUM_RECORDS {
-				for field in &FIELDS {
-					let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-					let result = tx.get(key.as_bytes());
-					assert!(
-						result.is_ok(),
-						"Post-restart: Record {} field {} get() should not error - got {:?}",
-						record_id,
-						field,
-						result.err()
-					);
-					assert!(
-						result.unwrap().is_some(),
-						"Post-restart: Record {} field {} should exist",
-						record_id,
-						field
-					);
-				}
-			}
-		}
-
-		// More mixed operations post-restart
-		for round in 0..ROUNDS {
-			let mut tx = tree.begin().unwrap();
-
-			for record_id in 0..NUM_RECORDS {
-				let is_odd = record_id % 2 == 1;
-				let delete_this_round = is_odd && (round % 4 == 0); // Delete odd records every 4th round
-				let reinsert_this_round = is_odd && (round % 4 == 2); // Re-insert 2 rounds later
-
-				if delete_this_round {
-					// DELETE odd records
-					for field in &FIELDS {
-						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-						tx.delete(key.as_bytes()).unwrap();
-					}
-				} else if reinsert_this_round {
-					// RE-INSERT previously deleted odd records
-					for field in &FIELDS {
-						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-						let value =
-							format!("phase2_reinsert_round{}_{}_{}", round, record_id, field)
-								.repeat(20);
-						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-					}
-				} else {
-					// UPDATE all records
-					for field in &FIELDS {
-						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-						let value = format!("phase2_update_round{}_{}_{}", round, record_id, field)
-							.repeat(20);
-						tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-					}
-				}
-			}
-
-			tx.commit().await.unwrap();
-			tree.flush().unwrap();
-
-			// Periodic compaction + VLog GC
-			if round > 0 && round % GC_INTERVAL == 0 {
-				let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-					Arc::new(Strategy::default());
-				for _ in 0..4 {
-					tree.compact(Arc::clone(&strategy)).unwrap();
-				}
-				print_storage_state(&path, &tree, "Phase2-Mixed", round);
-
-				// Verify records accessible after each GC cycle (catches progressive corruption)
-				let verify_tx = tree.begin().unwrap();
-				for record_id in 0..NUM_RECORDS {
-					// Determine expected state for this record at this round
-					let is_odd = record_id % 2 == 1;
-					let was_deleted_this_round = is_odd && (round % 4 == 0);
-					let was_reinserted_this_round = is_odd && (round % 4 == 2);
-
-					// Record should exist unless it was deleted this round and not reinserted
-					let should_exist = !was_deleted_this_round || was_reinserted_this_round;
-					// Note: even records are always updated (never deleted in phase 2)
-					// Odd records: deleted at round%4==0, reinserted at round%4==2
-					// At round 20: 20%4==0, so odd records are deleted → should NOT exist
-					// At round 10: 10%4==2, so odd records are reinserted → should exist
-
-					for field in &FIELDS {
-						let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-						let result = verify_tx.get(key.as_bytes());
-						assert!(
-							result.is_ok(),
-							"Phase2 round {}: Record {} field {} get() error: {:?}",
-							round,
-							record_id,
-							field,
-							result.err()
-						);
-
-						let value = result.unwrap();
-						if should_exist {
-							assert!(
-								value.is_some(),
-								"Phase2 round {}: Record {} field {} should exist but is None (VLog corruption?)",
-								round,
-								record_id,
-								field
-							);
-						} else {
-							assert!(
-								value.is_none(),
-								"Phase2 round {}: Record {} field {} should be deleted but still exists",
-								round,
-								record_id,
-								field
-							);
-						}
-					}
-				}
-			}
-		}
-
-		// Final compaction + GC
-		let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
-			Arc::new(Strategy::default());
-		tree.compact(strategy).unwrap();
-		print_storage_state(&path, &tree, "Phase2-Final", ROUNDS);
-
-		// Final verification
-		println!("=== Final verification ===");
-		let tx = tree.begin().unwrap();
-		for record_id in 0..NUM_RECORDS {
-			for field in &FIELDS {
-				let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-				let result = tx.get(key.as_bytes());
-				assert!(
-					result.is_ok(),
-					"Final: Record {} field {} get() error: {:?}",
-					record_id,
-					field,
-					result.err()
-				);
-				let value = result.unwrap();
-				assert!(
-					value.is_some(),
-					"Final: Record {} field {} missing - VLog file may have been incorrectly deleted",
-					record_id,
-					field
-				);
-			}
-		}
-
-		tree.close().await.unwrap();
-	}
-
-	// ========== PHASE 3: Another restart cycle to catch delayed corruption ==========
-	{
-		println!("=== PHASE 3: Second restart verification ===");
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-
-		// Full scan of all records
-		// After round 49 (last round), all records were updated, so all should exist
-		// Last round: 49 % 4 == 1 → UPDATE all records (not delete/reinsert)
-		let tx = tree.begin().unwrap();
-		let mut accessible_count = 0;
-		let mut io_error_count = 0;
-		let mut none_count = 0;
-
-		for record_id in 0..NUM_RECORDS {
-			for field in &FIELDS {
-				let key = format!("/app/db/table/record_{:04}:{}", record_id, field);
-				match tx.get(key.as_bytes()) {
-					Ok(Some(_)) => accessible_count += 1,
-					Ok(None) => {
-						// After round 49, all records should exist
-						println!(
-							"ERROR: Record {} field {} is None (should exist after round 49 update)",
-							record_id, field
-						);
-						none_count += 1;
-					}
-					Err(e) => {
-						println!(
-							"ERROR: Record {} field {} - IO error (VLog corruption): {:?}",
-							record_id, field, e
-						);
-						io_error_count += 1;
-					}
-				}
-			}
-		}
-
-		println!(
-			"=== Results: {} accessible, {} None, {} IO errors out of {} total ===",
-			accessible_count,
-			none_count,
-			io_error_count,
-			NUM_RECORDS * FIELDS.len()
-		);
-
-		assert_eq!(
-			io_error_count, 0,
-			"Found {} records with IO errors - VLog corruption detected!",
-			io_error_count
-		);
-		assert_eq!(
-			none_count, 0,
-			"Found {} records unexpectedly None - data loss detected!",
-			none_count
-		);
-		assert_eq!(accessible_count, NUM_RECORDS * FIELDS.len(), "Not all records accessible");
-
-		tree.close().await.unwrap();
 	}
 }
 
@@ -6089,9 +4424,9 @@ async fn test_recovery_detects_corrupt_log_number() {
 
 		// Write some data (creates WAL entries)
 		for i in 0..10 {
-			let mut txn = tree.begin().unwrap();
-			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			let mut batch = tree.new_batch();
+			batch.set(format!("key{}", i).as_bytes(), b"value").unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		// Close without flushing (data is only in WAL)
@@ -6158,10 +4493,10 @@ async fn test_validate_wal_log_number_multiple_wals() {
 
 		// Write enough data to trigger multiple WAL rotations
 		for i in 0..100 {
-			let mut txn = tree.begin().unwrap();
+			let mut batch = tree.new_batch();
 			let value = vec![b'x'; 100]; // 100 bytes per entry
-			txn.set(format!("key{:04}", i).as_bytes(), &value).unwrap();
-			txn.commit().await.unwrap();
+			batch.set(format!("key{:04}", i).as_bytes(), &value).unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		tree.close().await.unwrap();
@@ -6206,10 +4541,10 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		for i in 0..100 {
-			let mut txn = tree.begin().unwrap();
+			let mut batch = tree.new_batch();
 			let value = vec![b'x'; 100];
-			txn.set(format!("key{:04}", i).as_bytes(), &value).unwrap();
-			txn.commit().await.unwrap();
+			batch.set(format!("key{:04}", i).as_bytes(), &value).unwrap();
+			tree.apply(batch, false).await.unwrap();
 		}
 
 		tree.close().await.unwrap();

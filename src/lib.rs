@@ -1,5 +1,4 @@
 mod batch;
-pub mod bplustree;
 mod cache;
 mod checkpoint;
 mod clock;
@@ -15,11 +14,7 @@ mod lsm;
 mod memtable;
 mod snapshot;
 mod sstable;
-mod stall;
-mod task;
-mod transaction;
 mod vfs;
-mod vlog;
 mod wal;
 
 #[cfg(test)]
@@ -33,17 +28,16 @@ use std::sync::Arc;
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 use sstable::bloom::LevelDBBloomFilter;
 
+pub use crate::batch::Batch;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
-pub use crate::lsm::{Tree, TreeBuilder};
-pub use crate::transaction::{
-	Durability,
-	HistoryOptions,
-	Mode,
-	ReadOptions,
-	Transaction,
-	WriteOptions,
-};
+pub use crate::lsm::{Store, StoreBuilder};
+pub use crate::snapshot::{HistoryIterator, Snapshot, SnapshotIterator};
+// Alias for backward compatibility
+pub type Tree = Store;
+pub type TreeBuilder = StoreBuilder;
+// Re-export HistoryOptions for use with history_iter
+pub use crate::snapshot::HistoryOptions;
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {
@@ -133,15 +127,6 @@ pub type KeysResult = Result<Key>;
 /// Type alias for iterator results containing keys and values
 pub type RangeResult = Result<(Key, Value)>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VLogChecksumLevel {
-	/// No checksum verification - fastest but no data integrity protection
-	#[default]
-	Disabled = 0,
-	/// Full verification - recalculate checksum of value content
-	Full = 1,
-}
-
 /// WAL recovery mode to control consistency guarantees during crash recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WalRecoveryMode {
@@ -167,21 +152,9 @@ pub struct Options {
 	pub max_memtable_size: usize,
 	pub index_partition_size: usize,
 
-	// VLog configuration
-	pub vlog_max_file_size: u64,
-	pub vlog_checksum_verification: VLogChecksumLevel,
-	/// If true, disables `VLog` creation entirely
-	pub enable_vlog: bool,
-	/// If value size is less than this, it will be stored inline in `SSTable`
-	pub vlog_value_threshold: usize,
-
 	// Versioned query configuration
 	/// If true, enables versioned queries with timestamp tracking
 	pub enable_versioning: bool,
-	/// If true, creates a B+tree index for timestamp-based queries.
-	/// Requires enable_versioning to be true.
-	/// When false, versioned queries will scan the LSM tree directly.
-	pub enable_versioned_index: bool,
 	/// History retention period in nanoseconds (0 means no retention limit)
 	/// Default: 0 (no retention limit)
 	pub versioned_history_retention_ns: u64,
@@ -212,15 +185,11 @@ pub struct Options {
 	/// Default: 10.0
 	pub level_multiplier: f64,
 
-	/// Number of immutable memtables that triggers write stall.
-	/// When immutable memtable count >= this threshold, writes block until flushes complete.
-	/// Default: 2
-	pub memtable_stall_threshold: usize,
-	/// Number of L0 files that triggers write stall.
-	/// When L0 file count >= this threshold, writes block until compactions complete.
-	/// Should be >= level0_max_files (compaction trigger).
-	/// Default: 12 (3x level0_max_files)
-	pub l0_stall_threshold: usize,
+	/// Number of beats per compaction bar.
+	/// Each commit advances one beat. A bar is one full compaction cycle.
+	/// Levels alternate between half-bars: odd targets in first half, even in second.
+	/// Default: 32
+	pub compaction_beats_per_bar: u64,
 }
 
 impl Default for Options {
@@ -243,14 +212,9 @@ impl Default for Options {
 			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)), // 1MB cache
 			path: PathBuf::from(""),
 			level_count: 6,
-			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
-			index_partition_size: 16384,           // 16KB
-			vlog_max_file_size: 256 * 1024 * 1024, // 256MB
-			vlog_checksum_verification: VLogChecksumLevel::Disabled,
-			enable_vlog: false,
-			vlog_value_threshold: 1024, // 1KB default
+			max_memtable_size: 100 * 1024 * 1024, // 100 MB
+			index_partition_size: 16384,          // 16KB
 			enable_versioning: false,
-			enable_versioned_index: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
 			flush_on_close: true,
@@ -258,8 +222,7 @@ impl Default for Options {
 			level0_max_files: 4,
 			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
 			level_multiplier: 10.0,
-			memtable_stall_threshold: 2,
-			l0_stall_threshold: 12,
+			compaction_beats_per_bar: crate::compaction::DEFAULT_BEATS_PER_BAR,
 		}
 	}
 }
@@ -360,8 +323,7 @@ impl Options {
 		self
 	}
 
-	/// Sets the unified block cache capacity (includes data blocks, index
-	/// blocks, and VLog values)
+	/// Sets the unified block cache capacity (includes data blocks and index blocks)
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
 		self.block_cache = Arc::new(cache::BlockCache::with_capacity_bytes(capacity_bytes));
 		self
@@ -373,65 +335,10 @@ impl Options {
 		self
 	}
 
-	pub const fn with_vlog_max_file_size(mut self, value: u64) -> Self {
-		self.vlog_max_file_size = value;
-		self
-	}
-
-	pub const fn with_vlog_checksum_verification(mut self, value: VLogChecksumLevel) -> Self {
-		self.vlog_checksum_verification = value;
-		self
-	}
-
-	pub const fn with_enable_vlog(mut self, value: bool) -> Self {
-		self.enable_vlog = value;
-		self
-	}
-
-	/// Sets the VLog value threshold in bytes.
-	///
-	/// Values smaller than this threshold are stored inline in SSTables.
-	/// Values larger than or equal to this threshold are stored in VLog files.
-	///
-	/// Default: 4096 (4KB)
-	///
-	/// # Example
-	///
-	/// ```no_run
-	/// use surrealkv::TreeBuilder;
-	///
-	/// let tree = TreeBuilder::new()
-	///     .with_path("./data".into())
-	///     .with_enable_vlog(true)
-	///     .with_vlog_value_threshold(8192) // 8KB threshold
-	///     .build()
-	///     .unwrap();
-	/// ```
-	pub const fn with_vlog_value_threshold(mut self, value: usize) -> Self {
-		self.vlog_value_threshold = value;
-		self
-	}
-
 	/// Enables or disables versioned queries with timestamp tracking
-	/// When enabled, automatically configures VLog and value threshold for
-	/// optimal versioned query support
 	pub fn with_versioning(mut self, value: bool, retention_ns: u64) -> Self {
 		self.enable_versioning = value;
 		self.versioned_history_retention_ns = retention_ns;
-		if value {
-			// Versioned queries require VLog to be enabled
-			self.enable_vlog = true;
-			// All values should go to VLog for versioned queries
-			self.vlog_value_threshold = 0;
-		}
-		self
-	}
-
-	/// Enables or disables the B+tree versioned index for timestamp-based queries.
-	/// When disabled, versioned queries will scan the LSM tree directly.
-	/// Requires `enable_versioning` to be true for this to have any effect.
-	pub const fn with_versioned_index(mut self, value: bool) -> Self {
-		self.enable_versioned_index = value;
 		self
 	}
 
@@ -471,18 +378,6 @@ impl Options {
 		self
 	}
 
-	/// Sets the number of immutable memtables that triggers write stall.
-	pub const fn with_memtable_stall_threshold(mut self, value: usize) -> Self {
-		self.memtable_stall_threshold = value;
-		self
-	}
-
-	/// Sets the number of L0 files that triggers write stall.
-	pub const fn with_l0_stall_threshold(mut self, value: usize) -> Self {
-		self.l0_stall_threshold = value;
-		self
-	}
-
 	/// Returns the path for a manifest file with the given ID
 	/// Format: {path}/manifest/{id:020}.manifest
 	pub(crate) fn manifest_file_path(&self, id: u64) -> PathBuf {
@@ -495,12 +390,6 @@ impl Options {
 		self.sstable_dir().join(format!("{id:020}.sst"))
 	}
 
-	/// Returns the path for a `VLog` file with the given ID
-	/// Format: {path}/vlog/{id:020}.vlog
-	pub(crate) fn vlog_file_path(&self, id: u64) -> PathBuf {
-		self.vlog_dir().join(format!("{id:020}.vlog"))
-	}
-
 	/// Returns the directory path for WAL files
 	pub(crate) fn wal_dir(&self) -> PathBuf {
 		self.path.join("wal")
@@ -511,89 +400,18 @@ impl Options {
 		self.path.join("sstables")
 	}
 
-	/// Returns the directory path for `VLog` files
-	pub(crate) fn vlog_dir(&self) -> PathBuf {
-		self.path.join("vlog")
-	}
-
 	/// Returns the directory path for manifest files
 	pub(crate) fn manifest_dir(&self) -> PathBuf {
 		self.path.join("manifest")
-	}
-
-	/// Returns the directory path for versioned index files
-	pub(crate) fn versioned_index_dir(&self) -> PathBuf {
-		self.path.join("versioned_index")
-	}
-
-	/// Checks if a filename matches the `VLog` file naming pattern
-	/// Expected format: 20-digit zero-padded ID + ".vlog" (25 characters total)
-	pub(crate) fn is_vlog_filename(&self, filename: &str) -> bool {
-		filename.len() == 25
-			&& std::path::Path::new(filename)
-				.extension()
-				.is_some_and(|ext| ext.eq_ignore_ascii_case("vlog"))
-	}
-
-	/// Extracts the file ID from a `VLog` filename
-	/// Returns None if the filename doesn't match the expected pattern
-	pub(crate) fn extract_vlog_file_id(&self, filename: &str) -> Option<u32> {
-		if self.is_vlog_filename(filename) {
-			if let Some(id_part) = filename.strip_suffix(".vlog") {
-				if id_part.len() == 20 && id_part.chars().all(|c| c.is_ascii_digit()) {
-					return id_part.parse::<u32>().ok();
-				}
-			}
-		}
-		None
 	}
 
 	/// Validates the configuration options for consistency and correctness
 	/// This should be called when the store starts to catch configuration
 	/// errors early
 	pub fn validate(&self) -> Result<()> {
-		// Validate versioned queries configuration
-		if self.enable_versioning {
-			// Versioned queries require VLog to be enabled
-			if !self.enable_vlog {
-				return Err(Error::InvalidArgument(
-					"Versioned queries require VLog to be enabled. Set enable_vlog to true."
-						.to_string(),
-				));
-			}
-
-			// Versioned queries don't work well with value threshold (values should go to
-			// VLog)
-			if self.vlog_value_threshold > 0 {
-				return Err(Error::InvalidArgument(
-					"Versioned queries require all values to be stored in VLog. Set vlog_value_threshold to 0.".to_string(),
-				));
-			}
-		}
-
-		// Validate versioned index requires versioning to be enabled
-		if self.enable_versioned_index && !self.enable_versioning {
-			return Err(Error::InvalidArgument(
-				"Versioned index requires versioning to be enabled. Call with_versioning(true, retention_ns) first.".to_string(),
-			));
-		}
-
 		// Validate level count is reasonable
 		if self.level_count == 0 {
 			return Err(Error::InvalidArgument("Level count must be at least 1".to_string()));
-		}
-
-		// Validate write stall configuration
-		if self.memtable_stall_threshold < 2 {
-			return Err(Error::InvalidArgument(
-				"memtable_stall_threshold must be >= 2".to_string(),
-			));
-		}
-		if self.l0_stall_threshold < self.level0_max_files {
-			return Err(Error::InvalidArgument(format!(
-				"l0_stall_threshold ({}) must be >= level0_max_files ({})",
-				self.l0_stall_threshold, self.level0_max_files
-			)));
 		}
 
 		Ok(())
@@ -1033,17 +851,11 @@ pub trait LSMIterator {
 	fn key(&self) -> InternalKeyRef<'_>;
 
 	/// Get current raw value bytes (zero-copy). Caller must check valid() first.
-	///
-	/// For transaction-level iterators, this returns raw bytes that may be
-	/// VLog-encoded. Use `value()` for resolved values.
 	fn value_encoded(&self) -> Result<&[u8]>;
 
-	/// Get current value as owned bytes with VLog resolution.
+	/// Get current value as owned bytes.
 	///
-	/// This method resolves VLog pointers to actual values, returning owned data.
-	/// For iterators without VLog (internal iterators), this clones the raw bytes.
-	///
-	/// Default implementation clones raw bytes from `value()`.
+	/// Default implementation clones raw bytes from `value_encoded()`.
 	fn value(&self) -> Result<Value> {
 		Ok(self.value_encoded()?.to_vec())
 	}

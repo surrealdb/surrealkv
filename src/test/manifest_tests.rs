@@ -224,7 +224,7 @@ fn test_level_manifest_persistence() {
 
 	// Check Table1 basic properties
 	assert_eq!(table1_reloaded.id, table_id1, "Table 1 ID mismatch");
-	assert_eq!(table1_reloaded.file_size, 3838, "Table 1 file size should be 3838");
+	assert_eq!(table1_reloaded.file_size, 3830, "Table 1 file size should be 3830");
 
 	// Check Table1 metadata properties
 	let props1 = &table1_reloaded.meta.properties;
@@ -260,7 +260,7 @@ fn test_level_manifest_persistence() {
 
 	// Check Table2 basic properties
 	assert_eq!(table2_reloaded.id, table_id2, "Table 2 ID mismatch");
-	assert_eq!(table2_reloaded.file_size, 7145, "Table 2 file size should be 7145");
+	assert_eq!(table2_reloaded.file_size, 7137, "Table 2 file size should be 7137");
 
 	// Check Table2 metadata properties
 	let props2 = &table2_reloaded.meta.properties;
@@ -296,7 +296,7 @@ fn test_level_manifest_persistence() {
 
 	// Check Table3 basic properties
 	assert_eq!(table3_reloaded.id, table_id3, "Table 3 ID mismatch");
-	assert_eq!(table3_reloaded.file_size, 10452, "Table 3 file size should be 10452");
+	assert_eq!(table3_reloaded.file_size, 10444, "Table 3 file size should be 10444");
 
 	// Check Table3 metadata properties
 	let props3 = &table3_reloaded.meta.properties;

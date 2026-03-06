@@ -17,7 +17,6 @@ use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
-use crate::vlog::ValueLocation;
 use crate::{CompressionType, InternalKey, InternalKeyKind, Key, LSMIterator, Options, Value};
 
 /// Test environment setup helpers
@@ -86,10 +85,9 @@ fn create_comparator() -> Arc<InternalKeyComparator> {
 	Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())))
 }
 
-/// Helper function to create encoded inline values for testing
+/// Helper function to create test values
 fn create_inline_value(value: &[u8]) -> Vec<u8> {
-	let location = ValueLocation::with_inline_value(value.to_vec());
-	location.encode()
+	value.to_vec()
 }
 
 /// Helper function to create test entries with automatic value encoding
@@ -208,18 +206,12 @@ fn create_compaction_options(
 	opts: Arc<Options>,
 	manifest: Arc<RwLock<LevelManifest>>,
 ) -> CompactionOptions {
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-
-	let vlog = Arc::new(crate::vlog::VLog::new(Arc::clone(&opts)).unwrap());
-
 	CompactionOptions {
 		lopts: opts,
 		level_manifest: manifest,
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
-		vlog: Some(vlog),
 		error_handler: Arc::new(BackgroundErrorHandler::new()),
 		snapshot_tracker: SnapshotTracker::new(),
-		versioned_index: None,
 	}
 }
 
@@ -349,7 +341,7 @@ fn test_level_selection() {
 
 	// Verify L0 was selected for compaction (as it exceeds its limit)
 	match choice {
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			assert_eq!(input.source_level, 0, "L0 should be selected as source level");
 			assert_eq!(input.target_level, 1, "L1 should be selected as target level");
 
@@ -393,7 +385,7 @@ fn test_compaction_edge_cases() {
 	// Strategy should skip compaction when L0 is empty
 	match choice {
 		CompactionChoice::Skip => { /* Expected */ }
-		CompactionChoice::Merge(_) => {
+		CompactionChoice::Merge(_) | CompactionChoice::Move(_) => {
 			panic!("Compaction should be skipped when L0 is empty");
 		}
 	}
@@ -423,7 +415,7 @@ fn test_compaction_edge_cases() {
 		CompactionChoice::Skip => {
 			// Skip is OK if last level doesn't exceed byte limit
 		}
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			// If compaction is selected, it should be same-level compaction
 			if input.source_level == 3 {
 				assert_eq!(input.target_level, 3, "Bottom level should compact to itself");
@@ -498,7 +490,7 @@ fn test_level_selection_score_based() {
 	let choice = strategy.pick_levels(&manifest_guard).unwrap();
 
 	match choice {
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			// Since l2_bytes > l1_bytes, l2_score > l1_score
 			// And l2_score should be >= 1.0 (since we set base to make L1 ~0.5)
 			if l2_score > l1_score && l2_score >= 1.0 {
@@ -1414,11 +1406,8 @@ async fn test_compaction_respects_sequence_numbers() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
-				let location = ValueLocation::decode(iter.value_encoded().unwrap()).unwrap();
-				if location.is_value_pointer() {
-					panic!("Unexpected VLog pointer in test");
-				}
-				all_keys.insert(key, (*location.value).to_vec());
+				let value = iter.value_encoded().unwrap().to_vec();
+				all_keys.insert(key, value);
 				iter.next().unwrap();
 			}
 		}
@@ -1600,14 +1589,10 @@ async fn test_l0_overlapping_keys_compaction() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned();
-				let encoded_value = iter.value_encoded().unwrap().to_vec();
+				let value = iter.value_encoded().unwrap().to_vec();
 				match key.kind() {
 					InternalKeyKind::Set => {
-						let location = ValueLocation::decode(&encoded_value).unwrap();
-						if location.is_value_pointer() {
-							panic!("Unexpected VLog pointer in test");
-						}
-						all_keys.insert(key.user_key.clone(), (*location.value).to_vec());
+						all_keys.insert(key.user_key.clone(), value);
 					}
 					InternalKeyKind::Delete => {
 						tombstones.insert(key.user_key.clone(), key.seq_num());
@@ -1719,13 +1704,9 @@ async fn test_l0_tombstone_propagation_overlapping() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned();
-				let encoded_value = iter.value_encoded().unwrap().to_vec();
+				let value = iter.value_encoded().unwrap().to_vec();
 				if key.kind() == InternalKeyKind::Set {
-					let location = ValueLocation::decode(&encoded_value).unwrap();
-					if location.is_value_pointer() {
-						panic!("Unexpected VLog pointer in test");
-					}
-					survivors.insert(key.user_key.clone(), (*location.value).to_vec());
+					survivors.insert(key.user_key.clone(), value);
 				}
 				iter.next().unwrap();
 			}
@@ -1988,7 +1969,6 @@ fn test_table_properties_population() {
 	assert_eq!(props.num_deletions, expected_deletions);
 	assert_eq!(props.tombstone_count, expected_tombstones);
 	assert_eq!(props.data_size, 2975);
-	assert_eq!(props.oldest_vlog_file_id, 0);
 	assert_eq!(props.num_data_blocks, 1);
 
 	assert_eq!(props.index_size, 74, "Index size should be tracked");
@@ -2108,8 +2088,7 @@ async fn test_soft_delete_compaction_behavior() {
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 1.0);
 	let strategy = Arc::new(Strategy::from_options(opts));
-	let mut compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
-	compaction_options.vlog = None;
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 	let compactor = Compactor::new(compaction_options, strategy);
 
 	compactor.compact().unwrap();
@@ -2155,15 +2134,7 @@ async fn test_soft_delete_compaction_behavior() {
 			match key.kind() {
 				InternalKeyKind::Set => {
 					let key_str = String::from_utf8(key.user_key.clone()).unwrap();
-
-					// Decode the ValueLocation to get the actual value
-					let location = crate::vlog::ValueLocation::decode(&value).unwrap();
-					let actual_value = if location.is_value_pointer() {
-						panic!("Unexpected VLog pointer in test");
-					} else {
-						(*location.value).to_vec()
-					};
-					let value_str = String::from_utf8(actual_value).unwrap();
+					let value_str = String::from_utf8(value.clone()).unwrap();
 
 					// Verify we get the latest L0 values, not the old L1 values
 					if key_str.starts_with("key-") {
@@ -2213,8 +2184,6 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 	//   - SoftDelete (seq 100) - oldest
 	//
 	// With versioning disabled, the older versions should be marked stale.
-	// The bug was that older soft deletes (which have empty values) would crash
-	// when the code tried to decode them as ValueLocation.
 
 	let env = TestEnv::new_with_levels(2);
 	let mut levels = Levels::new(3, 10);
@@ -2259,7 +2228,6 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 1.0);
 	let strategy = Arc::new(Strategy::from_options(opts));
-	// NOTE: Do NOT set vlog = None - we need VLog enabled to trigger the bug
 	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 
 	let compactor = Compactor::new(compaction_options, strategy);
@@ -2326,7 +2294,7 @@ fn test_score_based_level_selection() {
 	// Score-based selection should pick the level with highest score
 	let choice = strategy.pick_levels(&manifest).unwrap();
 	match choice {
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			// Should pick a level that needs compaction (score >= 1.0)
 			assert!(input.source_level <= 1, "Should pick L0 or L1");
 		}
@@ -2359,7 +2327,7 @@ fn test_bytes_based_level_limits() {
 	// Check that L1 can be selected if it exceeds limit
 	let choice = strategy.pick_levels(&manifest).unwrap();
 	match choice {
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			// Should pick a level that needs compaction
 			assert!(input.source_level <= 2, "Should pick a valid level");
 		}
@@ -2394,7 +2362,7 @@ fn test_bottom_level_compaction() {
 	// Note: This will only trigger if L2 exceeds its byte limit
 	let choice = strategy.pick_levels(&manifest).unwrap();
 	match choice {
-		CompactionChoice::Merge(input) => {
+		CompactionChoice::Merge(input) | CompactionChoice::Move(input) => {
 			// If L2 is selected, it should compact to same level
 			if input.source_level == 2 {
 				assert_eq!(
@@ -2427,7 +2395,7 @@ fn create_test_table_with_bounds(
 
 	// Add smallest key
 	let small_key = InternalKey::new(smallest_key.to_vec(), 1, InternalKeyKind::Set, 0);
-	let value = ValueLocation::with_inline_value(b"v".to_vec()).encode();
+	let value = b"v".to_vec();
 	writer.add(small_key, &value).unwrap();
 
 	// Add largest key (if different)
@@ -2675,7 +2643,7 @@ fn test_expand_same_user_key_different_seq() {
 	let file1 = File::create(&table_path1).unwrap();
 	let mut writer1 = crate::sstable::table::TableWriter::new(file1, 1, Arc::clone(&opts), 0);
 	let key1 = InternalKey::new(b"foo".to_vec(), 100, InternalKeyKind::Set, 0);
-	let value = ValueLocation::with_inline_value(b"v1".to_vec()).encode();
+	let value = b"v1".to_vec();
 	writer1.add(key1, &value).unwrap();
 	writer1.finish().unwrap();
 	let file1 = std::fs::File::open(&table_path1).unwrap();
