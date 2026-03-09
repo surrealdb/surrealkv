@@ -2,12 +2,13 @@ use bytes::{Buf, BufMut, BytesMut};
 
 use crate::error::Error;
 use crate::sstable::error::SSTableError;
+use crate::sstable::sst_id::SstId;
 use crate::sstable::table::TableFormat;
 use crate::{CompressionType, InternalKey, Result};
 
 #[derive(Debug, Clone)]
 pub(crate) struct Properties {
-	pub(crate) id: u64,
+	pub(crate) id: SstId,
 	pub(crate) table_format: TableFormat,
 	pub(crate) num_entries: u64,
 	pub(crate) num_deletions: u64,
@@ -48,7 +49,7 @@ pub(crate) struct Properties {
 impl Properties {
 	pub(crate) fn new() -> Self {
 		Properties {
-			id: 0,
+			id: SstId::nil(),
 			table_format: TableFormat::LSMV1,
 			num_entries: 0,
 			num_deletions: 0,
@@ -77,7 +78,7 @@ impl Properties {
 
 	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut buf = BytesMut::with_capacity(256);
-		buf.put_u64(self.id);
+		buf.put_u128(self.id.0);
 		buf.put_u8(self.table_format as u8);
 		buf.put_u64(self.num_entries);
 		buf.put_u64(self.num_deletions);
@@ -107,7 +108,7 @@ impl Properties {
 
 	pub(crate) fn decode(buf: Vec<u8>) -> Result<Self> {
 		let mut buf = &buf[..];
-		let id = buf.get_u64();
+		let id = SstId::from(buf.get_u128());
 		let table_format = buf.get_u8();
 		let num_entries = buf.get_u64();
 		let num_deletions = buf.get_u64();

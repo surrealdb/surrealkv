@@ -86,8 +86,9 @@ use std::sync::Arc;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
 use crate::sstable::error::SSTableError;
-use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
-use crate::vfs::File;
+use crate::sstable::sst_id::SstId;
+use crate::sstable::table::{compress_block, write_block_at_offset};
+use crate::tablestore::TableStore;
 use crate::{CompressionType, Options};
 
 // =============================================================================
@@ -350,36 +351,31 @@ impl IndexWriter {
 /// Each entry points to a partition block that can be loaded on demand.
 #[derive(Clone)]
 pub(crate) struct Index {
-	pub(crate) id: u64,
+	pub(crate) id: SstId,
 	pub(crate) opts: Arc<Options>,
 
 	/// Partition block handles with their separator keys
 	/// Sorted by separator key in ascending order
 	pub(crate) blocks: Vec<BlockHandleWithKey>,
 
-	pub(crate) file: Arc<dyn File>,
+	pub(crate) table_store: Arc<TableStore>,
 }
 
 impl Index {
-	/// Loads the top-level index from disk.
+	/// Builds the top-level index from a pre-loaded block.
 	///
 	/// ## Process
 	///
-	/// 1. Read the top-level index block at `location`
-	/// 2. Iterate through all entries
-	/// 3. For each entry: decode (separator_key, partition_handle)
-	/// 4. Store in `blocks` vector for binary search during lookups
+	/// 1. Iterate through all entries in the pre-loaded top-level block
+	/// 2. For each entry: decode (separator_key, partition_handle)
+	/// 3. Store in `blocks` vector for binary search during lookups
 	pub(crate) fn new(
-		id: u64,
+		id: SstId,
 		opt: Arc<Options>,
-		f: Arc<dyn File>,
-		location: &BlockHandle,
+		table_store: Arc<TableStore>,
+		top_level_block: Block,
 	) -> Result<Self> {
-		// Read and parse the top-level index block
-		let block =
-			read_table_block(Arc::clone(&opt.internal_comparator), Arc::clone(&f), location)?;
-
-		let mut iter = block.iter()?;
+		let mut iter = top_level_block.iter()?;
 		let mut blocks = Vec::new();
 
 		// Extract all partition entries
@@ -400,7 +396,7 @@ impl Index {
 			id,
 			opts: opt,
 			blocks,
-			file: Arc::clone(&f),
+			table_store,
 		})
 	}
 
@@ -470,19 +466,22 @@ impl Index {
 			.map(|block| (index, block)))
 	}
 
-	/// Loads a partition block from disk (with caching).
-	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
+	/// Loads a partition block from the object store (with caching).
+	pub(crate) async fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
 		// Check cache first
 		if let Some(block) = self.opts.block_cache.get_index_block(self.id, block_handle.offset()) {
 			return Ok(block);
 		}
 
-		// Cache miss: read from disk
-		let block_data = read_table_block(
-			Arc::clone(&self.opts.internal_comparator),
-			Arc::clone(&self.file),
-			&block_handle.handle,
-		)?;
+		// Cache miss: read from object store
+		let block_data = self
+			.table_store
+			.read_table_block(
+				&self.id,
+				&block_handle.handle,
+				Arc::clone(&self.opts.internal_comparator),
+			)
+			.await?;
 		let block = Arc::new(block_data);
 
 		// Insert into cache
@@ -581,7 +580,7 @@ impl<'a> IndexIterator<'a> {
 	}
 
 	/// Seeks to the first entry across all partitions.
-	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
+	pub(crate) async fn seek_to_first(&mut self) -> Result<()> {
 		if self.index.blocks.is_empty() {
 			self.partition_iter = None;
 			let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex {
@@ -593,20 +592,20 @@ impl<'a> IndexIterator<'a> {
 
 		// Load first partition
 		self.partition_index = 0;
-		let block = self.index.load_block(&self.index.blocks[0])?;
+		let block = self.index.load_block(&self.index.blocks[0]).await?;
 		let mut iter = block.iter()?;
 		iter.seek_to_first()?;
 		self.partition_iter = Some(iter);
 
 		// Handle empty first partition
 		if !self.valid() {
-			self.next()?;
+			self.next().await?;
 		}
 		Ok(())
 	}
 
 	/// Seeks to the last entry across all partitions.
-	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
+	pub(crate) async fn seek_to_last(&mut self) -> Result<()> {
 		if self.index.blocks.is_empty() {
 			self.partition_iter = None;
 			let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex {
@@ -618,14 +617,14 @@ impl<'a> IndexIterator<'a> {
 
 		// Load last partition
 		self.partition_index = self.index.blocks.len() - 1;
-		let block = self.index.load_block(&self.index.blocks[self.partition_index])?;
+		let block = self.index.load_block(&self.index.blocks[self.partition_index]).await?;
 		let mut iter = block.iter()?;
 		iter.seek_to_last()?;
 		self.partition_iter = Some(iter);
 
 		// Handle empty last partition
 		if !self.valid() {
-			self.prev()?;
+			self.prev().await?;
 		}
 		Ok(())
 	}
@@ -655,7 +654,7 @@ impl<'a> IndexIterator<'a> {
 	///      - "elderberry" >= "date"? Yes → found!
 	///   3. Iterator at ("elderberry", D3)
 	/// ```
-	pub(crate) fn seek(&mut self, target: &[u8]) -> Result<()> {
+	pub(crate) async fn seek(&mut self, target: &[u8]) -> Result<()> {
 		if self.index.blocks.is_empty() {
 			self.partition_iter = None;
 			let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex {
@@ -669,7 +668,7 @@ impl<'a> IndexIterator<'a> {
 		match self.index.find_block_handle_by_key(target)? {
 			Some((idx, block_handle)) => {
 				self.partition_index = idx;
-				let block = self.index.load_block(block_handle)?;
+				let block = self.index.load_block(block_handle).await?;
 				let mut iter = block.iter()?;
 
 				// Seek within partition
@@ -680,7 +679,7 @@ impl<'a> IndexIterator<'a> {
 				// This handles the "gap" case where target is between
 				// this partition's actual entries and its separator
 				if !self.valid() {
-					self.next()?;
+					self.next().await?;
 				}
 			}
 			None => {
@@ -702,7 +701,7 @@ impl<'a> IndexIterator<'a> {
 	///    b. Seek to first entry
 	///    c. Repeat if that partition is also empty
 	/// ```
-	pub(crate) fn next(&mut self) -> Result<bool> {
+	pub(crate) async fn next(&mut self) -> Result<bool> {
 		// Try advancing within current partition
 		if let Some(ref mut iter) = self.partition_iter {
 			if iter.advance()? {
@@ -721,7 +720,7 @@ impl<'a> IndexIterator<'a> {
 			}
 
 			// Load next partition and position at start
-			let block = self.index.load_block(&self.index.blocks[self.partition_index])?;
+			let block = self.index.load_block(&self.index.blocks[self.partition_index]).await?;
 			let mut iter = block.iter()?;
 			iter.seek_to_first()?;
 			self.partition_iter = Some(iter);
@@ -734,7 +733,7 @@ impl<'a> IndexIterator<'a> {
 	}
 
 	/// Moves to the previous entry, crossing partition boundaries if needed.
-	pub(crate) fn prev(&mut self) -> Result<bool> {
+	pub(crate) async fn prev(&mut self) -> Result<bool> {
 		// Try retreating within current partition
 		if let Some(ref mut iter) = self.partition_iter {
 			if iter.prev_internal()? {
@@ -751,7 +750,7 @@ impl<'a> IndexIterator<'a> {
 			self.partition_index -= 1;
 
 			// Load previous partition and position at end
-			let block = self.index.load_block(&self.index.blocks[self.partition_index])?;
+			let block = self.index.load_block(&self.index.blocks[self.partition_index]).await?;
 			let mut iter = block.iter()?;
 			iter.seek_to_last()?;
 			self.partition_iter = Some(iter);

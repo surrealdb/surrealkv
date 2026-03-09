@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::levels::{Level, LevelManifest};
+use crate::sstable::sst_id::SstId;
 use crate::sstable::table::Table;
 use crate::{InternalKeyRange, Options, Result};
 
@@ -150,14 +151,14 @@ impl Strategy {
 	/// **Result:** {1, 2, 3} - File 4 excluded due to clean gap between "d" and "e"
 	pub(crate) fn select_overlapping_ranges(
 		level: &Level,
-		initial_table_id: u64,
-	) -> Result<Vec<u64>> {
+		initial_table_id: SstId,
+	) -> Result<Vec<SstId>> {
 		// Verify the initial table exists in the level
 		if !level.tables.iter().any(|t| t.id == initial_table_id) {
 			return Err(crate::error::Error::TableNotFound(initial_table_id));
 		}
 
-		let mut selected_ids: HashSet<u64> = HashSet::new();
+		let mut selected_ids: HashSet<SstId> = HashSet::new();
 		selected_ids.insert(initial_table_id);
 
 		// Keep expanding until no new files are added (fixed point)
@@ -195,9 +196,9 @@ impl Strategy {
 		source_level: &Level,
 		next_level: &Level,
 		source_level_num: u8,
-	) -> Result<Vec<u64>> {
+	) -> Result<Vec<SstId>> {
 		let mut tables = vec![];
-		let mut table_id_set = HashSet::new();
+		let mut table_id_set: HashSet<SstId> = HashSet::new();
 
 		if source_level.tables.is_empty() {
 			return Ok(tables);
@@ -251,7 +252,7 @@ impl Strategy {
 		Ok(tables)
 	}
 
-	fn select_best_table_for_compaction(&self, source_level: &Level) -> Option<u64> {
+	fn select_best_table_for_compaction(&self, source_level: &Level) -> Option<SstId> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
@@ -268,14 +269,14 @@ impl Strategy {
 	}
 
 	/// Selects ranges that haven't been compacted for longest
-	fn select_oldest_smallest_seq_first(&self, source_level: &Level) -> Option<u64> {
+	fn select_oldest_smallest_seq_first(&self, source_level: &Level) -> Option<SstId> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
 
 		#[derive(Debug)]
 		struct Choice {
-			table_id: u64,
+			table_id: SstId,
 			smallest_seq: u64,
 			file_size: u64,
 		}
@@ -304,14 +305,14 @@ impl Strategy {
 	}
 
 	/// Selects files whose latest update is oldest (cold data)
-	fn select_oldest_largest_seq_first(&self, source_level: &Level) -> Option<u64> {
+	fn select_oldest_largest_seq_first(&self, source_level: &Level) -> Option<SstId> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
 
 		#[derive(Debug)]
 		struct Choice {
-			table_id: u64,
+			table_id: SstId,
 			largest_seq: u64,
 			file_size: u64,
 		}
@@ -340,14 +341,14 @@ impl Strategy {
 	}
 
 	/// Selects files based on compensated size
-	pub(crate) fn select_by_compensated_size(&self, source_level: &Level) -> Option<u64> {
+	pub(crate) fn select_by_compensated_size(&self, source_level: &Level) -> Option<SstId> {
 		if source_level.tables.is_empty() {
 			return None;
 		}
 
 		#[derive(Debug)]
 		struct Choice {
-			table_id: u64,
+			table_id: SstId,
 			compensated_size: f64,
 		}
 

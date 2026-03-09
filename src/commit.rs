@@ -13,13 +13,14 @@ const MAX_CONCURRENT_COMMITS: usize = 8;
 const DEQUEUE_BITS: u32 = 32;
 
 // Trait for commit operations
+#[async_trait::async_trait]
 pub trait CommitEnv: Send + Sync + 'static {
 	// Write batch to WAL and process VLog entries (synchronous operation)
 	// Returns a new batch with VLog pointers applied
 	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch>;
 
 	// Apply processed batch to memtable
-	fn apply(&self, batch: &Batch) -> Result<()>;
+	async fn apply(&self, batch: &Batch) -> Result<()>;
 
 	// Check for background errors before committing
 	fn check_background_error(&self) -> Result<()>;
@@ -231,7 +232,7 @@ impl CommitPipeline {
 		// Phase 2: Apply to memtable (concurrent)
 		let apply_result = {
 			let env = Arc::clone(&self.env);
-			env.apply(&processed_batch)
+			env.apply(&processed_batch).await
 		};
 
 		// =========================================================================

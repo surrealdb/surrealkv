@@ -654,6 +654,12 @@ pub(crate) struct SkiplistIterator<'a> {
 	encoded_key_buf: Vec<u8>, // Buffer for encoded key to return InternalKeyRef
 }
 
+// SAFETY: SkiplistIterator is only used within a single task context.
+// The raw Node pointers point into the arena-allocated skiplist which is
+// kept alive by the &'a Skiplist reference. The iterator is never shared
+// across threads concurrently.
+unsafe impl Send for SkiplistIterator<'_> {}
+
 impl<'a> SkiplistIterator<'a> {
 	/// Check if iterator is valid
 	#[inline]
@@ -853,10 +859,11 @@ impl<'a> SkiplistIterator<'a> {
 // LSMIterator Implementation
 // ============================================================================
 
+#[async_trait::async_trait]
 impl LSMIterator for SkiplistIterator<'_> {
 	/// Seek to first entry >= target.
 	/// Target is an encoded internal key, we extract user_key for comparison.
-	fn seek(&mut self, target: &[u8]) -> CrateResult<bool> {
+	async fn seek(&mut self, target: &[u8]) -> CrateResult<bool> {
 		let user_key = InternalKey::user_key_from_encoded(target);
 		self.seek_ge(user_key);
 		self.populate_encoded_key();
@@ -864,21 +871,21 @@ impl LSMIterator for SkiplistIterator<'_> {
 	}
 
 	/// Seek to first entry.
-	fn seek_first(&mut self) -> CrateResult<bool> {
+	async fn seek_first(&mut self) -> CrateResult<bool> {
 		self.first();
 		self.populate_encoded_key();
 		Ok(self.is_valid())
 	}
 
 	/// Seek to last entry.
-	fn seek_last(&mut self) -> CrateResult<bool> {
+	async fn seek_last(&mut self) -> CrateResult<bool> {
 		self.last();
 		self.populate_encoded_key();
 		Ok(self.is_valid())
 	}
 
 	/// Move to next entry.
-	fn next(&mut self) -> CrateResult<bool> {
+	async fn next(&mut self) -> CrateResult<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
@@ -888,7 +895,7 @@ impl LSMIterator for SkiplistIterator<'_> {
 	}
 
 	/// Move to previous entry.
-	fn prev(&mut self) -> CrateResult<bool> {
+	async fn prev(&mut self) -> CrateResult<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}

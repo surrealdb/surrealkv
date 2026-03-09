@@ -1,4 +1,3 @@
-use std::fs::File as SysFile;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -10,8 +9,9 @@ use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
 
 use crate::batch::Batch;
 use crate::error::Result;
+use crate::sstable::sst_id::SstId;
 use crate::sstable::table::{Table, TableWriter};
-use crate::vfs::File;
+use crate::tablestore::TableStore;
 use crate::{InternalKey, InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX};
 
 /// Entry in the immutable memtables list, tracking both the table ID
@@ -19,7 +19,7 @@ use crate::{InternalKey, InternalKeyRef, LSMIterator, Options, Value, INTERNAL_K
 #[derive(Clone)]
 pub(crate) struct ImmutableEntry {
 	/// The table ID that will be used for the SST file
-	pub table_id: u64,
+	pub table_id: SstId,
 	/// The WAL number that was current when this memtable was active.
 	/// Used to determine which WALs can be safely deleted after flush.
 	pub wal_number: u64,
@@ -33,7 +33,7 @@ pub(crate) struct ImmutableMemtables(Vec<ImmutableEntry>);
 impl ImmutableMemtables {
 	/// Adds an immutable memtable entry with its associated table ID and WAL
 	/// number.
-	pub(crate) fn add(&mut self, table_id: u64, wal_number: u64, memtable: Arc<MemTable>) {
+	pub(crate) fn add(&mut self, table_id: SstId, wal_number: u64, memtable: Arc<MemTable>) {
 		self.0.push(ImmutableEntry {
 			table_id,
 			wal_number,
@@ -42,7 +42,7 @@ impl ImmutableMemtables {
 		self.0.sort_by_key(|entry| entry.table_id); // Maintain sorted order by ID
 	}
 
-	pub(crate) fn remove(&mut self, id_to_remove: u64) {
+	pub(crate) fn remove(&mut self, id_to_remove: SstId) {
 		if let Ok(index) = self.0.binary_search_by_key(&id_to_remove, |entry| entry.table_id) {
 			self.0.remove(index);
 		}
@@ -216,30 +216,36 @@ impl MemTable {
 		self.latest_seq_num.load(Ordering::Acquire)
 	}
 
-	pub(crate) fn flush(&self, table_id: u64, lsm_opts: Arc<Options>) -> Result<Arc<Table>> {
-		let table_file_path = lsm_opts.sstable_file_path(table_id);
-
+	pub(crate) async fn flush(
+		&self,
+		table_id: SstId,
+		lsm_opts: Arc<Options>,
+		table_store: Arc<TableStore>,
+	) -> Result<Arc<Table>> {
+		// Write SST to a local buffer, then upload via object store
+		let mut buf = Vec::new();
 		{
-			let file = SysFile::create(&table_file_path)?;
-			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
+			let mut table_writer = TableWriter::new(&mut buf, table_id, Arc::clone(&lsm_opts), 0);
 
 			let mut iter = self.iter();
-			iter.seek_first()?;
+			iter.seek_first().await?;
 			while iter.valid() {
 				let key = iter.key().to_owned();
 				let value = iter.value_encoded()?;
 				table_writer.add(key, value)?;
-				iter.next()?;
+				iter.next().await?;
 			}
 			table_writer.finish()?;
 		}
 
-		let file = crate::vfs::open_for_sync(&table_file_path)?;
-		file.sync_all()?;
-		let file: Arc<dyn File> = Arc::new(file);
-		let file_size = file.size()?;
+		let file_size = buf.len() as u64;
 
-		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);
+		// Upload to object store
+		table_store.write_sst(&table_id, bytes::Bytes::from(buf)).await?;
+
+		// Open table from object store
+		let created_table =
+			Arc::new(Table::new(table_id, lsm_opts, Arc::clone(&table_store), file_size).await?);
 		Ok(created_table)
 	}
 
@@ -273,25 +279,26 @@ pub(crate) struct MemTableIterator<'a> {
 	iter: SkiplistIterator<'a>,
 }
 
+#[async_trait::async_trait]
 impl LSMIterator for MemTableIterator<'_> {
-	fn seek(&mut self, target: &[u8]) -> Result<bool> {
-		self.iter.seek(target)
+	async fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		self.iter.seek(target).await
 	}
 
-	fn seek_first(&mut self) -> Result<bool> {
-		self.iter.seek_first()
+	async fn seek_first(&mut self) -> Result<bool> {
+		self.iter.seek_first().await
 	}
 
-	fn seek_last(&mut self) -> Result<bool> {
-		self.iter.seek_last()
+	async fn seek_last(&mut self) -> Result<bool> {
+		self.iter.seek_last().await
 	}
 
-	fn next(&mut self) -> Result<bool> {
-		self.iter.next()
+	async fn next(&mut self) -> Result<bool> {
+		self.iter.next().await
 	}
 
-	fn prev(&mut self) -> Result<bool> {
-		self.iter.prev()
+	async fn prev(&mut self) -> Result<bool> {
+		self.iter.prev().await
 	}
 
 	fn valid(&self) -> bool {

@@ -34,8 +34,8 @@ pub enum Error {
 	KeyNotFound,
 	ArenaFull, // Memtable arena is full, need rotation
 	FileDescriptorNotFound,
-	TableIDCollision(u64),
-	TableNotFound(u64),
+	TableIDCollision(crate::sstable::sst_id::SstId),
+	TableNotFound(crate::sstable::sst_id::SstId),
 	PipelineStall,
 	Other(String), // Other errors
 	NoSnapshot,
@@ -55,6 +55,11 @@ pub enum Error {
 		message: String,
 	},
 	SSTable(crate::sstable::error::SSTableError), // SSTable-specific errors
+	Fenced,                                       /* Writer or compactor has been fenced by a
+	                                               * newer instance */
+	ObjectStoreError(String), // Object store operation failed
+	InvalidDeletion,          /* Attempted to delete active manifest or checkpoint-referenced
+	                           * manifest */
 }
 
 // Implementation of Display trait for Error
@@ -101,6 +106,9 @@ impl fmt::Display for Error {
                 segment_id, offset, message
             ),
             Self::SSTable(err) => write!(f, "SSTable error: {err}"),
+            Self::Fenced => write!(f, "Writer or compactor has been fenced by a newer instance"),
+            Self::ObjectStoreError(err) => write!(f, "Object store error: {err}"),
+            Self::InvalidDeletion => write!(f, "Attempted to delete active or checkpoint-referenced manifest"),
         }
 	}
 }
@@ -136,6 +144,12 @@ impl From<crate::wal::Error> for Error {
 impl From<crate::sstable::error::SSTableError> for Error {
 	fn from(err: crate::sstable::error::SSTableError) -> Self {
 		Error::SSTable(err)
+	}
+}
+
+impl From<object_store::Error> for Error {
+	fn from(e: object_store::Error) -> Self {
+		Error::ObjectStoreError(e.to_string())
 	}
 }
 
@@ -217,6 +231,9 @@ impl BackgroundErrorHandler {
 
 			// Manifest write I/O is fatal
 			(BackgroundErrorReason::ManifestWrite, Error::Io(_)) => ErrorSeverity::FatalError,
+
+			// Fenced errors are fatal -- another instance has taken over
+			(_, Error::Fenced) => ErrorSeverity::FatalError,
 
 			// Default: treat as hard error for safety
 			_ => ErrorSeverity::HardError,

@@ -365,25 +365,25 @@ impl<'a> MergingIterator<'a> {
 	}
 
 	/// Initialize for forward iteration from the beginning.
-	fn init_forward(&mut self) -> Result<()> {
+	async fn init_forward(&mut self) -> Result<()> {
 		self.direction = Direction::Forward;
 		self.clear_heaps();
 
 		for child in &mut self.children {
-			child.iter.seek_first()?;
+			child.iter.seek_first().await?;
 		}
 		self.rebuild_min_heap();
 		Ok(())
 	}
 
 	/// Initialize for backward iteration from the end.
-	fn init_backward(&mut self) -> Result<()> {
+	async fn init_backward(&mut self) -> Result<()> {
 		self.direction = Direction::Backward;
 		self.init_max_heap();
 		self.clear_heaps();
 
 		for child in &mut self.children {
-			child.iter.seek_last()?;
+			child.iter.seek_last().await?;
 		}
 		self.rebuild_max_heap();
 		Ok(())
@@ -399,7 +399,7 @@ impl<'a> MergingIterator<'a> {
 	/// The current iterator (heap top) should simply move forward one position.
 	/// Non-current iterators need to be positioned at a key strictly greater than
 	/// `target` to ensure correct ordering.
-	fn switch_to_forward(&mut self, target: &[u8]) -> Result<()> {
+	async fn switch_to_forward(&mut self, target: &[u8]) -> Result<()> {
 		let current_idx = self.max_heap.as_ref().and_then(|h| h.peek());
 
 		self.direction = Direction::Forward;
@@ -408,15 +408,15 @@ impl<'a> MergingIterator<'a> {
 		for (idx, child) in self.children.iter_mut().enumerate() {
 			if Some(idx) == current_idx {
 				// Current iterator: just call next() once
-				child.iter.next()?;
+				child.iter.next().await?;
 			} else {
 				// Non-current: position at key strictly > target
-				if child.iter.seek(target)? {
+				if child.iter.seek(target).await? {
 					// Iterate forward until key > target
 					while child.iter.valid()
 						&& self.cmp.compare(child.iter.key().encoded(), target) != Ordering::Greater
 					{
-						if !child.iter.next()? {
+						if !child.iter.next().await? {
 							break;
 						}
 					}
@@ -434,7 +434,7 @@ impl<'a> MergingIterator<'a> {
 	/// The current iterator (heap top) should simply move back one position.
 	/// Non-current iterators need to be positioned at a key strictly less than
 	/// `target` to ensure correct ordering.
-	fn switch_to_backward(&mut self, target: &[u8]) -> Result<()> {
+	async fn switch_to_backward(&mut self, target: &[u8]) -> Result<()> {
 		let current_idx = self.min_heap.peek();
 
 		self.direction = Direction::Backward;
@@ -444,21 +444,21 @@ impl<'a> MergingIterator<'a> {
 		for (idx, child) in self.children.iter_mut().enumerate() {
 			if Some(idx) == current_idx {
 				// Current iterator: just call prev() once
-				child.iter.prev()?;
+				child.iter.prev().await?;
 			} else {
 				// Non-current: position at key strictly < target
-				if child.iter.seek(target)? {
+				if child.iter.seek(target).await? {
 					// Iterate backward until key < target
 					while child.iter.valid()
 						&& self.cmp.compare(child.iter.key().encoded(), target) != Ordering::Less
 					{
-						if !child.iter.prev()? {
+						if !child.iter.prev().await? {
 							break;
 						}
 					}
 				} else {
 					// Iterator positioned past all keys, go to last
-					child.iter.seek_last()?;
+					child.iter.seek_last().await?;
 				}
 			}
 		}
@@ -475,14 +475,14 @@ impl<'a> MergingIterator<'a> {
 	/// This is the hot path for iteration. After advancing the winner:
 	/// - If still valid: sift_down to restore heap property (O(log K))
 	/// - If exhausted: pop from heap (O(log K))
-	fn advance_winner(&mut self) -> Result<bool> {
+	async fn advance_winner(&mut self) -> Result<bool> {
 		match self.direction {
 			Direction::Forward => {
 				if self.min_heap.is_empty() {
 					return Ok(false);
 				}
 				let winner = self.min_heap.peek().unwrap();
-				let valid = self.children[winner].iter.next()?;
+				let valid = self.children[winner].iter.next().await?;
 				let children = &self.children;
 				let cmp = self.cmp.as_ref();
 				if valid {
@@ -500,7 +500,7 @@ impl<'a> MergingIterator<'a> {
 					return Ok(false);
 				}
 				let winner = max_heap.peek().unwrap();
-				let valid = self.children[winner].iter.prev()?;
+				let valid = self.children[winner].iter.prev().await?;
 				let children = &self.children;
 				let cmp = self.cmp.as_ref();
 				if valid {
@@ -553,59 +553,60 @@ impl<'a> MergingIterator<'a> {
 // LSMIterator Implementation
 // -----------------------------------------------------------------------------
 
+#[async_trait::async_trait]
 impl LSMIterator for MergingIterator<'_> {
 	/// Seek to the first key >= target.
-	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+	async fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = Direction::Forward;
 		self.clear_heaps();
 
 		for child in &mut self.children {
-			child.iter.seek(target)?;
+			child.iter.seek(target).await?;
 		}
 		self.rebuild_min_heap();
 		Ok(self.is_valid())
 	}
 
 	/// Seek to the first key.
-	fn seek_first(&mut self) -> Result<bool> {
-		self.init_forward()?;
+	async fn seek_first(&mut self) -> Result<bool> {
+		self.init_forward().await?;
 		Ok(self.is_valid())
 	}
 
 	/// Seek to the last key.
-	fn seek_last(&mut self) -> Result<bool> {
-		self.init_backward()?;
+	async fn seek_last(&mut self) -> Result<bool> {
+		self.init_backward().await?;
 		Ok(self.is_valid())
 	}
 
 	/// Move to the next key.
 	///
 	/// If currently iterating backward, switches direction first.
-	fn next(&mut self) -> Result<bool> {
+	async fn next(&mut self) -> Result<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
 		if self.direction != Direction::Forward {
 			let target = self.current_key().encoded().to_vec();
-			self.switch_to_forward(&target)?;
+			self.switch_to_forward(&target).await?;
 			return Ok(self.is_valid());
 		}
-		self.advance_winner()
+		self.advance_winner().await
 	}
 
 	/// Move to the previous key.
 	///
 	/// If currently iterating forward, switches direction first.
-	fn prev(&mut self) -> Result<bool> {
+	async fn prev(&mut self) -> Result<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
 		if self.direction != Direction::Backward {
 			let target = self.current_key().encoded().to_vec();
-			self.switch_to_backward(&target)?;
+			self.switch_to_backward(&target).await?;
 			return Ok(self.is_valid());
 		}
-		self.advance_winner()
+		self.advance_winner().await
 	}
 
 	fn valid(&self) -> bool {
@@ -794,8 +795,8 @@ impl<'a> CompactionIterator<'a> {
 	}
 
 	/// Initialize the iterator by seeking to the first entry.
-	fn initialize(&mut self) -> Result<()> {
-		self.merge_iter.seek_first()?;
+	async fn initialize(&mut self) -> Result<()> {
+		self.merge_iter.seek_first().await?;
 		self.initialized = true;
 		Ok(())
 	}
@@ -1225,9 +1226,9 @@ impl<'a> CompactionIterator<'a> {
 	///   - accumulated_versions: []
 	///   - return None
 	/// ```
-	pub fn advance(&mut self) -> Result<Option<(InternalKey, Value)>> {
+	pub async fn advance(&mut self) -> Result<Option<(InternalKey, Value)>> {
 		if !self.initialized {
-			self.initialize()?;
+			self.initialize().await?;
 		}
 
 		loop {
@@ -1271,7 +1272,7 @@ impl<'a> CompactionIterator<'a> {
 					self.accumulated_versions.push((key_owned, value));
 
 					// Advance merge iterator for next iteration
-					self.merge_iter.next()?;
+					self.merge_iter.next().await?;
 
 					// Return first output version from processed key if any
 					if !self.output_versions.is_empty() {
@@ -1283,37 +1284,15 @@ impl<'a> CompactionIterator<'a> {
 					self.accumulated_versions.push((key_owned, value));
 
 					// Advance merge iterator for next iteration
-					self.merge_iter.next()?;
+					self.merge_iter.next().await?;
 				}
 			} else {
 				// Same user key - add to accumulated versions
 				self.accumulated_versions.push((key_owned, value));
 
 				// Advance merge iterator for next iteration
-				self.merge_iter.next()?;
+				self.merge_iter.next().await?;
 			}
-		}
-	}
-}
-
-/// Implement Iterator trait for convenient use in for loops and iterators.
-///
-/// # Example
-/// ```text
-/// let compaction_iter = CompactionIterator::new(...);
-/// for result in compaction_iter {
-///     let (key, value) = result?;
-///     // Write to output SSTable
-/// }
-/// ```
-impl Iterator for CompactionIterator<'_> {
-	type Item = Result<(InternalKey, Value)>;
-
-	fn next(&mut self) -> Option<Self::Item> {
-		match self.advance() {
-			Ok(Some(item)) => Some(Ok(item)),
-			Ok(None) => None,
-			Err(e) => Some(Err(e)),
 		}
 	}
 }

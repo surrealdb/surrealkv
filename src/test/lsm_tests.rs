@@ -5,8 +5,9 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::compaction::leveled::Strategy;
-use crate::levels::{validate_wal_log_number, LevelManifest};
+use crate::levels::LevelManifest;
 use crate::lsm::{Core, CoreInner};
+use crate::manifest::validate_wal_log_number;
 use crate::test::collect_transaction_all;
 use crate::wal::list_segment_ids;
 use crate::{

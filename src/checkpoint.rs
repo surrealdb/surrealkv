@@ -8,6 +8,7 @@ use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::error::{Error, Result};
 use crate::lsm::CoreInner;
+use crate::manifest::serialize_manifest;
 
 /// Recursively copies a directory and all its contents
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -167,7 +168,7 @@ impl DatabaseCheckpoint {
 	///
 	/// # Returns
 	/// Metadata about the created checkpoint
-	pub fn create_checkpoint<P: AsRef<Path>>(
+	pub async fn create_checkpoint<P: AsRef<Path>>(
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
@@ -177,7 +178,7 @@ impl DatabaseCheckpoint {
 		fs::create_dir_all(checkpoint_path).map_err(|e| Error::Io(Arc::new(e)))?;
 
 		// Step 1: Flush all memtables to ensure consistency
-		self.flush_all_memtables()?;
+		self.flush_all_memtables().await?;
 
 		// Step 2: Get current sequence number from the manifest
 		let sequence_number = {
@@ -257,8 +258,101 @@ impl DatabaseCheckpoint {
 		Ok(metadata)
 	}
 
+	/// Creates a cloud checkpoint by uploading the manifest to the object store.
+	///
+	/// SSTs are already in the object store, so the checkpoint is just a
+	/// manifest snapshot under `checkpoints/{name}/`.
+	pub async fn create_cloud_checkpoint(&self, name: &str) -> Result<CheckpointMetadata> {
+		// Step 1: Flush all memtables to ensure all data is in SSTs
+		self.flush_all_memtables().await?;
+
+		// Step 2: Serialize current manifest
+		let (manifest_bytes, sequence_number, sstable_count) = {
+			let manifest = self.core.level_manifest.read()?;
+			let bytes = serialize_manifest(&manifest)?;
+			let seq = manifest.get_last_sequence();
+			let count: usize = manifest.levels.get_levels().iter().map(|l| l.tables.len()).sum();
+			(bytes, seq, count)
+		};
+
+		let manifest_size = manifest_bytes.len() as u64;
+
+		// Step 3: Upload manifest to checkpoint path
+		let checkpoint_manifest_path =
+			object_store::path::Path::from(format!("checkpoints/{name}/manifest"));
+		self.core
+			.table_store
+			.object_store()
+			.put(&checkpoint_manifest_path, bytes::Bytes::from(manifest_bytes).into())
+			.await
+			.map_err(|e| Error::Other(format!("Failed to upload checkpoint manifest: {e}")))?;
+
+		// Step 4: Create and upload metadata
+		let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+		let metadata =
+			CheckpointMetadata::new(timestamp, sequence_number, sstable_count, manifest_size);
+		let metadata_bytes = metadata.to_bytes()?;
+
+		let checkpoint_metadata_path =
+			object_store::path::Path::from(format!("checkpoints/{name}/metadata"));
+		self.core
+			.table_store
+			.object_store()
+			.put(&checkpoint_metadata_path, bytes::Bytes::from(metadata_bytes).into())
+			.await
+			.map_err(|e| Error::Other(format!("Failed to upload checkpoint metadata: {e}")))?;
+
+		Ok(metadata)
+	}
+
+	/// Restores the database from a cloud checkpoint.
+	///
+	/// Downloads the manifest from the object store checkpoint path and writes
+	/// it locally. The caller (Store) handles reloading in-memory state.
+	pub async fn restore_cloud_checkpoint(&self, name: &str) -> Result<CheckpointMetadata> {
+		// Step 1: Download metadata
+		let checkpoint_metadata_path =
+			object_store::path::Path::from(format!("checkpoints/{name}/metadata"));
+		let meta_result =
+			self.core.table_store.object_store().get(&checkpoint_metadata_path).await.map_err(
+				|e| Error::Other(format!("Failed to download checkpoint metadata: {e}")),
+			)?;
+		let meta_bytes = meta_result
+			.bytes()
+			.await
+			.map_err(|e| Error::Other(format!("Failed to read checkpoint metadata: {e}")))?;
+		let metadata = CheckpointMetadata::from_bytes(&meta_bytes)?;
+
+		// Step 2: Download manifest
+		let checkpoint_manifest_path =
+			object_store::path::Path::from(format!("checkpoints/{name}/manifest"));
+		let manifest_result =
+			self.core.table_store.object_store().get(&checkpoint_manifest_path).await.map_err(
+				|e| Error::Other(format!("Failed to download checkpoint manifest: {e}")),
+			)?;
+		let manifest_bytes = manifest_result
+			.bytes()
+			.await
+			.map_err(|e| Error::Other(format!("Failed to read checkpoint manifest: {e}")))?;
+
+		// Step 3: Write manifest locally using the manifest_id from the header
+		// V3 header: version (u16) | manifest_id (u64) | ...
+		let manifest_id = if manifest_bytes.len() >= 10 {
+			u64::from_be_bytes(manifest_bytes[2..10].try_into().unwrap())
+		} else {
+			0
+		};
+		let manifest_path = self.core.opts.manifest_file_path(manifest_id);
+		if let Some(parent) = manifest_path.parent() {
+			fs::create_dir_all(parent).map_err(|e| Error::Io(Arc::new(e)))?;
+		}
+		crate::manifest::replace_file_content(&manifest_path, &manifest_bytes)?;
+
+		Ok(metadata)
+	}
+
 	/// Flushes all memtables to ensure checkpoint consistency
-	fn flush_all_memtables(&self) -> Result<()> {
+	async fn flush_all_memtables(&self) -> Result<()> {
 		// Step 1: Rotate active memtable if it has data
 		{
 			let active = self.core.active_memtable.read()?;
@@ -268,8 +362,8 @@ impl DatabaseCheckpoint {
 			}
 		}
 
-		// Step 2: Flush all immutable memtables synchronously
-		self.core.flush_all_immutables_sync()
+		// Step 2: Flush all immutable memtables
+		self.core.flush_all_immutables_sync().await
 	}
 
 	/// Copies all SSTables to the checkpoint directory

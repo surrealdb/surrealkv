@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::fs::File as SysFile;
 use std::path::Path;
 #[cfg(test)]
@@ -10,13 +11,15 @@ use crate::compaction::{CompactionChoice, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
 #[cfg(test)]
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
-use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
+use crate::levels::LevelManifest;
+use crate::manifest::{write_manifest_to_disk, ManifestChangeSet, ManifestUploader};
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
+use crate::sstable::sst_id::SstId;
 use crate::sstable::table::Table;
 #[cfg(test)]
 use crate::sstable::table::TableWriter;
-use crate::vfs::File;
+use crate::tablestore::TableStore;
 #[cfg(test)]
 use crate::Comparator;
 use crate::Options as LSMOptions;
@@ -24,12 +27,12 @@ use crate::Options as LSMOptions;
 /// RAII guard to ensure tables are unhidden if compaction fails
 pub(crate) struct HiddenTablesGuard {
 	level_manifest: Arc<RwLock<LevelManifest>>,
-	table_ids: Vec<u64>,
+	table_ids: Vec<SstId>,
 	committed: bool,
 }
 
 impl HiddenTablesGuard {
-	pub(crate) fn new(level_manifest: Arc<RwLock<LevelManifest>>, table_ids: &[u64]) -> Self {
+	pub(crate) fn new(level_manifest: Arc<RwLock<LevelManifest>>, table_ids: &[SstId]) -> Self {
 		Self {
 			level_manifest,
 			table_ids: table_ids.to_vec(),
@@ -64,6 +67,10 @@ pub(crate) struct CompactionOptions {
 	/// sequence numbers. Versions visible to any active snapshot must be
 	/// preserved (unless hidden by a newer version in the same visibility boundary).
 	pub(crate) snapshot_tracker: SnapshotTracker,
+	/// Table store for reading/writing SSTs via object store.
+	pub(crate) table_store: Arc<TableStore>,
+	/// Manifest uploader for async object store uploads.
+	pub(crate) manifest_uploader: Arc<ManifestUploader>,
 }
 
 // ============================================================================
@@ -71,17 +78,23 @@ pub(crate) struct CompactionOptions {
 // (beat-spread). These are free functions to avoid coupling to either struct.
 // ============================================================================
 
-/// Open a table file and create a Table instance.
-pub(crate) fn open_table(
+/// Upload a locally-written SST file to the object store, then open it.
+///
+/// Compaction writes to a local file via `TableWriter<SysFile>`. Once `writer.finish()`
+/// completes, this function reads the file, uploads it to the object store, removes the
+/// local copy, and opens the table from the object store.
+pub(crate) async fn upload_and_open_table(
 	lopts: &Arc<LSMOptions>,
-	table_id: u64,
-	table_path: &Path,
+	table_id: SstId,
+	local_path: &Path,
+	table_store: &Arc<TableStore>,
 ) -> Result<Arc<Table>> {
-	let file = SysFile::open(table_path)?;
-	let file: Arc<dyn File> = Arc::new(file);
-	let file_size = file.size()?;
-
-	Ok(Arc::new(Table::new(table_id, Arc::clone(lopts), file, file_size)?))
+	let data = std::fs::read(local_path)?;
+	let file_size = data.len() as u64;
+	table_store.write_sst(&table_id, bytes::Bytes::from(data)).await?;
+	// Remove local file after successful upload
+	let _ = std::fs::remove_file(local_path);
+	Ok(Arc::new(Table::new(table_id, Arc::clone(lopts), Arc::clone(table_store), file_size).await?))
 }
 
 /// Update the manifest with a completed compaction: delete old tables, add new table.
@@ -121,10 +134,16 @@ pub(crate) fn update_manifest(
 	let rollback = manifest.apply_changeset(&changeset)?;
 
 	// Write manifest to disk - if this fails, revert in-memory state
-	if let Err(e) = write_manifest_to_disk(&manifest) {
-		manifest.revert_changeset(rollback);
-		opts.error_handler.set_error(e.clone(), crate::error::BackgroundErrorReason::ManifestWrite);
-		return Err(e);
+	match write_manifest_to_disk(&mut manifest) {
+		Ok(bytes) => {
+			opts.manifest_uploader.queue_upload(manifest.manifest_id, bytes);
+		}
+		Err(e) => {
+			manifest.revert_changeset(rollback);
+			opts.error_handler
+				.set_error(e.clone(), crate::error::BackgroundErrorReason::ManifestWrite);
+			return Err(e);
+		}
 	}
 
 	// Unhide tables before committing guard (they'll be removed from manifest anyway)
@@ -136,11 +155,10 @@ pub(crate) fn update_manifest(
 	Ok(())
 }
 
-/// Remove old table files from disk after successful manifest update.
-pub(crate) fn cleanup_old_tables(lopts: &Arc<LSMOptions>, input: &CompactionInput) {
+/// Remove old table files from the object store after successful manifest update.
+pub(crate) async fn cleanup_old_tables(table_store: &Arc<TableStore>, input: &CompactionInput) {
 	for &table_id in &input.tables_to_merge {
-		let path = lopts.sstable_file_path(table_id);
-		if let Err(e) = std::fs::remove_file(path) {
+		if let Err(e) = table_store.delete_sst(&table_id).await {
 			log::warn!("Failed to remove old table file: {e}");
 		}
 	}
@@ -163,19 +181,20 @@ impl Compactor {
 		}
 	}
 
-	pub(crate) fn compact(&self) -> Result<()> {
+	pub(crate) async fn compact(&self) -> Result<()> {
 		let mut levels_guard = self.options.level_manifest.write()?;
 		let choice = self.strategy.pick_levels(&levels_guard)?;
 
 		match choice {
-			CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input),
+			CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input).await,
 			CompactionChoice::Move(input) => {
 				// Move-table optimization: just relocate metadata, no merge needed.
 				assert_eq!(input.tables_to_merge.len(), 1, "Move expects exactly one table");
 				let table_id = input.tables_to_merge[0];
 
 				levels_guard.move_table(input.source_level, input.target_level, table_id)?;
-				write_manifest_to_disk(&levels_guard)?;
+				let bytes = write_manifest_to_disk(&mut levels_guard)?;
+				self.options.manifest_uploader.queue_upload(levels_guard.manifest_id, bytes);
 
 				log::debug!(
 					"Move-table: L{} → L{}, table_id={}",
@@ -189,7 +208,7 @@ impl Compactor {
 		}
 	}
 
-	fn merge_tables(
+	async fn merge_tables(
 		&self,
 		mut levels: RwLockWriteGuard<'_, LevelManifest>,
 		input: &CompactionInput,
@@ -217,12 +236,12 @@ impl Compactor {
 		drop(levels);
 
 		// Create new table
-		let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
+		let new_table_id = crate::levels::next_sst_id();
 		let new_table_path = self.options.lopts.sstable_file_path(new_table_id);
 
 		// Write merged data
 		let table_created =
-			match self.write_merged_table(&new_table_path, new_table_id, iterators, input) {
+			match self.write_merged_table(&new_table_path, new_table_id, iterators, input).await {
 				Ok(result) => result,
 				Err(e) => {
 					// Guard will unhide tables on drop
@@ -230,9 +249,16 @@ impl Compactor {
 				}
 			};
 
-		// Open table only if one was created
+		// Upload and open table only if one was created
 		let new_table = if table_created {
-			match open_table(&self.options.lopts, new_table_id, &new_table_path) {
+			match upload_and_open_table(
+				&self.options.lopts,
+				new_table_id,
+				&new_table_path,
+				&self.options.table_store,
+			)
+			.await
+			{
 				Ok(table) => Some(table),
 				Err(e) => {
 					// Guard will unhide tables on drop
@@ -246,16 +272,16 @@ impl Compactor {
 		// Update manifest - this will commit the guard on success
 		update_manifest(&self.options, input, new_table, &mut guard)?;
 
-		cleanup_old_tables(&self.options.lopts, input);
+		cleanup_old_tables(&self.options.table_store, input).await;
 
 		Ok(())
 	}
 
 	/// Returns true if a table file was created and finished, false otherwise
-	fn write_merged_table(
+	async fn write_merged_table(
 		&self,
 		path: &Path,
-		table_id: u64,
+		table_id: SstId,
 		merge_iter: Vec<BoxedLSMIterator<'_>>,
 		input: &CompactionInput,
 	) -> Result<bool> {
@@ -282,8 +308,7 @@ impl Compactor {
 		);
 
 		let mut entries = 0;
-		for item in &mut comp_iter {
-			let (key, value) = item?;
+		while let Some((key, value)) = comp_iter.advance().await? {
 			writer.add(key, &value)?;
 			entries += 1;
 		}

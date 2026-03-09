@@ -31,24 +31,27 @@ use std::sync::Arc;
 
 use crate::compaction::compactor::{
 	cleanup_old_tables,
-	open_table,
 	update_manifest,
+	upload_and_open_table,
 	CompactionOptions,
 	HiddenTablesGuard,
 };
 use crate::compaction::leveled::Strategy;
 use crate::error::BackgroundErrorHandler;
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
-use crate::levels::{write_manifest_to_disk, LevelManifest};
+use crate::levels::LevelManifest;
+use crate::manifest::{write_manifest_to_disk, ManifestUploader};
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
+use crate::sstable::sst_id::SstId;
 use crate::sstable::table::{OwnedTableIter, Table, TableWriter};
+use crate::tablestore::TableStore;
 use crate::{Comparator, Options, Result};
 
 /// Represents the input for a compaction operation
 #[derive(Debug, Eq, PartialEq, Clone)]
 pub(crate) struct CompactionInput {
-	pub tables_to_merge: Vec<u64>,
+	pub tables_to_merge: Vec<SstId>,
 	pub target_level: u8,
 	pub source_level: u8,
 }
@@ -192,7 +195,7 @@ struct LiveCompaction {
 	/// Path to the new table file being written
 	new_table_path: PathBuf,
 	/// ID of the new table being written
-	new_table_id: u64,
+	new_table_id: SstId,
 	/// Compaction input (source/target levels, table IDs to merge)
 	input: CompactionInput,
 	/// RAII guard — unhides tables if compaction fails before manifest commit
@@ -275,7 +278,7 @@ impl LiveCompaction {
 		);
 
 		// Create table writer for the output
-		let new_table_id = opts.level_manifest.read().unwrap().next_table_id();
+		let new_table_id = crate::levels::next_sst_id();
 		let new_table_path = opts.lopts.sstable_file_path(new_table_id);
 		let file = SysFile::create(&new_table_path)?;
 		let writer = TableWriter::new(file, new_table_id, Arc::clone(&opts.lopts), target_level);
@@ -299,7 +302,7 @@ impl LiveCompaction {
 	///   Commenced/Paused → Paused     (beat quota consumed, entries remain)
 	///   Commenced/Paused → Completed  (iterator exhausted)
 	///   Completed        → Completed  (no-op)
-	fn advance(&mut self, beats_remaining: u64) -> Result<()> {
+	async fn advance(&mut self, beats_remaining: u64) -> Result<()> {
 		if self.stage == CompactionStage::Completed {
 			return Ok(());
 		}
@@ -315,14 +318,13 @@ impl LiveCompaction {
 
 		// Process entries up to beat quota
 		while !self.quotas.beat_exhausted() {
-			match self.iterator.next() {
-				Some(Ok((key, value))) => {
+			match self.iterator.advance().await? {
+				Some((key, value)) => {
 					if let Some(ref mut writer) = self.writer {
 						writer.add(key, &value)?;
 					}
 					self.quotas.record_entry();
 				}
-				Some(Err(e)) => return Err(e),
 				None => {
 					self.finalize_table()?;
 					self.stage = CompactionStage::Completed;
@@ -334,7 +336,7 @@ impl LiveCompaction {
 		// Beat quota consumed. Check if bar quota also exhausted.
 		if self.quotas.bar_exhausted() {
 			// Estimate may be imprecise — drain any remaining entries
-			self.drain_remaining()?;
+			self.drain_remaining().await?;
 			self.finalize_table()?;
 			self.stage = CompactionStage::Completed;
 		} else {
@@ -345,16 +347,15 @@ impl LiveCompaction {
 	}
 
 	/// Drain any remaining entries after bar quota is exhausted.
-	fn drain_remaining(&mut self) -> Result<()> {
+	async fn drain_remaining(&mut self) -> Result<()> {
 		loop {
-			match self.iterator.next() {
-				Some(Ok((key, value))) => {
+			match self.iterator.advance().await? {
+				Some((key, value)) => {
 					if let Some(ref mut writer) = self.writer {
 						writer.add(key, &value)?;
 					}
 					self.quotas.record_entry();
 				}
-				Some(Err(e)) => return Err(e),
 				None => break,
 			}
 		}
@@ -376,20 +377,28 @@ impl LiveCompaction {
 	/// bar_complete equivalent: open new table, update manifest, cleanup old tables.
 	///
 	/// Called at half-bar end. Consumes self.
-	fn commit(mut self, opts: &CompactionOptions) -> Result<()> {
+	async fn commit(mut self, opts: &CompactionOptions) -> Result<()> {
 		// If not yet completed, drain and finalize (safety net for imprecise estimates)
 		if self.stage != CompactionStage::Completed {
 			log::warn!("commit() called in {:?} stage — draining remaining entries", self.stage);
-			self.drain_remaining()?;
+			self.drain_remaining().await?;
 			self.finalize_table()?;
 			self.stage = CompactionStage::Completed;
 		}
 
 		debug_assert_eq!(self.stage, CompactionStage::Completed);
 
-		// Open the new table (if entries were written)
+		// Upload local file to object store and open the new table (if entries were written)
 		let new_table = if self.quotas.has_output() {
-			Some(open_table(&opts.lopts, self.new_table_id, &self.new_table_path)?)
+			Some(
+				upload_and_open_table(
+					&opts.lopts,
+					self.new_table_id,
+					&self.new_table_path,
+					&opts.table_store,
+				)
+				.await?,
+			)
 		} else {
 			None
 		};
@@ -397,8 +406,8 @@ impl LiveCompaction {
 		// Update manifest and commit guard
 		update_manifest(opts, &self.input, new_table, &mut self.guard)?;
 
-		// Cleanup old table files
-		cleanup_old_tables(&opts.lopts, &self.input);
+		// Cleanup old table files from object store
+		cleanup_old_tables(&opts.table_store, &self.input).await;
 
 		Ok(())
 	}
@@ -413,7 +422,7 @@ enum PendingManifestOp {
 	MoveTable {
 		source_level: u8,
 		target_level: u8,
-		table_id: u64,
+		table_id: SstId,
 	},
 }
 
@@ -446,6 +455,10 @@ pub(crate) struct CompactionScheduler {
 	error_handler: Arc<BackgroundErrorHandler>,
 	/// Snapshot tracker for snapshot-aware compaction
 	snapshot_tracker: SnapshotTracker,
+	/// Table store for SST reads/writes via object store
+	table_store: Arc<TableStore>,
+	/// Manifest uploader for async object store uploads
+	manifest_uploader: Arc<ManifestUploader>,
 	/// Active merge compactions being spread across the current half-bar
 	active_compactions: Vec<LiveCompaction>,
 	/// Deferred manifest-only operations (moves) applied at half-bar end
@@ -459,6 +472,8 @@ impl CompactionScheduler {
 		immutable_memtables: Arc<std::sync::RwLock<ImmutableMemtables>>,
 		error_handler: Arc<BackgroundErrorHandler>,
 		snapshot_tracker: SnapshotTracker,
+		table_store: Arc<TableStore>,
+		manifest_uploader: Arc<ManifestUploader>,
 	) -> Self {
 		let beats_per_bar = opts.compaction_beats_per_bar;
 		Self {
@@ -470,6 +485,8 @@ impl CompactionScheduler {
 			immutable_memtables,
 			error_handler,
 			snapshot_tracker,
+			table_store,
+			manifest_uploader,
 			active_compactions: Vec::new(),
 			pending_manifest_ops: Vec::new(),
 		}
@@ -493,6 +510,8 @@ impl CompactionScheduler {
 			immutable_memtables: Arc::clone(&self.immutable_memtables),
 			error_handler: Arc::clone(&self.error_handler),
 			snapshot_tracker: self.snapshot_tracker.clone(),
+			table_store: Arc::clone(&self.table_store),
+			manifest_uploader: Arc::clone(&self.manifest_uploader),
 		}
 	}
 
@@ -502,7 +521,7 @@ impl CompactionScheduler {
 	/// 1. Half-bar start: bar_commence (select tables, create compactions)
 	/// 2. Every beat: advance compactions by quota
 	/// 3. Half-bar end: bar_complete (commit manifest changes)
-	pub(crate) fn compact_beat(&mut self) -> Result<()> {
+	pub(crate) async fn compact_beat(&mut self) -> Result<()> {
 		let beat = self.op % self.beats_per_bar;
 		let half_bar_beat = beat % self.half_bar;
 		let is_half_bar_start = beat == 0 || beat == self.half_bar;
@@ -519,12 +538,12 @@ impl CompactionScheduler {
 			if compaction.is_completed() {
 				continue;
 			}
-			compaction.advance(beats_remaining)?;
+			compaction.advance(beats_remaining).await?;
 		}
 
 		// ── bar_complete: at half-bar end, commit all manifest changes at once ──
 		if is_half_bar_end {
-			self.complete_half_bar()?;
+			self.complete_half_bar().await?;
 		}
 
 		self.op += 1;
@@ -609,7 +628,7 @@ impl CompactionScheduler {
 	}
 
 	/// bar_complete: commit all manifest changes at once.
-	fn complete_half_bar(&mut self) -> Result<()> {
+	async fn complete_half_bar(&mut self) -> Result<()> {
 		let opts = self.compaction_opts();
 
 		// Commit all active merge compactions
@@ -621,7 +640,7 @@ impl CompactionScheduler {
 				"complete_half_bar: unexpected stage {:?}",
 				compaction.stage
 			);
-			if let Err(e) = compaction.commit(&opts) {
+			if let Err(e) = compaction.commit(&opts).await {
 				log::error!("Failed to commit compaction: {:?}", e);
 				self.error_handler
 					.set_error(e.clone(), crate::error::BackgroundErrorReason::Compaction);
@@ -650,7 +669,8 @@ impl CompactionScheduler {
 					}
 				}
 			}
-			write_manifest_to_disk(&levels)?;
+			let bytes = write_manifest_to_disk(&mut levels)?;
+			self.manifest_uploader.queue_upload(levels.manifest_id, bytes);
 		}
 
 		Ok(())

@@ -1,4 +1,5 @@
 mod batch;
+mod blob;
 mod cache;
 mod checkpoint;
 mod clock;
@@ -11,9 +12,12 @@ mod iter;
 mod levels;
 mod lockfile;
 mod lsm;
+mod manifest;
 mod memtable;
+mod paths;
 mod snapshot;
 mod sstable;
+mod tablestore;
 mod vfs;
 mod wal;
 
@@ -190,6 +194,16 @@ pub struct Options {
 	/// Levels alternate between half-bars: odd targets in first half, even in second.
 	/// Default: 32
 	pub compaction_beats_per_bar: u64,
+
+	// Object store configuration
+	/// Object store for SSTs and manifest. Default: in-memory store.
+	pub object_store: Arc<dyn object_store::ObjectStore>,
+	/// Root path prefix in the object store for all data.
+	/// Default: empty (root of the store)
+	pub object_store_root: String,
+	/// Max SST size for compaction output splits.
+	/// Default: 64MB
+	pub max_sst_size: usize,
 }
 
 impl Default for Options {
@@ -223,6 +237,9 @@ impl Default for Options {
 			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
 			level_multiplier: 10.0,
 			compaction_beats_per_bar: crate::compaction::DEFAULT_BEATS_PER_BAR,
+			object_store: Arc::new(object_store::memory::InMemory::new()),
+			object_store_root: String::new(),
+			max_sst_size: 64 * 1024 * 1024, // 64MB
 		}
 	}
 }
@@ -378,6 +395,24 @@ impl Options {
 		self
 	}
 
+	/// Sets the object store for SSTs and manifest storage.
+	pub fn with_object_store(mut self, store: Arc<dyn object_store::ObjectStore>) -> Self {
+		self.object_store = store;
+		self
+	}
+
+	/// Sets the root path prefix in the object store.
+	pub fn with_object_store_root(mut self, root: impl Into<String>) -> Self {
+		self.object_store_root = root.into();
+		self
+	}
+
+	/// Sets the max SST size for compaction output splits.
+	pub const fn with_max_sst_size(mut self, size: usize) -> Self {
+		self.max_sst_size = size;
+		self
+	}
+
 	/// Returns the path for a manifest file with the given ID
 	/// Format: {path}/manifest/{id:020}.manifest
 	pub(crate) fn manifest_file_path(&self, id: u64) -> PathBuf {
@@ -385,9 +420,9 @@ impl Options {
 	}
 
 	/// Returns the path for an `SSTable` file with the given ID
-	/// Format: {path}/sstables/{id:020}.sst
-	pub(crate) fn sstable_file_path(&self, id: u64) -> PathBuf {
-		self.sstable_dir().join(format!("{id:020}.sst"))
+	/// Format: {path}/sstables/{id}.sst
+	pub(crate) fn sstable_file_path(&self, id: crate::sstable::sst_id::SstId) -> PathBuf {
+		self.sstable_dir().join(format!("{id}.sst"))
 	}
 
 	/// Returns the directory path for WAL files
@@ -820,22 +855,23 @@ impl std::fmt::Debug for InternalKeyRef<'_> {
 ///     iter.next()?;
 /// }
 /// ```
-pub trait LSMIterator {
+#[async_trait::async_trait]
+pub trait LSMIterator: Send {
 	/// Seek to first key >= target. Returns Ok(true) if valid.
 	/// Target is an encoded internal key. Use `encode_seek_key()` to encode a user key.
-	fn seek(&mut self, target: &[u8]) -> Result<bool>;
+	async fn seek(&mut self, target: &[u8]) -> Result<bool>;
 
 	/// Seek to first entry. Returns Ok(true) if valid.
-	fn seek_first(&mut self) -> Result<bool>;
+	async fn seek_first(&mut self) -> Result<bool>;
 
 	/// Seek to last entry. Returns Ok(true) if valid.
-	fn seek_last(&mut self) -> Result<bool>;
+	async fn seek_last(&mut self) -> Result<bool>;
 
 	/// Move to next entry. Returns Ok(true) if valid.
-	fn next(&mut self) -> Result<bool>;
+	async fn next(&mut self) -> Result<bool>;
 
 	/// Move to previous entry. Returns Ok(true) if valid.
-	fn prev(&mut self) -> Result<bool>;
+	async fn prev(&mut self) -> Result<bool>;
 
 	/// Check if positioned on valid entry.
 	fn valid(&self) -> bool;

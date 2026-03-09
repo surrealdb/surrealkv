@@ -749,27 +749,28 @@ impl BlockIterator {
 // INTERNAL ITERATOR IMPLEMENTATION
 // =============================================================================
 
+#[async_trait::async_trait]
 impl LSMIterator for BlockIterator {
 	/// Seeks to the first entry >= target.
-	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+	async fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.seek_internal(target)?;
 		Ok(self.is_valid())
 	}
 
 	/// Seeks to the first entry.
-	fn seek_first(&mut self) -> Result<bool> {
+	async fn seek_first(&mut self) -> Result<bool> {
 		self.seek_to_first()?;
 		Ok(self.is_valid())
 	}
 
 	/// Seeks to the last entry.
-	fn seek_last(&mut self) -> Result<bool> {
+	async fn seek_last(&mut self) -> Result<bool> {
 		self.seek_to_last()?;
 		Ok(self.is_valid())
 	}
 
 	/// Advances to the next entry.
-	fn next(&mut self) -> Result<bool> {
+	async fn next(&mut self) -> Result<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}
@@ -777,7 +778,7 @@ impl LSMIterator for BlockIterator {
 	}
 
 	/// Moves to the previous entry.
-	fn prev(&mut self) -> Result<bool> {
+	async fn prev(&mut self) -> Result<bool> {
 		if !self.is_valid() {
 			return Ok(false);
 		}

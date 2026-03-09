@@ -3,7 +3,9 @@ use std::sync::Arc;
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
-use crate::sstable::table::Table;
+use crate::sstable::meta::TableMetadata;
+use crate::sstable::sst_id::SstId;
+use crate::sstable::table::{Footer, Table};
 use crate::{InternalKeyRange, Result};
 
 /// Represents a single level in the LSM tree.
@@ -67,7 +69,7 @@ impl Level {
 	}
 
 	/// Removes a table by its ID and maintains sorted order
-	pub(crate) fn remove(&mut self, table_id: u64) -> bool {
+	pub(crate) fn remove(&mut self, table_id: SstId) -> bool {
 		let len_before = self.tables.len();
 		self.tables.retain(|table| table.id != table_id);
 		len_before > self.tables.len()
@@ -98,6 +100,15 @@ impl Level {
 	}
 }
 
+/// Entry decoded from a V3 manifest, containing all metadata needed to open a table
+/// without additional object store reads.
+pub(crate) struct TableEntry {
+	pub id: SstId,
+	pub file_size: u64,
+	pub footer: Footer,
+	pub metadata: TableMetadata,
+}
+
 /// Represents all levels in the LSM tree
 #[derive(Clone)]
 pub(crate) struct Levels(pub(crate) Vec<Arc<Level>>);
@@ -114,9 +125,10 @@ impl Levels {
 		self.0.iter().map(|level| level.tables.len()).sum()
 	}
 
-	/// Encodes the levels structure to a writer in a binary format.
-	/// Format (V2): levels count (u8), then per level: table count (u32),
-	/// then per table: table_id (u64), snapshot_min (u64), snapshot_max (u64).
+	/// Encodes the levels structure to a writer in binary format (V3).
+	/// Format: levels count (u8), then per level: table count (u32),
+	/// then per table: id (u128) | file_size (u64) | footer_len (u32) | footer_bytes |
+	/// metadata_len (u32) | metadata_bytes.
 	pub(crate) fn encode<W: Write>(&self, writer: &mut W) -> Result<()> {
 		writer.write_u8(self.0.len() as u8)?;
 
@@ -124,18 +136,27 @@ impl Levels {
 			writer.write_u32::<BigEndian>(level.tables.len() as u32)?;
 
 			for table in &level.tables {
-				writer.write_u64::<BigEndian>(table.id)?;
-				writer.write_u64::<BigEndian>(table.snapshot_min())?;
-				writer.write_u64::<BigEndian>(table.snapshot_max())?;
+				// Table ID
+				writer.write_u128::<BigEndian>(table.id.0)?;
+				// File size
+				writer.write_u64::<BigEndian>(table.file_size)?;
+				// Footer
+				let footer_bytes = table.footer().encode_to_vec();
+				writer.write_u32::<BigEndian>(footer_bytes.len() as u32)?;
+				writer.write_all(&footer_bytes)?;
+				// Metadata
+				let meta_bytes = table.meta.encode();
+				writer.write_u32::<BigEndian>(meta_bytes.len() as u32)?;
+				writer.write_all(&meta_bytes)?;
 			}
 		}
 
 		Ok(())
 	}
 
-	/// Decodes V2 levels structure from a reader.
-	/// Returns (table_id, snapshot_min, snapshot_max) per table per level.
-	pub(crate) fn decode<R: Read>(reader: &mut R) -> Result<Vec<Vec<(u64, u64, u64)>>> {
+	/// Decodes levels structure from a reader (V3 format).
+	/// Returns TableEntry per table per level.
+	pub(crate) fn decode<R: Read>(reader: &mut R) -> Result<Vec<Vec<TableEntry>>> {
 		let level_count = reader.read_u8()?;
 		let mut levels = Vec::with_capacity(level_count as usize);
 
@@ -144,10 +165,27 @@ impl Levels {
 			let mut level = Vec::with_capacity(table_count as usize);
 
 			for _ in 0..table_count {
-				let table_id = reader.read_u64::<BigEndian>()?;
-				let snapshot_min = reader.read_u64::<BigEndian>()?;
-				let snapshot_max = reader.read_u64::<BigEndian>()?;
-				level.push((table_id, snapshot_min, snapshot_max));
+				let id_raw = reader.read_u128::<BigEndian>()?;
+				let id = ulid::Ulid::from(id_raw);
+
+				let file_size = reader.read_u64::<BigEndian>()?;
+
+				let footer_len = reader.read_u32::<BigEndian>()? as usize;
+				let mut footer_bytes = vec![0u8; footer_len];
+				reader.read_exact(&mut footer_bytes)?;
+				let footer = Footer::decode(&footer_bytes)?;
+
+				let meta_len = reader.read_u32::<BigEndian>()? as usize;
+				let mut meta_bytes = vec![0u8; meta_len];
+				reader.read_exact(&mut meta_bytes)?;
+				let metadata = TableMetadata::decode(&meta_bytes)?;
+
+				level.push(TableEntry {
+					id,
+					file_size,
+					footer,
+					metadata,
+				});
 			}
 
 			levels.push(level);

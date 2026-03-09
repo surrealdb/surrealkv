@@ -106,7 +106,7 @@ pub enum SSTableError {
 
 	// Index errors
 	EmptyCorruptPartitionedIndex {
-		table_id: u64,
+		table_id: crate::sstable::sst_id::SstId,
 	},
 
 	// System errors
