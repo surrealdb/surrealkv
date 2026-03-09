@@ -96,8 +96,8 @@ fn test_cleanup_old_segments() {
 	);
 }
 
-#[test]
-fn test_wal_replay_all_segments() {
+#[test(tokio::test)]
+async fn test_wal_replay_all_segments() {
 	let temp_dir = create_test_wal_dir();
 
 	// Create WAL with manual rotation to create multiple segments
@@ -156,7 +156,7 @@ fn test_wal_replay_all_segments() {
 		let mut iter = memtable.iter();
 		while iter.valid() {
 			entry_count += 1;
-			iter.next().unwrap();
+			iter.next().await.unwrap();
 		}
 	}
 

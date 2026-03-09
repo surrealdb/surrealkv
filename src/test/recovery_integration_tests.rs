@@ -10,13 +10,13 @@ use crate::test::recovery_test_helpers::RecoveryTestHelper;
 use crate::TreeBuilder;
 
 /// Create a tree with custom options
-fn create_tree<F>(path: PathBuf, configure: F) -> crate::Tree
+async fn create_tree<F>(path: PathBuf, configure: F) -> crate::Tree
 where
 	F: FnOnce(TreeBuilder) -> TreeBuilder,
 {
 	let builder = TreeBuilder::new().with_path(path).with_max_memtable_size(1024 * 1024); // 1MB default
 
-	configure(builder).build().unwrap()
+	configure(builder).build().await.unwrap()
 }
 
 // ============================================================================
@@ -31,7 +31,7 @@ async fn test_basic_recovery() {
 
 	// Phase 1: Write and close
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		tree.set(b"foo", b"v1").await.unwrap();
 		tree.set(b"baz", b"v5").await.unwrap();
@@ -41,10 +41,10 @@ async fn test_basic_recovery() {
 
 	// Phase 2: Reopen and verify
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
-		RecoveryTestHelper::verify_key(&tree, "foo", "v1");
-		RecoveryTestHelper::verify_key(&tree, "baz", "v5");
+		RecoveryTestHelper::verify_key(&tree, "foo", "v1").await;
+		RecoveryTestHelper::verify_key(&tree, "baz", "v5").await;
 
 		// Write more data
 		tree.set(b"bar", b"v2").await.unwrap();
@@ -55,11 +55,11 @@ async fn test_basic_recovery() {
 
 	// Phase 3: Reopen again and verify all data
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
-		RecoveryTestHelper::verify_key(&tree, "foo", "v3");
-		RecoveryTestHelper::verify_key(&tree, "bar", "v2");
-		RecoveryTestHelper::verify_key(&tree, "baz", "v5");
+		RecoveryTestHelper::verify_key(&tree, "foo", "v3").await;
+		RecoveryTestHelper::verify_key(&tree, "bar", "v2").await;
+		RecoveryTestHelper::verify_key(&tree, "baz", "v5").await;
 
 		tree.close().await.unwrap();
 	}
@@ -75,13 +75,14 @@ async fn test_recover_with_existing_ssts() {
 	{
 		let tree = create_tree(path.clone(), |b| {
 			b.with_max_memtable_size(64 * 1024) // Explicit flushes, no size pressure needed
-		});
+		})
+		.await;
 
 		// First batch - will be flushed
 		tree.set(b"foo", b"v1").await.unwrap();
 		tree.set(b"bar", b"v2").await.unwrap();
 
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		let sst_count_1 = RecoveryTestHelper::count_sst_files(&sst_dir);
 		assert_eq!(sst_count_1, 1, "Should have 1 SST after first flush");
 
@@ -89,7 +90,7 @@ async fn test_recover_with_existing_ssts() {
 		tree.set(b"foo", b"v3").await.unwrap();
 		tree.set(b"bar", b"v4").await.unwrap();
 
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		let sst_count_2 = RecoveryTestHelper::count_sst_files(&sst_dir);
 		assert_eq!(sst_count_2, 2, "Should have 2 SSTs after second flush");
 
@@ -102,14 +103,14 @@ async fn test_recover_with_existing_ssts() {
 
 	// Reopen and verify
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		// Data from SSTs
-		RecoveryTestHelper::verify_key(&tree, "foo", "v3");
-		RecoveryTestHelper::verify_key(&tree, "bar", "v4");
+		RecoveryTestHelper::verify_key(&tree, "foo", "v3").await;
+		RecoveryTestHelper::verify_key(&tree, "bar", "v4").await;
 
 		// Data from WAL recovery
-		RecoveryTestHelper::verify_key(&tree, "big", "large_value_not_flushed");
+		RecoveryTestHelper::verify_key(&tree, "big", "large_value_not_flushed").await;
 
 		tree.close().await.unwrap();
 	}
@@ -124,7 +125,7 @@ async fn test_recover_multiple_wals_without_flush() {
 
 	// Phase 1: Write data (will create WAL, on close will flush creating SST)
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		for i in 0..keys_to_write {
 			let key = format!("key_{:05}", i);
@@ -139,13 +140,13 @@ async fn test_recover_multiple_wals_without_flush() {
 
 	// Phase 2: Reopen and verify all WALs replayed
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		// Verify all keys recovered from multiple WAL segments
 		for i in 0..keys_to_write {
 			let key = format!("key_{:05}", i);
 			let expected_value = format!("value_{:05}", i);
-			RecoveryTestHelper::verify_key(&tree, &key, &expected_value);
+			RecoveryTestHelper::verify_key(&tree, &key, &expected_value).await;
 		}
 
 		// Write more data (new WAL)
@@ -156,34 +157,34 @@ async fn test_recover_multiple_wals_without_flush() {
 
 	// Phase 3: Reopen again, verify original + new data
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		// Original data
 		for i in 0..keys_to_write {
 			let key = format!("key_{:05}", i);
 			let expected_value = format!("value_{:05}", i);
-			RecoveryTestHelper::verify_key(&tree, &key, &expected_value);
+			RecoveryTestHelper::verify_key(&tree, &key, &expected_value).await;
 		}
 
 		// New data
-		RecoveryTestHelper::verify_key(&tree, "new_key", "new_value");
+		RecoveryTestHelper::verify_key(&tree, "new_key", "new_value").await;
 
 		// Now flush everything
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		tree.close().await.unwrap();
 	}
 
 	// Phase 4: Reopen and verify data from SST
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		for i in 0..keys_to_write {
 			let key = format!("key_{:05}", i);
 			let expected_value = format!("value_{:05}", i);
-			RecoveryTestHelper::verify_key(&tree, &key, &expected_value);
+			RecoveryTestHelper::verify_key(&tree, &key, &expected_value).await;
 		}
-		RecoveryTestHelper::verify_key(&tree, "new_key", "new_value");
+		RecoveryTestHelper::verify_key(&tree, "new_key", "new_value").await;
 
 		tree.close().await.unwrap();
 	}
@@ -201,7 +202,8 @@ async fn test_recover_with_large_wal() {
 	{
 		let tree = create_tree(path.clone(), |b| {
 			b.with_max_memtable_size(10 * 1024 * 1024) // 10MB - avoid rotation
-		});
+		})
+		.await;
 
 		for i in 0..large_entry_count {
 			let key = format!("large_key_{:06}", i);
@@ -215,11 +217,11 @@ async fn test_recover_with_large_wal() {
 
 	// Reopen and verify all data recovered
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		for i in 0..large_entry_count {
 			let key = format!("large_key_{:06}", i);
-			let result = tree.get(key.as_bytes()).unwrap();
+			let result = tree.get(key.as_bytes()).await.unwrap();
 			assert!(result.is_some(), "Key {} should exist", key);
 		}
 
@@ -234,12 +236,12 @@ async fn test_recovery_with_empty_wal() {
 	let path = temp_dir.path().to_path_buf();
 
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		// Write and flush
 		tree.set(b"foo", b"v1").await.unwrap();
 
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// WAL is now empty (all data flushed)
 		tree.close().await.unwrap();
@@ -247,9 +249,9 @@ async fn test_recovery_with_empty_wal() {
 
 	// Reopen - should handle empty WAL gracefully
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
-		RecoveryTestHelper::verify_key(&tree, "foo", "v1");
+		RecoveryTestHelper::verify_key(&tree, "foo", "v1").await;
 
 		tree.close().await.unwrap();
 	}
@@ -268,7 +270,8 @@ async fn test_file_count_after_recovery() {
 		let tree = create_tree(path.clone(), |b| {
 			b.with_max_memtable_size(4 * 1024) // Small enough to trigger ~5-6 automatic flushes with 150
 			                          // entries
-		});
+		})
+		.await;
 
 		for i in 0..150 {
 			let key = format!("key_{:04}", i);
@@ -285,7 +288,7 @@ async fn test_file_count_after_recovery() {
 
 	// Reopen and verify file counts
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		let sst_count_after = RecoveryTestHelper::count_sst_files(&sst_dir);
 		let wal_count_after = RecoveryTestHelper::count_wal_files(&wal_dir);
@@ -299,7 +302,7 @@ async fn test_file_count_after_recovery() {
 		// Verify all data accessible
 		for i in 0..150 {
 			let key = format!("key_{:04}", i);
-			let result = tree.get(key.as_bytes()).unwrap();
+			let result = tree.get(key.as_bytes()).await.unwrap();
 			assert!(result.is_some(), "Key {} should exist after recovery", key);
 		}
 
@@ -315,7 +318,7 @@ async fn test_wal_cleanup_after_recovery_without_flush() {
 	let wal_dir = path.join("wal");
 
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		tree.set(b"foo", b"v1").await.unwrap();
 
@@ -325,20 +328,20 @@ async fn test_wal_cleanup_after_recovery_without_flush() {
 	// Reopen - WAL replayed but not flushed
 	let wal_count_before_flush;
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		wal_count_before_flush = RecoveryTestHelper::count_wal_files(&wal_dir);
 		assert!(wal_count_before_flush > 0, "WAL files should exist after recovery");
 
 		// Now flush
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		tree.close().await.unwrap();
 	}
 
 	// Reopen and verify old WALs cleaned up
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		let wal_count_after_flush = RecoveryTestHelper::count_wal_files(&wal_dir);
 
@@ -348,7 +351,7 @@ async fn test_wal_cleanup_after_recovery_without_flush() {
 			"Old WALs should be cleaned up after flush"
 		);
 
-		RecoveryTestHelper::verify_key(&tree, "foo", "v1");
+		RecoveryTestHelper::verify_key(&tree, "foo", "v1").await;
 
 		tree.close().await.unwrap();
 	}
@@ -361,13 +364,13 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 	let path = temp_dir.path().to_path_buf();
 
 	{
-		let tree = create_tree(path.clone(), |b| b.with_max_memtable_size(64 * 1024)); // Explicit flushes, no size pressure needed
+		let tree = create_tree(path.clone(), |b| b.with_max_memtable_size(64 * 1024)).await; // Explicit flushes, no size pressure needed
 
 		// Batch A - will be flushed
 		for i in 0..10 {
 			tree.set(format!("batch_a_{}", i).as_bytes(), b"value_a").await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		let log_number_after_flush = RecoveryTestHelper::get_manifest_log_number(&tree);
 
@@ -377,7 +380,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 		}
 
 		// Trigger rotation (creating new WAL segment)
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Batch C - stays in newest WAL segment
 		for i in 0..10 {
@@ -392,23 +395,23 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 
 	// Reopen and verify
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		// Batch A from SST
 		for i in 0..10 {
 			let key = format!("batch_a_{}", i);
-			RecoveryTestHelper::verify_key(&tree, &key, "value_a");
+			RecoveryTestHelper::verify_key(&tree, &key, "value_a").await;
 		}
 
 		// Batches B and C from WAL
 		for i in 0..10 {
 			let key = format!("batch_b_{}", i);
-			RecoveryTestHelper::verify_key(&tree, &key, "value_b");
+			RecoveryTestHelper::verify_key(&tree, &key, "value_b").await;
 		}
 
 		for i in 0..10 {
 			let key = format!("batch_c_{}", i);
-			RecoveryTestHelper::verify_key(&tree, &key, "value_c");
+			RecoveryTestHelper::verify_key(&tree, &key, "value_c").await;
 		}
 
 		tree.close().await.unwrap();
@@ -425,11 +428,11 @@ async fn test_orphaned_sst_doesnt_break_recovery() {
 
 	// Phase 1: Create database and write data
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		tree.set(b"real_key", b"real_value").await.unwrap();
 
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		tree.close().await.unwrap();
 	}
 
@@ -440,10 +443,10 @@ async fn test_orphaned_sst_doesnt_break_recovery() {
 
 	// Reopen - should handle orphan gracefully (cleanup or ignore)
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		// Real data should be there (orphan shouldn't affect recovery)
-		RecoveryTestHelper::verify_key(&tree, "real_key", "real_value");
+		RecoveryTestHelper::verify_key(&tree, "real_key", "real_value").await;
 
 		tree.close().await.unwrap();
 	}
@@ -457,7 +460,7 @@ async fn test_manifest_log_number_progression() {
 
 	// Cycle 1: Write and flush
 	{
-		let tree = create_tree(path.clone(), |b| b.with_max_memtable_size(64 * 1024)); // Explicit flushes, no size pressure needed
+		let tree = create_tree(path.clone(), |b| b.with_max_memtable_size(64 * 1024)).await; // Explicit flushes, no size pressure needed
 
 		let log_num_initial = RecoveryTestHelper::get_manifest_log_number(&tree);
 
@@ -465,7 +468,7 @@ async fn test_manifest_log_number_progression() {
 			tree.set(format!("c1_key_{}", i).as_bytes(), b"cycle1").await.unwrap();
 		}
 
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		let log_num_after_flush = RecoveryTestHelper::get_manifest_log_number(&tree);
 		assert!(log_num_after_flush > log_num_initial, "Log number should advance after flush");
@@ -475,7 +478,7 @@ async fn test_manifest_log_number_progression() {
 
 	// Cycle 2: Reopen, write and flush
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		let log_num_before = RecoveryTestHelper::get_manifest_log_number(&tree);
 
@@ -483,7 +486,7 @@ async fn test_manifest_log_number_progression() {
 			tree.set(format!("c2_key_{}", i).as_bytes(), b"cycle2").await.unwrap();
 		}
 
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		let log_num_after = RecoveryTestHelper::get_manifest_log_number(&tree);
 		assert!(log_num_after > log_num_before, "Log number should advance again");
@@ -493,7 +496,7 @@ async fn test_manifest_log_number_progression() {
 
 	// Cycle 3: Reopen, write and flush again
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		let log_num_before = RecoveryTestHelper::get_manifest_log_number(&tree);
 
@@ -501,7 +504,7 @@ async fn test_manifest_log_number_progression() {
 			tree.set(format!("c3_key_{}", i).as_bytes(), b"cycle3").await.unwrap();
 		}
 
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		let log_num_after = RecoveryTestHelper::get_manifest_log_number(&tree);
 
@@ -513,13 +516,13 @@ async fn test_manifest_log_number_progression() {
 
 	// Final reopen and verify all cycles
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		// Verify all data from all cycles
 		for i in 0..10 {
-			RecoveryTestHelper::verify_key(&tree, &format!("c1_key_{}", i), "cycle1");
-			RecoveryTestHelper::verify_key(&tree, &format!("c2_key_{}", i), "cycle2");
-			RecoveryTestHelper::verify_key(&tree, &format!("c3_key_{}", i), "cycle3");
+			RecoveryTestHelper::verify_key(&tree, &format!("c1_key_{}", i), "cycle1").await;
+			RecoveryTestHelper::verify_key(&tree, &format!("c2_key_{}", i), "cycle2").await;
+			RecoveryTestHelper::verify_key(&tree, &format!("c3_key_{}", i), "cycle3").await;
 		}
 
 		tree.close().await.unwrap();
@@ -535,13 +538,13 @@ async fn test_recovery_with_no_wal_files() {
 
 	// Create data and flush
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		for i in 0..20 {
 			tree.set(format!("key_{}", i).as_bytes(), b"value").await.unwrap();
 		}
 
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		tree.close().await.unwrap();
 	}
 
@@ -559,12 +562,12 @@ async fn test_recovery_with_no_wal_files() {
 
 	// Reopen - should recover from SST only
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		// Verify all data from SST
 		for i in 0..20 {
 			let key = format!("key_{}", i);
-			RecoveryTestHelper::verify_key(&tree, &key, "value");
+			RecoveryTestHelper::verify_key(&tree, &key, "value").await;
 		}
 
 		// New WAL should be created for new writes
@@ -585,13 +588,13 @@ async fn test_corrupted_wal_with_valid_sst() {
 	let wal_dir = path.join("wal");
 
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		// Write and flush to SST (data safe)
 		for i in 0..10 {
 			tree.set(format!("sst_key_{}", i).as_bytes(), b"safe_in_sst").await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Write more data to WAL
 		for i in 0..5 {
@@ -615,12 +618,12 @@ async fn test_corrupted_wal_with_valid_sst() {
 
 	// Reopen - should handle corruption
 	{
-		let tree = create_tree(path.clone(), |b| b);
+		let tree = create_tree(path.clone(), |b| b).await;
 
 		// SST data should be recovered successfully
 		for i in 0..10 {
 			let key = format!("sst_key_{}", i);
-			RecoveryTestHelper::verify_key(&tree, &key, "safe_in_sst");
+			RecoveryTestHelper::verify_key(&tree, &key, "safe_in_sst").await;
 		}
 
 		// WAL data may be partially recovered or repaired

@@ -384,6 +384,7 @@ mod tests {
 
 	struct MockEnv;
 
+	#[async_trait::async_trait]
 	impl CommitEnv for MockEnv {
 		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
 			// Create a copy of the batch for testing
@@ -399,7 +400,7 @@ mod tests {
 			Ok(new_batch)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		async fn apply(&self, _batch: &Batch) -> Result<()> {
 			Ok(())
 		}
 
@@ -495,6 +496,7 @@ mod tests {
 
 	struct DelayedMockEnv;
 
+	#[async_trait::async_trait]
 	impl CommitEnv for DelayedMockEnv {
 		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
 			let start = std::time::Instant::now();
@@ -514,7 +516,7 @@ mod tests {
 			Ok(new_batch)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		async fn apply(&self, _batch: &Batch) -> Result<()> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(50) {
 				std::hint::spin_loop();
@@ -579,6 +581,7 @@ mod tests {
 
 	struct AlwaysFailApplyEnv;
 
+	#[async_trait::async_trait]
 	impl CommitEnv for AlwaysFailApplyEnv {
 		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
 			let mut new_batch = Batch::new();
@@ -593,7 +596,7 @@ mod tests {
 			Ok(new_batch)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		async fn apply(&self, _batch: &Batch) -> Result<()> {
 			Err(Error::CommitFail("simulated apply failure".into()))
 		}
 
@@ -644,6 +647,7 @@ mod tests {
 		}
 	}
 
+	#[async_trait::async_trait]
 	impl CommitEnv for FailNTimesEnv {
 		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
 			let mut new_batch = Batch::new();
@@ -658,7 +662,7 @@ mod tests {
 			Ok(new_batch)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		async fn apply(&self, _batch: &Batch) -> Result<()> {
 			// Increment call count and get previous value
 			let call_num = self.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 

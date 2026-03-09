@@ -81,8 +81,8 @@ fn test_block_iter() {
 	assert_eq!(i, data.len());
 }
 
-#[test]
-fn test_block_iter_reverse() {
+#[tokio::test]
+async fn test_block_iter_reverse() {
 	let data = generate_data();
 	let o = make_opts(Some(3));
 	let mut builder = BlockWriter::new(
@@ -104,18 +104,18 @@ fn test_block_iter_reverse() {
 	assert_eq!(iter.value_encoded().unwrap(), b"value1".to_vec());
 
 	// Advance to second entry (loooongkey1)
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), "loooongkey1".as_bytes());
 	assert_eq!(iter.value_encoded().unwrap(), b"value2".to_vec());
 
 	// Advance to third entry (medium_key2)
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), "medium_key2".as_bytes());
 
 	// Go back to second entry (loooongkey1)
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), "loooongkey1".as_bytes());
 	assert_eq!(iter.value_encoded().unwrap(), b"value2".to_vec());
@@ -127,14 +127,14 @@ fn test_block_iter_reverse() {
 	assert_eq!(iter.value_encoded().unwrap(), b"value".to_vec());
 
 	// Move to second-to-last entry (pkey2)
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), "pkey2".as_bytes());
 	assert_eq!(iter.value_encoded().unwrap(), b"value".to_vec());
 }
 
-#[test]
-fn test_block_seek() {
+#[tokio::test]
+async fn test_block_seek() {
 	let data = generate_data();
 	let o = make_opts(Some(3));
 	let mut builder = BlockWriter::new(
@@ -153,7 +153,7 @@ fn test_block_seek() {
 		Block::new(block_contents, Arc::clone(&o.internal_comparator)).iter().unwrap();
 
 	let key = InternalKey::new(b"pkey2".to_vec(), 1, InternalKeyKind::Set, 0);
-	block_iter.seek(&key.encode()).unwrap();
+	block_iter.seek(&key.encode()).await.unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
 		Some((block_iter.key().user_key(), block_iter.value_encoded().unwrap(),)),
@@ -161,7 +161,7 @@ fn test_block_seek() {
 	);
 
 	let key = InternalKey::new(b"pkey0".to_vec(), 1, InternalKeyKind::Set, 0);
-	block_iter.seek(&key.encode()).unwrap();
+	block_iter.seek(&key.encode()).await.unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
 		Some((block_iter.key().user_key(), block_iter.value_encoded().unwrap(),)),
@@ -169,7 +169,7 @@ fn test_block_seek() {
 	);
 
 	let key = InternalKey::new(b"key1".to_vec(), 1, InternalKeyKind::Set, 0);
-	block_iter.seek(&key.encode()).unwrap();
+	block_iter.seek(&key.encode()).await.unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
 		Some((block_iter.key().user_key(), block_iter.value_encoded().unwrap(),)),
@@ -177,7 +177,7 @@ fn test_block_seek() {
 	);
 
 	let key = InternalKey::new(b"pkey3".to_vec(), 1, InternalKeyKind::Set, 0);
-	block_iter.seek(&key.encode()).unwrap();
+	block_iter.seek(&key.encode()).await.unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(
 		Some((block_iter.key().user_key(), block_iter.value_encoded().unwrap(),)),
@@ -185,12 +185,12 @@ fn test_block_seek() {
 	);
 
 	let key = InternalKey::new(b"pkey8".to_vec(), 1, InternalKeyKind::Set, 0);
-	block_iter.seek(&key.encode()).unwrap();
+	block_iter.seek(&key.encode()).await.unwrap();
 	assert!(!block_iter.valid());
 }
 
-#[test]
-fn test_block_seek_to_last() {
+#[tokio::test]
+async fn test_block_seek_to_last() {
 	// Test with different number of restarts
 	for block_restart_interval in [2, 6, 10] {
 		let data = generate_data();
@@ -220,11 +220,11 @@ fn test_block_seek_to_last() {
 		assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 		assert_eq!(block_iter.value_encoded().unwrap(), b"value1".to_vec());
 
-		block_iter.next().unwrap();
+		block_iter.next().await.unwrap();
 		assert!(block_iter.valid());
-		block_iter.next().unwrap();
+		block_iter.next().await.unwrap();
 		assert!(block_iter.valid());
-		block_iter.next().unwrap();
+		block_iter.next().await.unwrap();
 		assert!(block_iter.valid());
 
 		assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
@@ -232,8 +232,8 @@ fn test_block_seek_to_last() {
 	}
 }
 
-#[test]
-fn test_block_prev() {
+#[tokio::test]
+async fn test_block_prev() {
 	// Test backward iteration using prev()
 	let data = generate_data();
 	let o = make_opts(Some(2)); // Small restart interval to test restart logic
@@ -257,37 +257,37 @@ fn test_block_prev() {
 	assert_eq!(block_iter.key().user_key(), "pkey3".as_bytes());
 
 	// Go backward one step
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "pkey2".as_bytes());
 
 	// Go backward another step
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 
 	// Go backward one more step
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "medium_key2".as_bytes());
 
 	// Go backward to the beginning
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "loooongkey1".as_bytes());
 
 	// Go backward to the first key
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 	// Try to go past the beginning
-	assert!(!block_iter.prev().unwrap());
+	assert!(!block_iter.prev().await.unwrap());
 	assert!(!block_iter.valid());
 }
 
-#[test]
-fn test_block_double_ended_iteration() {
+#[tokio::test]
+async fn test_block_double_ended_iteration() {
 	// Test using both next() and next_back() (DoubleEndedIterator)
 	let data = generate_data();
 	let o = make_opts(Some(3));
@@ -311,7 +311,7 @@ fn test_block_double_ended_iteration() {
 	while forward_iter.valid() {
 		let key = forward_iter.key().to_owned().user_key.clone();
 		forward_keys.push(String::from_utf8(key.clone()).unwrap());
-		forward_iter.next().unwrap();
+		forward_iter.next().await.unwrap();
 	}
 	assert_eq!(forward_keys, vec!["key1", "loooongkey1", "medium_key2", "pkey1", "pkey2", "pkey3"]);
 
@@ -323,7 +323,7 @@ fn test_block_double_ended_iteration() {
 	while backward_iter.valid() {
 		let key = backward_iter.key().user_key();
 		backward_keys.push(String::from_utf8(key.to_vec()).unwrap());
-		if !backward_iter.prev().unwrap() {
+		if !backward_iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -336,8 +336,8 @@ fn test_block_double_ended_iteration() {
 	assert_eq!(forward_keys, backward_keys.iter().rev().cloned().collect::<Vec<_>>());
 }
 
-#[test]
-fn test_block_prev_from_middle() {
+#[tokio::test]
+async fn test_block_prev_from_middle() {
 	// Test prev() starting from the middle of the block
 	let data = generate_data();
 	let o = make_opts(Some(2));
@@ -357,30 +357,30 @@ fn test_block_prev_from_middle() {
 
 	// Seek to "pkey1"
 	let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
-	block_iter.seek(&seek_key.encode()).unwrap();
+	block_iter.seek(&seek_key.encode()).await.unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 
 	// Go backward from here
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "medium_key2".as_bytes());
 
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "loooongkey1".as_bytes());
 
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 	// Can't go further back
-	assert!(!block_iter.prev().unwrap());
+	assert!(!block_iter.prev().await.unwrap());
 	assert!(!block_iter.valid());
 }
 
-#[test]
-fn test_block_mixed_next_prev() {
+#[tokio::test]
+async fn test_block_mixed_next_prev() {
 	// Test basic prev() functionality after positioning
 	let data = generate_data();
 	let o = make_opts(Some(3));
@@ -400,30 +400,30 @@ fn test_block_mixed_next_prev() {
 
 	// Position at "pkey1"
 	let seek_key = InternalKey::new(b"pkey1".to_vec(), 1, InternalKeyKind::Set, 0);
-	block_iter.seek(&seek_key.encode()).unwrap();
+	block_iter.seek(&seek_key.encode()).await.unwrap();
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "pkey1".as_bytes());
 
 	// Go backward
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "medium_key2".as_bytes());
 
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "loooongkey1".as_bytes());
 
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
 	// Can't go further
-	assert!(!block_iter.prev().unwrap());
+	assert!(!block_iter.prev().await.unwrap());
 	assert!(!block_iter.valid());
 }
 
-#[test]
-fn test_block_prev_edge_cases() {
+#[tokio::test]
+async fn test_block_prev_edge_cases() {
 	// Test edge cases for prev()
 	let data = generate_data();
 	let o = make_opts(Some(5)); // Large restart interval
@@ -451,7 +451,7 @@ fn test_block_prev_edge_cases() {
 	.unwrap();
 	let mut empty_iter =
 		Block::new(empty_block, Arc::clone(&o.internal_comparator)).iter().unwrap();
-	assert!(!empty_iter.prev().unwrap());
+	assert!(!empty_iter.prev().await.unwrap());
 	assert!(!empty_iter.valid());
 
 	// Test prev() when at first entry
@@ -459,7 +459,7 @@ fn test_block_prev_edge_cases() {
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "key1".as_bytes());
 
-	assert!(!block_iter.prev().unwrap()); // Can't go before first
+	assert!(!block_iter.prev().await.unwrap()); // Can't go before first
 	assert!(!block_iter.valid());
 
 	// Test prev() after seek_to_last()
@@ -468,13 +468,13 @@ fn test_block_prev_edge_cases() {
 	assert_eq!(block_iter.key().user_key(), "pkey3".as_bytes());
 
 	// Should be able to go backward
-	assert!(block_iter.prev().unwrap());
+	assert!(block_iter.prev().await.unwrap());
 	assert!(block_iter.valid());
 	assert_eq!(block_iter.key().user_key(), "pkey2".as_bytes());
 }
 
-#[test]
-fn test_block_seek_key_not_found_past_end() {
+#[tokio::test]
+async fn test_block_seek_key_not_found_past_end() {
 	// Scenario: Seek for a key greater than all keys in the block
 	// Expected: Iterator should be invalid (valid() returns false)
 	let o = make_opts(Some(3));
@@ -498,13 +498,13 @@ fn test_block_seek_key_not_found_past_end() {
 
 	// Seek for a key that is greater than all keys
 	let target = InternalKey::new(b"zzz_past_end".to_vec(), 1, InternalKeyKind::Set, 0);
-	iter.seek(&target.encode()).unwrap();
+	iter.seek(&target.encode()).await.unwrap();
 
 	assert!(!iter.valid(), "Iterator should be invalid when seeking past all keys");
 }
 
-#[test]
-fn test_block_seek_key_not_found_before_start() {
+#[tokio::test]
+async fn test_block_seek_key_not_found_before_start() {
 	// Scenario: Seek for a key less than all keys in the block
 	// Expected: Iterator should land on the first key
 	let o = make_opts(Some(3));
@@ -528,15 +528,15 @@ fn test_block_seek_key_not_found_before_start() {
 
 	// Seek for a key that is less than all keys
 	let target = InternalKey::new(b"aaa_before_all".to_vec(), 1, InternalKeyKind::Set, 0);
-	iter.seek(&target.encode()).unwrap();
+	iter.seek(&target.encode()).await.unwrap();
 
 	assert!(iter.valid(), "Iterator should be valid");
 	let found_key = iter.key();
 	assert_eq!(found_key.user_key(), b"key_00".to_vec(), "Should land on first key");
 }
 
-#[test]
-fn test_block_seek_exact_match() {
+#[tokio::test]
+async fn test_block_seek_exact_match() {
 	// Scenario: Seek for a key that exists exactly
 	// Expected: Iterator lands on that exact key
 	let o = make_opts(Some(3));
@@ -559,15 +559,15 @@ fn test_block_seek_exact_match() {
 
 	// Seek for key_05 which exists
 	let target = InternalKey::new(b"key_05".to_vec(), 1, InternalKeyKind::Set, 0);
-	iter.seek(&target.encode()).unwrap();
+	iter.seek(&target.encode()).await.unwrap();
 
 	assert!(iter.valid());
 	let found_key = iter.key();
 	assert_eq!(found_key.user_key(), b"key_05".to_vec());
 }
 
-#[test]
-fn test_block_seek_between_keys() {
+#[tokio::test]
+async fn test_block_seek_between_keys() {
 	// Scenario: Seek for a key that falls between two existing keys
 	// Expected: Iterator lands on the first key >= target
 	let o = make_opts(Some(3));
@@ -586,7 +586,7 @@ fn test_block_seek_between_keys() {
 
 	// Seek for "banana" which is between "apple" and "cherry"
 	let target = InternalKey::new(b"banana".to_vec(), 1, InternalKeyKind::Set, 0);
-	iter.seek(&target.encode()).unwrap();
+	iter.seek(&target.encode()).await.unwrap();
 
 	assert!(iter.valid());
 	let found_key = iter.key();
@@ -597,8 +597,8 @@ fn test_block_seek_between_keys() {
 	);
 }
 
-#[test]
-fn test_block_seek_same_user_key_different_seq_nums() {
+#[tokio::test]
+async fn test_block_seek_same_user_key_different_seq_nums() {
 	// Scenario: Multiple versions of the same user key with different seq_nums
 	// Verify descending seq_num ordering works correctly
 	let o = make_opts(Some(3));
@@ -621,7 +621,7 @@ fn test_block_seek_same_user_key_different_seq_nums() {
 	// Test 1: Seek for seq=80, should find seq=75 (first key >= (foo, 80))
 	let mut iter = block.iter().unwrap();
 	let target = InternalKey::new(b"foo".to_vec(), 80, InternalKeyKind::Set, 0);
-	iter.seek(&target.encode()).unwrap();
+	iter.seek(&target.encode()).await.unwrap();
 	assert!(iter.valid());
 	let found = iter.key();
 	assert_eq!(found.user_key(), b"foo".to_vec());
@@ -632,18 +632,22 @@ fn test_block_seek_same_user_key_different_seq_nums() {
 	);
 
 	// Test 2: Seek for seq=50, should find exactly seq=50
-	iter.seek(&InternalKey::new(b"foo".to_vec(), 50, InternalKeyKind::Set, 0).encode()).unwrap();
+	iter.seek(&InternalKey::new(b"foo".to_vec(), 50, InternalKeyKind::Set, 0).encode())
+		.await
+		.unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().seq_num(), 50);
 
 	// Test 3: Seek for seq=200 (newer than all), should find seq=100
-	iter.seek(&InternalKey::new(b"foo".to_vec(), 200, InternalKeyKind::Set, 0).encode()).unwrap();
+	iter.seek(&InternalKey::new(b"foo".to_vec(), 200, InternalKeyKind::Set, 0).encode())
+		.await
+		.unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().seq_num(), 100, "Should find newest version seq=100");
 }
 
-#[test]
-fn test_block_single_restart_point() {
+#[tokio::test]
+async fn test_block_single_restart_point() {
 	// Scenario: Block with only 1 entry (1 restart point)
 	// Verify binary search handles this edge case
 	let o = make_opts(Some(10)); // Large interval, so only 1 restart point
@@ -660,22 +664,26 @@ fn test_block_single_restart_point() {
 
 	// Seek for the exact key
 	let target = InternalKey::new(b"only_key".to_vec(), 1, InternalKeyKind::Set, 0);
-	iter.seek(&target.encode()).unwrap();
+	iter.seek(&target.encode()).await.unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"only_key".to_vec());
 
 	// Seek for key before
-	iter.seek(&InternalKey::new(b"aaa".to_vec(), 1, InternalKeyKind::Set, 0).encode()).unwrap();
+	iter.seek(&InternalKey::new(b"aaa".to_vec(), 1, InternalKeyKind::Set, 0).encode())
+		.await
+		.unwrap();
 	assert!(iter.valid());
 	assert_eq!(iter.key().user_key(), b"only_key".to_vec());
 
 	// Seek for key after
-	iter.seek(&InternalKey::new(b"zzz".to_vec(), 1, InternalKeyKind::Set, 0).encode()).unwrap();
+	iter.seek(&InternalKey::new(b"zzz".to_vec(), 1, InternalKeyKind::Set, 0).encode())
+		.await
+		.unwrap();
 	assert!(!iter.valid(), "Should be invalid when seeking past single entry");
 }
 
-#[test]
-fn test_block_seek_at_restart_point_boundaries() {
+#[tokio::test]
+async fn test_block_seek_at_restart_point_boundaries() {
 	// Scenario: Seek for keys exactly at restart point boundaries
 	let o = make_opts(Some(2)); // Restart every 2 entries
 	let mut builder = BlockWriter::new(
@@ -697,7 +705,7 @@ fn test_block_seek_at_restart_point_boundaries() {
 	for i in [0, 2, 4] {
 		let target_key = format!("key_{:02}", i);
 		let target = InternalKey::new(target_key.as_bytes().to_vec(), 1, InternalKeyKind::Set, 0);
-		iter.seek(&target.encode()).unwrap();
+		iter.seek(&target.encode()).await.unwrap();
 		assert!(iter.valid(), "Should find key at restart point {}", i);
 		assert_eq!(iter.key().user_key(), target_key.as_bytes().to_vec());
 	}
@@ -755,8 +763,8 @@ fn test_seek_to_last_empty_block() {
 	assert!(!iter.valid(), "Empty block iterator should be invalid after seek_to_last");
 }
 
-#[test]
-fn test_prev_at_first_entry() {
+#[tokio::test]
+async fn test_prev_at_first_entry() {
 	// Test that prev() at first entry correctly returns false
 	let o = make_opts(Some(3));
 	let mut builder = BlockWriter::new(
@@ -781,7 +789,7 @@ fn test_prev_at_first_entry() {
 	assert_eq!(first_key.user_key(), b"key_00".to_vec());
 
 	// prev() at first entry should return false
-	let result = iter.prev().unwrap();
+	let result = iter.prev().await.unwrap();
 	assert!(!result, "prev() at first entry should return false");
 	assert!(!iter.valid(), "Iterator should be invalid after prev() at first entry");
 }

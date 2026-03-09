@@ -6,7 +6,9 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::levels::Level;
-use crate::sstable::table::{Table, TableWriter};
+use crate::sstable::sst_id::SstId;
+use crate::sstable::table::TableWriter;
+use crate::test::{new_test_table, test_sst_id};
 use crate::{
 	InternalKey,
 	InternalKeyKind,
@@ -49,9 +51,14 @@ fn make_range(
 }
 
 /// Creates a table with specific key range for testing
-fn create_test_table(id: u64, keys: &[&str], opts: Arc<Options>) -> Arc<Table> {
+async fn create_test_table(
+	id: u64,
+	keys: &[&str],
+	opts: Arc<Options>,
+) -> Arc<crate::sstable::table::Table> {
+	let sst_id = test_sst_id(id);
 	let mut buf = Vec::new();
-	let mut writer = TableWriter::new(&mut buf, id, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buf, sst_id, Arc::clone(&opts), 0);
 
 	for (i, key) in keys.iter().enumerate() {
 		let ikey =
@@ -59,19 +66,19 @@ fn create_test_table(id: u64, keys: &[&str], opts: Arc<Options>) -> Arc<Table> {
 		writer.add(ikey, b"value").unwrap();
 	}
 
-	let size = writer.finish().unwrap();
+	let _size = writer.finish().unwrap();
 
-	let file: Arc<dyn crate::vfs::File> = Arc::new(buf);
-	Arc::new(Table::new(id, opts, file, size as u64).unwrap())
+	Arc::new(new_test_table(sst_id, opts, buf).await.unwrap())
 }
 
 /// Creates a level with multiple non-overlapping tables for testing
-fn create_test_level(table_ranges: &[(&str, &str)], opts: Arc<Options>) -> Level {
+async fn create_test_level(table_ranges: &[(&str, &str)], opts: Arc<Options>) -> Level {
 	let mut tables = Vec::new();
 
 	for (id, (smallest, largest)) in table_ranges.iter().enumerate() {
 		// Create table with just the boundary keys
-		let table = create_test_table((id + 1) as u64, &[smallest, largest], Arc::clone(&opts));
+		let table =
+			create_test_table((id + 1) as u64, &[smallest, largest], Arc::clone(&opts)).await;
 		tables.push(table);
 	}
 
@@ -87,30 +94,30 @@ fn create_test_level(table_ranges: &[(&str, &str)], opts: Arc<Options>) -> Level
 mod is_before_range_tests {
 	use super::*;
 
-	#[test]
-	fn table_clearly_before_range() {
+	#[tokio::test]
+	async fn table_clearly_before_range() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["a", "c"], opts);
+		let table = create_test_table(1, &["a", "c"], opts).await;
 
 		// Table [a,c], Range [e,g] - clearly before
 		let range = make_range(Some((b"e", true)), Some((b"g", true)));
 		assert!(table.is_before_range(&range));
 	}
 
-	#[test]
-	fn table_clearly_not_before_range() {
+	#[tokio::test]
+	async fn table_clearly_not_before_range() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["e", "g"], opts);
+		let table = create_test_table(1, &["e", "g"], opts).await;
 
 		// Table [e,g], Range [a,c] - table is after, not before
 		let range = make_range(Some((b"a", true)), Some((b"c", true)));
 		assert!(!table.is_before_range(&range));
 	}
 
-	#[test]
-	fn table_touches_range_at_boundary_included() {
+	#[tokio::test]
+	async fn table_touches_range_at_boundary_included() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["a", "c"], opts);
+		let table = create_test_table(1, &["a", "c"], opts).await;
 
 		// Table [a,c], Range [c,e] (inclusive) - they touch at 'c'
 		// Table should NOT be before range (they overlap at boundary)
@@ -121,10 +128,10 @@ mod is_before_range_tests {
 		);
 	}
 
-	#[test]
-	fn table_at_boundary_excluded() {
+	#[tokio::test]
+	async fn table_at_boundary_excluded() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["a", "c"], opts);
+		let table = create_test_table(1, &["a", "c"], opts).await;
 
 		// Table [a,c], Range (c,e] (exclusive lower) - 'c' is excluded from range
 		// Table's largest is 'c', but range excludes 'c'
@@ -137,20 +144,20 @@ mod is_before_range_tests {
 		);
 	}
 
-	#[test]
-	fn table_overlaps_with_range() {
+	#[tokio::test]
+	async fn table_overlaps_with_range() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["a", "e"], opts);
+		let table = create_test_table(1, &["a", "e"], opts).await;
 
 		// Table [a,e], Range [c,g] - overlapping
 		let range = make_range(Some((b"c", true)), Some((b"g", true)));
 		assert!(!table.is_before_range(&range));
 	}
 
-	#[test]
-	fn unbounded_lower_range() {
+	#[tokio::test]
+	async fn unbounded_lower_range() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["a", "c"], opts);
+		let table = create_test_table(1, &["a", "c"], opts).await;
 
 		// Range [*, e] - unbounded lower means table is never "before"
 		let range = make_range(None, Some((b"e", true)));
@@ -165,30 +172,30 @@ mod is_before_range_tests {
 mod is_after_range_tests {
 	use super::*;
 
-	#[test]
-	fn table_clearly_after_range() {
+	#[tokio::test]
+	async fn table_clearly_after_range() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["e", "g"], opts);
+		let table = create_test_table(1, &["e", "g"], opts).await;
 
 		// Table [e,g], Range [a,c] - clearly after
 		let range = make_range(Some((b"a", true)), Some((b"c", true)));
 		assert!(table.is_after_range(&range));
 	}
 
-	#[test]
-	fn table_clearly_not_after_range() {
+	#[tokio::test]
+	async fn table_clearly_not_after_range() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["a", "c"], opts);
+		let table = create_test_table(1, &["a", "c"], opts).await;
 
 		// Table [a,c], Range [e,g] - table is before, not after
 		let range = make_range(Some((b"e", true)), Some((b"g", true)));
 		assert!(!table.is_after_range(&range));
 	}
 
-	#[test]
-	fn table_touches_range_at_boundary_included() {
+	#[tokio::test]
+	async fn table_touches_range_at_boundary_included() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["c", "e"], opts);
+		let table = create_test_table(1, &["c", "e"], opts).await;
 
 		// Table [c,e], Range [a,c] (inclusive) - they touch at 'c'
 		// Table should NOT be after range (they overlap at boundary)
@@ -199,10 +206,10 @@ mod is_after_range_tests {
 		);
 	}
 
-	#[test]
-	fn table_at_boundary_excluded() {
+	#[tokio::test]
+	async fn table_at_boundary_excluded() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["c", "e"], opts);
+		let table = create_test_table(1, &["c", "e"], opts).await;
 
 		// Table [c,e], Range [a,c) (exclusive upper) - 'c' is excluded from range
 		// Table's smallest is 'c', but range excludes 'c'
@@ -215,10 +222,10 @@ mod is_after_range_tests {
 		);
 	}
 
-	#[test]
-	fn unbounded_upper_range() {
+	#[tokio::test]
+	async fn unbounded_upper_range() {
 		let opts = Arc::new(Options::default());
-		let table = create_test_table(1, &["e", "g"], opts);
+		let table = create_test_table(1, &["e", "g"], opts).await;
 
 		// Range [a, *] - unbounded upper means table is never "after"
 		let range = make_range(Some((b"a", true)), None);
@@ -230,8 +237,8 @@ mod is_after_range_tests {
 // TESTS FOR find_first_overlapping_table and find_last_overlapping_table
 // ============================================================================
 
-#[test]
-fn select_middle_tables() {
+#[tokio::test]
+async fn select_middle_tables() {
 	let opts = Arc::new(Options::default());
 
 	// Create 5 non-overlapping tables:
@@ -239,67 +246,72 @@ fn select_middle_tables() {
 	let level = create_test_level(
 		&[("aa", "ac"), ("ba", "bc"), ("ca", "cc"), ("da", "dc"), ("ea", "ec")],
 		opts,
-	);
+	)
+	.await;
 
 	// Query [bb, cb] - should select T2 and T3
 	let range = make_range(Some((b"bb", true)), Some((b"cb", true)));
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
 
-	let selected_ids: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
+	let selected_ids: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
 
-	assert_eq!(selected_ids, vec![2, 3], "Query [bb,cb] should select T2 and T3");
+	assert_eq!(
+		selected_ids,
+		vec![test_sst_id(2), test_sst_id(3)],
+		"Query [bb,cb] should select T2 and T3"
+	);
 }
 
-#[test]
-fn select_first_table_only() {
+#[tokio::test]
+async fn select_first_table_only() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts);
+	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts).await;
 
 	// Query [aa, ab] - should select only T1
 	let range = make_range(Some((b"aa", true)), Some((b"ab", true)));
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
 
-	let selected_ids: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
+	let selected_ids: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
 
-	assert_eq!(selected_ids, vec![1]);
+	assert_eq!(selected_ids, vec![test_sst_id(1)]);
 }
 
-#[test]
-fn select_last_table_only() {
+#[tokio::test]
+async fn select_last_table_only() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts);
+	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts).await;
 
 	// Query [cb, cd] - should select only T3
 	let range = make_range(Some((b"cb", true)), Some((b"cd", true)));
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
 
-	let selected_ids: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
+	let selected_ids: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
 
-	assert_eq!(selected_ids, vec![3]);
+	assert_eq!(selected_ids, vec![test_sst_id(3)]);
 }
 
-#[test]
-fn select_all_tables() {
+#[tokio::test]
+async fn select_all_tables() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts);
+	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts).await;
 
 	// Query [aa, cc] - should select all tables
 	let range = make_range(Some((b"aa", true)), Some((b"cc", true)));
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
 
-	let selected_ids: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
+	let selected_ids: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
 
-	assert_eq!(selected_ids, vec![1, 2, 3]);
+	assert_eq!(selected_ids, vec![test_sst_id(1), test_sst_id(2), test_sst_id(3)]);
 }
 
-#[test]
-fn select_no_tables_before_all() {
+#[tokio::test]
+async fn select_no_tables_before_all() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("ba", "bc"), ("ca", "cc"), ("da", "dc")], opts);
+	let level = create_test_level(&[("ba", "bc"), ("ca", "cc"), ("da", "dc")], opts).await;
 
 	// Query [aa, az] - before all tables
 	let range = make_range(Some((b"aa", true)), Some((b"az", true)));
@@ -310,10 +322,10 @@ fn select_no_tables_before_all() {
 	assert_eq!(start, 0, "Should point to beginning");
 }
 
-#[test]
-fn select_no_tables_after_all() {
+#[tokio::test]
+async fn select_no_tables_after_all() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts);
+	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts).await;
 
 	// Query [da, dz] - after all tables
 	let range = make_range(Some((b"da", true)), Some((b"dz", true)));
@@ -324,13 +336,14 @@ fn select_no_tables_after_all() {
 	assert_eq!(start, 3, "Should point past end");
 }
 
-#[test]
-fn select_no_tables_in_gap() {
+#[tokio::test]
+async fn select_no_tables_in_gap() {
 	let opts = Arc::new(Options::default());
 	let level = create_test_level(
 		&[("aa", "ac"), ("da", "dc")], // Gap between ac and da
 		opts,
-	);
+	)
+	.await;
 
 	// Query [ba, ca] - in the gap
 	let range = make_range(Some((b"ba", true)), Some((b"ca", true)));
@@ -340,26 +353,30 @@ fn select_no_tables_in_gap() {
 	assert_eq!(start, end, "No tables in the gap");
 }
 
-#[test]
-fn select_with_boundary_touching_included() {
+#[tokio::test]
+async fn select_with_boundary_touching_included() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("aa", "ac"), ("ba", "bc")], opts);
+	let level = create_test_level(&[("aa", "ac"), ("ba", "bc")], opts).await;
 
 	// Query [ac, ba] - touches both table boundaries
 	let range = make_range(Some((b"ac", true)), Some((b"ba", true)));
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
 
-	let selected_ids: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
+	let selected_ids: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
 
 	// Both tables should be selected (T1 has 'ac', T2 has 'ba')
-	assert_eq!(selected_ids, vec![1, 2], "Both tables touch the range boundaries");
+	assert_eq!(
+		selected_ids,
+		vec![test_sst_id(1), test_sst_id(2)],
+		"Both tables touch the range boundaries"
+	);
 }
 
-#[test]
-fn select_with_exclusive_bounds_at_boundaries() {
+#[tokio::test]
+async fn select_with_exclusive_bounds_at_boundaries() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("aa", "ac"), ("ba", "bc")], opts);
+	let level = create_test_level(&[("aa", "ac"), ("ba", "bc")], opts).await;
 
 	// Query (ac, ba) - exclusive at both boundaries
 	// This is keys STRICTLY BETWEEN 'ac' and 'ba'
@@ -372,10 +389,10 @@ fn select_with_exclusive_bounds_at_boundaries() {
 	assert_eq!(start, end, "No tables should be selected for exclusive range (ac, ba)");
 }
 
-#[test]
-fn select_with_exclusive_lower_bound() {
+#[tokio::test]
+async fn select_with_exclusive_lower_bound() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts);
+	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts).await;
 
 	// Query (ac, cc] - exclusive lower at T1's largest
 	// T1 should NOT be selected, T2 and T3 should be selected
@@ -383,15 +400,19 @@ fn select_with_exclusive_lower_bound() {
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
 
-	let selected_ids: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
+	let selected_ids: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
 
-	assert_eq!(selected_ids, vec![2, 3], "T1 should be excluded for range (ac, cc]");
+	assert_eq!(
+		selected_ids,
+		vec![test_sst_id(2), test_sst_id(3)],
+		"T1 should be excluded for range (ac, cc]"
+	);
 }
 
-#[test]
-fn select_with_exclusive_upper_bound() {
+#[tokio::test]
+async fn select_with_exclusive_upper_bound() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts);
+	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts).await;
 
 	// Query [aa, ca) - exclusive upper at T3's smallest
 	// T3 should NOT be selected, T1 and T2 should be selected
@@ -399,55 +420,59 @@ fn select_with_exclusive_upper_bound() {
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
 
-	let selected_ids: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
+	let selected_ids: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
 
-	assert_eq!(selected_ids, vec![1, 2], "T3 should be excluded for range [aa, ca)");
+	assert_eq!(
+		selected_ids,
+		vec![test_sst_id(1), test_sst_id(2)],
+		"T3 should be excluded for range [aa, ca)"
+	);
 }
 
-#[test]
-fn unbounded_ranges() {
+#[tokio::test]
+async fn unbounded_ranges() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts);
+	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts).await;
 
 	// Query [*, bc] - unbounded lower
 	let range = make_range(None, Some((b"bc", true)));
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
-	let selected: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
-	assert_eq!(selected, vec![1, 2]);
+	let selected: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
+	assert_eq!(selected, vec![test_sst_id(1), test_sst_id(2)]);
 
 	// Query [bc, *] - unbounded upper
 	let range = make_range(Some((b"bc", true)), None);
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
-	let selected: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
-	assert_eq!(selected, vec![2, 3]);
+	let selected: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
+	assert_eq!(selected, vec![test_sst_id(2), test_sst_id(3)]);
 
 	// Query [*, *] - fully unbounded
 	let range = make_range(None, None);
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
-	let selected: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
-	assert_eq!(selected, vec![1, 2, 3]);
+	let selected: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
+	assert_eq!(selected, vec![test_sst_id(1), test_sst_id(2), test_sst_id(3)]);
 }
 
-#[test]
-fn single_point_query() {
+#[tokio::test]
+async fn single_point_query() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts);
+	let level = create_test_level(&[("aa", "ac"), ("ba", "bc"), ("ca", "cc")], opts).await;
 
 	// Query exactly for key 'bb' → [bb, bb]
 	let range = make_range(Some((b"bb", true)), Some((b"bb", true)));
 	let start = level.find_first_overlapping_table(&range);
 	let end = level.find_last_overlapping_table(&range);
 
-	let selected_ids: Vec<u64> = level.tables[start..end].iter().map(|t| t.id).collect();
+	let selected_ids: Vec<SstId> = level.tables[start..end].iter().map(|t| t.id).collect();
 
-	assert_eq!(selected_ids, vec![2], "Only T2 contains 'bb'");
+	assert_eq!(selected_ids, vec![test_sst_id(2)], "Only T2 contains 'bb'");
 }
 
-#[test]
-fn empty_level() {
+#[tokio::test]
+async fn empty_level() {
 	let level = Level {
 		tables: vec![],
 	};
@@ -460,10 +485,10 @@ fn empty_level() {
 	assert_eq!(end, 0);
 }
 
-#[test]
-fn single_table_level() {
+#[tokio::test]
+async fn single_table_level() {
 	let opts = Arc::new(Options::default());
-	let level = create_test_level(&[("ba", "bc")], opts);
+	let level = create_test_level(&[("ba", "bc")], opts).await;
 
 	// Query overlapping
 	let range = make_range(Some((b"bb", true)), Some((b"cc", true)));

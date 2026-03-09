@@ -154,6 +154,12 @@ impl LevelManifest {
 		self.last_sequence
 	}
 
+	/// Initializes levels with default values (test-visible for struct literal construction)
+	#[cfg(test)]
+	pub(crate) fn initialize_levels_for_test(level_count: u8) -> Levels {
+		Self::initialize_levels(level_count)
+	}
+
 	/// Initializes levels with default values
 	fn initialize_levels(level_count: u8) -> Levels {
 		let levels = (0..level_count).map(|_| Arc::new(Level::default())).collect::<Vec<_>>();

@@ -173,17 +173,17 @@ fn create_test_memtable(entries: Vec<TestEntry>) -> (Arc<MemTable>, u64) {
 	(memtable, last_seq)
 }
 
-#[test]
-fn test_empty_memtable() {
+#[test(tokio::test)]
+async fn test_empty_memtable() {
 	let memtable = Arc::new(MemTable::default());
 
 	// Test that iterator is empty
 	let mut iter = memtable.iter();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	let mut count = 0;
 	while iter.valid() {
 		count += 1;
-		if !iter.next().unwrap_or(false) {
+		if !iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -193,8 +193,8 @@ fn test_empty_memtable() {
 	assert!(memtable.is_empty());
 }
 
-#[test]
-fn test_single_key() {
+#[test(tokio::test)]
+async fn test_single_key() {
 	let (memtable, _) = create_test_memtable(vec![(
 		b"key1".to_vec(),
 		b"value1".to_vec(),
@@ -204,14 +204,14 @@ fn test_single_key() {
 
 	// Collect all entries
 	let mut iter = memtable.iter();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
-		if !iter.next().unwrap_or(false) {
+		if !iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -232,8 +232,8 @@ fn test_single_key() {
 	assert_value(&encoded_val, b"value1");
 }
 
-#[test]
-fn test_multiple_keys() {
+#[test(tokio::test)]
+async fn test_multiple_keys() {
 	let (memtable, _) = create_test_memtable(vec![
 		(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, None),
 		(b"key3".to_vec(), b"value3".to_vec(), InternalKeyKind::Set, None),
@@ -242,14 +242,14 @@ fn test_multiple_keys() {
 
 	// Collect all entries
 	let mut iter = memtable.iter();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
-		if !iter.next().unwrap_or(false) {
+		if !iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -271,8 +271,8 @@ fn test_multiple_keys() {
 	assert!(memtable.get(b"key4", None).is_none());
 }
 
-#[test]
-fn test_sequence_number_ordering() {
+#[test(tokio::test)]
+async fn test_sequence_number_ordering() {
 	// Create test with multiple sequence numbers for the same key
 	let (memtable, _) = create_test_memtable(vec![
 		(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, Some(10)),
@@ -283,14 +283,14 @@ fn test_sequence_number_ordering() {
 
 	// Collect all entries
 	let mut iter = memtable.iter();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
-		if !iter.next().unwrap_or(false) {
+		if !iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -345,8 +345,8 @@ fn test_key_updates_with_sequence_numbers() {
 	                                       // <= 8
 }
 
-#[test]
-fn test_tombstones() {
+#[test(tokio::test)]
+async fn test_tombstones() {
 	// Create test with deleted entries
 	let (memtable, _) = create_test_memtable(vec![
 		(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, Some(1)),
@@ -357,14 +357,14 @@ fn test_tombstones() {
 
 	// Iterator should see all entries including tombstones
 	let mut iter = memtable.iter();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
-		if !iter.next().unwrap_or(false) {
+		if !iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -381,8 +381,8 @@ fn test_tombstones() {
 	assert_eq!(key_counts[&b"key3".to_vec()], 1);
 }
 
-#[test]
-fn test_key_kinds() {
+#[test(tokio::test)]
+async fn test_key_kinds() {
 	// Test different key kinds
 	let (memtable, _) = create_test_memtable(vec![
 		(b"key1".to_vec(), b"value1".to_vec(), InternalKeyKind::Set, Some(10)),
@@ -393,14 +393,14 @@ fn test_key_kinds() {
 
 	// All key types should be visible in the iterator
 	let mut iter = memtable.iter();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
-		if !iter.next().unwrap_or(false) {
+		if !iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -443,8 +443,8 @@ fn test_key_kinds() {
 	assert_eq!(encoded_val.len(), 0);
 }
 
-#[test]
-fn test_range_query() {
+#[test(tokio::test)]
+async fn test_range_query() {
 	// Create a memtable with many keys
 	let (memtable, _) = create_test_memtable(vec![
 		(b"a".to_vec(), b"value-a".to_vec(), InternalKeyKind::Set, None),
@@ -462,14 +462,14 @@ fn test_range_query() {
 		Some("c".as_bytes()), // Inclusive lower
 		Some("l".as_bytes()), // Exclusive upper - includes "k" but not "l" or "m"
 	);
-	range_iter.seek_first().unwrap();
+	range_iter.seek_first().await.unwrap();
 	let mut range_entries = Vec::new();
 	while range_iter.valid() {
 		let key = range_iter.key().to_owned();
 		let value_bytes = range_iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		range_entries.push((key, value));
-		if !range_iter.next().unwrap_or(false) {
+		if !range_iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -489,14 +489,14 @@ fn test_range_query() {
 		Some("c".as_bytes()), // Inclusive lower
 		Some("k".as_bytes()), // Exclusive upper (excludes "k")
 	);
-	range_iter.seek_first().unwrap();
+	range_iter.seek_first().await.unwrap();
 	let mut range_entries = Vec::new();
 	while range_iter.valid() {
 		let key = range_iter.key().to_owned();
 		let value_bytes = range_iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		range_entries.push((key, value));
-		if !range_iter.next().unwrap_or(false) {
+		if !range_iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -510,8 +510,8 @@ fn test_range_query() {
 	assert_eq!(&user_keys[3], b"i");
 }
 
-#[test]
-fn test_range_query_with_sequence_numbers() {
+#[test(tokio::test)]
+async fn test_range_query_with_sequence_numbers() {
 	// Create a memtable with overlapping sequence numbers
 	let (memtable, _) = create_test_memtable(vec![
 		(b"a".to_vec(), b"value-a1".to_vec(), InternalKeyKind::Set, Some(10)),
@@ -526,14 +526,14 @@ fn test_range_query_with_sequence_numbers() {
 		Some("a".as_bytes()), // Inclusive lower
 		Some("f".as_bytes()), // Exclusive upper
 	);
-	range_iter.seek_first().unwrap();
+	range_iter.seek_first().await.unwrap();
 	let mut range_entries = Vec::new();
 	while range_iter.valid() {
 		let key = range_iter.key().to_owned();
 		let value_bytes = range_iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		range_entries.push((key, value));
-		if !range_iter.next().unwrap_or(false) {
+		if !range_iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -572,8 +572,8 @@ fn test_range_query_with_sequence_numbers() {
 	assert_eq!(entries_info[4].2, b"value-e2");
 }
 
-#[test]
-fn test_binary_keys() {
+#[test(tokio::test)]
+async fn test_binary_keys() {
 	// Test with binary keys containing nulls and various byte values
 	let (memtable, _) = create_test_memtable(vec![
 		(vec![0, 0, 1], b"value1".to_vec(), InternalKeyKind::Set, None),
@@ -583,14 +583,14 @@ fn test_binary_keys() {
 	]);
 
 	let mut iter = memtable.iter();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	let mut entries = Vec::new();
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		let value_bytes = iter.value_encoded();
 		let value = value_bytes.unwrap().to_vec();
 		entries.push((key, value));
-		if !iter.next().unwrap_or(false) {
+		if !iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -605,8 +605,8 @@ fn test_binary_keys() {
 	assert_eq!(user_keys[3].as_ref(), vec![0xFF, 0xFE, 0xFD]);
 }
 
-#[test]
-fn test_large_dataset() {
+#[test(tokio::test)]
+async fn test_large_dataset() {
 	// Create a larger dataset to test performance and correctness
 	let mut entries = Vec::new();
 	for i in 0..1000 {
@@ -619,11 +619,11 @@ fn test_large_dataset() {
 
 	// Test that all entries exist
 	let mut iter = memtable.iter();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	let mut count = 0;
 	while iter.valid() {
 		count += 1;
-		if !iter.next().unwrap_or(false) {
+		if !iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -712,8 +712,8 @@ fn test_get_highest_seq_num() {
 	assert_eq!(batch.get_highest_seq_num(), 14);
 }
 
-#[test]
-fn test_excluded_bound_skips_all_versions_of_key() {
+#[test(tokio::test)]
+async fn test_excluded_bound_skips_all_versions_of_key() {
 	// This test verifies that Bound::Excluded skips ALL entries with the same user key,
 	// not just one entry. In an LSM tree, there can be multiple versions of the same
 	// key with different sequence numbers.
@@ -732,7 +732,7 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 		Some("b".as_bytes()), // Start at "b" (inclusive)
 		None,                 // No upper bound
 	);
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Skip all entries with user key "b" (they have same user key, different seqnums)
 	let mut range_entries = Vec::new();
 	while iter.valid() {
@@ -742,7 +742,7 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 		if key.user_key != b"b" {
 			range_entries.push((key, value));
 			// Collect remaining entries
-			while iter.next().unwrap_or(false) && iter.valid() {
+			while iter.next().await.unwrap_or(false) && iter.valid() {
 				let key = iter.key().to_owned();
 				let value_bytes = iter.value_encoded();
 				let value = value_bytes.unwrap().to_vec();
@@ -750,7 +750,7 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 			}
 			break;
 		}
-		if !iter.next().unwrap_or(false) {
+		if !iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
@@ -762,8 +762,8 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 	assert_eq!(&user_keys[0], b"c");
 }
 
-#[test]
-fn test_excluded_bound_first_skips_all_versions() {
+#[test(tokio::test)]
+async fn test_excluded_bound_first_skips_all_versions() {
 	let (memtable, _) = create_test_memtable(vec![
 		(b"a".to_vec(), b"value-a".to_vec(), InternalKeyKind::Set, Some(10)),
 		(b"b".to_vec(), b"value-b1".to_vec(), InternalKeyKind::Set, Some(30)),
@@ -777,39 +777,39 @@ fn test_excluded_bound_first_skips_all_versions() {
 		Some("b".as_bytes()), // Start at "b" (inclusive)
 		None,                 // No upper bound
 	);
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Skip all entries with user key "b"
 	while iter.valid() {
 		let key = iter.key().to_owned();
 		if key.user_key != b"b" {
 			break;
 		}
-		if !iter.next().unwrap_or(false) {
+		if !iter.next().await.unwrap_or(false) {
 			break;
 		}
 	}
 
 	// Iterate once
-	let first = iter.seek_first().unwrap();
+	let first = iter.seek_first().await.unwrap();
 	assert!(first);
 	let key = iter.key().to_owned();
 	assert_eq!(&key.user_key, b"b", "First key should be 'b'");
 
 	// Reset and try again - create new iterator
 	let mut iter2 = memtable.range(Some("b".as_bytes()), None);
-	iter2.seek_first().unwrap();
+	iter2.seek_first().await.unwrap();
 	// Skip all entries with user key "b"
 	while iter2.valid() {
 		let key = iter2.key().to_owned();
 		if key.user_key != b"b" {
 			break;
 		}
-		if !iter2.next().unwrap_or(false) {
+		if !iter2.next().await.unwrap_or(false) {
 			break;
 		}
 	}
 
-	let first = iter2.seek_first().unwrap();
+	let first = iter2.seek_first().await.unwrap();
 	assert!(first);
 	let key = iter2.key().to_owned();
 	assert_eq!(&key.user_key, b"b", "After reset, first key should still be 'b'");

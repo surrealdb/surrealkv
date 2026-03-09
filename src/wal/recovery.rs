@@ -379,8 +379,8 @@ mod tests {
 	use crate::wal::Options;
 	use crate::{LSMIterator, WalRecoveryMode};
 
-	#[test]
-	fn test_replay_wal_sequence_number_tracking() {
+	#[tokio::test]
+	async fn test_replay_wal_sequence_number_tracking() {
 		// Create a temporary directory for WAL files
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
@@ -439,7 +439,7 @@ mod tests {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 		}
 		assert_eq!(
@@ -459,8 +459,8 @@ mod tests {
 		assert_eq!(memtables.len(), 0, "Empty WAL directory should return no memtables");
 	}
 
-	#[test]
-	fn test_replay_wal_single_entry_batches() {
+	#[tokio::test]
+	async fn test_replay_wal_single_entry_batches() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
@@ -508,7 +508,7 @@ mod tests {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 		}
 		assert_eq!(
@@ -517,8 +517,8 @@ mod tests {
 		);
 	}
 
-	#[test]
-	fn test_replay_wal_multiple_batches() {
+	#[tokio::test]
+	async fn test_replay_wal_multiple_batches() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
@@ -565,7 +565,7 @@ mod tests {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 		}
 
@@ -583,8 +583,8 @@ mod tests {
 		assert!(result.is_err(), "Should fail when segment doesn't exist");
 	}
 
-	#[test]
-	fn test_post_corruption_replay() {
+	#[tokio::test]
+	async fn test_post_corruption_replay() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
@@ -628,11 +628,12 @@ mod tests {
 			"Test repair",
 			WalRecoveryMode::TolerateCorruptedWithRepair,
 			1024,
-			|_memtable, _wal_number| {
+			|_memtable, _wal_number| async {
 				// Flush callback - not needed for this test
 				Ok(())
 			},
 		)
+		.await
 		.unwrap();
 
 		// Verify the repair worked correctly
@@ -643,8 +644,8 @@ mod tests {
 		assert!(memtable_opt.is_none(), "Should have no memtable when first record is corrupted");
 	}
 
-	#[test]
-	fn test_repair_with_three_batches_corrupt_third() {
+	#[tokio::test]
+	async fn test_repair_with_three_batches_corrupt_third() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
@@ -709,11 +710,12 @@ mod tests {
 			"Test repair",
 			WalRecoveryMode::TolerateCorruptedWithRepair,
 			1024,
-			|_memtable, _wal_number| {
+			|_memtable, _wal_number| async {
 				// Flush callback - not needed for this test
 				Ok(())
 			},
 		)
+		.await
 		.unwrap();
 
 		// Verify the repair worked correctly
@@ -732,7 +734,7 @@ mod tests {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 
 			assert_eq!(entry_count, 4, "Should have recovered 4 entries from first two batches");
@@ -832,8 +834,8 @@ mod tests {
 		// Reporter is used internally for logging
 	}
 
-	#[test]
-	fn test_multi_segment_recovery_after_crash() {
+	#[tokio::test]
+	async fn test_multi_segment_recovery_after_crash() {
 		use crate::batch::Batch;
 
 		let temp_dir = TempDir::new().unwrap();
@@ -885,7 +887,7 @@ mod tests {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
-				iter.next().unwrap();
+				iter.next().await.unwrap();
 			}
 		}
 
@@ -965,8 +967,8 @@ mod tests {
 		// This is correct behavior - corruption stops recovery
 	}
 
-	#[test]
-	fn test_multi_wal_recovery_creates_multiple_memtables() {
+	#[tokio::test]
+	async fn test_multi_wal_recovery_creates_multiple_memtables() {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		fs::create_dir_all(wal_dir).unwrap();
@@ -1008,11 +1010,11 @@ mod tests {
 		// Verify each memtable has correct data
 		{
 			let mut iter = memtables[0].0.iter();
-			iter.seek_first().unwrap();
+			iter.seek_first().await.unwrap();
 			let mut count = 0;
 			while iter.valid() {
 				count += 1;
-				if !iter.next().unwrap() {
+				if !iter.next().await.unwrap() {
 					break;
 				}
 			}
@@ -1020,11 +1022,11 @@ mod tests {
 		}
 		{
 			let mut iter = memtables[1].0.iter();
-			iter.seek_first().unwrap();
+			iter.seek_first().await.unwrap();
 			let mut count = 0;
 			while iter.valid() {
 				count += 1;
-				if !iter.next().unwrap() {
+				if !iter.next().await.unwrap() {
 					break;
 				}
 			}
@@ -1032,11 +1034,11 @@ mod tests {
 		}
 		{
 			let mut iter = memtables[2].0.iter();
-			iter.seek_first().unwrap();
+			iter.seek_first().await.unwrap();
 			let mut count = 0;
 			while iter.valid() {
 				count += 1;
-				if !iter.next().unwrap() {
+				if !iter.next().await.unwrap() {
 					break;
 				}
 			}

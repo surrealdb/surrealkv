@@ -17,25 +17,25 @@ fn create_temp_directory() -> TempDir {
 }
 
 // Common setup logic for creating a store
-fn create_store() -> (Tree, TempDir) {
+async fn create_store() -> (Tree, TempDir) {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
-	let tree = TreeBuilder::new().with_path(path).build().unwrap();
+	let tree = TreeBuilder::new().with_path(path).build().await.unwrap();
 	(tree, temp_dir)
 }
 
-fn create_versioned_store() -> (Tree, TempDir) {
+async fn create_versioned_store() -> (Tree, TempDir) {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 	let opts = Options::new().with_path(path).with_versioning(true, 0);
-	let tree = TreeBuilder::with_options(opts).build().unwrap();
+	let tree = TreeBuilder::with_options(opts).build().await.unwrap();
 	(tree, temp_dir)
 }
 
 #[test(tokio::test)]
 async fn basic_store_operations() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Define key-value pairs for the test
 	let key1 = b"foo1";
@@ -53,7 +53,7 @@ async fn basic_store_operations() {
 
 	// Read back and verify
 	{
-		let val = store.get(key1).unwrap().unwrap();
+		let val = store.get(key1).await.unwrap().unwrap();
 		assert_eq!(val.as_slice(), value1);
 	}
 
@@ -66,13 +66,13 @@ async fn basic_store_operations() {
 	}
 
 	// Read back and verify updated values
-	let val = store.get(key1).unwrap().unwrap();
+	let val = store.get(key1).await.unwrap().unwrap();
 	assert_eq!(val.as_slice(), value2);
 }
 
 #[test(tokio::test)]
 async fn sdb_delete_record_id_bug() {
-	let (store, _) = create_store();
+	let (store, _) = create_store().await;
 
 	let key1 = Vec::from(&[
 		47, 33, 110, 100, 166, 192, 229, 30, 101, 24, 73, 242, 185, 36, 233, 242, 54, 96, 72, 52,
@@ -95,7 +95,7 @@ async fn sdb_delete_record_id_bug() {
 	store.set(&key3, value1).await.unwrap();
 
 	// Verify key3 is readable
-	let val = store.get(&key3).unwrap();
+	let val = store.get(&key3).await.unwrap();
 	assert!(val.is_some());
 
 	// Write more complex keys
@@ -139,7 +139,7 @@ async fn sdb_delete_record_id_bug() {
 
 #[test(tokio::test)]
 async fn store_delete_from_index() {
-	let (store, _) = create_store();
+	let (store, _) = create_store().await;
 
 	let key1 = b"foo1";
 	let value = b"baz";
@@ -157,13 +157,13 @@ async fn store_delete_from_index() {
 	store.delete(key1).await.unwrap();
 
 	// Verify key1 is deleted and key2 remains
-	assert!(store.get(key1).unwrap().is_none());
-	assert_eq!(store.get(key2).unwrap().unwrap().as_slice(), value);
+	assert!(store.get(key1).await.unwrap().is_none());
+	assert_eq!(store.get(key2).await.unwrap().unwrap().as_slice(), value);
 }
 
 #[test(tokio::test)]
 async fn test_insert_delete_read_key() {
-	let (store, _) = create_store();
+	let (store, _) = create_store().await;
 
 	let key = b"test_key";
 	let value1 = b"test_value1";
@@ -179,12 +179,12 @@ async fn test_insert_delete_read_key() {
 	store.delete(key).await.unwrap();
 
 	// Verify it does not exist
-	assert!(store.get(key).unwrap().is_none());
+	assert!(store.get(key).await.unwrap().is_none());
 }
 
 #[test(tokio::test)]
 async fn test_range_basic_functionality() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert some initial data
 	{
@@ -201,6 +201,7 @@ async fn test_range_basic_functionality() {
 	{
 		let snap = store.new_snapshot();
 		let range = collect_transaction_all(&mut snap.range(Some(b"key2"), Some(b"key4")).unwrap())
+			.await
 			.unwrap();
 
 		assert_eq!(range.len(), 2); // key2, key3 (key4 is exclusive)
@@ -213,7 +214,7 @@ async fn test_range_basic_functionality() {
 
 #[test(tokio::test)]
 async fn test_range_with_bounds() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert some initial data
 	{
@@ -229,7 +230,8 @@ async fn test_range_with_bounds() {
 	// Test range with start bound as empty (None = unbounded)
 	{
 		let snap = store.new_snapshot();
-		let range = collect_transaction_all(&mut snap.range(None, Some(b"key4")).unwrap()).unwrap();
+		let range =
+			collect_transaction_all(&mut snap.range(None, Some(b"key4")).unwrap()).await.unwrap();
 		assert_eq!(range.len(), 3); // key1, key2, key3 (key4 is exclusive)
 		assert_eq!(&range[0].0, b"key1");
 		assert_eq!(&range[1].0, b"key2");
@@ -239,7 +241,7 @@ async fn test_range_with_bounds() {
 
 #[test(tokio::test)]
 async fn test_range_with_limit() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert test data
 	{
@@ -257,6 +259,7 @@ async fn test_range_with_limit() {
 		let snap = store.new_snapshot();
 		let all_range =
 			collect_transaction_all(&mut snap.range(Some(b"key01"), Some(b"key10")).unwrap())
+				.await
 				.unwrap();
 		let range: Vec<_> = all_range.into_iter().take(3).collect::<Vec<_>>();
 
@@ -269,7 +272,7 @@ async fn test_range_with_limit() {
 
 #[test(tokio::test)]
 async fn test_range_empty_result() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert data outside the range we'll query
 	{
@@ -282,15 +285,16 @@ async fn test_range_empty_result() {
 	// Query range with no data
 	{
 		let snap = store.new_snapshot();
-		let range =
-			collect_transaction_all(&mut snap.range(Some(b"m"), Some(b"n")).unwrap()).unwrap();
+		let range = collect_transaction_all(&mut snap.range(Some(b"m"), Some(b"n")).unwrap())
+			.await
+			.unwrap();
 		assert_eq!(range.len(), 0);
 	}
 }
 
 #[test(tokio::test)]
 async fn test_range_ordering() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert data in non-sequential order
 	{
@@ -307,6 +311,7 @@ async fn test_range_ordering() {
 	{
 		let snap = store.new_snapshot();
 		let range = collect_transaction_all(&mut snap.range(Some(b"key1"), Some(b"key6")).unwrap())
+			.await
 			.unwrap();
 
 		assert_eq!(range.len(), 5);
@@ -319,7 +324,7 @@ async fn test_range_ordering() {
 
 #[test(tokio::test)]
 async fn test_range_boundary_conditions() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert test data
 	{
@@ -334,6 +339,7 @@ async fn test_range_boundary_conditions() {
 	{
 		let snap = store.new_snapshot();
 		let range = collect_transaction_all(&mut snap.range(Some(b"key1"), Some(b"key4")).unwrap())
+			.await
 			.unwrap();
 
 		assert_eq!(range.len(), 3);
@@ -345,6 +351,7 @@ async fn test_range_boundary_conditions() {
 	{
 		let snap = store.new_snapshot();
 		let range = collect_transaction_all(&mut snap.range(Some(b"key2"), Some(b"key3")).unwrap())
+			.await
 			.unwrap();
 
 		assert_eq!(range.len(), 1);
@@ -360,6 +367,7 @@ async fn test_range_value_pointer_resolution_bug() {
 		.with_path(temp_dir.path().to_path_buf())
 		.with_max_memtable_size(64 * 1024)
 		.build()
+		.await
 		.unwrap();
 
 	// Create values that will be stored in VLog (> 50 bytes)
@@ -389,9 +397,9 @@ async fn test_range_value_pointer_resolution_bug() {
 
 	// Test 1: Verify get() works correctly
 	{
-		let retrieved1 = tree.get(key1).unwrap().unwrap();
-		let retrieved2 = tree.get(key2).unwrap().unwrap();
-		let retrieved3 = tree.get(key3).unwrap().unwrap();
+		let retrieved1 = tree.get(key1).await.unwrap().unwrap();
+		let retrieved2 = tree.get(key2).await.unwrap().unwrap();
+		let retrieved3 = tree.get(key3).await.unwrap().unwrap();
 
 		assert_eq!(
 			retrieved1.as_slice(),
@@ -415,6 +423,7 @@ async fn test_range_value_pointer_resolution_bug() {
 		let snap = tree.new_snapshot();
 		let range_results =
 			collect_transaction_all(&mut snap.range(Some(b"key1"), Some(b"key4")).unwrap())
+				.await
 				.unwrap();
 
 		assert_eq!(range_results.len(), 3, "Should get 3 items from range query");
@@ -454,7 +463,7 @@ mod double_ended_iterator_tests {
 
 	#[test(tokio::test)]
 	async fn test_reverse_iteration_basic() {
-		let (store, _temp_dir) = create_store();
+		let (store, _temp_dir) = create_store().await;
 
 		// Insert test data
 		{
@@ -472,6 +481,7 @@ mod double_ended_iterator_tests {
 			let snap = store.new_snapshot();
 			let reverse_results =
 				collect_transaction_reverse(&mut snap.range(Some(b"key1"), Some(b"key6")).unwrap())
+					.await
 					.unwrap();
 
 			assert_eq!(reverse_results.len(), 5);
@@ -488,7 +498,7 @@ mod double_ended_iterator_tests {
 
 	#[test(tokio::test)]
 	async fn test_reverse_iteration_with_limits() {
-		let (store, _temp_dir) = create_store();
+		let (store, _temp_dir) = create_store().await;
 
 		// Insert test data
 		{
@@ -507,6 +517,7 @@ mod double_ended_iterator_tests {
 			let reverse_results = collect_transaction_reverse(
 				&mut snap.range(Some(b"key01"), Some(b"key11")).unwrap(),
 			)
+			.await
 			.unwrap();
 
 			let limited_results: Vec<_> = reverse_results.into_iter().take(3).collect();
@@ -523,7 +534,7 @@ mod double_ended_iterator_tests {
 
 	#[test(tokio::test)]
 	async fn test_reverse_iteration_keys_only() {
-		let (store, _temp_dir) = create_store();
+		let (store, _temp_dir) = create_store().await;
 
 		// Insert test data
 		{
@@ -539,6 +550,7 @@ mod double_ended_iterator_tests {
 			let snap = store.new_snapshot();
 			let reverse_results =
 				collect_transaction_reverse(&mut snap.range(Some(b"key1"), Some(b"key4")).unwrap())
+					.await
 					.unwrap();
 
 			assert_eq!(reverse_results.len(), 3);
@@ -553,7 +565,7 @@ mod double_ended_iterator_tests {
 
 	#[test(tokio::test)]
 	async fn test_reverse_iteration_empty_range() {
-		let (store, _temp_dir) = create_store();
+		let (store, _temp_dir) = create_store().await;
 
 		// Insert data outside the range we'll query
 		{
@@ -568,6 +580,7 @@ mod double_ended_iterator_tests {
 			let snap = store.new_snapshot();
 			let reverse_results =
 				collect_transaction_reverse(&mut snap.range(Some(b"key2"), Some(b"key5")).unwrap())
+					.await
 					.unwrap();
 
 			assert_eq!(reverse_results.len(), 0);
@@ -576,7 +589,7 @@ mod double_ended_iterator_tests {
 
 	#[test(tokio::test)]
 	async fn test_reverse_iteration_consistency_with_forward() {
-		let (store, _temp_dir) = create_store();
+		let (store, _temp_dir) = create_store().await;
 
 		// Insert test data
 		{
@@ -596,11 +609,13 @@ mod double_ended_iterator_tests {
 			// Forward iteration
 			let forward_results =
 				collect_transaction_all(&mut snap.range(Some(b"key1"), Some(b"key5")).unwrap())
+					.await
 					.unwrap();
 
 			// Reverse iteration
 			let reverse_results =
 				collect_transaction_reverse(&mut snap.range(Some(b"key1"), Some(b"key5")).unwrap())
+					.await
 					.unwrap();
 
 			// Reverse the forward results
@@ -623,7 +638,7 @@ mod double_ended_iterator_tests {
 
 #[test(tokio::test)]
 async fn test_versioned_queries_basic() {
-	let (tree, _temp_dir) = create_versioned_store();
+	let (tree, _temp_dir) = create_versioned_store().await;
 
 	// Use explicit timestamps for better testing
 	let ts1 = 100;
@@ -634,13 +649,13 @@ async fn test_versioned_queries_basic() {
 	tree.set_at(b"key1", b"value1_v2", ts2).await.unwrap();
 
 	// Test regular get (should return latest)
-	let value = tree.get(b"key1").unwrap();
+	let value = tree.get(b"key1").await.unwrap();
 	assert_eq!(value, Some(Vec::from(b"value1_v2")));
 
 	// Get all versions using history_iter() to verify timestamps and values
 	let snap = tree.new_snapshot();
 	let mut iter = snap.history_iter(Some(b"key1"), Some(b"key2"), false, None, None).unwrap();
-	let versions = collect_history_all(&mut iter).unwrap();
+	let versions = collect_history_all(&mut iter).await.unwrap();
 	assert_eq!(versions.len(), 2);
 
 	// Find versions by timestamp
@@ -652,17 +667,17 @@ async fn test_versioned_queries_basic() {
 	assert_eq!(&v2.1, b"value1_v2");
 
 	// Test get at specific timestamp (earlier version)
-	let value_at_ts1 = snap.get_at(b"key1", ts1).unwrap();
+	let value_at_ts1 = snap.get_at(b"key1", ts1).await.unwrap();
 	assert_eq!(value_at_ts1, Some(Vec::from(b"value1_v1")));
 
 	// Test get at later timestamp (should return latest version as of that time)
-	let value_at_ts2 = snap.get_at(b"key1", ts2).unwrap();
+	let value_at_ts2 = snap.get_at(b"key1", ts2).await.unwrap();
 	assert_eq!(value_at_ts2, Some(Vec::from(b"value1_v2")));
 }
 
 #[test(tokio::test)]
 async fn test_set_at_timestamp() {
-	let (tree, _temp_dir) = create_versioned_store();
+	let (tree, _temp_dir) = create_versioned_store().await;
 
 	// Set a value with a specific timestamp
 	let custom_timestamp = 10;
@@ -670,22 +685,22 @@ async fn test_set_at_timestamp() {
 
 	// Verify we can get the value at that timestamp
 	let snap = tree.new_snapshot();
-	let value = snap.get_at(b"key1", custom_timestamp).unwrap();
+	let value = snap.get_at(b"key1", custom_timestamp).await.unwrap();
 	assert_eq!(value, Some(Vec::from(b"value1")));
 
 	// Verify we can get the value at a later timestamp
 	let later_timestamp = custom_timestamp + 1000000;
-	let value = snap.get_at(b"key1", later_timestamp).unwrap();
+	let value = snap.get_at(b"key1", later_timestamp).await.unwrap();
 	assert_eq!(value, Some(Vec::from(b"value1")));
 
 	// Verify we can't get the value at an earlier timestamp
 	let earlier_timestamp = custom_timestamp - 5;
-	let value = snap.get_at(b"key1", earlier_timestamp).unwrap();
+	let value = snap.get_at(b"key1", earlier_timestamp).await.unwrap();
 	assert_eq!(value, None);
 
 	// Verify using history_iter() to check the timestamp
 	let mut iter = snap.history_iter(Some(b"key1"), Some(b"key2"), false, None, None).unwrap();
-	let versions = collect_history_all(&mut iter).unwrap();
+	let versions = collect_history_all(&mut iter).await.unwrap();
 	assert_eq!(versions.len(), 1);
 	assert_eq!(versions[0].2, custom_timestamp);
 	assert_eq!(&versions[0].1, b"value1");
@@ -693,7 +708,7 @@ async fn test_set_at_timestamp() {
 
 #[test(tokio::test)]
 async fn test_timestamp_via_batch_set_at() {
-	let (tree, _temp_dir) = create_versioned_store();
+	let (tree, _temp_dir) = create_versioned_store().await;
 
 	// Test setting a value with timestamp via batch set_at
 	let custom_timestamp = 100;
@@ -705,7 +720,7 @@ async fn test_timestamp_via_batch_set_at() {
 
 	// Verify we can read it at that timestamp
 	let snap = tree.new_snapshot();
-	let value = snap.get_at(b"key1", custom_timestamp).unwrap();
+	let value = snap.get_at(b"key1", custom_timestamp).await.unwrap();
 	assert_eq!(value, Some(Vec::from(b"value1")));
 
 	// Test delete_at with timestamp (uses hard delete)
@@ -719,16 +734,16 @@ async fn test_timestamp_via_batch_set_at() {
 	// With HARD_DELETE barrier semantics, all historical versions become inaccessible
 	// after a hard delete. Both queries should return None.
 	let snap = tree.new_snapshot();
-	let value_before = snap.get_at(b"key1", custom_timestamp).unwrap();
+	let value_before = snap.get_at(b"key1", custom_timestamp).await.unwrap();
 	assert_eq!(value_before, None); // Key was hard-deleted, all versions inaccessible
 
-	let value_after = snap.get_at(b"key1", delete_timestamp).unwrap();
+	let value_after = snap.get_at(b"key1", delete_timestamp).await.unwrap();
 	assert_eq!(value_after, None);
 }
 
 #[test(tokio::test)]
 async fn test_commit_timestamp_consistency() {
-	let (tree, _temp_dir) = create_versioned_store();
+	let (tree, _temp_dir) = create_versioned_store().await;
 
 	// Set multiple values in a single batch
 	{
@@ -743,11 +758,11 @@ async fn test_commit_timestamp_consistency() {
 	{
 		let snap = tree.new_snapshot();
 		let mut iter1 = snap.history_iter(Some(b"key1"), Some(b"key2"), false, None, None).unwrap();
-		let versions1 = collect_history_all(&mut iter1).unwrap();
+		let versions1 = collect_history_all(&mut iter1).await.unwrap();
 		let mut iter2 = snap.history_iter(Some(b"key2"), Some(b"key3"), false, None, None).unwrap();
-		let versions2 = collect_history_all(&mut iter2).unwrap();
+		let versions2 = collect_history_all(&mut iter2).await.unwrap();
 		let mut iter3 = snap.history_iter(Some(b"key3"), Some(b"key4"), false, None, None).unwrap();
-		let versions3 = collect_history_all(&mut iter3).unwrap();
+		let versions3 = collect_history_all(&mut iter3).await.unwrap();
 
 		assert_eq!(versions1.len(), 1);
 		assert_eq!(versions2.len(), 1);
@@ -772,11 +787,11 @@ async fn test_commit_timestamp_consistency() {
 
 	let snap = tree.new_snapshot();
 	let mut iter4 = snap.history_iter(Some(b"key4"), Some(b"key5"), false, None, None).unwrap();
-	let versions4 = collect_history_all(&mut iter4).unwrap();
+	let versions4 = collect_history_all(&mut iter4).await.unwrap();
 	let mut iter5 = snap.history_iter(Some(b"key5"), Some(b"key6"), false, None, None).unwrap();
-	let versions5 = collect_history_all(&mut iter5).unwrap();
+	let versions5 = collect_history_all(&mut iter5).await.unwrap();
 	let mut iter6 = snap.history_iter(Some(b"key6"), Some(b"key7"), false, None, None).unwrap();
-	let versions6 = collect_history_all(&mut iter6).unwrap();
+	let versions6 = collect_history_all(&mut iter6).await.unwrap();
 
 	assert_eq!(versions4.len(), 1);
 	assert_eq!(versions5.len(), 1);
@@ -798,7 +813,7 @@ async fn test_commit_timestamp_consistency() {
 
 #[test(tokio::test)]
 async fn test_range_at_version() {
-	let (tree, _temp_dir) = create_versioned_store();
+	let (tree, _temp_dir) = create_versioned_store().await;
 
 	let ts1 = 100;
 	let ts2 = 200;
@@ -823,7 +838,7 @@ async fn test_range_at_version() {
 	// Test point-in-time query at first timestamp
 	let snap = tree.new_snapshot();
 	let mut iter = snap.history_iter(Some(b"key1"), Some(b"key5"), false, None, None).unwrap();
-	let scan_at_ts1 = point_in_time_from_history(&mut iter, ts1).unwrap();
+	let scan_at_ts1 = point_in_time_from_history(&mut iter, ts1).await.unwrap();
 	assert_eq!(scan_at_ts1.len(), 3);
 
 	let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
@@ -843,7 +858,7 @@ async fn test_range_at_version() {
 
 	// Test point-in-time query at second timestamp
 	let mut iter = snap.history_iter(Some(b"key1"), Some(b"key5"), false, None, None).unwrap();
-	let scan_at_ts2 = point_in_time_from_history(&mut iter, ts2).unwrap();
+	let scan_at_ts2 = point_in_time_from_history(&mut iter, ts2).await.unwrap();
 	assert_eq!(scan_at_ts2.len(), 4);
 
 	let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
@@ -864,7 +879,7 @@ async fn test_range_at_version() {
 
 	// Test with specific key range
 	let mut iter = snap.history_iter(Some(b"key2"), Some(b"key4"), false, None, None).unwrap();
-	let scan_range = point_in_time_from_history(&mut iter, ts2).unwrap();
+	let scan_range = point_in_time_from_history(&mut iter, ts2).await.unwrap();
 	assert_eq!(scan_range.len(), 2);
 	let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 	for (key, _) in &scan_range {
@@ -876,7 +891,7 @@ async fn test_range_at_version() {
 
 #[test(tokio::test)]
 async fn test_versioned_range_bounds_edge_cases() {
-	let (tree, _temp_dir) = create_versioned_store();
+	let (tree, _temp_dir) = create_versioned_store().await;
 
 	let ts = 100;
 
@@ -895,7 +910,7 @@ async fn test_versioned_range_bounds_edge_cases() {
 
 	// Test 1: Range includes exact start key (b to e should include b, c, d but not e)
 	let mut iter = snap.history_iter(Some(b"b"), Some(b"e"), false, None, None).unwrap();
-	let scan1 = point_in_time_from_history(&mut iter, ts).unwrap();
+	let scan1 = point_in_time_from_history(&mut iter, ts).await.unwrap();
 	assert_eq!(scan1.len(), 3);
 	let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 	for (key, _) in &scan1 {
@@ -908,7 +923,7 @@ async fn test_versioned_range_bounds_edge_cases() {
 
 	// Test 2: Range with start key not in data
 	let mut iter = snap.history_iter(Some(b"aa"), Some(b"cc"), false, None, None).unwrap();
-	let scan2 = point_in_time_from_history(&mut iter, ts).unwrap();
+	let scan2 = point_in_time_from_history(&mut iter, ts).await.unwrap();
 	assert_eq!(scan2.len(), 2);
 	let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 	for (key, _) in &scan2 {
@@ -920,7 +935,7 @@ async fn test_versioned_range_bounds_edge_cases() {
 
 	// Test 3: Range with end key not in data
 	let mut iter = snap.history_iter(Some(b"b"), Some(b"dd"), false, None, None).unwrap();
-	let scan3 = point_in_time_from_history(&mut iter, ts).unwrap();
+	let scan3 = point_in_time_from_history(&mut iter, ts).await.unwrap();
 	assert_eq!(scan3.len(), 3);
 	let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
 	for (key, _) in &scan3 {
@@ -932,12 +947,12 @@ async fn test_versioned_range_bounds_edge_cases() {
 
 	// Test 4: Empty range (start >= end should return empty)
 	let mut iter = snap.history_iter(Some(b"d"), Some(b"b"), false, None, None).unwrap();
-	let scan4 = point_in_time_from_history(&mut iter, ts).unwrap();
+	let scan4 = point_in_time_from_history(&mut iter, ts).await.unwrap();
 	assert_eq!(scan4.len(), 0);
 
 	// Test 5: Single key range (b to c should include only b)
 	let mut iter = snap.history_iter(Some(b"b"), Some(b"c"), false, None, None).unwrap();
-	let scan5 = point_in_time_from_history(&mut iter, ts).unwrap();
+	let scan5 = point_in_time_from_history(&mut iter, ts).await.unwrap();
 	assert_eq!(scan5.len(), 1);
 	assert_eq!(scan5[0].0.as_slice(), b"b");
 }
@@ -947,7 +962,7 @@ async fn test_range_at_version_with_deletes() {
 	let temp_dir = create_temp_directory();
 	let opts = Options::new().with_path(temp_dir.path().to_path_buf()).with_versioning(true, 0);
 	let clock = std::sync::Arc::clone(&opts.clock);
-	let tree = TreeBuilder::with_options(opts).build().unwrap();
+	let tree = TreeBuilder::with_options(opts).build().await.unwrap();
 
 	// Insert data
 	{
@@ -963,7 +978,7 @@ async fn test_range_at_version_with_deletes() {
 		// Query at this point should show all three keys
 		let snap = tree.new_snapshot();
 		let mut iter = snap.history_iter(Some(b"key1"), Some(b"key4"), true, None, None).unwrap();
-		let scan_before = point_in_time_from_history(&mut iter, ts_after_insert).unwrap();
+		let scan_before = point_in_time_from_history(&mut iter, ts_after_insert).await.unwrap();
 		assert_eq!(scan_before.len(), 3, "Should have all 3 keys before deletes");
 	}
 
@@ -976,12 +991,12 @@ async fn test_range_at_version_with_deletes() {
 
 	// Verify key2 is completely gone (hard deleted)
 	let mut iter = snap.history_iter(Some(b"key2"), Some(b"key3"), false, None, None).unwrap();
-	let versions2 = collect_history_all(&mut iter).unwrap();
+	let versions2 = collect_history_all(&mut iter).await.unwrap();
 	assert_eq!(versions2.len(), 0, "Hard deleted key should have no versions");
 
 	// Perform scan at timestamp after deletes
 	let mut iter = snap.history_iter(Some(b"key1"), Some(b"key4"), true, None, None).unwrap();
-	let scan_result = point_in_time_from_history(&mut iter, ts_after_deletes).unwrap();
+	let scan_result = point_in_time_from_history(&mut iter, ts_after_deletes).await.unwrap();
 	assert_eq!(scan_result.len(), 2, "Should have 2 keys after hard delete");
 
 	let mut found_keys: std::collections::HashSet<&[u8]> = std::collections::HashSet::new();
@@ -995,7 +1010,7 @@ async fn test_range_at_version_with_deletes() {
 
 #[test(tokio::test)]
 async fn test_scan_all_versions() {
-	let (tree, _temp_dir) = create_versioned_store();
+	let (tree, _temp_dir) = create_versioned_store().await;
 
 	// Insert data at different times
 	{
@@ -1022,7 +1037,7 @@ async fn test_scan_all_versions() {
 	// Test using history_iter() to get all versions
 	let snap = tree.new_snapshot();
 	let mut iter = snap.history_iter(Some(b"key1"), Some(b"key5"), false, None, None).unwrap();
-	let all_versions = collect_history_all(&mut iter).unwrap();
+	let all_versions = collect_history_all(&mut iter).await.unwrap();
 
 	assert_eq!(all_versions.len(), 6);
 
@@ -1058,18 +1073,18 @@ async fn test_scan_all_versions() {
 
 	// Test with specific key range
 	let mut iter = snap.history_iter(Some(b"key2"), Some(b"key4"), false, None, None).unwrap();
-	let range_versions = collect_history_all(&mut iter).unwrap();
+	let range_versions = collect_history_all(&mut iter).await.unwrap();
 	assert_eq!(range_versions.len(), 3); // 2 versions of key2 + 1 version of key3
 }
 
 #[test(tokio::test)]
 async fn test_versioned_queries_without_versioning() {
-	let (store, _temp_dir) = create_store(); // Non-versioned store
+	let (store, _temp_dir) = create_store().await; // Non-versioned store
 
 	// Test that versioned queries fail when versioning is disabled
 	let snap = store.new_snapshot();
 	assert!(snap.history_iter(Some(b"key1"), Some(b"key3"), false, None, None).is_err());
-	assert!(snap.get_at(b"key1", 123456789).is_err());
+	assert!(snap.get_at(b"key1", 123456789).await.is_err());
 }
 
 // Version management tests
@@ -1080,18 +1095,18 @@ mod version_tests {
 
 	use super::*;
 
-	fn create_tree() -> (Tree, TempDir) {
-		create_versioned_store()
+	async fn create_tree() -> (Tree, TempDir) {
+		create_versioned_store().await
 	}
 
 	/// Helper to collect all versions using history_iter() (returns sorted by timestamp ascending)
-	fn scan_all_versions_via_history(
+	async fn scan_all_versions_via_history(
 		snap: &crate::Snapshot,
 		start: &[u8],
 		end: &[u8],
 	) -> crate::Result<Vec<(Key, Value, u64, bool)>> {
 		let mut iter = snap.history_iter(Some(start), Some(end), false, None, None)?;
-		let mut results = collect_history_all(&mut iter)?;
+		let mut results = collect_history_all(&mut iter).await?;
 		// Sort by (key, timestamp) ascending
 		results.sort_by(|a, b| match a.0.cmp(&b.0) {
 			std::cmp::Ordering::Equal => a.2.cmp(&b.2),
@@ -1102,7 +1117,7 @@ mod version_tests {
 
 	#[test(tokio::test)]
 	async fn test_insert_multiple_versions_in_same_tx() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let key = Vec::from("key1");
 
 		// Insert multiple versions of the same key
@@ -1116,7 +1131,7 @@ mod version_tests {
 		let snap = store.new_snapshot();
 		let mut end_key = key.clone();
 		end_key.push(0);
-		let results = scan_all_versions_via_history(&snap, key.as_ref(), &end_key).unwrap();
+		let results = scan_all_versions_via_history(&snap, key.as_ref(), &end_key).await.unwrap();
 
 		assert_eq!(results.len(), values.len());
 		for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
@@ -1129,7 +1144,7 @@ mod version_tests {
 
 	#[test(tokio::test)]
 	async fn test_same_key_multiple_sets_in_single_batch_creates_versions() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let key = vec![218u8];
 
 		// Single batch: set same key twice with different values
@@ -1147,7 +1162,7 @@ mod version_tests {
 		end_key.push(0);
 
 		// Forward iteration: should see both versions (each set creates a version)
-		let results = scan_all_versions_via_history(&snap, &key, &end_key).unwrap();
+		let results = scan_all_versions_via_history(&snap, &key, &end_key).await.unwrap();
 		assert_eq!(results.len(), 2, "Expected two versions (no deduplication in batch)");
 		assert_eq!(results[0].0, key, "Key mismatch");
 		assert_eq!(results[1].0, key, "Key mismatch");
@@ -1159,7 +1174,7 @@ mod version_tests {
 
 	#[test(tokio::test)]
 	async fn test_scan_all_versions_single_key_multiple_versions() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let key = Vec::from("key1");
 
 		let values = [Vec::from("value1"), Vec::from("value2"), Vec::from("value3")];
@@ -1172,7 +1187,7 @@ mod version_tests {
 		let snap = store.new_snapshot();
 		let mut end_key = key.clone();
 		end_key.push(0);
-		let results = scan_all_versions_via_history(&snap, key.as_ref(), &end_key).unwrap();
+		let results = scan_all_versions_via_history(&snap, key.as_ref(), &end_key).await.unwrap();
 
 		assert_eq!(results.len(), values.len());
 		for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
@@ -1185,7 +1200,7 @@ mod version_tests {
 
 	#[test(tokio::test)]
 	async fn test_scan_all_versions_multiple_keys_single_version_each() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
 		let value = Vec::from("value1");
 
@@ -1197,7 +1212,9 @@ mod version_tests {
 		let mut end_key = keys.last().unwrap().clone();
 		end_key.push(0);
 		let results =
-			scan_all_versions_via_history(&snap, keys.first().unwrap().as_ref(), &end_key).unwrap();
+			scan_all_versions_via_history(&snap, keys.first().unwrap().as_ref(), &end_key)
+				.await
+				.unwrap();
 
 		assert_eq!(results.len(), keys.len());
 		for (i, (k, v, version, is_deleted)) in results.iter().enumerate() {
@@ -1210,7 +1227,7 @@ mod version_tests {
 
 	#[test(tokio::test)]
 	async fn test_scan_all_versions_multiple_keys_multiple_versions_each() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
 		let values = [Vec::from("value1"), Vec::from("value2"), Vec::from("value3")];
 
@@ -1225,7 +1242,9 @@ mod version_tests {
 		let mut end_key = keys.last().unwrap().clone();
 		end_key.push(0);
 		let results =
-			scan_all_versions_via_history(&snap, keys.first().unwrap().as_ref(), &end_key).unwrap();
+			scan_all_versions_via_history(&snap, keys.first().unwrap().as_ref(), &end_key)
+				.await
+				.unwrap();
 
 		let mut expected_results = Vec::new();
 		for key in &keys {
@@ -1247,7 +1266,7 @@ mod version_tests {
 
 	#[test(tokio::test)]
 	async fn test_scan_all_versions_range_boundaries() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
 		let value = Vec::from("value1");
 
@@ -1259,13 +1278,15 @@ mod version_tests {
 		let mut end_key = keys.last().unwrap().clone();
 		end_key.push(0);
 		let results =
-			scan_all_versions_via_history(&snap, keys.first().unwrap().as_ref(), &end_key).unwrap();
+			scan_all_versions_via_history(&snap, keys.first().unwrap().as_ref(), &end_key)
+				.await
+				.unwrap();
 		assert_eq!(results.len(), keys.len());
 	}
 
 	#[test(tokio::test)]
 	async fn test_scan_all_versions_with_limit() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
 		let value = Vec::from("value1");
 
@@ -1277,14 +1298,16 @@ mod version_tests {
 		let mut end_key = keys.last().unwrap().clone();
 		end_key.push(0);
 		let results =
-			scan_all_versions_via_history(&snap, keys.first().unwrap().as_ref(), &end_key).unwrap();
+			scan_all_versions_via_history(&snap, keys.first().unwrap().as_ref(), &end_key)
+				.await
+				.unwrap();
 
 		assert!(results.len() >= 2);
 	}
 
 	#[test(tokio::test)]
 	async fn test_scan_all_versions_single_key_single_version() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let key = Vec::from("key1");
 		let value = Vec::from("value1");
 
@@ -1293,7 +1316,7 @@ mod version_tests {
 		let snap = store.new_snapshot();
 		let mut end_key = key.clone();
 		end_key.push(0);
-		let results = scan_all_versions_via_history(&snap, key.as_ref(), &end_key).unwrap();
+		let results = scan_all_versions_via_history(&snap, key.as_ref(), &end_key).await.unwrap();
 
 		assert_eq!(results.len(), 1);
 		let (k, v, version, is_deleted) = &results[0];
@@ -1305,7 +1328,7 @@ mod version_tests {
 
 	#[test(tokio::test)]
 	async fn test_scan_all_versions_with_limit_with_multiple_versions_per_key() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let keys = vec![Vec::from("key1"), Vec::from("key2"), Vec::from("key3")];
 		let values = [Vec::from("value1"), Vec::from("value2"), Vec::from("value3")];
 
@@ -1320,7 +1343,9 @@ mod version_tests {
 		let mut end_key = keys.last().unwrap().clone();
 		end_key.push(0);
 		let all_results =
-			scan_all_versions_via_history(&snap, keys.first().unwrap().as_ref(), &end_key).unwrap();
+			scan_all_versions_via_history(&snap, keys.first().unwrap().as_ref(), &end_key)
+				.await
+				.unwrap();
 
 		assert_eq!(all_results.len(), 9);
 
@@ -1340,7 +1365,7 @@ mod version_tests {
 
 	#[test(tokio::test)]
 	async fn test_scan_all_versions_with_subsets() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let keys = vec![
 			Vec::from("key1"),
 			Vec::from("key2"),
@@ -1371,7 +1396,7 @@ mod version_tests {
 			let snap = store.new_snapshot();
 			let mut end_key = subset.1.clone();
 			end_key.push(0);
-			let results = scan_all_versions_via_history(&snap, subset.0, &end_key).unwrap();
+			let results = scan_all_versions_via_history(&snap, subset.0, &end_key).await.unwrap();
 
 			let unique_keys: HashSet<_> = results.iter().map(|(k, _, _, _)| k.clone()).collect();
 
@@ -1391,7 +1416,7 @@ mod version_tests {
 
 	#[test(tokio::test)]
 	async fn test_scan_all_versions_range_bounds() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 
 		{
 			let mut batch = store.new_batch();
@@ -1407,27 +1432,30 @@ mod version_tests {
 
 		let snap = store.new_snapshot();
 		let results =
-			scan_all_versions_via_history(&snap, &b""[..], &b"\xff\xff\xff\xff"[..]).unwrap();
+			scan_all_versions_via_history(&snap, &b""[..], &b"\xff\xff\xff\xff"[..]).await.unwrap();
 		assert_eq!(results.len(), 7);
 
-		let results =
-			scan_all_versions_via_history(&snap, &b"key2"[..], &b"\xff\xff\xff\xff"[..]).unwrap();
+		let results = scan_all_versions_via_history(&snap, &b"key2"[..], &b"\xff\xff\xff\xff"[..])
+			.await
+			.unwrap();
 		assert_eq!(results.len(), 5);
 
 		let results =
 			scan_all_versions_via_history(&snap, &b"key2\x00"[..], &b"\xff\xff\xff\xff"[..])
+				.await
 				.unwrap();
 		assert_eq!(results.len(), 3);
 
 		let results =
 			scan_all_versions_via_history(&snap, &b"key5\x00"[..], &b"\xff\xff\xff\xff"[..])
+				.await
 				.unwrap();
 		assert_eq!(results.len(), 0);
 	}
 
 	#[test(tokio::test)]
 	async fn test_scan_all_versions_with_batches() {
-		let (store, _tmp_dir) = create_tree();
+		let (store, _tmp_dir) = create_tree().await;
 		let keys = [
 			Vec::from("key1"),
 			Vec::from("key2"),
@@ -1452,7 +1480,7 @@ mod version_tests {
 
 		let snap = store.new_snapshot();
 		let all_results =
-			scan_all_versions_via_history(&snap, &b""[..], &b"\xff\xff\xff\xff"[..]).unwrap();
+			scan_all_versions_via_history(&snap, &b""[..], &b"\xff\xff\xff\xff"[..]).await.unwrap();
 
 		assert_eq!(all_results.len(), 12);
 
@@ -1484,7 +1512,7 @@ async fn test_versioned_range_survives_memtable_flush() {
 		.with_path(temp_dir.path().to_path_buf())
 		.with_versioning(true, 0)
 		.with_max_memtable_size(4 * 1024); // Small memtable to trigger flush
-	let store = TreeBuilder::with_options(opts).build().unwrap();
+	let store = TreeBuilder::with_options(opts).build().await.unwrap();
 
 	// Insert key1 three times with different values
 	for i in 1..=3 {
@@ -1496,7 +1524,7 @@ async fn test_versioned_range_survives_memtable_flush() {
 	{
 		let snap = store.new_snapshot();
 		let mut iter = snap.history_iter(Some(b"key1"), Some(b"key2"), false, None, None).unwrap();
-		let mut results = collect_history_all(&mut iter).unwrap();
+		let mut results = collect_history_all(&mut iter).await.unwrap();
 		results.sort_by_key(|a| a.2);
 		assert_eq!(results.len(), 3, "Should have 3 versions before flush");
 		assert_eq!(results[0].1, b"v1");
@@ -1514,7 +1542,7 @@ async fn test_versioned_range_survives_memtable_flush() {
 	// Query versions AFTER flush - this is the critical test
 	let snap = store.new_snapshot();
 	let mut iter = snap.history_iter(Some(b"key1"), Some(b"key2"), false, None, None).unwrap();
-	let mut results = collect_history_all(&mut iter).unwrap();
+	let mut results = collect_history_all(&mut iter).await.unwrap();
 	results.sort_by_key(|a| a.2);
 
 	assert_eq!(results.len(), 3, "All 3 versions should survive memtable flush");
@@ -1530,7 +1558,7 @@ async fn test_versioned_range_survives_memtable_flush() {
 /// Test 1: Forward-to-backward direction switch
 #[test(tokio::test)]
 async fn test_direction_switch_forward_to_backward() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	{
 		let mut batch = store.new_batch();
@@ -1545,28 +1573,28 @@ async fn test_direction_switch_forward_to_backward() {
 	let snap = store.new_snapshot();
 	let mut iter = snap.range(Some(b"a"), Some(b"f")).unwrap();
 
-	assert!(iter.seek_first().unwrap(), "seek_first should succeed");
+	assert!(iter.seek_first().await.unwrap(), "seek_first should succeed");
 	assert_eq!(iter.key().user_key(), b"a");
 
-	assert!(iter.next().unwrap());
+	assert!(iter.next().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"b");
 
-	assert!(iter.next().unwrap());
+	assert!(iter.next().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"c");
 
-	assert!(iter.prev().unwrap(), "prev from 'c' should succeed");
+	assert!(iter.prev().await.unwrap(), "prev from 'c' should succeed");
 	assert_eq!(iter.key().user_key(), b"b", "After prev() from 'c', should be at 'b'");
 
-	assert!(iter.prev().unwrap());
+	assert!(iter.prev().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"a");
 
-	assert!(!iter.prev().unwrap(), "prev from 'a' should return false");
+	assert!(!iter.prev().await.unwrap(), "prev from 'a' should return false");
 }
 
 /// Test 2: Forward-to-backward at end of range
 #[test(tokio::test)]
 async fn test_direction_switch_forward_to_backward_at_end() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	{
 		let mut batch = store.new_batch();
@@ -1581,20 +1609,20 @@ async fn test_direction_switch_forward_to_backward_at_end() {
 	let snap = store.new_snapshot();
 	let mut iter = snap.range(Some(b"a"), Some(b"f")).unwrap();
 
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	while iter.valid() && iter.key().user_key() != b"e" {
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 	assert_eq!(iter.key().user_key(), b"e");
 
-	assert!(iter.prev().unwrap());
+	assert!(iter.prev().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"d", "After prev() from 'e', should be at 'd'");
 }
 
 /// Test 3: Backward-to-forward direction switch
 #[test(tokio::test)]
 async fn test_direction_switch_backward_to_forward() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	{
 		let mut batch = store.new_batch();
@@ -1609,28 +1637,28 @@ async fn test_direction_switch_backward_to_forward() {
 	let snap = store.new_snapshot();
 	let mut iter = snap.range(Some(b"a"), Some(b"f")).unwrap();
 
-	assert!(iter.seek_last().unwrap());
+	assert!(iter.seek_last().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"e");
 
-	assert!(iter.prev().unwrap());
+	assert!(iter.prev().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"d");
 
-	assert!(iter.prev().unwrap());
+	assert!(iter.prev().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"c");
 
-	assert!(iter.next().unwrap());
+	assert!(iter.next().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"d");
 
-	assert!(iter.next().unwrap());
+	assert!(iter.next().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"e");
 
-	assert!(!iter.next().unwrap(), "next from 'e' should return false");
+	assert!(!iter.next().await.unwrap(), "next from 'e' should return false");
 }
 
 /// Test 4: Multiple direction switches
 #[test(tokio::test)]
 async fn test_multiple_direction_switches() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	{
 		let mut batch = store.new_batch();
@@ -1645,35 +1673,35 @@ async fn test_multiple_direction_switches() {
 	let snap = store.new_snapshot();
 	let mut iter = snap.range(Some(b"a"), Some(b"f")).unwrap();
 
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"a");
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"b");
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"c");
 
-	assert!(iter.prev().unwrap());
+	assert!(iter.prev().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"b");
 
-	assert!(iter.next().unwrap());
+	assert!(iter.next().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"c");
 
-	assert!(iter.next().unwrap());
+	assert!(iter.next().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"d");
-	assert!(iter.next().unwrap());
+	assert!(iter.next().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"e");
 
-	assert!(iter.prev().unwrap());
+	assert!(iter.prev().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"d");
 
-	assert!(iter.next().unwrap());
+	assert!(iter.next().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"e");
 }
 
 /// Test 5: Direction switch after seek
 #[test(tokio::test)]
 async fn test_direction_switch_after_seek() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	{
 		let mut batch = store.new_batch();
@@ -1688,9 +1716,9 @@ async fn test_direction_switch_after_seek() {
 	let snap = store.new_snapshot();
 	let mut iter = snap.range(Some(b"a"), Some(b"f")).unwrap();
 
-	assert!(iter.seek(b"c").unwrap());
+	assert!(iter.seek(b"c").await.unwrap());
 	assert_eq!(iter.key().user_key(), b"c");
 
-	assert!(iter.prev().unwrap());
+	assert!(iter.prev().await.unwrap());
 	assert_eq!(iter.key().user_key(), b"b", "After prev() from seek('c'), should be at 'b'");
 }

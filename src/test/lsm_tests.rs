@@ -8,7 +8,10 @@ use crate::compaction::leveled::Strategy;
 use crate::levels::LevelManifest;
 use crate::lsm::{Core, CoreInner};
 use crate::manifest::validate_wal_log_number;
-use crate::test::collect_transaction_all;
+use crate::paths::PathResolver;
+use crate::sstable::sst_id::SstId;
+use crate::tablestore::TableStore;
+use crate::test::{collect_transaction_all, collect_transaction_reverse, test_sst_id};
 use crate::wal::list_segment_ids;
 use crate::{
 	Error,
@@ -24,6 +27,15 @@ use crate::{
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
+}
+
+/// Creates a TableStore from Options, matching how CoreInner creates one.
+fn create_table_store(opts: &Options) -> Arc<TableStore> {
+	Arc::new(TableStore::new(
+		Arc::clone(&opts.object_store),
+		PathResolver::new(opts.object_store_root.as_str()),
+		Arc::clone(&opts.block_cache),
+	))
 }
 
 /// Creates test options with common defaults, allowing customization of
@@ -50,7 +62,7 @@ async fn test_tree_basic() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
-	let tree = Tree::new(create_test_options(path.clone(), |_| {})).unwrap();
+	let tree = Tree::new(create_test_options(path.clone(), |_| {})).await.unwrap();
 
 	// Insert a key-value pair
 	let key = "hello";
@@ -61,7 +73,7 @@ async fn test_tree_basic() {
 
 	// Read back the key-value pair
 
-	let result = tree.get(key.as_bytes()).unwrap().unwrap();
+	let result = tree.get(key.as_bytes()).await.unwrap().unwrap();
 	assert_eq!(result, value.as_bytes().to_vec());
 }
 
@@ -75,7 +87,7 @@ async fn test_memtable_flush() {
 	let key = "hello";
 	let values = ["world", "universe", "everyone", "planet"];
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Insert the same key multiple times with different values
 	for value in values.iter() {
@@ -86,12 +98,12 @@ async fn test_memtable_flush() {
 	}
 
 	// Ensure the active memtable is flushed to disk
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	{
 		// Read back the key-value pair
 
-		let result = tree.get(key.as_bytes()).unwrap().unwrap();
+		let result = tree.get(key.as_bytes()).await.unwrap().unwrap();
 		let expected_value = values.last().unwrap();
 		assert_eq!(result, expected_value.as_bytes().to_vec());
 	}
@@ -107,7 +119,7 @@ async fn test_memtable_flush_with_delete() {
 	let key = "hello";
 	let values = ["world", "universe", "everyone"];
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Insert the same key multiple times with different values
 	for value in values.iter() {
@@ -125,12 +137,12 @@ async fn test_memtable_flush_with_delete() {
 	}
 
 	// Ensure the active memtable is flushed to disk
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	{
 		// Read back the key-value pair
 
-		let result = tree.get(key.as_bytes()).unwrap();
+		let result = tree.get(key.as_bytes()).await.unwrap();
 		assert!(result.is_none(), "Expected key to be deleted");
 	}
 }
@@ -143,7 +155,7 @@ async fn test_memtable_flush_with_multiple_keys_and_updates() {
 	// Set a reasonable memtable size to trigger multiple flushes
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Number of keys to insert
 	const KEY_COUNT: usize = 10001;
@@ -172,11 +184,11 @@ async fn test_memtable_flush_with_multiple_keys_and_updates() {
 	}
 
 	// Final flush to ensure all data is on disk
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Verify all keys have their final values
 	for (key, expected_value) in expected_values {
-		let result = tree.get(key.as_bytes()).unwrap().unwrap();
+		let result = tree.get(key.as_bytes()).await.unwrap().unwrap();
 		assert_eq!(
 			result,
 			expected_value.as_bytes().to_vec(),
@@ -207,7 +219,7 @@ async fn test_persistence() {
 
 	// Step 1: Insert data and close the store
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut values = Vec::with_capacity(KEY_COUNT);
 
 		// Insert each key with multiple updates
@@ -229,7 +241,7 @@ async fn test_persistence() {
 		}
 
 		// Final flush to ensure all data is on disk
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Store values for later verification
 		expected_values = values;
@@ -244,7 +256,7 @@ async fn test_persistence() {
 
 	// Step 2: Reopen the store and verify data
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Verify L0 has tables after reopening
 		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
@@ -252,7 +264,7 @@ async fn test_persistence() {
 
 		// Verify all keys have their final values
 		for (key, expected_value) in expected_values.iter() {
-			let result = tree.get(key.as_bytes()).unwrap();
+			let result = tree.get(key.as_bytes()).await.unwrap();
 
 			assert!(result.is_some(), "Key '{key}' not found after reopening store");
 
@@ -277,7 +289,7 @@ async fn test_checkpoint_functionality() {
 	let opts = create_small_memtable_options(path.clone());
 
 	// Create initial data
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Insert some test data
 	for i in 0..10 {
@@ -290,11 +302,11 @@ async fn test_checkpoint_functionality() {
 	}
 
 	// Force flush to ensure data is on disk
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Create checkpoint
 	let checkpoint_dir = temp_dir.path().join("checkpoint");
-	let metadata = tree.create_checkpoint(&checkpoint_dir).unwrap();
+	let metadata = tree.create_checkpoint(&checkpoint_dir).await.unwrap();
 
 	// Verify checkpoint metadata and structure
 	assert!(metadata.timestamp > 0);
@@ -319,25 +331,25 @@ async fn test_checkpoint_functionality() {
 	}
 
 	// Force flush to ensure the new data is also on disk
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Verify all data exists before restore
 	for i in 0..15 {
 		let key = format!("key_{i:03}");
 
-		let result = tree.get(key.as_bytes()).unwrap();
+		let result = tree.get(key.as_bytes()).await.unwrap();
 		assert!(result.is_some(), "Key '{key}' should exist before restore");
 	}
 
 	// Restore from checkpoint
-	tree.restore_from_checkpoint(&checkpoint_dir).unwrap();
+	tree.restore_from_checkpoint(&checkpoint_dir).await.unwrap();
 
 	// Verify data is restored to checkpoint state (keys 0-9 exist, 10-14 don't)
 	for i in 0..10 {
 		let key = format!("key_{i:03}");
 		let expected_value = format!("value_{i:03}");
 
-		let result = tree.get(key.as_bytes()).unwrap();
+		let result = tree.get(key.as_bytes()).await.unwrap();
 		assert!(result.is_some(), "Key '{key}' should exist after restore");
 		assert_eq!(result.unwrap(), expected_value.as_bytes().to_vec());
 	}
@@ -346,7 +358,7 @@ async fn test_checkpoint_functionality() {
 	for i in 10..15 {
 		let key = format!("key_{i:03}");
 
-		let result = tree.get(key.as_bytes()).unwrap();
+		let result = tree.get(key.as_bytes()).await.unwrap();
 		assert!(result.is_none(), "Key '{key}' should not exist after restore");
 	}
 }
@@ -359,7 +371,7 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 	let opts = create_small_memtable_options(path.clone());
 
 	// Create initial data and checkpoint
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Insert initial data
 	for i in 0..5 {
@@ -372,11 +384,11 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 	}
 
 	// Force flush to ensure data is on disk
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Create checkpoint
 	let checkpoint_dir = temp_dir.path().join("checkpoint");
-	let metadata = tree.create_checkpoint(&checkpoint_dir).unwrap();
+	let metadata = tree.create_checkpoint(&checkpoint_dir).await.unwrap();
 	assert_eq!(metadata.sequence_number, 5);
 
 	// Insert NEW data that should be discarded during restore
@@ -393,7 +405,7 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 	for i in 0..5 {
 		let key = format!("key_{i:03}");
 
-		let result = tree.get(key.as_bytes()).unwrap().unwrap();
+		let result = tree.get(key.as_bytes()).await.unwrap().unwrap();
 		assert_eq!(
 			result,
 			format!("pending_value_{i:03}").as_bytes().to_vec(),
@@ -402,14 +414,14 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 	}
 
 	// Restore from checkpoint - this should discard pending writes
-	tree.restore_from_checkpoint(&checkpoint_dir).unwrap();
+	tree.restore_from_checkpoint(&checkpoint_dir).await.unwrap();
 
 	// Verify data is restored to checkpoint state (NOT the pending writes)
 	for i in 0..5 {
 		let key = format!("key_{i:03}");
 		let expected_value = format!("checkpoint_value_{i:03}");
 
-		let result = tree.get(key.as_bytes()).unwrap().unwrap();
+		let result = tree.get(key.as_bytes()).await.unwrap().unwrap();
 		assert_eq!(
 			result,
 			expected_value.as_bytes().to_vec(),
@@ -425,7 +437,7 @@ async fn test_simple_range_seek() {
 
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Insert simple keys
 	let keys = ["a", "b", "c", "d", "e"];
@@ -440,6 +452,7 @@ async fn test_simple_range_seek() {
 	let range_before_flush = collect_transaction_all(
 		&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	// Should return keys "a", "b", "c" ([a, d) range)
@@ -455,13 +468,14 @@ async fn test_simple_range_seek() {
 	}
 
 	// Force flush to ensure data is on disk
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Test range scan AFTER flushing (should work from SSTables)
 
 	let range_after_flush = collect_transaction_all(
 		&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	// Should return the same keys after flush
@@ -478,7 +492,7 @@ async fn test_simple_range_seek() {
 
 	// Test individual gets
 	for key in ["a", "b", "c"].iter() {
-		let result = tree.get(key.as_bytes()).unwrap();
+		let result = tree.get(key.as_bytes()).await.unwrap();
 
 		assert!(result.is_some(), "Key '{key}' should be found");
 		let value = result.unwrap();
@@ -500,7 +514,7 @@ async fn test_large_range_scan() {
 
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Insert 10,000 items with zero-padded keys for consistent ordering
 	const TOTAL_ITEMS: usize = 10_000;
@@ -518,7 +532,7 @@ async fn test_large_range_scan() {
 	}
 
 	// Force flush to ensure all data is on disk
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Test 1: Full range scan - should return all 10k items in order
 	let start_key = "key_000000".as_bytes();
@@ -527,6 +541,7 @@ async fn test_large_range_scan() {
 	let range_result = collect_transaction_all(
 		&mut tree.new_snapshot().range(Some(start_key), Some(end_key)).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	assert_eq!(
@@ -560,6 +575,7 @@ async fn test_large_range_scan() {
 	let partial_result = collect_transaction_all(
 		&mut tree.new_snapshot().range(Some(partial_start), Some(partial_end)).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	assert_eq!(partial_result.len(), 100, "Partial range scan should return 100 items");
@@ -589,6 +605,7 @@ async fn test_large_range_scan() {
 	let middle_result = collect_transaction_all(
 		&mut tree.new_snapshot().range(Some(middle_start), Some(middle_end)).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	assert_eq!(middle_result.len(), 100, "Middle range scan should return 100 items");
@@ -619,6 +636,7 @@ async fn test_large_range_scan() {
 	let end_result = collect_transaction_all(
 		&mut tree.new_snapshot().range(Some(end_start), Some(end_end)).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	assert_eq!(end_result.len(), 100, "End range scan should return 100 items");
@@ -649,6 +667,7 @@ async fn test_large_range_scan() {
 	let single_result = collect_transaction_all(
 		&mut tree.new_snapshot().range(Some(single_start), Some(single_end)).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	assert_eq!(single_result.len(), 1, "Single item range scan should return 1 item");
@@ -667,6 +686,7 @@ async fn test_large_range_scan() {
 	let empty_result = collect_transaction_all(
 		&mut tree.new_snapshot().range(Some(empty_start), Some(empty_end)).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	assert_eq!(empty_result.len(), 0, "Empty range scan should return 0 items");
@@ -679,7 +699,7 @@ async fn test_range_skip_take() {
 
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	const TOTAL_ITEMS: usize = 10_000;
 	let mut expected_items = Vec::with_capacity(TOTAL_ITEMS);
@@ -695,20 +715,20 @@ async fn test_range_skip_take() {
 		tree.apply(batch, false).await.unwrap();
 	}
 
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	let start_key = "key_000000".as_bytes();
 	let end_key = "key_999999".as_bytes();
 
 	let snapshot = tree.new_snapshot();
 	let mut iter = snapshot.range(Some(start_key), Some(end_key)).unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Skip 5000 items
 	for _ in 0..5000 {
 		if !iter.valid() {
 			break;
 		}
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 	// Take 100 items
 	let mut range_result = Vec::new();
@@ -719,7 +739,7 @@ async fn test_range_skip_take() {
 		let key = iter.key().user_key().to_vec();
 		let value = iter.value().unwrap();
 		range_result.push((key, value));
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 
 	assert_eq!(
@@ -754,7 +774,7 @@ async fn test_range_skip_take_alphabetical() {
 
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	fn generate_alphabetical_key(index: usize) -> String {
 		let mut result = String::new();
@@ -783,7 +803,7 @@ async fn test_range_skip_take_alphabetical() {
 		tree.apply(batch, false).await.unwrap();
 	}
 
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	expected_items.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -792,13 +812,13 @@ async fn test_range_skip_take_alphabetical() {
 
 	let snapshot = tree.new_snapshot();
 	let mut iter = snapshot.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Skip 5000 items
 	for _ in 0..5000 {
 		if !iter.valid() {
 			break;
 		}
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 	// Take 100 items
 	let mut range_result = Vec::new();
@@ -809,7 +829,7 @@ async fn test_range_skip_take_alphabetical() {
 		let key = iter.key().user_key().to_vec();
 		let value = iter.value().unwrap();
 		range_result.push((key, value));
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 
 	assert_eq!(
@@ -844,7 +864,7 @@ async fn test_range_limit_functionality() {
 
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	const TOTAL_ITEMS: usize = 10_000;
 	let mut expected_items = Vec::with_capacity(TOTAL_ITEMS);
@@ -860,14 +880,14 @@ async fn test_range_limit_functionality() {
 		tree.apply(batch, false).await.unwrap();
 	}
 
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	let beg = [0u8].to_vec();
 	let end = [255u8].to_vec();
 
 	let snapshot = tree.new_snapshot();
 	let mut iter = snapshot.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Take 100 items
 	let mut limited_result = Vec::new();
 	for _ in 0..100 {
@@ -877,7 +897,7 @@ async fn test_range_limit_functionality() {
 		let key = iter.key().user_key().to_vec();
 		let value = iter.value().unwrap();
 		limited_result.push((key, value));
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 
 	assert_eq!(
@@ -905,7 +925,7 @@ async fn test_range_limit_functionality() {
 
 	let snapshot2 = tree.new_snapshot();
 	let mut iter = snapshot2.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Take 1000 items
 	let mut limited_result_1000 = Vec::new();
 	for _ in 0..1000 {
@@ -915,7 +935,7 @@ async fn test_range_limit_functionality() {
 		let key = iter.key().user_key().to_vec();
 		let value = iter.value().unwrap();
 		limited_result_1000.push((key, value));
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 
 	assert_eq!(
@@ -943,7 +963,7 @@ async fn test_range_limit_functionality() {
 
 	let snapshot3 = tree.new_snapshot();
 	let mut iter = snapshot3.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Take 15000 items
 	let mut limited_result_large = Vec::new();
 	for _ in 0..15000 {
@@ -953,7 +973,7 @@ async fn test_range_limit_functionality() {
 		let key = iter.key().user_key().to_vec();
 		let value = iter.value().unwrap();
 		limited_result_large.push((key, value));
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 
 	assert_eq!(
@@ -965,6 +985,7 @@ async fn test_range_limit_functionality() {
 	let unlimited_result = collect_transaction_all(
 		&mut tree.new_snapshot().range(Some(beg.as_slice()), Some(end.as_slice())).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	assert_eq!(
@@ -975,7 +996,7 @@ async fn test_range_limit_functionality() {
 
 	let snapshot4 = tree.new_snapshot();
 	let mut iter = snapshot4.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Take 1 item
 	let mut single_result = Vec::new();
 	if iter.valid() {
@@ -995,7 +1016,7 @@ async fn test_range_limit_functionality() {
 
 	let snapshot5 = tree.new_snapshot();
 	let mut iter = snapshot5.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Take 0 items (don't collect anything)
 	let zero_result: Vec<(Key, Option<Value>)> = Vec::new();
 
@@ -1009,7 +1030,7 @@ async fn test_range_limit_with_skip_take() {
 
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	const TOTAL_ITEMS: usize = 20_000;
 	let mut expected_items = Vec::with_capacity(TOTAL_ITEMS);
@@ -1025,20 +1046,20 @@ async fn test_range_limit_with_skip_take() {
 		tree.apply(batch, false).await.unwrap();
 	}
 
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	let beg = [0u8].to_vec();
 	let end = [255u8].to_vec();
 
 	let snapshot = tree.new_snapshot();
 	let mut iter = snapshot.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Skip 5000 items
 	for _ in 0..5000 {
 		if !iter.valid() {
 			break;
 		}
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 	// Take 100 items
 	let mut unlimited_range_result = Vec::new();
@@ -1049,7 +1070,7 @@ async fn test_range_limit_with_skip_take() {
 		let key = iter.key().user_key().to_vec();
 		let value = iter.value().unwrap();
 		unlimited_range_result.push((key, value));
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 
 	assert_eq!(
@@ -1080,13 +1101,13 @@ async fn test_range_limit_with_skip_take() {
 
 	let snapshot2 = tree.new_snapshot();
 	let mut iter = snapshot2.range(Some(beg.as_slice()), Some(end.as_slice())).unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	// Skip 5000 items
 	for _ in 0..5000 {
 		if !iter.valid() {
 			break;
 		}
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 	// Take 50 items
 	let mut res = Vec::new();
@@ -1097,7 +1118,7 @@ async fn test_range_limit_with_skip_take() {
 		let key = iter.key().user_key().to_vec();
 		let value = iter.value().unwrap();
 		res.push((key, value));
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 
 	assert_eq!(res.len(), 50, "Range scan followed by skip(5000).take(50) should return 50 items");
@@ -1130,7 +1151,7 @@ async fn test_compaction_with_updates_and_delete() {
 		opts.level_count = 2;
 	});
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Create 2 keys in ascending order
 	let keys = ["key-1".as_bytes(), "key-2".as_bytes()];
@@ -1141,7 +1162,7 @@ async fn test_compaction_with_updates_and_delete() {
 		let mut batch = tree.new_batch();
 		batch.set(*key, value.as_bytes()).unwrap();
 		tree.apply(batch, false).await.unwrap();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 	}
 
 	// Insert second version of each key
@@ -1150,12 +1171,12 @@ async fn test_compaction_with_updates_and_delete() {
 		let mut batch = tree.new_batch();
 		batch.set(*key, value.as_bytes()).unwrap();
 		tree.apply(batch, false).await.unwrap();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 	}
 
 	// Verify the latest values before delete
 	for (i, key) in keys.iter().enumerate() {
-		let result = tree.get(*key).unwrap();
+		let result = tree.get(*key).await.unwrap();
 		let expected = format!("value-{}-v2", i + 1);
 		assert_eq!(result, Some(expected.as_bytes().to_vec()));
 	}
@@ -1168,15 +1189,15 @@ async fn test_compaction_with_updates_and_delete() {
 	}
 
 	// Flush memtable
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Force compaction
 	let strategy = Arc::new(Strategy::default());
-	tree.compact(strategy).unwrap();
+	tree.compact(strategy).await.unwrap();
 
 	// Verify all keys are gone after compaction
 	for key in keys.iter() {
-		let result = tree.get(*key).unwrap();
+		let result = tree.get(*key).await.unwrap();
 		assert_eq!(result, None);
 	}
 }
@@ -1190,7 +1211,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		opts.level_count = 2;
 	});
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Create single key
 	let keys = ["key-1".as_bytes()];
@@ -1201,7 +1222,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let mut batch = tree.new_batch();
 		batch.set(*key, value.as_bytes()).unwrap();
 		tree.apply(batch, false).await.unwrap();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 	}
 
 	// Insert second version of each key
@@ -1210,7 +1231,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let mut batch = tree.new_batch();
 		batch.set(*key, value.as_bytes()).unwrap();
 		tree.apply(batch, false).await.unwrap();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 	}
 
 	// Insert third version of each key
@@ -1219,7 +1240,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let mut batch = tree.new_batch();
 		batch.set(*key, value.as_bytes()).unwrap();
 		tree.apply(batch, false).await.unwrap();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 	}
 
 	// Insert fourth version of each key
@@ -1228,12 +1249,12 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let mut batch = tree.new_batch();
 		batch.set(*key, value.as_bytes()).unwrap();
 		tree.apply(batch, false).await.unwrap();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 	}
 
 	// Verify the latest values before delete
 	for (i, key) in keys.iter().enumerate() {
-		let result = tree.get(*key).unwrap();
+		let result = tree.get(*key).await.unwrap();
 		assert_eq!(result, Some(format!("value-{}-v4", i + 1).as_bytes().to_vec()));
 	}
 
@@ -1245,15 +1266,15 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 	}
 
 	// Flush memtable
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Force compaction
 	let strategy = Arc::new(Strategy::default());
-	tree.compact(strategy).unwrap();
+	tree.compact(strategy).await.unwrap();
 
 	// Verify all keys are gone after compaction
 	for key in keys.iter() {
-		let result = tree.get(*key).unwrap();
+		let result = tree.get(*key).await.unwrap();
 		assert_eq!(result, None);
 	}
 }
@@ -1270,7 +1291,7 @@ async fn test_sstable_lsn_bug() {
 
 	// Step 1: Create database and write data for first table
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write data for first table
 		for i in 0..6 {
@@ -1283,7 +1304,7 @@ async fn test_sstable_lsn_bug() {
 		}
 
 		// Force first flush
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Write data for second table
 		for i in 0..6 {
@@ -1296,7 +1317,7 @@ async fn test_sstable_lsn_bug() {
 		}
 
 		// Force second flush
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Verify all keys exist immediately after flush
 		for batch in 0..2 {
@@ -1304,7 +1325,7 @@ async fn test_sstable_lsn_bug() {
 				let key = format!("batch_{}_key_{:03}", batch, i);
 				let expected_value = format!("batch_{}_value_{:03}", batch, i);
 
-				let result = tree.get(key.as_bytes()).unwrap();
+				let result = tree.get(key.as_bytes()).await.unwrap();
 				assert!(result.is_some(), "Key '{}' should exist immediately after flush", key);
 				assert_eq!(&result.unwrap(), expected_value.as_bytes());
 			}
@@ -1316,7 +1337,7 @@ async fn test_sstable_lsn_bug() {
 
 	// Step 2: Reopen database and verify data persistence
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Verify all keys still exist after restart
 		for batch in 0..2 {
@@ -1324,7 +1345,7 @@ async fn test_sstable_lsn_bug() {
 				let key = format!("batch_{}_key_{:03}", batch, i);
 				let expected_value = format!("batch_{}_value_{:03}", batch, i);
 
-				let result = tree.get(key.as_bytes()).unwrap();
+				let result = tree.get(key.as_bytes()).await.unwrap();
 				assert!(result.is_some(), "Key '{}' should exist after restart", key);
 				assert_eq!(&result.unwrap(), expected_value.as_bytes());
 			}
@@ -1347,7 +1368,7 @@ async fn test_table_id_assignment_across_restart() {
 
 	// Step 1: Create initial database and write data for 2 memtables
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write data for first table
 		for i in 0..6 {
@@ -1360,7 +1381,7 @@ async fn test_table_id_assignment_across_restart() {
 		}
 
 		// Force first flush to create first table
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Write data for second table
 		for i in 0..6 {
@@ -1373,19 +1394,18 @@ async fn test_table_id_assignment_across_restart() {
 		}
 
 		// Force second flush to create second table
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Verify we have 2 tables in L0
 		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
 		assert_eq!(l0_size, 2, "Expected 2 tables in L0 after initial writes, got {l0_size}");
 
 		// Get the table IDs from the first session
-		let (table1_id, table2_id, next_table_id) = {
+		let (table1_id, table2_id) = {
 			let manifest = tree.core.level_manifest.read().unwrap();
 			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
-			let next_table_id = manifest.next_table_id();
-			(table1_id, table2_id, next_table_id)
+			(table1_id, table2_id)
 		};
 
 		// Verify table IDs are increasing (note: tables are stored in reverse order by
@@ -1394,9 +1414,11 @@ async fn test_table_id_assignment_across_restart() {
 			table1_id > table2_id,
 			"Table 1 ID should be greater than table 2 ID (newer table first)"
 		);
+		// Verify a newly generated ID would be greater than existing table IDs
+		let fresh_id = crate::levels::next_sst_id();
 		assert!(
-			table1_id < next_table_id,
-			"Next table ID should be greater than existing table IDs"
+			fresh_id > table1_id,
+			"A freshly generated ID should be greater than existing table IDs"
 		);
 
 		// Close the database
@@ -1405,7 +1427,7 @@ async fn test_table_id_assignment_across_restart() {
 
 	// Step 2: Reopen the database
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		{
 			// Verify we still have 2 tables in L0 after reopening
@@ -1416,16 +1438,17 @@ async fn test_table_id_assignment_across_restart() {
 			let manifest = tree.core.level_manifest.read().unwrap();
 			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
-			let next_table_id = manifest.next_table_id();
 
 			// Verify table IDs are still in correct order (newer table first)
 			assert!(
 				table1_id > table2_id,
 				"Table 1 ID should be greater than table 2 ID (newer table first)"
 			);
+			// Verify a newly generated ID would be greater than existing table IDs
+			let fresh_id = crate::levels::next_sst_id();
 			assert!(
-				table1_id < next_table_id,
-				"Next table ID should be greater than existing table IDs after reopen"
+				fresh_id > table1_id,
+				"A freshly generated ID should be greater than existing table IDs after reopen"
 			);
 		}
 
@@ -1440,7 +1463,7 @@ async fn test_table_id_assignment_across_restart() {
 		}
 
 		// Force flush to create the 3rd table
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		{
 			// Verify we now have 3 tables in L0
@@ -1453,7 +1476,6 @@ async fn test_table_id_assignment_across_restart() {
 			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
 			let table3_id = manifest.levels.get_levels()[0].tables[2].id;
-			let next_table_id = manifest.next_table_id();
 
 			// Verify table IDs are in correct order (newer tables first)
 			assert!(
@@ -1464,9 +1486,11 @@ async fn test_table_id_assignment_across_restart() {
 				table2_id > table3_id,
 				"Table 2 ID should be greater than table 3 ID (newer table first)"
 			);
+			// Verify a newly generated ID would be greater than all existing table IDs
+			let fresh_id = crate::levels::next_sst_id();
 			assert!(
-				table1_id < next_table_id,
-				"Next table ID should be greater than all existing table IDs"
+				fresh_id > table1_id,
+				"A freshly generated ID should be greater than all existing table IDs"
 			);
 		}
 
@@ -1476,7 +1500,7 @@ async fn test_table_id_assignment_across_restart() {
 				let key = format!("batch_{}_key_{:03}", batch, i);
 				let expected_value = format!("batch_{}_value_{:03}", batch, i);
 
-				let result = tree.get(key.as_bytes()).unwrap();
+				let result = tree.get(key.as_bytes()).await.unwrap();
 				assert!(result.is_some(), "Key '{}' should exist after restart", key);
 				assert_eq!(&result.unwrap(), expected_value.as_bytes());
 			}
@@ -1488,7 +1512,7 @@ async fn test_table_id_assignment_across_restart() {
 
 	// Step 4: Final verification - reopen and check everything is still correct
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Verify we still have 3 tables
 		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
@@ -1499,7 +1523,6 @@ async fn test_table_id_assignment_across_restart() {
 		let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 		let table2_id = manifest.levels.get_levels()[0].tables[1].id;
 		let table3_id = manifest.levels.get_levels()[0].tables[2].id;
-		let next_table_id = manifest.next_table_id();
 
 		assert!(
 			table1_id > table2_id,
@@ -1509,14 +1532,16 @@ async fn test_table_id_assignment_across_restart() {
 			table2_id > table3_id,
 			"Final check: Table 2 ID should be greater than table 3 ID (newer table first)"
 		);
+		// Verify a newly generated ID would be greater than all existing table IDs
+		let fresh_id = crate::levels::next_sst_id();
 		assert!(
-			table1_id < next_table_id,
-			"Final check: Next table ID should be greater than all existing table IDs"
+			fresh_id > table1_id,
+			"Final check: A freshly generated ID should be greater than all existing table IDs"
 		);
 
 		// Verify that we can read some data (simplified check)
 
-		let result = tree.get("batch_0_key_000".as_bytes()).unwrap();
+		let result = tree.get("batch_0_key_000".as_bytes()).await.unwrap();
 		assert!(result.is_some(), "Should be able to read at least one key");
 	}
 }
@@ -1531,6 +1556,7 @@ async fn test_tree_builder() {
 		.with_path(path.clone())
 		.with_max_memtable_size(64 * 1024)
 		.build()
+		.await
 		.unwrap();
 
 	// Test basic operations
@@ -1538,12 +1564,15 @@ async fn test_tree_builder() {
 	batch.set(b"test_key", b"test_value").unwrap();
 	tree.apply(batch, false).await.unwrap();
 
-	let result = tree.get(b"test_key").unwrap().unwrap();
+	let result = tree.get(b"test_key").await.unwrap().unwrap();
 	assert_eq!(result, b"test_value".to_vec());
 
 	// Test build_with_options
-	let (tree2, opts) =
-		TreeBuilder::new().with_path(temp_dir.path().join("tree2")).build_with_options().unwrap();
+	let (tree2, opts) = TreeBuilder::new()
+		.with_path(temp_dir.path().join("tree2"))
+		.build_with_options()
+		.await
+		.unwrap();
 
 	// Verify the options are accessible
 	assert_eq!(opts.path, temp_dir.path().join("tree2"));
@@ -1553,7 +1582,7 @@ async fn test_tree_builder() {
 	batch2.set(b"key2", b"value2").unwrap();
 	tree2.apply(batch2, false).await.unwrap();
 
-	let result = tree2.get(b"key2").unwrap().unwrap();
+	let result = tree2.get(b"key2").await.unwrap().unwrap();
 	assert_eq!(result, b"value2".to_vec());
 }
 
@@ -1570,7 +1599,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 
 	// Phase 1: Write data and clean shutdown
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		let mut batch = tree.new_batch();
 		batch.set(b"test_key", b"test_value").unwrap();
@@ -1581,7 +1610,9 @@ async fn test_clean_shutdown_actually_skips_wal() {
 	}
 
 	// Phase 2: Check manifest state after shutdown
-	let manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to load manifest");
+	let manifest = LevelManifest::new(Arc::clone(&opts), create_table_store(&opts))
+		.await
+		.expect("Failed to load manifest");
 	let log_number = manifest.get_log_number();
 
 	// CRITICAL CHECK: log_number should be > 0 to skip WAL #0
@@ -1594,7 +1625,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 	// Phase 3: Restart and verify WAL was actually skipped
 	{
 		// Create a custom Core to inspect if WAL was replayed
-		let inner = Arc::new(CoreInner::new(Arc::clone(&opts)).unwrap());
+		let inner = Arc::new(CoreInner::new(Arc::clone(&opts)).await.unwrap());
 
 		// Before WAL replay, memtable should be empty
 		let memtable_before = inner.active_memtable.read().unwrap().clone();
@@ -1610,8 +1641,9 @@ async fn test_clean_shutdown_actually_skips_wal() {
 			"Test",
 			WalRecoveryMode::default(),
 			opts.max_memtable_size,
-			|_memtable, _wal_number| Ok(()),
+			|_memtable, _wal_number| async { Ok(()) },
 		)
+		.await
 		.unwrap();
 
 		// CRITICAL: WAL should have been skipped (return None)
@@ -1635,7 +1667,7 @@ async fn test_crash_before_flush_replays_wal() {
 
 	// Phase 1: Write data and simulate crash (no clean shutdown)
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"crash_key", b"crash_value").unwrap();
 		tree.apply(batch, false).await.unwrap();
@@ -1652,11 +1684,11 @@ async fn test_crash_before_flush_replays_wal() {
 
 	// Phase 2: Restart and verify WAL was replayed
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Data should be available (recovered from WAL)
 
-		assert_eq!(tree.get(b"crash_key").unwrap(), Some(b"crash_value".to_vec()));
+		assert_eq!(tree.get(b"crash_key").await.unwrap(), Some(b"crash_value".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -1671,7 +1703,7 @@ async fn test_log_number_advances_with_flushes() {
 		opts.max_memtable_size = 1024;
 	});
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Initial log_number
 	let log_number_0 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -1684,7 +1716,7 @@ async fn test_log_number_advances_with_flushes() {
 	}
 
 	// Force flush
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 	let log_number_1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 	assert!(log_number_1 > log_number_0, "log_number should advance after flush");
 
@@ -1695,7 +1727,7 @@ async fn test_log_number_advances_with_flushes() {
 		tree.apply(batch, false).await.unwrap();
 	}
 
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 	let log_number_2 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 	assert!(log_number_2 > log_number_1, "log_number should advance after second flush");
 
@@ -1715,7 +1747,7 @@ async fn test_last_sequence_persists_across_restart() {
 
 	// Phase 1: Create database, write, flush
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write data
 		for i in 0..50 {
@@ -1725,7 +1757,7 @@ async fn test_last_sequence_persists_across_restart() {
 		}
 
 		// Force flush to persist
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Get last_sequence from manifest
 		expected_last_seq = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
@@ -1736,7 +1768,7 @@ async fn test_last_sequence_persists_across_restart() {
 
 	// Phase 2: Reopen and verify last_sequence persisted
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let loaded_last_seq = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
 
 		assert_eq!(
@@ -1761,7 +1793,7 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 
 	// Phase 1: Write data and clean shutdown (no flush, just close)
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"key1", b"value1").unwrap();
 		tree.apply(batch, false).await.unwrap();
@@ -1770,13 +1802,14 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		tree.close().await.unwrap();
 
 		// Get the manifest sequence after shutdown flush
-		let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+		let manifest =
+			LevelManifest::new(Arc::clone(&opts), create_table_store(&opts)).await.unwrap();
 		manifest_seq_initial = manifest.get_last_sequence();
 	}
 
 	// Phase 2: Write more data but crash (no flush, no close)
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"key2", b"value2").unwrap();
 		tree.apply(batch, false).await.unwrap();
@@ -1791,7 +1824,7 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 
 	// Phase 3: Recover and verify in-memory sequence > manifest sequence
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// In-memory sequence should be updated from WAL (key2 recovery)
 		let in_memory_seq =
@@ -1813,7 +1846,7 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		);
 
 		// Now flush and verify manifest gets updated
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		let manifest_seq_after_flush =
 			tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
 		assert!(
@@ -1837,7 +1870,7 @@ async fn test_clean_shutdown_no_empty_wal() {
 	let wal_dir = opts.wal_dir();
 
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write data and trigger flush
 		// make_room_for_write rotates WAL, creating a new WAL for subsequent writes
@@ -1846,7 +1879,7 @@ async fn test_clean_shutdown_no_empty_wal() {
 			batch.set(format!("key_{i}").as_bytes(), b"value").unwrap();
 			tree.apply(batch, false).await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Write a bit more data to the new WAL
 		let mut batch = tree.new_batch();
@@ -1874,10 +1907,10 @@ async fn test_clean_shutdown_no_empty_wal() {
 
 	// Verify restart works and data is accessible
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
-		assert_eq!(tree.get(b"key_0").unwrap(), Some(b"value".to_vec()));
-		assert_eq!(tree.get(b"extra").unwrap(), Some(b"data".to_vec()));
+		assert_eq!(tree.get(b"key_0").await.unwrap(), Some(b"value".to_vec()));
+		assert_eq!(tree.get(b"extra").await.unwrap(), Some(b"data".to_vec()));
 		tree.close().await.unwrap();
 	}
 }
@@ -1892,7 +1925,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 	});
 
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Flush cycle 1
 		for i in 0..50 {
@@ -1900,7 +1933,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 			batch.set(format!("batch1_key_{i}").as_bytes(), b"value1").unwrap();
 			tree.apply(batch, false).await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		let log_num_1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 
 		// Flush cycle 2
@@ -1909,7 +1942,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 			batch.set(format!("batch2_key_{i}").as_bytes(), b"value2").unwrap();
 			tree.apply(batch, false).await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		let log_num_2 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 
 		// Flush cycle 3
@@ -1918,7 +1951,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 			batch.set(format!("batch3_key_{i}").as_bytes(), b"value3").unwrap();
 			tree.apply(batch, false).await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		let log_num_3 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 
 		assert!(log_num_2 > log_num_1, "log_number should advance");
@@ -1929,12 +1962,12 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 
 	// Restart and verify all data accessible from SSTables
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// All batches should be accessible (reading doesn't need mut)
-		assert_eq!(tree.get(b"batch1_key_0").unwrap(), Some(b"value1".to_vec()));
-		assert_eq!(tree.get(b"batch2_key_0").unwrap(), Some(b"value2".to_vec()));
-		assert_eq!(tree.get(b"batch3_key_0").unwrap(), Some(b"value3".to_vec()));
+		assert_eq!(tree.get(b"batch1_key_0").await.unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"batch2_key_0").await.unwrap(), Some(b"value2".to_vec()));
+		assert_eq!(tree.get(b"batch3_key_0").await.unwrap(), Some(b"value3".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -1948,13 +1981,13 @@ async fn test_shutdown_with_empty_memtable() {
 	let opts = create_test_options(path.clone(), |_opts| {});
 
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write and flush everything
 		let mut batch = tree.new_batch();
 		batch.set(b"key", b"value").unwrap();
 		tree.apply(batch, false).await.unwrap();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Get manifest state
 		let log_number_before = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -1964,16 +1997,17 @@ async fn test_shutdown_with_empty_memtable() {
 		tree.close().await.unwrap();
 
 		// Verify manifest unchanged (no unnecessary updates)
-		let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+		let manifest =
+			LevelManifest::new(Arc::clone(&opts), create_table_store(&opts)).await.unwrap();
 		assert_eq!(manifest.get_log_number(), log_number_before);
 		assert_eq!(manifest.get_last_sequence(), last_seq_before);
 	}
 
 	// Restart successfully
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
-		assert_eq!(tree.get(b"key").unwrap(), Some(b"value".to_vec()));
+		assert_eq!(tree.get(b"key").await.unwrap(), Some(b"value".to_vec()));
 		tree.close().await.unwrap();
 	}
 }
@@ -1989,25 +2023,25 @@ async fn test_full_crash_recovery_scenario() {
 
 	// Phase 1: Write batch A, flush
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		for i in 0..50 {
 			let mut batch = tree.new_batch();
 			batch.set(format!("batch_a_{i}").as_bytes(), b"value_a").unwrap();
 			tree.apply(batch, false).await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		tree.close().await.unwrap();
 	}
 
 	// Phase 2: Write batch B, flush
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		for i in 0..50 {
 			let mut batch = tree.new_batch();
 			batch.set(format!("batch_b_{i}").as_bytes(), b"value_b").unwrap();
 			tree.apply(batch, false).await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Get log_number after second flush
 		let log_number_after_b = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -2021,7 +2055,7 @@ async fn test_full_crash_recovery_scenario() {
 
 	// Phase 3: Write batch C, crash before flush
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		for i in 0..20 {
 			let mut batch = tree.new_batch();
 			batch.set(format!("batch_c_{i}").as_bytes(), b"value_c").unwrap();
@@ -2039,14 +2073,14 @@ async fn test_full_crash_recovery_scenario() {
 
 	// Phase 4: Restart and verify
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// All data should be accessible
 
-		assert_eq!(tree.get(b"batch_a_0").unwrap(), Some(b"value_a".to_vec()));
-		assert_eq!(tree.get(b"batch_b_0").unwrap(), Some(b"value_b".to_vec()));
+		assert_eq!(tree.get(b"batch_a_0").await.unwrap(), Some(b"value_a".to_vec()));
+		assert_eq!(tree.get(b"batch_b_0").await.unwrap(), Some(b"value_b".to_vec()));
 		assert_eq!(
-			tree.get(b"batch_c_0").unwrap(),
+			tree.get(b"batch_c_0").await.unwrap(),
 			Some(b"value_c".to_vec()),
 			"Batch C should be recovered from WAL"
 		);
@@ -2064,7 +2098,7 @@ async fn test_concurrent_flush_after_rotation() {
 		opts.max_memtable_size = 1024;
 	});
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Write data
 	for i in 0..100 {
@@ -2076,7 +2110,7 @@ async fn test_concurrent_flush_after_rotation() {
 	// Verify data is accessible before flush
 	{
 		assert_eq!(
-			tree.get(b"key_0").unwrap(),
+			tree.get(b"key_0").await.unwrap(),
 			Some(b"value".to_vec()),
 			"Data should be accessible before flush"
 		);
@@ -2086,12 +2120,12 @@ async fn test_concurrent_flush_after_rotation() {
 	// 1. Rotate WAL
 	// 2. Call flush_memtable_and_update_manifest
 	// The function should handle empty memtable gracefully
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Verify data is still accessible after flush
 	{
 		assert_eq!(
-			tree.get(b"key_0").unwrap(),
+			tree.get(b"key_0").await.unwrap(),
 			Some(b"value".to_vec()),
 			"Data should be accessible after flush"
 		);
@@ -2105,12 +2139,12 @@ async fn test_concurrent_flush_after_rotation() {
 	// Verify both old and new data are accessible
 	{
 		assert_eq!(
-			tree.get(b"key_0").unwrap(),
+			tree.get(b"key_0").await.unwrap(),
 			Some(b"value".to_vec()),
 			"Old data should still be accessible"
 		);
 		assert_eq!(
-			tree.get(b"after_flush").unwrap(),
+			tree.get(b"after_flush").await.unwrap(),
 			Some(b"value".to_vec()),
 			"New data after flush should be accessible"
 		);
@@ -2130,7 +2164,7 @@ async fn test_wal_file_reuse_across_restarts() {
 
 	// Phase 1: Open database, write one transaction, close
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"key1", b"value1").unwrap();
 		tree.apply(batch, false).await.unwrap();
@@ -2140,7 +2174,7 @@ async fn test_wal_file_reuse_across_restarts() {
 
 	// Phase 2: Reopen database, check if WAL is reused
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write another transaction
 		let mut batch = tree.new_batch();
@@ -2152,11 +2186,11 @@ async fn test_wal_file_reuse_across_restarts() {
 
 	// Phase 3: Verify recovery
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Both keys should be accessible
-		let key1_present = tree.get(b"key1").unwrap().is_some();
-		let key2_present = tree.get(b"key2").unwrap().is_some();
+		let key1_present = tree.get(b"key1").await.unwrap().is_some();
+		let key2_present = tree.get(b"key2").await.unwrap().is_some();
 
 		assert!(key1_present && key2_present, "Both keys should be recovered");
 
@@ -2177,7 +2211,7 @@ async fn test_wal_append_after_crash_recovery() {
 
 	// Phase 1: Write data and simulate crash (no clean shutdown)
 	let manifest_log = {
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"key1", b"value1").unwrap();
 		tree.apply(batch, false).await.unwrap();
@@ -2195,12 +2229,12 @@ async fn test_wal_append_after_crash_recovery() {
 	};
 
 	// Verify manifest didn't change (no flush happened)
-	let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+	let manifest = LevelManifest::new(Arc::clone(&opts), create_table_store(&opts)).await.unwrap();
 	assert_eq!(manifest.get_log_number(), manifest_log, "Manifest should not change on crash");
 
 	// Phase 2: Reopen and verify WAL is reused (SAME number)
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		let wal_num_after_reopen = tree.core.inner.wal.read().get_active_log_number();
 
@@ -2252,7 +2286,7 @@ async fn test_flush_on_close_creates_sst() {
 
 	// Phase 1: Write data and close
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write data to memtable (no manual flush)
 		let mut batch = tree.new_batch();
@@ -2276,12 +2310,12 @@ async fn test_flush_on_close_creates_sst() {
 
 	// Phase 2: Reopen and verify data is in SST (not WAL)
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Memtable should be empty (data in SST)
 		// Data should still be accessible
 
-		assert_eq!(tree.get(b"test_key").unwrap(), Some(b"test_value".to_vec()));
+		assert_eq!(tree.get(b"test_key").await.unwrap(), Some(b"test_value".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -2314,7 +2348,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 
 	// Cycle 1: Write data, trigger flush, close
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		for i in 0..50 {
 			let mut batch = tree.new_batch();
@@ -2323,7 +2357,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		}
 
 		let sst_before = count_ssts();
-		tree.flush().unwrap(); // Explicit flush
+		tree.flush().await.unwrap(); // Explicit flush
 		let sst_after = count_ssts();
 
 		{
@@ -2338,14 +2372,15 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 
 	// Cycle 2: Reopen, verify recovery, write more, flush, close
 	{
-		let manifest_before = LevelManifest::new(Arc::clone(&opts)).unwrap();
+		let manifest_before =
+			LevelManifest::new(Arc::clone(&opts), create_table_store(&opts)).await.unwrap();
 		let log_num_before = manifest_before.get_log_number();
 
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Verify cycle 1 data is accessible
 
-		assert_eq!(tree.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"cycle1_key_0").await.unwrap(), Some(b"value1".to_vec()));
 
 		for i in 0..50 {
 			let mut batch = tree.new_batch();
@@ -2354,7 +2389,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		}
 
 		let sst_before = count_ssts();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		let sst_after = count_ssts();
 
 		{
@@ -2375,12 +2410,12 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 			flush_on_close: true,
 			..(*opts).clone()
 		});
-		let tree = Tree::new(opts_with_flush).unwrap();
+		let tree = Tree::new(opts_with_flush).await.unwrap();
 
 		// Verify both previous cycles' data
 
-		assert_eq!(tree.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
-		assert_eq!(tree.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec()));
+		assert_eq!(tree.get(b"cycle1_key_0").await.unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"cycle2_key_0").await.unwrap(), Some(b"value2".to_vec()));
 
 		for i in 0..50 {
 			let mut batch = tree.new_batch();
@@ -2404,11 +2439,11 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 
 	// Final verification: All data accessible from SSTs
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
-		assert_eq!(tree.get(b"cycle1_key_0").unwrap(), Some(b"value1".to_vec()));
-		assert_eq!(tree.get(b"cycle2_key_0").unwrap(), Some(b"value2".to_vec()));
-		assert_eq!(tree.get(b"cycle3_key_0").unwrap(), Some(b"value3".to_vec()));
+		assert_eq!(tree.get(b"cycle1_key_0").await.unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"cycle2_key_0").await.unwrap(), Some(b"value2".to_vec()));
+		assert_eq!(tree.get(b"cycle3_key_0").await.unwrap(), Some(b"value3".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -2426,7 +2461,7 @@ async fn test_close_without_flush() {
 
 	let sst_count_before;
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write some data that won't trigger auto-flush
 		for i in 0..10 {
@@ -2444,7 +2479,7 @@ async fn test_close_without_flush() {
 
 	// Reopen and verify SST count hasn't changed
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let sst_count_after = tree.core.inner.level_manifest.read().as_ref().iter().count();
 
 		assert_eq!(
@@ -2454,7 +2489,7 @@ async fn test_close_without_flush() {
 
 		// Data should still be accessible via WAL recovery
 
-		assert_eq!(tree.get(b"key_0").unwrap(), Some(b"value".to_vec()));
+		assert_eq!(tree.get(b"key_0").await.unwrap(), Some(b"value".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -2471,7 +2506,7 @@ async fn test_flush_on_close_option_comparison() {
 
 		let sst_before;
 		{
-			let tree = Tree::new(Arc::clone(&opts)).unwrap();
+			let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 			let mut batch = tree.new_batch();
 			batch.set(b"test", b"data").unwrap();
 			tree.apply(batch, false).await.unwrap();
@@ -2481,7 +2516,7 @@ async fn test_flush_on_close_option_comparison() {
 			tree.close().await.unwrap();
 		}
 
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let sst_after = tree.core.inner.level_manifest.read().unwrap().iter().count();
 
 		assert_eq!(sst_after, sst_before + 1, "flush_on_close=true should create SST");
@@ -2497,7 +2532,7 @@ async fn test_flush_on_close_option_comparison() {
 
 		let sst_before;
 		{
-			let tree = Tree::new(Arc::clone(&opts)).unwrap();
+			let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 			let mut batch = tree.new_batch();
 			batch.set(b"test", b"data").unwrap();
 			tree.apply(batch, false).await.unwrap();
@@ -2507,14 +2542,14 @@ async fn test_flush_on_close_option_comparison() {
 			tree.close().await.unwrap();
 		}
 
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let sst_after = tree.core.inner.level_manifest.read().unwrap().iter().count();
 
 		assert_eq!(sst_after, sst_before, "flush_on_close=false should NOT create SST");
 
 		// But data should still be accessible via WAL
 
-		assert_eq!(tree.get(b"test").unwrap(), Some(b"data".to_vec()));
+		assert_eq!(tree.get(b"test").await.unwrap(), Some(b"data".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -2551,7 +2586,7 @@ async fn test_flush_all_memtables_on_close_ordering() {
 	};
 
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write enough data to trigger multiple memtable flushes
 		// This creates immutable memtables in the background
@@ -2587,19 +2622,19 @@ async fn test_flush_all_memtables_on_close_ordering() {
 
 	// Reopen and verify all data is accessible
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Verify data from all writes
 		for i in 0..50 {
 			let key = format!("key_{:04}", i);
-			let value = tree.get(key.as_bytes()).unwrap();
+			let value = tree.get(key.as_bytes()).await.unwrap();
 			assert!(value.is_some(), "Key {} should exist after close/reopen", key);
 		}
 
 		// Verify final key
 
 		assert_eq!(
-			tree.get(b"final_key").unwrap(),
+			tree.get(b"final_key").await.unwrap(),
 			Some(b"final_value".to_vec()),
 			"Final key should exist after close/reopen"
 		);
@@ -2621,7 +2656,7 @@ async fn test_flush_immutable_memtables_with_empty_active() {
 	});
 
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write data to trigger a memtable flush (creates immutable memtable)
 		for i in 0..20 {
@@ -2640,11 +2675,11 @@ async fn test_flush_immutable_memtables_with_empty_active() {
 
 	// Reopen and verify data
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		for i in 0..20 {
 			let key = format!("key_{}", i);
-			assert!(tree.get(key.as_bytes()).unwrap().is_some(), "Key {} should exist", key);
+			assert!(tree.get(key.as_bytes()).await.unwrap().is_some(), "Key {} should exist", key);
 		}
 
 		tree.close().await.unwrap();
@@ -2664,7 +2699,7 @@ async fn test_sst_table_ids_ordered_correctly_on_close() {
 	});
 
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write data - will be flushed on close
 		for i in 0..5 {
@@ -2680,7 +2715,7 @@ async fn test_sst_table_ids_ordered_correctly_on_close() {
 		tree.close().await.unwrap();
 
 		// Reopen and verify table count increased
-		let tree2 = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree2 = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let after_count = tree2.core.inner.level_manifest.read().unwrap().iter().count();
 
 		assert_eq!(after_count, initial_count + 1, "Should have one more SST after close flush");
@@ -2688,15 +2723,17 @@ async fn test_sst_table_ids_ordered_correctly_on_close() {
 		// Verify table_ids are in ascending order
 		{
 			let manifest = tree2.core.inner.level_manifest.read().unwrap();
-			let mut prev_id = 0u64;
+			let mut prev_id: Option<SstId> = None;
 			for table in manifest.iter() {
-				assert!(
-					table.id > prev_id || prev_id == 0,
-					"Table IDs should be in ascending order: prev={}, current={}",
-					prev_id,
-					table.id
-				);
-				prev_id = table.id;
+				if let Some(prev) = prev_id {
+					assert!(
+						table.id > prev,
+						"Table IDs should be in ascending order: prev={}, current={}",
+						prev,
+						table.id
+					);
+				}
+				prev_id = Some(table.id);
 			}
 		} // Drop manifest before await
 
@@ -2716,7 +2753,7 @@ async fn test_wal_number_tracking_on_flush() {
 		opts.flush_on_close = true;
 	});
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Get initial state
 	let initial_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -2733,7 +2770,7 @@ async fn test_wal_number_tracking_on_flush() {
 	tree.apply(batch, false).await.unwrap();
 
 	// Explicitly flush
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Verify log_number increased to wal_number + 1
 	let after_flush_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -2762,7 +2799,7 @@ async fn test_wal_number_tracking_on_flush() {
 	batch.set(b"key2", b"value2").unwrap();
 	tree.apply(batch, false).await.unwrap();
 
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	let after_second_flush_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 	assert_eq!(
@@ -2775,15 +2812,15 @@ async fn test_wal_number_tracking_on_flush() {
 	// Verify data survives close/reopen
 	tree.close().await.unwrap();
 
-	let tree2 = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree2 = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	assert_eq!(
-		tree2.get(b"key1").unwrap(),
+		tree2.get(b"key1").await.unwrap(),
 		Some(b"value1".to_vec()),
 		"key1 should exist after reopen"
 	);
 	assert_eq!(
-		tree2.get(b"key2").unwrap(),
+		tree2.get(b"key2").await.unwrap(),
 		Some(b"value2".to_vec()),
 		"key2 should exist after reopen"
 	);
@@ -2802,7 +2839,7 @@ async fn test_memtable_wal_number_after_swap() {
 		opts.max_memtable_size = 10 * 1024 * 1024; // Large - prevent auto flush
 	});
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Track WAL numbers through explicit flush cycles
 	let wal_1 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
@@ -2813,7 +2850,7 @@ async fn test_memtable_wal_number_after_swap() {
 	batch.set(b"key1", b"value1").unwrap();
 	tree.apply(batch, false).await.unwrap();
 
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	let wal_2 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
 	log::info!("WAL number after first flush: {}", wal_2);
@@ -2824,7 +2861,7 @@ async fn test_memtable_wal_number_after_swap() {
 	batch.set(b"key2", b"value2").unwrap();
 	tree.apply(batch, false).await.unwrap();
 
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	let wal_3 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
 	log::info!("WAL number after second flush: {}", wal_3);
@@ -2833,15 +2870,15 @@ async fn test_memtable_wal_number_after_swap() {
 	// Verify data survives close/reopen
 	tree.close().await.unwrap();
 
-	let tree2 = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree2 = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	assert_eq!(
-		tree2.get(b"key1").unwrap(),
+		tree2.get(b"key1").await.unwrap(),
 		Some(b"value1".to_vec()),
 		"key1 should exist after reopen"
 	);
 	assert_eq!(
-		tree2.get(b"key2").unwrap(),
+		tree2.get(b"key2").await.unwrap(),
 		Some(b"value2".to_vec()),
 		"key2 should exist after reopen"
 	);
@@ -2865,7 +2902,7 @@ async fn test_wal_number_correct_after_reopen() {
 	let final_log_number;
 	let last_flushed_wal;
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Do 3 write+flush cycles, tracking the last WAL that gets flushed
 		let mut current_wal;
@@ -2876,7 +2913,7 @@ async fn test_wal_number_correct_after_reopen() {
 			let mut batch = tree.new_batch();
 			batch.set(format!("key{}", i).as_bytes(), b"value").unwrap();
 			tree.apply(batch, false).await.unwrap();
-			tree.flush().unwrap();
+			tree.flush().await.unwrap();
 
 			log::info!(
 				"After flush {}: flushed WAL {}, new log_number={}",
@@ -2901,7 +2938,7 @@ async fn test_wal_number_correct_after_reopen() {
 
 	// Phase 2: Reopen and verify active memtable's WAL number
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		let reopened_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 		let active_wal_number = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
@@ -2961,7 +2998,7 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 
 	for cycle in 1..=3 {
 		{
-			let tree = Tree::new(Arc::clone(&opts)).unwrap();
+			let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 			// Write 100 entries
 			for i in 0..100 {
@@ -2978,17 +3015,18 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 		}
 
 		// Check manifest state after close
-		let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+		let manifest =
+			LevelManifest::new(Arc::clone(&opts), create_table_store(&opts)).await.unwrap();
 		let log_number_after_close = manifest.get_log_number();
 		previous_log_numbers.push(log_number_after_close);
 
 		// Verify data from this cycle is accessible
 		{
-			let tree = Tree::new(Arc::clone(&opts)).unwrap();
+			let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 			// Check data from current cycle
 			assert_eq!(
-				tree.get(format!("cycle{}_key_0", cycle).as_bytes()).unwrap(),
+				tree.get(format!("cycle{}_key_0", cycle).as_bytes()).await.unwrap(),
 				Some(b"value".to_vec()),
 				"Data from cycle {} should be recoverable",
 				cycle
@@ -2997,7 +3035,7 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 			// Check data from all previous cycles is still accessible
 			for prev_cycle in 1..cycle {
 				assert_eq!(
-					tree.get(format!("cycle{}_key_0", prev_cycle).as_bytes()).unwrap(),
+					tree.get(format!("cycle{}_key_0", prev_cycle).as_bytes()).await.unwrap(),
 					Some(b"value".to_vec()),
 					"Data from previous cycle {} should still be accessible",
 					prev_cycle
@@ -3013,11 +3051,11 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 
 	// Verify all data is still accessible after all cycles
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		for cycle in 1..=3 {
 			assert_eq!(
-				tree.get(format!("cycle{}_key_0", cycle).as_bytes()).unwrap(),
+				tree.get(format!("cycle{}_key_0", cycle).as_bytes()).await.unwrap(),
 				Some(b"value".to_vec()),
 				"Data from cycle {} should be accessible in final check",
 				cycle
@@ -3036,16 +3074,16 @@ async fn test_cleanup_orphaned_sst_files() {
 
 	// Create initial tree and add some data
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"key1", b"value1").unwrap();
 		tree.apply(batch, false).await.unwrap();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		tree.close().await.unwrap();
 	}
 
 	// Manually create an orphaned SST file (simulating incomplete flush)
-	let orphaned_table_id = 9999;
+	let orphaned_table_id = test_sst_id(9999);
 	let orphaned_path = opts.sstable_file_path(orphaned_table_id);
 	std::fs::write(&orphaned_path, b"fake sst data").unwrap();
 
@@ -3054,14 +3092,14 @@ async fn test_cleanup_orphaned_sst_files() {
 
 	// Reopen database - should trigger cleanup
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Verify orphaned file was deleted
 		assert!(!orphaned_path.exists(), "Orphaned SST should be cleaned up");
 
 		// Verify real data still accessible
 
-		let result = tree.get(b"key1").unwrap().unwrap();
+		let result = tree.get(b"key1").await.unwrap().unwrap();
 		assert_eq!(result, b"value1".to_vec());
 
 		tree.close().await.unwrap();
@@ -3078,7 +3116,7 @@ async fn test_manifest_atomic_sst_and_log_number() {
 		opts.max_memtable_size = 1024;
 	});
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Get initial log_number
 	let initial_log_number = {
@@ -3094,7 +3132,7 @@ async fn test_manifest_atomic_sst_and_log_number() {
 	}
 
 	// Explicitly trigger flush to ensure test reliability
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Verify that when SST is added, log_number is also updated
 	{
@@ -3124,7 +3162,7 @@ async fn test_no_spurious_small_flush() {
 		opts.max_memtable_size = 100 * 1024; // 100KB threshold
 	});
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Add small amount of data (way below threshold)
 	let mut batch = tree.new_batch();
@@ -3157,22 +3195,22 @@ async fn test_crash_recovery_with_orphaned_sst() {
 
 	// Phase 1: Write data and flush
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"committed_key", b"committed_value").unwrap();
 		tree.apply(batch, false).await.unwrap();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		tree.close().await.unwrap();
 	}
 
 	// Phase 2: Simulate incomplete flush (create orphaned SST + keep WAL)
-	let orphaned_table_id = 9998;
+	let orphaned_table_id = test_sst_id(9998);
 	let orphaned_sst_path = opts.sstable_file_path(orphaned_table_id);
 	std::fs::write(&orphaned_sst_path, b"orphaned SST content").unwrap();
 
 	// Add more data that would be in WAL
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"wal_key", b"wal_value").unwrap();
 		tree.apply(batch, false).await.unwrap();
@@ -3182,18 +3220,18 @@ async fn test_crash_recovery_with_orphaned_sst() {
 
 	// Phase 3: Reopen - should cleanup orphaned SST and recover from WAL
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Verify orphaned SST was cleaned up
 		assert!(!orphaned_sst_path.exists(), "Orphaned SST should be removed");
 
 		// Verify WAL data was recovered
 
-		let result = tree.get(b"wal_key").unwrap().unwrap();
+		let result = tree.get(b"wal_key").await.unwrap().unwrap();
 		assert_eq!(result, b"wal_value".to_vec());
 
 		// Verify committed data still accessible
-		let result = tree.get(b"committed_key").unwrap().unwrap();
+		let result = tree.get(b"committed_key").await.unwrap().unwrap();
 		assert_eq!(result, b"committed_value".to_vec());
 
 		tree.close().await.unwrap();
@@ -3208,7 +3246,7 @@ async fn test_cleanup_multiple_orphaned_ssts() {
 
 	// Create initial database
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"key1", b"value1").unwrap();
 		tree.apply(batch, false).await.unwrap();
@@ -3216,7 +3254,7 @@ async fn test_cleanup_multiple_orphaned_ssts() {
 	}
 
 	// Create multiple orphaned SST files
-	let orphaned_ids = vec![8888, 9999, 10000];
+	let orphaned_ids: Vec<SstId> = vec![test_sst_id(8888), test_sst_id(9999), test_sst_id(10000)];
 	for table_id in &orphaned_ids {
 		let orphaned_path = opts.sstable_file_path(*table_id);
 		std::fs::write(&orphaned_path, format!("orphaned {}", table_id)).unwrap();
@@ -3229,7 +3267,7 @@ async fn test_cleanup_multiple_orphaned_ssts() {
 
 	// Reopen - should cleanup all orphaned files
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Verify all orphaned files deleted
 		for table_id in &orphaned_ids {
@@ -3252,7 +3290,7 @@ async fn test_valid_ssts_not_deleted_during_cleanup() {
 
 	// Create database and flush some data
 	let valid_table_ids = {
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		for i in 0..200 {
 			let mut batch = tree.new_batch();
@@ -3260,12 +3298,12 @@ async fn test_valid_ssts_not_deleted_during_cleanup() {
 			tree.apply(batch, false).await.unwrap();
 		}
 
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		// Get list of valid table IDs
 		let ids = {
 			let manifest = tree.core.inner.level_manifest.read().unwrap();
-			let ids: Vec<u64> = manifest.iter().map(|t| t.id).collect();
+			let ids: Vec<SstId> = manifest.iter().map(|t| t.id).collect();
 			drop(manifest);
 			ids
 		};
@@ -3275,12 +3313,12 @@ async fn test_valid_ssts_not_deleted_during_cleanup() {
 	};
 
 	// Create orphaned SST
-	let orphaned_id = 9999;
+	let orphaned_id = test_sst_id(9999);
 	std::fs::write(opts.sstable_file_path(orphaned_id), b"orphaned").unwrap();
 
 	// Reopen
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Verify orphaned deleted
 		assert!(!opts.sstable_file_path(orphaned_id).exists());
@@ -3296,7 +3334,7 @@ async fn test_valid_ssts_not_deleted_during_cleanup() {
 
 		// Verify data still accessible
 
-		let result = tree.get(b"key1").unwrap().unwrap();
+		let result = tree.get(b"key1").await.unwrap().unwrap();
 		assert_eq!(result, b"value".to_vec());
 
 		tree.close().await.unwrap();
@@ -3315,7 +3353,7 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 	// Phase 1: Create multiple valid SSTs with real data
 	let mut expected_keys = Vec::new();
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write multiple batches to create multiple SSTs
 		for batch_num in 0..5 {
@@ -3329,7 +3367,7 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 				tree.apply(batch, false).await.unwrap();
 			}
 			// Force flush after each batch
-			tree.flush().unwrap();
+			tree.flush().await.unwrap();
 		}
 
 		tree.close().await.unwrap();
@@ -3337,10 +3375,10 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 
 	// Phase 2: Get valid SST IDs and create orphaned SSTs
 	let valid_sst_ids = {
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let ids = {
 			let manifest = tree.core.inner.level_manifest.read().unwrap();
-			let ids: Vec<u64> = manifest.iter().map(|t| t.id).collect();
+			let ids: Vec<SstId> = manifest.iter().map(|t| t.id).collect();
 			drop(manifest);
 			ids
 		};
@@ -3349,7 +3387,8 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 	};
 
 	// Create multiple orphaned SST files
-	let orphaned_ids = vec![8888, 9999, 10000, 10001];
+	let orphaned_ids: Vec<SstId> =
+		vec![test_sst_id(8888), test_sst_id(9999), test_sst_id(10000), test_sst_id(10001)];
 	for table_id in &orphaned_ids {
 		let orphaned_path = opts.sstable_file_path(*table_id);
 		std::fs::write(&orphaned_path, format!("orphaned SST {}", table_id)).unwrap();
@@ -3373,7 +3412,7 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 
 	// Phase 3: Reopen - should cleanup orphaned but keep valid
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Verify all orphaned files deleted
 		for table_id in &orphaned_ids {
@@ -3395,16 +3434,16 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 
 		// Verify ALL data is still accessible
 		for key in &expected_keys {
-			let result = tree.get(key.as_bytes()).unwrap();
+			let result = tree.get(key.as_bytes()).await.unwrap();
 			assert!(result.is_some(), "Key {} should be accessible", key);
 		}
 
 		// Spot check a few specific values
 
-		let result = tree.get(b"batch0_key0").unwrap().unwrap();
+		let result = tree.get(b"batch0_key0").await.unwrap().unwrap();
 		assert_eq!(result, b"batch0_value0".to_vec());
 
-		let result = tree.get(b"batch4_key49").unwrap().unwrap();
+		let result = tree.get(b"batch4_key49").await.unwrap().unwrap();
 		assert_eq!(result, b"batch4_value49".to_vec());
 
 		tree.close().await.unwrap();
@@ -3425,7 +3464,7 @@ async fn test_wal_recovery_mode_absolute_consistency_fails_on_corruption() {
 			opts.flush_on_close = false; // Don't flush on close - keep data in WAL
 		});
 
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"key1", b"value1").unwrap();
 		batch.set(b"key2", b"value2").unwrap();
@@ -3449,7 +3488,7 @@ async fn test_wal_recovery_mode_absolute_consistency_fails_on_corruption() {
 			opts.wal_recovery_mode = WalRecoveryMode::AbsoluteConsistency;
 		});
 
-		let result = Tree::new(opts);
+		let result = Tree::new(opts).await;
 
 		// Should fail due to corruption
 		match result {
@@ -3481,7 +3520,7 @@ async fn test_wal_recovery_mode_tolerate_with_repair_succeeds_on_corruption() {
 			opts.flush_on_close = false; // Don't flush on close - keep data in WAL
 		});
 
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 		let mut batch = tree.new_batch();
 		batch.set(b"key1", b"value1").unwrap();
 		batch.set(b"key2", b"value2").unwrap();
@@ -3505,7 +3544,7 @@ async fn test_wal_recovery_mode_tolerate_with_repair_succeeds_on_corruption() {
 			opts.wal_recovery_mode = WalRecoveryMode::TolerateCorruptedWithRepair;
 		});
 
-		let result = Tree::new(opts);
+		let result = Tree::new(opts).await;
 
 		// Should succeed (repair the WAL and recover data)
 		let tree = match result {
@@ -3517,8 +3556,8 @@ async fn test_wal_recovery_mode_tolerate_with_repair_succeeds_on_corruption() {
 
 		// Verify data was recovered
 
-		assert_eq!(tree.get(b"key1").unwrap(), Some(b"value1".to_vec()));
-		assert_eq!(tree.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+		assert_eq!(tree.get(b"key1").await.unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(tree.get(b"key2").await.unwrap(), Some(b"value2".to_vec()));
 
 		tree.close().await.unwrap();
 	}
@@ -3547,7 +3586,7 @@ async fn test_wal_incremental_number_after_flush_and_reopen() {
 
 	// Phase 1: Write data and clean shutdown (triggers flush)
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		let wal_num_before = tree.core.inner.wal.read().get_active_log_number();
 		assert_eq!(wal_num_before, 0, "Fresh database should start at WAL #0");
@@ -3561,7 +3600,7 @@ async fn test_wal_incremental_number_after_flush_and_reopen() {
 
 	// Phase 2: Reopen and verify WAL has incremental number
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		let wal_num_after_reopen = tree.core.inner.wal.read().get_active_log_number();
 
@@ -3610,12 +3649,12 @@ async fn test_recovery_with_manually_created_wal_segments() {
 	let log_number_after_phase1;
 	let last_seq_after_phase1;
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		let mut batch = tree.new_batch();
 		batch.set(b"key1", b"value1_from_sst").unwrap();
 		tree.apply(batch, false).await.unwrap();
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 
 		log_number_after_phase1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 		last_seq_after_phase1 = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
@@ -3701,7 +3740,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 	// - WITH FIX: WAL opens at highest (3), new writes go to segment 3
 	let active_wal_after_recovery;
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		active_wal_after_recovery = tree.core.inner.wal.read().get_active_log_number();
 		let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -3721,9 +3760,9 @@ async fn test_recovery_with_manually_created_wal_segments() {
 
 		// Verify initial recovery worked
 
-		assert!(tree.get(b"key1").unwrap().is_some(), "key1 should exist");
-		assert!(tree.get(b"key2").unwrap().is_some(), "key2 should exist");
-		assert!(tree.get(b"key3").unwrap().is_some(), "key3 should exist");
+		assert!(tree.get(b"key1").await.unwrap().is_some(), "key1 should exist");
+		assert!(tree.get(b"key2").await.unwrap().is_some(), "key2 should exist");
+		assert!(tree.get(b"key3").await.unwrap().is_some(), "key3 should exist");
 
 		// Write NEW data after recovery - this is the data that could be lost
 		let mut batch = tree.new_batch();
@@ -3732,7 +3771,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		log::info!("Phase 3: Wrote key4 to WAL segment {}", active_wal_after_recovery);
 
 		// Flush - this updates log_number
-		tree.flush().unwrap();
+		tree.flush().await.unwrap();
 		let log_number_after_flush =
 			tree.core.inner.level_manifest.read().unwrap().get_log_number();
 		log::info!("Phase 3: After flush, log_number={}", log_number_after_flush);
@@ -3751,15 +3790,15 @@ async fn test_recovery_with_manually_created_wal_segments() {
 	// Without the fix, key4 and key5 would be lost because they were written
 	// to segment 1 (if WAL opened there), and segment 1 is now skipped
 	{
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Original data should still exist
-		assert!(tree.get(b"key1").unwrap().is_some(), "key1 should persist");
-		assert!(tree.get(b"key2").unwrap().is_some(), "key2 should persist");
-		assert!(tree.get(b"key3").unwrap().is_some(), "key3 should persist");
+		assert!(tree.get(b"key1").await.unwrap().is_some(), "key1 should persist");
+		assert!(tree.get(b"key2").await.unwrap().is_some(), "key2 should persist");
+		assert!(tree.get(b"key3").await.unwrap().is_some(), "key3 should persist");
 
 		// CRITICAL: New data written after recovery should NOT be lost
-		let key4 = tree.get(b"key4_new_after_recovery").unwrap();
+		let key4 = tree.get(b"key4_new_after_recovery").await.unwrap();
 		assert_eq!(
 			key4,
 			Some(b"value4".to_vec()),
@@ -3767,7 +3806,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 				 This happens when WAL opens at log_number instead of highest segment."
 		);
 
-		let key5 = tree.get(b"key5_unflushed").unwrap();
+		let key5 = tree.get(b"key5_unflushed").await.unwrap();
 		assert_eq!(key5, Some(b"value5".to_vec()), "DATA LOSS BUG: key5 (unflushed) was lost!");
 
 		log::info!("Phase 4: All data verified - no data loss!");
@@ -3786,7 +3825,7 @@ async fn test_flush_wal_concurrent_commits() {
 	let temp_dir = create_temp_directory();
 	let opts = create_test_options(temp_dir.path().to_path_buf(), |_opts| {});
 
-	let tree = Arc::new(Tree::new(opts).unwrap());
+	let tree = Arc::new(Tree::new(opts).await.unwrap());
 	let commit_count = Arc::new(AtomicUsize::new(0));
 	let flush_count = Arc::new(AtomicUsize::new(0));
 
@@ -3861,7 +3900,7 @@ async fn test_flush_wal_concurrent_commits() {
 		for task_id in 0..num_commit_tasks {
 			for i in 0..commits_per_task {
 				let key = format!("task{}_key{}", task_id, i);
-				let result = tree.get(key.as_bytes()).unwrap();
+				let result = tree.get(key.as_bytes()).await.unwrap();
 				assert!(result.is_some(), "Key {} should exist after concurrent operations", key);
 			}
 		}
@@ -3882,7 +3921,7 @@ async fn test_range_key_ordering_correctness() {
 
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Keys in expected lexicographic sorted order
 	let keys_in_order = ["a", "b", "ba", "baaa", "baaaaaaaaaaaaaaaaaa1", "c"];
@@ -3902,6 +3941,7 @@ async fn test_range_key_ordering_correctness() {
 		let range_result = collect_transaction_all(
 			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(
@@ -3932,6 +3972,7 @@ async fn test_range_key_ordering_correctness() {
 		let reverse_result = collect_transaction_reverse(
 			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(
@@ -3954,7 +3995,7 @@ async fn test_range_key_ordering_correctness() {
 	}
 
 	// Flush to disk
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	// Test AFTER flush (SSTable path)
 	{
@@ -3962,6 +4003,7 @@ async fn test_range_key_ordering_correctness() {
 		let range_result = collect_transaction_all(
 			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(
@@ -3992,6 +4034,7 @@ async fn test_range_key_ordering_correctness() {
 		let reverse_result = collect_transaction_reverse(
 			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"d".as_slice())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		for (idx, (key, _value)) in reverse_result.iter().enumerate() {
@@ -4019,7 +4062,7 @@ async fn test_range_prefix_differentiation() {
 
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Table records: /ns/db/tb/<id>
 	// Index records: /ns/db/ix/<name>
@@ -4049,6 +4092,7 @@ async fn test_range_prefix_differentiation() {
 				.range(Some(b"/ns/db/tb/".as_slice()), Some(b"/ns/db/tb0".as_slice()))
 				.unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(
@@ -4089,6 +4133,7 @@ async fn test_range_prefix_differentiation() {
 				.range(Some(b"/ns/db/ix/".as_slice()), Some(b"/ns/db/ix0".as_slice()))
 				.unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(
@@ -4120,7 +4165,7 @@ async fn test_range_prefix_differentiation() {
 	}
 
 	// Flush and test after flush
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	{
 		// Same tests after flush
@@ -4130,6 +4175,7 @@ async fn test_range_prefix_differentiation() {
 				.range(Some(b"/ns/db/tb/".as_slice()), Some(b"/ns/db/tb0".as_slice()))
 				.unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(
@@ -4154,6 +4200,7 @@ async fn test_range_prefix_differentiation() {
 				.range(Some(b"/ns/db/ix/".as_slice()), Some(b"/ns/db/ix0".as_slice()))
 				.unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(
@@ -4183,7 +4230,7 @@ async fn test_range_exclusive_boundaries() {
 
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Insert keys: a, b, c, d
 	let keys = ["a", "b", "c", "d"];
@@ -4199,6 +4246,7 @@ async fn test_range_exclusive_boundaries() {
 		let range_result = collect_transaction_all(
 			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"c".as_slice())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(range_result.len(), 2, "Range [a, c) should return 2 keys (a and b)");
@@ -4217,6 +4265,7 @@ async fn test_range_exclusive_boundaries() {
 		let range_result2 = collect_transaction_all(
 			&mut tree.new_snapshot().range(Some(b"b".as_slice()), Some(b"d".as_slice())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(range_result2.len(), 2, "Range [b, d) should return 2 keys (b and c)");
@@ -4235,6 +4284,7 @@ async fn test_range_exclusive_boundaries() {
 		let range_result3 = collect_transaction_all(
 			&mut tree.new_snapshot().range(Some(b"c".as_slice()), Some(b"e".as_slice())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(range_result3.len(), 2, "Range [c, e) should return 2 keys (c and d)");
@@ -4249,13 +4299,14 @@ async fn test_range_exclusive_boundaries() {
 	}
 
 	// Flush and test after flush
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	{
 		// Same tests after flush
 		let range_result = collect_transaction_all(
 			&mut tree.new_snapshot().range(Some(b"a".as_slice()), Some(b"c".as_slice())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		assert_eq!(range_result.len(), 2, "After flush: Range [a, c) should return 2 keys");
@@ -4290,7 +4341,7 @@ async fn test_range_boundary_edge_cases() {
 
 	let opts = create_small_memtable_options(path.clone());
 
-	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 	// Keys where some are proper prefixes of others
 	let keys = ["aa", "aaa", "aaaa", "aaaab", "ab", "b"];
@@ -4306,6 +4357,7 @@ async fn test_range_boundary_edge_cases() {
 		let range_result = collect_transaction_all(
 			&mut tree.new_snapshot().range(Some(b"aa".as_slice()), Some(b"ab".as_slice())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		let result_keys: Vec<String> = range_result
@@ -4340,6 +4392,7 @@ async fn test_range_boundary_edge_cases() {
 				.range(Some("aaa".as_bytes()), Some("aaaa".as_bytes()))
 				.unwrap(),
 		)
+		.await
 		.unwrap();
 
 		let narrow_keys: Vec<String> = narrow_range
@@ -4359,6 +4412,7 @@ async fn test_range_boundary_edge_cases() {
 		let exact_start = collect_transaction_all(
 			&mut tree.new_snapshot().range(Some("aaaa".as_bytes()), Some("ab".as_bytes())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		let exact_keys: Vec<String> = exact_start
@@ -4377,13 +4431,14 @@ async fn test_range_boundary_edge_cases() {
 	}
 
 	// Flush and test after flush
-	tree.flush().unwrap();
+	tree.flush().await.unwrap();
 
 	{
 		// Same primary test after flush
 		let range_result = collect_transaction_all(
 			&mut tree.new_snapshot().range(Some(b"aa".as_slice()), Some(b"ab".as_slice())).unwrap(),
 		)
+		.await
 		.unwrap();
 
 		let result_keys: Vec<String> = range_result
@@ -4421,7 +4476,7 @@ async fn test_recovery_detects_corrupt_log_number() {
 		let opts = create_test_options(path.clone(), |opts| {
 			opts.flush_on_close = false;
 		});
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write some data (creates WAL entries)
 		for i in 0..10 {
@@ -4460,7 +4515,7 @@ async fn test_recovery_detects_corrupt_log_number() {
 	// Phase 3: Try to open the database - should fail with ManifestCorruption
 	{
 		let opts = create_test_options(path.clone(), |_| {});
-		let result = Tree::new(Arc::clone(&opts));
+		let result = Tree::new(Arc::clone(&opts)).await;
 
 		match result {
 			Ok(_) => panic!("Expected error when opening with corrupted manifest"),
@@ -4490,7 +4545,7 @@ async fn test_validate_wal_log_number_multiple_wals() {
 			opts.max_memtable_size = 1024; // 1KB - triggers frequent rotations
 			opts.flush_on_close = false;
 		});
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		// Write enough data to trigger multiple WAL rotations
 		for i in 0..100 {
@@ -4539,7 +4594,7 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 			opts.max_memtable_size = 1024; // 1KB - triggers frequent rotations
 			opts.flush_on_close = false;
 		});
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = Tree::new(Arc::clone(&opts)).await.unwrap();
 
 		for i in 0..100 {
 			let mut batch = tree.new_batch();
@@ -4574,7 +4629,7 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 	// Phase 4: Try to open - should fail with ManifestCorruption
 	{
 		let opts = create_test_options(path.clone(), |_| {});
-		let result = Tree::new(Arc::clone(&opts));
+		let result = Tree::new(Arc::clone(&opts)).await;
 
 		match result {
 			Ok(_) => panic!("Expected error when opening with corrupted manifest"),

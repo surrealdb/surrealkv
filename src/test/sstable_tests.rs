@@ -7,9 +7,8 @@ use rand::{Rng, SeedableRng};
 use test_log::test;
 
 use crate::sstable::block::BlockHandle;
-use crate::sstable::table::{ChecksumType, Footer, IndexType, Table, TableFormat, TableWriter};
-use crate::test::{collect_all, collect_iter, count_iter};
-use crate::vfs::File;
+use crate::sstable::table::{ChecksumType, Footer, IndexType, TableFormat, TableWriter};
+use crate::test::{collect_all, collect_iter, count_iter, new_test_table, test_sst_id};
 use crate::{
 	user_range_to_internal_range,
 	InternalKey,
@@ -54,7 +53,7 @@ fn test_table_builder() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
 
-	let mut b = TableWriter::new(d, 0, opts, 0);
+	let mut b = TableWriter::new(d, test_sst_id(0), opts, 0);
 
 	let data = [("abc", "def"), ("abe", "dee"), ("bcd", "asa"), ("dcc", "a00")];
 	let data2 = [("abd", "def"), ("abf", "dee"), ("ccd", "asa"), ("dcd", "a00")];
@@ -82,7 +81,7 @@ fn test_bad_input() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
 
-	let mut b = TableWriter::new(d, 0, opts, 0);
+	let mut b = TableWriter::new(d, test_sst_id(0), opts, 0);
 
 	// Test two equal consecutive keys
 	let data = [("abc", "def"), ("abc", "dee"), ("bcd", "asa"), ("bsr", "a00")];
@@ -121,7 +120,7 @@ fn build_table(data: Vec<(&str, &str)>) -> (Vec<u8>, usize) {
 
 	{
 		// Uses the standard comparator in opt.
-		let mut b = TableWriter::new(&mut d, 0, opt, 0);
+		let mut b = TableWriter::new(&mut d, test_sst_id(0), opt, 0);
 
 		for &(k, v) in data.iter() {
 			b.add(
@@ -146,7 +145,7 @@ fn build_table_with_seq_num(data: Vec<(&str, &str, u64)>) -> (Vec<u8>, usize) {
 	let opt = Arc::new(opts);
 
 	{
-		let mut b = TableWriter::new(&mut d, 0, opt, 0);
+		let mut b = TableWriter::new(&mut d, test_sst_id(0), opt, 0);
 		for &(k, v, seq) in data.iter() {
 			b.add(
 				InternalKey::new(Vec::from(k.as_bytes()), seq, InternalKeyKind::Set, 0),
@@ -161,77 +160,73 @@ fn build_table_with_seq_num(data: Vec<(&str, &str, u64)>) -> (Vec<u8>, usize) {
 	(d, size)
 }
 
-fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
-	Arc::new(src)
-}
-
-#[test]
-fn test_table_seek() {
-	let (src, size) = build_table(build_data());
+#[tokio::test]
+async fn test_table_seek() {
+	let (src, _size) = build_table(build_data());
 	let opts = default_opts();
 
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 	let mut iter = table.iter(None).unwrap();
 
 	let key = InternalKey::new(Vec::from(b"bcd"), 2, InternalKeyKind::Set, 0);
-	iter.seek(&key.encode()).unwrap();
+	iter.seek(&key.encode()).await.unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value_encoded().unwrap()), (&b"bcd"[..], &b"asa"[..]));
 
 	let key = InternalKey::new(Vec::from(b"abc"), 2, InternalKeyKind::Set, 0);
-	iter.seek(&key.encode()).unwrap();
+	iter.seek(&key.encode()).await.unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value_encoded().unwrap()), (&b"abc"[..], &b"def"[..]));
 
 	// Seek-past-last invalidates.
 	let key = InternalKey::new(Vec::from(b"{{{"), 2, InternalKeyKind::Set, 0);
-	iter.seek(&key.encode()).unwrap();
+	iter.seek(&key.encode()).await.unwrap();
 	assert!(!iter.valid());
 
 	let key = InternalKey::new(Vec::from(b"bbb"), 2, InternalKeyKind::Set, 0);
-	iter.seek(&key.encode()).unwrap();
+	iter.seek(&key.encode()).await.unwrap();
 	assert!(iter.valid());
 }
 
-#[test]
-fn test_table_iter() {
-	let (src, size) = build_table(build_data());
+#[tokio::test]
+async fn test_table_iter() {
+	let (src, _size) = build_table(build_data());
 	let opts = default_opts();
 
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 	let mut iter = table.iter(None).unwrap();
 
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value_encoded().unwrap()), (&b"abc"[..], &b"def"[..]));
 
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value_encoded().unwrap()), (&b"abd"[..], &b"dee"[..]));
 
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value_encoded().unwrap()), (&b"bcd"[..], &b"asa"[..]));
 
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value_encoded().unwrap()), (&b"bsr"[..], &b"a00"[..]));
 
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value_encoded().unwrap()), (&b"xyz"[..], &b"xxx"[..]));
 
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value_encoded().unwrap()), (&b"xzz"[..], &b"yyy"[..]));
 
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid());
 	assert_eq!((iter.key().user_key(), iter.value_encoded().unwrap()), (&b"zzz"[..], &b"111"[..]));
 }
 
-#[test]
-fn test_many_items() {
+#[tokio::test]
+async fn test_many_items() {
 	// Create options with reasonable block size for test
 	let opts = Options::new();
 	let opts = Arc::new(opts);
@@ -240,7 +235,7 @@ fn test_many_items() {
 	let mut buffer = Vec::with_capacity(10240); // 10KB initial capacity
 
 	// Create TableWriter
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Number of items to generate
 	let num_items = 10001;
@@ -263,11 +258,11 @@ fn test_many_items() {
 	}
 
 	// Finish writing the table
-	let size = writer.finish().unwrap();
-	assert!(size > 0, "Table should have non-zero size");
+	let _size = writer.finish().unwrap();
+	assert!(_size > 0, "Table should have non-zero size");
 
 	// Create a table reader
-	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 	// Verify the number of entries matches
 	assert_eq!(
@@ -280,7 +275,7 @@ fn test_many_items() {
 		let internal_key =
 			InternalKey::new(Vec::from(key.as_bytes()), num_items + 1, InternalKeyKind::Set, 0);
 
-		let result = table.get(&internal_key).unwrap();
+		let result = table.get(&internal_key).await.unwrap();
 
 		assert!(result.is_some(), "Key '{key}' not found in table");
 
@@ -302,8 +297,8 @@ fn test_many_items() {
 	}
 }
 
-#[test]
-fn test_iter_items() {
+#[tokio::test]
+async fn test_iter_items() {
 	// Create options with reasonable block size for test
 	let opts = Options::new();
 	let opts = Arc::new(opts);
@@ -312,7 +307,7 @@ fn test_iter_items() {
 	let mut buffer = Vec::new();
 
 	// Create TableWriter
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Number of items to generate
 	let num_items = 10001;
@@ -331,11 +326,11 @@ fn test_iter_items() {
 	}
 
 	// Finish writing the table
-	let size = writer.finish().unwrap();
-	assert!(size > 0, "Table should have non-zero size");
+	let _size = writer.finish().unwrap();
+	assert!(_size > 0, "Table should have non-zero size");
 
 	// Create a table reader
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, buffer).await.unwrap());
 
 	// Verify the number of entries matches
 	assert_eq!(
@@ -344,7 +339,7 @@ fn test_iter_items() {
 	);
 
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_first().unwrap();
+	iter.seek_to_first().await.unwrap();
 	let mut item = 0;
 	while iter.valid() {
 		let key = iter.key().to_owned();
@@ -353,7 +348,7 @@ fn test_iter_items() {
 		let expected_value = format!("value_{item:05}");
 		assert_eq!(std::str::from_utf8(&key.user_key).unwrap(), expected_key);
 		assert_eq!(value, expected_value.as_bytes());
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 		item += 1;
 	}
 }
@@ -366,7 +361,7 @@ fn add_key(writer: &mut TableWriter<Vec<u8>>, key: &[u8], seq: u64, value: &[u8]
 fn test_writer_key_range_empty() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let writer = TableWriter::new(d, 1, opts, 0);
+	let writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Key range should be None for an empty table
 	assert!(writer.meta.smallest_point.is_none());
@@ -377,7 +372,7 @@ fn test_writer_key_range_empty() {
 fn test_writer_key_range_single_entry() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Add just one key
 	add_key(&mut writer, b"singleton", 1, b"value").unwrap();
@@ -397,7 +392,7 @@ fn test_writer_key_range_single_entry() {
 fn test_writer_key_range_ascending_keys() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Add keys in ascending order
 	let keys = ["aaa", "bbb", "ccc", "ddd", "eee"];
@@ -420,7 +415,7 @@ fn test_writer_key_range_ascending_keys() {
 fn test_writer_key_range_interleaved_pattern() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Add keys in a pattern that interleaves
 	let keys = ["a10", "a20", "a15", "a30", "a25"];
@@ -447,7 +442,7 @@ fn test_writer_key_range_interleaved_pattern() {
 fn test_writer_key_range_sparse_pattern() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Add very sparse keys with large gaps
 	let keys = ["aaaaa", "nnnnn", "zzzzz"];
@@ -471,7 +466,7 @@ fn test_writer_key_range_sparse_pattern() {
 fn test_writer_key_range_clustered_pattern() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Add clustered keys - many keys in a narrow range
 	let prefixes = ["aaa", "aab", "aac"];
@@ -499,7 +494,7 @@ fn test_writer_key_range_clustered_pattern() {
 fn test_writer_key_range_binary_keys() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Add binary keys
 	let keys = [vec![0x00, 0x01, 0x02], vec![0x10, 0x11, 0x12], vec![0xF0, 0xF1, 0xF2]];
@@ -523,7 +518,7 @@ fn test_writer_key_range_binary_keys() {
 fn test_writer_key_range_identical_keys_different_seqnums() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Add the same key multiple times with different sequence numbers
 
@@ -547,7 +542,7 @@ fn test_writer_key_range_identical_keys_different_seqnums() {
 fn test_writer_key_range_unicode_keys() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Add keys with unicode characters
 	let keys = ["α", "β", "γ", "δ", "ε"];
@@ -571,7 +566,7 @@ fn test_writer_key_range_unicode_keys() {
 fn test_writer_key_range_with_special_chars() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Add keys with special characters, including control characters
 	let keys = [
@@ -605,7 +600,7 @@ fn test_writer_key_range_with_special_chars() {
 fn test_writer_key_range_with_mixed_case() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Mixed case keys to test case-sensitivity in key range
 	let keys = ["AAA", "BBB", "aaa", "bbb"];
@@ -633,7 +628,7 @@ fn test_writer_key_range_with_mixed_case() {
 fn test_writer_key_range_with_pseudo_random_keys() {
 	let d = Vec::with_capacity(2048);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Generate 100 pseudo-random keys but add them in sorted order
 	let mut rng = StdRng::seed_from_u64(100);
@@ -671,7 +666,7 @@ fn test_writer_key_range_with_pseudo_random_keys() {
 fn test_writer_key_range_with_prefix_pattern() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	// Add keys with common prefixes but different suffixes
 	add_key(&mut writer, b"prefix:aaa", 1, b"value").unwrap();
@@ -696,7 +691,7 @@ fn test_writer_key_range_with_prefix_pattern() {
 fn test_writer_key_range_boundary_keys() {
 	let d = Vec::with_capacity(512);
 	let opts = default_opts();
-	let mut writer = TableWriter::new(d, 1, opts, 0);
+	let mut writer = TableWriter::new(d, test_sst_id(1), opts, 0);
 
 	let long = "z".repeat(1000);
 	let long = &long.as_str();
@@ -722,11 +717,11 @@ fn test_writer_key_range_boundary_keys() {
 	}
 }
 
-#[test]
-fn test_table_key_range_persistence() {
+#[tokio::test]
+async fn test_table_key_range_persistence() {
 	// Build a table with the test data
 	let data = build_data();
-	let (src, size) = build_table(data.clone());
+	let (src, _size) = build_table(data.clone());
 	let opts = default_opts();
 
 	// Calculate the expected key range from the original data
@@ -734,7 +729,7 @@ fn test_table_key_range_persistence() {
 	let expected_high = data.last().unwrap().0.as_bytes();
 
 	// Load the table back
-	let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+	let table = new_test_table(test_sst_id(1), opts, src).await.unwrap();
 
 	// Verify the key range was properly persisted and loaded
 	assert!(table.meta.smallest_point.is_some());
@@ -788,8 +783,8 @@ fn test_table_key_range_persistence() {
 	)));
 }
 
-#[test]
-fn test_table_disjoint_key_range_persistence() {
+#[tokio::test]
+async fn test_table_disjoint_key_range_persistence() {
 	// Build a table with disjoint data to ensure gaps are handled correctly
 	let disjoint_data = vec![
 		("aaa", "val1"),
@@ -799,7 +794,7 @@ fn test_table_disjoint_key_range_persistence() {
 		("zzz", "val5"), // Gap between qqq and zzz
 	];
 
-	let (src, size) = build_table(disjoint_data.clone());
+	let (src, _size) = build_table(disjoint_data.clone());
 	let opts = default_opts();
 
 	// Calculate expected range
@@ -807,7 +802,7 @@ fn test_table_disjoint_key_range_persistence() {
 	let expected_high = disjoint_data.last().unwrap().0.as_bytes();
 
 	// Load the table back
-	let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+	let table = new_test_table(test_sst_id(1), opts, src).await.unwrap();
 
 	// Verify key range was properly persisted with disjoint data
 	assert!(table.meta.smallest_point.is_some());
@@ -838,8 +833,8 @@ fn test_table_disjoint_key_range_persistence() {
 	)));
 }
 
-#[test]
-fn test_table_key_range_with_many_blocks() {
+#[tokio::test]
+async fn test_table_key_range_with_many_blocks() {
 	// Create a larger dataset that will span multiple blocks
 	let mut data: Vec<(String, String)> = Vec::new();
 
@@ -852,7 +847,7 @@ fn test_table_key_range_with_many_blocks() {
 
 	let data: Vec<(&str, &str)> = data.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
 
 	// Expected range
@@ -860,7 +855,7 @@ fn test_table_key_range_with_many_blocks() {
 	let expected_high = "key_049".as_bytes();
 
 	// Load the table
-	let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+	let table = new_test_table(test_sst_id(1), opts, src).await.unwrap();
 
 	// Verify key range
 	assert!(table.meta.smallest_point.is_some());
@@ -887,8 +882,8 @@ fn test_table_key_range_with_many_blocks() {
 	}
 }
 
-#[test]
-fn test_table_key_range_with_tombstones() {
+#[tokio::test]
+async fn test_table_key_range_with_tombstones() {
 	let data = vec![
 		("aaa", "val1"),
 		("bbb", "val2"),
@@ -897,11 +892,11 @@ fn test_table_key_range_with_tombstones() {
 		("eee", ""), // Tombstone
 	];
 
-	let (src, size) = build_table_with_tombstones(data.clone());
+	let (src, _size) = build_table_with_tombstones(data.clone());
 	let opts = default_opts();
 
 	// Load the table
-	let table = Table::new(1, opts, wrap_buffer(src), size as u64).unwrap();
+	let table = new_test_table(test_sst_id(1), opts, src).await.unwrap();
 
 	// Verify key range includes tombstones
 	assert!(table.meta.smallest_point.is_some());
@@ -926,7 +921,7 @@ fn build_table_with_tombstones(data: Vec<(&'static str, &'static str)>) -> (Vec<
 	let opt = Arc::new(opts);
 
 	{
-		let mut b = TableWriter::new(&mut d, 0, opt, 0);
+		let mut b = TableWriter::new(&mut d, test_sst_id(0), opt, 0);
 
 		for &(k, v) in data.iter() {
 			// Use Deletion kind for empty values to indicate tombstones
@@ -946,8 +941,8 @@ fn build_table_with_tombstones(data: Vec<(&'static str, &'static str)>) -> (Vec<
 	(d, size)
 }
 
-#[test]
-fn test_table_iterator_no_items_lost() {
+#[tokio::test]
+async fn test_table_iterator_no_items_lost() {
 	let data = vec![
 		("key_000", "value_000"),
 		("key_001", "value_001"),
@@ -956,12 +951,12 @@ fn test_table_iterator_no_items_lost() {
 		("key_004", "value_004"),
 	];
 
-	let (src, size) = build_table(data.clone());
+	let (src, _size) = build_table(data.clone());
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_first().unwrap();
+	iter.seek_to_first().await.unwrap();
 	let mut collected_items = Vec::new();
 
 	while iter.valid() {
@@ -970,7 +965,7 @@ fn test_table_iterator_no_items_lost() {
 		let key_str = std::str::from_utf8(&key.user_key).unwrap();
 		let value_str = std::str::from_utf8(value).unwrap();
 		collected_items.push((key_str.to_string(), value_str.to_string()));
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 
 	assert_eq!(
@@ -1002,16 +997,16 @@ fn test_table_iterator_no_items_lost() {
 	assert_eq!(collected_items[0].1, data[0].1, "First item value was lost!");
 }
 
-#[test]
-fn test_table_iterator_does_not_restart_after_exhaustion() {
+#[tokio::test]
+async fn test_table_iterator_does_not_restart_after_exhaustion() {
 	let data = vec![("a", "val_a"), ("b", "val_b"), ("c", "val_c")];
 
-	let (src, size) = build_table(data.clone());
+	let (src, _size) = build_table(data.clone());
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_first().unwrap();
+	iter.seek_to_first().await.unwrap();
 	let mut seen_keys = Vec::new();
 	let mut iteration_count = 0;
 
@@ -1037,7 +1032,7 @@ fn test_table_iterator_does_not_restart_after_exhaustion() {
 		if key_count > 1 {
 			panic!("Iterator restarted! Saw key '{key_str}' {key_count} times");
 		}
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 
 	assert_eq!(
@@ -1049,7 +1044,7 @@ fn test_table_iterator_does_not_restart_after_exhaustion() {
 	);
 
 	for i in 0..3 {
-		let result = iter.next().unwrap();
+		let result = iter.next().await.unwrap();
 		if result {
 			panic!(
 				"Iterator should remain exhausted, but returned true on additional call #{}",
@@ -1059,18 +1054,18 @@ fn test_table_iterator_does_not_restart_after_exhaustion() {
 	}
 }
 
-#[test]
-fn test_table_iterator_advance_method_correctness() {
+#[tokio::test]
+async fn test_table_iterator_advance_method_correctness() {
 	let data = vec![("item1", "data1"), ("item2", "data2"), ("item3", "data3")];
 
-	let (src, size) = build_table(data.clone());
+	let (src, _size) = build_table(data.clone());
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	let mut iter = table.iter(None).unwrap();
 
 	for expected_index in 0..data.len() {
-		let advance_result = iter.next().unwrap();
+		let advance_result = iter.next().await.unwrap();
 
 		assert!(
 			advance_result,
@@ -1089,12 +1084,12 @@ fn test_table_iterator_advance_method_correctness() {
             );
 	}
 
-	let final_advance = iter.next().unwrap();
+	let final_advance = iter.next().await.unwrap();
 	assert!(!final_advance, "next() should return false when trying to advance past the last item");
 	assert!(!iter.valid(), "Iterator should be invalid after advancing past the last item");
 
 	for i in 0..3 {
-		let advance_result = iter.next().unwrap();
+		let advance_result = iter.next().await.unwrap();
 		assert!(
 			!advance_result,
 			"next() should continue returning false after exhaustion (call #{})",
@@ -1104,17 +1099,17 @@ fn test_table_iterator_advance_method_correctness() {
 	}
 }
 
-#[test]
-fn test_table_iterator_edge_cases() {
+#[tokio::test]
+async fn test_table_iterator_edge_cases() {
 	// Single item table
 	{
 		let single_data = vec![("only_key", "only_value")];
-		let (src, size) = build_table(single_data.clone());
+		let (src, _size) = build_table(single_data.clone());
 		let opts = default_opts();
-		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+		let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 		let mut iter = table.iter(None).unwrap();
-		let collected = collect_all(&mut iter).unwrap();
+		let collected = collect_all(&mut iter).await.unwrap();
 		assert_eq!(collected.len(), 1, "Single item table should return exactly 1 item");
 
 		let key_str = std::str::from_utf8(&collected[0].0.user_key).unwrap();
@@ -1126,12 +1121,12 @@ fn test_table_iterator_edge_cases() {
 	// Two item table
 	{
 		let two_data = vec![("first", "1st"), ("second", "2nd")];
-		let (src, size) = build_table(two_data.clone());
+		let (src, _size) = build_table(two_data.clone());
 		let opts = default_opts();
-		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+		let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 		let mut iter = table.iter(None).unwrap();
-		let collected = collect_all(&mut iter).unwrap();
+		let collected = collect_all(&mut iter).await.unwrap();
 		assert_eq!(collected.len(), 2, "Two item table should return exactly 2 items");
 
 		let keys: Vec<String> = collected
@@ -1149,12 +1144,12 @@ fn test_table_iterator_edge_cases() {
 		let large_data_refs: Vec<(&str, &str)> =
 			large_data.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-		let (src, size) = build_table(large_data_refs);
+		let (src, _size) = build_table(large_data_refs);
 		let opts = default_opts();
-		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+		let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 		let mut iter = table.iter(None).unwrap();
-		let collected = collect_all(&mut iter).unwrap();
+		let collected = collect_all(&mut iter).await.unwrap();
 		assert_eq!(collected.len(), 100, "Large table should return exactly 100 items");
 
 		let mut seen_keys = std::collections::HashSet::new();
@@ -1173,8 +1168,8 @@ fn test_table_iterator_edge_cases() {
 	}
 }
 
-#[test]
-fn test_table_iterator_seek_then_iterate() {
+#[tokio::test]
+async fn test_table_iterator_seek_then_iterate() {
 	let data = vec![
 		("item_01", "val_01"),
 		("item_02", "val_02"),
@@ -1183,9 +1178,9 @@ fn test_table_iterator_seek_then_iterate() {
 		("item_05", "val_05"),
 	];
 
-	let (src, size) = build_table(data.clone());
+	let (src, _size) = build_table(data.clone());
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	let test_cases = vec![("item_01", 0), ("item_03", 2), ("item_05", 4)];
 
@@ -1194,7 +1189,7 @@ fn test_table_iterator_seek_then_iterate() {
 
 		let internal_key =
 			InternalKey::new(Vec::from(seek_key.as_bytes()), 1, InternalKeyKind::Set, 0);
-		iter.seek(&internal_key.encode()).unwrap();
+		iter.seek(&internal_key.encode()).await.unwrap();
 
 		assert!(iter.valid(), "Iterator should be valid after seeking to '{seek_key}'");
 
@@ -1206,7 +1201,7 @@ fn test_table_iterator_seek_then_iterate() {
 			let value_str = std::str::from_utf8(current_value).unwrap();
 			remaining_items.push((key_str.to_string(), value_str.to_string()));
 
-			if !iter.next().unwrap() {
+			if !iter.next().await.unwrap() {
 				break;
 			}
 		}
@@ -1236,8 +1231,8 @@ fn test_table_iterator_seek_then_iterate() {
 	}
 }
 
-#[test]
-fn test_table_iterator_seek_behavior() {
+#[tokio::test]
+async fn test_table_iterator_seek_behavior() {
 	let data = vec![
 		("key_001", "val_001"),
 		("key_002", "val_002"),
@@ -1246,22 +1241,22 @@ fn test_table_iterator_seek_behavior() {
 		("key_010", "val_010"),
 	];
 
-	let (src, size) = build_table(data.clone());
+	let (src, _size) = build_table(data.clone());
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Test seek to existing key
 	{
 		let mut iter = table.iter(None).unwrap();
 		let seek_key = InternalKey::new(Vec::from(b"key_005"), 1, InternalKeyKind::Set, 0);
-		iter.seek(&seek_key.encode()).unwrap();
+		iter.seek(&seek_key.encode()).await.unwrap();
 
 		assert!(iter.valid(), "Iterator should be valid after seeking to existing key");
 		let current_key = iter.key();
 		let found_key = std::str::from_utf8(current_key.user_key()).unwrap();
 		assert_eq!(found_key, "key_005", "Should find the exact key we sought");
 
-		let remaining_collected = collect_iter(&mut iter);
+		let remaining_collected = collect_iter(&mut iter).await;
 		let remaining: Vec<_> = remaining_collected
 			.iter()
 			.map(|(k, v)| {
@@ -1288,7 +1283,7 @@ fn test_table_iterator_seek_behavior() {
 	{
 		let mut iter = table.iter(None).unwrap();
 		let seek_key = InternalKey::new(Vec::from(b"key_003"), 1, InternalKeyKind::Set, 0);
-		iter.seek(&seek_key.encode()).unwrap();
+		iter.seek(&seek_key.encode()).await.unwrap();
 
 		assert!(iter.valid(), "Iterator should be valid after seeking to non-existing key");
 		let current_key = iter.key();
@@ -1300,14 +1295,14 @@ fn test_table_iterator_seek_behavior() {
 	{
 		let mut iter = table.iter(None).unwrap();
 		let seek_key = InternalKey::new(Vec::from(b"key_999"), 1, InternalKeyKind::Set, 0);
-		iter.seek(&seek_key.encode()).unwrap();
+		iter.seek(&seek_key.encode()).await.unwrap();
 
 		assert!(!iter.valid(), "Iterator should be invalid after seeking past end");
 	}
 }
 
-#[test]
-fn test_table_iterator_performance_regression() {
+#[tokio::test]
+async fn test_table_iterator_performance_regression() {
 	let mut large_data = Vec::new();
 	for i in 0..1000 {
 		large_data.push((format!("key_{i:06}"), format!("value_{i:06}")));
@@ -1316,15 +1311,15 @@ fn test_table_iterator_performance_regression() {
 	let large_data_refs: Vec<(&str, &str)> =
 		large_data.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-	let (src, size) = build_table(large_data_refs);
+	let (src, _size) = build_table(large_data_refs);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	use std::time::Instant;
 
 	let start = Instant::now();
 	let mut iter = table.iter(None).unwrap();
-	let count = count_iter(&mut iter).unwrap();
+	let count = count_iter(&mut iter).await.unwrap();
 	let duration = start.elapsed();
 
 	assert_eq!(count, 1000, "Should iterate through all 1000 items");
@@ -1336,7 +1331,7 @@ fn test_table_iterator_performance_regression() {
 		let mut iter = table.iter(None).unwrap();
 		let seek_key =
 			InternalKey::new(format!("key_{i:06}").into_bytes(), 1, InternalKeyKind::Set, 0);
-		iter.seek(&seek_key.encode()).unwrap();
+		iter.seek(&seek_key.encode()).await.unwrap();
 		assert!(iter.valid(), "Seek to key_{i:06} should succeed");
 	}
 	let seek_duration = start.elapsed();
@@ -1344,21 +1339,21 @@ fn test_table_iterator_performance_regression() {
 	assert!(seek_duration.as_millis() < 100, "Seek operations took too long: {seek_duration:?}");
 }
 
-#[test]
-fn test_table_iterator_state_invariants() {
+#[tokio::test]
+async fn test_table_iterator_state_invariants() {
 	let data = vec![("a", "1"), ("b", "2"), ("c", "3"), ("d", "4")];
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_first().unwrap();
+	iter.seek_to_first().await.unwrap();
 
 	while iter.valid() {
 		let _key = iter.key();
 		let _value = iter.value_encoded();
 
-		if !iter.next().unwrap() {
+		if !iter.next().await.unwrap() {
 			break;
 		}
 	}
@@ -1366,10 +1361,13 @@ fn test_table_iterator_state_invariants() {
 	assert!(!iter.valid(), "Iterator should be invalid after exhaustion");
 
 	for _ in 0..5 {
-		assert!(!iter.next().unwrap(), "next() should continue returning false after exhaustion");
+		assert!(
+			!iter.next().await.unwrap(),
+			"next() should continue returning false after exhaustion"
+		);
 		assert!(!iter.valid(), "Iterator should remain invalid");
 
-		let next_result = iter.next();
+		let next_result = iter.next().await;
 		assert!(
 			next_result.is_ok() && !next_result.unwrap(),
 			"next() should continue returning Ok(false) after exhaustion"
@@ -1377,18 +1375,18 @@ fn test_table_iterator_state_invariants() {
 	}
 }
 
-#[test]
-fn test_table_iterator_multiple_iterations() {
+#[tokio::test]
+async fn test_table_iterator_multiple_iterations() {
 	let data = vec![("alpha", "a"), ("beta", "b"), ("gamma", "g")];
 
-	let (src, size) = build_table(data.clone());
+	let (src, _size) = build_table(data.clone());
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Create multiple iterators and verify they work independently
 	for iteration in 0..3 {
 		let mut iter = table.iter(None).unwrap();
-		let collected = collect_all(&mut iter).unwrap();
+		let collected = collect_all(&mut iter).await.unwrap();
 
 		assert_eq!(
 			collected.len(),
@@ -1417,22 +1415,22 @@ fn test_table_iterator_multiple_iterations() {
 	}
 }
 
-#[test]
-fn test_table_iterator_positioning_edge_cases() {
+#[tokio::test]
+async fn test_table_iterator_positioning_edge_cases() {
 	// Test 1: Empty table
 	// Note: An empty SSTable has no valid index blocks, so seek operations
 	// return errors. This is expected behavior - empty SSTables are edge cases
 	// that shouldn't normally occur in production.
 	{
 		let empty_data: Vec<(&str, &str)> = vec![];
-		let (src, size) = build_table(empty_data);
+		let (src, _size) = build_table(empty_data);
 		let opts = default_opts();
-		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+		let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 		let mut iter = table.iter(None).unwrap();
 
 		// next() tries to seek_to_first() which fails on empty table (no valid blocks)
-		let result = iter.next();
+		let result = iter.next().await;
 		assert!(result.is_err(), "next() on empty table should return error (no valid blocks)");
 
 		// Iterator should not be valid
@@ -1442,39 +1440,39 @@ fn test_table_iterator_positioning_edge_cases() {
 	// Test 2: Single item table
 	{
 		let single_data = vec![("single", "item")];
-		let (src, size) = build_table(single_data);
+		let (src, _size) = build_table(single_data);
 		let opts = default_opts();
-		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+		let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 		let mut iter = table.iter(None).unwrap();
 
-		assert!(iter.next().unwrap(), "First advance should succeed on single-item table");
+		assert!(iter.next().await.unwrap(), "First advance should succeed on single-item table");
 		assert!(iter.valid(), "Iterator should be valid after first advance");
 
-		assert!(!iter.next().unwrap(), "Second advance should fail on single-item table");
+		assert!(!iter.next().await.unwrap(), "Second advance should fail on single-item table");
 		assert!(!iter.valid(), "Iterator should be invalid after second advance");
 	}
 
 	// Test 3: Reset behavior after exhaustion
 	{
 		let data = vec![("a", "1"), ("b", "2")];
-		let (src, size) = build_table(data);
+		let (src, _size) = build_table(data);
 		let opts = default_opts();
-		let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+		let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 		let mut iter = table.iter(None).unwrap();
 
 		// Exhaust the iterator
-		while iter.next().unwrap() {
+		while iter.next().await.unwrap() {
 			// just advance
 		}
 		assert!(!iter.valid(), "Iterator should be invalid after exhaustion");
 
 		// Further operations should not restart the iterator
-		assert!(!iter.next().unwrap(), "next() after exhaustion should return false");
+		assert!(!iter.next().await.unwrap(), "next() after exhaustion should return false");
 		assert!(!iter.valid(), "Iterator should remain invalid");
 
-		let next_result = iter.next();
+		let next_result = iter.next().await;
 		assert!(
 			next_result.is_ok() && !next_result.unwrap(),
 			"next() after exhaustion should return Ok(false)"
@@ -1482,32 +1480,32 @@ fn test_table_iterator_positioning_edge_cases() {
 	}
 }
 
-#[test]
-fn test_table_iterator_next_vs_advance_consistency() {
+#[tokio::test]
+async fn test_table_iterator_next_vs_advance_consistency() {
 	let data = vec![("x", "1"), ("y", "2"), ("z", "3")];
-	let (src, size) = build_table(data.clone());
+	let (src, _size) = build_table(data.clone());
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Test with manual next() loop - need to position first
 	let mut iter1 = table.iter(None).unwrap();
-	iter1.seek_to_first().unwrap();
+	iter1.seek_to_first().await.unwrap();
 	let mut collected_via_advance = Vec::new();
 	while iter1.valid() {
 		collected_via_advance
 			.push((iter1.key().to_owned(), iter1.value_encoded().unwrap().to_vec()));
-		if !iter1.next().unwrap() {
+		if !iter1.next().await.unwrap() {
 			break;
 		}
 	}
 
 	// Test with standard iterator interface
 	let mut iter2 = table.iter(None).unwrap();
-	iter2.seek_to_first().unwrap();
+	iter2.seek_to_first().await.unwrap();
 	let mut collected_via_next = Vec::new();
 	while iter2.valid() {
 		collected_via_next.push((iter2.key().to_owned(), iter2.value_encoded().unwrap().to_vec()));
-		if !iter2.next().unwrap() {
+		if !iter2.next().await.unwrap() {
 			break;
 		}
 	}
@@ -1534,8 +1532,8 @@ fn test_table_iterator_next_vs_advance_consistency() {
 	}
 }
 
-#[test]
-fn test_table_iterator_basic_correctness() {
+#[tokio::test]
+async fn test_table_iterator_basic_correctness() {
 	let mut large_data = Vec::new();
 	for i in 0..50 {
 		large_data.push((format!("key_{i:03}"), format!("value_{i:03}")));
@@ -1544,12 +1542,12 @@ fn test_table_iterator_basic_correctness() {
 	let large_data_refs: Vec<(&str, &str)> =
 		large_data.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
 
-	let (src, size) = build_table(large_data_refs);
+	let (src, _size) = build_table(large_data_refs);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	let mut iter = table.iter(None).unwrap();
-	let collected = collect_all(&mut iter).unwrap();
+	let collected = collect_all(&mut iter).await.unwrap();
 
 	assert_eq!(collected.len(), 50, "Should collect exactly 50 items");
 
@@ -1566,15 +1564,15 @@ fn test_table_iterator_basic_correctness() {
 	}
 }
 
-#[test]
-fn test_table_with_partitioned_index() {
+#[tokio::test]
+async fn test_table_with_partitioned_index() {
 	let mut opts = default_opts_mut();
 	opts.index_partition_size = 100; // Small partition size to force multiple partitions
 	opts.block_size = 64; // Small block size to create more data blocks
 	let opts = Arc::new(opts);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 	// Add enough entries to create multiple data blocks and index partitions
 	for i in 0..100 {
@@ -1585,11 +1583,11 @@ fn test_table_with_partitioned_index() {
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	assert!(size > 0, "Table should have non-zero size");
+	let _size = writer.finish().unwrap();
+	assert!(_size > 0, "Table should have non-zero size");
 
 	// Now read the table back with partitioned index
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, buffer).await.unwrap());
 
 	// Verify it's using partitioned index
 	match &table.index_block {
@@ -1609,7 +1607,7 @@ fn test_table_with_partitioned_index() {
 			0,
 		);
 
-		let result = table.get(&internal_key).unwrap();
+		let result = table.get(&internal_key).await.unwrap();
 		assert!(result.is_some(), "Key '{key}' not found in table");
 
 		if let Some((found_key, found_value)) = result {
@@ -1624,7 +1622,7 @@ fn test_table_with_partitioned_index() {
 
 	// Test full iteration
 	let mut iter = table.iter(None).unwrap();
-	let collected = collect_all(&mut iter).unwrap();
+	let collected = collect_all(&mut iter).await.unwrap();
 	assert_eq!(collected.len(), 100, "Should iterate through all entries");
 
 	// Verify iteration order and content
@@ -1645,14 +1643,14 @@ fn test_table_with_partitioned_index() {
 	}
 }
 
-#[test]
-fn test_get_nonexistent_key_returns_none() {
+#[tokio::test]
+async fn test_get_nonexistent_key_returns_none() {
 	// Regression test: get() should return None for non-existent keys,
 	// even when a lexicographically greater key exists in the table.
 	// Disable bloom filter so we actually exercise the key comparison logic.
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add only key_bbb to the table
 	let key = b"key_bbb";
@@ -1660,8 +1658,8 @@ fn test_get_nonexistent_key_returns_none() {
 	let internal_key = InternalKey::new(Vec::from(key), 1, InternalKeyKind::Set, 0);
 	writer.add(internal_key, value).unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	// Try to get key_aaa which does NOT exist
 	// key_aaa < key_bbb lexicographically
@@ -1672,7 +1670,7 @@ fn test_get_nonexistent_key_returns_none() {
 		0,
 	);
 
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	// The bug: with >= comparison, this incorrectly returns Some((key_bbb,
 	// value_bbb)) The fix: with == comparison, this correctly returns None
@@ -1686,14 +1684,14 @@ fn test_get_nonexistent_key_returns_none() {
 	);
 }
 
-#[test]
-fn test_get_same_key_different_sequence_numbers() {
+#[tokio::test]
+async fn test_get_same_key_different_sequence_numbers() {
 	// Validates fix returns value when user_key matches, even with different
 	// seq_nums Internal ordering: user_key asc, seq_num DESC (reversed: higher
 	// seq_nums sort first)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let user_key = b"my_key";
 
@@ -1703,25 +1701,25 @@ fn test_get_same_key_different_sequence_numbers() {
 	let key2 = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
 	writer.add(key2, b"value_50").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key_higher = InternalKey::new(Vec::from(user_key), 200, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key_higher).unwrap();
+	let result = table.get(&lookup_key_higher).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, found_value) = result.unwrap();
 	assert_eq!(found_key.user_key.as_slice(), user_key);
 	assert_eq!(&found_value, b"value_100");
 
 	let lookup_key_between = InternalKey::new(Vec::from(user_key), 75, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key_between).unwrap();
+	let result = table.get(&lookup_key_between).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, found_value) = result.unwrap();
 	assert_eq!(found_key.user_key.as_slice(), user_key);
 	assert_eq!(&found_value, b"value_50");
 
 	let lookup_key_exact = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key_exact).unwrap();
+	let result = table.get(&lookup_key_exact).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, found_value) = result.unwrap();
 	assert_eq!(found_key.user_key.as_slice(), user_key);
@@ -1730,7 +1728,7 @@ fn test_get_same_key_different_sequence_numbers() {
 	let different_user_key = b"other_key";
 	let lookup_key_different =
 		InternalKey::new(Vec::from(different_user_key), 200, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key_different).unwrap();
+	let result = table.get(&lookup_key_different).await.unwrap();
 	assert!(
 		result.is_none(),
 		"Should return None for different user_key, got: {:?}",
@@ -1741,12 +1739,12 @@ fn test_get_same_key_different_sequence_numbers() {
 	);
 }
 
-#[test]
-fn test_get_with_lower_sequence_number() {
+#[tokio::test]
+async fn test_get_with_lower_sequence_number() {
 	// Snapshot at seq=25 can't see future version at seq=50
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1761,11 +1759,11 @@ fn test_get_with_lower_sequence_number() {
 	let key_zzz = InternalKey::new(Vec::from(b"zzz_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_zzz, b"value_zzz").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key = InternalKey::new(Vec::from(user_key), 25, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	if result.is_some() {
 		let (found_key, found_value) = result.unwrap();
@@ -1779,26 +1777,26 @@ fn test_get_with_lower_sequence_number() {
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_get_empty_table() {
+#[tokio::test]
+async fn test_get_empty_table() {
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key = InternalKey::new(Vec::from(b"any_key"), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key);
+	let result = table.get(&lookup_key).await;
 	assert!(result.is_err());
 }
 
-#[test]
-fn test_get_multiple_keys_with_sequence_variations() {
+#[tokio::test]
+async fn test_get_multiple_keys_with_sequence_variations() {
 	// Ensures fix doesn't cause cross-key contamination with different seq_nums
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key_a = InternalKey::new(Vec::from(b"key_a"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_a, b"value_a_100").unwrap();
@@ -1809,38 +1807,38 @@ fn test_get_multiple_keys_with_sequence_variations() {
 	let key_c = InternalKey::new(Vec::from(b"key_c"), 75, InternalKeyKind::Set, 0);
 	writer.add(key_c, b"value_c_75").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_b_low = InternalKey::new(Vec::from(b"key_b"), 25, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_b_low).unwrap();
+	let result = table.get(&lookup_b_low).await.unwrap();
 	assert!(result.is_none());
 
 	let lookup_a_high = InternalKey::new(Vec::from(b"key_a"), 150, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_a_high).unwrap();
+	let result = table.get(&lookup_a_high).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, found_value) = result.unwrap();
 	assert_eq!(found_key.user_key.as_slice(), b"key_a");
 	assert_eq!(&found_value, b"value_a_100");
 
 	let lookup_c_exact = InternalKey::new(Vec::from(b"key_c"), 75, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_c_exact).unwrap();
+	let result = table.get(&lookup_c_exact).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, found_value) = result.unwrap();
 	assert_eq!(found_key.user_key.as_slice(), b"key_c");
 	assert_eq!(&found_value, b"value_c_75");
 
 	let lookup_key_b5 = InternalKey::new(Vec::from(b"key_b5"), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key_b5).unwrap();
+	let result = table.get(&lookup_key_b5).await.unwrap();
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_get_boundary_conditions() {
+#[tokio::test]
+async fn test_get_boundary_conditions() {
 	// Edge cases with sequence number boundaries (seq=0, seq=MAX, seq=1)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1852,28 +1850,28 @@ fn test_get_boundary_conditions() {
 	let key_zzz = InternalKey::new(Vec::from(b"zzz_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_zzz, b"value_zzz").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_min = InternalKey::new(Vec::from(user_key), 0, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_min).unwrap();
+	let result = table.get(&lookup_min).await.unwrap();
 	assert!(result.is_none());
 
 	let lookup_max =
 		InternalKey::new(Vec::from(user_key), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_max).unwrap();
+	let result = table.get(&lookup_max).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, found_value) = result.unwrap();
 	assert_eq!(found_key.user_key.as_slice(), user_key);
 	assert_eq!(&found_value, b"value_100");
 
 	let lookup_one = InternalKey::new(Vec::from(user_key), 1, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_one).unwrap();
+	let result = table.get(&lookup_one).await.unwrap();
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_get_lookup_higher_than_stored() {
+#[tokio::test]
+async fn test_get_lookup_higher_than_stored() {
 	// Snapshot at seq=50 can see older version at seq=25
 	// Internal ordering: user_key asc, seq_num DESC (reversed!)
 	// stored(25).cmp(lookup(50)) = lookup.seq_num().cmp(stored.seq_num()) =
@@ -1881,7 +1879,7 @@ fn test_get_lookup_higher_than_stored() {
 	// though 25 < 50 numerically)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"aaa_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1896,11 +1894,11 @@ fn test_get_lookup_higher_than_stored() {
 	let key_zzz = InternalKey::new(Vec::from(b"zzz_key"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_zzz, b"value_zzz").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	assert!(result.is_some());
 	let (found_key, found_value) = result.unwrap();
@@ -1909,12 +1907,12 @@ fn test_get_lookup_higher_than_stored() {
 	assert_eq!(&found_value, b"value_25");
 }
 
-#[test]
-fn test_get_partition_index_sequence_numbers() {
+#[tokio::test]
+async fn test_get_partition_index_sequence_numbers() {
 	// Partition index handles sequence numbers correctly across multiple blocks
 	let opts = Arc::new(Options::new().with_filter_policy(None).with_block_size(512));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	for i in 0..20 {
 		let key = format!("aaa_key_{:03}", i);
@@ -1936,13 +1934,13 @@ fn test_get_partition_index_sequence_numbers() {
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	assert!(table.meta.properties.block_count > 1);
 
 	let lookup_high = InternalKey::new(Vec::from(target_key), 1000, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_high).unwrap();
+	let result = table.get(&lookup_high).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, found_value) = result.unwrap();
 	assert_eq!(found_key.user_key.as_slice(), target_key);
@@ -1950,7 +1948,7 @@ fn test_get_partition_index_sequence_numbers() {
 	assert_eq!(&found_value, b"value_500");
 
 	let lookup_exact = InternalKey::new(Vec::from(target_key), 500, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_exact).unwrap();
+	let result = table.get(&lookup_exact).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, found_value) = result.unwrap();
 	assert_eq!(found_key.user_key.as_slice(), target_key);
@@ -1958,23 +1956,23 @@ fn test_get_partition_index_sequence_numbers() {
 	assert_eq!(&found_value, b"value_500");
 
 	let lookup_low = InternalKey::new(Vec::from(target_key), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_low).unwrap();
+	let result = table.get(&lookup_low).await.unwrap();
 	assert!(result.is_none());
 
 	let filler_key = b"zzz_key_010";
 	let lookup_filler = InternalKey::new(Vec::from(filler_key), 1000, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_filler).unwrap();
+	let result = table.get(&lookup_filler).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, _) = result.unwrap();
 	assert_eq!(found_key.user_key.as_slice(), filler_key);
 }
 
-#[test]
-fn test_get_nonexistent_key_greater_than_all() {
+#[tokio::test]
+async fn test_get_nonexistent_key_greater_than_all() {
 	// Key greater than all stored keys should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -1985,21 +1983,21 @@ fn test_get_nonexistent_key_greater_than_all() {
 	let key_ccc = InternalKey::new(Vec::from(b"key_ccc"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_ccc, b"value_ccc").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key = InternalKey::new(Vec::from(b"key_zzz"), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_get_nonexistent_key_between_existing() {
+#[tokio::test]
+async fn test_get_nonexistent_key_between_existing() {
 	// Key between existing keys should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -2010,21 +2008,21 @@ fn test_get_nonexistent_key_between_existing() {
 	let key_eee = InternalKey::new(Vec::from(b"key_eee"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_eee, b"value_eee").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key = InternalKey::new(Vec::from(b"key_bbb"), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_get_with_tombstone() {
+#[tokio::test]
+async fn test_get_with_tombstone() {
 	// Tombstones should be found and returned
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key_other = InternalKey::new(Vec::from(b"key_other"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_other, b"value_other").unwrap();
@@ -2035,11 +2033,11 @@ fn test_get_with_tombstone() {
 	let key_zzz = InternalKey::new(Vec::from(b"key_zzz"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_zzz, b"value_zzz").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key = InternalKey::new(Vec::from(b"key_target"), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	assert!(result.is_some());
 	let (found_key, _) = result.unwrap();
@@ -2047,12 +2045,12 @@ fn test_get_with_tombstone() {
 	assert!(found_key.is_tombstone());
 }
 
-#[test]
-fn test_get_nonexistent_with_similar_prefix() {
+#[tokio::test]
+async fn test_get_nonexistent_with_similar_prefix() {
 	// Prefix of existing keys should not match
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key1 = InternalKey::new(Vec::from(b"user_data"), 100, InternalKeyKind::Set, 0);
 	writer.add(key1, b"value1").unwrap();
@@ -2063,21 +2061,21 @@ fn test_get_nonexistent_with_similar_prefix() {
 	let key3 = InternalKey::new(Vec::from(b"username"), 100, InternalKeyKind::Set, 0);
 	writer.add(key3, b"value3").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key = InternalKey::new(Vec::from(b"user"), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_get_nonexistent_empty_key() {
+#[tokio::test]
+async fn test_get_nonexistent_empty_key() {
 	// Empty key should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key_aaa = InternalKey::new(Vec::from(b"key_aaa"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_aaa, b"value_aaa").unwrap();
@@ -2085,21 +2083,21 @@ fn test_get_nonexistent_empty_key() {
 	let key_bbb = InternalKey::new(Vec::from(b"key_bbb"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_bbb, b"value_bbb").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key = InternalKey::new(Vec::from(b""), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_get_nonexistent_with_special_chars() {
+#[tokio::test]
+async fn test_get_nonexistent_with_special_chars() {
 	// Binary keys with special bytes handled correctly
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key1 = InternalKey::new(Vec::from(b"key\x00"), 100, InternalKeyKind::Set, 0);
 	writer.add(key1, b"value0").unwrap();
@@ -2110,21 +2108,21 @@ fn test_get_nonexistent_with_special_chars() {
 	let key3 = InternalKey::new(Vec::from(b"key\xFF"), 100, InternalKeyKind::Set, 0);
 	writer.add(key3, b"value_ff").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key = InternalKey::new(Vec::from(b"key\x02"), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_get_nonexistent_in_large_table() {
+#[tokio::test]
+async fn test_get_nonexistent_in_large_table() {
 	// Non-existent key in multi-block table should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None).with_block_size(512));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	for i in 0..100 {
 		if i == 50 {
@@ -2137,23 +2135,23 @@ fn test_get_nonexistent_in_large_table() {
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	assert!(table.meta.properties.block_count > 1);
 
 	let lookup_key = InternalKey::new(Vec::from(b"key_050"), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_get_all_keys_same_prefix_different_suffix() {
+#[tokio::test]
+async fn test_get_all_keys_same_prefix_different_suffix() {
 	// Keys with same prefix but different suffix don't match
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key_a = InternalKey::new(Vec::from(b"prefix_a"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_a, b"value_a").unwrap();
@@ -2164,22 +2162,22 @@ fn test_get_all_keys_same_prefix_different_suffix() {
 	let key_c = InternalKey::new(Vec::from(b"prefix_c"), 100, InternalKeyKind::Set, 0);
 	writer.add(key_c, b"value_c").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	let lookup_key = InternalKey::new(Vec::from(b"prefix_d"), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_table_iterator_seek_nonexistent_key() {
+#[tokio::test]
+async fn test_table_iterator_seek_nonexistent_key() {
 	// Test that seeking to a non-existent key positions the iterator
 	// at the next greater key (correct iterator semantics)
 	let opts = Arc::new(Options::default());
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add only key_bbb to the table
 	let key = b"key_bbb";
@@ -2187,8 +2185,8 @@ fn test_table_iterator_seek_nonexistent_key() {
 	let internal_key = InternalKey::new(Vec::from(key), 1, InternalKeyKind::Set, 0);
 	writer.add(internal_key, value).unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Seek to key_aaa which does NOT exist
 	// key_aaa < key_bbb lexicographically
@@ -2199,7 +2197,7 @@ fn test_table_iterator_seek_nonexistent_key() {
 		InternalKeyKind::Set,
 		0,
 	);
-	iter.seek(&lookup_key.encode()).unwrap();
+	iter.seek(&lookup_key.encode()).await.unwrap();
 
 	// Iterator behavior: seek positions at next >= key
 	assert!(iter.valid(), "Iterator should be valid (positioned at next key)");
@@ -2217,49 +2215,49 @@ fn test_table_iterator_seek_nonexistent_key() {
 	assert!(!is_exact_match, "Caller should check for exact match if needed");
 }
 
-#[test]
-fn test_table_iterator_seek_nonexistent_past_end() {
+#[tokio::test]
+async fn test_table_iterator_seek_nonexistent_past_end() {
 	// Test that seeking past all keys makes iterator invalid
 	let opts = Arc::new(Options::default());
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key = b"key_bbb";
 	let value = b"value_bbb";
 	let internal_key = InternalKey::new(Vec::from(key), 1, InternalKeyKind::Set, 0);
 	writer.add(internal_key, value).unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Seek to key_zzz which is past all keys
 	let mut iter = table.iter(None).unwrap();
 	let lookup_key = InternalKey::new(Vec::from(b"key_zzz"), 2, InternalKeyKind::Set, 0);
-	iter.seek(&lookup_key.encode()).unwrap();
+	iter.seek(&lookup_key.encode()).await.unwrap();
 
 	// Iterator should be invalid (no more keys)
 	assert!(!iter.valid(), "Iterator should be invalid when seeking past all keys");
 }
 
-#[test]
-fn test_table_iterator_seek_exact_match() {
+#[tokio::test]
+async fn test_table_iterator_seek_exact_match() {
 	// Test that seeking to an existing key positions at that key
 	let opts = Arc::new(Options::default());
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let key = b"key_bbb";
 	let value = b"value_bbb";
 	let internal_key = InternalKey::new(Vec::from(key), 1, InternalKeyKind::Set, 0);
 	writer.add(internal_key, value).unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Seek to key_bbb which exists
 	let mut iter = table.iter(None).unwrap();
 	let lookup_key = InternalKey::new(Vec::from(b"key_bbb"), 2, InternalKeyKind::Set, 0);
-	iter.seek(&lookup_key.encode()).unwrap();
+	iter.seek(&lookup_key.encode()).await.unwrap();
 
 	assert!(iter.valid(), "Iterator should be valid");
 
@@ -2271,8 +2269,8 @@ fn test_table_iterator_seek_exact_match() {
 	);
 }
 
-#[test]
-fn test_table_iter_upper_bound_included() {
+#[tokio::test]
+async fn test_table_iter_upper_bound_included() {
 	// Use static strings to avoid lifetime issues
 	let data = vec![
 		("key_000", "value"),
@@ -2287,9 +2285,9 @@ fn test_table_iter_upper_bound_included() {
 		("key_009", "value"),
 	];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Iterate with range (Unbounded, Included("key_005"))
 	let mut iter = table
@@ -2300,11 +2298,11 @@ fn test_table_iter_upper_bound_included() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.next().unwrap() {
+		if !iter.next().await.unwrap() {
 			break;
 		}
 	}
@@ -2322,8 +2320,8 @@ fn test_table_iter_upper_bound_included() {
 	assert_eq!(results.last().unwrap(), "key_005");
 }
 
-#[test]
-fn test_table_iter_upper_bound_excluded() {
+#[tokio::test]
+async fn test_table_iter_upper_bound_excluded() {
 	// Use static strings to avoid lifetime issues
 	let data = vec![
 		("key_000", "value"),
@@ -2338,9 +2336,9 @@ fn test_table_iter_upper_bound_excluded() {
 		("key_009", "value"),
 	];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Iterate with range (Unbounded, Excluded("key_005"))
 	let mut iter = table
@@ -2351,11 +2349,11 @@ fn test_table_iter_upper_bound_excluded() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.next().unwrap() {
+		if !iter.next().await.unwrap() {
 			break;
 		}
 	}
@@ -2372,8 +2370,8 @@ fn test_table_iter_upper_bound_excluded() {
 	assert_eq!(results.last().unwrap(), "key_004");
 }
 
-#[test]
-fn test_table_iter_unbounded_reverse() {
+#[tokio::test]
+async fn test_table_iter_unbounded_reverse() {
 	// Use static strings to avoid lifetime issues
 	let data = vec![
 		("key_000", "value"),
@@ -2388,13 +2386,13 @@ fn test_table_iter_unbounded_reverse() {
 		("key_009", "value"),
 	];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// First test forward iteration to make sure table has data
 	let mut iter_temp = table.iter(None).unwrap();
-	let collected = collect_all(&mut iter_temp).unwrap();
+	let collected = collect_all(&mut iter_temp).await.unwrap();
 	assert_eq!(collected.len(), 10, "Forward iteration should return 10 items");
 
 	let forward_keys: Vec<String> = collected
@@ -2411,13 +2409,13 @@ fn test_table_iter_unbounded_reverse() {
 
 	// Test unbounded reverse iteration
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_last().unwrap(); // Position at the end for reverse iteration
+	iter.seek_to_last().await.unwrap(); // Position at the end for reverse iteration
 
 	let mut results = Vec::new();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -2427,8 +2425,8 @@ fn test_table_iter_unbounded_reverse() {
 	assert_eq!(results[9], "key_000");
 }
 
-#[test]
-fn test_table_iter_lower_bound_included_reverse() {
+#[tokio::test]
+async fn test_table_iter_lower_bound_included_reverse() {
 	// Use static strings to avoid lifetime issues
 	let data = vec![
 		("key_000", "value"),
@@ -2443,9 +2441,9 @@ fn test_table_iter_lower_bound_included_reverse() {
 		("key_009", "value"),
 	];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Iterate with range (Included("key_003"), Unbounded) using prev()
 	let mut iter = table
@@ -2456,11 +2454,11 @@ fn test_table_iter_lower_bound_included_reverse() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -2479,8 +2477,8 @@ fn test_table_iter_lower_bound_included_reverse() {
 	assert_eq!(results.last().unwrap(), "key_003");
 }
 
-#[test]
-fn test_table_iter_both_bounds() {
+#[tokio::test]
+async fn test_table_iter_both_bounds() {
 	// Use static strings to avoid lifetime issues
 	let data = vec![
 		("key_000", "value"),
@@ -2495,9 +2493,9 @@ fn test_table_iter_both_bounds() {
 		("key_009", "value"),
 	];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Iterate with range (Included("key_002"), Excluded("key_007"))
 	let mut iter = table
@@ -2506,13 +2504,13 @@ fn test_table_iter_both_bounds() {
 			Bound::Excluded(b"key_007".as_slice()),
 		)))
 		.unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 
 	let mut results = Vec::new();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.next().unwrap() {
+		if !iter.next().await.unwrap() {
 			break;
 		}
 	}
@@ -2526,8 +2524,8 @@ fn test_table_iter_both_bounds() {
 	assert_eq!(results[4], "key_006");
 }
 
-#[test]
-fn test_table_iter_unbounded() {
+#[tokio::test]
+async fn test_table_iter_unbounded() {
 	// Use static strings to avoid lifetime issues
 	let data = vec![
 		("key_000", "value"),
@@ -2542,20 +2540,20 @@ fn test_table_iter_unbounded() {
 		("key_009", "value"),
 	];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Test that (Bound::Unbounded, Bound::Unbounded) returns all items
 	let mut iter =
 		table.iter(Some(user_range_to_internal_range(Bound::Unbounded, Bound::Unbounded))).unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.next().unwrap() {
+		if !iter.next().await.unwrap() {
 			break;
 		}
 	}
@@ -2566,8 +2564,8 @@ fn test_table_iter_unbounded() {
 	assert_eq!(results[9], "key_009");
 }
 
-#[test]
-fn test_table_iter_forward_and_backward() {
+#[tokio::test]
+async fn test_table_iter_forward_and_backward() {
 	// Create enough data to span multiple blocks
 	// With block_size=32 and ~15 bytes per entry, 30 entries span ~15 blocks
 	let data = vec![
@@ -2603,18 +2601,18 @@ fn test_table_iter_forward_and_backward() {
 		("key_029", "value"),
 	];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Test forward iteration
 	let mut forward_iter = table.iter(None).unwrap();
-	forward_iter.seek_to_first().unwrap();
+	forward_iter.seek_to_first().await.unwrap();
 	let mut forward_keys = Vec::new();
 	while forward_iter.valid() {
 		let key = forward_iter.key();
 		forward_keys.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !forward_iter.next().unwrap() {
+		if !forward_iter.next().await.unwrap() {
 			break;
 		}
 	}
@@ -2624,12 +2622,12 @@ fn test_table_iter_forward_and_backward() {
 
 	// Test backward iteration on separate iterator
 	let mut backward_iter = table.iter(None).unwrap();
-	backward_iter.seek_to_last().unwrap();
+	backward_iter.seek_to_last().await.unwrap();
 	let mut backward_keys = Vec::new();
 	while backward_iter.valid() {
 		let key = backward_iter.key();
 		backward_keys.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !backward_iter.prev().unwrap() {
+		if !backward_iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -2639,12 +2637,12 @@ fn test_table_iter_forward_and_backward() {
 
 	// Test seeking to last and then going backward
 	let mut seek_iter = table.iter(None).unwrap();
-	seek_iter.seek_to_last().unwrap();
+	seek_iter.seek_to_last().await.unwrap();
 	let mut seek_backward = Vec::new();
 	while seek_iter.valid() {
 		let key = seek_iter.key();
 		seek_backward.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !seek_iter.prev().unwrap() {
+		if !seek_iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -2665,8 +2663,8 @@ fn test_table_iter_forward_and_backward() {
 	assert_eq!(seek_backward, backward_keys);
 }
 
-#[test]
-fn test_table_iter_upper_bound_excluded_reverse() {
+#[tokio::test]
+async fn test_table_iter_upper_bound_excluded_reverse() {
 	// Create table with multiple versions of the same key
 	let data = vec![
 		("key_000", "value", 1),
@@ -2683,9 +2681,9 @@ fn test_table_iter_upper_bound_excluded_reverse() {
 		("key_009", "value", 1),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Reverse iteration with EXCLUDED upper bound
 	let mut iter = table
@@ -2696,11 +2694,11 @@ fn test_table_iter_upper_bound_excluded_reverse() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_last().unwrap();
+	iter.seek_last().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -2715,8 +2713,8 @@ fn test_table_iter_upper_bound_excluded_reverse() {
 	assert!(!results.iter().any(|k| k == "key_005"), "key_005 should not appear in results");
 }
 
-#[test]
-fn test_table_iter_upper_bound_included_reverse_nonexistent_key() {
+#[tokio::test]
+async fn test_table_iter_upper_bound_included_reverse_nonexistent_key() {
 	let data = vec![
 		("key_000", "value"),
 		("key_001", "value"),
@@ -2730,9 +2728,9 @@ fn test_table_iter_upper_bound_included_reverse_nonexistent_key() {
 		("key_009", "value"),
 	];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Reverse iteration with INCLUDED upper bound on non-existent key
 	let mut iter = table
@@ -2743,11 +2741,11 @@ fn test_table_iter_upper_bound_included_reverse_nonexistent_key() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_last().unwrap();
+	iter.seek_last().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -2763,8 +2761,8 @@ fn test_table_iter_upper_bound_included_reverse_nonexistent_key() {
 	assert!(!results.iter().any(|k| k == "key_006"), "key_006 should not appear");
 }
 
-#[test]
-fn test_table_iter_lower_bound_excluded_forward_with_multiple_versions() {
+#[tokio::test]
+async fn test_table_iter_lower_bound_excluded_forward_with_multiple_versions() {
 	let data = vec![
 		("key_000", "v1", 1),
 		("key_001", "v1", 1),
@@ -2777,9 +2775,9 @@ fn test_table_iter_lower_bound_excluded_forward_with_multiple_versions() {
 		("key_005", "v1", 1),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Forward iteration with EXCLUDED lower bound
 	let mut iter = table
@@ -2790,11 +2788,11 @@ fn test_table_iter_lower_bound_excluded_forward_with_multiple_versions() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.next().unwrap() {
+		if !iter.next().await.unwrap() {
 			break;
 		}
 	}
@@ -2806,8 +2804,8 @@ fn test_table_iter_lower_bound_excluded_forward_with_multiple_versions() {
 	assert!(!results.iter().any(|k| k == "key_003"), "key_003 should not appear in results");
 }
 
-#[test]
-fn test_table_iter_excluded_bound_across_multiple_blocks() {
+#[tokio::test]
+async fn test_table_iter_excluded_bound_across_multiple_blocks() {
 	// Test that excluded lower bound correctly skips ALL versions of a key
 	// even when they span multiple blocks
 	let mut data = vec![];
@@ -2820,9 +2818,9 @@ fn test_table_iter_excluded_bound_across_multiple_blocks() {
 	data.push(("key_004", "value", 1));
 	data.push(("key_005", "value", 1));
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Forward iteration with excluded lower bound
 	let mut iter = table
@@ -2831,14 +2829,14 @@ fn test_table_iter_excluded_bound_across_multiple_blocks() {
 			Bound::Unbounded,
 		)))
 		.unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 
 	let mut results = Vec::new();
 	while iter.valid() {
 		let key = iter.key();
 		let user_key = String::from_utf8(key.user_key().to_vec()).unwrap();
 		results.push(user_key);
-		if !iter.next().unwrap() {
+		if !iter.next().await.unwrap() {
 			break;
 		}
 	}
@@ -2861,8 +2859,8 @@ fn test_table_iter_excluded_bound_across_multiple_blocks() {
 	assert_eq!(results.len(), 2, "Should return exactly 2 keys, got {}", results.len());
 }
 
-#[test]
-fn test_table_iter_excluded_bound_across_partitions_reverse() {
+#[tokio::test]
+async fn test_table_iter_excluded_bound_across_partitions_reverse() {
 	// Test reverse iteration with excluded upper bound across multiple versions
 	let mut data = vec![];
 
@@ -2879,9 +2877,9 @@ fn test_table_iter_excluded_bound_across_partitions_reverse() {
 	data.push(("key_004", "value", 1));
 	data.push(("key_005", "value", 1));
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Reverse iteration with excluded upper bound
 	let mut iter = table
@@ -2892,12 +2890,12 @@ fn test_table_iter_excluded_bound_across_partitions_reverse() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_last().unwrap();
+	iter.seek_last().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		let user_key = String::from_utf8(key.user_key().to_vec()).unwrap();
 		results.push(user_key);
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -2922,8 +2920,8 @@ fn test_table_iter_excluded_bound_across_partitions_reverse() {
 	assert_eq!(results[1], "key_001");
 }
 
-#[test]
-fn test_table_iter_both_bounds_excluded_same_key() {
+#[tokio::test]
+async fn test_table_iter_both_bounds_excluded_same_key() {
 	// Test empty range: (Excluded("key_003"), Excluded("key_003"))
 	// This should return no items
 	let data = vec![
@@ -2936,9 +2934,9 @@ fn test_table_iter_both_bounds_excluded_same_key() {
 		("key_005", "value", 1),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Forward iteration with both bounds excluded at same key
 	let mut iter = table
@@ -2947,9 +2945,9 @@ fn test_table_iter_both_bounds_excluded_same_key() {
 			Bound::Excluded(b"key_003".as_slice()),
 		)))
 		.unwrap();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 
-	let results = collect_all(&mut iter).unwrap();
+	let results = collect_all(&mut iter).await.unwrap();
 
 	// Should return NO items (empty range)
 	assert_eq!(
@@ -2960,8 +2958,8 @@ fn test_table_iter_both_bounds_excluded_same_key() {
 	);
 }
 
-#[test]
-fn test_table_iter_both_bounds_excluded_same_key_reverse() {
+#[tokio::test]
+async fn test_table_iter_both_bounds_excluded_same_key_reverse() {
 	// Test empty range in reverse: (Excluded("key_003"), Excluded("key_003"))
 	let data = vec![
 		("key_001", "value", 1),
@@ -2973,9 +2971,9 @@ fn test_table_iter_both_bounds_excluded_same_key_reverse() {
 		("key_005", "value", 1),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Reverse iteration with both bounds excluded at same key
 	let mut iter = table
@@ -2986,10 +2984,10 @@ fn test_table_iter_both_bounds_excluded_same_key_reverse() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_last().unwrap();
+	iter.seek_last().await.unwrap();
 	while iter.valid() {
 		results.push((iter.key().to_owned(), iter.value_encoded().unwrap().to_vec()));
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -3003,8 +3001,8 @@ fn test_table_iter_both_bounds_excluded_same_key_reverse() {
 	);
 }
 
-#[test]
-fn test_table_iter_excluded_bounds_adjacent_keys() {
+#[tokio::test]
+async fn test_table_iter_excluded_bounds_adjacent_keys() {
 	// Test: (Excluded("key_002"), Excluded("key_004"))
 	// Should only return key_003 (all versions)
 	let data = vec![
@@ -3019,9 +3017,9 @@ fn test_table_iter_excluded_bounds_adjacent_keys() {
 		("key_005", "value", 1),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Forward iteration
 	let mut iter = table
@@ -3032,12 +3030,12 @@ fn test_table_iter_excluded_bounds_adjacent_keys() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		let user_key = String::from_utf8(key.user_key().to_vec()).unwrap();
 		results.push((user_key, key.seq_num()));
-		if !iter.next().unwrap() {
+		if !iter.next().await.unwrap() {
 			break;
 		}
 	}
@@ -3060,8 +3058,8 @@ fn test_table_iter_excluded_bounds_adjacent_keys() {
 	assert_eq!(results[2].1, 10);
 }
 
-#[test]
-fn test_table_iter_multiple_versions_at_both_bounds() {
+#[tokio::test]
+async fn test_table_iter_multiple_versions_at_both_bounds() {
 	// Test with multiple versions at both excluded bounds
 	let data = vec![
 		// Multiple versions of lower bound (excluded)
@@ -3079,9 +3077,9 @@ fn test_table_iter_multiple_versions_at_both_bounds() {
 		("key_006", "value", 1),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Forward iteration
 	let mut iter = table
@@ -3092,12 +3090,12 @@ fn test_table_iter_multiple_versions_at_both_bounds() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		let user_key = String::from_utf8(key.user_key().to_vec()).unwrap();
 		results.push(user_key);
-		if !iter.next().unwrap() {
+		if !iter.next().await.unwrap() {
 			break;
 		}
 	}
@@ -3114,8 +3112,8 @@ fn test_table_iter_multiple_versions_at_both_bounds() {
 	);
 }
 
-#[test]
-fn test_get_block_boundary_same_user_key_bug() {
+#[tokio::test]
+async fn test_get_block_boundary_same_user_key_bug() {
 	// REGRESSION TEST: When multiple versions of the same user_key span multiple
 	// data blocks, looking up the exact key at the block boundary incorrectly
 	// returns None due to using < instead of <= in the index comparison.
@@ -3136,7 +3134,7 @@ fn test_get_block_boundary_same_user_key_bug() {
 	);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let user_key = b"test";
 
@@ -3156,8 +3154,8 @@ fn test_get_block_boundary_same_user_key_bug() {
 	let key4 = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
 	writer.add(key4, b"v").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	// Verify we have multiple data blocks (the bug requires this)
 	assert!(
@@ -3172,7 +3170,7 @@ fn test_get_block_boundary_same_user_key_bug() {
 	// (because same user_key causes separator to fall back to original key)
 	// With block_size=32, the boundary key is ("test", 200)
 	let lookup_boundary_key = InternalKey::new(Vec::from(user_key), 200, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_boundary_key).unwrap();
+	let result = table.get(&lookup_boundary_key).await.unwrap();
 
 	// This assertion will FAIL with the current buggy code
 	assert!(
@@ -3190,20 +3188,20 @@ fn test_get_block_boundary_same_user_key_bug() {
 
 	// Also verify other keys still work correctly
 	let lookup_key1 = InternalKey::new(Vec::from(user_key), 300, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key1).unwrap();
+	let result = table.get(&lookup_key1).await.unwrap();
 	assert!(result.is_some(), "seq=300 should be found");
 
 	let lookup_key3 = InternalKey::new(Vec::from(user_key), 100, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key3).unwrap();
+	let result = table.get(&lookup_key3).await.unwrap();
 	assert!(result.is_some(), "seq=100 should be found");
 
 	let lookup_key4 = InternalKey::new(Vec::from(user_key), 50, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup_key4).unwrap();
+	let result = table.get(&lookup_key4).await.unwrap();
 	assert!(result.is_some(), "seq=50 should be found");
 }
 
-#[test]
-fn test_iterator_trait_prev_multi_partition_bug() {
+#[tokio::test]
+async fn test_iterator_trait_prev_multi_partition_bug() {
 	// REGRESSION TEST: The Iterator trait's prev() method uses self.index_block
 	// which is only the first partition's iterator, NOT handling multiple partitions.
 	// When we have multiple index partitions and call prev() via the trait,
@@ -3224,7 +3222,7 @@ fn test_iterator_trait_prev_multi_partition_bug() {
 	);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add enough keys to create multiple data blocks, which creates multiple index entries,
 	// which in turn creates multiple index partitions
@@ -3239,8 +3237,8 @@ fn test_iterator_trait_prev_multi_partition_bug() {
 		writer.add(key, format!("value_{}", i).as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table_arc = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table_arc = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Verify we have multiple partitions (the bug requires this)
 	let IndexType::Partitioned(ref partitioned_index) = table_arc.index_block;
@@ -3256,13 +3254,13 @@ fn test_iterator_trait_prev_multi_partition_bug() {
 
 	// Create iterator and position at the LAST entry
 	let mut iter = table_arc.iter(None).unwrap();
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 	assert!(iter.valid(), "Iterator should be valid after seek_to_last");
 
 	// Collect all keys going backwards using the CORRECT inherent prev() method
 	let mut correct_results = Vec::new();
 	correct_results.push(iter.key().user_key().to_vec());
-	while iter.prev().unwrap() {
+	while iter.prev().await.unwrap() {
 		correct_results.push(iter.key().user_key().to_vec());
 	}
 	let correct_count = correct_results.len();
@@ -3272,13 +3270,13 @@ fn test_iterator_trait_prev_multi_partition_bug() {
 	// Now test with explicit trait method call
 	// Reset iterator
 	let mut iter2 = table_arc.iter(None).unwrap();
-	iter2.seek_to_last().unwrap();
+	iter2.seek_to_last().await.unwrap();
 	assert!(iter2.valid(), "Iterator should be valid after seek_to_last");
 
 	// Collect all keys going backwards using the BUGGY trait prev() method
 	let mut buggy_results = Vec::new();
 	buggy_results.push(iter2.key().user_key().to_vec());
-	while iter2.prev().unwrap() {
+	while iter2.prev().await.unwrap() {
 		buggy_results.push(iter2.key().user_key().to_vec());
 	}
 	let buggy_count = buggy_results.len();
@@ -3296,8 +3294,8 @@ fn test_iterator_trait_prev_multi_partition_bug() {
 	);
 }
 
-#[test]
-fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
+#[tokio::test]
+async fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
 	// REGRESSION TEST: The TopLevelIndex stores only user_key, losing seq_num ordering.
 	// When the same user_key has many versions spanning multiple partitions,
 	// Table::get may return None even when a visible version exists.
@@ -3322,7 +3320,7 @@ fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
 	);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add many versions of the SAME user key with decreasing seq_nums
 	// Internal key ordering: user_key ASC, seq_num DESC
@@ -3340,8 +3338,8 @@ fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
 	let key = InternalKey::new(b"goo".to_vec(), 1, InternalKeyKind::Set, 0);
 	writer.add(key, b"value_goo").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Verify we have multiple partitions (the bug requires this)
 	let IndexType::Partitioned(ref partitioned_index) = table.index_block;
@@ -3388,7 +3386,7 @@ fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
 	let query_seq = 30u64;
 	let lookup_key = InternalKey::new(user_key.to_vec(), query_seq, InternalKeyKind::Set, 0);
 
-	let result = table.get(&lookup_key).unwrap();
+	let result = table.get(&lookup_key).await.unwrap();
 
 	// The expected result: we should find a version with seq_num <= query_seq
 	// For query_seq=30, we should find (foo, 30) with value "value_at_seq_30"
@@ -3421,7 +3419,7 @@ fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
 	for query_seq in [10, 25, 50, 75, 99] {
 		let lookup = InternalKey::new(user_key.to_vec(), query_seq, InternalKeyKind::Set, 0);
 
-		let result = table.get(&lookup).unwrap();
+		let result = table.get(&lookup).await.unwrap();
 		assert!(
 			result.is_some(),
 			"BUG: Table::get returned None for (foo, seq={}), but version should exist!",
@@ -3438,13 +3436,13 @@ fn test_partitioned_index_same_user_key_spanning_partitions_bug() {
 	}
 }
 
-#[test]
-fn test_table_get_mvcc_correct_version() {
+#[tokio::test]
+async fn test_table_get_mvcc_correct_version() {
 	// Scenario: Table has multiple versions of same key
 	// Query at different seq_nums should return correct version
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let user_key = b"my_key";
 
@@ -3455,12 +3453,12 @@ fn test_table_get_mvcc_correct_version() {
 		writer.add(key, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	// Query at seq=200: should find seq=100 (newest visible)
 	let lookup = InternalKey::new(user_key.to_vec(), 200, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup).unwrap();
+	let result = table.get(&lookup).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, found_value) = result.unwrap();
 	assert_eq!(found_key.seq_num(), 100);
@@ -3468,52 +3466,52 @@ fn test_table_get_mvcc_correct_version() {
 
 	// Query at seq=80: should find seq=75
 	let lookup = InternalKey::new(user_key.to_vec(), 80, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup).unwrap();
+	let result = table.get(&lookup).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, _) = result.unwrap();
 	assert_eq!(found_key.seq_num(), 75);
 
 	// Query at seq=50: should find seq=50 exactly
 	let lookup = InternalKey::new(user_key.to_vec(), 50, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup).unwrap();
+	let result = table.get(&lookup).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, _) = result.unwrap();
 	assert_eq!(found_key.seq_num(), 50);
 
 	// Query at seq=10: should return None (no visible version)
 	let lookup = InternalKey::new(user_key.to_vec(), 10, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup).unwrap();
+	let result = table.get(&lookup).await.unwrap();
 	assert!(result.is_none(), "No version should be visible at seq=10");
 }
 
-#[test]
-fn test_table_get_returns_none_for_future_version() {
+#[tokio::test]
+async fn test_table_get_returns_none_for_future_version() {
 	// Scenario: Query for a key where only future versions exist
 	// Expected: Should return None (no visible version)
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Key only has version at seq=100
 	let key = InternalKey::new(b"future_key".to_vec(), 100, InternalKeyKind::Set, 0);
 	writer.add(key, b"future_value").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	// Query at seq=50: version at seq=100 is in the "future"
 	let lookup = InternalKey::new(b"future_key".to_vec(), 50, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup).unwrap();
+	let result = table.get(&lookup).await.unwrap();
 	assert!(result.is_none(), "Should not see future version at seq=100 when querying at seq=50");
 }
 
-#[test]
-fn test_table_get_different_user_keys() {
+#[tokio::test]
+async fn test_table_get_different_user_keys() {
 	// Scenario: Multiple different user keys
 	// Verify no cross-contamination
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	let keys = ["apple", "banana", "cherry", "date"];
 	for key in &keys {
@@ -3522,13 +3520,13 @@ fn test_table_get_different_user_keys() {
 		writer.add(ikey, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	// Each key should return its own value
 	for key in &keys {
 		let lookup = InternalKey::new(key.as_bytes().to_vec(), 200, InternalKeyKind::Set, 0);
-		let result = table.get(&lookup).unwrap();
+		let result = table.get(&lookup).await.unwrap();
 		assert!(result.is_some(), "Should find key {}", key);
 		let (found_key, found_value) = result.unwrap();
 		assert_eq!(found_key.user_key, key.as_bytes().to_vec());
@@ -3537,19 +3535,19 @@ fn test_table_get_different_user_keys() {
 
 	// Non-existent keys should return None
 	let lookup = InternalKey::new(b"nonexistent".to_vec(), 200, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup).unwrap();
+	let result = table.get(&lookup).await.unwrap();
 	assert!(result.is_none());
 }
 
-#[test]
-fn test_table_get_at_block_boundaries() {
+#[tokio::test]
+async fn test_table_get_at_block_boundaries() {
 	// Scenario: Force keys across multiple blocks, query at boundaries
 	let opts = Arc::new(
 		Options::new().with_filter_policy(None).with_block_size(64), /* Small blocks to
 		                                                              * force splits */
 	);
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add enough keys to span multiple blocks
 	for i in 0..20 {
@@ -3559,8 +3557,8 @@ fn test_table_get_at_block_boundaries() {
 		writer.add(ikey, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	// Verify multiple blocks were created
 	assert!(
@@ -3573,20 +3571,20 @@ fn test_table_get_at_block_boundaries() {
 	for i in 0..20 {
 		let key = format!("key_{:04}", i);
 		let lookup = InternalKey::new(key.as_bytes().to_vec(), 200, InternalKeyKind::Set, 0);
-		let result = table.get(&lookup).unwrap();
+		let result = table.get(&lookup).await.unwrap();
 		assert!(result.is_some(), "Should find key {}", key);
 		let (found_key, _) = result.unwrap();
 		assert_eq!(found_key.user_key, key.as_bytes().to_vec());
 	}
 }
 
-#[test]
-fn test_table_get_tombstone_handling() {
+#[tokio::test]
+async fn test_table_get_tombstone_handling() {
 	// Scenario: Key has a tombstone (delete marker)
 	// Table::get should still return the tombstone, caller handles it
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add a set followed by a delete
 	let set_key = InternalKey::new(b"my_key".to_vec(), 100, InternalKeyKind::Set, 0);
@@ -3595,12 +3593,12 @@ fn test_table_get_tombstone_handling() {
 	let delete_key = InternalKey::new(b"my_key".to_vec(), 50, InternalKeyKind::Delete, 0);
 	writer.add(delete_key, b"").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	// Query at seq=200: should get the Set at seq=100
 	let lookup = InternalKey::new(b"my_key".to_vec(), 200, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup).unwrap();
+	let result = table.get(&lookup).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, _) = result.unwrap();
 	assert_eq!(found_key.seq_num(), 100);
@@ -3608,20 +3606,20 @@ fn test_table_get_tombstone_handling() {
 
 	// Query at seq=75: should get the Delete at seq=50
 	let lookup = InternalKey::new(b"my_key".to_vec(), 75, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup).unwrap();
+	let result = table.get(&lookup).await.unwrap();
 	assert!(result.is_some());
 	let (found_key, _) = result.unwrap();
 	assert_eq!(found_key.seq_num(), 50);
 	assert!(found_key.is_tombstone(), "Should return the tombstone marker");
 }
 
-#[test]
-fn test_table_get_user_key_mismatch() {
+#[tokio::test]
+async fn test_table_get_user_key_mismatch() {
 	// Scenario: Seek lands on a different user key
 	// Expected: Should return None
 	let opts = Arc::new(Options::new().with_filter_policy(None));
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Only add "apple" and "cherry", not "banana"
 	let key1 = InternalKey::new(b"apple".to_vec(), 100, InternalKeyKind::Set, 0);
@@ -3630,34 +3628,34 @@ fn test_table_get_user_key_mismatch() {
 	let key2 = InternalKey::new(b"cherry".to_vec(), 100, InternalKeyKind::Set, 0);
 	writer.add(key2, b"cherry_value").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(0), opts, buffer).await.unwrap();
 
 	// Query for "banana" which doesn't exist
 	// Seek will land on "cherry", but user_key doesn't match
 	let lookup = InternalKey::new(b"banana".to_vec(), 200, InternalKeyKind::Set, 0);
-	let result = table.get(&lookup).unwrap();
+	let result = table.get(&lookup).await.unwrap();
 	assert!(result.is_none(), "Should return None when user_key doesn't match");
 }
 
-#[test]
-fn test_reverse_iteration_unbounded_consistency() {
+#[tokio::test]
+async fn test_reverse_iteration_unbounded_consistency() {
 	// Test that unbounded reverse iteration works correctly
 	let data = vec![("key_000", "value"), ("key_001", "value"), ("key_002", "value")];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	let mut iter = table.iter(None).unwrap();
 
 	// Collect all items in reverse
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 	let mut results = Vec::new();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -3672,8 +3670,8 @@ fn test_reverse_iteration_unbounded_consistency() {
 // BUG #5: Silent error handling in prev()
 // ============================================================
 
-#[test]
-fn test_prev_iteration_across_partitions() {
+#[tokio::test]
+async fn test_prev_iteration_across_partitions() {
 	// Test that prev() correctly handles partition boundaries
 	// Use small partition size to force multiple partitions
 	let mut opts = Options::new();
@@ -3690,8 +3688,8 @@ fn test_prev_iteration_across_partitions() {
 		})
 		.collect();
 
-	let (src, size) = build_table(data.clone());
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let (src, _size) = build_table(data.clone());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Verify multiple partitions
 	let IndexType::Partitioned(ref index) = table.index_block;
@@ -3699,13 +3697,13 @@ fn test_prev_iteration_across_partitions() {
 
 	// Test reverse iteration crosses partitions correctly
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 	let mut results = Vec::new();
 
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -3724,17 +3722,17 @@ fn test_prev_iteration_across_partitions() {
 // Note: This test would need to be in block.rs, but we can test the behavior
 // at the table level by ensuring seek_to_last works for valid data
 
-#[test]
-fn test_seek_to_last_valid_block() {
+#[tokio::test]
+async fn test_seek_to_last_valid_block() {
 	// Ensure seek_to_last works correctly for valid blocks
 	let data = vec![("aaa", "value1"), ("bbb", "value2"), ("ccc", "value3")];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 
 	assert!(iter.valid());
 	let key = iter.key();
@@ -3745,8 +3743,8 @@ fn test_seek_to_last_valid_block() {
 // Range boundary edge cases
 // ============================================================
 
-#[test]
-fn test_range_at_exact_block_boundary() {
+#[tokio::test]
+async fn test_range_at_exact_block_boundary() {
 	// Test range bounds at exact block boundaries
 	let mut opts = Options::new();
 	opts.block_size = 50; // Small blocks to force boundaries
@@ -3760,8 +3758,8 @@ fn test_range_at_exact_block_boundary() {
 		})
 		.collect();
 
-	let (src, size) = build_table(data);
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let (src, _size) = build_table(data);
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Test with bound that might be at a block boundary
 	let mut iter = table
@@ -3771,7 +3769,7 @@ fn test_range_at_exact_block_boundary() {
 		)))
 		.unwrap();
 
-	let collected = collect_all(&mut iter).unwrap();
+	let collected = collect_all(&mut iter).await.unwrap();
 	let results: Vec<String> =
 		collected.iter().map(|(k, _)| String::from_utf8(k.user_key.clone()).unwrap()).collect();
 
@@ -3780,8 +3778,8 @@ fn test_range_at_exact_block_boundary() {
 	assert_eq!(results[3], "key_006");
 }
 
-#[test]
-fn test_range_with_multiple_versions_at_boundary() {
+#[tokio::test]
+async fn test_range_with_multiple_versions_at_boundary() {
 	// Test range where boundary key has multiple versions
 	let data = vec![
 		("key_001", "v1", 10),
@@ -3792,9 +3790,9 @@ fn test_range_with_multiple_versions_at_boundary() {
 		("key_004", "v1", 10),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Included bound should include ALL versions
 	let mut iter = table
@@ -3804,7 +3802,7 @@ fn test_range_with_multiple_versions_at_boundary() {
 		)))
 		.unwrap();
 
-	let collected = collect_all(&mut iter).unwrap();
+	let collected = collect_all(&mut iter).await.unwrap();
 	let results: Vec<(String, u64)> = collected
 		.iter()
 		.map(|(k, _)| (String::from_utf8(k.user_key.clone()).unwrap(), k.seq_num()))
@@ -3823,8 +3821,8 @@ fn test_range_with_multiple_versions_at_boundary() {
 	assert_eq!(results[3].0, "key_003");
 }
 
-#[test]
-fn test_excluded_bound_skips_all_versions() {
+#[tokio::test]
+async fn test_excluded_bound_skips_all_versions() {
 	// Test that excluded bound skips ALL versions of a key
 	let data = vec![
 		("key_001", "v1", 10),
@@ -3834,9 +3832,9 @@ fn test_excluded_bound_skips_all_versions() {
 		("key_003", "v1", 10),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Excluded lower bound should skip ALL versions of key_002
 	let mut iter = table
@@ -3846,7 +3844,7 @@ fn test_excluded_bound_skips_all_versions() {
 		)))
 		.unwrap();
 
-	let collected = collect_all(&mut iter).unwrap();
+	let collected = collect_all(&mut iter).await.unwrap();
 	let results: Vec<String> =
 		collected.iter().map(|(k, _)| String::from_utf8(k.user_key.clone()).unwrap()).collect();
 
@@ -3858,8 +3856,8 @@ fn test_excluded_bound_skips_all_versions() {
 	assert!(!results.iter().any(|k| k == "key_002"), "key_002 should not appear in results");
 }
 
-#[test]
-fn test_reverse_iteration_with_excluded_upper_bound() {
+#[tokio::test]
+async fn test_reverse_iteration_with_excluded_upper_bound() {
 	// Test reverse iteration correctly respects excluded upper bound
 	let data = vec![
 		("key_001", "v1", 10),
@@ -3869,9 +3867,9 @@ fn test_reverse_iteration_with_excluded_upper_bound() {
 		("key_004", "v1", 10),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Excluded upper bound in reverse
 	let mut iter = table
@@ -3882,11 +3880,11 @@ fn test_reverse_iteration_with_excluded_upper_bound() {
 		.unwrap();
 
 	let mut results = Vec::new();
-	iter.seek_last().unwrap();
+	iter.seek_last().await.unwrap();
 	while iter.valid() {
 		let key = iter.key();
 		results.push(String::from_utf8(key.user_key().to_vec()).unwrap());
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -3899,14 +3897,14 @@ fn test_reverse_iteration_with_excluded_upper_bound() {
 	assert_eq!(results[0], "key_002");
 }
 
-#[test]
-fn test_empty_range_returns_nothing() {
+#[tokio::test]
+async fn test_empty_range_returns_nothing() {
 	// Test that a range with no matching keys returns nothing
 	let data = vec![("aaa", "value"), ("bbb", "value"), ("ddd", "value"), ("eee", "value")];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Range [ccc, ccc] - "ccc" doesn't exist
 	let mut iter = table
@@ -3916,18 +3914,18 @@ fn test_empty_range_returns_nothing() {
 		)))
 		.unwrap();
 
-	let results = collect_all(&mut iter).unwrap();
+	let results = collect_all(&mut iter).await.unwrap();
 	assert_eq!(results.len(), 0, "Range for non-existent key should be empty");
 }
 
-#[test]
-fn test_range_completely_before_table() {
+#[tokio::test]
+async fn test_range_completely_before_table() {
 	// Test range that is completely before all keys in table
 	let data = vec![("mmm", "value"), ("nnn", "value"), ("ooo", "value")];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	let mut iter = table
 		.iter(Some(user_range_to_internal_range(
@@ -3936,18 +3934,18 @@ fn test_range_completely_before_table() {
 		)))
 		.unwrap();
 
-	let results = collect_all(&mut iter).unwrap();
+	let results = collect_all(&mut iter).await.unwrap();
 	assert_eq!(results.len(), 0, "Range before all keys should be empty");
 }
 
-#[test]
-fn test_range_completely_after_table() {
+#[tokio::test]
+async fn test_range_completely_after_table() {
 	// Test range that is completely after all keys in table
 	let data = vec![("aaa", "value"), ("bbb", "value"), ("ccc", "value")];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	let mut iter = table
 		.iter(Some(user_range_to_internal_range(
@@ -3956,18 +3954,18 @@ fn test_range_completely_after_table() {
 		)))
 		.unwrap();
 
-	let results = collect_all(&mut iter).unwrap();
+	let results = collect_all(&mut iter).await.unwrap();
 	assert_eq!(results.len(), 0, "Range after all keys should be empty");
 }
 
-#[test]
-fn test_reverse_iteration_empty_range() {
+#[tokio::test]
+async fn test_reverse_iteration_empty_range() {
 	// Test reverse iteration with empty range
 	let data = vec![("aaa", "value"), ("bbb", "value"), ("ddd", "value")];
 
-	let (src, size) = build_table(data);
+	let (src, _size) = build_table(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Range [ccc, ccc] doesn't exist
 	let mut iter = table
@@ -3977,19 +3975,19 @@ fn test_reverse_iteration_empty_range() {
 		)))
 		.unwrap();
 
-	let result = iter.seek_last();
+	let result = iter.seek_last().await;
 	assert!(result.is_err() || !iter.valid(), "Empty range should be invalid on seek_last()");
 }
 
-#[test]
-fn test_table_properties_persistence() {
+#[tokio::test]
+async fn test_table_properties_persistence() {
 	// Test that table properties are correctly persisted through write/load cycle
 	let mut buffer = Vec::new();
 	let table_id = 42;
 	let opts = default_opts();
 
 	// Step 1: Create TableWriter and add entries
-	let mut writer = TableWriter::new(&mut buffer, table_id, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(table_id), Arc::clone(&opts), 0);
 
 	let mut entries = Vec::new();
 	let mut expected_deletions = 0u64;
@@ -4027,17 +4025,17 @@ fn test_table_properties_persistence() {
 	}
 
 	// Step 2: Finish writing to buffer
-	let size = writer.finish().unwrap();
+	let _size = writer.finish().unwrap();
 
 	// Step 3: Create new Table from buffer (load phase)
-	let table = Table::new(table_id, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let table = new_test_table(test_sst_id(table_id), opts, buffer).await.unwrap();
 
 	// Step 4: Verify all properties match expected values
 	let meta = &table.meta;
 	let props = &meta.properties;
 
 	// Basic properties
-	assert_eq!(props.id, table_id, "Table ID should match");
+	assert_eq!(props.id, test_sst_id(table_id), "Table ID should match");
 	assert_eq!(props.table_format, TableFormat::LSMV1, "Table format should be LSMV1");
 	assert_eq!(props.num_entries, 50, "Number of entries should be 50");
 	assert_eq!(props.item_count, 50, "Item count should be 50");
@@ -4103,8 +4101,8 @@ fn test_table_properties_persistence() {
 	assert_eq!(meta.has_point_keys, Some(true), "Should have point keys");
 }
 
-#[test]
-fn test_table_get_all_keys() {
+#[tokio::test]
+async fn test_table_get_all_keys() {
 	// Test Get operations on table with 100+ blocks
 	let mut opts = default_opts_mut();
 	opts.block_size = 64; // Small block size to create many blocks
@@ -4112,7 +4110,7 @@ fn test_table_get_all_keys() {
 	let opts = Arc::new(opts);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add 100 entries to create multiple blocks
 	for i in 0..100 {
@@ -4123,8 +4121,8 @@ fn test_table_get_all_keys() {
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Get every key individually
 	for i in 0..100 {
@@ -4133,7 +4131,7 @@ fn test_table_get_all_keys() {
 		let seek_key =
 			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
 
-		let result = table.get(&seek_key).unwrap();
+		let result = table.get(&seek_key).await.unwrap();
 		assert!(result.is_some(), "Key '{key}' not found");
 
 		if let Some((found_key, found_value)) = result {
@@ -4151,11 +4149,11 @@ fn test_table_get_all_keys() {
 	}
 }
 
-#[test]
-fn test_table_get_nonexistent_keys() {
+#[tokio::test]
+async fn test_table_get_nonexistent_keys() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add some entries
 	for i in 0..10 {
@@ -4165,14 +4163,14 @@ fn test_table_get_nonexistent_keys() {
 		writer.add(internal_key, b"value").unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Get keys that don't exist
 	let nonexistent_keys = vec!["key_10", "key_99", "aaa", "zzz"];
 	for key_str in &nonexistent_keys {
 		let seek_key = InternalKey::new(key_str.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
-		let result = table.get(&seek_key).unwrap();
+		let result = table.get(&seek_key).await.unwrap();
 		// Should return None for keys that don't exist
 		if result.is_some() {
 			// If found, verify it's a valid key (might find next key)
@@ -4183,8 +4181,8 @@ fn test_table_get_nonexistent_keys() {
 	}
 }
 
-#[test]
-fn test_table_get_with_compression() {
+#[tokio::test]
+async fn test_table_get_with_compression() {
 	// Test Get with each compression type
 	let compression_types =
 		vec![crate::CompressionType::None, crate::CompressionType::SnappyCompression];
@@ -4192,7 +4190,7 @@ fn test_table_get_with_compression() {
 	for compression in compression_types {
 		let opts = default_opts();
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+		let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 		// Add entries
 		for i in 0..20 {
@@ -4203,8 +4201,8 @@ fn test_table_get_with_compression() {
 			writer.add(internal_key, value.as_bytes()).unwrap();
 		}
 
-		let size = writer.finish().unwrap();
-		let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+		let _size = writer.finish().unwrap();
+		let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 		// Verify Get works with this compression type
 		for i in 0..20 {
@@ -4213,7 +4211,7 @@ fn test_table_get_with_compression() {
 			let seek_key =
 				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
 
-			let result = table.get(&seek_key).unwrap();
+			let result = table.get(&seek_key).await.unwrap();
 			assert!(result.is_some(), "Should find key {key} with compression {compression:?}");
 
 			if let Some((found_key, found_value)) = result {
@@ -4232,11 +4230,11 @@ fn test_table_get_with_compression() {
 	}
 }
 
-#[test]
-fn test_table_iterator_full_scan() {
+#[tokio::test]
+async fn test_table_iterator_full_scan() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Create table with known data
 	let test_data: Vec<(String, String)> =
@@ -4248,12 +4246,12 @@ fn test_table_iterator_full_scan() {
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Full forward scan
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_first().unwrap();
+	iter.seek_to_first().await.unwrap();
 
 	let mut collected = Vec::new();
 	while iter.valid() {
@@ -4263,7 +4261,7 @@ fn test_table_iterator_full_scan() {
 			std::str::from_utf8(key.user_key()).unwrap().to_string(),
 			std::str::from_utf8(value).unwrap().to_string(),
 		));
-		match iter.next() {
+		match iter.next().await {
 			Ok(false) => break,
 			Ok(true) => {}
 			Err(e) => panic!("Iterator error: {e}"),
@@ -4277,11 +4275,11 @@ fn test_table_iterator_full_scan() {
 	}
 }
 
-#[test]
-fn test_table_iterator_reverse_scan() {
+#[tokio::test]
+async fn test_table_iterator_reverse_scan() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Create table with known data
 	let test_data: Vec<(String, String)> =
@@ -4293,12 +4291,12 @@ fn test_table_iterator_reverse_scan() {
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Full reverse scan
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 
 	let mut collected = Vec::new();
 	while iter.valid() {
@@ -4308,7 +4306,7 @@ fn test_table_iterator_reverse_scan() {
 			std::str::from_utf8(key.user_key()).unwrap().to_string(),
 			std::str::from_utf8(value).unwrap().to_string(),
 		));
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
@@ -4322,11 +4320,11 @@ fn test_table_iterator_reverse_scan() {
 	}
 }
 
-#[test]
-fn test_table_iterator_seek_and_scan() {
+#[tokio::test]
+async fn test_table_iterator_seek_and_scan() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Create table with known data
 	for i in 0..30 {
@@ -4337,8 +4335,8 @@ fn test_table_iterator_seek_and_scan() {
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	let mut iter = table.iter(None).unwrap();
 
@@ -4348,7 +4346,7 @@ fn test_table_iterator_seek_and_scan() {
 	for seek_key_str in &seek_points {
 		let seek_key =
 			InternalKey::new(seek_key_str.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
-		iter.seek(&seek_key.encode()).unwrap();
+		iter.seek(&seek_key.encode()).await.unwrap();
 
 		if iter.valid() {
 			let found_key_bytes: &[u8] = iter.key().user_key();
@@ -4364,7 +4362,7 @@ fn test_table_iterator_seek_and_scan() {
 		let mut count = 0;
 		while iter.valid() && count < 5 {
 			count += 1;
-			match iter.next() {
+			match iter.next().await {
 				Ok(false) => break,
 				Ok(true) => {}
 				Err(e) => panic!("Iterator error: {e}"),
@@ -4372,20 +4370,20 @@ fn test_table_iterator_seek_and_scan() {
 		}
 	}
 
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 	let last_key_bytes = iter.key().user_key();
 	assert_eq!(std::str::from_utf8(last_key_bytes).unwrap(), "key_029", "Should find last key");
 
 	// Test Prev from last
 	for _ in 0..5 {
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
 }
 
-#[test]
-fn test_table_iterator_across_partitions() {
+#[tokio::test]
+async fn test_table_iterator_across_partitions() {
 	// Create table that spans multiple index partitions
 	let mut opts = default_opts_mut();
 	opts.index_partition_size = 150; // Small partition size
@@ -4393,7 +4391,7 @@ fn test_table_iterator_across_partitions() {
 	let opts = Arc::new(opts);
 
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add enough entries to create multiple partitions
 	for i in 0..100 {
@@ -4404,8 +4402,8 @@ fn test_table_iterator_across_partitions() {
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Verify we have multiple partitions
 	let crate::sstable::table::IndexType::Partitioned(ref partitioned_index) = table.index_block;
@@ -4413,12 +4411,12 @@ fn test_table_iterator_across_partitions() {
 
 	// Full forward scan across partitions
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_first().unwrap();
+	iter.seek_to_first().await.unwrap();
 
 	let mut count = 0;
 	while iter.valid() {
 		count += 1;
-		match iter.next() {
+		match iter.next().await {
 			Ok(false) => break,
 			Ok(true) => {}
 			Err(e) => panic!("Iterator error: {e}"),
@@ -4427,54 +4425,54 @@ fn test_table_iterator_across_partitions() {
 	assert_eq!(count, 100, "Should iterate all 100 keys across partitions");
 
 	// Full backward scan across partitions
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 	let mut count_backward = 0;
 	while iter.valid() {
 		count_backward += 1;
-		if !iter.prev().unwrap() {
+		if !iter.prev().await.unwrap() {
 			break;
 		}
 	}
 	assert_eq!(count_backward, 100, "Should iterate all 100 keys backwards across partitions");
 }
 
-#[test]
-fn test_empty_table_operations() {
+#[tokio::test]
+async fn test_empty_table_operations() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Don't add any entries - create empty table
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Verify Get returns not found
 	let seek_key = InternalKey::new(b"any_key".to_vec(), 1, InternalKeyKind::Set, 0);
-	let result = table.get(&seek_key);
+	let result = table.get(&seek_key).await;
 	assert!(result.is_err(), "Get on empty table should return error");
 
 	// Verify iterator immediately invalid
 	let mut iter = table.iter(None).unwrap();
-	let result = iter.seek_to_first();
+	let result = iter.seek_to_first().await;
 	assert!(result.is_err(), "Get on empty table should return error");
 }
 
-#[test]
-fn test_single_entry_table() {
+#[tokio::test]
+async fn test_single_entry_table() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add exactly one entry
 	let internal_key = InternalKey::new(b"single_key".to_vec(), 1, InternalKeyKind::Set, 0);
 	writer.add(internal_key, b"single_value").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Test Get
 	let seek_key = InternalKey::new(b"single_key".to_vec(), 1, InternalKeyKind::Set, 0);
-	let result = table.get(&seek_key).unwrap();
+	let result = table.get(&seek_key).await.unwrap();
 	assert!(result.is_some(), "Should find the single key");
 	if let Some((found_key, found_value)) = result {
 		assert_eq!(found_key.user_key, b"single_key");
@@ -4484,7 +4482,7 @@ fn test_single_entry_table() {
 
 	// Test iterator
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_first().unwrap();
+	iter.seek_to_first().await.unwrap();
 	assert!(iter.valid(), "Iterator should be valid");
 	assert_eq!(iter.key().user_key(), b"single_key");
 	let iter_value = iter.value_encoded().unwrap();
@@ -4492,7 +4490,7 @@ fn test_single_entry_table() {
 	assert_eq!(iter_value_bytes, b"single_value");
 
 	// Test Next - should invalidate iterator
-	match iter.next() {
+	match iter.next().await {
 		Ok(false) => {}
 		Ok(true) => {}
 		Err(e) => panic!("Iterator error: {e}"),
@@ -4500,11 +4498,11 @@ fn test_single_entry_table() {
 	assert!(!iter.valid(), "Iterator should be invalid after next()");
 }
 
-#[test]
-fn test_large_values() {
+#[tokio::test]
+async fn test_large_values() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(0), Arc::clone(&opts), 0);
 
 	// Add entries with large values (near size limits)
 	let large_value = vec![b'x'; 10000]; // 10KB value
@@ -4515,8 +4513,8 @@ fn test_large_values() {
 		writer.add(internal_key, &large_value).unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Arc::new(Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap());
+	let _size = writer.finish().unwrap();
+	let table = Arc::new(new_test_table(test_sst_id(0), opts, buffer).await.unwrap());
 
 	// Verify all large values are retrieved correctly
 	for i in 0..10 {
@@ -4524,7 +4522,7 @@ fn test_large_values() {
 		let seek_key =
 			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
 
-		let result = table.get(&seek_key).unwrap();
+		let result = table.get(&seek_key).await.unwrap();
 		assert!(result.is_some(), "Should find key {key}");
 
 		if let Some((found_key, found_value)) = result {
@@ -4542,8 +4540,8 @@ fn test_large_values() {
 // These tests verify correct behavior when iterating over keys with multiple
 // MVCC versions, particularly for backward iteration with bounds.
 
-#[test]
-fn test_backward_iter_multiple_versions_same_user_key() {
+#[tokio::test]
+async fn test_backward_iter_multiple_versions_same_user_key() {
 	// REGRESSION TEST: When a user key has multiple MVCC versions and we iterate
 	// backward with an inclusive upper bound, all versions should be returned.
 	//
@@ -4557,20 +4555,20 @@ fn test_backward_iter_multiple_versions_same_user_key() {
 		("key_000", "value_v1", 100),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Backward iteration with unbounded range should return ALL versions
 	let mut iter = table.iter(None).unwrap();
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 	let mut results: Vec<(String, u64)> = Vec::new();
 
 	while iter.valid() {
 		let key = iter.key();
 		let user_key = String::from_utf8(key.user_key().to_vec()).unwrap();
 		results.push((user_key, key.seq_num()));
-		iter.prev().unwrap();
+		iter.prev().await.unwrap();
 	}
 
 	// Should get both versions
@@ -4587,8 +4585,8 @@ fn test_backward_iter_multiple_versions_same_user_key() {
 	assert_eq!(results[1].1, 200, "Second backward result should be seq=200");
 }
 
-#[test]
-fn test_backward_iter_inclusive_upper_bound_mvcc() {
+#[tokio::test]
+async fn test_backward_iter_inclusive_upper_bound_mvcc() {
 	// Test inclusive upper bound positioning with multiple MVCC versions
 	let data = vec![
 		("key_001", "v1", 300),
@@ -4597,9 +4595,9 @@ fn test_backward_iter_inclusive_upper_bound_mvcc() {
 		("key_002", "v1", 50),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Inclusive upper bound at key_001 - should include all versions of key_001
 	let mut iter = table
@@ -4608,14 +4606,14 @@ fn test_backward_iter_inclusive_upper_bound_mvcc() {
 			Bound::Included(b"key_001".as_slice()),
 		)))
 		.unwrap();
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 
 	let mut results: Vec<(String, u64)> = Vec::new();
 	while iter.valid() {
 		let key = iter.key();
 		let user_key = String::from_utf8(key.user_key().to_vec()).unwrap();
 		results.push((user_key, key.seq_num()));
-		iter.prev().unwrap();
+		iter.prev().await.unwrap();
 	}
 
 	// Should get all 3 versions of key_001
@@ -4627,8 +4625,8 @@ fn test_backward_iter_inclusive_upper_bound_mvcc() {
 	}
 }
 
-#[test]
-fn test_backward_iter_exclusive_upper_bound_mvcc() {
+#[tokio::test]
+async fn test_backward_iter_exclusive_upper_bound_mvcc() {
 	// Test exclusive upper bound - should exclude ALL versions of the bound key
 	let data = vec![
 		("key_001", "v1", 300),
@@ -4637,9 +4635,9 @@ fn test_backward_iter_exclusive_upper_bound_mvcc() {
 		("key_002", "v2", 100),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Exclusive upper bound at key_002 - should exclude all versions of key_002
 	let mut iter = table
@@ -4648,14 +4646,14 @@ fn test_backward_iter_exclusive_upper_bound_mvcc() {
 			Bound::Excluded(b"key_002".as_slice()),
 		)))
 		.unwrap();
-	iter.seek_to_last().unwrap();
+	iter.seek_to_last().await.unwrap();
 
 	let mut results: Vec<(String, u64)> = Vec::new();
 	while iter.valid() {
 		let key = iter.key();
 		let user_key = String::from_utf8(key.user_key().to_vec()).unwrap();
 		results.push((user_key, key.seq_num()));
-		iter.prev().unwrap();
+		iter.prev().await.unwrap();
 	}
 
 	// Should only get key_001 versions (2 of them)
@@ -4667,8 +4665,8 @@ fn test_backward_iter_exclusive_upper_bound_mvcc() {
 	}
 }
 
-#[test]
-fn test_forward_backward_consistency_mvcc() {
+#[tokio::test]
+async fn test_forward_backward_consistency_mvcc() {
 	// Verify forward and backward iteration return same entries (in reverse order)
 	let data = vec![
 		("key_001", "v1", 300),
@@ -4677,28 +4675,28 @@ fn test_forward_backward_consistency_mvcc() {
 		("key_003", "v1", 100),
 	];
 
-	let (src, size) = build_table_with_seq_num(data);
+	let (src, _size) = build_table_with_seq_num(data);
 	let opts = default_opts();
-	let table = Arc::new(Table::new(1, opts, wrap_buffer(src), size as u64).unwrap());
+	let table = Arc::new(new_test_table(test_sst_id(1), opts, src).await.unwrap());
 
 	// Forward iteration
 	let mut iter_fwd = table.iter(None).unwrap();
-	iter_fwd.seek_to_first().unwrap();
+	iter_fwd.seek_to_first().await.unwrap();
 	let mut forward_results: Vec<(Vec<u8>, u64)> = vec![];
 	while iter_fwd.valid() {
 		let key = iter_fwd.key();
 		forward_results.push((key.user_key().to_vec(), key.seq_num()));
-		iter_fwd.next().unwrap();
+		iter_fwd.next().await.unwrap();
 	}
 
 	// Backward iteration
 	let mut iter_bwd = table.iter(None).unwrap();
-	iter_bwd.seek_to_last().unwrap();
+	iter_bwd.seek_to_last().await.unwrap();
 	let mut backward_results: Vec<(Vec<u8>, u64)> = Vec::new();
 	while iter_bwd.valid() {
 		let key = iter_bwd.key();
 		backward_results.push((key.user_key().to_vec(), key.seq_num()));
-		iter_bwd.prev().unwrap();
+		iter_bwd.prev().await.unwrap();
 	}
 
 	// Reverse backward results to compare
@@ -4720,11 +4718,11 @@ fn test_forward_backward_consistency_mvcc() {
 
 /// Tests that seq_num tracking works correctly when the first entry has seq_num=0.
 /// This was a bug where using 0 as sentinel value caused incorrect tracking.
-#[test]
-fn test_seq_num_tracking_with_zero_first() {
+#[tokio::test]
+async fn test_seq_num_tracking_with_zero_first() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 	// Add entries with seq_num: 0, 100, 50 (first is 0!)
 	// Keys must be in ascending order for SSTable
@@ -4739,8 +4737,8 @@ fn test_seq_num_tracking_with_zero_first() {
 		writer.add(internal_key, b"value").unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 	// Verify: smallest should be 0 (not overwritten), largest should be 100
 	assert_eq!(
@@ -4755,13 +4753,13 @@ fn test_seq_num_tracking_with_zero_first() {
 }
 
 /// Tests seq_num tracking with various insertion orders.
-#[test]
-fn test_seq_num_tracking_various_orders() {
+#[tokio::test]
+async fn test_seq_num_tracking_various_orders() {
 	// Test case 1: Ascending order
 	{
 		let opts = default_opts();
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+		let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 		for (i, seq) in [1u64, 2, 3].iter().enumerate() {
 			let key = format!("key_{i:02}");
@@ -4770,8 +4768,8 @@ fn test_seq_num_tracking_various_orders() {
 			writer.add(internal_key, b"value").unwrap();
 		}
 
-		let size = writer.finish().unwrap();
-		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+		let _size = writer.finish().unwrap();
+		let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 		assert_eq!(table.meta.smallest_seq_num, Some(1), "Ascending: smallest=1");
 		assert_eq!(table.meta.largest_seq_num, Some(3), "Ascending: largest=3");
@@ -4781,7 +4779,7 @@ fn test_seq_num_tracking_various_orders() {
 	{
 		let opts = default_opts();
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+		let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 		for (i, seq) in [3u64, 2, 1].iter().enumerate() {
 			let key = format!("key_{i:02}");
@@ -4790,8 +4788,8 @@ fn test_seq_num_tracking_various_orders() {
 			writer.add(internal_key, b"value").unwrap();
 		}
 
-		let size = writer.finish().unwrap();
-		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+		let _size = writer.finish().unwrap();
+		let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 		assert_eq!(table.meta.smallest_seq_num, Some(1), "Descending: smallest=1");
 		assert_eq!(table.meta.largest_seq_num, Some(3), "Descending: largest=3");
@@ -4801,7 +4799,7 @@ fn test_seq_num_tracking_various_orders() {
 	{
 		let opts = default_opts();
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+		let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 		for (i, seq) in [5u64, 1, 10, 3].iter().enumerate() {
 			let key = format!("key_{i:02}");
@@ -4810,8 +4808,8 @@ fn test_seq_num_tracking_various_orders() {
 			writer.add(internal_key, b"value").unwrap();
 		}
 
-		let size = writer.finish().unwrap();
-		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+		let _size = writer.finish().unwrap();
+		let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 		assert_eq!(table.meta.smallest_seq_num, Some(1), "Random: smallest=1");
 		assert_eq!(table.meta.largest_seq_num, Some(10), "Random: largest=10");
@@ -4819,11 +4817,11 @@ fn test_seq_num_tracking_various_orders() {
 }
 
 /// Tests that timestamp tracking works correctly when the first entry has timestamp=0.
-#[test]
-fn test_timestamp_tracking_with_zero_first() {
+#[tokio::test]
+async fn test_timestamp_tracking_with_zero_first() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 	// Add entries with timestamps: 0, 1000, 500 (first is 0!)
 	let entries = vec![
@@ -4837,8 +4835,8 @@ fn test_timestamp_tracking_with_zero_first() {
 		writer.add(internal_key, b"value").unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 	// Verify: oldest should be 0 (not overwritten), newest should be 1000
 	assert_eq!(
@@ -4850,13 +4848,13 @@ fn test_timestamp_tracking_with_zero_first() {
 }
 
 /// Tests timestamp tracking with various insertion orders.
-#[test]
-fn test_timestamp_tracking_various_orders() {
+#[tokio::test]
+async fn test_timestamp_tracking_various_orders() {
 	// Test case 1: Ascending timestamps
 	{
 		let opts = default_opts();
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+		let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 		for (i, ts) in [100u64, 200, 300].iter().enumerate() {
 			let key = format!("key_{i:02}");
@@ -4865,8 +4863,8 @@ fn test_timestamp_tracking_various_orders() {
 			writer.add(internal_key, b"value").unwrap();
 		}
 
-		let size = writer.finish().unwrap();
-		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+		let _size = writer.finish().unwrap();
+		let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 		assert_eq!(table.meta.properties.oldest_key_time, Some(100));
 		assert_eq!(table.meta.properties.newest_key_time, Some(300));
@@ -4876,7 +4874,7 @@ fn test_timestamp_tracking_various_orders() {
 	{
 		let opts = default_opts();
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+		let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 		for (i, ts) in [300u64, 200, 100].iter().enumerate() {
 			let key = format!("key_{i:02}");
@@ -4885,8 +4883,8 @@ fn test_timestamp_tracking_various_orders() {
 			writer.add(internal_key, b"value").unwrap();
 		}
 
-		let size = writer.finish().unwrap();
-		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+		let _size = writer.finish().unwrap();
+		let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 		assert_eq!(table.meta.properties.oldest_key_time, Some(100));
 		assert_eq!(table.meta.properties.newest_key_time, Some(300));
@@ -4896,7 +4894,7 @@ fn test_timestamp_tracking_various_orders() {
 	{
 		let opts = default_opts();
 		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+		let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 		for (i, ts) in [500u64, 0, 1000, 250].iter().enumerate() {
 			let key = format!("key_{i:02}");
@@ -4905,8 +4903,8 @@ fn test_timestamp_tracking_various_orders() {
 			writer.add(internal_key, b"value").unwrap();
 		}
 
-		let size = writer.finish().unwrap();
-		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+		let _size = writer.finish().unwrap();
+		let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 		assert_eq!(table.meta.properties.oldest_key_time, Some(0));
 		assert_eq!(table.meta.properties.newest_key_time, Some(1000));
@@ -4914,18 +4912,18 @@ fn test_timestamp_tracking_various_orders() {
 }
 
 /// Tests that a single entry correctly sets both smallest=largest and oldest=newest.
-#[test]
-fn test_single_entry_metadata() {
+#[tokio::test]
+async fn test_single_entry_metadata() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 	// Single entry with specific values
 	let internal_key = InternalKey::new(b"only_key".to_vec(), 42, InternalKeyKind::Set, 12345);
 	writer.add(internal_key, b"only_value").unwrap();
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 	// Both smallest and largest should be 42
 	assert_eq!(table.meta.smallest_seq_num, Some(42));
@@ -4970,11 +4968,11 @@ fn test_metadata_roundtrip_with_edge_values() {
 }
 
 /// Tests that all entries having seq_num=0 works correctly.
-#[test]
-fn test_all_zero_seq_nums() {
+#[tokio::test]
+async fn test_all_zero_seq_nums() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 	// All entries have seq_num = 0
 	for i in 0..5 {
@@ -4983,8 +4981,8 @@ fn test_all_zero_seq_nums() {
 		writer.add(internal_key, b"value").unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 	// Both should be 0
 	assert_eq!(table.meta.smallest_seq_num, Some(0));
@@ -4993,11 +4991,11 @@ fn test_all_zero_seq_nums() {
 }
 
 /// Tests that all entries having timestamp=0 works correctly.
-#[test]
-fn test_all_zero_timestamps() {
+#[tokio::test]
+async fn test_all_zero_timestamps() {
 	let opts = default_opts();
 	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+	let mut writer = TableWriter::new(&mut buffer, test_sst_id(1), Arc::clone(&opts), 0);
 
 	// All entries have timestamp = 0
 	for i in 0..5 {
@@ -5007,8 +5005,8 @@ fn test_all_zero_timestamps() {
 		writer.add(internal_key, b"value").unwrap();
 	}
 
-	let size = writer.finish().unwrap();
-	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+	let _size = writer.finish().unwrap();
+	let table = new_test_table(test_sst_id(1), opts, buffer).await.unwrap();
 
 	// Both should be 0
 	assert_eq!(table.meta.properties.oldest_key_time, Some(0));

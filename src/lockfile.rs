@@ -128,10 +128,11 @@ impl Drop for LockFile {
 #[cfg(test)]
 mod tests {
 	use std::fs;
-	use std::sync::{Arc, Barrier};
+	use std::sync::Arc;
 
 	use tempfile::TempDir;
 	use test_log::test;
+	use tokio::sync::Barrier;
 
 	use super::*;
 	use crate::error::Error;
@@ -238,10 +239,11 @@ mod tests {
 		let tree1 = StoreBuilder::new()
 			.with_path(temp_path.clone())
 			.build()
+			.await
 			.expect("First tree should be created successfully");
 
 		// Second instance should fail with lock error
-		let result = StoreBuilder::new().with_path(temp_path.clone()).build();
+		let result = StoreBuilder::new().with_path(temp_path.clone()).build().await;
 
 		assert!(result.is_err(), "Second tree should fail to acquire lock");
 		if let Err(Error::Other(msg)) = result {
@@ -256,6 +258,7 @@ mod tests {
 		let tree2 = StoreBuilder::new()
 			.with_path(temp_path)
 			.build()
+			.await
 			.expect("After closing first tree, second should succeed");
 
 		tree2.close().await.unwrap();
@@ -276,12 +279,12 @@ mod tests {
 			let path = temp_path.clone();
 			let thread_barrier = Arc::clone(&barrier);
 
-			let handle = tokio::task::spawn_blocking(move || {
-				// Wait for all threads to be ready
-				thread_barrier.wait();
+			let handle = tokio::spawn(async move {
+				// Wait for all tasks to be ready
+				thread_barrier.wait().await;
 
 				// Try to open the database
-				let result = StoreBuilder::new().with_path(path).build();
+				let result = StoreBuilder::new().with_path(path).build().await;
 
 				(i, result)
 			});

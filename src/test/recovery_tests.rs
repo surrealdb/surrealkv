@@ -18,8 +18,8 @@ const ARENA_SIZE: usize = 1024 * 1024;
 // Category 1: Basic Multi-Segment Recovery (6 tests)
 // ============================================================================
 
-#[test]
-fn test_sequential_5_segments_recovery() {
+#[test(tokio::test)]
+async fn test_sequential_5_segments_recovery() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -36,15 +36,15 @@ fn test_sequential_5_segments_recovery() {
 
 	// Verify all 500 entries recovered
 	assert_eq!(max_seq_opt, Some(1499), "Max sequence should be 1499");
-	WalTestHelper::verify_total_entry_count(&memtables, 500);
+	WalTestHelper::verify_total_entry_count(&memtables, 500).await;
 
 	// Verify max_seq_num is from last segment
 	let expected_keys = WalTestHelper::generate_expected_keys(0, 4, &entries_per_segment);
-	WalTestHelper::verify_entries_across_memtables(&memtables, &expected_keys);
+	WalTestHelper::verify_entries_across_memtables(&memtables, &expected_keys).await;
 }
 
-#[test]
-fn test_empty_segments_between_data() {
+#[test(tokio::test)]
+async fn test_empty_segments_between_data() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -58,15 +58,15 @@ fn test_empty_segments_between_data() {
 
 	// Verify 150 entries recovered (only non-empty segments)
 	assert!(max_seq_opt.is_some(), "Should have recovered data");
-	WalTestHelper::verify_total_entry_count(&memtables, 150);
+	WalTestHelper::verify_total_entry_count(&memtables, 150).await;
 
 	// Verify keys from segments 0, 2, 4
 	let expected_keys = WalTestHelper::generate_expected_keys(0, 4, &entries_per_segment);
-	WalTestHelper::verify_entries_across_memtables(&memtables, &expected_keys);
+	WalTestHelper::verify_entries_across_memtables(&memtables, &expected_keys).await;
 }
 
-#[test]
-fn test_large_batches_multiple_segments() {
+#[test(tokio::test)]
+async fn test_large_batches_multiple_segments() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -80,11 +80,11 @@ fn test_large_batches_multiple_segments() {
 
 	// Verify all 5000 entries recovered
 	assert_eq!(max_seq_opt, Some(14999), "Max sequence should be 14999");
-	WalTestHelper::verify_total_entry_count(&memtables, 5000);
+	WalTestHelper::verify_total_entry_count(&memtables, 5000).await;
 }
 
-#[test]
-fn test_variable_sized_segments() {
+#[test(tokio::test)]
+async fn test_variable_sized_segments() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -99,15 +99,15 @@ fn test_variable_sized_segments() {
 
 	// Verify all entries recovered
 	assert!(max_seq_opt.is_some(), "Should have recovered data");
-	WalTestHelper::verify_total_entry_count(&memtables, total_entries);
+	WalTestHelper::verify_total_entry_count(&memtables, total_entries).await;
 
 	// Verify all keys present
 	let expected_keys = WalTestHelper::generate_expected_keys(0, 4, &entries_per_segment);
-	WalTestHelper::verify_entries_across_memtables(&memtables, &expected_keys);
+	WalTestHelper::verify_entries_across_memtables(&memtables, &expected_keys).await;
 }
 
-#[test]
-fn test_100_segments_recovery() {
+#[test(tokio::test)]
+async fn test_100_segments_recovery() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -132,7 +132,7 @@ fn test_100_segments_recovery() {
 
 	// Verify all entries recovered
 	assert!(max_seq_opt.is_some(), "Should have recovered data");
-	WalTestHelper::verify_total_entry_count(&memtables, total_entries);
+	WalTestHelper::verify_total_entry_count(&memtables, total_entries).await;
 
 	// Log performance metrics
 	log::info!(
@@ -143,8 +143,8 @@ fn test_100_segments_recovery() {
 	);
 }
 
-#[test]
-fn test_single_large_vs_multiple_small_segments() {
+#[test(tokio::test)]
+async fn test_single_large_vs_multiple_small_segments() {
 	let temp_dir1 = TempDir::new().unwrap();
 	let temp_dir2 = TempDir::new().unwrap();
 	fs::create_dir_all(temp_dir1.path()).unwrap();
@@ -173,8 +173,8 @@ fn test_single_large_vs_multiple_small_segments() {
 
 	// Verify both recovered same data
 	assert_eq!(max_seq1, max_seq2);
-	WalTestHelper::verify_total_entry_count(&memtables1, total_entries);
-	WalTestHelper::verify_total_entry_count(&memtables2, total_entries);
+	WalTestHelper::verify_total_entry_count(&memtables1, total_entries).await;
+	WalTestHelper::verify_total_entry_count(&memtables2, total_entries).await;
 
 	log::info!("Single segment: create={:?}, replay={:?}", single_create, single_replay);
 	log::info!("Multiple segments: create={:?}, replay={:?}", multi_create, multi_replay);
@@ -184,8 +184,8 @@ fn test_single_large_vs_multiple_small_segments() {
 // Category 2: Crash Timing Scenarios (8 tests)
 // ============================================================================
 
-#[test]
-fn test_crash_immediately_after_rotation() {
+#[test(tokio::test)]
+async fn test_crash_immediately_after_rotation() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -210,11 +210,11 @@ fn test_crash_immediately_after_rotation() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert_eq!(max_seq_opt, Some(149), "Should recover all 50 entries from segment 0");
-	WalTestHelper::verify_total_entry_count(&memtables, 50);
+	WalTestHelper::verify_total_entry_count(&memtables, 50).await;
 }
 
-#[test]
-fn test_crash_after_multiple_rapid_rotations() {
+#[test(tokio::test)]
+async fn test_crash_after_multiple_rapid_rotations() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -239,11 +239,11 @@ fn test_crash_after_multiple_rapid_rotations() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 5);
+	WalTestHelper::verify_total_entry_count(&memtables, 5).await;
 }
 
-#[test]
-fn test_crash_during_wal_write_mid_batch() {
+#[test(tokio::test)]
+async fn test_crash_during_wal_write_mid_batch() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -286,7 +286,7 @@ fn test_crash_during_wal_write_mid_batch() {
 		}
 		Ok((_, memtables)) => {
 			// Also acceptable if corruption happens at boundary
-			let entry_count = WalTestHelper::count_total_entries(&memtables);
+			let entry_count = WalTestHelper::count_total_entries(&memtables).await;
 			assert!(
 				entry_count >= 10,
 				"Should recover at least batch1 (10 entries), got {}",
@@ -297,8 +297,8 @@ fn test_crash_during_wal_write_mid_batch() {
 	}
 }
 
-#[test]
-fn test_crash_with_unflushed_memtable() {
+#[test(tokio::test)]
+async fn test_crash_with_unflushed_memtable() {
 	// This test simulates the scenario where we have:
 	// - Active memtable with data
 	// - Multiple rotated WAL segments
@@ -316,11 +316,11 @@ fn test_crash_with_unflushed_memtable() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 90);
+	WalTestHelper::verify_total_entry_count(&memtables, 90).await;
 }
 
-#[test]
-fn test_partial_batch_at_segment_end() {
+#[test(tokio::test)]
+async fn test_partial_batch_at_segment_end() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -359,8 +359,8 @@ fn test_partial_batch_at_segment_end() {
 	}
 }
 
-#[test]
-fn test_empty_segment_at_end() {
+#[test(tokio::test)]
+async fn test_empty_segment_at_end() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -372,11 +372,11 @@ fn test_empty_segment_at_end() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 100);
+	WalTestHelper::verify_total_entry_count(&memtables, 100).await;
 }
 
-#[test]
-fn test_all_empty_segments() {
+#[test(tokio::test)]
+async fn test_all_empty_segments() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -390,11 +390,11 @@ fn test_all_empty_segments() {
 	// Should return None for empty recovery
 	assert_eq!(max_seq_opt, None);
 	assert!(memtables.is_empty(), "Should have no memtables for empty segments");
-	assert_eq!(WalTestHelper::count_total_entries(&memtables), 0);
+	assert_eq!(WalTestHelper::count_total_entries(&memtables).await, 0);
 }
 
-#[test]
-fn test_rapid_rotation_with_minimal_data() {
+#[test(tokio::test)]
+async fn test_rapid_rotation_with_minimal_data() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -406,15 +406,15 @@ fn test_rapid_rotation_with_minimal_data() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert_eq!(max_seq_opt, Some(2009));
-	WalTestHelper::verify_total_entry_count(&memtables, 10);
+	WalTestHelper::verify_total_entry_count(&memtables, 10).await;
 }
 
 // ============================================================================
 // Category 3: Corruption Scenarios (15 tests)
 // ============================================================================
 
-#[test]
-fn test_corruption_first_record_segment_0() {
+#[test(tokio::test)]
+async fn test_corruption_first_record_segment_0() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -441,8 +441,8 @@ fn test_corruption_first_record_segment_0() {
 	}
 }
 
-#[test]
-fn test_corruption_middle_segment_0() {
+#[test(tokio::test)]
+async fn test_corruption_middle_segment_0() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -470,8 +470,8 @@ fn test_corruption_middle_segment_0() {
 	}
 }
 
-#[test]
-fn test_corruption_end_segment_0() {
+#[test(tokio::test)]
+async fn test_corruption_end_segment_0() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -502,8 +502,8 @@ fn test_corruption_end_segment_0() {
 	}
 }
 
-#[test]
-fn test_corruption_beginning_middle_segment() {
+#[test(tokio::test)]
+async fn test_corruption_beginning_middle_segment() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -531,8 +531,8 @@ fn test_corruption_beginning_middle_segment() {
 	}
 }
 
-#[test]
-fn test_corruption_middle_of_middle_segment() {
+#[test(tokio::test)]
+async fn test_corruption_middle_of_middle_segment() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -560,8 +560,8 @@ fn test_corruption_middle_of_middle_segment() {
 	}
 }
 
-#[test]
-fn test_corruption_last_segment() {
+#[test(tokio::test)]
+async fn test_corruption_last_segment() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -589,8 +589,8 @@ fn test_corruption_last_segment() {
 	}
 }
 
-#[test]
-fn test_truncated_wal_file() {
+#[test(tokio::test)]
+async fn test_truncated_wal_file() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -617,15 +617,15 @@ fn test_truncated_wal_file() {
 		}
 		Ok((_, memtables)) => {
 			// Also acceptable for clean truncation at record boundary
-			let entry_count = WalTestHelper::count_total_entries(&memtables);
+			let entry_count = WalTestHelper::count_total_entries(&memtables).await;
 			assert!(entry_count >= 30, "Should have at least segment 0, got {}", entry_count);
 		}
 		Err(e) => panic!("Unexpected error: {}", e),
 	}
 }
 
-#[test]
-fn test_random_byte_corruption() {
+#[test(tokio::test)]
+async fn test_random_byte_corruption() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -655,8 +655,8 @@ fn test_random_byte_corruption() {
 	}
 }
 
-#[test]
-fn test_multiple_corruptions_stop_at_first() {
+#[test(tokio::test)]
+async fn test_multiple_corruptions_stop_at_first() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -686,8 +686,8 @@ fn test_multiple_corruptions_stop_at_first() {
 	}
 }
 
-#[test]
-fn test_crc_mismatch() {
+#[test(tokio::test)]
+async fn test_crc_mismatch() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -711,15 +711,15 @@ fn test_crc_mismatch() {
 		}
 		Ok((_, memtables)) => {
 			// Partial recovery with less than full entries
-			let entry_count = WalTestHelper::count_total_entries(&memtables);
+			let entry_count = WalTestHelper::count_total_entries(&memtables).await;
 			assert!(entry_count < 40, "Should have partial recovery");
 		}
 		Err(e) => panic!("Unexpected error: {}", e),
 	}
 }
 
-#[test]
-fn test_corruption_in_wal_header() {
+#[test(tokio::test)]
+async fn test_corruption_in_wal_header() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -747,8 +747,8 @@ fn test_corruption_in_wal_header() {
 	}
 }
 
-#[test]
-fn test_corruption_in_batch_data() {
+#[test(tokio::test)]
+async fn test_corruption_in_batch_data() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -778,8 +778,8 @@ fn test_corruption_in_batch_data() {
 	}
 }
 
-#[test]
-fn test_completely_corrupted_file() {
+#[test(tokio::test)]
+async fn test_completely_corrupted_file() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -809,8 +809,8 @@ fn test_completely_corrupted_file() {
 	}
 }
 
-#[test]
-fn test_tail_corruption_recovery() {
+#[test(tokio::test)]
+async fn test_tail_corruption_recovery() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -837,7 +837,7 @@ fn test_tail_corruption_recovery() {
 		}
 		Ok((_, memtables)) => {
 			// Also acceptable if corruption was at a clean boundary
-			let entry_count = WalTestHelper::count_total_entries(&memtables);
+			let entry_count = WalTestHelper::count_total_entries(&memtables).await;
 			assert!(
 				entry_count >= 30,
 				"Should recover most data despite tail corruption, got {}",
@@ -852,8 +852,8 @@ fn test_tail_corruption_recovery() {
 // Category 4: Sequence Number Validation (5 tests)
 // ============================================================================
 
-#[test]
-fn test_contiguous_sequence_numbers() {
+#[test(tokio::test)]
+async fn test_contiguous_sequence_numbers() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -871,11 +871,11 @@ fn test_contiguous_sequence_numbers() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert_eq!(max_seq_opt, Some(399), "Max sequence should be 399");
-	WalTestHelper::verify_total_entry_count(&memtables, 300);
+	WalTestHelper::verify_total_entry_count(&memtables, 300).await;
 }
 
-#[test]
-fn test_sequence_tracking_10_segments() {
+#[test(tokio::test)]
+async fn test_sequence_tracking_10_segments() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -890,11 +890,11 @@ fn test_sequence_tracking_10_segments() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert_eq!(max_seq_opt, Some(1999), "Max sequence should be 1999");
-	WalTestHelper::verify_total_entry_count(&memtables, 1000);
+	WalTestHelper::verify_total_entry_count(&memtables, 1000).await;
 }
 
-#[test]
-fn test_sequence_after_corruption() {
+#[test(tokio::test)]
+async fn test_sequence_after_corruption() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -922,8 +922,8 @@ fn test_sequence_after_corruption() {
 	}
 }
 
-#[test]
-fn test_large_sequence_numbers() {
+#[test(tokio::test)]
+async fn test_large_sequence_numbers() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -938,11 +938,11 @@ fn test_large_sequence_numbers() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert_eq!(max_seq_opt, Some(1_000_149));
-	WalTestHelper::verify_total_entry_count(&memtables, 150);
+	WalTestHelper::verify_total_entry_count(&memtables, 150).await;
 }
 
-#[test]
-fn test_sequence_gaps_detection() {
+#[test(tokio::test)]
+async fn test_sequence_gaps_detection() {
 	// This test verifies that we correctly track sequences even with empty segments
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
@@ -956,15 +956,15 @@ fn test_sequence_gaps_detection() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 90);
+	WalTestHelper::verify_total_entry_count(&memtables, 90).await;
 }
 
 // ============================================================================
 // Category 5: Min WAL Number / Flush Boundary Tests (7 tests)
 // ============================================================================
 
-#[test]
-fn test_skip_flushed_segments() {
+#[test(tokio::test)]
+async fn test_skip_flushed_segments() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -978,11 +978,11 @@ fn test_skip_flushed_segments() {
 
 	// Should only replay segments 3-4 (40 entries)
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 40);
+	WalTestHelper::verify_total_entry_count(&memtables, 40).await;
 }
 
-#[test]
-fn test_all_segments_already_flushed() {
+#[test(tokio::test)]
+async fn test_all_segments_already_flushed() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -997,11 +997,11 @@ fn test_all_segments_already_flushed() {
 	// Should return None (nothing to replay)
 	assert_eq!(max_seq_opt, None);
 	assert!(memtables.is_empty(), "Should have no memtables when all segments already flushed");
-	assert_eq!(WalTestHelper::count_total_entries(&memtables), 0);
+	assert_eq!(WalTestHelper::count_total_entries(&memtables).await, 0);
 }
 
-#[test]
-fn test_min_wal_equals_first_segment() {
+#[test(tokio::test)]
+async fn test_min_wal_equals_first_segment() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1022,11 +1022,11 @@ fn test_min_wal_equals_first_segment() {
 
 	// Should replay all three segments (5, 6, 7)
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 75);
+	WalTestHelper::verify_total_entry_count(&memtables, 75).await;
 }
 
-#[test]
-fn test_mixed_flushed_unflushed() {
+#[test(tokio::test)]
+async fn test_mixed_flushed_unflushed() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1041,11 +1041,11 @@ fn test_mixed_flushed_unflushed() {
 
 	// Should replay segments 3-5 (54 entries)
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 54);
+	WalTestHelper::verify_total_entry_count(&memtables, 54).await;
 }
 
-#[test]
-fn test_recovery_min_wal_zero() {
+#[test(tokio::test)]
+async fn test_recovery_min_wal_zero() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1059,11 +1059,11 @@ fn test_recovery_min_wal_zero() {
 
 	// Should replay all 6 segments
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 132);
+	WalTestHelper::verify_total_entry_count(&memtables, 132).await;
 }
 
-#[test]
-fn test_corruption_at_min_wal_boundary() {
+#[test(tokio::test)]
+async fn test_corruption_at_min_wal_boundary() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1091,8 +1091,8 @@ fn test_corruption_at_min_wal_boundary() {
 	}
 }
 
-#[test]
-fn test_boundary_with_empty_segments() {
+#[test(tokio::test)]
+async fn test_boundary_with_empty_segments() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1106,15 +1106,15 @@ fn test_boundary_with_empty_segments() {
 
 	// Should replay segments 2(empty), 3, 4 = 40 entries
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 40);
+	WalTestHelper::verify_total_entry_count(&memtables, 40).await;
 }
 
 // ============================================================================
 // Category 6: Large-Scale and Performance Tests (4 tests)
 // ============================================================================
 
-#[test]
-fn test_very_large_values_across_segments() {
+#[test(tokio::test)]
+async fn test_very_large_values_across_segments() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1144,11 +1144,11 @@ fn test_very_large_values_across_segments() {
 
 	// Verify all large values recovered
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 25);
+	WalTestHelper::verify_total_entry_count(&memtables, 25).await;
 }
 
-#[test]
-fn test_many_small_batches() {
+#[test(tokio::test)]
+async fn test_many_small_batches() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1179,13 +1179,13 @@ fn test_many_small_batches() {
 	let duration = start.elapsed();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 1000);
+	WalTestHelper::verify_total_entry_count(&memtables, 1000).await;
 
 	log::info!("1000 small batches replay time: {:?}", duration);
 }
 
-#[test]
-fn test_few_large_batches() {
+#[test(tokio::test)]
+async fn test_few_large_batches() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1214,13 +1214,13 @@ fn test_few_large_batches() {
 	let duration = start.elapsed();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 1000);
+	WalTestHelper::verify_total_entry_count(&memtables, 1000).await;
 
 	log::info!("5 large batches replay time: {:?}", duration);
 }
 
-#[test]
-fn test_recovery_performance_scaling() {
+#[test(tokio::test)]
+async fn test_recovery_performance_scaling() {
 	// Test that recovery time scales linearly with segment count
 	let segment_counts = vec![10, 20, 50];
 	let entries_per_segment = 50;
@@ -1239,7 +1239,7 @@ fn test_recovery_performance_scaling() {
 		let duration = start.elapsed();
 
 		let total_entries = seg_count * entries_per_segment;
-		WalTestHelper::verify_total_entry_count(&memtables, total_entries);
+		WalTestHelper::verify_total_entry_count(&memtables, total_entries).await;
 
 		log::info!("{} segments, {} entries: {:?}", seg_count, total_entries, duration);
 	}
@@ -1249,8 +1249,8 @@ fn test_recovery_performance_scaling() {
 // Category 7: Edge Cases and Error Handling (8 tests)
 // ============================================================================
 
-#[test]
-fn test_wal_segments_with_gaps() {
+#[test(tokio::test)]
+async fn test_wal_segments_with_gaps() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1270,11 +1270,11 @@ fn test_wal_segments_with_gaps() {
 	assert!(max_seq_opt.is_some());
 
 	// Should have 4 segments worth of data (0, 1, 3, 4)
-	WalTestHelper::verify_total_entry_count(&memtables, 112);
+	WalTestHelper::verify_total_entry_count(&memtables, 112).await;
 }
 
-#[test]
-fn test_non_sequential_segment_ids_with_min_wal() {
+#[test(tokio::test)]
+async fn test_non_sequential_segment_ids_with_min_wal() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1296,11 +1296,11 @@ fn test_non_sequential_segment_ids_with_min_wal() {
 
 	// Should process 5, 10, 15 (3 segments = 78 entries)
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 78);
+	WalTestHelper::verify_total_entry_count(&memtables, 78).await;
 }
 
-#[test]
-fn test_zero_length_segment_file() {
+#[test(tokio::test)]
+async fn test_zero_length_segment_file() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1318,11 +1318,11 @@ fn test_zero_length_segment_file() {
 
 	// Should get segment 0, skip empty segment 1, get segment 2
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 64);
+	WalTestHelper::verify_total_entry_count(&memtables, 64).await;
 }
 
-#[test]
-fn test_segment_larger_than_expected() {
+#[test(tokio::test)]
+async fn test_segment_larger_than_expected() {
 	// Create very large segment and ensure it's handled
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
@@ -1335,11 +1335,11 @@ fn test_segment_larger_than_expected() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 5000);
+	WalTestHelper::verify_total_entry_count(&memtables, 5000).await;
 }
 
-#[test]
-fn test_recovery_with_readonly_segment() {
+#[test(tokio::test)]
+async fn test_recovery_with_readonly_segment() {
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1362,11 +1362,11 @@ fn test_recovery_with_readonly_segment() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 70);
+	WalTestHelper::verify_total_entry_count(&memtables, 70).await;
 }
 
-#[test]
-fn test_only_wal_extension_processed() {
+#[test(tokio::test)]
+async fn test_only_wal_extension_processed() {
 	// Ensure we only process .wal files correctly
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
@@ -1380,11 +1380,11 @@ fn test_only_wal_extension_processed() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 76);
+	WalTestHelper::verify_total_entry_count(&memtables, 76).await;
 }
 
-#[test]
-fn test_symlink_to_wal_segment() {
+#[test(tokio::test)]
+async fn test_symlink_to_wal_segment() {
 	// Test handling of symlinked WAL files
 	#[cfg(unix)]
 	{
@@ -1405,13 +1405,13 @@ fn test_symlink_to_wal_segment() {
 		let (_result, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 		// Should process files (might process symlink as separate segment or skip it)
-		let entry_count = WalTestHelper::count_total_entries(&memtables);
+		let entry_count = WalTestHelper::count_total_entries(&memtables).await;
 		assert!(entry_count >= 42, "Should process at least original segment");
 	}
 }
 
-#[test]
-fn test_concurrent_wal_directory_modifications() {
+#[test(tokio::test)]
+async fn test_concurrent_wal_directory_modifications() {
 	// While this test can't truly test concurrency in single-threaded test,
 	// it verifies robustness to directory changes
 	let temp_dir = TempDir::new().unwrap();
@@ -1440,7 +1440,7 @@ fn test_concurrent_wal_directory_modifications() {
 		}
 		Ok((_, memtables)) => {
 			// Also acceptable if somehow handled gracefully
-			let entry_count = WalTestHelper::count_total_entries(&memtables);
+			let entry_count = WalTestHelper::count_total_entries(&memtables).await;
 			assert!(entry_count >= 90, "Should have recovered segments 0-1, got {}", entry_count);
 		}
 		Err(e) => panic!("Unexpected error: {}", e),
@@ -1451,8 +1451,8 @@ fn test_concurrent_wal_directory_modifications() {
 // Category 8: Compression Tests (3 tests)
 // ============================================================================
 
-#[test]
-fn test_compressed_wal_segments() {
+#[test(tokio::test)]
+async fn test_compressed_wal_segments() {
 	use crate::wal::CompressionType;
 
 	let temp_dir = TempDir::new().unwrap();
@@ -1486,11 +1486,11 @@ fn test_compressed_wal_segments() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 150);
+	WalTestHelper::verify_total_entry_count(&memtables, 150).await;
 }
 
-#[test]
-fn test_mixed_compression_segments() {
+#[test(tokio::test)]
+async fn test_mixed_compression_segments() {
 	use crate::wal::CompressionType;
 
 	let temp_dir = TempDir::new().unwrap();
@@ -1536,11 +1536,11 @@ fn test_mixed_compression_segments() {
 	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
 
 	assert!(max_seq_opt.is_some());
-	WalTestHelper::verify_total_entry_count(&memtables, 160);
+	WalTestHelper::verify_total_entry_count(&memtables, 160).await;
 }
 
-#[test]
-fn test_compressed_data_corruption() {
+#[test(tokio::test)]
+async fn test_compressed_data_corruption() {
 	use crate::wal::CompressionType;
 
 	let temp_dir = TempDir::new().unwrap();
@@ -1578,7 +1578,7 @@ fn test_compressed_data_corruption() {
 			// Expected corruption detected
 		}
 		Ok((_, memtables)) => {
-			let entry_count = WalTestHelper::count_total_entries(&memtables);
+			let entry_count = WalTestHelper::count_total_entries(&memtables).await;
 			assert!(entry_count < 60, "Should detect corruption in compressed data");
 		}
 		Err(e) => panic!("Unexpected error: {}", e),

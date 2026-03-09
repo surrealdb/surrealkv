@@ -14,8 +14,9 @@ use crate::test::{
 	collect_snapshot_iter,
 	collect_snapshot_reverse,
 	collect_transaction_all,
+	new_test_table,
+	test_sst_id,
 };
-use crate::vfs::File;
 use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Store, StoreBuilder};
 
 fn create_temp_directory() -> TempDir {
@@ -23,31 +24,32 @@ fn create_temp_directory() -> TempDir {
 }
 
 // Common setup logic for creating a store
-fn create_store() -> (Store, TempDir) {
+async fn create_store() -> (Store, TempDir) {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
-	let store = StoreBuilder::new().with_path(path).build().unwrap();
+	let store = StoreBuilder::new().with_path(path).build().await.unwrap();
 	(store, temp_dir)
 }
 
 #[test(tokio::test)]
 async fn test_empty_snapshot() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Create a snapshot without any data
 	let snapshot = store.new_snapshot();
 
 	// Range scan should return empty
-	let range =
-		collect_transaction_all(&mut snapshot.range(Some(b"a"), Some(b"z")).unwrap()).unwrap();
+	let range = collect_transaction_all(&mut snapshot.range(Some(b"a"), Some(b"z")).unwrap())
+		.await
+		.unwrap();
 
 	assert!(range.is_empty());
 }
 
 #[test(tokio::test)]
 async fn test_basic_snapshot_visibility() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert initial data
 	{
@@ -70,6 +72,7 @@ async fn test_basic_snapshot_visibility() {
 
 	// The snapshot should only see the initial data
 	let range = collect_transaction_all(&mut snapshot.range(Some(b"key0"), Some(b"key:")).unwrap())
+		.await
 		.unwrap();
 
 	assert_eq!(range.len(), 2);
@@ -79,7 +82,7 @@ async fn test_basic_snapshot_visibility() {
 
 #[test(tokio::test)]
 async fn test_snapshot_isolation_with_updates() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert initial data
 	{
@@ -102,6 +105,7 @@ async fn test_snapshot_isolation_with_updates() {
 
 	// The old snapshot should see the old values
 	let range = collect_transaction_all(&mut snapshot.range(Some(b"key0"), Some(b"key:")).unwrap())
+		.await
 		.unwrap();
 
 	assert_eq!(range.len(), 2);
@@ -112,6 +116,7 @@ async fn test_snapshot_isolation_with_updates() {
 	let new_snapshot = store.new_snapshot();
 	let range =
 		collect_transaction_all(&mut new_snapshot.range(Some(b"key0"), Some(b"key:")).unwrap())
+			.await
 			.unwrap();
 
 	assert_eq!(range.len(), 2);
@@ -121,7 +126,7 @@ async fn test_snapshot_isolation_with_updates() {
 
 #[test(tokio::test)]
 async fn test_tombstone_handling() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert initial data
 	{
@@ -145,6 +150,7 @@ async fn test_tombstone_handling() {
 	// The first snapshot should still see all three keys
 	let range =
 		collect_transaction_all(&mut snapshot1.range(Some(b"key0"), Some(b"key:")).unwrap())
+			.await
 			.unwrap();
 
 	assert_eq!(range.len(), 3);
@@ -156,6 +162,7 @@ async fn test_tombstone_handling() {
 	let snapshot2 = store.new_snapshot();
 	let range =
 		collect_transaction_all(&mut snapshot2.range(Some(b"key0"), Some(b"key:")).unwrap())
+			.await
 			.unwrap();
 
 	assert_eq!(range.len(), 2);
@@ -165,7 +172,7 @@ async fn test_tombstone_handling() {
 
 #[test(tokio::test)]
 async fn test_version_resolution() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert first version
 	store.set(b"key1", b"version1").await.unwrap();
@@ -183,19 +190,19 @@ async fn test_version_resolution() {
 	let snapshot3 = store.new_snapshot();
 
 	// Each snapshot should see its corresponding version
-	let value1 = snapshot1.get(b"key1").unwrap().unwrap().0;
+	let value1 = snapshot1.get(b"key1").await.unwrap().unwrap().0;
 	assert_eq!(value1, b"version1");
 
-	let value2 = snapshot2.get(b"key1").unwrap().unwrap().0;
+	let value2 = snapshot2.get(b"key1").await.unwrap().unwrap().0;
 	assert_eq!(value2, b"version2");
 
-	let value3 = snapshot3.get(b"key1").unwrap().unwrap().0;
+	let value3 = snapshot3.get(b"key1").await.unwrap().unwrap().0;
 	assert_eq!(value3, b"version3");
 }
 
 #[test(tokio::test)]
 async fn test_range_with_random_operations() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Initial data
 	{
@@ -231,6 +238,7 @@ async fn test_range_with_random_operations() {
 	// snapshot1 should see all original data
 	let range1 =
 		collect_transaction_all(&mut snapshot1.range(Some(b"key00"), Some(b"key99")).unwrap())
+			.await
 			.unwrap();
 
 	assert_eq!(range1.len(), 10);
@@ -244,6 +252,7 @@ async fn test_range_with_random_operations() {
 	// snapshot2 should see updated data with deletions
 	let range2 =
 		collect_transaction_all(&mut snapshot2.range(Some(b"key00"), Some(b"key99")).unwrap())
+			.await
 			.unwrap();
 
 	assert_eq!(range2.len(), 7); // 10 - 3 deleted
@@ -269,7 +278,7 @@ async fn test_range_with_random_operations() {
 
 #[test(tokio::test)]
 async fn test_concurrent_snapshots() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Initial state
 	store.set(b"counter", b"0").await.unwrap();
@@ -287,7 +296,7 @@ async fn test_concurrent_snapshots() {
 
 	// Each snapshot should see its corresponding counter value
 	for (i, snapshot) in snapshots.iter().enumerate() {
-		let value = snapshot.get(b"counter").unwrap().unwrap().0;
+		let value = snapshot.get(b"counter").await.unwrap().unwrap().0;
 		let expected = i.to_string();
 		assert_eq!(value, expected.as_bytes());
 	}
@@ -295,7 +304,7 @@ async fn test_concurrent_snapshots() {
 
 #[test(tokio::test)]
 async fn test_snapshot_with_complex_key_patterns() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert data with different key patterns
 	{
@@ -321,21 +330,26 @@ async fn test_snapshot_with_complex_key_patterns() {
 
 	// Test different range queries
 	let numeric_range =
-		collect_transaction_all(&mut snapshot.range(Some(b"000"), Some(b"999")).unwrap()).unwrap();
+		collect_transaction_all(&mut snapshot.range(Some(b"000"), Some(b"999")).unwrap())
+			.await
+			.unwrap();
 	assert_eq!(numeric_range.len(), 10);
 
-	let alpha_range =
-		collect_transaction_all(&mut snapshot.range(Some(b"a"), Some(b"z")).unwrap()).unwrap();
+	let alpha_range = collect_transaction_all(&mut snapshot.range(Some(b"a"), Some(b"z")).unwrap())
+		.await
+		.unwrap();
 	assert_eq!(alpha_range.len(), 15); // 10 numeric + 10 alpha + 5 mixed
 
 	let mixed_range =
-		collect_transaction_all(&mut snapshot.range(Some(b"mix"), Some(b"miy")).unwrap()).unwrap();
+		collect_transaction_all(&mut snapshot.range(Some(b"mix"), Some(b"miy")).unwrap())
+			.await
+			.unwrap();
 	assert_eq!(mixed_range.len(), 5);
 }
 
 #[test(tokio::test)]
 async fn test_snapshot_ordering_invariants() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert data in random order
 	{
@@ -353,6 +367,7 @@ async fn test_snapshot_ordering_invariants() {
 	// Range scan should return keys in sorted order
 	let range =
 		collect_transaction_all(&mut snapshot.range(Some(b"key00"), Some(b"key99")).unwrap())
+			.await
 			.unwrap();
 
 	assert_eq!(range.len(), 9);
@@ -369,7 +384,7 @@ async fn test_snapshot_ordering_invariants() {
 
 #[test(tokio::test)]
 async fn test_snapshot_keys_only() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert test data
 	{
@@ -389,7 +404,7 @@ async fn test_snapshot_keys_only() {
 	// Note: keys_only parameter no longer exists, using regular range and mapping to keys
 	let mut keys_only_iter =
 		snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
-	let keys_only_data = collect_snapshot_iter(&mut keys_only_iter).unwrap();
+	let keys_only_data = collect_snapshot_iter(&mut keys_only_iter).await.unwrap();
 	let keys_only: Vec<(Vec<u8>, Option<Vec<u8>>)> =
 		keys_only_data.into_iter().map(|(k, _)| (k.user_key, None)).collect();
 
@@ -408,7 +423,7 @@ async fn test_snapshot_keys_only() {
 	// Compare with regular range scan ([key1, key6) to include key5)
 	let mut regular_range_iter =
 		snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
-	let regular_range_data = collect_snapshot_iter(&mut regular_range_iter).unwrap();
+	let regular_range_data = collect_snapshot_iter(&mut regular_range_iter).await.unwrap();
 	let regular_range: Vec<_> =
 		regular_range_data.into_iter().map(|(k, v)| (k.user_key, Some(v))).collect();
 
@@ -429,27 +444,28 @@ async fn test_snapshot_keys_only() {
 	}
 }
 
-#[test]
-fn test_range_skips_non_overlapping_tables() {
-	fn build_table(data: Vec<(&'static [u8], &'static [u8])>) -> Arc<Table> {
+#[test(tokio::test)]
+async fn test_range_skips_non_overlapping_tables() {
+	async fn build_table(
+		id: crate::sstable::sst_id::SstId,
+		data: Vec<(&'static [u8], &'static [u8])>,
+	) -> Arc<Table> {
 		let opts = Arc::new(Options::new());
 		let mut buf = Vec::new();
 		{
-			let mut w = TableWriter::new(&mut buf, 0, Arc::clone(&opts), 0); // L0 for test
+			let mut w = TableWriter::new(&mut buf, id, Arc::clone(&opts), 0); // L0 for test
 			for (k, v) in data {
 				let ikey = InternalKey::new(k.to_vec(), 1, InternalKeyKind::Set, 0);
 				w.add(ikey, v).unwrap();
 			}
 			w.finish().unwrap();
 		}
-		let size = buf.len();
-		let file = Arc::new(buf) as Arc<dyn File>;
-		Arc::new(Table::new(1, opts, file, size as u64).unwrap())
+		Arc::new(new_test_table(id, opts, buf).await.unwrap())
 	}
 
 	// Build two tables with disjoint key ranges
-	let table1 = build_table(vec![(b"a1", b"v1"), (b"a2", b"v2")]);
-	let table2 = build_table(vec![(b"z1", b"v3"), (b"z2", b"v4")]);
+	let table1 = build_table(test_sst_id(1), vec![(b"a1", b"v1"), (b"a2", b"v2")]).await;
+	let table2 = build_table(test_sst_id(2), vec![(b"z1", b"v3"), (b"z2", b"v4")]).await;
 
 	let mut level0 = Level::with_capacity(10);
 	level0.insert(table1);
@@ -470,7 +486,7 @@ fn test_range_skips_non_overlapping_tables() {
 	);
 	let mut merge_iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let items = collect_all(&mut merge_iter).unwrap();
+	let items = collect_all(&mut merge_iter).await.unwrap();
 	assert_eq!(items.len(), 2);
 	assert_eq!(items[0].0.user_key.as_slice(), b"z1");
 	assert_eq!(items[1].0.user_key.as_slice(), b"z2");
@@ -478,7 +494,7 @@ fn test_range_skips_non_overlapping_tables() {
 
 #[test(tokio::test)]
 async fn test_double_ended_iteration() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert test data
 	{
@@ -497,7 +513,7 @@ async fn test_double_ended_iteration() {
 	// Test forward iteration ([key1, key6) to include key5)
 	let mut forward_iter =
 		snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
-	let forward_items = collect_snapshot_iter(&mut forward_iter).unwrap();
+	let forward_items = collect_snapshot_iter(&mut forward_iter).await.unwrap();
 
 	assert_eq!(forward_items.len(), 5);
 	assert_eq!(&forward_items[0].0.user_key, b"key1");
@@ -506,7 +522,7 @@ async fn test_double_ended_iteration() {
 	// Test backward iteration ([key1, key6) to include key5)
 	let mut backward_iter =
 		snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
-	let backward_items = collect_snapshot_reverse(&mut backward_iter).unwrap();
+	let backward_items = collect_snapshot_reverse(&mut backward_iter).await.unwrap();
 
 	assert_eq!(backward_items.len(), 5);
 	assert_eq!(&backward_items[0].0.user_key, b"key5");
@@ -520,7 +536,7 @@ async fn test_double_ended_iteration() {
 
 #[test(tokio::test)]
 async fn test_double_ended_iteration_with_tombstones() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert initial data
 	{
@@ -547,25 +563,25 @@ async fn test_double_ended_iteration_with_tombstones() {
 	// Test forward iteration on first snapshot (should see all keys)
 	let mut forward_iter1 =
 		snapshot1.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
-	let forward_items1 = collect_snapshot_iter(&mut forward_iter1).unwrap();
+	let forward_items1 = collect_snapshot_iter(&mut forward_iter1).await.unwrap();
 	assert_eq!(forward_items1.len(), 3);
 
 	// Test backward iteration on first snapshot
 	let mut backward_iter1 =
 		snapshot1.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
-	let backward_items1 = collect_snapshot_reverse(&mut backward_iter1).unwrap();
+	let backward_items1 = collect_snapshot_reverse(&mut backward_iter1).await.unwrap();
 	assert_eq!(backward_items1.len(), 3);
 
 	// Test forward iteration on second snapshot (should not see deleted key)
 	let mut forward_iter2 =
 		snapshot2.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
-	let forward_items2 = collect_snapshot_iter(&mut forward_iter2).unwrap();
+	let forward_items2 = collect_snapshot_iter(&mut forward_iter2).await.unwrap();
 	assert_eq!(forward_items2.len(), 2);
 
 	// Test backward iteration on second snapshot
 	let mut backward_iter2 =
 		snapshot2.range(Some("key1".as_bytes()), Some("key4".as_bytes())).unwrap();
-	let backward_items2 = collect_snapshot_reverse(&mut backward_iter2).unwrap();
+	let backward_items2 = collect_snapshot_reverse(&mut backward_iter2).await.unwrap();
 	assert_eq!(backward_items2.len(), 2);
 
 	// Verify both iterations produce the same items in reverse order
@@ -578,7 +594,7 @@ async fn test_double_ended_iteration_with_tombstones() {
 /// This tests if calling prev() after next() correctly returns the previous key.
 #[test(tokio::test)]
 async fn test_snapshot_iterator_direction_switch_forward_to_backward() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert 5 keys
 	{
@@ -595,17 +611,17 @@ async fn test_snapshot_iterator_direction_switch_forward_to_backward() {
 	let mut iter = snapshot.range(Some(b"key1".as_slice()), Some(b"key6".as_slice())).unwrap();
 
 	// Forward: seek to first, move to second
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	assert!(iter.valid(), "Should be valid after seek_first");
 	assert_eq!(iter.key().user_key(), b"key1", "First key should be key1");
 
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid(), "Should be valid after next");
 	assert_eq!(iter.key().user_key(), b"key2", "Second key should be key2");
 
 	// Switch direction: go backward
 	// After being at key2 and calling prev(), we should get key1
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert!(iter.valid(), "Should be valid after prev");
 	assert_eq!(
 		iter.key().user_key(),
@@ -615,7 +631,7 @@ async fn test_snapshot_iterator_direction_switch_forward_to_backward() {
 	);
 
 	// Continue backward - should become invalid (no more keys)
-	let has_more = iter.prev().unwrap();
+	let has_more = iter.prev().await.unwrap();
 	assert!(!has_more || !iter.valid(), "Should have no more keys before key1");
 }
 
@@ -623,7 +639,7 @@ async fn test_snapshot_iterator_direction_switch_forward_to_backward() {
 /// This tests if calling next() after prev() correctly returns the next key.
 #[test(tokio::test)]
 async fn test_snapshot_iterator_direction_switch_backward_to_forward() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert 5 keys
 	{
@@ -640,17 +656,17 @@ async fn test_snapshot_iterator_direction_switch_backward_to_forward() {
 	let mut iter = snapshot.range(Some(b"key1".as_slice()), Some(b"key6".as_slice())).unwrap();
 
 	// Backward: seek to last, move to previous
-	iter.seek_last().unwrap();
+	iter.seek_last().await.unwrap();
 	assert!(iter.valid(), "Should be valid after seek_last");
 	assert_eq!(iter.key().user_key(), b"key5", "Last key should be key5");
 
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert!(iter.valid(), "Should be valid after prev");
 	assert_eq!(iter.key().user_key(), b"key4", "Should be at key4");
 
 	// Switch direction: go forward
 	// After being at key4 and calling next(), we should get key5
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert!(iter.valid(), "Should be valid after next");
 	assert_eq!(
 		iter.key().user_key(),
@@ -660,13 +676,13 @@ async fn test_snapshot_iterator_direction_switch_backward_to_forward() {
 	);
 
 	// Continue forward - should become invalid (no more keys)
-	let has_more = iter.next().unwrap();
+	let has_more = iter.next().await.unwrap();
 	assert!(!has_more || !iter.valid(), "Should have no more keys after key5");
 }
 
 #[test(tokio::test)]
 async fn test_soft_delete_snapshot_individual_get() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert initial data
 	{
@@ -691,20 +707,20 @@ async fn test_soft_delete_snapshot_individual_get() {
 
 	// First snapshot should see both keys
 	{
-		assert_eq!(&snapshot1.get(b"key1").unwrap().unwrap().0, b"value1");
-		assert_eq!(&snapshot1.get(b"key2").unwrap().unwrap().0, b"value2");
+		assert_eq!(&snapshot1.get(b"key1").await.unwrap().unwrap().0, b"value1");
+		assert_eq!(&snapshot1.get(b"key2").await.unwrap().unwrap().0, b"value2");
 	}
 
 	// Second snapshot should not see the soft deleted key
 	{
-		assert_eq!(&snapshot2.get(b"key1").unwrap().unwrap().0, b"value1");
-		assert!(snapshot2.get(b"key2").unwrap().is_none());
+		assert_eq!(&snapshot2.get(b"key1").await.unwrap().unwrap().0, b"value1");
+		assert!(snapshot2.get(b"key2").await.unwrap().is_none());
 	}
 }
 
 #[test(tokio::test)]
 async fn test_soft_delete_snapshot_double_ended_iteration() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert initial data
 	{
@@ -732,7 +748,7 @@ async fn test_soft_delete_snapshot_double_ended_iteration() {
 	{
 		let mut forward_iter =
 			snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
-		let forward_items = collect_snapshot_iter(&mut forward_iter).unwrap();
+		let forward_items = collect_snapshot_iter(&mut forward_iter).await.unwrap();
 
 		assert_eq!(forward_items.len(), 3); // key1, key3, key5
 		assert_eq!(&forward_items[0].0.user_key, b"key1");
@@ -744,7 +760,7 @@ async fn test_soft_delete_snapshot_double_ended_iteration() {
 	{
 		let mut backward_iter =
 			snapshot.range(Some("key1".as_bytes()), Some("key6".as_bytes())).unwrap();
-		let backward_items = collect_snapshot_reverse(&mut backward_iter).unwrap();
+		let backward_items = collect_snapshot_reverse(&mut backward_iter).await.unwrap();
 
 		assert_eq!(backward_items.len(), 3); // key5, key3, key1
 		assert_eq!(&backward_items[0].0.user_key, b"key5");
@@ -755,7 +771,7 @@ async fn test_soft_delete_snapshot_double_ended_iteration() {
 
 #[test(tokio::test)]
 async fn test_soft_delete_snapshot_mixed_with_hard_delete() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert initial data
 	{
@@ -785,7 +801,7 @@ async fn test_soft_delete_snapshot_mixed_with_hard_delete() {
 	{
 		let mut range_iter =
 			snapshot1.range(Some("key1".as_bytes()), Some("key5".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 		assert_eq!(range.len(), 4);
 	}
 
@@ -793,7 +809,7 @@ async fn test_soft_delete_snapshot_mixed_with_hard_delete() {
 	{
 		let mut range_iter =
 			snapshot2.range(Some("key1".as_bytes()), Some("key5".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 		assert_eq!(range.len(), 2); // Only key3 and key4
 		assert_eq!(&range[0].0.user_key, b"key3");
 		assert_eq!(&range[1].0.user_key, b"key4");
@@ -802,7 +818,7 @@ async fn test_soft_delete_snapshot_mixed_with_hard_delete() {
 
 #[test(tokio::test)]
 async fn test_double_ended_iteration_mixed_operations() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert initial data
 	{
@@ -821,12 +837,12 @@ async fn test_double_ended_iteration_mixed_operations() {
 	// Test forward iteration
 	let mut forward_iter =
 		snapshot.range(Some("key01".as_bytes()), Some("key11".as_bytes())).unwrap();
-	let forward_items = collect_snapshot_iter(&mut forward_iter).unwrap();
+	let forward_items = collect_snapshot_iter(&mut forward_iter).await.unwrap();
 
 	// Test backward iteration
 	let mut backward_iter =
 		snapshot.range(Some("key01".as_bytes()), Some("key11".as_bytes())).unwrap();
-	let backward_items = collect_snapshot_reverse(&mut backward_iter).unwrap();
+	let backward_items = collect_snapshot_reverse(&mut backward_iter).await.unwrap();
 
 	// Both should have 10 items
 	assert_eq!(forward_items.len(), 10);
@@ -850,59 +866,51 @@ async fn test_double_ended_iteration_mixed_operations() {
 // ========================================================================
 
 // Helper function to create a test table with specific key range
-fn create_test_table_with_range(
+async fn create_test_table_with_range(
 	table_id: u64,
 	key_start: &str,
 	key_end: &str,
 	seq_start: u64,
 	opts: Arc<Options>,
 ) -> crate::Result<Arc<Table>> {
-	use std::fs::{self, File as SysFile};
+	let id = test_sst_id(table_id);
+	let mut buf = Vec::new();
 
-	// Ensure the sstables directory exists
-	let sstables_dir = opts.path.join("sstables");
-	fs::create_dir_all(&sstables_dir)?;
+	{
+		let mut writer = TableWriter::new(&mut buf, id, Arc::clone(&opts), 0); // L0 for test
 
-	let table_file_path = opts.sstable_file_path(table_id);
-	let mut file = SysFile::create(&table_file_path)?;
+		// Generate incremental keys spanning the range
+		let mut keys = Vec::new();
 
-	let mut writer = TableWriter::new(&mut file, table_id, Arc::clone(&opts), 0); // L0 for test
+		// For single-character ranges, generate all keys from start to end
+		if key_start.len() == 1 && key_end.len() == 1 {
+			let start_byte = key_start.as_bytes()[0];
+			let end_byte = key_end.as_bytes()[0];
 
-	// Generate incremental keys spanning the range
-	let mut keys = Vec::new();
-
-	// For single-character ranges, generate all keys from start to end
-	if key_start.len() == 1 && key_end.len() == 1 {
-		let start_byte = key_start.as_bytes()[0];
-		let end_byte = key_end.as_bytes()[0];
-
-		for byte_val in start_byte..=end_byte {
-			keys.push(String::from_utf8(vec![byte_val]).unwrap());
+			for byte_val in start_byte..=end_byte {
+				keys.push(String::from_utf8(vec![byte_val]).unwrap());
+			}
+		} else {
+			// For multi-character ranges, create keys with numeric suffixes
+			keys.push(key_start.to_string());
+			keys.push(format!("{key_start}_mid"));
+			keys.push(key_end.to_string());
 		}
-	} else {
-		// For multi-character ranges, create keys with numeric suffixes
-		keys.push(key_start.to_string());
-		keys.push(format!("{key_start}_mid"));
-		keys.push(key_end.to_string());
+
+		for (i, key) in keys.iter().enumerate() {
+			let seq_num = seq_start + i as u64;
+			let value = format!("value_{seq_num}");
+
+			let internal_key =
+				InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
+
+			writer.add(internal_key, value.as_bytes())?;
+		}
+
+		writer.finish()?;
 	}
 
-	for (i, key) in keys.iter().enumerate() {
-		let seq_num = seq_start + i as u64;
-		let value = format!("value_{seq_num}");
-
-		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
-
-		writer.add(internal_key, value.as_bytes())?;
-	}
-
-	let size = writer.finish()?;
-
-	let file = SysFile::open(&table_file_path)?;
-	file.sync_all()?;
-	let file: Arc<dyn File> = Arc::new(file);
-
-	let table = Table::new(table_id, opts, file, size as u64)?;
+	let table = new_test_table(id, opts, buf).await?;
 	Ok(Arc::new(table))
 }
 
@@ -938,20 +946,20 @@ fn create_iter_state_with_tables(
 }
 
 // Helper to count the number of items returned by iterator
-fn count_kmerge_items(mut iter: KMergeIterator) -> usize {
-	iter.seek_first().unwrap();
+async fn count_kmerge_items(mut iter: KMergeIterator<'_>) -> usize {
+	iter.seek_first().await.unwrap();
 	let mut count = 0;
 	while iter.valid() {
 		count += 1;
-		if !iter.next().unwrap() {
+		if !iter.next().await.unwrap() {
 			break;
 		}
 	}
 	count
 }
 
-#[test]
-fn test_level0_tables_before_range_skipped() {
+#[test(tokio::test)]
+async fn test_level0_tables_before_range_skipped() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -960,9 +968,9 @@ fn test_level0_tables_before_range_skipped() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables with ranges: [a-c], [d-f], [g-i]
-	let table1 = create_test_table_with_range(1, "a", "c", 1, Arc::clone(&opts)).unwrap();
-	let table2 = create_test_table_with_range(2, "d", "f", 4, Arc::clone(&opts)).unwrap();
-	let table3 = create_test_table_with_range(3, "g", "i", 7, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "c", 1, Arc::clone(&opts)).await.unwrap();
+	let table2 = create_test_table_with_range(2, "d", "f", 4, Arc::clone(&opts)).await.unwrap();
+	let table3 = create_test_table_with_range(3, "g", "i", 7, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
@@ -974,12 +982,12 @@ fn test_level0_tables_before_range_skipped() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert_eq!(count, 0, "No tables should be included as all are before range");
 }
 
-#[test]
-fn test_level0_tables_after_range_skipped() {
+#[test(tokio::test)]
+async fn test_level0_tables_after_range_skipped() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -988,9 +996,9 @@ fn test_level0_tables_after_range_skipped() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables with ranges: [m-o], [p-r], [s-u]
-	let table1 = create_test_table_with_range(1, "m", "o", 1, Arc::clone(&opts)).unwrap();
-	let table2 = create_test_table_with_range(2, "p", "r", 4, Arc::clone(&opts)).unwrap();
-	let table3 = create_test_table_with_range(3, "s", "u", 7, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "m", "o", 1, Arc::clone(&opts)).await.unwrap();
+	let table2 = create_test_table_with_range(2, "p", "r", 4, Arc::clone(&opts)).await.unwrap();
+	let table3 = create_test_table_with_range(3, "s", "u", 7, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
@@ -1002,12 +1010,12 @@ fn test_level0_tables_after_range_skipped() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert_eq!(count, 0, "No tables should be included as all are after range");
 }
 
-#[test]
-fn test_level0_overlapping_tables_included() {
+#[test(tokio::test)]
+async fn test_level0_overlapping_tables_included() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1016,9 +1024,9 @@ fn test_level0_overlapping_tables_included() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables with overlapping ranges
-	let table1 = create_test_table_with_range(1, "a", "e", 1, Arc::clone(&opts)).unwrap();
-	let table2 = create_test_table_with_range(2, "c", "g", 4, Arc::clone(&opts)).unwrap();
-	let table3 = create_test_table_with_range(3, "f", "j", 7, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "e", 1, Arc::clone(&opts)).await.unwrap();
+	let table2 = create_test_table_with_range(2, "c", "g", 4, Arc::clone(&opts)).await.unwrap();
+	let table3 = create_test_table_with_range(3, "f", "j", 7, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![table1, table2, table3], vec![], vec![], opts);
@@ -1030,13 +1038,13 @@ fn test_level0_overlapping_tables_included() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	// All 3 tables should contribute items
 	assert!(count > 0, "Should have items from overlapping L0 tables");
 }
 
-#[test]
-fn test_level0_mixed_overlap_scenarios() {
+#[test(tokio::test)]
+async fn test_level0_mixed_overlap_scenarios() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1045,11 +1053,11 @@ fn test_level0_mixed_overlap_scenarios() {
 	let opts = Arc::new(opts);
 
 	// Create L0 tables: [a-c], [e-g], [i-k], [d-f], [j-m]
-	let table1 = create_test_table_with_range(1, "a", "c", 1, Arc::clone(&opts)).unwrap();
-	let table2 = create_test_table_with_range(2, "e", "g", 4, Arc::clone(&opts)).unwrap();
-	let table3 = create_test_table_with_range(3, "i", "k", 7, Arc::clone(&opts)).unwrap();
-	let table4 = create_test_table_with_range(4, "d", "f", 10, Arc::clone(&opts)).unwrap();
-	let table5 = create_test_table_with_range(5, "j", "m", 13, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "c", 1, Arc::clone(&opts)).await.unwrap();
+	let table2 = create_test_table_with_range(2, "e", "g", 4, Arc::clone(&opts)).await.unwrap();
+	let table3 = create_test_table_with_range(3, "i", "k", 7, Arc::clone(&opts)).await.unwrap();
+	let table4 = create_test_table_with_range(4, "d", "f", 10, Arc::clone(&opts)).await.unwrap();
+	let table5 = create_test_table_with_range(5, "j", "m", 13, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state = create_iter_state_with_tables(
 		vec![table1, table2, table3, table4, table5],
@@ -1065,13 +1073,13 @@ fn test_level0_mixed_overlap_scenarios() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	// Should have items from multiple overlapping tables
 	assert!(count > 0, "Should have items from overlapping tables in range");
 }
 
-#[test]
-fn test_level1_binary_search_correct_range() {
+#[test(tokio::test)]
+async fn test_level1_binary_search_correct_range() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1080,11 +1088,11 @@ fn test_level1_binary_search_correct_range() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables with non-overlapping sorted ranges
-	let table1 = create_test_table_with_range(11, "a", "b", 1, Arc::clone(&opts)).unwrap();
-	let table2 = create_test_table_with_range(12, "c", "d", 4, Arc::clone(&opts)).unwrap();
-	let table3 = create_test_table_with_range(13, "e", "f", 7, Arc::clone(&opts)).unwrap();
-	let table4 = create_test_table_with_range(14, "g", "h", 10, Arc::clone(&opts)).unwrap();
-	let table5 = create_test_table_with_range(15, "i", "j", 13, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(11, "a", "b", 1, Arc::clone(&opts)).await.unwrap();
+	let table2 = create_test_table_with_range(12, "c", "d", 4, Arc::clone(&opts)).await.unwrap();
+	let table3 = create_test_table_with_range(13, "e", "f", 7, Arc::clone(&opts)).await.unwrap();
+	let table4 = create_test_table_with_range(14, "g", "h", 10, Arc::clone(&opts)).await.unwrap();
+	let table5 = create_test_table_with_range(15, "i", "j", 13, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state = create_iter_state_with_tables(
 		vec![],
@@ -1100,12 +1108,12 @@ fn test_level1_binary_search_correct_range() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert!(count > 0, "Should have items from L1 tables in range");
 }
 
-#[test]
-fn test_level1_query_before_all_tables() {
+#[test(tokio::test)]
+async fn test_level1_query_before_all_tables() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1114,9 +1122,9 @@ fn test_level1_query_before_all_tables() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables: [d-f], [g-i], [j-l]
-	let table1 = create_test_table_with_range(11, "d", "f", 1, Arc::clone(&opts)).unwrap();
-	let table2 = create_test_table_with_range(12, "g", "i", 4, Arc::clone(&opts)).unwrap();
-	let table3 = create_test_table_with_range(13, "j", "l", 7, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(11, "d", "f", 1, Arc::clone(&opts)).await.unwrap();
+	let table2 = create_test_table_with_range(12, "g", "i", 4, Arc::clone(&opts)).await.unwrap();
+	let table3 = create_test_table_with_range(13, "j", "l", 7, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
@@ -1128,12 +1136,12 @@ fn test_level1_query_before_all_tables() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert_eq!(count, 0, "No tables should be included as query is before all L1 tables");
 }
 
-#[test]
-fn test_level1_query_after_all_tables() {
+#[test(tokio::test)]
+async fn test_level1_query_after_all_tables() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1142,9 +1150,9 @@ fn test_level1_query_after_all_tables() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables: [a-c], [d-f], [g-i]
-	let table1 = create_test_table_with_range(11, "a", "c", 1, Arc::clone(&opts)).unwrap();
-	let table2 = create_test_table_with_range(12, "d", "f", 4, Arc::clone(&opts)).unwrap();
-	let table3 = create_test_table_with_range(13, "g", "i", 7, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(11, "a", "c", 1, Arc::clone(&opts)).await.unwrap();
+	let table2 = create_test_table_with_range(12, "d", "f", 4, Arc::clone(&opts)).await.unwrap();
+	let table3 = create_test_table_with_range(13, "g", "i", 7, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
@@ -1156,12 +1164,12 @@ fn test_level1_query_after_all_tables() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert_eq!(count, 0, "No tables should be included as query is after all L1 tables");
 }
 
-#[test]
-fn test_level1_query_spans_all_tables() {
+#[test(tokio::test)]
+async fn test_level1_query_spans_all_tables() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1170,9 +1178,9 @@ fn test_level1_query_spans_all_tables() {
 	let opts = Arc::new(opts);
 
 	// Create L1 tables: [b-d], [e-g], [h-j]
-	let table1 = create_test_table_with_range(11, "b", "d", 1, Arc::clone(&opts)).unwrap();
-	let table2 = create_test_table_with_range(12, "e", "g", 4, Arc::clone(&opts)).unwrap();
-	let table3 = create_test_table_with_range(13, "h", "j", 7, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(11, "b", "d", 1, Arc::clone(&opts)).await.unwrap();
+	let table2 = create_test_table_with_range(12, "e", "g", 4, Arc::clone(&opts)).await.unwrap();
+	let table3 = create_test_table_with_range(13, "h", "j", 7, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![], vec![table1, table2, table3], vec![], opts);
@@ -1184,12 +1192,12 @@ fn test_level1_query_spans_all_tables() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert!(count > 0, "Should have items from all L1 tables");
 }
 
-#[test]
-fn test_bound_included_start_and_end() {
+#[test(tokio::test)]
+async fn test_bound_included_start_and_end() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1198,7 +1206,7 @@ fn test_bound_included_start_and_end() {
 	let opts = Arc::new(opts);
 
 	// Create table with keys: "d1", "d5", "h"
-	let table1 = create_test_table_with_range(1, "d", "h", 1, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "d", "h", 1, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1209,12 +1217,12 @@ fn test_bound_included_start_and_end() {
 	);
 	let mut iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let items = collect_all(&mut iter).unwrap();
+	let items = collect_all(&mut iter).await.unwrap();
 	assert!(!items.is_empty(), "Should have items in inclusive range");
 }
 
-#[test]
-fn test_bound_excluded_start_and_end() {
+#[test(tokio::test)]
+async fn test_bound_excluded_start_and_end() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1223,7 +1231,7 @@ fn test_bound_excluded_start_and_end() {
 	let opts = Arc::new(opts);
 
 	// Create table with keys: "d1", "d5", "h"
-	let table1 = create_test_table_with_range(1, "d", "h", 1, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "d", "h", 1, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1235,14 +1243,14 @@ fn test_bound_excluded_start_and_end() {
 	);
 	let mut iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let items = collect_all(&mut iter).unwrap();
+	let items = collect_all(&mut iter).await.unwrap();
 	// Keys "d1" and "d5" should be included (they're > "d" and < "h")
 	// But exact "d" and exact "h" should not be (though "h" is at the boundary)
 	assert!(items.len() >= 2, "Should have at least d1 and d5");
 }
 
-#[test]
-fn test_bound_unbounded_start() {
+#[test(tokio::test)]
+async fn test_bound_unbounded_start() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1250,7 +1258,7 @@ fn test_bound_unbounded_start() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1259,12 +1267,12 @@ fn test_bound_unbounded_start() {
 		crate::user_range_to_internal_range(Bound::Unbounded, Bound::Included(b"h".as_slice()));
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert!(count > 0, "Should iterate from beginning with unbounded start");
 }
 
-#[test]
-fn test_bound_unbounded_end() {
+#[test(tokio::test)]
+async fn test_bound_unbounded_end() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1272,7 +1280,7 @@ fn test_bound_unbounded_end() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1281,12 +1289,12 @@ fn test_bound_unbounded_end() {
 		crate::user_range_to_internal_range(Bound::Included(b"d".as_slice()), Bound::Unbounded);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert!(count > 0, "Should iterate to end with unbounded end");
 }
 
-#[test]
-fn test_fully_unbounded_range() {
+#[test(tokio::test)]
+async fn test_fully_unbounded_range() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1294,20 +1302,20 @@ fn test_fully_unbounded_range() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
-	let table2 = create_test_table_with_range(2, "n", "z", 4, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).await.unwrap();
+	let table2 = create_test_table_with_range(2, "n", "z", 4, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1, table2], vec![], vec![], opts);
 
 	// Query with fully unbounded range
 	let iter = KMergeIterator::new_from(iter_state, (Bound::Unbounded, Bound::Unbounded));
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert!(count > 0, "Should return all keys with fully unbounded range");
 }
 
-#[test]
-fn test_empty_levels() {
+#[test(tokio::test)]
+async fn test_empty_levels() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1324,12 +1332,12 @@ fn test_empty_levels() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert_eq!(count, 0, "Iterator with no tables should return no items");
 }
 
-#[test]
-fn test_single_key_range() {
+#[test(tokio::test)]
+async fn test_single_key_range() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1337,7 +1345,7 @@ fn test_single_key_range() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "z", 1, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1348,15 +1356,15 @@ fn test_single_key_range() {
 	);
 	let mut iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let items = collect_all(&mut iter).unwrap();
+	let items = collect_all(&mut iter).await.unwrap();
 	// Should return at most 1 item
 	for (key, _) in &items {
 		assert_eq!(key.user_key.as_slice(), b"a1");
 	}
 }
 
-#[test]
-fn test_inverted_range() {
+#[test(tokio::test)]
+async fn test_inverted_range() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1364,7 +1372,7 @@ fn test_inverted_range() {
 	};
 	let opts = Arc::new(opts);
 
-	let table1 = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
+	let table1 = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state = create_iter_state_with_tables(vec![table1], vec![], vec![], opts);
 
@@ -1375,12 +1383,12 @@ fn test_inverted_range() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert_eq!(count, 0, "Inverted range should return no items");
 }
 
-#[test]
-fn test_mixed_level0_and_level1_tables() {
+#[test(tokio::test)]
+async fn test_mixed_level0_and_level1_tables() {
 	let temp_dir = create_temp_directory();
 	let opts = Options {
 		path: temp_dir.path().to_path_buf(),
@@ -1389,9 +1397,9 @@ fn test_mixed_level0_and_level1_tables() {
 	let opts = Arc::new(opts);
 
 	// Create both L0 and L1 tables
-	let l0_table = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).unwrap();
-	let l1_table1 = create_test_table_with_range(11, "d", "h", 4, Arc::clone(&opts)).unwrap();
-	let l1_table2 = create_test_table_with_range(12, "i", "n", 7, Arc::clone(&opts)).unwrap();
+	let l0_table = create_test_table_with_range(1, "a", "m", 1, Arc::clone(&opts)).await.unwrap();
+	let l1_table1 = create_test_table_with_range(11, "d", "h", 4, Arc::clone(&opts)).await.unwrap();
+	let l1_table2 = create_test_table_with_range(12, "i", "n", 7, Arc::clone(&opts)).await.unwrap();
 
 	let iter_state =
 		create_iter_state_with_tables(vec![l0_table], vec![l1_table1, l1_table2], vec![], opts);
@@ -1403,7 +1411,7 @@ fn test_mixed_level0_and_level1_tables() {
 	);
 	let iter = KMergeIterator::new_from(iter_state, internal_range);
 
-	let count = count_kmerge_items(iter);
+	let count = count_kmerge_items(iter).await;
 	assert!(count > 0, "Should have items from both L0 and L1 tables");
 }
 
@@ -1417,6 +1425,7 @@ async fn test_cache_effectiveness_with_range_query() {
 		.with_block_cache_capacity(10 * 1024 * 1024) // 10MB cache
 		.with_max_memtable_size(1024 * 64) // Small memtable to trigger flushes
 		.build()
+		.await
 		.unwrap();
 
 	eprintln!("\n=== Inserting 10,000 keys with periodic flushes ===");
@@ -1430,13 +1439,13 @@ async fn test_cache_effectiveness_with_range_query() {
 
 		// Flush every 1,000 keys to create multiple SSTables
 		if (i + 1) % 1_000 == 0 {
-			store.flush().unwrap();
+			store.flush().await.unwrap();
 			eprintln!("Flushed after {} keys", i + 1);
 		}
 	}
 
 	// Final flush to ensure all data is on disk
-	store.flush().unwrap();
+	store.flush().await.unwrap();
 	eprintln!("Final flush completed\n");
 
 	// Reset cache statistics before first query
@@ -1448,6 +1457,7 @@ async fn test_cache_effectiveness_with_range_query() {
 	let first_results = collect_transaction_all(
 		&mut snapshot.range(Some(b"key_00000000"), Some(b"key_00010000")).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	let first_stats = store.core.inner.opts.block_cache.get_stats();
@@ -1474,6 +1484,7 @@ async fn test_cache_effectiveness_with_range_query() {
 	let second_results = collect_transaction_all(
 		&mut snapshot.range(Some(b"key_00000000"), Some(b"key_00010000")).unwrap(),
 	)
+	.await
 	.unwrap();
 
 	let second_stats = store.core.inner.opts.block_cache.get_stats();
@@ -1512,7 +1523,7 @@ async fn test_cache_effectiveness_with_range_query() {
 
 #[test(tokio::test)]
 async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert key1
 	store.set(b"key1", b"value1_v1").await.unwrap();
@@ -1542,7 +1553,7 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	{
 		let mut range_iter =
 			snapshot1.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 1, "Snapshot1 should only see 1 key");
 		assert_eq!(&range[0].0.user_key, b"key1");
@@ -1553,7 +1564,7 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	{
 		let mut range_iter =
 			snapshot2.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 2, "Snapshot2 should see 2 keys");
 		assert_eq!(&range[0].0.user_key, b"key1");
@@ -1564,7 +1575,7 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	{
 		let mut range_iter =
 			snapshot3.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 3, "Snapshot3 should see 3 keys");
 		assert_eq!(&range[0].0.user_key, b"key1");
@@ -1576,7 +1587,7 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	{
 		let mut range_iter =
 			snapshot4.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 4, "Snapshot4 should see 4 keys");
 		assert_eq!(&range[0].0.user_key, b"key1");
@@ -1589,7 +1600,7 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	{
 		let mut range_iter =
 			snapshot2.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_reverse(&mut range_iter).unwrap();
+		let range = collect_snapshot_reverse(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 2, "Backward iteration should also see 2 keys");
 		assert_eq!(&range[0].0.user_key, b"key2");
@@ -1599,7 +1610,7 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 
 #[test(tokio::test)]
 async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert initial value for key1
 	store.set(b"key1", b"value_v1").await.unwrap();
@@ -1623,7 +1634,7 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 	{
 		let mut range_iter =
 			snapshot1.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 1);
 		assert_eq!(range[0].1.as_slice(), b"value_v1");
@@ -1632,7 +1643,7 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 	{
 		let mut range_iter =
 			snapshot2.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 1);
 		assert_eq!(range[0].1.as_slice(), b"value_v2");
@@ -1641,7 +1652,7 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 	{
 		let mut range_iter =
 			snapshot3.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 1);
 		assert_eq!(range[0].1.as_slice(), b"value_v3");
@@ -1650,7 +1661,7 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 
 #[test(tokio::test)]
 async fn test_snapshot_iterator_seq_num_with_deletions() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert keys 1, 2, 3
 	{
@@ -1674,7 +1685,7 @@ async fn test_snapshot_iterator_seq_num_with_deletions() {
 	{
 		let mut range_iter =
 			snapshot_before.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 3, "Before deletion: should see all 3 keys");
 		assert_eq!(&range[0].0.user_key, b"key1");
@@ -1686,7 +1697,7 @@ async fn test_snapshot_iterator_seq_num_with_deletions() {
 	{
 		let mut range_iter =
 			snapshot_after.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 2, "After deletion: should see only 2 keys");
 		assert_eq!(&range[0].0.user_key, b"key1");
@@ -1698,7 +1709,7 @@ async fn test_snapshot_iterator_seq_num_with_deletions() {
 	{
 		let mut range_iter =
 			snapshot_after.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_reverse(&mut range_iter).unwrap();
+		let range = collect_snapshot_reverse(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 2, "Backward: should see only 2 keys");
 		assert_eq!(&range[0].0.user_key, b"key3");
@@ -1708,7 +1719,7 @@ async fn test_snapshot_iterator_seq_num_with_deletions() {
 
 #[test(tokio::test)]
 async fn test_snapshot_iterator_seq_num_complex_scenario() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Timeline:
 	// 1. Insert key1, key2, key3
@@ -1745,7 +1756,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 	// Verify snap1: Should see key1(v1), key2(v2), key3(v3)
 	{
 		let mut range_iter = snap1.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 3);
 		assert_eq!(&range[0].0.user_key, b"key1");
@@ -1758,7 +1769,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 	// Verify snap2: Should see key1(v1), key2(v2_updated), key3(v3), key4(v4)
 	{
 		let mut range_iter = snap2.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 4);
 		assert_eq!(&range[0].0.user_key, b"key1");
@@ -1772,7 +1783,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 	// key1 should be deleted
 	{
 		let mut range_iter = snap3.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_iter(&mut range_iter).unwrap();
+		let range = collect_snapshot_iter(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 4);
 		// key1 should NOT be present (deleted)
@@ -1786,7 +1797,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 	// Verify backward iteration on snap2
 	{
 		let mut range_iter = snap2.range(Some("key0".as_bytes()), Some("key9".as_bytes())).unwrap();
-		let range = collect_snapshot_reverse(&mut range_iter).unwrap();
+		let range = collect_snapshot_reverse(&mut range_iter).await.unwrap();
 
 		assert_eq!(range.len(), 4);
 		assert_eq!(&range[0].0.user_key, b"key4");
@@ -1801,7 +1812,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 /// This ensures the iterator maintains correct state through repeated direction changes.
 #[test(tokio::test)]
 async fn test_snapshot_iterator_multiple_direction_switches() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert keys
 	{
@@ -1816,17 +1827,17 @@ async fn test_snapshot_iterator_multiple_direction_switches() {
 	let mut iter = snapshot.range(Some(b"key1".as_slice()), Some(b"key8".as_slice())).unwrap();
 
 	// Start forward
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"key1");
 
 	// Forward to key3
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"key2");
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"key3");
 
 	// Switch backward (key3 -> key2)
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert_eq!(
 		iter.key().user_key(),
 		b"key2",
@@ -1835,7 +1846,7 @@ async fn test_snapshot_iterator_multiple_direction_switches() {
 	);
 
 	// Switch forward again (key2 -> key3)
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert_eq!(
 		iter.key().user_key(),
 		b"key3",
@@ -1844,11 +1855,11 @@ async fn test_snapshot_iterator_multiple_direction_switches() {
 	);
 
 	// Continue forward
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"key4");
 
 	// Switch backward again (key4 -> key3)
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert_eq!(
 		iter.key().user_key(),
 		b"key3",
@@ -1857,9 +1868,9 @@ async fn test_snapshot_iterator_multiple_direction_switches() {
 	);
 
 	// Continue backward
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"key2");
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"key1");
 }
 
@@ -1867,7 +1878,7 @@ async fn test_snapshot_iterator_multiple_direction_switches() {
 /// This ensures direction switching works correctly near the start/end of iteration ranges.
 #[test(tokio::test)]
 async fn test_snapshot_iterator_direction_switch_at_bounds() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert keys
 	{
@@ -1883,11 +1894,11 @@ async fn test_snapshot_iterator_direction_switch_at_bounds() {
 	let mut iter = snapshot.range(Some(b"aaa".as_slice()), Some(b"eee".as_slice())).unwrap();
 
 	// Test at lower bound: seek first, try prev (should fail/invalid), then next
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"aaa");
 
 	// Try to go backward at lower bound
-	let has_prev = iter.prev().unwrap();
+	let has_prev = iter.prev().await.unwrap();
 	// Either returns false or becomes invalid - both are acceptable
 	if has_prev && iter.valid() {
 		panic!(
@@ -1897,11 +1908,11 @@ async fn test_snapshot_iterator_direction_switch_at_bounds() {
 	}
 
 	// Re-seek and test at upper bound
-	iter.seek_last().unwrap();
+	iter.seek_last().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"ddd");
 
 	// Try to go forward at upper bound
-	let has_next = iter.next().unwrap();
+	let has_next = iter.next().await.unwrap();
 	// Either returns false or becomes invalid - both are acceptable
 	if has_next && iter.valid() {
 		panic!(
@@ -1914,7 +1925,7 @@ async fn test_snapshot_iterator_direction_switch_at_bounds() {
 /// Test direction switching in the middle of the range with a fresh direction switch.
 #[test(tokio::test)]
 async fn test_snapshot_iterator_direction_switch_mid_range() {
-	let (store, _temp_dir) = create_store();
+	let (store, _temp_dir) = create_store().await;
 
 	// Insert 10 keys
 	{
@@ -1931,14 +1942,14 @@ async fn test_snapshot_iterator_direction_switch_mid_range() {
 	let mut iter = snapshot.range(Some(b"k00".as_slice()), Some(b"k99".as_slice())).unwrap();
 
 	// Go to middle (k05) via forward iteration
-	iter.seek_first().unwrap();
+	iter.seek_first().await.unwrap();
 	for _ in 0..5 {
-		iter.next().unwrap();
+		iter.next().await.unwrap();
 	}
 	assert_eq!(iter.key().user_key(), b"k05");
 
 	// Switch to backward
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert_eq!(
 		iter.key().user_key(),
 		b"k04",
@@ -1947,13 +1958,13 @@ async fn test_snapshot_iterator_direction_switch_mid_range() {
 	);
 
 	// Go backward two more times
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"k03");
-	iter.prev().unwrap();
+	iter.prev().await.unwrap();
 	assert_eq!(iter.key().user_key(), b"k02");
 
 	// Switch to forward again
-	iter.next().unwrap();
+	iter.next().await.unwrap();
 	assert_eq!(
 		iter.key().user_key(),
 		b"k03",
