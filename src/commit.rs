@@ -24,6 +24,10 @@ pub trait CommitEnv: Send + Sync + 'static {
 
 	// Check for background errors before committing
 	fn check_background_error(&self) -> Result<()>;
+
+	// Validates that no key in our write set was modified after we started.
+	// Only checks memtables - returns TransactionRetry if history insufficient.
+	fn validate_write_conflicts(&self, batch: &Batch) -> Result<()>;
 }
 
 // Lock-free commit queue entry
@@ -237,13 +241,29 @@ impl CommitPipeline {
 
 		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
 
-		// Phase 1: Assign sequence number and write to WAL (serialized)
-		let processed_batch = self.prepare(&mut batch, Arc::clone(&commit_batch), sync)?;
-
-		// Phase 2: Apply to memtable (concurrent)
+		// Atomically applying a batch of write operations to WAL and Memtable.
 		let apply_result = {
-			let env = Arc::clone(&self.env);
-			env.apply(&processed_batch)
+			let _guard = self.write_mutex.lock();
+
+			// Validate write-write conflict.
+			self.env.validate_write_conflicts(&batch)?;
+
+			let count = batch.count() as u64;
+			let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
+
+			// Set sequence numbers in commit batch
+			commit_batch.set_seq_num(seq_num);
+			// Update starting sequence number in batch
+			batch.set_starting_seq_num(seq_num);
+
+			// Enqueue operation (single producer)
+			self.pending.enqueue(Arc::clone(&commit_batch));
+
+			// Write to WAL and process VLog (serialized under lock)
+			let processed_batch = self.env.write(&mut batch, seq_num, sync)?;
+
+			// Apply batch to memtable
+			self.env.apply(&processed_batch)
 		};
 
 		// =========================================================================
@@ -295,31 +315,6 @@ impl CommitPipeline {
 
 		// Wait for completion
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
-	}
-
-	fn prepare(
-		&self,
-		batch: &mut Batch,
-		commit_batch: Arc<CommitBatch>,
-		sync: bool,
-	) -> Result<Batch> {
-		// Assign sequence number atomically and write to WAL (serialized)
-		let _guard = self.write_mutex.lock();
-
-		let count = batch.count() as u64;
-		let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
-
-		// Set sequence numbers in batch and commit batch
-		commit_batch.set_seq_num(seq_num);
-		batch.set_starting_seq_num(seq_num);
-
-		// Enqueue operation (single producer)
-		self.pending.enqueue(commit_batch);
-
-		// Write to WAL and process VLog (serialized under lock)
-		let processed_batch = self.env.write(batch, seq_num, sync)?;
-
-		Ok(processed_batch)
 	}
 
 	fn publish(&self) {
@@ -434,6 +429,10 @@ mod tests {
 		}
 
 		fn check_background_error(&self) -> Result<()> {
+			Ok(())
+		}
+
+		fn validate_write_conflicts(&self, _batch: &Batch) -> Result<()> {
 			Ok(())
 		}
 	}
@@ -558,6 +557,10 @@ mod tests {
 		fn check_background_error(&self) -> Result<()> {
 			Ok(())
 		}
+
+		fn validate_write_conflicts(&self, _batch: &Batch) -> Result<()> {
+			Ok(())
+		}
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -637,6 +640,10 @@ mod tests {
 		fn check_background_error(&self) -> Result<()> {
 			Ok(())
 		}
+
+		fn validate_write_conflicts(&self, _batch: &Batch) -> Result<()> {
+			Ok(())
+		}
 	}
 
 	/// Minimal reproduction: all applies fail.
@@ -712,6 +719,10 @@ mod tests {
 		}
 
 		fn check_background_error(&self) -> Result<()> {
+			Ok(())
+		}
+
+		fn validate_write_conflicts(&self, _batch: &Batch) -> Result<()> {
 			Ok(())
 		}
 	}
