@@ -2017,3 +2017,49 @@ async fn test_snapshot_iterator_direction_switch_mid_range() {
 		String::from_utf8_lossy(iter.key().user_key())
 	);
 }
+
+/// Regression test: backward iteration over many consecutive tombstoned keys
+/// must not stack-overflow.
+///
+/// `SnapshotIterator::skip_to_valid_backward` and `find_latest_visible_backward`
+/// were mutually recursive: every user-key whose latest visible version is a
+/// tombstone (or has no visible version) added ~2 stack frames instead of
+/// looping. With enough consecutive such keys, the recursion overflowed the
+/// thread stack.
+#[test(tokio::test)]
+async fn test_backward_iter_does_not_stack_overflow_on_tombstones() {
+	let (store, _temp_dir) = create_store();
+
+	// 2000 keys is well above any plausible Rust test-thread stack budget for
+	// the recursive implementation; the fixed loop-based version handles it
+	// trivially.
+	const N: usize = 2000;
+
+	// 1. Insert N keys.
+	{
+		let mut tx = store.begin().unwrap();
+		for i in 0..N {
+			let key = format!("k{:08}", i);
+			tx.set(key.as_bytes(), b"v").unwrap();
+		}
+		tx.commit().await.unwrap();
+	}
+
+	// 2. Delete them all -> latest visible version of each is a tombstone.
+	{
+		let mut tx = store.begin().unwrap();
+		for i in 0..N {
+			let key = format!("k{:08}", i);
+			tx.delete(key.as_bytes()).unwrap();
+		}
+		tx.commit().await.unwrap();
+	}
+
+	// 3. Backward range scan over the whole tombstoned span. Pre-fix this
+	// stack-overflows; post-fix it must return cleanly with zero entries.
+	let tx = store.begin().unwrap();
+	let snap = tx.snapshot.as_ref().unwrap();
+	let mut iter = snap.range(None, None).unwrap();
+	let items = collect_snapshot_reverse(&mut iter).unwrap();
+	assert_eq!(items.len(), 0, "all keys are tombstoned; expected empty");
+}
