@@ -975,94 +975,103 @@ impl SnapshotIterator<'_> {
 	}
 
 	/// Skip to the next valid entry in backward direction.
-	/// More complex because we see oldest version first, need to find latest visible.
+	/// Thin wrapper kept for symmetry with `skip_to_valid_forward`; all real
+	/// work happens in `find_latest_visible_backward`, which loops internally.
 	fn skip_to_valid_backward(&mut self) -> Result<bool> {
-		// First check if we have a buffered entry from previous iteration
-		if self.has_buffered_back {
-			self.has_buffered_back = false;
-			// The buffered entry is already the start of a new user key
-			// We need to find the latest visible version of this key
-			return self.find_latest_visible_backward();
-		}
-
-		if self.merge_iter.valid() {
-			return self.find_latest_visible_backward();
-		}
-		self.has_current_back = false;
-		Ok(false)
+		self.find_latest_visible_backward()
 	}
 
-	/// Find the latest visible version of the current user key going backward.
-	/// Backward iteration sees oldest version first (lowest seq_num).
+	/// Find the latest visible version of the next user key going backward.
+	///
+	/// Backward iteration sees the oldest version of each user key first
+	/// (lowest seq_num) and must walk back to the newest, picking the latest
+	/// version that is visible to this snapshot. If that latest version turns
+	/// out to be a tombstone (or no visible version exists at all), we must
+	/// skip the user key entirely and examine the next one back.
+	///
+	/// This was previously implemented via mutual tail-recursion between
+	/// `find_latest_visible_backward` and `skip_to_valid_backward`. Each
+	/// fully-tombstoned (or fully-invisible) user key consumed two stack
+	/// frames, so a backward range scan over a long run of such keys --- a
+	/// pattern that occurs naturally after deletes against an MVCC store ---
+	/// would overflow the thread stack. The loop below is semantically
+	/// identical but uses O(1) stack regardless of how many user keys we skip.
 	fn find_latest_visible_backward(&mut self) -> Result<bool> {
-		if !self.merge_iter.valid() {
-			self.has_current_back = false;
-			return Ok(false);
-		}
-
-		let first_key_ref = self.merge_iter.key();
-
-		// Store the current user key we're examining
-		let current_user_key: Vec<u8> = first_key_ref.user_key().to_vec();
-
-		// Track the latest visible version
-		let mut latest_key: Option<Vec<u8>> = None;
-		let mut latest_value: Option<Vec<u8>> = None;
-
-		// If first entry is visible, it's a candidate
-		if self.is_visible_ref(&first_key_ref) {
-			latest_key = Some(first_key_ref.encoded().to_vec());
-			latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
-		}
-
-		// Keep consuming entries with same user key, looking for newer visible versions
 		loop {
-			self.merge_iter.prev()?;
-
-			if !self.merge_iter.valid() {
-				break;
+			// Position merge_iter at the start of the next user key to examine.
+			//
+			// `has_buffered_back` is set when a prior iteration crossed into a
+			// new user key while walking versions of the previous one; the
+			// boundary key is already loaded into merge_iter, so we just clear
+			// the flag and fall through.
+			if self.has_buffered_back {
+				self.has_buffered_back = false;
+			} else if !self.merge_iter.valid() {
+				self.has_current_back = false;
+				return Ok(false);
 			}
 
-			let key_ref = self.merge_iter.key();
-			let user_key = key_ref.user_key();
+			let first_key_ref = self.merge_iter.key();
+			let current_user_key: Vec<u8> = first_key_ref.user_key().to_vec();
 
-			if user_key != current_user_key.as_slice() {
-				// Different user key - buffer it for next call
-				self.buffered_back_key.clear();
-				self.buffered_back_key.extend_from_slice(key_ref.encoded());
-				self.buffered_back_value.clear();
-				self.buffered_back_value.extend_from_slice(self.merge_iter.value_encoded()?);
-				self.has_buffered_back = true;
-				break;
-			}
+			let mut latest_key: Option<Vec<u8>> = None;
+			let mut latest_value: Option<Vec<u8>> = None;
 
-			// Same user key - check if this is a newer visible version
-			if self.is_visible_ref(&key_ref) {
-				latest_key = Some(key_ref.encoded().to_vec());
+			if self.is_visible_ref(&first_key_ref) {
+				latest_key = Some(first_key_ref.encoded().to_vec());
 				latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
 			}
-		}
 
-		// Check if we found a valid (non-tombstone) entry
-		if let (Some(key_bytes), Some(value_bytes)) = (latest_key, latest_value) {
-			let key_ref = InternalKeyRef::from_encoded(&key_bytes);
-			if key_ref.is_tombstone() {
-				// Latest visible is tombstone - skip this key, try next
-				self.has_current_back = false;
-				return self.skip_to_valid_backward();
+			// Walk older versions of this same user key, picking up the latest
+			// visible one. Stops when merge_iter goes invalid or crosses into
+			// a different user key (which becomes the buffered start for the
+			// next outer iteration).
+			loop {
+				self.merge_iter.prev()?;
+
+				if !self.merge_iter.valid() {
+					break;
+				}
+
+				let key_ref = self.merge_iter.key();
+				let user_key = key_ref.user_key();
+
+				if user_key != current_user_key.as_slice() {
+					self.buffered_back_key.clear();
+					self.buffered_back_key.extend_from_slice(key_ref.encoded());
+					self.buffered_back_value.clear();
+					self.buffered_back_value.extend_from_slice(self.merge_iter.value_encoded()?);
+					self.has_buffered_back = true;
+					break;
+				}
+
+				if self.is_visible_ref(&key_ref) {
+					latest_key = Some(key_ref.encoded().to_vec());
+					latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
+				}
 			}
-			// Store the found entry in current_back buffers so valid()/key()/value() work
-			self.current_back_key.clear();
-			self.current_back_key.extend_from_slice(&key_bytes);
-			self.current_back_value.clear();
-			self.current_back_value.extend_from_slice(&value_bytes);
-			self.has_current_back = true;
-			return Ok(true);
-		}
 
-		// No visible version found for this key, try next
-		self.has_current_back = false;
-		self.skip_to_valid_backward()
+			// Decide the outcome for this user key.
+			if let (Some(key_bytes), Some(value_bytes)) = (latest_key, latest_value) {
+				let key_ref = InternalKeyRef::from_encoded(&key_bytes);
+				if key_ref.is_tombstone() {
+					// Latest visible is a tombstone -- skip this user key and
+					// examine the next one. (Was: recursive call.)
+					self.has_current_back = false;
+					continue;
+				}
+				self.current_back_key.clear();
+				self.current_back_key.extend_from_slice(&key_bytes);
+				self.current_back_value.clear();
+				self.current_back_value.extend_from_slice(&value_bytes);
+				self.has_current_back = true;
+				return Ok(true);
+			}
+
+			// No visible version found for this user key -- skip it. (Was:
+			// recursive call.)
+			self.has_current_back = false;
+		}
 	}
 
 	/// Switch from backward to forward direction.
