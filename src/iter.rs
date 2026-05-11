@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::clock::LogicalClock;
@@ -725,7 +726,9 @@ pub(crate) struct CompactionIterator<'a> {
 	///
 	/// After processing accumulated_versions, valid entries are moved here.
 	/// The advance() method drains this buffer before processing more input.
-	output_versions: Vec<(InternalKey, Value)>,
+	/// VecDeque so `pop_front` is O(1) — previously `Vec::remove(0)` was O(n)
+	/// per emission and quadratic for multi-version keys.
+	output_versions: VecDeque<(InternalKey, Value)>,
 
 	// ========== Versioning Configuration ==========
 	/// Whether to keep multiple versions of keys.
@@ -784,7 +787,7 @@ impl<'a> CompactionIterator<'a> {
 			is_bottom_level,
 			current_user_key: Vec::new(),
 			accumulated_versions: Vec::new(),
-			output_versions: Vec::new(),
+			output_versions: VecDeque::new(),
 			enable_versioning,
 			retention_period_ns,
 			clock,
@@ -1027,10 +1030,14 @@ impl<'a> CompactionIterator<'a> {
 		// Used to detect when a newer version supersedes an older one.
 		let mut newer_version_visibility: Option<SnapshotVisibility> = None;
 
-		// We need to iterate with indices to access accumulated_versions
+		// First pass: compute the output decision per entry without touching
+		// values. Decision depends only on InternalKey + visibility, so this
+		// avoids any clone. Second pass below transfers ownership.
 		let len = self.accumulated_versions.len();
+		let mut keep = vec![false; len];
+
 		for i in 0..len {
-			let (key, value) = &self.accumulated_versions[i];
+			let (key, _value) = &self.accumulated_versions[i];
 			let is_hard_delete = key.is_hard_delete_marker();
 			let is_replace = key.is_replace();
 			let is_latest = i == 0;
@@ -1147,16 +1154,20 @@ impl<'a> CompactionIterator<'a> {
 				is_latest
 			};
 
-			if should_output {
-				self.output_versions.push((key.clone(), value.clone()));
-			}
+			keep[i] = should_output;
 
 			// Update for next iteration (this version becomes the "newer" one)
 			newer_version_visibility = Some(current_visibility);
 		}
 
-		// Clear accumulated versions for the next key
-		self.accumulated_versions.clear();
+		// Second pass: transfer ownership of kept entries into output_versions.
+		// Dropped entries are freed by drain. No clone of key or value here.
+		for (i, entry) in self.accumulated_versions.drain(..).enumerate() {
+			if keep[i] {
+				self.output_versions.push_back(entry);
+			}
+		}
+
 		Ok(())
 	}
 
@@ -1231,11 +1242,9 @@ impl<'a> CompactionIterator<'a> {
 		}
 
 		loop {
-			// Priority 1: Return any pending output versions
-			if !self.output_versions.is_empty() {
-				// Remove from front to maintain sequence number order
-				// (already sorted descending by seq_num)
-				return Ok(Some(self.output_versions.remove(0)));
+			// Priority 1: Return any pending output versions. O(1) pop_front.
+			if let Some(out) = self.output_versions.pop_front() {
+				return Ok(Some(out));
 			}
 
 			// Priority 2: Check if merge iterator is exhausted
@@ -1243,53 +1252,46 @@ impl<'a> CompactionIterator<'a> {
 				// Process any remaining accumulated versions
 				if !self.accumulated_versions.is_empty() {
 					self.process_accumulated_versions()?;
-					// Return first output version if any
-					if !self.output_versions.is_empty() {
-						return Ok(Some(self.output_versions.remove(0)));
+					if let Some(out) = self.output_versions.pop_front() {
+						return Ok(Some(out));
 					}
 				}
 				return Ok(None);
 			}
 
-			// Priority 3: Get next entry from merge iterator
-			// Extract to owned values to avoid borrow checker issues
+			// Priority 3: Get next entry from merge iterator.
+			// One clone (InternalKey) + one alloc (value Vec) per step.
+			// user_key is compared by reference — no separate clone for it.
 			let key_owned = self.merge_iter.current_key().to_owned();
-			let user_key_owned = key_owned.user_key.clone();
 			let value = self.merge_iter.current_value()?.to_vec();
 
-			// Check if this is a new user key
+			// Check if this is a new user key. Vec<u8> PartialEq is byte-wise,
+			// so we can compare the new key against the stored one without
+			// cloning out user_key.
 			let is_new_key =
-				self.current_user_key.is_empty() || user_key_owned != self.current_user_key;
+				self.current_user_key.is_empty() || key_owned.user_key != self.current_user_key;
 
 			if is_new_key {
-				// Process accumulated versions of the previous key
+				// Process accumulated versions of the previous key before
+				// switching current_user_key.
 				if !self.accumulated_versions.is_empty() {
 					self.process_accumulated_versions()?;
+				}
 
-					// Start accumulating the new key
-					self.current_user_key = user_key_owned;
-					self.accumulated_versions.push((key_owned, value));
+				// Update current_user_key in-place: reuses allocation when the
+				// new key fits in existing capacity.
+				self.current_user_key.clear();
+				self.current_user_key.extend_from_slice(&key_owned.user_key);
 
-					// Advance merge iterator for next iteration
-					self.merge_iter.next()?;
+				self.accumulated_versions.push((key_owned, value));
+				self.merge_iter.next()?;
 
-					// Return first output version from processed key if any
-					if !self.output_versions.is_empty() {
-						return Ok(Some(self.output_versions.remove(0)));
-					}
-				} else {
-					// First key - start accumulating
-					self.current_user_key = user_key_owned;
-					self.accumulated_versions.push((key_owned, value));
-
-					// Advance merge iterator for next iteration
-					self.merge_iter.next()?;
+				if let Some(out) = self.output_versions.pop_front() {
+					return Ok(Some(out));
 				}
 			} else {
 				// Same user key - add to accumulated versions
 				self.accumulated_versions.push((key_owned, value));
-
-				// Advance merge iterator for next iteration
 				self.merge_iter.next()?;
 			}
 		}

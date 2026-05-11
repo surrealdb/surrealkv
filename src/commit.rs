@@ -1,4 +1,10 @@
-// This commit pipeline is inspired by Pebble's commit pipeline.
+// Commit pipeline: assigns sequence numbers, appends to WAL, applies to
+// memtable, and ratchets visible_seq_num. Sync durability is amortized
+// across concurrent committers: prepare() registers a sync notifier under
+// the brief write_mutex critical section (so seq-num order matches
+// WAL-record order), but the fsync itself happens outside that mutex
+// via WalManager::drive_pending_syncs — so N concurrent sync=true
+// committers share one fsync round-trip instead of paying N sequentially.
 
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,11 +19,23 @@ use crate::stall::WriteStallController;
 const MAX_CONCURRENT_COMMITS: usize = 8;
 const DEQUEUE_BITS: u32 = 32;
 
-// Trait for commit operations
+// Trait for commit operations.
 pub trait CommitEnv: Send + Sync + 'static {
-	// Write batch to WAL and process VLog entries (synchronous operation)
-	// Returns a new batch with VLog pointers applied
-	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch>;
+	/// Append batch to WAL (memcpy + buffered write, NO fsync).
+	/// If `sync` is true, register a sync notifier and return the receiver;
+	/// the caller awaits it after calling `drive_pending_syncs()`.
+	fn write(
+		&self,
+		batch: &Batch,
+		seq_num: u64,
+		sync: bool,
+	) -> Result<(Batch, Option<oneshot::Receiver<Result<()>>>)>;
+
+	/// Trigger fsync of buffered WAL data, satisfying any registered sync
+	/// notifiers. Multiple concurrent callers serialize internally; one
+	/// fsync amortizes across all currently-pending waiters. Called
+	/// OUTSIDE the commit-pipeline write_mutex.
+	fn drive_pending_syncs(&self) -> Result<()>;
 
 	// Apply processed batch to memtable
 	fn apply(&self, batch: &Batch) -> Result<()>;
@@ -237,8 +255,11 @@ impl CommitPipeline {
 
 		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
 
-		// Phase 1: Assign sequence number and write to WAL (serialized)
-		let processed_batch = self.prepare(&mut batch, Arc::clone(&commit_batch), sync)?;
+		// Phase 1: Assign sequence number and append to WAL (serialized).
+		// When sync=true, this also registers a sync notifier; the actual
+		// fsync runs *outside* the write_mutex, below.
+		let (processed_batch, sync_rx) =
+			self.prepare(&mut batch, Arc::clone(&commit_batch), sync)?;
 
 		// Phase 2: Apply to memtable (concurrent)
 		let apply_result = {
@@ -293,6 +314,16 @@ impl CommitPipeline {
 			return Err(err);
 		}
 
+		// Phase 4 (sync=true only): drive the fsync OUTSIDE write_mutex
+		// so concurrent committers can keep filling the WAL buffer for
+		// the next fsync round. Multiple committers calling this race on
+		// an internal fsync_lock; whichever wins drains all pending
+		// notifiers in one fsync, satisfying everyone.
+		if let Some(rx) = sync_rx {
+			self.env.drive_pending_syncs()?;
+			rx.await.map_err(|_| Error::PipelineStall)??;
+		}
+
 		// Wait for completion
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
 	}
@@ -302,8 +333,12 @@ impl CommitPipeline {
 		batch: &mut Batch,
 		commit_batch: Arc<CommitBatch>,
 		sync: bool,
-	) -> Result<Batch> {
-		// Assign sequence number atomically and write to WAL (serialized)
+	) -> Result<(Batch, Option<oneshot::Receiver<Result<()>>>)> {
+		// Assign sequence number atomically and append to WAL (serialized).
+		// The critical section here covers ONLY: seq_num assignment,
+		// queue enqueue, WAL append (memcpy + buffered write), and
+		// (if sync) sync-notifier registration. NO fsync — that happens
+		// outside this lock so concurrent committers can pipeline.
 		let _guard = self.write_mutex.lock();
 
 		let count = batch.count() as u64;
@@ -316,10 +351,10 @@ impl CommitPipeline {
 		// Enqueue operation (single producer)
 		self.pending.enqueue(commit_batch);
 
-		// Write to WAL and process VLog (serialized under lock)
-		let processed_batch = self.env.write(batch, seq_num, sync)?;
+		// Append to WAL (no fsync). Returns a sync receiver iff sync=true.
+		let (processed_batch, sync_rx) = self.env.write(batch, seq_num, sync)?;
 
-		Ok(processed_batch)
+		Ok((processed_batch, sync_rx))
 	}
 
 	fn publish(&self) {
@@ -415,7 +450,12 @@ mod tests {
 	struct MockEnv;
 
 	impl CommitEnv for MockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
+		fn write(
+			&self,
+			batch: &Batch,
+			_seq_num: u64,
+			sync: bool,
+		) -> Result<(Batch, Option<oneshot::Receiver<Result<()>>>)> {
 			// Create a copy of the batch for testing
 			let mut new_batch = Batch::new(_seq_num);
 			for entry in batch.entries() {
@@ -426,7 +466,19 @@ mod tests {
 					entry.timestamp,
 				)?;
 			}
-			Ok(new_batch)
+			// Mock: immediately-satisfied sync receiver if sync requested.
+			let rx = if sync {
+				let (tx, rx) = oneshot::channel();
+				let _ = tx.send(Ok(()));
+				Some(rx)
+			} else {
+				None
+			};
+			Ok((new_batch, rx))
+		}
+
+		fn drive_pending_syncs(&self) -> Result<()> {
+			Ok(())
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -529,7 +581,12 @@ mod tests {
 	struct DelayedMockEnv;
 
 	impl CommitEnv for DelayedMockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
+		fn write(
+			&self,
+			batch: &Batch,
+			_seq_num: u64,
+			sync: bool,
+		) -> Result<(Batch, Option<oneshot::Receiver<Result<()>>>)> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(100) {
 				std::hint::spin_loop();
@@ -544,7 +601,18 @@ mod tests {
 					entry.timestamp,
 				)?;
 			}
-			Ok(new_batch)
+			let rx = if sync {
+				let (tx, rx) = oneshot::channel();
+				let _ = tx.send(Ok(()));
+				Some(rx)
+			} else {
+				None
+			};
+			Ok((new_batch, rx))
+		}
+
+		fn drive_pending_syncs(&self) -> Result<()> {
+			Ok(())
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -617,7 +685,12 @@ mod tests {
 	struct AlwaysFailApplyEnv;
 
 	impl CommitEnv for AlwaysFailApplyEnv {
-		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
+		fn write(
+			&self,
+			batch: &Batch,
+			seq_num: u64,
+			sync: bool,
+		) -> Result<(Batch, Option<oneshot::Receiver<Result<()>>>)> {
 			let mut new_batch = Batch::new(seq_num);
 			for entry in batch.entries() {
 				new_batch.add_record(
@@ -627,7 +700,18 @@ mod tests {
 					entry.timestamp,
 				)?;
 			}
-			Ok(new_batch)
+			let rx = if sync {
+				let (tx, rx) = oneshot::channel();
+				let _ = tx.send(Ok(()));
+				Some(rx)
+			} else {
+				None
+			};
+			Ok((new_batch, rx))
+		}
+
+		fn drive_pending_syncs(&self) -> Result<()> {
+			Ok(())
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -686,7 +770,12 @@ mod tests {
 	}
 
 	impl CommitEnv for FailNTimesEnv {
-		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
+		fn write(
+			&self,
+			batch: &Batch,
+			seq_num: u64,
+			sync: bool,
+		) -> Result<(Batch, Option<oneshot::Receiver<Result<()>>>)> {
 			let mut new_batch = Batch::new(seq_num);
 			for entry in batch.entries() {
 				new_batch.add_record(
@@ -696,7 +785,18 @@ mod tests {
 					entry.timestamp,
 				)?;
 			}
-			Ok(new_batch)
+			let rx = if sync {
+				let (tx, rx) = oneshot::channel();
+				let _ = tx.send(Ok(()));
+				Some(rx)
+			} else {
+				None
+			};
+			Ok((new_batch, rx))
+		}
+
+		fn drive_pending_syncs(&self) -> Result<()> {
+			Ok(())
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {

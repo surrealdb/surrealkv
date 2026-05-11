@@ -449,14 +449,30 @@ impl Drop for Wal {
 /// RwLock, matching VLog's pattern. The expensive fsync in `sync()`
 /// is performed outside the write lock using a pre-cloned file
 /// descriptor, allowing concurrent WAL appends to proceed.
+///
+/// Group-commit support: callers that want a durable commit register a
+/// sync notifier via `register_sync()`, then call `drive_pending_syncs()`
+/// (typically *outside* any commit-pipeline mutex). The first thread to
+/// take the internal fsync lock drains all currently-registered notifiers
+/// and performs a single fsync that satisfies them all. Other threads
+/// that arrive while that fsync is in flight wait briefly on the fsync
+/// lock; by the time they acquire it, the queue may already be empty
+/// (they have nothing more to do — their oneshot has been signaled).
 pub(crate) struct WalManager {
 	inner: parking_lot::RwLock<Wal>,
+	/// Sync notifiers waiting to be satisfied by the next fsync.
+	pending_syncs: parking_lot::Mutex<Vec<tokio::sync::oneshot::Sender<crate::error::Result<()>>>>,
+	/// Serializes fsync work across concurrent callers of
+	/// `drive_pending_syncs` so only one in-flight fsync exists at a time.
+	fsync_lock: parking_lot::Mutex<()>,
 }
 
 impl WalManager {
 	pub(crate) fn new(wal: Wal) -> Self {
 		Self {
 			inner: parking_lot::RwLock::new(wal),
+			pending_syncs: parking_lot::Mutex::new(Vec::new()),
+			fsync_lock: parking_lot::Mutex::new(()),
 		}
 	}
 
@@ -488,6 +504,68 @@ impl WalManager {
 	/// Returns a read guard for read-only WAL access.
 	pub(crate) fn read(&self) -> parking_lot::RwLockReadGuard<'_, Wal> {
 		self.inner.read()
+	}
+
+	/// Register a sync notifier. The returned receiver will be signaled
+	/// (with the result of the next successful fsync covering at least
+	/// the data appended *before* this call) once `drive_pending_syncs`
+	/// has run by some thread.
+	///
+	/// Ordering guarantee: callers MUST register only after their WAL
+	/// append has returned. That ensures the data they care about is
+	/// already in the WAL buffer when a subsequent fsync runs.
+	///
+	/// The receiver carries a `crate::error::Result` so callers awaiting
+	/// it can use `?` directly in code that returns the crate-level
+	/// error type.
+	pub(crate) fn register_sync(&self) -> tokio::sync::oneshot::Receiver<crate::error::Result<()>> {
+		let (tx, rx) = tokio::sync::oneshot::channel();
+		self.pending_syncs.lock().push(tx);
+		rx
+	}
+
+	/// Drive any pending sync requests: flush buffered WAL data to the OS,
+	/// fsync the inode, then signal all waiters that were registered as of
+	/// the moment we took the fsync lock.
+	///
+	/// Concurrent callers serialize on `fsync_lock`. A caller that arrives
+	/// after another caller has already drained the queue will find the
+	/// queue empty and return early — its own waiter has either been
+	/// signaled or is still pending (in which case the *next* caller will
+	/// drain it).
+	///
+	/// MUST NOT be called while holding any commit-pipeline mutex, or the
+	/// amortization is lost.
+	pub(crate) fn drive_pending_syncs(&self) -> crate::error::Result<()> {
+		let _fsync_guard = self.fsync_lock.lock();
+
+		let waiters: Vec<_> = std::mem::take(&mut *self.pending_syncs.lock());
+		if waiters.is_empty() {
+			return Ok(());
+		}
+
+		// Two-phase: flush buffered data under wal write lock (so the
+		// kernel has all bytes), then fsync via cloned fd outside the wal
+		// lock so concurrent appenders can keep filling the buffer for
+		// the *next* fsync round.
+		let flush_result: crate::error::Result<()> = {
+			let mut wal = self.inner.write();
+			wal.flush().map_err(crate::error::Error::from)
+		};
+
+		let result: crate::error::Result<()> = match flush_result {
+			Ok(()) => {
+				let sync_fd = self.inner.read().sync_fd();
+				sync_fd.sync_all().map_err(crate::error::Error::from)
+			}
+			Err(e) => Err(e),
+		};
+
+		for tx in waiters {
+			let _ = tx.send(result.clone());
+		}
+
+		result
 	}
 }
 

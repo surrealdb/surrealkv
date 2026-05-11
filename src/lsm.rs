@@ -966,9 +966,17 @@ impl LsmCommitEnv {
 }
 
 impl CommitEnv for LsmCommitEnv {
-	// Write batch to WAL with inline values (synchronous operation).
-	// VLog separation is deferred to memtable flush time.
-	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
+	/// Encode + append the batch to the WAL. Does NOT fsync — if the caller
+	/// requested durability (sync=true) we instead register a sync notifier
+	/// and hand back the receiver. The commit pipeline awaits it after
+	/// releasing its write_mutex, so multiple concurrent committers share
+	/// one amortized fsync via WalManager::drive_pending_syncs.
+	fn write(
+		&self,
+		batch: &Batch,
+		seq_num: u64,
+		sync: bool,
+	) -> Result<(Batch, Option<tokio::sync::oneshot::Receiver<crate::error::Result<()>>>)> {
 		let mut processed_batch = Batch::new(seq_num);
 
 		for (_, entry, _current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
@@ -986,16 +994,30 @@ impl CommitEnv for LsmCommitEnv {
 			processed_batch.add_record(entry.kind, entry.key.clone(), encoded_value, timestamp)?;
 		}
 
-		// Write to WAL for durability
+		// Append to WAL (buffered write, no fsync). Sync registration must
+		// happen while the commit pipeline still holds its write_mutex, so
+		// the notifier is queued in the same order as the WAL append.
 		let enc_bytes = processed_batch.encode()?;
-		let mut wal_guard = self.core.wal.write();
-		wal_guard.append(&enc_bytes)?;
-		if sync {
-			wal_guard.sync()?;
-		}
-		drop(wal_guard);
+		let sync_rx = {
+			let mut wal_guard = self.core.wal.write();
+			wal_guard.append(&enc_bytes)?;
+			if sync {
+				Some(self.core.wal.register_sync())
+			} else {
+				None
+			}
+		};
 
-		Ok(processed_batch)
+		Ok((processed_batch, sync_rx))
+	}
+
+	/// Trigger the amortized fsync that satisfies all currently-registered
+	/// sync notifiers. Called by the commit pipeline OUTSIDE write_mutex.
+	/// Returns immediately if another caller is already mid-fsync or if
+	/// the pending queue is empty.
+	fn drive_pending_syncs(&self) -> Result<()> {
+		self.core.wal.drive_pending_syncs()?;
+		Ok(())
 	}
 
 	/// Apply batch to memtable with retry on arena full.
