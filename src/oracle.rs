@@ -8,7 +8,7 @@
 // lands. This is what lets `apply()` run OUTSIDE `write_mutex`.
 //
 // Retention model:
-//   `recent_writes` contains every commit at `seq >= discard_below`. GC runs
+//   `recent_writes` contains every commit at `seq >= kept_since`. GC runs
 //   inside `publish` under two gates:
 //     (a) a commit-count throttle (`commits_since_gc >= GC_INTERVAL`) to
 //         amortize the O(N) HashMap walk, and
@@ -42,14 +42,13 @@ struct OracleInner {
 	// xxh3_64(key) -> commit_seq of the most recent writer of that key.
 	recent_writes: HashMap<u64, u64>,
 
-	// Any txn with `start_seq < discard_below` cannot be soundly validated by
-	// the map alone (its window has been GC'd). Such txns get TransactionRetry.
-	discard_below: u64,
-
-	// Highest `oldest_active` seen by a GC pass. Used as the skip-if-unchanged
-	// gate: if the watermark hasn't advanced since the last sweep there is no
-	// new work to do.
-	last_cleanup_oldest_active: u64,
+	// The smallest seq still represented in the map: every commit at
+	// `seq >= kept_since` is recorded. A txn with `start_seq < kept_since`
+	// cannot be soundly validated (its window has been pruned) and gets
+	// `TransactionRetry`. Doubles as the watermark check for GC: a sweep is
+	// only useful when `oldest_active > kept_since` (the live floor has moved
+	// past what we last pruned to).
+	kept_since: u64,
 
 	// Publishes since the last GC sweep. Bounds GC frequency to amortize the
 	// O(N) `HashMap::retain` cost. Reset to 0 inside the GC body.
@@ -69,8 +68,7 @@ impl CommitOracle {
 		Self {
 			inner: Mutex::new(OracleInner {
 				recent_writes: HashMap::new(),
-				discard_below: 0,
-				last_cleanup_oldest_active: 0,
+				kept_since: 0,
 				commits_since_gc: 0,
 			}),
 		}
@@ -79,14 +77,14 @@ impl CommitOracle {
 	/// Validate the write set against the recent-writes map.
 	///
 	/// Called under `write_mutex` BEFORE seq allocation. Returns:
-	/// - `TransactionRetry` if `start_seq < discard_below` (window GC'd).
+	/// - `TransactionRetry` if `start_seq < kept_since` (window GC'd).
 	/// - `TransactionWriteConflict` if any key was committed at seq > start_seq.
 	pub(crate) fn check<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
 	where
 		I: IntoIterator<Item = &'a [u8]>,
 	{
 		let g = self.inner.lock();
-		if start_seq < g.discard_below {
+		if start_seq < g.kept_since {
 			return Err(Error::TransactionRetry);
 		}
 		for k in keys {
@@ -107,10 +105,10 @@ impl CommitOracle {
 	/// conflict, but no real conflict is ever missed.
 	///
 	/// GC cadence: throttled by `commits_since_gc >= GC_INTERVAL` AND gated by
-	/// `oldest_active > last_cleanup_oldest_active`. Most calls do nothing
-	/// beyond an increment and a comparison — the O(N) `retain` runs at most
-	/// once per `GC_INTERVAL` publishes, and only when there's actually work to
-	/// do (the watermark has advanced since the previous sweep).
+	/// `oldest_active > kept_since`. Most calls do nothing beyond an increment
+	/// and a comparison — the O(N) `retain` runs at most once per `GC_INTERVAL`
+	/// publishes, and only when there's actually work to do (the watermark has
+	/// advanced past what we last pruned to).
 	///
 	/// Called under `write_mutex` AFTER seq allocation, BEFORE WAL.
 	pub(crate) fn publish<'a, I>(&self, keys: I, seq_num: u64, count: u64, oldest_active: u64)
@@ -132,19 +130,16 @@ impl CommitOracle {
 
 		// Two gates, both required:
 		//   (a) Enough commits since the last sweep — perf throttle.
-		//   (b) Watermark has advanced — skip fruitless walks.
+		//   (b) Watermark has advanced past what we already pruned to —
+		//       skip fruitless walks.
 		// `oldest_active` is provably non-decreasing across calls (it's derived
 		// from `min(start_seq)` over live txns, and `visible_seq_num` is
 		// monotonic). The debug_assert catches any future code path that
 		// violates that invariant.
-		if g.commits_since_gc >= GC_INTERVAL && oldest_active > g.last_cleanup_oldest_active {
-			debug_assert!(
-				oldest_active >= g.last_cleanup_oldest_active,
-				"oldest_active must be monotonic"
-			);
+		if g.commits_since_gc >= GC_INTERVAL && oldest_active > g.kept_since {
+			debug_assert!(oldest_active >= g.kept_since, "oldest_active must be monotonic");
 			g.commits_since_gc = 0;
-			g.last_cleanup_oldest_active = oldest_active;
-			g.discard_below = oldest_active;
+			g.kept_since = oldest_active;
 			g.recent_writes.retain(|_, v| *v >= oldest_active);
 		}
 	}
@@ -182,17 +177,16 @@ impl CommitOracle {
 	/// that are now greater than the restored `max_seq`; those are ghosts of
 	/// a future that no longer exists.
 	///
-	/// Resets the GC bookkeeping (`commits_since_gc`, `last_cleanup_oldest_active`)
-	/// along with the map so post-restore behavior starts from a clean slate.
+	/// Resets the GC bookkeeping (`commits_since_gc`) along with the map so
+	/// post-restore behavior starts from a clean slate.
 	///
 	/// NOT called at startup. A freshly-constructed oracle already has an
-	/// empty map and `discard_below = 0`, and the first post-startup txn has
+	/// empty map and `kept_since = 0`, and the first post-startup txn has
 	/// `start_seq = max_recovered_seq` which trivially passes the
-	/// `start_seq < discard_below` check.
+	/// `start_seq < kept_since` check.
 	pub(crate) fn reset_for_restore(&self, max_seq: u64) {
 		let mut g = self.inner.lock();
-		g.discard_below = max_seq;
-		g.last_cleanup_oldest_active = max_seq;
+		g.kept_since = max_seq;
 		g.commits_since_gc = 0;
 		g.recent_writes.clear();
 	}
@@ -203,8 +197,8 @@ impl CommitOracle {
 	}
 
 	#[cfg(test)]
-	pub(crate) fn discard_below(&self) -> u64 {
-		self.inner.lock().discard_below
+	pub(crate) fn kept_since(&self) -> u64 {
+		self.inner.lock().kept_since
 	}
 }
 
@@ -263,7 +257,7 @@ mod tests {
 		o.publish([key("k").as_slice()], 10, 1, 0);
 		o.reset_for_restore(100);
 		assert_eq!(o.len(), 0);
-		assert_eq!(o.discard_below(), 100);
+		assert_eq!(o.kept_since(), 100);
 		// A txn at start_seq=99 < 100 must retry.
 		assert!(matches!(o.check([key("k").as_slice()], 99), Err(Error::TransactionRetry)));
 		// A txn at start_seq=100 is accepted (strict <).
@@ -273,14 +267,14 @@ mod tests {
 		// after the reset must NOT trigger another GC (counter starts at 0
 		// post-reset, so we can do GC_INTERVAL-1 publishes without hitting
 		// the threshold). If counter weren't reset, GC could fire prematurely
-		// and disturb discard_below.
+		// and disturb kept_since.
 		for i in 0..(GC_INTERVAL - 1) {
-			// Stamp >= discard_below(=100) so entries are kept; watermark
-			// advancing would change discard_below if GC fires.
+			// Stamp >= kept_since(=100) so entries are kept; watermark
+			// advancing would change kept_since if GC fires.
 			o.publish([format!("k{i}").as_bytes()], 200 + i as u64, 1, 150);
 		}
-		// GC did NOT fire — discard_below still 100 (the reset value), not 150.
-		assert_eq!(o.discard_below(), 100);
+		// GC did NOT fire — kept_since still 100 (the reset value), not 150.
+		assert_eq!(o.kept_since(), 100);
 		assert_eq!(o.len(), (GC_INTERVAL - 1) as usize);
 	}
 
@@ -290,21 +284,21 @@ mod tests {
 
 		// Phase 1: push GC_INTERVAL publishes at watermark=5. At the last one,
 		// counter hits GC_INTERVAL and watermark=5 > last_cleanup(=0), so GC
-		// fires. All entries have seq >= 10, all retained. discard_below=5.
+		// fires. All entries have seq >= 10, all retained. kept_since=5.
 		for i in 0..GC_INTERVAL {
 			o.publish([format!("a{i}").as_bytes()], 10 + i as u64, 1, 5);
 		}
 		assert_eq!(o.len(), GC_INTERVAL as usize, "all entries kept (all seq >= 5)");
-		assert_eq!(o.discard_below(), 5);
+		assert_eq!(o.kept_since(), 5);
 
 		// Phase 2: push another GC_INTERVAL publishes at the SAME watermark=5.
 		// Counter reaches GC_INTERVAL again, but watermark(5) > last_cleanup(5)
-		// is false → GC body skipped. Map grows; discard_below unchanged.
+		// is false → GC body skipped. Map grows; kept_since unchanged.
 		for i in 0..GC_INTERVAL {
 			o.publish([format!("b{i}").as_bytes()], 10_000 + i as u64, 1, 5);
 		}
 		assert_eq!(o.len(), (2 * GC_INTERVAL) as usize, "second batch retained, no GC fired");
-		assert_eq!(o.discard_below(), 5, "discard_below unchanged when watermark unchanged");
+		assert_eq!(o.kept_since(), 5, "kept_since unchanged when watermark unchanged");
 	}
 
 	#[test]
@@ -317,7 +311,7 @@ mod tests {
 			o.publish([format!("low{i}").as_bytes()], 10 + i as u64, 1, 0);
 		}
 		assert_eq!(o.len(), (GC_INTERVAL - 1) as usize);
-		assert_eq!(o.discard_below(), 0);
+		assert_eq!(o.kept_since(), 0);
 
 		// One more publish at watermark=50. Counter hits GC_INTERVAL AND
 		// watermark advanced → GC fires. Entries with seq < 50 are dropped.
@@ -325,7 +319,7 @@ mod tests {
 		// those below 50 (10..49) get dropped, the rest stay. Plus the new
 		// entry "recent" at seq 99_999.
 		o.publish([key("recent").as_slice()], 99_999, 1, 50);
-		assert_eq!(o.discard_below(), 50);
+		assert_eq!(o.kept_since(), 50);
 		// 40 entries below threshold (seqs 10..49) dropped; (GC_INTERVAL-1)-40
 		// "low" entries kept + "recent" = GC_INTERVAL - 40.
 		assert_eq!(o.len() as u32, GC_INTERVAL - 40);
@@ -344,9 +338,9 @@ mod tests {
 			o.publish([format!("k{i}").as_bytes()], 10 + i as u64, 1, i as u64 + 1);
 		}
 		assert_eq!(o.len(), (GC_INTERVAL - 1) as usize);
-		// discard_below stays at its initial 0 — GC never ran despite watermark
+		// kept_since stays at its initial 0 — GC never ran despite watermark
 		// advancing on every call.
-		assert_eq!(o.discard_below(), 0);
+		assert_eq!(o.kept_since(), 0);
 	}
 
 	#[test]
@@ -359,7 +353,7 @@ mod tests {
 			o.publish([format!("a{i}").as_bytes()], 10 + i as u64, 1, 0);
 		}
 		o.publish([key("trigger").as_slice()], 99_999, 1, 50);
-		assert_eq!(o.discard_below(), 50, "GC fired on first batch");
+		assert_eq!(o.kept_since(), 50, "GC fired on first batch");
 
 		// After the sweep, counter is back at 0. Push GC_INTERVAL - 1 more
 		// publishes with a further-advancing watermark; GC must NOT fire again
@@ -367,9 +361,9 @@ mod tests {
 		for i in 0..(GC_INTERVAL - 1) {
 			o.publish([format!("b{i}").as_bytes()], 200_000 + i as u64, 1, 100 + i as u64);
 		}
-		// discard_below still 50 — second GC didn't fire because counter
+		// kept_since still 50 — second GC didn't fire because counter
 		// hadn't hit the threshold again.
-		assert_eq!(o.discard_below(), 50, "second GC did not fire after partial batch");
+		assert_eq!(o.kept_since(), 50, "second GC did not fire after partial batch");
 	}
 
 	#[test]

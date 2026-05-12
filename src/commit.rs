@@ -229,7 +229,7 @@ impl CommitPipeline {
 		}
 	}
 
-	/// Discard all oracle entries and set `discard_below = max_seq`.
+	/// Discard all oracle entries and set `kept_since = max_seq`.
 	///
 	/// Called from `Tree::restore_from_checkpoint` after the seq counter has
 	/// been rewound. The running process may have accumulated entries with

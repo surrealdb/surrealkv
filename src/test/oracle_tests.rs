@@ -222,15 +222,16 @@ async fn test_write_only_txn_holds_watermark() {
 	assert_ne!(tracker.oldest(), Some(pinned));
 }
 
-/// On a clean restart, the recovered `max_seq_num` should seed
-/// `oracle.discard_below`. New txns post-restart get `start_seq = max_seq`
-/// and the strict `start_seq < discard_below` check accepts them.
+/// On a clean restart, the oracle is constructed fresh and `set_seq_num`
+/// intentionally does NOT touch it. New txns post-recovery have
+/// `start_seq = max_recovered_seq`; the oracle's `kept_since` is 0, so the
+/// strict `start_seq < kept_since` check accepts them without any seeding.
 ///
-/// Note: we can't easily simulate a process restart in-process for an LSM tree
-/// without dropping and reopening it. This test reopens the tree on the same
-/// path and verifies new txns proceed normally.
+/// Note: we can't easily simulate a full process restart in-process for an
+/// LSM tree without dropping and reopening it. This test reopens the tree
+/// on the same path and verifies new txns proceed normally.
 #[test(tokio::test)]
-async fn test_recovery_seeds_discard_below() {
+async fn test_recovery_does_not_touch_oracle() {
 	let temp_dir = TempDir::new("oracle_recovery").unwrap();
 	let path = temp_dir.path().to_path_buf();
 
@@ -244,7 +245,7 @@ async fn test_recovery_seeds_discard_below() {
 		store.close().await.unwrap();
 	}
 
-	// Reopen: the oracle is constructed fresh (empty map, discard_below = 0).
+	// Reopen: the oracle is constructed fresh (empty map, kept_since = 0).
 	// `commit_pipeline.set_seq_num(max_seq)` bumps the seq counters but
 	// intentionally does NOT touch the oracle — a fresh oracle is already in
 	// the correct state for post-recovery transactions.
@@ -254,12 +255,12 @@ async fn test_recovery_seeds_discard_below() {
 
 	// Oracle is empty post-recovery (no commits have happened in this process).
 	assert_eq!(oracle.len(), 0, "oracle map should be empty after reopen");
-	// discard_below stays at its initial 0 — startup does not touch the oracle.
-	assert_eq!(oracle.discard_below(), 0);
+	// kept_since stays at its initial 0 — startup does not touch the oracle.
+	assert_eq!(oracle.kept_since(), 0);
 
 	// A fresh commit must succeed. Its `start_seq` is the recovered
 	// `visible_seq_num` (>= 8 since we did 8 commits), and the oracle's
-	// `discard_below = 0`, so the strict `start_seq < discard_below` check
+	// `kept_since = 0`, so the strict `start_seq < kept_since` check
 	// returns false and the txn proceeds.
 	let mut t = store.begin().unwrap();
 	t.set(b"post_recovery", b"ok").unwrap();
