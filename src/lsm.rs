@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use parking_lot::RwLock;
 
-use crate::batch::Batch;
+use crate::batch::{Batch, PreparedBatch};
 use crate::bplustree::tree::DiskBPlusTree;
 use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
 use crate::commit::{CommitEnv, CommitPipeline};
@@ -967,44 +967,33 @@ impl LsmCommitEnv {
 }
 
 impl CommitEnv for LsmCommitEnv {
-	// Write batch to WAL with inline values (synchronous operation).
-	// VLog separation is deferred to memtable flush time.
-	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
-		let mut processed_batch = Batch::new(seq_num);
+	/// Encode the batch into WAL bytes (stream-encode, no intermediate
+	/// processed Batch) and append to the WAL. Optionally fsync.
+	/// Returns a `PreparedBatch` whose `value_slices` reference offsets
+	/// into the same WAL bytes — `apply` reads each entry's encoded value
+	/// as a slice of those bytes, avoiding a per-entry value clone.
+	///
+	/// VLog separation is deferred to memtable flush time; values are
+	/// stored inline at commit.
+	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<PreparedBatch> {
+		let prepared = crate::batch::encode_batch_for_wal(batch, seq_num)?;
 
-		for (_, entry, _current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
-			// Always store values inline — VLog separation deferred to flush.
-			// Versioned index (B+tree) writes are also deferred to flush time,
-			// so the B+tree stores value pointers (consistent with SSTables).
-			let encoded_value = match &entry.value {
-				Some(value) => {
-					let value_location = ValueLocation::with_inline_value(value.clone());
-					Some(value_location.encode())
-				}
-				None => None,
-			};
-
-			processed_batch.add_record(entry.kind, entry.key.clone(), encoded_value, timestamp)?;
-		}
-
-		// Write to WAL for durability
-		let enc_bytes = processed_batch.encode()?;
 		let mut wal_guard = self.core.wal.write();
-		wal_guard.append(&enc_bytes)?;
+		wal_guard.append(&prepared.wal_bytes)?;
 		if sync {
 			wal_guard.sync()?;
 		}
 		drop(wal_guard);
 
-		Ok(processed_batch)
+		Ok(prepared)
 	}
 
 	/// Apply batch to memtable with retry on arena full.
-	fn apply(&self, batch: &Batch) -> Result<()> {
+	fn apply(&self, batch: &Batch, prepared: &PreparedBatch) -> Result<()> {
 		// Try to add to current memtable
 		let result = {
 			let active_memtable = self.core.active_memtable.read();
-			active_memtable.add(batch)
+			active_memtable.add_prepared(batch, prepared)
 		};
 
 		match result {
@@ -1022,7 +1011,7 @@ impl CommitEnv for LsmCommitEnv {
 
 				// Retry on new memtable - must succeed
 				let active_memtable = self.core.active_memtable.read();
-				active_memtable.add(batch)
+				active_memtable.add_prepared(batch, prepared)
 			}
 			Err(e) => Err(e),
 		}

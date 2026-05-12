@@ -1,7 +1,7 @@
 use integer_encoding::{VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
-use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
+use crate::vlog::{ValuePointer, VALUE_LOCATION_VERSION, VALUE_POINTER_SIZE};
 use crate::{InternalKeyKind, Key, Value};
 
 pub(crate) const MAX_BATCH_SIZE: u64 = 1 << 32;
@@ -285,4 +285,106 @@ impl Batch {
 			size: 0, // Decoded batches don't track size
 		})
 	}
+}
+
+/// Result of encoding a batch for both WAL persistence and memtable insertion.
+///
+/// Holds the encoded WAL bytes once. Per-entry `(offset, len)` slices into
+/// `wal_bytes` point at the encoded `ValueLocation` payload for each entry
+/// (meta byte + version byte + raw value bytes). The skiplist apply path
+/// passes these slices directly to `skiplist.add`, avoiding the
+/// allocate-then-clone pattern of building a separate processed `Batch`.
+///
+/// The wire format of `wal_bytes` is bit-exact with `Batch::encode()` so
+/// existing WAL recovery code reads the same bytes without modification.
+pub(crate) struct PreparedBatch {
+	/// Encoded WAL bytes, ready for `wal.append`.
+	pub(crate) wal_bytes: Vec<u8>,
+	/// Per-entry `(offset, len)` into `wal_bytes` for the encoded value.
+	/// `(0, 0)` denotes a delete (no value bytes).
+	pub(crate) value_slices: Vec<(usize, usize)>,
+}
+
+impl PreparedBatch {
+	/// Returns the encoded value bytes for entry `i`, or `&[]` for deletes.
+	pub(crate) fn value_bytes(&self, i: usize) -> &[u8] {
+		let (off, len) = self.value_slices[i];
+		if len == 0 {
+			&[]
+		} else {
+			&self.wal_bytes[off..off + len]
+		}
+	}
+}
+
+/// Stream-encode a batch into WAL bytes + per-entry value slices.
+///
+/// Produces the same wire bytes as constructing a processed `Batch` with
+/// `ValueLocation::with_inline_value(value).encode()` for each entry and
+/// then calling `Batch::encode()`. Avoids the intermediate processed Batch,
+/// per-entry value/key clones, and the second encoding pass.
+///
+/// Behavior matches `LsmCommitEnv::write`'s old loop:
+/// - VLog separation is deferred to memtable flush time, so the valueptrs section is always
+///   all-`None` (`count` zero bytes).
+/// - Each entry's value is wrapped as `[meta=0, version=VALUE_LOCATION_VERSION, raw...]`.
+pub(crate) fn encode_batch_for_wal(batch: &Batch, seq_num: u64) -> Result<PreparedBatch> {
+	let count = batch.count() as usize;
+
+	// Estimate capacity: 32 bytes header overhead + per-entry overhead +
+	// total key/value bytes. Slight over-allocation is cheap; avoiding
+	// resize is the goal.
+	let mut estimated = 32usize;
+	for entry in &batch.entries {
+		estimated += 32 + entry.key.len() + entry.value.as_deref().map_or(0, |v| v.len() + 2);
+	}
+	estimated += count; // valueptrs section (1 byte per entry, all zero)
+
+	let mut wal_bytes = Vec::with_capacity(estimated);
+	let mut value_slices = Vec::with_capacity(count);
+
+	// Header: matches Batch::encode lines 60-66.
+	wal_bytes.push(BATCH_VERSION);
+	wal_bytes.write_varint(seq_num)?;
+	wal_bytes.write_varint(count as u32)?;
+
+	// Entries section: matches Batch::encode lines 69-86.
+	for entry in &batch.entries {
+		wal_bytes.push(entry.kind as u8);
+
+		wal_bytes.write_varint(entry.key.len() as u64)?;
+		wal_bytes.extend_from_slice(&entry.key);
+
+		let slice = match &entry.value {
+			Some(raw) => {
+				// Encoded value layout matches ValueLocation::encode for an
+				// inline value: meta (1B) + version (1B) + raw bytes.
+				let encoded_len = raw.len() + 2;
+				wal_bytes.write_varint(encoded_len as u64)?;
+				let start = wal_bytes.len();
+				wal_bytes.push(0); // meta = 0 (inline, no VLog pointer)
+				wal_bytes.push(VALUE_LOCATION_VERSION);
+				wal_bytes.extend_from_slice(raw);
+				(start, encoded_len)
+			}
+			None => {
+				wal_bytes.write_varint(0u64)?;
+				(0, 0)
+			}
+		};
+		value_slices.push(slice);
+
+		wal_bytes.write_varint(entry.timestamp)?;
+	}
+
+	// Valueptrs section: all-None at commit time (VLog separation deferred
+	// to flush). Matches Batch::encode lines 89-99 with valueptr=None.
+	for _ in 0..count {
+		wal_bytes.push(0);
+	}
+
+	Ok(PreparedBatch {
+		wal_bytes,
+		value_slices,
+	})
 }

@@ -8,7 +8,7 @@ mod skiplist;
 use arena::Arena;
 use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
 
-use crate::batch::Batch;
+use crate::batch::{Batch, PreparedBatch};
 use crate::error::Result;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
@@ -154,59 +154,48 @@ impl MemTable {
 		self.skiplist.size() as usize
 	}
 
-	/// Adds a batch of operations to the memtable.
-	/// This includes appending the batch to the Write-Ahead Log (WAL),
-	/// applying the batch to the in-memory table, and updating the memtable
-	/// size and latest sequence number.
-	///
-	/// # Arguments
-	/// * `batch` - The batch of operations to apply
-	/// * `starting_seq_num` - The starting sequence number for this batch (records get consecutive
-	///   numbers)
+	/// Recovery / replay path: apply a decoded WAL batch to the memtable.
+	/// Reads each entry's already-encoded value bytes from `batch.entries[i].value`
+	/// (which holds the ValueLocation-encoded form, as written to the WAL).
 	pub(crate) fn add(&self, batch: &Batch) -> Result<()> {
 		let highest_seq_num = self.apply_batch_to_memtable(batch)?;
 		self.update_latest_sequence_number(highest_seq_num);
 		Ok(())
 	}
 
-	/// Applies the batch of operations to the in-memory table (memtable).
-	/// Returns (total_record_size, highest_seq_num_used).
-	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<u64> {
-		// Pre-allocate empty value Bytes for delete operations to avoid repeated
-		// allocations
-		let empty_val = Value::new();
-
-		// Process entries with pre-encoded ValueLocations
-		for (_i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
-			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
-
-			// Use the value directly (cheap Bytes clone), or reuse empty value for deletes
-			let val = if let Some(encoded_value) = &entry.value {
-				encoded_value.clone()
-			} else {
-				// For delete operations, reuse the pre-allocated empty value
-				empty_val.clone()
-			};
-
-			self.insert_into_memtable(&ikey, &val)?;
+	/// Commit-pipeline path: apply a batch whose encoded values live as
+	/// slices of `prepared.wal_bytes`. Avoids the per-entry value clone
+	/// that `add` would do (since `add`'s `entry.value` is a `Vec<u8>`).
+	pub(crate) fn add_prepared(&self, batch: &Batch, prepared: &PreparedBatch) -> Result<()> {
+		for (i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
+			let trailer = crate::make_trailer(current_seq_num, entry.kind);
+			let value = prepared.value_bytes(i);
+			match self.skiplist.add(&entry.key, trailer, timestamp, value) {
+				Ok(()) => {}
+				Err(SkiplistError::RecordExists) => {} // duplicate is not an error
+				Err(SkiplistError::ArenaFull) => return Err(crate::Error::ArenaFull),
+			}
 		}
-
-		// Get the highest sequence number used from the batch
-		let highest_seq_num = batch.get_highest_seq_num();
-
-		Ok(highest_seq_num)
+		self.update_latest_sequence_number(batch.get_highest_seq_num());
+		Ok(())
 	}
 
-	/// Inserts a key-value pair into the memtable.
-	/// Returns Err(ArenaFull) if there's not enough space.
-	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
-		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
-
-		match self.skiplist.add(&key.user_key, trailer, key.timestamp, value) {
-			Ok(()) => Ok(()),
-			Err(SkiplistError::RecordExists) => Ok(()), // Duplicate is not an error in memtable
-			Err(SkiplistError::ArenaFull) => Err(crate::Error::ArenaFull),
+	/// Applies the entries of a decoded batch (e.g. from WAL replay) to
+	/// the memtable. Each entry's `value` is the already-encoded
+	/// ValueLocation form (meta + version + raw); the skiplist copies
+	/// the bytes into its arena. No intermediate clones.
+	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<u64> {
+		for (_i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
+			let trailer = crate::make_trailer(current_seq_num, entry.kind);
+			let value: &[u8] = entry.value.as_deref().unwrap_or(&[]);
+			match self.skiplist.add(&entry.key, trailer, timestamp, value) {
+				Ok(()) => {}
+				Err(SkiplistError::RecordExists) => {}
+				Err(SkiplistError::ArenaFull) => return Err(crate::Error::ArenaFull),
+			}
 		}
+
+		Ok(batch.get_highest_seq_num())
 	}
 
 	/// Updates the latest sequence number in the memtable.

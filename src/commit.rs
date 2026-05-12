@@ -6,7 +6,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, Semaphore};
 
-use crate::batch::Batch;
+use crate::batch::{Batch, PreparedBatch};
 use crate::error::{Error, Result};
 use crate::stall::WriteStallController;
 
@@ -15,12 +15,15 @@ const DEQUEUE_BITS: u32 = 32;
 
 // Trait for commit operations
 pub trait CommitEnv: Send + Sync + 'static {
-	// Write batch to WAL and process VLog entries (synchronous operation)
-	// Returns a new batch with VLog pointers applied
-	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch>;
+	/// Encode batch into WAL bytes, append to WAL, optionally fsync.
+	/// Returns a PreparedBatch holding the encoded WAL bytes plus
+	/// per-entry value slices that `apply` will use to insert directly
+	/// into the memtable without re-allocating each value.
+	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<PreparedBatch>;
 
-	// Apply processed batch to memtable
-	fn apply(&self, batch: &Batch) -> Result<()>;
+	/// Apply the batch's entries to the memtable, using the encoded values
+	/// from `prepared`. Called concurrently across committers.
+	fn apply(&self, batch: &Batch, prepared: &PreparedBatch) -> Result<()>;
 
 	// Check for background errors before committing
 	fn check_background_error(&self) -> Result<()>;
@@ -237,13 +240,15 @@ impl CommitPipeline {
 
 		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
 
-		// Phase 1: Assign sequence number and write to WAL (serialized)
-		let processed_batch = self.prepare(&mut batch, Arc::clone(&commit_batch), sync)?;
+		// Phase 1: Assign sequence number, encode + WAL append (serialized)
+		let prepared = self.prepare(&mut batch, Arc::clone(&commit_batch), sync)?;
 
-		// Phase 2: Apply to memtable (concurrent)
+		// Phase 2: Apply to memtable (concurrent). The apply path reads
+		// each entry's encoded value as a slice of `prepared.wal_bytes`
+		// — no per-entry clones.
 		let apply_result = {
 			let env = Arc::clone(&self.env);
-			env.apply(&processed_batch)
+			env.apply(&batch, &prepared)
 		};
 
 		// =========================================================================
@@ -302,7 +307,7 @@ impl CommitPipeline {
 		batch: &mut Batch,
 		commit_batch: Arc<CommitBatch>,
 		sync: bool,
-	) -> Result<Batch> {
+	) -> Result<PreparedBatch> {
 		// Assign sequence number atomically and write to WAL (serialized)
 		let _guard = self.write_mutex.lock();
 
@@ -316,10 +321,12 @@ impl CommitPipeline {
 		// Enqueue operation (single producer)
 		self.pending.enqueue(commit_batch);
 
-		// Write to WAL and process VLog (serialized under lock)
-		let processed_batch = self.env.write(batch, seq_num, sync)?;
+		// Encode + WAL append. Returns a PreparedBatch whose `value_slices`
+		// reference offsets into the encoded WAL bytes, so the apply phase
+		// can pass them directly into the skiplist without cloning.
+		let prepared = self.env.write(batch, seq_num, sync)?;
 
-		Ok(processed_batch)
+		Ok(prepared)
 	}
 
 	fn publish(&self) {
@@ -415,21 +422,11 @@ mod tests {
 	struct MockEnv;
 
 	impl CommitEnv for MockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
-			// Create a copy of the batch for testing
-			let mut new_batch = Batch::new(_seq_num);
-			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
-			}
-			Ok(new_batch)
+		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<PreparedBatch> {
+			crate::batch::encode_batch_for_wal(batch, seq_num)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _batch: &Batch, _prepared: &PreparedBatch) -> Result<()> {
 			Ok(())
 		}
 
@@ -529,25 +526,15 @@ mod tests {
 	struct DelayedMockEnv;
 
 	impl CommitEnv for DelayedMockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
+		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<PreparedBatch> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(100) {
 				std::hint::spin_loop();
 			}
-			// Create a copy of the batch for testing
-			let mut new_batch = Batch::new(_seq_num);
-			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
-			}
-			Ok(new_batch)
+			crate::batch::encode_batch_for_wal(batch, seq_num)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _batch: &Batch, _prepared: &PreparedBatch) -> Result<()> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(50) {
 				std::hint::spin_loop();
@@ -617,20 +604,11 @@ mod tests {
 	struct AlwaysFailApplyEnv;
 
 	impl CommitEnv for AlwaysFailApplyEnv {
-		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
-			let mut new_batch = Batch::new(seq_num);
-			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
-			}
-			Ok(new_batch)
+		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<PreparedBatch> {
+			crate::batch::encode_batch_for_wal(batch, seq_num)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _batch: &Batch, _prepared: &PreparedBatch) -> Result<()> {
 			Err(Error::CommitFail("simulated apply failure".into()))
 		}
 
@@ -686,20 +664,11 @@ mod tests {
 	}
 
 	impl CommitEnv for FailNTimesEnv {
-		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
-			let mut new_batch = Batch::new(seq_num);
-			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
-			}
-			Ok(new_batch)
+		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<PreparedBatch> {
+			crate::batch::encode_batch_for_wal(batch, seq_num)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _batch: &Batch, _prepared: &PreparedBatch) -> Result<()> {
 			// Increment call count and get previous value
 			let call_num = self.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 

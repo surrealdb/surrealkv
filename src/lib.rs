@@ -787,6 +787,16 @@ fn trailer_to_seq_num(trailer: u64) -> u64 {
 	trailer >> 8
 }
 
+/// Packs (seq_num, kind) into the 8-byte internal-key trailer.
+/// This is the single source of truth for the trailer layout — any code
+/// that needs a trailer should call this rather than recomputing the
+/// bit math inline. The inverse helpers are `trailer_to_seq_num` and
+/// `trailer_to_kind`.
+#[inline(always)]
+pub(crate) fn make_trailer(seq_num: u64, kind: InternalKeyKind) -> u64 {
+	(seq_num << 8) | kind as u64
+}
+
 /// Checks if a key kind represents a tombstone (delete operation)
 #[inline(always)]
 fn is_delete_kind(kind: InternalKeyKind) -> bool {
@@ -848,7 +858,7 @@ impl InternalKey {
 		Self {
 			user_key,
 			timestamp,
-			trailer: (seq_num << 8) | kind as u64,
+			trailer: make_trailer(seq_num, kind),
 		}
 	}
 

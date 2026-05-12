@@ -1079,7 +1079,7 @@ impl<'a> TransactionRangeIterator<'a> {
 
 		self.ws_encoded_key_buf.clear();
 		self.ws_encoded_key_buf.extend_from_slice(key);
-		let trailer = ((entry.seqno as u64) << 8) | (entry.kind as u64);
+		let trailer = crate::make_trailer(entry.seqno as u64, entry.kind);
 		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 		self.ws_encoded_key_buf.extend_from_slice(&entry.timestamp.to_be_bytes());
 	}
@@ -1646,7 +1646,7 @@ impl<'a> TransactionHistoryIterator<'a> {
 
 		self.ws_encoded_key_buf.clear();
 		self.ws_encoded_key_buf.extend_from_slice(key);
-		let trailer = ((entry.seqno as u64) << 8) | (entry.kind as u64);
+		let trailer = crate::make_trailer(entry.seqno as u64, entry.kind);
 		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 		self.ws_encoded_key_buf.extend_from_slice(&entry.timestamp.to_be_bytes());
 	}
