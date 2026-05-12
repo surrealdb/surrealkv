@@ -143,18 +143,21 @@ async fn test_si_write_skew_still_allowed() {
 }
 
 /// A long-lived read-write transaction pins the oracle's GC watermark.
-/// Until it drops, recent_writes entries since its start cannot be pruned.
-/// After drop, the next commit advances the watermark and GC trims the map.
+/// While it's alive, `oldest_active` stays at its `start_seq` and no GC
+/// fires (skip-if-unchanged guard). Recent_writes entries accumulate.
+/// After it drops, the next commit sees a higher `oldest_active` and the
+/// per-publish GC runs, pruning entries below the new watermark.
 #[test(tokio::test)]
 async fn test_oracle_gc_bounded_by_long_reader() {
 	let (store, _td) = create_store();
 
-	// Long-lived reader: holds an ActiveTxnGuard pinned at start_seq=0.
+	// Long-lived reader pinned at start_seq = 0 (no commits before it).
 	let reader = store.begin().unwrap();
 
-	// Fire enough commits to cross GC_INTERVAL so a GC pass runs.
-	// Each commit writes a distinct key, so all entries land in `recent_writes`.
-	const N: u32 = crate::oracle::GC_INTERVAL + 32;
+	// Commit N distinct keys. While `reader` is alive, oldest_active = 0;
+	// per-publish GC sees the watermark hasn't advanced and skips. Every
+	// entry accumulates.
+	const N: usize = 200;
 	for i in 0..N {
 		let mut t = store.begin().unwrap();
 		t.set(format!("gc_{i}").as_bytes(), b"v").unwrap();
@@ -162,35 +165,26 @@ async fn test_oracle_gc_bounded_by_long_reader() {
 	}
 
 	let pipeline = &store.core.commit_pipeline;
-	let oracle_during_reader = pipeline.oracle();
-	// While the reader is alive, oldest_active_start_seq <= 0, so any GC
-	// pass would set discard_below <= 0 and retain all entries. The map
-	// should contain all N entries.
-	assert!(
-		oracle_during_reader.len() >= N as usize,
-		"expected >= {N} entries while reader alive, got {}",
-		oracle_during_reader.len()
+	let oracle = pipeline.oracle();
+	assert_eq!(
+		oracle.len(),
+		N,
+		"map should hold all {N} entries while reader pins oldest_active=0; got {}",
+		oracle.len()
 	);
 
-	// Drop the reader. Its ActiveTxnGuard releases on Drop.
+	// Drop the reader. `oldest_active` advances to the next-oldest live txn
+	// (or to `visible_seq_num` if none).
 	drop(reader);
 
-	// Trigger another GC_INTERVAL commits so the GC pass observes the new
-	// (higher) oldest_active and prunes.
-	for i in N..(N + crate::oracle::GC_INTERVAL) {
-		let mut t = store.begin().unwrap();
-		t.set(format!("gc_{i}").as_bytes(), b"v").unwrap();
-		t.commit().await.unwrap();
-	}
+	// The next commit's `publish` sees a higher `oldest_active` and triggers
+	// a GC sweep — entries below the new watermark are pruned.
+	let mut t = store.begin().unwrap();
+	t.set(b"trigger_gc", b"v").unwrap();
+	t.commit().await.unwrap();
 
-	let oracle_after = pipeline.oracle();
-	// After GC with a higher watermark, many of the old entries are gone.
-	// We expect significantly fewer than (2 * GC_INTERVAL + 32) entries.
-	assert!(
-		oracle_after.len() < (2 * crate::oracle::GC_INTERVAL as usize),
-		"expected map shrink after reader drop, got {}",
-		oracle_after.len()
-	);
+	let after = oracle.len();
+	assert!(after < N, "map should have shrunk after reader drop + one more commit; got {after}");
 }
 
 /// A long-lived write-only transaction must also pin the GC watermark
@@ -247,20 +241,80 @@ async fn test_recovery_seeds_discard_below() {
 		store.close().await.unwrap();
 	}
 
-	// Reopen: recovery replays WAL and calls commit_pipeline.set_seq_num,
-	// which seeds the oracle with discard_below = max_seq.
+	// Reopen: the oracle is constructed fresh (empty map, discard_below = 0).
+	// `commit_pipeline.set_seq_num(max_seq)` bumps the seq counters but
+	// intentionally does NOT touch the oracle — a fresh oracle is already in
+	// the correct state for post-recovery transactions.
 	let store = TreeBuilder::new().with_path(path).build().unwrap();
 	let pipeline = &store.core.commit_pipeline;
 	let oracle = pipeline.oracle();
 
-	// Oracle map starts empty post-recovery.
-	assert_eq!(oracle.len(), 0, "oracle map should be empty after recovery");
-	// discard_below should equal recovered max_seq (>= 8 since we did 8 commits).
-	assert!(oracle.discard_below() >= 8);
+	// Oracle is empty post-recovery (no commits have happened in this process).
+	assert_eq!(oracle.len(), 0, "oracle map should be empty after reopen");
+	// discard_below stays at its initial 0 — startup does not touch the oracle.
+	assert_eq!(oracle.discard_below(), 0);
 
-	// A fresh commit must succeed (its start_seq == max_seq, not < discard_below).
+	// A fresh commit must succeed. Its `start_seq` is the recovered
+	// `visible_seq_num` (>= 8 since we did 8 commits), and the oracle's
+	// `discard_below = 0`, so the strict `start_seq < discard_below` check
+	// returns false and the txn proceeds.
 	let mut t = store.begin().unwrap();
 	t.set(b"post_recovery", b"ok").unwrap();
+	assert!(t.commit().await.is_ok());
+}
+
+/// `Tree::restore_from_checkpoint` rewinds the seq counter mid-process. The
+/// running oracle has accumulated entries with seqs greater than the restored
+/// `max_seq`; those are ghosts of a future that no longer exists. The
+/// `reset_oracle_for_restore` call in the restore path must discard them.
+#[test(tokio::test)]
+async fn test_restore_clears_oracle_entries() {
+	let temp = TempDir::new("oracle_restore").unwrap();
+	let db_path = temp.path().join("db");
+	let checkpoint_path = temp.path().join("checkpoint");
+	std::fs::create_dir_all(&db_path).unwrap();
+
+	let store = TreeBuilder::new().with_path(db_path).build().unwrap();
+
+	// Write 4 keys, take a checkpoint at this state.
+	for i in 0..4 {
+		let mut t = store.begin().unwrap();
+		t.set(format!("pre_{i}").as_bytes(), b"v").unwrap();
+		t.commit().await.unwrap();
+	}
+	store.create_checkpoint(&checkpoint_path).unwrap();
+
+	// Pin the watermark so subsequent commits don't get GC'd away. Without
+	// this, per-publish GC keeps the map near-empty (1-2 entries) and we
+	// can't observe "entries existed before restore".
+	let reader = store.begin().unwrap();
+
+	// Write 4 more keys. With the watermark pinned, all 4 stay in the map.
+	for i in 0..4 {
+		let mut t = store.begin().unwrap();
+		t.set(format!("post_{i}").as_bytes(), b"v").unwrap();
+		t.commit().await.unwrap();
+	}
+	let oracle = store.core.commit_pipeline.oracle();
+	assert!(
+		oracle.len() >= 4,
+		"post-checkpoint commits should be retained while reader pins watermark; got {}",
+		oracle.len()
+	);
+
+	// Drop the reader before restore — its `start_seq_num` references a future
+	// (post-checkpoint) seq that won't exist after the restore.
+	drop(reader);
+
+	// Restore from the checkpoint. The restored manifest's max_seq is 4, but
+	// the oracle just had entries at seqs 5..=8 — ghosts of the discarded
+	// future. After restore, the oracle map must be empty.
+	store.restore_from_checkpoint(&checkpoint_path).unwrap();
+	assert_eq!(oracle.len(), 0, "oracle should be empty after restore");
+
+	// A fresh commit at the post-restore start_seq must succeed.
+	let mut t = store.begin().unwrap();
+	t.set(b"post_restore", b"ok").unwrap();
 	assert!(t.commit().await.is_ok());
 }
 

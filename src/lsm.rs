@@ -83,7 +83,6 @@ pub trait CompactionOperations: Send + Sync {
 /// 1. `active_memtable` - serializes writes
 /// 2. `level_manifest` - SST metadata and table IDs
 /// 3. `immutable_memtables` - pending flush queue
-/// 4. `flushed_history` - conflict detection history
 ///
 /// Read locks and write locks follow the same ordering.
 /// If a function needs multiple locks, it must acquire them in this order.
@@ -104,13 +103,6 @@ pub(crate) struct CoreInner {
 	/// memtables continue serving reads while waiting for background threads
 	/// to flush them to disk as SSTables.
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
-
-	/// Most recently flushed memtable kept for conflict detection.
-	/// When a memtable is flushed to SST, it's moved here so that long-running
-	/// transactions can still detect conflicts against recently flushed data.
-	/// This prevents spurious TransactionRetry errors when immutable_memtables
-	/// becomes empty after a flush.
-	pub(crate) flushed_history: Arc<RwLock<Option<Arc<MemTable>>>>,
 
 	/// The level structure managing all SSTables on disk.
 	///
@@ -221,7 +213,6 @@ impl CoreInner {
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
-			flushed_history: Arc::new(RwLock::new(None)),
 		})
 	}
 
@@ -330,10 +321,9 @@ impl CoreInner {
 		);
 
 		// Step 4: Apply changeset atomically
-		// Lock order: level_manifest → immutable_memtables → flushed_history
+		// Lock order: level_manifest → immutable_memtables
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
-		let mut history_lock = self.flushed_history.write()?;
 
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
@@ -348,12 +338,13 @@ impl CoreInner {
 			return Err(error);
 		}
 
-		// Remove successfully flushed memtable from immutables tracking
+		// Remove successfully flushed memtable from immutables tracking. The
+		// Arc<MemTable> in `memtable` (function parameter) falls out of scope at
+		// end of function — its data is now available via the SST that was just
+		// added to the manifest, and conflict detection uses the in-memory oracle
+		// (independent of memtables), so dropping this Arc is safe.
 		memtable_lock.remove(table_id);
-
-		// Atomically add to flushed history for conflict detection
-		// This ensures no visibility gap where memtable is in neither collection
-		*history_lock = Some(memtable);
+		drop(memtable);
 
 		log::info!(
 			"Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
@@ -1623,8 +1614,12 @@ impl Tree {
 			None => manifest_last_seq,
 		};
 
-		// Set visible sequence number
+		// Set visible sequence number AND reset the oracle. The live process
+		// may have accumulated oracle entries from pre-restore commits whose
+		// seqs are now ghosts of a future that no longer exists; clearing them
+		// prevents false write-write conflicts for new post-restore txns.
 		self.core.commit_pipeline.set_seq_num(max_seq_num);
+		self.core.commit_pipeline.reset_oracle_for_restore(max_seq_num);
 
 		Ok(metadata)
 	}

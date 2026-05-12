@@ -226,11 +226,24 @@ impl CommitPipeline {
 		if seq_num > 0 {
 			self.visible_seq_num.store(seq_num, Ordering::Release);
 			self.log_seq_num.store(seq_num + 1, Ordering::Release);
-			// Seed the oracle: clear the map and set discard_below=seq_num.
-			// New txns post-recovery start at seq_num, so the strict
-			// `start_seq < discard_below` check accepts them.
-			self.oracle.seed(seq_num);
+			// NB: the oracle is intentionally NOT touched here. At process
+			// startup, a freshly-constructed oracle is already in the correct
+			// state (empty map, discard_below = 0). The `Tree::restore_from_checkpoint`
+			// path — which rewinds the seq counter mid-process — calls
+			// `reset_oracle_for_restore` separately to discard ghost entries.
 		}
+	}
+
+	/// Discard all oracle entries and set `discard_below = max_seq`.
+	///
+	/// Called from `Tree::restore_from_checkpoint` after the seq counter has
+	/// been rewound. The running process may have accumulated entries with
+	/// seqs that are now greater than the restored `max_seq`; those would
+	/// falsely conflict with new post-restore txns.
+	///
+	/// NOT called at startup — see `set_seq_num` above.
+	pub(crate) fn reset_oracle_for_restore(&self, max_seq: u64) {
+		self.oracle.reset_for_restore(max_seq);
 	}
 
 	pub(crate) async fn commit(&self, mut batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
@@ -830,6 +843,35 @@ mod tests {
 		// Sequence numbers: fails consumed 1-10, successes got 11-20
 		let visible = pipeline.get_visible_seq_num();
 		assert_eq!(visible, 20, "Expected visible_seq_num=20");
+
+		pipeline.shutdown();
+	}
+
+	/// When `apply()` fails, the commit pipeline must roll the oracle entries
+	/// for the failed batch back. Otherwise a subsequent same-key transaction
+	/// would false-abort against a "ghost" stamp left behind by a non-applied
+	/// commit. Verified directly against `CommitPipeline` with an injected
+	/// failure on the first apply.
+	#[test(tokio::test)]
+	async fn test_apply_failure_releases_oracle_entry() {
+		let env = Arc::new(FailNTimesEnv::new(1)); // First apply fails, then succeeds.
+		let pipeline = CommitPipeline::new(env, test_visible_seq_num(), test_write_stall());
+
+		// First commit on key K: apply fails. Oracle entry stamped at the
+		// allocated seq, then rolled back inside `commit()` on the apply error.
+		let mut batch = Batch::new(0);
+		batch.add_record(InternalKeyKind::Set, b"K".to_vec(), Some(b"v1".to_vec()), 0).unwrap();
+		let r1 = pipeline.commit(batch, false, 0).await;
+		assert!(r1.is_err(), "expected first apply to fail, got {r1:?}");
+		assert_eq!(pipeline.oracle().len(), 0, "rollback should have removed the entry");
+
+		// Second commit on the same key K with start_seq=0 (i.e. the same
+		// "old" snapshot the failed one was reasoning from). With rollback,
+		// the oracle is empty so this MUST succeed — no ghost conflict.
+		let mut batch = Batch::new(0);
+		batch.add_record(InternalKeyKind::Set, b"K".to_vec(), Some(b"v2".to_vec()), 0).unwrap();
+		let r2 = pipeline.commit(batch, false, 0).await;
+		assert!(r2.is_ok(), "second commit on K should succeed (no ghost), got {r2:?}");
 
 		pipeline.shutdown();
 	}
