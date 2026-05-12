@@ -51,10 +51,6 @@ fastrand = "2.0.1"
 divan = "0.1.14"
 test-log = "0.2.18"
 proptest = "1.4"
-ahash = "0.8"
-gxhash = "3"
-rustc-hash = "2"
-nohash-hasher = "0.2"
 
 [lints.clippy]
 
@@ -190,8 +186,4 @@ harness = false
 
 [[bench]]
 name = "alloc_bench"
-harness = false
-
-[[bench]]
-name = "oracle_hash_bench"
 harness = false
