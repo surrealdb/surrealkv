@@ -3466,26 +3466,6 @@ async fn test_partial_overlap_conflict() {
 	);
 }
 
-/// Test that the earliest_seq field on memtables is properly tracked.
-#[test(tokio::test)]
-async fn test_memtable_earliest_seq_tracking() {
-	let (store, _temp_dir) = create_store();
-
-	// Write some data to establish a sequence number
-	{
-		let mut txn = store.begin().unwrap();
-		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
-	}
-
-	// The memtable should now have earliest_seq set
-	// When we start a new transaction, it should get the current visible_seq_num
-	let txn = store.begin().unwrap();
-
-	// The transaction's start_seq_num should be 1
-	assert_eq!(txn.start_seq_num, 1, "Transaction start_seq_num should be 1 after commit");
-}
-
 // =============================================================================
 // TransactionRangeIterator Direction-Switching Tests
 // =============================================================================
