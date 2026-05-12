@@ -129,6 +129,13 @@ pub(crate) struct CoreInner {
 	/// snapshot-aware compaction.
 	pub(crate) snapshot_tracker: SnapshotTracker,
 
+	/// Tracker for ALL active transaction `start_seq_num`s. Used as the
+	/// watermark source for `CommitOracle` GC. Separate from
+	/// `snapshot_tracker` because write-only txns need GC protection but
+	/// don't hold MVCC snapshots, and the oracle's required watermark may
+	/// advance faster than snapshot retention permits.
+	pub(crate) active_txn_tracker: Arc<crate::active_txn_tracker::ActiveTxnTracker>,
+
 	/// Value Log (VLog)
 	pub(crate) vlog: Option<Arc<VLog>>,
 
@@ -208,6 +215,7 @@ impl CoreInner {
 			immutable_memtables,
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
+			active_txn_tracker: Arc::new(crate::active_txn_tracker::ActiveTxnTracker::new()),
 			vlog,
 			wal: WalManager::new(wal_instance),
 			versioned_index,
@@ -229,72 +237,23 @@ impl CoreInner {
 			.unwrap_or(0)
 	}
 
-	pub(crate) fn check_keys_conflict<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
-	where
-		I: Iterator<Item = &'a [u8]>,
-	{
-		// Lock order: active → immutables → history
-		// All three locks are held for the duration of both the earliest_seq check
-		// and the conflict detection to prevent races with background flushes.
-		let memtable = self.active_memtable.read()?;
-		let immutables = self.immutable_memtables.read()?;
-		let history = self.flushed_history.read()?;
-
-		// Check if memtable history is sufficient for conflict detection.
-		// This must be done while holding all locks to prevent a race where
-		// flushed_history is replaced between this check and the conflict scan.
-		let earliest_seq = if let Some(ref h) = *history {
-			h.earliest_seq()
-		} else if let Some(oldest) = immutables.first() {
-			oldest.memtable.earliest_seq()
-		} else {
-			memtable.earliest_seq()
-		};
-
-		if start_seq < earliest_seq {
-			return Err(Error::TransactionRetry);
+	/// Smallest `start_seq_num` of any currently-live transaction (read-write
+	/// snapshot OR write-only). Used by the `CommitOracle` as its GC
+	/// threshold: entries with `committed_seq < oldest_active_start_seq` can
+	/// be discarded because no live txn could prove non-conflict against them.
+	///
+	/// If no txns are alive, falls back to `visible_seq_num` — every future
+	/// txn will start at >= that value, so it's a safe upper bound on the
+	/// threshold.
+	pub(crate) fn oldest_active_start_seq(&self) -> u64 {
+		let snap = self.snapshot_tracker.first();
+		let txn = self.active_txn_tracker.oldest();
+		match (snap, txn) {
+			(Some(a), Some(b)) => a.min(b),
+			(Some(a), None) => a,
+			(None, Some(b)) => b,
+			(None, None) => self.visible_seq_num.load(std::sync::atomic::Ordering::Acquire),
 		}
-
-		for key in keys {
-			// Check active memtable first (most recent writes)
-			if let Some((ikey, _)) = memtable.get(key, None) {
-				if ikey.seq_num() > start_seq {
-					return Err(Error::TransactionWriteConflict);
-				}
-				// Key exists but was written before our transaction started - no conflict
-				continue;
-			}
-
-			// Check immutable memtables (newest to oldest by iterating in reverse)
-			let mut found_in_immutable = false;
-			for entry in immutables.iter().rev() {
-				if let Some((ikey, _)) = entry.memtable.get(key, None) {
-					if ikey.seq_num() > start_seq {
-						return Err(Error::TransactionWriteConflict);
-					}
-					// Key exists but was written before our transaction started - no conflict
-					found_in_immutable = true;
-					break;
-				}
-			}
-			if found_in_immutable {
-				continue;
-			}
-
-			// Check flushed history
-			if let Some(ref flushed) = *history {
-				if let Some((ikey, _)) = flushed.get(key, None) {
-					if ikey.seq_num() > start_seq {
-						return Err(Error::TransactionWriteConflict);
-					}
-					// Key exists but was written before our transaction started - no conflict
-				}
-			}
-			// Key not found in any memtable or history - no conflict for this key
-		}
-
-		// No conflicts found for any key
-		Ok(())
 	}
 
 	/// Flushes a memtable to SST and atomically updates the manifest.
@@ -1032,11 +991,8 @@ impl CommitEnv for LsmCommitEnv {
 		self.core.error_handler.check_error()
 	}
 
-	fn validate_write_conflicts(&self, batch: &Batch) -> Result<()> {
-		self.core.check_keys_conflict(
-			batch.entries.iter().map(|b| b.key.as_slice()),
-			batch.starting_seq_num,
-		)
+	fn oldest_active_start_seq(&self) -> u64 {
+		self.core.oldest_active_start_seq()
 	}
 }
 
@@ -1331,9 +1287,18 @@ impl Core {
 		Ok(core)
 	}
 
-	pub(crate) async fn commit(&self, batch: Batch, sync: bool) -> Result<()> {
-		// Commit the batch using the commit pipeline
-		self.commit_pipeline.commit(batch, sync).await
+	pub(crate) async fn commit(
+		&self,
+		batch: Batch,
+		sync: bool,
+		write_keys: Vec<Vec<u8>>,
+		start_seq: u64,
+	) -> Result<()> {
+		// Commit the batch using the commit pipeline. `write_keys` is the
+		// transaction's write set; the commit pipeline validates it against
+		// the oracle (atomically with seq allocation) and inserts entries
+		// under the same `write_mutex` critical section as WAL.
+		self.commit_pipeline.commit(batch, sync, write_keys, start_seq).await
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {

@@ -8,6 +8,7 @@ use tokio::sync::{oneshot, Semaphore};
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
+use crate::oracle::CommitOracle;
 use crate::stall::WriteStallController;
 
 const MAX_CONCURRENT_COMMITS: usize = 8;
@@ -25,9 +26,11 @@ pub trait CommitEnv: Send + Sync + 'static {
 	// Check for background errors before committing
 	fn check_background_error(&self) -> Result<()>;
 
-	// Validates that no key in our write set was modified after we started.
-	// Only checks memtables - returns TransactionRetry if history insufficient.
-	fn validate_write_conflicts(&self, batch: &Batch) -> Result<()>;
+	// Smallest `start_seq_num` of any currently-live transaction.
+	// Used by the commit oracle to compute its GC threshold under
+	// `write_mutex`. Implementations that don't run real transactions
+	// (test envs) may return 0.
+	fn oldest_active_start_seq(&self) -> u64;
 }
 
 // Lock-free commit queue entry
@@ -184,6 +187,11 @@ pub(crate) struct CommitPipeline {
 	env: Arc<dyn CommitEnv>,
 	log_seq_num: AtomicU64,
 	visible_seq_num: Arc<AtomicU64>,
+	// In-memory write-set conflict map. Updated under `write_mutex` atomically
+	// with seq allocation; queried under `write_mutex` before seq allocation.
+	// This is the source of truth for "has key K been committed at seq > S?",
+	// not the memtable — which is why `apply()` can run outside `write_mutex`.
+	oracle: Arc<CommitOracle>,
 	// Single producer - only one thread can write to WAL at a time
 	write_mutex: Mutex<()>,
 	// Lock-free single-producer, multi-consumer commit queue
@@ -205,6 +213,7 @@ impl CommitPipeline {
 			env,
 			log_seq_num: AtomicU64::new(1),
 			visible_seq_num,
+			oracle: Arc::new(CommitOracle::new()),
 			write_mutex: Mutex::new(()),
 			pending: CommitQueue::new(),
 			commit_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMITS - 1)),
@@ -217,10 +226,20 @@ impl CommitPipeline {
 		if seq_num > 0 {
 			self.visible_seq_num.store(seq_num, Ordering::Release);
 			self.log_seq_num.store(seq_num + 1, Ordering::Release);
+			// Seed the oracle: clear the map and set discard_below=seq_num.
+			// New txns post-recovery start at seq_num, so the strict
+			// `start_seq < discard_below` check accepts them.
+			self.oracle.seed(seq_num);
 		}
 	}
 
-	pub(crate) async fn commit(&self, mut batch: Batch, sync: bool) -> Result<()> {
+	pub(crate) async fn commit(
+		&self,
+		mut batch: Batch,
+		sync: bool,
+		write_keys: Vec<Vec<u8>>,
+		start_seq: u64,
+	) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
@@ -241,30 +260,65 @@ impl CommitPipeline {
 
 		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
 
-		// Atomically applying a batch of write operations to WAL and Memtable.
-		let apply_result = {
+		// === CRITICAL SECTION under write_mutex ===
+		//
+		// Atomically: validate write_keys against the oracle map, allocate
+		// the commit seq, insert oracle entries with that seq, enqueue, and
+		// write to WAL. The single-producer invariant on `pending` requires
+		// seq allocation and `enqueue` to be in the same critical section
+		// (otherwise the FIFO `dequeue_applied` invariant breaks).
+		//
+		// Memtable `apply()` is intentionally OUTSIDE this block — that is
+		// the throughput unlock. While T1 is applying, T2 can enter
+		// `write_mutex` and run validate + seq + oracle + WAL. This is the
+		// pipeline-overlap pattern Pebble uses and that surrealkv used
+		// before PR #378.
+		let processed_batch_result = {
 			let _guard = self.write_mutex.lock();
 
-			// Validate write-write conflict.
-			self.env.validate_write_conflicts(&batch)?;
+			// 1. Validate against the oracle. Returns:
+			//    - TransactionWriteConflict if any key was committed at seq > start_seq.
+			//    - TransactionRetry if start_seq < discard_below (window GC'd).
+			if let Err(e) = self.oracle.check(write_keys.iter().map(|k| k.as_slice()), start_seq) {
+				Err(e)
+			} else {
+				let count = batch.count() as u64;
+				let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
 
-			let count = batch.count() as u64;
-			let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
+				// 2. Publish the oracle entries with the allocated seq. Stamp = seq_num + count - 1
+				//    (highest in batch).
+				let oldest_active = self.env.oldest_active_start_seq();
+				self.oracle.publish(
+					write_keys.iter().map(|k| k.as_slice()),
+					seq_num,
+					count,
+					oldest_active,
+				);
 
-			// Set sequence numbers in commit batch
-			commit_batch.set_seq_num(seq_num);
-			// Update starting sequence number in batch
-			batch.set_starting_seq_num(seq_num);
+				// 3. Stamp the commit_batch & batch.
+				commit_batch.set_seq_num(seq_num);
+				batch.set_starting_seq_num(seq_num);
 
-			// Enqueue operation (single producer)
-			self.pending.enqueue(Arc::clone(&commit_batch));
+				// 4. Enqueue (single producer, same critical section as seq alloc).
+				self.pending.enqueue(Arc::clone(&commit_batch));
 
-			// Write to WAL and process VLog (serialized under lock)
-			let processed_batch = self.env.write(&batch, seq_num, sync)?;
-
-			// Apply batch to memtable
-			self.env.apply(&processed_batch)
+				// 5. WAL + VLog (serialized under lock).
+				self.env.write(&batch, seq_num, sync)
+			}
 		};
+		// === END CRITICAL SECTION ===
+
+		// Bail early on pre-apply errors (validation conflict, WAL failure).
+		// In these cases nothing was enqueued, so there is no zombie batch
+		// to drain. The semaphore permit drops at end of function.
+		let processed_batch = match processed_batch_result {
+			Ok(b) => b,
+			Err(e) => return Err(e),
+		};
+
+		// 6. Memtable apply — OUTSIDE write_mutex. The next committer can already be inside the
+		//    critical section. This restores the pipeline overlap that PR #378 destroyed.
+		let apply_result = self.env.apply(&processed_batch);
 
 		// =========================================================================
 		// NOTE: We mark batch as applied and call publish(), even on failure.
@@ -282,16 +336,13 @@ impl CommitPipeline {
 		//   maintaining the condition: batches_in_queue <= permits_held < queue_capacity
 		//
 		// LIMITATION - SEQUENCE NUMBER GAPS:
-		//   Sequence numbers are allocated in prepare() before apply() is called.
+		//   Sequence numbers are allocated before apply() is called.
 		//   When apply() fails, those sequence numbers are not used but also cannot
-		//   be reclaimed. Example:
-		//
-		//     Batch A: seq 1-3, apply succeeds → entries 1,2,3 exist in memtable
-		//     Batch B: seq 4-6, apply FAILS    → entries 4,5,6 do NOT exist
-		//     Batch C: seq 7-9, apply succeeds → entries 7,8,9 exist in memtable
-		//     visible_seq_num: 3 → 6 → 9
-		//
-		//   Entries for sequence numbers 4,5,6 do not exist in the memtable.
+		//   be reclaimed. Same for the oracle entries: they remain stamped at the
+		//   reserved seq even if apply fails. This is intentional — the alternative
+		//   (rolling back oracle entries on apply failure) races with concurrent
+		//   committers and complicates correctness reasoning. WAL is durable on
+		//   apply failure, so on restart WAL replay rebuilds the memtable state.
 		// =========================================================================
 
 		commit_batch.mark_applied();
@@ -315,6 +366,11 @@ impl CommitPipeline {
 
 		// Wait for completion
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
+	}
+
+	#[cfg(test)]
+	pub(crate) fn oracle(&self) -> &Arc<CommitOracle> {
+		&self.oracle
 	}
 
 	fn publish(&self) {
@@ -432,8 +488,8 @@ mod tests {
 			Ok(())
 		}
 
-		fn validate_write_conflicts(&self, _batch: &Batch) -> Result<()> {
-			Ok(())
+		fn oldest_active_start_seq(&self) -> u64 {
+			0
 		}
 	}
 
@@ -447,7 +503,7 @@ mod tests {
 			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
 			.unwrap();
 
-		let result = pipeline.commit(batch, false).await;
+		let result = pipeline.commit(batch, false, Vec::new(), 0).await;
 		assert!(result.is_ok(), "Single commit failed: {result:?}");
 
 		let visible = pipeline.get_visible_seq_num();
@@ -475,7 +531,7 @@ mod tests {
 					i,
 				)
 				.unwrap();
-			let result = pipeline.commit(batch, false).await;
+			let result = pipeline.commit(batch, false, Vec::new(), 0).await;
 			assert!(result.is_ok(), "Sequential commit {i} failed: {result:?}");
 		}
 
@@ -502,7 +558,7 @@ mod tests {
 						i,
 					)
 					.unwrap();
-				pipeline.commit(batch, false).await
+				pipeline.commit(batch, false, Vec::new(), 0).await
 			});
 			handles.push(handle);
 		}
@@ -558,8 +614,8 @@ mod tests {
 			Ok(())
 		}
 
-		fn validate_write_conflicts(&self, _batch: &Batch) -> Result<()> {
-			Ok(())
+		fn oldest_active_start_seq(&self) -> u64 {
+			0
 		}
 	}
 
@@ -584,7 +640,7 @@ mod tests {
 						i,
 					)
 					.unwrap();
-				pipeline.commit(batch, false).await
+				pipeline.commit(batch, false, Vec::new(), 0).await
 			});
 			handles.push(handle);
 		}
@@ -641,8 +697,8 @@ mod tests {
 			Ok(())
 		}
 
-		fn validate_write_conflicts(&self, _batch: &Batch) -> Result<()> {
-			Ok(())
+		fn oldest_active_start_seq(&self) -> u64 {
+			0
 		}
 	}
 
@@ -669,7 +725,7 @@ mod tests {
 				)
 				.unwrap();
 
-			let result = pipeline.commit(batch, false).await;
+			let result = pipeline.commit(batch, false, Vec::new(), 0).await;
 			assert!(result.is_err(), "Expected error at iteration {i}");
 		}
 
@@ -722,8 +778,8 @@ mod tests {
 			Ok(())
 		}
 
-		fn validate_write_conflicts(&self, _batch: &Batch) -> Result<()> {
-			Ok(())
+		fn oldest_active_start_seq(&self) -> u64 {
+			0
 		}
 	}
 
@@ -748,7 +804,7 @@ mod tests {
 				)
 				.unwrap();
 
-			let result = pipeline.commit(batch, false).await;
+			let result = pipeline.commit(batch, false, Vec::new(), 0).await;
 
 			if i < fail_count {
 				assert!(result.is_err(), "Expected error at iteration {i}");
