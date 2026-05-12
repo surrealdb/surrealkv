@@ -103,7 +103,7 @@ impl RecoveryTestHelper {
 	/// Get manifest log number (using internal access for testing)
 	pub fn get_manifest_log_number(tree: &Tree) -> u64 {
 		// Access through the deref'd inner Core fields
-		tree.core.level_manifest.read().unwrap().get_log_number()
+		tree.core.level_manifest.read().get_log_number()
 	}
 }
 

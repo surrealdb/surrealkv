@@ -4,7 +4,9 @@ use std::fs::create_dir_all;
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
+
+use parking_lot::RwLock;
 
 use crate::batch::Batch;
 use crate::bplustree::tree::DiskBPlusTree;
@@ -219,14 +221,11 @@ impl CoreInner {
 	}
 
 	pub(crate) fn immutable_count(&self) -> usize {
-		self.immutable_memtables.read().map(|imm| imm.iter().count()).unwrap_or(0)
+		self.immutable_memtables.read().iter().count()
 	}
 
 	pub(crate) fn l0_file_count(&self) -> usize {
-		self.level_manifest
-			.read()
-			.map(|m| m.levels.get_levels().first().map(|l| l.tables.len()).unwrap_or(0))
-			.unwrap_or(0)
+		self.level_manifest.read().levels.get_levels().first().map(|l| l.tables.len()).unwrap_or(0)
 	}
 
 	pub(crate) fn check_keys_conflict<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
@@ -236,9 +235,9 @@ impl CoreInner {
 		// Lock order: active → immutables → history
 		// All three locks are held for the duration of both the earliest_seq check
 		// and the conflict detection to prevent races with background flushes.
-		let memtable = self.active_memtable.read()?;
-		let immutables = self.immutable_memtables.read()?;
-		let history = self.flushed_history.read()?;
+		let memtable = self.active_memtable.read();
+		let immutables = self.immutable_memtables.read();
+		let history = self.flushed_history.read();
 
 		// Check if memtable history is sufficient for conflict detection.
 		// This must be done while holding all locks to prevent a race where
@@ -373,9 +372,9 @@ impl CoreInner {
 
 		// Step 4: Apply changeset atomically
 		// Lock order: level_manifest → immutable_memtables → flushed_history
-		let mut manifest = self.level_manifest.write()?;
-		let mut memtable_lock = self.immutable_memtables.write()?;
-		let mut history_lock = self.flushed_history.write()?;
+		let mut manifest = self.level_manifest.write();
+		let mut memtable_lock = self.immutable_memtables.write();
+		let mut history_lock = self.flushed_history.write();
 
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
@@ -420,7 +419,7 @@ impl CoreInner {
 	/// The actual SST flush happens asynchronously via background task.
 	pub(crate) fn rotate_memtable(&self) -> Result<()> {
 		// Step 1: Acquire WRITE lock upfront to prevent race conditions
-		let mut active_memtable = self.active_memtable.write()?;
+		let mut active_memtable = self.active_memtable.write();
 
 		if active_memtable.is_empty() {
 			return Ok(());
@@ -464,8 +463,8 @@ impl CoreInner {
 		//   Thread A (rotate): holds imm.write, waits manifest.read
 		//   Thread B (flush):  holds manifest.write, waits imm.write
 		// By acquiring manifest.read first, we ensure no circular wait.
-		let table_id = self.level_manifest.read()?.next_table_id();
-		let mut immutable_memtables = self.immutable_memtables.write()?;
+		let table_id = self.level_manifest.read().next_table_id();
+		let mut immutable_memtables = self.immutable_memtables.write();
 		immutable_memtables.add(table_id, flushed_wal_number, Arc::clone(&flushed_memtable));
 
 		// Release locks
@@ -491,7 +490,7 @@ impl CoreInner {
 	fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
 		// Get the oldest immutable entry (clone to release lock before I/O)
 		let entry = {
-			let guard = self.immutable_memtables.read()?;
+			let guard = self.immutable_memtables.read();
 			guard.first().cloned()
 		};
 
@@ -505,7 +504,7 @@ impl CoreInner {
 
 		// Skip empty memtables
 		if entry.memtable.is_empty() {
-			let mut guard = self.immutable_memtables.write()?;
+			let mut guard = self.immutable_memtables.write();
 			guard.remove(entry.table_id);
 			log::debug!(
 				"flush_oldest_immutable_to_sst: skipped empty memtable table_id={}",
@@ -600,7 +599,7 @@ impl CoreInner {
 		flushed_wal_number: Option<u64>,
 	) -> Result<Option<Arc<Table>>> {
 		// Step 1: Atomically swap active memtable with a new empty one
-		let mut active_memtable = self.active_memtable.write()?;
+		let mut active_memtable = self.active_memtable.write();
 
 		// Don't flush an empty memtable
 		if active_memtable.is_empty() {
@@ -610,9 +609,9 @@ impl CoreInner {
 		// LOCK ORDER: Get table_id from manifest BEFORE acquiring immutable_memtables lock.
 		// This maintains consistent ordering: active -> level_manifest -> immutable_memtables
 		// which matches flush_immutable_to_sst() and prevents deadlock with background flush.
-		let table_id = self.level_manifest.read()?.next_table_id();
+		let table_id = self.level_manifest.read().next_table_id();
 
-		let mut immutable_memtables = self.immutable_memtables.write()?;
+		let mut immutable_memtables = self.immutable_memtables.write();
 
 		// Get the current WAL number for the new memtable
 		let current_wal_number = self.wal.read().get_active_log_number();
@@ -688,7 +687,7 @@ impl CoreInner {
 		// STEP 1: Flush ALL immutable memtables FIRST (older data, lower table_ids)
 		// We need to collect them first to avoid holding the lock during I/O
 		let immutables_to_flush: Vec<ImmutableEntry> = {
-			let immutable_guard = self.immutable_memtables.read()?;
+			let immutable_guard = self.immutable_memtables.read();
 			immutable_guard.iter().cloned().collect()
 		};
 
@@ -709,7 +708,7 @@ impl CoreInner {
 		for entry in immutables_to_flush {
 			if entry.memtable.is_empty() {
 				// Skip empty memtables - just remove from tracking
-				let mut immutable_guard = self.immutable_memtables.write()?;
+				let mut immutable_guard = self.immutable_memtables.write();
 				immutable_guard.remove(entry.table_id);
 				log::debug!("Skipped empty immutable memtable: table_id={}", entry.table_id);
 				continue;
@@ -738,7 +737,7 @@ impl CoreInner {
 		}
 
 		// STEP 2: Flush active memtable LAST (newest data, gets highest table_id)
-		let active_memtable = self.active_memtable.read()?;
+		let active_memtable = self.active_memtable.read();
 		let active_size = active_memtable.size();
 		let active_is_empty = active_memtable.is_empty();
 		drop(active_memtable);
@@ -775,7 +774,7 @@ impl CoreInner {
 					..Default::default()
 				};
 
-				let mut manifest = self.level_manifest.write()?;
+				let mut manifest = self.level_manifest.write();
 				let rollback = manifest.apply_changeset(&changeset)?;
 				if let Err(e) = write_manifest_to_disk(&manifest) {
 					manifest.revert_changeset(rollback);
@@ -814,7 +813,7 @@ impl CoreInner {
 		}
 
 		// Get all table IDs from manifest
-		let manifest = self.level_manifest.read()?;
+		let manifest = self.level_manifest.read();
 		let live_tables = manifest.get_all_tables();
 		let live_table_ids: HashSet<u64> = live_tables.keys().copied().collect();
 		drop(manifest);
@@ -876,7 +875,7 @@ impl CoreInner {
 			return Ok(()); // No VLog, nothing to clean up
 		}
 
-		let manifest = self.level_manifest.read()?;
+		let manifest = self.level_manifest.read();
 		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
 
 		// If no SSTs reference VLog files yet, keep all files
@@ -935,7 +934,7 @@ impl CompactionOperations for CoreInner {
 	}
 
 	fn has_pending_immutables(&self) -> bool {
-		self.immutable_memtables.read().map(|guard| !guard.is_empty()).unwrap_or(false)
+		!self.immutable_memtables.read().is_empty()
 	}
 }
 
@@ -1002,7 +1001,7 @@ impl CommitEnv for LsmCommitEnv {
 	fn apply(&self, batch: &Batch) -> Result<()> {
 		// Try to add to current memtable
 		let result = {
-			let active_memtable = self.core.active_memtable.read()?;
+			let active_memtable = self.core.active_memtable.read();
 			active_memtable.add(batch)
 		};
 
@@ -1020,7 +1019,7 @@ impl CommitEnv for LsmCommitEnv {
 				}
 
 				// Retry on new memtable - must succeed
-				let active_memtable = self.core.active_memtable.read()?;
+				let active_memtable = self.core.active_memtable.read();
 				active_memtable.add(batch)
 			}
 			Err(e) => Err(e),
@@ -1232,8 +1231,8 @@ impl Core {
 		let wal_path = opts.wal_dir();
 
 		// Get min_wal_number from manifest to skip already-flushed WALs
-		let min_wal_number = inner.level_manifest.read()?.get_log_number();
-		let manifest_last_seq = inner.level_manifest.read()?.get_last_sequence();
+		let min_wal_number = inner.level_manifest.read().get_log_number();
+		let manifest_last_seq = inner.level_manifest.read().get_last_sequence();
 
 		log::info!(
 			"Manifest state: log_number={}, last_sequence={}",
@@ -1250,7 +1249,7 @@ impl Core {
 			opts.max_memtable_size,
 			|memtable, wal_number| {
 				// Flush intermediate memtable to SST during recovery
-				let table_id = inner.level_manifest.read()?.next_table_id();
+				let table_id = inner.level_manifest.read().next_table_id();
 				inner.flush_immutable_to_sst(Arc::clone(&memtable), table_id, wal_number)?;
 				log::info!(
 					"Recovery: flushed memtable to SST table_id={}, wal_number={}",
@@ -1263,19 +1262,19 @@ impl Core {
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
-			let mut active_memtable = inner.active_memtable.write()?;
+			let mut active_memtable = inner.active_memtable.write();
 			*active_memtable = memtable;
 		}
 
 		// Ensure the active memtable has the correct WAL number set
 		{
-			let active_memtable = inner.active_memtable.read()?;
+			let active_memtable = inner.active_memtable.read();
 			let current_wal_number = inner.wal.read().get_active_log_number();
 			active_memtable.set_wal_number(current_wal_number);
 		}
 
 		// Get last_sequence from manifest
-		let manifest_last_seq = inner.level_manifest.read()?.get_last_sequence();
+		let manifest_last_seq = inner.level_manifest.read().get_last_sequence();
 
 		// Determine effective sequence number:
 		// - If WAL was replayed, use max(manifest, WAL)
@@ -1435,7 +1434,7 @@ impl Core {
 		// When memtable flush sets log_number = current_wal + 1, cleanup would delete
 		// the active WAL if done before closing it.
 		let wal_dir = self.inner.wal.read().get_dir_path().to_path_buf();
-		let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
+		let min_wal_to_keep = self.inner.level_manifest.read().get_log_number();
 
 		log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
 
@@ -1463,7 +1462,7 @@ impl Core {
 		lockfile.release()?;
 
 		// Log final state
-		let final_manifest = self.inner.level_manifest.read()?;
+		let final_manifest = self.inner.level_manifest.read();
 		log::info!(
 			"=== LSM tree shutdown complete === log_number={}, last_sequence={}",
 			final_manifest.get_log_number(),
@@ -1586,7 +1585,7 @@ impl Tree {
 
 		// Replace the current levels with the reloaded ones
 		{
-			let mut levels_guard = self.core.inner.level_manifest.write()?;
+			let mut levels_guard = self.core.inner.level_manifest.write();
 			*levels_guard = new_levels;
 		}
 
@@ -1594,19 +1593,19 @@ impl Tree {
 		// This discards any pending writes, which is correct for restore operations
 		{
 			let earliest_seq = self.core.inner.visible_seq_num.load(Ordering::Acquire);
-			let mut active_memtable = self.core.inner.active_memtable.write()?;
+			let mut active_memtable = self.core.inner.active_memtable.write();
 			*active_memtable =
 				Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size, earliest_seq));
 		}
 
 		{
-			let mut immutable_memtables = self.core.inner.immutable_memtables.write()?;
+			let mut immutable_memtables = self.core.inner.immutable_memtables.write();
 			*immutable_memtables = ImmutableMemtables::default();
 		}
 
 		// Reopen the WAL from the restored directory
 		let wal_path = self.core.inner.opts.path.join("wal");
-		let manifest_log_number = self.core.inner.level_manifest.read()?.get_log_number();
+		let manifest_log_number = self.core.inner.level_manifest.read().get_log_number();
 
 		{
 			let mut wal_guard = self.core.inner.wal.write();
@@ -1627,7 +1626,7 @@ impl Tree {
 			self.core.inner.opts.max_memtable_size,
 			|memtable, wal_number| {
 				// Flush intermediate memtable to SST during recovery
-				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
+				let table_id = self.core.inner.level_manifest.read().next_table_id();
 				self.core.inner.flush_immutable_to_sst(
 					Arc::clone(&memtable),
 					table_id,
@@ -1644,19 +1643,19 @@ impl Tree {
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
-			let mut active_memtable = self.core.inner.active_memtable.write()?;
+			let mut active_memtable = self.core.inner.active_memtable.write();
 			*active_memtable = memtable;
 		}
 
 		// Ensure the active memtable has the correct WAL number set
 		{
-			let active_memtable = self.core.inner.active_memtable.read()?;
+			let active_memtable = self.core.inner.active_memtable.read();
 			let current_wal_number = self.core.inner.wal.read().get_active_log_number();
 			active_memtable.set_wal_number(current_wal_number);
 		}
 
 		// Get last_sequence from manifest
-		let manifest_last_seq = self.core.inner.level_manifest.read()?.get_last_sequence();
+		let manifest_last_seq = self.core.inner.level_manifest.read().get_last_sequence();
 
 		// Determine effective sequence number (same logic as Core::new)
 		let max_seq_num = match wal_seq_num_opt {
@@ -1680,7 +1679,7 @@ impl Tree {
 	pub(crate) fn flush(&self) -> Result<()> {
 		// Step 1: Rotate active memtable if it has data
 		{
-			let active = self.core.inner.active_memtable.read()?;
+			let active = self.core.inner.active_memtable.read();
 			if !active.is_empty() {
 				drop(active); // Release read lock before acquiring write lock
 				self.core.inner.rotate_memtable()?;

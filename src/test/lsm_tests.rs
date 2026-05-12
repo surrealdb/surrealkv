@@ -203,7 +203,7 @@ async fn test_memtable_flush_with_multiple_keys_and_updates() {
 	}
 
 	// Verify the LSM state: we should have multiple SSTables
-	let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+	let l0_size = tree.core.level_manifest.read().levels.get_levels()[0].tables.len();
 	assert!(l0_size > 0, "Expected SSTables in L0, got {l0_size}");
 }
 
@@ -255,7 +255,7 @@ async fn test_persistence() {
 		expected_values = values;
 
 		// Verify L0 has tables before closing
-		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+		let l0_size = tree.core.level_manifest.read().levels.get_levels()[0].tables.len();
 		assert!(l0_size > 0, "Expected SSTables in L0 before closing, got {l0_size}");
 
 		// Tree will be dropped here, closing the store
@@ -267,7 +267,7 @@ async fn test_persistence() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Verify L0 has tables after reopening
-		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+		let l0_size = tree.core.level_manifest.read().levels.get_levels()[0].tables.len();
 		assert!(l0_size > 0, "Expected SSTables in L0 after reopening, got {l0_size}");
 
 		// Verify all keys have their final values
@@ -1643,12 +1643,12 @@ async fn test_table_id_assignment_across_restart() {
 		tree.flush().unwrap();
 
 		// Verify we have 2 tables in L0
-		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+		let l0_size = tree.core.level_manifest.read().levels.get_levels()[0].tables.len();
 		assert_eq!(l0_size, 2, "Expected 2 tables in L0 after initial writes, got {l0_size}");
 
 		// Get the table IDs from the first session
 		let (table1_id, table2_id, next_table_id) = {
-			let manifest = tree.core.level_manifest.read().unwrap();
+			let manifest = tree.core.level_manifest.read();
 			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
 			let next_table_id = manifest.next_table_id();
@@ -1676,11 +1676,10 @@ async fn test_table_id_assignment_across_restart() {
 
 		{
 			// Verify we still have 2 tables in L0 after reopening
-			let l0_size =
-				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+			let l0_size = tree.core.level_manifest.read().levels.get_levels()[0].tables.len();
 			assert_eq!(l0_size, 2, "Expected 2 tables in L0 after reopening, got {l0_size}");
 			// Get the table IDs after reopening
-			let manifest = tree.core.level_manifest.read().unwrap();
+			let manifest = tree.core.level_manifest.read();
 			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
 			let next_table_id = manifest.next_table_id();
@@ -1711,12 +1710,11 @@ async fn test_table_id_assignment_across_restart() {
 
 		{
 			// Verify we now have 3 tables in L0
-			let l0_size =
-				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+			let l0_size = tree.core.level_manifest.read().levels.get_levels()[0].tables.len();
 			assert_eq!(l0_size, 3, "Expected 3 tables in L0 after adding more data, got {l0_size}");
 
 			// Get the table IDs from all 3 tables
-			let manifest = tree.core.level_manifest.read().unwrap();
+			let manifest = tree.core.level_manifest.read();
 			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
 			let table3_id = manifest.levels.get_levels()[0].tables[2].id;
@@ -1759,11 +1757,11 @@ async fn test_table_id_assignment_across_restart() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Verify we still have 3 tables
-		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+		let l0_size = tree.core.level_manifest.read().levels.get_levels()[0].tables.len();
 		assert_eq!(l0_size, 3, "Expected 3 tables in L0 after final reopen, got {l0_size}");
 
 		// Verify table IDs are still in correct order (newer tables first)
-		let manifest = tree.core.level_manifest.read().unwrap();
+		let manifest = tree.core.level_manifest.read();
 		let table1_id = manifest.levels.get_levels()[0].tables[0].id;
 		let table2_id = manifest.levels.get_levels()[0].tables[1].id;
 		let table3_id = manifest.levels.get_levels()[0].tables[2].id;
@@ -2184,7 +2182,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 		let inner = Arc::new(CoreInner::new(Arc::clone(&opts)).unwrap());
 
 		// Before WAL replay, memtable should be empty
-		let memtable_before = inner.active_memtable.read().unwrap().clone();
+		let memtable_before = inner.active_memtable.read().clone();
 		assert!(memtable_before.is_empty(), "Memtable should be empty before WAL replay");
 
 		// Now do WAL replay
@@ -2261,7 +2259,7 @@ async fn test_log_number_advances_with_flushes() {
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 	// Initial log_number
-	let log_number_0 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	let log_number_0 = tree.core.inner.level_manifest.read().get_log_number();
 
 	// Write data to trigger flush #1
 	for i in 0..100 {
@@ -2272,7 +2270,7 @@ async fn test_log_number_advances_with_flushes() {
 
 	// Force flush
 	tree.flush().unwrap();
-	let log_number_1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	let log_number_1 = tree.core.inner.level_manifest.read().get_log_number();
 	assert!(log_number_1 > log_number_0, "log_number should advance after flush");
 
 	// Write more data, trigger flush #2
@@ -2283,7 +2281,7 @@ async fn test_log_number_advances_with_flushes() {
 	}
 
 	tree.flush().unwrap();
-	let log_number_2 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	let log_number_2 = tree.core.inner.level_manifest.read().get_log_number();
 	assert!(log_number_2 > log_number_1, "log_number should advance after second flush");
 
 	tree.close().await.unwrap();
@@ -2315,7 +2313,7 @@ async fn test_last_sequence_persists_across_restart() {
 		tree.flush().unwrap();
 
 		// Get last_sequence from manifest
-		expected_last_seq = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		expected_last_seq = tree.core.inner.level_manifest.read().get_last_sequence();
 		assert!(expected_last_seq > 0, "last_sequence should be > 0 after flush");
 
 		tree.close().await.unwrap();
@@ -2324,7 +2322,7 @@ async fn test_last_sequence_persists_across_restart() {
 	// Phase 2: Reopen and verify last_sequence persisted
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let loaded_last_seq = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		let loaded_last_seq = tree.core.inner.level_manifest.read().get_last_sequence();
 
 		assert_eq!(
 			loaded_last_seq, expected_last_seq,
@@ -2384,7 +2382,7 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		let in_memory_seq = tree.core.seq_num();
 
 		// Manifest sequence should still be from Phase 1
-		let manifest_seq = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		let manifest_seq = tree.core.inner.level_manifest.read().get_last_sequence();
 		assert_eq!(
 			manifest_seq, manifest_seq_initial,
 			"Manifest last_sequence should not be updated until flush (from Phase 2 crash)"
@@ -2400,8 +2398,7 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 
 		// Now flush and verify manifest gets updated
 		tree.flush().unwrap();
-		let manifest_seq_after_flush =
-			tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		let manifest_seq_after_flush = tree.core.inner.level_manifest.read().get_last_sequence();
 		assert!(
 			manifest_seq_after_flush >= in_memory_seq,
 			"Manifest last_sequence should update after flush"
@@ -2487,7 +2484,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 			txn.commit().await.unwrap();
 		}
 		tree.flush().unwrap();
-		let log_num_1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let log_num_1 = tree.core.inner.level_manifest.read().get_log_number();
 
 		// Flush cycle 2
 		for i in 0..50 {
@@ -2496,7 +2493,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 			txn.commit().await.unwrap();
 		}
 		tree.flush().unwrap();
-		let log_num_2 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let log_num_2 = tree.core.inner.level_manifest.read().get_log_number();
 
 		// Flush cycle 3
 		for i in 0..50 {
@@ -2505,7 +2502,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 			txn.commit().await.unwrap();
 		}
 		tree.flush().unwrap();
-		let log_num_3 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let log_num_3 = tree.core.inner.level_manifest.read().get_log_number();
 
 		assert!(log_num_2 > log_num_1, "log_number should advance");
 		assert!(log_num_3 > log_num_2, "log_number should advance");
@@ -2544,8 +2541,8 @@ async fn test_shutdown_with_empty_memtable() {
 		tree.flush().unwrap();
 
 		// Get manifest state
-		let log_number_before = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-		let last_seq_before = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		let log_number_before = tree.core.inner.level_manifest.read().get_log_number();
+		let last_seq_before = tree.core.inner.level_manifest.read().get_last_sequence();
 
 		// Shutdown with empty memtable
 		tree.close().await.unwrap();
@@ -2597,7 +2594,7 @@ async fn test_full_crash_recovery_scenario() {
 		tree.flush().unwrap();
 
 		// Get log_number after second flush
-		let log_number_after_b = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let log_number_after_b = tree.core.inner.level_manifest.read().get_log_number();
 		assert!(log_number_after_b >= 2, "Should have rotated WAL at least twice");
 
 		tree.close().await.unwrap();
@@ -2775,7 +2772,7 @@ async fn test_wal_append_after_crash_recovery() {
 		txn.set(b"key1", b"value1").unwrap();
 		txn.commit().await.unwrap();
 
-		let manifest_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let manifest_log = tree.core.inner.level_manifest.read().get_log_number();
 
 		// Simulate crash: drop without close (but release lock)
 		{
@@ -2920,7 +2917,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		let sst_after = count_ssts();
 
 		{
-			let manifest = tree.core.inner.level_manifest.read().unwrap();
+			let manifest = tree.core.inner.level_manifest.read();
 			drop(manifest);
 		}
 
@@ -2952,7 +2949,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		let sst_after = count_ssts();
 
 		{
-			let manifest = tree.core.inner.level_manifest.read().unwrap();
+			let manifest = tree.core.inner.level_manifest.read();
 
 			assert!(sst_after > sst_before, "Second flush should create more SST");
 			assert!(manifest.get_log_number() > log_num_before, "log_number should advance");
@@ -3032,7 +3029,16 @@ async fn test_close_without_flush() {
 		}
 
 		// Count SSTs before close
-		sst_count_before = tree.core.inner.level_manifest.read().as_ref().iter().count();
+		sst_count_before = tree
+			.core
+			.inner
+			.level_manifest
+			.read()
+			.levels
+			.get_levels()
+			.iter()
+			.map(|l| l.tables.len())
+			.sum::<usize>();
 
 		// Close without flush (flush_on_close=false)
 		tree.close().await.unwrap();
@@ -3041,7 +3047,16 @@ async fn test_close_without_flush() {
 	// Reopen and verify SST count hasn't changed
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let sst_count_after = tree.core.inner.level_manifest.read().as_ref().iter().count();
+		let sst_count_after = tree
+			.core
+			.inner
+			.level_manifest
+			.read()
+			.levels
+			.get_levels()
+			.iter()
+			.map(|l| l.tables.len())
+			.sum::<usize>();
 
 		assert_eq!(
 			sst_count_after, sst_count_before,
@@ -3072,13 +3087,13 @@ async fn test_flush_on_close_option_comparison() {
 			txn.set(b"test", b"data").unwrap();
 			txn.commit().await.unwrap();
 
-			sst_before = tree.core.inner.level_manifest.read().unwrap().iter().count();
+			sst_before = tree.core.inner.level_manifest.read().iter().count();
 
 			tree.close().await.unwrap();
 		}
 
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let sst_after = tree.core.inner.level_manifest.read().unwrap().iter().count();
+		let sst_after = tree.core.inner.level_manifest.read().iter().count();
 
 		assert_eq!(sst_after, sst_before + 1, "flush_on_close=true should create SST");
 		tree.close().await.unwrap();
@@ -3098,13 +3113,13 @@ async fn test_flush_on_close_option_comparison() {
 			txn.set(b"test", b"data").unwrap();
 			txn.commit().await.unwrap();
 
-			sst_before = tree.core.inner.level_manifest.read().unwrap().iter().count();
+			sst_before = tree.core.inner.level_manifest.read().iter().count();
 
 			tree.close().await.unwrap();
 		}
 
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let sst_after = tree.core.inner.level_manifest.read().unwrap().iter().count();
+		let sst_after = tree.core.inner.level_manifest.read().iter().count();
 
 		assert_eq!(sst_after, sst_before, "flush_on_close=false should NOT create SST");
 
@@ -3272,20 +3287,20 @@ async fn test_sst_table_ids_ordered_correctly_on_close() {
 		}
 
 		// Get initial table count
-		let initial_count = tree.core.inner.level_manifest.read().unwrap().iter().count();
+		let initial_count = tree.core.inner.level_manifest.read().iter().count();
 
 		// Close triggers flush
 		tree.close().await.unwrap();
 
 		// Reopen and verify table count increased
 		let tree2 = Tree::new(Arc::clone(&opts)).unwrap();
-		let after_count = tree2.core.inner.level_manifest.read().unwrap().iter().count();
+		let after_count = tree2.core.inner.level_manifest.read().iter().count();
 
 		assert_eq!(after_count, initial_count + 1, "Should have one more SST after close flush");
 
 		// Verify table_ids are in ascending order
 		{
-			let manifest = tree2.core.inner.level_manifest.read().unwrap();
+			let manifest = tree2.core.inner.level_manifest.read();
 			let mut prev_id = 0u64;
 			for table in manifest.iter() {
 				assert!(
@@ -3317,8 +3332,8 @@ async fn test_wal_number_tracking_on_flush() {
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 	// Get initial state
-	let initial_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-	let initial_wal_number = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+	let initial_log_number = tree.core.inner.level_manifest.read().get_log_number();
+	let initial_wal_number = tree.core.inner.active_memtable.read().get_wal_number();
 	log::info!(
 		"Initial state: log_number={}, wal_number={}",
 		initial_log_number,
@@ -3334,7 +3349,7 @@ async fn test_wal_number_tracking_on_flush() {
 	tree.flush().unwrap();
 
 	// Verify log_number increased to wal_number + 1
-	let after_flush_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	let after_flush_log = tree.core.inner.level_manifest.read().get_log_number();
 	assert_eq!(
 		after_flush_log,
 		initial_wal_number + 1,
@@ -3342,7 +3357,7 @@ async fn test_wal_number_tracking_on_flush() {
 	);
 
 	// Verify new memtable has new WAL number
-	let new_wal_number = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+	let new_wal_number = tree.core.inner.active_memtable.read().get_wal_number();
 	assert!(
 		new_wal_number > initial_wal_number,
 		"New memtable should have higher WAL number: {} > {}",
@@ -3362,7 +3377,7 @@ async fn test_wal_number_tracking_on_flush() {
 
 	tree.flush().unwrap();
 
-	let after_second_flush_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	let after_second_flush_log = tree.core.inner.level_manifest.read().get_log_number();
 	assert_eq!(
 		after_second_flush_log,
 		new_wal_number + 1,
@@ -3404,7 +3419,7 @@ async fn test_memtable_wal_number_after_swap() {
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 	// Track WAL numbers through explicit flush cycles
-	let wal_1 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+	let wal_1 = tree.core.inner.active_memtable.read().get_wal_number();
 	log::info!("Initial WAL number: {}", wal_1);
 
 	// Write data and flush
@@ -3414,7 +3429,7 @@ async fn test_memtable_wal_number_after_swap() {
 
 	tree.flush().unwrap();
 
-	let wal_2 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+	let wal_2 = tree.core.inner.active_memtable.read().get_wal_number();
 	log::info!("WAL number after first flush: {}", wal_2);
 	assert!(wal_2 > wal_1, "WAL number should increase after flush: {} > {}", wal_2, wal_1);
 
@@ -3425,7 +3440,7 @@ async fn test_memtable_wal_number_after_swap() {
 
 	tree.flush().unwrap();
 
-	let wal_3 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+	let wal_3 = tree.core.inner.active_memtable.read().get_wal_number();
 	log::info!("WAL number after second flush: {}", wal_3);
 	assert!(wal_3 > wal_2, "WAL number should increase after second flush: {} > {}", wal_3, wal_2);
 
@@ -3471,7 +3486,7 @@ async fn test_wal_number_correct_after_reopen() {
 		let mut current_wal;
 		for i in 0..3 {
 			// Get the WAL number before flush - this WAL will be flushed
-			current_wal = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+			current_wal = tree.core.inner.active_memtable.read().get_wal_number();
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
@@ -3482,13 +3497,13 @@ async fn test_wal_number_correct_after_reopen() {
 				"After flush {}: flushed WAL {}, new log_number={}",
 				i,
 				current_wal,
-				tree.core.inner.level_manifest.read().unwrap().get_log_number()
+				tree.core.inner.level_manifest.read().get_log_number()
 			);
 		}
 
 		// The last WAL that was flushed is the one before the final flush
-		last_flushed_wal = tree.core.inner.level_manifest.read().unwrap().get_log_number() - 1;
-		final_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		last_flushed_wal = tree.core.inner.level_manifest.read().get_log_number() - 1;
+		final_log_number = tree.core.inner.level_manifest.read().get_log_number();
 
 		log::info!(
 			"Before close: last_flushed_wal={}, final_log_number={}",
@@ -3503,8 +3518,8 @@ async fn test_wal_number_correct_after_reopen() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-		let reopened_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-		let active_wal_number = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+		let reopened_log_number = tree.core.inner.level_manifest.read().get_log_number();
+		let active_wal_number = tree.core.inner.active_memtable.read().get_wal_number();
 
 		log::info!(
 			"After reopen: log_number={}, active_wal_number={}, last_flushed_wal={}",
@@ -3686,7 +3701,7 @@ async fn test_manifest_atomic_sst_and_log_number() {
 
 	// Get initial log_number
 	let initial_log_number = {
-		let manifest = tree.core.inner.level_manifest.read().unwrap();
+		let manifest = tree.core.inner.level_manifest.read();
 		manifest.get_log_number()
 	};
 
@@ -3702,7 +3717,7 @@ async fn test_manifest_atomic_sst_and_log_number() {
 
 	// Verify that when SST is added, log_number is also updated
 	{
-		let manifest = tree.core.inner.level_manifest.read().unwrap();
+		let manifest = tree.core.inner.level_manifest.read();
 		let new_log_number = manifest.get_log_number();
 		let level0_tables = &manifest.levels.get_levels()[0].tables;
 
@@ -3745,7 +3760,7 @@ async fn test_no_spurious_small_flush() {
 
 	// Verify no flush occurred (data still in active memtable, not in L0)
 	{
-		let manifest = tree.core.inner.level_manifest.read().unwrap();
+		let manifest = tree.core.inner.level_manifest.read();
 		assert!(
 			manifest.levels.get_levels()[0].tables.is_empty(),
 			"Should not flush small memtable due to spurious notification"
@@ -3871,7 +3886,7 @@ async fn test_valid_ssts_not_deleted_during_cleanup() {
 
 		// Get list of valid table IDs
 		let ids = {
-			let manifest = tree.core.inner.level_manifest.read().unwrap();
+			let manifest = tree.core.inner.level_manifest.read();
 			let ids: Vec<u64> = manifest.iter().map(|t| t.id).collect();
 			drop(manifest);
 			ids
@@ -3946,7 +3961,7 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 	let valid_sst_ids = {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let ids = {
-			let manifest = tree.core.inner.level_manifest.read().unwrap();
+			let manifest = tree.core.inner.level_manifest.read();
 			let ids: Vec<u64> = manifest.iter().map(|t| t.id).collect();
 			drop(manifest);
 			ids
@@ -4226,8 +4241,8 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		txn.commit().await.unwrap();
 		tree.flush().unwrap();
 
-		log_number_after_phase1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-		last_seq_after_phase1 = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		log_number_after_phase1 = tree.core.inner.level_manifest.read().get_log_number();
+		last_seq_after_phase1 = tree.core.inner.level_manifest.read().get_last_sequence();
 		log::info!(
 			"Phase 1: After flush, log_number={}, last_seq={}",
 			log_number_after_phase1,
@@ -4315,7 +4330,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		active_wal_after_recovery = tree.core.inner.wal.read().get_active_log_number();
-		let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let log_number = tree.core.inner.level_manifest.read().get_log_number();
 		log::info!(
 			"Phase 3: active_wal={}, log_number={}, highest_created={}",
 			active_wal_after_recovery,
@@ -4345,8 +4360,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 
 		// Flush - this updates log_number
 		tree.flush().unwrap();
-		let log_number_after_flush =
-			tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let log_number_after_flush = tree.core.inner.level_manifest.read().get_log_number();
 		log::info!("Phase 3: After flush, log_number={}", log_number_after_flush);
 
 		// Write more data that stays in WAL (not flushed)
@@ -5512,7 +5526,7 @@ async fn test_vlog_gc_non_versioned_surrealdb_style_keys() {
 		};
 
 		// Get SSTable counts per level from manifest
-		let manifest = tree.core.level_manifest.read().unwrap();
+		let manifest = tree.core.level_manifest.read();
 		let levels = manifest.levels.get_levels();
 		let level_counts: Vec<usize> = levels.iter().map(|l| l.tables.len()).collect();
 
@@ -5705,7 +5719,7 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 			vec![]
 		};
 
-		let manifest = tree.core.level_manifest.read().unwrap();
+		let manifest = tree.core.level_manifest.read();
 		let levels = manifest.levels.get_levels();
 		let level_counts: Vec<usize> = levels.iter().map(|l| l.tables.len()).collect();
 

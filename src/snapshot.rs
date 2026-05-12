@@ -145,14 +145,17 @@ impl Snapshot {
 	/// This is a helper method used by both iterators and optimized operations
 	/// like count
 	pub(crate) fn collect_iter_state(&self) -> Result<IterState> {
-		let active = guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.active_memtable))?;
-		let immutable =
-			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.immutable_memtables))?;
-		let manifest =
-			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.level_manifest))?;
+		// Take all three guards under their natural lock order (active →
+		// immutables → level_manifest), clone out what we need into owned
+		// state, then drop. No need for the `guardian` crate's
+		// self-referential wrapper — we don't keep the guards alive past
+		// this function.
+		let active = self.core.active_memtable.read();
+		let immutable = self.core.immutable_memtables.read();
+		let manifest = self.core.level_manifest.read();
 
 		Ok(IterState {
-			active: active.clone(),
+			active: Arc::clone(&active),
 			immutable: immutable.iter().map(|entry| Arc::clone(&entry.memtable)).collect(),
 			levels: manifest.levels.clone(),
 			versioned_index: self.core.versioned_index.clone(),
@@ -173,7 +176,7 @@ impl Snapshot {
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
 		// self.core.get_internal(key, self.seq_num)
 		// Read lock on the active memtable
-		let memtable_lock = self.core.active_memtable.read()?;
+		let memtable_lock = self.core.active_memtable.read();
 
 		// Check the active memtable for the key
 		if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
@@ -185,7 +188,7 @@ impl Snapshot {
 		drop(memtable_lock); // Release the lock on the active memtable
 
 		// Read lock on the immutable memtables
-		let memtable_lock = self.core.immutable_memtables.read()?;
+		let memtable_lock = self.core.immutable_memtables.read();
 
 		// Check the immutable memtables for the key
 		for entry in memtable_lock.iter().rev() {
@@ -200,7 +203,7 @@ impl Snapshot {
 		drop(memtable_lock); // Release the lock on the immutable memtables
 
 		// Read lock on the level manifest
-		let level_manifest = self.core.level_manifest.read()?;
+		let level_manifest = self.core.level_manifest.read();
 
 		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
 

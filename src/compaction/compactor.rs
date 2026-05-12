@@ -1,6 +1,8 @@
 use std::fs::File as SysFile;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::Arc;
+
+use parking_lot::{RwLock, RwLockWriteGuard};
 
 use crate::bplustree::tree::DiskBPlusTree;
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
@@ -39,9 +41,8 @@ impl HiddenTablesGuard {
 impl Drop for HiddenTablesGuard {
 	fn drop(&mut self) {
 		if !self.committed {
-			if let Ok(mut levels) = self.level_manifest.write() {
-				levels.unhide_tables(&self.table_ids);
-			}
+			let mut levels = self.level_manifest.write();
+			levels.unhide_tables(&self.table_ids);
 		}
 	}
 }
@@ -92,7 +93,7 @@ impl Compactor {
 	}
 
 	pub(crate) fn compact(&self) -> Result<()> {
-		let levels_guard = self.options.level_manifest.write()?;
+		let levels_guard = self.options.level_manifest.write();
 		let choice = self.strategy.pick_levels(&levels_guard)?;
 
 		match choice {
@@ -129,7 +130,7 @@ impl Compactor {
 		drop(levels);
 
 		// Create new table
-		let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
+		let new_table_id = self.options.level_manifest.read().next_table_id();
 		let new_table_path = self.get_table_path(new_table_id);
 
 		// Write merged data
@@ -217,7 +218,7 @@ impl Compactor {
 		new_table: Option<Arc<Table>>,
 		guard: &mut HiddenTablesGuard,
 	) -> Result<()> {
-		let mut manifest = self.options.level_manifest.write()?;
+		let mut manifest = self.options.level_manifest.write();
 		let _imm_guard = self.options.immutable_memtables.write();
 
 		// Check for table ID collision if adding a new table

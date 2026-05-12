@@ -1,8 +1,9 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
+use parking_lot::RwLock;
 use tempfile::TempDir;
 use test_log::test;
 
@@ -228,7 +229,7 @@ fn verify_keys_after_compaction(
 	manifest: &RwLock<LevelManifest>,
 	expected_keys: &HashSet<(Key, Value)>,
 ) -> (usize, HashMap<Key, Value>) {
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 	let levels = manifest_guard.levels.get_levels();
 
 	// Build a map of all key-value pairs from all tables across all levels
@@ -270,7 +271,7 @@ fn verify_all_keys_present(
 	manifest: &RwLock<LevelManifest>,
 	expected_keys: &HashMap<Key, Value>,
 ) -> bool {
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 
 	// Build map of all keys found after compaction
 	let mut all_key_values = HashMap::new();
@@ -345,7 +346,7 @@ fn test_level_selection() {
 	let strategy = Strategy::from_options(opts);
 
 	// Test the strategy's level selection
-	let choice = strategy.pick_levels(&manifest.read().unwrap()).unwrap();
+	let choice = strategy.pick_levels(&manifest.read()).unwrap();
 
 	// Verify L0 was selected for compaction (as it exceeds its limit)
 	match choice {
@@ -388,7 +389,7 @@ fn test_compaction_edge_cases() {
 	let strategy = Strategy::from_options(opts);
 
 	// Test strategy with empty level
-	let choice = strategy.pick_levels(&manifest.read().unwrap()).unwrap();
+	let choice = strategy.pick_levels(&manifest.read()).unwrap();
 
 	// Strategy should skip compaction when L0 is empty
 	match choice {
@@ -416,7 +417,7 @@ fn test_compaction_edge_cases() {
 	let manifest = create_test_manifest(&env, last_level_tables).unwrap();
 
 	// Test strategy with many tables in last level
-	let choice = strategy.pick_levels(&manifest.read().unwrap()).unwrap();
+	let choice = strategy.pick_levels(&manifest.read()).unwrap();
 
 	// If the last level exceeds its byte limit, it can compact to itself for tombstone cleanup
 	match choice {
@@ -494,7 +495,7 @@ fn test_level_selection_score_based() {
 	let strategy = Strategy::from_options(opts);
 
 	// Verify selection matches expected highest score
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 	let choice = strategy.pick_levels(&manifest_guard).unwrap();
 
 	match choice {
@@ -672,7 +673,7 @@ async fn test_simple_merge_compaction() {
 	);
 
 	{
-		let updated_manifest = manifest.read().unwrap();
+		let updated_manifest = manifest.read();
 
 		// L1 should have at least one table after compaction
 		let l1_tables = &updated_manifest.levels.get_levels()[1].tables;
@@ -856,7 +857,7 @@ async fn test_multi_level_merge_compaction() {
 		}
 
 		// Check if all levels are within limits
-		let manifest_guard = manifest.read().unwrap();
+		let manifest_guard = manifest.read();
 		let levels = manifest_guard.levels.get_levels();
 
 		let all_levels_ok = levels.iter().enumerate().all(|(idx, level)| {
@@ -886,7 +887,7 @@ async fn test_multi_level_merge_compaction() {
 	);
 
 	// Check for key range overlaps within levels
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 	let levels = manifest_guard.levels.get_levels();
 
 	for (level_idx, level) in levels.iter().enumerate().skip(1) {
@@ -1400,7 +1401,7 @@ async fn test_compaction_respects_sequence_numbers() {
 	perform_compaction_rounds(&compactor, 2);
 
 	// Verify the highest sequence number values are preserved
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 	let levels = manifest_guard.levels.get_levels();
 
 	// There should be no tables in L0 after compaction
@@ -1491,7 +1492,7 @@ async fn test_tombstone_propagation() {
 	assert!(result.is_ok(), "Compaction failed");
 
 	// Verify exactly 5 keys remain (95-99)
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 	let levels = manifest_guard.levels.get_levels();
 
 	let mut remaining_keys = Vec::new();
@@ -1589,7 +1590,7 @@ async fn test_l0_overlapping_keys_compaction() {
 	perform_compaction_rounds(&compactor, 2);
 
 	// Verify sequence number precedence: highest seq wins for overlapping keys
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 	let levels = manifest_guard.levels.get_levels();
 
 	let mut all_keys = HashMap::new();
@@ -1709,7 +1710,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 	perform_compaction_rounds(&compactor, 2);
 
 	// Verify tombstone wins: keys 2, 6, 8, 9, 12, 14, 17 should be deleted
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 	let levels = manifest_guard.levels.get_levels();
 
 	let mut survivors = HashMap::new();
@@ -1835,7 +1836,7 @@ async fn test_tombstone_propagation_through_levels() {
 	compactor.compact().unwrap();
 
 	// Verify bottom-level tombstone filtering: L3 should have no tombstones
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 	let levels = manifest_guard.levels.get_levels();
 
 	let mut tombstones = 0;
@@ -2116,7 +2117,7 @@ async fn test_soft_delete_compaction_behavior() {
 
 	// Verify that soft deletes flow through compaction normally (like any other
 	// key)
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 	let levels = manifest_guard.levels.get_levels();
 
 	let mut soft_deletes = 0;
@@ -2268,7 +2269,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 	compactor.compact().unwrap();
 
 	// Verify the result: only the latest SoftDelete should remain
-	let manifest_guard = manifest.read().unwrap();
+	let manifest_guard = manifest.read();
 	let levels = manifest_guard.levels.get_levels();
 
 	let mut soft_deletes = 0;
@@ -2788,7 +2789,7 @@ fn test_clean_cut_shared_boundary_key() {
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
-	let levels_guard = manifest.read().unwrap();
+	let levels_guard = manifest.read();
 	let source_level = &levels_guard.levels.get_levels()[1];
 
 	// Test clean cut expansion directly: selecting File 1 should expand to include File 2
@@ -2851,7 +2852,7 @@ fn test_clean_cut_chain_expansion() {
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
-	let levels_guard = manifest.read().unwrap();
+	let levels_guard = manifest.read();
 	let source_level = &levels_guard.levels.get_levels()[1];
 
 	// Test clean cut expansion directly: selecting File 2 should expand to include Files 1 and 3
@@ -2906,7 +2907,7 @@ fn test_clean_cut_no_expansion_needed() {
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
-	let levels_guard = manifest.read().unwrap();
+	let levels_guard = manifest.read();
 	let source_level = &levels_guard.levels.get_levels()[1];
 
 	// Test clean cut expansion directly: selecting File 1 should not expand (no shared boundaries)
@@ -2979,7 +2980,7 @@ fn test_clean_cut_integration_shared_boundary() {
 	let opts = create_options_with_compaction_settings(&env.options, 4, 2.0);
 	let strategy = Strategy::from_options(opts);
 
-	let levels_guard = manifest.read().unwrap();
+	let levels_guard = manifest.read();
 	let source_level = &levels_guard.levels.get_levels()[1];
 	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
 
@@ -3055,7 +3056,7 @@ fn test_clean_cut_integration_chain_expansion() {
 	let opts = create_options_with_compaction_settings(&env.options, 4, 2.0);
 	let strategy = Strategy::from_options(opts);
 
-	let levels_guard = manifest.read().unwrap();
+	let levels_guard = manifest.read();
 	let source_level = &levels_guard.levels.get_levels()[1];
 	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
 
@@ -3123,7 +3124,7 @@ fn test_clean_cut_integration_with_oldest_seq_priority() {
 	let opts = create_options_with_compaction_settings(&env.options, 4, 2.0);
 	let strategy = create_strategy_with_priority(&opts, CompactionPriority::OldestSmallestSeqFirst);
 
-	let levels_guard = manifest.read().unwrap();
+	let levels_guard = manifest.read();
 	let source_level = &levels_guard.levels.get_levels()[1];
 	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
 
@@ -3191,7 +3192,7 @@ fn test_clean_cut_integration_no_expansion() {
 	let opts = create_options_with_compaction_settings(&env.options, 4, 2.0);
 	let strategy = Strategy::from_options(opts);
 
-	let levels_guard = manifest.read().unwrap();
+	let levels_guard = manifest.read();
 	let source_level = &levels_guard.levels.get_levels()[1];
 	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
 
