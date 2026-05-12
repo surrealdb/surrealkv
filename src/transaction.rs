@@ -733,11 +733,8 @@ impl Transaction {
 			return Ok(());
 		}
 
-		// This checks if any key in our write set was modified after we started.
-		self.validate_write_conflicts()?;
-
 		// Create and prepare batch directly
-		let mut batch = Batch::new(0);
+		let mut batch = Batch::new(self.start_seq_num);
 
 		// Extract the vector of entries for the current transaction,
 		// respecting the insertion order recorded with Entry::seqno.
@@ -767,14 +764,6 @@ impl Transaction {
 		// Mark the transaction as closed
 		self.closed = true;
 		Ok(())
-	}
-
-	/// Validates that no key in our write set was modified after we started.
-	/// Only checks memtables - returns TransactionRetry if history insufficient.
-	fn validate_write_conflicts(&self) -> Result<()> {
-		self.core
-			.inner
-			.check_keys_conflict(self.write_set.keys().map(|k| k.as_slice()), self.start_seq_num)
 	}
 
 	pub fn rollback(&mut self) {

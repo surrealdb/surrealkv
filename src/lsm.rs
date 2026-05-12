@@ -1031,6 +1031,10 @@ impl CommitEnv for LsmCommitEnv {
 	fn check_background_error(&self) -> Result<()> {
 		self.core.error_handler.check_error()
 	}
+
+	fn validate_write_conflicts(&self, batch: &Batch) -> Result<()> {
+		self.core.check_keys_conflict(batch.entries.iter().map(|b| b.key.as_slice()), batch.starting_seq_num)
+	}
 }
 
 // ===== Core with Background Task Management =====

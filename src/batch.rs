@@ -21,7 +21,10 @@ pub(crate) struct Batch {
 	pub(crate) entries: Vec<BatchEntry>,
 	pub(crate) valueptrs: Vec<Option<ValuePointer>>, /* Parallel array to entries, None for
 	                                                  * inline values */
-	pub(crate) starting_seq_num: u64, // Starting sequence number for this batch
+	// Starting sequence number for this batch
+	// Initial with start sequence number of a transaction for the write-write conflict validation,
+	// and update to log sequence number before WAL write.
+	pub(crate) starting_seq_num: u64,
 	pub(crate) size: u64,             // Total size of all records (not serialized)
 }
 
