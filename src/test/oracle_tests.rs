@@ -143,22 +143,24 @@ async fn test_si_write_skew_still_allowed() {
 }
 
 /// A long-lived read-write transaction pins the oracle's GC watermark.
-/// While it's alive, `oldest_active` stays at its `start_seq` and no GC
-/// fires (skip-if-unchanged guard). Recent_writes entries accumulate.
-/// After it drops, the next commit sees a higher `oldest_active` and the
-/// per-publish GC runs, pruning entries below the new watermark.
+/// While it's alive, `oldest_active` stays at its `start_seq` and the GC
+/// watermark check stays false, so no sweep fires. Recent_writes entries
+/// accumulate. After it drops, enough subsequent commits cross the
+/// `GC_INTERVAL` throttle AND see an advanced watermark → GC fires and
+/// prunes everything below.
 #[test(tokio::test)]
 async fn test_oracle_gc_bounded_by_long_reader() {
+	use crate::oracle::GC_INTERVAL;
 	let (store, _td) = create_store();
 
 	// Long-lived reader pinned at start_seq = 0 (no commits before it).
 	let reader = store.begin().unwrap();
 
-	// Commit N distinct keys. While `reader` is alive, oldest_active = 0;
-	// per-publish GC sees the watermark hasn't advanced and skips. Every
-	// entry accumulates.
-	const N: usize = 200;
-	for i in 0..N {
+	// Commit GC_INTERVAL distinct keys. While `reader` is alive,
+	// oldest_active = 0 so the watermark check is false on every publish
+	// → no GC, regardless of the counter. All entries accumulate.
+	let n = GC_INTERVAL as usize;
+	for i in 0..n {
 		let mut t = store.begin().unwrap();
 		t.set(format!("gc_{i}").as_bytes(), b"v").unwrap();
 		t.commit().await.unwrap();
@@ -168,8 +170,8 @@ async fn test_oracle_gc_bounded_by_long_reader() {
 	let oracle = pipeline.oracle();
 	assert_eq!(
 		oracle.len(),
-		N,
-		"map should hold all {N} entries while reader pins oldest_active=0; got {}",
+		n,
+		"map should hold all {n} entries while reader pins oldest_active=0; got {}",
 		oracle.len()
 	);
 
@@ -177,14 +179,15 @@ async fn test_oracle_gc_bounded_by_long_reader() {
 	// (or to `visible_seq_num` if none).
 	drop(reader);
 
-	// The next commit's `publish` sees a higher `oldest_active` and triggers
-	// a GC sweep — entries below the new watermark are pruned.
+	// At this point `commits_since_gc` is at `GC_INTERVAL` (saturated/at-cap
+	// from the loop above without a GC firing). The first post-drop commit
+	// sees a higher `oldest_active` → both gates pass → GC fires.
 	let mut t = store.begin().unwrap();
 	t.set(b"trigger_gc", b"v").unwrap();
 	t.commit().await.unwrap();
 
 	let after = oracle.len();
-	assert!(after < N, "map should have shrunk after reader drop + one more commit; got {after}");
+	assert!(after < n, "map should have shrunk after reader drop + one more commit; got {after}");
 }
 
 /// A long-lived write-only transaction must also pin the GC watermark
