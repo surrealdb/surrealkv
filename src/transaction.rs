@@ -233,8 +233,8 @@ pub struct Transaction {
 	/// Registry slot in `Core::active_txn_tracker`. Drop unregisters the
 	/// `start_seq_num` from the GC watermark used by `CommitOracle`.
 	/// `Option<>` so that `rollback`/`commit` can release the slot promptly
-	/// rather than waiting for `Drop`.
-	_txn_guard: Option<ActiveTxnGuard>,
+	/// rather than waiting for the `Transaction`'s own `Drop`.
+	txn_guard: Option<ActiveTxnGuard>,
 }
 
 impl Transaction {
@@ -288,7 +288,7 @@ impl Transaction {
 			start_seq_num,
 			savepoints: 0,
 			write_seqno: 0,
-			_txn_guard: txn_guard,
+			txn_guard,
 		})
 	}
 
@@ -747,22 +747,16 @@ impl Transaction {
 		if self.write_set.is_empty() {
 			self.closed = true;
 			// Release the GC watermark slot promptly; otherwise it waits for Drop.
-			if let Some(mut g) = self._txn_guard.take() {
+			if let Some(mut g) = self.txn_guard.take() {
 				g.release();
 			}
 			return Ok(());
 		}
 
-		// Snapshot the write_set keys for the commit oracle. These are the
-		// keys to validate against `oracle.recent_writes` and to insert
-		// (stamped with the allocated seq) once validation passes. We clone
-		// the keys here because we drain `write_set` into `latest_writes`
-		// for the batch below.
-		let write_keys: Vec<Vec<u8>> = self.write_set.keys().cloned().collect();
-
 		// Create and prepare batch directly. `Batch::new(0)`: the
 		// `starting_seq_num` will be stamped by the commit pipeline after
-		// seq allocation. (We do NOT smuggle `start_seq_num` through here.)
+		// seq allocation. The pipeline derives oracle keys from
+		// `batch.entries` itself, so we don't pre-collect a parallel vector.
 		let mut batch = Batch::new(0);
 
 		// Extract the vector of entries for the current transaction,
@@ -790,11 +784,11 @@ impl Transaction {
 		// seq alloc + oracle.publish + WAL atomically under `write_mutex`,
 		// then runs memtable apply OUTSIDE the lock.
 		let should_sync = self.durability == Durability::Immediate;
-		self.core.commit(batch, should_sync, write_keys, self.start_seq_num).await?;
+		self.core.commit(batch, should_sync, self.start_seq_num).await?;
 
 		// Mark the transaction as closed and release the watermark slot.
 		self.closed = true;
-		if let Some(mut g) = self._txn_guard.take() {
+		if let Some(mut g) = self.txn_guard.take() {
 			g.release();
 		}
 		Ok(())
@@ -807,7 +801,7 @@ impl Transaction {
 		self.savepoints = 0;
 		self.write_seqno = 0;
 		// Release the GC watermark slot eagerly (Drop is a fallback for panic paths).
-		if let Some(mut g) = self._txn_guard.take() {
+		if let Some(mut g) = self.txn_guard.take() {
 			g.release();
 		}
 	}

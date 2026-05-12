@@ -1,12 +1,23 @@
-// Tracks active transactions' `start_seq_num` for the commit oracle's GC.
+// Tracks every live transaction's `start_seq_num` for the commit oracle's GC.
 //
-// Separate from `SnapshotTracker` (which drives compaction MVCC retention)
-// because their semantics diverge: write-only txns need GC protection but
-// don't hold MVCC snapshots, and the oracle's watermark advances faster than
-// snapshot retention requires.
+// Distinct from `SnapshotTracker`:
+//   - `SnapshotTracker` registers only read-bearing snapshots; it drives compaction MVCC retention.
+//   - `ActiveTxnTracker` registers every transaction including write-only ones (which have no
+//     `Snapshot`); it drives oracle map GC. The oracle's required watermark can advance faster than
+//     compaction's, so the two stay separate.
 //
-// Lock-free SkipSet of `(start_seq, unique_id)`. The `unique_id` differentiates
-// concurrent txns that share a `start_seq` so `remove` doesn't collide.
+// Lock-free `SkipSet<(start_seq, unique_id)>`. `unique_id` differentiates
+// concurrent transactions that happen to share a `start_seq` so `remove`
+// in `Drop` doesn't collide.
+//
+// Registration race safety: `Transaction::new` does
+// `start_seq = visible_seq_num.load(); tracker.register(start_seq);` with
+// no lock spanning the two operations. This is sound because
+// `visible_seq_num` is strictly monotonic (`CommitPipeline::publish` only
+// advances it via CAS), so any later `core.seq_num()` returns at least the
+// `start_seq` of any currently-registered transaction. A GC threshold
+// computed from `oldest()` can therefore never exceed a future transaction's
+// `start_seq`.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -48,11 +59,8 @@ impl ActiveTxnTracker {
 	/// Smallest `start_seq` currently registered. `None` if empty.
 	///
 	/// Cheap (O(log N) via `SkipSet::front`). Safe to call concurrently with
-	/// `register` / unregister — see the registration race analysis in the
-	/// plan: because `visible_seq_num` is strictly monotonic, any registered
-	/// txn's `start_seq` is `<=` every later `core.seq_num()`, so a momentarily-
-	/// missing registration cannot cause a future txn's `start_seq` to fall
-	/// below the watermark observed here.
+	/// `register` and unregister. See the module-level comment for the
+	/// monotonicity-based race proof.
 	pub(crate) fn oldest(&self) -> Option<u64> {
 		self.seqs.front().map(|e| e.value().0)
 	}

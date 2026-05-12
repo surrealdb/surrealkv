@@ -154,7 +154,6 @@ pub(crate) struct CoreInner {
 
 	/// Visible sequence number - the highest sequence number that is visible to readers.
 	/// Shared with CommitPipeline for coordinated updates.
-	/// Used to set `earliest_seq` when creating new memtables for conflict detection.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
 }
 
@@ -184,7 +183,7 @@ impl CoreInner {
 
 		// Initialize active memtable with its WAL number set to the initial WAL
 		// This tracks which WAL the memtable's data belongs to for later flush
-		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size, 0));
+		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size));
 		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
 		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
@@ -252,7 +251,7 @@ impl CoreInner {
 			(Some(a), Some(b)) => a.min(b),
 			(Some(a), None) => a,
 			(None, Some(b)) => b,
-			(None, None) => self.visible_seq_num.load(std::sync::atomic::Ordering::Acquire),
+			(None, None) => self.visible_seq_num.load(Ordering::Acquire),
 		}
 	}
 
@@ -406,10 +405,9 @@ impl CoreInner {
 		};
 
 		// Step 3: Swap memtable while STILL holding write lock
-		let earliest_seq = self.visible_seq_num.load(Ordering::Acquire);
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size, earliest_seq)),
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
 		);
 
 		// Set the WAL number on the new (empty) active memtable
@@ -576,14 +574,11 @@ impl CoreInner {
 		// Get the current WAL number for the new memtable
 		let current_wal_number = self.wal.read().get_active_log_number();
 
-		// Get the current visible_seq_num as earliest_seq for the new memtable
-		let earliest_seq = self.visible_seq_num.load(Ordering::Acquire);
-
 		// Swap the active memtable with a new empty one
 		// This allows writes to continue immediately
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size, earliest_seq)),
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
 		);
 
 		// Set the WAL number on the new active memtable
@@ -1287,18 +1282,12 @@ impl Core {
 		Ok(core)
 	}
 
-	pub(crate) async fn commit(
-		&self,
-		batch: Batch,
-		sync: bool,
-		write_keys: Vec<Vec<u8>>,
-		start_seq: u64,
-	) -> Result<()> {
-		// Commit the batch using the commit pipeline. `write_keys` is the
-		// transaction's write set; the commit pipeline validates it against
-		// the oracle (atomically with seq allocation) and inserts entries
-		// under the same `write_mutex` critical section as WAL.
-		self.commit_pipeline.commit(batch, sync, write_keys, start_seq).await
+	pub(crate) async fn commit(&self, batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
+		// Commit the batch using the commit pipeline. `start_seq` is the
+		// transaction's snapshot seq (used by the oracle's write-write
+		// conflict check). The write keys are derived from `batch.entries`
+		// inside the pipeline — no duplicated parallel array.
+		self.commit_pipeline.commit(batch, sync, start_seq).await
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {
@@ -1565,10 +1554,8 @@ impl Tree {
 		// Clear the current memtables since they would be stale after restore
 		// This discards any pending writes, which is correct for restore operations
 		{
-			let earliest_seq = self.core.inner.visible_seq_num.load(Ordering::Acquire);
 			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable =
-				Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size, earliest_seq));
+			*active_memtable = Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size));
 		}
 
 		{

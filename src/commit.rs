@@ -233,13 +233,7 @@ impl CommitPipeline {
 		}
 	}
 
-	pub(crate) async fn commit(
-		&self,
-		mut batch: Batch,
-		sync: bool,
-		write_keys: Vec<Vec<u8>>,
-		start_seq: u64,
-	) -> Result<()> {
+	pub(crate) async fn commit(&self, mut batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
@@ -262,7 +256,7 @@ impl CommitPipeline {
 
 		// === CRITICAL SECTION under write_mutex ===
 		//
-		// Atomically: validate write_keys against the oracle map, allocate
+		// Atomically: validate write keys against the oracle map, allocate
 		// the commit seq, insert oracle entries with that seq, enqueue, and
 		// write to WAL. The single-producer invariant on `pending` requires
 		// seq allocation and `enqueue` to be in the same critical section
@@ -273,23 +267,26 @@ impl CommitPipeline {
 		// `write_mutex` and run validate + seq + oracle + WAL. This is the
 		// pipeline-overlap pattern Pebble uses and that surrealkv used
 		// before PR #378.
-		let processed_batch_result = {
+		//
+		// Keys are derived from `batch.entries` (single source of truth).
+		// Duplicate keys within a batch (e.g. from savepoint history) are
+		// harmless: oracle.check/publish are idempotent on the same key.
+		let (processed_batch_result, allocated_seq) = {
 			let _guard = self.write_mutex.lock();
 
-			// 1. Validate against the oracle. Returns:
-			//    - TransactionWriteConflict if any key was committed at seq > start_seq.
-			//    - TransactionRetry if start_seq < discard_below (window GC'd).
-			if let Err(e) = self.oracle.check(write_keys.iter().map(|k| k.as_slice()), start_seq) {
-				Err(e)
+			// 1. Validate against the oracle.
+			if let Err(e) =
+				self.oracle.check(batch.entries.iter().map(|e| e.key.as_slice()), start_seq)
+			{
+				(Err(e), 0u64)
 			} else {
 				let count = batch.count() as u64;
 				let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
 
-				// 2. Publish the oracle entries with the allocated seq. Stamp = seq_num + count - 1
-				//    (highest in batch).
+				// 2. Publish the oracle entries with the allocated seq.
 				let oldest_active = self.env.oldest_active_start_seq();
 				self.oracle.publish(
-					write_keys.iter().map(|k| k.as_slice()),
+					batch.entries.iter().map(|e| e.key.as_slice()),
 					seq_num,
 					count,
 					oldest_active,
@@ -303,17 +300,36 @@ impl CommitPipeline {
 				self.pending.enqueue(Arc::clone(&commit_batch));
 
 				// 5. WAL + VLog (serialized under lock).
-				self.env.write(&batch, seq_num, sync)
+				let res = self.env.write(&batch, seq_num, sync);
+				(res, seq_num)
 			}
 		};
 		// === END CRITICAL SECTION ===
 
-		// Bail early on pre-apply errors (validation conflict, WAL failure).
-		// In these cases nothing was enqueued, so there is no zombie batch
-		// to drain. The semaphore permit drops at end of function.
+		// Bail early on pre-apply errors. For oracle.check failures, nothing
+		// was enqueued or stamped. For WAL write failures after a successful
+		// publish, we need to roll the oracle entries back so subsequent
+		// commits aren't falsely aborted by ghosts of a non-durable txn.
 		let processed_batch = match processed_batch_result {
 			Ok(b) => b,
-			Err(e) => return Err(e),
+			Err(e) => {
+				if allocated_seq > 0 {
+					// WAL failed after oracle.publish. Roll back the entries
+					// we stamped with `allocated_seq`. Other committers may
+					// have already overwritten some of those entries at higher
+					// seqs; rollback's seq-match guard leaves those untouched.
+					let count = batch.count() as u64;
+					let stamp = allocated_seq + count - 1;
+					self.oracle.rollback(batch.entries.iter().map(|e| e.key.as_slice()), stamp);
+					// The batch is also in `pending` and never marked applied.
+					// Mark and publish to drain it (existing zombie-prevention
+					// invariant — see the comment block below).
+					commit_batch.complete(Err(e.clone()));
+					commit_batch.mark_applied();
+					self.publish();
+				}
+				return Err(e);
+			}
 		};
 
 		// 6. Memtable apply — OUTSIDE write_mutex. The next committer can already be inside the
@@ -321,34 +337,32 @@ impl CommitPipeline {
 		let apply_result = self.env.apply(&processed_batch);
 
 		// =========================================================================
-		// NOTE: We mark batch as applied and call publish(), even on failure.
+		// Failure-path invariants
 		// =========================================================================
-		//
-		// Issue:
-		//   On apply() failure, we returned early without calling mark_applied()
-		//   or publish(). The batch remained in the queue as a "zombie" but the
-		//   semaphore permit was released. After ~8 failures, zombies
-		//   filled the queue and new enqueues panicked with "queue overflow".
-		//
-		// FIX:
-		//   Always mark_applied() and publish() regardless of success/failure.
-		//   This ensures batches are dequeueable before their permit is released,
-		//   maintaining the condition: batches_in_queue <= permits_held < queue_capacity
-		//
-		// LIMITATION - SEQUENCE NUMBER GAPS:
-		//   Sequence numbers are allocated before apply() is called.
-		//   When apply() fails, those sequence numbers are not used but also cannot
-		//   be reclaimed. Same for the oracle entries: they remain stamped at the
-		//   reserved seq even if apply fails. This is intentional — the alternative
-		//   (rolling back oracle entries on apply failure) races with concurrent
-		//   committers and complicates correctness reasoning. WAL is durable on
-		//   apply failure, so on restart WAL replay rebuilds the memtable state.
+		// (a) Zombie prevention: every enqueued batch MUST eventually be
+		//     marked applied and drained from `pending`, otherwise the queue
+		//     fills and panics with "commit queue overflow" (see [c]).
+		// (b) Oracle rollback on apply failure: when apply fails, the WAL
+		//     record is durable but the memtable did not receive it. Other
+		//     in-flight txns that would conflict with this seq's stamp must
+		//     not be falsely aborted, so we roll back the oracle entries
+		//     for this batch (seq-match guarded — concurrent overwriters
+		//     keep their stamps).
+		// (c) Sequence number gaps: the allocated `seq_num` is consumed
+		//     irrespective of apply success. On WAL replay after restart,
+		//     a WAL-durable but apply-failed entry will be re-inserted into
+		//     the memtable; a later same-key writer's higher seq shadows it.
 		// =========================================================================
 
 		commit_batch.mark_applied();
 
-		// If apply failed, send error to waiter now (before publish)
 		let apply_err = if let Err(ref e) = apply_result {
+			// Roll back this txn's oracle entries so subsequent same-key
+			// commits don't false-abort against a ghost stamp.
+			let count = batch.count() as u64;
+			let stamp = allocated_seq + count - 1;
+			self.oracle.rollback(batch.entries.iter().map(|e| e.key.as_slice()), stamp);
+
 			let err = Error::CommitFail(e.to_string());
 			commit_batch.complete(Err(err.clone()));
 			Some(err)
@@ -356,15 +370,13 @@ impl CommitPipeline {
 			None
 		};
 
-		// Phase 3: Publish (multi-consumer) - MUST always run to drain queue
+		// Publish (multi-consumer) - MUST always run to drain queue
 		self.publish();
 
-		// Return error if apply failed
 		if let Some(err) = apply_err {
 			return Err(err);
 		}
 
-		// Wait for completion
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
 	}
 
@@ -503,7 +515,7 @@ mod tests {
 			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
 			.unwrap();
 
-		let result = pipeline.commit(batch, false, Vec::new(), 0).await;
+		let result = pipeline.commit(batch, false, 0).await;
 		assert!(result.is_ok(), "Single commit failed: {result:?}");
 
 		let visible = pipeline.get_visible_seq_num();
@@ -531,7 +543,7 @@ mod tests {
 					i,
 				)
 				.unwrap();
-			let result = pipeline.commit(batch, false, Vec::new(), 0).await;
+			let result = pipeline.commit(batch, false, 0).await;
 			assert!(result.is_ok(), "Sequential commit {i} failed: {result:?}");
 		}
 
@@ -558,7 +570,7 @@ mod tests {
 						i,
 					)
 					.unwrap();
-				pipeline.commit(batch, false, Vec::new(), 0).await
+				pipeline.commit(batch, false, 0).await
 			});
 			handles.push(handle);
 		}
@@ -640,7 +652,7 @@ mod tests {
 						i,
 					)
 					.unwrap();
-				pipeline.commit(batch, false, Vec::new(), 0).await
+				pipeline.commit(batch, false, 0).await
 			});
 			handles.push(handle);
 		}
@@ -725,7 +737,7 @@ mod tests {
 				)
 				.unwrap();
 
-			let result = pipeline.commit(batch, false, Vec::new(), 0).await;
+			let result = pipeline.commit(batch, false, 0).await;
 			assert!(result.is_err(), "Expected error at iteration {i}");
 		}
 
@@ -804,7 +816,7 @@ mod tests {
 				)
 				.unwrap();
 
-			let result = pipeline.commit(batch, false, Vec::new(), 0).await;
+			let result = pipeline.commit(batch, false, 0).await;
 
 			if i < fail_count {
 				assert!(result.is_err(), "Expected error at iteration {i}");
