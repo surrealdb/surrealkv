@@ -25,7 +25,7 @@ pub(crate) struct Batch {
 	// Initial with start sequence number of a transaction for the write-write conflict validation,
 	// and update to log sequence number before WAL write.
 	pub(crate) starting_seq_num: u64,
-	pub(crate) size: u64,             // Total size of all records (not serialized)
+	pub(crate) size: u64, // Total size of all records (not serialized)
 }
 
 impl Default for Batch {

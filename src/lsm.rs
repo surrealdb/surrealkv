@@ -1033,7 +1033,10 @@ impl CommitEnv for LsmCommitEnv {
 	}
 
 	fn validate_write_conflicts(&self, batch: &Batch) -> Result<()> {
-		self.core.check_keys_conflict(batch.entries.iter().map(|b| b.key.as_slice()), batch.starting_seq_num)
+		self.core.check_keys_conflict(
+			batch.entries.iter().map(|b| b.key.as_slice()),
+			batch.starting_seq_num,
+		)
 	}
 }
 

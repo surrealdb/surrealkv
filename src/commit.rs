@@ -260,7 +260,7 @@ impl CommitPipeline {
 			self.pending.enqueue(Arc::clone(&commit_batch));
 
 			// Write to WAL and process VLog (serialized under lock)
-			let processed_batch = self.env.write(&mut batch, seq_num, sync)?;
+			let processed_batch = self.env.write(&batch, seq_num, sync)?;
 
 			// Apply batch to memtable
 			self.env.apply(&processed_batch)
