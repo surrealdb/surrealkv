@@ -1013,6 +1013,38 @@ impl<'a> CompactionIterator<'a> {
 		// Higher sequence number = more recent write
 		self.accumulated_versions.sort_by_key(|b| std::cmp::Reverse(b.0.seq_num()));
 
+		// Defensive dedup of physical duplicates that share an InternalKey
+		// (same user_key implied by accumulation pass + same seq_num).
+		//
+		// The snapshot-aware logic below decides *semantic* supersession
+		// via SnapshotVisibility, but with `enable_versioning=true` and
+		// `NoActiveSnapshots` (the default operating mode for an embedded
+		// store with no concurrent read transactions), `snapshot_allows_drop`
+		// is `false`, so the `superseded` check never marks duplicates as
+		// droppable. Two records with identical `(user_key, seq_num)` then
+		// flow to the downstream `BlockBuilder::add`, which compares them
+		// with `InternalKeyComparator` (user_key ASC, seq_num DESC), gets
+		// `Equal` instead of `Less`, and aborts the SST flush with
+		// `Error::KeyNotInOrder`. The next compaction sees the poisoned
+		// state and escalates to `severity HardError`, blocking every
+		// subsequent commit.
+		//
+		// Whatever upstream path produced the duplicate (WAL replay,
+		// memtable rotation race, manual checkpoint replay) the LSM
+		// invariant at this point is StrictlySorted: equal-seq dups must
+		// not reach the block builder. `dedup_by_key` keeps the first of
+		// each consecutive run with equal seq_num — and after the
+		// `Reverse(seq_num)` sort that's the highest-seq one (and since
+		// these are equal-seq dups, it doesn't matter which physical copy
+		// we keep).
+		//
+		// Reproduced and characterized 2026-05-11 in ckl-sandbox-orchestrator
+		// (ckl 0.5.19, surrealkv 0.21.1) — see Koslab-DevOrg/ckl
+		// `docs/known-issues.md#KNOWN_ISSUE-001` for the full forensic
+		// trail (failing key, fingerprint, recovery cycle).
+		self.accumulated_versions
+			.dedup_by_key(|b| b.0.seq_num());
+
 		// Check if latest version is DELETE at bottom level
 		// If so, we can completely remove this key from the database
 		let latest_is_delete_at_bottom = self.is_bottom_level
