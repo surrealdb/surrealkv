@@ -113,7 +113,12 @@ impl MemTable {
 		self.wal_number.load(Ordering::Acquire)
 	}
 
-	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
+	/// Looks up the newest version of `key` visible at `seq_no` (or any
+	/// seq if `seq_no` is `None`). Returns the trailer (which encodes both
+	/// seq_num and kind via `trailer_to_seq_num` / `trailer_to_kind`) and
+	/// the value bytes. The user_key is not returned — callers already
+	/// have it.
+	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(u64, Value)> {
 		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 		let mut iter = self.skiplist.iter();
 		iter.seek_ge(key);
@@ -126,22 +131,31 @@ impl MemTable {
 			}
 
 			let found_trailer = iter.trailer();
-			let found_seq = found_trailer >> 8;
+			let found_seq = crate::trailer_to_seq_num(found_trailer);
 
 			// Check if this entry's sequence number is <= requested seq_no
 			if found_seq <= max_seq {
 				// This is the newest version with seq <= max_seq
-				let internal_key = InternalKey {
-					user_key: found_key.to_vec(),
-					timestamp: 0,
-					trailer: found_trailer,
-				};
-				return Some((internal_key, iter.value_bytes().to_vec()));
+				return Some((found_trailer, iter.value_bytes().to_vec()));
 			}
 
 			iter.advance();
 		}
 		None
+	}
+
+	/// Returns the seq_num of the newest version of `key`, regardless of
+	/// kind (tombstone or not). Skips the value-clone, so it's cheaper
+	/// than `get(key, None)` when the caller only needs to detect a
+	/// write conflict.
+	pub(crate) fn max_seq_for_key(&self, key: &[u8]) -> Option<u64> {
+		let mut iter = self.skiplist.iter();
+		iter.seek_ge(key);
+		if iter.is_valid() && iter.key_bytes() == key {
+			Some(crate::trailer_to_seq_num(iter.trailer()))
+		} else {
+			None
+		}
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {

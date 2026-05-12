@@ -226,8 +226,7 @@ fn test_single_key() {
 	// Test get method
 	let result = memtable.get(b"key1", None);
 	assert!(result.is_some());
-	let (ikey, encoded_val) = result.unwrap();
-	assert_eq!(&ikey.user_key, b"key1");
+	let (_trailer, encoded_val) = result.unwrap();
 
 	assert_value(&encoded_val, b"value1");
 }
@@ -317,8 +316,8 @@ fn test_sequence_number_ordering() {
 	// Test get method - should return the highest sequence number
 	let result = memtable.get(b"key1", None);
 	assert!(result.is_some());
-	let (ikey, encoded_val) = result.unwrap();
-	assert_eq!(ikey.seq_num(), 20);
+	let (trailer, encoded_val) = result.unwrap();
+	assert_eq!(crate::trailer_to_seq_num(trailer), 20);
 	assert_eq!(&encoded_val, b"value2");
 }
 
@@ -433,13 +432,13 @@ fn test_key_kinds() {
 	// Test get method behavior with different kinds
 	let result = memtable.get(b"key1", None);
 	assert!(result.is_some());
-	let (ikey, _) = result.unwrap();
-	assert_eq!(ikey.kind(), InternalKeyKind::Set);
+	let (trailer, _) = result.unwrap();
+	assert_eq!(crate::trailer_to_kind(trailer), InternalKeyKind::Set);
 
 	let result = memtable.get(b"key2", None);
 	assert!(result.is_some());
-	let (ikey, encoded_val) = result.unwrap();
-	assert_eq!(ikey.kind(), InternalKeyKind::Delete);
+	let (trailer, encoded_val) = result.unwrap();
+	assert_eq!(crate::trailer_to_kind(trailer), InternalKeyKind::Delete);
 	assert_eq!(encoded_val.len(), 0);
 }
 

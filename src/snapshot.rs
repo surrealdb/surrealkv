@@ -178,12 +178,15 @@ impl Snapshot {
 		// Read lock on the active memtable
 		let memtable_lock = self.core.active_memtable.read();
 
-		// Check the active memtable for the key
-		if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
-			if item.0.is_tombstone() {
-				return Ok(None); // Key is a tombstone, return None
+		// Check the active memtable for the key. `get` returns (trailer,
+		// value) — derive seq_num + kind from the trailer using the
+		// centralized helpers; avoids allocating an InternalKey we'd
+		// throw away immediately.
+		if let Some((trailer, value)) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
+			if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
+				return Ok(None); // tombstone
 			}
-			return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
+			return Ok(Some((value, crate::trailer_to_seq_num(trailer))));
 		}
 		drop(memtable_lock); // Release the lock on the active memtable
 
@@ -193,11 +196,11 @@ impl Snapshot {
 		// Check the immutable memtables for the key
 		for entry in memtable_lock.iter().rev() {
 			let memtable = &entry.memtable;
-			if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
-				if item.0.is_tombstone() {
-					return Ok(None); // Key is a tombstone, return None
+			if let Some((trailer, value)) = memtable.get(key.as_ref(), Some(self.seq_num)) {
+				if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
+					return Ok(None); // tombstone
 				}
-				return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
+				return Ok(Some((value, crate::trailer_to_seq_num(trailer))));
 			}
 		}
 		drop(memtable_lock); // Release the lock on the immutable memtables

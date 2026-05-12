@@ -764,7 +764,7 @@ fn read_u64_be(buffer: &[u8], offset: usize) -> u64 {
 
 /// Converts a trailer byte to InternalKeyKind
 /// This centralizes the kind conversion logic to avoid duplication and errors
-fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
+pub(crate) fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 	let kind_byte = trailer as u8;
 	match kind_byte {
 		0 => InternalKeyKind::Delete,
@@ -783,7 +783,7 @@ fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 /// Extracts sequence number from trailer
 /// This centralizes the seq_num extraction logic to avoid duplication
 #[inline(always)]
-fn trailer_to_seq_num(trailer: u64) -> u64 {
+pub(crate) fn trailer_to_seq_num(trailer: u64) -> u64 {
 	trailer >> 8
 }
 
@@ -799,7 +799,7 @@ pub(crate) fn make_trailer(seq_num: u64, kind: InternalKeyKind) -> u64 {
 
 /// Checks if a key kind represents a tombstone (delete operation)
 #[inline(always)]
-fn is_delete_kind(kind: InternalKeyKind) -> bool {
+pub(crate) fn is_delete_kind(kind: InternalKeyKind) -> bool {
 	matches!(
 		kind,
 		InternalKeyKind::Delete | InternalKeyKind::SoftDelete | InternalKeyKind::RangeDelete

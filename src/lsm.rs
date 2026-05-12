@@ -257,9 +257,10 @@ impl CoreInner {
 		}
 
 		for key in keys {
-			// Check active memtable first (most recent writes)
-			if let Some((ikey, _)) = memtable.get(key, None) {
-				if ikey.seq_num() > start_seq {
+			// Check active memtable first (most recent writes).
+			// Use max_seq_for_key (no value clone) since we only need the seq.
+			if let Some(seq) = memtable.max_seq_for_key(key) {
+				if seq > start_seq {
 					return Err(Error::TransactionWriteConflict);
 				}
 				// Key exists but was written before our transaction started - no conflict
@@ -269,8 +270,8 @@ impl CoreInner {
 			// Check immutable memtables (newest to oldest by iterating in reverse)
 			let mut found_in_immutable = false;
 			for entry in immutables.iter().rev() {
-				if let Some((ikey, _)) = entry.memtable.get(key, None) {
-					if ikey.seq_num() > start_seq {
+				if let Some(seq) = entry.memtable.max_seq_for_key(key) {
+					if seq > start_seq {
 						return Err(Error::TransactionWriteConflict);
 					}
 					// Key exists but was written before our transaction started - no conflict
@@ -284,8 +285,8 @@ impl CoreInner {
 
 			// Check flushed history
 			if let Some(ref flushed) = *history {
-				if let Some((ikey, _)) = flushed.get(key, None) {
-					if ikey.seq_num() > start_seq {
+				if let Some(seq) = flushed.max_seq_for_key(key) {
+					if seq > start_seq {
 						return Err(Error::TransactionWriteConflict);
 					}
 					// Key exists but was written before our transaction started - no conflict
