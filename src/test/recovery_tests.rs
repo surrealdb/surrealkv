@@ -13,7 +13,12 @@ use crate::wal::manager::Wal;
 use crate::wal::recovery::replay_wal;
 use crate::wal::Options;
 
-const ARENA_SIZE: usize = 1024 * 1024;
+// Tests use single-batch segments up to 10,000 entries. With `MemTable::add` now
+// performing an atomic worst-case preflight reservation (199 bytes per entry +
+// key + value), a single batch must fit inside the arena. 4 MiB accommodates the
+// worst-case estimate for the largest batches in this file (10k entries × ~225B
+// ≈ 2.25 MiB) with comfortable headroom.
+const ARENA_SIZE: usize = 4 * 1024 * 1024;
 // ============================================================================
 // Category 1: Basic Multi-Segment Recovery (6 tests)
 // ============================================================================

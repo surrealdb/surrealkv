@@ -6,6 +6,7 @@ mod arena;
 mod skiplist;
 
 use arena::Arena;
+pub(crate) use skiplist::max_entry_bytes;
 use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
 
 use crate::batch::Batch;
@@ -73,11 +74,31 @@ pub(crate) struct MemTable {
 	/// WAL number that was current when this memtable started receiving writes.
 	/// Used to determine which WALs can be safely deleted after flush.
 	wal_number: AtomicU64,
+	/// Bytes reserved by in-flight `add` calls but not yet allocated in the
+	/// skiplist arena. Atomically updated by `try_reserve` / `release_reservation`
+	/// to ensure batch-atomic insertion: a batch either fits entirely (reservation
+	/// succeeds) or the memtable is left unchanged (reservation fails with ArenaFull).
+	reserved: AtomicU64,
 }
 
 impl Default for MemTable {
 	fn default() -> Self {
 		Self::new(1024 * 1024)
+	}
+}
+
+/// Releases a `MemTable` reservation on drop. Used by `MemTable::add` to ensure
+/// the reservation is freed even if `apply_batch_to_memtable` returns an error
+/// (which should not happen after a successful `try_reserve`, but the guard
+/// keeps the contract panic-safe and `?`-safe).
+struct ReservationGuard<'a> {
+	memtable: &'a MemTable,
+	bytes: u64,
+}
+
+impl Drop for ReservationGuard<'_> {
+	fn drop(&mut self) {
+		self.memtable.release_reservation(self.bytes);
 	}
 }
 
@@ -90,6 +111,7 @@ impl MemTable {
 			skiplist,
 			latest_seq_num: AtomicU64::new(0),
 			wal_number: AtomicU64::new(0),
+			reserved: AtomicU64::new(0),
 		}
 	}
 
@@ -147,16 +169,68 @@ impl MemTable {
 		self.skiplist.size() as usize
 	}
 
-	/// Adds a batch of operations to the memtable.
-	/// This includes appending the batch to the Write-Ahead Log (WAL),
-	/// applying the batch to the in-memory table, and updating the memtable
-	/// size and latest sequence number.
+	/// Arena capacity in bytes (total, including sentinel overhead).
+	pub(crate) fn arena_capacity(&self) -> usize {
+		self.skiplist.arena_capacity()
+	}
+
+	/// Atomically reserve `bytes` of arena space for an upcoming batch insertion.
+	///
+	/// On `Ok(())`, the caller has exclusive claim to `bytes` of arena space and
+	/// MUST eventually call `release_reservation(bytes)`. On `Err(ArenaFull)`,
+	/// the memtable state is unchanged and the caller should rotate to a fresh
+	/// memtable and retry.
+	///
+	/// This is a CAS loop; spurious failures retry until either the reservation
+	/// succeeds or `ArenaFull` is observed against the freshest `reserved` value.
+	pub(crate) fn try_reserve(&self, bytes: u64) -> Result<()> {
+		let capacity = self.arena_capacity() as u64;
+		loop {
+			let current = self.reserved.load(Ordering::Acquire);
+			let used = self.skiplist.size() as u64;
+			let avail = capacity.saturating_sub(used).saturating_sub(current);
+			if bytes > avail {
+				return Err(crate::Error::ArenaFull);
+			}
+			if self
+				.reserved
+				.compare_exchange_weak(
+					current,
+					current + bytes,
+					Ordering::AcqRel,
+					Ordering::Acquire,
+				)
+				.is_ok()
+			{
+				return Ok(());
+			}
+		}
+	}
+
+	/// Release `bytes` previously claimed by `try_reserve`.
+	pub(crate) fn release_reservation(&self, bytes: u64) {
+		self.reserved.fetch_sub(bytes, Ordering::AcqRel);
+	}
+
+	/// Applies a batch of operations to the memtable **atomically**.
+	///
+	/// Returns `Err(ArenaFull)` if the batch will not fit; in that case the
+	/// memtable state is unchanged and the caller may rotate and retry on a
+	/// fresh memtable. On `Ok(())` every entry has been inserted.
+	///
+	/// The atomicity is provided by an upfront `try_reserve` call using a
+	/// worst-case upper bound (`Batch::memtable_size_estimate`); after the
+	/// reservation succeeds, the per-entry inserts cannot run out of space.
 	///
 	/// # Arguments
 	/// * `batch` - The batch of operations to apply
-	/// * `starting_seq_num` - The starting sequence number for this batch (records get consecutive
-	///   numbers)
 	pub(crate) fn add(&self, batch: &Batch) -> Result<()> {
+		let needed = batch.memtable_size_estimate();
+		self.try_reserve(needed)?;
+		let _guard = ReservationGuard {
+			memtable: self,
+			bytes: needed,
+		};
 		let highest_seq_num = self.apply_batch_to_memtable(batch)?;
 		self.update_latest_sequence_number(highest_seq_num);
 		Ok(())
@@ -191,14 +265,27 @@ impl MemTable {
 	}
 
 	/// Inserts a key-value pair into the memtable.
-	/// Returns Err(ArenaFull) if there's not enough space.
+	///
+	/// `MemTable::add` reserves arena space via `try_reserve` before calling this,
+	/// so `SkiplistError::ArenaFull` here would indicate the size estimator drifted
+	/// from the actual skiplist node size. We assert in debug, and fall through to
+	/// returning `ArenaFull` in release so the upstream rotate-and-retry path stays
+	/// as a safety net rather than corrupting state via panic.
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
 		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
 
 		match self.skiplist.add(&key.user_key, trailer, key.timestamp, value) {
 			Ok(()) => Ok(()),
 			Err(SkiplistError::RecordExists) => Ok(()), // Duplicate is not an error in memtable
-			Err(SkiplistError::ArenaFull) => Err(crate::Error::ArenaFull),
+			Err(SkiplistError::ArenaFull) => {
+				debug_assert!(
+					false,
+					"ArenaFull inside insert_into_memtable after a successful try_reserve; \
+					memtable_size_estimate is out of sync with skiplist node size"
+				);
+				log::error!("ArenaFull after reservation; memtable size estimator drift");
+				Err(crate::Error::ArenaFull)
+			}
 		}
 	}
 
