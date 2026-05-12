@@ -182,7 +182,11 @@ pub(crate) fn replay_wal(
 					match current_memtable.add(&batch) {
 						Ok(()) => {}
 						Err(Error::ArenaFull) => {
-							// Edge case: single segment exceeds memtable capacity
+							// `MemTable::add` is atomic: it either fully applies the
+							// batch or returns ArenaFull with the memtable unchanged
+							// (no partial prefix). If the active memtable is empty here,
+							// the batch alone exceeds arena capacity and no rotation
+							// will help — surface as fatal.
 							if current_memtable.is_empty() {
 								return Err(Error::Other(format!(
 									"Batch too large for memtable (batch size exceeds arena_size={})",
