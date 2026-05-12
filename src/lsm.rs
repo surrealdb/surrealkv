@@ -171,8 +171,10 @@ impl CoreInner {
 		// Initialize WAL starting from manifest.log_number
 		let wal_path = opts.wal_dir();
 		// This avoids creating intermediate empty WAL files
-		let wal_instance =
-			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+		let mut wal_opts = wal::Options::default();
+		wal_opts.manual_flush = opts.manual_wal_flush;
+		wal_opts.buffer_size = opts.wal_buffer_size;
+		let wal_instance = Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal_opts)?;
 
 		// Starts at 0 since no commits have happened yet.
 		let visible_seq_num = Arc::new(AtomicU64::new(0));
@@ -1609,11 +1611,10 @@ impl Tree {
 
 		{
 			let mut wal_guard = self.core.inner.wal.write();
-			let new_wal = Wal::open_with_min_log_number(
-				&wal_path,
-				manifest_log_number,
-				wal::Options::default(),
-			)?;
+			let mut wal_opts = wal::Options::default();
+			wal_opts.manual_flush = self.core.inner.opts.manual_wal_flush;
+			wal_opts.buffer_size = self.core.inner.opts.wal_buffer_size;
+			let new_wal = Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal_opts)?;
 			*wal_guard = new_wal;
 		}
 

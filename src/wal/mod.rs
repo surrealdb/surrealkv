@@ -161,6 +161,16 @@ pub struct Options {
 
 	/// The maximum size of the segment file.
 	pub(crate) max_file_size: u64,
+
+	/// If true, the WAL writer holds appended records in its in-process
+	/// buffer and does not push them to the OS after each record. See
+	/// the top-level `Options::manual_wal_flush` field for the full
+	/// trade-off discussion. Default: false.
+	pub(crate) manual_flush: bool,
+
+	/// Capacity of the in-process WAL buffer (bytes). Mirrors the
+	/// top-level `Options::wal_buffer_size`. Default: BLOCK_SIZE.
+	pub(crate) buffer_size: usize,
 }
 
 impl Default for Options {
@@ -171,6 +181,8 @@ impl Default for Options {
 			compression_type: CompressionType::None,
 			file_extension: Some("wal".to_string()),
 			max_file_size: DEFAULT_FILE_SIZE,
+			manual_flush: false,
+			buffer_size: BLOCK_SIZE,
 		}
 	}
 }

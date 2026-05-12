@@ -221,6 +221,37 @@ pub struct Options {
 	/// Should be >= level0_max_files (compaction trigger).
 	/// Default: 12 (3x level0_max_files)
 	pub l0_stall_threshold: usize,
+
+	// WAL buffering configuration
+	/// If true, the WAL writer keeps appended records in its in-process
+	/// buffer and does NOT push them to the OS after each record.
+	/// Buffered bytes only reach the OS when the buffer fills (see
+	/// `wal_buffer_size`), or on an explicit `flush_wal` / `sync_wal`
+	/// / WAL rotation / shutdown.
+	///
+	/// Trade-off:
+	/// - `false` (default): every committed record reaches the OS page cache immediately via a
+	///   `write(2)` syscall. Strongest contract: abrupt process termination (`kill -9`, panic)
+	///   does NOT lose buffered data because the OS still has it. Pays one syscall per commit.
+	/// - `true`: per-commit syscall is skipped; data accumulates in user-space until the next
+	///   natural flush. Best for callers that batch sync explicitly (e.g. group commit / periodic
+	///   flushers). Abrupt process termination CAN lose up to `wal_buffer_size` bytes of recent
+	///   commits.
+	///
+	/// Default: false. Mirrors the default in similar engines (RocksDB's
+	/// `DBOptions::manual_wal_flush` is also false by default).
+	pub manual_wal_flush: bool,
+
+	/// In-process WAL buffer capacity, in bytes. Controls how much
+	/// committed data can accumulate in user-space before it is pushed
+	/// to the OS page cache. Larger values amortize syscall and lock
+	/// overhead better; smaller values bound the at-risk window for
+	/// `kill -9` style abrupt termination when `manual_wal_flush=true`.
+	///
+	/// Default: BLOCK_SIZE (32 KB). This matches the WAL record-framing
+	/// block size and is the smallest value that doesn't fragment records
+	/// across buffer flushes.
+	pub wal_buffer_size: usize,
 }
 
 impl Default for Options {
@@ -260,6 +291,8 @@ impl Default for Options {
 			level_multiplier: 10.0,
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
+			manual_wal_flush: false,
+			wal_buffer_size: crate::wal::BLOCK_SIZE,
 		}
 	}
 }
@@ -480,6 +513,36 @@ impl Options {
 	/// Sets the number of L0 files that triggers write stall.
 	pub const fn with_l0_stall_threshold(mut self, value: usize) -> Self {
 		self.l0_stall_threshold = value;
+		self
+	}
+
+	/// Sets WAL manual flush mode.
+	///
+	/// When `false` (default), every WAL record append calls `write(2)`
+	/// so data reaches the OS page cache immediately. When `true`, the
+	/// WAL writer holds appended records in its in-process buffer until
+	/// the buffer fills or an explicit `flush_wal`/`sync_wal`/rotation/
+	/// shutdown drains it.
+	///
+	/// Enable this together with an external coordinator (group commit
+	/// or a periodic background flusher) that calls `flush_wal()` to
+	/// bound the at-risk window. See `with_wal_buffer_size` to tune the
+	/// buffer capacity.
+	pub const fn with_manual_wal_flush(mut self, value: bool) -> Self {
+		self.manual_wal_flush = value;
+		self
+	}
+
+	/// Sets the in-process WAL buffer capacity in bytes.
+	///
+	/// This controls how much WAL data can accumulate in user-space
+	/// before being pushed to the OS page cache. Only meaningful when
+	/// `manual_wal_flush=true` — otherwise the buffer is flushed after
+	/// every record regardless of size.
+	///
+	/// Default: 32 KB (BLOCK_SIZE).
+	pub const fn with_wal_buffer_size(mut self, value: usize) -> Self {
+		self.wal_buffer_size = value;
 		self
 	}
 

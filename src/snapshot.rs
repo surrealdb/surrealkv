@@ -202,13 +202,22 @@ impl Snapshot {
 		}
 		drop(memtable_lock); // Release the lock on the immutable memtables
 
-		// Read lock on the level manifest
-		let level_manifest = self.core.level_manifest.read();
+		// Snapshot the level layout under a brief read lock, then drop the
+		// guard immediately. The actual SST walk happens lock-free against
+		// the cloned Arc<Level> vector. Arc clones are cheap atomic refcount
+		// bumps; the Tables they point to remain valid for the lifetime of
+		// our snapshot even if a concurrent compaction unlinks the
+		// underlying files (POSIX unlink keeps the inode alive while the
+		// open fd we hold is live).
+		let levels = {
+			let guard = self.core.level_manifest.read();
+			guard.levels.clone()
+		};
 
 		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
 
 		// Check the tables in each level for the key
-		for (level_idx, level) in (&level_manifest.levels).into_iter().enumerate() {
+		for (level_idx, level) in (&levels).into_iter().enumerate() {
 			if level_idx == 0 {
 				// Level 0: Tables can overlap, check all
 				for table in level.tables.iter() {
