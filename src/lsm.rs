@@ -1718,6 +1718,16 @@ impl Tree {
 
 impl Drop for Tree {
 	fn drop(&mut self) {
+		// Synchronously push any buffered WAL bytes to the OS BEFORE the
+		// async close runs. Durability::Eventual documents data as living
+		// "in the OS page cache" — that's only true if write(2) has been
+		// called. We don't fsync here (that's what `close().await` is for);
+		// we just need the bytes out of user-space so the kernel can keep
+		// them across process drop.
+		if let Err(err) = self.core.inner.wal.flush() {
+			log::warn!("Tree::drop: WAL flush failed: {err:?}");
+		}
+
 		#[cfg(not(target_arch = "wasm32"))]
 		{
 			// Native environment - use tokio

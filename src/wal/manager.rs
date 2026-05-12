@@ -154,6 +154,17 @@ impl Wal {
 		// Get file size from the opened file handle
 		let existing_size = file.metadata()?.len();
 
+		// `manual_flush = true`: the writer does NOT flush after every
+		// add_record. The underlying BufWriter still auto-flushes when its
+		// BLOCK_SIZE buffer fills, so the kernel gets ~1 write() per block
+		// instead of 1 per record. Explicit durability paths (`sync`,
+		// `rotate`, `close`) still flush the buffer before any fsync, so
+		// Durability::Immediate semantics are unchanged. Durability::Eventual
+		// callers already accept losing recent in-memory writes on crash;
+		// with manual flush, the unflushed window is bounded by the buffer
+		// (BLOCK_SIZE bytes), same crash-loss class.
+		const MANUAL_FLUSH: bool = true;
+
 		if existing_size > 0 {
 			// Existing file: detect the compression type from the file itself.
 			// This prevents compression mismatch bugs when reopening with different
@@ -166,7 +177,10 @@ impl Wal {
 			// Create buffered file writer
 			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-			Ok((Writer::new(buffered_writer, false, detected_compression, block_offset), sync_fd))
+			Ok((
+				Writer::new(buffered_writer, MANUAL_FLUSH, detected_compression, block_offset),
+				sync_fd,
+			))
 		} else {
 			// New file - use compression type from options
 			let compression_type = opts.compression_type;
@@ -174,7 +188,7 @@ impl Wal {
 			// Create buffered file writer
 			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
 
-			let mut writer = Writer::new(buffered_writer, false, compression_type, 0);
+			let mut writer = Writer::new(buffered_writer, MANUAL_FLUSH, compression_type, 0);
 			if compression_type != CompressionType::None {
 				writer.add_compression_type_record()?;
 			}
