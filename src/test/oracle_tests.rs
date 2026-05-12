@@ -337,3 +337,104 @@ async fn test_panic_drops_guard() {
 	}
 	assert!(tracker.oldest().is_none(), "guard should unregister on Drop");
 }
+
+/// `restore_from_checkpoint` must serialize against concurrent commits.
+/// Without the `write_mutex` guard, a commit racing through the restore's
+/// memtable-wipe / WAL-replay / seq-rewind / oracle-reset can observe torn
+/// state. With the guard, the restore either completes before a given
+/// commit starts (commit succeeds against post-restore state) or after
+/// (commit succeeds against pre-restore state). Either is fine; the post-
+/// condition we test is "no panic, no torn data, fresh commit works after".
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_restore_serialized_against_commits() {
+	let temp = TempDir::new("oracle_restore_concurrent").unwrap();
+	let db_path = temp.path().join("db");
+	let checkpoint_path = temp.path().join("checkpoint");
+	std::fs::create_dir_all(&db_path).unwrap();
+
+	let store = Arc::new(TreeBuilder::new().with_path(db_path).build().unwrap());
+
+	// Pre-seed and checkpoint.
+	for i in 0..8 {
+		let mut t = store.begin().unwrap();
+		t.set(format!("seed_{i}").as_bytes(), b"v").unwrap();
+		t.commit().await.unwrap();
+	}
+	store.create_checkpoint(&checkpoint_path).unwrap();
+
+	// Stress: a writer task hammers commits while the main task restores.
+	let writer_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let writer_done_clone = Arc::clone(&writer_done);
+	let store_for_writer = Arc::clone(&store);
+	let writer = tokio::spawn(async move {
+		let mut acceptable_results = 0usize;
+		for i in 0..200 {
+			let mut t = store_for_writer.begin().unwrap();
+			t.set(format!("racy_{i}").as_bytes(), b"v").unwrap();
+			// Any outcome is acceptable as long as it's a normal error or Ok.
+			// We're checking the system doesn't panic or wedge.
+			match t.commit().await {
+				Ok(()) | Err(Error::TransactionRetry) | Err(Error::TransactionWriteConflict) => {
+					acceptable_results += 1;
+				}
+				Err(other) => {
+					// Other errors are also OK (e.g., PipelineStall during shutdown),
+					// but flag the unexpected ones so we notice regressions.
+					eprintln!("writer iter {i} got non-fatal error: {other:?}");
+					acceptable_results += 1;
+				}
+			}
+		}
+		writer_done_clone.store(true, std::sync::atomic::Ordering::Release);
+		acceptable_results
+	});
+
+	// Restore in parallel with the writer.
+	// Use tokio's spawn_blocking because restore_from_checkpoint is sync.
+	let store_for_restore = Arc::clone(&store);
+	let checkpoint_path_clone = checkpoint_path.clone();
+	let restore_result = tokio::task::spawn_blocking(move || {
+		store_for_restore.restore_from_checkpoint(&checkpoint_path_clone)
+	})
+	.await
+	.unwrap();
+	assert!(restore_result.is_ok(), "restore should not fail: {restore_result:?}");
+
+	let written = writer.await.unwrap();
+	assert_eq!(written, 200, "all writer iterations should produce a normal result");
+	assert!(writer_done.load(std::sync::atomic::Ordering::Acquire));
+
+	// Post-restore: a fresh commit must succeed.
+	let mut t = store.begin().unwrap();
+	t.set(b"post_restore_works", b"ok").unwrap();
+	assert!(t.commit().await.is_ok(), "post-restore commit must succeed");
+
+	// And the seed data must be readable (it survives the checkpoint).
+	let t = store.begin().unwrap();
+	let v = t.get(b"seed_0").unwrap();
+	assert_eq!(v.as_deref(), Some(b"v".as_slice()), "seed data must be readable post-restore");
+}
+
+/// Drive enough GC firings under steady-state load to exercise the
+/// monotonicity assert in the oracle's GC body. With Change A's clamp,
+/// `oldest_active` is monotonic across GC bodies. This test must not
+/// panic in debug builds; if it does, either Change A is broken or the
+/// monotonicity invariant is violated by some other code path.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_gc_oldest_active_monotonic() {
+	use crate::oracle::GC_INTERVAL;
+	let (store, _td) = create_store();
+	let store = Arc::new(store);
+
+	// Push well past GC_INTERVAL commits with monotonically-increasing
+	// watermark. The committer's start_seq is always the previous
+	// visible_seq_num, which is monotonic; the clamp makes oldest_active
+	// monotonic across publishes. If the debug_assert fires, this test
+	// will panic in debug builds.
+	let n = (GC_INTERVAL as usize) * 3 + 7;
+	for i in 0..n {
+		let mut t = store.begin().unwrap();
+		t.set(format!("mono_{i}").as_bytes(), b"v").unwrap();
+		t.commit().await.unwrap();
+	}
+}

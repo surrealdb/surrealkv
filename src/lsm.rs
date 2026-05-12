@@ -232,9 +232,13 @@ impl CoreInner {
 	/// threshold: entries with `committed_seq < oldest_active_start_seq` can
 	/// be discarded because no live txn could prove non-conflict against them.
 	///
-	/// If no txns are alive, falls back to `visible_seq_num` — every future
-	/// txn will start at >= that value, so it's a safe upper bound on the
-	/// threshold.
+	/// If no txns are alive, falls back to `visible_seq_num`. NOTE: this
+	/// fallback is unsafe-by-default — if a caller drives `Core::commit`
+	/// without first registering in `active_txn_tracker`, the fallback may
+	/// exceed that caller's snapshot. The commit pipeline clamps the value
+	/// returned here by the committing txn's `start_seq` (see
+	/// `CommitPipeline::commit`), which neutralizes the fallback for all
+	/// production paths.
 	pub(crate) fn oldest_active_start_seq(&self) -> u64 {
 		let snap = self.snapshot_tracker.first();
 		let txn = self.active_txn_tracker.oldest();
@@ -1527,6 +1531,15 @@ impl Tree {
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
+		// Block new commits from entering the critical section for the duration
+		// of the restore. The restore is a multi-step rewrite of nearly all
+		// in-memory state (manifest, memtables, WAL, seq counters, oracle); a
+		// concurrent commit racing through any one of those steps would observe
+		// torn state. In-flight commits already past `write_mutex` (in their
+		// apply phase) will finish against the soon-to-be-replaced memtable —
+		// their data is intentionally discarded by the restore.
+		let _write_guard = self.core.commit_pipeline.lock_writes();
+
 		// Step 1: Restore files from checkpoint
 		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
 		let metadata = checkpoint.restore_from_checkpoint(checkpoint_dir)?;

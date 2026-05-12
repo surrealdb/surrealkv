@@ -229,6 +229,15 @@ impl CommitPipeline {
 		}
 	}
 
+	/// Block new commits from entering the critical section until the returned
+	/// guard is dropped. Used by `Tree::restore_from_checkpoint` to serialize
+	/// the multi-step restore (manifest reload, memtable wipe, WAL replay,
+	/// seq-counter rewind, oracle reset) against concurrent commits. Returns
+	/// `impl Drop` so callers don't bind to which internal lock backs it.
+	pub(crate) fn lock_writes(&self) -> impl Drop + '_ {
+		self.write_mutex.lock()
+	}
+
 	/// Discard all oracle entries and set `kept_since = max_seq`.
 	///
 	/// Called from `Tree::restore_from_checkpoint` after the seq counter has
@@ -295,7 +304,15 @@ impl CommitPipeline {
 			let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
 
 			// Publish the oracle entries with the allocated seq.
-			let oldest_active = self.env.oldest_active_start_seq();
+			//
+			// Clamp `oldest_active` by this txn's own `start_seq`. Defense-in-depth
+			// against a caller that drives `Core::commit` without registering in
+			// `active_txn_tracker` (the `(None, None)` fallback in
+			// `oldest_active_start_seq` returns `visible_seq_num`, which may exceed
+			// `start_seq` once `visible_seq_num` has advanced past the committing
+			// txn's snapshot). With this clamp, `kept_since` can never advance past
+			// the committing txn's own snapshot — regardless of caller hygiene.
+			let oldest_active = self.env.oldest_active_start_seq().min(start_seq);
 			self.oracle.publish(
 				batch.entries.iter().map(|e| e.key.as_slice()),
 				seq_num,
@@ -865,6 +882,82 @@ mod tests {
 		batch.add_record(InternalKeyKind::Set, b"K".to_vec(), Some(b"v2".to_vec()), 0).unwrap();
 		let r2 = pipeline.commit(batch, false, 0).await;
 		assert!(r2.is_ok(), "second commit on K should succeed (no ghost), got {r2:?}");
+
+		pipeline.shutdown();
+	}
+
+	/// A misbehaving `CommitEnv` reporting `oldest_active_start_seq` >
+	/// `start_seq` (e.g. caller bypassed `Transaction::new` and the
+	/// `(None, None)` fallback returned an over-large `visible_seq_num`)
+	/// must NOT advance `kept_since` past the committing txn's snapshot.
+	/// Change A clamps `oldest_active = env.oldest_active_start_seq().min(start_seq)`
+	/// in the publish call site.
+	struct OverreportingEnv {
+		overreport: u64,
+	}
+
+	impl CommitEnv for OverreportingEnv {
+		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
+			let mut new_batch = Batch::new(seq_num);
+			for entry in batch.entries() {
+				new_batch.add_record(
+					entry.kind,
+					entry.key.clone(),
+					entry.value.clone(),
+					entry.timestamp,
+				)?;
+			}
+			Ok(new_batch)
+		}
+
+		fn apply(&self, _batch: &Batch) -> Result<()> {
+			Ok(())
+		}
+
+		fn check_background_error(&self) -> Result<()> {
+			Ok(())
+		}
+
+		fn oldest_active_start_seq(&self) -> u64 {
+			self.overreport
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn test_publish_clamps_oldest_active_by_start_seq() {
+		use crate::oracle::GC_INTERVAL;
+
+		// Env reports an `oldest_active` way above any plausible start_seq.
+		let env = Arc::new(OverreportingEnv {
+			overreport: 10_000_000,
+		});
+		let pipeline = CommitPipeline::new(env, test_visible_seq_num(), test_write_stall());
+
+		// Drive enough commits past GC_INTERVAL with a tiny start_seq (= 0).
+		// Without the clamp, the GC body would advance `kept_since` to
+		// 10_000_000 and every subsequent `check(start_seq=0)` would
+		// TransactionRetry. With the clamp, `kept_since` cannot exceed
+		// the committer's start_seq (= 0 here), so it stays at 0.
+		for i in 0..(GC_INTERVAL + 2) {
+			let mut batch = Batch::new(0);
+			batch
+				.add_record(
+					InternalKeyKind::Set,
+					format!("k{i}").into_bytes(),
+					Some(b"v".to_vec()),
+					0,
+				)
+				.unwrap();
+			let r = pipeline.commit(batch, false, 0).await;
+			assert!(r.is_ok(), "iter {i}: commit must succeed, got {r:?}");
+		}
+
+		// Sanity: kept_since never advanced past the per-commit start_seq=0.
+		assert_eq!(
+			pipeline.oracle().kept_since(),
+			0,
+			"clamp must hold kept_since at the committer's start_seq",
+		);
 
 		pipeline.shutdown();
 	}

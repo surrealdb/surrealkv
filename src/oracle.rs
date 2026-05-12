@@ -55,6 +55,16 @@ struct OracleInner {
 	// `saturating_add` on increment so it doesn't overflow during long stretches
 	// where the watermark is pinned (e.g. one long reader holding GC back).
 	commits_since_gc: u32,
+
+	// Highest `oldest_active` observed at any GC body firing. Used by a
+	// debug-only monotonicity assert; the GC body asserts `oldest_active >=
+	// last_gc_oldest_active`. Catches caller-side regressions that pass a
+	// regressing `oldest_active` (the `oldest_active_start_seq` source) but
+	// will NOT fire on the documented registration race (see tracker.rs) —
+	// that race causes `kept_since` to exceed an unregistered txn's
+	// `start_seq` at check time, not a regression of `oldest_active`.
+	#[cfg(debug_assertions)]
+	last_gc_oldest_active: u64,
 }
 
 impl Default for CommitOracle {
@@ -70,6 +80,8 @@ impl CommitOracle {
 				recent_writes: HashMap::new(),
 				kept_since: 0,
 				commits_since_gc: 0,
+				#[cfg(debug_assertions)]
+				last_gc_oldest_active: 0,
 			}),
 		}
 	}
@@ -132,12 +144,22 @@ impl CommitOracle {
 		//   (a) Enough commits since the last sweep — perf throttle.
 		//   (b) Watermark has advanced past what we already pruned to —
 		//       skip fruitless walks.
-		// `oldest_active` is provably non-decreasing across calls (it's derived
-		// from `min(start_seq)` over live txns, and `visible_seq_num` is
-		// monotonic). The debug_assert catches any future code path that
-		// violates that invariant.
+		// `oldest_active` is expected to be non-decreasing across firings:
+		// it's clamped at the call site by the committing txn's `start_seq`
+		// (see `CommitPipeline::commit`), and both `active_txn_tracker.oldest`
+		// and `visible_seq_num` are monotonic. The debug-only assert below
+		// catches caller-side regressions.
 		if g.commits_since_gc >= GC_INTERVAL && oldest_active > g.kept_since {
-			debug_assert!(oldest_active >= g.kept_since, "oldest_active must be monotonic");
+			#[cfg(debug_assertions)]
+			{
+				debug_assert!(
+					oldest_active >= g.last_gc_oldest_active,
+					"oldest_active regressed across GC bodies: prev={} new={}",
+					g.last_gc_oldest_active,
+					oldest_active,
+				);
+				g.last_gc_oldest_active = oldest_active;
+			}
 			g.commits_since_gc = 0;
 			g.kept_since = oldest_active;
 			g.recent_writes.retain(|_, v| *v >= oldest_active);
@@ -152,11 +174,20 @@ impl CommitOracle {
 	/// a concurrent transaction has already overwritten an entry with a
 	/// higher seq, leaves it alone (their stamp wins).
 	///
-	/// Soundness: removing our entry can never cause a subsequent commit
-	/// to miss a *real* conflict. The seq we are rolling back was reserved
-	/// but its memtable apply failed; no other writer's correctness depends
-	/// on its presence. A late retry by the original caller will pass
-	/// validation (entry gone) and succeed at a fresh seq.
+	/// Soundness (live process only): removing our entry cannot cause a
+	/// subsequent commit to miss a *real* conflict in this process — the
+	/// seq we are rolling back was reserved but its memtable apply failed,
+	/// so no reader saw its writes. A concurrent overwriter's stamp is
+	/// preserved by the `v == my_seq` guard.
+	///
+	/// Across crash recovery, the WAL record for the failed-apply seq is
+	/// still durable and will be replayed into the memtable on restart. A
+	/// later same-key writer that committed in the live process can then
+	/// have a snapshot that did NOT see this seq, even though the
+	/// post-recovery DB contains it. The resulting SI gap is the
+	/// pre-existing apply-failure / seq-gap issue documented at
+	/// `src/commit.rs` (around the "Sequence number gaps" comment block)
+	/// and is orthogonal to this rollback's live-process soundness.
 	pub(crate) fn rollback<'a, I>(&self, keys: I, my_seq: u64)
 	where
 		I: IntoIterator<Item = &'a [u8]>,
@@ -189,6 +220,13 @@ impl CommitOracle {
 		g.kept_since = max_seq;
 		g.commits_since_gc = 0;
 		g.recent_writes.clear();
+		// `oldest_active` can legitimately go backwards across a restore (the
+		// seq counter has been rewound). Reset the monotonicity baseline so
+		// the debug assert doesn't fire on the first post-restore GC.
+		#[cfg(debug_assertions)]
+		{
+			g.last_gc_oldest_active = 0;
+		}
 	}
 
 	#[cfg(test)]

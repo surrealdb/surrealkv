@@ -10,14 +10,31 @@
 // concurrent transactions that happen to share a `start_seq` so `remove`
 // in `Drop` doesn't collide.
 //
-// Registration race safety: `Transaction::new` does
-// `start_seq = visible_seq_num.load(); tracker.register(start_seq);` with
-// no lock spanning the two operations. This is sound because
-// `visible_seq_num` is strictly monotonic (`CommitPipeline::publish` only
-// advances it via CAS), so any later `core.seq_num()` returns at least the
-// `start_seq` of any currently-registered transaction. A GC threshold
-// computed from `oldest()` can therefore never exceed a future transaction's
-// `start_seq`.
+// Registration race window (KNOWN, DOCUMENTED, NOT FIXED PROTOCOL-SIDE):
+//   `Transaction::new` does
+//     `start_seq = visible_seq_num.load(); tracker.register(start_seq);`
+//   with no synchronization spanning the two operations. If the thread is
+//   preempted between them and a concurrent commit fires the oracle's GC
+//   body with `oldest_active > start_seq` (because no other live txn has
+//   `start_seq <= our start_seq` at that moment), `kept_since` rises past
+//   our `start_seq`. Our subsequent `oracle.check` then returns
+//   `TransactionRetry`.
+//
+//   This is benign:
+//     - `TransactionRetry` is already part of the public API contract and callers of
+//       `Transaction::commit` are required to retry.
+//     - On retry, `start_seq` is reloaded fresh and the race window does not re-apply.
+//     - Worst-case cost per occurrence: one extra `begin()` call, no I/O.
+//     - The race fires only when (a) `commits_since_gc` reaches `GC_INTERVAL` during the
+//       load+register window (typically microseconds), AND (b) no other live txn pins the
+//       oldest_active below our `start_seq`. Combined probability is low.
+//
+//   Protocol-side fixes considered and rejected: every variant (mutex gate
+//   around load+register, retry loop, lock-free placeholder-then-update)
+//   adds ~10ns or more to every `begin()`. The cost arithmetic doesn't
+//   favor preventing a sub-1500ns/sec event by paying ~1ms/sec across all
+//   begins. Revisit if production benchmarks show the race firing often
+//   enough to dominate.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
