@@ -83,7 +83,6 @@ pub trait CompactionOperations: Send + Sync {
 /// 1. `active_memtable` - serializes writes
 /// 2. `level_manifest` - SST metadata and table IDs
 /// 3. `immutable_memtables` - pending flush queue
-/// 4. `flushed_history` - conflict detection history
 ///
 /// Read locks and write locks follow the same ordering.
 /// If a function needs multiple locks, it must acquire them in this order.
@@ -105,13 +104,6 @@ pub(crate) struct CoreInner {
 	/// to flush them to disk as SSTables.
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 
-	/// Most recently flushed memtable kept for conflict detection.
-	/// When a memtable is flushed to SST, it's moved here so that long-running
-	/// transactions can still detect conflicts against recently flushed data.
-	/// This prevents spurious TransactionRetry errors when immutable_memtables
-	/// becomes empty after a flush.
-	pub(crate) flushed_history: Arc<RwLock<Option<Arc<MemTable>>>>,
-
 	/// The level structure managing all SSTables on disk.
 	///
 	/// LSM trees organize SSTables into levels:
@@ -128,6 +120,13 @@ pub(crate) struct CoreInner {
 	/// of the data. The tracker stores actual sequence numbers to enable
 	/// snapshot-aware compaction.
 	pub(crate) snapshot_tracker: SnapshotTracker,
+
+	/// Tracker for ALL active transaction `start_seq_num`s. Used as the
+	/// watermark source for `CommitOracle` GC. Separate from
+	/// `snapshot_tracker` because write-only txns need GC protection but
+	/// don't hold MVCC snapshots, and the oracle's required watermark may
+	/// advance faster than snapshot retention permits.
+	pub(crate) active_txn_tracker: Arc<crate::tracker::ActiveTxnTracker>,
 
 	/// Value Log (VLog)
 	pub(crate) vlog: Option<Arc<VLog>>,
@@ -147,7 +146,6 @@ pub(crate) struct CoreInner {
 
 	/// Visible sequence number - the highest sequence number that is visible to readers.
 	/// Shared with CommitPipeline for coordinated updates.
-	/// Used to set `earliest_seq` when creating new memtables for conflict detection.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
 }
 
@@ -177,7 +175,7 @@ impl CoreInner {
 
 		// Initialize active memtable with its WAL number set to the initial WAL
 		// This tracks which WAL the memtable's data belongs to for later flush
-		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size, 0));
+		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size));
 		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
 		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
@@ -208,13 +206,13 @@ impl CoreInner {
 			immutable_memtables,
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
+			active_txn_tracker: Arc::new(crate::tracker::ActiveTxnTracker::new()),
 			vlog,
 			wal: WalManager::new(wal_instance),
 			versioned_index,
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
-			flushed_history: Arc::new(RwLock::new(None)),
 		})
 	}
 
@@ -229,72 +227,27 @@ impl CoreInner {
 			.unwrap_or(0)
 	}
 
-	pub(crate) fn check_keys_conflict<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
-	where
-		I: Iterator<Item = &'a [u8]>,
-	{
-		// Lock order: active → immutables → history
-		// All three locks are held for the duration of both the earliest_seq check
-		// and the conflict detection to prevent races with background flushes.
-		let memtable = self.active_memtable.read()?;
-		let immutables = self.immutable_memtables.read()?;
-		let history = self.flushed_history.read()?;
-
-		// Check if memtable history is sufficient for conflict detection.
-		// This must be done while holding all locks to prevent a race where
-		// flushed_history is replaced between this check and the conflict scan.
-		let earliest_seq = if let Some(ref h) = *history {
-			h.earliest_seq()
-		} else if let Some(oldest) = immutables.first() {
-			oldest.memtable.earliest_seq()
-		} else {
-			memtable.earliest_seq()
-		};
-
-		if start_seq < earliest_seq {
-			return Err(Error::TransactionRetry);
+	/// Smallest `start_seq_num` of any currently-live transaction (read-write
+	/// snapshot OR write-only). Used by the `CommitOracle` as its GC
+	/// threshold: entries with `committed_seq < oldest_active_start_seq` can
+	/// be discarded because no live txn could prove non-conflict against them.
+	///
+	/// If no txns are alive, falls back to `visible_seq_num`. NOTE: this
+	/// fallback is unsafe-by-default — if a caller drives `Core::commit`
+	/// without first registering in `active_txn_tracker`, the fallback may
+	/// exceed that caller's snapshot. The commit pipeline clamps the value
+	/// returned here by the committing txn's `start_seq` (see
+	/// `CommitPipeline::commit`), which neutralizes the fallback for all
+	/// production paths.
+	pub(crate) fn oldest_active_start_seq(&self) -> u64 {
+		let snap = self.snapshot_tracker.first();
+		let txn = self.active_txn_tracker.oldest();
+		match (snap, txn) {
+			(Some(a), Some(b)) => a.min(b),
+			(Some(a), None) => a,
+			(None, Some(b)) => b,
+			(None, None) => self.visible_seq_num.load(Ordering::Acquire),
 		}
-
-		for key in keys {
-			// Check active memtable first (most recent writes)
-			if let Some((ikey, _)) = memtable.get(key, None) {
-				if ikey.seq_num() > start_seq {
-					return Err(Error::TransactionWriteConflict);
-				}
-				// Key exists but was written before our transaction started - no conflict
-				continue;
-			}
-
-			// Check immutable memtables (newest to oldest by iterating in reverse)
-			let mut found_in_immutable = false;
-			for entry in immutables.iter().rev() {
-				if let Some((ikey, _)) = entry.memtable.get(key, None) {
-					if ikey.seq_num() > start_seq {
-						return Err(Error::TransactionWriteConflict);
-					}
-					// Key exists but was written before our transaction started - no conflict
-					found_in_immutable = true;
-					break;
-				}
-			}
-			if found_in_immutable {
-				continue;
-			}
-
-			// Check flushed history
-			if let Some(ref flushed) = *history {
-				if let Some((ikey, _)) = flushed.get(key, None) {
-					if ikey.seq_num() > start_seq {
-						return Err(Error::TransactionWriteConflict);
-					}
-					// Key exists but was written before our transaction started - no conflict
-				}
-			}
-			// Key not found in any memtable or history - no conflict for this key
-		}
-
-		// No conflicts found for any key
-		Ok(())
 	}
 
 	/// Flushes a memtable to SST and atomically updates the manifest.
@@ -372,10 +325,9 @@ impl CoreInner {
 		);
 
 		// Step 4: Apply changeset atomically
-		// Lock order: level_manifest → immutable_memtables → flushed_history
+		// Lock order: level_manifest → immutable_memtables
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
-		let mut history_lock = self.flushed_history.write()?;
 
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
@@ -390,12 +342,13 @@ impl CoreInner {
 			return Err(error);
 		}
 
-		// Remove successfully flushed memtable from immutables tracking
+		// Remove successfully flushed memtable from immutables tracking. The
+		// Arc<MemTable> in `memtable` (function parameter) falls out of scope at
+		// end of function — its data is now available via the SST that was just
+		// added to the manifest, and conflict detection uses the in-memory oracle
+		// (independent of memtables), so dropping this Arc is safe.
 		memtable_lock.remove(table_id);
-
-		// Atomically add to flushed history for conflict detection
-		// This ensures no visibility gap where memtable is in neither collection
-		*history_lock = Some(memtable);
+		drop(memtable);
 
 		log::info!(
 			"Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
@@ -447,10 +400,9 @@ impl CoreInner {
 		};
 
 		// Step 3: Swap memtable while STILL holding write lock
-		let earliest_seq = self.visible_seq_num.load(Ordering::Acquire);
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size, earliest_seq)),
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
 		);
 
 		// Set the WAL number on the new (empty) active memtable
@@ -617,14 +569,11 @@ impl CoreInner {
 		// Get the current WAL number for the new memtable
 		let current_wal_number = self.wal.read().get_active_log_number();
 
-		// Get the current visible_seq_num as earliest_seq for the new memtable
-		let earliest_seq = self.visible_seq_num.load(Ordering::Acquire);
-
 		// Swap the active memtable with a new empty one
 		// This allows writes to continue immediately
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size, earliest_seq)),
+			Arc::new(MemTable::new(self.opts.max_memtable_size)),
 		);
 
 		// Set the WAL number on the new active memtable
@@ -1032,8 +981,8 @@ impl CommitEnv for LsmCommitEnv {
 		self.core.error_handler.check_error()
 	}
 
-	fn validate_write_conflicts(&self, batch: &Batch) -> Result<()> {
-		self.core.check_keys_conflict(batch.entries.iter().map(|b| b.key.as_slice()), batch.starting_seq_num)
+	fn oldest_active_start_seq(&self) -> u64 {
+		self.core.oldest_active_start_seq()
 	}
 }
 
@@ -1328,9 +1277,12 @@ impl Core {
 		Ok(core)
 	}
 
-	pub(crate) async fn commit(&self, batch: Batch, sync: bool) -> Result<()> {
-		// Commit the batch using the commit pipeline
-		self.commit_pipeline.commit(batch, sync).await
+	pub(crate) async fn commit(&self, batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
+		// Commit the batch using the commit pipeline. `start_seq` is the
+		// transaction's snapshot seq (used by the oracle's write-write
+		// conflict check). The write keys are derived from `batch.entries`
+		// inside the pipeline — no duplicated parallel array.
+		self.commit_pipeline.commit(batch, sync, start_seq).await
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {
@@ -1579,6 +1531,15 @@ impl Tree {
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
+		// Block new commits from entering the critical section for the duration
+		// of the restore. The restore is a multi-step rewrite of nearly all
+		// in-memory state (manifest, memtables, WAL, seq counters, oracle); a
+		// concurrent commit racing through any one of those steps would observe
+		// torn state. In-flight commits already past `write_mutex` (in their
+		// apply phase) will finish against the soon-to-be-replaced memtable —
+		// their data is intentionally discarded by the restore.
+		let _write_guard = self.core.commit_pipeline.lock_writes();
+
 		// Step 1: Restore files from checkpoint
 		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
 		let metadata = checkpoint.restore_from_checkpoint(checkpoint_dir)?;
@@ -1597,10 +1558,8 @@ impl Tree {
 		// Clear the current memtables since they would be stale after restore
 		// This discards any pending writes, which is correct for restore operations
 		{
-			let earliest_seq = self.core.inner.visible_seq_num.load(Ordering::Acquire);
 			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable =
-				Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size, earliest_seq));
+			*active_memtable = Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size));
 		}
 
 		{
@@ -1668,8 +1627,12 @@ impl Tree {
 			None => manifest_last_seq,
 		};
 
-		// Set visible sequence number
+		// Set visible sequence number AND reset the oracle. The live process
+		// may have accumulated oracle entries from pre-restore commits whose
+		// seqs are now ghosts of a future that no longer exists; clearing them
+		// prevents false write-write conflicts for new post-restore txns.
 		self.core.commit_pipeline.set_seq_num(max_seq_num);
+		self.core.commit_pipeline.reset_oracle_for_restore(max_seq_num);
 
 		Ok(metadata)
 	}

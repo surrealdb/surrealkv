@@ -7,6 +7,7 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{HistoryIterator, MergeDirection, Snapshot, SnapshotIterator};
+use crate::tracker::ActiveTxnGuard;
 use crate::{InternalKeyKind, InternalKeyRef, IntoBytes, Key, LSMIterator, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can
@@ -228,6 +229,12 @@ pub struct Transaction {
 	/// write sequence number is used for real-time ordering of writes within a
 	/// transaction.
 	write_seqno: u32,
+
+	/// Registry slot in `Core::active_txn_tracker`. Drop unregisters the
+	/// `start_seq_num` from the GC watermark used by `CommitOracle`.
+	/// `Option<>` so that `rollback`/`commit` can release the slot promptly
+	/// rather than waiting for the `Transaction`'s own `Drop`.
+	txn_guard: Option<ActiveTxnGuard>,
 }
 
 impl Transaction {
@@ -258,6 +265,14 @@ impl Transaction {
 		// Get the current visible sequence number as our start point.
 		let start_seq_num = core.seq_num();
 
+		// Register this txn's start_seq with the GC watermark tracker.
+		// Both read-write and write-only txns register here (write-only txns
+		// don't get a Snapshot, so SnapshotTracker alone wouldn't see them).
+		// See registration-race proof in the plan: visible_seq_num is
+		// strictly monotonic, so this load-then-register sequence cannot
+		// cause GC to advance past our start_seq.
+		let txn_guard = Some(core.active_txn_tracker.register(start_seq_num));
+
 		let mut snapshot = None;
 		if !mode.is_write_only() {
 			snapshot = Some(Snapshot::new(Arc::clone(&core), start_seq_num));
@@ -273,6 +288,7 @@ impl Transaction {
 			start_seq_num,
 			savepoints: 0,
 			write_seqno: 0,
+			txn_guard,
 		})
 	}
 
@@ -730,11 +746,18 @@ impl Transaction {
 		// If there are no pending writes, there's nothing to commit, so return early.
 		if self.write_set.is_empty() {
 			self.closed = true;
+			// Release the GC watermark slot promptly; otherwise it waits for Drop.
+			if let Some(mut g) = self.txn_guard.take() {
+				g.release();
+			}
 			return Ok(());
 		}
 
-		// Create and prepare batch directly
-		let mut batch = Batch::new(self.start_seq_num);
+		// Create and prepare batch directly. `Batch::new(0)`: the
+		// `starting_seq_num` will be stamped by the commit pipeline after
+		// seq allocation. The pipeline derives oracle keys from
+		// `batch.entries` itself, so we don't pre-collect a parallel vector.
+		let mut batch = Batch::new(0);
 
 		// Extract the vector of entries for the current transaction,
 		// respecting the insertion order recorded with Entry::seqno.
@@ -757,12 +780,17 @@ impl Transaction {
 			batch.add_record(entry.kind, entry.key, entry.value, timestamp)?;
 		}
 
-		// Write the batch to storage
+		// Write the batch to storage. The pipeline runs the oracle.check +
+		// seq alloc + oracle.publish + WAL atomically under `write_mutex`,
+		// then runs memtable apply OUTSIDE the lock.
 		let should_sync = self.durability == Durability::Immediate;
-		self.core.commit(batch, should_sync).await?;
+		self.core.commit(batch, should_sync, self.start_seq_num).await?;
 
-		// Mark the transaction as closed
+		// Mark the transaction as closed and release the watermark slot.
 		self.closed = true;
+		if let Some(mut g) = self.txn_guard.take() {
+			g.release();
+		}
 		Ok(())
 	}
 
@@ -772,6 +800,10 @@ impl Transaction {
 		self.snapshot.take();
 		self.savepoints = 0;
 		self.write_seqno = 0;
+		// Release the GC watermark slot eagerly (Drop is a fallback for panic paths).
+		if let Some(mut g) = self.txn_guard.take() {
+			g.release();
+		}
 	}
 
 	/// After calling this method the subsequent modifications within this

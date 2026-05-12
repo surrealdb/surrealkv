@@ -31,6 +31,8 @@ pub mod manifest_tests;
 #[cfg(test)]
 pub mod memtable_tests;
 #[cfg(test)]
+pub mod oracle_tests;
+#[cfg(test)]
 pub mod recovery_integration_tests;
 #[cfg(test)]
 pub mod recovery_test_helpers;

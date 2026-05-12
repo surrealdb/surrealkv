@@ -96,6 +96,13 @@ impl SnapshotTracker {
 	pub(crate) fn get_all_snapshots(&self) -> Vec<u64> {
 		self.snapshots.iter().map(|entry| *entry).collect()
 	}
+
+	/// Returns the smallest active snapshot seq, if any. O(log N) via
+	/// `SkipSet::front`. Used by the commit oracle to compute its GC
+	/// watermark on every commit.
+	pub(crate) fn first(&self) -> Option<u64> {
+		self.snapshots.front().map(|e| *e.value())
+	}
 }
 
 // ===== Iterator State =====

@@ -1042,8 +1042,7 @@ impl<'a> CompactionIterator<'a> {
 		// (ckl 0.5.19, surrealkv 0.21.1) — see Koslab-DevOrg/ckl
 		// `docs/known-issues.md#KNOWN_ISSUE-001` for the full forensic
 		// trail (failing key, fingerprint, recovery cycle).
-		self.accumulated_versions
-			.dedup_by_key(|b| b.0.seq_num());
+		self.accumulated_versions.dedup_by_key(|b| b.0.seq_num());
 
 		// Check if latest version is DELETE at bottom level
 		// If so, we can completely remove this key from the database

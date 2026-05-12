@@ -21,11 +21,12 @@ pub(crate) struct Batch {
 	pub(crate) entries: Vec<BatchEntry>,
 	pub(crate) valueptrs: Vec<Option<ValuePointer>>, /* Parallel array to entries, None for
 	                                                  * inline values */
-	// Starting sequence number for this batch
-	// Initial with start sequence number of a transaction for the write-write conflict validation,
-	// and update to log sequence number before WAL write.
+	// The WAL log sequence number assigned to the first entry in this batch.
+	// Stamped by `CommitPipeline::commit` under `write_mutex` after the
+	// oracle has validated the write set. Constructed with `0` by callers;
+	// the pipeline overwrites it before the batch is written to WAL.
 	pub(crate) starting_seq_num: u64,
-	pub(crate) size: u64,             // Total size of all records (not serialized)
+	pub(crate) size: u64, // Total size of all records (not serialized)
 }
 
 impl Default for Batch {
