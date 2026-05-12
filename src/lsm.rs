@@ -126,7 +126,7 @@ pub(crate) struct CoreInner {
 	/// `snapshot_tracker` because write-only txns need GC protection but
 	/// don't hold MVCC snapshots, and the oracle's required watermark may
 	/// advance faster than snapshot retention permits.
-	pub(crate) active_txn_tracker: Arc<crate::active_txn_tracker::ActiveTxnTracker>,
+	pub(crate) active_txn_tracker: Arc<crate::tracker::ActiveTxnTracker>,
 
 	/// Value Log (VLog)
 	pub(crate) vlog: Option<Arc<VLog>>,
@@ -206,7 +206,7 @@ impl CoreInner {
 			immutable_memtables,
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
-			active_txn_tracker: Arc::new(crate::active_txn_tracker::ActiveTxnTracker::new()),
+			active_txn_tracker: Arc::new(crate::tracker::ActiveTxnTracker::new()),
 			vlog,
 			wal: WalManager::new(wal_instance),
 			versioned_index,

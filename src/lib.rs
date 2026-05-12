@@ -1,4 +1,3 @@
-mod active_txn_tracker;
 mod batch;
 pub mod bplustree;
 mod cache;
@@ -19,6 +18,7 @@ mod snapshot;
 mod sstable;
 mod stall;
 mod task;
+mod tracker;
 mod transaction;
 mod vfs;
 mod vlog;

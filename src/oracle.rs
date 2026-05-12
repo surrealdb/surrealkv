@@ -13,21 +13,6 @@
 //   `oldest_active = min(start_seq over live transactions)` as the threshold.
 //   Map size is bounded by the live-reader window, not by commit count or any
 //   tuning knob.
-//
-// Why u64 fingerprints (not full keys):
-//   Per-check collision rate is `map_size / 2^64`. For 1M entries it's
-//   5.4e-14; for 10M, 5.4e-13. False aborts at these rates are below
-//   cosmic-ray bit-flip frequencies and have never been reported in
-//   Badger (which uses the same approach in production since 2017).
-//   Memory: ~3x smaller than full-key storage. No per-publish allocation.
-//   On the rare collision: a transaction sees a spurious WriteConflict,
-//   retries, and succeeds. Soundness is preserved.
-//
-// Why a single `parking_lot::Mutex`:
-//   The critical section is short (O(W) hash ops, no I/O). RwLock buys
-//   nothing — every call mutates state. Sharding helps only if commits
-//   scaled past `write_mutex`, which serializes them already at a coarser
-//   layer.
 
 use std::collections::HashMap;
 
@@ -106,7 +91,7 @@ impl CommitOracle {
 	/// `start_seq` falls inside `[seq_num, seq_num+count-1)` may see a false
 	/// conflict, but no real conflict is ever missed.
 	///
-	/// GC cadence (Badger pattern): run per publish, but bail immediately when
+	/// GC cadence: run per publish, but bail immediately when
 	/// `oldest_active` has not advanced since the previous sweep. In steady
 	/// state under long-lived readers this is two atomic-ish reads + a
 	/// comparison and no map walk. When the watermark moves, prune entries

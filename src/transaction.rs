@@ -3,11 +3,11 @@ use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::active_txn_tracker::ActiveTxnGuard;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{HistoryIterator, MergeDirection, Snapshot, SnapshotIterator};
+use crate::tracker::ActiveTxnGuard;
 use crate::{InternalKeyKind, InternalKeyRef, IntoBytes, Key, LSMIterator, Value};
 
 /// `Mode` is an enumeration representing the different modes a transaction can

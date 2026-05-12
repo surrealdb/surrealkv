@@ -277,9 +277,7 @@ impl CommitPipeline {
 		//
 		// Memtable `apply()` is intentionally OUTSIDE this block — that is
 		// the throughput unlock. While T1 is applying, T2 can enter
-		// `write_mutex` and run validate + seq + oracle + WAL. This is the
-		// pipeline-overlap pattern Pebble uses and that surrealkv used
-		// before PR #378.
+		// `write_mutex` and run validate + seq + oracle + WAL.
 		//
 		// Keys are derived from `batch.entries` (single source of truth).
 		// Duplicate keys within a batch (e.g. from savepoint history) are
