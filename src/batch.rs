@@ -168,6 +168,18 @@ impl Batch {
 		self.entries.is_empty()
 	}
 
+	/// Upper bound on the bytes this batch would consume in a memtable's skiplist arena.
+	/// Uses the worst-case per-entry overhead (max skiplist height + alignment padding),
+	/// so the actual allocation cannot exceed this. Used by `MemTable::add` for atomic
+	/// preflight reservation.
+	pub(crate) fn memtable_size_estimate(&self) -> u64 {
+		use crate::memtable::max_entry_bytes;
+		self.entries
+			.iter()
+			.map(|e| max_entry_bytes(e.key.len(), e.value.as_ref().map_or(0, |v| v.len())))
+			.sum()
+	}
+
 	/// Get entries for VLog processing
 	#[cfg(test)]
 	pub(crate) fn entries(&self) -> &[BatchEntry] {

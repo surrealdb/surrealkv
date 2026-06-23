@@ -948,6 +948,16 @@ impl CommitEnv for LsmCommitEnv {
 	}
 
 	/// Apply batch to memtable with retry on arena full.
+	///
+	/// Atomicity invariant (since the introduction of `MemTable::try_reserve`):
+	/// `active_memtable.add(batch)` either fully applies the batch or returns
+	/// `Err(ArenaFull)` with the memtable unchanged. The rotate-and-retry below
+	/// is therefore safe: no partial-application prefix can leak into the
+	/// immutable queue, and the retry on a fresh memtable will not produce
+	/// duplicates of `(user_key, seq_num)` across two SSTs. This matters
+	/// specifically because `CommitPipeline::commit` (see commit.rs) runs
+	/// `apply()` outside its `write_mutex`, so concurrent calls to this
+	/// function on the same active memtable are routine.
 	fn apply(&self, batch: &Batch) -> Result<()> {
 		// Try to add to current memtable
 		let result = {

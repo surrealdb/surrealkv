@@ -26,14 +26,28 @@ use crate::error::Result as CrateResult;
 use crate::memtable::arena::Arena;
 use crate::{InternalKey, InternalKeyRef, LSMIterator};
 
-const MAX_HEIGHT: usize = 20;
+pub(crate) const MAX_HEIGHT: usize = 20;
 const P_VALUE: f64 = 1.0 / std::f64::consts::E; // ~0.368
 
 /// Size of the Links struct
-const LINKS_SIZE: usize = std::mem::size_of::<Links>();
+pub(crate) const LINKS_SIZE: usize = std::mem::size_of::<Links>();
 
 /// Maximum node size (with full tower)
-const MAX_NODE_SIZE: usize = std::mem::size_of::<Node>() + (MAX_HEIGHT - 1) * LINKS_SIZE;
+pub(crate) const MAX_NODE_SIZE: usize = std::mem::size_of::<Node>() + (MAX_HEIGHT - 1) * LINKS_SIZE;
+
+/// Skiplist node allocation alignment (matches the hard-coded `8` in `new_raw_node`).
+pub(crate) const NODE_ALIGNMENT: u32 = 8;
+
+// Compile-time sanity check: if `Node` layout changes, this fires.
+// If you hit this, recompute the entry-size constants accordingly.
+const _: () = assert!(MAX_NODE_SIZE == 192);
+
+/// Upper bound on bytes consumed in the arena by inserting one entry
+/// with the given key/value sizes. Worst-case skiplist height + alignment padding.
+/// Used for atomic preflight reservation in `MemTable::add`.
+pub(crate) const fn max_entry_bytes(key_len: usize, value_len: usize) -> u64 {
+	(MAX_NODE_SIZE as u64) + (key_len as u64) + (value_len as u64) + (NODE_ALIGNMENT as u64 - 1)
+}
 
 /// Precomputed probabilities for random height generation
 fn probabilities() -> &'static [u32; MAX_HEIGHT] {
@@ -308,6 +322,12 @@ impl Skiplist {
 	#[inline]
 	pub fn size(&self) -> u32 {
 		self.arena.size() as u32
+	}
+
+	/// Arena capacity getter (total bytes available to this skiplist's arena).
+	#[inline]
+	pub fn arena_capacity(&self) -> usize {
+		self.arena.buf.len()
 	}
 
 	/// Add a key
