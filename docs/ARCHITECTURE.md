@@ -130,7 +130,6 @@ database_path/
 ├── vlog/                   # Value log files (if enabled)
 │   ├── 00000000000000000001.vlog
 │   └── 00000000000000000002.vlog
-├── versioned_index/        # B+tree index (if enabled)
 └── LOCK                    # Lock file
 ```
 
@@ -505,31 +504,28 @@ This enables time-travel queries where applications can read the database state 
 
 ### Versioned Storage Architecture
 
-When versioning is enabled, SurrealKV automatically configures the storage layer to support efficient historical queries. The key insight is that all values are stored in the VLog, and indexes (both LSM and optional B+tree) store only value pointers. This architecture enables multiple index structures on top of a single value store.
+When versioning is enabled, SurrealKV automatically configures the storage layer to support efficient historical queries. All values are stored in the VLog, and the LSM tree stores only value pointers.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                     VERSIONED STORAGE ARCHITECTURE                          │
 │                                                                             │
 │  When versioning is enabled, all values are stored in VLog.                 │
-│  Indexes store only value pointers, enabling multiple index structures.     │
+│  The LSM tree stores only value pointers.                                   │
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │                        INDEX LAYER                                  │    │
 │  │                                                                     │    │
-│  │   ┌───────────────────┐         ┌───────────────────┐               │    │
-│  │   │  LSM Tree Index   │         │  B+Tree Index     │               │    │
-│  │   │  (always present) │         │  (optional)       │               │    │
-│  │   │                   │         │                   │               │    │
-│  │   │  InternalKey ──►  │         │  InternalKey ──►  │               │    │
-│  │   │  ValuePointer     │         │  ValuePointer     │               │    │
-│  │   └─────────┬─────────┘         └─────────┬─────────┘               │    │
-│  │             │                             │                         │    │
-│  │             └──────────────┬──────────────┘                         │    │
-│  │                            │                                        │    │
-│  └────────────────────────────┼────────────────────────────────────────┘    │
-│                               │                                             │
-│                               ▼                                             │
+│  │                    ┌───────────────────┐                            │    │
+│  │                    │  LSM Tree Index   │                            │    │
+│  │                    │                   │                            │    │
+│  │                    │  InternalKey ──►  │                            │    │
+│  │                    │  ValuePointer     │                            │    │
+│  │                    └─────────┬─────────┘                            │    │
+│  │                              │                                      │    │
+│  └──────────────────────────────┼──────────────────────────────────────┘    │
+│                                 │                                           │
+│                                 ▼                                           │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
 │  │                        VALUE LOG (VLog)                             │    │
 │  │                                                                     │    │
@@ -550,59 +546,23 @@ When `with_versioning(true, retention_ns)` is called:
 - `vlog_value_threshold` is set to 0, so all values go to VLog
 - The LSM tree stores `(InternalKey → ValuePointer)` instead of inline values
 
-**Two Query Modes:**
-
-| Mode | Configuration | Query Method |
-|------|---------------|--------------|
-| LSM-only | `with_versioning(true, retention_ns)` | K-way merge across all LSM components |
-| B+tree indexed | + `with_versioned_index(true)` | Direct B+tree lookup |
-
 **LSM-based Versioned Queries:**
 
-When using LSM-only versioning, the `history()` API uses a `KMergeIterator` that gathers iterators from:
+The `history()` API uses a `KMergeIterator` that gathers iterators from:
 - Active memtable
 - All immutable memtables (pending flush)
 - All SSTable levels (L0, L1, L2, ...)
 
 These are merged using a k-way merge that returns entries sorted by (user_key, seq_num descending). Finding all versions of a key requires scanning all levels.
 
-**B+tree Versioned Queries:**
-
-When `with_versioned_index(true)` is also enabled, versioned queries go directly to the B+tree which stores all `(InternalKey → ValuePointer)` entries. The B+tree keeps entries sorted, so all versions of a key are contiguous and can be retrieved with a single seek.
-
-The B+tree implementation uses a disk-based page management approach, with the handling of large entries drawing inspiration from SQLite's overflow page design.
-
-**Why Use B+tree Index:**
-
-The motivation for the optional B+tree index:
-- LSM stores keys across multiple SSTables; finding all versions requires checking every level
-- B+tree consolidates all versions in a single sorted structure
-- Single index lookup vs. merging N sources (where N = memtables + SSTables)
-
-**B+tree Trade-offs:**
-
-| Pros | Cons |
-|------|------|
-| Single index lookup instead of k-way merge | Slow insertion (in-place modified tree on disk) |
-| Fast point and range queries for history | Insert performance slows during LSM writes |
-| All versions of a key are contiguous | Every LSM write also updates B+tree |
-
 **Timestamp Ordering Limitation:**
 
-When using LSM-only versioning (without B+tree index), timestamps inserted "back in time" will not be read correctly. This occurs because:
+Timestamps inserted "back in time" (earlier than existing timestamps for a key) will not be read correctly. This occurs because:
 - LSM orders entries by `(user_key ASC, seq_num DESC)`
 - Point-in-time queries (`get_at`) find the first entry with `seq_num <= snapshot_seq` where `timestamp <= query_timestamp`
 - A later-inserted entry with an earlier timestamp will have a higher sequence number, causing it to be returned instead of the correct historical value
 
-To support out-of-order timestamp inserts, enable the B+tree index with `with_versioned_index(true)`. The B+tree stores entries sorted by `(user_key, timestamp)` and supports in-place updates, correctly handling historical data insertion.
-
-**Read-after-Write Consistency:**
-
-Currently, the B+tree index is updated synchronously during LSM writes, providing read-after-write consistency for versioned queries. A recently written version is immediately visible via the `history()` API.
-
-**Future Work:**
-
-Async indexing could improve write performance by decoupling B+tree updates from the LSM write path. However, this would require relaxing the read-after-write consistency guarantee (recently written versions may not be immediately visible via B+tree queries). This is a potential optimization for future versions.
+Insert versions in increasing timestamp order per key to avoid this.
 
 ---
 
@@ -987,16 +947,6 @@ Any VLog file with `file_id < min_oldest_vlog` is safe to delete because no SSTa
 │                                                                             │
 │  This prevents deleting files that in-flight reads may access.              │
 └─────────────────────────────────────────────────────────────────────────────┘
-                                       │
-                                       ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         VERSIONED INDEX CLEANUP                             │
-│                                                                             │
-│  If versioned_index (B+tree) is enabled:                                    │
-│    - Scan B+tree entries for stale VLog pointers                            │
-│    - Remove entries where pointer.file_id < min_oldest_vlog                 │
-│    - Uses read-scan + batched-write-delete for concurrency safety           │
-└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### GC Components
@@ -1006,7 +956,6 @@ Any VLog file with `file_id < min_oldest_vlog` is safe to delete because no SSTa
 | **oldest_vlog_file_id** | SST metadata tracking oldest VLog file referenced | SST properties |
 | **min_oldest_vlog_file_id()** | Computes global minimum across all SSTs | `LevelManifest` method |
 | **iterator_count** | Safety counter for active readers | `VLog` struct |
-| **cleanup_stale_versioned_index()** | Removes stale B+tree entries | `CoreInner` method |
 
 ### GC Trigger Points
 
@@ -1035,15 +984,6 @@ VLog files cannot be deleted while readers might access them. The `iterator_coun
 - If `iterator_count > 0`, deletion is deferred to startup cleanup
 
 This prevents the race condition where GC deletes a file that an in-flight read is about to access.
-
-**Versioned Index Cleanup:**
-
-When the optional B+tree versioned index is enabled, it stores `(InternalKey → ValuePointer)` entries. After VLog files are deleted, stale entries pointing to those files must be removed:
-
-1. **Read Phase**: Scan the B+tree under a read lock, collecting keys with `pointer.file_id < min_oldest_vlog`
-2. **Delete Phase**: Remove collected keys in batches under brief write locks
-
-This two-phase approach avoids holding locks during the full scan, allowing concurrent writes.
 
 ---
 

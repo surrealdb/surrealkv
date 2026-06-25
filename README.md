@@ -148,9 +148,7 @@ let tree = TreeBuilder::with_options(opts).build()?;
 
 **Note:** Versioning requires VLog to be enabled. When you call `with_versioning(true, retention_ns)`, VLog is automatically enabled and configured appropriately.
 
-**Important:** When versioning is enabled without the B+tree index, timestamps inserted "back in time" (earlier than existing timestamps) will not be read correctly. This is because the LSM tree orders entries by user key ascending and sequence number descending, not by timestamp.
-
-If you need to insert historical data with earlier timestamps, enable the B+tree versioned index with `with_versioned_index(true)`. The B+tree allows in-place updates and correctly handles out-of-order timestamp inserts.
+**Important:** Timestamps inserted "back in time" (earlier than existing timestamps for a key) will not be read correctly. This is because the LSM tree orders entries by user key ascending and sequence number descending, not by timestamp. Insert versions in increasing timestamp order per key.
 
 ## Transaction Operations
 
@@ -316,8 +314,8 @@ assert_eq!(value.unwrap().as_ref(), b"value_v2");
 
 ### Retrieving All Versions
 
-Use the unified `history()` API to iterate over all historical versions of keys in a range.
-This API uses streaming iteration (no memory collection) and works with both LSM and B+tree backends:
+Use the `history()` API to iterate over all historical versions of keys in a range.
+This API uses streaming iteration (no memory collection) over the LSM (memtables + SSTables):
 
 ```rust
 let tx = tree.begin()?;

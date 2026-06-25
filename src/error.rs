@@ -55,7 +55,6 @@ pub enum Error {
 	                     * WAL segments) */
 	InvalidArgument(String),
 	InvalidTag(String),
-	BPlusTree(String),    // B+ tree specific errors
 	InterleavedIteration, // Interleaved iteration not supported
 	/// WAL corruption detected during recovery, includes location for repair
 	WalCorruption {
@@ -109,7 +108,6 @@ impl fmt::Display for Error {
             Self::ManifestCorruption(err) => write!(f, "Manifest corruption detected: {err}"),
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
-            Self::BPlusTree(err) => write!(f, "B+ tree error: {err}"),
             Self::InterleavedIteration => write!(f, "Interleaved iteration not supported: cannot mix next() and next_back() on same iterator"),
             Self::WalCorruption { segment_id, offset, message } => write!(
                 f,
@@ -146,12 +144,6 @@ impl From<io::Error> for Error {
 impl From<crate::wal::Error> for Error {
 	fn from(err: crate::wal::Error) -> Self {
 		Error::Wal(err.to_string())
-	}
-}
-
-impl From<crate::bplustree::tree::BPlusTreeError> for Error {
-	fn from(err: crate::bplustree::tree::BPlusTreeError) -> Self {
-		Error::BPlusTree(err.to_string())
 	}
 }
 

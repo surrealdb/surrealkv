@@ -457,7 +457,7 @@ impl Transaction {
 			}
 		}
 
-		// Query the versioned index through the snapshot
+		// Query historical versions through the snapshot
 		match &self.snapshot {
 			Some(snapshot) => snapshot.get_at(key.as_slice(), timestamp),
 			None => Err(Error::NoSnapshot),
@@ -558,13 +558,10 @@ impl Transaction {
 		TransactionRangeIterator::new_with_options(self, Arc::clone(&self.core), start_key, end_key)
 	}
 
-	/// Returns a unified history iterator over ALL versions of keys in the range.
+	/// Returns a history iterator over ALL versions of keys in the range.
 	///
-	/// Returns an iterator implementing `LSMIterator`, providing a unified
-	/// streaming API regardless of whether the B+tree index is enabled.
-	///
-	/// - If B+tree index is enabled: Uses streaming B+tree iteration
-	/// - If B+tree index is disabled: Uses LSM-based versioned iteration
+	/// Returns an iterator implementing `LSMIterator` that streams LSM-based
+	/// versioned iteration over memtables and SSTables.
 	///
 	/// # Arguments
 	/// * `start` - Start key (inclusive)

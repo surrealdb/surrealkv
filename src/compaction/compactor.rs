@@ -2,12 +2,11 @@ use std::fs::File as SysFile;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
-use crate::bplustree::tree::DiskBPlusTree;
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
-use crate::lsm::{cleanup_vlog_and_index, CoreInner};
+use crate::lsm::{cleanup_obsolete_vlog, CoreInner};
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
@@ -59,8 +58,6 @@ pub(crate) struct CompactionOptions {
 	/// sequence numbers. Versions visible to any active snapshot must be
 	/// preserved (unless hidden by a newer version in the same visibility boundary).
 	pub(crate) snapshot_tracker: SnapshotTracker,
-	/// Versioned B+ tree index for cleanup after VLog GC
-	pub(crate) versioned_index: Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
 }
 
 impl CompactionOptions {
@@ -72,7 +69,6 @@ impl CompactionOptions {
 			vlog: tree.vlog.clone(),
 			error_handler: Arc::clone(&tree.error_handler),
 			snapshot_tracker: tree.snapshot_tracker.clone(),
-			versioned_index: tree.versioned_index.clone(),
 		}
 	}
 }
@@ -260,14 +256,9 @@ impl Compactor {
 		// Commit guard - tables are now properly handled in manifest
 		guard.commit();
 
-		// After successful manifest commit, cleanup obsolete vlog files and stale index entries
+		// After successful manifest commit, cleanup obsolete vlog files
 		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-		cleanup_vlog_and_index(
-			&self.options.vlog,
-			&self.options.versioned_index,
-			min_oldest_vlog,
-			"compaction",
-		);
+		cleanup_obsolete_vlog(&self.options.vlog, min_oldest_vlog, "compaction");
 
 		Ok(())
 	}

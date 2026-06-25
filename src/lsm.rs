@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::Batch;
-use crate::bplustree::tree::DiskBPlusTree;
 use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
 use crate::commit::{CommitEnv, CommitPipeline};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
@@ -21,17 +20,15 @@ use crate::sstable::table::Table;
 use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
-use crate::vlog::{VLog, ValueLocation, ValuePointer};
+use crate::vlog::{VLog, ValueLocation};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
 use crate::{
-	BytewiseComparator,
 	Comparator,
 	Error,
 	FilterPolicy,
 	LSMIterator,
 	Options,
-	TimestampComparator,
 	VLogChecksumLevel,
 	Value,
 	WalRecoveryMode,
@@ -134,10 +131,6 @@ pub(crate) struct CoreInner {
 	/// Write-Ahead Log (WAL) for durability
 	pub(crate) wal: WalManager,
 
-	/// Versioned B+ tree index for timestamp-based queries
-	/// Maps InternalKey -> Value for time-range queries
-	pub(crate) versioned_index: Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
-
 	/// Lock file to prevent multiple processes from opening the same database
 	pub(crate) lockfile: Mutex<LockFile>,
 
@@ -181,19 +174,6 @@ impl CoreInner {
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
-		// Initialize versioned index if B+tree versioned index is enabled
-		let versioned_index = if opts.enable_versioned_index {
-			// Create the versioned index directory if it doesn't exist
-			let versioned_index_dir = opts.versioned_index_dir();
-			let versioned_index_path = versioned_index_dir.join("index.bpt");
-			let comparator =
-				Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));
-			let tree = DiskBPlusTree::disk(&versioned_index_path, comparator)?;
-			Some(Arc::new(parking_lot::RwLock::new(tree)))
-		} else {
-			None
-		};
-
 		let vlog = if opts.enable_vlog {
 			Some(Arc::new(VLog::new(Arc::clone(&opts))?))
 		} else {
@@ -209,7 +189,6 @@ impl CoreInner {
 			active_txn_tracker: Arc::new(crate::tracker::ActiveTxnTracker::new()),
 			vlog,
 			wal: WalManager::new(wal_instance),
-			versioned_index,
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
@@ -271,17 +250,13 @@ impl CoreInner {
 		table_id: u64,
 		wal_number: u64,
 	) -> Result<Arc<Table>> {
-		let collect_bptree = self.versioned_index.is_some();
-
 		// Step 1: Flush memtable to SST (with VLog separation for large values)
-		// Also collects entries for B+tree versioned index if enabled
-		let (table, bptree_entries) = memtable
+		let table = memtable
 			.flush(
 				table_id,
 				Arc::clone(&self.opts),
 				self.vlog.as_ref(),
 				self.opts.vlog_value_threshold,
-				collect_bptree,
 			)
 			.map_err(|e| {
 				Error::Other(format!(
@@ -292,27 +267,7 @@ impl CoreInner {
 
 		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
-		// Step 2: Write to versioned index (B+tree) with vlog-separated values
-		// Note: Replace entries are NOT cleaned up here. The HistoryIterator uses
-		// barrier logic (barrier_seen) to skip older entries when it encounters a
-		// Replace — same as how hard deletes work. Stale entries are eventually
-		// removed by cleanup_stale_versioned_index when their vlog files are cleaned.
-		if let Some(ref versioned_index) = self.versioned_index {
-			let mut vi_guard = versioned_index.write();
-
-			for (encoded_key, encoded_value) in &bptree_entries {
-				vi_guard.insert(encoded_key.clone(), encoded_value.clone())?;
-			}
-
-			vi_guard.sync()?;
-			log::debug!(
-				"Versioned index updated: {} entries written for table_id={}",
-				bptree_entries.len(),
-				table_id
-			);
-		}
-
-		// Step 3: Prepare atomic changeset
+		// Step 2: Prepare atomic changeset
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&table)));
 		changeset.log_number = Some(wal_number + 1);
@@ -324,7 +279,7 @@ impl CoreInner {
 			wal_number
 		);
 
-		// Step 4: Apply changeset atomically
+		// Step 3: Apply changeset atomically
 		// Lock order: level_manifest → immutable_memtables
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
@@ -357,9 +312,9 @@ impl CoreInner {
 			manifest.get_last_sequence()
 		);
 
-		// After successful manifest commit, cleanup obsolete vlog files and stale index entries
+		// After successful manifest commit, cleanup obsolete vlog files
 		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-		cleanup_vlog_and_index(&self.vlog, &self.versioned_index, min_oldest_vlog, "flush");
+		cleanup_obsolete_vlog(&self.vlog, min_oldest_vlog, "flush");
 
 		Ok(table)
 	}
@@ -838,7 +793,7 @@ impl CoreInner {
 		log::info!("Cleaning up orphaned VLog files below min_oldest_vlog={}", min_oldest_vlog);
 
 		// Use the consolidated cleanup helper
-		cleanup_vlog_and_index(&self.vlog, &self.versioned_index, min_oldest_vlog, "startup");
+		cleanup_obsolete_vlog(&self.vlog, min_oldest_vlog, "startup");
 
 		Ok(())
 	}
@@ -922,8 +877,6 @@ impl CommitEnv for LsmCommitEnv {
 
 		for (_, entry, _current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
 			// Always store values inline — VLog separation deferred to flush.
-			// Versioned index (B+tree) writes are also deferred to flush time,
-			// so the B+tree stores value pointers (consistent with SSTables).
 			let encoded_value = match &entry.value {
 				Some(value) => {
 					let value_location = ValueLocation::with_inline_value(value.clone());
@@ -1362,13 +1315,6 @@ impl Core {
 			log::debug!("VLog closed");
 		}
 
-		// Close the versioned index if present
-		if let Some(ref versioned_index) = self.inner.versioned_index {
-			log::debug!("Closing versioned index...");
-			versioned_index.read().close()?;
-			log::debug!("Versioned index closed");
-		}
-
 		// Step 3: Conditionally flush ALL memtables based on flush_on_close option
 		// CRITICAL ORDERING: Immutable memtables must be flushed BEFORE active memtable
 		// to preserve SSTable ordering (older data = lower table_ids)
@@ -1481,10 +1427,6 @@ impl Tree {
 		// Create VLog directories
 		if opts.enable_vlog {
 			create_dir_all(opts.vlog_dir())?;
-		}
-
-		if opts.enable_versioning {
-			create_dir_all(opts.versioned_index_dir())?;
 		}
 
 		Ok(())
@@ -1862,14 +1804,6 @@ impl TreeBuilder {
 		self
 	}
 
-	/// Enables or disables the B+tree versioned index for timestamp-based queries.
-	/// When disabled, versioned queries will scan the LSM tree directly.
-	/// Requires `with_versioning` to be called first with `enable = true`.
-	pub fn with_versioned_index(mut self, enable: bool) -> Self {
-		self.opts = self.opts.with_versioned_index(enable);
-		self
-	}
-
 	/// Controls whether to flush the active memtable during database shutdown.
 	pub fn with_flush_on_close(mut self, value: bool) -> Self {
 		self.opts = self.opts.with_flush_on_close(value);
@@ -1970,16 +1904,6 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 		})?;
 	}
 
-	if opts.enable_versioning {
-		fsync_directory(opts.versioned_index_dir()).map_err(|e| {
-			Error::Other(format!(
-				"Failed to sync versioned index directory '{}': {}",
-				opts.versioned_index_dir().display(),
-				e
-			))
-		})?;
-	}
-
 	fsync_directory(&opts.path).map_err(|e| {
 		Error::Other(format!("Failed to sync base directory '{}': {}", opts.path.display(), e))
 	})?;
@@ -1987,123 +1911,22 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 	Ok(())
 }
 
-// ===== VLog and Versioned Index Cleanup Helpers =====
+// ===== VLog Cleanup Helpers =====
 
-/// Cleans up stale versioned_index entries that reference deleted VLog files.
+/// Cleans up obsolete VLog files that are no longer referenced by any SST.
 ///
-/// After VLog GC deletes files, the versioned_index (B+ tree) may contain
-/// entries with ValuePointers referencing those deleted files. This function
-/// removes those stale entries.
-///
-/// # Algorithm:
-/// 1. Phase 1: Acquire READ lock, iterate all entries, collect stale keys
-/// 2. Release READ lock
-/// 3. Phase 2: For each batch of keys, acquire WRITE lock, delete, release
-///
-/// This design allows concurrent read/write operations between batches.
-///
-/// # Arguments
-/// * `versioned_index` - The versioned B+ tree index
-/// * `min_valid_file_id` - VLog files with file_id < this are considered deleted
-///
-/// # Returns
-/// The number of stale entries deleted
-pub(crate) fn cleanup_stale_versioned_index(
-	versioned_index: &Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
-	min_valid_file_id: u32,
-) -> Result<usize> {
-	let versioned_index = match versioned_index {
-		Some(idx) => idx,
-		None => return Ok(0),
-	};
-
-	// Phase 1: Read lock - collect stale keys
-	let keys_to_delete: Vec<Vec<u8>> = {
-		let guard = versioned_index.read();
-		let mut stale_keys = Vec::new();
-
-		// Use range(..) to iterate all entries (RangeFull implements RangeBounds<T>)
-		let empty: &[u8] = &[];
-		let iter = guard.range(empty..)?;
-
-		for entry in iter {
-			let (key, value) = entry?;
-			// Check if this entry has a VLog pointer to a deleted file
-			if let Ok(loc) = ValueLocation::decode(&value) {
-				if loc.is_value_pointer() {
-					if let Ok(ptr) = ValuePointer::decode(&loc.value) {
-						if ptr.file_id < min_valid_file_id {
-							stale_keys.push(key.to_vec());
-						}
-					}
-				}
-			}
-		}
-		stale_keys
-	}; // Read lock released here
-
-	if keys_to_delete.is_empty() {
-		return Ok(0);
-	}
-
-	log::debug!(
-		"Cleaning up {} stale versioned_index entries for VLog files < {}",
-		keys_to_delete.len(),
-		min_valid_file_id
-	);
-
-	// Phase 2: Write lock per batch - delete
-	let mut deleted_count = 0;
-	const BATCH_SIZE: usize = 100;
-
-	for batch in keys_to_delete.chunks(BATCH_SIZE) {
-		let mut guard = versioned_index.write();
-		for key in batch {
-			// No re-verification needed:
-			// - Keys are never updated (unique InternalKey)
-			// - If deleted by concurrent Replace, delete() returns None (harmless)
-			if guard.delete(key)?.is_some() {
-				deleted_count += 1;
-			}
-		}
-		// Write lock released here, allowing other operations between batches
-	}
-
-	Ok(deleted_count)
-}
-
-/// Cleans up obsolete VLog files and stale versioned_index entries.
-///
-/// This is the consolidated cleanup function that should be called after
-/// compaction, flush, or during startup recovery. It:
-/// 1. Removes VLog files that are no longer referenced by any SST
-/// 2. Removes versioned_index entries pointing to deleted VLog files
+/// This should be called after compaction, flush, or during startup recovery.
 ///
 /// # Arguments
 /// * `vlog` - The VLog instance (if value separation is enabled)
-/// * `versioned_index` - The versioned B+ tree index (if versioned reads are enabled)
 /// * `min_oldest_vlog` - Minimum oldest_vlog_file_id across all live SSTs
 /// * `context` - Description of the calling context (e.g., "flush", "compaction", "startup")
-pub(crate) fn cleanup_vlog_and_index(
-	vlog: &Option<Arc<VLog>>,
-	versioned_index: &Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
-	min_oldest_vlog: u32,
-	context: &str,
-) {
+pub(crate) fn cleanup_obsolete_vlog(vlog: &Option<Arc<VLog>>, min_oldest_vlog: u32, context: &str) {
 	// Skip cleanup if no SSTs reference VLog files yet (fresh database case)
 	if min_oldest_vlog == 0 {
 		return;
 	}
 
-	// Clean stale versioned_index entries FIRST — remove references to
-	// soon-to-be-deleted vlog files before actually deleting them, so
-	// no history query can hit a dangling vlog pointer.
-	if let Err(e) = cleanup_stale_versioned_index(versioned_index, min_oldest_vlog) {
-		log::warn!("Failed to cleanup stale versioned_index entries during {}: {}", context, e);
-		// Don't propagate error - cleanup failures shouldn't fail the primary operation
-	}
-
-	// THEN delete obsolete VLog files (safe: no live bplustree references remain)
 	if let Some(ref vlog) = vlog {
 		if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
 			log::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);

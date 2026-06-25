@@ -1,5 +1,4 @@
 mod batch;
-pub mod bplustree;
 mod cache;
 mod checkpoint;
 mod clock;
@@ -180,10 +179,6 @@ pub struct Options {
 	// Versioned query configuration
 	/// If true, enables versioned queries with timestamp tracking
 	pub enable_versioning: bool,
-	/// If true, creates a B+tree index for timestamp-based queries.
-	/// Requires enable_versioning to be true.
-	/// When false, versioned queries will scan the LSM tree directly.
-	pub enable_versioned_index: bool,
 	/// History retention period in nanoseconds (0 means no retention limit)
 	/// Default: 0 (no retention limit)
 	pub versioned_history_retention_ns: u64,
@@ -252,7 +247,6 @@ impl Default for Options {
 			enable_vlog: false,
 			vlog_value_threshold: 1024, // 1KB default
 			enable_versioning: false,
-			enable_versioned_index: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
 			flush_on_close: true,
@@ -429,14 +423,6 @@ impl Options {
 		self
 	}
 
-	/// Enables or disables the B+tree versioned index for timestamp-based queries.
-	/// When disabled, versioned queries will scan the LSM tree directly.
-	/// Requires `enable_versioning` to be true for this to have any effect.
-	pub const fn with_versioned_index(mut self, value: bool) -> Self {
-		self.enable_versioned_index = value;
-		self
-	}
-
 	/// Controls whether to flush the active memtable during database shutdown.
 	///
 	/// When enabled, ensures all in-memory data is persisted to SSTables before
@@ -523,11 +509,6 @@ impl Options {
 		self.path.join("manifest")
 	}
 
-	/// Returns the directory path for versioned index files
-	pub(crate) fn versioned_index_dir(&self) -> PathBuf {
-		self.path.join("versioned_index")
-	}
-
 	/// Checks if a filename matches the `VLog` file naming pattern
 	/// Expected format: 20-digit zero-padded ID + ".vlog" (25 characters total)
 	pub(crate) fn is_vlog_filename(&self, filename: &str) -> bool {
@@ -571,13 +552,6 @@ impl Options {
 					"Versioned queries require all values to be stored in VLog. Set vlog_value_threshold to 0.".to_string(),
 				));
 			}
-		}
-
-		// Validate versioned index requires versioning to be enabled
-		if self.enable_versioned_index && !self.enable_versioning {
-			return Err(Error::InvalidArgument(
-				"Versioned index requires versioning to be enabled. Call with_versioning(true, retention_ns) first.".to_string(),
-			));
 		}
 
 		// Validate level count is reasonable
