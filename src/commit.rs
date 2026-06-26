@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, Semaphore};
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
@@ -17,12 +17,26 @@ use crate::stall::WriteStallController;
 /// Must be a power of two. The number of *in-flight* commits is gated below
 /// this by the semaphore (`max_concurrent_commits()`), so the ring never
 /// overflows.
-/// Capacity of the lock-free commit ring buffer. Must be a power of two and at
-/// least as large as the maximum number of concurrent committers (each holds at
-/// most one in-flight `CommitBatch`); backpressure beyond that is the write
-/// stall controller's job. The Treiber write group has no fixed bound.
-const COMMIT_QUEUE_SIZE: usize = 1024;
+/// Capacity of the lock-free commit ring buffer (power of two). The number of
+/// in-flight commits is bounded BELOW this by `commit_sem` so the ring can never
+/// overflow — each in-flight committer contributes at most one `CommitBatch` to
+/// the queue.
+const COMMIT_QUEUE_SIZE: usize = 4096;
 const DEQUEUE_BITS: u32 = 32;
+
+/// Max number of in-flight commits (semaphore permits). This is BACKPRESSURE,
+/// not a serialization cap: with group commit most committers become cheap
+/// followers, so this can be high. It MUST stay `< COMMIT_QUEUE_SIZE` so the
+/// lock-free ring never overflows. Tunable via `SURREALKV_MAX_CONCURRENT_COMMITS`
+/// (clamped to `[1, COMMIT_QUEUE_SIZE - 1]`); the sweet spot trades group size
+/// (WAL amortization) against parallel-apply contention.
+fn max_concurrent_commits() -> usize {
+	std::env::var("SURREALKV_MAX_CONCURRENT_COMMITS")
+		.ok()
+		.and_then(|v| v.parse::<usize>().ok())
+		.map(|v| v.clamp(1, COMMIT_QUEUE_SIZE - 1))
+		.unwrap_or(256)
+}
 
 /// Output of [`CommitEnv::pre_serialize`]: the processed batch (values wrapped
 /// in `ValueLocation`, ready for memtable apply) plus its WAL encoding carrying
@@ -266,9 +280,13 @@ pub(crate) struct CommitPipeline {
 	// Lock-free single-producer, multi-consumer commit queue
 	pending: CommitQueue,
 	// Head of the lock-free write group (Treiber stack of `Arc<WriteRequest>`
-	// raw pointers). Replaces the old flow-control semaphore: the first
-	// committer to link an empty list becomes the group leader.
+	// raw pointers). The first committer to link an empty list becomes the
+	// group leader.
 	newest_writer: AtomicPtr<WriteRequest>,
+	// Backpressure: bounds in-flight commits below `COMMIT_QUEUE_SIZE` so the
+	// lock-free ring never overflows. A high cap (group commit makes excess
+	// committers cheap followers), held async so a waiting committer yields.
+	commit_sem: Arc<Semaphore>,
 	shutdown: AtomicBool,
 	// Write stall controller - checked before acquiring write_mutex
 	write_stall: Arc<WriteStallController>,
@@ -288,6 +306,7 @@ impl CommitPipeline {
 			write_mutex: Mutex::new(()),
 			pending: CommitQueue::new(),
 			newest_writer: AtomicPtr::new(ptr::null_mut()),
+			commit_sem: Arc::new(Semaphore::new(max_concurrent_commits())),
 			shutdown: AtomicBool::new(false),
 			write_stall,
 		})
@@ -337,6 +356,12 @@ impl CommitPipeline {
 		// stalled committer YIELDS its worker — the flush that clears the stall
 		// is itself a tokio task and needs a free worker to run.
 		self.write_stall.check().await?;
+
+		// Backpressure: bound in-flight commits below the ring capacity so the
+		// lock-free queue can never overflow. Held (RAII) until the commit
+		// completes, which covers the batch's whole queue-occupancy window.
+		// Async acquire => a throttled committer yields its worker.
+		let _permit = self.commit_sem.acquire().await.map_err(|_| Error::PipelineStall)?;
 
 		// Pre-serialize OUTSIDE the group/lock: clone+wrap values and encode the
 		// batch (the expensive part). On failure nothing has been allocated,
