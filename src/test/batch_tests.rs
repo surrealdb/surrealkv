@@ -67,6 +67,36 @@ fn test_batch_read_record() {
 }
 
 #[test]
+fn test_patch_encoded_seq_roundtrip() {
+	// Mirrors the commit pipeline: pre-encode with a placeholder seq (0) off the
+	// write lock, then stamp the real seq in place under the lock.
+	let mut placeholder = Batch::new(0);
+	placeholder.set(b"key1".to_vec(), b"value1".to_vec(), 7).unwrap();
+	placeholder.set(b"key2".to_vec(), b"value2".to_vec(), 8).unwrap();
+	let mut bytes = placeholder.encode().unwrap();
+
+	Batch::patch_encoded_seq(&mut bytes, 4242);
+
+	// Decoding the patched buffer reflects the stamped seq and intact entries.
+	let decoded = Batch::decode(&bytes).unwrap();
+	assert_eq!(decoded.version, BATCH_VERSION);
+	assert_eq!(decoded.starting_seq_num, 4242);
+	let entries = decoded.entries();
+	assert_eq!(entries.len(), 2);
+	assert_eq!(entries[0].key.as_slice(), b"key1");
+	assert_eq!(entries[0].value.as_ref().unwrap().as_slice(), b"value1");
+	assert_eq!(entries[1].key.as_slice(), b"key2");
+	assert_eq!(entries[1].value.as_ref().unwrap().as_slice(), b"value2");
+
+	// The patched buffer must be byte-identical to encoding with the real seq
+	// from the start — the fixed-width header guarantees this.
+	let mut direct = Batch::new(4242);
+	direct.set(b"key1".to_vec(), b"value1".to_vec(), 7).unwrap();
+	direct.set(b"key2".to_vec(), b"value2".to_vec(), 8).unwrap();
+	assert_eq!(bytes, direct.encode().unwrap(), "patched buffer must equal direct encode");
+}
+
+#[test]
 fn test_batch_empty() {
 	let batch = Batch::new(1);
 	let encoded = batch.encode().unwrap();
