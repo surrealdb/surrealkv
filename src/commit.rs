@@ -11,14 +11,45 @@ use crate::error::{Error, Result};
 use crate::oracle::CommitOracle;
 use crate::stall::WriteStallController;
 
-const MAX_CONCURRENT_COMMITS: usize = 8;
+/// Capacity of the lock-free commit ring buffer (slot array + index mask).
+/// Must be a power of two. The number of *in-flight* commits is gated below
+/// this by the semaphore (`max_concurrent_commits()`), so the ring never
+/// overflows.
+const COMMIT_QUEUE_SIZE: usize = 1024;
 const DEQUEUE_BITS: u32 = 32;
+
+/// Maximum number of commits allowed in the pipeline concurrently (semaphore
+/// permits). Default 7 reproduces the v2 baseline exactly. Override with the
+/// `SURREALKV_MAX_CONCURRENT_COMMITS` env var to sweep; clamped to
+/// `[1, COMMIT_QUEUE_SIZE - 1]` so the ring can never overflow.
+fn max_concurrent_commits() -> usize {
+	std::env::var("SURREALKV_MAX_CONCURRENT_COMMITS")
+		.ok()
+		.and_then(|v| v.parse::<usize>().ok())
+		.map(|v| v.clamp(1, COMMIT_QUEUE_SIZE - 1))
+		.unwrap_or(7)
+}
+
+/// Output of [`CommitEnv::pre_serialize`]: the processed batch (values wrapped
+/// in `ValueLocation`, ready for memtable apply) plus its WAL encoding carrying
+/// a placeholder sequence number. The real seq is stamped in place under
+/// `write_mutex` by [`CommitEnv::write_prepared`].
+pub(crate) struct PreparedWrite {
+	pub(crate) processed_batch: Batch,
+	pub(crate) bytes: Vec<u8>,
+}
 
 // Trait for commit operations
 pub trait CommitEnv: Send + Sync + 'static {
-	// Write batch to WAL and process VLog entries (synchronous operation)
-	// Returns a new batch with VLog pointers applied
-	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch>;
+	// Build the WAL-ready encoding of `batch` (value-location wrapping + encode)
+	// OUTSIDE the commit `write_mutex` — this is the expensive part. Returns the
+	// processed batch (for `apply`) plus its encoded bytes with a placeholder seq.
+	fn pre_serialize(&self, batch: &Batch) -> Result<PreparedWrite>;
+
+	// Stamp `seq_num` into the pre-encoded bytes (in place) and append to the
+	// WAL. Called UNDER `write_mutex`; intentionally cheap (an 8-byte patch +
+	// a WAL append, no clone/encode).
+	fn write_prepared(&self, prepared: &mut PreparedWrite, seq_num: u64, sync: bool) -> Result<()>;
 
 	// Apply processed batch to memtable
 	fn apply(&self, batch: &Batch) -> Result<()>;
@@ -87,7 +118,7 @@ struct CommitQueue {
 	// head = index of next slot to fill (high 32 bits)
 	// tail = index of oldest data in queue (low 32 bits)
 	head_tail: AtomicU64,
-	slots: [AtomicPtr<CommitBatch>; MAX_CONCURRENT_COMMITS],
+	slots: [AtomicPtr<CommitBatch>; COMMIT_QUEUE_SIZE],
 }
 
 impl CommitQueue {
@@ -114,13 +145,13 @@ impl CommitQueue {
 		let (head, tail) = self.unpack(ptrs);
 
 		// Check if queue is full
-		if tail.wrapping_add(MAX_CONCURRENT_COMMITS as u32) == head {
+		if tail.wrapping_add(COMMIT_QUEUE_SIZE as u32) == head {
 			// Queue is full. This should never be reached because the semaphore
 			// limits the number of concurrent operations.
 			panic!("commit queue overflow - should not be reached");
 		}
 
-		let slot_idx = (head & (MAX_CONCURRENT_COMMITS as u32 - 1)) as usize;
+		let slot_idx = (head & (COMMIT_QUEUE_SIZE as u32 - 1)) as usize;
 		let slot = &self.slots[slot_idx];
 
 		// Check if the head slot has been released by dequeueApplied
@@ -150,7 +181,7 @@ impl CommitQueue {
 				return None;
 			}
 
-			let slot_idx = (tail & (MAX_CONCURRENT_COMMITS as u32 - 1)) as usize;
+			let slot_idx = (tail & (COMMIT_QUEUE_SIZE as u32 - 1)) as usize;
 			let slot = &self.slots[slot_idx];
 			let batch_ptr = slot.load(Ordering::Acquire);
 
@@ -216,7 +247,7 @@ impl CommitPipeline {
 			oracle: Arc::new(CommitOracle::new()),
 			write_mutex: Mutex::new(()),
 			pending: CommitQueue::new(),
-			commit_sem: Arc::new(Semaphore::new(MAX_CONCURRENT_COMMITS - 1)),
+			commit_sem: Arc::new(Semaphore::new(max_concurrent_commits())),
 			shutdown: AtomicBool::new(false),
 			write_stall,
 		})
@@ -250,7 +281,7 @@ impl CommitPipeline {
 		self.oracle.reset_for_restore(max_seq);
 	}
 
-	pub(crate) async fn commit(&self, mut batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
+	pub(crate) async fn commit(&self, batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
@@ -269,15 +300,21 @@ impl CommitPipeline {
 		// Acquire permit for flow control
 		let _permit = self.commit_sem.acquire().await.map_err(|_| Error::PipelineStall)?;
 
+		// Pre-serialize OUTSIDE `write_mutex`: clone+wrap values and encode the
+		// batch (the expensive part). Only seq-stamping + the WAL append stay
+		// under the lock. On failure nothing has been allocated / enqueued /
+		// written — `?` simply returns, so no cleanup is needed.
+		let mut prepared = self.env.pre_serialize(&batch)?;
+
 		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
 
 		// === CRITICAL SECTION under write_mutex ===
 		//
 		// Atomically: validate write keys against the oracle map, allocate
 		// the commit seq, insert oracle entries with that seq, enqueue, and
-		// write to WAL. The single-producer invariant on `pending` requires
-		// seq allocation and `enqueue` to be in the same critical section
-		// (otherwise the FIFO `dequeue_applied` invariant breaks).
+		// stamp+append to WAL. The single-producer invariant on `pending`
+		// requires seq allocation and `enqueue` to be in the same critical
+		// section (otherwise the FIFO `dequeue_applied` invariant breaks).
 		//
 		// Memtable `apply()` is intentionally OUTSIDE this block — that is
 		// the throughput unlock. While T1 is applying, T2 can enter
@@ -286,14 +323,14 @@ impl CommitPipeline {
 		// Two distinct failure modes inside the section:
 		//   1. `oracle.check` failure: nothing has been allocated, enqueued, or written. Propagate
 		//      the error with `?`; no cleanup.
-		//   2. `env.write` (WAL) failure: oracle entries were already published and the batch was
-		//      enqueued. Roll back those entries (seq-match guard preserves concurrent
+		//   2. `env.write_prepared` (WAL) failure: oracle entries were already published and the
+		//      batch was enqueued. Roll back those entries (seq-match guard preserves concurrent
 		//      overwriters), drain the queue slot, release the lock, and return the error.
 		//
 		// Keys are derived from `batch.entries` (single source of truth).
 		// Duplicate keys within a batch (e.g. from savepoint history) are
 		// harmless: oracle.check/publish are idempotent on the same key.
-		let (processed_batch, allocated_seq): (Batch, u64) = {
+		let allocated_seq: u64 = {
 			let _guard = self.write_mutex.lock();
 
 			// Validate against the oracle. No state has changed yet; on
@@ -320,16 +357,15 @@ impl CommitPipeline {
 				oldest_active,
 			);
 
-			// Stamp the commit_batch & batch.
+			// Stamp the commit_batch.
 			commit_batch.set_seq_num(seq_num);
-			batch.set_starting_seq_num(seq_num);
 
 			// Enqueue (single producer, same critical section as seq alloc).
 			self.pending.enqueue(Arc::clone(&commit_batch));
 
-			// WAL + VLog (serialized under lock).
-			match self.env.write(&batch, seq_num, sync) {
-				Ok(processed) => (processed, seq_num),
+			// Stamp seq into the pre-encoded bytes + WAL append (serialized).
+			match self.env.write_prepared(&mut prepared, seq_num, sync) {
+				Ok(()) => seq_num,
 				Err(e) => {
 					// WAL failed AFTER oracle.publish. Roll back the entries
 					// we stamped; the seq-match guard leaves concurrent
@@ -354,7 +390,7 @@ impl CommitPipeline {
 		// Memtable apply — OUTSIDE write_mutex. The next committer can already
 		// be inside the critical section. This restores the pipeline overlap
 		// that PR #378 destroyed.
-		let apply_result = self.env.apply(&processed_batch);
+		let apply_result = self.env.apply(&prepared.processed_batch);
 
 		// =========================================================================
 		// Failure-path invariants
@@ -498,21 +534,45 @@ mod tests {
 		Arc::new(crate::stall::WriteStallController::new(provider, thresholds))
 	}
 
+	// Test helpers mirroring the old `write` (copy batch + encode), split into
+	// the new pre_serialize / write_prepared shape.
+	fn mock_pre_serialize(batch: &Batch) -> Result<PreparedWrite> {
+		let mut new_batch = Batch::new(0);
+		for entry in batch.entries() {
+			new_batch.add_record(
+				entry.kind,
+				entry.key.clone(),
+				entry.value.clone(),
+				entry.timestamp,
+			)?;
+		}
+		let bytes = new_batch.encode()?;
+		Ok(PreparedWrite {
+			processed_batch: new_batch,
+			bytes,
+		})
+	}
+
+	fn mock_write_prepared(prepared: &mut PreparedWrite, seq_num: u64) -> Result<()> {
+		Batch::patch_encoded_seq(&mut prepared.bytes, seq_num);
+		prepared.processed_batch.set_starting_seq_num(seq_num);
+		Ok(())
+	}
+
 	struct MockEnv;
 
 	impl CommitEnv for MockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
-			// Create a copy of the batch for testing
-			let mut new_batch = Batch::new(_seq_num);
-			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
-			}
-			Ok(new_batch)
+		fn pre_serialize(&self, batch: &Batch) -> Result<PreparedWrite> {
+			mock_pre_serialize(batch)
+		}
+
+		fn write_prepared(
+			&self,
+			prepared: &mut PreparedWrite,
+			seq_num: u64,
+			_sync: bool,
+		) -> Result<()> {
+			mock_write_prepared(prepared, seq_num)
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -619,22 +679,22 @@ mod tests {
 	struct DelayedMockEnv;
 
 	impl CommitEnv for DelayedMockEnv {
-		fn write(&self, batch: &Batch, _seq_num: u64, _sync: bool) -> Result<Batch> {
+		fn pre_serialize(&self, batch: &Batch) -> Result<PreparedWrite> {
+			mock_pre_serialize(batch)
+		}
+
+		fn write_prepared(
+			&self,
+			prepared: &mut PreparedWrite,
+			seq_num: u64,
+			_sync: bool,
+		) -> Result<()> {
+			// Simulate WAL write cost under the lock (as the old `write` did).
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(100) {
 				std::hint::spin_loop();
 			}
-			// Create a copy of the batch for testing
-			let mut new_batch = Batch::new(_seq_num);
-			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
-			}
-			Ok(new_batch)
+			mock_write_prepared(prepared, seq_num)
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -711,17 +771,17 @@ mod tests {
 	struct AlwaysFailApplyEnv;
 
 	impl CommitEnv for AlwaysFailApplyEnv {
-		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
-			let mut new_batch = Batch::new(seq_num);
-			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
-			}
-			Ok(new_batch)
+		fn pre_serialize(&self, batch: &Batch) -> Result<PreparedWrite> {
+			mock_pre_serialize(batch)
+		}
+
+		fn write_prepared(
+			&self,
+			prepared: &mut PreparedWrite,
+			seq_num: u64,
+			_sync: bool,
+		) -> Result<()> {
+			mock_write_prepared(prepared, seq_num)
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -784,17 +844,17 @@ mod tests {
 	}
 
 	impl CommitEnv for FailNTimesEnv {
-		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
-			let mut new_batch = Batch::new(seq_num);
-			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
-			}
-			Ok(new_batch)
+		fn pre_serialize(&self, batch: &Batch) -> Result<PreparedWrite> {
+			mock_pre_serialize(batch)
+		}
+
+		fn write_prepared(
+			&self,
+			prepared: &mut PreparedWrite,
+			seq_num: u64,
+			_sync: bool,
+		) -> Result<()> {
+			mock_write_prepared(prepared, seq_num)
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -897,17 +957,17 @@ mod tests {
 	}
 
 	impl CommitEnv for OverreportingEnv {
-		fn write(&self, batch: &Batch, seq_num: u64, _sync: bool) -> Result<Batch> {
-			let mut new_batch = Batch::new(seq_num);
-			for entry in batch.entries() {
-				new_batch.add_record(
-					entry.kind,
-					entry.key.clone(),
-					entry.value.clone(),
-					entry.timestamp,
-				)?;
-			}
-			Ok(new_batch)
+		fn pre_serialize(&self, batch: &Batch) -> Result<PreparedWrite> {
+			mock_pre_serialize(batch)
+		}
+
+		fn write_prepared(
+			&self,
+			prepared: &mut PreparedWrite,
+			seq_num: u64,
+			_sync: bool,
+		) -> Result<()> {
+			mock_write_prepared(prepared, seq_num)
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {

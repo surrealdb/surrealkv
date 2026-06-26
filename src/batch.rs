@@ -5,7 +5,11 @@ use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
 use crate::{InternalKeyKind, Key, Value};
 
 pub(crate) const MAX_BATCH_SIZE: u64 = 1 << 32;
-pub(crate) const BATCH_VERSION: u8 = 1;
+/// Batch encoding version. v2 encodes `starting_seq_num` as a fixed-width
+/// 8-byte LE value (instead of v1's varint) so the commit pipeline can
+/// pre-encode a batch off the write lock and stamp the real seq in place
+/// under the lock — see `Batch::patch_encoded_seq`. `decode` still reads v1.
+pub(crate) const BATCH_VERSION: u8 = 2;
 /// Represents a single entry in a batch
 #[derive(Debug, Clone)]
 pub(crate) struct BatchEntry {
@@ -63,8 +67,10 @@ impl Batch {
 		// Write version (1 byte)
 		encoded.push(self.version);
 
-		// Write sequence number (8 bytes)
-		encoded.write_varint(self.starting_seq_num)?;
+		// Write sequence number (fixed-width 8-byte LE).
+		// Fixed width (vs varint) lets the commit pipeline stamp the seq in
+		// place after pre-encoding off the write lock — see `patch_encoded_seq`.
+		encoded.extend_from_slice(&self.starting_seq_num.to_le_bytes());
 
 		// Write count (4 bytes)
 		encoded.write_varint(self.entries.len() as u32)?;
@@ -103,6 +109,17 @@ impl Batch {
 		}
 
 		Ok(encoded)
+	}
+
+	/// Stamp the commit sequence number into an already-encoded (v2+) batch
+	/// buffer, in place. `encode` writes the seq as 8 fixed-width LE bytes at
+	/// offset `[1..9]` (right after the 1-byte version), so the commit pipeline
+	/// can pre-encode a batch off the write lock with a placeholder seq and then
+	/// stamp the real seq under the lock with no re-encode and no copy.
+	pub(crate) fn patch_encoded_seq(buf: &mut [u8], seq: u64) {
+		debug_assert!(buf.len() >= 9, "encoded batch too short to patch seq");
+		debug_assert!(buf[0] >= 2, "patch_encoded_seq requires batch version >= 2");
+		buf[1..9].copy_from_slice(&seq.to_le_bytes());
 	}
 
 	#[cfg(test)]
@@ -222,14 +239,28 @@ impl Batch {
 		// Read version
 		let version = data[pos];
 		pos += 1;
-		if version != BATCH_VERSION {
+		// Accept v1 (varint seq) for replaying pre-upgrade WAL segments and the
+		// current version (fixed-width seq). Reject anything else.
+		if version != 1 && version != BATCH_VERSION {
 			return Err(Error::InvalidBatchRecord);
 		}
 
-		// Read sequence number
-		let (seq_num, bytes_read) =
-			u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
-		pos += bytes_read;
+		// Read sequence number. v2+ is fixed-width 8-byte LE; v1 was a varint.
+		let seq_num = if version >= 2 {
+			if data.len() < pos + 8 {
+				return Err(Error::InvalidBatchRecord);
+			}
+			let seq = u64::from_le_bytes(
+				data[pos..pos + 8].try_into().map_err(|_| Error::InvalidBatchRecord)?,
+			);
+			pos += 8;
+			seq
+		} else {
+			let (seq, bytes_read) =
+				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+			pos += bytes_read;
+			seq
+		};
 
 		// Read count
 		let (count, bytes_read) = u32::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::Batch;
 use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
-use crate::commit::{CommitEnv, CommitPipeline};
+use crate::commit::{CommitEnv, CommitPipeline, PreparedWrite};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
@@ -870,12 +870,15 @@ impl LsmCommitEnv {
 }
 
 impl CommitEnv for LsmCommitEnv {
-	// Write batch to WAL with inline values (synchronous operation).
-	// VLog separation is deferred to memtable flush time.
-	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
-		let mut processed_batch = Batch::new(seq_num);
+	// Build the WAL-ready encoding OUTSIDE the commit write_mutex: wrap each
+	// value in a ValueLocation (inline; VLog separation is deferred to flush)
+	// and encode the batch. The seq is a placeholder (0) here — the per-entry
+	// bytes do not depend on it; only the fixed-width header does. The commit
+	// pipeline stamps the real seq in `write_prepared` via patch_encoded_seq.
+	fn pre_serialize(&self, batch: &Batch) -> Result<PreparedWrite> {
+		let mut processed_batch = Batch::new(0);
 
-		for (_, entry, _current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
+		for entry in &batch.entries {
 			// Always store values inline — VLog separation deferred to flush.
 			let encoded_value = match &entry.value {
 				Some(value) => {
@@ -885,19 +888,41 @@ impl CommitEnv for LsmCommitEnv {
 				None => None,
 			};
 
-			processed_batch.add_record(entry.kind, entry.key.clone(), encoded_value, timestamp)?;
+			processed_batch.add_record(
+				entry.kind,
+				entry.key.clone(),
+				encoded_value,
+				entry.timestamp,
+			)?;
 		}
 
-		// Write to WAL for durability
-		let enc_bytes = processed_batch.encode()?;
+		let bytes = processed_batch.encode()?;
+		Ok(PreparedWrite {
+			processed_batch,
+			bytes,
+		})
+	}
+
+	// Stamp the allocated seq into the pre-encoded bytes (in place) and into the
+	// processed batch (consumed by `apply`), then append to the WAL. This is all
+	// that remains under write_mutex — no clone, no re-encode.
+	fn write_prepared(
+		&self,
+		prepared: &mut PreparedWrite,
+		seq_num: u64,
+		sync: bool,
+	) -> Result<()> {
+		Batch::patch_encoded_seq(&mut prepared.bytes, seq_num);
+		prepared.processed_batch.set_starting_seq_num(seq_num);
+
 		let mut wal_guard = self.core.wal.write();
-		wal_guard.append(&enc_bytes)?;
+		wal_guard.append(&prepared.bytes)?;
 		if sync {
 			wal_guard.sync()?;
 		}
 		drop(wal_guard);
 
-		Ok(processed_batch)
+		Ok(())
 	}
 
 	/// Apply batch to memtable with retry on arena full.
