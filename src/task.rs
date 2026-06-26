@@ -1,8 +1,7 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
-
-use tokio::sync::Notify;
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 
 use crate::compaction::leveled::Strategy;
 use crate::compaction::CompactionStrategy;
@@ -11,25 +10,61 @@ use crate::lsm::CompactionOperations;
 use crate::stall::WriteStallController;
 use crate::Options;
 
-/// Manages background tasks for the LSM tree
+/// A coalescing, level-triggered signal for waking a background thread.
+///
+/// `notify()` sets a flag and wakes one waiter; `wait()` blocks until the flag
+/// is set, then clears it. Multiple `notify()`s before a `wait()` coalesce into
+/// one wakeup — fine because each worker drains all pending work per wakeup.
+/// Replaces `tokio::sync::Notify` (the commit path is now synchronous, so
+/// background work runs on `std::thread`, not the tokio runtime).
+struct Signal {
+	flag: Mutex<bool>,
+	cv: Condvar,
+}
+
+impl Signal {
+	fn new() -> Self {
+		Self {
+			flag: Mutex::new(false),
+			cv: Condvar::new(),
+		}
+	}
+
+	fn notify(&self) {
+		let mut g = self.flag.lock().unwrap();
+		*g = true;
+		self.cv.notify_one();
+	}
+
+	fn wait(&self) {
+		let mut g = self.flag.lock().unwrap();
+		while !*g {
+			g = self.cv.wait(g).unwrap();
+		}
+		*g = false;
+	}
+}
+
+/// Manages background tasks for the LSM tree (memtable flush + level compaction),
+/// each on a dedicated `std::thread`.
 pub(crate) struct TaskManager {
 	/// Flag to signal tasks to stop
 	stop_flag: Arc<AtomicBool>,
 
-	/// Notification for memtable compaction task
-	memtable_notify: Arc<Notify>,
+	/// Signal for the memtable flush thread
+	memtable_signal: Arc<Signal>,
 
-	/// Notification for level compaction task
-	level_notify: Arc<Notify>,
+	/// Signal for the level compaction thread
+	level_signal: Arc<Signal>,
 
-	/// Flag indicating if memtable compaction is running
+	/// Flag indicating if memtable flush is running
 	memtable_running: Arc<AtomicBool>,
 
 	/// Flag indicating if level compaction is running
 	level_running: Arc<AtomicBool>,
 
-	/// Task handles for cleanup
-	task_handles: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+	/// Thread handles for cleanup
+	task_handles: Mutex<Option<Vec<JoinHandle<()>>>>,
 }
 
 impl fmt::Debug for TaskManager {
@@ -48,25 +83,34 @@ impl TaskManager {
 		write_stall: Arc<WriteStallController>,
 	) -> Self {
 		let stop_flag = Arc::new(AtomicBool::new(false));
-		let memtable_notify = Arc::new(Notify::new());
-		let level_notify = Arc::new(Notify::new());
+		let memtable_signal = Arc::new(Signal::new());
+		let level_signal = Arc::new(Signal::new());
 		let memtable_running = Arc::new(AtomicBool::new(false));
 		let level_running = Arc::new(AtomicBool::new(false));
 		let task_handles = Mutex::new(Some(Vec::new()));
 
-		// Spawn memtable compaction task
+		// Serializes flush vs compaction. Background work now runs on preemptive
+		// `std::thread`s (vs v2's cooperatively-scheduled tokio tasks), which
+		// exposes a latent race where a level compaction reads an L0 SST that a
+		// memtable flush is concurrently producing ("bad magic number"). Holding
+		// this lock around each `compact_memtable`/`compact` keeps the two from
+		// ever overlapping.
+		let flush_compact_lock = Arc::new(Mutex::new(()));
+
+		// Spawn memtable flush thread
 		{
 			let core = Arc::clone(&core);
 			let stop_flag = Arc::clone(&stop_flag);
-			let notify = Arc::clone(&memtable_notify);
+			let signal = Arc::clone(&memtable_signal);
 			let running = Arc::clone(&memtable_running);
-			let level_notify = Arc::clone(&level_notify);
+			let level_signal = Arc::clone(&level_signal);
 			let write_stall = Arc::clone(&write_stall);
+			let flush_compact_lock = Arc::clone(&flush_compact_lock);
 
-			let handle = tokio::spawn(async move {
-				loop {
-					// Wait for notification
-					notify.notified().await;
+			let handle = std::thread::Builder::new()
+				.name("surrealkv-flush".into())
+				.spawn(move || loop {
+					signal.wait();
 
 					if stop_flag.load(Ordering::SeqCst) {
 						break;
@@ -78,11 +122,15 @@ impl TaskManager {
 					// Flush ALL pending immutable memtables in a loop
 					let mut flush_count = 0;
 					loop {
-						match core.compact_memtable() {
+						let res = {
+							// Serialize against level compaction (see above).
+							let _g = flush_compact_lock.lock().unwrap();
+							core.compact_memtable()
+						};
+						match res {
 							Ok(()) => {
 								flush_count += 1;
 								write_stall.signal_work_done();
-								// Check if there are more immutables to flush
 								if !core.has_pending_immutables() {
 									break;
 								}
@@ -103,29 +151,30 @@ impl TaskManager {
 							flush_count
 						);
 						// Trigger level compaction after successful flushes
-						level_notify.notify_one();
+						level_signal.notify();
 					} else {
 						log::debug!("Memtable flush task: no immutables to flush");
 					}
 
 					running.store(false, Ordering::SeqCst);
-				}
-			});
+				})
+				.expect("failed to spawn memtable flush thread");
 			task_handles.lock().unwrap().as_mut().unwrap().push(handle);
 		}
 
-		// Spawn level compaction task
+		// Spawn level compaction thread
 		{
 			let core = Arc::clone(&core);
 			let stop_flag = Arc::clone(&stop_flag);
-			let notify = Arc::clone(&level_notify);
+			let signal = Arc::clone(&level_signal);
 			let running = Arc::clone(&level_running);
 			let write_stall = Arc::clone(&write_stall);
+			let flush_compact_lock = Arc::clone(&flush_compact_lock);
 
-			let handle = tokio::spawn(async move {
-				loop {
-					// Wait for notification
-					notify.notified().await;
+			let handle = std::thread::Builder::new()
+				.name("surrealkv-compact".into())
+				.spawn(move || loop {
+					signal.wait();
 
 					if stop_flag.load(Ordering::SeqCst) {
 						break;
@@ -134,10 +183,14 @@ impl TaskManager {
 					running.store(true, Ordering::SeqCst);
 					log::debug!("Level compaction task starting");
 
-					// Use leveled compaction strategy
 					let strategy: Arc<dyn CompactionStrategy> =
 						Arc::new(Strategy::from_options(Arc::clone(&opts)));
-					if let Err(e) = core.compact(strategy) {
+					let res = {
+						// Serialize against memtable flush (see above).
+						let _g = flush_compact_lock.lock().unwrap();
+						core.compact(strategy)
+					};
+					if let Err(e) = res {
 						log::error!("Level compaction task error: {e:?}");
 						core.error_handler().set_error(e, BackgroundErrorReason::Compaction);
 						write_stall.signal_shutdown();
@@ -146,15 +199,15 @@ impl TaskManager {
 						write_stall.signal_work_done();
 					}
 					running.store(false, Ordering::SeqCst);
-				}
-			});
+				})
+				.expect("failed to spawn level compaction thread");
 			task_handles.lock().unwrap().as_mut().unwrap().push(handle);
 		}
 
 		Self {
 			stop_flag,
-			memtable_notify,
-			level_notify,
+			memtable_signal,
+			level_signal,
 			memtable_running,
 			level_running,
 			task_handles,
@@ -162,41 +215,33 @@ impl TaskManager {
 	}
 
 	pub(crate) fn wake_up_memtable(&self) {
-		// Only notify if not already running
+		// Only notify if not already running. A wake lost while the flush thread
+		// is running is harmless: that run drains ALL pending immutables.
 		if !self.memtable_running.load(Ordering::Acquire) {
-			self.memtable_notify.notify_one();
+			self.memtable_signal.notify();
 		}
 	}
 
 	pub(crate) fn wake_up_level(&self) {
-		// Only notify if not already running
+		// Only notify if not already running.
 		if !self.level_running.load(Ordering::Acquire) {
-			self.level_notify.notify_one();
+			self.level_signal.notify();
 		}
 	}
 
-	pub async fn stop(&self) {
-		// Set the stop flag to prevent new operations from starting
+	pub(crate) fn stop(&self) {
+		// Set the stop flag, then wake both threads so they observe it and exit.
 		self.stop_flag.store(true, Ordering::SeqCst);
+		self.memtable_signal.notify();
+		self.level_signal.notify();
 
-		// Wake up any waiting tasks so they can check the stop flag and exit
-		self.memtable_notify.notify_one();
-		self.level_notify.notify_one();
-
-		// Wait for any in-progress compactions to complete (no timeout - wait
-		// indefinitely)
-		while self.memtable_running.load(Ordering::Acquire)
-			|| self.level_running.load(Ordering::Acquire)
-		{
-			// Yield to other tasks and wait a short time before checking again
-			tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-		}
-
-		// Now it's safe to wait for all tasks to complete
-		let task_handles = self.task_handles.lock().unwrap().take().unwrap();
-		for handle in task_handles {
-			if let Err(e) = handle.await {
-				log::error!("Error shutting down task: {e:?}");
+		// Join the threads. Each finishes its in-progress work, loops, observes
+		// the stop flag, and exits — so join returns once that completes.
+		if let Some(handles) = self.task_handles.lock().unwrap().take() {
+			for handle in handles {
+				if let Err(e) = handle.join() {
+					log::error!("Error shutting down task: {e:?}");
+				}
 			}
 		}
 	}
@@ -336,7 +381,7 @@ mod tests {
 		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 1);
 		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 1); // Level compaction should follow
 
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -361,7 +406,7 @@ mod tests {
 		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 3);
 		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 3); // Each memtable compaction triggers a level compaction
 
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -380,7 +425,7 @@ mod tests {
 		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 1);
 		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 0); // Memtable should not be affected
 
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -405,7 +450,7 @@ mod tests {
 		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 3);
 		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 0); // Memtable should not be affected
 
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -436,7 +481,7 @@ mod tests {
 		// 2 direct level compactions + 2 triggered by memtable
 		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 4);
 
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -472,7 +517,7 @@ mod tests {
 		// 1 from memtable + 1 directly triggered = 2
 		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 2);
 
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -506,7 +551,7 @@ mod tests {
 		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 10);
 		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 10);
 
-		Arc::try_unwrap(task_manager).expect("Task manager still has references").stop().await;
+		Arc::try_unwrap(task_manager).expect("Task manager still has references").stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -544,7 +589,7 @@ mod tests {
 			"Expected between 1-5 level compactions, got {level_count}"
 		);
 
-		Arc::try_unwrap(task_manager).expect("Task manager still has references").stop().await;
+		Arc::try_unwrap(task_manager).expect("Task manager still has references").stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -621,7 +666,7 @@ mod tests {
 		let level_count = core.level_compactions.load(Ordering::SeqCst);
 		println!("After wake_up_level with success: level_count={level_count}");
 
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -656,7 +701,7 @@ mod tests {
 		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 1);
 
 		// Task should still be responsive after error
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 
 	struct AboveThresholdProvider {
@@ -697,7 +742,7 @@ mod tests {
 		);
 
 		let stall_clone = Arc::clone(&write_stall);
-		let writer_handle = tokio::spawn(async move { stall_clone.check().await });
+		let writer_handle = tokio::spawn(async move { stall_clone.check() });
 
 		// Let the writer enter the stall loop
 		time::sleep(Duration::from_millis(50)).await;
@@ -715,7 +760,7 @@ mod tests {
 			"Stalled writer should return Err(PipelineStall) after compaction failure"
 		);
 
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -732,7 +777,7 @@ mod tests {
 		);
 
 		let stall_clone = Arc::clone(&write_stall);
-		let writer_handle = tokio::spawn(async move { stall_clone.check().await });
+		let writer_handle = tokio::spawn(async move { stall_clone.check() });
 
 		// Let the writer enter the stall loop
 		time::sleep(Duration::from_millis(50)).await;
@@ -750,7 +795,7 @@ mod tests {
 			"Stalled writer should return Err(PipelineStall) after flush failure"
 		);
 
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -769,7 +814,7 @@ mod tests {
 		let mut writer_handles = Vec::new();
 		for _ in 0..5 {
 			let stall_clone = Arc::clone(&write_stall);
-			writer_handles.push(tokio::spawn(async move { stall_clone.check().await }));
+			writer_handles.push(tokio::spawn(async move { stall_clone.check() }));
 		}
 
 		// Let all writers enter the stall loop
@@ -787,6 +832,6 @@ mod tests {
 			assert!(writer_result.is_err(), "Writer {i} should return Err(PipelineStall)");
 		}
 
-		task_manager.stop().await;
+		task_manager.stop();
 	}
 }

@@ -51,12 +51,12 @@ async fn test_first_writer_wins_concurrent_same_key() {
 		let h1 = tokio::spawn(async move {
 			let mut t = store1.begin().unwrap();
 			t.set(&k1, b"v1").unwrap();
-			t.commit().await
+			t.commit()
 		});
 		let h2 = tokio::spawn(async move {
 			let mut t = store2.begin().unwrap();
 			t.set(&k2, b"v2").unwrap();
-			t.commit().await
+			t.commit()
 		});
 
 		let r1 = h1.await.unwrap();
@@ -96,7 +96,7 @@ async fn test_no_false_aborts_disjoint_keys() {
 		handles.push(tokio::spawn(async move {
 			let mut t = store.begin().unwrap();
 			t.set(format!("disjoint_{i}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
-			t.commit().await
+			t.commit()
 		}));
 	}
 
@@ -124,7 +124,7 @@ async fn test_si_write_skew_still_allowed() {
 	{
 		let mut t = store.begin().unwrap();
 		t.set(b"x", b"init").unwrap();
-		t.commit().await.unwrap();
+		t.commit().unwrap();
 	}
 
 	let mut t1 = store.begin().unwrap();
@@ -138,8 +138,8 @@ async fn test_si_write_skew_still_allowed() {
 	t1.set(b"y", b"from_t1").unwrap();
 	t2.set(b"z", b"from_t2").unwrap();
 
-	assert!(t1.commit().await.is_ok());
-	assert!(t2.commit().await.is_ok());
+	assert!(t1.commit().is_ok());
+	assert!(t2.commit().is_ok());
 }
 
 /// A long-lived read-write transaction pins the oracle's GC watermark.
@@ -163,7 +163,7 @@ async fn test_oracle_gc_bounded_by_long_reader() {
 	for i in 0..n {
 		let mut t = store.begin().unwrap();
 		t.set(format!("gc_{i}").as_bytes(), b"v").unwrap();
-		t.commit().await.unwrap();
+		t.commit().unwrap();
 	}
 
 	let pipeline = &store.core.commit_pipeline;
@@ -184,7 +184,7 @@ async fn test_oracle_gc_bounded_by_long_reader() {
 	// sees a higher `oldest_active` → both gates pass → GC fires.
 	let mut t = store.begin().unwrap();
 	t.set(b"trigger_gc", b"v").unwrap();
-	t.commit().await.unwrap();
+	t.commit().unwrap();
 
 	let after = oracle.len();
 	assert!(after < n, "map should have shrunk after reader drop + one more commit; got {after}");
@@ -211,7 +211,7 @@ async fn test_write_only_txn_holds_watermark() {
 	for i in 0..16 {
 		let mut t = store.begin().unwrap();
 		t.set(format!("wo_{i}").as_bytes(), b"v").unwrap();
-		t.commit().await.unwrap();
+		t.commit().unwrap();
 	}
 	assert_eq!(tracker.oldest(), Some(pinned), "write-only txn must continue to pin the watermark");
 
@@ -240,9 +240,9 @@ async fn test_recovery_does_not_touch_oracle() {
 		for i in 0..8 {
 			let mut t = store.begin().unwrap();
 			t.set(format!("recov_{i}").as_bytes(), b"v").unwrap();
-			t.commit().await.unwrap();
+			t.commit().unwrap();
 		}
-		store.close().await.unwrap();
+		store.close().unwrap();
 	}
 
 	// Reopen: the oracle is constructed fresh (empty map, kept_since = 0).
@@ -264,7 +264,7 @@ async fn test_recovery_does_not_touch_oracle() {
 	// returns false and the txn proceeds.
 	let mut t = store.begin().unwrap();
 	t.set(b"post_recovery", b"ok").unwrap();
-	assert!(t.commit().await.is_ok());
+	assert!(t.commit().is_ok());
 }
 
 /// `Tree::restore_from_checkpoint` rewinds the seq counter mid-process. The
@@ -284,7 +284,7 @@ async fn test_restore_clears_oracle_entries() {
 	for i in 0..4 {
 		let mut t = store.begin().unwrap();
 		t.set(format!("pre_{i}").as_bytes(), b"v").unwrap();
-		t.commit().await.unwrap();
+		t.commit().unwrap();
 	}
 	store.create_checkpoint(&checkpoint_path).unwrap();
 
@@ -297,7 +297,7 @@ async fn test_restore_clears_oracle_entries() {
 	for i in 0..4 {
 		let mut t = store.begin().unwrap();
 		t.set(format!("post_{i}").as_bytes(), b"v").unwrap();
-		t.commit().await.unwrap();
+		t.commit().unwrap();
 	}
 	let oracle = store.core.commit_pipeline.oracle();
 	assert!(
@@ -319,7 +319,7 @@ async fn test_restore_clears_oracle_entries() {
 	// A fresh commit at the post-restore start_seq must succeed.
 	let mut t = store.begin().unwrap();
 	t.set(b"post_restore", b"ok").unwrap();
-	assert!(t.commit().await.is_ok());
+	assert!(t.commit().is_ok());
 }
 
 /// The `ActiveTxnGuard`'s `Drop` releases the watermark slot even when a
@@ -358,7 +358,7 @@ async fn test_restore_serialized_against_commits() {
 	for i in 0..8 {
 		let mut t = store.begin().unwrap();
 		t.set(format!("seed_{i}").as_bytes(), b"v").unwrap();
-		t.commit().await.unwrap();
+		t.commit().unwrap();
 	}
 	store.create_checkpoint(&checkpoint_path).unwrap();
 
@@ -373,7 +373,7 @@ async fn test_restore_serialized_against_commits() {
 			t.set(format!("racy_{i}").as_bytes(), b"v").unwrap();
 			// Any outcome is acceptable as long as it's a normal error or Ok.
 			// We're checking the system doesn't panic or wedge.
-			match t.commit().await {
+			match t.commit() {
 				Ok(()) | Err(Error::TransactionRetry) | Err(Error::TransactionWriteConflict) => {
 					acceptable_results += 1;
 				}
@@ -407,7 +407,7 @@ async fn test_restore_serialized_against_commits() {
 	// Post-restore: a fresh commit must succeed.
 	let mut t = store.begin().unwrap();
 	t.set(b"post_restore_works", b"ok").unwrap();
-	assert!(t.commit().await.is_ok(), "post-restore commit must succeed");
+	assert!(t.commit().is_ok(), "post-restore commit must succeed");
 
 	// And the seed data must be readable (it survives the checkpoint).
 	let t = store.begin().unwrap();
@@ -435,6 +435,6 @@ async fn test_gc_oldest_active_monotonic() {
 	for i in 0..n {
 		let mut t = store.begin().unwrap();
 		t.set(format!("mono_{i}").as_bytes(), b"v").unwrap();
-		t.commit().await.unwrap();
+		t.commit().unwrap();
 	}
 }

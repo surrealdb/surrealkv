@@ -1,10 +1,12 @@
 // This commit pipeline is inspired by Pebble's commit pipeline.
 
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
+use std::cell::UnsafeCell;
+use std::ptr;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::thread::Thread;
 
 use parking_lot::Mutex;
-use tokio::sync::{oneshot, Semaphore};
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
@@ -12,28 +14,47 @@ use crate::oracle::CommitOracle;
 use crate::stall::WriteStallController;
 
 /// Capacity of the lock-free commit ring buffer (slot array + index mask).
-/// Must be a power of two. The number of *in-flight* commits is gated below
-/// this by the semaphore (`max_concurrent_commits()`), so the ring never
-/// overflows.
+/// Must be a power of two. Commit is synchronous, so the number of in-flight
+/// commits is bounded by the number of caller threads (each blocks until done)
+/// — RocksDB's model. This capacity only needs to exceed that thread count;
+/// 1024 is far above any realistic writer-thread pool, so the ring can never
+/// overflow.
 const COMMIT_QUEUE_SIZE: usize = 1024;
 const DEQUEUE_BITS: u32 = 32;
 
-/// Maximum number of commits allowed in the pipeline concurrently (semaphore
-/// permits). Default 7 reproduces the v2 baseline exactly. Override with the
-/// `SURREALKV_MAX_CONCURRENT_COMMITS` env var to sweep; clamped to
-/// `[1, COMMIT_QUEUE_SIZE - 1]` so the ring can never overflow.
-fn max_concurrent_commits() -> usize {
-	std::env::var("SURREALKV_MAX_CONCURRENT_COMMITS")
-		.ok()
-		.and_then(|v| v.parse::<usize>().ok())
-		.map(|v| v.clamp(1, COMMIT_QUEUE_SIZE - 1))
-		.unwrap_or(7)
+/// Spin iterations before yielding while waiting (RocksDB uses 200 pause loops).
+const WAIT_SPINS: u32 = 256;
+/// Yield budget before parking, in microseconds (RocksDB default 100µs).
+const WAIT_YIELD_US: u64 = 100;
+
+/// 3-phase wait (spin → yield → park) on a predicate, mirroring RocksDB's
+/// `AwaitState`. Most waits resolve in the spin/yield window (the leader signals
+/// within microseconds), so they never hit a futex park / context switch.
+/// `done` must be re-checked each step (park may wake spuriously).
+#[inline]
+fn spin_yield_park<F: Fn() -> bool>(done: F) {
+	for _ in 0..WAIT_SPINS {
+		if done() {
+			return;
+		}
+		std::hint::spin_loop();
+	}
+	let start = std::time::Instant::now();
+	while start.elapsed() < std::time::Duration::from_micros(WAIT_YIELD_US) {
+		if done() {
+			return;
+		}
+		std::thread::yield_now();
+	}
+	while !done() {
+		std::thread::park();
+	}
 }
 
 /// Output of [`CommitEnv::pre_serialize`]: the processed batch (values wrapped
 /// in `ValueLocation`, ready for memtable apply) plus its WAL encoding carrying
-/// a placeholder sequence number. The real seq is stamped in place under
-/// `write_mutex` by [`CommitEnv::write_prepared`].
+/// a placeholder sequence number. The group leader stamps the real seq into the
+/// bytes in place (`Batch::patch_encoded_seq`) before appending to the WAL.
 pub(crate) struct PreparedWrite {
 	pub(crate) processed_batch: Batch,
 	pub(crate) bytes: Vec<u8>,
@@ -46,10 +67,10 @@ pub trait CommitEnv: Send + Sync + 'static {
 	// processed batch (for `apply`) plus its encoded bytes with a placeholder seq.
 	fn pre_serialize(&self, batch: &Batch) -> Result<PreparedWrite>;
 
-	// Stamp `seq_num` into the pre-encoded bytes (in place) and append to the
-	// WAL. Called UNDER `write_mutex`; intentionally cheap (an 8-byte patch +
-	// a WAL append, no clone/encode).
-	fn write_prepared(&self, prepared: &mut PreparedWrite, seq_num: u64, sync: bool) -> Result<()>;
+	// Append a whole group of pre-encoded WAL records in ONE lock acquisition,
+	// then flush once (and fsync once iff `sync`). Called by the group leader
+	// UNDER `write_mutex`. Amortizes the `write()` syscall across the group.
+	fn wal_append_group(&self, records: &[&[u8]], sync: bool) -> Result<()>;
 
 	// Apply processed batch to memtable
 	fn apply(&self, batch: &Batch) -> Result<()>;
@@ -64,24 +85,38 @@ pub trait CommitEnv: Send + Sync + 'static {
 	fn oldest_active_start_seq(&self) -> u64;
 }
 
-// Lock-free commit queue entry
+// Lock-free commit queue entry. Completion is delivered synchronously via
+// `complete()` (from `publish()`), which wakes the committer parked in `wait()`.
 struct CommitBatch {
 	seq_num: AtomicU64,
 	count: u32, // Number of entries in the batch
 	applied: AtomicBool,
-	complete_tx: Mutex<Option<oneshot::Sender<Result<()>>>>,
+	/// Won once by the first `complete()` caller (claim); later callers are
+	/// no-ops, so a `publish()` Ok cannot clobber an earlier Err.
+	claimed: AtomicBool,
+	/// Result is visible once `done` is observed true (Acquire).
+	done: AtomicBool,
+	result: UnsafeCell<Option<Result<()>>>,
+	/// The committing thread, parked in `wait()`; woken by `complete()`.
+	waiter: Thread,
 }
 
+// SAFETY: `result` is written exactly once by the single `complete()` claimer
+// before `done` is set (Release); `wait()` reads it only after observing `done`
+// (Acquire). No concurrent access.
+unsafe impl Sync for CommitBatch {}
+
 impl CommitBatch {
-	fn new(count: u32) -> (Arc<Self>, oneshot::Receiver<Result<()>>) {
-		let (tx, rx) = oneshot::channel();
-		let commit = Arc::new(Self {
+	fn new(count: u32, waiter: Thread) -> Arc<Self> {
+		Arc::new(Self {
 			seq_num: AtomicU64::new(0),
 			count,
 			applied: AtomicBool::new(false),
-			complete_tx: Mutex::new(Some(tx)),
-		});
-		(commit, rx)
+			claimed: AtomicBool::new(false),
+			done: AtomicBool::new(false),
+			result: UnsafeCell::new(None),
+			waiter,
+		})
 	}
 
 	fn set_seq_num(&self, seq: u64) {
@@ -100,13 +135,59 @@ impl CommitBatch {
 		self.applied.load(Ordering::Acquire)
 	}
 
+	/// Deliver the commit result and wake the waiter. Idempotent: only the first
+	/// caller wins the claim and writes the result.
 	fn complete(&self, result: Result<()>) {
-		let mut guard = self.complete_tx.lock();
-		if let Some(tx) = guard.take() {
-			let _ = tx.send(result);
+		if self.claimed.swap(true, Ordering::AcqRel) {
+			return;
 		}
+		// SAFETY: we won the claim — sole writer of `result`, before `done`.
+		unsafe { *self.result.get() = Some(result) };
+		self.done.store(true, Ordering::Release);
+		self.waiter.unpark();
+	}
+
+	/// Block (spin → yield → park) until completed, then take the result.
+	fn wait(&self) -> Result<()> {
+		spin_yield_park(|| self.done.load(Ordering::Acquire));
+		// SAFETY: `done` observed true ⇒ `result` written by the claimer.
+		unsafe { (*self.result.get()).take().unwrap() }
 	}
 }
+
+/// Writer-group states.
+const WS_INIT: u8 = 0;
+const WS_WAL_OK: u8 = 1;
+const WS_WAL_ERR: u8 = 2;
+
+/// A committer's node in the lock-free write group (RocksDB-style group commit).
+/// Stack-allocated by the committer and shared with the group leader via a raw
+/// pointer on the Treiber stack `newest_writer`. Its address is stable for the
+/// duration of the synchronous `commit()` call (RocksDB's `Writer` model).
+struct WriteRequest {
+	/// Pre-encoded WAL record (placeholder seq). Leader patches the seq + reads
+	/// it for the WAL append; the owner never touches it after linking.
+	bytes: UnsafeCell<Vec<u8>>,
+	/// Processed batch. Leader reads keys (oracle) + stamps seq; owner applies
+	/// after observing `state == WS_WAL_OK`.
+	processed_batch: UnsafeCell<Batch>,
+	commit_batch: Arc<CommitBatch>,
+	start_seq: u64,
+	sync: bool,
+	link_next: AtomicPtr<WriteRequest>,
+	/// WS_INIT → WS_WAL_OK / WS_WAL_ERR (Release by leader, Acquire by owner).
+	state: AtomicU8,
+	/// WAL outcome error (set by leader before `state` when WS_WAL_ERR).
+	outcome: UnsafeCell<Option<Error>>,
+	/// Owner thread, unparked by the leader when it sets `state`.
+	thread: Thread,
+}
+
+// SAFETY: each `UnsafeCell` field is accessed by exactly one thread at a time,
+// gated by the CAS-link/swap (leader's first access) and the `state`
+// Release/Acquire handoff (owner's access). See `run_leader_group`.
+unsafe impl Send for WriteRequest {}
+unsafe impl Sync for WriteRequest {}
 
 // Lock-free single-producer, multi-consumer commit queue
 //
@@ -227,8 +308,10 @@ pub(crate) struct CommitPipeline {
 	write_mutex: Mutex<()>,
 	// Lock-free single-producer, multi-consumer commit queue
 	pending: CommitQueue,
-	// Semaphore for flow control
-	commit_sem: Arc<Semaphore>,
+	// Head of the lock-free write group (Treiber stack of stack-allocated
+	// `WriteRequest` nodes). The first committer to link an empty list is the
+	// group leader. No semaphore: sync commit bounds in-flight by caller threads.
+	newest_writer: AtomicPtr<WriteRequest>,
 	shutdown: AtomicBool,
 	// Write stall controller - checked before acquiring write_mutex
 	write_stall: Arc<WriteStallController>,
@@ -247,7 +330,7 @@ impl CommitPipeline {
 			oracle: Arc::new(CommitOracle::new()),
 			write_mutex: Mutex::new(()),
 			pending: CommitQueue::new(),
-			commit_sem: Arc::new(Semaphore::new(max_concurrent_commits())),
+			newest_writer: AtomicPtr::new(ptr::null_mut()),
 			shutdown: AtomicBool::new(false),
 			write_stall,
 		})
@@ -281,7 +364,7 @@ impl CommitPipeline {
 		self.oracle.reset_for_restore(max_seq);
 	}
 
-	pub(crate) async fn commit(&self, batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
+	pub(crate) fn commit(&self, batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
@@ -293,133 +376,70 @@ impl CommitPipeline {
 			return Ok(());
 		}
 
-		// Check write stall BEFORE acquiring any locks.
-		// This ensures stalled writers wait here without blocking others.
-		self.write_stall.check().await?;
+		// Check write stall BEFORE entering the group (no lock held). Sync: a
+		// stalled committer blocks its own thread; the flush that clears the
+		// stall runs on a dedicated std::thread, so nothing is starved.
+		self.write_stall.check()?;
 
-		// Acquire permit for flow control
-		let _permit = self.commit_sem.acquire().await.map_err(|_| Error::PipelineStall)?;
+		// Pre-serialize OUTSIDE the group/lock: clone+wrap values and encode the
+		// batch (the expensive part). On failure nothing has been allocated,
+		// enqueued, or written — `?` simply returns.
+		let prepared = self.env.pre_serialize(&batch)?;
+		let count = prepared.processed_batch.count();
+		drop(batch); // keys now live in `prepared.processed_batch`
 
-		// Pre-serialize OUTSIDE `write_mutex`: clone+wrap values and encode the
-		// batch (the expensive part). Only seq-stamping + the WAL append stay
-		// under the lock. On failure nothing has been allocated / enqueued /
-		// written — `?` simply returns, so no cleanup is needed.
-		let mut prepared = self.env.pre_serialize(&batch)?;
+		let commit_batch = CommitBatch::new(count, std::thread::current());
 
-		let (commit_batch, complete_rx) = CommitBatch::new(batch.count());
-
-		// === CRITICAL SECTION under write_mutex ===
-		//
-		// Atomically: validate write keys against the oracle map, allocate
-		// the commit seq, insert oracle entries with that seq, enqueue, and
-		// stamp+append to WAL. The single-producer invariant on `pending`
-		// requires seq allocation and `enqueue` to be in the same critical
-		// section (otherwise the FIFO `dequeue_applied` invariant breaks).
-		//
-		// Memtable `apply()` is intentionally OUTSIDE this block — that is
-		// the throughput unlock. While T1 is applying, T2 can enter
-		// `write_mutex` and run validate + seq + oracle + WAL.
-		//
-		// Two distinct failure modes inside the section:
-		//   1. `oracle.check` failure: nothing has been allocated, enqueued, or written. Propagate
-		//      the error with `?`; no cleanup.
-		//   2. `env.write_prepared` (WAL) failure: oracle entries were already published and the
-		//      batch was enqueued. Roll back those entries (seq-match guard preserves concurrent
-		//      overwriters), drain the queue slot, release the lock, and return the error.
-		//
-		// Keys are derived from `batch.entries` (single source of truth).
-		// Duplicate keys within a batch (e.g. from savepoint history) are
-		// harmless: oracle.check/publish are idempotent on the same key.
-		let allocated_seq: u64 = {
-			let _guard = self.write_mutex.lock();
-
-			// Validate against the oracle. No state has changed yet; on
-			// failure `?` simply returns the error to the caller.
-			self.oracle.check(batch.entries.iter().map(|e| e.key.as_slice()), start_seq)?;
-
-			let count = batch.count() as u64;
-			let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
-
-			// Publish the oracle entries with the allocated seq.
-			//
-			// Clamp `oldest_active` by this txn's own `start_seq`. Defense-in-depth
-			// against a caller that drives `Core::commit` without registering in
-			// `active_txn_tracker` (the `(None, None)` fallback in
-			// `oldest_active_start_seq` returns `visible_seq_num`, which may exceed
-			// `start_seq` once `visible_seq_num` has advanced past the committing
-			// txn's snapshot). With this clamp, `kept_since` can never advance past
-			// the committing txn's own snapshot — regardless of caller hygiene.
-			let oldest_active = self.env.oldest_active_start_seq().min(start_seq);
-			self.oracle.publish(
-				batch.entries.iter().map(|e| e.key.as_slice()),
-				seq_num,
-				count,
-				oldest_active,
-			);
-
-			// Stamp the commit_batch.
-			commit_batch.set_seq_num(seq_num);
-
-			// Enqueue (single producer, same critical section as seq alloc).
-			self.pending.enqueue(Arc::clone(&commit_batch));
-
-			// Stamp seq into the pre-encoded bytes + WAL append (serialized).
-			match self.env.write_prepared(&mut prepared, seq_num, sync) {
-				Ok(()) => seq_num,
-				Err(e) => {
-					// WAL failed AFTER oracle.publish. Roll back the entries
-					// we stamped; the seq-match guard leaves concurrent
-					// overwriters untouched.
-					let stamp = seq_num + count - 1;
-					self.oracle.rollback(batch.entries.iter().map(|e| e.key.as_slice()), stamp);
-					// The batch is in `pending` and was never marked applied.
-					// Order matters: complete with Err FIRST, then mark_applied,
-					// so a concurrent publish() can't dequeue and call
-					// complete(Ok) before our Err is set.
-					commit_batch.complete(Err(e.clone()));
-					commit_batch.mark_applied();
-					// Release write_mutex before draining the queue.
-					drop(_guard);
-					self.publish();
-					return Err(e);
-				}
-			}
+		// Stack-allocated write-group node (RocksDB `Writer` model). Stable
+		// address for this function's duration; shared with the leader via `*mut`.
+		let req = WriteRequest {
+			bytes: UnsafeCell::new(prepared.bytes),
+			processed_batch: UnsafeCell::new(prepared.processed_batch),
+			commit_batch: Arc::clone(&commit_batch),
+			start_seq,
+			sync,
+			link_next: AtomicPtr::new(ptr::null_mut()),
+			state: AtomicU8::new(WS_INIT),
+			outcome: UnsafeCell::new(None),
+			thread: std::thread::current(),
 		};
-		// === END CRITICAL SECTION ===
+		let wp: *mut WriteRequest = &req as *const WriteRequest as *mut WriteRequest;
 
-		// Memtable apply — OUTSIDE write_mutex. The next committer can already
-		// be inside the critical section. This restores the pipeline overlap
-		// that PR #378 destroyed.
-		let apply_result = self.env.apply(&prepared.processed_batch);
+		// Join the write group. The first committer to link an empty list is the
+		// LEADER: it runs oracle/seq/enqueue/WAL for the WHOLE group under one
+		// `write_mutex` hold + one flush. Followers wait (spin → yield → park).
+		let is_leader = self.join_group(wp);
+		if is_leader {
+			self.run_leader_group(wp);
+		} else {
+			spin_yield_park(|| req.state.load(Ordering::Acquire) != WS_INIT);
+		}
 
-		// =========================================================================
-		// Failure-path invariants
-		// =========================================================================
-		// (a) Zombie prevention: every enqueued batch MUST eventually be
-		//     marked applied and drained from `pending`, otherwise the queue
-		//     fills and panics with "commit queue overflow" (see [c]).
-		// (b) Oracle rollback on apply failure: when apply fails, the WAL
-		//     record is durable but the memtable did not receive it. Other
-		//     in-flight txns that would conflict with this seq's stamp must
-		//     not be falsely aborted, so we roll back the oracle entries
-		//     for this batch (seq-match guarded — concurrent overwriters
-		//     keep their stamps).
-		// (c) Sequence number gaps: the allocated `seq_num` is consumed
-		//     irrespective of apply success. On WAL replay after restart,
-		//     a WAL-durable but apply-failed entry will be re-inserted into
-		//     the memtable; a later same-key writer's higher seq shadows it.
-		// =========================================================================
+		// WAL outcome (set by the leader, Acquire-synchronized with `state`).
+		if req.state.load(Ordering::Acquire) == WS_WAL_ERR {
+			// SAFETY: leader wrote `outcome` before the Release store of `state`.
+			// For an enqueued member it also rolled back the oracle, completed our
+			// CommitBatch with the error, and drained it from `pending`; a
+			// conflicting member was never enqueued.
+			let err = unsafe { (*req.outcome.get()).take() }.unwrap_or(Error::PipelineStall);
+			return Err(err);
+		}
+
+		// === Memtable apply — OUTSIDE any lock, in PARALLEL across group members.
+		// SAFETY: the leader stamped our seq into `processed_batch` before the
+		// Release store of WS_WAL_OK (observed above, Acquire) and no longer
+		// touches the node.
+		let apply_result = self.env.apply(unsafe { &*req.processed_batch.get() });
 
 		let apply_err = if let Err(ref e) = apply_result {
-			// Roll back this txn's oracle entries so subsequent same-key
-			// commits don't false-abort against a ghost stamp.
-			let count = batch.count() as u64;
-			let stamp = allocated_seq + count - 1;
-			self.oracle.rollback(batch.entries.iter().map(|e| e.key.as_slice()), stamp);
-
-			// Order matters: complete with Err FIRST, then mark_applied below.
-			// Otherwise a concurrent publish() could dequeue the (already
-			// applied) batch and call complete(Ok) before our Err lands.
+			// Roll back this txn's oracle entries (seq-match guarded) so a
+			// subsequent same-key commit doesn't false-abort on a ghost stamp.
+			let pb = unsafe { &*req.processed_batch.get() };
+			let c = pb.count() as u64;
+			let stamp = commit_batch.get_seq_num() + c - 1;
+			self.oracle.rollback(pb.entries.iter().map(|e| e.key.as_slice()), stamp);
+			// Complete with Err FIRST, then mark_applied, so a concurrent
+			// publish() can't dequeue and complete(Ok) before our Err lands.
 			let err = Error::CommitFail(e.to_string());
 			commit_batch.complete(Err(err.clone()));
 			Some(err)
@@ -429,14 +449,156 @@ impl CommitPipeline {
 
 		commit_batch.mark_applied();
 
-		// Publish (multi-consumer) - MUST always run to drain queue
+		// Publish (multi-consumer) - MUST always run to drain the queue.
 		self.publish();
 
 		if let Some(err) = apply_err {
 			return Err(err);
 		}
 
-		complete_rx.await.map_err(|_| Error::PipelineStall)?
+		commit_batch.wait()
+	}
+
+	/// CAS-link `w` onto the write group (Treiber push). Returns `true` if this
+	/// committer linked an empty list and is therefore the group LEADER.
+	fn join_group(&self, w: *mut WriteRequest) -> bool {
+		loop {
+			let head = self.newest_writer.load(Ordering::Acquire);
+			// SAFETY: `w` is our own node, not yet visible to other threads.
+			unsafe { (*w).link_next.store(head, Ordering::Relaxed) };
+			if self
+				.newest_writer
+				.compare_exchange_weak(head, w, Ordering::AcqRel, Ordering::Acquire)
+				.is_ok()
+			{
+				return head.is_null();
+			}
+		}
+	}
+
+	/// Leader path: drain the write group and, under a SINGLE `write_mutex`
+	/// acquisition, run oracle.check → seq alloc → oracle.publish → enqueue →
+	/// stamp-seq for each member in FIFO order, then append ALL records + flush
+	/// once. Finally signal every follower its WAL outcome (targeted `unpark`).
+	///
+	/// Invariant: `write_mutex` is held across the ENTIRE member loop (never
+	/// released mid-group) and `fetch_add`+`enqueue` are adjacent per member, so
+	/// enqueue order == seq order (the FIFO `pending` queue requires it).
+	fn run_leader_group(&self, self_w: *mut WriteRequest) {
+		let guard = self.write_mutex.lock();
+
+		// Close the group: steal the whole stack. Anyone linking after this sees
+		// an empty head and becomes the next group's leader.
+		let mut node = self.newest_writer.swap(ptr::null_mut(), Ordering::AcqRel);
+
+		// Treiber stack is newest-first; reverse to FIFO (= arrival / seq order).
+		let mut group: Vec<*mut WriteRequest> = Vec::new();
+		while !node.is_null() {
+			group.push(node);
+			// SAFETY: nodes stay alive (owners blocked) until we set their state.
+			node = unsafe { (*node).link_next.load(Ordering::Relaxed) };
+		}
+		group.reverse();
+
+		let mut records: Vec<&[u8]> = Vec::with_capacity(group.len());
+		let mut enqueued: Vec<*mut WriteRequest> = Vec::with_capacity(group.len());
+
+		for &w in &group {
+			// SAFETY: leader-exclusive access (owner parked); see WriteRequest doc.
+			let pb = unsafe { &mut *(*w).processed_batch.get() };
+			let cnt = pb.count() as u64;
+			let start_seq = unsafe { (*w).start_seq };
+
+			// Conflict check. A failing member consumes NO seq and is NOT
+			// enqueued; record its error in `outcome`.
+			if let Err(e) =
+				self.oracle.check(pb.entries.iter().map(|e| e.key.as_slice()), start_seq)
+			{
+				unsafe { *(*w).outcome.get() = Some(e) };
+				continue;
+			}
+
+			let seq = self.log_seq_num.fetch_add(cnt, Ordering::SeqCst);
+			let oldest_active = self.env.oldest_active_start_seq().min(start_seq);
+			// Publish BEFORE the next member's check so intra-group same-key
+			// write-write conflicts are detected.
+			self.oracle.publish(
+				pb.entries.iter().map(|e| e.key.as_slice()),
+				seq,
+				cnt,
+				oldest_active,
+			);
+
+			unsafe { (*w).commit_batch.set_seq_num(seq) };
+			pb.set_starting_seq_num(seq);
+			// Stamp the seq into the pre-encoded WAL record in place.
+			let bytes = unsafe { &mut *(*w).bytes.get() };
+			Batch::patch_encoded_seq(bytes, seq);
+
+			// Enqueue (single producer = leader, FIFO/seq order).
+			unsafe { self.pending.enqueue(Arc::clone(&(*w).commit_batch)) };
+
+			// SAFETY: slice valid for this fn — the node lives in `group` and
+			// owners don't touch `bytes` after linking.
+			let slice_ptr: *const [u8] = bytes.as_slice();
+			records.push(unsafe { &*slice_ptr });
+			enqueued.push(w);
+		}
+
+		let need_sync = enqueued.iter().any(|&w| unsafe { (*w).sync });
+
+		let wal_failed = if records.is_empty() {
+			false
+		} else {
+			match self.env.wal_append_group(&records, need_sync) {
+				Ok(()) => false,
+				Err(e) => {
+					// Coalesced WAL write failed: every enqueued member is in
+					// doubt. Roll back (seq-match guarded), complete(Err), and
+					// mark applied so `publish()` drains it. Record the error.
+					for &w in &enqueued {
+						let pb = unsafe { &*(*w).processed_batch.get() };
+						let c = pb.count() as u64;
+						let stamp = unsafe { (*w).commit_batch.get_seq_num() } + c - 1;
+						self.oracle.rollback(pb.entries.iter().map(|e| e.key.as_slice()), stamp);
+						unsafe {
+							(*w).commit_batch.complete(Err(e.clone()));
+							(*w).commit_batch.mark_applied();
+							*(*w).outcome.get() = Some(e.clone());
+						}
+					}
+					true
+				}
+			}
+		};
+
+		drop(guard);
+
+		// Followers return early on WS_WAL_ERR and never call publish(), so the
+		// leader must drain the failed-but-enqueued batches here.
+		if wal_failed {
+			self.publish();
+		}
+
+		// Signal every member its WAL outcome. A member is WS_WAL_OK iff it has
+		// no recorded `outcome` (passed check AND the WAL write succeeded).
+		// Clone the thread BEFORE the Release store of `state`: once a follower
+		// observes the state it may return and free its stack node.
+		for &w in &group {
+			let st = if unsafe { (*(*w).outcome.get()).is_some() } {
+				WS_WAL_ERR
+			} else {
+				WS_WAL_OK
+			};
+			if w == self_w {
+				// Leader reads its own state after this function returns.
+				unsafe { (*w).state.store(st, Ordering::Release) };
+			} else {
+				let t = unsafe { (*w).thread.clone() };
+				unsafe { (*w).state.store(st, Ordering::Release) };
+				t.unpark();
+			}
+		}
 	}
 
 	#[cfg(test)]
@@ -553,12 +715,6 @@ mod tests {
 		})
 	}
 
-	fn mock_write_prepared(prepared: &mut PreparedWrite, seq_num: u64) -> Result<()> {
-		Batch::patch_encoded_seq(&mut prepared.bytes, seq_num);
-		prepared.processed_batch.set_starting_seq_num(seq_num);
-		Ok(())
-	}
-
 	struct MockEnv;
 
 	impl CommitEnv for MockEnv {
@@ -566,13 +722,8 @@ mod tests {
 			mock_pre_serialize(batch)
 		}
 
-		fn write_prepared(
-			&self,
-			prepared: &mut PreparedWrite,
-			seq_num: u64,
-			_sync: bool,
-		) -> Result<()> {
-			mock_write_prepared(prepared, seq_num)
+		fn wal_append_group(&self, _records: &[&[u8]], _sync: bool) -> Result<()> {
+			Ok(())
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -598,7 +749,7 @@ mod tests {
 			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
 			.unwrap();
 
-		let result = pipeline.commit(batch, false, 0).await;
+		let result = pipeline.commit(batch, false, 0);
 		assert!(result.is_ok(), "Single commit failed: {result:?}");
 
 		let visible = pipeline.get_visible_seq_num();
@@ -626,7 +777,7 @@ mod tests {
 					i,
 				)
 				.unwrap();
-			let result = pipeline.commit(batch, false, 0).await;
+			let result = pipeline.commit(batch, false, 0);
 			assert!(result.is_ok(), "Sequential commit {i} failed: {result:?}");
 		}
 
@@ -653,7 +804,7 @@ mod tests {
 						i,
 					)
 					.unwrap();
-				pipeline.commit(batch, false, 0).await
+				pipeline.commit(batch, false, 0)
 			});
 			handles.push(handle);
 		}
@@ -683,18 +834,13 @@ mod tests {
 			mock_pre_serialize(batch)
 		}
 
-		fn write_prepared(
-			&self,
-			prepared: &mut PreparedWrite,
-			seq_num: u64,
-			_sync: bool,
-		) -> Result<()> {
-			// Simulate WAL write cost under the lock (as the old `write` did).
+		fn wal_append_group(&self, _records: &[&[u8]], _sync: bool) -> Result<()> {
+			// Simulate WAL write cost for the group (as the old `write` did).
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(100) {
 				std::hint::spin_loop();
 			}
-			mock_write_prepared(prepared, seq_num)
+			Ok(())
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -735,7 +881,7 @@ mod tests {
 						i,
 					)
 					.unwrap();
-				pipeline.commit(batch, false, 0).await
+				pipeline.commit(batch, false, 0)
 			});
 			handles.push(handle);
 		}
@@ -775,13 +921,8 @@ mod tests {
 			mock_pre_serialize(batch)
 		}
 
-		fn write_prepared(
-			&self,
-			prepared: &mut PreparedWrite,
-			seq_num: u64,
-			_sync: bool,
-		) -> Result<()> {
-			mock_write_prepared(prepared, seq_num)
+		fn wal_append_group(&self, _records: &[&[u8]], _sync: bool) -> Result<()> {
+			Ok(())
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -820,7 +961,7 @@ mod tests {
 				)
 				.unwrap();
 
-			let result = pipeline.commit(batch, false, 0).await;
+			let result = pipeline.commit(batch, false, 0);
 			assert!(result.is_err(), "Expected error at iteration {i}");
 		}
 
@@ -848,13 +989,8 @@ mod tests {
 			mock_pre_serialize(batch)
 		}
 
-		fn write_prepared(
-			&self,
-			prepared: &mut PreparedWrite,
-			seq_num: u64,
-			_sync: bool,
-		) -> Result<()> {
-			mock_write_prepared(prepared, seq_num)
+		fn wal_append_group(&self, _records: &[&[u8]], _sync: bool) -> Result<()> {
+			Ok(())
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -899,7 +1035,7 @@ mod tests {
 				)
 				.unwrap();
 
-			let result = pipeline.commit(batch, false, 0).await;
+			let result = pipeline.commit(batch, false, 0);
 
 			if i < fail_count {
 				assert!(result.is_err(), "Expected error at iteration {i}");
@@ -931,7 +1067,7 @@ mod tests {
 		// allocated seq, then rolled back inside `commit()` on the apply error.
 		let mut batch = Batch::new(0);
 		batch.add_record(InternalKeyKind::Set, b"K".to_vec(), Some(b"v1".to_vec()), 0).unwrap();
-		let r1 = pipeline.commit(batch, false, 0).await;
+		let r1 = pipeline.commit(batch, false, 0);
 		assert!(r1.is_err(), "expected first apply to fail, got {r1:?}");
 		assert_eq!(pipeline.oracle().len(), 0, "rollback should have removed the entry");
 
@@ -940,7 +1076,7 @@ mod tests {
 		// the oracle is empty so this MUST succeed — no ghost conflict.
 		let mut batch = Batch::new(0);
 		batch.add_record(InternalKeyKind::Set, b"K".to_vec(), Some(b"v2".to_vec()), 0).unwrap();
-		let r2 = pipeline.commit(batch, false, 0).await;
+		let r2 = pipeline.commit(batch, false, 0);
 		assert!(r2.is_ok(), "second commit on K should succeed (no ghost), got {r2:?}");
 
 		pipeline.shutdown();
@@ -961,13 +1097,8 @@ mod tests {
 			mock_pre_serialize(batch)
 		}
 
-		fn write_prepared(
-			&self,
-			prepared: &mut PreparedWrite,
-			seq_num: u64,
-			_sync: bool,
-		) -> Result<()> {
-			mock_write_prepared(prepared, seq_num)
+		fn wal_append_group(&self, _records: &[&[u8]], _sync: bool) -> Result<()> {
+			Ok(())
 		}
 
 		fn apply(&self, _batch: &Batch) -> Result<()> {
@@ -1008,7 +1139,7 @@ mod tests {
 					0,
 				)
 				.unwrap();
-			let r = pipeline.commit(batch, false, 0).await;
+			let r = pipeline.commit(batch, false, 0);
 			assert!(r.is_ok(), "iter {i}: commit must succeed, got {r:?}");
 		}
 

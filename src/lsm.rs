@@ -434,25 +434,25 @@ impl CoreInner {
 			entry.wal_number,
 		)?;
 
-		// Schedule async WAL cleanup
+		// Clean up old WAL segments now that this immutable is flushed (its WAL is
+		// no longer needed). Done synchronously on the flush thread — a quick
+		// directory scan + unlink. (Was a `tokio::spawn`; the flush path now runs
+		// on a std::thread with no tokio runtime.)
 		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
 		let min_wal_to_keep = entry.wal_number + 1;
-
-		tokio::spawn(async move {
-			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
-				Ok(count) if count > 0 => {
-					log::info!(
-						"Cleaned up {} old WAL segments (min_wal_to_keep={})",
-						count,
-						min_wal_to_keep
-					);
-				}
-				Ok(_) => {}
-				Err(e) => {
-					log::warn!("Failed to clean up old WAL segments: {}", e);
-				}
+		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+			Ok(count) if count > 0 => {
+				log::info!(
+					"Cleaned up {} old WAL segments (min_wal_to_keep={})",
+					count,
+					min_wal_to_keep
+				);
 			}
-		});
+			Ok(_) => {}
+			Err(e) => {
+				log::warn!("Failed to clean up old WAL segments: {}", e);
+			}
+		}
 
 		log::debug!(
 			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
@@ -903,21 +903,20 @@ impl CommitEnv for LsmCommitEnv {
 		})
 	}
 
-	// Stamp the allocated seq into the pre-encoded bytes (in place) and into the
-	// processed batch (consumed by `apply`), then append to the WAL. This is all
-	// that remains under write_mutex — no clone, no re-encode.
-	fn write_prepared(
-		&self,
-		prepared: &mut PreparedWrite,
-		seq_num: u64,
-		sync: bool,
-	) -> Result<()> {
-		Batch::patch_encoded_seq(&mut prepared.bytes, seq_num);
-		prepared.processed_batch.set_starting_seq_num(seq_num);
-
+	// Append a whole group of pre-encoded WAL records in ONE `wal.write()`
+	// acquisition, then flush once (and fsync once iff `sync`). Coalescing the
+	// flush is the eventual-durability win: one `write()` syscall per group
+	// instead of one per commit. The group leader has already stamped each
+	// record's seq in place (`Batch::patch_encoded_seq`).
+	fn wal_append_group(&self, records: &[&[u8]], sync: bool) -> Result<()> {
 		let mut wal_guard = self.core.wal.write();
-		wal_guard.append(&prepared.bytes)?;
+		for rec in records {
+			wal_guard.append_no_flush(rec)?;
+		}
+		// One flush to the OS page cache for the whole group.
+		wal_guard.flush()?;
 		if sync {
+			// One fsync for the whole group.
 			wal_guard.sync()?;
 		}
 		drop(wal_guard);
@@ -1265,12 +1264,12 @@ impl Core {
 		Ok(core)
 	}
 
-	pub(crate) async fn commit(&self, batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
+	pub(crate) fn commit(&self, batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
 		// Commit the batch using the commit pipeline. `start_seq` is the
 		// transaction's snapshot seq (used by the oracle's write-write
 		// conflict check). The write keys are derived from `batch.entries`
 		// inside the pipeline — no duplicated parallel array.
-		self.commit_pipeline.commit(batch, sync, start_seq).await
+		self.commit_pipeline.commit(batch, sync, start_seq)
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {
@@ -1314,7 +1313,7 @@ impl Core {
 	///
 	/// Unlike `make_room_for_write`, this does NOT rotate the WAL before
 	/// flushing. This prevents creating an empty WAL file on clean shutdown.
-	pub async fn close(&self) -> Result<()> {
+	pub fn close(&self) -> Result<()> {
 		log::info!("Shutting down LSM tree...");
 
 		// Step 1: Shutdown the commit pipeline to stop accepting new writes
@@ -1329,7 +1328,7 @@ impl Core {
 		let task_manager = self.task_manager.lock().unwrap().take();
 		if let Some(task_manager) = task_manager {
 			log::debug!("Stopping background task manager...");
-			task_manager.stop().await;
+			task_manager.stop();
 			log::debug!("Background task manager stopped");
 		}
 
@@ -1614,8 +1613,8 @@ impl Tree {
 		Ok(metadata)
 	}
 
-	pub async fn close(&self) -> Result<()> {
-		self.core.close().await
+	pub fn close(&self) -> Result<()> {
+		self.core.close()
 	}
 
 	/// Flushes all memtables to disk synchronously.
@@ -1663,19 +1662,14 @@ impl Tree {
 
 impl Drop for Tree {
 	fn drop(&mut self) {
-		#[cfg(not(target_arch = "wasm32"))]
-		{
-			// Native environment - use tokio
-			if let Ok(handle) = tokio::runtime::Handle::try_current() {
-				// Clone the Arc to move into the async task
-				let core = Arc::clone(&self.core);
-				handle.spawn(async move {
-					if let Err(err) = core.close().await {
-						log::error!("Error closing store: {}", err);
-					}
-				});
-			} else {
-				log::warn!("No runtime available for closing the store correctly");
+		// Close synchronously on the LAST handle to this core. Commit/close are
+		// now synchronous (no tokio runtime needed); background tasks run on
+		// std::threads and are joined inside `close()` → `task_manager.stop()`.
+		// The `strong_count == 1` guard ensures a shared core is closed only
+		// when its final `Tree` is dropped.
+		if Arc::strong_count(&self.core) == 1 {
+			if let Err(err) = self.core.close() {
+				log::error!("Error closing store on drop: {}", err);
 			}
 		}
 	}

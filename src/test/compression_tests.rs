@@ -504,7 +504,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 		let value = generate_compressible_value(200, (idx % 256) as u8);
 		let mut txn = tree.begin().unwrap();
 		txn.set(key, &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -568,7 +568,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 	);
 	println!("Partial range scan returned {} keys", partial_count);
 
-	tree.close().await.unwrap();
+	tree.close().unwrap();
 }
 
 #[test(tokio::test)]
@@ -598,7 +598,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 			let value = generate_compressible_value(250, (idx % 256) as u8);
 			let mut txn = tree.begin().unwrap();
 			txn.set(key, &value).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			if idx % 2000 == 0 && idx > 0 {
 				println!("  Inserted {} keys", idx);
@@ -609,7 +609,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 		tree.flush().unwrap();
 
 		println!("Closing tree...");
-		tree.close().await.unwrap();
+		tree.close().unwrap();
 		println!("Tree closed successfully");
 	}
 
@@ -702,7 +702,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 		assert_eq!(scanned_count, keys.len(), "Range scan should return all keys after reopen");
 		println!("✓ Range scan successfully iterated through all {} keys", scanned_count);
 
-		tree.close().await.unwrap();
+		tree.close().unwrap();
 	}
 }
 
@@ -744,7 +744,7 @@ async fn test_lsm_compression_disk_size_comparison() {
 		let value = generate_compressible_value(500, b'A');
 		let mut txn = tree_compressed.begin().unwrap();
 		txn.set(key, &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		if idx % 1000 == 0 && idx > 0 {
 			println!("  Inserted {} keys", idx);
@@ -756,7 +756,7 @@ async fn test_lsm_compression_disk_size_comparison() {
 		let value = generate_compressible_value(500, b'A');
 		let mut txn = tree_uncompressed.begin().unwrap();
 		txn.set(key, &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		if idx % 1000 == 0 && idx > 0 {
 			println!("  Inserted {} keys", idx);
@@ -769,8 +769,8 @@ async fn test_lsm_compression_disk_size_comparison() {
 	println!("Flushing uncompressed tree...");
 	tree_uncompressed.flush().unwrap();
 
-	tree_compressed.close().await.unwrap();
-	tree_uncompressed.close().await.unwrap();
+	tree_compressed.close().unwrap();
+	tree_uncompressed.close().unwrap();
 
 	let compressed_sst_dir = path_compressed.join("sstables");
 	let uncompressed_sst_dir = path_uncompressed.join("sstables");
@@ -817,7 +817,7 @@ async fn test_lsm_compression_disk_size_comparison() {
 		let result = txn.get(&key).unwrap();
 		assert!(result.is_some(), "Key {} should exist after reopening compressed tree", i);
 	}
-	tree_compressed.close().await.unwrap();
+	tree_compressed.close().unwrap();
 }
 
 fn calculate_directory_size(dir: &PathBuf) -> u64 {
@@ -937,7 +937,7 @@ async fn test_compression_per_level_sstable_creation() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(&key, &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush to create L0 SSTable
@@ -952,7 +952,7 @@ async fn test_compression_per_level_sstable_creation() {
 		assert_eq!(value.len(), 1000);
 	}
 
-	tree.close().await.unwrap();
+	tree.close().unwrap();
 }
 
 #[test]
@@ -995,7 +995,7 @@ async fn test_compression_per_level_with_different_levels() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(&key, &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush and compaction
@@ -1009,5 +1009,5 @@ async fn test_compression_per_level_with_different_levels() {
 	let result = txn.get(&keys[0]).unwrap();
 	assert!(result.is_some(), "Should be able to read data after flush");
 
-	tree.close().await.unwrap();
+	tree.close().unwrap();
 }

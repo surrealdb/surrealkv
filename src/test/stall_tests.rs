@@ -54,22 +54,22 @@ fn default_thresholds() -> StallThresholds {
 	}
 }
 
-// ===== Unit Tests for WriteStallController =====
+// ===== Unit Tests for WriteStallController (synchronous; signaler on a thread) =====
 
-#[test(tokio::test)]
-async fn test_no_stall_below_threshold() {
+#[test]
+fn test_no_stall_below_threshold() {
 	let provider = Arc::new(MockStallCountProvider::new(1, 5));
 	let controller = WriteStallController::new(provider, default_thresholds());
 
 	// Below thresholds - should not stall
-	let result = controller.check().await;
+	let result = controller.check();
 	assert!(result.is_ok());
 	assert!(result.unwrap().is_none());
 	assert!(!controller.is_stalled());
 }
 
-#[test(tokio::test)]
-async fn test_memtable_stall_triggers() {
+#[test]
+fn test_memtable_stall_triggers() {
 	let provider = Arc::new(MockStallCountProvider::new(2, 0)); // At threshold
 	let controller = Arc::new(WriteStallController::new(
 		Arc::clone(&provider) as Arc<dyn WriteStallCountProvider>,
@@ -78,15 +78,15 @@ async fn test_memtable_stall_triggers() {
 	let controller_clone = Arc::clone(&controller);
 	let provider_clone = Arc::clone(&provider);
 
-	// Spawn task that will signal after delay
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(50)).await;
+	// Signal after a delay on a separate thread (check() blocks synchronously).
+	std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(50));
 		provider_clone.set_counts(1, 0); // Simulate flush completing
 		controller_clone.signal_work_done();
 	});
 
 	let start = std::time::Instant::now();
-	let result = controller.check().await;
+	let result = controller.check();
 
 	assert!(result.is_ok());
 	let stall_info: WriteStallInfo = result.unwrap().expect("Expected stall info");
@@ -99,8 +99,8 @@ async fn test_memtable_stall_triggers() {
 	assert!(start.elapsed() >= Duration::from_millis(40));
 }
 
-#[test(tokio::test)]
-async fn test_l0_stall_triggers() {
+#[test]
+fn test_l0_stall_triggers() {
 	let provider = Arc::new(MockStallCountProvider::new(0, 12)); // At L0 threshold
 	let controller = Arc::new(WriteStallController::new(
 		Arc::clone(&provider) as Arc<dyn WriteStallCountProvider>,
@@ -109,13 +109,13 @@ async fn test_l0_stall_triggers() {
 	let controller_clone = Arc::clone(&controller);
 	let provider_clone = Arc::clone(&provider);
 
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(50)).await;
+	std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(50));
 		provider_clone.set_counts(0, 5); // Simulate compaction completing
 		controller_clone.signal_work_done();
 	});
 
-	let result = controller.check().await;
+	let result = controller.check();
 	assert!(result.is_ok());
 
 	let stall_info = result.unwrap().expect("Expected stall info");
@@ -127,8 +127,8 @@ async fn test_l0_stall_triggers() {
 	assert!(stall_info.duration >= Duration::from_millis(40));
 }
 
-#[test(tokio::test)]
-async fn test_shutdown_during_stall() {
+#[test]
+fn test_shutdown_during_stall() {
 	let provider = Arc::new(MockStallCountProvider::new(2, 0)); // Always at threshold
 	let controller = Arc::new(WriteStallController::new(
 		provider as Arc<dyn WriteStallCountProvider>,
@@ -136,21 +136,20 @@ async fn test_shutdown_during_stall() {
 	));
 	let controller_clone = Arc::clone(&controller);
 
-	// Spawn task that will signal shutdown after delay
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(50)).await;
+	std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(50));
 		controller_clone.signal_shutdown();
 	});
 
-	let result = controller.check().await;
+	let result = controller.check();
 
 	// Should return Err(PipelineStall) on shutdown
 	assert!(result.is_err());
 	assert!(matches!(result.unwrap_err(), Error::PipelineStall));
 }
 
-#[test(tokio::test)]
-async fn test_stall_wakes_on_signal() {
+#[test]
+fn test_stall_wakes_on_signal() {
 	let provider = Arc::new(MockStallCountProvider::new(1, 5)); // Below threshold
 	let controller = Arc::new(WriteStallController::new(
 		provider as Arc<dyn WriteStallCountProvider>,
@@ -158,22 +157,21 @@ async fn test_stall_wakes_on_signal() {
 	));
 	let controller_clone = Arc::clone(&controller);
 
-	// Spawn multiple signals to simulate flush completing
-	tokio::spawn(async move {
+	std::thread::spawn(move || {
 		for _ in 0..3 {
-			time::sleep(Duration::from_millis(20)).await;
+			std::thread::sleep(Duration::from_millis(20));
 			controller_clone.signal_work_done();
 		}
 	});
 
 	// Below threshold - should not stall
-	let result = controller.check().await;
+	let result = controller.check();
 	assert!(result.is_ok());
 	assert!(result.unwrap().is_none()); // Wasn't stalled
 }
 
-#[test(tokio::test)]
-async fn test_is_stalled_flag() {
+#[test]
+fn test_is_stalled_flag() {
 	let provider = Arc::new(MockStallCountProvider::new(2, 0)); // At threshold
 	let controller = Arc::new(WriteStallController::new(
 		Arc::clone(&provider) as Arc<dyn WriteStallCountProvider>,
@@ -185,17 +183,16 @@ async fn test_is_stalled_flag() {
 
 	assert!(!controller.is_stalled());
 
-	// Spawn task that will check and then signal
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(20)).await;
+	std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(20));
 		// At this point, should be stalled
 		assert!(controller_check.is_stalled());
-		time::sleep(Duration::from_millis(30)).await;
+		std::thread::sleep(Duration::from_millis(30));
 		provider_clone.set_counts(1, 0); // Simulate flush completing
 		controller_clone.signal_work_done();
 	});
 
-	let _ = controller.check().await;
+	let _ = controller.check();
 
 	// After stall cleared
 	assert!(!controller.is_stalled());
@@ -221,10 +218,10 @@ async fn test_integration_basic_writes_no_stall() {
 		let value = vec![0u8; 100];
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), &value).unwrap();
-		let _: Result<(), crate::Error> = txn.commit().await;
+		let _: Result<(), crate::Error> = txn.commit();
 	}
 
-	let _: Result<(), crate::Error> = tree.close().await;
+	let _: Result<(), crate::Error> = tree.close();
 }
 
 #[test(tokio::test)]
@@ -297,7 +294,7 @@ async fn test_shutdown_completes_with_pending_writes() {
 			if txn.set(key.as_bytes(), &value).is_err() {
 				return;
 			}
-			if txn.commit().await.is_err() {
+			if txn.commit().is_err() {
 				return;
 			}
 		}
@@ -313,10 +310,10 @@ async fn test_shutdown_completes_with_pending_writes() {
 		Err(_) => panic!("Failed to unwrap Arc<Tree>"),
 	};
 
-	let shutdown_result = tokio::time::timeout(Duration::from_secs(5), tree_owned.close()).await;
+	// close() is synchronous now (joins the background std::threads).
+	let shutdown_result = tree_owned.close();
 
-	assert!(shutdown_result.is_ok(), "Shutdown should not hang");
-	assert!(shutdown_result.unwrap().is_ok(), "Shutdown should succeed");
+	assert!(shutdown_result.is_ok(), "Shutdown should succeed");
 
 	// Writer task should complete
 	let _ = writer.await;
@@ -349,13 +346,13 @@ async fn test_stall_check_at_arena_full() {
 		let value = vec![0u8; 500]; // ~500B per entry
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), &value).unwrap();
-		let result = txn.commit().await;
+		let result = txn.commit();
 		assert!(result.is_ok(), "Commit should succeed: {:?}", result.err());
 	}
 
 	// Should have rotated and created immutable memtables
 	tree.flush().unwrap();
-	tree.close().await.unwrap();
+	tree.close().unwrap();
 }
 
 #[test(tokio::test)]
@@ -382,7 +379,7 @@ async fn test_concurrent_writes_with_rotation() {
 				let value = vec![writer_id as u8; 200];
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), &value).unwrap();
-				if let Err(e) = txn.commit().await {
+				if let Err(e) = txn.commit() {
 					// Shutdown errors are acceptable
 					if !matches!(e, Error::PipelineStall) {
 						panic!("Unexpected error: {:?}", e);
@@ -412,7 +409,7 @@ async fn test_concurrent_writes_with_rotation() {
 		Ok(t) => t,
 		Err(_) => panic!("Failed to unwrap Arc<Tree>"),
 	};
-	tree.close().await.unwrap();
+	tree.close().unwrap();
 }
 
 #[test(tokio::test)]
@@ -433,7 +430,7 @@ async fn test_flush_waits_for_active_writers() {
 		let value = vec![0u8; 400];
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Flush should complete successfully (waited for any active writers)
@@ -447,7 +444,7 @@ async fn test_flush_waits_for_active_writers() {
 		assert!(result.is_some());
 	}
 
-	tree.close().await.unwrap();
+	tree.close().unwrap();
 }
 
 #[test(tokio::test)]
@@ -479,7 +476,7 @@ async fn test_memtable_rotation_under_concurrent_load() {
 				if txn.set(key.as_bytes(), &value).is_err() {
 					return;
 				}
-				if txn.commit().await.is_err() {
+				if txn.commit().is_err() {
 					return; // Shutdown or other error is acceptable in stress test
 				}
 			}
@@ -511,5 +508,5 @@ async fn test_memtable_rotation_under_concurrent_load() {
 		Ok(t) => t,
 		Err(_) => panic!("Failed to unwrap Arc<Tree>"),
 	};
-	tree.close().await.unwrap();
+	tree.close().unwrap();
 }
