@@ -35,7 +35,7 @@ pub fn seq_insert(b: divan::Bencher<'_, '_>, count: usize) {
 		let mut txn = tree.begin().unwrap();
 		txn.set(&key, &value).unwrap();
 		Handle::current().block_on(async {
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		});
 	});
 }
@@ -65,7 +65,7 @@ pub fn seq_get(b: divan::Bencher<'_, '_>, count: usize) {
 		keys.push(key);
 	}
 	Handle::current().block_on(async {
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 	});
 
 	b.counter(count).bench_local(|| {
@@ -101,7 +101,7 @@ pub fn seq_range(b: divan::Bencher<'_, '_>, count: usize) {
 		keys.push(key);
 	}
 	Handle::current().block_on(async {
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 	});
 
 	// Sort keys to get min for range start

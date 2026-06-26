@@ -35,13 +35,13 @@ async fn test_basic_recovery() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v1").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"baz", b"v5").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Phase 2: Reopen and verify
@@ -54,13 +54,13 @@ async fn test_basic_recovery() {
 		// Write more data
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"bar", b"v2").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v3").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Phase 3: Reopen again and verify all data
@@ -71,7 +71,7 @@ async fn test_basic_recovery() {
 		RecoveryTestHelper::verify_key(&tree, "bar", "v2").await;
 		RecoveryTestHelper::verify_key(&tree, "baz", "v5").await;
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -90,11 +90,11 @@ async fn test_recover_with_existing_ssts() {
 		// First batch - will be flushed
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v1").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"bar", b"v2").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
 		tree.flush().unwrap();
 		let sst_count_1 = RecoveryTestHelper::count_sst_files(&sst_dir);
@@ -103,11 +103,11 @@ async fn test_recover_with_existing_ssts() {
 		// Second batch - will be flushed
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v3").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"bar", b"v4").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
 		tree.flush().unwrap();
 		let sst_count_2 = RecoveryTestHelper::count_sst_files(&sst_dir);
@@ -116,10 +116,10 @@ async fn test_recover_with_existing_ssts() {
 		// Third write - stays in WAL only
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"big", b"large_value_not_flushed").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
 		// Close without flushing the last write
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Reopen and verify
@@ -133,7 +133,7 @@ async fn test_recover_with_existing_ssts() {
 		// Data from WAL recovery
 		RecoveryTestHelper::verify_key(&tree, "big", "large_value_not_flushed").await;
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -154,11 +154,11 @@ async fn test_recover_multiple_wals_without_flush() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 
 		// Note: Close will auto-flush in surrealkv
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Phase 2: Reopen and verify all WALs replayed
@@ -175,9 +175,9 @@ async fn test_recover_multiple_wals_without_flush() {
 		// Write more data (new WAL)
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"new_key", b"new_value").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Phase 3: Reopen again, verify original + new data
@@ -197,7 +197,7 @@ async fn test_recover_multiple_wals_without_flush() {
 		// Now flush everything
 		tree.flush().unwrap();
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Phase 4: Reopen and verify data from SST
@@ -211,7 +211,7 @@ async fn test_recover_multiple_wals_without_flush() {
 		}
 		RecoveryTestHelper::verify_key(&tree, "new_key", "new_value").await;
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -235,10 +235,10 @@ async fn test_recover_with_large_wal() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Reopen and verify all data recovered
@@ -252,7 +252,7 @@ async fn test_recover_with_large_wal() {
 			assert!(result.is_some(), "Key {} should exist", key);
 		}
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -268,12 +268,12 @@ async fn test_recovery_with_empty_wal() {
 		// Write and flush
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v1").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
 		tree.flush().unwrap();
 
 		// WAL is now empty (all data flushed)
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Reopen - should handle empty WAL gracefully
@@ -282,7 +282,7 @@ async fn test_recovery_with_empty_wal() {
 
 		RecoveryTestHelper::verify_key(&tree, "foo", "v1").await;
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -307,13 +307,13 @@ async fn test_file_count_after_recovery() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 
 		let sst_count = RecoveryTestHelper::count_sst_files(&sst_dir);
 		assert!(sst_count >= 1, "Should have created SST files");
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Reopen and verify file counts
@@ -337,7 +337,7 @@ async fn test_file_count_after_recovery() {
 			assert!(result.is_some(), "Key {} should exist after recovery", key);
 		}
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -353,9 +353,9 @@ async fn test_wal_cleanup_after_recovery_without_flush() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v1").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Reopen - WAL replayed but not flushed
@@ -369,7 +369,7 @@ async fn test_wal_cleanup_after_recovery_without_flush() {
 		// Now flush
 		tree.flush().unwrap();
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Reopen and verify old WALs cleaned up
@@ -386,7 +386,7 @@ async fn test_wal_cleanup_after_recovery_without_flush() {
 
 		RecoveryTestHelper::verify_key(&tree, "foo", "v1").await;
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -403,7 +403,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch_a_{}", i).as_bytes(), b"value_a").unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 		tree.flush().unwrap();
 
@@ -413,7 +413,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch_b_{}", i).as_bytes(), b"value_b").unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 
 		// Trigger rotation (creating new WAL segment)
@@ -423,11 +423,11 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch_c_{}", i).as_bytes(), b"value_c").unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 
 		// Close without flushing B and C
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 
 		log::info!("Log number after flush: {}", log_number_after_flush);
 	}
@@ -453,7 +453,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 			RecoveryTestHelper::verify_key(&tree, &key, "value_c").await;
 		}
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -471,10 +471,10 @@ async fn test_orphaned_sst_doesnt_break_recovery() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"real_key", b"real_value").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
 		tree.flush().unwrap();
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Manually create orphaned SST file (not in manifest)
@@ -489,7 +489,7 @@ async fn test_orphaned_sst_doesnt_break_recovery() {
 		// Real data should be there (orphan shouldn't affect recovery)
 		RecoveryTestHelper::verify_key(&tree, "real_key", "real_value").await;
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -508,7 +508,7 @@ async fn test_manifest_log_number_progression() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("c1_key_{}", i).as_bytes(), b"cycle1").unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -516,7 +516,7 @@ async fn test_manifest_log_number_progression() {
 		let log_num_after_flush = RecoveryTestHelper::get_manifest_log_number(&tree);
 		assert!(log_num_after_flush > log_num_initial, "Log number should advance after flush");
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Cycle 2: Reopen, write and flush
@@ -528,7 +528,7 @@ async fn test_manifest_log_number_progression() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("c2_key_{}", i).as_bytes(), b"cycle2").unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -536,7 +536,7 @@ async fn test_manifest_log_number_progression() {
 		let log_num_after = RecoveryTestHelper::get_manifest_log_number(&tree);
 		assert!(log_num_after > log_num_before, "Log number should advance again");
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Cycle 3: Reopen, write and flush again
@@ -548,7 +548,7 @@ async fn test_manifest_log_number_progression() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("c3_key_{}", i).as_bytes(), b"cycle3").unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -558,7 +558,7 @@ async fn test_manifest_log_number_progression() {
 		// Log number should advance with each flush
 		assert!(log_num_after > log_num_before, "Log number should advance with flush in cycle 3");
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Final reopen and verify all cycles
@@ -572,7 +572,7 @@ async fn test_manifest_log_number_progression() {
 			RecoveryTestHelper::verify_key(&tree, &format!("c3_key_{}", i), "cycle3").await;
 		}
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -590,11 +590,11 @@ async fn test_recovery_with_no_wal_files() {
 		for i in 0..20 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 
 		tree.flush().unwrap();
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Manually delete all WAL files (simulating cleanup)
@@ -622,12 +622,12 @@ async fn test_recovery_with_no_wal_files() {
 		// New WAL should be created for new writes
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"new_key", b"new_value").unwrap();
-		txn.commit().unwrap();
+		txn.commit().await.unwrap();
 
 		let wal_count_after_write = RecoveryTestHelper::count_wal_files(&wal_dir);
 		assert!(wal_count_after_write > 0, "New WAL should be created");
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }
 
@@ -645,7 +645,7 @@ async fn test_corrupted_wal_with_valid_sst() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("sst_key_{}", i).as_bytes(), b"safe_in_sst").unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 		tree.flush().unwrap();
 
@@ -653,10 +653,10 @@ async fn test_corrupted_wal_with_valid_sst() {
 		for i in 0..5 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("wal_key_{}", i).as_bytes(), b"in_wal").unwrap();
-			txn.commit().unwrap();
+			txn.commit().await.unwrap();
 		}
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 
 	// Corrupt the WAL file
@@ -684,6 +684,6 @@ async fn test_corrupted_wal_with_valid_sst() {
 		// WAL data may be partially recovered or repaired
 		// At minimum, SST data should be intact
 
-		tree.close().unwrap();
+		tree.close().await.unwrap();
 	}
 }

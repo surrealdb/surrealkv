@@ -729,7 +729,7 @@ impl Transaction {
 	}
 
 	/// Commits the transaction, by writing all pending entries to the store.
-	pub fn commit(&mut self) -> Result<()> {
+	pub async fn commit(&mut self) -> Result<()> {
 		// If the transaction is closed, return an error.
 		if self.closed {
 			return Err(Error::TransactionClosed);
@@ -781,7 +781,7 @@ impl Transaction {
 		// seq alloc + oracle.publish + WAL atomically under `write_mutex`,
 		// then runs memtable apply OUTSIDE the lock.
 		let should_sync = self.durability == Durability::Immediate;
-		self.core.commit(batch, should_sync, self.start_seq_num)?;
+		self.core.commit(batch, should_sync, self.start_seq_num).await?;
 
 		// Mark the transaction as closed and release the watermark slot.
 		self.closed = true;

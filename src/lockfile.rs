@@ -251,14 +251,14 @@ mod tests {
 		}
 
 		// After closing the first tree, we should be able to open again
-		tree1.close().unwrap();
+		tree1.close().await.unwrap();
 
 		let tree2 = TreeBuilder::new()
 			.with_path(temp_path)
 			.build()
 			.expect("After closing first tree, second should succeed");
 
-		tree2.close().unwrap();
+		tree2.close().await.unwrap();
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -302,7 +302,7 @@ mod tests {
 		// Close the successful instance
 		for (_, result) in results {
 			if let Ok(tree) = result {
-				tree.close().unwrap();
+				tree.close().await.unwrap();
 			}
 		}
 	}
@@ -354,7 +354,7 @@ mod tests {
 	// 	// Close the successful instance
 	// 	for (_, result) in results {
 	// 		if let Ok(tree) = result {
-	// 			tree.close().unwrap();
+	// 			tree.close().await.unwrap();
 	// 			break; // Only one should succeed, so we can break after closing it
 	// 		}
 	// 	}
