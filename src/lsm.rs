@@ -903,19 +903,21 @@ impl CommitEnv for LsmCommitEnv {
 		})
 	}
 
-	// Append a whole group of pre-encoded WAL records in ONE `wal.write()`
-	// acquisition, then flush once (and fsync once iff `sync`). Coalescing the
-	// flush is the eventual-durability win: one `write()` syscall per group
-	// instead of one per commit. Called by the group leader under `write_mutex`.
-	fn wal_append_group(&self, records: &[&[u8]], sync: bool) -> Result<()> {
+	// Stamp the allocated seq into the pre-encoded bytes (in place) and into the
+	// processed batch (consumed by `apply`), then append to the WAL. This is all
+	// that remains under write_mutex — no clone, no re-encode.
+	fn write_prepared(
+		&self,
+		prepared: &mut PreparedWrite,
+		seq_num: u64,
+		sync: bool,
+	) -> Result<()> {
+		Batch::patch_encoded_seq(&mut prepared.bytes, seq_num);
+		prepared.processed_batch.set_starting_seq_num(seq_num);
+
 		let mut wal_guard = self.core.wal.write();
-		for rec in records {
-			wal_guard.append_no_flush(rec)?;
-		}
-		// One flush to the OS page cache for the whole group.
-		wal_guard.flush()?;
+		wal_guard.append(&prepared.bytes)?;
 		if sync {
-			// One fsync for the whole group.
 			wal_guard.sync()?;
 		}
 		drop(wal_guard);

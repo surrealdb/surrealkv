@@ -53,11 +53,6 @@ pub struct WriteStallInfo {
 ///
 /// Owns its count provider and thresholds, providing a self-contained
 /// API for the commit path to check backpressure conditions.
-///
-/// `check()` is ASYNC and yields (rather than blocking the thread) when
-/// stalled — critical because the commit path runs on tokio workers and the
-/// flush/compaction that clears a stall is itself a tokio task: a stalled
-/// committer must release its worker so that work can run.
 pub struct WriteStallController {
 	/// Notification for when stall conditions clear
 	stall_cleared: Notify,

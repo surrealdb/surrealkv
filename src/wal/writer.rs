@@ -76,27 +76,6 @@ impl Writer {
 	/// - Ok(()) if successful.
 	/// - Err if an I/O error occurs.
 	pub fn add_record(&mut self, slice: &[u8]) -> Result<()> {
-		self.write_record(slice)?;
-
-		// Flush if not in manual mode
-		if !self.manual_flush {
-			self.write_buffer()?;
-		}
-
-		Ok(())
-	}
-
-	/// Adds a record WITHOUT flushing the buffer, regardless of `manual_flush`.
-	///
-	/// Used by group commit: the leader appends every group member with this and
-	/// then calls `write_buffer()` (and optionally `sync()`) ONCE for the whole
-	/// group, coalescing the `write()` syscall. The caller MUST flush afterward.
-	pub fn add_record_no_flush(&mut self, slice: &[u8]) -> Result<()> {
-		self.write_record(slice)
-	}
-
-	/// Fragments `slice` into physical records and emits them. Does NOT flush.
-	fn write_record(&mut self, slice: &[u8]) -> Result<()> {
 		// Compress data if compression is enabled
 		let compressed;
 		let data_to_write = if self.compression_type == CompressionType::Lz4 {
@@ -137,6 +116,11 @@ impl Writer {
 			// Advance pointer
 			ptr = &ptr[fragment_length..];
 			begin = false;
+		}
+
+		// Flush if not in manual mode
+		if !self.manual_flush {
+			self.write_buffer()?;
 		}
 
 		Ok(())
