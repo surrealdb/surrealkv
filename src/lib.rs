@@ -43,6 +43,8 @@ pub use crate::oracle::CommitOracle;
 pub use crate::wal::writer::Writer as WalWriter;
 #[doc(hidden)]
 pub use crate::wal::{BufferedFileWriter, CompressionType as WalCompressionType, BLOCK_SIZE};
+#[doc(hidden)] // Exposed for `benches/memtable_bench.rs`; not a supported public API.
+pub use crate::memtable::MemTable;
 pub use crate::transaction::{
 	Durability,
 	HistoryOptions,

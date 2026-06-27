@@ -192,3 +192,7 @@ harness = false
 [[bench]]
 name = "wal_bench"
 harness = false
+
+[[bench]]
+name = "memtable_bench"
+harness = false

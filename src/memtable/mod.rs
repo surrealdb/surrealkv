@@ -65,7 +65,8 @@ impl ImmutableMemtables {
 	}
 }
 
-pub(crate) struct MemTable {
+#[doc(hidden)] // Exposed for `benches/memtable_bench.rs`; not a supported public API.
+pub struct MemTable {
 	skiplist: Skiplist,
 	latest_seq_num: AtomicU64,
 	/// WAL number that was current when this memtable started receiving writes.
@@ -100,7 +101,7 @@ impl Drop for ReservationGuard<'_> {
 }
 
 impl MemTable {
-	pub(crate) fn new(arena_capacity: usize) -> Self {
+	pub fn new(arena_capacity: usize) -> Self {
 		let arena = Arc::new(Arena::new(arena_capacity));
 		let cmp: Compare = |a, b| a.cmp(b);
 		let skiplist = Skiplist::new(arena, cmp);
@@ -221,6 +222,19 @@ impl MemTable {
 	///
 	/// # Arguments
 	/// * `batch` - The batch of operations to apply
+	/// Benchmark-only: exercises the exact production `apply()` hot path
+	/// (build 1-entry batch → `memtable_size_estimate` → `try_reserve` CAS →
+	/// concurrent skiplist insert) for one key/value. Used by
+	/// `benches/memtable_bench.rs` to measure apply throughput under N-thread
+	/// contention. NOT a supported public API.
+	#[doc(hidden)]
+	pub fn bench_insert(&self, key: &[u8], value: &[u8], seq: u64) -> Result<()> {
+		let mut batch = crate::batch::Batch::new(0);
+		batch.add_record(crate::InternalKeyKind::Set, key.to_vec(), Some(value.to_vec()), 0)?;
+		batch.set_starting_seq_num(seq);
+		self.add(&batch)
+	}
+
 	pub(crate) fn add(&self, batch: &Batch) -> Result<()> {
 		let needed = batch.memtable_size_estimate();
 		self.try_reserve(needed)?;
