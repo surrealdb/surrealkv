@@ -34,7 +34,60 @@ fn fp(key: &[u8]) -> u64 {
 	xxh3_64(key)
 }
 
-pub(crate) struct CommitOracle {
+/// Conflict-check body, run with `inner` already locked. Returns the same
+/// errors as [`CommitOracle::check`]. Shared by `check` and `check_and_publish`
+/// so the two paths can never drift.
+#[inline]
+fn check_locked<'a, I>(g: &OracleInner, keys: I, start_seq: u64) -> Result<()>
+where
+	I: IntoIterator<Item = &'a [u8]>,
+{
+	if start_seq < g.kept_since {
+		return Err(Error::TransactionRetry);
+	}
+	for k in keys {
+		if let Some(&committed) = g.recent_writes.get(&fp(k)) {
+			if committed > start_seq {
+				return Err(Error::TransactionWriteConflict);
+			}
+		}
+	}
+	Ok(())
+}
+
+/// Publish body (stamp keys + opportunistic GC), run with `inner` already
+/// locked. Shared by `publish` and `check_and_publish`.
+#[inline]
+fn publish_locked<'a, I>(g: &mut OracleInner, keys: I, seq_num: u64, count: u64, oldest_active: u64)
+where
+	I: IntoIterator<Item = &'a [u8]>,
+{
+	let stamp = seq_num + count - 1;
+	for k in keys {
+		g.recent_writes.insert(fp(k), stamp);
+	}
+
+	g.commits_since_gc = g.commits_since_gc.saturating_add(1);
+
+	if g.commits_since_gc >= GC_INTERVAL && oldest_active > g.kept_since {
+		#[cfg(debug_assertions)]
+		{
+			debug_assert!(
+				oldest_active >= g.last_gc_oldest_active,
+				"oldest_active regressed across GC bodies: prev={} new={}",
+				g.last_gc_oldest_active,
+				oldest_active,
+			);
+			g.last_gc_oldest_active = oldest_active;
+		}
+		g.commits_since_gc = 0;
+		g.kept_since = oldest_active;
+		g.recent_writes.retain(|_, v| *v >= oldest_active);
+	}
+}
+
+#[doc(hidden)] // Exposed for `benches/oracle_bench.rs`; not a supported public API.
+pub struct CommitOracle {
 	inner: Mutex<OracleInner>,
 }
 
@@ -74,7 +127,7 @@ impl Default for CommitOracle {
 }
 
 impl CommitOracle {
-	pub(crate) fn new() -> Self {
+	pub fn new() -> Self {
 		Self {
 			inner: Mutex::new(OracleInner {
 				recent_writes: HashMap::new(),
@@ -91,21 +144,39 @@ impl CommitOracle {
 	/// Called under `write_mutex` BEFORE seq allocation. Returns:
 	/// - `TransactionRetry` if `start_seq < kept_since` (window GC'd).
 	/// - `TransactionWriteConflict` if any key was committed at seq > start_seq.
-	pub(crate) fn check<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
+	pub fn check<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
 	where
 		I: IntoIterator<Item = &'a [u8]>,
 	{
 		let g = self.inner.lock();
-		if start_seq < g.kept_since {
-			return Err(Error::TransactionRetry);
-		}
-		for k in keys {
-			if let Some(&committed) = g.recent_writes.get(&fp(k)) {
-				if committed > start_seq {
-					return Err(Error::TransactionWriteConflict);
-				}
-			}
-		}
+		check_locked(&g, keys, start_seq)
+	}
+
+	/// Validate AND publish under a SINGLE `inner` lock acquisition.
+	///
+	/// Semantically identical to `check(keys, start_seq)?` immediately followed
+	/// by `publish(keys, seq_num, count, oldest_active)`, but takes the internal
+	/// lock once instead of twice. `keys` is iterated twice (check then publish)
+	/// so the iterator must be `Clone` (slice-backed iterators are). On a
+	/// conflict/retry error nothing is published — identical to the two-call form
+	/// where `check`'s `?` short-circuits before `publish`.
+	///
+	/// Called under `write_mutex` (like `check`/`publish`).
+	pub fn check_and_publish<'a, I>(
+		&self,
+		keys: I,
+		start_seq: u64,
+		seq_num: u64,
+		count: u64,
+		oldest_active: u64,
+	) -> Result<()>
+	where
+		I: IntoIterator<Item = &'a [u8]> + Clone,
+	{
+		debug_assert!(count >= 1, "check_and_publish called with count=0");
+		let mut g = self.inner.lock();
+		check_locked(&g, keys.clone(), start_seq)?;
+		publish_locked(&mut g, keys, seq_num, count, oldest_active);
 		Ok(())
 	}
 
@@ -123,47 +194,13 @@ impl CommitOracle {
 	/// advanced past what we last pruned to).
 	///
 	/// Called under `write_mutex` AFTER seq allocation, BEFORE WAL.
-	pub(crate) fn publish<'a, I>(&self, keys: I, seq_num: u64, count: u64, oldest_active: u64)
+	pub fn publish<'a, I>(&self, keys: I, seq_num: u64, count: u64, oldest_active: u64)
 	where
 		I: IntoIterator<Item = &'a [u8]>,
 	{
 		debug_assert!(count >= 1, "publish called with count=0");
 		let mut g = self.inner.lock();
-		let stamp = seq_num + count - 1;
-		for k in keys {
-			g.recent_writes.insert(fp(k), stamp);
-		}
-
-		// `saturating_add` so the counter doesn't overflow if the watermark
-		// stays pinned across billions of commits (theoretical edge case under
-		// a stuck long-running reader). Once the watermark moves, the GC body
-		// runs and resets the counter to 0.
-		g.commits_since_gc = g.commits_since_gc.saturating_add(1);
-
-		// Two gates, both required:
-		//   (a) Enough commits since the last sweep — perf throttle.
-		//   (b) Watermark has advanced past what we already pruned to —
-		//       skip fruitless walks.
-		// `oldest_active` is expected to be non-decreasing across firings:
-		// it's clamped at the call site by the committing txn's `start_seq`
-		// (see `CommitPipeline::commit`), and both `active_txn_tracker.oldest`
-		// and `visible_seq_num` are monotonic. The debug-only assert below
-		// catches caller-side regressions.
-		if g.commits_since_gc >= GC_INTERVAL && oldest_active > g.kept_since {
-			#[cfg(debug_assertions)]
-			{
-				debug_assert!(
-					oldest_active >= g.last_gc_oldest_active,
-					"oldest_active regressed across GC bodies: prev={} new={}",
-					g.last_gc_oldest_active,
-					oldest_active,
-				);
-				g.last_gc_oldest_active = oldest_active;
-			}
-			g.commits_since_gc = 0;
-			g.kept_since = oldest_active;
-			g.recent_writes.retain(|_, v| *v >= oldest_active);
-		}
+		publish_locked(&mut g, keys, seq_num, count, oldest_active);
 	}
 
 	/// Roll back oracle entries reserved by a transaction whose commit
@@ -188,7 +225,7 @@ impl CommitOracle {
 	/// pre-existing apply-failure / seq-gap issue documented at
 	/// `src/commit.rs` (around the "Sequence number gaps" comment block)
 	/// and is orthogonal to this rollback's live-process soundness.
-	pub(crate) fn rollback<'a, I>(&self, keys: I, my_seq: u64)
+	pub fn rollback<'a, I>(&self, keys: I, my_seq: u64)
 	where
 		I: IntoIterator<Item = &'a [u8]>,
 	{
@@ -215,7 +252,7 @@ impl CommitOracle {
 	/// empty map and `kept_since = 0`, and the first post-startup txn has
 	/// `start_seq = max_recovered_seq` which trivially passes the
 	/// `start_seq < kept_since` check.
-	pub(crate) fn reset_for_restore(&self, max_seq: u64) {
+	pub fn reset_for_restore(&self, max_seq: u64) {
 		let mut g = self.inner.lock();
 		g.kept_since = max_seq;
 		g.commits_since_gc = 0;

@@ -44,6 +44,7 @@ getrandom = { version = "0.3.3", features = ["wasm_js"] }
 
 [dev-dependencies]
 tempdir = "0.3"
+crc32fast = "1.2.1"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 tokio = { version = "1.39.2", features = ["full"] }
 tempfile = "3.10.1"
@@ -182,4 +183,12 @@ unwrap_used = "allow"
 
 [[bench]]
 name = "alloc_bench"
+harness = false
+
+[[bench]]
+name = "oracle_bench"
+harness = false
+
+[[bench]]
+name = "wal_bench"
 harness = false

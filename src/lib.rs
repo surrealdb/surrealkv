@@ -37,6 +37,12 @@ use sstable::bloom::LevelDBBloomFilter;
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
+#[doc(hidden)] // Exposed for `benches/oracle_bench.rs`; not a supported public API.
+pub use crate::oracle::CommitOracle;
+#[doc(hidden)] // Exposed for `benches/wal_bench.rs`; not a supported public API.
+pub use crate::wal::writer::Writer as WalWriter;
+#[doc(hidden)]
+pub use crate::wal::{BufferedFileWriter, CompressionType as WalCompressionType, BLOCK_SIZE};
 pub use crate::transaction::{
 	Durability,
 	HistoryOptions,
