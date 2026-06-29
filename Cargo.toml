@@ -200,3 +200,7 @@ harness = false
 [[bench]]
 name = "tracker_bench"
 harness = false
+
+[[bench]]
+name = "convoy_bench"
+harness = false
