@@ -83,7 +83,7 @@ async fn test_basic_snapshot_visibility() {
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Start a read transaction (captures snapshot)
@@ -94,7 +94,7 @@ async fn test_basic_snapshot_visibility() {
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// The read transaction should only see the initial data
@@ -114,7 +114,7 @@ async fn test_snapshot_isolation_with_updates() {
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value1_v1").unwrap();
 		tx.set(b"key2", b"value2_v1").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Start a read transaction
@@ -125,7 +125,7 @@ async fn test_snapshot_isolation_with_updates() {
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value1_v2").unwrap();
 		tx.set(b"key2", b"value2_v2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// The read transaction should see the old values
@@ -154,7 +154,7 @@ async fn test_tombstone_handling() {
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Start a read transaction
@@ -164,7 +164,7 @@ async fn test_tombstone_handling() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.delete(b"key2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// The first read transaction should still see all three keys
@@ -192,7 +192,7 @@ async fn test_version_resolution() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"version1").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx1 = store.begin().unwrap();
@@ -200,7 +200,7 @@ async fn test_version_resolution() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"version2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx2 = store.begin().unwrap();
@@ -208,7 +208,7 @@ async fn test_version_resolution() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"version3").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx3 = store.begin().unwrap();
@@ -236,7 +236,7 @@ async fn test_range_with_random_operations() {
 			let value = format!("value{i}");
 			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx1 = store.begin().unwrap();
@@ -254,7 +254,7 @@ async fn test_range_with_random_operations() {
 		tx.delete(b"key03").unwrap();
 		tx.delete(b"key06").unwrap();
 		tx.delete(b"key09").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx2 = store.begin().unwrap();
@@ -302,7 +302,7 @@ async fn test_concurrent_snapshots() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"counter", b"0").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Create multiple snapshots at different points
@@ -316,7 +316,7 @@ async fn test_concurrent_snapshots() {
 		{
 			let mut tx = store.begin().unwrap();
 			tx.set(b"counter", i.to_string().as_bytes()).unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 	}
 
@@ -349,7 +349,7 @@ async fn test_snapshot_with_complex_key_patterns() {
 			let key = format!("mix{i}key");
 			tx.set(key.as_bytes(), b"mixed").unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();
@@ -377,7 +377,7 @@ async fn test_snapshot_ordering_invariants() {
 		for key in keys {
 			tx.set(key.as_bytes(), key.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();
@@ -409,7 +409,7 @@ async fn test_snapshot_keys_only() {
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
 		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Create snapshot via transaction
@@ -518,7 +518,7 @@ async fn test_double_ended_iteration() {
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
 		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Create snapshot via transaction
@@ -557,7 +557,7 @@ async fn test_double_ended_iteration_with_tombstones() {
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Take a snapshot before deletion
@@ -567,7 +567,7 @@ async fn test_double_ended_iteration_with_tombstones() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.delete(b"key2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Take another snapshot after deletion
@@ -619,7 +619,7 @@ async fn test_snapshot_iterator_direction_switch_forward_to_backward() {
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
 		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();
@@ -665,7 +665,7 @@ async fn test_snapshot_iterator_direction_switch_backward_to_forward() {
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
 		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();
@@ -706,7 +706,7 @@ async fn test_soft_delete_snapshot_individual_get() {
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Take a snapshot before soft delete
@@ -716,7 +716,7 @@ async fn test_soft_delete_snapshot_individual_get() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.soft_delete(b"key2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Take another snapshot after soft delete
@@ -747,7 +747,7 @@ async fn test_soft_delete_snapshot_double_ended_iteration() {
 			let value = format!("value{i}");
 			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Soft delete key2 and key4
@@ -755,7 +755,7 @@ async fn test_soft_delete_snapshot_double_ended_iteration() {
 		let mut tx = store.begin().unwrap();
 		tx.soft_delete(b"key2").unwrap();
 		tx.soft_delete(b"key4").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Take snapshot after soft delete
@@ -799,7 +799,7 @@ async fn test_soft_delete_snapshot_mixed_with_hard_delete() {
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Take snapshot before any deletes
@@ -810,7 +810,7 @@ async fn test_soft_delete_snapshot_mixed_with_hard_delete() {
 		let mut tx = store.begin().unwrap();
 		tx.soft_delete(b"key1").unwrap(); // Soft delete
 		tx.delete(b"key2").unwrap(); // Hard delete
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Take snapshot after deletes
@@ -849,7 +849,7 @@ async fn test_double_ended_iteration_mixed_operations() {
 			let value = format!("value{i}");
 			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Take a snapshot
@@ -1466,7 +1466,7 @@ async fn test_cache_effectiveness_with_range_query() {
 
 		let mut tx = tree.begin().unwrap();
 		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 
 		// Flush every 1,000 keys to create multiple SSTables
 		if (i + 1) % 1_000 == 0 {
@@ -1554,7 +1554,7 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value1_v1").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Capture snapshot after key1 insert (should see only key1)
@@ -1564,7 +1564,7 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key2", b"value2_v1").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Capture snapshot after key2 insert (should see key1 and key2)
@@ -1574,7 +1574,7 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key3", b"value3_v1").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Capture snapshot after key3 insert (should see key1, key2, and key3)
@@ -1584,7 +1584,7 @@ async fn test_snapshot_iterator_seq_num_filtering_via_transactions() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key4", b"value4_v1").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Capture snapshot after key4 insert (should see all keys)
@@ -1662,7 +1662,7 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value_v1").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Snapshot after v1
@@ -1672,7 +1672,7 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value_v2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Snapshot after v2
@@ -1682,7 +1682,7 @@ async fn test_snapshot_iterator_seq_num_filtering_with_updates() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value_v3").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Snapshot after v3
@@ -1730,7 +1730,7 @@ async fn test_snapshot_iterator_seq_num_with_deletions() {
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Snapshot before deletion
@@ -1740,7 +1740,7 @@ async fn test_snapshot_iterator_seq_num_with_deletions() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.delete(b"key2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Snapshot after deletion
@@ -1795,7 +1795,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 	tx.set(b"key1", b"v1").unwrap();
 	tx.set(b"key2", b"v2").unwrap();
 	tx.set(b"key3", b"v3").unwrap();
-	tx.commit().await.unwrap();
+	tx.commit().unwrap();
 
 	let snap1 = store.begin().unwrap();
 
@@ -1803,7 +1803,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 	let mut tx = store.begin().unwrap();
 	tx.set(b"key2", b"v2_updated").unwrap();
 	tx.set(b"key4", b"v4").unwrap();
-	tx.commit().await.unwrap();
+	tx.commit().unwrap();
 
 	let snap2 = store.begin().unwrap();
 
@@ -1811,7 +1811,7 @@ async fn test_snapshot_iterator_seq_num_complex_scenario() {
 	let mut tx = store.begin().unwrap();
 	tx.delete(b"key1").unwrap();
 	tx.set(b"key5", b"v5").unwrap();
-	tx.commit().await.unwrap();
+	tx.commit().unwrap();
 
 	let snap3 = store.begin().unwrap();
 
@@ -1890,7 +1890,7 @@ async fn test_snapshot_iterator_multiple_direction_switches() {
 		for i in 1..=7 {
 			tx.set(format!("key{}", i).as_bytes(), format!("value{}", i).as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();
@@ -1958,7 +1958,7 @@ async fn test_snapshot_iterator_direction_switch_at_bounds() {
 		tx.set(b"bbb", b"v2").unwrap();
 		tx.set(b"ccc", b"v3").unwrap();
 		tx.set(b"ddd", b"v4").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();
@@ -2007,7 +2007,7 @@ async fn test_snapshot_iterator_direction_switch_mid_range() {
 			let val = format!("v{:02}", i);
 			tx.set(key.as_bytes(), val.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();
@@ -2070,7 +2070,7 @@ async fn test_backward_iter_does_not_stack_overflow_on_tombstones() {
 			let key = format!("k{:08}", i);
 			tx.set(key.as_bytes(), b"v").unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// 2. Delete them all -> latest visible version of each is a tombstone.
@@ -2080,7 +2080,7 @@ async fn test_backward_iter_does_not_stack_overflow_on_tombstones() {
 			let key = format!("k{:08}", i);
 			tx.delete(key.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// 3. Backward range scan over the whole tombstoned span. Pre-fix this

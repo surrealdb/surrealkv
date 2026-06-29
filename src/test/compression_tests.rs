@@ -504,7 +504,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 		let value = generate_compressible_value(200, (idx % 256) as u8);
 		let mut txn = tree.begin().unwrap();
 		txn.set(key, &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -598,7 +598,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 			let value = generate_compressible_value(250, (idx % 256) as u8);
 			let mut txn = tree.begin().unwrap();
 			txn.set(key, &value).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			if idx % 2000 == 0 && idx > 0 {
 				println!("  Inserted {} keys", idx);
@@ -744,7 +744,7 @@ async fn test_lsm_compression_disk_size_comparison() {
 		let value = generate_compressible_value(500, b'A');
 		let mut txn = tree_compressed.begin().unwrap();
 		txn.set(key, &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		if idx % 1000 == 0 && idx > 0 {
 			println!("  Inserted {} keys", idx);
@@ -756,7 +756,7 @@ async fn test_lsm_compression_disk_size_comparison() {
 		let value = generate_compressible_value(500, b'A');
 		let mut txn = tree_uncompressed.begin().unwrap();
 		txn.set(key, &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		if idx % 1000 == 0 && idx > 0 {
 			println!("  Inserted {} keys", idx);
@@ -937,7 +937,7 @@ async fn test_compression_per_level_sstable_creation() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(&key, &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush to create L0 SSTable
@@ -995,7 +995,7 @@ async fn test_compression_per_level_with_different_levels() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(&key, &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush and compaction

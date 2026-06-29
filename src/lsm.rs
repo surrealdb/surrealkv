@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::Batch;
 use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
-use crate::commit::{CommitEnv, CommitPipeline, PreparedWrite};
+use crate::committer::{CommitEnv, Committer, PreparedWrite};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
@@ -903,20 +903,16 @@ impl CommitEnv for LsmCommitEnv {
 		})
 	}
 
-	// Stamp the allocated seq into the pre-encoded bytes (in place) and into the
-	// processed batch (consumed by `apply`), then append to the WAL. This is all
-	// that remains under write_mutex — no clone, no re-encode.
-	fn write_prepared(
-		&self,
-		prepared: &mut PreparedWrite,
-		seq_num: u64,
-		sync: bool,
-	) -> Result<()> {
-		Batch::patch_encoded_seq(&mut prepared.bytes, seq_num);
-		prepared.processed_batch.set_starting_seq_num(seq_num);
-
+	// Append a whole group of pre-encoded WAL records (seqs already patched by
+	// the commit thread) in ONE `wal.write()` acquisition, then flush ONCE
+	// (fsync iff `sync`). Coalescing the flush is the group-commit win — one
+	// `write()` syscall per group instead of one per commit.
+	fn wal_append_group(&self, records: &[&[u8]], sync: bool) -> Result<()> {
 		let mut wal_guard = self.core.wal.write();
-		wal_guard.append(&prepared.bytes)?;
+		for rec in records {
+			wal_guard.append_no_flush(rec)?;
+		}
+		wal_guard.flush()?;
 		if sync {
 			wal_guard.sync()?;
 		}
@@ -986,7 +982,7 @@ pub(crate) struct Core {
 	pub(crate) inner: Arc<CoreInner>,
 
 	/// The commit pipeline that handles write batches
-	pub(crate) commit_pipeline: Arc<CommitPipeline>,
+	pub(crate) commit_pipeline: Arc<Committer>,
 
 	/// Task manager for background operations (stored in Option so we can take
 	/// it for shutdown)
@@ -1163,7 +1159,7 @@ impl Core {
 
 		// Pass the shared visible_seq_num from CoreInner to CommitPipeline
 		// Both will use the same atomic for coordinated updates
-		let commit_pipeline = CommitPipeline::new(
+		let commit_pipeline = Committer::new(
 			commit_env,
 			Arc::clone(&inner.visible_seq_num),
 			Arc::clone(&write_stall),
@@ -1265,12 +1261,13 @@ impl Core {
 		Ok(core)
 	}
 
-	pub(crate) async fn commit(&self, batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
+	pub(crate) fn commit(&self, batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
 		// Commit the batch using the commit pipeline. `start_seq` is the
 		// transaction's snapshot seq (used by the oracle's write-write
 		// conflict check). The write keys are derived from `batch.entries`
-		// inside the pipeline — no duplicated parallel array.
-		self.commit_pipeline.commit(batch, sync, start_seq).await
+		// inside the pipeline — no duplicated parallel array. Synchronous: the
+		// caller's thread parks until the commit thread makes it durable+visible.
+		self.commit_pipeline.commit(batch, sync, start_seq)
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {

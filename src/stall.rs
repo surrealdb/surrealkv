@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::Notify;
+use parking_lot::{Condvar, Mutex};
 
 use crate::error::{Error, Result, WriteStallReason};
 
@@ -54,8 +54,10 @@ pub struct WriteStallInfo {
 /// Owns its count provider and thresholds, providing a self-contained
 /// API for the commit path to check backpressure conditions.
 pub struct WriteStallController {
-	/// Notification for when stall conditions clear
-	stall_cleared: Notify,
+	/// Condvar signalled when stall conditions may have cleared, paired with
+	/// `stall_mutex` (held briefly by both waiter and signaller — lost-wakeup-safe).
+	stall_cleared: Condvar,
+	stall_mutex: Mutex<()>,
 
 	/// Current stall state (for fast-path check)
 	is_stalled: AtomicBool,
@@ -73,7 +75,8 @@ pub struct WriteStallController {
 impl WriteStallController {
 	pub fn new(provider: Arc<dyn WriteStallCountProvider>, thresholds: StallThresholds) -> Self {
 		Self {
-			stall_cleared: Notify::new(),
+			stall_cleared: Condvar::new(),
+			stall_mutex: Mutex::new(()),
 			is_stalled: AtomicBool::new(false),
 			shutdown: AtomicBool::new(false),
 			provider,
@@ -94,18 +97,23 @@ impl WriteStallController {
 	/// `notify_waiters()` calls that happen after we register but before we
 	/// check. Per tokio docs: "The Notified future is guaranteed to receive
 	/// wakeups from notify_waiters() as soon as it has been created."
-	pub async fn check(&self) -> Result<Option<WriteStallInfo>> {
+	pub fn check(&self) -> Result<Option<WriteStallInfo>> {
+		// Fast path: not stalled — return without taking the lock (the common case).
+		let counts = self.provider.get_stall_counts();
+		if counts.immutable_memtables < self.thresholds.memtable_limit
+			&& counts.l0_files < self.thresholds.l0_file_limit
+		{
+			return Ok(None);
+		}
+
+		// Slow path: stalled — wait on the condvar, re-checking each wakeup.
 		let mut stall_start: Option<Instant> = None;
 		let mut stall_reason: Option<WriteStallReason> = None;
 		let mut stall_value: usize = 0;
 		let mut stall_threshold: usize = 0;
 
+		let mut guard = self.stall_mutex.lock();
 		loop {
-			// Create Notified FIRST to register for wakeups.
-			// Any notify_waiters() call after this point will wake us.
-			let notified = self.stall_cleared.notified();
-
-			// Check shutdown
 			if self.shutdown.load(Ordering::Acquire) {
 				if stall_reason.is_some() {
 					self.is_stalled.store(false, Ordering::Release);
@@ -113,14 +121,10 @@ impl WriteStallController {
 				return Err(Error::PipelineStall);
 			}
 
-			// Re-read counts (now any notify_waiters() after notified creation will wake us)
 			let counts = self.provider.get_stall_counts();
-
-			// Check if NOT stalled - return without awaiting
 			if counts.immutable_memtables < self.thresholds.memtable_limit
 				&& counts.l0_files < self.thresholds.l0_file_limit
 			{
-				// Not stalled - return result
 				if let Some(reason) = stall_reason {
 					self.is_stalled.store(false, Ordering::Release);
 					let duration = stall_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
@@ -135,7 +139,6 @@ impl WriteStallController {
 				return Ok(None);
 			}
 
-			// Stalled - determine which condition triggered it
 			let (reason, value, threshold) =
 				if counts.immutable_memtables >= self.thresholds.memtable_limit {
 					(
@@ -147,7 +150,6 @@ impl WriteStallController {
 					(WriteStallReason::L0FileLimit, counts.l0_files, self.thresholds.l0_file_limit)
 				};
 
-			// Record stall reason if first time
 			if stall_reason.is_none() {
 				stall_reason = Some(reason);
 				stall_value = value;
@@ -157,8 +159,9 @@ impl WriteStallController {
 				log::warn!("Write stall: {:?} ({} >= {})", reason, value, threshold);
 			}
 
-			// Wait
-			notified.await;
+			// Release the lock and wait for a signal (signallers hold the same
+			// mutex around notify_all, so no wakeup is lost).
+			self.stall_cleared.wait(&mut guard);
 		}
 	}
 
@@ -185,13 +188,15 @@ impl WriteStallController {
 	/// Signal that stall conditions may have changed.
 	/// Called after flush or compaction completes.
 	pub fn signal_work_done(&self) {
-		self.stall_cleared.notify_waiters();
+		let _g = self.stall_mutex.lock();
+		self.stall_cleared.notify_all();
 	}
 
 	/// Signal shutdown - wakes all stalled writers to exit.
 	pub fn signal_shutdown(&self) {
 		self.shutdown.store(true, Ordering::Release);
-		self.stall_cleared.notify_waiters();
+		let _g = self.stall_mutex.lock();
+		self.stall_cleared.notify_all();
 	}
 
 	/// Fast check if currently stalled (for metrics).

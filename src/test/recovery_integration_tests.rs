@@ -35,11 +35,11 @@ async fn test_basic_recovery() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v1").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"baz", b"v5").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -54,11 +54,11 @@ async fn test_basic_recovery() {
 		// Write more data
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"bar", b"v2").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v3").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -90,11 +90,11 @@ async fn test_recover_with_existing_ssts() {
 		// First batch - will be flushed
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v1").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"bar", b"v2").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.flush().unwrap();
 		let sst_count_1 = RecoveryTestHelper::count_sst_files(&sst_dir);
@@ -103,11 +103,11 @@ async fn test_recover_with_existing_ssts() {
 		// Second batch - will be flushed
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v3").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"bar", b"v4").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.flush().unwrap();
 		let sst_count_2 = RecoveryTestHelper::count_sst_files(&sst_dir);
@@ -116,7 +116,7 @@ async fn test_recover_with_existing_ssts() {
 		// Third write - stays in WAL only
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"big", b"large_value_not_flushed").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Close without flushing the last write
 		tree.close().await.unwrap();
@@ -154,7 +154,7 @@ async fn test_recover_multiple_wals_without_flush() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Note: Close will auto-flush in surrealkv
@@ -175,7 +175,7 @@ async fn test_recover_multiple_wals_without_flush() {
 		// Write more data (new WAL)
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"new_key", b"new_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -235,7 +235,7 @@ async fn test_recover_with_large_wal() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.close().await.unwrap();
@@ -268,7 +268,7 @@ async fn test_recovery_with_empty_wal() {
 		// Write and flush
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v1").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.flush().unwrap();
 
@@ -307,7 +307,7 @@ async fn test_file_count_after_recovery() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let sst_count = RecoveryTestHelper::count_sst_files(&sst_dir);
@@ -353,7 +353,7 @@ async fn test_wal_cleanup_after_recovery_without_flush() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"foo", b"v1").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -403,7 +403,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch_a_{}", i).as_bytes(), b"value_a").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 		tree.flush().unwrap();
 
@@ -413,7 +413,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch_b_{}", i).as_bytes(), b"value_b").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Trigger rotation (creating new WAL segment)
@@ -423,7 +423,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch_c_{}", i).as_bytes(), b"value_c").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Close without flushing B and C
@@ -471,7 +471,7 @@ async fn test_orphaned_sst_doesnt_break_recovery() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"real_key", b"real_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.flush().unwrap();
 		tree.close().await.unwrap();
@@ -508,7 +508,7 @@ async fn test_manifest_log_number_progression() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("c1_key_{}", i).as_bytes(), b"cycle1").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -528,7 +528,7 @@ async fn test_manifest_log_number_progression() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("c2_key_{}", i).as_bytes(), b"cycle2").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -548,7 +548,7 @@ async fn test_manifest_log_number_progression() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("c3_key_{}", i).as_bytes(), b"cycle3").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -590,7 +590,7 @@ async fn test_recovery_with_no_wal_files() {
 		for i in 0..20 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -622,7 +622,7 @@ async fn test_recovery_with_no_wal_files() {
 		// New WAL should be created for new writes
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"new_key", b"new_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let wal_count_after_write = RecoveryTestHelper::count_wal_files(&wal_dir);
 		assert!(wal_count_after_write > 0, "New WAL should be created");
@@ -645,7 +645,7 @@ async fn test_corrupted_wal_with_valid_sst() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("sst_key_{}", i).as_bytes(), b"safe_in_sst").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 		tree.flush().unwrap();
 
@@ -653,7 +653,7 @@ async fn test_corrupted_wal_with_valid_sst() {
 		for i in 0..5 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("wal_key_{}", i).as_bytes(), b"in_wal").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.close().await.unwrap();

@@ -44,7 +44,7 @@ async fn basic_transaction() {
 		let mut txn1 = store.begin().unwrap();
 		txn1.set(&key1, &value1).unwrap();
 		txn1.set(&key2, &value1).unwrap();
-		txn1.commit().await.unwrap();
+		txn1.commit().unwrap();
 	}
 
 	{
@@ -59,7 +59,7 @@ async fn basic_transaction() {
 		let mut txn2 = store.begin().unwrap();
 		txn2.set(&key1, &value2).unwrap();
 		txn2.set(&key2, &value2).unwrap();
-		txn2.commit().await.unwrap();
+		txn2.commit().unwrap();
 	}
 
 	// Start a read-only transaction (txn4)
@@ -85,11 +85,11 @@ async fn mvcc_snapshot_isolation() {
 		let mut txn2 = store.begin().unwrap();
 
 		txn1.set(&key1, &value1).unwrap();
-		txn1.commit().await.unwrap();
+		txn1.commit().unwrap();
 
 		assert!(txn2.get(&key2).unwrap().is_none());
 		txn2.set(&key2, &value2).unwrap();
-		txn2.commit().await.unwrap();
+		txn2.commit().unwrap();
 	}
 
 	// blind writes should succeed if key wasn't read first
@@ -100,8 +100,8 @@ async fn mvcc_snapshot_isolation() {
 		txn1.set(&key1, &value1).unwrap();
 		txn2.set(&key1, &value2).unwrap();
 
-		txn1.commit().await.unwrap();
-		assert!(match txn2.commit().await {
+		txn1.commit().unwrap();
+		assert!(match txn2.commit() {
 			Err(err) => {
 				matches!(err, Error::TransactionWriteConflict)
 			}
@@ -119,11 +119,11 @@ async fn mvcc_snapshot_isolation() {
 		let mut txn2 = store.begin().unwrap();
 
 		txn1.set(&key, &value1).unwrap();
-		txn1.commit().await.unwrap();
+		txn1.commit().unwrap();
 
 		assert!(txn2.get(&key).unwrap().is_none());
 		txn2.set(&key, &value1).unwrap();
-		assert!(match txn2.commit().await {
+		assert!(match txn2.commit() {
 			Err(err) => {
 				matches!(err, Error::TransactionWriteConflict)
 			}
@@ -150,13 +150,13 @@ async fn ryow() {
 		txn1.delete(&key1).unwrap();
 		let res = txn1.get(&key1).unwrap();
 		assert!(res.is_none());
-		txn1.commit().await.unwrap();
+		txn1.commit().unwrap();
 	}
 
 	{
 		let mut txn = store.begin().unwrap();
 		txn.set(&key1, &value1).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	{
@@ -167,7 +167,7 @@ async fn ryow() {
 		assert!(txn.get(&key3).unwrap().is_none());
 		txn.set(&key2, &value1).unwrap();
 		assert_eq!(&txn.get(&key2).unwrap().unwrap(), &value1);
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 }
 
@@ -183,7 +183,7 @@ async fn create_hermitage_store() -> Tree {
 	let mut txn = store.begin().unwrap();
 	txn.set(&key1, &value1).unwrap();
 	txn.set(&key2, &value2).unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	store
 }
@@ -216,10 +216,10 @@ async fn g0_tests() {
 
 		txn1.set(&key2, &value5).unwrap();
 
-		txn1.commit().await.unwrap();
+		txn1.commit().unwrap();
 
 		txn2.set(&key2, &value6).unwrap();
-		assert!(match txn2.commit().await {
+		assert!(match txn2.commit() {
 			Err(err) => {
 				matches!(err, Error::TransactionWriteConflict)
 			}
@@ -254,9 +254,9 @@ async fn p4() {
 		txn1.set(&key1, &value3).unwrap();
 		txn2.set(&key1, &value3).unwrap();
 
-		txn1.commit().await.unwrap();
+		txn1.commit().unwrap();
 
-		assert!(match txn2.commit().await {
+		assert!(match txn2.commit() {
 			Err(err) => {
 				matches!(err, Error::TransactionWriteConflict)
 			}
@@ -286,10 +286,10 @@ async fn g_single_tests() {
 		txn2.set(&key1, &value3).unwrap();
 		txn2.set(&key2, &value4).unwrap();
 
-		txn2.commit().await.unwrap();
+		txn2.commit().unwrap();
 
 		assert_eq!(txn1.get(&key2).unwrap().unwrap(), value2);
-		txn1.commit().await.unwrap();
+		txn1.commit().unwrap();
 	}
 }
 
@@ -369,7 +369,7 @@ async fn insert_large_txn_and_get() {
 		let (key, value) = gen_pair(&mut rng);
 		txn.set(&key, &value).unwrap();
 	}
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 	drop(txn);
 
 	// Read the keys from the store
@@ -400,7 +400,7 @@ async fn sdb_delete_record_id_bug() {
 		let mut txn = store.begin().unwrap();
 		txn.set(&key1, &value1).unwrap();
 		txn.set(&key2, &value1).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	let key3 = Vec::from(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
@@ -408,7 +408,7 @@ async fn sdb_delete_record_id_bug() {
 		// Start a new read-write transaction (txn)
 		let mut txn = store.begin().unwrap();
 		txn.set(&key3, &value1).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	let key4 = Vec::from(&[47, 33, 117, 115, 114, 111, 111, 116, 0]);
@@ -475,7 +475,7 @@ async fn sdb_delete_record_id_bug() {
 		]))
 		.unwrap();
 
-		txn2.commit().await.unwrap();
+		txn2.commit().unwrap();
 	}
 
 	{
@@ -516,7 +516,7 @@ async fn sdb_delete_record_id_bug() {
 			&value1,
 		)
 		.unwrap();
-		txn3.commit().await.unwrap();
+		txn3.commit().unwrap();
 	}
 }
 
@@ -534,14 +534,14 @@ async fn transaction_delete_from_index() {
 		let mut txn1 = store.begin().unwrap();
 		txn1.set(&key1, &value).unwrap();
 		txn1.set(&key2, &value).unwrap();
-		txn1.commit().await.unwrap();
+		txn1.commit().unwrap();
 	}
 
 	{
 		// Start another read-write transaction (txn2)
 		let mut txn2 = store.begin().unwrap();
 		txn2.delete(&key1).unwrap();
-		txn2.commit().await.unwrap();
+		txn2.commit().unwrap();
 	}
 
 	{
@@ -574,20 +574,20 @@ async fn test_insert_delete_read_key() {
 	{
 		let mut txn = store.begin().unwrap();
 		txn.set(&key, &value1).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	{
 		let mut txn = store.begin().unwrap();
 		txn.set(&key, &value2).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Clear the key in a separate transaction
 	{
 		let mut txn = store.begin().unwrap();
 		txn.delete(&key).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Read the key in a new transaction to verify it does not exist
@@ -609,7 +609,7 @@ async fn test_range_basic_functionality() {
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
 		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Test basic range scan
@@ -637,7 +637,7 @@ async fn test_range_with_bounds() {
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
 		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Test range with start bound as empty
@@ -673,7 +673,7 @@ async fn test_range_with_limit() {
 			let value = format!("value{i}");
 			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Test with .take()
@@ -700,7 +700,7 @@ async fn test_range_read_your_own_writes() {
 		tx.set(b"a", b"1").unwrap();
 		tx.set(b"c", b"3").unwrap();
 		tx.set(b"e", b"5").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Test RYOW - uncommitted writes should be visible in range
@@ -738,7 +738,7 @@ async fn test_range_with_deletes() {
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
 		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Test range with deletes in write set
@@ -769,7 +769,7 @@ async fn test_range_delete_then_set() {
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Test delete followed by set
@@ -797,7 +797,7 @@ async fn test_range_empty_result() {
 		let mut tx = store.begin().unwrap();
 		tx.set(b"a", b"1").unwrap();
 		tx.set(b"z", b"26").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Query range with no data
@@ -821,7 +821,7 @@ async fn test_range_ordering() {
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Verify correct ordering in range ([key1, key6) to include key5)
@@ -847,7 +847,7 @@ async fn test_range_boundary_conditions() {
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Test range boundaries ([key1, key4) to include key3)
@@ -906,7 +906,7 @@ async fn test_keys_method() {
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
 		tx.set(b"key5", b"value5").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Test with RYOW - add a key in the current transaction
@@ -1003,7 +1003,7 @@ async fn test_range_value_pointer_resolution_bug() {
 		txn.set(key1, large_value1.as_bytes()).unwrap();
 		txn.set(key2, large_value2.as_bytes()).unwrap();
 		txn.set(key3, large_value3.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush to ensure data goes to SSTables (and VLog)
@@ -1090,7 +1090,7 @@ mod double_ended_iterator_tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test reverse iteration
@@ -1123,7 +1123,7 @@ mod double_ended_iterator_tests {
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test reverse iteration with transaction writes
@@ -1165,7 +1165,7 @@ mod double_ended_iterator_tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test reverse iteration with deletes in transaction
@@ -1207,7 +1207,7 @@ mod double_ended_iterator_tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test reverse iteration with soft deletes in transaction
@@ -1249,7 +1249,7 @@ mod double_ended_iterator_tests {
 				let value = format!("value{}", i);
 				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test reverse iteration with take
@@ -1283,7 +1283,7 @@ mod double_ended_iterator_tests {
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key2", b"value2").unwrap();
 			tx.set(b"key3", b"value3").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test reverse iteration with keys only
@@ -1316,7 +1316,7 @@ mod double_ended_iterator_tests {
 			tx.set(b"key3", b"value3").unwrap();
 			tx.set(b"key4", b"value4").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test reverse iteration with mixed operations in transaction
@@ -1360,7 +1360,7 @@ mod double_ended_iterator_tests {
 			let mut tx = store.begin().unwrap();
 			tx.set(b"key1", b"value1").unwrap();
 			tx.set(b"key5", b"value5").unwrap();
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test reverse iteration on empty range
@@ -1386,7 +1386,7 @@ mod double_ended_iterator_tests {
 				let value = format!("value{}", i);
 				tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 		}
 
 		// Test that reverse iteration gives same results as forward iteration reversed
@@ -1471,7 +1471,7 @@ mod savepoint_tests {
 		assert!(matches!(txn1.rollback_to_savepoint(), Err(Error::TransactionWithoutSavepoint)));
 
 		// Commit the transaction.
-		txn1.commit().await.unwrap();
+		txn1.commit().unwrap();
 		drop(txn1);
 
 		// Start another transaction and check again for the keys.
@@ -1601,7 +1601,7 @@ async fn test_soft_delete_basic_functionality() {
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Verify data is visible
@@ -1616,7 +1616,7 @@ async fn test_soft_delete_basic_functionality() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.soft_delete(b"key2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Verify soft deleted key is not visible in reads
@@ -1648,7 +1648,7 @@ async fn test_soft_delete_vs_hard_delete() {
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key3", b"value3").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Soft delete key1, hard delete key2
@@ -1656,7 +1656,7 @@ async fn test_soft_delete_vs_hard_delete() {
 		let mut tx = store.begin().unwrap();
 		tx.soft_delete(b"key1").unwrap();
 		tx.delete(b"key2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Both should be invisible to reads
@@ -1685,7 +1685,7 @@ async fn test_soft_delete_in_transaction_write_set() {
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value1").unwrap();
 		tx.set(b"key2", b"value2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Start a transaction and soft delete within it
@@ -1705,7 +1705,7 @@ async fn test_soft_delete_in_transaction_write_set() {
 		assert_eq!(range.len(), 1); // Only key2
 		assert_eq!(&range[0].0, b"key2");
 
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// After commit, soft deleted key should still be invisible
@@ -1724,14 +1724,14 @@ async fn test_soft_delete_then_reinsert() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value1").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Soft delete the key
 	{
 		let mut tx = store.begin().unwrap();
 		tx.soft_delete(b"key1").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Verify it's not visible
@@ -1744,7 +1744,7 @@ async fn test_soft_delete_then_reinsert() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value1_new").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Verify the new value is visible
@@ -1766,7 +1766,7 @@ async fn test_soft_delete_range_scan_filtering() {
 			let value = format!("value{i}");
 			tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Soft delete some keys
@@ -1775,7 +1775,7 @@ async fn test_soft_delete_range_scan_filtering() {
 		tx.soft_delete(b"key02").unwrap();
 		tx.soft_delete(b"key05").unwrap();
 		tx.soft_delete(b"key08").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Range scan should not include soft deleted keys ([key01, key11) to include
@@ -1813,7 +1813,7 @@ async fn test_soft_delete_mixed_with_other_operations() {
 		tx.set(b"key2", b"value2").unwrap();
 		tx.set(b"key3", b"value3").unwrap();
 		tx.set(b"key4", b"value4").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Mix of operations in one transaction
@@ -1823,7 +1823,7 @@ async fn test_soft_delete_mixed_with_other_operations() {
 		tx.delete(b"key2").unwrap(); // Hard delete
 		tx.set(b"key3", b"value3_updated").unwrap(); // Update
 											   // key4 remains unchanged
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Verify results
@@ -1854,7 +1854,7 @@ async fn test_soft_delete_rollback() {
 	{
 		let mut tx = store.begin().unwrap();
 		tx.set(b"key1", b"value1").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Start transaction and soft delete, then rollback
@@ -1890,11 +1890,11 @@ async fn test_versioned_queries_basic() {
 	// Insert data with explicit timestamps
 	let mut tx1 = tree.begin().unwrap();
 	tx1.set_at(b"key1", b"value1_v1", ts1).unwrap();
-	tx1.commit().await.unwrap();
+	tx1.commit().unwrap();
 
 	let mut tx2 = tree.begin().unwrap();
 	tx2.set_at(b"key1", b"value1_v2", ts2).unwrap();
-	tx2.commit().await.unwrap();
+	tx2.commit().unwrap();
 
 	// Test regular get (should return latest)
 	let tx = tree.begin().unwrap();
@@ -1934,19 +1934,19 @@ async fn test_versioned_queries_with_deletes() {
 	// Insert first version
 	let mut tx1 = tree.begin().unwrap();
 	tx1.set(b"key1", b"value1").unwrap();
-	tx1.commit().await.unwrap();
+	tx1.commit().unwrap();
 	let ts1 = clock.now();
 
 	// Update with second version
 	let mut tx2 = tree.begin().unwrap();
 	tx2.set(b"key1", b"value2").unwrap();
-	tx2.commit().await.unwrap();
+	tx2.commit().unwrap();
 	let ts2 = clock.now();
 
 	// Delete the key
 	let mut tx3 = tree.begin().unwrap();
 	tx3.soft_delete(b"key1").unwrap(); // Soft delete
-	tx3.commit().await.unwrap();
+	tx3.commit().unwrap();
 	let ts3 = clock.now();
 
 	// Test regular get (should return None due to delete)
@@ -2020,7 +2020,7 @@ async fn test_set_at_timestamp() {
 	let custom_timestamp = 10;
 	let mut tx = tree.begin().unwrap();
 	tx.set_at(b"key1", b"value1", custom_timestamp).unwrap();
-	tx.commit().await.unwrap();
+	tx.commit().unwrap();
 
 	// Verify we can get the value at that timestamp
 	let tx = tree.begin().unwrap();
@@ -2061,7 +2061,7 @@ async fn test_timestamp_via_write_options() {
 		&WriteOptions::default().with_timestamp(Some(custom_timestamp)),
 	)
 	.unwrap();
-	tx.commit().await.unwrap();
+	tx.commit().unwrap();
 
 	// Verify we can read it at that timestamp
 	let tx = tree.begin().unwrap();
@@ -2076,7 +2076,7 @@ async fn test_timestamp_via_write_options() {
 		&WriteOptions::default().with_timestamp(Some(delete_timestamp)),
 	)
 	.unwrap();
-	tx.commit().await.unwrap();
+	tx.commit().unwrap();
 
 	// Verify the value exists at the earlier timestamp but not at the delete
 	// timestamp
@@ -2100,7 +2100,7 @@ async fn test_commit_timestamp_consistency() {
 	tx.set(b"key1", b"value1").unwrap();
 	tx.set(b"key2", b"value2").unwrap();
 	tx.set(b"key3", b"value3").unwrap();
-	tx.commit().await.unwrap();
+	tx.commit().unwrap();
 
 	// All keys should have the same timestamp - use history() API
 	{
@@ -2130,7 +2130,7 @@ async fn test_commit_timestamp_consistency() {
 	tx.set(b"key4", b"value4").unwrap(); // Will get commit timestamp
 	tx.set_at(b"key5", b"value5", custom_timestamp).unwrap(); // Explicit timestamp
 	tx.set(b"key6", b"value6").unwrap(); // Will get commit timestamp
-	tx.commit().await.unwrap();
+	tx.commit().unwrap();
 
 	let tx = tree.begin().unwrap();
 	let mut iter4 = tx.history(b"key4", b"key5").unwrap();
@@ -2175,13 +2175,13 @@ async fn test_range_at_version() {
 	tx1.set_at(b"key1", b"value1", ts1).unwrap();
 	tx1.set_at(b"key2", b"value2", ts1).unwrap();
 	tx1.set_at(b"key3", b"value3", ts1).unwrap();
-	tx1.commit().await.unwrap();
+	tx1.commit().unwrap();
 
 	// Insert data with second timestamp
 	let mut tx2 = tree.begin().unwrap();
 	tx2.set_at(b"key2", b"value2_updated", ts2).unwrap(); // Update existing key
 	tx2.set_at(b"key4", b"value4", ts2).unwrap(); // Add new key
-	tx2.commit().await.unwrap();
+	tx2.commit().unwrap();
 
 	// Test point-in-time query at first timestamp using history() API
 	let tx = tree.begin().unwrap();
@@ -2255,7 +2255,7 @@ async fn test_versioned_range_bounds_edge_cases() {
 	tx.set_at(b"c", b"value_c", ts).unwrap();
 	tx.set_at(b"d", b"value_d", ts).unwrap();
 	tx.set_at(b"e", b"value_e", ts).unwrap();
-	tx.commit().await.unwrap();
+	tx.commit().unwrap();
 
 	let tx = tree.begin().unwrap();
 
@@ -2321,7 +2321,7 @@ async fn test_range_at_version_with_deletes() {
 	tx1.set(b"key1", b"value1").unwrap();
 	tx1.set(b"key2", b"value2").unwrap();
 	tx1.set(b"key3", b"value3").unwrap();
-	tx1.commit().await.unwrap();
+	tx1.commit().unwrap();
 	let ts_after_insert = clock.now();
 
 	// IMPORTANT: point_in_time_from_history requires include_tombstones=true to detect soft deletes
@@ -2343,7 +2343,7 @@ async fn test_range_at_version_with_deletes() {
 	let mut tx2 = tree.begin().unwrap();
 	tx2.delete(b"key2").unwrap();
 	tx2.soft_delete(b"key3").unwrap();
-	tx2.commit().await.unwrap();
+	tx2.commit().unwrap();
 	let ts_after_deletes = clock.now();
 
 	// Test point-in-time query at a time after the deletes
@@ -2384,17 +2384,17 @@ async fn test_scan_all_versions() {
 	let mut tx1 = tree.begin().unwrap();
 	tx1.set(b"key1", b"value1_v1").unwrap();
 	tx1.set(b"key2", b"value2_v1").unwrap();
-	tx1.commit().await.unwrap();
+	tx1.commit().unwrap();
 
 	let mut tx2 = tree.begin().unwrap();
 	tx2.set(b"key1", b"value1_v2").unwrap();
 	tx2.set(b"key3", b"value3_v1").unwrap();
-	tx2.commit().await.unwrap();
+	tx2.commit().unwrap();
 
 	let mut tx3 = tree.begin().unwrap();
 	tx3.set(b"key2", b"value2_v2").unwrap();
 	tx3.set(b"key4", b"value4_v1").unwrap();
-	tx3.commit().await.unwrap();
+	tx3.commit().unwrap();
 
 	// Test using history() API to get all versions
 	let tx = tree.begin().unwrap();
@@ -2459,17 +2459,17 @@ async fn test_scan_all_versions_with_deletes() {
 	let mut tx1 = tree.begin().unwrap();
 	tx1.set(b"key1", b"value1_v1").unwrap();
 	tx1.set(b"key2", b"value2_v1").unwrap();
-	tx1.commit().await.unwrap();
+	tx1.commit().unwrap();
 
 	let mut tx2 = tree.begin().unwrap();
 	tx2.set(b"key1", b"value1_v2").unwrap();
 	tx2.set(b"key2", b"value2_v2").unwrap();
-	tx2.commit().await.unwrap();
+	tx2.commit().unwrap();
 
 	let mut tx3 = tree.begin().unwrap();
 	tx3.delete(b"key1").unwrap(); // Hard delete
 	tx3.soft_delete(b"key2").unwrap(); // Soft delete
-	tx3.commit().await.unwrap();
+	tx3.commit().unwrap();
 
 	// Test using history_with_options() to get all versions including tombstones
 	let tx = tree.begin().unwrap();
@@ -2607,7 +2607,7 @@ mod version_tests {
 			let mut txn = store.begin().unwrap();
 			let version = (i + 1) as u64; // Incremental version
 			txn.set_at(&key, value, version).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let txn = store.begin().unwrap();
@@ -2638,7 +2638,7 @@ mod version_tests {
 			let mut txn = store.begin().unwrap();
 			txn.set(&key, &[254u8]).unwrap(); // First set
 			txn.set(&key, &[]).unwrap(); // Second set (should replace first)
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Read back with history iterator
@@ -2672,7 +2672,7 @@ mod version_tests {
 			let mut txn = store.begin().unwrap();
 			let version = (i + 1) as u64; // Incremental version
 			txn.set_at(&key, value, version).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let txn = store.begin().unwrap();
@@ -2699,7 +2699,7 @@ mod version_tests {
 		for key in &keys {
 			let mut txn = store.begin().unwrap();
 			txn.set_at(key, &value, 1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let txn = store.begin().unwrap();
@@ -2728,7 +2728,7 @@ mod version_tests {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64;
 				txn.set_at(key, value, version).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 		}
 
@@ -2764,11 +2764,11 @@ mod version_tests {
 
 		let mut txn = store.begin().unwrap();
 		txn.set_at(&key, &value, 1).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let mut txn = store.begin().unwrap();
 		txn.soft_delete(&key).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let txn = store.begin().unwrap();
 		let mut end_key = key.clone();
@@ -2797,13 +2797,13 @@ mod version_tests {
 		for key in &keys {
 			let mut txn = store.begin().unwrap();
 			txn.set_at(key, &value, 1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		for key in &keys {
 			let mut txn = store.begin().unwrap();
 			txn.soft_delete(key).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let txn = store.begin().unwrap();
@@ -2840,14 +2840,14 @@ mod version_tests {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64;
 				txn.set_at(key, value, version).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 		}
 
 		for key in &keys {
 			let mut txn = store.begin().unwrap();
 			txn.soft_delete(key).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let txn = store.begin().unwrap();
@@ -2886,15 +2886,15 @@ mod version_tests {
 
 		let mut txn = store.begin().unwrap();
 		txn.set_at(&key, &value, 1).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let mut txn = store.begin().unwrap();
 		txn.soft_delete(&key).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let mut txn = store.begin().unwrap();
 		txn.delete(&key).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let txn = store.begin().unwrap();
 		let mut end_key = key.clone();
@@ -2913,7 +2913,7 @@ mod version_tests {
 		for key in &keys {
 			let mut txn = store.begin().unwrap();
 			txn.set_at(key, &value, 1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Inclusive range
@@ -2934,7 +2934,7 @@ mod version_tests {
 		for key in &keys {
 			let mut txn = store.begin().unwrap();
 			txn.set_at(key, &value, 1).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Note: With history() API, we get all results and can use .take() on iterator
@@ -2956,7 +2956,7 @@ mod version_tests {
 
 		let mut txn = store.begin().unwrap();
 		txn.set_at(&key, &value, 1).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let txn = store.begin().unwrap();
 		let mut end_key = key.clone();
@@ -2983,7 +2983,7 @@ mod version_tests {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64;
 				txn.set_at(key, value, version).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 		}
 
@@ -3037,7 +3037,7 @@ mod version_tests {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64;
 				txn.set_at(key, value, version).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 		}
 
@@ -3089,7 +3089,7 @@ mod version_tests {
 		txn.set_at(b"key4", b"value4", 1).unwrap();
 		txn.set_at(b"key5", b"value5", 1).unwrap();
 
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Test 1: Unbounded range should return all versions
 		let txn = store.begin().unwrap();
@@ -3140,7 +3140,7 @@ mod version_tests {
 				let mut txn = store.begin().unwrap();
 				let version = (i + 1) as u64;
 				txn.set_at(key, value, version).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 		}
 
@@ -3180,7 +3180,7 @@ mod version_tests {
 		// Test basic Replace functionality
 		let mut txn = store.begin().unwrap();
 		txn.replace(b"test_key", b"test_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Verify the value exists
 		let txn = store.begin().unwrap();
@@ -3190,7 +3190,7 @@ mod version_tests {
 		// Test Replace with options
 		let mut txn = store.begin().unwrap();
 		txn.replace(b"test_key2", b"test_value2").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Verify the second value exists
 		let txn = store.begin().unwrap();
@@ -3207,7 +3207,7 @@ mod version_tests {
 			let value = format!("value_v{}", version);
 			let mut txn = store.begin().unwrap();
 			txn.set(b"test_key", value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Verify the latest version exists
@@ -3218,7 +3218,7 @@ mod version_tests {
 		// Use Replace to replace all previous versions
 		let mut txn = store.begin().unwrap();
 		txn.replace(b"test_key", b"replaced_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Verify the new value exists
 		let txn = store.begin().unwrap();
@@ -3235,7 +3235,7 @@ mod version_tests {
 		txn.set(b"key1", b"regular_value1").unwrap();
 		txn.replace(b"key2", b"replace_value2").unwrap();
 		txn.set(b"key3", b"regular_value3").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Verify all values exist
 		let txn = store.begin().unwrap();
@@ -3246,7 +3246,7 @@ mod version_tests {
 		// Update key2 with regular set
 		let mut txn = store.begin().unwrap();
 		txn.set(b"key2", b"updated_regular_value2").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Verify the updated value
 		let txn = store.begin().unwrap();
@@ -3255,7 +3255,7 @@ mod version_tests {
 		// Use replace on key1
 		let mut txn = store.begin().unwrap();
 		txn.replace(b"key1", b"final_set_with_delete_value1").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Verify the final value
 		let txn = store.begin().unwrap();
@@ -3280,7 +3280,7 @@ async fn test_versioned_range_survives_memtable_flush() {
 		let mut tx = store.begin().unwrap();
 		let value = format!("v{i}");
 		tx.set_at(b"key1", value.as_bytes(), i as u64 * 100).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Verify all 3 versions exist in memtable BEFORE flush using history() API
@@ -3331,10 +3331,10 @@ async fn test_conflict_detection_basic() {
 	txn2.set(key, value2).unwrap();
 
 	// First commit succeeds
-	txn1.commit().await.unwrap();
+	txn1.commit().unwrap();
 
 	// Second commit should fail with write conflict
-	let result = txn2.commit().await;
+	let result = txn2.commit();
 	assert!(
 		matches!(result, Err(Error::TransactionWriteConflict)),
 		"Expected TransactionWriteConflict, got: {:?}",
@@ -3360,8 +3360,8 @@ async fn test_no_conflict_different_keys() {
 	txn2.set(key2, value).unwrap();
 
 	// Both should succeed
-	txn1.commit().await.unwrap();
-	txn2.commit().await.unwrap();
+	txn1.commit().unwrap();
+	txn2.commit().unwrap();
 
 	// Verify both writes are visible
 	let txn3 = store.begin().unwrap();
@@ -3383,7 +3383,7 @@ async fn test_read_write_no_conflict() {
 	{
 		let mut txn = store.begin().unwrap();
 		txn.set(key, value1).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Start two transactions
@@ -3398,7 +3398,7 @@ async fn test_read_write_no_conflict() {
 	assert_eq!(read_value, value1.to_vec()); // Should see old value (snapshot isolation)
 
 	// txn1 commits successfully
-	txn1.commit().await.unwrap();
+	txn1.commit().unwrap();
 
 	// txn2 can still read its snapshot
 	assert_eq!(txn2.get(key).unwrap().unwrap(), value1.to_vec());
@@ -3417,14 +3417,14 @@ async fn test_sequential_no_conflict() {
 	{
 		let mut txn1 = store.begin().unwrap();
 		txn1.set(key, value1).unwrap();
-		txn1.commit().await.unwrap();
+		txn1.commit().unwrap();
 	}
 
 	// Second transaction starts AFTER first commits - no conflict
 	{
 		let mut txn2 = store.begin().unwrap();
 		txn2.set(key, value2).unwrap();
-		txn2.commit().await.unwrap();
+		txn2.commit().unwrap();
 	}
 
 	// Verify final value
@@ -3455,10 +3455,10 @@ async fn test_partial_overlap_conflict() {
 	txn2.set(key3, value).unwrap();
 
 	// First commit succeeds
-	txn1.commit().await.unwrap();
+	txn1.commit().unwrap();
 
 	// Second commit should fail due to key2 conflict
-	let result = txn2.commit().await;
+	let result = txn2.commit();
 	assert!(
 		matches!(result, Err(Error::TransactionWriteConflict)),
 		"Expected TransactionWriteConflict, got: {:?}",
@@ -3488,7 +3488,7 @@ async fn test_direction_switch_forward_to_backward_empty_writeset() {
 		txn.set(b"c", b"val_c").unwrap();
 		txn.set(b"d", b"val_d").unwrap();
 		txn.set(b"e", b"val_e").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Start new read-only transaction (empty write-set)
@@ -3532,7 +3532,7 @@ async fn test_direction_switch_forward_to_backward_at_end() {
 		txn.set(b"c", b"val_c").unwrap();
 		txn.set(b"d", b"val_d").unwrap();
 		txn.set(b"e", b"val_e").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();
@@ -3564,7 +3564,7 @@ async fn test_direction_switch_backward_to_forward() {
 		txn.set(b"c", b"val_c").unwrap();
 		txn.set(b"d", b"val_d").unwrap();
 		txn.set(b"e", b"val_e").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();
@@ -3609,7 +3609,7 @@ async fn test_direction_switch_with_ryow() {
 		txn.set(b"a", b"val_a_committed").unwrap();
 		txn.set(b"c", b"val_c_committed").unwrap();
 		txn.set(b"e", b"val_e_committed").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Start write transaction, add key "b" (uncommitted - in write-set)
@@ -3655,7 +3655,7 @@ async fn test_multiple_direction_switches() {
 		txn.set(b"c", b"val_c").unwrap();
 		txn.set(b"d", b"val_d").unwrap();
 		txn.set(b"e", b"val_e").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();
@@ -3706,7 +3706,7 @@ async fn test_direction_switch_after_seek() {
 		txn.set(b"c", b"val_c").unwrap();
 		txn.set(b"d", b"val_d").unwrap();
 		txn.set(b"e", b"val_e").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	let tx = store.begin().unwrap();

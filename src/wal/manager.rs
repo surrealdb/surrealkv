@@ -346,6 +346,19 @@ impl Wal {
 		Ok(0)
 	}
 
+	/// Append a record WITHOUT flushing. The caller MUST call `flush()` (and
+	/// optionally `sync()`) afterward. Used by group commit to coalesce the
+	/// `write()` syscall across a whole group.
+	pub(crate) fn append_no_flush(&mut self, rec: &[u8]) -> Result<()> {
+		if self.closed {
+			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "WAL is closed")));
+		}
+		if rec.is_empty() {
+			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "buf is empty")));
+		}
+		self.active_writer.add_record_no_flush(rec)
+	}
+
 	pub(crate) fn sync(&mut self) -> Result<()> {
 		if self.closed {
 			return Ok(());

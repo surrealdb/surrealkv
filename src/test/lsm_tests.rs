@@ -74,7 +74,7 @@ async fn test_tree_basic() {
 	let value = "world";
 	let mut txn = tree.begin().unwrap();
 	txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	// Read back the key-value pair
 	let txn = tree.begin().unwrap();
@@ -99,7 +99,7 @@ async fn test_memtable_flush() {
 		// Insert key-value pair in a new transaction
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Ensure the active memtable is flushed to disk
@@ -131,14 +131,14 @@ async fn test_memtable_flush_with_delete() {
 		// Insert key-value pair in a new transaction
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Delete the key
 	{
 		let mut txn = tree.begin().unwrap();
 		txn.delete(key.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Ensure the active memtable is flushed to disk
@@ -184,7 +184,7 @@ async fn test_memtable_flush_with_multiple_keys_and_updates() {
 			// Insert in a new transaction
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 	}
 
@@ -244,7 +244,7 @@ async fn test_persistence() {
 				// Insert in a new transaction
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 		}
 
@@ -307,7 +307,7 @@ async fn test_checkpoint_functionality() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush to ensure data is on disk
@@ -336,7 +336,7 @@ async fn test_checkpoint_functionality() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush to ensure the new data is also on disk
@@ -391,7 +391,7 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush to ensure data is on disk
@@ -409,7 +409,7 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Verify the pending writes are in memory but not yet flushed
@@ -456,7 +456,7 @@ async fn test_simple_range_seek() {
 	for key in keys.iter() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), key.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Test range scan BEFORE flushing (should work from memtables)
@@ -533,7 +533,7 @@ async fn test_large_range_scan() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush to ensure all data is on disk
@@ -704,7 +704,7 @@ async fn test_range_skip_take() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -792,7 +792,7 @@ async fn test_range_skip_take_alphabetical() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -869,7 +869,7 @@ async fn test_range_limit_functionality() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -1032,7 +1032,7 @@ async fn test_range_limit_with_skip_take() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -1145,7 +1145,7 @@ async fn test_vlog_basic() {
 
 	let mut txn = tree.begin().unwrap();
 	txn.set(small_key.as_bytes(), small_value.as_bytes()).unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	// Test 2: Large values should be stored in VLog
 	let large_key = "large_key";
@@ -1153,7 +1153,7 @@ async fn test_vlog_basic() {
 
 	let mut txn = tree.begin().unwrap();
 	txn.set(large_key.as_bytes(), large_value.as_bytes()).unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	// Force memtable flush to persist to SSTables
 	tree.flush().unwrap();
@@ -1194,7 +1194,7 @@ async fn test_vlog_concurrent_operations() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush to ensure all data is persisted
@@ -1251,7 +1251,7 @@ async fn test_vlog_file_rotation() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush
@@ -1307,7 +1307,7 @@ async fn test_compaction_with_updates_and_delete() {
 		let value = format!("value-{}-v1", i + 1);
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 		tree.flush().unwrap();
 	}
 
@@ -1316,7 +1316,7 @@ async fn test_compaction_with_updates_and_delete() {
 		let value = format!("value-{}-v2", i + 1);
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 		tree.flush().unwrap();
 	}
 
@@ -1332,7 +1332,7 @@ async fn test_compaction_with_updates_and_delete() {
 	for key in keys.iter() {
 		let mut tx = tree.begin().unwrap();
 		tx.delete(*key).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Flush memtable
@@ -1371,7 +1371,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let value = format!("value-{}-v1", i + 1);
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 		tree.flush().unwrap();
 	}
 
@@ -1380,7 +1380,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let value = format!("value-{}-v2", i + 1);
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 		tree.flush().unwrap();
 	}
 
@@ -1389,7 +1389,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let value = format!("value-{}-v3", i + 1);
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 		tree.flush().unwrap();
 	}
 
@@ -1398,7 +1398,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let value = format!("value-{}-v4", i + 1);
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 		tree.flush().unwrap();
 	}
 
@@ -1413,7 +1413,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 	for key in keys.iter() {
 		let mut tx = tree.begin().unwrap();
 		tx.delete(*key).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 
 	// Flush memtable
@@ -1451,7 +1451,7 @@ async fn test_vlog_compaction_preserves_sequence_numbers() {
 		let value = format!("value1_version_{i}").repeat(10); // Large value to fill VLog
 		let mut tx = tree.begin().unwrap();
 		tx.set(&key1, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 		tree.flush().unwrap();
 	}
 
@@ -1461,13 +1461,13 @@ async fn test_vlog_compaction_preserves_sequence_numbers() {
 		// Insert key2
 		let mut tx = tree.begin().unwrap();
 		tx.set(&key2, b"value2").unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 		tree.flush().unwrap();
 
 		// Delete key2
 		let mut tx = tree.begin().unwrap();
 		tx.delete(&key2).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 		tree.flush().unwrap();
 	}
 
@@ -1484,7 +1484,7 @@ async fn test_vlog_compaction_preserves_sequence_numbers() {
 		let value = format!("value2_version_{i}").repeat(10); // Large values
 		let mut tx = tree.begin().unwrap();
 		tx.set(&key3, value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 		tree.flush().unwrap();
 	}
 
@@ -1492,7 +1492,7 @@ async fn test_vlog_compaction_preserves_sequence_numbers() {
 	{
 		let mut tx = tree.begin().unwrap();
 		tx.set(&key1, "final_value_key1".repeat(10).as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 	}
 	tree.flush().unwrap();
 
@@ -1544,7 +1544,7 @@ async fn test_sstable_lsn_bug() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force first flush
@@ -1557,7 +1557,7 @@ async fn test_sstable_lsn_bug() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force second flush
@@ -1623,7 +1623,7 @@ async fn test_table_id_assignment_across_restart() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force first flush to create first table
@@ -1636,7 +1636,7 @@ async fn test_table_id_assignment_across_restart() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force second flush to create second table
@@ -1703,7 +1703,7 @@ async fn test_table_id_assignment_across_restart() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to create the 3rd table
@@ -1812,7 +1812,7 @@ async fn test_vlog_prefill_on_reopen() {
 
 		let mut tx = tree1.begin().unwrap();
 		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
-		tx.commit().await.unwrap();
+		tx.commit().unwrap();
 
 		// Verify the data was written immediately
 		let tx = tree1.begin().unwrap();
@@ -1855,7 +1855,7 @@ async fn test_vlog_prefill_on_reopen() {
 
 	let mut tx = tree2.begin().unwrap();
 	tx.set(new_key.as_bytes(), new_value.as_bytes()).unwrap();
-	tx.commit().await.unwrap();
+	tx.commit().unwrap();
 
 	// Verify the new data can be read
 	let tx = tree2.begin().unwrap();
@@ -1895,7 +1895,7 @@ async fn test_tree_builder() {
 	// Test basic operations
 	let mut txn = tree.begin().unwrap();
 	txn.set(b"test_key", b"test_value").unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	let txn = tree.begin().unwrap();
 	let result = txn.get(b"test_key").unwrap().unwrap();
@@ -1911,7 +1911,7 @@ async fn test_tree_builder() {
 	// Test basic operations on the second tree
 	let mut txn = tree2.begin().unwrap();
 	txn.set(b"key2", b"value2").unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	let txn = tree2.begin().unwrap();
 	let result = txn.get(b"key2").unwrap().unwrap();
@@ -1936,7 +1936,7 @@ async fn test_soft_delete() {
 			let value = format!("value_v{}", version);
 			let mut txn = tree.begin().unwrap();
 			txn.set(b"test_key", value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Verify the latest version exists
@@ -1947,7 +1947,7 @@ async fn test_soft_delete() {
 		// Soft delete the key
 		let mut txn = tree.begin().unwrap();
 		txn.soft_delete(b"test_key").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Verify the key is now invisible (soft deleted)
 		let txn = tree.begin().unwrap();
@@ -1957,7 +1957,7 @@ async fn test_soft_delete() {
 		// Add a new different key
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"other_key", b"other_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Verify the new key exists
 		let txn = tree.begin().unwrap();
@@ -2013,7 +2013,7 @@ async fn test_soft_delete() {
 		// Test that we can reinsert the same key after soft delete
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"test_key", b"new_value_after_soft_delete").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Verify the new value is visible
 		let txn = tree.begin().unwrap();
@@ -2044,7 +2044,7 @@ async fn test_checkpoint_with_vlog() {
 		let key = format!("key_{i}");
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), &large_value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush to create VLog files
@@ -2088,7 +2088,7 @@ async fn test_checkpoint_with_vlog() {
 		let key = format!("key_{i}");
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), &large_value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush to ensure the new data is also on disk
@@ -2161,7 +2161,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"test_key", b"test_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Clean shutdown - should flush to SST
 		tree.close().await.unwrap();
@@ -2225,7 +2225,7 @@ async fn test_crash_before_flush_replays_wal() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"crash_key", b"crash_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Simulate crash: drop tree without calling close()
 		// This leaves data in WAL but not flushed to SST
@@ -2267,7 +2267,7 @@ async fn test_log_number_advances_with_flushes() {
 	for i in 0..100 {
 		let mut txn = tree.begin().unwrap();
 		txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Force flush
@@ -2279,7 +2279,7 @@ async fn test_log_number_advances_with_flushes() {
 	for i in 100..200 {
 		let mut txn = tree.begin().unwrap();
 		txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	tree.flush().unwrap();
@@ -2308,7 +2308,7 @@ async fn test_last_sequence_persists_across_restart() {
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Force flush to persist
@@ -2351,7 +2351,7 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Don't flush, just close - this will flush memtable on shutdown
 		tree.close().await.unwrap();
@@ -2366,7 +2366,7 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Crash: drop without close, release lock manually
 		{
@@ -2430,14 +2430,14 @@ async fn test_clean_shutdown_no_empty_wal() {
 		for i in 0..100 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 		tree.flush().unwrap();
 
 		// Write a bit more data to the new WAL
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"extra", b"data").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Clean shutdown (should flush the extra data, update log_number, close WAL)
 		tree.close().await.unwrap();
@@ -2484,7 +2484,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch1_key_{i}").as_bytes(), b"value1").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 		tree.flush().unwrap();
 		let log_num_1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -2493,7 +2493,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch2_key_{i}").as_bytes(), b"value2").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 		tree.flush().unwrap();
 		let log_num_2 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -2502,7 +2502,7 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch3_key_{i}").as_bytes(), b"value3").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 		tree.flush().unwrap();
 		let log_num_3 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -2540,7 +2540,7 @@ async fn test_shutdown_with_empty_memtable() {
 		// Write and flush everything
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key", b"value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 		tree.flush().unwrap();
 
 		// Get manifest state
@@ -2580,7 +2580,7 @@ async fn test_full_crash_recovery_scenario() {
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch_a_{i}").as_bytes(), b"value_a").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 		tree.flush().unwrap();
 		tree.close().await.unwrap();
@@ -2592,7 +2592,7 @@ async fn test_full_crash_recovery_scenario() {
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch_b_{i}").as_bytes(), b"value_b").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 		tree.flush().unwrap();
 
@@ -2612,7 +2612,7 @@ async fn test_full_crash_recovery_scenario() {
 		for i in 0..20 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch_c_{i}").as_bytes(), b"value_c").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Simulate crash: drop without close
@@ -2657,7 +2657,7 @@ async fn test_concurrent_flush_after_rotation() {
 	for i in 0..100 {
 		let mut txn = tree.begin().unwrap();
 		txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Verify data is accessible before flush
@@ -2689,7 +2689,7 @@ async fn test_concurrent_flush_after_rotation() {
 	// Verify no errors and system continues
 	let mut txn = tree.begin().unwrap();
 	txn.set(b"after_flush", b"value").unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 	drop(txn);
 
 	// Verify both old and new data are accessible
@@ -2725,7 +2725,7 @@ async fn test_wal_file_reuse_across_restarts() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -2737,7 +2737,7 @@ async fn test_wal_file_reuse_across_restarts() {
 		// Write another transaction
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -2773,7 +2773,7 @@ async fn test_wal_append_after_crash_recovery() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let manifest_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 
@@ -2803,7 +2803,7 @@ async fn test_wal_append_after_crash_recovery() {
 		// Write another transaction to same WAL
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let wal_num_after_write = tree.core.inner.wal.read().get_active_log_number();
 
@@ -2850,7 +2850,7 @@ async fn test_flush_on_close_creates_sst() {
 		// Write data to memtable (no manual flush)
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"test_key", b"test_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		let sst_count_before_close = count_ssts();
 
@@ -2912,7 +2912,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("cycle1_key_{}", i).as_bytes(), b"value1").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let sst_before = count_ssts();
@@ -2944,7 +2944,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("cycle2_key_{}", i).as_bytes(), b"value2").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let sst_before = count_ssts();
@@ -2980,7 +2980,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("cycle3_key_{}", i).as_bytes(), b"value3").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		let sst_before_close = count_ssts();
@@ -3028,7 +3028,7 @@ async fn test_close_without_flush() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Count SSTs before close
@@ -3070,7 +3070,7 @@ async fn test_flush_on_close_option_comparison() {
 			let tree = Tree::new(Arc::clone(&opts)).unwrap();
 			let mut txn = tree.begin().unwrap();
 			txn.set(b"test", b"data").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			sst_before = tree.core.inner.level_manifest.read().unwrap().iter().count();
 
@@ -3096,7 +3096,7 @@ async fn test_flush_on_close_option_comparison() {
 			let tree = Tree::new(Arc::clone(&opts)).unwrap();
 			let mut txn = tree.begin().unwrap();
 			txn.set(b"test", b"data").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 
 			sst_before = tree.core.inner.level_manifest.read().unwrap().iter().count();
 
@@ -3154,7 +3154,7 @@ async fn test_flush_all_memtables_on_close_ordering() {
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key_{:04}", i).as_bytes(), b"value_data_here").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Wait a bit for background flushes to start
@@ -3166,7 +3166,7 @@ async fn test_flush_all_memtables_on_close_ordering() {
 		// Write one more entry to ensure active memtable has data
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"final_key", b"final_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Close - should flush all remaining memtables
 		tree.close().await.unwrap();
@@ -3224,7 +3224,7 @@ async fn test_flush_immutable_memtables_with_empty_active() {
 		for i in 0..20 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key_{}", i).as_bytes(), b"value_data").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Wait for background flush to complete
@@ -3268,7 +3268,7 @@ async fn test_sst_table_ids_ordered_correctly_on_close() {
 		for i in 0..5 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key_{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Get initial table count
@@ -3328,7 +3328,7 @@ async fn test_wal_number_tracking_on_flush() {
 	// Write some data
 	let mut txn = tree.begin().unwrap();
 	txn.set(b"key1", b"value1").unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	// Explicitly flush
 	tree.flush().unwrap();
@@ -3358,7 +3358,7 @@ async fn test_wal_number_tracking_on_flush() {
 	// Second write + flush cycle
 	let mut txn = tree.begin().unwrap();
 	txn.set(b"key2", b"value2").unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	tree.flush().unwrap();
 
@@ -3410,7 +3410,7 @@ async fn test_memtable_wal_number_after_swap() {
 	// Write data and flush
 	let mut txn = tree.begin().unwrap();
 	txn.set(b"key1", b"value1").unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	tree.flush().unwrap();
 
@@ -3421,7 +3421,7 @@ async fn test_memtable_wal_number_after_swap() {
 	// Write more and flush again
 	let mut txn = tree.begin().unwrap();
 	txn.set(b"key2", b"value2").unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	tree.flush().unwrap();
 
@@ -3475,7 +3475,7 @@ async fn test_wal_number_correct_after_reopen() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 			tree.flush().unwrap();
 
 			log::info!(
@@ -3567,7 +3567,7 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 			for i in 0..100 {
 				let mut txn = tree.begin().unwrap();
 				txn.set(format!("cycle{}_key_{}", cycle, i).as_bytes(), b"value").unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 
 			// Close (should flush)
@@ -3643,7 +3643,7 @@ async fn test_cleanup_orphaned_sst_files() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 		tree.flush().unwrap();
 		tree.close().await.unwrap();
 	}
@@ -3694,7 +3694,7 @@ async fn test_manifest_atomic_sst_and_log_number() {
 	for i in 0..100 {
 		let mut txn = tree.begin().unwrap();
 		txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Explicitly trigger flush to ensure test reliability
@@ -3733,7 +3733,7 @@ async fn test_no_spurious_small_flush() {
 	// Add small amount of data (way below threshold)
 	let mut txn = tree.begin().unwrap();
 	txn.set(b"key1", b"value1").unwrap();
-	txn.commit().await.unwrap();
+	txn.commit().unwrap();
 
 	// Manually trigger wake_up (simulating spurious notification)
 	if let Some(ref task_manager) = *tree.core.task_manager.lock().unwrap() {
@@ -3767,7 +3767,7 @@ async fn test_crash_recovery_with_orphaned_sst() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"committed_key", b"committed_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 		tree.flush().unwrap();
 		tree.close().await.unwrap();
 	}
@@ -3782,7 +3782,7 @@ async fn test_crash_recovery_with_orphaned_sst() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"wal_key", b"wal_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 		// Don't flush - keep in WAL
 		tree.close().await.unwrap();
 	}
@@ -3818,7 +3818,7 @@ async fn test_cleanup_multiple_orphaned_ssts() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 		tree.close().await.unwrap();
 	}
 
@@ -3864,7 +3864,7 @@ async fn test_valid_ssts_not_deleted_during_cleanup() {
 		for i in 0..200 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.flush().unwrap();
@@ -3933,7 +3933,7 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 			}
 			// Force flush after each batch
 			tree.flush().unwrap();
@@ -4037,7 +4037,7 @@ async fn test_wal_recovery_mode_absolute_consistency_fails_on_corruption() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1").unwrap();
 		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Close without flush - data only in WAL
 		tree.close().await.unwrap();
@@ -4093,7 +4093,7 @@ async fn test_wal_recovery_mode_tolerate_with_repair_succeeds_on_corruption() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1").unwrap();
 		txn.set(b"key2", b"value2").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		// Close without flush - data only in WAL
 		tree.close().await.unwrap();
@@ -4162,7 +4162,7 @@ async fn test_wal_incremental_number_after_flush_and_reopen() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"test_key", b"test_value").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -4223,7 +4223,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1_from_sst").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 		tree.flush().unwrap();
 
 		log_number_after_phase1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
@@ -4340,7 +4340,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		// Write NEW data after recovery - this is the data that could be lost
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key4_new_after_recovery", b"value4").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 		log::info!("Phase 3: Wrote key4 to WAL segment {}", active_wal_after_recovery);
 
 		// Flush - this updates log_number
@@ -4352,7 +4352,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		// Write more data that stays in WAL (not flushed)
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key5_unflushed", b"value5").unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 		log::info!("Phase 3: Wrote key5 (unflushed)");
 
 		// Close without flush (simulating crash)
@@ -4432,7 +4432,7 @@ async fn test_flush_wal_concurrent_commits() {
 
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 				commit_count.fetch_add(1, Ordering::SeqCst);
 			}
 		});
@@ -4511,7 +4511,7 @@ async fn test_range_key_ordering_correctness() {
 		let mut txn = tree.begin().unwrap();
 		let value = format!("value_for_{}", key);
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Test BEFORE flush (memtable path)
@@ -4649,7 +4649,7 @@ async fn test_range_prefix_differentiation() {
 	for (key, value) in table_records.iter().chain(index_records.iter()) {
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Test before flush
@@ -4786,7 +4786,7 @@ async fn test_range_exclusive_boundaries() {
 	for key in keys.iter() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), format!("value_{}", key).as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Test before flush
@@ -4885,7 +4885,7 @@ async fn test_range_boundary_edge_cases() {
 	for key in keys.iter() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), format!("value_{}", key).as_bytes()).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Test before flush
@@ -5016,7 +5016,7 @@ async fn test_vlog_files_persist_across_restart() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Flush to ensure data is persisted to SST (so VLog files are referenced)
@@ -5100,7 +5100,7 @@ async fn test_vlog_files_persist_across_restart() {
 
 			let mut txn = tree.begin().unwrap();
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		log::info!("Added 10 new entries (total records: {})", keys_and_values.len());
@@ -5266,7 +5266,7 @@ async fn test_vlog_gc_non_versioned_surrealdb_style_keys() {
 					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 				}
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 
 			// Periodic compaction + VLog GC
@@ -5306,7 +5306,7 @@ async fn test_vlog_gc_non_versioned_surrealdb_style_keys() {
 					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 				}
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 
 			// Periodic compaction + VLog GC (this is where progressive corruption would appear)
@@ -5461,7 +5461,7 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 					tx.set(key.as_bytes(), value.as_bytes()).unwrap();
 				}
 			}
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 		}
 
@@ -5507,7 +5507,7 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 				}
 			}
 
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 
 			// Periodic compaction + VLog GC
@@ -5621,7 +5621,7 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 				}
 			}
 
-			tx.commit().await.unwrap();
+			tx.commit().unwrap();
 			tree.flush().unwrap();
 
 			// Periodic compaction + VLog GC
@@ -5798,7 +5798,7 @@ async fn test_recovery_detects_corrupt_log_number() {
 		for i in 0..10 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		// Close without flushing (data is only in WAL)
@@ -5868,7 +5868,7 @@ async fn test_validate_wal_log_number_multiple_wals() {
 			let mut txn = tree.begin().unwrap();
 			let value = vec![b'x'; 100]; // 100 bytes per entry
 			txn.set(format!("key{:04}", i).as_bytes(), &value).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.close().await.unwrap();
@@ -5916,7 +5916,7 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 			let mut txn = tree.begin().unwrap();
 			let value = vec![b'x'; 100];
 			txn.set(format!("key{:04}", i).as_bytes(), &value).unwrap();
-			txn.commit().await.unwrap();
+			txn.commit().unwrap();
 		}
 
 		tree.close().await.unwrap();

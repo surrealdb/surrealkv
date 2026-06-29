@@ -697,7 +697,7 @@ mod tests {
 		);
 
 		let stall_clone = Arc::clone(&write_stall);
-		let writer_handle = tokio::spawn(async move { stall_clone.check().await });
+		let writer_handle = tokio::spawn(async move { stall_clone.check() });
 
 		// Let the writer enter the stall loop
 		time::sleep(Duration::from_millis(50)).await;
@@ -732,7 +732,7 @@ mod tests {
 		);
 
 		let stall_clone = Arc::clone(&write_stall);
-		let writer_handle = tokio::spawn(async move { stall_clone.check().await });
+		let writer_handle = tokio::spawn(async move { stall_clone.check() });
 
 		// Let the writer enter the stall loop
 		time::sleep(Duration::from_millis(50)).await;
@@ -769,7 +769,7 @@ mod tests {
 		let mut writer_handles = Vec::new();
 		for _ in 0..5 {
 			let stall_clone = Arc::clone(&write_stall);
-			writer_handles.push(tokio::spawn(async move { stall_clone.check().await }));
+			writer_handles.push(tokio::spawn(async move { stall_clone.check() }));
 		}
 
 		// Let all writers enter the stall loop

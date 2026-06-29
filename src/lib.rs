@@ -2,7 +2,6 @@ mod batch;
 mod cache;
 mod checkpoint;
 mod clock;
-mod commit;
 mod committer;
 mod compaction;
 mod comparator;

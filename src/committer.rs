@@ -127,6 +127,7 @@ pub(crate) struct Committer {
 	tx: Sender<Msg>,
 	shared: Arc<Shared>,
 	env: Arc<dyn CommitEnv>,
+	write_stall: Arc<WriteStallController>,
 	handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -134,7 +135,7 @@ impl Committer {
 	pub(crate) fn new(
 		env: Arc<dyn CommitEnv>,
 		visible_seq_num: Arc<AtomicU64>,
-		_write_stall: Arc<WriteStallController>,
+		write_stall: Arc<WriteStallController>,
 	) -> Arc<Self> {
 		let shared = Arc::new(Shared {
 			visible_seq_num,
@@ -156,6 +157,7 @@ impl Committer {
 			tx,
 			shared,
 			env,
+			write_stall,
 			handle: Mutex::new(Some(handle)),
 		})
 	}
@@ -212,6 +214,10 @@ impl Committer {
 		if batch.is_empty() {
 			return Ok(());
 		}
+
+		// Backpressure: block here (off the commit thread) if the memtable/L0
+		// backlog is over the stall threshold, so stalled writers don't queue.
+		self.write_stall.check()?;
 
 		// Expensive encode OFF the commit thread (parallel across committers).
 		let prepared = self.env.pre_serialize(&batch)?;

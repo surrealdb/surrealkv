@@ -32,7 +32,7 @@ impl RecoveryTestHelper {
 
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
+				txn.commit().unwrap();
 
 				total_keys += 1;
 			}

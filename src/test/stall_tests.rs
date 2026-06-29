@@ -62,7 +62,7 @@ async fn test_no_stall_below_threshold() {
 	let controller = WriteStallController::new(provider, default_thresholds());
 
 	// Below thresholds - should not stall
-	let result = controller.check().await;
+	let result = controller.check();
 	assert!(result.is_ok());
 	assert!(result.unwrap().is_none());
 	assert!(!controller.is_stalled());
@@ -86,7 +86,7 @@ async fn test_memtable_stall_triggers() {
 	});
 
 	let start = std::time::Instant::now();
-	let result = controller.check().await;
+	let result = controller.check();
 
 	assert!(result.is_ok());
 	let stall_info: WriteStallInfo = result.unwrap().expect("Expected stall info");
@@ -115,7 +115,7 @@ async fn test_l0_stall_triggers() {
 		controller_clone.signal_work_done();
 	});
 
-	let result = controller.check().await;
+	let result = controller.check();
 	assert!(result.is_ok());
 
 	let stall_info = result.unwrap().expect("Expected stall info");
@@ -142,7 +142,7 @@ async fn test_shutdown_during_stall() {
 		controller_clone.signal_shutdown();
 	});
 
-	let result = controller.check().await;
+	let result = controller.check();
 
 	// Should return Err(PipelineStall) on shutdown
 	assert!(result.is_err());
@@ -167,7 +167,7 @@ async fn test_stall_wakes_on_signal() {
 	});
 
 	// Below threshold - should not stall
-	let result = controller.check().await;
+	let result = controller.check();
 	assert!(result.is_ok());
 	assert!(result.unwrap().is_none()); // Wasn't stalled
 }
@@ -195,7 +195,7 @@ async fn test_is_stalled_flag() {
 		controller_clone.signal_work_done();
 	});
 
-	let _ = controller.check().await;
+	let _ = controller.check();
 
 	// After stall cleared
 	assert!(!controller.is_stalled());
@@ -221,7 +221,7 @@ async fn test_integration_basic_writes_no_stall() {
 		let value = vec![0u8; 100];
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), &value).unwrap();
-		let _: Result<(), crate::Error> = txn.commit().await;
+		let _: Result<(), crate::Error> = txn.commit();
 	}
 
 	let _: Result<(), crate::Error> = tree.close().await;
@@ -297,7 +297,7 @@ async fn test_shutdown_completes_with_pending_writes() {
 			if txn.set(key.as_bytes(), &value).is_err() {
 				return;
 			}
-			if txn.commit().await.is_err() {
+			if txn.commit().is_err() {
 				return;
 			}
 		}
@@ -349,7 +349,7 @@ async fn test_stall_check_at_arena_full() {
 		let value = vec![0u8; 500]; // ~500B per entry
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), &value).unwrap();
-		let result = txn.commit().await;
+		let result = txn.commit();
 		assert!(result.is_ok(), "Commit should succeed: {:?}", result.err());
 	}
 
@@ -382,7 +382,7 @@ async fn test_concurrent_writes_with_rotation() {
 				let value = vec![writer_id as u8; 200];
 				let mut txn = tree.begin().unwrap();
 				txn.set(key.as_bytes(), &value).unwrap();
-				if let Err(e) = txn.commit().await {
+				if let Err(e) = txn.commit() {
 					// Shutdown errors are acceptable
 					if !matches!(e, Error::PipelineStall) {
 						panic!("Unexpected error: {:?}", e);
@@ -433,7 +433,7 @@ async fn test_flush_waits_for_active_writers() {
 		let value = vec![0u8; 400];
 		let mut txn = tree.begin().unwrap();
 		txn.set(key.as_bytes(), &value).unwrap();
-		txn.commit().await.unwrap();
+		txn.commit().unwrap();
 	}
 
 	// Flush should complete successfully (waited for any active writers)
@@ -479,7 +479,7 @@ async fn test_memtable_rotation_under_concurrent_load() {
 				if txn.set(key.as_bytes(), &value).is_err() {
 					return;
 				}
-				if txn.commit().await.is_err() {
+				if txn.commit().is_err() {
 					return; // Shutdown or other error is acceptable in stress test
 				}
 			}
