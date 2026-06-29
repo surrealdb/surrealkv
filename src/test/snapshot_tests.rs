@@ -45,6 +45,36 @@ async fn test_empty_snapshot() {
 }
 
 #[test(tokio::test)]
+async fn range_does_not_drop_snapshot_registration() {
+	// Regression: `SnapshotIterator::new_from` builds a transient `Snapshot`
+	// via struct literal that shares the live txn's seq. Before the fix its
+	// `Drop` called `unregister(seq)`, dropping the live read txn's
+	// registration; with the refcount tracker that would also be an unbalanced
+	// decrement. The fix tags the transient with `tracker_shard = None` so its
+	// `Drop` is a no-op. Verify a range scan leaves the registration intact.
+	let (store, _temp_dir) = create_store();
+
+	// A read-write begin() registers a snapshot at its start_seq.
+	let read_tx = store.begin().unwrap();
+	let before = store.core.inner.snapshot_tracker.get_all_snapshots();
+	assert!(!before.is_empty(), "begin() should register a snapshot");
+
+	// Drive a range scan, which constructs a SnapshotIterator (→ new_from).
+	let _ = collect_transaction_all(&mut read_tx.range(b"a", b"z").unwrap()).unwrap();
+
+	let after = store.core.inner.snapshot_tracker.get_all_snapshots();
+	assert_eq!(before, after, "range() must NOT unregister the live snapshot's seq");
+
+	// Dropping the only reader unregisters its seq.
+	let seq = before[0];
+	drop(read_tx);
+	assert!(
+		!store.core.inner.snapshot_tracker.get_all_snapshots().contains(&seq),
+		"dropping the read txn should unregister its seq"
+	);
+}
+
+#[test(tokio::test)]
 async fn test_basic_snapshot_visibility() {
 	let (store, _temp_dir) = create_store();
 

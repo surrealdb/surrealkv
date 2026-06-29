@@ -2,9 +2,8 @@ use std::cmp::Ordering;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use crossbeam_skiplist::SkipSet;
-
 use crate::error::{Error, Result};
+use crate::min_tracker::ShardedMinTracker;
 use crate::iter::BoxedLSMIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
@@ -37,7 +36,11 @@ use crate::{
 /// search. Versions visible to snapshots are preserved unless hidden by a newer
 /// version in the same visibility boundary.
 pub(crate) struct SnapshotTracker {
-	snapshots: Arc<SkipSet<u64>>,
+	// Sharded refcount-by-seq tracker. Replaces a global `SkipSet<u64>`: the
+	// refcount correctly tracks multiple live snapshots that share a seq
+	// (concurrent begins all read the same `visible_seq_num`), which the bare
+	// set could not — first drop would have unregistered a seq still in use.
+	snapshots: Arc<ShardedMinTracker>,
 }
 
 impl Clone for SnapshotTracker {
@@ -64,41 +67,42 @@ impl SnapshotTracker {
 	/// Creates a new empty snapshot tracker.
 	pub(crate) fn new() -> Self {
 		Self {
-			snapshots: Arc::new(SkipSet::new()),
+			snapshots: Arc::new(ShardedMinTracker::new()),
 		}
 	}
 
-	/// Registers a new snapshot with the given sequence number.
+	/// Registers a new snapshot with the given sequence number. Returns the
+	/// shard index, which the caller (the `Snapshot`) MUST pass back to
+	/// `unregister` on drop.
 	///
-	/// Called when a new snapshot is created. The sequence number is added
-	/// to the tracking set, ensuring compaction will preserve versions
-	/// visible to this snapshot.
-	pub(crate) fn register(&self, seq_num: u64) {
-		self.snapshots.insert(seq_num);
+	/// Called when a new snapshot is created, ensuring compaction will preserve
+	/// versions visible to this snapshot.
+	pub(crate) fn register(&self, seq_num: u64) -> usize {
+		self.snapshots.register(seq_num)
 	}
 
-	/// Unregisters a snapshot with the given sequence number.
+	/// Unregisters a snapshot previously registered at `(shard, seq_num)`.
 	///
 	/// Called when a snapshot is dropped. Once all snapshots at or above
 	/// a certain sequence number are dropped, older versions become eligible
 	/// for garbage collection during compaction.
-	pub(crate) fn unregister(&self, seq_num: u64) {
-		self.snapshots.remove(&seq_num);
+	pub(crate) fn unregister(&self, shard: usize, seq_num: u64) {
+		self.snapshots.unregister(shard, seq_num);
 	}
 
-	/// Returns all active snapshots as a sorted vector.
+	/// Returns all active snapshots as a sorted, de-duplicated vector.
 	///
 	/// This is the primary method used by compaction. The returned vector
 	/// is sorted in ascending order.
 	pub(crate) fn get_all_snapshots(&self) -> Vec<u64> {
-		self.snapshots.iter().map(|entry| *entry).collect()
+		self.snapshots.get_all()
 	}
 
-	/// Returns the smallest active snapshot seq, if any. O(log N) via
-	/// `SkipSet::front`. Used by the commit oracle to compute its GC
-	/// watermark on every commit.
+	/// Returns the smallest active snapshot seq, if any. Lock-free min over the
+	/// shard caches. Used by the commit oracle to compute its GC watermark on
+	/// every commit.
 	pub(crate) fn first(&self) -> Option<u64> {
-		self.snapshots.front().map(|e| *e.value())
+		self.snapshots.oldest()
 	}
 }
 
@@ -128,6 +132,13 @@ pub(crate) struct Snapshot {
 	/// Sequence number defining this snapshot's view of the data
 	/// Only data with seq_num <= this value is visible
 	pub(crate) seq_num: u64,
+
+	/// Shard index returned by `snapshot_tracker.register`, or `None` for a
+	/// transient `Snapshot` that was NOT registered (see `SnapshotIterator::
+	/// new_from`). `Drop` unregisters iff `Some`, keeping register/unregister
+	/// balanced — required for the refcount tracker (an unbalanced unregister
+	/// would otherwise drop a live snapshot's seq).
+	tracker_shard: Option<usize>,
 }
 
 impl Snapshot {
@@ -135,11 +146,12 @@ impl Snapshot {
 	pub(crate) fn new(core: Arc<Core>, seq_num: u64) -> Self {
 		// Register this snapshot's sequence number so compaction knows
 		// to preserve versions visible to this snapshot
-		core.snapshot_tracker.register(seq_num);
+		let shard = core.snapshot_tracker.register(seq_num);
 
 		Self {
 			core,
 			seq_num,
+			tracker_shard: Some(shard),
 		}
 	}
 
@@ -353,9 +365,13 @@ impl Snapshot {
 
 impl Drop for Snapshot {
 	fn drop(&mut self) {
-		// Unregister this snapshot's sequence number so compaction can
-		// clean up versions no longer visible to any snapshot
-		self.core.snapshot_tracker.unregister(self.seq_num);
+		// Unregister this snapshot's sequence number so compaction can clean up
+		// versions no longer visible to any snapshot. Only registered snapshots
+		// (those built via `Snapshot::new`) unregister; transient ones built by
+		// `new_from` carry `None` and must not touch the tracker.
+		if let Some(shard) = self.tracker_shard {
+			self.core.snapshot_tracker.unregister(shard, self.seq_num);
+		}
 	}
 }
 
@@ -832,10 +848,14 @@ pub(crate) struct SnapshotIterator<'a> {
 impl SnapshotIterator<'_> {
 	/// Creates a new iterator over a specific key range
 	fn new_from(core: Arc<Core>, seq_num: u64, range: InternalKeyRange) -> Result<Self> {
-		// Create a temporary snapshot to use the helper method
+		// Create a temporary snapshot to use the helper method. It is NOT
+		// registered with the snapshot tracker (the real `Snapshot` it derives
+		// from already is), so `tracker_shard = None` ensures its `Drop` does
+		// NOT unregister — otherwise it would drop the live snapshot's seq.
 		let snapshot = Snapshot {
 			core: Arc::clone(&core),
 			seq_num,
+			tracker_shard: None,
 		};
 		let iter_state = snapshot.collect_iter_state()?;
 
@@ -1806,9 +1826,10 @@ mod tests {
 	fn test_snapshot_tracker_ordering() {
 		let tracker = SnapshotTracker::new();
 
-		// Insert snapshots in non-sorted order
-		tracker.register(100);
-		tracker.register(50);
+		// Insert snapshots in non-sorted order (capture shards for the ones we
+		// later unregister).
+		let s100 = tracker.register(100);
+		let s50 = tracker.register(50);
 		tracker.register(200);
 		tracker.register(75);
 		tracker.register(150);
@@ -1818,8 +1839,8 @@ mod tests {
 		assert_eq!(snapshots, vec![50, 75, 100, 150, 200]);
 
 		// Unregister some and verify order is maintained
-		tracker.unregister(100);
-		tracker.unregister(50);
+		tracker.unregister(s100, 100);
+		tracker.unregister(s50, 50);
 
 		let snapshots = tracker.get_all_snapshots();
 		assert_eq!(snapshots, vec![75, 150, 200]);
@@ -1849,5 +1870,23 @@ mod tests {
 		// Both should see the same snapshots
 		assert_eq!(tracker1.get_all_snapshots(), vec![50, 100]);
 		assert_eq!(tracker2.get_all_snapshots(), vec![50, 100]);
+	}
+
+	#[test]
+	fn test_duplicate_seq_refcount() {
+		// Two live snapshots at the same seq (concurrent begins share
+		// `visible_seq_num`). The old `SkipSet<u64>` collapsed them to one
+		// entry, so the first drop wrongly unregistered the seq the second
+		// still needed. The refcount tracker keeps the seq until BOTH drop.
+		let tracker = SnapshotTracker::new();
+		let a = tracker.register(100);
+		let b = tracker.register(100);
+		assert_eq!(tracker.get_all_snapshots(), vec![100]);
+		tracker.unregister(a, 100);
+		assert_eq!(tracker.get_all_snapshots(), vec![100], "still live for the second snapshot");
+		assert_eq!(tracker.first(), Some(100));
+		tracker.unregister(b, 100);
+		assert!(tracker.get_all_snapshots().is_empty());
+		assert_eq!(tracker.first(), None);
 	}
 }

@@ -6,9 +6,10 @@
 //     `Snapshot`); it drives oracle map GC. The oracle's required watermark can advance faster than
 //     compaction's, so the two stay separate.
 //
-// Lock-free `SkipSet<(start_seq, unique_id)>`. `unique_id` differentiates
-// concurrent transactions that happen to share a `start_seq` so `remove`
-// in `Drop` doesn't collide.
+// Backed by a sharded refcount-by-seq tracker (`ShardedMinTracker`). The
+// refcount handles concurrent transactions that share a `start_seq` (common,
+// since `start_seq` is loaded from `visible_seq_num`, which only advances on
+// commit) without the per-entry `unique_id` a set would need.
 //
 // Registration race window (KNOWN, DOCUMENTED, NOT FIXED PROTOCOL-SIDE):
 //   `Transaction::new` does
@@ -36,14 +37,16 @@
 //   begins. Revisit if production benchmarks show the race firing often
 //   enough to dominate.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crossbeam_skiplist::SkipSet;
+use crate::min_tracker::ShardedMinTracker;
 
 pub(crate) struct ActiveTxnTracker {
-	seqs: Arc<SkipSet<(u64, u64)>>,
-	next_id: AtomicU64,
+	// Sharded refcount-by-seq tracker. Replaces a global `SkipSet<(seq, id)>`:
+	// the refcount subsumes the `unique_id` multiset trick (concurrent begins
+	// share a `start_seq`), and sharding removes the lock-free-skiplist churn
+	// that dominated CPU under high begin/commit concurrency.
+	inner: ShardedMinTracker,
 }
 
 impl Default for ActiveTxnTracker {
@@ -55,36 +58,35 @@ impl Default for ActiveTxnTracker {
 impl ActiveTxnTracker {
 	pub(crate) fn new() -> Self {
 		Self {
-			seqs: Arc::new(SkipSet::new()),
-			next_id: AtomicU64::new(0),
+			inner: ShardedMinTracker::new(),
 		}
 	}
 
 	/// Register a transaction's start_seq. Returns an RAII guard whose `Drop`
 	/// unregisters the entry.
 	pub(crate) fn register(self: &Arc<Self>, start_seq: u64) -> ActiveTxnGuard {
-		let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-		let entry = (start_seq, id);
-		self.seqs.insert(entry);
+		let shard = self.inner.register(start_seq);
 		ActiveTxnGuard {
 			tracker: Arc::clone(self),
-			entry,
+			shard,
+			seq: start_seq,
 			released: false,
 		}
 	}
 
 	/// Smallest `start_seq` currently registered. `None` if empty.
 	///
-	/// Cheap (O(log N) via `SkipSet::front`). Safe to call concurrently with
-	/// `register` and unregister. See the module-level comment for the
-	/// monotonicity-based race proof.
+	/// Lock-free (a min over the per-shard cached minimums). Safe to call
+	/// concurrently with `register` and unregister. Never over-estimates in
+	/// steady state; see the module-level comment for the monotonicity-based
+	/// race proof.
 	pub(crate) fn oldest(&self) -> Option<u64> {
-		self.seqs.front().map(|e| e.value().0)
+		self.inner.oldest()
 	}
 
 	#[cfg(test)]
 	pub(crate) fn len(&self) -> usize {
-		self.seqs.len()
+		self.inner.len()
 	}
 }
 
@@ -92,7 +94,8 @@ impl ActiveTxnTracker {
 /// via `release`) on commit / rollback / drop / panic.
 pub(crate) struct ActiveTxnGuard {
 	tracker: Arc<ActiveTxnTracker>,
-	entry: (u64, u64),
+	shard: usize,
+	seq: u64,
 	released: bool,
 }
 
@@ -100,7 +103,7 @@ impl ActiveTxnGuard {
 	/// Release the slot eagerly. Idempotent.
 	pub(crate) fn release(&mut self) {
 		if !self.released {
-			self.tracker.seqs.remove(&self.entry);
+			self.tracker.inner.unregister(self.shard, self.seq);
 			self.released = true;
 		}
 	}
