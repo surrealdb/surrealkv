@@ -204,3 +204,7 @@ harness = false
 [[bench]]
 name = "convoy_bench"
 harness = false
+
+[[bench]]
+name = "committer_proto"
+harness = false
