@@ -434,25 +434,23 @@ impl CoreInner {
 			entry.wal_number,
 		)?;
 
-		// Schedule async WAL cleanup
+		// WAL cleanup, inline (this runs on the std::thread flush worker — no
+		// tokio runtime, so it must NOT be spawned). It's a cheap directory scan.
 		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
 		let min_wal_to_keep = entry.wal_number + 1;
-
-		tokio::spawn(async move {
-			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
-				Ok(count) if count > 0 => {
-					log::info!(
-						"Cleaned up {} old WAL segments (min_wal_to_keep={})",
-						count,
-						min_wal_to_keep
-					);
-				}
-				Ok(_) => {}
-				Err(e) => {
-					log::warn!("Failed to clean up old WAL segments: {}", e);
-				}
+		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+			Ok(count) if count > 0 => {
+				log::info!(
+					"Cleaned up {} old WAL segments (min_wal_to_keep={})",
+					count,
+					min_wal_to_keep
+				);
 			}
-		});
+			Ok(_) => {}
+			Err(e) => {
+				log::warn!("Failed to clean up old WAL segments: {}", e);
+			}
+		}
 
 		log::debug!(
 			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
@@ -1326,7 +1324,7 @@ impl Core {
 		let task_manager = self.task_manager.lock().unwrap().take();
 		if let Some(task_manager) = task_manager {
 			log::debug!("Stopping background task manager...");
-			task_manager.stop().await;
+			task_manager.stop();
 			log::debug!("Background task manager stopped");
 		}
 
