@@ -4,6 +4,12 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+// `write_mutex` uses std's Mutex, not parking_lot's: the convoy bench on the
+// 64-core Linux target showed parking_lot COLLAPSES past ~7 contending threads
+// (8.5M -> 0.8M ops/s), while std::sync::Mutex degrades gracefully (4.85M/s at
+// N=128, 6x faster under contention). parking_lot's eager-fairness handoff is
+// the cause. This is what kept the in-flight cap pinned at 7.
+use std::sync::Mutex as StdMutex;
 use tokio::sync::{oneshot, Semaphore};
 
 use crate::batch::Batch;
@@ -224,7 +230,7 @@ pub(crate) struct CommitPipeline {
 	// not the memtable — which is why `apply()` can run outside `write_mutex`.
 	oracle: Arc<CommitOracle>,
 	// Single producer - only one thread can write to WAL at a time
-	write_mutex: Mutex<()>,
+	write_mutex: StdMutex<()>,
 	// Lock-free single-producer, multi-consumer commit queue
 	pending: CommitQueue,
 	// Semaphore for flow control
@@ -245,7 +251,7 @@ impl CommitPipeline {
 			log_seq_num: AtomicU64::new(1),
 			visible_seq_num,
 			oracle: Arc::new(CommitOracle::new()),
-			write_mutex: Mutex::new(()),
+			write_mutex: StdMutex::new(()),
 			pending: CommitQueue::new(),
 			commit_sem: Arc::new(Semaphore::new(max_concurrent_commits())),
 			shutdown: AtomicBool::new(false),
@@ -266,7 +272,9 @@ impl CommitPipeline {
 	/// seq-counter rewind, oracle reset) against concurrent commits. Returns
 	/// `impl Drop` so callers don't bind to which internal lock backs it.
 	pub(crate) fn lock_writes(&self) -> impl Drop + '_ {
-		self.write_mutex.lock()
+		// Poison-tolerant (recover the guard if a prior holder panicked) so the
+		// pipeline keeps the no-poison semantics parking_lot gave us.
+		self.write_mutex.lock().unwrap_or_else(|e| e.into_inner())
 	}
 
 	/// Discard all oracle entries and set `kept_since = max_seq`.
@@ -331,7 +339,7 @@ impl CommitPipeline {
 		// Duplicate keys within a batch (e.g. from savepoint history) are
 		// harmless: oracle.check/publish are idempotent on the same key.
 		let allocated_seq: u64 = {
-			let _guard = self.write_mutex.lock();
+			let _guard = self.write_mutex.lock().unwrap_or_else(|e| e.into_inner());
 
 			// Validate against the oracle. No state has changed yet; on
 			// failure `?` simply returns the error to the caller.
