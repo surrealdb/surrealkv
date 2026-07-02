@@ -1890,6 +1890,13 @@ impl TreeBuilder {
 		self
 	}
 
+	/// Disable write-stall backpressure entirely (benchmarking / diagnostic
+	/// knob). See [`Options::disable_write_stall`].
+	pub fn with_write_stall_disabled(mut self, value: bool) -> Self {
+		self.opts = self.opts.with_write_stall_disabled(value);
+		self
+	}
+
 	/// Builds the LSM tree with the configured options.
 	///
 	/// This method ensures type safety by using the same key type K
