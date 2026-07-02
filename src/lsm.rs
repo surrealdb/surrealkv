@@ -140,6 +140,19 @@ pub(crate) struct CoreInner {
 	/// Visible sequence number - the highest sequence number that is visible to readers.
 	/// Shared with CommitPipeline for coordinated updates.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
+
+	/// Serializes flush-vs-flush and flush-vs-compaction.
+	///
+	/// The background flush worker, the background compaction worker, and a
+	/// synchronous `Tree::flush()` all write SSTs and mutate the manifest. As
+	/// preemptive OS threads they can run truly concurrently (cooperative tokio
+	/// scheduling hid this). Without serialization two flush callers select the
+	/// SAME oldest immutable and write the same `table_id` path concurrently,
+	/// producing SST corruption (bad magic number / block checksum failures on
+	/// read-back). Acquired at the top of `flush_oldest_immutable_to_sst` and
+	/// `compact` — the only concurrency-exposed flush/compaction entry points
+	/// (recovery and shutdown flushes are single-threaded).
+	pub(crate) flush_compact_lock: Arc<std::sync::Mutex<()>>,
 }
 
 impl CoreInner {
@@ -192,6 +205,7 @@ impl CoreInner {
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
+			flush_compact_lock: Arc::new(std::sync::Mutex::new(())),
 		})
 	}
 
@@ -396,6 +410,13 @@ impl CoreInner {
 	/// 2. Flushes it to SST via flush_immutable_to_sst (which also removes from queue)
 	/// 3. Schedules async WAL cleanup
 	fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
+		// Serialize against other flushes (background worker vs synchronous
+		// Tree::flush) and against compaction. The queue read below MUST happen
+		// under this lock, otherwise two flushers select the same oldest
+		// immutable and write the same table_id path concurrently. See
+		// `flush_compact_lock`.
+		let _fc = self.flush_compact_lock.lock().unwrap_or_else(|e| e.into_inner());
+
 		// Get the oldest immutable entry (clone to release lock before I/O)
 		let entry = {
 			let guard = self.immutable_memtables.read()?;
@@ -818,6 +839,10 @@ impl CompactionOperations for CoreInner {
 	/// - Removes deleted entries to reclaim space
 	/// - Maintains the level invariants (size ratios and key ranges)
 	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
+		// Serialize against flushes (which also write SSTs / mutate the
+		// manifest). See `flush_compact_lock`.
+		let _fc = self.flush_compact_lock.lock().unwrap_or_else(|e| e.into_inner());
+
 		// Create compaction options from the current LSM tree state
 		let options = CompactionOptions::from(self);
 
@@ -988,6 +1013,11 @@ pub(crate) struct Core {
 
 	/// Write stall controller for backpressure management
 	pub(crate) write_stall: Arc<crate::stall::WriteStallController>,
+
+	/// Set once the tree has been closed (via `close()` or `Drop`). Makes the
+	/// shutdown sequence idempotent so a `Drop`-triggered close after an
+	/// explicit `close()` is a no-op (and vice versa).
+	pub(crate) closed: std::sync::atomic::AtomicBool,
 }
 
 impl std::ops::Deref for Core {
@@ -1252,6 +1282,7 @@ impl Core {
 			commit_pipeline: Arc::clone(&commit_pipeline),
 			task_manager: Mutex::new(Some(task_manager)),
 			write_stall,
+			closed: std::sync::atomic::AtomicBool::new(false),
 		};
 
 		log::info!("=== LSM tree initialization complete ===");
@@ -1310,6 +1341,19 @@ impl Core {
 	/// Unlike `make_room_for_write`, this does NOT rotate the WAL before
 	/// flushing. This prevents creating an empty WAL file on clean shutdown.
 	pub async fn close(&self) -> Result<()> {
+		self.close_sync()
+	}
+
+	/// Synchronous shutdown. All shutdown work is blocking (stop the commit
+	/// thread + background workers, flush, close WAL/VLog, release the lock), so
+	/// this is sync and is shared by the async `close()` wrapper and `Drop for
+	/// Tree`. Idempotent via the `closed` flag: a second call (e.g. `Drop` after
+	/// an explicit `close()`) returns `Ok(())` immediately.
+	pub(crate) fn close_sync(&self) -> Result<()> {
+		if self.closed.swap(true, std::sync::atomic::Ordering::AcqRel) {
+			return Ok(());
+		}
+
 		log::info!("Shutting down LSM tree...");
 
 		// Step 1: Shutdown the commit pipeline to stop accepting new writes
@@ -1658,20 +1702,23 @@ impl Tree {
 
 impl Drop for Tree {
 	fn drop(&mut self) {
-		#[cfg(not(target_arch = "wasm32"))]
-		{
-			// Native environment - use tokio
-			if let Ok(handle) = tokio::runtime::Handle::try_current() {
-				// Clone the Arc to move into the async task
-				let core = Arc::clone(&self.core);
-				handle.spawn(async move {
-					if let Err(err) = core.close().await {
-						log::error!("Error closing store: {}", err);
-					}
-				});
-			} else {
-				log::warn!("No runtime available for closing the store correctly");
-			}
+		// Stop the background threads SYNCHRONOUSLY so they cannot outlive the
+		// Tree. We deliberately do NOT flush, close the WAL, or release the lock
+		// here: a plain `drop` (without `close()`) is crash-like — unflushed data
+		// must remain in the WAL for recovery. Explicit `close()` performs the
+		// clean shutdown.
+		//
+		// The previous implementation spawned a fire-and-forget tokio task that
+		// ran `close()` asynchronously, so `drop(tree)` returned while the old
+		// tree's commit thread and flush/compaction workers were still running.
+		// A new Tree opened on the same directory then raced those still-running
+		// workers on SST files (bad magic number / block-checksum corruption).
+		// Joining the threads here closes that window. Both calls are idempotent
+		// (an explicit `close()` already performed them).
+		self.core.commit_pipeline.shutdown();
+		let tm = self.core.task_manager.lock().unwrap_or_else(|e| e.into_inner()).take();
+		if let Some(tm) = tm {
+			tm.stop();
 		}
 	}
 }

@@ -78,9 +78,10 @@ async fn test_memtable_stall_triggers() {
 	let controller_clone = Arc::clone(&controller);
 	let provider_clone = Arc::clone(&provider);
 
-	// Spawn task that will signal after delay
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(50)).await;
+	// Signal from a real OS thread: `check()` is now SYNC and blocks the calling
+	// thread, so a tokio task on a current-thread runtime would never get to run.
+	std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(50));
 		provider_clone.set_counts(1, 0); // Simulate flush completing
 		controller_clone.signal_work_done();
 	});
@@ -109,8 +110,8 @@ async fn test_l0_stall_triggers() {
 	let controller_clone = Arc::clone(&controller);
 	let provider_clone = Arc::clone(&provider);
 
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(50)).await;
+	std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(50));
 		provider_clone.set_counts(0, 5); // Simulate compaction completing
 		controller_clone.signal_work_done();
 	});
@@ -136,9 +137,9 @@ async fn test_shutdown_during_stall() {
 	));
 	let controller_clone = Arc::clone(&controller);
 
-	// Spawn task that will signal shutdown after delay
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(50)).await;
+	// Signal shutdown from a real OS thread (sync check() blocks the caller).
+	std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(50));
 		controller_clone.signal_shutdown();
 	});
 
@@ -185,12 +186,12 @@ async fn test_is_stalled_flag() {
 
 	assert!(!controller.is_stalled());
 
-	// Spawn task that will check and then signal
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(20)).await;
+	// Observe + signal from a real OS thread (sync check() blocks the caller).
+	std::thread::spawn(move || {
+		std::thread::sleep(Duration::from_millis(20));
 		// At this point, should be stalled
 		assert!(controller_check.is_stalled());
-		time::sleep(Duration::from_millis(30)).await;
+		std::thread::sleep(Duration::from_millis(30));
 		provider_clone.set_counts(1, 0); // Simulate flush completing
 		controller_clone.signal_work_done();
 	});

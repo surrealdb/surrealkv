@@ -304,7 +304,7 @@ fn run_commit_loop(rx: Receiver<Msg>, shared: Arc<Shared>, env: Arc<dyn CommitEn
 	}
 
 	// Fail any stragglers so their callers don't block forever.
-	while let Ok(Msg::Commit(mut req)) = rx.try_recv() {
+	while let Ok(Msg::Commit(req)) = rx.try_recv() {
 		unsafe { *req.comp.result.get() = Some(Err(Error::PipelineStall)) };
 		let prev = req.comp.state.swap(ST_DONE, Ordering::Release);
 		if prev == ST_PARKED {

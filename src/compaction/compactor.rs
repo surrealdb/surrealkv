@@ -167,9 +167,18 @@ impl Compactor {
 		merge_iter: Vec<BoxedLSMIterator<'_>>,
 		input: &CompactionInput,
 	) -> Result<bool> {
-		let file = SysFile::create(path)?;
-		let mut writer =
-			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
+		// Hold ownership of the write handle (pass `&mut file` to the writer) so we
+		// can fsync it after `finish()` and BEFORE `open_table` reopens the file for
+		// read-back. `TableWriter::finish` does not fsync; without this barrier the
+		// dropped write handle races the fresh read handle under concurrent I/O and
+		// the reader can observe a 0-byte / partially-written SST (FLUSH-RACE).
+		let mut file = SysFile::create(path)?;
+		let mut writer = TableWriter::new(
+			&mut file,
+			table_id,
+			Arc::clone(&self.options.lopts),
+			input.target_level,
+		);
 
 		// Get active snapshots for snapshot-aware compaction
 		// This is a snapshot of the snapshot list at the start of compaction.
@@ -197,13 +206,16 @@ impl Compactor {
 		}
 
 		if entries == 0 {
-			// No entries - drop writer and remove empty file
+			// No entries - drop writer and the write handle, then remove empty file
 			drop(writer);
+			drop(file);
 			let _ = std::fs::remove_file(path);
 			return Ok(false);
 		}
 
 		writer.finish()?;
+		// Durability barrier on the write handle before the caller reopens for read.
+		file.sync_all()?;
 		Ok(true)
 	}
 

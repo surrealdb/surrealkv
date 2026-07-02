@@ -1,4 +1,3 @@
-use std::fs::File as SysFile;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -332,9 +331,25 @@ impl MemTable {
 	) -> Result<Arc<Table>> {
 		let table_file_path = lsm_opts.sstable_file_path(table_id);
 
+		// ONE read+write handle for the whole flush: write → fsync → read-back.
+		// The previous code wrote via a write-only handle, dropped it, then
+		// REOPENED a fresh read handle — which races the write handle's close
+		// under the preemptive std-thread flush worker and observes a 0-byte /
+		// partially-written file (verified: written=729, reopened fstat=0;
+		// cooperative tokio never interleaved here). Passing `&mut file` to the
+		// writer keeps ownership so we fsync and read back on the SAME fd — no
+		// reopen, no cross-fd visibility race.
+		let mut file = std::fs::OpenOptions::new()
+			.read(true)
+			.write(true)
+			.create(true)
+			.truncate(true)
+			.open(&table_file_path)
+			.map_err(|e| crate::Error::Io(e.into()))?;
+
+		let written_size: usize;
 		{
-			let file = SysFile::create(&table_file_path)?;
-			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
+			let mut table_writer = TableWriter::new(&mut file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
 
 			let mut iter = self.iter();
 			iter.seek_first()?;
@@ -348,7 +363,7 @@ impl MemTable {
 				table_writer.add(key, &sst_value)?;
 				iter.next()?;
 			}
-			table_writer.finish()?;
+			written_size = table_writer.finish()?;
 		}
 
 		// Sync VLog after all entries written (one fsync for the entire flush)
@@ -356,12 +371,12 @@ impl MemTable {
 			vlog.sync()?;
 		}
 
-		let file = crate::vfs::open_for_sync(&table_file_path)?;
-		file.sync_all()?;
-		let file: Arc<dyn File> = Arc::new(file);
-		let file_size = file.size()?;
+		// Durability barrier on the SAME handle that wrote, before read-back.
+		file.sync_all().map_err(|e| crate::Error::Io(e.into()))?;
 
-		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);
+		let file: Arc<dyn File> = Arc::new(file);
+		// Authoritative size from the writer (no fstat race).
+		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, written_size as u64)?);
 		Ok(created_table)
 	}
 

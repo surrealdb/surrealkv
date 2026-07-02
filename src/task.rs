@@ -84,11 +84,6 @@ impl TaskManager {
 		let memtable_running = Arc::new(AtomicBool::new(false));
 		let level_running = Arc::new(AtomicBool::new(false));
 		let task_handles = Mutex::new(Some(Vec::new()));
-		// Serialize flush vs compaction. They are now separate OS threads
-		// (preemptive), so they can run truly concurrently and race on SST files /
-		// the manifest — corruption that cooperative tokio scheduling hid. This
-		// lock makes a flush and a compaction mutually exclusive.
-		let flush_compact_lock = Arc::new(Mutex::new(()));
 
 		// Spawn memtable compaction task
 		{
@@ -98,7 +93,6 @@ impl TaskManager {
 			let running = Arc::clone(&memtable_running);
 			let level_notify = Arc::clone(&level_notify);
 			let write_stall = Arc::clone(&write_stall);
-			let flush_compact_lock = Arc::clone(&flush_compact_lock);
 
 			let handle = std::thread::Builder::new()
 				.name("surrealkv-flush".into())
@@ -113,10 +107,10 @@ impl TaskManager {
 					running.store(true, Ordering::SeqCst);
 					log::debug!("Memtable flush task starting");
 
-					// Hold the flush<->compaction lock for the whole flush pass.
-					let _fc = flush_compact_lock.lock().unwrap_or_else(|e| e.into_inner());
-
-					// Flush ALL pending immutable memtables in a loop
+					// Flush ALL pending immutable memtables in a loop. Flush-vs-flush
+					// and flush-vs-compaction serialization lives inside Core
+					// (`flush_compact_lock`), so the synchronous `Tree::flush()` path is
+					// serialized against this worker too.
 					let mut flush_count = 0;
 					loop {
 						match core.compact_memtable() {
@@ -162,7 +156,6 @@ impl TaskManager {
 			let notify = Arc::clone(&level_notify);
 			let running = Arc::clone(&level_running);
 			let write_stall = Arc::clone(&write_stall);
-			let flush_compact_lock = Arc::clone(&flush_compact_lock);
 
 			let handle = std::thread::Builder::new()
 				.name("surrealkv-compact".into())
@@ -177,8 +170,8 @@ impl TaskManager {
 					running.store(true, Ordering::SeqCst);
 					log::debug!("Level compaction task starting");
 
-					// Hold the flush<->compaction lock for the compaction pass.
-					let _fc = flush_compact_lock.lock().unwrap_or_else(|e| e.into_inner());
+					// flush-vs-compaction serialization lives inside Core::compact
+					// (`flush_compact_lock`).
 
 					// Use leveled compaction strategy
 					let strategy: Arc<dyn CompactionStrategy> =

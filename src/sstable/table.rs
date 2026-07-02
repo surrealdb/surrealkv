@@ -597,7 +597,10 @@ impl<W: Write> TableWriter<W> {
 		let mut buf = vec![0u8; TABLE_FULL_FOOTER_LENGTH];
 		footer.encode(&mut buf);
 
-		self.offset += self.writer.write(&buf[..])?;
+		// Use write_all so a short write completes the footer (bare `write` may
+		// under-write under IO pressure, truncating the trailing magic).
+		self.writer.write_all(&buf[..])?;
+		self.offset += buf.len();
 		self.writer.flush()?;
 		Ok(self.offset)
 	}
