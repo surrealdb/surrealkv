@@ -229,6 +229,14 @@ pub struct Options {
 	/// Should be >= level0_max_files (compaction trigger).
 	/// Default: 12 (3x level0_max_files)
 	pub l0_stall_threshold: usize,
+
+	/// If true, disables write-stall backpressure entirely: `check()` becomes a
+	/// no-op and writes never block on immutable-memtable / L0-file counts.
+	///
+	/// This is a benchmarking / diagnostic knob — with stalls off, immutable
+	/// memtables and L0 files can grow unbounded if background flush/compaction
+	/// cannot keep up, trading bounded memory for no backpressure. Default: false.
+	pub disable_write_stall: bool,
 }
 
 impl Default for Options {
@@ -267,6 +275,7 @@ impl Default for Options {
 			level_multiplier: 10.0,
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
+			disable_write_stall: false,
 		}
 	}
 }
@@ -479,6 +488,13 @@ impl Options {
 	/// Sets the number of L0 files that triggers write stall.
 	pub const fn with_l0_stall_threshold(mut self, value: usize) -> Self {
 		self.l0_stall_threshold = value;
+		self
+	}
+
+	/// Disables write-stall backpressure entirely (benchmarking / diagnostic
+	/// knob). See [`Options::disable_write_stall`].
+	pub const fn with_write_stall_disabled(mut self, value: bool) -> Self {
+		self.disable_write_stall = value;
 		self
 	}
 

@@ -1170,9 +1170,10 @@ impl Core {
 			memtable_limit: opts.memtable_stall_threshold,
 			l0_file_limit: opts.l0_stall_threshold,
 		};
-		let write_stall = Arc::new(crate::stall::WriteStallController::new(
+		let write_stall = Arc::new(crate::stall::WriteStallController::with_disabled(
 			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
 			thresholds,
+			opts.disable_write_stall,
 		));
 
 		// Initialize background task manager

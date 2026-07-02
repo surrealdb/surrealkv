@@ -70,10 +70,25 @@ pub struct WriteStallController {
 
 	/// Static thresholds configured at startup
 	thresholds: StallThresholds,
+
+	/// If true, `check()` is a no-op and writes never stall (benchmarking /
+	/// diagnostic knob; see `Options::disable_write_stall`).
+	disabled: bool,
 }
 
 impl WriteStallController {
+	/// Convenience constructor with stalls enabled (used by tests). Production
+	/// uses [`WriteStallController::with_disabled`] to honor the config knob.
+	#[allow(dead_code)]
 	pub fn new(provider: Arc<dyn WriteStallCountProvider>, thresholds: StallThresholds) -> Self {
+		Self::with_disabled(provider, thresholds, false)
+	}
+
+	pub fn with_disabled(
+		provider: Arc<dyn WriteStallCountProvider>,
+		thresholds: StallThresholds,
+		disabled: bool,
+	) -> Self {
 		Self {
 			stall_cleared: Condvar::new(),
 			stall_mutex: Mutex::new(()),
@@ -81,6 +96,7 @@ impl WriteStallController {
 			shutdown: AtomicBool::new(false),
 			provider,
 			thresholds,
+			disabled,
 		}
 	}
 
@@ -98,6 +114,12 @@ impl WriteStallController {
 	/// check. Per tokio docs: "The Notified future is guaranteed to receive
 	/// wakeups from notify_waiters() as soon as it has been created."
 	pub fn check(&self) -> Result<Option<WriteStallInfo>> {
+		// Disabled: write-stall backpressure is off entirely (no count read, no
+		// lock). Writes never block here regardless of memtable / L0 pressure.
+		if self.disabled {
+			return Ok(None);
+		}
+
 		// Fast path: not stalled — return without taking the lock (the common case).
 		let counts = self.provider.get_stall_counts();
 		if counts.immutable_memtables < self.thresholds.memtable_limit
