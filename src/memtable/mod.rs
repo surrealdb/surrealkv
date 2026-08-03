@@ -351,9 +351,11 @@ impl MemTable {
 			vlog.sync()?;
 		}
 
-		let file = crate::vfs::open_for_sync(&table_file_path)?;
-		file.sync_all()?;
-		let file: Arc<dyn File> = Arc::new(file);
+		// Durability fix: the SST's data and its directory entry must be
+		// durable before the manifest references this table.
+		crate::vfs::fsync_file(&table_file_path)?;
+		crate::lsm::fsync_directory(lsm_opts.sstable_dir())?;
+		let file: Arc<dyn File> = Arc::new(SysFile::open(&table_file_path)?);
 		let file_size = file.size()?;
 
 		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);

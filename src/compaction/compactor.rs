@@ -208,6 +208,15 @@ impl Compactor {
 		}
 
 		writer.finish()?;
+
+		// Durability fix: the SST's data and its directory entry must be
+		// durable BEFORE the manifest (fsynced in update_manifest) references
+		// this table. Otherwise a power loss after the manifest commit leaves
+		// a durable manifest pointing at a zero-byte table, with the merged
+		// inputs already deleted (surrealdb/surrealdb#7426).
+		crate::vfs::fsync_file(path)?;
+		crate::lsm::fsync_directory(self.options.lopts.sstable_dir())?;
+
 		Ok(true)
 	}
 
