@@ -243,3 +243,46 @@ pub fn open_for_sync<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<SysF
 		SysFile::open(path)
 	}
 }
+
+/// Fsyncs an existing file's data and metadata to disk (durability barrier).
+///
+/// Uses `sync_all` deliberately: readers depend on the durable file *size*
+/// (e.g. SST footers are located relative to the end of the file), so syncing
+/// data alone is not enough.
+pub(crate) fn fsync_file<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<()> {
+	let file = open_for_sync(&path)?;
+	file.sync_all()?;
+	#[cfg(test)]
+	sync_tracker::record(path.as_ref());
+	Ok(())
+}
+
+/// Test-only ledger of files made durable via [`fsync_file`].
+///
+/// Lets crash-consistency tests simulate power loss faithfully: files NOT in
+/// the ledger may legally lose their data (truncate to 0), while files in it
+/// must survive intact.
+#[cfg(test)]
+pub(crate) mod sync_tracker {
+	use std::collections::HashSet;
+	use std::path::{Path, PathBuf};
+	use std::sync::{LazyLock, Mutex};
+
+	static SYNCED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+
+	// Canonicalize symmetrically in record() and was_synced(): on macOS,
+	// temp dirs under /var/folders canonicalize to /private/var/folders, so
+	// one-sided canonicalization would make lookups miss.
+	fn key(path: &Path) -> PathBuf {
+		path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+	}
+
+	pub(crate) fn record(path: &Path) {
+		SYNCED.lock().unwrap().insert(key(path));
+	}
+
+	#[cfg(test)]
+	pub(crate) fn was_synced(path: &Path) -> bool {
+		SYNCED.lock().unwrap().contains(&key(path))
+	}
+}
