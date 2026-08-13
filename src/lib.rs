@@ -189,7 +189,7 @@ pub struct Options {
 	/// If true, flush active memtable to SSTable during shutdown.
 	/// If false, skip flush for faster shutdown.
 	///
-	/// DEFAULT: false
+	/// DEFAULT: true
 	pub flush_on_close: bool,
 
 	// WAL recovery configuration

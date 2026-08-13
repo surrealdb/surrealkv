@@ -615,6 +615,11 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 	let updated_file = crate::vfs::open_for_sync(target_path)?;
 	updated_file.sync_all()?;
 
+	// Make the rename itself durable: without a parent-directory fsync, a
+	// crash can revert the directory entry to the old file even though the
+	// new content was synced.
+	crate::lsm::fsync_directory(directory)?;
+
 	Ok(())
 }
 
