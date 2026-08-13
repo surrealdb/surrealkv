@@ -10,16 +10,8 @@ use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::{
-	BytewiseComparator,
-	Comparator,
-	InternalKey,
-	InternalKeyComparator,
-	InternalKeyKind,
-	InternalKeyRange,
-	InternalKeyRef,
-	LSMIterator,
-	TimestampComparator,
-	Value,
+	BytewiseComparator, Comparator, InternalKey, InternalKeyComparator, InternalKeyKind,
+	InternalKeyRange, InternalKeyRef, LSMIterator, TimestampComparator, Value,
 };
 
 // ===== Snapshot Tracker =====
@@ -339,7 +331,7 @@ impl Snapshot {
 					// Key was deleted at this timestamp
 					best_value = None;
 				} else {
-					best_value = Some(self.core.resolve_value(iter.value_encoded()?)?);
+					best_value = Some(iter.value_encoded()?.to_vec());
 				}
 				best_timestamp = entry_ts;
 			}

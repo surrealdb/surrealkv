@@ -501,11 +501,7 @@ impl Transaction {
 
 		// The value is not in the write set, so attempt to get it from the snapshot.
 		match self.snapshot.as_ref().unwrap().get(key.as_slice())? {
-			Some(val) => {
-				// Resolve the value reference through VLog if needed
-				let resolved_value = self.core.resolve_value(&val.0)?;
-				Ok(Some(resolved_value))
-			}
+			Some(val) => Ok(Some(val.0)),
 			None => Ok(None),
 		}
 	}
@@ -523,7 +519,7 @@ impl Transaction {
 	///
 	/// # Example
 	/// ```ignore
-	/// 
+	///
 	/// let mut iter = tx.range(b"a", b"z")?;
 	/// iter.seek_first()?;
 	/// while iter.valid() {
@@ -555,7 +551,7 @@ impl Transaction {
 	pub fn range_with_options(&self, options: &ReadOptions) -> Result<impl LSMIterator + '_> {
 		let start_key = options.lower_bound.clone().unwrap_or_default();
 		let end_key = options.upper_bound.clone().unwrap_or_default();
-		TransactionRangeIterator::new_with_options(self, Arc::clone(&self.core), start_key, end_key)
+		TransactionRangeIterator::new_with_options(self, start_key, end_key)
 	}
 
 	/// Returns a history iterator over ALL versions of keys in the range.
@@ -657,7 +653,6 @@ impl Transaction {
 
 		Ok(TransactionHistoryIterator::new(
 			inner,
-			Arc::clone(&self.core),
 			write_set_entries,
 			hard_delete_keys,
 			opts.include_tombstones,
@@ -946,9 +941,6 @@ pub(crate) struct TransactionRangeIterator<'a> {
 	/// Snapshot iterator (implements LSMIterator)
 	snapshot_iter: SnapshotIterator<'a>,
 
-	/// Core for resolving VLog references to actual values.
-	core: Arc<Core>,
-
 	/// Write-set entries for the range (collected, filtered for tombstones on access)
 	write_set_entries: Vec<(&'a Key, &'a Entry)>,
 
@@ -976,7 +968,6 @@ impl<'a> TransactionRangeIterator<'a> {
 	/// Creates a new range iterator with custom read options
 	pub(crate) fn new_with_options(
 		tx: &'a Transaction,
-		core: Arc<Core>,
 		start_key: Vec<u8>,
 		end_key: Vec<u8>,
 	) -> Result<Self> {
@@ -1009,7 +1000,6 @@ impl<'a> TransactionRangeIterator<'a> {
 
 		Ok(Self {
 			snapshot_iter,
-			core,
 			write_set_entries,
 			ws_pos: None,
 			is_key_equal: false,
@@ -1371,11 +1361,7 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 	fn value(&self) -> Result<Value> {
 		debug_assert!(self.valid());
 		let raw = self.value_encoded()?;
-		if self.current_source == CurrentSource::WriteSet {
-			Ok(raw.to_vec())
-		} else {
-			self.core.resolve_value(raw)
-		}
+		Ok(raw.to_vec())
 	}
 }
 
@@ -1477,9 +1463,6 @@ pub(crate) struct TransactionHistoryIterator<'a> {
 	/// Already sorted by (user_key ASC, timestamp DESC).
 	inner: HistoryIterator<'a>,
 
-	/// Core for resolving VLog references to actual values.
-	core: Arc<Core>,
-
 	// === RYOW (Read Your Own Writes) fields ===
 	/// Write-set entries for the range, sorted by key.
 	/// These are the transaction's uncommitted writes that should be
@@ -1551,20 +1534,17 @@ impl<'a> TransactionHistoryIterator<'a> {
 	/// # Arguments
 	///
 	/// * `inner` - The underlying snapshot history iterator
-	/// * `core` - Core for VLog value resolution
 	/// * `write_set_entries` - Transaction's uncommitted writes, sorted by key
 	/// * `hard_delete_keys` - Keys to completely erase from history
 	/// * `include_tombstones` - Whether to return tombstone entries
 	pub(crate) fn new(
 		inner: HistoryIterator<'a>,
-		core: Arc<Core>,
 		write_set_entries: Vec<(&'a Key, &'a Entry)>,
 		hard_delete_keys: std::collections::HashSet<&'a [u8]>,
 		include_tombstones: bool,
 	) -> Self {
 		Self {
 			inner,
-			core,
 			write_set_entries,
 			hard_delete_keys,
 			ws_pos: None,
@@ -2117,7 +2097,7 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 
 	/// Returns the current raw value as a byte slice.
 	///
-	/// For snapshot entries, may be a VLog reference requiring resolution.
+	/// Snapshot and write-set entries both contain raw inline values.
 	/// For write-set entries, returns the direct value bytes.
 	fn value_encoded(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
@@ -2134,10 +2114,6 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 	fn value(&self) -> Result<Value> {
 		debug_assert!(self.valid());
 		let raw = self.value_encoded()?;
-		if self.current_source == CurrentSource::WriteSet {
-			Ok(raw.to_vec())
-		} else {
-			self.core.resolve_value(raw)
-		}
+		Ok(raw.to_vec())
 	}
 }

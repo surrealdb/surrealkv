@@ -1,15 +1,13 @@
 use integer_encoding::{VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
-use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
 use crate::{InternalKeyKind, Key, Value};
 
 pub(crate) const MAX_BATCH_SIZE: u64 = 1 << 32;
-/// Batch encoding version. v2 encodes `starting_seq_num` as a fixed-width
-/// 8-byte LE value (instead of v1's varint) so the commit pipeline can
-/// pre-encode a batch off the write lock and stamp the real seq in place
-/// under the lock — see `Batch::patch_encoded_seq`. `decode` still reads v1.
-pub(crate) const BATCH_VERSION: u8 = 2;
+/// Inline-only batch encoding version. The sequence number is fixed-width so
+/// the commit pipeline can stamp it in place. Earlier, incompatible layouts
+/// are intentionally rejected.
+pub(crate) const BATCH_VERSION: u8 = 3;
 /// Represents a single entry in a batch
 #[derive(Debug, Clone)]
 pub(crate) struct BatchEntry {
@@ -23,8 +21,6 @@ pub(crate) struct BatchEntry {
 pub(crate) struct Batch {
 	pub(crate) version: u8,
 	pub(crate) entries: Vec<BatchEntry>,
-	pub(crate) valueptrs: Vec<Option<ValuePointer>>, /* Parallel array to entries, None for
-	                                                  * inline values */
 	// The WAL log sequence number assigned to the first entry in this batch.
 	// Stamped by `CommitPipeline::commit` under `write_mutex` after the
 	// oracle has validated the write set. Constructed with `0` by callers;
@@ -43,7 +39,6 @@ impl Batch {
 	pub(crate) fn new(starting_seq_num: u64) -> Self {
 		Self {
 			entries: Vec::new(),
-			valueptrs: Vec::new(),
 			version: BATCH_VERSION,
 			starting_seq_num,
 			size: 0,
@@ -57,7 +52,6 @@ impl Batch {
 		}
 		self.size += record_size;
 		self.entries.reserve(1);
-		self.valueptrs.reserve(1);
 		Ok(())
 	}
 
@@ -95,30 +89,17 @@ impl Batch {
 			encoded.write_varint(entry.timestamp)?;
 		}
 
-		// Write value pointers
-		for valueptr in &self.valueptrs {
-			match valueptr {
-				Some(ptr) => {
-					encoded.push(1); // Has pointer
-					encoded.extend_from_slice(&ptr.encode());
-				}
-				None => {
-					encoded.push(0); // No pointer (inline value)
-				}
-			}
-		}
-
 		Ok(encoded)
 	}
 
-	/// Stamp the commit sequence number into an already-encoded (v2+) batch
+	/// Stamp the commit sequence number into an already-encoded batch
 	/// buffer, in place. `encode` writes the seq as 8 fixed-width LE bytes at
 	/// offset `[1..9]` (right after the 1-byte version), so the commit pipeline
 	/// can pre-encode a batch off the write lock with a placeholder seq and then
 	/// stamp the real seq under the lock with no re-encode and no copy.
 	pub(crate) fn patch_encoded_seq(buf: &mut [u8], seq: u64) {
 		debug_assert!(buf.len() >= 9, "encoded batch too short to patch seq");
-		debug_assert!(buf[0] >= 2, "patch_encoded_seq requires batch version >= 2");
+		debug_assert_eq!(buf[0], BATCH_VERSION, "unexpected batch version");
 		buf[1..9].copy_from_slice(&seq.to_le_bytes());
 	}
 
@@ -132,15 +113,26 @@ impl Batch {
 		self.add_record(InternalKeyKind::Delete, key, None, timestamp)
 	}
 
-	/// Internal method to add a record with optional value pointer
-	fn add_record_internal(
+	pub(crate) fn add_record(
 		&mut self,
 		kind: InternalKeyKind,
 		key: Key,
 		value: Option<Value>,
-		valueptr: Option<ValuePointer>,
 		timestamp: u64,
 	) -> Result<()> {
+		let requires_value = matches!(
+			kind,
+			InternalKeyKind::Set
+				| InternalKeyKind::Merge
+				| InternalKeyKind::LogData
+				| InternalKeyKind::Replace
+		);
+		if requires_value != value.is_some() {
+			return Err(Error::InvalidArgument(format!(
+				"invalid value presence for batch record kind {kind:?}"
+			)));
+		}
+
 		let key_len = key.len();
 		let value_len = value.as_ref().map_or(0, |v| v.len());
 
@@ -162,19 +154,8 @@ impl Batch {
 		};
 
 		self.entries.push(entry);
-		self.valueptrs.push(valueptr);
 
 		Ok(())
-	}
-
-	pub(crate) fn add_record(
-		&mut self,
-		kind: InternalKeyKind,
-		key: Key,
-		value: Option<Value>,
-		timestamp: u64,
-	) -> Result<()> {
-		self.add_record_internal(kind, key, value, None, timestamp)
 	}
 
 	pub(crate) fn count(&self) -> u32 {
@@ -197,7 +178,6 @@ impl Batch {
 			.sum()
 	}
 
-	/// Get entries for VLog processing
 	#[cfg(test)]
 	pub(crate) fn entries(&self) -> &[BatchEntry] {
 		&self.entries
@@ -239,28 +219,19 @@ impl Batch {
 		// Read version
 		let version = data[pos];
 		pos += 1;
-		// Accept v1 (varint seq) for replaying pre-upgrade WAL segments and the
-		// current version (fixed-width seq). Reject anything else.
-		if version != 1 && version != BATCH_VERSION {
+		// The inline-value format intentionally rejects older batch versions.
+		// Old stores require an explicit external migration.
+		if version != BATCH_VERSION {
 			return Err(Error::InvalidBatchRecord);
 		}
 
-		// Read sequence number. v2+ is fixed-width 8-byte LE; v1 was a varint.
-		let seq_num = if version >= 2 {
-			if data.len() < pos + 8 {
-				return Err(Error::InvalidBatchRecord);
-			}
-			let seq = u64::from_le_bytes(
-				data[pos..pos + 8].try_into().map_err(|_| Error::InvalidBatchRecord)?,
-			);
-			pos += 8;
-			seq
-		} else {
-			let (seq, bytes_read) =
-				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
-			pos += bytes_read;
-			seq
-		};
+		if data.len() < pos + 8 {
+			return Err(Error::InvalidBatchRecord);
+		}
+		let seq_num = u64::from_le_bytes(
+			data[pos..pos + 8].try_into().map_err(|_| Error::InvalidBatchRecord)?,
+		);
+		pos += 8;
 
 		// Read count
 		let (count, bytes_read) = u32::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
@@ -292,6 +263,14 @@ impl Batch {
 				let value_data = data[pos..pos + value_len as usize].to_vec();
 				pos += value_len as usize;
 				Some(value_data)
+			} else if matches!(
+				kind,
+				InternalKeyKind::Set
+					| InternalKeyKind::Merge
+					| InternalKeyKind::LogData
+					| InternalKeyKind::Replace
+			) {
+				Some(Vec::new())
 			} else {
 				None
 			};
@@ -309,25 +288,13 @@ impl Batch {
 			});
 		}
 
-		// Read value pointers
-		let mut valueptrs = Vec::with_capacity(count as usize);
-		for _ in 0..count {
-			let has_pointer = data[pos];
-			pos += 1;
-			let valueptr = if has_pointer == 1 {
-				let ptr_data = &data[pos..pos + VALUE_POINTER_SIZE];
-				pos += VALUE_POINTER_SIZE;
-				Some(ValuePointer::decode(ptr_data)?)
-			} else {
-				None
-			};
-			valueptrs.push(valueptr);
+		if pos != data.len() {
+			return Err(Error::InvalidBatchRecord);
 		}
 
 		Ok(Self {
 			version,
 			entries,
-			valueptrs,
 			starting_seq_num: seq_num,
 			size: 0, // Decoded batches don't track size
 		})

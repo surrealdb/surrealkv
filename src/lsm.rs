@@ -20,19 +20,9 @@ use crate::sstable::table::Table;
 use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
-use crate::vlog::{VLog, ValueLocation};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
-use crate::{
-	Comparator,
-	Error,
-	FilterPolicy,
-	LSMIterator,
-	Options,
-	VLogChecksumLevel,
-	Value,
-	WalRecoveryMode,
-};
+use crate::{Comparator, Error, FilterPolicy, LSMIterator, Options, WalRecoveryMode};
 
 // ===== Compaction Operations Trait =====
 /// Defines the compaction operations that can be performed on an LSM tree.
@@ -125,9 +115,6 @@ pub(crate) struct CoreInner {
 	/// advance faster than snapshot retention permits.
 	pub(crate) active_txn_tracker: Arc<crate::tracker::ActiveTxnTracker>,
 
-	/// Value Log (VLog)
-	pub(crate) vlog: Option<Arc<VLog>>,
-
 	/// Write-Ahead Log (WAL) for durability
 	pub(crate) wal: WalManager,
 
@@ -174,12 +161,6 @@ impl CoreInner {
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
-		let vlog = if opts.enable_vlog {
-			Some(Arc::new(VLog::new(Arc::clone(&opts))?))
-		} else {
-			None
-		};
-
 		Ok(Self {
 			opts,
 			active_memtable,
@@ -187,7 +168,6 @@ impl CoreInner {
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
 			active_txn_tracker: Arc::new(crate::tracker::ActiveTxnTracker::new()),
-			vlog,
 			wal: WalManager::new(wal_instance),
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
@@ -250,20 +230,10 @@ impl CoreInner {
 		table_id: u64,
 		wal_number: u64,
 	) -> Result<Arc<Table>> {
-		// Step 1: Flush memtable to SST (with VLog separation for large values)
-		let table = memtable
-			.flush(
-				table_id,
-				Arc::clone(&self.opts),
-				self.vlog.as_ref(),
-				self.opts.vlog_value_threshold,
-			)
-			.map_err(|e| {
-				Error::Other(format!(
-					"Failed to flush memtable to SST table_id={}: {}",
-					table_id, e
-				))
-			})?;
+		// Step 1: Flush the inline-value memtable to an SST.
+		let table = memtable.flush(table_id, Arc::clone(&self.opts)).map_err(|e| {
+			Error::Other(format!("Failed to flush memtable to SST table_id={}: {}", table_id, e))
+		})?;
 
 		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
@@ -311,10 +281,6 @@ impl CoreInner {
 			wal_number + 1,
 			manifest.get_last_sequence()
 		);
-
-		// After successful manifest commit, cleanup obsolete vlog files
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-		cleanup_obsolete_vlog(&self.vlog, min_oldest_vlog, "flush");
 
 		Ok(table)
 	}
@@ -764,46 +730,6 @@ impl CoreInner {
 
 		Ok(())
 	}
-
-	/// Cleans up orphaned VLog files that are not referenced by any SST.
-	///
-	/// After a crash, there may be VLog files that:
-	/// 1. Were written but never referenced by an SST (write crashed before flush)
-	/// 2. Are no longer referenced because all referencing SSTs were compacted away
-	///
-	/// This method computes the minimum oldest_vlog_file_id across all live SSTs
-	/// and removes any VLog files below that threshold.
-	///
-	/// SAFETY: This must be called after manifest is loaded and SSTs are known.
-	fn cleanup_orphaned_vlog_files(&self) -> Result<()> {
-		if self.vlog.is_none() {
-			return Ok(()); // No VLog, nothing to clean up
-		}
-
-		let manifest = self.level_manifest.read()?;
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-
-		// If no SSTs reference VLog files yet, keep all files
-		// (This handles the fresh database case)
-		if min_oldest_vlog == 0 {
-			log::debug!("No SSTs with VLog references found, skipping VLog orphan cleanup");
-			return Ok(());
-		}
-
-		log::info!("Cleaning up orphaned VLog files below min_oldest_vlog={}", min_oldest_vlog);
-
-		// Use the consolidated cleanup helper
-		cleanup_obsolete_vlog(&self.vlog, min_oldest_vlog, "startup");
-
-		Ok(())
-	}
-
-	/// Resolves a value, checking if it's a VLog pointer and retrieving from
-	/// VLog if needed
-	pub(crate) fn resolve_value(&self, value: &[u8]) -> Result<Value> {
-		let location = ValueLocation::decode(value)?;
-		location.resolve_value(self.vlog.as_ref())
-	}
 }
 
 impl CompactionOperations for CoreInner {
@@ -870,35 +796,14 @@ impl LsmCommitEnv {
 }
 
 impl CommitEnv for LsmCommitEnv {
-	// Build the WAL-ready encoding OUTSIDE the commit write_mutex: wrap each
-	// value in a ValueLocation (inline; VLog separation is deferred to flush)
-	// and encode the batch. The seq is a placeholder (0) here — the per-entry
+	// Build the WAL-ready encoding OUTSIDE the commit write_mutex. Values stay
+	// inline. The seq is a placeholder (0) here — the per-entry
 	// bytes do not depend on it; only the fixed-width header does. The commit
 	// pipeline stamps the real seq in `write_prepared` via patch_encoded_seq.
-	fn pre_serialize(&self, batch: &Batch) -> Result<PreparedWrite> {
-		let mut processed_batch = Batch::new(0);
-
-		for entry in &batch.entries {
-			// Always store values inline — VLog separation deferred to flush.
-			let encoded_value = match &entry.value {
-				Some(value) => {
-					let value_location = ValueLocation::with_inline_value(value.clone());
-					Some(value_location.encode())
-				}
-				None => None,
-			};
-
-			processed_batch.add_record(
-				entry.kind,
-				entry.key.clone(),
-				encoded_value,
-				entry.timestamp,
-			)?;
-		}
-
-		let bytes = processed_batch.encode()?;
+	fn pre_serialize(&self, batch: Batch) -> Result<PreparedWrite> {
+		let bytes = batch.encode()?;
 		Ok(PreparedWrite {
-			processed_batch,
+			processed_batch: batch,
 			bytes,
 		})
 	}
@@ -906,12 +811,7 @@ impl CommitEnv for LsmCommitEnv {
 	// Stamp the allocated seq into the pre-encoded bytes (in place) and into the
 	// processed batch (consumed by `apply`), then append to the WAL. This is all
 	// that remains under write_mutex — no clone, no re-encode.
-	fn write_prepared(
-		&self,
-		prepared: &mut PreparedWrite,
-		seq_num: u64,
-		sync: bool,
-	) -> Result<()> {
+	fn write_prepared(&self, prepared: &mut PreparedWrite, seq_num: u64, sync: bool) -> Result<()> {
 		Batch::patch_encoded_seq(&mut prepared.bytes, seq_num);
 		prepared.processed_batch.set_starting_seq_num(seq_num);
 
@@ -1246,10 +1146,6 @@ impl Core {
 		// but BEFORE any new flushes that might create new SSTs
 		inner.cleanup_orphaned_sst_files()?;
 
-		// Clean up any orphaned VLog files that are no longer referenced by any SST
-		// SAFETY: This must happen AFTER manifest is loaded so we know which SSTs exist
-		inner.cleanup_orphaned_vlog_files()?;
-
 		// Trigger level compaction check at startup
 		task_manager.wake_up_level();
 
@@ -1277,18 +1173,12 @@ impl Core {
 		self.commit_pipeline.get_visible_seq_num()
 	}
 
-	/// Flushes WAL and VLog buffers to OS cache.
+	/// Flushes WAL buffers to OS cache.
 	///
 	/// If `sync` is true, also fsyncs to disk for durability.
 	/// This is safe to call concurrently with ongoing transactions.
 	///
-	/// # Order of Operations
-	///
-	/// VLog is flushed first (contains data referenced by WAL), then WAL.
-	/// This ensures that if WAL contains a ValuePointer, the referenced
-	/// VLog data is at least as durable.
 	pub(crate) fn flush_wal(&self, sync: bool) -> Result<()> {
-		// VLog is NOT synced here — VLog writes are deferred to memtable flush.
 		if sync {
 			self.wal.sync()?;
 		} else {
@@ -1331,13 +1221,6 @@ impl Core {
 			log::debug!("Stopping background task manager...");
 			task_manager.stop().await;
 			log::debug!("Background task manager stopped");
-		}
-
-		// Close the VLog if present
-		if let Some(ref vlog) = self.inner.vlog {
-			log::debug!("Closing VLog...");
-			vlog.close()?;
-			log::debug!("VLog closed");
 		}
 
 		// Step 3: Conditionally flush ALL memtables based on flush_on_close option
@@ -1448,11 +1331,6 @@ impl Tree {
 		create_dir_all(opts.sstable_dir())?;
 		create_dir_all(opts.wal_dir())?;
 		create_dir_all(opts.manifest_dir())?;
-
-		// Create VLog directories
-		if opts.enable_vlog {
-			create_dir_all(opts.vlog_dir())?;
-		}
 
 		Ok(())
 	}
@@ -1647,7 +1525,7 @@ impl Tree {
 		Ok(())
 	}
 
-	/// Flushes WAL and VLog buffers to OS cache.
+	/// Flushes WAL buffers to OS cache.
 	///
 	/// If `sync` is true, also fsyncs to disk, guaranteeing durability
 	/// of all previously committed transactions.
@@ -1769,7 +1647,7 @@ impl TreeBuilder {
 	}
 
 	/// Sets the unified block cache capacity (includes data blocks, index
-	/// blocks, and VLog values).
+	/// and index blocks).
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
 		self.opts = self.opts.with_block_cache_capacity(capacity_bytes);
 		self
@@ -1778,48 +1656,6 @@ impl TreeBuilder {
 	/// Sets the index partition size.
 	pub fn with_index_partition_size(mut self, size: usize) -> Self {
 		self.opts = self.opts.with_index_partition_size(size);
-		self
-	}
-
-	/// Sets the VLog maximum file size.
-	pub fn with_vlog_max_file_size(mut self, size: u64) -> Self {
-		self.opts = self.opts.with_vlog_max_file_size(size);
-		self
-	}
-
-	/// Sets the VLog checksum verification level.
-	pub fn with_vlog_checksum_verification(mut self, level: VLogChecksumLevel) -> Self {
-		self.opts = self.opts.with_vlog_checksum_verification(level);
-		self
-	}
-
-	/// Enables or disables VLog.
-	pub fn with_enable_vlog(mut self, enable: bool) -> Self {
-		self.opts = self.opts.with_enable_vlog(enable);
-		self
-	}
-
-	/// Sets the VLog value threshold in bytes.
-	///
-	/// Values smaller than this threshold are stored inline in SSTables.
-	/// Values larger than or equal to this threshold are stored in VLog files.
-	///
-	/// Default: 4096 (4KB)
-	///
-	/// # Example
-	///
-	/// ```no_run
-	/// use surrealkv::TreeBuilder;
-	///
-	/// let tree = TreeBuilder::new()
-	///     .with_path("./data".into())
-	///     .with_enable_vlog(true)
-	///     .with_vlog_value_threshold(8192) // 8KB threshold
-	///     .build()
-	///     .unwrap();
-	/// ```
-	pub fn with_vlog_value_threshold(mut self, value: usize) -> Self {
-		self.opts = self.opts.with_vlog_value_threshold(value);
 		self
 	}
 
@@ -1918,44 +1754,9 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 		))
 	})?;
 
-	// Sync VLog directories
-	if opts.enable_vlog {
-		fsync_directory(opts.vlog_dir()).map_err(|e| {
-			Error::Other(format!(
-				"Failed to sync VLog directory '{}': {}",
-				opts.vlog_dir().display(),
-				e
-			))
-		})?;
-	}
-
 	fsync_directory(&opts.path).map_err(|e| {
 		Error::Other(format!("Failed to sync base directory '{}': {}", opts.path.display(), e))
 	})?;
 
 	Ok(())
-}
-
-// ===== VLog Cleanup Helpers =====
-
-/// Cleans up obsolete VLog files that are no longer referenced by any SST.
-///
-/// This should be called after compaction, flush, or during startup recovery.
-///
-/// # Arguments
-/// * `vlog` - The VLog instance (if value separation is enabled)
-/// * `min_oldest_vlog` - Minimum oldest_vlog_file_id across all live SSTs
-/// * `context` - Description of the calling context (e.g., "flush", "compaction", "startup")
-pub(crate) fn cleanup_obsolete_vlog(vlog: &Option<Arc<VLog>>, min_oldest_vlog: u32, context: &str) {
-	// Skip cleanup if no SSTs reference VLog files yet (fresh database case)
-	if min_oldest_vlog == 0 {
-		return;
-	}
-
-	if let Some(ref vlog) = vlog {
-		if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
-			log::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);
-			// Don't propagate error - cleanup failures shouldn't fail the primary operation
-		}
-	}
 }

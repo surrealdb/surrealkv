@@ -84,19 +84,9 @@ use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
 use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
 use crate::sstable::meta::TableMetadata;
 use crate::vfs::File;
-use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{
-	Comparator,
-	CompressionType,
-	FilterPolicy,
-	InternalKey,
-	InternalKeyKind,
-	InternalKeyRange,
-	InternalKeyRef,
-	LSMIterator,
-	Options,
-	Value,
-	INTERNAL_KEY_SEQ_NUM_MAX,
+	Comparator, CompressionType, FilterPolicy, InternalKey, InternalKeyKind, InternalKeyRange,
+	InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX,
 	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 
@@ -154,13 +144,13 @@ pub enum ChecksumType {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum TableFormat {
-	LSMV1 = 1,
+	LSMV2 = 2,
 }
 
 impl TableFormat {
 	pub(crate) fn from_u8(val: u8) -> Result<Self> {
 		match val {
-			1 => Ok(TableFormat::LSMV1),
+			2 => Ok(TableFormat::LSMV2),
 			_ => Err(Error::InvalidTableFormat),
 		}
 	}
@@ -177,7 +167,7 @@ impl TableFormat {
 /// ```text
 /// Offset  Size  Field
 /// ------  ----  -----
-/// 0       1     Format version (1 = LSMV1)
+/// 0       1     Format version (2 = LSMV2)
 /// 1       1     Checksum type (1 = CRC32c)
 /// 2       16    Meta index block handle (varint encoded offset + size)
 /// 18      16    Index block handle (varint encoded offset + size)
@@ -204,7 +194,7 @@ impl Footer {
 		Footer {
 			meta_index: metaix,
 			index,
-			format: TableFormat::LSMV1,
+			format: TableFormat::LSMV2,
 			checksum: ChecksumType::CRC32c,
 		}
 	}
@@ -271,7 +261,7 @@ impl Footer {
 	/// Encodes the footer into a byte buffer.
 	pub(crate) fn encode(&self, dst: &mut [u8]) {
 		match self.format {
-			TableFormat::LSMV1 => {
+			TableFormat::LSMV2 => {
 				dst[..TABLE_FOOTER_LENGTH].fill(0);
 
 				// Format version (1 byte)
@@ -350,11 +340,6 @@ pub(crate) struct TableWriter<W: Write> {
 
 	/// Comparator for internal keys
 	internal_cmp: Arc<dyn Comparator>,
-
-	/// Minimum vlog file_id seen across all ValuePointers in this SST.
-	/// Used to track which vlog files this SST references.
-	/// None if no vlog pointers have been seen yet.
-	min_vlog_file_id: Option<u32>,
 }
 
 impl<W: Write> TableWriter<W> {
@@ -392,7 +377,6 @@ impl<W: Write> TableWriter<W> {
 			partitioned_index: IndexWriter::new(Arc::clone(&opts), opts.index_partition_size),
 			filter_block: fb,
 			internal_cmp: Arc::clone(&opts.internal_comparator) as Arc<dyn Comparator>,
-			min_vlog_file_id: None,
 		}
 	}
 
@@ -423,17 +407,6 @@ impl<W: Write> TableWriter<W> {
 				let mut filter_block = FilterBlockWriter::new(Arc::clone(filter_policy));
 				filter_block.start_block(0);
 				self.filter_block = Some(filter_block);
-			}
-		}
-
-		// Track minimum vlog file_id if value is a vlog pointer
-		if let Ok(location) = ValueLocation::decode(val) {
-			if location.is_value_pointer() {
-				if let Ok(pointer) = ValuePointer::decode(&location.value) {
-					let file_id = pointer.file_id;
-					self.min_vlog_file_id =
-						Some(self.min_vlog_file_id.map_or(file_id, |min| min.min(file_id)));
-				}
 			}
 		}
 
@@ -535,10 +508,6 @@ impl<W: Write> TableWriter<W> {
 
 		self.meta.properties.seqnos =
 			(self.meta.smallest_seq_num.unwrap_or(0), self.meta.largest_seq_num.unwrap_or(0));
-
-		// Store the minimum vlog file_id referenced by this SST.
-		// 0 means no vlog references (sentinel value).
-		self.meta.properties.oldest_vlog_file_id = self.min_vlog_file_id.unwrap_or(0) as u64;
 
 		// Flush last data block if it has entries
 		if self.data_block.as_ref().is_some_and(|db| db.entries() > 0) {

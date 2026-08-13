@@ -160,7 +160,6 @@ impl DatabaseCheckpoint {
 	/// - All SSTables from all levels
 	/// - Current WAL segments
 	/// - Level manifest
-	/// - VLog directories (if enabled)
 	/// - Checkpoint metadata
 	///
 	/// # Arguments
@@ -201,20 +200,17 @@ impl DatabaseCheckpoint {
 		// Step 6: Copy level manifest
 		let manifest_size = self.copy_level_manifest(checkpoint_path)?;
 
-		// Step 7: Copy VLog directories if enabled
-		let vlog_size = self.copy_vlog_directories(checkpoint_path)?;
-
-		// Step 8: Create checkpoint metadata
+		// Step 7: Create checkpoint metadata
 		let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
 		let metadata = CheckpointMetadata::new(
 			timestamp,
 			sequence_number,
 			sstable_count,
-			sstables_size + manifest_size + vlog_size,
+			sstables_size + manifest_size,
 		);
 
-		// Step 9: Write metadata file
+		// Step 8: Write metadata file
 		self.write_checkpoint_metadata(checkpoint_path, &metadata)?;
 
 		Ok(metadata)
@@ -257,9 +253,6 @@ impl DatabaseCheckpoint {
 			}
 			copy_dir_all(&manifest_source, &manifest_dest).map_err(|e| Error::Io(Arc::new(e)))?;
 		}
-
-		// Restore VLog directories if they exist in the checkpoint
-		self.restore_vlog_directories(checkpoint_path)?;
 
 		Ok(metadata)
 	}
@@ -352,61 +345,6 @@ impl DatabaseCheckpoint {
 		Ok(0)
 	}
 
-	/// Copies VLog-related directories to the checkpoint directory if VLog is
-	/// enabled
-	fn copy_vlog_directories(&self, dest_dir: &Path) -> Result<u64> {
-		if !self.core.opts.enable_vlog {
-			return Ok(0);
-		}
-
-		let mut total_size = 0u64;
-
-		// Copy VLog directory
-		let vlog_source = self.core.opts.vlog_dir();
-		let vlog_dest = dest_dir.join("vlog");
-		if vlog_source.exists() {
-			copy_dir_all(&vlog_source, &vlog_dest).map_err(|e| Error::Io(Arc::new(e)))?;
-			total_size += Self::calculate_directory_size(&vlog_dest)?;
-		}
-
-		Ok(total_size)
-	}
-
-	/// Calculates the total size of a directory recursively
-	fn calculate_directory_size(dir_path: &Path) -> Result<u64> {
-		let mut total_size = 0u64;
-
-		if let Ok(entries) = fs::read_dir(dir_path) {
-			for entry in entries.flatten() {
-				let entry_path = entry.path();
-				if entry_path.is_file() {
-					if let Ok(metadata) = entry_path.metadata() {
-						total_size += metadata.len();
-					}
-				} else if entry_path.is_dir() {
-					total_size += Self::calculate_directory_size(&entry_path)?;
-				}
-			}
-		}
-
-		Ok(total_size)
-	}
-
-	/// Restores VLog-related directories from the checkpoint
-	fn restore_vlog_directories(&self, checkpoint_path: &Path) -> Result<()> {
-		// Restore VLog directory
-		let vlog_source = checkpoint_path.join("vlog");
-		let vlog_dest = self.core.opts.vlog_dir();
-		if vlog_source.exists() {
-			if vlog_dest.exists() {
-				fs::remove_dir_all(&vlog_dest).map_err(|e| Error::Io(Arc::new(e)))?;
-			}
-			copy_dir_all(&vlog_source, &vlog_dest).map_err(|e| Error::Io(Arc::new(e)))?;
-		}
-
-		Ok(())
-	}
-
 	/// Writes checkpoint metadata to a file
 	fn write_checkpoint_metadata(
 		&self,
@@ -483,14 +421,6 @@ impl DatabaseCheckpoint {
 		let manifest_path = self.core.opts.manifest_dir();
 		if manifest_path.exists() {
 			fs::remove_dir_all(&manifest_path).map_err(|e| Error::Io(Arc::new(e)))?;
-		}
-
-		// Clear VLog directory if VLog is enabled
-		if self.core.opts.enable_vlog {
-			let vlog_dir = self.core.opts.vlog_dir();
-			if vlog_dir.exists() {
-				fs::remove_dir_all(&vlog_dir).map_err(|e| Error::Io(Arc::new(e)))?;
-			}
 		}
 
 		Ok(())

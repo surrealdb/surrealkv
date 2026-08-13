@@ -727,7 +727,7 @@ impl BlockIterator {
 
 		self.offset = key_end;
 
-		// Track value location
+		// Track the value's byte range in the block.
 		self.current_value_offset_start = self.offset;
 		self.current_value_offset_end = self.offset + value_size;
 		self.offset = value_end;

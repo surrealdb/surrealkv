@@ -11,12 +11,7 @@ use crate::sstable::table::{ChecksumType, Footer, IndexType, Table, TableFormat,
 use crate::test::{collect_all, collect_iter, count_iter};
 use crate::vfs::File;
 use crate::{
-	user_range_to_internal_range,
-	InternalKey,
-	InternalKeyKind,
-	LSMIterator,
-	Options,
-	Result,
+	user_range_to_internal_range, InternalKey, InternalKeyKind, LSMIterator, Options, Result,
 	INTERNAL_KEY_SEQ_NUM_MAX,
 };
 
@@ -45,8 +40,12 @@ fn test_footer() {
 	assert_eq!(f2.meta_index.size(), 4);
 	assert_eq!(f2.index.offset(), 55);
 	assert_eq!(f2.index.size(), 5);
-	assert_eq!(f2.format, TableFormat::LSMV1);
+	assert_eq!(f2.format, TableFormat::LSMV2);
 	assert_eq!(f2.checksum, ChecksumType::CRC32c);
+
+	let mut obsolete = buf;
+	obsolete[0] = 1;
+	assert!(Footer::decode(&obsolete).is_err());
 }
 
 #[test]
@@ -73,7 +72,7 @@ fn test_table_builder() {
 	}
 
 	let actual = b.finish().unwrap();
-	assert_eq!(724, actual);
+	assert_eq!(716, actual);
 }
 
 #[test]
@@ -4038,7 +4037,7 @@ fn test_table_properties_persistence() {
 
 	// Basic properties
 	assert_eq!(props.id, table_id, "Table ID should match");
-	assert_eq!(props.table_format, TableFormat::LSMV1, "Table format should be LSMV1");
+	assert_eq!(props.table_format, TableFormat::LSMV2, "Table format should be LSMV2");
 	assert_eq!(props.num_entries, 50, "Number of entries should be 50");
 	assert_eq!(props.item_count, 50, "Item count should be 50");
 	assert_eq!(props.key_count, 50, "Key count should be 50");

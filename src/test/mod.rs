@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 
 use crate::snapshot::SnapshotIterator;
-use crate::vlog::ValueLocation;
 use crate::{InternalKey, Key, LSMIterator, Result, Value};
 
 #[cfg(test)]
@@ -52,8 +51,6 @@ pub mod stall_tests;
 pub mod transaction_tests;
 #[cfg(test)]
 pub mod version_iterator_tests;
-#[cfg(test)]
-pub mod vlog_tests;
 #[cfg(test)]
 pub mod wal_tests;
 
@@ -123,14 +120,11 @@ fn collect_transaction_reverse(iter: &mut impl LSMIterator) -> Result<Vec<(Vec<u
 }
 
 /// Collects all entries from a SnapshotIterator starting from seek_first()
-/// Decodes ValueLocation encoding to return raw user values
 fn collect_snapshot_iter(iter: &mut SnapshotIterator) -> Result<Vec<(InternalKey, Vec<u8>)>> {
 	iter.seek_first()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let encoded_value = iter.value_encoded()?;
-		let decoded_value = ValueLocation::decode(encoded_value)?.value;
-		result.push((iter.key().to_owned(), decoded_value));
+		result.push((iter.key().to_owned(), iter.value_encoded()?.to_vec()));
 		if !iter.next()? {
 			break;
 		}
@@ -139,14 +133,11 @@ fn collect_snapshot_iter(iter: &mut SnapshotIterator) -> Result<Vec<(InternalKey
 }
 
 /// Collects entries from a SnapshotIterator in reverse order
-/// Decodes ValueLocation encoding to return raw user values
 fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(InternalKey, Vec<u8>)>> {
 	iter.seek_last()?;
 	let mut result = Vec::new();
 	while iter.valid() {
-		let encoded_value = iter.value_encoded()?;
-		let decoded_value = ValueLocation::decode(encoded_value)?.value;
-		result.push((iter.key().to_owned(), decoded_value));
+		result.push((iter.key().to_owned(), iter.value_encoded()?.to_vec()));
 		if !iter.prev()? {
 			break;
 		}

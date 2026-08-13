@@ -318,47 +318,23 @@ fn test_batch_version() {
 	let decoded_batch = Batch::decode(&encoded).unwrap();
 	assert_eq!(decoded_batch.starting_seq_num, 100);
 	assert_eq!(decoded_batch.version, BATCH_VERSION);
+
+	for obsolete_version in [1, 2] {
+		let mut obsolete = encoded.clone();
+		obsolete[0] = obsolete_version;
+		assert!(Batch::decode(&obsolete).is_err());
+	}
 }
 
 #[test]
 fn test_add_record_consistent_encoding() {
-	// Test that None and Some(&[]) now encode identically (both as value_len=0)
-	let mut batch_none = Batch::new(100);
-	batch_none.add_record(InternalKeyKind::Delete, b"test_key".to_vec(), None, 100).unwrap();
+	let mut invalid_delete = Batch::new(100);
+	assert!(invalid_delete
+		.add_record(InternalKeyKind::Delete, b"test_key".to_vec(), Some(Vec::new()), 100)
+		.is_err());
 
-	let mut batch_empty = Batch::new(100);
-	batch_empty
-		.add_record(InternalKeyKind::Delete, b"test_key".to_vec(), Some(vec![]), 100)
-		.unwrap();
-
-	let encoded_none = batch_none.encode().unwrap();
-	let encoded_empty = batch_empty.encode().unwrap();
-
-	// Now they should encode identically (both write value_len=0)
-	assert_eq!(encoded_none, encoded_empty, "None and Some(&[]) should now encode identically");
-
-	// Test reading them back - both should return None (since both encode as
-	// value_len=0)
-	let decoded_batch_none = Batch::decode(&encoded_none).unwrap();
-	assert_eq!(decoded_batch_none.starting_seq_num, 100);
-	let entries_none = decoded_batch_none.entries();
-	assert_eq!(entries_none.len(), 1);
-	assert_eq!(entries_none[0].kind, InternalKeyKind::Delete);
-	assert_eq!(entries_none[0].key, b"test_key");
-	assert!(entries_none[0].value.is_none(), "None encodes as value_len=0, reads back as None");
-	assert_eq!(entries_none[0].timestamp, 100);
-
-	let decoded_batch_empty = Batch::decode(&encoded_empty).unwrap();
-	assert_eq!(decoded_batch_empty.starting_seq_num, 100);
-	let entries_empty = decoded_batch_empty.entries();
-	assert_eq!(entries_empty.len(), 1);
-	assert_eq!(entries_empty[0].kind, InternalKeyKind::Delete);
-	assert_eq!(entries_empty[0].key, b"test_key");
-	assert!(
-		entries_empty[0].value.is_none(),
-		"Some(&[]) also encodes as value_len=0, reads back as None"
-	);
-	assert_eq!(entries_empty[0].timestamp, 100);
+	let mut invalid_set = Batch::new(100);
+	assert!(invalid_set.add_record(InternalKeyKind::Set, b"test_key".to_vec(), None, 100).is_err());
 
 	// Test with different operation types to ensure they all work
 	let mut batch_merge = Batch::new(300);
@@ -399,11 +375,20 @@ fn test_add_record_consistent_encoding() {
 }
 
 #[test]
+fn test_empty_set_value_roundtrips_without_a_value_prefix() {
+	let mut batch = Batch::new(7);
+	batch.set(b"empty".to_vec(), Vec::new(), 11).unwrap();
+
+	let decoded = Batch::decode(&batch.encode().unwrap()).unwrap();
+	assert_eq!(decoded.entries()[0].value, Some(Vec::new()));
+}
+
+#[test]
 fn test_batch_encode_decode() {
 	// Create a batch with all possible variations
 	let mut batch = Batch::new(12345);
 
-	// Add various types of records with different value pointer scenarios
+	// Add all supported value-presence scenarios.
 	batch.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 1).unwrap();
 	batch.add_record(InternalKeyKind::Delete, b"key2".to_vec(), None, 2).unwrap();
 	batch
@@ -413,7 +398,7 @@ fn test_batch_encode_decode() {
 	batch
 		.add_record(InternalKeyKind::Set, b"key4".to_vec(), Some(b"large_value".to_vec()), 4)
 		.unwrap();
-	batch.add_record(InternalKeyKind::Set, b"key5".to_vec(), None, 5).unwrap();
+	batch.add_record(InternalKeyKind::Set, b"key5".to_vec(), Some(Vec::new()), 5).unwrap();
 	batch.add_record(InternalKeyKind::Delete, b"key6".to_vec(), None, 6).unwrap();
 
 	// Add some edge cases
@@ -483,7 +468,7 @@ fn test_batch_encode_decode() {
 	assert_eq!(entries[2].value.as_ref().unwrap().as_slice(), b"merge_value");
 	assert_eq!(entries[2].timestamp, 3);
 
-	// Check entries with value pointers
+	// Check additional value entries.
 	assert_eq!(entries[3].kind, InternalKeyKind::Set);
 	assert_eq!(entries[3].key.as_slice(), b"key4");
 	assert_eq!(entries[3].value.as_ref().unwrap().as_slice(), b"large_value");
@@ -491,7 +476,7 @@ fn test_batch_encode_decode() {
 
 	assert_eq!(entries[4].kind, InternalKeyKind::Set);
 	assert_eq!(entries[4].key.as_slice(), b"key5");
-	assert!(entries[4].value.is_none());
+	assert_eq!(entries[4].value, Some(Vec::new()));
 	assert_eq!(entries[4].timestamp, 5);
 
 	assert_eq!(entries[5].kind, InternalKeyKind::Delete);
@@ -507,14 +492,12 @@ fn test_batch_encode_decode() {
 
 	assert_eq!(entries[7].kind, InternalKeyKind::Set);
 	assert_eq!(entries[7].key.as_slice(), b"empty_value_key");
-	// Empty string values decode as None (this is the intended behavior)
-	assert!(entries[7].value.is_none());
+	assert_eq!(entries[7].value, Some(Vec::new()));
 	assert_eq!(entries[7].timestamp, 8);
 
 	assert_eq!(entries[8].kind, InternalKeyKind::Set);
 	assert_eq!(entries[8].key.as_slice(), b"");
-	// Empty string values decode as None (this is the intended behavior)
-	assert!(entries[8].value.is_none());
+	assert_eq!(entries[8].value, Some(Vec::new()));
 	assert_eq!(entries[8].timestamp, 9);
 
 	// Check unicode entries
@@ -527,9 +510,6 @@ fn test_batch_encode_decode() {
 	assert_eq!(entries[10].key.as_slice(), "こんにちは".as_bytes());
 	assert_eq!(entries[10].value.as_ref().unwrap().as_slice(), "世界".as_bytes());
 	assert_eq!(entries[10].timestamp, 11);
-
-	// Verify value pointers are preserved correctly
-	assert_eq!(decoded_batch.entries.len(), decoded_batch.valueptrs.len());
 
 	// Test sequence number iteration
 	let entries_with_seq_nums: Vec<_> = decoded_batch.entries_with_seq_nums().unwrap().collect();

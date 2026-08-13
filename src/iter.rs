@@ -631,7 +631,6 @@ impl LSMIterator for MergingIterator<'_> {
 // 1. Merges data from multiple levels
 // 2. Removes old versions of keys (keeps only latest)
 // 3. Removes deleted keys (tombstones) when safe
-// 4. Tracks garbage for Value Log cleanup
 //
 // ## How it Works
 //

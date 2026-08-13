@@ -6,12 +6,11 @@ use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
-use crate::lsm::{cleanup_obsolete_vlog, CoreInner};
+use crate::lsm::CoreInner;
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
-use crate::vlog::VLog;
 use crate::{Comparator, Options as LSMOptions};
 
 /// RAII guard to ensure tables are unhidden if compaction fails
@@ -50,7 +49,6 @@ pub(crate) struct CompactionOptions {
 	pub(crate) lopts: Arc<LSMOptions>,
 	pub(crate) level_manifest: Arc<RwLock<LevelManifest>>,
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
-	pub(crate) vlog: Option<Arc<VLog>>,
 	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
 	/// Snapshot tracker for snapshot-aware compaction.
 	///
@@ -66,7 +64,6 @@ impl CompactionOptions {
 			lopts: Arc::clone(&tree.opts),
 			level_manifest: Arc::clone(&tree.level_manifest),
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
-			vlog: tree.vlog.clone(),
 			error_handler: Arc::clone(&tree.error_handler),
 			snapshot_tracker: tree.snapshot_tracker.clone(),
 		}
@@ -264,10 +261,6 @@ impl Compactor {
 
 		// Commit guard - tables are now properly handled in manifest
 		guard.commit();
-
-		// After successful manifest commit, cleanup obsolete vlog files
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-		cleanup_obsolete_vlog(&self.options.vlog, min_oldest_vlog, "compaction");
 
 		Ok(())
 	}

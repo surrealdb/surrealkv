@@ -7,11 +7,8 @@ use test_log::test;
 
 use crate::lsm::Tree;
 use crate::test::{
-	collect_history_all,
-	collect_transaction_all,
-	collect_transaction_reverse,
-	point_in_time_from_history,
-	KeyVersionsMap,
+	collect_history_all, collect_transaction_all, collect_transaction_reverse,
+	point_in_time_from_history, KeyVersionsMap,
 };
 use crate::transaction::HistoryOptions;
 use crate::{Error, Key, LSMIterator, Mode, Options, TreeBuilder, WriteOptions};
@@ -975,100 +972,6 @@ async fn test_keys_method() {
 			.collect();
 
 		assert!(!key_names.contains(&"key3".to_string()), "key3 should be removed");
-	}
-}
-
-#[test(tokio::test)]
-async fn test_range_value_pointer_resolution_bug() {
-	let temp_dir = create_temp_directory();
-
-	let tree = TreeBuilder::new()
-		.with_path(temp_dir.path().to_path_buf())
-		.with_max_memtable_size(64 * 1024)
-		.build()
-		.unwrap();
-
-	// Create values that will be stored in VLog (> 50 bytes)
-	let key1 = b"key1";
-	let key2 = b"key2";
-	let key3 = b"key3";
-
-	let large_value1 = "X".repeat(100); // > 50 bytes, goes to VLog
-	let large_value2 = "Y".repeat(100); // > 50 bytes, goes to VLog
-	let large_value3 = "Z".repeat(100); // > 50 bytes, goes to VLog
-
-	// Insert the values
-	{
-		let mut txn = tree.begin().unwrap();
-		txn.set(key1, large_value1.as_bytes()).unwrap();
-		txn.set(key2, large_value2.as_bytes()).unwrap();
-		txn.set(key3, large_value3.as_bytes()).unwrap();
-		txn.commit().await.unwrap();
-	}
-
-	// Force flush to ensure data goes to SSTables (and VLog)
-	tree.flush().unwrap();
-
-	// Test 1: Verify get() works correctly
-	{
-		let txn = tree.begin().unwrap();
-
-		let retrieved1 = txn.get(key1).unwrap().unwrap();
-		let retrieved2 = txn.get(key2).unwrap().unwrap();
-		let retrieved3 = txn.get(key3).unwrap().unwrap();
-
-		assert_eq!(
-			retrieved1.as_slice(),
-			large_value1.as_bytes(),
-			"get() should resolve value pointers correctly"
-		);
-		assert_eq!(
-			retrieved2.as_slice(),
-			large_value2.as_bytes(),
-			"get() should resolve value pointers correctly"
-		);
-		assert_eq!(
-			retrieved3.as_slice(),
-			large_value3.as_bytes(),
-			"get() should resolve value pointers correctly"
-		);
-	}
-
-	// Test 2: Verify range() also works correctly
-	{
-		let txn = tree.begin().unwrap();
-
-		let range_results =
-			collect_transaction_all(&mut txn.range(b"key1", b"key4").unwrap()).unwrap();
-
-		assert_eq!(range_results.len(), 3, "Should get 3 items from range query");
-
-		// Check that all values are correctly resolved (not value pointers)
-		for (i, (returned_key, returned_value)) in range_results.iter().enumerate() {
-			let expected_key = match i {
-				0 => key1,
-				1 => key2,
-				2 => key3,
-				_ => panic!("Unexpected index"),
-			};
-			let expected_value = match i {
-				0 => &large_value1,
-				1 => &large_value2,
-				2 => &large_value3,
-				_ => panic!("Unexpected index"),
-			};
-
-			assert_eq!(returned_key.as_slice(), expected_key, "Key mismatch in range result");
-
-			// The returned value should be the actual value, not a value pointer
-			assert_eq!(
-				returned_value.as_slice(),
-				expected_value.as_bytes(),
-				"Range should return resolved values, not value pointers. \
-                     Expected actual value of {} bytes, but got a different value",
-				expected_value.len(),
-			);
-		}
 	}
 }
 

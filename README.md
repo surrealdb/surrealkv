@@ -13,7 +13,7 @@ It is designed specifically for use within SurrealDB, with the goal of reducing 
 - **Durability Levels**: Immediate and Eventual durability modes
 - **Time-Travel Queries**: Built-in versioning with point-in-time reads and historical queries
 - **Checkpoint and Restore**: Create consistent snapshots for backup and recovery
-- **Value Log (Wisckey)**: Ability to store large values separately, with garbage collection
+- **Inline Values**: One value representation across WAL, memory, SSTables, and compaction
 
 ## Quick Start
 
@@ -109,29 +109,6 @@ let tree = TreeBuilder::with_options(opts).build()?;
 - `CompressionType::None` - No compression (fastest writes, largest files)
 - `CompressionType::SnappyCompression` - Snappy compression (good balance of speed and compression ratio)
 
-### Value Log Configuration
-
-The Value Log (VLog) separates large values from the LSM tree for more efficient storage and compaction.
-
-```rust
-use surrealkv::{TreeBuilder, VLogChecksumLevel};
-
-let tree = TreeBuilder::new()
-    .with_path("path/to/db".into())
-    .with_enable_vlog(true)                     // Enable VLog
-    .with_vlog_value_threshold(1024)            // Values > 1KB go to VLog
-    .with_vlog_max_file_size(256 * 1024 * 1024) // 256MB VLog file size
-    .with_vlog_checksum_verification(VLogChecksumLevel::Full)
-    .build()?;
-```
-
-**Options:**
-- `with_enable_vlog()` - Enable/disable Value Log for large value storage
-- `with_vlog_value_threshold()` - Size threshold in bytes; values larger than this are stored in VLog (default: 1KB)
-- `with_vlog_max_file_size()` - Maximum size of VLog files before rotation (default: 256MB)
-- `with_vlog_checksum_verification()` - Checksum verification level (`Disabled` or `Full`)
-
-
 ### Versioning Configuration
 
 Enable time-travel queries to read historical versions of your data:
@@ -146,7 +123,7 @@ let opts = Options::new()
 let tree = TreeBuilder::with_options(opts).build()?;
 ```
 
-**Note:** Versioning requires VLog to be enabled. When you call `with_versioning(true, retention_ns)`, VLog is automatically enabled and configured appropriately.
+Values remain inline when versioning is enabled; no secondary value store or pointer resolution is involved.
 
 **Important:** Timestamps inserted "back in time" (earlier than existing timestamps for a key) will not be read correctly. This is because the LSM tree orders entries by user key ascending and sequence number descending, not by timestamp. Insert versions in increasing timestamp order per key.
 
@@ -430,7 +407,6 @@ tree.restore_from_checkpoint(&checkpoint_dir)?;
 - All SSTables from all levels
 - Current WAL segments
 - Level manifest
-- VLog directories (if VLog is enabled)
 - Checkpoint metadata
 
 **Note:** Restoring from a checkpoint discards any pending writes in the active memtable and returns the database to the exact state when the checkpoint was created.
@@ -444,7 +420,7 @@ tree.restore_from_checkpoint(&checkpoint_dir)?;
 ### ❌ Not Supported
 - **WebAssembly (WASM)**: Not supported due to fundamental incompatibilities:
   - Requires file system access not available in WASM environments
-  - Write-Ahead Log (WAL) and Value Log (VLog) operations are not compatible
+  - The current filesystem and WAL adapters are not compatible
   - System-level I/O operations are not available
 
 - **Windows** (x86_64): Basic functionality supported, but some features are limited:

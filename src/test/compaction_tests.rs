@@ -17,7 +17,6 @@ use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
-use crate::vlog::ValueLocation;
 use crate::{CompressionType, InternalKey, InternalKeyKind, Key, LSMIterator, Options, Value};
 
 /// Test environment setup helpers
@@ -86,12 +85,6 @@ fn create_comparator() -> Arc<InternalKeyComparator> {
 	Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())))
 }
 
-/// Helper function to create encoded inline values for testing
-fn create_inline_value(value: &[u8]) -> Vec<u8> {
-	let location = ValueLocation::with_inline_value(value.to_vec());
-	location.encode()
-}
-
 /// Helper function to create test entries with automatic value encoding
 fn create_test_entries(
 	min_key: u64,
@@ -105,7 +98,7 @@ fn create_test_entries(
 		let key =
 			InternalKey::new(user_key, min_seq + (key_val - min_key), InternalKeyKind::Set, 0);
 		let value = format!("{value_prefix}-{key_val}").into_bytes();
-		let encoded_value = create_inline_value(&value);
+		let encoded_value = value.clone();
 		entries.push((key, encoded_value));
 	}
 	entries
@@ -126,7 +119,7 @@ fn create_ordered_entries(
 		let key = format!("{}-{:05}", key_prefix, start + i).into_bytes();
 		let value = format!("{}-{:05}", value_prefix, start + i).into_bytes();
 		let internal_key = InternalKey::new(key, seq_num + i as u64, InternalKeyKind::Set, 0);
-		let encoded_value = create_inline_value(&value);
+		let encoded_value = value.clone();
 		entries.push((internal_key, encoded_value));
 	}
 	entries
@@ -208,15 +201,10 @@ fn create_compaction_options(
 	opts: Arc<Options>,
 	manifest: Arc<RwLock<LevelManifest>>,
 ) -> CompactionOptions {
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
-
-	let vlog = Arc::new(crate::vlog::VLog::new(Arc::clone(&opts)).unwrap());
-
 	CompactionOptions {
 		lopts: opts,
 		level_manifest: manifest,
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
-		vlog: Some(vlog),
 		error_handler: Arc::new(BackgroundErrorHandler::new()),
 		snapshot_tracker: SnapshotTracker::new(),
 	}
@@ -545,7 +533,7 @@ fn generate_entries(
 
 		// Create a value that's predictable - format: "value-{:02d}-{:03d}"
 		let value = format!("value-{table_idx:02}-{i:03}").into_bytes();
-		let encoded_value = create_inline_value(&value);
+		let encoded_value = value.clone();
 
 		entries.push((internal_key, encoded_value));
 	}
@@ -712,7 +700,7 @@ async fn test_multi_level_merge_compaction() {
 			let key = format!("L{level}-T{table_idx:02}-K-{idx:05}").into_bytes();
 			let internal_key = InternalKey::new(key, seq_num, InternalKeyKind::Set, 0);
 			let value = format!("V-{level}-{table_idx:02}-{idx:05}").into_bytes();
-			let encoded_value = create_inline_value(&value);
+			let encoded_value = value.clone();
 			entries.push((internal_key, encoded_value));
 		}
 
@@ -1354,7 +1342,7 @@ async fn test_compaction_respects_sequence_numbers() {
 			let key = format!("key-{j:03}").into_bytes();
 			let key_bytes = key;
 			let value_encoded = format!("value-from-table-{}-seq-{}", i, base_seq + j).into_bytes();
-			let encoded_value = create_inline_value(&value_encoded);
+			let encoded_value = value_encoded.clone();
 
 			let internal_key =
 				InternalKey::new(key_bytes.clone(), (base_seq + j) as u64, InternalKeyKind::Set, 0);
@@ -1413,11 +1401,7 @@ async fn test_compaction_respects_sequence_numbers() {
 			iter.seek_first().unwrap();
 			while iter.valid() {
 				let key = iter.key().to_owned().user_key.clone();
-				let location = ValueLocation::decode(iter.value_encoded().unwrap()).unwrap();
-				if location.is_value_pointer() {
-					panic!("Unexpected VLog pointer in test");
-				}
-				all_keys.insert(key, (*location.value).to_vec());
+				all_keys.insert(key, iter.value_encoded().unwrap().to_vec());
 				iter.next().unwrap();
 			}
 		}
@@ -1457,7 +1441,7 @@ async fn test_tombstone_propagation() {
 
 		// Add value second (lower sequence number)
 		let value_encoded = format!("original-value-{i}").into_bytes();
-		let encoded_value = create_inline_value(&value_encoded);
+		let encoded_value = value_encoded.clone();
 
 		let set_key = InternalKey::new(key_bytes, 100 + i, InternalKeyKind::Set, 0);
 		all_entries.push((set_key, encoded_value));
@@ -1525,7 +1509,7 @@ async fn test_l0_overlapping_keys_compaction() {
 	for i in 5..=15 {
 		let key = format!("key-{i:03}").into_bytes();
 		let value_encoded = format!("value-from-table1-{i}").into_bytes();
-		let encoded_value = create_inline_value(&value_encoded);
+		let encoded_value = value_encoded.clone();
 
 		let internal_key = InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0);
 		entries1.push((internal_key, encoded_value));
@@ -1536,7 +1520,7 @@ async fn test_l0_overlapping_keys_compaction() {
 	for i in 10..=20 {
 		let key = format!("key-{i:03}").into_bytes();
 		let value_encoded = format!("value-from-table2-{i}").into_bytes();
-		let encoded_value = create_inline_value(&value_encoded);
+		let encoded_value = value_encoded.clone();
 
 		let internal_key = InternalKey::new(key, 150 + i - 10, InternalKeyKind::Set, 0);
 		entries2.push((internal_key, encoded_value));
@@ -1547,7 +1531,7 @@ async fn test_l0_overlapping_keys_compaction() {
 	for i in 8..=12 {
 		let key = format!("key-{i:03}").into_bytes();
 		let value_encoded = format!("value-from-table3-{i}").into_bytes();
-		let encoded_value = create_inline_value(&value_encoded);
+		let encoded_value = value_encoded.clone();
 
 		let internal_key = InternalKey::new(key, 200 + i - 8, InternalKeyKind::Set, 0);
 		entries3.push((internal_key, encoded_value));
@@ -1602,11 +1586,7 @@ async fn test_l0_overlapping_keys_compaction() {
 				let encoded_value = iter.value_encoded().unwrap().to_vec();
 				match key.kind() {
 					InternalKeyKind::Set => {
-						let location = ValueLocation::decode(&encoded_value).unwrap();
-						if location.is_value_pointer() {
-							panic!("Unexpected VLog pointer in test");
-						}
-						all_keys.insert(key.user_key.clone(), (*location.value).to_vec());
+						all_keys.insert(key.user_key.clone(), encoded_value);
 					}
 					InternalKeyKind::Delete => {
 						tombstones.insert(key.user_key.clone(), key.seq_num());
@@ -1653,7 +1633,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 	for i in 0..20 {
 		let key = format!("key-{i:03}").into_bytes();
 		let value_encoded = format!("original-value-{i}").into_bytes();
-		let encoded_value = create_inline_value(&value_encoded);
+		let encoded_value = value_encoded.clone();
 
 		entries1.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
 	}
@@ -1666,7 +1646,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 			(InternalKeyKind::Delete, vec![]) // Every 3rd key becomes tombstone
 		} else {
 			let value_encoded = format!("updated-value-{i}").into_bytes();
-			let encoded_value = create_inline_value(&value_encoded);
+			let encoded_value = value_encoded.clone();
 
 			(InternalKeyKind::Set, encoded_value)
 		};
@@ -1720,11 +1700,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 				let key = iter.key().to_owned();
 				let encoded_value = iter.value_encoded().unwrap().to_vec();
 				if key.kind() == InternalKeyKind::Set {
-					let location = ValueLocation::decode(&encoded_value).unwrap();
-					if location.is_value_pointer() {
-						panic!("Unexpected VLog pointer in test");
-					}
-					survivors.insert(key.user_key.clone(), (*location.value).to_vec());
+					survivors.insert(key.user_key.clone(), encoded_value);
 				}
 				iter.next().unwrap();
 			}
@@ -1785,7 +1761,7 @@ async fn test_tombstone_propagation_through_levels() {
 				(200 + i, InternalKeyKind::Delete, vec![]) // Even keys = tombstones
 			} else {
 				let value_encoded = format!("l2-value-{i}").into_bytes();
-				let encoded_value = create_inline_value(&value_encoded);
+				let encoded_value = value_encoded.clone();
 
 				(200 + i, InternalKeyKind::Set, encoded_value) // Odd keys = values
 			};
@@ -1800,7 +1776,7 @@ async fn test_tombstone_propagation_through_levels() {
 	for i in 0..12 {
 		let key = format!("key-{i:03}").into_bytes();
 		let value_encoded = format!("l3-old-value-{i}").into_bytes();
-		let encoded_value = create_inline_value(&value_encoded);
+		let encoded_value = value_encoded.clone();
 
 		l3_entries.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
 	}
@@ -1884,7 +1860,7 @@ fn test_tombstone_propagation_journey() {
 	let value_key = InternalKey::new(key_bytes, 50, InternalKeyKind::Set, 0);
 
 	let value_encoded = b"old-value".to_vec();
-	let encoded_value = create_inline_value(&value_encoded);
+	let encoded_value = value_encoded;
 
 	value_entries.push((value_key, encoded_value));
 	let value_table = env.create_test_table(101, value_entries).unwrap();
@@ -1980,14 +1956,13 @@ fn test_table_properties_population() {
 
 	// Verify Properties fields
 	assert_eq!(props.id, table_id);
-	assert_eq!(props.table_format, TableFormat::LSMV1);
+	assert_eq!(props.table_format, TableFormat::LSMV2);
 	assert_eq!(props.num_entries, 100);
 	assert_eq!(props.item_count, 100);
 	assert_eq!(props.key_count, 100);
 	assert_eq!(props.num_deletions, expected_deletions);
 	assert_eq!(props.tombstone_count, expected_tombstones);
 	assert_eq!(props.data_size, 2975);
-	assert_eq!(props.oldest_vlog_file_id, 0);
 	assert_eq!(props.num_data_blocks, 1);
 
 	assert_eq!(props.index_size, 74, "Index size should be tracked");
@@ -2069,7 +2044,7 @@ async fn test_soft_delete_compaction_behavior() {
 			} else {
 				// Every 3rd+2 key = set value
 				let value_encoded = format!("l0-value-{i}").into_bytes();
-				let encoded_value = create_inline_value(&value_encoded);
+				let encoded_value = value_encoded.clone();
 				(200 + i, InternalKeyKind::Set, encoded_value)
 			};
 			l0_entries.push((InternalKey::new(key, seq, kind, 0), value));
@@ -2083,7 +2058,7 @@ async fn test_soft_delete_compaction_behavior() {
 	for i in 0..12 {
 		let key = format!("key-{i:03}").into_bytes();
 		let value_encoded = format!("l1-old-value-{i}").into_bytes();
-		let encoded_value = create_inline_value(&value_encoded);
+		let encoded_value = value_encoded.clone();
 
 		l1_entries.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
 	}
@@ -2107,8 +2082,7 @@ async fn test_soft_delete_compaction_behavior() {
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 1.0);
 	let strategy = Arc::new(Strategy::from_options(opts));
-	let mut compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
-	compaction_options.vlog = None;
+	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 	let compactor = Compactor::new(compaction_options, strategy);
 
 	compactor.compact().unwrap();
@@ -2155,14 +2129,7 @@ async fn test_soft_delete_compaction_behavior() {
 				InternalKeyKind::Set => {
 					let key_str = String::from_utf8(key.user_key.clone()).unwrap();
 
-					// Decode the ValueLocation to get the actual value
-					let location = crate::vlog::ValueLocation::decode(&value).unwrap();
-					let actual_value = if location.is_value_pointer() {
-						panic!("Unexpected VLog pointer in test");
-					} else {
-						(*location.value).to_vec()
-					};
-					let value_str = String::from_utf8(actual_value).unwrap();
+					let value_str = String::from_utf8(value).unwrap();
 
 					// Verify we get the latest L0 values, not the old L1 values
 					if key_str.starts_with("key-") {
@@ -2213,7 +2180,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 	//
 	// With versioning disabled, the older versions should be marked stale.
 	// The bug was that older soft deletes (which have empty values) would crash
-	// when the code tried to decode them as ValueLocation.
+	// when the code tried to decode an empty tombstone as a value.
 
 	let env = TestEnv::new_with_levels(2);
 	let mut levels = Levels::new(3, 10);
@@ -2230,7 +2197,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 
 	// Create L1 table with older Set (seq 200) and oldest SoftDelete (seq 100)
 	let value_encoded = b"some-value".to_vec();
-	let encoded_value = create_inline_value(&value_encoded);
+	let encoded_value = value_encoded;
 	let l1_entries = vec![
 		(InternalKey::new(key.clone(), 200, InternalKeyKind::Set, 0), encoded_value),
 		(
@@ -2258,7 +2225,6 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 1.0);
 	let strategy = Arc::new(Strategy::from_options(opts));
-	// NOTE: Do NOT set vlog = None - we need VLog enabled to trigger the bug
 	let compaction_options = create_compaction_options(env.options, Arc::clone(&manifest));
 
 	let compactor = Compactor::new(compaction_options, strategy);
@@ -2426,7 +2392,7 @@ fn create_test_table_with_bounds(
 
 	// Add smallest key
 	let small_key = InternalKey::new(smallest_key.to_vec(), 1, InternalKeyKind::Set, 0);
-	let value = ValueLocation::with_inline_value(b"v".to_vec()).encode();
+	let value = b"v".to_vec();
 	writer.add(small_key, &value).unwrap();
 
 	// Add largest key (if different)
@@ -2674,7 +2640,7 @@ fn test_expand_same_user_key_different_seq() {
 	let file1 = File::create(&table_path1).unwrap();
 	let mut writer1 = crate::sstable::table::TableWriter::new(file1, 1, Arc::clone(&opts), 0);
 	let key1 = InternalKey::new(b"foo".to_vec(), 100, InternalKeyKind::Set, 0);
-	let value = ValueLocation::with_inline_value(b"v1".to_vec()).encode();
+	let value = b"v1".to_vec();
 	writer1.add(key1, &value).unwrap();
 	writer1.finish().unwrap();
 	let file1 = std::fs::File::open(&table_path1).unwrap();
@@ -2732,7 +2698,7 @@ fn create_entries_with_keys(keys: &[&str], seq_num: u64) -> Vec<(InternalKey, Ve
 		let user_key = key.as_bytes().to_vec();
 		let internal_key = InternalKey::new(user_key, seq_num + i as u64, InternalKeyKind::Set, 0);
 		let value = format!("value-{}", key).into_bytes();
-		let encoded_value = create_inline_value(&value);
+		let encoded_value = value.clone();
 		entries.push((internal_key, encoded_value));
 	}
 	entries
