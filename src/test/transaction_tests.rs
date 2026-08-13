@@ -5,13 +5,17 @@ use std::sync::Arc;
 use tempdir::TempDir;
 use test_log::test;
 
+use crate::batch::BatchOwner;
 use crate::lsm::Tree;
 use crate::test::{
 	collect_history_all, collect_transaction_all, collect_transaction_reverse,
 	point_in_time_from_history, KeyVersionsMap,
 };
-use crate::transaction::HistoryOptions;
-use crate::{Error, Key, LSMIterator, Mode, Options, TreeBuilder, WriteOptions};
+use crate::transaction::{HistoryOptions, Transaction, TransactionOptions};
+use crate::{
+	BranchGeneration, BranchId, CommitVersion, Error, Key, LSMIterator, Mode, Options, TreeBuilder,
+	WriteOptions,
+};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -3622,4 +3626,34 @@ async fn test_direction_switch_after_seek() {
 	// Call prev() - should return "b", not "e"
 	assert!(iter.prev().unwrap(), "prev from 'c' should succeed");
 	assert_eq!(iter.key().user_key(), b"b", "After prev() from seek('c'), should be at 'b'");
+}
+
+#[test(tokio::test)]
+async fn deleting_a_branch_fences_an_already_open_transaction_before_wal_append() {
+	let (store, _temp_dir) = create_store();
+	let branch = BranchId::from_u128(77);
+	let record = store
+		.core
+		.branch_catalog
+		.write()
+		.unwrap()
+		.create(branch, "agent/session", CommitVersion(0))
+		.unwrap();
+	let owner = BatchOwner {
+		branch,
+		generation: record.generation,
+	};
+	let mut transaction =
+		Transaction::new_owned(Arc::clone(&store.core), TransactionOptions::write_only(), owner)
+			.unwrap();
+	transaction.set(b"key", b"value").unwrap();
+	store.core.branch_catalog.write().unwrap().delete(branch).unwrap();
+
+	assert!(matches!(transaction.commit().await, Err(Error::BranchFenced)));
+	assert_eq!(store.core.seq_num(), 0, "fenced transaction must not allocate a commit version");
+	assert_eq!(
+		owner.generation,
+		BranchGeneration(0),
+		"fixture must exercise the first live generation"
+	);
 }

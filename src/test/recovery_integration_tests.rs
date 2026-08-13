@@ -6,7 +6,10 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 use test_log::test;
 
+use crate::batch::Batch;
+use crate::memtable::MemTable;
 use crate::test::recovery_test_helpers::RecoveryTestHelper;
+use crate::wal::recovery::replay_wal;
 use crate::TreeBuilder;
 
 /// Create a tree with custom options
@@ -73,6 +76,131 @@ async fn test_basic_recovery() {
 
 		tree.close().await.unwrap();
 	}
+}
+
+#[test(tokio::test)]
+async fn partial_flush_of_split_wal_keeps_the_segment_replayable() {
+	let temp_dir = TempDir::new().unwrap();
+	let path = temp_dir.path().to_path_buf();
+	let tree = create_tree(path.clone(), |builder| builder);
+	let wal_number = tree.core.wal.read().get_active_log_number();
+
+	let mut first_batch = Batch::new(1);
+	first_batch.set(b"first".to_vec(), b"one".to_vec(), 0).unwrap();
+	let mut second_batch = Batch::new(2);
+	second_batch.set(b"second".to_vec(), b"two".to_vec(), 0).unwrap();
+	{
+		let mut wal = tree.core.wal.write();
+		wal.append(&first_batch.encode().unwrap()).unwrap();
+		wal.append(&second_batch.encode().unwrap()).unwrap();
+		wal.rotate().unwrap();
+	}
+	let active_wal = tree.core.wal.read().get_active_log_number();
+	tree.core.active_memtable.read().unwrap().set_wal_number(active_wal);
+
+	let first_memtable = std::sync::Arc::new(MemTable::new(64 * 1024));
+	let second_memtable = std::sync::Arc::new(MemTable::new(64 * 1024));
+	first_memtable.set_wal_number(wal_number);
+	second_memtable.set_wal_number(wal_number);
+	first_memtable.add(&first_batch).unwrap();
+	second_memtable.add(&second_batch).unwrap();
+	tree.core
+		.wal_dependencies
+		.register_component(first_memtable.dependency_id(), wal_number);
+	tree.core
+		.wal_dependencies
+		.register_component(second_memtable.dependency_id(), wal_number);
+	let first_table_id = tree.core.level_manifest.read().unwrap().next_table_id();
+	{
+		let mut immutables = tree.core.immutable_memtables.write().unwrap();
+		immutables.add(first_table_id, wal_number, first_memtable);
+		immutables.add(first_table_id + 1, wal_number, second_memtable);
+	}
+
+	tree.core.flush_oldest_immutable_for_test().unwrap().unwrap();
+	assert_eq!(
+		tree.core.level_manifest.read().unwrap().get_log_number(),
+		wal_number,
+		"partial flush must not advance beyond a still-dependent WAL"
+	);
+	assert_eq!(tree.core.immutable_memtables.read().unwrap().iter().count(), 1);
+	let (max_sequence, replayed) =
+		replay_wal(&tree.core.opts.wal_dir(), wal_number, 64 * 1024).unwrap();
+	assert_eq!(max_sequence, Some(2));
+	assert_eq!(replayed.len(), 1, "the original segment must still replay both batches");
+
+	tree.core.flush_oldest_immutable_for_test().unwrap().unwrap();
+	assert_eq!(tree.core.level_manifest.read().unwrap().get_log_number(), active_wal);
+	tree.close().await.unwrap();
+}
+
+#[test(tokio::test)]
+async fn delayed_apply_after_rotation_keeps_its_actual_wal_replayable() {
+	let temp_dir = TempDir::new().unwrap();
+	let path = temp_dir.path().to_path_buf();
+	let tree = create_tree(path, |builder| builder.with_max_memtable_size(256 * 1024));
+
+	// Seed the current memtable so the production rotation path has a real
+	// component to freeze.
+	let mut txn = tree.begin().unwrap();
+	txn.set(b"already-applied", b"one").unwrap();
+	txn.commit().await.unwrap();
+	let old_component = tree.core.active_memtable.read().unwrap().dependency_id();
+	let old_wal = tree.core.wal.read().get_active_log_number();
+
+	// Reproduce the commit-pipeline interval: the record is appended and
+	// pinned, but memtable apply has not happened yet.
+	let mut delayed = Batch::new(2);
+	delayed.set(b"delayed".to_vec(), b"two".to_vec(), 0).unwrap();
+	tree.core.wal_dependencies.pin_in_flight(2, old_wal);
+	let actual_wal = tree.core.wal.write().append(&delayed.encode().unwrap()).unwrap();
+	assert_eq!(actual_wal, old_wal, "fixture must append to the pre-rotation WAL");
+	assert_eq!(
+		tree.core.wal_dependencies.snapshot(old_wal).in_flight_count,
+		1,
+		"fixture must expose the durable-but-not-applied interval"
+	);
+
+	tree.core.rotate_memtable().unwrap();
+	let new_wal = tree.core.wal.read().get_active_log_number();
+	assert!(new_wal > old_wal, "fixture must rotate the WAL");
+
+	// Apply to the replacement memtable using the segment captured at append,
+	// then atomically hand off the in-flight dependency.
+	let new_active = tree.core.active_memtable.read().unwrap().clone();
+	assert_ne!(new_active.dependency_id(), old_component);
+	new_active.add(&delayed).unwrap();
+	new_active.record_wal_dependency(actual_wal);
+	tree.core.wal_dependencies.handoff_to_component(
+		2,
+		new_active.dependency_id(),
+		actual_wal,
+	);
+	assert_eq!(
+		new_active.get_wal_number(),
+		old_wal,
+		"a delayed apply must lower the replacement memtable's WAL dependency"
+	);
+
+	// Flushing the older frozen component must not advance the manifest past
+	// the same old segment, because the replacement active still depends on it.
+	tree.core.flush_oldest_immutable_for_test().unwrap().unwrap();
+	assert_eq!(
+		tree.core.level_manifest.read().unwrap().get_log_number(),
+		old_wal,
+		"partial flush must preserve the delayed apply's only durable segment"
+	);
+	let (max_sequence, replayed) =
+		replay_wal(&tree.core.opts.wal_dir(), old_wal, 256 * 1024).unwrap();
+	assert_eq!(max_sequence, Some(2));
+	assert!(
+		replayed.iter().any(|(memtable, segment)| {
+			*segment == old_wal && memtable.get(b"delayed", Some(2)).is_some()
+		}),
+		"the old WAL must still replay the delayed batch"
+	);
+
+	tree.close().await.unwrap();
 }
 
 /// Test 2: Recovery With Existing SST Files

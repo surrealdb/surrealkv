@@ -6,13 +6,14 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use test_log::test;
 
+use crate::batch::BatchOwner;
 use crate::sstable::block::BlockHandle;
 use crate::sstable::table::{ChecksumType, Footer, IndexType, Table, TableFormat, TableWriter};
 use crate::test::{collect_all, collect_iter, count_iter};
 use crate::vfs::File;
 use crate::{
-	user_range_to_internal_range, InternalKey, InternalKeyKind, LSMIterator, Options, Result,
-	INTERNAL_KEY_SEQ_NUM_MAX,
+	user_range_to_internal_range, BranchGeneration, BranchId, InternalKey, InternalKeyKind,
+	LSMIterator, Options, Result, INTERNAL_KEY_SEQ_NUM_MAX,
 };
 
 fn default_opts() -> Arc<Options> {
@@ -40,7 +41,7 @@ fn test_footer() {
 	assert_eq!(f2.meta_index.size(), 4);
 	assert_eq!(f2.index.offset(), 55);
 	assert_eq!(f2.index.size(), 5);
-	assert_eq!(f2.format, TableFormat::LSMV2);
+	assert_eq!(f2.format, TableFormat::LSMV3);
 	assert_eq!(f2.checksum, ChecksumType::CRC32c);
 
 	let mut obsolete = buf;
@@ -72,7 +73,7 @@ fn test_table_builder() {
 	}
 
 	let actual = b.finish().unwrap();
-	assert_eq!(716, actual);
+	assert_eq!(740, actual);
 }
 
 #[test]
@@ -4037,7 +4038,7 @@ fn test_table_properties_persistence() {
 
 	// Basic properties
 	assert_eq!(props.id, table_id, "Table ID should match");
-	assert_eq!(props.table_format, TableFormat::LSMV2, "Table format should be LSMV2");
+	assert_eq!(props.table_format, TableFormat::LSMV3, "Table format should be LSMV3");
 	assert_eq!(props.num_entries, 50, "Number of entries should be 50");
 	assert_eq!(props.item_count, 50, "Item count should be 50");
 	assert_eq!(props.key_count, 50, "Key count should be 50");
@@ -4100,6 +4101,26 @@ fn test_table_properties_persistence() {
 
 	// Verify TableMetadata fields
 	assert_eq!(meta.has_point_keys, Some(true), "Should have point keys");
+}
+
+#[test]
+fn table_owner_roundtrips_without_changing_stored_user_keys() {
+	let mut buffer = Vec::new();
+	let opts = default_opts();
+	let owner = BatchOwner {
+		branch: BranchId::from_u128(0xabc),
+		generation: BranchGeneration(9),
+	};
+	let mut writer = TableWriter::new_owned(&mut buffer, 77, Arc::clone(&opts), 0, owner);
+	writer.add(InternalKey::new(b"plain".to_vec(), 1, InternalKeyKind::Set, 0), b"value").unwrap();
+	let size = writer.finish().unwrap();
+
+	let table = Table::new(77, opts, wrap_buffer(buffer), size as u64).unwrap();
+	assert_eq!(table.meta.owner, owner);
+	let mut iterator = table.iter(None).unwrap();
+	iterator.seek_first().unwrap();
+	assert_eq!(iterator.key().user_key(), b"plain");
+	assert_eq!(iterator.key().user_key().len(), b"plain".len());
 }
 
 #[test]

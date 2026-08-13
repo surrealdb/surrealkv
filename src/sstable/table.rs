@@ -76,6 +76,7 @@ use crc32fast::Hasher as Crc32;
 use integer_encoding::{FixedInt, FixedIntWriter};
 use snap::raw::max_compress_len;
 
+use crate::batch::BatchOwner;
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
@@ -144,13 +145,13 @@ pub enum ChecksumType {
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum TableFormat {
-	LSMV2 = 2,
+	LSMV3 = 3,
 }
 
 impl TableFormat {
 	pub(crate) fn from_u8(val: u8) -> Result<Self> {
 		match val {
-			2 => Ok(TableFormat::LSMV2),
+			3 => Ok(TableFormat::LSMV3),
 			_ => Err(Error::InvalidTableFormat),
 		}
 	}
@@ -167,7 +168,7 @@ impl TableFormat {
 /// ```text
 /// Offset  Size  Field
 /// ------  ----  -----
-/// 0       1     Format version (2 = LSMV2)
+/// 0       1     Format version (3 = LSMV3 with physical owner metadata)
 /// 1       1     Checksum type (1 = CRC32c)
 /// 2       16    Meta index block handle (varint encoded offset + size)
 /// 18      16    Index block handle (varint encoded offset + size)
@@ -194,7 +195,7 @@ impl Footer {
 		Footer {
 			meta_index: metaix,
 			index,
-			format: TableFormat::LSMV2,
+			format: TableFormat::LSMV3,
 			checksum: ChecksumType::CRC32c,
 		}
 	}
@@ -261,7 +262,7 @@ impl Footer {
 	/// Encodes the footer into a byte buffer.
 	pub(crate) fn encode(&self, dst: &mut [u8]) {
 		match self.format {
-			TableFormat::LSMV2 => {
+			TableFormat::LSMV3 => {
 				dst[..TABLE_FOOTER_LENGTH].fill(0);
 
 				// Format version (1 byte)
@@ -343,7 +344,18 @@ pub(crate) struct TableWriter<W: Write> {
 }
 
 impl<W: Write> TableWriter<W> {
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
+		Self::new_owned(writer, id, opts, target_level, BatchOwner::DEFAULT)
+	}
+
+	pub(crate) fn new_owned(
+		writer: W,
+		id: u64,
+		opts: Arc<Options>,
+		target_level: u8,
+		owner: BatchOwner,
+	) -> Self {
 		let fb = {
 			if let Some(policy) = opts.filter_policy.clone() {
 				let mut f = FilterBlockWriter::new(Arc::clone(&policy));
@@ -356,7 +368,7 @@ impl<W: Write> TableWriter<W> {
 
 		let compression_selector = CompressionSelector::new(opts.compression_per_level.clone());
 
-		let mut meta = TableMetadata::new();
+		let mut meta = TableMetadata::new_owned(owner);
 		meta.properties.id = id;
 		meta.properties.compression = compression_selector.select_compression(target_level);
 

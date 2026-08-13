@@ -10,10 +10,7 @@ use crate::memtable::MemTable;
 use crate::snapshot::{IterState, KMergeIterator};
 use crate::sstable::table::{Table, TableWriter};
 use crate::test::{
-	collect_all,
-	collect_snapshot_iter,
-	collect_snapshot_reverse,
-	collect_transaction_all,
+	collect_all, collect_snapshot_iter, collect_snapshot_reverse, collect_transaction_all,
 };
 use crate::vfs::File;
 use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Tree, TreeBuilder};

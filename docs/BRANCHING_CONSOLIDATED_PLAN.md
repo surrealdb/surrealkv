@@ -69,6 +69,7 @@ These decisions are settled unless a failing vertical proof forces a written ame
 | Core host seam | `ObjectStore`, `CommitStore`, `Platform` | Three roles cover immutable data, authority, and runtime facts. |
 | Required backends | Memory, Local, SimStorage | Smallest useful and testable durable foundation. |
 | Optional backends | Proof-gated adapters | A desired target cannot distort branch/MVCC semantics. |
+| Native remote object mechanics | Wrap the Arrow `object_store` crate | Reuse S3/R2-family ranges, multipart upload, retries, credentials, and provider errors; do not rebuild an HTTP object client. |
 
 ### 2.1 Consolidation ledger
 
@@ -109,11 +110,10 @@ The `v2` worktree was checked on 2026-08-13:
 
 - the B+tree implementation and public surface are already absent, so the work is an
   enforced-absence guard, not a removal project;
-- VLog is still reachable through `src/vlog.rs`, memtable flush, LSM open/read/cleanup, batch
-  encoding, compaction, checkpoint/restore, public options, and tests, so removing it is a real
-  vertical cut rather than a configuration change;
-- the four P0 failure scenarios below apply to the current LSM and remain mandatory rewrite
-  regressions.
+- VLog, its value prefix/pointer resolution, metadata, public configuration, lifecycle, and
+  dedicated tests were removed in commit `4b07fce`;
+- P0 fixes and measurements are recorded in `P0_CORRECTNESS_BASELINE.md`; the four failure scenarios
+  remain mandatory regressions for the replacement spine.
 
 Recheck this baseline before opening implementation issues; paths may move while the architectural
 invariants do not.
@@ -535,6 +535,15 @@ may remain local. A fourth behavior-bearing core trait requires an architecture 
 cache, DO hot rows, io_uring buffers, filesystem locks, and retry wrappers are internal components
 or adapter decorators, not additional semantic roles.
 
+Native S3/R2-family adapters should wrap the Arrow `object_store` crate (as SlateDB does) rather
+than implement remote HTTP, multipart upload, retry, credential, or provider logic. SurrealKV's
+smaller contract remains the semantic boundary because it adds unique immutable publication,
+capability/durability negotiation, and stable errors. A workerd R2 binding is a separate thin
+adapter candidate: it must not pull a native HTTP/AWS runtime into the isolate merely to share an
+implementation. The Local adapter may use `object_store::local::LocalFileSystem` only if the P8
+audit proves equivalent create-only publication plus file/directory durability; otherwise its
+small fsync container remains local durability machinery, not a second remote client.
+
 ### 6.2 Profile matrix
 
 | Profile | Objects | Commit authority | Status and promise |
@@ -649,6 +658,21 @@ Each slice owns one behavior, normally stays below approximately 1,500 net lines
 goldens, and has a paired test slice. Every issue records goal, owned files, invariants, non-goals,
 source evidence, literal verification commands, stop conditions, and exit evidence.
 
+No implementation-only slice may be marked complete. Every material production change must have:
+
+1. a direct regression at the owning module, with a fixture that fails when the changed condition is
+   sabotaged;
+2. a vertical test at the highest relevant boundary: crash/reopen for durability, model parity for
+   branch/MVCC semantics, backend-contract parity for storage adapters, and public-API behavior for
+   API changes;
+3. a non-vacuity assertion proving the fixture actually entered the intended state or fault point;
+4. the full suite, strict lint, and changed-file audit recorded as exit evidence.
+
+A helper-level assertion is not a substitute for a crash/model/backend test. Conversely, a large
+end-to-end test does not replace a focused owner-module regression. If a vertical harness does not
+exist yet, building that harness is part of the slice and the phase remains incomplete until it is
+used. This two-level test gate applies to P0 through P10 and to every optional adapter spike.
+
 ```mermaid
 flowchart LR
     P0["P0 correctness baseline"] --> P1["P1 contracts and testkit"]
@@ -664,6 +688,9 @@ flowchart LR
 ```
 
 ### P0 — Correctness baseline and decision freeze
+
+Status: complete on 2026-08-13; evidence is in `P0_CORRECTNESS_BASELINE.md` and the paired
+regression tests. P1 is the next implementation phase.
 
 Purpose: prevent the rewrite from inheriting known corruption and data-loss behavior.
 
@@ -700,6 +727,9 @@ promise.
 
 ### P1 — Contracts, model, and peer test backends
 
+Status: complete on 2026-08-13; evidence and adversarial findings are recorded in
+`P1_CONTRACTS_AND_TESTKIT.md`. P2 is the next implementation phase.
+
 Slices:
 
 - create `api`, `format`, `storage`, `table`, `branch`, `commit`, `lifecycle`, and `testkit` module
@@ -722,6 +752,9 @@ Exit gate: Memory and SimStorage pass the same contracts; storage adapters conta
 policy; the model can execute branch and temporal operations without an LSM.
 
 ### P2 — Remote-ready immutable table format
+
+Status: complete on 2026-08-13; evidence and adversarial findings are recorded in
+`P2_REMOTE_TABLE_FORMAT.md`. P3 is the next implementation phase.
 
 Slices:
 
@@ -747,6 +780,13 @@ table code assumes rename, mmap, append, directory fsync, or branch-key rewritin
 
 ### P3 — Single-branch commit and temporal vertical spine
 
+Status: integration reopened on 2026-08-13. `P3_SINGLE_BRANCH_CUTOVER.md` records useful prototype
+evidence, but the attempted wholesale cutover was reversed. The original runtime and complete test
+corpus are restored and compiled alongside the branch-native modules. P3 is complete only when the
+new branch/storage semantics run through adapted existing batch, commit, memtable, SST, iterator,
+compaction, recovery, and transaction machinery. See `INTEGRATION_REUSE_AUDIT.md` and
+`P3_INTEGRATION_PROGRESS.md`.
+
 Slices:
 
 - active/frozen tables with chunked lazy allocation and a database-wide write-buffer manager;
@@ -756,9 +796,10 @@ Slices:
 - Local `CommitStore`: framed journal, root slots, writer fencing, and recovery;
 - latest/version/timestamp point/range/history reads with tombstone/TTL rules;
 - branch-zero flush and owned compaction;
-- switch the public entry point to the new spine;
-- delete the old runtime, VLog module, pointer representation, VLog SST metadata/options,
-  checkpoint/restore/GC paths, and VLog-only tests.
+- add the new public entry point only after it uses the integrated existing runtime;
+- remove only the already-rejected VLog pointer representation/metadata/options and genuinely
+  VLog-only tests; preserve and adapt the existing LSM, commit, SST, iterator, compaction,
+  recovery, checkpoint, and transaction code and tests.
 
 Tests:
 
@@ -770,8 +811,8 @@ Tests:
 - old format is rejected by identity.
 
 Exit gate: one branch is a complete crash-durable Local engine; Memory/Local/Sim semantics agree;
-there is one MVCC order and one reachable runtime; VLog is absent; all four P0 regression scenarios
-pass against the new engine.
+the branch-native public path uses the adapted existing runtime rather than a parallel commit/table
+engine; VLog is absent; the retained suite plus all four P0 scenarios pass against that same engine.
 
 ### P4 — Branch lifecycle and exact COW fork
 
@@ -779,7 +820,14 @@ Slices:
 
 - `BranchId`, generation, validated name catalog, protected default branch;
 - empty create/get/list/delete/recreate with idempotency;
-- branch-local runtime registry, lazy memtables, conflict state, and branch-tagged commits;
+- actual WAL-segment provenance plus durable-but-not-applied dependency pins, proved first on the
+  retained single-branch runtime;
+- extract the complete default-branch component set into `BranchRuntime` before introducing a
+  registry; an active-memtable-only map is forbidden;
+- partition owned L0..Ln and replay facts by owner before routing non-default writes;
+- lazy branch-local runtime registry, chunked memtables, conflict state, branch-tagged commits,
+  independent branch rotation over the shared WAL, and a database-wide write-buffer manager;
+- branch-selected snapshots and demultiplexed generation-fenced recovery;
 - flattened `InheritedView` and capped multi-source iterators;
 - exact `Head` fork with bounded fork-delta;
 - historical version and timestamp fork through the global timeline;
@@ -805,7 +853,8 @@ branches do not allocate full memtables; every budget failure occurs before dest
 
 Slices:
 
-- per-branch rotation/replay floors decoupled from global commit-log rotation;
+- oldest-WAL-dependency trickle flush and replay-floor reclamation policy over the independently
+  rotating branch runtimes established in P4;
 - branch-owned flush and compaction;
 - explicit materialization placed below owned precedence;
 - persisted operation records for flush/compaction/materialization outputs;

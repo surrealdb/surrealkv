@@ -3,7 +3,7 @@ use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::batch::Batch;
+use crate::batch::{Batch, BatchOwner};
 use crate::error::{Error, Result};
 use crate::lsm::Core;
 use crate::snapshot::{HistoryIterator, MergeDirection, Snapshot, SnapshotIterator};
@@ -193,6 +193,9 @@ impl HistoryOptions {
 // ===== Transaction Implementation =====
 /// A transaction in the LSM tree providing ACID guarantees.
 pub struct Transaction {
+	/// Physical branch/generation owner. This metadata scopes conflicts, WAL
+	/// replay, memtables, and SSTs without changing user keys.
+	owner: BatchOwner,
 	/// `mode` is the transaction mode. This can be either `ReadWrite`,
 	/// `ReadOnly`, or `WriteOnly`.
 	mode: Mode,
@@ -257,6 +260,18 @@ impl Transaction {
 
 	/// Prepare a new transaction in the given mode.
 	pub(crate) fn new(core: Arc<Core>, opts: TransactionOptions) -> Result<Self> {
+		Self::new_owned(core, opts, BatchOwner::DEFAULT)
+	}
+
+	pub(crate) fn new_owned(
+		core: Arc<Core>,
+		opts: TransactionOptions,
+		owner: BatchOwner,
+	) -> Result<Self> {
+		core.branch_catalog
+			.read()?
+			.validate_owner(owner.branch, owner.generation)
+			.map_err(|_| Error::BranchFenced)?;
 		let TransactionOptions {
 			mode,
 			durability,
@@ -279,6 +294,7 @@ impl Transaction {
 		}
 
 		Ok(Self {
+			owner,
 			mode,
 			snapshot,
 			core,
@@ -749,7 +765,12 @@ impl Transaction {
 		// `starting_seq_num` will be stamped by the commit pipeline after
 		// seq allocation. The pipeline derives oracle keys from
 		// `batch.entries` itself, so we don't pre-collect a parallel vector.
-		let mut batch = Batch::new(0);
+		self.core
+			.branch_catalog
+			.read()?
+			.validate_owner(self.owner.branch, self.owner.generation)
+			.map_err(|_| Error::BranchFenced)?;
+		let mut batch = Batch::for_owner(0, self.owner);
 
 		// Extract the vector of entries for the current transaction,
 		// respecting the insertion order recorded with Entry::seqno.

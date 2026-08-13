@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::Batch;
+use crate::branch_runtime::BranchRuntime;
 use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
 use crate::commit::{CommitEnv, CommitPipeline, PreparedWrite};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
@@ -21,6 +22,7 @@ use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
+use crate::wal::dependency::WalDependencyTracker;
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
 use crate::{Comparator, Error, FilterPolicy, LSMIterator, Options, WalRecoveryMode};
 
@@ -75,29 +77,15 @@ pub trait CompactionOperations: Send + Sync {
 /// If a function needs multiple locks, it must acquire them in this order.
 /// See `rotate_memtable()`, `flush_immutable_to_sst()` for examples.
 pub(crate) struct CoreInner {
-	/// The active memtable (write buffer) that receives all new writes.
-	///
-	/// In LSM trees, all writes first go to an in-memory structure for fast
-	/// insertion. This memtable is typically implemented as a skip list or
-	/// balanced tree to maintain sorted order while supporting concurrent
-	/// access.
-	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable>>>,
-
-	/// Collection of immutable memtables waiting to be flushed to disk.
-	///
-	/// When the active memtable fills up (reaches max_memtable_size), it
-	/// becomes immutable and a new active memtable is created. These immutable
-	/// memtables continue serving reads while waiting for background threads
-	/// to flush them to disk as SSTables.
-	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
-
-	/// The level structure managing all SSTables on disk.
-	///
-	/// LSM trees organize SSTables into levels:
-	/// - L0: Contains SSTables flushed directly from memtables. May have overlapping key ranges.
-	/// - L1+: Each level is larger than the previous. SSTables have non-overlapping key ranges
-	///   within a level, enabling efficient binary search.
-	pub level_manifest: Arc<RwLock<LevelManifest>>,
+	/// Durable-model branch identity catalog. Data routing remains on the
+	/// existing LSM components and is integrated incrementally.
+	pub(crate) branch_catalog: RwLock<crate::branch::BranchCatalog>,
+	/// Complete component set for the retained default branch: the active
+	/// memtable (write buffer), the immutable-memtable flush queue, and the
+	/// owned level manifest. `CoreInner` temporarily dereferences to this
+	/// runtime so existing call sites keep using the same objects while the
+	/// extraction proceeds; later slices make runtimes lazy and owner-indexed.
+	pub(crate) default_runtime: BranchRuntime,
 
 	/// Configuration options controlling LSM tree behavior
 	pub opts: Arc<Options>,
@@ -118,6 +106,11 @@ pub(crate) struct CoreInner {
 	/// Write-Ahead Log (WAL) for durability
 	pub(crate) wal: WalManager,
 
+	/// Live dependencies that prevent WAL replay-floor advancement. A commit
+	/// is pinned before append and handed to its destination memtable after
+	/// successful apply.
+	pub(crate) wal_dependencies: WalDependencyTracker,
+
 	/// Lock file to prevent multiple processes from opening the same database
 	pub(crate) lockfile: Mutex<LockFile>,
 
@@ -127,6 +120,17 @@ pub(crate) struct CoreInner {
 	/// Visible sequence number - the highest sequence number that is visible to readers.
 	/// Shared with CommitPipeline for coordinated updates.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
+}
+
+/// Transitional compatibility for the default-branch extraction. Field
+/// access resolves to the sole `BranchRuntime`; there are no alias fields or
+/// duplicated component collections in `CoreInner`.
+impl std::ops::Deref for CoreInner {
+	type Target = BranchRuntime;
+
+	fn deref(&self) -> &Self::Target {
+		&self.default_runtime
+	}
 }
 
 impl CoreInner {
@@ -155,20 +159,36 @@ impl CoreInner {
 
 		// Initialize active memtable with its WAL number set to the initial WAL
 		// This tracks which WAL the memtable's data belongs to for later flush
-		let initial_memtable = Arc::new(MemTable::new(opts.max_memtable_size));
+		let branch_catalog = crate::branch::BranchCatalog::new(crate::BranchId([0; 16]));
+		let initial_memtable = Arc::new(MemTable::new_owned(
+			opts.max_memtable_size,
+			crate::batch::BatchOwner::DEFAULT,
+		));
 		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
 		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
-		Ok(Self {
-			opts,
+		let default_runtime = BranchRuntime::new(
+			crate::batch::BatchOwner::DEFAULT,
 			active_memtable,
 			immutable_memtables,
 			level_manifest,
+		);
+		if !default_runtime.validate_component_owners() {
+			return Err(Error::ManifestCorruption(
+				"default branch runtime contains a foreign-owned component".to_owned(),
+			));
+		}
+
+		Ok(Self {
+			branch_catalog: RwLock::new(branch_catalog),
+			opts,
+			default_runtime,
 			snapshot_tracker: SnapshotTracker::new(),
 			active_txn_tracker: Arc::new(crate::tracker::ActiveTxnTracker::new()),
 			wal: WalManager::new(wal_instance),
+			wal_dependencies: WalDependencyTracker::new(),
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
@@ -180,9 +200,14 @@ impl CoreInner {
 	}
 
 	pub(crate) fn l0_file_count(&self) -> usize {
+		let owner = self.default_runtime.owner();
 		self.level_manifest
 			.read()
-			.map(|m| m.levels.get_levels().first().map(|l| l.tables.len()).unwrap_or(0))
+			.map(|m| {
+				m.levels_for(owner)
+					.and_then(|levels| levels.get_levels().first().map(|l| l.tables.len()))
+					.unwrap_or(0)
+			})
 			.unwrap_or(0)
 	}
 
@@ -237,31 +262,38 @@ impl CoreInner {
 
 		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
-		// Step 2: Prepare atomic changeset
-		let mut changeset = ManifestChangeSet::default();
-		changeset.new_tables.push((0, Arc::clone(&table)));
-		changeset.log_number = Some(wal_number + 1);
-
-		log::debug!(
-			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
-			table_id,
-			wal_number + 1,
-			wal_number
+		// Step 2: Apply the table and the safe replay floor atomically. A WAL
+		// segment can feed multiple memtables (recovery splits and, later,
+		// branches), so flushing one component does not prove the whole segment
+		// reclaimable.
+		let current_wal_segment = self.wal.read().get_active_log_number();
+		let dependency_snapshot = self.wal_dependencies.snapshot_excluding(
+			Some(memtable.dependency_id()),
+			current_wal_segment,
 		);
-
-		// Step 3: Apply changeset atomically
-		// Lock order: level_manifest → immutable_memtables
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
+		let replay_floor = dependency_snapshot.replay_floor;
+		let mut changeset = ManifestChangeSet {
+			owner: memtable.owner(),
+			..ManifestChangeSet::default()
+		};
+		changeset.new_tables.push((0, Arc::clone(&table)));
+		changeset.log_number = Some(replay_floor);
+
+		log::debug!(
+			"Changeset prepared: table_id={}, replay_floor={} after flushing WAL #{:020}",
+			table_id,
+			replay_floor,
+			wal_number
+		);
 
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
 			manifest.revert_changeset(rollback);
 			let error = Error::Other(format!(
 				"Failed to atomically update manifest: table_id={}, log_number={}: {}",
-				table_id,
-				wal_number + 1,
-				e
+				table_id, replay_floor, e
 			));
 			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
 			return Err(error);
@@ -273,12 +305,13 @@ impl CoreInner {
 		// added to the manifest, and conflict detection uses the in-memory oracle
 		// (independent of memtables), so dropping this Arc is safe.
 		memtable_lock.remove(table_id);
+		self.wal_dependencies.release_component(memtable.dependency_id());
 		drop(memtable);
 
 		log::info!(
 			"Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
 			table_id,
-			wal_number + 1,
+			replay_floor,
 			manifest.get_last_sequence()
 		);
 
@@ -321,9 +354,10 @@ impl CoreInner {
 		};
 
 		// Step 3: Swap memtable while STILL holding write lock
+		let owner = self.default_runtime.owner();
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+			Arc::new(MemTable::new_owned(self.opts.max_memtable_size, owner)),
 		);
 
 		// Set the WAL number on the new (empty) active memtable
@@ -380,6 +414,7 @@ impl CoreInner {
 		if entry.memtable.is_empty() {
 			let mut guard = self.immutable_memtables.write()?;
 			guard.remove(entry.table_id);
+			self.wal_dependencies.release_component(entry.memtable.dependency_id());
 			log::debug!(
 				"flush_oldest_immutable_to_sst: skipped empty memtable table_id={}",
 				entry.table_id
@@ -402,7 +437,7 @@ impl CoreInner {
 
 		// Schedule async WAL cleanup
 		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
-		let min_wal_to_keep = entry.wal_number + 1;
+		let min_wal_to_keep = self.level_manifest.read()?.get_log_number();
 
 		tokio::spawn(async move {
 			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
@@ -427,6 +462,11 @@ impl CoreInner {
 		);
 
 		Ok(Some(table))
+	}
+
+	#[cfg(test)]
+	pub(crate) fn flush_oldest_immutable_for_test(&self) -> Result<Option<Arc<Table>>> {
+		self.flush_oldest_immutable_to_sst()
 	}
 
 	/// Flushes ALL immutable memtables synchronously.
@@ -489,12 +529,13 @@ impl CoreInner {
 
 		// Get the current WAL number for the new memtable
 		let current_wal_number = self.wal.read().get_active_log_number();
+		let owner = self.default_runtime.owner();
 
 		// Swap the active memtable with a new empty one
 		// This allows writes to continue immediately
 		let flushed_memtable = std::mem::replace(
 			&mut *active_memtable,
-			Arc::new(MemTable::new(self.opts.max_memtable_size)),
+			Arc::new(MemTable::new_owned(self.opts.max_memtable_size, owner)),
 		);
 
 		// Set the WAL number on the new active memtable
@@ -581,6 +622,7 @@ impl CoreInner {
 				// Skip empty memtables - just remove from tracking
 				let mut immutable_guard = self.immutable_memtables.write()?;
 				immutable_guard.remove(entry.table_id);
+				self.wal_dependencies.release_component(entry.memtable.dependency_id());
 				log::debug!("Skipped empty immutable memtable: table_id={}", entry.table_id);
 				continue;
 			}
@@ -635,33 +677,26 @@ impl CoreInner {
 			}
 		} else {
 			log::debug!("Active memtable is empty, skipping flush");
+		}
 
-			// Even if active is empty, we should update log_number if we flushed immutables
-			// This marks the WAL as safe to delete
-			if flushed_count > 0 {
-				let current_wal = self.wal.read().get_active_log_number();
-				let changeset = ManifestChangeSet {
-					log_number: Some(current_wal + 1),
-					..Default::default()
-				};
-
-				let mut manifest = self.level_manifest.write()?;
-				let rollback = manifest.apply_changeset(&changeset)?;
-				if let Err(e) = write_manifest_to_disk(&manifest) {
-					manifest.revert_changeset(rollback);
-					let error = Error::Other(format!(
-						"Failed to update manifest log_number after immutable flush: {}",
-						e
-					));
-					self.error_handler
-						.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
-					return Err(error);
-				}
-
-				log::debug!(
-					"Updated manifest log_number to {} after immutable flushes",
-					current_wal + 1
-				);
+		if flushed_count > 0 || !active_is_empty {
+			// Commits and maintenance are stopped by the shutdown caller. With all
+			// components from this lifecycle covered by SSTs, the closed segment
+			// can be skipped in full. Empty reopen/close cycles do not advance it.
+			let current_wal = self.wal.read().get_active_log_number();
+			let dependency_snapshot = self.wal_dependencies.snapshot(current_wal + 1);
+			let changeset = ManifestChangeSet {
+				log_number: Some(dependency_snapshot.replay_floor),
+				..Default::default()
+			};
+			let mut manifest = self.level_manifest.write()?;
+			let rollback = manifest.apply_changeset(&changeset)?;
+			if let Err(error) = write_manifest_to_disk(&manifest) {
+				manifest.revert_changeset(rollback);
+				let error =
+					Error::Other(format!("Failed to finalize shutdown replay floor: {error}"));
+				self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
+				return Err(error);
 			}
 		}
 
@@ -805,6 +840,7 @@ impl CommitEnv for LsmCommitEnv {
 		Ok(PreparedWrite {
 			processed_batch: batch,
 			bytes,
+			wal_segment: None,
 		})
 	}
 
@@ -816,7 +852,17 @@ impl CommitEnv for LsmCommitEnv {
 		prepared.processed_batch.set_starting_seq_num(seq_num);
 
 		let mut wal_guard = self.core.wal.write();
-		wal_guard.append(&prepared.bytes)?;
+		let expected_segment = wal_guard.get_active_log_number();
+		self.core.wal_dependencies.pin_in_flight(seq_num, expected_segment);
+		let actual_segment = match wal_guard.append(&prepared.bytes) {
+			Ok(segment) => segment,
+			Err(error) => {
+				self.core.wal_dependencies.cancel_in_flight(seq_num);
+				return Err(error.into());
+			}
+		};
+		debug_assert_eq!(actual_segment, expected_segment);
+		prepared.wal_segment = Some(actual_segment);
 		if sync {
 			wal_guard.sync()?;
 		}
@@ -836,15 +882,30 @@ impl CommitEnv for LsmCommitEnv {
 	/// specifically because `CommitPipeline::commit` (see commit.rs) runs
 	/// `apply()` outside its `write_mutex`, so concurrent calls to this
 	/// function on the same active memtable are routine.
-	fn apply(&self, batch: &Batch) -> Result<()> {
+	fn apply(&self, prepared: &PreparedWrite) -> Result<()> {
+		let batch = &prepared.processed_batch;
+		let wal_segment = prepared.wal_segment.ok_or_else(|| {
+			Error::Other("WAL-backed apply is missing its actual segment provenance".to_owned())
+		})?;
 		// Try to add to current memtable
-		let result = {
+		let (result, component_id) = {
 			let active_memtable = self.core.active_memtable.read()?;
-			active_memtable.add(batch)
+			let result = active_memtable.add(batch);
+			if result.is_ok() {
+				active_memtable.record_wal_dependency(wal_segment);
+			}
+			(result, active_memtable.dependency_id())
 		};
 
 		match result {
-			Ok(()) => Ok(()),
+			Ok(()) => {
+				self.core.wal_dependencies.handoff_to_component(
+					batch.starting_seq_num,
+					component_id,
+					wal_segment,
+				);
+				Ok(())
+			}
 			Err(Error::ArenaFull) => {
 				// Arena is full - rotate memtable and retry
 				log::debug!("apply: arena full, rotating memtable");
@@ -858,7 +919,16 @@ impl CommitEnv for LsmCommitEnv {
 
 				// Retry on new memtable - must succeed
 				let active_memtable = self.core.active_memtable.read()?;
-				active_memtable.add(batch)
+				let result = active_memtable.add(batch);
+				if result.is_ok() {
+					active_memtable.record_wal_dependency(wal_segment);
+					self.core.wal_dependencies.handoff_to_component(
+						batch.starting_seq_num,
+						active_memtable.dependency_id(),
+						wal_segment,
+					);
+				}
+				result
 			}
 			Err(e) => Err(e),
 		}
@@ -867,6 +937,12 @@ impl CommitEnv for LsmCommitEnv {
 	// Check for background errors before committing
 	fn check_background_error(&self) -> Result<()> {
 		self.core.error_handler.check_error()
+	}
+
+	fn on_durable_apply_failure(&self, error: &Error) {
+		self.core
+			.error_handler
+			.set_error(error.clone(), BackgroundErrorReason::DurableCommitApply);
 	}
 
 	fn oldest_active_start_seq(&self) -> u64 {
@@ -1001,6 +1077,18 @@ impl Core {
 			return Ok((None, None));
 		}
 
+		// The existing single-branch Tree cannot safely install a foreign
+		// branch component. The branch catalog/router replaces this guard in
+		// the branch-aware integration slice; until then recovery fails closed.
+		if memtables
+			.iter()
+			.any(|(memtable, _)| memtable.owner() != crate::batch::BatchOwner::DEFAULT)
+		{
+			return Err(Error::InvalidArgument(
+				"branch-owned WAL requires the branch catalog recovery path".to_owned(),
+			));
+		}
+
 		// Flush all memtables except the last to SST
 		let memtable_count = memtables.len();
 		if memtable_count > 1 {
@@ -1091,6 +1179,9 @@ impl Core {
 			opts.max_memtable_size,
 			|memtable, wal_number| {
 				// Flush intermediate memtable to SST during recovery
+				inner
+					.wal_dependencies
+					.register_component(memtable.dependency_id(), wal_number);
 				let table_id = inner.level_manifest.read()?.next_table_id();
 				inner.flush_immutable_to_sst(Arc::clone(&memtable), table_id, wal_number)?;
 				log::info!(
@@ -1104,6 +1195,10 @@ impl Core {
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
+			inner.wal_dependencies.register_component(
+				memtable.dependency_id(),
+				memtable.get_wal_number(),
+			);
 			let mut active_memtable = inner.active_memtable.write()?;
 			*active_memtable = memtable;
 		}
@@ -1112,7 +1207,11 @@ impl Core {
 		{
 			let active_memtable = inner.active_memtable.read()?;
 			let current_wal_number = inner.wal.read().get_active_log_number();
-			active_memtable.set_wal_number(current_wal_number);
+			if active_memtable.is_empty() {
+				active_memtable.set_wal_number(current_wal_number);
+			} else {
+				active_memtable.record_wal_dependency(current_wal_number);
+			}
 		}
 
 		// Get last_sequence from manifest
@@ -1421,6 +1520,7 @@ impl Tree {
 			let mut immutable_memtables = self.core.inner.immutable_memtables.write()?;
 			*immutable_memtables = ImmutableMemtables::default();
 		}
+		self.core.inner.wal_dependencies.clear();
 
 		// Reopen the WAL from the restored directory
 		let wal_path = self.core.inner.opts.path.join("wal");
@@ -1445,6 +1545,10 @@ impl Tree {
 			self.core.inner.opts.max_memtable_size,
 			|memtable, wal_number| {
 				// Flush intermediate memtable to SST during recovery
+				self.core
+					.inner
+					.wal_dependencies
+					.register_component(memtable.dependency_id(), wal_number);
 				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
 				self.core.inner.flush_immutable_to_sst(
 					Arc::clone(&memtable),
@@ -1462,6 +1566,10 @@ impl Tree {
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
+			self.core.inner.wal_dependencies.register_component(
+				memtable.dependency_id(),
+				memtable.get_wal_number(),
+			);
 			let mut active_memtable = self.core.inner.active_memtable.write()?;
 			*active_memtable = memtable;
 		}
@@ -1470,7 +1578,11 @@ impl Tree {
 		{
 			let active_memtable = self.core.inner.active_memtable.read()?;
 			let current_wal_number = self.core.inner.wal.read().get_active_log_number();
-			active_memtable.set_wal_number(current_wal_number);
+			if active_memtable.is_empty() {
+				active_memtable.set_wal_number(current_wal_number);
+			} else {
+				active_memtable.record_wal_dependency(current_wal_number);
+			}
 		}
 
 		// Get last_sequence from manifest

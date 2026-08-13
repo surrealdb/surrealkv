@@ -177,7 +177,7 @@ async fn test_memtable_flush_with_multiple_keys_and_updates() {
 	}
 
 	// Verify the LSM state: we should have multiple SSTables
-	let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+	let l0_size = tree.core.level_manifest.read().unwrap().default_owner_levels().get_levels()[0].tables.len();
 	assert!(l0_size > 0, "Expected SSTables in L0, got {l0_size}");
 }
 
@@ -226,7 +226,7 @@ async fn test_persistence() {
 		expected_values = values;
 
 		// Verify L0 has tables before closing
-		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+		let l0_size = tree.core.level_manifest.read().unwrap().default_owner_levels().get_levels()[0].tables.len();
 		assert!(l0_size > 0, "Expected SSTables in L0 before closing, got {l0_size}");
 
 		// Tree will be dropped here, closing the store
@@ -238,7 +238,7 @@ async fn test_persistence() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Verify L0 has tables after reopening
-		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+		let l0_size = tree.core.level_manifest.read().unwrap().default_owner_levels().get_levels()[0].tables.len();
 		assert!(l0_size > 0, "Expected SSTables in L0 after reopening, got {l0_size}");
 
 		// Verify all keys have their final values
@@ -1362,14 +1362,14 @@ async fn test_table_id_assignment_across_restart() {
 		tree.flush().unwrap();
 
 		// Verify we have 2 tables in L0
-		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+		let l0_size = tree.core.level_manifest.read().unwrap().default_owner_levels().get_levels()[0].tables.len();
 		assert_eq!(l0_size, 2, "Expected 2 tables in L0 after initial writes, got {l0_size}");
 
 		// Get the table IDs from the first session
 		let (table1_id, table2_id, next_table_id) = {
 			let manifest = tree.core.level_manifest.read().unwrap();
-			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
-			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
+			let table1_id = manifest.default_owner_levels().get_levels()[0].tables[0].id;
+			let table2_id = manifest.default_owner_levels().get_levels()[0].tables[1].id;
 			let next_table_id = manifest.next_table_id();
 			(table1_id, table2_id, next_table_id)
 		};
@@ -1396,12 +1396,12 @@ async fn test_table_id_assignment_across_restart() {
 		{
 			// Verify we still have 2 tables in L0 after reopening
 			let l0_size =
-				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+				tree.core.level_manifest.read().unwrap().default_owner_levels().get_levels()[0].tables.len();
 			assert_eq!(l0_size, 2, "Expected 2 tables in L0 after reopening, got {l0_size}");
 			// Get the table IDs after reopening
 			let manifest = tree.core.level_manifest.read().unwrap();
-			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
-			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
+			let table1_id = manifest.default_owner_levels().get_levels()[0].tables[0].id;
+			let table2_id = manifest.default_owner_levels().get_levels()[0].tables[1].id;
 			let next_table_id = manifest.next_table_id();
 
 			// Verify table IDs are still in correct order (newer table first)
@@ -1431,14 +1431,14 @@ async fn test_table_id_assignment_across_restart() {
 		{
 			// Verify we now have 3 tables in L0
 			let l0_size =
-				tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+				tree.core.level_manifest.read().unwrap().default_owner_levels().get_levels()[0].tables.len();
 			assert_eq!(l0_size, 3, "Expected 3 tables in L0 after adding more data, got {l0_size}");
 
 			// Get the table IDs from all 3 tables
 			let manifest = tree.core.level_manifest.read().unwrap();
-			let table1_id = manifest.levels.get_levels()[0].tables[0].id;
-			let table2_id = manifest.levels.get_levels()[0].tables[1].id;
-			let table3_id = manifest.levels.get_levels()[0].tables[2].id;
+			let table1_id = manifest.default_owner_levels().get_levels()[0].tables[0].id;
+			let table2_id = manifest.default_owner_levels().get_levels()[0].tables[1].id;
+			let table3_id = manifest.default_owner_levels().get_levels()[0].tables[2].id;
 			let next_table_id = manifest.next_table_id();
 
 			// Verify table IDs are in correct order (newer tables first)
@@ -1478,14 +1478,14 @@ async fn test_table_id_assignment_across_restart() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Verify we still have 3 tables
-		let l0_size = tree.core.level_manifest.read().unwrap().levels.get_levels()[0].tables.len();
+		let l0_size = tree.core.level_manifest.read().unwrap().default_owner_levels().get_levels()[0].tables.len();
 		assert_eq!(l0_size, 3, "Expected 3 tables in L0 after final reopen, got {l0_size}");
 
 		// Verify table IDs are still in correct order (newer tables first)
 		let manifest = tree.core.level_manifest.read().unwrap();
-		let table1_id = manifest.levels.get_levels()[0].tables[0].id;
-		let table2_id = manifest.levels.get_levels()[0].tables[1].id;
-		let table3_id = manifest.levels.get_levels()[0].tables[2].id;
+		let table1_id = manifest.default_owner_levels().get_levels()[0].tables[0].id;
+		let table2_id = manifest.default_owner_levels().get_levels()[0].tables[1].id;
+		let table3_id = manifest.default_owner_levels().get_levels()[0].tables[2].id;
 		let next_table_id = manifest.next_table_id();
 
 		assert!(
@@ -3212,7 +3212,7 @@ async fn test_manifest_atomic_sst_and_log_number() {
 	{
 		let manifest = tree.core.inner.level_manifest.read().unwrap();
 		let new_log_number = manifest.get_log_number();
-		let level0_tables = &manifest.levels.get_levels()[0].tables;
+		let level0_tables = &manifest.default_owner_levels().get_levels()[0].tables;
 
 		// SST should be flushed now
 		assert!(!level0_tables.is_empty(), "SST should be flushed");
@@ -3255,7 +3255,7 @@ async fn test_no_spurious_small_flush() {
 	{
 		let manifest = tree.core.inner.level_manifest.read().unwrap();
 		assert!(
-			manifest.levels.get_levels()[0].tables.is_empty(),
+			manifest.default_owner_levels().get_levels()[0].tables.is_empty(),
 			"Should not flush small memtable due to spurious notification"
 		);
 		drop(manifest);

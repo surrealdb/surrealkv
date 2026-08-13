@@ -20,8 +20,9 @@
 use std::collections::HashMap;
 
 use parking_lot::Mutex;
-use xxhash_rust::xxh3::xxh3_64;
+use xxhash_rust::xxh3::{xxh3_64, xxh3_64_with_seed};
 
+use crate::batch::BatchOwner;
 use crate::error::{Error, Result};
 
 /// Throttle on GC frequency inside `publish`. GC runs at most once per
@@ -30,8 +31,9 @@ use crate::error::{Error, Result};
 pub(crate) const GC_INTERVAL: u32 = 1024;
 
 #[inline]
-fn fp(key: &[u8]) -> u64 {
-	xxh3_64(key)
+fn owned_fp(owner: BatchOwner, key: &[u8]) -> u64 {
+	let owner_seed = xxh3_64(&owner.branch.0) ^ owner.generation.0.rotate_left(17);
+	xxh3_64_with_seed(key, owner_seed)
 }
 
 pub(crate) struct CommitOracle {
@@ -91,7 +93,20 @@ impl CommitOracle {
 	/// Called under `write_mutex` BEFORE seq allocation. Returns:
 	/// - `TransactionRetry` if `start_seq < kept_since` (window GC'd).
 	/// - `TransactionWriteConflict` if any key was committed at seq > start_seq.
+	#[cfg(test)]
 	pub(crate) fn check<'a, I>(&self, keys: I, start_seq: u64) -> Result<()>
+	where
+		I: IntoIterator<Item = &'a [u8]>,
+	{
+		self.check_owned(BatchOwner::DEFAULT, keys, start_seq)
+	}
+
+	pub(crate) fn check_owned<'a, I>(
+		&self,
+		owner: BatchOwner,
+		keys: I,
+		start_seq: u64,
+	) -> Result<()>
 	where
 		I: IntoIterator<Item = &'a [u8]>,
 	{
@@ -99,11 +114,12 @@ impl CommitOracle {
 		if start_seq < g.kept_since {
 			return Err(Error::TransactionRetry);
 		}
-		for k in keys {
-			if let Some(&committed) = g.recent_writes.get(&fp(k)) {
-				if committed > start_seq {
-					return Err(Error::TransactionWriteConflict);
-				}
+		for key in keys {
+			if g.recent_writes
+				.get(&owned_fp(owner, key))
+				.is_some_and(|committed| *committed > start_seq)
+			{
+				return Err(Error::TransactionWriteConflict);
 			}
 		}
 		Ok(())
@@ -123,47 +139,31 @@ impl CommitOracle {
 	/// advanced past what we last pruned to).
 	///
 	/// Called under `write_mutex` AFTER seq allocation, BEFORE WAL.
+	#[cfg(test)]
 	pub(crate) fn publish<'a, I>(&self, keys: I, seq_num: u64, count: u64, oldest_active: u64)
 	where
 		I: IntoIterator<Item = &'a [u8]>,
 	{
-		debug_assert!(count >= 1, "publish called with count=0");
+		self.publish_owned(BatchOwner::DEFAULT, keys, seq_num, count, oldest_active);
+	}
+
+	pub(crate) fn publish_owned<'a, I>(
+		&self,
+		owner: BatchOwner,
+		keys: I,
+		seq_num: u64,
+		count: u64,
+		oldest_active: u64,
+	) where
+		I: IntoIterator<Item = &'a [u8]>,
+	{
+		debug_assert!(count >= 1, "publish_owned called with count=0");
 		let mut g = self.inner.lock();
 		let stamp = seq_num + count - 1;
-		for k in keys {
-			g.recent_writes.insert(fp(k), stamp);
+		for key in keys {
+			g.recent_writes.insert(owned_fp(owner, key), stamp);
 		}
-
-		// `saturating_add` so the counter doesn't overflow if the watermark
-		// stays pinned across billions of commits (theoretical edge case under
-		// a stuck long-running reader). Once the watermark moves, the GC body
-		// runs and resets the counter to 0.
-		g.commits_since_gc = g.commits_since_gc.saturating_add(1);
-
-		// Two gates, both required:
-		//   (a) Enough commits since the last sweep — perf throttle.
-		//   (b) Watermark has advanced past what we already pruned to —
-		//       skip fruitless walks.
-		// `oldest_active` is expected to be non-decreasing across firings:
-		// it's clamped at the call site by the committing txn's `start_seq`
-		// (see `CommitPipeline::commit`), and both `active_txn_tracker.oldest`
-		// and `visible_seq_num` are monotonic. The debug-only assert below
-		// catches caller-side regressions.
-		if g.commits_since_gc >= GC_INTERVAL && oldest_active > g.kept_since {
-			#[cfg(debug_assertions)]
-			{
-				debug_assert!(
-					oldest_active >= g.last_gc_oldest_active,
-					"oldest_active regressed across GC bodies: prev={} new={}",
-					g.last_gc_oldest_active,
-					oldest_active,
-				);
-				g.last_gc_oldest_active = oldest_active;
-			}
-			g.commits_since_gc = 0;
-			g.kept_since = oldest_active;
-			g.recent_writes.retain(|_, v| *v >= oldest_active);
-		}
+		Self::maybe_gc(&mut g, oldest_active);
 	}
 
 	/// Roll back oracle entries reserved by a transaction whose commit
@@ -188,18 +188,43 @@ impl CommitOracle {
 	/// pre-existing apply-failure / seq-gap issue documented at
 	/// `src/commit.rs` (around the "Sequence number gaps" comment block)
 	/// and is orthogonal to this rollback's live-process soundness.
+	#[cfg(test)]
 	pub(crate) fn rollback<'a, I>(&self, keys: I, my_seq: u64)
 	where
 		I: IntoIterator<Item = &'a [u8]>,
 	{
+		self.rollback_owned(BatchOwner::DEFAULT, keys, my_seq);
+	}
+
+	pub(crate) fn rollback_owned<'a, I>(&self, owner: BatchOwner, keys: I, my_seq: u64)
+	where
+		I: IntoIterator<Item = &'a [u8]>,
+	{
 		let mut g = self.inner.lock();
-		for k in keys {
-			let fk = fp(k);
-			if let Some(&v) = g.recent_writes.get(&fk) {
-				if v == my_seq {
-					g.recent_writes.remove(&fk);
-				}
+		for key in keys {
+			let fingerprint = owned_fp(owner, key);
+			if g.recent_writes.get(&fingerprint).is_some_and(|stamp| *stamp == my_seq) {
+				g.recent_writes.remove(&fingerprint);
 			}
+		}
+	}
+
+	fn maybe_gc(g: &mut OracleInner, oldest_active: u64) {
+		g.commits_since_gc = g.commits_since_gc.saturating_add(1);
+		if g.commits_since_gc >= GC_INTERVAL && oldest_active > g.kept_since {
+			#[cfg(debug_assertions)]
+			{
+				debug_assert!(
+					oldest_active >= g.last_gc_oldest_active,
+					"oldest_active regressed across GC bodies: prev={} new={}",
+					g.last_gc_oldest_active,
+					oldest_active,
+				);
+				g.last_gc_oldest_active = oldest_active;
+			}
+			g.commits_since_gc = 0;
+			g.kept_since = oldest_active;
+			g.recent_writes.retain(|_, version| *version >= oldest_active);
 		}
 	}
 
@@ -243,6 +268,7 @@ impl CommitOracle {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::{BranchGeneration, BranchId};
 
 	fn key(s: &str) -> Vec<u8> {
 		s.as_bytes().to_vec()
@@ -277,6 +303,26 @@ mod tests {
 		let o = CommitOracle::new();
 		o.publish([key("a").as_slice()], 10, 1, 0);
 		assert!(o.check([key("b").as_slice()], 5).is_ok());
+	}
+
+	#[test]
+	fn same_user_key_conflicts_only_within_one_branch_generation() {
+		let oracle = CommitOracle::new();
+		let first = BatchOwner {
+			branch: BranchId::from_u128(1),
+			generation: BranchGeneration(1),
+		};
+		let second = BatchOwner {
+			branch: BranchId::from_u128(2),
+			generation: BranchGeneration(1),
+		};
+		oracle.publish_owned(first, [key("shared").as_slice()], 10, 1, 0);
+
+		assert!(matches!(
+			oracle.check_owned(first, [key("shared").as_slice()], 5),
+			Err(Error::TransactionWriteConflict)
+		));
+		assert!(oracle.check_owned(second, [key("shared").as_slice()], 5).is_ok());
 	}
 
 	#[test]

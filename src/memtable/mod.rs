@@ -9,8 +9,8 @@ use arena::Arena;
 pub(crate) use skiplist::max_entry_bytes;
 use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
 
-use crate::batch::Batch;
-use crate::error::Result;
+use crate::batch::{Batch, BatchOwner};
+use crate::error::{Error, Result};
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::{InternalKey, InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX};
@@ -62,9 +62,20 @@ impl ImmutableMemtables {
 	pub(crate) fn first(&self) -> Option<&ImmutableEntry> {
 		self.0.first()
 	}
+
+	#[cfg(test)]
+	pub(crate) fn replay_floor_excluding(&self, table_id: u64, active_wal: u64) -> u64 {
+		self.0
+			.iter()
+			.filter(|entry| entry.table_id != table_id)
+			.map(|entry| entry.wal_number)
+			.fold(active_wal, u64::min)
+	}
 }
 
 pub(crate) struct MemTable {
+	dependency_id: crate::wal::dependency::ComponentId,
+	owner: BatchOwner,
 	skiplist: Skiplist,
 	latest_seq_num: AtomicU64,
 	/// WAL number that was current when this memtable started receiving writes.
@@ -100,10 +111,17 @@ impl Drop for ReservationGuard<'_> {
 
 impl MemTable {
 	pub(crate) fn new(arena_capacity: usize) -> Self {
+		Self::new_owned(arena_capacity, BatchOwner::DEFAULT)
+	}
+
+	pub(crate) fn new_owned(arena_capacity: usize, owner: BatchOwner) -> Self {
+		static NEXT_DEPENDENCY_ID: AtomicU64 = AtomicU64::new(1);
 		let arena = Arc::new(Arena::new(arena_capacity));
 		let cmp: Compare = |a, b| a.cmp(b);
 		let skiplist = Skiplist::new(arena, cmp);
 		MemTable {
+			dependency_id: NEXT_DEPENDENCY_ID.fetch_add(1, Ordering::Relaxed),
+			owner,
 			skiplist,
 			latest_seq_num: AtomicU64::new(0),
 			wal_number: AtomicU64::new(0),
@@ -111,11 +129,26 @@ impl MemTable {
 		}
 	}
 
+	pub(crate) fn owner(&self) -> BatchOwner {
+		self.owner
+	}
+
+	pub(crate) fn dependency_id(&self) -> crate::wal::dependency::ComponentId {
+		self.dependency_id
+	}
+
 	/// Sets the WAL number associated with this memtable.
 	/// This should be called when the memtable starts receiving writes
 	/// to track which WAL contains its data.
 	pub(crate) fn set_wal_number(&self, wal_number: u64) {
 		self.wal_number.store(wal_number, Ordering::Release);
+	}
+
+	/// Records the earliest actual WAL segment containing an entry applied to
+	/// this memtable. This may move backwards when a delayed apply lands after
+	/// a concurrent WAL/memtable rotation.
+	pub(crate) fn record_wal_dependency(&self, wal_number: u64) {
+		self.wal_number.fetch_min(wal_number, Ordering::AcqRel);
 	}
 
 	/// Gets the WAL number associated with this memtable.
@@ -221,6 +254,11 @@ impl MemTable {
 	/// # Arguments
 	/// * `batch` - The batch of operations to apply
 	pub(crate) fn add(&self, batch: &Batch) -> Result<()> {
+		if batch.owner != self.owner {
+			return Err(Error::InvalidArgument(
+				"batch owner does not match branch-pure memtable owner".to_owned(),
+			));
+		}
 		let needed = batch.memtable_size_estimate();
 		self.try_reserve(needed)?;
 		let _guard = ReservationGuard {
@@ -313,7 +351,8 @@ impl MemTable {
 
 		{
 			let file = SysFile::create(&table_file_path)?;
-			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
+			let mut table_writer =
+				TableWriter::new_owned(file, table_id, Arc::clone(&lsm_opts), 0, self.owner); // Memtables always flush to L0
 
 			let mut iter = self.iter();
 			iter.seek_first()?;

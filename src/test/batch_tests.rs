@@ -1,7 +1,7 @@
 use test_log::test;
 
-use crate::batch::{Batch, BATCH_VERSION, MAX_BATCH_SIZE};
-use crate::InternalKeyKind;
+use crate::batch::{Batch, BatchOwner, BATCH_VERSION, MAX_BATCH_SIZE};
+use crate::{BranchGeneration, BranchId, InternalKeyKind};
 
 #[test]
 fn test_batch_new() {
@@ -94,6 +94,39 @@ fn test_patch_encoded_seq_roundtrip() {
 	direct.set(b"key1".to_vec(), b"value1".to_vec(), 7).unwrap();
 	direct.set(b"key2".to_vec(), b"value2".to_vec(), 8).unwrap();
 	assert_eq!(bytes, direct.encode().unwrap(), "patched buffer must equal direct encode");
+}
+
+#[test]
+fn branch_owner_roundtrips_without_entering_user_keys() {
+	let owner = BatchOwner {
+		branch: BranchId::from_u128(0xfeed),
+		generation: BranchGeneration(7),
+	};
+	let mut batch = Batch::for_owner(41, owner);
+	batch.set(b"plain-user-key".to_vec(), b"value".to_vec(), 9).unwrap();
+
+	let encoded = batch.encode().unwrap();
+	let decoded = Batch::decode(&encoded).unwrap();
+
+	assert_eq!(decoded.owner, owner);
+	assert_eq!(decoded.entries()[0].key, b"plain-user-key");
+	assert_eq!(decoded.entries()[0].key.len(), b"plain-user-key".len());
+}
+
+#[test]
+fn branch_owner_header_truncation_fails_closed_without_panicking() {
+	let owner = BatchOwner {
+		branch: BranchId::from_u128(3),
+		generation: BranchGeneration(11),
+	};
+	let encoded = Batch::for_owner(1, owner).encode().unwrap();
+
+	for prefix_len in 0..encoded.len() {
+		assert!(
+			Batch::decode(&encoded[..prefix_len]).is_err(),
+			"truncated prefix {prefix_len} unexpectedly decoded"
+		);
+	}
 }
 
 #[test]

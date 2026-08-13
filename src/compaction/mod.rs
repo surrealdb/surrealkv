@@ -23,6 +23,12 @@ pub enum CompactionChoice {
 
 /// Defines the strategy interface for compaction
 pub trait CompactionStrategy: Send + Sync {
-	/// Determines which levels should be compacted
-	fn pick_levels(&self, manifest: &LevelManifest) -> Result<CompactionChoice>;
+	/// Determines which levels of one physical owner's level set should be
+	/// compacted. Strategies only ever see the selected owner's tables, so a
+	/// mixed-owner compaction cannot be picked.
+	fn pick_levels(
+		&self,
+		manifest: &LevelManifest,
+		owner: crate::batch::BatchOwner,
+	) -> Result<CompactionChoice>;
 }

@@ -1,13 +1,35 @@
 use integer_encoding::{VarInt, VarIntWriter};
 
 use crate::error::{Error, Result};
-use crate::{InternalKeyKind, Key, Value};
+use crate::{BranchGeneration, BranchId, InternalKeyKind, Key, Value};
 
 pub(crate) const MAX_BATCH_SIZE: u64 = 1 << 32;
 /// Inline-only batch encoding version. The sequence number is fixed-width so
 /// the commit pipeline can stamp it in place. Earlier, incompatible layouts
 /// are intentionally rejected.
-pub(crate) const BATCH_VERSION: u8 = 3;
+pub(crate) const BATCH_VERSION: u8 = 4;
+
+/// Physical owner of every row in a commit batch. Ownership stays in the
+/// batch/component metadata and is deliberately not prefixed into user keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BatchOwner {
+	pub(crate) branch: BranchId,
+	pub(crate) generation: BranchGeneration,
+}
+
+impl BatchOwner {
+	/// Owner used by the existing single-branch runtime during integration.
+	pub(crate) const DEFAULT: Self = Self {
+		branch: BranchId([0; 16]),
+		generation: BranchGeneration(0),
+	};
+}
+
+impl Default for BatchOwner {
+	fn default() -> Self {
+		Self::DEFAULT
+	}
+}
 /// Represents a single entry in a batch
 #[derive(Debug, Clone)]
 pub(crate) struct BatchEntry {
@@ -20,6 +42,7 @@ pub(crate) struct BatchEntry {
 #[derive(Debug, Clone)]
 pub(crate) struct Batch {
 	pub(crate) version: u8,
+	pub(crate) owner: BatchOwner,
 	pub(crate) entries: Vec<BatchEntry>,
 	// The WAL log sequence number assigned to the first entry in this batch.
 	// Stamped by `CommitPipeline::commit` under `write_mutex` after the
@@ -37,9 +60,14 @@ impl Default for Batch {
 
 impl Batch {
 	pub(crate) fn new(starting_seq_num: u64) -> Self {
+		Self::for_owner(starting_seq_num, BatchOwner::DEFAULT)
+	}
+
+	pub(crate) fn for_owner(starting_seq_num: u64, owner: BatchOwner) -> Self {
 		Self {
 			entries: Vec::new(),
 			version: BATCH_VERSION,
+			owner,
 			starting_seq_num,
 			size: 0,
 		}
@@ -65,6 +93,11 @@ impl Batch {
 		// Fixed width (vs varint) lets the commit pipeline stamp the seq in
 		// place after pre-encoding off the write lock — see `patch_encoded_seq`.
 		encoded.extend_from_slice(&self.starting_seq_num.to_le_bytes());
+
+		// Write branch identity and generation. These bytes identify the
+		// component owner; user keys remain unchanged.
+		encoded.extend_from_slice(&self.owner.branch.0);
+		encoded.extend_from_slice(&self.owner.generation.0.to_le_bytes());
 
 		// Write count (4 bytes)
 		encoded.write_varint(self.entries.len() as u32)?;
@@ -225,24 +258,29 @@ impl Batch {
 			return Err(Error::InvalidBatchRecord);
 		}
 
-		if data.len() < pos + 8 {
-			return Err(Error::InvalidBatchRecord);
-		}
-		let seq_num = u64::from_le_bytes(
-			data[pos..pos + 8].try_into().map_err(|_| Error::InvalidBatchRecord)?,
-		);
-		pos += 8;
+		let seq_num = u64::from_le_bytes(take(data, &mut pos, 8)?.try_into().unwrap());
+		let mut branch = [0; 16];
+		branch.copy_from_slice(take(data, &mut pos, 16)?);
+		let generation = u64::from_le_bytes(take(data, &mut pos, 8)?.try_into().unwrap());
+		let owner = BatchOwner {
+			branch: BranchId(branch),
+			generation: BranchGeneration(generation),
+		};
 
 		// Read count
-		let (count, bytes_read) = u32::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+		let (count, bytes_read) =
+			u32::decode_var(data.get(pos..).ok_or(Error::InvalidBatchRecord)?)
+				.ok_or(Error::InvalidBatchRecord)?;
 		pos += bytes_read;
+		if count as usize > data.len().saturating_sub(pos) / 4 {
+			return Err(Error::InvalidBatchRecord);
+		}
 
 		// Read entries
 		let mut entries = Vec::with_capacity(count as usize);
 		for _ in 0..count {
 			// Read kind
-			let kind_byte = data[pos];
-			pos += 1;
+			let kind_byte = take(data, &mut pos, 1)?[0];
 			let kind = InternalKeyKind::from(kind_byte);
 			if kind == InternalKeyKind::Invalid {
 				return Err(Error::InvalidBatchRecord);
@@ -250,18 +288,20 @@ impl Batch {
 
 			// Read key
 			let (key_len, bytes_read) =
-				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+				u64::decode_var(data.get(pos..).ok_or(Error::InvalidBatchRecord)?)
+					.ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
-			let key = data[pos..pos + key_len as usize].to_vec();
-			pos += key_len as usize;
+			let key_len = usize::try_from(key_len).map_err(|_| Error::InvalidBatchRecord)?;
+			let key = take(data, &mut pos, key_len)?.to_vec();
 
 			// Read value
 			let (value_len, bytes_read) =
-				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+				u64::decode_var(data.get(pos..).ok_or(Error::InvalidBatchRecord)?)
+					.ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
+			let value_len = usize::try_from(value_len).map_err(|_| Error::InvalidBatchRecord)?;
 			let value = if value_len > 0 {
-				let value_data = data[pos..pos + value_len as usize].to_vec();
-				pos += value_len as usize;
+				let value_data = take(data, &mut pos, value_len)?.to_vec();
 				Some(value_data)
 			} else if matches!(
 				kind,
@@ -277,7 +317,8 @@ impl Batch {
 
 			// Read timestamp
 			let (timestamp, bytes_read) =
-				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+				u64::decode_var(data.get(pos..).ok_or(Error::InvalidBatchRecord)?)
+					.ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
 
 			entries.push(BatchEntry {
@@ -294,9 +335,17 @@ impl Batch {
 
 		Ok(Self {
 			version,
+			owner,
 			entries,
 			starting_seq_num: seq_num,
 			size: 0, // Decoded batches don't track size
 		})
 	}
+}
+
+fn take<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
+	let end = pos.checked_add(len).ok_or(Error::InvalidBatchRecord)?;
+	let bytes = data.get(*pos..end).ok_or(Error::InvalidBatchRecord)?;
+	*pos = end;
+	Ok(bytes)
 }

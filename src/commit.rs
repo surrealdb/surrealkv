@@ -37,6 +37,9 @@ fn max_concurrent_commits() -> usize {
 pub(crate) struct PreparedWrite {
 	pub(crate) processed_batch: Batch,
 	pub(crate) bytes: Vec<u8>,
+	/// Actual WAL segment selected under the append lock. Durable engines set
+	/// this before append; non-WAL test environments leave it as `None`.
+	pub(crate) wal_segment: Option<u64>,
 }
 
 // Trait for commit operations
@@ -50,11 +53,17 @@ pub trait CommitEnv: Send + Sync + 'static {
 	// a WAL append, no clone/encode).
 	fn write_prepared(&self, prepared: &mut PreparedWrite, seq_num: u64, sync: bool) -> Result<()>;
 
-	// Apply processed batch to memtable
-	fn apply(&self, batch: &Batch) -> Result<()>;
+	// Apply the processed batch using durability provenance captured by
+	// `write_prepared`.
+	fn apply(&self, prepared: &PreparedWrite) -> Result<()>;
 
 	// Check for background errors before committing
 	fn check_background_error(&self) -> Result<()>;
+
+	/// Latch a fail-closed runtime error when WAL durability succeeded but
+	/// memtable apply failed. Test environments without durable storage may use
+	/// the default no-op.
+	fn on_durable_apply_failure(&self, _error: &Error) {}
 
 	// Smallest `start_seq_num` of any currently-live transaction.
 	// Used by the commit oracle to compute its GC threshold under
@@ -68,6 +77,7 @@ struct CommitBatch {
 	seq_num: AtomicU64,
 	count: u32, // Number of entries in the batch
 	applied: AtomicBool,
+	apply_succeeded: AtomicBool,
 	complete_tx: Mutex<Option<oneshot::Sender<Result<()>>>>,
 }
 
@@ -78,6 +88,7 @@ impl CommitBatch {
 			seq_num: AtomicU64::new(0),
 			count,
 			applied: AtomicBool::new(false),
+			apply_succeeded: AtomicBool::new(false),
 			complete_tx: Mutex::new(Some(tx)),
 		});
 		(commit, rx)
@@ -92,11 +103,20 @@ impl CommitBatch {
 	}
 
 	fn mark_applied(&self) {
+		self.apply_succeeded.store(true, Ordering::Release);
+		self.applied.store(true, Ordering::Release);
+	}
+
+	fn mark_failed(&self) {
 		self.applied.store(true, Ordering::Release);
 	}
 
 	fn is_applied(&self) -> bool {
 		self.applied.load(Ordering::Acquire)
+	}
+
+	fn apply_succeeded(&self) -> bool {
+		self.apply_succeeded.load(Ordering::Acquire)
 	}
 
 	fn complete(&self, result: Result<()>) {
@@ -334,7 +354,8 @@ impl CommitPipeline {
 
 			// Validate against the oracle. No state has changed yet; on
 			// failure `?` simply returns the error to the caller.
-			self.oracle.check(
+			self.oracle.check_owned(
+				prepared.processed_batch.owner,
 				prepared.processed_batch.entries.iter().map(|e| e.key.as_slice()),
 				start_seq,
 			)?;
@@ -352,7 +373,8 @@ impl CommitPipeline {
 			// txn's snapshot). With this clamp, `kept_since` can never advance past
 			// the committing txn's own snapshot — regardless of caller hygiene.
 			let oldest_active = self.env.oldest_active_start_seq().min(start_seq);
-			self.oracle.publish(
+			self.oracle.publish_owned(
+				prepared.processed_batch.owner,
 				prepared.processed_batch.entries.iter().map(|e| e.key.as_slice()),
 				seq_num,
 				count,
@@ -373,7 +395,8 @@ impl CommitPipeline {
 					// we stamped; the seq-match guard leaves concurrent
 					// overwriters untouched.
 					let stamp = seq_num + count - 1;
-					self.oracle.rollback(
+					self.oracle.rollback_owned(
+						prepared.processed_batch.owner,
 						prepared.processed_batch.entries.iter().map(|e| e.key.as_slice()),
 						stamp,
 					);
@@ -382,7 +405,7 @@ impl CommitPipeline {
 					// so a concurrent publish() can't dequeue and call
 					// complete(Ok) before our Err is set.
 					commit_batch.complete(Err(e.clone()));
-					commit_batch.mark_applied();
+					commit_batch.mark_failed();
 					// Release write_mutex before draining the queue.
 					drop(_guard);
 					self.publish();
@@ -395,7 +418,7 @@ impl CommitPipeline {
 		// Memtable apply — OUTSIDE write_mutex. The next committer can already
 		// be inside the critical section. This restores the pipeline overlap
 		// that PR #378 destroyed.
-		let apply_result = self.env.apply(&prepared.processed_batch);
+		let apply_result = self.env.apply(&prepared);
 
 		// =========================================================================
 		// Failure-path invariants
@@ -416,11 +439,13 @@ impl CommitPipeline {
 		// =========================================================================
 
 		let apply_err = if let Err(ref e) = apply_result {
+			self.env.on_durable_apply_failure(e);
 			// Roll back this txn's oracle entries so subsequent same-key
 			// commits don't false-abort against a ghost stamp.
 			let count = prepared.processed_batch.count() as u64;
 			let stamp = allocated_seq + count - 1;
-			self.oracle.rollback(
+			self.oracle.rollback_owned(
+				prepared.processed_batch.owner,
 				prepared.processed_batch.entries.iter().map(|e| e.key.as_slice()),
 				stamp,
 			);
@@ -435,7 +460,11 @@ impl CommitPipeline {
 			None
 		};
 
-		commit_batch.mark_applied();
+		if apply_err.is_some() {
+			commit_batch.mark_failed();
+		} else {
+			commit_batch.mark_applied();
+		}
 
 		// Publish (multi-consumer) - MUST always run to drain queue
 		self.publish();
@@ -459,6 +488,11 @@ impl CommitPipeline {
 
 			match dequeued {
 				Some(batch) => {
+					if !batch.apply_succeeded() {
+						// The error was delivered before `mark_failed`. Drain the
+						// queue slot without making an absent memtable row visible.
+						continue;
+					}
 					// Publish this batch's sequence number
 					let new_visible = batch.get_seq_num() + batch.count as u64 - 1;
 
@@ -516,7 +550,8 @@ mod tests {
 	use test_log::test;
 
 	use super::*;
-	use crate::InternalKeyKind;
+	use crate::batch::BatchOwner;
+	use crate::{BranchGeneration, BranchId, InternalKeyKind};
 
 	fn test_visible_seq_num() -> Arc<AtomicU64> {
 		Arc::new(AtomicU64::new(0))
@@ -549,6 +584,7 @@ mod tests {
 		Ok(PreparedWrite {
 			processed_batch: batch,
 			bytes,
+			wal_segment: None,
 		})
 	}
 
@@ -574,7 +610,7 @@ mod tests {
 			mock_write_prepared(prepared, seq_num)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _prepared: &PreparedWrite) -> Result<()> {
 			Ok(())
 		}
 
@@ -607,6 +643,35 @@ mod tests {
 		);
 
 		pipeline.shutdown();
+	}
+
+	#[test(tokio::test)]
+	async fn commit_conflicts_are_scoped_by_branch_owner() {
+		let pipeline =
+			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
+		let first = BatchOwner {
+			branch: BranchId::from_u128(1),
+			generation: BranchGeneration(1),
+		};
+		let second = BatchOwner {
+			branch: BranchId::from_u128(2),
+			generation: BranchGeneration(1),
+		};
+		let mut first_batch = Batch::for_owner(0, first);
+		first_batch.set(b"shared".to_vec(), b"first".to_vec(), 0).unwrap();
+		pipeline.commit(first_batch, false, 0).await.unwrap();
+
+		let mut second_batch = Batch::for_owner(0, second);
+		second_batch.set(b"shared".to_vec(), b"second".to_vec(), 0).unwrap();
+		pipeline.commit(second_batch, false, 0).await.unwrap();
+
+		let mut conflicting = Batch::for_owner(0, first);
+		conflicting.set(b"shared".to_vec(), b"third".to_vec(), 0).unwrap();
+		assert!(matches!(
+			pipeline.commit(conflicting, false, 0).await,
+			Err(Error::TransactionWriteConflict)
+		));
+		assert_eq!(pipeline.get_visible_seq_num(), 2);
 	}
 
 	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
@@ -696,7 +761,7 @@ mod tests {
 			mock_write_prepared(prepared, seq_num)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _prepared: &PreparedWrite) -> Result<()> {
 			let start = std::time::Instant::now();
 			while start.elapsed() < Duration::from_micros(50) {
 				std::hint::spin_loop();
@@ -783,7 +848,7 @@ mod tests {
 			mock_write_prepared(prepared, seq_num)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _prepared: &PreparedWrite) -> Result<()> {
 			Err(Error::CommitFail("simulated apply failure".into()))
 		}
 
@@ -856,7 +921,7 @@ mod tests {
 			mock_write_prepared(prepared, seq_num)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _prepared: &PreparedWrite) -> Result<()> {
 			// Increment call count and get previous value
 			let call_num = self.call_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -945,6 +1010,67 @@ mod tests {
 		pipeline.shutdown();
 	}
 
+	struct FencingApplyEnv {
+		fenced: AtomicBool,
+	}
+
+	impl CommitEnv for FencingApplyEnv {
+		fn pre_serialize(&self, batch: Batch) -> Result<PreparedWrite> {
+			mock_pre_serialize(batch)
+		}
+
+		fn write_prepared(
+			&self,
+			prepared: &mut PreparedWrite,
+			seq_num: u64,
+			_sync: bool,
+		) -> Result<()> {
+			mock_write_prepared(prepared, seq_num)
+		}
+
+		fn apply(&self, _prepared: &PreparedWrite) -> Result<()> {
+			Err(Error::CommitFail("durable apply failed".into()))
+		}
+
+		fn check_background_error(&self) -> Result<()> {
+			if self.fenced.load(Ordering::Acquire) {
+				Err(Error::CommitFail("recovery required".into()))
+			} else {
+				Ok(())
+			}
+		}
+
+		fn on_durable_apply_failure(&self, _error: &Error) {
+			self.fenced.store(true, Ordering::Release);
+		}
+
+		fn oldest_active_start_seq(&self) -> u64 {
+			0
+		}
+	}
+
+	#[test(tokio::test)]
+	async fn durable_apply_failure_fences_subsequent_commits() {
+		let env = Arc::new(FencingApplyEnv {
+			fenced: AtomicBool::new(false),
+		});
+		let pipeline = CommitPipeline::new(env, test_visible_seq_num(), test_write_stall());
+
+		let mut first = Batch::new(0);
+		first.set(b"first".to_vec(), b"one".to_vec(), 0).unwrap();
+		assert!(pipeline.commit(first, false, 0).await.is_err());
+
+		let mut second = Batch::new(0);
+		second.set(b"second".to_vec(), b"two".to_vec(), 0).unwrap();
+		let error = pipeline.commit(second, false, 0).await.unwrap_err();
+		assert!(matches!(error, Error::CommitFail(message) if message == "recovery required"));
+		assert_eq!(
+			pipeline.get_visible_seq_num(),
+			0,
+			"neither the unresolved commit nor a later mutation may become visible"
+		);
+	}
+
 	/// A misbehaving `CommitEnv` reporting `oldest_active_start_seq` >
 	/// `start_seq` (e.g. caller bypassed `Transaction::new` and the
 	/// `(None, None)` fallback returned an over-large `visible_seq_num`)
@@ -969,7 +1095,7 @@ mod tests {
 			mock_write_prepared(prepared, seq_num)
 		}
 
-		fn apply(&self, _batch: &Batch) -> Result<()> {
+		fn apply(&self, _prepared: &PreparedWrite) -> Result<()> {
 			Ok(())
 		}
 

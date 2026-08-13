@@ -333,8 +333,10 @@ impl Wal {
 
 		self.active_writer.add_record(rec)?;
 
-		// Return 0 for now (offset tracking can be added if needed)
-		Ok(0)
+		// The caller must carry the actual segment into memtable apply. Apply
+		// runs outside the commit write mutex, so observing the active segment
+		// later is racy with WAL rotation.
+		Ok(self.active_log_number)
 	}
 
 	pub(crate) fn sync(&mut self) -> Result<()> {

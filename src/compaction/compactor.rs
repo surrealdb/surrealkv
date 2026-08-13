@@ -2,6 +2,7 @@ use std::fs::File as SysFile;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
+use crate::batch::BatchOwner;
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
@@ -47,6 +48,10 @@ impl Drop for HiddenTablesGuard {
 /// Compaction options
 pub(crate) struct CompactionOptions {
 	pub(crate) lopts: Arc<LSMOptions>,
+	/// Physical owner whose level set this compaction operates on. Picking
+	/// and changeset application never see another owner's tables, so a
+	/// mixed-owner compaction is unrepresentable.
+	pub(crate) owner: BatchOwner,
 	pub(crate) level_manifest: Arc<RwLock<LevelManifest>>,
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
@@ -62,6 +67,7 @@ impl CompactionOptions {
 	pub(crate) fn from(tree: &CoreInner) -> Self {
 		Self {
 			lopts: Arc::clone(&tree.opts),
+			owner: tree.default_runtime.owner(),
 			level_manifest: Arc::clone(&tree.level_manifest),
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			error_handler: Arc::clone(&tree.error_handler),
@@ -86,7 +92,7 @@ impl Compactor {
 
 	pub(crate) fn compact(&self) -> Result<()> {
 		let levels_guard = self.options.level_manifest.write()?;
-		let choice = self.strategy.pick_levels(&levels_guard)?;
+		let choice = self.strategy.pick_levels(&levels_guard, self.options.owner)?;
 
 		match choice {
 			CompactionChoice::Merge(input) => self.merge_tables(levels_guard, &input),
@@ -111,6 +117,7 @@ impl Compactor {
 		let tables = levels.get_all_tables();
 		let to_merge: Vec<_> =
 			input.tables_to_merge.iter().filter_map(|&id| tables.get(&id).cloned()).collect();
+		let owner = common_owner(to_merge.iter().map(|table| table.meta.owner))?;
 
 		// Keep tables alive while iterators borrow from them
 		let iterators: Vec<BoxedLSMIterator<'_>> = to_merge
@@ -127,7 +134,7 @@ impl Compactor {
 
 		// Write merged data
 		let table_created =
-			match self.write_merged_table(&new_table_path, new_table_id, iterators, input) {
+			match self.write_merged_table(&new_table_path, new_table_id, iterators, input, owner) {
 				Ok(result) => result,
 				Err(e) => {
 					// Guard will unhide tables on drop
@@ -163,10 +170,16 @@ impl Compactor {
 		table_id: u64,
 		merge_iter: Vec<BoxedLSMIterator<'_>>,
 		input: &CompactionInput,
+		owner: crate::batch::BatchOwner,
 	) -> Result<bool> {
 		let file = SysFile::create(path)?;
-		let mut writer =
-			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
+		let mut writer = TableWriter::new_owned(
+			file,
+			table_id,
+			Arc::clone(&self.options.lopts),
+			input.target_level,
+			owner,
+		);
 
 		// Get active snapshots for snapshot-aware compaction
 		// This is a snapshot of the snapshot list at the start of compaction.
@@ -229,10 +242,19 @@ impl Compactor {
 			}
 		}
 
-		let mut changeset = ManifestChangeSet::default();
+		let mut changeset = ManifestChangeSet {
+			owner: self.options.owner,
+			..ManifestChangeSet::default()
+		};
 
-		// Delete old tables
-		for (level_idx, level) in manifest.levels.get_levels().iter().enumerate() {
+		// Delete old tables from this owner's level set
+		let owner_levels = manifest.levels_for(self.options.owner).ok_or_else(|| {
+			crate::error::Error::Corruption(format!(
+				"compaction owner {:?} has no level set",
+				self.options.owner
+			))
+		})?;
+		for (level_idx, level) in owner_levels.get_levels().iter().enumerate() {
 			for &table_id in &input.tables_to_merge {
 				if level.tables.iter().any(|t| t.id == table_id) {
 					changeset.deleted_tables.insert((level_idx as u8, table_id));
@@ -285,5 +307,40 @@ impl Compactor {
 		let file_size = file.size()?;
 
 		Ok(Arc::new(Table::new(table_id, Arc::clone(&self.options.lopts), file, file_size)?))
+	}
+}
+
+fn common_owner(
+	mut owners: impl Iterator<Item = crate::batch::BatchOwner>,
+) -> Result<crate::batch::BatchOwner> {
+	let owner = owners.next().unwrap_or_default();
+	if owners.any(|candidate| candidate != owner) {
+		return Err(crate::error::Error::InvalidArgument(
+			"compaction cannot mix branch-owned tables".to_owned(),
+		));
+	}
+	Ok(owner)
+}
+
+#[cfg(test)]
+mod owner_tests {
+	use super::*;
+	use crate::batch::BatchOwner;
+	use crate::{BranchGeneration, BranchId, Error};
+
+	#[test]
+	fn compaction_rejects_mixed_branch_owners_before_writing_output() {
+		let first = BatchOwner {
+			branch: BranchId::from_u128(1),
+			generation: BranchGeneration(1),
+		};
+		let second = BatchOwner {
+			branch: BranchId::from_u128(2),
+			generation: BranchGeneration(1),
+		};
+
+		let error = common_owner([first, second].into_iter()).unwrap_err();
+		assert!(matches!(error, Error::InvalidArgument(_)));
+		assert_eq!(common_owner([first, first].into_iter()).unwrap(), first);
 	}
 }

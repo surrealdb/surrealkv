@@ -1,9 +1,12 @@
 use bytes::{Buf, BufMut, BytesMut};
 
+use crate::batch::BatchOwner;
 use crate::error::Error;
 use crate::sstable::error::SSTableError;
 use crate::sstable::table::TableFormat;
 use crate::{CompressionType, InternalKey, Result};
+
+const PROPERTIES_ENCODED_LEN: usize = 186;
 
 #[derive(Debug, Clone)]
 pub(crate) struct Properties {
@@ -49,7 +52,7 @@ impl Properties {
 	pub(crate) fn new() -> Self {
 		Properties {
 			id: 0,
-			table_format: TableFormat::LSMV2,
+			table_format: TableFormat::LSMV3,
 			num_entries: 0,
 			num_deletions: 0,
 			data_size: 0,
@@ -106,6 +109,9 @@ impl Properties {
 	}
 
 	pub(crate) fn decode(buf: Vec<u8>) -> Result<Self> {
+		if buf.len() != PROPERTIES_ENCODED_LEN {
+			return Err(Error::InvalidTableFormat);
+		}
 		let mut buf = &buf[..];
 		let id = buf.get_u64();
 		let table_format = buf.get_u8();
@@ -164,6 +170,7 @@ impl Properties {
 
 #[derive(Debug, Clone)]
 pub struct TableMetadata {
+	pub(crate) owner: BatchOwner,
 	pub(crate) has_point_keys: Option<bool>,
 	pub(crate) smallest_seq_num: Option<u64>,
 	pub(crate) largest_seq_num: Option<u64>,
@@ -173,8 +180,14 @@ pub struct TableMetadata {
 }
 
 impl TableMetadata {
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn new() -> Self {
+		Self::new_owned(BatchOwner::DEFAULT)
+	}
+
+	pub(crate) fn new_owned(owner: BatchOwner) -> Self {
 		TableMetadata {
+			owner,
 			smallest_point: None,
 			largest_point: None,
 			has_point_keys: None,
@@ -213,6 +226,8 @@ impl TableMetadata {
 		// Write 0 if not set (only happens for empty tables which aren't persisted)
 		buf.put_u64(self.smallest_seq_num.unwrap_or(0));
 		buf.put_u64(self.largest_seq_num.unwrap_or(0));
+		buf.extend_from_slice(&self.owner.branch.0);
+		buf.put_u64(self.owner.generation.0);
 
 		let properties_encoded = self.properties.encode();
 		let properties_encoded_len = properties_encoded.len() as u64;
@@ -244,6 +259,9 @@ impl TableMetadata {
 	}
 
 	pub(crate) fn decode(src: &[u8]) -> Result<TableMetadata> {
+		if src.len() < 1 + 8 + 8 + 16 + 8 + 8 + PROPERTIES_ENCODED_LEN + 1 + 1 {
+			return Err(Error::InvalidTableFormat);
+		}
 		let mut cursor = std::io::Cursor::new(src);
 
 		// Decode has_point_keys
@@ -262,9 +280,18 @@ impl TableMetadata {
 		// Always Some since persisted tables have entries
 		let smallest_seq_num = Some(cursor.get_u64());
 		let largest_seq_num = Some(cursor.get_u64());
+		let mut branch = [0; 16];
+		cursor.copy_to_slice(&mut branch);
+		let owner = BatchOwner {
+			branch: crate::BranchId(branch),
+			generation: crate::BranchGeneration(cursor.get_u64()),
+		};
 
 		// Decode properties
 		let properties_len = cursor.get_u64() as usize;
+		if properties_len != PROPERTIES_ENCODED_LEN || cursor.remaining() < properties_len + 2 {
+			return Err(Error::InvalidTableFormat);
+		}
 		let mut properties_bytes = vec![0u8; properties_len];
 		cursor.copy_to_slice(&mut properties_bytes);
 		let properties = Properties::decode(properties_bytes)?;
@@ -302,6 +329,7 @@ impl TableMetadata {
 		};
 
 		Ok(TableMetadata {
+			owner,
 			has_point_keys,
 			smallest_seq_num,
 			largest_seq_num,

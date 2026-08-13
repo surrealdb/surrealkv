@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use tempfile::TempDir;
 use test_log::test;
 
+use crate::batch::BatchOwner;
 use crate::clock::MockLogicalClock;
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::leveled::{CompactionPriority, Strategy};
@@ -179,16 +180,7 @@ fn create_test_manifest(
 	let next_table_id = max_table_id + 1000;
 
 	// Create the manifest with next_table_id
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(next_table_id)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(next_table_id)));
 
 	// Write the manifest to disk
 	write_manifest_to_disk(&manifest)?;
@@ -203,6 +195,7 @@ fn create_compaction_options(
 ) -> CompactionOptions {
 	CompactionOptions {
 		lopts: opts,
+		owner: BatchOwner::DEFAULT,
 		level_manifest: manifest,
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 		error_handler: Arc::new(BackgroundErrorHandler::new()),
@@ -216,7 +209,7 @@ fn verify_keys_after_compaction(
 	expected_keys: &HashSet<(Key, Value)>,
 ) -> (usize, HashMap<Key, Value>) {
 	let manifest_guard = manifest.read().unwrap();
-	let levels = manifest_guard.levels.get_levels();
+	let levels = manifest_guard.default_owner_levels().get_levels();
 
 	// Build a map of all key-value pairs from all tables across all levels
 	let mut all_key_values = HashMap::new();
@@ -261,7 +254,7 @@ fn verify_all_keys_present(
 
 	// Build map of all keys found after compaction
 	let mut all_key_values = HashMap::new();
-	let levels = manifest_guard.levels.get_levels();
+	let levels = manifest_guard.default_owner_levels().get_levels();
 
 	// Collect all keys from all tables across all levels
 	for level in levels {
@@ -332,7 +325,7 @@ fn test_level_selection() {
 	let strategy = Strategy::from_options(opts);
 
 	// Test the strategy's level selection
-	let choice = strategy.pick_levels(&manifest.read().unwrap()).unwrap();
+	let choice = strategy.pick_levels(&manifest.read().unwrap(), BatchOwner::DEFAULT).unwrap();
 
 	// Verify L0 was selected for compaction (as it exceeds its limit)
 	match choice {
@@ -375,7 +368,7 @@ fn test_compaction_edge_cases() {
 	let strategy = Strategy::from_options(opts);
 
 	// Test strategy with empty level
-	let choice = strategy.pick_levels(&manifest.read().unwrap()).unwrap();
+	let choice = strategy.pick_levels(&manifest.read().unwrap(), BatchOwner::DEFAULT).unwrap();
 
 	// Strategy should skip compaction when L0 is empty
 	match choice {
@@ -403,7 +396,7 @@ fn test_compaction_edge_cases() {
 	let manifest = create_test_manifest(&env, last_level_tables).unwrap();
 
 	// Test strategy with many tables in last level
-	let choice = strategy.pick_levels(&manifest.read().unwrap()).unwrap();
+	let choice = strategy.pick_levels(&manifest.read().unwrap(), BatchOwner::DEFAULT).unwrap();
 
 	// If the last level exceeds its byte limit, it can compact to itself for tombstone cleanup
 	match choice {
@@ -448,16 +441,7 @@ fn test_level_selection_score_based() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest_score");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -482,7 +466,7 @@ fn test_level_selection_score_based() {
 
 	// Verify selection matches expected highest score
 	let manifest_guard = manifest.read().unwrap();
-	let choice = strategy.pick_levels(&manifest_guard).unwrap();
+	let choice = strategy.pick_levels(&manifest_guard, BatchOwner::DEFAULT).unwrap();
 
 	match choice {
 		CompactionChoice::Merge(input) => {
@@ -618,16 +602,7 @@ async fn test_simple_merge_compaction() {
 	// Use a safe starting value for next_table_id
 	let next_table_id = max_table_id + 1000;
 
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(next_table_id)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(next_table_id)));
 
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -662,11 +637,11 @@ async fn test_simple_merge_compaction() {
 		let updated_manifest = manifest.read().unwrap();
 
 		// L1 should have at least one table after compaction
-		let l1_tables = &updated_manifest.levels.get_levels()[1].tables;
+		let l1_tables = &updated_manifest.default_owner_levels().get_levels()[1].tables;
 		assert!(!l1_tables.is_empty(), "L1 should have at least one table after compaction");
 
 		// L0 should be under its limit after compaction
-		let l0_tables = &updated_manifest.levels.get_levels()[0].tables;
+		let l0_tables = &updated_manifest.default_owner_levels().get_levels()[0].tables;
 		assert!(l0_tables.len() < 4, "L0 should be under its limit after compaction");
 
 		// All original L0 tables should be removed by compaction since ALL L0 tables
@@ -812,16 +787,7 @@ async fn test_multi_level_merge_compaction() {
 	// compactor
 	let shared_table_id_counter = Arc::new(AtomicU64::new(next_table_id));
 
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: shared_table_id_counter,
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, shared_table_id_counter);
 
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -844,7 +810,7 @@ async fn test_multi_level_merge_compaction() {
 
 		// Check if all levels are within limits
 		let manifest_guard = manifest.read().unwrap();
-		let levels = manifest_guard.levels.get_levels();
+		let levels = manifest_guard.default_owner_levels().get_levels();
 
 		let all_levels_ok = levels.iter().enumerate().all(|(idx, level)| {
 			let limit = if idx == 0 {
@@ -874,7 +840,7 @@ async fn test_multi_level_merge_compaction() {
 
 	// Check for key range overlaps within levels
 	let manifest_guard = manifest.read().unwrap();
-	let levels = manifest_guard.levels.get_levels();
+	let levels = manifest_guard.default_owner_levels().get_levels();
 
 	for (level_idx, level) in levels.iter().enumerate().skip(1) {
 		if level.tables.len() >= 2 {
@@ -1284,16 +1250,7 @@ async fn test_compaction_with_large_keys_and_values() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -1363,16 +1320,7 @@ async fn test_compaction_respects_sequence_numbers() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -1388,7 +1336,7 @@ async fn test_compaction_respects_sequence_numbers() {
 
 	// Verify the highest sequence number values are preserved
 	let manifest_guard = manifest.read().unwrap();
-	let levels = manifest_guard.levels.get_levels();
+	let levels = manifest_guard.default_owner_levels().get_levels();
 
 	// There should be no tables in L0 after compaction
 	assert_eq!(levels[0].tables.len(), 0, "L0 should be empty after compaction");
@@ -1452,16 +1400,7 @@ async fn test_tombstone_propagation() {
 	Arc::make_mut(&mut levels.get_levels_mut()[0]).insert(table);
 
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1475,7 +1414,7 @@ async fn test_tombstone_propagation() {
 
 	// Verify exactly 5 keys remain (95-99)
 	let manifest_guard = manifest.read().unwrap();
-	let levels = manifest_guard.levels.get_levels();
+	let levels = manifest_guard.default_owner_levels().get_levels();
 
 	let mut remaining_keys = Vec::new();
 	for level in levels {
@@ -1552,16 +1491,7 @@ async fn test_l0_overlapping_keys_compaction() {
 
 	// Create manifest and run compaction
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1573,7 +1503,7 @@ async fn test_l0_overlapping_keys_compaction() {
 
 	// Verify sequence number precedence: highest seq wins for overlapping keys
 	let manifest_guard = manifest.read().unwrap();
-	let levels = manifest_guard.levels.get_levels();
+	let levels = manifest_guard.default_owner_levels().get_levels();
 
 	let mut all_keys = HashMap::new();
 	let mut tombstones = HashMap::new();
@@ -1668,16 +1598,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 
 	// Create manifest and run compaction
 	let manifest_path = env.options.path.join("test_manifest_tombstone");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1689,7 +1610,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 
 	// Verify tombstone wins: keys 2, 6, 8, 9, 12, 14, 17 should be deleted
 	let manifest_guard = manifest.read().unwrap();
-	let levels = manifest_guard.levels.get_levels();
+	let levels = manifest_guard.default_owner_levels().get_levels();
 
 	let mut survivors = HashMap::new();
 	for level in levels {
@@ -1785,16 +1706,7 @@ async fn test_tombstone_propagation_through_levels() {
 
 	// Create manifest and run L2→L3 compaction (bottom level)
 	let manifest_path = env.options.path.join("test_manifest_propagation");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1811,7 +1723,7 @@ async fn test_tombstone_propagation_through_levels() {
 
 	// Verify bottom-level tombstone filtering: L3 should have no tombstones
 	let manifest_guard = manifest.read().unwrap();
-	let levels = manifest_guard.levels.get_levels();
+	let levels = manifest_guard.default_owner_levels().get_levels();
 
 	let mut tombstones = 0;
 	let mut values = 0;
@@ -1956,7 +1868,7 @@ fn test_table_properties_population() {
 
 	// Verify Properties fields
 	assert_eq!(props.id, table_id);
-	assert_eq!(props.table_format, TableFormat::LSMV2);
+	assert_eq!(props.table_format, TableFormat::LSMV3);
 	assert_eq!(props.num_entries, 100);
 	assert_eq!(props.item_count, 100);
 	assert_eq!(props.key_count, 100);
@@ -2067,16 +1979,7 @@ async fn test_soft_delete_compaction_behavior() {
 
 	// Create manifest and run L0→L1 compaction
 	let manifest_path = env.options.path.join("test_manifest_soft_delete");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2090,7 +1993,7 @@ async fn test_soft_delete_compaction_behavior() {
 	// Verify that soft deletes flow through compaction normally (like any other
 	// key)
 	let manifest_guard = manifest.read().unwrap();
-	let levels = manifest_guard.levels.get_levels();
+	let levels = manifest_guard.default_owner_levels().get_levels();
 
 	let mut soft_deletes = 0;
 	let mut regular_deletes = 0;
@@ -2210,16 +2113,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 
 	// Create manifest and run compaction
 	let manifest_path = env.options.path.join("test_manifest_older_soft_delete");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2234,7 +2128,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 
 	// Verify the result: only the latest SoftDelete should remain
 	let manifest_guard = manifest.read().unwrap();
-	let levels = manifest_guard.levels.get_levels();
+	let levels = manifest_guard.default_owner_levels().get_levels();
 
 	let mut soft_deletes = 0;
 	let mut sets = 0;
@@ -2277,7 +2171,7 @@ fn test_score_based_level_selection() {
 	for i in 0..5 {
 		let entries = create_ordered_entries("l0_key", i, 1, i as u64, None);
 		let table = env.create_test_table(i as u64, entries).unwrap();
-		Arc::make_mut(&mut manifest.levels.get_levels_mut()[0]).insert(table);
+		Arc::make_mut(&mut manifest.default_owner_levels_mut().get_levels_mut()[0]).insert(table);
 	}
 
 	// Add L1 files totaling 150MB (score = 150/100 = 1.5)
@@ -2285,11 +2179,11 @@ fn test_score_based_level_selection() {
 	for i in 0..3 {
 		let entries = create_ordered_entries("l1_key", i, 10, (10 + i) as u64, None);
 		let table = env.create_test_table((10 + i) as u64, entries).unwrap();
-		Arc::make_mut(&mut manifest.levels.get_levels_mut()[1]).insert(table);
+		Arc::make_mut(&mut manifest.default_owner_levels_mut().get_levels_mut()[1]).insert(table);
 	}
 
 	// Score-based selection should pick the level with highest score
-	let choice = strategy.pick_levels(&manifest).unwrap();
+	let choice = strategy.pick_levels(&manifest, BatchOwner::DEFAULT).unwrap();
 	match choice {
 		CompactionChoice::Merge(input) => {
 			// Should pick a level that needs compaction (score >= 1.0)
@@ -2318,11 +2212,11 @@ fn test_bytes_based_level_limits() {
 	for i in 0..3 {
 		let entries = create_ordered_entries("l1_key", i, 100, i as u64, None);
 		let table = env.create_test_table(i as u64, entries).unwrap();
-		Arc::make_mut(&mut manifest.levels.get_levels_mut()[1]).insert(table);
+		Arc::make_mut(&mut manifest.default_owner_levels_mut().get_levels_mut()[1]).insert(table);
 	}
 
 	// Check that L1 can be selected if it exceeds limit
-	let choice = strategy.pick_levels(&manifest).unwrap();
+	let choice = strategy.pick_levels(&manifest, BatchOwner::DEFAULT).unwrap();
 	match choice {
 		CompactionChoice::Merge(input) => {
 			// Should pick a level that needs compaction
@@ -2352,12 +2246,12 @@ fn test_bottom_level_compaction() {
 	for i in 0..3 {
 		let entries = create_ordered_entries("l2_key", i, 100, (20 + i) as u64, None);
 		let table = env.create_test_table((20 + i) as u64, entries).unwrap();
-		Arc::make_mut(&mut manifest.levels.get_levels_mut()[2]).insert(table);
+		Arc::make_mut(&mut manifest.default_owner_levels_mut().get_levels_mut()[2]).insert(table);
 	}
 
 	// Bottom level compaction should be allowed (same-level compaction)
 	// Note: This will only trigger if L2 exceeds its byte limit
-	let choice = strategy.pick_levels(&manifest).unwrap();
+	let choice = strategy.pick_levels(&manifest, BatchOwner::DEFAULT).unwrap();
 	match choice {
 		CompactionChoice::Merge(input) => {
 			// If L2 is selected, it should compact to same level
@@ -2740,21 +2634,12 @@ fn test_clean_cut_shared_boundary_key() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let levels_guard = manifest.read().unwrap();
-	let source_level = &levels_guard.levels.get_levels()[1];
+	let source_level = &levels_guard.default_owner_levels().get_levels()[1];
 
 	// Test clean cut expansion directly: selecting File 1 should expand to include File 2
 	let selected = Strategy::select_overlapping_ranges(source_level, 1).unwrap();
@@ -2803,21 +2688,12 @@ fn test_clean_cut_chain_expansion() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let levels_guard = manifest.read().unwrap();
-	let source_level = &levels_guard.levels.get_levels()[1];
+	let source_level = &levels_guard.default_owner_levels().get_levels()[1];
 
 	// Test clean cut expansion directly: selecting File 2 should expand to include Files 1 and 3
 	let selected = Strategy::select_overlapping_ranges(source_level, 2).unwrap();
@@ -2858,21 +2734,12 @@ fn test_clean_cut_no_expansion_needed() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let levels_guard = manifest.read().unwrap();
-	let source_level = &levels_guard.levels.get_levels()[1];
+	let source_level = &levels_guard.default_owner_levels().get_levels()[1];
 
 	// Test clean cut expansion directly: selecting File 1 should not expand (no shared boundaries)
 	let selected = Strategy::select_overlapping_ranges(source_level, 1).unwrap();
@@ -2927,16 +2794,7 @@ fn test_clean_cut_integration_shared_boundary() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2945,8 +2803,8 @@ fn test_clean_cut_integration_shared_boundary() {
 	let strategy = Strategy::from_options(opts);
 
 	let levels_guard = manifest.read().unwrap();
-	let source_level = &levels_guard.levels.get_levels()[1];
-	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
+	let source_level = &levels_guard.default_owner_levels().get_levels()[1];
+	let next_level = &levels_guard.default_owner_levels().get_levels()[2]; // Empty L2
 
 	// File 1 should be selected (largest), and should expand to include File 2
 	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
@@ -3003,16 +2861,7 @@ fn test_clean_cut_integration_chain_expansion() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -3021,8 +2870,8 @@ fn test_clean_cut_integration_chain_expansion() {
 	let strategy = Strategy::from_options(opts);
 
 	let levels_guard = manifest.read().unwrap();
-	let source_level = &levels_guard.levels.get_levels()[1];
-	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
+	let source_level = &levels_guard.default_owner_levels().get_levels()[1];
+	let next_level = &levels_guard.default_owner_levels().get_levels()[2]; // Empty L2
 
 	// File 2 should be selected (largest), and should expand to include Files 1 and 3
 	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
@@ -3071,16 +2920,7 @@ fn test_clean_cut_integration_with_oldest_seq_priority() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -3089,8 +2929,8 @@ fn test_clean_cut_integration_with_oldest_seq_priority() {
 	let strategy = create_strategy_with_priority(&opts, CompactionPriority::OldestSmallestSeqFirst);
 
 	let levels_guard = manifest.read().unwrap();
-	let source_level = &levels_guard.levels.get_levels()[1];
-	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
+	let source_level = &levels_guard.default_owner_levels().get_levels()[1];
+	let next_level = &levels_guard.default_owner_levels().get_levels()[2]; // Empty L2
 
 	// File 1 should be selected (oldest sequence), and should expand to include File 2
 	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();
@@ -3139,16 +2979,7 @@ fn test_clean_cut_integration_no_expansion() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest {
-		path: manifest_path,
-		levels,
-		hidden_set: HashSet::new(),
-		next_table_id: Arc::new(AtomicU64::new(1000)),
-		manifest_format_version: crate::levels::MANIFEST_FORMAT_VERSION_V1,
-		snapshots: Vec::new(),
-		log_number: 0,
-		last_sequence: 0,
-	};
+	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -3157,8 +2988,8 @@ fn test_clean_cut_integration_no_expansion() {
 	let strategy = Strategy::from_options(opts);
 
 	let levels_guard = manifest.read().unwrap();
-	let source_level = &levels_guard.levels.get_levels()[1];
-	let next_level = &levels_guard.levels.get_levels()[2]; // Empty L2
+	let source_level = &levels_guard.default_owner_levels().get_levels()[1];
+	let next_level = &levels_guard.default_owner_levels().get_levels()[2]; // Empty L2
 
 	// File 1 should be selected (largest), but should NOT expand (no shared boundaries)
 	let selected = strategy.select_tables_for_compaction(source_level, next_level, 1).unwrap();

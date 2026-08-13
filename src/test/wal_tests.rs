@@ -5,23 +5,15 @@ use std::path::Path;
 use tempdir::TempDir;
 use test_log::test;
 
-use crate::batch::Batch;
+use crate::batch::{Batch, BatchOwner};
 use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
 use crate::wal::{
-	cleanup_old_segments,
-	get_segment_range,
-	list_segment_ids,
-	parse_segment_name,
-	segment_name,
-	should_include_file,
-	CompressionType,
-	Options,
-	RecordType,
-	SegmentRef,
+	cleanup_old_segments, get_segment_range, list_segment_ids, parse_segment_name, segment_name,
+	should_include_file, CompressionType, Options, RecordType, SegmentRef,
 };
-use crate::LSMIterator;
+use crate::{BranchGeneration, BranchId, LSMIterator};
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -165,6 +157,37 @@ fn test_wal_replay_all_segments() {
 
 	// Verify the memtable contains data from ALL segments (3 + 4 + 5 = 12 entries)
 	assert_eq!(entry_count, 12, "Expected 12 entries from all 3 segments combined");
+}
+
+#[test]
+fn wal_recovery_keeps_branch_owners_in_separate_memtables() {
+	let temp_dir = create_test_wal_dir();
+	let mut wal = Wal::open(temp_dir.path(), Options::default()).unwrap();
+	let first_owner = BatchOwner {
+		branch: BranchId::from_u128(10),
+		generation: BranchGeneration(1),
+	};
+	let second_owner = BatchOwner {
+		branch: BranchId::from_u128(20),
+		generation: BranchGeneration(3),
+	};
+	let mut first = Batch::for_owner(1, first_owner);
+	first.set(b"same-key".to_vec(), b"first".to_vec(), 0).unwrap();
+	let mut second = Batch::for_owner(2, second_owner);
+	second.set(b"same-key".to_vec(), b"second".to_vec(), 0).unwrap();
+	wal.append(&first.encode().unwrap()).unwrap();
+	wal.append(&second.encode().unwrap()).unwrap();
+	drop(wal);
+
+	let (max_sequence, memtables) = replay_wal(temp_dir.path(), 0, 1024 * 1024).unwrap();
+
+	assert_eq!(max_sequence, Some(2));
+	assert_eq!(memtables.len(), 2, "owner change must split physical components");
+	assert_eq!(memtables[0].0.owner(), first_owner);
+	assert_eq!(memtables[1].0.owner(), second_owner);
+	assert_eq!(memtables[0].1, memtables[1].1, "both batches used one WAL segment");
+	assert_eq!(memtables[0].0.get(b"same-key", None).unwrap().1, b"first");
+	assert_eq!(memtables[1].0.get(b"same-key", None).unwrap().1, b"second");
 }
 
 #[test]

@@ -6,6 +6,7 @@ use std::sync::PoisonError;
 
 use crc32fast::Hasher;
 
+pub(crate) mod dependency;
 pub mod manager;
 pub mod reader;
 pub mod recovery;

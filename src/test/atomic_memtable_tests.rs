@@ -22,9 +22,9 @@ use std::thread;
 
 use test_log::test;
 
-use crate::batch::Batch;
-use crate::memtable::{max_entry_bytes, MemTable};
-use crate::Error;
+use crate::batch::{Batch, BatchOwner};
+use crate::memtable::{max_entry_bytes, ImmutableMemtables, MemTable};
+use crate::{BranchGeneration, BranchId, Error};
 
 /// Per-entry arena cost upper bound, as exposed by `max_entry_bytes`.
 /// Equal to `MAX_NODE_SIZE (192) + NODE_ALIGNMENT-1 (7)`.
@@ -429,4 +429,43 @@ fn try_reserve_zero_always_succeeds() {
 	batch.set(vec![0u8; 8], vec![0u8; 4096], 0).unwrap();
 	let _ = memtable.add(&batch); // expected to fail
 	memtable.try_reserve(0).expect("try_reserve(0) failed on full memtable");
+}
+
+#[test]
+fn memtable_rejects_a_batch_from_another_branch_before_allocation() {
+	let owner = BatchOwner {
+		branch: BranchId::from_u128(1),
+		generation: BranchGeneration(2),
+	};
+	let other = BatchOwner {
+		branch: BranchId::from_u128(3),
+		generation: BranchGeneration(4),
+	};
+	let memtable = MemTable::new_owned(64 * 1024, owner);
+	let size_before = memtable.size();
+	let mut batch = Batch::for_owner(1, other);
+	batch.set(b"key".to_vec(), b"value".to_vec(), 0).unwrap();
+
+	let error = memtable.add(&batch).unwrap_err();
+	assert!(matches!(error, Error::InvalidArgument(_)));
+	assert_eq!(memtable.size(), size_before);
+	assert!(memtable.is_empty());
+}
+
+#[test]
+fn replay_floor_stays_on_a_wal_until_every_component_from_it_is_flushed() {
+	let mut immutables = ImmutableMemtables::default();
+	let first = Arc::new(MemTable::new(4096));
+	let second = Arc::new(MemTable::new(4096));
+	first.set_wal_number(5);
+	second.set_wal_number(5);
+	immutables.add(10, 5, first);
+	immutables.add(11, 5, second);
+
+	assert_eq!(immutables.iter().count(), 2, "fixture must contain split components");
+	assert_eq!(immutables.replay_floor_excluding(10, 6), 5);
+	assert_eq!(immutables.replay_floor_excluding(11, 6), 5);
+
+	immutables.remove(10);
+	assert_eq!(immutables.replay_floor_excluding(11, 6), 6);
 }

@@ -10,6 +10,8 @@ use crate::snapshot::SnapshotIterator;
 use crate::{InternalKey, Key, LSMIterator, Result, Value};
 
 #[cfg(test)]
+pub mod architecture_guard_tests;
+#[cfg(test)]
 pub mod atomic_memtable_tests;
 #[cfg(test)]
 pub mod batch_tests;
@@ -41,6 +43,8 @@ pub mod recovery_integration_tests;
 pub mod recovery_test_helpers;
 #[cfg(test)]
 pub mod recovery_tests;
+#[cfg(test)]
+pub mod rewrite_public_tests;
 #[cfg(test)]
 pub mod snapshot_tests;
 #[cfg(test)]

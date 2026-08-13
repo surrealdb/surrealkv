@@ -69,7 +69,7 @@ async fn power_loss_after_compaction_must_not_lose_synced_data() {
 
 	let l0_ids: Vec<u64> = {
 		let manifest = tree.core.inner.level_manifest.read().unwrap();
-		manifest.levels.get_levels()[0].tables.iter().map(|t| t.id).collect()
+		manifest.default_owner_levels().get_levels()[0].tables.iter().map(|t| t.id).collect()
 	};
 	assert_eq!(l0_ids.len(), 2, "expected two L0 tables before compaction");
 
@@ -79,7 +79,7 @@ async fn power_loss_after_compaction_must_not_lose_synced_data() {
 	// Don't trust Ok(()) — a Skip decision also returns Ok. Assert post-state.
 	let output_id = {
 		let manifest = tree.core.inner.level_manifest.read().unwrap();
-		let levels = manifest.levels.get_levels();
+		let levels = manifest.default_owner_levels().get_levels();
 		assert!(levels[0].tables.is_empty(), "L0 should be empty after compaction");
 		assert_eq!(levels[1].tables.len(), 1, "L1 should hold the compaction output");
 		levels[1].tables[0].id
@@ -111,7 +111,7 @@ async fn power_loss_after_compaction_must_not_lose_synced_data() {
 	}
 	let sibling_id = {
 		let manifest = tree.core.inner.level_manifest.read().unwrap();
-		let levels = manifest.levels.get_levels();
+		let levels = manifest.default_owner_levels().get_levels();
 		assert_eq!(levels[0].tables.len(), 1, "post-compaction flush should land in L0");
 		levels[0].tables[0].id
 	};
@@ -189,7 +189,7 @@ async fn manifest_referencing_zero_byte_sst_fails_cleanly() {
 
 		let table_id = {
 			let manifest = tree.core.inner.level_manifest.read().unwrap();
-			manifest.levels.get_levels()[0].tables[0].id
+			manifest.default_owner_levels().get_levels()[0].tables[0].id
 		};
 		tree.close().await.unwrap();
 		table_id

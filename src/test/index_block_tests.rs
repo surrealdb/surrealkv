@@ -7,12 +7,7 @@ use crate::sstable::block::BlockHandle;
 use crate::sstable::index_block::{BlockHandleWithKey, Index, IndexWriter};
 use crate::vfs::File;
 use crate::{
-	CompressionType,
-	InternalKey,
-	InternalKeyKind,
-	LSMIterator,
-	Options,
-	INTERNAL_KEY_SEQ_NUM_MAX,
+	CompressionType, InternalKey, InternalKeyKind, LSMIterator, Options, INTERNAL_KEY_SEQ_NUM_MAX,
 	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 

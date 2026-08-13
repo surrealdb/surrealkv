@@ -32,6 +32,7 @@ pub enum Error {
 	InvalidBatchRecord,
 	TransactionWriteConflict,
 	TransactionRetry,
+	BranchFenced,
 	TransactionClosed,
 	EmptyKey,
 	TransactionWriteOnly,
@@ -88,6 +89,7 @@ impl fmt::Display for Error {
             Self::InvalidBatchRecord => write!(f, "Invalid batch record"),
             Self::TransactionWriteConflict => write!(f, "Transaction write conflict"),
             Self::TransactionRetry => write!(f, "Transaction retry required: snapshot is older than the commit oracle's GC window"),
+            Self::BranchFenced => write!(f, "Branch generation is stale or deleted"),
             Self::TransactionClosed => write!(f, "Transaction closed"),
             Self::EmptyKey => write!(f, "Empty key"),
             Self::TransactionWriteOnly => write!(f, "Transaction is write-only"),
@@ -182,6 +184,9 @@ pub enum BackgroundErrorReason {
 	MemtablaFlush,
 	Compaction,
 	ManifestWrite,
+	/// A WAL append succeeded but applying the durable batch to mutable state
+	/// failed. Recovery is required before any later mutation is safe.
+	DurableCommitApply,
 }
 
 /// Reason for write stall - used for logging and metrics.

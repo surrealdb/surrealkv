@@ -1,4 +1,7 @@
+mod api;
 mod batch;
+mod branch;
+mod branch_runtime;
 mod cache;
 mod checkpoint;
 mod clock;
@@ -6,9 +9,15 @@ mod commit;
 mod compaction;
 mod comparator;
 mod compression;
+#[cfg(test)]
+mod database;
 mod error;
+#[cfg(test)]
+mod format;
 mod iter;
 mod levels;
+#[cfg(test)]
+mod lifecycle;
 mod lockfile;
 mod lsm;
 mod memtable;
@@ -16,11 +25,19 @@ mod oracle;
 mod snapshot;
 mod sstable;
 mod stall;
+mod storage;
+#[cfg(test)]
+mod table;
 mod task;
 mod tracker;
 mod transaction;
 mod vfs;
 mod wal;
+
+#[cfg(test)]
+mod testkit;
+
+pub mod branch_native;
 
 #[cfg(test)]
 mod test;
@@ -39,6 +56,11 @@ pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::transaction::{
 	Durability, HistoryOptions, Mode, ReadOptions, Transaction, WriteOptions,
 };
+pub use api::{
+	AuthorityFence, BranchGeneration, BranchId, CommitTimestamp, CommitVersion, DatabaseId,
+	ErrorCode, KernelError, KernelResult,
+};
+pub use branch::{ReadSelector, WriteOperation};
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {

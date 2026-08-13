@@ -162,6 +162,13 @@ pub(crate) fn replay_wal(
 				Ok((record_data, offset)) => {
 					last_valid_offset = offset as usize;
 					let batch = Batch::decode(record_data)?;
+					if batch.owner != current_memtable.owner() {
+						if !current_memtable.is_empty() {
+							current_memtable.set_wal_number(segment_id);
+							memtables.push((Arc::clone(&current_memtable), segment_id));
+						}
+						current_memtable = Arc::new(MemTable::new_owned(arena_size, batch.owner));
+					}
 					let batch_highest_seq_num = batch.get_highest_seq_num();
 
 					if batch_highest_seq_num > max_seq_num {
@@ -198,8 +205,10 @@ pub(crate) fn replay_wal(
 								"WAL segment #{:020} exceeds single memtable capacity, splitting",
 								segment_id
 							);
+							current_memtable.set_wal_number(segment_id);
 							memtables.push((Arc::clone(&current_memtable), segment_id));
-							current_memtable = Arc::new(MemTable::new(arena_size));
+							current_memtable =
+								Arc::new(MemTable::new_owned(arena_size, batch.owner));
 							// Retry on fresh memtable
 							current_memtable.add(&batch)?;
 						}
@@ -228,6 +237,7 @@ pub(crate) fn replay_wal(
 
 		// Save this segment's memtable if it has data
 		if !current_memtable.is_empty() {
+			current_memtable.set_wal_number(segment_id);
 			memtables.push((current_memtable, segment_id));
 		}
 

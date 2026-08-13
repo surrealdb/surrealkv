@@ -375,8 +375,15 @@ impl Strategy {
 	/// Compute compaction scores for all levels
 	/// Returns vector of (level, score) pairs sorted by score descending
 	/// Only includes levels with score >= 1.0
-	fn compute_compaction_scores(&self, manifest: &LevelManifest) -> Vec<(u8, f64)> {
-		let levels = manifest.levels.get_levels();
+	fn compute_compaction_scores(
+		&self,
+		manifest: &LevelManifest,
+		owner: crate::batch::BatchOwner,
+	) -> Vec<(u8, f64)> {
+		let Some(owner_levels) = manifest.levels_for(owner) else {
+			return Vec::new();
+		};
+		let levels = owner_levels.get_levels();
 		let mut scores = Vec::new();
 
 		// L0: score = max(file_count/trigger, total_bytes/max_bytes_for_level_base)
@@ -406,8 +413,12 @@ impl Strategy {
 		scores
 	}
 
-	pub(crate) fn find_compaction_level(&self, manifest: &LevelManifest) -> Option<u8> {
-		let scores = self.compute_compaction_scores(manifest);
+	pub(crate) fn find_compaction_level(
+		&self,
+		manifest: &LevelManifest,
+		owner: crate::batch::BatchOwner,
+	) -> Option<u8> {
+		let scores = self.compute_compaction_scores(manifest, owner);
 
 		// No levels need compaction
 		if scores.is_empty() {
@@ -421,13 +432,20 @@ impl Strategy {
 }
 
 impl CompactionStrategy for Strategy {
-	fn pick_levels(&self, manifest: &LevelManifest) -> Result<CompactionChoice> {
-		let source_level = match self.find_compaction_level(manifest) {
+	fn pick_levels(
+		&self,
+		manifest: &LevelManifest,
+		owner: crate::batch::BatchOwner,
+	) -> Result<CompactionChoice> {
+		let source_level = match self.find_compaction_level(manifest, owner) {
 			Some(level) => level,
 			None => return Ok(CompactionChoice::Skip),
 		};
 
-		let levels = manifest.levels.get_levels();
+		let levels = match manifest.levels_for(owner) {
+			Some(owner_levels) => owner_levels.get_levels(),
+			None => return Ok(CompactionChoice::Skip),
+		};
 
 		// Allow same-level compaction at the bottom level for tombstone cleanup
 		let target_level = if source_level >= manifest.last_level_index() {

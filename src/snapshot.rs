@@ -145,10 +145,20 @@ impl Snapshot {
 		let manifest =
 			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.level_manifest))?;
 
+		let owner = self.core.default_runtime.owner();
+		let levels = manifest
+			.levels_for(owner)
+			.ok_or_else(|| {
+				crate::error::Error::Corruption(format!(
+					"snapshot owner {owner:?} has no level set"
+				))
+			})?
+			.clone();
+
 		Ok(IterState {
 			active: active.clone(),
 			immutable: immutable.iter().map(|entry| Arc::clone(&entry.memtable)).collect(),
-			levels: manifest.levels.clone(),
+			levels,
 		})
 	}
 
@@ -192,13 +202,18 @@ impl Snapshot {
 		}
 		drop(memtable_lock); // Release the lock on the immutable memtables
 
-		// Read lock on the level manifest
+		// Read lock on the level manifest; reads select this snapshot's
+		// owner level set — there is no owner-blind table scan.
 		let level_manifest = self.core.level_manifest.read()?;
+		let owner = self.core.default_runtime.owner();
+		let Some(owner_levels) = level_manifest.levels_for(owner) else {
+			return Ok(None);
+		};
 
 		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
 
 		// Check the tables in each level for the key
-		for (level_idx, level) in (&level_manifest.levels).into_iter().enumerate() {
+		for (level_idx, level) in owner_levels.into_iter().enumerate() {
 			if level_idx == 0 {
 				// Level 0: Tables can overlap, check all
 				for table in level.tables.iter() {
