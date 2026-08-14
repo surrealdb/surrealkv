@@ -81,12 +81,31 @@ pub enum Error {
 	/// pipeline. Nothing was published; the fork can be retried.
 	ForkFenceTimeout,
 
-	/// A fork published a lower inherited-view retention pin while a compaction
-	/// of the parent was already merging. The output is discarded unpublished;
-	/// the next cycle re-picks the same inputs under the stricter floor.
+	/// A merge was refused because keys conflict. Nothing was written; preview
+	/// the merge to see which keys, or choose a strategy that resolves them.
+	MergeConflicts {
+		count: usize,
+	},
+
+	/// A merge is larger than one batch can carry. Nothing was written.
+	MergeTooLarge {
+		estimated_bytes: u64,
+		budget_bytes: u64,
+	},
+
+	/// Two branches have no recorded common base, so a merge between them would
+	/// have to invent one. A merge is only accepted into the branch the source
+	/// was forked from.
+	BranchesUnrelated {
+		reason: String,
+	},
+
+	/// A fork or a merge pinned a retention anchor while a compaction of that
+	/// owner was already merging, so the output may be missing what the new
+	/// anchor promises. It is discarded unpublished; the next cycle re-picks the
+	/// same inputs with the anchor in hand.
 	CompactionPinRaced {
-		sampled_floor: u64,
-		current_floor: u64,
+		unsampled_anchor: u64,
 	},
 	InvalidTag(String),
 	InterleavedIteration, // Interleaved iteration not supported
@@ -154,13 +173,22 @@ impl fmt::Display for Error {
                 f,
                 "Fork point {requested} is below the retention floor {floor}; that history has been collapsed"
             ),
+            Self::MergeConflicts { count } => write!(
+                f,
+                "Merge refused: {count} conflicting key(s); preview the merge or choose a strategy"
+            ),
+            Self::MergeTooLarge { estimated_bytes, budget_bytes } => write!(
+                f,
+                "Merge of {estimated_bytes} bytes exceeds the {budget_bytes}-byte batch budget"
+            ),
+            Self::BranchesUnrelated { reason } => write!(f, "Branches cannot be merged: {reason}"),
             Self::ForkFenceTimeout => write!(
                 f,
                 "Fork fence timed out waiting for in-flight commits to drain"
             ),
-            Self::CompactionPinRaced { sampled_floor, current_floor } => write!(
+            Self::CompactionPinRaced { unsampled_anchor } => write!(
                 f,
-                "Compaction sampled inherited-view floor {sampled_floor} but the catalog now pins {current_floor}; output discarded"
+                "The catalog pins sequence {unsampled_anchor}, which this compaction did not sample; output discarded"
             ),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::InterleavedIteration => write!(f, "Interleaved iteration not supported: cannot mix next() and next_back() on same iterator"),

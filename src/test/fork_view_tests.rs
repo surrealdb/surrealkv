@@ -14,11 +14,10 @@ use test_log::test;
 
 use crate::authority::store::KEEP_METADATA_VERSIONS;
 use crate::batch::BatchOwner;
-use crate::branch::{ForkPoint, ForkReceipt, MAX_VIEW_DEPTH};
+use crate::branch::{ForkPoint, ForkReceipt, RetentionAnchors, MAX_VIEW_DEPTH};
 use crate::compaction::compactor::CompactionOptions;
 use crate::compaction::leveled::Strategy;
 use crate::error::Result;
-use crate::iter::NO_HISTORY_PIN;
 use crate::lsm::Tree;
 use crate::transaction::{Transaction, TransactionOptions};
 use crate::{Error, LSMIterator, TreeBuilder};
@@ -356,21 +355,132 @@ async fn bottom_level_is_disabled_for_both_sides_of_a_fork() {
 	let plain = store.core.inner.create_branch("plain").unwrap();
 	let options = CompactionOptions::for_owner(&store.core.inner, plain).unwrap();
 	assert!(!options.force_not_bottom, "a branch with no fork relation has a real bottom level");
-	assert_eq!(options.history_pin_floor, NO_HISTORY_PIN);
+	assert!(options.pin_anchors.is_empty());
 
 	let child = fork_at(&store, "fork/flags", BatchOwner::DEFAULT, anchor);
 
 	let parent_options =
 		CompactionOptions::for_owner(&store.core.inner, BatchOwner::DEFAULT).unwrap();
 	assert!(parent_options.force_not_bottom, "a parent of an Active child has no bottom level");
-	assert_eq!(parent_options.history_pin_floor, anchor);
+	assert_eq!(parent_options.pin_anchors, RetentionAnchors::from_iter_for_test([anchor]));
 
 	let child_options = CompactionOptions::for_owner(&store.core.inner, child).unwrap();
 	assert!(child_options.force_not_bottom, "a fork child reads below its own bottom level");
-	assert_eq!(
-		child_options.history_pin_floor, NO_HISTORY_PIN,
-		"a childless child pins no history of its own"
+	assert!(child_options.pin_anchors.is_empty(), "a childless child pins no history of its own");
+}
+
+// ===== FK6: one anchor per reader, not one floor for all =====
+
+/// Two children forked at different points, and the parent compacting between
+/// them. Each child must read the value that was current at ITS anchor.
+///
+/// This is the defect FK6 exists for. With one point pin at the oldest anchor —
+/// what §3.3a specified and what shipped through FK5 — the deeper child read the
+/// shallower child's value and said nothing. The `retained_floor` assertion is
+/// the non-vacuity fact: the compaction has to have actually dropped something,
+/// or neither pin is being exercised.
+#[test(tokio::test)]
+async fn two_children_at_different_anchors_each_read_their_own_view() {
+	let (store, _temp) = create_store_with(|b| b.with_level_count(2));
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k", b"v1").unwrap();
+	txn.commit().await.unwrap();
+	store.flush().unwrap();
+	let shallow = fork_at(&store, "fork/shallow", BatchOwner::DEFAULT, visible_seq(&store));
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k", b"v2").unwrap();
+	txn.commit().await.unwrap();
+	store.flush().unwrap();
+	let deep = fork_at(&store, "fork/deep", BatchOwner::DEFAULT, visible_seq(&store));
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k", b"v3").unwrap();
+	txn.commit().await.unwrap();
+	store.flush().unwrap();
+	for round in 0..4u32 {
+		let mut txn = store.begin().unwrap();
+		txn.set(format!("filler/{round}").as_bytes(), b"f").unwrap();
+		txn.commit().await.unwrap();
+		store.flush().unwrap();
+	}
+
+	// No snapshot may be live: one would pin these versions for an unrelated
+	// reason and this test would pass with the anchor set deleted.
+	assert!(
+		store.core.inner.snapshot_tracker.get_all_snapshots().is_empty(),
+		"the fixture must leave no live snapshot"
 	);
+	let level_table_count = |level: usize| {
+		store
+			.core
+			.inner
+			.level_manifest
+			.read()
+			.unwrap()
+			.levels_for(BatchOwner::DEFAULT)
+			.map(|levels| levels.get_levels().get(level).map(|l| l.tables.len()).unwrap_or(0))
+			.unwrap_or(0)
+	};
+	assert_eq!(level_table_count(0), 7, "fixture must build seven L0 tables");
+	let strategy = Arc::new(Strategy::from_options(Arc::clone(&store.core.inner.opts)));
+	store.compact(strategy).unwrap();
+	assert!(
+		level_table_count(0) < 7 && level_table_count(1) > 0,
+		"the versions of `k` must actually have been merged together, or nothing is under test"
+	);
+
+	let txn = begin_owned_rw(&store, shallow);
+	assert_eq!(txn.get(b"k").unwrap(), Some(b"v1".to_vec()), "the shallow child's own anchor");
+	drop(txn);
+	let txn = begin_owned_rw(&store, deep);
+	assert_eq!(
+		txn.get(b"k").unwrap(),
+		Some(b"v2".to_vec()),
+		"the deep child must read what was current at ITS anchor, not the shallow child's"
+	);
+	drop(txn);
+	let txn = store.begin().unwrap();
+	assert_eq!(txn.get(b"k").unwrap(), Some(b"v3".to_vec()), "and the parent reads its own head");
+}
+
+/// The anchor set is per reader, so a parent carrying many of them keeps one
+/// version per anchor — and every child still reads exactly its own.
+#[test(tokio::test)]
+async fn a_parent_with_many_children_serves_every_anchor() {
+	const CHILDREN: u32 = 64;
+	let (store, _temp) = create_store_with(|b| b.with_level_count(2));
+
+	let mut children = Vec::new();
+	for round in 0..CHILDREN {
+		let mut txn = store.begin().unwrap();
+		txn.set(b"k", format!("v{round}").as_bytes()).unwrap();
+		txn.commit().await.unwrap();
+		if round % 8 == 0 {
+			store.flush().unwrap();
+		}
+		children.push((
+			round,
+			fork_at(&store, &format!("fork/{round}"), BatchOwner::DEFAULT, visible_seq(&store)),
+		));
+	}
+	store.flush().unwrap();
+	assert!(
+		store.core.inner.snapshot_tracker.get_all_snapshots().is_empty(),
+		"the fixture must leave no live snapshot"
+	);
+	let strategy = Arc::new(Strategy::from_options(Arc::clone(&store.core.inner.opts)));
+	store.compact(strategy).unwrap();
+
+	for (round, child) in children {
+		let txn = begin_owned_rw(&store, child);
+		assert_eq!(
+			txn.get(b"k").unwrap(),
+			Some(format!("v{round}").into_bytes()),
+			"child {round} must read the value current at its own anchor"
+		);
+	}
 }
 
 // ===== FK4: the fork protocol =====
@@ -545,8 +655,12 @@ async fn fork_below_the_retention_floor_is_refused() {
 		store.flush().unwrap();
 	}
 
-	// Intact history: the fork point is still servable.
+	// Intact history: the fork point is still servable. Deleted again before the
+	// compaction, because a live child AT that point would pin it — and then the
+	// second fork below would be legitimately servable rather than refused,
+	// which is a different property (asserted at the end of this test).
 	fork(&store, "main", "fork/before-floor", ForkPoint::AtVersion(first_seq)).unwrap();
+	store.delete_branch("fork/before-floor").unwrap();
 
 	let strategy = Arc::new(Strategy::from_options(Arc::clone(&store.core.inner.opts)));
 	store.compact(strategy).unwrap();
@@ -565,7 +679,21 @@ async fn fork_below_the_retention_floor_is_refused() {
 		"expected the boundary in the error, got {error}"
 	);
 	// Head is always servable, floor or not.
-	fork(&store, "main", "fork/head-still-fine", ForkPoint::Head).unwrap();
+	let head = fork(&store, "main", "fork/head-still-fine", ForkPoint::Head).unwrap();
+
+	// FK6: a cap below the floor is servable after all when it is a live anchor,
+	// because compaction preserved that exact view on purpose. Forking a second
+	// branch off the same point as an existing one is the ordinary way to reach
+	// this, and refusing it would be refusing a view the store is still holding.
+	let sibling = fork(&store, "main", "fork/same-point", ForkPoint::AtVersion(head.fork_seq))
+		.expect("a fork at a live anchor is servable however low the floor is");
+	assert_eq!(sibling.fork_seq, head.fork_seq);
+	let txn = begin_owned_rw(&store, sibling.child);
+	assert_eq!(
+		txn.get(b"k").unwrap(),
+		Some(b"v4".to_vec()),
+		"and it reads the pinned view, not whatever survived"
+	);
 }
 
 /// A retried fork returns the original receipt instead of creating a second
@@ -1379,7 +1507,7 @@ async fn detach_releases_the_parent_s_retention_pin() {
 	// The parent's compaction now runs with a real bottom level again.
 	let options = CompactionOptions::for_owner(&store.core.inner, BatchOwner::DEFAULT).unwrap();
 	assert!(!options.force_not_bottom, "with no children the parent regains its bottom level");
-	assert_eq!(options.history_pin_floor, NO_HISTORY_PIN);
+	assert!(options.pin_anchors.is_empty());
 }
 
 /// Detaching a branch with no parent is a no-op, and a branch that occupies

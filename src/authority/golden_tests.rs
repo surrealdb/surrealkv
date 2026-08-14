@@ -26,8 +26,9 @@ fn hex(bytes: &[u8]) -> String {
 /// SKBC v1: db_id 0x20×16, catalog_version 7, next_generation 5,
 /// writer_epoch 3, maintenance_epoch 2; entries: main (default id, gen 0,
 /// active, created 0, no options) and agent/sandbox (id 9, gen 4, active,
-/// created 41, parent=default@0 fork_seq 41, expires 99000).
-const GOLDEN_CATALOG: &str = "534b42430100202020202020202020202020202020200700000000000000050000000000000003000000000000000200000000000000020000000000000000000000000000000000000004006d61696e000000000000000000000000000000000000000000000000000000000000000000090d006167656e742f73616e64626f780400000000000000000529000000000000000000000000000000000000000000000000000000000000002900000000000000b88201000000000046d7cb17";
+/// created 41, parent=default@0 fork_seq 41, expires 99000, and one merge edge
+/// from id 10 @gen 2 through source seq 55 / target seq 61).
+const GOLDEN_CATALOG: &str = "534b42430100202020202020202020202020202020200700000000000000050000000000000003000000000000000200000000000000020000000000000000000000000000000000000004006d61696e000000000000000000000000000000000000000000000000000000000000000000090d006167656e742f73616e64626f780400000000000000000d29000000000000000000000000000000000000000000000000000000000000002900000000000000b882010000000000010000000000000000000000000000000000000a020000000000000037000000000000003d00000000000000a2a47731";
 
 /// SKBM v1: branch id 9, generation 4, state_version 3, last_sequence 120,
 /// flushed_log_number 2, retained_floor_seq 64; levels [ [7,5], [], [9] ].
@@ -56,6 +57,7 @@ fn golden_catalog_value() -> CatalogManifest {
 				parent: None,
 				deleted_at_seq: None,
 				expires_at: None,
+				merges: Vec::new(),
 			},
 			CatalogEntry {
 				branch: BranchId::from_u128(9),
@@ -70,6 +72,12 @@ fn golden_catalog_value() -> CatalogManifest {
 				}),
 				deleted_at_seq: None,
 				expires_at: Some(99_000),
+				merges: vec![MergeEdge {
+					source: BranchId::from_u128(10),
+					source_generation: BranchGeneration(2),
+					source_through_seq: 55,
+					target_through_seq: 61,
+				}],
 			},
 		],
 	}

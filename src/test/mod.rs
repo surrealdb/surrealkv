@@ -26,6 +26,8 @@ pub mod compression_tests;
 #[cfg(test)]
 pub mod crash_consistency_tests;
 #[cfg(test)]
+mod diff_tests;
+#[cfg(test)]
 mod fork_view_tests;
 #[cfg(test)]
 pub mod index_block_tests;
@@ -39,6 +41,10 @@ pub mod lsm_tests;
 pub mod manifest_tests;
 #[cfg(test)]
 pub mod memtable_tests;
+#[cfg(test)]
+mod merge_tests;
+#[cfg(test)]
+mod metrics_tests;
 #[cfg(test)]
 pub mod oracle_tests;
 #[cfg(test)]

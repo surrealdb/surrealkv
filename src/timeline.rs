@@ -108,8 +108,8 @@ impl Timeline {
 	}
 
 	/// The covered horizon `[floor_ts, last_commit_ts]`, or `None` when no
-	/// fencepost is retained. A metered quantity, not an internal detail.
-	#[cfg_attr(not(test), allow(dead_code))]
+	/// fencepost is retained. A metered quantity, not an internal detail:
+	/// `Tree::metrics` reports it, which is what FK2 promised and PE delivered.
 	pub(crate) fn horizon(&self) -> Option<(u64, u64)> {
 		let posts = self.fenceposts.lock().unwrap();
 		posts.front().map(|&(floor_ts, _)| (floor_ts, self.last_commit_ts()))

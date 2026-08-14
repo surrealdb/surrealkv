@@ -7,14 +7,14 @@ use tempfile::TempDir;
 use test_log::test;
 
 use crate::batch::BatchOwner;
-use crate::branch::BranchCatalog;
+use crate::branch::{BranchCatalog, RetentionAnchors};
 use crate::clock::MockLogicalClock;
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::leveled::{CompactionPriority, Strategy};
 use crate::compaction::{CompactionChoice, CompactionStrategy};
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::error::{BackgroundErrorHandler, Result};
-use crate::iter::{CompactionIterator, NO_HISTORY_PIN};
+use crate::iter::CompactionIterator;
 use crate::levels::{Level, LevelManifest, Levels};
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
@@ -212,7 +212,8 @@ fn create_compaction_options(
 		// inherited-view pin and a real bottom level, matching what every
 		// pre-branching compaction test asserts.
 		branch_catalog: Arc::new(RwLock::new(BranchCatalog::new(BranchId::DEFAULT))),
-		history_pin_floor: NO_HISTORY_PIN,
+		metrics: Arc::new(crate::metrics::BranchMetrics::default()),
+		pin_anchors: RetentionAnchors::default(),
 		force_not_bottom: false,
 	}
 }
@@ -1803,7 +1804,7 @@ fn test_tombstone_propagation_journey() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
-		NO_HISTORY_PIN,
+		RetentionAnchors::default(),
 	);
 	let non_bottom_result: Vec<_> = comp_iter_non_bottom.by_ref().map(|r| r.unwrap()).collect();
 
@@ -1826,7 +1827,7 @@ fn test_tombstone_propagation_journey() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
-		NO_HISTORY_PIN,
+		RetentionAnchors::default(),
 	);
 	let bottom_result: Vec<_> = comp_iter_bottom.by_ref().map(|r| r.unwrap()).collect();
 
@@ -3021,19 +3022,19 @@ fn test_clean_cut_integration_no_expansion() {
 	assert!(selected.contains(&1), "File 1 should be the only selected file");
 }
 
-/// FK3: a fork published while a compaction was merging can pin history that
-/// compaction already dropped. The floor is sampled before the merge, outside
-/// the manifest lock, so publication re-reads it and refuses to install an
+/// FK3/FK6: a fork published while a compaction was merging can pin history that
+/// compaction already dropped. The anchors are sampled before the merge, outside
+/// the manifest lock, so publication re-reads them and refuses to install an
 /// output built against a weaker promise.
 ///
-/// The race state is built directly: a job carrying the floor it sampled
-/// earlier, against a catalog that now pins a lower anchor. The control arm —
+/// The race state is built directly: a job carrying the anchors it sampled
+/// earlier, against a catalog that now holds one it did not. The control arm —
 /// same job, catalog unchanged — must publish, or this test would pass with the
 /// re-validation deleted.
 #[test(tokio::test)]
-async fn compaction_refuses_to_publish_under_a_lowered_inherited_view_floor() {
+async fn compaction_refuses_to_publish_under_an_unsampled_retention_anchor() {
 	let build_case =
-		|sampled_floor: u64, child_anchor: Option<u64>| {
+		|sampled_anchor: u64, child_anchor: Option<u64>| {
 			let env = TestEnv::new_with_levels(2);
 			let mut levels = Levels::new(3, 10);
 			for table_idx in 0..2u64 {
@@ -3079,7 +3080,7 @@ async fn compaction_refuses_to_publish_under_a_lowered_inherited_view_floor() {
 			let mut options =
 				create_compaction_options(Arc::clone(&env.options), Arc::clone(&manifest));
 			options.branch_catalog = Arc::new(RwLock::new(catalog));
-			options.history_pin_floor = sampled_floor;
+			options.pin_anchors = RetentionAnchors::from_iter_for_test([sampled_anchor]);
 			let strategy = Arc::new(Strategy::from_options(
 				create_options_with_compaction_settings(&env.options, 1, 1.0),
 			));
@@ -3091,18 +3092,17 @@ async fn compaction_refuses_to_publish_under_a_lowered_inherited_view_floor() {
 	compactor.compact().unwrap();
 	assert!(
 		!manifest.read().unwrap().default_owner_levels().get_levels()[1].tables.is_empty(),
-		"an unchanged floor must publish normally"
+		"an unchanged anchor set must publish normally"
 	);
 
-	// Race: a fork with a lower anchor landed after the sample.
+	// Race: a fork with an anchor the job never sampled landed after the sample.
 	let (env, manifest, compactor) = build_case(500, Some(120));
-	let error = compactor.compact().expect_err("a lowered floor must refuse publication");
+	let error = compactor.compact().expect_err("an unsampled anchor must refuse publication");
 	assert!(
 		matches!(
 			error,
 			crate::Error::CompactionPinRaced {
-				sampled_floor: 500,
-				current_floor: 120,
+				unsampled_anchor: 120,
 			}
 		),
 		"expected a typed pin-race error, got {error}"

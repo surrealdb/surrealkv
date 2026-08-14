@@ -200,13 +200,21 @@ pub(crate) struct Snapshot {
 /// must HIDE farther layers, not fall through to them).
 enum LayerHit {
 	Value(Value, u64),
-	Tombstone,
+	/// A delete is a version: its sequence is what tells a merge whether the
+	/// branch moved, so it is carried rather than collapsed away.
+	Tombstone {
+		seq: u64,
+		kind: InternalKeyKind,
+	},
 }
 
 impl LayerHit {
 	fn from_item(item: (InternalKey, Value)) -> Self {
 		if item.0.is_tombstone() {
-			Self::Tombstone
+			Self::Tombstone {
+				seq: item.0.seq_num(),
+				kind: item.0.kind(),
+			}
 		} else {
 			let seq = item.0.seq_num();
 			Self::Value(item.1, seq)
@@ -216,6 +224,13 @@ impl LayerHit {
 	fn from_owned(item: (InternalKey, Value)) -> Self {
 		Self::from_item(item)
 	}
+}
+
+/// What a snapshot can say about a key without reading its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VersionMeta {
+	pub(crate) seq: u64,
+	pub(crate) kind: InternalKeyKind,
 }
 
 pub(crate) struct SnapshotLayer {
@@ -258,6 +273,27 @@ impl Snapshot {
 				cap,
 			});
 		}
+		Ok(Self {
+			core,
+			seq_num,
+			layers,
+			_tracker_guard: tracker_guard,
+		})
+	}
+
+	/// A snapshot of only what `owner` OWNS: its own memtables and level set,
+	/// with no ancestor layers at all.
+	///
+	/// Diff reads through this. Note that "owns" is not the same as "wrote":
+	/// detach materializes inherited rows into the branch's own tables, so
+	/// callers that mean "changed since the fork" must still filter by sequence.
+	pub(crate) fn own_only(core: Arc<Core>, seq_num: u64, owner: BatchOwner) -> Result<Self> {
+		let tracker_guard = core.snapshot_tracker.register(seq_num);
+		let layers = vec![SnapshotLayer {
+			owner,
+			runtime: core.inner.runtimes.get(owner),
+			cap: seq_num,
+		}];
 		Ok(Self {
 			core,
 			seq_num,
@@ -385,9 +421,40 @@ impl Snapshot {
 		for layer in &self.layers {
 			if let Some(found) = Self::get_in_layer(&level_manifest, layer, key)? {
 				return Ok(match found {
-					LayerHit::Tombstone => None,
+					LayerHit::Tombstone {
+						..
+					} => None,
 					LayerHit::Value(value, seq) => Some((value, seq)),
 				});
+			}
+		}
+		Ok(None)
+	}
+
+	/// The newest version of `key` visible to this snapshot, as metadata only —
+	/// no value is loaded, and a delete is reported rather than hidden.
+	///
+	/// Merge planning uses this to ask "did the target move since the fork" for
+	/// every key the source changed, which must stay a metadata question: the
+	/// common answer is "no", and loading a value to discover that would make
+	/// planning proportional to the target's data rather than its changes.
+	pub(crate) fn get_latest_meta(&self, key: &[u8]) -> crate::Result<Option<VersionMeta>> {
+		let level_manifest = self.core.level_manifest.read()?;
+		for layer in &self.layers {
+			if let Some(found) = Self::get_in_layer(&level_manifest, layer, key)? {
+				return Ok(Some(match found {
+					LayerHit::Tombstone {
+						seq,
+						kind,
+					} => VersionMeta {
+						seq,
+						kind,
+					},
+					LayerHit::Value(_, seq) => VersionMeta {
+						seq,
+						kind: InternalKeyKind::Set,
+					},
+				}));
 			}
 		}
 		Ok(None)

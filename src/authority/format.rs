@@ -37,6 +37,22 @@ pub(crate) struct ParentLink {
 	pub(crate) fork_seq: u64,
 }
 
+/// A completed merge from one source into this branch.
+///
+/// Both sequences are load-bearing and neither is redundant: the source one
+/// bounds what a later merge still has to diff, and the target one is where the
+/// three-way base must be read, because after a merge the last common state is
+/// what was merged rather than the original fork.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MergeEdge {
+	pub(crate) source: BranchId,
+	pub(crate) source_generation: BranchGeneration,
+	/// The source's visible head at the time of the merge.
+	pub(crate) source_through_seq: u64,
+	/// This branch's visible head immediately after the merge landed.
+	pub(crate) target_through_seq: u64,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CatalogEntry {
 	pub(crate) branch: BranchId,
@@ -48,6 +64,11 @@ pub(crate) struct CatalogEntry {
 	pub(crate) deleted_at_seq: Option<u64>,
 	/// Branch TTL for agentic sandboxes; enforcement is a maintenance sweep.
 	pub(crate) expires_at: Option<u64>,
+	/// Merges already applied to this branch, one per source, sorted strictly
+	/// ascending by source id. Scoped per source deliberately: a merge from one
+	/// child must never be excluded from another child's comparison, or the
+	/// second merge would overwrite the first one's keys silently (plan C5).
+	pub(crate) merges: Vec<MergeEdge>,
 }
 
 /// THE authority: branch existence, generation, parentage, anchors, TTLs.
@@ -227,7 +248,12 @@ fn seal_envelope(mut out: Vec<u8>) -> Vec<u8> {
 const ENTRY_FLAG_PARENT: u8 = 1 << 0;
 const ENTRY_FLAG_DELETED_AT: u8 = 1 << 1;
 const ENTRY_FLAG_EXPIRES: u8 = 1 << 2;
-const ENTRY_FLAG_KNOWN: u8 = ENTRY_FLAG_PARENT | ENTRY_FLAG_DELETED_AT | ENTRY_FLAG_EXPIRES;
+const ENTRY_FLAG_MERGES: u8 = 1 << 3;
+const ENTRY_FLAG_KNOWN: u8 =
+	ENTRY_FLAG_PARENT | ENTRY_FLAG_DELETED_AT | ENTRY_FLAG_EXPIRES | ENTRY_FLAG_MERGES;
+/// Merge edges per branch: one per distinct source, so the catalog cap bounds
+/// this too.
+pub(crate) const MAX_MERGE_EDGES: usize = MAX_CATALOG_ENTRIES;
 
 const STATUS_ACTIVE: u8 = 0;
 const STATUS_DELETED: u8 = 1;
@@ -263,6 +289,9 @@ impl CatalogManifest {
 			if entry.expires_at.is_some() {
 				flags |= ENTRY_FLAG_EXPIRES;
 			}
+			if !entry.merges.is_empty() {
+				flags |= ENTRY_FLAG_MERGES;
+			}
 			out.push(flags);
 			put_u64(&mut out, entry.created_at_seq);
 			if let Some(parent) = &entry.parent {
@@ -275,6 +304,15 @@ impl CatalogManifest {
 			}
 			if let Some(expires) = entry.expires_at {
 				put_u64(&mut out, expires);
+			}
+			if !entry.merges.is_empty() {
+				put_u32(&mut out, entry.merges.len() as u32);
+				for edge in &entry.merges {
+					out.extend_from_slice(&edge.source.0);
+					put_u64(&mut out, edge.source_generation.0);
+					put_u64(&mut out, edge.source_through_seq);
+					put_u64(&mut out, edge.target_through_seq);
+				}
 			}
 		}
 		Ok(seal_envelope(out))
@@ -339,6 +377,28 @@ impl CatalogManifest {
 			} else {
 				None
 			};
+			let merges = if flags & ENTRY_FLAG_MERGES != 0 {
+				let count = reader.u32("entry merge count")? as usize;
+				if count > MAX_MERGE_EDGES {
+					return Err(invalid(
+						FORMAT,
+						"entry merge count",
+						&format!("{count} exceeds cap {MAX_MERGE_EDGES}"),
+					));
+				}
+				let mut merges = Vec::with_capacity(count);
+				for _ in 0..count {
+					merges.push(MergeEdge {
+						source: BranchId(reader.array16("merge source id")?),
+						source_generation: BranchGeneration(reader.u64("merge source generation")?),
+						source_through_seq: reader.u64("merge source_through_seq")?,
+						target_through_seq: reader.u64("merge target_through_seq")?,
+					});
+				}
+				merges
+			} else {
+				Vec::new()
+			};
 			entries.push(CatalogEntry {
 				branch,
 				name,
@@ -348,6 +408,7 @@ impl CatalogManifest {
 				parent,
 				deleted_at_seq,
 				expires_at,
+				merges,
 			});
 		}
 		reader.finish(FORMAT)?;
@@ -410,6 +471,33 @@ impl CatalogManifest {
 					));
 				}
 				_ => {}
+			}
+			if entry.merges.len() > MAX_MERGE_EDGES {
+				return Err(invalid(
+					FORMAT,
+					"entry merge count",
+					&format!("{} exceeds cap {MAX_MERGE_EDGES}", entry.merges.len()),
+				));
+			}
+			let mut previous_source: Option<&BranchId> = None;
+			for edge in &entry.merges {
+				if let Some(previous_source) = previous_source {
+					if edge.source.0 <= previous_source.0 {
+						return Err(invalid(
+							FORMAT,
+							"entry merge order",
+							"merge edges must be strictly ascending by source id",
+						));
+					}
+				}
+				previous_source = Some(&edge.source);
+				if edge.source == entry.branch {
+					return Err(invalid(
+						FORMAT,
+						"entry merge source",
+						"a branch cannot record a merge from itself",
+					));
+				}
 			}
 			if entry.generation.0 >= self.next_generation && entry.generation.0 != 0 {
 				return Err(invalid(

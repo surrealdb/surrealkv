@@ -146,8 +146,21 @@ For every Active child C in the catalog with parent P and anchor `F`:
 - **(a) Version retention (RANGE pin)**: P's compaction preserves every version
   at or below `F` that the child can read: forks inherit full history, so with
   versioning enabled the wall-clock retention floor (`iter.rs` version-drop) is
-  clamped to the oldest Active child anchor, and the newest-≤F version per key
-  plus plan-C1 tombstone rules are preserved unconditionally. Additionally, P's
+  clamped to the HIGHEST anchor P carries, and the newest-≤F version per key
+  plus plan-C1 tombstone rules are preserved unconditionally.
+
+  **Corrected by FK6 (2026-08-14).** This clause said "clamped to the oldest
+  Active child anchor", and one anchor cannot serve several readers: a child
+  forked above the oldest one silently read a version that was never current at
+  its own anchor, confirmed by executable probe. P's pins are a SET
+  (`RetentionAnchors`), holding every live child's `F` **and** the target-side
+  base of every live merge edge into P — the second kind makes exactly the same
+  promise and was simply never expressed as one, which let a compaction move a
+  merge's base. Non-versioned P preserves the newest version at or below each
+  anchor separately; versioned P range-pins below the highest. Neither `min` nor
+  `max` alone is a fix, and range-pinning to `max` unconditionally would retain
+  P's whole history for as long as anything is forked at its head. See the FK6
+  gate and as-built records in `P3_INTEGRATION_PROGRESS.md`. Additionally, P's
   compaction runs with `is_bottom_level = false` while any Active child anchor
   exists — the bottom-level hard-delete drop-all path otherwise overrides
   retention (`iter.rs:1037`, `:1104-1112`). Pins derive from CATALOG anchors
@@ -386,12 +399,13 @@ phase; ULID table ids optional there); public API (after FK5).
    delta table itself.)
 3. A parent of an Active child cannot be deleted; its catalog entry and state
    lineage remain loadable (resolvability, §3.3b).
-4. Parent compaction preserves the §3.3a pin: under versioning, every version
-   at or below the oldest Active child anchor; otherwise the newest version at
-   or below it. C1 tombstone rules included, with `is_bottom_level = false`
-   while any Active child anchor exists. Whichever of {fork, compaction}
-   publishes second re-checks the other and fails closed
-   (`CompactionPinRaced` / `BelowRetentionFloor`).
+4. Parent compaction preserves the §3.3a pins: under versioning, every version
+   at or below the highest anchor; otherwise the newest version at or below
+   EACH anchor. C1 tombstone rules included, with `is_bottom_level = false`
+   while any anchor exists. Whichever of {fork, merge, compaction} publishes
+   second re-checks the others and fails closed (`CompactionPinRaced` when the
+   catalog holds an anchor a job never sampled / `BelowRetentionFloor` when a
+   requested cap is neither above the retention floor nor a live anchor).
 5. Rows above a view's cap are unreadable through that view on every path.
 6. Every committed fork anchor `F` is gap-free (§3.5); capping at `F` yields
    identical rows before and after any crash.

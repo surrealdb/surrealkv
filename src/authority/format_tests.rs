@@ -18,6 +18,7 @@ fn sample_catalog() -> CatalogManifest {
 				parent: None,
 				deleted_at_seq: None,
 				expires_at: None,
+				merges: Vec::new(),
 			},
 			CatalogEntry {
 				branch: BranchId::from_u128(9),
@@ -32,6 +33,12 @@ fn sample_catalog() -> CatalogManifest {
 				}),
 				deleted_at_seq: None,
 				expires_at: Some(99_000),
+				merges: vec![MergeEdge {
+					source: BranchId::from_u128(10),
+					source_generation: BranchGeneration(2),
+					source_through_seq: 55,
+					target_through_seq: 61,
+				}],
 			},
 			CatalogEntry {
 				branch: BranchId::from_u128(10),
@@ -42,6 +49,7 @@ fn sample_catalog() -> CatalogManifest {
 				parent: None,
 				deleted_at_seq: Some(30),
 				expires_at: None,
+				merges: Vec::new(),
 			},
 		],
 	}

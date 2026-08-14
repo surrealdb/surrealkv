@@ -176,6 +176,10 @@ pub(crate) struct CoreInner {
 	/// mutex, seeded at open from the root tail + WAL replay, snapshotted
 	/// into every root version. Shared with `LevelManifest`.
 	pub(crate) timeline: Arc<crate::timeline::Timeline>,
+
+	/// Event counters for branch operations. Gauges are not stored here: they
+	/// are derived when a snapshot is taken (see `crate::metrics`).
+	pub(crate) metrics: Arc<crate::metrics::BranchMetrics>,
 }
 
 /// Transitional compatibility for the default-branch extraction. Field
@@ -333,6 +337,7 @@ impl CoreInner {
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
 			authority,
+			metrics: Arc::new(crate::metrics::BranchMetrics::default()),
 			catalog_publish: Mutex::new(CatalogPublishState {
 				catalog_version,
 				writer_epoch,
@@ -538,6 +543,7 @@ impl CoreInner {
 			*catalog = snapshot_catalog;
 			return Err(error);
 		}
+		self.metrics.record_detach();
 		Ok(rows)
 	}
 
@@ -691,11 +697,19 @@ impl CoreInner {
 		}
 
 		let mut deleted = 0usize;
+		let mut released = 0u64;
 		for owner in tombstoned {
+			// The catalog keeps a tombstoned entry until metadata pruning drops
+			// it, so this loop revisits owners it has already emptied. Only an
+			// owner that still had something to give up counts as reclaimed —
+			// otherwise the number would climb on every idle sweep.
+			let mut freed_something = false;
+
 			// Drop the runtime FIRST: once it is gone the flush loop cannot pick
 			// this owner up again, and any flush already past that point is
 			// refused by the liveness guard inside the manifest critical section.
 			for memtable in self.runtimes.reclaim(owner) {
+				freed_something = true;
 				// A discarded memtable still holds a WAL dependency. Releasing it
 				// is what lets the segments it pinned be reclaimed; skipping this
 				// would trade a bounded table leak for an unbounded WAL leak.
@@ -713,6 +727,10 @@ impl CoreInner {
 				tables
 			};
 
+			freed_something |= !reclaimed.is_empty();
+			if freed_something {
+				released += 1;
+			}
 			for table in reclaimed {
 				let path = self.opts.sstable_file_path(table.id);
 				match std::fs::remove_file(&path) {
@@ -726,6 +744,7 @@ impl CoreInner {
 				}
 			}
 		}
+		self.metrics.record_reclamation(released, deleted as u64);
 		Ok(deleted)
 	}
 
@@ -1456,16 +1475,16 @@ impl CompactionOperations for CoreInner {
 			let compactor = Compactor::new(options, Arc::clone(&strategy));
 			match compactor.compact() {
 				Ok(()) => {}
-				// A fork pinned lower history mid-merge. Nothing was published
-				// and the inputs are unhidden, so this is a retry condition,
-				// not damage: the next cycle re-picks them under the new floor.
-				// Every other error still fails the cycle.
+				// A fork or a merge pinned an anchor mid-merge. Nothing was
+				// published and the inputs are unhidden, so this is a retry
+				// condition, not damage: the next cycle re-picks them with the
+				// anchor in hand. Every other error still fails the cycle.
 				Err(Error::CompactionPinRaced {
-					sampled_floor,
-					current_floor,
+					unsampled_anchor,
 				}) => {
+					self.metrics.record_pin_race();
 					log::debug!(
-						"compaction of {owner:?} deferred: inherited-view floor moved {sampled_floor} -> {current_floor}"
+						"compaction of {owner:?} deferred: the catalog now pins sequence {unsampled_anchor}"
 					);
 				}
 				Err(error) => return Err(error),
@@ -1845,16 +1864,17 @@ impl Core {
 		// The fence: no new sequence can be allocated while it is held, and once
 		// the pipeline has drained, `visible_seq_num` is exactly the highest
 		// readable sequence.
-		let head = {
+		let (head, drain) = {
+			let fence_taken = std::time::Instant::now();
 			let _fence = self.commit_pipeline.lock_writes();
-			let deadline = std::time::Instant::now() + FORK_DRAIN_TIMEOUT;
+			let deadline = fence_taken + FORK_DRAIN_TIMEOUT;
 			while !self.commit_pipeline.is_drained() {
 				if std::time::Instant::now() >= deadline {
 					return Err(Error::ForkFenceTimeout);
 				}
 				std::hint::spin_loop();
 			}
-			self.inner.visible_seq_num.load(Ordering::Acquire)
+			(self.inner.visible_seq_num.load(Ordering::Acquire), fence_taken.elapsed())
 		};
 
 		let fork_seq = match at {
@@ -1881,11 +1901,17 @@ impl Core {
 		// through `CompactionPinRaced`, the fork through the floor check.
 		let levels = self.inner.level_manifest.read()?;
 		let floor = levels.retained_floor(parent_owner);
-		if fork_seq < floor {
-			return Err(Error::BelowRetentionFloor {
-				requested: fork_seq,
-				floor,
-			});
+		{
+			// Scoped: the catalog write lock is taken below, and a read guard
+			// still alive here would deadlock against it.
+			let catalog = self.inner.branch_catalog.read()?;
+			let anchors = catalog.retention_anchors(parent_owner.branch, parent_owner.generation);
+			if !anchors.view_is_complete_at(fork_seq, floor) {
+				return Err(Error::BelowRetentionFloor {
+					requested: fork_seq,
+					floor,
+				});
+			}
 		}
 
 		let mut catalog = self.inner.branch_catalog.write()?;
@@ -1912,6 +1938,7 @@ impl Core {
 			return Err(error);
 		}
 
+		self.inner.metrics.record_fork(drain.as_nanos() as u64);
 		Ok(ForkReceipt {
 			child,
 			parent: parent_owner,
@@ -2430,6 +2457,28 @@ impl Tree {
 		self.core.inner.delete_branch(id)
 	}
 
+	/// What branching has done and is costing, as of now.
+	///
+	/// The counters are this process's tally since open; the gauges are read
+	/// from the state that owns them at the moment of the call, so they cannot
+	/// disagree with it.
+	pub fn metrics(&self) -> Result<crate::BranchMetricsSnapshot> {
+		let live_branches = self.core.inner.branch_catalog.read()?.list().count() as u64;
+		let timeline_horizon = self.core.inner.timeline.horizon();
+		let wal_pinned_segments = self
+			.core
+			.inner
+			.wal_dependencies
+			.snapshot(self.core.inner.wal.read().get_active_log_number())
+			.component_count;
+		Ok(crate::BranchMetricsSnapshot::assemble(
+			&self.core.inner.metrics,
+			live_branches,
+			timeline_horizon,
+			wal_pinned_segments,
+		))
+	}
+
 	/// Every live branch, in catalog order.
 	pub fn list_branches(&self) -> Result<Vec<BranchInfo>> {
 		let records: Vec<_> = {
@@ -2763,6 +2812,256 @@ impl BranchHandle {
 			TransactionOptions::new_with_mode(mode),
 			self.owner,
 		)
+	}
+
+	/// Everything this branch changed since it was forked, in key order.
+	///
+	/// One entry per key — the branch's newest write to it — including deletes,
+	/// which is what tells a consumer to remove a key rather than leave the
+	/// inherited value in place. Rows the branch inherited are not changes and
+	/// are excluded.
+	///
+	/// Refuses a branch with no fork lineage (`main`, a plain `create_branch`,
+	/// or one that has been detached): there is no point to diff against, and
+	/// answering with "everything it owns" would be a different question wearing
+	/// this one's name.
+	pub fn diff(&self) -> Result<crate::BranchDiff> {
+		self.diff_from(self.fork_anchor()?)
+	}
+
+	/// This branch's changes above an explicit base. Merge uses it to re-diff
+	/// from the last merge point rather than from the fork.
+	fn diff_from(&self, base: u64) -> Result<crate::BranchDiff> {
+		let visible = self.core.inner.visible_seq_num.load(Ordering::Acquire);
+		let snapshot =
+			crate::snapshot::Snapshot::own_only(Arc::clone(&self.core), visible, self.owner)?;
+		Ok(crate::BranchDiff::new(snapshot, base))
+	}
+
+	/// Computes what merging this branch into `target` would do, without
+	/// changing anything.
+	///
+	/// Every conflict is reported before a single write happens, so a caller can
+	/// refuse the merge, resolve by hand, or proceed — the decision is never
+	/// made halfway through.
+	///
+	/// A merge is only accepted into the branch this one was forked from.
+	/// Sibling branches have no recorded common base, and inventing one would be
+	/// a guess, so they are refused with [`Error::BranchesUnrelated`]. If the
+	/// target has already collapsed the history at the fork point, the
+	/// comparison is unanswerable and the merge is refused with
+	/// [`Error::BelowRetentionFloor`] rather than planned against a partly
+	/// guessed base.
+	pub fn preview_merge_into(&self, target: &BranchHandle) -> Result<crate::MergeReport> {
+		let (base, visible) = self.merge_preconditions(target)?;
+
+		// The source's changes since the last merge (or the fork), and the
+		// target read at two caps: as it stood at that same point, and now.
+		let diff = self.diff_from(base.source_through)?;
+		let at_base = crate::snapshot::Snapshot::new_owned(
+			Arc::clone(&self.core),
+			base.target_at,
+			target.owner,
+		)?;
+		let now =
+			crate::snapshot::Snapshot::new_owned(Arc::clone(&self.core), visible, target.owner)?;
+		let mut probe = crate::merge::PointProbe::new(&at_base, &now);
+		let changes = diff.iter()?;
+		let report = crate::merge::plan(changes, &mut probe)?;
+		Ok(report)
+	}
+
+	/// Applies this branch's changes to `target`.
+	///
+	/// The merge writes through the ordinary commit path: sequence numbers come
+	/// from the same clock as any other write, it is durable through the WAL, it
+	/// gets fresh commit timestamps rather than replaying this branch's, and the
+	/// oracle judges it against everything the target has done **since the merge
+	/// was planned** — not since the write began. A caller that sees
+	/// [`Error::TransactionWriteConflict`] should re-preview and retry: the
+	/// target moved under the plan.
+	///
+	/// Under [`MergeStrategy::Strict`] a single conflict refuses the whole merge
+	/// and nothing is written — [`BranchHandle::preview_merge_into`] reports what
+	/// they are. Under [`MergeStrategy::SourceWins`] conflicting keys take this
+	/// branch's value, discarding the target's.
+	///
+	/// **Atomicity.** A merge that fits in one batch is one transaction and
+	/// lands all at once. A larger one is written in chunks, each durable on its
+	/// own: it is resumable rather than atomic, and a failure part-way leaves the
+	/// earlier chunks applied. Re-running the merge is the way to finish it —
+	/// every key already written classifies as converged, so it costs a re-scan
+	/// and nothing else. The one size that cannot be chunked is a single entry
+	/// larger than the whole budget, which is refused up front with
+	/// [`Error::MergeTooLarge`].
+	///
+	/// Once it lands, the merge is recorded on the target so a later merge from
+	/// this branch starts from here rather than re-offering what was already
+	/// applied.
+	pub async fn merge_into(
+		&self,
+		target: &BranchHandle,
+		strategy: crate::MergeStrategy,
+	) -> Result<crate::MergeOutcome> {
+		let session = self.merge_session(target)?;
+		let preflight = session.preflight(strategy)?;
+		if preflight.conflicts > 0 && strategy == crate::MergeStrategy::Strict {
+			return Err(Error::MergeConflicts {
+				count: preflight.conflicts,
+			});
+		}
+
+		let source_through_seq = session.source_through_seq();
+		let (target_through_seq, chunks) = if preflight.writes == 0 {
+			(source_through_seq, 0)
+		} else {
+			session.apply(strategy, &preflight).await?
+		};
+
+		self.record_merge_edge(target, source_through_seq, target_through_seq)?;
+		self.core.inner.metrics.record_merge(chunks);
+
+		let resolved = if strategy == crate::MergeStrategy::SourceWins {
+			preflight.conflicts
+		} else {
+			0
+		};
+		Ok(crate::MergeOutcome {
+			applied: preflight.writes,
+			converged: preflight.converged,
+			resolved,
+			chunks,
+			source_through_seq,
+			target_through_seq,
+		})
+	}
+
+	/// Records on the target that this branch has been merged into it up to
+	/// these sequences.
+	///
+	/// Data first, edge second. A crash in between re-offers what was already
+	/// applied on the next merge, which converges or conflicts — never a silent
+	/// overwrite. The opposite order would advance past changes that were never
+	/// written and lose them.
+	///
+	/// The level manifest is held for reading across the publish because the
+	/// edge's target-side sequence becomes a retention anchor (FK6) the instant
+	/// it lands. Compaction publishes under the same lock exclusively, so this
+	/// closes the window where a job that sampled anchors without this one could
+	/// install an output missing what the anchor promises. A job already merging
+	/// still re-checks and discards on its own.
+	fn record_merge_edge(
+		&self,
+		target: &BranchHandle,
+		source_through_seq: u64,
+		target_through_seq: u64,
+	) -> Result<()> {
+		let _levels = self.core.inner.level_manifest.read()?;
+		let mut publish = self.core.inner.catalog_publish.lock().unwrap();
+		let mut catalog = self.core.inner.branch_catalog.write()?;
+		let snapshot = catalog.clone();
+		catalog
+			.record_merge(
+				target.owner.branch,
+				target.owner.generation,
+				crate::authority::format::MergeEdge {
+					source: self.owner.branch,
+					source_generation: self.owner.generation,
+					source_through_seq,
+					target_through_seq,
+				},
+			)
+			.map_err(|error| {
+				Error::InvalidArgument(format!("merge record rejected: {}", error.message))
+			})?;
+		if let Err(error) = self.core.inner.publish_catalog_locked(&mut publish, &catalog) {
+			*catalog = snapshot;
+			return Err(error);
+		}
+		Ok(())
+	}
+
+	/// Validates the merge and fixes everything it will be judged against: the
+	/// base, the source's changes, and the target read at two caps.
+	///
+	/// The two halves of a merge are separable on purpose. Planning is a pure
+	/// read and writing is not, and the sequence the session captures here is
+	/// what the oracle judges every chunk against — so the gap between them is
+	/// covered rather than being a window where a concurrent write disappears.
+	pub(crate) fn merge_session(
+		&self,
+		target: &BranchHandle,
+	) -> Result<crate::merge::MergeSession> {
+		let (base, visible) = self.merge_preconditions(target)?;
+		crate::merge::MergeSession::new(
+			Arc::clone(&self.core),
+			self.owner,
+			target.owner,
+			base,
+			visible,
+		)
+	}
+
+	/// Validates lineage and retention, returning the effective base and the
+	/// current visible head.
+	fn merge_preconditions(
+		&self,
+		target: &BranchHandle,
+	) -> Result<(crate::merge::EffectiveBase, u64)> {
+		if !Arc::ptr_eq(&self.core, &target.core) {
+			return Err(Error::InvalidArgument(
+				"branches from different stores cannot be merged".to_owned(),
+			));
+		}
+		let retained_floor = self.core.inner.level_manifest.read()?.retained_floor(target.owner);
+		let base = {
+			let catalog = self.core.inner.branch_catalog.read()?;
+			catalog
+				.validate_owner(target.owner.branch, target.owner.generation)
+				.map_err(|_| Error::BranchFenced)?;
+			let fork_seq = crate::merge::validate_lineage(&catalog, self.owner, target.owner)?;
+			let base = crate::merge::effective_base(&catalog, self.owner, target.owner, fork_seq);
+
+			// The base side of the three-way comparison is read at this cap, so
+			// the target's history there has to still answer exactly. Once it has
+			// been collapsed, "did the target move" is unanswerable, and planning
+			// against a partly-guessed base is how a merge overwrites something
+			// silently.
+			//
+			// This cap is normally an anchor by construction — it is either the
+			// fork seq of a live child or the target side of a live merge edge,
+			// which is exactly what `retention_anchors` derives. It stops being
+			// one in the window between a merge's data commit and its edge
+			// record: a compaction that samples anchors in that window has not
+			// seen the new one yet and may drop what it promises. Refusing here
+			// is that race surfacing, and refusing is the right end for it. PD3's
+			// durable merge intent closes the window by pinning ahead of the
+			// commit.
+			let anchors = catalog.retention_anchors(target.owner.branch, target.owner.generation);
+			if !anchors.view_is_complete_at(base.target_at, retained_floor) {
+				return Err(Error::BelowRetentionFloor {
+					requested: base.target_at,
+					floor: retained_floor,
+				});
+			}
+			base
+		};
+		Ok((base, self.core.inner.visible_seq_num.load(Ordering::Acquire)))
+	}
+
+	/// The sequence this branch was forked at — the base every change is
+	/// measured against.
+	fn fork_anchor(&self) -> Result<u64> {
+		let catalog = self.core.inner.branch_catalog.read()?;
+		let record = catalog
+			.validate_owner(self.owner.branch, self.owner.generation)
+			.map_err(|_| Error::BranchFenced)?;
+		record.parent.as_ref().map(|link| link.fork_seq).ok_or_else(|| {
+			Error::InvalidArgument(format!(
+				"branch {:?} has no fork lineage to diff against",
+				self.name
+			))
+		})
 	}
 
 	/// This branch's catalog facts as of now.

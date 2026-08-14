@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::batch::BatchOwner;
-use crate::branch::BranchCatalog;
+use crate::branch::{BranchCatalog, RetentionAnchors};
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
-use crate::iter::{BoxedLSMIterator, CompactionIterator, NO_HISTORY_PIN};
+use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{LevelManifest, ManifestChangeSet};
 use crate::lsm::CoreInner;
 use crate::memtable::ImmutableMemtables;
@@ -66,14 +66,17 @@ pub(crate) struct CompactionOptions {
 	/// (design §3.3a, plan amendment C9 — never the snapshot tracker, never
 	/// child state manifests).
 	pub(crate) branch_catalog: Arc<RwLock<BranchCatalog>>,
-	/// Minimum fork anchor across `owner`'s Active children, sampled from the
-	/// catalog when this job was created, or [`NO_HISTORY_PIN`].
-	pub(crate) history_pin_floor: u64,
+	/// Where the count of pin-retained versions goes. Compaction is the only
+	/// place that number exists.
+	pub(crate) metrics: Arc<crate::metrics::BranchMetrics>,
+	/// The caps `owner` must stay exactly readable at, sampled from the catalog
+	/// when this job was created.
+	pub(crate) pin_anchors: RetentionAnchors,
 	/// Whether this compaction must not treat its highest level as the bottom
-	/// of a read stack. True when `owner` has Active children (their inherited
-	/// views read below the tombstones being compacted) or when `owner` is
-	/// itself a fork child (its ancestors sit below its own bottom level) —
-	/// plan amendment C1(c).
+	/// of a read stack. True when anything still reads `owner` at a cap (an
+	/// Active child's inherited view or a merge's base, both of which read below
+	/// the tombstones being compacted) or when `owner` is itself a fork child
+	/// (its ancestors sit below its own bottom level) — plan amendment C1(c).
 	pub(crate) force_not_bottom: bool,
 }
 
@@ -83,13 +86,12 @@ impl CompactionOptions {
 		// without already holding the level manifest, and every other catalog
 		// reader is leaf-level, so `level_manifest -> branch_catalog` (used at
 		// publish time) is a consistent global order.
-		let (history_pin_floor, force_not_bottom) = {
+		let (pin_anchors, force_not_bottom) = {
 			let catalog = tree.branch_catalog.read()?;
-			let anchor = catalog.min_active_child_anchor(owner.branch, owner.generation);
-			(
-				anchor.unwrap_or(NO_HISTORY_PIN),
-				anchor.is_some() || catalog.record_has_parent(owner.branch, owner.generation),
-			)
+			let anchors = catalog.retention_anchors(owner.branch, owner.generation);
+			let force_not_bottom =
+				!anchors.is_empty() || catalog.record_has_parent(owner.branch, owner.generation);
+			(anchors, force_not_bottom)
 		};
 		Ok(Self {
 			lopts: Arc::clone(&tree.opts),
@@ -99,7 +101,8 @@ impl CompactionOptions {
 			error_handler: Arc::clone(&tree.error_handler),
 			snapshot_tracker: tree.snapshot_tracker.clone(),
 			branch_catalog: Arc::clone(&tree.branch_catalog),
-			history_pin_floor,
+			metrics: Arc::clone(&tree.metrics),
+			pin_anchors,
 			force_not_bottom,
 		})
 	}
@@ -239,7 +242,7 @@ impl Compactor {
 			self.options.lopts.versioned_history_retention_ns,
 			Arc::clone(&self.options.lopts.clock),
 			snapshots,
-			self.options.history_pin_floor,
+			self.options.pin_anchors.clone(),
 		);
 
 		let mut entries = 0;
@@ -250,12 +253,13 @@ impl Compactor {
 		}
 
 		let pin_retained = comp_iter.pin_retained_versions();
+		self.options.metrics.record_pin_retained(pin_retained);
 		if pin_retained > 0 {
 			log::debug!(
-				"compaction of {:?} retained {} version(s) for inherited views at or below seq {}",
+				"compaction of {:?} retained {} version(s) for the views pinned at {:?}",
 				self.options.owner,
 				pin_retained,
-				self.options.history_pin_floor
+				self.options.pin_anchors
 			);
 		}
 
@@ -294,22 +298,21 @@ impl Compactor {
 		let mut manifest = self.options.level_manifest.write()?;
 		let _imm_guard = self.options.immutable_memtables.write();
 
-		// A fork published while this job was merging can pin history the job
-		// already dropped: the floor was sampled before the merge, outside the
-		// manifest lock. Re-read it here, under the lock that serialises
-		// publication, and refuse to publish an output built against a weaker
-		// promise. The hidden inputs are restored by `HiddenTablesGuard`, and
-		// the next cycle re-picks them with the stricter floor.
-		let current_floor = self
+		// A fork or a merge published while this job was merging can pin history
+		// the job already dropped: the anchors were sampled before the merge,
+		// outside the manifest lock. Re-read them here, under the lock that
+		// serialises publication, and refuse to publish an output built against
+		// a weaker promise. The hidden inputs are restored by
+		// `HiddenTablesGuard`, and the next cycle re-picks them with the anchor
+		// in hand.
+		let current = self
 			.options
 			.branch_catalog
 			.read()?
-			.min_active_child_anchor(self.options.owner.branch, self.options.owner.generation)
-			.unwrap_or(NO_HISTORY_PIN);
-		if pin_floor_regressed(self.options.history_pin_floor, current_floor) {
+			.retention_anchors(self.options.owner.branch, self.options.owner.generation);
+		if let Some(unsampled_anchor) = current.appeared_since(&self.options.pin_anchors) {
 			return Err(crate::error::Error::CompactionPinRaced {
-				sampled_floor: self.options.history_pin_floor,
-				current_floor,
+				unsampled_anchor,
 			});
 		}
 
@@ -398,18 +401,6 @@ impl Compactor {
 struct MergeOutcome {
 	table_created: bool,
 	retained_floor_advance: u64,
-}
-
-/// Whether a compaction that retained history down to `sampled_floor` is still
-/// allowed to publish now that the catalog pins `current_floor`.
-///
-/// A floor that rose (or vanished, because the last child was deleted) means the
-/// output over-retains, which is always safe. Only a floor that dropped below
-/// what the job assumed is unsafe: versions between the two floors may already
-/// have been discarded from the output table.
-fn pin_floor_regressed(sampled_floor: u64, current_floor: u64) -> bool {
-	current_floor != NO_HISTORY_PIN
-		&& (sampled_floor == NO_HISTORY_PIN || current_floor < sampled_floor)
 }
 
 fn common_owner(

@@ -345,6 +345,765 @@ through its skipped parent, pruning bounded to the retained window followed by a
 every branch, the scale gate (900 plain branches + 100 forks, pruned, reopened, 1,001 records, an
 inherited view still resolving, one runtime), and the truncation sabotage with its control arm.
 
+### FK6 — Multi-anchor retention pins: complete (2026-08-14)
+
+As built:
+
+- **`RetentionAnchors`** (`branch.rs`) — the sorted, deduplicated set of caps one owner must stay
+  exactly readable at, with `AnchorWalker` serving them in a single pass over a key's versions.
+  The walker is the whole fix in five lines: anchors descend, versions arrive newest-first, so one
+  shared index decides "is this version the newest at or below an anchor nothing has answered yet".
+- **`BranchCatalog::retention_anchors(owner, generation)`** — every live child's `fork_seq` plus
+  every merge edge's `target_through_seq` whose source is still live at that generation. A deleted
+  source releases both of its anchors, so branch churn still reclaims.
+- **`CompactionIterator`** takes the set instead of a floor. Non-versioned: the newest version at
+  or below *each* anchor. Versioned: the range below the *highest* anchor, which is what "forks
+  inherit full history ≤ F" means once F is not unique.
+- **`RetentionAnchors::view_is_complete_at(cap, floor)`** — one predicate, used by the fork check
+  and the merge check, replacing a pin-blind `cap < floor` comparison in each.
+- **`CompactionPinRaced { unsampled_anchor }`** — was `{ sampled_floor, current_floor }`. The
+  question generalised from "did the floor drop" to "does the catalog hold an anchor this job never
+  sampled"; an anchor that vanished still means the job merely over-retained.
+- `min_active_child_anchor` survives, wired to its one real caller: the delete guard's "does
+  anything still fork off this branch".
+
+**Both gate defects are now permanent tests, and both were probed.**
+
+Defect 1 (`two_children_at_different_anchors_each_read_their_own_view`) is backed by a unit
+sabotage: `fk6_every_anchor_keeps_the_version_that_answers_for_it` runs the same versions through
+the production iterator with each of the two single-anchor sets the design used to have, and
+records that `min` (what shipped) loses the deep child's version and `max` loses the shallow
+child's. Neither single pin is a fix for the other.
+
+Defect 2's probe is worth recording in full, because it took two steps. Disabling the merge-edge
+anchor alone did NOT expose the overwrite — it reddened on `BelowRetentionFloor` instead, because
+the completeness guard caught the missing anchor first. Disabling **both** produced the real
+failure: `preview_merge_into` reports **zero conflicts** where it must report one, meaning the
+merge applies straight over the target's deliberate revert. Two layers, and the outer one is doing
+real work; that is why the guard stays even though a live source always pins the cap its merge
+reads at.
+
+Plan-vs-reality deltas:
+
+1. **The gate's "the anchor set is capped" is wrong and the code does not cap it.** A cap that
+   truncates would silently drop a promise, which is the defect being fixed wearing a hat. The
+   count needs no separate cap: it is bounded by the catalog's own 4096-entry limit at two anchors
+   per entry.
+2. **`retained_floor` is now often 0 where it used to advance.** The first version of defect 1's
+   test asserted `retained_floor > 0` as its non-vacuity fact — copied from the probe, where the
+   floor rose *because* the pin had failed. With the pin working the fixture drops nothing at all.
+   The honest non-vacuity fact is that a compaction happened: L0 shrank and L1 grew.
+3. **`fork_below_the_retention_floor_is_refused` was passing for a fixture reason.** Its control
+   arm forked at the very point it later expected to be refused, and that live child now pins the
+   point — so the second fork is legitimately servable. The control is deleted before the
+   compaction, and a new arm pins the new behaviour: **a fork at a live anchor is servable however
+   low the floor is**, which is the ordinary "fork two branches off the same commit" case that the
+   old floor check refused.
+4. **`a_base_below_the_target_s_retention_floor_is_refused` never observed its own refusal** — it
+   asserted the floor moved and that an unrelated fresh fork still planned. Renamed to
+   `detaching_a_source_releases_the_parent_s_pin`, which is what it proves, with the reachability
+   of the guard written down rather than implied.
+5. **No format change**, so no golden vectors were regenerated: anchors derive from the catalog,
+   which is already durable, and `retained_floor_seq` keeps its meaning.
+
+Carried to PD3: the merge guard is reachable through one narrow window — between a merge's data
+commit and its edge record, a compaction can sample anchors without the new one and drop what it
+will promise. The refusal is the right end for that race, and PD3's durable merge intent closes it
+properly by pinning the base before the commit rather than after.
+
+Verification: 1,092 lib tests green (1,078 → 1,092), 4 doc tests, clippy `--all-targets
+--all-features` clean, fmt clean. Fourteen new tests: seven unit arms on the anchor set and its
+walker, three on the compaction iterator (two-anchor retention with both single-anchor sabotage
+arms, one-version-per-anchor, the bottom-level delete against an anchor set), two integration arms
+for defect 1 (two children, and a 64-child parent where every child still reads its own anchor),
+and two for defect 2 (a merge surviving the parent's compaction, and the reverted-key conflict).
+
+### PD3a — The bounded merge: complete (2026-08-14)
+
+As built:
+
+- **`MergeSession`** (`merge.rs`) — one merge, holding everything it is judged against: one source
+  diff snapshot, one pair of target snapshots, one planning sequence, and one `ActiveTxnGuard` at
+  that sequence. Both passes read the fixed view, so a write arriving mid-merge cannot make pass two
+  disagree with pass one about what conflicts.
+- **`Transaction::new_owned_at(core, opts, owner, start_seq)`** — a transaction whose conflict
+  window opens at a stated sequence instead of at "now". `new_owned` is now a one-line call into it.
+  This is F1's fix, and it is the whole of it.
+- **`preflight`** — pass one. Classifies everything, buffers nothing, counts writes / converged /
+  conflicts, measures total and largest-entry bytes, and keeps conflicts up to
+  `CONFLICT_REPORT_LIMIT` (1024) for the refusal. Under `Strict` it stops measuring once a conflict
+  is seen, because nothing will be written.
+- **`apply`** — pass two. Re-streams the same view, fills a chunk to `max_memtable_size` bytes,
+  commits, repeats. Returns the target head and the chunk count.
+- **`MergeOutcome.chunks`** — new public field. One means the merge landed atomically; more means
+  each chunk is durable on its own. A caller cannot otherwise tell whether the operation it just ran
+  was all-or-nothing, and after this slice that is no longer a constant.
+- **`record_merge_edge`** holds the level manifest for reading across the catalog publish (F5), so
+  no compaction can publish between the last chunk and the edge that becomes its retention anchor.
+
+Verified by probe, both ways:
+
+- Removing the shared `start_seq` (chunks built with `new_owned` instead of `new_owned_at`) turns
+  `a_target_write_between_planning_and_writing_conflicts` from a conflict into a **success**:
+  `apply` returns `(4, 1)` and the concurrent write is overwritten. That is F1's defect, reproduced.
+- `outcome.chunks > 1` is the non-vacuity fact for the chunking test — without it, "40 keys landed"
+  is equally true of a single batch, and the test would pass with chunking deleted.
+
+Plan-vs-reality deltas:
+
+1. **`MergeTooLarge` changed meaning rather than dying.** The plan wanted a size preflight raising
+   it; chunking makes the merge-wide version unreachable. It now names a *single entry* larger than
+   the whole budget, which is the one size chunking genuinely cannot fix, and it is raised in pass
+   one before anything is written. `an_oversized_merge_is_refused_before_writing` became
+   `a_merge_past_the_chunk_budget_completes_in_chunks` — same fixture, opposite expectation,
+   because the behaviour it asserted is the behaviour this slice removes.
+2. **`Transaction::write_set_size_estimate` is deleted.** Its only caller was `commit_merge`, which
+   measured after materializing the whole write set — the thing F3 says is too late. Pass one
+   measures from the diff entries instead, so the method had no consumer left.
+3. **The durable cursor is NOT here** and the gate argues it is not the correctness mechanism the
+   plan implies: a crashed chunked merge, re-run, classifies every already-applied key as Converged
+   and reaches the same final state. PD3b builds the intent for the three things it *is* good for —
+   naming the half-merged state, refusing a conflicting second merge, and skipping the re-scan.
+4. **Two passes, uniformly, including for small merges.** A "buffer until it overflows, then fall
+   back" shape would save a pass on the common case at the cost of two code paths through the most
+   dangerous operation in the store. The extra pass over a small diff is microseconds; PD3c's scan
+   probe makes it cheaper still.
+5. **`merge_session` is `pub(crate)`, not a test hook.** `merge_into` goes through it. The window in
+   F1 is only deterministic if a test can stand between planning and writing, and the honest way to
+   allow that is for the two halves to be genuinely separate in production, which they now are.
+
+Verification: 1,095 lib tests green (1,092 → 1,095), 4 doc tests, clippy `--all-targets
+--all-features` clean, fmt clean. Four tests replace one: chunked completion with a re-merge proving
+the edge covers the whole extent, one-chunk atomicity, the unchunkable single entry with nothing
+written, and the planning-window conflict.
+
+### PE1 — Branch metrics: complete (2026-08-15)
+
+As built: `src/metrics.rs`, `Tree::metrics() -> BranchMetricsSnapshot`, and one new test file.
+
+Eight counters, incremented where the event happens: `forks`, `fork_drain_nanos`, `detaches`,
+`merges`, `chunked_merges`, `branches_reclaimed`, `tables_reclaimed`, `pin_retained_versions`,
+`compaction_pin_races`. Three gauges, computed when the snapshot is taken and never stored:
+`live_branches`, `timeline_horizon`, `wal_pinned_segments`.
+
+`Timeline::horizon` loses its `allow(dead_code)`: FK2 wrote it for a metric that never shipped, and
+this is that metric.
+
+**Two production defects, both found by writing the twin rather than the happy arm.**
+
+1. **`branches_reclaimed` was counting SST files.** The wiring took `reclaim_tombstoned_branches`'s
+   return value, which is `deleted` — incremented per `remove_file`, not per branch. A branch
+   deleted before it flushed would have reported zero reclamations while having been fully
+   reclaimed. Fixed by counting both, separately, because they answer different questions and
+   routinely differ: `branches_reclaimed` says the sweep is running, `tables_reclaimed` says how
+   much disk it gave back.
+2. **The branch count climbed on every idle sweep.** A tombstoned catalog entry survives until
+   metadata pruning drops it, so the sweep revisits owners it has already emptied. `released += 1`
+   per tombstoned owner therefore counted *attempts*. Fixed to count only an owner that still had
+   something to give up — a runtime with its memtables and WAL dependency, or tables. The twin that
+   caught it is "a second sweep releases nothing".
+
+Plan-vs-reality deltas beyond the gate's four findings:
+
+3. **The metric's meaning was pinned down by the test, and then written into its doc.** A branch
+   that never wrote holds no runtime (BR4's lazy runtimes), so releasing it releases nothing and it
+   is not counted. That is defensible and now stated: the counter measures resources freed, not
+   tombstones walked. Counting tombstones would need new durable state to know which had been seen.
+4. **Two of my test expectations were wrong and the code was right**, recorded because they are the
+   same class of error each time — asserting the behaviour I remembered rather than the one that
+   shipped. A fork retry is *idempotent* (FK4), so it returns the original receipt rather than
+   erroring, and it correctly counts nothing. And `Tree::flush` rotates only the default runtime, so
+   a child branch's memtable has to be rotated explicitly to put a table on disk.
+
+Verification: 1,107 lib tests green (1,101 → 1,107), clippy `--all-targets --all-features` clean,
+fmt clean. Six tests, each with the twin its counter needs.
+
+## PE gate record (adversarial gate 2026-08-14 — the slice splits; fault injection is blocked)
+
+**F1 — PE's fault-injection half cannot be built yet.** The plan says to inject faults "using the
+existing `SimObjectStore`/`SimCommitStore` fault scripts (`src/storage/sim.rs`)". Those intercept
+nothing today: `src/authority/publish.rs:11` opens files through `std::fs`/`OpenOptions` directly,
+and the level manifest does the same (`src/levels/mod.rs:2`). Routing that IO through the roles is
+**PF1's** entire job. Injecting faults into the branch state machines before the seam exists would
+mean building a second, throwaway injection mechanism.
+→ **PE splits.** PE1 is the metrics, now. **PE2** is the fault-injection lane over fork / delete /
+expiry / detach / merge, and it moves to immediately after PF1, where the sim stores actually sit
+under the engine. Recorded as a dependency, not a deferral of convenience.
+
+**F2 — `pinned_bytes_by_branch` is not attributable after FK6, and bytes are not measured.** The
+plan names a per-branch byte gauge. Two problems: retention pins are now a *set* of anchors and one
+retained version commonly serves several of them, so attributing its bytes to one branch is a
+choice, not a measurement; and the compaction iterator counts versions, not bytes. What it already
+computes — `pin_retained_versions`, currently thrown away in a `log::debug!` — is the honest form of
+the same question ("what is branching costing me in retained history"), so that is what ships.
+
+**F3 — half the plan's list is already computable, and storing it would create staleness.** The
+timeline horizon (`timeline.rs:113`, carrying an `allow(dead_code)` since FK2 precisely because its
+metric never shipped), the WAL pinned-segment count (`WalDependencySnapshot`), the live branch count
+and the per-owner retention floor are all derivable on demand from state that is already the source
+of truth. Copying them into atomics would add a second place for each to be wrong — the exact hazard
+the no-stale-state rule names.
+→ The snapshot mixes **stored counters** (events, which must be counted as they happen) with
+**derived gauges** (computed at read time, structurally incapable of drifting). Only the counters
+need plumbing.
+
+**F4 — "fork latency" as the caller sees it is not the number worth having.** A caller times its own
+`fork_branch` call. What no one can see is how long the write fence was held, which is the cost the
+whole store pays for one branch operation and the number the "many cheap branches" premise stands
+on. `fork_drain_nanos` measures the fence, not the call. Detach and merge get counts but no timing:
+the caller awaits them and can time them itself, and neither blocks unrelated writers.
+
+**Exit gate (PE1):** every counter has a test that moves it and a twin where it must not move; the
+derived gauges are read through the same snapshot and asserted against the state they derive from.
+
+### PD3c — The scan-mode probe and its equivalence: complete (2026-08-14)
+
+Closes PD1's deferral. Plan A7 asked for "point `get_latest_meta` per key below a threshold,
+seq-filtered scan above it", with the two modes proven to agree.
+
+As built:
+
+- **`TargetProbe` now asks the question it needs**, not two questions that imply it.
+  `base_meta` + `target_meta` became `moved_since_base(key)`. The old pair forced every
+  implementation to manufacture two `VersionMeta`s so the caller could compare their sequences,
+  which the scan cannot do cheaply and does not need to: "has the target moved since the base" and
+  "is this key in the target's changes above the base" are the same question. The conflict rules in
+  `classify` are otherwise untouched, which is what PD1's gate required of this slice.
+- **`ScanProbe`** — a forward-only walk of the target's OWN changes above `base.target_at`, which is
+  a `BranchDiff` on the target: the same machinery PC built for the source side, pointed the other
+  way. A key absent from the walk has not moved, answered with no reads at all. A key present hands
+  over its value too, so the read the point probe would have made for `target_value` is already
+  done.
+- **The ordering contract is enforced, not assumed.** The probe refuses a key at or below the last
+  one it answered. Answering would be wrong in the worst available direction — a moved key reported
+  as untouched, which applies straight over it — so it fails closed.
+- **`SCAN_PROBE_THRESHOLD` (256), chosen from an exact count rather than an estimate.** Pass one
+  always points, because it is the pass that *discovers* how big the merge is; pass two picks by
+  `preflight.examined()`. The alternative was estimating the source's size from SST `item_count` and
+  memtable bytes before either pass, which needs an invented bytes-per-entry constant — the skiplist
+  exposes no entry count — for a decision the first pass answers exactly a moment later.
+
+Verified by probe, both directions:
+
+- Advancing the cursor with `<=` instead of `<`, so it steps past the key it was asked about,
+  reddens the equivalence test on "the two probes must not disagree about anything". The test binds.
+- Removing only the cursor-value optimisation, so `target_value` always reads through the snapshot,
+  leaves it green. The test is insensitive to changes that are not semantic, which is what an
+  equivalence test should be.
+
+Plan-vs-reality delta: the plan describes the crossover as a property of the *detection mode* chosen
+per merge. As built it is a property of pass two only. Pass one cannot choose by size without
+already knowing the size, and the honest resolutions are either a fabricated estimate or this. The
+cost is that a very large merge still pays one point-probing pass — the same one PD2 always paid —
+and pass two, the pass PD3a added, is the one that gets cheap.
+
+Verification: 1,101 lib tests green (1,098 → 1,101), 4 doc tests, clippy `--all-targets
+--all-features` clean, fmt clean. Three new tests: the decision-table equivalence fixture covering
+every row (with assertions that the fixture reaches all of them, so agreement is not cheap), the
+out-of-order refusal, and a merge above the threshold applied end to end through the public API.
+
+### PD3b — The crash matrix (no durable intent): complete (2026-08-14)
+
+As built: three tests and no production code. The gate below records why the slice's planned
+mechanism was not built; this records what stands in its place and what it proves.
+
+- **`interrupted_chunked_merge`** — the shared fixture. It drives a chunked merge that breaks off
+  part-way, using no injection: a concurrent write to a key late in the key order makes that key's
+  chunk fail on the oracle while the chunks before it are already durable, which is the same state a
+  crash between chunks leaves. The fixture asserts its own non-vacuity — the first key present, the
+  last absent — so a change that made the merge atomic again could not leave these tests green.
+- **`an_interrupted_chunked_merge_completes_on_a_re_run`** — the re-run finishes it, with
+  `converged > 0` and `resolved == 1`. Probed: removing the convergence rule from `classify`
+  reddens it on exactly that assertion, so it is evidence that the re-run completes by comparing
+  values rather than by replaying blindly.
+- **`a_half_merged_target_reopens_and_the_re_run_finishes_it`** — the same across `close` and
+  reopen. The half-merged data is durable, and so is the *absence* of an edge, so the re-run still
+  has the whole merge to offer.
+- **`a_second_source_finds_a_half_merged_target_and_conflicts`** — another branch merging into a
+  half-merged target sees keys it did not put there and conflicts.
+
+Plan-vs-reality delta beyond the gate: the second-source test first asserted a conflict that did not
+happen, and the code was right. The second source had been forked *after* the interrupted merge, so
+the half-merged writes were its own base and overwriting them is an ordinary non-conflicting write.
+Moving the fork before the merge is what makes the scenario the one the test names.
+
+Verification: 1,098 lib tests green (1,095 → 1,098), clippy `--all-targets --all-features` clean,
+fmt clean.
+
+## PD3b gate record (adversarial gate 2026-08-14 — the durable intent is NOT built; reasoning below)
+
+The plan's PD3 asks for "a durable `MergeIntent` cursor so a crash resumes instead of stranding
+partial state. The intent pins the base against retention." Re-verified against the code after
+PD3a, each of the three things it is for is either already true, already free, or actively worse
+than not having it.
+
+**The pin is already held, twice over.** A merge reads the target at `base.target_at`, which is
+either the source's fork anchor or the target side of the previous merge edge. FK6 made both of
+those live retention anchors derived from the catalog, and PD3a's `record_merge_edge` holds the
+level manifest across the publish so the anchor cannot be missed by an in-flight compaction. There
+is nothing left for the intent to pin, and a second mechanism pinning the same thing is the kind of
+duplicate expression of one invariant that PD2's C5 probe already showed makes a system harder to
+reason about, not safer.
+
+**"Stranding partial state" overstates the risk.** A crashed chunked merge, re-run, classifies every
+already-applied key as **Converged** — the target holds exactly the source's value, which is the
+third row of the decision table — and applies the rest. The final state is the same one an
+uninterrupted merge would have reached. That is not a workaround; convergence is what the three-way
+comparison is *for*. It is now proven by test rather than asserted.
+
+**A cursor would make behaviour worse, not better.** Skipping keys at or below a recorded cursor
+assumes they are still as the merge left them. If the target changed one of them after the crash, a
+cursor skips it silently, where re-classification reports a conflict. The cursor trades a correct
+conflict report for speed on a path that runs once per crash. That is the wrong direction for the
+one operation in this store that can destroy another writer's data.
+
+**And it introduces a stuck state.** An intent written before the first chunk and cleared after the
+edge outlives a crash by construction. Something must then clear it, which means either automatic
+resume on open — resuming a merge the operator never asked to resume — or a manual escape, or an
+expiry. All three are new machinery guarding against a hazard that the absence of an edge already
+handles correctly.
+
+**Cost, for completeness:** a catalog format change with golden vectors regenerated, plus two extra
+catalog publishes (~4 fsyncs) on *every* merge including the small atomic ones, to buy a typed
+"merge in progress" in place of an accurate conflict.
+
+**One benefit is real and is being declined knowingly.** After a crash mid-chunked-merge, if the
+source then changes a key it had already merged, the missing edge makes the target's movement look
+like independent divergence and the re-merge reports a **false conflict**. PD2 recorded that
+degradation and accepted it ("false conflicts, never silent overwrite"); only a cursor would remove
+it, and a cursor costs the silent skip above. Refusing is the safe end of that trade.
+
+**What PD3b ships instead:** the crash matrix the exit gate actually cares about, with no new
+durable state — an interrupted chunked merge completing on a re-run, the same across a close and
+reopen, and a second source finding a half-merged target and conflicting rather than overwriting.
+The interruption is real rather than injected: a concurrent write to a key in a later chunk makes
+that chunk fail on the oracle, which is exactly the shape a crash leaves behind.
+
+## PD3a gate record (adversarial gate passed 2026-08-14, with one defect and four amendments)
+
+The retention half of PD3's gate is above (it became FK6). This is the merge half, re-verified
+against the code after FK6 landed. PD3 splits into three slices; this is the first.
+
+**F1 — the merge's oracle check does not cover the planning window. (a PD2 defect)**
+`preview_merge_into` plans against `visible_seq_num = V`; `commit_merge` then builds a transaction
+whose `start_seq_num` is `core.seq_num()` — read later, from the *same* `Arc<AtomicU64>`
+(`lsm.rs:334` and `commit.rs:271` share it). The oracle refuses a commit only when a written key's
+stamp is `> start_seq` (`commit.rs:378`), so a target write landing in `[V, start_seq]` is invisible
+to the plan AND accepted by the oracle: silently overwritten, under `Strict`, with no conflict
+reported. PD2's doc comment claims the oracle catches concurrent writers; it catches only those
+arriving after the transaction was constructed.
+→ The merge holds ONE `start_seq` — the sequence it planned at — and every chunk commits with it.
+A target write to any merged key since planning then conflicts. If the merge runs long enough for
+the oracle to GC past it, `check_owned` returns `TransactionRetry`: an honest refusal, not a missed
+conflict. The session also holds one `ActiveTxnGuard` at that sequence for its whole life, so the
+GC watermark cannot advance past it *between* chunks and manufacture that retry.
+
+**F2 — chunking cannot preserve `Strict`'s "nothing is written", so planning becomes a separate
+pass.** PD1's exit gate is that conflicts are reported before any mutation. If chunks commit as the
+plan streams, a conflict in chunk 5 arrives after chunks 1–4 are durable. So pass 1 scans and
+classifies without buffering (counts, bytes, and conflicts up to a reporting cap) and pass 2
+re-streams and commits. Both passes read ONE fixed source diff and one fixed pair of target
+snapshots, held by the session — otherwise a source write between the passes could introduce a
+conflict pass 1 never saw.
+→ Recorded contract change: **a merge that fits in one chunk is atomic; above that it is resumable,
+not atomic.** Chunking and all-or-nothing are incompatible, and the plan asked for chunking.
+
+**F3 — the size preflight is after the materialization it exists to prevent.** Today `MergeTooLarge`
+is raised after a full `Vec<(key, value)>` and a full transaction write set are built — three copies
+of the apply set in RAM before the refusal. Pass 1 measures while streaming, so the chunk-or-refuse
+decision happens before anything is materialized.
+
+**F4 — `MergeTooLarge` would become dead code, so it is re-pointed at the one thing chunking cannot
+fix.** If everything above the ceiling chunks, nothing is left to refuse. A single entry larger than
+the chunk budget is genuinely unchunkable — one key cannot be split across two batches — and that is
+now what the error means, with both numbers being the offending entry and the budget. Reachable,
+testable, and actionable ("raise `max_memtable_size`"). No new options type; `merge_into` keeps its
+signature.
+
+**F5 — FK6's carried window closes here, and it does not need the durable intent.** The hazard was a
+compaction publishing between a merge's data commit and its edge record, having sampled anchors
+without the new one. Taking the level-manifest READ lock across the edge publish blocks exactly that
+(compaction publishes under the write lock), and any compaction already in flight hits
+`appeared_since` on re-check and discards its output. Lock order stays `level_manifest ->
+branch_catalog`, matching the fork path (`lsm.rs:1882`) and the compactor's publish.
+
+**Split.** PD3a is F1–F5 with no format change. **PD3b** is the durable `MergeIntent` (a catalog
+format change, so golden vectors), automatic resume, and the refusal of a second merge into a
+half-merged target. **PD3c** is PD1's deferred scan-mode `TargetProbe` and its equivalence test.
+The plan's "durable cursor so a crash resumes instead of stranding partial state" overstates what is
+at risk: a crashed chunked merge re-run from the start classifies every already-applied key as
+**Converged** and reaches the same final state without a cursor. The intent's real jobs are to name
+the half-merged state, refuse a conflicting concurrent merge, and skip the re-scan — worth a slice,
+not worth conflating with this one.
+
+**Exit gate:** a merge larger than the chunk budget completes in chunks and is fully visible; a
+target write in the planning window produces a conflict rather than an overwrite (with the probe
+showing the overwrite when the shared `start_seq` is removed); an unchunkable single entry is
+refused with both numbers and nothing is written; a one-chunk merge stays atomic and byte-identical
+to PD2's behaviour.
+
+## PD3 gate record (adversarial gate FAILED 2026-08-14 — two confirmed defects, plan amended)
+
+PD3's gate re-verified the chunked-merge plan against the code and found that the ground it stands
+on is not sound. Two defects, both confirmed by executable probes rather than by argument, both
+rooted in the same mechanism. PD3 is postponed behind a new slice, **FK6**, which fixes the root
+cause. Chunking a merge that is already refused-or-wrong would have been building on sand.
+
+### The mechanism
+
+§3.3a of the fork design says a parent's compaction pins "the oldest Active child anchor" — one
+sequence number, `min_active_child_anchor` (`branch.rs:270`), fed to the compaction iterator as
+`history_pin_floor` (`iter.rs:767`). With versioning off (the default) that is a *point* pin: for
+each key it retains the newest version at or below the floor (`iter.rs:1178`). Separately,
+`retained_floor_advance` (`iter.rs:782`) records, for any key that lost a version, that key's
+NEWEST sequence — so `retained_floor` means "a view capped below this is incomplete", and it is
+pin-blind: it rises even when the dropped version was irrelevant to every pin.
+
+**One point pin cannot serve two distinct read anchors on one owner.** That is the root cause of
+both defects below, and neither `min` nor `max` fixes it: `min` breaks the deeper child, `max`
+breaks the shallower one, and range-pinning at `max` retains the parent's entire history for as
+long as any child forked at head is alive, which is unacceptable for a store whose premise is many
+cheap branches.
+
+### Defect 1 — a second child at a different anchor reads a stale inherited value
+
+Probe (temporary, run against the tree at this commit): parent writes `k=v1`, flush, fork
+`shallow`; writes `k=v2`, flush, fork `deep`; writes `k=v3`, flush; four filler flushes; compact.
+
+```
+PROBE retained_floor after compaction = 3
+PROBE shallow=Some("v1") deep=Some("v1")
+assertion failed: deep child's inherited view
+  left: Some("v1")   right: Some("v2")
+```
+
+The pin floor is `min` = `shallow`'s anchor, so the newest version at or below it (`v1`) is
+retained and `v2` is dropped as superseded by `v3`. `deep`, capped at `v2`'s sequence, finds `v1`
+and answers with it. No error, no diagnostic: **a fork child silently reads a value that was never
+current at its anchor.** This is invariant 5 of the FK design failing, and it predates PC/PD1/PD2 —
+it has been reachable since FK3. Under versioning the same hole exists in its wall-clock flavour:
+the clamped retention floor is clamped to the *oldest* anchor, so versions between the anchors age
+out while a deeper child still needs them.
+
+### Defect 2 — the first parent compaction permanently disables merge
+
+Probe: fork `work`, write, merge into `main` (clean, edge recorded), `main` reverts the key, five
+filler flushes, compact, `work` writes again, re-merge.
+
+```
+PROBE merge 1 = MergeOutcome { applied: 1, ..., source_through_seq: 2, target_through_seq: 3 }
+PROBE retained_floor = 4
+PROBE merge 2 refused: Fork point 1 is below the retention floor 4; that history has been collapsed
+```
+
+`validate_lineage` (`merge.rs:294`) gates on `retained_floor > fork_seq`. Because the floor is
+pin-blind, ANY key losing ANY version raises it above every child's anchor — which is what ordinary
+compaction of an updated key does. So a merge works exactly until the parent first compacts, and is
+refused for ever after. The refusal is *false*: `work`'s inherited view is intact, pinned at its
+anchor. Merge is, as shipped in PD2, a one-shot feature that dies at the first compaction.
+
+Worse, the refusal is also load-bearing in a way I did not design: relaxing it naively would expose
+a silent overwrite. After the first merge, `effective_base.target_at` is the edge's
+`target_through_seq` — a cap ABOVE the fork anchor, pinned by nothing. Compaction may drop the
+version the merge left behind, so the base reads as the pre-merge value; if the target has since
+reverted to that value, `base_value == target_value` classifies the key as **Apply** and the second
+merge overwrites the target's deliberate revert with no conflict. The over-broad floor check is
+currently the only thing standing between PD2 and that overwrite.
+
+### FK6 — the fix (this slice)
+
+Retention pins become a **set of anchors per owner**, derived from the catalog as today:
+
+- every live child's `fork_seq` (defect 1), and
+- every live merge edge's `target_through_seq` (defect 2) — the base a future merge from that
+  source reads at, which is exactly the same kind of promise a fork anchor makes and was simply
+  never expressed as one.
+
+Compaction retains, per key, the newest version at or below *each* anchor (the range form under
+versioning). Completeness becomes one predicate — a view capped at `C` is exact iff
+`C >= retained_floor || C` is a live anchor — used by both the fork check (`lsm.rs:1884`) and the
+merge check, replacing the pin-blind comparison in each. `CompactionPinRaced` generalises from
+"the floor regressed" to "the current anchor set contains an anchor the job did not sample"; an
+anchor that disappeared is harmless, because the job retained more than was needed.
+
+No format change: anchors derive from the catalog, which is already durable, so `retained_floor_seq`
+keeps its meaning and the golden vectors stand.
+
+**Exit gate:** the two probes above become permanent tests and pass; a merge still succeeds after
+the parent has compacted (defect 2's false refusal is gone); the silent-overwrite scenario behind
+it produces a **conflict**; the anchor set is capped and a 1000-branch parent still compacts; each
+arm ships its sabotage twin (collapse the anchor set back to `min` and the deep-child test reddens;
+drop the merge-edge anchor and the overwrite test reddens).
+
+### PD2 — The merge commit and promotion edges: complete (2026-08-14)
+
+As built:
+
+- **`BranchHandle::merge_into(target, strategy)`** — plans, then writes the applies as ONE ordinary
+  transaction on the target (the gate's reversal: no SST ingest). It therefore inherits sequence
+  allocation, WAL durability, fresh commit timestamps, oracle conflict detection and `visible_seq`
+  publication from the existing write path rather than re-implementing them beside it.
+- **`MergeStrategy::{Strict, SourceWins}`** — `Strict` is the default and refuses the entire merge
+  on any conflict, writing nothing; `SourceWins` applies the source's value to conflicting keys and
+  reports how many it overrode in `MergeOutcome::resolved`.
+- **Promotion edges** — `MergeEdge { source, source_generation, source_through_seq,
+  target_through_seq }` on the target's catalog entry, sorted by source id, capped, and validated
+  (strictly ascending, no self-merge). Format change: the catalog golden vector was regenerated
+  deliberately and its comment updated to describe the new field.
+- **`effective_base`** — a later merge diffs the source from `source_through_seq` and reads the
+  target's base side at `target_through_seq`. Both are needed; the first design carried only the
+  source side and would have reported a clean re-merge as a conflict against the target's own copy
+  of the source's change (gate amendment 1).
+- **Refusals**: `MergeConflicts` under `Strict`, `MergeTooLarge` when the write set exceeds the
+  target's memtable budget (checked *before* committing), `BranchesUnrelated`,
+  `BelowRetentionFloor`, and `TransactionWriteConflict` when a concurrent writer touched the same
+  keys.
+
+**A probe that refused to redden, and what it taught.** The C5 test — one source's merge must not
+shift another's base — passed with the per-source edge lookup replaced by "any edge on the target".
+The reason is that the generation guard is a second expression of the same invariant: FK1 makes
+generations globally unique, so "an edge whose `source_generation` matches this source" is already
+"an edge from this exact source incarnation". The two checks are redundant by construction, and
+either alone blocks the hazard. Removing **both** does redden the test, and the failure is
+instructive: the second source's merge returns `applied: 0` — silently dropping its change in the
+belief it was already merged. Recorded rather than left as a mysteriously-green probe.
+
+Other probes, each reddening on its intended assertion: ignoring the recorded edge makes a repeat
+merge re-offer an already-merged key (`left: 1, right: 0`).
+
+Verification: **1,070 → 1,078 lib tests** green, clippy `--all-targets --all-features` at zero
+warnings, fmt clean. Eight new merge tests covering the clean path, `Strict`'s all-or-nothing
+refusal, `SourceWins`, iterative re-merge (including a target edit after a merge not resurrecting a
+conflict), per-source edge scoping, the lost-edge crash window degrading to convergence, durability
+across a reopen, and the oversized-merge refusal.
+
+## PD2 gate record (adversarial gate passed 2026-08-14, with one reversal and four amendments)
+
+Verified against the tree before implementing the merge commit — the first slice in this phase
+that writes to a branch it does not own.
+
+**REVERSAL: merge-as-SST-ingest is not built. The merge commits as an ordinary transaction.**
+Plan amendment A2 mandated building the merged rows into an SST with `TableWriter` and adding it
+to the target's L0 through a manifest changeset, bypassing the write path. Its stated
+justification — that `MemTable::add` reserves the whole batch in a fixed arena, so a large merge
+could never be applied — expired when the FK-era fix made `apply` rotate to a right-sized arena
+(recorded as PD1 gate finding F6). What remained was "a multi-hundred-megabyte memtable is absurd
+and a giant oracle publish freezes writers", and that argues for **bounding the batch**, not for
+bypassing the write path. Bounding is what PD3's chunking does, and it is required anyway.
+
+Weighed against each other, ingest loses on every correctness axis. Committing as a transaction
+gets sequence allocation, WAL durability, fresh commit timestamps from the FK2 timeline, oracle
+conflict detection against concurrent target writers, and `visible_seq` publication — all from a
+path with a thousand tests behind it. Ingest would need each of those re-implemented beside the
+pipeline, in the one operation where a mistake means silently overwriting someone's data. So:
+merge is a transaction on the target, with a size preflight that refuses `MergeTooLarge` above the
+target's memtable bound, and PD3 removes the bound by chunking rather than by bypassing.
+
+**Amendment 1: a promotion edge needs BOTH sides' sequences, not just the source's.** The
+first design recorded here carried only `source_through_seq` (diff from the last merge instead of
+the fork). Working an example shows that is not enough: after S's `K=1` is merged, the three-way
+base for a later merge must be evaluated at the target as it stood *after* that merge, not at the
+fork. Read at the fork, `K`'s base is the pre-merge value while the target holds the merged one, so
+a clean re-merge reports a conflict against the target's own copy of the source's change. The edge
+is `{source, source_generation, source_through_seq, target_through_seq}` and the effective base is
+`(diff from source_through, compare against the target at target_through)`. The plan's original
+shape was right and the simplification was wrong.
+
+**Amendment 2: edges are a usability requirement, not a correctness one — which is why they ship
+now.** Without any edge the merge is still sound: an already-merged key has `source_value ==
+target_value`, so PD1's converged rule makes it a no-op, and a key the target has since changed
+becomes a false conflict rather than an overwrite. But that makes merge effectively single-use per
+branch — the second merge conflicts on everything the first one applied and the target later
+touched. For a workload built around agents iterating on a branch and merging repeatedly, that is
+not a rough edge, it is the feature not working.
+
+**Amendment 3: data before edge, verified rather than asserted.** The merge commits its rows
+first and publishes the edge second. A crash in between leaves the edge at its previous value, so
+the next merge re-diffs from the older base: already-merged keys reappear, converge if the target
+still holds them, and conflict if the target has moved on. False conflicts, never silent
+overwrite. The opposite order would advance the base past changes that were never applied — which
+loses them permanently and silently.
+
+**Amendment 4: concurrent target writes are the oracle's job, and the answer is a typed retry.**
+The merge transaction's write set goes through `check_owned` like any other, so a target write that
+lands between planning and commit produces `TransactionWriteConflict`. PD2 surfaces that rather
+than looping: an automatic re-plan is a policy decision, and a caller that just had its merge
+invalidated by a concurrent writer usually wants to know.
+
+### PD1 — Merge planning and conflict detection: complete (2026-08-14)
+
+Planning is a pure read that produces the complete verdict before anything is written, so a merge
+that would conflict is refusable without having already applied half of itself.
+
+As built (`src/merge.rs`):
+
+- **The decision table**, in rule order: `base_seq == target_seq` → apply (metadata only, no value
+  read); `base_value == target_value` → apply (the target moved and came back);
+  `source_value == target_value` → converged, a no-op; otherwise conflict. Absence is a value
+  throughout, which is what makes delete-vs-delete converge and delete-vs-modify conflict.
+- **`MergeReport { applies, conflicts, converged }`** and
+  **`Conflict { key, kind, base, source, target }`** carrying all three sides, so a caller decides
+  without re-reading. `ConflictKind` distinguishes both-modified from either delete direction.
+- **`Snapshot::get_latest_meta`** — metadata for the newest visible version, tombstones reported
+  rather than hidden. Built by extending `LayerHit::Tombstone` to carry `(seq, kind)` so it uses
+  the *same* layer walk as `get`, rather than a parallel one that could disagree about visibility.
+- **`TargetProbe`** seam with the point-lookup implementation. The scan implementation and its
+  equivalence test are deferred to PD3 (gate amendment 4), recorded rather than dropped.
+- **`validate_lineage`** — merges are accepted only into the source's recorded parent
+  (`BranchesUnrelated` otherwise), and only while the target's history at the anchor survives
+  (`BelowRetentionFloor`).
+- **`BranchHandle::preview_merge_into`** is the public entry point.
+
+**A wrong justification of mine, corrected while writing the tests.** Gate amendment 1 originally
+claimed the writes-only comparison is *unsound* because a target that is itself a fork child can
+have keys change under it. That is false — inheritance is frozen at the anchor, so an ancestor's
+later writes are permanently invisible. The comparison shipped is unchanged and still correct, but
+the reason is now the honest one, and
+`an_inherited_view_is_frozen_so_only_the_target_s_own_writes_move_it` pins the property the
+argument rests on instead of leaving it assumed. The full correction is in the gate record below.
+
+Sensitivity probes, all reddening on their intended assertion:
+
+- removing the revert-to-base rule turns a content-unchanged target into a false conflict;
+- removing the converged rule turns agreement between the two sides into a conflict;
+- removing the lineage check lets a **sibling merge return an empty clean report** — a silent wrong
+  answer rather than an error, which is precisely the failure class merge must not have.
+
+Also removed: a speculative `VersionMeta::is_delete` with no caller.
+
+Verification: **1,055 → 1,070 lib tests** green (7 decision-table unit tests against a fake probe,
+8 integration tests against the real read stack), clippy `--all-targets --all-features` at zero
+warnings, fmt clean.
+
+## PD1 gate record (adversarial gate passed 2026-08-14, with five amendments)
+
+Verified against the tree before implementing merge planning. Merge is where silent overwrite
+lives, so these are stated as rules rather than notes.
+
+**Amendment 1: "changed since the base" is a question about the target's VIEW, not its writes.**
+The sound test is the newest version visible at cap `F` versus the newest version visible now, both
+resolved through the target's full read stack — same machinery as an ordinary read, different cap.
+
+> **Correction, made while writing the tests.** The justification first recorded here was wrong.
+> It claimed the writes-only comparison is *unsound* because a target that is itself a fork child
+> can have a key change under it when its own parent writes. That cannot happen: a fork child's
+> inherited view is frozen at its anchor, so an ancestor's later writes are permanently invisible
+> to it. Under the shipped model the two comparisons therefore agree, and the writes-only one is
+> not wrong today. The view comparison is kept anyway, for a weaker but honest reason: it is
+> correct *without* depending on inheritance staying frozen, so a future feature that let a branch
+> re-anchor would not silently turn merge into an overwrite. `an_inherited_view_is_frozen_so_only_
+> the_target_s_own_writes_move_it` pins the property the argument now rests on, rather than
+> leaving it assumed.
+
+**Amendment 2: the comparison is three-way by value, with a sequence fast path.** Comparing
+sequences alone makes a target that changed a key and then changed it back look modified, which
+produces a false conflict on a target that is, in content, untouched. The shipped rule is:
+
+1. `base_seq == target_seq` → target never moved → **apply** (no value read at all — the common
+   case stays metadata-only);
+2. else `base_value == target_value` → target moved and came back → **apply**;
+3. else `source_value == target_value` → both sides converged → **no-op**;
+4. else → **conflict**.
+
+Absence is a value here: a delete on either side compares equal to a delete on the other, which is
+what makes delete-vs-delete resolve rather than conflict. Delete-vs-modify falls through to (4) and
+always conflicts.
+
+**Amendment 3: `LayerHit::Tombstone` discards the sequence, so it has to carry it.** The variant
+currently collapses to `None` in `get`, losing the one fact `get_latest_meta` needs — a delete IS a
+version, and its sequence is what decides whether the target moved. Extended to carry `(seq, kind)`.
+This is deliberately done by extending the existing layer walk rather than writing a parallel one:
+metadata and values must never disagree about what is visible, and one code path is how that is
+guaranteed rather than tested.
+
+**Amendment 4: scan-mode conflict detection is deferred to PD3, and the exit criterion goes with
+it.** Plan A7 pairs per-key point lookups with a seq-filtered scan of the target, chosen by a size
+crossover, and PD1's exit gate asks that both modes agree. Building the second mode now would add a
+second implementation of the most dangerous logic in the system, for a performance crossover
+nothing can measure yet — and the "both agree" test would be asserting an equivalence between two
+things written on the same afternoon by the same author, which is worth very little. Point mode
+ships here behind a `TargetProbe` seam so the scan implementation drops in without touching the
+conflict rules, and the equivalence test lands in PD3 where it compares against code that has
+soaked. Recorded rather than silently dropped.
+
+**Amendment 5: merging needs the base to still exist.** Reading the target at cap `F` is only
+sound if the target's history at `F` is intact. `retained_floor(target) > F` means the versions the
+comparison depends on have been collapsed, so the merge is refused with `BelowRetentionFloor`
+rather than planned against a base that is partly guesswork. Direction is also checked: a merge is
+only accepted into the source's recorded parent, with `BranchesUnrelated` otherwise — no
+sibling-to-sibling, no re-anchoring.
+
+### PC — Branch diff: complete (2026-08-14)
+
+A read-only, streaming view of what a branch changed since it was forked. Ships alone so it can
+soak as an inspection tool before merge depends on it.
+
+As built (`src/diff.rs`):
+
+- **`Snapshot::own_only`** — the branch's own memtables and level set, no ancestors. The mirror of
+  PB2's `inherited_only`.
+- **`BranchDiff`** owns that snapshot, so the view is fixed for as long as it lives: iterate it
+  twice and get the same answer, and writes landing afterwards do not appear. `iter()` yields a
+  cursor, `collect()` materializes, `base_seq()` reports the anchor.
+- **`DiffIter`** is a real `Iterator<Item = Result<DiffEntry>>` with an inherent `seek(key)` for
+  resumption. One entry per key (the branch's newest write), tombstone-inclusive.
+- **`DiffOp { Set | Delete | SoftDelete }`** rather than leaking `InternalKeyKind`, which carries
+  encoding-only variants that are not part of any contract (gate amendment 5).
+- **`BranchHandle::diff()`** refuses a branch with no lineage — `main`, a plain branch, or a
+  detached one.
+
+**The sequence filter is the whole slice.** Gate amendment 1 found that "everything in a branch's
+own components was written by that branch" stopped being true when PB2 landed: detach materializes
+inherited rows into the branch's own tables. So entries are filtered `seq > base` explicitly.
+The probe is unambiguous — removing the filter makes a materialized branch report its entire
+inheritance as changes (3 entries instead of 1).
+
+**A real API bug the tests caught.** `collect` took the current entry, and `next` inferred
+"exhausted" from `current.is_none()` — so every diff returned exactly one entry and stopped. Four
+tests failed at once. Fixed by tracking exhaustion explicitly rather than inferring it from a field
+a consumer can drain. Clippy then flagged the deeper problem: a cursor exposing `next()` without
+implementing `Iterator` is a trap for exactly this kind of confusion. Reworked into a genuine
+`Iterator`, which removed `collect`'s hand-rolled loop entirely and made the tests idiomatic.
+
+Verification: **1,047 → 1,055 lib tests** green, clippy `--all-targets --all-features` at zero
+warnings, fmt clean.
+
+## PC gate record (adversarial gate passed 2026-08-14, with five amendments)
+
+Verified against the tree before implementing diff.
+
+**Amendment 1 (the important one): "everything a branch owns is above its fork anchor" is NOT an
+invariant, and PB2 is what broke it.** The obvious implementation of diff — "iterate the branch's
+own components, everything there is a change" — was true when the plan was written: a fork child's
+writes all draw sequences above `fork_seq`. Detach violates it deliberately, by copying inherited
+rows (all at or below the anchor) into tables the branch owns. So diff filters `seq > base`
+EXPLICITLY rather than leaning on the invariant. Two consequences follow: a detached branch has no
+parent and therefore no base, so `diff` refuses it rather than reporting its entire materialized
+inheritance as "changes"; and the filter is written as a filter, not as an assumption with a
+comment, because the next feature that puts a low-sequence row in a branch's own set would
+otherwise silently corrupt every merge built on top.
+
+**Amendment 2: diff reads the branch's OWN layer only** — the mirror of PB2's
+`Snapshot::inherited_only`. A `Snapshot::own_only` gives exactly the rows the branch is
+responsible for, with none of its ancestors'.
+
+**Amendment 3: `SnapshotIterator` cannot be reused.** It is newest-version-per-key, which diff
+wants, but it drops tombstones unconditionally (`src/snapshot.rs:1167`) — and a delete is the most
+important thing a diff can report, since it is what tells a merge to remove a key. Adding an
+`include_tombstones` flag would put a branch in the hot read path for a feature that path never
+uses. Diff gets its own small iterator over `KMergeIterator` instead.
+
+**Amendment 4: `get_latest_meta` moves to PD1.** The plan lists it here, but nothing in diff calls
+it — it exists for merge's target-side "has this key changed since the base" check. Building it
+now would add an API with no consumer and a shape guessed rather than driven by its caller, which
+the project's own rules forbid. It lands in PD1 with its first real use.
+
+**Amendment 5: diff needs its own public op type.** `InternalKeyKind` is `pub` but deliberately
+never re-exported from `lib.rs` — it is an internal encoding detail (it carries `Separator`,
+`LogData`, `Max`, `Invalid`). Leaking it through `DiffEntry` would make an internal enum part of
+the public contract. Diff exposes `DiffOp { Set(value) | Delete | SoftDelete }` instead, which is
+the complete set of things a branch can express about a key.
+
 ### PB2 — Detach (materialize): complete (2026-08-14)
 
 The relief valve for the two costs a long-lived fork imposes: the ancestor chain every read walks,

@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
+use crate::branch::RetentionAnchors;
 use crate::clock::LogicalClock;
 use crate::error::{Error, Result};
 use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator, Value};
@@ -754,19 +755,16 @@ pub(crate) struct CompactionIterator<'a> {
 	/// order for efficient binary search.
 	snapshots: Vec<u64>,
 
-	// ========== Inherited-View Pin (FK3) ==========
-	/// Minimum fork anchor across this owner's Active children in the branch
-	/// catalog, or [`NO_HISTORY_PIN`] when the owner has no children.
-	///
-	/// Every version at or below this sequence is readable by at least one
-	/// child branch through its inherited view (`§3.3a` of the fork design), so
-	/// it survives supersession, wall-clock expiry, and REPLACE/DELETE
-	/// collapse. Unlike `snapshots`, this pin is derived from durable catalog
-	/// anchors, so what a child inherits never depends on which readers
-	/// happened to be live when compaction ran.
-	history_pin_floor: u64,
+	// ========== Inherited-View Pin (FK3, FK6) ==========
+	/// The caps some durable reader still resolves this owner at (`§3.3a` of the
+	/// fork design): a child's inherited view, or a merge's base. The newest
+	/// version at or below each survives supersession, wall-clock expiry, and
+	/// REPLACE/DELETE collapse. Unlike `snapshots`, these are derived from
+	/// durable catalog anchors, so what a child inherits never depends on which
+	/// readers happened to be live when compaction ran.
+	pin_anchors: RetentionAnchors,
 
-	/// Count of versions retained solely because of `history_pin_floor`.
+	/// Count of versions retained solely because of `pin_anchors`.
 	/// Logged by the compactor and asserted by the retention tests, which
 	/// otherwise could not distinguish "the pin worked" from "nothing was
 	/// droppable anyway".
@@ -782,11 +780,6 @@ pub(crate) struct CompactionIterator<'a> {
 	retained_floor_advance: u64,
 }
 
-/// `history_pin_floor` value meaning "this owner has no Active children, so no
-/// version is pinned by an inherited view". Sequence numbers start at 1, so
-/// zero can never pin a real version.
-pub(crate) const NO_HISTORY_PIN: u64 = 0;
-
 impl<'a> CompactionIterator<'a> {
 	/// Create a new compaction iterator.
 	///
@@ -798,7 +791,8 @@ impl<'a> CompactionIterator<'a> {
 	/// * `retention_period_ns` - How long to keep old versions
 	/// * `clock` - Time source for retention calculations
 	/// * `snapshots` - Sorted list of active snapshot sequence numbers
-	/// * `history_pin_floor` - Inherited-view retention floor, or [`NO_HISTORY_PIN`]
+	/// * `pin_anchors` - Catalog-derived retention anchors; empty when nothing forks off or merges
+	///   into this owner
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		iterators: Vec<BoxedLSMIterator<'a>>,
@@ -808,7 +802,7 @@ impl<'a> CompactionIterator<'a> {
 		retention_period_ns: u64,
 		clock: Arc<dyn LogicalClock>,
 		snapshots: Vec<u64>,
-		history_pin_floor: u64,
+		pin_anchors: RetentionAnchors,
 	) -> Self {
 		let merge_iter = MergingIterator::new(iterators, cmp);
 
@@ -823,7 +817,7 @@ impl<'a> CompactionIterator<'a> {
 			clock,
 			initialized: false,
 			snapshots,
-			history_pin_floor,
+			pin_anchors,
 			pin_retained_versions: 0,
 			retained_floor_advance: 0,
 		}
@@ -998,7 +992,7 @@ impl<'a> CompactionIterator<'a> {
 			return true;
 		}
 		let uncovered = |boundary: u64| boundary >= oldest_seq && boundary < delete_seq;
-		if self.history_pin_floor != NO_HISTORY_PIN && uncovered(self.history_pin_floor) {
+		if self.pin_anchors.any_in(oldest_seq, delete_seq) {
 			return false;
 		}
 		!self.snapshots.iter().copied().any(uncovered)
@@ -1129,10 +1123,9 @@ impl<'a> CompactionIterator<'a> {
 		// REPLACE semantics: delete all older versions regardless of retention
 		let has_set_with_delete = self.accumulated_versions.iter().any(|(key, _)| key.is_replace());
 
-		// Tracks whether a version at or below `history_pin_floor` was already
-		// pinned for this key. Versions arrive newest-first, so the first one is
-		// the newest at or below the floor — all a point-in-time child can read.
-		let mut pinned_below_floor = false;
+		// Serves this key's versions to the retention anchors. Versions arrive
+		// newest-first, which is the order the walker requires.
+		let mut pins = self.pin_anchors.walker();
 
 		// Track the visibility of the previous (newer) version we processed.
 		// Used to detect when a newer version supersedes an older one.
@@ -1167,20 +1160,24 @@ impl<'a> CompactionIterator<'a> {
 
 			let current_visibility = self.find_earliest_visible_snapshot(seq_num)?;
 
-			// ===== INHERITED-VIEW PIN (FK3, design §3.3a) =====
+			// ===== INHERITED-VIEW PIN (FK3, design §3.3a; FK6) =====
 			//
-			// A version at or below the pin floor is inside some Active child's
-			// inherited view. A versioned parent pins the whole range (children
-			// inherit full history); a non-versioned parent pins only the newest
-			// version at or below the anchor, which is all a point-in-time child
-			// can read. Both forms are deterministic: they depend on durable
-			// catalog anchors, never on which snapshots are live.
-			let pinned_by_child_view = self.history_pin_floor != NO_HISTORY_PIN
-				&& seq_num <= self.history_pin_floor
-				&& (self.enable_versioning || !pinned_below_floor);
-			if pinned_by_child_view {
-				pinned_below_floor = true;
-			}
+			// A versioned parent pins the whole range below its highest anchor,
+			// because forks inherit full history and a view capped anywhere in
+			// that range may want any version under it. A non-versioned parent
+			// pins the newest version at or below each anchor separately, which
+			// is all a point-in-time reader can see — one version per anchor,
+			// not the range, which is what makes many branches affordable.
+			//
+			// Both forms are deterministic: they depend on durable catalog
+			// anchors, never on which snapshots are live.
+			let pinned_by_child_view = if self.pin_anchors.is_empty() {
+				false
+			} else if self.enable_versioning {
+				seq_num <= self.pin_anchors.highest()
+			} else {
+				pins.serves(seq_num)
+			};
 
 			// Check if this version is superseded by a newer version
 			let superseded = if let Some(newer_vis) = newer_version_visibility {

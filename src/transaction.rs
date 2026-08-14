@@ -268,6 +268,31 @@ impl Transaction {
 		opts: TransactionOptions,
 		owner: BatchOwner,
 	) -> Result<Self> {
+		// Get the current visible sequence number as our start point.
+		let start_seq_num = core.seq_num();
+		Self::new_owned_at(core, opts, owner, start_seq_num)
+	}
+
+	/// A transaction whose conflict window opens at an explicitly given sequence
+	/// rather than at "now".
+	///
+	/// For work that decided what to write at one moment and commits it at a
+	/// later one: passing the earlier sequence makes the oracle judge the write
+	/// set against everything that happened since the decision, not since the
+	/// transaction object was built. A merge is the case that needs it — it
+	/// plans against a snapshot and then commits, possibly in several chunks —
+	/// and without it a write landing in that gap is neither seen by the plan nor
+	/// caught by the oracle.
+	///
+	/// A sequence old enough to have left the oracle's GC window is refused at
+	/// commit with [`Error::TransactionRetry`], which is the honest answer: the
+	/// oracle can no longer prove the absence of a conflict.
+	pub(crate) fn new_owned_at(
+		core: Arc<Core>,
+		opts: TransactionOptions,
+		owner: BatchOwner,
+		start_seq_num: u64,
+	) -> Result<Self> {
 		core.branch_catalog
 			.read()?
 			.validate_owner(owner.branch, owner.generation)
@@ -276,9 +301,6 @@ impl Transaction {
 			mode,
 			durability,
 		} = opts;
-
-		// Get the current visible sequence number as our start point.
-		let start_seq_num = core.seq_num();
 
 		// Register this txn's start_seq with the GC watermark tracker.
 		// Both read-write and write-only txns register here (write-only txns

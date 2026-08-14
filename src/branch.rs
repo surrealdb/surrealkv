@@ -41,6 +41,119 @@ pub(crate) struct ForkReceipt {
 /// this demands materialization rather than degrading.
 pub(crate) const MAX_VIEW_DEPTH: usize = 64;
 
+/// Every sequence cap at which some durable reader still reads one owner
+/// exactly — what its compaction must preserve (design §3.3a).
+///
+/// Two kinds, making the same promise. A live child's fork anchor: its
+/// inherited view is re-resolved at that cap on every read. And a live merge
+/// edge's target-side base: the next merge from that source compares the target
+/// against how it stood there. The second kind was missing until FK6, which is
+/// why a parent compaction could silently move a merge's base.
+///
+/// A single anchor cannot stand in for several. Pinning only the lowest leaves
+/// a child forked higher up reading a version that was never current at its
+/// anchor; pinning only the highest drops what the lowest needs; range-pinning
+/// to the highest retains the parent's whole history for as long as anything is
+/// forked at head. So the set is kept as a set, and compaction preserves the
+/// newest version at or below *each* of them.
+///
+/// Sorted descending and deduplicated, which is what lets [`AnchorWalker`]
+/// serve every anchor in one pass over a key's versions.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RetentionAnchors {
+	anchors: Vec<u64>,
+}
+
+impl RetentionAnchors {
+	/// Sorts and deduplicates. Nothing is ever dropped for size: an anchor is a
+	/// promise, and the count is already bounded by the catalog's own entry cap.
+	fn from_unsorted(mut anchors: Vec<u64>) -> Self {
+		anchors.sort_unstable_by(|a, b| b.cmp(a));
+		anchors.dedup();
+		Self {
+			anchors,
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn from_iter_for_test(anchors: impl IntoIterator<Item = u64>) -> Self {
+		Self::from_unsorted(anchors.into_iter().collect())
+	}
+
+	/// No child, no merge edge: compaction behaves exactly as it would in a
+	/// store that never forked.
+	pub(crate) fn is_empty(&self) -> bool {
+		self.anchors.is_empty()
+	}
+
+	/// The highest anchor, or zero when there is none. Sequences start at 1, so
+	/// zero pins nothing.
+	pub(crate) fn highest(&self) -> u64 {
+		self.anchors.first().copied().unwrap_or(0)
+	}
+
+	/// Whether any anchor lies in `[low, high)`.
+	///
+	/// The bottom-level hard-delete shortcut asks this: an anchor inside the
+	/// span between a key's oldest version and the tombstone above it is a
+	/// reader that would see the data without seeing the delete.
+	pub(crate) fn any_in(&self, low: u64, high: u64) -> bool {
+		self.anchors.iter().any(|&anchor| anchor >= low && anchor < high)
+	}
+
+	/// Whether a view of this owner capped at `cap` still reads exactly.
+	///
+	/// Either the cap is at or above the retention floor — no key has lost a
+	/// version that a view up there would need — or the cap is one of the pinned
+	/// anchors, where compaction preserved the answer on purpose. Any other cap
+	/// below the floor reads whatever happened to survive, which is a guess.
+	pub(crate) fn view_is_complete_at(&self, cap: u64, retained_floor: u64) -> bool {
+		cap >= retained_floor || self.anchors.contains(&cap)
+	}
+
+	/// An anchor the catalog holds now that `sampled` did not.
+	///
+	/// A compaction job samples the anchor set before it merges and re-checks it
+	/// under the publication lock. An anchor that appeared in between may need a
+	/// version the job already discarded, so the output is refused. An anchor
+	/// that *vanished* is harmless: the job merely over-retained.
+	pub(crate) fn appeared_since(&self, sampled: &Self) -> Option<u64> {
+		self.anchors.iter().copied().find(|anchor| !sampled.anchors.contains(anchor))
+	}
+
+	/// A cursor for one key's versions, which must be offered newest-first.
+	pub(crate) fn walker(&self) -> AnchorWalker<'_> {
+		AnchorWalker {
+			anchors: &self.anchors,
+			next: 0,
+		}
+	}
+}
+
+/// Decides, for one key, which of its versions the anchors pin.
+///
+/// Anchors descend and versions arrive newest-first, so one shared index is
+/// enough: when a version's sequence drops at or below the highest anchor that
+/// nothing has served yet, that version is the newest at or below it — every
+/// version seen so far was higher — and it serves that anchor and any others it
+/// has just passed.
+pub(crate) struct AnchorWalker<'a> {
+	anchors: &'a [u64],
+	next: usize,
+}
+
+impl AnchorWalker<'_> {
+	/// Whether this version is the newest at or below an anchor no newer
+	/// version already answered for.
+	pub(crate) fn serves(&mut self, seq: u64) -> bool {
+		let before = self.next;
+		while self.next < self.anchors.len() && self.anchors[self.next] >= seq {
+			self.next += 1;
+		}
+		self.next > before
+	}
+}
+
 /// Where a branch came from: the parent it was forked off and the anchor its
 /// view of that parent is capped at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,6 +205,9 @@ pub(crate) struct BranchRecord {
 	/// COW lineage: the parent this branch was forked from, with the fork
 	/// anchor `fork_seq` (the child reads the parent capped at this seq).
 	pub(crate) parent: Option<crate::authority::format::ParentLink>,
+	/// Merges already applied INTO this branch, one per source. Sorted by
+	/// source id, which the format also requires.
+	pub(crate) merges: Vec<crate::authority::format::MergeEdge>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +234,7 @@ impl BranchCatalog {
 			deleted_at_seq: None,
 			expires_at: None,
 			parent: None,
+			merges: Vec::new(),
 		};
 		Self {
 			default_branch,
@@ -159,6 +276,7 @@ impl BranchCatalog {
 			deleted_at_seq: None,
 			expires_at: None,
 			parent: None,
+			merges: Vec::new(),
 		};
 		self.records.insert(id, record.clone());
 		self.live_names.insert(name.to_owned(), id);
@@ -195,6 +313,50 @@ impl BranchCatalog {
 		})
 	}
 
+	/// Records that `source` has been merged into `branch` up to the given
+	/// sequences, replacing any previous edge from the same source.
+	///
+	/// Per source, never global: a merge from one child must not shift the base
+	/// another child's merge is compared against, or the second merge would
+	/// silently overwrite the first one's keys (plan C5).
+	pub(crate) fn record_merge(
+		&mut self,
+		branch: BranchId,
+		generation: BranchGeneration,
+		edge: crate::authority::format::MergeEdge,
+	) -> KernelResult<()> {
+		if edge.source == branch {
+			return Err(KernelError::new(
+				ErrorCode::InvalidArgument,
+				"a branch cannot record a merge from itself",
+			));
+		}
+		let record = self
+			.records
+			.get_mut(&branch)
+			.filter(|record| !record.deleted && record.generation == generation)
+			.ok_or_else(|| KernelError::new(ErrorCode::NotFound, "branch not found"))?;
+		match record.merges.binary_search_by(|existing| existing.source.0.cmp(&edge.source.0)) {
+			Ok(index) => record.merges[index] = edge,
+			Err(index) => record.merges.insert(index, edge),
+		}
+		Ok(())
+	}
+
+	/// The merge edge recorded on `branch` for `source`, if any.
+	pub(crate) fn merge_edge(
+		&self,
+		branch: BranchId,
+		source: BranchId,
+	) -> Option<crate::authority::format::MergeEdge> {
+		let record = self.records.get(&branch)?;
+		record
+			.merges
+			.binary_search_by(|existing| existing.source.0.cmp(&source.0))
+			.ok()
+			.map(|index| record.merges[index])
+	}
+
 	/// Clears a branch's parent link after its inherited view has been copied
 	/// into its own tables.
 	///
@@ -215,9 +377,51 @@ impl BranchCatalog {
 		Ok(())
 	}
 
-	/// Minimum fork anchor across Active children of `(parent, generation)` —
-	/// the retention-promise pin floor: the parent's compaction must preserve
-	/// every version at or below this sequence (§3.3a of the FK design).
+	/// Every cap `(owner, generation)`'s compaction must keep readable: the fork
+	/// anchor of each Active child, and the target-side base of each merge edge
+	/// whose source is still live (§3.3a of the FK design, as corrected by FK6).
+	///
+	/// A stale edge pins nothing. Its source is gone, so no future merge can
+	/// compare against that base — and holding history for a branch that no
+	/// longer exists is how a store that churns sandbox branches never reclaims
+	/// anything.
+	pub(crate) fn retention_anchors(
+		&self,
+		owner: BranchId,
+		generation: BranchGeneration,
+	) -> RetentionAnchors {
+		let mut anchors: Vec<u64> = self
+			.records
+			.values()
+			.filter(|record| !record.deleted)
+			.filter_map(|record| record.parent.as_ref())
+			.filter(|link| link.parent == owner && link.parent_generation == generation)
+			.map(|link| link.fork_seq)
+			.collect();
+		if let Some(record) = self.live_record(owner, generation) {
+			anchors.extend(
+				record
+					.merges
+					.iter()
+					.filter(|edge| self.live_record(edge.source, edge.source_generation).is_some())
+					.map(|edge| edge.target_through_seq),
+			);
+		}
+		RetentionAnchors::from_unsorted(anchors)
+	}
+
+	/// The record for a branch that exists at exactly this generation.
+	fn live_record(&self, branch: BranchId, generation: BranchGeneration) -> Option<&BranchRecord> {
+		self.records
+			.get(&branch)
+			.filter(|record| !record.deleted && record.generation == generation)
+	}
+
+	/// Minimum fork anchor across Active children of `(parent, generation)`.
+	///
+	/// The delete guard's question — "does anything still fork off this?" — not
+	/// a retention pin: [`BranchCatalog::retention_anchors`] is what compaction
+	/// preserves.
 	pub(crate) fn min_active_child_anchor(
 		&self,
 		parent: BranchId,
@@ -413,6 +617,7 @@ impl BranchCatalog {
 				deleted_at_seq: entry.deleted_at_seq,
 				expires_at: entry.expires_at,
 				parent: entry.parent.clone(),
+				merges: entry.merges.clone(),
 			};
 			if !deleted && live_names.insert(entry.name.clone(), entry.branch).is_some() {
 				return Err(crate::error::Error::Corruption(format!(
@@ -457,6 +662,7 @@ impl BranchCatalog {
 		self.records
 			.values()
 			.map(|record| CatalogEntry {
+				merges: record.merges.clone(),
 				branch: record.id,
 				name: record.name.clone(),
 				generation: record.generation,
@@ -549,5 +755,137 @@ mod tests {
 		catalog.delete(child, 9).unwrap();
 		let error = catalog.validate_owner(record.id, record.generation).unwrap_err();
 		assert_eq!(error.code, ErrorCode::Fenced);
+	}
+
+	// ===== FK6: retention anchors =====
+
+	fn anchors(values: impl IntoIterator<Item = u64>) -> RetentionAnchors {
+		RetentionAnchors::from_iter_for_test(values)
+	}
+
+	/// Which version of a key each anchor is answered by. Versions descend, as
+	/// the compaction iterator offers them, and each anchor must be served by the
+	/// newest version at or below it — exactly one version per anchor, never the
+	/// range between them.
+	#[test]
+	fn every_anchor_is_served_by_the_newest_version_at_or_below_it() {
+		let pins = anchors([100, 10]);
+		let mut walker = pins.walker();
+		assert!(!walker.serves(200), "nothing is pinned above the highest anchor");
+		assert!(walker.serves(50), "50 is the newest version at or below 100");
+		assert!(!walker.serves(20), "100 is already answered and 20 is above 10");
+		assert!(walker.serves(5), "5 is the newest version at or below 10");
+		assert!(!walker.serves(1), "both anchors are answered");
+	}
+
+	/// One version can answer several anchors at once, and does not thereby stop
+	/// answering: the walker consumes every anchor it passes.
+	#[test]
+	fn one_version_can_serve_several_anchors() {
+		let pins = anchors([100, 80, 60]);
+		let mut walker = pins.walker();
+		assert!(walker.serves(50), "50 is the newest version at or below all three");
+		assert!(!walker.serves(40), "nothing is left to serve");
+	}
+
+	#[test]
+	fn anchors_are_deduplicated_and_ordered_and_an_empty_set_pins_nothing() {
+		assert_eq!(anchors([10, 100, 10]), anchors([100, 10]));
+		assert_eq!(anchors([100, 10]).highest(), 100);
+		let empty = anchors([]);
+		assert!(empty.is_empty());
+		assert_eq!(empty.highest(), 0, "sequences start at 1, so zero pins nothing");
+		assert!(!empty.walker().serves(1));
+	}
+
+	/// The completeness predicate both the fork check and the merge check ask.
+	#[test]
+	fn a_view_is_complete_above_the_floor_or_exactly_on_an_anchor() {
+		let pins = anchors([100, 10]);
+		assert!(pins.view_is_complete_at(500, 200), "at or above the floor");
+		assert!(pins.view_is_complete_at(200, 200), "the floor itself");
+		assert!(!pins.view_is_complete_at(150, 200), "below the floor, not an anchor");
+		assert!(pins.view_is_complete_at(100, 200), "below the floor but pinned");
+		assert!(pins.view_is_complete_at(10, 200), "the lower anchor is pinned too");
+		assert!(!pins.view_is_complete_at(99, 200), "next to an anchor is not on it");
+		assert!(
+			anchors([]).view_is_complete_at(150, 0),
+			"with no floor advance every cap is complete, anchors or not"
+		);
+		assert!(
+			!anchors([]).view_is_complete_at(150, 200),
+			"and with no anchors only the floor saves it"
+		);
+	}
+
+	/// What a compaction job re-checks before publishing. An anchor that appeared
+	/// after the sample may need a version the job discarded; one that vanished
+	/// only means the job over-retained.
+	#[test]
+	fn only_an_anchor_that_appeared_since_the_sample_refuses_a_publish() {
+		let sampled = anchors([100, 10]);
+		assert_eq!(sampled.appeared_since(&sampled), None);
+		assert_eq!(anchors([100]).appeared_since(&sampled), None, "one vanished: safe");
+		assert_eq!(anchors([]).appeared_since(&sampled), None, "all vanished: safe");
+		assert_eq!(anchors([100, 50, 10]).appeared_since(&sampled), Some(50), "one appeared");
+		assert_eq!(anchors([500]).appeared_since(&sampled), Some(500), "even a higher one");
+	}
+
+	#[test]
+	fn any_in_reports_an_anchor_inside_a_half_open_span() {
+		let pins = anchors([100, 10]);
+		assert!(pins.any_in(50, 200), "100 is inside");
+		assert!(pins.any_in(100, 101), "the low bound is inclusive");
+		assert!(!pins.any_in(101, 200), "and 100 is below it");
+		assert!(!pins.any_in(11, 100), "the high bound is exclusive, so 100 is out");
+		assert!(pins.any_in(5, 100), "but 10 is in");
+		assert!(!pins.any_in(11, 99), "neither anchor is in the gap");
+	}
+
+	/// Both kinds of anchor, and the liveness rules that release them.
+	#[test]
+	fn anchors_come_from_live_children_and_live_merge_edges() {
+		let main = BranchId::from_u128(1);
+		let child = BranchId::from_u128(2);
+		let gone = BranchId::from_u128(3);
+		let mut catalog = BranchCatalog::new(main);
+		let main_generation = catalog.get(main).unwrap().generation;
+		let link = |seq| crate::authority::format::ParentLink {
+			parent: main,
+			parent_generation: main_generation,
+			fork_seq: seq,
+		};
+		let child_record = catalog.create_fork(child, "child", 10, link(10)).unwrap();
+		let gone_record = catalog.create_fork(gone, "gone", 20, link(20)).unwrap();
+		assert_eq!(catalog.retention_anchors(main, main_generation), anchors([10, 20]));
+
+		let edge = |source, generation, target_through| crate::authority::format::MergeEdge {
+			source,
+			source_generation: generation,
+			source_through_seq: 0,
+			target_through_seq: target_through,
+		};
+		catalog
+			.record_merge(main, main_generation, edge(child, child_record.generation, 300))
+			.unwrap();
+		catalog
+			.record_merge(main, main_generation, edge(gone, gone_record.generation, 400))
+			.unwrap();
+		assert_eq!(
+			catalog.retention_anchors(main, main_generation),
+			anchors([10, 20, 300, 400]),
+			"a merge edge pins the base the next merge from that source reads at"
+		);
+
+		catalog.delete(gone, 99).unwrap();
+		assert_eq!(
+			catalog.retention_anchors(main, main_generation),
+			anchors([10, 300]),
+			"a deleted source releases both its fork anchor and its edge"
+		);
+		assert!(
+			catalog.retention_anchors(child, child_record.generation).is_empty(),
+			"a childless branch nothing merges into pins nothing"
+		);
 	}
 }
