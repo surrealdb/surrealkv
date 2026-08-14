@@ -286,7 +286,6 @@ impl BranchCatalog {
 	/// Creates a fork child entry: like [`Self::create`] plus the COW parent
 	/// link. FK4's fork protocol is the production caller; FK3 exercises it
 	/// through the test seam.
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn create_fork(
 		&mut self,
 		id: BranchId,
@@ -489,7 +488,6 @@ impl BranchCatalog {
 			.ok_or_else(|| KernelError::new(ErrorCode::NotFound, "branch not found"))
 	}
 
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn get_by_name(&self, name: &str) -> KernelResult<&BranchRecord> {
 		let id = self
 			.live_names
@@ -552,7 +550,6 @@ impl BranchCatalog {
 	}
 
 	/// Sets or clears a branch's expiry. `None` makes the branch permanent.
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn set_expiry(&mut self, id: BranchId, expires_at: Option<u64>) -> KernelResult<()> {
 		if id == self.default_branch {
 			return Err(KernelError::new(
@@ -576,7 +573,6 @@ impl BranchCatalog {
 	/// would break views its children still resolve through, and deleting the
 	/// subtree would destroy branches whose own TTL has not fired. Its tombstone
 	/// lands on the first sweep after the last child is gone.
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn expire_due(&mut self, now: u64, deleted_at_seq: u64) -> Vec<String> {
 		let due: Vec<(BranchId, String)> = self
 			.records

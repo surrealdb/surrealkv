@@ -1759,7 +1759,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 	// Phase 3: Restart and verify WAL was actually skipped
 	{
 		// Create a custom Core to inspect if WAL was replayed
-		let inner = Arc::new(CoreInner::new(Arc::clone(&opts)).unwrap());
+		let inner = Arc::new(CoreInner::new_impl(Arc::clone(&opts)).unwrap());
 
 		// Before WAL replay, memtable should be empty
 		let memtable_before = inner.active_memtable.read().unwrap().clone();

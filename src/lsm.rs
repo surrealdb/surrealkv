@@ -180,6 +180,17 @@ pub(crate) struct CoreInner {
 	/// Event counters for branch operations. Gauges are not stored here: they
 	/// are derived when a snapshot is taken (see `crate::metrics`).
 	pub(crate) metrics: Arc<crate::metrics::BranchMetrics>,
+
+	/// The same atomic the level manifest holds, so a catalog publish can record
+	/// the new version WITHOUT taking the manifest lock.
+	///
+	/// That is not an optimisation. `fork_branch` and `record_merge_edge` both
+	/// hold a manifest read guard across their catalog publish — deliberately,
+	/// to exclude a concurrent compaction publish — and `std::sync::RwLock` is
+	/// not reentrant: a second read on the same thread deadlocks as soon as a
+	/// compaction is queued for the write lock. Sharing the atomic removes the
+	/// second acquisition entirely.
+	pub(crate) catalog_version: Arc<AtomicU64>,
 }
 
 /// Transitional compatibility for the default-branch extraction. Field
@@ -194,16 +205,10 @@ impl std::ops::Deref for CoreInner {
 }
 
 impl CoreInner {
-	/// Creates a new LSM tree core instance
-	#[cfg_attr(not(test), allow(dead_code))]
-	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
-		Self::new_impl(opts)
-	}
-
-	/// Opens the durable authority (catalog lineage first — it is recovery's
-	/// fencing authority), hydrates the runtime manifest from state lineages,
+	/// Creates the LSM tree core: opens the durable authority (catalog lineage first — it is
+	/// recovery's fencing authority), hydrates the runtime manifest from state lineages,
 	/// and seeds the clock so it can never fall below a catalog anchor.
-	fn new_impl(opts: Arc<Options>) -> Result<Self> {
+	pub(crate) fn new_impl(opts: Arc<Options>) -> Result<Self> {
 		// Acquire database lock to prevent multiple processes from opening the same
 		// database
 		let mut lockfile = LockFile::new(&opts.path);
@@ -309,6 +314,9 @@ impl CoreInner {
 		initial_memtable.set_wal_number(wal_instance.get_active_log_number());
 		let active_memtable = Arc::new(RwLock::new(initial_memtable));
 
+		// Cloned before the manifest goes behind its lock, so the publish path can
+		// reach it without acquiring that lock a second time.
+		let catalog_version_handle = Arc::clone(&manifest.catalog_version);
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
 		let default_runtime = Arc::new(BranchRuntime::new(
@@ -338,6 +346,7 @@ impl CoreInner {
 			visible_seq_num,
 			authority,
 			metrics: Arc::new(crate::metrics::BranchMetrics::default()),
+			catalog_version: catalog_version_handle,
 			catalog_publish: Mutex::new(CatalogPublishState {
 				catalog_version,
 				writer_epoch,
@@ -362,7 +371,6 @@ impl CoreInner {
 	/// Durable branch creation: mutates the runtime catalog and publishes the
 	/// next catalog version. The catalog mutation is rolled back if the
 	/// publish fails, so the runtime never runs ahead of the authority.
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn create_branch(&self, name: &str) -> Result<crate::batch::BatchOwner> {
 		let created_at_seq = self.visible_seq_num.load(Ordering::Acquire);
 		let mut publish = self.catalog_publish.lock().unwrap();
@@ -429,7 +437,6 @@ impl CoreInner {
 	}
 
 	/// Sets or clears a branch's expiry, publishing one catalog version.
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn set_branch_expiry(
 		&self,
 		branch: crate::BranchId,
@@ -479,6 +486,9 @@ impl CoreInner {
 			log::debug!("branch maintenance expired {} branch(es): {:?}", expired.len(), expired);
 		}
 
+		// The table count is logged, not returned: this function's second return
+		// value is the metadata-prune count. `Tree::metrics().tables_reclaimed`
+		// is where a caller reads how much disk a sweep gave back.
 		let reclaimed = self.reclaim_tombstoned_branches()?;
 		if reclaimed > 0 {
 			log::debug!("branch maintenance reclaimed {reclaimed} table(s) from deleted branches");
@@ -716,15 +726,27 @@ impl CoreInner {
 				self.wal_dependencies.release_component(memtable.dependency_id());
 			}
 
-			let reclaimed = {
+			let reclaimed: Vec<Arc<Table>> = {
 				let mut manifest = self.level_manifest.write()?;
-				let tables = manifest.reclaim_owner(owner);
-				if !tables.is_empty() {
-					// The root still carries a state hint for this owner; publish
-					// so the durable record stops naming a lineage nothing loads.
-					manifest.persist_root()?;
+				match manifest.reclaim_owner(owner) {
+					None => Vec::new(),
+					Some(reclaimed) if reclaimed.tables().is_empty() => reclaimed.tables().to_vec(),
+					Some(reclaimed) => {
+						// The root still carries a state hint for this owner;
+						// publish so the durable record stops naming a lineage
+						// nothing loads. If that publish fails, put the owner
+						// back: the removal above is in-memory only, and leaving
+						// it applied would make the manifest disagree with the
+						// root that still names those tables — and the next
+						// sweep would then find nothing to reclaim, leaking the
+						// files until the next process start.
+						if let Err(error) = manifest.persist_root() {
+							manifest.restore_owner(reclaimed);
+							return Err(error);
+						}
+						reclaimed.tables().to_vec()
+					}
 				}
-				tables
 			};
 
 			freed_something |= !reclaimed.is_empty();
@@ -750,7 +772,6 @@ impl CoreInner {
 
 	/// Durable branch deletion (tombstone). Same rollback-on-publish-failure
 	/// contract as creation.
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn delete_branch(&self, branch: crate::BranchId) -> Result<()> {
 		let deleted_at_seq = self.visible_seq_num.load(Ordering::Acquire);
 		let mut publish = self.catalog_publish.lock().unwrap();
@@ -800,12 +821,16 @@ impl CoreInner {
 			maintenance_epoch: publish.maintenance_epoch,
 			entries: catalog.to_entries(),
 		};
+		failpoint!(crate::failpoints::CATALOG_PUBLISH);
 		self.authority.publish_catalog(&manifest)?;
 		publish.catalog_version = next_version;
 		publish.writer_epoch = writer_epoch;
 		publish.session_bumped = true;
-		// Mirrored for root publication only after the publish succeeded.
-		self.level_manifest.read()?.catalog_version.store(next_version, Ordering::Release);
+		// Mirrored for root publication only after the publish succeeded. Written
+		// through the shared handle rather than through the manifest lock: two
+		// callers hold a manifest read guard across this publish, and taking the
+		// lock again here deadlocks them against a queued compaction writer.
+		self.catalog_version.store(next_version, Ordering::Release);
 		Ok(())
 	}
 
@@ -1035,7 +1060,7 @@ impl CoreInner {
 	///
 	/// The default-runtime convenience wrapper; see
 	/// [`Self::rotate_runtime_memtable`].
-	#[cfg_attr(not(test), allow(dead_code))]
+	#[cfg(test)]
 	pub(crate) fn rotate_memtable(&self) -> Result<()> {
 		self.rotate_runtime_memtable(&self.default_runtime, 0)
 	}
@@ -1222,8 +1247,21 @@ impl CoreInner {
 			if runtime.owner() == self.default_runtime.owner() {
 				continue;
 			}
-			if let Some(table) = self.flush_oldest_immutable_for_runtime(&runtime)? {
-				return Ok(Some(table));
+			// Drain rather than take one: an empty or fenced entry produces no
+			// table but leaves the queue shorter, and stopping there would hide
+			// whatever is behind it.
+			loop {
+				let before = runtime.immutable_memtables.read()?.iter().count();
+				if before == 0 {
+					break;
+				}
+				if let Some(table) = self.flush_oldest_immutable_for_runtime(&runtime)? {
+					return Ok(Some(table));
+				}
+				if runtime.immutable_memtables.read()?.iter().count() == before {
+					// Nothing was consumed, so retrying would spin.
+					break;
+				}
 			}
 		}
 		Ok(None)
@@ -1266,11 +1304,37 @@ impl CoreInner {
 		);
 
 		// Flush to SST (this also removes from immutable queue and updates manifest)
-		let table = self.flush_immutable_to_sst(
+		let table = match self.flush_immutable_to_sst(
 			Arc::clone(&entry.memtable),
 			entry.table_id,
 			entry.wal_number,
-		)?;
+		) {
+			Ok(table) => table,
+			// The branch was deleted while this memtable was queued. There is
+			// nowhere for these rows to go — the owner has no level set to
+			// publish into and the reclamation sweep is about to drop
+			// everything it owns — so the entry is discarded rather than
+			// retried.
+			//
+			// Retrying is not a neutral alternative: this is the one flush loop
+			// every branch shares, so a single deleted branch holding a dirty
+			// memtable would fail the loop on every cycle and stall flushing for
+			// the whole store. It also made `close()` fail outright after the
+			// ordinary sequence of writing to a branch and then deleting it.
+			Err(Error::BranchFenced) => {
+				let mut guard = runtime.immutable_memtables.write()?;
+				guard.remove(entry.table_id);
+				drop(guard);
+				self.wal_dependencies.release_component(entry.memtable.dependency_id());
+				log::debug!(
+					"discarded memtable table_id={} for deleted branch {:?}",
+					entry.table_id,
+					runtime.owner()
+				);
+				return Ok(None);
+			}
+			Err(error) => return Err(error),
+		};
 
 		// Schedule async WAL cleanup
 		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
@@ -1781,7 +1845,6 @@ impl Core {
 	/// committed rows that are not yet flushed: the child's read stack resolves
 	/// the parent's memtables under the same cap, and a crash replays them into
 	/// the parent from the WAL.
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn fork_branch(
 		&self,
 		parent_name: &str,
@@ -2762,6 +2825,14 @@ impl Tree {
 	}
 }
 
+fn bound_as_ref(bound: &std::ops::Bound<Vec<u8>>) -> std::ops::Bound<&[u8]> {
+	match bound {
+		std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+		std::ops::Bound::Included(key) => std::ops::Bound::Included(key.as_slice()),
+		std::ops::Bound::Excluded(key) => std::ops::Bound::Excluded(key.as_slice()),
+	}
+}
+
 /// A branch, pinned to the generation it was opened at.
 ///
 /// Every operation validates that generation, so a handle to a branch that has
@@ -2853,22 +2924,7 @@ impl BranchHandle {
 	/// [`Error::BelowRetentionFloor`] rather than planned against a partly
 	/// guessed base.
 	pub fn preview_merge_into(&self, target: &BranchHandle) -> Result<crate::MergeReport> {
-		let (base, visible) = self.merge_preconditions(target)?;
-
-		// The source's changes since the last merge (or the fork), and the
-		// target read at two caps: as it stood at that same point, and now.
-		let diff = self.diff_from(base.source_through)?;
-		let at_base = crate::snapshot::Snapshot::new_owned(
-			Arc::clone(&self.core),
-			base.target_at,
-			target.owner,
-		)?;
-		let now =
-			crate::snapshot::Snapshot::new_owned(Arc::clone(&self.core), visible, target.owner)?;
-		let mut probe = crate::merge::PointProbe::new(&at_base, &now);
-		let changes = diff.iter()?;
-		let report = crate::merge::plan(changes, &mut probe)?;
-		Ok(report)
+		self.merge_session(target)?.report()
 	}
 
 	/// Applies this branch's changes to `target`.
@@ -2903,9 +2959,91 @@ impl BranchHandle {
 		target: &BranchHandle,
 		strategy: crate::MergeStrategy,
 	) -> Result<crate::MergeOutcome> {
+		self.merge_into_impl(target, strategy, None).await
+	}
+
+	/// [`BranchHandle::merge_into`], but only if the target still stands where
+	/// the caller last saw it.
+	///
+	/// `expected_head` is the target's [`BranchInfo::last_write_seq`] — the
+	/// newest sequence that branch wrote itself, `None` if it has never
+	/// written. If it has moved, the merge is refused with
+	/// [`Error::UnexpectedHead`] and nothing is written.
+	///
+	/// This is a **stronger** condition than the merge's own safety net. The
+	/// oracle already refuses a merge whose keys the target changed since
+	/// planning; this refuses one where the target changed *at all*, including
+	/// on keys the merge never touches. It is the check to reach for when a
+	/// human or an agent reviewed a preview and wants the thing they approved to
+	/// be the thing that lands.
+	pub async fn merge_into_expecting(
+		&self,
+		target: &BranchHandle,
+		strategy: crate::MergeStrategy,
+		expected_head: Option<u64>,
+	) -> Result<crate::MergeOutcome> {
+		self.merge_into_impl(target, strategy, Some(expected_head)).await
+	}
+
+	/// Merges only the changes whose keys fall in a range.
+	///
+	/// The rest of this branch's changes are left where they are, and can be
+	/// merged later.
+	///
+	/// **A scoped merge records no promotion edge, deliberately.** An edge says
+	/// "everything this source wrote up to sequence N is now in the target", and
+	/// that is a claim about sequences, not keys — there is no way to express
+	/// "all of it except the keys outside this range". Recording one anyway
+	/// would make the next full merge skip the keys this one did not carry,
+	/// losing them silently, which is the worst failure this system has.
+	///
+	/// The consequence is that a later full merge re-offers what this one
+	/// applied. That is harmless: the target already holds the source's value
+	/// for those keys, so they classify as converged and are not rewritten.
+	pub async fn merge_range(
+		&self,
+		target: &BranchHandle,
+		strategy: crate::MergeStrategy,
+		lower: std::ops::Bound<Vec<u8>>,
+		upper: std::ops::Bound<Vec<u8>>,
+	) -> Result<crate::MergeOutcome> {
+		let session = self.merge_session(target)?.scoped_to(lower, upper);
+		self.run_merge(target, strategy, session).await
+	}
+
+	async fn merge_into_impl(
+		&self,
+		target: &BranchHandle,
+		strategy: crate::MergeStrategy,
+		expected_head: Option<Option<u64>>,
+	) -> Result<crate::MergeOutcome> {
 		let session = self.merge_session(target)?;
-		let preflight = session.preflight(strategy)?;
-		if preflight.conflicts > 0 && strategy == crate::MergeStrategy::Strict {
+
+		// Checked after the session has fixed what it compares against, and
+		// before anything is written.
+		if let Some(expected) = expected_head {
+			let actual = self.core.last_write_seq(target.owner)?;
+			if actual != expected {
+				return Err(Error::UnexpectedHead {
+					expected,
+					actual,
+				});
+			}
+		}
+
+		self.run_merge(target, strategy, session).await
+	}
+
+	/// The half both entry points share: refuse or apply, then record the edge
+	/// unless this merge covered only part of the source.
+	async fn run_merge(
+		&self,
+		target: &BranchHandle,
+		strategy: crate::MergeStrategy,
+		session: crate::merge::MergeSession,
+	) -> Result<crate::MergeOutcome> {
+		let preflight = session.preflight(&strategy)?;
+		if preflight.refused {
 			return Err(Error::MergeConflicts {
 				count: preflight.conflicts,
 			});
@@ -2915,21 +3053,18 @@ impl BranchHandle {
 		let (target_through_seq, chunks) = if preflight.writes == 0 {
 			(source_through_seq, 0)
 		} else {
-			session.apply(strategy, &preflight).await?
+			session.apply(&strategy, &preflight).await?
 		};
 
-		self.record_merge_edge(target, source_through_seq, target_through_seq)?;
+		if !session.is_scoped() {
+			self.record_merge_edge(target, source_through_seq, target_through_seq)?;
+		}
 		self.core.inner.metrics.record_merge(chunks);
 
-		let resolved = if strategy == crate::MergeStrategy::SourceWins {
-			preflight.conflicts
-		} else {
-			0
-		};
 		Ok(crate::MergeOutcome {
 			applied: preflight.writes,
 			converged: preflight.converged,
-			resolved,
+			resolved: preflight.resolved,
 			chunks,
 			source_through_seq,
 			target_through_seq,
@@ -3062,6 +3197,68 @@ impl BranchHandle {
 				self.name
 			))
 		})
+	}
+
+	/// Undoes this branch's own changes over a key range, restoring what it
+	/// inherited at its fork anchor.
+	///
+	/// Written as a **compensating commit**: new writes that happen to restore
+	/// old values. Nothing is rewritten and nothing is erased — the branch's
+	/// history still shows what it did and then that it undid it, which is the
+	/// only honest thing an append-only store can do and the only thing that
+	/// keeps a concurrent reader's view consistent.
+	///
+	/// Keys the branch never touched are left alone; keys it created since the
+	/// fork are deleted, because "what it inherited" for those is nothing.
+	/// Returns the number of keys restored.
+	///
+	/// Refuses a branch with no fork lineage: there is no inherited state to
+	/// restore to.
+	pub async fn revert_range(
+		&self,
+		lower: std::ops::Bound<Vec<u8>>,
+		upper: std::ops::Bound<Vec<u8>>,
+	) -> Result<usize> {
+		let anchor = self.fork_anchor()?;
+		let visible = self.core.inner.visible_seq_num.load(Ordering::Acquire);
+
+		// What this branch changed, and what it saw before it did.
+		let own = crate::snapshot::Snapshot::own_only(Arc::clone(&self.core), visible, self.owner)?;
+		let inherited =
+			crate::snapshot::Snapshot::inherited_only(Arc::clone(&self.core), anchor, self.owner)?;
+		let changes = crate::BranchDiff::new(own, anchor);
+
+		let mut restorations: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+		for entry in changes.iter_range(bound_as_ref(&lower), bound_as_ref(&upper))? {
+			let entry = entry?;
+			// `fork_anchor` already refused a branch with no lineage, so the
+			// `None` arm is unreachable; it is written out rather than
+			// unwrapped because an unreachable unwrap is still an unwrap.
+			let inherited_value = match &inherited {
+				Some(snapshot) => snapshot.get(&entry.key)?.map(|(value, _)| value),
+				None => None,
+			};
+			// A key whose current value already equals what it inherited needs
+			// no compensating write.
+			if inherited_value == entry.op.value().cloned() {
+				continue;
+			}
+			restorations.push((entry.key, inherited_value));
+		}
+		if restorations.is_empty() {
+			return Ok(0);
+		}
+
+		let restored = restorations.len();
+		let mut txn = self.begin()?;
+		for (key, value) in restorations {
+			match value {
+				Some(value) => txn.set(key.as_slice(), value.as_slice())?,
+				None => txn.delete(key.as_slice())?,
+			}
+		}
+		txn.commit().await?;
+		Ok(restored)
 	}
 
 	/// This branch's catalog facts as of now.

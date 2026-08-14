@@ -150,7 +150,7 @@ pub(crate) struct IterState {
 impl IterState {
 	/// Single-layer state (no inheritance) — the default-branch shape and
 	/// the test-fixture constructor.
-	#[cfg_attr(not(test), allow(dead_code))]
+	#[cfg(test)]
 	pub(crate) fn single(
 		active: Option<Arc<MemTable>>,
 		immutable: Vec<Arc<MemTable>>,
@@ -703,8 +703,7 @@ pub(crate) struct KMergeIterator<'iter> {
 	iterators: Vec<BoxedLSMIterator<'iter>>,
 
 	// Owned state
-	#[allow(dead_code)]
-	iter_state: Box<IterState>,
+	_iter_state: Box<IterState>,
 
 	/// Current winner index (None if exhausted)
 	winner: Option<usize>,
@@ -861,7 +860,7 @@ impl<'a> KMergeIterator<'a> {
 
 		Self {
 			iterators,
-			iter_state: boxed_state,
+			_iter_state: boxed_state,
 			winner: None,
 			active_count: 0,
 			direction: MergeDirection::Forward,
@@ -1150,10 +1149,6 @@ pub(crate) struct SnapshotIterator<'a> {
 	/// Sequence number for visibility
 	snapshot_seq_num: u64,
 
-	/// Core for resolving values
-	#[allow(dead_code)]
-	core: Arc<Core>,
-
 	/// Last user key seen (forward direction) - reusable buffer
 	last_key_fwd: Vec<u8>,
 
@@ -1190,7 +1185,6 @@ impl SnapshotIterator<'_> {
 		Ok(Self {
 			merge_iter,
 			snapshot_seq_num: snapshot.seq_num,
-			core: Arc::clone(&snapshot.core),
 			last_key_fwd: Vec::new(),
 			buffered_back_key: Vec::new(),
 			buffered_back_value: Vec::new(),

@@ -323,7 +323,15 @@ async fn is_send_sync() {
 	require_sync(txn);
 }
 
-const ENTRIES: usize = 400_000;
+/// Entries in the large-transaction test below.
+///
+/// It was 400,000 — roughly 70 MB in one transaction — and carried a bare
+/// `#[ignore]` with no rationale, which is not a decision anyone can act on: a
+/// reader cannot tell "too slow for CI" from "known broken". It is neither. The
+/// count is now one a normal run can afford, so the test actually runs and the
+/// path it covers — a single transaction far larger than one memtable — is
+/// covered on every commit rather than never.
+const ENTRIES: usize = 40_000;
 const KEY_SIZE: usize = 24;
 const VALUE_SIZE: usize = 150;
 const RNG_SEED: u64 = 3;
@@ -369,7 +377,6 @@ fn make_rng() -> fastrand::Rng {
 }
 
 #[test(tokio::test)]
-#[ignore]
 async fn insert_large_txn_and_get() {
 	let store = create_hermitage_store().await;
 

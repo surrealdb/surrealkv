@@ -28,10 +28,6 @@ pub struct Writer {
 
 	/// The compression type to use for records.
 	compression_type: CompressionType,
-
-	/// Buffer for compressed data (allocated when compression is enabled).
-	#[allow(dead_code)]
-	compressed_buffer: Option<Vec<u8>>,
 }
 
 impl Writer {
@@ -47,19 +43,11 @@ impl Writer {
 		compression_type: CompressionType,
 		block_offset: usize,
 	) -> Self {
-		// Allocate compressed buffer if compression is enabled
-		let compressed_buffer = if compression_type != CompressionType::None {
-			Some(Vec::with_capacity(BLOCK_SIZE))
-		} else {
-			None
-		};
-
 		Self {
 			dest,
 			block_offset,
 			manual_flush,
 			compression_type,
-			compressed_buffer,
 		}
 	}
 

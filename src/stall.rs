@@ -39,7 +39,6 @@ pub trait WriteStallCountProvider: Send + Sync + 'static {
 /// Information about a write stall event.
 /// Fields are used for diagnostics, testing, and potential future logging/metrics.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct WriteStallInfo {
 	/// The reason for the stall
 	pub reason: WriteStallReason,
@@ -162,26 +161,6 @@ impl WriteStallController {
 			// Wait
 			notified.await;
 		}
-	}
-
-	/// Non-blocking check of whether stall conditions are currently met.
-	#[allow(dead_code)]
-	pub fn should_stall(&self, owner: crate::batch::BatchOwner) -> bool {
-		let counts = self.provider.get_stall_counts(owner);
-		counts.immutable_memtables >= self.thresholds.memtable_limit
-			|| counts.l0_files >= self.thresholds.l0_file_limit
-	}
-
-	/// Get current counts from the provider (for determining stall reason).
-	#[allow(dead_code)]
-	pub fn provider_counts(&self, owner: crate::batch::BatchOwner) -> StallCounts {
-		self.provider.get_stall_counts(owner)
-	}
-
-	/// Get the configured memtable stall limit.
-	#[allow(dead_code)]
-	pub fn memtable_limit(&self) -> usize {
-		self.thresholds.memtable_limit
 	}
 
 	/// Signal that stall conditions may have changed.

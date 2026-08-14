@@ -477,6 +477,498 @@ Verification: 1,095 lib tests green (1,092 → 1,095), 4 doc tests, clippy `--al
 the edge covers the whole extent, one-chunk atomicity, the unchunkable single entry with nothing
 written, and the planning-window conflict.
 
+### V6 — Property tests against a branch-semantics model: complete (2026-08-15)
+
+`proptest` had been a declared dev-dependency with **zero uses** since it was added. This slice uses
+it: generated histories of fork / write / delete / merge / flush / compact / churn / reopen, with
+every live branch's view of every key checked against a model after **every** operation.
+
+`VisibilityModel` is ~90 lines and answers exactly one question — "what should this branch see for
+this key?" — by walking the ancestor chain with a running-minimum cap. It knows nothing about SSTs,
+memtables, compaction, WAL or the authority. The module docs carry the test for whether it has
+drifted back into the shape PA2 deleted: **if it ever needs to know about a flush, a level, a table,
+or a sequence that is not a fork anchor or a commit cap, it has.** Merge is modelled by applying the
+keys the engine *reported* writing, deliberately — restating the decision table in the model would
+only prove it was written twice.
+
+**The non-vacuity check failed three times before it passed, and each failure was informative.**
+
+1. **First attempt: the re-planted FK6 defect was not caught.** Collapsing `retention_anchors` to
+   its single lowest anchor — the pre-FK6 behaviour — left the whole suite green.
+2. **A coverage counter said why: zero of 48 histories ever exercised the retention pin.** Random
+   operations almost never build the shape a compaction needs in order to *drop* a version, so a
+   suite that claimed to test a retention promise was not reaching that code at all. Fixed by
+   configuring the store so compaction actually triggers (`level0_max_files: 2`, `level_count: 2`)
+   and adding an `Op::Churn` that overwrites one key several times with flushes between. Biasing a
+   generator toward the interesting region is the point of writing one.
+3. **Still not caught, and a seeded history explained it.** The pin was now being exercised, but the
+   seeded history had **one** child — and with one child the lowest anchor IS the only anchor, so a
+   single point pin is accidentally correct. Two children at different anchors is the entire
+   defect. With that, the re-planted defect fails immediately and legibly:
+   `branch b2 key "a": engine says Some("1"), the specification says Some("2")` — the bug in one
+   line.
+
+That seeded history ships as `a_seeded_history_reaches_the_retention_pin_and_agrees_with_the_
+specification`, and it asserts the pin was reached, so it cannot quietly stop testing what it is
+for.
+
+**Recorded honestly:** the random generator still does not reliably reach the retention region in 48
+cases; the seeded history is what covers it. Both belong, and pretending the generator covers it
+would be exactly the kind of claim this project's probes exist to prevent.
+
+Four hand-checked model tests as well — a specification nobody has verified is just a second
+opinion: an inherited view capped at the anchor, each anchor getting its own answer, a chain
+narrowing monotonically, and absence treated as a value.
+
+Verification: 1,126 lib tests green (1,119 → 1,126), 4 doc tests, clippy `--all-targets
+--all-features` clean, fmt clean.
+
+### V5 — The concurrency matrix: complete (2026-08-15)
+
+Before this slice, **no branch operation appeared inside a spawned task or thread anywhere in the
+repository**, and no branch test used a multi-threaded runtime. `Error::CompactionPinRaced` exists
+solely to describe a race and was tested by hand-assembling the state that race would leave.
+
+Six tests in `src/test/branch_concurrency_tests.rs`, all on
+`#[tokio::test(flavor = "multi_thread", worker_threads = 4)]`, each asserting an **invariant rather
+than a schedule**: concurrent forks off one parent (unique generations, all resolving), fork ∥
+compaction, delete ∥ write, merge ∥ merge into one target, merge ∥ target writes, and the
+maintenance sweep ∥ branch churn. Run ten times consecutively without a flake.
+
+**It found a deadlock — the most serious defect of this whole stretch.**
+
+`Core::fork_branch` holds a `level_manifest.read()` guard across its catalog publish (FK6's floor
+check), and `publish_catalog_locked` then took `level_manifest.read()` **again on the same thread**
+to mirror the catalog version. `std::sync::RwLock` is not reentrant, and a queued writer blocks new
+readers — so as soon as a compaction was waiting for the write lock, the fork blocked on itself.
+Forever. `BranchHandle::record_merge_edge` has the same shape for the same reason (FK6's window
+closure), so **a merge could deadlock the same way**.
+
+Neither was reachable before this slice, because nothing had ever run a branch operation
+concurrently with a compaction. The probe is unambiguous: restore the recursive read and
+`forking_while_the_parent_compacts_never_costs_the_child_its_view` hangs indefinitely instead of
+finishing in 1.5 seconds.
+
+Fixed by giving `CoreInner` its own clone of the `Arc<AtomicU64>` the manifest already holds, so the
+publish path records the catalog version without acquiring that lock at all. The two deliberate
+read-guard holds stay exactly as FK6 designed them — they are what excludes a concurrent compaction
+publish — and the second acquisition simply no longer exists.
+
+Plan-vs-reality deltas:
+
+1. **`merge_into`'s future is not `Send`**, so a merge cannot be `tokio::spawn`ed. It holds a
+   `DiffIter` and a `&mut dyn TargetProbe` across await points, and making it `Send` would require
+   `LSMIterator: Send` — a deep change well outside this slice. The tests drive merges through
+   `spawn_blocking` + `Handle::block_on`, which is exactly what a caller has to do, and the
+   constraint is now recorded here rather than discovered by the first user who tries. Worth
+   revisiting when the async work lands, since it is the same layer.
+2. A `Send + Sync` assertion for `Tree` and `BranchHandle` was added to the architecture guards
+   first. Nothing had ever shared a `Tree` across threads, so the alternative was discovering the
+   answer inside a race.
+3. The fork ∥ compaction test accepts `CompactionPinRaced` as a legal outcome rather than a
+   failure — that error means the mechanism worked. What it asserts instead is the child's read,
+   which is the property; asserting which side won would be asserting the scheduler.
+
+Verification: 1,119 lib tests green (1,112 → 1,119), 4 doc tests, clippy `--all-targets
+--all-features` clean, fmt clean, concurrency lane green over 10 consecutive runs.
+
+### V4 — The crash and reopen matrix: complete (2026-08-15)
+
+Seven tests in `src/test/branch_crash_tests.rs`, closing the holes the exploration measured: a
+deleted branch's tombstone reloaded (and its name re-created, against a fresh generation), a TTL
+surviving a restart and firing on the first sweep after it, **retention floors and fork anchors
+across a restart** with the pinned version still readable, `AtVersion`/`AtTimestamp` resolving
+identically after a reopen, an interrupted reclamation finishing after a restart, a power-loss test
+that loses an unsynced *branch-owned* SST, and metrics gauges re-derived while counters reset.
+
+**It found a second production bug, worse than V3's.**
+
+`close()` failed outright after the ordinary sequence *write on a branch → delete the branch →
+close*: `"Failed to flush memtables during shutdown: Branch generation is stale or deleted"`. The
+deleted branch's dirty memtable is still queued, shutdown tries to flush it, and PB1's liveness
+guard correctly refuses — but the refusal propagated as a hard error.
+
+The shutdown failure is the visible symptom; the real exposure is that **this is the one flush loop
+every branch shares**. A single deleted branch holding a dirty memtable would fail that loop on
+every cycle, so flushing stalls for the whole store, not just for the branch that was deleted.
+
+Fixed in `flush_oldest_immutable_for_runtime`: `Err(Error::BranchFenced)` now discards the entry and
+releases its WAL dependency instead of propagating. Discarding is correct rather than merely
+convenient — the owner has no level set to publish into and the reclamation sweep is about to drop
+everything it owns, so there is nowhere for those rows to go. `flush_oldest_immutable_to_sst` also
+had to learn to drain a runtime rather than take one entry, because an entry that produces no table
+(empty or fenced) previously stopped the sweep with work still queued behind it.
+
+Probed: restoring the propagation reproduces the exact shutdown failure.
+
+Plan-vs-reality delta: the plan listed "interrupted detach reloaded from disk" as its own arm. V3's
+failpoint test already covers the in-process half, and the reload half is subsumed by
+`an_interrupted_reclamation_finishes_after_a_restart`, which exercises the same shape — an
+operation interrupted between two publishes, then reloaded. A separate detach reload would assert
+the same property twice.
+
+Verification: 1,112 lib tests green (1,105 → 1,112), clippy `--all-targets --all-features` clean,
+fmt clean.
+
+### V3 — Failpoints and the branch fault-injection lane: complete (2026-08-15)
+
+This is the coverage PE2 was blocked on. PE2 needed `SimObjectStore`'s fault points, which the
+engine never called; V3 injects at the engine's own durable steps instead, and needs no seam.
+
+As built: `src/failpoints.rs` (`#[cfg(test)]`) plus a `failpoint!` macro that expands to **nothing**
+in a published build — no registry, no lookup, no branch. Three points, at
+`publish_catalog_locked`, `persist_owner_update` and `persist_root`. Thread-local and RAII-disarmed,
+so a panicking test cannot leak a fault into the next one and a background flush cannot be surprised
+by another test's injection. The cost, stated in the module docs: faults cannot be injected into
+background work this way — irrelevant here, because every branch state machine publishes on the
+caller's thread.
+
+**It found a production bug on its first run.** `reclaim_tombstoned_branches` removed a deleted
+branch's level set, state version and retention floor from the in-memory manifest and *then*
+published a root without it. That order is forced — the root's contents derive from the
+state-version map, so it cannot describe an owner's absence until the owner is absent — which means
+a failed publish left memory ahead of disk. Unlike every other publish path in this engine, it did
+not roll back. The consequence: the next sweep finds nothing to reclaim while the files sit on disk
+referenced by a root that was never replaced, so **the tables leak until the next process start** —
+exactly the leak PB1 existed to fix, returning on the failure path.
+
+Fixed with `LevelManifest::{reclaim_owner -> Option<ReclaimedOwner>, restore_owner}`, matching the
+rollback discipline of `revert_changeset` and the catalog's `*catalog = snapshot`. Probed: with the
+`restore_owner` call removed, the test reddens on "the level set was removed in memory without being
+published" (`left: 0, right: 1`).
+
+Seven tests, each pairing an injected failure with a control arm that must succeed — without the
+control, a test could pass because the operation was refused for an unrelated reason:
+fork, delete, detach, TTL expiry, the merge promotion edge, reclamation, and the registry's own
+behaviour (one-shot fires once, always-armed keeps firing, the guard disarms on drop). That last one
+exists so the control arms cannot be silently vacuous.
+
+Plan-vs-reality deltas:
+
+1. **My assertion read the wrong number, and finding out why was worth the detour.**
+   `sweep_branch_maintenance` returns `(expired, removed)` where `removed` is the **metadata-prune**
+   count; the reclaimed-table count only feeds a `log::debug!`. The test now asserts on
+   `Tree::metrics().tables_reclaimed` and on the owner's level-set size directly. A comment at the
+   return site now says which number is which, because the tuple gives no clue.
+2. **The detach failure case is the one with a genuine window** and it behaves correctly:
+   detach materializes inherited rows into the branch's own tables *before* clearing the parent
+   link, so a failure between them leaves rows copied but the link intact. Reads are identical
+   either way, because the copies shadow what they were copied from — asserted rather than assumed.
+3. Two of `docs/removed-surfaces.md`'s carried-forward obligations are now partially reachable
+   (a failed publish that recovers the complete old state). The object-store-specific half — an
+   outcome that is *unknown* rather than chosen — stays with PG1, as `ASYNC_OBJECT_STORE_HANDOVER.md`
+   records.
+
+Verification: 1,105 lib tests green (1,098 → 1,105), 4 doc tests, clippy `--all-targets
+--all-features` clean, fmt clean.
+
+### V2b — Selected apply and compensating restore: complete (2026-08-15)
+
+Closes the last two gaps against strata's design contract (items 8 and 9 of its ten V1 workflows).
+With these, SurrealKV implements all ten; strata itself implements six.
+
+As built:
+
+- **`BranchDiff::iter_range(lower, upper)`** — bounded at the iterator, not filtered after it, so a
+  diff over a narrow range of a large branch reads a narrow range. `DiffIter::new` now takes the
+  bounds that were hard-coded `Unbounded`.
+- **`BranchHandle::merge_range(target, strategy, lower, upper)`** — the same two-pass session,
+  scoped. `MergeSession::scoped_to` sets the range; `changes()` applies it to both passes, so the
+  plan and the write see the same subset.
+- **`BranchHandle::revert_range(lower, upper)`** — a compensating commit. For each key the branch
+  changed in the range, it writes back what the branch inherited at its fork anchor, deleting keys
+  it created. Keys already equal to their inherited value are skipped, which is what makes it
+  idempotent.
+
+**The load-bearing decision: a scoped merge records NO promotion edge.** An edge says "everything
+this source wrote up to sequence N is in the target" — a claim about *sequences*, and there is no
+way to express "all of it except the keys outside this range". Recording one after a partial apply
+would make the next full merge skip the keys the scoped one did not carry.
+
+Probed, and the failure is exactly as bad as predicted: with the `is_scoped()` guard removed so a
+scoped merge records a full edge, `a_scoped_merge_does_not_claim_the_source_is_fully_merged` reports
+`applied: 0` on the following full merge. Two keys that were never merged are **never offered
+again**. That is silent data loss, and it is now guarded by a test whose assertion names the keys
+that would vanish.
+
+Plan-vs-reality delta:
+
+1. **`diff()` is write-based, not value-based, and a revert test had to be rewritten to say so.**
+   The first version asserted the diff shrinks to one entry after reverting three keys. It does not,
+   and should not: a revert is a compensating *write*, so the branch still reports four changed
+   keys — it has written values that happen to equal what it inherited. The corrected test asserts
+   the count stays at four, that the reverted key's newest op is a `Set` of the inherited value, and
+   that the invented key is now **tombstoned rather than absent**. That is the difference between
+   compensating and rewriting history, and it is worth an explicit test rather than a comment.
+2. The `merge_range` entry point and `merge_into` now share `run_merge`, so the refuse / apply /
+   record-edge sequence exists once. The scoped/unscoped difference is a single `if` at the edge
+   record, which is where it belongs.
+
+Verification: 1,098 lib tests green (1,093 → 1,098), 4 doc tests, clippy `--all-targets
+--all-features` clean, fmt clean. Five new tests: a scoped merge carrying only its range, the
+no-edge guarantee with its data-loss assertion, revert restoring / un-deleting / removing-created
+with an out-of-range control, revert's idempotence and its no-op case, and its refusal on a branch
+with no lineage.
+
+### V2a — The strategy set, and one place it becomes an action: complete (2026-08-15)
+
+As built:
+
+- **`MergeStrategy::decide(&Conflict) -> ConflictOutcome`** — the single exhaustive `match`. Every
+  decision point routes through it, so adding a variant is now a compile error at exactly one site.
+  It replaced **four `==` comparisons** spread across `merge.rs` and `lsm.rs`, under which a new
+  `TargetWins` would have fallen through to "not Strict, therefore write the source's value" — the
+  precise opposite of its name, compiling clean.
+- **`MergeStrategy::TargetWins`** — keeps the target on a conflict; everything non-conflicting still
+  applies.
+- **`MergeStrategy::Resolve(Arc<dyn ConflictResolver>)`** with `ConflictChoice { Source, Target,
+  Value(Option<Value>), Refuse }`. Blanket-implemented for `Fn(&Conflict) -> ConflictChoice`, so a
+  closure is a resolver. It runs inside pass two, which is the point: a caller who previews,
+  decides, and then writes through an ordinary transaction is writing **outside** the merge's
+  `start_seq` window, where a concurrent target write is not caught. Resolution was always
+  *possible*; this makes it safe.
+- **`merge_into_expecting(target, strategy, expected_head)`** with `Error::UnexpectedHead`.
+  `expected_head` is the target's `BranchInfo::last_write_seq`. Deliberately stronger than the
+  oracle's protection: the oracle refuses when the target changed a key the merge writes, this
+  refuses when the target changed *at all*.
+
+Verified by probe: making `TargetWins` write the source's value — exactly what the old `==` chain
+would have done — reddens `target_wins_keeps_the_target_and_still_applies_the_rest` on its first
+assertion (`applied` 2 where 1 is correct). `source_wins_is_the_exact_mirror_of_target_wins` runs
+the same fixture with the opposite expectation, so a strategy quietly doing the other one's job
+cannot pass either.
+
+Plan-vs-reality deltas:
+
+1. **`MergeStrategy` lost `Copy`, `PartialEq` and `Eq`.** `Resolve` carries behaviour, and a
+   strategy that carries behaviour cannot honestly be compared for equality. Checked first that
+   nothing depended on it: all 28 test uses pass a strategy as an argument, none compares one.
+   `Debug` is now hand-written — a resolver is a function and there is nothing useful to print.
+   Strategies pass by reference through `preflight`/`apply`.
+2. **`resolved` moved into `MergePreflight` and is no longer inferred at the call site.** It was
+   `if strategy == SourceWins { conflicts } else { 0 }` — which would have reported `0` for
+   `TargetWins` and for every resolver. `MergePreflight` also gained `refused`, so the refusal
+   check is "did the strategy refuse", not "is the strategy `Strict`" — which is what makes a
+   resolver's `Refuse` work without a second code path.
+3. **`preflight` re-measures the entry when a resolver substitutes a value.** A resolver may return
+   something larger than the source's value, and the chunk budget and `MergeTooLarge` preflight are
+   both sized from that number.
+4. **The resolver's determinism is a documented contract, not an assertion.** Both passes ask about
+   the same keys; a resolver that answers differently the second time makes the plan a lie about
+   the write. `apply`'s `Refuse` arm is therefore a real typed error rather than an
+   `unreachable!()`, and it says so — with the honest consequence that chunks already committed
+   stay committed.
+
+Verification: 1,093 lib tests green (1,087 → 1,093), 4 doc tests, clippy `--all-targets
+--all-features` clean, fmt clean. Six new tests: `TargetWins` and its `SourceWins` mirror, a
+resolver inventing a value (asserting it was handed base/source/target for the conflicting key
+only), a resolver deleting and a resolver refusing, per-key `Source`/`Target` choices, and
+expected-head refusing a target that moved on an unrelated key — with a control arm proving the
+refusal was the condition.
+
+### V1 — Dead code deleted: complete (2026-08-15)
+
+As built: `src/storage/` gone (7 files, 2,591 lines, 21 tests), plus eight orphans and every stale
+`allow(dead_code)` marker in the tree. Full ledger in `docs/removed-surfaces.md`.
+
+**The method that mattered here was stripping the markers and letting the compiler classify.**
+Eighteen `#[cfg_attr(not(test), allow(dead_code))]` markers were removed wholesale; the compiler
+then flagged exactly six items as unused. Those six are genuinely test-only and are now labelled
+`#[cfg(test)]`, which is what they always meant. The other **twelve markers were stale** — their
+items have had real production callers since PA wired the public branch API, and the attributes had
+been silencing the very warning that would have found the dead code sitting next to them.
+
+**Two claims in the plan were wrong, and the code was right both times.**
+
+1. **`CoreInner::new` was not callerless.** The exploration said "zero callers anywhere, incl.
+   tests"; `src/test/lsm_tests.rs:1762` used it. The `task.rs` hits that produced the false
+   negative were `MockCoreInner::new` — a different type. Resolved by pointing the test at
+   `new_impl`, the constructor production actually uses, and making it `pub(crate)`.
+2. **Three `src/test/mod.rs` helpers were not dead.** `collect_history_all` alone has ~80 callers
+   across `transaction_tests.rs` and `version_iterator_tests.rs`. Their `allow(dead_code)` markers
+   were stale, and an in-flight deletion of them was caught — by the new guard, before it reached a
+   commit. The markers went; the helpers stayed.
+
+**The sanctioned test-count drop was undercounted in the plan.** It said "exactly the 11
+conformance tests". The real figure is **21**: 11 in `conformance_tests.rs` plus 10 inline tests in
+the backends the exploration's per-file table did not include (`local.rs` 2, `local_commit.rs` 4,
+`memory.rs` 3, `native.rs` 1). Reconciled: −21 storage tests − 1 removed guard
+(`simulated_fault_backend_is_test_only`, vacuous once the module is gone) + 2 new guards = **−20**,
+which is exactly 1,107 → 1,087.
+
+Other plan-vs-reality deltas:
+
+3. **`WriteStallInfo` was wired, not deleted.** `check()` built it and `commit.rs` discarded the
+   result, so its fields were write-only in production while `stall_tests.rs` asserted on them —
+   `#[cfg(test)]` was therefore not available. A stall that cleared, with its reason, duration,
+   value and threshold, is genuine operator signal, so the commit path now logs it. "Wire it or
+   delete it": wired.
+4. **`Writer.compressed_buffer` deleted rather than finished.** WAL compression is half-built;
+   completing it is a feature and does not belong in a dead-code sweep. The unread buffer went, the
+   compression-type byte on the wire is unaffected, and the decision is recorded rather than left
+   implicit.
+5. **Two guards were narrowed rather than deleted.**
+   `branch_native_filesystem_io_is_confined_to_local_adapter` became
+   `branch_decisions_stay_free_of_filesystem_io` over `src/api.rs` and `src/branch.rs` — still a
+   real claim (the catalog decides, it does not do IO) — and gained a non-vacuity arm proving the
+   detector finds `std::fs` where it genuinely is.
+   `crate_root_exposes_one_engine_over_the_injected_roles` simply lost `"mod storage;"` and its
+   now-inaccurate name.
+6. **`SnapshotIterator.core` was deleted; `KMergeIterator.iter_state` was renamed `_iter_state`.**
+   The second is a drop-order keepalive that must be held — the underscore says so without an
+   attribute, which is the difference between documenting a constraint and suppressing a warning.
+
+The new `no_module_suppresses_dead_code_warnings` guard found four false positives on its first
+run — its own doc comment and its own comparison expression — and was tightened to match
+attributes only. It self-tests twice: that the walk reached the tree (>30 files) and that the
+detector matches its own target.
+
+Verification: 1,087 lib tests green (1,107 → 1,087, reconciled above), 4 doc tests, clippy
+`--all-targets --all-features` clean, fmt clean. **Zero `allow(dead_code)` attributes remain in
+`src/`** outside one written allowlist entry.
+
+### V0 — The async / object-store handover: complete (2026-08-15)
+
+**Scope change:** `v2` no longer runs the seam port or the object-store adapter. Those move to a
+separate experimental branch; `v2` finishes branching and closes the coverage gaps. The plan is at
+`~/.claude/plans/ignore-bplustree-understand-how-harmonic-eclipse.md` (revision 2026-08-15),
+stages V0–V8.
+
+As built: `docs/ASYNC_OBJECT_STORE_HANDOVER.md`, docs only, no code changes. It carries forward the
+PF1 gate's findings plus everything the deleted `src/storage/` module is worth remembering, so that
+V1 can delete 2,591 lines without losing the reasoning. This is PA2's discipline repeated — write
+the ledger first, then delete — and it is why V0 precedes V1.
+
+Contents: the Option A / Option B decision with both cases stated (so the trade stays
+re-examinable); why the deleted traits must not be restored verbatim; what in them *was* good
+(`PutOutcome`'s idempotency semantics, `Bindings::validate`'s refuse-don't-degrade posture, the
+`FaultPoint` before/after taxonomy) and what was not; the measured ~170 sites across 17 files; F3
+and the atomic-swap manifest that resolves it; the nine-slice derived plan; six invariants the port
+must not break, each named with the code that enforces it; the five carried-forward obligations
+re-homed with their owners; PE2's split between V3's local failpoints and what only a real object
+store can test; and nine open questions recorded rather than invented.
+
+Gate note — a docs slice's gate is fact-checking, and it caught one error before publication. The
+draft claimed the engine "uses tokio only in the commit pipeline and tests". It does not: `task.rs`
+(11 uses), `commit.rs` (7), `lsm.rs` (2), `stall.rs` (1), `lockfile.rs` (1). Corrected, and the
+open question reframed from "adopt a runtime" to "how much more of the engine becomes
+runtime-bound, and does an embedded user without a runtime still have a usable API" — which is the
+question that actually matters.
+
+Also verified before writing, rather than recalled: the seventeen lock-holding publish sites
+(9 × `catalog_publish.lock()` + 8 × `level_manifest.write()`); `PublishOutcome` and `PutOutcome`
+being variant-for-variant identical; `BindingRequirements`' eight fields and its
+`ErrorCode::CapabilityMismatch`; the seven `FaultPoint` variants; `snapshot.rs:355` taking the
+manifest read guard from sync iterator construction; and that `src/vfs.rs` is a `File` trait for
+`read_at`, not a swappable filesystem.
+
+Verification: 1,107 lib tests green (unchanged — docs only), clippy clean, fmt clean.
+
+## PF1 gate record (adversarial gate 2026-08-15 — STOPPED: the "cheap half" is not cheap, and one
+## decision has to be made before any of it is written)
+
+Two findings. The first is a scope measurement; the second is an architectural fork that determines
+the shape of PF1, PF2 and PG1, and it is the reason this gate stops rather than amends.
+
+**F1 — the seam port is ~170 IO sites across 17 files, not one module.** Counted against the tree:
+
+| file | sites | | file | sites |
+|---|---|---|---|---|
+| `wal/recovery.rs` | 26 | | `lsm.rs` | 14 |
+| `wal/manager.rs` | 25 | | `vfs.rs` | 7 |
+| `checkpoint.rs` | 24 | | `compaction/compactor.rs` | 7 |
+| `wal/reader.rs` | 21 | | `wal/writer.rs` | 6 |
+| `authority/publish.rs` | 16 | | `lockfile.rs` | 6 |
+
+(plus `wal/mod.rs`, `memtable/mod.rs`, `branch_runtime.rs`, `levels/mod.rs`, `sstable/*` at 1–4
+each). The plan's PF1 covers authority + manifest + WAL + checkpoint in one slice at "≤ ~1,500 LOC
+net". The WAL alone is four files and ~78 sites. **PF1 is at least three slices** — authority,
+then WAL, then checkpoint + lockfile — with the source guard landing last, when the allowlist can
+actually be minimal.
+
+**F2 — `ObjectStore` is async; every caller that would use it is sync AND holds a lock across the
+call.** This is the finding that stops the gate.
+
+`ObjectStore` (`storage/mod.rs:168`) is `async fn` throughout. The authority publish path is called
+from seventeen sites that hold either `catalog_publish` (a `std::sync::Mutex`) or
+`level_manifest.write()` (a `std::sync::RwLock`) across the publish — fork, delete, detach, TTL
+expiry, merge-edge recording, flush, compaction. A `std` guard may not be held across an `await`, so
+these cannot become `async` without restructuring their locking, and that locking is load-bearing:
+FK6's merge-edge publish holds the manifest read lock *precisely* to exclude a concurrent compaction
+publish, and the compactor's `update_manifest` holds the write lock to make its anchor re-check
+atomic with its own publish.
+
+Plan finding F5 called PF1 "the cheap half" because FK1's publish primitive (temp-write → fsync →
+`hard_link` → unlink → dir-fsync) maps exactly onto `put_unique` + `PutOutcome`. That mapping is
+real and still correct — but it is a *semantic* match, and F5 did not check the calling convention.
+It is not cheap.
+
+`spawn_blocking` or a bare `block_on` inside the engine is not available as an escape: `merge_into`
+is `async` and calls the sync `record_merge_edge`, so a `block_on` there would run on a runtime
+worker. Plan finding F8 already refused this shape once, for fork, in the same words: "Do not paper
+over this with `spawn_blocking` inside the engine — that hides a real property from the caller."
+
+**The fork in the road.** Two coherent answers, and they are not compatible:
+
+- **(A) The engine's IO seam is synchronous.** `ObjectStore` becomes sync, or gains a sync sibling
+  that the engine uses; the async object-store adapter owns a runtime internally and blocks its
+  caller. Keeps every lock structure exactly as built, keeps `LSMIterator` sync (which F4 already
+  decided for reads), and confines async to the hydration path and the adapter's insides. The cost
+  is honest and must be documented: an authority publish against S3 blocks the calling thread, and
+  for `fork_branch` that thread is one every writer is waiting behind.
+- **(B) The engine goes async on its write paths.** `std` locks become async locks, the publish
+  paths become `async fn`, and fork's contract changes. This is what SlateDB does, and it is the
+  shape that does not lie about the cost. It is also a rewrite of the locking in the commit, flush,
+  compaction and branch-op paths — far beyond a seam port — and it contradicts plan finding F8's
+  recorded decision that fork stays sync.
+
+**Recommendation: (A)**, because F4 has already committed the read path to "sync engine, async
+confined to hydration", and (B) would make the read and write paths disagree about their own
+concurrency model while rewriting locking that three slices of this project were spent getting
+right. But this is the decision that cannot be discovered by writing code and then revised: it
+determines whether PG1's object-store adapter is a blocking bridge or a native async backend, and
+picking wrong means porting all 170 sites twice.
+
+**DECISION (user, 2026-08-15): (B) — the engine's write paths go async.** Recorded against my
+recommendation of (A); the reasoning above stands as the case that was made and lost, and it is kept
+because a later reader deserves to know the trade was made deliberately. **Plan finding F8 is
+superseded**: `fork_branch` no longer has to stay sync.
+
+**F3 — (B) as literally stated would drag the READ path async too, and that is not what was
+chosen.** `Snapshot::collect_iter_state` (`snapshot.rs:355`) takes a read guard on
+`level_manifest`, and it is called from sync `LSMIterator` construction. Turning that `RwLock` into
+an async lock makes every scan and every point read `async`, which is exactly what plan finding F4
+rejected on evidence, and nothing in the decision above asks for it.
+
+The way to have async publishes and sync reads is to stop making readers take a lock the publisher
+holds. Two mechanisms, and both are needed:
+
+- **`level_manifest` becomes immutable versions behind an atomic swap.** Readers clone an `Arc` of
+  the current version — no lock, no await, no blocking. A publisher builds the next version, awaits
+  its IO, and swaps it in only on success. This removes the window that today is covered by holding
+  the write lock across `apply_changeset` + `persist_owner_update`: with a swap there is no moment
+  where an applied-but-not-durable state is observable, because the state readers see does not
+  change until the IO has succeeded. (This is RocksDB's `VersionSet` shape, and it is a better fit
+  for an LSM manifest than a mutex regardless of the async question.)
+- **`catalog_publish` becomes an async mutex**, held across the await. It already serialises every
+  branch operation; that is unchanged, it just becomes awaitable.
+
+FK6's merge-edge ordering survives intact and gets *simpler*: it holds the manifest read lock today
+to exclude a concurrent compaction publish, and with serialised publishers the exclusion is the
+publish mutex itself.
+
+**Derived slice plan (replaces the plan's single PF1):**
+
+| slice | scope |
+|---|---|
+| **PF0a** | `LevelManifest` → immutable versions + atomic swap. Readers lock-free and sync. No IO or async changes; pure restructuring, fully testable on its own. |
+| **PF0b** | Publish paths → `async fn`; `catalog_publish` → async mutex; fork / delete / detach / expiry / flush / compaction publishes and their transitive callers become async. `Tree`'s branch API becomes async. |
+| **PF1a** | Authority publish through `ObjectStore::put_unique` / `read_range` / `list_page`, keeping `AlreadyExistsSame` idempotency. |
+| **PF1b** | WAL IO through the roles (4 files, ~78 sites). |
+| **PF1c** | Checkpoint + lockfile through the roles; `Platform` clock/randomness injection; the source guard, whose allowlist can only be minimal once everything above has landed. |
+
+PF0a is next and carries its own gate.
+
 ### PE1 — Branch metrics: complete (2026-08-15)
 
 As built: `src/metrics.rs`, `Tree::metrics() -> BranchMetricsSnapshot`, and one new test file.

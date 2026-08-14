@@ -147,11 +147,11 @@ const DEFAULT_FILE_SIZE: u64 = 100 * 1024 * 1024;
 #[derive(Clone)]
 pub struct Options {
 	/// The permission mode for creating directories (Unix only).
-	#[allow(dead_code)] // Used on Unix via #[cfg(unix)] in Wal::prepare_directory
+	#[cfg_attr(not(unix), allow(dead_code))] // read under #[cfg(unix)] in Wal::prepare_directory
 	pub(crate) dir_mode: Option<u32>,
 
 	/// The file mode to set for the segment file (Unix only).
-	#[allow(dead_code)] // Used on Unix via #[cfg(unix)] in Wal::open_wal_file
+	#[cfg_attr(not(unix), allow(dead_code))] // read under #[cfg(unix)] in Wal::open_wal_file
 	pub(crate) file_mode: Option<u32>,
 
 	/// The compression type to apply to the segment's data.

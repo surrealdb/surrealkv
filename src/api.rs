@@ -8,7 +8,6 @@ macro_rules! id16 {
 		pub struct $name(pub [u8; 16]);
 
 		impl $name {
-			#[cfg_attr(not(test), allow(dead_code))]
 			pub const fn from_u128(value: u128) -> Self {
 				Self(value.to_be_bytes())
 			}
@@ -27,23 +26,9 @@ impl BranchId {
 	/// from this single definition; user branches never receive it.
 	pub(crate) const DEFAULT: Self = Self([0; 16]);
 }
-id16!(OperationId);
-id16!(SessionId);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BranchGeneration(pub u64);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AuthorityFence(pub u64);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct MonotonicTime(pub(crate) u64);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DurabilityClass {
-	Ephemeral,
-	CrashDurable,
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {

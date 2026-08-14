@@ -18,6 +18,12 @@ pub mod batch_tests;
 #[cfg(test)]
 pub mod block_tests;
 
+#[cfg(test)]
+mod branch_concurrency_tests;
+#[cfg(test)]
+mod branch_crash_tests;
+#[cfg(test)]
+mod branch_property_tests;
 pub mod branch_runtime_tests;
 #[cfg(test)]
 pub mod compaction_tests;
@@ -27,6 +33,8 @@ pub mod compression_tests;
 pub mod crash_consistency_tests;
 #[cfg(test)]
 mod diff_tests;
+#[cfg(test)]
+mod fault_injection_tests;
 #[cfg(test)]
 mod fork_view_tests;
 #[cfg(test)]
@@ -162,12 +170,10 @@ fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(Internal
 
 /// Type alias for a map of keys to their version information
 /// Each key maps to a vector of (value, timestamp, is_tombstone) tuples
-#[allow(dead_code)]
 type KeyVersionsMap = HashMap<Key, Vec<(Vec<u8>, u64, bool)>>;
 
 /// Collects all entries from a history iterator
 /// Returns a vector of (key, value, timestamp, is_tombstone) tuples
-#[allow(dead_code)]
 fn collect_history_all(iter: &mut impl LSMIterator) -> crate::Result<Vec<(Key, Value, u64, bool)>> {
 	iter.seek_first()?;
 	let mut result = Vec::new();
@@ -192,7 +198,6 @@ fn collect_history_all(iter: &mut impl LSMIterator) -> crate::Result<Vec<(Key, V
 /// IMPORTANT: The iterator MUST be created with include_tombstones=true for this
 /// function to correctly handle deleted keys. If tombstones are not included,
 /// soft-deleted keys will incorrectly appear in the results.
-#[allow(dead_code)]
 fn point_in_time_from_history(
 	iter: &mut impl LSMIterator,
 	timestamp: u64,

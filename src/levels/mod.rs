@@ -34,6 +34,24 @@ pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64)
 	Ok(())
 }
 
+/// Everything `reclaim_owner` removed, kept so a failed publish can put it back.
+pub(crate) struct ReclaimedOwner {
+	owner: BatchOwner,
+	position: usize,
+	levels: Levels,
+	state_version: Option<u64>,
+	retained_floor: Option<u64>,
+	tables: Vec<Arc<Table>>,
+}
+
+impl ReclaimedOwner {
+	/// The tables this owner held, which become unreferenced once the removal
+	/// is durable.
+	pub(crate) fn tables(&self) -> &[Arc<Table>] {
+		&self.tables
+	}
+}
+
 /// Represents a set of changes to be applied to the manifest.
 ///
 /// A changeset mutates exactly one physical owner's component set. Flush and
@@ -139,7 +157,7 @@ pub(crate) const TABLE_ID_BLOCK: u64 = 1024;
 impl LevelManifest {
 	/// Fresh in-memory manifest for a store with no durable states yet.
 	/// Nothing is published here — the first flush publishes state+root.
-	#[cfg_attr(not(test), allow(dead_code))]
+	#[cfg(test)]
 	pub(crate) fn fresh(opts: Arc<Options>, authority: AuthorityStore) -> Self {
 		assert!(opts.level_count > 0, "level_count should be >= 1");
 		Self {
@@ -321,23 +339,54 @@ impl LevelManifest {
 	/// reachability rule `cleanup_orphaned_sst_files` applies at open, run
 	/// without waiting for a restart. The state lineage on disk is left alone —
 	/// metadata pruning caps it, and nothing loads a deleted branch's state.
-	pub(crate) fn reclaim_owner(&mut self, owner: BatchOwner) -> Vec<Arc<Table>> {
-		let Some(position) = self.levels_by_owner.iter().position(|(set, _)| *set == owner) else {
-			return Vec::new();
-		};
+	pub(crate) fn reclaim_owner(&mut self, owner: BatchOwner) -> Option<ReclaimedOwner> {
+		let position = self.levels_by_owner.iter().position(|(set, _)| *set == owner)?;
 		let (_, levels) = self.levels_by_owner.remove(position);
-		self.state_versions.remove(&owner);
-		self.retained_floors.remove(&owner);
-		let mut reclaimed = Vec::new();
+		let state_version = self.state_versions.remove(&owner);
+		let retained_floor = self.retained_floors.remove(&owner);
+		let mut tables = Vec::new();
 		for level in levels.get_levels() {
 			for table in &level.tables {
 				// A table hidden by an in-flight compaction is still this
 				// owner's and still unreferenced once the owner is gone; the
 				// compaction's own output is refused by the liveness guard.
-				reclaimed.push(Arc::clone(table));
+				tables.push(Arc::clone(table));
 			}
 		}
-		reclaimed
+		Some(ReclaimedOwner {
+			owner,
+			position,
+			levels,
+			state_version,
+			retained_floor,
+			tables,
+		})
+	}
+
+	/// Puts back what [`LevelManifest::reclaim_owner`] took.
+	///
+	/// The removal has to happen before the root is published — the root's
+	/// contents are derived from `state_versions`, so it cannot describe an
+	/// owner's absence until the owner is absent. That ordering means a failed
+	/// publish leaves memory ahead of disk, and this is what closes the gap.
+	/// Every other publish path in this engine rolls back the same way.
+	pub(crate) fn restore_owner(&mut self, reclaimed: ReclaimedOwner) {
+		let ReclaimedOwner {
+			owner,
+			position,
+			levels,
+			state_version,
+			retained_floor,
+			..
+		} = reclaimed;
+		let position = position.min(self.levels_by_owner.len());
+		self.levels_by_owner.insert(position, (owner, levels));
+		if let Some(version) = state_version {
+			self.state_versions.insert(owner, version);
+		}
+		if let Some(floor) = retained_floor {
+			self.retained_floors.insert(owner, floor);
+		}
 	}
 
 	/// Lowest sequence at which a view of `owner` is still complete. Zero means
@@ -637,6 +686,7 @@ impl LevelManifest {
 	/// compaction ordering), the stale root hint is healed by forward
 	/// probing, and the next successful publish supersedes it.
 	pub(crate) fn persist_owner_update(&mut self, owner: BatchOwner) -> Result<()> {
+		failpoint!(crate::failpoints::OWNER_STATE_PUBLISH);
 		let next_state = self.state_versions.get(&owner).copied().unwrap_or(0) + 1;
 		let retained_floor_seq = self.retained_floor(owner);
 		let levels: Vec<Vec<u64>> = self
@@ -665,6 +715,7 @@ impl LevelManifest {
 	/// Publishes a root version alone (floor-only transitions, e.g. the
 	/// shutdown replay-floor advance).
 	pub(crate) fn persist_root(&mut self) -> Result<()> {
+		failpoint!(crate::failpoints::ROOT_PUBLISH);
 		let next_root = self.root_version + 1;
 		let allocated = self.next_table_id.load(std::sync::atomic::Ordering::SeqCst);
 		let watermark = (allocated / TABLE_ID_BLOCK + 1) * TABLE_ID_BLOCK;

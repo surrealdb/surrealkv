@@ -122,6 +122,63 @@ model, so they die with the model:
 `single_branch_memory_spine_matches_logical_model_after_each_operation`,
 `reference_model_executes_branch_and_temporal_script`.
 
+## The three-role storage seam (deleted in V1)
+
+`src/storage/` — `ObjectStore` / `CommitStore` / `Platform` plus the memory, local, sim and native
+implementations. 7 files, 2,591 lines, 21 tests.
+
+**Why:** it had **zero engine callers**. Its only references were `mod storage;` in `src/lib.rs`
+and two architecture-guard tests that read the files as *text* — guards that pinned dead code in
+place rather than protecting anything. The module carried `#![allow(dead_code)]` at its root plus
+three `#[allow(unused_imports)]` markers whose comments promised a "P3 runtime cutover" that never
+happened.
+
+**And it could not simply have been wired up.** `ObjectStore` was `async fn` throughout, while all
+seventeen engine call sites that would use it hold a `std::sync` guard across the would-be `await`
+(nine `catalog_publish.lock()`, eight `level_manifest.write()`). A `std` guard may not be held
+across an await, so the seam was incompatible **by calling convention**, not merely unused. See the
+PF1 gate record in `P3_INTEGRATION_PROGRESS.md`.
+
+**Recovery:** commit `5d8d769`.
+
+**What replaces it:** nothing, in `v2`. The branch that takes on async IO and object storage
+designs its seam against the engine's real call sites. `ASYNC_OBJECT_STORE_HANDOVER.md` — written
+in slice V0, deliberately *before* this deletion — records the decision, what in the deleted code
+was worth keeping as an idea (`PutOutcome`'s idempotency semantics, `Bindings::validate`'s
+refuse-don't-degrade posture, the `FaultPoint` before/after taxonomy), what was not, the measured
+scope of the port, and the invariants it must not break.
+
+**Guard:** `src/test/architecture_guard_tests.rs` —
+`removed_storage_role_seam_remains_absent` asserts the directory and the `mod storage;` declaration
+stay gone, with a non-vacuity check that it parsed the real crate root.
+
+### Taken with it
+
+`src/api.rs` lost `MonotonicTime`, `DurabilityClass`, `OperationId`, `SessionId` and
+`AuthorityFence` — vocabulary that existed only for this seam. `AuthorityFence` was additionally
+re-exported from `src/lib.rs` despite nothing in the crate using it.
+
+## Orphans removed in the same slice (V1)
+
+Each had zero callers. Listed because "it might be useful later" is how the 2,591 lines above
+accumulated.
+
+| Removed | Where | Note |
+|---|---|---|
+| `CoreInner::new` | `src/lsm.rs` | A pass-through wrapper over `new_impl`, which is what production and now tests call. |
+| `WriteStall::{should_stall, provider_counts, memtable_limit}` | `src/stall.rs` | Built for the per-branch stall exemption that was deferred and never returned. |
+| `PartitionedIndexIterator::key` | `src/sstable/index_block.rs` | |
+| `Reporter::old_log_record` + its impl + `report_old_log_record` | `src/wal/{reader,recovery}.rs` | The whole path was unreachable: nothing ever called the reporter method. |
+| `DefaultReporter`'s three counters | `src/wal/recovery.rs` | Nothing read them; recovery decides from its `Result`. The struct is now a logger. |
+| `Writer.compressed_buffer` | `src/wal/writer.rs` | WAL compression is unfinished. **Finishing it is a feature, not a dead-code sweep**, so the unread buffer went and the half-written encode stayed — the compression-type byte on the wire comes from `compression_type` and the format is unchanged. |
+| `SnapshotIterator.core` | `src/snapshot.rs` | |
+| `collect_history_all` / `KeyVersionsMap` / `point_in_time_from_history` markers | `src/test/mod.rs` | **Kept, markers removed** — all three are heavily used; the attributes were stale and had been hiding that. |
+
+**Guard:** `no_module_suppresses_dead_code_warnings` fails if any `allow(dead_code)` attribute
+returns to `src/`, with a written allowlist (currently one entry: `src/wal/mod.rs`, whose two
+fields are read under `#[cfg(unix)]` and genuinely unread on Windows). The guard asserts its own
+non-vacuity twice — that the walk reached the tree, and that the detector matches its own target.
+
 ## Destructive restore without a catalog
 
 Restore refuses a checkpoint that lacks the authority lineages. Local restore is a whole-database

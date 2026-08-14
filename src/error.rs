@@ -39,9 +39,6 @@ pub enum Error {
 	TransactionReadOnly,
 	TransactionWithoutSavepoint,
 	KeyNotFound,
-	WriteStall {
-		reason: WriteStallReason,
-	},
 	ArenaFull, // Memtable arena is full, need rotation
 	FileDescriptorNotFound,
 	TableIDCollision(u64),
@@ -100,6 +97,15 @@ pub enum Error {
 		reason: String,
 	},
 
+	/// A merge was made conditional on the target standing at a stated sequence,
+	/// and it does not. Nothing was written. Re-read the target and decide
+	/// again: what changed may or may not matter to this merge, and only the
+	/// caller knows which.
+	UnexpectedHead {
+		expected: Option<u64>,
+		actual: Option<u64>,
+	},
+
 	/// A fork or a merge pinned a retention anchor while a compaction of that
 	/// owner was already merging, so the output may be missing what the new
 	/// anchor promises. It is discarded unpublished; the next cycle re-picks the
@@ -148,7 +154,6 @@ impl fmt::Display for Error {
             Self::TransactionReadOnly => write!(f, "Transaction is read-only"),
             Self::TransactionWithoutSavepoint => write!(f, "Transaction has no savepoint to rollback to"),
             Self::KeyNotFound => write!(f, "Key not found"),
-            Self::WriteStall { reason } => write!(f, "Write stall: {:?}", reason),
             Self::ArenaFull => write!(f, "Memtable arena is full"),
             Self::FileDescriptorNotFound => write!(f, "File descriptor not found"),
 			Self::TableIDCollision(id) => write!(f, "CRITICAL ERROR: Table ID collision detected. New table ID {id} conflicts with a table ID in the merge list."),
@@ -182,6 +187,10 @@ impl fmt::Display for Error {
                 "Merge of {estimated_bytes} bytes exceeds the {budget_bytes}-byte batch budget"
             ),
             Self::BranchesUnrelated { reason } => write!(f, "Branches cannot be merged: {reason}"),
+            Self::UnexpectedHead { expected, actual } => write!(
+                f,
+                "Branch head is {actual:?}, not the expected {expected:?}; nothing was written"
+            ),
             Self::ForkFenceTimeout => write!(
                 f,
                 "Fork fence timed out waiting for in-flight commits to drain"

@@ -182,7 +182,7 @@ impl BranchRuntimeRegistry {
 		self.runtimes.read().map(|map| map.values().cloned().collect()).unwrap_or_default()
 	}
 
-	#[cfg_attr(not(test), allow(dead_code))]
+	#[cfg(test)]
 	pub(crate) fn len(&self) -> usize {
 		self.runtimes.read().map(|map| map.len()).unwrap_or(0)
 	}

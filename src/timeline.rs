@@ -87,7 +87,6 @@ impl Timeline {
 	/// Exact-or-abstain resolution: the highest sequence whose commit
 	/// timestamp is at or below `timestamp`. Production caller lands with
 	/// FK4's `AtTimestamp` fork selector.
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn resolve(&self, timestamp: u64) -> Result<u64> {
 		let posts = self.fenceposts.lock().unwrap();
 		let Some(&(floor_ts, _)) = posts.front() else {

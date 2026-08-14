@@ -180,7 +180,7 @@ pub struct TableMetadata {
 }
 
 impl TableMetadata {
-	#[cfg_attr(not(test), allow(dead_code))]
+	#[cfg(test)]
 	pub(crate) fn new() -> Self {
 		Self::new_owned(BatchOwner::DEFAULT)
 	}

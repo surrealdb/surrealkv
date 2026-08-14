@@ -835,6 +835,434 @@ async fn a_merge_past_the_chunk_budget_completes_in_chunks() {
 	assert_eq!(again.chunks, 0);
 }
 
+// ===== V2b: selected apply, and compensating restore =====
+
+/// A scoped merge carries only the keys in its range, and leaves the rest to be
+/// merged later.
+#[test(tokio::test)]
+async fn a_scoped_merge_carries_only_its_range() {
+	let (store, _temp) = create_store();
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"anchor", b"base").unwrap();
+	txn.commit().await.unwrap();
+	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
+	let main = store.branch("main").unwrap();
+
+	let mut txn = child.begin().unwrap();
+	for key in ["a/1", "a/2", "b/1", "c/1"] {
+		txn.set(key.as_bytes(), b"by-source").unwrap();
+	}
+	txn.commit().await.unwrap();
+
+	let outcome = child
+		.merge_range(
+			&main,
+			MergeStrategy::Strict,
+			std::ops::Bound::Included(b"a/".to_vec()),
+			std::ops::Bound::Excluded(b"b/".to_vec()),
+		)
+		.await
+		.unwrap();
+	assert_eq!(outcome.applied, 2, "only the a/ keys");
+
+	let txn = store.begin().unwrap();
+	assert_eq!(txn.get(b"a/1").unwrap(), Some(b"by-source".to_vec()));
+	assert_eq!(txn.get(b"a/2").unwrap(), Some(b"by-source".to_vec()));
+	assert_eq!(txn.get(b"b/1").unwrap(), None, "outside the range");
+	assert_eq!(txn.get(b"c/1").unwrap(), None, "outside the range");
+}
+
+/// The reason a scoped merge records no edge: a later full merge must still
+/// carry the keys the scoped one left behind.
+///
+/// If a scoped merge recorded an edge, `effective_base` would advance past
+/// everything the source wrote up to that sequence — including `b/1` and `c/1`
+/// — and they would never be offered again. This is the test that catches that,
+/// and the keys it checks for are the ones that would vanish.
+#[test(tokio::test)]
+async fn a_scoped_merge_does_not_claim_the_source_is_fully_merged() {
+	let (store, _temp) = create_store();
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"anchor", b"base").unwrap();
+	txn.commit().await.unwrap();
+	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
+	let main = store.branch("main").unwrap();
+
+	let mut txn = child.begin().unwrap();
+	for key in ["a/1", "b/1", "c/1"] {
+		txn.set(key.as_bytes(), b"by-source").unwrap();
+	}
+	txn.commit().await.unwrap();
+
+	child
+		.merge_range(
+			&main,
+			MergeStrategy::Strict,
+			std::ops::Bound::Included(b"a/".to_vec()),
+			std::ops::Bound::Excluded(b"b/".to_vec()),
+		)
+		.await
+		.unwrap();
+
+	// The full merge that follows must still carry everything the scoped one
+	// skipped, and must recognise what it already applied.
+	let outcome = child.merge_into(&main, MergeStrategy::Strict).await.unwrap();
+	assert_eq!(outcome.applied, 2, "b/1 and c/1 were never merged and must be offered");
+	assert_eq!(outcome.converged, 1, "a/1 is already there, so it converges rather than rewriting");
+
+	let txn = store.begin().unwrap();
+	for key in ["a/1", "b/1", "c/1"] {
+		assert_eq!(
+			txn.get(key.as_bytes()).unwrap(),
+			Some(b"by-source".to_vec()),
+			"{key} did not survive scoped-then-full merging"
+		);
+	}
+}
+
+/// Reverting restores what the branch inherited, as new writes. Keys it created
+/// since the fork are removed, because it inherited nothing for those.
+#[test(tokio::test)]
+async fn revert_restores_the_inherited_value_and_removes_what_was_created() {
+	let (store, _temp) = create_store();
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k/kept", b"inherited").unwrap();
+	txn.set(b"k/changed", b"inherited").unwrap();
+	txn.set(b"k/deleted", b"inherited").unwrap();
+	txn.set(b"outside", b"inherited").unwrap();
+	txn.commit().await.unwrap();
+
+	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
+	let mut txn = child.begin().unwrap();
+	txn.set(b"k/changed", b"by-child").unwrap();
+	txn.delete(b"k/deleted").unwrap();
+	txn.set(b"k/created", b"by-child").unwrap();
+	txn.set(b"outside", b"by-child").unwrap();
+	txn.commit().await.unwrap();
+
+	let restored = child
+		.revert_range(
+			std::ops::Bound::Included(b"k/".to_vec()),
+			std::ops::Bound::Excluded(b"l".to_vec()),
+		)
+		.await
+		.unwrap();
+	assert_eq!(restored, 3, "changed, deleted and created");
+
+	let txn = child.begin().unwrap();
+	assert_eq!(txn.get(b"k/changed").unwrap(), Some(b"inherited".to_vec()), "restored");
+	assert_eq!(txn.get(b"k/deleted").unwrap(), Some(b"inherited".to_vec()), "un-deleted");
+	assert_eq!(txn.get(b"k/created").unwrap(), None, "nothing was inherited for it");
+	assert_eq!(txn.get(b"k/kept").unwrap(), Some(b"inherited".to_vec()), "never touched");
+	assert_eq!(
+		txn.get(b"outside").unwrap(),
+		Some(b"by-child".to_vec()),
+		"outside the range, so untouched"
+	);
+	drop(txn);
+
+	let txn = store.begin().unwrap();
+	assert_eq!(txn.get(b"k/changed").unwrap(), Some(b"inherited".to_vec()), "the parent is intact");
+	drop(txn);
+
+	// History is not rewritten, and the diff is where that shows. A revert is a
+	// compensating WRITE, not an erasure, so the branch still reports four
+	// changed keys — it has simply written values equal to what it inherited.
+	// Anything that made this number shrink would be rewriting history.
+	let changes = child.diff().unwrap().collect().unwrap();
+	assert_eq!(changes.len(), 4, "a revert adds writes; it does not remove them");
+	let reverted = changes.iter().find(|entry| entry.key == b"k/changed").unwrap();
+	assert_eq!(
+		reverted.op,
+		crate::DiffOp::Set(b"inherited".to_vec()),
+		"the branch's newest write to it restores the inherited value"
+	);
+	let recreated = changes.iter().find(|entry| entry.key == b"k/created").unwrap();
+	assert!(recreated.op.is_delete(), "the key it invented is now tombstoned, not absent");
+}
+
+/// Reverting twice changes nothing the second time, and a branch already at its
+/// inherited state has nothing to compensate for.
+#[test(tokio::test)]
+async fn revert_is_idempotent_and_writes_nothing_when_there_is_nothing_to_undo() {
+	let (store, _temp) = create_store();
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k", b"inherited").unwrap();
+	txn.commit().await.unwrap();
+	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
+
+	assert_eq!(
+		child.revert_range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded).await.unwrap(),
+		0,
+		"a branch that changed nothing has nothing to restore"
+	);
+
+	let mut txn = child.begin().unwrap();
+	txn.set(b"k", b"by-child").unwrap();
+	txn.commit().await.unwrap();
+
+	assert_eq!(
+		child.revert_range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded).await.unwrap(),
+		1
+	);
+	assert_eq!(
+		child.revert_range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded).await.unwrap(),
+		0,
+		"the second revert has nothing left to compensate for"
+	);
+	let txn = child.begin().unwrap();
+	assert_eq!(txn.get(b"k").unwrap(), Some(b"inherited".to_vec()));
+}
+
+/// A branch with no lineage inherited nothing, so there is no state to restore
+/// to and the request is refused rather than guessed at.
+#[test(tokio::test)]
+async fn revert_refuses_a_branch_with_no_fork_lineage() {
+	let (store, _temp) = create_store();
+	let plain = store.create_branch("standalone").unwrap();
+	let mut txn = plain.begin().unwrap();
+	txn.set(b"k", b"v").unwrap();
+	txn.commit().await.unwrap();
+
+	let error = plain
+		.revert_range(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+		.await
+		.expect_err("a branch with nothing to inherit cannot be reverted");
+	assert!(matches!(error, Error::InvalidArgument(_)), "got {error}");
+}
+
+// ===== V2a: the strategy set, and the one place it turns into an action =====
+
+/// Builds a source and target that conflict on exactly one key, and agree
+/// everywhere else. Returns (source, target) plus the key that conflicts.
+async fn one_conflict_fixture(store: &Tree) -> (crate::BranchHandle, crate::BranchHandle) {
+	let mut txn = store.begin().unwrap();
+	txn.set(b"clean", b"base").unwrap();
+	txn.set(b"fought-over", b"base").unwrap();
+	txn.commit().await.unwrap();
+
+	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
+	let main = store.branch("main").unwrap();
+
+	let mut txn = child.begin().unwrap();
+	txn.set(b"clean", b"by-source").unwrap();
+	txn.set(b"fought-over", b"by-source").unwrap();
+	txn.commit().await.unwrap();
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"fought-over", b"by-target").unwrap();
+	txn.commit().await.unwrap();
+
+	(child, main)
+}
+
+/// `TargetWins` keeps the target's value on a conflict and still applies
+/// everything that does not conflict. The counters distinguish the two.
+#[test(tokio::test)]
+async fn target_wins_keeps_the_target_and_still_applies_the_rest() {
+	let (store, _temp) = create_store();
+	let (child, main) = one_conflict_fixture(&store).await;
+
+	let outcome = child.merge_into(&main, MergeStrategy::TargetWins).await.unwrap();
+	assert_eq!(outcome.applied, 1, "the clean key");
+	assert_eq!(outcome.resolved, 1, "the conflict was settled, by keeping the target");
+
+	let txn = store.begin().unwrap();
+	assert_eq!(txn.get(b"clean").unwrap(), Some(b"by-source".to_vec()));
+	assert_eq!(
+		txn.get(b"fought-over").unwrap(),
+		Some(b"by-target".to_vec()),
+		"TargetWins must not write the source's value"
+	);
+}
+
+/// The mirror, so that a strategy silently doing the opposite of its name
+/// cannot pass. Same fixture, same conflict, opposite outcome on that key —
+/// and identical on the key that never conflicted.
+#[test(tokio::test)]
+async fn source_wins_is_the_exact_mirror_of_target_wins() {
+	let (store, _temp) = create_store();
+	let (child, main) = one_conflict_fixture(&store).await;
+
+	let outcome = child.merge_into(&main, MergeStrategy::SourceWins).await.unwrap();
+	assert_eq!(outcome.applied, 2, "the clean key and the resolved conflict");
+	assert_eq!(outcome.resolved, 1);
+
+	let txn = store.begin().unwrap();
+	assert_eq!(txn.get(b"clean").unwrap(), Some(b"by-source".to_vec()));
+	assert_eq!(txn.get(b"fought-over").unwrap(), Some(b"by-source".to_vec()));
+}
+
+/// A resolver decides per key, and can answer with something neither side
+/// proposed. It sees the base, source and target values, which is what makes a
+/// real decision possible.
+#[test(tokio::test)]
+async fn a_resolver_decides_each_conflict_and_may_invent_a_value() {
+	let (store, _temp) = create_store();
+	let (child, main) = one_conflict_fixture(&store).await;
+
+	let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+	let recorder = std::sync::Arc::clone(&seen);
+	let resolver = move |conflict: &crate::Conflict| {
+		recorder.lock().unwrap().push((
+			conflict.key.clone(),
+			conflict.base.clone(),
+			conflict.source.clone(),
+			conflict.target.clone(),
+		));
+		crate::ConflictChoice::Value(Some(b"negotiated".to_vec()))
+	};
+
+	let outcome = child
+		.merge_into(&main, MergeStrategy::Resolve(std::sync::Arc::new(resolver)))
+		.await
+		.unwrap();
+	assert_eq!(outcome.applied, 2);
+	assert_eq!(outcome.resolved, 1);
+
+	let txn = store.begin().unwrap();
+	assert_eq!(txn.get(b"fought-over").unwrap(), Some(b"negotiated".to_vec()));
+	assert_eq!(txn.get(b"clean").unwrap(), Some(b"by-source".to_vec()), "no resolver for this one");
+
+	// The resolver was handed all three sides, and only for the key that
+	// actually conflicted.
+	let seen = seen.lock().unwrap();
+	assert_eq!(seen.len(), 2, "asked once per pass, for one key");
+	let (key, base, source, target) = &seen[0];
+	assert_eq!(key, b"fought-over");
+	assert_eq!(base.as_deref(), Some(b"base".as_slice()));
+	assert_eq!(source.as_deref(), Some(b"by-source".as_slice()));
+	assert_eq!(target.as_deref(), Some(b"by-target".as_slice()));
+}
+
+/// A resolver can delete, and can refuse the whole merge.
+#[test(tokio::test)]
+async fn a_resolver_can_delete_a_key_or_refuse_the_merge() {
+	let (store, _temp) = create_store();
+	let (child, main) = one_conflict_fixture(&store).await;
+
+	let refuse = |_: &crate::Conflict| crate::ConflictChoice::Refuse;
+	let error = child
+		.merge_into(&main, MergeStrategy::Resolve(std::sync::Arc::new(refuse)))
+		.await
+		.expect_err("a refusing resolver must refuse the merge");
+	assert!(
+		matches!(
+			error,
+			Error::MergeConflicts {
+				count: 1
+			}
+		),
+		"got {error}"
+	);
+	let txn = store.begin().unwrap();
+	assert_eq!(
+		txn.get(b"clean").unwrap(),
+		Some(b"base".to_vec()),
+		"a refusal writes nothing at all, not even the keys that did not conflict"
+	);
+	drop(txn);
+
+	let delete = |_: &crate::Conflict| crate::ConflictChoice::Value(None);
+	let outcome =
+		child.merge_into(&main, MergeStrategy::Resolve(std::sync::Arc::new(delete))).await.unwrap();
+	assert_eq!(outcome.resolved, 1);
+	let txn = store.begin().unwrap();
+	assert_eq!(txn.get(b"fought-over").unwrap(), None, "the resolver deleted it");
+	assert_eq!(txn.get(b"clean").unwrap(), Some(b"by-source".to_vec()));
+}
+
+/// `Source` and `Target` choices are shorthands for the two built-in
+/// strategies, per key.
+#[test(tokio::test)]
+async fn a_resolver_can_choose_either_side_per_key() {
+	let (store, _temp) = create_store();
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"a", b"base").unwrap();
+	txn.set(b"b", b"base").unwrap();
+	txn.commit().await.unwrap();
+	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
+	let main = store.branch("main").unwrap();
+
+	let mut txn = child.begin().unwrap();
+	txn.set(b"a", b"by-source").unwrap();
+	txn.set(b"b", b"by-source").unwrap();
+	txn.commit().await.unwrap();
+	let mut txn = store.begin().unwrap();
+	txn.set(b"a", b"by-target").unwrap();
+	txn.set(b"b", b"by-target").unwrap();
+	txn.commit().await.unwrap();
+
+	let per_key = |conflict: &crate::Conflict| {
+		if conflict.key == b"a" {
+			crate::ConflictChoice::Source
+		} else {
+			crate::ConflictChoice::Target
+		}
+	};
+	let outcome = child
+		.merge_into(&main, MergeStrategy::Resolve(std::sync::Arc::new(per_key)))
+		.await
+		.unwrap();
+	assert_eq!(outcome.resolved, 2, "both conflicts settled");
+	assert_eq!(outcome.applied, 1, "only the one that chose Source is written");
+
+	let txn = store.begin().unwrap();
+	assert_eq!(txn.get(b"a").unwrap(), Some(b"by-source".to_vec()));
+	assert_eq!(txn.get(b"b").unwrap(), Some(b"by-target".to_vec()));
+}
+
+/// A merge can be made conditional on the target not having moved. The oracle
+/// only protects the keys the merge writes; this protects the whole branch.
+#[test(tokio::test)]
+async fn an_expected_head_refuses_a_target_that_moved_anywhere() {
+	let (store, _temp) = create_store();
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"anchor", b"base").unwrap();
+	txn.commit().await.unwrap();
+	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
+	let main = store.branch("main").unwrap();
+	let mut txn = child.begin().unwrap();
+	txn.set(b"from-child", b"v").unwrap();
+	txn.commit().await.unwrap();
+
+	let head = main.info().unwrap().last_write_seq;
+
+	// A write on a key this merge never touches still moves the branch.
+	let mut txn = store.begin().unwrap();
+	txn.set(b"unrelated", b"v").unwrap();
+	txn.commit().await.unwrap();
+
+	let error = child
+		.merge_into_expecting(&main, MergeStrategy::Strict, head)
+		.await
+		.expect_err("the target moved, so the merge must be refused");
+	let Error::UnexpectedHead {
+		expected,
+		actual,
+	} = error
+	else {
+		panic!("expected UnexpectedHead, got {error}");
+	};
+	assert_eq!(expected, head);
+	assert_ne!(actual, head);
+
+	let txn = store.begin().unwrap();
+	assert_eq!(txn.get(b"from-child").unwrap(), None, "nothing may have been written");
+	drop(txn);
+
+	// Control: with the current head it goes through, so the refusal above was
+	// the condition and not something else.
+	let head_now = main.info().unwrap().last_write_seq;
+	let outcome = child.merge_into_expecting(&main, MergeStrategy::Strict, head_now).await.unwrap();
+	assert_eq!(outcome.applied, 1);
+}
+
 // ===== PD3c: the two probes, and their equivalence =====
 
 /// Builds a store where every row of the decision table is represented, and
@@ -885,10 +1313,8 @@ async fn the_point_and_scan_probes_agree_on_every_verdict() {
 	let (child, main) = decision_table_fixture(&store).await;
 
 	let session = child.merge_session(&main).unwrap();
-	let by_point =
-		crate::merge::plan(session.changes().unwrap(), &mut session.point_probe()).unwrap();
-	let by_scan =
-		crate::merge::plan(session.changes().unwrap(), &mut session.scan_probe().unwrap()).unwrap();
+	let by_point = session.report_with(&mut session.point_probe()).unwrap();
+	let by_scan = session.report_with(&mut session.scan_probe().unwrap()).unwrap();
 
 	// The fixture has to actually exercise every branch, or agreement is cheap.
 	assert_eq!(applied(&by_point).len(), 2, "clean and reverted");
@@ -1001,7 +1427,7 @@ async fn interrupted_chunked_merge(path: std::path::PathBuf) -> (Tree, Vec<u8>) 
 
 	let main = store.branch("main").unwrap();
 	let session = child.merge_session(&main).unwrap();
-	let preflight = session.preflight(MergeStrategy::Strict).unwrap();
+	let preflight = session.preflight(&MergeStrategy::Strict).unwrap();
 
 	// A key late in the key order, so the chunks before it have committed by the
 	// time its own chunk is refused.
@@ -1010,7 +1436,7 @@ async fn interrupted_chunked_merge(path: std::path::PathBuf) -> (Tree, Vec<u8>) 
 	txn.commit().await.unwrap();
 
 	let error = session
-		.apply(MergeStrategy::Strict, &preflight)
+		.apply(&MergeStrategy::Strict, &preflight)
 		.await
 		.expect_err("the merge must break off");
 	assert!(matches!(error, Error::TransactionWriteConflict), "got {error}");
@@ -1143,7 +1569,7 @@ async fn a_target_write_between_planning_and_writing_conflicts() {
 
 	// Plan: the target is untouched, so this is clean.
 	let session = child.merge_session(&main).unwrap();
-	let preflight = session.preflight(MergeStrategy::Strict).unwrap();
+	let preflight = session.preflight(&MergeStrategy::Strict).unwrap();
 	assert_eq!(
 		preflight.conflicts, 0,
 		"the plan must be clean, or the window is not what is tested"
@@ -1156,7 +1582,7 @@ async fn a_target_write_between_planning_and_writing_conflicts() {
 	txn.commit().await.unwrap();
 
 	let error = session
-		.apply(MergeStrategy::Strict, &preflight)
+		.apply(&MergeStrategy::Strict, &preflight)
 		.await
 		.expect_err("a write inside the planning window must be a conflict, not a casualty");
 	assert!(matches!(error, Error::TransactionWriteConflict), "got {error}");

@@ -30,6 +30,10 @@ use crate::snapshot::{Snapshot, VersionMeta};
 use crate::transaction::{Transaction, TransactionOptions};
 use crate::{DiffEntry, Value};
 
+/// A half-open key range, as the caller gave it. Owned because a merge session
+/// outlives the call that built it.
+pub(crate) type KeyScope = (std::ops::Bound<Vec<u8>>, std::ops::Bound<Vec<u8>>);
+
 /// How a conflicting key differs. Reported so a caller can decide without
 /// re-reading the store.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,8 +59,51 @@ pub struct Conflict {
 	pub target: Option<Value>,
 }
 
+/// What to do with one conflicting key, decided by the caller.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConflictChoice {
+	/// Take the source's value, discarding the target's change.
+	Source,
+	/// Keep the target's value, discarding the source's change.
+	Target,
+	/// Write something else entirely. `None` deletes the key.
+	Value(Option<Value>),
+	/// Abandon the whole merge. Nothing further is written.
+	Refuse,
+}
+
+/// Decides conflicts one key at a time.
+///
+/// Implemented for any `Fn(&Conflict) -> ConflictChoice`, so a closure is a
+/// resolver.
+///
+/// **It must be deterministic.** A merge plans in one pass and writes in a
+/// second, and both ask the resolver about the same keys; a resolver that
+/// answers differently the second time makes the plan a lie about the write.
+/// Answering from the `Conflict` alone — which carries the base, source and
+/// target values — is enough for every decision worth making, and is
+/// deterministic by construction.
+pub trait ConflictResolver: Send + Sync {
+	fn resolve(&self, conflict: &Conflict) -> ConflictChoice;
+}
+
+impl<F> ConflictResolver for F
+where
+	F: Fn(&Conflict) -> ConflictChoice + Send + Sync,
+{
+	fn resolve(&self, conflict: &Conflict) -> ConflictChoice {
+		self(conflict)
+	}
+}
+
 /// How a merge treats keys both sides changed.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+///
+/// Not `Copy` or `PartialEq`: `Resolve` carries behaviour, and a strategy that
+/// carries behaviour cannot honestly be compared for equality. That is deliberate
+/// — every decision point matches exhaustively through
+/// [`MergeStrategy::decide`] instead, so a new variant cannot be silently
+/// mishandled.
+#[derive(Clone, Default)]
 pub enum MergeStrategy {
 	/// Refuse the whole merge if anything conflicts, listing every conflict
 	/// first. Nothing is written. The default, because the alternative to
@@ -66,6 +113,58 @@ pub enum MergeStrategy {
 	/// Apply the source's value to every conflicting key. Chosen deliberately,
 	/// per merge — it discards the target's change on those keys.
 	SourceWins,
+	/// Keep the target's value on every conflicting key, discarding the
+	/// source's change there. The merge still applies everything that does not
+	/// conflict.
+	TargetWins,
+	/// Ask, per conflict.
+	Resolve(std::sync::Arc<dyn ConflictResolver>),
+}
+
+impl std::fmt::Debug for MergeStrategy {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Strict => f.write_str("Strict"),
+			Self::SourceWins => f.write_str("SourceWins"),
+			Self::TargetWins => f.write_str("TargetWins"),
+			// A resolver is a function; there is nothing useful to print.
+			Self::Resolve(_) => f.write_str("Resolve(..)"),
+		}
+	}
+}
+
+/// What the merge does about one conflict once the strategy has spoken.
+pub(crate) enum ConflictOutcome {
+	/// Abandon the merge.
+	Refuse,
+	/// Write this value to the target. `None` deletes.
+	Write(Option<Value>),
+	/// Leave the target as it is.
+	Skip,
+}
+
+impl MergeStrategy {
+	/// The single place a strategy turns into an action.
+	///
+	/// Every decision point in the merge routes through here, and it matches
+	/// exhaustively, so adding a variant is a compile error at exactly one
+	/// site rather than a silent behaviour change at four. It used to be four
+	/// `==` comparisons against `Strict` and `SourceWins`, under which a new
+	/// `TargetWins` would have applied the SOURCE's value — the precise
+	/// opposite of its name.
+	pub(crate) fn decide(&self, conflict: &Conflict) -> ConflictOutcome {
+		match self {
+			Self::Strict => ConflictOutcome::Refuse,
+			Self::SourceWins => ConflictOutcome::Write(conflict.source.clone()),
+			Self::TargetWins => ConflictOutcome::Skip,
+			Self::Resolve(resolver) => match resolver.resolve(conflict) {
+				ConflictChoice::Source => ConflictOutcome::Write(conflict.source.clone()),
+				ConflictChoice::Target => ConflictOutcome::Skip,
+				ConflictChoice::Value(value) => ConflictOutcome::Write(value),
+				ConflictChoice::Refuse => ConflictOutcome::Refuse,
+			},
+		}
+	}
 }
 
 /// What a merge did.
@@ -75,8 +174,9 @@ pub struct MergeOutcome {
 	pub applied: usize,
 	/// Keys skipped because the target already had the source's value.
 	pub converged: usize,
-	/// Conflicting keys resolved by the strategy. Zero under `Strict`, which
-	/// refuses instead.
+	/// Conflicting keys the strategy settled — written under `SourceWins` or a
+	/// resolver, skipped under `TargetWins`. Zero under `Strict`, which refuses
+	/// instead of settling anything.
 	pub resolved: usize,
 	/// How many transactions the merge took. One means it landed atomically;
 	/// more means each chunk is durable on its own and a failure part-way would
@@ -303,16 +403,13 @@ fn classify(entry: &DiffEntry, probe: &mut dyn TargetProbe) -> Result<Decision> 
 	}))
 }
 
-enum Decision {
-	Apply,
-	Converged,
-	Conflict(Conflict),
-}
-
-/// Plans a merge: classifies every source change against the target.
+/// Accumulates a full report from a stream of source changes.
 ///
-/// Reads only. The caller decides what to do with the report.
-pub(crate) fn plan(
+/// One accumulation path, shared by the session's report and by the unit tests
+/// that drive the decision table against a fake probe — the latter cannot build
+/// a session, and duplicating the loop for them would be duplicating the thing
+/// most worth keeping identical.
+fn classify_all(
 	changes: impl Iterator<Item = Result<DiffEntry>>,
 	probe: &mut dyn TargetProbe,
 ) -> Result<MergeReport> {
@@ -326,6 +423,12 @@ pub(crate) fn plan(
 		}
 	}
 	Ok(report)
+}
+
+enum Decision {
+	Apply,
+	Converged,
+	Conflict(Conflict),
 }
 
 /// One merge, from planning to its last chunk.
@@ -359,6 +462,9 @@ pub(crate) struct MergeSession {
 	_watermark: crate::tracker::ActiveTxnGuard,
 	/// Bytes of key plus value one chunk may carry.
 	chunk_budget: u64,
+	/// When set, only these keys are merged. A scoped merge deliberately
+	/// records no promotion edge — see `BranchHandle::merge_range`.
+	scope: Option<KeyScope>,
 }
 
 /// What pass one found, and what pass two needs to know before it writes.
@@ -372,6 +478,13 @@ pub(crate) struct MergePreflight {
 	/// count; this may be shorter.
 	pub(crate) sample: Vec<Conflict>,
 	pub(crate) conflicts: usize,
+	/// Conflicts the strategy settled — written or deliberately skipped. Equal
+	/// to `conflicts` unless the strategy refused.
+	pub(crate) resolved: usize,
+	/// The strategy refused at least one conflict, so nothing may be written.
+	/// Computed here rather than inferred from the strategy at the call site,
+	/// which is how `Strict` used to be the only refusing strategy by accident.
+	pub(crate) refused: bool,
 	/// Total key + value bytes of everything that would be written.
 	pub(crate) bytes: u64,
 	/// The largest single entry, which is what decides whether the merge is
@@ -420,6 +533,7 @@ impl MergeSession {
 		Ok(Self {
 			core,
 			target,
+			scope: None,
 			diff: crate::BranchDiff::new(own, base.source_through),
 			target_changes: crate::BranchDiff::new(target_own, base.target_at),
 			at_base,
@@ -436,9 +550,28 @@ impl MergeSession {
 		self.start_seq
 	}
 
+	/// Restricts this merge to a key range.
+	pub(crate) fn scoped_to(
+		mut self,
+		lower: std::ops::Bound<Vec<u8>>,
+		upper: std::ops::Bound<Vec<u8>>,
+	) -> Self {
+		self.scope = Some((lower, upper));
+		self
+	}
+
+	/// Whether this merge covers only part of the source's changes, and so may
+	/// not claim the source is fully merged.
+	pub(crate) fn is_scoped(&self) -> bool {
+		self.scope.is_some()
+	}
+
 	/// The source's changes, in key order — what both passes classify.
 	pub(crate) fn changes(&self) -> Result<crate::DiffIter<'_>> {
-		self.diff.iter()
+		match &self.scope {
+			None => self.diff.iter(),
+			Some((lower, upper)) => self.diff.iter_range(bound_as_ref(lower), bound_as_ref(upper)),
+		}
 	}
 
 	pub(crate) fn point_probe(&self) -> PointProbe<'_> {
@@ -454,14 +587,15 @@ impl MergeSession {
 	/// Refuses before pass two ever runs when a single entry cannot fit in a
 	/// chunk — one key cannot be split across two batches, so that is the one
 	/// size problem chunking does not solve.
-	pub(crate) fn preflight(&self, strategy: MergeStrategy) -> Result<MergePreflight> {
+	pub(crate) fn preflight(&self, strategy: &MergeStrategy) -> Result<MergePreflight> {
 		// Pass one always points: it is the pass that discovers how big the
 		// merge is, so it cannot choose by size without begging the question.
 		let mut probe = PointProbe::new(&self.at_base, &self.now);
 		let mut preflight = MergePreflight::default();
 		for entry in self.changes()? {
 			let entry = entry?;
-			let size = (entry.key.len() + entry.op.value().map_or(0, |value| value.len())) as u64;
+			let mut size =
+				(entry.key.len() + entry.op.value().map_or(0, |value| value.len())) as u64;
 			match classify(&entry, &mut probe)? {
 				Decision::Apply => {}
 				Decision::Converged => {
@@ -470,13 +604,29 @@ impl MergeSession {
 				}
 				Decision::Conflict(conflict) => {
 					preflight.conflicts += 1;
+					let outcome = strategy.decide(&conflict);
 					if preflight.sample.len() < CONFLICT_REPORT_LIMIT {
 						preflight.sample.push(conflict);
 					}
-					if strategy == MergeStrategy::Strict {
-						// Nothing will be written, so measuring the rest is
-						// work for an answer no one receives.
-						continue;
+					match outcome {
+						ConflictOutcome::Refuse => {
+							// Nothing will be written, so measuring the rest is
+							// work for an answer no one receives. Keep counting
+							// conflicts: the refusal reports how many.
+							preflight.refused = true;
+							continue;
+						}
+						ConflictOutcome::Skip => {
+							preflight.resolved += 1;
+							continue;
+						}
+						ConflictOutcome::Write(value) => {
+							preflight.resolved += 1;
+							// The resolver may substitute a value of a different
+							// size than the source's.
+							size = (entry.key.len() + value.as_ref().map_or(0, |value| value.len()))
+								as u64;
+						}
 					}
 				}
 			}
@@ -493,6 +643,27 @@ impl MergeSession {
 		Ok(preflight)
 	}
 
+	/// The full classification, materialized — what a caller asked to *see*
+	/// rather than to apply.
+	///
+	/// Shares `classify` and the session's fixed snapshots with `preflight`, so
+	/// a preview cannot disagree with the merge it previews. It was previously a
+	/// separate free function reached through a separately-built probe, which
+	/// gave the two paths room to drift apart.
+	///
+	/// Materializes every entry, unlike `preflight`: listing them IS the point,
+	/// and a caller previewing a merge of millions of keys should stream the
+	/// diff instead.
+	pub(crate) fn report(&self) -> Result<MergeReport> {
+		self.report_with(&mut self.point_probe())
+	}
+
+	/// [`MergeSession::report`] against a stated probe, so the two probe modes
+	/// can be compared on one fixed view (plan A7's equivalence requirement).
+	pub(crate) fn report_with(&self, probe: &mut dyn TargetProbe) -> Result<MergeReport> {
+		classify_all(self.changes()?, probe)
+	}
+
 	/// Pass two: re-stream the same fixed view and write it, in as few chunks as
 	/// the budget allows.
 	///
@@ -502,7 +673,7 @@ impl MergeSession {
 	/// part-way leaves the earlier ones applied.
 	pub(crate) async fn apply(
 		&self,
-		strategy: MergeStrategy,
+		strategy: &MergeStrategy,
 		preflight: &MergePreflight,
 	) -> Result<(u64, usize)> {
 		let mut scan;
@@ -522,17 +693,21 @@ impl MergeSession {
 			let value = match classify(&entry, probe)? {
 				Decision::Apply => entry.op.value().cloned(),
 				Decision::Converged => continue,
-				// Under `Strict` this is unreachable: `preflight` refused the
-				// merge before pass two began. Under `SourceWins` the source's
-				// value is what resolves it.
-				Decision::Conflict(conflict) => {
-					if strategy == MergeStrategy::Strict {
+				Decision::Conflict(conflict) => match strategy.decide(&conflict) {
+					// Unreachable for the built-in strategies: `preflight`
+					// refused before pass two began. Reachable only through a
+					// resolver that answered differently the second time, which
+					// its contract forbids — so this is a refusal, not an
+					// assertion, and the merge stops with whatever chunks were
+					// already durable.
+					ConflictOutcome::Refuse => {
 						return Err(Error::MergeConflicts {
 							count: 1,
-						});
+						})
 					}
-					conflict.source
-				}
+					ConflictOutcome::Skip => continue,
+					ConflictOutcome::Write(value) => value,
+				},
 			};
 			let size = (entry.key.len() + value.as_ref().map_or(0, |value| value.len())) as u64;
 			if !chunk.is_empty() && chunk_bytes + size > self.chunk_budget {
@@ -564,6 +739,14 @@ impl MergeSession {
 			}
 		}
 		txn.commit().await
+	}
+}
+
+fn bound_as_ref(bound: &std::ops::Bound<Vec<u8>>) -> std::ops::Bound<&[u8]> {
+	match bound {
+		std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
+		std::ops::Bound::Included(key) => std::ops::Bound::Included(key.as_slice()),
+		std::ops::Bound::Excluded(key) => std::ops::Bound::Excluded(key.as_slice()),
 	}
 }
 
@@ -805,7 +988,7 @@ mod tests {
 			Ok(set("conflicted", "source", 21)),
 			Ok(set("converged", "agreed", 22)),
 		];
-		let report = plan(changes.into_iter(), &mut probe).unwrap();
+		let report = classify_all(changes.into_iter(), &mut probe).unwrap();
 		assert_eq!(report.applies.len(), 1);
 		assert_eq!(report.applies[0].key, b"clean".to_vec());
 		assert_eq!(report.conflicts.len(), 1);

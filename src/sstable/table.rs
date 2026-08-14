@@ -70,7 +70,6 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crc32fast::Hasher as Crc32;
 use integer_encoding::{FixedInt, FixedIntWriter};
@@ -353,7 +352,7 @@ pub(crate) struct TableWriter<W: Write> {
 }
 
 impl<W: Write> TableWriter<W> {
-	#[cfg_attr(not(test), allow(dead_code))]
+	#[cfg(test)]
 	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
 		Self::new_owned(writer, id, opts, target_level, BatchOwner::DEFAULT)
 	}
@@ -515,27 +514,10 @@ impl<W: Write> TableWriter<W> {
 
 	/// Finalizes the SSTable by writing all remaining blocks and the footer.
 	pub(crate) fn finish(mut self) -> Result<usize> {
-		// Set creation timestamp
-		self.meta.properties.created_at = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.map_err(|e| {
-				let err = Error::from(SSTableError::FailedToGetSystemTime {
-					source: e.to_string(),
-				});
-				log::error!("[TABLE_WRITER] {}", err);
-				err
-			})?
-			.as_nanos();
-
-		self.meta.properties.seqnos =
-			(self.meta.smallest_seq_num.unwrap_or(0), self.meta.largest_seq_num.unwrap_or(0));
-
-		// Flush last data block if it has entries
-		if self.data_block.as_ref().is_some_and(|db| db.entries() > 0) {
-			let key_past_last =
-				self.internal_cmp.successor(&self.data_block.as_ref().unwrap().last_key);
-			self.write_data_block(&key_past_last)?;
-		}
+		// Through the injected clock, not `SystemTime::now()`: this value ends up
+		// in durable table metadata, and a store whose clock is controlled (tests,
+		// deterministic replay) must not have an ambient one leak into its files.
+		self.meta.properties.created_at = self.opts.clock.now() as u128;
 
 		// Build meta index block
 		let mut meta_ix_block = BlockWriter::new(

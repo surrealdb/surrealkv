@@ -188,7 +188,6 @@ impl CommitQueue {
 		self.head_tail.fetch_add(1 << DEQUEUE_BITS, Ordering::Release);
 	}
 
-	#[cfg_attr(not(test), allow(dead_code))]
 	fn is_empty(&self) -> bool {
 		let (head, tail) = self.unpack(self.head_tail.load(Ordering::Acquire));
 		head == tail
@@ -304,7 +303,6 @@ impl CommitPipeline {
 	/// `visible_seq_num == log_seq_num - 1` would never return. An empty queue
 	/// means `visible_seq_num` is exactly the highest readable sequence, and the
 	/// gaps belong to sequences no row will ever carry.
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn is_drained(&self) -> bool {
 		self.pending.is_empty()
 	}
@@ -335,7 +333,16 @@ impl CommitPipeline {
 
 		// Check write stall BEFORE acquiring any locks.
 		// This ensures stalled writers wait here without blocking others.
-		self.write_stall.check(batch.owner).await?;
+		if let Some(stall) = self.write_stall.check(batch.owner).await? {
+			log::debug!(
+				"write stalled on {:?} for {:?}: {:?} reached {} against a limit of {}",
+				batch.owner,
+				stall.duration,
+				stall.reason,
+				stall.current_value,
+				stall.threshold
+			);
+		}
 
 		// Acquire permit for flow control
 		let _permit = self.commit_sem.acquire().await.map_err(|_| Error::PipelineStall)?;

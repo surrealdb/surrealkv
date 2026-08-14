@@ -560,13 +560,6 @@ impl<'a> IndexIterator<'a> {
 		self.partition_iter.as_ref().is_some_and(|iter| iter.is_valid())
 	}
 
-	/// Returns the current key (separator key from the index entry).
-	#[allow(dead_code)]
-	pub(crate) fn key(&self) -> &[u8] {
-		debug_assert!(self.valid());
-		self.partition_iter.as_ref().unwrap().key_bytes()
-	}
-
 	/// Returns the current value as a BlockHandle (data block handle).
 	///
 	/// ## Note

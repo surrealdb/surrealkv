@@ -1,3 +1,13 @@
+/// Fails at a named durable step when a test has armed it; expands to nothing
+/// otherwise, so a published build carries no registry, no lookup and no
+/// branch. See `crate::failpoints`.
+macro_rules! failpoint {
+	($name:expr) => {
+		#[cfg(test)]
+		crate::failpoints::check($name)?;
+	};
+}
+
 mod api;
 mod authority;
 mod batch;
@@ -12,6 +22,8 @@ mod comparator;
 mod compression;
 mod diff;
 mod error;
+#[cfg(test)]
+mod failpoints;
 mod iter;
 mod levels;
 mod lockfile;
@@ -23,7 +35,6 @@ mod oracle;
 mod snapshot;
 mod sstable;
 mod stall;
-mod storage;
 mod task;
 mod timeline;
 mod tracker;
@@ -39,11 +50,19 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use api::{AuthorityFence, BranchGeneration, BranchId, ErrorCode, KernelError, KernelResult};
+pub use api::{BranchGeneration, BranchId, ErrorCode, KernelError, KernelResult};
 pub use branch::{BranchInfo, BranchLineage, ForkPoint};
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 pub use diff::{BranchDiff, DiffEntry, DiffIter, DiffOp};
-pub use merge::{Conflict, ConflictKind, MergeOutcome, MergeReport, MergeStrategy};
+pub use merge::{
+	Conflict,
+	ConflictChoice,
+	ConflictKind,
+	ConflictResolver,
+	MergeOutcome,
+	MergeReport,
+	MergeStrategy,
+};
 pub use metrics::BranchMetricsSnapshot;
 use sstable::bloom::LevelDBBloomFilter;
 

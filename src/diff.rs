@@ -88,7 +88,15 @@ impl BranchDiff {
 
 	/// A streaming cursor over the changes, in key order.
 	pub fn iter(&self) -> Result<DiffIter<'_>> {
-		DiffIter::new(&self.snapshot, self.base)
+		DiffIter::new(&self.snapshot, self.base, Bound::Unbounded, Bound::Unbounded)
+	}
+
+	/// The changes within a key range, in key order.
+	///
+	/// Bounded at the iterator rather than filtered afterwards, so a diff over a
+	/// narrow range of a large branch reads a narrow range.
+	pub fn iter_range(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> Result<DiffIter<'_>> {
+		DiffIter::new(&self.snapshot, self.base, lower, upper)
 	}
 
 	/// Every change, materialized. Fine for inspection and tests; large diffs
@@ -115,9 +123,14 @@ pub struct DiffIter<'a> {
 }
 
 impl<'a> DiffIter<'a> {
-	fn new(snapshot: &'a Snapshot, base: u64) -> Result<Self> {
+	fn new(
+		snapshot: &'a Snapshot,
+		base: u64,
+		lower: Bound<&[u8]>,
+		upper: Bound<&[u8]>,
+	) -> Result<Self> {
 		let iter_state = snapshot.collect_iter_state()?;
-		let range = crate::user_range_to_internal_range(Bound::Unbounded, Bound::Unbounded);
+		let range = crate::user_range_to_internal_range(lower, upper);
 		Ok(Self {
 			merge: KMergeIterator::new_from(iter_state, range),
 			base,
@@ -235,5 +248,34 @@ impl Iterator for DiffIter<'_> {
 				Some(Err(error))
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// `DiffOp` is the vocabulary a consumer acts on, and the two deletes are
+	/// the part that is easy to get wrong: they differ in what they do to
+	/// *history*, and not at all in what they do to the current value.
+	#[test]
+	fn both_deletes_remove_the_key_and_neither_carries_a_value() {
+		assert!(DiffOp::Delete.is_delete());
+		assert!(DiffOp::SoftDelete.is_delete());
+		assert!(!DiffOp::Set(b"v".to_vec()).is_delete());
+
+		assert_eq!(DiffOp::Delete.value(), None);
+		assert_eq!(DiffOp::SoftDelete.value(), None);
+		assert_eq!(DiffOp::Set(b"v".to_vec()).value(), Some(&b"v".to_vec()));
+	}
+
+	/// A `Set` of empty bytes is a value, not an absence. Merge's decision table
+	/// compares `Option<Value>`, so collapsing the two would turn "the source
+	/// wrote an empty string" into "the source deleted it".
+	#[test]
+	fn an_empty_value_is_not_a_delete() {
+		let empty = DiffOp::Set(Vec::new());
+		assert!(!empty.is_delete());
+		assert_eq!(empty.value(), Some(&Vec::new()));
 	}
 }

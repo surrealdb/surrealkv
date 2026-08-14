@@ -2,7 +2,6 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
@@ -204,8 +203,10 @@ impl DatabaseCheckpoint {
 		// Step 6: Copy level manifest
 		let manifest_size = self.copy_level_manifest(checkpoint_path)?;
 
-		// Step 7: Create checkpoint metadata
-		let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+		// Step 7: Create checkpoint metadata. Through the injected clock, not
+		// `SystemTime::now()`: this is recorded in the checkpoint on disk, and a
+		// store whose clock is controlled must not have an ambient one leak in.
+		let timestamp = self.core.opts.clock.now();
 
 		let metadata = CheckpointMetadata::new(
 			timestamp,
