@@ -4,18 +4,48 @@ use std::sync::Arc;
 
 use test_log::test;
 
-use crate::levels::{
-	write_manifest_to_disk,
-	LevelManifest,
-	ManifestChangeSet,
-	SnapshotInfo,
-	MANIFEST_FORMAT_VERSION,
-};
+use crate::batch::BatchOwner;
+use crate::levels::{LevelManifest, ManifestChangeSet};
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::{InternalKey, InternalKeyKind, Options, Result};
 
 // Helper function to create a test table with direct file IO
+fn authority_for(opts: &Arc<Options>) -> crate::authority::store::AuthorityStore {
+	crate::authority::store::AuthorityStore::new(opts.path.clone(), [7; 16])
+}
+
+/// The catalog version these in-memory fixture catalogs stand for: whatever is
+/// published on disk, or 0 when nothing is.
+fn latest_published_catalog_version(opts: &Arc<Options>) -> u64 {
+	crate::authority::store::AuthorityStore::load_latest_catalog(&opts.path)
+		.unwrap()
+		.map(|manifest| manifest.catalog_version)
+		.unwrap_or(0)
+}
+
+/// Reload through the production path: newest root -> state lineages ->
+/// hydrated manifest, against a default-only catalog.
+fn reload_default_manifest(opts: &Arc<Options>) -> LevelManifest {
+	let authority = authority_for(opts);
+	let catalog = crate::branch::BranchCatalog::new(crate::BranchId::DEFAULT);
+	let root = authority.load_latest_root().unwrap();
+	let catalog_version = latest_published_catalog_version(opts);
+	LevelManifest::hydrate(
+		Arc::clone(opts),
+		authority,
+		&catalog,
+		catalog_version,
+		root.as_ref(),
+		std::sync::Arc::new(crate::timeline::Timeline::new()),
+	)
+	.unwrap()
+}
+
+fn fresh_manifest(opts: &Arc<Options>) -> LevelManifest {
+	LevelManifest::fresh(Arc::clone(opts), authority_for(opts))
+}
+
 fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Result<Arc<Table>> {
 	let table_file_path = opts.sstable_file_path(table_id);
 
@@ -64,10 +94,9 @@ fn test_level_manifest_persistence() {
 	fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
 
 	// Create manifest directory
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
 
 	// Create a new manifest with 3 levels
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	// Create tables and add them to the manifest
 	// Create 2 tables for level 0
@@ -93,22 +122,6 @@ fn test_level_manifest_persistence() {
 			(0, table2), // Level 0
 			(1, table3), // Level 1
 		],
-		new_snapshots: vec![
-			SnapshotInfo {
-				seq_num: 10,
-				created_at: std::time::SystemTime::now()
-					.duration_since(std::time::UNIX_EPOCH)
-					.map(|d| d.as_nanos())
-					.unwrap_or(0),
-			},
-			SnapshotInfo {
-				seq_num: 20,
-				created_at: std::time::SystemTime::now()
-					.duration_since(std::time::UNIX_EPOCH)
-					.map(|d| d.as_nanos())
-					.unwrap_or(0),
-			},
-		],
 		..Default::default()
 	};
 
@@ -118,32 +131,18 @@ fn test_level_manifest_persistence() {
 	// Verify last_sequence was updated correctly (table3 has largest_seq_num = 300)
 	assert_eq!(manifest.get_last_sequence(), 300, "last_sequence should be 300");
 
-	// Persist the manifest with our custom next_table_id
-	write_manifest_to_disk(&manifest).expect("Failed to write to disk");
+	// Persist: one state version for the default owner plus a root version.
+	manifest.persist_owner_update(BatchOwner::DEFAULT).expect("Failed to persist");
 
-	// Load the manifest directly to verify persistence
-	let manifest_path = opts.manifest_file_path(0);
-	let loaded_manifest = LevelManifest::load_from_file(&manifest_path, Arc::clone(&opts))
-		.expect("Failed to load manifest");
+	// Reload through the production hydrate path.
+	let loaded_manifest = reload_default_manifest(&opts);
 
-	// Verify all manifest fields were persisted correctly
-	assert_eq!(
-		loaded_manifest.next_table_id.load(Ordering::SeqCst),
-		expected_next_id,
-		"Next table ID not persisted correctly"
-	);
-	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION,
-		"Manifest version not persisted correctly"
-	);
-	assert_eq!(loaded_manifest.snapshots.len(), 2, "Snapshots not persisted correctly");
-	assert_eq!(
-		loaded_manifest.snapshots[0].seq_num, 10,
-		"First snapshot seq_num not persisted correctly"
-	);
-	assert_eq!(
-		loaded_manifest.snapshots[1].seq_num, 20,
-		"Second snapshot seq_num not persisted correctly"
+	// The table-id allocator resumes at the root's block-reserved watermark:
+	// strictly above every allocated id, at the next block boundary.
+	let watermark = loaded_manifest.next_table_id.load(Ordering::SeqCst);
+	assert!(
+		watermark > expected_next_id && watermark % 1024 == 0,
+		"allocator must resume at a block boundary above {expected_next_id}, got {watermark}"
 	);
 
 	// Verify level count matches what we created
@@ -173,24 +172,14 @@ fn test_level_manifest_persistence() {
 		"Level 1 should contain table_id3"
 	);
 
-	// Create a new manifest from the same path (simulating restart/recovery)
-	let new_manifest = LevelManifest::new(Arc::clone(&opts))
-		.expect("Failed to create manifest from existing file");
-
-	// Verify all manifest fields were loaded correctly in the new manifest
+	// Reload a second time (simulating a second restart): hydration is
+	// deterministic and idempotent.
+	let new_manifest = reload_default_manifest(&opts);
 	assert_eq!(
 		new_manifest.next_table_id.load(Ordering::SeqCst),
-		expected_next_id,
-		"Next table ID not loaded correctly in new manifest"
+		watermark,
+		"the watermark must be stable across repeated reloads"
 	);
-	assert_eq!(
-		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION,
-		"Manifest version not loaded correctly"
-	);
-	assert_eq!(new_manifest.snapshots.len(), 2, "Snapshots not loaded correctly");
-	assert_eq!(new_manifest.snapshots[0].seq_num, 10, "First snapshot not loaded correctly");
-	assert_eq!(new_manifest.snapshots[1].seq_num, 20, "Second snapshot not loaded correctly");
-	assert_eq!(new_manifest.path, opts.manifest_file_path(0), "Path not set correctly");
 
 	// Verify the number of levels in the new manifest
 	assert_eq!(
@@ -409,10 +398,9 @@ fn test_lsn_with_multiple_l0_tables() {
 	fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
 
 	// Create manifest directory
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
 
 	// Create a new manifest
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	// Test 1: Empty manifest should have last_sequence of 0
 	assert_eq!(manifest.get_last_sequence(), 0, "Empty manifest should return last_sequence of 0");
@@ -581,14 +569,12 @@ fn test_last_sequence_persistence_across_manifest_reload() {
 	fs::create_dir_all(&sstable_path).expect("Failed to create sstables directory");
 
 	// Create manifest directory
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest directory");
 
 	let expected_last_sequence = 50;
 
 	// Create manifest with tables via changeset and verify last_sequence
 	{
-		let mut manifest =
-			LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+		let mut manifest = fresh_manifest(&opts);
 
 		// Create tables with different sequence ranges
 		let table1 = create_test_table_with_seq_nums(1, 1, 20, Arc::clone(&opts))
@@ -615,12 +601,12 @@ fn test_last_sequence_persistence_across_manifest_reload() {
 		);
 
 		// Persist the manifest
-		write_manifest_to_disk(&manifest).expect("Failed to write manifest to disk");
+		manifest.persist_owner_update(BatchOwner::DEFAULT).expect("Failed to persist");
 	}
 
 	// Reload manifest and verify last_sequence is preserved
 	{
-		let reloaded_manifest = LevelManifest::new(opts).expect("Failed to reload manifest");
+		let reloaded_manifest = reload_default_manifest(&opts);
 
 		// Verify last_sequence after reload
 		assert_eq!(
@@ -664,10 +650,9 @@ fn test_manifest_v2_with_log_number_and_last_sequence() {
 
 	// Create required directories
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
 	// Create a manifest with log_number and last_sequence set
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	// Add a table to ensure non-trivial state
 	// Table with sequence numbers 100-200, so last_sequence should be 200
@@ -687,17 +672,11 @@ fn test_manifest_v2_with_log_number_and_last_sequence() {
 	// Verify last_sequence was updated by the changeset
 	assert_eq!(manifest.get_last_sequence(), 200, "last_sequence should be updated by changeset");
 
-	// Persist to disk
-	write_manifest_to_disk(&manifest).expect("Failed to write manifest");
+	// Persist to the lineages
+	manifest.persist_owner_update(BatchOwner::DEFAULT).expect("Failed to persist");
 
 	// Reload and verify
-	let loaded_manifest = LevelManifest::new(opts).expect("Failed to reload manifest");
-
-	// Verify format version is still V1
-	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION,
-		"Should be V2 format"
-	);
+	let loaded_manifest = reload_default_manifest(&opts);
 
 	// Verify new fields persisted correctly
 	assert_eq!(loaded_manifest.get_log_number(), 42, "log_number should persist");
@@ -717,13 +696,11 @@ fn test_revert_empty_changeset() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	let initial_last_sequence = manifest.get_last_sequence();
 	let initial_log_number = manifest.get_log_number();
-	let initial_version = manifest.manifest_format_version;
 
 	let changeset = ManifestChangeSet::default();
 	let rollback = manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
@@ -736,10 +713,6 @@ fn test_revert_empty_changeset() {
 		"last_sequence should be unchanged"
 	);
 	assert_eq!(manifest.get_log_number(), initial_log_number, "log_number should be unchanged");
-	assert_eq!(
-		manifest.manifest_format_version, initial_version,
-		"manifest_format_version should be unchanged"
-	);
 }
 
 #[test]
@@ -752,9 +725,8 @@ fn test_revert_added_tables_only() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
 		.expect("Failed to create table 1");
@@ -806,9 +778,8 @@ fn test_revert_deleted_tables_only() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	// Add some tables first
 	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
@@ -873,9 +844,8 @@ fn test_revert_mixed_add_delete() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	// Add initial tables
 	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
@@ -931,9 +901,8 @@ fn test_revert_preserves_table_ordering_l0() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	// Add tables with different sequence numbers
 	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
@@ -980,9 +949,8 @@ fn test_revert_preserves_table_ordering_l1() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	// Add tables to L1 (sorted by key)
 	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
@@ -1029,9 +997,8 @@ fn test_revert_log_number_change() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	let initial_log_number = manifest.get_log_number();
 	let new_log_number = 42;
@@ -1060,9 +1027,8 @@ fn test_revert_log_number_not_changed() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	// Set log_number to a higher value first
 	let higher_log_number = 50;
@@ -1104,9 +1070,8 @@ fn test_revert_last_sequence() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	let initial_last_sequence = manifest.get_last_sequence();
 
@@ -1132,150 +1097,6 @@ fn test_revert_last_sequence() {
 }
 
 #[test]
-fn test_revert_manifest_version() {
-	let mut opts = Options::default();
-	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-	let repo_path = temp_dir.path().to_path_buf();
-	opts.path = repo_path;
-	opts.level_count = 3;
-	let opts = Arc::new(opts);
-
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
-
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
-
-	let initial_version = manifest.manifest_format_version;
-	let new_version = 2;
-
-	let changeset = ManifestChangeSet {
-		manifest_format_version: Some(new_version),
-		..Default::default()
-	};
-
-	let rollback = manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
-
-	assert_eq!(
-		manifest.manifest_format_version, new_version,
-		"manifest_format_version should be updated"
-	);
-
-	manifest.revert_changeset(rollback);
-
-	assert_eq!(
-		manifest.manifest_format_version, initial_version,
-		"manifest_format_version should be reverted"
-	);
-}
-
-#[test]
-fn test_revert_snapshots_added() {
-	let mut opts = Options::default();
-	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-	let repo_path = temp_dir.path().to_path_buf();
-	opts.path = repo_path;
-	opts.level_count = 3;
-	let opts = Arc::new(opts);
-
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
-
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
-
-	let initial_snapshot_count = manifest.snapshots.len();
-
-	let snapshot1 = SnapshotInfo {
-		seq_num: 10,
-		created_at: std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map(|d| d.as_nanos())
-			.unwrap_or(0),
-	};
-	let snapshot2 = SnapshotInfo {
-		seq_num: 20,
-		created_at: std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map(|d| d.as_nanos())
-			.unwrap_or(0),
-	};
-
-	let changeset = ManifestChangeSet {
-		new_snapshots: vec![snapshot1, snapshot2],
-		..Default::default()
-	};
-
-	let rollback = manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
-
-	assert_eq!(manifest.snapshots.len(), initial_snapshot_count + 2, "Snapshots should be added");
-
-	manifest.revert_changeset(rollback);
-
-	assert_eq!(
-		manifest.snapshots.len(),
-		initial_snapshot_count,
-		"Snapshots should be removed on revert"
-	);
-}
-
-#[test]
-fn test_revert_snapshots_deleted() {
-	let mut opts = Options::default();
-	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
-	let repo_path = temp_dir.path().to_path_buf();
-	opts.path = repo_path;
-	opts.level_count = 3;
-	let opts = Arc::new(opts);
-
-	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
-
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
-
-	// Add snapshots first
-	let snapshot1 = SnapshotInfo {
-		seq_num: 10,
-		created_at: std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map(|d| d.as_nanos())
-			.unwrap_or(0),
-	};
-	let snapshot2 = SnapshotInfo {
-		seq_num: 20,
-		created_at: std::time::SystemTime::now()
-			.duration_since(std::time::UNIX_EPOCH)
-			.map(|d| d.as_nanos())
-			.unwrap_or(0),
-	};
-
-	let add_changeset = ManifestChangeSet {
-		new_snapshots: vec![snapshot1, snapshot2],
-		..Default::default()
-	};
-	let _ = manifest.apply_changeset(&add_changeset).expect("Failed to apply changeset");
-
-	let initial_snapshot_count = manifest.snapshots.len();
-
-	// Now delete one
-	let delete_changeset = ManifestChangeSet {
-		deleted_snapshots: std::collections::HashSet::from([10]),
-		..Default::default()
-	};
-
-	let rollback = manifest.apply_changeset(&delete_changeset).expect("Failed to apply changeset");
-
-	assert_eq!(manifest.snapshots.len(), initial_snapshot_count - 1, "Snapshot should be deleted");
-
-	manifest.revert_changeset(rollback);
-
-	assert_eq!(
-		manifest.snapshots.len(),
-		initial_snapshot_count,
-		"Snapshot should be restored on revert"
-	);
-	assert!(manifest.snapshots.iter().any(|s| s.seq_num == 10));
-}
-
-#[test]
 fn test_revert_multiple_tables_same_level() {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -1285,9 +1106,8 @@ fn test_revert_multiple_tables_same_level() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
 		.expect("Failed to create table 1");
@@ -1326,9 +1146,8 @@ fn test_revert_table_only_one_in_level() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	let table = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
 		.expect("Failed to create table");
@@ -1370,9 +1189,8 @@ fn test_revert_idempotent() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	let table = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
 		.expect("Failed to create table");
@@ -1408,9 +1226,8 @@ fn test_apply_revert_apply_cycle() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
 		.expect("Failed to create table 1");
@@ -1453,9 +1270,8 @@ fn test_revert_after_disk_write_failure_simulation() {
 	let opts = Arc::new(opts);
 
 	fs::create_dir_all(opts.sstable_dir()).expect("Failed to create sstables dir");
-	fs::create_dir_all(opts.manifest_dir()).expect("Failed to create manifest dir");
 
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to create manifest");
+	let mut manifest = fresh_manifest(&opts);
 
 	// Add some initial tables
 	let table1 = create_test_table_with_seq_nums(1, 1, 10, Arc::clone(&opts))
@@ -1475,7 +1291,6 @@ fn test_revert_after_disk_write_failure_simulation() {
 		manifest.default_owner_levels().get_levels()[1].tables.len(),
 		manifest.get_last_sequence(),
 		manifest.get_log_number(),
-		manifest.manifest_format_version,
 	);
 
 	// Simulate a compaction-like operation: delete old tables, add new table
@@ -1515,10 +1330,6 @@ fn test_revert_after_disk_write_failure_simulation() {
 	);
 	assert_eq!(manifest.get_last_sequence(), state_before.2, "last_sequence should be restored");
 	assert_eq!(manifest.get_log_number(), state_before.3, "log_number should be restored");
-	assert_eq!(
-		manifest.manifest_format_version, state_before.4,
-		"manifest_format_version should be restored"
-	);
 
 	// Verify original tables are still present
 	assert!(manifest.default_owner_levels().get_levels()[0].tables.iter().any(|t| t.id == 1));
@@ -1559,6 +1370,25 @@ fn create_owned_test_table(
 	Ok(Arc::new(Table::new(table_id, opts, file, size as u64)?))
 }
 
+/// Reload with a catalog containing the default branch AND the br3 foreign
+/// branch (both must hydrate for the two-owner tests).
+fn reload_two_owner_manifest(opts: &Arc<Options>) -> crate::Result<LevelManifest> {
+	let authority = authority_for(opts);
+	let mut catalog = crate::branch::BranchCatalog::new(crate::BranchId::DEFAULT);
+	let record = catalog.create(foreign_owner().branch, "br3/foreign", 0).unwrap();
+	assert_eq!(record.generation, foreign_owner().generation, "fixture generation must line up");
+	let root = authority.load_latest_root()?;
+	let catalog_version = latest_published_catalog_version(opts);
+	LevelManifest::hydrate(
+		Arc::clone(opts),
+		authority,
+		&catalog,
+		catalog_version,
+		root.as_ref(),
+		std::sync::Arc::new(crate::timeline::Timeline::new()),
+	)
+}
+
 fn br3_test_opts() -> Arc<Options> {
 	let mut opts = Options::default();
 	let temp_dir = tempfile::tempdir().expect("Failed to create temp dir");
@@ -1568,7 +1398,6 @@ fn br3_test_opts() -> Arc<Options> {
 	std::mem::forget(temp_dir);
 	fs::create_dir_all(opts.sstable_dir()).unwrap();
 	fs::create_dir_all(opts.wal_dir()).unwrap();
-	fs::create_dir_all(opts.manifest_dir()).unwrap();
 	Arc::new(opts)
 }
 
@@ -1577,7 +1406,7 @@ fn br3_test_opts() -> Arc<Options> {
 #[test]
 fn br3_same_key_ranges_in_two_owners_are_legal() {
 	let opts = br3_test_opts();
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+	let mut manifest = fresh_manifest(&opts);
 
 	let default_owner = crate::batch::BatchOwner::DEFAULT;
 	let table_a = create_owned_test_table(1, default_owner, 1, 10, Arc::clone(&opts)).unwrap();
@@ -1604,9 +1433,9 @@ fn br3_same_key_ranges_in_two_owners_are_legal() {
 	};
 	manifest.apply_changeset(&changeset_b).expect("foreign-owner apply must succeed");
 
-	write_manifest_to_disk(&manifest).unwrap();
-	let reloaded =
-		LevelManifest::load_from_file(opts.manifest_file_path(0), Arc::clone(&opts)).unwrap();
+	manifest.persist_owner_update(BatchOwner::DEFAULT).unwrap();
+	manifest.persist_owner_update(foreign_owner()).unwrap();
+	let reloaded = reload_two_owner_manifest(&opts).unwrap();
 
 	assert_eq!(reloaded.levels_for(default_owner).unwrap().get_levels()[1].tables.len(), 1);
 	assert_eq!(reloaded.levels_for(foreign_owner()).unwrap().get_levels()[1].tables.len(), 1);
@@ -1617,7 +1446,7 @@ fn br3_same_key_ranges_in_two_owners_are_legal() {
 #[test]
 fn br3_changeset_owner_mismatch_fails_closed_before_mutation() {
 	let opts = br3_test_opts();
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+	let mut manifest = fresh_manifest(&opts);
 
 	let foreign_table =
 		create_owned_test_table(1, foreign_owner(), 1, 5, Arc::clone(&opts)).unwrap();
@@ -1652,7 +1481,7 @@ fn br3_changeset_owner_mismatch_fails_closed_before_mutation() {
 #[test]
 fn br3_on_disk_owner_mismatch_fails_closed_on_open() {
 	let opts = br3_test_opts();
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+	let mut manifest = fresh_manifest(&opts);
 
 	let foreign_table =
 		create_owned_test_table(1, foreign_owner(), 1, 5, Arc::clone(&opts)).unwrap();
@@ -1662,9 +1491,9 @@ fn br3_on_disk_owner_mismatch_fails_closed_on_open() {
 	Arc::make_mut(&mut manifest.default_owner_levels_mut().get_levels_mut()[0])
 		.insert(Arc::clone(&foreign_table));
 	manifest.last_sequence = 5;
-	write_manifest_to_disk(&manifest).unwrap();
+	manifest.persist_owner_update(BatchOwner::DEFAULT).unwrap();
 
-	let result = LevelManifest::load_from_file(opts.manifest_file_path(0), Arc::clone(&opts));
+	let result = reload_two_owner_manifest(&opts);
 	let err = result.err().expect("owner mismatch must fail closed on open").to_string();
 	assert!(err.contains("owner"), "error must name the ownership violation: {err}");
 }
@@ -1676,45 +1505,79 @@ fn br3_on_disk_owner_mismatch_fails_closed_on_open() {
 #[test]
 fn br3_duplicate_table_listing_fails_closed_on_open() {
 	let opts = br3_test_opts();
-	let mut manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+	let mut manifest = fresh_manifest(&opts);
 
 	let table =
 		create_owned_test_table(1, crate::batch::BatchOwner::DEFAULT, 1, 5, Arc::clone(&opts))
 			.unwrap();
-	// Craft the corrupt double listing (L0 and L1) via the test-only accessor.
+	// A double listing WITHIN one state (L0 and L1) is rejected by the
+	// format itself, at publish time — even earlier than open.
 	Arc::make_mut(&mut manifest.default_owner_levels_mut().get_levels_mut()[0])
 		.insert(Arc::clone(&table));
 	Arc::make_mut(&mut manifest.default_owner_levels_mut().get_levels_mut()[1])
 		.insert(Arc::clone(&table));
 	manifest.last_sequence = 5;
-	write_manifest_to_disk(&manifest).unwrap();
+	let err = manifest
+		.persist_owner_update(BatchOwner::DEFAULT)
+		.expect_err("within-state duplicate must fail the publish")
+		.to_string();
+	assert!(err.contains("listed more than once"), "error must name the duplication: {err}");
 
-	let result = LevelManifest::load_from_file(opts.manifest_file_path(0), Arc::clone(&opts));
-	let err = result.err().expect("duplicate table listing must fail closed on open").to_string();
+	// A CROSS-state duplicate (the same table id under two owners) is
+	// hydrate's check: craft two states each listing table 1.
+	let opts = br3_test_opts();
+	let table_default =
+		create_owned_test_table(1, crate::batch::BatchOwner::DEFAULT, 1, 5, Arc::clone(&opts))
+			.unwrap();
+	let mut manifest = fresh_manifest(&opts);
+	Arc::make_mut(&mut manifest.default_owner_levels_mut().get_levels_mut()[0])
+		.insert(table_default);
+	manifest.last_sequence = 5;
+	manifest.persist_owner_update(BatchOwner::DEFAULT).unwrap();
+	// Publish a foreign state claiming the same table id directly.
+	let foreign_state = crate::authority::format::BranchStateManifest {
+		branch: foreign_owner().branch,
+		generation: foreign_owner().generation,
+		state_version: 1,
+		last_sequence: 5,
+		flushed_log_number: 0,
+		retained_floor_seq: 0,
+		levels: vec![vec![1]],
+	};
+	authority_for(&opts).publish_state(&foreign_state).unwrap();
+
+	let result = reload_two_owner_manifest(&opts);
+	let err = result.err().expect("cross-state duplicate must fail closed on open").to_string();
 	assert!(err.contains("listed more than once"), "error must name the duplication: {err}");
 }
 
-/// Any manifest version other than the rewrite line's is rejected by
-/// identity, before structural decoding.
+/// Any state-manifest format version other than the rewrite line's is
+/// rejected by identity at open, before structural decoding — a hand-crafted
+/// on-disk file exercises the full open path (the format-level twin lives in
+/// the authority module's own tests).
 #[test]
-fn br3_foreign_manifest_version_is_rejected_by_identity() {
-	use byteorder::{BigEndian, WriteBytesExt};
+fn fk1_foreign_state_version_is_rejected_by_identity_on_open() {
+	let opts = br3_test_opts();
+	let mut manifest = fresh_manifest(&opts);
+	let table =
+		create_owned_test_table(1, crate::batch::BatchOwner::DEFAULT, 1, 5, Arc::clone(&opts))
+			.unwrap();
+	Arc::make_mut(&mut manifest.default_owner_levels_mut().get_levels_mut()[0]).insert(table);
+	manifest.last_sequence = 5;
+	manifest.persist_owner_update(BatchOwner::DEFAULT).unwrap();
 
-	for foreign_version in [0u16, crate::levels::MANIFEST_FORMAT_VERSION + 1] {
-		let opts = br3_test_opts();
-		let manifest_path = opts.manifest_file_path(0);
-		let mut buf = Vec::new();
-		buf.write_u16::<BigEndian>(foreign_version).unwrap();
-		buf.write_u64::<BigEndian>(1).unwrap(); // next_table_id
-		buf.write_u64::<BigEndian>(0).unwrap(); // log_number
-		buf.write_u64::<BigEndian>(0).unwrap(); // last_sequence
-		fs::write(&manifest_path, &buf).unwrap();
+	// Patch the published state's format version to a future value and
+	// refresh the trailing checksum so ONLY the version identity trips.
+	let state_dir = opts.path.join("branch").join("00000000000000000000000000000000");
+	let state_path = state_dir.join("00000000000000000001.state");
+	let mut bytes = fs::read(&state_path).unwrap();
+	bytes[4..6].copy_from_slice(&2u16.to_le_bytes());
+	let body_end = bytes.len() - 4;
+	let crc = crc32fast::hash(&bytes[..body_end]);
+	bytes[body_end..].copy_from_slice(&crc.to_le_bytes());
+	fs::write(&state_path, &bytes).unwrap();
 
-		let result = LevelManifest::load_from_file(&manifest_path, Arc::clone(&opts));
-		let err = result.err().expect("foreign version must be rejected").to_string();
-		assert!(
-			err.contains(&format!("Unsupported manifest format version: {foreign_version}")),
-			"rejection must name the version: {err}"
-		);
-	}
+	let result = reload_two_owner_manifest(&opts);
+	let err = result.err().expect("future state version must be rejected").to_string();
+	assert!(err.contains("future format version 2"), "rejection must name the version: {err}");
 }

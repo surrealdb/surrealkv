@@ -1,30 +1,97 @@
-//! Branch selectors, write operations, and reference-model tests.
+//! The branch catalog: the runtime view of the durable authority's branch
+//! records, their generations, COW parent links and fork anchors.
 
 use std::collections::BTreeMap;
 
-use bytes::Bytes;
-
-use super::api::{
-	BranchGeneration,
-	BranchId,
-	CommitTimestamp,
-	CommitVersion,
-	ErrorCode,
-	KernelError,
-	KernelResult,
-};
+use super::api::{BranchGeneration, BranchId, ErrorCode, KernelError, KernelResult};
 
 pub(crate) const DEFAULT_BRANCH_NAME: &str = "main";
-#[cfg(test)]
-const MAX_BRANCH_NAME_LEN: usize = 255;
+
+/// Where a fork cuts its view of the parent. Every point is exact: the child
+/// sees precisely the rows a reader of the parent would have seen at that
+/// point, including rows still only in the parent's memtables, because the
+/// child resolves the parent's live state rather than a set of files
+/// (design §3.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkPoint {
+	/// The parent's visible head at the instant of the fork, established by
+	/// draining the commit pipeline under the write fence.
+	Head,
+	/// A specific sequence, which must be at or below the drained head and at
+	/// or above the parent's retention floor.
+	AtVersion(u64),
+	/// The highest sequence committed at or before this timestamp, resolved
+	/// exactly or refused (`Error::TimestampBelowHorizon`).
+	AtTimestamp(u64),
+}
+
+/// What a completed fork returns internally, and what an idempotent retry
+/// returns, so a caller that lost the response can re-issue the same request.
+///
+/// Crate-internal: it names owners, and `BatchOwner` is not part of the public
+/// surface. `Tree::fork_branch` hands back a [`BranchHandle`] instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForkReceipt {
+	pub(crate) child: crate::batch::BatchOwner,
+	pub(crate) parent: crate::batch::BatchOwner,
+	pub(crate) fork_seq: u64,
+}
+
+/// Ancestor-chain depth budget (strata-parity, plan D6): resolution beyond
+/// this demands materialization rather than degrading.
+pub(crate) const MAX_VIEW_DEPTH: usize = 64;
+
+/// Where a branch came from: the parent it was forked off and the anchor its
+/// view of that parent is capped at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchLineage {
+	pub branch: BranchId,
+	pub generation: BranchGeneration,
+	/// Rows the parent committed after this sequence are invisible to the
+	/// child, permanently.
+	pub fork_seq: u64,
+}
+
+/// A branch's catalog facts, as of the moment it was read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchInfo {
+	pub name: String,
+	pub id: BranchId,
+	/// Incarnations of a name are distinguished by generation; a stale
+	/// generation is fenced rather than silently re-bound.
+	pub generation: BranchGeneration,
+	/// Global commit sequence when this incarnation was created.
+	pub created_at_seq: u64,
+	/// `None` for a root branch such as `main`.
+	pub parent: Option<BranchLineage>,
+	/// Newest sequence this branch wrote ITSELF — not a per-branch head, which
+	/// a single global commit clock does not have. `None` means the branch has
+	/// never written, so it reads purely through its inherited view.
+	pub last_write_seq: Option<u64>,
+	/// Absolute expiry on the store's clock; the maintenance sweep tombstones
+	/// the branch once it passes.
+	pub expires_at: Option<u64>,
+}
+
+use crate::authority::format::MAX_BRANCH_NAME_LEN;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BranchRecord {
 	pub(crate) id: BranchId,
 	pub(crate) name: String,
 	pub(crate) generation: BranchGeneration,
-	pub(crate) head: CommitVersion,
 	pub(crate) deleted: bool,
+	/// Global commit sequence when THIS incarnation was created — the
+	/// generation-fence anchor (a predecessor generation's records are all at
+	/// or below it) and an allocator restart-safety input.
+	pub(crate) created_at_seq: u64,
+	/// Global commit sequence when this incarnation was deleted.
+	pub(crate) deleted_at_seq: Option<u64>,
+	/// Branch TTL for agentic sandboxes; enforcement is a maintenance sweep.
+	pub(crate) expires_at: Option<u64>,
+	/// COW lineage: the parent this branch was forked from, with the fork
+	/// anchor `fork_seq` (the child reads the parent capped at this seq).
+	pub(crate) parent: Option<crate::authority::format::ParentLink>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,7 +99,12 @@ pub(crate) struct BranchCatalog {
 	default_branch: BranchId,
 	records: BTreeMap<BranchId, BranchRecord>,
 	live_names: BTreeMap<String, BranchId>,
-	name_generations: BTreeMap<String, BranchGeneration>,
+	/// Globally monotone generation allocator: generations are unique across
+	/// every branch that ever existed (never per-name ordinals), so catalog
+	/// tombstone reclamation can never enable stale-generation acceptance.
+	/// The default branch holds the reserved generation 0; allocation starts
+	/// at 1.
+	next_generation: u64,
 }
 
 impl BranchCatalog {
@@ -41,17 +113,17 @@ impl BranchCatalog {
 			id: default_branch,
 			name: DEFAULT_BRANCH_NAME.to_owned(),
 			generation: BranchGeneration(0),
-			head: CommitVersion(0),
 			deleted: false,
+			created_at_seq: 0,
+			deleted_at_seq: None,
+			expires_at: None,
+			parent: None,
 		};
 		Self {
 			default_branch,
 			records: BTreeMap::from([(default_branch, record)]),
 			live_names: BTreeMap::from([(DEFAULT_BRANCH_NAME.to_owned(), default_branch)]),
-			name_generations: BTreeMap::from([(
-				DEFAULT_BRANCH_NAME.to_owned(),
-				BranchGeneration(0),
-			)]),
+			next_generation: 1,
 		}
 	}
 
@@ -60,35 +132,152 @@ impl BranchCatalog {
 		self.default_branch
 	}
 
-	#[cfg(test)]
+	pub(crate) fn next_generation(&self) -> u64 {
+		self.next_generation
+	}
+
 	pub(crate) fn create(
 		&mut self,
 		id: BranchId,
 		name: &str,
-		head: CommitVersion,
+		created_at_seq: u64,
 	) -> KernelResult<BranchRecord> {
 		validate_branch_name(name)?;
 		if self.records.contains_key(&id) || self.live_names.contains_key(name) {
 			return Err(KernelError::new(ErrorCode::AlreadyExists, "branch already exists"));
 		}
-		let generation = self
-			.name_generations
-			.get(name)
-			.map_or(BranchGeneration(0), |previous| BranchGeneration(previous.0 + 1));
+		let generation = BranchGeneration(self.next_generation);
+		self.next_generation = self.next_generation.checked_add(1).ok_or_else(|| {
+			KernelError::new(ErrorCode::ResourceExhausted, "branch generation allocator exhausted")
+		})?;
 		let record = BranchRecord {
 			id,
 			name: name.to_owned(),
 			generation,
-			head,
 			deleted: false,
+			created_at_seq,
+			deleted_at_seq: None,
+			expires_at: None,
+			parent: None,
 		};
 		self.records.insert(id, record.clone());
 		self.live_names.insert(name.to_owned(), id);
-		self.name_generations.insert(name.to_owned(), generation);
 		Ok(record)
 	}
 
-	#[cfg(test)]
+	/// Creates a fork child entry: like [`Self::create`] plus the COW parent
+	/// link. FK4's fork protocol is the production caller; FK3 exercises it
+	/// through the test seam.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn create_fork(
+		&mut self,
+		id: BranchId,
+		name: &str,
+		created_at_seq: u64,
+		parent: crate::authority::format::ParentLink,
+	) -> KernelResult<BranchRecord> {
+		if !self
+			.records
+			.get(&parent.parent)
+			.is_some_and(|record| !record.deleted && record.generation == parent.parent_generation)
+		{
+			return Err(KernelError::new(
+				ErrorCode::NotFound,
+				"fork parent is not a live branch at that generation",
+			));
+		}
+		let record = self.create(id, name, created_at_seq)?;
+		let record_mut = self.records.get_mut(&id).expect("record was just inserted");
+		record_mut.parent = Some(parent);
+		Ok(BranchRecord {
+			parent: record_mut.parent.clone(),
+			..record
+		})
+	}
+
+	/// Clears a branch's parent link after its inherited view has been copied
+	/// into its own tables.
+	///
+	/// The link is the only thing that makes the branch read through an
+	/// ancestor, so dropping it both shortens the chain and releases the
+	/// retention pin its anchor placed on the parent.
+	pub(crate) fn detach(
+		&mut self,
+		branch: BranchId,
+		generation: BranchGeneration,
+	) -> KernelResult<()> {
+		let record = self
+			.records
+			.get_mut(&branch)
+			.filter(|record| !record.deleted && record.generation == generation)
+			.ok_or_else(|| KernelError::new(ErrorCode::NotFound, "branch not found"))?;
+		record.parent = None;
+		Ok(())
+	}
+
+	/// Minimum fork anchor across Active children of `(parent, generation)` —
+	/// the retention-promise pin floor: the parent's compaction must preserve
+	/// every version at or below this sequence (§3.3a of the FK design).
+	pub(crate) fn min_active_child_anchor(
+		&self,
+		parent: BranchId,
+		parent_generation: BranchGeneration,
+	) -> Option<u64> {
+		self.records
+			.values()
+			.filter(|record| !record.deleted)
+			.filter_map(|record| record.parent.as_ref())
+			.filter(|link| link.parent == parent && link.parent_generation == parent_generation)
+			.map(|link| link.fork_seq)
+			.min()
+	}
+
+	/// Whether `(branch, generation)` itself is a fork child (reads stack
+	/// inherited views; its own compaction may never treat its bottom level
+	/// as the bottom of its read stack).
+	pub(crate) fn record_has_parent(&self, branch: BranchId, generation: BranchGeneration) -> bool {
+		self.records.get(&branch).is_some_and(|record| {
+			!record.deleted && record.generation == generation && record.parent.is_some()
+		})
+	}
+
+	/// The ancestor chain for a live owner, nearest-first, as
+	/// `(owner, fork_seq_cap_into_that_ancestor)`. Depth-capped fail-closed.
+	pub(crate) fn parent_chain(
+		&self,
+		branch: BranchId,
+		generation: BranchGeneration,
+		max_depth: usize,
+	) -> crate::error::Result<Vec<(BranchId, BranchGeneration, u64)>> {
+		let mut chain = Vec::new();
+		let mut current = self
+			.records
+			.get(&branch)
+			.filter(|record| !record.deleted && record.generation == generation);
+		while let Some(record) = current {
+			let Some(link) = record.parent.as_ref() else {
+				break;
+			};
+			if chain.len() >= max_depth {
+				return Err(crate::error::Error::MaterializationRequired {
+					depth: chain.len(),
+				});
+			}
+			chain.push((link.parent, link.parent_generation, link.fork_seq));
+			let parent_record = self.records.get(&link.parent).filter(|parent_record| {
+				!parent_record.deleted && parent_record.generation == link.parent_generation
+			});
+			if parent_record.is_none() {
+				return Err(crate::error::Error::Corruption(format!(
+					"branch {:?} names a parent that is not live at the linked generation",
+					record.id
+				)));
+			}
+			current = parent_record;
+		}
+		Ok(chain)
+	}
+
 	pub(crate) fn get(&self, id: BranchId) -> KernelResult<&BranchRecord> {
 		self.records
 			.get(&id)
@@ -96,7 +285,7 @@ impl BranchCatalog {
 			.ok_or_else(|| KernelError::new(ErrorCode::NotFound, "branch not found"))
 	}
 
-	#[cfg(test)]
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn get_by_name(&self, name: &str) -> KernelResult<&BranchRecord> {
 		let id = self
 			.live_names
@@ -120,41 +309,30 @@ impl BranchCatalog {
 		Ok(record)
 	}
 
-	#[cfg(test)]
+	/// Live branches in catalog order (tombstones excluded).
 	pub(crate) fn list(&self) -> impl Iterator<Item = &BranchRecord> {
 		self.live_names.values().filter_map(|id| self.records.get(id))
 	}
 
-	#[cfg(test)]
-	pub(crate) fn advance_head(
-		&mut self,
-		id: BranchId,
-		generation: BranchGeneration,
-		expected: CommitVersion,
-		new_head: CommitVersion,
-	) -> KernelResult<()> {
-		let record = self
-			.records
-			.get_mut(&id)
-			.filter(|record| !record.deleted)
-			.ok_or_else(|| KernelError::new(ErrorCode::NotFound, "branch not found"))?;
-		if record.generation != generation {
-			return Err(KernelError::new(ErrorCode::Fenced, "branch generation is stale"));
-		}
-		if record.head != expected || new_head <= expected {
-			return Err(KernelError::new(ErrorCode::Conflict, "branch head changed"));
-		}
-		record.head = new_head;
-		Ok(())
-	}
-
-	#[cfg(test)]
-	pub(crate) fn delete(&mut self, id: BranchId) -> KernelResult<bool> {
+	pub(crate) fn delete(&mut self, id: BranchId, deleted_at_seq: u64) -> KernelResult<bool> {
 		if id == self.default_branch {
 			return Err(KernelError::new(
 				ErrorCode::InvalidArgument,
 				"default branch cannot be deleted",
 			));
+		}
+		// §3.3b: an Active child's view is resolved through its parent's live
+		// state, so a parent may not be tombstoned while any child names it. The
+		// catalog loader enforces the same invariant, which means publishing such
+		// a tombstone would make the store unopenable.
+		let generation = self.records.get(&id).map(|record| record.generation);
+		if let Some(generation) = generation {
+			if self.min_active_child_anchor(id, generation).is_some() {
+				return Err(KernelError::new(
+					ErrorCode::Conflict,
+					"branch has active fork children and cannot be deleted",
+				));
+			}
 		}
 		let record = self
 			.records
@@ -164,12 +342,149 @@ impl BranchCatalog {
 			return Ok(false);
 		}
 		record.deleted = true;
+		record.deleted_at_seq = Some(deleted_at_seq);
 		self.live_names.remove(&record.name);
 		Ok(true)
 	}
+
+	/// Sets or clears a branch's expiry. `None` makes the branch permanent.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn set_expiry(&mut self, id: BranchId, expires_at: Option<u64>) -> KernelResult<()> {
+		if id == self.default_branch {
+			return Err(KernelError::new(
+				ErrorCode::InvalidArgument,
+				"the default branch cannot expire",
+			));
+		}
+		let record = self
+			.records
+			.get_mut(&id)
+			.filter(|record| !record.deleted)
+			.ok_or_else(|| KernelError::new(ErrorCode::NotFound, "branch not found"))?;
+		record.expires_at = expires_at;
+		Ok(())
+	}
+
+	/// Tombstones every live branch whose expiry has passed, returning their
+	/// names in catalog order.
+	///
+	/// A parent of Active children is skipped rather than cascaded: deleting it
+	/// would break views its children still resolve through, and deleting the
+	/// subtree would destroy branches whose own TTL has not fired. Its tombstone
+	/// lands on the first sweep after the last child is gone.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn expire_due(&mut self, now: u64, deleted_at_seq: u64) -> Vec<String> {
+		let due: Vec<(BranchId, String)> = self
+			.records
+			.values()
+			.filter(|record| !record.deleted)
+			.filter(|record| record.expires_at.is_some_and(|expiry| expiry <= now))
+			.map(|record| (record.id, record.name.clone()))
+			.collect();
+		let mut expired = Vec::new();
+		for (id, name) in due {
+			if self.delete(id, deleted_at_seq).unwrap_or(false) {
+				expired.push(name);
+			}
+		}
+		expired
+	}
+
+	/// Every record, including tombstones — the durable catalog encodes all.
+	pub(crate) fn all_records(&self) -> impl Iterator<Item = &BranchRecord> {
+		self.records.values()
+	}
+
+	/// Rebuilds the runtime catalog from a decoded durable manifest.
+	pub(crate) fn from_manifest(
+		default_branch: BranchId,
+		manifest: &crate::authority::format::CatalogManifest,
+	) -> crate::error::Result<Self> {
+		let mut records = BTreeMap::new();
+		let mut live_names = BTreeMap::new();
+		for entry in &manifest.entries {
+			let deleted = entry.status == crate::authority::format::BranchStatus::Deleted;
+			let record = BranchRecord {
+				id: entry.branch,
+				name: entry.name.clone(),
+				generation: entry.generation,
+				deleted,
+				created_at_seq: entry.created_at_seq,
+				deleted_at_seq: entry.deleted_at_seq,
+				expires_at: entry.expires_at,
+				parent: entry.parent.clone(),
+			};
+			if !deleted && live_names.insert(entry.name.clone(), entry.branch).is_some() {
+				return Err(crate::error::Error::Corruption(format!(
+					"catalog manifest lists two live branches named {:?}",
+					entry.name
+				)));
+			}
+			records.insert(entry.branch, record);
+		}
+		if records.get(&default_branch).is_none_or(|record| record.deleted) {
+			return Err(crate::error::Error::Corruption(
+				"catalog manifest is missing the live default branch".to_owned(),
+			));
+		}
+		// Invariant 3 (resolvability), enforced at load ahead of FK5's delete
+		// guard: an Active child's parent must be Active at the linked
+		// generation, or the child's reads have nothing to resolve through.
+		for record in records.values().filter(|record| !record.deleted) {
+			if let Some(link) = record.parent.as_ref() {
+				let parent_live = records.get(&link.parent).is_some_and(|parent_record| {
+					!parent_record.deleted && parent_record.generation == link.parent_generation
+				});
+				if !parent_live {
+					return Err(crate::error::Error::Corruption(format!(
+						"catalog manifest: active branch {:?} names a parent that is not live at the linked generation",
+						record.id
+					)));
+				}
+			}
+		}
+		Ok(Self {
+			default_branch,
+			records,
+			live_names,
+			next_generation: manifest.next_generation,
+		})
+	}
+
+	/// Encodes the runtime catalog as durable entries, sorted by branch id.
+	pub(crate) fn to_entries(&self) -> Vec<crate::authority::format::CatalogEntry> {
+		use crate::authority::format::{BranchStatus, CatalogEntry};
+		self.records
+			.values()
+			.map(|record| CatalogEntry {
+				branch: record.id,
+				name: record.name.clone(),
+				generation: record.generation,
+				status: if record.deleted {
+					BranchStatus::Deleted
+				} else {
+					BranchStatus::Active
+				},
+				created_at_seq: record.created_at_seq,
+				parent: record.parent.clone(),
+				deleted_at_seq: record.deleted_at_seq,
+				expires_at: record.expires_at,
+			})
+			.collect()
+	}
+
+	/// Maximum version anchor across ALL records including tombstones: the
+	/// recovered clock must never fall below a catalog-referenced sequence,
+	/// or generation fences would eat legitimate new commits.
+	pub(crate) fn max_version_anchor(&self) -> u64 {
+		self.records
+			.values()
+			.map(|record| record.created_at_seq.max(record.deleted_at_seq.unwrap_or(0)))
+			.max()
+			.unwrap_or(0)
+	}
 }
 
-#[cfg(test)]
 fn validate_branch_name(name: &str) -> KernelResult<()> {
 	if name.is_empty()
 		|| name.len() > MAX_BRANCH_NAME_LEN
@@ -181,344 +496,33 @@ fn validate_branch_name(name: &str) -> KernelResult<()> {
 	Ok(())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReadSelector {
-	Latest,
-	Version(CommitVersion),
-	Timestamp(CommitTimestamp),
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WriteOperation {
-	Put {
-		key: Bytes,
-		value: Bytes,
-		expires_at: Option<CommitTimestamp>,
-	},
-	Delete {
-		key: Bytes,
-	},
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg(test)]
-pub(crate) struct ModelCommitReceipt {
-	pub(crate) version: CommitVersion,
-	pub(crate) timestamp: CommitTimestamp,
-	pub(crate) branch_head: CommitVersion,
-}
-
-#[derive(Clone, Debug)]
-#[cfg(test)]
-struct ModelValue {
-	version: CommitVersion,
-	timestamp: CommitTimestamp,
-	value: Option<Bytes>,
-	expires_at: Option<CommitTimestamp>,
-}
-
-#[derive(Clone, Debug)]
-#[cfg(test)]
-struct ModelBranch {
-	name: String,
-	generation: BranchGeneration,
-	head: CommitVersion,
-	deleted: bool,
-	history: BTreeMap<Bytes, Vec<ModelValue>>,
-}
-
-/// Independent logical oracle. Copying state during fork is intentional here:
-/// the model optimizes for obvious semantics, not implementation shape.
-#[cfg(test)]
-pub(crate) struct BranchModel {
-	branches: BTreeMap<BranchId, ModelBranch>,
-	names: BTreeMap<String, BranchId>,
-	name_generations: BTreeMap<String, BranchGeneration>,
-	timeline: Vec<(CommitTimestamp, CommitVersion)>,
-	global_version: CommitVersion,
-	current_time: CommitTimestamp,
-	steps: usize,
-}
-
-#[cfg(test)]
-impl BranchModel {
-	pub(crate) fn new(main_id: BranchId) -> Self {
-		let main = ModelBranch {
-			name: DEFAULT_BRANCH_NAME.to_string(),
-			generation: BranchGeneration(0),
-			head: CommitVersion(0),
-			deleted: false,
-			history: BTreeMap::new(),
-		};
-		Self {
-			branches: BTreeMap::from([(main_id, main)]),
-			names: BTreeMap::from([(DEFAULT_BRANCH_NAME.to_string(), main_id)]),
-			name_generations: BTreeMap::from([(
-				DEFAULT_BRANCH_NAME.to_string(),
-				BranchGeneration(0),
-			)]),
-			timeline: Vec::new(),
-			global_version: CommitVersion(0),
-			current_time: CommitTimestamp(0),
-			steps: 0,
-		}
-	}
-
-	pub(crate) fn advance_time(&mut self, timestamp: CommitTimestamp) -> KernelResult<()> {
-		if timestamp < self.current_time {
-			return Err(KernelError::new(
-				ErrorCode::InvalidArgument,
-				"model clock cannot move backwards",
-			));
-		}
-		self.current_time = timestamp;
-		self.steps += 1;
-		Ok(())
-	}
-
-	pub(crate) fn head(&self, branch: BranchId) -> KernelResult<CommitVersion> {
-		Ok(self.live_branch(branch)?.head)
-	}
-
-	pub(crate) fn generation(&self, branch: BranchId) -> KernelResult<BranchGeneration> {
-		Ok(self.live_branch(branch)?.generation)
-	}
-
-	pub(crate) fn steps(&self) -> usize {
-		self.steps
-	}
-
-	pub(crate) fn commit(
-		&mut self,
-		branch: BranchId,
-		expected_head: CommitVersion,
-		timestamp: CommitTimestamp,
-		writes: Vec<WriteOperation>,
-	) -> KernelResult<ModelCommitReceipt> {
-		let current_head = self.live_branch(branch)?.head;
-		if current_head != expected_head {
-			return Err(KernelError::new(ErrorCode::Conflict, "branch head changed"));
-		}
-		if self.timeline.last().is_some_and(|(last, _)| timestamp.0 <= last.0) {
-			return Err(KernelError::new(
-				ErrorCode::InvalidArgument,
-				"commit timestamps must increase",
-			));
-		}
-		if writes.is_empty() {
-			return Err(KernelError::new(ErrorCode::InvalidArgument, "empty model commit"));
-		}
-
-		let version = CommitVersion(self.global_version.0 + 1);
-		let state = self.branches.get_mut(&branch).unwrap();
-		for write in writes {
-			let (key, value, expires_at) = match write {
-				WriteOperation::Put {
-					key,
-					value,
-					expires_at,
-				} => (key, Some(value), expires_at),
-				WriteOperation::Delete {
-					key,
-				} => (key, None, None),
-			};
-			state.history.entry(key).or_default().push(ModelValue {
-				version,
-				timestamp,
-				value,
-				expires_at,
-			});
-		}
-		state.head = version;
-		self.global_version = version;
-		self.timeline.push((timestamp, version));
-		self.current_time = self.current_time.max(timestamp);
-		self.steps += 1;
-		Ok(ModelCommitReceipt {
-			version,
-			timestamp,
-			branch_head: version,
-		})
-	}
-
-	pub(crate) fn fork(
-		&mut self,
-		source: BranchId,
-		selector: ReadSelector,
-		new_id: BranchId,
-		name: &str,
-	) -> KernelResult<BranchGeneration> {
-		if self.names.contains_key(name) || self.branches.contains_key(&new_id) {
-			return Err(KernelError::new(ErrorCode::AlreadyExists, "branch already exists"));
-		}
-		let source_state = self.live_branch(source)?.clone();
-		let cap = self.resolve_selector(&source_state, selector)?;
-		let generation = self
-			.name_generations
-			.get(name)
-			.map_or(BranchGeneration(0), |generation| BranchGeneration(generation.0 + 1));
-		let history = source_state
-			.history
-			.into_iter()
-			.filter_map(|(key, values)| {
-				let retained: Vec<_> =
-					values.into_iter().filter(|value| value.version <= cap).collect();
-				(!retained.is_empty()).then_some((key, retained))
-			})
-			.collect();
-		self.branches.insert(
-			new_id,
-			ModelBranch {
-				name: name.to_string(),
-				generation,
-				head: cap,
-				deleted: false,
-				history,
-			},
-		);
-		self.names.insert(name.to_string(), new_id);
-		self.name_generations.insert(name.to_string(), generation);
-		self.steps += 1;
-		Ok(generation)
-	}
-
-	pub(crate) fn delete_branch(&mut self, branch: BranchId) -> KernelResult<()> {
-		let state = self
-			.branches
-			.get_mut(&branch)
-			.ok_or_else(|| KernelError::new(ErrorCode::NotFound, "branch not found"))?;
-		if state.name == DEFAULT_BRANCH_NAME {
-			return Err(KernelError::new(ErrorCode::InvalidArgument, "main cannot be deleted"));
-		}
-		if state.deleted {
-			return Ok(());
-		}
-		state.deleted = true;
-		self.names.remove(&state.name);
-		self.steps += 1;
-		Ok(())
-	}
-
-	pub(crate) fn get(
-		&self,
-		branch: BranchId,
-		key: &[u8],
-		selector: ReadSelector,
-	) -> KernelResult<Option<Bytes>> {
-		let state = self.live_branch(branch)?;
-		let version = self.resolve_selector(state, selector)?;
-		let timestamp = match selector {
-			ReadSelector::Timestamp(timestamp) => timestamp,
-			ReadSelector::Latest => self.current_time,
-			ReadSelector::Version(_) => self.timestamp_for_version(version),
-		};
-		Ok(state.history.get(key).and_then(|history| {
-			history.iter().rev().find(|value| value.version <= version).and_then(|value| {
-				if value.expires_at.is_some_and(|expiry| expiry.0 <= timestamp.0) {
-					None
-				} else {
-					value.value.clone()
-				}
-			})
-		}))
-	}
-
-	pub(crate) fn scan(
-		&self,
-		branch: BranchId,
-		start: &[u8],
-		end: &[u8],
-		selector: ReadSelector,
-	) -> KernelResult<Vec<(Bytes, Bytes)>> {
-		if start > end {
-			return Err(KernelError::new(ErrorCode::InvalidArgument, "invalid key range"));
-		}
-		let state = self.live_branch(branch)?;
-		let mut output = Vec::new();
-		for key in state.history.keys().filter(|key| key.as_ref() >= start && key.as_ref() < end) {
-			if let Some(value) = self.get(branch, key, selector)? {
-				output.push((key.clone(), value));
-			}
-		}
-		Ok(output)
-	}
-
-	pub(crate) fn history(
-		&self,
-		branch: BranchId,
-		key: &[u8],
-	) -> KernelResult<Vec<(CommitVersion, CommitTimestamp, Option<Bytes>)>> {
-		let state = self.live_branch(branch)?;
-		Ok(state.history.get(key).map_or_else(Vec::new, |values| {
-			values
-				.iter()
-				.rev()
-				.map(|value| (value.version, value.timestamp, value.value.clone()))
-				.collect()
-		}))
-	}
-
-	fn live_branch(&self, branch: BranchId) -> KernelResult<&ModelBranch> {
-		self.branches
-			.get(&branch)
-			.filter(|branch| !branch.deleted)
-			.ok_or_else(|| KernelError::new(ErrorCode::NotFound, "branch not found"))
-	}
-
-	fn resolve_selector(
-		&self,
-		branch: &ModelBranch,
-		selector: ReadSelector,
-	) -> KernelResult<CommitVersion> {
-		let requested = match selector {
-			ReadSelector::Latest => branch.head,
-			ReadSelector::Version(version) => version,
-			ReadSelector::Timestamp(timestamp) => self
-				.timeline
-				.iter()
-				.rev()
-				.find(|(candidate, _)| *candidate <= timestamp)
-				.map_or(CommitVersion(0), |(_, version)| *version),
-		};
-		if requested > self.global_version {
-			return Err(KernelError::new(
-				ErrorCode::InvalidArgument,
-				"selector exceeds published database version",
-			));
-		}
-		Ok(requested)
-	}
-
-	fn timestamp_for_version(&self, version: CommitVersion) -> CommitTimestamp {
-		self.timeline
-			.iter()
-			.rev()
-			.find(|(_, candidate)| *candidate <= version)
-			.map_or(CommitTimestamp(0), |(timestamp, _)| *timestamp)
-	}
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
 
 	#[test]
-	fn catalog_delete_recreate_increments_generation_and_fences_stale_owner() {
+	fn catalog_delete_recreate_allocates_globally_fresh_generation_and_fences_stale_owner() {
 		let main = BranchId::from_u128(1);
 		let first = BranchId::from_u128(2);
 		let second = BranchId::from_u128(3);
 		let mut catalog = BranchCatalog::new(main);
-		let original = catalog.create(first, " agent/work", CommitVersion(0));
+		let original = catalog.create(first, " agent/work", 0);
 		assert_eq!(original.unwrap_err().code, ErrorCode::InvalidArgument);
-		let original = catalog.create(first, "agent/work", CommitVersion(4)).unwrap();
-		assert_eq!(original.generation, BranchGeneration(0));
-		assert!(catalog.delete(first).unwrap());
-		assert!(!catalog.delete(first).unwrap());
-		let recreated = catalog.create(second, "agent/work", CommitVersion(8)).unwrap();
-		assert_eq!(recreated.generation, BranchGeneration(1));
-		let stale =
-			catalog.advance_head(second, original.generation, CommitVersion(8), CommitVersion(9));
+		let original = catalog.create(first, "agent/work", 4).unwrap();
+		assert_eq!(original.generation, BranchGeneration(1), "allocation starts above default's 0");
+		assert_eq!(original.created_at_seq, 4);
+		assert!(catalog.delete(first, 7).unwrap());
+		assert!(!catalog.delete(first, 7).unwrap());
+		// Global allocator: the recreated name gets a globally fresh
+		// generation — never a per-name ordinal — so tombstone reclamation
+		// can never enable stale-generation acceptance.
+		let recreated = catalog.create(second, "agent/work", 8).unwrap();
+		assert_eq!(recreated.generation, BranchGeneration(2));
+		assert!(recreated.generation != original.generation);
+		let stale = catalog.validate_owner(second, original.generation);
 		assert_eq!(stale.unwrap_err().code, ErrorCode::Fenced);
+		// Anchors survive on the tombstone for clock restart safety.
+		assert_eq!(catalog.max_version_anchor(), 8);
 	}
 
 	#[test]
@@ -526,27 +530,14 @@ mod tests {
 		let main = BranchId::from_u128(1);
 		let child = BranchId::from_u128(2);
 		let mut catalog = BranchCatalog::new(main);
-		catalog.create(child, "child", CommitVersion(3)).unwrap();
+		catalog.create(child, "child", 3).unwrap();
 		assert_eq!(catalog.default_branch(), main);
 		assert_eq!(catalog.get_by_name("child").unwrap().id, child);
 		assert_eq!(catalog.list().count(), 2);
-		assert_eq!(catalog.delete(main).unwrap_err().code, ErrorCode::InvalidArgument);
-		catalog.delete(child).unwrap();
+		assert_eq!(catalog.delete(main, 9).unwrap_err().code, ErrorCode::InvalidArgument);
+		catalog.delete(child, 9).unwrap();
 		assert_eq!(catalog.list().count(), 1);
 		assert_eq!(catalog.get_by_name("child").unwrap_err().code, ErrorCode::NotFound);
-	}
-
-	#[test]
-	fn catalog_expected_head_transition_is_strict() {
-		let main = BranchId::from_u128(1);
-		let mut catalog = BranchCatalog::new(main);
-		catalog
-			.advance_head(main, BranchGeneration(0), CommitVersion(0), CommitVersion(2))
-			.unwrap();
-		assert_eq!(catalog.get(main).unwrap().head, CommitVersion(2));
-		let conflict =
-			catalog.advance_head(main, BranchGeneration(0), CommitVersion(0), CommitVersion(3));
-		assert_eq!(conflict.unwrap_err().code, ErrorCode::Conflict);
 	}
 
 	#[test]
@@ -554,94 +545,9 @@ mod tests {
 		let main = BranchId::from_u128(1);
 		let child = BranchId::from_u128(2);
 		let mut catalog = BranchCatalog::new(main);
-		let record = catalog.create(child, "child", CommitVersion(0)).unwrap();
-		catalog.delete(child).unwrap();
+		let record = catalog.create(child, "child", 0).unwrap();
+		catalog.delete(child, 9).unwrap();
 		let error = catalog.validate_owner(record.id, record.generation).unwrap_err();
 		assert_eq!(error.code, ErrorCode::Fenced);
-	}
-
-	#[test]
-	fn owner_model_masks_older_values_with_tombstones_and_ttl() {
-		let main = BranchId::from_u128(1);
-		let mut model = BranchModel::new(main);
-		model
-			.commit(
-				main,
-				CommitVersion(0),
-				CommitTimestamp(10),
-				vec![WriteOperation::Put {
-					key: Bytes::from_static(b"ttl"),
-					value: Bytes::from_static(b"value"),
-					expires_at: Some(CommitTimestamp(20)),
-				}],
-			)
-			.unwrap();
-		assert_eq!(
-			model.get(main, b"ttl", ReadSelector::Latest).unwrap(),
-			Some(Bytes::from_static(b"value"))
-		);
-		model.advance_time(CommitTimestamp(20)).unwrap();
-		assert_eq!(model.get(main, b"ttl", ReadSelector::Latest).unwrap(), None);
-		assert_eq!(
-			model.get(main, b"ttl", ReadSelector::Version(CommitVersion(1))).unwrap(),
-			Some(Bytes::from_static(b"value")),
-			"historical version evaluates TTL at that version's commit time"
-		);
-
-		model
-			.commit(
-				main,
-				CommitVersion(1),
-				CommitTimestamp(30),
-				vec![WriteOperation::Delete {
-					key: Bytes::from_static(b"ttl"),
-				}],
-			)
-			.unwrap();
-		assert_eq!(model.get(main, b"ttl", ReadSelector::Latest).unwrap(), None);
-		assert_eq!(model.history(main, b"ttl").unwrap().len(), 2);
-	}
-
-	#[test]
-	fn owner_model_accepts_global_selector_above_sparse_branch_head() {
-		let main = BranchId::from_u128(1);
-		let child = BranchId::from_u128(2);
-		let snapshot = BranchId::from_u128(3);
-		let mut model = BranchModel::new(main);
-		model
-			.commit(
-				main,
-				CommitVersion(0),
-				CommitTimestamp(10),
-				vec![WriteOperation::Put {
-					key: Bytes::from_static(b"a"),
-					value: Bytes::from_static(b"main"),
-					expires_at: None,
-				}],
-			)
-			.unwrap();
-		model.fork(main, ReadSelector::Latest, child, "child").unwrap();
-		model
-			.commit(
-				child,
-				CommitVersion(1),
-				CommitTimestamp(20),
-				vec![WriteOperation::Put {
-					key: Bytes::from_static(b"b"),
-					value: Bytes::from_static(b"child"),
-					expires_at: None,
-				}],
-			)
-			.unwrap();
-
-		assert_eq!(
-			model.get(main, b"a", ReadSelector::Version(CommitVersion(2))).unwrap(),
-			Some(Bytes::from_static(b"main"))
-		);
-		model
-			.fork(main, ReadSelector::Timestamp(CommitTimestamp(20)), snapshot, "snapshot")
-			.unwrap();
-		assert_eq!(model.head(snapshot).unwrap(), CommitVersion(2));
-		assert_eq!(model.get(snapshot, b"b", ReadSelector::Latest).unwrap(), None);
 	}
 }

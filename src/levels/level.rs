@@ -1,10 +1,7 @@
-use std::io::{Read, Write};
 use std::sync::Arc;
 
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-
 use crate::sstable::table::Table;
-use crate::{InternalKeyRange, Result};
+use crate::InternalKeyRange;
 
 /// Represents a single level in the LSM tree.
 /// Each level contains a sorted collection of SSTables.
@@ -112,55 +109,6 @@ impl Levels {
 
 	pub(crate) fn total_tables(&self) -> usize {
 		self.0.iter().map(|level| level.tables.len()).sum()
-	}
-
-	/// Encodes the levels structure to a writer in a binary format
-	/// Format:
-	/// - Number of levels (u8)
-	/// - For each level:
-	///   - Number of tables (u32, BigEndian)
-	///   - For each table:
-	///     - Table ID (u64, BigEndian)
-	pub(crate) fn encode<W: Write>(&self, writer: &mut W) -> Result<()> {
-		writer.write_u8(self.0.len() as u8)?;
-
-		for level in &self.0 {
-			writer.write_u32::<BigEndian>(level.tables.len() as u32)?;
-
-			for table in &level.tables {
-				writer.write_u64::<BigEndian>(table.id)?;
-			}
-		}
-
-		Ok(())
-	}
-
-	/// Decodes the levels structure from a reader in a binary format
-	/// Format:
-	/// - Number of levels (u8)
-	/// - For each level:
-	///   - Number of tables (u32, BigEndian)
-	///   - For each table:
-	///     - Table ID (u64, BigEndian)
-	///
-	/// Returns a vector of vectors containing table IDs for each level
-	pub(crate) fn decode<R: Read>(reader: &mut R) -> Result<Vec<Vec<u64>>> {
-		let level_count = reader.read_u8()?;
-		let mut levels = Vec::with_capacity(level_count as usize);
-
-		for _ in 0..level_count {
-			let table_count = reader.read_u32::<BigEndian>()?;
-			let mut level = Vec::with_capacity(table_count as usize);
-
-			for _ in 0..table_count {
-				let table_id = reader.read_u64::<BigEndian>()?;
-				level.push(table_id);
-			}
-
-			levels.push(level);
-		}
-
-		Ok(levels)
 	}
 
 	/// Returns a reference to all levels

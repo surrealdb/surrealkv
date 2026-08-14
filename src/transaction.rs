@@ -290,7 +290,7 @@ impl Transaction {
 
 		let mut snapshot = None;
 		if !mode.is_write_only() {
-			snapshot = Some(Snapshot::new_owned(Arc::clone(&core), start_seq_num, owner));
+			snapshot = Some(Snapshot::new_owned(Arc::clone(&core), start_seq_num, owner)?);
 		}
 
 		Ok(Self {
@@ -754,10 +754,7 @@ impl Transaction {
 		// If there are no pending writes, there's nothing to commit, so return early.
 		if self.write_set.is_empty() {
 			self.closed = true;
-			// Release the GC watermark slot promptly; otherwise it waits for Drop.
-			if let Some(mut g) = self.txn_guard.take() {
-				g.release();
-			}
+			self.release_reader_state();
 			return Ok(());
 		}
 
@@ -799,24 +796,36 @@ impl Transaction {
 		let should_sync = self.durability == Durability::Immediate;
 		self.core.commit(batch, should_sync, self.start_seq_num).await?;
 
-		// Mark the transaction as closed and release the watermark slot.
+		// Mark the transaction as closed and release the reader state.
 		self.closed = true;
-		if let Some(mut g) = self.txn_guard.take() {
-			g.release();
-		}
+		self.release_reader_state();
 		Ok(())
+	}
+
+	/// Drops everything a finished transaction holds on behalf of readers: the
+	/// oracle's GC watermark slot and the read snapshot.
+	///
+	/// Both must go at the end of the transaction rather than at `Drop`. Every
+	/// read path refuses a closed transaction before reaching the snapshot, so a
+	/// committed handle can no longer use either — but while it holds them it
+	/// pins the oracle watermark and, through the snapshot tracker, the
+	/// retention boundary that compaction honours. A caller who parks a
+	/// committed `Transaction` in a struct field would otherwise freeze version
+	/// reclamation for as long as it lives.
+	fn release_reader_state(&mut self) {
+		if let Some(mut guard) = self.txn_guard.take() {
+			guard.release();
+		}
+		self.snapshot.take();
 	}
 
 	pub fn rollback(&mut self) {
 		self.closed = true;
 		self.write_set.clear();
-		self.snapshot.take();
 		self.savepoints = 0;
 		self.write_seqno = 0;
-		// Release the GC watermark slot eagerly (Drop is a fallback for panic paths).
-		if let Some(mut g) = self.txn_guard.take() {
-			g.release();
-		}
+		// Eager release; Drop is the fallback for panic paths.
+		self.release_reader_state();
 	}
 
 	/// After calling this method the subsequent modifications within this

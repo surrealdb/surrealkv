@@ -11,6 +11,28 @@ fn removed_vlog_and_btree_engines_remain_absent() {
 	}
 }
 
+/// FK1 enforced absence: the single-file manifest engine (whole-file
+/// rewrite, rename-replace, snapshot list) must not return. Metadata is
+/// numbered immutable lineages published by conditional create.
+#[test]
+fn removed_manifest_file_engine_remains_absent() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let levels = std::fs::read_to_string(root.join("src/levels/mod.rs")).unwrap();
+	for forbidden in ["fn write_manifest_to_disk", "fn load_from_file", "struct SnapshotInfo"] {
+		assert!(
+			!levels.contains(forbidden),
+			"single-file manifest machinery returned to levels/mod.rs: {forbidden}"
+		);
+	}
+	// Non-vacuity: the replacement persistence exists where expected.
+	assert!(levels.contains("fn persist_owner_update"), "guard parsed the wrong file");
+	let lib = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+	assert!(
+		!lib.contains("fn manifest_file_path"),
+		"manifest file-path plumbing returned to Options"
+	);
+}
+
 #[test]
 fn simulated_fault_backend_is_test_only() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -31,10 +53,6 @@ fn branch_native_filesystem_io_is_confined_to_local_adapter() {
 	for relative in [
 		"src/api.rs",
 		"src/branch.rs",
-		"src/database.rs",
-		"src/format.rs",
-		"src/lifecycle.rs",
-		"src/table.rs",
 		"src/storage/mod.rs",
 		"src/storage/memory.rs",
 		"src/storage/sim.rs",
@@ -86,7 +104,7 @@ fn core_inner_owns_lsm_components_only_through_branch_runtime() {
 }
 
 #[test]
-fn crate_root_keeps_existing_engine_during_branch_native_integration() {
+fn crate_root_exposes_one_engine_over_the_injected_roles() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let source = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
 	for retained in [
@@ -95,16 +113,63 @@ fn crate_root_keeps_existing_engine_during_branch_native_integration() {
 		"mod wal;",
 		"mod sstable;",
 		"mod memtable;",
+		"mod branch;",
+		"mod storage;",
 		"pub use crate::lsm",
 		"pub use crate::transaction",
 	] {
-		assert!(source.contains(retained), "existing runtime was bypassed: {retained}");
-	}
-	for integrated in ["mod branch;", "mod database;", "mod storage;", "mod table;"] {
-		assert!(
-			source.contains(integrated),
-			"branch-native module is not integrated: {integrated}"
-		);
+		assert!(source.contains(retained), "the engine or its seam was bypassed: {retained}");
 	}
 	assert!(!source.contains("mod rewrite;"), "temporary rewrite namespace returned");
+}
+
+/// PA2 enforced absence: the parallel prototype engine is deleted, not
+/// deprecated (`docs/removed-surfaces.md`). It carried a second table format and
+/// a second codec stack whose filenames shadowed the live ones, so "the format
+/// file" was ambiguous. Nothing here may come back without a new design.
+#[test]
+fn removed_prototype_engine_remains_absent() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	for relative in [
+		"src/database.rs",
+		"src/table.rs",
+		"src/format.rs",
+		"src/testkit.rs",
+		"src/lifecycle.rs",
+		"src/branch_native.rs",
+		"src/test/rewrite_public_tests.rs",
+	] {
+		assert!(!root.join(relative).exists(), "deleted prototype path returned: {relative}");
+	}
+
+	let lib = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+	for forbidden in ["mod database;", "mod table;", "mod format;", "mod testkit;", "branch_native"]
+	{
+		assert!(!lib.contains(forbidden), "prototype module was re-declared: {forbidden}");
+	}
+
+	// The reference model and its selector types went with it; the catalog that
+	// shares the file did not.
+	let branch = std::fs::read_to_string(root.join("src/branch.rs")).unwrap();
+	for forbidden in
+		["struct BranchModel", "enum ReadSelector", "enum WriteOperation", "advance_head"]
+	{
+		assert!(!branch.contains(forbidden), "reference model returned to branch.rs: {forbidden}");
+	}
+	// Non-vacuity, twice over: this guard reads the real file, and the detector
+	// finds a string that IS present in it.
+	assert!(branch.contains("struct BranchCatalog"), "guard parsed the wrong file");
+	assert!(
+		!branch.contains("struct BranchModelXX"),
+		"placeholder assertion must not match anything"
+	);
+
+	// The seam the prototype existed to prove is retained.
+	let storage = std::fs::read_to_string(root.join("src/storage/mod.rs")).unwrap();
+	for retained in ["trait ObjectStore", "trait CommitStore", "trait Platform"] {
+		assert!(
+			storage.contains(retained),
+			"the injected role seam was lost with the prototype: {retained}"
+		);
+	}
 }

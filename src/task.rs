@@ -158,6 +158,21 @@ impl TaskManager {
 						log::debug!("Level compaction completed successfully");
 						write_stall.signal_work_done();
 					}
+
+					// Branch metadata maintenance rides this wake rather than a
+					// timer of its own (D10 seam 3). A failure here costs
+					// retention, not correctness — expired branches stay live and
+					// old metadata versions stay on disk until the next wake — so
+					// it is logged and does not stall writes.
+					match core.sweep_branch_maintenance() {
+						Ok((expired, pruned)) if expired > 0 || pruned > 0 => {
+							log::debug!(
+								"branch maintenance: {expired} expired, {pruned} metadata version(s) pruned"
+							);
+						}
+						Ok(_) => {}
+						Err(e) => log::warn!("branch maintenance step failed: {e:?}"),
+					}
 					running.store(false, Ordering::SeqCst);
 				}
 			});

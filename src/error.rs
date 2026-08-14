@@ -55,6 +55,39 @@ pub enum Error {
 	ManifestCorruption(String), /* Manifest inconsistency detected (e.g., log_number exceeds
 	                     * WAL segments) */
 	InvalidArgument(String),
+
+	/// A timestamp resolution below the timeline's covered horizon: the
+	/// answer would be a guess, so the request abstains with the boundary.
+	TimestampBelowHorizon {
+		requested: u64,
+		horizon_floor: u64,
+	},
+
+	/// An ancestor chain exceeded the depth budget: the branch must be
+	/// materialized (detached) before this operation can proceed.
+	MaterializationRequired {
+		depth: usize,
+	},
+
+	/// A fork point below the parent's retention floor: the history that view
+	/// needs has already been collapsed, so the request is refused rather than
+	/// served short of rows.
+	BelowRetentionFloor {
+		requested: u64,
+		floor: u64,
+	},
+
+	/// The fork fence gave up waiting for in-flight commits to leave the
+	/// pipeline. Nothing was published; the fork can be retried.
+	ForkFenceTimeout,
+
+	/// A fork published a lower inherited-view retention pin while a compaction
+	/// of the parent was already merging. The output is discarded unpublished;
+	/// the next cycle re-picks the same inputs under the stricter floor.
+	CompactionPinRaced {
+		sampled_floor: u64,
+		current_floor: u64,
+	},
 	InvalidTag(String),
 	InterleavedIteration, // Interleaved iteration not supported
 	/// WAL corruption detected during recovery, includes location for repair
@@ -109,6 +142,26 @@ impl fmt::Display for Error {
             Self::Corruption(err) => write!(f, "Data corruption detected: {err}"),
             Self::ManifestCorruption(err) => write!(f, "Manifest corruption detected: {err}"),
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
+            Self::TimestampBelowHorizon { requested, horizon_floor } => write!(
+                f,
+                "Timestamp {requested} is below the timeline horizon floor {horizon_floor}"
+            ),
+            Self::MaterializationRequired { depth } => write!(
+                f,
+                "Ancestor chain depth {depth} exceeds the view budget; materialize the branch"
+            ),
+            Self::BelowRetentionFloor { requested, floor } => write!(
+                f,
+                "Fork point {requested} is below the retention floor {floor}; that history has been collapsed"
+            ),
+            Self::ForkFenceTimeout => write!(
+                f,
+                "Fork fence timed out waiting for in-flight commits to drain"
+            ),
+            Self::CompactionPinRaced { sampled_floor, current_floor } => write!(
+                f,
+                "Compaction sampled inherited-view floor {sampled_floor} but the catalog now pins {current_floor}; output discarded"
+            ),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::InterleavedIteration => write!(f, "Interleaved iteration not supported: cannot mix next() and next_back() on same iterator"),
             Self::WalCorruption { segment_id, offset, message } => write!(

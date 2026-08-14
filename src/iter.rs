@@ -753,7 +753,39 @@ pub(crate) struct CompactionIterator<'a> {
 	/// active snapshot must be preserved. The list is sorted in ascending
 	/// order for efficient binary search.
 	snapshots: Vec<u64>,
+
+	// ========== Inherited-View Pin (FK3) ==========
+	/// Minimum fork anchor across this owner's Active children in the branch
+	/// catalog, or [`NO_HISTORY_PIN`] when the owner has no children.
+	///
+	/// Every version at or below this sequence is readable by at least one
+	/// child branch through its inherited view (`§3.3a` of the fork design), so
+	/// it survives supersession, wall-clock expiry, and REPLACE/DELETE
+	/// collapse. Unlike `snapshots`, this pin is derived from durable catalog
+	/// anchors, so what a child inherits never depends on which readers
+	/// happened to be live when compaction ran.
+	history_pin_floor: u64,
+
+	/// Count of versions retained solely because of `history_pin_floor`.
+	/// Logged by the compactor and asserted by the retention tests, which
+	/// otherwise could not distinguish "the pin worked" from "nothing was
+	/// droppable anyway".
+	pin_retained_versions: u64,
+
+	/// Highest sequence below which this compaction leaves a view incomplete.
+	///
+	/// Whenever a key loses a version, every view capped between that version
+	/// and the key's newest surviving sequence would answer wrongly — the older
+	/// row is gone and the row that replaced it is above the cap. Recording the
+	/// key's NEWEST sequence (not the dropped one) is what makes the floor
+	/// sound: at or above it, the surviving version answers correctly.
+	retained_floor_advance: u64,
 }
+
+/// `history_pin_floor` value meaning "this owner has no Active children, so no
+/// version is pinned by an inherited view". Sequence numbers start at 1, so
+/// zero can never pin a real version.
+pub(crate) const NO_HISTORY_PIN: u64 = 0;
 
 impl<'a> CompactionIterator<'a> {
 	/// Create a new compaction iterator.
@@ -766,6 +798,7 @@ impl<'a> CompactionIterator<'a> {
 	/// * `retention_period_ns` - How long to keep old versions
 	/// * `clock` - Time source for retention calculations
 	/// * `snapshots` - Sorted list of active snapshot sequence numbers
+	/// * `history_pin_floor` - Inherited-view retention floor, or [`NO_HISTORY_PIN`]
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		iterators: Vec<BoxedLSMIterator<'a>>,
@@ -775,6 +808,7 @@ impl<'a> CompactionIterator<'a> {
 		retention_period_ns: u64,
 		clock: Arc<dyn LogicalClock>,
 		snapshots: Vec<u64>,
+		history_pin_floor: u64,
 	) -> Self {
 		let merge_iter = MergingIterator::new(iterators, cmp);
 
@@ -789,7 +823,24 @@ impl<'a> CompactionIterator<'a> {
 			clock,
 			initialized: false,
 			snapshots,
+			history_pin_floor,
+			pin_retained_versions: 0,
+			retained_floor_advance: 0,
 		}
+	}
+
+	/// Number of versions this compaction retained solely because an Active
+	/// child branch inherits them.
+	pub(crate) fn pin_retained_versions(&self) -> u64 {
+		self.pin_retained_versions
+	}
+
+	/// The owner's retention floor must be raised to at least this sequence
+	/// before this compaction's output becomes durable. Zero when no key lost a
+	/// version, which is the whole-store case for `retention_period_ns == 0`
+	/// with versioning on.
+	pub(crate) fn retained_floor_advance(&self) -> u64 {
+		self.retained_floor_advance
 	}
 
 	/// Initialize the iterator by seeking to the first entry.
@@ -917,6 +968,42 @@ impl<'a> CompactionIterator<'a> {
 		matches!(visibility, SnapshotVisibility::BoundedBySnapshot(_))
 	}
 
+	/// Whether the bottom-level shortcut "the newest version is a hard delete,
+	/// so the whole key leaves the database" is legal for these versions.
+	///
+	/// It is legal only when every reader that can still see an older version
+	/// also sees the tombstone that erases it. A reader boundary is a live
+	/// snapshot sequence or the inherited-view pin floor; a boundary landing in
+	/// `[oldest_seq, delete_seq)` reads data the tombstone does not cover for
+	/// it, so those versions — and the tombstone above them, which must keep
+	/// masking them for readers at or above `delete_seq` — have to survive.
+	///
+	/// This is plan amendment C1(a). The shortcut is evaluated ahead of the
+	/// per-version snapshot check, so before this guard a tombstone reaching
+	/// the bottom level erased versions a live snapshot still read — a
+	/// snapshot-isolation defect independent of branching — and would equally
+	/// erase what a fork child inherits.
+	fn hard_delete_may_drop_all(&self, versions: &[(InternalKey, Value)]) -> bool {
+		let Some((newest, _)) = versions.first() else {
+			return false;
+		};
+		if !newest.is_hard_delete_marker() {
+			return false;
+		}
+		let delete_seq = newest.seq_num();
+		// Sorted descending, so the last entry carries the oldest sequence.
+		let oldest_seq = versions.last().map_or(delete_seq, |(key, _)| key.seq_num());
+		if oldest_seq >= delete_seq {
+			// The tombstone is the only version: nothing below it to preserve.
+			return true;
+		}
+		let uncovered = |boundary: u64| boundary >= oldest_seq && boundary < delete_seq;
+		if self.history_pin_floor != NO_HISTORY_PIN && uncovered(self.history_pin_floor) {
+			return false;
+		}
+		!self.snapshots.iter().copied().any(uncovered)
+	}
+
 	/// Process all accumulated versions of the current key.
 	///
 	/// This is the heart of compaction logic. It decides:
@@ -1032,19 +1119,28 @@ impl<'a> CompactionIterator<'a> {
 		// zero rows.
 		self.accumulated_versions.dedup_by_key(|b| b.0.seq_num());
 
-		// Check if latest version is DELETE at bottom level
-		// If so, we can completely remove this key from the database
-		let latest_is_delete_at_bottom = self.is_bottom_level
-			&& !self.accumulated_versions.is_empty()
-			&& self.accumulated_versions[0].0.is_hard_delete_marker();
+		// Check if latest version is DELETE at bottom level and no reader
+		// boundary sits between the tombstone and the versions below it.
+		// If so, we can completely remove this key from the database.
+		let latest_is_delete_at_bottom =
+			self.is_bottom_level && self.hard_delete_may_drop_all(&self.accumulated_versions);
 
 		// Check if any version is REPLACE
 		// REPLACE semantics: delete all older versions regardless of retention
 		let has_set_with_delete = self.accumulated_versions.iter().any(|(key, _)| key.is_replace());
 
+		// Tracks whether a version at or below `history_pin_floor` was already
+		// pinned for this key. Versions arrive newest-first, so the first one is
+		// the newest at or below the floor — all a point-in-time child can read.
+		let mut pinned_below_floor = false;
+
 		// Track the visibility of the previous (newer) version we processed.
 		// Used to detect when a newer version supersedes an older one.
 		let mut newer_version_visibility: Option<SnapshotVisibility> = None;
+
+		// The key's newest sequence: the floor a dropped version forces, because
+		// this is the version that answers for it once it is gone.
+		let newest_seq = self.accumulated_versions[0].0.seq_num();
 
 		// We need to iterate with indices to access accumulated_versions
 		let len = self.accumulated_versions.len();
@@ -1070,6 +1166,21 @@ impl<'a> CompactionIterator<'a> {
 			// old versions based on retention policy, not snapshot visibility.
 
 			let current_visibility = self.find_earliest_visible_snapshot(seq_num)?;
+
+			// ===== INHERITED-VIEW PIN (FK3, design §3.3a) =====
+			//
+			// A version at or below the pin floor is inside some Active child's
+			// inherited view. A versioned parent pins the whole range (children
+			// inherit full history); a non-versioned parent pins only the newest
+			// version at or below the anchor, which is all a point-in-time child
+			// can read. Both forms are deterministic: they depend on durable
+			// catalog anchors, never on which snapshots are live.
+			let pinned_by_child_view = self.history_pin_floor != NO_HISTORY_PIN
+				&& seq_num <= self.history_pin_floor
+				&& (self.enable_versioning || !pinned_below_floor);
+			if pinned_by_child_view {
+				pinned_below_floor = true;
+			}
 
 			// Check if this version is superseded by a newer version
 			let superseded = if let Some(newer_vis) = newer_version_visibility {
@@ -1099,7 +1210,7 @@ impl<'a> CompactionIterator<'a> {
 			// ===== DETERMINE IF ENTRY IS STALE =====
 			// Stale entries are filtered out during compaction
 
-			let should_mark_stale = if superseded {
+			let stale_ignoring_pin = if superseded {
 				// Superseded: a newer version in the same visibility boundary
 				// makes this version redundant - safe to drop
 				true
@@ -1113,11 +1224,14 @@ impl<'a> CompactionIterator<'a> {
 			} else if is_latest && !is_hard_delete && !is_replace {
 				// Latest PUT: never stale (will be output)
 				false
-			} else if is_latest && is_hard_delete && self.is_bottom_level {
-				// Latest DELETE at bottom: stale (won't be output)
-				true
-			} else if is_latest && is_hard_delete && !self.is_bottom_level {
-				// Latest DELETE at non-bottom: not stale (tombstone preserved)
+			} else if is_latest && is_hard_delete {
+				// Latest DELETE that has to keep masking data: either a
+				// non-bottom level (lower levels may still hold the key), or the
+				// bottom level with the drop-all shortcut disqualified, which
+				// means a version below it survives and would resurrect for
+				// readers at or above this tombstone (C1(b)). A bottom-level
+				// tombstone that IS allowed to drop everything never reaches
+				// this arm — `latest_is_delete_at_bottom` above claims it.
 				false
 			} else if is_latest && is_replace {
 				// Latest REPLACE: not stale (will be output)
@@ -1149,13 +1263,13 @@ impl<'a> CompactionIterator<'a> {
 
 			// ===== DETERMINE IF ENTRY SHOULD BE OUTPUT =====
 
-			let should_output = if superseded {
+			let output_ignoring_pin = if superseded {
 				// Superseded by newer version: don't output
 				false
 			} else if latest_is_delete_at_bottom {
 				// DELETE at bottom: output NOTHING
 				false
-			} else if should_mark_stale {
+			} else if stale_ignoring_pin {
 				// Stale entries: don't output
 				false
 			} else if self.enable_versioning || required_by_snapshot {
@@ -1165,6 +1279,19 @@ impl<'a> CompactionIterator<'a> {
 				// No versioning, no snapshot requirement: only output latest
 				is_latest
 			};
+
+			// The inherited-view pin is an override layer over the rules above:
+			// it only ever adds retention, so parent-visible behaviour with no
+			// children is byte-identical to a store that never forked.
+			let should_output = output_ignoring_pin || pinned_by_child_view;
+			if pinned_by_child_view && !output_ignoring_pin {
+				self.pin_retained_versions += 1;
+			}
+			if !should_output {
+				// This key just lost a version: views capped below its newest
+				// sequence are no longer complete.
+				self.retained_floor_advance = self.retained_floor_advance.max(newest_seq);
+			}
 
 			if should_output {
 				self.output_versions.push((key.clone(), value.clone()));

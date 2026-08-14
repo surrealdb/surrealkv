@@ -16,15 +16,6 @@ macro_rules! id16 {
 	};
 }
 
-macro_rules! id32 {
-	($name:ident) => {
-		#[cfg_attr(not(test), allow(dead_code))]
-		#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-		pub struct $name(pub [u8; 32]);
-	};
-}
-
-id16!(DatabaseId);
 id16!(BranchId);
 
 impl BranchId {
@@ -38,16 +29,9 @@ impl BranchId {
 }
 id16!(OperationId);
 id16!(SessionId);
-id32!(TableId);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BranchGeneration(pub u64);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CommitVersion(pub u64);
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CommitTimestamp(pub u64);
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AuthorityFence(pub u64);

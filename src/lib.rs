@@ -1,4 +1,5 @@
 mod api;
+mod authority;
 mod batch;
 mod branch;
 mod branch_runtime;
@@ -9,15 +10,9 @@ mod commit;
 mod compaction;
 mod comparator;
 mod compression;
-#[cfg(test)]
-mod database;
 mod error;
-#[cfg(test)]
-mod format;
 mod iter;
 mod levels;
-#[cfg(test)]
-mod lifecycle;
 mod lockfile;
 mod lsm;
 mod memtable;
@@ -26,18 +21,12 @@ mod snapshot;
 mod sstable;
 mod stall;
 mod storage;
-#[cfg(test)]
-mod table;
 mod task;
+mod timeline;
 mod tracker;
 mod transaction;
 mod vfs;
 mod wal;
-
-#[cfg(test)]
-mod testkit;
-
-pub mod branch_native;
 
 #[cfg(test)]
 mod test;
@@ -47,24 +36,14 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub use api::{
-	AuthorityFence,
-	BranchGeneration,
-	BranchId,
-	CommitTimestamp,
-	CommitVersion,
-	DatabaseId,
-	ErrorCode,
-	KernelError,
-	KernelResult,
-};
-pub use branch::{ReadSelector, WriteOperation};
+pub use api::{AuthorityFence, BranchGeneration, BranchId, ErrorCode, KernelError, KernelResult};
+pub use branch::{BranchInfo, BranchLineage, ForkPoint};
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 use sstable::bloom::LevelDBBloomFilter;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
-pub use crate::lsm::{Tree, TreeBuilder};
+pub use crate::lsm::{BranchHandle, Tree, TreeBuilder};
 pub use crate::transaction::{
 	Durability,
 	HistoryOptions,
@@ -466,12 +445,6 @@ impl Options {
 		self
 	}
 
-	/// Returns the path for a manifest file with the given ID
-	/// Format: {path}/manifest/{id:020}.manifest
-	pub(crate) fn manifest_file_path(&self, id: u64) -> PathBuf {
-		self.manifest_dir().join(format!("{id:020}.manifest"))
-	}
-
 	/// Returns the path for an `SSTable` file with the given ID
 	/// Format: {path}/sstables/{id:020}.sst
 	pub(crate) fn sstable_file_path(&self, id: u64) -> PathBuf {
@@ -486,11 +459,6 @@ impl Options {
 	/// Returns the directory path for `SSTable` files
 	pub(crate) fn sstable_dir(&self) -> PathBuf {
 		self.path.join("sstables")
-	}
-
-	/// Returns the directory path for manifest files
-	pub(crate) fn manifest_dir(&self) -> PathBuf {
-		self.path.join("manifest")
 	}
 
 	/// Validates the configuration options for consistency and correctness

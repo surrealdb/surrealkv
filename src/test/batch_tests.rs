@@ -75,7 +75,7 @@ fn test_patch_encoded_seq_roundtrip() {
 	placeholder.set(b"key2".to_vec(), b"value2".to_vec(), 8).unwrap();
 	let mut bytes = placeholder.encode().unwrap();
 
-	Batch::patch_encoded_seq(&mut bytes, 4242);
+	Batch::patch_encoded_header(&mut bytes, 4242, 777);
 
 	// Decoding the patched buffer reflects the stamped seq and intact entries.
 	let decoded = Batch::decode(&bytes).unwrap();
@@ -88,11 +88,14 @@ fn test_patch_encoded_seq_roundtrip() {
 	assert_eq!(entries[1].key.as_slice(), b"key2");
 	assert_eq!(entries[1].value.as_ref().unwrap().as_slice(), b"value2");
 
-	// The patched buffer must be byte-identical to encoding with the real seq
-	// from the start — the fixed-width header guarantees this.
+	// The patched buffer must be byte-identical to encoding with the real
+	// seq AND commit timestamp from the start — the fixed-width header
+	// guarantees this.
 	let mut direct = Batch::new(4242);
 	direct.set(b"key1".to_vec(), b"value1".to_vec(), 7).unwrap();
 	direct.set(b"key2".to_vec(), b"value2".to_vec(), 8).unwrap();
+	direct.set_commit_ts(777);
+	assert_eq!(decoded.commit_ts, 777, "decode must surface the stamped commit timestamp");
 	assert_eq!(bytes, direct.encode().unwrap(), "patched buffer must equal direct encode");
 }
 

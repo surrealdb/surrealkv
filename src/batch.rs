@@ -12,11 +12,13 @@ pub(crate) const MAX_BATCH_SIZE: u64 = 1 << 32;
 pub(crate) const BATCH_VERSION: u8 = 1;
 
 /// Fixed-width batch header layout. `encode`, `decode`, and
-/// `patch_encoded_seq` all derive from these constants; changing the header
+/// `patch_encoded_header` all derive from these constants; changing the header
 /// means changing exactly these, nowhere else.
 pub(crate) const BATCH_HEADER_VERSION_OFFSET: usize = 0;
 pub(crate) const BATCH_HEADER_SEQ_OFFSET: usize = 1;
 pub(crate) const BATCH_HEADER_SEQ_LEN: usize = 8;
+pub(crate) const BATCH_HEADER_TS_OFFSET: usize = BATCH_HEADER_SEQ_OFFSET + BATCH_HEADER_SEQ_LEN;
+pub(crate) const BATCH_HEADER_TS_LEN: usize = 8;
 
 /// Physical owner of every row in a commit batch. Ownership stays in the
 /// batch/component metadata and is deliberately not prefixed into user keys.
@@ -58,6 +60,10 @@ pub(crate) struct Batch {
 	// oracle has validated the write set. Constructed with `0` by callers;
 	// the pipeline overwrites it before the batch is written to WAL.
 	pub(crate) starting_seq_num: u64,
+	/// Commit-ordered timestamp, stamped under the commit write mutex with a
+	/// strictly monotone clamp (FK2). Feeds the global timeline; per-entry
+	/// timestamps remain independent user-facing values.
+	pub(crate) commit_ts: u64,
 	pub(crate) size: u64, // Total size of all records (not serialized)
 }
 
@@ -78,6 +84,12 @@ impl Batch {
 			version: BATCH_VERSION,
 			owner,
 			starting_seq_num,
+			// Placeholder mirroring the starting seq: the commit pipeline
+			// ALWAYS overwrites it under the write mutex
+			// (`patch_encoded_header`), so this value is never durable on the
+			// production path — while hand-built batches (tests, tools) with
+			// increasing seqs form valid strictly-monotone timelines.
+			commit_ts: starting_seq_num,
 			size: 0,
 		}
 	}
@@ -101,10 +113,14 @@ impl Batch {
 
 		// Write sequence number (fixed-width 8-byte LE).
 		// Fixed width (vs varint) lets the commit pipeline stamp the seq in
-		// place after pre-encoding off the write lock — see `patch_encoded_seq`.
+		// place after pre-encoding off the write lock — see `patch_encoded_header`.
 		debug_assert_eq!(encoded.len(), BATCH_HEADER_SEQ_OFFSET);
 		encoded.extend_from_slice(&self.starting_seq_num.to_le_bytes());
-		debug_assert_eq!(encoded.len(), BATCH_HEADER_SEQ_OFFSET + BATCH_HEADER_SEQ_LEN);
+		debug_assert_eq!(encoded.len(), BATCH_HEADER_TS_OFFSET);
+		// Commit timestamp (fixed-width so the pipeline can stamp it in place
+		// together with the sequence — see `patch_encoded_header`).
+		encoded.extend_from_slice(&self.commit_ts.to_le_bytes());
+		debug_assert_eq!(encoded.len(), BATCH_HEADER_TS_OFFSET + BATCH_HEADER_TS_LEN);
 
 		// Write branch identity and generation. These bytes identify the
 		// component owner; user keys remain unchanged.
@@ -137,15 +153,16 @@ impl Batch {
 		Ok(encoded)
 	}
 
-	/// Stamp the commit sequence number into an already-encoded batch
-	/// buffer, in place. `encode` writes the seq as 8 fixed-width LE bytes at
-	/// offset `[1..9]` (right after the 1-byte version), so the commit pipeline
-	/// can pre-encode a batch off the write lock with a placeholder seq and then
-	/// stamp the real seq under the lock with no re-encode and no copy.
-	pub(crate) fn patch_encoded_seq(buf: &mut [u8], seq: u64) {
+	/// Stamps the commit sequence AND the commit timestamp into an
+	/// already-encoded batch buffer, in place. `encode` writes both as
+	/// fixed-width LE fields at the named header offsets, so the commit
+	/// pipeline can pre-encode a batch off the write lock with placeholders
+	/// and stamp the real values under the lock with no re-encode and no
+	/// copy.
+	pub(crate) fn patch_encoded_header(buf: &mut [u8], seq: u64, commit_ts: u64) {
 		debug_assert!(
-			buf.len() >= BATCH_HEADER_SEQ_OFFSET + BATCH_HEADER_SEQ_LEN,
-			"encoded batch too short to patch seq"
+			buf.len() >= BATCH_HEADER_TS_OFFSET + BATCH_HEADER_TS_LEN,
+			"encoded batch too short to patch its header"
 		);
 		debug_assert_eq!(
 			buf[BATCH_HEADER_VERSION_OFFSET], BATCH_VERSION,
@@ -153,6 +170,12 @@ impl Batch {
 		);
 		buf[BATCH_HEADER_SEQ_OFFSET..BATCH_HEADER_SEQ_OFFSET + BATCH_HEADER_SEQ_LEN]
 			.copy_from_slice(&seq.to_le_bytes());
+		buf[BATCH_HEADER_TS_OFFSET..BATCH_HEADER_TS_OFFSET + BATCH_HEADER_TS_LEN]
+			.copy_from_slice(&commit_ts.to_le_bytes());
+	}
+
+	pub(crate) fn set_commit_ts(&mut self, commit_ts: u64) {
+		self.commit_ts = commit_ts;
 	}
 
 	#[cfg(test)]
@@ -280,6 +303,9 @@ impl Batch {
 		debug_assert_eq!(pos, BATCH_HEADER_SEQ_OFFSET, "decode drifted from the header layout");
 		let seq_num =
 			u64::from_le_bytes(take(data, &mut pos, BATCH_HEADER_SEQ_LEN)?.try_into().unwrap());
+		debug_assert_eq!(pos, BATCH_HEADER_TS_OFFSET, "decode drifted from the header layout");
+		let commit_ts =
+			u64::from_le_bytes(take(data, &mut pos, BATCH_HEADER_TS_LEN)?.try_into().unwrap());
 		let mut branch = [0; 16];
 		branch.copy_from_slice(take(data, &mut pos, 16)?);
 		let generation = u64::from_le_bytes(take(data, &mut pos, 8)?.try_into().unwrap());
@@ -359,6 +385,7 @@ impl Batch {
 			owner,
 			entries,
 			starting_seq_num: seq_num,
+			commit_ts,
 			size: 0, // Decoded batches don't track size
 		})
 	}

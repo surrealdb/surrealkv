@@ -188,6 +188,12 @@ impl CommitQueue {
 		self.head_tail.fetch_add(1 << DEQUEUE_BITS, Ordering::Release);
 	}
 
+	#[cfg_attr(not(test), allow(dead_code))]
+	fn is_empty(&self) -> bool {
+		let (head, tail) = self.unpack(self.head_tail.load(Ordering::Acquire));
+		head == tail
+	}
+
 	// Multi-consumer dequeue - removes the earliest enqueued Batch, if it is
 	// applied
 	fn dequeue_applied(&self) -> Option<Arc<CommitBatch>> {
@@ -286,6 +292,21 @@ impl CommitPipeline {
 	/// `impl Drop` so callers don't bind to which internal lock backs it.
 	pub(crate) fn lock_writes(&self) -> impl Drop + '_ {
 		self.write_mutex.lock()
+	}
+
+	/// Whether every batch that entered the pipeline has left it — published or
+	/// discarded. Only meaningful while `lock_writes` is held, because enqueue
+	/// happens inside the critical section that lock excludes.
+	///
+	/// This is the fork fence's drain condition. The seq counters cannot serve:
+	/// a batch that allocated a sequence and then failed its WAL append leaves a
+	/// permanent gap that `visible_seq_num` never covers, so waiting for
+	/// `visible_seq_num == log_seq_num - 1` would never return. An empty queue
+	/// means `visible_seq_num` is exactly the highest readable sequence, and the
+	/// gaps belong to sequences no row will ever carry.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn is_drained(&self) -> bool {
+		self.pending.is_empty()
 	}
 
 	/// Discard all oracle entries and set `kept_since = max_seq`.
@@ -481,6 +502,14 @@ impl CommitPipeline {
 		&self.oracle
 	}
 
+	/// Highest sequence ever handed out. Used only to state, in a test, that
+	/// `visible_seq_num` can fall permanently short of it — the reason
+	/// `is_drained` and not the counters defines the fork fence.
+	#[cfg(test)]
+	pub(crate) fn allocated_seq_high_water(&self) -> u64 {
+		self.log_seq_num.load(Ordering::Acquire) - 1
+	}
+
 	fn publish(&self) {
 		// Multi-consumer publish loop
 		loop {
@@ -589,8 +618,11 @@ mod tests {
 	}
 
 	fn mock_write_prepared(prepared: &mut PreparedWrite, seq_num: u64) -> Result<()> {
-		Batch::patch_encoded_seq(&mut prepared.bytes, seq_num);
+		// Mocks stamp the seq as the commit timestamp too: strictly monotone
+		// per the production clamp's contract.
+		Batch::patch_encoded_header(&mut prepared.bytes, seq_num, seq_num);
 		prepared.processed_batch.set_starting_seq_num(seq_num);
+		prepared.processed_batch.set_commit_ts(seq_num);
 		Ok(())
 	}
 
@@ -1144,6 +1176,148 @@ mod tests {
 			"clamp must hold kept_since at the committer's start_seq",
 		);
 
+		pipeline.shutdown();
+	}
+
+	/// The fork fence's drain condition, in the state it exists for: a batch
+	/// that allocated its sequence and is still applying. The pipeline is not
+	/// drained, and `visible_seq_num` does not yet cover the batch — so a fork
+	/// that only fenced writes, without draining, could capture a head whose
+	/// rows are not in the memtable yet.
+	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+	async fn is_drained_is_false_while_a_batch_is_still_applying() {
+		struct GatedEnv {
+			entered: Arc<AtomicBool>,
+			release: Arc<AtomicBool>,
+		}
+
+		impl CommitEnv for GatedEnv {
+			fn pre_serialize(&self, batch: Batch) -> Result<PreparedWrite> {
+				mock_pre_serialize(batch)
+			}
+
+			fn write_prepared(
+				&self,
+				prepared: &mut PreparedWrite,
+				seq_num: u64,
+				_sync: bool,
+			) -> Result<()> {
+				mock_write_prepared(prepared, seq_num)
+			}
+
+			fn apply(&self, _prepared: &PreparedWrite) -> Result<()> {
+				self.entered.store(true, Ordering::Release);
+				while !self.release.load(Ordering::Acquire) {
+					std::hint::spin_loop();
+				}
+				Ok(())
+			}
+
+			fn check_background_error(&self) -> Result<()> {
+				Ok(())
+			}
+
+			fn oldest_active_start_seq(&self) -> u64 {
+				0
+			}
+		}
+
+		let entered = Arc::new(AtomicBool::new(false));
+		let release = Arc::new(AtomicBool::new(false));
+		let pipeline = CommitPipeline::new(
+			Arc::new(GatedEnv {
+				entered: Arc::clone(&entered),
+				release: Arc::clone(&release),
+			}),
+			test_visible_seq_num(),
+			test_write_stall(),
+		);
+		assert!(pipeline.is_drained(), "a pipeline with no traffic is drained");
+
+		let committer = {
+			let pipeline = Arc::clone(&pipeline);
+			tokio::spawn(async move {
+				let mut batch = Batch::new(0);
+				batch.add_record(InternalKeyKind::Set, b"k".to_vec(), Some(vec![1]), 0).unwrap();
+				pipeline.commit(batch, false, 0).await
+			})
+		};
+
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		while !entered.load(Ordering::Acquire) {
+			assert!(std::time::Instant::now() < deadline, "apply never started");
+			tokio::time::sleep(Duration::from_millis(1)).await;
+		}
+		assert!(!pipeline.is_drained(), "an applying batch is still in the pipeline");
+		assert_eq!(
+			pipeline.get_visible_seq_num(),
+			0,
+			"its sequence is allocated but not yet readable"
+		);
+
+		release.store(true, Ordering::Release);
+		committer.await.unwrap().unwrap();
+		let deadline = std::time::Instant::now() + Duration::from_secs(5);
+		while !pipeline.is_drained() {
+			assert!(std::time::Instant::now() < deadline, "pipeline never drained");
+			tokio::time::sleep(Duration::from_millis(1)).await;
+		}
+		assert_eq!(pipeline.get_visible_seq_num(), 1);
+		pipeline.shutdown();
+	}
+
+	/// Why the fence cannot wait on the sequence counters: a batch whose WAL
+	/// append fails has already consumed its sequence, and nothing ever
+	/// publishes it. The queue still empties, so a drain defined on the queue
+	/// returns; a drain defined as `visible_seq_num == log_seq_num - 1` would
+	/// wait forever, holding the write mutex.
+	#[test(tokio::test)]
+	async fn a_failed_wal_append_drains_the_queue_but_never_the_counters() {
+		struct FailingWalEnv;
+
+		impl CommitEnv for FailingWalEnv {
+			fn pre_serialize(&self, batch: Batch) -> Result<PreparedWrite> {
+				mock_pre_serialize(batch)
+			}
+
+			fn write_prepared(
+				&self,
+				_prepared: &mut PreparedWrite,
+				_seq_num: u64,
+				_sync: bool,
+			) -> Result<()> {
+				Err(Error::Wal("planted append failure".to_owned()))
+			}
+
+			fn apply(&self, _prepared: &PreparedWrite) -> Result<()> {
+				panic!("apply must not run after a failed append");
+			}
+
+			fn check_background_error(&self) -> Result<()> {
+				Ok(())
+			}
+
+			fn oldest_active_start_seq(&self) -> u64 {
+				0
+			}
+		}
+
+		let pipeline = CommitPipeline::new(
+			Arc::new(FailingWalEnv),
+			test_visible_seq_num(),
+			test_write_stall(),
+		);
+		let mut batch = Batch::new(0);
+		batch.add_record(InternalKeyKind::Set, b"k".to_vec(), Some(vec![1]), 0).unwrap();
+		assert!(pipeline.commit(batch, false, 0).await.is_err());
+
+		assert!(pipeline.is_drained(), "the failed batch must leave the queue");
+		assert_eq!(pipeline.allocated_seq_high_water(), 1, "its sequence was consumed");
+		assert_eq!(
+			pipeline.get_visible_seq_num(),
+			0,
+			"and can never be published, so the counters never meet"
+		);
 		pipeline.shutdown();
 	}
 }

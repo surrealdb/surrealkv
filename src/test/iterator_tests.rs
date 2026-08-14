@@ -5,7 +5,7 @@ use test_log::test;
 
 use crate::clock::{LogicalClock, MockLogicalClock};
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
-use crate::iter::{BoxedLSMIterator, CompactionIterator, MergingIterator};
+use crate::iter::{BoxedLSMIterator, CompactionIterator, MergingIterator, NO_HISTORY_PIN};
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Value};
@@ -96,6 +96,7 @@ fn test_merge_iterator_sequence_ordering() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	// Collect all items
@@ -175,6 +176,7 @@ fn test_compaction_iterator_hard_delete_filtering() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	// Collect all items
@@ -249,6 +251,7 @@ fn test_compaction_iterator_hard_delete_filtering() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	// Collect all items
@@ -303,6 +306,7 @@ async fn test_combined_iterator_returns_latest_version() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	// Should return only the latest version (seq=300)
@@ -347,6 +351,7 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	// Consume the iterator
@@ -385,6 +390,7 @@ async fn test_hard_delete_at_bottom_level() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	// At bottom level, hard_delete should NOT be returned
@@ -415,6 +421,7 @@ async fn test_hard_delete_at_non_bottom_level() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	// At non-bottom level, hard_delete SHOULD be returned
@@ -464,6 +471,7 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -517,6 +525,7 @@ fn test_compaction_iterator_without_delete_list() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	// Should still work and return latest version
@@ -577,6 +586,7 @@ async fn test_sequence_ordering_across_iterators() {
 		0,
 		Arc::new(MockLogicalClock::default()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -684,6 +694,7 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 		retention_period_ns,
 		clock,
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -810,6 +821,7 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 		retention_period_ns,
 		clock,
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -919,6 +931,7 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 		retention_period_ns,
 		clock,
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -1021,6 +1034,7 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 		retention_period_ns,
 		clock,
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -1088,6 +1102,7 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 		1000,  // retention period
 		clock,
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -1146,6 +1161,7 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 		1000,  // retention period
 		clock,
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -1195,6 +1211,7 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 		1000,  // retention period
 		clock,
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -1244,6 +1261,7 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 		1000,  // retention period
 		clock,
 		vec![],
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -1295,6 +1313,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1342,6 +1361,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1393,6 +1413,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1444,6 +1465,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1510,6 +1532,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1554,6 +1577,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1598,6 +1622,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000, // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1649,6 +1674,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000,  // retention period
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1697,6 +1723,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000,  // retention period (ignored when versioning is disabled)
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1747,6 +1774,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000,  // retention period (ignored when versioning is disabled)
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1791,6 +1819,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000,  // retention period (ignored when versioning is disabled)
 			Arc::clone(&clock) as Arc<dyn LogicalClock>,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -1835,6 +1864,7 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 			1000,  // retention period (ignored when versioning is disabled)
 			clock,
 			vec![],
+			NO_HISTORY_PIN,
 		);
 
 		let mut result = Vec::new();
@@ -2052,6 +2082,7 @@ fn test_snapshot_compaction_no_snapshots_keeps_only_latest() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![], // No snapshots
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2087,6 +2118,7 @@ fn test_snapshot_compaction_single_snapshot_preserves_visible_version() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50], // Snapshot at seq=50
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2131,6 +2163,7 @@ fn test_snapshot_compaction_multiple_snapshots_different_boundaries() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50, 150], // Two snapshots
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2179,6 +2212,7 @@ fn test_snapshot_compaction_newer_version_hides_older_in_same_boundary() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![150], // Snapshot at seq=150
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2214,6 +2248,7 @@ fn test_snapshot_compaction_versions_at_tip_hidden_by_newer() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50], // Snapshot at seq=50
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2250,6 +2285,7 @@ fn test_snapshot_compaction_multiple_keys() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50], // Snapshot at seq=50
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2284,6 +2320,7 @@ fn test_snapshot_compaction_tombstone_visible_to_snapshot() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![150],
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2322,6 +2359,7 @@ fn test_snapshot_compaction_tombstone_at_bottom_with_snapshot() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![150],
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2355,6 +2393,7 @@ fn test_snapshot_compaction_exact_sequence_match() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50], // Snapshot at exact seq=50
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2392,6 +2431,7 @@ fn test_snapshot_compaction_version_older_than_all_snapshots() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![50, 150],
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2421,6 +2461,7 @@ fn test_snapshot_visibility_states() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![], // No snapshots
+		NO_HISTORY_PIN,
 	);
 
 	// Test via the iterator behavior - with no snapshots, should keep only latest
@@ -2458,6 +2499,7 @@ fn test_snapshot_compaction_with_versioning_enabled() {
 		300,   // retention period = 300ns
 		clock, // current time = 1000
 		vec![60],
+		NO_HISTORY_PIN,
 	);
 
 	let mut result = Vec::new();
@@ -2472,4 +2514,218 @@ fn test_snapshot_compaction_with_versioning_enabled() {
 	assert_eq!(result.len(), 2, "Latest and snapshot-visible should be kept");
 	assert!(result.contains(&("key1".to_string(), 100)));
 	assert!(result.contains(&("key1".to_string(), 50)));
+}
+
+// ===== FK3: inherited-view retention pin (design §3.3a) =====
+
+/// Runs one key's versions through the compaction iterator and returns the
+/// surviving `(seq, kind)` pairs, newest first.
+fn compact_versions(
+	versions: Vec<(InternalKey, Value)>,
+	is_bottom_level: bool,
+	enable_versioning: bool,
+	snapshots: Vec<u64>,
+	history_pin_floor: u64,
+) -> Vec<(u64, InternalKeyKind)> {
+	let mut comp_iter = CompactionIterator::new(
+		vec![build_table_iterator(versions)],
+		create_comparator(),
+		is_bottom_level,
+		enable_versioning,
+		0,
+		Arc::new(MockLogicalClock::new()),
+		snapshots,
+		history_pin_floor,
+	);
+	let mut out = Vec::new();
+	for item in comp_iter.by_ref() {
+		let (key, _) = item.unwrap();
+		out.push((key.seq_num(), key.kind()));
+	}
+	out
+}
+
+/// A hard delete at the bottom level erases a key's history — unless a reader
+/// boundary sits between the tombstone and the versions below it. An inherited
+/// view at the pin floor is such a boundary (plan amendment C1(a)), and the
+/// tombstone above the retained version is kept so the parent still reads
+/// "deleted" (C1(b)).
+///
+/// The floor-less arm is the sabotage twin: it must lose the version, or this
+/// test would still pass with the pin mechanism deleted.
+#[test]
+fn fk3_pinned_history_survives_a_bottom_level_hard_delete() {
+	let versions = vec![
+		(create_internal_key("key1", 100, InternalKeyKind::Delete), Vec::new()),
+		(create_internal_key("key1", 30, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let unpinned = compact_versions(versions.clone(), true, false, vec![], NO_HISTORY_PIN);
+	assert!(
+		unpinned.is_empty(),
+		"sabotage twin: with no inherited view the bottom-level delete must still erase the key, got {unpinned:?}"
+	);
+
+	let pinned = compact_versions(versions, true, false, vec![], 50);
+	assert_eq!(
+		pinned,
+		vec![(100, InternalKeyKind::Delete), (30, InternalKeyKind::Set)],
+		"a child forked at 50 reads the row at 30, and the tombstone must keep masking it for the parent"
+	);
+}
+
+/// The same boundary rule applies to live snapshots, which is a pre-existing
+/// snapshot-isolation defect independent of branching: the drop-all shortcut ran
+/// ahead of the per-version snapshot check, so a snapshot below the tombstone
+/// lost its version. A snapshot *above* the tombstone sees the delete and so
+/// does not disqualify the shortcut — that is the sabotage twin here, and it is
+/// also asserted by `test_snapshot_compaction_tombstone_at_bottom_with_snapshot`.
+#[test]
+fn fk3_snapshot_below_a_bottom_level_hard_delete_keeps_its_version() {
+	let versions = vec![
+		(create_internal_key("key1", 100, InternalKeyKind::Delete), Vec::new()),
+		(create_internal_key("key1", 30, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let above = compact_versions(versions.clone(), true, false, vec![150], NO_HISTORY_PIN);
+	assert!(
+		above.is_empty(),
+		"sabotage twin: a snapshot above the tombstone sees the delete, so drop-all stays legal, got {above:?}"
+	);
+
+	let below = compact_versions(versions, true, false, vec![50], NO_HISTORY_PIN);
+	assert_eq!(
+		below,
+		vec![(100, InternalKeyKind::Delete), (30, InternalKeyKind::Set)],
+		"a snapshot at 50 reads the row at 30 and must not lose it to a newer tombstone"
+	);
+}
+
+/// A versioned parent pins the whole range below the anchor (children inherit
+/// full history); a non-versioned parent pins only the newest version at or
+/// below it, which is all a point-in-time child can read. Neither form depends
+/// on which snapshots happen to be live.
+#[test]
+fn fk3_pin_shape_follows_the_parents_own_retention_semantics() {
+	let versions = vec![
+		(create_internal_key("key1", 90, InternalKeyKind::Set), b"v4".to_vec()),
+		(create_internal_key("key1", 40, InternalKeyKind::Set), b"v3".to_vec()),
+		(create_internal_key("key1", 20, InternalKeyKind::Set), b"v2".to_vec()),
+		(create_internal_key("key1", 10, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	let point = compact_versions(versions.clone(), false, false, vec![], 50);
+	assert_eq!(
+		point,
+		vec![(90, InternalKeyKind::Set), (40, InternalKeyKind::Set)],
+		"a point-in-time child needs exactly the newest version at or below its anchor"
+	);
+
+	let range = compact_versions(versions.clone(), false, true, vec![], 50);
+	assert_eq!(
+		range,
+		vec![
+			(90, InternalKeyKind::Set),
+			(40, InternalKeyKind::Set),
+			(20, InternalKeyKind::Set),
+			(10, InternalKeyKind::Set)
+		],
+		"a versioned child inherits full history at or below its anchor"
+	);
+
+	// The pin is deterministic: a live snapshot collapses a versioned store's
+	// history boundary, but the pinned range survives regardless.
+	let with_snapshot = compact_versions(versions.clone(), false, true, vec![200], 50);
+	assert_eq!(
+		with_snapshot, range,
+		"what a child inherits must not depend on which readers were live during compaction"
+	);
+
+	// Sabotage twin for the collapse: with no pin, the same versioned store with
+	// a live snapshot above them drops everything below the newest.
+	let unpinned = compact_versions(versions, false, true, vec![200], NO_HISTORY_PIN);
+	assert_eq!(
+		unpinned,
+		vec![(90, InternalKeyKind::Set)],
+		"without a pin the snapshot boundary collapses the older versions"
+	);
+}
+
+/// Runs one key's versions through the compaction iterator and returns how far
+/// the owner's retention floor must move (FK4 amendment 2).
+fn compact_floor_advance(
+	versions: Vec<(InternalKey, Value)>,
+	is_bottom_level: bool,
+	enable_versioning: bool,
+	retention_period_ns: u64,
+	clock: Arc<MockLogicalClock>,
+) -> u64 {
+	let mut comp_iter = CompactionIterator::new(
+		vec![build_table_iterator(versions)],
+		create_comparator(),
+		is_bottom_level,
+		enable_versioning,
+		retention_period_ns,
+		clock,
+		vec![],
+		NO_HISTORY_PIN,
+	);
+	for item in comp_iter.by_ref() {
+		item.unwrap();
+	}
+	comp_iter.retained_floor_advance()
+}
+
+/// The floor moves past the SURVIVING version, not the dropped one: once
+/// `k@30` is gone, every view capped in `[30, 39]` would answer from nothing,
+/// because the row that replaced it sits at 40 and is above such a cap. A
+/// compaction that drops nothing must not move the floor at all — that arm is
+/// what keeps historical forks available on a versioned store.
+#[test]
+fn fk4_retention_floor_clears_the_surviving_version() {
+	let versions = vec![
+		(create_internal_key("key1", 40, InternalKeyKind::Set), b"v2".to_vec()),
+		(create_internal_key("key1", 30, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+
+	// Point-in-time store: the older version is collapsed, so views below 40
+	// are no longer complete.
+	assert_eq!(
+		compact_floor_advance(versions.clone(), false, false, 0, Arc::new(MockLogicalClock::new())),
+		40
+	);
+
+	// Versioned store keeping everything: nothing is dropped, so every
+	// historical point stays forkable.
+	assert_eq!(
+		compact_floor_advance(versions, false, true, 0, Arc::new(MockLogicalClock::new())),
+		0,
+		"a compaction that drops nothing must not restrict historical views"
+	);
+
+	// A bottom-level hard delete erases the key outright; the floor must clear
+	// the tombstone, which is above every surviving sequence.
+	let deleted = vec![
+		(create_internal_key("key1", 100, InternalKeyKind::Delete), Vec::new()),
+		(create_internal_key("key1", 30, InternalKeyKind::Set), b"v1".to_vec()),
+	];
+	assert_eq!(
+		compact_floor_advance(deleted, true, true, 0, Arc::new(MockLogicalClock::new())),
+		100
+	);
+
+	// Wall-clock expiry is a drop like any other.
+	let clock = Arc::new(MockLogicalClock::new());
+	clock.set_time(10_000);
+	let aged = vec![
+		(
+			create_internal_key_with_timestamp("key1", 40, InternalKeyKind::Set, 9_900),
+			b"new".to_vec(),
+		),
+		(
+			create_internal_key_with_timestamp("key1", 30, InternalKeyKind::Set, 1_000),
+			b"old".to_vec(),
+		),
+	];
+	assert_eq!(compact_floor_advance(aged, false, true, 300, clock), 40);
 }

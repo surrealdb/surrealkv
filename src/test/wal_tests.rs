@@ -146,8 +146,8 @@ fn test_wal_replay_all_segments() {
 
 	// Replay WAL - should replay all segments
 	let arena_size = 1024 * 1024; // 1MB for tests
-	let (sequence_number_opt, memtables) =
-		replay_wal(temp_dir.path(), 0, arena_size, arena_size, &|_| true).unwrap();
+	let outcome = replay_wal(temp_dir.path(), 0, arena_size, arena_size, &|_| true).unwrap();
+	let (sequence_number_opt, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 	let sequence_number = sequence_number_opt.unwrap_or(0);
 
@@ -188,8 +188,8 @@ fn wal_recovery_keeps_branch_owners_in_separate_memtables() {
 	wal.append(&second.encode().unwrap()).unwrap();
 	drop(wal);
 
-	let (max_sequence, memtables) =
-		replay_wal(temp_dir.path(), 0, 1024 * 1024, 1024 * 1024, &|_| true).unwrap();
+	let outcome = replay_wal(temp_dir.path(), 0, 1024 * 1024, 1024 * 1024, &|_| true).unwrap();
+	let (max_sequence, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 	assert_eq!(max_sequence, Some(2));
 	assert_eq!(memtables.len(), 2, "owner change must split physical components");

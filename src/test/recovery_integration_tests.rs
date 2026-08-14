@@ -120,8 +120,9 @@ async fn partial_flush_of_split_wal_keeps_the_segment_replayable() {
 		"partial flush must not advance beyond a still-dependent WAL"
 	);
 	assert_eq!(tree.core.immutable_memtables.read().unwrap().iter().count(), 1);
-	let (max_sequence, replayed) =
+	let outcome =
 		replay_wal(&tree.core.opts.wal_dir(), wal_number, 64 * 1024, 64 * 1024, &|_| true).unwrap();
+	let (max_sequence, replayed) = (outcome.max_seq_num, outcome.memtables);
 	assert_eq!(max_sequence, Some(2));
 	assert_eq!(replayed.len(), 1, "the original segment must still replay both batches");
 
@@ -148,6 +149,9 @@ async fn delayed_apply_after_rotation_keeps_its_actual_wal_replayable() {
 	// pinned, but memtable apply has not happened yet.
 	let mut delayed = Batch::new(2);
 	delayed.set(b"delayed".to_vec(), b"two".to_vec(), 0).unwrap();
+	// Stamp a commit timestamp above the real commits' wall-clock stamps,
+	// exactly as the pipeline would (strictly monotone).
+	delayed.set_commit_ts(tree.core.inner.timeline.last_commit_ts() + 1);
 	tree.core.wal_dependencies.pin_in_flight(2, old_wal);
 	let actual_wal = tree.core.wal.write().append(&delayed.encode().unwrap()).unwrap();
 	assert_eq!(actual_wal, old_wal, "fixture must append to the pre-rotation WAL");
@@ -188,8 +192,9 @@ async fn delayed_apply_after_rotation_keeps_its_actual_wal_replayable() {
 		old_wal,
 		"partial flush must preserve the delayed apply's only durable segment"
 	);
-	let (max_sequence, replayed) =
+	let outcome =
 		replay_wal(&tree.core.opts.wal_dir(), old_wal, 256 * 1024, 256 * 1024, &|_| true).unwrap();
+	let (max_sequence, replayed) = (outcome.max_seq_num, outcome.memtables);
 	assert_eq!(max_sequence, Some(2));
 	assert!(
 		replayed.iter().any(|(memtable, segment)| {

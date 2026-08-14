@@ -457,11 +457,8 @@ fn test_range_skips_non_overlapping_tables() {
 
 	let levels = Levels(vec![Arc::new(level0)]);
 
-	let iter_state = IterState {
-		active: Some(Arc::new(MemTable::default())),
-		immutable: Vec::new(),
-		levels,
-	};
+	let iter_state =
+		IterState::single(Some(Arc::new(MemTable::default())), Vec::new(), levels, u64::MAX);
 
 	// Range that only overlaps with table2
 	let internal_range = crate::user_range_to_internal_range(
@@ -938,11 +935,7 @@ fn create_iter_state_with_tables(
 
 	let levels = Levels(vec![Arc::new(level0), Arc::new(level1), Arc::new(level2)]);
 
-	IterState {
-		active: Some(Arc::new(MemTable::default())),
-		immutable: vec![],
-		levels,
-	}
+	IterState::single(Some(Arc::new(MemTable::default())), vec![], levels, u64::MAX)
 }
 
 // Helper to count the number of items returned by iterator

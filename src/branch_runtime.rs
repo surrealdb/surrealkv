@@ -153,6 +153,30 @@ impl BranchRuntimeRegistry {
 		Ok(runtime)
 	}
 
+	/// Drops a reclaimed branch's runtime and hands back its memtables so the
+	/// caller can release their WAL dependencies.
+	///
+	/// The memtables are discarded, not flushed: the branch is tombstoned, so
+	/// anything it had not yet flushed is unreachable by definition. Their WAL
+	/// dependencies must still be released or the reclaimed branch pins log
+	/// segments forever.
+	pub(crate) fn reclaim(&self, owner: BatchOwner) -> Vec<Arc<MemTable>> {
+		let Ok(mut runtimes) = self.runtimes.write() else {
+			return Vec::new();
+		};
+		let Some(runtime) = runtimes.remove(&owner) else {
+			return Vec::new();
+		};
+		let mut discarded = Vec::new();
+		if let Ok(active) = runtime.active_memtable.read() {
+			discarded.push(Arc::clone(&active));
+		}
+		if let Ok(immutable) = runtime.immutable_memtables.read() {
+			discarded.extend(immutable.iter().map(|entry| Arc::clone(&entry.memtable)));
+		}
+		discarded
+	}
+
 	/// All live runtimes (flush selection, budget accounting, shutdown).
 	pub(crate) fn all(&self) -> Vec<Arc<BranchRuntime>> {
 		self.runtimes.read().map(|map| map.values().cloned().collect()).unwrap_or_default()
@@ -188,12 +212,12 @@ mod tests {
 		});
 		std::fs::create_dir_all(options.sstable_dir()).unwrap();
 		std::fs::create_dir_all(options.wal_dir()).unwrap();
-		std::fs::create_dir_all(options.manifest_dir()).unwrap();
+		let authority = crate::authority::store::AuthorityStore::new(options.path.clone(), [0; 16]);
 		BranchRuntime::new(
 			BatchOwner::DEFAULT,
 			Arc::new(RwLock::new(Arc::new(MemTable::new_owned(64 * 1024, BatchOwner::DEFAULT)))),
 			Arc::new(RwLock::new(ImmutableMemtables::default())),
-			Arc::new(RwLock::new(LevelManifest::new(options).unwrap())),
+			Arc::new(RwLock::new(LevelManifest::fresh(options, authority))),
 		)
 	}
 
@@ -242,16 +266,16 @@ mod tests {
 		});
 		std::fs::create_dir_all(options.sstable_dir()).unwrap();
 		std::fs::create_dir_all(options.wal_dir()).unwrap();
-		std::fs::create_dir_all(options.manifest_dir()).unwrap();
 		let foreign = BatchOwner {
 			branch: crate::BranchId([1; 16]),
 			generation: crate::BranchGeneration(0),
 		};
+		let authority = crate::authority::store::AuthorityStore::new(options.path.clone(), [0; 16]);
 		let _ = BranchRuntime::new(
 			BatchOwner::DEFAULT,
 			Arc::new(RwLock::new(Arc::new(MemTable::new_owned(64 * 1024, foreign)))),
 			Arc::new(RwLock::new(ImmutableMemtables::default())),
-			Arc::new(RwLock::new(LevelManifest::new(options).unwrap())),
+			Arc::new(RwLock::new(LevelManifest::fresh(options, authority))),
 		);
 	}
 }

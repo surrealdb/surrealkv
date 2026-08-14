@@ -1,38 +1,20 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File as SysFile;
-use std::io::{Cursor, Read, Write};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use iter::LevelManifestIterator;
 pub(crate) use level::{Level, Levels};
-use rand::Rng;
 
+use crate::authority::format::{BranchStateManifest, RootManifest};
+use crate::authority::store::AuthorityStore;
 use crate::batch::BatchOwner;
 use crate::error::Error;
 use crate::sstable::table::Table;
 use crate::vfs::File;
 use crate::wal::list_segment_ids;
 use crate::{Options, Result};
-
-fn encode_owner<W: Write>(writer: &mut W, owner: BatchOwner) -> Result<()> {
-	writer.write_all(&owner.branch.0)?;
-	writer.write_u64::<BigEndian>(owner.generation.0)?;
-	Ok(())
-}
-
-fn decode_owner<R: Read>(reader: &mut R) -> Result<BatchOwner> {
-	let mut branch = [0u8; 16];
-	reader.read_exact(&mut branch)?;
-	let generation = reader.read_u64::<BigEndian>()?;
-	Ok(BatchOwner {
-		branch: crate::BranchId(branch),
-		generation: crate::BranchGeneration(generation),
-	})
-}
 
 /// Validates that the manifest's log_number doesn't exceed actual WAL segments on disk.
 /// This detects manifest corruption that could cause silent data loss.
@@ -52,40 +34,6 @@ pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64)
 	Ok(())
 }
 
-/// Owner-partitioned manifest layout: levels are stored per physical
-/// `BatchOwner`. This rewrite line starts at 1 and carries no on-disk
-/// compatibility promise; any other version — including earlier lines'
-/// formats — is rejected by identity, and pre-rewrite files that happen to
-/// share the number fail the structural owner validation instead.
-pub const MANIFEST_FORMAT_VERSION: u16 = 1;
-
-/// Snapshot information stored in the manifest
-#[derive(Debug, Clone)]
-pub(crate) struct SnapshotInfo {
-	/// Snapshot sequence number
-	pub seq_num: u64,
-	/// Creation timestamp (system time in nanoseconds)
-	pub created_at: u128,
-}
-
-impl SnapshotInfo {
-	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-		let mut buf = Vec::new();
-		buf.write_u64::<BigEndian>(self.seq_num)?;
-		buf.write_u128::<BigEndian>(self.created_at)?;
-		Ok(buf)
-	}
-
-	pub(crate) fn decode(mut buf: &[u8]) -> Result<Self> {
-		let seq_num = buf.read_u64::<BigEndian>()?;
-		let created_at = buf.read_u128::<BigEndian>()?;
-		Ok(Self {
-			seq_num,
-			created_at,
-		})
-	}
-}
-
 /// Represents a set of changes to be applied to the manifest.
 ///
 /// A changeset mutates exactly one physical owner's component set. Flush and
@@ -98,20 +46,11 @@ pub(crate) struct ManifestChangeSet {
 	/// fails closed otherwise.
 	pub owner: BatchOwner,
 
-	/// Manifest format version if changed
-	pub manifest_format_version: Option<u16>,
-
 	/// Tables to delete from manifest
 	pub deleted_tables: HashSet<(u8, u64)>, // (level, table_id)
 
 	/// Tables to add to manifest
 	pub new_tables: Vec<(u8, Arc<Table>)>, // (level, table)
-
-	/// Snapshots to add
-	pub new_snapshots: Vec<SnapshotInfo>,
-
-	/// Snapshots to delete (by sequence number)
-	pub deleted_snapshots: HashSet<u64>,
 
 	/// New log_number to set (if Some)
 	/// Indicates that WALs with number < log_number have been flushed
@@ -126,12 +65,6 @@ pub(crate) struct ChangeSetRollback {
 	pub deleted_tables: Vec<(u8, Arc<Table>)>,
 	/// Table IDs that were added (need to be removed on revert)
 	pub added_table_ids: Vec<(u8, u64)>,
-	/// Snapshots that were deleted
-	pub deleted_snapshots: Vec<SnapshotInfo>,
-	/// Snapshot seq_nums that were added
-	pub added_snapshot_seqs: Vec<u64>,
-	/// Previous manifest_format_version if changed
-	pub prev_version: Option<u16>,
 	/// Previous log_number if it was updated
 	pub prev_log_number: Option<u64>,
 	/// Previous last_sequence value
@@ -152,8 +85,9 @@ pub type HiddenSet = HashSet<u64>;
 /// scan globally and filter afterwards. Table IDs remain globally unique
 /// across all owners (one `next_table_id` counter).
 pub(crate) struct LevelManifest {
-	/// Path of level manifest file
-	pub path: PathBuf,
+	/// Durable lineage access (numbered immutable catalog/state/root
+	/// versions); see docs/FK_AUTHORITY_FORK_DESIGN.md.
+	pub(crate) authority: AuthorityStore,
 
 	/// Per-owner level sets. Small cardinality; ordered by first appearance.
 	levels_by_owner: Vec<(BatchOwner, Levels)>,
@@ -161,14 +95,30 @@ pub(crate) struct LevelManifest {
 	/// Set of hidden tables that should not appear during compaction
 	pub(crate) hidden_set: HiddenSet,
 
-	/// Next table ID to use (persisted to disk for safe recovery)
+	/// Next table ID to use (persisted as a block-reserved watermark in root
+	/// versions; recovery resumes at the watermark so ids are never reused)
 	pub(crate) next_table_id: Arc<AtomicU64>,
 
-	/// Manifest format version to allow schema evolution
-	pub manifest_format_version: u16,
+	/// Last published state version per owner (0 = never published).
+	state_versions: HashMap<BatchOwner, u64>,
 
-	/// A list of read snapshots that are currently open
-	pub snapshots: Vec<SnapshotInfo>,
+	/// Lowest sequence at which a view of an owner is still complete. Raised by
+	/// the compaction that drops versions and published with that compaction's
+	/// state version; a historical fork below it is refused rather than served
+	/// short of rows (FK4 amendment 2). Absent = nothing was ever dropped.
+	retained_floors: HashMap<BatchOwner, u64>,
+
+	/// Last published root version (0 = never published).
+	root_version: u64,
+
+	/// Newest successfully published catalog version, mirrored here for root
+	/// publication. Written only after a catalog publish succeeds, so it can lag
+	/// but never lead: a root recording a stale floor makes the open-time
+	/// truncation check weaker, never wrong.
+	pub(crate) catalog_version: Arc<AtomicU64>,
+
+	/// Shared global commit timeline; root publishes snapshot its tail.
+	timeline: std::sync::Arc<crate::timeline::Timeline>,
 
 	/// Minimum WAL number that contains unflushed data.
 	/// All WAL files with number < log_number have been flushed to SST and can
@@ -181,58 +131,169 @@ pub(crate) struct LevelManifest {
 	pub(crate) last_sequence: u64,
 }
 
+/// Table ids are handed out in blocks of this size: each root version
+/// persists a watermark at the next block boundary above the allocated
+/// counter, so a crash wastes at most one block and never reuses an id.
+pub(crate) const TABLE_ID_BLOCK: u64 = 1024;
+
 impl LevelManifest {
-	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+	/// Fresh in-memory manifest for a store with no durable states yet.
+	/// Nothing is published here — the first flush publishes state+root.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn fresh(opts: Arc<Options>, authority: AuthorityStore) -> Self {
 		assert!(opts.level_count > 0, "level_count should be >= 1");
-
-		let manifest_file_path = opts.manifest_file_path(0);
-
-		// Check if the manifest file already exists
-		if manifest_file_path.exists() {
-			// Load existing manifest from file
-			return Self::load_from_file(&manifest_file_path, opts);
-		}
-
-		// If no manifest exists, create a new one
-
-		// Initialize levels with default values
-		let levels = Self::initialize_levels(opts.level_count);
-
-		// Start with next_table_id = 1 (0 is reserved)
-		let next_table_id = Arc::new(AtomicU64::new(1));
-
-		let manifest = Self {
-			path: manifest_file_path,
-			levels_by_owner: vec![(BatchOwner::DEFAULT, levels)],
+		Self {
+			authority,
+			levels_by_owner: vec![(BatchOwner::DEFAULT, Self::initialize_levels(opts.level_count))],
 			hidden_set: HashSet::with_capacity(10),
-			next_table_id,
-			manifest_format_version: MANIFEST_FORMAT_VERSION,
-			snapshots: Vec::new(),
+			next_table_id: Arc::new(AtomicU64::new(1)),
+			state_versions: HashMap::new(),
+			retained_floors: HashMap::new(),
+			root_version: 0,
+			catalog_version: Arc::new(AtomicU64::new(0)),
+			timeline: std::sync::Arc::new(crate::timeline::Timeline::new()),
 			log_number: 0,
 			last_sequence: 0,
-		};
+		}
+	}
 
-		// Write levels to disk with the counter
-		write_manifest_to_disk(&manifest)?;
+	/// Rebuilds the runtime manifest from durable lineages: one state per
+	/// Active catalog branch (absent = the branch never flushed), floors and
+	/// the table-id watermark from the newest root. Fail-closed: an
+	/// unloadable state or a table whose persisted owner disagrees with its
+	/// listing refuses the open.
+	pub(crate) fn hydrate(
+		opts: Arc<Options>,
+		authority: AuthorityStore,
+		catalog: &crate::branch::BranchCatalog,
+		catalog_version: u64,
+		root: Option<&RootManifest>,
+		timeline: std::sync::Arc<crate::timeline::Timeline>,
+	) -> Result<Self> {
+		assert!(opts.level_count > 0, "level_count should be >= 1");
 
-		Ok(manifest)
+		let log_number = root.map(|r| r.wal_reclaim_floor).unwrap_or(0);
+		validate_wal_log_number(&opts.wal_dir(), log_number)?;
+
+		let mut seen_table_ids: HashMap<u64, BatchOwner> = HashMap::new();
+		let mut levels_by_owner: Vec<(BatchOwner, Levels)> = Vec::new();
+		let mut state_versions: HashMap<BatchOwner, u64> = HashMap::new();
+		let mut retained_floors: HashMap<BatchOwner, u64> = HashMap::new();
+		let mut last_sequence = root.map(|r| r.visible_seq).unwrap_or(0);
+		let mut max_referenced_id = 0u64;
+
+		for record in catalog.all_records().filter(|record| !record.deleted) {
+			let owner = BatchOwner {
+				branch: record.id,
+				generation: record.generation,
+			};
+			let hint = root
+				.and_then(|r| {
+					r.state_hints
+						.iter()
+						.find(|(branch, generation, _)| {
+							*branch == record.id && *generation == record.generation
+						})
+						.map(|(_, _, version)| *version)
+				})
+				.unwrap_or(0);
+			let Some(state) = authority.load_state(record.id, record.generation, hint)? else {
+				// Never flushed: legitimately no state lineage. The DEFAULT
+				// owner still needs its (empty) runtime level set.
+				if owner == BatchOwner::DEFAULT {
+					levels_by_owner.push((owner, Self::initialize_levels(opts.level_count)));
+				}
+				continue;
+			};
+
+			let mut levels_vec = Vec::with_capacity(state.levels.len().max(1));
+			for (level_idx, table_ids) in state.levels.iter().enumerate() {
+				let mut tables = Vec::with_capacity(table_ids.len());
+				for &table_id in table_ids {
+					if let Some(previous_owner) = seen_table_ids.insert(table_id, owner) {
+						return Err(Error::LoadManifestFail(format!(
+							"Table {table_id} is listed more than once in owned component sets (owners {previous_owner:?} and {owner:?}); a table has exactly one physical placement"
+						)));
+					}
+					max_referenced_id = max_referenced_id.max(table_id);
+					let table = match Self::load_table(table_id, Arc::clone(&opts)) {
+						Ok(table) => table,
+						Err(err) => {
+							log::error!("Error loading table {table_id}: {err:?}");
+							return Err(Error::LoadManifestFail(err.to_string()));
+						}
+					};
+					if table.meta.owner != owner {
+						return Err(Error::LoadManifestFail(format!(
+							"Table {} is listed under owner {:?} but its persisted metadata names owner {:?}",
+							table_id, owner, table.meta.owner
+						)));
+					}
+					tables.push(table);
+				}
+				if level_idx > 0 && !tables.is_empty() {
+					Self::validate_table_sequence_numbers(level_idx as u8, &tables)?;
+				}
+				levels_vec.push(Arc::new(Level {
+					tables,
+				}));
+			}
+			while levels_vec.len() < opts.level_count as usize {
+				levels_vec.push(Arc::new(Level::default()));
+			}
+			last_sequence = last_sequence.max(state.last_sequence);
+			state_versions.insert(owner, state.state_version);
+			if state.retained_floor_seq > 0 {
+				retained_floors.insert(owner, state.retained_floor_seq);
+			}
+			levels_by_owner.push((owner, Levels(levels_vec)));
+		}
+
+		if !levels_by_owner.iter().any(|(owner, _)| *owner == BatchOwner::DEFAULT) {
+			levels_by_owner
+				.insert(0, (BatchOwner::DEFAULT, Self::initialize_levels(opts.level_count)));
+		}
+
+		// The watermark from root is the floor; states may reference ids the
+		// root never recorded (a state published, then the root publish was
+		// lost). Resume strictly above both, at a fresh block boundary.
+		let watermark = root.map(|r| r.next_table_id).unwrap_or(1);
+		let next_table_id =
+			watermark.max((max_referenced_id / TABLE_ID_BLOCK + 1) * TABLE_ID_BLOCK);
+
+		Ok(Self {
+			authority,
+			levels_by_owner,
+			hidden_set: HashSet::with_capacity(10),
+			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
+			state_versions,
+			retained_floors,
+			root_version: root.map(|r| r.root_version).unwrap_or(0),
+			catalog_version: Arc::new(AtomicU64::new(catalog_version)),
+			timeline,
+			log_number,
+			last_sequence,
+		})
 	}
 
 	/// Test-only: manifest whose default owner set is `levels`, with empty
 	/// snapshots and zeroed floors (the shape the retained tests construct).
 	#[cfg(test)]
 	pub(crate) fn new_for_test(
-		path: PathBuf,
+		path: std::path::PathBuf,
 		levels: Levels,
 		next_table_id: Arc<AtomicU64>,
 	) -> Self {
 		Self {
-			path,
+			authority: AuthorityStore::new(path, [0; 16]),
 			levels_by_owner: vec![(BatchOwner::DEFAULT, levels)],
 			hidden_set: HashSet::new(),
 			next_table_id,
-			manifest_format_version: MANIFEST_FORMAT_VERSION,
-			snapshots: Vec::new(),
+			state_versions: HashMap::new(),
+			retained_floors: HashMap::new(),
+			root_version: 0,
+			catalog_version: Arc::new(AtomicU64::new(0)),
+			timeline: std::sync::Arc::new(crate::timeline::Timeline::new()),
 			log_number: 0,
 			last_sequence: 0,
 		}
@@ -250,6 +311,51 @@ impl LevelManifest {
 	/// Every physical owner that currently has a level set, default first.
 	pub(crate) fn owners(&self) -> Vec<BatchOwner> {
 		self.levels_by_owner.iter().map(|(owner, _)| *owner).collect()
+	}
+
+	/// Drops a reclaimed owner's entire durable footprint from the runtime
+	/// manifest and returns the tables that are now unreferenced, so the caller
+	/// can delete their files.
+	///
+	/// Only legal for an owner the catalog has tombstoned: this is the same
+	/// reachability rule `cleanup_orphaned_sst_files` applies at open, run
+	/// without waiting for a restart. The state lineage on disk is left alone —
+	/// metadata pruning caps it, and nothing loads a deleted branch's state.
+	pub(crate) fn reclaim_owner(&mut self, owner: BatchOwner) -> Vec<Arc<Table>> {
+		let Some(position) = self.levels_by_owner.iter().position(|(set, _)| *set == owner) else {
+			return Vec::new();
+		};
+		let (_, levels) = self.levels_by_owner.remove(position);
+		self.state_versions.remove(&owner);
+		self.retained_floors.remove(&owner);
+		let mut reclaimed = Vec::new();
+		for level in levels.get_levels() {
+			for table in &level.tables {
+				// A table hidden by an in-flight compaction is still this
+				// owner's and still unreferenced once the owner is gone; the
+				// compaction's own output is refused by the liveness guard.
+				reclaimed.push(Arc::clone(table));
+			}
+		}
+		reclaimed
+	}
+
+	/// Lowest sequence at which a view of `owner` is still complete. Zero means
+	/// no compaction has ever dropped one of its versions, so every historical
+	/// point is intact.
+	pub(crate) fn retained_floor(&self, owner: BatchOwner) -> u64 {
+		self.retained_floors.get(&owner).copied().unwrap_or(0)
+	}
+
+	/// Raises `owner`'s retention floor. Called with the advance a compaction
+	/// computed, before that compaction's state version is published, so the
+	/// floor and the level set it describes become durable together.
+	pub(crate) fn raise_retained_floor(&mut self, owner: BatchOwner, floor: u64) {
+		if floor == 0 {
+			return;
+		}
+		let entry = self.retained_floors.entry(owner).or_insert(0);
+		*entry = (*entry).max(floor);
 	}
 
 	fn levels_for_mut(&mut self, owner: BatchOwner) -> Option<&mut Levels> {
@@ -298,164 +404,6 @@ impl LevelManifest {
 		let levels = (0..level_count).map(|_| Arc::new(Level::default())).collect::<Vec<_>>();
 
 		Levels(levels)
-	}
-
-	/// Load a manifest from file and return a complete LevelManifest instance
-	pub(crate) fn load_from_file<P: AsRef<Path>>(
-		manifest_path: P,
-		opts: Arc<Options>,
-	) -> Result<Self> {
-		log::info!("Loading manifest from {:?}", manifest_path.as_ref());
-
-		// Read and parse the manifest file
-		let data = std::fs::read(&manifest_path)?;
-		let mut level_manifest = Cursor::new(data);
-
-		// Read versioned manifest format. Earlier layouts are rejected by
-		// identity: this line makes no on-disk compatibility promise.
-		let version = level_manifest.read_u16::<BigEndian>()?;
-		if version != MANIFEST_FORMAT_VERSION {
-			return Err(Error::LoadManifestFail(format!(
-				"Unsupported manifest format version: {}",
-				version
-			)));
-		}
-
-		let next_table_id = level_manifest.read_u64::<BigEndian>()?;
-		let log_number = level_manifest.read_u64::<BigEndian>()?;
-		let last_sequence = level_manifest.read_u64::<BigEndian>()?;
-
-		log::debug!(
-			"Manifest header: version={}, next_table_id={}, log_number={}, last_sequence={}",
-			version,
-			next_table_id,
-			log_number,
-			last_sequence
-		);
-
-		// Validate log_number against actual WAL segments BEFORE proceeding
-		validate_wal_log_number(&opts.wal_dir(), log_number)?;
-
-		// Read per-owner level sets
-		let owner_count = level_manifest.read_u32::<BigEndian>()? as usize;
-		if owner_count == 0 {
-			return Err(Error::LoadManifestFail(
-				"Manifest contains no owner level sets".to_string(),
-			));
-		}
-		let mut owner_level_data = Vec::with_capacity(owner_count);
-		for _ in 0..owner_count {
-			let owner = decode_owner(&mut level_manifest)?;
-			let level_data = Levels::decode(&mut level_manifest)?;
-			if owner_level_data.iter().any(|(existing, _)| *existing == owner) {
-				return Err(Error::LoadManifestFail(format!(
-					"Manifest lists owner {owner:?} twice"
-				)));
-			}
-			owner_level_data.push((owner, level_data));
-		}
-		if !owner_level_data.iter().any(|(owner, _)| *owner == BatchOwner::DEFAULT) {
-			return Err(Error::LoadManifestFail(
-				"Manifest is missing the default owner level set".to_string(),
-			));
-		}
-
-		// Read snapshots
-		let snapshot_count = level_manifest.read_u32::<BigEndian>()?;
-		let mut snapshots = Vec::new();
-		for _ in 0..snapshot_count {
-			let snapshot_len = level_manifest.read_u32::<BigEndian>()? as usize;
-			let mut snapshot_bytes = vec![0u8; snapshot_len];
-			level_manifest.read_exact(&mut snapshot_bytes)?;
-			let snapshot = SnapshotInfo::decode(&snapshot_bytes)?;
-			snapshots.push(snapshot);
-		}
-
-		// Convert the level data into Level objects with loaded Table
-		// instances, validating physical ownership fail-closed: a table listed
-		// under one owner whose persisted metadata names another owner, or a
-		// table listed under two owners, is corruption.
-		let mut seen_table_ids: HashMap<u64, BatchOwner> = HashMap::new();
-		let mut levels_by_owner = Vec::with_capacity(owner_level_data.len());
-		let mut total_tables = 0usize;
-
-		for (owner, level_data) in &owner_level_data {
-			let mut levels_vec = Vec::with_capacity(level_data.len());
-			for (level_idx, table_ids) in level_data.iter().enumerate() {
-				let mut tables = Vec::with_capacity(table_ids.len());
-
-				for &table_id in table_ids {
-					if let Some(previous_owner) = seen_table_ids.insert(table_id, *owner) {
-						return Err(Error::LoadManifestFail(format!(
-							"Table {table_id} is listed more than once in owned component sets (owners {previous_owner:?} and {owner:?}); a table has exactly one physical placement"
-						)));
-					}
-					// Load the actual table from disk
-					let table = match Self::load_table(table_id, Arc::clone(&opts)) {
-						Ok(table) => table,
-						Err(err) => {
-							log::error!("Error loading table {table_id}: {err:?}");
-							return Err(Error::LoadManifestFail(err.to_string()));
-						}
-					};
-					if table.meta.owner != *owner {
-						return Err(Error::LoadManifestFail(format!(
-							"Table {} is listed under owner {:?} but its persisted metadata names owner {:?}",
-							table_id, owner, table.meta.owner
-						)));
-					}
-					tables.push(table);
-				}
-
-				// Validate sequence numbers inside this owner's level
-				if level_idx > 0 && !tables.is_empty() {
-					Self::validate_table_sequence_numbers(level_idx as u8, &tables)?;
-				}
-
-				total_tables += tables.len();
-				levels_vec.push(Arc::new(Level {
-					tables,
-				}));
-			}
-			levels_by_owner.push((*owner, Levels(levels_vec)));
-		}
-
-		log::info!(
-			"Manifest loaded successfully: version={}, log_number={}, last_sequence={}, tables={}, owners={}",
-			version,
-			log_number,
-			last_sequence,
-			total_tables,
-			levels_by_owner.len()
-		);
-
-		// Validate last_sequence matches the maximum sequence number across
-		// all owners' tables
-		let computed_max_seq = levels_by_owner
-			.iter()
-			.flat_map(|(_, levels)| levels.get_levels().iter())
-			.flat_map(|level| level.tables.iter())
-			.filter_map(|table| table.meta.largest_seq_num)
-			.max()
-			.unwrap_or(0);
-
-		if computed_max_seq != last_sequence {
-			return Err(Error::LoadManifestFail(format!(
-				"Manifest last_sequence mismatch: stored={}, computed from tables={}",
-				last_sequence, computed_max_seq
-			)));
-		}
-
-		Ok(Self {
-			path: manifest_path.as_ref().to_path_buf(),
-			levels_by_owner,
-			hidden_set: HashSet::with_capacity(10),
-			next_table_id: Arc::new(AtomicU64::new(next_table_id)),
-			manifest_format_version: version,
-			snapshots,
-			log_number,
-			last_sequence,
-		})
 	}
 
 	fn validate_table_sequence_numbers(level_idx: u8, tables: &[Arc<Table>]) -> Result<()> {
@@ -591,18 +539,9 @@ impl LevelManifest {
 			owner: changeset.owner,
 			deleted_tables: Vec::new(),
 			added_table_ids: Vec::new(),
-			deleted_snapshots: Vec::new(),
-			added_snapshot_seqs: Vec::new(),
-			prev_version: None,
 			prev_log_number: None,
 			prev_last_sequence: self.last_sequence,
 		};
-
-		// Capture and apply version change
-		if let Some(version) = changeset.manifest_format_version {
-			rollback.prev_version = Some(self.manifest_format_version);
-			self.manifest_format_version = version;
-		}
 
 		// Apply log_number if present, but only if it's higher
 		// This prevents race conditions where concurrent flushes could move log_number
@@ -650,22 +589,6 @@ impl LevelManifest {
 			}
 		}
 
-		// Capture and delete snapshots
-		let deleted: Vec<_> = self
-			.snapshots
-			.iter()
-			.filter(|s| changeset.deleted_snapshots.contains(&s.seq_num))
-			.cloned()
-			.collect();
-		rollback.deleted_snapshots = deleted;
-		self.snapshots.retain(|snapshot| !changeset.deleted_snapshots.contains(&snapshot.seq_num));
-
-		// Add new snapshots and track their seq_nums
-		for snapshot in &changeset.new_snapshots {
-			self.snapshots.push(snapshot.clone());
-			rollback.added_snapshot_seqs.push(snapshot.seq_num);
-		}
-
 		Ok(rollback)
 	}
 
@@ -673,11 +596,6 @@ impl LevelManifest {
 	pub(crate) fn revert_changeset(&mut self, rollback: ChangeSetRollback) {
 		// Restore last_sequence
 		self.last_sequence = rollback.prev_last_sequence;
-
-		// Restore version if it was changed
-		if let Some(prev_version) = rollback.prev_version {
-			self.manifest_format_version = prev_version;
-		}
 
 		// Restore log_number if it was changed
 		if let Some(prev_log_number) = rollback.prev_log_number {
@@ -707,14 +625,79 @@ impl LevelManifest {
 				}
 			}
 		}
+	}
 
-		// Remove snapshots that were added
-		self.snapshots.retain(|s| !rollback.added_snapshot_seqs.contains(&s.seq_num));
+	/// Publishes the touched owner's state version, then a root version —
+	/// the replacement for the deleted whole-file manifest write. Called
+	/// under the manifest write lock (same blocking profile as before).
+	///
+	/// A root failure after a state success does NOT roll the version
+	/// counters back: the published state is a valid superset whose
+	/// referenced SSTs were made durable before this call (existing flush /
+	/// compaction ordering), the stale root hint is healed by forward
+	/// probing, and the next successful publish supersedes it.
+	pub(crate) fn persist_owner_update(&mut self, owner: BatchOwner) -> Result<()> {
+		let next_state = self.state_versions.get(&owner).copied().unwrap_or(0) + 1;
+		let retained_floor_seq = self.retained_floor(owner);
+		let levels: Vec<Vec<u64>> = self
+			.levels_for(owner)
+			.ok_or_else(|| {
+				Error::Corruption(format!("persisting owner {owner:?} with no level set"))
+			})?
+			.get_levels()
+			.iter()
+			.map(|level| level.tables.iter().map(|table| table.id).collect())
+			.collect();
+		let state = BranchStateManifest {
+			branch: owner.branch,
+			generation: owner.generation,
+			state_version: next_state,
+			last_sequence: self.last_sequence,
+			flushed_log_number: self.log_number,
+			retained_floor_seq,
+			levels,
+		};
+		self.authority.publish_state(&state)?;
+		self.state_versions.insert(owner, next_state);
+		self.persist_root()
+	}
 
-		// Re-add snapshots that were deleted
-		for snapshot in rollback.deleted_snapshots {
-			self.snapshots.push(snapshot);
+	/// Publishes a root version alone (floor-only transitions, e.g. the
+	/// shutdown replay-floor advance).
+	pub(crate) fn persist_root(&mut self) -> Result<()> {
+		let next_root = self.root_version + 1;
+		let allocated = self.next_table_id.load(std::sync::atomic::Ordering::SeqCst);
+		let watermark = (allocated / TABLE_ID_BLOCK + 1) * TABLE_ID_BLOCK;
+
+		// One hint per branch: after delete/recreate within one process the
+		// map can hold a dead generation's entry — keep the newest
+		// generation only, and sort strictly by branch id (format law).
+		let mut hints: Vec<(crate::BranchId, crate::BranchGeneration, u64)> = Vec::new();
+		for (owner, version) in &self.state_versions {
+			match hints.iter_mut().find(|(branch, _, _)| *branch == owner.branch) {
+				Some(existing) if existing.1 .0 < owner.generation.0 => {
+					*existing = (owner.branch, owner.generation, *version);
+				}
+				Some(_) => {}
+				None => hints.push((owner.branch, owner.generation, *version)),
+			}
 		}
+		hints.sort_by_key(|hint| hint.0 .0);
+
+		let root = RootManifest {
+			db_id: self.authority.db_id,
+			root_version: next_root,
+			visible_seq: self.last_sequence,
+			last_commit_ts: self.timeline.last_commit_ts(),
+			timeline_tail: self.timeline.tail(crate::authority::format::MAX_TIMELINE_TAIL),
+			wal_reclaim_floor: self.log_number,
+			next_table_id: watermark,
+			catalog_version_floor: self.catalog_version.load(std::sync::atomic::Ordering::Acquire),
+			state_hints: hints,
+		};
+		self.authority.publish_root(&root)?;
+		self.root_version = next_root;
+		Ok(())
 	}
 
 	/// Generates the next unique table ID for a new SSTable
@@ -722,104 +705,4 @@ impl LevelManifest {
 	pub(crate) fn next_table_id(&self) -> u64 {
 		self.next_table_id.fetch_add(1, std::sync::atomic::Ordering::Release)
 	}
-}
-
-/// Safely updates a file's content.
-pub(crate) fn replace_file_content<P: AsRef<Path>>(
-	file_path: P,
-	new_content: &[u8],
-) -> std::io::Result<()> {
-	let target_path = file_path.as_ref();
-	let directory = target_path
-		.parent()
-		.ok_or(std::io::Error::new(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
-
-	// Generate a unique temporary filename
-	let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-	let temp_filename = format!(".tmp_{}_{}", timestamp, rand::rng().random::<u64>());
-	let temp_path = directory.join(temp_filename);
-
-	// Get original file permissions if the file exists
-	let original_permissions = std::fs::metadata(target_path).ok().map(|m| m.permissions());
-
-	// Create and write to the temporary file
-	{
-		let mut temp_file = SysFile::create(&temp_path)?;
-		temp_file.write_all(new_content)?;
-		temp_file.sync_all()?;
-	}
-
-	// Apply original permissions to temp file if they exist
-	if let Some(permissions) = original_permissions {
-		if let Err(e) = std::fs::set_permissions(&temp_path, permissions) {
-			// Clean up temp file on permission error
-			let _ = std::fs::remove_file(&temp_path);
-			return Err(e);
-		}
-	}
-
-	// Atomically replace the target file with the temporary file
-	if let Err(e) = std::fs::rename(&temp_path, target_path) {
-		// Clean up temp file on rename failure
-		let _ = std::fs::remove_file(&temp_path);
-		return Err(e);
-	}
-
-	let updated_file = crate::vfs::open_for_sync(target_path)?;
-	updated_file.sync_all()?;
-
-	// Make the rename itself durable: without a parent-directory fsync, a
-	// crash can revert the directory entry to the old file even though the
-	// new content was synced.
-	crate::lsm::fsync_directory(directory)?;
-
-	Ok(())
-}
-
-/// Write the full versioned manifest to disk
-pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
-	let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
-	let total_tables: usize = manifest
-		.levels_by_owner
-		.iter()
-		.flat_map(|(_, levels)| levels.get_levels().iter())
-		.map(|l| l.tables.len())
-		.sum();
-
-	log::debug!(
-		"Writing manifest: version={}, log_number={}, last_sequence={}, next_table_id={}, total_tables={}, owners={}",
-		manifest.manifest_format_version,
-		manifest.log_number,
-		manifest.last_sequence,
-		next_table_id,
-		total_tables,
-		manifest.levels_by_owner.len()
-	);
-
-	let mut buf = Vec::new();
-
-	// Write header
-	buf.write_u16::<BigEndian>(manifest.manifest_format_version)?;
-	buf.write_u64::<BigEndian>(next_table_id)?;
-	buf.write_u64::<BigEndian>(manifest.log_number)?;
-	buf.write_u64::<BigEndian>(manifest.last_sequence)?;
-
-	// Write per-owner level sets
-	buf.write_u32::<BigEndian>(manifest.levels_by_owner.len() as u32)?;
-	for (owner, levels) in &manifest.levels_by_owner {
-		encode_owner(&mut buf, *owner)?;
-		levels.encode(&mut buf)?;
-	}
-
-	// Write snapshots
-	buf.write_u32::<BigEndian>(manifest.snapshots.len() as u32)?;
-	for snapshot in &manifest.snapshots {
-		let snapshot_bytes = snapshot.encode()?;
-		buf.write_u32::<BigEndian>(snapshot_bytes.len() as u32)?;
-		buf.extend_from_slice(&snapshot_bytes);
-	}
-
-	replace_file_content(&manifest.path, &buf)?;
-	log::debug!("Manifest written successfully to {:?}", manifest.path);
-	Ok(())
 }

@@ -33,10 +33,9 @@ pub(crate) use local_commit::LocalCommitStore;
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg(test)]
 mod native;
-#[cfg(not(target_arch = "wasm32"))]
-#[cfg(test)]
-pub(crate) use native::NativePlatform;
 
+#[cfg(test)]
+mod conformance_tests;
 #[cfg(test)]
 mod sim;
 #[cfg(test)]

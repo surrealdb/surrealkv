@@ -7,13 +7,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::Batch;
+use crate::branch::{BranchInfo, BranchLineage, ForkPoint};
 use crate::branch_runtime::{BranchRuntime, BranchRuntimeRegistry};
 use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
 use crate::commit::{CommitEnv, CommitPipeline, PreparedWrite};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
-use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
+use crate::levels::{LevelManifest, ManifestChangeSet};
 use crate::lockfile::LockFile;
 use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
@@ -55,6 +56,14 @@ pub trait CompactionOperations: Send + Sync {
 	fn rotate_wal_pinned_runtime(&self) -> Result<bool> {
 		Ok(false)
 	}
+
+	/// One re-entrant branch-metadata maintenance step: expire due branches and
+	/// prune authority lineages. Runs at the tail of a maintenance wake rather
+	/// than on a timer, so no executor needs a resident clock. Default: nothing
+	/// to maintain.
+	fn sweep_branch_maintenance(&self) -> Result<(usize, usize)> {
+		Ok((0, 0))
+	}
 }
 
 // ===== Core LSM Tree Implementation =====
@@ -86,10 +95,27 @@ pub trait CompactionOperations: Send + Sync {
 /// Read locks and write locks follow the same ordering.
 /// If a function needs multiple locks, it must acquire them in this order.
 /// See `rotate_memtable()`, `flush_immutable_to_sst()` for examples.
+/// Serialized catalog-publish facts (version + epochs + lazy-bump flag).
+pub(crate) struct CatalogPublishState {
+	pub(crate) catalog_version: u64,
+	pub(crate) writer_epoch: u64,
+	pub(crate) maintenance_epoch: u64,
+	session_bumped: bool,
+}
+
+static BRANCH_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn mint_identity(opts: &Options) -> [u8; 16] {
+	let nanos = opts.clock.now();
+	let discriminant = (std::process::id() as u64) << 32
+		| BRANCH_ID_COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFFFF_FFFF;
+	CoreInner::mint_identity_bytes(nanos, discriminant)
+}
+
 pub(crate) struct CoreInner {
 	/// Durable-model branch identity catalog. Data routing remains on the
 	/// existing LSM components and is integrated incrementally.
-	pub(crate) branch_catalog: RwLock<crate::branch::BranchCatalog>,
+	pub(crate) branch_catalog: Arc<RwLock<crate::branch::BranchCatalog>>,
 	/// Complete component set for the retained default branch: the active
 	/// memtable (write buffer), the immutable-memtable flush queue, and the
 	/// owned level manifest. `CoreInner` temporarily dereferences to this
@@ -134,6 +160,22 @@ pub(crate) struct CoreInner {
 	/// Visible sequence number - the highest sequence number that is visible to readers.
 	/// Shared with CommitPipeline for coordinated updates.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
+
+	/// Durable lineage access for catalog publication.
+	pub(crate) authority: crate::authority::store::AuthorityStore,
+
+	/// Catalog version + epochs; every durable catalog op serializes here.
+	pub(crate) catalog_publish: Mutex<CatalogPublishState>,
+
+	/// Recovered clock floor from catalog anchors and the root's visible
+	/// floor; the clock seed takes the max of this, the states, and WAL
+	/// replay (a deleted branch's sequences stay allocated forever).
+	pub(crate) clock_floor: u64,
+
+	/// The global commit timeline (FK2): stamped per commit under the write
+	/// mutex, seeded at open from the root tail + WAL replay, snapshotted
+	/// into every root version. Shared with `LevelManifest`.
+	pub(crate) timeline: Arc<crate::timeline::Timeline>,
 }
 
 /// Transitional compatibility for the default-branch extraction. Field
@@ -151,16 +193,13 @@ impl CoreInner {
 	/// Creates a new LSM tree core instance
 	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
-		Self::new_impl(opts, None)
+		Self::new_impl(opts)
 	}
 
-	/// The catalog-at-open is recovery's fencing authority. Until the fork
-	/// lifecycle slice lands durable catalogs, production opens with the
-	/// default-only catalog; tests inject prepared catalogs here.
-	fn new_impl(
-		opts: Arc<Options>,
-		initial_catalog: Option<crate::branch::BranchCatalog>,
-	) -> Result<Self> {
+	/// Opens the durable authority (catalog lineage first — it is recovery's
+	/// fencing authority), hydrates the runtime manifest from state lineages,
+	/// and seeds the clock so it can never fall below a catalog anchor.
+	fn new_impl(opts: Arc<Options>) -> Result<Self> {
 		// Acquire database lock to prevent multiple processes from opening the same
 		// database
 		let mut lockfile = LockFile::new(&opts.path);
@@ -169,27 +208,45 @@ impl CoreInner {
 		// Initialize immutable memtables
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
 
-		// Initialize level manifest FIRST to get log_number
-		let manifest = LevelManifest::new(Arc::clone(&opts))?;
-		let manifest_log_number = manifest.get_log_number();
-
-		// Initialize WAL starting from manifest.log_number
-		let wal_path = opts.wal_dir();
-		// This avoids creating intermediate empty WAL files
-		let wal_instance =
-			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
-
-		// Starts at 0 since no commits have happened yet.
-		let visible_seq_num = Arc::new(AtomicU64::new(0));
-
-		// Initialize active memtable with its WAL number set to the initial WAL
-		// This tracks which WAL the memtable's data belongs to for later flush
-		let branch_catalog = initial_catalog
-			.unwrap_or_else(|| crate::branch::BranchCatalog::new(crate::BranchId::DEFAULT));
+		// Load or create the durable catalog: the sole authority for branch
+		// existence, generation, anchors, and TTLs.
+		let loaded_catalog =
+			crate::authority::store::AuthorityStore::load_latest_catalog(&opts.path)?;
+		let (branch_catalog, db_id, catalog_version, writer_epoch, maintenance_epoch) =
+			match loaded_catalog {
+				Some(manifest) => {
+					let catalog = crate::branch::BranchCatalog::from_manifest(
+						crate::BranchId::DEFAULT,
+						&manifest,
+					)?;
+					(
+						catalog,
+						manifest.db_id,
+						manifest.catalog_version,
+						manifest.writer_epoch,
+						manifest.maintenance_epoch,
+					)
+				}
+				None => {
+					let db_id = mint_identity(&opts);
+					let catalog = crate::branch::BranchCatalog::new(crate::BranchId::DEFAULT);
+					let manifest = crate::authority::format::CatalogManifest {
+						db_id,
+						catalog_version: 1,
+						next_generation: catalog.next_generation(),
+						writer_epoch: 0,
+						maintenance_epoch: 0,
+						entries: catalog.to_entries(),
+					};
+					crate::authority::store::AuthorityStore::new(opts.path.clone(), db_id)
+						.publish_catalog(&manifest)?;
+					(catalog, db_id, 1, 0, 0)
+				}
+			};
 		// The engine addresses the default branch by the reserved
-		// `BranchId::DEFAULT` in every batch, memtable, and SST. A catalog —
-		// built-in or injected — that cannot validate that identity would
-		// fence every default transaction, so refuse it at open.
+		// `BranchId::DEFAULT` in every batch, memtable, and SST. A catalog
+		// that cannot validate that identity would fence every default
+		// transaction, so refuse it at open.
 		if branch_catalog
 			.validate_owner(
 				crate::batch::BatchOwner::DEFAULT.branch,
@@ -201,6 +258,46 @@ impl CoreInner {
 				"branch catalog does not validate the reserved default branch identity".to_owned(),
 			));
 		}
+
+		let authority = crate::authority::store::AuthorityStore::new(opts.path.clone(), db_id);
+		let root = authority.load_latest_root()?;
+		if let Some(root) = &root {
+			if root.catalog_version_floor > catalog_version {
+				return Err(Error::Corruption(format!(
+					"latest catalog version {catalog_version} is below the root's reclaim floor {}",
+					root.catalog_version_floor
+				)));
+			}
+		}
+		let timeline = Arc::new(crate::timeline::Timeline::new());
+		if let Some(root) = &root {
+			timeline.seed(&root.timeline_tail);
+			timeline.observe_floor(root.last_commit_ts);
+		}
+		let manifest = LevelManifest::hydrate(
+			Arc::clone(&opts),
+			authority.clone(),
+			&branch_catalog,
+			catalog_version,
+			root.as_ref(),
+			Arc::clone(&timeline),
+		)?;
+		let manifest_log_number = manifest.get_log_number();
+		// The recovered clock must never fall below a catalog anchor (a
+		// deleted branch's sequences stay allocated) or the root's published
+		// visible floor — the BR6 fenced-batch rule extended to the catalog.
+		let clock_floor = branch_catalog
+			.max_version_anchor()
+			.max(root.as_ref().map(|r| r.visible_seq).unwrap_or(0));
+
+		// Initialize WAL starting from manifest.log_number
+		let wal_path = opts.wal_dir();
+		// This avoids creating intermediate empty WAL files
+		let wal_instance =
+			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+
+		// Starts at 0 since no commits have happened yet.
+		let visible_seq_num = Arc::new(AtomicU64::new(0));
 		let initial_memtable = Arc::new(MemTable::new_owned(
 			opts.max_memtable_size,
 			crate::batch::BatchOwner::DEFAULT,
@@ -224,7 +321,7 @@ impl CoreInner {
 		let runtimes = BranchRuntimeRegistry::new(Arc::clone(&default_runtime));
 
 		Ok(Self {
-			branch_catalog: RwLock::new(branch_catalog),
+			branch_catalog: Arc::new(RwLock::new(branch_catalog)),
 			opts,
 			default_runtime,
 			runtimes,
@@ -235,7 +332,462 @@ impl CoreInner {
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
+			authority,
+			catalog_publish: Mutex::new(CatalogPublishState {
+				catalog_version,
+				writer_epoch,
+				maintenance_epoch,
+				session_bumped: false,
+			}),
+			clock_floor,
+			timeline,
 		})
+	}
+
+	/// Mints a 16-byte identity from the injected clock, the process id, and
+	/// a counter. Not a global-uniqueness claim (the adapter phase mints real
+	/// ULIDs); sufficient for identity-mismatch detection across lineages.
+	fn mint_identity_bytes(nanos: u64, discriminant: u64) -> [u8; 16] {
+		let mut id = [0u8; 16];
+		id[..8].copy_from_slice(&nanos.to_le_bytes());
+		id[8..].copy_from_slice(&discriminant.to_le_bytes());
+		id
+	}
+
+	/// Durable branch creation: mutates the runtime catalog and publishes the
+	/// next catalog version. The catalog mutation is rolled back if the
+	/// publish fails, so the runtime never runs ahead of the authority.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn create_branch(&self, name: &str) -> Result<crate::batch::BatchOwner> {
+		let created_at_seq = self.visible_seq_num.load(Ordering::Acquire);
+		let mut publish = self.catalog_publish.lock().unwrap();
+		let mut catalog = self.branch_catalog.write()?;
+		let snapshot = catalog.clone();
+		let id = self.mint_branch_id(&catalog);
+		let record = catalog.create(id, name, created_at_seq).map_err(|error| {
+			Error::InvalidArgument(format!("branch create rejected: {}", error.message))
+		})?;
+		let owner = crate::batch::BatchOwner {
+			branch: id,
+			generation: record.generation,
+		};
+		if let Err(error) = self.publish_catalog_locked(&mut publish, &catalog) {
+			*catalog = snapshot;
+			return Err(error);
+		}
+		Ok(owner)
+	}
+
+	/// FK3 seam: publishes a fork child's catalog entry and nothing else.
+	///
+	/// This is the read/retention half of a fork — the half FK3 owns. It takes
+	/// `fork_seq` as given instead of establishing it, so it deliberately lacks
+	/// everything FK4 adds: the drain-to-visible commit fence that makes the
+	/// anchor exact, the bounded delta table covering committed-but-undurable
+	/// rows, and crash-recovery of a partial fork. Because of that it may only
+	/// be called from tests, with an anchor the test already knows is durable.
+	/// FK4 replaces it with the real protocol and this method is deleted.
+	#[cfg(test)]
+	pub(crate) fn create_fork_entry_for_test(
+		&self,
+		name: &str,
+		parent: crate::batch::BatchOwner,
+		fork_seq: u64,
+	) -> Result<crate::batch::BatchOwner> {
+		let mut publish = self.catalog_publish.lock().unwrap();
+		let mut catalog = self.branch_catalog.write()?;
+		let snapshot = catalog.clone();
+		let id = self.mint_branch_id(&catalog);
+		let record = catalog
+			.create_fork(
+				id,
+				name,
+				fork_seq,
+				crate::authority::format::ParentLink {
+					parent: parent.branch,
+					parent_generation: parent.generation,
+					fork_seq,
+				},
+			)
+			.map_err(|error| {
+				Error::InvalidArgument(format!("fork create rejected: {}", error.message))
+			})?;
+		let owner = crate::batch::BatchOwner {
+			branch: id,
+			generation: record.generation,
+		};
+		if let Err(error) = self.publish_catalog_locked(&mut publish, &catalog) {
+			*catalog = snapshot;
+			return Err(error);
+		}
+		Ok(owner)
+	}
+
+	/// Sets or clears a branch's expiry, publishing one catalog version.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn set_branch_expiry(
+		&self,
+		branch: crate::BranchId,
+		expires_at: Option<u64>,
+	) -> Result<()> {
+		let mut publish = self.catalog_publish.lock().unwrap();
+		let mut catalog = self.branch_catalog.write()?;
+		let snapshot = catalog.clone();
+		catalog.set_expiry(branch, expires_at).map_err(|error| {
+			Error::InvalidArgument(format!("branch expiry rejected: {}", error.message))
+		})?;
+		if let Err(error) = self.publish_catalog_locked(&mut publish, &catalog) {
+			*catalog = snapshot;
+			return Err(error);
+		}
+		Ok(())
+	}
+
+	/// One maintenance step over branch metadata: tombstone expired branches,
+	/// then prune every authority lineage to its retained depth.
+	///
+	/// Re-entrant and idempotent by construction — it recomputes what is due from
+	/// the catalog each time rather than holding a cursor — so it can run at the
+	/// tail of a maintenance wake on any executor, including the request-driven
+	/// ones the object and edge adapters will use. Returns
+	/// `(branches expired, metadata files removed)`.
+	pub(crate) fn sweep_branch_maintenance(&self) -> Result<(usize, usize)> {
+		let now = self.opts.clock.now();
+		let deleted_at_seq = self.visible_seq_num.load(Ordering::Acquire);
+
+		let mut publish = self.catalog_publish.lock().unwrap();
+		let expired = {
+			let mut catalog = self.branch_catalog.write()?;
+			let snapshot = catalog.clone();
+			let expired = catalog.expire_due(now, deleted_at_seq);
+			if expired.is_empty() {
+				Vec::new()
+			} else {
+				if let Err(error) = self.publish_catalog_locked(&mut publish, &catalog) {
+					*catalog = snapshot;
+					return Err(error);
+				}
+				expired
+			}
+		};
+		if !expired.is_empty() {
+			log::debug!("branch maintenance expired {} branch(es): {:?}", expired.len(), expired);
+		}
+
+		let reclaimed = self.reclaim_tombstoned_branches()?;
+		if reclaimed > 0 {
+			log::debug!("branch maintenance reclaimed {reclaimed} table(s) from deleted branches");
+		}
+
+		// Pruning runs after the publish, so the version this sweep just created
+		// is inside the retained window and can never be its own victim.
+		let owners: Vec<_> = self
+			.branch_catalog
+			.read()?
+			.all_records()
+			.map(|record| (record.id, record.generation))
+			.collect();
+		let removed = self.authority.prune_metadata(&owners)?;
+		Ok((expired.len(), removed))
+	}
+
+	/// Copies everything `owner` inherits into its own tables and clears its
+	/// parent link, so it stops resolving through an ancestor.
+	///
+	/// This is the relief valve for the two costs a long-lived fork imposes: it
+	/// shortens the ancestor chain that every read walks, and it releases the
+	/// retention pin its anchor placed on the parent, letting the parent's
+	/// compaction reclaim versions it was holding.
+	///
+	/// The materialized tables are placed BELOW every level the branch already
+	/// occupies. That is not a detail: reads return the first table containing a
+	/// key, level by level, so inherited rows sitting above the branch's own
+	/// compacted rows would shadow them with stale values.
+	///
+	/// Returns the number of rows copied. Detaching a branch with no parent is a
+	/// no-op, not an error, so a caller can detach unconditionally.
+	pub(crate) fn detach_branch(
+		&self,
+		core: &Arc<Core>,
+		owner: crate::batch::BatchOwner,
+	) -> Result<u64> {
+		let mut publish = self.catalog_publish.lock().unwrap();
+		{
+			let catalog = self.branch_catalog.read()?;
+			catalog
+				.validate_owner(owner.branch, owner.generation)
+				.map_err(|_| Error::BranchFenced)?;
+			if !catalog.record_has_parent(owner.branch, owner.generation) {
+				return Ok(0);
+			}
+		}
+
+		// State before catalog. A crash between the two leaves the branch
+		// holding both the materialized tables and its parent link: every
+		// inherited row is then present twice, at identical sequences with
+		// identical values, which reads collapse and compaction reclaims. The
+		// other order would lose the inherited data outright.
+		let rows = self.materialize_inherited(core, owner)?;
+
+		let mut catalog = self.branch_catalog.write()?;
+		let snapshot_catalog = catalog.clone();
+		catalog.detach(owner.branch, owner.generation).map_err(|error| {
+			Error::InvalidArgument(format!("detach rejected: {}", error.message))
+		})?;
+		if let Err(error) = self.publish_catalog_locked(&mut publish, &catalog) {
+			*catalog = snapshot_catalog;
+			return Err(error);
+		}
+		Ok(rows)
+	}
+
+	/// The durable half of a detach: copies everything `owner` inherits into its
+	/// own tables and publishes its state, WITHOUT touching the parent link.
+	///
+	/// Separate from `detach_branch` because it is the half that must land
+	/// first, and because the state it leaves behind — materialized tables plus
+	/// a still-live parent link — is exactly the crash window, so it can be
+	/// tested rather than merely argued.
+	pub(crate) fn materialize_inherited(
+		&self,
+		core: &Arc<Core>,
+		owner: crate::batch::BatchOwner,
+	) -> Result<u64> {
+		// Read the inherited view at the current visible head. Anything the
+		// branch itself wrote is excluded: it is already in its own tables, and
+		// copying it would duplicate rows at their original sequences.
+		let visible = self.visible_seq_num.load(Ordering::Acquire);
+		let Some(snapshot) =
+			crate::snapshot::Snapshot::inherited_only(Arc::clone(core), visible, owner)?
+		else {
+			return Ok(0);
+		};
+
+		let target_level = self.detach_target_level(owner)?;
+		let table_id = self.level_manifest.read()?.next_table_id();
+		let path = self.opts.sstable_file_path(table_id);
+
+		// Every version and every tombstone comes across, in internal-key order,
+		// which is both what makes the result self-contained and what
+		// `TableWriter` requires.
+		let rows = {
+			use crate::LSMIterator as _;
+			let iter_state = snapshot.collect_iter_state()?;
+			let mut merge = crate::snapshot::KMergeIterator::new_from(
+				iter_state,
+				crate::user_range_to_internal_range(
+					std::ops::Bound::Unbounded,
+					std::ops::Bound::Unbounded,
+				),
+			);
+			let file = std::fs::File::create(&path)?;
+			let mut writer = crate::sstable::table::TableWriter::new_owned(
+				file,
+				table_id,
+				Arc::clone(&self.opts),
+				target_level,
+				owner,
+			);
+			let mut rows = 0u64;
+			let mut valid = merge.seek_first()?;
+			while valid {
+				writer.add(merge.key().to_owned(), merge.value_encoded()?)?;
+				rows += 1;
+				valid = merge.next()?;
+			}
+			if rows == 0 {
+				drop(writer);
+				let _ = std::fs::remove_file(&path);
+			} else {
+				writer.finish()?;
+				crate::vfs::fsync_file(&path)?;
+				fsync_directory(self.opts.sstable_dir())?;
+			}
+			rows
+		};
+
+		if rows > 0 {
+			let table = {
+				let file = std::fs::File::open(&path)?;
+				let file: Arc<dyn crate::vfs::File> = Arc::new(file);
+				let file_size = file.size()?;
+				Arc::new(crate::sstable::table::Table::new(
+					table_id,
+					Arc::clone(&self.opts),
+					file,
+					file_size,
+				)?)
+			};
+			let mut manifest = self.level_manifest.write()?;
+			let changeset = crate::levels::ManifestChangeSet {
+				owner,
+				new_tables: vec![(target_level, table)],
+				..crate::levels::ManifestChangeSet::default()
+			};
+			let rollback = manifest.apply_changeset(&changeset)?;
+			if let Err(error) = manifest.persist_owner_update(owner) {
+				manifest.revert_changeset(rollback);
+				let _ = std::fs::remove_file(&path);
+				return Err(error);
+			}
+		}
+		Ok(rows)
+	}
+
+	/// The level a detach writes into: one below the deepest level the branch
+	/// already occupies, so its own rows are always found first.
+	fn detach_target_level(&self, owner: crate::batch::BatchOwner) -> Result<u8> {
+		let manifest = self.level_manifest.read()?;
+		let deepest_occupied = manifest.levels_for(owner).and_then(|levels| {
+			levels
+				.get_levels()
+				.iter()
+				.enumerate()
+				.filter(|(_, level)| !level.tables.is_empty())
+				.map(|(index, _)| index)
+				.next_back()
+		});
+		let target = match deepest_occupied {
+			Some(deepest) => deepest + 1,
+			None => 0,
+		};
+		if target >= self.opts.level_count as usize {
+			return Err(Error::InvalidArgument(format!(
+				"branch {:?} occupies every level; compact it before detaching",
+				owner.branch
+			)));
+		}
+		Ok(target as u8)
+	}
+
+	/// Frees the data of branches the catalog has tombstoned, returning how many
+	/// tables were deleted.
+	///
+	/// This is the runtime half of a rule the store already applies at open: a
+	/// table is live exactly when some non-deleted owner's level set names it
+	/// (`LevelManifest::hydrate` skips deleted records, so their tables are
+	/// already reclaimed by `cleanup_orphaned_sst_files` on the next start). No
+	/// reference counts and no deletion journal are involved — the manifest IS
+	/// the proof, because a fork child holds no physical reference to its
+	/// parent's tables. See `docs/removed-surfaces.md`.
+	///
+	/// Files are unlinked with no grace period. An in-flight reader holds an
+	/// `Arc<Table>` that owns the descriptor, so its reads keep working after
+	/// the unlink — the same property compaction has always relied on when it
+	/// deletes its inputs.
+	fn reclaim_tombstoned_branches(&self) -> Result<usize> {
+		let tombstoned: Vec<crate::batch::BatchOwner> = self
+			.branch_catalog
+			.read()?
+			.all_records()
+			.filter(|record| record.deleted)
+			.map(|record| crate::batch::BatchOwner {
+				branch: record.id,
+				generation: record.generation,
+			})
+			.collect();
+		if tombstoned.is_empty() {
+			return Ok(0);
+		}
+
+		let mut deleted = 0usize;
+		for owner in tombstoned {
+			// Drop the runtime FIRST: once it is gone the flush loop cannot pick
+			// this owner up again, and any flush already past that point is
+			// refused by the liveness guard inside the manifest critical section.
+			for memtable in self.runtimes.reclaim(owner) {
+				// A discarded memtable still holds a WAL dependency. Releasing it
+				// is what lets the segments it pinned be reclaimed; skipping this
+				// would trade a bounded table leak for an unbounded WAL leak.
+				self.wal_dependencies.release_component(memtable.dependency_id());
+			}
+
+			let reclaimed = {
+				let mut manifest = self.level_manifest.write()?;
+				let tables = manifest.reclaim_owner(owner);
+				if !tables.is_empty() {
+					// The root still carries a state hint for this owner; publish
+					// so the durable record stops naming a lineage nothing loads.
+					manifest.persist_root()?;
+				}
+				tables
+			};
+
+			for table in reclaimed {
+				let path = self.opts.sstable_file_path(table.id);
+				match std::fs::remove_file(&path) {
+					Ok(()) => deleted += 1,
+					// Already gone: the previous open reclaimed it, or a
+					// concurrent sweep won the race. Same outcome either way.
+					Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+					Err(error) => {
+						log::warn!("failed to reclaim table {}: {error}", path.display());
+					}
+				}
+			}
+		}
+		Ok(deleted)
+	}
+
+	/// Durable branch deletion (tombstone). Same rollback-on-publish-failure
+	/// contract as creation.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn delete_branch(&self, branch: crate::BranchId) -> Result<()> {
+		let deleted_at_seq = self.visible_seq_num.load(Ordering::Acquire);
+		let mut publish = self.catalog_publish.lock().unwrap();
+		let mut catalog = self.branch_catalog.write()?;
+		let snapshot = catalog.clone();
+		catalog.delete(branch, deleted_at_seq).map_err(|error| {
+			Error::InvalidArgument(format!("branch delete rejected: {}", error.message))
+		})?;
+		if let Err(error) = self.publish_catalog_locked(&mut publish, &catalog) {
+			*catalog = snapshot;
+			return Err(error);
+		}
+		Ok(())
+	}
+
+	fn mint_branch_id(&self, catalog: &crate::branch::BranchCatalog) -> crate::BranchId {
+		loop {
+			let nanos = self.opts.clock.now();
+			let discriminant = (std::process::id() as u64) << 32
+				| BRANCH_ID_COUNTER.fetch_add(1, Ordering::Relaxed) & 0xFFFF_FFFF;
+			let id = crate::BranchId(Self::mint_identity_bytes(nanos, discriminant));
+			if id != crate::BranchId::DEFAULT && catalog.get(id).is_err() {
+				return id;
+			}
+		}
+	}
+
+	/// Publishes the runtime catalog as the next catalog version. The
+	/// writer epoch bumps lazily, folded into the session's first real
+	/// catalog write (an open that never writes bumps nothing).
+	fn publish_catalog_locked(
+		&self,
+		publish: &mut CatalogPublishState,
+		catalog: &crate::branch::BranchCatalog,
+	) -> Result<()> {
+		let next_version = publish.catalog_version + 1;
+		let writer_epoch = if publish.session_bumped {
+			publish.writer_epoch
+		} else {
+			publish.writer_epoch + 1
+		};
+		let manifest = crate::authority::format::CatalogManifest {
+			db_id: self.authority.db_id,
+			catalog_version: next_version,
+			next_generation: catalog.next_generation(),
+			writer_epoch,
+			maintenance_epoch: publish.maintenance_epoch,
+			entries: catalog.to_entries(),
+		};
+		self.authority.publish_catalog(&manifest)?;
+		publish.catalog_version = next_version;
+		publish.writer_epoch = writer_epoch;
+		publish.session_bumped = true;
+		// Mirrored for root publication only after the publish succeeded.
+		self.level_manifest.read()?.catalog_version.store(next_version, Ordering::Release);
+		Ok(())
 	}
 
 	/// Smallest `start_seq_num` of any currently-live transaction (read-write
@@ -276,6 +828,19 @@ impl CoreInner {
 	///
 	/// # Returns
 	/// The flushed SSTable
+	/// Test seam for the reclamation race: drives one flush directly so the
+	/// "branch deleted while its table was being written" interleaving is
+	/// reproducible without timing.
+	#[cfg(test)]
+	pub(crate) fn flush_immutable_to_sst_for_test(
+		&self,
+		memtable: Arc<MemTable>,
+		table_id: u64,
+		wal_number: u64,
+	) -> Result<Arc<Table>> {
+		self.flush_immutable_to_sst(memtable, table_id, wal_number)
+	}
+
 	fn flush_immutable_to_sst(
 		&self,
 		memtable: Arc<MemTable>,
@@ -304,6 +869,30 @@ impl CoreInner {
 			))
 		})?;
 		let mut manifest = self.level_manifest.write()?;
+
+		// Maintenance may have reclaimed this branch while the table above was
+		// being written. Check INSIDE the manifest critical section, which is
+		// what serialises this against the sweep — the liveness check at the top
+		// of this function runs before the lock and cannot close the window.
+		//
+		// Without this the flush would not merely fail: `apply_changeset` calls
+		// `ensure_owner_levels`, which recreates a missing level set, so the
+		// deleted branch would be silently resurrected and published.
+		let owner = memtable.owner();
+		if self.branch_catalog.read()?.validate_owner(owner.branch, owner.generation).is_err() {
+			drop(manifest);
+			log::debug!(
+				"flush abandoned: owner {owner:?} was reclaimed while its table was written"
+			);
+			let path = self.opts.sstable_file_path(table_id);
+			if let Err(error) = std::fs::remove_file(&path) {
+				log::warn!("failed to remove abandoned flush output {}: {error}", path.display());
+			}
+			// The memtable and its WAL dependency belong to the reclaimed
+			// branch; the sweep released them when it dropped the runtime.
+			return Err(Error::BranchFenced);
+		}
+
 		let mut memtable_lock = owning_runtime.immutable_memtables.write()?;
 		let replay_floor = dependency_snapshot.replay_floor;
 		let mut changeset = ManifestChangeSet {
@@ -321,7 +910,7 @@ impl CoreInner {
 		);
 
 		let rollback = manifest.apply_changeset(&changeset)?;
-		if let Err(e) = write_manifest_to_disk(&manifest) {
+		if let Err(e) = manifest.persist_owner_update(memtable.owner()) {
 			manifest.revert_changeset(rollback);
 			let error = Error::Other(format!(
 				"Failed to atomically update manifest: table_id={}, log_number={}: {}",
@@ -767,7 +1356,7 @@ impl CoreInner {
 			};
 			let mut manifest = self.level_manifest.write()?;
 			let rollback = manifest.apply_changeset(&changeset)?;
-			if let Err(error) = write_manifest_to_disk(&manifest) {
+			if let Err(error) = manifest.persist_root() {
 				manifest.revert_changeset(rollback);
 				let error =
 					Error::Other(format!("Failed to finalize shutdown replay floor: {error}"));
@@ -863,9 +1452,24 @@ impl CompactionOperations for CoreInner {
 		// permanently.
 		let owners = self.level_manifest.read()?.owners();
 		for owner in owners {
-			let options = CompactionOptions::for_owner(self, owner);
+			let options = CompactionOptions::for_owner(self, owner)?;
 			let compactor = Compactor::new(options, Arc::clone(&strategy));
-			compactor.compact()?;
+			match compactor.compact() {
+				Ok(()) => {}
+				// A fork pinned lower history mid-merge. Nothing was published
+				// and the inputs are unhidden, so this is a retry condition,
+				// not damage: the next cycle re-picks them under the new floor.
+				// Every other error still fails the cycle.
+				Err(Error::CompactionPinRaced {
+					sampled_floor,
+					current_floor,
+				}) => {
+					log::debug!(
+						"compaction of {owner:?} deferred: inherited-view floor moved {sampled_floor} -> {current_floor}"
+					);
+				}
+				Err(error) => return Err(error),
+			}
 		}
 
 		Ok(())
@@ -886,6 +1490,10 @@ impl CompactionOperations for CoreInner {
 
 	fn rotate_wal_pinned_runtime(&self) -> Result<bool> {
 		self.rotate_wal_pinned_runtime_impl()
+	}
+
+	fn sweep_branch_maintenance(&self) -> Result<(usize, usize)> {
+		CoreInner::sweep_branch_maintenance(self)
 	}
 }
 
@@ -953,8 +1561,14 @@ impl CommitEnv for LsmCommitEnv {
 	// processed batch (consumed by `apply`), then append to the WAL. This is all
 	// that remains under write_mutex — no clone, no re-encode.
 	fn write_prepared(&self, prepared: &mut PreparedWrite, seq_num: u64, sync: bool) -> Result<()> {
-		Batch::patch_encoded_seq(&mut prepared.bytes, seq_num);
+		// Stamp the commit timestamp with the sequence, under the same write
+		// mutex: the strictly monotone clamp orders the timeline exactly like
+		// the sequence axis (FK2).
+		let highest_seq = seq_num + prepared.processed_batch.count() as u64 - 1;
+		let commit_ts = self.core.timeline.stamp(self.core.opts.clock.now(), highest_seq);
+		Batch::patch_encoded_header(&mut prepared.bytes, seq_num, commit_ts);
 		prepared.processed_batch.set_starting_seq_num(seq_num);
+		prepared.processed_batch.set_commit_ts(commit_ts);
 
 		let mut wal_guard = self.core.wal.write();
 		let expected_segment = wal_guard.get_active_log_number();
@@ -1126,7 +1740,185 @@ impl std::ops::Deref for Core {
 	}
 }
 
+/// How long the fork fence waits for in-flight commits to leave the pipeline
+/// before giving up. The wait is normally microseconds — the batches are
+/// already WAL-durable and only need their memtable apply and publish. A commit
+/// whose future was dropped between enqueue and apply would otherwise hold the
+/// fence, and with it every writer, forever.
+const FORK_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 impl Core {
+	/// Forks `child_name` off `parent_name` at `at`.
+	///
+	/// The protocol is one durable step. Under the branch-op mutex: fence
+	/// writes, drain the commit pipeline so the visible head is exact, resolve
+	/// the fork sequence, release the fence, then publish ONE catalog version
+	/// naming the child, its parent link and its anchor. That publish is the
+	/// commit point — before it nothing durable mentions the child, after it the
+	/// child is fully readable with no further work, because its view is
+	/// computed from the parent's live state (design §3.2).
+	///
+	/// No data is copied and no table is written, including when the parent has
+	/// committed rows that are not yet flushed: the child's read stack resolves
+	/// the parent's memtables under the same cap, and a crash replays them into
+	/// the parent from the WAL.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn fork_branch(
+		&self,
+		parent_name: &str,
+		child_name: &str,
+		at: crate::branch::ForkPoint,
+	) -> Result<crate::branch::ForkReceipt> {
+		use crate::branch::{ForkPoint, ForkReceipt};
+
+		// Serialises every branch operation, so the parent resolved below cannot
+		// change under us while the fence is taken and released.
+		let mut publish = self.inner.catalog_publish.lock().unwrap();
+
+		let (parent_owner, existing_child) = {
+			let catalog = self.inner.branch_catalog.read()?;
+			let parent = catalog.get_by_name(parent_name).map_err(|_| {
+				Error::InvalidArgument(format!("fork parent {parent_name:?} is not a live branch"))
+			})?;
+			let parent_owner = crate::batch::BatchOwner {
+				branch: parent.id,
+				generation: parent.generation,
+			};
+			// Refuse up front rather than publishing a branch whose every read
+			// would then fail: the child sits one link deeper than its parent, so
+			// the parent's own chain must leave room for it.
+			let parent_depth = catalog
+				.parent_chain(
+					parent_owner.branch,
+					parent_owner.generation,
+					crate::branch::MAX_VIEW_DEPTH,
+				)?
+				.len();
+			if parent_depth + 1 > crate::branch::MAX_VIEW_DEPTH {
+				return Err(Error::MaterializationRequired {
+					depth: parent_depth + 1,
+				});
+			}
+			let existing = catalog.get_by_name(child_name).ok().map(|child| {
+				(
+					crate::batch::BatchOwner {
+						branch: child.id,
+						generation: child.generation,
+					},
+					child.parent.clone(),
+				)
+			});
+			(parent_owner, existing)
+		};
+
+		// Idempotent retry: the same fork, re-issued. A name that exists with a
+		// different lineage is a genuine conflict and fails closed rather than
+		// being silently reinterpreted.
+		if let Some((child_owner, link)) = existing_child {
+			let Some(link) = link else {
+				return Err(Error::InvalidArgument(format!(
+					"branch {child_name:?} already exists and is not a fork"
+				)));
+			};
+			if link.parent != parent_owner.branch
+				|| link.parent_generation != parent_owner.generation
+			{
+				return Err(Error::InvalidArgument(format!(
+					"branch {child_name:?} already exists as a fork of a different parent"
+				)));
+			}
+			if let ForkPoint::AtVersion(version) = at {
+				if version != link.fork_seq {
+					return Err(Error::InvalidArgument(format!(
+						"branch {child_name:?} already exists at fork sequence {}, not {version}",
+						link.fork_seq
+					)));
+				}
+			}
+			return Ok(ForkReceipt {
+				child: child_owner,
+				parent: parent_owner,
+				fork_seq: link.fork_seq,
+			});
+		}
+
+		// The fence: no new sequence can be allocated while it is held, and once
+		// the pipeline has drained, `visible_seq_num` is exactly the highest
+		// readable sequence.
+		let head = {
+			let _fence = self.commit_pipeline.lock_writes();
+			let deadline = std::time::Instant::now() + FORK_DRAIN_TIMEOUT;
+			while !self.commit_pipeline.is_drained() {
+				if std::time::Instant::now() >= deadline {
+					return Err(Error::ForkFenceTimeout);
+				}
+				std::hint::spin_loop();
+			}
+			self.inner.visible_seq_num.load(Ordering::Acquire)
+		};
+
+		let fork_seq = match at {
+			ForkPoint::Head => head,
+			ForkPoint::AtVersion(version) => {
+				if version > head {
+					return Err(Error::InvalidArgument(format!(
+						"fork sequence {version} is above the parent's visible head {head}"
+					)));
+				}
+				version
+			}
+			ForkPoint::AtTimestamp(timestamp) => {
+				let resolved = self.inner.timeline.resolve(timestamp)?;
+				resolved.min(head)
+			}
+		};
+
+		// Commit point. The manifest read lock is taken FIRST (the order FK3
+		// established) and held through the publish: it is the lock compaction
+		// publication takes exclusively, so the retention floor read here cannot
+		// be raised by a compaction that publishes concurrently. Whichever of
+		// the two publishes second sees the other and fails closed — compaction
+		// through `CompactionPinRaced`, the fork through the floor check.
+		let levels = self.inner.level_manifest.read()?;
+		let floor = levels.retained_floor(parent_owner);
+		if fork_seq < floor {
+			return Err(Error::BelowRetentionFloor {
+				requested: fork_seq,
+				floor,
+			});
+		}
+
+		let mut catalog = self.inner.branch_catalog.write()?;
+		let snapshot = catalog.clone();
+		let id = self.inner.mint_branch_id(&catalog);
+		let record = catalog
+			.create_fork(
+				id,
+				child_name,
+				fork_seq,
+				crate::authority::format::ParentLink {
+					parent: parent_owner.branch,
+					parent_generation: parent_owner.generation,
+					fork_seq,
+				},
+			)
+			.map_err(|error| Error::InvalidArgument(format!("fork rejected: {}", error.message)))?;
+		let child = crate::batch::BatchOwner {
+			branch: id,
+			generation: record.generation,
+		};
+		if let Err(error) = self.inner.publish_catalog_locked(&mut publish, &catalog) {
+			*catalog = snapshot;
+			return Err(error);
+		}
+
+		Ok(ForkReceipt {
+			child,
+			parent: parent_owner,
+			fork_seq,
+		})
+	}
+
 	/// Replays WAL with configurable corruption handling.
 	///
 	/// Creates one memtable per WAL segment. Flushes all but the last memtable
@@ -1139,9 +1931,6 @@ impl Core {
 	/// * `recovery_mode` - How to handle corruption
 	/// * `arena_size` - Size for memtable arenas
 	/// * `flush_memtable` - Callback to flush intermediate memtables to SST
-	///
-	/// # Returns
-	/// * `(Option<max_seq_num>, Option<active_memtable>)`
 	pub(crate) fn replay_wal_with_repair(
 		wal_path: &Path,
 		min_wal_number: u64,
@@ -1150,9 +1939,9 @@ impl Core {
 		default_arena_size: usize,
 		branch_arena_size: usize,
 		is_live_owner: &dyn Fn(crate::batch::BatchOwner) -> bool,
-	) -> Result<(Option<u64>, RecoveredMemtables)> {
+	) -> Result<crate::wal::recovery::ReplayOutcome> {
 		// Replay WAL - returns branch-pure memtables per (segment, owner)
-		let (wal_seq_num_opt, memtables) = match replay_wal(
+		let outcome = match replay_wal(
 			wal_path,
 			min_wal_number,
 			default_arena_size,
@@ -1228,22 +2017,15 @@ impl Core {
 			Err(e) => return Err(e),
 		};
 
-		Ok((wal_seq_num_opt, memtables))
+		Ok(outcome)
 	}
 
 	/// Creates a new LSM tree with background task management
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
-		Self::new_impl(opts, None)
-	}
-
-	fn new_impl(
-		opts: Arc<Options>,
-		initial_catalog: Option<crate::branch::BranchCatalog>,
-	) -> Result<Self> {
 		log::info!("=== Starting LSM tree initialization ===");
 		log::info!("Database path: {:?}", opts.path);
 
-		let inner = Arc::new(CoreInner::new_impl(Arc::clone(&opts), initial_catalog)?);
+		let inner = Arc::new(CoreInner::new_impl(Arc::clone(&opts))?);
 
 		// Create the write stall controller with the provider and thresholds
 		let thresholds = StallThresholds {
@@ -1297,7 +2079,7 @@ impl Core {
 				.map(|catalog| catalog.validate_owner(owner.branch, owner.generation).is_ok())
 				.unwrap_or(false)
 		};
-		let (wal_seq_num_opt, recovered_memtables) = Self::replay_wal_with_repair(
+		let replay_outcome = Self::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Database startup",
@@ -1306,8 +2088,21 @@ impl Core {
 			opts.branch_memtable_size,
 			&catalog_fence,
 		)?;
+		let wal_seq_num_opt = replay_outcome.max_seq_num;
 
-		inner.install_recovered_memtables(recovered_memtables, "Recovery")?;
+		// Seed the timeline with replayed fenceposts past the root tail's
+		// coverage (the tail records commits up to the last root publish;
+		// replay re-reads segments at or beyond the floor, so they overlap).
+		let tail_end = inner.timeline.last_commit_ts();
+		let fresh: Vec<(u64, u64)> = replay_outcome
+			.fenceposts
+			.iter()
+			.copied()
+			.filter(|&(commit_ts, _)| commit_ts > tail_end)
+			.collect();
+		inner.timeline.seed(&fresh);
+
+		inner.install_recovered_memtables(replay_outcome.memtables, "Recovery")?;
 
 		// Get last_sequence from manifest
 		let manifest_last_seq = inner.level_manifest.read()?.get_last_sequence();
@@ -1331,6 +2126,10 @@ impl Core {
 				manifest_last_seq
 			}
 		};
+		// The clock never seeds below a catalog anchor or the root's visible
+		// floor: a deleted branch's sequences stay allocated, and generation
+		// fences would otherwise eat legitimate new commits (invariant 6).
+		let max_seq_num = max_seq_num.max(inner.clock_floor);
 
 		// Set visible sequence number (in-memory, will be persisted on next flush)
 		commit_pipeline.set_seq_num(max_seq_num);
@@ -1515,22 +2314,6 @@ impl Tree {
 		})
 	}
 
-	/// Test-only open with a prepared branch catalog as the recovery fencing
-	/// authority; see `TreeBuilder::with_initial_branch_catalog`.
-	#[cfg(test)]
-	pub(crate) fn new_with_catalog(
-		opts: Arc<Options>,
-		catalog: crate::branch::BranchCatalog,
-	) -> Result<Self> {
-		opts.validate()?;
-		Self::create_directory_structure(&opts)?;
-		let core = Core::new_impl(Arc::clone(&opts), Some(catalog))?;
-		sync_directory_structure(&opts)?;
-		Ok(Self {
-			core: Arc::new(core),
-		})
-	}
-
 	/// Creates all required directory structure for the LSM tree
 	fn create_directory_structure(opts: &Options) -> Result<()> {
 		// Create base directory
@@ -1539,7 +2322,6 @@ impl Tree {
 		// Create all subdirectories
 		create_dir_all(opts.sstable_dir())?;
 		create_dir_all(opts.wal_dir())?;
-		create_dir_all(opts.manifest_dir())?;
 
 		Ok(())
 	}
@@ -1567,6 +2349,138 @@ impl Tree {
 		let mut txn = self.begin_with_mode(Mode::ReadOnly)?;
 		f(&mut txn)?;
 		Ok(())
+	}
+
+	// ===== Branches =====
+	//
+	// `begin`, `view` and every method above operate on `main`, which always
+	// exists and behaves exactly as it did before branching. Everything below is
+	// additive.
+
+	/// Opens an existing branch.
+	///
+	/// The handle is pinned to the branch's current generation, so if the branch
+	/// is deleted (and possibly recreated under the same name) every operation
+	/// through this handle fails with [`Error::BranchFenced`] rather than
+	/// silently binding to the new incarnation.
+	pub fn branch(&self, name: &str) -> Result<BranchHandle> {
+		let catalog = self.core.inner.branch_catalog.read()?;
+		let record = catalog
+			.get_by_name(name)
+			.map_err(|_| Error::InvalidArgument(format!("branch {name:?} does not exist")))?;
+		Ok(BranchHandle {
+			core: Arc::clone(&self.core),
+			owner: crate::batch::BatchOwner {
+				branch: record.id,
+				generation: record.generation,
+			},
+			name: record.name.clone(),
+		})
+	}
+
+	/// Creates an empty branch that inherits nothing.
+	///
+	/// This is NOT a fork: the new branch starts with no data and no parent. Use
+	/// [`Tree::fork_branch`] for copy-on-write branching.
+	pub fn create_branch(&self, name: &str) -> Result<BranchHandle> {
+		let owner = self.core.inner.create_branch(name)?;
+		Ok(BranchHandle {
+			core: Arc::clone(&self.core),
+			owner,
+			name: name.to_owned(),
+		})
+	}
+
+	/// Forks `source` into a new branch `name`, cutting its view at `at`.
+	///
+	/// No data is copied and no table is written, including when the source has
+	/// committed rows that are not yet flushed: the child resolves the parent's
+	/// live state under a sequence cap. The catalog publish is the whole
+	/// operation, so a crash immediately afterwards needs no recovery work.
+	///
+	/// Briefly blocking: the fork fences writes while it drains the commit
+	/// pipeline, so the anchor is the parent's exact visible head. That window
+	/// is normally microseconds; if in-flight commits cannot drain it fails with
+	/// [`Error::ForkFenceTimeout`] rather than holding writers indefinitely.
+	///
+	/// Re-issuing the same fork returns the original branch instead of creating
+	/// a second one; reusing the name with a different parent or a different
+	/// fork point is refused.
+	pub fn fork_branch(&self, source: &str, name: &str, at: ForkPoint) -> Result<BranchHandle> {
+		let receipt = self.core.fork_branch(source, name, at)?;
+		Ok(BranchHandle {
+			core: Arc::clone(&self.core),
+			owner: receipt.child,
+			name: name.to_owned(),
+		})
+	}
+
+	/// Tombstones a branch. Its data is reclaimed by maintenance, not here.
+	///
+	/// Refuses `main`, and refuses any branch that still has active fork
+	/// children — their views resolve through it.
+	pub fn delete_branch(&self, name: &str) -> Result<()> {
+		let id = {
+			let catalog = self.core.inner.branch_catalog.read()?;
+			catalog
+				.get_by_name(name)
+				.map_err(|_| Error::InvalidArgument(format!("branch {name:?} does not exist")))?
+				.id
+		};
+		self.core.inner.delete_branch(id)
+	}
+
+	/// Every live branch, in catalog order.
+	pub fn list_branches(&self) -> Result<Vec<BranchInfo>> {
+		let records: Vec<_> = {
+			let catalog = self.core.inner.branch_catalog.read()?;
+			catalog.list().cloned().collect()
+		};
+		records.into_iter().map(|record| self.core.branch_info(&record)).collect()
+	}
+
+	/// Sets or clears a branch's time-to-live, relative to now.
+	///
+	/// An expired branch is tombstoned by the maintenance sweep, not on a timer,
+	/// so expiry is observed at the next maintenance pass rather than exactly at
+	/// the deadline. `None` makes the branch permanent again. Refuses `main`.
+	pub fn set_branch_ttl(&self, name: &str, ttl: Option<std::time::Duration>) -> Result<()> {
+		let id = {
+			let catalog = self.core.inner.branch_catalog.read()?;
+			catalog
+				.get_by_name(name)
+				.map_err(|_| Error::InvalidArgument(format!("branch {name:?} does not exist")))?
+				.id
+		};
+		// Absolute expiry on the store's own clock, so the maintenance sweep
+		// never has to reason about when the TTL was set.
+		let expires_at = ttl.map(|ttl| {
+			let nanos = u64::try_from(ttl.as_nanos()).unwrap_or(u64::MAX);
+			self.core.inner.opts.clock.now().saturating_add(nanos)
+		});
+		self.core.inner.set_branch_expiry(id, expires_at)
+	}
+
+	/// Begins a transaction on `name`. Sugar for `branch(name)?.begin()`.
+	pub fn begin_on(&self, name: &str) -> Result<Transaction> {
+		self.branch(name)?.begin()
+	}
+
+	/// Materializes a forked branch's inherited data into its own tables and
+	/// drops its parent link, returning the number of rows copied.
+	///
+	/// Reads are unchanged by this — the branch sees exactly what it saw before.
+	/// What changes is cost: the branch stops walking its ancestor chain on
+	/// every read, and it releases the retention pin its fork anchor placed on
+	/// the parent, so the parent's compaction can reclaim the versions it was
+	/// holding on the branch's behalf.
+	///
+	/// This copies data and is proportional to what the branch inherits. A
+	/// branch with no parent is already detached, so this returns `Ok(0)` rather
+	/// than an error.
+	pub fn detach_branch(&self, name: &str) -> Result<u64> {
+		let handle = self.branch(name)?;
+		self.core.inner.detach_branch(&self.core, handle.owner)
 	}
 
 	/// Creates a database checkpoint at the specified directory.
@@ -1608,15 +2522,53 @@ impl Tree {
 		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
 		let metadata = checkpoint.restore_from_checkpoint(checkpoint_dir)?;
 
-		// Step 2: Reload in-memory state to match restored files
+		// Step 2: Reload in-memory state to match restored files. Restore is
+		// a whole-database swap INCLUDING the catalog (the restored catalog
+		// and states are one consistent cut; mixing the live catalog with
+		// restored states would cross identities).
+		let restored_catalog_manifest =
+			crate::authority::store::AuthorityStore::load_latest_catalog(
+				&self.core.inner.opts.path,
+			)?
+			.ok_or_else(|| {
+				Error::Corruption("restored checkpoint carries no branch catalog".to_owned())
+			})?;
+		let restored_catalog = crate::branch::BranchCatalog::from_manifest(
+			crate::BranchId::DEFAULT,
+			&restored_catalog_manifest,
+		)?;
+		let restored_authority = crate::authority::store::AuthorityStore::new(
+			self.core.inner.opts.path.clone(),
+			restored_catalog_manifest.db_id,
+		);
+		let restored_root = restored_authority.load_latest_root()?;
+		// Whole-clock swap: the restored root's tail is the timeline now.
+		self.core.inner.timeline.reset(
+			restored_root.as_ref().map(|r| r.timeline_tail.as_slice()).unwrap_or(&[]),
+			restored_root.as_ref().map(|r| r.last_commit_ts).unwrap_or(0),
+		);
+		let new_levels = LevelManifest::hydrate(
+			Arc::clone(&self.core.inner.opts),
+			restored_authority,
+			&restored_catalog,
+			restored_catalog_manifest.catalog_version,
+			restored_root.as_ref(),
+			Arc::clone(&self.core.inner.timeline),
+		)?;
 
-		// Create a new LevelManifest from the current path
-		let new_levels = LevelManifest::new(Arc::clone(&self.core.inner.opts))?;
-
-		// Replace the current levels with the reloaded ones
+		// Replace the current levels and catalog with the reloaded ones
 		{
 			let mut levels_guard = self.core.inner.level_manifest.write()?;
 			*levels_guard = new_levels;
+		}
+		{
+			let mut publish = self.core.inner.catalog_publish.lock().unwrap();
+			publish.catalog_version = restored_catalog_manifest.catalog_version;
+			publish.writer_epoch = restored_catalog_manifest.writer_epoch;
+			publish.maintenance_epoch = restored_catalog_manifest.maintenance_epoch;
+			publish.session_bumped = false;
+			let mut catalog_guard = self.core.inner.branch_catalog.write()?;
+			*catalog_guard = restored_catalog;
 		}
 
 		// Clear the current memtables since they would be stale after restore
@@ -1656,7 +2608,7 @@ impl Tree {
 				.map(|catalog| catalog.validate_owner(owner.branch, owner.generation).is_ok())
 				.unwrap_or(false)
 		};
-		let (wal_seq_num_opt, recovered_memtables) = Core::replay_wal_with_repair(
+		let replay_outcome = Core::replay_wal_with_repair(
 			&wal_path,
 			manifest_log_number,
 			"Database restore",
@@ -1665,8 +2617,17 @@ impl Tree {
 			self.core.inner.opts.branch_memtable_size,
 			&restore_fence,
 		)?;
+		let wal_seq_num_opt = replay_outcome.max_seq_num;
+		let restored_tail_end = self.core.inner.timeline.last_commit_ts();
+		let fresh: Vec<(u64, u64)> = replay_outcome
+			.fenceposts
+			.iter()
+			.copied()
+			.filter(|&(commit_ts, _)| commit_ts > restored_tail_end)
+			.collect();
+		self.core.inner.timeline.seed(&fresh);
 
-		self.core.inner.install_recovered_memtables(recovered_memtables, "Restore")?;
+		self.core.inner.install_recovered_memtables(replay_outcome.memtables, "Restore")?;
 
 		// Ensure the active memtable has the correct WAL number set
 		{
@@ -1683,8 +2644,15 @@ impl Tree {
 		let manifest_last_seq = self.core.inner.level_manifest.read()?.get_last_sequence();
 
 		// Determine effective sequence number (same logic as Core::new)
+		let restored_clock_floor = self
+			.core
+			.inner
+			.branch_catalog
+			.read()?
+			.max_version_anchor()
+			.max(restored_root.as_ref().map(|r| r.visible_seq).unwrap_or(0));
 		let max_seq_num = match wal_seq_num_opt {
-			Some(wal_seq) => std::cmp::max(manifest_last_seq, wal_seq),
+			Some(wal_seq) => std::cmp::max(manifest_last_seq, wal_seq).max(restored_clock_floor),
 			None => manifest_last_seq,
 		};
 
@@ -1745,6 +2713,119 @@ impl Tree {
 	}
 }
 
+/// A branch, pinned to the generation it was opened at.
+///
+/// Every operation validates that generation, so a handle to a branch that has
+/// since been deleted fails with [`Error::BranchFenced`] instead of binding to a
+/// new branch that reused the name.
+#[derive(Clone)]
+pub struct BranchHandle {
+	core: Arc<Core>,
+	owner: crate::batch::BatchOwner,
+	name: String,
+}
+
+impl std::fmt::Debug for BranchHandle {
+	/// Identity only: a handle holds the whole engine, which is neither
+	/// printable nor useful in a diagnostic.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("BranchHandle")
+			.field("name", &self.name)
+			.field("id", &self.owner.branch)
+			.field("generation", &self.owner.generation)
+			.finish()
+	}
+}
+
+impl BranchHandle {
+	pub fn name(&self) -> &str {
+		&self.name
+	}
+
+	pub fn id(&self) -> crate::BranchId {
+		self.owner.branch
+	}
+
+	pub fn generation(&self) -> crate::BranchGeneration {
+		self.owner.generation
+	}
+
+	/// Begins a transaction scoped to this branch. Reads resolve this branch's
+	/// own data first and then its inherited view; writes land here alone.
+	pub fn begin(&self) -> Result<Transaction> {
+		Transaction::new_owned(Arc::clone(&self.core), TransactionOptions::new(), self.owner)
+	}
+
+	/// Begins a transaction on this branch with the given mode.
+	pub fn begin_with_mode(&self, mode: Mode) -> Result<Transaction> {
+		Transaction::new_owned(
+			Arc::clone(&self.core),
+			TransactionOptions::new_with_mode(mode),
+			self.owner,
+		)
+	}
+
+	/// This branch's catalog facts as of now.
+	pub fn info(&self) -> Result<BranchInfo> {
+		let record = {
+			let catalog = self.core.inner.branch_catalog.read()?;
+			catalog
+				.validate_owner(self.owner.branch, self.owner.generation)
+				.map_err(|_| Error::BranchFenced)?
+				.clone()
+		};
+		self.core.branch_info(&record)
+	}
+}
+
+impl Core {
+	/// Builds the public view of a catalog record, deriving the facts that are
+	/// not stored in the catalog.
+	fn branch_info(&self, record: &crate::branch::BranchRecord) -> Result<BranchInfo> {
+		let owner = crate::batch::BatchOwner {
+			branch: record.id,
+			generation: record.generation,
+		};
+		Ok(BranchInfo {
+			name: record.name.clone(),
+			id: record.id,
+			generation: record.generation,
+			created_at_seq: record.created_at_seq,
+			parent: record.parent.as_ref().map(|link| BranchLineage {
+				branch: link.parent,
+				generation: link.parent_generation,
+				fork_seq: link.fork_seq,
+			}),
+			last_write_seq: self.last_write_seq(owner)?,
+			expires_at: record.expires_at,
+		})
+	}
+
+	/// Newest sequence `owner` wrote itself, across its durable tables and its
+	/// live memtables. `None` means it has never written anything.
+	///
+	/// Deliberately not read from the manifest's `last_sequence`: that field is
+	/// global, and `persist_owner_update` copies the same value into every
+	/// owner's state, so it says nothing about an individual branch.
+	fn last_write_seq(&self, owner: crate::batch::BatchOwner) -> Result<Option<u64>> {
+		let mut newest = 0u64;
+		if let Some(levels) = self.inner.level_manifest.read()?.levels_for(owner) {
+			for level in levels.get_levels() {
+				for table in &level.tables {
+					newest = newest.max(table.meta.largest_seq_num.unwrap_or(0));
+				}
+			}
+		}
+		if let Some(runtime) = self.inner.runtimes.get(owner) {
+			newest = newest.max(runtime.active_memtable.read()?.lsn());
+			for entry in runtime.immutable_memtables.read()?.iter() {
+				newest = newest.max(entry.memtable.lsn());
+			}
+		}
+		Ok((newest > 0).then_some(newest))
+	}
+}
+
 impl Drop for Tree {
 	fn drop(&mut self) {
 		#[cfg(not(target_arch = "wasm32"))]
@@ -1768,11 +2849,6 @@ impl Drop for Tree {
 /// A builder for creating LSM trees with type-safe configuration.
 pub struct TreeBuilder {
 	opts: Options,
-	/// Test-only recovery authority: the catalog the store opens with, so
-	/// fencing tests can present live/deleted/recreated branches at replay.
-	/// Production catalogs become durable in the fork lifecycle slice.
-	#[cfg(test)]
-	initial_branch_catalog: Option<crate::branch::BranchCatalog>,
 }
 
 impl TreeBuilder {
@@ -1781,8 +2857,6 @@ impl TreeBuilder {
 	pub fn new() -> Self {
 		Self {
 			opts: Options::default(),
-			#[cfg(test)]
-			initial_branch_catalog: None,
 		}
 	}
 
@@ -1793,8 +2867,6 @@ impl TreeBuilder {
 	pub fn with_options(opts: Options) -> Self {
 		Self {
 			opts,
-			#[cfg(test)]
-			initial_branch_catalog: None,
 		}
 	}
 
@@ -1922,22 +2994,7 @@ impl TreeBuilder {
 	/// This method ensures type safety by using the same key type K
 	/// for both the builder and the resulting tree.
 	pub fn build(self) -> Result<Tree> {
-		#[cfg(test)]
-		if let Some(catalog) = self.initial_branch_catalog {
-			return Tree::new_with_catalog(Arc::new(self.opts), catalog);
-		}
 		Tree::new(Arc::new(self.opts))
-	}
-
-	/// Opens the store with a prepared branch catalog as the recovery
-	/// fencing authority (test-only; see `initial_branch_catalog`).
-	#[cfg(test)]
-	pub(crate) fn with_initial_branch_catalog(
-		mut self,
-		catalog: crate::branch::BranchCatalog,
-	) -> Self {
-		self.initial_branch_catalog = Some(catalog);
-		self
 	}
 
 	/// Builds the LSM tree and returns both the tree and the options.
@@ -1995,10 +3052,10 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 		Error::Other(format!("Failed to sync WAL directory '{}': {}", opts.wal_dir().display(), e))
 	})?;
 
-	fsync_directory(opts.manifest_dir()).map_err(|e| {
+	fsync_directory(crate::authority::publish::catalog_dir(&opts.path)).map_err(|e| {
 		Error::Other(format!(
-			"Failed to sync manifest directory '{}': {}",
-			opts.manifest_dir().display(),
+			"Failed to sync catalog directory '{}': {}",
+			crate::authority::publish::catalog_dir(&opts.path).display(),
 			e
 		))
 	})?;

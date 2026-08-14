@@ -391,7 +391,8 @@ impl MemTable {
 		}
 	}
 
-	#[allow(unused)]
+	/// Newest sequence applied to this memtable, or 0 if it has never taken a
+	/// batch. Feeds `BranchInfo::last_write_seq`.
 	pub(crate) fn lsn(&self) -> u64 {
 		self.latest_seq_num.load(Ordering::Acquire)
 	}

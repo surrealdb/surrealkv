@@ -5,7 +5,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::compaction::leveled::Strategy;
-use crate::levels::{validate_wal_log_number, LevelManifest};
+use crate::levels::validate_wal_log_number;
 use crate::lsm::{Core, CoreInner};
 use crate::test::collect_transaction_all;
 use crate::wal::list_segment_ids;
@@ -20,6 +20,47 @@ use crate::{
 	Value,
 	WalRecoveryMode,
 };
+
+/// Reloads the durable manifest exactly the way open does: newest catalog ->
+/// newest root -> hydrated states.
+/// Sabotage helper: rewrites the newest root version in place with a
+/// poisoned `wal_reclaim_floor` (decode -> mutate -> re-encode keeps every
+/// other invariant intact, so ONLY the floor validation can trip).
+fn poison_root_wal_floor(path: &std::path::Path, floor: u64) {
+	let root_dir = path.join("root");
+	let newest = std::fs::read_dir(&root_dir)
+		.unwrap()
+		.filter_map(|entry| entry.ok())
+		.filter(|entry| entry.file_name().to_string_lossy().ends_with(".root"))
+		.max_by_key(|entry| entry.file_name())
+		.expect("store must have a root version")
+		.path();
+	let bytes = std::fs::read(&newest).unwrap();
+	let mut root = crate::authority::format::RootManifest::decode(&bytes).unwrap();
+	root.wal_reclaim_floor = floor;
+	std::fs::write(&newest, root.encode().unwrap()).unwrap();
+}
+
+fn reload_manifest_from_disk(opts: &Arc<Options>) -> crate::levels::LevelManifest {
+	let catalog_manifest = crate::authority::store::AuthorityStore::load_latest_catalog(&opts.path)
+		.unwrap()
+		.expect("store must have a durable catalog");
+	let catalog =
+		crate::branch::BranchCatalog::from_manifest(crate::BranchId::DEFAULT, &catalog_manifest)
+			.unwrap();
+	let authority =
+		crate::authority::store::AuthorityStore::new(opts.path.clone(), catalog_manifest.db_id);
+	let root = authority.load_latest_root().unwrap();
+	crate::levels::LevelManifest::hydrate(
+		Arc::clone(opts),
+		authority,
+		&catalog,
+		catalog_manifest.catalog_version,
+		root.as_ref(),
+		std::sync::Arc::new(crate::timeline::Timeline::new()),
+	)
+	.unwrap()
+}
 
 fn create_temp_directory() -> TempDir {
 	TempDir::new("test").unwrap()
@@ -313,7 +354,10 @@ async fn test_checkpoint_functionality() {
 	assert!(checkpoint_dir.exists());
 	assert!(checkpoint_dir.join("sstables").exists());
 	assert!(checkpoint_dir.join("wal").exists());
-	assert!(checkpoint_dir.join("manifest").exists());
+	// The checkpoint captures the authority lineages (catalog, root, states).
+	assert!(checkpoint_dir.join("catalog").exists());
+	assert!(checkpoint_dir.join("root").exists());
+	assert!(checkpoint_dir.join("branch").exists());
 	assert!(checkpoint_dir.join("CHECKPOINT_METADATA").exists());
 
 	// Insert more data after checkpoint
@@ -1702,7 +1746,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 	}
 
 	// Phase 2: Check manifest state after shutdown
-	let manifest = LevelManifest::new(Arc::clone(&opts)).expect("Failed to load manifest");
+	let manifest = reload_manifest_from_disk(&opts);
 	let log_number = manifest.get_log_number();
 
 	// CRITICAL CHECK: log_number should be > 0 to skip WAL #0
@@ -1725,7 +1769,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 		let wal_path = opts.wal_dir();
 		let min_wal_number = log_number;
 
-		let (wal_seq_opt, _memtables) = Core::replay_wal_with_repair(
+		let outcome = Core::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Test",
@@ -1735,6 +1779,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 			&|_| true,
 		)
 		.unwrap();
+		let wal_seq_opt = outcome.max_seq_num;
 
 		// CRITICAL: WAL should have been skipped (return None)
 		assert_eq!(
@@ -1896,7 +1941,7 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		tree.close().await.unwrap();
 
 		// Get the manifest sequence after shutdown flush
-		let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+		let manifest = reload_manifest_from_disk(&opts);
 		manifest_seq_initial = manifest.get_last_sequence();
 	}
 
@@ -2093,7 +2138,7 @@ async fn test_shutdown_with_empty_memtable() {
 		tree.close().await.unwrap();
 
 		// Verify manifest unchanged (no unnecessary updates)
-		let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+		let manifest = reload_manifest_from_disk(&opts);
 		assert_eq!(manifest.get_log_number(), log_number_before);
 		assert_eq!(manifest.get_last_sequence(), last_seq_before);
 	}
@@ -2308,9 +2353,14 @@ async fn test_wal_append_after_crash_recovery() {
 
 	let opts = create_test_options(path.clone(), |opts| {
 		opts.max_memtable_size = 10 * 1024 * 1024; // Large to prevent auto-flush
+											 // The crash simulation: nothing may flush at close, so the WAL stays
+											 // the only copy. (A drop-without-close would SCHEDULE an async close
+											 // whose flush races the reopen — the old whole-file manifest rewrite
+											 // masked that race; conditional-create publication surfaces it.)
+		opts.flush_on_close = false;
 	});
 
-	// Phase 1: Write data and simulate crash (no clean shutdown)
+	// Phase 1: Write data and end the session with the WAL unflushed
 	let manifest_log = {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
@@ -2318,19 +2368,12 @@ async fn test_wal_append_after_crash_recovery() {
 		txn.commit().await.unwrap();
 
 		let manifest_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-
-		// Simulate crash: drop without close (but release lock)
-		{
-			let mut lockfile = tree.core.inner.lockfile.lock().unwrap();
-			lockfile.release().unwrap();
-		}
-		drop(tree);
-
+		tree.close().await.unwrap();
 		manifest_log
 	};
 
 	// Verify manifest didn't change (no flush happened)
-	let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+	let manifest = reload_manifest_from_disk(&opts);
 	assert_eq!(manifest.get_log_number(), manifest_log, "Manifest should not change on crash");
 
 	// Phase 2: Reopen and verify WAL is reused (SAME number)
@@ -2473,7 +2516,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 
 	// Cycle 2: Reopen, verify recovery, write more, flush, close
 	{
-		let manifest_before = LevelManifest::new(Arc::clone(&opts)).unwrap();
+		let manifest_before = reload_manifest_from_disk(&opts);
 		let log_num_before = manifest_before.get_log_number();
 
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
@@ -3131,7 +3174,7 @@ async fn test_wal_files_after_multiple_open_close_cycles() {
 		}
 
 		// Check manifest state after close
-		let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
+		let manifest = reload_manifest_from_disk(&opts);
 		let log_number_after_close = manifest.get_log_number();
 		previous_log_numbers.push(log_number_after_close);
 
@@ -3814,8 +3857,13 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		// Create segment for key2
 		let segment_for_key2 = highest_existing + 1;
 		let next_seq = last_seq_after_phase1 + 1;
+		// Crafted batches follow real commits in this WAL: their commit
+		// timestamps must continue the strictly monotone timeline. Far-future
+		// bases keep them above any wall-clock stamp from phase 1.
+		let crafted_ts_base = 2_000_000_000_000_000_000u64;
 		{
 			let mut batch = Batch::new(next_seq);
+			batch.set_commit_ts(crafted_ts_base);
 			let encoded_value = b"value2_from_wal".to_vec();
 			batch
 				.add_record(InternalKeyKind::Set, b"key2".to_vec(), Some(encoded_value), 0)
@@ -3837,6 +3885,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		let segment_for_key3 = segment_for_key2 + 1;
 		{
 			let mut batch = Batch::new(next_seq + 1);
+			batch.set_commit_ts(crafted_ts_base + 1);
 			let encoded_value = b"value3_from_wal".to_vec();
 			batch
 				.add_record(InternalKeyKind::Set, b"key3".to_vec(), Some(encoded_value), 0)
@@ -4537,8 +4586,6 @@ async fn test_range_boundary_edge_cases() {
 
 #[test_log::test(tokio::test)]
 async fn test_recovery_detects_corrupt_log_number() {
-	use byteorder::{BigEndian, WriteBytesExt};
-
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
@@ -4557,32 +4604,14 @@ async fn test_recovery_detects_corrupt_log_number() {
 			txn.commit().await.unwrap();
 		}
 
-		// Close without flushing (data is only in WAL)
+		// One explicit flush publishes the first root version (the poison
+		// target); flush_on_close stays off so WAL segments remain on disk.
+		tree.flush().unwrap();
 		tree.close().await.unwrap();
 	}
 
-	// Phase 2: Corrupt the manifest by setting log_number to a very high value
-	{
-		// Manifest format is: {path}/manifest/{id:020}.manifest
-		let manifest_path = path.join("manifest").join("00000000000000000000.manifest");
-
-		// Read the existing manifest
-		let data = std::fs::read(&manifest_path).expect("Failed to read manifest");
-
-		// Create corrupted manifest with log_number = 999999 (way beyond any WAL)
-		let mut corrupted = Vec::new();
-		// Copy version (u16)
-		corrupted.extend_from_slice(&data[0..2]);
-		// Copy next_table_id (u64)
-		corrupted.extend_from_slice(&data[2..10]);
-		// Write corrupted log_number (u64) - set to 999999
-		corrupted.write_u64::<BigEndian>(999999).unwrap();
-		// Copy rest of the file (last_sequence and beyond)
-		corrupted.extend_from_slice(&data[18..]);
-
-		// Write corrupted manifest
-		std::fs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
-	}
+	// Phase 2: Poison the newest root's WAL reclaim floor (way beyond any WAL)
+	poison_root_wal_floor(&path, 999_999);
 
 	// Phase 3: Try to open the database - should fail with ManifestCorruption
 	{
@@ -4655,8 +4684,6 @@ async fn test_validate_wal_log_number_multiple_wals() {
 /// Tests the full recovery flow with multiple WAL segments.
 #[test_log::test(tokio::test)]
 async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
-	use byteorder::{BigEndian, WriteBytesExt};
-
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
@@ -4684,19 +4711,8 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 	assert!(!segment_ids.is_empty(), "Expected WAL segments, got {}", segment_ids.len());
 	let max_wal = *segment_ids.last().unwrap();
 
-	// Phase 3: Corrupt the manifest file
-	{
-		let manifest_path = path.join("manifest").join("00000000000000000000.manifest");
-		let data = std::fs::read(&manifest_path).expect("Failed to read manifest");
-
-		let mut corrupted = Vec::new();
-		corrupted.extend_from_slice(&data[0..2]); // version (u16)
-		corrupted.extend_from_slice(&data[2..10]); // next_table_id (u64)
-		corrupted.write_u64::<BigEndian>(max_wal + 100).unwrap(); // corrupted log_number
-		corrupted.extend_from_slice(&data[18..]); // rest of file
-
-		std::fs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
-	}
+	// Phase 3: Poison the newest root's WAL reclaim floor past every segment
+	poison_root_wal_floor(&path, max_wal + 100);
 
 	// Phase 4: Try to open - should fail with ManifestCorruption
 	{

@@ -8,7 +8,7 @@ use crate::batch::BatchOwner;
 use crate::branch_runtime::BranchRuntime;
 use crate::error::{Error, Result};
 use crate::iter::BoxedLSMIterator;
-use crate::levels::Levels;
+use crate::levels::{LevelManifest, Levels};
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::{
@@ -124,16 +124,48 @@ impl Drop for SnapshotGuard {
 
 // ===== Iterator State =====
 /// Holds references to all LSM tree components needed for iteration.
-pub(crate) struct IterState {
-	/// The active memtable receiving current writes. `None` when the
-	/// snapshot's owner has no runtime (idle branch) — never synthesized,
-	/// because an empty stand-in memtable would allocate a full arena per
-	/// read.
+/// One layer of a snapshot's read stack: a branch's own components with the
+/// visibility cap that applies to them from the reader's position in the
+/// fork chain.
+pub(crate) struct IterLayer {
+	/// The active memtable receiving current writes. `None` when the layer's
+	/// owner has no runtime (idle branch) — never synthesized, because an
+	/// empty stand-in memtable would allocate a full arena per read.
 	pub active: Option<Arc<MemTable>>,
 	/// Immutable memtables waiting to be flushed
 	pub immutable: Vec<Arc<MemTable>>,
-	/// All levels containing SSTables
+	/// The layer owner's own levels
 	pub levels: Levels,
+	/// Visibility cap: `min(snapshot seq, every fork anchor on the path to
+	/// this ancestor)`. Rows above it are unreadable through this layer.
+	pub cap: u64,
+}
+
+/// The full capture: the reader's own layer first, then ancestors
+/// nearest-first (logical inherited views resolved through the catalog).
+pub(crate) struct IterState {
+	pub layers: Vec<IterLayer>,
+}
+
+impl IterState {
+	/// Single-layer state (no inheritance) — the default-branch shape and
+	/// the test-fixture constructor.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn single(
+		active: Option<Arc<MemTable>>,
+		immutable: Vec<Arc<MemTable>>,
+		levels: Levels,
+		cap: u64,
+	) -> Self {
+		Self {
+			layers: vec![IterLayer {
+				active,
+				immutable,
+				levels,
+				cap,
+			}],
+		}
+	}
 }
 
 // ===== Snapshot Implementation =====
@@ -152,78 +184,183 @@ pub(crate) struct Snapshot {
 	/// Only data with seq_num <= this value is visible
 	pub(crate) seq_num: u64,
 
-	/// Physical owner whose component set this snapshot reads.
-	owner: BatchOwner,
-
-	/// The owner's runtime as resolved at snapshot creation. `None` means the
-	/// owner had no runtime (an idle branch) — which is a complete view, not a
-	/// race: `seq_num` comes from the drained visible sequence and apply
-	/// creates a runtime before publication advances, so a runtime absent here
-	/// can only ever hold sequences beyond this snapshot's horizon. Reads
-	/// never create runtimes (an idle branch allocates no arena).
-	runtime: Option<Arc<BranchRuntime>>,
+	/// The read stack: the owner's layer first, then catalog-resolved
+	/// ancestors nearest-first, each with its visibility cap. A layer's
+	/// `runtime` is `None` when that owner has no runtime (idle branch) —
+	/// which is a complete view, not a race: `seq_num` comes from the
+	/// drained visible sequence and apply creates a runtime before
+	/// publication advances. Reads never create runtimes.
+	layers: Vec<SnapshotLayer>,
 
 	/// Tracker registration; released on drop.
 	_tracker_guard: SnapshotGuard,
 }
 
+/// A point-get hit inside one layer: a live value or a tombstone (which
+/// must HIDE farther layers, not fall through to them).
+enum LayerHit {
+	Value(Value, u64),
+	Tombstone,
+}
+
+impl LayerHit {
+	fn from_item(item: (InternalKey, Value)) -> Self {
+		if item.0.is_tombstone() {
+			Self::Tombstone
+		} else {
+			let seq = item.0.seq_num();
+			Self::Value(item.1, seq)
+		}
+	}
+
+	fn from_owned(item: (InternalKey, Value)) -> Self {
+		Self::from_item(item)
+	}
+}
+
+pub(crate) struct SnapshotLayer {
+	owner: BatchOwner,
+	runtime: Option<Arc<BranchRuntime>>,
+	/// `min(snapshot seq, fork anchors on the path)`.
+	cap: u64,
+}
+
 impl Snapshot {
-	/// Creates a new snapshot of one physical owner's component set.
-	pub(crate) fn new_owned(core: Arc<Core>, seq_num: u64, owner: BatchOwner) -> Self {
+	/// Creates a new snapshot of one physical owner's read stack: its own
+	/// components plus catalog-resolved ancestor layers, nearest-first, each
+	/// capped at `min(seq_num, fork anchors on the path)` (FK3 logical
+	/// views).
+	pub(crate) fn new_owned(core: Arc<Core>, seq_num: u64, owner: BatchOwner) -> Result<Self> {
 		// Register this snapshot's sequence number so compaction knows
 		// to preserve versions visible to this snapshot
 		let tracker_guard = core.snapshot_tracker.register(seq_num);
 
-		let runtime = core.inner.runtimes.get(owner);
-		Self {
+		let mut layers = vec![SnapshotLayer {
+			owner,
+			runtime: core.inner.runtimes.get(owner),
+			cap: seq_num,
+		}];
+		let chain = core.inner.branch_catalog.read()?.parent_chain(
+			owner.branch,
+			owner.generation,
+			crate::branch::MAX_VIEW_DEPTH,
+		)?;
+		let mut cap = seq_num;
+		for (branch, generation, fork_seq) in chain {
+			cap = cap.min(fork_seq);
+			let ancestor = BatchOwner {
+				branch,
+				generation,
+			};
+			layers.push(SnapshotLayer {
+				owner: ancestor,
+				runtime: core.inner.runtimes.get(ancestor),
+				cap,
+			});
+		}
+		Ok(Self {
 			core,
 			seq_num,
-			owner,
-			runtime,
+			layers,
 			_tracker_guard: tracker_guard,
+		})
+	}
+
+	/// A snapshot of only what `owner` INHERITS: the same ancestor layers with
+	/// the same cumulative caps, minus the owner's own components.
+	///
+	/// Detach uses this to copy the inherited view into the branch's own tables.
+	/// Including the owner's own layer would duplicate its rows at their
+	/// original sequences — survivable, since compaction dedups equal sequences,
+	/// but wasteful and it would blur what a materialized table contains.
+	///
+	/// Returns `None` when the owner inherits nothing, which is the honest
+	/// answer for a root branch and the cheap exit for an already-detached one.
+	pub(crate) fn inherited_only(
+		core: Arc<Core>,
+		seq_num: u64,
+		owner: BatchOwner,
+	) -> Result<Option<Self>> {
+		let tracker_guard = core.snapshot_tracker.register(seq_num);
+		let chain = core.inner.branch_catalog.read()?.parent_chain(
+			owner.branch,
+			owner.generation,
+			crate::branch::MAX_VIEW_DEPTH,
+		)?;
+		if chain.is_empty() {
+			return Ok(None);
 		}
+		let mut layers = Vec::with_capacity(chain.len());
+		let mut cap = seq_num;
+		for (branch, generation, fork_seq) in chain {
+			cap = cap.min(fork_seq);
+			let ancestor = BatchOwner {
+				branch,
+				generation,
+			};
+			layers.push(SnapshotLayer {
+				owner: ancestor,
+				runtime: core.inner.runtimes.get(ancestor),
+				cap,
+			});
+		}
+		Ok(Some(Self {
+			core,
+			seq_num,
+			layers,
+			_tracker_guard: tracker_guard,
+		}))
 	}
 
 	/// Collects the iterator state from the owner's LSM components
 	/// This is a helper method used by both iterators and optimized operations
 	/// like count
 	pub(crate) fn collect_iter_state(&self) -> Result<IterState> {
-		let (active, immutable) = match &self.runtime {
-			Some(runtime) => {
-				let active =
-					guardian::ArcRwLockReadGuardian::take(Arc::clone(&runtime.active_memtable))?;
-				let immutable = guardian::ArcRwLockReadGuardian::take(Arc::clone(
-					&runtime.immutable_memtables,
-				))?;
-				(
-					Some(active.clone()),
-					immutable.iter().map(|entry| Arc::clone(&entry.memtable)).collect(),
-				)
-			}
-			None => (None, Vec::new()),
-		};
-
 		let manifest =
 			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.level_manifest))?;
 
-		let levels = match manifest.levels_for(self.owner) {
-			Some(levels) => levels.clone(),
-			// Manifest load fail-closes on a missing default set, so this is
-			// unreachable except through corruption — keep it fail-closed.
-			None if self.owner == BatchOwner::DEFAULT => {
-				return Err(crate::error::Error::Corruption(format!(
-					"snapshot owner {:?} has no level set",
-					self.owner
-				)));
-			}
-			// The owner never flushed an SST: an empty durable view.
-			None => Levels::new(self.core.opts.level_count as usize, 0),
-		};
+		let mut layers = Vec::with_capacity(self.layers.len());
+		for layer in &self.layers {
+			let (active, immutable) = match &layer.runtime {
+				Some(runtime) => {
+					let active = guardian::ArcRwLockReadGuardian::take(Arc::clone(
+						&runtime.active_memtable,
+					))?;
+					let immutable = guardian::ArcRwLockReadGuardian::take(Arc::clone(
+						&runtime.immutable_memtables,
+					))?;
+					(
+						Some(active.clone()),
+						immutable.iter().map(|entry| Arc::clone(&entry.memtable)).collect(),
+					)
+				}
+				None => (None, Vec::new()),
+			};
+
+			let levels = match manifest.levels_for(layer.owner) {
+				Some(levels) => levels.clone(),
+				// Manifest load fail-closes on a missing default set, so
+				// this is unreachable except through corruption.
+				None if layer.owner == BatchOwner::DEFAULT => {
+					return Err(crate::error::Error::Corruption(format!(
+						"snapshot owner {:?} has no level set",
+						layer.owner
+					)));
+				}
+				// The owner never flushed an SST: an empty durable view.
+				None => Levels::new(self.core.opts.level_count as usize, 0),
+			};
+
+			layers.push(IterLayer {
+				active,
+				immutable,
+				levels,
+				cap: layer.cap,
+			});
+		}
 
 		Ok(IterState {
-			active,
-			immutable,
-			levels,
+			layers,
 		})
 	}
 
@@ -239,87 +376,73 @@ impl Snapshot {
 	/// The search stops at the first version found with seq_num <= snapshot
 	/// seq_num.
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
-		// Memtable phases exist only when the owner has a runtime; an idle
-		// branch's view is durable tables at most (and usually nothing).
-		if let Some(runtime) = &self.runtime {
-			// Read lock on the active memtable
-			let memtable_lock = runtime.active_memtable.read()?;
-
-			// Check the active memtable for the key
-			if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
-				if item.0.is_tombstone() {
-					return Ok(None); // Key is a tombstone, return None
-				}
-				return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
+		// Walk the read stack nearest-first: the owner's layer, then
+		// catalog-resolved ancestors, each capped at its fork-path cap. The
+		// first visible version wins; a tombstone in a nearer layer hides
+		// every farther layer (COW shadowing is structural under the global
+		// clock: a child's sequences exceed every inherited visible one).
+		let level_manifest = self.core.level_manifest.read()?;
+		for layer in &self.layers {
+			if let Some(found) = Self::get_in_layer(&level_manifest, layer, key)? {
+				return Ok(match found {
+					LayerHit::Tombstone => None,
+					LayerHit::Value(value, seq) => Some((value, seq)),
+				});
 			}
-			drop(memtable_lock); // Release the lock on the active memtable
+		}
+		Ok(None)
+	}
 
-			// Read lock on the immutable memtables
+	fn get_in_layer(
+		level_manifest: &LevelManifest,
+		layer: &SnapshotLayer,
+		key: &[u8],
+	) -> crate::Result<Option<LayerHit>> {
+		// Memtable phases exist only when the layer's owner has a runtime;
+		// an idle branch's view is durable tables at most.
+		if let Some(runtime) = &layer.runtime {
+			let memtable_lock = runtime.active_memtable.read()?;
+			if let Some(item) = memtable_lock.get(key.as_ref(), Some(layer.cap)) {
+				return Ok(Some(LayerHit::from_item(item)));
+			}
+			drop(memtable_lock);
+
 			let memtable_lock = runtime.immutable_memtables.read()?;
-
-			// Check the immutable memtables for the key
 			for entry in memtable_lock.iter().rev() {
-				let memtable = &entry.memtable;
-				if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
-					if item.0.is_tombstone() {
-						return Ok(None); // Key is a tombstone, return None
-					}
-					return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
+				if let Some(item) = entry.memtable.get(key.as_ref(), Some(layer.cap)) {
+					return Ok(Some(LayerHit::from_item(item)));
 				}
 			}
 		}
 
-		// Read lock on the level manifest; reads select this snapshot's
-		// owner level set — there is no owner-blind table scan.
-		let level_manifest = self.core.level_manifest.read()?;
-		let Some(owner_levels) = level_manifest.levels_for(self.owner) else {
+		// The layer's own durable tables, capped at the layer cap.
+		let Some(owner_levels) = level_manifest.levels_for(layer.owner) else {
 			return Ok(None);
 		};
-
-		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
-
-		// Check the tables in each level for the key
+		let ikey = InternalKey::new(key.to_vec(), layer.cap, InternalKeyKind::Set, 0);
 		for (level_idx, level) in owner_levels.into_iter().enumerate() {
 			if level_idx == 0 {
-				// Level 0: Tables can overlap, check all
 				for table in level.tables.iter() {
 					if !table.is_key_in_key_range(&ikey) {
-						continue; // Skip this table if the key is not in its range
+						continue;
 					}
-
-					let maybe_item = table.get(&ikey)?;
-
-					if let Some(item) = maybe_item {
-						let ikey = &item.0;
-						if ikey.is_tombstone() {
-							return Ok(None); // Key is a tombstone, return None
-						}
-						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
+					if let Some(item) = table.get(&ikey)? {
+						return Ok(Some(LayerHit::from_owned(item)));
 					}
 				}
 			} else {
-				// Level 1+: Non-overlapping, binary search for the one table
 				let query_range =
 					crate::user_range_to_internal_range(Bound::Included(key), Bound::Included(key));
 				let start_idx = level.find_first_overlapping_table(&query_range);
 				let end_idx = level.find_last_overlapping_table(&query_range);
-
-				// At most one table can contain this exact key
 				for table in &level.tables[start_idx..end_idx] {
-					let maybe_item = table.get(&ikey)?;
-
-					if let Some(item) = maybe_item {
-						let ikey = &item.0;
-						if ikey.is_tombstone() {
-							return Ok(None); // Key is a tombstone, return None
-						}
-						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
+					if let Some(item) = table.get(&ikey)? {
+						return Ok(Some(LayerHit::from_owned(item)));
 					}
 				}
 			}
 		}
-
-		Ok(None) // Key not found in any memtable or table, return None
+		Ok(None)
 	}
 
 	/// Creates an iterator for a range scan within the snapshot
@@ -431,6 +554,78 @@ pub(crate) enum MergeDirection {
 	Backward,
 }
 
+/// Caps one layer's iterator at its fork-path visibility: entries with
+/// `seq > cap` are skipped in whichever direction the wrapper is moving.
+/// Internal order is key-ascending with seq DESCENDING inside a key, so a
+/// forward skip walks from a key's newest (possibly above-cap) versions down
+/// to its visible ones; backward is the mirror image.
+struct SeqCappedIterator<'a> {
+	inner: BoxedLSMIterator<'a>,
+	cap: u64,
+}
+
+impl<'a> SeqCappedIterator<'a> {
+	fn new(inner: BoxedLSMIterator<'a>, cap: u64) -> Self {
+		Self {
+			inner,
+			cap,
+		}
+	}
+
+	fn skip_forward(&mut self, mut valid: bool) -> Result<bool> {
+		while valid && self.inner.key().seq_num() > self.cap {
+			valid = self.inner.next()?;
+		}
+		Ok(valid)
+	}
+
+	fn skip_backward(&mut self, mut valid: bool) -> Result<bool> {
+		while valid && self.inner.key().seq_num() > self.cap {
+			valid = self.inner.prev()?;
+		}
+		Ok(valid)
+	}
+}
+
+impl LSMIterator for SeqCappedIterator<'_> {
+	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		let valid = self.inner.seek(target)?;
+		self.skip_forward(valid)
+	}
+
+	fn seek_first(&mut self) -> Result<bool> {
+		let valid = self.inner.seek_first()?;
+		self.skip_forward(valid)
+	}
+
+	fn seek_last(&mut self) -> Result<bool> {
+		let valid = self.inner.seek_last()?;
+		self.skip_backward(valid)
+	}
+
+	fn next(&mut self) -> Result<bool> {
+		let valid = self.inner.next()?;
+		self.skip_forward(valid)
+	}
+
+	fn prev(&mut self) -> Result<bool> {
+		let valid = self.inner.prev()?;
+		self.skip_backward(valid)
+	}
+
+	fn valid(&self) -> bool {
+		self.inner.valid()
+	}
+
+	fn key(&self) -> InternalKeyRef<'_> {
+		self.inner.key()
+	}
+
+	fn value_encoded(&self) -> Result<&[u8]> {
+		self.inner.value_encoded()
+	}
+}
+
 /// A merge iterator that sorts by key+seqno.
 /// Uses index-based tracking for zero-allocation iteration.
 pub(crate) struct KMergeIterator<'iter> {
@@ -492,10 +687,13 @@ impl<'a> KMergeIterator<'a> {
 
 		let query_range = Arc::new(internal_range);
 
-		// Pre-allocate capacity for the iterators.
-		// 1 active memtable + immutable memtables + level tables.
-		let mut iterators: Vec<BoxedLSMIterator<'a>> =
-			Vec::with_capacity(1 + boxed_state.immutable.len() + boxed_state.levels.total_tables());
+		// Pre-allocate capacity for the iterators across every layer.
+		let capacity: usize = boxed_state
+			.layers
+			.iter()
+			.map(|layer| 1 + layer.immutable.len() + layer.levels.total_tables())
+			.sum();
+		let mut iterators: Vec<BoxedLSMIterator<'a>> = Vec::with_capacity(capacity);
 
 		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
 
@@ -512,71 +710,85 @@ impl<'a> KMergeIterator<'a> {
 			                                                * iterators */
 		};
 
-		// Active memtable (absent for an idle branch's snapshot)
-		if let Some(active) = &state_ref.active {
-			let active_iter = active.range(lower, upper);
-			iterators.push(Box::new(active_iter) as BoxedLSMIterator<'a>);
-		}
+		for layer in &state_ref.layers {
+			// Every iterator of this layer is wrapped in a SeqCappedIterator
+			// BEFORE the merge: per-layer fork caps cannot be expressed by
+			// the merged stream's global snapshot filter.
+			let mut layer_iterators: Vec<BoxedLSMIterator<'a>> = Vec::new();
 
-		// Immutable memtables
-		for memtable in &state_ref.immutable {
-			let iter = memtable.range(lower, upper);
-			iterators.push(Box::new(iter) as BoxedLSMIterator<'a>);
-		}
+			// Active memtable (absent for an idle branch's layer)
+			if let Some(active) = &layer.active {
+				let active_iter = active.range(lower, upper);
+				layer_iterators.push(Box::new(active_iter) as BoxedLSMIterator<'a>);
+			}
 
-		// Tables - these have native seek support
-		for (level_idx, level) in (&state_ref.levels).into_iter().enumerate() {
-			// Optimization: Skip tables that are completely outside the query range
-			if level_idx == 0 {
-				// Level 0: Tables can overlap, so we check all but skip those completely
-				// outside range
-				for table in &level.tables {
-					// Skip tables completely before or after the range
-					if table.is_before_range(&query_range) || table.is_after_range(&query_range) {
-						continue;
-					}
-					// Skip tables outside timestamp range (if specified)
-					if let Some((ts_start, ts_end)) = ts_range {
-						let props = &table.meta.properties;
-						if let (Some(newest), Some(oldest)) =
-							(props.newest_key_time, props.oldest_key_time)
+			// Immutable memtables
+			for memtable in &layer.immutable {
+				let iter = memtable.range(lower, upper);
+				layer_iterators.push(Box::new(iter) as BoxedLSMIterator<'a>);
+			}
+
+			// Tables - these have native seek support
+			for (level_idx, level) in (&layer.levels).into_iter().enumerate() {
+				// Optimization: Skip tables that are completely outside the query range
+				if level_idx == 0 {
+					// Level 0: Tables can overlap, so we check all but skip those completely
+					// outside range
+					for table in &level.tables {
+						// Skip tables completely before or after the range
+						if table.is_before_range(&query_range) || table.is_after_range(&query_range)
 						{
-							if newest < ts_start || oldest > ts_end {
-								continue;
+							continue;
+						}
+						// Skip tables outside timestamp range (if specified)
+						if let Some((ts_start, ts_end)) = ts_range {
+							let props = &table.meta.properties;
+							if let (Some(newest), Some(oldest)) =
+								(props.newest_key_time, props.oldest_key_time)
+							{
+								if newest < ts_start || oldest > ts_end {
+									continue;
+								}
 							}
 						}
-					}
-					// Use custom comparator for table iteration
-					if let Ok(table_iter) =
-						table.iter_with_comparator(Some((*query_range).clone()), Arc::clone(&cmp))
-					{
-						iterators.push(Box::new(table_iter) as BoxedLSMIterator<'a>);
-					}
-				}
-			} else {
-				// Level 1+: Tables have non-overlapping key ranges, use binary search
-				let start_idx = level.find_first_overlapping_table(&query_range);
-				let end_idx = level.find_last_overlapping_table(&query_range);
-
-				for table in &level.tables[start_idx..end_idx] {
-					// Skip tables outside timestamp range (if specified)
-					if let Some((ts_start, ts_end)) = ts_range {
-						let props = &table.meta.properties;
-						if let (Some(newest), Some(oldest)) =
-							(props.newest_key_time, props.oldest_key_time)
+						// Use custom comparator for table iteration
+						if let Ok(table_iter) = table
+							.iter_with_comparator(Some((*query_range).clone()), Arc::clone(&cmp))
 						{
-							if newest < ts_start || oldest > ts_end {
-								continue;
-							}
+							layer_iterators.push(Box::new(table_iter) as BoxedLSMIterator<'a>);
 						}
 					}
-					// Use custom comparator for table iteration
-					if let Ok(table_iter) =
-						table.iter_with_comparator(Some((*query_range).clone()), Arc::clone(&cmp))
-					{
-						iterators.push(Box::new(table_iter) as BoxedLSMIterator<'a>);
+				} else {
+					// Level 1+: Tables have non-overlapping key ranges, use binary search
+					let start_idx = level.find_first_overlapping_table(&query_range);
+					let end_idx = level.find_last_overlapping_table(&query_range);
+
+					for table in &level.tables[start_idx..end_idx] {
+						// Skip tables outside timestamp range (if specified)
+						if let Some((ts_start, ts_end)) = ts_range {
+							let props = &table.meta.properties;
+							if let (Some(newest), Some(oldest)) =
+								(props.newest_key_time, props.oldest_key_time)
+							{
+								if newest < ts_start || oldest > ts_end {
+									continue;
+								}
+							}
+						}
+						// Use custom comparator for table iteration
+						if let Ok(table_iter) = table
+							.iter_with_comparator(Some((*query_range).clone()), Arc::clone(&cmp))
+						{
+							layer_iterators.push(Box::new(table_iter) as BoxedLSMIterator<'a>);
+						}
 					}
 				}
+			}
+
+			for inner in layer_iterators {
+				iterators.push(
+					Box::new(SeqCappedIterator::new(inner, layer.cap)) as BoxedLSMIterator<'a>
+				);
 			}
 		}
 

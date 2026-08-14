@@ -18,7 +18,6 @@ use crate::transaction::{HistoryOptions, Transaction, TransactionOptions};
 use crate::{
 	BranchGeneration,
 	BranchId,
-	CommitVersion,
 	Error,
 	Key,
 	LSMIterator,
@@ -3643,13 +3642,8 @@ async fn test_direction_switch_after_seek() {
 async fn deleting_a_branch_fences_an_already_open_transaction_before_wal_append() {
 	let (store, _temp_dir) = create_store();
 	let branch = BranchId::from_u128(77);
-	let record = store
-		.core
-		.branch_catalog
-		.write()
-		.unwrap()
-		.create(branch, "agent/session", CommitVersion(0))
-		.unwrap();
+	let record =
+		store.core.branch_catalog.write().unwrap().create(branch, "agent/session", 0).unwrap();
 	let owner = BatchOwner {
 		branch,
 		generation: record.generation,
@@ -3658,13 +3652,55 @@ async fn deleting_a_branch_fences_an_already_open_transaction_before_wal_append(
 		Transaction::new_owned(Arc::clone(&store.core), TransactionOptions::write_only(), owner)
 			.unwrap();
 	transaction.set(b"key", b"value").unwrap();
-	store.core.branch_catalog.write().unwrap().delete(branch).unwrap();
+	store.core.branch_catalog.write().unwrap().delete(branch, 0).unwrap();
 
 	assert!(matches!(transaction.commit().await, Err(Error::BranchFenced)));
 	assert_eq!(store.core.seq_num(), 0, "fenced transaction must not allocate a commit version");
 	assert_eq!(
 		owner.generation,
-		BranchGeneration(0),
-		"fixture must exercise the first live generation"
+		BranchGeneration(1),
+		"fixture must exercise the first allocated generation (0 is reserved for the default branch)"
 	);
+}
+
+/// A finished transaction stops being a reader immediately, not when its handle
+/// is finally dropped. Both the oracle's GC watermark and the read snapshot are
+/// released at `commit`/`rollback`, because a parked handle would otherwise pin
+/// the retention boundary compaction honours for as long as it lives.
+#[test(tokio::test)]
+async fn a_finished_transaction_releases_its_reader_state_immediately() {
+	let (store, _temp_dir) = create_store();
+	let tracker = &store.core.inner.snapshot_tracker;
+
+	let mut committed = store.begin().unwrap();
+	committed.set(b"k", b"v").unwrap();
+	assert!(!tracker.get_all_snapshots().is_empty(), "an open transaction registers a snapshot");
+	committed.commit().await.unwrap();
+	assert!(
+		tracker.get_all_snapshots().is_empty(),
+		"the snapshot must be released at commit, not at drop"
+	);
+	// The handle is still alive and still refuses reads with the same error as
+	// before, rather than tripping over the released snapshot.
+	assert!(matches!(committed.get(b"k"), Err(Error::TransactionClosed)));
+	assert!(matches!(committed.range(b"a", b"z"), Err(Error::TransactionClosed)));
+
+	// An empty commit takes the early-return path and must release just as much.
+	let mut empty = store.begin().unwrap();
+	empty.commit().await.unwrap();
+	assert!(tracker.get_all_snapshots().is_empty());
+
+	// Rollback keeps its existing contract.
+	let mut rolled_back = store.begin().unwrap();
+	rolled_back.set(b"k2", b"v2").unwrap();
+	rolled_back.rollback();
+	assert!(tracker.get_all_snapshots().is_empty());
+	drop(committed);
+	drop(empty);
+	drop(rolled_back);
+
+	// The write itself is unaffected.
+	let reader = store.begin().unwrap();
+	assert_eq!(reader.get(b"k").unwrap(), Some(b"v".to_vec()));
+	assert_eq!(reader.get(b"k2").unwrap(), None);
 }

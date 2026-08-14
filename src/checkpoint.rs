@@ -31,6 +31,10 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Current checkpoint metadata format version
 const CHECKPOINT_VERSION: u32 = 1;
 
+/// The authority lineage directories a checkpoint captures and a restore
+/// swaps as one unit.
+const AUTHORITY_LINEAGE_DIRS: [&str; 3] = ["catalog", "root", "branch"];
+
 /// Checkpoint file name
 const CHECKPOINT_METADATA_FILE: &str = "CHECKPOINT_METADATA";
 
@@ -244,14 +248,17 @@ impl DatabaseCheckpoint {
 			Self::copy_directory_sync(&wal_source, &wal_dest)?;
 		}
 
-		// Restore level manifest directory
-		let manifest_source = checkpoint_path.join("manifest");
-		let manifest_dest = self.core.opts.manifest_dir();
-		if manifest_source.exists() {
-			if manifest_dest.exists() {
-				fs::remove_dir_all(&manifest_dest).map_err(|e| Error::Io(Arc::new(e)))?;
+		// Restore the authority lineages (catalog, root, per-branch states):
+		// restore is a whole-database swap including the branch catalog.
+		for lineage in AUTHORITY_LINEAGE_DIRS {
+			let source = checkpoint_path.join(lineage);
+			let dest = self.core.opts.path.join(lineage);
+			if source.exists() {
+				if dest.exists() {
+					fs::remove_dir_all(&dest).map_err(|e| Error::Io(Arc::new(e)))?;
+				}
+				copy_dir_all(&source, &dest).map_err(|e| Error::Io(Arc::new(e)))?;
 			}
-			copy_dir_all(&manifest_source, &manifest_dest).map_err(|e| Error::Io(Arc::new(e)))?;
 		}
 
 		Ok(metadata)
@@ -322,10 +329,20 @@ impl DatabaseCheckpoint {
 		Ok(())
 	}
 
-	/// Copies the level manifest directory to the checkpoint directory
+	/// Copies the authority lineages (catalog, root, per-branch states) to
+	/// the checkpoint directory. Together with the SSTs these are one
+	/// consistent cut of the database including the branch catalog.
 	fn copy_level_manifest(&self, dest_dir: &Path) -> Result<u64> {
-		let source_path = self.core.opts.manifest_dir();
-		let dest_path = dest_dir.join("manifest");
+		let mut total = 0u64;
+		for lineage in AUTHORITY_LINEAGE_DIRS {
+			total += self.copy_one_lineage(dest_dir, lineage)?;
+		}
+		Ok(total)
+	}
+
+	fn copy_one_lineage(&self, dest_dir: &Path, lineage: &str) -> Result<u64> {
+		let source_path = self.core.opts.path.join(lineage);
+		let dest_path = dest_dir.join(lineage);
 
 		if source_path.exists() {
 			copy_dir_all(&source_path, &dest_path).map_err(|e| Error::Io(Arc::new(e)))?;
@@ -419,10 +436,12 @@ impl DatabaseCheckpoint {
 			fs::remove_dir_all(&wal_dir).map_err(|e| Error::Io(Arc::new(e)))?;
 		}
 
-		// Remove level manifest directory
-		let manifest_path = self.core.opts.manifest_dir();
-		if manifest_path.exists() {
-			fs::remove_dir_all(&manifest_path).map_err(|e| Error::Io(Arc::new(e)))?;
+		// Remove the authority lineages; the checkpoint's copies replace them.
+		for lineage in AUTHORITY_LINEAGE_DIRS {
+			let dir = self.core.opts.path.join(lineage);
+			if dir.exists() {
+				fs::remove_dir_all(&dir).map_err(|e| Error::Io(Arc::new(e)))?;
+			}
 		}
 
 		Ok(())

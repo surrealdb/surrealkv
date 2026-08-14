@@ -3,10 +3,11 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::batch::BatchOwner;
+use crate::branch::BranchCatalog;
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
-use crate::iter::{BoxedLSMIterator, CompactionIterator};
-use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
+use crate::iter::{BoxedLSMIterator, CompactionIterator, NO_HISTORY_PIN};
+use crate::levels::{LevelManifest, ManifestChangeSet};
 use crate::lsm::CoreInner;
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
@@ -61,18 +62,46 @@ pub(crate) struct CompactionOptions {
 	/// sequence numbers. Versions visible to any active snapshot must be
 	/// preserved (unless hidden by a newer version in the same visibility boundary).
 	pub(crate) snapshot_tracker: SnapshotTracker,
+	/// The branch catalog: the sole source of inherited-view retention pins
+	/// (design §3.3a, plan amendment C9 — never the snapshot tracker, never
+	/// child state manifests).
+	pub(crate) branch_catalog: Arc<RwLock<BranchCatalog>>,
+	/// Minimum fork anchor across `owner`'s Active children, sampled from the
+	/// catalog when this job was created, or [`NO_HISTORY_PIN`].
+	pub(crate) history_pin_floor: u64,
+	/// Whether this compaction must not treat its highest level as the bottom
+	/// of a read stack. True when `owner` has Active children (their inherited
+	/// views read below the tombstones being compacted) or when `owner` is
+	/// itself a fork child (its ancestors sit below its own bottom level) —
+	/// plan amendment C1(c).
+	pub(crate) force_not_bottom: bool,
 }
 
 impl CompactionOptions {
-	pub(crate) fn for_owner(tree: &CoreInner, owner: BatchOwner) -> Self {
-		Self {
+	pub(crate) fn for_owner(tree: &CoreInner, owner: BatchOwner) -> Result<Self> {
+		// Lock order: this is the only place a compaction job takes the catalog
+		// without already holding the level manifest, and every other catalog
+		// reader is leaf-level, so `level_manifest -> branch_catalog` (used at
+		// publish time) is a consistent global order.
+		let (history_pin_floor, force_not_bottom) = {
+			let catalog = tree.branch_catalog.read()?;
+			let anchor = catalog.min_active_child_anchor(owner.branch, owner.generation);
+			(
+				anchor.unwrap_or(NO_HISTORY_PIN),
+				anchor.is_some() || catalog.record_has_parent(owner.branch, owner.generation),
+			)
+		};
+		Ok(Self {
 			lopts: Arc::clone(&tree.opts),
 			owner,
 			level_manifest: Arc::clone(&tree.level_manifest),
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			error_handler: Arc::clone(&tree.error_handler),
 			snapshot_tracker: tree.snapshot_tracker.clone(),
-		}
+			branch_catalog: Arc::clone(&tree.branch_catalog),
+			history_pin_floor,
+			force_not_bottom,
+		})
 	}
 }
 
@@ -133,14 +162,16 @@ impl Compactor {
 		let new_table_path = self.get_table_path(new_table_id);
 
 		// Write merged data
-		let table_created =
-			match self.write_merged_table(&new_table_path, new_table_id, iterators, input, owner) {
-				Ok(result) => result,
-				Err(e) => {
-					// Guard will unhide tables on drop
-					return Err(e);
-				}
-			};
+		let MergeOutcome {
+			table_created,
+			retained_floor_advance,
+		} = match self.write_merged_table(&new_table_path, new_table_id, iterators, input, owner) {
+			Ok(result) => result,
+			Err(e) => {
+				// Guard will unhide tables on drop
+				return Err(e);
+			}
+		};
 
 		// Open table only if one was created
 		let new_table = if table_created {
@@ -156,14 +187,25 @@ impl Compactor {
 		};
 
 		// Update manifest - this will commit the guard on success
-		self.update_manifest(input, new_table, &mut guard)?;
+		if let Err(error) =
+			self.update_manifest(input, new_table, retained_floor_advance, &mut guard)
+		{
+			// The output table is unreachable: nothing references it, and the
+			// guard is about to restore the inputs. Remove it here rather than
+			// leaving an orphan for the next open to reclaim.
+			if table_created {
+				if let Err(remove_error) = std::fs::remove_file(&new_table_path) {
+					log::warn!("failed to remove unpublished compaction output: {remove_error}");
+				}
+			}
+			return Err(error);
+		}
 
 		self.cleanup_old_tables(input);
 
 		Ok(())
 	}
 
-	/// Returns true if a table file was created and finished, false otherwise
 	fn write_merged_table(
 		&self,
 		path: &Path,
@@ -171,7 +213,7 @@ impl Compactor {
 		merge_iter: Vec<BoxedLSMIterator<'_>>,
 		input: &CompactionInput,
 		owner: crate::batch::BatchOwner,
-	) -> Result<bool> {
+	) -> Result<MergeOutcome> {
 		let file = SysFile::create(path)?;
 		let mut writer = TableWriter::new_owned(
 			file,
@@ -188,7 +230,7 @@ impl Compactor {
 
 		// Create a compaction iterator that filters tombstones and respects snapshots
 		let max_level = self.options.lopts.level_count - 1;
-		let is_bottom_level = input.target_level >= max_level;
+		let is_bottom_level = input.target_level >= max_level && !self.options.force_not_bottom;
 		let mut comp_iter = CompactionIterator::new(
 			merge_iter,
 			Arc::clone(&self.options.lopts.internal_comparator) as Arc<dyn Comparator>,
@@ -197,6 +239,7 @@ impl Compactor {
 			self.options.lopts.versioned_history_retention_ns,
 			Arc::clone(&self.options.lopts.clock),
 			snapshots,
+			self.options.history_pin_floor,
 		);
 
 		let mut entries = 0;
@@ -206,11 +249,26 @@ impl Compactor {
 			entries += 1;
 		}
 
+		let pin_retained = comp_iter.pin_retained_versions();
+		if pin_retained > 0 {
+			log::debug!(
+				"compaction of {:?} retained {} version(s) for inherited views at or below seq {}",
+				self.options.owner,
+				pin_retained,
+				self.options.history_pin_floor
+			);
+		}
+
+		let outcome = MergeOutcome {
+			table_created: entries > 0,
+			retained_floor_advance: comp_iter.retained_floor_advance(),
+		};
+
 		if entries == 0 {
 			// No entries - drop writer and remove empty file
 			drop(writer);
 			let _ = std::fs::remove_file(path);
-			return Ok(false);
+			return Ok(outcome);
 		}
 
 		writer.finish()?;
@@ -223,17 +281,37 @@ impl Compactor {
 		crate::vfs::fsync_file(path)?;
 		crate::lsm::fsync_directory(self.options.lopts.sstable_dir())?;
 
-		Ok(true)
+		Ok(outcome)
 	}
 
 	fn update_manifest(
 		&self,
 		input: &CompactionInput,
 		new_table: Option<Arc<Table>>,
+		retained_floor_advance: u64,
 		guard: &mut HiddenTablesGuard,
 	) -> Result<()> {
 		let mut manifest = self.options.level_manifest.write()?;
 		let _imm_guard = self.options.immutable_memtables.write();
+
+		// A fork published while this job was merging can pin history the job
+		// already dropped: the floor was sampled before the merge, outside the
+		// manifest lock. Re-read it here, under the lock that serialises
+		// publication, and refuse to publish an output built against a weaker
+		// promise. The hidden inputs are restored by `HiddenTablesGuard`, and
+		// the next cycle re-picks them with the stricter floor.
+		let current_floor = self
+			.options
+			.branch_catalog
+			.read()?
+			.min_active_child_anchor(self.options.owner.branch, self.options.owner.generation)
+			.unwrap_or(NO_HISTORY_PIN);
+		if pin_floor_regressed(self.options.history_pin_floor, current_floor) {
+			return Err(crate::error::Error::CompactionPinRaced {
+				sampled_floor: self.options.history_pin_floor,
+				current_floor,
+			});
+		}
 
 		// Check for table ID collision if adding a new table
 		if let Some(ref table) = new_table {
@@ -267,10 +345,15 @@ impl Compactor {
 			changeset.new_tables.push((input.target_level, table));
 		}
 
+		// The floor must be durable together with the level set it describes: a
+		// crash between them would leave a state whose tables no longer support
+		// the views its floor still promises.
+		manifest.raise_retained_floor(self.options.owner, retained_floor_advance);
+
 		let rollback = manifest.apply_changeset(&changeset)?;
 
-		// Write manifest to disk - if this fails, revert in-memory state
-		if let Err(e) = write_manifest_to_disk(&manifest) {
+		// Publish the owner's state + root - if this fails, revert in-memory state
+		if let Err(e) = manifest.persist_owner_update(self.options.owner) {
 			manifest.revert_changeset(rollback);
 			self.options
 				.error_handler
@@ -308,6 +391,25 @@ impl Compactor {
 
 		Ok(Arc::new(Table::new(table_id, Arc::clone(&self.options.lopts), file, file_size)?))
 	}
+}
+
+/// What one merge produced: whether an output table exists, and how far the
+/// owner's retention floor must move before that output can be published.
+struct MergeOutcome {
+	table_created: bool,
+	retained_floor_advance: u64,
+}
+
+/// Whether a compaction that retained history down to `sampled_floor` is still
+/// allowed to publish now that the catalog pins `current_floor`.
+///
+/// A floor that rose (or vanished, because the last child was deleted) means the
+/// output over-retains, which is always safe. Only a floor that dropped below
+/// what the job assumed is unsafe: versions between the two floors may already
+/// have been discarded from the output table.
+fn pin_floor_regressed(sampled_floor: u64, current_floor: u64) -> bool {
+	current_floor != NO_HISTORY_PIN
+		&& (sampled_floor == NO_HISTORY_PIN || current_floor < sampled_floor)
 }
 
 fn common_owner(

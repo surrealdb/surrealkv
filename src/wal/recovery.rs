@@ -67,11 +67,17 @@ impl Reporter for DefaultReporter {
 /// * `branch_arena_size` - Arena size for non-default-owner memtables
 /// * `is_live_owner` - Catalog fence: `false` drops the batch as fenced
 ///
-/// # Returns
-/// * `Ok((Some(max_seq_num), memtables))` - Memtables with their WAL numbers
-/// * `Ok((None, vec![]))` - No data recovered
-/// * `Err(...)` - Error during replay
-type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, u64)>);
+/// Everything replay recovers besides the memtables themselves.
+pub(crate) struct ReplayOutcome {
+	/// Highest sequence seen across ALL batches including fenced ones (the
+	/// clock never reseeds below an allocated sequence).
+	pub(crate) max_seq_num: Option<u64>,
+	/// Branch-pure memtables with their WAL segment numbers.
+	pub(crate) memtables: Vec<(Arc<MemTable>, u64)>,
+	/// `(commit_ts, highest_seq)` per replayed batch, fenced included —
+	/// strictly increasing on both axes (validated), feeding the timeline.
+	pub(crate) fenceposts: Vec<(u64, u64)>,
+}
 
 pub(crate) fn replay_wal(
 	wal_dir: &Path,
@@ -79,7 +85,7 @@ pub(crate) fn replay_wal(
 	default_arena_size: usize,
 	branch_arena_size: usize,
 	is_live_owner: &dyn Fn(BatchOwner) -> bool,
-) -> Result<ReplayResult> {
+) -> Result<ReplayOutcome> {
 	log::info!("Starting WAL recovery from directory: {:?}", wal_dir);
 	log::debug!(
 		"WAL recovery parameters: min_wal_number={}, default_arena_size={}, branch_arena_size={}",
@@ -91,12 +97,20 @@ pub(crate) fn replay_wal(
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
 		log::debug!("WAL directory does not exist, skipping recovery");
-		return Ok((None, vec![]));
+		return Ok(ReplayOutcome {
+			max_seq_num: None,
+			memtables: vec![],
+			fenceposts: vec![],
+		});
 	}
 
 	if list_segment_ids(wal_dir, Some("wal"))?.is_empty() {
 		log::debug!("No WAL segments found, skipping recovery");
-		return Ok((None, vec![]));
+		return Ok(ReplayOutcome {
+			max_seq_num: None,
+			memtables: vec![],
+			fenceposts: vec![],
+		});
 	}
 
 	// Get range of segment IDs (looking for .wal files)
@@ -104,7 +118,11 @@ pub(crate) fn replay_wal(
 		Ok(range) => range,
 		Err(WalError::IO(ref io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
 			log::debug!("WAL segment range not found, skipping recovery");
-			return Ok((None, vec![]));
+			return Ok(ReplayOutcome {
+				max_seq_num: None,
+				memtables: vec![],
+				fenceposts: vec![],
+			});
 		}
 		Err(e) => return Err(e.into()),
 	};
@@ -112,7 +130,11 @@ pub(crate) fn replay_wal(
 	// If no segments, nothing to replay
 	if first > last {
 		log::debug!("No valid WAL segment range, skipping recovery");
-		return Ok((None, vec![]));
+		return Ok(ReplayOutcome {
+			max_seq_num: None,
+			memtables: vec![],
+			fenceposts: vec![],
+		});
 	}
 
 	// Determine the range of segments to replay
@@ -124,7 +146,11 @@ pub(crate) fn replay_wal(
 			last,
 			min_wal_number
 		);
-		return Ok((None, vec![]));
+		return Ok(ReplayOutcome {
+			max_seq_num: None,
+			memtables: vec![],
+			fenceposts: vec![],
+		});
 	}
 
 	log::info!("Replaying WAL segments #{:020} to #{:020}", start_segment, last);
@@ -135,8 +161,12 @@ pub(crate) fn replay_wal(
 	let mut fenced_batches: u64 = 0;
 	let mut segments_processed = 0;
 
-	// Sequence-order enforcement across the whole replayed range.
+	// Sequence- and timestamp-order enforcement across the replayed range:
+	// both are stamped under the commit write mutex, so both must strictly
+	// increase; a regression on either axis is corruption.
 	let mut last_replayed_seq: Option<u64> = None;
+	let mut last_replayed_ts: Option<u64> = None;
+	let mut fenceposts: Vec<(u64, u64)> = Vec::new();
 
 	// Collect memtables - one per (WAL segment, live owner)
 	let mut memtables: Vec<(Arc<MemTable>, u64)> = Vec::new();
@@ -197,6 +227,24 @@ pub(crate) fn replay_wal(
 						}
 					}
 					last_replayed_seq = Some(batch_highest_seq_num);
+
+					if let Some(previous_ts) = last_replayed_ts {
+						if batch.commit_ts <= previous_ts {
+							return Err(Error::wal_corruption(
+								segment_id as usize,
+								last_valid_offset,
+								format!(
+									"batch commit timestamp regressed during replay: {} after {}",
+									batch.commit_ts, previous_ts
+								),
+							));
+						}
+					}
+					last_replayed_ts = Some(batch.commit_ts);
+					// Fenced batches fencepost too: their timestamps and
+					// sequences were allocated; resolving onto them is exact
+					// and their data is simply unreachable.
+					fenceposts.push((batch.commit_ts, batch_highest_seq_num));
 
 					// The clock never rewinds below a fenced batch: its
 					// sequences were allocated (and possibly acknowledged)
@@ -338,7 +386,11 @@ pub(crate) fn replay_wal(
 		result
 	);
 
-	Ok((result, memtables))
+	Ok(ReplayOutcome {
+		max_seq_num: result,
+		memtables,
+		fenceposts,
+	})
 }
 
 pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
@@ -497,8 +549,8 @@ mod tests {
 
 		// Replay the WAL - should replay BOTH segments
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (max_seq_num_opt, memtables) =
-			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let outcome = replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let (max_seq_num_opt, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 		// Verify both segments are replayed: max_seq_num should be 203 (highest from
 		// batch2)
@@ -531,8 +583,8 @@ mod tests {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (max_seq_num_opt, memtables) =
-			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let outcome = replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let (max_seq_num_opt, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 		assert_eq!(max_seq_num_opt, None, "Empty WAL directory should return None");
 		assert_eq!(memtables.len(), 0, "Empty WAL directory should return no memtables");
@@ -569,8 +621,8 @@ mod tests {
 		wal.close().unwrap();
 
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (max_seq_num_opt, memtables) =
-			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let outcome = replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let (max_seq_num_opt, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 		// All three segments should be replayed, max should be 700
 		assert_eq!(
@@ -627,8 +679,8 @@ mod tests {
 
 		// Replay WAL
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (max_seq_num_opt, memtables) =
-			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let outcome = replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let (max_seq_num_opt, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 		// Both segments should be replayed, max should be 301
 		assert_eq!(
@@ -703,7 +755,7 @@ mod tests {
 		drop(file);
 
 		// Test using Core::replay_wal_with_repair (the actual production flow)
-		let (max_seq_num, memtables) = crate::lsm::Core::replay_wal_with_repair(
+		let outcome = crate::lsm::Core::replay_wal_with_repair(
 			wal_dir,
 			0,
 			"Test repair",
@@ -713,6 +765,7 @@ mod tests {
 			&|_| true,
 		)
 		.unwrap();
+		let (max_seq_num, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 		// Verify the repair worked correctly
 		// Since the first record is corrupted, we should recover None (no valid data)
@@ -782,7 +835,7 @@ mod tests {
 		file.write_all(&data).unwrap(); // Data
 		drop(file);
 
-		let (max_seq_num, memtables) = crate::lsm::Core::replay_wal_with_repair(
+		let outcome = crate::lsm::Core::replay_wal_with_repair(
 			wal_dir,
 			0,
 			"Test repair",
@@ -792,6 +845,7 @@ mod tests {
 			&|_| true,
 		)
 		.unwrap();
+		let (max_seq_num, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 		// Verify the repair worked correctly
 		// Since the third batch is corrupted, we should recover data from the first two
@@ -902,8 +956,8 @@ mod tests {
 
 		// Replay - DefaultReporter is created internally
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (seq_num_opt, memtables) =
-			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let outcome = replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let (seq_num_opt, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 		assert_eq!(seq_num_opt, Some(100));
 		assert_eq!(memtables.len(), 1, "Should create one memtable for single segment");
@@ -945,8 +999,8 @@ mod tests {
 
 		// Now attempt recovery - both WAL segments should be replayed
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (max_seq_num_opt, memtables) =
-			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let outcome = replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let (max_seq_num_opt, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 		// Verify both segments were replayed
 		assert_eq!(
@@ -1074,8 +1128,8 @@ mod tests {
 
 		// Replay - should create 3 memtables
 		let arena_size = 1024 * 1024;
-		let (max_seq, memtables) =
-			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let outcome = replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
+		let (max_seq, memtables) = (outcome.max_seq_num, outcome.memtables);
 
 		assert_eq!(max_seq, Some(300), "Max seq should be from last batch");
 		assert_eq!(memtables.len(), 3, "Should create one memtable per WAL segment");

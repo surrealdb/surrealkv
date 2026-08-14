@@ -7,18 +7,28 @@ use tempfile::TempDir;
 use test_log::test;
 
 use crate::batch::BatchOwner;
+use crate::branch::BranchCatalog;
 use crate::clock::MockLogicalClock;
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::leveled::{CompactionPriority, Strategy};
 use crate::compaction::{CompactionChoice, CompactionStrategy};
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::error::{BackgroundErrorHandler, Result};
-use crate::iter::CompactionIterator;
-use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
+use crate::iter::{CompactionIterator, NO_HISTORY_PIN};
+use crate::levels::{Level, LevelManifest, Levels};
 use crate::memtable::ImmutableMemtables;
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
-use crate::{CompressionType, InternalKey, InternalKeyKind, Key, LSMIterator, Options, Value};
+use crate::{
+	BranchId,
+	CompressionType,
+	InternalKey,
+	InternalKeyKind,
+	Key,
+	LSMIterator,
+	Options,
+	Value,
+};
 
 /// Test environment setup helpers
 struct TestEnv {
@@ -183,9 +193,6 @@ fn create_test_manifest(
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(next_table_id)));
 
-	// Write the manifest to disk
-	write_manifest_to_disk(&manifest)?;
-
 	Ok(Arc::new(RwLock::new(manifest)))
 }
 
@@ -201,6 +208,12 @@ fn create_compaction_options(
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 		error_handler: Arc::new(BackgroundErrorHandler::new()),
 		snapshot_tracker: SnapshotTracker::new(),
+		// A catalog holding only the default branch: no fork children, so no
+		// inherited-view pin and a real bottom level, matching what every
+		// pre-branching compaction test asserts.
+		branch_catalog: Arc::new(RwLock::new(BranchCatalog::new(BranchId::DEFAULT))),
+		history_pin_floor: NO_HISTORY_PIN,
+		force_not_bottom: false,
 	}
 }
 
@@ -444,7 +457,6 @@ fn test_level_selection_score_based() {
 	let manifest_path = env.options.path.join("test_manifest_score");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Calculate expected scores using the actual formula
@@ -607,7 +619,6 @@ async fn test_simple_merge_compaction() {
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(next_table_id)));
 
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create the leveled compaction strategy
@@ -792,7 +803,6 @@ async fn test_multi_level_merge_compaction() {
 
 	let manifest = LevelManifest::new_for_test(manifest_path, levels, shared_table_id_counter);
 
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create the strategy and compactor
@@ -1256,7 +1266,6 @@ async fn test_compaction_with_large_keys_and_values() {
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Track expected data
@@ -1327,7 +1336,6 @@ async fn test_compaction_respects_sequence_numbers() {
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Set up compaction
@@ -1407,7 +1415,6 @@ async fn test_tombstone_propagation() {
 	let manifest_path = env.options.path.join("test_manifest");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Run compaction
@@ -1499,7 +1506,6 @@ async fn test_l0_overlapping_keys_compaction() {
 	let manifest_path = env.options.path.join("test_manifest");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 2.0);
@@ -1607,7 +1613,6 @@ async fn test_l0_tombstone_propagation_overlapping() {
 	let manifest_path = env.options.path.join("test_manifest_tombstone");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 2.0);
@@ -1716,7 +1721,6 @@ async fn test_tombstone_propagation_through_levels() {
 	let manifest_path = env.options.path.join("test_manifest_propagation");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Use very small byte limits to ensure compaction is triggered
@@ -1799,6 +1803,7 @@ fn test_tombstone_propagation_journey() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 	let non_bottom_result: Vec<_> = comp_iter_non_bottom.by_ref().map(|r| r.unwrap()).collect();
 
@@ -1821,6 +1826,7 @@ fn test_tombstone_propagation_journey() {
 		0,
 		Arc::new(MockLogicalClock::new()),
 		vec![],
+		NO_HISTORY_PIN,
 	);
 	let bottom_result: Vec<_> = comp_iter_bottom.by_ref().map(|r| r.unwrap()).collect();
 
@@ -1990,7 +1996,6 @@ async fn test_soft_delete_compaction_behavior() {
 	let manifest_path = env.options.path.join("test_manifest_soft_delete");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 1.0);
@@ -2125,7 +2130,6 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 	let manifest_path = env.options.path.join("test_manifest_older_soft_delete");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 1.0);
@@ -2166,9 +2170,10 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 #[test]
 fn test_score_based_level_selection() {
 	let env = TestEnv::new();
-	// Ensure manifest directory exists
-	std::fs::create_dir_all(env.options.manifest_dir()).unwrap();
-	let mut manifest = LevelManifest::new(Arc::clone(&env.options)).unwrap();
+	let mut manifest = LevelManifest::fresh(
+		Arc::clone(&env.options),
+		crate::authority::store::AuthorityStore::new(env.options.path.clone(), [0; 16]),
+	);
 
 	// Create options with specific compaction settings
 	let mut opts = (*env.options).clone();
@@ -2207,9 +2212,10 @@ fn test_score_based_level_selection() {
 #[test]
 fn test_bytes_based_level_limits() {
 	let env = TestEnv::new();
-	// Ensure manifest directory exists
-	std::fs::create_dir_all(env.options.manifest_dir()).unwrap();
-	let mut manifest = LevelManifest::new(Arc::clone(&env.options)).unwrap();
+	let mut manifest = LevelManifest::fresh(
+		Arc::clone(&env.options),
+		crate::authority::store::AuthorityStore::new(env.options.path.clone(), [0; 16]),
+	);
 
 	// Create options with bytes-based limits
 	let mut opts = (*env.options).clone();
@@ -2242,9 +2248,10 @@ fn test_bytes_based_level_limits() {
 #[test]
 fn test_bottom_level_compaction() {
 	let env = TestEnv::new_with_levels(3); // 3 levels: L0, L1, L2 (L2 is bottom)
-										// Ensure manifest directory exists
-	std::fs::create_dir_all(env.options.manifest_dir()).unwrap();
-	let mut manifest = LevelManifest::new(Arc::clone(&env.options)).unwrap();
+	let mut manifest = LevelManifest::fresh(
+		Arc::clone(&env.options),
+		crate::authority::store::AuthorityStore::new(env.options.path.clone(), [0; 16]),
+	);
 
 	// Create options
 	let mut opts = (*env.options).clone();
@@ -2647,7 +2654,6 @@ fn test_clean_cut_shared_boundary_key() {
 	let manifest_path = env.options.path.join("test_manifest");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let levels_guard = manifest.read().unwrap();
@@ -2702,7 +2708,6 @@ fn test_clean_cut_chain_expansion() {
 	let manifest_path = env.options.path.join("test_manifest");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let levels_guard = manifest.read().unwrap();
@@ -2749,7 +2754,6 @@ fn test_clean_cut_no_expansion_needed() {
 	let manifest_path = env.options.path.join("test_manifest");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let levels_guard = manifest.read().unwrap();
@@ -2810,7 +2814,6 @@ fn test_clean_cut_integration_shared_boundary() {
 	let manifest_path = env.options.path.join("test_manifest");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create strategy with default priority (ByCompensatedSize)
@@ -2878,7 +2881,6 @@ fn test_clean_cut_integration_chain_expansion() {
 	let manifest_path = env.options.path.join("test_manifest");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create strategy with default priority (ByCompensatedSize)
@@ -2938,7 +2940,6 @@ fn test_clean_cut_integration_with_oldest_seq_priority() {
 	let manifest_path = env.options.path.join("test_manifest");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create strategy with OldestSmallestSeqFirst priority
@@ -2998,7 +2999,6 @@ fn test_clean_cut_integration_no_expansion() {
 	let manifest_path = env.options.path.join("test_manifest");
 	let manifest =
 		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
-	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create strategy with default priority (ByCompensatedSize)
@@ -3019,4 +3019,108 @@ fn test_clean_cut_integration_no_expansion() {
 		"Only one file should be selected when there are no shared boundaries"
 	);
 	assert!(selected.contains(&1), "File 1 should be the only selected file");
+}
+
+/// FK3: a fork published while a compaction was merging can pin history that
+/// compaction already dropped. The floor is sampled before the merge, outside
+/// the manifest lock, so publication re-reads it and refuses to install an
+/// output built against a weaker promise.
+///
+/// The race state is built directly: a job carrying the floor it sampled
+/// earlier, against a catalog that now pins a lower anchor. The control arm —
+/// same job, catalog unchanged — must publish, or this test would pass with the
+/// re-validation deleted.
+#[test(tokio::test)]
+async fn compaction_refuses_to_publish_under_a_lowered_inherited_view_floor() {
+	let build_case =
+		|sampled_floor: u64, child_anchor: Option<u64>| {
+			let env = TestEnv::new_with_levels(2);
+			let mut levels = Levels::new(3, 10);
+			for table_idx in 0..2u64 {
+				let entries: Vec<_> = ((table_idx * 4)..((table_idx + 1) * 4))
+					.map(|i| {
+						(
+							InternalKey::new(
+								format!("key-{i:03}").into_bytes(),
+								200 + i,
+								InternalKeyKind::Set,
+								0,
+							),
+							format!("v{i}").into_bytes(),
+						)
+					})
+					.collect();
+				let table = env.create_test_table(100 + table_idx, entries).unwrap();
+				Arc::make_mut(&mut levels.get_levels_mut()[0]).insert(table);
+			}
+			let manifest_path = env.options.path.join("test_manifest_pin_race");
+			let manifest = Arc::new(RwLock::new(LevelManifest::new_for_test(
+				manifest_path,
+				levels,
+				Arc::new(AtomicU64::new(1000)),
+			)));
+
+			let mut catalog = BranchCatalog::new(BranchId::DEFAULT);
+			if let Some(anchor) = child_anchor {
+				catalog
+					.create_fork(
+						BranchId::from_u128(7),
+						"fork/race",
+						anchor,
+						crate::authority::format::ParentLink {
+							parent: BranchId::DEFAULT,
+							parent_generation: crate::BranchGeneration(0),
+							fork_seq: anchor,
+						},
+					)
+					.unwrap();
+			}
+
+			let mut options =
+				create_compaction_options(Arc::clone(&env.options), Arc::clone(&manifest));
+			options.branch_catalog = Arc::new(RwLock::new(catalog));
+			options.history_pin_floor = sampled_floor;
+			let strategy = Arc::new(Strategy::from_options(
+				create_options_with_compaction_settings(&env.options, 1, 1.0),
+			));
+			(env, manifest, Compactor::new(options, strategy))
+		};
+
+	// Control: the catalog still agrees with what the job sampled.
+	let (_env, manifest, compactor) = build_case(500, Some(500));
+	compactor.compact().unwrap();
+	assert!(
+		!manifest.read().unwrap().default_owner_levels().get_levels()[1].tables.is_empty(),
+		"an unchanged floor must publish normally"
+	);
+
+	// Race: a fork with a lower anchor landed after the sample.
+	let (env, manifest, compactor) = build_case(500, Some(120));
+	let error = compactor.compact().expect_err("a lowered floor must refuse publication");
+	assert!(
+		matches!(
+			error,
+			crate::Error::CompactionPinRaced {
+				sampled_floor: 500,
+				current_floor: 120,
+			}
+		),
+		"expected a typed pin-race error, got {error}"
+	);
+	{
+		let guard = manifest.read().unwrap();
+		let levels = guard.default_owner_levels().get_levels();
+		assert!(levels[1].tables.is_empty(), "nothing may be published on the race path");
+		assert_eq!(levels[0].tables.len(), 2, "the inputs must be restored, not consumed");
+	}
+	// The abandoned output must not be left behind for a later open to reclaim.
+	let orphans: Vec<_> = std::fs::read_dir(env.options.sstable_dir())
+		.unwrap()
+		.filter_map(|entry| entry.ok())
+		.filter(|entry| {
+			let name = entry.file_name().to_string_lossy().to_string();
+			!name.contains("100") && !name.contains("101")
+		})
+		.collect();
+	assert!(orphans.is_empty(), "the unpublished output must be removed: {orphans:?}");
 }

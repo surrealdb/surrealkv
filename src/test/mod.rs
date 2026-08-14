@@ -26,6 +26,8 @@ pub mod compression_tests;
 #[cfg(test)]
 pub mod crash_consistency_tests;
 #[cfg(test)]
+mod fork_view_tests;
+#[cfg(test)]
 pub mod index_block_tests;
 #[cfg(test)]
 pub mod iterator_tests;
@@ -40,19 +42,20 @@ pub mod memtable_tests;
 #[cfg(test)]
 pub mod oracle_tests;
 #[cfg(test)]
+mod public_branch_api_tests;
+#[cfg(test)]
 pub mod recovery_integration_tests;
 #[cfg(test)]
 pub mod recovery_test_helpers;
 #[cfg(test)]
 pub mod recovery_tests;
 #[cfg(test)]
-pub mod rewrite_public_tests;
-#[cfg(test)]
 pub mod snapshot_tests;
 #[cfg(test)]
 pub mod sstable_tests;
 #[cfg(test)]
 pub mod stall_tests;
+mod timeline_tests;
 #[cfg(test)]
 pub mod transaction_tests;
 #[cfg(test)]

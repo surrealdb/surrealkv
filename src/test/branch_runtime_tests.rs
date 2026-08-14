@@ -8,7 +8,7 @@ use test_log::test;
 use crate::batch::BatchOwner;
 use crate::lsm::Tree;
 use crate::transaction::{Transaction, TransactionOptions};
-use crate::{BranchId, CommitVersion, LSMIterator, TreeBuilder};
+use crate::{LSMIterator, TreeBuilder};
 
 fn create_store_with<F>(configure: F) -> (Tree, TempDir)
 where
@@ -20,15 +20,9 @@ where
 	(tree, temp_dir)
 }
 
-/// Registers `branch` in the catalog and returns its physical owner.
-fn register_branch(store: &Tree, id: u128, name: &str) -> BatchOwner {
-	let branch = BranchId::from_u128(id);
-	let record =
-		store.core.branch_catalog.write().unwrap().create(branch, name, CommitVersion(0)).unwrap();
-	BatchOwner {
-		branch,
-		generation: record.generation,
-	}
+/// Durably creates `name` (one catalog version) and returns its owner.
+fn register_branch(store: &Tree, name: &str) -> BatchOwner {
+	store.core.inner.create_branch(name).unwrap()
 }
 
 fn begin_owned(store: &Tree, owner: BatchOwner) -> Transaction {
@@ -45,7 +39,7 @@ async fn idle_branches_allocate_no_runtime_or_arena() {
 
 	let mut owners = Vec::new();
 	for i in 0..1_000u128 {
-		owners.push(register_branch(&store, 1_000 + i, &format!("idle/{i}")));
+		owners.push(register_branch(&store, &format!("idle/{i}")));
 	}
 
 	assert_eq!(
@@ -81,7 +75,7 @@ async fn same_keys_in_two_branches_stay_isolated_through_rotations() {
 	// scheduling the flush task; the default stall threshold (2) would park
 	// round-two commits waiting for a flush this fixture never runs.
 	let (store, _temp_dir) = create_store_with(|b| b.with_memtable_stall_threshold(8));
-	let foreign = register_branch(&store, 42, "agent/sandbox");
+	let foreign = register_branch(&store, "agent/sandbox");
 
 	for round in 0u32..3 {
 		let mut txn = store.begin().unwrap();
@@ -142,7 +136,7 @@ async fn same_keys_in_two_branches_stay_isolated_through_rotations() {
 #[test(tokio::test)]
 async fn oversized_batch_right_sizes_the_branch_arena() {
 	let (store, _temp_dir) = create_store_with(|b| b.with_branch_memtable_size(4 * 1024));
-	let foreign = register_branch(&store, 7, "small/arena");
+	let foreign = register_branch(&store, "small/arena");
 
 	// Fill the small arena first so the oversized batch hits ArenaFull.
 	let mut txn = begin_owned(&store, foreign);
@@ -176,8 +170,8 @@ async fn write_buffer_budget_rotates_largest_victim() {
 	let (store, _temp_dir) = create_store_with(|b| {
 		b.with_branch_memtable_size(8 * 1024).with_write_buffer_budget(Some(16 * 1024))
 	});
-	let first = register_branch(&store, 11, "budget/first");
-	let second = register_branch(&store, 12, "budget/second");
+	let first = register_branch(&store, "budget/first");
+	let second = register_branch(&store, "budget/second");
 
 	// First branch becomes the largest non-empty active memtable.
 	let mut txn = begin_owned(&store, first);
@@ -256,7 +250,7 @@ fn collect_reverse(iter: &mut impl crate::LSMIterator) -> Vec<(Vec<u8>, Vec<u8>)
 #[test(tokio::test)]
 async fn br5_point_reads_and_tombstones_stay_owner_scoped() {
 	let (store, _temp_dir) = create_store_with(|b| b);
-	let foreign = register_branch(&store, 51, "read/point");
+	let foreign = register_branch(&store, "read/point");
 
 	let mut txn = store.begin().unwrap();
 	txn.set(b"shared", b"default-v").unwrap();
@@ -305,7 +299,7 @@ async fn br5_point_reads_and_tombstones_stay_owner_scoped() {
 #[test(tokio::test)]
 async fn br5_range_and_reverse_scans_stay_owner_scoped() {
 	let (store, _temp_dir) = create_store_with(|b| b);
-	let foreign = register_branch(&store, 52, "read/range");
+	let foreign = register_branch(&store, "read/range");
 
 	let mut txn = store.begin().unwrap();
 	txn.set(b"a", b"d-a").unwrap();
@@ -369,7 +363,7 @@ async fn br5_range_and_reverse_scans_stay_owner_scoped() {
 #[test(tokio::test)]
 async fn br5_versioned_reads_stay_owner_scoped() {
 	let (store, _temp_dir) = create_store_with(|b| b.with_versioning(true, 0));
-	let foreign = register_branch(&store, 53, "read/versions");
+	let foreign = register_branch(&store, "read/versions");
 
 	let mut txn = store.begin().unwrap();
 	txn.set_at(b"k", b"d1", 10).unwrap();
@@ -423,7 +417,7 @@ async fn br5_versioned_reads_stay_owner_scoped() {
 #[test(tokio::test)]
 async fn br5_idle_branch_reads_see_empty_and_allocate_nothing() {
 	let (store, _temp_dir) = create_store_with(|b| b);
-	let idle = register_branch(&store, 54, "read/idle");
+	let idle = register_branch(&store, "read/idle");
 
 	let baseline_runtimes = store.core.inner.runtimes.len();
 	let baseline_arenas = store.core.inner.runtimes.total_arena_capacity_bytes();
@@ -465,7 +459,7 @@ async fn br5_idle_branch_reads_see_empty_and_allocate_nothing() {
 #[test(tokio::test)]
 async fn br5_flushed_branch_values_are_read_from_owned_levels() {
 	let (store, _temp_dir) = create_store_with(|b| b);
-	let foreign = register_branch(&store, 55, "read/levels");
+	let foreign = register_branch(&store, "read/levels");
 
 	let mut txn = store.begin().unwrap();
 	txn.set(b"shared", b"default-durable").unwrap();
@@ -522,18 +516,6 @@ fn crash_open(path: std::path::PathBuf) -> Tree {
 	TreeBuilder::new().with_path(path).with_flush_on_close(false).build().unwrap()
 }
 
-fn crash_open_with_catalog(
-	path: std::path::PathBuf,
-	catalog: crate::branch::BranchCatalog,
-) -> Tree {
-	TreeBuilder::new()
-		.with_path(path)
-		.with_flush_on_close(false)
-		.with_initial_branch_catalog(catalog)
-		.build()
-		.unwrap()
-}
-
 /// Two owners interleaved in one WAL segment: reopen rebuilds each owner's
 /// runtime from its own batches, and reads stay isolated across the crash.
 #[test(tokio::test)]
@@ -543,7 +525,7 @@ async fn br6_multi_owner_segment_reopen_restores_both_branches() {
 
 	let foreign = {
 		let store = crash_open(path.clone());
-		let foreign = register_branch(&store, 61, "crash/multi");
+		let foreign = register_branch(&store, "crash/multi");
 		let mut txn = store.begin().unwrap();
 		txn.set(b"shared", b"default-v").unwrap();
 		txn.commit().await.unwrap();
@@ -554,9 +536,7 @@ async fn br6_multi_owner_segment_reopen_restores_both_branches() {
 		foreign
 	};
 
-	let mut catalog = crate::branch::BranchCatalog::new(BranchId::DEFAULT);
-	catalog.create(BranchId::from_u128(61), "crash/multi", CommitVersion(0)).unwrap();
-	let store = crash_open_with_catalog(path, catalog);
+	let store = crash_open(path);
 
 	assert_eq!(
 		store.core.inner.runtimes.len(),
@@ -583,7 +563,7 @@ async fn br6_one_owner_across_segments_flushes_intermediates_at_open() {
 
 	let foreign = {
 		let store = crash_open(path.clone());
-		let foreign = register_branch(&store, 62, "crash/segments");
+		let foreign = register_branch(&store, "crash/segments");
 		let mut txn = begin_owned_rw(&store, foreign);
 		txn.set(b"k1", b"v1").unwrap();
 		txn.commit().await.unwrap();
@@ -595,9 +575,7 @@ async fn br6_one_owner_across_segments_flushes_intermediates_at_open() {
 		foreign
 	};
 
-	let mut catalog = crate::branch::BranchCatalog::new(BranchId::DEFAULT);
-	catalog.create(BranchId::from_u128(62), "crash/segments", CommitVersion(0)).unwrap();
-	let store = crash_open_with_catalog(path, catalog);
+	let store = crash_open(path);
 
 	// The older segment's memtable was flushed into the owner's own L0.
 	let owner_l0_tables = store
@@ -632,16 +610,20 @@ async fn br6_stale_generation_is_fenced_on_replay() {
 
 	let (stale_owner, live_owner) = {
 		let store = crash_open(path.clone());
-		let stale_owner = register_branch(&store, 63, "agent/x");
+		let stale_owner = register_branch(&store, "agent/x");
 		let mut txn = begin_owned_rw(&store, stale_owner);
 		txn.set(b"k", b"stale-gen0").unwrap();
 		txn.commit().await.unwrap();
 
-		// Delete and recreate the same name: the new branch id carries
-		// generation 1; the old owner is fenced from this point on.
-		store.core.branch_catalog.write().unwrap().delete(BranchId::from_u128(63)).unwrap();
-		let live_owner = register_branch(&store, 64, "agent/x");
-		assert_eq!(live_owner.generation.0, 1, "recreated name must advance the generation");
+		// Durably delete and recreate the same name: the old owner is fenced
+		// from the tombstone's catalog version on.
+		store.core.inner.delete_branch(stale_owner.branch).unwrap();
+		let live_owner = register_branch(&store, "agent/x");
+		assert_eq!(
+			live_owner.generation.0, 2,
+			"recreated name must get a globally fresh generation (allocation order: gen 1 then 2)"
+		);
+		assert_ne!(live_owner.generation, stale_owner.generation);
 		let mut txn = begin_owned_rw(&store, live_owner);
 		txn.set(b"k", b"live-gen1").unwrap();
 		txn.commit().await.unwrap();
@@ -649,11 +631,7 @@ async fn br6_stale_generation_is_fenced_on_replay() {
 		(stale_owner, live_owner)
 	};
 
-	let mut catalog = crate::branch::BranchCatalog::new(BranchId::DEFAULT);
-	catalog.create(BranchId::from_u128(63), "agent/x", CommitVersion(0)).unwrap();
-	catalog.delete(BranchId::from_u128(63)).unwrap();
-	catalog.create(BranchId::from_u128(64), "agent/x", CommitVersion(0)).unwrap();
-	let store = crash_open_with_catalog(path, catalog);
+	let store = crash_open(path);
 
 	assert!(
 		store.core.inner.runtimes.get(stale_owner).is_none(),
@@ -671,17 +649,17 @@ async fn br6_stale_generation_is_fenced_on_replay() {
 	store.close().await.unwrap();
 }
 
-/// Reopening with a catalog that does not know the owner (today's production
-/// default until catalogs are durable) succeeds, drops the foreign batches,
-/// and still never rewinds the sequence clock below the fenced batches.
+/// A branch durably deleted before the crash: its WAL batches are fenced by
+/// the tombstone at replay, no runtime is rebuilt for it, and the sequence
+/// clock still never rewinds below the fenced batches.
 #[test(tokio::test)]
-async fn br6_unknown_owner_is_fenced_and_seq_clock_never_rewinds() {
+async fn br6_deleted_branch_batches_are_fenced_and_seq_clock_never_rewinds() {
 	let temp_dir = TempDir::new("test").unwrap();
 	let path = temp_dir.path().to_path_buf();
 
 	let pre_crash_seq = {
 		let store = crash_open(path.clone());
-		let foreign = register_branch(&store, 65, "crash/unknown");
+		let foreign = register_branch(&store, "crash/deleted");
 		let mut txn = store.begin().unwrap();
 		txn.set(b"k", b"default-v").unwrap();
 		txn.commit().await.unwrap();
@@ -691,14 +669,15 @@ async fn br6_unknown_owner_is_fenced_and_seq_clock_never_rewinds() {
 		txn.set(b"k", b"foreign-v").unwrap();
 		txn.commit().await.unwrap();
 		let pre_crash_seq = store.core.seq_num();
+		// Durable tombstone: from here the branch's batches are dead.
+		store.core.inner.delete_branch(foreign.branch).unwrap();
 		store.close().await.unwrap();
 		pre_crash_seq
 	};
 
-	// No injected catalog: the reopen authority knows only the default branch.
 	let store = crash_open(path);
 
-	assert_eq!(store.core.inner.runtimes.len(), 1, "unknown owners must not get runtimes");
+	assert_eq!(store.core.inner.runtimes.len(), 1, "deleted owners must not get runtimes");
 	let txn = store.begin().unwrap();
 	assert_eq!(txn.get(b"k").unwrap(), Some(b"default-v".to_vec()));
 	drop(txn);
@@ -730,7 +709,7 @@ async fn br6_partial_branch_flush_replays_only_the_wal_tail() {
 
 	let foreign = {
 		let store = crash_open(path.clone());
-		let foreign = register_branch(&store, 66, "crash/partial");
+		let foreign = register_branch(&store, "crash/partial");
 		let mut txn = begin_owned_rw(&store, foreign);
 		txn.set(b"k1", b"v1").unwrap();
 		txn.commit().await.unwrap();
@@ -751,9 +730,7 @@ async fn br6_partial_branch_flush_replays_only_the_wal_tail() {
 		foreign
 	};
 
-	let mut catalog = crate::branch::BranchCatalog::new(BranchId::DEFAULT);
-	catalog.create(BranchId::from_u128(66), "crash/partial", CommitVersion(0)).unwrap();
-	let store = crash_open_with_catalog(path, catalog);
+	let store = crash_open(path);
 
 	let txn = begin_owned_rw(&store, foreign);
 	assert_eq!(txn.get(b"k1").unwrap(), Some(b"v1".to_vec()), "flushed row must come from the SST");
@@ -808,7 +785,7 @@ async fn br6_sequence_regression_fails_closed() {
 #[test(tokio::test)]
 async fn br7_foreign_branch_l0_compacts() {
 	let (store, _temp_dir) = create_store_with(|b| b);
-	let foreign = register_branch(&store, 71, "compact/branch");
+	let foreign = register_branch(&store, "compact/branch");
 
 	// Five foreign L0 tables (level0_max_files default is 4, so the leveled
 	// strategy must pick this owner's L0).
@@ -872,7 +849,7 @@ async fn br7_shutdown_flushes_every_dirty_runtime() {
 
 	let foreign = {
 		let store = TreeBuilder::new().with_path(path.clone()).build().unwrap();
-		let foreign = register_branch(&store, 72, "shutdown/dirty");
+		let foreign = register_branch(&store, "shutdown/dirty");
 		let mut txn = store.begin().unwrap();
 		txn.set(b"k", b"default-v").unwrap();
 		txn.commit().await.unwrap();
@@ -883,9 +860,7 @@ async fn br7_shutdown_flushes_every_dirty_runtime() {
 		foreign
 	};
 
-	let mut catalog = crate::branch::BranchCatalog::new(BranchId::DEFAULT);
-	catalog.create(BranchId::from_u128(72), "shutdown/dirty", CommitVersion(0)).unwrap();
-	let store = crash_open_with_catalog(path, catalog);
+	let store = crash_open(path);
 
 	assert_eq!(
 		store.core.inner.runtimes.len(),
@@ -912,16 +887,16 @@ async fn br7_checkpoint_captures_dirty_branch_actives() {
 	let path = temp_dir.path().to_path_buf();
 
 	let store = TreeBuilder::new().with_path(path).build().unwrap();
-	let foreign = register_branch(&store, 73, "checkpoint/dirty");
+	let foreign = register_branch(&store, "checkpoint/dirty");
 	let mut txn = begin_owned_rw(&store, foreign);
 	txn.set(b"k", b"cp-v").unwrap();
 	txn.commit().await.unwrap();
 
 	store.create_checkpoint(checkpoint_dir.path()).unwrap();
 
-	let mut catalog = crate::branch::BranchCatalog::new(BranchId::DEFAULT);
-	catalog.create(BranchId::from_u128(73), "checkpoint/dirty", CommitVersion(0)).unwrap();
-	let restored = crash_open_with_catalog(checkpoint_dir.path().to_path_buf(), catalog);
+	// The checkpoint captured the catalog lineage too: opening the
+	// checkpoint directory needs no seeding of any kind.
+	let restored = crash_open(checkpoint_dir.path().to_path_buf());
 
 	assert_eq!(
 		restored.core.inner.runtimes.len(),
@@ -955,8 +930,8 @@ async fn br7_trickle_rotates_single_oldest_victim() {
 			.with_flush_on_close(false)
 			.build()
 			.unwrap();
-		let first = register_branch(&store, 74, "trickle/oldest");
-		let second = register_branch(&store, 75, "trickle/newer");
+		let first = register_branch(&store, "trickle/oldest");
+		let second = register_branch(&store, "trickle/newer");
 
 		// First pins segment 0, second pins segment 1.
 		let mut txn = begin_owned_rw(&store, first);
@@ -993,10 +968,7 @@ async fn br7_trickle_rotates_single_oldest_victim() {
 	};
 
 	// No acknowledged commit was lost to the reclaim policy.
-	let mut catalog = crate::branch::BranchCatalog::new(BranchId::DEFAULT);
-	catalog.create(BranchId::from_u128(74), "trickle/oldest", CommitVersion(0)).unwrap();
-	catalog.create(BranchId::from_u128(75), "trickle/newer", CommitVersion(0)).unwrap();
-	let store = crash_open_with_catalog(path, catalog);
+	let store = crash_open(path);
 	let txn = begin_owned_rw(&store, first);
 	assert_eq!(txn.get(b"a").unwrap(), Some(b"a-v".to_vec()));
 	drop(txn);
@@ -1013,6 +985,7 @@ async fn br7_trickle_rotates_single_oldest_victim() {
 async fn br7_hundred_cold_branches_bounded_wal_and_no_lost_commit() {
 	let temp_dir = TempDir::new("test").unwrap();
 	let path = temp_dir.path().to_path_buf();
+	let mut owners = Vec::new();
 
 	{
 		let store = TreeBuilder::new()
@@ -1022,7 +995,8 @@ async fn br7_hundred_cold_branches_bounded_wal_and_no_lost_commit() {
 			.build()
 			.unwrap();
 		for i in 0..100u128 {
-			let owner = register_branch(&store, 7_000 + i, &format!("cold/{i}"));
+			let owner = register_branch(&store, &format!("cold/{i}"));
+			owners.push(owner);
 			let mut txn = begin_owned_rw(&store, owner);
 			txn.set(format!("k{i}").into_bytes().as_slice(), format!("v{i}").as_bytes()).unwrap();
 			txn.commit().await.unwrap();
@@ -1049,19 +1023,9 @@ async fn br7_hundred_cold_branches_bounded_wal_and_no_lost_commit() {
 		store.close().await.unwrap();
 	}
 
-	let mut catalog = crate::branch::BranchCatalog::new(BranchId::DEFAULT);
-	for i in 0..100u128 {
-		catalog
-			.create(BranchId::from_u128(7_000 + i), &format!("cold/{i}"), CommitVersion(0))
-			.unwrap();
-	}
-	let store = crash_open_with_catalog(path, catalog);
+	let store = crash_open(path);
 	assert_eq!(store.core.inner.runtimes.len(), 1, "clean shutdown leaves nothing to replay");
-	for i in 0..100u128 {
-		let owner = BatchOwner {
-			branch: BranchId::from_u128(7_000 + i),
-			generation: crate::BranchGeneration(0),
-		};
+	for (i, owner) in owners.into_iter().enumerate() {
 		let txn = begin_owned_rw(&store, owner);
 		assert_eq!(
 			txn.get(format!("k{i}").as_bytes()).unwrap(),
@@ -1072,16 +1036,126 @@ async fn br7_hundred_cold_branches_bounded_wal_and_no_lost_commit() {
 	store.close().await.unwrap();
 }
 
-/// The engine addresses the default branch by the reserved
-/// `BranchId::DEFAULT`; an injected catalog whose default identity differs
-/// would fence every default transaction, so the open refuses it outright.
+/// FK1 fail-closed posture: a corrupt latest catalog version refuses the
+/// open outright — there is no fallback to an older version. The same
+/// fixture opens fine before the corruption (non-vacuity).
 #[test(tokio::test)]
-async fn br6_open_refuses_catalog_with_foreign_default_identity() {
+async fn fk1_corrupt_latest_catalog_refuses_open() {
 	let temp_dir = TempDir::new("test").unwrap();
-	let wrong = crate::branch::BranchCatalog::new(BranchId::from_u128(999));
-	let result = TreeBuilder::new()
-		.with_path(temp_dir.path().to_path_buf())
-		.with_initial_branch_catalog(wrong)
-		.build();
-	assert!(result.is_err(), "a catalog missing the reserved default identity must be refused");
+	let path = temp_dir.path().to_path_buf();
+	{
+		let store = crash_open(path.clone());
+		register_branch(&store, "victim/branch");
+		store.close().await.unwrap();
+	}
+
+	// Flip one byte in the newest catalog version.
+	let catalog_dir = path.join("catalog");
+	let newest = std::fs::read_dir(&catalog_dir)
+		.unwrap()
+		.filter_map(|entry| entry.ok())
+		.filter(|entry| entry.file_name().to_string_lossy().ends_with(".catalog"))
+		.max_by_key(|entry| entry.file_name())
+		.unwrap()
+		.path();
+	let mut bytes = std::fs::read(&newest).unwrap();
+	let middle = bytes.len() / 2;
+	bytes[middle] ^= 0x01;
+	std::fs::write(&newest, &bytes).unwrap();
+
+	let result = TreeBuilder::new().with_path(path).build();
+	let error = result.err().expect("corrupt latest catalog must refuse the open").to_string();
+	assert!(error.contains("checksum mismatch"), "{error}");
+}
+
+/// Crash window between a state publish and its root publish: the root's
+/// hint is stale-low, and open must heal it by probing forward — every row
+/// stays readable and later publishes do not collide.
+#[test(tokio::test)]
+async fn fk1_lost_newest_root_is_healed_by_forward_probe() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let path = temp_dir.path().to_path_buf();
+
+	{
+		let store = crash_open(path.clone());
+		let mut txn = store.begin().unwrap();
+		txn.set(b"k1", b"v1").unwrap();
+		txn.commit().await.unwrap();
+		store.core.inner.rotate_memtable().unwrap();
+		while store.core.inner.flush_oldest_immutable_for_test().unwrap().is_some() {}
+		let mut txn = store.begin().unwrap();
+		txn.set(b"k2", b"v2").unwrap();
+		txn.commit().await.unwrap();
+		store.core.inner.rotate_memtable().unwrap();
+		while store.core.inner.flush_oldest_immutable_for_test().unwrap().is_some() {}
+		store.close().await.unwrap();
+	}
+
+	// Simulate the crash window: the newest root version vanishes, so its
+	// state hints lag the published states.
+	let root_dir = path.join("root");
+	let newest = std::fs::read_dir(&root_dir)
+		.unwrap()
+		.filter_map(|entry| entry.ok())
+		.filter(|entry| entry.file_name().to_string_lossy().ends_with(".root"))
+		.max_by_key(|entry| entry.file_name())
+		.unwrap()
+		.path();
+	std::fs::remove_file(&newest).unwrap();
+
+	let store = crash_open(path);
+	let txn = store.begin().unwrap();
+	assert_eq!(txn.get(b"k1").unwrap(), Some(b"v1".to_vec()));
+	assert_eq!(txn.get(b"k2").unwrap(), Some(b"v2".to_vec()));
+	drop(txn);
+	// Later publishes must not collide with the states the lost root never
+	// recorded (version counters resumed correctly).
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k3", b"v3").unwrap();
+	txn.commit().await.unwrap();
+	store.core.inner.rotate_memtable().unwrap();
+	while store.core.inner.flush_oldest_immutable_for_test().unwrap().is_some() {}
+	store.close().await.unwrap();
+}
+
+/// The writer epoch bumps lazily: once per session that actually writes the
+/// catalog, monotone across such sessions, and not at all for sessions that
+/// never write it.
+#[test(tokio::test)]
+async fn fk1_writer_epoch_bumps_lazily_and_monotonically() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let path = temp_dir.path().to_path_buf();
+
+	let read_epoch = |path: &std::path::Path| {
+		crate::authority::store::AuthorityStore::load_latest_catalog(path)
+			.unwrap()
+			.expect("catalog must exist")
+			.writer_epoch
+	};
+
+	{
+		let store = crash_open(path.clone());
+		register_branch(&store, "epoch/one");
+		register_branch(&store, "epoch/two");
+		store.close().await.unwrap();
+	}
+	// One writing session, two catalog writes, ONE bump.
+	assert_eq!(read_epoch(&path), 1);
+
+	{
+		let store = crash_open(path.clone());
+		let txn = store.begin().unwrap();
+		assert_eq!(txn.get(b"nope").unwrap(), None);
+		drop(txn);
+		store.close().await.unwrap();
+	}
+	// A session that never writes the catalog bumps nothing.
+	assert_eq!(read_epoch(&path), 1);
+
+	{
+		let store = crash_open(path.clone());
+		register_branch(&store, "epoch/three");
+		store.close().await.unwrap();
+	}
+	assert_eq!(read_epoch(&path), 2, "the next writing session bumps monotonically");
 }
