@@ -259,17 +259,19 @@ impl DatabaseCheckpoint {
 
 	/// Flushes all memtables to ensure checkpoint consistency
 	fn flush_all_memtables(&self) -> Result<()> {
-		// Step 1: Rotate active memtable if it has data
-		{
-			let active = self.core.active_memtable.read()?;
-			if !active.is_empty() {
-				drop(active); // Release read lock before acquiring write lock
-				self.core.rotate_memtable()?;
+		// Step 1: Rotate every runtime's non-empty active memtable — a dirty
+		// branch's rows must reach SSTs or the checkpoint silently misses
+		// them (the SST copy is the only capture; memtables are not copied).
+		for runtime in self.core.runtimes.all() {
+			let non_empty = !runtime.active_memtable.read()?.is_empty();
+			if non_empty {
+				self.core.rotate_runtime_memtable(&runtime, 0)?;
 			}
 		}
 
 		// Step 2: Flush all immutable memtables synchronously
-		self.core.flush_all_immutables_sync()
+		self.core.flush_all_immutables_sync()?;
+		Ok(())
 	}
 
 	/// Copies all SSTables to the checkpoint directory

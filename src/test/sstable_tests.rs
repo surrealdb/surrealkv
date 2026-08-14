@@ -12,8 +12,15 @@ use crate::sstable::table::{ChecksumType, Footer, IndexType, Table, TableFormat,
 use crate::test::{collect_all, collect_iter, count_iter};
 use crate::vfs::File;
 use crate::{
-	user_range_to_internal_range, BranchGeneration, BranchId, InternalKey, InternalKeyKind,
-	LSMIterator, Options, Result, INTERNAL_KEY_SEQ_NUM_MAX,
+	user_range_to_internal_range,
+	BranchGeneration,
+	BranchId,
+	InternalKey,
+	InternalKeyKind,
+	LSMIterator,
+	Options,
+	Result,
+	INTERNAL_KEY_SEQ_NUM_MAX,
 };
 
 fn default_opts() -> Arc<Options> {

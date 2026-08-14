@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::batch::BatchOwner;
+use crate::error::{Error, Result};
 use crate::levels::LevelManifest;
 use crate::memtable::{ImmutableMemtables, MemTable};
 
@@ -36,16 +38,48 @@ impl BranchRuntime {
 		}
 	}
 
+	/// Lazily created runtime for a non-default owner: a fresh memtable at
+	/// the (small) branch arena size, an empty immutable queue, and the
+	/// shared level manifest selected by owner at access time.
+	pub(crate) fn new_for_owner(
+		owner: BatchOwner,
+		arena_capacity: usize,
+		level_manifest: Arc<RwLock<LevelManifest>>,
+	) -> Self {
+		Self {
+			owner,
+			active_memtable: Arc::new(RwLock::new(Arc::new(MemTable::new_owned(
+				arena_capacity,
+				owner,
+			)))),
+			immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
+			level_manifest,
+		}
+	}
+
 	pub(crate) fn owner(&self) -> BatchOwner {
 		self.owner
 	}
 
-	pub(crate) fn validate_component_owners(&self) -> bool {
-		let active_matches = self
+	/// Sum of arena capacities held by this runtime (active + immutable),
+	/// used by the database-wide write-buffer budget.
+	pub(crate) fn arena_capacity_bytes(&self) -> u64 {
+		let active = self
 			.active_memtable
 			.read()
-			.map(|active| active.owner() == self.owner)
-			.unwrap_or(false);
+			.map(|memtable| memtable.arena_capacity() as u64)
+			.unwrap_or(0);
+		let immutable = self
+			.immutable_memtables
+			.read()
+			.map(|imms| imms.iter().map(|e| e.memtable.arena_capacity() as u64).sum())
+			.unwrap_or(0);
+		active + immutable
+	}
+
+	pub(crate) fn validate_component_owners(&self) -> bool {
+		let active_matches =
+			self.active_memtable.read().map(|active| active.owner() == self.owner).unwrap_or(false);
 		let immutables_match = self
 			.immutable_memtables
 			.read()
@@ -54,17 +88,84 @@ impl BranchRuntime {
 		let levels_match = self
 			.level_manifest
 			.read()
-			.map(|manifest| {
-				manifest.levels_for(self.owner).is_some_and(|levels| {
-					levels
-						.get_levels()
-						.iter()
-						.flat_map(|level| level.tables.iter())
-						.all(|table| table.meta.owner == self.owner)
-				})
+			.map(|manifest| match manifest.levels_for(self.owner) {
+				// No durable level set yet (this owner never flushed an
+				// SST): vacuously owner-pure.
+				None => true,
+				Some(levels) => levels
+					.get_levels()
+					.iter()
+					.flat_map(|level| level.tables.iter())
+					.all(|table| table.meta.owner == self.owner),
 			})
 			.unwrap_or(false);
 		active_matches && immutables_match && levels_match
+	}
+}
+
+/// Owner-indexed runtimes. A registry lookup never allocates; a runtime (and
+/// with it the first arena) is created only on the owner's first routed write
+/// — an idle branch is a catalog record plus one map entry at most.
+///
+/// Reads are a read-lock + hash on a commit path that already takes several
+/// locks; a lock-free structure is a recorded optimization, not a v1 need.
+pub(crate) struct BranchRuntimeRegistry {
+	runtimes: RwLock<HashMap<BatchOwner, Arc<BranchRuntime>>>,
+}
+
+impl BranchRuntimeRegistry {
+	pub(crate) fn new(default_runtime: Arc<BranchRuntime>) -> Self {
+		let mut runtimes = HashMap::new();
+		runtimes.insert(default_runtime.owner(), default_runtime);
+		Self {
+			runtimes: RwLock::new(runtimes),
+		}
+	}
+
+	pub(crate) fn get(&self, owner: BatchOwner) -> Option<Arc<BranchRuntime>> {
+		self.runtimes.read().ok()?.get(&owner).cloned()
+	}
+
+	/// Resolve or lazily create the runtime for an already-validated owner.
+	pub(crate) fn get_or_create(
+		&self,
+		owner: BatchOwner,
+		arena_capacity: usize,
+		level_manifest: &Arc<RwLock<LevelManifest>>,
+	) -> Result<Arc<BranchRuntime>> {
+		if let Some(runtime) = self.get(owner) {
+			return Ok(runtime);
+		}
+		let mut runtimes = self
+			.runtimes
+			.write()
+			.map_err(|_| Error::Other("branch runtime registry lock poisoned".to_string()))?;
+		// Double-checked: another writer may have created it.
+		if let Some(runtime) = runtimes.get(&owner) {
+			return Ok(Arc::clone(runtime));
+		}
+		let runtime = Arc::new(BranchRuntime::new_for_owner(
+			owner,
+			arena_capacity,
+			Arc::clone(level_manifest),
+		));
+		runtimes.insert(owner, Arc::clone(&runtime));
+		Ok(runtime)
+	}
+
+	/// All live runtimes (flush selection, budget accounting, shutdown).
+	pub(crate) fn all(&self) -> Vec<Arc<BranchRuntime>> {
+		self.runtimes.read().map(|map| map.values().cloned().collect()).unwrap_or_default()
+	}
+
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn len(&self) -> usize {
+		self.runtimes.read().map(|map| map.len()).unwrap_or(0)
+	}
+
+	/// Total arena bytes across all runtimes, for the write-buffer budget.
+	pub(crate) fn total_arena_capacity_bytes(&self) -> u64 {
+		self.all().iter().map(|runtime| runtime.arena_capacity_bytes()).sum()
 	}
 }
 
@@ -90,10 +191,7 @@ mod tests {
 		std::fs::create_dir_all(options.manifest_dir()).unwrap();
 		BranchRuntime::new(
 			BatchOwner::DEFAULT,
-			Arc::new(RwLock::new(Arc::new(MemTable::new_owned(
-				64 * 1024,
-				BatchOwner::DEFAULT,
-			)))),
+			Arc::new(RwLock::new(Arc::new(MemTable::new_owned(64 * 1024, BatchOwner::DEFAULT)))),
 			Arc::new(RwLock::new(ImmutableMemtables::default())),
 			Arc::new(RwLock::new(LevelManifest::new(options).unwrap())),
 		)

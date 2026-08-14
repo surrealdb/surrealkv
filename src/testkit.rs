@@ -7,17 +7,42 @@ use bytes::Bytes;
 use test_log::test;
 
 use super::api::{
-	AuthorityFence, BranchGeneration, BranchId, CommitTimestamp, CommitVersion, DurabilityClass,
-	ErrorCode, OperationId, TableId,
+	AuthorityFence,
+	BranchGeneration,
+	BranchId,
+	CommitTimestamp,
+	CommitVersion,
+	DurabilityClass,
+	ErrorCode,
+	OperationId,
+	TableId,
 };
 use super::branch::{BranchModel, ReadSelector, WriteOperation};
 use super::database::KernelDatabase;
 use super::format::{InternalKey, RowKind, StorageRow};
 use super::storage::{
-	BindingRequirements, Bindings, ByteRange, CommitOutcome, CommitProposal, CommitStore,
-	DeleteOutcome, FaultPoint, MaintenanceHint, MemoryCommitStore, MemoryObjectStore,
-	MemoryPlatform, ObjectBody, ObjectId, ObjectPrefix, ObjectStore, OpenMode, Platform,
-	PutOutcome, PutRequest, ReconcileOutcome, SimHarness,
+	BindingRequirements,
+	Bindings,
+	ByteRange,
+	CommitOutcome,
+	CommitProposal,
+	CommitStore,
+	DeleteOutcome,
+	FaultPoint,
+	MaintenanceHint,
+	MemoryCommitStore,
+	MemoryObjectStore,
+	MemoryPlatform,
+	ObjectBody,
+	ObjectId,
+	ObjectPrefix,
+	ObjectStore,
+	OpenMode,
+	Platform,
+	PutOutcome,
+	PutRequest,
+	ReconcileOutcome,
+	SimHarness,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use super::storage::{LocalCommitStore, LocalObjectStore};

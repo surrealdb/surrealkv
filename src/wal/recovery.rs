@@ -2,7 +2,7 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::batch::Batch;
+use crate::batch::{Batch, BatchOwner};
 use crate::error::{Error, Result};
 use crate::lsm::fsync_directory;
 use crate::memtable::MemTable;
@@ -49,13 +49,23 @@ impl Reporter for DefaultReporter {
 
 /// Replays the Write-Ahead Log (WAL) to recover recent writes.
 ///
-/// Creates one memtable per WAL segment, matching the original design where
-/// each WAL segment corresponds to one memtable.
+/// Creates one branch-pure memtable per (WAL segment, live batch owner):
+/// batches are demultiplexed by their physical owner, fenced against
+/// `is_live_owner` (the catalog-at-open authority — deleted, stale-generation,
+/// or unknown owners are dropped and never installed), and validated for
+/// strictly increasing sequences (append order equals sequence order because
+/// both happen under the commit write mutex, so a regression is corruption).
+///
+/// Fenced batches still advance the returned `max_seq_num`: their sequences
+/// were allocated (and possibly acknowledged) before the crash, so the clock
+/// must never be reseeded below them.
 ///
 /// # Arguments
 /// * `wal_dir` - Path to the WAL directory
 /// * `min_wal_number` - Minimum WAL number to replay (older segments are skipped)
-/// * `arena_size` - Size for each memtable arena
+/// * `default_arena_size` - Arena size for default-owner memtables
+/// * `branch_arena_size` - Arena size for non-default-owner memtables
+/// * `is_live_owner` - Catalog fence: `false` drops the batch as fenced
 ///
 /// # Returns
 /// * `Ok((Some(max_seq_num), memtables))` - Memtables with their WAL numbers
@@ -66,13 +76,16 @@ type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, u64)>);
 pub(crate) fn replay_wal(
 	wal_dir: &Path,
 	min_wal_number: u64,
-	arena_size: usize,
+	default_arena_size: usize,
+	branch_arena_size: usize,
+	is_live_owner: &dyn Fn(BatchOwner) -> bool,
 ) -> Result<ReplayResult> {
 	log::info!("Starting WAL recovery from directory: {:?}", wal_dir);
 	log::debug!(
-		"WAL recovery parameters: min_wal_number={}, arena_size={}",
+		"WAL recovery parameters: min_wal_number={}, default_arena_size={}, branch_arena_size={}",
 		min_wal_number,
-		arena_size
+		default_arena_size,
+		branch_arena_size
 	);
 
 	// Check if WAL directory exists
@@ -119,9 +132,13 @@ pub(crate) fn replay_wal(
 	// Track statistics
 	let mut max_seq_num: u64 = 0;
 	let mut total_batches_replayed = 0;
+	let mut fenced_batches: u64 = 0;
 	let mut segments_processed = 0;
 
-	// Collect memtables - one per WAL segment
+	// Sequence-order enforcement across the whole replayed range.
+	let mut last_replayed_seq: Option<u64> = None;
+
+	// Collect memtables - one per (WAL segment, live owner)
 	let mut memtables: Vec<(Arc<MemTable>, u64)> = Vec::new();
 
 	// Get all segments in the directory
@@ -145,8 +162,8 @@ pub(crate) fn replay_wal(
 
 		log::debug!("Processing WAL segment #{:020}", segment_id);
 
-		// Create a new memtable for this segment
-		let mut current_memtable = Arc::new(MemTable::new(arena_size));
+		// One branch-pure memtable per live owner seen in this segment.
+		let mut segment_memtables: Vec<(BatchOwner, Arc<MemTable>)> = Vec::new();
 
 		// Open the segment file
 		let file = File::open(&segment.file_path)?;
@@ -162,17 +179,45 @@ pub(crate) fn replay_wal(
 				Ok((record_data, offset)) => {
 					last_valid_offset = offset as usize;
 					let batch = Batch::decode(record_data)?;
-					if batch.owner != current_memtable.owner() {
-						if !current_memtable.is_empty() {
-							current_memtable.set_wal_number(segment_id);
-							memtables.push((Arc::clone(&current_memtable), segment_id));
-						}
-						current_memtable = Arc::new(MemTable::new_owned(arena_size, batch.owner));
-					}
 					let batch_highest_seq_num = batch.get_highest_seq_num();
 
+					// Append order equals sequence order (both happen under
+					// the commit write mutex): a regression means the log is
+					// not the history it claims to be — fail closed.
+					if let Some(previous_highest) = last_replayed_seq {
+						if batch.starting_seq_num <= previous_highest {
+							return Err(Error::wal_corruption(
+								segment_id as usize,
+								last_valid_offset,
+								format!(
+									"batch sequence regressed during replay: starting_seq={} after highest_seq={}",
+									batch.starting_seq_num, previous_highest
+								),
+							));
+						}
+					}
+					last_replayed_seq = Some(batch_highest_seq_num);
+
+					// The clock never rewinds below a fenced batch: its
+					// sequences were allocated (and possibly acknowledged)
+					// before the crash, and reseeding below them would let
+					// new commits reuse them.
 					if batch_highest_seq_num > max_seq_num {
 						max_seq_num = batch_highest_seq_num;
+					}
+
+					// Catalog generation fence: a deleted, stale-generation,
+					// or unknown owner's batch is dropped, never installed.
+					if !is_live_owner(batch.owner) {
+						fenced_batches += 1;
+						log::info!(
+							"Fenced WAL batch during replay: owner {:?} is not live (segment #{:020}, seqs {}..={})",
+							batch.owner,
+							segment_id,
+							batch.starting_seq_num,
+							batch_highest_seq_num
+						);
+						continue;
 					}
 
 					batches_in_segment += 1;
@@ -185,32 +230,55 @@ pub(crate) fn replay_wal(
 						offset
 					);
 
-					// Apply batch to current memtable with ArenaFull handling
-					match current_memtable.add(&batch) {
+					// Route to this segment's memtable for the batch owner,
+					// creating it right-sized on first sight.
+					let base_arena = if batch.owner == BatchOwner::DEFAULT {
+						default_arena_size
+					} else {
+						branch_arena_size
+					};
+					let slot =
+						match segment_memtables.iter().position(|(owner, _)| *owner == batch.owner)
+						{
+							Some(index) => index,
+							None => {
+								segment_memtables.push((
+									batch.owner,
+									Arc::new(MemTable::new_owned_admitting(
+										base_arena,
+										batch.memtable_size_estimate(),
+										batch.owner,
+									)),
+								));
+								segment_memtables.len() - 1
+							}
+						};
+
+					// Apply batch with ArenaFull handling. `MemTable::add` is
+					// atomic: it either fully applies or leaves the memtable
+					// unchanged, so retiring and retrying cannot duplicate.
+					match segment_memtables[slot].1.add(&batch) {
 						Ok(()) => {}
 						Err(Error::ArenaFull) => {
-							// `MemTable::add` is atomic: it either fully applies the
-							// batch or returns ArenaFull with the memtable unchanged
-							// (no partial prefix). If the active memtable is empty here,
-							// the batch alone exceeds arena capacity and no rotation
-							// will help — surface as fatal.
-							if current_memtable.is_empty() {
-								return Err(Error::Other(format!(
-									"Batch too large for memtable (batch size exceeds arena_size={})",
-									arena_size
-								)));
-							}
-							// Save current memtable and create new one
 							log::warn!(
-								"WAL segment #{:020} exceeds single memtable capacity, splitting",
-								segment_id
+								"WAL segment #{:020} exceeds single memtable capacity for owner {:?}, splitting",
+								segment_id,
+								batch.owner
 							);
-							current_memtable.set_wal_number(segment_id);
-							memtables.push((Arc::clone(&current_memtable), segment_id));
-							current_memtable =
-								Arc::new(MemTable::new_owned(arena_size, batch.owner));
-							// Retry on fresh memtable
-							current_memtable.add(&batch)?;
+							let replacement = Arc::new(MemTable::new_owned_admitting(
+								base_arena,
+								batch.memtable_size_estimate(),
+								batch.owner,
+							));
+							let full =
+								std::mem::replace(&mut segment_memtables[slot].1, replacement);
+							if !full.is_empty() {
+								full.set_wal_number(segment_id);
+								memtables.push((full, segment_id));
+							}
+							// Retry on the right-sized fresh memtable — a
+							// WAL-durable batch never permanently fails.
+							segment_memtables[slot].1.add(&batch)?;
 						}
 						Err(e) => return Err(e),
 					}
@@ -235,10 +303,12 @@ pub(crate) fn replay_wal(
 			}
 		}
 
-		// Save this segment's memtable if it has data
-		if !current_memtable.is_empty() {
-			current_memtable.set_wal_number(segment_id);
-			memtables.push((current_memtable, segment_id));
+		// Save this segment's non-empty memtables, in first-sight owner order.
+		for (_, memtable) in segment_memtables {
+			if !memtable.is_empty() {
+				memtable.set_wal_number(segment_id);
+				memtables.push((memtable, segment_id));
+			}
 		}
 
 		if batches_in_segment > 0 {
@@ -260,10 +330,11 @@ pub(crate) fn replay_wal(
 	};
 
 	log::info!(
-		"WAL recovery complete: {} batches across {} segments, {} memtables created, max_seq_num={:?}",
+		"WAL recovery complete: {} batches across {} segments, {} memtables created, {} batches fenced, max_seq_num={:?}",
 		total_batches_replayed,
 		segments_processed,
 		memtables.len(),
+		fenced_batches,
 		result
 	);
 
@@ -278,12 +349,13 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 	use crate::wal::Options;
 
 	// Build segment paths
-	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
+	let segment_path = wal_dir.join(crate::wal::segment_name(segment_id as u64, "wal"));
 
 	// Verify the corrupted segment exists
 	if !segment_path.exists() {
 		return Err(crate::error::Error::Other(format!(
-			"WAL segment {segment_id:020}.wal does not exist"
+			"WAL segment {} does not exist",
+			segment_path.display()
 		)));
 	}
 
@@ -355,7 +427,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 		// No valid data
 		fs::remove_file(&segment_path)?;
 		fs::remove_dir_all(&repair_dir).ok();
-		log::info!("Deleted corrupted WAL segment {segment_id:020}.wal (no valid data)");
+		log::info!("Deleted corrupted WAL segment {} (no valid data)", segment_path.display());
 		return Ok(());
 	}
 
@@ -425,7 +497,8 @@ mod tests {
 
 		// Replay the WAL - should replay BOTH segments
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (max_seq_num_opt, memtables) = replay_wal(wal_dir, 0, arena_size).unwrap();
+		let (max_seq_num_opt, memtables) =
+			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
 
 		// Verify both segments are replayed: max_seq_num should be 203 (highest from
 		// batch2)
@@ -458,7 +531,8 @@ mod tests {
 		let temp_dir = TempDir::new().unwrap();
 		let wal_dir = temp_dir.path();
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (max_seq_num_opt, memtables) = replay_wal(wal_dir, 0, arena_size).unwrap();
+		let (max_seq_num_opt, memtables) =
+			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
 
 		assert_eq!(max_seq_num_opt, None, "Empty WAL directory should return None");
 		assert_eq!(memtables.len(), 0, "Empty WAL directory should return no memtables");
@@ -495,7 +569,8 @@ mod tests {
 		wal.close().unwrap();
 
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (max_seq_num_opt, memtables) = replay_wal(wal_dir, 0, arena_size).unwrap();
+		let (max_seq_num_opt, memtables) =
+			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
 
 		// All three segments should be replayed, max should be 700
 		assert_eq!(
@@ -552,7 +627,8 @@ mod tests {
 
 		// Replay WAL
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (max_seq_num_opt, memtables) = replay_wal(wal_dir, 0, arena_size).unwrap();
+		let (max_seq_num_opt, memtables) =
+			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
 
 		// Both segments should be replayed, max should be 301
 		assert_eq!(
@@ -627,16 +703,14 @@ mod tests {
 		drop(file);
 
 		// Test using Core::replay_wal_with_repair (the actual production flow)
-		let (max_seq_num, memtable_opt) = crate::lsm::Core::replay_wal_with_repair(
+		let (max_seq_num, memtables) = crate::lsm::Core::replay_wal_with_repair(
 			wal_dir,
 			0,
 			"Test repair",
 			WalRecoveryMode::TolerateCorruptedWithRepair,
 			1024,
-			|_memtable, _wal_number| {
-				// Flush callback - not needed for this test
-				Ok(())
-			},
+			1024,
+			&|_| true,
 		)
 		.unwrap();
 
@@ -645,7 +719,7 @@ mod tests {
 		assert_eq!(max_seq_num, None, "Should have recovered None when first record is corrupted");
 
 		// Verify that no memtable was returned (since first record was corrupted)
-		assert!(memtable_opt.is_none(), "Should have no memtable when first record is corrupted");
+		assert!(memtables.is_empty(), "Should have no memtable when first record is corrupted");
 	}
 
 	#[test]
@@ -708,16 +782,14 @@ mod tests {
 		file.write_all(&data).unwrap(); // Data
 		drop(file);
 
-		let (max_seq_num, memtable_opt) = crate::lsm::Core::replay_wal_with_repair(
+		let (max_seq_num, memtables) = crate::lsm::Core::replay_wal_with_repair(
 			wal_dir,
 			0,
 			"Test repair",
 			WalRecoveryMode::TolerateCorruptedWithRepair,
 			1024,
-			|_memtable, _wal_number| {
-				// Flush callback - not needed for this test
-				Ok(())
-			},
+			1024,
+			&|_| true,
 		)
 		.unwrap();
 
@@ -732,7 +804,7 @@ mod tests {
 		);
 
 		// Verify that we got a memtable with entries from the first two batches
-		if let Some(memtable) = memtable_opt {
+		if let Some((memtable, _)) = memtables.into_iter().last() {
 			let mut entry_count = 0;
 			let mut iter = memtable.iter();
 			while iter.valid() {
@@ -775,7 +847,7 @@ mod tests {
 
 		// Replay with TolerateCorruptedTailRecords (default)
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let result = replay_wal(wal_dir, 0, arena_size);
+		let result = replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true);
 
 		// Should report corruption as an error
 		match result {
@@ -806,7 +878,7 @@ mod tests {
 		wal.close().unwrap();
 
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let result = replay_wal(wal_dir, 0, arena_size);
+		let result = replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true);
 
 		assert!(result.is_ok());
 	}
@@ -830,7 +902,8 @@ mod tests {
 
 		// Replay - DefaultReporter is created internally
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (seq_num_opt, memtables) = replay_wal(wal_dir, 0, arena_size).unwrap();
+		let (seq_num_opt, memtables) =
+			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
 
 		assert_eq!(seq_num_opt, Some(100));
 		assert_eq!(memtables.len(), 1, "Should create one memtable for single segment");
@@ -872,7 +945,8 @@ mod tests {
 
 		// Now attempt recovery - both WAL segments should be replayed
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let (max_seq_num_opt, memtables) = replay_wal(wal_dir, 0, arena_size).unwrap();
+		let (max_seq_num_opt, memtables) =
+			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
 
 		// Verify both segments were replayed
 		assert_eq!(
@@ -951,7 +1025,7 @@ mod tests {
 
 		// Attempt recovery
 		let arena_size = 1024 * 1024; // 1MB for tests
-		let result = replay_wal(wal_dir, 0, arena_size);
+		let result = replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true);
 
 		// Should report corruption in segment 1
 		match result {
@@ -1000,7 +1074,8 @@ mod tests {
 
 		// Replay - should create 3 memtables
 		let arena_size = 1024 * 1024;
-		let (max_seq, memtables) = replay_wal(wal_dir, 0, arena_size).unwrap();
+		let (max_seq, memtables) =
+			replay_wal(wal_dir, 0, arena_size, arena_size, &|_| true).unwrap();
 
 		assert_eq!(max_seq, Some(300), "Max seq should be from last batch");
 		assert_eq!(memtables.len(), 3, "Should create one memtable per WAL segment");

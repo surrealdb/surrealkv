@@ -314,7 +314,7 @@ impl CommitPipeline {
 
 		// Check write stall BEFORE acquiring any locks.
 		// This ensures stalled writers wait here without blocking others.
-		self.write_stall.check().await?;
+		self.write_stall.check(batch.owner).await?;
 
 		// Acquire permit for flow control
 		let _permit = self.commit_sem.acquire().await.map_err(|_| Error::PipelineStall)?;
@@ -560,7 +560,7 @@ mod tests {
 	struct MockStallProvider;
 
 	impl crate::stall::WriteStallCountProvider for MockStallProvider {
-		fn get_stall_counts(&self) -> crate::stall::StallCounts {
+		fn get_stall_counts(&self, _owner: crate::batch::BatchOwner) -> crate::stall::StallCounts {
 			crate::stall::StallCounts {
 				immutable_memtables: 0,
 				l0_files: 0,

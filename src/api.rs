@@ -26,6 +26,16 @@ macro_rules! id32 {
 
 id16!(DatabaseId);
 id16!(BranchId);
+
+impl BranchId {
+	/// Reserved identity of the always-existing default branch ("main").
+	/// The default branch must be addressable before any durable catalog
+	/// exists (fresh stores, recovery, replay fencing), so its id is a
+	/// well-known constant rather than a minted identifier.
+	/// `BatchOwner::DEFAULT` and the open-time catalog check both derive
+	/// from this single definition; user branches never receive it.
+	pub(crate) const DEFAULT: Self = Self([0; 16]);
+}
 id16!(OperationId);
 id16!(SessionId);
 id32!(TableId);

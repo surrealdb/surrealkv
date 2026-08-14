@@ -10,8 +10,16 @@ use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
 use crate::wal::{
-	cleanup_old_segments, get_segment_range, list_segment_ids, parse_segment_name, segment_name,
-	should_include_file, CompressionType, Options, RecordType, SegmentRef,
+	cleanup_old_segments,
+	get_segment_range,
+	list_segment_ids,
+	parse_segment_name,
+	segment_name,
+	should_include_file,
+	CompressionType,
+	Options,
+	RecordType,
+	SegmentRef,
 };
 use crate::{BranchGeneration, BranchId, LSMIterator};
 
@@ -138,7 +146,8 @@ fn test_wal_replay_all_segments() {
 
 	// Replay WAL - should replay all segments
 	let arena_size = 1024 * 1024; // 1MB for tests
-	let (sequence_number_opt, memtables) = replay_wal(temp_dir.path(), 0, arena_size).unwrap();
+	let (sequence_number_opt, memtables) =
+		replay_wal(temp_dir.path(), 0, arena_size, arena_size, &|_| true).unwrap();
 
 	let sequence_number = sequence_number_opt.unwrap_or(0);
 
@@ -179,7 +188,8 @@ fn wal_recovery_keeps_branch_owners_in_separate_memtables() {
 	wal.append(&second.encode().unwrap()).unwrap();
 	drop(wal);
 
-	let (max_sequence, memtables) = replay_wal(temp_dir.path(), 0, 1024 * 1024).unwrap();
+	let (max_sequence, memtables) =
+		replay_wal(temp_dir.path(), 0, 1024 * 1024, 1024 * 1024, &|_| true).unwrap();
 
 	assert_eq!(max_sequence, Some(2));
 	assert_eq!(memtables.len(), 2, "owner change must split physical components");
@@ -518,4 +528,42 @@ fn test_cleanup_respects_min_wal_number() {
 	assert_eq!(remaining_segment_ids.len(), 2, "Should have 2 segments remaining");
 	assert_eq!(remaining_segment_ids[0], 3, "Segment 3 should remain");
 	assert_eq!(remaining_segment_ids[1], 4, "Segment 4 should remain");
+}
+
+/// BR4 size-driven WAL rotation: the predicate is the WAL's only rotation
+/// policy now that branch memtable rotations never touch the shared log.
+/// Covers the full lifecycle: false on a fresh segment (non-vacuity), true
+/// once appended bytes reach the cap, false again after rotation, and the
+/// counter genuinely restarts (a small post-rotation append stays false).
+#[test]
+fn test_should_rotate_for_size_trips_on_cap_and_resets_on_rotation() {
+	let temp_dir = create_test_wal_dir();
+	let opts = Options::default().with_max_file_size(256);
+	let mut wal = Wal::open(temp_dir.path(), opts).unwrap();
+
+	assert!(!wal.should_rotate_for_size(), "fresh segment must not demand rotation");
+
+	// One encoded record strictly larger than the cap trips the predicate
+	// regardless of record-header overhead.
+	wal.append(&[7u8; 300]).unwrap();
+	assert!(wal.should_rotate_for_size(), "appending past max_file_size must demand rotation");
+
+	let segment_before = wal.get_active_log_number();
+	wal.rotate().unwrap();
+	assert_eq!(
+		wal.get_active_log_number(),
+		segment_before + 1,
+		"rotation must open the next segment"
+	);
+	assert!(!wal.should_rotate_for_size(), "rotation must reset the size counter");
+
+	// The counter restarts from zero: a small append must not inherit the
+	// previous segment's bytes.
+	wal.append(&[7u8; 32]).unwrap();
+	assert!(
+		!wal.should_rotate_for_size(),
+		"post-rotation counter must reflect only the new segment's bytes"
+	);
+
+	wal.close().unwrap();
 }

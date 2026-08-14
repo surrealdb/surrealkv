@@ -13,8 +13,17 @@ use bytes::{BufMut, Bytes, BytesMut};
 use crc32fast::hash as crc32;
 
 use super::{
-	ByteRange, DeleteOutcome, ListCursor, ObjectCapabilities, ObjectId, ObjectMetadata, ObjectPage,
-	ObjectPrefix, ObjectStore, PutOutcome, PutRequest,
+	ByteRange,
+	DeleteOutcome,
+	ListCursor,
+	ObjectCapabilities,
+	ObjectId,
+	ObjectMetadata,
+	ObjectPage,
+	ObjectPrefix,
+	ObjectStore,
+	PutOutcome,
+	PutRequest,
 };
 use crate::api::{DurabilityClass, ErrorCode, KernelError, KernelResult};
 

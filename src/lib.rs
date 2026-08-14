@@ -47,6 +47,18 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub use api::{
+	AuthorityFence,
+	BranchGeneration,
+	BranchId,
+	CommitTimestamp,
+	CommitVersion,
+	DatabaseId,
+	ErrorCode,
+	KernelError,
+	KernelResult,
+};
+pub use branch::{ReadSelector, WriteOperation};
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 use sstable::bloom::LevelDBBloomFilter;
 
@@ -54,13 +66,13 @@ use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
 pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::transaction::{
-	Durability, HistoryOptions, Mode, ReadOptions, Transaction, WriteOptions,
+	Durability,
+	HistoryOptions,
+	Mode,
+	ReadOptions,
+	Transaction,
+	WriteOptions,
 };
-pub use api::{
-	AuthorityFence, BranchGeneration, BranchId, CommitTimestamp, CommitVersion, DatabaseId,
-	ErrorCode, KernelError, KernelResult,
-};
-pub use branch::{ReadSelector, WriteOperation};
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {
@@ -173,6 +185,22 @@ pub struct Options {
 	pub path: PathBuf,
 	pub level_count: u8,
 	pub max_memtable_size: usize,
+	/// Initial arena capacity for a non-default branch's lazily created
+	/// memtable. Kept deliberately small: many ephemeral branches must not
+	/// multiply `max_memtable_size`. A rotation forced by an oversized batch
+	/// right-sizes the replacement arena, so this is a floor, not a cap.
+	pub branch_memtable_size: usize,
+	/// Database-wide budget for the sum of all branch memtable arena
+	/// capacities (active + immutable). `None` preserves the single-branch
+	/// behavior (no budget). When the budget would be exceeded, the largest
+	/// active memtable is rotated and scheduled for flush before new
+	/// allocation proceeds.
+	pub write_buffer_budget: Option<u64>,
+	/// A non-empty branch active memtable pinning a WAL segment at least this
+	/// many segments behind the active one is rotated toward flush — one
+	/// victim at a time (a trickle, never a mass flush) — so cold dirty
+	/// branches cannot retain the log unboundedly.
+	pub wal_pinned_segment_limit: usize,
 	pub index_partition_size: usize,
 
 	// Versioned query configuration
@@ -239,8 +267,11 @@ impl Default for Options {
 			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)), // 1MB cache
 			path: PathBuf::from(""),
 			level_count: 6,
-			max_memtable_size: 100 * 1024 * 1024, // 100 MB
-			index_partition_size: 16384,          // 16KB
+			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
+			branch_memtable_size: 2 * 1024 * 1024, // 2 MB
+			write_buffer_budget: None,
+			wal_pinned_segment_limit: 8,
+			index_partition_size: 16384, // 16KB
 			enable_versioning: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
@@ -343,6 +374,23 @@ impl Options {
 
 	pub const fn with_level_count(mut self, value: u8) -> Self {
 		self.level_count = value;
+		self
+	}
+
+	/// Initial arena capacity for non-default branch memtables.
+	pub const fn with_branch_memtable_size(mut self, value: usize) -> Self {
+		self.branch_memtable_size = value;
+		self
+	}
+
+	/// Database-wide budget over all branch memtable arenas.
+	pub const fn with_write_buffer_budget(mut self, value: Option<u64>) -> Self {
+		self.write_buffer_budget = value;
+		self
+	}
+
+	pub const fn with_wal_pinned_segment_limit(mut self, value: usize) -> Self {
+		self.wal_pinned_segment_limit = value;
 		self
 	}
 
@@ -455,6 +503,11 @@ impl Options {
 		}
 
 		// Validate write stall configuration
+		if self.wal_pinned_segment_limit == 0 {
+			return Err(Error::InvalidArgument(
+				"wal_pinned_segment_limit must be >= 1".to_string(),
+			));
+		}
 		if self.memtable_stall_threshold < 2 {
 			return Err(Error::InvalidArgument(
 				"memtable_stall_threshold must be >= 2".to_string(),
@@ -561,6 +614,10 @@ pub(crate) fn user_range_to_internal_range(
 // gives a binary number with 56 ones, which is the maximum value for 56 bits.
 pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
 pub(crate) const INTERNAL_KEY_TIMESTAMP_MAX: u64 = u64::MAX;
+/// Maximum encodable trailer — `(INTERNAL_KEY_SEQ_NUM_MAX << 8) | 0xFF`,
+/// which is `u64::MAX`. Used by seek keys that must sort at the boundary of
+/// a user key's version chain.
+pub(crate) const INTERNAL_KEY_TRAILER_MAX: u64 = u64::MAX;
 
 // Helper function for reading u64 from byte slices without unwrap()
 // Safe to use when bounds have already been checked
@@ -591,8 +648,17 @@ fn trailer_to_kind(trailer: u64) -> InternalKeyKind {
 /// Extracts sequence number from trailer
 /// This centralizes the seq_num extraction logic to avoid duplication
 #[inline(always)]
-fn trailer_to_seq_num(trailer: u64) -> u64 {
+pub(crate) fn trailer_to_seq_num(trailer: u64) -> u64 {
 	trailer >> 8
+}
+
+/// Packs `(seq_num, kind)` into a trailer — the inverse of
+/// `trailer_to_seq_num`. Every trailer in the system is built here (or via
+/// `InternalKey::new`, which delegates); the 56-bit-seq/8-bit-kind split is
+/// defined nowhere else.
+#[inline(always)]
+pub(crate) fn make_trailer(seq_num: u64, kind: InternalKeyKind) -> u64 {
+	(seq_num << 8) | kind as u64
 }
 
 /// Checks if a key kind represents a tombstone (delete operation)
@@ -656,7 +722,7 @@ impl InternalKey {
 		Self {
 			user_key,
 			timestamp,
-			trailer: (seq_num << 8) | kind as u64,
+			trailer: make_trailer(seq_num, kind),
 		}
 	}
 

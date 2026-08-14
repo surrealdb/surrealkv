@@ -30,8 +30,10 @@ pub struct StallThresholds {
 /// Implementors provide live resource counts that the controller
 /// checks against its configured thresholds.
 pub trait WriteStallCountProvider: Send + Sync + 'static {
-	/// Get current immutable memtable count and L0 file count.
-	fn get_stall_counts(&self) -> StallCounts;
+	/// Get current immutable memtable count and L0 file count for one
+	/// physical owner. Stall accounting is branch-scoped: one branch's flush
+	/// backlog must not stall every other branch's writes.
+	fn get_stall_counts(&self, owner: crate::batch::BatchOwner) -> StallCounts;
 }
 
 /// Information about a write stall event.
@@ -94,7 +96,7 @@ impl WriteStallController {
 	/// `notify_waiters()` calls that happen after we register but before we
 	/// check. Per tokio docs: "The Notified future is guaranteed to receive
 	/// wakeups from notify_waiters() as soon as it has been created."
-	pub async fn check(&self) -> Result<Option<WriteStallInfo>> {
+	pub async fn check(&self, owner: crate::batch::BatchOwner) -> Result<Option<WriteStallInfo>> {
 		let mut stall_start: Option<Instant> = None;
 		let mut stall_reason: Option<WriteStallReason> = None;
 		let mut stall_value: usize = 0;
@@ -114,7 +116,7 @@ impl WriteStallController {
 			}
 
 			// Re-read counts (now any notify_waiters() after notified creation will wake us)
-			let counts = self.provider.get_stall_counts();
+			let counts = self.provider.get_stall_counts(owner);
 
 			// Check if NOT stalled - return without awaiting
 			if counts.immutable_memtables < self.thresholds.memtable_limit
@@ -164,16 +166,16 @@ impl WriteStallController {
 
 	/// Non-blocking check of whether stall conditions are currently met.
 	#[allow(dead_code)]
-	pub fn should_stall(&self) -> bool {
-		let counts = self.provider.get_stall_counts();
+	pub fn should_stall(&self, owner: crate::batch::BatchOwner) -> bool {
+		let counts = self.provider.get_stall_counts(owner);
 		counts.immutable_memtables >= self.thresholds.memtable_limit
 			|| counts.l0_files >= self.thresholds.l0_file_limit
 	}
 
 	/// Get current counts from the provider (for determining stall reason).
 	#[allow(dead_code)]
-	pub fn provider_counts(&self) -> StallCounts {
-		self.provider.get_stall_counts()
+	pub fn provider_counts(&self, owner: crate::batch::BatchOwner) -> StallCounts {
+		self.provider.get_stall_counts(owner)
 	}
 
 	/// Get the configured memtable stall limit.

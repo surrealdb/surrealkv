@@ -86,8 +86,17 @@ use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
 use crate::sstable::meta::TableMetadata;
 use crate::vfs::File;
 use crate::{
-	Comparator, CompressionType, FilterPolicy, InternalKey, InternalKeyKind, InternalKeyRange,
-	InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX,
+	Comparator,
+	CompressionType,
+	FilterPolicy,
+	InternalKey,
+	InternalKeyKind,
+	InternalKeyRange,
+	InternalKeyRef,
+	LSMIterator,
+	Options,
+	Value,
+	INTERNAL_KEY_SEQ_NUM_MAX,
 	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 

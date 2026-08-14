@@ -37,7 +37,8 @@ fn test_sequential_5_segments_recovery() {
 	assert_eq!(final_seq, 1500, "Final sequence should be 1500 (1000 + 500 entries)");
 
 	// Replay WAL
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Verify all 500 entries recovered
 	assert_eq!(max_seq_opt, Some(1499), "Max sequence should be 1499");
@@ -59,7 +60,8 @@ fn test_empty_segments_between_data() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 100);
 
 	// Replay WAL
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Verify 150 entries recovered (only non-empty segments)
 	assert!(max_seq_opt.is_some(), "Should have recovered data");
@@ -81,7 +83,8 @@ fn test_large_batches_multiple_segments() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 10000);
 
 	// Replay WAL
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Verify all 5000 entries recovered
 	assert_eq!(max_seq_opt, Some(14999), "Max sequence should be 14999");
@@ -100,7 +103,8 @@ fn test_variable_sized_segments() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 5000);
 
 	// Replay WAL
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Verify all entries recovered
 	assert!(max_seq_opt.is_some(), "Should have recovered data");
@@ -132,7 +136,8 @@ fn test_100_segments_recovery() {
 
 	// Replay WAL
 	let start = std::time::Instant::now();
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 	let replay_duration = start.elapsed();
 
 	// Verify all entries recovered
@@ -163,7 +168,8 @@ fn test_single_large_vs_multiple_small_segments() {
 	let single_create = start.elapsed();
 
 	let start = std::time::Instant::now();
-	let (max_seq1, memtables1) = replay_wal(temp_dir1.path(), 0, ARENA_SIZE).unwrap();
+	let (max_seq1, memtables1) =
+		replay_wal(temp_dir1.path(), 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 	let single_replay = start.elapsed();
 
 	// Scenario B: 10 segments with 1000 entries each
@@ -173,7 +179,8 @@ fn test_single_large_vs_multiple_small_segments() {
 	let multi_create = start.elapsed();
 
 	let start = std::time::Instant::now();
-	let (max_seq2, memtables2) = replay_wal(temp_dir2.path(), 0, ARENA_SIZE).unwrap();
+	let (max_seq2, memtables2) =
+		replay_wal(temp_dir2.path(), 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 	let multi_replay = start.elapsed();
 
 	// Verify both recovered same data
@@ -218,7 +225,8 @@ fn test_crash_immediately_after_rotation() {
 	wal.close().unwrap();
 
 	// Recovery should replay segment 0 fully, ignore empty segment 1
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert_eq!(max_seq_opt, Some(149), "Should recover all 50 entries from segment 0");
 	WalTestHelper::verify_total_entry_count(&memtables, 50);
@@ -253,7 +261,8 @@ fn test_crash_after_multiple_rapid_rotations() {
 	wal.close().unwrap();
 
 	// Recovery should replay all 5 segments
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 5);
@@ -303,7 +312,7 @@ fn test_crash_during_wal_write_mid_batch() {
 	file.set_len(truncate_point).unwrap();
 
 	// Recovery should get batch1 fully, then detect corruption in batch2
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption or recover with partial data
 	match result {
@@ -342,7 +351,8 @@ fn test_crash_with_unflushed_memtable() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 500);
 
 	// Recovery should get all segments
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 90);
@@ -378,7 +388,7 @@ fn test_partial_batch_at_segment_end() {
 	file.set_len(current_size - 10).unwrap(); // Remove last 10 bytes
 
 	// Recovery may detect corruption or handle EOF
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should either recover data or detect corruption
 	match result {
@@ -404,7 +414,8 @@ fn test_empty_segment_at_end() {
 	let entries_per_segment = vec![50, 50, 0];
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 1000);
 
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 100);
@@ -420,7 +431,8 @@ fn test_all_empty_segments() {
 	let entries_per_segment = vec![0, 0, 0];
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 1000);
 
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Should return None for empty recovery
 	assert_eq!(max_seq_opt, None);
@@ -438,7 +450,8 @@ fn test_rapid_rotation_with_minimal_data() {
 	let entries_per_segment = vec![1; 10];
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 2000);
 
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert_eq!(max_seq_opt, Some(2009));
 	WalTestHelper::verify_total_entry_count(&memtables, 10);
@@ -462,7 +475,7 @@ fn test_corruption_first_record_segment_0() {
 	WalTestHelper::corrupt_segment(wal_dir, 0, 0.0, CorruptionType::HeaderCorruption);
 
 	// Recovery should detect corruption, not process any segments
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption immediately in segment 0
 	match result {
@@ -490,7 +503,7 @@ fn test_corruption_middle_segment_0() {
 	WalTestHelper::corrupt_segment(wal_dir, 0, 0.5, CorruptionType::RandomBytes);
 
 	// Recovery should get partial data from segment 0, stop there
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption in segment 0
 	match result {
@@ -519,7 +532,7 @@ fn test_corruption_end_segment_0() {
 	WalTestHelper::corrupt_segment(wal_dir, 0, 0.9, CorruptionType::RandomBytes);
 
 	// Recovery should get most of segment 0
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption
 	match result {
@@ -551,7 +564,7 @@ fn test_corruption_beginning_middle_segment() {
 	WalTestHelper::corrupt_segment(wal_dir, 2, 0.0, CorruptionType::HeaderCorruption);
 
 	// Recovery should get segments 0-1, stop at segment 2
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption in segment 2
 	match result {
@@ -580,7 +593,7 @@ fn test_corruption_middle_of_middle_segment() {
 	WalTestHelper::corrupt_segment(wal_dir, 2, 0.5, CorruptionType::RandomBytes);
 
 	// Recovery should get 0-1 full, 2 partial
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption in segment 2
 	match result {
@@ -609,7 +622,7 @@ fn test_corruption_last_segment() {
 	WalTestHelper::corrupt_segment(wal_dir, 4, 0.1, CorruptionType::RandomBytes);
 
 	// Recovery should get 0-3 fully, partial 4
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption in segment 4
 	match result {
@@ -638,7 +651,7 @@ fn test_truncated_wal_file() {
 	WalTestHelper::corrupt_segment(wal_dir, 1, 0.6, CorruptionType::Truncate);
 
 	// Recovery may detect truncation as corruption
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should have segment 0 + possibly partial segment 1
 	match result {
@@ -673,7 +686,7 @@ fn test_random_byte_corruption() {
 	WalTestHelper::corrupt_segment(wal_dir, 0, 0.4, CorruptionType::RandomBytes);
 
 	// Should detect corruption via CRC or invalid data
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Corruption should be detected (or partial recovery happened before
 	// corruption)
@@ -706,7 +719,7 @@ fn test_multiple_corruptions_stop_at_first() {
 	WalTestHelper::corrupt_segment(wal_dir, 3, 0.3, CorruptionType::RandomBytes);
 
 	// Should stop at segment 1 corruption
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should stop at segment 1, never reach segment 3
 	match result {
@@ -735,7 +748,7 @@ fn test_crc_mismatch() {
 	WalTestHelper::corrupt_segment(wal_dir, 0, 0.3, CorruptionType::CrcMismatch);
 
 	// Should detect CRC mismatch
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// CRC check should catch corruption
 	match result {
@@ -767,7 +780,7 @@ fn test_corruption_in_wal_header() {
 	WalTestHelper::corrupt_segment(wal_dir, 1, 0.0, CorruptionType::HeaderCorruption);
 
 	// Should detect header corruption immediately in segment 1
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption in segment 1
 	match result {
@@ -796,7 +809,7 @@ fn test_corruption_in_batch_data() {
 	WalTestHelper::corrupt_segment(wal_dir, 0, 0.5, CorruptionType::RandomBytes);
 
 	// Should detect when trying to decode batch
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Either corruption detected or partial recovery
 	// (depends on where exactly corruption hits)
@@ -829,7 +842,7 @@ fn test_completely_corrupted_file() {
 	fs::write(&segment_path, garbage).unwrap();
 
 	// Should get segment 0, fail on segment 1
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption in segment 1
 	match result {
@@ -860,7 +873,7 @@ fn test_tail_corruption_recovery() {
 	file.write_all(b"CORRUPTED_TAIL_DATA_HERE").unwrap();
 
 	// Should detect tail corruption or recover valid data
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should either detect corruption or recover all valid data
 	match result {
@@ -903,7 +916,8 @@ fn test_contiguous_sequence_numbers() {
 	assert_eq!(final_seq, 400, "Final sequence should be 400");
 
 	// Replay and verify
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert_eq!(max_seq_opt, Some(399), "Max sequence should be 399");
 	WalTestHelper::verify_total_entry_count(&memtables, 300);
@@ -922,7 +936,8 @@ fn test_sequence_tracking_10_segments() {
 	assert_eq!(final_seq, 2000, "Final sequence should be 2000");
 
 	// Replay and verify
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert_eq!(max_seq_opt, Some(1999), "Max sequence should be 1999");
 	WalTestHelper::verify_total_entry_count(&memtables, 1000);
@@ -942,7 +957,7 @@ fn test_sequence_after_corruption() {
 	WalTestHelper::corrupt_segment(wal_dir, 1, 0.5, CorruptionType::RandomBytes);
 
 	// Replay
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption in segment 1
 	match result {
@@ -970,7 +985,8 @@ fn test_large_sequence_numbers() {
 	assert_eq!(final_seq, 1_000_150);
 
 	// Replay
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert_eq!(max_seq_opt, Some(1_000_149));
 	WalTestHelper::verify_total_entry_count(&memtables, 150);
@@ -988,7 +1004,8 @@ fn test_sequence_gaps_detection() {
 	let entries_per_segment = vec![30, 0, 30, 0, 30];
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 5000);
 
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 90);
@@ -1009,7 +1026,8 @@ fn test_skip_flushed_segments() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 6000);
 
 	// Replay with min_wal_number=3 (segments 0-2 already flushed)
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 3, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 3, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Should only replay segments 3-4 (40 entries)
 	assert!(max_seq_opt.is_some());
@@ -1027,7 +1045,8 @@ fn test_all_segments_already_flushed() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 7000);
 
 	// Replay with min_wal_number=3 (all segments already flushed)
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 3, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 3, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Should return None (nothing to replay)
 	assert_eq!(max_seq_opt, None);
@@ -1053,7 +1072,8 @@ fn test_min_wal_equals_first_segment() {
 	}
 
 	// Replay with min_wal_number=5
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 5, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 5, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Should replay all three segments (5, 6, 7)
 	assert!(max_seq_opt.is_some());
@@ -1072,7 +1092,8 @@ fn test_mixed_flushed_unflushed() {
 
 	// Simulate: segments 0-2 flushed (min_wal_number=3)
 	// Segments 3-5 unflushed
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 3, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 3, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Should replay segments 3-5 (54 entries)
 	assert!(max_seq_opt.is_some());
@@ -1090,7 +1111,8 @@ fn test_recovery_min_wal_zero() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 10000);
 
 	// Replay with min_wal_number=0 (all segments)
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Should replay all 6 segments
 	assert!(max_seq_opt.is_some());
@@ -1111,7 +1133,7 @@ fn test_corruption_at_min_wal_boundary() {
 	WalTestHelper::corrupt_segment(wal_dir, 3, 0.2, CorruptionType::RandomBytes);
 
 	// Replay with min_wal_number=3
-	let result = replay_wal(wal_dir, 3, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 3, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption in segment 3, not process 4-5
 	match result {
@@ -1137,7 +1159,8 @@ fn test_boundary_with_empty_segments() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 12000);
 
 	// Replay with min_wal_number=2 (skip 0, 1)
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 2, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 2, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Should replay segments 2(empty), 3, 4 = 40 entries
 	assert!(max_seq_opt.is_some());
@@ -1175,7 +1198,8 @@ fn test_very_large_values_across_segments() {
 	wal.close().unwrap();
 
 	// Replay
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Verify all large values recovered
 	assert!(max_seq_opt.is_some());
@@ -1210,7 +1234,8 @@ fn test_many_small_batches() {
 
 	// Replay
 	let start = std::time::Instant::now();
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 	let duration = start.elapsed();
 
 	assert!(max_seq_opt.is_some());
@@ -1245,7 +1270,8 @@ fn test_few_large_batches() {
 
 	// Replay
 	let start = std::time::Instant::now();
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 	let duration = start.elapsed();
 
 	assert!(max_seq_opt.is_some());
@@ -1270,7 +1296,8 @@ fn test_recovery_performance_scaling() {
 
 		let start = std::time::Instant::now();
 
-		let (_max_seq, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+		let (_max_seq, memtables) =
+			replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 		let duration = start.elapsed();
 
 		let total_entries = seg_count * entries_per_segment;
@@ -1299,7 +1326,8 @@ fn test_wal_segments_with_gaps() {
 	fs::remove_file(segment2_path).ok();
 
 	// Replay - should warn but process available segments
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Should process 0, 1, then skip 2 (missing), then 3, 4
 	assert!(max_seq_opt.is_some());
@@ -1327,7 +1355,8 @@ fn test_non_sequential_segment_ids_with_min_wal() {
 	}
 
 	// Replay with min_wal_number=5
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 5, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 5, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Should process 5, 10, 15 (3 segments = 78 entries)
 	assert!(max_seq_opt.is_some());
@@ -1349,7 +1378,8 @@ fn test_zero_length_segment_file() {
 	fs::write(&segment1_path, b"").unwrap();
 
 	// Replay
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	// Should get segment 0, skip empty segment 1, get segment 2
 	assert!(max_seq_opt.is_some());
@@ -1367,7 +1397,8 @@ fn test_segment_larger_than_expected() {
 	let entries_per_segment = vec![5000];
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 20000);
 
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 5000);
@@ -1394,7 +1425,8 @@ fn test_recovery_with_readonly_segment() {
 	}
 
 	// Replay should work (only reading, not writing)
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 70);
@@ -1412,7 +1444,8 @@ fn test_only_wal_extension_processed() {
 	WalTestHelper::create_segments(wal_dir, &entries_per_segment, 22000);
 
 	// Replay should only process .wal files (segments 0 and 1)
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 76);
@@ -1437,7 +1470,8 @@ fn test_symlink_to_wal_segment() {
 		std::os::unix::fs::symlink(&original, &symlink).ok();
 
 		// Replay should handle symlink
-		let (_result, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+		let (_result, memtables) =
+			replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 		// Should process files (might process symlink as separate segment or skip it)
 		let entry_count = WalTestHelper::count_total_entries(&memtables);
@@ -1461,7 +1495,7 @@ fn test_concurrent_wal_directory_modifications() {
 	fs::write(wal_dir.join("00000000000000000002.wal"), b"new_file").unwrap();
 
 	// Replay - the new file with invalid content will cause corruption
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should either detect corruption in the garbage file or recover segments 0-1
 	match result {
@@ -1518,7 +1552,8 @@ fn test_compressed_wal_segments() {
 	wal.close().unwrap();
 
 	// Replay - should decompress automatically
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 150);
@@ -1568,7 +1603,8 @@ fn test_mixed_compression_segments() {
 	wal.close().unwrap();
 
 	// Replay - should handle both compressed and uncompressed segments
-	let (max_seq_opt, memtables) = replay_wal(wal_dir, 0, ARENA_SIZE).unwrap();
+	let (max_seq_opt, memtables) =
+		replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true).unwrap();
 
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 160);
@@ -1602,7 +1638,7 @@ fn test_compressed_data_corruption() {
 	WalTestHelper::corrupt_segment(wal_dir, 0, 0.5, CorruptionType::RandomBytes);
 
 	// Replay - should detect corruption (decompression failure or CRC mismatch)
-	let result = replay_wal(wal_dir, 0, ARENA_SIZE);
+	let result = replay_wal(wal_dir, 0, ARENA_SIZE, ARENA_SIZE, &|_| true);
 
 	// Should detect corruption or have partial recovery
 	// (exact behavior depends on where corruption hits in compressed stream)

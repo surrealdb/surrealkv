@@ -64,7 +64,7 @@ fn core_inner_owns_lsm_components_only_through_branch_runtime() {
 
 	// Non-vacuity: the extracted block is the real struct, not a fragment.
 	assert!(
-		core_inner.contains("default_runtime: BranchRuntime"),
+		core_inner.contains("default_runtime: Arc<BranchRuntime>"),
 		"CoreInner no longer holds the default BranchRuntime"
 	);
 	assert!(core_inner.contains("wal:"), "guard parsed a fragment, not the CoreInner struct");

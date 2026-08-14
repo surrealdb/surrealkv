@@ -9,7 +9,11 @@ use tokio::time;
 
 use crate::error::WriteStallReason;
 use crate::stall::{
-	StallCounts, StallThresholds, WriteStallController, WriteStallCountProvider, WriteStallInfo,
+	StallCounts,
+	StallThresholds,
+	WriteStallController,
+	WriteStallCountProvider,
+	WriteStallInfo,
 };
 use crate::{Error, Tree, TreeBuilder};
 
@@ -35,7 +39,7 @@ impl MockStallCountProvider {
 }
 
 impl WriteStallCountProvider for MockStallCountProvider {
-	fn get_stall_counts(&self) -> StallCounts {
+	fn get_stall_counts(&self, _owner: crate::batch::BatchOwner) -> StallCounts {
 		StallCounts {
 			immutable_memtables: self.immutable_count.load(Ordering::Acquire),
 			l0_files: self.l0_count.load(Ordering::Acquire),
@@ -58,7 +62,7 @@ async fn test_no_stall_below_threshold() {
 	let controller = WriteStallController::new(provider, default_thresholds());
 
 	// Below thresholds - should not stall
-	let result = controller.check().await;
+	let result = controller.check(crate::batch::BatchOwner::DEFAULT).await;
 	assert!(result.is_ok());
 	assert!(result.unwrap().is_none());
 	assert!(!controller.is_stalled());
@@ -82,7 +86,7 @@ async fn test_memtable_stall_triggers() {
 	});
 
 	let start = std::time::Instant::now();
-	let result = controller.check().await;
+	let result = controller.check(crate::batch::BatchOwner::DEFAULT).await;
 
 	assert!(result.is_ok());
 	let stall_info: WriteStallInfo = result.unwrap().expect("Expected stall info");
@@ -111,7 +115,7 @@ async fn test_l0_stall_triggers() {
 		controller_clone.signal_work_done();
 	});
 
-	let result = controller.check().await;
+	let result = controller.check(crate::batch::BatchOwner::DEFAULT).await;
 	assert!(result.is_ok());
 
 	let stall_info = result.unwrap().expect("Expected stall info");
@@ -138,7 +142,7 @@ async fn test_shutdown_during_stall() {
 		controller_clone.signal_shutdown();
 	});
 
-	let result = controller.check().await;
+	let result = controller.check(crate::batch::BatchOwner::DEFAULT).await;
 
 	// Should return Err(PipelineStall) on shutdown
 	assert!(result.is_err());
@@ -163,7 +167,7 @@ async fn test_stall_wakes_on_signal() {
 	});
 
 	// Below threshold - should not stall
-	let result = controller.check().await;
+	let result = controller.check(crate::batch::BatchOwner::DEFAULT).await;
 	assert!(result.is_ok());
 	assert!(result.unwrap().is_none()); // Wasn't stalled
 }
@@ -191,7 +195,7 @@ async fn test_is_stalled_flag() {
 		controller_clone.signal_work_done();
 	});
 
-	let _ = controller.check().await;
+	let _ = controller.check(crate::batch::BatchOwner::DEFAULT).await;
 
 	// After stall cleared
 	assert!(!controller.is_stalled());

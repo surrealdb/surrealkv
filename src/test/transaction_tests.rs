@@ -8,12 +8,23 @@ use test_log::test;
 use crate::batch::BatchOwner;
 use crate::lsm::Tree;
 use crate::test::{
-	collect_history_all, collect_transaction_all, collect_transaction_reverse,
-	point_in_time_from_history, KeyVersionsMap,
+	collect_history_all,
+	collect_transaction_all,
+	collect_transaction_reverse,
+	point_in_time_from_history,
+	KeyVersionsMap,
 };
 use crate::transaction::{HistoryOptions, Transaction, TransactionOptions};
 use crate::{
-	BranchGeneration, BranchId, CommitVersion, Error, Key, LSMIterator, Mode, Options, TreeBuilder,
+	BranchGeneration,
+	BranchId,
+	CommitVersion,
+	Error,
+	Key,
+	LSMIterator,
+	Mode,
+	Options,
+	TreeBuilder,
 	WriteOptions,
 };
 

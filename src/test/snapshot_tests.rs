@@ -10,7 +10,10 @@ use crate::memtable::MemTable;
 use crate::snapshot::{IterState, KMergeIterator};
 use crate::sstable::table::{Table, TableWriter};
 use crate::test::{
-	collect_all, collect_snapshot_iter, collect_snapshot_reverse, collect_transaction_all,
+	collect_all,
+	collect_snapshot_iter,
+	collect_snapshot_reverse,
+	collect_transaction_all,
 };
 use crate::vfs::File;
 use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Tree, TreeBuilder};
@@ -455,7 +458,7 @@ fn test_range_skips_non_overlapping_tables() {
 	let levels = Levels(vec![Arc::new(level0)]);
 
 	let iter_state = IterState {
-		active: Arc::new(MemTable::default()),
+		active: Some(Arc::new(MemTable::default())),
 		immutable: Vec::new(),
 		levels,
 	};
@@ -936,7 +939,7 @@ fn create_iter_state_with_tables(
 	let levels = Levels(vec![Arc::new(level0), Arc::new(level1), Arc::new(level2)]);
 
 	IterState {
-		active: Arc::new(MemTable::default()),
+		active: Some(Arc::new(MemTable::default())),
 		immutable: vec![],
 		levels,
 	}

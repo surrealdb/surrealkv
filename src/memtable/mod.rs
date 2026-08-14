@@ -110,11 +110,20 @@ impl Drop for ReservationGuard<'_> {
 }
 
 impl MemTable {
+	/// Initial `wal_number`: "no WAL dependency recorded yet". `u64::MAX` is
+	/// the identity element of `record_wal_dependency`'s `fetch_min`, so the
+	/// first applied batch's actual segment becomes the baseline; a zero
+	/// initialization could never be raised and would pin every
+	/// lazily-created memtable to segment 0.
+	pub(crate) const NO_WAL_DEPENDENCY: u64 = u64::MAX;
+
 	pub(crate) fn new(arena_capacity: usize) -> Self {
 		Self::new_owned(arena_capacity, BatchOwner::DEFAULT)
 	}
 
 	pub(crate) fn new_owned(arena_capacity: usize, owner: BatchOwner) -> Self {
+		// Dependency ids are opaque; starting at 1 only keeps 0 out of logs
+		// and dumps — no code anywhere treats 0 as a sentinel.
 		static NEXT_DEPENDENCY_ID: AtomicU64 = AtomicU64::new(1);
 		let arena = Arc::new(Arena::new(arena_capacity));
 		let cmp: Compare = |a, b| a.cmp(b);
@@ -124,7 +133,7 @@ impl MemTable {
 			owner,
 			skiplist,
 			latest_seq_num: AtomicU64::new(0),
-			wal_number: AtomicU64::new(0),
+			wal_number: AtomicU64::new(Self::NO_WAL_DEPENDENCY),
 			reserved: AtomicU64::new(0),
 		}
 	}
@@ -151,8 +160,12 @@ impl MemTable {
 		self.wal_number.fetch_min(wal_number, Ordering::AcqRel);
 	}
 
-	/// Gets the WAL number associated with this memtable.
-	/// Returns 0 if the WAL number has not been set.
+	/// Gets the earliest WAL segment this memtable depends on.
+	///
+	/// A fresh memtable starts at [`Self::NO_WAL_DEPENDENCY`]; see its doc.
+	/// Every non-empty memtable has a real value (apply records its actual
+	/// append segment); empty actives are explicitly baselined by
+	/// open/rotation.
 	pub(crate) fn get_wal_number(&self) -> u64 {
 		self.wal_number.load(Ordering::Acquire)
 	}
@@ -170,7 +183,7 @@ impl MemTable {
 			}
 
 			let found_trailer = iter.trailer();
-			let found_seq = found_trailer >> 8;
+			let found_seq = crate::trailer_to_seq_num(found_trailer);
 
 			// Check if this entry's sequence number is <= requested seq_no
 			if found_seq <= max_seq {
@@ -201,6 +214,43 @@ impl MemTable {
 	/// Arena capacity in bytes (total, including sentinel overhead).
 	pub(crate) fn arena_capacity(&self) -> usize {
 		self.skiplist.arena_capacity()
+	}
+
+	/// Arena bytes still reservable: capacity minus skiplist usage (which
+	/// includes the empty skiplist's own head/tail sentinel allocations)
+	/// minus outstanding reservations. `try_reserve(n)` succeeds iff
+	/// `n <= arena_available()` at the moment of the CAS. Right-sizing a
+	/// replacement arena must use this, not raw capacity: an arena sized
+	/// exactly to a batch estimate can never admit that batch.
+	pub(crate) fn arena_available(&self) -> u64 {
+		(self.arena_capacity() as u64)
+			.saturating_sub(self.skiplist.size() as u64)
+			.saturating_sub(self.reserved.load(Ordering::Acquire))
+	}
+
+	/// Builds an owned memtable guaranteed to admit a reservation of
+	/// `min_reservable` bytes: starts at `max(base_capacity, min_reservable)`
+	/// and grows once by the measured sentinel shortfall. This is the single
+	/// right-sizing rule shared by forced rotation and WAL replay — a
+	/// WAL-durable batch must never permanently fail to apply because the
+	/// fresh arena's own sentinel nodes consumed its headroom.
+	pub(crate) fn new_owned_admitting(
+		base_capacity: usize,
+		min_reservable: u64,
+		owner: crate::batch::BatchOwner,
+	) -> Self {
+		let capacity = base_capacity.max(min_reservable as usize);
+		let table = Self::new_owned(capacity, owner);
+		let shortfall = min_reservable.saturating_sub(table.arena_available());
+		if shortfall == 0 {
+			return table;
+		}
+		let grown = Self::new_owned(capacity + shortfall as usize, owner);
+		debug_assert!(
+			grown.arena_available() >= min_reservable,
+			"right-sized arena cannot admit the forcing reservation"
+		);
+		grown
 	}
 
 	/// Atomically reserve `bytes` of arena space for an upcoming batch insertion.
@@ -306,7 +356,7 @@ impl MemTable {
 	/// returning `ArenaFull` in release so the upstream rotate-and-retry path stays
 	/// as a safety net rather than corrupting state via panic.
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
-		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
+		let trailer = crate::make_trailer(key.seq_num(), key.kind());
 
 		match self.skiplist.add(&key.user_key, trailer, key.timestamp, value) {
 			Ok(()) => Ok(()),

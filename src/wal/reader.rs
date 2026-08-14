@@ -3,8 +3,16 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::vec::Vec;
 
 use crate::wal::{
-	calculate_crc32, validate_record_type, CompressionType, CorruptionError, Error, IOError,
-	RecordType, Result, BLOCK_SIZE, HEADER_SIZE as WAL_RECORD_HEADER_SIZE,
+	calculate_crc32,
+	validate_record_type,
+	CompressionType,
+	CorruptionError,
+	Error,
+	IOError,
+	RecordType,
+	Result,
+	BLOCK_SIZE,
+	HEADER_SIZE as WAL_RECORD_HEADER_SIZE,
 };
 
 /// Reporter interface for WAL corruption and errors.

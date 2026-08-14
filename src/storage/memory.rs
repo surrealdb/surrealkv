@@ -6,14 +6,38 @@ use bytes::Bytes;
 use parking_lot::{Mutex, RwLock};
 
 use super::{
-	AuthorityRoot, AuthoritySession, ByteRange, CommitCapabilities, CommitOutcome, CommitProposal,
-	CommitStore, DeleteOutcome, ListCursor, MaintenanceHint, MemoryBudget, ObjectCapabilities,
-	ObjectId, ObjectMetadata, ObjectPage, ObjectPrefix, ObjectStore, OpenMode, Platform,
-	PutOutcome, PutRequest, ReconcileOutcome,
+	AuthorityRoot,
+	AuthoritySession,
+	ByteRange,
+	CommitCapabilities,
+	CommitOutcome,
+	CommitProposal,
+	CommitStore,
+	DeleteOutcome,
+	ListCursor,
+	MaintenanceHint,
+	MemoryBudget,
+	ObjectCapabilities,
+	ObjectId,
+	ObjectMetadata,
+	ObjectPage,
+	ObjectPrefix,
+	ObjectStore,
+	OpenMode,
+	Platform,
+	PutOutcome,
+	PutRequest,
+	ReconcileOutcome,
 };
 use crate::api::{
-	AuthorityFence, DurabilityClass, ErrorCode, KernelError, KernelResult, MonotonicTime,
-	OperationId, SessionId,
+	AuthorityFence,
+	DurabilityClass,
+	ErrorCode,
+	KernelError,
+	KernelResult,
+	MonotonicTime,
+	OperationId,
+	SessionId,
 };
 
 #[derive(Clone)]

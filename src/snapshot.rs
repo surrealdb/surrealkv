@@ -4,14 +4,24 @@ use std::sync::Arc;
 
 use crossbeam_skiplist::SkipSet;
 
+use crate::batch::BatchOwner;
+use crate::branch_runtime::BranchRuntime;
 use crate::error::{Error, Result};
 use crate::iter::BoxedLSMIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::{
-	BytewiseComparator, Comparator, InternalKey, InternalKeyComparator, InternalKeyKind,
-	InternalKeyRange, InternalKeyRef, LSMIterator, TimestampComparator, Value,
+	BytewiseComparator,
+	Comparator,
+	InternalKey,
+	InternalKeyComparator,
+	InternalKeyKind,
+	InternalKeyRange,
+	InternalKeyRef,
+	LSMIterator,
+	TimestampComparator,
+	Value,
 };
 
 // ===== Snapshot Tracker =====
@@ -28,14 +38,22 @@ use crate::{
 /// removal, it checks if the version is visible to any snapshot using binary
 /// search. Versions visible to snapshots are preserved unless hidden by a newer
 /// version in the same visibility boundary.
+/// Entries are `(seq, unique_id)`, exactly like `ActiveTxnTracker`: the id
+/// differentiates concurrent snapshots that share a sequence number (any two
+/// read transactions started with no commit in between do), so dropping one
+/// cannot strip the other's compaction protection. Registration returns an
+/// RAII guard, making an unregister without a matching register
+/// unrepresentable.
 pub(crate) struct SnapshotTracker {
-	snapshots: Arc<SkipSet<u64>>,
+	snapshots: Arc<SkipSet<(u64, u64)>>,
+	next_id: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Clone for SnapshotTracker {
 	fn clone(&self) -> Self {
 		Self {
 			snapshots: Arc::clone(&self.snapshots),
+			next_id: Arc::clone(&self.next_id),
 		}
 	}
 }
@@ -57,48 +75,61 @@ impl SnapshotTracker {
 	pub(crate) fn new() -> Self {
 		Self {
 			snapshots: Arc::new(SkipSet::new()),
+			next_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
 		}
 	}
 
 	/// Registers a new snapshot with the given sequence number.
 	///
-	/// Called when a new snapshot is created. The sequence number is added
-	/// to the tracking set, ensuring compaction will preserve versions
-	/// visible to this snapshot.
-	pub(crate) fn register(&self, seq_num: u64) {
-		self.snapshots.insert(seq_num);
+	/// The returned guard keeps compaction preserving versions visible to
+	/// this snapshot; dropping the guard releases exactly this registration.
+	pub(crate) fn register(&self, seq_num: u64) -> SnapshotGuard {
+		let entry = (seq_num, self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+		self.snapshots.insert(entry);
+		SnapshotGuard {
+			snapshots: Arc::clone(&self.snapshots),
+			entry,
+		}
 	}
 
-	/// Unregisters a snapshot with the given sequence number.
-	///
-	/// Called when a snapshot is dropped. Once all snapshots at or above
-	/// a certain sequence number are dropped, older versions become eligible
-	/// for garbage collection during compaction.
-	pub(crate) fn unregister(&self, seq_num: u64) {
-		self.snapshots.remove(&seq_num);
-	}
-
-	/// Returns all active snapshots as a sorted vector.
+	/// Returns all active snapshots as a sorted, deduplicated vector.
 	///
 	/// This is the primary method used by compaction. The returned vector
 	/// is sorted in ascending order.
 	pub(crate) fn get_all_snapshots(&self) -> Vec<u64> {
-		self.snapshots.iter().map(|entry| *entry).collect()
+		let mut seqs: Vec<u64> = self.snapshots.iter().map(|entry| entry.value().0).collect();
+		seqs.dedup();
+		seqs
 	}
 
 	/// Returns the smallest active snapshot seq, if any. O(log N) via
 	/// `SkipSet::front`. Used by the commit oracle to compute its GC
 	/// watermark on every commit.
 	pub(crate) fn first(&self) -> Option<u64> {
-		self.snapshots.front().map(|e| *e.value())
+		self.snapshots.front().map(|e| e.value().0)
+	}
+}
+
+/// RAII registration handle: one guard = one tracked snapshot entry.
+pub(crate) struct SnapshotGuard {
+	snapshots: Arc<SkipSet<(u64, u64)>>,
+	entry: (u64, u64),
+}
+
+impl Drop for SnapshotGuard {
+	fn drop(&mut self) {
+		self.snapshots.remove(&self.entry);
 	}
 }
 
 // ===== Iterator State =====
 /// Holds references to all LSM tree components needed for iteration.
 pub(crate) struct IterState {
-	/// The active memtable receiving current writes
-	pub active: Arc<MemTable>,
+	/// The active memtable receiving current writes. `None` when the
+	/// snapshot's owner has no runtime (idle branch) — never synthesized,
+	/// because an empty stand-in memtable would allocate a full arena per
+	/// read.
+	pub active: Option<Arc<MemTable>>,
 	/// Immutable memtables waiting to be flushed
 	pub immutable: Vec<Arc<MemTable>>,
 	/// All levels containing SSTables
@@ -120,44 +151,78 @@ pub(crate) struct Snapshot {
 	/// Sequence number defining this snapshot's view of the data
 	/// Only data with seq_num <= this value is visible
 	pub(crate) seq_num: u64,
+
+	/// Physical owner whose component set this snapshot reads.
+	owner: BatchOwner,
+
+	/// The owner's runtime as resolved at snapshot creation. `None` means the
+	/// owner had no runtime (an idle branch) — which is a complete view, not a
+	/// race: `seq_num` comes from the drained visible sequence and apply
+	/// creates a runtime before publication advances, so a runtime absent here
+	/// can only ever hold sequences beyond this snapshot's horizon. Reads
+	/// never create runtimes (an idle branch allocates no arena).
+	runtime: Option<Arc<BranchRuntime>>,
+
+	/// Tracker registration; released on drop.
+	_tracker_guard: SnapshotGuard,
 }
 
 impl Snapshot {
-	/// Creates a new snapshot at the current sequence number
-	pub(crate) fn new(core: Arc<Core>, seq_num: u64) -> Self {
+	/// Creates a new snapshot of one physical owner's component set.
+	pub(crate) fn new_owned(core: Arc<Core>, seq_num: u64, owner: BatchOwner) -> Self {
 		// Register this snapshot's sequence number so compaction knows
 		// to preserve versions visible to this snapshot
-		core.snapshot_tracker.register(seq_num);
+		let tracker_guard = core.snapshot_tracker.register(seq_num);
 
+		let runtime = core.inner.runtimes.get(owner);
 		Self {
 			core,
 			seq_num,
+			owner,
+			runtime,
+			_tracker_guard: tracker_guard,
 		}
 	}
 
-	/// Collects the iterator state from all LSM components
+	/// Collects the iterator state from the owner's LSM components
 	/// This is a helper method used by both iterators and optimized operations
 	/// like count
 	pub(crate) fn collect_iter_state(&self) -> Result<IterState> {
-		let active = guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.active_memtable))?;
-		let immutable =
-			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.immutable_memtables))?;
+		let (active, immutable) = match &self.runtime {
+			Some(runtime) => {
+				let active =
+					guardian::ArcRwLockReadGuardian::take(Arc::clone(&runtime.active_memtable))?;
+				let immutable = guardian::ArcRwLockReadGuardian::take(Arc::clone(
+					&runtime.immutable_memtables,
+				))?;
+				(
+					Some(active.clone()),
+					immutable.iter().map(|entry| Arc::clone(&entry.memtable)).collect(),
+				)
+			}
+			None => (None, Vec::new()),
+		};
+
 		let manifest =
 			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.level_manifest))?;
 
-		let owner = self.core.default_runtime.owner();
-		let levels = manifest
-			.levels_for(owner)
-			.ok_or_else(|| {
-				crate::error::Error::Corruption(format!(
-					"snapshot owner {owner:?} has no level set"
-				))
-			})?
-			.clone();
+		let levels = match manifest.levels_for(self.owner) {
+			Some(levels) => levels.clone(),
+			// Manifest load fail-closes on a missing default set, so this is
+			// unreachable except through corruption — keep it fail-closed.
+			None if self.owner == BatchOwner::DEFAULT => {
+				return Err(crate::error::Error::Corruption(format!(
+					"snapshot owner {:?} has no level set",
+					self.owner
+				)));
+			}
+			// The owner never flushed an SST: an empty durable view.
+			None => Levels::new(self.core.opts.level_count as usize, 0),
+		};
 
 		Ok(IterState {
-			active: active.clone(),
-			immutable: immutable.iter().map(|entry| Arc::clone(&entry.memtable)).collect(),
+			active,
+			immutable,
 			levels,
 		})
 	}
@@ -174,39 +239,40 @@ impl Snapshot {
 	/// The search stops at the first version found with seq_num <= snapshot
 	/// seq_num.
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
-		// self.core.get_internal(key, self.seq_num)
-		// Read lock on the active memtable
-		let memtable_lock = self.core.active_memtable.read()?;
+		// Memtable phases exist only when the owner has a runtime; an idle
+		// branch's view is durable tables at most (and usually nothing).
+		if let Some(runtime) = &self.runtime {
+			// Read lock on the active memtable
+			let memtable_lock = runtime.active_memtable.read()?;
 
-		// Check the active memtable for the key
-		if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
-			if item.0.is_tombstone() {
-				return Ok(None); // Key is a tombstone, return None
-			}
-			return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
-		}
-		drop(memtable_lock); // Release the lock on the active memtable
-
-		// Read lock on the immutable memtables
-		let memtable_lock = self.core.immutable_memtables.read()?;
-
-		// Check the immutable memtables for the key
-		for entry in memtable_lock.iter().rev() {
-			let memtable = &entry.memtable;
-			if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
+			// Check the active memtable for the key
+			if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
 				if item.0.is_tombstone() {
 					return Ok(None); // Key is a tombstone, return None
 				}
 				return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
 			}
+			drop(memtable_lock); // Release the lock on the active memtable
+
+			// Read lock on the immutable memtables
+			let memtable_lock = runtime.immutable_memtables.read()?;
+
+			// Check the immutable memtables for the key
+			for entry in memtable_lock.iter().rev() {
+				let memtable = &entry.memtable;
+				if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
+					if item.0.is_tombstone() {
+						return Ok(None); // Key is a tombstone, return None
+					}
+					return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
+				}
+			}
 		}
-		drop(memtable_lock); // Release the lock on the immutable memtables
 
 		// Read lock on the level manifest; reads select this snapshot's
 		// owner level set — there is no owner-blind table scan.
 		let level_manifest = self.core.level_manifest.read()?;
-		let owner = self.core.default_runtime.owner();
-		let Some(owner_levels) = level_manifest.levels_for(owner) else {
+		let Some(owner_levels) = level_manifest.levels_for(self.owner) else {
 			return Ok(None);
 		};
 
@@ -267,7 +333,7 @@ impl Snapshot {
 			lower.map(Bound::Included).unwrap_or(Bound::Unbounded),
 			upper.map(Bound::Excluded).unwrap_or(Bound::Unbounded),
 		);
-		SnapshotIterator::new_from(Arc::clone(&self.core), self.seq_num, internal_range)
+		SnapshotIterator::new_from(self, internal_range)
 	}
 
 	/// Creates a history iterator over memtables + SSTables via KMergeIterator.
@@ -355,14 +421,6 @@ impl Snapshot {
 		}
 
 		Ok(best_value)
-	}
-}
-
-impl Drop for Snapshot {
-	fn drop(&mut self) {
-		// Unregister this snapshot's sequence number so compaction can
-		// clean up versions no longer visible to any snapshot
-		self.core.snapshot_tracker.unregister(self.seq_num);
 	}
 }
 
@@ -454,9 +512,11 @@ impl<'a> KMergeIterator<'a> {
 			                                                * iterators */
 		};
 
-		// Active memtable
-		let active_iter = state_ref.active.range(lower, upper);
-		iterators.push(Box::new(active_iter) as BoxedLSMIterator<'a>);
+		// Active memtable (absent for an idle branch's snapshot)
+		if let Some(active) = &state_ref.active {
+			let active_iter = active.range(lower, upper);
+			iterators.push(Box::new(active_iter) as BoxedLSMIterator<'a>);
+		}
 
 		// Immutable memtables
 		for memtable in &state_ref.immutable {
@@ -837,21 +897,21 @@ pub(crate) struct SnapshotIterator<'a> {
 }
 
 impl SnapshotIterator<'_> {
-	/// Creates a new iterator over a specific key range
-	fn new_from(core: Arc<Core>, seq_num: u64, range: InternalKeyRange) -> Result<Self> {
-		// Create a temporary snapshot to use the helper method
-		let snapshot = Snapshot {
-			core: Arc::clone(&core),
-			seq_num,
-		};
+	/// Creates a new iterator over a specific key range.
+	///
+	/// Takes the real snapshot: it must not construct a stand-in `Snapshot`
+	/// to reuse `collect_iter_state`, because a stand-in was never registered
+	/// with the tracker yet its drop unregistered the caller's sequence,
+	/// silently stripping the live snapshot's compaction protection.
+	fn new_from(snapshot: &Snapshot, range: InternalKeyRange) -> Result<Self> {
 		let iter_state = snapshot.collect_iter_state()?;
 
 		let merge_iter = KMergeIterator::new_from(iter_state, range);
 
 		Ok(Self {
 			merge_iter,
-			snapshot_seq_num: seq_num,
-			core,
+			snapshot_seq_num: snapshot.seq_num,
+			core: Arc::clone(&snapshot.core),
 			last_key_fwd: Vec::new(),
 			buffered_back_key: Vec::new(),
 			buffered_back_value: Vec::new(),
@@ -1028,7 +1088,12 @@ impl SnapshotIterator<'_> {
 
 		// Seek to first entry >= current user key
 		// Using (user_key, MAX_SEQ) positions at the start of this user key's entries
-		let seek_key = InternalKey::new(current_user_key, u64::MAX, InternalKeyKind::Set, u64::MAX);
+		let seek_key = InternalKey::new(
+			current_user_key,
+			crate::INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Set,
+			crate::INTERNAL_KEY_TIMESTAMP_MAX,
+		);
 		self.merge_iter.seek(&seek_key.encode())?;
 
 		// skip_to_valid_forward() will skip entries with user_key == last_key_fwd
@@ -1310,8 +1375,12 @@ impl<'a> HistoryIterator<'a> {
 			let next_key_vec = self.inner_key().user_key().to_vec();
 			if next_key_vec != current {
 				// Found next key - seek to (next_key, ts_end) to skip entries above range
-				let seek_key =
-					InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set, ts_end);
+				let seek_key = InternalKey::new(
+					next_key_vec,
+					crate::INTERNAL_KEY_SEQ_NUM_MAX,
+					InternalKeyKind::Set,
+					ts_end,
+				);
 				self.inner.seek(&seek_key.encode())?;
 				return Ok(self.inner_valid());
 			}
@@ -1712,7 +1781,7 @@ impl LSMIterator for HistoryIterator<'_> {
 
 		if self.ts_range.is_some() {
 			// Seek to (lower_bound or empty, ts_end) to skip entries above range
-			let ts = self.ts_range.map(|(_, end)| end).unwrap_or(u64::MAX);
+			let ts = self.ts_range.map(|(_, end)| end).unwrap_or(crate::INTERNAL_KEY_TIMESTAMP_MAX);
 			let seek_key = InternalKey::new(
 				self.lower_bound.clone().unwrap_or_default(),
 				u64::MAX,
@@ -1814,29 +1883,55 @@ mod tests {
 		let tracker = SnapshotTracker::new();
 
 		// Insert snapshots in non-sorted order
-		tracker.register(100);
-		tracker.register(50);
-		tracker.register(200);
-		tracker.register(75);
-		tracker.register(150);
+		let g100 = tracker.register(100);
+		let g50 = tracker.register(50);
+		let _g200 = tracker.register(200);
+		let _g75 = tracker.register(75);
+		let _g150 = tracker.register(150);
 
 		// Verify get_all_snapshots returns sorted order
 		let snapshots = tracker.get_all_snapshots();
 		assert_eq!(snapshots, vec![50, 75, 100, 150, 200]);
 
-		// Unregister some and verify order is maintained
-		tracker.unregister(100);
-		tracker.unregister(50);
+		// Release some and verify order is maintained
+		drop(g100);
+		drop(g50);
 
 		let snapshots = tracker.get_all_snapshots();
 		assert_eq!(snapshots, vec![75, 150, 200]);
 
 		// Add more and verify
-		tracker.register(25);
-		tracker.register(300);
+		let _g25 = tracker.register(25);
+		let _g300 = tracker.register(300);
 
 		let snapshots = tracker.get_all_snapshots();
 		assert_eq!(snapshots, vec![25, 75, 150, 200, 300]);
+	}
+
+	/// Regression for the set-collision bug: two snapshots sharing one
+	/// sequence (any two read transactions with no commit in between) must
+	/// each hold an independent registration. Dropping one — or a stand-in
+	/// created and dropped mid-read, as `SnapshotIterator::new_from` once
+	/// did — must not strip the survivor's compaction protection.
+	#[test]
+	fn same_seq_registrations_do_not_collide() {
+		let tracker = SnapshotTracker::new();
+
+		let first = tracker.register(42);
+		let second = tracker.register(42);
+		assert_eq!(tracker.get_all_snapshots(), vec![42], "deduplicated view");
+
+		drop(first);
+		assert_eq!(
+			tracker.get_all_snapshots(),
+			vec![42],
+			"the surviving snapshot must keep sequence 42 protected"
+		);
+		assert_eq!(tracker.first(), Some(42));
+
+		drop(second);
+		assert_eq!(tracker.get_all_snapshots(), Vec::<u64>::new());
+		assert_eq!(tracker.first(), None);
 	}
 
 	#[test]
@@ -1848,10 +1943,10 @@ mod tests {
 	#[test]
 	fn test_snapshot_tracker_clone_shares_state() {
 		let tracker1 = SnapshotTracker::new();
-		tracker1.register(100);
+		let _g100 = tracker1.register(100);
 
 		let tracker2 = tracker1.clone();
-		tracker2.register(50);
+		let _g50 = tracker2.register(50);
 
 		// Both should see the same snapshots
 		assert_eq!(tracker1.get_all_snapshots(), vec![50, 100]);

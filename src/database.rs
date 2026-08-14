@@ -8,17 +8,36 @@ use parking_lot::RwLock;
 use tokio::sync::Mutex;
 
 use super::api::{
-	AuthorityFence, BranchGeneration, BranchId, CommitTimestamp, CommitVersion, DatabaseId,
-	ErrorCode, KernelError, KernelResult, OperationId,
+	AuthorityFence,
+	BranchGeneration,
+	BranchId,
+	CommitTimestamp,
+	CommitVersion,
+	DatabaseId,
+	ErrorCode,
+	KernelError,
+	KernelResult,
+	OperationId,
 };
 use super::branch::{ReadSelector, WriteOperation};
 use super::format::{InternalKey, RowKind, StorageRow, MAX_USER_KEY_LEN};
 use super::storage::{
-	AuthoritySession, BindingRequirements, Bindings, CommitOutcome, CommitProposal, OpenMode,
-	PutRequest, ReconcileOutcome,
+	AuthoritySession,
+	BindingRequirements,
+	Bindings,
+	CommitOutcome,
+	CommitProposal,
+	OpenMode,
+	PutRequest,
+	ReconcileOutcome,
 };
 use super::table::{
-	decode_descriptor, encode_descriptor, BlockCache, TableBuilder, TableDescriptor, TableOwner,
+	decode_descriptor,
+	encode_descriptor,
+	BlockCache,
+	TableBuilder,
+	TableDescriptor,
+	TableOwner,
 	TableReader,
 };
 

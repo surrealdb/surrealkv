@@ -108,10 +108,8 @@ impl WalDependencyTracker {
 			.filter(|(id, _)| Some(**id) != excluded_component)
 			.map(|(_, segment)| *segment)
 			.min();
-		let replay_floor = in_flight_floor
-			.into_iter()
-			.chain(component_floor)
-			.fold(current_wal_segment, u64::min);
+		let replay_floor =
+			in_flight_floor.into_iter().chain(component_floor).fold(current_wal_segment, u64::min);
 		WalDependencySnapshot {
 			revision: state.revision,
 			replay_floor,

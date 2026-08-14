@@ -589,7 +589,7 @@ pub(crate) fn cleanup_old_segments(wal_dir: &Path, min_wal_number: u64) -> Resul
 	// Remove all segments older than min_wal_number (already flushed to SST)
 	for segment_id in segment_ids {
 		if segment_id < min_wal_number {
-			let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
+			let segment_path = wal_dir.join(segment_name(segment_id, "wal"));
 
 			match fs::remove_file(&segment_path) {
 				Ok(_) => {

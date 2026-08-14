@@ -104,12 +104,8 @@ async fn partial_flush_of_split_wal_keeps_the_segment_replayable() {
 	second_memtable.set_wal_number(wal_number);
 	first_memtable.add(&first_batch).unwrap();
 	second_memtable.add(&second_batch).unwrap();
-	tree.core
-		.wal_dependencies
-		.register_component(first_memtable.dependency_id(), wal_number);
-	tree.core
-		.wal_dependencies
-		.register_component(second_memtable.dependency_id(), wal_number);
+	tree.core.wal_dependencies.register_component(first_memtable.dependency_id(), wal_number);
+	tree.core.wal_dependencies.register_component(second_memtable.dependency_id(), wal_number);
 	let first_table_id = tree.core.level_manifest.read().unwrap().next_table_id();
 	{
 		let mut immutables = tree.core.immutable_memtables.write().unwrap();
@@ -125,7 +121,7 @@ async fn partial_flush_of_split_wal_keeps_the_segment_replayable() {
 	);
 	assert_eq!(tree.core.immutable_memtables.read().unwrap().iter().count(), 1);
 	let (max_sequence, replayed) =
-		replay_wal(&tree.core.opts.wal_dir(), wal_number, 64 * 1024).unwrap();
+		replay_wal(&tree.core.opts.wal_dir(), wal_number, 64 * 1024, 64 * 1024, &|_| true).unwrap();
 	assert_eq!(max_sequence, Some(2));
 	assert_eq!(replayed.len(), 1, "the original segment must still replay both batches");
 
@@ -161,6 +157,12 @@ async fn delayed_apply_after_rotation_keeps_its_actual_wal_replayable() {
 		"fixture must expose the durable-but-not-applied interval"
 	);
 
+	// Memtable rotation is independent of the shared WAL now; recreate the
+	// danger window by closing the segment explicitly (production closes it
+	// via the size policy) BEFORE rotating the memtable, so the replacement
+	// memtable starts on the new segment and the delayed apply genuinely
+	// lowers its recorded dependency.
+	tree.core.wal.write().rotate().unwrap();
 	tree.core.rotate_memtable().unwrap();
 	let new_wal = tree.core.wal.read().get_active_log_number();
 	assert!(new_wal > old_wal, "fixture must rotate the WAL");
@@ -171,11 +173,7 @@ async fn delayed_apply_after_rotation_keeps_its_actual_wal_replayable() {
 	assert_ne!(new_active.dependency_id(), old_component);
 	new_active.add(&delayed).unwrap();
 	new_active.record_wal_dependency(actual_wal);
-	tree.core.wal_dependencies.handoff_to_component(
-		2,
-		new_active.dependency_id(),
-		actual_wal,
-	);
+	tree.core.wal_dependencies.handoff_to_component(2, new_active.dependency_id(), actual_wal);
 	assert_eq!(
 		new_active.get_wal_number(),
 		old_wal,
@@ -191,7 +189,7 @@ async fn delayed_apply_after_rotation_keeps_its_actual_wal_replayable() {
 		"partial flush must preserve the delayed apply's only durable segment"
 	);
 	let (max_sequence, replayed) =
-		replay_wal(&tree.core.opts.wal_dir(), old_wal, 256 * 1024).unwrap();
+		replay_wal(&tree.core.opts.wal_dir(), old_wal, 256 * 1024, 256 * 1024, &|_| true).unwrap();
 	assert_eq!(max_sequence, Some(2));
 	assert!(
 		replayed.iter().any(|(memtable, segment)| {
@@ -639,6 +637,7 @@ async fn test_manifest_log_number_progression() {
 			txn.commit().await.unwrap();
 		}
 
+		tree.core.inner.wal.write().rotate().unwrap();
 		tree.flush().unwrap();
 
 		let log_num_after_flush = RecoveryTestHelper::get_manifest_log_number(&tree);
@@ -659,6 +658,7 @@ async fn test_manifest_log_number_progression() {
 			txn.commit().await.unwrap();
 		}
 
+		tree.core.inner.wal.write().rotate().unwrap();
 		tree.flush().unwrap();
 
 		let log_num_after = RecoveryTestHelper::get_manifest_log_number(&tree);
@@ -679,6 +679,7 @@ async fn test_manifest_log_number_progression() {
 			txn.commit().await.unwrap();
 		}
 
+		tree.core.inner.wal.write().rotate().unwrap();
 		tree.flush().unwrap();
 
 		let log_num_after = RecoveryTestHelper::get_manifest_log_number(&tree);

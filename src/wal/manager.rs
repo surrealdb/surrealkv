@@ -5,8 +5,17 @@ use std::sync::Arc;
 
 use super::writer::Writer;
 use super::{
-	get_segment_range, segment_name, BufferedFileWriter, CompressionType, Error, IOError, Options,
-	RecordType, Result, BLOCK_SIZE, HEADER_SIZE,
+	get_segment_range,
+	segment_name,
+	BufferedFileWriter,
+	CompressionType,
+	Error,
+	IOError,
+	Options,
+	RecordType,
+	Result,
+	BLOCK_SIZE,
+	HEADER_SIZE,
 };
 
 /// Write-Ahead Log (Wal) manager for coordinating WAL operations.
@@ -20,6 +29,12 @@ pub struct Wal {
 
 	/// The log number of the currently active Writer.
 	active_log_number: u64,
+
+	/// Bytes appended to the active segment since it was opened or rotated.
+	/// Drives the size-based rotation policy now that memtable rotation no
+	/// longer rotates the WAL (branch rotations are independent of the shared
+	/// log). Approximate: record payload size, excluding block framing.
+	bytes_in_active_segment: u64,
 
 	/// The directory where the WAL files are located.
 	dir: PathBuf,
@@ -53,6 +68,7 @@ impl Wal {
 			active_writer,
 			sync_fd,
 			active_log_number,
+			bytes_in_active_segment: 0,
 			dir: dir.to_path_buf(),
 			opts,
 			closed: false,
@@ -116,6 +132,7 @@ impl Wal {
 			active_writer,
 			sync_fd,
 			active_log_number,
+			bytes_in_active_segment: 0,
 			dir: dir.to_path_buf(),
 			opts,
 			closed: false,
@@ -332,6 +349,7 @@ impl Wal {
 		log::trace!("WAL append: log_number={}, bytes={}", self.active_log_number, rec.len());
 
 		self.active_writer.add_record(rec)?;
+		self.bytes_in_active_segment += rec.len() as u64;
 
 		// The caller must carry the actual segment into memtable apply. Apply
 		// runs outside the commit write mutex, so observing the active segment
@@ -397,10 +415,19 @@ impl Wal {
 	}
 
 	/// Explicitly rotates the active WAL to a new file.
+	/// True when the active segment has reached the configured size and the
+	/// caller (holding the write guard) should rotate. Size-driven rotation is
+	/// the only WAL rotation policy: branch memtable rotations are independent
+	/// of the shared log.
+	pub(crate) fn should_rotate_for_size(&self) -> bool {
+		self.bytes_in_active_segment >= self.opts.max_file_size
+	}
+
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
 		let old_log_number = self.active_log_number;
 
 		self.active_writer.sync()?;
+		self.bytes_in_active_segment = 0;
 
 		// Update the log number
 		self.active_log_number += 1;

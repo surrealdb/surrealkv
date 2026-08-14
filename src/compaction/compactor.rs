@@ -64,10 +64,10 @@ pub(crate) struct CompactionOptions {
 }
 
 impl CompactionOptions {
-	pub(crate) fn from(tree: &CoreInner) -> Self {
+	pub(crate) fn for_owner(tree: &CoreInner, owner: BatchOwner) -> Self {
 		Self {
 			lopts: Arc::clone(&tree.opts),
-			owner: tree.default_runtime.owner(),
+			owner,
 			level_manifest: Arc::clone(&tree.level_manifest),
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			error_handler: Arc::clone(&tree.error_handler),

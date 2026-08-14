@@ -7,7 +7,12 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 
 use super::api::{
-	AuthorityFence, DurabilityClass, KernelError, KernelResult, MonotonicTime, OperationId,
+	AuthorityFence,
+	DurabilityClass,
+	KernelError,
+	KernelResult,
+	MonotonicTime,
+	OperationId,
 	SessionId,
 };
 

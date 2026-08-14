@@ -15,11 +15,23 @@ use fs2::FileExt;
 use parking_lot::Mutex;
 
 use super::{
-	AuthorityRoot, AuthoritySession, CommitCapabilities, CommitOutcome, CommitProposal,
-	CommitStore, OpenMode, ReconcileOutcome,
+	AuthorityRoot,
+	AuthoritySession,
+	CommitCapabilities,
+	CommitOutcome,
+	CommitProposal,
+	CommitStore,
+	OpenMode,
+	ReconcileOutcome,
 };
 use crate::api::{
-	AuthorityFence, DurabilityClass, ErrorCode, KernelError, KernelResult, OperationId, SessionId,
+	AuthorityFence,
+	DurabilityClass,
+	ErrorCode,
+	KernelError,
+	KernelResult,
+	OperationId,
+	SessionId,
 };
 
 const FRAME_MAGIC: [u8; 8] = *b"SKVCMT01";

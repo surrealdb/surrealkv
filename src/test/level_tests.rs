@@ -8,7 +8,11 @@ use std::sync::Arc;
 use crate::levels::Level;
 use crate::sstable::table::{Table, TableWriter};
 use crate::{
-	InternalKey, InternalKeyKind, InternalKeyRange, Options, INTERNAL_KEY_SEQ_NUM_MAX,
+	InternalKey,
+	InternalKeyKind,
+	InternalKeyRange,
+	Options,
+	INTERNAL_KEY_SEQ_NUM_MAX,
 	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 

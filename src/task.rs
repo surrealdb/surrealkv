@@ -75,15 +75,28 @@ impl TaskManager {
 					running.store(true, Ordering::SeqCst);
 					log::debug!("Memtable flush task starting");
 
-					// Flush ALL pending immutable memtables in a loop
+					// Flush ALL pending immutable memtables in a loop. Each
+					// pass first lets the WAL-span trickle policy retire at
+					// most one cold pinned active (rotate one, flush, ask
+					// again — never a mass flush).
 					let mut flush_count = 0;
 					loop {
+						let rotated = match core.rotate_wal_pinned_runtime() {
+							Ok(rotated) => rotated,
+							Err(e) => {
+								log::error!("WAL-span trickle rotation error: {e:?}");
+								core.error_handler()
+									.set_error(e, BackgroundErrorReason::MemtablaFlush);
+								write_stall.signal_shutdown();
+								break;
+							}
+						};
 						match core.compact_memtable() {
 							Ok(()) => {
 								flush_count += 1;
 								write_stall.signal_work_done();
 								// Check if there are more immutables to flush
-								if !core.has_pending_immutables() {
+								if !rotated && !core.has_pending_immutables() {
 									break;
 								}
 							}
@@ -215,7 +228,10 @@ mod tests {
 	use crate::error::{BackgroundErrorHandler, Result};
 	use crate::lsm::CompactionOperations;
 	use crate::stall::{
-		StallCounts, StallThresholds, WriteStallController, WriteStallCountProvider,
+		StallCounts,
+		StallThresholds,
+		WriteStallController,
+		WriteStallCountProvider,
 	};
 	use crate::task::TaskManager;
 	use crate::{Error, Options};
@@ -223,7 +239,7 @@ mod tests {
 	struct NoopStallProvider;
 
 	impl WriteStallCountProvider for NoopStallProvider {
-		fn get_stall_counts(&self) -> StallCounts {
+		fn get_stall_counts(&self, _owner: crate::batch::BatchOwner) -> StallCounts {
 			StallCounts {
 				immutable_memtables: 0,
 				l0_files: 0,
@@ -661,7 +677,7 @@ mod tests {
 	}
 
 	impl WriteStallCountProvider for AboveThresholdProvider {
-		fn get_stall_counts(&self) -> StallCounts {
+		fn get_stall_counts(&self, _owner: crate::batch::BatchOwner) -> StallCounts {
 			StallCounts {
 				immutable_memtables: 0,
 				l0_files: self.l0_files,
@@ -694,7 +710,8 @@ mod tests {
 		);
 
 		let stall_clone = Arc::clone(&write_stall);
-		let writer_handle = tokio::spawn(async move { stall_clone.check().await });
+		let writer_handle =
+			tokio::spawn(async move { stall_clone.check(crate::batch::BatchOwner::DEFAULT).await });
 
 		// Let the writer enter the stall loop
 		time::sleep(Duration::from_millis(50)).await;
@@ -729,7 +746,8 @@ mod tests {
 		);
 
 		let stall_clone = Arc::clone(&write_stall);
-		let writer_handle = tokio::spawn(async move { stall_clone.check().await });
+		let writer_handle =
+			tokio::spawn(async move { stall_clone.check(crate::batch::BatchOwner::DEFAULT).await });
 
 		// Let the writer enter the stall loop
 		time::sleep(Duration::from_millis(50)).await;
@@ -766,7 +784,9 @@ mod tests {
 		let mut writer_handles = Vec::new();
 		for _ in 0..5 {
 			let stall_clone = Arc::clone(&write_stall);
-			writer_handles.push(tokio::spawn(async move { stall_clone.check().await }));
+			writer_handles.push(tokio::spawn(async move {
+				stall_clone.check(crate::batch::BatchOwner::DEFAULT).await
+			}));
 		}
 
 		// Let all writers enter the stall loop

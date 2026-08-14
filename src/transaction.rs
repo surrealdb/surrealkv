@@ -290,7 +290,7 @@ impl Transaction {
 
 		let mut snapshot = None;
 		if !mode.is_write_only() {
-			snapshot = Some(Snapshot::new(Arc::clone(&core), start_seq_num));
+			snapshot = Some(Snapshot::new_owned(Arc::clone(&core), start_seq_num, owner));
 		}
 
 		Ok(Self {
@@ -535,7 +535,7 @@ impl Transaction {
 	///
 	/// # Example
 	/// ```ignore
-	///
+	/// 
 	/// let mut iter = tx.range(b"a", b"z")?;
 	/// iter.seek_first()?;
 	/// while iter.valid() {
@@ -1108,7 +1108,7 @@ impl<'a> TransactionRangeIterator<'a> {
 
 		self.ws_encoded_key_buf.clear();
 		self.ws_encoded_key_buf.extend_from_slice(key);
-		let trailer = ((entry.seqno as u64) << 8) | (entry.kind as u64);
+		let trailer = crate::make_trailer(entry.seqno as u64, entry.kind);
 		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 		self.ws_encoded_key_buf.extend_from_slice(&entry.timestamp.to_be_bytes());
 	}
@@ -1228,8 +1228,8 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 
 		// Encode user key with MAX trailer/timestamp for >= seek
 		let mut encoded = target.to_vec();
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
+		encoded.extend_from_slice(&crate::INTERNAL_KEY_TRAILER_MAX.to_be_bytes());
+		encoded.extend_from_slice(&crate::INTERNAL_KEY_TIMESTAMP_MAX.to_be_bytes());
 		self.snapshot_iter.seek(&encoded)?;
 
 		// Position write-set at first entry >= target
@@ -1665,7 +1665,7 @@ impl<'a> TransactionHistoryIterator<'a> {
 
 		self.ws_encoded_key_buf.clear();
 		self.ws_encoded_key_buf.extend_from_slice(key);
-		let trailer = ((entry.seqno as u64) << 8) | (entry.kind as u64);
+		let trailer = crate::make_trailer(entry.seqno as u64, entry.kind);
 		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 		self.ws_encoded_key_buf.extend_from_slice(&entry.timestamp.to_be_bytes());
 	}
@@ -2073,8 +2073,8 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 
 		// Encode user key with MAX trailer/timestamp for >= seek
 		let mut encoded = target.to_vec();
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
+		encoded.extend_from_slice(&crate::INTERNAL_KEY_TRAILER_MAX.to_be_bytes());
+		encoded.extend_from_slice(&crate::INTERNAL_KEY_TIMESTAMP_MAX.to_be_bytes());
 		self.inner.seek(&encoded)?;
 
 		// Position write-set at first entry >= target

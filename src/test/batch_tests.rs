@@ -352,10 +352,13 @@ fn test_batch_version() {
 	assert_eq!(decoded_batch.starting_seq_num, 100);
 	assert_eq!(decoded_batch.version, BATCH_VERSION);
 
-	for obsolete_version in [1, 2] {
-		let mut obsolete = encoded.clone();
-		obsolete[0] = obsolete_version;
-		assert!(Batch::decode(&obsolete).is_err());
+	// Any version other than the rewrite line's is rejected by identity;
+	// derive the foreign values from the constant so renumbering cannot
+	// silently vacate this test.
+	for foreign_version in [0, BATCH_VERSION + 1] {
+		let mut foreign = encoded.clone();
+		foreign[0] = foreign_version;
+		assert!(Batch::decode(&foreign).is_err());
 	}
 }
 

@@ -52,15 +52,12 @@ pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64)
 	Ok(())
 }
 
-/// Current manifest format version
-/// Superseded single-owner layout, retained only so rejection tests can
-/// construct it; `load_from_file` rejects it by identity.
-#[cfg_attr(not(test), allow(dead_code))]
-pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
 /// Owner-partitioned manifest layout: levels are stored per physical
-/// `BatchOwner`. Earlier layouts are rejected by identity; this line carries
-/// no on-disk compatibility promise.
-pub const MANIFEST_FORMAT_VERSION_V2: u16 = 2;
+/// `BatchOwner`. This rewrite line starts at 1 and carries no on-disk
+/// compatibility promise; any other version — including earlier lines'
+/// formats — is rejected by identity, and pre-rewrite files that happen to
+/// share the number fail the structural owner validation instead.
+pub const MANIFEST_FORMAT_VERSION: u16 = 1;
 
 /// Snapshot information stored in the manifest
 #[derive(Debug, Clone)]
@@ -209,7 +206,7 @@ impl LevelManifest {
 			levels_by_owner: vec![(BatchOwner::DEFAULT, levels)],
 			hidden_set: HashSet::with_capacity(10),
 			next_table_id,
-			manifest_format_version: MANIFEST_FORMAT_VERSION_V2,
+			manifest_format_version: MANIFEST_FORMAT_VERSION,
 			snapshots: Vec::new(),
 			log_number: 0,
 			last_sequence: 0,
@@ -234,7 +231,7 @@ impl LevelManifest {
 			levels_by_owner: vec![(BatchOwner::DEFAULT, levels)],
 			hidden_set: HashSet::new(),
 			next_table_id,
-			manifest_format_version: MANIFEST_FORMAT_VERSION_V2,
+			manifest_format_version: MANIFEST_FORMAT_VERSION,
 			snapshots: Vec::new(),
 			log_number: 0,
 			last_sequence: 0,
@@ -248,6 +245,11 @@ impl LevelManifest {
 			.iter()
 			.find(|(set_owner, _)| *set_owner == owner)
 			.map(|(_, levels)| levels)
+	}
+
+	/// Every physical owner that currently has a level set, default first.
+	pub(crate) fn owners(&self) -> Vec<BatchOwner> {
+		self.levels_by_owner.iter().map(|(owner, _)| *owner).collect()
 	}
 
 	fn levels_for_mut(&mut self, owner: BatchOwner) -> Option<&mut Levels> {
@@ -312,7 +314,7 @@ impl LevelManifest {
 		// Read versioned manifest format. Earlier layouts are rejected by
 		// identity: this line makes no on-disk compatibility promise.
 		let version = level_manifest.read_u16::<BigEndian>()?;
-		if version != MANIFEST_FORMAT_VERSION_V2 {
+		if version != MANIFEST_FORMAT_VERSION {
 			return Err(Error::LoadManifestFail(format!(
 				"Unsupported manifest format version: {}",
 				version
@@ -553,7 +555,6 @@ impl LevelManifest {
 
 		output
 	}
-
 
 	pub(crate) fn unhide_tables(&mut self, keys: &[u64]) {
 		for key in keys {

@@ -10,8 +10,14 @@ use sha2::{Digest, Sha256};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
 use super::api::{
-	BranchGeneration, BranchId, CommitTimestamp, CommitVersion, ErrorCode, KernelError,
-	KernelResult, TableId,
+	BranchGeneration,
+	BranchId,
+	CommitTimestamp,
+	CommitVersion,
+	ErrorCode,
+	KernelError,
+	KernelResult,
+	TableId,
 };
 use super::format::{compare_internal, StorageRow, FORMAT_MAGIC, FORMAT_VERSION, MAX_USER_KEY_LEN};
 use super::storage::{ByteRange, ObjectBody, ObjectId, ObjectStore, Platform};
@@ -1217,8 +1223,15 @@ mod tests {
 	use super::*;
 	use crate::format::{InternalKey, RowKind};
 	use crate::storage::{
-		DeleteOutcome, ListCursor, MemoryObjectStore, ObjectCapabilities, ObjectMetadata,
-		ObjectPage, ObjectPrefix, PutOutcome, PutRequest,
+		DeleteOutcome,
+		ListCursor,
+		MemoryObjectStore,
+		ObjectCapabilities,
+		ObjectMetadata,
+		ObjectPage,
+		ObjectPrefix,
+		PutOutcome,
+		PutRequest,
 	};
 
 	fn owner() -> TableOwner {

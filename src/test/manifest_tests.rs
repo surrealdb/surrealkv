@@ -5,8 +5,11 @@ use std::sync::Arc;
 use test_log::test;
 
 use crate::levels::{
-	write_manifest_to_disk, LevelManifest, ManifestChangeSet, SnapshotInfo,
-	MANIFEST_FORMAT_VERSION_V2,
+	write_manifest_to_disk,
+	LevelManifest,
+	ManifestChangeSet,
+	SnapshotInfo,
+	MANIFEST_FORMAT_VERSION,
 };
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
@@ -130,7 +133,7 @@ fn test_level_manifest_persistence() {
 		"Next table ID not persisted correctly"
 	);
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION,
 		"Manifest version not persisted correctly"
 	);
 	assert_eq!(loaded_manifest.snapshots.len(), 2, "Snapshots not persisted correctly");
@@ -181,7 +184,7 @@ fn test_level_manifest_persistence() {
 		"Next table ID not loaded correctly in new manifest"
 	);
 	assert_eq!(
-		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
+		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION,
 		"Manifest version not loaded correctly"
 	);
 	assert_eq!(new_manifest.snapshots.len(), 2, "Snapshots not loaded correctly");
@@ -692,7 +695,7 @@ fn test_manifest_v2_with_log_number_and_last_sequence() {
 
 	// Verify format version is still V1
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION,
 		"Should be V2 format"
 	);
 
@@ -770,8 +773,14 @@ fn test_revert_added_tables_only() {
 
 	let rollback = manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
 
-	assert_eq!(manifest.default_owner_levels().get_levels()[0].tables.len(), initial_table_count_l0 + 1);
-	assert_eq!(manifest.default_owner_levels().get_levels()[1].tables.len(), initial_table_count_l1 + 2);
+	assert_eq!(
+		manifest.default_owner_levels().get_levels()[0].tables.len(),
+		initial_table_count_l0 + 1
+	);
+	assert_eq!(
+		manifest.default_owner_levels().get_levels()[1].tables.len(),
+		initial_table_count_l1 + 2
+	);
 
 	manifest.revert_changeset(rollback);
 
@@ -826,8 +835,14 @@ fn test_revert_deleted_tables_only() {
 
 	let rollback = manifest.apply_changeset(&delete_changeset).expect("Failed to apply changeset");
 
-	assert_eq!(manifest.default_owner_levels().get_levels()[0].tables.len(), initial_table_count_l0 - 2);
-	assert_eq!(manifest.default_owner_levels().get_levels()[1].tables.len(), initial_table_count_l1 - 1);
+	assert_eq!(
+		manifest.default_owner_levels().get_levels()[0].tables.len(),
+		initial_table_count_l0 - 2
+	);
+	assert_eq!(
+		manifest.default_owner_levels().get_levels()[1].tables.len(),
+		initial_table_count_l1 - 1
+	);
 
 	manifest.revert_changeset(rollback);
 
@@ -888,7 +903,10 @@ fn test_revert_mixed_add_delete() {
 
 	let rollback = manifest.apply_changeset(&mixed_changeset).expect("Failed to apply changeset");
 
-	assert_eq!(manifest.default_owner_levels().get_levels()[0].tables.len(), initial_table_count_l0);
+	assert_eq!(
+		manifest.default_owner_levels().get_levels()[0].tables.len(),
+		initial_table_count_l0
+	);
 	assert!(manifest.default_owner_levels().get_levels()[0].tables.iter().any(|t| t.id == 3));
 	assert!(!manifest.default_owner_levels().get_levels()[0].tables.iter().any(|t| t.id == 1));
 
@@ -1291,7 +1309,11 @@ fn test_revert_multiple_tables_same_level() {
 
 	manifest.revert_changeset(rollback);
 
-	assert_eq!(manifest.default_owner_levels().get_levels()[0].tables.len(), 0, "All tables should be removed");
+	assert_eq!(
+		manifest.default_owner_levels().get_levels()[0].tables.len(),
+		0,
+		"All tables should be removed"
+	);
 }
 
 #[test]
@@ -1330,7 +1352,11 @@ fn test_revert_table_only_one_in_level() {
 
 	manifest.revert_changeset(rollback);
 
-	assert_eq!(manifest.default_owner_levels().get_levels()[1].tables.len(), 1, "Single table should be restored");
+	assert_eq!(
+		manifest.default_owner_levels().get_levels()[1].tables.len(),
+		1,
+		"Single table should be restored"
+	);
 	assert_eq!(manifest.default_owner_levels().get_levels()[1].tables[0].id, 1);
 }
 
@@ -1358,7 +1384,11 @@ fn test_revert_idempotent() {
 
 	let rollback = manifest.apply_changeset(&changeset).expect("Failed to apply changeset");
 
-	assert_eq!(manifest.default_owner_levels().get_levels()[0].tables.len(), 1, "Table should be added");
+	assert_eq!(
+		manifest.default_owner_levels().get_levels()[0].tables.len(),
+		1,
+		"Table should be added"
+	);
 
 	// Revert once
 	manifest.revert_changeset(rollback);
@@ -1589,7 +1619,8 @@ fn br3_changeset_owner_mismatch_fails_closed_before_mutation() {
 	let opts = br3_test_opts();
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
 
-	let foreign_table = create_owned_test_table(1, foreign_owner(), 1, 5, Arc::clone(&opts)).unwrap();
+	let foreign_table =
+		create_owned_test_table(1, foreign_owner(), 1, 5, Arc::clone(&opts)).unwrap();
 
 	// Non-vacuity: the same table applies cleanly under its own owner.
 	let matching = ManifestChangeSet {
@@ -1623,7 +1654,8 @@ fn br3_on_disk_owner_mismatch_fails_closed_on_open() {
 	let opts = br3_test_opts();
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
 
-	let foreign_table = create_owned_test_table(1, foreign_owner(), 1, 5, Arc::clone(&opts)).unwrap();
+	let foreign_table =
+		create_owned_test_table(1, foreign_owner(), 1, 5, Arc::clone(&opts)).unwrap();
 
 	// Bypass apply-time validation via the test-only mutable accessor to
 	// craft the corrupt state: a foreign-owner table inside the DEFAULT set.
@@ -1646,8 +1678,9 @@ fn br3_duplicate_table_listing_fails_closed_on_open() {
 	let opts = br3_test_opts();
 	let mut manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
 
-	let table = create_owned_test_table(1, crate::batch::BatchOwner::DEFAULT, 1, 5, Arc::clone(&opts))
-		.unwrap();
+	let table =
+		create_owned_test_table(1, crate::batch::BatchOwner::DEFAULT, 1, 5, Arc::clone(&opts))
+			.unwrap();
 	// Craft the corrupt double listing (L0 and L1) via the test-only accessor.
 	Arc::make_mut(&mut manifest.default_owner_levels_mut().get_levels_mut()[0])
 		.insert(Arc::clone(&table));
@@ -1661,24 +1694,27 @@ fn br3_duplicate_table_listing_fails_closed_on_open() {
 	assert!(err.contains("listed more than once"), "error must name the duplication: {err}");
 }
 
-/// The superseded single-owner V1 layout is rejected by identity.
+/// Any manifest version other than the rewrite line's is rejected by
+/// identity, before structural decoding.
 #[test]
-fn br3_v1_manifest_is_rejected_by_identity() {
+fn br3_foreign_manifest_version_is_rejected_by_identity() {
 	use byteorder::{BigEndian, WriteBytesExt};
 
-	let opts = br3_test_opts();
-	let manifest_path = opts.manifest_file_path(0);
-	let mut buf = Vec::new();
-	buf.write_u16::<BigEndian>(crate::levels::MANIFEST_FORMAT_VERSION_V1).unwrap();
-	buf.write_u64::<BigEndian>(1).unwrap(); // next_table_id
-	buf.write_u64::<BigEndian>(0).unwrap(); // log_number
-	buf.write_u64::<BigEndian>(0).unwrap(); // last_sequence
-	fs::write(&manifest_path, &buf).unwrap();
+	for foreign_version in [0u16, crate::levels::MANIFEST_FORMAT_VERSION + 1] {
+		let opts = br3_test_opts();
+		let manifest_path = opts.manifest_file_path(0);
+		let mut buf = Vec::new();
+		buf.write_u16::<BigEndian>(foreign_version).unwrap();
+		buf.write_u64::<BigEndian>(1).unwrap(); // next_table_id
+		buf.write_u64::<BigEndian>(0).unwrap(); // log_number
+		buf.write_u64::<BigEndian>(0).unwrap(); // last_sequence
+		fs::write(&manifest_path, &buf).unwrap();
 
-	let result = LevelManifest::load_from_file(&manifest_path, Arc::clone(&opts));
-	let err = result.err().expect("V1 manifest must be rejected").to_string();
-	assert!(
-		err.contains("Unsupported manifest format version: 1"),
-		"rejection must name the version: {err}"
-	);
+		let result = LevelManifest::load_from_file(&manifest_path, Arc::clone(&opts));
+		let err = result.err().expect("foreign version must be rejected").to_string();
+		assert!(
+			err.contains(&format!("Unsupported manifest format version: {foreign_version}")),
+			"rejection must name the version: {err}"
+		);
+	}
 }

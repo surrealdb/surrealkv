@@ -180,7 +180,8 @@ fn create_test_manifest(
 	let next_table_id = max_table_id + 1000;
 
 	// Create the manifest with next_table_id
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(next_table_id)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(next_table_id)));
 
 	// Write the manifest to disk
 	write_manifest_to_disk(&manifest)?;
@@ -441,7 +442,8 @@ fn test_level_selection_score_based() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest_score");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -602,7 +604,8 @@ async fn test_simple_merge_compaction() {
 	// Use a safe starting value for next_table_id
 	let next_table_id = max_table_id + 1000;
 
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(next_table_id)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(next_table_id)));
 
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -1250,7 +1253,8 @@ async fn test_compaction_with_large_keys_and_values() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -1320,7 +1324,8 @@ async fn test_compaction_respects_sequence_numbers() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -1400,7 +1405,8 @@ async fn test_tombstone_propagation() {
 	Arc::make_mut(&mut levels.get_levels_mut()[0]).insert(table);
 
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1491,7 +1497,8 @@ async fn test_l0_overlapping_keys_compaction() {
 
 	// Create manifest and run compaction
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1598,7 +1605,8 @@ async fn test_l0_tombstone_propagation_overlapping() {
 
 	// Create manifest and run compaction
 	let manifest_path = env.options.path.join("test_manifest_tombstone");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1706,7 +1714,8 @@ async fn test_tombstone_propagation_through_levels() {
 
 	// Create manifest and run L2→L3 compaction (bottom level)
 	let manifest_path = env.options.path.join("test_manifest_propagation");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -1979,7 +1988,8 @@ async fn test_soft_delete_compaction_behavior() {
 
 	// Create manifest and run L0→L1 compaction
 	let manifest_path = env.options.path.join("test_manifest_soft_delete");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2113,7 +2123,8 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 
 	// Create manifest and run compaction
 	let manifest_path = env.options.path.join("test_manifest_older_soft_delete");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2634,7 +2645,8 @@ fn test_clean_cut_shared_boundary_key() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2688,7 +2700,8 @@ fn test_clean_cut_chain_expansion() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2734,7 +2747,8 @@ fn test_clean_cut_no_expansion_needed() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2794,7 +2808,8 @@ fn test_clean_cut_integration_shared_boundary() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2861,7 +2876,8 @@ fn test_clean_cut_integration_chain_expansion() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2920,7 +2936,8 @@ fn test_clean_cut_integration_with_oldest_seq_priority() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
@@ -2979,7 +2996,8 @@ fn test_clean_cut_integration_no_expansion() {
 
 	// Create manifest
 	let manifest_path = env.options.path.join("test_manifest");
-	let manifest = LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
+	let manifest =
+		LevelManifest::new_for_test(manifest_path, levels, Arc::new(AtomicU64::new(1000)));
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 

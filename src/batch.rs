@@ -7,11 +7,20 @@ pub(crate) const MAX_BATCH_SIZE: u64 = 1 << 32;
 /// Inline-only batch encoding version. The sequence number is fixed-width so
 /// the commit pipeline can stamp it in place. Earlier, incompatible layouts
 /// are intentionally rejected.
-pub(crate) const BATCH_VERSION: u8 = 4;
+/// Batch format version. This rewrite line starts at 1 and carries no
+/// on-disk compatibility promise; decode rejects any other version.
+pub(crate) const BATCH_VERSION: u8 = 1;
+
+/// Fixed-width batch header layout. `encode`, `decode`, and
+/// `patch_encoded_seq` all derive from these constants; changing the header
+/// means changing exactly these, nowhere else.
+pub(crate) const BATCH_HEADER_VERSION_OFFSET: usize = 0;
+pub(crate) const BATCH_HEADER_SEQ_OFFSET: usize = 1;
+pub(crate) const BATCH_HEADER_SEQ_LEN: usize = 8;
 
 /// Physical owner of every row in a commit batch. Ownership stays in the
 /// batch/component metadata and is deliberately not prefixed into user keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct BatchOwner {
 	pub(crate) branch: BranchId,
 	pub(crate) generation: BranchGeneration,
@@ -20,7 +29,7 @@ pub(crate) struct BatchOwner {
 impl BatchOwner {
 	/// Owner used by the existing single-branch runtime during integration.
 	pub(crate) const DEFAULT: Self = Self {
-		branch: BranchId([0; 16]),
+		branch: BranchId::DEFAULT,
 		generation: BranchGeneration(0),
 	};
 }
@@ -87,12 +96,15 @@ impl Batch {
 		let mut encoded = Vec::new();
 
 		// Write version (1 byte)
+		debug_assert_eq!(encoded.len(), BATCH_HEADER_VERSION_OFFSET);
 		encoded.push(self.version);
 
 		// Write sequence number (fixed-width 8-byte LE).
 		// Fixed width (vs varint) lets the commit pipeline stamp the seq in
 		// place after pre-encoding off the write lock — see `patch_encoded_seq`.
+		debug_assert_eq!(encoded.len(), BATCH_HEADER_SEQ_OFFSET);
 		encoded.extend_from_slice(&self.starting_seq_num.to_le_bytes());
+		debug_assert_eq!(encoded.len(), BATCH_HEADER_SEQ_OFFSET + BATCH_HEADER_SEQ_LEN);
 
 		// Write branch identity and generation. These bytes identify the
 		// component owner; user keys remain unchanged.
@@ -131,9 +143,16 @@ impl Batch {
 	/// can pre-encode a batch off the write lock with a placeholder seq and then
 	/// stamp the real seq under the lock with no re-encode and no copy.
 	pub(crate) fn patch_encoded_seq(buf: &mut [u8], seq: u64) {
-		debug_assert!(buf.len() >= 9, "encoded batch too short to patch seq");
-		debug_assert_eq!(buf[0], BATCH_VERSION, "unexpected batch version");
-		buf[1..9].copy_from_slice(&seq.to_le_bytes());
+		debug_assert!(
+			buf.len() >= BATCH_HEADER_SEQ_OFFSET + BATCH_HEADER_SEQ_LEN,
+			"encoded batch too short to patch seq"
+		);
+		debug_assert_eq!(
+			buf[BATCH_HEADER_VERSION_OFFSET], BATCH_VERSION,
+			"unexpected batch version"
+		);
+		buf[BATCH_HEADER_SEQ_OFFSET..BATCH_HEADER_SEQ_OFFSET + BATCH_HEADER_SEQ_LEN]
+			.copy_from_slice(&seq.to_le_bytes());
 	}
 
 	#[cfg(test)]
@@ -258,7 +277,9 @@ impl Batch {
 			return Err(Error::InvalidBatchRecord);
 		}
 
-		let seq_num = u64::from_le_bytes(take(data, &mut pos, 8)?.try_into().unwrap());
+		debug_assert_eq!(pos, BATCH_HEADER_SEQ_OFFSET, "decode drifted from the header layout");
+		let seq_num =
+			u64::from_le_bytes(take(data, &mut pos, BATCH_HEADER_SEQ_LEN)?.try_into().unwrap());
 		let mut branch = [0; 16];
 		branch.copy_from_slice(take(data, &mut pos, 16)?);
 		let generation = u64::from_le_bytes(take(data, &mut pos, 8)?.try_into().unwrap());

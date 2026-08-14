@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::Batch;
-use crate::branch_runtime::BranchRuntime;
+use crate::branch_runtime::{BranchRuntime, BranchRuntimeRegistry};
 use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
 use crate::commit::{CommitEnv, CommitPipeline, PreparedWrite};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
@@ -15,16 +15,19 @@ use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lockfile::LockFile;
-use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
+use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::Table;
 use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
-use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::dependency::WalDependencyTracker;
+use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
-use crate::{Comparator, Error, FilterPolicy, LSMIterator, Options, WalRecoveryMode};
+use crate::{Comparator, Error, FilterPolicy, Options, WalRecoveryMode};
+
+/// Replayed memtables paired with the WAL segment each was recovered from.
+pub(crate) type RecoveredMemtables = Vec<(Arc<MemTable>, u64)>;
 
 // ===== Compaction Operations Trait =====
 /// Defines the compaction operations that can be performed on an LSM tree.
@@ -45,6 +48,13 @@ pub trait CompactionOperations: Send + Sync {
 
 	/// Returns true if there are immutable memtables pending flush.
 	fn has_pending_immutables(&self) -> bool;
+
+	/// Rotates at most ONE runtime whose non-empty active memtable pins a WAL
+	/// segment too far behind the active one (the trickle WAL-span policy).
+	/// Returns whether a victim was rotated. Default: no policy.
+	fn rotate_wal_pinned_runtime(&self) -> Result<bool> {
+		Ok(false)
+	}
 }
 
 // ===== Core LSM Tree Implementation =====
@@ -84,8 +94,12 @@ pub(crate) struct CoreInner {
 	/// memtable (write buffer), the immutable-memtable flush queue, and the
 	/// owned level manifest. `CoreInner` temporarily dereferences to this
 	/// runtime so existing call sites keep using the same objects while the
-	/// extraction proceeds; later slices make runtimes lazy and owner-indexed.
-	pub(crate) default_runtime: BranchRuntime,
+	/// extraction proceeds. The same `Arc` is the registry's default entry.
+	pub(crate) default_runtime: Arc<BranchRuntime>,
+
+	/// Owner-indexed runtimes. Non-default runtimes are created lazily on the
+	/// owner's first routed write; an idle branch allocates no arena.
+	pub(crate) runtimes: BranchRuntimeRegistry,
 
 	/// Configuration options controlling LSM tree behavior
 	pub opts: Arc<Options>,
@@ -135,7 +149,18 @@ impl std::ops::Deref for CoreInner {
 
 impl CoreInner {
 	/// Creates a new LSM tree core instance
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		Self::new_impl(opts, None)
+	}
+
+	/// The catalog-at-open is recovery's fencing authority. Until the fork
+	/// lifecycle slice lands durable catalogs, production opens with the
+	/// default-only catalog; tests inject prepared catalogs here.
+	fn new_impl(
+		opts: Arc<Options>,
+		initial_catalog: Option<crate::branch::BranchCatalog>,
+	) -> Result<Self> {
 		// Acquire database lock to prevent multiple processes from opening the same
 		// database
 		let mut lockfile = LockFile::new(&opts.path);
@@ -159,7 +184,23 @@ impl CoreInner {
 
 		// Initialize active memtable with its WAL number set to the initial WAL
 		// This tracks which WAL the memtable's data belongs to for later flush
-		let branch_catalog = crate::branch::BranchCatalog::new(crate::BranchId([0; 16]));
+		let branch_catalog = initial_catalog
+			.unwrap_or_else(|| crate::branch::BranchCatalog::new(crate::BranchId::DEFAULT));
+		// The engine addresses the default branch by the reserved
+		// `BranchId::DEFAULT` in every batch, memtable, and SST. A catalog —
+		// built-in or injected — that cannot validate that identity would
+		// fence every default transaction, so refuse it at open.
+		if branch_catalog
+			.validate_owner(
+				crate::batch::BatchOwner::DEFAULT.branch,
+				crate::batch::BatchOwner::DEFAULT.generation,
+			)
+			.is_err()
+		{
+			return Err(Error::InvalidArgument(
+				"branch catalog does not validate the reserved default branch identity".to_owned(),
+			));
+		}
 		let initial_memtable = Arc::new(MemTable::new_owned(
 			opts.max_memtable_size,
 			crate::batch::BatchOwner::DEFAULT,
@@ -169,22 +210,24 @@ impl CoreInner {
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
-		let default_runtime = BranchRuntime::new(
+		let default_runtime = Arc::new(BranchRuntime::new(
 			crate::batch::BatchOwner::DEFAULT,
 			active_memtable,
 			immutable_memtables,
 			level_manifest,
-		);
+		));
 		if !default_runtime.validate_component_owners() {
 			return Err(Error::ManifestCorruption(
 				"default branch runtime contains a foreign-owned component".to_owned(),
 			));
 		}
+		let runtimes = BranchRuntimeRegistry::new(Arc::clone(&default_runtime));
 
 		Ok(Self {
 			branch_catalog: RwLock::new(branch_catalog),
 			opts,
 			default_runtime,
+			runtimes,
 			snapshot_tracker: SnapshotTracker::new(),
 			active_txn_tracker: Arc::new(crate::tracker::ActiveTxnTracker::new()),
 			wal: WalManager::new(wal_instance),
@@ -193,22 +236,6 @@ impl CoreInner {
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
 		})
-	}
-
-	pub(crate) fn immutable_count(&self) -> usize {
-		self.immutable_memtables.read().map(|imm| imm.iter().count()).unwrap_or(0)
-	}
-
-	pub(crate) fn l0_file_count(&self) -> usize {
-		let owner = self.default_runtime.owner();
-		self.level_manifest
-			.read()
-			.map(|m| {
-				m.levels_for(owner)
-					.and_then(|levels| levels.get_levels().first().map(|l| l.tables.len()))
-					.unwrap_or(0)
-			})
-			.unwrap_or(0)
 	}
 
 	/// Smallest `start_seq_num` of any currently-live transaction (read-write
@@ -267,12 +294,17 @@ impl CoreInner {
 		// branches), so flushing one component does not prove the whole segment
 		// reclaimable.
 		let current_wal_segment = self.wal.read().get_active_log_number();
-		let dependency_snapshot = self.wal_dependencies.snapshot_excluding(
-			Some(memtable.dependency_id()),
-			current_wal_segment,
-		);
+		let dependency_snapshot = self
+			.wal_dependencies
+			.snapshot_excluding(Some(memtable.dependency_id()), current_wal_segment);
+		let owning_runtime = self.runtimes.get(memtable.owner()).ok_or_else(|| {
+			Error::Other(format!(
+				"flushing memtable for owner {:?} with no live runtime",
+				memtable.owner()
+			))
+		})?;
 		let mut manifest = self.level_manifest.write()?;
-		let mut memtable_lock = self.immutable_memtables.write()?;
+		let mut memtable_lock = owning_runtime.immutable_memtables.write()?;
 		let replay_floor = dependency_snapshot.replay_floor;
 		let mut changeset = ManifestChangeSet {
 			owner: memtable.owner(),
@@ -318,50 +350,230 @@ impl CoreInner {
 		Ok(table)
 	}
 
+	/// Installs replayed memtables per owner, mirroring the single-branch
+	/// policy uniformly: for each owner, all-but-last flush to the owner's
+	/// level set immediately; the last becomes the owner's runtime active
+	/// memtable. Foreign runtimes are created here — they hold data, so they
+	/// are not idle. Finally every runtime's active memtable is given the
+	/// current WAL baseline (an empty active starts on the current segment; a
+	/// recovered active keeps its recovered dependency, since record takes
+	/// the min, while noting the current segment for future writes).
+	pub(crate) fn install_recovered_memtables(
+		&self,
+		recovered: RecoveredMemtables,
+		context: &str,
+	) -> Result<()> {
+		let mut recovered_by_owner: Vec<(crate::batch::BatchOwner, RecoveredMemtables)> =
+			Vec::new();
+		for (memtable, wal_number) in recovered {
+			let owner = memtable.owner();
+			match recovered_by_owner.iter_mut().find(|(existing, _)| *existing == owner) {
+				Some((_, list)) => list.push((memtable, wal_number)),
+				None => recovered_by_owner.push((owner, vec![(memtable, wal_number)])),
+			}
+		}
+		for (owner, mut owner_memtables) in recovered_by_owner {
+			let runtime = if owner == crate::batch::BatchOwner::DEFAULT {
+				Arc::clone(&self.default_runtime)
+			} else {
+				self.runtimes.get_or_create(
+					owner,
+					self.opts.branch_memtable_size,
+					&self.default_runtime.level_manifest,
+				)?
+			};
+
+			let (last_memtable, last_wal_number) =
+				owner_memtables.pop().expect("group is non-empty");
+
+			for (memtable, wal_number) in owner_memtables {
+				if memtable.is_empty() {
+					continue;
+				}
+				self.wal_dependencies.register_component(memtable.dependency_id(), wal_number);
+				let table_id = self.level_manifest.read()?.next_table_id();
+				self.flush_immutable_to_sst(Arc::clone(&memtable), table_id, wal_number)?;
+				log::info!(
+					"{context}: flushed memtable to SST table_id={table_id}, owner={owner:?}, wal_number={wal_number}"
+				);
+			}
+
+			self.wal_dependencies
+				.register_component(last_memtable.dependency_id(), last_memtable.get_wal_number());
+			log::info!(
+				"{context}: installing last memtable (owner={owner:?}, wal={last_wal_number}) as the runtime active"
+			);
+			let mut active_memtable = runtime.active_memtable.write()?;
+			*active_memtable = last_memtable;
+		}
+
+		let current_wal_number = self.wal.read().get_active_log_number();
+		for runtime in self.runtimes.all() {
+			let active_memtable = runtime.active_memtable.read()?;
+			if active_memtable.is_empty() {
+				active_memtable.set_wal_number(current_wal_number);
+			} else {
+				active_memtable.record_wal_dependency(current_wal_number);
+			}
+		}
+
+		Ok(())
+	}
+
 	/// Rotates the active memtable to the immutable queue WITHOUT flushing to SST.
 	/// This is a fast operation (no disk I/O) that:
-	/// 1. Rotates WAL to a new file
-	/// 2. Swaps active memtable with a fresh one
-	/// 3. Adds old memtable to immutable queue
+	/// 1. Swaps the active memtable with a fresh one
+	/// 2. Adds the old memtable to the immutable queue
 	///
-	/// The actual SST flush happens asynchronously via background task.
+	/// The default-runtime convenience wrapper; see
+	/// [`Self::rotate_runtime_memtable`].
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn rotate_memtable(&self) -> Result<()> {
-		// Step 1: Acquire WRITE lock upfront to prevent race conditions
-		let mut active_memtable = self.active_memtable.write()?;
+		self.rotate_runtime_memtable(&self.default_runtime, 0)
+	}
 
-		if active_memtable.is_empty() {
+	/// Database-wide mutable-memory budget. When configured and the incoming
+	/// allocation would exceed it, the largest active memtable across all
+	/// runtimes is rotated toward flush. Best-effort back-pressure: failures
+	/// here never fail the write (the budget bounds memory, not correctness).
+	///
+	/// Returns whether a rotation happened. The caller must then schedule the
+	/// memtable flush task: it is event-driven, and an unflushed budget
+	/// rotation both reclaims no memory and can park the victim's next write
+	/// in the stall loop waiting for a flush that was never scheduled.
+	pub(crate) fn enforce_write_buffer_budget(&self, incoming_bytes: u64) -> bool {
+		let Some(budget) = self.opts.write_buffer_budget else {
+			return false;
+		};
+		let total = self.runtimes.total_arena_capacity_bytes();
+		if total.saturating_add(incoming_bytes) <= budget {
+			return false;
+		}
+		// Victim = largest non-empty active memtable.
+		let victim = self
+			.runtimes
+			.all()
+			.into_iter()
+			.filter(|runtime| {
+				runtime.active_memtable.read().map(|memtable| !memtable.is_empty()).unwrap_or(false)
+			})
+			.max_by_key(|runtime| {
+				runtime.active_memtable.read().map(|memtable| memtable.size() as u64).unwrap_or(0)
+			});
+		if let Some(victim) = victim {
+			log::debug!(
+				"write-buffer budget exceeded (total={total}, incoming={incoming_bytes}, budget={budget}); rotating owner {:?}",
+				victim.owner()
+			);
+			match self.rotate_runtime_memtable(&victim, 0) {
+				Ok(()) => return true,
+				Err(error) => log::warn!("budget-driven rotation failed: {error}"),
+			}
+		}
+		false
+	}
+
+	/// Rotates at most ONE runtime whose non-empty active memtable pins a WAL
+	/// segment at least `wal_pinned_segment_limit` segments behind the active
+	/// one — the victim with the OLDEST pinned segment. One victim per call
+	/// keeps reclaim a trickle, never a reclaim-triggered mass flush: the
+	/// memtable task flushes the rotated victim before asking again.
+	pub(crate) fn rotate_wal_pinned_runtime_impl(&self) -> Result<bool> {
+		let limit = self.opts.wal_pinned_segment_limit as u64;
+		let current_segment = self.wal.read().get_active_log_number();
+		let victim = self
+			.runtimes
+			.all()
+			.into_iter()
+			.filter_map(|runtime| {
+				let pinned = {
+					let active = runtime.active_memtable.read().ok()?;
+					if active.is_empty() {
+						return None;
+					}
+					active.get_wal_number()
+				};
+				(pinned.saturating_add(limit) <= current_segment).then_some((pinned, runtime))
+			})
+			.min_by_key(|(pinned, _)| *pinned);
+
+		match victim {
+			Some((pinned, runtime)) => {
+				log::debug!(
+					"WAL-span trickle: rotating owner {:?} pinned at segment {} (active segment {})",
+					runtime.owner(),
+					pinned,
+					current_segment
+				);
+				self.rotate_runtime_memtable(&runtime, 0)?;
+				Ok(true)
+			}
+			None => Ok(false),
+		}
+	}
+
+	/// Rotates one branch runtime's memtable **without rotating the shared
+	/// WAL**. Branch rotations are independent: the retired memtable keeps
+	/// pinning the WAL segments it actually depends on (BR1 dependency
+	/// tracking), and the WAL rotates on its own size policy at append time.
+	///
+	/// `min_capacity` right-sizes the replacement arena: a rotation forced by
+	/// a batch larger than the branch arena must produce an arena that can
+	/// hold that batch, or a WAL-durable batch could never apply.
+	pub(crate) fn rotate_runtime_memtable(
+		&self,
+		runtime: &BranchRuntime,
+		min_capacity: usize,
+	) -> Result<()> {
+		// Acquire WRITE lock upfront to prevent race conditions
+		let mut active_memtable = runtime.active_memtable.write()?;
+
+		if active_memtable.is_empty() && (min_capacity as u64) <= active_memtable.arena_available()
+		{
 			return Ok(());
 		}
 
-		log::debug!("rotate_memtable: rotating memtable size={}", active_memtable.size());
-
-		// Step 2: Rotate WAL while STILL holding memtable write lock
-		let (flushed_wal_number, new_wal_number) = {
-			let mut wal_guard = self.wal.write();
-			let old_log_number = wal_guard.get_active_log_number();
-			wal_guard.rotate().map_err(|e| {
-				Error::Other(format!("Failed to rotate WAL before memtable rotation: {}", e))
-			})?;
-			let new_log_number = wal_guard.get_active_log_number();
-			drop(wal_guard);
-
-			log::debug!(
-				"WAL rotated during memtable rotation: {} -> {}",
-				old_log_number,
-				new_log_number
-			);
-			(old_log_number, new_log_number)
-		};
-
-		// Step 3: Swap memtable while STILL holding write lock
-		let owner = self.default_runtime.owner();
-		let flushed_memtable = std::mem::replace(
-			&mut *active_memtable,
-			Arc::new(MemTable::new_owned(self.opts.max_memtable_size, owner)),
+		log::debug!(
+			"rotate_runtime_memtable: owner={:?} size={}",
+			runtime.owner(),
+			active_memtable.size()
 		);
 
-		// Set the WAL number on the new (empty) active memtable
-		active_memtable.set_wal_number(new_wal_number);
+		// The retired memtable's recorded WAL number is its earliest actual
+		// dependency segment (`record_wal_dependency` keeps the min); it
+		// travels with it into the immutable queue, and replay floors come
+		// from the dependency tracker.
+		let flushed_wal_number = active_memtable.get_wal_number();
+		let current_wal_number = self.wal.read().get_active_log_number();
+		let retiree_is_empty = active_memtable.is_empty();
+
+		let base_capacity = if runtime.owner() == crate::batch::BatchOwner::DEFAULT {
+			self.opts.max_memtable_size
+		} else {
+			self.opts.branch_memtable_size
+		};
+
+		// Right-size against the reservation formula, not raw capacity (see
+		// `MemTable::new_owned_admitting`): a replacement sized exactly to
+		// the batch estimate could never admit it and a WAL-durable batch
+		// would permanently fail to apply.
+		let owner = runtime.owner();
+		let replacement =
+			Arc::new(MemTable::new_owned_admitting(base_capacity, min_capacity as u64, owner));
+
+		// Swap memtable while STILL holding write lock
+		let flushed_memtable = std::mem::replace(&mut *active_memtable, replacement);
+
+		// The new (empty) memtable starts on the currently active segment.
+		active_memtable.set_wal_number(current_wal_number);
+
+		// An empty retiree (a right-sizing rotation) carries no data and no
+		// recorded dependencies; queueing it would only occupy the flush path.
+		if retiree_is_empty {
+			drop(active_memtable);
+			log::debug!("rotate_runtime_memtable: right-sized empty memtable, owner={owner:?}");
+			return Ok(());
+		}
 
 		// LOCK ORDER: Get table_id from manifest BEFORE acquiring immutable_memtables lock.
 		// This maintains consistent ordering: level_manifest -> immutable_memtables
@@ -372,7 +584,7 @@ impl CoreInner {
 		//   Thread B (flush):  holds manifest.write, waits imm.write
 		// By acquiring manifest.read first, we ensure no circular wait.
 		let table_id = self.level_manifest.read()?.next_table_id();
-		let mut immutable_memtables = self.immutable_memtables.write()?;
+		let mut immutable_memtables = runtime.immutable_memtables.write()?;
 		immutable_memtables.add(table_id, flushed_wal_number, Arc::clone(&flushed_memtable));
 
 		// Release locks
@@ -380,7 +592,8 @@ impl CoreInner {
 		drop(immutable_memtables);
 
 		log::debug!(
-			"rotate_memtable: completed rotation, table_id={}, wal_number={}",
+			"rotate_runtime_memtable: completed rotation, owner={:?}, table_id={}, wal_number={}",
+			owner,
 			table_id,
 			flushed_wal_number
 		);
@@ -388,17 +601,33 @@ impl CoreInner {
 		Ok(())
 	}
 
-	/// Flushes the oldest immutable memtable to an SSTable.
-	/// Returns Ok(Some(table)) if a memtable was flushed, Ok(None) if queue was empty.
-	///
-	/// This method:
-	/// 1. Gets the oldest entry from immutable queue (lowest table_id)
-	/// 2. Flushes it to SST via flush_immutable_to_sst (which also removes from queue)
-	/// 3. Schedules async WAL cleanup
+	/// Flushes the oldest immutable memtable of the first runtime with a
+	/// non-empty queue (default runtime first) to an SSTable. One memtable
+	/// per call; the background task loops until every queue drains.
+	/// Returns Ok(Some(table)) if a memtable was flushed, Ok(None) if every
+	/// queue was empty.
 	fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
+		if let Some(table) = self.flush_oldest_immutable_for_runtime(&self.default_runtime)? {
+			return Ok(Some(table));
+		}
+		for runtime in self.runtimes.all() {
+			if runtime.owner() == self.default_runtime.owner() {
+				continue;
+			}
+			if let Some(table) = self.flush_oldest_immutable_for_runtime(&runtime)? {
+				return Ok(Some(table));
+			}
+		}
+		Ok(None)
+	}
+
+	fn flush_oldest_immutable_for_runtime(
+		&self,
+		runtime: &BranchRuntime,
+	) -> Result<Option<Arc<Table>>> {
 		// Get the oldest immutable entry (clone to release lock before I/O)
 		let entry = {
-			let guard = self.immutable_memtables.read()?;
+			let guard = runtime.immutable_memtables.read()?;
 			guard.first().cloned()
 		};
 
@@ -412,7 +641,7 @@ impl CoreInner {
 
 		// Skip empty memtables
 		if entry.memtable.is_empty() {
-			let mut guard = self.immutable_memtables.write()?;
+			let mut guard = runtime.immutable_memtables.write()?;
 			guard.remove(entry.table_id);
 			self.wal_dependencies.release_component(entry.memtable.dependency_id());
 			log::debug!(
@@ -472,7 +701,7 @@ impl CoreInner {
 	/// Flushes ALL immutable memtables synchronously.
 	/// Used by Tree::flush() and checkpoint for forced/sync flush.
 	/// Blocks until all immutables are written to SST.
-	pub(crate) fn flush_all_immutables_sync(&self) -> Result<()> {
+	pub(crate) fn flush_all_immutables_sync(&self) -> Result<usize> {
 		let mut count = 0;
 		while self.flush_oldest_immutable_to_sst()?.is_some() {
 			count += 1;
@@ -480,96 +709,7 @@ impl CoreInner {
 		if count > 0 {
 			log::debug!("flush_all_immutables_sync: flushed {} immutable memtables", count);
 		}
-		Ok(())
-	}
-
-	/// Flushes active memtable to SST and updates manifest log_number.
-	///
-	/// This is the core flush logic used by both shutdown and normal memtable
-	/// rotation. Unlike `make_room_for_write`, this does NOT rotate the WAL -
-	/// the caller is responsible for WAL rotation if needed.
-	///
-	/// # Arguments
-	///
-	/// - `flushed_wal_number`: Optional WAL number that was flushed. If provided, log_number will
-	///   be set to `flushed_wal_number + 1`. If None, uses current active WAL number.
-	///
-	/// # Returns
-	///
-	/// - `Ok(Some(table))` if flush occurred successfully
-	/// - `Ok(None)` if memtable was empty (nothing to flush)
-	/// - `Err(_)` on failure
-	///
-	/// # Flush Process
-	///
-	/// The flush process follows these steps:
-	/// 1. Memtable is swapped and marked as immutable
-	/// 2. Immutable memtable is flushed to SST file
-	/// 3. SST is added to Level 0
-	/// 4. Manifest log_number is updated to mark flushed WALs
-	/// 5. This marks all previous WALs as flushed
-	fn flush_memtable_and_update_manifest(
-		&self,
-		flushed_wal_number: Option<u64>,
-	) -> Result<Option<Arc<Table>>> {
-		// Step 1: Atomically swap active memtable with a new empty one
-		let mut active_memtable = self.active_memtable.write()?;
-
-		// Don't flush an empty memtable
-		if active_memtable.is_empty() {
-			return Ok(None);
-		}
-
-		// LOCK ORDER: Get table_id from manifest BEFORE acquiring immutable_memtables lock.
-		// This maintains consistent ordering: active -> level_manifest -> immutable_memtables
-		// which matches flush_immutable_to_sst() and prevents deadlock with background flush.
-		let table_id = self.level_manifest.read()?.next_table_id();
-
-		let mut immutable_memtables = self.immutable_memtables.write()?;
-
-		// Get the current WAL number for the new memtable
-		let current_wal_number = self.wal.read().get_active_log_number();
-		let owner = self.default_runtime.owner();
-
-		// Swap the active memtable with a new empty one
-		// This allows writes to continue immediately
-		let flushed_memtable = std::mem::replace(
-			&mut *active_memtable,
-			Arc::new(MemTable::new_owned(self.opts.max_memtable_size, owner)),
-		);
-
-		// Set the WAL number on the new active memtable
-		active_memtable.set_wal_number(current_wal_number);
-
-		// Get the WAL number from the memtable (set when it started receiving writes)
-		// or use the current WAL if not set
-		let memtable_wal_number = flushed_memtable.get_wal_number();
-
-		// Track the immutable memtable until it's successfully flushed
-		immutable_memtables.add(table_id, memtable_wal_number, Arc::clone(&flushed_memtable));
-
-		// Release locks before the potentially slow flush operation
-		drop(active_memtable);
-		drop(immutable_memtables);
-
-		// Step 2: Determine which WAL was flushed
-		let wal_that_was_flushed = match flushed_wal_number {
-			Some(num) => num,
-			None => {
-				// No explicit WAL provided, use the memtable's stored WAL number
-				// This is the WAL that was active when the memtable started receiving writes
-				memtable_wal_number
-			}
-		};
-
-		// Step 3: Flush the immutable memtable to disk and update manifest
-		let table = self.flush_immutable_to_sst(
-			Arc::clone(&flushed_memtable),
-			table_id,
-			wal_that_was_flushed,
-		)?;
-
-		Ok(Some(table))
+		Ok(count)
 	}
 
 	/// Flushes all memtables (immutable and active) during shutdown.
@@ -596,90 +736,26 @@ impl CoreInner {
 	fn flush_all_memtables_for_shutdown(&self) -> Result<()> {
 		log::info!("Flushing all memtables for shutdown...");
 
-		// STEP 1: Flush ALL immutable memtables FIRST (older data, lower table_ids)
-		// We need to collect them first to avoid holding the lock during I/O
-		let immutables_to_flush: Vec<ImmutableEntry> = {
-			let immutable_guard = self.immutable_memtables.read()?;
-			immutable_guard.iter().cloned().collect()
-		};
-
-		let immutable_count = immutables_to_flush.len();
-		if immutable_count > 0 {
-			log::info!("Flushing {} immutable memtable(s) first (older data)", immutable_count);
-		}
-
-		// Flush each immutable memtable using its pre-assigned table_id and WAL number
-		// These were assigned when the memtable was moved from active to immutable
-		//
-		// We use fail-fast because:
-		// 1. Successfully flushed memtables already updated log_number (their WALs can be deleted)
-		// 2. Failed memtable's WAL is preserved (its wal_number >= current log_number)
-		// 3. On restart, WAL replay recovers all unflushed data
-		let mut flushed_count = 0;
-
-		for entry in immutables_to_flush {
-			if entry.memtable.is_empty() {
-				// Skip empty memtables - just remove from tracking
-				let mut immutable_guard = self.immutable_memtables.write()?;
-				immutable_guard.remove(entry.table_id);
-				self.wal_dependencies.release_component(entry.memtable.dependency_id());
-				log::debug!("Skipped empty immutable memtable: table_id={}", entry.table_id);
-				continue;
+		// STEP 1: Rotate every runtime's non-empty active memtable into its
+		// immutable queue (memory-only; shutdown never rotates the WAL).
+		// Entries already queued keep their older table_ids, so SST ordering
+		// is preserved, and foreign runtimes are captured the same way as the
+		// default — a dirty branch must not survive only in the WAL.
+		let mut rotated_any = false;
+		for runtime in self.runtimes.all() {
+			let non_empty = !runtime.active_memtable.read()?.is_empty();
+			if non_empty {
+				self.rotate_runtime_memtable(&runtime, 0)?;
+				rotated_any = true;
 			}
-
-			// Fail-fast: return immediately on error
-			// WAL replay will recover this and subsequent memtables on restart
-			self.flush_immutable_to_sst(
-				Arc::clone(&entry.memtable),
-				entry.table_id,
-				entry.wal_number,
-			)?;
-
-			flushed_count += 1;
-			log::debug!(
-				"Flushed immutable memtable {}/{}: table_id={}, wal_number={}",
-				flushed_count,
-				immutable_count,
-				entry.table_id,
-				entry.wal_number
-			);
 		}
 
-		if flushed_count > 0 {
-			log::info!("Flushed {} immutable memtable(s) successfully", flushed_count);
-		}
+		// STEP 2: Drain every runtime's queue (default first, then branches).
+		// Fail-fast is safe: flushed memtables advanced durable state; a
+		// failed one keeps its WAL dependency and replays on restart.
+		let flushed_count = self.flush_all_immutables_sync()?;
 
-		// STEP 2: Flush active memtable LAST (newest data, gets highest table_id)
-		let active_memtable = self.active_memtable.read()?;
-		let active_size = active_memtable.size();
-		let active_is_empty = active_memtable.is_empty();
-		drop(active_memtable);
-
-		if !active_is_empty {
-			log::info!("Flushing active memtable last (newest data): size={}", active_size);
-
-			// Use flush_memtable_and_update_manifest which:
-			// - Gets a new (highest) table_id
-			// - Updates log_number to mark WAL as flushed
-			// - Does NOT rotate WAL (we pass None)
-			// Fail-fast: return immediately on error
-			match self.flush_memtable_and_update_manifest(None)? {
-				Some(table) => {
-					log::info!(
-						"Active memtable flushed: table_id={}, file_size={}",
-						table.id,
-						table.file_size
-					);
-				}
-				None => {
-					log::debug!("Active memtable was empty, skipped flush");
-				}
-			}
-		} else {
-			log::debug!("Active memtable is empty, skipping flush");
-		}
-
-		if flushed_count > 0 || !active_is_empty {
+		if rotated_any || flushed_count > 0 {
 			// Commits and maintenance are stopped by the shutdown caller. With all
 			// components from this lifecycle covered by SSTs, the closed segment
 			// can be skipped in full. Empty reopen/close cycles do not advance it.
@@ -781,15 +857,16 @@ impl CompactionOperations for CoreInner {
 	/// - Removes deleted entries to reclaim space
 	/// - Maintains the level invariants (size ratios and key ranges)
 	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
-		// Create compaction options from the current LSM tree state
-		let options = CompactionOptions::from(self);
-
-		// Execute compaction according to the chosen strategy
-		let compactor = Compactor::new(options, strategy);
-		compactor.compact()?;
-
-		// // Clean deleted versions from versioned index after compaction
-		// self.clean_expired_versions()?;
+		// One scheduler, every owner: each owner's level set gets the same
+		// strategy. Without this, a foreign branch's L0 never compacts and
+		// its owner-scoped stall would eventually park that branch's writes
+		// permanently.
+		let owners = self.level_manifest.read()?.owners();
+		for owner in owners {
+			let options = CompactionOptions::for_owner(self, owner);
+			let compactor = Compactor::new(options, Arc::clone(&strategy));
+			compactor.compact()?;
+		}
 
 		Ok(())
 	}
@@ -800,15 +877,43 @@ impl CompactionOperations for CoreInner {
 	}
 
 	fn has_pending_immutables(&self) -> bool {
-		self.immutable_memtables.read().map(|guard| !guard.is_empty()).unwrap_or(false)
+		// Any runtime's backlog keeps the flush loop running, not only the
+		// default's — the trickle policy feeds branch queues too.
+		self.runtimes.all().iter().any(|runtime| {
+			runtime.immutable_memtables.read().map(|guard| !guard.is_empty()).unwrap_or(false)
+		})
+	}
+
+	fn rotate_wal_pinned_runtime(&self) -> Result<bool> {
+		self.rotate_wal_pinned_runtime_impl()
 	}
 }
 
 impl WriteStallCountProvider for CoreInner {
-	fn get_stall_counts(&self) -> StallCounts {
+	fn get_stall_counts(&self, owner: crate::batch::BatchOwner) -> StallCounts {
+		// Branch-scoped: only the owner's own flush backlog and L0 pressure
+		// stall its writes. A missing runtime (never-written branch) has no
+		// backlog by definition.
+		let Some(runtime) = self.runtimes.get(owner) else {
+			return StallCounts {
+				immutable_memtables: 0,
+				l0_files: 0,
+			};
+		};
+		let immutable_memtables =
+			runtime.immutable_memtables.read().map(|imm| imm.iter().count()).unwrap_or(0);
+		let l0_files = self
+			.level_manifest
+			.read()
+			.map(|m| {
+				m.levels_for(owner)
+					.and_then(|levels| levels.get_levels().first().map(|l| l.tables.len()))
+					.unwrap_or(0)
+			})
+			.unwrap_or(0);
 		StallCounts {
-			immutable_memtables: self.immutable_count(),
-			l0_files: self.l0_file_count(),
+			immutable_memtables,
+			l0_files,
 		}
 	}
 }
@@ -866,7 +971,25 @@ impl CommitEnv for LsmCommitEnv {
 		if sync {
 			wal_guard.sync()?;
 		}
+		// Size-driven WAL rotation is the only rotation policy now that
+		// branch memtable rotations are independent of the shared log. The
+		// appended batch stays in the old segment; the next append pins the
+		// new one.
+		let rotated_for_size = if wal_guard.should_rotate_for_size() {
+			wal_guard.rotate()?;
+			true
+		} else {
+			false
+		};
 		drop(wal_guard);
+
+		// A new segment is when cold branches start falling behind: schedule
+		// the flush task so the WAL-span trickle policy runs.
+		if rotated_for_size {
+			if let Some(ref task_manager) = self.task_manager {
+				task_manager.wake_up_memtable();
+			}
+		}
 
 		Ok(())
 	}
@@ -887,9 +1010,28 @@ impl CommitEnv for LsmCommitEnv {
 		let wal_segment = prepared.wal_segment.ok_or_else(|| {
 			Error::Other("WAL-backed apply is missing its actual segment provenance".to_owned())
 		})?;
-		// Try to add to current memtable
+
+		// Route by the already-validated physical owner. The runtime (and its
+		// first arena) is created lazily here on the owner's first write; an
+		// idle branch allocates nothing.
+		let runtime = if batch.owner == self.core.default_runtime.owner() {
+			Arc::clone(&self.core.default_runtime)
+		} else {
+			if self.core.enforce_write_buffer_budget(self.core.opts.branch_memtable_size as u64) {
+				if let Some(ref task_manager) = self.task_manager {
+					task_manager.wake_up_memtable();
+				}
+			}
+			self.core.runtimes.get_or_create(
+				batch.owner,
+				self.core.opts.branch_memtable_size,
+				&self.core.default_runtime.level_manifest,
+			)?
+		};
+
+		// Try to add to the owner's current memtable
 		let (result, component_id) = {
-			let active_memtable = self.core.active_memtable.read()?;
+			let active_memtable = runtime.active_memtable.read()?;
 			let result = active_memtable.add(batch);
 			if result.is_ok() {
 				active_memtable.record_wal_dependency(wal_segment);
@@ -907,10 +1049,16 @@ impl CommitEnv for LsmCommitEnv {
 				Ok(())
 			}
 			Err(Error::ArenaFull) => {
-				// Arena is full - rotate memtable and retry
-				log::debug!("apply: arena full, rotating memtable");
+				// Arena is full - rotate this runtime's memtable and retry.
+				// The replacement arena is right-sized to the batch so a
+				// WAL-durable batch can never permanently fail to apply.
+				log::debug!("apply: arena full, rotating memtable for owner {:?}", batch.owner);
 
-				self.core.rotate_memtable()?;
+				let min_capacity = batch.memtable_size_estimate() as usize;
+				// The unconditional wake below schedules the flush for both
+				// this budget rotation and the forced one.
+				let _budget_rotated = self.core.enforce_write_buffer_budget(min_capacity as u64);
+				self.core.rotate_runtime_memtable(&runtime, min_capacity)?;
 
 				// Schedule background flush
 				if let Some(ref task_manager) = self.task_manager {
@@ -918,7 +1066,7 @@ impl CommitEnv for LsmCommitEnv {
 				}
 
 				// Retry on new memtable - must succeed
-				let active_memtable = self.core.active_memtable.read()?;
+				let active_memtable = runtime.active_memtable.read()?;
 				let result = active_memtable.add(batch);
 				if result.is_ok() {
 					active_memtable.record_wal_dependency(wal_segment);
@@ -940,9 +1088,7 @@ impl CommitEnv for LsmCommitEnv {
 	}
 
 	fn on_durable_apply_failure(&self, error: &Error) {
-		self.core
-			.error_handler
-			.set_error(error.clone(), BackgroundErrorReason::DurableCommitApply);
+		self.core.error_handler.set_error(error.clone(), BackgroundErrorReason::DurableCommitApply);
 	}
 
 	fn oldest_active_start_seq(&self) -> u64 {
@@ -996,19 +1142,23 @@ impl Core {
 	///
 	/// # Returns
 	/// * `(Option<max_seq_num>, Option<active_memtable>)`
-	pub(crate) fn replay_wal_with_repair<F>(
+	pub(crate) fn replay_wal_with_repair(
 		wal_path: &Path,
 		min_wal_number: u64,
 		context: &str,
 		recovery_mode: WalRecoveryMode,
-		arena_size: usize,
-		mut flush_memtable: F,
-	) -> Result<(Option<u64>, Option<Arc<MemTable>>)>
-	where
-		F: FnMut(Arc<MemTable>, u64) -> Result<()>,
-	{
-		// Replay WAL - returns memtables per segment
-		let (wal_seq_num_opt, memtables) = match replay_wal(wal_path, min_wal_number, arena_size) {
+		default_arena_size: usize,
+		branch_arena_size: usize,
+		is_live_owner: &dyn Fn(crate::batch::BatchOwner) -> bool,
+	) -> Result<(Option<u64>, RecoveredMemtables)> {
+		// Replay WAL - returns branch-pure memtables per (segment, owner)
+		let (wal_seq_num_opt, memtables) = match replay_wal(
+			wal_path,
+			min_wal_number,
+			default_arena_size,
+			branch_arena_size,
+			is_live_owner,
+		) {
 			Ok(result) => result,
 			Err(Error::WalCorruption {
 				segment_id,
@@ -1049,7 +1199,13 @@ impl Core {
 						}
 
 						// Retry after repair
-						match replay_wal(wal_path, min_wal_number, arena_size) {
+						match replay_wal(
+							wal_path,
+							min_wal_number,
+							default_arena_size,
+							branch_arena_size,
+							is_live_owner,
+						) {
 							Ok(result) => result,
 							Err(Error::WalCorruption {
 								segment_id: seg_id,
@@ -1072,62 +1228,22 @@ impl Core {
 			Err(e) => return Err(e),
 		};
 
-		// If no memtables, nothing was recovered
-		if memtables.is_empty() {
-			return Ok((None, None));
-		}
-
-		// The existing single-branch Tree cannot safely install a foreign
-		// branch component. The branch catalog/router replaces this guard in
-		// the branch-aware integration slice; until then recovery fails closed.
-		if memtables
-			.iter()
-			.any(|(memtable, _)| memtable.owner() != crate::batch::BatchOwner::DEFAULT)
-		{
-			return Err(Error::InvalidArgument(
-				"branch-owned WAL requires the branch catalog recovery path".to_owned(),
-			));
-		}
-
-		// Flush all memtables except the last to SST
-		let memtable_count = memtables.len();
-		if memtable_count > 1 {
-			log::info!("Recovery: flushing {} intermediate memtables to SST", memtable_count - 1);
-			for (memtable, wal_number) in memtables.iter().take(memtable_count - 1) {
-				if !memtable.is_empty() {
-					flush_memtable(Arc::clone(memtable), *wal_number)?;
-				}
-			}
-		}
-
-		// Return the last memtable as the active one
-		let (last_memtable, last_wal_number) = memtables.into_iter().last().unwrap();
-		let entry_count = {
-			let mut iter = last_memtable.iter();
-			let mut count = 0;
-			if iter.seek_first().unwrap_or(false) {
-				count += 1;
-				while iter.next().unwrap_or(false) {
-					count += 1;
-				}
-			}
-			count
-		};
-		log::info!(
-			"Recovery: setting last memtable (wal={}) as active with {} entries",
-			last_wal_number,
-			entry_count
-		);
-
-		Ok((wal_seq_num_opt, Some(last_memtable)))
+		Ok((wal_seq_num_opt, memtables))
 	}
 
 	/// Creates a new LSM tree with background task management
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		Self::new_impl(opts, None)
+	}
+
+	fn new_impl(
+		opts: Arc<Options>,
+		initial_catalog: Option<crate::branch::BranchCatalog>,
+	) -> Result<Self> {
 		log::info!("=== Starting LSM tree initialization ===");
 		log::info!("Database path: {:?}", opts.path);
 
-		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
+		let inner = Arc::new(CoreInner::new_impl(Arc::clone(&opts), initial_catalog)?);
 
 		// Create the write stall controller with the provider and thresholds
 		let thresholds = StallThresholds {
@@ -1170,49 +1286,28 @@ impl Core {
 			manifest_last_seq
 		);
 
-		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
-		let (wal_seq_num_opt, recovered_memtable) = Self::replay_wal_with_repair(
+		// Replay WAL with configurable recovery mode. The catalog-at-open is
+		// the fencing authority: a batch whose owner it cannot validate
+		// (deleted, stale generation, or unknown) is dropped during replay
+		// and never installed into any runtime.
+		let catalog_fence = |owner: crate::batch::BatchOwner| {
+			inner
+				.branch_catalog
+				.read()
+				.map(|catalog| catalog.validate_owner(owner.branch, owner.generation).is_ok())
+				.unwrap_or(false)
+		};
+		let (wal_seq_num_opt, recovered_memtables) = Self::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Database startup",
 			opts.wal_recovery_mode,
 			opts.max_memtable_size,
-			|memtable, wal_number| {
-				// Flush intermediate memtable to SST during recovery
-				inner
-					.wal_dependencies
-					.register_component(memtable.dependency_id(), wal_number);
-				let table_id = inner.level_manifest.read()?.next_table_id();
-				inner.flush_immutable_to_sst(Arc::clone(&memtable), table_id, wal_number)?;
-				log::info!(
-					"Recovery: flushed memtable to SST table_id={}, wal_number={}",
-					table_id,
-					wal_number
-				);
-				Ok(())
-			},
+			opts.branch_memtable_size,
+			&catalog_fence,
 		)?;
 
-		// Set recovered memtable as active (if any)
-		if let Some(memtable) = recovered_memtable {
-			inner.wal_dependencies.register_component(
-				memtable.dependency_id(),
-				memtable.get_wal_number(),
-			);
-			let mut active_memtable = inner.active_memtable.write()?;
-			*active_memtable = memtable;
-		}
-
-		// Ensure the active memtable has the correct WAL number set
-		{
-			let active_memtable = inner.active_memtable.read()?;
-			let current_wal_number = inner.wal.read().get_active_log_number();
-			if active_memtable.is_empty() {
-				active_memtable.set_wal_number(current_wal_number);
-			} else {
-				active_memtable.record_wal_dependency(current_wal_number);
-			}
-		}
+		inner.install_recovered_memtables(recovered_memtables, "Recovery")?;
 
 		// Get last_sequence from manifest
 		let manifest_last_seq = inner.level_manifest.read()?.get_last_sequence();
@@ -1276,7 +1371,6 @@ impl Core {
 	///
 	/// If `sync` is true, also fsyncs to disk for durability.
 	/// This is safe to call concurrently with ongoing transactions.
-	///
 	pub(crate) fn flush_wal(&self, sync: bool) -> Result<()> {
 		if sync {
 			self.wal.sync()?;
@@ -1421,6 +1515,22 @@ impl Tree {
 		})
 	}
 
+	/// Test-only open with a prepared branch catalog as the recovery fencing
+	/// authority; see `TreeBuilder::with_initial_branch_catalog`.
+	#[cfg(test)]
+	pub(crate) fn new_with_catalog(
+		opts: Arc<Options>,
+		catalog: crate::branch::BranchCatalog,
+	) -> Result<Self> {
+		opts.validate()?;
+		Self::create_directory_structure(&opts)?;
+		let core = Core::new_impl(Arc::clone(&opts), Some(catalog))?;
+		sync_directory_structure(&opts)?;
+		Ok(Self {
+			core: Arc::new(core),
+		})
+	}
+
 	/// Creates all required directory structure for the LSM tree
 	fn create_directory_structure(opts: &Options) -> Result<()> {
 		// Create base directory
@@ -1536,43 +1646,27 @@ impl Tree {
 			*wal_guard = new_wal;
 		}
 
-		// Replay any WAL entries that were restored
-		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_with_repair(
+		// Replay any WAL entries that were restored, fenced against the
+		// running store's catalog (the authority at this restore point).
+		let restore_fence = |owner: crate::batch::BatchOwner| {
+			self.core
+				.inner
+				.branch_catalog
+				.read()
+				.map(|catalog| catalog.validate_owner(owner.branch, owner.generation).is_ok())
+				.unwrap_or(false)
+		};
+		let (wal_seq_num_opt, recovered_memtables) = Core::replay_wal_with_repair(
 			&wal_path,
 			manifest_log_number,
 			"Database restore",
 			self.core.inner.opts.wal_recovery_mode,
 			self.core.inner.opts.max_memtable_size,
-			|memtable, wal_number| {
-				// Flush intermediate memtable to SST during recovery
-				self.core
-					.inner
-					.wal_dependencies
-					.register_component(memtable.dependency_id(), wal_number);
-				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
-				self.core.inner.flush_immutable_to_sst(
-					Arc::clone(&memtable),
-					table_id,
-					wal_number,
-				)?;
-				log::info!(
-					"Restore: flushed memtable to SST table_id={}, wal_number={}",
-					table_id,
-					wal_number
-				);
-				Ok(())
-			},
+			self.core.inner.opts.branch_memtable_size,
+			&restore_fence,
 		)?;
 
-		// Set recovered memtable as active (if any)
-		if let Some(memtable) = recovered_memtable {
-			self.core.inner.wal_dependencies.register_component(
-				memtable.dependency_id(),
-				memtable.get_wal_number(),
-			);
-			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable = memtable;
-		}
+		self.core.inner.install_recovered_memtables(recovered_memtables, "Restore")?;
 
 		// Ensure the active memtable has the correct WAL number set
 		{
@@ -1674,6 +1768,11 @@ impl Drop for Tree {
 /// A builder for creating LSM trees with type-safe configuration.
 pub struct TreeBuilder {
 	opts: Options,
+	/// Test-only recovery authority: the catalog the store opens with, so
+	/// fencing tests can present live/deleted/recreated branches at replay.
+	/// Production catalogs become durable in the fork lifecycle slice.
+	#[cfg(test)]
+	initial_branch_catalog: Option<crate::branch::BranchCatalog>,
 }
 
 impl TreeBuilder {
@@ -1682,6 +1781,8 @@ impl TreeBuilder {
 	pub fn new() -> Self {
 		Self {
 			opts: Options::default(),
+			#[cfg(test)]
+			initial_branch_catalog: None,
 		}
 	}
 
@@ -1692,6 +1793,8 @@ impl TreeBuilder {
 	pub fn with_options(opts: Options) -> Self {
 		Self {
 			opts,
+			#[cfg(test)]
+			initial_branch_catalog: None,
 		}
 	}
 
@@ -1758,6 +1861,25 @@ impl TreeBuilder {
 		self
 	}
 
+	/// Sets the initial arena capacity for non-default branch memtables.
+	pub fn with_branch_memtable_size(mut self, size: usize) -> Self {
+		self.opts = self.opts.with_branch_memtable_size(size);
+		self
+	}
+
+	/// Sets the database-wide budget over all branch memtable arenas.
+	pub fn with_write_buffer_budget(mut self, budget: Option<u64>) -> Self {
+		self.opts = self.opts.with_write_buffer_budget(budget);
+		self
+	}
+
+	/// Sets how many WAL segments a cold branch memtable may pin before the
+	/// trickle policy rotates it toward flush.
+	pub fn with_wal_pinned_segment_limit(mut self, limit: usize) -> Self {
+		self.opts = self.opts.with_wal_pinned_segment_limit(limit);
+		self
+	}
+
 	/// Sets the unified block cache capacity (includes data blocks, index
 	/// and index blocks).
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {
@@ -1800,7 +1922,22 @@ impl TreeBuilder {
 	/// This method ensures type safety by using the same key type K
 	/// for both the builder and the resulting tree.
 	pub fn build(self) -> Result<Tree> {
+		#[cfg(test)]
+		if let Some(catalog) = self.initial_branch_catalog {
+			return Tree::new_with_catalog(Arc::new(self.opts), catalog);
+		}
 		Tree::new(Arc::new(self.opts))
+	}
+
+	/// Opens the store with a prepared branch catalog as the recovery
+	/// fencing authority (test-only; see `initial_branch_catalog`).
+	#[cfg(test)]
+	pub(crate) fn with_initial_branch_catalog(
+		mut self,
+		catalog: crate::branch::BranchCatalog,
+	) -> Self {
+		self.initial_branch_catalog = Some(catalog);
+		self
 	}
 
 	/// Builds the LSM tree and returns both the tree and the options.

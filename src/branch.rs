@@ -5,7 +5,12 @@ use std::collections::BTreeMap;
 use bytes::Bytes;
 
 use super::api::{
-	BranchGeneration, BranchId, CommitTimestamp, CommitVersion, ErrorCode, KernelError,
+	BranchGeneration,
+	BranchId,
+	CommitTimestamp,
+	CommitVersion,
+	ErrorCode,
+	KernelError,
 	KernelResult,
 };
 
@@ -239,7 +244,7 @@ pub(crate) struct BranchModel {
 impl BranchModel {
 	pub(crate) fn new(main_id: BranchId) -> Self {
 		let main = ModelBranch {
-			name: "main".to_string(),
+			name: DEFAULT_BRANCH_NAME.to_string(),
 			generation: BranchGeneration(0),
 			head: CommitVersion(0),
 			deleted: false,
@@ -247,8 +252,11 @@ impl BranchModel {
 		};
 		Self {
 			branches: BTreeMap::from([(main_id, main)]),
-			names: BTreeMap::from([("main".to_string(), main_id)]),
-			name_generations: BTreeMap::from([("main".to_string(), BranchGeneration(0))]),
+			names: BTreeMap::from([(DEFAULT_BRANCH_NAME.to_string(), main_id)]),
+			name_generations: BTreeMap::from([(
+				DEFAULT_BRANCH_NAME.to_string(),
+				BranchGeneration(0),
+			)]),
 			timeline: Vec::new(),
 			global_version: CommitVersion(0),
 			current_time: CommitTimestamp(0),
@@ -379,7 +387,7 @@ impl BranchModel {
 			.branches
 			.get_mut(&branch)
 			.ok_or_else(|| KernelError::new(ErrorCode::NotFound, "branch not found"))?;
-		if state.name == "main" {
+		if state.name == DEFAULT_BRANCH_NAME {
 			return Err(KernelError::new(ErrorCode::InvalidArgument, "main cannot be deleted"));
 		}
 		if state.deleted {

@@ -2,8 +2,11 @@ use bytes::Bytes;
 
 use crate::database::KernelDatabase as Database;
 use crate::{
-	CommitTimestamp, CommitVersion, ErrorCode as DatabaseErrorCode,
-	ReadSelector as BranchReadSelector, WriteOperation,
+	CommitTimestamp,
+	CommitVersion,
+	ErrorCode as DatabaseErrorCode,
+	ReadSelector as BranchReadSelector,
+	WriteOperation,
 };
 
 #[tokio::test]
