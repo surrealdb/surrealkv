@@ -3211,7 +3211,7 @@ async fn test_versioned_range_survives_memtable_flush() {
 	}
 
 	// FORCE MEMTABLE FLUSH - this is where versions get dropped with the bug!
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Query versions AFTER flush - this is the critical test using history() API
 	let tx = store.begin().unwrap();

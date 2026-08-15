@@ -1,4 +1,5 @@
 use std::fs::File as SysFile;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -427,25 +428,19 @@ impl MemTable {
 	}
 
 	pub(crate) fn iter(&self) -> MemTableIterator<'_> {
-		self.range(None, None)
+		self.range(Bound::Unbounded, Bound::Unbounded)
 	}
 
 	/// Returns an iterator over keys in [lower, upper)
 	/// Lower is inclusive, upper is exclusive
-	pub(crate) fn range(
-		&self,
-		lower: Option<&[u8]>, // Inclusive, None = unbounded
-		upper: Option<&[u8]>, // Exclusive, None = unbounded
-	) -> MemTableIterator<'_> {
+	/// Iterates the memtable over a user-key range.
+	///
+	/// Takes real [`Bound`]s: an inclusive upper and an exclusive lower are
+	/// expressible here, and were not before. `first()` does the positioning,
+	/// including stepping past an excluded lower bound.
+	pub(crate) fn range(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> MemTableIterator<'_> {
 		let mut iter = self.skiplist.new_iter(lower, upper);
-
-		// Pre-position for forward iteration
-		if let Some(lower_key) = lower {
-			iter.seek_ge(lower_key);
-		} else {
-			iter.first();
-		}
-
+		iter.first();
 		MemTableIterator {
 			iter,
 		}

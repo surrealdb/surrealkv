@@ -262,12 +262,33 @@ pub(crate) fn fsync_file<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<
 /// Lets crash-consistency tests simulate power loss faithfully: files NOT in
 /// the ledger may legally lose their data (truncate to 0), while files in it
 /// must survive intact.
+///
+/// # The invariant this ledger rests on
+///
+/// **It contains SSTables and nothing else**, because [`fsync_file`] is called
+/// from exactly three places and all three are SST paths: the flush
+/// (`memtable/mod.rs`), the compaction output (`compaction/compactor.rs`) and
+/// detach's materialised table (`lsm.rs`). The WAL, the authority publish and
+/// the manifest reach durability through their own paths and never enter here.
+///
+/// So `was_synced` answers "was this SST fsynced", and for anything else it
+/// answers `false` **because it was never a candidate**, not because the file is
+/// vulnerable. A caller that widened its walk from `opts.sstable_dir()` to the
+/// store root would therefore truncate durable WAL segments and manifest
+/// versions. That used to be guarded only by each caller remembering to filter
+/// on `extension == "sst"`; it is now checked below, so the mistake is loud.
 #[cfg(test)]
 pub(crate) mod sync_tracker {
 	use std::collections::HashSet;
 	use std::path::{Path, PathBuf};
 	use std::sync::{LazyLock, Mutex};
 
+	/// Not cleared, ever. Safe today because every test owns a `TempDir`, so two
+	/// tests cannot produce the same canonical path. It would go wrong for a
+	/// test that crashed **twice on one path**: entries from the first store
+	/// instance would still be present, and a file the second instance never
+	/// synced would be spared truncation. Nothing does that yet; see
+	/// `docs/KNOWN_GAPS.md` §5.
 	static SYNCED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
 
 	// Canonicalize symmetrically in record() and was_synced(): on macOS,
@@ -277,12 +298,25 @@ pub(crate) mod sync_tracker {
 		path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 	}
 
+	/// The ledger only ever describes SSTables. Asking about anything else means
+	/// the caller has widened its walk past what this can answer.
+	fn assert_is_sstable(path: &Path, what: &str) {
+		debug_assert!(
+			path.extension().is_some_and(|ext| ext == "sst"),
+			"sync_tracker::{what} was given {path:?}, which is not an SSTable. This ledger \
+			 records only SST fsyncs, so it would answer `false` for a file that is perfectly \
+			 durable — and a power-loss simulation would then truncate it."
+		);
+	}
+
 	pub(crate) fn record(path: &Path) {
+		assert_is_sstable(path, "record");
 		SYNCED.lock().unwrap().insert(key(path));
 	}
 
 	#[cfg(test)]
 	pub(crate) fn was_synced(path: &Path) -> bool {
+		assert_is_sstable(path, "was_synced");
 		SYNCED.lock().unwrap().contains(&key(path))
 	}
 }

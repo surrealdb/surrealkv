@@ -62,7 +62,7 @@ async fn child_inherits_the_parent_as_of_its_anchor_only() {
 	txn.set(b"before/a", b"a-at-fork").unwrap();
 	txn.set(b"before/b", b"b-at-fork").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let anchor = visible_seq(&store);
 	let child = fork_at(&store, "fork/reads", BatchOwner::DEFAULT, anchor);
@@ -104,7 +104,7 @@ async fn child_writes_and_tombstones_shadow_the_inherited_view() {
 	txn.set(b"shadowed", b"parent-v").unwrap();
 	txn.set(b"hidden", b"parent-v").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = fork_at(&store, "fork/shadow", BatchOwner::DEFAULT, visible_seq(&store));
 
@@ -139,7 +139,7 @@ async fn range_iteration_merges_layers_under_per_layer_caps() {
 	txn.set(b"k2", b"parent-2").unwrap();
 	txn.set(b"k3", b"parent-3").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = fork_at(&store, "fork/range", BatchOwner::DEFAULT, visible_seq(&store));
 
@@ -192,7 +192,7 @@ async fn grandchild_view_caps_at_the_minimum_anchor_on_the_path() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"early", b"root-early").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	let low_anchor = visible_seq(&store);
 
 	// A grandparent row committed after the low anchor: visible to a child
@@ -200,7 +200,7 @@ async fn grandchild_view_caps_at_the_minimum_anchor_on_the_path() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"late", b"root-late").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	let high_anchor = visible_seq(&store);
 
 	let late_child = fork_at(&store, "fork/late", BatchOwner::DEFAULT, high_anchor);
@@ -234,7 +234,7 @@ async fn ancestor_chain_beyond_the_view_budget_fails_closed() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"root", b"v").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	let anchor = visible_seq(&store);
 
 	let mut owner = BatchOwner::DEFAULT;
@@ -272,7 +272,7 @@ async fn parent_compaction_to_bottom_level_preserves_what_the_child_inherits() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"forked", b"pre-fork").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = fork_at(&store, "fork/retain", BatchOwner::DEFAULT, visible_seq(&store));
 
@@ -282,12 +282,12 @@ async fn parent_compaction_to_bottom_level_preserves_what_the_child_inherits() {
 	let mut txn = store.begin().unwrap();
 	txn.delete(b"forked").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	for round in 0..4u32 {
 		let mut txn = store.begin().unwrap();
 		txn.set(format!("filler/{round}").as_bytes(), b"f").unwrap();
 		txn.commit().await.unwrap();
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 	}
 
 	let level_table_count = |level: usize| {
@@ -340,7 +340,7 @@ async fn bottom_level_is_disabled_for_both_sides_of_a_fork() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	let anchor = visible_seq(&store);
 
 	let plain = store.core.inner.create_branch("plain").unwrap();
@@ -377,24 +377,24 @@ async fn two_children_at_different_anchors_each_read_their_own_view() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v1").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	let shallow = fork_at(&store, "fork/shallow", BatchOwner::DEFAULT, visible_seq(&store));
 
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v2").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	let deep = fork_at(&store, "fork/deep", BatchOwner::DEFAULT, visible_seq(&store));
 
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v3").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	for round in 0..4u32 {
 		let mut txn = store.begin().unwrap();
 		txn.set(format!("filler/{round}").as_bytes(), b"f").unwrap();
 		txn.commit().await.unwrap();
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 	}
 
 	// No snapshot may be live: one would pin these versions for an unrelated
@@ -449,14 +449,14 @@ async fn a_parent_with_many_children_serves_every_anchor() {
 		txn.set(b"k", format!("v{round}").as_bytes()).unwrap();
 		txn.commit().await.unwrap();
 		if round % 8 == 0 {
-			store.flush().unwrap();
+			store.drain_flushes_synchronously().unwrap();
 		}
 		children.push((
 			round,
 			fork_at(&store, &format!("fork/{round}"), BatchOwner::DEFAULT, visible_seq(&store)),
 		));
 	}
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	assert!(
 		store.core.inner.snapshot_tracker.get_all_snapshots().is_empty(),
 		"the fixture must leave no live snapshot"
@@ -494,7 +494,7 @@ async fn fork_at_head_is_exact_including_unflushed_parent_rows() {
 	txn.set(b"unflushed/b", b"v2").unwrap();
 	txn.commit().await.unwrap();
 	assert!(
-		store.core.inner.level_manifest.read().unwrap().get_last_sequence() == 0,
+		crate::test::support::manifest_last_sequence(&store) == 0,
 		"fixture must leave the rows unflushed, or this proves nothing"
 	);
 
@@ -635,7 +635,7 @@ async fn fork_below_the_retention_floor_is_refused() {
 	txn.set(b"k", b"first").unwrap();
 	txn.commit().await.unwrap();
 	let first_seq = visible_seq(&store);
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Same key overwritten and flushed repeatedly: the compaction that merges
 	// these tables must drop the older versions of `k`.
@@ -643,7 +643,7 @@ async fn fork_below_the_retention_floor_is_refused() {
 		let mut txn = store.begin().unwrap();
 		txn.set(b"k", format!("v{round}").as_bytes()).unwrap();
 		txn.commit().await.unwrap();
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 	}
 
 	// Intact history: the fork point is still servable. Deleted again before the
@@ -857,14 +857,14 @@ async fn the_maintenance_sweep_expires_only_due_branches() {
 	store.core.inner.set_branch_expiry(due.branch, Some(EXPIRED_TTL)).unwrap();
 	store.core.inner.set_branch_expiry(later.branch, Some(DISTANT_TTL)).unwrap();
 
-	let (expired, _) = store.core.inner.sweep_branch_maintenance().unwrap();
+	let (expired, _) = crate::test::support::sweep(&store);
 	assert_eq!(expired, 1, "exactly the due branch expires");
 	assert!(!branch_exists(&store, "ttl/due"));
 	assert!(branch_exists(&store, "ttl/later"));
 	assert!(branch_exists(&store, "ttl/none"));
 
 	// Re-entrant: a second sweep finds nothing new and changes nothing.
-	let (expired, _) = store.core.inner.sweep_branch_maintenance().unwrap();
+	let (expired, _) = crate::test::support::sweep(&store);
 	assert_eq!(expired, 0);
 
 	// A write to an expired branch is fenced, and the tombstone survives reopen
@@ -891,7 +891,7 @@ async fn an_expired_parent_of_active_children_is_skipped_not_cascaded() {
 	let child = fork(&store, "cascade/parent", "cascade/child", ForkPoint::Head).unwrap();
 	store.core.inner.set_branch_expiry(parent.child.branch, Some(EXPIRED_TTL)).unwrap();
 
-	let (expired, _) = store.core.inner.sweep_branch_maintenance().unwrap();
+	let (expired, _) = crate::test::support::sweep(&store);
 	assert_eq!(expired, 0, "the expired parent must be skipped while its child is active");
 	assert!(branch_exists(&store, "cascade/parent"));
 	assert!(branch_exists(&store, "cascade/child"));
@@ -901,7 +901,7 @@ async fn an_expired_parent_of_active_children_is_skipped_not_cascaded() {
 	drop(txn);
 
 	store.core.inner.delete_branch(child.child.branch).unwrap();
-	let (expired, _) = store.core.inner.sweep_branch_maintenance().unwrap();
+	let (expired, _) = crate::test::support::sweep(&store);
 	assert_eq!(expired, 1, "with the child gone, the parent's expiry finally fires");
 	assert!(!branch_exists(&store, "cascade/parent"));
 }
@@ -941,7 +941,7 @@ async fn metadata_pruning_bounds_the_lineage_and_the_store_still_opens() {
 			"fixture must publish more versions than are retained"
 		);
 
-		let (_, pruned) = store.core.inner.sweep_branch_maintenance().unwrap();
+		let (_, pruned) = crate::test::support::sweep(&store);
 		assert!(pruned > 0, "the sweep must have removed something");
 		assert_eq!(
 			version_file_count(&catalog_dir, "catalog"),
@@ -972,7 +972,7 @@ async fn a_thousand_branches_and_a_hundred_forks_reopen_within_the_metadata_budg
 		let mut txn = store.begin().unwrap();
 		txn.set(b"root", b"v").unwrap();
 		txn.commit().await.unwrap();
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 
 		for i in 0..900 {
 			store.core.inner.create_branch(&format!("scale/plain/{i}")).unwrap();
@@ -980,11 +980,11 @@ async fn a_thousand_branches_and_a_hundred_forks_reopen_within_the_metadata_budg
 		for i in 0..100 {
 			fork(&store, "main", &format!("scale/fork/{i}"), ForkPoint::Head).unwrap();
 		}
-		let (_, pruned) = store.core.inner.sweep_branch_maintenance().unwrap();
+		let (_, pruned) = crate::test::support::sweep(&store);
 		assert!(pruned > 0);
 		assert_eq!(version_file_count(&path.join("catalog"), "catalog"), KEEP_METADATA_VERSIONS);
 		// Idle branches hold no runtime (BR4's invariant, restated at scale).
-		assert_eq!(store.core.inner.runtimes.len(), 1);
+		assert_eq!(crate::test::support::runtime_count(&store), 1);
 		store.close().await.unwrap();
 	}
 
@@ -1027,7 +1027,7 @@ async fn a_catalog_truncated_below_the_root_floor_fails_closed() {
 		txn.set(b"k", b"v").unwrap();
 		txn.commit().await.unwrap();
 		// The flush publishes a root, recording the catalog version it saw.
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 		store.close().await.unwrap();
 	}
 
@@ -1075,11 +1075,11 @@ async fn last_write_seq_comes_from_the_branch_s_own_components() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let main_seq = store.branch("main").unwrap().info().unwrap().last_write_seq;
 	assert_eq!(main_seq, Some(visible_seq(&store)), "a flushed write is still main's own");
-	let global = store.core.inner.level_manifest.read().unwrap().get_last_sequence();
+	let global = crate::test::support::manifest_last_sequence(&store);
 	assert!(
 		global > 0,
 		"the fixture must move the global sequence, or the next arm proves nothing"
@@ -1099,7 +1099,7 @@ async fn last_write_seq_comes_from_the_branch_s_own_components() {
 	let mut txn = child.begin().unwrap();
 	txn.set(b"child", b"c").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	let child_seq = child.info().unwrap().last_write_seq.expect("the child has written");
 	assert!(child_seq > main_seq.unwrap(), "the child's write is newer than main's");
 	assert_eq!(
@@ -1154,7 +1154,7 @@ async fn the_sweep_reclaims_a_deleted_branch_s_tables_without_a_restart() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"main-key", b"v").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	let after_main = sst_count(&store);
 	assert!(after_main > 0, "main must have flushed a table");
 
@@ -1170,7 +1170,7 @@ async fn the_sweep_reclaims_a_deleted_branch_s_tables_without_a_restart() {
 	store.delete_branch("doomed").unwrap();
 	assert_eq!(sst_count(&store), with_branch, "delete must not reclaim synchronously");
 
-	let (_, _) = store.core.inner.sweep_branch_maintenance().unwrap();
+	let (_, _) = crate::test::support::sweep(&store);
 	assert_eq!(
 		sst_count(&store),
 		after_main,
@@ -1181,7 +1181,7 @@ async fn the_sweep_reclaims_a_deleted_branch_s_tables_without_a_restart() {
 	let txn = store.begin().unwrap();
 	assert_eq!(txn.get(b"main-key").unwrap(), Some(b"v".to_vec()));
 	drop(txn);
-	store.core.inner.sweep_branch_maintenance().unwrap();
+	crate::test::support::sweep(&store);
 	assert_eq!(sst_count(&store), after_main, "a second sweep finds nothing left to do");
 }
 
@@ -1195,7 +1195,7 @@ async fn the_sweep_reclaims_a_deleted_branch_s_tables_without_a_restart() {
 #[test(tokio::test)]
 async fn reclamation_releases_the_wal_dependencies_it_discards() {
 	let (store, _temp) = create_store_with(|b| b);
-	let active_segment = || store.core.inner.wal.read().get_active_log_number();
+	let active_segment = || crate::test::support::active_wal_segment(&store);
 	let components =
 		|| store.core.inner.wal_dependencies.snapshot(active_segment()).component_count;
 
@@ -1219,7 +1219,7 @@ async fn reclamation_releases_the_wal_dependencies_it_discards() {
 	);
 
 	store.delete_branch("unflushed").unwrap();
-	store.core.inner.sweep_branch_maintenance().unwrap();
+	crate::test::support::sweep(&store);
 
 	assert!(
 		store.core.inner.runtimes.get(owner).is_none(),
@@ -1296,7 +1296,7 @@ async fn a_flush_for_a_deleted_branch_is_refused_not_resurrected() {
 	);
 
 	// The store is otherwise healthy, and the sweep still cleans up after it.
-	store.core.inner.sweep_branch_maintenance().unwrap();
+	crate::test::support::sweep(&store);
 	let txn = store.begin().unwrap();
 	assert_eq!(txn.get(b"anchor").unwrap(), Some(b"v".to_vec()));
 }
@@ -1310,7 +1310,7 @@ async fn churning_branches_stays_bounded_without_a_restart() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"base", b"v").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	let baseline = sst_count(&store);
 
 	for round in 0..40u32 {
@@ -1321,7 +1321,7 @@ async fn churning_branches_stays_bounded_without_a_restart() {
 		txn.commit().await.unwrap();
 		flush_branch(&store, &name);
 		store.delete_branch(&name).unwrap();
-		store.core.inner.sweep_branch_maintenance().unwrap();
+		crate::test::support::sweep(&store);
 	}
 
 	assert_eq!(
@@ -1352,7 +1352,7 @@ async fn detach_preserves_every_read_and_drops_the_parent_link() {
 	txn.set(b"shadowed", b"parent-value").unwrap();
 	txn.set(b"deleted-later", b"parent-value").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = store.fork_branch("main", "detachable", ForkPoint::Head).unwrap();
 	let mut txn = child.begin().unwrap();
@@ -1413,7 +1413,7 @@ async fn detach_places_inherited_rows_below_the_branch_s_own_levels() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"contested", b"parent-old").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = store.fork_branch("main", "layered", ForkPoint::Head).unwrap();
 	let mut txn = child.begin().unwrap();
@@ -1472,7 +1472,7 @@ async fn detach_releases_the_parent_s_retention_pin() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = store.fork_branch("main", "pinning", ForkPoint::Head).unwrap();
 	let anchor = child.info().unwrap().parent.unwrap().fork_seq;
@@ -1507,7 +1507,7 @@ async fn detach_is_a_no_op_without_a_parent_and_refuses_when_it_cannot_place() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// main has no parent.
 	assert_eq!(store.detach_branch("main").unwrap(), 0);
@@ -1576,7 +1576,7 @@ async fn a_detached_branch_reopens_without_its_ancestor() {
 		let mut txn = store.begin().unwrap();
 		txn.set(b"inherited", b"from-parent").unwrap();
 		txn.commit().await.unwrap();
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 		let child = store.fork_branch("main", "standalone", ForkPoint::Head).unwrap();
 		let mut txn = child.begin().unwrap();
 		txn.set(b"own", b"from-child").unwrap();
@@ -1612,7 +1612,7 @@ async fn detach_interrupted_between_its_publishes_reads_correctly() {
 	txn.set(b"shadowed", b"parent-value").unwrap();
 	txn.set(b"gone", b"parent-value").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = store.fork_branch("main", "interrupted", ForkPoint::Head).unwrap();
 	let mut txn = child.begin().unwrap();

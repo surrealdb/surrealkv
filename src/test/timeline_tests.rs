@@ -112,10 +112,10 @@ async fn fk2_root_tail_serves_resolutions_past_the_replay_floor() {
 		}
 		// Close the segment and flush: the floor advances past it, and the
 		// root version records the timeline tail.
-		store.core.inner.wal.write().rotate().unwrap();
+		crate::test::support::rotate_wal(&store);
 		store.core.inner.rotate_memtable().unwrap();
 		while store.core.inner.flush_oldest_immutable_for_test().unwrap().is_some() {}
-		let floor = store.core.inner.level_manifest.read().unwrap().get_log_number();
+		let floor = crate::test::support::wal_log_number(&store);
 		assert!(floor >= 1, "fixture: the flush must advance the replay floor");
 		store.close().await.unwrap();
 	}

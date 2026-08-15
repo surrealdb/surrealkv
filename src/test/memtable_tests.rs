@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use test_log::test;
@@ -459,8 +460,8 @@ fn test_range_query() {
 	// Test inclusive lower, exclusive upper
 	// To include "k", use upper bound "l" (exclusive upper means < upper)
 	let mut range_iter = memtable.range(
-		Some("c".as_bytes()), // Inclusive lower
-		Some("l".as_bytes()), // Exclusive upper - includes "k" but not "l" or "m"
+		Bound::Included("c".as_bytes()),
+		Bound::Excluded("l".as_bytes()), // includes "k" but not "l" or "m"
 	);
 	range_iter.seek_first().unwrap();
 	let mut range_entries = Vec::new();
@@ -486,8 +487,8 @@ fn test_range_query() {
 
 	// Test exclusive range
 	let mut range_iter = memtable.range(
-		Some("c".as_bytes()), // Inclusive lower
-		Some("k".as_bytes()), // Exclusive upper (excludes "k")
+		Bound::Included("c".as_bytes()),
+		Bound::Excluded("k".as_bytes()), // excludes "k"
 	);
 	range_iter.seek_first().unwrap();
 	let mut range_entries = Vec::new();
@@ -522,10 +523,8 @@ fn test_range_query_with_sequence_numbers() {
 	]);
 
 	// Perform a range query from "a" to "f" (inclusive lower, exclusive upper)
-	let mut range_iter = memtable.range(
-		Some("a".as_bytes()), // Inclusive lower
-		Some("f".as_bytes()), // Exclusive upper
-	);
+	let mut range_iter =
+		memtable.range(Bound::Included("a".as_bytes()), Bound::Excluded("f".as_bytes()));
 	range_iter.seek_first().unwrap();
 	let mut range_entries = Vec::new();
 	while range_iter.valid() {
@@ -727,10 +726,7 @@ fn test_excluded_bound_skips_all_versions_of_key() {
 	]);
 
 	// Query with excluded lower bound "b" - manually skip ALL versions of "b"
-	let mut iter = memtable.range(
-		Some("b".as_bytes()), // Start at "b" (inclusive)
-		None,                 // No upper bound
-	);
+	let mut iter = memtable.range(Bound::Included("b".as_bytes()), Bound::Unbounded);
 	iter.seek_first().unwrap();
 	// Skip all entries with user key "b" (they have same user key, different seqnums)
 	let mut range_entries = Vec::new();
@@ -772,10 +768,7 @@ fn test_excluded_bound_first_skips_all_versions() {
 	]);
 
 	// Test excluded lower bound - manually skip "b" entries
-	let mut iter = memtable.range(
-		Some("b".as_bytes()), // Start at "b" (inclusive)
-		None,                 // No upper bound
-	);
+	let mut iter = memtable.range(Bound::Included("b".as_bytes()), Bound::Unbounded);
 	iter.seek_first().unwrap();
 	// Skip all entries with user key "b"
 	while iter.valid() {
@@ -795,7 +788,7 @@ fn test_excluded_bound_first_skips_all_versions() {
 	assert_eq!(&key.user_key, b"b", "First key should be 'b'");
 
 	// Reset and try again - create new iterator
-	let mut iter2 = memtable.range(Some("b".as_bytes()), None);
+	let mut iter2 = memtable.range(Bound::Included("b".as_bytes()), Bound::Unbounded);
 	iter2.seek_first().unwrap();
 	// Skip all entries with user key "b"
 	while iter2.valid() {
@@ -812,4 +805,113 @@ fn test_excluded_bound_first_skips_all_versions() {
 	assert!(first);
 	let key = iter2.key().to_owned();
 	assert_eq!(&key.user_key, b"b", "After reset, first key should still be 'b'");
+}
+
+/// A memtable range means what its bounds say, at both ends.
+///
+/// `MemTable::range` took `Option<&[u8]>` until 2026-08-15, which could only
+/// express *inclusive lower, exclusive upper*. An inclusive upper and an
+/// exclusive lower had no encoding, so `Snapshot::collect_iter_state` widened
+/// them silently — an `Included` upper became unbounded, and an `Excluded` lower
+/// became inclusive. Table iterators took the full range and were always right,
+/// so the answer depended on whether the data had been flushed.
+///
+/// Two tests in this file used to skip versions of `"b"` by hand for exactly
+/// this reason. That workaround was the gap, written down and not recognised.
+#[test]
+fn a_memtable_range_honours_every_bound_form() {
+	let (memtable, _) = create_test_memtable(vec![
+		(b"a".to_vec(), b"value-a".to_vec(), InternalKeyKind::Set, None),
+		(b"b".to_vec(), b"value-b".to_vec(), InternalKeyKind::Set, None),
+		(b"c".to_vec(), b"value-c".to_vec(), InternalKeyKind::Set, None),
+	]);
+
+	let user_keys = |lower, upper| -> Vec<Vec<u8>> {
+		let mut iter = memtable.range(lower, upper);
+		iter.seek_first().unwrap();
+		let mut keys = Vec::new();
+		while iter.valid() {
+			let key = iter.key().user_key().to_vec();
+			if keys.last() != Some(&key) {
+				keys.push(key);
+			}
+			if !iter.next().unwrap() {
+				break;
+			}
+		}
+		keys
+	};
+
+	let a = b"a".as_slice();
+	let b = b"b".as_slice();
+	let c = b"c".as_slice();
+
+	// The two forms that were always expressible, as a control.
+	assert_eq!(user_keys(Bound::Included(a), Bound::Excluded(c)), vec![a.to_vec(), b.to_vec()]);
+	assert_eq!(
+		user_keys(Bound::Unbounded, Bound::Unbounded),
+		vec![a.to_vec(), b.to_vec(), c.to_vec()]
+	);
+
+	// The two that were not.
+	assert_eq!(
+		user_keys(Bound::Included(a), Bound::Included(b)),
+		vec![a.to_vec(), b.to_vec()],
+		"an inclusive upper must admit its own key and stop there"
+	);
+	assert_eq!(
+		user_keys(Bound::Excluded(a), Bound::Unbounded),
+		vec![b.to_vec(), c.to_vec()],
+		"an exclusive lower must skip every version of the key it excluded"
+	);
+	assert_eq!(user_keys(Bound::Excluded(a), Bound::Included(b)), vec![b.to_vec()], "both at once");
+	assert_eq!(
+		user_keys(Bound::Excluded(c), Bound::Unbounded),
+		Vec::<Vec<u8>>::new(),
+		"excluding the last key leaves nothing"
+	);
+}
+
+/// Reverse iteration honours the same bounds. `prev` and `seek_last` take a
+/// different path through the skiplist than `next` and `first`, and the
+/// inclusivity logic lives in one predicate pair shared by both — this is what
+/// says so.
+#[test]
+fn a_memtable_range_honours_every_bound_form_in_reverse() {
+	let (memtable, _) = create_test_memtable(vec![
+		(b"a".to_vec(), b"value-a".to_vec(), InternalKeyKind::Set, None),
+		(b"b".to_vec(), b"value-b".to_vec(), InternalKeyKind::Set, None),
+		(b"c".to_vec(), b"value-c".to_vec(), InternalKeyKind::Set, None),
+	]);
+
+	let user_keys_reverse = |lower, upper| -> Vec<Vec<u8>> {
+		let mut iter = memtable.range(lower, upper);
+		iter.seek_last().unwrap();
+		let mut keys = Vec::new();
+		while iter.valid() {
+			let key = iter.key().user_key().to_vec();
+			if keys.last() != Some(&key) {
+				keys.push(key);
+			}
+			if !iter.prev().unwrap() {
+				break;
+			}
+		}
+		keys
+	};
+
+	let a = b"a".as_slice();
+	let b = b"b".as_slice();
+	let c = b"c".as_slice();
+
+	assert_eq!(
+		user_keys_reverse(Bound::Unbounded, Bound::Included(b)),
+		vec![b.to_vec(), a.to_vec()],
+		"an inclusive upper must be where a reverse scan starts"
+	);
+	assert_eq!(
+		user_keys_reverse(Bound::Excluded(a), Bound::Unbounded),
+		vec![c.to_vec(), b.to_vec()],
+		"a reverse scan must stop before the excluded lower bound"
+	);
 }

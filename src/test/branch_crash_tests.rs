@@ -144,7 +144,7 @@ async fn a_ttl_survives_a_reopen_and_the_first_sweep_after_it_expires_the_branch
 		"an expired-but-unswept branch is still live after a reopen; opening is not a sweep"
 	);
 
-	let (expired, _) = store.core.inner.sweep_branch_maintenance().unwrap();
+	let (expired, _) = crate::test::support::sweep(&store);
 	assert_eq!(expired, 1, "the TTL was durable, so the first sweep after the restart fires it");
 	assert_eq!(branch_names(&store), vec!["main", "permanent"]);
 	store.close().await.unwrap();
@@ -167,7 +167,7 @@ async fn retention_anchors_and_what_they_pin_survive_a_restart() {
 		let mut txn = store.begin().unwrap();
 		txn.set(b"k", b"v1").unwrap();
 		txn.commit().await.unwrap();
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 		let child = store.fork_branch("main", "reader", ForkPoint::Head).unwrap();
 		let anchor = child.info().unwrap().parent.unwrap().fork_seq;
 
@@ -177,7 +177,7 @@ async fn retention_anchors_and_what_they_pin_survive_a_restart() {
 			let mut txn = store.begin().unwrap();
 			txn.set(b"k", format!("v{round}").as_bytes()).unwrap();
 			txn.commit().await.unwrap();
-			store.flush().unwrap();
+			store.drain_flushes_synchronously().unwrap();
 		}
 		store
 			.compact(Arc::new(Strategy::from_options(Arc::clone(&store.core.inner.opts))))
@@ -311,7 +311,7 @@ async fn an_interrupted_reclamation_finishes_after_a_restart() {
 	assert_eq!(branch_names(&store), vec!["main"], "the tombstone is durable");
 	// Whether the tables were reclaimed at open or are still waiting, the sweep
 	// after the restart must leave nothing behind either way.
-	store.core.inner.sweep_branch_maintenance().unwrap();
+	crate::test::support::sweep(&store);
 	let remaining = std::fs::read_dir(store.core.inner.opts.sstable_dir())
 		.unwrap()
 		.filter_map(|entry| entry.ok())

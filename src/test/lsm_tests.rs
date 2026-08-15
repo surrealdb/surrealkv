@@ -146,7 +146,7 @@ async fn test_memtable_flush() {
 	}
 
 	// Ensure the active memtable is flushed to disk
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	{
 		// Read back the key-value pair
@@ -185,7 +185,7 @@ async fn test_memtable_flush_with_delete() {
 	}
 
 	// Ensure the active memtable is flushed to disk
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	{
 		// Read back the key-value pair
@@ -232,7 +232,7 @@ async fn test_memtable_flush_with_multiple_keys_and_updates() {
 	}
 
 	// Final flush to ensure all data is on disk
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Verify all keys have their final values
 	for (key, expected_value) in expected_values {
@@ -291,7 +291,7 @@ async fn test_persistence() {
 		}
 
 		// Final flush to ensure all data is on disk
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Store values for later verification
 		expected_values = values;
@@ -359,7 +359,7 @@ async fn test_checkpoint_functionality() {
 	}
 
 	// Force flush to ensure data is on disk
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Create checkpoint
 	let checkpoint_dir = temp_dir.path().join("checkpoint");
@@ -391,7 +391,7 @@ async fn test_checkpoint_functionality() {
 	}
 
 	// Force flush to ensure the new data is also on disk
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Verify all data exists before restore
 	for i in 0..15 {
@@ -446,7 +446,7 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 	}
 
 	// Force flush to ensure data is on disk
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Create checkpoint
 	let checkpoint_dir = temp_dir.path().join("checkpoint");
@@ -527,7 +527,7 @@ async fn test_simple_range_seek() {
 	}
 
 	// Force flush to ensure data is on disk
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Test range scan AFTER flushing (should work from SSTables)
 	let txn = tree.begin().unwrap();
@@ -588,7 +588,7 @@ async fn test_large_range_scan() {
 	}
 
 	// Force flush to ensure all data is on disk
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Test 1: Full range scan - should return all 10k items in order
 	let start_key = "key_000000".as_bytes();
@@ -758,7 +758,7 @@ async fn test_range_skip_take() {
 		txn.commit().await.unwrap();
 	}
 
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	let start_key = "key_000000".as_bytes();
 	let end_key = "key_999999".as_bytes();
@@ -846,7 +846,7 @@ async fn test_range_skip_take_alphabetical() {
 		txn.commit().await.unwrap();
 	}
 
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	expected_items.sort_by(|a, b| a.0.cmp(&b.0));
 
@@ -923,7 +923,7 @@ async fn test_range_limit_functionality() {
 		txn.commit().await.unwrap();
 	}
 
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	let beg = [0u8].to_vec();
 	let end = [255u8].to_vec();
@@ -1086,7 +1086,7 @@ async fn test_range_limit_with_skip_take() {
 		txn.commit().await.unwrap();
 	}
 
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	let beg = [0u8].to_vec();
 	let end = [255u8].to_vec();
@@ -1201,7 +1201,7 @@ async fn test_compaction_with_updates_and_delete() {
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
 		tx.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 	}
 
 	// Insert second version of each key
@@ -1210,7 +1210,7 @@ async fn test_compaction_with_updates_and_delete() {
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
 		tx.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 	}
 
 	// Verify the latest values before delete
@@ -1229,7 +1229,7 @@ async fn test_compaction_with_updates_and_delete() {
 	}
 
 	// Flush memtable
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Force compaction.
 	let strategy = Arc::new(Strategy::default());
@@ -1263,7 +1263,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
 		tx.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 	}
 
 	// Insert second version of each key
@@ -1272,7 +1272,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
 		tx.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 	}
 
 	// Insert third version of each key
@@ -1281,7 +1281,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
 		tx.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 	}
 
 	// Insert fourth version of each key
@@ -1290,7 +1290,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 		let mut tx = tree.begin().unwrap();
 		tx.set(*key, value.as_bytes()).unwrap();
 		tx.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 	}
 
 	// Verify the latest values before delete
@@ -1308,7 +1308,7 @@ async fn test_compaction_with_updates_and_delete_on_same_key() {
 	}
 
 	// Flush memtable
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Force compaction.
 	let strategy = Arc::new(Strategy::default());
@@ -1347,7 +1347,7 @@ async fn test_sstable_lsn_bug() {
 		}
 
 		// Force first flush
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Write data for second table
 		for i in 0..6 {
@@ -1360,7 +1360,7 @@ async fn test_sstable_lsn_bug() {
 		}
 
 		// Force second flush
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Verify all keys exist immediately after flush
 		for batch in 0..2 {
@@ -1426,7 +1426,7 @@ async fn test_table_id_assignment_across_restart() {
 		}
 
 		// Force first flush to create first table
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Write data for second table
 		for i in 0..6 {
@@ -1439,7 +1439,7 @@ async fn test_table_id_assignment_across_restart() {
 		}
 
 		// Force second flush to create second table
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Verify we have 2 tables in L0
 		let l0_size = tree.core.level_manifest.read().unwrap().default_owner_levels().get_levels()
@@ -1511,7 +1511,7 @@ async fn test_table_id_assignment_across_restart() {
 		}
 
 		// Force flush to create the 3rd table
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		{
 			// Verify we now have 3 tables in L0
@@ -1683,7 +1683,7 @@ async fn test_soft_delete() {
 		assert_eq!(&result, b"other_value");
 
 		// Force flush to persist all changes to disk
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Close the database
 		tree.close().await.unwrap();
@@ -1861,7 +1861,7 @@ async fn test_log_number_advances_with_flushes() {
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 	// Initial log_number
-	let log_number_0 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	let log_number_0 = crate::test::support::wal_log_number(&tree);
 
 	// Write data to trigger flush #1
 	for i in 0..100 {
@@ -1873,9 +1873,9 @@ async fn test_log_number_advances_with_flushes() {
 	// The replay floor advances past a segment only once it is closed and its
 	// dependents flushed; close the segment explicitly (WAL rotation is
 	// size-driven now, independent of memtable rotation).
-	tree.core.inner.wal.write().rotate().unwrap();
-	tree.flush().unwrap();
-	let log_number_1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	crate::test::support::rotate_wal(&tree);
+	tree.drain_flushes_synchronously().unwrap();
+	let log_number_1 = crate::test::support::wal_log_number(&tree);
 	assert!(log_number_1 > log_number_0, "log_number should advance after flush");
 
 	// Write more data, trigger flush #2
@@ -1885,9 +1885,9 @@ async fn test_log_number_advances_with_flushes() {
 		txn.commit().await.unwrap();
 	}
 
-	tree.core.inner.wal.write().rotate().unwrap();
-	tree.flush().unwrap();
-	let log_number_2 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	crate::test::support::rotate_wal(&tree);
+	tree.drain_flushes_synchronously().unwrap();
+	let log_number_2 = crate::test::support::wal_log_number(&tree);
 	assert!(log_number_2 > log_number_1, "log_number should advance after second flush");
 
 	tree.close().await.unwrap();
@@ -1916,10 +1916,10 @@ async fn test_last_sequence_persists_across_restart() {
 		}
 
 		// Force flush to persist
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Get last_sequence from manifest
-		expected_last_seq = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		expected_last_seq = crate::test::support::manifest_last_sequence(&tree);
 		assert!(expected_last_seq > 0, "last_sequence should be > 0 after flush");
 
 		tree.close().await.unwrap();
@@ -1928,7 +1928,7 @@ async fn test_last_sequence_persists_across_restart() {
 	// Phase 2: Reopen and verify last_sequence persisted
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let loaded_last_seq = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		let loaded_last_seq = crate::test::support::manifest_last_sequence(&tree);
 
 		assert_eq!(
 			loaded_last_seq, expected_last_seq,
@@ -1988,7 +1988,7 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		let in_memory_seq = tree.core.seq_num();
 
 		// Manifest sequence should still be from Phase 1
-		let manifest_seq = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		let manifest_seq = crate::test::support::manifest_last_sequence(&tree);
 		assert_eq!(
 			manifest_seq, manifest_seq_initial,
 			"Manifest last_sequence should not be updated until flush (from Phase 2 crash)"
@@ -2003,9 +2003,8 @@ async fn test_wal_recovery_updates_last_sequence_in_memory() {
 		);
 
 		// Now flush and verify manifest gets updated
-		tree.flush().unwrap();
-		let manifest_seq_after_flush =
-			tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		tree.drain_flushes_synchronously().unwrap();
+		let manifest_seq_after_flush = crate::test::support::manifest_last_sequence(&tree);
 		assert!(
 			manifest_seq_after_flush >= in_memory_seq,
 			"Manifest last_sequence should update after flush"
@@ -2036,7 +2035,7 @@ async fn test_clean_shutdown_no_empty_wal() {
 			txn.set(format!("key_{i}").as_bytes(), b"value").unwrap();
 			txn.commit().await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Write a bit more data to the new WAL
 		let mut txn = tree.begin().unwrap();
@@ -2090,29 +2089,29 @@ async fn test_multiple_flush_cycles_log_number_sequence() {
 			txn.set(format!("batch1_key_{i}").as_bytes(), b"value1").unwrap();
 			txn.commit().await.unwrap();
 		}
-		tree.flush().unwrap();
-		let log_num_1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		tree.drain_flushes_synchronously().unwrap();
+		let log_num_1 = crate::test::support::wal_log_number(&tree);
 
 		// Flush cycle 2 (segments close by size policy; forced here so each
 		// cycle spans a distinct segment)
-		tree.core.inner.wal.write().rotate().unwrap();
+		crate::test::support::rotate_wal(&tree);
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch2_key_{i}").as_bytes(), b"value2").unwrap();
 			txn.commit().await.unwrap();
 		}
-		tree.flush().unwrap();
-		let log_num_2 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		tree.drain_flushes_synchronously().unwrap();
+		let log_num_2 = crate::test::support::wal_log_number(&tree);
 
 		// Flush cycle 3
-		tree.core.inner.wal.write().rotate().unwrap();
+		crate::test::support::rotate_wal(&tree);
 		for i in 0..50 {
 			let mut txn = tree.begin().unwrap();
 			txn.set(format!("batch3_key_{i}").as_bytes(), b"value3").unwrap();
 			txn.commit().await.unwrap();
 		}
-		tree.flush().unwrap();
-		let log_num_3 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		tree.drain_flushes_synchronously().unwrap();
+		let log_num_3 = crate::test::support::wal_log_number(&tree);
 
 		assert!(log_num_2 > log_num_1, "log_number should advance");
 		assert!(log_num_3 > log_num_2, "log_number should advance");
@@ -2148,11 +2147,11 @@ async fn test_shutdown_with_empty_memtable() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key", b"value").unwrap();
 		txn.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Get manifest state
-		let log_number_before = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-		let last_seq_before = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		let log_number_before = crate::test::support::wal_log_number(&tree);
+		let last_seq_before = crate::test::support::manifest_last_sequence(&tree);
 
 		// Shutdown with empty memtable
 		tree.close().await.unwrap();
@@ -2189,8 +2188,8 @@ async fn test_full_crash_recovery_scenario() {
 			txn.set(format!("batch_a_{i}").as_bytes(), b"value_a").unwrap();
 			txn.commit().await.unwrap();
 		}
-		tree.core.inner.wal.write().rotate().unwrap();
-		tree.flush().unwrap();
+		crate::test::support::rotate_wal(&tree);
+		tree.drain_flushes_synchronously().unwrap();
 		tree.close().await.unwrap();
 	}
 
@@ -2202,11 +2201,11 @@ async fn test_full_crash_recovery_scenario() {
 			txn.set(format!("batch_b_{i}").as_bytes(), b"value_b").unwrap();
 			txn.commit().await.unwrap();
 		}
-		tree.core.inner.wal.write().rotate().unwrap();
-		tree.flush().unwrap();
+		crate::test::support::rotate_wal(&tree);
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Get log_number after second flush (two closed, flushed segments)
-		let log_number_after_b = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let log_number_after_b = crate::test::support::wal_log_number(&tree);
 		assert!(log_number_after_b >= 2, "floor should pass the two closed, flushed segments");
 
 		tree.close().await.unwrap();
@@ -2281,7 +2280,7 @@ async fn test_concurrent_flush_after_rotation() {
 
 	// Call flush which rotates the active memtable and drains every queue;
 	// it must handle an empty memtable gracefully
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Verify data is still accessible after flush
 	{
@@ -2387,7 +2386,7 @@ async fn test_wal_append_after_crash_recovery() {
 		txn.set(b"key1", b"value1").unwrap();
 		txn.commit().await.unwrap();
 
-		let manifest_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let manifest_log = crate::test::support::wal_log_number(&tree);
 		tree.close().await.unwrap();
 		manifest_log
 	};
@@ -2400,7 +2399,7 @@ async fn test_wal_append_after_crash_recovery() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-		let wal_num_after_reopen = tree.core.inner.wal.read().get_active_log_number();
+		let wal_num_after_reopen = crate::test::support::active_wal_segment(&tree);
 
 		// CRITICAL: WAL number should be SAME as before (appending to existing)
 		assert_eq!(wal_num_after_reopen, 0, "WAL should reuse existing file #0 since log_number=0");
@@ -2410,7 +2409,7 @@ async fn test_wal_append_after_crash_recovery() {
 		txn.set(b"key2", b"value2").unwrap();
 		txn.commit().await.unwrap();
 
-		let wal_num_after_write = tree.core.inner.wal.read().get_active_log_number();
+		let wal_num_after_write = crate::test::support::active_wal_segment(&tree);
 
 		// Should still be same WAL
 		assert_eq!(
@@ -2521,7 +2520,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 		}
 
 		let sst_before = count_ssts();
-		tree.flush().unwrap(); // Explicit flush
+		tree.drain_flushes_synchronously().unwrap(); // Explicit flush
 		let sst_after = count_ssts();
 
 		{
@@ -2554,8 +2553,8 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 
 		let sst_before = count_ssts();
 		// Close the segment so the replay floor can pass it once flushed
-		tree.core.inner.wal.write().rotate().unwrap();
-		tree.flush().unwrap();
+		crate::test::support::rotate_wal(&tree);
+		tree.drain_flushes_synchronously().unwrap();
 		let sst_after = count_ssts();
 
 		{
@@ -2679,13 +2678,13 @@ async fn test_flush_on_close_option_comparison() {
 			txn.set(b"test", b"data").unwrap();
 			txn.commit().await.unwrap();
 
-			sst_before = tree.core.inner.level_manifest.read().unwrap().iter().count();
+			sst_before = crate::test::support::total_table_count(&tree);
 
 			tree.close().await.unwrap();
 		}
 
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let sst_after = tree.core.inner.level_manifest.read().unwrap().iter().count();
+		let sst_after = crate::test::support::total_table_count(&tree);
 
 		assert_eq!(sst_after, sst_before + 1, "flush_on_close=true should create SST");
 		tree.close().await.unwrap();
@@ -2705,13 +2704,13 @@ async fn test_flush_on_close_option_comparison() {
 			txn.set(b"test", b"data").unwrap();
 			txn.commit().await.unwrap();
 
-			sst_before = tree.core.inner.level_manifest.read().unwrap().iter().count();
+			sst_before = crate::test::support::total_table_count(&tree);
 
 			tree.close().await.unwrap();
 		}
 
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let sst_after = tree.core.inner.level_manifest.read().unwrap().iter().count();
+		let sst_after = crate::test::support::total_table_count(&tree);
 
 		assert_eq!(sst_after, sst_before, "flush_on_close=false should NOT create SST");
 
@@ -2879,14 +2878,14 @@ async fn test_sst_table_ids_ordered_correctly_on_close() {
 		}
 
 		// Get initial table count
-		let initial_count = tree.core.inner.level_manifest.read().unwrap().iter().count();
+		let initial_count = crate::test::support::total_table_count(&tree);
 
 		// Close triggers flush
 		tree.close().await.unwrap();
 
 		// Reopen and verify table count increased
 		let tree2 = Tree::new(Arc::clone(&opts)).unwrap();
-		let after_count = tree2.core.inner.level_manifest.read().unwrap().iter().count();
+		let after_count = crate::test::support::total_table_count(&tree2);
 
 		assert_eq!(after_count, initial_count + 1, "Should have one more SST after close flush");
 
@@ -2924,7 +2923,7 @@ async fn test_wal_number_tracking_on_flush() {
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 	// Get initial state
-	let initial_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	let initial_log_number = crate::test::support::wal_log_number(&tree);
 	let initial_wal_number = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
 	log::info!(
 		"Initial state: log_number={}, wal_number={}",
@@ -2939,11 +2938,11 @@ async fn test_wal_number_tracking_on_flush() {
 
 	// Close the segment explicitly (WAL rotation is size-driven and
 	// independent of memtable rotation), then flush.
-	tree.core.inner.wal.write().rotate().unwrap();
-	tree.flush().unwrap();
+	crate::test::support::rotate_wal(&tree);
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Verify log_number increased to wal_number + 1
-	let after_flush_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	let after_flush_log = crate::test::support::wal_log_number(&tree);
 	assert_eq!(
 		after_flush_log,
 		initial_wal_number + 1,
@@ -2969,10 +2968,10 @@ async fn test_wal_number_tracking_on_flush() {
 	txn.set(b"key2", b"value2").unwrap();
 	txn.commit().await.unwrap();
 
-	tree.core.inner.wal.write().rotate().unwrap();
-	tree.flush().unwrap();
+	crate::test::support::rotate_wal(&tree);
+	tree.drain_flushes_synchronously().unwrap();
 
-	let after_second_flush_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	let after_second_flush_log = crate::test::support::wal_log_number(&tree);
 	assert_eq!(
 		after_second_flush_log,
 		new_wal_number + 1,
@@ -3024,8 +3023,8 @@ async fn test_memtable_wal_number_after_swap() {
 
 	// Memtable rotation no longer rotates the shared WAL; close the segment
 	// explicitly so the replacement memtable starts on a newer one.
-	tree.core.inner.wal.write().rotate().unwrap();
-	tree.flush().unwrap();
+	crate::test::support::rotate_wal(&tree);
+	tree.drain_flushes_synchronously().unwrap();
 
 	let wal_2 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
 	log::info!("WAL number after first flush: {}", wal_2);
@@ -3036,8 +3035,8 @@ async fn test_memtable_wal_number_after_swap() {
 	txn.set(b"key2", b"value2").unwrap();
 	txn.commit().await.unwrap();
 
-	tree.core.inner.wal.write().rotate().unwrap();
-	tree.flush().unwrap();
+	crate::test::support::rotate_wal(&tree);
+	tree.drain_flushes_synchronously().unwrap();
 
 	let wal_3 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
 	log::info!("WAL number after second flush: {}", wal_3);
@@ -3091,20 +3090,20 @@ async fn test_wal_number_correct_after_reopen() {
 			txn.set(format!("key{}", i).as_bytes(), b"value").unwrap();
 			txn.commit().await.unwrap();
 			// Segments close by size policy; forced here per cycle
-			tree.core.inner.wal.write().rotate().unwrap();
-			tree.flush().unwrap();
+			crate::test::support::rotate_wal(&tree);
+			tree.drain_flushes_synchronously().unwrap();
 
 			log::info!(
 				"After flush {}: flushed WAL {}, new log_number={}",
 				i,
 				current_wal,
-				tree.core.inner.level_manifest.read().unwrap().get_log_number()
+				crate::test::support::wal_log_number(&tree)
 			);
 		}
 
 		// The last WAL that was flushed is the one before the final flush
-		last_flushed_wal = tree.core.inner.level_manifest.read().unwrap().get_log_number() - 1;
-		final_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		last_flushed_wal = crate::test::support::wal_log_number(&tree) - 1;
+		final_log_number = crate::test::support::wal_log_number(&tree);
 
 		log::info!(
 			"Before close: last_flushed_wal={}, final_log_number={}",
@@ -3119,7 +3118,7 @@ async fn test_wal_number_correct_after_reopen() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-		let reopened_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let reopened_log_number = crate::test::support::wal_log_number(&tree);
 		let active_wal_number = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
 
 		log::info!(
@@ -3260,7 +3259,7 @@ async fn test_cleanup_orphaned_sst_files() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1").unwrap();
 		txn.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 		tree.close().await.unwrap();
 	}
 
@@ -3314,8 +3313,8 @@ async fn test_manifest_atomic_sst_and_log_number() {
 	}
 
 	// Close the segment, then explicitly trigger flush
-	tree.core.inner.wal.write().rotate().unwrap();
-	tree.flush().unwrap();
+	crate::test::support::rotate_wal(&tree);
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Verify that when SST is added, log_number is also updated
 	{
@@ -3405,7 +3404,7 @@ async fn test_crash_recovery_with_orphaned_sst() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"committed_key", b"committed_value").unwrap();
 		txn.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 		tree.close().await.unwrap();
 	}
 
@@ -3504,7 +3503,7 @@ async fn test_valid_ssts_not_deleted_during_cleanup() {
 			txn.commit().await.unwrap();
 		}
 
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Get list of valid table IDs
 		let ids = {
@@ -3573,7 +3572,7 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 				txn.commit().await.unwrap();
 			}
 			// Force flush after each batch
-			tree.flush().unwrap();
+			tree.drain_flushes_synchronously().unwrap();
 		}
 
 		tree.close().await.unwrap();
@@ -3794,7 +3793,7 @@ async fn test_wal_incremental_number_after_flush_and_reopen() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-		let wal_num_before = tree.core.inner.wal.read().get_active_log_number();
+		let wal_num_before = crate::test::support::active_wal_segment(&tree);
 		assert_eq!(wal_num_before, 0, "Fresh database should start at WAL #0");
 
 		let mut txn = tree.begin().unwrap();
@@ -3808,7 +3807,7 @@ async fn test_wal_incremental_number_after_flush_and_reopen() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-		let wal_num_after_reopen = tree.core.inner.wal.read().get_active_log_number();
+		let wal_num_after_reopen = crate::test::support::active_wal_segment(&tree);
 
 		// CRITICAL: WAL number should be > 0 since WAL #0 was flushed
 		assert!(
@@ -3860,10 +3859,10 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1_from_sst").unwrap();
 		txn.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
-		log_number_after_phase1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-		last_seq_after_phase1 = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
+		log_number_after_phase1 = crate::test::support::wal_log_number(&tree);
+		last_seq_after_phase1 = crate::test::support::manifest_last_sequence(&tree);
 		log::info!(
 			"Phase 1: After flush, log_number={}, last_seq={}",
 			log_number_after_phase1,
@@ -3954,8 +3953,8 @@ async fn test_recovery_with_manually_created_wal_segments() {
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-		active_wal_after_recovery = tree.core.inner.wal.read().get_active_log_number();
-		let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		active_wal_after_recovery = crate::test::support::active_wal_segment(&tree);
+		let log_number = crate::test::support::wal_log_number(&tree);
 		log::info!(
 			"Phase 3: active_wal={}, log_number={}, highest_created={}",
 			active_wal_after_recovery,
@@ -3984,9 +3983,8 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		log::info!("Phase 3: Wrote key4 to WAL segment {}", active_wal_after_recovery);
 
 		// Flush - this updates log_number
-		tree.flush().unwrap();
-		let log_number_after_flush =
-			tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		tree.drain_flushes_synchronously().unwrap();
+		let log_number_after_flush = crate::test::support::wal_log_number(&tree);
 		log::info!("Phase 3: After flush, log_number={}", log_number_after_flush);
 
 		// Write more data that stays in WAL (not flushed)
@@ -4206,7 +4204,7 @@ async fn test_range_key_ordering_correctness() {
 	}
 
 	// Flush to disk
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Test AFTER flush (SSTable path)
 	{
@@ -4361,7 +4359,7 @@ async fn test_range_prefix_differentiation() {
 	}
 
 	// Flush and test after flush
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	{
 		let txn = tree.begin().unwrap();
@@ -4475,7 +4473,7 @@ async fn test_range_exclusive_boundaries() {
 	}
 
 	// Flush and test after flush
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	{
 		let txn = tree.begin().unwrap();
@@ -4596,7 +4594,7 @@ async fn test_range_boundary_edge_cases() {
 	}
 
 	// Flush and test after flush
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	{
 		let txn = tree.begin().unwrap();
@@ -4646,7 +4644,7 @@ async fn test_recovery_detects_corrupt_log_number() {
 
 		// One explicit flush publishes the first root version (the poison
 		// target); flush_on_close stays off so WAL segments remain on disk.
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 		tree.close().await.unwrap();
 	}
 
@@ -4852,7 +4850,7 @@ async fn a_store_reopens_when_l1_key_order_and_sequence_order_disagree() {
 				let mut tx = tree.begin().unwrap();
 				tx.set(key, value).unwrap();
 				tx.commit().await.unwrap();
-				tree.flush().unwrap();
+				tree.drain_flushes_synchronously().unwrap();
 			}
 			let strategy = Arc::new(crate::compaction::leveled::Strategy::from_options(
 				Arc::clone(&tree.core.inner.opts),

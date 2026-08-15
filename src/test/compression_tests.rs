@@ -499,7 +499,7 @@ async fn test_lsm_compression_10k_keys_with_range_scans() {
 		txn.commit().await.unwrap();
 	}
 
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	println!("Flushed all keys to SSTable");
 
@@ -598,7 +598,7 @@ async fn test_lsm_compression_persistence_after_reopen() {
 		}
 
 		println!("Flushing to SSTables...");
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		println!("Closing tree...");
 		tree.close().await.unwrap();
@@ -756,10 +756,10 @@ async fn test_lsm_compression_disk_size_comparison() {
 	}
 
 	println!("Flushing compressed tree...");
-	tree_compressed.flush().unwrap();
+	tree_compressed.drain_flushes_synchronously().unwrap();
 
 	println!("Flushing uncompressed tree...");
-	tree_uncompressed.flush().unwrap();
+	tree_uncompressed.drain_flushes_synchronously().unwrap();
 
 	tree_compressed.close().await.unwrap();
 	tree_uncompressed.close().await.unwrap();
@@ -933,7 +933,7 @@ async fn test_compression_per_level_sstable_creation() {
 	}
 
 	// Force flush to create L0 SSTable
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// Verify data can be read back
 	for key in &keys {
@@ -991,7 +991,7 @@ async fn test_compression_per_level_with_different_levels() {
 	}
 
 	// Force flush and compaction
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// The test mainly verifies that the system doesn't crash with per-level
 	// compression In a real LSM tree, we'd need to trigger compaction to higher

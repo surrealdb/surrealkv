@@ -64,7 +64,7 @@ async fn power_loss_after_compaction_must_not_lose_synced_data() {
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
 		txn.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 	}
 
 	let l0_ids: Vec<u64> = {
@@ -107,7 +107,7 @@ async fn power_loss_after_compaction_must_not_lose_synced_data() {
 			txn.set(key.as_bytes(), value.as_bytes()).unwrap();
 		}
 		txn.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 	}
 	let sibling_id = {
 		let manifest = tree.core.inner.level_manifest.read().unwrap();
@@ -185,7 +185,7 @@ async fn manifest_referencing_zero_byte_sst_fails_cleanly() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key", b"value").unwrap();
 		txn.commit().await.unwrap();
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		let table_id = {
 			let manifest = tree.core.inner.level_manifest.read().unwrap();
@@ -208,4 +208,21 @@ async fn manifest_referencing_zero_byte_sst_fails_cleanly() {
 		}
 		Err(other) => panic!("expected LoadManifestFail, got: {other}"),
 	}
+}
+
+/// The sync ledger refuses to answer about anything that is not an SSTable.
+///
+/// `fsync_file` is called from exactly three places and all three are SST
+/// paths, so the ledger contains only SSTs. That makes `was_synced` answer
+/// `false` for a WAL segment — not because the segment is vulnerable, but
+/// because it was never a candidate. A power-loss simulation that widened its
+/// walk from `opts.sstable_dir()` to the store root would act on that `false`
+/// and truncate durable data.
+///
+/// Until 2026-08-15 the only thing preventing that was each caller remembering
+/// to filter on the extension. Now it panics instead.
+#[test]
+#[should_panic(expected = "which is not an SSTable")]
+fn the_sync_ledger_refuses_to_answer_about_a_non_sstable() {
+	sync_tracker::was_synced(std::path::Path::new("/tmp/surrealkv-probe/000000000000000001.wal"));
 }

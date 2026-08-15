@@ -1362,6 +1362,11 @@ impl CoreInner {
 			table.file_size
 		);
 
+		// The single point at which a memtable has become a table. Both the
+		// background worker and the synchronous drain reach it, so the counter
+		// means the same thing whichever scheduled the work.
+		self.metrics.record_memtable_flush();
+
 		Ok(Some(table))
 	}
 
@@ -1823,13 +1828,6 @@ impl std::ops::Deref for Core {
 	}
 }
 
-/// How long the fork fence waits for in-flight commits to leave the pipeline
-/// before giving up. The wait is normally microseconds — the batches are
-/// already WAL-durable and only need their memtable apply and publish. A commit
-/// whose future was dropped between enqueue and apply would otherwise hold the
-/// fence, and with it every writer, forever.
-const FORK_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
 impl Core {
 	/// Forks `child_name` off `parent_name` at `at`.
 	///
@@ -1930,7 +1928,7 @@ impl Core {
 		let (head, drain) = {
 			let fence_taken = std::time::Instant::now();
 			let _fence = self.commit_pipeline.lock_writes();
-			let deadline = fence_taken + FORK_DRAIN_TIMEOUT;
+			let deadline = fence_taken + self.inner.opts.fork_drain_timeout;
 			while !self.commit_pipeline.is_drained() {
 				if std::time::Instant::now() >= deadline {
 					return Err(Error::ForkFenceTimeout);
@@ -2783,10 +2781,26 @@ impl Tree {
 		self.core.close().await
 	}
 
-	/// Flushes all memtables to disk synchronously.
-	/// This is a blocking operation that ensures all data is persisted before returning.
+	/// Drains every pending memtable to an SSTable **on the calling thread**,
+	/// bypassing the background flush worker.
+	///
+	/// The work is the same either way — the worker's `compact_memtable` is
+	/// literally `flush_oldest_immutable_to_sst`, which is what this calls in a
+	/// loop. What differs is the *scheduling*: nothing else is running while
+	/// this executes, because the caller is blocked inside it.
+	///
+	/// That makes it a good barrier for a test that wants a quiescent store, and
+	/// the wrong tool for a test about anything racing a flush — a rotation
+	/// concurrent with a read, a branch deleted while its own flush is in
+	/// flight, a compaction scheduled off a flush that has not published. For
+	/// those, use [`Tree::flush_and_wait`], which goes through the worker.
+	///
+	/// Note it rotates only the **default** runtime's active memtable, so a
+	/// non-default branch's writes stay in its memtable unless something else
+	/// rotated them; `crate::test::support::flush_branch_to_table` handles that
+	/// case and asserts a table appeared.
 	#[cfg(test)]
-	pub(crate) fn flush(&self) -> Result<()> {
+	pub(crate) fn drain_flushes_synchronously(&self) -> Result<()> {
 		// Step 1: Rotate active memtable if it has data
 		{
 			let active = self.core.inner.active_memtable.read()?;
@@ -2803,6 +2817,53 @@ impl Tree {
 		self.core.write_stall.signal_work_done();
 
 		Ok(())
+	}
+
+	/// Rotates the active memtable and waits for the **background worker** to
+	/// turn it into an SSTable.
+	///
+	/// This is the durability barrier that goes through the shipped path: it
+	/// rotates, rings production's own bell (`wake_up_memtable`), and then waits
+	/// for the flush counter to advance and the backlog to empty. Use it
+	/// whenever the test is about something happening *while* a flush is in
+	/// flight; use [`Tree::drain_flushes_synchronously`] when you just want a
+	/// quiescent store.
+	///
+	/// It must be `async`: the worker is a spawned task, and tests run on a
+	/// current-thread runtime by default, so a blocking wait would never let the
+	/// worker run.
+	///
+	/// Returns whether the flush was observed. `false` means the deadline passed
+	/// — treat that as a failure rather than proceeding, because it means the
+	/// data is not durable yet.
+	#[cfg(test)]
+	pub(crate) async fn flush_and_wait(&self) -> Result<bool> {
+		use crate::lsm::CompactionOperations as _;
+
+		let before = self.metrics()?.memtable_flushes;
+
+		{
+			let active = self.core.inner.active_memtable.read()?;
+			if active.is_empty() && !self.core.inner.has_pending_immutables() {
+				// Nothing to flush; the counter would never advance.
+				return Ok(true);
+			}
+			if !active.is_empty() {
+				drop(active);
+				self.core.inner.rotate_memtable()?;
+			}
+		}
+
+		// Production's own signal, not a private back door.
+		if let Some(ref task_manager) = *self.core.task_manager.lock().unwrap() {
+			task_manager.wake_up_memtable();
+		}
+
+		Ok(crate::test::support::wait_until(|| {
+			self.metrics().map(|m| m.memtable_flushes > before).unwrap_or(false)
+				&& !self.core.inner.has_pending_immutables()
+		})
+		.await)
 	}
 
 	#[cfg(test)]
@@ -3494,6 +3555,13 @@ impl TreeBuilder {
 	/// Set the L0 stall threshold.
 	pub fn with_l0_stall_threshold(mut self, value: usize) -> Self {
 		self.opts = self.opts.with_l0_stall_threshold(value);
+		self
+	}
+
+	/// Set how long the fork fence waits for in-flight commits to drain before
+	/// returning `ForkFenceTimeout`.
+	pub fn with_fork_drain_timeout(mut self, value: std::time::Duration) -> Self {
+		self.opts = self.opts.with_fork_drain_timeout(value);
 		self
 	}
 

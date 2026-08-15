@@ -365,7 +365,7 @@ async fn test_stall_check_at_arena_full() {
 	}
 
 	// Should have rotated and created immutable memtables
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 	tree.close().await.unwrap();
 }
 
@@ -448,7 +448,7 @@ async fn test_flush_waits_for_active_writers() {
 	}
 
 	// Flush should complete successfully (waited for any active writers)
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// All data should be readable
 	for i in 0..30 {

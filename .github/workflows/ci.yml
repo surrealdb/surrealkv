@@ -86,6 +86,13 @@ jobs:
 
       - name: Clippy
         run: cargo clippy -- -Dwarnings
+      # A `#[cfg(test)]` item that nothing calls raises no dead-code warning in a
+      # release build, so it can sit behind the attribute forever — the loophole
+      # in the `allow(dead_code)` guard (docs/KNOWN_GAPS.md §7). It IS dead in the
+      # test build, where the compiler sees it, so compiling the tests with
+      # warnings denied catches it. Verified to catch a planted item, 2026-08-15.
+      - name: No dead test-only code
+        run: RUSTFLAGS="-D warnings" cargo test --lib --no-run
       - name: Build WASM
         run: |
           rustup target add wasm32-unknown-unknown

@@ -61,6 +61,158 @@ where
 	(tree, temp_dir)
 }
 
+/// Flushes one branch's own memtable to an SSTable, and asserts a table
+/// actually appeared.
+///
+/// `Tree::drain_flushes_synchronously` rotates only the **default** runtime's
+/// active memtable (`CoreInner::rotate_memtable` →
+/// `rotate_runtime_memtable(&default_runtime)`), so a non-default branch's
+/// writes stay in its own memtable and a test that drains and then believes it
+/// is reading tables is reading the memtable. That vacuity is the reason this
+/// asserts rather than just flushes.
+///
+/// This is the one place a test reaches `core.inner` for the runtime registry,
+/// so the reach is confined here instead of repeated per file.
+pub(crate) fn flush_branch_to_table(store: &Tree, name: &str) {
+	let owner = {
+		let catalog = store.core.inner.branch_catalog.read().unwrap();
+		let record =
+			catalog.get_by_name(name).unwrap_or_else(|_| panic!("branch {name} must exist"));
+		crate::batch::BatchOwner {
+			branch: record.id,
+			generation: record.generation,
+		}
+	};
+	let runtime = store.core.inner.runtimes.get(owner).expect("branch must have a runtime");
+	store.core.inner.rotate_runtime_memtable(&runtime, 0).unwrap();
+	store.core.inner.flush_all_immutables_sync().unwrap();
+	assert!(
+		owner_table_count(store, name) > 0,
+		"branch {name} was flushed but produced no table; anything reading `on disk` after this \
+		 would still be reading the memtable"
+	);
+}
+
+/// Rotates one branch's memtable and waits for the **background worker** to
+/// turn it into a table.
+///
+/// The async twin of [`flush_branch_to_table`], for tests about something
+/// happening while a flush is in flight. Keeps the same assertion that a table
+/// actually appeared — that is what caught a vacuous test in V9.
+pub(crate) async fn flush_branch_and_wait(store: &Tree, name: &str) {
+	let before = owner_table_count(store, name);
+	rotate_branch_and_signal(store, name);
+	assert!(
+		wait_until(|| owner_table_count(store, name) > before).await,
+		"the background worker never flushed branch {name}; it is not durable, so anything \
+         asserted after this would be reading the memtable"
+	);
+}
+
+/// Puts one branch's memtable in front of the background worker and returns
+/// **without waiting**.
+///
+/// For tests that want a flush *in flight* rather than finished — racing a
+/// delete, a compaction or a read against it. `Tree::flush_and_wait` will not
+/// serve: it rotates only the default runtime, so a test using it while claiming
+/// to race "the branch's own flush" would in fact be racing `main`'s.
+pub(crate) fn rotate_branch_and_signal(store: &Tree, name: &str) {
+	let owner = {
+		let catalog = store.core.inner.branch_catalog.read().unwrap();
+		let record =
+			catalog.get_by_name(name).unwrap_or_else(|_| panic!("branch {name} must exist"));
+		crate::batch::BatchOwner {
+			branch: record.id,
+			generation: record.generation,
+		}
+	};
+	let runtime = store.core.inner.runtimes.get(owner).expect("branch must have a runtime");
+	store.core.inner.rotate_runtime_memtable(&runtime, 0).unwrap();
+
+	// Production's own signal; the worker drains every runtime's backlog, not
+	// just the default one.
+	if let Some(ref task_manager) = *store.core.task_manager.lock().unwrap() {
+		task_manager.wake_up_memtable();
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Accessors for internals tests legitimately need.
+//
+// Every one of these replaced a `store.core.inner.<field>` reach repeated across
+// the suite. They exist so that renaming a `CoreInner` field is a small edit
+// rather than a 150-site one — which matters most for `level_manifest`, the
+// field the async port turns into atomic-swap versions.
+//
+// This is principle 4's allowed case (`docs/PATTERNS.md`): a `#[cfg(test)]`
+// accessor on a production type, for a test that genuinely needs an internal.
+// ---------------------------------------------------------------------------
+
+/// The manifest's WAL log number — segments below it are reclaimable.
+pub(crate) fn wal_log_number(store: &Tree) -> u64 {
+	store.core.inner.level_manifest.read().unwrap().get_log_number()
+}
+
+/// The last sequence the manifest has persisted.
+pub(crate) fn manifest_last_sequence(store: &Tree) -> u64 {
+	store.core.inner.level_manifest.read().unwrap().get_last_sequence()
+}
+
+/// SSTables across every owner and level.
+pub(crate) fn total_table_count(store: &Tree) -> usize {
+	store.core.inner.level_manifest.read().unwrap().iter().count()
+}
+
+/// Live branch runtimes, including the default one.
+pub(crate) fn runtime_count(store: &Tree) -> usize {
+	store.core.inner.runtimes.len()
+}
+
+/// Summed arena capacity of every runtime's memtables — the write-buffer budget
+/// this store is actually consuming.
+pub(crate) fn total_arena_bytes(store: &Tree) -> u64 {
+	store.core.inner.runtimes.total_arena_capacity_bytes()
+}
+
+/// Runs one branch-maintenance pass: expire due branches, prune lineages.
+/// Returns `(expired, pruned)`.
+pub(crate) fn sweep(store: &Tree) -> (usize, usize) {
+	store.core.inner.sweep_branch_maintenance().unwrap()
+}
+
+/// Rotates the WAL to a fresh segment.
+pub(crate) fn rotate_wal(store: &Tree) {
+	store.core.inner.wal.write().rotate().unwrap();
+}
+
+/// The WAL segment currently being appended to.
+pub(crate) fn active_wal_segment(store: &Tree) -> u64 {
+	store.core.inner.wal.read().get_active_log_number()
+}
+
+/// SSTables at L0 belonging to a branch.
+pub(crate) fn owner_table_count(store: &Tree, name: &str) -> usize {
+	let owner = {
+		let catalog = store.core.inner.branch_catalog.read().unwrap();
+		let Ok(record) = catalog.get_by_name(name) else {
+			return 0;
+		};
+		crate::batch::BatchOwner {
+			branch: record.id,
+			generation: record.generation,
+		}
+	};
+	store
+		.core
+		.inner
+		.level_manifest
+		.read()
+		.unwrap()
+		.levels_for(owner)
+		.map(|levels| levels.get_levels()[0].tables.len())
+		.unwrap_or(0)
+}
+
 /// How long [`wait_until`] keeps polling before giving up. Generous on purpose:
 /// it is a deadlock backstop, not a timing assertion. A test that needs a
 /// *short* deadline to be meaningful is measuring the machine.

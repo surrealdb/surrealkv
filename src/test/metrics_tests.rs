@@ -79,7 +79,7 @@ async fn detaches_are_counted_only_when_a_parent_link_is_cleared() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	store.fork_branch("main", "child", ForkPoint::Head).unwrap();
 	assert_eq!(metrics(&store).detaches, 0);
 
@@ -167,13 +167,13 @@ async fn reclaimed_branches_are_counted_when_the_sweep_releases_them() {
 	assert_eq!(tombstoned.branches_reclaimed, 0, "deleting tombstones the entry, nothing more");
 	assert_eq!(tombstoned.tables_reclaimed, 0);
 
-	store.core.inner.sweep_branch_maintenance().unwrap();
+	crate::test::support::sweep(&store);
 	let swept = metrics(&store);
 	assert_eq!(swept.branches_reclaimed, 1);
 	assert_eq!(swept.tables_reclaimed, 1, "the branch had flushed one table of its own");
 
 	// The twin: sweeping again has nothing left to release.
-	store.core.inner.sweep_branch_maintenance().unwrap();
+	crate::test::support::sweep(&store);
 	let again = metrics(&store);
 	assert_eq!(again.branches_reclaimed, 1, "a second sweep releases nothing");
 	assert_eq!(again.tables_reclaimed, 1);
@@ -186,7 +186,7 @@ async fn reclaimed_branches_are_counted_when_the_sweep_releases_them() {
 	txn.set(b"in-memory-only", b"v").unwrap();
 	txn.commit().await.unwrap();
 	store.delete_branch("never-flushed").unwrap();
-	store.core.inner.sweep_branch_maintenance().unwrap();
+	crate::test::support::sweep(&store);
 	let empty = metrics(&store);
 	assert_eq!(empty.branches_reclaimed, 2);
 	assert_eq!(empty.tables_reclaimed, 1, "it had nothing on disk to free");
@@ -195,7 +195,7 @@ async fn reclaimed_branches_are_counted_when_the_sweep_releases_them() {
 	// releases nothing and is not counted.
 	store.fork_branch("main", "untouched", ForkPoint::Head).unwrap();
 	store.delete_branch("untouched").unwrap();
-	store.core.inner.sweep_branch_maintenance().unwrap();
+	crate::test::support::sweep(&store);
 	assert_eq!(
 		metrics(&store).branches_reclaimed,
 		2,
@@ -212,7 +212,7 @@ async fn versions_kept_for_an_anchor_are_counted() {
 		let mut txn = store.begin().unwrap();
 		txn.set(b"k", b"v1").unwrap();
 		txn.commit().await.unwrap();
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 
 		if fork {
 			store.fork_branch("main", "reader", ForkPoint::Head).unwrap();
@@ -222,7 +222,7 @@ async fn versions_kept_for_an_anchor_are_counted() {
 			let mut txn = store.begin().unwrap();
 			txn.set(b"k", format!("v{round}").as_bytes()).unwrap();
 			txn.commit().await.unwrap();
-			store.flush().unwrap();
+			store.drain_flushes_synchronously().unwrap();
 		}
 		assert!(store.core.inner.snapshot_tracker.get_all_snapshots().is_empty());
 		let strategy = Arc::new(Strategy::from_options(Arc::clone(&store.core.inner.opts)));
@@ -274,7 +274,7 @@ async fn gauges_follow_the_state_they_are_derived_from() {
 	assert_eq!(metrics(&store).live_branches, 2);
 
 	// And flushing releases the WAL dependency the commit held.
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	assert_eq!(
 		metrics(&store).wal_pinned_segments,
 		0,

@@ -110,7 +110,7 @@ async fn a_failed_publish_leaves_a_detached_branch_reading_through_its_parent() 
 	let mut txn = store.begin().unwrap();
 	txn.set(b"inherited", b"from-parent").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
 	let mut txn = child.begin().unwrap();
@@ -161,7 +161,7 @@ async fn a_failed_publish_leaves_an_expiring_branch_alive_until_the_next_sweep()
 	assert!(branch_exists(&store, "ephemeral"), "expired in memory without being published");
 
 	// Control: the next sweep completes the expiry.
-	let (expired, _) = store.core.inner.sweep_branch_maintenance().unwrap();
+	let (expired, _) = crate::test::support::sweep(&store);
 	assert_eq!(expired, 1);
 	assert!(!branch_exists(&store, "ephemeral"));
 }
@@ -264,7 +264,7 @@ async fn a_failed_root_publish_during_reclamation_puts_the_owner_back() {
 	// Control: the retry completes and the table is actually released. Without
 	// the rollback above this reclaims nothing, because the owner would already
 	// be gone from the manifest.
-	store.core.inner.sweep_branch_maintenance().unwrap();
+	crate::test::support::sweep(&store);
 	assert_eq!(owned_tables(&store), 0);
 	assert_eq!(store.metrics().unwrap().tables_reclaimed, 1, "the retry freed the table");
 }

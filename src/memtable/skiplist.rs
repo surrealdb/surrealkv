@@ -17,6 +17,7 @@
 // https://github.com/cockroachdb/pebble/blob/master/internal/arenaskl/skl.go
 
 use std::cmp::Ordering;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 use std::sync::Arc;
 
@@ -638,20 +639,31 @@ impl Skiplist {
 
 	/// Create iterator
 	pub(crate) fn iter(&self) -> SkiplistIterator<'_> {
-		self.new_iter(None, None)
+		self.new_iter(Bound::Unbounded, Bound::Unbounded)
 	}
 
-	/// Create iterator with bounds
+	/// Create iterator with bounds.
+	///
+	/// Takes real [`Bound`]s rather than `Option<&[u8]>`. The old signature
+	/// could only express *inclusive lower, exclusive upper*, so a caller
+	/// wanting an inclusive upper or an exclusive lower had no way to say so and
+	/// the bound was silently widened. Nothing could reach that until
+	/// `merge_range` and `revert_range` began accepting caller-supplied bounds.
 	pub(crate) fn new_iter<'b>(
 		&'b self,
-		lower: Option<&[u8]>,
-		upper: Option<&[u8]>,
+		lower: Bound<&[u8]>,
+		upper: Bound<&[u8]>,
 	) -> SkiplistIterator<'b> {
+		let owned = |bound: Bound<&[u8]>| match bound {
+			Bound::Included(key) => Bound::Included(key.to_vec()),
+			Bound::Excluded(key) => Bound::Excluded(key.to_vec()),
+			Bound::Unbounded => Bound::Unbounded,
+		};
 		SkiplistIterator {
 			list: self,
 			nd: self.head,
-			lower: lower.map(|s| s.to_vec()),
-			upper: upper.map(|s| s.to_vec()),
+			lower: owned(lower),
+			upper: owned(upper),
 			lower_node: std::ptr::null_mut(),
 			upper_node: std::ptr::null_mut(),
 			encoded_key_buf: Vec::new(),
@@ -667,14 +679,62 @@ impl Skiplist {
 pub(crate) struct SkiplistIterator<'a> {
 	list: &'a Skiplist,
 	nd: *mut Node,
-	lower: Option<Vec<u8>>,   // Inclusive lower bound
-	upper: Option<Vec<u8>>,   // Exclusive upper bound
+	lower: Bound<Vec<u8>>,    // Lower bound, inclusive or exclusive
+	upper: Bound<Vec<u8>>,    // Upper bound, inclusive or exclusive
 	lower_node: *mut Node,    // Cached node at lower bound
 	upper_node: *mut Node,    // Cached node at upper bound
 	encoded_key_buf: Vec<u8>, // Buffer for encoded key to return InternalKeyRef
 }
 
 impl<'a> SkiplistIterator<'a> {
+	/// Whether `key` falls short of the lower bound.
+	///
+	/// This and [`SkiplistIterator::past_upper`] are the ONLY places the
+	/// inclusivity of a bound is decided. Previously each of the six positioning
+	/// sites open-coded it into a comparison operator — which is why the
+	/// interface could not grow an exclusive lower or an inclusive upper without
+	/// editing all six, and why it never did.
+	#[inline]
+	fn before_lower(&self, key: &[u8]) -> bool {
+		match &self.lower {
+			Bound::Unbounded => false,
+			// out if key < lower
+			Bound::Included(lower) => (self.list.cmp)(lower, key) == Ordering::Greater,
+			// out if key <= lower
+			Bound::Excluded(lower) => (self.list.cmp)(lower, key) != Ordering::Less,
+		}
+	}
+
+	/// Whether `key` lies past the upper bound.
+	#[inline]
+	fn past_upper(&self, key: &[u8]) -> bool {
+		match &self.upper {
+			Bound::Unbounded => false,
+			// out if key > upper
+			Bound::Included(upper) => (self.list.cmp)(upper, key) == Ordering::Less,
+			// out if key >= upper
+			Bound::Excluded(upper) => (self.list.cmp)(upper, key) != Ordering::Greater,
+		}
+	}
+
+	/// After any forward positioning: step over entries short of the lower
+	/// bound, then stop if the result is past the upper bound.
+	fn settle_forward(&mut self) {
+		while self.is_valid() && self.before_lower(self.key_bytes()) {
+			self.nd = self.list.get_next(self.nd, 0);
+			if self.nd == self.list.tail || self.nd == self.upper_node {
+				return;
+			}
+		}
+		if self.nd == self.list.tail || self.nd == self.upper_node {
+			return;
+		}
+		if self.is_valid() && self.past_upper(self.key_bytes()) {
+			self.upper_node = self.nd;
+			self.nd = self.list.tail;
+		}
+	}
+
 	/// Check if iterator is valid
 	#[inline]
 	pub fn is_valid(&self) -> bool {
@@ -724,26 +784,14 @@ impl<'a> SkiplistIterator<'a> {
 
 	/// Move to first entry within bounds
 	pub fn first(&mut self) {
-		// If we have a lower bound, seek to it; otherwise start at the beginning
-		if let Some(ref lower) = self.lower.clone() {
-			self.seek_ge(lower);
-		} else {
-			self.nd = self.list.get_next(self.list.head, 0);
+		// Seek to the lower bound if there is one, else start at the beginning.
+		// An EXCLUDED lower lands on the bound key itself, which `settle_forward`
+		// then steps over — including every version of it.
+		match self.lower.clone() {
+			Bound::Included(lower) | Bound::Excluded(lower) => self.seek_ge(&lower),
+			Bound::Unbounded => self.nd = self.list.get_next(self.list.head, 0),
 		}
-
-		if self.nd == self.list.tail || self.nd == self.upper_node {
-			return;
-		}
-		// Check upper bound
-		if let Some(upper) = self.upper.as_deref() {
-			if self.is_valid() {
-				let key = self.key_bytes();
-				if (self.list.cmp)(upper, key) <= Ordering::Equal {
-					self.upper_node = self.nd;
-					self.nd = self.list.tail;
-				}
-			}
-		}
+		self.settle_forward();
 	}
 
 	/// Move to last entry
@@ -752,30 +800,16 @@ impl<'a> SkiplistIterator<'a> {
 		if self.nd == self.list.head || self.nd == self.lower_node {
 			return;
 		}
-		// Check upper bound first - if entry is at or past upper, move backward
-		if let Some(upper) = self.upper.as_deref() {
-			while self.is_valid() {
-				let key = self.key_bytes();
-				if (self.list.cmp)(upper, key) == Ordering::Greater {
-					// key < upper, so this entry is valid
-					break;
-				}
-				// key >= upper, skip this entry
-				self.nd = self.list.get_prev(self.nd, 0);
-				if self.nd == self.list.head || self.nd == self.lower_node {
-					return;
-				}
+		// Walk back over anything past the upper bound.
+		while self.is_valid() && self.past_upper(self.key_bytes()) {
+			self.nd = self.list.get_prev(self.nd, 0);
+			if self.nd == self.list.head || self.nd == self.lower_node {
+				return;
 			}
 		}
-		// Check lower bound
-		if let Some(lower) = self.lower.as_deref() {
-			if self.is_valid() {
-				let key = self.key_bytes();
-				if (self.list.cmp)(lower, key) == Ordering::Greater {
-					self.lower_node = self.nd;
-					self.nd = self.list.head;
-				}
-			}
+		if self.is_valid() && self.before_lower(self.key_bytes()) {
+			self.lower_node = self.nd;
+			self.nd = self.list.head;
 		}
 	}
 
@@ -786,15 +820,9 @@ impl<'a> SkiplistIterator<'a> {
 		if self.nd == self.list.tail || self.nd == self.upper_node {
 			return;
 		}
-		// Check upper bound
-		if let Some(upper) = self.upper.as_deref() {
-			if self.is_valid() {
-				let key = self.key_bytes();
-				if (self.list.cmp)(upper, key) <= Ordering::Equal {
-					self.upper_node = self.nd;
-					self.nd = self.list.tail;
-				}
-			}
+		if self.is_valid() && self.past_upper(self.key_bytes()) {
+			self.upper_node = self.nd;
+			self.nd = self.list.tail;
 		}
 	}
 
@@ -805,15 +833,9 @@ impl<'a> SkiplistIterator<'a> {
 		if self.nd == self.list.head || self.nd == self.lower_node {
 			return;
 		}
-		// Check lower bound
-		if let Some(lower) = self.lower.as_deref() {
-			if self.is_valid() {
-				let key = self.key_bytes();
-				if (self.list.cmp)(lower, key) == Ordering::Greater {
-					self.lower_node = self.nd;
-					self.nd = self.list.head;
-				}
-			}
+		if self.is_valid() && self.before_lower(self.key_bytes()) {
+			self.lower_node = self.nd;
+			self.nd = self.list.head;
 		}
 	}
 
@@ -824,15 +846,9 @@ impl<'a> SkiplistIterator<'a> {
 		if self.nd == self.list.tail || self.nd == self.upper_node {
 			return;
 		}
-		// Check upper bound
-		if let Some(upper) = self.upper.as_deref() {
-			if self.is_valid() {
-				let current_key = self.key_bytes();
-				if (self.list.cmp)(upper, current_key) <= Ordering::Equal {
-					self.upper_node = self.nd;
-					self.nd = self.list.tail;
-				}
-			}
+		if self.is_valid() && self.past_upper(self.key_bytes()) {
+			self.upper_node = self.nd;
+			self.nd = self.list.tail;
 		}
 	}
 

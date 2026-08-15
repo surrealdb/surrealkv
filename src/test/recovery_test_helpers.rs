@@ -39,7 +39,7 @@ impl RecoveryTestHelper {
 
 			// Trigger flush to rotate to next WAL (except for last iteration)
 			if wal_idx < wal_count - 1 {
-				tree.flush().unwrap();
+				tree.drain_flushes_synchronously().unwrap();
 			}
 		}
 

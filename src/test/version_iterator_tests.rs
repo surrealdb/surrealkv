@@ -72,7 +72,7 @@ async fn test_history_multiple_versions_single_key() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Query versioned range
 	let tx = store.begin().unwrap();
@@ -136,7 +136,7 @@ async fn test_history_multiple_keys_multiple_versions() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Query all keys
 	let tx = store.begin().unwrap();
@@ -190,7 +190,7 @@ async fn test_history_excludes_tombstones() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Query with history (excludes tombstones by default)
 	let tx = store.begin().unwrap();
@@ -237,7 +237,7 @@ async fn test_history_with_tombstones() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Query with history_with_options (includes tombstones)
 	let tx = store.begin().unwrap();
@@ -283,7 +283,7 @@ async fn test_history_replace_shows_all_versions() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Query all versions
 	let tx = store.begin().unwrap();
@@ -332,7 +332,7 @@ async fn test_history_soft_delete_vs_hard_delete() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Query with tombstones
@@ -371,7 +371,7 @@ async fn test_history_bounds() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Query range [key_b, key_d) - should include key_b and key_c, NOT key_d
@@ -402,7 +402,7 @@ async fn test_history_empty_range() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Query range [key_c, key_d) - no matching keys
@@ -443,7 +443,7 @@ async fn test_history_single_key_match() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Query range that only matches key_a
 	let tx = store.begin().unwrap();
@@ -487,7 +487,7 @@ async fn test_history_interleaved_iteration() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin().unwrap();
 	let mut iter = tx.history(b"key0", b"key9").unwrap();
@@ -547,7 +547,7 @@ async fn test_history_seek_middle() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin().unwrap();
 	let mut iter = tx.history(b"key0", b"key9").unwrap();
@@ -601,7 +601,7 @@ async fn test_history_backward_iteration() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin().unwrap();
 	let mut iter = tx.history(b"key0", b"key9").unwrap();
@@ -643,7 +643,7 @@ async fn test_history_snapshot_isolation() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Take snapshot2
 	let tx2 = store.begin().unwrap();
@@ -684,7 +684,7 @@ async fn test_history_many_versions() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Query all versions
@@ -726,7 +726,7 @@ async fn test_history_timestamps() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Query versions
@@ -770,7 +770,7 @@ async fn test_history_entry_method() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Query with tombstones
 	let tx = store.begin().unwrap();
@@ -823,7 +823,7 @@ async fn test_get_at_fallback() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin().unwrap();
 
@@ -873,7 +873,7 @@ async fn test_get_at_tombstone() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin().unwrap();
 
@@ -970,7 +970,7 @@ async fn test_history_survives_memtable_flush() {
 	}
 
 	// FORCE MEMTABLE FLUSH
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Query versions AFTER flush
@@ -1023,7 +1023,7 @@ async fn test_replace_cuts_off_history_with_versioning() {
 	}
 
 	// Force flush
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// After flush - same result
@@ -1070,7 +1070,7 @@ async fn test_multiple_replaces_preserved_with_versioning() {
 	}
 
 	// Force flush
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		let tx = store.begin().unwrap();
@@ -1113,7 +1113,7 @@ async fn test_replace_after_delete_with_versioning() {
 	}
 
 	// Force flush
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		let tx = store.begin().unwrap();
@@ -1143,7 +1143,7 @@ async fn test_versions_survive_compaction() {
 	}
 
 	// First flush (memtable -> L0)
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Verify versions after first flush
 	{
@@ -1162,7 +1162,7 @@ async fn test_versions_survive_compaction() {
 	}
 
 	// Second flush
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Verify all 10 versions exist across L0 files
@@ -1202,7 +1202,7 @@ async fn test_history_bidirectional_iteration() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		let tx = store.begin().unwrap();
@@ -1248,7 +1248,7 @@ async fn test_history_ts_range_forward() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Query with ts_range [150, 350] - should only return v200 and v300
@@ -1284,7 +1284,7 @@ async fn test_history_ts_range_backward() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Query with ts_range [150, 250] - should only return v200
@@ -1313,7 +1313,7 @@ async fn test_history_limit_forward() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		let tx = store.begin().unwrap();
@@ -1339,7 +1339,7 @@ async fn test_history_limit_backward() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		let tx = store.begin().unwrap();
@@ -1379,7 +1379,7 @@ async fn test_history_limit_multiple_keys() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		let tx = store.begin().unwrap();
@@ -1406,7 +1406,7 @@ async fn test_history_ts_range_with_limit() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		let tx = store.begin().unwrap();
@@ -1432,7 +1432,7 @@ async fn test_history_limit_zero() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		let tx = store.begin().unwrap();
@@ -1460,7 +1460,7 @@ async fn test_history_ts_range_empty_result() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		let tx = store.begin().unwrap();
@@ -1488,7 +1488,7 @@ async fn test_get_at_ryow() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Start a new transaction and write uncommitted data
 	let mut tx = store.begin().unwrap();
@@ -1536,7 +1536,7 @@ async fn test_get_at_ryow_tombstone() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	// Delete the key in a new transaction (uncommitted)
 	let mut tx = store.begin().unwrap();
@@ -1560,7 +1560,7 @@ async fn test_history_ryow() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Start a new transaction and write uncommitted data
@@ -1604,7 +1604,7 @@ async fn test_history_ryow_timestamp_collision() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Write uncommitted data with the SAME timestamp
@@ -1636,7 +1636,7 @@ async fn test_history_ryow_with_ts_range() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		let mut tx = store.begin().unwrap();
@@ -1667,7 +1667,7 @@ async fn test_history_ryow_soft_delete() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Soft delete key in new transaction (uncommitted)
@@ -1712,7 +1712,7 @@ async fn test_history_ryow_hard_delete() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	{
 		// Hard delete key1 in new transaction (uncommitted)
@@ -1751,7 +1751,7 @@ async fn test_get_at_ryow_hard_delete() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let mut tx = store.begin().unwrap();
 	tx.delete(b"key1").unwrap();
@@ -1802,7 +1802,7 @@ async fn test_history_forward_respects_lower_bound() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 
@@ -1846,7 +1846,7 @@ async fn test_history_backward_respects_upper_bound() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 
@@ -1906,7 +1906,7 @@ async fn test_history_respects_both_bounds() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 
@@ -1978,7 +1978,7 @@ async fn test_history_bounds_with_timestamp_range() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 
@@ -2014,7 +2014,7 @@ async fn test_history_bounds_direction_switch_forward_to_backward() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2061,7 +2061,7 @@ async fn test_history_bounds_direction_switch_backward_to_forward() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2114,7 +2114,7 @@ async fn test_history_direction_switch_multi_version_keys() {
 		}
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2190,7 +2190,7 @@ async fn test_history_seek_outside_lower_bound() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2223,7 +2223,7 @@ async fn test_history_seek_outside_upper_bound() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2254,7 +2254,7 @@ async fn test_history_seek_to_exact_bounds() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2284,7 +2284,7 @@ async fn test_history_key_at_exact_lower_bound() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2311,7 +2311,7 @@ async fn test_history_key_at_exact_upper_bound() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2350,7 +2350,7 @@ async fn test_history_adjacent_byte_boundaries() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2404,7 +2404,7 @@ async fn test_history_tombstone_at_lower_bound() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 
@@ -2463,7 +2463,7 @@ async fn test_history_hard_delete_at_boundary() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2498,7 +2498,7 @@ async fn test_history_replace_at_boundary() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2529,7 +2529,7 @@ async fn test_history_bounds_equal_lower_upper() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2555,7 +2555,7 @@ async fn test_history_bounds_inverted() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2579,7 +2579,7 @@ async fn test_history_single_key_in_range() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2617,7 +2617,7 @@ async fn test_history_all_keys_outside_range() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2655,7 +2655,7 @@ async fn test_history_bounds_with_limit() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true).with_limit(3);
@@ -2689,7 +2689,7 @@ async fn test_history_bounds_with_limit_backward() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true).with_limit(3);
@@ -2749,7 +2749,7 @@ async fn test_history_bounds_ts_range_and_limit() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	// All three constraints: key bounds [key, key_z), ts_range [5,5], limit 3
@@ -2790,7 +2790,7 @@ async fn test_history_bounds_prefix_pattern() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2828,7 +2828,7 @@ async fn test_history_bounds_null_bytes() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);
@@ -2869,7 +2869,7 @@ async fn test_history_bounds_max_byte_values() {
 		tx.commit().await.unwrap();
 	}
 
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let tx = store.begin_with_mode(Mode::ReadOnly).unwrap();
 	let opts = HistoryOptions::new().with_tombstones(true);

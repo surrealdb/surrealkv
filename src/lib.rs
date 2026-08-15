@@ -245,6 +245,20 @@ pub struct Options {
 	/// Default: 12 (3x level0_max_files)
 	pub l0_stall_threshold: usize,
 
+	/// How long the fork fence waits for in-flight commits to leave the
+	/// pipeline before giving up with [`crate::Error::ForkFenceTimeout`].
+	///
+	/// The wait is normally microseconds — the batches are already WAL-durable
+	/// and only need their memtable apply and publish. The bound exists because
+	/// a commit whose future was dropped between enqueue and apply would
+	/// otherwise hold the fence, and with it every writer in the store, forever.
+	///
+	/// A hardcoded 5-second constant until 2026-08-15, which made the timeout
+	/// path unreachable from a test.
+	///
+	/// Default: 5s
+	pub fork_drain_timeout: std::time::Duration,
+
 	/// How many commits may be in the pipeline at once.
 	///
 	/// Read from an environment variable until 2026-08-15, which meant every
@@ -294,6 +308,7 @@ impl Default for Options {
 			level_multiplier: 10.0,
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
+			fork_drain_timeout: std::time::Duration::from_secs(5),
 			max_concurrent_commits: commit::DEFAULT_MAX_CONCURRENT_COMMITS,
 		}
 	}
@@ -476,6 +491,12 @@ impl Options {
 	/// Sets the number of L0 files that triggers write stall.
 	pub const fn with_l0_stall_threshold(mut self, value: usize) -> Self {
 		self.l0_stall_threshold = value;
+		self
+	}
+
+	/// Sets how long the fork fence waits for in-flight commits to drain.
+	pub const fn with_fork_drain_timeout(mut self, value: std::time::Duration) -> Self {
+		self.fork_drain_timeout = value;
 		self
 	}
 

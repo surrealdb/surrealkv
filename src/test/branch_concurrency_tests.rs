@@ -91,12 +91,12 @@ async fn forking_while_the_parent_compacts_never_costs_the_child_its_view() {
 	for attempt in 0..8u32 {
 		let (store, _temp) = create_shared_store(2);
 		seed(&store, b"k", b"v1").await;
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 		for round in 0..4u32 {
 			let mut txn = store.begin().unwrap();
 			txn.set(b"k", format!("v{round}").as_bytes()).unwrap();
 			txn.commit().await.unwrap();
-			store.flush().unwrap();
+			store.drain_flushes_synchronously().unwrap();
 		}
 
 		let compacting = {
@@ -329,7 +329,7 @@ async fn the_maintenance_sweep_runs_safely_against_live_branch_traffic() {
 	churning.await.unwrap();
 
 	// A final sweep leaves nothing behind, and `main` is untouched.
-	store.core.inner.sweep_branch_maintenance().unwrap();
+	crate::test::support::sweep(&store);
 	assert_eq!(store.list_branches().unwrap().len(), 1, "only main should remain");
 	let txn = store.begin().unwrap();
 	assert_eq!(txn.get(b"k").unwrap(), Some(b"v".to_vec()));

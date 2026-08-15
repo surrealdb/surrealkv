@@ -3,6 +3,8 @@
 //! The property under test throughout is that a diff reports exactly what the
 //! branch changed — not what it can read, and not what it happens to own.
 
+use std::ops::Bound::{Excluded, Included, Unbounded};
+
 use test_log::test;
 
 use crate::test::support::create_store;
@@ -94,7 +96,7 @@ async fn diff_is_identical_across_a_flush_boundary() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"inherited", b"parent").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = store.fork_branch("main", "flushing", ForkPoint::Head).unwrap();
 	let mut txn = child.begin().unwrap();
@@ -213,7 +215,7 @@ async fn diff_refuses_a_branch_with_no_lineage() {
 	txn.set(b"a", b"parent").unwrap();
 	txn.set(b"b", b"parent").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	assert!(store.branch("main").unwrap().diff().is_err(), "main has no lineage");
 	store.create_branch("plain").unwrap();
@@ -240,7 +242,7 @@ async fn the_sequence_filter_excludes_materialized_inherited_rows() {
 	txn.set(b"inherited-1", b"parent").unwrap();
 	txn.set(b"inherited-2", b"parent").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = store.fork_branch("main", "materialized", ForkPoint::Head).unwrap();
 	let mut txn = child.begin().unwrap();
@@ -283,4 +285,118 @@ async fn a_branch_that_wrote_nothing_has_an_empty_diff() {
 	// And a fenced branch reports the fencing, not an empty diff.
 	store.delete_branch("idle").unwrap();
 	assert!(matches!(child.diff(), Err(Error::BranchFenced)));
+}
+
+/// A diff range means what its bounds say, at both ends.
+///
+/// `merge_range` and `revert_range` both scope through `BranchDiff::iter_range`
+/// and take arbitrary `Bound`s, so an inclusive upper that admits the next key,
+/// or an exclusive lower that admits the key it excluded, applies a branch's
+/// changes to keys the caller never asked about.
+///
+/// Both forms were unreachable before those two APIs existed — every other
+/// range path in the store hard-codes inclusive-lower/exclusive-upper — so this
+/// is the first test that could have caught it.
+#[test(tokio::test)]
+async fn a_diff_range_honours_inclusive_upper_and_exclusive_lower_bounds() {
+	let (store, _temp) = create_store();
+	let mut txn = store.begin().unwrap();
+	txn.set(b"a", b"base").unwrap();
+	txn.set(b"b", b"base").unwrap();
+	txn.commit().await.unwrap();
+
+	let child = store.fork_branch("main", "child", crate::ForkPoint::Head).unwrap();
+	let mut txn = child.begin().unwrap();
+	txn.set(b"a", b"child").unwrap();
+	txn.set(b"b", b"child").unwrap();
+	txn.commit().await.unwrap();
+
+	let diff = child.diff().unwrap();
+	let keys = |lower, upper| -> Vec<Vec<u8>> {
+		diff.iter_range(lower, upper).unwrap().map(|entry| entry.unwrap().key).collect()
+	};
+
+	// The two forms that always worked, as a control: if these ever break, the
+	// problem is not the one this test is about.
+	assert_eq!(keys(Included(&b"a"[..]), Excluded(&b"b"[..])), vec![b"a".to_vec()], "[a, b)");
+	assert_eq!(keys(Included(&b"b"[..]), Unbounded), vec![b"b".to_vec()], "[b, ..]");
+
+	// The two forms only `merge_range` and `revert_range` can produce.
+	assert_eq!(
+		keys(Included(&b"a"[..]), Included(&b"a"[..])),
+		vec![b"a".to_vec()],
+		"[a, a] must not admit `b`"
+	);
+	assert_eq!(
+		keys(Excluded(&b"a"[..]), Unbounded),
+		vec![b"b".to_vec()],
+		"(a, ..] must not admit the key it excluded"
+	);
+}
+
+/// A user-key range as the diff APIs take it.
+type KeyRange<'a> = (std::ops::Bound<&'a [u8]>, std::ops::Bound<&'a [u8]>);
+
+/// The same range over the same data returns the same rows before and after a
+/// flush.
+///
+/// This is the property the bound defect actually violated: table iterators
+/// receive the full `InternalKeyRange` and were always right, while memtable
+/// iterators received a user-key window that could not express half of it. So
+/// the answer depended on where the data happened to live, which is the worst
+/// shape a bug can take — it hides in whichever direction you test.
+#[test(tokio::test)]
+async fn a_diff_range_returns_the_same_rows_before_and_after_a_flush() {
+	let (store, _temp) = create_store();
+	let mut txn = store.begin().unwrap();
+	for key in [&b"a"[..], b"b", b"c", b"d"] {
+		txn.set(key, b"base").unwrap();
+	}
+	txn.commit().await.unwrap();
+
+	let child = store.fork_branch("main", "child", crate::ForkPoint::Head).unwrap();
+	let mut txn = child.begin().unwrap();
+	for key in [&b"a"[..], b"b", b"c", b"d"] {
+		txn.set(key, b"child").unwrap();
+	}
+	txn.commit().await.unwrap();
+
+	let ranges: [KeyRange<'_>; 6] = [
+		(Unbounded, Unbounded),
+		(Included(b"b"), Included(b"c")),
+		(Excluded(b"a"), Included(b"c")),
+		(Included(b"a"), Excluded(b"c")),
+		(Excluded(b"a"), Unbounded),
+		(Unbounded, Included(b"b")),
+	];
+
+	let collect = |store: &crate::Tree| -> Vec<Vec<Vec<u8>>> {
+		let child = store.branch("child").unwrap();
+		let diff = child.diff().unwrap();
+		ranges
+			.iter()
+			.map(|(lower, upper)| {
+				diff.iter_range(*lower, *upper).unwrap().map(|entry| entry.unwrap().key).collect()
+			})
+			.collect()
+	};
+
+	let in_memtable = collect(&store);
+	// `Tree::flush` would NOT move this branch's rows — it rotates only the
+	// default runtime — so a plain `flush()` here would compare the memtable
+	// against itself and pass no matter what. `flush_branch_to_table` asserts a
+	// table appeared.
+	crate::test::support::flush_branch_to_table(&store, "child");
+	let on_disk = collect(&store);
+
+	assert_eq!(
+		on_disk, in_memtable,
+		"moving rows from the memtable to a table changed what a range returned"
+	);
+	// Non-vacuity: the ranges must actually discriminate, or agreeing proves
+	// nothing.
+	assert!(
+		in_memtable.iter().any(|rows| rows.len() != 4),
+		"every range returned everything; these bounds are not testing anything"
+	);
 }

@@ -477,6 +477,201 @@ Verification: 1,095 lib tests green (1,092 → 1,095), 4 doc tests, clippy `--al
 the edge covers the whole extent, one-chunk atomicity, the unchunkable single entry with nothing
 written, and the planning-window conflict.
 
+### G1–G5 — Closing the known gaps before the async port: complete (2026-08-15)
+
+Five slices against `docs/KNOWN_GAPS.md`, acting on the gaps whose stated trigger had fired and
+deferring the two whose had not. **1,155 lib tests** (1,145 → 1,155), clippy `--all-targets
+--all-features` clean, fmt clean.
+
+**The theme of this phase: three of the seven gap entries were wrong about their own subject**, and
+measuring them was most of the work. They had been written from reading, not from running.
+
+| Gap | Outcome |
+|---|---|
+| 1. `Tree::flush` | **closed**, and the entry's central claim corrected |
+| 2. `ForkFenceTimeout` | **re-scoped**: unreachable by construction; deadline made configurable |
+| 5. `sync_tracker` | one hazard **closed** and its claim corrected; one recorded as remaining |
+| 6. `core.inner` reaches | 262 → **160**, with a ratchet guard |
+| 7. dead-code loophole | **closed** — one CI line |
+| 3, 4 (determinism) | **deferred**, user decision; trigger has not fired |
+
+**G1 — the flush gap was concurrency, not a divergent code path.** §1 said the suite ran "a
+synchronous path production never runs". It does not: `compact_memtable()` is literally
+`flush_oldest_immutable_to_sst()`, the function the synchronous drain calls in a loop. The work is
+identical; what the drain removes is everything else happening at the same time. So the plan's
+original remedy — migrate 207 call sites — would have covered none of the gap.
+
+What landed: `Tree::flush` renamed to `drain_flushes_synchronously` (all 207 sites) with a doc
+comment saying it bypasses the scheduler and when not to use it; `Tree::flush_and_wait` through the
+real worker; `BranchMetricsSnapshot::memtable_flushes` as a genuine production counter incremented
+at the single point a memtable becomes a table; `support::{flush_branch_and_wait,
+rotate_branch_and_signal}`; and `src/test/flush_concurrency_tests.rs` — seven tests covering branch
+delete racing its own flush, compaction racing an unpublished flush, WAL reclamation under
+concurrent flushes, writes under queued flushes, reads racing a rotation, and the barrier itself.
+
+Deltas worth keeping:
+
+1. **A probe refused to redden, and that was the finding.** Making the barrier return without
+   waiting left all five concurrency tests green — because `rotate` and `wake_up_memtable` fire
+   *before* the wait, so the race still happens. Those five test invariants under concurrency; a
+   separate test is needed for the barrier's own claim, and
+   `the_barrier_returns_only_once_the_flush_has_produced_a_table` is it. Without the misbehaving
+   probe the distinction would have gone unnoticed.
+2. **A mis-scoped probe looked like a hang.** Applied to the whole file it made ~15 barrier calls
+   each burn the full 5s `WAIT_UNTIL_DEADLINE` — ~75s of silence. Scoped to the one test it targets:
+   5.05s, same answer. Probes go on the single test whose claim they break.
+3. **The delete test raced the wrong branch.** It called `Tree::flush_and_wait`, which rotates only
+   the *default* runtime, so it raced `main`'s flush while claiming to race the branch's.
+   `rotate_branch_and_signal` exists because of that, and was found by chasing an unused-function
+   warning rather than by review.
+
+**G2 — `core.inner` reaching.** Measured the recurring *questions* rather than guessing: 21 sites
+wanted `get_log_number()`, 24 wanted `wal.write().rotate()`, 21 wanted `sweep_branch_maintenance()`,
+12 wanted `runtimes.len()`. Eight accessors in `support/` replaced **102 reaches**; the count outside
+the support layer went 262 → 160, and `level_manifest` — the field the async port turns into
+atomic-swap versions — went 57 → 24.
+
+`tests_do_not_reach_further_into_core_inner_than_they_already_do` is a two-sided ratchet: it fails if
+the count rises above the ceiling, **and** if it drops well below without the ceiling being lowered.
+The second arm fired immediately and correctly — my ceiling of 177 was measured by a different method
+(lines including `support/`) than the guard uses (occurrences excluding it). The real number was 160.
+Both arms probed.
+
+**G3 — `sync_tracker`.** §5 claimed the readers' `extension == "sst"` filter was "the only thing
+keeping a durable WAL segment out of the truncation blast radius". Wrong twice: both readers walk
+`opts.sstable_dir()`, so a WAL segment is never enumerated, and the extension filter is secondary.
+The invariant that genuinely was undocumented: **the ledger contains SSTables and nothing else**,
+because `fsync_file` is called from exactly three places and all three are SST paths. `record` and
+`was_synced` now `debug_assert` it, so widening a walk is loud rather than silently destructive;
+`the_sync_ledger_refuses_to_answer_about_a_non_sstable` proves the guard fires. The never-cleared
+hazard remains, is unreachable today, and is recorded with the shape that would reach it (a test
+crashing twice on one path).
+
+**G4 — the dead-code loophole, one line.** A `#[cfg(test)]` item that nothing calls is dead *in the
+test build*, where the compiler sees it. `RUSTFLAGS="-D warnings" cargo test --lib --no-run` is now a
+CI step; the tree is clean under it, and it was verified by planting a dead method
+(`error: method 'probe_dead_cfg_test_item' is never used`).
+
+**G5 — `ForkFenceTimeout` is unreachable by construction.** The deadline is now
+`Options::fork_drain_timeout` rather than a hardcoded 5-second constant. But the error itself cannot
+currently be produced: its doc comment guards against "a commit whose future was dropped between
+enqueue and apply", and in `CommitPipeline::commit` there is **no suspension point** between
+`pending.enqueue()` (line 424) and `publish()` (line 506) — the awaits are at the stall check (344),
+the semaphore (356) and the completion receiver (512, after publish). A test asserting a timeout must
+occur found **zero in 200 attempts against 217 concurrent commits** at a zero timeout; its
+non-vacuity assertion is what surfaced this instead of passing vacuously. The guard stays — the async
+port adds awaits to this path and makes the state producible — and the test now asserts the invariant
+that does hold.
+
+### V9 — User documentation and final reconciliation: complete (2026-08-15)
+
+- **`docs/BRANCHING.md`** — the user-facing document this project did not have. One global commit
+  clock; fork anchors and why a child never sees a parent write above its own; what the retention
+  promise costs and how to read `pin_retained_versions`; what a merge's base is and how a promotion
+  edge moves it; `MergeOutcome::chunks` as the atomic-vs-resumable signal; range-bound semantics for
+  the two scoped APIs; the named limits; and the retryable-versus-terminal error split.
+- **`docs/PATTERNS.md`** — the injection and testing patterns, so the next contributor inherits them
+  rather than re-deriving them per slice. Ten principles, each with the real example that produced
+  it, plus a table of every seam and its production default and test double.
+- **`docs/KNOWN_GAPS.md`** — seven entries, each with what it would take and what would raise its
+  priority.
+
+**Delta: writing the document is what found the eighth defect.** The plan's end-to-end composition
+test — `the_whole_branch_surface_composes_and_survives_a_reopen`, the "proof that the surface
+composes" — was the first caller to exercise `revert_range` on a single-key range, and it returned
+2. Two claims in the draft `BRANCHING.md` also turned out to be wrong against the code and were
+corrected before publication: `BranchDiff` has `collect`/`iter`/`iter_range`, not `entries`, and the
+oversized-chunk error is `MergeTooLarge { estimated_bytes, budget_bytes }`, not `ApplyTooLarge`
+(which does not exist). Writing the document *is* a test of the API surface.
+
+### DEFECT — an inclusive upper or exclusive lower bound leaked one key, for unflushed rows (2026-08-15)
+
+**Found by V9's own composition test.** The eighth production defect on this branch, and the second
+found by a test written for a different purpose.
+
+**Provenance, established before anything was changed: this is not a regression.** The degrading
+code is byte-identical on `main` (`main:src/snapshot.rs:524-532`, comment included). What changed is
+who can call it:
+
+| path | bounds it can produce | on `main`? |
+|---|---|---|
+| `Transaction::range` → `range_with_options` | `[start, end)`, hard-coded | yes |
+| `Snapshot::range` | `lower.map(Bound::Included)`, `upper.map(Bound::Excluded)` | yes |
+| `Snapshot::history_iter` | same, hard-coded | yes |
+| **`BranchDiff::iter_range`** | **arbitrary `Bound`s from the caller** | **no — added in V2b** |
+
+Every pre-existing caller hard-codes inclusive-lower/exclusive-upper, so the two mishandled forms
+were **structurally unreachable**. `merge_range` and `revert_range` are the first APIs in this store
+that let a caller choose its own bounds. A latent defect made reachable by a new feature.
+
+**The defect.** `Snapshot::collect_iter_state` received a full `InternalKeyRange` and threw half of
+it away before handing it to memtables — `Excluded` lower collapsed to `Included`, `Included` upper
+dropped to unbounded — because `MemTable::range` took `Option<&[u8]>` meaning *inclusive lower,
+exclusive upper* and **could not express** the other two forms. Table iterators took the full range
+and were always correct.
+
+| range | expected | before |
+|---|---|---|
+| `[a, b)` | `[a]` | `[a]` |
+| `[a, a]` | `[a]` | **`[a, b]`** |
+| `(a, ..]` | `[b]` | **`[a, b]`** |
+
+So `merge_range` merged past its upper bound and `revert_range` reverted the key the caller
+excluded — silent over-application on the two most destructive operations in the API — **and the
+same call returned different results before and after a flush**, which is worse than a consistent
+bug because it hides in whichever direction you test.
+
+**The fix, and why not the cheaper ones.**
+
+1. *Normalising the bound at the call site* (`Included(u)` → `Excluded(successor(u))`) is wrong:
+   `Comparator::successor` (`src/comparator.rs:114`) is a **short** successor — it increments the
+   first non-`0xFF` byte and truncates, so `successor("a") == "b"` and `"ab"` is wrongly admitted.
+   It is a separator hint, not an exact bound, and the comparator is pluggable.
+2. *Wrapping the memtable iterator in a filter* — written, then reverted on review. It works, but
+   leaves the interface still unable to express the range, re-implements bound logic in a second
+   place, and makes the memtable walk keys it should never visit. The next caller would rediscover
+   the gap.
+
+The fix is that `Skiplist::new_iter` and `MemTable::range` take `Bound<&[u8]>`, and
+`collect_iter_state` passes the bounds through with their inclusivity intact. **The repair that
+matters is structural**: the exclusivity used to be open-coded into the comparison operator at six
+positioning sites (`first`, `last`, `advance`, `prev_internal`, `seek_ge`, and the `first`
+prepositioning), which is exactly why the interface could not grow a bound without editing all six —
+so it never did. They now route through two predicates, `before_lower` and `past_upper`, which are
+the only places inclusivity is decided.
+
+**Evidence the gap was known and papered over:** two tests in `memtable_tests.rs` skipped every
+version of `"b"` **by hand**, with the comment "Query with excluded lower bound — manually skip ALL
+versions". The workaround was the missing feature, written down and not recognised as such.
+
+**Tests**, at three layers, each guarding its own:
+
+- `a_memtable_range_honours_every_bound_form` and `..._in_reverse` — the defect at its source, and
+  only expressible once the interface was. Reverse matters because `prev`/`seek_last` take a
+  different path and now share the predicates.
+- `a_diff_range_honours_inclusive_upper_and_exclusive_lower_bounds` — with the two always-working
+  forms as a control.
+- `a_diff_range_returns_the_same_rows_before_and_after_a_flush` — **the property that was actually
+  violated**, and the one nothing asserted.
+- `a_scoped_merge_applies_only_inside_its_range`, `a_scoped_revert_compensates_only_inside_its_range`
+  — the two user-visible harms.
+
+**A near-miss worth recording.** The flush-parity test passed on its first run. `Tree::flush`
+rotates only the **default** runtime's memtable, so the child branch's rows never left memory and
+the test compared the memtable with itself. My non-vacuity check — that the ranges discriminate —
+was true and beside the point. `support::flush_branch_to_table` now asserts a table actually
+appeared, and the existing `diff_is_identical_across_a_flush_boundary` had done this correctly all
+along; reusing its idiom instead of inventing a weaker one was the fix.
+
+**Sensitivity probes.** Restoring the degradation in `snapshot.rs` reddens five tests — the diff
+bounds, flush parity, scoped merge, scoped revert, and the end-to-end composition test. It leaves
+`a_memtable_range_honours_*` green, **correctly**: those exercise `MemTable::range` directly, below
+the layer being sabotaged. Inverting the two predicates reddens exactly that pair. Each test guards
+its own layer rather than all of them re-checking one thing. Both probes reverted.
+
+Verification: **1,145 lib tests** (1,138 → 1,145), 4 doc tests, clippy `--all-targets
+--all-features` clean, fmt clean.
+
 ### DEFECT — a store whose L1 key order disagreed with its sequence order would not reopen (2026-08-15)
 
 **Found by the property suite, generating a case rather than re-running a planted one.** This is the
@@ -532,6 +727,67 @@ returned quietly rather than an error.
 because its tests either put one table in a level or wrote keys in ascending order, so key order and
 sequence order coincided. Nothing was wrong with those tests; the shape simply never occurred to
 anyone writing them by hand. That is the argument for V6 in one defect.
+
+### V8b-2 — The testing pattern: complete (2026-08-15)
+
+**`src/test/support/` now holds what every test file was redefining**: `create_temp_directory`
+(six copies), `wrap_buffer` (four), `create_store` and `create_store_with` (eight between them),
+`branch_exists`, and a new `wait_until`. Sixteen duplicate definitions deleted.
+
+Two helpers that shared a name while answering different questions were **renamed rather than
+merged**, which is the "one name, one meaning" rule doing its job:
+`fault_injection_tests::create_store` (returns a scripted fault policy too) is
+`create_store_with_faults`; `branch_concurrency_tests::create_store(levels)` (returns an `Arc<Tree>`)
+is `create_shared_store`; and `metrics_tests::create_store` (configures two levels) is
+`create_store_with_two_levels`, implemented through `create_store_with`.
+
+**`test_helpers_are_not_redefined_outside_the_shared_layers`** reads the exported names out of
+*both* shared files and fails if any test file defines one. Probed: adding a `wrap_buffer` to
+`diff_tests.rs` fails it with `diff_tests.rs:288 redefines 'wrap_buffer'`.
+
+**Three of the plan's four flake claims did not survive measurement**, and the gate is the reason
+the effort went where it mattered:
+
+| plan's claim | measured |
+|---|---|
+| `stall_tests.rs:98,127` — "10ms margin on a loaded box" | **not flaky.** The margin is a *lower* bound and the signalling task sleeps 50ms first, so elapsed is always ≥50ms. A loaded machine makes it larger, never smaller. Left alone. |
+| `stall_tests.rs:192` — "timing assertion inside a spawned task, where a failure may never be observed" | **correct, and it is a real defect.** Fixed. |
+| `lsm_tests.rs:3341` — "asserts a negative after a fixed wait, so it can only ever fail spuriously" | **inverted.** The line is unrelated; the sleep-then-assert-negative is `test_no_spurious_small_flush`, and it can only ever *pass* spuriously. Fixed, differently than planned. |
+
+- **`test_is_stalled_flag`** asserted `controller.is_stalled()` inside a `tokio::spawn`. A failure
+  panics the task, the `JoinHandle` is dropped, and the panic is swallowed — the test passed
+  whatever the flag said. It now waits for the stall to be entered instead of sleeping 20ms and
+  hoping, and *returns* the observation for the main task to assert. **Probe:** making
+  `is_stalled()` return `false` unconditionally now fails the test on
+  "the controller never reported itself stalled while a writer was blocked in `check`". Before the
+  fix, that same probe left it green — which is the defect in one sentence.
+- **`test_no_spurious_small_flush`** slept 100ms and asserted L0 was empty. Nothing established the
+  flush worker had run at all, so "no flush happened" was equally consistent with "nothing was
+  listening" — it would have passed with the flush path deleted. It keeps the bounded wait (a
+  negative needs one) and adds a **positive control**: the same worker, woken the same way, must
+  flush an over-threshold memtable. The failure message says what the control is for.
+- **`wait_until`** is the general replacement for sleep-then-assert, with a 5-second deadline that
+  is a deadlock backstop rather than a timing assertion. Its doc says what it cannot do: establish a
+  negative.
+
+**Not done, and why.** `core.inner` reaches went 259 → 256; the plan wanted them confined to the
+support layer. Doing that properly means designing accessors for what tests legitimately need from
+`level_manifest` (57), `runtimes` (34) and `wal` (30), which is a slice of its own and would have
+buried the two defects above in mechanical churn. Recorded in `docs/KNOWN_GAPS.md` rather than
+half-done. The remaining two-site helper pairs (`build_table`, `create_test_table`,
+`create_internal_key`, `default_opts_mut`, `collect_forward`, `begin_owned_rw`) are genuinely
+different contracts — different formats, different fixtures, one a method — and merging them would
+force a false abstraction; the guard covers them if anyone tries to make them shared.
+
+**On duplicate test names**, which the plan flagged: measured at four, **two are false positives**
+(`craft_wal` is a `fn` nested inside two different test bodies). Of the real two,
+`table_at_boundary_excluded` and `table_touches_range_at_boundary_included` live in
+`is_before_range_tests` and `is_after_range_tests` in one file, where the names are correct under
+their modules and the module path disambiguates. Left alone; `cargo test <substring>` running both
+is reasonable behaviour, not a defect.
+
+Verification: **1,138 lib tests**, 4 doc tests, clippy `--all-targets --all-features` clean, fmt
+clean.
 
 ### V8b-1 — The two test-layer defects: complete (2026-08-15)
 

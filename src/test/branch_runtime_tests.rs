@@ -34,11 +34,11 @@ async fn idle_branches_allocate_no_runtime_or_arena() {
 	}
 
 	assert_eq!(
-		store.core.inner.runtimes.len(),
+		crate::test::support::runtime_count(&store),
 		1,
 		"1,000 idle branches must not create runtimes beyond the default"
 	);
-	let default_only = store.core.inner.runtimes.total_arena_capacity_bytes();
+	let default_only = crate::test::support::total_arena_bytes(&store);
 
 	// Non-vacuity: the first routed write creates exactly one runtime with
 	// one small arena.
@@ -46,8 +46,12 @@ async fn idle_branches_allocate_no_runtime_or_arena() {
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
 
-	assert_eq!(store.core.inner.runtimes.len(), 2, "first write must create the owner's runtime");
-	let with_one_branch = store.core.inner.runtimes.total_arena_capacity_bytes();
+	assert_eq!(
+		crate::test::support::runtime_count(&store),
+		2,
+		"first write must create the owner's runtime"
+	);
+	let with_one_branch = crate::test::support::total_arena_bytes(&store);
 	assert_eq!(
 		with_one_branch - default_only,
 		store.core.inner.opts.branch_memtable_size as u64,
@@ -410,8 +414,8 @@ async fn br5_idle_branch_reads_see_empty_and_allocate_nothing() {
 	let (store, _temp_dir) = create_store_with(|b| b);
 	let idle = register_branch(&store, "read/idle");
 
-	let baseline_runtimes = store.core.inner.runtimes.len();
-	let baseline_arenas = store.core.inner.runtimes.total_arena_capacity_bytes();
+	let baseline_runtimes = crate::test::support::runtime_count(&store);
+	let baseline_arenas = crate::test::support::total_arena_bytes(&store);
 
 	let txn = begin_owned_rw(&store, idle);
 	assert_eq!(txn.get(b"anything").unwrap(), None);
@@ -421,12 +425,12 @@ async fn br5_idle_branch_reads_see_empty_and_allocate_nothing() {
 	drop(txn);
 
 	assert_eq!(
-		store.core.inner.runtimes.len(),
+		crate::test::support::runtime_count(&store),
 		baseline_runtimes,
 		"reads must not create a runtime for an idle branch"
 	);
 	assert_eq!(
-		store.core.inner.runtimes.total_arena_capacity_bytes(),
+		crate::test::support::total_arena_bytes(&store),
 		baseline_arenas,
 		"reads must not allocate an arena for an idle branch"
 	);
@@ -438,7 +442,7 @@ async fn br5_idle_branch_reads_see_empty_and_allocate_nothing() {
 	let txn = begin_owned_rw(&store, idle);
 	assert_eq!(txn.get(b"anything").unwrap(), Some(b"now-present".to_vec()));
 	drop(txn);
-	assert_eq!(store.core.inner.runtimes.len(), baseline_runtimes + 1);
+	assert_eq!(crate::test::support::runtime_count(&store), baseline_runtimes + 1);
 
 	store.close().await.unwrap();
 }
@@ -530,7 +534,7 @@ async fn br6_multi_owner_segment_reopen_restores_both_branches() {
 	let store = crash_open(path);
 
 	assert_eq!(
-		store.core.inner.runtimes.len(),
+		crate::test::support::runtime_count(&store),
 		2,
 		"reopen must rebuild the foreign runtime from its WAL batches"
 	);
@@ -558,7 +562,7 @@ async fn br6_one_owner_across_segments_flushes_intermediates_at_open() {
 		let mut txn = begin_owned_rw(&store, foreign);
 		txn.set(b"k1", b"v1").unwrap();
 		txn.commit().await.unwrap();
-		store.core.inner.wal.write().rotate().unwrap();
+		crate::test::support::rotate_wal(&store);
 		let mut txn = begin_owned_rw(&store, foreign);
 		txn.set(b"k2", b"v2").unwrap();
 		txn.commit().await.unwrap();
@@ -628,7 +632,11 @@ async fn br6_stale_generation_is_fenced_on_replay() {
 		store.core.inner.runtimes.get(stale_owner).is_none(),
 		"a fenced generation must not get a runtime"
 	);
-	assert_eq!(store.core.inner.runtimes.len(), 2, "default plus the live generation only");
+	assert_eq!(
+		crate::test::support::runtime_count(&store),
+		2,
+		"default plus the live generation only"
+	);
 	let txn = begin_owned_rw(&store, live_owner);
 	assert_eq!(
 		txn.get(b"k").unwrap(),
@@ -668,7 +676,11 @@ async fn br6_deleted_branch_batches_are_fenced_and_seq_clock_never_rewinds() {
 
 	let store = crash_open(path);
 
-	assert_eq!(store.core.inner.runtimes.len(), 1, "deleted owners must not get runtimes");
+	assert_eq!(
+		crate::test::support::runtime_count(&store),
+		1,
+		"deleted owners must not get runtimes"
+	);
 	let txn = store.begin().unwrap();
 	assert_eq!(txn.get(b"k").unwrap(), Some(b"default-v".to_vec()));
 	drop(txn);
@@ -707,11 +719,11 @@ async fn br6_partial_branch_flush_replays_only_the_wal_tail() {
 
 		// Close k1's segment, flush it to the owner's SST, and prove the
 		// replay floor moved past that segment.
-		store.core.inner.wal.write().rotate().unwrap();
+		crate::test::support::rotate_wal(&store);
 		let foreign_runtime = store.core.inner.runtimes.get(foreign).unwrap();
 		store.core.inner.rotate_runtime_memtable(&foreign_runtime, 0).unwrap();
 		while store.core.inner.flush_oldest_immutable_for_test().unwrap().is_some() {}
-		let floor = store.core.inner.level_manifest.read().unwrap().get_log_number();
+		let floor = crate::test::support::wal_log_number(&store);
 		assert!(floor >= 1, "fixture: the flush must advance the replay floor, got {floor}");
 
 		let mut txn = begin_owned_rw(&store, foreign);
@@ -854,7 +866,7 @@ async fn br7_shutdown_flushes_every_dirty_runtime() {
 	let store = crash_open(path);
 
 	assert_eq!(
-		store.core.inner.runtimes.len(),
+		crate::test::support::runtime_count(&store),
 		1,
 		"a clean shutdown must leave nothing to replay — the branch row lives in its SSTs"
 	);
@@ -890,7 +902,7 @@ async fn br7_checkpoint_captures_dirty_branch_actives() {
 	let restored = crash_open(checkpoint_dir.path().to_path_buf());
 
 	assert_eq!(
-		restored.core.inner.runtimes.len(),
+		crate::test::support::runtime_count(&restored),
 		1,
 		"the checkpoint's fresh WAL replays nothing — the row must come from SSTs"
 	);
@@ -928,12 +940,12 @@ async fn br7_trickle_rotates_single_oldest_victim() {
 		let mut txn = begin_owned_rw(&store, first);
 		txn.set(b"a", b"a-v").unwrap();
 		txn.commit().await.unwrap();
-		store.core.inner.wal.write().rotate().unwrap();
+		crate::test::support::rotate_wal(&store);
 		let mut txn = begin_owned_rw(&store, second);
 		txn.set(b"b", b"b-v").unwrap();
 		txn.commit().await.unwrap();
-		store.core.inner.wal.write().rotate().unwrap();
-		store.core.inner.wal.write().rotate().unwrap(); // active segment 3
+		crate::test::support::rotate_wal(&store);
+		crate::test::support::rotate_wal(&store); // active segment 3
 
 		// Call 1: only the OLDEST victim rotates (trickle, not a storm).
 		assert!(store.core.inner.rotate_wal_pinned_runtime_impl().unwrap());
@@ -992,8 +1004,8 @@ async fn br7_hundred_cold_branches_bounded_wal_and_no_lost_commit() {
 			txn.set(format!("k{i}").into_bytes().as_slice(), format!("v{i}").as_bytes()).unwrap();
 			txn.commit().await.unwrap();
 		}
-		store.core.inner.wal.write().rotate().unwrap();
-		store.core.inner.wal.write().rotate().unwrap(); // spans now exceed the limit
+		crate::test::support::rotate_wal(&store);
+		crate::test::support::rotate_wal(&store); // spans now exceed the limit
 
 		// Trickle drain: one rotation, then its flush, then ask again.
 		let mut rotations = 0;
@@ -1003,7 +1015,7 @@ async fn br7_hundred_cold_branches_bounded_wal_and_no_lost_commit() {
 		}
 		assert_eq!(rotations, 100, "every cold branch must be drained exactly once");
 
-		let floor = store.core.inner.level_manifest.read().unwrap().get_log_number();
+		let floor = crate::test::support::wal_log_number(&store);
 		assert!(floor >= 1, "the replay floor must advance past the drained segment");
 		let wal_dir = store.core.inner.opts.wal_dir();
 		let removed = crate::wal::cleanup_old_segments(&wal_dir, floor).unwrap();
@@ -1015,7 +1027,11 @@ async fn br7_hundred_cold_branches_bounded_wal_and_no_lost_commit() {
 	}
 
 	let store = crash_open(path);
-	assert_eq!(store.core.inner.runtimes.len(), 1, "clean shutdown leaves nothing to replay");
+	assert_eq!(
+		crate::test::support::runtime_count(&store),
+		1,
+		"clean shutdown leaves nothing to replay"
+	);
 	for (i, owner) in owners.into_iter().enumerate() {
 		let txn = begin_owned_rw(&store, owner);
 		assert_eq!(

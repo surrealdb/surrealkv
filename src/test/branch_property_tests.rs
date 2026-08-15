@@ -329,7 +329,7 @@ async fn run_history(ops: Vec<Op>) -> std::result::Result<HistoryOutcome, TestCa
 				model.apply_merge(parent, applied);
 			}
 			Op::Flush => {
-				harness.store.flush().unwrap();
+				harness.store.drain_flushes_synchronously().unwrap();
 			}
 			Op::Compact => {
 				let strategy =
@@ -360,7 +360,7 @@ async fn run_history(ops: Vec<Op>) -> std::result::Result<HistoryOutcome, TestCa
 						.await
 						.map_err(|error| TestCaseError::fail(format!("churn failed: {error}")))?;
 					model.write(0, KEYS[key], Some(VALUES[round % VALUES.len()].to_vec()));
-					harness.store.flush().unwrap();
+					harness.store.drain_flushes_synchronously().unwrap();
 				}
 			}
 		}

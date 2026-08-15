@@ -26,6 +26,7 @@ pub(crate) struct BranchMetrics {
 	tables_reclaimed: AtomicU64,
 	pin_retained_versions: AtomicU64,
 	compaction_pin_races: AtomicU64,
+	memtable_flushes: AtomicU64,
 }
 
 impl BranchMetrics {
@@ -85,6 +86,16 @@ impl BranchMetrics {
 		self.compaction_pin_races.fetch_add(1, Ordering::Relaxed);
 	}
 
+	/// One memtable became an SSTable.
+	///
+	/// Recorded at the single point where a table is actually produced, so it
+	/// counts flushes rather than attempts: the background flush loop wakes on
+	/// notification and calls `compact_memtable` whether or not there is
+	/// anything to do, and its own pass counter increments either way.
+	pub(crate) fn record_memtable_flush(&self) {
+		self.memtable_flushes.fetch_add(1, Ordering::Relaxed);
+	}
+
 	fn read(&self) -> CountersOnly {
 		CountersOnly {
 			forks: self.forks.load(Ordering::Relaxed),
@@ -96,6 +107,7 @@ impl BranchMetrics {
 			tables_reclaimed: self.tables_reclaimed.load(Ordering::Relaxed),
 			pin_retained_versions: self.pin_retained_versions.load(Ordering::Relaxed),
 			compaction_pin_races: self.compaction_pin_races.load(Ordering::Relaxed),
+			memtable_flushes: self.memtable_flushes.load(Ordering::Relaxed),
 		}
 	}
 }
@@ -104,6 +116,7 @@ impl BranchMetrics {
 /// the gauges alongside it.
 struct CountersOnly {
 	forks: u64,
+	memtable_flushes: u64,
 	fork_drain_nanos: u64,
 	detaches: u64,
 	merges: u64,
@@ -156,6 +169,12 @@ pub struct BranchMetricsSnapshot {
 	/// WAL segments that cannot be reclaimed because some memtable still depends
 	/// on them.
 	pub wal_pinned_segments: usize,
+	/// Memtables that have become SSTables since the store was opened.
+	///
+	/// Monotonic, and incremented only when a table was actually written — which
+	/// is what makes it usable as a durability barrier: observe it, trigger a
+	/// flush, and wait for it to advance.
+	pub memtable_flushes: u64,
 }
 
 impl BranchMetricsSnapshot {
@@ -176,6 +195,7 @@ impl BranchMetricsSnapshot {
 			tables_reclaimed: counters.tables_reclaimed,
 			pin_retained_versions: counters.pin_retained_versions,
 			compaction_pin_races: counters.compaction_pin_races,
+			memtable_flushes: counters.memtable_flushes,
 			live_branches,
 			timeline_horizon,
 			wal_pinned_segments,

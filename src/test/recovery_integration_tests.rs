@@ -227,7 +227,7 @@ async fn test_recover_with_existing_ssts() {
 		txn.set(b"bar", b"v2").unwrap();
 		txn.commit().await.unwrap();
 
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 		let sst_count_1 = RecoveryTestHelper::count_sst_files(&sst_dir);
 		assert_eq!(sst_count_1, 1, "Should have 1 SST after first flush");
 
@@ -240,7 +240,7 @@ async fn test_recover_with_existing_ssts() {
 		txn.set(b"bar", b"v4").unwrap();
 		txn.commit().await.unwrap();
 
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 		let sst_count_2 = RecoveryTestHelper::count_sst_files(&sst_dir);
 		assert_eq!(sst_count_2, 2, "Should have 2 SSTs after second flush");
 
@@ -326,7 +326,7 @@ async fn test_recover_multiple_wals_without_flush() {
 		RecoveryTestHelper::verify_key(&tree, "new_key", "new_value").await;
 
 		// Now flush everything
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -401,7 +401,7 @@ async fn test_recovery_with_empty_wal() {
 		txn.set(b"foo", b"v1").unwrap();
 		txn.commit().await.unwrap();
 
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// WAL is now empty (all data flushed)
 		tree.close().await.unwrap();
@@ -498,7 +498,7 @@ async fn test_wal_cleanup_after_recovery_without_flush() {
 		assert!(wal_count_before_flush > 0, "WAL files should exist after recovery");
 
 		// Now flush
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		tree.close().await.unwrap();
 	}
@@ -536,7 +536,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 			txn.set(format!("batch_a_{}", i).as_bytes(), b"value_a").unwrap();
 			txn.commit().await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		let log_number_after_flush = RecoveryTestHelper::get_manifest_log_number(&tree);
 
@@ -548,7 +548,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 		}
 
 		// Trigger rotation (creating new WAL segment)
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Batch C - stays in newest WAL segment
 		for i in 0..10 {
@@ -604,7 +604,7 @@ async fn test_orphaned_sst_doesnt_break_recovery() {
 		txn.set(b"real_key", b"real_value").unwrap();
 		txn.commit().await.unwrap();
 
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 		tree.close().await.unwrap();
 	}
 
@@ -642,8 +642,8 @@ async fn test_manifest_log_number_progression() {
 			txn.commit().await.unwrap();
 		}
 
-		tree.core.inner.wal.write().rotate().unwrap();
-		tree.flush().unwrap();
+		crate::test::support::rotate_wal(&tree);
+		tree.drain_flushes_synchronously().unwrap();
 
 		let log_num_after_flush = RecoveryTestHelper::get_manifest_log_number(&tree);
 		assert!(log_num_after_flush > log_num_initial, "Log number should advance after flush");
@@ -663,8 +663,8 @@ async fn test_manifest_log_number_progression() {
 			txn.commit().await.unwrap();
 		}
 
-		tree.core.inner.wal.write().rotate().unwrap();
-		tree.flush().unwrap();
+		crate::test::support::rotate_wal(&tree);
+		tree.drain_flushes_synchronously().unwrap();
 
 		let log_num_after = RecoveryTestHelper::get_manifest_log_number(&tree);
 		assert!(log_num_after > log_num_before, "Log number should advance again");
@@ -684,8 +684,8 @@ async fn test_manifest_log_number_progression() {
 			txn.commit().await.unwrap();
 		}
 
-		tree.core.inner.wal.write().rotate().unwrap();
-		tree.flush().unwrap();
+		crate::test::support::rotate_wal(&tree);
+		tree.drain_flushes_synchronously().unwrap();
 
 		let log_num_after = RecoveryTestHelper::get_manifest_log_number(&tree);
 
@@ -727,7 +727,7 @@ async fn test_recovery_with_no_wal_files() {
 			txn.commit().await.unwrap();
 		}
 
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 		tree.close().await.unwrap();
 	}
 
@@ -781,7 +781,7 @@ async fn test_corrupted_wal_with_valid_sst() {
 			txn.set(format!("sst_key_{}", i).as_bytes(), b"safe_in_sst").unwrap();
 			txn.commit().await.unwrap();
 		}
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		// Write more data to WAL
 		for i in 0..5 {

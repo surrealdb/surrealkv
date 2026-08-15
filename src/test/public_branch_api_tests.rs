@@ -369,3 +369,244 @@ fn public_surface_snapshot() {
 	}
 	assert!(branch_api.contains("BranchHandle"), "guard parsed the wrong file");
 }
+
+/// A resolver that settles a conflict by taking whichever value is longer, and
+/// refuses when either side deleted the key.
+struct PreferLonger;
+
+impl crate::ConflictResolver for PreferLonger {
+	fn resolve(&self, conflict: &crate::Conflict) -> crate::ConflictChoice {
+		match (&conflict.source, &conflict.target) {
+			(Some(source), Some(target)) if source.len() >= target.len() => {
+				crate::ConflictChoice::Source
+			}
+			(Some(_), Some(_)) => crate::ConflictChoice::Target,
+			_ => crate::ConflictChoice::Refuse,
+		}
+	}
+}
+
+/// Rows a branch must read: key, and the value it should have (`None` = absent).
+type ExpectedRows<'a> = &'a [(&'a [u8], Option<&'a [u8]>)];
+
+/// The whole branch surface, composed in one scenario, through the public API
+/// alone — and then reopened from disk and checked again.
+///
+/// Every other test in this file isolates one operation. This one is the proof
+/// that they compose: that a fork of a fork still reads correctly after its
+/// parent was merged into, that a scoped merge and a full merge coexist, that a
+/// revert does not disturb a neighbour, and that all of it survives a restart.
+///
+/// It is also the executable half of `docs/BRANCHING.md`: every claim that
+/// document makes about ordering, bases, chunks and metrics is exercised here,
+/// so the document cannot drift from the code without this failing.
+#[test(tokio::test)]
+async fn the_whole_branch_surface_composes_and_survives_a_reopen() {
+	let temp_dir = TempDir::new("public-branch-compose").unwrap();
+	let path = temp_dir.path().to_path_buf();
+	let build =
+		|| TreeBuilder::new().with_path(path.clone()).with_versioning(true, 0).build().unwrap();
+
+	let store = build();
+
+	// --- main gets a baseline -------------------------------------------
+	for (key, value) in [(&b"a"[..], &b"a1"[..]), (b"b", b"b1"), (b"c", b"c1")] {
+		let mut txn = store.begin().unwrap();
+		txn.set(key, value).unwrap();
+		txn.commit().await.unwrap();
+	}
+	let baseline = info_for(&store, "main").last_write_seq.unwrap();
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"a", b"a2").unwrap();
+	txn.commit().await.unwrap();
+
+	// --- three forks, one per selector -----------------------------------
+	let at_head = store.fork_branch("main", "head", ForkPoint::Head).unwrap();
+	let at_version = store.fork_branch("main", "version", ForkPoint::AtVersion(baseline)).unwrap();
+	let now = info_for(&store, "main").created_at_seq; // any resolvable point
+	let _ = now;
+	let at_timestamp = store
+		.fork_branch("main", "timestamp", ForkPoint::AtTimestamp(u64::MAX))
+		.expect("a timestamp above every commit resolves to the newest one");
+
+	// The anchor decides what each child inherited.
+	assert_eq!(at_head.begin().unwrap().get(b"a").unwrap(), Some(b"a2".to_vec()));
+	assert_eq!(
+		at_version.begin().unwrap().get(b"a").unwrap(),
+		Some(b"a1".to_vec()),
+		"a fork at an older version must not see the newer write"
+	);
+	assert_eq!(at_timestamp.begin().unwrap().get(b"a").unwrap(), Some(b"a2".to_vec()));
+
+	// --- each child diverges ---------------------------------------------
+	let mut txn = at_head.begin().unwrap();
+	txn.set(b"a", b"head-a").unwrap();
+	txn.set(b"head-only", b"h").unwrap();
+	txn.delete(b"c").unwrap();
+	txn.commit().await.unwrap();
+
+	let mut txn = at_version.begin().unwrap();
+	txn.set(b"b", b"version-b").unwrap();
+	txn.set(b"zzz", b"scoped").unwrap();
+	txn.commit().await.unwrap();
+
+	let mut txn = at_timestamp.begin().unwrap();
+	txn.set(b"a", b"ts-a").unwrap();
+	txn.set(b"b", b"ts-b").unwrap();
+	txn.commit().await.unwrap();
+
+	// --- diff: a branch's own writes, nothing inherited -------------------
+	let head_diff = at_head.diff().unwrap();
+	let mut head_keys: Vec<_> =
+		head_diff.collect().unwrap().into_iter().map(|entry| entry.key).collect();
+	head_keys.sort();
+	assert_eq!(
+		head_keys,
+		vec![b"a".to_vec(), b"c".to_vec(), b"head-only".to_vec()],
+		"a diff is the branch's own writes — including its delete, and excluding untouched keys"
+	);
+
+	// --- preview, then the strategies ------------------------------------
+	// `main` moved after the forks, so `a` conflicts.
+	let mut txn = store.begin().unwrap();
+	txn.set(b"a", b"main-a3").unwrap();
+	txn.commit().await.unwrap();
+
+	let main = store.branch("main").unwrap();
+	let report = at_head.preview_merge_into(&main).unwrap();
+	assert!(!report.conflicts.is_empty(), "the preview must see the conflict on `a`");
+
+	// Strict refuses and writes nothing.
+	let refused = at_head.merge_into(&main, crate::MergeStrategy::Strict).await;
+	assert!(matches!(refused, Err(Error::MergeConflicts { .. })), "got {refused:?}");
+	assert_eq!(
+		main.begin().unwrap().get(b"a").unwrap(),
+		Some(b"main-a3".to_vec()),
+		"a refused merge must leave the target exactly as it was"
+	);
+
+	// TargetWins keeps the target's value but still applies the rest.
+	let outcome = at_head.merge_into(&main, crate::MergeStrategy::TargetWins).await.unwrap();
+	assert!(outcome.resolved >= 1, "the conflict must be counted as resolved, not applied");
+	assert!(outcome.chunks <= 1, "a merge this small must be atomic");
+	let txn = main.begin().unwrap();
+	assert_eq!(txn.get(b"a").unwrap(), Some(b"main-a3".to_vec()), "TargetWins keeps the target");
+	assert_eq!(txn.get(b"head-only").unwrap(), Some(b"h".to_vec()), "non-conflicts still apply");
+	assert_eq!(txn.get(b"c").unwrap(), None, "the source's delete applies too");
+	drop(txn);
+
+	// A resolver settles the next conflict itself.
+	let mut txn = at_head.begin().unwrap();
+	txn.set(b"a", b"head-a-much-longer").unwrap();
+	txn.commit().await.unwrap();
+	let outcome = at_head
+		.merge_into(&main, crate::MergeStrategy::Resolve(std::sync::Arc::new(PreferLonger)))
+		.await
+		.unwrap();
+	assert!(outcome.applied + outcome.resolved >= 1);
+	assert_eq!(
+		main.begin().unwrap().get(b"a").unwrap(),
+		Some(b"head-a-much-longer".to_vec()),
+		"the resolver chose the longer value"
+	);
+
+	// --- a scoped merge from the second child ----------------------------
+	let scoped = at_version
+		.merge_range(
+			&main,
+			crate::MergeStrategy::SourceWins,
+			std::ops::Bound::Included(b"z".to_vec()),
+			std::ops::Bound::Unbounded,
+		)
+		.await
+		.unwrap();
+	assert_eq!(scoped.applied, 1, "only the key inside the range may be merged");
+	let txn = main.begin().unwrap();
+	assert_eq!(txn.get(b"zzz").unwrap(), Some(b"scoped".to_vec()));
+	assert_eq!(
+		txn.get(b"b").unwrap(),
+		Some(b"b1".to_vec()),
+		"a key outside the range must be untouched by a scoped merge"
+	);
+	drop(txn);
+
+	// --- revert on the third child ---------------------------------------
+	let reverted = at_timestamp
+		.revert_range(
+			std::ops::Bound::Included(b"a".to_vec()),
+			std::ops::Bound::Included(b"a".to_vec()),
+		)
+		.await
+		.unwrap();
+	assert_eq!(reverted, 1, "exactly the one changed key in range is compensated");
+	let txn = at_timestamp.begin().unwrap();
+	assert_eq!(
+		txn.get(b"a").unwrap(),
+		Some(b"a2".to_vec()),
+		"revert restores what the branch inherited at its anchor"
+	);
+	assert_eq!(txn.get(b"b").unwrap(), Some(b"ts-b".to_vec()), "outside the range, untouched");
+	drop(txn);
+
+	// --- detach and TTL ---------------------------------------------------
+	let materialized = store.detach_branch("version").unwrap();
+	assert!(materialized > 0, "detaching must copy the inherited view");
+	assert_eq!(
+		info_for(&store, "version").parent,
+		None,
+		"a detached branch has no parent link left"
+	);
+	assert_eq!(
+		store.branch("version").unwrap().begin().unwrap().get(b"a").unwrap(),
+		Some(b"a1".to_vec()),
+		"detaching must not change what the branch reads"
+	);
+
+	store.set_branch_ttl("timestamp", Some(Duration::from_secs(3600))).unwrap();
+	assert!(info_for(&store, "timestamp").expires_at.is_some());
+
+	// --- metrics before the restart ---------------------------------------
+	let metrics = store.metrics().unwrap();
+	assert_eq!(metrics.forks, 3, "three forks were taken");
+	assert_eq!(metrics.detaches, 1);
+	assert_eq!(metrics.merges, 3, "TargetWins, the resolver, and the scoped range");
+	assert_eq!(metrics.live_branches, 4, "main plus three children");
+
+	// --- close, reopen, and check every branch again ----------------------
+	store.close().await.unwrap();
+	let store = build();
+
+	let expected: [(&str, ExpectedRows<'_>); 4] = [
+		(
+			"main",
+			&[
+				(b"a", Some(b"head-a-much-longer")),
+				(b"b", Some(b"b1")),
+				(b"c", None),
+				(b"head-only", Some(b"h")),
+				(b"zzz", Some(b"scoped")),
+			],
+		),
+		("head", &[(b"a", Some(b"head-a-much-longer")), (b"c", None)]),
+		("version", &[(b"a", Some(b"a1")), (b"b", Some(b"version-b")), (b"zzz", Some(b"scoped"))]),
+		("timestamp", &[(b"a", Some(b"a2")), (b"b", Some(b"ts-b"))]),
+	];
+	for (branch, rows) in expected {
+		let txn = store.begin_on(branch).unwrap();
+		for (key, value) in rows.iter() {
+			assert_eq!(
+				txn.get(*key).unwrap().as_deref(),
+				*value,
+				"after reopen, branch {branch} key {:?}",
+				String::from_utf8_lossy(key)
+			);
+		}
+	}
+
+	// The TTL is durable, and so is the detachment.
+	assert!(info_for(&store, "timestamp").expires_at.is_some(), "a TTL must survive a restart");
+	assert_eq!(info_for(&store, "version").parent, None, "detachment must survive a restart");
+
+	store.close().await.unwrap();
+}

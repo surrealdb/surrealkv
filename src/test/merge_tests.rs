@@ -297,7 +297,7 @@ async fn detaching_a_source_releases_the_parent_s_pin() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"base").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
 	let mut txn = child.begin().unwrap();
@@ -314,7 +314,7 @@ async fn detaching_a_source_releases_the_parent_s_pin() {
 		let mut txn = store.begin().unwrap();
 		txn.set(b"k", format!("v{round}").as_bytes()).unwrap();
 		txn.commit().await.unwrap();
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 	}
 	let strategy = std::sync::Arc::new(crate::compaction::leveled::Strategy::from_options(
 		std::sync::Arc::clone(&store.core.inner.opts),
@@ -662,7 +662,7 @@ async fn a_source_can_still_be_merged_after_its_parent_has_compacted() {
 	let mut txn = store.begin().unwrap();
 	txn.set(b"shared", b"base").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
 	let main = store.branch("main").unwrap();
@@ -673,7 +673,7 @@ async fn a_source_can_still_be_merged_after_its_parent_has_compacted() {
 		let mut txn = store.begin().unwrap();
 		txn.set(b"churn", format!("v{round}").as_bytes()).unwrap();
 		txn.commit().await.unwrap();
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 	}
 	let strategy = std::sync::Arc::new(crate::compaction::leveled::Strategy::from_options(
 		std::sync::Arc::clone(&store.core.inner.opts),
@@ -717,7 +717,7 @@ async fn a_target_that_reverted_a_merged_key_conflicts_instead_of_being_overwrit
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"original").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 
 	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
 	let main = store.branch("main").unwrap();
@@ -733,12 +733,12 @@ async fn a_target_that_reverted_a_merged_key_conflicts_instead_of_being_overwrit
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"original").unwrap();
 	txn.commit().await.unwrap();
-	store.flush().unwrap();
+	store.drain_flushes_synchronously().unwrap();
 	for round in 0..5u32 {
 		let mut txn = store.begin().unwrap();
 		txn.set(format!("filler/{round}").as_bytes(), b"f").unwrap();
 		txn.commit().await.unwrap();
-		store.flush().unwrap();
+		store.drain_flushes_synchronously().unwrap();
 	}
 	assert!(
 		store.core.inner.snapshot_tracker.get_all_snapshots().is_empty(),
@@ -1653,4 +1653,107 @@ async fn a_single_entry_larger_than_the_budget_is_refused_before_writing() {
 	let txn = store.begin().unwrap();
 	assert_eq!(txn.get(b"small").unwrap(), None, "nothing may have been written");
 	assert_eq!(txn.get(b"oversized").unwrap(), None);
+}
+
+/// A scoped merge applies only inside its range, at both ends.
+///
+/// `merge_range` takes caller-supplied `Bound`s, and was the first API in this
+/// store that could. An inclusive upper that admitted the next key, or an
+/// exclusive lower that admitted the key it excluded, silently applies a
+/// branch's changes to keys the caller never named — on the operation with the
+/// least room for surprise.
+#[test(tokio::test)]
+async fn a_scoped_merge_applies_only_inside_its_range() {
+	use std::ops::Bound::{Excluded, Included, Unbounded};
+
+	let (store, _temp) = create_store();
+	let mut txn = store.begin().unwrap();
+	for key in [&b"a"[..], b"b", b"c", b"d"] {
+		txn.set(key, b"base").unwrap();
+	}
+	txn.commit().await.unwrap();
+
+	let target = store.branch("main").unwrap();
+
+	// Each arm gets its own source branch, so the arms cannot mask each other.
+	for (name, lower, upper, expected) in [
+		("incl-upper", Included(b"b".to_vec()), Included(b"c".to_vec()), vec![&b"b"[..], b"c"]),
+		("excl-lower", Excluded(b"b".to_vec()), Unbounded, vec![&b"c"[..], b"d"]),
+		("excl-upper", Included(b"b".to_vec()), Excluded(b"c".to_vec()), vec![&b"b"[..]]),
+	] {
+		let source = store.fork_branch("main", name, ForkPoint::Head).unwrap();
+		let mut txn = source.begin().unwrap();
+		for key in [&b"a"[..], b"b", b"c", b"d"] {
+			txn.set(key, name.as_bytes()).unwrap();
+		}
+		txn.commit().await.unwrap();
+
+		let outcome =
+			source.merge_range(&target, MergeStrategy::SourceWins, lower, upper).await.unwrap();
+		assert_eq!(
+			outcome.applied,
+			expected.len(),
+			"{name}: merged a different number of keys than the range names"
+		);
+
+		let txn = target.begin().unwrap();
+		for key in [&b"a"[..], b"b", b"c", b"d"] {
+			let got = txn.get(key).unwrap().unwrap();
+			let should_be_merged = expected.contains(&key);
+			assert_eq!(
+				got == name.as_bytes(),
+				should_be_merged,
+				"{name}: key {:?} was {}",
+				String::from_utf8_lossy(key),
+				if should_be_merged {
+					"not merged but should have been"
+				} else {
+					"merged but is outside the range"
+				}
+			);
+		}
+		drop(txn);
+
+		// Put the target back so the next arm starts from the same state.
+		let mut txn = target.begin().unwrap();
+		for key in [&b"a"[..], b"b", b"c", b"d"] {
+			txn.set(key, b"base").unwrap();
+		}
+		txn.commit().await.unwrap();
+	}
+}
+
+/// A revert compensates only inside its range, at both ends. Same hazard as the
+/// scoped merge, on the other operation that takes caller-supplied bounds:
+/// reverting a key the caller excluded overwrites it with an older value.
+#[test(tokio::test)]
+async fn a_scoped_revert_compensates_only_inside_its_range() {
+	use std::ops::Bound::{Excluded, Unbounded};
+
+	let (store, _temp) = create_store();
+	let mut txn = store.begin().unwrap();
+	for key in [&b"a"[..], b"b", b"c"] {
+		txn.set(key, b"base").unwrap();
+	}
+	txn.commit().await.unwrap();
+
+	let child = store.fork_branch("main", "child", ForkPoint::Head).unwrap();
+	let mut txn = child.begin().unwrap();
+	for key in [&b"a"[..], b"b", b"c"] {
+		txn.set(key, b"child").unwrap();
+	}
+	txn.commit().await.unwrap();
+
+	// (a, ..] — `a` is excluded and must keep the branch's own value.
+	let reverted = child.revert_range(Excluded(b"a".to_vec()), Unbounded).await.unwrap();
+	assert_eq!(reverted, 2, "only `b` and `c` are inside (a, ..]");
+
+	let txn = child.begin().unwrap();
+	assert_eq!(
+		txn.get(b"a").unwrap(),
+		Some(b"child".to_vec()),
+		"the excluded key must not have been reverted"
+	);
+	assert_eq!(txn.get(b"b").unwrap(), Some(b"base".to_vec()));
+	assert_eq!(txn.get(b"c").unwrap(), Some(b"base".to_vec()));
 }

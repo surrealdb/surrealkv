@@ -1429,10 +1429,10 @@ async fn repeated_range_queries_over_many_ssts_return_identical_results() {
 		tx.commit().await.unwrap();
 
 		if (i + 1) % 1_000 == 0 {
-			tree.flush().unwrap();
+			tree.drain_flushes_synchronously().unwrap();
 		}
 	}
-	tree.flush().unwrap();
+	tree.drain_flushes_synchronously().unwrap();
 
 	// First scan: cold cache, every block comes off disk.
 	let tx = tree.begin().unwrap();
@@ -1475,10 +1475,10 @@ async fn a_cache_too_small_to_hold_the_working_set_returns_the_same_results() {
 			tx.commit().await.unwrap();
 
 			if (i + 1) % 500 == 0 {
-				tree.flush().unwrap();
+				tree.drain_flushes_synchronously().unwrap();
 			}
 		}
-		tree.flush().unwrap();
+		tree.drain_flushes_synchronously().unwrap();
 
 		let tx = tree.begin().unwrap();
 		let results =

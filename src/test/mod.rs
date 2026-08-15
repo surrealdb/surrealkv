@@ -38,6 +38,8 @@ mod diff_tests;
 #[cfg(test)]
 mod fault_injection_tests;
 #[cfg(test)]
+mod flush_concurrency_tests;
+#[cfg(test)]
 mod fork_view_tests;
 #[cfg(test)]
 pub mod index_block_tests;

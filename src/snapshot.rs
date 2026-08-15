@@ -763,18 +763,25 @@ impl<'a> KMergeIterator<'a> {
 
 		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
 
-		// Extract user key bounds from InternalKeyRange (inclusive lower, exclusive
-		// upper)
+		// User-key bounds for the memtable iterators, WITH their inclusivity.
+		//
+		// This used to collapse `Excluded` lower to `Included` and drop an
+		// `Included` upper entirely (passing `None`, i.e. unbounded), on the
+		// grounds that table iterators handled it — which they do. Memtables did
+		// not, so the same range returned different rows depending on whether
+		// the data had been flushed. Nothing could reach the two mishandled
+		// forms until `merge_range` and `revert_range` started taking bounds
+		// from the caller.
 		let (start_bound, end_bound) = query_range.as_ref();
-		let lower = match start_bound {
-			Bound::Included(key) | Bound::Excluded(key) => Some(key.user_key.as_slice()),
-			Bound::Unbounded => None,
-		};
-		let upper = match end_bound {
-			Bound::Excluded(key) => Some(key.user_key.as_slice()),
-			Bound::Included(_) | Bound::Unbounded => None, /* Included upper handled by table
-			                                                * iterators */
-		};
+		fn user_bound(bound: &Bound<InternalKey>) -> Bound<&[u8]> {
+			match bound {
+				Bound::Included(key) => Bound::Included(key.user_key.as_slice()),
+				Bound::Excluded(key) => Bound::Excluded(key.user_key.as_slice()),
+				Bound::Unbounded => Bound::Unbounded,
+			}
+		}
+		let lower = user_bound(start_bound);
+		let upper = user_bound(end_bound);
 
 		for layer in &state_ref.layers {
 			// Every iterator of this layer is wrapped in a SeqCappedIterator

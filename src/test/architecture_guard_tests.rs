@@ -525,3 +525,51 @@ fn test_helpers_are_not_redefined_outside_the_shared_layers() {
 		offenders.join("\n  ")
 	);
 }
+
+/// Ceiling on how many places outside the support layer reach into
+/// `store.core.inner`.
+///
+/// It was 262. Every reach binds a test to an internal field name, so renaming
+/// one is a suite-wide edit — and the async port renames the most-read of them,
+/// turning `level_manifest` into atomic-swap versions. `level_manifest` alone
+/// was 57 reaches and is now 24.
+///
+/// **This is a ratchet, not a target.** Lower it when you remove reaches; never
+/// raise it. If a new test genuinely needs an internal, add an accessor to
+/// `src/test/support/` and reach from there — that is the one place allowed to,
+/// so the port has one file to fix rather than fourteen.
+const CORE_INNER_REACH_CEILING: usize = 160;
+
+#[test]
+fn tests_do_not_reach_further_into_core_inner_than_they_already_do() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut reaches = 0usize;
+	let mut files_scanned = 0usize;
+
+	for entry in std::fs::read_dir(root.join("src/test")).unwrap().filter_map(Result::ok) {
+		let path = entry.path();
+		if path.extension().is_none_or(|ext| ext != "rs") {
+			continue;
+		}
+		files_scanned += 1;
+		reaches += std::fs::read_to_string(&path).unwrap().matches("core.inner").count();
+	}
+
+	// Non-vacuity: the walk reached the tree, and the detector matches its own
+	// target. `support/` is a directory, so `read_dir` over `src/test` skips it —
+	// which is the point: its reaches are the sanctioned ones.
+	assert!(files_scanned > 10, "only {files_scanned} test files scanned; the walk is wrong");
+	assert!(reaches > 0, "no reaches found at all; the detector is not matching");
+
+	assert!(
+		reaches <= CORE_INNER_REACH_CEILING,
+		"tests now reach into `core.inner` at {reaches} places, above the ceiling of \
+		 {CORE_INNER_REACH_CEILING}. Add an accessor to `src/test/support/` instead of reaching \
+		 from a test file."
+	);
+	assert!(
+		reaches >= CORE_INNER_REACH_CEILING.saturating_sub(10),
+		"reaches dropped to {reaches}, well under the ceiling of {CORE_INNER_REACH_CEILING} — \
+		 lower the ceiling so the ratchet keeps its grip"
+	);
+}

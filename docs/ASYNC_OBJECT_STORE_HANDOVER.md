@@ -146,7 +146,7 @@ you.
 
 This is the trap. **Read it before designing anything.**
 
-`Snapshot::collect_iter_state` (`src/snapshot.rs:355`) takes a read guard on `level_manifest`, and
+`Snapshot::collect_iter_state` (`src/snapshot.rs`) takes a read guard on `level_manifest`, and
 it is called from **synchronous `LSMIterator` construction**. Turn that `RwLock` into an async lock
 and every scan and every point read becomes `async` — which is exactly what plan finding F4
 rejected on evidence, and which nothing in the async decision asks for. The decision was about
@@ -294,3 +294,84 @@ Recorded rather than invented, per V0's exit gate.
 5. **What is the WAL's story on an object store at all?** The port list assumes it moves, but an
    append-only WAL on S3 is a different design (SlateDB writes WAL objects per batch). This may be
    a redesign rather than a port, and if so it should be planned as one.
+
+---
+
+## 10. Reconciliation against the finished `v2` (2026-08-15)
+
+Sections 1–9 were written at V0, **before** V1–V9 ran. Everything above still holds; this section
+records what changed underneath it, so the port starts from the branch as it actually is. Line
+numbers elsewhere in this file are indicative only — V1–V9 moved a great deal of code. Names are
+stable; line numbers are not, and are no longer quoted.
+
+### Three invariants added since V0 — add these to §6
+
+7. **A level below L0 must come back in ascending key order.** `LevelManifest::validate_level_tables`
+   enforces it, because `Level::find_first_overlapping_table` reads the level with
+   `slice::partition_point` and `hydrate` never sorts. Until V8b this validated ascending *sequence*
+   order instead — an ordering nothing establishes and no reader wants — and refused to open a
+   perfectly valid store. **Under an atomic-swap manifest, whatever reconstructs a level must
+   preserve key order and this check must survive.** A binary search over an unsorted vector does
+   not fail loudly; it returns a wrong answer.
+8. **Range bounds must not be widened on their way to a component.** `Skiplist::new_iter` and
+   `MemTable::range` take `Bound<&[u8]>`, and `collect_iter_state` passes inclusivity through
+   unchanged. Before V9 the memtable interface could only express `[lower, upper)`, so an inclusive
+   upper became unbounded and an exclusive lower became inclusive — while table iterators, which
+   took the full `InternalKeyRange`, were correct. **Any new component the port introduces (a
+   downloaded-object reader, a prefetch buffer, a remote iterator) must take the full range, not a
+   convenience subset.** The failure mode is that results depend on where the data currently lives,
+   which is invisible to a test that only exercises one tier.
+9. **Failure at a durable step is injected, not global.** `Options::fault_policy: Arc<dyn
+   FaultPolicy>` with `FaultPoint::{CatalogPublish, OwnerStatePublish, RootPublish}`. The port
+   should **extend `FaultPoint`** for its new durable steps (object PUT, conditional PUT, manifest
+   swap) rather than build a second fault mechanism. `docs/PATTERNS.md` has the shape.
+
+### What the port inherits that V0 could not promise
+
+- **A test seam per dependency**, listed in `docs/PATTERNS.md` §"Where the seams are". In
+  particular `vfs::File` is a trait with test doubles already in use (`SealableFile` in
+  `src/test/cache_tests.rs`), which is the natural place to stand a remote-object double.
+- **`src/test/support/`** — store construction, `wait_until` (use it instead of sleeping; the port
+  will add far more asynchrony), `flush_branch_to_table` (note: `Tree::flush` rotates only the
+  default runtime — a trap the port will hit repeatedly).
+- **A property suite over branch visibility** (`src/test/branch_property_tests.rs`) that found a
+  defect on its own. Run it against the ported engine; it is storage-agnostic by construction.
+- **Two source-scanning guards** — no ambient state outside a written allowlist, and no test helper
+  redefined outside the shared layers. The port will want an entry in the first for anything the
+  object layer makes global.
+
+### Eight defects were found and fixed on this branch
+
+Three were silent-wrong-answer bugs in branch semantics (FK6 ×2, PD3a), one a deadlock between a
+branch operation and compaction (V5), one a table leak on a failed publish (V3), one a store-wide
+flush stall on close (V4), one a store that would not reopen (V8b), and one silent
+over-application in `merge_range`/`revert_range` (V9). **Six of the eight were found by tests
+written for something else, or by taking a red test literally rather than adjusting it.** That is
+the working method this port should keep; it is written up in `docs/PATTERNS.md`.
+
+### Added by G1–G5 (2026-08-15), after §10 was first written
+
+- **`Options::fork_drain_timeout`** replaces the hardcoded `FORK_DRAIN_TIMEOUT`, so open question 1
+  now has a knob. And a finding for that question: **`ForkFenceTimeout` is currently unreachable** —
+  there is no suspension point between `pending.enqueue()` and `publish()` in
+  `CommitPipeline::commit`. **Your port changes that.** The moment a publish path grows an `await`
+  there, a dropped future can strand a batch and the fence can genuinely time out. Write that test
+  when you add the await; it is why the guard was kept rather than deleted.
+- **`Tree::flush_and_wait`** and `BranchMetricsSnapshot::memtable_flushes` — a durability barrier
+  through the real background worker, plus the counter it waits on. `Tree::flush` is now
+  `drain_flushes_synchronously`, which says what it is. Prefer the barrier for anything the port
+  makes asynchronous.
+- **`src/test/flush_concurrency_tests.rs`** — seven tests that put something alongside a flush.
+  These are the ones most likely to break under the port, and that is what they are for.
+- **`support::` grew eight accessors** and `core.inner` reaching outside it fell 262 → 160,
+  `level_manifest` specifically 57 → 24, held by a ratchet guard. This was gap 6, and its trigger
+  was your port: restructuring `level_manifest` is now a small edit.
+- **`sync_tracker` asserts its SST-only invariant.** If the port changes what reaches durability
+  through `fsync_file`, that assertion is where it will tell you.
+
+### `docs/KNOWN_GAPS.md` is the companion to read next
+
+Both entries that used to be aimed at this work have since been acted on (G1 and G5 above). The more
+useful lesson from doing so: **three of the seven entries were wrong about their own subject** when
+measured against the code. Read the file for its reasoning and its triggers, not as a statement of
+current fact — verify before acting on any of it, exactly as G1–G5 had to.
