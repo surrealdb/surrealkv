@@ -2,13 +2,13 @@ use std::collections::HashSet;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use tempdir::TempDir;
 use test_log::test;
 
 use crate::levels::{Level, Levels};
 use crate::memtable::MemTable;
 use crate::snapshot::{IterState, KMergeIterator};
 use crate::sstable::table::{Table, TableWriter};
+use crate::test::support::{create_store, create_temp_directory};
 use crate::test::{
 	collect_all,
 	collect_snapshot_iter,
@@ -16,20 +16,9 @@ use crate::test::{
 	collect_transaction_all,
 };
 use crate::vfs::File;
-use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Tree, TreeBuilder};
-
-fn create_temp_directory() -> TempDir {
-	TempDir::new("test").unwrap()
-}
+use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, TreeBuilder};
 
 // Common setup logic for creating a store
-fn create_store() -> (Tree, TempDir) {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let tree = TreeBuilder::new().with_path(path).build().unwrap();
-	(tree, temp_dir)
-}
 
 #[test(tokio::test)]
 async fn test_empty_snapshot() {
@@ -1408,8 +1397,21 @@ fn test_mixed_level0_and_level1_tables() {
 	assert!(count > 0, "Should have items from both L0 and L1 tables");
 }
 
+/// Number of keys the two range-query tests below write. Enough to span many
+/// SSTables at the memtable size they use, which is the point: the scan has to
+/// merge across levels rather than read one table.
+const RANGE_QUERY_KEYS: usize = 10_000;
+
+/// A range scan over many SSTables returns the same thing every time it runs.
+///
+/// This used to assert cache hit counters compiled into the cache under
+/// `#[cfg(test)]`. Those are gone, and "the second read came from the cache" is
+/// now proven directly, and deterministically, in `crate::test::cache_tests` by
+/// sealing the file. What is left here is the end-to-end fact that test cannot
+/// reach: a full scan across L0 and beyond, run twice against a warm cache,
+/// yields identical results.
 #[test(tokio::test)]
-async fn test_cache_effectiveness_with_range_query() {
+async fn repeated_range_queries_over_many_ssts_return_identical_results() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
@@ -1420,93 +1422,79 @@ async fn test_cache_effectiveness_with_range_query() {
 		.build()
 		.unwrap();
 
-	eprintln!("\n=== Inserting 10,000 keys with periodic flushes ===");
-
-	// Insert 10,000 keys, flushing every 1,000 keys
-	for i in 0..10_000 {
-		let key = format!("key_{:08}", i);
-		let value = format!("value_{}", i);
-
+	// Flush every 1,000 keys to create multiple SSTables.
+	for i in 0..RANGE_QUERY_KEYS {
 		let mut tx = tree.begin().unwrap();
-		tx.set(key.as_bytes(), value.as_bytes()).unwrap();
+		tx.set(format!("key_{i:08}").as_bytes(), format!("value_{i}").as_bytes()).unwrap();
 		tx.commit().await.unwrap();
 
-		// Flush every 1,000 keys to create multiple SSTables
 		if (i + 1) % 1_000 == 0 {
 			tree.flush().unwrap();
-			eprintln!("Flushed after {} keys", i + 1);
 		}
 	}
-
-	// Final flush to ensure all data is on disk
 	tree.flush().unwrap();
-	eprintln!("Final flush completed\n");
 
-	// Reset cache statistics before first query
-	tree.core.opts.block_cache.reset_stats();
-
-	eprintln!("=== First range query (populating cache) ===");
-	// First range query - this will populate the cache
+	// First scan: cold cache, every block comes off disk.
 	let tx = tree.begin().unwrap();
-	let first_results =
+	let first =
 		collect_transaction_all(&mut tx.range("key_00000000", "key_00010000").unwrap()).unwrap();
 
-	let first_stats = tree.core.opts.block_cache.get_stats();
-	eprintln!("First query results: {} items", first_results.len());
-	eprintln!("First query cache stats:");
-	eprintln!("  Data hits: {}, Data misses: {}", first_stats.data_hits, first_stats.data_misses);
-	eprintln!(
-		"  Index hits: {}, Index misses: {}",
-		first_stats.index_hits, first_stats.index_misses
-	);
-	eprintln!(
-		"  Total hits: {}, Total misses: {}",
-		first_stats.total_hits(),
-		first_stats.total_misses()
-	);
-	eprintln!("  Hit ratio: {:.2}%\n", first_stats.hit_ratio() * 100.0);
-
-	// Reset cache statistics before second query
-	tree.core.opts.block_cache.reset_stats();
-
-	eprintln!("=== Second range query (served from cache) ===");
-	// Second range query - should be served mostly from cache
+	// Second scan: warm cache, most blocks come from memory.
 	let tx = tree.begin().unwrap();
-	let second_results =
+	let second =
 		collect_transaction_all(&mut tx.range(b"key_00000000", b"key_00010000").unwrap()).unwrap();
 
-	let second_stats = tree.core.opts.block_cache.get_stats();
-	eprintln!("Second query results: {} items", second_results.len());
-	eprintln!("Second query cache stats:");
-	eprintln!("  Data hits: {}, Data misses: {}", second_stats.data_hits, second_stats.data_misses);
-	eprintln!(
-		"  Index hits: {}, Index misses: {}",
-		second_stats.index_hits, second_stats.index_misses
-	);
-	eprintln!(
-		"  Total hits: {}, Total misses: {}",
-		second_stats.total_hits(),
-		second_stats.total_misses()
-	);
-	eprintln!("  Hit ratio: {:.2}%\n", second_stats.hit_ratio() * 100.0);
-
-	// Assertions
-	assert_eq!(first_results.len(), 10_000, "First query should return all 10,000 items");
-	assert_eq!(second_results.len(), 10_000, "Second query should return all 10,000 items");
-	assert!(
-		second_stats.total_hits() > first_stats.total_hits() * 2,
-		"Second query should have at least 2x more cache hits. First: {}, Second: {}",
-		first_stats.total_hits(),
-		second_stats.total_hits()
-	);
-
-	assert!(
-		second_stats.hit_ratio() == 1.0,
-		"Second query should have 100% cache hit ratio, got {:.2}%",
-		second_stats.hit_ratio() * 100.0
+	assert_eq!(first.len(), RANGE_QUERY_KEYS, "the scan must see every key written");
+	assert_eq!(
+		second, first,
+		"a warm cache must not change what a scan returns, in value or in order"
 	);
 
 	tree.close().await.unwrap();
+}
+
+/// The cache is not load-bearing for correctness: a capacity too small to hold
+/// the working set evicts constantly, and the answer is the same.
+///
+/// Nothing else covers eviction. The counters this replaces could not have —
+/// they measured hits, not whether an evicted block was re-read correctly.
+#[test(tokio::test)]
+async fn a_cache_too_small_to_hold_the_working_set_returns_the_same_results() {
+	async fn scan_with_cache_capacity(capacity_bytes: u64) -> Vec<(Vec<u8>, Vec<u8>)> {
+		let temp_dir = create_temp_directory();
+		let tree = TreeBuilder::new()
+			.with_path(temp_dir.path().to_path_buf())
+			.with_block_cache_capacity(capacity_bytes)
+			.with_max_memtable_size(1024 * 16)
+			.build()
+			.unwrap();
+
+		for i in 0..2_000 {
+			let mut tx = tree.begin().unwrap();
+			tx.set(format!("key_{i:08}").as_bytes(), format!("value_{i}").as_bytes()).unwrap();
+			tx.commit().await.unwrap();
+
+			if (i + 1) % 500 == 0 {
+				tree.flush().unwrap();
+			}
+		}
+		tree.flush().unwrap();
+
+		let tx = tree.begin().unwrap();
+		let results =
+			collect_transaction_all(&mut tx.range("key_00000000", "key_00002000").unwrap())
+				.unwrap();
+
+		tree.close().await.unwrap();
+		results
+	}
+
+	// 4 KiB holds a couple of blocks at most, so the scan evicts as it goes.
+	let starved = scan_with_cache_capacity(4 * 1024).await;
+	let roomy = scan_with_cache_capacity(10 * 1024 * 1024).await;
+
+	assert_eq!(starved.len(), 2_000, "the starved scan must still see every key");
+	assert_eq!(starved, roomy, "cache capacity must not change what a scan returns");
 }
 
 #[test(tokio::test)]

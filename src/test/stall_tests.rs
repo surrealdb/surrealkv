@@ -15,6 +15,7 @@ use crate::stall::{
 	WriteStallCountProvider,
 	WriteStallInfo,
 };
+use crate::test::support::wait_until;
 use crate::{Error, Tree, TreeBuilder};
 
 // ===== Mock Provider =====
@@ -185,18 +186,28 @@ async fn test_is_stalled_flag() {
 
 	assert!(!controller.is_stalled());
 
-	// Spawn task that will check and then signal
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(20)).await;
-		// At this point, should be stalled
-		assert!(controller_check.is_stalled());
-		time::sleep(Duration::from_millis(30)).await;
+	// The mid-stall observation is REPORTED, not asserted here.
+	//
+	// It used to be `assert!(controller_check.is_stalled())` inside this task,
+	// where a failure panics the task, the `JoinHandle` is dropped, and the
+	// panic is swallowed — the test passed whatever the flag said. Sleeping 20ms
+	// and hoping the main task had entered the stall by then made that worse:
+	// the one assertion that could catch a real defect was both racy and
+	// unobservable.
+	let observer = tokio::spawn(async move {
+		// Wait for the stall to be entered rather than guessing at a duration.
+		let entered = wait_until(|| controller_check.is_stalled()).await;
 		provider_clone.set_counts(1, 0); // Simulate flush completing
 		controller_clone.signal_work_done();
+		entered
 	});
 
 	let _ = controller.check(crate::batch::BatchOwner::DEFAULT).await;
 
+	assert!(
+		observer.await.expect("the observer task must not panic"),
+		"the controller never reported itself stalled while a writer was blocked in `check`"
+	);
 	// After stall cleared
 	assert!(!controller.is_stalled());
 }

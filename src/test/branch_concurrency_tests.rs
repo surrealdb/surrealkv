@@ -23,7 +23,7 @@ use crate::compaction::leveled::Strategy;
 use crate::lsm::Tree;
 use crate::{Error, ForkPoint, MergeStrategy, TreeBuilder};
 
-fn create_store(levels: u8) -> (Arc<Tree>, TempDir) {
+fn create_shared_store(levels: u8) -> (Arc<Tree>, TempDir) {
 	let temp_dir = TempDir::new("branch-concurrency").unwrap();
 	let path = temp_dir.path().to_path_buf();
 	let tree = TreeBuilder::new().with_path(path).with_level_count(levels).build().unwrap();
@@ -46,7 +46,7 @@ async fn seed(store: &Tree, key: &[u8], value: &[u8]) {
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn concurrent_forks_off_one_parent_all_resolve_and_never_share_a_generation() {
 	const FORKS: usize = 16;
-	let (store, _temp) = create_store(2);
+	let (store, _temp) = create_shared_store(2);
 	seed(&store, b"k", b"v").await;
 
 	let mut tasks = Vec::new();
@@ -89,7 +89,7 @@ async fn concurrent_forks_off_one_parent_all_resolve_and_never_share_a_generatio
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn forking_while_the_parent_compacts_never_costs_the_child_its_view() {
 	for attempt in 0..8u32 {
-		let (store, _temp) = create_store(2);
+		let (store, _temp) = create_shared_store(2);
 		seed(&store, b"k", b"v1").await;
 		store.flush().unwrap();
 		for round in 0..4u32 {
@@ -138,7 +138,7 @@ async fn forking_while_the_parent_compacts_never_costs_the_child_its_view() {
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn deleting_a_branch_while_it_is_written_either_fences_or_completes() {
 	for attempt in 0..8u32 {
-		let (store, _temp) = create_store(2);
+		let (store, _temp) = create_shared_store(2);
 		seed(&store, b"k", b"v").await;
 		let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
 
@@ -186,7 +186,7 @@ async fn deleting_a_branch_while_it_is_written_either_fences_or_completes() {
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn two_sources_merging_into_one_target_never_both_win_a_key() {
 	for attempt in 0..8u32 {
-		let (store, _temp) = create_store(2);
+		let (store, _temp) = create_shared_store(2);
 		seed(&store, b"shared", b"base").await;
 
 		let left = store.fork_branch("main", "left", ForkPoint::Head).unwrap();
@@ -245,7 +245,7 @@ async fn two_sources_merging_into_one_target_never_both_win_a_key() {
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_merge_racing_target_writes_never_loses_one_silently() {
 	for attempt in 0..8u32 {
-		let (store, _temp) = create_store(2);
+		let (store, _temp) = create_shared_store(2);
 		seed(&store, b"contested", b"base").await;
 		let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
 		let mut txn = child.begin().unwrap();
@@ -302,7 +302,7 @@ async fn a_merge_racing_target_writes_never_loses_one_silently() {
 /// because the catalog moved under it.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_maintenance_sweep_runs_safely_against_live_branch_traffic() {
-	let (store, _temp) = create_store(2);
+	let (store, _temp) = create_shared_store(2);
 	seed(&store, b"k", b"v").await;
 
 	let sweeping = {

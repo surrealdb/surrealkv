@@ -228,9 +228,25 @@ impl Harness {
 	}
 }
 
+/// What a history exercised, beyond agreeing with the specification.
+///
+/// Returned rather than accumulated in a process-global counter, which is what
+/// this was until 2026-08-15. `run_history` is shared by the seeded test below
+/// and by the 48 generated cases, and every caller incremented the same static —
+/// so the seeded test's non-vacuity assertion could be satisfied by somebody
+/// else's history, and the guard written to stop that test silently ceasing to
+/// test the retention promise was itself disarmed.
+#[derive(Debug, Clone, Copy)]
+struct HistoryOutcome {
+	/// A compaction retained at least one version solely because a live fork
+	/// anchor still needed it — the retention promise actually engaging, rather
+	/// than the history merely running.
+	pin_exercised: bool,
+}
+
 /// Runs one generated history against the engine and the model, checking every
 /// live branch's view of every key after every step.
-async fn run_history(ops: Vec<Op>) -> std::result::Result<(), TestCaseError> {
+async fn run_history(ops: Vec<Op>) -> std::result::Result<HistoryOutcome, TestCaseError> {
 	let mut harness = Harness::new();
 	let mut model = VisibilityModel::new();
 
@@ -374,13 +390,10 @@ async fn run_history(ops: Vec<Op>) -> std::result::Result<(), TestCaseError> {
 
 	let pinned = harness.store.metrics().unwrap().pin_retained_versions;
 	harness.store.close().await.unwrap();
-	if pinned > 0 {
-		PIN_EXERCISED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-	}
-	Ok(())
+	Ok(HistoryOutcome {
+		pin_exercised: pinned > 0,
+	})
 }
-
-static PIN_EXERCISED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 proptest! {
 	#![proptest_config(ProptestConfig {
@@ -420,7 +433,7 @@ proptest! {
 #[test]
 fn a_seeded_history_reaches_the_retention_pin_and_agrees_with_the_specification() {
 	let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-	runtime.block_on(async {
+	let outcome = runtime.block_on(async {
 		// Two children at DIFFERENT anchors is the whole point: with one child
 		// the lowest anchor IS the only anchor, so a single point pin is
 		// accidentally correct and proves nothing.
@@ -450,12 +463,12 @@ fn a_seeded_history_reaches_the_retention_pin_and_agrees_with_the_specification(
 			},
 			Op::Compact,
 		];
-		run_history(ops).await.unwrap();
+		run_history(ops).await.unwrap()
 	});
 	assert!(
-		PIN_EXERCISED.load(std::sync::atomic::Ordering::Relaxed) > 0,
-		"the seeded history no longer makes a compaction retain a version for an anchor, \
-		 so it is no longer testing the retention promise"
+		outcome.pin_exercised,
+		"THIS history must make a compaction retain a version for a fork anchor. It no longer \
+		 does, so it is no longer testing the retention promise, whatever the other cases did"
 	);
 }
 

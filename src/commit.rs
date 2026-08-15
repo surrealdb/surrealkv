@@ -13,22 +13,25 @@ use crate::stall::WriteStallController;
 
 /// Capacity of the lock-free commit ring buffer (slot array + index mask).
 /// Must be a power of two. The number of *in-flight* commits is gated below
-/// this by the semaphore (`max_concurrent_commits()`), so the ring never
-/// overflows.
+/// this by the semaphore ([`MAX_CONCURRENT_COMMITS_CEILING`]), so the ring
+/// never overflows.
 const COMMIT_QUEUE_SIZE: usize = 1024;
+
+/// The "must be a power of two" above is not decoration: the queue indexes its
+/// slots with `head & (COMMIT_QUEUE_SIZE - 1)`, which is only a modulo for a
+/// power of two. Stated in a comment and unchecked until 2026-08-15.
+const _: () = assert!(COMMIT_QUEUE_SIZE.is_power_of_two());
+
 const DEQUEUE_BITS: u32 = 32;
 
-/// Maximum number of commits allowed in the pipeline concurrently (semaphore
-/// permits). Default 7 reproduces the v2 baseline exactly. Override with the
-/// `SURREALKV_MAX_CONCURRENT_COMMITS` env var to sweep; clamped to
-/// `[1, COMMIT_QUEUE_SIZE - 1]` so the ring can never overflow.
-fn max_concurrent_commits() -> usize {
-	std::env::var("SURREALKV_MAX_CONCURRENT_COMMITS")
-		.ok()
-		.and_then(|v| v.parse::<usize>().ok())
-		.map(|v| v.clamp(1, COMMIT_QUEUE_SIZE - 1))
-		.unwrap_or(7)
-}
+/// Commits allowed in the pipeline concurrently (semaphore permits) unless a
+/// store says otherwise through [`crate::Options::max_concurrent_commits`].
+/// Reproduces the v2 baseline exactly.
+pub(crate) const DEFAULT_MAX_CONCURRENT_COMMITS: usize = 7;
+
+/// Largest permit count the ring can support. One below its capacity, so a
+/// full complement of in-flight commits can never wrap onto an occupied slot.
+pub(crate) const MAX_CONCURRENT_COMMITS_CEILING: usize = COMMIT_QUEUE_SIZE - 1;
 
 /// Output of [`CommitEnv::pre_serialize`]: the owned batch ready for memtable
 /// apply, plus its WAL encoding carrying
@@ -259,11 +262,16 @@ pub(crate) struct CommitPipeline {
 }
 
 impl CommitPipeline {
+	/// `max_concurrent_commits` is clamped here rather than where it is
+	/// configured, so that no construction path — builder, default, or a future
+	/// caller — can hand the ring more in-flight commits than it has slots.
 	pub(crate) fn new(
 		env: Arc<dyn CommitEnv>,
 		visible_seq_num: Arc<AtomicU64>,
 		write_stall: Arc<WriteStallController>,
+		max_concurrent_commits: usize,
 	) -> Arc<Self> {
+		let permits = max_concurrent_commits.clamp(1, MAX_CONCURRENT_COMMITS_CEILING);
 		Arc::new(Self {
 			env,
 			log_seq_num: AtomicU64::new(1),
@@ -271,7 +279,7 @@ impl CommitPipeline {
 			oracle: Arc::new(CommitOracle::new()),
 			write_mutex: Mutex::new(()),
 			pending: CommitQueue::new(),
-			commit_sem: Arc::new(Semaphore::new(max_concurrent_commits())),
+			commit_sem: Arc::new(Semaphore::new(permits)),
 			shutdown: AtomicBool::new(false),
 			write_stall,
 		})
@@ -571,6 +579,15 @@ impl CommitPipeline {
 	pub(crate) fn shutdown(&self) {
 		self.shutdown.store(true, Ordering::Release);
 	}
+
+	/// In-flight commits this pipeline will admit at once, after clamping. The
+	/// only way to observe [`crate::Options::max_concurrent_commits`] reaching
+	/// the pipeline — the alternative is a timing assertion, which would be
+	/// measuring the scheduler rather than the configuration.
+	#[cfg(test)]
+	pub(crate) fn commit_permits(&self) -> usize {
+		self.commit_sem.available_permits()
+	}
 }
 
 impl Drop for CommitPipeline {
@@ -664,8 +681,12 @@ mod tests {
 
 	#[test(tokio::test)]
 	async fn test_single_commit() {
-		let pipeline =
-			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(
+			Arc::new(MockEnv),
+			test_visible_seq_num(),
+			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
+		);
 
 		let mut batch = Batch::new(0);
 		batch
@@ -686,8 +707,12 @@ mod tests {
 
 	#[test(tokio::test)]
 	async fn commit_conflicts_are_scoped_by_branch_owner() {
-		let pipeline =
-			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(
+			Arc::new(MockEnv),
+			test_visible_seq_num(),
+			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
+		);
 		let first = BatchOwner {
 			branch: BranchId::from_u128(1),
 			generation: BranchGeneration(1),
@@ -715,8 +740,12 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 	async fn test_sequential_commits() {
-		let pipeline =
-			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(
+			Arc::new(MockEnv),
+			test_visible_seq_num(),
+			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
+		);
 
 		// First test sequential commits to verify basic functionality
 		for i in 0..5 {
@@ -740,8 +769,12 @@ mod tests {
 
 	#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 	async fn test_concurrent_commits() {
-		let pipeline =
-			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(
+			Arc::new(MockEnv),
+			test_visible_seq_num(),
+			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
+		);
 
 		let mut handles = vec![];
 		for i in 0..10 {
@@ -823,6 +856,7 @@ mod tests {
 			Arc::new(DelayedMockEnv),
 			test_visible_seq_num(),
 			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
 		);
 
 		let mut handles = vec![];
@@ -910,6 +944,7 @@ mod tests {
 			Arc::new(AlwaysFailApplyEnv),
 			test_visible_seq_num(),
 			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
 		);
 
 		for i in 0..20 {
@@ -989,7 +1024,12 @@ mod tests {
 	async fn test_queue_overflow_partial_fail() {
 		let fail_count = 10; // Fail first 10, then succeed
 		let env = Arc::new(FailNTimesEnv::new(fail_count));
-		let pipeline = CommitPipeline::new(env, test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(
+			env,
+			test_visible_seq_num(),
+			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
+		);
 
 		for i in 0..20 {
 			let mut batch = Batch::new(0);
@@ -1028,7 +1068,12 @@ mod tests {
 	#[test(tokio::test)]
 	async fn test_apply_failure_releases_oracle_entry() {
 		let env = Arc::new(FailNTimesEnv::new(1)); // First apply fails, then succeeds.
-		let pipeline = CommitPipeline::new(env, test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(
+			env,
+			test_visible_seq_num(),
+			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
+		);
 
 		// First commit on key K: apply fails. Oracle entry stamped at the
 		// allocated seq, then rolled back inside `commit()` on the apply error.
@@ -1093,7 +1138,12 @@ mod tests {
 		let env = Arc::new(FencingApplyEnv {
 			fenced: AtomicBool::new(false),
 		});
-		let pipeline = CommitPipeline::new(env, test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(
+			env,
+			test_visible_seq_num(),
+			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
+		);
 
 		let mut first = Batch::new(0);
 		first.set(b"first".to_vec(), b"one".to_vec(), 0).unwrap();
@@ -1155,7 +1205,12 @@ mod tests {
 		let env = Arc::new(OverreportingEnv {
 			overreport: 10_000_000,
 		});
-		let pipeline = CommitPipeline::new(env, test_visible_seq_num(), test_write_stall());
+		let pipeline = CommitPipeline::new(
+			env,
+			test_visible_seq_num(),
+			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
+		);
 
 		// Drive enough commits past GC_INTERVAL with a tiny start_seq (= 0).
 		// Without the clamp, the GC body would advance `kept_since` to
@@ -1238,6 +1293,7 @@ mod tests {
 			}),
 			test_visible_seq_num(),
 			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
 		);
 		assert!(pipeline.is_drained(), "a pipeline with no traffic is drained");
 
@@ -1313,6 +1369,7 @@ mod tests {
 			Arc::new(FailingWalEnv),
 			test_visible_seq_num(),
 			test_write_stall(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
 		);
 		let mut batch = Batch::new(0);
 		batch.add_record(InternalKeyKind::Set, b"k".to_vec(), Some(vec![1]), 0).unwrap();
@@ -1326,5 +1383,35 @@ mod tests {
 			"and can never be published, so the counters never meet"
 		);
 		pipeline.shutdown();
+	}
+
+	fn pipeline_with_limit(limit: usize) -> Arc<CommitPipeline> {
+		CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall(), limit)
+	}
+
+	/// The configured limit reaches the semaphore, and cannot put the ring
+	/// buffer at risk however it is configured.
+	///
+	/// This value came from `SURREALKV_MAX_CONCURRENT_COMMITS` until 2026-08-15
+	/// — ambient, process-wide, untested, and able to change concurrency under
+	/// every store in the process at once.
+	#[test]
+	fn the_commit_limit_is_honoured_and_clamped_to_the_ring() {
+		assert_eq!(
+			pipeline_with_limit(DEFAULT_MAX_CONCURRENT_COMMITS).commit_permits(),
+			DEFAULT_MAX_CONCURRENT_COMMITS,
+			"a value inside the range must be used as given"
+		);
+		assert_eq!(pipeline_with_limit(3).commit_permits(), 3, "including a non-default one");
+		assert_eq!(
+			pipeline_with_limit(0).commit_permits(),
+			1,
+			"zero permits would deadlock every commit, so the floor is one"
+		);
+		assert_eq!(
+			pipeline_with_limit(usize::MAX).commit_permits(),
+			MAX_CONCURRENT_COMMITS_CEILING,
+			"more in-flight commits than ring slots would overflow the queue"
+		);
 	}
 }

@@ -5,17 +5,13 @@ use std::sync::Arc;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-use tempdir::TempDir;
 use test_log::test;
 
 use crate::sstable::table::{Table, TableWriter};
+use crate::test::support::{create_temp_directory, wrap_buffer};
 use crate::{CompressionType, InternalKey, InternalKeyKind, LSMIterator, Options};
 
 // ========== Helper Functions ==========
-
-fn create_temp_directory() -> TempDir {
-	TempDir::new("compression_test").unwrap()
-}
 
 fn create_compression_test_options(path: PathBuf) -> Options {
 	Options {
@@ -31,10 +27,6 @@ fn default_opts_mut() -> Options {
 	opts.block_restart_interval = 3;
 	opts.index_partition_size = 100; // Force multiple partitions
 	opts
-}
-
-fn wrap_buffer(src: Vec<u8>) -> Arc<dyn crate::vfs::File> {
-	Arc::new(src)
 }
 
 fn generate_compressible_value(size: usize, pattern: u8) -> Vec<u8> {

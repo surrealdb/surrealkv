@@ -6,6 +6,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::batch::{Batch, BatchOwner};
+use crate::test::support::create_temp_directory;
 use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
@@ -22,10 +23,6 @@ use crate::wal::{
 	SegmentRef,
 };
 use crate::{BranchGeneration, BranchId, LSMIterator};
-
-fn create_temp_directory() -> TempDir {
-	TempDir::new("test").unwrap()
-}
 
 fn create_segment_file(dir: &Path, name: &str) {
 	let file_path = dir.join(name);

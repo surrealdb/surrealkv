@@ -26,6 +26,8 @@ mod branch_crash_tests;
 mod branch_property_tests;
 pub mod branch_runtime_tests;
 #[cfg(test)]
+mod cache_tests;
+#[cfg(test)]
 pub mod compaction_tests;
 #[cfg(test)]
 pub mod compression_tests;
@@ -69,6 +71,8 @@ pub mod snapshot_tests;
 pub mod sstable_tests;
 #[cfg(test)]
 pub mod stall_tests;
+#[cfg(test)]
+pub mod support;
 mod timeline_tests;
 #[cfg(test)]
 pub mod transaction_tests;

@@ -16,39 +16,48 @@
 //! unarmed, must succeed. Without that, a test could pass because the operation
 //! was refused for some unrelated reason.
 
+use std::sync::Arc;
+
 use tempdir::TempDir;
 use test_log::test;
 
-use crate::failpoints::{self, arm_once, CATALOG_PUBLISH, ROOT_PUBLISH};
+use crate::failpoints::{FaultPoint, FaultPolicy, ScriptedFaults};
 use crate::lsm::Tree;
+use crate::test::support::branch_exists;
 use crate::{ForkPoint, MergeStrategy, TreeBuilder};
 
-fn create_store() -> (Tree, TempDir) {
+/// A store whose fault policy the test holds a handle on.
+///
+/// The policy is injected through `Options` exactly as the clock is, and its
+/// state lives in the instance — so scripting a fault here cannot reach a store
+/// in another test running on another thread.
+fn create_store_with_faults() -> (Tree, Arc<ScriptedFaults>, TempDir) {
 	let temp_dir = TempDir::new("faults").unwrap();
-	let path = temp_dir.path().to_path_buf();
-	let tree = TreeBuilder::new().with_path(path).with_level_count(2).build().unwrap();
-	(tree, temp_dir)
-}
-
-fn branch_exists(store: &Tree, name: &str) -> bool {
-	store.list_branches().unwrap().iter().any(|info| info.name == name)
+	let faults = Arc::new(ScriptedFaults::new());
+	let tree = TreeBuilder::new()
+		.with_path(temp_dir.path().to_path_buf())
+		.with_level_count(2)
+		.with_fault_policy(Arc::clone(&faults) as Arc<dyn FaultPolicy>)
+		.build()
+		.unwrap();
+	(tree, faults, temp_dir)
 }
 
 /// A fork whose catalog publish fails creates nothing, and the name is free to
 /// use afterwards.
 #[test(tokio::test)]
 async fn a_failed_publish_leaves_no_half_created_fork() {
-	let (store, _temp) = create_store();
+	let (store, faults, _temp) = create_store_with_faults();
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
 
 	{
-		let _armed = arm_once(CATALOG_PUBLISH);
+		faults.fail_times(FaultPoint::CatalogPublish, 1);
 		store
 			.fork_branch("main", "doomed", ForkPoint::Head)
 			.expect_err("the publish failed, so the fork must fail");
-		assert!(!failpoints::is_armed(CATALOG_PUBLISH), "the injected fault was consumed");
+		assert!(!faults.is_armed(FaultPoint::CatalogPublish), "the injected fault was consumed");
 	}
 
 	assert!(
@@ -67,14 +76,14 @@ async fn a_failed_publish_leaves_no_half_created_fork() {
 /// tombstoned in memory while the durable catalog still lists it.
 #[test(tokio::test)]
 async fn a_failed_publish_leaves_a_deleted_branch_alive() {
-	let (store, _temp) = create_store();
+	let (store, faults, _temp) = create_store_with_faults();
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
 	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
 
 	{
-		let _armed = arm_once(CATALOG_PUBLISH);
+		faults.fail_times(FaultPoint::CatalogPublish, 1);
 		store.delete_branch("work").expect_err("the publish failed, so the delete must fail");
 	}
 
@@ -97,7 +106,7 @@ async fn a_failed_publish_leaves_a_deleted_branch_alive() {
 /// identically, because the copies shadow what they were copied from.
 #[test(tokio::test)]
 async fn a_failed_publish_leaves_a_detached_branch_reading_through_its_parent() {
-	let (store, _temp) = create_store();
+	let (store, faults, _temp) = create_store_with_faults();
 	let mut txn = store.begin().unwrap();
 	txn.set(b"inherited", b"from-parent").unwrap();
 	txn.commit().await.unwrap();
@@ -109,7 +118,7 @@ async fn a_failed_publish_leaves_a_detached_branch_reading_through_its_parent() 
 	txn.commit().await.unwrap();
 
 	{
-		let _armed = arm_once(CATALOG_PUBLISH);
+		faults.fail_times(FaultPoint::CatalogPublish, 1);
 		store.detach_branch("work").expect_err("the publish failed, so the detach must fail");
 	}
 
@@ -134,7 +143,7 @@ async fn a_failed_publish_leaves_a_detached_branch_reading_through_its_parent() 
 /// expires it. A sweep that failed must not report work it did not do.
 #[test(tokio::test)]
 async fn a_failed_publish_leaves_an_expiring_branch_alive_until_the_next_sweep() {
-	let (store, _temp) = create_store();
+	let (store, faults, _temp) = create_store_with_faults();
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
@@ -142,7 +151,7 @@ async fn a_failed_publish_leaves_an_expiring_branch_alive_until_the_next_sweep()
 	store.set_branch_ttl("ephemeral", Some(std::time::Duration::ZERO)).unwrap();
 
 	{
-		let _armed = arm_once(CATALOG_PUBLISH);
+		faults.fail_times(FaultPoint::CatalogPublish, 1);
 		store
 			.core
 			.inner
@@ -161,7 +170,7 @@ async fn a_failed_publish_leaves_an_expiring_branch_alive_until_the_next_sweep()
 /// The contract is the one PD2 recorded: re-offering, never silent loss.
 #[test(tokio::test)]
 async fn a_merge_whose_edge_fails_to_publish_re_offers_rather_than_losing() {
-	let (store, _temp) = create_store();
+	let (store, faults, _temp) = create_store_with_faults();
 	let mut txn = store.begin().unwrap();
 	txn.set(b"anchor", b"base").unwrap();
 	txn.commit().await.unwrap();
@@ -173,7 +182,7 @@ async fn a_merge_whose_edge_fails_to_publish_re_offers_rather_than_losing() {
 	txn.commit().await.unwrap();
 
 	{
-		let _armed = arm_once(CATALOG_PUBLISH);
+		faults.fail_times(FaultPoint::CatalogPublish, 1);
 		child
 			.merge_into(&main, MergeStrategy::Strict)
 			.await
@@ -205,7 +214,7 @@ async fn a_merge_whose_edge_fails_to_publish_re_offers_rather_than_losing() {
 /// failure path.
 #[test(tokio::test)]
 async fn a_failed_root_publish_during_reclamation_puts_the_owner_back() {
-	let (store, _temp) = create_store();
+	let (store, faults, _temp) = create_store_with_faults();
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
@@ -238,7 +247,7 @@ async fn a_failed_root_publish_during_reclamation_puts_the_owner_back() {
 	store.delete_branch("doomed").unwrap();
 
 	{
-		let _armed = arm_once(ROOT_PUBLISH);
+		faults.fail_times(FaultPoint::RootPublish, 1);
 		store
 			.core
 			.inner
@@ -268,23 +277,24 @@ async fn a_failed_root_publish_during_reclamation_puts_the_owner_back() {
 /// arms silently vacuous rather than loudly wrong.
 #[test(tokio::test)]
 async fn the_registry_fires_as_armed_and_stops_when_disarmed() {
-	let (store, _temp) = create_store();
+	let (store, faults, _temp) = create_store_with_faults();
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
 
 	{
-		let _armed = arm_once(CATALOG_PUBLISH);
+		faults.fail_times(FaultPoint::CatalogPublish, 1);
 		assert!(store.create_branch("a").is_err(), "the first call must fail");
 		assert!(store.create_branch("a").is_ok(), "and the second must not");
 	}
 
 	{
-		let _armed = failpoints::arm_always(CATALOG_PUBLISH);
+		faults.fail_always(FaultPoint::CatalogPublish);
 		assert!(store.create_branch("b").is_err());
 		assert!(store.create_branch("b").is_err(), "an always-armed point keeps firing");
-		assert!(failpoints::is_armed(CATALOG_PUBLISH));
+		assert!(faults.is_armed(FaultPoint::CatalogPublish));
 	}
-	assert!(!failpoints::is_armed(CATALOG_PUBLISH), "the guard disarms on drop");
+	faults.clear(FaultPoint::CatalogPublish);
+	assert!(!faults.is_armed(FaultPoint::CatalogPublish));
 	store.create_branch("b").expect("normal operation resumes");
 }

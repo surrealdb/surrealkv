@@ -5,7 +5,7 @@ use test_log::test;
 
 use crate::sstable::block::BlockHandle;
 use crate::sstable::index_block::{BlockHandleWithKey, Index, IndexWriter};
-use crate::vfs::File;
+use crate::test::support::wrap_buffer;
 use crate::{
 	CompressionType,
 	InternalKey,
@@ -15,10 +15,6 @@ use crate::{
 	INTERNAL_KEY_SEQ_NUM_MAX,
 	INTERNAL_KEY_TIMESTAMP_MAX,
 };
-
-fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
-	Arc::new(src)
-}
 
 fn create_internal_key(user_key: Vec<u8>, sequence: u64) -> Vec<u8> {
 	InternalKey::new(user_key, sequence, InternalKeyKind::Set, 0).encode()

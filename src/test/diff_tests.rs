@@ -3,17 +3,10 @@
 //! The property under test throughout is that a diff reports exactly what the
 //! branch changed — not what it can read, and not what it happens to own.
 
-use tempdir::TempDir;
 use test_log::test;
 
-use crate::{Error, ForkPoint, Tree, TreeBuilder};
-
-fn create_store() -> (Tree, TempDir) {
-	let temp_dir = TempDir::new("diff").unwrap();
-	let path = temp_dir.path().to_path_buf();
-	let tree = TreeBuilder::new().with_path(path).build().unwrap();
-	(tree, temp_dir)
-}
+use crate::test::support::create_store;
+use crate::{Error, ForkPoint};
 
 fn keys(entries: &[crate::DiffEntry]) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
 	entries.iter().map(|entry| (entry.key.clone(), entry.op.value().cloned())).collect()

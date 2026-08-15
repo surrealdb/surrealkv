@@ -1,13 +1,3 @@
-/// Fails at a named durable step when a test has armed it; expands to nothing
-/// otherwise, so a published build carries no registry, no lookup and no
-/// branch. See `crate::failpoints`.
-macro_rules! failpoint {
-	($name:expr) => {
-		#[cfg(test)]
-		crate::failpoints::check($name)?;
-	};
-}
-
 mod api;
 mod authority;
 mod batch;
@@ -22,7 +12,6 @@ mod comparator;
 mod compression;
 mod diff;
 mod error;
-#[cfg(test)]
 mod failpoints;
 mod iter;
 mod levels;
@@ -68,6 +57,7 @@ use sstable::bloom::LevelDBBloomFilter;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
+use crate::failpoints::FaultPolicy;
 pub use crate::lsm::{BranchHandle, Tree, TreeBuilder};
 pub use crate::transaction::{
 	Durability,
@@ -215,6 +205,11 @@ pub struct Options {
 	pub versioned_history_retention_ns: u64,
 	/// Logical clock for time-based operations
 	pub(crate) clock: Arc<dyn LogicalClock>,
+	/// Consulted at each durable step. `NoFaults` in every build a user sees;
+	/// tests substitute a scripted policy to drive the rollback paths. Injected
+	/// rather than global so two stores in one process cannot see each other's
+	/// script, and so production runs the same code path the tests do.
+	pub(crate) fault_policy: Arc<dyn FaultPolicy>,
 
 	// Shutdown configuration
 	/// If true, flush active memtable to SSTable during shutdown.
@@ -249,6 +244,17 @@ pub struct Options {
 	/// Should be >= level0_max_files (compaction trigger).
 	/// Default: 12 (3x level0_max_files)
 	pub l0_stall_threshold: usize,
+
+	/// How many commits may be in the pipeline at once.
+	///
+	/// Read from an environment variable until 2026-08-15, which meant every
+	/// store in a process silently inherited a value it could not opt out of —
+	/// and this one changes concurrency, so it changes reproducibility. Set it
+	/// per store instead. Clamped to the pipeline's ring capacity on use; see
+	/// [`TreeBuilder::with_max_concurrent_commits`].
+	///
+	/// Default: 7
+	pub max_concurrent_commits: usize,
 }
 
 impl Default for Options {
@@ -256,6 +262,7 @@ impl Default for Options {
 		let bf = LevelDBBloomFilter::new(10);
 		// Initialize the logical clock
 		let clock = Arc::new(DefaultLogicalClock::new());
+		let fault_policy: Arc<dyn FaultPolicy> = Arc::new(crate::failpoints::NoFaults);
 
 		let comparator: Arc<dyn Comparator> = Arc::new(crate::BytewiseComparator {});
 		let internal_comparator: Arc<dyn Comparator> =
@@ -279,6 +286,7 @@ impl Default for Options {
 			enable_versioning: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
+			fault_policy,
 			flush_on_close: true,
 			wal_recovery_mode: WalRecoveryMode::default(),
 			level0_max_files: 4,
@@ -286,6 +294,7 @@ impl Default for Options {
 			level_multiplier: 10.0,
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
+			max_concurrent_commits: commit::DEFAULT_MAX_CONCURRENT_COMMITS,
 		}
 	}
 }
@@ -467,6 +476,15 @@ impl Options {
 	/// Sets the number of L0 files that triggers write stall.
 	pub const fn with_l0_stall_threshold(mut self, value: usize) -> Self {
 		self.l0_stall_threshold = value;
+		self
+	}
+
+	/// Sets how many commits may be in the pipeline at once.
+	///
+	/// Effective range is `[1, 1023]`; the pipeline clamps to it, because the
+	/// ring buffer behind the pipeline must never overflow.
+	pub const fn with_max_concurrent_commits(mut self, value: usize) -> Self {
+		self.max_concurrent_commits = value;
 		self
 	}
 

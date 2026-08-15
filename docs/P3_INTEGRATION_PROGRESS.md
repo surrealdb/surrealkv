@@ -477,6 +477,299 @@ Verification: 1,095 lib tests green (1,092 → 1,095), 4 doc tests, clippy `--al
 the edge covers the whole extent, one-chunk atomicity, the unchunkable single entry with nothing
 written, and the planning-window conflict.
 
+### DEFECT — a store whose L1 key order disagreed with its sequence order would not reopen (2026-08-15)
+
+**Found by the property suite, generating a case rather than re-running a planted one.** This is the
+fifth production defect the coverage slices have found, and the first the randomized testing found on
+its own. `proptest` shrank it to
+`[Churn { key: 2 }, Compact, Churn { key: 0 }, Compact, Reopen]`; the seed is persisted in
+`proptest-regressions/test/branch_property_tests.txt`.
+
+**The defect.** `LevelManifest::hydrate` validated every level below L0 with
+`validate_table_sequence_numbers`, which required adjacent tables to satisfy
+`next.smallest_seq_num > current.largest_seq_num` — ascending, disjoint *sequence* ranges.
+
+Levels below L0 are ordered by **key**. `Level::find_first_overlapping_table` and
+`find_last_overlapping_table` read them with `slice::partition_point`, a binary search that is only
+correct on a key-sorted vector, and `hydrate` pushes tables in manifest order and never sorts them.
+So the loader demanded one ordering of a vector every reader requires to be in another. Key order
+and sequence order are independent, and the guard was `level_idx > 0` — the exact inverse of the
+level where a sequence-disjointness argument could even be made.
+
+**The consequence.** Write a high key, compact it to L1, write a low key, compact it to L1, close,
+reopen: `LoadManifestFail("Level 1 tables have overlapping sequence numbers: Table 1031
+(Some(6)-Some(6)) and Table 1027 (Some(3)-Some(3))")`. Note the two ranges do not overlap — they are
+disjoint and *descending*, which is the tell that the check was reporting an ordering violation as
+an overlap. **The store never opens again.** No branches are involved; this is the plain single-owner
+write path.
+
+**The fix.** `validate_level_tables` keeps the per-table sanity checks (both sequence numbers
+present, `smallest <= largest`) and replaces the cross-table sequence check with the invariant the
+readers actually depend on: adjacent tables must be in ascending key order. Nothing validated that
+before, so a manifest that would have broken the binary search loaded silently — a wrong answer
+returned quietly rather than an error.
+
+**Verification.**
+
+- `a_store_reopens_when_l1_key_order_and_sequence_order_disagree` (`src/test/lsm_tests.rs`) is the
+  defect reduced to the plain public API, with no branching. It fails on the old check with the
+  identical error, table ids and sequence numbers as the generated case.
+- **A first reduction was too small and passed.** Two keys and two compactions merge into a *single*
+  L1 table, and the check is skipped for `tables.len() <= 1`. The reproducer needs the property
+  harness's configuration — `level_count: 2`, `level0_max_files: 2` — and three writes per key, so
+  that each key becomes its own L1 table. Recorded because the near-miss is the interesting part: a
+  reduction that passes is not proof the diagnosis is wrong.
+- **Sabotage twin.** `reverse_l1_table_order` decodes the newest `BranchStateManifest`, reverses
+  L1's table ids, and re-encodes — so only the level's key ordering is wrong and every other
+  invariant is intact. The reopen must be refused with the new message. Without this arm the test
+  would only prove the loader accepts things.
+- **Sensitivity probe.** Neutering the new condition makes the sabotage arm fail with "a level whose
+  tables are out of key order must be refused". (A first probe using `windows(0)` was invalid — it
+  panicked inside the probe itself, so the test failed for the wrong reason. Recorded because a
+  probe that reddens for the wrong reason is not a probe.)
+
+**What this says about the property suite.** The 1,129-test hand-written suite never caught this
+because its tests either put one table in a level or wrote keys in ascending order, so key order and
+sequence order coincided. Nothing was wrong with those tests; the shape simply never occurred to
+anyone writing them by hand. That is the argument for V6 in one defect.
+
+### V8b-1 — The two test-layer defects: complete (2026-08-15)
+
+**`PIN_EXERCISED` is gone; `run_history` returns a `HistoryOutcome`.** The static was incremented by
+the seeded retention test *and* by all 48 generated cases, so the seeded test's
+`assert!(PIN_EXERCISED > 0)` — added specifically to stop that test silently ceasing to test the
+retention promise — could be satisfied by somebody else's history. It was disarmed from the day it
+was written. The seeded test now asserts on its own return value, and the message says so: "THIS
+history must make a compaction retain a version for a fork anchor".
+
+**`branch_exists` is one function.** It was defined in `fault_injection_tests.rs` (via
+`list_branches`) and in `fork_view_tests.rs` (via `core.inner.branch_catalog.get_by_name`).
+
+Delta: **the plan said these "answer different questions"; they do not.** `BranchCatalog::list` and
+`get_by_name` are both driven by the same `live_names` index, and `delete` removes from it, so both
+forms answer "is there a live branch with this name" and every existing assertion means what it
+appears to mean. The hazard was real but different: two implementations under one name, at two
+different layers, that nothing held together — a test moved between the files would have changed
+which layer it exercised without changing a line. The `list_branches` form was also the worse of the
+two in the file that used it, since it builds a `BranchInfo` for *every* branch (walking the level
+manifest per branch), so in a fault-injection test an unrelated failure turns a clean `false` into a
+panic from `.unwrap()`.
+
+The single definition lives in the new `src/test/support/` and goes through `Tree::branch(name)`:
+public API, O(1), no panic path, and identical semantics to both — so no assertion changed meaning,
+which the "stop if" for this slice required.
+
+Verification: **1,137 lib tests**, clippy `--all-targets --all-features` clean, fmt clean. The
+ambient-state guard failed once during this slice, correctly: deleting `PIN_EXERCISED` left its
+allowlist entry stale, which is the both-directions check earning its place on its first outing.
+
+### V8a — The injection seam: in progress (2026-08-15)
+
+**V8a-1 — the fault policy becomes a dependency.** V3 shipped its failpoints as a `#[cfg(test)]`
+`thread_local!` registry keyed by `&'static str` and reached through a `failpoint!` macro. It is now
+`Options.fault_policy: Arc<dyn FaultPolicy>`, defaulted in `Default::default()`, mirroring
+`clock: Arc<dyn LogicalClock>` exactly. `FaultPoint` is a closed enum the engine matches
+exhaustively; `NoFaults` is the zero-sized production default; `ScriptedFaults` is `#[cfg(test)]`
+and holds its script **in the instance**, which is why the global version needed a thread-local and
+this one does not. `LevelManifest` stores the policy as a field — `fresh`/`hydrate` already take
+`Arc<Options>`, so `persist_owner_update` and `persist_root` reach it with no signature changes.
+`TreeBuilder::with_fault_policy` is the test seam. Production and tests now compile the same call
+sites; only the injected value differs.
+
+**V8a-2 — the block cache's `#[cfg(test)]` counters are deleted.** `src/cache.rs` carried six
+`AtomicU64` fields, three `#[cfg(test)]` blocks in the lookup path, `get_stats`, `reset_stats` and
+`CacheStats` — about twenty conditional sites on the hottest read path in the engine, serving four
+assertions in one test. It was the sharpest violation of principle 4 in the crate: the cache under
+test had a different struct size and six extra atomic read-modify-writes per lookup than the one
+that ships. All of it is gone; `BlockCache` is one object in every build.
+
+Plan-vs-reality deltas:
+
+1. **The replacement is stronger than the assertions it replaces, and lives at a different level.**
+   The plan said "rewrite the 4 assertions to check observable behaviour — a second read of a cached
+   block does not re-read the file". That is not observable through `Tree`: table readers hold an
+   open `Arc<dyn File>`, so nothing at the tree level can tell a cache hit from a file read. It *is*
+   observable one level down, because `crate::vfs::File` is already a trait. `src/test/cache_tests.rs`
+   introduces `SealableFile`, an ordinary `File` implementation that fails every `read_at` once
+   sealed. The table under test therefore runs exactly the shipped code path and only the file
+   beneath it differs — principle 4's allowed case, a test *double*, not a `#[cfg(test)]` branch
+   inside the subject.
+2. **Non-vacuity is asserted inside the test, not only by a probe.** After sealing, the same lookup
+   still succeeds (the cache served it) **and** a lookup into a data block this table has never read
+   fails with the sealed-file error. The second assertion is what stops the first from being vacuous
+   if the seal ever stops biting. A separate control arm seals before any lookup and requires the
+   read to fail, pinning the fact that uncached reads genuinely reach the file.
+3. **The history block cache is covered too.** It had its own pair of counters
+   (`data_history_hits`/`misses`) and is keyed by a distinct kind, so it gets its own test: a full
+   scan under `TimestampComparator`, sealed, re-scanned, asserted identical.
+4. **The tree-level test survives, minus the counters, and gains a second arm.** What it can still
+   prove end-to-end is that a scan across many SSTables returns identical results warm and cold
+   (`repeated_range_queries_over_many_ssts_return_identical_results`). Added alongside it:
+   `a_cache_too_small_to_hold_the_working_set_returns_the_same_results`, which runs the same workload
+   under a 4 KiB cache and a 10 MiB one and requires the results to match. **Nothing covered eviction
+   before** — the deleted counters measured hits, never whether an evicted block was re-read
+   correctly.
+5. **It stayed in `snapshot_tests.rs` rather than moving.** Moving it would have needed an eighth
+   copy of `create_temp_directory`; V8b consolidates those into `src/test/support/` and can move it
+   then. The new table-level tests need no temp directory, so they live in the new file.
+
+**Sensitivity probe.** Making all three `BlockCache` getters return `None` (cache disabled) reddens
+`a_block_already_in_the_cache_is_served_without_reading_the_file` and
+`the_history_block_cache_serves_a_repeat_scan_without_reading_the_file` on exactly the intended
+assertion — the sealed-read error — and leaves the control arm
+`a_block_not_in_the_cache_is_read_from_the_file` green, which is correct: that test asserts the
+*miss* path. Probe reverted.
+
+Verification after V8a-2: **1,133 lib tests** (1,129 → 1,133: three table-level cache tests, plus
+the eviction arm, less the one test replaced), 4 doc tests, clippy `--all-targets --all-features`
+clean, fmt clean.
+
+**V8a-3 — the last ambient dependency, and a gate finding that struck half the slice.**
+
+The env read is gone. `SURREALKV_MAX_CONCURRENT_COMMITS` (`src/commit.rs`) was the only
+`std::env::var` in the crate, and it set the commit pipeline's semaphore permits — so every store in
+a process silently inherited one ambient value that changes concurrency, and therefore
+reproducibility. It is now `Options::max_concurrent_commits` with
+`TreeBuilder::with_max_concurrent_commits`, defaulted to `DEFAULT_MAX_CONCURRENT_COMMITS` (7, the v2
+baseline). `CommitPipeline::new` takes it as a parameter — thirteen call sites, twelve of them in
+`commit.rs`'s own unit tests; a missed one cannot compile, which is why a parameter was preferred to
+a second constructor.
+
+`SSTableError::FailedToGetSystemTime` is deleted: never constructed, a vestige of the
+`SystemTime::now()` call removed from the SST writer.
+
+Deltas:
+
+1. **The plan's "five `#[cfg(test)]` methods with zero call sites" is wrong, and the deletion is
+   struck.** Measured against the current tree, *every one* has live callers:
+   `BranchCatalog::default_branch` (`src/branch.rs:736`), `CommitPipeline::oracle` (five sites
+   across `commit.rs` and `src/test/oracle_tests.rs`), `allocated_seq_high_water`
+   (`src/commit.rs:1322`), and `BackgroundErrorHandler`'s `get_error` / `is_db_stopped` /
+   `error_count` / `clear_error` (eleven sites in `error.rs`'s own test module — the plan also
+   miscounted these as three items, not four). They are test-only accessors on production types
+   with tests that legitimately need them, which is exactly principle 4's *allowed* case. Deleting
+   them would have deleted the assertions with them. The standing method's "stop if any deleted item
+   turns out to have a live consumer" applied, so they stay.
+2. **The concern behind that entry is still real, and moves to `docs/KNOWN_GAPS.md`.** V1's guard
+   forbids `allow(dead_code)`, so genuinely dead code can satisfy it by hiding behind `#[cfg(test)]`
+   instead. That loophole exists; these five simply are not instances of it. A static check cannot
+   reasonably prove a `cfg(test)` item is uncalled, so it is recorded as a known limit of the guard
+   rather than papered over.
+3. **The clamp moved to the pipeline, and it is load-bearing.** The env version clamped at the read
+   site; the option is clamped inside `CommitPipeline::new`, so no construction path — builder,
+   default, or a future caller — can hand the ring more in-flight commits than it has slots. The
+   probe below shows this is not defensive decoration: without it, `Semaphore::new(usize::MAX)`
+   panics inside tokio at store construction.
+4. **A compile-time invariant that was a comment became a check.** `COMMIT_QUEUE_SIZE` carried
+   "Must be a power of two" with nothing enforcing it, while the queue indexes slots with
+   `head & (COMMIT_QUEUE_SIZE - 1)`. It is now `const _: () = assert!(…is_power_of_two())`. This
+   replaced a runtime assertion in the new test that clippy correctly flagged as constant — and it
+   *was* vacuous, since the ceiling is defined as `COMMIT_QUEUE_SIZE - 1`; the power-of-two fact is
+   the one a reader cannot see from the literal.
+
+**Sensitivity probes.** (a) Replacing the clamp with `.max(1)` reddens
+`the_commit_limit_is_honoured_and_clamped_to_the_ring` — by panicking inside tokio's semaphore,
+which is the failure the clamp exists to prevent. (b) Hard-coding the default at the `lsm.rs`
+construction site instead of reading `opts.max_concurrent_commits` reddens
+`each_store_gets_its_own_commit_concurrency_limit` with `left: 7, right: 3`. Both reverted.
+
+Verification after V8a-3: **1,135 lib tests**, 4 doc tests, clippy `--all-targets --all-features`
+clean, fmt clean.
+
+**V8a-4 — the allowlist becomes machine-checked, and the gaps get a home.**
+
+`no_ambient_state_outside_the_written_allowlist` (`src/test/architecture_guard_tests.rs`) walks
+`src/` and fails on: a `static` item declaration not named in `AMBIENT_STATE_ALLOWLIST`, any
+`thread_local!` / `lazy_static!` / `once_cell::`, any `env::var`, any `SystemTime::now()` outside
+`src/clock.rs`, and any `rand::rng()` / `thread_rng()` outside `src/memtable/skiplist.rs`. The
+allowlist is keyed `file:NAME` and each entry carries its reason inline, so moving a global to
+another file forces a fresh decision rather than inheriting one.
+
+Deltas:
+
+1. **The allowlist is checked in both directions.** The plan asked for the shape of the dead-code
+   guard, which only catches *unlisted* offenders. This one also fails when a listed global no
+   longer exists, so a reason cannot outlive the code it describes. That turns the allowlist into a
+   ratchet: V8b-1's deletion of `PIN_EXERCISED` will fail this test until its entry is removed too,
+   which is the intended behaviour.
+2. **The measurement moved.** The plan said "six statics with interior mutability, one env read, one
+   ambient RNG". Measured now: **seven** statics (the plan's six plus
+   `src/test/iterator_tests.rs:TEST_TABLE_ID_COUNTER`, which the earlier sweep missed), **zero** env
+   reads (V8a-3 removed the only one), **zero** `thread_local!` (V8a-1 removed the only one), one
+   ambient RNG, and one `SystemTime::now()` — in `src/clock.rs`, which is the clock adapter itself.
+   The two other apparent `SystemTime::now()` hits are comments explaining why the call is *not*
+   there, which is why the detector skips comment lines.
+3. **`docs/KNOWN_GAPS.md` requires a trigger per entry.** Each gap states what it is, why it was
+   left, what it would take, and **what would raise its priority** — because an entry with no
+   trigger is not a decision. Six entries: `Tree::flush`, `ForkFenceTimeout`, the skiplist RNG,
+   `BRANCH_ID_COUNTER`, `vfs::sync_tracker`, and (new, from V8a-3's gate) the `#[cfg(test)]`
+   loophole in the dead-code guard — carrying the warning that the plan's "five dead methods" claim
+   was wrong, so nobody deletes on that basis again. A "not gaps" section records the decisions that
+   should not be re-litigated.
+4. **The `Tree::flush` entry is written at length, on request.** It is the longest entry because it
+   is the largest divergence: 206 test call sites reaching durability through a `#[cfg(test)]`
+   synchronous path production never runs, so anything that only breaks *because a flush is
+   concurrent with something else* is invisible to all of them — and V4's defect was found in
+   exactly that territory, by a test that did not go through `Tree::flush`. It carries a four-step
+   migration sketch and the warning that the barrier must be the production path plus a completion
+   signal, or it becomes a second `Tree::flush` with extra steps.
+
+**Sensitivity probes.** All four detector arms were planted and fired: an unlisted
+`static PROBE_GLOBAL` in `src/stall.rs` (`unlisted global 'PROBE_GLOBAL'`), a fabricated allowlist
+entry for a global that does not exist (`allowlist entries name globals that no longer exist`), an
+`env::var` read, and a `SystemTime::now()` outside the clock adapter. All reverted;
+`git diff src/stall.rs` is empty.
+
+**V8a exit gate met.** No `static`/`thread_local!` state in `src/` outside the written allowlist, no
+`SystemTime::now()` outside `src/clock.rs`, no env reads, the 7 fault-injection tests and the crash
+lane green against the injected policy. **1,136 lib tests**, 4 doc tests, clippy `--all-targets
+--all-features` clean, fmt clean.
+
+### REGRESSION introduced and fixed in V7/V8a — every SST lost its final data block (2026-08-15)
+
+**Committed in `8fa5387` ("p1"). Fixed in the working tree. Read this before trusting anything
+written by that commit.**
+
+While replacing `SystemTime::now()` with the injected clock in `TableWriter::finish`
+(`src/sstable/table.rs`), a scripted string replacement computed its end offset by searching
+forward for `"?;\n"` and then to the next line. That offset ran past the statement it was meant to
+replace and swallowed **two more**:
+
+```rust
+self.meta.properties.seqnos =
+    (self.meta.smallest_seq_num.unwrap_or(0), self.meta.largest_seq_num.unwrap_or(0));
+
+// Flush last data block if it has entries
+if self.data_block.as_ref().is_some_and(|db| db.entries() > 0) {
+    let key_past_last = self.internal_cmp.successor(&self.data_block.as_ref().unwrap().last_key);
+    self.write_data_block(&key_past_last)?;
+}
+```
+
+The consequences, in order of severity:
+
+1. **Every SST written lost its last data block.** For a small table that is the *only* data block,
+   so the table's index has no entries at all and any lookup through it fails
+   `EmptyCorruptPartitionedIndex`. This is silent data loss at write time, not a read bug.
+2. **`properties.seqnos` was left at its default**, so per-SST sequence ranges were wrong — which is
+   precisely the metadata PD3c's scan-mode probe and PC's seq-filtered scan use to skip tables.
+
+**How it survived.** The edit compiled, and it left a stray `}` that I "fixed" by deleting the
+brace — treating a symptom of the real damage as a formatting slip. I then made two further edits
+and **never re-ran the suite** before the session moved on; the last green run (1,129) predated the
+change. The commit was taken on top of that stale confidence.
+
+**How it was caught.** V8a's first `cargo test` after unbreaking the failpoint refactor showed one
+failure, `a_failed_publish_leaves_a_detached_branch_reading_through_its_parent`, whose *injected
+fault never fired* — detach was failing earlier, for an unrelated reason. Chasing "why did the
+fault not fire" rather than accepting the red test is what led to it. Confirmed by removing the
+fault entirely: detach still failed, so the fault mechanism was never involved.
+
+**What this changes about how edits are made.** Offset-computed replacements over source are not
+acceptable for anything but an exact, whole-statement literal match. Where a replacement cannot be
+expressed as one, edit the file directly and read the result back. And a build that compiles is not
+a verification — the suite must run before the work is called done, and certainly before a commit.
+
 ### V6 — Property tests against a branch-semantics model: complete (2026-08-15)
 
 `proptest` had been a declared dev-dependency with **zero uses** since it was added. This slice uses

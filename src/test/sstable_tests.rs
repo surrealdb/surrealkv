@@ -9,8 +9,8 @@ use test_log::test;
 use crate::batch::BatchOwner;
 use crate::sstable::block::BlockHandle;
 use crate::sstable::table::{ChecksumType, Footer, IndexType, Table, TableFormat, TableWriter};
+use crate::test::support::wrap_buffer;
 use crate::test::{collect_all, collect_iter, count_iter};
-use crate::vfs::File;
 use crate::{
 	user_range_to_internal_range,
 	BranchGeneration,
@@ -166,10 +166,6 @@ fn build_table_with_seq_num(data: Vec<(&str, &str, u64)>) -> (Vec<u8>, usize) {
 
 	let size = d.len();
 	(d, size)
-}
-
-fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
-	Arc::new(src)
 }
 
 #[test]

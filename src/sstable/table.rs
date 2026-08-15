@@ -519,6 +519,16 @@ impl<W: Write> TableWriter<W> {
 		// deterministic replay) must not have an ambient one leak into its files.
 		self.meta.properties.created_at = self.opts.clock.now() as u128;
 
+		self.meta.properties.seqnos =
+			(self.meta.smallest_seq_num.unwrap_or(0), self.meta.largest_seq_num.unwrap_or(0));
+
+		// Flush last data block if it has entries
+		if self.data_block.as_ref().is_some_and(|db| db.entries() > 0) {
+			let key_past_last =
+				self.internal_cmp.successor(&self.data_block.as_ref().unwrap().last_key);
+			self.write_data_block(&key_past_last)?;
+		}
+
 		// Build meta index block
 		let mut meta_ix_block = BlockWriter::new(
 			self.opts.block_size,

@@ -11,14 +11,8 @@ use std::time::Duration;
 use tempdir::TempDir;
 use test_log::test;
 
+use crate::test::support::create_store;
 use crate::{BranchInfo, Error, ForkPoint, LSMIterator, Mode, Tree, TreeBuilder};
-
-fn create_store() -> (Tree, TempDir) {
-	let temp_dir = TempDir::new("public-branch").unwrap();
-	let path = temp_dir.path().to_path_buf();
-	let tree = TreeBuilder::new().with_path(path).build().unwrap();
-	(tree, temp_dir)
-}
 
 fn info_for(store: &Tree, name: &str) -> BranchInfo {
 	store

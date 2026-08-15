@@ -108,11 +108,6 @@ pub enum SSTableError {
 	EmptyCorruptPartitionedIndex {
 		table_id: u64,
 	},
-
-	// System errors
-	FailedToGetSystemTime {
-		source: String,
-	},
 }
 
 impl fmt::Display for SSTableError {
@@ -297,13 +292,6 @@ impl fmt::Display for SSTableError {
 				table_id,
 			} => {
 				write!(f, "Attempted lookup on empty/corrupt partitioned index with no blocks. Table ID: {}", table_id)
-			}
-
-			// System errors
-			SSTableError::FailedToGetSystemTime {
-				source,
-			} => {
-				write!(f, "Failed to get system time: {}", source)
 			}
 		}
 	}

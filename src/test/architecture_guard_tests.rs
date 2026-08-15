@@ -278,3 +278,250 @@ fn the_catalog_publish_does_not_touch_the_level_manifest() {
 		 guard across it and this deadlocks them against a queued compaction writer"
 	);
 }
+
+/// Every module-level `static` in `src/`, keyed `file:NAME`, with the reason it
+/// is allowed to be one. Adding an entry has to be a decision someone writes
+/// down; `docs/KNOWN_GAPS.md` holds the long form, including what would change
+/// each answer.
+///
+/// The guard below matches `static` *item declarations*, so an immutable one
+/// would also need naming — its reason would simply be "immutable".
+const AMBIENT_STATE_ALLOWLIST: &[(&str, &str)] = &[
+	(
+		"src/vfs.rs:SYNCED",
+		"the fsync ledger the crash tests read. `#[cfg(test)]` at both the module and the call \
+		 site, so zero production cost, and keyed by canonicalised absolute path so two tests \
+		 with their own TempDir cannot collide. Injecting it would thread a test-only \
+		 observation through every write path in the engine.",
+	),
+	(
+		"src/lsm.rs:BRANCH_ID_COUNTER",
+		"folded with the pid into minted branch identities. Defeats reproducible identities \
+		 across runs, but `mint_branch_id` loops against the catalog until unused, so this is a \
+		 collision-reducer, not a correctness dependency.",
+	),
+	(
+		"src/memtable/mod.rs:NEXT_DEPENDENCY_ID",
+		"opaque ids, compared only for equality within one store, no value is a sentinel.",
+	),
+	(
+		"src/memtable/skiplist.rs:PROBABILITIES",
+		"a memoized constant — a pure function of two compile-time constants. Not state.",
+	),
+	(
+		"src/authority/publish.rs:TEMP_COUNTER",
+		"a monotonic uniqueness source for temp-file names, not state anything reads. Sharing \
+		 it across stores is if anything safer: two stores in one directory still get distinct \
+		 names.",
+	),
+	(
+		"src/test/iterator_tests.rs:TEST_TABLE_ID_COUNTER",
+		"test-only uniqueness source for table ids, same shape as TEMP_COUNTER.",
+	),
+];
+
+/// Ambient state does not accumulate.
+///
+/// Every dependency the engine needs but must not *choose* is carried on
+/// `Options` as `Arc<dyn Trait>` — `clock` and `fault_policy` are the two worked
+/// examples. Before V8a there were also a `thread_local!` failpoint registry and
+/// an environment variable that set commit concurrency for every store in the
+/// process at once. Both are gone; this keeps them gone, and makes any new
+/// global an entry someone had to write.
+///
+/// The allowlist is checked in both directions: an unlisted global fails, and so
+/// does a listed one that no longer exists, so the reasons cannot outlive the
+/// code they describe.
+#[test]
+fn no_ambient_state_outside_the_written_allowlist() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut files_scanned = 0usize;
+	let mut found: Vec<String> = Vec::new();
+	let mut offenders: Vec<String> = Vec::new();
+
+	/// A `static` item declaration, e.g. `static NAME: Type = ...`, at any
+	/// indentation. Returns the name.
+	fn static_name(line: &str) -> Option<&str> {
+		let trimmed = line.trim_start();
+		let rest = trimmed
+			.strip_prefix("static ")
+			.or_else(|| trimmed.strip_prefix("pub static "))
+			.or_else(|| trimmed.strip_prefix("pub(crate) static "))?;
+		let name = rest.split(':').next()?.trim();
+		// `static mut` would be a different, worse thing; name it as such.
+		let name = name.strip_prefix("mut ").unwrap_or(name);
+		(!name.is_empty() && name.chars().all(|c| c.is_ascii_uppercase() || c == '_'))
+			.then_some(name)
+	}
+
+	fn walk(
+		dir: &Path,
+		root: &Path,
+		files: &mut usize,
+		found: &mut Vec<String>,
+		offenders: &mut Vec<String>,
+	) {
+		for entry in std::fs::read_dir(dir).unwrap().filter_map(Result::ok) {
+			let path = entry.path();
+			if path.is_dir() {
+				walk(&path, root, files, found, offenders);
+				continue;
+			}
+			if path.extension().is_none_or(|ext| ext != "rs") {
+				continue;
+			}
+			let relative = path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/");
+			// This file necessarily contains the patterns it looks for, in the
+			// allowlist above and in the probes below.
+			if relative == "src/test/architecture_guard_tests.rs" {
+				continue;
+			}
+			*files += 1;
+			let source = std::fs::read_to_string(&path).unwrap();
+			for (number, line) in source.lines().enumerate() {
+				let trimmed = line.trim_start();
+				if trimmed.starts_with("//") {
+					continue;
+				}
+				let at = format!("{relative}:{}", number + 1);
+
+				if let Some(name) = static_name(line) {
+					found.push(format!("{relative}:{name}"));
+					if !AMBIENT_STATE_ALLOWLIST
+						.iter()
+						.any(|(k, _)| *k == format!("{relative}:{name}"))
+					{
+						offenders.push(format!("{at} unlisted global `{name}`"));
+					}
+				}
+				for pattern in ["thread_local!", "lazy_static!", "once_cell::"] {
+					if trimmed.contains(pattern) {
+						offenders.push(format!("{at} {pattern}"));
+					}
+				}
+				if trimmed.contains("env::var") {
+					offenders.push(format!("{at} reads the environment"));
+				}
+				if trimmed.contains("SystemTime::now()") && relative != "src/clock.rs" {
+					offenders.push(format!("{at} reads the wall clock outside the clock adapter"));
+				}
+				if (trimmed.contains("rand::rng()") || trimmed.contains("thread_rng()"))
+					&& relative != "src/memtable/skiplist.rs"
+				{
+					offenders.push(format!("{at} draws from an ambient RNG"));
+				}
+			}
+		}
+	}
+	walk(&root.join("src"), root, &mut files_scanned, &mut found, &mut offenders);
+
+	// Non-vacuity: the walk reached the tree, and each detector matches its own
+	// target.
+	assert!(files_scanned > 30, "the walk only saw {files_scanned} files; it is not scanning src/");
+	assert_eq!(static_name("\tstatic FOO: AtomicU64 = x;"), Some("FOO"), "static detector broken");
+	assert_eq!(static_name("pub static BAR: X = y;"), Some("BAR"), "static detector broken");
+	assert_eq!(static_name("static mut BAZ: X = y;"), Some("BAZ"), "static detector broken");
+	assert_eq!(static_name("pub trait T: Send + 'static {"), None, "static detector over-matches");
+	assert!(!found.is_empty(), "the walk found no statics at all; the detector is not working");
+
+	assert!(
+		offenders.is_empty(),
+		"ambient state outside the allowlist:\n  {}",
+		offenders.join("\n  ")
+	);
+
+	// The reasons cannot outlive the code: every allowlist entry must still
+	// name something that exists.
+	let stale: Vec<&str> = AMBIENT_STATE_ALLOWLIST
+		.iter()
+		.map(|(k, _)| *k)
+		.filter(|key| !found.iter().any(|f| f == key))
+		.collect();
+	assert!(stale.is_empty(), "allowlist entries name globals that no longer exist: {stale:?}");
+}
+
+/// Test helpers do not get redefined outside the shared layers.
+///
+/// `create_temp_directory` had six copies, `wrap_buffer` four, `create_store`
+/// nine — and two of those nine answered a different question under the same
+/// name. Duplicates are not merely untidy: they drift, and a test moved between
+/// files silently changes what it exercises. `branch_exists` was the worked
+/// example, defined twice at two different layers.
+///
+/// The support layer is the list. Anything it provides, no other test file may
+/// define — so re-introducing a copy fails here rather than at the next
+/// divergence.
+#[test]
+fn test_helpers_are_not_redefined_outside_the_shared_layers() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+	// TWO shared locations, both read from the files so this list cannot drift:
+	// `support/` holds store and branch fixtures, and `src/test/mod.rs` holds
+	// the iterator collectors it predates. Keeping both is a deliberate choice —
+	// merging them is a large mechanical change for little gain — but a helper
+	// in either is one nobody may redefine.
+	let mut provided: Vec<String> = Vec::new();
+	for (relative, prefix) in
+		[("src/test/support/mod.rs", "pub(crate) fn "), ("src/test/mod.rs", "fn ")]
+	{
+		let source = std::fs::read_to_string(root.join(relative)).unwrap();
+		let before = provided.len();
+		provided.extend(
+			source
+				.lines()
+				.filter_map(|line| line.strip_prefix(prefix)?.split(['(', '<']).next())
+				.map(str::to_string),
+		);
+		assert!(
+			provided.len() > before,
+			"{relative} exported no helpers; this guard is reading it wrong"
+		);
+	}
+	assert!(
+		provided.len() >= 10,
+		"only {} shared helpers found; this guard is reading the wrong files",
+		provided.len()
+	);
+
+	let mut offenders = Vec::new();
+	let mut files_scanned = 0usize;
+	for entry in std::fs::read_dir(root.join("src/test")).unwrap().filter_map(Result::ok) {
+		let path = entry.path();
+		if path.extension().is_none_or(|ext| ext != "rs") {
+			continue;
+		}
+		let name = path.file_name().unwrap().to_string_lossy().to_string();
+		// The shared layers are where these are allowed to be defined.
+		if name == "mod.rs" {
+			continue;
+		}
+		files_scanned += 1;
+		for (number, line) in std::fs::read_to_string(&path).unwrap().lines().enumerate() {
+			// Top-level definitions only. A `fn` nested inside a test body is
+			// scoped to that test and cannot be confused with anything.
+			let Some(rest) = line.strip_prefix("fn ").or_else(|| line.strip_prefix("pub fn "))
+			else {
+				continue;
+			};
+			let Some(defined) = rest.split(['(', '<']).next() else {
+				continue;
+			};
+			if provided.iter().any(|p| p == defined.trim()) {
+				offenders.push(format!("{name}:{} redefines `{defined}`", number + 1));
+			}
+		}
+	}
+
+	// Non-vacuity: the walk reached the tree, and the detector matches its own
+	// target shape.
+	assert!(files_scanned > 10, "only {files_scanned} test files scanned; the walk is wrong");
+	assert!(
+		provided.iter().any(|p| p == "branch_exists"),
+		"the support layer no longer provides `branch_exists`; the guard is reading it wrong"
+	);
+	assert!(
+		offenders.is_empty(),
+		"the support layer already provides these, so a second definition can only diverge:\n  {}",
+		offenders.join("\n  ")
+	);
+}

@@ -19,18 +19,9 @@ use crate::compaction::compactor::CompactionOptions;
 use crate::compaction::leveled::Strategy;
 use crate::error::Result;
 use crate::lsm::Tree;
+use crate::test::support::{branch_exists, create_store_with};
 use crate::transaction::{Transaction, TransactionOptions};
 use crate::{Error, LSMIterator, TreeBuilder};
-
-fn create_store_with<F>(configure: F) -> (Tree, TempDir)
-where
-	F: FnOnce(TreeBuilder) -> TreeBuilder,
-{
-	let temp_dir = TempDir::new("fork-view").unwrap();
-	let path = temp_dir.path().to_path_buf();
-	let tree = configure(TreeBuilder::new().with_path(path)).build().unwrap();
-	(tree, temp_dir)
-}
 
 fn begin_owned_rw(store: &Tree, owner: BatchOwner) -> Transaction {
 	Transaction::new_owned(Arc::clone(&store.core), TransactionOptions::new(), owner).unwrap()
@@ -825,10 +816,6 @@ async fn fork_past_the_view_budget_is_refused_before_publication() {
 /// the far end of the range never is — no mock clock needed for either arm.
 const EXPIRED_TTL: u64 = 1;
 const DISTANT_TTL: u64 = u64::MAX;
-
-fn branch_exists(store: &Tree, name: &str) -> bool {
-	store.core.inner.branch_catalog.read().unwrap().get_by_name(name).is_ok()
-}
 
 /// A parent whose child still resolves views through it cannot be tombstoned:
 /// the catalog loader rejects exactly that shape, so publishing the tombstone

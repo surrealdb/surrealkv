@@ -16,15 +16,8 @@ use std::sync::Arc;
 use tempdir::TempDir;
 use test_log::test;
 
-use crate::lsm::Tree;
+use crate::test::support::create_store;
 use crate::{Error, Mode, TreeBuilder};
-
-fn create_store() -> (Tree, TempDir) {
-	let temp_dir = TempDir::new("oracle_test").unwrap();
-	let path = temp_dir.path().to_path_buf();
-	let tree = TreeBuilder::new().with_path(path).build().unwrap();
-	(tree, temp_dir)
-}
 
 /// Issue surrealdb#7303 race: two concurrent txns at the same `start_seq_num`
 /// both write key K. Exactly one must succeed; the other gets

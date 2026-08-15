@@ -7,18 +7,9 @@ use test_log::test;
 
 use crate::batch::BatchOwner;
 use crate::lsm::Tree;
+use crate::test::support::create_store_with;
 use crate::transaction::{Transaction, TransactionOptions};
 use crate::{LSMIterator, TreeBuilder};
-
-fn create_store_with<F>(configure: F) -> (Tree, TempDir)
-where
-	F: FnOnce(TreeBuilder) -> TreeBuilder,
-{
-	let temp_dir = TempDir::new("test").unwrap();
-	let path = temp_dir.path().to_path_buf();
-	let tree = configure(TreeBuilder::new().with_path(path)).build().unwrap();
-	(tree, temp_dir)
-}
 
 /// Durably creates `name` (one catalog version) and returns its owner.
 fn register_branch(store: &Tree, name: &str) -> BatchOwner {

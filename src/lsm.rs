@@ -821,7 +821,7 @@ impl CoreInner {
 			maintenance_epoch: publish.maintenance_epoch,
 			entries: catalog.to_entries(),
 		};
-		failpoint!(crate::failpoints::CATALOG_PUBLISH);
+		self.opts.fault_policy.check(crate::failpoints::FaultPoint::CatalogPublish)?;
 		self.authority.publish_catalog(&manifest)?;
 		publish.catalog_version = next_version;
 		publish.writer_epoch = writer_epoch;
@@ -2143,6 +2143,7 @@ impl Core {
 			commit_env,
 			Arc::clone(&inner.visible_seq_num),
 			Arc::clone(&write_stall),
+			opts.max_concurrent_commits,
 		);
 
 		// Path for the WAL directory
@@ -3418,6 +3419,17 @@ impl TreeBuilder {
 	}
 
 	/// Sets the number of levels.
+	/// Substitutes the fault policy. Test-only: the production policy never
+	/// fails, and a user has no reason to inject one that does.
+	#[cfg(test)]
+	pub(crate) fn with_fault_policy(
+		mut self,
+		policy: std::sync::Arc<dyn crate::failpoints::FaultPolicy>,
+	) -> Self {
+		self.opts.fault_policy = policy;
+		self
+	}
+
 	pub fn with_level_count(mut self, count: u8) -> Self {
 		self.opts = self.opts.with_level_count(count);
 		self
@@ -3482,6 +3494,13 @@ impl TreeBuilder {
 	/// Set the L0 stall threshold.
 	pub fn with_l0_stall_threshold(mut self, value: usize) -> Self {
 		self.opts = self.opts.with_l0_stall_threshold(value);
+		self
+	}
+
+	/// Set how many commits may be in the pipeline at once (effective range
+	/// `[1, 1023]`).
+	pub fn with_max_concurrent_commits(mut self, value: usize) -> Self {
+		self.opts = self.opts.with_max_concurrent_commits(value);
 		self
 	}
 

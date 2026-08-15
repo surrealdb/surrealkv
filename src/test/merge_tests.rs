@@ -9,14 +9,8 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::merge::TargetProbe;
+use crate::test::support::create_store;
 use crate::{ConflictKind, Error, ForkPoint, MergeReport, MergeStrategy, Tree, TreeBuilder};
-
-fn create_store() -> (Tree, TempDir) {
-	let temp_dir = TempDir::new("merge").unwrap();
-	let path = temp_dir.path().to_path_buf();
-	let tree = TreeBuilder::new().with_path(path).build().unwrap();
-	(tree, temp_dir)
-}
 
 fn applied(report: &MergeReport) -> Vec<(Vec<u8>, Option<Vec<u8>>)> {
 	report.applies.iter().map(|entry| (entry.key.clone(), entry.op.value().cloned())).collect()

@@ -24,7 +24,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::compaction::leveled::Strategy;
-use crate::failpoints::{arm_once, ROOT_PUBLISH};
+use crate::failpoints::{FaultPoint, FaultPolicy, ScriptedFaults};
 use crate::lsm::Tree;
 use crate::{ForkPoint, Options, Tree as TreeAlias, TreeBuilder};
 
@@ -52,6 +52,19 @@ fn crash(tree: Tree) {
 
 fn reopen(path: &std::path::Path) -> Tree {
 	TreeBuilder::new().with_path(path.to_path_buf()).build().unwrap()
+}
+
+/// Reopen with a fault policy the caller keeps a handle on. Each incarnation
+/// gets its own policy, which is what makes "fail the first attempt, then let
+/// the restart succeed" expressible without a global.
+fn reopen_with_faults(path: &std::path::Path) -> (Tree, Arc<ScriptedFaults>) {
+	let faults = Arc::new(ScriptedFaults::new());
+	let opts = Options {
+		path: path.to_path_buf(),
+		fault_policy: Arc::clone(&faults) as Arc<dyn FaultPolicy>,
+		..Options::default()
+	};
+	(TreeBuilder::with_options(opts).build().unwrap(), faults)
 }
 
 fn branch_names(store: &Tree) -> Vec<String> {
@@ -268,7 +281,7 @@ async fn an_interrupted_reclamation_finishes_after_a_restart() {
 	let path = temp_dir.path().to_path_buf();
 
 	{
-		let store = reopen(&path);
+		let (store, faults) = reopen_with_faults(&path);
 		let mut txn = store.begin().unwrap();
 		txn.set(b"k", b"v").unwrap();
 		txn.commit().await.unwrap();
@@ -285,14 +298,12 @@ async fn an_interrupted_reclamation_finishes_after_a_restart() {
 		while store.core.inner.flush_oldest_immutable_for_test().unwrap().is_some() {}
 		store.delete_branch("doomed").unwrap();
 
-		{
-			let _armed = arm_once(ROOT_PUBLISH);
-			store
-				.core
-				.inner
-				.sweep_branch_maintenance()
-				.expect_err("the interrupted sweep must report its failure");
-		}
+		faults.fail_times(FaultPoint::RootPublish, 1);
+		store
+			.core
+			.inner
+			.sweep_branch_maintenance()
+			.expect_err("the interrupted sweep must report its failure");
 		store.close().await.unwrap();
 	}
 

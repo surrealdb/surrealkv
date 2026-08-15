@@ -5,3 +5,4 @@
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
 cc f827e9c37c80fca7226a702d238159070c60d1058194734fff90af354f7b5cbd # shrinks to ops = [Churn { key: 0 }]
+cc 803c44eb8543db0e5054c41c4e3e3407e9e0fb029ce22c66b1c3bb889fd6007f # shrinks to ops = [Churn { key: 2 }, Compact, Churn { key: 0 }, Compact, Reopen]

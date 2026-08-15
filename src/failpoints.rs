@@ -26,7 +26,10 @@ use crate::error::Result;
 /// A durable step the engine can be made to fail at.
 ///
 /// An enum rather than a name: the set is small, closed, and worth being
-/// exhaustive over.
+/// exhaustive over. Every variant names a *publish*, because a publish is where
+/// this engine makes a decision durable — which is exactly where the rollback
+/// paths worth testing live. The shared suffix is the point, not an accident.
+#[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FaultPoint {
 	/// The catalog publish that commits every branch operation: create, fork,

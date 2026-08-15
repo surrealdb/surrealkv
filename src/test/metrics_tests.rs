@@ -12,13 +12,16 @@ use test_log::test;
 
 use crate::compaction::leveled::Strategy;
 use crate::lsm::Tree;
+use crate::test::support::create_store_with;
 use crate::{BranchMetricsSnapshot, ForkPoint, MergeStrategy, TreeBuilder};
 
-fn create_store() -> (Tree, TempDir) {
-	let temp_dir = TempDir::new("metrics").unwrap();
-	let path = temp_dir.path().to_path_buf();
-	let tree = TreeBuilder::new().with_path(path).with_level_count(2).build().unwrap();
-	(tree, temp_dir)
+/// Two levels, so a flush lands in L0 and a compaction moves it to L1 — the
+/// shape the reclamation and retention-pin counters are about. Named for what
+/// makes it different from the plain [`create_store`], because a second
+/// `create_store` that quietly configures something else is how two helpers
+/// end up disagreeing under one name.
+fn create_store_with_two_levels() -> (Tree, TempDir) {
+	create_store_with(|builder| builder.with_level_count(2))
 }
 
 fn metrics(store: &Tree) -> BranchMetricsSnapshot {
@@ -35,7 +38,7 @@ fn child_owner(handle: &crate::BranchHandle) -> crate::batch::BatchOwner {
 /// Forking moves the fork counters; writing does not.
 #[test(tokio::test)]
 async fn forks_are_counted_and_the_fence_hold_is_timed() {
-	let (store, _temp) = create_store();
+	let (store, _temp) = create_store_with_two_levels();
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
@@ -72,7 +75,7 @@ async fn forks_are_counted_and_the_fence_hold_is_timed() {
 /// Detach is counted only when it detaches something.
 #[test(tokio::test)]
 async fn detaches_are_counted_only_when_a_parent_link_is_cleared() {
-	let (store, _temp) = create_store();
+	let (store, _temp) = create_store_with_two_levels();
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
@@ -143,7 +146,7 @@ async fn merges_are_counted_and_chunked_ones_are_distinguished() {
 /// counter follows the sweep.
 #[test(tokio::test)]
 async fn reclaimed_branches_are_counted_when_the_sweep_releases_them() {
-	let (store, _temp) = create_store();
+	let (store, _temp) = create_store_with_two_levels();
 	let mut txn = store.begin().unwrap();
 	txn.set(b"k", b"v").unwrap();
 	txn.commit().await.unwrap();
@@ -205,7 +208,7 @@ async fn reclaimed_branches_are_counted_when_the_sweep_releases_them() {
 #[test(tokio::test)]
 async fn versions_kept_for_an_anchor_are_counted() {
 	let run = |fork: bool| async move {
-		let (store, _temp) = create_store();
+		let (store, _temp) = create_store_with_two_levels();
 		let mut txn = store.begin().unwrap();
 		txn.set(b"k", b"v1").unwrap();
 		txn.commit().await.unwrap();
@@ -239,7 +242,7 @@ async fn versions_kept_for_an_anchor_are_counted() {
 /// anyone having to remember to update them.
 #[test(tokio::test)]
 async fn gauges_follow_the_state_they_are_derived_from() {
-	let (store, _temp) = create_store();
+	let (store, _temp) = create_store_with_two_levels();
 
 	let empty = metrics(&store);
 	assert_eq!(empty.live_branches, 1, "main exists before anything else does");

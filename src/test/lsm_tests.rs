@@ -8,6 +8,7 @@ use crate::compaction::leveled::Strategy;
 use crate::levels::validate_wal_log_number;
 use crate::lsm::{Core, CoreInner};
 use crate::test::collect_transaction_all;
+use crate::test::support::create_temp_directory;
 use crate::wal::list_segment_ids;
 use crate::{
 	Error,
@@ -41,6 +42,29 @@ fn poison_root_wal_floor(path: &std::path::Path, floor: u64) {
 	std::fs::write(&newest, root.encode().unwrap()).unwrap();
 }
 
+/// Sabotage helper: reverses the order of L1's table ids in the newest state
+/// version of the default branch (decode -> mutate -> re-encode, so every other
+/// invariant stays intact and ONLY the level's key ordering is wrong).
+fn reverse_l1_table_order(path: &std::path::Path) {
+	let dir = crate::authority::publish::branch_state_dir(path, &crate::BranchId::DEFAULT);
+	let newest = std::fs::read_dir(&dir)
+		.unwrap()
+		.filter_map(|entry| entry.ok())
+		.filter(|entry| entry.file_name().to_string_lossy().ends_with(".state"))
+		.max_by_key(|entry| entry.file_name())
+		.expect("the default branch must have a state version")
+		.path();
+	let bytes = std::fs::read(&newest).unwrap();
+	let mut state = crate::authority::format::BranchStateManifest::decode(&bytes).unwrap();
+	assert!(
+		state.levels.get(1).is_some_and(|l1| l1.len() > 1),
+		"the sabotage needs at least two L1 tables to reverse, found {:?}",
+		state.levels
+	);
+	state.levels[1].reverse();
+	std::fs::write(&newest, state.encode().unwrap()).unwrap();
+}
+
 fn reload_manifest_from_disk(opts: &Arc<Options>) -> crate::levels::LevelManifest {
 	let catalog_manifest = crate::authority::store::AuthorityStore::load_latest_catalog(&opts.path)
 		.unwrap()
@@ -60,10 +84,6 @@ fn reload_manifest_from_disk(opts: &Arc<Options>) -> crate::levels::LevelManifes
 		std::sync::Arc::new(crate::timeline::Timeline::new()),
 	)
 	.unwrap()
-}
-
-fn create_temp_directory() -> TempDir {
-	TempDir::new("test").unwrap()
 }
 
 /// Creates test options with common defaults, allowing customization of
@@ -3333,22 +3353,42 @@ async fn test_no_spurious_small_flush() {
 	txn.commit().await.unwrap();
 
 	// Manually trigger wake_up (simulating spurious notification)
-	if let Some(ref task_manager) = *tree.core.task_manager.lock().unwrap() {
-		task_manager.wake_up_memtable();
-	}
+	let wake_up = |tree: &Tree| {
+		if let Some(ref task_manager) = *tree.core.task_manager.lock().unwrap() {
+			task_manager.wake_up_memtable();
+		}
+	};
+	let l0_is_empty = |tree: &Tree| {
+		tree.core.inner.level_manifest.read().unwrap().default_owner_levels().get_levels()[0]
+			.tables
+			.is_empty()
+	};
 
-	// Wait a bit
+	wake_up(&tree);
+
+	// A negative can only be established by waiting, so wait — but see the
+	// positive control below, without which "nothing was flushed" is equally
+	// consistent with "the flush worker had not run yet".
 	tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+	assert!(l0_is_empty(&tree), "Should not flush small memtable due to spurious notification");
 
-	// Verify no flush occurred (data still in active memtable, not in L0)
-	{
-		let manifest = tree.core.inner.level_manifest.read().unwrap();
-		assert!(
-			manifest.default_owner_levels().get_levels()[0].tables.is_empty(),
-			"Should not flush small memtable due to spurious notification"
-		);
-		drop(manifest);
+	// Positive control: the SAME worker, woken the SAME way, must flush once the
+	// memtable is genuinely over threshold. If this does not happen, the
+	// assertion above proved nothing — it would have held with the flush path
+	// broken, or not running at all.
+	let big = vec![b'x'; 8 * 1024];
+	for i in 0..32 {
+		let mut txn = tree.begin().unwrap();
+		txn.set(format!("big{i:04}").as_bytes(), &big).unwrap();
+		txn.commit().await.unwrap();
 	}
+	wake_up(&tree);
+
+	assert!(
+		crate::test::support::wait_until(|| !l0_is_empty(&tree)).await,
+		"the flush worker never flushed an over-threshold memtable, so the spurious-wake-up \
+		 assertion above was vacuous"
+	);
 
 	tree.close().await.unwrap();
 }
@@ -4730,5 +4770,117 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 			}
 			Err(other) => panic!("Expected ManifestCorruption error, got: {}", other),
 		}
+	}
+}
+
+/// A per-store setting stays per-store.
+///
+/// `max_concurrent_commits` was read from `SURREALKV_MAX_CONCURRENT_COMMITS`
+/// until 2026-08-15, so every store in a process inherited one ambient value.
+/// It is now on [`Options`], and this asserts it actually reaches the pipeline
+/// — and that two stores in one process can disagree about it, which is the
+/// property the environment variable could not offer.
+#[test(tokio::test)]
+async fn each_store_gets_its_own_commit_concurrency_limit() {
+	let first_dir = TempDir::new("commit_limit_first").unwrap();
+	let second_dir = TempDir::new("commit_limit_second").unwrap();
+
+	let first = TreeBuilder::new()
+		.with_path(first_dir.path().to_path_buf())
+		.with_max_concurrent_commits(3)
+		.build()
+		.unwrap();
+	let second = TreeBuilder::new()
+		.with_path(second_dir.path().to_path_buf())
+		.with_max_concurrent_commits(11)
+		.build()
+		.unwrap();
+
+	assert_eq!(first.core.commit_pipeline.commit_permits(), 3);
+	assert_eq!(second.core.commit_pipeline.commit_permits(), 11);
+
+	// And a store that says nothing gets the documented default rather than
+	// whatever the last one asked for.
+	let default_dir = TempDir::new("commit_limit_default").unwrap();
+	let defaulted = TreeBuilder::new().with_path(default_dir.path().to_path_buf()).build().unwrap();
+	assert_eq!(
+		defaulted.core.commit_pipeline.commit_permits(),
+		crate::commit::DEFAULT_MAX_CONCURRENT_COMMITS
+	);
+
+	first.close().await.unwrap();
+	second.close().await.unwrap();
+	defaulted.close().await.unwrap();
+}
+
+/// A store whose L1 ends up holding a lower sequence number after a higher one.
+///
+/// Found by the branch property suite (V8b, 2026-08-15) as
+/// `[Churn { key: 2 }, Compact, Churn { key: 0 }, Compact, Reopen]`, reduced
+/// here to the smallest form that has nothing to do with branching: write a
+/// HIGH key, compact it into L1, then write a LOW key and compact that into L1
+/// as a second table.
+///
+/// L1+ tables are ordered by KEY range — `Level::find_first_overlapping_table`
+/// binary-searches on exactly that — so L1 is now `[a (newer seq), c (older
+/// seq)]`. Key order and sequence order are independent, and disagreeing is
+/// ordinary. The store must still open.
+#[test(tokio::test)]
+async fn a_store_reopens_when_l1_key_order_and_sequence_order_disagree() {
+	let temp_dir = create_temp_directory();
+	let path = temp_dir.path().to_path_buf();
+
+	// `level_count: 2` and `level0_max_files: 2` are the property harness's
+	// configuration: two L0 files are enough to trigger a merge, and two levels
+	// make that merge land in L1 rather than shuffling within L0.
+	let build = |path: PathBuf| {
+		create_test_options(path, |opts| {
+			opts.level_count = 2;
+			opts.level0_max_files = 2;
+		})
+	};
+
+	{
+		let tree = Tree::new(build(path.clone())).unwrap();
+
+		// Higher key first, so it takes the LOWER sequence numbers. Three
+		// writes each, so the flushes make enough L0 files to compact.
+		for (key, values) in
+			[(b"c".as_slice(), [b"1", b"2", b"3"]), (b"a".as_slice(), [b"4", b"5", b"6"])]
+		{
+			for value in values {
+				let mut tx = tree.begin().unwrap();
+				tx.set(key, value).unwrap();
+				tx.commit().await.unwrap();
+				tree.flush().unwrap();
+			}
+			let strategy = Arc::new(crate::compaction::leveled::Strategy::from_options(
+				Arc::clone(&tree.core.inner.opts),
+			));
+			tree.compact(strategy).unwrap();
+		}
+
+		tree.close().await.unwrap();
+	}
+
+	let reopened = Tree::new(build(path.clone()))
+		.expect("a store must reopen when L1 key order and sequence order disagree");
+
+	let tx = reopened.begin().unwrap();
+	assert_eq!(tx.get(b"a").unwrap().as_deref(), Some(b"6".as_slice()));
+	assert_eq!(tx.get(b"c").unwrap().as_deref(), Some(b"3".as_slice()));
+	reopened.close().await.unwrap();
+
+	// Sabotage twin: a level whose tables really are out of key order is
+	// corruption, because `find_first_overlapping_table` binary-searches it.
+	// Without this arm the check above only proves the loader accepts things.
+	reverse_l1_table_order(&path);
+	match Tree::new(build(path)) {
+		Err(Error::LoadManifestFail(message)) => assert!(
+			message.contains("ascending key order"),
+			"expected the key-order rejection, got: {message}"
+		),
+		Err(other) => panic!("expected LoadManifestFail, got: {other}"),
+		Ok(_) => panic!("a level whose tables are out of key order must be refused"),
 	}
 }

@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::fs::File as SysFile;
 use std::path::Path;
@@ -138,6 +139,11 @@ pub(crate) struct LevelManifest {
 	/// Shared global commit timeline; root publishes snapshot its tail.
 	timeline: std::sync::Arc<crate::timeline::Timeline>,
 
+	/// Consulted before each durable publish. Carried here rather than passed
+	/// per call because `persist_owner_update` and `persist_root` are reached
+	/// from several places and none of them should have to know about it.
+	fault_policy: Arc<dyn crate::failpoints::FaultPolicy>,
+
 	/// Minimum WAL number that contains unflushed data.
 	/// All WAL files with number < log_number have been flushed to SST and can
 	/// be safely deleted.
@@ -161,6 +167,7 @@ impl LevelManifest {
 	pub(crate) fn fresh(opts: Arc<Options>, authority: AuthorityStore) -> Self {
 		assert!(opts.level_count > 0, "level_count should be >= 1");
 		Self {
+			fault_policy: Arc::clone(&opts.fault_policy),
 			authority,
 			levels_by_owner: vec![(BatchOwner::DEFAULT, Self::initialize_levels(opts.level_count))],
 			hidden_set: HashSet::with_capacity(10),
@@ -250,7 +257,7 @@ impl LevelManifest {
 					tables.push(table);
 				}
 				if level_idx > 0 && !tables.is_empty() {
-					Self::validate_table_sequence_numbers(level_idx as u8, &tables)?;
+					Self::validate_level_tables(level_idx as u8, &tables)?;
 				}
 				levels_vec.push(Arc::new(Level {
 					tables,
@@ -280,6 +287,7 @@ impl LevelManifest {
 			watermark.max((max_referenced_id / TABLE_ID_BLOCK + 1) * TABLE_ID_BLOCK);
 
 		Ok(Self {
+			fault_policy: Arc::clone(&opts.fault_policy),
 			authority,
 			levels_by_owner,
 			hidden_set: HashSet::with_capacity(10),
@@ -303,6 +311,7 @@ impl LevelManifest {
 		next_table_id: Arc<AtomicU64>,
 	) -> Self {
 		Self {
+			fault_policy: Arc::new(crate::failpoints::NoFaults),
 			authority: AuthorityStore::new(path, [0; 16]),
 			levels_by_owner: vec![(BatchOwner::DEFAULT, levels)],
 			hidden_set: HashSet::new(),
@@ -455,7 +464,8 @@ impl LevelManifest {
 		Levels(levels)
 	}
 
-	fn validate_table_sequence_numbers(level_idx: u8, tables: &[Arc<Table>]) -> Result<()> {
+	/// Checks what a level below L0 must satisfy for its readers to be correct.
+	fn validate_level_tables(level_idx: u8, tables: &[Arc<Table>]) -> Result<()> {
 		// Basic sanity check for all tables
 		for table in tables {
 			// Ensure both sequence numbers exist (they should always be set together)
@@ -485,25 +495,40 @@ impl LevelManifest {
 			}
 		}
 
-		// If we have multiple tables, check sequence continuity across all tables
-		if tables.len() > 1 {
-			for i in 0..tables.len() - 1 {
-				let current = &tables[i];
-				let next = &tables[i + 1];
-
-				// Check if sequence numbers maintain continuity
-				if let (Some(next_smallest), Some(current_largest)) =
-					(next.meta.smallest_seq_num, current.meta.largest_seq_num)
-				{
-					if next_smallest <= current_largest {
-						return Err(Error::LoadManifestFail(format!(
-							"Level {} tables have overlapping sequence numbers: Table {} ({:?}-{:?}) and Table {} ({:?}-{:?})",
-							level_idx,
-							current.id, current.meta.smallest_seq_num, current.meta.largest_seq_num,
-							next.id, next.meta.smallest_seq_num, next.meta.largest_seq_num
-						)));
-					}
-				}
+		// A level below L0 partitions the key space, and the order it partitions
+		// it in is the order recorded here: `hydrate` pushes tables in manifest
+		// order and nothing sorts them afterwards, while
+		// `Level::find_first_overlapping_table` reads them with
+		// `slice::partition_point`. A binary search over an unsorted vector does
+		// not return a wrong answer loudly; it returns a wrong answer.
+		//
+		// Until 2026-08-15 this checked ascending, disjoint *sequence* ranges
+		// instead — an ordering nothing establishes and no reader wants. Key
+		// order and sequence order are independent: writing a high key before a
+		// low one is enough to make them disagree, and that made the store
+		// refuse to open. See the V8b as-built record.
+		for pair in tables.windows(2) {
+			let (current, next) = (&pair[0], &pair[1]);
+			// A table with no point-key metadata carries no range to compare;
+			// `is_before_range` already treats that as "assume overlap".
+			let (Some(current_largest), Some(next_smallest)) =
+				(&current.meta.largest_point, &next.meta.smallest_point)
+			else {
+				continue;
+			};
+			if current.opts.comparator.compare(&current_largest.user_key, &next_smallest.user_key)
+				== Ordering::Greater
+			{
+				return Err(Error::LoadManifestFail(format!(
+					"Level {} tables are not in ascending key order: Table {} ends at {:?} but the \
+					 next table {} starts at {:?}; levels below L0 are searched by binary search \
+					 and must partition the key space in order",
+					level_idx,
+					current.id,
+					String::from_utf8_lossy(&current_largest.user_key),
+					next.id,
+					String::from_utf8_lossy(&next_smallest.user_key),
+				)));
 			}
 		}
 
@@ -686,7 +711,7 @@ impl LevelManifest {
 	/// compaction ordering), the stale root hint is healed by forward
 	/// probing, and the next successful publish supersedes it.
 	pub(crate) fn persist_owner_update(&mut self, owner: BatchOwner) -> Result<()> {
-		failpoint!(crate::failpoints::OWNER_STATE_PUBLISH);
+		self.fault_policy.check(crate::failpoints::FaultPoint::OwnerStatePublish)?;
 		let next_state = self.state_versions.get(&owner).copied().unwrap_or(0) + 1;
 		let retained_floor_seq = self.retained_floor(owner);
 		let levels: Vec<Vec<u64>> = self
@@ -715,7 +740,7 @@ impl LevelManifest {
 	/// Publishes a root version alone (floor-only transitions, e.g. the
 	/// shutdown replay-floor advance).
 	pub(crate) fn persist_root(&mut self) -> Result<()> {
-		failpoint!(crate::failpoints::ROOT_PUBLISH);
+		self.fault_policy.check(crate::failpoints::FaultPoint::RootPublish)?;
 		let next_root = self.root_version + 1;
 		let allocated = self.next_table_id.load(std::sync::atomic::Ordering::SeqCst);
 		let watermark = (allocated / TABLE_ID_BLOCK + 1) * TABLE_ID_BLOCK;

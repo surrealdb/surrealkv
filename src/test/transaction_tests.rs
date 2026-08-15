@@ -7,6 +7,7 @@ use test_log::test;
 
 use crate::batch::BatchOwner;
 use crate::lsm::Tree;
+use crate::test::support::{create_store, create_temp_directory};
 use crate::test::{
 	collect_history_all,
 	collect_transaction_all,
@@ -27,18 +28,7 @@ use crate::{
 	WriteOptions,
 };
 
-fn create_temp_directory() -> TempDir {
-	TempDir::new("test").unwrap()
-}
-
 // Common setup logic for creating a store
-fn create_store() -> (Tree, TempDir) {
-	let temp_dir = create_temp_directory();
-	let path = temp_dir.path().to_path_buf();
-
-	let tree = TreeBuilder::new().with_path(path).build().unwrap();
-	(tree, temp_dir)
-}
 
 #[test(tokio::test)]
 async fn basic_transaction() {

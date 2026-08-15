@@ -8,7 +8,7 @@ use crate::clock::{LogicalClock, MockLogicalClock};
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::iter::{BoxedLSMIterator, CompactionIterator, MergingIterator};
 use crate::sstable::table::{Table, TableWriter};
-use crate::vfs::File;
+use crate::test::support::wrap_buffer;
 use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, Value};
 
 /// Global counter for generating unique table IDs in tests
@@ -29,11 +29,6 @@ fn create_internal_key_with_timestamp(
 
 fn create_comparator() -> Arc<InternalKeyComparator> {
 	Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())))
-}
-
-/// Wraps a Vec<u8> as a File for in-memory table reading
-fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
-	Arc::new(src)
 }
 
 /// Builds an in-memory SSTable and returns its iterator.

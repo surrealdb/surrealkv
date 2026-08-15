@@ -5,12 +5,10 @@
 use tempdir::TempDir;
 use test_log::test;
 
+use crate::test::collect_history_all;
+use crate::test::support::create_temp_directory;
 use crate::transaction::{HistoryOptions, Mode};
 use crate::{Key, LSMIterator, Options, Result, TreeBuilder, Value};
-
-fn create_temp_directory() -> TempDir {
-	TempDir::new("test").unwrap()
-}
 
 /// Create a store with versioning enabled
 fn create_versioned_store() -> (crate::lsm::Tree, TempDir) {
@@ -26,25 +24,6 @@ fn create_store_no_versioning() -> (crate::lsm::Tree, TempDir) {
 	let opts = Options::new().with_path(temp_dir.path().to_path_buf());
 	let tree = TreeBuilder::with_options(opts).build().unwrap();
 	(tree, temp_dir)
-}
-
-/// Collects all entries from a history iterator
-fn collect_history_all(iter: &mut impl LSMIterator) -> Result<Vec<(Key, Value, u64, bool)>> {
-	iter.seek_first()?;
-	let mut result = Vec::new();
-	while iter.valid() {
-		let key_ref = iter.key();
-		let is_tombstone = key_ref.is_tombstone();
-		// Tombstones have no value, so use empty vec
-		let value = if is_tombstone {
-			Vec::new()
-		} else {
-			iter.value()?
-		};
-		result.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
-		iter.next()?;
-	}
-	Ok(result)
 }
 
 /// Collects all entries from a history iterator in reverse
