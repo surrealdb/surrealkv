@@ -118,6 +118,18 @@ The `v2` worktree was checked on 2026-08-13:
 Recheck this baseline before opening implementation issues; paths may move while the architectural
 invariants do not.
 
+### 2.4 Phase -1: as-built v2 adversarial remediation (2026-08-17)
+
+Before further format work, the current runtime was challenged with vertical regressions for merge
+bases, catalog churn, restore identity/runtime replacement, checkpoint cuts, historical forks, WAL
+pin cleanup, lock order, and metric/API contracts. The fixes and observed red/green outputs are in
+[BRANCHING_V2_ADVERSARIAL_FIX_LOG.md](BRANCHING_V2_ADVERSARIAL_FIX_LOG.md).
+
+One performance item deliberately crosses into Phase 1: branch mutations still rewrite the entire
+live catalog. Tombstone retirement prevents the fixed 4,096-entry lifetime-exhaustion failure, but
+does not make publication incremental. Phase 1's persistent immutable metadata subobjects must add
+format-level crash tests and branch-count benchmarks before replacing that path.
+
 ## 3. Architecture
 
 ### 3.1 Layer and host boundary

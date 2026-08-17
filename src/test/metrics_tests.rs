@@ -227,7 +227,7 @@ async fn versions_kept_for_an_anchor_are_counted() {
 		assert!(store.core.inner.snapshot_tracker.get_all_snapshots().is_empty());
 		let strategy = Arc::new(Strategy::from_options(Arc::clone(&store.core.inner.opts)));
 		store.compact(strategy).unwrap();
-		metrics(&store).pin_retained_versions
+		metrics(&store).pin_retained_versions_total
 	};
 
 	assert!(run(true).await > 0, "the fork's anchor must have kept a version alive");
@@ -279,5 +279,28 @@ async fn gauges_follow_the_state_they_are_derived_from() {
 		metrics(&store).wal_pinned_segments,
 		0,
 		"a flushed memtable no longer depends on its segment"
+	);
+}
+
+/// Several memtables may depend on the same WAL segment. The public gauge is a
+/// segment count, not a component count, so those dependencies must collapse.
+#[test(tokio::test)]
+async fn wal_pinned_segments_counts_distinct_segments_not_memtables() {
+	let (store, _temp) = create_store_with_two_levels();
+	let mut txn = store.begin().unwrap();
+	txn.set(b"main", b"v").unwrap();
+	txn.commit().await.unwrap();
+
+	let child = store.fork_branch("main", "child", ForkPoint::Head).unwrap();
+	let mut txn = child.begin().unwrap();
+	txn.set(b"child", b"v").unwrap();
+	txn.commit().await.unwrap();
+
+	let dependencies = crate::test::support::wal_dependency_snapshot(&store);
+	assert!(dependencies.component_count >= 2, "fixture needs two dependent memtables");
+	assert_eq!(
+		metrics(&store).wal_pinned_segments,
+		1,
+		"both memtables depend on the same physical WAL segment"
 	);
 }

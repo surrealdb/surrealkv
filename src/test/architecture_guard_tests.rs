@@ -279,6 +279,141 @@ fn the_catalog_publish_does_not_touch_the_level_manifest() {
 	);
 }
 
+/// Every branch operation that needs both the catalog publication serializer
+/// and the level manifest takes the serializer first. Checkpoint and restore
+/// need that order while they freeze a whole-database cut; a merge edge taking
+/// them in reverse can otherwise deadlock with either operation.
+#[test]
+fn merge_edge_publication_obeys_the_catalog_then_level_lock_order() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let lsm = std::fs::read_to_string(root.join("src/lsm.rs")).unwrap();
+	let start =
+		lsm.find("fn record_merge_edge(").expect("record_merge_edge moved; update this guard");
+	let end = lsm[start..]
+		.find("\n\t}\n\n\t/// Validates the merge")
+		.expect("record_merge_edge is unterminated");
+	let body = &lsm[start..start + end];
+	let catalog = body
+		.find("catalog_publish.lock()")
+		.expect("merge edge no longer serializes catalog publication");
+	let levels = body
+		.find("level_manifest.read()")
+		.expect("merge edge no longer pins its retention anchors across publication");
+	assert!(
+		catalog < levels,
+		"record_merge_edge takes level_manifest before catalog_publish; checkpoint/restore take the \
+		 reverse order, so the pair can deadlock"
+	);
+}
+
+/// Point reads resolve one level set per lineage layer. Owner lookup must be
+/// keyed; a linear scan makes every point read scale with total branch count.
+#[test]
+fn point_reads_use_constant_time_owner_level_lookup() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let levels = std::fs::read_to_string(root.join("src/levels/mod.rs")).unwrap();
+	assert!(
+		levels.contains("levels_by_owner: HashMap<BatchOwner, Levels>"),
+		"LevelManifest still stores owner levels in a linearly searched collection"
+	);
+	let start = levels.find("pub(crate) fn levels_for(").expect("levels_for moved");
+	let body_len = levels[start..].find("\n\t}").expect("levels_for is unterminated");
+	let body = &levels[start..start + body_len];
+	assert!(body.contains(".get(&owner)"), "levels_for is not a keyed lookup");
+	assert!(!body.contains(".find("), "levels_for regressed to a linear search");
+}
+
+/// Root publication collapses state generations once per branch. Building the
+/// hint set must be linear before its required final sort, not a nested scan of
+/// an ever-growing Vec.
+#[test]
+fn root_state_hints_are_built_without_a_quadratic_scan() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let levels = std::fs::read_to_string(root.join("src/levels/mod.rs")).unwrap();
+	let start = levels.find("pub(crate) fn persist_root(").expect("persist_root moved");
+	let body_len = levels[start..].find("\n\t}").expect("persist_root is unterminated");
+	let body = &levels[start..start + body_len];
+	assert!(
+		body.contains("hints_by_branch"),
+		"root hints are not accumulated through a branch-keyed map"
+	);
+	assert!(
+		!body.contains("hints.iter_mut().find"),
+		"root hint construction regressed to O(branches squared)"
+	);
+}
+
+/// Detach copies the inherited dataset and can be O(database size). The global
+/// catalog publication mutex may protect only the final lineage transition,
+/// not that data copy.
+#[test]
+fn detach_does_not_hold_catalog_publication_lock_while_copying_data() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let lsm = std::fs::read_to_string(root.join("src/lsm.rs")).unwrap();
+	let start = lsm.find("pub(crate) fn detach_branch(").expect("detach_branch moved");
+	let body_len = lsm[start..]
+		.find("\n\t/// The durable half of a detach")
+		.expect("detach_branch boundary moved");
+	let body = &lsm[start..start + body_len];
+	let materialize = body.find("self.materialize_inherited").expect("detach lost materialization");
+	let publish_lock =
+		body.find("self.catalog_publish.lock").expect("detach lost publication lock");
+	assert!(
+		materialize < publish_lock,
+		"detach holds the global catalog lock across inherited-data materialization"
+	);
+}
+
+/// Large merge preflight must not issue target point probes for every source
+/// key. A cheap source count may choose the same scan probe used by apply.
+#[test]
+fn large_merge_preflight_selects_the_scan_probe() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let merge = std::fs::read_to_string(root.join("src/merge.rs")).unwrap();
+	let start = merge.find("pub(crate) fn preflight(").expect("preflight moved");
+	let body_len =
+		merge[start..].find("\n\t/// The full classification").expect("preflight boundary moved");
+	let body = &merge[start..start + body_len];
+	assert!(body.contains("self.change_count()?"), "preflight never measures source cardinality");
+	assert!(body.contains("self.scan_probe()?"), "preflight cannot choose the scan probe");
+	assert!(
+		!body.contains("let mut probe = PointProbe"),
+		"preflight is hard-wired to per-key point probing"
+	);
+}
+
+/// The retained-version metric is incremented per compaction and never
+/// decremented. Its public name must say it is cumulative rather than claiming
+/// to be the current storage price.
+#[test]
+fn cumulative_retention_metric_is_named_as_a_total() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let metrics = std::fs::read_to_string(root.join("src/metrics.rs")).unwrap();
+	assert!(
+		metrics.contains("pub pin_retained_versions_total: u64"),
+		"the cumulative retained-version counter is still exposed as a current gauge"
+	);
+}
+
+/// Rotating an active arena retains it as immutable and allocates a replacement,
+/// so this mechanism is a pressure trigger, not a hard memory cap. Its public
+/// configuration must not promise a budget the implementation cannot enforce.
+#[test]
+fn write_buffer_pressure_configuration_is_not_advertised_as_a_hard_budget() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let lib = std::fs::read_to_string(root.join("src/lib.rs")).unwrap();
+	let lsm = std::fs::read_to_string(root.join("src/lsm.rs")).unwrap();
+	assert!(lib.contains("write_buffer_soft_limit"), "Options lacks the explicit soft-limit name");
+	assert!(
+		!lib.contains("pub write_buffer_budget:"),
+		"the best-effort pressure trigger is still advertised as a hard budget"
+	);
+	assert!(
+		lsm.contains("with_write_buffer_soft_limit"),
+		"TreeBuilder does not expose the corrected contract"
+	);
+}
+
 /// Every module-level `static` in `src/`, keyed `file:NAME`, with the reason it
 /// is allowed to be one. Adding an entry has to be a decision someone writes
 /// down; `docs/KNOWN_GAPS.md` holds the long form, including what would change

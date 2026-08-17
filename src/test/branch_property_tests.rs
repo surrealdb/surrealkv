@@ -388,7 +388,7 @@ async fn run_history(ops: Vec<Op>) -> std::result::Result<HistoryOutcome, TestCa
 		}
 	}
 
-	let pinned = harness.store.metrics().unwrap().pin_retained_versions;
+	let pinned = harness.store.metrics().unwrap().pin_retained_versions_total;
 	harness.store.close().await.unwrap();
 	Ok(HistoryOutcome {
 		pin_exercised: pinned > 0,

@@ -87,13 +87,13 @@ That is the retention promise, and it has a price you can read directly:
 
 ```rust
 let m = tree.metrics()?;
-println!("versions kept alive for anchors: {}", m.pin_retained_versions);
+println!("versions retained for anchors by compactions: {}", m.pin_retained_versions_total);
 ```
 
-`pin_retained_versions` is the number of versions compaction has retained *solely* because an
-anchor needed them. It is the direct storage cost of your live branches. If it grows without bound,
-you have branches nobody is using — delete them, or `detach` the ones that must outlive their
-parent.
+`pin_retained_versions_total` is the cumulative number of versions completed compactions retained
+*solely* because an anchor needed them since this process opened. It measures retention work, not a
+current on-disk gauge. Sustained growth means live branches are repeatedly making compaction retain
+history; delete unused branches, or `detach` the ones that must outlive their parent.
 
 Two related counters:
 
@@ -143,8 +143,13 @@ A merge replays the source branch's diff onto a target.
 
 A merge compares three things per key: the value the source has, the value the target has, and the
 value at the **base** — the point the two branches last agreed. Initially the base is the source's
-fork anchor. When a merge completes, it records a **promotion edge** on the target naming the
-sequence it consumed, and that edge becomes the base for the next merge.
+fork anchor. When a merge completes, it records a **promotion edge** on the target naming both the
+source sequence it consumed and the resulting target head.
+
+On a later merge, the source snapshot at the consumed source sequence is the three-way base.
+Target-only values below the target edge are not silently incorporated into the source: merging
+does not mutate the source branch. Both edge sequences are retained across compaction so the source
+base and the target's durable merge history remain exact.
 
 Without the edge, merging twice would re-apply the first merge's changes and report conflicts that
 were already settled. With it, the second merge considers only what the source did *since*.
@@ -351,7 +356,7 @@ let m = tree.metrics()?;
 | `merges`, `chunked_merges` | how many merges were not atomic |
 | `detaches` | branches materialized away from their parent |
 | `branches_reclaimed`, `tables_reclaimed` | what deleting branches actually freed |
-| `pin_retained_versions` | **the storage price of your live branches** |
+| `pin_retained_versions_total` | cumulative compaction work caused by retention anchors |
 | `compaction_pin_races` | forking contending with compaction |
 | `live_branches` | branches in the catalog now, `main` included |
 | `timeline_horizon` | the range `AtTimestamp` can still answer inside |

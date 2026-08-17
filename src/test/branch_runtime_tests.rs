@@ -158,12 +158,12 @@ async fn oversized_batch_right_sizes_the_branch_arena() {
 	store.close().await.unwrap();
 }
 
-/// The database-wide write-buffer budget rotates the largest active memtable
-/// toward flush instead of letting branch arenas accumulate unbounded.
+/// The database-wide write-buffer soft limit rotates the largest active
+/// memtable toward flush when branch arenas cross the pressure threshold.
 #[test(tokio::test)]
-async fn write_buffer_budget_rotates_largest_victim() {
+async fn write_buffer_soft_limit_rotates_largest_victim() {
 	let (store, _temp_dir) = create_store_with(|b| {
-		b.with_branch_memtable_size(8 * 1024).with_write_buffer_budget(Some(16 * 1024))
+		b.with_branch_memtable_size(8 * 1024).with_write_buffer_soft_limit(Some(16 * 1024))
 	});
 	let first = register_branch(&store, "budget/first");
 	let second = register_branch(&store, "budget/second");
@@ -180,7 +180,7 @@ async fn write_buffer_budget_rotates_largest_victim() {
 		"fixture must start with an empty flush queue"
 	);
 
-	// Creating the second runtime pushes the arena total past the budget;
+	// Creating the second runtime pushes the arena total past the threshold;
 	// enforcement must rotate the largest victim (the first branch) and wake
 	// the flush task. The flush may therefore already have drained the queue
 	// by the time we assert, so the evidence is (a) the victim's active
@@ -192,7 +192,7 @@ async fn write_buffer_budget_rotates_largest_victim() {
 
 	assert!(
 		first_runtime.active_memtable.read().unwrap().is_empty(),
-		"budget breach must rotate the largest active memtable"
+		"soft-limit breach must rotate the largest active memtable"
 	);
 	let in_queue = first_runtime
 		.immutable_memtables

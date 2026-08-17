@@ -182,11 +182,12 @@ impl DatabaseCheckpoint {
 		// Step 1: Flush all memtables to ensure consistency
 		self.flush_all_memtables()?;
 
-		// Step 2: Get current sequence number from the manifest
-		let sequence_number = {
-			let levels_guard = self.core.level_manifest.read()?;
-			levels_guard.get_last_sequence()
-		};
+		// Freeze level/state/root publication for the rest of the cut. Commits and
+		// catalog publication are fenced by the caller; this read guard prevents
+		// flush or compaction from replacing/deleting tables between the SST copy
+		// and the authority-lineage copy.
+		let levels_guard = self.core.level_manifest.read()?;
+		let sequence_number = levels_guard.get_last_sequence();
 
 		// Step 3: Create checkpoint subdirectories
 		let sstables_dir = checkpoint_path.join("sstables");
@@ -195,7 +196,7 @@ impl DatabaseCheckpoint {
 		fs::create_dir_all(&wal_dir).map_err(|e| Error::Io(Arc::new(e)))?;
 
 		// Step 4: Copy all SSTables
-		let (sstable_count, sstables_size) = self.copy_sstables(&sstables_dir)?;
+		let (sstable_count, sstables_size) = self.copy_sstables(&levels_guard, &sstables_dir)?;
 
 		// Step 5: Copy WAL segments
 		self.create_new_wal(&wal_dir)?;
@@ -283,8 +284,11 @@ impl DatabaseCheckpoint {
 	}
 
 	/// Copies all SSTables to the checkpoint directory
-	fn copy_sstables(&self, dest_dir: &Path) -> Result<(usize, u64)> {
-		let levels_guard = self.core.level_manifest.read()?;
+	fn copy_sstables(
+		&self,
+		levels_guard: &crate::levels::LevelManifest,
+		dest_dir: &Path,
+	) -> Result<(usize, u64)> {
 		let mut total_size = 0u64;
 		let mut count = 0usize;
 

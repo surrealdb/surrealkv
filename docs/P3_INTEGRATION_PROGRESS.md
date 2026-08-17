@@ -2,6 +2,14 @@
 
 Updated: 2026-08-14
 
+> **2026-08-17 adversarial correction.** This is a chronological implementation record, so older
+> sections retain the names and assumptions they had when written. The current implementation and
+> red/green evidence are in [BRANCHING_V2_ADVERSARIAL_FIX_LOG.md](BRANCHING_V2_ADVERSARIAL_FIX_LOG.md).
+> In particular, `write_buffer_budget` is now `write_buffer_soft_limit`, the cumulative retention
+> counter is `pin_retained_versions_total`, large-merge preflight uses the scan probe, owner-level
+> lookup is keyed, tombstones and deleted state lineages are retired, and repeated merge bases use
+> the prior source tip rather than the target's prior head.
+
 This file records the corrected P3 implementation slices. The branch-native design is being built
 through SurrealKV's retained commit, WAL, memtable, SST, manifest, iterator, compaction, and
 transaction machinery. Prototype modules remain test-only evidence until their semantics have been

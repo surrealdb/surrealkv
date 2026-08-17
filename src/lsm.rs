@@ -162,10 +162,14 @@ pub(crate) struct CoreInner {
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
 
 	/// Durable lineage access for catalog publication.
-	pub(crate) authority: crate::authority::store::AuthorityStore,
+	pub(crate) authority: RwLock<crate::authority::store::AuthorityStore>,
 
 	/// Catalog version + epochs; every durable catalog op serializes here.
 	pub(crate) catalog_publish: Mutex<CatalogPublishState>,
+	/// Serializes dataset materialization with branch deletion and whole-store
+	/// checkpoint/restore. It is deliberately separate from `catalog_publish`:
+	/// unrelated catalog operations remain available during an O(dataset) detach.
+	branch_materialization: Mutex<()>,
 
 	/// Recovered clock floor from catalog anchors and the root's visible
 	/// floor; the clock seed takes the max of this, the states, and WAL
@@ -344,7 +348,7 @@ impl CoreInner {
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
-			authority,
+			authority: RwLock::new(authority),
 			metrics: Arc::new(crate::metrics::BranchMetrics::default()),
 			catalog_version: catalog_version_handle,
 			catalog_publish: Mutex::new(CatalogPublishState {
@@ -353,6 +357,7 @@ impl CoreInner {
 				maintenance_epoch,
 				session_bumped: false,
 			}),
+			branch_materialization: Mutex::new(()),
 			clock_floor,
 			timeline,
 		})
@@ -372,6 +377,7 @@ impl CoreInner {
 	/// next catalog version. The catalog mutation is rolled back if the
 	/// publish fails, so the runtime never runs ahead of the authority.
 	pub(crate) fn create_branch(&self, name: &str) -> Result<crate::batch::BatchOwner> {
+		self.reclaim_catalog_capacity_if_needed()?;
 		let created_at_seq = self.visible_seq_num.load(Ordering::Acquire);
 		let mut publish = self.catalog_publish.lock().unwrap();
 		let mut catalog = self.branch_catalog.write()?;
@@ -464,6 +470,7 @@ impl CoreInner {
 	/// ones the object and edge adapters will use. Returns
 	/// `(branches expired, metadata files removed)`.
 	pub(crate) fn sweep_branch_maintenance(&self) -> Result<(usize, usize)> {
+		let _materialization = self.branch_materialization.lock().unwrap();
 		let now = self.opts.clock.now();
 		let deleted_at_seq = self.visible_seq_num.load(Ordering::Acquire);
 
@@ -502,8 +509,51 @@ impl CoreInner {
 			.all_records()
 			.map(|record| (record.id, record.generation))
 			.collect();
-		let removed = self.authority.prune_metadata(&owners)?;
+		let mut removed = self.authority.read()?.prune_metadata(&owners)?;
+		let tombstoned: Vec<_> = self
+			.branch_catalog
+			.read()?
+			.all_records()
+			.filter(|record| record.deleted)
+			.map(|record| record.id)
+			.collect();
+		for branch in tombstoned {
+			removed += self.authority.read()?.retire_state_lineage(branch)?;
+		}
+
+		// A tombstone is required until every mutable/durable owner component and
+		// its authority lineage have been reclaimed. After that it is pure catalog
+		// growth. Retire it in one more durable catalog publication, also removing
+		// stale merge edges that named the deleted source.
+		let retired = {
+			let mut catalog = self.branch_catalog.write()?;
+			let snapshot = catalog.clone();
+			let retired = catalog.retire_deleted();
+			if retired > 0 {
+				if let Err(error) = self.publish_catalog_locked(&mut publish, &catalog) {
+					*catalog = snapshot;
+					return Err(error);
+				}
+			}
+			retired
+		};
+		if retired > 0 {
+			log::debug!("branch maintenance retired {retired} catalog tombstone(s)");
+		}
 		Ok((expired.len(), removed))
+	}
+
+	/// Makes a last-chance synchronous maintenance pass before a catalog-growing
+	/// operation would exceed the durable format cap. Normal reclamation runs in
+	/// the background; this guard prevents a burst of cheap create/delete cycles
+	/// from outrunning that worker and permanently wedging future creation.
+	fn reclaim_catalog_capacity_if_needed(&self) -> Result<()> {
+		let at_capacity = self.branch_catalog.read()?.all_records().count()
+			>= crate::authority::format::MAX_CATALOG_ENTRIES;
+		if at_capacity {
+			self.sweep_branch_maintenance()?;
+		}
+		Ok(())
 	}
 
 	/// Copies everything `owner` inherits into its own tables and clears its
@@ -526,7 +576,7 @@ impl CoreInner {
 		core: &Arc<Core>,
 		owner: crate::batch::BatchOwner,
 	) -> Result<u64> {
-		let mut publish = self.catalog_publish.lock().unwrap();
+		let _materialization = self.branch_materialization.lock().unwrap();
 		{
 			let catalog = self.branch_catalog.read()?;
 			catalog
@@ -544,7 +594,12 @@ impl CoreInner {
 		// other order would lose the inherited data outright.
 		let rows = self.materialize_inherited(core, owner)?;
 
+		let mut publish = self.catalog_publish.lock().unwrap();
 		let mut catalog = self.branch_catalog.write()?;
+		catalog.validate_owner(owner.branch, owner.generation).map_err(|_| Error::BranchFenced)?;
+		if !catalog.record_has_parent(owner.branch, owner.generation) {
+			return Ok(rows);
+		}
 		let snapshot_catalog = catalog.clone();
 		catalog.detach(owner.branch, owner.generation).map_err(|error| {
 			Error::InvalidArgument(format!("detach rejected: {}", error.message))
@@ -773,6 +828,7 @@ impl CoreInner {
 	/// Durable branch deletion (tombstone). Same rollback-on-publish-failure
 	/// contract as creation.
 	pub(crate) fn delete_branch(&self, branch: crate::BranchId) -> Result<()> {
+		let _materialization = self.branch_materialization.lock().unwrap();
 		let deleted_at_seq = self.visible_seq_num.load(Ordering::Acquire);
 		let mut publish = self.catalog_publish.lock().unwrap();
 		let mut catalog = self.branch_catalog.write()?;
@@ -813,8 +869,9 @@ impl CoreInner {
 		} else {
 			publish.writer_epoch + 1
 		};
+		let authority = self.authority.read()?;
 		let manifest = crate::authority::format::CatalogManifest {
-			db_id: self.authority.db_id,
+			db_id: authority.db_id,
 			catalog_version: next_version,
 			next_generation: catalog.next_generation(),
 			writer_epoch,
@@ -822,7 +879,7 @@ impl CoreInner {
 			entries: catalog.to_entries(),
 		};
 		self.opts.fault_policy.check(crate::failpoints::FaultPoint::CatalogPublish)?;
-		self.authority.publish_catalog(&manifest)?;
+		authority.publish_catalog(&manifest)?;
 		publish.catalog_version = next_version;
 		publish.writer_epoch = writer_epoch;
 		publish.session_bumped = true;
@@ -1065,21 +1122,22 @@ impl CoreInner {
 		self.rotate_runtime_memtable(&self.default_runtime, 0)
 	}
 
-	/// Database-wide mutable-memory budget. When configured and the incoming
+	/// Database-wide mutable-memory pressure threshold. When configured and the incoming
 	/// allocation would exceed it, the largest active memtable across all
 	/// runtimes is rotated toward flush. Best-effort back-pressure: failures
-	/// here never fail the write (the budget bounds memory, not correctness).
+	/// here never fail the write, and resident memory may remain above the soft
+	/// limit until immutable memtables finish flushing.
 	///
 	/// Returns whether a rotation happened. The caller must then schedule the
-	/// memtable flush task: it is event-driven, and an unflushed budget
+	/// memtable flush task: it is event-driven, and an unflushed pressure
 	/// rotation both reclaims no memory and can park the victim's next write
 	/// in the stall loop waiting for a flush that was never scheduled.
-	pub(crate) fn enforce_write_buffer_budget(&self, incoming_bytes: u64) -> bool {
-		let Some(budget) = self.opts.write_buffer_budget else {
+	pub(crate) fn apply_write_buffer_pressure(&self, incoming_bytes: u64) -> bool {
+		let Some(soft_limit) = self.opts.write_buffer_soft_limit else {
 			return false;
 		};
 		let total = self.runtimes.total_arena_capacity_bytes();
-		if total.saturating_add(incoming_bytes) <= budget {
+		if total.saturating_add(incoming_bytes) <= soft_limit {
 			return false;
 		}
 		// Victim = largest non-empty active memtable.
@@ -1095,12 +1153,12 @@ impl CoreInner {
 			});
 		if let Some(victim) = victim {
 			log::debug!(
-				"write-buffer budget exceeded (total={total}, incoming={incoming_bytes}, budget={budget}); rotating owner {:?}",
+				"write-buffer soft limit exceeded (total={total}, incoming={incoming_bytes}, soft_limit={soft_limit}); rotating owner {:?}",
 				victim.owner()
 			);
 			match self.rotate_runtime_memtable(&victim, 0) {
 				Ok(()) => return true,
-				Err(error) => log::warn!("budget-driven rotation failed: {error}"),
+				Err(error) => log::warn!("pressure-driven rotation failed: {error}"),
 			}
 		}
 		false
@@ -1661,29 +1719,36 @@ impl CommitEnv for LsmCommitEnv {
 		let mut wal_guard = self.core.wal.write();
 		let expected_segment = wal_guard.get_active_log_number();
 		self.core.wal_dependencies.pin_in_flight(seq_num, expected_segment);
-		let actual_segment = match wal_guard.append(&prepared.bytes) {
-			Ok(segment) => segment,
+		let wal_result = (|| -> Result<(u64, bool)> {
+			let actual_segment = wal_guard.append(&prepared.bytes).map_err(Error::from)?;
+			debug_assert_eq!(actual_segment, expected_segment);
+			if sync {
+				self.core.opts.fault_policy.check(crate::failpoints::FaultPoint::WalSync)?;
+				wal_guard.sync()?;
+			}
+			// Size-driven WAL rotation is the only rotation policy now that
+			// branch memtable rotations are independent of the shared log. The
+			// appended batch stays in the old segment; the next append pins the
+			// new one.
+			let rotated_for_size = if wal_guard.should_rotate_for_size() {
+				self.core.opts.fault_policy.check(crate::failpoints::FaultPoint::WalRotate)?;
+				wal_guard.rotate()?;
+				true
+			} else {
+				false
+			};
+			Ok((actual_segment, rotated_for_size))
+		})();
+		drop(wal_guard);
+		let (actual_segment, rotated_for_size) = match wal_result {
+			Ok(result) => result,
 			Err(error) => {
 				self.core.wal_dependencies.cancel_in_flight(seq_num);
-				return Err(error.into());
+				prepared.wal_segment = None;
+				return Err(error);
 			}
 		};
-		debug_assert_eq!(actual_segment, expected_segment);
 		prepared.wal_segment = Some(actual_segment);
-		if sync {
-			wal_guard.sync()?;
-		}
-		// Size-driven WAL rotation is the only rotation policy now that
-		// branch memtable rotations are independent of the shared log. The
-		// appended batch stays in the old segment; the next append pins the
-		// new one.
-		let rotated_for_size = if wal_guard.should_rotate_for_size() {
-			wal_guard.rotate()?;
-			true
-		} else {
-			false
-		};
-		drop(wal_guard);
 
 		// A new segment is when cold branches start falling behind: schedule
 		// the flush task so the WAL-span trickle policy runs.
@@ -1719,7 +1784,7 @@ impl CommitEnv for LsmCommitEnv {
 		let runtime = if batch.owner == self.core.default_runtime.owner() {
 			Arc::clone(&self.core.default_runtime)
 		} else {
-			if self.core.enforce_write_buffer_budget(self.core.opts.branch_memtable_size as u64) {
+			if self.core.apply_write_buffer_pressure(self.core.opts.branch_memtable_size as u64) {
 				if let Some(ref task_manager) = self.task_manager {
 					task_manager.wake_up_memtable();
 				}
@@ -1758,8 +1823,8 @@ impl CommitEnv for LsmCommitEnv {
 
 				let min_capacity = batch.memtable_size_estimate() as usize;
 				// The unconditional wake below schedules the flush for both
-				// this budget rotation and the forced one.
-				let _budget_rotated = self.core.enforce_write_buffer_budget(min_capacity as u64);
+				// this pressure rotation and the forced one.
+				let _pressure_rotated = self.core.apply_write_buffer_pressure(min_capacity as u64);
 				self.core.rotate_runtime_memtable(&runtime, min_capacity)?;
 
 				// Schedule background flush
@@ -1850,12 +1915,13 @@ impl Core {
 		at: crate::branch::ForkPoint,
 	) -> Result<crate::branch::ForkReceipt> {
 		use crate::branch::{ForkPoint, ForkReceipt};
+		self.inner.reclaim_catalog_capacity_if_needed()?;
 
 		// Serialises every branch operation, so the parent resolved below cannot
 		// change under us while the fence is taken and released.
 		let mut publish = self.inner.catalog_publish.lock().unwrap();
 
-		let (parent_owner, existing_child) = {
+		let (parent_owner, parent_created_at, existing_child) = {
 			let catalog = self.inner.branch_catalog.read()?;
 			let parent = catalog.get_by_name(parent_name).map_err(|_| {
 				Error::InvalidArgument(format!("fork parent {parent_name:?} is not a live branch"))
@@ -1888,7 +1954,7 @@ impl Core {
 					child.parent.clone(),
 				)
 			});
-			(parent_owner, existing)
+			(parent_owner, parent.created_at_seq, existing)
 		};
 
 		// Idempotent retry: the same fork, re-issued. A name that exists with a
@@ -1907,13 +1973,21 @@ impl Core {
 					"branch {child_name:?} already exists as a fork of a different parent"
 				)));
 			}
-			if let ForkPoint::AtVersion(version) = at {
-				if version != link.fork_seq {
-					return Err(Error::InvalidArgument(format!(
-						"branch {child_name:?} already exists at fork sequence {}, not {version}",
-						link.fork_seq
-					)));
-				}
+			let requested_seq = match at {
+				ForkPoint::Head => None,
+				ForkPoint::AtVersion(version) => Some(version),
+				ForkPoint::AtTimestamp(timestamp) => Some(
+					self.inner
+						.timeline
+						.resolve(timestamp)?
+						.min(self.inner.visible_seq_num.load(Ordering::Acquire)),
+				),
+			};
+			if let Some(version) = requested_seq.filter(|version| *version != link.fork_seq) {
+				return Err(Error::InvalidArgument(format!(
+					"branch {child_name:?} already exists at fork sequence {}, not {version}",
+					link.fork_seq
+				)));
 			}
 			return Ok(ForkReceipt {
 				child: child_owner,
@@ -1953,6 +2027,11 @@ impl Core {
 				resolved.min(head)
 			}
 		};
+		if fork_seq < parent_created_at {
+			return Err(Error::InvalidArgument(format!(
+				"fork sequence {fork_seq} is before the parent's creation at sequence {parent_created_at}"
+			)));
+		}
 
 		// Commit point. The manifest read lock is taken FIRST (the order FK3
 		// established) and held through the publish: it is the lock compaction
@@ -2516,7 +2595,11 @@ impl Tree {
 				.map_err(|_| Error::InvalidArgument(format!("branch {name:?} does not exist")))?
 				.id
 		};
-		self.core.inner.delete_branch(id)
+		self.core.inner.delete_branch(id)?;
+		if let Some(ref task_manager) = *self.core.task_manager.lock().unwrap() {
+			task_manager.wake_up_level();
+		}
+		Ok(())
 	}
 
 	/// What branching has done and is costing, as of now.
@@ -2532,7 +2615,7 @@ impl Tree {
 			.inner
 			.wal_dependencies
 			.snapshot(self.core.inner.wal.read().get_active_log_number())
-			.component_count;
+			.pinned_segment_count;
 		Ok(crate::BranchMetricsSnapshot::assemble(
 			&self.core.inner.metrics,
 			live_branches,
@@ -2611,6 +2694,19 @@ impl Tree {
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
+		// One cut across branch catalog, commits, owner states, root and SSTs.
+		// Match fork/restore's global lock order: catalog before commit fence.
+		let _materialization = self.core.inner.branch_materialization.lock().unwrap();
+		let _catalog_guard = self.core.inner.catalog_publish.lock().unwrap();
+		let fence_taken = std::time::Instant::now();
+		let _write_guard = self.core.commit_pipeline.lock_writes();
+		let deadline = fence_taken + self.core.inner.opts.fork_drain_timeout;
+		while !self.core.commit_pipeline.is_drained() {
+			if std::time::Instant::now() >= deadline {
+				return Err(Error::Other("checkpoint commit drain timed out".to_owned()));
+			}
+			std::hint::spin_loop();
+		}
 		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
 		checkpoint.create_checkpoint(checkpoint_dir)
 	}
@@ -2620,13 +2716,17 @@ impl Tree {
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
-		// Block new commits from entering the critical section for the duration
-		// of the restore. The restore is a multi-step rewrite of nearly all
+		// Branch/catalog operations take `catalog_publish` before the commit
+		// fence, so restore follows that same global order. Holding both blocks
+		// catalog publication and new commits for the duration of the multi-step
+		// rewrite of nearly all
 		// in-memory state (manifest, memtables, WAL, seq counters, oracle); a
 		// concurrent commit racing through any one of those steps would observe
 		// torn state. In-flight commits already past `write_mutex` (in their
 		// apply phase) will finish against the soon-to-be-replaced memtable —
 		// their data is intentionally discarded by the restore.
+		let _materialization = self.core.inner.branch_materialization.lock().unwrap();
+		let mut publish = self.core.inner.catalog_publish.lock().unwrap();
 		let _write_guard = self.core.commit_pipeline.lock_writes();
 
 		// Step 1: Restore files from checkpoint
@@ -2658,22 +2758,28 @@ impl Tree {
 			restored_root.as_ref().map(|r| r.timeline_tail.as_slice()).unwrap_or(&[]),
 			restored_root.as_ref().map(|r| r.last_commit_ts).unwrap_or(0),
 		);
-		let new_levels = LevelManifest::hydrate(
+		let mut new_levels = LevelManifest::hydrate(
 			Arc::clone(&self.core.inner.opts),
-			restored_authority,
+			restored_authority.clone(),
 			&restored_catalog,
 			restored_catalog_manifest.catalog_version,
 			restored_root.as_ref(),
 			Arc::clone(&self.core.inner.timeline),
 		)?;
+		// Root and catalog publishers must share this handle after the swap.
+		self.core
+			.inner
+			.catalog_version
+			.store(restored_catalog_manifest.catalog_version, Ordering::Release);
+		new_levels.catalog_version = Arc::clone(&self.core.inner.catalog_version);
 
-		// Replace the current levels and catalog with the reloaded ones
+		// Replace the current levels, authority and catalog with the reloaded cut.
 		{
 			let mut levels_guard = self.core.inner.level_manifest.write()?;
 			*levels_guard = new_levels;
 		}
 		{
-			let mut publish = self.core.inner.catalog_publish.lock().unwrap();
+			*self.core.inner.authority.write()? = restored_authority;
 			publish.catalog_version = restored_catalog_manifest.catalog_version;
 			publish.writer_epoch = restored_catalog_manifest.writer_epoch;
 			publish.maintenance_epoch = restored_catalog_manifest.maintenance_epoch;
@@ -2693,6 +2799,7 @@ impl Tree {
 			let mut immutable_memtables = self.core.inner.immutable_memtables.write()?;
 			*immutable_memtables = ImmutableMemtables::default();
 		}
+		self.core.inner.runtimes.reset_to_default()?;
 		self.core.inner.wal_dependencies.clear();
 
 		// Reopen the WAL from the restored directory
@@ -3142,19 +3249,18 @@ impl BranchHandle {
 	/// written and lose them.
 	///
 	/// The level manifest is held for reading across the publish because the
-	/// edge's target-side sequence becomes a retention anchor (FK6) the instant
-	/// it lands. Compaction publishes under the same lock exclusively, so this
-	/// closes the window where a job that sampled anchors without this one could
-	/// install an output missing what the anchor promises. A job already merging
-	/// still re-checks and discards on its own.
+	/// edge's target-side head and source-side consumed cursor become retention
+	/// anchors the instant it lands. Compaction publishes under the same lock
+	/// exclusively, so this closes the window where a job that sampled anchors
+	/// without either one could install output missing what the edge promises.
 	fn record_merge_edge(
 		&self,
 		target: &BranchHandle,
 		source_through_seq: u64,
 		target_through_seq: u64,
 	) -> Result<()> {
-		let _levels = self.core.inner.level_manifest.read()?;
 		let mut publish = self.core.inner.catalog_publish.lock().unwrap();
+		let _levels = self.core.inner.level_manifest.read()?;
 		let mut catalog = self.core.inner.branch_catalog.write()?;
 		let snapshot = catalog.clone();
 		catalog
@@ -3210,7 +3316,10 @@ impl BranchHandle {
 				"branches from different stores cannot be merged".to_owned(),
 			));
 		}
-		let retained_floor = self.core.inner.level_manifest.read()?.retained_floor(target.owner);
+		let (target_floor, source_floor) = {
+			let levels = self.core.inner.level_manifest.read()?;
+			(levels.retained_floor(target.owner), levels.retained_floor(self.owner))
+		};
 		let base = {
 			let catalog = self.core.inner.branch_catalog.read()?;
 			catalog
@@ -3235,11 +3344,27 @@ impl BranchHandle {
 			// durable merge intent closes the window by pinning ahead of the
 			// commit.
 			let anchors = catalog.retention_anchors(target.owner.branch, target.owner.generation);
-			if !anchors.view_is_complete_at(base.target_at, retained_floor) {
+			if !anchors.view_is_complete_at(base.target_at, target_floor) {
 				return Err(Error::BelowRetentionFloor {
 					requested: base.target_at,
-					floor: retained_floor,
+					floor: target_floor,
 				});
+			}
+
+			// Incremental merges compare against the source as it stood at the
+			// previously consumed cursor. The incoming edge pins that cap on the
+			// source owner. The first merge is different: its source-side base is
+			// the inherited fork view, whose parent-side fork anchor is already
+			// validated above, and the source cannot own rows at or below its birth.
+			if base.source_through > base.fork_at {
+				let source_anchors =
+					catalog.retention_anchors(self.owner.branch, self.owner.generation);
+				if !source_anchors.view_is_complete_at(base.source_through, source_floor) {
+					return Err(Error::BelowRetentionFloor {
+						requested: base.source_through,
+						floor: source_floor,
+					});
+				}
 			}
 			base
 		};
@@ -3508,9 +3633,9 @@ impl TreeBuilder {
 		self
 	}
 
-	/// Sets the database-wide budget over all branch memtable arenas.
-	pub fn with_write_buffer_budget(mut self, budget: Option<u64>) -> Self {
-		self.opts = self.opts.with_write_buffer_budget(budget);
+	/// Sets the database-wide soft pressure threshold for branch memtable arenas.
+	pub fn with_write_buffer_soft_limit(mut self, soft_limit: Option<u64>) -> Self {
+		self.opts = self.opts.with_write_buffer_soft_limit(soft_limit);
 		self
 	}
 

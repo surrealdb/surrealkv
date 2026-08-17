@@ -234,19 +234,19 @@ pub(crate) trait TargetProbe {
 	fn target_value(&mut self, key: &[u8]) -> Result<Option<Value>>;
 }
 
-/// Per-key point lookups against the target's read stack, at two caps.
+/// Per-key point lookups against the source base and the target now.
 ///
 /// Two metadata reads per key to answer `moved_since_base`, which is cheap when
 /// the merge is small and is the reason [`ScanProbe`] exists when it is not.
 pub(crate) struct PointProbe<'a> {
-	at_base: &'a Snapshot,
+	source_base: &'a Snapshot,
 	now: &'a Snapshot,
 }
 
 impl<'a> PointProbe<'a> {
-	pub(crate) fn new(at_base: &'a Snapshot, now: &'a Snapshot) -> Self {
+	pub(crate) fn new(source_base: &'a Snapshot, now: &'a Snapshot) -> Self {
 		Self {
-			at_base,
+			source_base,
 			now,
 		}
 	}
@@ -258,13 +258,13 @@ impl<'a> PointProbe<'a> {
 
 impl TargetProbe for PointProbe<'_> {
 	fn moved_since_base(&mut self, key: &[u8]) -> Result<bool> {
-		let base = Self::meta(self.at_base, key)?;
+		let base = Self::meta(self.source_base, key)?;
 		let now = Self::meta(self.now, key)?;
 		Ok(base.map(|meta| meta.seq) != now.map(|meta| meta.seq))
 	}
 
 	fn base_value(&mut self, key: &[u8]) -> Result<Option<Value>> {
-		Ok(self.at_base.get(key)?.map(|(value, _)| value))
+		Ok(self.source_base.get(key)?.map(|(value, _)| value))
 	}
 
 	fn target_value(&mut self, key: &[u8]) -> Result<Option<Value>> {
@@ -287,7 +287,7 @@ impl TargetProbe for PointProbe<'_> {
 /// their original sequences, which the same filter excludes.
 pub(crate) struct ScanProbe<'a> {
 	changes: crate::DiffIter<'a>,
-	at_base: &'a Snapshot,
+	source_base: &'a Snapshot,
 	now: &'a Snapshot,
 	/// The cursor's current entry, or `None` once the walk is done.
 	current: Option<DiffEntry>,
@@ -302,12 +302,12 @@ pub(crate) struct ScanProbe<'a> {
 impl<'a> ScanProbe<'a> {
 	pub(crate) fn new(
 		changes: crate::DiffIter<'a>,
-		at_base: &'a Snapshot,
+		source_base: &'a Snapshot,
 		now: &'a Snapshot,
 	) -> Result<Self> {
 		let mut probe = Self {
 			changes,
-			at_base,
+			source_base,
 			now,
 			current: None,
 			last_asked: None,
@@ -342,7 +342,7 @@ impl TargetProbe for ScanProbe<'_> {
 	}
 
 	fn base_value(&mut self, key: &[u8]) -> Result<Option<Value>> {
-		Ok(self.at_base.get(key)?.map(|(value, _)| value))
+		Ok(self.source_base.get(key)?.map(|(value, _)| value))
 	}
 
 	fn target_value(&mut self, key: &[u8]) -> Result<Option<Value>> {
@@ -447,10 +447,13 @@ pub(crate) struct MergeSession {
 	target: BatchOwner,
 	/// The source's changes above the base.
 	diff: crate::BranchDiff,
-	/// The target's own changes above the base — what [`ScanProbe`] walks.
-	/// Built with the session so both passes see the same fixed set.
+	/// The target's own changes since the branches diverged — what
+	/// [`ScanProbe`] walks. A previous merge edge cannot be the filter here:
+	/// target-only writes below that edge were never incorporated into source.
 	target_changes: crate::BranchDiff,
-	at_base: Snapshot,
+	/// The source as it stood at the last consumed source cursor. This is the
+	/// three-way base; merging into the target never mutates the source.
+	source_base: Snapshot,
 	now: Snapshot,
 	/// The sequence every chunk commits at. See
 	/// [`Transaction::new_owned_at`]: it is what makes a target write arriving
@@ -526,8 +529,8 @@ impl MergeSession {
 		let watermark = core.active_txn_tracker.register(visible);
 		let own = crate::snapshot::Snapshot::own_only(Arc::clone(&core), visible, source)?;
 		let target_own = crate::snapshot::Snapshot::own_only(Arc::clone(&core), visible, target)?;
-		let at_base =
-			crate::snapshot::Snapshot::new_owned(Arc::clone(&core), base.target_at, target)?;
+		let source_base =
+			crate::snapshot::Snapshot::new_owned(Arc::clone(&core), base.source_through, source)?;
 		let now = crate::snapshot::Snapshot::new_owned(Arc::clone(&core), visible, target)?;
 		let chunk_budget = core.inner.opts.max_memtable_size as u64;
 		Ok(Self {
@@ -535,8 +538,8 @@ impl MergeSession {
 			target,
 			scope: None,
 			diff: crate::BranchDiff::new(own, base.source_through),
-			target_changes: crate::BranchDiff::new(target_own, base.target_at),
-			at_base,
+			target_changes: crate::BranchDiff::new(target_own, base.fork_at),
+			source_base,
 			now,
 			start_seq: visible,
 			_watermark: watermark,
@@ -574,12 +577,19 @@ impl MergeSession {
 		}
 	}
 
+	/// Counts the fixed source diff without touching the target. This extra
+	/// sequential source pass is cheaper than two target point reads per key for
+	/// a large merge and lets preflight choose the same scan strategy as apply.
+	fn change_count(&self) -> Result<usize> {
+		self.changes()?.try_fold(0usize, |count, entry| entry.map(|_| count.saturating_add(1)))
+	}
+
 	pub(crate) fn point_probe(&self) -> PointProbe<'_> {
-		PointProbe::new(&self.at_base, &self.now)
+		PointProbe::new(&self.source_base, &self.now)
 	}
 
 	pub(crate) fn scan_probe(&self) -> Result<ScanProbe<'_>> {
-		ScanProbe::new(self.target_changes.iter()?, &self.at_base, &self.now)
+		ScanProbe::new(self.target_changes.iter()?, &self.source_base, &self.now)
 	}
 
 	/// Pass one: classify everything, buffer nothing.
@@ -588,15 +598,22 @@ impl MergeSession {
 	/// chunk — one key cannot be split across two batches, so that is the one
 	/// size problem chunking does not solve.
 	pub(crate) fn preflight(&self, strategy: &MergeStrategy) -> Result<MergePreflight> {
-		// Pass one always points: it is the pass that discovers how big the
-		// merge is, so it cannot choose by size without begging the question.
-		let mut probe = PointProbe::new(&self.at_base, &self.now);
+		let examined = self.change_count()?;
+		let mut scan;
+		let mut point;
+		let probe: &mut dyn TargetProbe = if examined >= SCAN_PROBE_THRESHOLD {
+			scan = self.scan_probe()?;
+			&mut scan
+		} else {
+			point = self.point_probe();
+			&mut point
+		};
 		let mut preflight = MergePreflight::default();
 		for entry in self.changes()? {
 			let entry = entry?;
 			let mut size =
 				(entry.key.len() + entry.op.value().map_or(0, |value| value.len())) as u64;
-			match classify(&entry, &mut probe)? {
+			match classify(&entry, probe)? {
 				Decision::Apply => {}
 				Decision::Converged => {
 					preflight.converged += 1;
@@ -750,18 +767,18 @@ fn bound_as_ref(bound: &std::ops::Bound<Vec<u8>>) -> std::ops::Bound<&[u8]> {
 	}
 }
 
-/// Where a merge measures from: what the source still has to offer, and where
-/// the target's side of the three-way comparison is read.
-///
-/// Before the first merge both are the fork anchor. Afterwards they move to the
-/// recorded edge, because the last state the two branches shared is what was
-/// merged, not what was forked.
+/// Where an incremental merge measures from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EffectiveBase {
-	/// Source changes at or below this sequence have already been merged.
+	/// Source changes at or below this sequence have already been consumed. The
+	/// source snapshot at this cap is the base side of the three-way comparison.
 	pub(crate) source_through: u64,
-	/// Cap at which the target is read for the base side of the comparison.
+	/// Target head produced by the previous merge. Retained as durable edge
+	/// history and reported to callers; it is not a source-side base value.
 	pub(crate) target_at: u64,
+	/// Original divergence point. A scan probe must include every target write
+	/// above this point, including target-only writes predating the last edge.
+	pub(crate) fork_at: u64,
 }
 
 /// Resolves the base for merging `source` into `target`, given the fork anchor.
@@ -778,10 +795,12 @@ pub(crate) fn effective_base(
 		Some(edge) if edge.source_generation == source.generation => EffectiveBase {
 			source_through: edge.source_through_seq.max(fork_seq),
 			target_at: edge.target_through_seq.max(fork_seq),
+			fork_at: fork_seq,
 		},
 		_ => EffectiveBase {
 			source_through: fork_seq,
 			target_at: fork_seq,
+			fork_at: fork_seq,
 		},
 	}
 }

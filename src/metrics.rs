@@ -24,7 +24,7 @@ pub(crate) struct BranchMetrics {
 	chunked_merges: AtomicU64,
 	branches_reclaimed: AtomicU64,
 	tables_reclaimed: AtomicU64,
-	pin_retained_versions: AtomicU64,
+	pin_retained_versions_total: AtomicU64,
 	compaction_pin_races: AtomicU64,
 	memtable_flushes: AtomicU64,
 }
@@ -74,7 +74,7 @@ impl BranchMetrics {
 	/// (design §3.3a).
 	pub(crate) fn record_pin_retained(&self, versions: u64) {
 		if versions > 0 {
-			self.pin_retained_versions.fetch_add(versions, Ordering::Relaxed);
+			self.pin_retained_versions_total.fetch_add(versions, Ordering::Relaxed);
 		}
 	}
 
@@ -105,7 +105,7 @@ impl BranchMetrics {
 			chunked_merges: self.chunked_merges.load(Ordering::Relaxed),
 			branches_reclaimed: self.branches_reclaimed.load(Ordering::Relaxed),
 			tables_reclaimed: self.tables_reclaimed.load(Ordering::Relaxed),
-			pin_retained_versions: self.pin_retained_versions.load(Ordering::Relaxed),
+			pin_retained_versions_total: self.pin_retained_versions_total.load(Ordering::Relaxed),
 			compaction_pin_races: self.compaction_pin_races.load(Ordering::Relaxed),
 			memtable_flushes: self.memtable_flushes.load(Ordering::Relaxed),
 		}
@@ -123,7 +123,7 @@ struct CountersOnly {
 	chunked_merges: u64,
 	branches_reclaimed: u64,
 	tables_reclaimed: u64,
-	pin_retained_versions: u64,
+	pin_retained_versions_total: u64,
 	compaction_pin_races: u64,
 }
 
@@ -155,9 +155,10 @@ pub struct BranchMetricsSnapshot {
 	/// SST files those releases freed. Lower than `branches_reclaimed` whenever
 	/// a branch was deleted before it flushed.
 	pub tables_reclaimed: u64,
-	/// Versions compaction has kept alive for a retention anchor. The direct
-	/// price of keeping forks and merge bases readable.
-	pub pin_retained_versions: u64,
+	/// Cumulative versions retained by completed compactions solely for a
+	/// retention anchor since this process opened. This measures retention work,
+	/// not the number of extra versions currently live on disk.
+	pub pin_retained_versions_total: u64,
 	/// Compactions that threw away their output because an anchor appeared
 	/// while they were running.
 	pub compaction_pin_races: u64,
@@ -193,7 +194,7 @@ impl BranchMetricsSnapshot {
 			chunked_merges: counters.chunked_merges,
 			branches_reclaimed: counters.branches_reclaimed,
 			tables_reclaimed: counters.tables_reclaimed,
-			pin_retained_versions: counters.pin_retained_versions,
+			pin_retained_versions_total: counters.pin_retained_versions_total,
 			compaction_pin_races: counters.compaction_pin_races,
 			memtable_flushes: counters.memtable_flushes,
 			live_branches,

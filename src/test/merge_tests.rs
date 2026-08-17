@@ -530,6 +530,94 @@ async fn a_second_merge_starts_from_the_first_one() {
 	assert_eq!(txn.get(b"k").unwrap(), Some(b"target-owns-it-now".to_vec()));
 }
 
+/// A merge edge may advance past target-only writes, but those writes are not
+/// thereby incorporated into the unchanged source branch. A later source edit
+/// to the same key is still based on the fork value and must conflict under
+/// strict three-way semantics.
+#[test(tokio::test)]
+async fn no_op_merge_does_not_reconcile_unseen_target_changes() {
+	let (store, _temp) = create_store();
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k", b"base").unwrap();
+	txn.commit().await.unwrap();
+
+	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
+	let main = store.branch("main").unwrap();
+
+	let mut txn = main.begin().unwrap();
+	txn.set(b"k", b"target").unwrap();
+	txn.commit().await.unwrap();
+
+	let first = child.merge_into(&main, MergeStrategy::Strict).await.unwrap();
+	assert_eq!(first.applied, 0, "the unchanged source offers no writes");
+
+	let mut txn = child.begin().unwrap();
+	txn.set(b"k", b"source").unwrap();
+	txn.commit().await.unwrap();
+
+	let error = child
+		.merge_into(&main, MergeStrategy::Strict)
+		.await
+		.expect_err("the source never incorporated the target-only value");
+	assert!(
+		matches!(
+			error,
+			Error::MergeConflicts {
+				count: 1
+			}
+		),
+		"got {error}"
+	);
+
+	let txn = main.begin().unwrap();
+	assert_eq!(txn.get(b"k").unwrap(), Some(b"target".to_vec()));
+}
+
+/// The same baseline rule applies when the earlier merge was not a no-op. An
+/// edge is global to the source/target pair, but it cannot mark untouched keys
+/// as agreed merely because some other source key was promoted.
+#[test(tokio::test)]
+async fn merge_of_an_unrelated_key_does_not_reconcile_target_changes() {
+	let (store, _temp) = create_store();
+	let mut txn = store.begin().unwrap();
+	txn.set(b"contested", b"base").unwrap();
+	txn.commit().await.unwrap();
+
+	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
+	let main = store.branch("main").unwrap();
+
+	let mut txn = main.begin().unwrap();
+	txn.set(b"contested", b"target").unwrap();
+	txn.commit().await.unwrap();
+	let mut txn = child.begin().unwrap();
+	txn.set(b"unrelated", b"source-first").unwrap();
+	txn.commit().await.unwrap();
+
+	let first = child.merge_into(&main, MergeStrategy::Strict).await.unwrap();
+	assert_eq!(first.applied, 1);
+
+	let mut txn = child.begin().unwrap();
+	txn.set(b"contested", b"source-second").unwrap();
+	txn.commit().await.unwrap();
+
+	let error = child
+		.merge_into(&main, MergeStrategy::Strict)
+		.await
+		.expect_err("an unrelated promoted key cannot reconcile this key");
+	assert!(
+		matches!(
+			error,
+			Error::MergeConflicts {
+				count: 1
+			}
+		),
+		"got {error}"
+	);
+
+	let txn = main.begin().unwrap();
+	assert_eq!(txn.get(b"contested").unwrap(), Some(b"target".to_vec()));
+}
+
 /// Edges are per source. One child's merge must never shift the base another
 /// child is compared against — otherwise the second merge would overwrite the
 /// first one's keys without reporting anything (plan C5).
@@ -785,6 +873,68 @@ async fn a_target_that_reverted_a_merged_key_conflicts_instead_of_being_overwrit
 	);
 	let txn = store.begin().unwrap();
 	assert_eq!(txn.get(b"k").unwrap(), Some(b"original".to_vec()), "the revert stands");
+}
+
+/// The previous source tip is the three-way base for an incremental merge, so
+/// source compaction must retain it just as target compaction retains the
+/// target-side merge head. Otherwise a target revert can masquerade as an
+/// unchanged target and be overwritten.
+#[test(tokio::test)]
+async fn source_compaction_keeps_the_previous_merge_base_exact() {
+	let (store, _temp) = create_store_with_levels(2);
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k", b"original").unwrap();
+	txn.commit().await.unwrap();
+	store.drain_flushes_synchronously().unwrap();
+
+	let child = store.fork_branch("main", "work", ForkPoint::Head).unwrap();
+	let main = store.branch("main").unwrap();
+	let mut txn = child.begin().unwrap();
+	txn.set(b"k", b"source-v1").unwrap();
+	txn.commit().await.unwrap();
+	crate::test::support::flush_branch_to_table(&store, "work");
+	let first = child.merge_into(&main, MergeStrategy::Strict).await.unwrap();
+
+	let mut txn = main.begin().unwrap();
+	txn.set(b"k", b"original").unwrap();
+	txn.commit().await.unwrap();
+
+	let mut txn = child.begin().unwrap();
+	txn.set(b"k", b"source-v2").unwrap();
+	txn.commit().await.unwrap();
+	crate::test::support::flush_branch_to_table(&store, "work");
+	for round in 0..3u32 {
+		let mut txn = child.begin().unwrap();
+		txn.set(b"churn", format!("v{round}").as_bytes()).unwrap();
+		txn.commit().await.unwrap();
+		crate::test::support::flush_branch_to_table(&store, "work");
+	}
+
+	crate::test::support::compact_leveled(&store);
+
+	let floor = crate::test::support::branch_retained_floor(&store, "work");
+	assert!(
+		floor > first.source_through_seq,
+		"fixture must compact past source cursor: floor={floor}, cursor={}",
+		first.source_through_seq
+	);
+
+	let error = child
+		.merge_into(&main, MergeStrategy::Strict)
+		.await
+		.expect_err("the retained source-v1 base exposes the target revert");
+	assert!(
+		matches!(
+			error,
+			Error::MergeConflicts {
+				count: 1
+			}
+		),
+		"got {error}"
+	);
+	let txn = main.begin().unwrap();
+	assert_eq!(txn.get(b"k").unwrap(), Some(b"original".to_vec()));
 }
 
 #[test(tokio::test)]

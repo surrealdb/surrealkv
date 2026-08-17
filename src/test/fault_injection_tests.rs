@@ -72,6 +72,29 @@ async fn a_failed_publish_leaves_no_half_created_fork() {
 	assert_eq!(txn.get(b"k").unwrap(), Some(b"v".to_vec()), "and it inherits correctly");
 }
 
+/// Once a commit pins its WAL segment, every error before the dependency is
+/// handed to a memtable must cancel that in-flight pin. Sync failure occurs
+/// after append and used to bypass the append-only cleanup arm.
+#[test(tokio::test)]
+async fn a_failed_wal_sync_releases_its_in_flight_dependency() {
+	let (store, faults, _temp) = create_store_with_faults();
+	let snapshot = || crate::test::support::wal_dependency_snapshot(&store);
+	let before = snapshot();
+
+	faults.fail_times(FaultPoint::WalSync, 1);
+	let mut txn = store.begin().unwrap();
+	txn.set_durability(crate::Durability::Immediate);
+	txn.set(b"k", b"v").unwrap();
+	txn.commit().await.expect_err("the injected post-append sync failure must surface");
+	assert!(!faults.is_armed(FaultPoint::WalSync));
+
+	let after = snapshot();
+	assert_eq!(
+		after.in_flight_count, before.in_flight_count,
+		"a failed sync left a commit pin that no apply can ever hand off"
+	);
+}
+
 /// A delete whose publish fails leaves the branch live and writable — not
 /// tombstoned in memory while the durable catalog still lists it.
 #[test(tokio::test)]

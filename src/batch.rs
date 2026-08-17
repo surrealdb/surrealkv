@@ -22,7 +22,7 @@ pub(crate) const BATCH_HEADER_TS_LEN: usize = 8;
 
 /// Physical owner of every row in a commit batch. Ownership stays in the
 /// batch/component metadata and is deliberately not prefixed into user keys.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct BatchOwner {
 	pub(crate) branch: BranchId,
 	pub(crate) generation: BranchGeneration,

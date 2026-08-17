@@ -623,6 +623,28 @@ async fn fork_above_the_visible_head_is_refused() {
 	assert!(store.core.inner.branch_catalog.read().unwrap().get_by_name("fork/future").is_err());
 }
 
+/// A branch cannot be forked at a version before that parent branch existed.
+/// Allowing it fabricates a lineage cap below the parent's own birth and can
+/// make a grandchild depend on grandparent history that no durable anchor pins.
+#[test(tokio::test)]
+async fn nested_fork_before_the_parent_s_creation_is_refused() {
+	let (store, _temp) = create_store_with(|b| b.with_versioning(true, 0));
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k", b"parent-base").unwrap();
+	txn.commit().await.unwrap();
+	let parent_created = visible_seq(&store);
+
+	fork(&store, "main", "parent", ForkPoint::Head).unwrap();
+	let requested = parent_created - 1;
+	let error = fork(&store, "parent", "impossible-child", ForkPoint::AtVersion(requested))
+		.expect_err("the requested parent did not exist at that version");
+	assert!(
+		error.to_string().contains("before the parent's creation"),
+		"unexpected refusal: {error}"
+	);
+	assert!(!branch_exists(&store, "impossible-child"), "the refusal must publish no child");
+}
+
 /// Once a compaction has collapsed history, a historical fork into the
 /// collapsed range is refused with the boundary rather than served short of
 /// rows. The pre-compaction arm is the non-vacuity check: the same fork point
@@ -723,6 +745,31 @@ async fn fork_retry_is_idempotent_and_divergence_fails_closed() {
 	let not_a_fork = fork(&store, "main", "plain/name", ForkPoint::Head)
 		.expect_err("an existing non-fork branch must not be adopted");
 	assert!(not_a_fork.to_string().contains("is not a fork"), "{not_a_fork}");
+}
+
+/// Idempotency is equality of the requested operation, not merely reuse of a
+/// child name and parent. A timestamp retry that resolves to another version
+/// must fail just like a different explicit `AtVersion` request.
+#[test(tokio::test)]
+async fn fork_retry_with_a_different_timestamp_is_refused() {
+	let (store, _temp) = create_store_with(|b| b.with_versioning(true, 0));
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k", b"first").unwrap();
+	txn.commit().await.unwrap();
+	let first_ts = crate::test::support::last_commit_timestamp(&store);
+	let mut txn = store.begin().unwrap();
+	txn.set(b"k", b"second").unwrap();
+	txn.commit().await.unwrap();
+	let second_ts = crate::test::support::last_commit_timestamp(&store);
+
+	let first = fork(&store, "main", "timestamp-retry", ForkPoint::AtTimestamp(first_ts)).unwrap();
+	let error = fork(&store, "main", "timestamp-retry", ForkPoint::AtTimestamp(second_ts))
+		.expect_err("a timestamp resolving to another version is not the same fork request");
+	assert!(error.to_string().contains("fork sequence"), "unexpected refusal: {error}");
+	assert_eq!(
+		crate::test::support::branch_fork_sequence(&store, "timestamp-retry"),
+		first.fork_seq
+	);
 }
 
 /// The catalog publish is the whole fork. After it, a crash needs no further
@@ -1185,6 +1232,51 @@ async fn the_sweep_reclaims_a_deleted_branch_s_tables_without_a_restart() {
 	assert_eq!(sst_count(&store), after_main, "a second sweep finds nothing left to do");
 }
 
+/// A tombstone is a transition fence, not a permanent catalog tenant. Once the
+/// sweep has removed the branch runtime, level state and authority lineage, the
+/// durable catalog must stop carrying the record or repeated branch churn will
+/// eventually hit `MAX_CATALOG_ENTRIES` with no live branches.
+#[test(tokio::test)]
+async fn the_sweep_retires_reclaimed_catalog_tombstones() {
+	let (store, temp) = create_store_with(|b| b);
+	let child = store.fork_branch("main", "ephemeral", ForkPoint::Head).unwrap();
+	let mut txn = child.begin().unwrap();
+	txn.set(b"owned", b"state").unwrap();
+	txn.commit().await.unwrap();
+	crate::test::support::flush_branch_to_table(&store, "ephemeral");
+	let child_id = child.info().unwrap().id;
+	let state_dir = crate::authority::publish::branch_state_dir(temp.path(), &child_id);
+	assert!(state_dir.exists(), "fixture must publish a branch-state lineage");
+	store.delete_branch("ephemeral").unwrap();
+
+	assert_eq!(
+		crate::test::support::catalog_record_count(&store),
+		2,
+		"delete must publish the tombstone before reclamation"
+	);
+	crate::test::support::sweep(&store);
+	assert_eq!(
+		crate::test::support::catalog_record_count(&store),
+		1,
+		"a fully reclaimed tombstone must release its catalog slot"
+	);
+	assert!(
+		!state_dir.exists(),
+		"retiring the catalog record must also retire its now-unreachable state lineage"
+	);
+
+	store.close().await.unwrap();
+	let reopened = TreeBuilder::new().with_path(temp.path().to_path_buf()).build().unwrap();
+	assert_eq!(
+		crate::test::support::catalog_record_count(&reopened),
+		1,
+		"the compacted catalog must be durable"
+	);
+	reopened
+		.fork_branch("main", "ephemeral", ForkPoint::Head)
+		.expect("the retired name can be reused without reviving the old generation");
+}
+
 /// Reclamation releases the WAL dependencies of the memtables it discards.
 ///
 /// Without this, freeing a branch's tables would pin its log segments forever —
@@ -1333,6 +1425,11 @@ async fn churning_branches_stays_bounded_without_a_restart() {
 		store.core.inner.branch_catalog.read().unwrap().list().count(),
 		1,
 		"only main survives"
+	);
+	assert_eq!(
+		crate::test::support::catalog_record_count(&store),
+		1,
+		"the churn must retire tombstones rather than merely hide them from list()"
 	);
 	let txn = store.begin().unwrap();
 	assert_eq!(txn.get(b"base").unwrap(), Some(b"v".to_vec()));

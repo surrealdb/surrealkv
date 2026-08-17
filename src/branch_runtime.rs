@@ -177,6 +177,19 @@ impl BranchRuntimeRegistry {
 		discarded
 	}
 
+	/// Whole-database restore replaces every foreign runtime. Keeping a runtime
+	/// that had no WAL rows in the restored checkpoint would leave its old active
+	/// memtable reachable and allow discarded future versions to reappear when
+	/// the global sequence advances again.
+	pub(crate) fn reset_to_default(&self) -> Result<()> {
+		let mut runtimes = self
+			.runtimes
+			.write()
+			.map_err(|_| Error::Other("branch runtime registry lock poisoned".to_string()))?;
+		runtimes.retain(|owner, _| *owner == BatchOwner::DEFAULT);
+		Ok(())
+	}
+
 	/// All live runtimes (flush selection, budget accounting, shutdown).
 	pub(crate) fn all(&self) -> Vec<Arc<BranchRuntime>> {
 		self.runtimes.read().map(|map| map.values().cloned().collect()).unwrap_or_default()

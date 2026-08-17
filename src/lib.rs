@@ -184,12 +184,11 @@ pub struct Options {
 	/// multiply `max_memtable_size`. A rotation forced by an oversized batch
 	/// right-sizes the replacement arena, so this is a floor, not a cap.
 	pub branch_memtable_size: usize,
-	/// Database-wide budget for the sum of all branch memtable arena
-	/// capacities (active + immutable). `None` preserves the single-branch
-	/// behavior (no budget). When the budget would be exceeded, the largest
-	/// active memtable is rotated and scheduled for flush before new
-	/// allocation proceeds.
-	pub write_buffer_budget: Option<u64>,
+	/// Soft database-wide mutable-memory pressure threshold. Crossing it rotates
+	/// the largest non-empty active memtable toward asynchronous flush. `None`
+	/// disables this pressure trigger. It is not a hard cap: immutable arenas
+	/// remain resident until their flushes complete.
+	pub write_buffer_soft_limit: Option<u64>,
 	/// A non-empty branch active memtable pinning a WAL segment at least this
 	/// many segments behind the active one is rotated toward flush — one
 	/// victim at a time (a trickle, never a mass flush) — so cold dirty
@@ -294,7 +293,7 @@ impl Default for Options {
 			level_count: 6,
 			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
 			branch_memtable_size: 2 * 1024 * 1024, // 2 MB
-			write_buffer_budget: None,
+			write_buffer_soft_limit: None,
 			wal_pinned_segment_limit: 8,
 			index_partition_size: 16384, // 16KB
 			enable_versioning: false,
@@ -411,9 +410,9 @@ impl Options {
 		self
 	}
 
-	/// Database-wide budget over all branch memtable arenas.
-	pub const fn with_write_buffer_budget(mut self, value: Option<u64>) -> Self {
-		self.write_buffer_budget = value;
+	/// Sets the database-wide soft pressure threshold for branch memtable arenas.
+	pub const fn with_write_buffer_soft_limit(mut self, value: Option<u64>) -> Self {
+		self.write_buffer_soft_limit = value;
 		self
 	}
 

@@ -12,6 +12,7 @@
 //!    depend on an internal field name. Where internals are genuinely needed, the reach is confined
 //!    here rather than spread across the test files.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use tempdir::TempDir;
@@ -188,6 +189,82 @@ pub(crate) fn rotate_wal(store: &Tree) {
 /// The WAL segment currently being appended to.
 pub(crate) fn active_wal_segment(store: &Tree) -> u64 {
 	store.core.inner.wal.read().get_active_log_number()
+}
+
+/// Current WAL dependency state, sampled against the active segment.
+pub(crate) fn wal_dependency_snapshot(
+	store: &Tree,
+) -> crate::wal::dependency::WalDependencySnapshot {
+	let active = active_wal_segment(store);
+	store.core.inner.wal_dependencies.snapshot(active)
+}
+
+/// Number of durable catalog records, including transition tombstones.
+pub(crate) fn catalog_record_count(store: &Tree) -> usize {
+	store.core.inner.branch_catalog.read().unwrap().all_records().count()
+}
+
+/// Last timestamp allocated by the commit timeline.
+pub(crate) fn last_commit_timestamp(store: &Tree) -> u64 {
+	store.core.inner.timeline.last_commit_ts()
+}
+
+/// The persisted fork sequence for one live branch.
+pub(crate) fn branch_fork_sequence(store: &Tree, name: &str) -> u64 {
+	store
+		.core
+		.inner
+		.branch_catalog
+		.read()
+		.unwrap()
+		.get_by_name(name)
+		.unwrap_or_else(|_| panic!("branch {name} must exist"))
+		.parent
+		.as_ref()
+		.unwrap_or_else(|| panic!("branch {name} must be a fork"))
+		.fork_seq
+}
+
+/// The durable retained floor for one live branch owner.
+pub(crate) fn branch_retained_floor(store: &Tree, name: &str) -> u64 {
+	let owner = {
+		let catalog = store.core.inner.branch_catalog.read().unwrap();
+		let record =
+			catalog.get_by_name(name).unwrap_or_else(|_| panic!("branch {name} must exist"));
+		crate::batch::BatchOwner {
+			branch: record.id,
+			generation: record.generation,
+		}
+	};
+	store.core.inner.level_manifest.read().unwrap().retained_floor(owner)
+}
+
+/// Runs one normal leveled compaction with the store's configured options.
+pub(crate) fn compact_leveled(store: &Tree) {
+	let strategy = Arc::new(crate::compaction::leveled::Strategy::from_options(Arc::clone(
+		&store.core.inner.opts,
+	)));
+	store.compact(strategy).unwrap();
+}
+
+/// Deterministically observes whether checkpoint holds the catalog fence while
+/// blocked inside its multi-file cut.
+pub(crate) fn checkpoint_holds_catalog_fence(store: &Arc<Tree>, checkpoint: &Path) -> bool {
+	let levels_guard = store.core.inner.level_manifest.write().unwrap();
+	let checkpoint_store = Arc::clone(store);
+	let checkpoint_path = checkpoint.to_path_buf();
+	let worker = std::thread::spawn(move || checkpoint_store.create_checkpoint(checkpoint_path));
+
+	let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+	while !checkpoint.exists() && std::time::Instant::now() < deadline {
+		std::thread::yield_now();
+	}
+	assert!(checkpoint.exists(), "checkpoint worker never entered the cut");
+	let catalog_is_fenced = store.core.inner.catalog_publish.try_lock().is_err();
+
+	drop(levels_guard);
+	worker.join().unwrap().unwrap();
+	catalog_is_fenced
 }
 
 /// SSTables at L0 belonging to a branch.

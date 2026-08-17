@@ -32,6 +32,10 @@ use crate::error::Result;
 #[allow(clippy::enum_variant_names)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum FaultPoint {
+	/// Failure after WAL append but before an immediate-durability sync returns.
+	WalSync,
+	/// Failure after WAL append when size-driven segment rotation is due.
+	WalRotate,
 	/// The catalog publish that commits every branch operation: create, fork,
 	/// delete, detach, TTL expiry, and the merge promotion edge.
 	CatalogPublish,

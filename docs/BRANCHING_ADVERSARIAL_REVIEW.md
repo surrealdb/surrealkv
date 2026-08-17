@@ -2,6 +2,12 @@
 
 Status: Architecture review
 
+> **As-built v2 follow-up (2026-08-17):** verified runtime defects, disputed-finding adjudication,
+> fixes, and red/green evidence are recorded in
+> [BRANCHING_V2_ADVERSARIAL_FIX_LOG.md](BRANCHING_V2_ADVERSARIAL_FIX_LOG.md). The remaining
+> whole-catalog publication cost is intentionally carried into this review's persistent-subobject
+> metadata design rather than marked fixed in the numbered-manifest runtime.
+
 Reviewed against:
 
 - SurrealKV `v2`, including the completed B+tree removal at `2c9e8f3`;

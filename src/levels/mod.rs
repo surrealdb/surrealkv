@@ -5,7 +5,6 @@ use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
-use iter::LevelManifestIterator;
 pub(crate) use level::{Level, Levels};
 
 use crate::authority::format::{BranchStateManifest, RootManifest};
@@ -38,7 +37,6 @@ pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64)
 /// Everything `reclaim_owner` removed, kept so a failed publish can put it back.
 pub(crate) struct ReclaimedOwner {
 	owner: BatchOwner,
-	position: usize,
 	levels: Levels,
 	state_version: Option<u64>,
 	retained_floor: Option<u64>,
@@ -90,7 +88,6 @@ pub(crate) struct ChangeSetRollback {
 	pub prev_last_sequence: u64,
 }
 
-mod iter;
 mod level;
 
 pub type HiddenSet = HashSet<u64>;
@@ -108,8 +105,9 @@ pub(crate) struct LevelManifest {
 	/// versions); see docs/FK_AUTHORITY_FORK_DESIGN.md.
 	pub(crate) authority: AuthorityStore,
 
-	/// Per-owner level sets. Small cardinality; ordered by first appearance.
-	levels_by_owner: Vec<(BatchOwner, Levels)>,
+	/// Per-owner level sets. Point reads address this by physical owner; branch
+	/// count must not enter the lookup cost.
+	levels_by_owner: HashMap<BatchOwner, Levels>,
 
 	/// Set of hidden tables that should not appear during compaction
 	pub(crate) hidden_set: HiddenSet,
@@ -169,7 +167,10 @@ impl LevelManifest {
 		Self {
 			fault_policy: Arc::clone(&opts.fault_policy),
 			authority,
-			levels_by_owner: vec![(BatchOwner::DEFAULT, Self::initialize_levels(opts.level_count))],
+			levels_by_owner: HashMap::from([(
+				BatchOwner::DEFAULT,
+				Self::initialize_levels(opts.level_count),
+			)]),
 			hidden_set: HashSet::with_capacity(10),
 			next_table_id: Arc::new(AtomicU64::new(1)),
 			state_versions: HashMap::new(),
@@ -201,7 +202,7 @@ impl LevelManifest {
 		validate_wal_log_number(&opts.wal_dir(), log_number)?;
 
 		let mut seen_table_ids: HashMap<u64, BatchOwner> = HashMap::new();
-		let mut levels_by_owner: Vec<(BatchOwner, Levels)> = Vec::new();
+		let mut levels_by_owner: HashMap<BatchOwner, Levels> = HashMap::new();
 		let mut state_versions: HashMap<BatchOwner, u64> = HashMap::new();
 		let mut retained_floors: HashMap<BatchOwner, u64> = HashMap::new();
 		let mut last_sequence = root.map(|r| r.visible_seq).unwrap_or(0);
@@ -226,7 +227,7 @@ impl LevelManifest {
 				// Never flushed: legitimately no state lineage. The DEFAULT
 				// owner still needs its (empty) runtime level set.
 				if owner == BatchOwner::DEFAULT {
-					levels_by_owner.push((owner, Self::initialize_levels(opts.level_count)));
+					levels_by_owner.insert(owner, Self::initialize_levels(opts.level_count));
 				}
 				continue;
 			};
@@ -271,13 +272,12 @@ impl LevelManifest {
 			if state.retained_floor_seq > 0 {
 				retained_floors.insert(owner, state.retained_floor_seq);
 			}
-			levels_by_owner.push((owner, Levels(levels_vec)));
+			levels_by_owner.insert(owner, Levels(levels_vec));
 		}
 
-		if !levels_by_owner.iter().any(|(owner, _)| *owner == BatchOwner::DEFAULT) {
-			levels_by_owner
-				.insert(0, (BatchOwner::DEFAULT, Self::initialize_levels(opts.level_count)));
-		}
+		levels_by_owner
+			.entry(BatchOwner::DEFAULT)
+			.or_insert_with(|| Self::initialize_levels(opts.level_count));
 
 		// The watermark from root is the floor; states may reference ids the
 		// root never recorded (a state published, then the root publish was
@@ -313,7 +313,7 @@ impl LevelManifest {
 		Self {
 			fault_policy: Arc::new(crate::failpoints::NoFaults),
 			authority: AuthorityStore::new(path, [0; 16]),
-			levels_by_owner: vec![(BatchOwner::DEFAULT, levels)],
+			levels_by_owner: HashMap::from([(BatchOwner::DEFAULT, levels)]),
 			hidden_set: HashSet::new(),
 			next_table_id,
 			state_versions: HashMap::new(),
@@ -329,15 +329,14 @@ impl LevelManifest {
 	/// Level set for one physical owner. This is the only read access to
 	/// levels; owner-blind level iteration deliberately does not exist.
 	pub(crate) fn levels_for(&self, owner: BatchOwner) -> Option<&Levels> {
-		self.levels_by_owner
-			.iter()
-			.find(|(set_owner, _)| *set_owner == owner)
-			.map(|(_, levels)| levels)
+		self.levels_by_owner.get(&owner)
 	}
 
 	/// Every physical owner that currently has a level set, default first.
 	pub(crate) fn owners(&self) -> Vec<BatchOwner> {
-		self.levels_by_owner.iter().map(|(owner, _)| *owner).collect()
+		let mut owners: Vec<_> = self.levels_by_owner.keys().copied().collect();
+		owners.sort_unstable();
+		owners
 	}
 
 	/// Drops a reclaimed owner's entire durable footprint from the runtime
@@ -349,8 +348,7 @@ impl LevelManifest {
 	/// without waiting for a restart. The state lineage on disk is left alone —
 	/// metadata pruning caps it, and nothing loads a deleted branch's state.
 	pub(crate) fn reclaim_owner(&mut self, owner: BatchOwner) -> Option<ReclaimedOwner> {
-		let position = self.levels_by_owner.iter().position(|(set, _)| *set == owner)?;
-		let (_, levels) = self.levels_by_owner.remove(position);
+		let levels = self.levels_by_owner.remove(&owner)?;
 		let state_version = self.state_versions.remove(&owner);
 		let retained_floor = self.retained_floors.remove(&owner);
 		let mut tables = Vec::new();
@@ -364,7 +362,6 @@ impl LevelManifest {
 		}
 		Some(ReclaimedOwner {
 			owner,
-			position,
 			levels,
 			state_version,
 			retained_floor,
@@ -382,14 +379,12 @@ impl LevelManifest {
 	pub(crate) fn restore_owner(&mut self, reclaimed: ReclaimedOwner) {
 		let ReclaimedOwner {
 			owner,
-			position,
 			levels,
 			state_version,
 			retained_floor,
 			..
 		} = reclaimed;
-		let position = position.min(self.levels_by_owner.len());
-		self.levels_by_owner.insert(position, (owner, levels));
+		self.levels_by_owner.insert(owner, levels);
 		if let Some(version) = state_version {
 			self.state_versions.insert(owner, version);
 		}
@@ -417,10 +412,7 @@ impl LevelManifest {
 	}
 
 	fn levels_for_mut(&mut self, owner: BatchOwner) -> Option<&mut Levels> {
-		self.levels_by_owner
-			.iter_mut()
-			.find(|(set_owner, _)| *set_owner == owner)
-			.map(|(_, levels)| levels)
+		self.levels_by_owner.get_mut(&owner)
 	}
 
 	/// Level set for the retained default branch. Explicit convenience for
@@ -442,7 +434,7 @@ impl LevelManifest {
 	fn ensure_owner_levels(&mut self, owner: BatchOwner) -> &mut Levels {
 		if self.levels_for(owner).is_none() {
 			let depth = self.depth() as usize;
-			self.levels_by_owner.push((owner, Levels::new(depth, 0)));
+			self.levels_by_owner.insert(owner, Levels::new(depth, 0));
 		}
 		self.levels_for_mut(owner).expect("owner level set was just ensured")
 	}
@@ -563,7 +555,9 @@ impl LevelManifest {
 	/// orphan cleanup, recovery accounting). Read paths must use
 	/// [`Self::levels_for`] instead — never iterate globally and filter.
 	pub(crate) fn iter(&self) -> impl Iterator<Item = Arc<Table>> + '_ {
-		LevelManifestIterator::new(self)
+		self.levels_by_owner.values().flat_map(|levels| {
+			levels.get_levels().iter().flat_map(|level| level.tables.iter().cloned())
+		})
 	}
 
 	/// Lifecycle-only: all tables across all owners, keyed by globally unique
@@ -748,16 +742,25 @@ impl LevelManifest {
 		// One hint per branch: after delete/recreate within one process the
 		// map can hold a dead generation's entry — keep the newest
 		// generation only, and sort strictly by branch id (format law).
-		let mut hints: Vec<(crate::BranchId, crate::BranchGeneration, u64)> = Vec::new();
+		let mut hints_by_branch: HashMap<crate::BranchId, (crate::BranchGeneration, u64)> =
+			HashMap::new();
 		for (owner, version) in &self.state_versions {
-			match hints.iter_mut().find(|(branch, _, _)| *branch == owner.branch) {
-				Some(existing) if existing.1 .0 < owner.generation.0 => {
-					*existing = (owner.branch, owner.generation, *version);
+			match hints_by_branch.entry(owner.branch) {
+				std::collections::hash_map::Entry::Occupied(mut existing)
+					if existing.get().0 < owner.generation =>
+				{
+					existing.insert((owner.generation, *version));
 				}
-				Some(_) => {}
-				None => hints.push((owner.branch, owner.generation, *version)),
+				std::collections::hash_map::Entry::Occupied(_) => {}
+				std::collections::hash_map::Entry::Vacant(slot) => {
+					slot.insert((owner.generation, *version));
+				}
 			}
 		}
+		let mut hints: Vec<_> = hints_by_branch
+			.into_iter()
+			.map(|(branch, (generation, version))| (branch, generation, version))
+			.collect();
 		hints.sort_by_key(|hint| hint.0 .0);
 
 		let root = RootManifest {

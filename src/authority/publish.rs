@@ -84,7 +84,7 @@ pub(crate) fn publish_version(
 	outcome
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<()> {
 	File::open(dir).and_then(|handle| handle.sync_all())?;
 	Ok(())
 }

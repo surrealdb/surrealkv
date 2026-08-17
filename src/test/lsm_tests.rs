@@ -493,6 +493,106 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 	}
 }
 
+/// Whole-database restore must replace every branch runtime, not only the
+/// default runtime reached through `CoreInner::Deref`. A stale foreign
+/// memtable can be temporarily hidden by the rewound sequence and then become
+/// visible again when an unrelated post-restore commit advances the clock.
+#[test(tokio::test)]
+async fn checkpoint_restore_discards_non_default_runtime_writes_permanently() {
+	let temp = create_temp_directory();
+	let path = temp.path().join("db");
+	let checkpoint = temp.path().join("checkpoint");
+	let store = TreeBuilder::new().with_path(path).build().unwrap();
+	let child = store.fork_branch("main", "work", crate::ForkPoint::Head).unwrap();
+
+	let mut txn = child.begin().unwrap();
+	txn.set(b"k", b"checkpoint-value").unwrap();
+	txn.commit().await.unwrap();
+	store.create_checkpoint(&checkpoint).unwrap();
+
+	let mut txn = child.begin().unwrap();
+	txn.set(b"k", b"discarded-future").unwrap();
+	txn.commit().await.unwrap();
+	let txn = child.begin().unwrap();
+	assert_eq!(txn.get(b"k").unwrap(), Some(b"discarded-future".to_vec()));
+	drop(txn);
+
+	store.restore_from_checkpoint(&checkpoint).unwrap();
+	let txn = child.begin().unwrap();
+	assert_eq!(txn.get(b"k").unwrap(), Some(b"checkpoint-value".to_vec()));
+	drop(txn);
+
+	// Reuse/advance the discarded sequence on another owner. The stale child
+	// row must not reappear when it falls below the new visible head.
+	let mut txn = store.begin().unwrap();
+	txn.set(b"advance", b"clock").unwrap();
+	txn.commit().await.unwrap();
+	let txn = child.begin().unwrap();
+	assert_eq!(
+		txn.get(b"k").unwrap(),
+		Some(b"checkpoint-value".to_vec()),
+		"the pre-restore foreign memtable must be unreachable forever"
+	);
+}
+
+/// Restoring a checkpoint from another database replaces the database
+/// identity. Catalog and root/state publication must use that same restored
+/// authority afterward; retaining the originally opened catalog authority
+/// creates two identities and makes the next reopen fail closed.
+#[test(tokio::test)]
+async fn cross_database_restore_keeps_one_authority_identity_after_new_publications() {
+	let temp = create_temp_directory();
+	let source_path = temp.path().join("source");
+	let target_path = temp.path().join("target");
+	let checkpoint = temp.path().join("checkpoint");
+
+	let source = TreeBuilder::new().with_path(source_path).build().unwrap();
+	let mut txn = source.begin().unwrap();
+	txn.set(b"from-source", b"checkpoint").unwrap();
+	txn.commit().await.unwrap();
+	source.create_checkpoint(&checkpoint).unwrap();
+
+	let target = TreeBuilder::new().with_path(target_path.clone()).build().unwrap();
+	let mut txn = target.begin().unwrap();
+	txn.set(b"from-target", b"discarded").unwrap();
+	txn.commit().await.unwrap();
+	target.restore_from_checkpoint(&checkpoint).unwrap();
+	target.create_branch("post-restore").unwrap();
+	let mut txn = target.begin().unwrap();
+	txn.set(b"after-restore", b"published").unwrap();
+	txn.commit().await.unwrap();
+	target.drain_flushes_synchronously().unwrap();
+	target.close().await.unwrap();
+
+	let reopened = TreeBuilder::new()
+		.with_path(target_path)
+		.build()
+		.expect("catalog and root publications after restore must share one db_id");
+	let txn = reopened.begin().unwrap();
+	assert_eq!(txn.get(b"from-source").unwrap(), Some(b"checkpoint".to_vec()));
+	assert_eq!(txn.get(b"from-target").unwrap(), None);
+	assert_eq!(txn.get(b"after-restore").unwrap(), Some(b"published".to_vec()));
+	assert!(reopened.branch("post-restore").is_ok());
+}
+
+/// Checkpoint creation must hold the catalog publication fence for its entire
+/// multi-file cut. Holding the level manifest here deterministically parks the
+/// checkpoint after it creates the destination directory; at that point a
+/// missing catalog fence is directly observable without relying on a racy
+/// corrupt-checkpoint outcome.
+#[test(tokio::test)]
+async fn checkpoint_holds_catalog_fence_across_the_consistent_cut() {
+	let temp = create_temp_directory();
+	let path = temp.path().join("db");
+	let checkpoint = temp.path().join("checkpoint");
+	let store = Arc::new(TreeBuilder::new().with_path(path).build().unwrap());
+
+	assert!(
+		crate::test::support::checkpoint_holds_catalog_fence(&store, &checkpoint),
+		"catalog publication remained possible while checkpoint files were being cut"
+	);
+}
+
 #[test(tokio::test)]
 async fn test_simple_range_seek() {
 	let temp_dir = create_temp_directory();

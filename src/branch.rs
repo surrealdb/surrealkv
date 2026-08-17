@@ -44,11 +44,11 @@ pub(crate) const MAX_VIEW_DEPTH: usize = 64;
 /// Every sequence cap at which some durable reader still reads one owner
 /// exactly — what its compaction must preserve (design §3.3a).
 ///
-/// Two kinds, making the same promise. A live child's fork anchor: its
-/// inherited view is re-resolved at that cap on every read. And a live merge
-/// edge's target-side base: the next merge from that source compares the target
-/// against how it stood there. The second kind was missing until FK6, which is
-/// why a parent compaction could silently move a merge's base.
+/// Three kinds, making the same promise. A live child's fork anchor: its
+/// inherited view is re-resolved at that cap on every read. A live merge edge's
+/// target-side head preserves durable edge history. And the edge's source-side
+/// cursor preserves the actual three-way base: merging into a target never
+/// mutates the source or incorporates target-only values into it.
 ///
 /// A single anchor cannot stand in for several. Pinning only the lowest leaves
 /// a child forked higher up reading a version that was never current at its
@@ -376,9 +376,8 @@ impl BranchCatalog {
 		Ok(())
 	}
 
-	/// Every cap `(owner, generation)`'s compaction must keep readable: the fork
-	/// anchor of each Active child, and the target-side base of each merge edge
-	/// whose source is still live (§3.3a of the FK design, as corrected by FK6).
+	/// Every cap `(owner, generation)`'s compaction must keep readable: child fork
+	/// anchors, target-side merge heads, and source-side consumed merge cursors.
 	///
 	/// A stale edge pins nothing. Its source is gone, so no future merge can
 	/// compare against that base — and holding history for a branch that no
@@ -404,6 +403,14 @@ impl BranchCatalog {
 					.iter()
 					.filter(|edge| self.live_record(edge.source, edge.source_generation).is_some())
 					.map(|edge| edge.target_through_seq),
+			);
+			anchors.extend(
+				self.records
+					.values()
+					.filter(|target| !target.deleted)
+					.flat_map(|target| target.merges.iter())
+					.filter(|edge| edge.source == owner && edge.source_generation == generation)
+					.map(|edge| edge.source_through_seq),
 			);
 		}
 		RetentionAnchors::from_unsorted(anchors)
@@ -514,6 +521,23 @@ impl BranchCatalog {
 	/// Live branches in catalog order (tombstones excluded).
 	pub(crate) fn list(&self) -> impl Iterator<Item = &BranchRecord> {
 		self.live_names.values().filter_map(|id| self.records.get(id))
+	}
+
+	/// Permanently removes deletion fences after runtime, level and authority
+	/// reclamation has completed. Branch generations are globally monotone and
+	/// physical owners include that generation, so old transactions and WAL rows
+	/// remain fenced even if an injected ID source later repeats a BranchId.
+	pub(crate) fn retire_deleted(&mut self) -> usize {
+		let retired: std::collections::BTreeSet<_> =
+			self.records.values().filter(|record| record.deleted).map(|record| record.id).collect();
+		if retired.is_empty() {
+			return 0;
+		}
+		self.records.retain(|id, _| !retired.contains(id));
+		for record in self.records.values_mut() {
+			record.merges.retain(|edge| !retired.contains(&edge.source));
+		}
+		retired.len()
 	}
 
 	pub(crate) fn delete(&mut self, id: BranchId, deleted_at_seq: u64) -> KernelResult<bool> {
@@ -675,9 +699,9 @@ impl BranchCatalog {
 			.collect()
 	}
 
-	/// Maximum version anchor across ALL records including tombstones: the
-	/// recovered clock must never fall below a catalog-referenced sequence,
-	/// or generation fences would eat legitimate new commits.
+	/// Maximum version anchor across the records still represented by the latest
+	/// catalog. Retired tombstones need no clock anchor: their data and authority
+	/// lineage are already gone, while `next_generation` preserves fencing.
 	pub(crate) fn max_version_anchor(&self) -> u64 {
 		self.records
 			.values()
@@ -858,7 +882,7 @@ mod tests {
 		let edge = |source, generation, target_through| crate::authority::format::MergeEdge {
 			source,
 			source_generation: generation,
-			source_through_seq: 0,
+			source_through_seq: target_through,
 			target_through_seq: target_through,
 		};
 		catalog
@@ -872,6 +896,11 @@ mod tests {
 			anchors([10, 20, 300, 400]),
 			"a merge edge pins the base the next merge from that source reads at"
 		);
+		assert_eq!(
+			catalog.retention_anchors(child, child_record.generation),
+			anchors([300]),
+			"the source-side state consumed by a merge remains an exact three-way base"
+		);
 
 		catalog.delete(gone, 99).unwrap();
 		assert_eq!(
@@ -879,9 +908,10 @@ mod tests {
 			anchors([10, 300]),
 			"a deleted source releases both its fork anchor and its edge"
 		);
-		assert!(
-			catalog.retention_anchors(child, child_record.generation).is_empty(),
-			"a childless branch nothing merges into pins nothing"
+		assert_eq!(
+			catalog.retention_anchors(child, child_record.generation),
+			anchors([300]),
+			"a live source keeps its consumed source-side merge base pinned"
 		);
 	}
 }

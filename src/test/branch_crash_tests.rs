@@ -190,7 +190,7 @@ async fn retention_anchors_and_what_they_pin_survive_a_restart() {
 			.unwrap()
 			.retained_floor(crate::batch::BatchOwner::DEFAULT);
 		assert!(
-			store.metrics().unwrap().pin_retained_versions > 0,
+			store.metrics().unwrap().pin_retained_versions_total > 0,
 			"the fixture must have made the parent hold a version for the child"
 		);
 		store.close().await.unwrap();

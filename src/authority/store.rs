@@ -14,6 +14,8 @@ use super::publish::{
 	read_version,
 	resolve_from_hint,
 	root_dir,
+	sync_dir,
+	versions_in,
 	PublishOutcome,
 };
 use crate::error::{Error, Result};
@@ -192,6 +194,24 @@ impl AuthorityStore {
 			)?;
 		}
 		Ok(removed)
+	}
+
+	/// Removes one deleted owner's now-unreachable state lineage. The durable
+	/// tombstone remains in the catalog until this succeeds, so a failed removal
+	/// is retried by maintenance and cannot make a live owner disappear.
+	pub(crate) fn retire_state_lineage(&self, branch: BranchId) -> Result<usize> {
+		let dir = branch_state_dir(&self.base, &branch);
+		let versions = versions_in(&dir, STATE_EXT)?.len();
+		match std::fs::remove_dir_all(&dir) {
+			Ok(()) => {
+				if let Some(parent) = dir.parent() {
+					sync_dir(parent)?;
+				}
+				Ok(versions)
+			}
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+			Err(error) => Err(error.into()),
+		}
 	}
 
 	pub(crate) fn publish_state(&self, manifest: &BranchStateManifest) -> Result<PublishOutcome> {

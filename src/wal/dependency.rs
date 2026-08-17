@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use parking_lot::Mutex;
 
@@ -14,6 +14,7 @@ pub(crate) struct WalDependencySnapshot {
 	pub(crate) replay_floor: u64,
 	pub(crate) in_flight_count: usize,
 	pub(crate) component_count: usize,
+	pub(crate) pinned_segment_count: usize,
 }
 
 #[derive(Default)]
@@ -110,11 +111,25 @@ impl WalDependencyTracker {
 			.min();
 		let replay_floor =
 			in_flight_floor.into_iter().chain(component_floor).fold(current_wal_segment, u64::min);
+		let pinned_segment_count = state
+			.in_flight
+			.values()
+			.chain(
+				state
+					.components
+					.iter()
+					.filter(|(id, _)| Some(**id) != excluded_component)
+					.map(|(_, segment)| segment),
+			)
+			.copied()
+			.collect::<BTreeSet<_>>()
+			.len();
 		WalDependencySnapshot {
 			revision: state.revision,
 			replay_floor,
 			in_flight_count: state.in_flight.len(),
 			component_count: state.components.len(),
+			pinned_segment_count,
 		}
 	}
 
