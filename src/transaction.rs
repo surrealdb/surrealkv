@@ -160,7 +160,13 @@ pub struct HistoryOptions {
 	/// Only versions within this range are returned.
 	/// Default: None (no timestamp filtering)
 	pub ts_range: Option<(u64, u64)>,
-	/// Optional limit on the total number of entries/versions to return.
+	/// Optional limit on the number of entries/versions to return per traversal.
+	///
+	/// The budget is spent as entries are yielded and is carried across a change
+	/// of direction, so a walk that runs forward and then back yields at most
+	/// `limit` entries in total. An explicit `seek_first`/`seek_last`/`seek`
+	/// starts a new traversal and restarts the budget.
+	///
 	/// Default: None (no limit)
 	pub limit: Option<usize>,
 }
@@ -183,7 +189,8 @@ impl HistoryOptions {
 		self
 	}
 
-	/// Set a limit on the total number of entries/versions to return.
+	/// Set a limit on the number of entries/versions to return per traversal.
+	/// See [`HistoryOptions::limit`].
 	pub fn with_limit(mut self, limit: usize) -> Self {
 		self.limit = Some(limit);
 		self
@@ -943,6 +950,111 @@ enum CurrentSource {
 	None,
 }
 
+/// Re-anchors the *non-current* sub-cursor when a write-set merge iterator
+/// reverses direction. Shared by `TransactionRangeIterator` and
+/// `TransactionHistoryIterator`, which are otherwise byte-identical here.
+///
+/// # Why the invalid case re-anchors rather than seeks
+///
+/// A plain `seek_first`/`seek_last` would be wrong for any `I` that carries state
+/// accumulated across the traversal, because a seek legitimately resets it —
+/// `HistoryIterator` refunds its whole `limit` budget. This is a continuation of a
+/// traversal in progress, not a new one, so it goes through
+/// [`LSMIterator::reanchor_first`]/[`reanchor_last`](LSMIterator::reanchor_last),
+/// whose contract is exactly "reposition without starting over". The default
+/// implementations are the plain seeks, so position-only iterators are unaffected.
+///
+/// Deciding this with a *predicate* instead — asking the iterator whether it is
+/// exhausted and skipping the re-anchor if not — does not work: an iterator can
+/// stop early without recording that it did, and it leaves the reverse pass no
+/// way to run on the remaining budget. Hence an operation, not a branch.
+///
+/// # The invariant this restores
+///
+/// After a positioning call, the merge iterator holds two sub-cursors and
+/// `current_source` names the one sitting on the emitted entry. The *other*
+/// cursor is, by construction, on the nearest entry at or beyond the emitted one
+/// in the current direction — strictly beyond it in the ordinary case, or exactly
+/// on it in the RYOW case where both sources hold the same key and the write-set
+/// copy won (`is_key_equal`) — or exhausted, meaning it has no such entry at all.
+///
+/// Reversing direction has to turn that into "the nearest entry strictly beyond
+/// the emitted one in the NEW direction", for the other cursor only; the current
+/// cursor is stepped afterwards by the caller's ordinary advance. Stepping the
+/// other cursor once handles both shapes: from strictly-beyond it lands on the
+/// neighbour on the far side of the emitted entry, and from on-the-emitted-entry
+/// it lands on that same neighbour. Three cases:
+///
+/// - the other cursor is positioned: step it one entry in the new direction;
+/// - the other cursor is invalid: either it ran out of entries, in which case every one of them
+///   lies on the new direction's side of the emitted entry, or it stopped early under a policy that
+///   is still in force. Both are served by re-anchoring it to its extreme entry — a still-binding
+///   policy re-applies itself there and the cursor simply stays invalid.
+///
+/// # What this replaced
+///
+/// ```ignore
+/// if !inner.valid() || !self.ws_valid() {
+///     self.seek_ws_first();   // seek_ws_last() in the prev() mirror
+/// } else if self.current_source == CurrentSource::Snapshot {
+///     self.advance_ws();
+/// } else {
+///     inner.next()?;
+/// }
+/// ```
+///
+/// That block had two independent faults, both live in three copies:
+///
+/// 1. **Teleport.** The guard fired on `!inner.valid()` — permanently true for an uncommitted
+///    transaction with no committed data — and then reset the *write-set* cursor to index 0 (or the
+///    last index). `advance_ws()` walked it straight back, so the iterator re-emitted the entry it
+///    was already on and failed to invalidate at the range's edge.
+/// 2. **Missing re-anchor.** When the exhausted cursor was `inner` and the current source was the
+///    write-set, `inner` was never repositioned at all — only the `current_source == Snapshot`
+///    branch ever touched it — so committed entries behind the cursor became unreachable and
+///    iteration invalidated one step early.
+///
+/// `CurrentSource::None` cannot reach here: `next()`/`prev()` return early on an
+/// invalid iterator. It is handled as a no-op so this stays total.
+fn reanchor_other_source<I: LSMIterator>(
+	inner: &mut I,
+	ws_pos: &mut Option<usize>,
+	ws_len: usize,
+	current_source: CurrentSource,
+	new_direction: MergeDirection,
+) -> Result<()> {
+	match current_source {
+		CurrentSource::None => {}
+		// The write-set is the other source.
+		CurrentSource::Snapshot => {
+			*ws_pos = match (*ws_pos, new_direction) {
+				(Some(pos), MergeDirection::Forward) => (pos + 1 < ws_len).then_some(pos + 1),
+				(Some(pos), MergeDirection::Backward) => pos.checked_sub(1),
+				(None, MergeDirection::Forward) => (ws_len > 0).then_some(0),
+				(None, MergeDirection::Backward) => ws_len.checked_sub(1),
+			};
+		}
+		// The snapshot / history iterator is the other source.
+		CurrentSource::WriteSet => match (inner.valid(), new_direction) {
+			(true, MergeDirection::Forward) => {
+				inner.next()?;
+			}
+			(true, MergeDirection::Backward) => {
+				inner.prev()?;
+			}
+			// Re-anchor, NOT seek: this continues a traversal already in progress,
+			// so any budget the cursor has spent must survive. See above.
+			(false, MergeDirection::Forward) => {
+				inner.reanchor_first()?;
+			}
+			(false, MergeDirection::Backward) => {
+				inner.reanchor_last()?;
+			}
+		},
+	}
+	Ok(())
+}
+
 /// An iterator that performs a merging scan over a transaction's snapshot and
 /// write set. Implements LSMIterator for zero-copy iteration.
 pub(crate) struct TransactionRangeIterator<'a> {
@@ -1257,18 +1369,26 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 			return self.seek_first();
 		}
 
+		// Stepping off an already-invalid iterator is a no-op: an exhausted
+		// iterator stays exhausted until an explicit re-seek. Checked before the
+		// direction-change fixup so that fixup can never mutate the sub-cursors
+		// of an iterator that is about to report `false` anyway.
+		if !self.valid() {
+			return Ok(false);
+		}
+
 		// Direction change: backward → forward
 		if self.direction != MergeDirection::Forward {
 			self.direction = MergeDirection::Forward;
 			self.is_key_equal = false;
 
-			if !self.snapshot_iter.valid() || !self.ws_valid() {
-				self.seek_ws_first();
-			} else if self.current_source == CurrentSource::Snapshot {
-				self.advance_ws();
-			} else {
-				self.snapshot_iter.next()?;
-			}
+			reanchor_other_source(
+				&mut self.snapshot_iter,
+				&mut self.ws_pos,
+				self.write_set_entries.len(),
+				self.current_source,
+				MergeDirection::Forward,
+			)?;
 
 			// Check if now at equal keys
 			if self.snapshot_iter.valid()
@@ -1304,18 +1424,23 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 			return self.seek_last();
 		}
 
+		// See the matching note in `next()`.
+		if !self.valid() {
+			return Ok(false);
+		}
+
 		// Direction change: forward → backward
 		if self.direction != MergeDirection::Backward {
 			self.direction = MergeDirection::Backward;
 			self.is_key_equal = false;
 
-			if !self.snapshot_iter.valid() || !self.ws_valid() {
-				self.seek_ws_last();
-			} else if self.current_source == CurrentSource::Snapshot {
-				self.advance_ws();
-			} else {
-				self.snapshot_iter.prev()?;
-			}
+			reanchor_other_source(
+				&mut self.snapshot_iter,
+				&mut self.ws_pos,
+				self.write_set_entries.len(),
+				self.current_source,
+				MergeDirection::Backward,
+			)?;
 
 			// Check if now at equal keys
 			if self.snapshot_iter.valid()
@@ -1953,18 +2078,23 @@ impl<'a> TransactionHistoryIterator<'a> {
 			return self.seek_first();
 		}
 
+		// See the matching note in `TransactionRangeIterator::next`.
+		if !self.valid() {
+			return Ok(false);
+		}
+
 		// Direction change: backward → forward
 		if self.direction != MergeDirection::Forward {
 			self.direction = MergeDirection::Forward;
 			self.is_key_equal = false;
 
-			if !self.inner.valid() || !self.ws_valid() {
-				self.seek_ws_first();
-			} else if self.current_source == CurrentSource::Snapshot {
-				self.advance_ws();
-			} else {
-				self.inner.next()?;
-			}
+			reanchor_other_source(
+				&mut self.inner,
+				&mut self.ws_pos,
+				self.write_set_entries.len(),
+				self.current_source,
+				MergeDirection::Forward,
+			)?;
 
 			// Check if now at equal (key, timestamp)
 			if self.inner.valid()
@@ -2005,18 +2135,23 @@ impl<'a> TransactionHistoryIterator<'a> {
 			return self.seek_last();
 		}
 
+		// See the matching note in `TransactionRangeIterator::next`.
+		if !self.valid() {
+			return Ok(false);
+		}
+
 		// Direction change: forward → backward
 		if self.direction != MergeDirection::Backward {
 			self.direction = MergeDirection::Backward;
 			self.is_key_equal = false;
 
-			if !self.inner.valid() || !self.ws_valid() {
-				self.seek_ws_last();
-			} else if self.current_source == CurrentSource::Snapshot {
-				self.advance_ws();
-			} else {
-				self.inner.prev()?;
-			}
+			reanchor_other_source(
+				&mut self.inner,
+				&mut self.ws_pos,
+				self.write_set_entries.len(),
+				self.current_source,
+				MergeDirection::Backward,
+			)?;
 
 			// Check if now at equal (key, timestamp)
 			if self.inner.valid()
