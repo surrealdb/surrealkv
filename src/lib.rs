@@ -1024,6 +1024,48 @@ pub trait LSMIterator {
 	/// Check if positioned on valid entry.
 	fn valid(&self) -> bool;
 
+	/// Re-anchor to the first entry as a CONTINUATION of the traversal already in
+	/// progress, rather than as a fresh, user-initiated seek. See
+	/// [`reanchor_last`](Self::reanchor_last) for the full contract.
+	fn reanchor_first(&mut self) -> Result<bool> {
+		self.seek_first()
+	}
+
+	/// Re-anchor to the last entry as a CONTINUATION of the traversal already in
+	/// progress, rather than as a fresh, user-initiated seek.
+	///
+	/// A merge layer that owns two sub-cursors has to reposition the one it is not
+	/// currently emitting from when iteration reverses direction. If that cursor
+	/// has gone invalid, "reposition" means "anchor to your extreme entry" — but
+	/// it must NOT mean "start over", because the traversal is not starting over.
+	///
+	/// The distinction is invisible for an iterator whose only state is a
+	/// position: for those the default here, a plain `seek_first`/`seek_last`, is
+	/// exactly right. It matters for an iterator carrying budget or policy state
+	/// accumulated over the traversal — an entry limit, a quota, a deadline — where
+	/// a user-initiated seek legitimately resets that state and an internal
+	/// re-anchor legitimately must not. Such an implementation MUST override these
+	/// two methods to reposition while preserving what it has already spent;
+	/// otherwise the reverse pass silently runs on a refunded budget and yields
+	/// entries the policy had excluded. `HistoryIterator` is the one implementation
+	/// in-tree that needs the override.
+	///
+	/// Note also that `valid()` cannot be used to tell the two situations apart —
+	/// an iterator stopped by a policy and one that simply ran out of data both
+	/// report `false`, and an implementation may reach the former without ever
+	/// recording it. That is precisely why this is an operation on the iterator
+	/// rather than a predicate the caller branches on.
+	///
+	/// One latent case worth knowing about: `TransactionHistoryIterator` takes the
+	/// default even though it wraps a `HistoryIterator` that does not. Its own
+	/// `valid()` is `current_source != None`, which goes false exactly when the
+	/// inner history source is policy-stopped and the write set is spent, so if it
+	/// were ever nested as the `I` of another merge layer it would inherit the
+	/// default and forward a budget-resetting seek. Nothing nests it today.
+	fn reanchor_last(&mut self) -> Result<bool> {
+		self.seek_last()
+	}
+
 	/// Get current key (zero-copy). Caller must check valid() first.
 	///
 	/// Returns an `InternalKeyRef` which provides access to:

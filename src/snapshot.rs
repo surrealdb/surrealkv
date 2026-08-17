@@ -1409,11 +1409,75 @@ impl<'a> HistoryIterator<'a> {
 		self.backward_buffer_index = None;
 	}
 
-	fn reset_all_state(&mut self) {
+	/// Everything `reset_all_state` clears EXCEPT the `limit` budget counter.
+	///
+	/// `limit_reached` is cleared here rather than preserved because it is a
+	/// derived flag: `skip_to_valid_forward` and `collect_user_key_backward`
+	/// re-raise it from `entries_returned` against `limit` on the way out.
+	fn reset_position_state(&mut self) {
 		self.reset_forward_state();
 		self.clear_backward_buffer();
-		self.entries_returned = 0;
 		self.limit_reached = false;
+	}
+
+	fn reset_all_state(&mut self) {
+		self.reset_position_state();
+		self.entries_returned = 0;
+	}
+
+	/// Shared body of `seek_first`/`seek_last` and of the `reanchor_*` methods a
+	/// merge layer uses to reposition this iterator mid-traversal.
+	///
+	/// `reset_budget` is the sole difference between the two: a seek the user
+	/// asked for restarts the `limit` budget, an internal re-anchor continues on
+	/// whatever is left of it.
+	fn anchor(&mut self, direction: MergeDirection, reset_budget: bool) -> Result<bool> {
+		self.direction = direction;
+		self.reset_position_state();
+		if reset_budget {
+			self.entries_returned = 0;
+		}
+
+		// NOTE: `initialized` is set inside each arm, AFTER the inner seek, to
+		// match the originals and `seek()` below. On the success path the
+		// placement is invisible, but hoisting it above the seek would leave the
+		// iterator `initialized` on a seek error, so a later `next()` would take
+		// the normal-iteration branch and report `Ok(false)` instead of retrying
+		// via `seek_first()`.
+		match direction {
+			MergeDirection::Forward => {
+				if self.ts_range.is_some() {
+					// Seek to (lower_bound or empty, ts_end) to skip entries above range
+					let ts = self.ts_range.map(|(_, end)| end).unwrap_or(u64::MAX);
+					let seek_key = InternalKey::new(
+						self.lower_bound.clone().unwrap_or_default(),
+						u64::MAX,
+						InternalKeyKind::Set,
+						ts,
+					);
+					self.inner.seek(&seek_key.encode())?;
+				} else if let Some(ref lower) = self.lower_bound {
+					let seek_key =
+						InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set, u64::MAX);
+					self.inner.seek(&seek_key.encode())?;
+				} else {
+					self.inner.seek_first()?;
+				}
+				self.initialized = true;
+				self.skip_to_valid_forward()
+			}
+			MergeDirection::Backward => {
+				self.inner.seek_last()?;
+				self.initialized = true;
+				self.collect_user_key_backward()
+			}
+		}
+	}
+
+	/// Reposition to the extreme entry in `direction` without refunding the
+	/// `limit` budget already spent. See `LSMIterator::reanchor_last`.
+	fn reanchor(&mut self, direction: MergeDirection) -> Result<bool> {
+		self.anchor(direction, false)
 	}
 
 	// --- Inner iterator helpers ---
@@ -1866,38 +1930,11 @@ impl LSMIterator for HistoryIterator<'_> {
 	}
 
 	fn seek_first(&mut self) -> Result<bool> {
-		self.direction = MergeDirection::Forward;
-		self.reset_all_state();
-
-		if self.ts_range.is_some() {
-			// Seek to (lower_bound or empty, ts_end) to skip entries above range
-			let ts = self.ts_range.map(|(_, end)| end).unwrap_or(u64::MAX);
-			let seek_key = InternalKey::new(
-				self.lower_bound.clone().unwrap_or_default(),
-				u64::MAX,
-				InternalKeyKind::Set,
-				ts,
-			);
-			self.inner.seek(&seek_key.encode())?;
-		} else if let Some(ref lower) = self.lower_bound {
-			let seek_key =
-				InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set, u64::MAX);
-			self.inner.seek(&seek_key.encode())?;
-		} else {
-			self.inner.seek_first()?;
-		}
-
-		self.initialized = true;
-		self.skip_to_valid_forward()
+		self.anchor(MergeDirection::Forward, true)
 	}
 
 	fn seek_last(&mut self) -> Result<bool> {
-		self.direction = MergeDirection::Backward;
-		self.reset_all_state();
-
-		self.inner.seek_last()?;
-		self.initialized = true;
-		self.collect_user_key_backward()
+		self.anchor(MergeDirection::Backward, true)
 	}
 
 	fn next(&mut self) -> Result<bool> {
@@ -1945,6 +1982,27 @@ impl LSMIterator for HistoryIterator<'_> {
 			MergeDirection::Forward => self.inner_valid() && self.within_upper_bound(),
 			MergeDirection::Backward => self.has_buffered_entry(),
 		}
+	}
+
+	/// Overridden because `seek_first`/`seek_last` here begin with
+	/// `reset_all_state()`, which zeroes `entries_returned` — refunding the whole
+	/// `limit` budget. That is right for a seek the *user* asked for and wrong for
+	/// an internal re-anchor, which continues a traversal that has already spent
+	/// part of the budget.
+	///
+	/// Note this deliberately does NOT branch on `limit_reached`. That flag is
+	/// only ever set inside `skip_to_valid_forward`'s `while self.inner_valid()`
+	/// loop and inside `collect_user_key_backward` past its early returns, so when
+	/// the data runs dry at or before the limit the iterator goes invalid with the
+	/// flag still `false` and the budget already spent. Preserving the counter is
+	/// correct in both cases and needs no such test; the collect below re-derives
+	/// the flag from the remaining budget.
+	fn reanchor_first(&mut self) -> Result<bool> {
+		self.reanchor(MergeDirection::Forward)
+	}
+
+	fn reanchor_last(&mut self) -> Result<bool> {
+		self.reanchor(MergeDirection::Backward)
 	}
 
 	fn key(&self) -> InternalKeyRef<'_> {
