@@ -1468,6 +1468,230 @@ async fn test_history_limit_backward() {
 	}
 }
 
+/// An entry limit must survive a forward -> backward direction switch taken while
+/// the merge cursor is on a WRITE-SET entry.
+///
+/// `HistoryIterator::valid()` reports `false` for two very different reasons: it
+/// ran out of entries, or it stopped early because `limit` was reached. Its
+/// `seek_first`/`seek_last` both begin with `reset_all_state()`, which clears
+/// `entries_returned`/`limit_reached` — correct for a user-initiated seek, but
+/// catastrophic if the merge layer issues one internally to re-anchor a cursor it
+/// believes is exhausted. That would disarm the limit and resurrect versions the
+/// limit had excluded.
+///
+/// `test_history_limit_backward` above cannot catch this: it uses committed data
+/// only, so `current_source` is never `WriteSet` and the direction switch never
+/// has to re-anchor the history iterator. The uncommitted keys here are what put
+/// the cursor on the write set at the moment direction reverses.
+///
+/// TWO uncommitted keys, so the merge stays valid after the reversal and walks
+/// back across `kb` while the history source has to stay silent. With only one,
+/// the reversal invalidates the merge immediately and any follow-up assertion is
+/// vacuous — `prev()` early-returns on an already-invalid iterator and never
+/// reaches the re-anchor at all.
+#[test(tokio::test)]
+async fn history_limit_survives_direction_switch_from_write_set() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		for i in 1..=5 {
+			let mut tx = store.begin().unwrap();
+			tx.set_at(b"ka", format!("v{}", i).as_bytes(), i * 100).unwrap();
+			tx.commit().await.unwrap();
+		}
+		store.flush().unwrap();
+
+		{
+			let mut tx = store.begin().unwrap();
+			// Uncommitted: these are the entries the cursor sits on when it reverses.
+			tx.set_at(b"kb", b"wb", 600).unwrap();
+			tx.set_at(b"kc", b"wc", 700).unwrap();
+
+			let opts = HistoryOptions::new().with_limit(2);
+			let mut iter = tx.history_with_options(b"ka", b"kd", &opts).unwrap();
+
+			// Forward: two "ka" versions consume the limit, then both write-set
+			// entries are emitted from the other source.
+			let mut seen = Vec::new();
+			assert!(iter.seek_first().unwrap(), "with_index={with_index}");
+			seen.push((iter.key().user_key().to_vec(), iter.key().timestamp()));
+			for _ in 0..3 {
+				assert!(iter.next().unwrap(), "with_index={with_index}");
+				seen.push((iter.key().user_key().to_vec(), iter.key().timestamp()));
+			}
+
+			assert_eq!(
+				seen,
+				vec![
+					(b"ka".to_vec(), 500),
+					(b"ka".to_vec(), 400),
+					(b"kb".to_vec(), 600),
+					(b"kc".to_vec(), 700)
+				],
+				"with_index={with_index}: forward prefix"
+			);
+
+			// Reversing must not re-anchor (and thereby re-arm) the limit-stopped
+			// history iterator. The merge stays valid — it steps back onto the
+			// other write-set entry — but no "ka" version may reappear.
+			assert!(iter.prev().unwrap(), "with_index={with_index}: prev() must reach kb");
+			assert_eq!(
+				(iter.key().user_key().to_vec(), iter.key().timestamp()),
+				(b"kb".to_vec(), 600),
+				"with_index={with_index}: prev() must not resurrect versions the limit excluded"
+			);
+
+			// The limit must still be spent after a backward step, not silently
+			// disarmed: with the write set spent too, there is nothing left.
+			assert!(
+				!iter.prev().unwrap(),
+				"with_index={with_index}: the limit must stay armed across backward steps"
+			);
+			assert!(!iter.valid(), "with_index={with_index}");
+		}
+		store.close().await.unwrap();
+	}
+}
+
+/// The same defect one data-shape away: the budget is spent, but the DATA ran out
+/// at the same moment, so `limit_reached` was never set.
+///
+/// `limit_reached = true` is only ever assigned inside `skip_to_valid_forward`'s
+/// `while self.inner_valid()` loop (`src/snapshot.rs`) and inside
+/// `collect_user_key_backward` after its early returns. When the underlying data
+/// runs dry at or before the limit, the loop body never executes and the iterator
+/// goes invalid with `limit_reached == false` while `entries_returned` is already
+/// at the budget. Any re-anchor decision keyed off the FLAG therefore reads
+/// "exhausted", re-seeks, and — because the seek resets `entries_returned` — hands
+/// the reverse pass a fresh full `limit`.
+///
+/// Two committed versions against `with_limit(2)` is the minimal shape: forward
+/// yields exactly the budget and empties the source in the same step.
+#[test(tokio::test)]
+async fn history_limit_survives_direction_switch_when_data_exhausts_first() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		for i in 1..=2 {
+			let mut tx = store.begin().unwrap();
+			tx.set_at(b"ka", format!("v{}", i).as_bytes(), i * 100).unwrap();
+			tx.commit().await.unwrap();
+		}
+		store.flush().unwrap();
+
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set_at(b"kb", b"wb", 600).unwrap();
+			tx.set_at(b"kc", b"wc", 700).unwrap();
+
+			let opts = HistoryOptions::new().with_limit(2);
+			let mut iter = tx.history_with_options(b"ka", b"kd", &opts).unwrap();
+
+			let mut seen = Vec::new();
+			assert!(iter.seek_first().unwrap(), "with_index={with_index}");
+			seen.push((iter.key().user_key().to_vec(), iter.key().timestamp()));
+			for _ in 0..3 {
+				assert!(iter.next().unwrap(), "with_index={with_index}");
+				seen.push((iter.key().user_key().to_vec(), iter.key().timestamp()));
+			}
+
+			// Both "ka" versions exactly consume the budget AND empty the source.
+			assert_eq!(
+				seen,
+				vec![
+					(b"ka".to_vec(), 200),
+					(b"ka".to_vec(), 100),
+					(b"kb".to_vec(), 600),
+					(b"kc".to_vec(), 700)
+				],
+				"with_index={with_index}: forward prefix"
+			);
+
+			assert!(iter.prev().unwrap(), "with_index={with_index}: prev() must reach kb");
+			assert_eq!(
+				(iter.key().user_key().to_vec(), iter.key().timestamp()),
+				(b"kb".to_vec(), 600),
+				"with_index={with_index}: a spent budget must not be refunded by the re-anchor"
+			);
+
+			assert!(
+				!iter.prev().unwrap(),
+				"with_index={with_index}: the spent budget must stay spent"
+			);
+			assert!(!iter.valid(), "with_index={with_index}");
+		}
+		store.close().await.unwrap();
+	}
+}
+
+/// The partial-budget case, which is what makes `limit` a *budget* carried across
+/// the reversal rather than a flag that is either tripped or not.
+///
+/// Three committed versions against `with_limit(5)`: the forward pass spends 3 and
+/// the data runs out, so the reverse pass must be allowed to spend the remaining
+/// 2 — and no more. A fix that merely refused to re-anchor whenever the budget was
+/// spent would under-yield here (3 in total, forfeiting the remaining 2); the
+/// original defect refunds the budget and re-collects all three versions, yielding
+/// 6. Both are wrong; the total must be exactly the limit.
+///
+/// A re-anchor implementation that refunds the budget (the original defect) fails
+/// this test with:
+///
+/// ```text
+/// assertion `left == right` failed: with_index=false: forward + reverse must
+/// total exactly the limit, neither refunded (>5) nor forfeited (3)
+///   left: 6
+///  right: 5
+/// ```
+#[test(tokio::test)]
+async fn history_limit_reverse_pass_runs_on_the_remaining_budget() {
+	for with_index in [false, true] {
+		let (store, _temp_dir) = create_versioned_store(with_index);
+
+		for i in 1..=3 {
+			let mut tx = store.begin().unwrap();
+			tx.set_at(b"ka", format!("v{}", i).as_bytes(), i * 100).unwrap();
+			tx.commit().await.unwrap();
+		}
+		store.flush().unwrap();
+
+		{
+			let mut tx = store.begin().unwrap();
+			tx.set_at(b"kb", b"wb", 600).unwrap();
+			tx.set_at(b"kc", b"wc", 700).unwrap();
+
+			let opts = HistoryOptions::new().with_limit(5);
+			let mut iter = tx.history_with_options(b"ka", b"kd", &opts).unwrap();
+
+			// Forward is [ka@300, ka@200, ka@100, kb, kc]; stop ON kc rather than
+			// past it, so the reversal happens from a valid position.
+			let mut history_entries = 0;
+			assert!(iter.seek_first().unwrap(), "with_index={with_index}");
+			for _ in 0..4 {
+				if iter.key().user_key() == b"ka" {
+					history_entries += 1;
+				}
+				assert!(iter.next().unwrap(), "with_index={with_index}");
+			}
+			assert_eq!(iter.key().user_key(), b"kc", "with_index={with_index}");
+			assert_eq!(history_entries, 3, "with_index={with_index}: forward spends 3 of 5");
+
+			// Reverse: re-anchoring must carry the 3 already spent, leaving 2.
+			while iter.prev().unwrap() {
+				if iter.key().user_key() == b"ka" {
+					history_entries += 1;
+				}
+			}
+			assert_eq!(
+				history_entries, 5,
+				"with_index={with_index}: forward + reverse must total exactly the limit, \
+				 neither refunded (>5) nor forfeited (3)"
+			);
+		}
+		store.close().await.unwrap();
+	}
+}
+
 #[test(tokio::test)]
 async fn test_history_limit_multiple_keys() {
 	for with_index in [false, true] {
