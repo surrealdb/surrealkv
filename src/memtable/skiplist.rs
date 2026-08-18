@@ -676,9 +676,7 @@ pub(crate) struct SkiplistIterator<'a> {
 	// They are deliberately sticky: skiplist nodes are immutable and never
 	// unlinked, and the bounds are fixed for the lifetime of the iterator, so
 	// "this node's key is < `lower`" / "this node's key is >= `upper`" are facts
-	// that stay true across re-seeks. What must NOT be assumed is that a cursor
-	// sitting on one of them is a dead end: `last()` has to *start* on an
-	// out-of-bounds node and walk back off it. See the note in `last()`.
+	// that stay true across re-seeks.
 	lower_node: *mut Node, // Cached node known to be below the inclusive lower bound
 	upper_node: *mut Node, // Cached node known to be at or past the exclusive upper bound
 	encoded_key_buf: Vec<u8>, // Buffer for encoded key to return InternalKeyRef
@@ -776,18 +774,11 @@ impl<'a> SkiplistIterator<'a> {
 		}
 		// Check upper bound first - if entry is at or past upper, move backward.
 		//
-		// This walk must NOT be guarded by `is_valid()`. `is_valid()` is false
-		// both for the list sentinels AND for a cursor parked on the memoised
-		// `upper_node`/`lower_node` — and `upper_node` is precisely the node this
-		// loop exists to step back off. Guarding on `is_valid()` made the loop
-		// body unreachable whenever a previous forward `advance()` had already
-		// memoised the list's physically last node as `upper_node`, leaving
-		// `last()` pinned on that out-of-range node and reporting the iterator
-		// invalid (the `seek_last()`-after-`next()`-ran-past-the-end bug).
-		//
-		// `lower_node` still terminates the walk below, because a node known to
-		// be below the inclusive lower bound means everything from here down is
-		// out of range.
+		// This walk must not be guarded by `is_valid()`: that reports false for a
+		// cursor parked on `upper_node`, which is precisely the node the walk exists
+		// to step back off. `lower_node` still terminates it, because a node known to
+		// be below the inclusive lower bound means everything from here down is out
+		// of range.
 		if let Some(upper) = self.upper.as_deref() {
 			while self.nd != self.list.head && self.nd != self.list.tail && !self.nd.is_null() {
 				let key = self.node_key_bytes();
