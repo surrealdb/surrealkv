@@ -13,6 +13,8 @@ use crate::{InternalKey, Key, LSMIterator, Result, Value};
 #[cfg(test)]
 pub mod atomic_memtable_tests;
 #[cfg(test)]
+pub mod alloc_hygiene_proofs;
+#[cfg(test)]
 pub mod batch_tests;
 #[cfg(test)]
 pub mod block_tests;
