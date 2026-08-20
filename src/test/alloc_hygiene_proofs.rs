@@ -43,11 +43,13 @@ fn total_allocated() -> u64 {
 	TOTAL_ALLOCATED.with(|c| c.get())
 }
 
-/// P5: `TableWriter::add` calls `ValueLocation::decode` on every entry just
-/// to test the value-pointer meta bit; `decode_from` builds a full copy of
-/// the value via `read_to_end` (with geometric regrowth). With vlog disabled
-/// — the default — every value byte streamed through flush/compaction is
-/// copied for nothing.
+/// P5: `TableWriter::add` must not copy the value just to inspect the
+/// value-pointer meta bit. Pre-fix, `ValueLocation::decode` read_to_end-
+/// copied every value per entry: one 1 MB add() allocated 4,260,134 bytes;
+/// with the zero-copy peek it allocates ~3.2 MB (block-buffer append and
+/// flush machinery — legitimate, though further reducible). The bound
+/// below sits between the two so reintroducing a per-entry value copy
+/// fails the test.
 #[test]
 fn proof_p5_add_copies_every_value_to_peek_pointer_bit() {
 	const VALUE_SIZE: usize = 1024 * 1024;
@@ -70,12 +72,12 @@ fn proof_p5_add_copies_every_value_to_peek_pointer_bit() {
 
 	eprintln!("P5: one add() of a {VALUE_SIZE}-byte value allocated {allocated} bytes");
 
-	// BUG: the decode copy alone accounts for ~2x the value size
-	// (read_to_end regrowth) on top of the block-buffer append the writer
-	// legitimately needs. Post-fix this must drop below ~3.5 MB.
+	// Post-fix bound: measured ~3.2 MB (block machinery) vs 4,260,134 B with
+	// the per-entry decode copy. 3.5 MB catches any reintroduced full-value
+	// copy while allowing block-buffer variance.
 	assert!(
-		allocated >= (VALUE_SIZE * 2) as u64,
-		"expected the wasteful decode copy (>= 2x value size), got {allocated} — if this fails \
-		 the fix landed and this proof must flip to an upper bound"
+		allocated <= 3_500_000,
+		"add() allocated {allocated} B for a 1 MB value — a per-entry value copy appears to be \
+		 back"
 	);
 }

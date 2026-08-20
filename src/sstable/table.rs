@@ -426,14 +426,15 @@ impl<W: Write> TableWriter<W> {
 			}
 		}
 
-		// Track minimum vlog file_id if value is a vlog pointer
-		if let Ok(location) = ValueLocation::decode(val) {
-			if location.is_value_pointer() {
-				if let Ok(pointer) = ValuePointer::decode(&location.value) {
-					let file_id = pointer.file_id;
-					self.min_vlog_file_id =
-						Some(self.min_vlog_file_id.map_or(file_id, |min| min.min(file_id)));
-				}
+		// Track minimum vlog file_id if value is a vlog pointer. Peek the
+		// meta byte instead of decoding: ValueLocation::decode copies the
+		// entire value, which in this per-entry path costs a full copy of
+		// every byte streamed through flush/compaction.
+		if let Some(payload) = ValueLocation::peek_pointer_payload(val) {
+			if let Ok(pointer) = ValuePointer::decode(payload) {
+				let file_id = pointer.file_id;
+				self.min_vlog_file_id =
+					Some(self.min_vlog_file_id.map_or(file_id, |min| min.min(file_id)));
 			}
 		}
 
@@ -651,7 +652,9 @@ impl<W: Write> TableWriter<W> {
 			}
 		}
 		props.key_count += 1;
-		props.data_size += (key.encode().len() + value.len()) as u64;
+		// key.size() equals the encoded length (user_key + 16-byte trailer)
+		// without allocating an encode buffer per entry.
+		props.data_size += (key.size() + value.len()) as u64;
 	}
 }
 

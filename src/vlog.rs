@@ -234,6 +234,16 @@ impl ValueLocation {
 		(self.meta & BIT_VALUE_POINTER) != 0
 	}
 
+	/// Returns the pointer payload of an ENCODED ValueLocation when its meta
+	/// byte has the value-pointer bit set, without copying the value bytes.
+	/// Layout: meta (1 byte), version (1 byte), value.
+	pub(crate) fn peek_pointer_payload(data: &[u8]) -> Option<&[u8]> {
+		match data.first() {
+			Some(meta) if meta & BIT_VALUE_POINTER != 0 => data.get(2..),
+			_ => None,
+		}
+	}
+
 	/// Calculates the encoded size of this ValueLocation
 	pub(crate) fn encoded_size(&self) -> usize {
 		// meta (1 byte) + version (1 byte) + value length
