@@ -416,6 +416,81 @@ fn proof_p4_compaction_peak_memory_independent_of_input_size() {
 	);
 }
 
+// --- GB-scale A/B: legacy writer vs partitioned writer, same binary -----------
+
+/// Issue #397 at the reporter's scale, as a direct A/B in one binary:
+/// building ONE large SST (23M keys ≈ a ~2.7 GB file with ~100 B entries)
+/// needed over 1 GB of RAM for the bloom filter ALONE under the legacy
+/// design — the exact `FilterBlockWriter` struct shipped in ≤ v0.21.3,
+/// still compiled for tests, fed the same keys — while the partitioned
+/// writer stays under 100 MB on identical input. Arm B deliberately builds
+/// one UNSPLIT table (writer output discarded via io::sink, so only builder
+/// memory is measured): even without target_file_size splitting, the filter
+/// fix alone removes the GB-scale residency; splitting bounds it further in
+/// real compactions.
+///
+/// Ignored by default: run once per change with
+/// `cargo test --lib gb_scale -- --ignored --nocapture` (~1-2 minutes).
+#[test]
+#[ignore = "GB-scale measurement (~1-2 min); run once per change"]
+fn proof_gb_scale_legacy_filter_needs_1gb_partitioned_does_not() {
+	use crate::sstable::bloom::LevelDBBloomFilter;
+	use crate::sstable::filter_block::FilterBlockWriter;
+
+	const KEYS: usize = 23_000_000;
+	let policy: Arc<dyn crate::FilterPolicy> = Arc::new(LevelDBBloomFilter::new(10));
+
+	// Arm A: the legacy monolithic filter builder exactly as shipped —
+	// add_key buffers every raw key until finish().
+	let base = reset_high_water();
+	let old_peak;
+	{
+		let mut legacy = FilterBlockWriter::new(Arc::clone(&policy));
+		for k in 0..KEYS {
+			legacy.add_key(format!("key{k:012}").as_bytes());
+		}
+		old_peak = high_water_since(base);
+	}
+
+	// Arm B: the partitioned writer building the same single (unsplit)
+	// table: same 23M keys, ~100 B values, output discarded.
+	let opts = Arc::new(Options::new());
+	let value = ValueLocation::with_inline_value(vec![0xEFu8; 100]).encode();
+	let base = reset_high_water();
+	let new_peak;
+	{
+		let mut writer = TableWriter::new(std::io::sink(), 1, Arc::clone(&opts), 1);
+		for k in 0..KEYS {
+			let key = InternalKey::new(
+				format!("key{k:012}").into_bytes(),
+				(k + 1) as u64,
+				InternalKeyKind::Set,
+				0,
+			);
+			writer.add(key, &value).unwrap();
+		}
+		new_peak = high_water_since(base);
+	}
+
+	eprintln!(
+		"GB-scale: legacy filter peak = {old_peak} B ({:.2} GB), partitioned writer peak = \
+		 {new_peak} B ({:.1} MB), reduction = {:.0}x",
+		old_peak as f64 / (1 << 30) as f64,
+		new_peak as f64 / (1 << 20) as f64,
+		old_peak as f64 / new_peak.max(1) as f64
+	);
+
+	assert!(
+		old_peak >= 900 * 1024 * 1024,
+		"legacy arm expected ~1 GB for 23M keys, got {old_peak} B — measurement broken?"
+	);
+	assert!(
+		new_peak <= 100 * 1024 * 1024,
+		"partitioned writer used {new_peak} B for 23M keys — the O(keys) filter residency \
+		 (issue #397) is back"
+	);
+}
+
 // --- B-P1: filter build memory ------------------------------------------------
 
 /// Writes `n` entries with values of `value_size` bytes through a

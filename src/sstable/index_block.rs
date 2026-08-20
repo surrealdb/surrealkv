@@ -259,7 +259,12 @@ impl IndexWriter {
 			self.opts.block_restart_interval,
 			Arc::clone(&self.opts.internal_comparator),
 		);
-		let finished_block = std::mem::replace(&mut self.current_block, new_block);
+		let mut finished_block = std::mem::replace(&mut self.current_block, new_block);
+		// Finished partitions are retained until finish(); without this, each
+		// keeps its full pre-sized buffer capacity for a few hundred bytes of
+		// content, and with many partitions (filter-driven cuts) the empty
+		// capacity dominates writer memory.
+		finished_block.shrink_to_fit();
 		self.index_blocks.push(finished_block);
 	}
 
