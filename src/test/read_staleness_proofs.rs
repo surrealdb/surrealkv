@@ -16,7 +16,7 @@
 use std::collections::HashSet;
 use std::fs::File as SysFile;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use tempfile::TempDir;
 use test_log::test;
@@ -120,19 +120,17 @@ async fn proof_interleaved_l0_reads_return_newest_version() {
 	drop(txn);
 	tree.close().await.unwrap();
 
-	// BUG (present on main): first-hit source order returns the STALE
-	// versions — "old95" (from the higher-max-seq L0 table) and "old60"
-	// (from L0, shadowing the newer L1 version).
+	// Point reads must return the NEWEST visible version regardless of which
+	// source holds it. (Pre-fix, first-hit source order returned the stale
+	// "old95"/"old60".)
 	assert_eq!(
 		dup.as_deref(),
-		Some(b"old95".as_slice()),
-		"expected the stale-read bug for interleaved L0 tables; if this fails with new105, the \
-		 fix landed and this proof must flip"
+		Some(b"new105".as_slice()),
+		"stale read across interleaved L0 tables — the first-hit early return is back"
 	);
 	assert_eq!(
 		dup2.as_deref(),
-		Some(b"old60".as_slice()),
-		"expected the stale-read bug across L0 vs L1; if this fails with new115, the fix landed \
-		 and this proof must flip"
+		Some(b"new115".as_slice()),
+		"stale read across L0 vs L1 — the first-hit early return is back"
 	);
 }
