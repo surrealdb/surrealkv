@@ -211,6 +211,46 @@ fn build_l0_store(
 	(temp_dir, manifest, compactor)
 }
 
+// --- P4: end-to-end — compaction peak memory vs merged input size ------------
+
+/// P4 (issue #397's headline claim, end-to-end): peak heap growth during a
+/// compaction must be independent of the merged input size. Runs a ~125 MB
+/// merge and a ~500 MB merge (4x) and compares live-heap high-water during
+/// `compact()`. Ignored by default: run once per change with
+/// `cargo test --lib proof_p4 -- --ignored --nocapture` (writes 625 MB of
+/// SSTs; a few minutes).
+///
+/// Baseline measured on main (29fda1b) with the same harness:
+/// S = 6,192,578 B, 4S = 23,668,848 B, ratio 3.82 — linear in input.
+#[test]
+#[ignore = "measurement harness: writes 625 MB; run once per change"]
+fn proof_p4_compaction_peak_memory_independent_of_input_size() {
+	// S: 6 tables x 20k entries x ~1 KB = ~125 MB input.
+	let (_dir_s, _manifest_s, compactor_s) = build_l0_store(6, 20_000, 64 * 1024 * 1024);
+	let base = reset_high_water();
+	compactor_s.compact().unwrap();
+	let peak_s = high_water_since(base);
+
+	// 4S: 6 tables x 80k entries x ~1 KB = ~500 MB input.
+	let (_dir_4s, _manifest_4s, compactor_4s) = build_l0_store(6, 80_000, 64 * 1024 * 1024);
+	let base = reset_high_water();
+	compactor_4s.compact().unwrap();
+	let peak_4s = high_water_since(base);
+
+	eprintln!(
+		"P4: peak heap during compact(): S(125MB input) = {peak_s} B, 4S(500MB input) = \
+		 {peak_4s} B, ratio = {:.2}",
+		peak_4s as f64 / peak_s.max(1) as f64
+	);
+
+	// Flat means 4x the input does not cost 4x the memory; allow 2x headroom
+	// for per-output metadata differences.
+	assert!(
+		peak_4s < peak_s * 2,
+		"compaction peak memory scales with input size again (S = {peak_s} B, 4S = {peak_4s} B)"
+	);
+}
+
 // --- B-P1: filter build memory ------------------------------------------------
 
 /// Writes `n` entries with values of `value_size` bytes through a
@@ -246,10 +286,14 @@ fn retained_bytes_before_finish(n: usize, value_size: usize, with_filter: bool) 
 	retained
 }
 
-/// B-P1: the filter builder buffers EVERY user key of the output file in RAM
-/// until `finish()` (one owned Vec per key), so writer memory grows linearly
-/// with the entry count — the root memory bug of issue #397. The ablation
-/// arm (no filter policy) isolates the filter's share.
+/// B-P1: the partitioned filter builder buffers a 4-byte HASH per key
+/// (drained into finished partition bits at every index-partition cut), not
+/// the raw key. Pre-fix the builder held every user key as an owned Vec
+/// until `finish()`: 18.78 MB at 400k keys, 46 B/key, 98.9% of writer
+/// residency — the root memory bug of issue #397. Post-fix measured:
+/// 2.78 MB at 400k keys, filter share 2.58 MB ≈ 6.4 B/key (hash + finished
+/// bloom bits + buffer overheads). The ablation arm (no filter policy)
+/// isolates the filter's share.
 #[test]
 fn proof_bp1_filter_buffers_every_key_until_finish() {
 	// Small-entry regime (~115 B/entry): pointer-sized values, like vlog mode.
@@ -269,32 +313,74 @@ fn proof_bp1_filter_buffers_every_key_until_finish() {
 	eprintln!("B-P1: filter share at 4N = {filter_share} B ({} B/key)", filter_share / 400_000);
 	eprintln!("B-P1: large regime: N=8k → {large_n} B, 4N=32k → {large_4n} B");
 
-	// BUG (issue #397): residency is O(#entries) — 4x the entries retain
-	// ~4x the bytes, and the filter's key buffer dominates (>= 15 B/key of
-	// raw keys + per-key allocation overhead).
+	// Post-fix bounds: the filter retains ~6.4 B/key (4 B hash + ~1.25 B/key
+	// finished bloom bits + buffer overheads) instead of 46 B/key of raw
+	// keys. 8 B/key of headroom still fails hard on any return of raw-key
+	// buffering.
 	assert!(
-		small_4n >= small_n * 3,
-		"small regime: expected linear growth, got N={small_n} vs 4N={small_4n}"
+		filter_share <= 400_000 * 8,
+		"filter memory exceeds 8 B/key (share = {filter_share} B at 400k keys) — the raw-key \
+		 buffering bug (issue #397) is back"
 	);
 	assert!(
-		large_4n >= large_n * 3,
-		"large regime: expected linear growth, got N={large_n} vs 4N={large_4n}"
+		small_4n <= 400_000 * 10,
+		"small regime: writer retains {small_4n} B at 400k entries, expected <= 10 B/key"
 	);
 	assert!(
-		filter_share >= 400_000 * 15,
-		"expected the filter key buffer to dominate; share = {filter_share} B — if this fails, \
-		 the partitioned-filter fix landed and this proof must flip to a per-key bound"
+		large_4n <= 32_000 * 16,
+		"large regime: writer retains {large_4n} B at 32k entries, expected <= 16 B/key"
 	);
+	// Guard the measurement itself.
+	assert!(small_n > 0 && large_n > 0, "allocation counter appears broken");
+}
+
+/// Companion to B-P1/B-P2: end-to-end read correctness of the partitioned
+/// filter through the real read path. Every written key must be found (no
+/// bloom false negatives across any partition) and in-range absent keys
+/// must return None.
+#[test]
+fn partitioned_filter_reads_have_no_false_negatives() {
+	let (table, _reads, n) = build_counted_table(4 * 1024 * 1024);
+
+	// The table must actually have a partitioned, multi-partition filter.
+	let partitions = match &table.filter {
+		crate::sstable::table::TableFilter::Partitioned(f) => f.num_partitions(),
+		_ => panic!("new tables must carry a partitioned filter"),
+	};
+	assert!(partitions > 1, "test requires a multi-partition filter, got {partitions}");
+
+	for i in (0..n).step_by(23) {
+		let key = InternalKey::new(
+			format!("key{i:012}").into_bytes(),
+			INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Set,
+			0,
+		);
+		assert!(table.get(&key).unwrap().is_some(), "false negative for present key index {i}");
+	}
+	for i in (1..n).step_by(101) {
+		let key = InternalKey::new(
+			format!("key{i:012}x").into_bytes(),
+			INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Set,
+			0,
+		);
+		assert!(table.get(&key).unwrap().is_none(), "phantom hit for absent key index {i}");
+	}
 }
 
 // --- B-P2: absent-key lookups must not read data ------------------------------
 
-/// Builds an SST of roughly `total_bytes` (1 KB values) through the real
-/// `TableWriter`, opens it over a read-counting file, and returns the table
-/// plus the read counter. `n_keys` reports how many keys were written.
+/// Builds an SST of roughly `total_bytes` (100 B values, so a multi-MB
+/// table spans multiple filter partitions) through the real `TableWriter`,
+/// opens it over a read-counting file, and returns the table plus the read
+/// counter and the number of keys written.
 fn build_counted_table(total_bytes: usize) -> (Table, Arc<AtomicU64>, usize) {
-	let opts = Arc::new(Options::new());
-	let value = ValueLocation::with_inline_value(vec![0xCDu8; 1024]).encode();
+	// A realistic block-cache size: with the 1 MB default, quick_cache's
+	// per-shard weight limit can reject ~16 KB filter/index partitions
+	// outright, making every lookup re-read them.
+	let opts = Arc::new(Options::new().with_block_cache_capacity(8 * 1024 * 1024));
+	let value = ValueLocation::with_inline_value(vec![0xCDu8; 100]).encode();
 	let n = total_bytes / (value.len() + 16);
 
 	let mut buf = Vec::new();
@@ -334,10 +420,12 @@ fn proof_bp2_absent_key_lookups_do_not_read_data() {
 	let (table, reads, n) = build_counted_table(4 * 1024 * 1024);
 
 	let absent_key = |i: usize| {
-		// "kez" sorts inside the table's range so the index cannot reject it
-		// before the filter is consulted.
+		// "key<i>x" sorts strictly BETWEEN two present keys, so neither the
+		// table range check nor the index can reject it — only the bloom
+		// filter can. (A suffix beyond the last key would take the
+		// past-the-end fast path and never exercise the filter.)
 		InternalKey::new(
-			format!("kez{i:012}").into_bytes(),
+			format!("key{i:012}x").into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Set,
 			0,
@@ -360,10 +448,12 @@ fn proof_bp2_absent_key_lookups_do_not_read_data() {
 	}
 	let repeated_absent_reads = reads.load(Ordering::Relaxed) - before;
 
-	// (b) 50 distinct absent keys vs 50 distinct present keys.
+	// (b) 50 distinct absent keys vs 50 distinct present keys. Indices stay
+	// well inside the written key range (0..n) so every probe is in-range.
 	let before = reads.load(Ordering::Relaxed);
 	for i in 0..50 {
-		assert!(table.get(&absent_key(1 + i * 97)).unwrap().is_none());
+		let k = (1 + i * (n / 64)).min(n - 1);
+		assert!(table.get(&absent_key(k)).unwrap().is_none());
 	}
 	let absent_reads = reads.load(Ordering::Relaxed) - before;
 

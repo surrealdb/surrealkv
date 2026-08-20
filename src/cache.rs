@@ -13,12 +13,15 @@ const KIND_DATA: u8 = 0;
 const KIND_INDEX: u8 = 1;
 const KIND_VLOG: u8 = 2;
 const KIND_DATA_HISTORY: u8 = 3;
+const KIND_FILTER: u8 = 4;
 
 #[derive(Clone)]
 pub(crate) enum Item {
 	Data(Arc<Block>),
 	Index(Arc<Block>),
 	VLog(Value),
+	/// Raw bloom-filter partition bytes (not block-encoded)
+	Filter(Arc<Value>),
 }
 
 /// Cache key with kind-based differentiation.
@@ -57,6 +60,7 @@ impl Weighter<CacheKey, Item> for BlockWeighter {
 			Item::Data(block) => block.size() as u64,
 			Item::Index(block) => block.size() as u64,
 			Item::VLog(value) => value.len() as u64,
+			Item::Filter(bytes) => bytes.len() as u64,
 		}
 	}
 }
@@ -123,6 +127,20 @@ impl BlockCache {
 	/// Inserts a VLog value into the cache.
 	pub(crate) fn insert_vlog(&self, file_id: u32, offset: u64, value: Value) {
 		self.data.insert((KIND_VLOG, file_id as u64, offset).into(), Item::VLog(value));
+	}
+
+	/// Inserts a bloom-filter partition (raw bytes) into the cache.
+	pub(crate) fn insert_filter_partition(&self, table_id: u64, offset: u64, bytes: Arc<Value>) {
+		self.data.insert((KIND_FILTER, table_id, offset).into(), Item::Filter(bytes));
+	}
+
+	/// Retrieves a bloom-filter partition from the cache.
+	pub(crate) fn get_filter_partition(&self, table_id: u64, offset: u64) -> Option<Arc<Value>> {
+		let key = (KIND_FILTER, table_id, &offset);
+		match self.data.get(&key) {
+			Some(Item::Filter(bytes)) => Some(bytes),
+			_ => None,
+		}
 	}
 
 	/// Retrieves a data block from the cache.

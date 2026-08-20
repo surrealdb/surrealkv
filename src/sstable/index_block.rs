@@ -173,6 +173,11 @@ pub(crate) struct IndexWriter {
 	/// Maximum size for a partition block
 	max_block_size: usize,
 
+	/// A partition cut was requested (by the partitioned bloom filter, whose
+	/// partitions stay aligned with index partitions); honored at the next
+	/// `add`.
+	cut_requested: bool,
+
 	// Statistics (populated during finish())
 	index_size: u64,
 	num_partitions: u64,
@@ -190,10 +195,18 @@ impl IndexWriter {
 				Arc::clone(&opts.internal_comparator),
 			),
 			max_block_size,
+			cut_requested: false,
 			index_size: 0,
 			num_partitions: 0,
 			top_level_index_size: 0,
 		}
+	}
+
+	/// Requests a partition cut at the next `add` (RocksDB request/grant:
+	/// the filter requests, the index grants at its next block boundary so
+	/// filter and index partitions stay aligned).
+	pub(crate) fn request_partition_cut(&mut self) {
+		self.cut_requested = true;
 	}
 
 	pub(crate) fn index_size(&self) -> u64 {
@@ -214,12 +227,29 @@ impl IndexWriter {
 	///
 	/// - `key`: Separator key (upper bound for keys in the data block)
 	/// - `handle`: Encoded BlockHandle of the data block
-	pub(crate) fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<()> {
-		// Start new partition if current one is full
-		if self.current_block.size_estimate() >= self.max_block_size {
+	///
+	/// ## Returns
+	///
+	/// When adding this entry finished the previous index partition (i.e.,
+	/// this entry starts a new partition), returns that finished partition's
+	/// last separator key — the partitioned bloom filter cuts its own
+	/// partition on the same boundary so filter and index partitions stay
+	/// aligned (RocksDB Partitioned Index/Filters).
+	pub(crate) fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<Option<Vec<u8>>> {
+		// Start a new partition if the current one is full, or if a cut was
+		// requested (only meaningful when the current partition has entries;
+		// an empty partition cannot be cut).
+		let mut finished_partition_last_key = None;
+		if (self.cut_requested || self.current_block.size_estimate() >= self.max_block_size)
+			&& self.current_block.entries() > 0
+		{
 			self.finish_current_block();
+			finished_partition_last_key =
+				Some(self.index_blocks.last().expect("just finished a partition").last_key.clone());
 		}
-		self.current_block.add(key, handle)
+		self.cut_requested = false;
+		self.current_block.add(key, handle)?;
+		Ok(finished_partition_last_key)
 	}
 
 	/// Moves current block to completed list and starts a new empty block.
