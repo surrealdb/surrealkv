@@ -195,7 +195,7 @@ impl Compactor {
 
 		let target_file_size = self.options.lopts.target_file_size;
 		let mut outputs: Vec<(u64, PathBuf)> = Vec::new();
-		let mut writer: Option<TableWriter<SysFile>> = None;
+		let mut current: Option<(TableWriter<SysFile>, u64, PathBuf)> = None;
 		let mut prev_user_key: Vec<u8> = Vec::new();
 
 		for item in &mut comp_iter {
@@ -203,29 +203,27 @@ impl Compactor {
 
 			// Roll over once the current output is full, but only when the
 			// user key changes: versions of one key must never span files.
-			if let Some(w) = &writer {
-				if w.estimated_file_size() >= target_file_size
+			let roll = current.as_ref().is_some_and(|(w, _, _)| {
+				w.estimated_file_size() >= target_file_size
 					&& key.user_key.as_slice() != prev_user_key.as_slice()
-				{
-					let (id, path) = outputs.last().expect("writer implies an output entry");
-					self.finish_output(writer.take().expect("checked above"), *id, path)?;
+			});
+			if roll {
+				if let Some((w, id, path)) = current.take() {
+					self.finish_output(w, id, &path)?;
+					outputs.push((id, path));
 				}
 			}
 
 			// Open the next output lazily so we never create empty files.
-			let w = match &mut writer {
-				Some(w) => w,
+			let (w, ..) = match &mut current {
+				Some(c) => c,
 				None => {
-					let id = self.options.level_manifest.read().unwrap().next_table_id();
+					let id = self.options.level_manifest.read()?.next_table_id();
 					let path = self.get_table_path(id);
 					let file = SysFile::create(&path)?;
-					outputs.push((id, path));
-					writer.insert(TableWriter::new(
-						file,
-						id,
-						Arc::clone(&self.options.lopts),
-						input.target_level,
-					))
+					let writer =
+						TableWriter::new(file, id, Arc::clone(&self.options.lopts), input.target_level);
+					current.insert((writer, id, path))
 				}
 			};
 
@@ -234,9 +232,9 @@ impl Compactor {
 			w.add(key, &value)?;
 		}
 
-		if let Some(w) = writer.take() {
-			let (id, path) = outputs.last().expect("writer implies an output entry");
-			self.finish_output(w, *id, path)?;
+		if let Some((w, id, path)) = current.take() {
+			self.finish_output(w, id, &path)?;
+			outputs.push((id, path));
 		}
 
 		if !outputs.is_empty() {

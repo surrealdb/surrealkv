@@ -243,17 +243,16 @@ impl IndexWriter {
 		if (self.cut_requested || self.current_block.size_estimate() >= self.max_block_size)
 			&& self.current_block.entries() > 0
 		{
-			self.finish_current_block();
-			finished_partition_last_key =
-				Some(self.index_blocks.last().expect("just finished a partition").last_key.clone());
+			finished_partition_last_key = Some(self.finish_current_block());
 		}
 		self.cut_requested = false;
 		self.current_block.add(key, handle)?;
 		Ok(finished_partition_last_key)
 	}
 
-	/// Moves current block to completed list and starts a new empty block.
-	fn finish_current_block(&mut self) {
+	/// Moves the current block to the completed list, starts a new empty
+	/// block, and returns the finished partition's last key.
+	fn finish_current_block(&mut self) -> Vec<u8> {
 		let new_block = BlockWriter::new(
 			self.opts.block_size,
 			self.opts.block_restart_interval,
@@ -262,10 +261,12 @@ impl IndexWriter {
 		let mut finished_block = std::mem::replace(&mut self.current_block, new_block);
 		// Finished partitions are retained until finish(); without this, each
 		// keeps its full pre-sized buffer capacity for a few hundred bytes of
-		// content, and with many partitions (filter-driven cuts) the empty
-		// capacity dominates writer memory.
+		// content, and with many partitions the empty capacity dominates
+		// writer memory.
 		finished_block.shrink_to_fit();
+		let last_key = finished_block.last_key.clone();
 		self.index_blocks.push(finished_block);
+		last_key
 	}
 
 	fn write_compressed_block<W: Write>(
