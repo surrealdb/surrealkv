@@ -213,6 +213,13 @@ pub struct Options {
 	/// Level N max bytes = base * multiplier^(N-1)
 	/// Default: 10.0
 	pub level_multiplier: f64,
+	/// Target size for SSTs produced by compaction. A compaction rolls over
+	/// to a new output file once the current one reaches this size (cutting
+	/// only at user-key boundaries), which keeps compaction memory and the
+	/// size of any single compaction's inputs bounded regardless of level
+	/// size.
+	/// Default: 64MB
+	pub target_file_size: u64,
 
 	/// Number of immutable memtables that triggers write stall.
 	/// When immutable memtable count >= this threshold, writes block until flushes complete.
@@ -260,6 +267,7 @@ impl Default for Options {
 			level0_max_files: 4,
 			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
 			level_multiplier: 10.0,
+			target_file_size: 64 * 1024 * 1024, // 64MB
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
 		}
@@ -359,6 +367,14 @@ impl Options {
 
 	pub const fn with_max_memtable_size(mut self, value: usize) -> Self {
 		self.max_memtable_size = value;
+		self
+	}
+
+	/// Sets the target size for SSTs produced by compaction; a compaction
+	/// rolls over to a new output file once the current one reaches this
+	/// size (cut only at user-key boundaries).
+	pub const fn with_target_file_size(mut self, value: u64) -> Self {
+		self.target_file_size = value;
 		self
 	}
 

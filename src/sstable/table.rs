@@ -396,6 +396,14 @@ impl<W: Write> TableWriter<W> {
 		}
 	}
 
+	/// Estimated size of the table file so far: bytes already written plus
+	/// the in-progress data block. Used by compaction to decide when to roll
+	/// over to a new output file.
+	pub(crate) fn estimated_file_size(&self) -> u64 {
+		let pending = self.data_block.as_ref().map_or(0, |b| b.size_estimate());
+		(self.offset + pending) as u64
+	}
+
 	/// Adds a key-value pair to the table.
 	///
 	/// ## Requirements

@@ -31,10 +31,12 @@ use crate::{InternalKey, InternalKeyKind, LSMIterator, Options};
 fn build_l0_store(
 	num_tables: usize,
 	entries_per_table: usize,
+	target_file_size: u64,
 ) -> (TempDir, Arc<RwLock<LevelManifest>>, Compactor) {
 	let temp_dir = TempDir::new().unwrap();
 	let mut opts = Options::new();
 	opts.path = temp_dir.path().to_path_buf();
+	opts.target_file_size = target_file_size;
 	// The default trigger is 4 L0 files; more files -> compaction fires.
 	let opts = Arc::new(opts);
 
@@ -98,16 +100,18 @@ fn build_l0_store(
 	(temp_dir, manifest, compactor)
 }
 
-/// P3: an L0→L1 compaction merges its entire input into exactly ONE output
-/// SST, no matter how large the input is — there is no target file size or
-/// output splitting anywhere in the compaction path (issue #397). Output
-/// size therefore scales with level size, every future compaction of that
-/// file is bigger, and a crash-interrupted compaction retries the whole
-/// oversized job from scratch.
+/// P3: an L0→L1 compaction splits its output at `target_file_size`
+/// boundaries — each output SST stays near the target no matter how large
+/// the merged input is, so output sizes, future compaction inputs, and
+/// crash-retry work are all independent of level size. (Issue #397: the
+/// whole merge previously landed in ONE file — 12,601,804 bytes from this
+/// exact input.)
 #[test]
-fn proof_p3_compaction_writes_single_monolithic_output() {
-	// 6 L0 tables x 2,000 entries x ~1 KB values ≈ 12.5 MB of input.
-	let (_dir, manifest, compactor) = build_l0_store(6, 2_000);
+fn proof_p3_compaction_splits_output_at_target_file_size() {
+	// 6 L0 tables x 2,000 entries x ~1 KB values ≈ 12.5 MB of input,
+	// compacted with a 2 MB output target.
+	const TARGET: u64 = 2 * 1024 * 1024;
+	let (_dir, manifest, compactor) = build_l0_store(6, 2_000, TARGET);
 
 	compactor.compact().unwrap();
 
@@ -120,26 +124,34 @@ fn proof_p3_compaction_writes_single_monolithic_output() {
 
 	assert!(levels[0].tables.is_empty(), "L0 must be fully merged");
 	assert!(total > 10 * 1024 * 1024, "input should be ~12 MB, got {total}");
-
-	// BUG (issue #397): the whole merge lands in one file. A splitting
-	// compactor bounds each output at ~target_file_size; when the fix lands
-	// this proof must flip to `> 1` outputs each ≤ ~target.
-	assert_eq!(
-		l1_sizes.len(),
-		1,
-		"expected the monolithic-output bug; if this fails, output splitting now works and this \
-		 proof must flip"
+	assert!(
+		l1_sizes.len() > 1,
+		"expected the merge to split into multiple outputs (== 1 is the issue #397 \
+		 monolithic-output bug)"
 	);
+	// Rollover triggers at the target and then finishes the file (footer,
+	// index, filter), so each output may exceed the target by the metadata
+	// plus one block; 25% is generous headroom.
+	let max_allowed = TARGET + TARGET / 4;
+	for (i, size) in l1_sizes.iter().enumerate() {
+		assert!(*size <= max_allowed, "output {i} is {size} bytes, above target+25% ({max_allowed})");
+	}
 
-	// Read-back sanity for the proof harness itself.
-	let mut all_keys = 0usize;
+	// The split outputs must form disjoint, sorted ranges and preserve every
+	// key: read all keys back through table iterators.
+	let mut all_keys = Vec::new();
 	for table in &levels[1].tables {
 		let mut iter = table.iter(None).unwrap();
 		iter.seek_first().unwrap();
 		while iter.valid() {
-			all_keys += 1;
+			all_keys.push(iter.key().to_owned().user_key.clone());
 			iter.next().unwrap();
 		}
 	}
-	assert_eq!(all_keys, 12_000, "every input key must survive the merge");
+	assert_eq!(all_keys.len(), 12_000, "every input key must survive the split");
+	let mut sorted = all_keys.clone();
+	sorted.sort();
+	sorted.dedup();
+	assert_eq!(sorted.len(), 12_000, "keys must be unique across outputs");
+	assert_eq!(all_keys, sorted, "outputs must be sorted and non-overlapping");
 }
