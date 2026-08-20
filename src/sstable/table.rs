@@ -81,9 +81,9 @@ use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
 use crate::sstable::error::SSTableError;
 use crate::sstable::filter_block::FilterBlockReader;
-use crate::sstable::partitioned_filter::{PartitionedFilterReader, PartitionedFilterWriter};
 use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
 use crate::sstable::meta::TableMetadata;
+use crate::sstable::partitioned_filter::{PartitionedFilterReader, PartitionedFilterWriter};
 use crate::vfs::File;
 use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{
@@ -509,13 +509,13 @@ impl<W: Write> TableWriter<W> {
 		// Add index entry: separator_key → block_handle. If the filter's
 		// current partition is full, ask the index to cut here so filter and
 		// index partitions are created on the same boundary whichever limit
-		// (index bytes or filter keys) is reached first — RocksDB's
-		// request/grant alignment.
+		// (index bytes or filter keys) is reached first.
 		let handle_encoded = handle.encode();
 		if self.filter_block.as_ref().is_some_and(|f| f.wants_cut()) {
 			self.partitioned_index.request_partition_cut();
 		}
-		let finished_index_partition = self.partitioned_index.add(&separator_key, &handle_encoded)?;
+		let finished_index_partition =
+			self.partitioned_index.add(&separator_key, &handle_encoded)?;
 
 		// Keep the bloom filter's partitions aligned with the index
 		// partitions: when this entry finished an index partition, cut a

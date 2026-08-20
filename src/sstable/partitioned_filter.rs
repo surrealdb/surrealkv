@@ -1,4 +1,4 @@
-//! # Partitioned Bloom Filter (RocksDB Partitioned Index/Filters design)
+//! # Partitioned Bloom Filter
 //!
 //! Completes the two-level design the partitioned INDEX (`index_block.rs`)
 //! already implements: the bloom filter is stored as one small partition per
@@ -56,8 +56,8 @@ use crate::{FilterPolicy, Options};
 /// - `add_key` for every entry (buffers a 4-byte hash),
 /// - `absorb_block` after each data block is flushed,
 /// - `cut` whenever the index writer finishes an index partition,
-/// - `finish` to obtain the final `(separator, filter_bytes)` list, which
-///   `TableWriter` writes out and indexes.
+/// - `finish` to obtain the final `(separator, filter_bytes)` list, which `TableWriter` writes out
+///   and indexes.
 pub(crate) struct PartitionedFilterWriter {
 	policy: Arc<dyn FilterPolicy>,
 
@@ -72,9 +72,8 @@ pub(crate) struct PartitionedFilterWriter {
 	partition_hashes: Vec<u32>,
 
 	/// Once this many keys accumulate, the writer asks the index to cut a
-	/// partition at its next boundary (RocksDB's request/grant alignment:
-	/// a partition is cut when EITHER the index bytes or the filter keys
-	/// reach the configured partition size).
+	/// partition at its next boundary — a partition is cut when EITHER the
+	/// index bytes or the filter keys reach the configured partition size.
 	keys_per_partition: usize,
 
 	/// Finished partitions: (index partition's last separator key, bits).
@@ -84,7 +83,7 @@ pub(crate) struct PartitionedFilterWriter {
 impl PartitionedFilterWriter {
 	/// `partition_bytes` is the target size of one filter partition
 	/// (`Options::index_partition_size` — the same knob that sizes index
-	/// partitions, mirroring RocksDB's single `metadata_block_size`).
+	/// partitions, so one setting governs both).
 	pub(crate) fn new(policy: Arc<dyn FilterPolicy>, partition_bytes: usize) -> Self {
 		let keys_per_partition = policy.filter_keys_per_partition(partition_bytes);
 		Self {
@@ -224,31 +223,30 @@ impl PartitionedFilterReader {
 		};
 
 		let offset = partition.handle.offset() as u64;
-		let bits = if let Some(bits) =
-			self.opts.block_cache.get_filter_partition(self.table_id, offset)
-		{
-			bits
-		} else {
-			match read_verified_raw_block(Arc::clone(&self.file), &partition.handle) {
-				Ok(bytes) => {
-					let bytes = Arc::new(bytes);
-					self.opts.block_cache.insert_filter_partition(
-						self.table_id,
-						offset,
-						Arc::clone(&bytes),
-					);
-					bytes
-				}
-				Err(e) => {
-					log::warn!(
+		let bits =
+			if let Some(bits) = self.opts.block_cache.get_filter_partition(self.table_id, offset) {
+				bits
+			} else {
+				match read_verified_raw_block(Arc::clone(&self.file), &partition.handle) {
+					Ok(bytes) => {
+						let bytes = Arc::new(bytes);
+						self.opts.block_cache.insert_filter_partition(
+							self.table_id,
+							offset,
+							Arc::clone(&bytes),
+						);
+						bytes
+					}
+					Err(e) => {
+						log::warn!(
 						"Failed to read filter partition for table {} at offset {offset}: {e}; \
 						 proceeding without the filter",
 						self.table_id
 					);
-					return true;
+						return true;
+					}
 				}
-			}
-		};
+			};
 
 		self.policy.may_contain(&bits, user_key)
 	}

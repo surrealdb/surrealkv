@@ -202,9 +202,9 @@ impl IndexWriter {
 		}
 	}
 
-	/// Requests a partition cut at the next `add` (RocksDB request/grant:
-	/// the filter requests, the index grants at its next block boundary so
-	/// filter and index partitions stay aligned).
+	/// Requests a partition cut at the next `add`: the partitioned bloom
+	/// filter requests, the index grants at its next block boundary, so
+	/// filter and index partitions stay aligned.
 	pub(crate) fn request_partition_cut(&mut self) {
 		self.cut_requested = true;
 	}
@@ -234,7 +234,7 @@ impl IndexWriter {
 	/// this entry starts a new partition), returns that finished partition's
 	/// last separator key — the partitioned bloom filter cuts its own
 	/// partition on the same boundary so filter and index partitions stay
-	/// aligned (RocksDB Partitioned Index/Filters).
+	/// aligned.
 	pub(crate) fn add(&mut self, key: &[u8], handle: &[u8]) -> Result<Option<Vec<u8>>> {
 		// Start a new partition if the current one is full, or if a cut was
 		// requested (only meaningful when the current partition has entries;

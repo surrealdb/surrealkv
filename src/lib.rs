@@ -249,11 +249,10 @@ impl Default for Options {
 			internal_comparator,
 			compression_per_level: Vec::new(),
 			filter_policy: Some(Arc::new(bf)),
-			// 32MB — RocksDB's default block-cache size ("the recommended
-			// minimum size for 64 shards, to reduce contention"). Below
-			// this, the sharded cache's per-item weight limit can reject
-			// ~16 KB index/filter partitions outright, forcing every lookup
-			// to re-read them from disk.
+			// 32MB. The cache is sharded, and each shard enforces a
+			// per-item weight limit derived from capacity/shards; below
+			// ~32MB that limit can reject ~16 KB index/filter partitions
+			// outright, forcing every lookup to re-read them from disk.
 			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(32 << 20)),
 			path: PathBuf::from(""),
 			level_count: 6,

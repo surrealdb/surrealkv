@@ -98,40 +98,52 @@ impl File for CountingFile {
 	fn write(&mut self, buf: &[u8]) -> crate::Result<usize> {
 		File::write(&mut self.inner, buf)
 	}
+
 	fn flush(&mut self) -> crate::Result<()> {
 		File::flush(&mut self.inner)
 	}
+
 	fn close(&mut self) -> crate::Result<()> {
 		File::close(&mut self.inner)
 	}
+
 	fn seek(&mut self, pos: SeekFrom) -> crate::Result<u64> {
 		File::seek(&mut self.inner, pos)
 	}
+
 	fn read(&mut self, buf: &mut [u8]) -> crate::Result<usize> {
 		File::read(&mut self.inner, buf)
 	}
+
 	fn read_all(&mut self, buf: &mut Vec<u8>) -> crate::Result<usize> {
 		File::read_all(&mut self.inner, buf)
 	}
+
 	fn lock(&self) -> crate::Result<()> {
 		File::lock(&self.inner)
 	}
+
 	fn unlock(&self) -> crate::Result<()> {
 		File::unlock(&self.inner)
 	}
+
 	fn read_at(&self, offset: u64, buf: &mut [u8]) -> crate::Result<usize> {
 		self.reads.fetch_add(1, Ordering::Relaxed);
 		self.inner.read_at(offset, buf)
 	}
+
 	fn write_at(&mut self, offset: u64, buf: &[u8]) -> crate::Result<usize> {
 		File::write_at(&mut self.inner, offset, buf)
 	}
+
 	fn sync(&self) -> crate::Result<()> {
 		File::sync(&self.inner)
 	}
+
 	fn sync_data(&self) -> crate::Result<()> {
 		File::sync_data(&self.inner)
 	}
+
 	fn size(&self) -> crate::Result<u64> {
 		File::size(&self.inner)
 	}
@@ -491,6 +503,75 @@ fn proof_gb_scale_legacy_filter_needs_1gb_partitioned_does_not() {
 	);
 }
 
+// --- Read-path perf smoke: gets (hit/miss) + full scan ------------------------
+
+/// Wall-clock smoke comparison for the read path. Not a rigorous benchmark;
+/// run once per side with `cargo test --release --lib perf_get_range_smoke
+/// -- --ignored --nocapture` and compare against main built the same way.
+#[test]
+#[ignore = "wall-clock perf smoke; run once with --release"]
+fn perf_get_range_smoke() {
+	use std::time::Instant;
+
+	// ~64 MB table, ~100 B values (~550k keys) — the shape one compaction
+	// output has after this branch.
+	let (table, _reads, n) = build_counted_table(64 * 1024 * 1024);
+	const OPS: usize = 200_000;
+
+	let present = |i: usize| {
+		let k = (i * 7919) % n;
+		InternalKey::new(
+			format!("key{k:012}").into_bytes(),
+			INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Set,
+			0,
+		)
+	};
+	let absent = |i: usize| {
+		let k = (i * 7919) % n;
+		InternalKey::new(
+			format!("key{k:012}x").into_bytes(),
+			INTERNAL_KEY_SEQ_NUM_MAX,
+			InternalKeyKind::Set,
+			0,
+		)
+	};
+
+	// Warm-up pass so both sides measure steady-state (caches populated).
+	for i in 0..OPS / 10 {
+		let _ = table.get(&present(i)).unwrap();
+		let _ = table.get(&absent(i)).unwrap();
+	}
+
+	let t = Instant::now();
+	for i in 0..OPS {
+		assert!(table.get(&present(i)).unwrap().is_some());
+	}
+	let present_ns = t.elapsed().as_nanos() as u64 / OPS as u64;
+
+	let t = Instant::now();
+	for i in 0..OPS {
+		assert!(table.get(&absent(i)).unwrap().is_none());
+	}
+	let absent_ns = t.elapsed().as_nanos() as u64 / OPS as u64;
+
+	let t = Instant::now();
+	let mut iter = table.iter(None).unwrap();
+	iter.seek_first().unwrap();
+	let mut scanned = 0usize;
+	while iter.valid() {
+		scanned += 1;
+		iter.next().unwrap();
+	}
+	let scan_ms = t.elapsed().as_millis();
+	assert_eq!(scanned, n);
+
+	eprintln!(
+		"PERF: present-get = {present_ns} ns/op, absent-get = {absent_ns} ns/op, full scan of \
+		 {scanned} keys = {scan_ms} ms"
+	);
+}
+
 // --- B-P1: filter build memory ------------------------------------------------
 
 /// Writes `n` entries with values of `value_size` bytes through a
@@ -754,7 +835,10 @@ fn proof_p3_compaction_splits_output_at_target_file_size() {
 	// plus one block; 25% is generous headroom.
 	let max_allowed = TARGET + TARGET / 4;
 	for (i, size) in l1_sizes.iter().enumerate() {
-		assert!(*size <= max_allowed, "output {i} is {size} bytes, above target+25% ({max_allowed})");
+		assert!(
+			*size <= max_allowed,
+			"output {i} is {size} bytes, above target+25% ({max_allowed})"
+		);
 	}
 
 	// The split outputs must form disjoint, sorted ranges and preserve every
