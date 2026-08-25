@@ -433,6 +433,17 @@ impl Transaction {
 	/// [`Error::TransactionWriteConflict`]. The locked read itself persists
 	/// nothing.
 	///
+	/// The guarantee is snapshot validation, not mutual exclusion: commit
+	/// fails only if another transaction committed a *write* to the key
+	/// after this transaction's snapshot. A locked read publishes nothing,
+	/// so it is invisible to other transactions' conflict checks — two
+	/// transactions may lock the same key concurrently and, provided
+	/// neither commits a write to it, both commit successfully. Locked
+	/// reads therefore do not prevent write skew between transactions that
+	/// only read the contended key; callers that need concurrent lockers of
+	/// the same key to conflict with each other must write the key (for
+	/// example, by writing back the value that was read).
+	///
 	/// Requires a `ReadWrite` transaction: read-only transactions cannot run
 	/// commit-time validation, and write-only transactions cannot read.
 	///
@@ -776,7 +787,14 @@ impl Transaction {
 		Ok(())
 	}
 
-	/// Commits the transaction, by writing all pending entries to the store.
+	/// Commits the transaction, writing all pending entries to the store and
+	/// validating any locked reads against the commit oracle.
+	///
+	/// A commit attempt is terminal: on success and on failure alike the
+	/// transaction closes, and every subsequent operation on it returns
+	/// [`Error::TransactionClosed`]. The attempt consumes the pending write
+	/// and locked-read state, so a failed commit cannot be retried — begin a
+	/// new transaction instead.
 	pub async fn commit(&mut self) -> Result<()> {
 		// If the transaction is closed, return an error.
 		if self.closed {
@@ -788,19 +806,36 @@ impl Transaction {
 			return Err(Error::TransactionReadOnly);
 		}
 
+		let result = self.commit_inner().await;
+
+		// Close the transaction whether the attempt succeeded or failed:
+		// the write set and read set have been consumed, so leaving the
+		// transaction open would let a retried commit report success
+		// without validating or persisting anything. Release the GC
+		// watermark slot promptly; otherwise it waits for Drop.
+		self.closed = true;
+		if let Some(mut g) = self.txn_guard.take() {
+			g.release();
+		}
+
+		result
+	}
+
+	/// Performs the fallible portion of [`commit`]: batch construction,
+	/// oracle validation, and the pipeline write. The caller closes the
+	/// transaction and releases the watermark slot regardless of the
+	/// outcome.
+	///
+	/// [`commit`]: Transaction::commit
+	async fn commit_inner(&mut self) -> Result<()> {
 		// If there are no pending writes, only the locked reads (if any) need
 		// commit-time validation; nothing is persisted.
 		if self.write_set.is_empty() {
-			if !self.read_set.is_empty() {
-				let read_set: Vec<Key> = std::mem::take(&mut self.read_set).into_keys().collect();
-				self.core.check_conflicts(&read_set, self.start_seq_num)?;
+			if self.read_set.is_empty() {
+				return Ok(());
 			}
-			self.closed = true;
-			// Release the GC watermark slot promptly; otherwise it waits for Drop.
-			if let Some(mut g) = self.txn_guard.take() {
-				g.release();
-			}
-			return Ok(());
+			let read_set: Vec<Key> = std::mem::take(&mut self.read_set).into_keys().collect();
+			return self.core.check_conflicts(&read_set, self.start_seq_num);
 		}
 
 		// Create and prepare batch directly. `Batch::new(0)`: the
@@ -842,14 +877,7 @@ impl Transaction {
 		// seq alloc + oracle.publish + WAL atomically under `write_mutex`,
 		// then runs memtable apply OUTSIDE the lock.
 		let should_sync = self.durability == Durability::Immediate;
-		self.core.commit(batch, should_sync, self.start_seq_num, &read_set).await?;
-
-		// Mark the transaction as closed and release the watermark slot.
-		self.closed = true;
-		if let Some(mut g) = self.txn_guard.take() {
-			g.release();
-		}
-		Ok(())
+		self.core.commit(batch, should_sync, self.start_seq_num, &read_set).await
 	}
 
 	pub fn rollback(&mut self) {

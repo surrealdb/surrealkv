@@ -265,8 +265,13 @@ impl CommitPipeline {
 		// Check for background errors before proceeding
 		self.env.check_background_error()?;
 
+		// An empty batch persists nothing, but any locked-read keys must
+		// still be validated before the commit can report success.
 		if batch.is_empty() {
-			return Ok(());
+			if read_set.is_empty() {
+				return Ok(());
+			}
+			return self.check_conflicts(read_set, start_seq);
 		}
 
 		// Check write stall BEFORE acquiring any locks.
@@ -586,6 +591,37 @@ mod tests {
 			visible, 1,
 			"Expected visible=1 after one commit with count=1 (highest seq num used)"
 		);
+
+		pipeline.shutdown();
+	}
+
+	#[test(tokio::test)]
+	async fn test_empty_batch_validates_read_set() {
+		let pipeline =
+			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
+
+		// Publish a write to the key so it carries a commit seq in the oracle.
+		let mut batch = Batch::new(0);
+		batch.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"v1".to_vec()), 0).unwrap();
+		pipeline.commit(batch, false, 0, &[]).await.unwrap();
+
+		// An empty batch with a conflicting locked-read key must fail: the
+		// key was written after the caller's start seq.
+		let result = pipeline.commit(Batch::new(0), false, 0, &[b"key1".to_vec()]).await;
+		assert!(
+			matches!(result, Err(Error::TransactionWriteConflict)),
+			"Expected TransactionWriteConflict, got: {result:?}"
+		);
+
+		// The same locked-read key validates cleanly against a start seq at
+		// or after the write's commit seq.
+		let start_seq = pipeline.get_visible_seq_num();
+		let result = pipeline.commit(Batch::new(0), false, start_seq, &[b"key1".to_vec()]).await;
+		assert!(result.is_ok(), "Expected clean validation, got: {result:?}");
+
+		// An empty batch with no locked reads is a no-op.
+		let result = pipeline.commit(Batch::new(0), false, 0, &[]).await;
+		assert!(result.is_ok(), "Expected no-op commit, got: {result:?}");
 
 		pipeline.shutdown();
 	}

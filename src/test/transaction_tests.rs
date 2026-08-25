@@ -1790,6 +1790,72 @@ mod get_for_update_tests {
 		let mut wo = store.begin_with_mode(Mode::WriteOnly).unwrap();
 		assert!(matches!(wo.get_for_update(b"k1"), Err(Error::TransactionWriteOnly)));
 	}
+
+	#[test(tokio::test)]
+	async fn failed_check_only_commit_is_terminal() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The conflicting commit closes the transaction; a retry must fail
+		// loudly rather than report an unvalidated success.
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionClosed)));
+	}
+
+	#[test(tokio::test)]
+	async fn failed_write_commit_is_terminal() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.set(&other, b"v1").unwrap();
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The conflicting commit closes the transaction; a retry must fail
+		// loudly rather than report an unvalidated success.
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionClosed)));
+
+		// The failed commit persisted nothing.
+		let txn3 = store.begin().unwrap();
+		assert!(txn3.get(&other).unwrap().is_none());
+	}
+
+	#[test(tokio::test)]
+	async fn concurrent_lockers_of_same_key_both_commit() {
+		let (store, _) = create_store();
+
+		let shared = Vec::from("shared");
+
+		// A locked read publishes nothing, so it is invisible to the other
+		// transaction's conflict check: locking is snapshot validation, not
+		// mutual exclusion.
+		let mut txn1 = store.begin().unwrap();
+		let mut txn2 = store.begin().unwrap();
+
+		assert!(txn1.get_for_update(&shared).unwrap().is_none());
+		assert!(txn2.get_for_update(&shared).unwrap().is_none());
+
+		txn1.set(b"out1", b"a").unwrap();
+		txn2.set(b"out2", b"b").unwrap();
+
+		txn1.commit().await.unwrap();
+		txn2.commit().await.unwrap();
+	}
 }
 
 #[test(tokio::test)]
