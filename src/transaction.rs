@@ -215,6 +215,15 @@ pub struct Transaction {
 	/// savepoints and rollbacks.
 	pub(crate) write_set: BTreeMap<Key, Vec<Entry>>,
 
+	/// `read_set` holds the keys registered via [`get_for_update`] for
+	/// commit-time conflict validation, each mapped to the savepoint number
+	/// at which it was first registered. These keys join the write-set keys
+	/// in the oracle conflict check at commit but are never written to
+	/// storage.
+	///
+	/// [`get_for_update`]: Transaction::get_for_update
+	pub(crate) read_set: BTreeMap<Key, u32>,
+
 	/// `closed` indicates if the transaction is closed. A closed transaction
 	/// cannot make any more changes to the data.
 	closed: bool,
@@ -283,6 +292,7 @@ impl Transaction {
 			snapshot,
 			core,
 			write_set: BTreeMap::new(),
+			read_set: BTreeMap::new(),
 			durability,
 			closed: false,
 			start_seq_num,
@@ -411,6 +421,41 @@ impl Transaction {
 		K: IntoBytes,
 	{
 		self.get_with_options(key, &ReadOptions::default())
+	}
+
+	/// Gets a value for a key if it exists, and registers the key for
+	/// commit-time conflict validation.
+	///
+	/// Read semantics are identical to [`get`], including read-your-own-writes
+	/// from the write set. In addition, the key joins the oracle conflict
+	/// check at commit: if another transaction commits a write to the key
+	/// after this transaction started, the commit fails with
+	/// [`Error::TransactionWriteConflict`]. The locked read itself persists
+	/// nothing.
+	///
+	/// Requires a `ReadWrite` transaction: read-only transactions cannot run
+	/// commit-time validation, and write-only transactions cannot read.
+	///
+	/// [`get`]: Transaction::get
+	pub fn get_for_update<K>(&mut self, key: K) -> Result<Option<Value>>
+	where
+		K: IntoBytes,
+	{
+		// Commit-time validation requires a commit, which read-only
+		// transactions cannot perform.
+		if !self.mode.mutable() {
+			return Err(Error::TransactionReadOnly);
+		}
+
+		let key = key.into_bytes();
+		let value = self.get_with_options(key.as_slice(), &ReadOptions::default())?;
+
+		// Register the key for the commit-time oracle check. Keep the
+		// earliest savepoint number so a savepoint rollback only releases
+		// locks first acquired after the corresponding set_savepoint call.
+		self.read_set.entry(key).or_insert(self.savepoints);
+
+		Ok(value)
 	}
 
 	/// Gets a value for a key at a specific timestamp.
@@ -743,8 +788,13 @@ impl Transaction {
 			return Err(Error::TransactionReadOnly);
 		}
 
-		// If there are no pending writes, there's nothing to commit, so return early.
+		// If there are no pending writes, only the locked reads (if any) need
+		// commit-time validation; nothing is persisted.
 		if self.write_set.is_empty() {
+			if !self.read_set.is_empty() {
+				let read_set: Vec<Key> = std::mem::take(&mut self.read_set).into_keys().collect();
+				self.core.check_conflicts(&read_set, self.start_seq_num)?;
+			}
 			self.closed = true;
 			// Release the GC watermark slot promptly; otherwise it waits for Drop.
 			if let Some(mut g) = self.txn_guard.take() {
@@ -758,6 +808,14 @@ impl Transaction {
 		// seq allocation. The pipeline derives oracle keys from
 		// `batch.entries` itself, so we don't pre-collect a parallel vector.
 		let mut batch = Batch::new(0);
+
+		// Locked-read keys not shadowed by a write join the oracle conflict
+		// check alongside the batch keys; shadowed keys are already covered
+		// by the batch entries.
+		let read_set: Vec<Key> = std::mem::take(&mut self.read_set)
+			.into_keys()
+			.filter(|k| !self.write_set.contains_key(k))
+			.collect();
 
 		// Extract the vector of entries for the current transaction,
 		// respecting the insertion order recorded with Entry::seqno.
@@ -784,7 +842,7 @@ impl Transaction {
 		// seq alloc + oracle.publish + WAL atomically under `write_mutex`,
 		// then runs memtable apply OUTSIDE the lock.
 		let should_sync = self.durability == Durability::Immediate;
-		self.core.commit(batch, should_sync, self.start_seq_num).await?;
+		self.core.commit(batch, should_sync, self.start_seq_num, &read_set).await?;
 
 		// Mark the transaction as closed and release the watermark slot.
 		self.closed = true;
@@ -797,6 +855,7 @@ impl Transaction {
 	pub fn rollback(&mut self) {
 		self.closed = true;
 		self.write_set.clear();
+		self.read_set.clear();
 		self.snapshot.take();
 		self.savepoints = 0;
 		self.write_seqno = 0;
@@ -858,6 +917,10 @@ impl Transaction {
 
 		// Remove keys with no entries left after the rollback above.
 		self.write_set.retain(|_, entries| !entries.is_empty());
+
+		// Release locked reads first acquired since the last call to
+		// set_savepoint().
+		self.read_set.retain(|_, savepoint_no| *savepoint_no != self.savepoints);
 
 		// Decrement the latest savepoint number unless it's zero.
 		// Cannot undeflow due to the zero check above.

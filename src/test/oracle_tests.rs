@@ -114,7 +114,8 @@ async fn test_no_false_aborts_disjoint_keys() {
 }
 
 /// SI allows write-skew: txn1 reads X writes Y; txn2 reads X writes Z.
-/// Both must commit successfully because we do not track reads.
+/// Both must commit successfully because plain reads are not tracked
+/// (only `get_for_update` registers keys for validation).
 /// This confirms the design did not accidentally drift toward serializability.
 #[test(tokio::test)]
 async fn test_si_write_skew_still_allowed() {
@@ -436,5 +437,46 @@ async fn test_gc_oldest_active_monotonic() {
 		let mut t = store.begin().unwrap();
 		t.set(format!("mono_{i}").as_bytes(), b"v").unwrap();
 		t.commit().await.unwrap();
+	}
+}
+
+/// A check-only committer (locked read, no writes) racing a writer of the
+/// same key. The reader's commit validates under `write_mutex`, so it
+/// either serializes before the writer's publish (both commit) or after it
+/// (the reader gets `TransactionWriteConflict`). The writer must always
+/// commit; no other error variant is acceptable on either side.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn test_locked_read_check_only_races_writer() {
+	let (store, _td) = create_store();
+	let store = Arc::new(store);
+
+	const ITERS: usize = 200;
+	for i in 0..ITERS {
+		let key = format!("locked_key_{i}").into_bytes();
+
+		let store1 = Arc::clone(&store);
+		let store2 = Arc::clone(&store);
+		let k1 = key.clone();
+		let k2 = key.clone();
+
+		let reader = tokio::spawn(async move {
+			let mut t = store1.begin().unwrap();
+			t.get_for_update(&k1).unwrap();
+			t.commit().await
+		});
+		let writer = tokio::spawn(async move {
+			let mut t = store2.begin().unwrap();
+			t.set(&k2, b"v").unwrap();
+			t.commit().await
+		});
+
+		let r = reader.await.unwrap();
+		let w = writer.await.unwrap();
+
+		assert!(w.is_ok(), "iteration {i}: writer must commit: {w:?}");
+		assert!(
+			r.is_ok() || matches!(r, Err(Error::TransactionWriteConflict)),
+			"iteration {i}: unexpected reader result: {r:?}"
+		);
 	}
 }

@@ -1591,6 +1591,207 @@ mod savepoint_tests {
 	}
 }
 
+mod get_for_update_tests {
+	use test_log::test;
+
+	use super::*;
+
+	#[test(tokio::test)]
+	async fn conflict_when_locked_key_written_by_other_txn() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		// Another transaction commits a write to the locked key.
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// txn1 writes a different key; the locked read still conflicts.
+		txn1.set(&other, b"v1").unwrap();
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn no_conflict_when_other_txn_writes_unrelated_key() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+		let unrelated = Vec::from("k3");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		// Another transaction commits a write to a key txn1 never locked.
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&unrelated, b"v3").unwrap();
+		txn2.commit().await.unwrap();
+
+		txn1.set(&other, b"v1").unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn locked_key_also_written_still_conflicts() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The locked key is also written, so the write-set key alone
+		// carries the conflict.
+		txn1.set(&key, b"v1").unwrap();
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn check_only_commit_conflicts_on_locked_key() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		// txn1 locks the key but writes nothing.
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn check_only_commit_succeeds_without_concurrent_writer() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let value = Vec::from("v1");
+
+		let mut txn = store.begin().unwrap();
+		txn.set(&key, &value).unwrap();
+		txn.commit().await.unwrap();
+
+		// A locked read with no writes and no concurrent writer commits fine.
+		let mut txn1 = store.begin().unwrap();
+		assert_eq!(&txn1.get_for_update(&key).unwrap().unwrap(), &value);
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn reads_match_get_including_ryow() {
+		let (store, _) = create_store();
+
+		let key1 = Vec::from("k1");
+		let key2 = Vec::from("k2");
+		let value1 = Vec::from("v1");
+		let value2 = Vec::from("v2");
+
+		let mut txn = store.begin().unwrap();
+		txn.set(&key1, &value1).unwrap();
+		txn.commit().await.unwrap();
+
+		let mut txn1 = store.begin().unwrap();
+
+		// Committed value.
+		assert_eq!(txn1.get(&key1).unwrap(), txn1.get_for_update(&key1).unwrap());
+		assert_eq!(&txn1.get_for_update(&key1).unwrap().unwrap(), &value1);
+
+		// Missing key.
+		assert!(txn1.get_for_update(&key2).unwrap().is_none());
+
+		// RYOW: a pending write is visible.
+		txn1.set(&key2, &value2).unwrap();
+		assert_eq!(&txn1.get_for_update(&key2).unwrap().unwrap(), &value2);
+
+		// RYOW: a pending delete reads as None.
+		txn1.delete(&key1).unwrap();
+		assert!(txn1.get_for_update(&key1).unwrap().is_none());
+	}
+
+	#[test(tokio::test)]
+	async fn plain_get_does_not_register_for_validation() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// A plain get takes no lock, so txn1 commits fine.
+		txn1.set(&other, b"v1").unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn savepoint_rollback_releases_locks_taken_after_savepoint() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		txn1.set_savepoint().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.rollback_to_savepoint().unwrap();
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The lock was rolled back with the savepoint, so no conflict.
+		txn1.set(&other, b"v1").unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn savepoint_rollback_keeps_locks_taken_before_savepoint() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.set_savepoint().unwrap();
+		// Re-locking after the savepoint must not downgrade the earlier lock.
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.rollback_to_savepoint().unwrap();
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn rejected_in_read_only_and_write_only_modes() {
+		let (store, _) = create_store();
+
+		let mut ro = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		assert!(matches!(ro.get_for_update(b"k1"), Err(Error::TransactionReadOnly)));
+
+		let mut wo = store.begin_with_mode(Mode::WriteOnly).unwrap();
+		assert!(matches!(wo.get_for_update(b"k1"), Err(Error::TransactionWriteOnly)));
+	}
+}
+
 #[test(tokio::test)]
 async fn test_soft_delete_basic_functionality() {
 	let (store, _temp_dir) = create_store();
