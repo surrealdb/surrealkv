@@ -1856,6 +1856,45 @@ mod get_for_update_tests {
 		txn1.commit().await.unwrap();
 		txn2.commit().await.unwrap();
 	}
+
+	#[test(tokio::test)]
+	async fn cancelled_commit_success_on_retry() {
+		let temp_dir = create_temp_directory();
+		let store = TreeBuilder::new()
+			.with_path(temp_dir.path().to_path_buf())
+			.with_memtable_stall_threshold(2)
+			.build()
+			.unwrap();
+		// Force commit to wait before writing.
+		{
+			let mut immutables = store.core.inner.immutable_memtables.write().unwrap();
+			immutables.add(1, 0, Arc::new(crate::memtable::MemTable::new(1024)));
+			immutables.add(2, 0, Arc::new(crate::memtable::MemTable::new(1024)));
+		}
+
+		let locked = Vec::from("locked");
+		let written = Vec::from("written");
+
+		let mut txn = store.begin().unwrap();
+		assert!(txn.get_for_update(&locked).unwrap().is_none());
+		txn.set(&written, b"value").unwrap();
+
+		let result = tokio::time::timeout(std::time::Duration::from_millis(20), txn.commit()).await;
+		assert!(result.is_err(), "the deliberately stalled commit should time out");
+
+		// A cancelled commit must close the transaction.
+		assert!(txn.read_set.is_empty(), "cancelled commit drained the locked reads");
+		assert!(txn.write_set.is_empty(), "cancelled commit drained the pending writes");
+		let post_cancel_read = txn.get(&locked);
+		let retry_result = txn.commit().await;
+		let reader = store.begin().unwrap();
+		assert!(reader.get(&written).unwrap().is_none(), "cancelled write unexpectedly persisted");
+		assert!(
+			matches!(&post_cancel_read, Err(Error::TransactionClosed))
+				&& matches!(&retry_result, Err(Error::TransactionClosed)),
+			"cancelled commit must close the transaction: post_cancel_read={post_cancel_read:?}, retry_result={retry_result:?}"
+		);
+	}
 }
 
 #[test(tokio::test)]

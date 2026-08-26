@@ -806,17 +806,13 @@ impl Transaction {
 			return Err(Error::TransactionReadOnly);
 		}
 
-		let result = self.commit_inner().await;
-
-		// Close the transaction whether the attempt succeeded or failed:
-		// the write set and read set have been consumed, so leaving the
-		// transaction open would let a retried commit report success
-		// without validating or persisting anything. Release the GC
-		// watermark slot promptly; otherwise it waits for Drop.
+		// Close before awaiting so a cancelled commit cannot be retried.
 		self.closed = true;
-		if let Some(mut g) = self.txn_guard.take() {
-			g.release();
-		}
+
+		// Moving the guard here releases it even if commit is cancelled.
+		let txn_guard = self.txn_guard.take();
+		let result = self.commit_inner().await;
+		drop(txn_guard);
 
 		result
 	}
