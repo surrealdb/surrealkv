@@ -10,6 +10,7 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::oracle::CommitOracle;
 use crate::stall::WriteStallController;
+use crate::Key;
 
 const MAX_CONCURRENT_COMMITS: usize = 8;
 const DEQUEUE_BITS: u32 = 32;
@@ -250,7 +251,13 @@ impl CommitPipeline {
 		self.oracle.reset_for_restore(max_seq);
 	}
 
-	pub(crate) async fn commit(&self, mut batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
+	pub(crate) async fn commit(
+		&self,
+		mut batch: Batch,
+		sync: bool,
+		start_seq: u64,
+		read_set: &[Key],
+	) -> Result<()> {
 		if self.shutdown.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
@@ -258,8 +265,13 @@ impl CommitPipeline {
 		// Check for background errors before proceeding
 		self.env.check_background_error()?;
 
+		// An empty batch persists nothing, but any locked-read keys must
+		// still be validated before the commit can report success.
 		if batch.is_empty() {
-			return Ok(());
+			if read_set.is_empty() {
+				return Ok(());
+			}
+			return self.check_conflicts(read_set, start_seq);
 		}
 
 		// Check write stall BEFORE acquiring any locks.
@@ -290,15 +302,26 @@ impl CommitPipeline {
 		//      enqueued. Roll back those entries (seq-match guard preserves concurrent
 		//      overwriters), drain the queue slot, release the lock, and return the error.
 		//
-		// Keys are derived from `batch.entries` (single source of truth).
-		// Duplicate keys within a batch (e.g. from savepoint history) are
-		// harmless: oracle.check/publish are idempotent on the same key.
+		// Write keys are derived from `batch.entries` (single source of
+		// truth); `read_set` contributes check-only keys that are validated
+		// but never published or written. Duplicate keys within a batch
+		// (e.g. from savepoint history) are harmless: oracle.check/publish
+		// are idempotent on the same key.
 		let (processed_batch, allocated_seq): (Batch, u64) = {
 			let _guard = self.write_mutex.lock();
 
-			// Validate against the oracle. No state has changed yet; on
-			// failure `?` simply returns the error to the caller.
-			self.oracle.check(batch.entries.iter().map(|e| e.key.as_slice()), start_seq)?;
+			// Validate against the oracle. The checked keys are the union of
+			// the batch's write keys and the caller's locked-read keys; only
+			// the write keys are published below. No state has changed yet;
+			// on failure `?` simply returns the error to the caller.
+			self.oracle.check(
+				batch
+					.entries
+					.iter()
+					.map(|e| e.key.as_slice())
+					.chain(read_set.iter().map(|k| k.as_slice())),
+				start_seq,
+			)?;
 
 			let count = batch.count() as u64;
 			let seq_num = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
@@ -401,6 +424,28 @@ impl CommitPipeline {
 		}
 
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
+	}
+
+	/// Validate `keys` against the commit oracle without allocating a seq,
+	/// publishing oracle entries, or writing anything.
+	///
+	/// This is the commit path for a transaction whose only commit-time
+	/// obligation is conflict validation of locked reads. The check runs
+	/// under `write_mutex`, which makes it atomic with respect to concurrent
+	/// committers: every commit that entered the critical section before us
+	/// has already published its oracle entries and is visible to this
+	/// check, and every commit that enters after us serializes after this
+	/// transaction's validation point.
+	pub(crate) fn check_conflicts(&self, keys: &[Key], start_seq: u64) -> Result<()> {
+		if self.shutdown.load(Ordering::Acquire) {
+			return Err(Error::PipelineStall);
+		}
+
+		// Check for background errors before proceeding
+		self.env.check_background_error()?;
+
+		let _guard = self.write_mutex.lock();
+		self.oracle.check(keys.iter().map(|k| k.as_slice()), start_seq)
 	}
 
 	#[cfg(test)]
@@ -538,7 +583,7 @@ mod tests {
 			.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"value1".to_vec()), 0)
 			.unwrap();
 
-		let result = pipeline.commit(batch, false, 0).await;
+		let result = pipeline.commit(batch, false, 0, &[]).await;
 		assert!(result.is_ok(), "Single commit failed: {result:?}");
 
 		let visible = pipeline.get_visible_seq_num();
@@ -546,6 +591,37 @@ mod tests {
 			visible, 1,
 			"Expected visible=1 after one commit with count=1 (highest seq num used)"
 		);
+
+		pipeline.shutdown();
+	}
+
+	#[test(tokio::test)]
+	async fn test_empty_batch_validates_read_set() {
+		let pipeline =
+			CommitPipeline::new(Arc::new(MockEnv), test_visible_seq_num(), test_write_stall());
+
+		// Publish a write to the key so it carries a commit seq in the oracle.
+		let mut batch = Batch::new(0);
+		batch.add_record(InternalKeyKind::Set, b"key1".to_vec(), Some(b"v1".to_vec()), 0).unwrap();
+		pipeline.commit(batch, false, 0, &[]).await.unwrap();
+
+		// An empty batch with a conflicting locked-read key must fail: the
+		// key was written after the caller's start seq.
+		let result = pipeline.commit(Batch::new(0), false, 0, &[b"key1".to_vec()]).await;
+		assert!(
+			matches!(result, Err(Error::TransactionWriteConflict)),
+			"Expected TransactionWriteConflict, got: {result:?}"
+		);
+
+		// The same locked-read key validates cleanly against a start seq at
+		// or after the write's commit seq.
+		let start_seq = pipeline.get_visible_seq_num();
+		let result = pipeline.commit(Batch::new(0), false, start_seq, &[b"key1".to_vec()]).await;
+		assert!(result.is_ok(), "Expected clean validation, got: {result:?}");
+
+		// An empty batch with no locked reads is a no-op.
+		let result = pipeline.commit(Batch::new(0), false, 0, &[]).await;
+		assert!(result.is_ok(), "Expected no-op commit, got: {result:?}");
 
 		pipeline.shutdown();
 	}
@@ -566,7 +642,7 @@ mod tests {
 					i,
 				)
 				.unwrap();
-			let result = pipeline.commit(batch, false, 0).await;
+			let result = pipeline.commit(batch, false, 0, &[]).await;
 			assert!(result.is_ok(), "Sequential commit {i} failed: {result:?}");
 		}
 
@@ -593,7 +669,7 @@ mod tests {
 						i,
 					)
 					.unwrap();
-				pipeline.commit(batch, false, 0).await
+				pipeline.commit(batch, false, 0, &[]).await
 			});
 			handles.push(handle);
 		}
@@ -675,7 +751,7 @@ mod tests {
 						i,
 					)
 					.unwrap();
-				pipeline.commit(batch, false, 0).await
+				pipeline.commit(batch, false, 0, &[]).await
 			});
 			handles.push(handle);
 		}
@@ -760,7 +836,7 @@ mod tests {
 				)
 				.unwrap();
 
-			let result = pipeline.commit(batch, false, 0).await;
+			let result = pipeline.commit(batch, false, 0, &[]).await;
 			assert!(result.is_err(), "Expected error at iteration {i}");
 		}
 
@@ -839,7 +915,7 @@ mod tests {
 				)
 				.unwrap();
 
-			let result = pipeline.commit(batch, false, 0).await;
+			let result = pipeline.commit(batch, false, 0, &[]).await;
 
 			if i < fail_count {
 				assert!(result.is_err(), "Expected error at iteration {i}");
@@ -871,7 +947,7 @@ mod tests {
 		// allocated seq, then rolled back inside `commit()` on the apply error.
 		let mut batch = Batch::new(0);
 		batch.add_record(InternalKeyKind::Set, b"K".to_vec(), Some(b"v1".to_vec()), 0).unwrap();
-		let r1 = pipeline.commit(batch, false, 0).await;
+		let r1 = pipeline.commit(batch, false, 0, &[]).await;
 		assert!(r1.is_err(), "expected first apply to fail, got {r1:?}");
 		assert_eq!(pipeline.oracle().len(), 0, "rollback should have removed the entry");
 
@@ -880,7 +956,7 @@ mod tests {
 		// the oracle is empty so this MUST succeed — no ghost conflict.
 		let mut batch = Batch::new(0);
 		batch.add_record(InternalKeyKind::Set, b"K".to_vec(), Some(b"v2".to_vec()), 0).unwrap();
-		let r2 = pipeline.commit(batch, false, 0).await;
+		let r2 = pipeline.commit(batch, false, 0, &[]).await;
 		assert!(r2.is_ok(), "second commit on K should succeed (no ghost), got {r2:?}");
 
 		pipeline.shutdown();
@@ -948,7 +1024,7 @@ mod tests {
 					0,
 				)
 				.unwrap();
-			let r = pipeline.commit(batch, false, 0).await;
+			let r = pipeline.commit(batch, false, 0, &[]).await;
 			assert!(r.is_ok(), "iter {i}: commit must succeed, got {r:?}");
 		}
 

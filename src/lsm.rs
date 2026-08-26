@@ -29,6 +29,7 @@ use crate::{
 	Comparator,
 	Error,
 	FilterPolicy,
+	Key,
 	LSMIterator,
 	Options,
 	TimestampComparator,
@@ -1287,12 +1288,27 @@ impl Core {
 		Ok(core)
 	}
 
-	pub(crate) async fn commit(&self, batch: Batch, sync: bool, start_seq: u64) -> Result<()> {
+	pub(crate) async fn commit(
+		&self,
+		batch: Batch,
+		sync: bool,
+		start_seq: u64,
+		read_set: &[Key],
+	) -> Result<()> {
 		// Commit the batch using the commit pipeline. `start_seq` is the
 		// transaction's snapshot seq (used by the oracle's write-write
 		// conflict check). The write keys are derived from `batch.entries`
-		// inside the pipeline — no duplicated parallel array.
-		self.commit_pipeline.commit(batch, sync, start_seq).await
+		// inside the pipeline — no duplicated parallel array. `read_set`
+		// carries locked-read keys that join the conflict check without
+		// being written.
+		self.commit_pipeline.commit(batch, sync, start_seq, read_set).await
+	}
+
+	pub(crate) fn check_conflicts(&self, keys: &[Key], start_seq: u64) -> Result<()> {
+		// Validate locked-read keys against the commit oracle without
+		// writing anything. Used by transactions whose commit carries only
+		// locked reads.
+		self.commit_pipeline.check_conflicts(keys, start_seq)
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {

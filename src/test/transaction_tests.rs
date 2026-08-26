@@ -1591,6 +1591,312 @@ mod savepoint_tests {
 	}
 }
 
+mod get_for_update_tests {
+	use test_log::test;
+
+	use super::*;
+
+	#[test(tokio::test)]
+	async fn conflict_when_locked_key_written_by_other_txn() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		// Another transaction commits a write to the locked key.
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// txn1 writes a different key; the locked read still conflicts.
+		txn1.set(&other, b"v1").unwrap();
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn no_conflict_when_other_txn_writes_unrelated_key() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+		let unrelated = Vec::from("k3");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		// Another transaction commits a write to a key txn1 never locked.
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&unrelated, b"v3").unwrap();
+		txn2.commit().await.unwrap();
+
+		txn1.set(&other, b"v1").unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn locked_key_also_written_still_conflicts() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The locked key is also written, so the write-set key alone
+		// carries the conflict.
+		txn1.set(&key, b"v1").unwrap();
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn check_only_commit_conflicts_on_locked_key() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		// txn1 locks the key but writes nothing.
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn check_only_commit_succeeds_without_concurrent_writer() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let value = Vec::from("v1");
+
+		let mut txn = store.begin().unwrap();
+		txn.set(&key, &value).unwrap();
+		txn.commit().await.unwrap();
+
+		// A locked read with no writes and no concurrent writer commits fine.
+		let mut txn1 = store.begin().unwrap();
+		assert_eq!(&txn1.get_for_update(&key).unwrap().unwrap(), &value);
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn reads_match_get_including_ryow() {
+		let (store, _) = create_store();
+
+		let key1 = Vec::from("k1");
+		let key2 = Vec::from("k2");
+		let value1 = Vec::from("v1");
+		let value2 = Vec::from("v2");
+
+		let mut txn = store.begin().unwrap();
+		txn.set(&key1, &value1).unwrap();
+		txn.commit().await.unwrap();
+
+		let mut txn1 = store.begin().unwrap();
+
+		// Committed value.
+		assert_eq!(txn1.get(&key1).unwrap(), txn1.get_for_update(&key1).unwrap());
+		assert_eq!(&txn1.get_for_update(&key1).unwrap().unwrap(), &value1);
+
+		// Missing key.
+		assert!(txn1.get_for_update(&key2).unwrap().is_none());
+
+		// RYOW: a pending write is visible.
+		txn1.set(&key2, &value2).unwrap();
+		assert_eq!(&txn1.get_for_update(&key2).unwrap().unwrap(), &value2);
+
+		// RYOW: a pending delete reads as None.
+		txn1.delete(&key1).unwrap();
+		assert!(txn1.get_for_update(&key1).unwrap().is_none());
+	}
+
+	#[test(tokio::test)]
+	async fn plain_get_does_not_register_for_validation() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// A plain get takes no lock, so txn1 commits fine.
+		txn1.set(&other, b"v1").unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn savepoint_rollback_releases_locks_taken_after_savepoint() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		txn1.set_savepoint().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.rollback_to_savepoint().unwrap();
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The lock was rolled back with the savepoint, so no conflict.
+		txn1.set(&other, b"v1").unwrap();
+		txn1.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn savepoint_rollback_keeps_locks_taken_before_savepoint() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.set_savepoint().unwrap();
+		// Re-locking after the savepoint must not downgrade the earlier lock.
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.rollback_to_savepoint().unwrap();
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+	}
+
+	#[test(tokio::test)]
+	async fn rejected_in_read_only_and_write_only_modes() {
+		let (store, _) = create_store();
+
+		let mut ro = store.begin_with_mode(Mode::ReadOnly).unwrap();
+		assert!(matches!(ro.get_for_update(b"k1"), Err(Error::TransactionReadOnly)));
+
+		let mut wo = store.begin_with_mode(Mode::WriteOnly).unwrap();
+		assert!(matches!(wo.get_for_update(b"k1"), Err(Error::TransactionWriteOnly)));
+	}
+
+	#[test(tokio::test)]
+	async fn failed_check_only_commit_is_terminal() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The conflicting commit closes the transaction; a retry must fail
+		// loudly rather than report an unvalidated success.
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionClosed)));
+	}
+
+	#[test(tokio::test)]
+	async fn failed_write_commit_is_terminal() {
+		let (store, _) = create_store();
+
+		let key = Vec::from("k1");
+		let other = Vec::from("k2");
+
+		let mut txn1 = store.begin().unwrap();
+		assert!(txn1.get_for_update(&key).unwrap().is_none());
+		txn1.set(&other, b"v1").unwrap();
+
+		let mut txn2 = store.begin().unwrap();
+		txn2.set(&key, b"v2").unwrap();
+		txn2.commit().await.unwrap();
+
+		// The conflicting commit closes the transaction; a retry must fail
+		// loudly rather than report an unvalidated success.
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionWriteConflict)));
+		assert!(matches!(txn1.commit().await, Err(Error::TransactionClosed)));
+
+		// The failed commit persisted nothing.
+		let txn3 = store.begin().unwrap();
+		assert!(txn3.get(&other).unwrap().is_none());
+	}
+
+	#[test(tokio::test)]
+	async fn concurrent_lockers_of_same_key_both_commit() {
+		let (store, _) = create_store();
+
+		let shared = Vec::from("shared");
+
+		// A locked read publishes nothing, so it is invisible to the other
+		// transaction's conflict check: locking is snapshot validation, not
+		// mutual exclusion.
+		let mut txn1 = store.begin().unwrap();
+		let mut txn2 = store.begin().unwrap();
+
+		assert!(txn1.get_for_update(&shared).unwrap().is_none());
+		assert!(txn2.get_for_update(&shared).unwrap().is_none());
+
+		txn1.set(b"out1", b"a").unwrap();
+		txn2.set(b"out2", b"b").unwrap();
+
+		txn1.commit().await.unwrap();
+		txn2.commit().await.unwrap();
+	}
+
+	#[test(tokio::test)]
+	async fn cancelled_commit_success_on_retry() {
+		let temp_dir = create_temp_directory();
+		let store = TreeBuilder::new()
+			.with_path(temp_dir.path().to_path_buf())
+			.with_memtable_stall_threshold(2)
+			.build()
+			.unwrap();
+		// Force commit to wait before writing.
+		{
+			let mut immutables = store.core.inner.immutable_memtables.write().unwrap();
+			immutables.add(1, 0, Arc::new(crate::memtable::MemTable::new(1024)));
+			immutables.add(2, 0, Arc::new(crate::memtable::MemTable::new(1024)));
+		}
+
+		let locked = Vec::from("locked");
+		let written = Vec::from("written");
+
+		let mut txn = store.begin().unwrap();
+		assert!(txn.get_for_update(&locked).unwrap().is_none());
+		txn.set(&written, b"value").unwrap();
+
+		let result = tokio::time::timeout(std::time::Duration::from_millis(20), txn.commit()).await;
+		assert!(result.is_err(), "the deliberately stalled commit should time out");
+
+		// A cancelled commit must close the transaction.
+		assert!(txn.read_set.is_empty(), "cancelled commit drained the locked reads");
+		assert!(txn.write_set.is_empty(), "cancelled commit drained the pending writes");
+		let post_cancel_read = txn.get(&locked);
+		let retry_result = txn.commit().await;
+		let reader = store.begin().unwrap();
+		assert!(reader.get(&written).unwrap().is_none(), "cancelled write unexpectedly persisted");
+		assert!(
+			matches!(&post_cancel_read, Err(Error::TransactionClosed))
+				&& matches!(&retry_result, Err(Error::TransactionClosed)),
+			"cancelled commit must close the transaction: post_cancel_read={post_cancel_read:?}, retry_result={retry_result:?}"
+		);
+	}
+}
+
 #[test(tokio::test)]
 async fn test_soft_delete_basic_functionality() {
 	let (store, _temp_dir) = create_store();
