@@ -80,9 +80,10 @@ use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
 use crate::sstable::error::SSTableError;
-use crate::sstable::filter_block::{FilterBlockReader, FilterBlockWriter};
+use crate::sstable::filter_block::FilterBlockReader;
 use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
 use crate::sstable::meta::TableMetadata;
+use crate::sstable::partitioned_filter::{PartitionedFilterReader, PartitionedFilterWriter};
 use crate::vfs::File;
 use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{
@@ -345,8 +346,13 @@ pub(crate) struct TableWriter<W: Write> {
 	/// Partitioned index writer
 	partitioned_index: IndexWriter,
 
-	/// Optional bloom filter writer
-	filter_block: Option<FilterBlockWriter>,
+	/// Optional partitioned bloom filter writer (partitions aligned with the
+	/// index partitions; see `partitioned_filter.rs`)
+	filter_block: Option<PartitionedFilterWriter>,
+
+	/// Last separator key handed to the partitioned index — the final filter
+	/// partition is keyed by it at finish()
+	last_index_separator: Vec<u8>,
 
 	/// Comparator for internal keys
 	internal_cmp: Arc<dyn Comparator>,
@@ -359,15 +365,10 @@ pub(crate) struct TableWriter<W: Write> {
 
 impl<W: Write> TableWriter<W> {
 	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
-		let fb = {
-			if let Some(policy) = opts.filter_policy.clone() {
-				let mut f = FilterBlockWriter::new(Arc::clone(&policy));
-				f.start_block(0);
-				Some(f)
-			} else {
-				None
-			}
-		};
+		let fb = opts
+			.filter_policy
+			.clone()
+			.map(|policy| PartitionedFilterWriter::new(policy, opts.index_partition_size));
 
 		let compression_selector = CompressionSelector::new(opts.compression_per_level.clone());
 
@@ -391,9 +392,18 @@ impl<W: Write> TableWriter<W> {
 			)),
 			partitioned_index: IndexWriter::new(Arc::clone(&opts), opts.index_partition_size),
 			filter_block: fb,
+			last_index_separator: Vec::new(),
 			internal_cmp: Arc::clone(&opts.internal_comparator) as Arc<dyn Comparator>,
 			min_vlog_file_id: None,
 		}
+	}
+
+	/// Estimated size of the table file so far: bytes already written plus
+	/// the in-progress data block. Used by compaction to decide when to roll
+	/// over to a new output file.
+	pub(crate) fn estimated_file_size(&self) -> u64 {
+		let pending = self.data_block.as_ref().map_or(0, |b| b.size_estimate());
+		(self.offset + pending) as u64
 	}
 
 	/// Adds a key-value pair to the table.
@@ -415,15 +425,6 @@ impl<W: Write> TableWriter<W> {
 		if !self.prev_block_last_key.is_empty() {
 			let order = self.internal_cmp.compare(&self.prev_block_last_key, &enc_key);
 			assert_eq!(order, Ordering::Less, "Keys must be in ascending order");
-		}
-
-		// Initialize filter block on first key if needed
-		if self.filter_block.is_none() {
-			if let Some(filter_policy) = self.opts.filter_policy.as_ref() {
-				let mut filter_block = FilterBlockWriter::new(Arc::clone(filter_policy));
-				filter_block.start_block(0);
-				self.filter_block = Some(filter_block);
-			}
 		}
 
 		// Track minimum vlog file_id if value is a vlog pointer
@@ -505,9 +506,29 @@ impl<W: Write> TableWriter<W> {
 		let compression_type = self.compression_selector.select_compression(self.target_level);
 		let handle = self.write_compressed_block(contents, compression_type)?;
 
-		// Add index entry: separator_key → block_handle
+		// Add index entry: separator_key → block_handle. If the filter's
+		// current partition is full, ask the index to cut here so filter and
+		// index partitions are created on the same boundary whichever limit
+		// (index bytes or filter keys) is reached first.
 		let handle_encoded = handle.encode();
-		self.partitioned_index.add(&separator_key, &handle_encoded)?;
+		if self.filter_block.as_ref().is_some_and(|f| f.wants_cut()) {
+			self.partitioned_index.request_partition_cut();
+		}
+		let finished_index_partition =
+			self.partitioned_index.add(&separator_key, &handle_encoded)?;
+
+		// Keep the bloom filter's partitions aligned with the index
+		// partitions: when this entry finished an index partition, cut a
+		// filter partition keyed by that partition's last separator, THEN
+		// absorb the just-flushed block's key hashes (they belong to the
+		// same partition as this block's index entry).
+		if let Some(fblock) = self.filter_block.as_mut() {
+			if let Some(partition_last_key) = &finished_index_partition {
+				fblock.cut(partition_last_key);
+			}
+			fblock.absorb_block();
+		}
+		self.last_index_separator = separator_key;
 
 		// Prepare new empty data block
 		self.data_block = Some(BlockWriter::new(
@@ -554,21 +575,35 @@ impl<W: Write> TableWriter<W> {
 			Arc::clone(&self.opts.internal_comparator),
 		);
 
-		// Write filter block
+		// Write the partitioned bloom filter: one block per filter partition
+		// (aligned with the index partitions), then the filter's top-level
+		// index mapping separator keys to partition handles. The meta-index
+		// entry is recorded here but added AFTER the "meta" entry below,
+		// since meta-index keys must be added in ascending order and
+		// "meta" < "partitionedfilter.…".
+		let mut filter_index_entry: Option<(String, BlockHandle)> = None;
 		if let Some(fblock) = self.filter_block.take() {
-			let filter_key = format!("filter.{}", fblock.filter_name());
-			let fblock_data = fblock.finish();
+			let filter_name = format!("partitionedfilter.{}", fblock.filter_name());
+			let last_separator = std::mem::take(&mut self.last_index_separator);
+			let partitions = fblock.finish(&last_separator);
 
-			if !fblock_data.is_empty() {
-				let fblock_handle =
-					self.write_compressed_block(fblock_data, CompressionType::None)?;
-				self.meta.properties.filter_size = fblock_handle.size as u64;
-
-				let mut handle_enc = vec![0u8; 16];
-				let enc_len = fblock_handle.encode_into(&mut handle_enc);
-				let filter_key =
-					InternalKey::new(Vec::from(filter_key.as_bytes()), 0, InternalKeyKind::Set, 0);
-				meta_ix_block.add(&filter_key.encode(), &handle_enc[0..enc_len])?;
+			if !partitions.is_empty() {
+				let mut filter_index = BlockWriter::new(
+					self.opts.index_partition_size,
+					self.opts.block_restart_interval,
+					Arc::clone(&self.opts.internal_comparator),
+				);
+				let mut filter_bytes_total = 0u64;
+				for (separator, bits) in partitions {
+					let handle = self.write_compressed_block(bits, CompressionType::None)?;
+					filter_bytes_total += handle.size as u64;
+					filter_index.add(&separator, &handle.encode())?;
+				}
+				let filter_index_data = filter_index.finish()?;
+				let fi_handle =
+					self.write_compressed_block(filter_index_data, CompressionType::None)?;
+				self.meta.properties.filter_size = filter_bytes_total + fi_handle.size as u64;
+				filter_index_entry = Some((filter_name, fi_handle));
 			}
 		}
 
@@ -587,6 +622,15 @@ impl<W: Write> TableWriter<W> {
 		let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set, 0);
 		let meta_value = self.meta.encode();
 		meta_ix_block.add(&meta_key.encode(), &meta_value)?;
+
+		// Reference the partitioned filter's top-level index (added after
+		// "meta" to keep the meta-index keys ascending)
+		if let Some((name, handle)) = filter_index_entry {
+			let mut handle_enc = vec![0u8; 16];
+			let enc_len = handle.encode_into(&mut handle_enc);
+			let key = InternalKey::new(Vec::from(name.as_bytes()), 0, InternalKeyKind::Set, 0);
+			meta_ix_block.add(&key.encode(), &handle_enc[0..enc_len])?;
+		}
 
 		// Write meta index block
 		let meta_block = meta_ix_block.finish()?;
@@ -772,6 +816,14 @@ pub(crate) fn read_table_block(
 	f: Arc<dyn File>,
 	location: &BlockHandle,
 ) -> Result<Block> {
+	let block = read_verified_raw_block(f, location)?;
+	Ok(Block::new(block, comparator))
+}
+
+/// Reads, checksum-verifies, and decompresses a block's raw bytes without
+/// interpreting them as a restart-encoded `Block` (used for bloom filter
+/// partitions, which have their own encoding).
+pub(crate) fn read_verified_raw_block(f: Arc<dyn File>, location: &BlockHandle) -> Result<Vec<u8>> {
 	// Read block data
 	let buf = read_bytes(Arc::clone(&f), location)?;
 
@@ -798,9 +850,7 @@ pub(crate) fn read_table_block(
 	}
 
 	// Decompress
-	let block = decompress_block(&buf, CompressionType::try_from(compress[0])?)?;
-
-	Ok(Block::new(block, comparator))
+	decompress_block(&buf, CompressionType::try_from(compress[0])?)
 }
 
 /// Verifies a block's checksum.
@@ -855,7 +905,20 @@ pub(crate) struct Table {
 	pub(crate) meta: TableMetadata,
 
 	pub(crate) index_block: IndexType,
-	pub(crate) filter_reader: Option<FilterBlockReader>,
+	pub(crate) filter: TableFilter,
+}
+
+/// Per-file bloom filter reader, dispatched on which meta-index entry the
+/// file carries. Files written before partitioned filters existed hold one
+/// monolithic filter (`filter.<policy>`) and keep their exact old read
+/// path; new files hold partition-per-index-partition filters
+/// (`partitionedfilter.<policy>`). Both kinds coexist in one store with no
+/// migration.
+#[derive(Clone)]
+pub(crate) enum TableFilter {
+	None,
+	Legacy(FilterBlockReader),
+	Partitioned(PartitionedFilterReader),
 }
 
 impl Table {
@@ -887,11 +950,38 @@ impl Table {
 		let writer_metadata =
 			read_writer_meta_properties(&metaindexblock)?.ok_or(Error::TableMetadataNotFound)?;
 
-		// Step 5: Load filter block if configured
-		let filter_reader = if opts.filter_policy.is_some() {
-			Self::read_filter_block(&metaindexblock, Arc::clone(&file), &opts)?
+		// Step 5: Load the bloom filter, dispatching per file on which
+		// meta-index entry exists: files written before partitioned filters
+		// carry a monolithic filter under "filter.<policy>" and keep their
+		// exact old read path (zero migration); new files carry
+		// "partitionedfilter.<policy>" (only the small top-level filter
+		// index is loaded here — partitions are fetched on demand through
+		// the block cache).
+		let filter = if let Some(policy) = opts.filter_policy.as_ref() {
+			let name = policy.name();
+			if let Some(handle) =
+				Self::find_meta_handle(&metaindexblock, &format!("partitionedfilter.{name}"))?
+			{
+				TableFilter::Partitioned(PartitionedFilterReader::new(
+					id,
+					Arc::clone(&opts),
+					Arc::clone(&file),
+					&handle,
+					Arc::clone(policy),
+				)?)
+			} else if let Some(handle) =
+				Self::find_meta_handle(&metaindexblock, &format!("filter.{name}"))?
+			{
+				TableFilter::Legacy(read_filter_block(
+					Arc::clone(&file),
+					&handle,
+					Arc::clone(policy),
+				)?)
+			} else {
+				TableFilter::None
+			}
 		} else {
-			None
+			TableFilter::None
 		};
 
 		Ok(Table {
@@ -899,45 +989,32 @@ impl Table {
 			file,
 			file_size,
 			opts,
-			filter_reader,
+			filter,
 			index_block,
 			meta: writer_metadata,
 		})
 	}
 
-	fn read_filter_block(
-		metaix: &Block,
-		file: Arc<dyn File>,
-		options: &Options,
-	) -> Result<Option<FilterBlockReader>> {
-		let filter_name = format!("filter.{}", options.filter_policy.as_ref().unwrap().name());
-		let filter_key =
-			InternalKey::new(Vec::from(filter_name.as_bytes()), 0, InternalKeyKind::Set, 0);
+	/// Seeks the meta index for an exact entry name and decodes its handle.
+	/// Returns None when the entry is absent or empty (the meta index may
+	/// contain other entries — "meta", either filter kind — so a seek
+	/// landing on a different key means "not present", not corruption).
+	fn find_meta_handle(metaix: &Block, name: &str) -> Result<Option<BlockHandle>> {
+		let seek_key = InternalKey::new(Vec::from(name.as_bytes()), 0, InternalKeyKind::Set, 0);
 
 		let mut metaindexiter = metaix.iter()?;
-		metaindexiter.seek_internal(&filter_key.encode())?;
+		metaindexiter.seek_internal(&seek_key.encode())?;
 
-		if metaindexiter.is_valid() {
-			let k = metaindexiter.key();
-			assert_eq!(k.user_key(), filter_name.as_bytes());
+		if metaindexiter.is_valid() && metaindexiter.key().user_key() == name.as_bytes() {
 			let val = metaindexiter.value_encoded()?;
-
-			let fbl = BlockHandle::decode(val);
-			let filter_block_location = match fbl {
-				Err(e) => {
-					return Err(Error::from(SSTableError::FailedToDecodeBlockHandle {
-						value_bytes: val.to_vec(),
-						context: format!("error: {:?}", e),
-					}));
-				}
-				Ok(res) => res.0,
-			};
-			if filter_block_location.size() > 0 {
-				return Ok(Some(read_filter_block(
-					file,
-					&filter_block_location,
-					Arc::clone(options.filter_policy.as_ref().unwrap()),
-				)?));
+			let (handle, _) = BlockHandle::decode(val).map_err(|e| {
+				Error::from(SSTableError::FailedToDecodeBlockHandle {
+					value_bytes: val.to_vec(),
+					context: format!("error: {:?}", e),
+				})
+			})?;
+			if handle.size() > 0 {
+				return Ok(Some(handle));
 			}
 		}
 		Ok(None)
@@ -1021,11 +1098,21 @@ impl Table {
 	pub(crate) fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
 		let key_encoded = key.encode();
 
-		// Step 1: Bloom filter for early rejection
-		if let Some(ref filters) = self.filter_reader {
-			if !filters.may_contain(key.user_key.as_slice(), 0) {
-				return Ok(None);
+		// Step 1: Bloom filter for early rejection (before any index work)
+		match &self.filter {
+			TableFilter::Legacy(filters) => {
+				// Monolithic filter: every key of the file lives in
+				// partition 0 (the only kind old files can contain).
+				if !filters.may_contain(key.user_key.as_slice(), 0) {
+					return Ok(None);
+				}
 			}
+			TableFilter::Partitioned(filters) => {
+				if !filters.may_contain(&key_encoded, key.user_key.as_slice()) {
+					return Ok(None);
+				}
+			}
+			TableFilter::None => {}
 		}
 
 		let IndexType::Partitioned(partitioned_index) = &self.index_block;

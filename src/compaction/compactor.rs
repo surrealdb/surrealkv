@@ -128,53 +128,53 @@ impl Compactor {
 
 		drop(levels);
 
-		// Create new table
-		let new_table_id = self.options.level_manifest.read().unwrap().next_table_id();
-		let new_table_path = self.get_table_path(new_table_id);
+		// Write merged data, rolling over to a new output file at
+		// target_file_size boundaries. Returns the (id, path) of every
+		// finished output.
+		let outputs = match self.write_merged_table(iterators, input) {
+			Ok(result) => result,
+			Err(e) => {
+				// Guard will unhide tables on drop
+				return Err(e);
+			}
+		};
 
-		// Write merged data
-		let table_created =
-			match self.write_merged_table(&new_table_path, new_table_id, iterators, input) {
-				Ok(result) => result,
+		// Open the finished outputs
+		let mut new_tables = Vec::with_capacity(outputs.len());
+		for (id, path) in &outputs {
+			match self.open_table(*id, path) {
+				Ok(table) => new_tables.push(table),
 				Err(e) => {
-					// Guard will unhide tables on drop
-					return Err(e);
-				}
-			};
-
-		// Open table only if one was created
-		let new_table = if table_created {
-			match self.open_table(new_table_id, &new_table_path) {
-				Ok(table) => Some(table),
-				Err(e) => {
-					// Guard will unhide tables on drop
+					// Guard will unhide tables on drop; the already-written
+					// output files are removed as orphans on next startup.
 					return Err(e);
 				}
 			}
-		} else {
-			None
-		};
+		}
 
 		// Update manifest - this will commit the guard on success
-		self.update_manifest(input, new_table, &mut guard)?;
+		self.update_manifest(input, new_tables, &mut guard)?;
 
 		self.cleanup_old_tables(input);
 
 		Ok(())
 	}
 
-	/// Returns true if a table file was created and finished, false otherwise
+	/// Writes the merged stream into one or more output SSTs, rolling over to
+	/// a new file whenever the current output reaches
+	/// `Options::target_file_size`. Rollover happens only at user-key
+	/// boundaries so all versions of a user key stay in one file (the same
+	/// bytewise grouping `CompactionIterator` uses). Bounding output size
+	/// keeps per-file writer memory (bloom/index build) and future compaction
+	/// inputs independent of level size (issue #397).
+	///
+	/// Returns the `(table_id, path)` of every finished output; empty if the
+	/// merge produced no entries.
 	fn write_merged_table(
 		&self,
-		path: &Path,
-		table_id: u64,
 		merge_iter: Vec<BoxedLSMIterator<'_>>,
 		input: &CompactionInput,
-	) -> Result<bool> {
-		let file = SysFile::create(path)?;
-		let mut writer =
-			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
-
+	) -> Result<Vec<(u64, PathBuf)>> {
 		// Get active snapshots for snapshot-aware compaction
 		// This is a snapshot of the snapshot list at the start of compaction.
 		// Any snapshots created during compaction will be handled by the next compaction.
@@ -193,44 +193,81 @@ impl Compactor {
 			snapshots,
 		);
 
-		let mut entries = 0;
+		let target_file_size = self.options.lopts.target_file_size;
+		let mut outputs: Vec<(u64, PathBuf)> = Vec::new();
+		let mut current: Option<(TableWriter<SysFile>, u64, PathBuf)> = None;
+		let mut prev_user_key: Vec<u8> = Vec::new();
+
 		for item in &mut comp_iter {
 			let (key, value) = item?;
-			writer.add(key, &value)?;
-			entries += 1;
+
+			// Roll over once the current output is full, but only when the
+			// user key changes: versions of one key must never span files.
+			let roll = current.as_ref().is_some_and(|(w, _, _)| {
+				w.estimated_file_size() >= target_file_size
+					&& key.user_key.as_slice() != prev_user_key.as_slice()
+			});
+			if roll {
+				if let Some((w, id, path)) = current.take() {
+					self.finish_output(w, id, &path)?;
+					outputs.push((id, path));
+				}
+			}
+
+			// Open the next output lazily so we never create empty files.
+			let (w, ..) = match &mut current {
+				Some(c) => c,
+				None => {
+					let id = self.options.level_manifest.read()?.next_table_id();
+					let path = self.get_table_path(id);
+					let file = SysFile::create(&path)?;
+					let writer =
+						TableWriter::new(file, id, Arc::clone(&self.options.lopts), input.target_level);
+					current.insert((writer, id, path))
+				}
+			};
+
+			prev_user_key.clear();
+			prev_user_key.extend_from_slice(key.user_key.as_slice());
+			w.add(key, &value)?;
 		}
 
-		if entries == 0 {
-			// No entries - drop writer and remove empty file
-			drop(writer);
-			let _ = std::fs::remove_file(path);
-			return Ok(false);
+		if let Some((w, id, path)) = current.take() {
+			self.finish_output(w, id, &path)?;
+			outputs.push((id, path));
 		}
 
+		if !outputs.is_empty() {
+			// Durability: the directory entries of all outputs must be
+			// durable BEFORE the manifest (fsynced in update_manifest)
+			// references them (surrealdb/surrealdb#7426).
+			crate::lsm::fsync_directory(self.options.lopts.sstable_dir())?;
+		}
+
+		Ok(outputs)
+	}
+
+	/// Finishes one compaction output and makes its contents durable. The
+	/// file must be fsynced before the manifest references it; the directory
+	/// fsync happens once after all outputs are finished.
+	fn finish_output(&self, writer: TableWriter<SysFile>, id: u64, path: &Path) -> Result<()> {
 		writer.finish()?;
-
-		// Durability fix: the SST's data and its directory entry must be
-		// durable BEFORE the manifest (fsynced in update_manifest) references
-		// this table. Otherwise a power loss after the manifest commit leaves
-		// a durable manifest pointing at a zero-byte table, with the merged
-		// inputs already deleted (surrealdb/surrealdb#7426).
 		crate::vfs::fsync_file(path)?;
-		crate::lsm::fsync_directory(self.options.lopts.sstable_dir())?;
-
-		Ok(true)
+		log::debug!("Compaction finished output table {id} at {}", path.display());
+		Ok(())
 	}
 
 	fn update_manifest(
 		&self,
 		input: &CompactionInput,
-		new_table: Option<Arc<Table>>,
+		new_tables: Vec<Arc<Table>>,
 		guard: &mut HiddenTablesGuard,
 	) -> Result<()> {
 		let mut manifest = self.options.level_manifest.write()?;
 		let _imm_guard = self.options.immutable_memtables.write();
 
-		// Check for table ID collision if adding a new table
-		if let Some(ref table) = new_table {
+		// Check for table ID collisions before adding the new tables
+		for table in &new_tables {
 			if input.tables_to_merge.contains(&table.id) {
 				return Err(crate::error::Error::TableIDCollision(table.id));
 			}
@@ -247,8 +284,8 @@ impl Compactor {
 			}
 		}
 
-		// Add new table if present
-		if let Some(table) = new_table {
+		// Add all compaction outputs in the same atomic changeset
+		for table in new_tables {
 			changeset.new_tables.push((input.target_level, table));
 		}
 

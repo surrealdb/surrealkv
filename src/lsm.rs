@@ -1817,6 +1817,14 @@ impl TreeBuilder {
 		self
 	}
 
+	/// Sets the target size for SSTs produced by compaction; a compaction
+	/// rolls over to a new output file once the current one reaches this
+	/// size (cut only at user-key boundaries).
+	pub fn with_target_file_size(mut self, size: u64) -> Self {
+		self.opts = self.opts.with_target_file_size(size);
+		self
+	}
+
 	/// Sets the unified block cache capacity (includes data blocks, index
 	/// blocks, and VLog values).
 	pub fn with_block_cache_capacity(mut self, capacity_bytes: u64) -> Self {

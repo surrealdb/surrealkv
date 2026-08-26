@@ -4,12 +4,19 @@ use integer_encoding::FixedInt;
 
 use crate::FilterPolicy;
 
+#[cfg(test)]
 pub(crate) const FILTER_BASE_LOG2: u32 = 11;
+#[cfg(test)]
 const FILTER_BASE: u32 = 1 << FILTER_BASE_LOG2;
 const FILTER_META_LENGTH: usize = 5; // 4bytes filter offsets length + 1bytes base log
 
-// A writer for writing filter blocks, which are used to quickly test if a key
-// is present in a set of keys.
+// A writer for the LEGACY (pre-partitioned-filter) monolithic filter block
+// format. Production code no longer writes this format — new SSTs carry
+// partitioned filters (see partitioned_filter.rs) — but the READER below
+// stays: every store written before the change holds filter blocks in this
+// format, and they are read forever without migration. The writer is kept
+// under cfg(test) so tests can construct legacy-format blocks.
+#[cfg(test)]
 pub(crate) struct FilterBlockWriter {
 	policy: Arc<dyn FilterPolicy>, // The filter policy used to generate filters.
 	keys: Vec<Vec<u8>>,            // A collection of keys to be added to the filter.
@@ -17,6 +24,7 @@ pub(crate) struct FilterBlockWriter {
 	filter_offsets: Vec<u32>,      // Offsets for each filter in the `filters` vector.
 }
 
+#[cfg(test)]
 impl FilterBlockWriter {
 	// Constructs a new `FilterBlockWriter` with a given filter policy.
 	pub(crate) fn new(policy: Arc<dyn FilterPolicy>) -> Self {
@@ -58,11 +66,6 @@ impl FilterBlockWriter {
 		self.filters.extend(filter); // Append the generated filter to the filters vector.
 
 		self.keys.clear(); // Clear the keys, as they are now included in a filter.
-	}
-
-	// Returns the name of the filter policy.
-	pub(crate) fn filter_name(&self) -> &str {
-		self.policy.name()
 	}
 
 	// Finalizes the filter block, returning the complete set of filters and their

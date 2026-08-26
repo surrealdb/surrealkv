@@ -213,6 +213,13 @@ pub struct Options {
 	/// Level N max bytes = base * multiplier^(N-1)
 	/// Default: 10.0
 	pub level_multiplier: f64,
+	/// Target size for SSTs produced by compaction. A compaction rolls over
+	/// to a new output file once the current one reaches this size (cutting
+	/// only at user-key boundaries), which keeps compaction memory and the
+	/// size of any single compaction's inputs bounded regardless of level
+	/// size.
+	/// Default: 64MB
+	pub target_file_size: u64,
 
 	/// Number of immutable memtables that triggers write stall.
 	/// When immutable memtable count >= this threshold, writes block until flushes complete.
@@ -242,7 +249,11 @@ impl Default for Options {
 			internal_comparator,
 			compression_per_level: Vec::new(),
 			filter_policy: Some(Arc::new(bf)),
-			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(1 << 20)), // 1MB cache
+			// 32MB. The cache is sharded, and each shard enforces a
+			// per-item weight limit derived from capacity/shards; below
+			// ~32MB that limit can reject ~16 KB index/filter partitions
+			// outright, forcing every lookup to re-read them from disk.
+			block_cache: Arc::new(cache::BlockCache::with_capacity_bytes(32 << 20)),
 			path: PathBuf::from(""),
 			level_count: 6,
 			max_memtable_size: 100 * 1024 * 1024,  // 100 MB
@@ -260,6 +271,7 @@ impl Default for Options {
 			level0_max_files: 4,
 			max_bytes_for_level: 256 * 1024 * 1024, // 256MB
 			level_multiplier: 10.0,
+			target_file_size: 64 * 1024 * 1024, // 64MB
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
 		}
@@ -359,6 +371,14 @@ impl Options {
 
 	pub const fn with_max_memtable_size(mut self, value: usize) -> Self {
 		self.max_memtable_size = value;
+		self
+	}
+
+	/// Sets the target size for SSTs produced by compaction; a compaction
+	/// rolls over to a new output file once the current one reaches this
+	/// size (cut only at user-key boundaries).
+	pub const fn with_target_file_size(mut self, value: u64) -> Self {
+		self.target_file_size = value;
 		self
 	}
 
@@ -643,6 +663,25 @@ pub trait FilterPolicy: Send + Sync {
 
 	/// Creates a filter based on given keys
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8>;
+
+	/// Returns the single hash value this policy derives from a key.
+	///
+	/// Filter construction may buffer this hash (4 bytes) instead of the raw
+	/// key, so builder memory stays constant per key regardless of key size.
+	/// `create_filter_from_hashes(&[key_hash(k) for k in keys])` must produce
+	/// exactly the same bytes as `create_filter(keys)`.
+	fn key_hash(&self, key: &[u8]) -> u32;
+
+	/// Creates a filter from pre-computed key hashes (see [`Self::key_hash`]).
+	fn create_filter_from_hashes(&self, hashes: &[u32]) -> Vec<u8>;
+
+	/// Approximates how many keys produce a filter of `partition_bytes`
+	/// bytes — used to size filter partitions (a partition cut is requested
+	/// once this many keys accumulate). The default is a conservative
+	/// 1 byte/key; policies should override with their real density.
+	fn filter_keys_per_partition(&self, partition_bytes: usize) -> usize {
+		partition_bytes.max(1)
+	}
 }
 
 use std::ops::Bound;
