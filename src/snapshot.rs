@@ -178,81 +178,80 @@ impl Snapshot {
 	/// The search stops at the first version found with seq_num <= snapshot
 	/// seq_num.
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
-		// self.core.get_internal(key, self.seq_num)
-		// Read lock on the active memtable
-		let memtable_lock = self.core.active_memtable.read()?;
+		// A key's versions can be interleaved across sources: commits apply
+		// to the memtable OUTSIDE the commit pipeline's write mutex (see
+		// commit.rs), and rotation triggers on ArenaFull from whichever
+		// apply hits it, so a lower-seq batch can land in a NEWER memtable
+		// than a higher-seq batch — and that inversion survives flush and
+		// compaction (two L0 files, or an L0 file vs a deeper level, can
+		// hold a key's versions in inverted recency order). No source may
+		// therefore short-circuit the lookup: collect the newest visible
+		// version across ALL sources, then interpret tombstones once.
+		let mut best: Option<(InternalKey, Value)> = None;
 
-		// Check the active memtable for the key
-		if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
-			if item.0.is_tombstone() {
-				return Ok(None); // Key is a tombstone, return None
+		let consider = |item: (InternalKey, Value), best: &mut Option<(InternalKey, Value)>| {
+			if best.as_ref().is_none_or(|(bk, _)| item.0.seq_num() > bk.seq_num()) {
+				*best = Some(item);
 			}
-			return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
+		};
+
+		// Active memtable
+		{
+			let memtable_lock = self.core.active_memtable.read()?;
+			if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
+				consider(item, &mut best);
+			}
 		}
-		drop(memtable_lock); // Release the lock on the active memtable
 
-		// Read lock on the immutable memtables
-		let memtable_lock = self.core.immutable_memtables.read()?;
-
-		// Check the immutable memtables for the key
-		for entry in memtable_lock.iter().rev() {
-			let memtable = &entry.memtable;
-			if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
-				if item.0.is_tombstone() {
-					return Ok(None); // Key is a tombstone, return None
+		// Immutable memtables
+		{
+			let memtable_lock = self.core.immutable_memtables.read()?;
+			for entry in memtable_lock.iter() {
+				if let Some(item) = entry.memtable.get(key.as_ref(), Some(self.seq_num)) {
+					consider(item, &mut best);
 				}
-				return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
 			}
 		}
-		drop(memtable_lock); // Release the lock on the immutable memtables
 
-		// Read lock on the level manifest
-		let level_manifest = self.core.level_manifest.read()?;
+		// SSTables, all levels
+		{
+			let level_manifest = self.core.level_manifest.read()?;
+			let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
 
-		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
-
-		// Check the tables in each level for the key
-		for (level_idx, level) in (&level_manifest.levels).into_iter().enumerate() {
-			if level_idx == 0 {
-				// Level 0: Tables can overlap, check all
-				for table in level.tables.iter() {
-					if !table.is_key_in_key_range(&ikey) {
-						continue; // Skip this table if the key is not in its range
-					}
-
-					let maybe_item = table.get(&ikey)?;
-
-					if let Some(item) = maybe_item {
-						let ikey = &item.0;
-						if ikey.is_tombstone() {
-							return Ok(None); // Key is a tombstone, return None
+			for (level_idx, level) in (&level_manifest.levels).into_iter().enumerate() {
+				if level_idx == 0 {
+					// Level 0: tables can overlap, check all
+					for table in level.tables.iter() {
+						if !table.is_key_in_key_range(&ikey) {
+							continue;
 						}
-						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
-					}
-				}
-			} else {
-				// Level 1+: Non-overlapping, binary search for the one table
-				let query_range =
-					crate::user_range_to_internal_range(Bound::Included(key), Bound::Included(key));
-				let start_idx = level.find_first_overlapping_table(&query_range);
-				let end_idx = level.find_last_overlapping_table(&query_range);
-
-				// At most one table can contain this exact key
-				for table in &level.tables[start_idx..end_idx] {
-					let maybe_item = table.get(&ikey)?;
-
-					if let Some(item) = maybe_item {
-						let ikey = &item.0;
-						if ikey.is_tombstone() {
-							return Ok(None); // Key is a tombstone, return None
+						if let Some(item) = table.get(&ikey)? {
+							consider(item, &mut best);
 						}
-						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
+					}
+				} else {
+					// Level 1+: non-overlapping, binary search for the table
+					let query_range = crate::user_range_to_internal_range(
+						Bound::Included(key),
+						Bound::Included(key),
+					);
+					let start_idx = level.find_first_overlapping_table(&query_range);
+					let end_idx = level.find_last_overlapping_table(&query_range);
+
+					for table in &level.tables[start_idx..end_idx] {
+						if let Some(item) = table.get(&ikey)? {
+							consider(item, &mut best);
+						}
 					}
 				}
 			}
 		}
 
-		Ok(None) // Key not found in any memtable or table, return None
+		match best {
+			Some((ikey, _)) if ikey.is_tombstone() => Ok(None),
+			Some((ikey, value)) => Ok(Some((value, ikey.seq_num()))),
+			None => Ok(None),
+		}
 	}
 
 	/// Creates an iterator for a range scan within the snapshot
