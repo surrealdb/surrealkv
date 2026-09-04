@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Maximum arena size (u32::MAX to fit in offset)
@@ -21,18 +22,41 @@ pub(crate) const MAX_ARENA_SIZE: usize = u32::MAX as usize;
 pub(crate) struct Arena {
 	/// Current allocation offset (atomically incremented)
 	n: AtomicU64,
-	/// Pre-allocated buffer
-	pub(crate) buf: Box<[u8]>,
+	/// Pre-allocated buffer.
+	///
+	/// Backed by `UnsafeCell<u8>` (not plain `u8`) so that `get_bytes_mut`
+	/// and `get_pointer` can legitimately derive write-capable pointers from
+	/// `&self`. A shared reference to plain bytes only ever grants read
+	/// provenance to those bytes; casting that pointer to `*mut u8` does not
+	/// confer write permission (this was the root cause of the UB this type
+	/// used to invoke). `UnsafeCell` is the documented, Miri-legitimate way
+	/// to opt specific memory out of the "shared reference implies
+	/// read-only" rule under both the Stacked Borrows and Tree Borrows
+	/// models, so that interior mutation through raw pointers is sound.
+	pub(crate) buf: Box<[UnsafeCell<u8>]>,
 }
 
-// Safety: Arena uses atomic operations for all mutations
+// Safety: `UnsafeCell<u8>` makes `Arena` not automatically `Sync` (and
+// `get_bytes_mut`/`get_pointer` hand out raw pointers into `buf`), so this
+// impl is load-bearing, not decorative. It is sound because all mutation of
+// `buf` is coordinated through the atomic `n` cursor in `alloc`: each
+// successful `alloc` call reserves a byte range that no other call can also
+// reserve, so distinct threads never write (or read-while-writing) the same
+// bytes concurrently. `n` being an `AtomicU64` is what makes that
+// coordination itself race-free.
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
 	pub(crate) fn new(capacity: usize) -> Self {
 		let capacity = capacity.min(MAX_ARENA_SIZE);
-		let buf = vec![0u8; capacity].into_boxed_slice();
+		let buf: Box<[u8]> = vec![0u8; capacity].into_boxed_slice();
+		// SAFETY: `UnsafeCell<u8>` is `#[repr(transparent)]` over `u8`, so it
+		// has identical size, alignment, and (lack of) drop glue. A
+		// `Box<[u8]>` allocation is therefore also a valid `Box<[UnsafeCell<u8>]>`
+		// allocation, and this pointer cast/reconstruction is sound.
+		let buf: Box<[UnsafeCell<u8>]> =
+			unsafe { Box::from_raw(Box::into_raw(buf) as *mut [UnsafeCell<u8>]) };
 
 		Self {
 			// Start at 1 to reserve offset 0 as "null"
@@ -81,25 +105,51 @@ impl Arena {
 	}
 
 	/// Get a byte slice from the arena by offset.
+	///
+	/// # Safety (internal invariant, not caller-facing)
+	/// Relies on the same "no writer overlaps this read" discipline as
+	/// `get_bytes_mut`: callers only read a region after the writer that
+	/// populated it (via `get_bytes_mut`/`get_pointer`) has finished with it.
 	#[inline]
 	pub(crate) fn get_bytes(&self, offset: u32, size: u32) -> &[u8] {
 		if offset == 0 {
 			return &[];
 		}
-		&self.buf[offset as usize..(offset + size) as usize]
+		let start = offset as usize;
+		let end = start + size as usize;
+		// Reborrowing through the `UnsafeCell<u8>` slice (rather than
+		// indexing straight into `&[u8]`) keeps these bytes exempt from the
+		// "shared reference implies read-only" rule, matching `buf`'s type.
+		let cell_slice: &[UnsafeCell<u8>] = &self.buf[start..end];
+		let ptr = cell_slice.as_ptr() as *const u8;
+		// SAFETY: `ptr` is derived from a slice pointer covering exactly
+		// `size` initialized bytes within `buf`'s single allocation.
+		unsafe { std::slice::from_raw_parts(ptr, size as usize) }
 	}
 
 	/// Get a mutable byte slice from the arena by offset.
 	///
 	/// # Safety
 	/// Caller must ensure no other references to this region exist.
+	// `clippy::mut_from_ref` is a syntactic lint (it only looks at the `&self`
+	// -> `&mut [u8]` shape) and cannot see that `buf` is `UnsafeCell`-backed,
+	// which is precisely what makes deriving a `&mut` from `&self` sound here
+	// (verified under Miri with both Stacked Borrows and Tree Borrows). This
+	// is not silencing the original soundness bug -- that was fixed at the
+	// `buf` field -- it is a false positive on now-legitimate code.
 	#[allow(clippy::mut_from_ref)]
 	#[inline]
 	pub(crate) unsafe fn get_bytes_mut(&self, offset: u32, size: u32) -> &mut [u8] {
 		if offset == 0 {
 			return &mut [];
 		}
-		let ptr = self.buf.as_ptr().add(offset as usize) as *mut u8;
+		let start = offset as usize;
+		let end = start + size as usize;
+		let cell_ptr: *const UnsafeCell<u8> = self.buf[start..end].as_ptr();
+		// `UnsafeCell::raw_get` derives a write-capable pointer without ever
+		// materializing a shared `&u8`/`&[u8]` over these bytes, which is
+		// what makes the resulting pointer legitimately write-capable.
+		let ptr: *mut u8 = UnsafeCell::raw_get(cell_ptr);
 		std::slice::from_raw_parts_mut(ptr, size as usize)
 	}
 
@@ -109,7 +159,11 @@ impl Arena {
 		if offset == 0 {
 			std::ptr::null_mut()
 		} else {
-			unsafe { self.buf.as_ptr().add(offset as usize) as *mut u8 }
+			// SAFETY: `offset` is at most `buf.len()` (see `alloc`'s bounds
+			// check), so this is at most one-past-the-end, which is valid
+			// for pointer arithmetic (not dereferenced here).
+			let cell_ptr = unsafe { self.buf.as_ptr().add(offset as usize) };
+			UnsafeCell::raw_get(cell_ptr)
 		}
 	}
 
