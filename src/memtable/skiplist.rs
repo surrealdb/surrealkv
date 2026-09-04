@@ -667,10 +667,18 @@ impl Skiplist {
 pub(crate) struct SkiplistIterator<'a> {
 	list: &'a Skiplist,
 	nd: *mut Node,
-	lower: Option<Vec<u8>>,   // Inclusive lower bound
-	upper: Option<Vec<u8>>,   // Exclusive upper bound
-	lower_node: *mut Node,    // Cached node at lower bound
-	upper_node: *mut Node,    // Cached node at upper bound
+	lower: Option<Vec<u8>>, // Inclusive lower bound
+	upper: Option<Vec<u8>>, // Exclusive upper bound
+	// `lower_node` / `upper_node` memoise the first node the cursor was ever
+	// found to sit outside the bounds on, so subsequent steps onto the same node
+	// can be rejected by pointer identity instead of a key comparison.
+	//
+	// They are deliberately sticky: skiplist nodes are immutable and never
+	// unlinked, and the bounds are fixed for the lifetime of the iterator, so
+	// "this node's key is < `lower`" / "this node's key is >= `upper`" are facts
+	// that stay true across re-seeks.
+	lower_node: *mut Node, // Cached node known to be below the inclusive lower bound
+	upper_node: *mut Node, // Cached node known to be at or past the exclusive upper bound
 	encoded_key_buf: Vec<u8>, // Buffer for encoded key to return InternalKeyRef
 }
 
@@ -689,6 +697,18 @@ impl<'a> SkiplistIterator<'a> {
 	#[inline]
 	pub fn key_bytes(&self) -> &[u8] {
 		debug_assert!(self.is_valid());
+		self.node_key_bytes()
+	}
+
+	/// Key bytes of whatever node the cursor sits on, without `is_valid()`'s
+	/// in-bounds requirement.
+	///
+	/// Only for the internal bound walks, which legitimately inspect nodes that
+	/// are outside the iterator's range. The caller must guarantee `nd` is a real
+	/// node (neither sentinel, non-null).
+	#[inline]
+	fn node_key_bytes(&self) -> &[u8] {
+		debug_assert!(!self.nd.is_null() && self.nd != self.list.head && self.nd != self.list.tail);
 		unsafe { (*self.nd).get_key_bytes(&self.list.arena) }
 	}
 
@@ -752,10 +772,16 @@ impl<'a> SkiplistIterator<'a> {
 		if self.nd == self.list.head || self.nd == self.lower_node {
 			return;
 		}
-		// Check upper bound first - if entry is at or past upper, move backward
+		// Check upper bound first - if entry is at or past upper, move backward.
+		//
+		// This walk must not be guarded by `is_valid()`: that reports false for a
+		// cursor parked on `upper_node`, which is precisely the node the walk exists
+		// to step back off. `lower_node` still terminates it, because a node known to
+		// be below the inclusive lower bound means everything from here down is out
+		// of range.
 		if let Some(upper) = self.upper.as_deref() {
-			while self.is_valid() {
-				let key = self.key_bytes();
+			while self.nd != self.list.head && self.nd != self.list.tail && !self.nd.is_null() {
+				let key = self.node_key_bytes();
 				if (self.list.cmp)(upper, key) == Ordering::Greater {
 					// key < upper, so this entry is valid
 					break;

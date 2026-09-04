@@ -25,6 +25,8 @@ pub mod crash_consistency_tests;
 #[cfg(test)]
 pub mod index_block_tests;
 #[cfg(test)]
+pub mod iterator_semantics_tests;
+#[cfg(test)]
 pub mod iterator_tests;
 #[cfg(test)]
 pub mod level_tests;
