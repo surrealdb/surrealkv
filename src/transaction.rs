@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::btree_map::Entry as BTreeEntry;
 use std::collections::BTreeMap;
+use std::ops::Bound;
 use std::sync::Arc;
 
 use crate::batch::Batch;
@@ -616,9 +617,12 @@ impl Transaction {
 	/// The iterator iterates over all keys and values in the
 	/// range, inclusive of the start key, but not the end key.
 	pub fn range_with_options(&self, options: &ReadOptions) -> Result<impl LSMIterator + '_> {
-		let start_key = options.lower_bound.clone().unwrap_or_default();
-		let end_key = options.upper_bound.clone().unwrap_or_default();
-		TransactionRangeIterator::new_with_options(self, Arc::clone(&self.core), start_key, end_key)
+		TransactionRangeIterator::new_with_options(
+			self,
+			Arc::clone(&self.core),
+			options.lower_bound.clone(),
+			options.upper_bound.clone(),
+		)
 	}
 
 	/// Returns a unified history iterator over ALL versions of keys in the range.
@@ -1179,8 +1183,8 @@ impl<'a> TransactionRangeIterator<'a> {
 	pub(crate) fn new_with_options(
 		tx: &'a Transaction,
 		core: Arc<Core>,
-		start_key: Vec<u8>,
-		end_key: Vec<u8>,
+		lower: Option<Vec<u8>>,
+		upper: Option<Vec<u8>>,
 	) -> Result<Self> {
 		// Validate transaction state
 		if tx.closed {
@@ -1198,12 +1202,17 @@ impl<'a> TransactionRangeIterator<'a> {
 		};
 
 		// Create a snapshot iterator for the range (now returns SnapshotIterator directly)
-		let snapshot_iter = snapshot.range(Some(start_key.as_slice()), Some(end_key.as_slice()))?;
+		// A missing bound is unbounded on that side, not the empty key.
+		let snapshot_iter = snapshot.range(lower.as_deref(), upper.as_deref())?;
 
 		// Collect write-set entries for the range
 		// We collect references to avoid cloning, and filter tombstones during iteration
 		let mut write_set_entries: Vec<(&'a Key, &'a Entry)> = Vec::new();
-		for (key, entry_list) in tx.write_set.range(start_key..end_key) {
+		let ws_range = (
+			lower.map_or(Bound::Unbounded, Bound::Included),
+			upper.map_or(Bound::Unbounded, Bound::Excluded),
+		);
+		for (key, entry_list) in tx.write_set.range::<Key, _>(ws_range) {
 			if let Some(entry) = entry_list.last() {
 				write_set_entries.push((key, entry));
 			}

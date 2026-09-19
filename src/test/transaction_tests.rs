@@ -4026,3 +4026,48 @@ async fn test_direction_switch_after_seek() {
 	assert!(iter.prev().unwrap(), "prev from 'c' should succeed");
 	assert_eq!(iter.key().user_key(), b"b", "After prev() from seek('c'), should be at 'b'");
 }
+
+// A `ReadOptions` side left at `None` is documented as unbounded, so the scan
+// must run to the end of the keyspace on that side, and must see keys written
+// in this transaction there as well as committed ones.
+#[test(tokio::test)]
+async fn range_with_options_treats_missing_bounds_as_unbounded() {
+	use crate::ReadOptions;
+
+	let (store, _temp_dir) = create_store();
+	{
+		let mut txn = store.begin().unwrap();
+		for k in [&b"a"[..], b"m1", b"m2", b"z"] {
+			txn.set(k, b"committed").unwrap();
+		}
+		txn.commit().await.unwrap();
+	}
+
+	let mut txn = store.begin().unwrap();
+	txn.set(b"zz", b"uncommitted").unwrap();
+
+	let keys = |txn: &crate::Transaction, lower: Option<&[u8]>, upper: Option<&[u8]>| {
+		let mut options = ReadOptions::new();
+		options.set_iterate_lower_bound(lower.map(<[u8]>::to_vec));
+		options.set_iterate_upper_bound(upper.map(<[u8]>::to_vec));
+		let forward = collect_transaction_all(&mut txn.range_with_options(&options).unwrap())
+			.unwrap()
+			.into_iter()
+			.map(|(k, _)| k)
+			.collect::<Vec<_>>();
+		let mut reverse =
+			collect_transaction_reverse(&mut txn.range_with_options(&options).unwrap())
+				.unwrap()
+				.into_iter()
+				.map(|(k, _)| k)
+				.collect::<Vec<_>>();
+		reverse.reverse();
+		assert_eq!(forward, reverse, "forward and reverse scans disagree");
+		forward
+	};
+	let expect = |ks: &[&[u8]]| ks.iter().map(|k| k.to_vec()).collect::<Vec<_>>();
+
+	assert_eq!(keys(&txn, Some(b"m"), None), expect(&[b"m1", b"m2", b"z", b"zz"]));
+	assert_eq!(keys(&txn, None, Some(b"m2")), expect(&[b"a", b"m1"]));
+	assert_eq!(keys(&txn, None, None), expect(&[b"a", b"m1", b"m2", b"z", b"zz"]));
+}
