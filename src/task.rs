@@ -359,7 +359,8 @@ mod tests {
 		time::sleep(Duration::from_millis(300)).await;
 
 		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 3);
-		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 3); // Each memtable compaction triggers a level compaction
+		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 3); // Each memtable compaction triggers
+																// a level compaction
 
 		task_manager.stop().await;
 	}
@@ -378,7 +379,8 @@ mod tests {
 		time::sleep(Duration::from_millis(100)).await; // Allow time for task to complete
 
 		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 1);
-		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 0); // Memtable should not be affected
+		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 0); // Memtable should not be
+																   // affected
 
 		task_manager.stop().await;
 	}
@@ -403,7 +405,8 @@ mod tests {
 		time::sleep(Duration::from_millis(300)).await;
 
 		assert_eq!(core.level_compactions.load(Ordering::SeqCst), 3);
-		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 0); // Memtable should not be affected
+		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 0); // Memtable should not be
+																   // affected
 
 		task_manager.stop().await;
 	}

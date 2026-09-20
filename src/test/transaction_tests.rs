@@ -2708,8 +2708,8 @@ async fn test_scan_all_versions() {
 	let all_versions = collect_history_all(&mut iter).unwrap();
 
 	// Should get all versions of all keys in the range
-	assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 + 1 version of
-									// key4
+	assert_eq!(all_versions.len(), 6); // 2 versions of key1 + 2 versions of key2 + 1 version of key3 +
+									// 1 version of key4
 
 	// Group by key to verify we have all versions
 	let mut key_versions: KeyVersionsMap = HashMap::new();
@@ -2801,7 +2801,8 @@ async fn test_scan_all_versions_with_deletes() {
 	}
 
 	// Should get all versions including soft delete markers, exclude hard-deleted keys
-	assert_eq!(all_versions.len(), 3); // 3 versions of key2 (key1 is hard deleted, soft delete marker included)
+	assert_eq!(all_versions.len(), 3); // 3 versions of key2 (key1 is hard deleted, soft delete marker
+									// included)
 
 	// Group by key to verify we have all versions
 	let mut key_versions: KeyVersionsMap = HashMap::new();
