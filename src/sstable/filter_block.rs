@@ -37,7 +37,8 @@ impl FilterBlockWriter {
 	// Starts a new block at a given offset. This may trigger the generation of a
 	// new filter if necessary.
 	pub(crate) fn start_block(&mut self, block_offset: usize) {
-		let filter_index = block_offset / FILTER_BASE as usize; // Calculate the index of the filter for the current block.
+		let filter_index = block_offset / FILTER_BASE as usize; // Calculate the index of the filter for
+														  // the current block.
 		let filters_len = self.filter_offsets.len();
 		assert!(filter_index >= filters_len); // Ensure the filter index is not out of bounds.
 		while filter_index > self.filter_offsets.len() {
@@ -75,7 +76,8 @@ impl FilterBlockWriter {
 		let mut result = self.filters;
 		let offsets_offset = self.filter_offsets.len();
 		let mut ix = result.len();
-		result.resize(ix + 4 * self.filter_offsets.len() + 5, 0); // Resize the result to fit the offsets and the base log2 value.
+		result.resize(ix + 4 * self.filter_offsets.len() + 5, 0); // Resize the result to fit the offsets
+															// and the base log2 value.
 
 		// Append per-filter offsets to the result.
 		for offset in self.filter_offsets {
@@ -106,7 +108,14 @@ impl FilterBlockReader {
 	pub(crate) fn new(data: Vec<u8>, policy: Arc<dyn FilterPolicy>) -> Self {
 		let n = data.len();
 		let base_lg = data[n - 1] as u32; // The last byte is the base log2 value.
-		let num_offset = u32::decode_fixed(&data[n - FILTER_META_LENGTH..n - 1]).unwrap() as usize; // The offsets start 5 bytes from the end.
+		let num_offset = u32::decode_fixed(&data[n - FILTER_META_LENGTH..n - 1]).unwrap() as usize; // The
+																							  // offsets
+																							  // start
+																							  // 5 bytes
+																							  // from
+																							  // the
+																							  // end.
+																							  //
 		let mut filter_offsets = Vec::with_capacity(num_offset);
 		if num_offset * 4 + FILTER_META_LENGTH > n {
 			panic!("invalid filter block data");
