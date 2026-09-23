@@ -1,9 +1,10 @@
-use std::sync::atomic::{AtomicU64, Ordering};
-use parking_lot::Mutex;
-use tokio::sync::oneshot;
 use crate::batch::Batch;
 use crate::error::Result;
+use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::oneshot;
 
+#[derive(Default)]
 pub(crate) struct SlotData {
 	/// The slot id this slot currently represents.
 	pub seq: u64,
@@ -17,19 +18,6 @@ pub(crate) struct SlotData {
 	pub complete_tx: Option<oneshot::Sender<Result<()>>>,
 	/// Tracks whether this transaction was aborted (e.g. conflict).
 	pub aborted: bool,
-}
-
-impl Default for SlotData {
-	fn default() -> Self {
-		Self {
-			seq: 0,
-			max_seq: 0,
-			batch: None,
-			sync: false,
-			complete_tx: None,
-			aborted: false,
-		}
-	}
 }
 
 /// A single slot in the Ring Buffer.

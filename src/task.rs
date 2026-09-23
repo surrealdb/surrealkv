@@ -215,10 +215,7 @@ mod tests {
 	use crate::error::{BackgroundErrorHandler, Result};
 	use crate::lsm::CompactionOperations;
 	use crate::stall::{
-		StallCounts,
-		StallThresholds,
-		WriteStallController,
-		WriteStallCountProvider,
+		StallCounts, StallThresholds, WriteStallController, WriteStallCountProvider,
 	};
 	use crate::task::TaskManager;
 	use crate::{Error, Options};

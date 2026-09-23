@@ -10,16 +10,8 @@ use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::{
-	BytewiseComparator,
-	Comparator,
-	InternalKey,
-	InternalKeyComparator,
-	InternalKeyKind,
-	InternalKeyRange,
-	InternalKeyRef,
-	LSMIterator,
-	TimestampComparator,
-	Value,
+	BytewiseComparator, Comparator, InternalKey, InternalKeyComparator, InternalKeyKind,
+	InternalKeyRange, InternalKeyRef, LSMIterator, TimestampComparator, Value,
 };
 
 // ===== Snapshot Tracker =====
@@ -1157,7 +1149,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 /// # Safety
 /// This is a self-referential struct. The iterator borrows from the guarded tree.
 
-
 // ===== Unified History Iterator =====
 
 #[derive(Clone)]
@@ -1383,8 +1374,7 @@ impl<'a> HistoryIterator<'a> {
 			let next_key_vec = self.inner_key().user_key().to_vec();
 			if next_key_vec != current {
 				// Found next key - seek to (next_key, ts_end) to skip entries above range
-				let seek_key =
-					InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set);
+				let seek_key = InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set);
 				self.inner.seek(&seek_key.encode())?;
 				return Ok(self.inner_valid());
 			}

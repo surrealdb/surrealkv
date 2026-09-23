@@ -101,8 +101,7 @@ fn create_test_entries(
 	let mut entries = Vec::new();
 	for key_val in min_key..=max_key {
 		let user_key = format!("key-{key_val:010}").into_bytes();
-		let key =
-			InternalKey::new(user_key, min_seq + (key_val - min_key), InternalKeyKind::Set);
+		let key = InternalKey::new(user_key, min_seq + (key_val - min_key), InternalKeyKind::Set);
 		let value = format!("{value_prefix}-{key_val}").into_bytes();
 		let encoded_value = create_inline_value(&value);
 		entries.push((key, encoded_value));
@@ -1449,8 +1448,7 @@ async fn test_tombstone_propagation() {
 
 		// Add tombstone first (higher sequence number) for 95% of keys
 		if i < 95 {
-			let delete_key =
-				InternalKey::new(key_bytes.clone(), 300 + i, InternalKeyKind::Delete);
+			let delete_key = InternalKey::new(key_bytes.clone(), 300 + i, InternalKeyKind::Delete);
 			all_entries.push((delete_key, vec![]));
 		}
 
@@ -1893,12 +1891,8 @@ fn test_tombstone_propagation_journey() {
 		Box::new(tombstone_table.iter(None).unwrap()) as Box<dyn LSMIterator>,
 		Box::new(value_table.iter(None).unwrap()) as Box<dyn LSMIterator>,
 	];
-	let mut comp_iter_non_bottom = CompactionIterator::new(
-		iterators,
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter_non_bottom =
+		CompactionIterator::new(iterators, create_comparator(), false, vec![]);
 	let non_bottom_result: Vec<_> = comp_iter_non_bottom.by_ref().map(|r| r.unwrap()).collect();
 
 	// Non-bottom level should preserve tombstone
@@ -1912,12 +1906,8 @@ fn test_tombstone_propagation_journey() {
 		Box::new(tombstone_table.iter(None).unwrap()) as Box<dyn LSMIterator>,
 		Box::new(value_table.iter(None).unwrap()) as Box<dyn LSMIterator>,
 	];
-	let mut comp_iter_bottom = CompactionIterator::new(
-		iterators,
-		create_comparator(),
-		true,
-		vec![],
-	);
+	let mut comp_iter_bottom =
+		CompactionIterator::new(iterators, create_comparator(), true, vec![]);
 	let bottom_result: Vec<_> = comp_iter_bottom.by_ref().map(|r| r.unwrap()).collect();
 
 	// Bottom level should filter out tombstones

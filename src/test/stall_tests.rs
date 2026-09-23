@@ -9,11 +9,7 @@ use tokio::time;
 
 use crate::error::WriteStallReason;
 use crate::stall::{
-	StallCounts,
-	StallThresholds,
-	WriteStallController,
-	WriteStallCountProvider,
-	WriteStallInfo,
+	StallCounts, StallThresholds, WriteStallController, WriteStallCountProvider, WriteStallInfo,
 };
 use crate::{Error, Tree, TreeBuilder};
 

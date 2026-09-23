@@ -766,8 +766,7 @@ fn test_prev_at_first_entry() {
 	);
 
 	for i in 0..5 {
-		let key =
-			InternalKey::new(format!("key_{:02}", i).into_bytes(), 1, InternalKeyKind::Set);
+		let key = InternalKey::new(format!("key_{:02}", i).into_bytes(), 1, InternalKeyKind::Set);
 		builder.add(&key.encode(), b"value").unwrap();
 	}
 

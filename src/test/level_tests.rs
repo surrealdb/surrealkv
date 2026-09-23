@@ -10,13 +10,7 @@ use std::sync::Arc;
 
 use crate::levels::{Level, LevelManifest, Levels, MANIFEST_FORMAT_VERSION_V1};
 use crate::sstable::table::{Table, TableWriter};
-use crate::{
-	InternalKey,
-	InternalKeyKind,
-	InternalKeyRange,
-	Options,
-	INTERNAL_KEY_SEQ_NUM_MAX,
-};
+use crate::{InternalKey, InternalKeyKind, InternalKeyRange, Options, INTERNAL_KEY_SEQ_NUM_MAX};
 
 /// Helper to create an InternalKeyRange
 fn make_range(
@@ -30,15 +24,11 @@ fn make_range(
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
 		)),
-		Some((k, false)) => {
-			Bound::Excluded(InternalKey::new(k.to_vec(), 0, InternalKeyKind::Set))
-		}
+		Some((k, false)) => Bound::Excluded(InternalKey::new(k.to_vec(), 0, InternalKeyKind::Set)),
 	};
 	let end = match upper {
 		None => Bound::Unbounded,
-		Some((k, true)) => {
-			Bound::Included(InternalKey::new(k.to_vec(), 0, InternalKeyKind::Set))
-		}
+		Some((k, true)) => Bound::Included(InternalKey::new(k.to_vec(), 0, InternalKeyKind::Set)),
 		Some((k, false)) => Bound::Excluded(InternalKey::new(
 			k.to_vec(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
@@ -54,8 +44,7 @@ fn create_test_table(id: u64, keys: &[&str], opts: Arc<Options>) -> Arc<Table> {
 	let mut writer = TableWriter::new(&mut buf, id, Arc::clone(&opts), 0);
 
 	for (i, key) in keys.iter().enumerate() {
-		let ikey =
-			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
+		let ikey = InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
 		writer.add(ikey, b"value").unwrap();
 	}
 
@@ -499,8 +488,7 @@ fn create_test_table_with_vlog_id(
 	let mut writer = TableWriter::new(&mut buf, id, Arc::clone(&opts), 0);
 
 	for (i, key) in keys.iter().enumerate() {
-		let ikey =
-			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
+		let ikey = InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
 		writer.add(ikey, b"value").unwrap();
 	}
 

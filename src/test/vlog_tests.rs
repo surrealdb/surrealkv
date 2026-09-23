@@ -5,15 +5,8 @@ use tempfile::TempDir;
 use test_log::test;
 
 use crate::vlog::{
-	VLog,
-	VLogFileHeader,
-	VLogWriter,
-	ValueLocation,
-	ValuePointer,
-	BIT_VALUE_POINTER,
-	VALUE_LOCATION_VERSION,
-	VALUE_POINTER_SIZE,
-	VLOG_FORMAT_VERSION,
+	VLog, VLogFileHeader, VLogWriter, ValueLocation, ValuePointer, BIT_VALUE_POINTER,
+	VALUE_LOCATION_VERSION, VALUE_POINTER_SIZE, VLOG_FORMAT_VERSION,
 };
 use crate::{CompressionType, Options, VLogChecksumLevel};
 

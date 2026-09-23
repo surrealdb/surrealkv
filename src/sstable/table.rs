@@ -86,17 +86,8 @@ use crate::sstable::meta::TableMetadata;
 use crate::vfs::File;
 use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{
-	Comparator,
-	CompressionType,
-	FilterPolicy,
-	InternalKey,
-	InternalKeyKind,
-	InternalKeyRange,
-	InternalKeyRef,
-	LSMIterator,
-	Options,
-	Value,
-	INTERNAL_KEY_SEQ_NUM_MAX,
+	Comparator, CompressionType, FilterPolicy, InternalKey, InternalKeyKind, InternalKeyRange,
+	InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX,
 };
 
 // =============================================================================
@@ -751,7 +742,7 @@ pub(crate) fn read_filter_block(
 	Ok(FilterBlockReader::new(buf, policy))
 }
 
-	fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
+fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
 	let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set).encode();
 	let mut metaindexiter = metaix.iter()?;
 	metaindexiter.seek_internal(&meta_key)?;

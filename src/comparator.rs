@@ -184,11 +184,8 @@ impl Comparator for InternalKeyComparator {
 			if sep.len() <= key_a.user_key.len()
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
-				let result = InternalKey::new(
-					sep,
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Separator,
-				);
+				let result =
+					InternalKey::new(sep, INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator);
 				return result.encode();
 			}
 		}
@@ -281,11 +278,8 @@ impl Comparator for TimestampComparator {
 			if sep.len() <= key_a.user_key.len()
 				&& self.user_comparator.compare(key_a.user_key.as_ref(), &sep) == Ordering::Less
 			{
-				let result = InternalKey::new(
-					sep,
-					INTERNAL_KEY_SEQ_NUM_MAX,
-					InternalKeyKind::Separator,
-				);
+				let result =
+					InternalKey::new(sep, INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator);
 				return result.encode();
 			}
 		}
@@ -648,12 +642,8 @@ mod tests {
 	/// Helper to create an encoded internal key with max seq num (for expected
 	/// separator results)
 	fn ikey_max_seq(user_key: &[u8]) -> Vec<u8> {
-		InternalKey::new(
-			user_key.to_vec(),
-			INTERNAL_KEY_SEQ_NUM_MAX,
-			InternalKeyKind::Separator,
-		)
-		.encode()
+		InternalKey::new(user_key.to_vec(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator)
+			.encode()
 	}
 
 	#[test]
@@ -874,12 +864,9 @@ mod tests {
 		);
 
 		// (foo, MAX) should come BEFORE all other (foo, *) keys
-		let key_max = InternalKey::new(
-			b"foo".to_vec(),
-			INTERNAL_KEY_SEQ_NUM_MAX,
-			InternalKeyKind::Separator,
-		)
-		.encode();
+		let key_max =
+			InternalKey::new(b"foo".to_vec(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator)
+				.encode();
 
 		assert_eq!(
 			cmp.compare(&key_max, &key_100),

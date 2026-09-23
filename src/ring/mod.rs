@@ -1,12 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-mod slot;
 mod bloom;
-mod queue;
 mod pipeline;
+mod queue;
+mod slot;
 
-use slot::Slot;
 pub(crate) use pipeline::CommitPipeline;
+use slot::Slot;
 
 /// A lock-free, Multi-Producer Single-Consumer (MPSC) Ring Buffer.
 /// Used for the Optimistic Concurrency Control (OCC) commit pipeline.
