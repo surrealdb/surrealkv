@@ -600,6 +600,7 @@ impl Options {
 pub enum CompressionType {
 	None = 0,
 	SnappyCompression = 1,
+	ZstdCompression = 2,
 }
 
 impl CompressionType {
@@ -607,6 +608,7 @@ impl CompressionType {
 		match *self {
 			Self::None => "none",
 			Self::SnappyCompression => "snappy",
+			Self::ZstdCompression => "zstd",
 		}
 	}
 }
@@ -618,6 +620,7 @@ impl TryFrom<u8> for CompressionType {
 		match byte {
 			0 => Ok(Self::None),
 			1 => Ok(Self::SnappyCompression),
+			2 => Ok(Self::ZstdCompression),
 			_ => Err(Error::Compression(format!("Unknown compression type: {}", byte))),
 		}
 	}

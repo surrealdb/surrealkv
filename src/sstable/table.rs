@@ -688,14 +688,15 @@ pub(crate) fn compress_block(
 			match enc.compress(&raw_block, buffer.as_mut_slice()) {
 				Ok(size) => buffer.truncate(size),
 				Err(e) => return Err(Error::Compression(e.to_string())),
-			}
+			};
 			Ok(buffer)
 		}
+		CompressionType::ZstdCompression => zstd::stream::encode_all(&raw_block[..], 3)
+			.map_err(|e| Error::Compression(e.to_string())),
 		CompressionType::None => Ok(raw_block),
 	}
 }
 
-/// Decompresses block data.
 pub(crate) fn decompress_block(
 	compressed_block: &[u8],
 	compression: CompressionType,
@@ -705,6 +706,8 @@ pub(crate) fn decompress_block(
 			let mut dec = snap::raw::Decoder::new();
 			dec.decompress_vec(compressed_block).map_err(|e| Error::Decompression(e.to_string()))
 		}
+		CompressionType::ZstdCompression => zstd::stream::decode_all(compressed_block)
+			.map_err(|e| Error::Decompression(e.to_string())),
 		CompressionType::None => Ok(Vec::from(compressed_block)),
 	}
 }
