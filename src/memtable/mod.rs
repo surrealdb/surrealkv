@@ -58,6 +58,11 @@ impl ImmutableMemtables {
 		self.0.iter()
 	}
 
+	/// Returns the total memory size of all immutable memtables.
+	pub(crate) fn total_size(&self) -> usize {
+		self.0.iter().map(|e| e.memtable.size()).sum()
+	}
+
 	pub(crate) fn is_empty(&self) -> bool {
 		self.0.is_empty()
 	}
