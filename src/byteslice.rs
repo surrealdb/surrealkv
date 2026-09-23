@@ -1,19 +1,5 @@
 //! Immutable zero-copy byte slice with Small String Optimization (SSO)
 //! and prefix-accelerated comparison (German String design).
-//!
-//! # Layout
-//!
-//! Exactly 24 bytes on 64-bit systems (3 words, matching `Vec<u8>` and slices).
-//!
-//! - **Short representation** (length <= 20 bytes):
-//!   The data is stored entirely inline inside the 24-byte struct.
-//!   Zero heap allocations, zero pointer indirections, zero atomic refcounts.
-//!
-//! - **Long representation** (length > 20 bytes):
-//!   Stores the first 4 bytes of data as an inline `prefix`, a pointer to the heap
-//!   allocation with an atomic reference count, the original length, and the offset.
-//!   Sub-slicing does not copy, and comparisons compare the 4-byte prefix first to
-//!   avoid pointer dereferencing on non-equal lookups.
 
 use std::alloc::{alloc, dealloc, handle_alloc_error, Layout};
 use std::mem::ManuallyDrop;
@@ -115,9 +101,14 @@ impl ByteSlice {
 
 	/// Creates a new slice from an existing byte slice.
 	/// Inlines values <= 20 bytes with zero allocations.
+	///
+	/// # Panics
+	///
+	/// Panics if the input length exceeds 4GB (u32::MAX).
+	#[allow(clippy::cast_possible_truncation)]
 	pub fn from_slice(src: &[u8]) -> Self {
 		let src_len = src.len();
-		assert!(src_len <= u32::MAX as usize, "slice length exceeds 4GB limit");
+		assert!(u32::try_from(src_len).is_ok(), "slice length exceeds 4GB limit");
 
 		if src_len <= INLINE_CAPACITY {
 			let mut data = [0u8; INLINE_CAPACITY];
@@ -146,7 +137,7 @@ impl ByteSlice {
 				}
 
 				// Initialize atomic ref_count to 1
-				let header = heap_ptr as *mut HeapHeader;
+				let header: *mut HeapHeader = heap_ptr.cast();
 				(*header).ref_count = AtomicU64::new(1);
 
 				// Copy payload after header
@@ -169,12 +160,19 @@ impl ByteSlice {
 	}
 
 	/// Zero-copy wrap of a `bytes::Bytes` buffer without unnecessary reallocation.
-	pub fn from_bytes(b: bytes::Bytes) -> Self {
+	#[inline]
+	pub fn from_bytes(b: &bytes::Bytes) -> Self {
 		Self::from_slice(b.as_ref())
 	}
 
 	/// Clones a sub-range of this slice without heap allocation.
 	/// Automatically downgrades to an inlined representation if subslice length <= 20 bytes.
+	///
+	/// # Panics
+	///
+	/// Panics if the slice bounds are invalid or out of range.
+	#[must_use]
+	#[allow(clippy::cast_possible_truncation)]
 	pub fn slice(&self, range: impl std::ops::RangeBounds<usize>) -> Self {
 		use std::ops::Bound;
 
@@ -247,7 +245,10 @@ impl ByteSlice {
 
 	fn heap_header(&self) -> &HeapHeader {
 		debug_assert!(!self.is_inline());
-		unsafe { &*(self.repr.long.heap as *const HeapHeader) }
+		unsafe {
+			let ptr: *const HeapHeader = self.repr.long.heap.cast();
+			&*ptr
+		}
 	}
 
 	/// Returns current reference count (1 for inlined data).
@@ -360,7 +361,7 @@ impl std::hash::Hash for ByteSlice {
 impl std::fmt::Debug for ByteSlice {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match std::str::from_utf8(self.as_slice()) {
-			Ok(s) => write!(f, "ByteSlice({:?})", s),
+			Ok(s) => write!(f, "ByteSlice({s:?})"),
 			Err(_) => write!(f, "ByteSlice({:?})", self.as_slice()),
 		}
 	}
@@ -390,7 +391,7 @@ impl From<Vec<u8>> for ByteSlice {
 impl From<bytes::Bytes> for ByteSlice {
 	#[inline]
 	fn from(b: bytes::Bytes) -> Self {
-		Self::from_bytes(b)
+		Self::from_slice(b.as_ref())
 	}
 }
 
@@ -423,19 +424,16 @@ mod tests {
 		assert_eq!(&*s, long_str.as_bytes());
 		assert_eq!(s.prefix(), &long_str.as_bytes()[..4]);
 
-		// Slicing long range shares allocation
 		let sub_long = s.slice(10..40);
 		assert!(!sub_long.is_inline());
 		assert_eq!(s.ref_count(), 2);
 		assert_eq!(sub_long.len(), 30);
 		assert_eq!(&*sub_long, &long_str.as_bytes()[10..40]);
 
-		// Slicing short range automatically downgrades to inline
 		let sub_short = s.slice(0..10);
 		assert!(sub_short.is_inline());
 		assert_eq!(sub_short.len(), 10);
 		assert_eq!(&*sub_short, &long_str.as_bytes()[0..10]);
-		// Dropping sub_long decrements ref count
 		drop(sub_long);
 		assert_eq!(s.ref_count(), 1);
 	}
