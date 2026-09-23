@@ -18,12 +18,13 @@ rust-version = "1.86"
 [dependencies]
 affinitypool = "0.8.0"
 snap = "1.0.0"
+zstd = { version = "0.13", default-features = false }
 crc32fast = "1.2.1"
 quick_cache = "0.6.16"
 parking_lot = "0.12.1"
 bytes = "1.11.1"
 rand = "0.9.2"
-tokio = { version = "1.36", features = ["rt", "sync", "macros", "time"] }
+tokio = { version = "1.36", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 async-trait = "0.1.82"
 log = "0.4.28"
 lz4_flex = "0.12"
