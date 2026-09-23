@@ -1,7 +1,6 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{oneshot, Notify};
-use parking_lot::Mutex;
+use tokio::sync::{oneshot, Notify, RwLock};
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
@@ -24,8 +23,10 @@ pub(crate) struct CommitPipeline {
 	pub(crate) task_manager: Option<Arc<TaskManager>>,
 	pub(crate) notify_flusher: Arc<Notify>,
 	pub(crate) shutdown: AtomicBool,
+	/// Sequence number allocator for batch entries
+	pub(crate) log_seq_num: AtomicU64,
 	/// Lock used to pause all incoming commits during a full restore from checkpoint.
-	pub(crate) restore_lock: Mutex<()>,
+	pub(crate) restore_lock: RwLock<()>,
 }
 
 impl CommitPipeline {
@@ -35,9 +36,10 @@ impl CommitPipeline {
 		task_manager: Option<Arc<TaskManager>>,
 		start_seq: u64,
 	) -> Self {
-		let ring = Arc::new(Ring::new(1024, start_seq));
+		let ring = Arc::new(Ring::new(1024, 1));
 		let queue = Arc::new(CommitQueue::new());
 		let notify_flusher = Arc::new(Notify::new());
+		let seq = start_seq.max(1);
 
 		Self {
 			ring,
@@ -47,7 +49,8 @@ impl CommitPipeline {
 			task_manager,
 			notify_flusher,
 			shutdown: AtomicBool::new(false),
-			restore_lock: Mutex::new(()),
+			log_seq_num: AtomicU64::new(seq),
+			restore_lock: RwLock::new(()),
 		}
 	}
 
@@ -94,7 +97,7 @@ impl CommitPipeline {
 		self.write_stall.check().await?;
 
 		// Acquire restore lock to ensure restore is not running
-		let _restore_guard = self.restore_lock.lock();
+		let _restore_guard = self.restore_lock.read().await;
 
 		// Extract write keys and build bloom filters
 		let write_keys: Vec<Key> = batch.entries.iter().map(|e| e.key.clone()).collect();
@@ -108,35 +111,38 @@ impl CommitPipeline {
 			read_bloom.insert(k);
 		}
 
-		// Atomically claim next sequence number in the ring
-		let seq = self.ring.claim();
+		// Allocate contiguous sequence numbers for the entries in this batch
+		let count = batch.count() as u64;
+		let start_batch_seq = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
+		let end_batch_seq = if count > 0 { start_batch_seq + count - 1 } else { start_batch_seq };
+		batch.set_starting_seq_num(start_batch_seq);
+
+		// Atomically claim next slot in the ring
+		let slot_id = self.ring.claim();
 
 		// Wait until the slot is available (in case of ring lap wrap-around)
-		while !self.ring.has_room(seq) {
+		while !self.ring.has_room(slot_id) {
 			tokio::task::yield_now().await;
 		}
 
-		let slot = self.ring.slot(seq);
+		let slot = self.ring.slot(slot_id);
 
 		// Check for OCC conflicts against commits made after start_seq
-		if !self.queue.check_conflicts(start_seq, seq, &write_keys, &write_bloom, read_set, &read_bloom) {
+		if !self.queue.check_conflicts(start_seq, end_batch_seq, &write_keys, &write_bloom, read_set, &read_bloom) {
 			// Conflict detected: mark slot aborted and publish so flusher can skip it
 			{
 				let mut data = slot.data.lock();
-				data.seq = seq;
+				data.seq = slot_id;
 				data.aborted = true;
 			}
-			slot.publish(seq);
+			slot.publish(slot_id);
 			self.notify_flusher.notify_one();
 			return Err(Error::TransactionWriteConflict);
 		}
 
 		// No conflict: register in commit queue
-		let commit_entry = Arc::new(CommitEntry::new(seq, write_keys));
+		let commit_entry = Arc::new(CommitEntry::new(end_batch_seq, write_keys));
 		self.queue.insert(commit_entry);
-
-		// Prepare batch with allocated sequence number
-		batch.set_starting_seq_num(seq);
 
 		// Set up completion notification channel
 		let (complete_tx, complete_rx) = oneshot::channel();
@@ -144,7 +150,8 @@ impl CommitPipeline {
 		// Write batch into the slot
 		{
 			let mut data = slot.data.lock();
-			data.seq = seq;
+			data.seq = slot_id;
+			data.max_seq = end_batch_seq;
 			data.batch = Some(batch);
 			data.sync = sync;
 			data.complete_tx = Some(complete_tx);
@@ -152,7 +159,7 @@ impl CommitPipeline {
 		}
 
 		// Publish slot
-		slot.publish(seq);
+		slot.publish(slot_id);
 
 		// Wake up background flusher
 		self.notify_flusher.notify_one();
@@ -182,6 +189,7 @@ impl CommitPipeline {
 			let mut completion_senders = Vec::new();
 			let mut need_sync = false;
 			let mut last_seq = taken;
+			let mut highest_max_seq = self.inner.visible_seq_num.load(Ordering::Acquire);
 
 			while self.ring.drainable(next_seq) {
 				let slot = self.ring.slot(next_seq);
@@ -192,6 +200,7 @@ impl CommitPipeline {
 						if data.sync {
 							need_sync = true;
 						}
+						highest_max_seq = highest_max_seq.max(data.max_seq);
 						batches_to_apply.push(batch);
 					}
 					if let Some(tx) = data.complete_tx.take() {
@@ -209,7 +218,7 @@ impl CommitPipeline {
 				match flush_res {
 					Ok(()) => {
 						// Advance visible sequence number
-						self.inner.visible_seq_num.store(last_seq, Ordering::Release);
+						self.inner.visible_seq_num.store(highest_max_seq, Ordering::Release);
 						self.ring.advance_taken(last_seq);
 
 						// Complete all waiting transactions
@@ -298,14 +307,15 @@ impl CommitPipeline {
 	}
 
 	/// Locks writes for database restore.
-	pub(crate) fn lock_writes(&self) -> parking_lot::MutexGuard<'_, ()> {
-		self.restore_lock.lock()
+	pub(crate) fn lock_writes(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+		self.restore_lock.blocking_write()
 	}
 
 	/// Resets the pipeline for restore.
 	pub(crate) fn reset_for_restore(&self, seq: u64) {
 		self.ring.advance_taken(seq);
 		self.ring.next.store(seq + 1, Ordering::Release);
+		self.log_seq_num.store(seq + 1, Ordering::Release);
 		self.inner.visible_seq_num.store(seq, Ordering::Release);
 	}
 }
