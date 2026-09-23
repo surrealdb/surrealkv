@@ -1000,7 +1000,7 @@ impl<'a> CompactionIterator<'a> {
 	///   - seq=100: age=0, KEEP (latest)
 	///   - seq=50:  age=30min < 1hour, KEEP (within retention)
 	///   - seq=20:  age=2hours > 1hour, DROP (expired)
-	///   
+	///
 	/// Output: [seq=100, seq=50]
 	/// delete_list: [seq=20]
 	/// ```
@@ -1131,21 +1131,9 @@ impl<'a> CompactionIterator<'a> {
 				true
 			} else {
 				// Older PUT: check versioning and retention
-				if !self.enable_versioning {
-					// No versioning enabled: only the latest version matters,
-					// all older versions are stale
-					true
-				} else if self.retention_period_ns > 0 {
-					// Versioning enabled with retention period:
-					// Keep versions within the retention window, drop older ones
-					let current_time = self.clock.now();
-					let age = current_time.saturating_sub(key.timestamp);
-					age > self.retention_period_ns
-				} else {
-					// Versioning enabled, retention_period_ns == 0:
-					// Keep all versions forever
-					false
-				}
+				// Single-version KV: only the latest version matters,
+				// all older superseded versions are stale
+				true
 			};
 
 			// ===== DETERMINE IF ENTRY SHOULD BE OUTPUT =====
@@ -1188,18 +1176,18 @@ impl<'a> CompactionIterator<'a> {
 	/// loop:
 	///   1. If output_versions is not empty:
 	///      → Return next output entry
-	///      
+	///
 	///   2. If merge_iter is exhausted:
 	///      → Process remaining accumulated versions
 	///      → Return next output entry or None
-	///      
+	///
 	///   3. Get next entry from merge_iter
-	///   
+	///
 	///   4. If new user key:
 	///      → Process accumulated versions of previous key
 	///      → Start accumulating new key
 	///      → Return output if any
-	///      
+	///
 	///   5. If same user key:
 	///      → Add to accumulated versions
 	///      → Continue loop
@@ -1219,26 +1207,26 @@ impl<'a> CompactionIterator<'a> {
 	///   - new key: accumulate, current_user_key = "apple"
 	///   - merge_iter.next()
 	///   - loop continues...
-	///   
+	///
 	/// advance() call 1 (continued):
 	///   - merge_iter → ("apple", 50)
 	///   - same key: accumulate
 	///   - merge_iter.next()
 	///   - loop continues...
-	///   
+	///
 	/// advance() call 1 (continued):
 	///   - merge_iter → ("banana", 60)
 	///   - NEW key! Process "apple" accumulated versions
 	///   - output_versions = [("apple", 100)]  // only latest
 	///   - start accumulating "banana"
 	///   - return ("apple", 100)
-	///   
+	///
 	/// advance() call 2:
 	///   - output_versions: []
 	///   - merge_iter exhausted
 	///   - process "banana" accumulated versions
 	///   - return ("banana", 60)
-	///   
+	///
 	/// advance() call 3:
 	///   - output_versions: []
 	///   - merge_iter exhausted

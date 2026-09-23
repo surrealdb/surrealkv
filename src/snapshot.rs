@@ -1025,7 +1025,7 @@ impl SnapshotIterator<'_> {
 
 		// Seek to first entry >= current user key
 		// Using (user_key, MAX_SEQ) positions at the start of this user key's entries
-		let seek_key = InternalKey::new(current_user_key, u64::MAX, InternalKeyKind::Set, u64::MAX);
+		let seek_key = InternalKey::new(current_user_key, u64::MAX, InternalKeyKind::Set, 0);
 		self.merge_iter.seek(&seek_key.encode())?;
 
 		// skip_to_valid_forward() will skip entries with user_key == last_key_fwd
@@ -1307,7 +1307,7 @@ impl<'a> HistoryIterator<'a> {
 	/// Returns true if positioned on a new user_key, false if iterator exhausted.
 	fn advance_to_next_user_key(&mut self) -> Result<bool> {
 		// Only optimize with ts_range
-		let ts_end = match self.ts_range {
+		let _ts_end = match self.ts_range {
 			Some((_, end)) => end,
 			None => return self.skip_to_next_user_key(),
 		};
@@ -1320,7 +1320,7 @@ impl<'a> HistoryIterator<'a> {
 			if next_key_vec != current {
 				// Found next key - seek to (next_key, ts_end) to skip entries above range
 				let seek_key =
-					InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set, ts_end);
+					InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set, 0);
 				self.inner.seek(&seek_key.encode())?;
 				return Ok(self.inner_valid());
 			}
@@ -1722,17 +1722,17 @@ impl LSMIterator for HistoryIterator<'_> {
 
 		if self.ts_range.is_some() {
 			// Seek to (lower_bound or empty, ts_end) to skip entries above range
-			let ts = self.ts_range.map(|(_, end)| end).unwrap_or(u64::MAX);
+			let _ts = self.ts_range.map(|(_, end)| end).unwrap_or(u64::MAX);
 			let seek_key = InternalKey::new(
 				self.lower_bound.clone().unwrap_or_default(),
 				u64::MAX,
 				InternalKeyKind::Set,
-				ts,
+				0,
 			);
 			self.inner.seek(&seek_key.encode())?;
 		} else if let Some(ref lower) = self.lower_bound {
 			let seek_key =
-				InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set, u64::MAX);
+				InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set, 0);
 			self.inner.seek(&seek_key.encode())?;
 		} else {
 			self.inner.seek_first()?;

@@ -365,6 +365,24 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// Deletes a range of keys [start, end) as an O(1) range tombstone.
+	pub fn delete_range<K>(&mut self, start: K, end: K) -> Result<()>
+	where
+		K: IntoBytes,
+	{
+		let write_seqno = self.next_write_seqno();
+		let entry = Entry::new(
+			start,
+			Some(end.into_bytes()),
+			InternalKeyKind::RangeDelete,
+			self.savepoints,
+			write_seqno,
+			Entry::COMMIT_TIME,
+		);
+		self.write(entry)?;
+		Ok(())
+	}
+
 	/// Soft delete a key. This will add a tombstone at the current timestamp.
 	pub fn soft_delete<K>(&mut self, key: K) -> Result<()>
 	where
@@ -579,7 +597,7 @@ impl Transaction {
 	///
 	/// # Example
 	/// ```ignore
-	/// 
+	///
 	/// let mut iter = tx.range(b"a", b"z")?;
 	/// iter.seek_first()?;
 	/// while iter.valid() {
@@ -1189,7 +1207,6 @@ impl<'a> TransactionRangeIterator<'a> {
 		self.ws_encoded_key_buf.extend_from_slice(key);
 		let trailer = ((entry.seqno as u64) << 8) | (entry.kind as u64);
 		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
-		self.ws_encoded_key_buf.extend_from_slice(&entry.timestamp.to_be_bytes());
 	}
 
 	/// Position to minimum of two sources (forward merge).
@@ -1305,10 +1322,9 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 		self.initialized = true;
 		self.is_key_equal = false;
 
-		// Encode user key with MAX trailer/timestamp for >= seek
+		// Encode user key with MAX trailer for >= seek
 		let mut encoded = target.to_vec();
 		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
 		self.snapshot_iter.seek(&encoded)?;
 
 		// Position write-set at first entry >= target
@@ -1756,7 +1772,6 @@ impl<'a> TransactionHistoryIterator<'a> {
 		self.ws_encoded_key_buf.extend_from_slice(key);
 		let trailer = ((entry.seqno as u64) << 8) | (entry.kind as u64);
 		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
-		self.ws_encoded_key_buf.extend_from_slice(&entry.timestamp.to_be_bytes());
 	}
 
 	// =========================================================================
@@ -2160,10 +2175,9 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 		self.initialized = true;
 		self.is_key_equal = false;
 
-		// Encode user key with MAX trailer/timestamp for >= seek
+		// Encode user key with MAX trailer for >= seek
 		let mut encoded = target.to_vec();
 		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max timestamp
 		self.inner.seek(&encoded)?;
 
 		// Position write-set at first entry >= target

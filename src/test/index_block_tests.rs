@@ -568,7 +568,7 @@ fn test_partitioned_index_seek_correctness() {
 fn test_partitioned_index_boundary_keys() {
 	// Test keys at exact partition boundaries
 	let opts = Options {
-		index_partition_size: 50, // Small partition size to force multiple partitions
+		index_partition_size: 40, // Small partition size to force multiple partitions
 		block_size: 500,
 		..Default::default()
 	};

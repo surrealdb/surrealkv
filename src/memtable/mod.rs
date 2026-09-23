@@ -148,7 +148,6 @@ impl MemTable {
 				// This is the newest version with seq <= max_seq
 				let internal_key = InternalKey {
 					user_key: found_key.to_vec(),
-					timestamp: 0,
 					trailer: found_trailer,
 				};
 				return Some((internal_key, iter.value_bytes().to_vec()));
@@ -244,8 +243,8 @@ impl MemTable {
 		let empty_val = Value::new();
 
 		// Process entries with pre-encoded ValueLocations
-		for (_i, entry, current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
-			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, timestamp);
+		for (_i, entry, current_seq_num, _timestamp) in batch.entries_with_seq_nums()? {
+			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, 0);
 
 			// Use the value directly (cheap Bytes clone), or reuse empty value for deletes
 			let val = if let Some(encoded_value) = &entry.value {
@@ -274,7 +273,7 @@ impl MemTable {
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
 		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
 
-		match self.skiplist.add(&key.user_key, trailer, key.timestamp, value) {
+		match self.skiplist.add(&key.user_key, trailer, value) {
 			Ok(()) => Ok(()),
 			Err(SkiplistError::RecordExists) => Ok(()), // Duplicate is not an error in memtable
 			Err(SkiplistError::ArenaFull) => {

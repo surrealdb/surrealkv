@@ -723,42 +723,25 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
-	// With versioning enabled and retention period of 5 seconds, should get 7 items
-	// total:
-	// - key1: 3 versions (all within retention)
-	// - key2: 3 versions (all within retention)
-	// - key3: 1 version (only recent one, very old versions filtered out due to retention)
-	assert_eq!(result.len(), 7, "Expected 7 items: 3 from key1, 3 from key2, 1 from key3");
+	// In V2 single-version KV: compaction retains only the latest version per key
+	assert_eq!(result.len(), 3, "Expected 3 items: 1 from key1, 1 from key2, 1 from key3");
 
-	// Verify we get all versions of key1 (all within retention)
+	// Verify we get the latest version of key1
 	let key1_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key1").collect();
-	assert_eq!(key1_versions.len(), 3, "key1 should have 3 versions within retention");
+	assert_eq!(key1_versions.len(), 1, "key1 should have 1 latest version");
 
-	// Verify we get all versions of key2 (all within retention)
+	// Verify we get the latest version of key2
 	let key2_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key2").collect();
-	assert_eq!(key2_versions.len(), 3, "key2 should have 3 versions within retention");
+	assert_eq!(key2_versions.len(), 1, "key2 should have 1 latest version");
 
-	// Verify we get only the recent version of key3 (very old versions outside
-	// retention)
+	// Verify we get the latest version of key3
 	let key3_versions: Vec<_> = result.iter().filter(|(k, _)| &k.user_key == b"key3").collect();
-	assert_eq!(
-		key3_versions.len(),
-		1,
-		"key3 should have only 1 version (recent), very old versions filtered"
-	);
+	assert_eq!(key3_versions.len(), 1, "key3 should have 1 latest version");
 
-	// Verify sequence numbers for key1 (sorted descending: latest first)
-	assert_eq!(key1_versions[0].0.seq_num(), 300); // DELETE
-	assert_eq!(key1_versions[1].0.seq_num(), 200); // SET
-	assert_eq!(key1_versions[2].0.seq_num(), 100); // SET
-
-	// Verify sequence numbers for key2 (sorted descending: latest first)
-	assert_eq!(key2_versions[0].0.seq_num(), 600); // DELETE
-	assert_eq!(key2_versions[1].0.seq_num(), 500); // SET
-	assert_eq!(key2_versions[2].0.seq_num(), 400); // SET
-
-	// Verify sequence number for key3 (only recent version)
-	assert_eq!(key3_versions[0].0.seq_num(), 900); // Recent SET only
+	// Verify sequence numbers (only latest version survives in single-version KV)
+	assert_eq!(key1_versions[0].0.seq_num(), 300);
+	assert_eq!(key2_versions[0].0.seq_num(), 600);
+	assert_eq!(key3_versions[0].0.seq_num(), 900);
 }
 
 #[test(tokio::test)]

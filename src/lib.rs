@@ -656,7 +656,7 @@ pub(crate) fn user_range_to_internal_range(
 			key.into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
-			INTERNAL_KEY_TIMESTAMP_MAX,
+			0,
 		)),
 		Bound::Excluded(key) => {
 			Bound::Excluded(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
@@ -672,7 +672,7 @@ pub(crate) fn user_range_to_internal_range(
 			key.into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
-			INTERNAL_KEY_TIMESTAMP_MAX,
+			0,
 		)),
 	};
 
@@ -684,7 +684,7 @@ pub(crate) fn user_range_to_internal_range(
 // resulting in a binary number with a 1 followed by 56 zeros. Subtracting 1
 // gives a binary number with 56 ones, which is the maximum value for 56 bits.
 pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
-pub(crate) const INTERNAL_KEY_TIMESTAMP_MAX: u64 = u64::MAX;
+pub(crate) const INTERNAL_KEY_TIMESTAMP_MAX: u64 = 0;
 
 // Helper function for reading u64 from byte slices without unwrap()
 // Safe to use when bounds have already been checked
@@ -769,34 +769,37 @@ impl From<u8> for InternalKeyKind {
 pub(crate) struct InternalKey {
 	/// The application's key bytes.
 	pub(crate) user_key: Key,
-	/// System time in nanoseconds since epoch.
-	pub(crate) timestamp: u64,
 	/// Trailer containing (seq_num << 8) | kind.
 	pub(crate) trailer: u64,
 }
 
 impl InternalKey {
-	pub(crate) fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind, timestamp: u64) -> Self {
+	pub(crate) fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind, _timestamp: u64) -> Self {
 		Self {
 			user_key,
-			timestamp,
+			trailer: (seq_num << 8) | kind as u64,
+		}
+	}
+
+	#[allow(dead_code)]
+	pub(crate) fn new_flat(user_key: Key, seq_num: u64, kind: InternalKeyKind) -> Self {
+		Self {
+			user_key,
 			trailer: (seq_num << 8) | kind as u64,
 		}
 	}
 
 	pub(crate) fn size(&self) -> usize {
-		self.user_key.len() + 16 // 8 bytes for timestamp + 8 bytes for trailer
+		self.user_key.len() + 8
 	}
 
 	pub(crate) fn decode(encoded_key: &[u8]) -> Self {
-		let n = encoded_key.len() - 16; // 8 bytes for timestamp + 8 bytes for trailer
+		let n = encoded_key.len() - 8;
 		let trailer = read_u64_be(encoded_key, n);
-		let timestamp = read_u64_be(encoded_key, n + 8);
 		let user_key = encoded_key[..n].to_vec();
 
 		Self {
 			user_key,
-			timestamp,
 			trailer,
 		}
 	}
@@ -804,13 +807,13 @@ impl InternalKey {
 	/// Extract user key slice without allocation
 	#[inline]
 	pub(crate) fn user_key_from_encoded(encoded: &[u8]) -> &[u8] {
-		&encoded[..encoded.len() - 16]
+		&encoded[..encoded.len() - 8]
 	}
 
 	/// Extract trailer (seq_num + kind) without allocation
 	#[inline]
 	pub(crate) fn trailer_from_encoded(encoded: &[u8]) -> u64 {
-		let n = encoded.len() - 16;
+		let n = encoded.len() - 8;
 		read_u64_be(encoded, n)
 	}
 
@@ -823,7 +826,6 @@ impl InternalKey {
 	pub(crate) fn encode(&self) -> Vec<u8> {
 		let mut buf = self.user_key.clone();
 		buf.extend_from_slice(&self.trailer.to_be_bytes());
-		buf.extend_from_slice(&self.timestamp.to_be_bytes());
 		buf
 	}
 
@@ -841,24 +843,14 @@ impl InternalKey {
 		is_delete_kind(self.kind())
 	}
 
+	#[inline]
 	pub(crate) fn is_hard_delete_marker(&self) -> bool {
 		is_hard_delete_marker(self.kind())
 	}
 
+	#[inline]
 	pub(crate) fn is_replace(&self) -> bool {
 		is_replace_kind(self.kind())
-	}
-
-	/// Compares this key with another key using timestamp-based ordering
-	/// First compares by user key, then by timestamp (descending - newer
-	/// timestamps first, matching LSM seq_num ordering)
-	pub(crate) fn cmp_by_timestamp(&self, other: &Self) -> Ordering {
-		// First compare by user key (ascending)
-		match self.user_key.cmp(&other.user_key) {
-			// If user keys are equal, compare by timestamp (descending - newer timestamps first)
-			Ordering::Equal => other.timestamp.cmp(&self.timestamp),
-			ordering => ordering,
-		}
 	}
 }
 
@@ -867,10 +859,7 @@ impl Ord for InternalKey {
 	fn cmp(&self, other: &Self) -> Ordering {
 		match self.user_key.cmp(&other.user_key) {
 			Ordering::Equal => match other.seq_num().cmp(&self.seq_num()) {
-				Ordering::Equal => match self.kind().cmp(&other.kind()) {
-					Ordering::Equal => other.timestamp.cmp(&self.timestamp), // DESC for timestamp
-					ord => ord,
-				},
+				Ordering::Equal => self.kind().cmp(&other.kind()),
 				ord => ord,
 			},
 			ord => ord,
@@ -902,7 +891,7 @@ pub struct InternalKeyRef<'a> {
 impl<'a> InternalKeyRef<'a> {
 	#[inline]
 	pub fn from_encoded(encoded: &'a [u8]) -> Self {
-		debug_assert!(encoded.len() >= 16);
+		debug_assert!(encoded.len() >= 8);
 		Self {
 			encoded,
 		}
@@ -930,8 +919,7 @@ impl<'a> InternalKeyRef<'a> {
 
 	#[inline]
 	pub fn timestamp(&self) -> u64 {
-		let n = self.encoded.len() - 8;
-		read_u64_be(self.encoded, n)
+		0
 	}
 
 	#[inline]

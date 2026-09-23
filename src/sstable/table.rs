@@ -97,7 +97,6 @@ use crate::{
 	Options,
 	Value,
 	INTERNAL_KEY_SEQ_NUM_MAX,
-	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 
 // =============================================================================
@@ -635,7 +634,7 @@ impl<W: Write> TableWriter<W> {
 		props.raw_key_size += key.size() as u64;
 		props.raw_value_size += value.len() as u64;
 
-		let ts = key.timestamp;
+		let ts = 0;
 		props.oldest_key_time = Some(props.oldest_key_time.map_or(ts, |t| t.min(ts)));
 		props.newest_key_time = Some(props.newest_key_time.map_or(ts, |t| t.max(ts)));
 
@@ -752,7 +751,7 @@ pub(crate) fn read_filter_block(
 	Ok(FilterBlockReader::new(buf, policy))
 }
 
-fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
+	fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
 	let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set, 0).encode();
 	let mut metaindexiter = metaix.iter()?;
 	metaindexiter.seek_internal(&meta_key)?;
@@ -1223,7 +1222,7 @@ impl Table {
 /// TableIterator
 /// ├── first_level: IndexIterator
 /// │   └── Iterates over index entries: separator_key → data_block_handle
-/// ├── second_level: BlockIterator  
+/// ├── second_level: BlockIterator
 /// │   └── Iterates over data entries: key → value
 /// └── range: bounds for filtering results
 /// ```
@@ -1248,7 +1247,7 @@ impl Table {
 ///   1. Index lookup: "banana" <= "c"? YES → DataBlock 1
 ///   2. Seek in DataBlock 1:
 ///      - "apple" < "banana" → continue
-///      - "apricot" < "banana" → continue  
+///      - "apricot" < "banana" → continue
 ///      - END OF BLOCK! Iterator invalid.
 ///   3. advance_to_valid_entry():
 ///      - Current block exhausted, move to next
@@ -1690,7 +1689,7 @@ impl<'a> TableIterator<'a> {
 					internal_key.user_key.clone(),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Max,
-					INTERNAL_KEY_TIMESTAMP_MAX,
+					0,
 				);
 				self.seek_internal(&seek_key.encode())?;
 
