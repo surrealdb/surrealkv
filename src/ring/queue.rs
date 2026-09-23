@@ -1,6 +1,7 @@
 use super::bloom::BloomFilter;
 use crate::Key;
-use crossbeam_skiplist::SkipMap;
+use parking_lot::RwLock;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// An entry in the OCC commit queue representing a committed (or in-flight) transaction.
@@ -62,13 +63,12 @@ impl CommitEntry {
 		true
 	}
 
-	/// Checks if this commit's write set conflicts with a read set.
+	/// Checks if this commit's write set is disjoint from a read set.
 	pub(crate) fn is_disjoint_readset(&self, read_keys: &[Key], read_bloom: &BloomFilter) -> bool {
 		if self.bloom.is_empty() || read_bloom.is_empty() {
 			return true;
 		}
 
-		// Fast path: check if any of our write keys are in the read bloom filter
 		let mut any_possible = false;
 		for k in self.keys.iter() {
 			if read_bloom.may_contain(k) {
@@ -80,7 +80,6 @@ impl CommitEntry {
 			return true;
 		}
 
-		// Exact path
 		for k in read_keys {
 			if self.keys.binary_search(k).is_ok() {
 				return false;
@@ -91,21 +90,21 @@ impl CommitEntry {
 	}
 }
 
-/// A lock-free OCC commit queue tracking recent commits.
+/// An OCC commit queue tracking recent commits using concurrent BTreeMap.
 pub(crate) struct CommitQueue {
-	queue: SkipMap<u64, Arc<CommitEntry>>,
+	queue: RwLock<BTreeMap<u64, Arc<CommitEntry>>>,
 }
 
 impl CommitQueue {
 	pub(crate) fn new() -> Self {
 		Self {
-			queue: SkipMap::new(),
+			queue: RwLock::new(BTreeMap::new()),
 		}
 	}
 
 	/// Inserts a new commit entry into the queue.
 	pub(crate) fn insert(&self, entry: Arc<CommitEntry>) {
-		self.queue.insert(entry.seq_num, entry);
+		self.queue.write().insert(entry.seq_num, entry);
 	}
 
 	/// Checks if the given write and read sets conflict with any commits in (from_seq..to_seq].
@@ -118,8 +117,8 @@ impl CommitQueue {
 		read_keys: &[Key],
 		read_bloom: &BloomFilter,
 	) -> bool {
-		for entry in self.queue.range(from_seq + 1..=to_seq) {
-			let committed = entry.value();
+		let queue = self.queue.read();
+		for (_, committed) in queue.range(from_seq + 1..=to_seq) {
 			if committed.aborted {
 				continue;
 			}
@@ -140,8 +139,10 @@ impl CommitQueue {
 
 	/// Trims the queue, removing entries older than `min_active_seq`.
 	pub(crate) fn prune(&self, min_active_seq: u64) {
-		for entry in self.queue.range(..min_active_seq) {
-			entry.remove();
+		let mut queue = self.queue.write();
+		let keys_to_remove: Vec<u64> = queue.range(..min_active_seq).map(|(&k, _)| k).collect();
+		for k in keys_to_remove {
+			queue.remove(&k);
 		}
 	}
 }

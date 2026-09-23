@@ -1,8 +1,9 @@
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use crossbeam_skiplist::SkipSet;
+use parking_lot::RwLock;
 
 use crate::error::{Error, Result};
 use crate::iter::BoxedLSMIterator;
@@ -29,7 +30,7 @@ use crate::{
 /// search. Versions visible to snapshots are preserved unless hidden by a newer
 /// version in the same visibility boundary.
 pub(crate) struct SnapshotTracker {
-	snapshots: Arc<SkipSet<u64>>,
+	snapshots: Arc<RwLock<BTreeSet<u64>>>,
 }
 
 impl Clone for SnapshotTracker {
@@ -56,7 +57,7 @@ impl SnapshotTracker {
 	/// Creates a new empty snapshot tracker.
 	pub(crate) fn new() -> Self {
 		Self {
-			snapshots: Arc::new(SkipSet::new()),
+			snapshots: Arc::new(RwLock::new(BTreeSet::new())),
 		}
 	}
 
@@ -66,7 +67,7 @@ impl SnapshotTracker {
 	/// to the tracking set, ensuring compaction will preserve versions
 	/// visible to this snapshot.
 	pub(crate) fn register(&self, seq_num: u64) {
-		self.snapshots.insert(seq_num);
+		self.snapshots.write().insert(seq_num);
 	}
 
 	/// Unregisters a snapshot with the given sequence number.
@@ -75,7 +76,7 @@ impl SnapshotTracker {
 	/// a certain sequence number are dropped, older versions become eligible
 	/// for garbage collection during compaction.
 	pub(crate) fn unregister(&self, seq_num: u64) {
-		self.snapshots.remove(&seq_num);
+		self.snapshots.write().remove(&seq_num);
 	}
 
 	/// Returns all active snapshots as a sorted vector.
@@ -83,14 +84,12 @@ impl SnapshotTracker {
 	/// This is the primary method used by compaction. The returned vector
 	/// is sorted in ascending order.
 	pub(crate) fn get_all_snapshots(&self) -> Vec<u64> {
-		self.snapshots.iter().map(|entry| *entry).collect()
+		self.snapshots.read().iter().copied().collect()
 	}
 
-	/// Returns the smallest active snapshot seq, if any. O(log N) via
-	/// `SkipSet::front`. Used by the commit oracle to compute its GC
-	/// watermark on every commit.
+	/// Returns the smallest active snapshot seq, if any.
 	pub(crate) fn first(&self) -> Option<u64> {
-		self.snapshots.front().map(|e| *e.value())
+		self.snapshots.read().first().copied()
 	}
 }
 

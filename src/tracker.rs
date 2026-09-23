@@ -36,13 +36,14 @@
 //   begins. Revisit if production benchmarks show the race firing often
 //   enough to dominate.
 
+use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crossbeam_skiplist::SkipSet;
+use parking_lot::RwLock;
 
 pub(crate) struct ActiveTxnTracker {
-	seqs: Arc<SkipSet<(u64, u64)>>,
+	seqs: Arc<RwLock<BTreeSet<(u64, u64)>>>,
 	next_id: AtomicU64,
 }
 
@@ -55,7 +56,7 @@ impl Default for ActiveTxnTracker {
 impl ActiveTxnTracker {
 	pub(crate) fn new() -> Self {
 		Self {
-			seqs: Arc::new(SkipSet::new()),
+			seqs: Arc::new(RwLock::new(BTreeSet::new())),
 			next_id: AtomicU64::new(0),
 		}
 	}
@@ -65,7 +66,7 @@ impl ActiveTxnTracker {
 	pub(crate) fn register(self: &Arc<Self>, start_seq: u64) -> ActiveTxnGuard {
 		let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 		let entry = (start_seq, id);
-		self.seqs.insert(entry);
+		self.seqs.write().insert(entry);
 		ActiveTxnGuard {
 			tracker: Arc::clone(self),
 			entry,
@@ -74,17 +75,13 @@ impl ActiveTxnTracker {
 	}
 
 	/// Smallest `start_seq` currently registered. `None` if empty.
-	///
-	/// Cheap (O(log N) via `SkipSet::front`). Safe to call concurrently with
-	/// `register` and unregister. See the module-level comment for the
-	/// monotonicity-based race proof.
 	pub(crate) fn oldest(&self) -> Option<u64> {
-		self.seqs.front().map(|e| e.value().0)
+		self.seqs.read().first().map(|e| e.0)
 	}
 
 	#[cfg(test)]
 	pub(crate) fn len(&self) -> usize {
-		self.seqs.len()
+		self.seqs.read().len()
 	}
 }
 
@@ -100,7 +97,7 @@ impl ActiveTxnGuard {
 	/// Release the slot eagerly. Idempotent.
 	pub(crate) fn release(&mut self) {
 		if !self.released {
-			self.tracker.seqs.remove(&self.entry);
+			self.tracker.seqs.write().remove(&self.entry);
 			self.released = true;
 		}
 	}
