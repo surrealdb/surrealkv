@@ -3,7 +3,6 @@ pub mod bplustree;
 mod cache;
 mod checkpoint;
 mod clock;
-mod commit;
 mod compaction;
 mod comparator;
 mod compression;
