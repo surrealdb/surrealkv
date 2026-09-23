@@ -151,7 +151,7 @@ To ensure clean engineering and prevent format churn over the cloud tier:
 ## Phase 5: Advanced Engine & Block Format Optimizations
 To push read and write throughput to the absolute hardware limits and establish the final SSTable format before cloud storage integration.
 
-- [x] Zero-Copy Deserialization: Aligned SSTable block layouts and borrowed slice access (`BlockIterator::value_bytes`).
+- [x] Zero-Copy Deserialization: Aligned SSTable block layouts, borrowed slice access (`BlockIterator::value_bytes`), and 24-byte `ByteSlice` with SSO.
 - [x] Zstd Block Compression: Level-aware and SSTable compression with `ZstdCompression`.
 - [x] High-Performance User-Space Cache: Tailored concurrent block cache (`BlockCache` with W-TinyLFU / `quick_cache`).
 - [x] Ribbon / XOR Filters: Cache-line aligned compact filter structures (`RibbonFilter`) reducing memory footprint by 25-30% over standard Bloom filters.
