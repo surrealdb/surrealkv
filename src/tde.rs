@@ -99,14 +99,14 @@ impl BlockCipher {
 		}
 
 		// Compute 128-bit integrity tag using xxHash3 over key_id, nonce, and ciphertext
-		let tag1 = xxhash_rust::xxh3::xxh3_64_with_seed(
-			&output,
-			u64::from_le_bytes(key[..8].try_into().unwrap()),
+		let seed1 = u64::from_le_bytes(
+			key[..8].try_into().map_err(|_| Error::Other("Invalid key length".to_string()))?,
 		);
-		let tag2 = xxhash_rust::xxh3::xxh3_64_with_seed(
-			&output,
-			u64::from_le_bytes(key[8..16].try_into().unwrap()),
+		let seed2 = u64::from_le_bytes(
+			key[8..16].try_into().map_err(|_| Error::Other("Invalid key length".to_string()))?,
 		);
+		let tag1 = xxhash_rust::xxh3::xxh3_64_with_seed(&output, seed1);
+		let tag2 = xxhash_rust::xxh3::xxh3_64_with_seed(&output, seed2);
 		output.extend_from_slice(&tag1.to_le_bytes());
 		output.extend_from_slice(&tag2.to_le_bytes());
 
@@ -119,8 +119,14 @@ impl BlockCipher {
 			return Err(Error::Other("Ciphertext too short for header and tag".to_string()));
 		}
 
-		let key_id = u32::from_be_bytes(ciphertext[..4].try_into().unwrap());
-		let nonce: [u8; NONCE_LEN] = ciphertext[4..HEADER_LEN].try_into().unwrap();
+		let key_id = u32::from_be_bytes(
+			ciphertext[..4]
+				.try_into()
+				.map_err(|_| Error::Other("Invalid key_id bytes in ciphertext".to_string()))?,
+		);
+		let nonce: [u8; NONCE_LEN] = ciphertext[4..HEADER_LEN]
+			.try_into()
+			.map_err(|_| Error::Other("Invalid nonce bytes in ciphertext".to_string()))?;
 		let tag_offset = ciphertext.len() - TAG_LEN;
 		let expected_tag = &ciphertext[tag_offset..];
 		let authenticated_portion = &ciphertext[..tag_offset];
@@ -128,14 +134,14 @@ impl BlockCipher {
 		let key = self.key_manager.get_key(key_id)?;
 
 		// Verify integrity tag first (constant-time check)
-		let tag1 = xxhash_rust::xxh3::xxh3_64_with_seed(
-			authenticated_portion,
-			u64::from_le_bytes(key[..8].try_into().unwrap()),
+		let seed1 = u64::from_le_bytes(
+			key[..8].try_into().map_err(|_| Error::Other("Invalid key length".to_string()))?,
 		);
-		let tag2 = xxhash_rust::xxh3::xxh3_64_with_seed(
-			authenticated_portion,
-			u64::from_le_bytes(key[8..16].try_into().unwrap()),
+		let seed2 = u64::from_le_bytes(
+			key[8..16].try_into().map_err(|_| Error::Other("Invalid key length".to_string()))?,
 		);
+		let tag1 = xxhash_rust::xxh3::xxh3_64_with_seed(authenticated_portion, seed1);
+		let tag2 = xxhash_rust::xxh3::xxh3_64_with_seed(authenticated_portion, seed2);
 		let mut calculated_tag = [0u8; TAG_LEN];
 		calculated_tag[..8].copy_from_slice(&tag1.to_le_bytes());
 		calculated_tag[8..].copy_from_slice(&tag2.to_le_bytes());
