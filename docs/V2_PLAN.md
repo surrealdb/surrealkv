@@ -187,9 +187,9 @@ When reading a block from an SSTable, parsing the keys and values typically requ
 ## Phase 6: Resilience, Security, & Telemetry
 To ensure the engine behaves predictably in production, we must protect against hardware lies, secure data at rest, and provide zero-cost observability.
 
-- [ ] Transparent Data Encryption (TDE): Block-level encryption at rest (AES-GCM / ChaCha20-Poly1305) with KMS key rotation.
-- [ ] End-to-End Integrity & Background Scrubbing: Continuous background verification with `xxHash3` checksums.
-- [ ] Zero-Allocation Telemetry: Real-time latency tracking (p99/p99.99) with lock-free atomics and HDRHistograms.
+- [x] Transparent Data Encryption (TDE): Block-level encryption at rest with KMS key rotation support (`KeyManager`, `BlockCipher`).
+- [x] End-to-End Integrity & Background Scrubbing: Continuous background verification (`Scrubber`, `scrub_table`).
+- [x] Zero-Allocation Telemetry: Real-time latency tracking (p99/p99.99) with lock-free atomics and HDRHistograms (`LatencyHistogram`, `FlightRecorder`).
 
 ### Transparent Data Encryption (TDE) & KMS Integration
 Pushing SSTables and WAL segments to S3/Object Storage mandates strict security. We will add block-level Encryption at Rest. Before a 4KB block or a WAL frame is written to disk/S3, it is encrypted (e.g., using AES-GCM or ChaCha20-Poly1305). The engine will integrate with a Key Management System (KMS) so that the master encryption key can be rotated without rewriting the data. Because encryption happens *after* Zstd compression, it has minimal impact on storage size, and hardware acceleration makes the CPU cost negligible.
