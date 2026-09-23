@@ -139,16 +139,20 @@ impl Snapshot {
 	/// This is a helper method used by both iterators and optimized operations
 	/// like count
 	pub(crate) fn collect_iter_state(&self) -> Result<IterState> {
-		let active = guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.active_memtable))?;
-		let immutable =
-			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.immutable_memtables))?;
-		let manifest =
-			guardian::ArcRwLockReadGuardian::take(Arc::clone(&self.core.level_manifest))?;
+		let active = self.core.active_memtable.read()?.clone();
+		let immutable = self
+			.core
+			.immutable_memtables
+			.read()?
+			.iter()
+			.map(|entry| Arc::clone(&entry.memtable))
+			.collect();
+		let levels = self.core.level_manifest.read()?.levels.clone();
 
 		Ok(IterState {
-			active: active.clone(),
-			immutable: immutable.iter().map(|entry| Arc::clone(&entry.memtable)).collect(),
-			levels: manifest.levels.clone(),
+			active,
+			immutable,
+			levels,
 		})
 	}
 
