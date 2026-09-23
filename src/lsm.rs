@@ -897,104 +897,6 @@ impl WriteStallCountProvider for CoreInner {
 	}
 }
 
-struct LsmCommitEnv {
-	core: Arc<CoreInner>,
-
-	/// Manages background tasks like flushing and compaction
-	task_manager: Option<Arc<TaskManager>>,
-}
-
-impl LsmCommitEnv {
-	/// Creates a new commit environment for the LSM tree
-	pub(crate) fn new(core: Arc<CoreInner>, task_manager: Arc<TaskManager>) -> Result<Self> {
-		Ok(Self {
-			core,
-			task_manager: Some(task_manager),
-		})
-	}
-}
-
-impl CommitEnv for LsmCommitEnv {
-	// Write batch to WAL with inline values (synchronous operation).
-	// VLog separation is deferred to memtable flush time.
-	fn write(&self, batch: &Batch, seq_num: u64, sync: bool) -> Result<Batch> {
-		let mut processed_batch = Batch::new(seq_num);
-
-		for (_, entry, _current_seq_num, timestamp) in batch.entries_with_seq_nums()? {
-			// Always store values inline — VLog separation deferred to flush.
-			// Versioned index (B+tree) writes are also deferred to flush time,
-			// so the B+tree stores value pointers (consistent with SSTables).
-			let encoded_value = match &entry.value {
-				Some(value) => {
-					let value_location = ValueLocation::with_inline_value(value.clone());
-					Some(value_location.encode())
-				}
-				None => None,
-			};
-
-			processed_batch.add_record(entry.kind, entry.key.clone(), encoded_value, timestamp)?;
-		}
-
-		// Write to WAL for durability
-		let enc_bytes = processed_batch.encode()?;
-		let mut wal_guard = self.core.wal.write();
-		wal_guard.append(&enc_bytes)?;
-		if sync {
-			wal_guard.sync()?;
-		}
-		drop(wal_guard);
-
-		Ok(processed_batch)
-	}
-
-	/// Apply batch to memtable with retry on arena full.
-	///
-	/// Atomicity invariant (since the introduction of `MemTable::try_reserve`):
-	/// `active_memtable.add(batch)` either fully applies the batch or returns
-	/// `Err(ArenaFull)` with the memtable unchanged. The rotate-and-retry below
-	/// is therefore safe: no partial-application prefix can leak into the
-	/// immutable queue, and the retry on a fresh memtable will not produce
-	/// duplicates of `(user_key, seq_num)` across two SSTs. This matters
-	/// specifically because `CommitPipeline::commit` (see commit.rs) runs
-	/// `apply()` outside its `write_mutex`, so concurrent calls to this
-	/// function on the same active memtable are routine.
-	fn apply(&self, batch: &Batch) -> Result<()> {
-		// Try to add to current memtable
-		let result = {
-			let active_memtable = self.core.active_memtable.read()?;
-			active_memtable.add(batch)
-		};
-
-		match result {
-			Ok(()) => Ok(()),
-			Err(Error::ArenaFull) => {
-				// Arena is full - rotate memtable and retry
-				log::debug!("apply: arena full, rotating memtable");
-
-				self.core.rotate_memtable()?;
-
-				// Schedule background flush
-				if let Some(ref task_manager) = self.task_manager {
-					task_manager.wake_up_memtable();
-				}
-
-				// Retry on new memtable - must succeed
-				let active_memtable = self.core.active_memtable.read()?;
-				active_memtable.add(batch)
-			}
-			Err(e) => Err(e),
-		}
-	}
-
-	// Check for background errors before committing
-	fn check_background_error(&self) -> Result<()> {
-		self.core.error_handler.check_error()
-	}
-
-	fn oldest_active_start_seq(&self) -> u64 {
-		self.core.oldest_active_start_seq()
-	}
-}
 
 // ===== Core with Background Task Management =====
 /// Wraps the LSM tree core with background task management.
@@ -1007,8 +909,8 @@ pub(crate) struct Core {
 	/// The inner LSM tree implementation
 	pub(crate) inner: Arc<CoreInner>,
 
-	/// The commit pipeline that handles write batches
-	pub(crate) commit_pipeline: Arc<CommitPipeline>,
+	/// The commit pipeline for lock-free OCC transactions and group commit
+	pub(crate) commit_pipeline: Arc<crate::ring::CommitPipeline>,
 
 	/// Task manager for background operations (stored in Option so we can take
 	/// it for shutdown)
@@ -1016,6 +918,9 @@ pub(crate) struct Core {
 
 	/// Write stall controller for backpressure management
 	pub(crate) write_stall: Arc<crate::stall::WriteStallController>,
+
+	/// Handle to the background flusher task
+	pub(crate) flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl std::ops::Deref for Core {
@@ -1180,17 +1085,6 @@ impl Core {
 			Arc::clone(&write_stall),
 		));
 
-		let commit_env =
-			Arc::new(LsmCommitEnv::new(Arc::clone(&inner), Arc::clone(&task_manager))?);
-
-		// Pass the shared visible_seq_num from CoreInner to CommitPipeline
-		// Both will use the same atomic for coordinated updates
-		let commit_pipeline = CommitPipeline::new(
-			commit_env,
-			Arc::clone(&inner.visible_seq_num),
-			Arc::clone(&write_stall),
-		);
-
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
 
@@ -1261,7 +1155,17 @@ impl Core {
 		};
 
 		// Set visible sequence number (in-memory, will be persisted on next flush)
-		commit_pipeline.set_seq_num(max_seq_num);
+		inner.visible_seq_num.store(max_seq_num, Ordering::Release);
+
+		// Initialize the CommitPipeline for lock-free OCC commits and background flushing.
+		let commit_pipeline = Arc::new(crate::ring::CommitPipeline::new(
+			Arc::clone(&inner),
+			Arc::clone(&write_stall),
+			Some(Arc::clone(&task_manager)),
+			max_seq_num + 1,
+		));
+
+		let flusher_handle = commit_pipeline.start_flusher();
 
 		// Clean up any orphaned SST files from previous crashes
 		// SAFETY: This must happen AFTER WAL replay so data is recovered
@@ -1277,9 +1181,10 @@ impl Core {
 
 		let core = Self {
 			inner: Arc::clone(&inner),
-			commit_pipeline: Arc::clone(&commit_pipeline),
+			commit_pipeline,
 			task_manager: Mutex::new(Some(task_manager)),
 			write_stall,
+			flusher_handle: Mutex::new(Some(flusher_handle)),
 		};
 
 		log::info!("=== LSM tree initialization complete ===");
@@ -1311,7 +1216,7 @@ impl Core {
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {
-		self.commit_pipeline.get_visible_seq_num()
+		self.inner.visible_seq_num.load(Ordering::Acquire)
 	}
 
 	/// Flushes WAL and VLog buffers to OS cache.
@@ -1357,6 +1262,11 @@ impl Core {
 		// Step 1: Shutdown the commit pipeline to stop accepting new writes
 		self.commit_pipeline.shutdown();
 		log::debug!("Commit pipeline shutdown complete");
+
+		let handle = self.flusher_handle.lock().unwrap().take();
+		if let Some(handle) = handle {
+			let _ = handle.await;
+		}
 
 		// Step 2: Signal write stall controller - wake any stalled writers
 		self.write_stall.signal_shutdown();
@@ -1656,8 +1566,7 @@ impl Tree {
 		// may have accumulated oracle entries from pre-restore commits whose
 		// seqs are now ghosts of a future that no longer exists; clearing them
 		// prevents false write-write conflicts for new post-restore txns.
-		self.core.commit_pipeline.set_seq_num(max_seq_num);
-		self.core.commit_pipeline.reset_oracle_for_restore(max_seq_num);
+		self.core.commit_pipeline.reset_for_restore(max_seq_num);
 
 		Ok(metadata)
 	}

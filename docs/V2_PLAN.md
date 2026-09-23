@@ -20,8 +20,8 @@ The primary performance bottleneck in the current SurrealKV implementation is th
 - [x] Delete the legacy `commit.rs` module and `CommitPipeline`.
 - [x] Scaffold the Lock-Free MPSC `Ring` buffer.
 - [x] Implement fast `BloomFilter` for OCC read/write sets.
-- [ ] Connect the `Transaction` to use the `Ring` buffer (claim, validate, write).
-- [ ] Implement the `Flusher` task for Group Commit to WAL & Memtable.
+- [x] Connect the `Transaction` to use the `Ring` buffer (claim, validate, write).
+- [x] Implement the `Flusher` task for Group Commit to WAL & Memtable.
 - [ ] Implement Multiple Immutable Memtables (Burst Buffering).
 - [ ] Implement Proactive Write Pacing.
 - [ ] Refactor hot-path `Vec<u8>` usage for Zero-Allocation data paths.
