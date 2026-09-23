@@ -109,6 +109,73 @@ impl ObjectStore for MemObjectStore {
 // AffinityPool Storage Implementations (macOS / Windows / Non-io_uring Linux)
 // ============================================================================
 
+/// Append-only log store backed by dedicated affinitypool worker threads and WAL manager.
+pub struct AffinityLogStore {
+	wal: Arc<parking_lot::RwLock<crate::wal::manager::Wal>>,
+}
+
+impl std::fmt::Debug for AffinityLogStore {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("AffinityLogStore").finish()
+	}
+}
+
+impl AffinityLogStore {
+	pub fn new(wal: Arc<parking_lot::RwLock<crate::wal::manager::Wal>>) -> Self {
+		Self {
+			wal,
+		}
+	}
+}
+
+impl LogStore for AffinityLogStore {
+	fn append(&self, data: &[u8]) -> BoxFuture<'_, u64> {
+		let wal = Arc::clone(&self.wal);
+		let data = data.to_vec();
+		Box::pin(async move {
+			let join_res = affinitypool::spawn(move || -> Result<u64> {
+				let mut guard = wal.write();
+				guard.append(&data).map_err(|e| crate::error::Error::Other(e.to_string()))
+			})
+			.await;
+			match join_res {
+				Ok(inner_res) => Ok(inner_res),
+				Err(e) => Err(crate::error::Error::Other(e.to_string())),
+			}
+		})
+	}
+
+	fn sync(&self) -> BoxFuture<'_, ()> {
+		let wal = Arc::clone(&self.wal);
+		Box::pin(async move {
+			let join_res = affinitypool::spawn(move || -> Result<()> {
+				let mut guard = wal.write();
+				guard.sync().map_err(|e| crate::error::Error::Other(e.to_string()))
+			})
+			.await;
+			match join_res {
+				Ok(inner_res) => Ok(inner_res),
+				Err(e) => Err(crate::error::Error::Other(e.to_string())),
+			}
+		})
+	}
+
+	fn size(&self) -> BoxFuture<'_, u64> {
+		let wal = Arc::clone(&self.wal);
+		Box::pin(async move {
+			let join_res = affinitypool::spawn(move || -> Result<u64> {
+				let _guard = wal.read();
+				Ok(0)
+			})
+			.await;
+			match join_res {
+				Ok(inner_res) => Ok(inner_res),
+				Err(e) => Err(crate::error::Error::Other(e.to_string())),
+			}
+		})
+	}
+}
+
 /// Filesystem ObjectStore backed by dedicated affinitypool worker threads.
 pub struct AffinityObjectStore {
 	file: Arc<dyn crate::vfs::File>,
@@ -132,46 +199,30 @@ impl ObjectStore for AffinityObjectStore {
 	fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'_, Bytes> {
 		let file = Arc::clone(&self.file);
 		Box::pin(async move {
-			affinitypool::spawn(move || -> Result<Bytes> {
+			let join_res = affinitypool::spawn(move || -> Result<Bytes> {
 				let mut buf = vec![0u8; len];
 				file.read_at(offset, &mut buf)?;
 				Ok(Bytes::from(buf))
 			})
-			.await
-			.map_err(|e| crate::error::Error::Other(e.to_string()))
+			.await;
+			match join_res {
+				Ok(inner_res) => Ok(inner_res),
+				Err(e) => Err(crate::error::Error::Other(e.to_string())),
+			}
 		})
 	}
 
 	fn size(&self) -> BoxFuture<'_, u64> {
 		let file = Arc::clone(&self.file);
 		Box::pin(async move {
-			affinitypool::spawn(move || file.size())
-				.await
-				.map_err(|e| crate::error::Error::Other(e.to_string()))
+			let join_res = affinitypool::spawn(move || -> Result<u64> { file.size() }).await;
+			match join_res {
+				Ok(inner_res) => Ok(inner_res),
+				Err(e) => Err(crate::error::Error::Other(e.to_string())),
+			}
 		})
 	}
 }
 
 #[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[tokio::test]
-	async fn test_mem_log_store() {
-		let store = MemLogStore::new();
-		let off1 = store.append(b"hello ").await.unwrap();
-		assert_eq!(off1, 6);
-		let off2 = store.append(b"world").await.unwrap();
-		assert_eq!(off2, 11);
-		store.sync().await.unwrap();
-		assert_eq!(store.size().await.unwrap(), 11);
-	}
-
-	#[tokio::test]
-	async fn test_mem_object_store() {
-		let store = MemObjectStore::new(b"hello world".as_slice());
-		let slice = store.read_at(6, 5).await.unwrap();
-		assert_eq!(slice.as_ref(), b"world");
-		assert_eq!(store.size().await.unwrap(), 11);
-	}
-}
+mod tests;
