@@ -366,14 +366,21 @@ impl Transaction {
 	}
 
 	/// Deletes a range of keys [start, end) as an O(1) range tombstone.
+	/// If start >= end, this is a no-op (empty range).
 	pub fn delete_range<K>(&mut self, start: K, end: K) -> Result<()>
 	where
 		K: IntoBytes,
 	{
+		let start_bytes = start.into_bytes();
+		let end_bytes = end.into_bytes();
+		if start_bytes.as_slice() >= end_bytes.as_slice() {
+			return Ok(());
+		}
+
 		let write_seqno = self.next_write_seqno();
 		let entry = Entry::new(
-			start,
-			Some(end.into_bytes()),
+			start_bytes,
+			Some(end_bytes),
 			InternalKeyKind::RangeDelete,
 			self.savepoints,
 			write_seqno,
@@ -559,9 +566,28 @@ impl Transaction {
 
 		// RYOW semantics: Read your own writes. If the value is in the write set,
 		// return it.
+		let mut range_delete_entry = None;
+		for (start, entries) in &self.write_set {
+			if let Some(entry) = entries.last() {
+				if entry.kind == InternalKeyKind::RangeDelete {
+					if let Some(ref end) = entry.value {
+						let k = key.as_slice();
+						if k >= start.as_slice() && k < end.as_slice() {
+							range_delete_entry = Some(entry);
+						}
+					}
+				}
+			}
+		}
+
 		if let Some(last_entry) =
 			self.write_set.get(key.as_slice()).and_then(|entries| entries.last())
 		{
+			if let Some(r) = range_delete_entry {
+				if r.seqno > last_entry.seqno {
+					return Ok(None);
+				}
+			}
 			// If the entry is a tombstone, return None.
 			if last_entry.is_tombstone() {
 				return Ok(None);
@@ -570,6 +596,8 @@ impl Transaction {
 				return Ok(Some(v.clone()));
 			}
 			// If the entry has no value, it means the key was deleted in this transaction.
+			return Ok(None);
+		} else if range_delete_entry.is_some() {
 			return Ok(None);
 		}
 
@@ -772,10 +800,10 @@ impl Transaction {
 				// Exception: When using explicit timestamps (set_at), entries with
 				// different timestamps should be preserved as separate versions, not replaced.
 				if let Some(last_entry) = entries.last() {
-					if last_entry.savepoint_no == e.savepoint_no {
-						// Same savepoint - check if timestamps differ
-						// If both have explicit timestamps and they're different,
-						// preserve both as separate versions
+					if last_entry.savepoint_no == e.savepoint_no
+						&& last_entry.kind != InternalKeyKind::RangeDelete
+						&& e.kind != InternalKeyKind::RangeDelete
+					{
 						let last_has_explicit_ts = last_entry.timestamp != Entry::COMMIT_TIME;
 						let new_has_explicit_ts = e.timestamp != Entry::COMMIT_TIME;
 
@@ -790,7 +818,7 @@ impl Transaction {
 							*entries.last_mut().unwrap() = e;
 						}
 					} else {
-						// Different savepoint - add new entry
+						// Different savepoint or range delete - add new entry
 						entries.push(e);
 					}
 				} else {

@@ -437,6 +437,16 @@ impl LevelManifest {
 		}
 	}
 
+	/// Finds a table by its table ID across all levels.
+	pub(crate) fn find_table_by_id(&self, table_id: u64) -> Option<Arc<Table>> {
+		for level in &self.levels {
+			if let Some(table) = level.tables.iter().find(|t| t.id == table_id) {
+				return Some(Arc::clone(table));
+			}
+		}
+		None
+	}
+
 	/// Apply a changeset to this manifest and return rollback data
 	pub(crate) fn apply_changeset(
 		&mut self,

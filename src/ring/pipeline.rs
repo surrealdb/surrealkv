@@ -289,12 +289,16 @@ impl CommitPipeline {
 		for batch in batches {
 			let mut processed = Batch::new(batch.starting_seq_num);
 			for (_, entry, _seq, timestamp) in batch.entries_with_seq_nums()? {
-				let encoded_value = match &entry.value {
-					Some(value) => {
-						let value_location = ValueLocation::with_inline_value(value.clone());
-						Some(value_location.encode())
+				let encoded_value = if entry.kind == crate::InternalKeyKind::RangeDelete {
+					entry.value.clone()
+				} else {
+					match &entry.value {
+						Some(value) => {
+							let value_location = ValueLocation::with_inline_value(value.clone());
+							Some(value_location.encode())
+						}
+						None => None,
 					}
-					None => None,
 				};
 				processed.add_record(entry.kind, entry.key.clone(), encoded_value, timestamp)?;
 			}
