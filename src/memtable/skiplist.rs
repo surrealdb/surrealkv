@@ -390,8 +390,7 @@ impl Skiplist {
 				}
 
 				// CAS failed, recompute splice
-				let (new_prev, new_next, found) =
-					self.find_splice_for_level(key, trailer, i, prev);
+				let (new_prev, new_next, found) = self.find_splice_for_level(key, trailer, i, prev);
 				if found {
 					if i != 0 {
 						panic!("how can another thread have inserted a node at a non-base level?");
@@ -417,15 +416,9 @@ impl Skiplist {
 	}
 
 	/// Create new node with height CAS
-	fn new_node(
-		&self,
-		key: &[u8],
-		trailer: u64,
-		value: &[u8],
-	) -> Result<(*mut Node, u32), Error> {
+	fn new_node(&self, key: &[u8], trailer: u64, value: &[u8]) -> Result<(*mut Node, u32), Error> {
 		let height = self.random_height();
-		let nd = new_node(&self.arena, height, key, trailer, value)
-			.ok_or(Error::ArenaFull)?;
+		let nd = new_node(&self.arena, height, key, trailer, value).ok_or(Error::ArenaFull)?;
 
 		// Try to increase height via CAS
 		let mut list_height = self.height();
@@ -472,10 +465,8 @@ impl Skiplist {
 					continue;
 				}
 
-				if (spl.prev != self.head
-					&& !self.key_is_after_node(spl.prev, key, trailer))
-					|| (spl.next != self.tail
-						&& self.key_is_after_node(spl.next, key, trailer))
+				if (spl.prev != self.head && !self.key_is_after_node(spl.prev, key, trailer))
+					|| (spl.next != self.tail && self.key_is_after_node(spl.next, key, trailer))
 				{
 					level = list_height as i32;
 				} else {

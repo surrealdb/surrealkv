@@ -11,12 +11,7 @@ use crate::sstable::table::{ChecksumType, Footer, IndexType, Table, TableFormat,
 use crate::test::{collect_all, collect_iter, count_iter};
 use crate::vfs::File;
 use crate::{
-	user_range_to_internal_range,
-	InternalKey,
-	InternalKeyKind,
-	LSMIterator,
-	Options,
-	Result,
+	user_range_to_internal_range, InternalKey, InternalKeyKind, LSMIterator, Options, Result,
 	INTERNAL_KEY_SEQ_NUM_MAX,
 };
 
@@ -124,11 +119,8 @@ fn build_table(data: Vec<(&str, &str)>) -> (Vec<u8>, usize) {
 		let mut b = TableWriter::new(&mut d, 0, opt, 0);
 
 		for &(k, v) in data.iter() {
-			b.add(
-				InternalKey::new(Vec::from(k.as_bytes()), 1, InternalKeyKind::Set),
-				v.as_bytes(),
-			)
-			.unwrap();
+			b.add(InternalKey::new(Vec::from(k.as_bytes()), 1, InternalKeyKind::Set), v.as_bytes())
+				.unwrap();
 		}
 
 		b.finish().unwrap();
@@ -323,8 +315,7 @@ fn test_iter_items() {
 		let value = format!("value_{i:05}");
 		items.push((key.clone(), value.clone()));
 
-		let internal_key =
-			InternalKey::new(Vec::from(key.as_bytes()), i + 1, InternalKeyKind::Set);
+		let internal_key = InternalKey::new(Vec::from(key.as_bytes()), i + 1, InternalKeyKind::Set);
 
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
@@ -749,32 +740,37 @@ fn test_table_key_range_persistence() {
 	assert!(table.is_key_in_key_range(&InternalKey::new(
 		Vec::from(expected_low),
 		1,
-		InternalKeyKind::Set)));
+		InternalKeyKind::Set
+	)));
 	assert!(table.is_key_in_key_range(&InternalKey::new(
 		Vec::from(expected_high),
 		1,
-		InternalKeyKind::Set)));
+		InternalKeyKind::Set
+	)));
 
 	// A key before the range should not be in the range
 	let before_range = "aaa".as_bytes();
 	assert!(!table.is_key_in_key_range(&InternalKey::new(
 		Vec::from(before_range),
 		1,
-		InternalKeyKind::Set)));
+		InternalKeyKind::Set
+	)));
 
 	// A key after the range should not be in the range
 	let after_range = "zzzz".as_bytes();
 	assert!(!table.is_key_in_key_range(&InternalKey::new(
 		Vec::from(after_range),
 		1,
-		InternalKeyKind::Set)));
+		InternalKeyKind::Set
+	)));
 
 	// Test a key in the middle of the range
 	let middle_key = "bsr".as_bytes(); // This is in the test data
 	assert!(table.is_key_in_key_range(&InternalKey::new(
 		Vec::from(middle_key),
 		1,
-		InternalKeyKind::Set)));
+		InternalKeyKind::Set
+	)));
 }
 
 #[test]
@@ -814,13 +810,15 @@ fn test_table_disjoint_key_range_persistence() {
 	assert!(table.is_key_in_key_range(&InternalKey::new(
 		Vec::from(in_first_gap),
 		1,
-		InternalKeyKind::Set)));
+		InternalKeyKind::Set
+	)));
 
 	let in_second_gap = "xxx".as_bytes(); // Between qqq and zzz
 	assert!(table.is_key_in_key_range(&InternalKey::new(
 		Vec::from(in_second_gap),
 		1,
-		InternalKeyKind::Set)));
+		InternalKeyKind::Set
+	)));
 }
 
 #[test]
@@ -866,7 +864,8 @@ fn test_table_key_range_with_many_blocks() {
 		assert!(table.is_key_in_key_range(&InternalKey::new(
 			Vec::from(key.as_bytes()),
 			1,
-			InternalKeyKind::Set)));
+			InternalKeyKind::Set
+		)));
 	}
 }
 
@@ -1563,8 +1562,7 @@ fn test_table_with_partitioned_index() {
 	for i in 0..100 {
 		let key = format!("key_{i:03}");
 		let value = format!("value_{i:03}");
-		let internal_key =
-			InternalKey::new(Vec::from(key.as_bytes()), i + 1, InternalKeyKind::Set);
+		let internal_key = InternalKey::new(Vec::from(key.as_bytes()), i + 1, InternalKeyKind::Set);
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
@@ -1900,8 +1898,7 @@ fn test_get_partition_index_sequence_numbers() {
 	for i in 0..20 {
 		let key = format!("aaa_key_{:03}", i);
 		let value = format!("value_{}", i);
-		let internal_key =
-			InternalKey::new(Vec::from(key.as_bytes()), 1000, InternalKeyKind::Set);
+		let internal_key = InternalKey::new(Vec::from(key.as_bytes()), 1000, InternalKeyKind::Set);
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
@@ -1912,8 +1909,7 @@ fn test_get_partition_index_sequence_numbers() {
 	for i in 0..40 {
 		let key = format!("zzz_key_{:03}", i);
 		let value = format!("value_{}", i);
-		let internal_key =
-			InternalKey::new(Vec::from(key.as_bytes()), 1000, InternalKeyKind::Set);
+		let internal_key = InternalKey::new(Vec::from(key.as_bytes()), 1000, InternalKeyKind::Set);
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
@@ -2113,8 +2109,7 @@ fn test_get_nonexistent_in_large_table() {
 		}
 		let key = format!("key_{:03}", i);
 		let value = format!("value_{}", i);
-		let internal_key =
-			InternalKey::new(Vec::from(key.as_bytes()), 100, InternalKeyKind::Set);
+		let internal_key = InternalKey::new(Vec::from(key.as_bytes()), 100, InternalKeyKind::Set);
 		writer.add(internal_key, value.as_bytes()).unwrap();
 	}
 
@@ -4797,7 +4792,7 @@ fn test_seq_num_tracking_various_orders() {
 	}
 }
 
-	/// Tests that a single entry correctly sets both smallest=largest and oldest=newest.
+/// Tests that a single entry correctly sets both smallest=largest and oldest=newest.
 #[test]
 fn test_single_entry_metadata() {
 	let opts = default_opts();

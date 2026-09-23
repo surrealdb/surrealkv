@@ -82,7 +82,14 @@ impl CommitPipeline {
 			read_bloom.insert(k);
 		}
 		let current_seq = self.ring.next.load(Ordering::Acquire);
-		if !self.queue.check_conflicts(start_seq, current_seq, &[], &BloomFilter::new(), read_keys, &read_bloom) {
+		if !self.queue.check_conflicts(
+			start_seq,
+			current_seq,
+			&[],
+			&BloomFilter::new(),
+			read_keys,
+			&read_bloom,
+		) {
 			return Err(Error::TransactionWriteConflict);
 		}
 		Ok(())
@@ -131,7 +138,11 @@ impl CommitPipeline {
 		// Allocate contiguous sequence numbers for the entries in this batch
 		let count = batch.count() as u64;
 		let start_batch_seq = self.log_seq_num.fetch_add(count, Ordering::SeqCst);
-		let end_batch_seq = if count > 0 { start_batch_seq + count - 1 } else { start_batch_seq };
+		let end_batch_seq = if count > 0 {
+			start_batch_seq + count - 1
+		} else {
+			start_batch_seq
+		};
 		batch.set_starting_seq_num(start_batch_seq);
 
 		// Atomically claim next slot in the ring
@@ -145,7 +156,14 @@ impl CommitPipeline {
 		let slot = self.ring.slot(slot_id);
 
 		// Check for OCC conflicts against commits made after start_seq
-		if !self.queue.check_conflicts(start_seq, end_batch_seq, &write_keys, &write_bloom, read_set, &read_bloom) {
+		if !self.queue.check_conflicts(
+			start_seq,
+			end_batch_seq,
+			&write_keys,
+			&write_bloom,
+			read_set,
+			&read_bloom,
+		) {
 			// Conflict detected: mark slot aborted and publish so flusher can skip it
 			{
 				let mut data = slot.data.lock();
@@ -247,10 +265,9 @@ impl CommitPipeline {
 						log::error!("Error during group commit flush: {:?}", e);
 						self.ring.advance_taken(last_seq);
 						for tx in completion_senders {
-							let _ = tx.send(Err(Error::Io(std::io::Error::new(
-								std::io::ErrorKind::Other,
-								"Group commit failed",
-							).into())));
+							let _ = tx.send(Err(Error::Io(
+								std::io::Error::other("Group commit failed").into(),
+							)));
 						}
 					}
 				}

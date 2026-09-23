@@ -10,15 +10,7 @@ use crate::lsm::{Core, CoreInner};
 use crate::test::collect_transaction_all;
 use crate::wal::list_segment_ids;
 use crate::{
-	Error,
-	InternalKeyKind,
-	Key,
-	LSMIterator,
-	Options,
-	Tree,
-	TreeBuilder,
-	Value,
-	WalRecoveryMode,
+	Error, InternalKeyKind, Key, LSMIterator, Options, Tree, TreeBuilder, Value, WalRecoveryMode,
 };
 
 fn create_temp_directory() -> TempDir {

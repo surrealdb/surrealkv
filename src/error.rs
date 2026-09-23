@@ -147,8 +147,6 @@ impl From<crate::wal::Error> for Error {
 	}
 }
 
-
-
 impl From<crate::sstable::error::SSTableError> for Error {
 	fn from(err: crate::sstable::error::SSTableError) -> Self {
 		Error::SSTable(err)

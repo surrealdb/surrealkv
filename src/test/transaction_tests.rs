@@ -5,10 +5,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::lsm::Tree;
-use crate::test::{
-	collect_transaction_all,
-	collect_transaction_reverse,
-};
+use crate::test::{collect_transaction_all, collect_transaction_reverse};
 use crate::{Error, LSMIterator, Mode, TreeBuilder};
 
 fn create_temp_directory() -> TempDir {

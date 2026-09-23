@@ -5,10 +5,7 @@ use std::sync::Arc;
 use test_log::test;
 
 use crate::levels::{
-	write_manifest_to_disk,
-	LevelManifest,
-	ManifestChangeSet,
-	SnapshotInfo,
+	write_manifest_to_disk, LevelManifest, ManifestChangeSet, SnapshotInfo,
 	MANIFEST_FORMAT_VERSION_V1,
 };
 use crate::sstable::table::{Table, TableWriter};
@@ -29,8 +26,7 @@ fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Resul
 		let key = format!("key_{i:05}");
 		let value = format!("value_{i:05}");
 
-		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set);
+		let internal_key = InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set);
 
 		writer.add(internal_key, value.as_bytes())?;
 	}
@@ -374,8 +370,7 @@ fn create_test_table_with_seq_nums(
 		let key = format!("key_{seq_num:05}");
 		let value = format!("value_{seq_num:05}");
 
-		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set);
+		let internal_key = InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set);
 
 		writer.add(internal_key, value.as_bytes())?;
 	}

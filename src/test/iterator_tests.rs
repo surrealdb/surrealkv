@@ -107,12 +107,8 @@ fn test_merge_iterator_sequence_ordering() {
 	let iter2 = build_table_iterator(items2);
 
 	// Create the merge iterator
-	let mut merge_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut merge_iter =
+		CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 	// Collect all items
 	let mut result = Vec::new();
@@ -183,12 +179,8 @@ fn test_compaction_iterator_hard_delete_filtering() {
 	let iter2 = build_table_iterator(items2);
 
 	// Test non-bottom level (should keep hard delete entries)
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 	// Collect all items
 	let mut result = Vec::new();
@@ -254,12 +246,8 @@ fn test_compaction_iterator_hard_delete_filtering() {
 	let iter2 = build_table_iterator(items2);
 
 	// Use bottom level
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		true,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2], create_comparator(), true, vec![]);
 
 	// Collect all items
 	let mut bottom_result = Vec::new();
@@ -307,12 +295,8 @@ async fn test_combined_iterator_returns_latest_version() {
 	let iter3 = build_table_iterator(items3);
 
 	// Create compaction iterator (non-bottom level)
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2, iter3],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2, iter3], create_comparator(), false, vec![]);
 
 	// Should return only the latest version (seq=300)
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -350,12 +334,8 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 	let iter2 = build_table_iterator(items2);
 	let iter3 = build_table_iterator(items3);
 
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2, iter3],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2, iter3], create_comparator(), false, vec![]);
 
 	// Consume the iterator
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -387,12 +367,8 @@ async fn test_hard_delete_at_bottom_level() {
 	let iter1 = build_table_iterator(items1);
 	let iter2 = build_table_iterator(items2);
 
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		true,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2], create_comparator(), true, vec![]);
 
 	// At bottom level, hard_delete should NOT be returned
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -416,12 +392,8 @@ async fn test_hard_delete_at_non_bottom_level() {
 	let iter1 = build_table_iterator(items1);
 	let iter2 = build_table_iterator(items2);
 
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 	// At non-bottom level, hard_delete SHOULD be returned
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -464,12 +436,8 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 	let iter2 = build_table_iterator(items2);
 	let iter3 = build_table_iterator(items3);
 
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2, iter3],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2, iter3], create_comparator(), false, vec![]);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
@@ -514,12 +482,8 @@ fn test_no_vlog_no_delete_list() {
 	let iter1 = build_table_iterator(items1);
 	let iter2 = build_table_iterator(items2);
 
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 	// Should still work and return latest version
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
@@ -573,12 +537,8 @@ async fn test_sequence_ordering_across_iterators() {
 	let iter2 = build_table_iterator(items2);
 	let iter3 = build_table_iterator(items3);
 
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2, iter3],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2, iter3], create_comparator(), false, vec![]);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
@@ -678,12 +638,8 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 	let iter3 = build_table_iterator(items3);
 
 	// Test with versioning enabled and 5-second retention period
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2, iter3],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2, iter3], create_comparator(), false, vec![]);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
@@ -892,12 +848,8 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 	let iter3 = build_table_iterator(items3);
 
 	// Test with versioning DISABLED at NON-BOTTOM level
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2, iter3],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2, iter3], create_comparator(), false, vec![]);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
@@ -992,12 +944,8 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 	let iter3 = build_table_iterator(items3);
 
 	// Test with versioning DISABLED at BOTTOM level
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2, iter3],
-		create_comparator(),
-		true,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2, iter3], create_comparator(), true, vec![]);
 
 	let result: Vec<_> = comp_iter.by_ref().map(|r| r.unwrap()).collect();
 
@@ -1056,12 +1004,8 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 	let iter2 = build_table_iterator(items2);
 
 	// Test non-bottom level compaction (should preserve Replace)
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -1111,12 +1055,8 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 	let iter2 = build_table_iterator(items2);
 
 	// Test compaction
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -1157,12 +1097,8 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 	let iter2 = build_table_iterator(items2);
 
 	// Test compaction
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -1203,12 +1139,8 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 	let iter2 = build_table_iterator(items2);
 
 	// Test non-bottom level compaction
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -1251,12 +1183,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter2 = build_table_iterator(items2);
 
 		// Test non-bottom level compaction
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1295,12 +1223,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter2 = build_table_iterator(items2);
 
 		// Test bottom level compaction
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		true,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2], create_comparator(), true, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1343,12 +1267,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter2 = build_table_iterator(items2);
 
 		// Test compaction
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1391,12 +1311,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter2 = build_table_iterator(items2);
 
 		// Test compaction
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1454,12 +1370,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter3 = build_table_iterator(items3);
 
 		// Test compaction
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2, iter3],
-		create_comparator(),
-		false,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2, iter3], create_comparator(), false, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1495,12 +1407,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter2 = build_table_iterator(items2);
 
 		// Test non-bottom level compaction
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1536,12 +1444,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter2 = build_table_iterator(items2);
 
 		// Test bottom level compaction
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		true,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2], create_comparator(), true, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1584,12 +1488,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter3 = build_table_iterator(items3);
 
 		// Test non-bottom level compaction
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2, iter3],
-		create_comparator(),
-		false,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2, iter3], create_comparator(), false, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1629,12 +1529,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter2 = build_table_iterator(items2);
 
 		// Test compaction without versioning
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1676,12 +1572,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter3 = build_table_iterator(items3);
 
 		// Test compaction without versioning
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2, iter3],
-		create_comparator(),
-		false,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2, iter3], create_comparator(), false, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1717,12 +1609,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter2 = build_table_iterator(items2);
 
 		// Test non-bottom level compaction without versioning
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		false,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2], create_comparator(), false, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1758,12 +1646,8 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 		let iter2 = build_table_iterator(items2);
 
 		// Test bottom level compaction without versioning
-		let mut comp_iter = CompactionIterator::new(
-		vec![iter1, iter2],
-		create_comparator(),
-		true,
-		vec![],
-	);
+		let mut comp_iter =
+			CompactionIterator::new(vec![iter1, iter2], create_comparator(), true, vec![]);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1972,12 +1856,7 @@ fn test_snapshot_compaction_no_snapshots_keeps_only_latest() {
 	let iter = build_table_iterator(items);
 
 	// No snapshots - should only keep latest version
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter = CompactionIterator::new(vec![iter], create_comparator(), false, vec![]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -2004,12 +1883,7 @@ fn test_snapshot_compaction_single_snapshot_preserves_visible_version() {
 	let iter = build_table_iterator(items);
 
 	// Snapshot at seq=50 - version seq=30 is the visible version for this snapshot
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![50],
-	);
+	let mut comp_iter = CompactionIterator::new(vec![iter], create_comparator(), false, vec![50]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -2045,12 +1919,8 @@ fn test_snapshot_compaction_multiple_snapshots_different_boundaries() {
 	let iter = build_table_iterator(items);
 
 	// Snapshots at seq=50 and seq=150
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![50, 150],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter], create_comparator(), false, vec![50, 150]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -2090,12 +1960,7 @@ fn test_snapshot_compaction_newer_version_hides_older_in_same_boundary() {
 	let iter = build_table_iterator(items);
 
 	// Snapshot at seq=150 - both versions are visible to it (same boundary)
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![150],
-	);
+	let mut comp_iter = CompactionIterator::new(vec![iter], create_comparator(), false, vec![150]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -2122,12 +1987,7 @@ fn test_snapshot_compaction_versions_at_tip_hidden_by_newer() {
 	let iter = build_table_iterator(items);
 
 	// Snapshot at seq=50 - all versions are newer than all snapshots (NewerThanAllSnapshots)
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![50],
-	);
+	let mut comp_iter = CompactionIterator::new(vec![iter], create_comparator(), false, vec![50]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -2155,12 +2015,7 @@ fn test_snapshot_compaction_multiple_keys() {
 	let iter = build_table_iterator(items);
 
 	// Snapshot at seq=50
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![50],
-	);
+	let mut comp_iter = CompactionIterator::new(vec![iter], create_comparator(), false, vec![50]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -2186,12 +2041,7 @@ fn test_snapshot_compaction_tombstone_visible_to_snapshot() {
 	let iter = build_table_iterator(items);
 
 	// Snapshot at seq=150 - tombstone is visible to snapshot
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![150],
-	);
+	let mut comp_iter = CompactionIterator::new(vec![iter], create_comparator(), false, vec![150]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -2221,12 +2071,7 @@ fn test_snapshot_compaction_tombstone_at_bottom_with_snapshot() {
 	let iter = build_table_iterator(items);
 
 	// Snapshot at seq=150 - both versions visible, but bottom level
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		true,
-		vec![150],
-	);
+	let mut comp_iter = CompactionIterator::new(vec![iter], create_comparator(), true, vec![150]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -2251,12 +2096,7 @@ fn test_snapshot_compaction_exact_sequence_match() {
 	let iter = build_table_iterator(items);
 
 	// Snapshot at seq=50 (exact match with v1)
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![50],
-	);
+	let mut comp_iter = CompactionIterator::new(vec![iter], create_comparator(), false, vec![50]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -2285,12 +2125,8 @@ fn test_snapshot_compaction_version_older_than_all_snapshots() {
 	let iter = build_table_iterator(items);
 
 	// Snapshots at seq=50 and seq=150
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![50, 150],
-	);
+	let mut comp_iter =
+		CompactionIterator::new(vec![iter], create_comparator(), false, vec![50, 150]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {
@@ -2311,12 +2147,7 @@ fn test_snapshot_visibility_states() {
 	// Test NoActiveSnapshots
 	let items = vec![(create_internal_key("key1", 100, InternalKeyKind::Set), b"v1".to_vec())];
 	let iter = build_table_iterator(items);
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![],
-	);
+	let mut comp_iter = CompactionIterator::new(vec![iter], create_comparator(), false, vec![]);
 
 	// Test via the iterator behavior - with no snapshots, should keep only latest
 	let mut count = 0;
@@ -2342,12 +2173,7 @@ fn test_snapshot_compaction_with_versioning_enabled() {
 	let iter = build_table_iterator(items);
 
 	// Snapshot at seq=60, versioning with 300ns retention
-	let mut comp_iter = CompactionIterator::new(
-		vec![iter],
-		create_comparator(),
-		false,
-		vec![60],
-	);
+	let mut comp_iter = CompactionIterator::new(vec![iter], create_comparator(), false, vec![60]);
 
 	let mut result = Vec::new();
 	for item in comp_iter.by_ref() {

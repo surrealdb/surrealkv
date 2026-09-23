@@ -23,14 +23,7 @@ use crate::vlog::{VLog, ValueLocation};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
 use crate::{
-	Comparator,
-	Error,
-	FilterPolicy,
-	Key,
-	LSMIterator,
-	Options,
-	VLogChecksumLevel,
-	Value,
+	Comparator, Error, FilterPolicy, Key, LSMIterator, Options, VLogChecksumLevel, Value,
 	WalRecoveryMode,
 };
 
@@ -855,7 +848,6 @@ impl WriteStallCountProvider for CoreInner {
 	}
 }
 
-
 // ===== Core with Background Task Management =====
 /// Wraps the LSM tree core with background task management.
 ///
@@ -1027,10 +1019,8 @@ impl Core {
 		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
 
 		// Create the write stall controller with the provider and thresholds
-		let thresholds = StallThresholds::new(
-			opts.memtable_stall_threshold,
-			opts.l0_stall_threshold,
-		);
+		let thresholds =
+			StallThresholds::new(opts.memtable_stall_threshold, opts.l0_stall_threshold);
 		let write_stall = Arc::new(crate::stall::WriteStallController::new(
 			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
 			thresholds,
@@ -1858,11 +1848,7 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 /// * `vlog` - The VLog instance (if value separation is enabled)
 /// * `min_oldest_vlog` - Minimum oldest_vlog_file_id across all live SSTs
 /// * `context` - Description of the calling context (e.g., "flush", "compaction", "startup")
-pub(crate) fn cleanup_vlog(
-	vlog: &Option<Arc<VLog>>,
-	min_oldest_vlog: u32,
-	context: &str,
-) {
+pub(crate) fn cleanup_vlog(vlog: &Option<Arc<VLog>>, min_oldest_vlog: u32, context: &str) {
 	// Skip cleanup if no SSTs reference VLog files yet (fresh database case)
 	if min_oldest_vlog == 0 {
 		return;

@@ -3,15 +3,8 @@ use std::io;
 use crc32fast::Hasher;
 
 use super::{
-	BufferedFileWriter,
-	CompressionType,
-	Error,
-	IOError,
-	RecordType,
-	Result,
-	WritableFile,
-	BLOCK_SIZE,
-	HEADER_SIZE,
+	BufferedFileWriter, CompressionType, Error, IOError, RecordType, Result, WritableFile,
+	BLOCK_SIZE, HEADER_SIZE,
 };
 
 /// Writer for WAL records.

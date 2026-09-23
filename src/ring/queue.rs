@@ -1,7 +1,7 @@
-use std::sync::Arc;
-use crossbeam_skiplist::SkipMap;
-use crate::Key;
 use super::bloom::BloomFilter;
+use crate::Key;
+use crossbeam_skiplist::SkipMap;
+use std::sync::Arc;
 
 /// An entry in the OCC commit queue representing a committed (or in-flight) transaction.
 pub(crate) struct CommitEntry {
@@ -31,7 +31,11 @@ impl CommitEntry {
 	}
 
 	/// Checks if this commit's write set is disjoint from another write set.
-	pub(crate) fn is_disjoint_writeset(&self, other_keys: &[Key], other_bloom: &BloomFilter) -> bool {
+	pub(crate) fn is_disjoint_writeset(
+		&self,
+		other_keys: &[Key],
+		other_bloom: &BloomFilter,
+	) -> bool {
 		if self.bloom.is_empty() || other_bloom.is_empty() {
 			return true;
 		}

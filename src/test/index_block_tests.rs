@@ -7,12 +7,7 @@ use crate::sstable::block::BlockHandle;
 use crate::sstable::index_block::{BlockHandleWithKey, Index, IndexWriter};
 use crate::vfs::File;
 use crate::{
-	CompressionType,
-	InternalKey,
-	InternalKeyKind,
-	LSMIterator,
-	Options,
-	INTERNAL_KEY_SEQ_NUM_MAX,
+	CompressionType, InternalKey, InternalKeyKind, LSMIterator, Options, INTERNAL_KEY_SEQ_NUM_MAX,
 };
 
 fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
@@ -181,12 +176,9 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 	// Partition 2: contains (foo, 19) to (foo, 1), separator = (g, MAX)
 	let sep_foo_60 = create_internal_key(b"foo".to_vec(), 60);
 	let sep_foo_20 = create_internal_key(b"foo".to_vec(), 20);
-	let sep_g = InternalKey::new(
-		b"g".to_vec(),
-		INTERNAL_KEY_SEQ_NUM_MAX,
-		InternalKeyKind::Separator,
-	)
-	.encode();
+	let sep_g =
+		InternalKey::new(b"g".to_vec(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator)
+			.encode();
 
 	let index = Index {
 		id: 0,
@@ -265,24 +257,15 @@ fn test_find_block_handle_by_key_different_user_keys() {
 	// Partition 0: contains "apple" keys, separator = (b, MAX) [shortened from apple/banana
 	// boundary] Partition 1: contains "banana", "cherry" keys, separator = (d, MAX)
 	// Partition 2: contains "date" keys, separator = (e, MAX)
-	let sep_b = InternalKey::new(
-		b"b".to_vec(),
-		INTERNAL_KEY_SEQ_NUM_MAX,
-		InternalKeyKind::Separator,
-	)
-	.encode();
-	let sep_d = InternalKey::new(
-		b"d".to_vec(),
-		INTERNAL_KEY_SEQ_NUM_MAX,
-		InternalKeyKind::Separator,
-	)
-	.encode();
-	let sep_e = InternalKey::new(
-		b"e".to_vec(),
-		INTERNAL_KEY_SEQ_NUM_MAX,
-		InternalKeyKind::Separator,
-	)
-	.encode();
+	let sep_b =
+		InternalKey::new(b"b".to_vec(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator)
+			.encode();
+	let sep_d =
+		InternalKey::new(b"d".to_vec(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator)
+			.encode();
+	let sep_e =
+		InternalKey::new(b"e".to_vec(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator)
+			.encode();
 
 	let index = Index {
 		id: 0,
@@ -301,12 +284,8 @@ fn test_find_block_handle_by_key_different_user_keys() {
 		(create_internal_key(b"aardvark".to_vec(), 50), Some(0)),
 		// Key exactly at separator boundary
 		(
-			InternalKey::new(
-				b"b".to_vec(),
-				INTERNAL_KEY_SEQ_NUM_MAX,
-				InternalKeyKind::Separator,
-			)
-			.encode(),
+			InternalKey::new(b"b".to_vec(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Separator)
+				.encode(),
 			Some(0),
 		),
 		// Keys in second partition ("b" < key <= "d")
