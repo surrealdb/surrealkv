@@ -113,8 +113,8 @@ Swap the synchronous `vfs.rs` abstraction for a truly async storage layer. The c
 - [x] Implement in-memory async stores for testing and simulator mocks (`MemLogStore`, `MemObjectStore`).
 - [x] Migrate `SSTable` block reading and point lookup to async (`read_block_async`, `Table::get_async`, `Transaction::get_async`).
 - [x] Integrate asynchronous LogStore & ObjectStore tests into test suite.
-- [ ] Upgrade WAL append & sync in `CommitPipeline` flusher to async `LogStore::append`.
-- [ ] Run full DST and unit tests verifying async storage equivalence.
+- [x] Upgrade WAL append & sync in `CommitPipeline` flusher to async `LogStore::append`.
+- [x] Run full DST and unit tests verifying async storage equivalence.
 
 ### Distinct Storage Traits
 We will split the monolithic `File` trait into two distinct abstractions tailored to their access patterns:

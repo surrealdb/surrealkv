@@ -6,6 +6,7 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::CoreInner;
 use crate::stall::WriteStallController;
+use crate::storage::{AffinityLogStore, LogStore};
 use crate::task::TaskManager;
 use crate::vlog::ValueLocation;
 use crate::Key;
@@ -27,6 +28,8 @@ pub(crate) struct CommitPipeline {
 	pub(crate) log_seq_num: AtomicU64,
 	/// Flag used to pause all incoming commits during a full restore from checkpoint.
 	pub(crate) restoring: AtomicBool,
+	/// Asynchronous log store interface for the WAL.
+	pub(crate) log_store: Arc<dyn LogStore>,
 }
 
 pub(crate) struct RestoreGuard<'a> {
@@ -50,6 +53,8 @@ impl CommitPipeline {
 		let queue = Arc::new(CommitQueue::new());
 		let notify_flusher = Arc::new(Notify::new());
 		let seq = start_seq.max(1);
+		let log_store: Arc<dyn LogStore> =
+			Arc::new(AffinityLogStore::new(Arc::clone(&inner.wal.inner)));
 
 		Self {
 			ring,
@@ -61,6 +66,7 @@ impl CommitPipeline {
 			shutdown: AtomicBool::new(false),
 			log_seq_num: AtomicU64::new(seq),
 			restoring: AtomicBool::new(false),
+			log_store,
 		}
 	}
 
@@ -248,7 +254,7 @@ impl CommitPipeline {
 			}
 
 			if !batches_to_apply.is_empty() {
-				let flush_res = self.flush_group(&batches_to_apply, need_sync);
+				let flush_res = self.flush_group(&batches_to_apply, need_sync).await;
 
 				match flush_res {
 					Ok(()) => {
@@ -283,7 +289,7 @@ impl CommitPipeline {
 	}
 
 	/// Flushes a group of batches to WAL and applies them to the Memtable.
-	fn flush_group(&self, batches: &[Batch], sync: bool) -> Result<()> {
+	async fn flush_group(&self, batches: &[Batch], sync: bool) -> Result<()> {
 		// 1. Process batches (inline values) and encode for WAL
 		let mut processed_batches = Vec::with_capacity(batches.len());
 		for batch in batches {
@@ -305,17 +311,14 @@ impl CommitPipeline {
 			processed_batches.push(processed);
 		}
 
-		// 2. Append all batches to WAL in a single lock acquisition reusing a buffer
-		{
-			let mut wal_guard = self.inner.wal.write();
-			let mut wal_buffer = Vec::with_capacity(4096);
-			for batch in &processed_batches {
-				batch.encode_into(&mut wal_buffer)?;
-				wal_guard.append(&wal_buffer)?;
-			}
-			if sync {
-				wal_guard.sync()?;
-			}
+		// 2. Append all batches to WAL asynchronously via LogStore
+		let mut wal_buffer = Vec::with_capacity(4096);
+		for batch in &processed_batches {
+			batch.encode_into(&mut wal_buffer)?;
+			self.log_store.append(&wal_buffer).await?;
+		}
+		if sync {
+			self.log_store.sync().await?;
 		}
 
 		// 3. Apply to Active Memtable
