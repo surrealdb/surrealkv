@@ -970,6 +970,15 @@ impl VLog {
 	///
 	/// The write lock is held only for the BufWriter flush (draining the
 	/// internal buffer to OS page cache, ~microseconds). The expensive
+	/// Flushes buffered data in the active writer to OS page cache.
+	pub(crate) fn flush(&self) -> Result<()> {
+		let mut guard = self.writer.write();
+		if let Some(ref mut writer) = *guard {
+			writer.flush()?;
+		}
+		Ok(())
+	}
+
 	/// fsync is performed outside the lock using a pre-cloned file
 	/// descriptor, allowing concurrent VLog appends to proceed.
 	pub(crate) fn sync(&self) -> Result<()> {

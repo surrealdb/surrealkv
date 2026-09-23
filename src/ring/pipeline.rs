@@ -290,18 +290,41 @@ impl CommitPipeline {
 
 	/// Flushes a group of batches to WAL and applies them to the Memtable.
 	async fn flush_group(&self, batches: &[Batch], sync: bool) -> Result<()> {
-		// 1. Process batches (inline values) and encode for WAL
+		// 1. Process batches: separate large values to VLog if enabled (WiscKey WAL bypass)
+		// and encode for WAL
+		let vlog_threshold = self.inner.opts.vlog_value_threshold;
+		let vlog = self.inner.vlog.as_ref();
+
 		let mut processed_batches = Vec::with_capacity(batches.len());
 		for batch in batches {
 			let mut processed = Batch::new(batch.starting_seq_num);
-			for (_, entry, _seq, timestamp) in batch.entries_with_seq_nums()? {
+			for (_, entry, seq_num, timestamp) in batch.entries_with_seq_nums()? {
 				let encoded_value = if entry.kind == crate::InternalKeyKind::RangeDelete {
 					entry.value.clone()
 				} else {
 					match &entry.value {
 						Some(value) => {
-							let value_location = ValueLocation::with_inline_value(value.clone());
-							Some(value_location.encode())
+							if let Some(vlog_inst) = vlog {
+								if value.len() > vlog_threshold {
+									let ikey = crate::InternalKey::new(
+										entry.key.clone(),
+										seq_num,
+										entry.kind,
+									);
+									let encoded_key = ikey.encode();
+									let pointer = vlog_inst.append(&encoded_key, value)?;
+									let value_location = ValueLocation::with_pointer(pointer);
+									Some(value_location.encode())
+								} else {
+									let value_location =
+										ValueLocation::with_inline_value(value.clone());
+									Some(value_location.encode())
+								}
+							} else {
+								let value_location =
+									ValueLocation::with_inline_value(value.clone());
+								Some(value_location.encode())
+							}
 						}
 						None => None,
 					}
@@ -312,12 +335,19 @@ impl CommitPipeline {
 		}
 
 		// 2. Append all batches to WAL asynchronously via LogStore
+		if let Some(vlog_inst) = vlog {
+			vlog_inst.flush()?;
+		}
+
 		let mut wal_buffer = Vec::with_capacity(4096);
 		for batch in &processed_batches {
 			batch.encode_into(&mut wal_buffer)?;
 			self.log_store.append(&wal_buffer).await?;
 		}
 		if sync {
+			if let Some(vlog_inst) = vlog {
+				vlog_inst.sync()?;
+			}
 			self.log_store.sync().await?;
 		}
 
