@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use iter::LevelManifestIterator;
 pub(crate) use level::{Level, Levels};
 use rand::Rng;
@@ -50,14 +49,20 @@ pub(crate) struct SnapshotInfo {
 impl SnapshotInfo {
 	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
 		let mut buf = Vec::new();
-		buf.write_u64::<BigEndian>(self.seq_num)?;
-		buf.write_u128::<BigEndian>(self.created_at)?;
+		buf.extend_from_slice(&self.seq_num.to_be_bytes());
+		buf.extend_from_slice(&self.created_at.to_be_bytes());
 		Ok(buf)
 	}
 
 	pub(crate) fn decode(mut buf: &[u8]) -> Result<Self> {
-		let seq_num = buf.read_u64::<BigEndian>()?;
-		let created_at = buf.read_u128::<BigEndian>()?;
+		let mut u64_buf = [0u8; 8];
+		buf.read_exact(&mut u64_buf)?;
+		let seq_num = u64::from_be_bytes(u64_buf);
+
+		let mut u128_buf = [0u8; 16];
+		buf.read_exact(&mut u128_buf)?;
+		let created_at = u128::from_be_bytes(u128_buf);
+
 		Ok(Self {
 			seq_num,
 			created_at,
@@ -208,17 +213,24 @@ impl LevelManifest {
 		let mut level_manifest = Cursor::new(data);
 
 		// Read versioned manifest format
-		let version = level_manifest.read_u16::<BigEndian>()?;
+		let mut u16_buf = [0u8; 2];
+		level_manifest.read_exact(&mut u16_buf)?;
+		let version = u16::from_be_bytes(u16_buf);
 		if version != MANIFEST_FORMAT_VERSION_V1 {
 			return Err(Error::LoadManifestFail(format!(
-				"Unsupported manifest format version: {}",
-				version
+				"Unsupported manifest format version: {version}. Expected: {MANIFEST_FORMAT_VERSION_V1}"
 			)));
 		}
 
-		let next_table_id = level_manifest.read_u64::<BigEndian>()?;
-		let log_number = level_manifest.read_u64::<BigEndian>()?;
-		let last_sequence = level_manifest.read_u64::<BigEndian>()?;
+		let mut u64_buf = [0u8; 8];
+		level_manifest.read_exact(&mut u64_buf)?;
+		let next_table_id = u64::from_be_bytes(u64_buf);
+
+		level_manifest.read_exact(&mut u64_buf)?;
+		let log_number = u64::from_be_bytes(u64_buf);
+
+		level_manifest.read_exact(&mut u64_buf)?;
+		let last_sequence = u64::from_be_bytes(u64_buf);
 
 		log::debug!(
 			"Manifest header: version={}, next_table_id={}, log_number={}, last_sequence={}",
@@ -235,10 +247,13 @@ impl LevelManifest {
 		let level_data = Levels::decode(&mut level_manifest)?;
 
 		// Read snapshots
-		let snapshot_count = level_manifest.read_u32::<BigEndian>()?;
+		let mut u32_buf = [0u8; 4];
+		level_manifest.read_exact(&mut u32_buf)?;
+		let snapshot_count = u32::from_be_bytes(u32_buf);
 		let mut snapshots = Vec::new();
 		for _ in 0..snapshot_count {
-			let snapshot_len = level_manifest.read_u32::<BigEndian>()? as usize;
+			level_manifest.read_exact(&mut u32_buf)?;
+			let snapshot_len = u32::from_be_bytes(u32_buf) as usize;
 			let mut snapshot_bytes = vec![0u8; snapshot_len];
 			level_manifest.read_exact(&mut snapshot_bytes)?;
 			let snapshot = SnapshotInfo::decode(&snapshot_bytes)?;
@@ -650,19 +665,19 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 	let mut buf = Vec::new();
 
 	// Write header
-	buf.write_u16::<BigEndian>(manifest.manifest_format_version)?;
-	buf.write_u64::<BigEndian>(next_table_id)?;
-	buf.write_u64::<BigEndian>(manifest.log_number)?;
-	buf.write_u64::<BigEndian>(manifest.last_sequence)?;
+	buf.extend_from_slice(&manifest.manifest_format_version.to_be_bytes());
+	buf.extend_from_slice(&next_table_id.to_be_bytes());
+	buf.extend_from_slice(&manifest.log_number.to_be_bytes());
+	buf.extend_from_slice(&manifest.last_sequence.to_be_bytes());
 
 	// Write levels data
 	manifest.levels.encode(&mut buf)?;
 
 	// Write snapshots
-	buf.write_u32::<BigEndian>(manifest.snapshots.len() as u32)?;
+	buf.extend_from_slice(&(manifest.snapshots.len() as u32).to_be_bytes());
 	for snapshot in &manifest.snapshots {
 		let snapshot_bytes = snapshot.encode()?;
-		buf.write_u32::<BigEndian>(snapshot_bytes.len() as u32)?;
+		buf.extend_from_slice(&(snapshot_bytes.len() as u32).to_be_bytes());
 		buf.extend_from_slice(&snapshot_bytes);
 	}
 
