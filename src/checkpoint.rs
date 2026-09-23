@@ -1,10 +1,8 @@
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
 use crate::error::{Error, Result};
 use crate::lsm::CoreInner;
@@ -78,20 +76,19 @@ impl CheckpointMetadata {
 		let mut buf = Vec::new();
 
 		// Write version first for compatibility checking
-		buf.write_u32::<BigEndian>(self.version).map_err(|e| Error::Io(Arc::new(e)))?;
+		buf.extend_from_slice(&self.version.to_be_bytes());
 
 		// Write timestamp
-		buf.write_u64::<BigEndian>(self.timestamp).map_err(|e| Error::Io(Arc::new(e)))?;
+		buf.extend_from_slice(&self.timestamp.to_be_bytes());
 
 		// Write sequence number
-		buf.write_u64::<BigEndian>(self.sequence_number).map_err(|e| Error::Io(Arc::new(e)))?;
+		buf.extend_from_slice(&self.sequence_number.to_be_bytes());
 
 		// Write sstable count (convert usize to u64 for portability)
-		buf.write_u64::<BigEndian>(self.sstable_count as u64)
-			.map_err(|e| Error::Io(Arc::new(e)))?;
+		buf.extend_from_slice(&(self.sstable_count as u64).to_be_bytes());
 
 		// Write total size
-		buf.write_u64::<BigEndian>(self.total_size).map_err(|e| Error::Io(Arc::new(e)))?;
+		buf.extend_from_slice(&self.total_size.to_be_bytes());
 
 		Ok(buf)
 	}
@@ -100,10 +97,11 @@ impl CheckpointMetadata {
 	pub fn from_bytes(data: &[u8]) -> Result<Self> {
 		let mut reader = std::io::Cursor::new(data);
 
-		// Read version first
-		let version = reader
-			.read_u32::<BigEndian>()
+		let mut u32_buf = [0u8; 4];
+		reader
+			.read_exact(&mut u32_buf)
 			.map_err(|e| Error::Other(format!("Failed to read version: {e}")))?;
+		let version = u32::from_be_bytes(u32_buf);
 
 		// Check if we can handle this version
 		if version > CHECKPOINT_VERSION {
@@ -112,23 +110,27 @@ impl CheckpointMetadata {
 			)));
 		}
 
-		// Read remaining fields
-		let timestamp = reader
-			.read_u64::<BigEndian>()
+		let mut u64_buf = [0u8; 8];
+
+		reader
+			.read_exact(&mut u64_buf)
 			.map_err(|e| Error::Other(format!("Failed to read timestamp: {e}")))?;
+		let timestamp = u64::from_be_bytes(u64_buf);
 
-		let sequence_number = reader
-			.read_u64::<BigEndian>()
+		reader
+			.read_exact(&mut u64_buf)
 			.map_err(|e| Error::Other(format!("Failed to read sequence_number: {e}")))?;
+		let sequence_number = u64::from_be_bytes(u64_buf);
 
-		let sstable_count = reader
-			.read_u64::<BigEndian>()
-			.map_err(|e| Error::Other(format!("Failed to read sstable_count: {e}")))?
-			as usize;
+		reader
+			.read_exact(&mut u64_buf)
+			.map_err(|e| Error::Other(format!("Failed to read sstable_count: {e}")))?;
+		let sstable_count = u64::from_be_bytes(u64_buf) as usize;
 
-		let total_size = reader
-			.read_u64::<BigEndian>()
+		reader
+			.read_exact(&mut u64_buf)
 			.map_err(|e| Error::Other(format!("Failed to read total_size: {e}")))?;
+		let total_size = u64::from_be_bytes(u64_buf);
 
 		Ok(Self {
 			version,

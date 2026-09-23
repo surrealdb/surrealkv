@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use byteorder::{ReadBytesExt, WriteBytesExt};
 use crc32fast::Hasher;
 use parking_lot::RwLock;
 
@@ -250,10 +249,10 @@ impl ValueLocation {
 	/// Encodes the ValueLocation into a writer
 	pub(crate) fn encode_into<W: Write>(&self, writer: &mut W) -> Result<()> {
 		// Write meta byte
-		writer.write_u8(self.meta)?;
+		writer.write_all(&[self.meta])?;
 
 		// Write version as u8
-		writer.write_u8(self.version)?;
+		writer.write_all(&[self.version])?;
 
 		// Write value
 		writer.write_all(&self.value)?;
@@ -270,10 +269,14 @@ impl ValueLocation {
 	/// Decodes a ValueLocation from a reader
 	fn decode_from<R: Read>(reader: &mut R) -> Result<Self> {
 		// Read meta byte
-		let meta = reader.read_u8()?;
+		let mut meta_buf = [0u8; 1];
+		reader.read_exact(&mut meta_buf)?;
+		let meta = meta_buf[0];
 
 		// Read version as u8
-		let version = reader.read_u8()?;
+		let mut version_buf = [0u8; 1];
+		reader.read_exact(&mut version_buf)?;
+		let version = version_buf[0];
 
 		// Read remaining data as value
 		let mut value = Vec::new();

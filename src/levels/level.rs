@@ -1,8 +1,6 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-
 use crate::sstable::table::Table;
 use crate::{InternalKeyRange, Result};
 
@@ -122,13 +120,13 @@ impl Levels {
 	///   - For each table:
 	///     - Table ID (u64, BigEndian)
 	pub(crate) fn encode<W: Write>(&self, writer: &mut W) -> Result<()> {
-		writer.write_u8(self.0.len() as u8)?;
+		writer.write_all(&[self.0.len() as u8])?;
 
 		for level in &self.0 {
-			writer.write_u32::<BigEndian>(level.tables.len() as u32)?;
+			writer.write_all(&(level.tables.len() as u32).to_be_bytes())?;
 
 			for table in &level.tables {
-				writer.write_u64::<BigEndian>(table.id)?;
+				writer.write_all(&table.id.to_be_bytes())?;
 			}
 		}
 
@@ -145,18 +143,24 @@ impl Levels {
 	///
 	/// Returns a vector of vectors containing table IDs for each level
 	pub(crate) fn decode<R: Read>(reader: &mut R) -> Result<Vec<Vec<u64>>> {
-		let level_count = reader.read_u8()?;
+		let mut len_buf = [0u8; 1];
+		reader.read_exact(&mut len_buf)?;
+		let level_count = len_buf[0];
 		let mut levels = Vec::with_capacity(level_count as usize);
 
+		let mut u32_buf = [0u8; 4];
+		let mut u64_buf = [0u8; 8];
+
 		for _ in 0..level_count {
-			let table_count = reader.read_u32::<BigEndian>()?;
+			reader.read_exact(&mut u32_buf)?;
+			let table_count = u32::from_be_bytes(u32_buf);
 			let mut level = Vec::with_capacity(table_count as usize);
 
 			for _ in 0..table_count {
-				let table_id = reader.read_u64::<BigEndian>()?;
+				reader.read_exact(&mut u64_buf)?;
+				let table_id = u64::from_be_bytes(u64_buf);
 				level.push(table_id);
 			}
-
 			levels.push(level);
 		}
 

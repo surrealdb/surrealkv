@@ -5773,8 +5773,6 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 /// This prevents silent data loss when log_number exceeds actual WAL segments.
 #[test_log::test(tokio::test)]
 async fn test_recovery_detects_corrupt_log_number() {
-	use byteorder::{BigEndian, WriteBytesExt};
-
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
@@ -5812,7 +5810,7 @@ async fn test_recovery_detects_corrupt_log_number() {
 		// Copy next_table_id (u64)
 		corrupted.extend_from_slice(&data[2..10]);
 		// Write corrupted log_number (u64) - set to 999999
-		corrupted.write_u64::<BigEndian>(999999).unwrap();
+		corrupted.extend_from_slice(&999999u64.to_be_bytes());
 		// Copy rest of the file (last_sequence and beyond)
 		corrupted.extend_from_slice(&data[18..]);
 
@@ -5891,8 +5889,6 @@ async fn test_validate_wal_log_number_multiple_wals() {
 /// Tests the full recovery flow with multiple WAL segments.
 #[test_log::test(tokio::test)]
 async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
-	use byteorder::{BigEndian, WriteBytesExt};
-
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
@@ -5928,7 +5924,7 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 		let mut corrupted = Vec::new();
 		corrupted.extend_from_slice(&data[0..2]); // version (u16)
 		corrupted.extend_from_slice(&data[2..10]); // next_table_id (u64)
-		corrupted.write_u64::<BigEndian>(max_wal + 100).unwrap(); // corrupted log_number
+		corrupted.extend_from_slice(&(max_wal + 100).to_be_bytes()); // corrupted log_number
 		corrupted.extend_from_slice(&data[18..]); // rest of file
 
 		std::fs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
