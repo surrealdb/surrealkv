@@ -105,6 +105,12 @@ impl BlockCache {
 		}
 	}
 
+	/// Returns the capacity of the cache in bytes.
+	#[cfg(test)]
+	pub(crate) fn capacity(&self) -> u64 {
+		self.data.capacity()
+	}
+
 	/// Inserts a data block into the cache.
 	pub(crate) fn insert_data_block(&self, table_id: u64, offset: u64, block: Arc<Block>) {
 		self.data.insert((KIND_DATA, table_id, offset).into(), Item::Data(block));
