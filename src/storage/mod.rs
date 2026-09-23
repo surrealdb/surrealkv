@@ -133,45 +133,33 @@ impl LogStore for AffinityLogStore {
 		let wal = Arc::clone(&self.wal);
 		let data = data.to_vec();
 		Box::pin(async move {
-			let join_res = affinitypool::spawn(move || -> Result<u64> {
+			affinitypool::spawn(move || -> Result<u64> {
 				let mut guard = wal.write();
 				guard.append(&data).map_err(|e| crate::error::Error::Other(e.to_string()))
 			})
-			.await;
-			match join_res {
-				Ok(inner_res) => Ok(inner_res),
-				Err(e) => Err(crate::error::Error::Other(e.to_string())),
-			}
+			.await
 		})
 	}
 
 	fn sync(&self) -> BoxFuture<'_, ()> {
 		let wal = Arc::clone(&self.wal);
 		Box::pin(async move {
-			let join_res = affinitypool::spawn(move || -> Result<()> {
+			affinitypool::spawn(move || -> Result<()> {
 				let mut guard = wal.write();
 				guard.sync().map_err(|e| crate::error::Error::Other(e.to_string()))
 			})
-			.await;
-			match join_res {
-				Ok(inner_res) => Ok(inner_res),
-				Err(e) => Err(crate::error::Error::Other(e.to_string())),
-			}
+			.await
 		})
 	}
 
 	fn size(&self) -> BoxFuture<'_, u64> {
 		let wal = Arc::clone(&self.wal);
 		Box::pin(async move {
-			let join_res = affinitypool::spawn(move || -> Result<u64> {
+			affinitypool::spawn(move || -> Result<u64> {
 				let _guard = wal.read();
 				Ok(0)
 			})
-			.await;
-			match join_res {
-				Ok(inner_res) => Ok(inner_res),
-				Err(e) => Err(crate::error::Error::Other(e.to_string())),
-			}
+			.await
 		})
 	}
 }
@@ -199,28 +187,18 @@ impl ObjectStore for AffinityObjectStore {
 	fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'_, Bytes> {
 		let file = Arc::clone(&self.file);
 		Box::pin(async move {
-			let join_res = affinitypool::spawn(move || -> Result<Bytes> {
+			affinitypool::spawn(move || -> Result<Bytes> {
 				let mut buf = vec![0u8; len];
 				file.read_at(offset, &mut buf)?;
 				Ok(Bytes::from(buf))
 			})
-			.await;
-			match join_res {
-				Ok(inner_res) => Ok(inner_res),
-				Err(e) => Err(crate::error::Error::Other(e.to_string())),
-			}
+			.await
 		})
 	}
 
 	fn size(&self) -> BoxFuture<'_, u64> {
 		let file = Arc::clone(&self.file);
-		Box::pin(async move {
-			let join_res = affinitypool::spawn(move || -> Result<u64> { file.size() }).await;
-			match join_res {
-				Ok(inner_res) => Ok(inner_res),
-				Err(e) => Err(crate::error::Error::Other(e.to_string())),
-			}
-		})
+		Box::pin(async move { affinitypool::spawn(move || -> Result<u64> { file.size() }).await })
 	}
 }
 
