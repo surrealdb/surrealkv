@@ -73,7 +73,6 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crc32fast::Hasher as Crc32;
-use integer_encoding::{FixedInt, FixedIntWriter};
 use snap::raw::max_compress_len;
 
 use crate::compression::CompressionSelector;
@@ -669,7 +668,7 @@ pub(crate) fn write_block_at_offset<W: Write>(
 	let cksum = calculate_checksum(&block, compression_type);
 	writer.write_all(&block)?;
 	writer.write_all(&[compression_type as u8; BLOCK_COMPRESS_LEN])?;
-	writer.write_fixedint(mask(cksum.finalize()))?;
+	writer.write_all(&mask(cksum.finalize()).to_le_bytes())?;
 
 	let handle = BlockHandle::new(offset, block.len());
 	let new_offset = offset + block.len() + BLOCK_CKSUM_LEN + BLOCK_COMPRESS_LEN;
@@ -782,7 +781,10 @@ pub(crate) fn read_table_block(
 	)?;
 
 	// Verify checksum
-	if !verify_table_block(&buf, compress[0], unmask(u32::decode_fixed(&cksum).unwrap())) {
+	let cksum_val = u32::from_le_bytes(
+		cksum.as_slice().try_into().map_err(|_| SSTableError::CorruptedBlockHandle)?,
+	);
+	if !verify_table_block(&buf, compress[0], unmask(cksum_val)) {
 		return Err(Error::from(SSTableError::ChecksumVerificationFailed {
 			block_offset: location.offset() as u64,
 		}));

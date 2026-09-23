@@ -86,10 +86,9 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use integer_encoding::{FixedInt, FixedIntWriter, VarInt, VarIntWriter};
-
 use crate::error::{Error, Result};
 use crate::sstable::error::SSTableError;
+use crate::varint::{decode_varint_usize, encode_varint_u64, put_varint_u64, varint_len_u64};
 use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator};
 
 /// Raw block data as a byte vector.
@@ -137,17 +136,15 @@ impl BlockHandle {
 	/// Encodes the handle into a byte slice, returns bytes written.
 	#[inline]
 	pub(crate) fn encode_into(&self, dst: &mut [u8]) -> usize {
-		assert!(dst.len() >= self.offset.required_space() + self.size.required_space());
-
-		let off = self.offset.encode_var(dst);
-		let size = self.size.encode_var(&mut dst[off..]);
+		let off = encode_varint_u64(self.offset as u64, dst);
+		let size = encode_varint_u64(self.size as u64, &mut dst[off..]);
 		off + size
 	}
 
 	/// Encodes the handle into a new byte vector.
 	#[inline]
 	pub(crate) fn encode(&self) -> Vec<u8> {
-		let cap = self.offset.required_space() + self.size.required_space();
+		let cap = varint_len_u64(self.offset as u64) + varint_len_u64(self.size as u64);
 		let mut v = vec![0; cap];
 		self.encode_into(&mut v);
 		v
@@ -155,9 +152,9 @@ impl BlockHandle {
 
 	/// Decodes a handle from bytes, returns (handle, bytes_read).
 	pub(crate) fn decode(src: &[u8]) -> Result<(Self, usize)> {
-		let (off, offsize) = usize::decode_var(src).ok_or(SSTableError::CorruptedBlockHandle)?;
+		let (off, offsize) = decode_varint_usize(src).ok_or(SSTableError::CorruptedBlockHandle)?;
 		let (sz, szsize) =
-			usize::decode_var(&src[offsize..]).ok_or(SSTableError::CorruptedBlockHandle)?;
+			decode_varint_usize(&src[offsize..]).ok_or(SSTableError::CorruptedBlockHandle)?;
 
 		Ok((
 			BlockHandle {
@@ -426,9 +423,9 @@ impl BlockWriter {
 		let non_shared_key_length = key.len() - shared_prefix_length;
 
 		// Write header (all varints)
-		self.buffer.write_varint(shared_prefix_length as u64)?;
-		self.buffer.write_varint(non_shared_key_length as u64)?;
-		self.buffer.write_varint(value.len() as u64)?;
+		put_varint_u64(&mut self.buffer, shared_prefix_length as u64);
+		put_varint_u64(&mut self.buffer, non_shared_key_length as u64);
+		put_varint_u64(&mut self.buffer, value.len() as u64);
 
 		// Write key suffix (non-shared part)
 		self.buffer.extend_from_slice(&key[shared_prefix_length..]);
@@ -449,18 +446,11 @@ impl BlockWriter {
 	pub(crate) fn finish(mut self) -> Result<BlockData> {
 		// Append restart point offsets (fixed 4 bytes each)
 		for &r in self.restart_points.iter() {
-			self.buffer.write_fixedint(r).map_err(|e| {
-				let err = Error::Io(Arc::new(std::io::Error::other(format!(
-					"Failed to write restart point {}: {}",
-					r, e
-				))));
-				log::error!("[BLOCK] {}", err);
-				err
-			})?;
+			self.buffer.extend_from_slice(&r.to_le_bytes());
 		}
 
 		// Append number of restart points
-		self.buffer.write_fixedint(self.restart_points.len() as u32).expect("block write failed");
+		self.buffer.extend_from_slice(&(self.restart_points.len() as u32).to_le_bytes());
 
 		Ok(self.buffer)
 	}
@@ -568,11 +558,12 @@ impl BlockIterator {
 		}
 
 		// Decode number of restarts from last 4 bytes
-		let num_restarts = u32::decode_fixed(&block[block.len() - 4..]).ok_or_else(|| {
-			Error::from(SSTableError::FailedToDecodeRestartCount {
-				block_size: block.len(),
-			})
-		})? as usize;
+		let num_restarts =
+			u32::from_le_bytes(block[block.len() - 4..].try_into().map_err(|_| {
+				SSTableError::FailedToDecodeRestartCount {
+					block_size: block.len(),
+				}
+			})?) as usize;
 
 		// Calculate where entry data ends (before restart array)
 		let restart_offset = block.len().checked_sub(4 * (num_restarts + 1)).ok_or_else(|| {
@@ -597,12 +588,12 @@ impl BlockIterator {
 				return Err(err);
 			}
 			*restart_point =
-				u32::decode_fixed(&block[start_point..end_point]).ok_or_else(|| {
-					Error::from(SSTableError::FailedToDecodeRestartPoint {
+				u32::from_le_bytes(block[start_point..end_point].try_into().map_err(|_| {
+					SSTableError::FailedToDecodeRestartPoint {
 						index: i,
 						offset: start_point,
-					})
-				})?;
+					}
+				})?);
 		}
 
 		Ok(BlockIterator {
@@ -637,7 +628,7 @@ impl BlockIterator {
 		let mut i = 0;
 
 		let (shared_prefix_length, shared_prefix_length_size) =
-			usize::decode_var(&self.block[offset..]).ok_or_else(|| {
+			decode_varint_usize(&self.block[offset..]).ok_or_else(|| {
 				Error::from(SSTableError::FailedToDecodeSharedPrefix {
 					offset,
 				})
@@ -645,14 +636,14 @@ impl BlockIterator {
 		i += shared_prefix_length_size;
 
 		let (non_shared_key_length, non_shared_key_length_size) =
-			usize::decode_var(&self.block[offset + i..]).ok_or_else(|| {
+			decode_varint_usize(&self.block[offset + i..]).ok_or_else(|| {
 				Error::from(SSTableError::FailedToDecodeNonSharedKeyLength {
 					offset: offset + i,
 				})
 			})?;
 		i += non_shared_key_length_size;
 
-		let (value_size, value_size_size) = usize::decode_var(&self.block[offset + i..])
+		let (value_size, value_size_size) = decode_varint_usize(&self.block[offset + i..])
 			.ok_or_else(|| {
 				Error::from(SSTableError::FailedToDecodeValueSize {
 					offset: offset + i,
