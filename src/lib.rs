@@ -1,5 +1,6 @@
 pub mod autotune;
 mod batch;
+pub mod byteslice;
 mod cache;
 mod checkpoint;
 mod clock;
@@ -15,7 +16,6 @@ pub mod memory;
 mod memtable;
 mod ring;
 pub mod scrubber;
-pub mod slice;
 mod snapshot;
 mod sstable;
 mod stall;
