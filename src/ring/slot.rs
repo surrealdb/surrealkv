@@ -1,19 +1,19 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use parking_lot::Mutex;
-
-/// Status flags embedded in the atomic `state` of a Slot.
-pub(crate) const SLOT_EMPTY: u64 = 0;
-pub(crate) const SLOT_PUBLISHED: u64 = 1;
-pub(crate) const SLOT_DRAINED: u64 = 2;
+use tokio::sync::oneshot;
+use crate::batch::Batch;
+use crate::error::Result;
 
 pub(crate) struct SlotData {
 	/// The sequence number this slot currently represents.
 	pub seq: u64,
-	/// Pre-allocated buffer for encoding the transaction batch.
-	/// Ensures zero-allocation on the hot write path.
-	pub buffer: Vec<u8>,
-	/// Tracks whether this transaction was rolled back (aborted)
-	/// after claiming the slot.
+	/// The batch to be written and applied.
+	pub batch: Option<Batch>,
+	/// Whether this commit requires an immediate fsync.
+	pub sync: bool,
+	/// Notification channel back to the committing transaction.
+	pub complete_tx: Option<oneshot::Sender<Result<()>>>,
+	/// Tracks whether this transaction was aborted (e.g. conflict).
 	pub aborted: bool,
 }
 
@@ -21,9 +21,9 @@ impl Default for SlotData {
 	fn default() -> Self {
 		Self {
 			seq: 0,
-			// Pre-allocate a reasonable default batch size (e.g., 4KB)
-			// to avoid allocations for typical transactions.
-			buffer: Vec::with_capacity(4096),
+			batch: None,
+			sync: false,
+			complete_tx: None,
 			aborted: false,
 		}
 	}
@@ -31,18 +31,16 @@ impl Default for SlotData {
 
 /// A single slot in the Ring Buffer.
 pub(crate) struct Slot {
-	/// The atomic state of this slot.
-	/// Stores the sequence number, and potentially status flags.
+	/// The atomic state of this slot (stores the sequence number when published).
 	pub(crate) state: AtomicU64,
-	/// The underlying data. A writer and flusher only collide here
-	/// if the ring is completely full (lap overlap).
+	/// The underlying slot data.
 	pub(crate) data: Mutex<SlotData>,
 }
 
 impl Slot {
 	pub(crate) fn new() -> Self {
 		Self {
-			state: AtomicU64::new(SLOT_EMPTY),
+			state: AtomicU64::new(0),
 			data: Mutex::new(SlotData::default()),
 		}
 	}
@@ -51,5 +49,11 @@ impl Slot {
 	#[inline]
 	pub(crate) fn publish(&self, seq: u64) {
 		self.state.store(seq, Ordering::Release);
+	}
+
+	/// Checks if the slot has been published with the given sequence number.
+	#[inline]
+	pub(crate) fn is_published(&self, seq: u64) -> bool {
+		self.state.load(Ordering::Acquire) == seq
 	}
 }

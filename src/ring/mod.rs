@@ -1,11 +1,12 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 
 mod slot;
 mod bloom;
+mod queue;
+mod pipeline;
 
-pub(crate) use slot::{Slot, SlotData};
-pub(crate) use bloom::BloomFilter;
+use slot::Slot;
+pub(crate) use pipeline::CommitPipeline;
 
 /// A lock-free, Multi-Producer Single-Consumer (MPSC) Ring Buffer.
 /// Used for the Optimistic Concurrency Control (OCC) commit pipeline.
@@ -17,14 +18,11 @@ pub(crate) struct Ring {
 	slots: Box<[Slot]>,
 
 	/// The next sequence number to hand out to a writer.
-	next: AtomicU64,
-
-	/// The highest sequence number where all slots at or below it are filled and ready to flush.
-	published: AtomicU64,
+	pub(crate) next: AtomicU64,
 
 	/// The highest sequence number that has been successfully drained (flushed).
 	/// Slots at or below this sequence are free to be claimed for the next lap.
-	taken: AtomicU64,
+	pub(crate) taken: AtomicU64,
 }
 
 impl Ring {
@@ -40,7 +38,6 @@ impl Ring {
 		Self {
 			slots: slots.into_boxed_slice(),
 			next: AtomicU64::new(first_seq),
-			published: AtomicU64::new(first_seq.saturating_sub(1)),
 			taken: AtomicU64::new(first_seq.saturating_sub(1)),
 		}
 	}
@@ -74,5 +71,17 @@ impl Ring {
 	#[inline]
 	pub(crate) fn taken(&self) -> u64 {
 		self.taken.load(Ordering::Acquire)
+	}
+
+	/// Checks if the slot for `seq` is drainable (has been published).
+	#[inline]
+	pub(crate) fn drainable(&self, seq: u64) -> bool {
+		self.slot(seq).is_published(seq)
+	}
+
+	/// Advances the taken pointer to `seq`.
+	#[inline]
+	pub(crate) fn advance_taken(&self, seq: u64) {
+		self.taken.store(seq, Ordering::Release);
 	}
 }
