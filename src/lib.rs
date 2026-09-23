@@ -15,6 +15,7 @@ pub mod memory;
 mod memtable;
 mod ring;
 pub mod scrubber;
+pub mod slice;
 mod snapshot;
 mod sstable;
 mod stall;
