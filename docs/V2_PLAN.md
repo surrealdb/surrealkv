@@ -24,7 +24,7 @@ The primary performance bottleneck in the current SurrealKV implementation is th
 - [x] Implement the `Flusher` task for Group Commit to WAL & Memtable.
 - [x] Implement Multiple Immutable Memtables (Burst Buffering).
 - [x] Implement Proactive Write Pacing.
-- [ ] Refactor hot-path `Vec<u8>` usage for Zero-Allocation data paths.
+- [x] Refactor hot-path `Vec<u8>` usage for Zero-Allocation data paths.
 
 ### The Commit Ring Buffer
 We will replace the `commit_sem` and `write_mutex` with a fixed-size, multi-producer single-consumer (MPSC) Ring Buffer inspired by the LMAX Disruptor and ShaleDB.
@@ -57,6 +57,12 @@ Refactor code utilizing `Vec<u8>` or `Bytes` in the hot paths (like `Batch::enco
 
 ## Phase 2: The Purge (Simplifying the LSM Tree)
 With the new commit pipeline in place, we strip out the deeply integrated versioning logic to make the tree a pure, ultra-fast byte-to-byte store.
+
+- [ ] Flat Entries: Remove `timestamp`, `seq_num`, and `kind` from core `Node` and `Entry`.
+- [ ] True Single-Version KV: Implement direct overwrite/tombstone semantics without retention windows.
+- [ ] Delete the legacy `bplustree` module completely.
+- [ ] Simplified Compaction: Purge timestamp comparator logic and rewrite compaction as pure byte-prefix merging.
+- [ ] Implement Range Tombstones (O(1) Mass Deletions).
 
 ### Flat Entries & True Single-Version KV
 Remove `timestamp`, `seq_num`, and `kind` (Tombstone vs. Value) from the core `Node` and `Entry` structs. SurrealKV becomes a strict, single-version key-value store. Overwrites physically replace older values. Time-travel, MVCC, and historical versioning must be handled at the higher database layer (SurrealDB) by appending timestamps to the keys themselves.

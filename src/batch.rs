@@ -58,7 +58,13 @@ impl Batch {
 	}
 
 	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
-		let mut encoded = Vec::new();
+		let mut encoded = Vec::with_capacity(self.size as usize + 64);
+		self.encode_into(&mut encoded)?;
+		Ok(encoded)
+	}
+
+	pub(crate) fn encode_into(&self, encoded: &mut Vec<u8>) -> Result<()> {
+		encoded.clear();
 
 		// Write version (1 byte)
 		encoded.push(self.version);
@@ -102,7 +108,7 @@ impl Batch {
 			}
 		}
 
-		Ok(encoded)
+		Ok(())
 	}
 
 	#[cfg(test)]
