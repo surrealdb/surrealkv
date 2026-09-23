@@ -441,13 +441,13 @@ impl Drop for Wal {
 /// is performed outside the write lock using a pre-cloned file
 /// descriptor, allowing concurrent WAL appends to proceed.
 pub(crate) struct WalManager {
-	inner: parking_lot::RwLock<Wal>,
+	pub(crate) inner: Arc<parking_lot::RwLock<Wal>>,
 }
 
 impl WalManager {
 	pub(crate) fn new(wal: Wal) -> Self {
 		Self {
-			inner: parking_lot::RwLock::new(wal),
+			inner: Arc::new(parking_lot::RwLock::new(wal)),
 		}
 	}
 
