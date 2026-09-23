@@ -1,7 +1,5 @@
 use std::sync::Arc;
 
-use integer_encoding::FixedInt;
-
 use crate::FilterPolicy;
 
 pub(crate) const FILTER_BASE_LOG2: u32 = 11;
@@ -79,11 +77,11 @@ impl FilterBlockWriter {
 
 		// Append per-filter offsets to the result.
 		for offset in self.filter_offsets {
-			offset.encode_fixed(&mut result[ix..ix + 4]);
+			result[ix..ix + 4].copy_from_slice(&offset.to_le_bytes());
 			ix += 4;
 		}
 		// Append the total number of offsets as a 4-byte value.
-		(offsets_offset as u32).encode_fixed(&mut result[ix..ix + 4]);
+		result[ix..ix + 4].copy_from_slice(&(offsets_offset as u32).to_le_bytes());
 		ix += 4;
 		// Append the base log2 value as a single byte.
 		result[ix] = FILTER_BASE_LOG2 as u8;
@@ -106,7 +104,9 @@ impl FilterBlockReader {
 	pub(crate) fn new(data: Vec<u8>, policy: Arc<dyn FilterPolicy>) -> Self {
 		let n = data.len();
 		let base_lg = data[n - 1] as u32; // The last byte is the base log2 value.
-		let num_offset = u32::decode_fixed(&data[n - FILTER_META_LENGTH..n - 1]).unwrap() as usize; // The offsets start 5 bytes from the end.
+		let num_offset = u32::from_le_bytes(
+			data[n - FILTER_META_LENGTH..n - 1].try_into().expect("slice length must be 4"),
+		) as usize; // The offsets start 5 bytes from the end.
 		let mut filter_offsets = Vec::with_capacity(num_offset);
 		if num_offset * 4 + FILTER_META_LENGTH > n {
 			panic!("invalid filter block data");
@@ -118,7 +118,8 @@ impl FilterBlockReader {
 		for i in 0..num_offset {
 			let start = offsets_offset + i * 4;
 			let end = offsets_offset + (i + 1) * 4;
-			let offset = u32::decode_fixed(&data[start..end]).unwrap();
+			let offset =
+				u32::from_le_bytes(data[start..end].try_into().expect("slice length must be 4"));
 			filter_offsets.push(offset);
 		}
 

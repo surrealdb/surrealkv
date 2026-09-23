@@ -1,6 +1,7 @@
-use integer_encoding::{VarInt, VarIntWriter};
-
 use crate::error::{Error, Result};
+use crate::varint::{
+	decode_varint_u32, decode_varint_u64, put_varint_u32, put_varint_u64, varint_len_u64,
+};
 use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
 use crate::{InternalKeyKind, Key, Value};
 
@@ -71,10 +72,10 @@ impl Batch {
 		encoded.push(self.version);
 
 		// Write sequence number (8 bytes)
-		encoded.write_varint(self.starting_seq_num)?;
+		put_varint_u64(encoded, self.starting_seq_num);
 
 		// Write count (4 bytes)
-		encoded.write_varint(self.entries.len() as u32)?;
+		put_varint_u32(encoded, self.entries.len() as u32);
 
 		// Write entries
 		for entry in &self.entries {
@@ -82,18 +83,18 @@ impl Batch {
 			encoded.push(entry.kind as u8);
 
 			// Write key length and key
-			encoded.write_varint(entry.key.len() as u64)?;
+			put_varint_u64(encoded, entry.key.len() as u64);
 			encoded.extend_from_slice(&entry.key);
 
 			// Write value length and value
 			let value_len = entry.value.as_ref().map_or(0, |v| v.len());
-			encoded.write_varint(value_len as u64)?;
+			put_varint_u64(encoded, value_len as u64);
 			if let Some(value) = &entry.value {
 				encoded.extend_from_slice(value);
 			}
 
 			// Write timestamp (8 bytes)
-			encoded.write_varint(entry.timestamp)?;
+			put_varint_u64(encoded, entry.timestamp);
 		}
 
 		// Write value pointers
@@ -136,9 +137,9 @@ impl Batch {
 
 		// Calculate the total size needed for this record
 		let record_size = 1u64 + // kind
-			(key_len as u64).required_space() as u64 +
+			varint_len_u64(key_len as u64) as u64 +
 			key_len as u64 +
-			(value_len as u64).required_space() as u64 +
+			varint_len_u64(value_len as u64) as u64 +
 			value_len as u64 +
 			8u64; // timestamp (8 bytes)
 
@@ -235,11 +236,12 @@ impl Batch {
 
 		// Read sequence number
 		let (seq_num, bytes_read) =
-			u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+			decode_varint_u64(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 		pos += bytes_read;
 
 		// Read count
-		let (count, bytes_read) = u32::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+		let (count, bytes_read) =
+			decode_varint_u32(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 		pos += bytes_read;
 
 		// Read entries
@@ -254,27 +256,28 @@ impl Batch {
 			}
 
 			// Read key
+			// Read key length and key
 			let (key_len, bytes_read) =
-				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+				decode_varint_u64(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
 			let key = data[pos..pos + key_len as usize].to_vec();
 			pos += key_len as usize;
 
-			// Read value
+			// Read value length and value
 			let (value_len, bytes_read) =
-				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+				decode_varint_u64(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
 			let value = if value_len > 0 {
-				let value_data = data[pos..pos + value_len as usize].to_vec();
+				let val = data[pos..pos + value_len as usize].to_vec();
 				pos += value_len as usize;
-				Some(value_data)
+				Some(val)
 			} else {
 				None
 			};
 
 			// Read timestamp
 			let (timestamp, bytes_read) =
-				u64::decode_var(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
+				decode_varint_u64(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
 
 			entries.push(BatchEntry {

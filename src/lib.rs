@@ -18,6 +18,7 @@ mod stall;
 mod task;
 mod tracker;
 mod transaction;
+pub(crate) mod varint;
 mod vfs;
 mod vlog;
 mod wal;
