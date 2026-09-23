@@ -37,6 +37,7 @@ use std::sync::Arc;
 
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 use sstable::bloom::LevelDBBloomFilter;
+pub use sstable::ribbon::RibbonFilter;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{Error, Result};
