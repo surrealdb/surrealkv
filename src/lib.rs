@@ -14,6 +14,7 @@ mod lockfile;
 mod lsm;
 mod memtable;
 mod oracle;
+mod ring;
 mod snapshot;
 mod sstable;
 mod stall;
@@ -123,7 +124,7 @@ pub type IterResult = Result<(Key, Option<Value>)>;
 /// The Key type used throughout the LSM tree
 pub type Key = Vec<u8>;
 
-/// The Value type used throughout the LSM tree  
+/// The Value type used throughout the LSM tree
 pub type Value = Vec<u8>;
 
 /// Type alias for version/timestamp values
