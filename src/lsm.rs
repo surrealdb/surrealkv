@@ -133,6 +133,9 @@ pub(crate) struct CoreInner {
 	/// Visible sequence number - the highest sequence number that is visible to readers.
 	/// Shared with CommitPipeline for coordinated updates.
 	pub(crate) visible_seq_num: Arc<AtomicU64>,
+
+	/// Global memory controller accounting memory across memtables, ring buffer, and cache.
+	pub(crate) memory_controller: Arc<crate::memory::MemoryController>,
 }
 
 impl CoreInner {
@@ -172,6 +175,7 @@ impl CoreInner {
 		} else {
 			None
 		};
+		let memory_controller = Arc::new(crate::memory::MemoryController::default());
 
 		Ok(Self {
 			opts,
@@ -185,6 +189,7 @@ impl CoreInner {
 			lockfile: Mutex::new(lockfile),
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
+			memory_controller,
 		})
 	}
 
@@ -299,6 +304,7 @@ impl CoreInner {
 		// added to the manifest, and conflict detection uses the in-memory oracle
 		// (independent of memtables), so dropping this Arc is safe.
 		memtable_lock.remove(table_id);
+		self.memory_controller.set_immutable_memtable_bytes(memtable_lock.total_size());
 		drop(memtable);
 
 		log::info!(
@@ -370,6 +376,10 @@ impl CoreInner {
 		let table_id = self.level_manifest.read()?.next_table_id();
 		let mut immutable_memtables = self.immutable_memtables.write()?;
 		immutable_memtables.add(table_id, flushed_wal_number, Arc::clone(&flushed_memtable));
+
+		// Update global memory accounting
+		self.memory_controller.set_active_memtable_bytes(0);
+		self.memory_controller.set_immutable_memtable_bytes(immutable_memtables.total_size());
 
 		// Release locks
 		drop(active_memtable);
