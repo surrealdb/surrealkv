@@ -87,7 +87,7 @@ use crate::vfs::File;
 use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{
 	Comparator, CompressionType, FilterPolicy, InternalKey, InternalKeyKind, InternalKeyRange,
-	InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX,
+	InternalKeyRef, Key, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX,
 };
 
 // =============================================================================
@@ -631,6 +631,7 @@ impl<W: Write> TableWriter<W> {
 
 		if key.kind() == InternalKeyKind::RangeDelete {
 			props.num_range_deletions += 1;
+			self.meta.range_deletions.push((key.user_key.clone(), value.to_vec(), key.seq_num()));
 		}
 
 		if key.is_tombstone() {
@@ -846,6 +847,7 @@ pub(crate) struct Table {
 
 	pub(crate) index_block: IndexType,
 	pub(crate) filter_reader: Option<FilterBlockReader>,
+	pub(crate) range_deletions: Arc<parking_lot::RwLock<Vec<(Key, Key, u64)>>>,
 }
 
 impl Table {
@@ -891,6 +893,9 @@ impl Table {
 			opts,
 			filter_reader,
 			index_block,
+			range_deletions: Arc::new(parking_lot::RwLock::new(
+				writer_metadata.range_deletions.clone(),
+			)),
 			meta: writer_metadata,
 		})
 	}

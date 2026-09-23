@@ -108,7 +108,7 @@ impl CommitQueue {
 		self.queue.insert(entry.seq_num, entry);
 	}
 
-	/// Checks if the given write and read sets conflict with any commits in (from_seq..to_seq).
+	/// Checks if the given write and read sets conflict with any commits in (from_seq..to_seq].
 	pub(crate) fn check_conflicts(
 		&self,
 		from_seq: u64,
@@ -118,7 +118,7 @@ impl CommitQueue {
 		read_keys: &[Key],
 		read_bloom: &BloomFilter,
 	) -> bool {
-		for entry in self.queue.range(from_seq + 1..to_seq) {
+		for entry in self.queue.range(from_seq + 1..=to_seq) {
 			let committed = entry.value();
 			if committed.aborted {
 				continue;

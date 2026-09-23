@@ -141,7 +141,23 @@ impl Compactor {
 		// Open table only if one was created
 		let new_table = if table_created {
 			match self.open_table(new_table_id, &new_table_path) {
-				Ok(table) => Some(table),
+				Ok(table) => {
+					let max_level = self.options.lopts.level_count - 1;
+					let is_bottom = input.target_level >= max_level;
+					if !is_bottom {
+						if let Ok(manifest) = self.options.level_manifest.read() {
+							for &tid in &input.tables_to_merge {
+								if let Some(t) = manifest.find_table_by_id(tid) {
+									table
+										.range_deletions
+										.write()
+										.extend(t.range_deletions.read().clone());
+								}
+							}
+						}
+					}
+					Some(table)
+				}
 				Err(e) => {
 					// Guard will unhide tables on drop
 					return Err(e);

@@ -11,7 +11,7 @@ use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::{
 	BytewiseComparator, Comparator, InternalKey, InternalKeyComparator, InternalKeyKind,
-	InternalKeyRange, InternalKeyRef, LSMIterator, TimestampComparator, Value,
+	InternalKeyRange, InternalKeyRef, Key, LSMIterator, TimestampComparator, Value,
 };
 
 // ===== Snapshot Tracker =====
@@ -165,35 +165,67 @@ impl Snapshot {
 	/// seq_num.
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
 		// self.core.get_internal(key, self.seq_num)
-		// Read lock on the active memtable
-		let memtable_lock = self.core.active_memtable.read()?;
+		// Read locks
+		let active_lock = self.core.active_memtable.read()?;
+		let imm_lock = self.core.immutable_memtables.read()?;
+		let level_manifest = self.core.level_manifest.read()?;
+
+		// Collect any covering range tombstones across active, immutables, and tables
+		let mut max_range_delete_seq: Option<u64> = None;
+		for (start, end, seq) in active_lock.range_deletions.read().iter() {
+			if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+				max_range_delete_seq = Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+			}
+		}
+		for entry in imm_lock.iter() {
+			let memtable = &entry.memtable;
+			for (start, end, seq) in memtable.range_deletions.read().iter() {
+				if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+					max_range_delete_seq = Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+				}
+			}
+		}
+		for level in &level_manifest.levels {
+			for table in &level.tables {
+				for (start, end, seq) in table.range_deletions.read().iter() {
+					if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+						max_range_delete_seq =
+							Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+					}
+				}
+			}
+		}
 
 		// Check the active memtable for the key
-		if let Some(item) = memtable_lock.get(key.as_ref(), Some(self.seq_num)) {
+		if let Some(item) = active_lock.get(key.as_ref(), Some(self.seq_num)) {
 			if item.0.is_tombstone() {
 				return Ok(None); // Key is a tombstone, return None
 			}
+			if let Some(rseq) = max_range_delete_seq {
+				if item.0.seq_num() <= rseq {
+					return Ok(None);
+				}
+			}
 			return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
 		}
-		drop(memtable_lock); // Release the lock on the active memtable
-
-		// Read lock on the immutable memtables
-		let memtable_lock = self.core.immutable_memtables.read()?;
+		drop(active_lock);
 
 		// Check the immutable memtables for the key
-		for entry in memtable_lock.iter().rev() {
+		for entry in imm_lock.iter().rev() {
 			let memtable = &entry.memtable;
 			if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
 				if item.0.is_tombstone() {
 					return Ok(None); // Key is a tombstone, return None
 				}
+				if let Some(rseq) = max_range_delete_seq {
+					if item.0.seq_num() <= rseq {
+						return Ok(None);
+					}
+				}
 				return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
 			}
 		}
-		drop(memtable_lock); // Release the lock on the immutable memtables
-
-		// Read lock on the level manifest
-		let level_manifest = self.core.level_manifest.read()?;
+		drop(imm_lock);
 
 		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set);
 
@@ -213,6 +245,11 @@ impl Snapshot {
 						if ikey.is_tombstone() {
 							return Ok(None); // Key is a tombstone, return None
 						}
+						if let Some(rseq) = max_range_delete_seq {
+							if ikey.seq_num() <= rseq {
+								return Ok(None);
+							}
+						}
 						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
 					}
 				}
@@ -231,6 +268,11 @@ impl Snapshot {
 						let ikey = &item.0;
 						if ikey.is_tombstone() {
 							return Ok(None); // Key is a tombstone, return None
+						}
+						if let Some(rseq) = max_range_delete_seq {
+							if ikey.seq_num() <= rseq {
+								return Ok(None);
+							}
 						}
 						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
 					}
@@ -818,6 +860,9 @@ pub(crate) struct SnapshotIterator<'a> {
 	current_back_value: Vec<u8>,
 	has_current_back: bool,
 
+	/// Active range tombstones: (start_key, end_key, seq_num)
+	range_deletions: Vec<(Key, Key, u64)>,
+
 	/// Direction of iteration
 	direction: MergeDirection,
 
@@ -837,10 +882,28 @@ impl SnapshotIterator<'_> {
 
 		let merge_iter = KMergeIterator::new_from(iter_state, range);
 
+		let mut range_deletions = Vec::new();
+		if let Ok(active) = core.active_memtable.read() {
+			range_deletions.extend(active.range_deletions.read().clone());
+		}
+		if let Ok(imm) = core.immutable_memtables.read() {
+			for entry in imm.iter() {
+				range_deletions.extend(entry.memtable.range_deletions.read().clone());
+			}
+		}
+		if let Ok(manifest) = core.level_manifest.read() {
+			for level in &manifest.levels {
+				for table in &level.tables {
+					range_deletions.extend(table.range_deletions.read().clone());
+				}
+			}
+		}
+
 		Ok(Self {
 			merge_iter,
 			snapshot_seq_num: seq_num,
 			core,
+			range_deletions,
 			last_key_fwd: Vec::new(),
 			buffered_back_key: Vec::new(),
 			buffered_back_value: Vec::new(),
@@ -856,6 +919,20 @@ impl SnapshotIterator<'_> {
 	#[inline]
 	fn is_visible_ref(&self, key: &InternalKeyRef<'_>) -> bool {
 		key.seq_num() <= self.snapshot_seq_num
+	}
+
+	#[inline]
+	fn is_deleted_by_range(&self, user_key: &[u8], seq_num: u64) -> bool {
+		for (start, end, rseq) in &self.range_deletions {
+			if seq_num <= *rseq
+				&& *rseq <= self.snapshot_seq_num
+				&& user_key >= start.as_slice()
+				&& user_key < end.as_slice()
+			{
+				return true;
+			}
+		}
+		false
 	}
 
 	/// Skip to the next valid entry in forward direction.
@@ -881,8 +958,8 @@ impl SnapshotIterator<'_> {
 			self.last_key_fwd.clear();
 			self.last_key_fwd.extend_from_slice(user_key);
 
-			// Skip tombstones (but remember we saw this key)
-			if key_ref.is_tombstone() {
+			// Skip tombstones and range-deleted keys (but remember we saw this key)
+			if key_ref.is_tombstone() || self.is_deleted_by_range(user_key, key_ref.seq_num()) {
 				self.merge_iter.next()?;
 				continue;
 			}
@@ -973,9 +1050,11 @@ impl SnapshotIterator<'_> {
 			// Decide the outcome for this user key.
 			if let (Some(key_bytes), Some(value_bytes)) = (latest_key, latest_value) {
 				let key_ref = InternalKeyRef::from_encoded(&key_bytes);
-				if key_ref.is_tombstone() {
+				if key_ref.is_tombstone()
+					|| self.is_deleted_by_range(key_ref.user_key(), key_ref.seq_num())
+				{
 					// Latest visible is a tombstone -- skip this user key and
-					// examine the next one. (Was: recursive call.)
+					// examine the next one.
 					self.has_current_back = false;
 					continue;
 				}

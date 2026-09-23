@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator, Value};
+use crate::{Comparator, InternalKey, InternalKeyRef, Key, LSMIterator, Value};
 
 // ============================================================================
 // SNAPSHOT VISIBILITY
@@ -736,6 +736,9 @@ pub(crate) struct CompactionIterator<'a> {
 	/// active snapshot must be preserved. The list is sorted in ascending
 	/// order for efficient binary search.
 	snapshots: Vec<u64>,
+
+	/// Active range tombstones accumulated during compaction: (start_key, end_key, seq_num)
+	active_range_deletions: Vec<(Key, Key, u64)>,
 }
 
 impl<'a> CompactionIterator<'a> {
@@ -765,6 +768,7 @@ impl<'a> CompactionIterator<'a> {
 			output_versions: Vec::new(),
 			initialized: false,
 			snapshots,
+			active_range_deletions: Vec::new(),
 		}
 	}
 
@@ -1008,6 +1012,13 @@ impl<'a> CompactionIterator<'a> {
 		// zero rows.
 		self.accumulated_versions.dedup_by_key(|b| b.0.seq_num());
 
+		// Register any range tombstones in accumulated versions
+		for (k, v) in &self.accumulated_versions {
+			if k.kind() == crate::InternalKeyKind::RangeDelete {
+				self.active_range_deletions.push((k.user_key.clone(), v.clone(), k.seq_num()));
+			}
+		}
+
 		// Check if latest version is DELETE at bottom level
 		// If so, we can completely remove this key from the database
 		let latest_is_delete_at_bottom = self.is_bottom_level
@@ -1074,7 +1085,16 @@ impl<'a> CompactionIterator<'a> {
 			// ===== DETERMINE IF ENTRY IS STALE =====
 			// Stale entries are filtered out during compaction
 
-			let should_mark_stale = if superseded {
+			let is_covered_by_range =
+				self.active_range_deletions.iter().any(|(start, end, rseq)| {
+					*rseq >= seq_num
+						&& key.user_key.as_slice() >= start.as_slice()
+						&& key.user_key.as_slice() < end.as_slice()
+				});
+
+			let should_mark_stale = if is_covered_by_range {
+				true
+			} else if superseded {
 				// Superseded: a newer version in the same visibility boundary
 				// makes this version redundant - safe to drop
 				true

@@ -15,6 +15,7 @@ use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::vlog::{VLog, ValueLocation};
 use crate::{InternalKey, InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX};
+use crate::{InternalKeyKind, Key};
 
 /// Encoded bplustree entries: Vec of (encoded_key, encoded_value) pairs.
 pub(crate) type BPTreeEntries = Vec<(Vec<u8>, Vec<u8>)>;
@@ -79,6 +80,8 @@ pub(crate) struct MemTable {
 	/// to ensure batch-atomic insertion: a batch either fits entirely (reservation
 	/// succeeds) or the memtable is left unchanged (reservation fails with ArenaFull).
 	reserved: AtomicU64,
+	/// Tracked range tombstones: (start_key, end_key, seq_num)
+	pub(crate) range_deletions: parking_lot::RwLock<Vec<(Key, Key, u64)>>,
 }
 
 impl Default for MemTable {
@@ -112,6 +115,7 @@ impl MemTable {
 			latest_seq_num: AtomicU64::new(0),
 			wal_number: AtomicU64::new(0),
 			reserved: AtomicU64::new(0),
+			range_deletions: parking_lot::RwLock::new(Vec::new()),
 		}
 	}
 
@@ -130,6 +134,16 @@ impl MemTable {
 
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
 		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
+
+		// Check if covered by any range tombstone
+		let mut range_tombstone_seq: Option<u64> = None;
+		for (start, end, seq) in self.range_deletions.read().iter() {
+			if *seq <= max_seq && key >= start.as_slice() && key < end.as_slice() {
+				range_tombstone_seq = Some(range_tombstone_seq.map_or(*seq, |s| s.max(*seq)));
+			}
+		}
+
+		let mut point_res: Option<(InternalKey, Value)> = None;
 		let mut iter = self.skiplist.iter();
 		iter.seek_ge(key);
 
@@ -150,12 +164,23 @@ impl MemTable {
 					user_key: found_key.to_vec(),
 					trailer: found_trailer,
 				};
-				return Some((internal_key, iter.value_bytes().to_vec()));
+				point_res = Some((internal_key, iter.value_bytes().to_vec()));
+				break;
 			}
 
 			iter.advance();
 		}
-		None
+
+		if let Some(rseq) = range_tombstone_seq {
+			if let Some(ref res) = point_res {
+				if res.0.seq_num() > rseq {
+					return point_res;
+				}
+			}
+			return None;
+		}
+
+		point_res
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
@@ -244,6 +269,15 @@ impl MemTable {
 
 		// Process entries with pre-encoded ValueLocations
 		for (_i, entry, current_seq_num, _timestamp) in batch.entries_with_seq_nums()? {
+			if entry.kind == InternalKeyKind::RangeDelete {
+				let end_key = entry.value.clone().unwrap_or_default();
+				self.range_deletions.write().push((
+					entry.key.clone(),
+					end_key.clone(),
+					current_seq_num,
+				));
+			}
+
 			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind);
 
 			// Use the value directly (cheap Bytes clone), or reuse empty value for deletes
@@ -358,6 +392,7 @@ impl MemTable {
 		let file_size = file.size()?;
 
 		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);
+		created_table.range_deletions.write().extend(self.range_deletions.read().clone());
 		Ok((created_table, bptree_entries))
 	}
 

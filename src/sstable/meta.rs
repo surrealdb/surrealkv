@@ -175,6 +175,7 @@ pub struct TableMetadata {
 	pub(crate) properties: Properties,
 	pub(crate) smallest_point: Option<InternalKey>,
 	pub(crate) largest_point: Option<InternalKey>,
+	pub(crate) range_deletions: Vec<(crate::Key, crate::Key, u64)>,
 }
 
 impl TableMetadata {
@@ -186,6 +187,7 @@ impl TableMetadata {
 			smallest_seq_num: None,
 			largest_seq_num: None,
 			properties: Properties::new(),
+			range_deletions: Vec::new(),
 		}
 	}
 
@@ -243,6 +245,16 @@ impl TableMetadata {
 				buf.put_u64(key_encoded.len() as u64); // Write the size of the encoded key
 				buf.extend_from_slice(&key_encoded); // Write the encoded key itself
 			}
+		}
+
+		// Encode range deletions
+		buf.put_u32(self.range_deletions.len() as u32);
+		for (start, end, seq) in &self.range_deletions {
+			buf.put_u32(start.len() as u32);
+			buf.extend_from_slice(start);
+			buf.put_u32(end.len() as u32);
+			buf.extend_from_slice(end);
+			buf.put_u64(*seq);
 		}
 
 		buf.to_vec()
@@ -306,6 +318,21 @@ impl TableMetadata {
 			}
 		};
 
+		let mut range_deletions = Vec::new();
+		if cursor.has_remaining() && cursor.remaining() >= 4 {
+			let count = cursor.get_u32();
+			for _ in 0..count {
+				let slen = cursor.get_u32() as usize;
+				let mut start = vec![0u8; slen];
+				cursor.copy_to_slice(&mut start);
+				let elen = cursor.get_u32() as usize;
+				let mut end = vec![0u8; elen];
+				cursor.copy_to_slice(&mut end);
+				let seq = cursor.get_u64();
+				range_deletions.push((start, end, seq));
+			}
+		}
+
 		Ok(TableMetadata {
 			has_point_keys,
 			smallest_seq_num,
@@ -313,6 +340,7 @@ impl TableMetadata {
 			properties,
 			smallest_point,
 			largest_point,
+			range_deletions,
 		})
 	}
 }

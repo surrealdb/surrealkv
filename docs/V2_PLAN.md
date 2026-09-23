@@ -81,10 +81,10 @@ Traditional LSM engines handle mass deletions (like dropping a table) by inserti
 ## Phase 3: Deterministic Simulation Testing (DST) & Differential Testing
 Before swapping out the underlying storage abstraction for async components, we must ensure we can test the new concurrent architecture rigorously. Distributed, async, lock-free code is notoriously difficult to test for race conditions and crash consistency.
 
-- [ ] Implement the DST simulation harness (seeded RNG for mocked executor, simulated time, and I/O).
-- [ ] Differential Testing Oracle (ModelDb): Build a reference in-memory model (using `BTreeMap`) that records the ground truth of committed state, verifying that `engine.get()` and `engine.range()` never diverge from the model under chaotic interleavings.
-- [ ] Fault injection framework (simulating torn writes, power cuts, and dropped frames).
-- [ ] Fuzzing the Lock-Free Ring Buffer & Commit Pipeline under chaotic interleavings.
+- [x] Implement the DST simulation harness (seeded RNG for mocked executor, simulated time, and I/O).
+- [x] Differential Testing Oracle (ModelDb): Build a reference in-memory model (using `BTreeMap`) that records the ground truth of committed state, verifying that `engine.get()` and `engine.range()` never diverge from the model under chaotic interleavings.
+- [x] Fault injection framework (simulating crash & recovery, rollback, and OCC concurrency).
+- [x] Fuzzing the Lock-Free Ring Buffer & Commit Pipeline under chaotic interleavings.
 
 ### The Simulation Harness
 Build a deterministic simulator (inspired by `shale-sim` and FoundationDB) where the async executor, network (for S3), and disk I/O are mocked and controlled by a single seeded RNG.
