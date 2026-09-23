@@ -9,7 +9,6 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::batch::Batch;
 use crate::bplustree::tree::DiskBPlusTree;
 use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
-use crate::commit::{CommitEnv, CommitPipeline};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
