@@ -59,22 +59,22 @@ union ViewRepr {
 /// An immutable, zero-copy byte slice with Small String Optimization (SSO)
 /// and prefix-accelerated comparison.
 #[repr(C)]
-pub struct Slice {
+pub struct ByteSlice {
 	repr: ViewRepr,
 }
 
 #[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl Send for Slice {}
+unsafe impl Send for ByteSlice {}
 #[allow(clippy::non_send_fields_in_send_ty)]
-unsafe impl Sync for Slice {}
+unsafe impl Sync for ByteSlice {}
 
-impl Default for Slice {
+impl Default for ByteSlice {
 	fn default() -> Self {
 		Self::empty()
 	}
 }
 
-impl Slice {
+impl ByteSlice {
 	/// Creates a new empty slice.
 	#[inline]
 	pub const fn empty() -> Self {
@@ -260,7 +260,7 @@ impl Slice {
 	}
 }
 
-impl Deref for Slice {
+impl Deref for ByteSlice {
 	type Target = [u8];
 
 	#[inline]
@@ -269,28 +269,28 @@ impl Deref for Slice {
 	}
 }
 
-impl AsRef<[u8]> for Slice {
+impl AsRef<[u8]> for ByteSlice {
 	#[inline]
 	fn as_ref(&self) -> &[u8] {
 		self.as_slice()
 	}
 }
 
-impl std::borrow::Borrow<[u8]> for Slice {
+impl std::borrow::Borrow<[u8]> for ByteSlice {
 	#[inline]
 	fn borrow(&self) -> &[u8] {
 		self.as_slice()
 	}
 }
 
-impl Clone for Slice {
+impl Clone for ByteSlice {
 	#[inline]
 	fn clone(&self) -> Self {
 		self.slice(..)
 	}
 }
 
-impl Drop for Slice {
+impl Drop for ByteSlice {
 	fn drop(&mut self) {
 		if self.is_inline() {
 			return;
@@ -309,7 +309,7 @@ impl Drop for Slice {
 	}
 }
 
-impl PartialEq for Slice {
+impl PartialEq for ByteSlice {
 	#[inline]
 	fn eq(&self, other: &Self) -> bool {
 		if self.len() != other.len() {
@@ -329,16 +329,16 @@ impl PartialEq for Slice {
 	}
 }
 
-impl Eq for Slice {}
+impl Eq for ByteSlice {}
 
-impl PartialOrd for Slice {
+impl PartialOrd for ByteSlice {
 	#[inline]
 	fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
-impl Ord for Slice {
+impl Ord for ByteSlice {
 	#[inline]
 	fn cmp(&self, other: &Self) -> std::cmp::Ordering {
 		// Fast path: check prefix ordering first
@@ -350,44 +350,44 @@ impl Ord for Slice {
 	}
 }
 
-impl std::hash::Hash for Slice {
+impl std::hash::Hash for ByteSlice {
 	#[inline]
 	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 		self.as_slice().hash(state);
 	}
 }
 
-impl std::fmt::Debug for Slice {
+impl std::fmt::Debug for ByteSlice {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match std::str::from_utf8(self.as_slice()) {
-			Ok(s) => write!(f, "Slice({:?})", s),
-			Err(_) => write!(f, "Slice({:?})", self.as_slice()),
+			Ok(s) => write!(f, "ByteSlice({:?})", s),
+			Err(_) => write!(f, "ByteSlice({:?})", self.as_slice()),
 		}
 	}
 }
 
-impl From<&[u8]> for Slice {
+impl From<&[u8]> for ByteSlice {
 	#[inline]
 	fn from(s: &[u8]) -> Self {
 		Self::from_slice(s)
 	}
 }
 
-impl From<&str> for Slice {
+impl From<&str> for ByteSlice {
 	#[inline]
 	fn from(s: &str) -> Self {
 		Self::from_slice(s.as_bytes())
 	}
 }
 
-impl From<Vec<u8>> for Slice {
+impl From<Vec<u8>> for ByteSlice {
 	#[inline]
 	fn from(v: Vec<u8>) -> Self {
 		Self::from_slice(&v)
 	}
 }
 
-impl From<bytes::Bytes> for Slice {
+impl From<bytes::Bytes> for ByteSlice {
 	#[inline]
 	fn from(b: bytes::Bytes) -> Self {
 		Self::from_bytes(b)
@@ -400,7 +400,7 @@ mod tests {
 
 	#[test]
 	fn test_short_inline_slice() {
-		let s = Slice::from("hello world");
+		let s = ByteSlice::from("hello world");
 		assert_eq!(s.len(), 11);
 		assert!(s.is_inline());
 		assert_eq!(s.ref_count(), 1);
@@ -416,7 +416,7 @@ mod tests {
 	#[test]
 	fn test_long_heap_slice() {
 		let long_str = "this is a very long string that definitely exceeds twenty bytes!";
-		let s = Slice::from(long_str);
+		let s = ByteSlice::from(long_str);
 		assert_eq!(s.len(), long_str.len());
 		assert!(!s.is_inline());
 		assert_eq!(s.ref_count(), 1);
@@ -442,8 +442,8 @@ mod tests {
 
 	#[test]
 	fn test_prefix_accelerated_ordering() {
-		let s1 = Slice::from("apple_pie_delicious");
-		let s2 = Slice::from("banana_split_sweet");
+		let s1 = ByteSlice::from("apple_pie_delicious");
+		let s2 = ByteSlice::from("banana_split_sweet");
 		assert!(s1 < s2);
 		assert_eq!(s1.prefix(), b"appl");
 		assert_eq!(s2.prefix(), b"bana");
@@ -452,6 +452,6 @@ mod tests {
 	#[test]
 	fn test_struct_size_is_24_bytes() {
 		#[cfg(target_pointer_width = "64")]
-		assert_eq!(std::mem::size_of::<Slice>(), 24);
+		assert_eq!(std::mem::size_of::<ByteSlice>(), 24);
 	}
 }
