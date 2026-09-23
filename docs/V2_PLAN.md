@@ -16,6 +16,16 @@ The ultimate goal is to build an engine that handles massive concurrency without
 ## Phase 1: The Concurrency Revamp (Lock-Free Ring Buffer & OCC)
 The primary performance bottleneck in the current SurrealKV implementation is the serialization of disk I/O and conflict checking behind a single `write_mutex` in `commit_pipeline.rs`. We will decouple CPU-bound conflict validation from I/O-bound disk writes.
 
+- [x] Create the V2 Transition Plan documentation.
+- [x] Delete the legacy `commit.rs` module and `CommitPipeline`.
+- [x] Scaffold the Lock-Free MPSC `Ring` buffer.
+- [x] Implement fast `BloomFilter` for OCC read/write sets.
+- [ ] Connect the `Transaction` to use the `Ring` buffer (claim, validate, write).
+- [ ] Implement the `Flusher` task for Group Commit to WAL & Memtable.
+- [ ] Implement Multiple Immutable Memtables (Burst Buffering).
+- [ ] Implement Proactive Write Pacing.
+- [ ] Refactor hot-path `Vec<u8>` usage for Zero-Allocation data paths.
+
 ### The Commit Ring Buffer
 We will replace the `commit_sem` and `write_mutex` with a fixed-size, multi-producer single-consumer (MPSC) Ring Buffer inspired by the LMAX Disruptor and ShaleDB.
 * Writers atomically `claim()` a slot (sequence number) in the ring.
