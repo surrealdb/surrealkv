@@ -48,10 +48,7 @@ impl WriteStallCountProvider for MockStallCountProvider {
 }
 
 fn default_thresholds() -> StallThresholds {
-	StallThresholds {
-		memtable_limit: 2,
-		l0_file_limit: 12,
-	}
+	StallThresholds::new(2, 12)
 }
 
 // ===== Unit Tests for WriteStallController =====

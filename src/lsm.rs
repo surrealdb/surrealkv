@@ -1069,10 +1069,10 @@ impl Core {
 		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
 
 		// Create the write stall controller with the provider and thresholds
-		let thresholds = StallThresholds {
-			memtable_limit: opts.memtable_stall_threshold,
-			l0_file_limit: opts.l0_stall_threshold,
-		};
+		let thresholds = StallThresholds::new(
+			opts.memtable_stall_threshold,
+			opts.l0_stall_threshold,
+		);
 		let write_stall = Arc::new(crate::stall::WriteStallController::new(
 			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
 			thresholds,

@@ -236,10 +236,7 @@ mod tests {
 
 	fn test_write_stall() -> Arc<WriteStallController> {
 		let provider: Arc<dyn WriteStallCountProvider> = Arc::new(NoopStallProvider);
-		let thresholds = StallThresholds {
-			memtable_limit: 2,
-			l0_file_limit: 12,
-		};
+		let thresholds = StallThresholds::new(2, 12);
 		Arc::new(WriteStallController::new(provider, thresholds))
 	}
 
@@ -679,10 +676,7 @@ mod tests {
 		let provider: Arc<dyn WriteStallCountProvider> = Arc::new(AboveThresholdProvider {
 			l0_files,
 		});
-		let thresholds = StallThresholds {
-			memtable_limit: 2,
-			l0_file_limit: 12,
-		};
+		let thresholds = StallThresholds::new(2, 12);
 		Arc::new(WriteStallController::new(provider, thresholds))
 	}
 
