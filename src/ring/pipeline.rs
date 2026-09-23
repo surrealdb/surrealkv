@@ -258,12 +258,13 @@ impl CommitPipeline {
 			processed_batches.push(processed);
 		}
 
-		// 2. Append all batches to WAL in a single lock acquisition
+		// 2. Append all batches to WAL in a single lock acquisition reusing a buffer
 		{
 			let mut wal_guard = self.inner.wal.write();
+			let mut wal_buffer = Vec::with_capacity(4096);
 			for batch in &processed_batches {
-				let enc = batch.encode()?;
-				wal_guard.append(&enc)?;
+				batch.encode_into(&mut wal_buffer)?;
+				wal_guard.append(&wal_buffer)?;
 			}
 			if sync {
 				wal_guard.sync()?;
