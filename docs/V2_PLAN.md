@@ -132,8 +132,99 @@ Upgrade the read path. Instead of blocking the executor during `SSTable::get`, r
 
 ---
 
-## Phase 5: Object-Storage Native (The Cloud Tier)
-Adapt the LSM tree to function efficiently over network boundaries, mirroring SlateDB and ShaleDB architectures.
+## Strategic Roadmap & Phase Sequencing
+
+To ensure clean engineering and prevent format churn over the cloud tier:
+1. **Phase 1 (Complete):** The Concurrency Revamp (Lock-Free OCC Ring Buffer, Group Commit, Write Pacing).
+2. **Phase 2 (Complete):** The Purge (Removed in-tree versioning, flattened keys to 184 bytes, Range Tombstones).
+3. **Phase 3 (Complete):** DST & Differential Testing (Deterministic PRNG Simulation, ModelDb Oracle).
+4. **Phase 4 (Complete):** Async Native & Storage Traits (`LogStore`, `ObjectStore`, `AffinityObjectStore`, `AffinityLogStore`, `get_async`).
+5. **Phase 5 (Next):** Engine & Block Format Optimizations (Zero-Copy aligned block format, Zstd dictionary compression, user-space W-TinyLFU cache, parallel WAL replay, Ribbon filters).
+6. **Phase 6:** Resilience, Security, & Telemetry (Block-level TDE encryption, end-to-end xxHash3 scrubbing, zero-allocation telemetry).
+7. **Phase 7:** Global Memory Accounting & Operational Excellence (Strict unified memory budget across MemTable/Cache/Ring, auto-tuning).
+8. **Phase 8:** Object-Storage Native (The Cloud Tier - S3/MinIO via `object_store`, atomic CAS manifest, zero-cost COW branching, PITR, tiered NVMe/S3 caching, and S3 orphan GC).
+
+*Note: Solidifying block serialization, compression, encryption, and local caching **before** uploading to cloud object storage guarantees that remote SSTables are written in their final, zero-copy, high-density format from day one.*
+
+---
+
+## Phase 5: Advanced Engine & Block Format Optimizations
+To push read and write throughput to the absolute hardware limits and establish the final SSTable format before cloud storage integration.
+
+- [ ] Zero-Copy Deserialization: Aligned SSTable block layouts allowing direct zero-copy parsing.
+- [ ] Zstd Dictionary Compression: SSTable-level dictionary training during flushes for high-density document compression.
+- [ ] High-Performance User-Space Cache: Tailored concurrent block cache (W-TinyLFU) replacing generic caching.
+- [ ] Ribbon / XOR Filters: Cache-line aligned compact filter structures reducing memory footprint by 25-30% over standard Bloom filters.
+- [ ] Parallel WAL Replay: Multi-threaded recovery sharding by key-hash for sub-millisecond restarts.
+- [ ] VLog WAL Bypass (WiscKey): Write large values directly to VLog during group commit and only log tiny pointers in WAL.
+
+### Direct I/O (`O_DIRECT`)
+Bypass the OS page cache entirely on local storage. Data moves via DMA directly from the database's pre-allocated memory pools to the NVMe controller, eliminating CPU memory copies and preventing double-caching (where data lives in both the OS cache and SurrealKV's block cache).
+
+### High-Performance User-Space Cache
+Because `O_DIRECT` bypasses the OS cache, we are fully responsible for memory management. Implement a highly concurrent block cache (using W-TinyLFU) tailored to our SSTables and Object Store chunks, preventing cache thrashing during large range scans.
+
+### Zstd Dictionary Compression
+Instead of compressing 4KB blocks in isolation (like standard Snappy/LZ4), train a Zstd Dictionary for the entire SSTable during flush. This massively compresses repetitive document schemas (JSON-like data), drastically multiplying I/O throughput.
+
+### Remote / Stateless Compactions
+Compaction can be fully offloaded. Stateless "Compactor" worker processes can read SSTables from storage, merge them, and write out new SSTables independently. This prevents background compactions from causing latency spikes (write stalls) on the primary serving node.
+
+### VLog WAL Bypass (WiscKey)
+Write large values directly to the Value Log (VLog) during the group commit phase, and only write a tiny VLog pointer to the WAL. This halves write amplification for large values and dramatically shrinks the size of the WAL, accelerating recovery.
+
+### XOR / Ribbon Filters
+Upgrade standard Bloom filters to XOR or Ribbon filters (like RocksDB). They consume ~20-30% less memory for the same false-positive rate and are designed to fit perfectly into a single CPU cache line, significantly accelerating point-read (`get()`) queries.
+
+### Parallel WAL Replay (Instant Crash Recovery)
+Because V2 uses a single-version KV model (Phase 2), writes to different keys are independent. During crash recovery, one thread streams the WAL and shards records by key-hash into multiple queues, while N worker threads concurrently insert them into the Memtable. This shifts recovery from I/O-bound to CPU-bound across all cores, shrinking failover times to milliseconds.
+
+### Zero-Copy Deserialization (Aligned Block Formats)
+When reading a block from an SSTable, parsing the keys and values typically requires copying bytes into new Rust structs or strings, which burns CPU cycles. We will design the SSTable block format to be strictly memory-aligned (using zero-copy techniques like `zerocopy` or `rkyv`). When a 4KB block is pulled from disk via `O_DIRECT`, we cast the raw memory pointer directly to a Rust struct, achieving literal zero-CPU-cost deserialization once the data is in RAM.
+
+---
+
+## Phase 6: Resilience, Security, & Telemetry
+To ensure the engine behaves predictably in production, we must protect against hardware lies, secure data at rest, and provide zero-cost observability.
+
+- [ ] Transparent Data Encryption (TDE): Block-level encryption at rest (AES-GCM / ChaCha20-Poly1305) with KMS key rotation.
+- [ ] End-to-End Integrity & Background Scrubbing: Continuous background verification with `xxHash3` checksums.
+- [ ] Zero-Allocation Telemetry: Real-time latency tracking (p99/p99.99) with lock-free atomics and HDRHistograms.
+
+### Transparent Data Encryption (TDE) & KMS Integration
+Pushing SSTables and WAL segments to S3/Object Storage mandates strict security. We will add block-level Encryption at Rest. Before a 4KB block or a WAL frame is written to disk/S3, it is encrypted (e.g., using AES-GCM or ChaCha20-Poly1305). The engine will integrate with a Key Management System (KMS) so that the master encryption key can be rotated without rewriting the data. Because encryption happens *after* Zstd compression, it has minimal impact on storage size, and hardware acceleration makes the CPU cost negligible.
+
+### End-to-End Integrity & Background Scrubbing
+Protect against silent bit-rot. Every SSTable block, WAL frame, and the Manifest itself must carry inline `xxHash3` checksums. A low-priority background "scrubber" task will continuously trickle through cold data on disk/S3, verifying checksums and proactively self-healing from replicas/backups before a user query hits a bad sector.
+
+### Zero-Allocation Telemetry (The Flight Recorder)
+Logging is too slow for a high-throughput engine. Measure everything (Ring Buffer wait times, `fsync` latency percentiles, cache hit rates) using `Relaxed` atomics, thread-local aggregators, and lock-free HDRHistograms. This allows SurrealDB to expose Prometheus metrics with p99/p99.99 latencies in real-time with zero performance penalty on the critical path.
+
+---
+
+## Phase 7: Global Memory Accounting & Operational Excellence
+To ensure the engine is not just fast, but robust and easy to operate in production environments without out-of-memory panics.
+
+- [ ] Global Memory Accounting: Unified memory tracker balancing Active MemTable, Immutables, Ring, and Cache.
+- [ ] Zero-Config Auto-Tuning: Automatic hardware detection (RAM, CPU cores) sizing caches and worker pools on startup.
+
+### Global Memory Accounting (OOM Prevention)
+Tie all in-memory components (Active Memtable, Immutable Memtables, Ring Buffer, User-Space Block Cache) into a unified memory tracker. The engine dynamically balances a strict `max_memory` budget—for example, if a write burst balloons the immutable memtable queue, the block cache automatically shrinks to compensate, ensuring the database never crashes due to Out-Of-Memory errors.
+
+### Zero-Config Auto-Tuning
+Avoid "configuration hell." On startup, SurrealKV should query the OS for total system RAM and CPU core count, automatically calculating the optimal thread pool sizes, memtable capacities, and block cache limits. It will be fiercely optimized out-of-the-box, with manual overrides available but rarely necessary.
+
+---
+
+## Phase 8: Object-Storage Native (The Cloud Tier)
+Adapt the finalized, high-density LSM engine to run over network boundaries and cloud object stores (S3, MinIO, GCS, Azure Blob).
+
+- [ ] Object Storage Integration: Implement `ObjectStore` using the `object_store` crate.
+- [ ] Manifest Compare-and-Swap (CAS): Centralized atomic manifest commits via S3 conditional writes.
+- [ ] Zero-Cost Branching & Forking: Copy-on-Write branching by duplicating manifests without blob copying.
+- [ ] Point-In-Time Recovery (PITR) & Checkpointing: Archived WAL segments + periodic manifest snapshots.
+- [ ] Tiered Storage (NVMe Buffer & LRU Cache for S3): Automatic promotions and evictions between RAM, local NVMe, and S3.
+- [ ] S3 Orphan Garbage Collection: Background reconciliation removing unreferenced cloud blobs.
 
 ### Immutable Object Paradigm
 Guarantee that once a WAL segment or SSTable is closed, it is strictly immutable. This enables aggressive local caching and trivial replication.
@@ -156,59 +247,5 @@ Traditional leveled compaction has massive write amplification, leading to satur
 ### Tiered Storage (Hot NVMe vs. Cold S3)
 To prevent excessive S3 egress fees and high latency on repeated queries, the engine will natively support Tiered Storage. The local NVMe drive will act as a massive LRU cache for S3. Data lifecycle shifts dynamically: "Hot" SSTables live in RAM (Block Cache), "Warm" SSTables live on local NVMe, and "Cold" SSTables live strictly in S3. When a Cold SSTable is queried, it is fetched and pinned to local NVMe, while a background thread evicts the least-recently-used warm SSTables back to "S3-only" status when local disk space fills up.
 
----
-
-## Phase 6: Advanced Engine Optimizations
-To push read and write throughput to the absolute hardware and network limits, we will implement these cutting-edge storage engine techniques.
-
-### Direct I/O (`O_DIRECT`)
-Bypass the OS page cache entirely on local storage. Data moves via DMA directly from the database's pre-allocated memory pools to the NVMe controller, eliminating CPU memory copies and preventing double-caching (where data lives in both the OS cache and SurrealKV's block cache).
-
-### High-Performance User-Space Cache
-Because `O_DIRECT` bypasses the OS cache, we are fully responsible for memory management. Implement a highly concurrent block cache (using W-TinyLFU) tailored to our SSTables and Object Store chunks, preventing cache thrashing during large range scans.
-
-### Zstd Dictionary Compression
-Instead of compressing 4KB blocks in isolation (like standard Snappy/LZ4), train a Zstd Dictionary for the entire SSTable during flush. This massively compresses repetitive document schemas (JSON-like data), drastically multiplying I/O throughput.
-
-### Remote / Stateless Compactions
-Because Phase 5 moves SSTables to the `ObjectStore`, compaction can be fully offloaded. Stateless "Compactor" worker processes can read SSTables from S3, merge them, and write out new SSTables independently. This prevents background compactions from causing latency spikes (write stalls) on the primary serving node.
-
-### VLog WAL Bypass (WiscKey)
-Write large values directly to the Value Log (VLog) during the group commit phase, and only write a tiny VLog pointer to the WAL. This halves write amplification for large values and dramatically shrinks the size of the WAL, accelerating recovery.
-
-### XOR / Ribbon Filters
-Upgrade standard Bloom filters to XOR or Ribbon filters (like RocksDB). They consume ~20-30% less memory for the same false-positive rate and are designed to fit perfectly into a single CPU cache line, significantly accelerating point-read (`get()`) queries.
-
-### Parallel WAL Replay (Instant Crash Recovery)
-Because V2 uses a single-version KV model (Phase 2), writes to different keys are independent. During crash recovery, one thread streams the WAL and shards records by key-hash into multiple queues, while N worker threads concurrently insert them into the Memtable. This shifts recovery from I/O-bound to CPU-bound across all cores, shrinking failover times to milliseconds.
-
-### Zero-Copy Deserialization (Aligned Block Formats)
-When reading a block from an SSTable, parsing the keys and values typically requires copying bytes into new Rust structs or strings, which burns CPU cycles. We will design the SSTable block format to be strictly memory-aligned (using zero-copy techniques like `zerocopy` or `rkyv`). When a 4KB block is pulled from disk via `O_DIRECT`, we cast the raw memory pointer directly to a Rust struct, achieving literal zero-CPU-cost deserialization once the data is in RAM.
-
----
-
-## Phase 7: Resilience, Security, & Telemetry
-To ensure the engine behaves predictably in production, we must protect against hardware lies, secure data at rest, and provide zero-cost observability.
-
-### Transparent Data Encryption (TDE) & KMS Integration
-Pushing SSTables and WAL segments to S3/Object Storage mandates strict security. We will add block-level Encryption at Rest. Before a 4KB block or a WAL frame is written to disk/S3, it is encrypted (e.g., using AES-GCM or ChaCha20-Poly1305). The engine will integrate with a Key Management System (KMS) so that the master encryption key can be rotated without rewriting the data. Because encryption happens *after* Zstd compression, it has minimal impact on storage size, and hardware acceleration makes the CPU cost negligible.
-
-### End-to-End Integrity & Background Scrubbing
-Protect against silent bit-rot. Every SSTable block, WAL frame, and the Manifest itself must carry inline `xxHash3` checksums. A low-priority background "scrubber" task will continuously trickle through cold data on disk/S3, verifying checksums and proactively self-healing from replicas/backups before a user query hits a bad sector.
-
-### Zero-Allocation Telemetry (The Flight Recorder)
-Logging is too slow for a high-throughput engine. Measure everything (Ring Buffer wait times, `fsync` latency percentiles, cache hit rates) using `Relaxed` atomics, thread-local aggregators, and lock-free HDRHistograms. This allows SurrealDB to expose Prometheus metrics with p99/p99.99 latencies in real-time with zero performance penalty on the critical path.
-
----
-
-## Phase 8: Operational Excellence
-To ensure the engine is not just fast, but robust and easy to operate in production environments, we will implement these final operational pillars.
-
-### Global Memory Accounting (OOM Prevention)
-Tie all in-memory components (Active Memtable, Immutable Memtables, Ring Buffer, User-Space Block Cache) into a unified memory tracker. The engine dynamically balances a strict `max_memory` budget—for example, if a write burst balloons the immutable memtable queue, the block cache automatically shrinks to compensate, ensuring the database never crashes due to Out-Of-Memory errors.
-
 ### S3 Orphan Garbage Collection
 When writing to object storage, network partitions or crashed compactors can leave "orphaned" SSTables that cost money but belong to no Manifest. An epoch-based background garbage collector will routinely reconcile the S3 bucket contents against active and Checkpoint Manifests, safely deleting unreferenced blobs after a safe grace period.
-
-### Zero-Config Auto-Tuning
-Avoid "configuration hell." On startup, SurrealKV should query the OS for total system RAM and CPU core count, automatically calculating the optimal thread pool sizes, memtable capacities, and block cache limits. It will be fiercely optimized out-of-the-box, with manual overrides available but rarely necessary.
