@@ -78,11 +78,23 @@ Traditional LSM engines handle mass deletions (like dropping a table) by inserti
 
 ---
 
-## Phase 3: Deterministic Simulation Testing (DST)
+## Phase 3: Deterministic Simulation Testing (DST) & Differential Testing
 Before swapping out the underlying storage abstraction for async components, we must ensure we can test the new concurrent architecture rigorously. Distributed, async, lock-free code is notoriously difficult to test for race conditions and crash consistency.
+
+- [ ] Implement the DST simulation harness (seeded RNG for mocked executor, simulated time, and I/O).
+- [ ] Differential Testing Oracle (ModelDb): Build a reference in-memory model (using `BTreeMap`) that records the ground truth of committed state, verifying that `engine.get()` and `engine.range()` never diverge from the model under chaotic interleavings.
+- [ ] Fault injection framework (simulating torn writes, power cuts, and dropped frames).
+- [ ] Fuzzing the Lock-Free Ring Buffer & Commit Pipeline under chaotic interleavings.
 
 ### The Simulation Harness
 Build a deterministic simulator (inspired by `shale-sim` and FoundationDB) where the async executor, network (for S3), and disk I/O are mocked and controlled by a single seeded RNG.
+
+### The Differential Testing Oracle (ModelDb)
+A crash-free simulation run does not prove data correctness—a storage engine could silently lose keys or return stale data without crashing. We will build a differential testing harness:
+* Maintain a trivial, mathematically correct in-memory reference model (`ModelDb`) alongside SurrealKV.
+* Execute identical randomized transactions (inserts, overwrites, deletes, range tombstones, and snapshot reads) against both SurrealKV and the reference model simultaneously.
+* After every commit, range scan, or simulated power failure/recovery, verify that SurrealKV's state matches the reference model byte-for-byte.
+* If a single divergence occurs, the test halts and outputs the exact random seed for 100% deterministic reproduction.
 
 ### Fault Injection
 Simulate power losses, dropped network packets, out-of-order writes, and thread stalls instantly, finding trillion-to-one edge cases in seconds on a laptop. If a test fails, the exact seed can be replayed to perfectly reproduce the bug.
