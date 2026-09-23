@@ -20,10 +20,25 @@ pub struct StallCounts {
 /// Thresholds that trigger write stalls when exceeded.
 #[derive(Debug, Clone, Copy)]
 pub struct StallThresholds {
-	/// Maximum immutable memtable count before stalling writes
+	/// Maximum immutable memtable count before hard stalling writes
 	pub memtable_limit: usize,
-	/// Maximum L0 file count before stalling writes
+	/// Soft threshold where proactive pacing delays start for memtables
+	pub memtable_soft_limit: usize,
+	/// Maximum L0 file count before hard stalling writes
 	pub l0_file_limit: usize,
+	/// Soft threshold where proactive pacing delays start for L0 files
+	pub l0_file_soft_limit: usize,
+}
+
+impl StallThresholds {
+	pub fn new(memtable_limit: usize, l0_file_limit: usize) -> Self {
+		Self {
+			memtable_limit,
+			memtable_soft_limit: memtable_limit.saturating_sub(2).max(1),
+			l0_file_limit,
+			l0_file_soft_limit: l0_file_limit.saturating_sub(4).max(1),
+		}
+	}
 }
 
 /// Trait for getting current stall condition counts.
@@ -116,11 +131,11 @@ impl WriteStallController {
 			// Re-read counts (now any notify_waiters() after notified creation will wake us)
 			let counts = self.provider.get_stall_counts();
 
-			// Check if NOT stalled - return without awaiting
+			// Check if NOT hard-stalled
 			if counts.immutable_memtables < self.thresholds.memtable_limit
 				&& counts.l0_files < self.thresholds.l0_file_limit
 			{
-				// Not stalled - return result
+				// If we were stalled, clean up and return
 				if let Some(reason) = stall_reason {
 					self.is_stalled.store(false, Ordering::Release);
 					let duration = stall_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
@@ -132,6 +147,22 @@ impl WriteStallController {
 						duration,
 					}));
 				}
+
+				// Proactive Write Pacing: apply microsecond delays if above soft limits
+				let mut pacing_micros: u64 = 0;
+				if counts.immutable_memtables > self.thresholds.memtable_soft_limit {
+					let excess = counts.immutable_memtables - self.thresholds.memtable_soft_limit;
+					pacing_micros = pacing_micros.max((excess as u64) * 200);
+				}
+				if counts.l0_files > self.thresholds.l0_file_soft_limit {
+					let excess = counts.l0_files - self.thresholds.l0_file_soft_limit;
+					pacing_micros = pacing_micros.max((excess as u64) * 100);
+				}
+
+				if pacing_micros > 0 {
+					tokio::time::sleep(Duration::from_micros(pacing_micros)).await;
+				}
+
 				return Ok(None);
 			}
 
