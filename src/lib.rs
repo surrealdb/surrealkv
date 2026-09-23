@@ -1,3 +1,4 @@
+pub mod autotune;
 mod batch;
 mod cache;
 mod checkpoint;
@@ -10,6 +11,7 @@ mod iter;
 mod levels;
 mod lockfile;
 mod lsm;
+pub mod memory;
 mod memtable;
 mod ring;
 pub mod scrubber;

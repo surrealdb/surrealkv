@@ -205,8 +205,8 @@ Logging is too slow for a high-throughput engine. Measure everything (Ring Buffe
 ## Phase 7: Global Memory Accounting & Operational Excellence
 To ensure the engine is not just fast, but robust and easy to operate in production environments without out-of-memory panics.
 
-- [ ] Global Memory Accounting: Unified memory tracker balancing Active MemTable, Immutables, Ring, and Cache.
-- [ ] Zero-Config Auto-Tuning: Automatic hardware detection (RAM, CPU cores) sizing caches and worker pools on startup.
+- [x] Global Memory Accounting: Unified memory tracker balancing Active MemTable, Immutables, Ring, and Cache (`MemoryController`, `SharedMemoryController`).
+- [x] Zero-Config Auto-Tuning: Automatic hardware detection (RAM, CPU cores) sizing caches and worker pools on startup (`HardwareProfile`, `auto_tune_options`).
 
 ### Global Memory Accounting (OOM Prevention)
 Tie all in-memory components (Active Memtable, Immutable Memtables, Ring Buffer, User-Space Block Cache) into a unified memory tracker. The engine dynamically balances a strict `max_memory` budget—for example, if a write burst balloons the immutable memtable queue, the block cache automatically shrinks to compensate, ensuring the database never crashes due to Out-Of-Memory errors.
