@@ -175,6 +175,18 @@ unnecessary_to_owned = "warn"
 # Warning or denying this lint can cause unexpected errors.
 unused_async = "allow"
 
+# Checks for usage of Mutex<X> where an atomic will do.
+# https://rust-lang.github.io/rust-clippy/master/#mutex_atomic
+mutex_atomic = "warn"
+
+# Checks for binding to underscore prefixed variable without side-effects.
+# https://rust-lang.github.io/rust-clippy/master/index.html#no_effect_underscore_binding
+no_effect_underscore_binding = "warn"
+
+# Checks for the use of bindings with a single leading underscore.
+# https://rust-lang.github.io/rust-clippy/master/index.html#used_underscore_binding
+used_underscore_binding = "warn"
+
 # Checks for `.unwrap()` or `.unwrap_err()` calls on Results and `.unwrap()` call on `Option`s.
 # https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used
 # TODO(Farhan): This must be changed to `warn`.
