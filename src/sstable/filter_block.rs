@@ -274,7 +274,6 @@ mod tests {
 				user_key.as_bytes().to_vec(),
 				(i + 1) as u64, // sequence numbers
 				InternalKeyKind::Set,
-				0,
 			);
 
 			// Encode and add to filter
@@ -303,7 +302,7 @@ mod tests {
 			// Use values outside the range of existing keys
 			let user_key = format!("nonexistent_{:05}", i + num_items);
 			let internal_key =
-				InternalKey::new(user_key.as_bytes().to_vec(), i as u64, InternalKeyKind::Set, 0);
+				InternalKey::new(user_key.as_bytes().to_vec(), i as u64, InternalKeyKind::Set);
 
 			let encoded_key = internal_key.encode();
 

@@ -57,6 +57,7 @@ impl Batch {
 		Ok(())
 	}
 
+	#[cfg(test)]
 	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
 		let mut encoded = Vec::with_capacity(self.size as usize + 64);
 		self.encode_into(&mut encoded)?;

@@ -183,9 +183,6 @@ impl Compactor {
 			merge_iter,
 			Arc::clone(&self.options.lopts.internal_comparator) as Arc<dyn Comparator>,
 			is_bottom_level,
-			self.options.lopts.enable_versioning,
-			self.options.lopts.versioned_history_retention_ns,
-			Arc::clone(&self.options.lopts.clock),
 			snapshots,
 		);
 

@@ -30,7 +30,7 @@ fn create_test_table(table_id: u64, num_items: u64, opts: Arc<Options>) -> Resul
 		let value = format!("value_{i:05}");
 
 		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set, 0);
+			InternalKey::new(key.as_bytes().to_vec(), i + 1, InternalKeyKind::Set);
 
 		writer.add(internal_key, value.as_bytes())?;
 	}
@@ -375,7 +375,7 @@ fn create_test_table_with_seq_nums(
 		let value = format!("value_{seq_num:05}");
 
 		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
+			InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set);
 
 		writer.add(internal_key, value.as_bytes())?;
 	}

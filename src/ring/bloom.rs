@@ -51,12 +51,6 @@ impl BloomFilter {
 		self.count == 0
 	}
 
-	/// Reset the filter to its initial empty state
-	pub const fn clear(&mut self) {
-		self.bits = [0; BLOOM_BYTES];
-		self.count = 0;
-	}
-
 	/// Compute a dual FNV-1a hash for double hashing
 	#[inline]
 	fn hash(key: &[u8]) -> (u64, u64) {

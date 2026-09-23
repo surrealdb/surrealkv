@@ -656,23 +656,21 @@ pub(crate) fn user_range_to_internal_range(
 			key.into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
-			0,
 		)),
 		Bound::Excluded(key) => {
-			Bound::Excluded(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
+			Bound::Excluded(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set))
 		}
 	};
 
 	let end_bound = match upper {
 		Bound::Unbounded => Bound::Unbounded,
 		Bound::Included(key) => {
-			Bound::Included(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set, 0))
+			Bound::Included(InternalKey::new(key.into_bytes(), 0, InternalKeyKind::Set))
 		}
 		Bound::Excluded(key) => Bound::Excluded(InternalKey::new(
 			key.into_bytes(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
-			0,
 		)),
 	};
 
@@ -684,7 +682,6 @@ pub(crate) fn user_range_to_internal_range(
 // resulting in a binary number with a 1 followed by 56 zeros. Subtracting 1
 // gives a binary number with 56 ones, which is the maximum value for 56 bits.
 pub(crate) const INTERNAL_KEY_SEQ_NUM_MAX: u64 = (1 << 56) - 1;
-pub(crate) const INTERNAL_KEY_TIMESTAMP_MAX: u64 = 0;
 
 // Helper function for reading u64 from byte slices without unwrap()
 // Safe to use when bounds have already been checked
@@ -774,15 +771,7 @@ pub(crate) struct InternalKey {
 }
 
 impl InternalKey {
-	pub(crate) fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind, _timestamp: u64) -> Self {
-		Self {
-			user_key,
-			trailer: (seq_num << 8) | kind as u64,
-		}
-	}
-
-	#[allow(dead_code)]
-	pub(crate) fn new_flat(user_key: Key, seq_num: u64, kind: InternalKeyKind) -> Self {
+	pub(crate) fn new(user_key: Key, seq_num: u64, kind: InternalKeyKind) -> Self {
 		Self {
 			user_key,
 			trailer: (seq_num << 8) | kind as u64,

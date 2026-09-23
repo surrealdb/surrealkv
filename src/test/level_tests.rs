@@ -16,7 +16,6 @@ use crate::{
 	InternalKeyRange,
 	Options,
 	INTERNAL_KEY_SEQ_NUM_MAX,
-	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 
 /// Helper to create an InternalKeyRange
@@ -30,22 +29,20 @@ fn make_range(
 			k.to_vec(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
-			INTERNAL_KEY_TIMESTAMP_MAX,
 		)),
 		Some((k, false)) => {
-			Bound::Excluded(InternalKey::new(k.to_vec(), 0, InternalKeyKind::Set, 0))
+			Bound::Excluded(InternalKey::new(k.to_vec(), 0, InternalKeyKind::Set))
 		}
 	};
 	let end = match upper {
 		None => Bound::Unbounded,
 		Some((k, true)) => {
-			Bound::Included(InternalKey::new(k.to_vec(), 0, InternalKeyKind::Set, 0))
+			Bound::Included(InternalKey::new(k.to_vec(), 0, InternalKeyKind::Set))
 		}
 		Some((k, false)) => Bound::Excluded(InternalKey::new(
 			k.to_vec(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Max,
-			INTERNAL_KEY_TIMESTAMP_MAX,
 		)),
 	};
 	(start, end)
@@ -58,7 +55,7 @@ fn create_test_table(id: u64, keys: &[&str], opts: Arc<Options>) -> Arc<Table> {
 
 	for (i, key) in keys.iter().enumerate() {
 		let ikey =
-			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
 		writer.add(ikey, b"value").unwrap();
 	}
 
@@ -503,7 +500,7 @@ fn create_test_table_with_vlog_id(
 
 	for (i, key) in keys.iter().enumerate() {
 		let ikey =
-			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
 		writer.add(ikey, b"value").unwrap();
 	}
 
