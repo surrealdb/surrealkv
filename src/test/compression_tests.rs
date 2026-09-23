@@ -93,6 +93,51 @@ fn build_table_with_compression(
 // ========== Compression Tests ==========
 
 #[test]
+fn test_zstd_compression_roundtrip_and_ratio() {
+	let mut data = Vec::new();
+
+	for i in 0..5_000 {
+		let key = format!("key_{:08}", i).into_bytes();
+		let value = generate_json_like_value(i, 256);
+		data.push((key, value));
+	}
+
+	let (_none_buf, none_size) = build_table_with_compression(data.clone(), CompressionType::None);
+	let (zstd_buf, zstd_size) =
+		build_table_with_compression(data.clone(), CompressionType::ZstdCompression);
+
+	// Verify significant size reduction with Zstd on JSON-like data
+	assert!(
+		zstd_size < none_size / 2,
+		"Zstd should reduce size by >50%: none={}, zstd={}",
+		none_size,
+		zstd_size
+	);
+
+	let opts = {
+		let mut opts = default_opts_mut();
+		opts.compression_per_level = vec![CompressionType::ZstdCompression];
+		Arc::new(opts)
+	};
+
+	let table = Arc::new(Table::new(1, opts, wrap_buffer(zstd_buf), zstd_size as u64).unwrap());
+	let mut iter = table.iter(None).unwrap();
+	let mut count = 0;
+	iter.seek_to_first().unwrap();
+	while iter.valid() {
+		let key = iter.key().to_owned();
+		let value = iter.value_encoded().unwrap();
+
+		assert_eq!(key.user_key, &data[count].0[..]);
+		assert_eq!(value, &data[count].1[..]);
+
+		count += 1;
+		iter.next().unwrap();
+	}
+	assert_eq!(count, 5_000);
+}
+
+#[test]
 fn test_compression_10k_pairs_roundtrip() {
 	let mut data = Vec::new();
 	let mut rng = StdRng::seed_from_u64(12345);
