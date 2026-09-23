@@ -127,7 +127,23 @@ pub(crate) fn replay_wal(
 	// Get all segments in the directory
 	let all_segments = SegmentRef::read_segments_from_directory(wal_dir, Some("wal"))?;
 
-	// Process each segment in order
+	// Collect segments to replay in order
+	let mut segments_to_replay: Vec<SegmentRef> = Vec::new();
+	for segment_id in start_segment..=last {
+		if let Some(seg) = all_segments.iter().find(|seg| seg.id == segment_id) {
+			segments_to_replay.push((*seg).clone());
+		}
+	}
+
+	// Use parallel WAL decoder if multiple segments exist
+	if segments_to_replay.len() > 1 {
+		return crate::wal::parallel_recovery::replay_segments_sync(
+			&segments_to_replay,
+			arena_size,
+		);
+	}
+
+	// Process single segment in order
 	for segment_id in start_segment..=last {
 		// Find this segment in the list
 		let segment = match all_segments.iter().find(|seg| seg.id == segment_id) {

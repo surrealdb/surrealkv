@@ -7,6 +7,7 @@ use std::sync::PoisonError;
 use crc32fast::Hasher;
 
 pub mod manager;
+pub(crate) mod parallel_recovery;
 pub mod reader;
 pub mod recovery;
 pub mod writer;
@@ -395,7 +396,7 @@ pub(crate) fn should_include_file(
 	}
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct SegmentRef {
 	pub file_path: PathBuf,
 	pub id: u64,
