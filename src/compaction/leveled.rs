@@ -56,7 +56,6 @@ impl Strategy {
 		}
 	}
 
-	/// Create a Strategy from Options with a specific compaction priority
 	#[cfg(test)]
 	pub(crate) fn from_options_with_priority(
 		opts: Arc<Options>,
