@@ -109,9 +109,10 @@ Swap the synchronous `vfs.rs` abstraction for a truly async storage layer. The c
 
 - [x] Add `affinitypool = "0.8"` dependency.
 - [x] Define asynchronous storage traits (`LogStore` for append-only sequential log persistence and `ObjectStore` / `PageStore` for immutable block/SSTable random reads).
-- [x] Implement `AffinityObjectStore` backed by `affinitypool` (and local filesystem).
+- [x] Implement `AffinityLogStore` and `AffinityObjectStore` backed by `affinitypool` (and local filesystem).
 - [x] Implement in-memory async stores for testing and simulator mocks (`MemLogStore`, `MemObjectStore`).
 - [x] Migrate `SSTable` block reading and point lookup to async (`read_block_async`, `Table::get_async`, `Transaction::get_async`).
+- [x] Integrate asynchronous LogStore & ObjectStore tests into test suite.
 - [ ] Upgrade WAL append & sync in `CommitPipeline` flusher to async `LogStore::append`.
 - [ ] Run full DST and unit tests verifying async storage equivalence.
 
