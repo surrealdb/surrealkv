@@ -553,6 +553,62 @@ impl Transaction {
 		}
 	}
 
+	/// Asynchronously gets a value for a key from the database.
+	pub async fn get_async<K>(&self, key: K) -> Result<Option<Value>>
+	where
+		K: IntoBytes,
+	{
+		let key_slice = key.as_slice();
+		if self.closed {
+			return Err(Error::TransactionClosed);
+		}
+		if key_slice.is_empty() {
+			return Err(Error::EmptyKey);
+		}
+		if self.mode.is_write_only() {
+			return Err(Error::TransactionWriteOnly);
+		}
+
+		let mut range_delete_entry = None;
+		for (start, entries) in &self.write_set {
+			if let Some(entry) = entries.last() {
+				if entry.kind == InternalKeyKind::RangeDelete {
+					if let Some(ref end) = entry.value {
+						let k = key_slice;
+						if k >= start.as_slice() && k < end.as_slice() {
+							range_delete_entry = Some(entry);
+						}
+					}
+				}
+			}
+		}
+
+		if let Some(last_entry) = self.write_set.get(key_slice).and_then(|entries| entries.last()) {
+			if let Some(r) = range_delete_entry {
+				if r.seqno > last_entry.seqno {
+					return Ok(None);
+				}
+			}
+			if last_entry.is_tombstone() {
+				return Ok(None);
+			}
+			if let Some(v) = &last_entry.value {
+				return Ok(Some(v.clone()));
+			}
+			return Ok(None);
+		} else if range_delete_entry.is_some() {
+			return Ok(None);
+		}
+
+		match self.snapshot.as_ref().unwrap().get_async(key_slice).await? {
+			Some(val) => {
+				let resolved_value = self.core.resolve_value(&val.0)?;
+				Ok(Some(resolved_value))
+			}
+			None => Ok(None),
+		}
+	}
+
 	/// Gets a value for a key, with custom read options.
 	pub fn get_with_options<K>(&self, key: K, _options: &ReadOptions) -> Result<Option<Value>>
 	where
