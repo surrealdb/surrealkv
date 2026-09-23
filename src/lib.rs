@@ -1,5 +1,4 @@
 mod batch;
-pub mod bplustree;
 mod cache;
 mod checkpoint;
 mod clock;
@@ -520,11 +519,6 @@ impl Options {
 	/// Returns the directory path for manifest files
 	pub(crate) fn manifest_dir(&self) -> PathBuf {
 		self.path.join("manifest")
-	}
-
-	/// Returns the directory path for versioned index files
-	pub(crate) fn versioned_index_dir(&self) -> PathBuf {
-		self.path.join("versioned_index")
 	}
 
 	/// Checks if a filename matches the `VLog` file naming pattern

@@ -58,9 +58,9 @@ Refactor code utilizing `Vec<u8>` or `Bytes` in the hot paths (like `Batch::enco
 ## Phase 2: The Purge (Simplifying the LSM Tree)
 With the new commit pipeline in place, we strip out the deeply integrated versioning logic to make the tree a pure, ultra-fast byte-to-byte store.
 
+- [x] Delete the legacy `bplustree` module completely.
 - [ ] Flat Entries: Remove `timestamp`, `seq_num`, and `kind` from core `Node` and `Entry`.
 - [ ] True Single-Version KV: Implement direct overwrite/tombstone semantics without retention windows.
-- [ ] Delete the legacy `bplustree` module completely.
 - [ ] Simplified Compaction: Purge timestamp comparator logic and rewrite compaction as pure byte-prefix merging.
 - [ ] Implement Range Tombstones (O(1) Mass Deletions).
 
