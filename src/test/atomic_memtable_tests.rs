@@ -27,11 +27,11 @@ use crate::memtable::{max_entry_bytes, MemTable};
 use crate::Error;
 
 /// Per-entry arena cost upper bound, as exposed by `max_entry_bytes`.
-/// Equal to `MAX_NODE_SIZE (192) + NODE_ALIGNMENT-1 (7)`.
-const ENTRY_OVERHEAD: u64 = 199;
+/// Equal to `MAX_NODE_SIZE (184) + NODE_ALIGNMENT-1 (7)`.
+const ENTRY_OVERHEAD: u64 = 191;
 
 /// Bytes the skiplist sentinels consume in the arena at MemTable construction
-/// (two full-height nodes + 1 reserved offset). 199 per sentinel + 1.
+/// (two full-height nodes + 1 reserved offset). 191 per sentinel + 1.
 const SENTINEL_OVERHEAD: usize = 2 * (ENTRY_OVERHEAD as usize) + 1;
 
 // ============================================================================

@@ -51,8 +51,6 @@ pub mod stall_tests;
 #[cfg(test)]
 pub mod transaction_tests;
 #[cfg(test)]
-pub mod version_iterator_tests;
-#[cfg(test)]
 pub mod vlog_tests;
 #[cfg(test)]
 pub mod wal_tests;

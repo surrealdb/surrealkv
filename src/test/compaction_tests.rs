@@ -1986,16 +1986,16 @@ fn test_table_properties_population() {
 	assert_eq!(props.key_count, 100);
 	assert_eq!(props.num_deletions, expected_deletions);
 	assert_eq!(props.tombstone_count, expected_tombstones);
-	assert_eq!(props.data_size, 2975);
+	assert_eq!(props.data_size, 2175);
 	assert_eq!(props.oldest_vlog_file_id, 0);
 	assert_eq!(props.num_data_blocks, 1);
 
-	assert_eq!(props.index_size, 74, "Index size should be tracked");
+	assert_eq!(props.index_size, 58, "Index size should be tracked");
 	assert_eq!(props.index_partitions, 1, "Should have 1 index partition for small table");
-	assert_eq!(props.top_level_index_size, 32, "Top-level index size should be tracked");
+	assert_eq!(props.top_level_index_size, 24, "Top-level index size should be tracked");
 	// Verify filter metrics (should have bloom filter by default)
 	assert_eq!(props.filter_size, 135, "Filter size should be tracked with default bloom filter");
-	assert_eq!(props.raw_key_size, 2300, "Raw key size should be tracked");
+	assert_eq!(props.raw_key_size, 1500, "Raw key size should be tracked");
 	assert_eq!(props.raw_value_size, 675, "Raw value size should be tracked");
 	assert!(
 		props.raw_key_size + props.raw_value_size == props.data_size,
@@ -2010,7 +2010,7 @@ fn test_table_properties_population() {
 	assert_eq!(props.num_range_deletions, 5, "Should have 5 range deletions (every 20th key)");
 
 	assert!(props.created_at > 0);
-	assert_eq!(props.block_size, 2757);
+	assert_eq!(props.block_size, 1957);
 	assert_eq!(props.block_count, 1);
 	assert_eq!(props.compression, CompressionType::None);
 	assert_eq!(props.seqnos.0, 1000);

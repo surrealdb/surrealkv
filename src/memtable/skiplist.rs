@@ -40,7 +40,7 @@ pub(crate) const NODE_ALIGNMENT: u32 = 8;
 
 // Compile-time sanity check: if `Node` layout changes, this fires.
 // If you hit this, recompute the entry-size constants accordingly.
-const _: () = assert!(MAX_NODE_SIZE == 192);
+const _: () = assert!(MAX_NODE_SIZE == 184);
 
 /// Upper bound on bytes consumed in the arena by inserting one entry
 /// with the given key/value sizes. Worst-case skiplist height + alignment padding.
@@ -98,8 +98,6 @@ struct Node {
 	key_size: u32,
 	/// Trailer: (seq_num << 8) | kind
 	key_trailer: u64,
-	/// Timestamp: System time in nanoseconds
-	key_timestamp: u64,
 	/// Size of value in bytes
 	value_size: u32,
 	/// Padding for 8-byte alignment of tower
@@ -179,7 +177,6 @@ fn new_node(
 	height: u32,
 	key: &[u8],
 	trailer: u64,
-	timestamp: u64,
 	value: &[u8],
 ) -> Option<*mut Node> {
 	if height < 1 || height > MAX_HEIGHT as u32 {
@@ -190,7 +187,6 @@ fn new_node(
 
 	unsafe {
 		(*nd).key_trailer = trailer;
-		(*nd).key_timestamp = timestamp;
 		// Copy key bytes directly (no length prefix!)
 		let key_bytes = arena.get_bytes_mut((*nd).key_offset, (*nd).key_size);
 		key_bytes.copy_from_slice(key);
@@ -331,9 +327,9 @@ impl Skiplist {
 	}
 
 	/// Add a key
-	pub fn add(&self, key: &[u8], trailer: u64, timestamp: u64, value: &[u8]) -> Result<(), Error> {
+	pub fn add(&self, key: &[u8], trailer: u64, value: &[u8]) -> Result<(), Error> {
 		let mut ins = Inserter::new();
-		self.add_internal(key, trailer, timestamp, value, &mut ins)
+		self.add_internal(key, trailer, value, &mut ins)
 	}
 
 	/// Internal add
@@ -341,17 +337,16 @@ impl Skiplist {
 		&self,
 		key: &[u8],
 		trailer: u64,
-		timestamp: u64,
 		value: &[u8],
 		ins: &mut Inserter,
 	) -> Result<(), Error> {
 		// Find splice
-		if self.find_splice(key, trailer, timestamp, ins) {
+		if self.find_splice(key, trailer, ins) {
 			return Err(Error::RecordExists);
 		}
 
 		// Allocate node
-		let (nd, height) = self.new_node(key, trailer, timestamp, value)?;
+		let (nd, height) = self.new_node(key, trailer, value)?;
 		let nd_offset = self.arena.get_pointer_offset(nd as *const u8);
 
 		// Link at each level
@@ -396,7 +391,7 @@ impl Skiplist {
 
 				// CAS failed, recompute splice
 				let (new_prev, new_next, found) =
-					self.find_splice_for_level(key, trailer, timestamp, i, prev);
+					self.find_splice_for_level(key, trailer, i, prev);
 				if found {
 					if i != 0 {
 						panic!("how can another thread have inserted a node at a non-base level?");
@@ -426,11 +421,10 @@ impl Skiplist {
 		&self,
 		key: &[u8],
 		trailer: u64,
-		timestamp: u64,
 		value: &[u8],
 	) -> Result<(*mut Node, u32), Error> {
 		let height = self.random_height();
-		let nd = new_node(&self.arena, height, key, trailer, timestamp, value)
+		let nd = new_node(&self.arena, height, key, trailer, value)
 			.ok_or(Error::ArenaFull)?;
 
 		// Try to increase height via CAS
@@ -462,7 +456,7 @@ impl Skiplist {
 	}
 
 	/// Find splice
-	fn find_splice(&self, key: &[u8], trailer: u64, timestamp: u64, ins: &mut Inserter) -> bool {
+	fn find_splice(&self, key: &[u8], trailer: u64, ins: &mut Inserter) -> bool {
 		let list_height = self.height();
 		let mut level: i32;
 		let mut prev = self.head;
@@ -479,9 +473,9 @@ impl Skiplist {
 				}
 
 				if (spl.prev != self.head
-					&& !self.key_is_after_node(spl.prev, key, trailer, timestamp))
+					&& !self.key_is_after_node(spl.prev, key, trailer))
 					|| (spl.next != self.tail
-						&& self.key_is_after_node(spl.next, key, trailer, timestamp))
+						&& self.key_is_after_node(spl.next, key, trailer))
 				{
 					level = list_height as i32;
 				} else {
@@ -516,17 +510,8 @@ impl Skiplist {
 				if cmp == Ordering::Equal {
 					let next_trailer = unsafe { (*next).key_trailer };
 					if trailer == next_trailer {
-						// Trailer equal - check timestamp as tiebreaker
-						let next_timestamp = unsafe { (*next).key_timestamp };
-						if timestamp == next_timestamp {
-							found = true;
-							break;
-						}
-						// Higher timestamp comes first (DESC), so stop if our timestamp > next
-						if timestamp > next_timestamp {
-							break;
-						}
-						// timestamp < next_timestamp, continue searching
+						found = true;
+						break;
 					} else if trailer > next_trailer {
 						break;
 					}
@@ -546,7 +531,6 @@ impl Skiplist {
 		&self,
 		key: &[u8],
 		trailer: u64,
-		timestamp: u64,
 		level: usize,
 		start: *mut Node,
 	) -> (*mut Node, *mut Node, bool) {
@@ -568,16 +552,7 @@ impl Skiplist {
 			if cmp == Ordering::Equal {
 				let next_trailer = unsafe { (*next).key_trailer };
 				if trailer == next_trailer {
-					// Trailer equal - check timestamp as tiebreaker
-					let next_timestamp = unsafe { (*next).key_timestamp };
-					if timestamp == next_timestamp {
-						return (prev, next, true); // True duplicate
-					}
-					// Higher timestamp comes first (DESC), so stop if our timestamp > next
-					if timestamp > next_timestamp {
-						return (prev, next, false);
-					}
-					// timestamp < next_timestamp, continue searching
+					return (prev, next, true); // True duplicate
 				} else if trailer > next_trailer {
 					return (prev, next, false);
 				}
@@ -589,7 +564,7 @@ impl Skiplist {
 
 	/// Key comparison
 	#[inline]
-	fn key_is_after_node(&self, nd: *mut Node, key: &[u8], trailer: u64, timestamp: u64) -> bool {
+	fn key_is_after_node(&self, nd: *mut Node, key: &[u8], trailer: u64) -> bool {
 		if nd == self.head {
 			return true;
 		}
@@ -606,15 +581,7 @@ impl Skiplist {
 			Ordering::Equal => {
 				let nd_trailer = unsafe { (*nd).key_trailer };
 				if trailer == nd_trailer {
-					// Trailer equal - use timestamp as tiebreaker (DESC order)
-					let nd_timestamp = unsafe { (*nd).key_timestamp };
-					if timestamp == nd_timestamp {
-						false // Same key
-					} else {
-						// Higher timestamp comes first, so key is "after" node if timestamp <
-						// nd_timestamp
-						timestamp < nd_timestamp
-					}
+					false
 				} else {
 					trailer < nd_trailer
 				}
@@ -732,14 +699,13 @@ impl<'a> SkiplistIterator<'a> {
 			return;
 		}
 		// Access node data directly to avoid borrow conflict
-		let (key_bytes, trailer, timestamp) = unsafe {
+		let (key_bytes, trailer) = unsafe {
 			let node = &*self.nd;
-			(node.get_key_bytes(&self.list.arena), node.key_trailer, node.key_timestamp)
+			(node.get_key_bytes(&self.list.arena), node.key_trailer)
 		};
 		self.encoded_key_buf.clear();
 		self.encoded_key_buf.extend_from_slice(key_bytes);
 		self.encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
-		self.encoded_key_buf.extend_from_slice(&timestamp.to_be_bytes());
 	}
 
 	/// Move to first entry within bounds

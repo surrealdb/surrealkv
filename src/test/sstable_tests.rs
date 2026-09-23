@@ -73,7 +73,7 @@ fn test_table_builder() {
 	}
 
 	let actual = b.finish().unwrap();
-	assert_eq!(724, actual);
+	assert_eq!(612, actual);
 }
 
 #[test]
@@ -4388,7 +4388,7 @@ fn test_table_iterator_seek_and_scan() {
 fn test_table_iterator_across_partitions() {
 	// Create table that spans multiple index partitions
 	let mut opts = default_opts_mut();
-	opts.index_partition_size = 150; // Small partition size
+	opts.index_partition_size = 50; // Small partition size
 	opts.block_size = 500;
 	let opts = Arc::new(opts);
 
@@ -4818,102 +4818,7 @@ fn test_seq_num_tracking_various_orders() {
 	}
 }
 
-/// Tests that timestamp tracking works correctly when the first entry has timestamp=0.
-#[test]
-fn test_timestamp_tracking_with_zero_first() {
-	let opts = default_opts();
-	let mut buffer = Vec::new();
-	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
-
-	// Add entries with timestamps: 0, 1000, 500 (first is 0!)
-	let entries = vec![
-		("aaa", 0u64),    // First entry has timestamp = 0
-		("bbb", 1000u64), // Larger timestamp
-		("ccc", 500u64),  // Middle timestamp
-	];
-
-	for (key, ts) in &entries {
-		let internal_key = InternalKey::new(key.as_bytes().to_vec(), 1, InternalKeyKind::Set, *ts);
-		writer.add(internal_key, b"value").unwrap();
-	}
-
-	let size = writer.finish().unwrap();
-	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
-
-	// Verify: oldest should be 0 (not overwritten), newest should be 1000
-	assert_eq!(
-		table.meta.properties.oldest_key_time,
-		Some(0),
-		"oldest_key_time should be 0 (first entry's timestamp)"
-	);
-	assert_eq!(table.meta.properties.newest_key_time, Some(1000), "newest_key_time should be 1000");
-}
-
-/// Tests timestamp tracking with various insertion orders.
-#[test]
-fn test_timestamp_tracking_various_orders() {
-	// Test case 1: Ascending timestamps
-	{
-		let opts = default_opts();
-		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
-
-		for (i, ts) in [100u64, 200, 300].iter().enumerate() {
-			let key = format!("key_{i:02}");
-			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), 1, InternalKeyKind::Set, *ts);
-			writer.add(internal_key, b"value").unwrap();
-		}
-
-		let size = writer.finish().unwrap();
-		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
-
-		assert_eq!(table.meta.properties.oldest_key_time, Some(100));
-		assert_eq!(table.meta.properties.newest_key_time, Some(300));
-	}
-
-	// Test case 2: Descending timestamps
-	{
-		let opts = default_opts();
-		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
-
-		for (i, ts) in [300u64, 200, 100].iter().enumerate() {
-			let key = format!("key_{i:02}");
-			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), 1, InternalKeyKind::Set, *ts);
-			writer.add(internal_key, b"value").unwrap();
-		}
-
-		let size = writer.finish().unwrap();
-		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
-
-		assert_eq!(table.meta.properties.oldest_key_time, Some(100));
-		assert_eq!(table.meta.properties.newest_key_time, Some(300));
-	}
-
-	// Test case 3: Random order with 0
-	{
-		let opts = default_opts();
-		let mut buffer = Vec::new();
-		let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
-
-		for (i, ts) in [500u64, 0, 1000, 250].iter().enumerate() {
-			let key = format!("key_{i:02}");
-			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), 1, InternalKeyKind::Set, *ts);
-			writer.add(internal_key, b"value").unwrap();
-		}
-
-		let size = writer.finish().unwrap();
-		let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
-
-		assert_eq!(table.meta.properties.oldest_key_time, Some(0));
-		assert_eq!(table.meta.properties.newest_key_time, Some(1000));
-	}
-}
-
-/// Tests that a single entry correctly sets both smallest=largest and oldest=newest.
+	/// Tests that a single entry correctly sets both smallest=largest and oldest=newest.
 #[test]
 fn test_single_entry_metadata() {
 	let opts = default_opts();
@@ -4932,9 +4837,9 @@ fn test_single_entry_metadata() {
 	assert_eq!(table.meta.largest_seq_num, Some(42));
 	assert_eq!(table.meta.properties.seqnos, (42, 42));
 
-	// Both oldest and newest should be 12345
-	assert_eq!(table.meta.properties.oldest_key_time, Some(12345));
-	assert_eq!(table.meta.properties.newest_key_time, Some(12345));
+	// Both oldest and newest should be 0 (in-tree timestamps removed in V2)
+	assert_eq!(table.meta.properties.oldest_key_time, Some(0));
+	assert_eq!(table.meta.properties.newest_key_time, Some(0));
 }
 
 /// Tests that metadata survives encode/decode roundtrip with edge values.

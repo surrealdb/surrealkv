@@ -3,7 +3,7 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX, INTERNAL_KEY_TIMESTAMP_MAX};
+use crate::{InternalKey, InternalKeyKind, INTERNAL_KEY_SEQ_NUM_MAX};
 
 /// A trait for comparing keys in a key-value store.
 ///
@@ -188,7 +188,7 @@ impl Comparator for InternalKeyComparator {
 					sep,
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
-					INTERNAL_KEY_TIMESTAMP_MAX,
+					0,
 				);
 				return result.encode();
 			}
@@ -212,7 +212,7 @@ impl Comparator for InternalKeyComparator {
 				user_key_succ,
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
-				INTERNAL_KEY_TIMESTAMP_MAX,
+				0,
 			);
 			return result.encode();
 		}
@@ -244,11 +244,17 @@ impl Comparator for TimestampComparator {
 	}
 
 	fn compare(&self, a: &[u8], b: &[u8]) -> Ordering {
-		// Decode internal keys using InternalKey
-		let key_a = InternalKey::decode(a);
-		let key_b = InternalKey::decode(b);
-		// Use the timestamp-based comparison method
-		key_a.cmp_by_timestamp(&key_b)
+		let user_key_a = InternalKey::user_key_from_encoded(a);
+		let user_key_b = InternalKey::user_key_from_encoded(b);
+
+		match self.user_comparator.compare(user_key_a, user_key_b) {
+			Ordering::Equal => {
+				let seq_a = InternalKey::seq_num_from_encoded(a);
+				let seq_b = InternalKey::seq_num_from_encoded(b);
+				seq_b.cmp(&seq_a)
+			}
+			ord => ord,
+		}
 	}
 
 	/// Generates a separator key between two internal keys.
@@ -281,7 +287,7 @@ impl Comparator for TimestampComparator {
 					sep,
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
-					INTERNAL_KEY_TIMESTAMP_MAX,
+					0,
 				);
 				return result.encode();
 			}
@@ -306,7 +312,7 @@ impl Comparator for TimestampComparator {
 				user_key_succ,
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
-				INTERNAL_KEY_TIMESTAMP_MAX,
+				0,
 			);
 			return result.encode();
 		}
@@ -650,7 +656,7 @@ mod tests {
 			user_key.to_vec(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
-			INTERNAL_KEY_TIMESTAMP_MAX,
+			0,
 		)
 		.encode()
 	}
@@ -877,7 +883,7 @@ mod tests {
 			b"foo".to_vec(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
-			INTERNAL_KEY_TIMESTAMP_MAX,
+			0,
 		)
 		.encode();
 

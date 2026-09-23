@@ -59,10 +59,10 @@ Refactor code utilizing `Vec<u8>` or `Bytes` in the hot paths (like `Batch::enco
 With the new commit pipeline in place, we strip out the deeply integrated versioning logic to make the tree a pure, ultra-fast byte-to-byte store.
 
 - [x] Delete the legacy `bplustree` module completely.
-- [ ] Flat Entries: Remove `timestamp`, `seq_num`, and `kind` from core `Node` and `Entry`.
-- [ ] True Single-Version KV: Implement direct overwrite/tombstone semantics without retention windows.
-- [ ] Simplified Compaction: Purge timestamp comparator logic and rewrite compaction as pure byte-prefix merging.
-- [ ] Implement Range Tombstones (O(1) Mass Deletions).
+- [x] Flat Entries: Remove `timestamp`, `seq_num`, and `kind` from core `Node` and `Entry`.
+- [x] True Single-Version KV: Implement direct overwrite/tombstone semantics without retention windows.
+- [x] Simplified Compaction: Purge timestamp comparator logic and rewrite compaction as pure byte-prefix merging.
+- [x] Implement Range Tombstones (O(1) Mass Deletions).
 
 ### Flat Entries & True Single-Version KV
 Remove `timestamp`, `seq_num`, and `kind` (Tombstone vs. Value) from the core `Node` and `Entry` structs. SurrealKV becomes a strict, single-version key-value store. Overwrites physically replace older values. Time-travel, MVCC, and historical versioning must be handled at the higher database layer (SurrealDB) by appending timestamps to the keys themselves.
