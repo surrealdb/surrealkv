@@ -4,18 +4,17 @@ use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arc_swap::ArcSwap;
+use parking_lot::RwLock;
 
 /// Defines the logical clock that SurrealKV will use to measure
 /// commit timestamps and retention periods checks.
 pub trait LogicalClock: Debug + Send + Sync {
-	/// Returns a timestamp (typically measured in nanoseconds since the unix
-	/// epoch). Must return monotonically increasing numbers.
+	/// Returns the current logical timestamp.
+	/// Guarantees monotonicity: each call returns a value > previous calls.
 	fn now(&self) -> u64;
 }
 
-/// A logical clock implementation that wraps the system clock
-/// and returns the number of nanoseconds since the Unix epoch.
+/// A high-performance logical clock that combines wall-clock time with monotonicity.
 ///
 /// Uses a background thread to periodically sync with system time,
 /// and fast monotonic `Instant::now()` for high-performance time queries
@@ -36,7 +35,7 @@ pub struct DefaultLogicalClockInner {
 	/// The latest monotonic counter for this oracle
 	timestamp: AtomicU64,
 	/// Reference time when this clock was last synced with system clock
-	reference: ArcSwap<(u64, Instant)>,
+	reference: RwLock<(u64, Instant)>,
 	/// Specifies whether timestamp syncing is enabled in the background
 	resync_enabled: AtomicBool,
 	/// Stores a handle to the current timestamp syncing background thread
@@ -71,7 +70,7 @@ impl DefaultLogicalClock {
 		let clock = Self {
 			inner: Arc::new(DefaultLogicalClockInner {
 				timestamp: AtomicU64::new(reference_unix),
-				reference: ArcSwap::new(Arc::new((reference_unix, reference_time))),
+				reference: RwLock::new((reference_unix, reference_time)),
 				resync_enabled: AtomicBool::new(true),
 				resync_handle: Mutex::new(None),
 				resync_interval: Duration::from_secs(1),
@@ -102,7 +101,7 @@ impl DefaultLogicalClock {
 	#[inline]
 	pub(crate) fn current_time_ns(&self) -> u64 {
 		// Get the current reference time
-		let reference = self.inner.reference.load();
+		let reference = *self.inner.reference.read();
 		// Calculate the nanoseconds since the Unix epoch
 		reference.0 + reference.1.elapsed().as_nanos() as u64
 	}
@@ -135,7 +134,7 @@ impl DefaultLogicalClock {
 				// Get a new monotonically increasing clock
 				let reference_time = Instant::now();
 				// Store the timestamp and monotonic instant
-				inner.reference.store(Arc::new((reference_unix, reference_time)));
+				*inner.reference.write() = (reference_unix, reference_time);
 			}
 		});
 		// Store and track the thread handle
