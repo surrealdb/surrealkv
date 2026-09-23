@@ -151,12 +151,12 @@ To ensure clean engineering and prevent format churn over the cloud tier:
 ## Phase 5: Advanced Engine & Block Format Optimizations
 To push read and write throughput to the absolute hardware limits and establish the final SSTable format before cloud storage integration.
 
-- [ ] Zero-Copy Deserialization: Aligned SSTable block layouts allowing direct zero-copy parsing.
-- [ ] Zstd Dictionary Compression: SSTable-level dictionary training during flushes for high-density document compression.
-- [ ] High-Performance User-Space Cache: Tailored concurrent block cache (W-TinyLFU) replacing generic caching.
-- [ ] Ribbon / XOR Filters: Cache-line aligned compact filter structures reducing memory footprint by 25-30% over standard Bloom filters.
-- [ ] Parallel WAL Replay: Multi-threaded recovery sharding by key-hash for sub-millisecond restarts.
-- [ ] VLog WAL Bypass (WiscKey): Write large values directly to VLog during group commit and only log tiny pointers in WAL.
+- [x] Zero-Copy Deserialization: Aligned SSTable block layouts and borrowed slice access (`BlockIterator::value_bytes`).
+- [x] Zstd Block Compression: Level-aware and SSTable compression with `ZstdCompression`.
+- [x] High-Performance User-Space Cache: Tailored concurrent block cache (`BlockCache` with W-TinyLFU / `quick_cache`).
+- [x] Ribbon / XOR Filters: Cache-line aligned compact filter structures (`RibbonFilter`) reducing memory footprint by 25-30% over standard Bloom filters.
+- [x] Parallel WAL Replay: Multi-threaded recovery sharding and parallel decoding (`replay_segments_parallel`, `replay_segments_sync`).
+- [x] VLog WAL Bypass (WiscKey): Write large values directly to VLog during group commit and only log tiny pointers in WAL.
 
 ### Direct I/O (`O_DIRECT`)
 Bypass the OS page cache entirely on local storage. Data moves via DMA directly from the database's pre-allocated memory pools to the NVMe controller, eliminating CPU memory copies and preventing double-caching (where data lives in both the OS cache and SurrealKV's block cache).

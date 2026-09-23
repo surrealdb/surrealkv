@@ -65,19 +65,24 @@ pub(crate) fn replay_segments_sync(
 	segments: &[SegmentRef],
 	arena_size: usize,
 ) -> Result<ParallelReplayResult> {
-	let handle = tokio::runtime::Handle::try_current();
-	match handle {
-		Ok(h) => tokio::task::block_in_place(|| {
-			h.block_on(replay_segments_parallel(segments, arena_size))
-		}),
-		Err(_) => {
-			let rt = tokio::runtime::Builder::new_current_thread()
-				.enable_all()
-				.build()
-				.map_err(|e| Error::Other(e.to_string()))?;
-			rt.block_on(replay_segments_parallel(segments, arena_size))
+	if let Ok(handle) = tokio::runtime::Handle::try_current() {
+		if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+			return tokio::task::block_in_place(|| {
+				handle.block_on(replay_segments_parallel(segments, arena_size))
+			});
 		}
 	}
+
+	let segs = segments.to_vec();
+	std::thread::spawn(move || {
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.map_err(|e| Error::Other(e.to_string()))?;
+		rt.block_on(replay_segments_parallel(&segs, arena_size))
+	})
+	.join()
+	.map_err(|_| Error::Other("Parallel WAL recovery thread panicked".to_string()))?
 }
 
 /// Replays a slice of segments in parallel using affinitypool, applying batches
