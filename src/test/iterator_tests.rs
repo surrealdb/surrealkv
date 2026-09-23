@@ -4,7 +4,6 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
-use crate::clock::{LogicalClock, MockLogicalClock};
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::iter::{BoxedLSMIterator, CompactionIterator, MergingIterator};
 use crate::sstable::table::{Table, TableWriter};
@@ -16,16 +15,16 @@ use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, VLogChecksumLeve
 static TEST_TABLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn create_internal_key(user_key: &str, sequence: u64, kind: InternalKeyKind) -> InternalKey {
-	InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, 0)
+	InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind)
 }
 
 fn create_internal_key_with_timestamp(
 	user_key: &str,
 	sequence: u64,
 	kind: InternalKeyKind,
-	timestamp: u64,
+	_timestamp: u64,
 ) -> InternalKey {
-	InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind, timestamp)
+	InternalKey::new(user_key.as_bytes().to_vec(), sequence, kind)
 }
 
 fn create_test_vlog() -> (Arc<VLog>, TempDir) {
@@ -112,9 +111,6 @@ fn test_merge_iterator_sequence_ordering() {
 		vec![iter1, iter2],
 		create_comparator(),
 		false,
-		false, // versioning disabled
-		0,
-		Arc::new(MockLogicalClock::new()),
 		vec![],
 	);
 
@@ -191,9 +187,6 @@ fn test_compaction_iterator_hard_delete_filtering() {
 		vec![iter1, iter2],
 		create_comparator(),
 		false,
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
 		vec![],
 	);
 
@@ -264,10 +257,7 @@ fn test_compaction_iterator_hard_delete_filtering() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		create_comparator(),
-		true, // bottom level
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
+		true,
 		vec![],
 	);
 
@@ -320,10 +310,7 @@ async fn test_combined_iterator_returns_latest_version() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		create_comparator(),
-		false, // not bottom level
 		false,
-		0,
-		Arc::new(MockLogicalClock::default()),
 		vec![],
 	);
 
@@ -366,10 +353,7 @@ async fn test_combined_iterator_adds_older_versions_to_delete_list() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		create_comparator(),
-		false, // not bottom level
 		false,
-		0,
-		Arc::new(MockLogicalClock::default()),
 		vec![],
 	);
 
@@ -406,10 +390,7 @@ async fn test_hard_delete_at_bottom_level() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		create_comparator(),
-		true, // bottom level
-		false,
-		0,
-		Arc::new(MockLogicalClock::default()),
+		true,
 		vec![],
 	);
 
@@ -438,10 +419,7 @@ async fn test_hard_delete_at_non_bottom_level() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		create_comparator(),
-		false, // not bottom level
 		false,
-		0,
-		Arc::new(MockLogicalClock::default()),
 		vec![],
 	);
 
@@ -489,10 +467,7 @@ async fn test_multiple_keys_with_mixed_scenarios() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		create_comparator(),
-		false, // not bottom level
 		false,
-		0,
-		Arc::new(MockLogicalClock::default()),
 		vec![],
 	);
 
@@ -542,10 +517,7 @@ fn test_no_vlog_no_delete_list() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		create_comparator(),
-		false, // not bottom level
 		false,
-		0,
-		Arc::new(MockLogicalClock::default()),
 		vec![],
 	);
 
@@ -604,10 +576,7 @@ async fn test_sequence_ordering_across_iterators() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		create_comparator(),
-		false, // not bottom level
 		false,
-		0,
-		Arc::new(MockLogicalClock::default()),
 		vec![],
 	);
 
@@ -646,7 +615,6 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 
 	// Use fixed current time for consistent testing
 	let current_time = 1000000000000; // Fixed current time
-	let retention_period_ns = 5_000_000_000; // 5 seconds
 
 	// Create keys with different timestamps and operations
 	let recent_time = current_time - 1_000_000_000; // 1 second ago (within retention)
@@ -710,14 +678,10 @@ async fn test_compaction_iterator_versioning_retention_logic() {
 	let iter3 = build_table_iterator(items3);
 
 	// Test with versioning enabled and 5-second retention period
-	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		create_comparator(),
-		false, // not bottom level
-		true,  // enable versioning
-		retention_period_ns,
-		clock,
+		false,
 		vec![],
 	);
 
@@ -751,7 +715,6 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 
 	// Use fixed current time for consistent testing
 	let current_time = 1000000000000; // Fixed current time
-	let retention_period_ns = 5_000_000_000; // 5 seconds
 
 	// Create keys with different timestamps and operations
 	let recent_time = current_time - 1_000_000_000; // 1 second ago (within retention)
@@ -822,14 +785,10 @@ async fn test_compaction_iterator_versioning_retention_bottom_level() {
 	let iter4 = build_table_iterator(items4);
 
 	// Test with versioning enabled, 5-second retention period, and BOTTOM LEVEL
-	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3, iter4],
 		create_comparator(),
-		true, // BOTTOM LEVEL - delete markers should be dropped
-		true, // enable versioning
-		retention_period_ns,
-		clock,
+		true,
 		vec![],
 	);
 
@@ -880,7 +839,6 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 
 	// Use fixed current time for consistent testing
 	let current_time = 1000000000000; // Fixed current time
-	let retention_period_ns = 0; // No retention period (versioning disabled)
 
 	// Create keys with different timestamps and operations
 	let recent_time = current_time - 1_000_000_000; // 1 second ago
@@ -934,14 +892,10 @@ async fn test_compaction_iterator_no_versioning_non_bottom_level() {
 	let iter3 = build_table_iterator(items3);
 
 	// Test with versioning DISABLED at NON-BOTTOM level
-	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		create_comparator(),
-		false, // NON-BOTTOM LEVEL
-		false, // VERSIONING DISABLED
-		retention_period_ns,
-		clock,
+		false,
 		vec![],
 	);
 
@@ -985,7 +939,6 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 
 	// Use fixed current time for consistent testing
 	let current_time = 1000000000000; // Fixed current time
-	let retention_period_ns = 0; // No retention period (versioning disabled)
 
 	// Create keys with different timestamps and operations
 	let recent_time = current_time - 1_000_000_000; // 1 second ago
@@ -1039,14 +992,10 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 	let iter3 = build_table_iterator(items3);
 
 	// Test with versioning DISABLED at BOTTOM level
-	let clock = Arc::new(MockLogicalClock::with_timestamp(current_time));
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2, iter3],
 		create_comparator(),
-		true,  // BOTTOM LEVEL
-		false, // VERSIONING DISABLED
-		retention_period_ns,
-		clock,
+		true,
 		vec![],
 	);
 
@@ -1083,7 +1032,6 @@ async fn test_compaction_iterator_no_versioning_bottom_level() {
 #[test(tokio::test)]
 async fn test_compaction_iterator_set_with_delete_behavior() {
 	let (vlog, _tmp_dir) = create_test_vlog();
-	let clock = Arc::new(MockLogicalClock::new());
 
 	// Create test data with Replace operations
 	let mut items1 = Vec::new();
@@ -1111,10 +1059,7 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		create_comparator(),
-		false, // non-bottom level
-		true,  // enable versioning
-		1000,  // retention period
-		clock,
+		false,
 		vec![],
 	);
 
@@ -1133,7 +1078,6 @@ async fn test_compaction_iterator_set_with_delete_behavior() {
 #[test(tokio::test)]
 async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 	let (vlog, _tmp_dir) = create_test_vlog();
-	let clock = Arc::new(MockLogicalClock::new());
 
 	// Create test data with multiple versions and Replace
 	let mut items1 = Vec::new();
@@ -1170,10 +1114,7 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		create_comparator(),
-		false, // non-bottom level
-		true,  // enable versioning
-		1000,  // retention period
-		clock,
+		false,
 		vec![],
 	);
 
@@ -1192,7 +1133,6 @@ async fn test_compaction_iterator_set_with_delete_marks_older_versions_stale() {
 #[test(tokio::test)]
 async fn test_compaction_iterator_set_with_delete_latest_version() {
 	let (vlog, _tmp_dir) = create_test_vlog();
-	let clock = Arc::new(MockLogicalClock::new());
 
 	// Create test data where Replace is the latest version
 	let mut items1 = Vec::new();
@@ -1220,10 +1160,7 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		create_comparator(),
-		false, // non-bottom level
-		true,  // enable versioning
-		1000,  // retention period
-		clock,
+		false,
 		vec![],
 	);
 
@@ -1242,7 +1179,6 @@ async fn test_compaction_iterator_set_with_delete_latest_version() {
 #[test(tokio::test)]
 async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 	let (vlog, _tmp_dir) = create_test_vlog();
-	let clock = Arc::new(MockLogicalClock::new());
 
 	// Create test data with Replace and hard delete operations
 	let mut items1 = Vec::new();
@@ -1270,10 +1206,7 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter1, iter2],
 		create_comparator(),
-		false, // non-bottom level
-		true,  // enable versioning
-		1000,  // retention period
-		clock,
+		false,
 		vec![],
 	);
 
@@ -1292,7 +1225,6 @@ async fn test_compaction_iterator_set_with_delete_mixed_with_hard_delete() {
 #[test(tokio::test)]
 async fn test_compaction_iterator_multiple_replace_operations() {
 	let (vlog, _tmp_dir) = create_test_vlog();
-	let clock = Arc::new(MockLogicalClock::new());
 
 	// Test case 1: Multiple Replace operations for the same key
 	// Only the latest Replace should be preserved
@@ -1320,14 +1252,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test non-bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2],
-			create_comparator(),
-			false, // non-bottom level
-			true,  // enable versioning
-			1000,  // retention period
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2],
+		create_comparator(),
+		false,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1367,14 +1296,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2],
-			create_comparator(),
-			true, // bottom level
-			true, // enable versioning
-			1000, // retention period
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2],
+		create_comparator(),
+		true,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1418,14 +1344,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test compaction
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2],
-			create_comparator(),
-			false, // non-bottom level
-			true,  // enable versioning
-			1000,  // retention period
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2],
+		create_comparator(),
+		false,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1469,14 +1392,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test compaction
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2],
-			create_comparator(),
-			false, // non-bottom level
-			true,  // enable versioning
-			1000,  // retention period
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2],
+		create_comparator(),
+		false,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1535,14 +1455,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test compaction
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2, iter3],
-			create_comparator(),
-			false, // non-bottom level
-			true,  // enable versioning
-			1000,  // retention period
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2, iter3],
+		create_comparator(),
+		false,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1579,14 +1496,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test non-bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2],
-			create_comparator(),
-			false, // non-bottom level
-			true,  // enable versioning
-			1000,  // retention period
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2],
+		create_comparator(),
+		false,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1623,14 +1537,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2],
-			create_comparator(),
-			true, // bottom level
-			true, // enable versioning
-			1000, // retention period
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2],
+		create_comparator(),
+		true,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1674,14 +1585,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test non-bottom level compaction
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2, iter3],
-			create_comparator(),
-			false, // non-bottom level
-			true,  // enable versioning
-			1000,  // retention period
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2, iter3],
+		create_comparator(),
+		false,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1722,14 +1630,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2],
-			create_comparator(),
-			false, // non-bottom level
-			false, // versioning disabled
-			1000,  // retention period (ignored when versioning is disabled)
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2],
+		create_comparator(),
+		false,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1772,14 +1677,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2, iter3],
-			create_comparator(),
-			false, // non-bottom level
-			false, // versioning disabled
-			1000,  // retention period (ignored when versioning is disabled)
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2, iter3],
+		create_comparator(),
+		false,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1816,14 +1718,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test non-bottom level compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2],
-			create_comparator(),
-			false, // non-bottom level
-			false, // versioning disabled
-			1000,  // retention period (ignored when versioning is disabled)
-			Arc::clone(&clock) as Arc<dyn LogicalClock>,
-			vec![],
-		);
+		vec![iter1, iter2],
+		create_comparator(),
+		false,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -1860,14 +1759,11 @@ async fn test_compaction_iterator_multiple_replace_operations() {
 
 		// Test bottom level compaction without versioning
 		let mut comp_iter = CompactionIterator::new(
-			vec![iter1, iter2],
-			create_comparator(),
-			true,  // bottom level
-			false, // versioning disabled
-			1000,  // retention period (ignored when versioning is disabled)
-			clock,
-			vec![],
-		);
+		vec![iter1, iter2],
+		create_comparator(),
+		true,
+		vec![],
+	);
 
 		let mut result = Vec::new();
 		for item in comp_iter.by_ref() {
@@ -2079,11 +1975,8 @@ fn test_snapshot_compaction_no_snapshots_keeps_only_latest() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter],
 		create_comparator(),
-		false, // not bottom level
-		false, // versioning disabled
-		0,
-		Arc::new(MockLogicalClock::new()),
-		vec![], // No snapshots
+		false,
+		vec![],
 	);
 
 	let mut result = Vec::new();
@@ -2115,10 +2008,7 @@ fn test_snapshot_compaction_single_snapshot_preserves_visible_version() {
 		vec![iter],
 		create_comparator(),
 		false,
-		false, // versioning disabled
-		0,
-		Arc::new(MockLogicalClock::new()),
-		vec![50], // Snapshot at seq=50
+		vec![50],
 	);
 
 	let mut result = Vec::new();
@@ -2159,10 +2049,7 @@ fn test_snapshot_compaction_multiple_snapshots_different_boundaries() {
 		vec![iter],
 		create_comparator(),
 		false,
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
-		vec![50, 150], // Two snapshots
+		vec![50, 150],
 	);
 
 	let mut result = Vec::new();
@@ -2207,10 +2094,7 @@ fn test_snapshot_compaction_newer_version_hides_older_in_same_boundary() {
 		vec![iter],
 		create_comparator(),
 		false,
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
-		vec![150], // Snapshot at seq=150
+		vec![150],
 	);
 
 	let mut result = Vec::new();
@@ -2242,10 +2126,7 @@ fn test_snapshot_compaction_versions_at_tip_hidden_by_newer() {
 		vec![iter],
 		create_comparator(),
 		false,
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
-		vec![50], // Snapshot at seq=50
+		vec![50],
 	);
 
 	let mut result = Vec::new();
@@ -2278,10 +2159,7 @@ fn test_snapshot_compaction_multiple_keys() {
 		vec![iter],
 		create_comparator(),
 		false,
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
-		vec![50], // Snapshot at seq=50
+		vec![50],
 	);
 
 	let mut result = Vec::new();
@@ -2311,10 +2189,7 @@ fn test_snapshot_compaction_tombstone_visible_to_snapshot() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter],
 		create_comparator(),
-		false, // NOT bottom level - tombstone must be preserved
 		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
 		vec![150],
 	);
 
@@ -2349,10 +2224,7 @@ fn test_snapshot_compaction_tombstone_at_bottom_with_snapshot() {
 	let mut comp_iter = CompactionIterator::new(
 		vec![iter],
 		create_comparator(),
-		true, // Bottom level
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
+		true,
 		vec![150],
 	);
 
@@ -2383,10 +2255,7 @@ fn test_snapshot_compaction_exact_sequence_match() {
 		vec![iter],
 		create_comparator(),
 		false,
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
-		vec![50], // Snapshot at exact seq=50
+		vec![50],
 	);
 
 	let mut result = Vec::new();
@@ -2420,9 +2289,6 @@ fn test_snapshot_compaction_version_older_than_all_snapshots() {
 		vec![iter],
 		create_comparator(),
 		false,
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
 		vec![50, 150],
 	);
 
@@ -2449,10 +2315,7 @@ fn test_snapshot_visibility_states() {
 		vec![iter],
 		create_comparator(),
 		false,
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
-		vec![], // No snapshots
+		vec![],
 	);
 
 	// Test via the iterator behavior - with no snapshots, should keep only latest
@@ -2466,9 +2329,6 @@ fn test_snapshot_visibility_states() {
 /// Test: Snapshot-aware compaction with versioning enabled
 #[test]
 fn test_snapshot_compaction_with_versioning_enabled() {
-	let clock = Arc::new(MockLogicalClock::new());
-	clock.set_time(1000); // Current time = 1000
-
 	// Versions with different timestamps
 	let items = vec![
 		(
@@ -2486,9 +2346,6 @@ fn test_snapshot_compaction_with_versioning_enabled() {
 		vec![iter],
 		create_comparator(),
 		false,
-		true,  // versioning enabled
-		300,   // retention period = 300ns
-		clock, // current time = 1000
 		vec![60],
 	);
 

@@ -6,7 +6,6 @@ use std::sync::{Arc, RwLock};
 use tempfile::TempDir;
 use test_log::test;
 
-use crate::clock::MockLogicalClock;
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::leveled::{CompactionPriority, Strategy};
 use crate::compaction::{CompactionChoice, CompactionStrategy};
@@ -103,7 +102,7 @@ fn create_test_entries(
 	for key_val in min_key..=max_key {
 		let user_key = format!("key-{key_val:010}").into_bytes();
 		let key =
-			InternalKey::new(user_key, min_seq + (key_val - min_key), InternalKeyKind::Set, 0);
+			InternalKey::new(user_key, min_seq + (key_val - min_key), InternalKeyKind::Set);
 		let value = format!("{value_prefix}-{key_val}").into_bytes();
 		let encoded_value = create_inline_value(&value);
 		entries.push((key, encoded_value));
@@ -125,7 +124,7 @@ fn create_ordered_entries(
 	for i in 0..count {
 		let key = format!("{}-{:05}", key_prefix, start + i).into_bytes();
 		let value = format!("{}-{:05}", value_prefix, start + i).into_bytes();
-		let internal_key = InternalKey::new(key, seq_num + i as u64, InternalKeyKind::Set, 0);
+		let internal_key = InternalKey::new(key, seq_num + i as u64, InternalKeyKind::Set);
 		let encoded_value = create_inline_value(&value);
 		entries.push((internal_key, encoded_value));
 	}
@@ -541,7 +540,7 @@ fn generate_entries(
 	for i in 0..keys_per_table {
 		// Create a key with table and index - format: "table{:02d}-key-{:03d}"
 		let key = format!("table{table_idx:02}-key-{i:03}").into_bytes();
-		let internal_key = InternalKey::new(key, seq_num, InternalKeyKind::Set, 0);
+		let internal_key = InternalKey::new(key, seq_num, InternalKeyKind::Set);
 
 		// Create a value that's predictable - format: "value-{:02d}-{:03d}"
 		let value = format!("value-{table_idx:02}-{i:03}").into_bytes();
@@ -710,7 +709,7 @@ async fn test_multi_level_merge_compaction() {
 		for i in 0..keys_per_table {
 			let idx = start_idx + i;
 			let key = format!("L{level}-T{table_idx:02}-K-{idx:05}").into_bytes();
-			let internal_key = InternalKey::new(key, seq_num, InternalKeyKind::Set, 0);
+			let internal_key = InternalKey::new(key, seq_num, InternalKeyKind::Set);
 			let value = format!("V-{level}-{table_idx:02}-{idx:05}").into_bytes();
 			let encoded_value = create_inline_value(&value);
 			entries.push((internal_key, encoded_value));
@@ -1285,7 +1284,7 @@ async fn test_compaction_with_large_keys_and_values() {
 		let value_padding = "Y".repeat(4000);
 		let value = format!("{value_base}{value_padding}").into_bytes();
 
-		let internal_key = InternalKey::new(key, 1000, InternalKeyKind::Set, 0);
+		let internal_key = InternalKey::new(key, 1000, InternalKeyKind::Set);
 
 		large_entries.push((internal_key, value));
 	}
@@ -1357,7 +1356,7 @@ async fn test_compaction_respects_sequence_numbers() {
 			let encoded_value = create_inline_value(&value_encoded);
 
 			let internal_key =
-				InternalKey::new(key_bytes.clone(), (base_seq + j) as u64, InternalKeyKind::Set, 0);
+				InternalKey::new(key_bytes.clone(), (base_seq + j) as u64, InternalKeyKind::Set);
 
 			entries.push((internal_key, encoded_value));
 
@@ -1451,7 +1450,7 @@ async fn test_tombstone_propagation() {
 		// Add tombstone first (higher sequence number) for 95% of keys
 		if i < 95 {
 			let delete_key =
-				InternalKey::new(key_bytes.clone(), 300 + i, InternalKeyKind::Delete, 0);
+				InternalKey::new(key_bytes.clone(), 300 + i, InternalKeyKind::Delete);
 			all_entries.push((delete_key, vec![]));
 		}
 
@@ -1459,7 +1458,7 @@ async fn test_tombstone_propagation() {
 		let value_encoded = format!("original-value-{i}").into_bytes();
 		let encoded_value = create_inline_value(&value_encoded);
 
-		let set_key = InternalKey::new(key_bytes, 100 + i, InternalKeyKind::Set, 0);
+		let set_key = InternalKey::new(key_bytes, 100 + i, InternalKeyKind::Set);
 		all_entries.push((set_key, encoded_value));
 	}
 
@@ -1527,7 +1526,7 @@ async fn test_l0_overlapping_keys_compaction() {
 		let value_encoded = format!("value-from-table1-{i}").into_bytes();
 		let encoded_value = create_inline_value(&value_encoded);
 
-		let internal_key = InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0);
+		let internal_key = InternalKey::new(key, 100 + i, InternalKeyKind::Set);
 		entries1.push((internal_key, encoded_value));
 	}
 
@@ -1538,7 +1537,7 @@ async fn test_l0_overlapping_keys_compaction() {
 		let value_encoded = format!("value-from-table2-{i}").into_bytes();
 		let encoded_value = create_inline_value(&value_encoded);
 
-		let internal_key = InternalKey::new(key, 150 + i - 10, InternalKeyKind::Set, 0);
+		let internal_key = InternalKey::new(key, 150 + i - 10, InternalKeyKind::Set);
 		entries2.push((internal_key, encoded_value));
 	}
 
@@ -1549,12 +1548,12 @@ async fn test_l0_overlapping_keys_compaction() {
 		let value_encoded = format!("value-from-table3-{i}").into_bytes();
 		let encoded_value = create_inline_value(&value_encoded);
 
-		let internal_key = InternalKey::new(key, 200 + i - 8, InternalKeyKind::Set, 0);
+		let internal_key = InternalKey::new(key, 200 + i - 8, InternalKeyKind::Set);
 		entries3.push((internal_key, encoded_value));
 	}
 	// Add tombstone that should win over other tables
 	let tombstone_key = "key-014".as_bytes().to_vec();
-	let tombstone = InternalKey::new(tombstone_key, 210, InternalKeyKind::Delete, 0);
+	let tombstone = InternalKey::new(tombstone_key, 210, InternalKeyKind::Delete);
 	entries3.push((tombstone, vec![]));
 
 	// Create tables and add to L0
@@ -1655,7 +1654,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 		let value_encoded = format!("original-value-{i}").into_bytes();
 		let encoded_value = create_inline_value(&value_encoded);
 
-		entries1.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
+		entries1.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set), encoded_value));
 	}
 
 	// Table 2: Mixed updates/deletes (seq 150-159) for keys 5-14
@@ -1670,14 +1669,14 @@ async fn test_l0_tombstone_propagation_overlapping() {
 
 			(InternalKeyKind::Set, encoded_value)
 		};
-		entries2.push((InternalKey::new(key, 150 + i - 5, kind, 0), value));
+		entries2.push((InternalKey::new(key, 150 + i - 5, kind), value));
 	}
 
 	// Table 3: Final tombstones (seq 200+) for specific keys
 	let mut entries3 = Vec::new();
 	for i in [2, 8, 14, 17] {
 		let key = format!("key-{i:03}").into_bytes();
-		entries3.push((InternalKey::new(key, 200 + i / 2, InternalKeyKind::Delete, 0), vec![]));
+		entries3.push((InternalKey::new(key, 200 + i / 2, InternalKeyKind::Delete), vec![]));
 	}
 
 	// Add tables to L0
@@ -1789,7 +1788,7 @@ async fn test_tombstone_propagation_through_levels() {
 
 				(200 + i, InternalKeyKind::Set, encoded_value) // Odd keys = values
 			};
-			l2_entries.push((InternalKey::new(key, seq, kind, 0), value));
+			l2_entries.push((InternalKey::new(key, seq, kind), value));
 		}
 		let table = env.create_test_table(100 + table_idx, l2_entries).unwrap();
 		Arc::make_mut(&mut levels.get_levels_mut()[2]).insert(table);
@@ -1802,7 +1801,7 @@ async fn test_tombstone_propagation_through_levels() {
 		let value_encoded = format!("l3-old-value-{i}").into_bytes();
 		let encoded_value = create_inline_value(&value_encoded);
 
-		l3_entries.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
+		l3_entries.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set), encoded_value));
 	}
 	let l3_table = env.create_test_table(200, l3_entries).unwrap();
 	Arc::make_mut(&mut levels.get_levels_mut()[3]).insert(l3_table);
@@ -1875,13 +1874,13 @@ fn test_tombstone_propagation_journey() {
 
 	// Table 1: tombstone entry
 	let mut tombstone_entries = Vec::new();
-	let tombstone = InternalKey::new(key_bytes.clone(), 100, InternalKeyKind::Delete, 0);
+	let tombstone = InternalKey::new(key_bytes.clone(), 100, InternalKeyKind::Delete);
 	tombstone_entries.push((tombstone, vec![]));
 	let tombstone_table = env.create_test_table(100, tombstone_entries).unwrap();
 
 	// Table 2: older value entry
 	let mut value_entries = Vec::new();
-	let value_key = InternalKey::new(key_bytes, 50, InternalKeyKind::Set, 0);
+	let value_key = InternalKey::new(key_bytes, 50, InternalKeyKind::Set);
 
 	let value_encoded = b"old-value".to_vec();
 	let encoded_value = create_inline_value(&value_encoded);
@@ -1898,9 +1897,6 @@ fn test_tombstone_propagation_journey() {
 		iterators,
 		create_comparator(),
 		false,
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
 		vec![],
 	);
 	let non_bottom_result: Vec<_> = comp_iter_non_bottom.by_ref().map(|r| r.unwrap()).collect();
@@ -1920,9 +1916,6 @@ fn test_tombstone_propagation_journey() {
 		iterators,
 		create_comparator(),
 		true,
-		false,
-		0,
-		Arc::new(MockLogicalClock::new()),
 		vec![],
 	);
 	let bottom_result: Vec<_> = comp_iter_bottom.by_ref().map(|r| r.unwrap()).collect();
@@ -1962,7 +1955,7 @@ fn test_table_properties_population() {
 			_ => unreachable!(),
 		};
 
-		let internal_key = InternalKey::new(key, seq, kind, 0);
+		let internal_key = InternalKey::new(key, seq, kind);
 
 		let entry_value = match kind {
 			InternalKeyKind::Delete | InternalKeyKind::RangeDelete => vec![],
@@ -2072,7 +2065,7 @@ async fn test_soft_delete_compaction_behavior() {
 				let encoded_value = create_inline_value(&value_encoded);
 				(200 + i, InternalKeyKind::Set, encoded_value)
 			};
-			l0_entries.push((InternalKey::new(key, seq, kind, 0), value));
+			l0_entries.push((InternalKey::new(key, seq, kind), value));
 		}
 		let table = env.create_test_table(100 + table_idx, l0_entries.clone()).unwrap();
 		Arc::make_mut(&mut levels.get_levels_mut()[0]).insert(table);
@@ -2085,7 +2078,7 @@ async fn test_soft_delete_compaction_behavior() {
 		let value_encoded = format!("l1-old-value-{i}").into_bytes();
 		let encoded_value = create_inline_value(&value_encoded);
 
-		l1_entries.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set, 0), encoded_value));
+		l1_entries.push((InternalKey::new(key, 100 + i, InternalKeyKind::Set), encoded_value));
 	}
 	let l1_table = env.create_test_table(200, l1_entries.clone()).unwrap();
 	Arc::make_mut(&mut levels.get_levels_mut()[1]).insert(l1_table);
@@ -2222,7 +2215,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 
 	// Create L0 table with latest SoftDelete (seq 300)
 	let l0_entries = vec![(
-		InternalKey::new(key.clone(), 300, InternalKeyKind::SoftDelete, 0),
+		InternalKey::new(key.clone(), 300, InternalKeyKind::SoftDelete),
 		vec![], // SoftDelete has empty value
 	)];
 	let l0_table = env.create_test_table(100, l0_entries).unwrap();
@@ -2232,9 +2225,9 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 	let value_encoded = b"some-value".to_vec();
 	let encoded_value = create_inline_value(&value_encoded);
 	let l1_entries = vec![
-		(InternalKey::new(key.clone(), 200, InternalKeyKind::Set, 0), encoded_value),
+		(InternalKey::new(key.clone(), 200, InternalKeyKind::Set), encoded_value),
 		(
-			InternalKey::new(key, 100, InternalKeyKind::SoftDelete, 0),
+			InternalKey::new(key, 100, InternalKeyKind::SoftDelete),
 			vec![], // Older SoftDelete also has empty value
 		),
 	];
@@ -2425,13 +2418,13 @@ fn create_test_table_with_bounds(
 	let mut writer = crate::sstable::table::TableWriter::new(file, id, Arc::clone(opts), 0);
 
 	// Add smallest key
-	let small_key = InternalKey::new(smallest_key.to_vec(), 1, InternalKeyKind::Set, 0);
+	let small_key = InternalKey::new(smallest_key.to_vec(), 1, InternalKeyKind::Set);
 	let value = ValueLocation::with_inline_value(b"v".to_vec()).encode();
 	writer.add(small_key, &value).unwrap();
 
 	// Add largest key (if different)
 	if smallest_key != largest_key {
-		let large_key = InternalKey::new(largest_key.to_vec(), 2, InternalKeyKind::Set, 0);
+		let large_key = InternalKey::new(largest_key.to_vec(), 2, InternalKeyKind::Set);
 		writer.add(large_key, &value).unwrap();
 	}
 
@@ -2673,7 +2666,7 @@ fn test_expand_same_user_key_different_seq() {
 	let table_path1 = opts.sstable_file_path(1);
 	let file1 = File::create(&table_path1).unwrap();
 	let mut writer1 = crate::sstable::table::TableWriter::new(file1, 1, Arc::clone(&opts), 0);
-	let key1 = InternalKey::new(b"foo".to_vec(), 100, InternalKeyKind::Set, 0);
+	let key1 = InternalKey::new(b"foo".to_vec(), 100, InternalKeyKind::Set);
 	let value = ValueLocation::with_inline_value(b"v1".to_vec()).encode();
 	writer1.add(key1, &value).unwrap();
 	writer1.finish().unwrap();
@@ -2688,7 +2681,7 @@ fn test_expand_same_user_key_different_seq() {
 	let table_path2 = opts.sstable_file_path(2);
 	let file2 = File::create(&table_path2).unwrap();
 	let mut writer2 = crate::sstable::table::TableWriter::new(file2, 2, Arc::clone(&opts), 0);
-	let key2 = InternalKey::new(b"foo".to_vec(), 50, InternalKeyKind::Set, 0);
+	let key2 = InternalKey::new(b"foo".to_vec(), 50, InternalKeyKind::Set);
 	writer2.add(key2, &value).unwrap();
 	writer2.finish().unwrap();
 	let file2 = std::fs::File::open(&table_path2).unwrap();
@@ -2730,7 +2723,7 @@ fn create_entries_with_keys(keys: &[&str], seq_num: u64) -> Vec<(InternalKey, Ve
 	let mut entries = Vec::new();
 	for (i, key) in keys.iter().enumerate() {
 		let user_key = key.as_bytes().to_vec();
-		let internal_key = InternalKey::new(user_key, seq_num + i as u64, InternalKeyKind::Set, 0);
+		let internal_key = InternalKey::new(user_key, seq_num + i as u64, InternalKeyKind::Set);
 		let value = format!("value-{}", key).into_bytes();
 		let encoded_value = create_inline_value(&value);
 		entries.push((internal_key, encoded_value));

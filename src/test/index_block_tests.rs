@@ -13,7 +13,6 @@ use crate::{
 	LSMIterator,
 	Options,
 	INTERNAL_KEY_SEQ_NUM_MAX,
-	INTERNAL_KEY_TIMESTAMP_MAX,
 };
 
 fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
@@ -21,7 +20,7 @@ fn wrap_buffer(src: Vec<u8>) -> Arc<dyn File> {
 }
 
 fn create_internal_key(user_key: Vec<u8>, sequence: u64) -> Vec<u8> {
-	InternalKey::new(user_key, sequence, InternalKeyKind::Set, 0).encode()
+	InternalKey::new(user_key, sequence, InternalKeyKind::Set).encode()
 }
 
 #[test]
@@ -186,7 +185,6 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 		b"g".to_vec(),
 		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 
@@ -271,21 +269,18 @@ fn test_find_block_handle_by_key_different_user_keys() {
 		b"b".to_vec(),
 		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 	let sep_d = InternalKey::new(
 		b"d".to_vec(),
 		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 	let sep_e = InternalKey::new(
 		b"e".to_vec(),
 		INTERNAL_KEY_SEQ_NUM_MAX,
 		InternalKeyKind::Separator,
-		INTERNAL_KEY_TIMESTAMP_MAX,
 	)
 	.encode();
 
@@ -310,7 +305,6 @@ fn test_find_block_handle_by_key_different_user_keys() {
 				b"b".to_vec(),
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
-				INTERNAL_KEY_TIMESTAMP_MAX,
 			)
 			.encode(),
 			Some(0),
@@ -499,7 +493,7 @@ fn test_partitioned_index_seek_correctness() {
 
 	for (seq, key) in test_keys.iter().enumerate() {
 		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), (seq + 1) as u64, InternalKeyKind::Set, 0);
+			InternalKey::new(key.as_bytes().to_vec(), (seq + 1) as u64, InternalKeyKind::Set);
 		let value = format!("v-{key}").into_bytes();
 		writer.add(internal_key, &value).unwrap();
 	}
@@ -515,7 +509,7 @@ fn test_partitioned_index_seek_correctness() {
 	// Test Seek to existing keys
 	for (seq, key) in test_keys.iter().enumerate() {
 		let seek_key =
-			InternalKey::new(key.as_bytes().to_vec(), (seq + 1) as u64, InternalKeyKind::Set, 0);
+			InternalKey::new(key.as_bytes().to_vec(), (seq + 1) as u64, InternalKeyKind::Set);
 		let result = table.get(&seek_key).unwrap();
 		assert!(result.is_some(), "Should find key {key}");
 		if let Some((found_key, found_value)) = result {
@@ -535,7 +529,7 @@ fn test_partitioned_index_seek_correctness() {
 	// Test Seek to non-existing keys (between blocks)
 	let non_existing_keys = vec!["0016", "0036", "0053", "0059", "0074", "0077", "0094"];
 	for key in &non_existing_keys {
-		let seek_key = InternalKey::new(key.as_bytes().to_vec(), 100, InternalKeyKind::Set, 0);
+		let seek_key = InternalKey::new(key.as_bytes().to_vec(), 100, InternalKeyKind::Set);
 		let result = table.get(&seek_key).unwrap();
 		// Should either find the next key or return None
 		if let Some((found_key, _)) = result {
@@ -583,7 +577,7 @@ fn test_partitioned_index_boundary_keys() {
 	for i in 0..50 {
 		let key = format!("key_{i:03}");
 		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
 		let value = format!("value_{i:03}").into_bytes();
 		writer.add(internal_key, &value).unwrap();
 	}
@@ -598,12 +592,12 @@ fn test_partitioned_index_boundary_keys() {
 	assert!(partitioned_index.blocks.len() >= 2, "Should have at least 2 partitions");
 
 	// Test first key in first partition
-	let first_key = InternalKey::new(b"key_000".to_vec(), 1, InternalKeyKind::Set, 0);
+	let first_key = InternalKey::new(b"key_000".to_vec(), 1, InternalKeyKind::Set);
 	let result = table.get(&first_key).unwrap();
 	assert!(result.is_some(), "Should find first key");
 
 	// Test last key in last partition
-	let last_key = InternalKey::new(b"key_049".to_vec(), 50, InternalKeyKind::Set, 0);
+	let last_key = InternalKey::new(b"key_049".to_vec(), 50, InternalKeyKind::Set);
 	let result = table.get(&last_key).unwrap();
 	assert!(result.is_some(), "Should find last key");
 
@@ -620,7 +614,6 @@ fn test_partitioned_index_boundary_keys() {
 				sep_user_key.as_bytes().to_vec(),
 				sep_key.seq_num() + 1, // Higher seq = earlier in ordering
 				InternalKeyKind::Set,
-				0,
 			);
 			let result = table.get(&test_key).unwrap();
 			// Should find something (might be in previous partition)
@@ -650,7 +643,7 @@ fn test_partitioned_index_reseek() {
 
 	for (seq, key) in test_keys.iter().enumerate() {
 		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), (seq + 1) as u64, InternalKeyKind::Set, 0);
+			InternalKey::new(key.as_bytes().to_vec(), (seq + 1) as u64, InternalKeyKind::Set);
 		let value = format!("v-{key}").into_bytes();
 		writer.add(internal_key, &value).unwrap();
 	}
@@ -663,7 +656,7 @@ fn test_partitioned_index_reseek() {
 	let mut iter = table.iter(None).unwrap();
 
 	// Seek to middle key
-	let seek_key = InternalKey::new(b"0055".to_vec(), 4, InternalKeyKind::Set, 0);
+	let seek_key = InternalKey::new(b"0055".to_vec(), 4, InternalKeyKind::Set);
 	iter.seek(&seek_key.encode()).unwrap();
 	assert!(iter.valid(), "Iterator should be valid after seek");
 	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0055", "Should find key 0055");
@@ -703,7 +696,7 @@ fn test_partitioned_index_reseek() {
 	);
 
 	// Seek to 0095
-	let seek_key_0095 = InternalKey::new(b"0095".to_vec(), 10, InternalKeyKind::Set, 0);
+	let seek_key_0095 = InternalKey::new(b"0095".to_vec(), 10, InternalKeyKind::Set);
 	iter.seek(&seek_key_0095.encode()).unwrap();
 	assert!(iter.valid());
 	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0095", "Should find key 0095");
@@ -741,7 +734,7 @@ fn test_partitioned_index_reseek() {
 	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0075", "Should find key 0075");
 
 	// Seek to 0075
-	let seek_key_0075 = InternalKey::new(b"0075".to_vec(), 8, InternalKeyKind::Set, 0);
+	let seek_key_0075 = InternalKey::new(b"0075".to_vec(), 8, InternalKeyKind::Set);
 	iter.seek(&seek_key_0075.encode()).unwrap();
 	assert!(iter.valid());
 	assert_eq!(std::str::from_utf8(iter.key().user_key()).unwrap(), "0075", "Should find key 0075");
@@ -787,7 +780,7 @@ fn test_partitioned_index_varying_partition_sizes() {
 		for i in 0..20 {
 			let key = format!("key_{i:03}");
 			let internal_key =
-				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
 			let value = format!("value_{i:03}").into_bytes();
 			writer.add(internal_key, &value).unwrap();
 		}
@@ -801,7 +794,7 @@ fn test_partitioned_index_varying_partition_sizes() {
 		for i in 0..20 {
 			let key = format!("key_{i:03}");
 			let seek_key =
-				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set, 0);
+				InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
 			let result = table.get(&seek_key).unwrap();
 			assert!(result.is_some(), "Should find key {key} at partition_size {partition_size}");
 			if let Some((found_key, found_value)) = result {

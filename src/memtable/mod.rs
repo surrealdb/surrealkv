@@ -244,7 +244,7 @@ impl MemTable {
 
 		// Process entries with pre-encoded ValueLocations
 		for (_i, entry, current_seq_num, _timestamp) in batch.entries_with_seq_nums()? {
-			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind, 0);
+			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind);
 
 			// Use the value directly (cheap Bytes clone), or reuse empty value for deletes
 			let val = if let Some(encoded_value) = &entry.value {

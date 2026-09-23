@@ -566,7 +566,7 @@ impl<W: Write> TableWriter<W> {
 				let mut handle_enc = vec![0u8; 16];
 				let enc_len = fblock_handle.encode_into(&mut handle_enc);
 				let filter_key =
-					InternalKey::new(Vec::from(filter_key.as_bytes()), 0, InternalKeyKind::Set, 0);
+					InternalKey::new(Vec::from(filter_key.as_bytes()), 0, InternalKeyKind::Set);
 				meta_ix_block.add(&filter_key.encode(), &handle_enc[0..enc_len])?;
 			}
 		}
@@ -583,7 +583,7 @@ impl<W: Write> TableWriter<W> {
 		self.meta.properties.top_level_index_size = self.partitioned_index.top_level_index_size();
 
 		// Write metadata to meta index
-		let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set, 0);
+		let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set);
 		let meta_value = self.meta.encode();
 		meta_ix_block.add(&meta_key.encode(), &meta_value)?;
 
@@ -752,7 +752,7 @@ pub(crate) fn read_filter_block(
 }
 
 	fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
-	let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set, 0).encode();
+	let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set).encode();
 	let mut metaindexiter = metaix.iter()?;
 	metaindexiter.seek_internal(&meta_key)?;
 
@@ -911,7 +911,7 @@ impl Table {
 	) -> Result<Option<FilterBlockReader>> {
 		let filter_name = format!("filter.{}", options.filter_policy.as_ref().unwrap().name());
 		let filter_key =
-			InternalKey::new(Vec::from(filter_name.as_bytes()), 0, InternalKeyKind::Set, 0);
+			InternalKey::new(Vec::from(filter_name.as_bytes()), 0, InternalKeyKind::Set);
 
 		let mut metaindexiter = metaix.iter()?;
 		metaindexiter.seek_internal(&filter_key.encode())?;
@@ -1574,7 +1574,6 @@ impl<'a> TableIterator<'a> {
 					internal_key.user_key.clone(),
 					0, // Largest internal key for this user_key
 					InternalKeyKind::Set,
-					0,
 				);
 				self.seek_internal(&seek_key.encode())?;
 
@@ -1660,7 +1659,7 @@ impl<'a> TableIterator<'a> {
 				// This positions past all versions, then we back up
 				let bound_user_key = internal_key.user_key.clone();
 				let seek_key =
-					InternalKey::new(internal_key.user_key.clone(), 0, InternalKeyKind::Set, 0);
+					InternalKey::new(internal_key.user_key.clone(), 0, InternalKeyKind::Set);
 				self.seek_internal(&seek_key.encode())?;
 
 				if !self.is_valid() {
@@ -1689,7 +1688,6 @@ impl<'a> TableIterator<'a> {
 					internal_key.user_key.clone(),
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Max,
-					0,
 				);
 				self.seek_internal(&seek_key.encode())?;
 

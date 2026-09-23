@@ -1,7 +1,6 @@
 use std::cmp::Ordering;
 use std::sync::Arc;
 
-use crate::clock::LogicalClock;
 use crate::error::{Error, Result};
 use crate::{Comparator, InternalKey, InternalKeyRef, LSMIterator, Value};
 
@@ -727,23 +726,6 @@ pub(crate) struct CompactionIterator<'a> {
 	/// The advance() method drains this buffer before processing more input.
 	output_versions: Vec<(InternalKey, Value)>,
 
-	// ========== Versioning Configuration ==========
-	/// Whether to keep multiple versions of keys.
-	///
-	/// - false: Only keep the latest version (point-in-time database)
-	/// - true: Keep versions based on retention_period_ns
-	enable_versioning: bool,
-
-	/// How long to keep old versions (in nanoseconds).
-	///
-	/// - 0: Keep all versions forever
-	/// - >0: Keep versions newer than (current_time - retention_period_ns)
-	retention_period_ns: u64,
-
-	/// Logical clock for time-based operations.
-	/// Used to determine if versions are within retention period.
-	clock: Arc<dyn LogicalClock>,
-
 	/// Whether the iterator has been initialized.
 	initialized: bool,
 
@@ -767,14 +749,10 @@ impl<'a> CompactionIterator<'a> {
 	/// * `retention_period_ns` - How long to keep old versions
 	/// * `clock` - Time source for retention calculations
 	/// * `snapshots` - Sorted list of active snapshot sequence numbers
-	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		iterators: Vec<BoxedLSMIterator<'a>>,
 		cmp: Arc<dyn Comparator>,
 		is_bottom_level: bool,
-		enable_versioning: bool,
-		retention_period_ns: u64,
-		clock: Arc<dyn LogicalClock>,
 		snapshots: Vec<u64>,
 	) -> Self {
 		let merge_iter = MergingIterator::new(iterators, cmp);
@@ -785,9 +763,6 @@ impl<'a> CompactionIterator<'a> {
 			current_user_key: Vec::new(),
 			accumulated_versions: Vec::new(),
 			output_versions: Vec::new(),
-			enable_versioning,
-			retention_period_ns,
-			clock,
 			initialized: false,
 			snapshots,
 		}
@@ -1079,9 +1054,8 @@ impl<'a> CompactionIterator<'a> {
 					// Active snapshots exist - use visibility boundaries to decide
 					SnapshotVisibility::BoundedBySnapshot(_) => true,
 					SnapshotVisibility::NewerThanAllSnapshots => true,
-					// No snapshots - only drop if versioning is disabled
-					// (with versioning enabled, retention policy decides instead)
-					SnapshotVisibility::NoActiveSnapshots => !self.enable_versioning,
+					// No snapshots - single-version KV drops superseded versions
+					SnapshotVisibility::NoActiveSnapshots => true,
 				};
 
 				// Superseded = not latest AND in same visibility boundary AND allowed to drop
@@ -1147,11 +1121,11 @@ impl<'a> CompactionIterator<'a> {
 			} else if should_mark_stale {
 				// Stale entries: don't output
 				false
-			} else if self.enable_versioning || required_by_snapshot {
-				// Versioning enabled or snapshot requires it: output
+			} else if required_by_snapshot {
+				// Snapshot requires it: output
 				true
 			} else {
-				// No versioning, no snapshot requirement: only output latest
+				// Single-version KV: only output latest
 				is_latest
 			};
 

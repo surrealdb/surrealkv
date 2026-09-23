@@ -437,7 +437,7 @@ fn test_range_skips_non_overlapping_tables() {
 		{
 			let mut w = TableWriter::new(&mut buf, 0, Arc::clone(&opts), 0); // L0 for test
 			for (k, v) in data {
-				let ikey = InternalKey::new(k.to_vec(), 1, InternalKeyKind::Set, 0);
+				let ikey = InternalKey::new(k.to_vec(), 1, InternalKeyKind::Set);
 				w.add(ikey, v).unwrap();
 			}
 			w.finish().unwrap();
@@ -899,7 +899,7 @@ fn create_test_table_with_range(
 		let value = format!("value_{seq_num}");
 
 		let internal_key =
-			InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set, 0);
+			InternalKey::new(key.as_bytes().to_vec(), seq_num, InternalKeyKind::Set);
 
 		writer.add(internal_key, value.as_bytes())?;
 	}

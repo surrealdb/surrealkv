@@ -175,49 +175,8 @@ impl LogicalClock for DefaultLogicalClock {
 			} else {
 				std::thread::park_timeout(Duration::from_micros(10));
 			}
-			// Increase the number loop spins we have attempted
 			spins += 1;
 		}
-	}
-}
-
-/// A mock logical clock implementation.
-#[cfg(test)]
-#[derive(Debug)]
-pub struct MockLogicalClock {
-	current_tick: std::sync::atomic::AtomicI64,
-}
-
-#[cfg(test)]
-impl Default for MockLogicalClock {
-	fn default() -> Self {
-		Self::new()
-	}
-}
-
-#[cfg(test)]
-impl MockLogicalClock {
-	pub fn new() -> Self {
-		Self {
-			current_tick: std::sync::atomic::AtomicI64::new(i64::MIN),
-		}
-	}
-
-	pub fn with_timestamp(timestamp: u64) -> Self {
-		Self {
-			current_tick: std::sync::atomic::AtomicI64::new(timestamp as i64),
-		}
-	}
-
-	pub fn set_time(&self, timestamp: u64) {
-		self.current_tick.store(timestamp as i64, Ordering::SeqCst);
-	}
-}
-
-#[cfg(test)]
-impl LogicalClock for MockLogicalClock {
-	fn now(&self) -> u64 {
-		self.current_tick.load(Ordering::SeqCst) as u64
 	}
 }
 

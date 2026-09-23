@@ -203,7 +203,7 @@ impl Snapshot {
 		// Read lock on the level manifest
 		let level_manifest = self.core.level_manifest.read()?;
 
-		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set, 0);
+		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set);
 
 		// Check the tables in each level for the key
 		for (level_idx, level) in (&level_manifest.levels).into_iter().enumerate() {
@@ -1025,7 +1025,7 @@ impl SnapshotIterator<'_> {
 
 		// Seek to first entry >= current user key
 		// Using (user_key, MAX_SEQ) positions at the start of this user key's entries
-		let seek_key = InternalKey::new(current_user_key, u64::MAX, InternalKeyKind::Set, 0);
+		let seek_key = InternalKey::new(current_user_key, u64::MAX, InternalKeyKind::Set);
 		self.merge_iter.seek(&seek_key.encode())?;
 
 		// skip_to_valid_forward() will skip entries with user_key == last_key_fwd
@@ -1384,7 +1384,7 @@ impl<'a> HistoryIterator<'a> {
 			if next_key_vec != current {
 				// Found next key - seek to (next_key, ts_end) to skip entries above range
 				let seek_key =
-					InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set, 0);
+					InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set);
 				self.inner.seek(&seek_key.encode())?;
 				return Ok(self.inner_valid());
 			}

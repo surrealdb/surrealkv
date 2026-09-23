@@ -103,6 +103,11 @@ impl CommitPipeline {
 		// Check for background errors before proceeding
 		self.inner.error_handler.check_error()?;
 
+		// If batch is empty, only validate conflicts for locked reads
+		if batch.is_empty() {
+			return self.check_conflicts(read_set, start_seq);
+		}
+
 		// Write stall backpressure
 		self.write_stall.check().await?;
 

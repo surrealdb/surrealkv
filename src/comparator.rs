@@ -188,7 +188,6 @@ impl Comparator for InternalKeyComparator {
 					sep,
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
-					0,
 				);
 				return result.encode();
 			}
@@ -212,7 +211,6 @@ impl Comparator for InternalKeyComparator {
 				user_key_succ,
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
-				0,
 			);
 			return result.encode();
 		}
@@ -287,7 +285,6 @@ impl Comparator for TimestampComparator {
 					sep,
 					INTERNAL_KEY_SEQ_NUM_MAX,
 					InternalKeyKind::Separator,
-					0,
 				);
 				return result.encode();
 			}
@@ -312,7 +309,6 @@ impl Comparator for TimestampComparator {
 				user_key_succ,
 				INTERNAL_KEY_SEQ_NUM_MAX,
 				InternalKeyKind::Separator,
-				0,
 			);
 			return result.encode();
 		}
@@ -646,7 +642,7 @@ mod tests {
 
 	/// Helper to create an encoded internal key for testing
 	fn ikey(user_key: &[u8], seq: u64, kind: InternalKeyKind) -> Vec<u8> {
-		InternalKey::new(user_key.to_vec(), seq, kind, 0).encode()
+		InternalKey::new(user_key.to_vec(), seq, kind).encode()
 	}
 
 	/// Helper to create an encoded internal key with max seq num (for expected
@@ -656,7 +652,6 @@ mod tests {
 			user_key.to_vec(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
-			0,
 		)
 		.encode()
 	}
@@ -883,7 +878,6 @@ mod tests {
 			b"foo".to_vec(),
 			INTERNAL_KEY_SEQ_NUM_MAX,
 			InternalKeyKind::Separator,
-			0,
 		)
 		.encode();
 
