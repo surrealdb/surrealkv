@@ -10,6 +10,7 @@ use crate::iter::BoxedLSMIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
+use crate::sstable::table::Table;
 use crate::{
 	BytewiseComparator, Comparator, InternalKey, InternalKeyComparator, InternalKeyKind,
 	InternalKeyRange, InternalKeyRef, Key, LSMIterator, TimestampComparator, Value,
@@ -284,6 +285,117 @@ impl Snapshot {
 		}
 
 		Ok(None) // Key not found in any memtable or table, return None
+	}
+
+	/// Asynchronously gets a value from the snapshot.
+	pub(crate) async fn get_async(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
+		let mut max_range_delete_seq: Option<u64> = None;
+
+		// 1. Check active memtable and collect range deletions
+		{
+			let active_lock = self.core.active_memtable.read()?;
+			for (start, end, seq) in active_lock.range_deletions.read().iter() {
+				if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+					max_range_delete_seq = Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+				}
+			}
+			if let Some(item) = active_lock.get(key.as_ref(), Some(self.seq_num)) {
+				if item.0.is_tombstone() {
+					return Ok(None);
+				}
+				if let Some(rseq) = max_range_delete_seq {
+					if item.0.seq_num() <= rseq {
+						return Ok(None);
+					}
+				}
+				return Ok(Some((item.1, item.0.seq_num())));
+			}
+		}
+
+		// 2. Check immutable memtables and collect range deletions
+		{
+			let imm_lock = self.core.immutable_memtables.read()?;
+			for entry in imm_lock.iter() {
+				let memtable = &entry.memtable;
+				for (start, end, seq) in memtable.range_deletions.read().iter() {
+					if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+						max_range_delete_seq =
+							Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+					}
+				}
+			}
+			for entry in imm_lock.iter().rev() {
+				let memtable = &entry.memtable;
+				if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
+					if item.0.is_tombstone() {
+						return Ok(None);
+					}
+					if let Some(rseq) = max_range_delete_seq {
+						if item.0.seq_num() <= rseq {
+							return Ok(None);
+						}
+					}
+					return Ok(Some((item.1, item.0.seq_num())));
+				}
+			}
+		}
+
+		// 3. Collect level tables while holding level_manifest lock, then drop lock before awaiting
+		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set);
+		let tables_to_check: Vec<Arc<Table>> = {
+			let level_manifest = self.core.level_manifest.read()?;
+			for level in &level_manifest.levels {
+				for table in &level.tables {
+					for (start, end, seq) in table.range_deletions.read().iter() {
+						if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+							max_range_delete_seq =
+								Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+						}
+					}
+				}
+			}
+
+			let mut tables = Vec::new();
+			for (level_idx, level) in level_manifest.levels.get_levels().iter().enumerate() {
+				if level_idx == 0 {
+					for table in level.tables.iter() {
+						if table.is_key_in_key_range(&ikey) {
+							tables.push(Arc::clone(table));
+						}
+					}
+				} else {
+					let query_range = crate::user_range_to_internal_range(
+						Bound::Included(key),
+						Bound::Included(key),
+					);
+					let start_idx = level.find_first_overlapping_table(&query_range);
+					let end_idx = level.find_last_overlapping_table(&query_range);
+					for table in &level.tables[start_idx..end_idx] {
+						tables.push(Arc::clone(table));
+					}
+				}
+			}
+			tables
+		};
+
+		// 4. Asynchronously search SSTables without holding any synchronous locks across await
+		for table in tables_to_check {
+			let maybe_item = table.get_async(&ikey).await?;
+			if let Some(item) = maybe_item {
+				let ikey = &item.0;
+				if ikey.is_tombstone() {
+					return Ok(None);
+				}
+				if let Some(rseq) = max_range_delete_seq {
+					if ikey.seq_num() <= rseq {
+						return Ok(None);
+					}
+				}
+				return Ok(Some((item.1, ikey.seq_num())));
+			}
+		}
+
+		Ok(None)
 	}
 
 	/// Creates an iterator for a range scan within the snapshot

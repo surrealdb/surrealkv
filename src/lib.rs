@@ -15,6 +15,7 @@ mod ring;
 mod snapshot;
 mod sstable;
 mod stall;
+pub mod storage;
 mod task;
 mod tracker;
 mod transaction;

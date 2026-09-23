@@ -841,6 +841,7 @@ pub enum IndexType {
 pub(crate) struct Table {
 	pub id: u64,
 	pub file: Arc<dyn File>,
+	pub(crate) object_store: Arc<dyn crate::storage::ObjectStore>,
 	#[allow(unused)]
 	pub file_size: u64,
 
@@ -860,6 +861,9 @@ impl Table {
 		file: Arc<dyn File>,
 		file_size: u64,
 	) -> Result<Table> {
+		let object_store: Arc<dyn crate::storage::ObjectStore> =
+			Arc::new(crate::storage::AffinityObjectStore::new(Arc::clone(&file)));
+
 		// Step 1: Read footer
 		let footer = read_footer(Arc::clone(&file), file_size as usize)?;
 
@@ -891,6 +895,7 @@ impl Table {
 		Ok(Table {
 			id,
 			file,
+			object_store,
 			file_size,
 			opts,
 			filter_reader,
@@ -992,7 +997,90 @@ impl Table {
 		Ok(b)
 	}
 
-	/// Point lookup for a single key.
+	/// Reads a data block asynchronously, using cache if available.
+	pub(crate) async fn read_block_async(&self, location: &BlockHandle) -> Result<Arc<Block>> {
+		// Check cache first
+		if let Some(block) = self.opts.block_cache.get_data_block(self.id, location.offset() as u64)
+		{
+			return Ok(block);
+		}
+
+		// Read whole block + compress byte + checksum via ObjectStore asynchronously
+		let total_len = location.size() + BLOCK_COMPRESS_LEN + BLOCK_CKSUM_LEN;
+		let raw_bytes = self.object_store.read_at(location.offset() as u64, total_len).await?;
+
+		let buf = &raw_bytes[..location.size()];
+		let compress = &raw_bytes[location.size()..location.size() + BLOCK_COMPRESS_LEN];
+		let cksum = &raw_bytes[location.size() + BLOCK_COMPRESS_LEN..];
+
+		let cksum_val =
+			u32::from_le_bytes(cksum.try_into().map_err(|_| SSTableError::CorruptedBlockHandle)?);
+		if !verify_table_block(buf, compress[0], unmask(cksum_val)) {
+			return Err(Error::from(SSTableError::ChecksumVerificationFailed {
+				block_offset: location.offset() as u64,
+			}));
+		}
+
+		let block = decompress_block(buf, CompressionType::try_from(compress[0])?)?;
+		let b = Arc::new(Block::new(block, Arc::clone(&self.opts.internal_comparator)));
+
+		// Insert into cache
+		self.opts.block_cache.insert_data_block(self.id, location.offset() as u64, Arc::clone(&b));
+
+		Ok(b)
+	}
+
+	/// Asynchronous point lookup for a single key.
+	pub(crate) async fn get_async(
+		&self,
+		key: &InternalKey,
+	) -> Result<Option<(InternalKey, Value)>> {
+		let key_encoded = key.encode();
+
+		// Step 1: Bloom filter for early rejection
+		if let Some(ref filters) = self.filter_reader {
+			if !filters.may_contain(key.user_key.as_slice(), 0) {
+				return Ok(None);
+			}
+		}
+
+		let IndexType::Partitioned(partitioned_index) = &self.index_block;
+
+		// Step 2: Find partition that could contain this key
+		let Some((_, partition_handle)) =
+			partitioned_index.find_block_handle_by_key(&key_encoded)?
+		else {
+			return Ok(None);
+		};
+
+		// Step 3: Load partition block and seek
+		let partition_block = partitioned_index.load_block(partition_handle)?;
+		let mut partition_iter = partition_block.iter()?;
+		partition_iter.seek_internal(&key_encoded)?;
+
+		if !partition_iter.is_valid() {
+			return Ok(None);
+		}
+
+		// Decode data block handle from partition entry
+		let (data_handle, _) = BlockHandle::decode(partition_iter.value_bytes()).map_err(|e| {
+			Error::from(SSTableError::FailedToDecodeBlockHandle {
+				value_bytes: partition_iter.value_bytes().to_vec(),
+				context: format!("Failed to decode BlockHandle in get_async(): {e}"),
+			})
+		})?;
+
+		// Step 4: Read data block asynchronously and search
+		let data_block = self.read_block_async(&data_handle).await?;
+		let mut iter = data_block.iter()?;
+		iter.seek_internal(&key_encoded)?;
+
+		if iter.is_valid() && iter.user_key() == key.user_key.as_slice() {
+			Ok(Some((iter.key().to_owned(), iter.value_encoded()?.to_vec())))
+		} else {
+			Ok(None)
+		}
+	}
 	///
 	/// ## Lookup Process
 	///

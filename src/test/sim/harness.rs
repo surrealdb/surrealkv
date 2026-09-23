@@ -104,6 +104,13 @@ impl SimRunner {
 				Action::PointRead(key) => {
 					let stx = self.store.as_ref().unwrap().begin().unwrap();
 					let store_val = stx.get(&key).unwrap();
+					let store_val_async = stx.get_async(&key).await.unwrap();
+					assert_eq!(
+						store_val,
+						store_val_async,
+						"Sync get and async get diverged at seed {seed}, step {step} on key {:?}",
+						String::from_utf8_lossy(&key)
+					);
 					let model_val = self.model.get(&key);
 
 					assert_eq!(
