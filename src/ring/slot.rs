@@ -5,8 +5,10 @@ use crate::batch::Batch;
 use crate::error::Result;
 
 pub(crate) struct SlotData {
-	/// The sequence number this slot currently represents.
+	/// The slot id this slot currently represents.
 	pub seq: u64,
+	/// The highest sequence number assigned to records in this batch.
+	pub max_seq: u64,
 	/// The batch to be written and applied.
 	pub batch: Option<Batch>,
 	/// Whether this commit requires an immediate fsync.
@@ -21,6 +23,7 @@ impl Default for SlotData {
 	fn default() -> Self {
 		Self {
 			seq: 0,
+			max_seq: 0,
 			batch: None,
 			sync: false,
 			complete_tx: None,
