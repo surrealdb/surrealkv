@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{oneshot, Notify, RwLock};
+use tokio::sync::{oneshot, Notify};
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
@@ -25,8 +25,18 @@ pub(crate) struct CommitPipeline {
 	pub(crate) shutdown: AtomicBool,
 	/// Sequence number allocator for batch entries
 	pub(crate) log_seq_num: AtomicU64,
-	/// Lock used to pause all incoming commits during a full restore from checkpoint.
-	pub(crate) restore_lock: RwLock<()>,
+	/// Flag used to pause all incoming commits during a full restore from checkpoint.
+	pub(crate) restoring: AtomicBool,
+}
+
+pub(crate) struct RestoreGuard<'a> {
+	restoring: &'a AtomicBool,
+}
+
+impl Drop for RestoreGuard<'_> {
+	fn drop(&mut self) {
+		self.restoring.store(false, Ordering::Release);
+	}
 }
 
 impl CommitPipeline {
@@ -50,7 +60,7 @@ impl CommitPipeline {
 			notify_flusher,
 			shutdown: AtomicBool::new(false),
 			log_seq_num: AtomicU64::new(seq),
-			restore_lock: RwLock::new(()),
+			restoring: AtomicBool::new(false),
 		}
 	}
 
@@ -96,8 +106,10 @@ impl CommitPipeline {
 		// Write stall backpressure
 		self.write_stall.check().await?;
 
-		// Acquire restore lock to ensure restore is not running
-		let _restore_guard = self.restore_lock.read().await;
+		// Check if restore is in progress
+		if self.restoring.load(Ordering::Acquire) {
+			return Err(Error::PipelineStall);
+		}
 
 		// Extract write keys and build bloom filters
 		let write_keys: Vec<Key> = batch.entries.iter().map(|e| e.key.clone()).collect();
@@ -307,8 +319,11 @@ impl CommitPipeline {
 	}
 
 	/// Locks writes for database restore.
-	pub(crate) fn lock_writes(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
-		self.restore_lock.blocking_write()
+	pub(crate) fn lock_writes(&self) -> RestoreGuard<'_> {
+		self.restoring.store(true, Ordering::SeqCst);
+		RestoreGuard {
+			restoring: &self.restoring,
+		}
 	}
 
 	/// Resets the pipeline for restore.

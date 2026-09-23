@@ -1,12 +1,9 @@
 use std::cmp::Ordering;
-use std::fs::File;
 use std::ops::Bound;
 use std::sync::Arc;
 
 use crossbeam_skiplist::SkipSet;
-use parking_lot::RwLockReadGuard;
 
-use crate::bplustree::tree::{BPlusTreeIterator, DiskBPlusTree};
 use crate::error::{Error, Result};
 use crate::iter::BoxedLSMIterator;
 use crate::levels::Levels;
@@ -114,8 +111,6 @@ pub(crate) struct IterState {
 	pub immutable: Vec<Arc<MemTable>>,
 	/// All levels containing SSTables
 	pub levels: Levels,
-	/// Optional versioned index (B+tree) for history queries
-	pub versioned_index: Option<Arc<parking_lot::RwLock<DiskBPlusTree>>>,
 }
 
 // ===== Snapshot Implementation =====
@@ -162,7 +157,6 @@ impl Snapshot {
 			active: active.clone(),
 			immutable: immutable.iter().map(|entry| Arc::clone(&entry.memtable)).collect(),
 			levels: manifest.levels.clone(),
-			versioned_index: self.core.versioned_index.clone(),
 		})
 	}
 
@@ -302,31 +296,16 @@ impl Snapshot {
 		);
 		let iter_state = self.collect_iter_state()?;
 
-		if self.core.opts.enable_versioned_index {
-			// Merge memtables (unflushed) + B+tree (flushed with value pointers)
-			let merge_iter = KMergeIterator::new_for_history_with_btree(iter_state, range)?;
-			Ok(HistoryIterator::new(
-				merge_iter,
-				self.seq_num,
-				include_tombstones,
-				lower,
-				upper,
-				ts_range,
-				limit,
-			))
-		} else {
-			// Merge memtables + SSTables (no B+tree)
-			Ok(HistoryIterator::new_lsm(
-				self.seq_num,
-				iter_state,
-				range,
-				include_tombstones,
-				ts_range,
-				limit,
-				lower,
-				upper,
-			))
-		}
+		Ok(HistoryIterator::new_lsm(
+			self.seq_num,
+			iter_state,
+			range,
+			include_tombstones,
+			ts_range,
+			limit,
+			lower,
+			upper,
+		))
 	}
 
 	/// Queries for a specific key at a specific timestamp.
@@ -439,65 +418,6 @@ impl<'a> KMergeIterator<'a> {
 		let cmp: Arc<dyn Comparator> =
 			Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));
 		Self::new_with_comparator(iter_state, internal_range, cmp, ts_range)
-	}
-
-	/// Creates a KMergeIterator merging memtable iterators + B+tree versioned index.
-	/// Used when `enable_versioned_index` is true: the B+tree holds flushed data with
-	/// value pointers, while memtables hold unflushed data with inline values.
-	/// No SSTable iterators are included (bplustree already covers flushed data).
-	pub(crate) fn new_for_history_with_btree(
-		iter_state: IterState,
-		internal_range: InternalKeyRange,
-	) -> Result<Self> {
-		let cmp: Arc<dyn Comparator> =
-			Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));
-
-		let boxed_state = Box::new(iter_state);
-
-		// 1 active memtable + immutable memtables + 1 bplustree iterator
-		let mut iterators: Vec<BoxedLSMIterator<'a>> =
-			Vec::with_capacity(1 + boxed_state.immutable.len() + 1);
-
-		// SAFETY: The boxed_state keeps all referenced data alive for the lifetime of
-		// this struct. The iterators are dropped before iter_state (field declaration order).
-		let state_ref: &'a IterState = unsafe { &*(&*boxed_state as *const IterState) };
-
-		// Extract user key bounds
-		let (ref start_bound, ref end_bound) = internal_range;
-		let lower = match start_bound {
-			Bound::Included(key) | Bound::Excluded(key) => Some(key.user_key.as_slice()),
-			Bound::Unbounded => None,
-		};
-		let upper = match end_bound {
-			Bound::Excluded(key) => Some(key.user_key.as_slice()),
-			Bound::Included(_) | Bound::Unbounded => None,
-		};
-
-		// Active memtable
-		let active_iter = state_ref.active.range(lower, upper);
-		iterators.push(Box::new(active_iter) as BoxedLSMIterator<'a>);
-
-		// Immutable memtables
-		for memtable in &state_ref.immutable {
-			let iter = memtable.range(lower, upper);
-			iterators.push(Box::new(iter) as BoxedLSMIterator<'a>);
-		}
-
-		// B+tree versioned index (contains all flushed data with value pointers)
-		if let Some(ref btree_arc) = state_ref.versioned_index {
-			let btree_iter = BPlusTreeIteratorWithGuard::new(btree_arc)?;
-			iterators.push(Box::new(btree_iter) as BoxedLSMIterator<'a>);
-		}
-
-		Ok(Self {
-			iterators,
-			iter_state: boxed_state,
-			winner: None,
-			active_count: 0,
-			direction: MergeDirection::Forward,
-			initialized: false,
-			cmp,
-		})
 	}
 
 	/// Creates a new KMergeIterator with a configurable comparator.
@@ -1236,76 +1156,7 @@ impl LSMIterator for SnapshotIterator<'_> {
 ///
 /// # Safety
 /// This is a self-referential struct. The iterator borrows from the guarded tree.
-/// Field declaration order is critical: `iter` MUST be declared before `_guard`
-/// to ensure the iterator is dropped before the guard.
-pub struct BPlusTreeIteratorWithGuard<'a> {
-	/// The iterator borrowing from the guarded tree.
-	/// MUST be declared before _guard for correct drop order.
-	iter: BPlusTreeIterator<'a, File>,
 
-	/// The read guard that keeps the tree alive.
-	/// Dropped AFTER iter due to field declaration order.
-	#[allow(dead_code)]
-	_guard: RwLockReadGuard<'a, DiskBPlusTree>,
-}
-
-impl<'a> BPlusTreeIteratorWithGuard<'a> {
-	/// Creates a new streaming B+tree iterator.
-	///
-	/// # Safety
-	/// Uses unsafe to create a self-referential struct. This is safe because:
-	/// 1. The guard keeps the tree alive for the lifetime of this struct
-	/// 2. The iterator is dropped before the guard (field declaration order)
-	/// 3. The tree memory is stable (behind Arc<RwLock<>>)
-	pub(crate) fn new(versioned_index: &'a parking_lot::RwLock<DiskBPlusTree>) -> Result<Self> {
-		let guard = versioned_index.read();
-
-		// SAFETY: The guard keeps the tree alive for the lifetime of this struct.
-		// The iterator is dropped before the guard due to field declaration order.
-		let tree_ref: &'a DiskBPlusTree = unsafe { &*(&*guard as *const DiskBPlusTree) };
-
-		let iter = tree_ref.internal_iterator();
-
-		Ok(Self {
-			iter,
-			_guard: guard,
-		})
-	}
-}
-
-impl LSMIterator for BPlusTreeIteratorWithGuard<'_> {
-	fn seek(&mut self, target: &[u8]) -> Result<bool> {
-		self.iter.seek(target)
-	}
-
-	fn seek_first(&mut self) -> Result<bool> {
-		self.iter.seek_first()
-	}
-
-	fn seek_last(&mut self) -> Result<bool> {
-		self.iter.seek_last()
-	}
-
-	fn next(&mut self) -> Result<bool> {
-		self.iter.next()
-	}
-
-	fn prev(&mut self) -> Result<bool> {
-		self.iter.prev()
-	}
-
-	fn valid(&self) -> bool {
-		self.iter.valid()
-	}
-
-	fn key(&self) -> InternalKeyRef<'_> {
-		self.iter.key()
-	}
-
-	fn value_encoded(&self) -> Result<&[u8]> {
-		self.iter.value_encoded()
-	}
-}
 
 // ===== Unified History Iterator =====
 
