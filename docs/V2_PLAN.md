@@ -107,11 +107,11 @@ The new lock-free OCC Ring Buffer (from Phase 1) will be the first component sub
 ## Phase 4: Async Native & `io_uring` / `affinitypool`
 Swap the synchronous `vfs.rs` abstraction for a truly async storage layer. The current implementation relies on blocking operations that severely limit throughput and stall the async executor.
 
-- [ ] Add `affinitypool = "0.8"` dependency.
-- [ ] Define asynchronous storage traits (`LogStore` for append-only sequential log persistence and `ObjectStore` / `PageStore` for immutable block/SSTable random reads).
-- [ ] Implement `AffinityLogStore` and `AffinityObjectStore` backed by `affinitypool` (and local filesystem).
-- [ ] Implement in-memory async stores for testing and simulator mocks.
-- [ ] Migrate `SSTable` block reading to async (`read_table_block_async`).
+- [x] Add `affinitypool = "0.8"` dependency.
+- [x] Define asynchronous storage traits (`LogStore` for append-only sequential log persistence and `ObjectStore` / `PageStore` for immutable block/SSTable random reads).
+- [x] Implement `AffinityObjectStore` backed by `affinitypool` (and local filesystem).
+- [x] Implement in-memory async stores for testing and simulator mocks (`MemLogStore`, `MemObjectStore`).
+- [x] Migrate `SSTable` block reading and point lookup to async (`read_block_async`, `Table::get_async`, `Transaction::get_async`).
 - [ ] Upgrade WAL append & sync in `CommitPipeline` flusher to async `LogStore::append`.
 - [ ] Run full DST and unit tests verifying async storage equivalence.
 
