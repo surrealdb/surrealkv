@@ -139,10 +139,10 @@ To ensure clean engineering and prevent format churn over the cloud tier:
 2. **Phase 2 (Complete):** The Purge (Removed in-tree versioning, flattened keys to 184 bytes, Range Tombstones).
 3. **Phase 3 (Complete):** DST & Differential Testing (Deterministic PRNG Simulation, ModelDb Oracle).
 4. **Phase 4 (Complete):** Async Native & Storage Traits (`LogStore`, `ObjectStore`, `AffinityObjectStore`, `AffinityLogStore`, `get_async`).
-5. **Phase 5 (Next):** Engine & Block Format Optimizations (Zero-Copy aligned block format, Zstd dictionary compression, user-space W-TinyLFU cache, parallel WAL replay, Ribbon filters).
-6. **Phase 6:** Resilience, Security, & Telemetry (Block-level TDE encryption, end-to-end xxHash3 scrubbing, zero-allocation telemetry).
-7. **Phase 7:** Global Memory Accounting & Operational Excellence (Strict unified memory budget across MemTable/Cache/Ring, auto-tuning).
-8. **Phase 8:** Object-Storage Native (The Cloud Tier - S3/MinIO via `object_store`, atomic CAS manifest, zero-cost COW branching, PITR, tiered NVMe/S3 caching, and S3 orphan GC).
+5. **Phase 5 (Complete):** Engine & Block Format Optimizations (Zero-Copy aligned block format, Zstd dictionary compression, user-space W-TinyLFU cache, parallel WAL replay, Ribbon filters, ByteSlice SSO).
+6. **Phase 6 (Complete):** Resilience, Security, & Telemetry (Block-level TDE encryption, end-to-end xxHash3 scrubbing, zero-allocation telemetry).
+7. **Phase 7 (Complete):** Global Memory Accounting & Operational Excellence (Strict unified memory budget across MemTable/Cache/Ring, auto-tuning).
+8. **Phase 8 (Next):** Object-Storage Native (The Cloud Tier - S3/MinIO via `object_store` v0.14.2, atomic CAS manifest, zero-cost COW branching, PITR, tiered NVMe/S3 caching, and S3 orphan GC).
 
 *Note: Solidifying block serialization, compression, encryption, and local caching **before** uploading to cloud object storage guarantees that remote SSTables are written in their final, zero-copy, high-density format from day one.*
 
@@ -217,35 +217,77 @@ Avoid "configuration hell." On startup, SurrealKV should query the OS for total 
 ---
 
 ## Phase 8: Object-Storage Native (The Cloud Tier)
-Adapt the finalized, high-density LSM engine to run over network boundaries and cloud object stores (S3, MinIO, GCS, Azure Blob).
+Adapt the finalized, high-density LSM engine to run over network boundaries and cloud object stores (S3, MinIO, GCS, Azure Blob, and Cloudflare R2) using the latest `object_store` crate (v0.14.2).
 
-- [ ] Object Storage Integration: Implement `ObjectStore` using the `object_store` crate.
-- [ ] Manifest Compare-and-Swap (CAS): Centralized atomic manifest commits via S3 conditional writes.
-- [ ] Zero-Cost Branching & Forking: Copy-on-Write branching by duplicating manifests without blob copying.
-- [ ] Point-In-Time Recovery (PITR) & Checkpointing: Archived WAL segments + periodic manifest snapshots.
-- [ ] Tiered Storage (NVMe Buffer & LRU Cache for S3): Automatic promotions and evictions between RAM, local NVMe, and S3.
-- [ ] S3 Orphan Garbage Collection: Background reconciliation removing unreferenced cloud blobs.
+### Deliverables & Task Tracker
+- [ ] **Cloud Storage Integration (Latest `object_store` v0.14.2)**:
+  - Add `object_store = { version = "0.14.2", default-features = false, features = ["aws", "azure", "gcp", "http", "fs"] }`.
+  - Implement `CloudObjectStore` implementing SurrealKV's internal `ObjectStore` trait over `Arc<dyn object_store::ObjectStore>`.
+  - URI parser & automatic cloud builder: `s3://`, `gs://`, `az://`, `file://`, and `memory://`.
+  - Range-read streaming via `get_range(offset..offset + len)` yielding zero-copy `Bytes`.
+  - Multipart streaming uploads for newly sealed SSTables (`put_multipart`).
+  - Exponential backoff retry layer with jitter for cloud rate limits (HTTP 429/503 SlowDown).
+- [ ] **Manifest Compare-and-Swap (CAS) & Consensus**:
+  - Centralized atomic manifest commits stored in `manifest/{epoch:020}.manifest`.
+  - Manifest pointer in `manifest/CURRENT` updated using conditional PUT (`PutMode::Update(UpdateVersion)` / `If-Match` ETag).
+  - Optimistic concurrency control (OCC) for manifest commits: if a concurrent compactor commits first, reload manifest, rebase changesets, and re-attempt CAS.
+  - Manifest binary format with xxHash3 checksum, storing level hierarchies, SSTable metadata, key boundaries, and referenced VLog files.
+- [ ] **Zero-Cost Copy-on-Write (COW) Branching & Forking**:
+  - `Tree::create_branch(&self, branch_name: &str) -> Result<Tree>`.
+  - Duplicates the current manifest metadata under `branches/{branch_name}/manifest/CURRENT`.
+  - Zero data copying of SSTables: parent and branch initially reference the identical immutable SSTable and VLog blobs in object storage.
+  - Divergent evolution: writes and compactions in either branch generate new, globally unique SSTable IDs, creating independent linear histories without mutating shared parent blobs.
+  - Branch deletion and lifecycle management (`Tree::drop_branch(&self, branch_name: &str)`).
+- [ ] **Point-In-Time Recovery (PITR) & Checkpointing**:
+  - Continuous WAL archiving: closed WAL segments are sealed and copied to `wal_archive/{start_seq:020}_{end_seq:020}.wal`.
+  - Periodic manifest snapshots saved to `checkpoints/{checkpoint_id}.manifest`.
+  - `Tree::restore_pitr(&self, target_seq_num: u64, destination_branch: Option<&str>) -> Result<Tree>`:
+    1. Binary search available checkpoints to locate the latest checkpoint with `last_sequence <= target_seq_num`.
+    2. Load the checkpoint manifest state into a fresh memory instance.
+    3. Replay archived WAL segments from `checkpoint.last_sequence` up to `target_seq_num`.
+    4. Atomically commit the restored state as a new branch or primary database.
+- [ ] **Tiered Storage Architecture (Hot RAM -> Warm NVMe -> Cold S3)**:
+  - Local NVMe caching layer (`TieredStorageEngine`):
+    - Configurable local disk cache directory (`--cache-dir`) with strict disk budget (`--max-cache-disk-bytes`).
+    - Multi-tiered lookup: Block Cache (RAM) -> Local NVMe Cache -> Remote Cloud Store (S3).
+    - Block-level on-demand paging: fetch 64KB/128KB compressed data blocks via HTTP `Range` headers rather than pulling entire multi-gigabyte SSTables.
+    - Asynchronous disk writer populating local NVMe cache on cloud misses.
+    - Background LRU/W-TinyLFU disk cache evictor enforcing disk capacity bounds.
+  - Cloud-optimized compaction placement:
+    - L0 and L1 kept on local NVMe for minimal latency and zero S3 PUT cost during high-ingest spikes.
+    - L2+ compacted directly to cloud object storage using Size-Tiered or Lazy-Leveled compaction to minimize cloud write amplification.
+- [ ] **S3 Orphan Garbage Collection**:
+  - Background reconciler daemon (`CloudGarbageCollector`):
+    - Enumerates all live table IDs and VLog IDs across all active branch manifests (`branches/*/manifest/CURRENT`) and unexpired checkpoint manifests.
+    - Lists all physical blobs in the cloud bucket prefix (`sst/` and `vlog/`).
+    - Identifies candidate unreferenced blobs.
+    - Enforces a safety grace period (e.g. 2 hours minimum age based on cloud `last_modified`) to prevent deleting in-flight SSTables created by concurrent compaction jobs before manifest commit.
+    - Executes bulk blob deletions via `delete_stream`.
 
 ### Immutable Object Paradigm
 Guarantee that once a WAL segment or SSTable is closed, it is strictly immutable. This enables aggressive local caching and trivial replication.
 
-### S3 Integration via `object_store`
-Implement the `ObjectStore` trait using the `object_store` crate, allowing SurrealKV to run entirely backed by S3, MinIO, or Azure Blob Storage.
+### S3 Integration via `object_store` (v0.14.2)
+Implement the `ObjectStore` trait using the latest `object_store` crate (v0.14.2), allowing SurrealKV to run entirely backed by AWS S3, MinIO, Google Cloud Storage, Azure Blob Storage, or local disk.
 
 ### Manifest Compare-and-Swap (CAS)
-Store the LSM manifest (the list of active SSTables and levels) in a centralized location using atomic CAS operations (e.g., S3 conditional puts). This acts as the single source of truth for the database state.
+Store the LSM manifest (the list of active SSTables and levels) in a centralized location using atomic CAS operations (e.g. S3 conditional PUTs via `PutMode::Update(version)`). This acts as the single source of truth for the database state, allowing multi-node clusters and compactors to safely coordinate without split-brain anomalies.
 
 ### Zero-Cost Branching & Forking
-Because SSTables are immutable, forking the database requires zero data copying. Branching is achieved simply by duplicating the Manifest file. Both branches initially share the same underlying SSTables, diverging seamlessly (Copy-On-Write) as they write new data and generate independent SSTables.
+Because SSTables are immutable and content-addressed, forking the database requires zero data copying. Branching is achieved simply by duplicating the Manifest file under a new branch namespace. Both branches initially share the exact same underlying SSTables, diverging seamlessly (Copy-On-Write) as they write new data and generate independent SSTables.
 
 ### Point-In-Time Recovery (PITR) & Checkpointing
-By continuously archiving immutable WAL segments and periodically snapshotting the Manifest (creating lightweight "Checkpoints") to object storage, PITR becomes a trivial routing operation. Restoring to a specific millisecond involves loading the nearest historical Checkpoint Manifest and replaying the archived WAL up to the target sequence number.
+By continuously archiving immutable WAL segments and periodically snapshotting the Manifest (creating lightweight "Checkpoints") to object storage, PITR becomes a deterministic routing operation. Restoring to a specific sequence number or millisecond involves loading the nearest historical Checkpoint Manifest and replaying the archived WAL up to the target sequence number.
 
 ### Cloud-Optimized Compaction (Cost & Network Mitigation)
-Traditional leveled compaction has massive write amplification, leading to saturated networks and high S3 PUT costs. The new compaction strategy will keep L0/L1 on fast local NVMe (acting as a disk-backed buffer) and switch higher object-storage levels (L2+) to Size-Tiered or Lazy-Leveled compaction to drastically slash write amplification.
+Traditional leveled compaction has massive write amplification, leading to saturated networks and high S3 PUT costs. The new compaction strategy keeps L0/L1 on fast local NVMe (acting as a disk-backed buffer) and switches higher object-storage levels (L2+) to Size-Tiered or Lazy-Leveled compaction to drastically slash write amplification and cloud API costs.
 
-### Tiered Storage (Hot NVMe vs. Cold S3)
-To prevent excessive S3 egress fees and high latency on repeated queries, the engine will natively support Tiered Storage. The local NVMe drive will act as a massive LRU cache for S3. Data lifecycle shifts dynamically: "Hot" SSTables live in RAM (Block Cache), "Warm" SSTables live on local NVMe, and "Cold" SSTables live strictly in S3. When a Cold SSTable is queried, it is fetched and pinned to local NVMe, while a background thread evicts the least-recently-used warm SSTables back to "S3-only" status when local disk space fills up.
+### Tiered Storage (Hot RAM -> Warm NVMe -> Cold S3)
+To prevent excessive S3 egress fees and high latency on repeated queries, the engine natively supports Tiered Storage. The local NVMe drive acts as a massive block-level LRU cache for S3. Data lifecycle shifts dynamically:
+1. **Hot**: Active MemTable and Block Cache in RAM.
+2. **Warm**: SSTables cached on local NVMe SSD (fast point lookups and range scans).
+3. **Cold**: SSTables stored in cloud object storage (S3/MinIO/GCS/Azure).
+When cold SSTable data is queried, 64KB/128KB blocks are fetched on-demand using HTTP Range requests and pinned to the local NVMe cache, while a background eviction worker reclaims local disk space when the cache limit is reached.
 
 ### S3 Orphan Garbage Collection
-When writing to object storage, network partitions or crashed compactors can leave "orphaned" SSTables that cost money but belong to no Manifest. An epoch-based background garbage collector will routinely reconcile the S3 bucket contents against active and Checkpoint Manifests, safely deleting unreferenced blobs after a safe grace period.
+When writing to object storage, network partitions or crashed compactors can leave "orphaned" SSTables that cost money but belong to no Manifest. An epoch-based background garbage collector routinely reconciles the S3 bucket contents against active branch manifests and retained checkpoints, safely deleting unreferenced blobs after a safe grace period.
