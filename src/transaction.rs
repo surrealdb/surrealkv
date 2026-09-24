@@ -1316,7 +1316,6 @@ impl<'a> TransactionRangeIterator<'a> {
 		let snapshot_iter = snapshot.range(lower.as_deref(), upper.as_deref())?;
 
 		// Collect write-set entries for the range
-		// We collect references to avoid cloning, and filter tombstones during iteration
 		let mut write_set_entries: Vec<(&'a Key, &'a Entry)> = Vec::new();
 		let ws_range = (
 			lower.map_or(Bound::Unbounded, Bound::Included),
