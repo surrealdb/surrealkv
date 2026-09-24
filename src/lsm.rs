@@ -1397,7 +1397,8 @@ impl Tree {
 			for (k, v) in records {
 				last_seq += 1;
 				let ikey = crate::InternalKey::new(k, last_seq, crate::InternalKeyKind::Set);
-				writer.add(ikey, &v)?;
+				let val_encoded = crate::vlog::ValueLocation::with_inline_value(v).encode();
+				writer.add(ikey, &val_encoded)?;
 			}
 			let file_size = writer.finish()? as u64;
 
