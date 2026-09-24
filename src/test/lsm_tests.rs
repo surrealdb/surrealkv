@@ -5945,3 +5945,26 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 		}
 	}
 }
+
+#[test(tokio::test)]
+async fn test_auto_migration_from_indxdb_dump() {
+	let temp_dir = tempfile::tempdir().unwrap();
+	let dump_file = temp_dir.path().join("indxdb_dump.bin");
+
+	let entries =
+		vec![(b"user:001".to_vec(), b"Alice".to_vec()), (b"user:002".to_vec(), b"Bob".to_vec())];
+
+	surrealkv_compat_indxdb::export_dump(&dump_file, &entries).unwrap();
+
+	// Open SurrealKV Tree at this directory — it should auto-migrate!
+	let tree = TreeBuilder::new().with_path(temp_dir.path().to_path_buf()).build().unwrap();
+
+	let tx = tree.begin().unwrap();
+	assert_eq!(tx.get(b"user:001").unwrap(), Some(b"Alice".to_vec()));
+	assert_eq!(tx.get(b"user:002").unwrap(), Some(b"Bob".to_vec()));
+
+	// Verify backup was created
+	assert!(temp_dir.path().join("_indxdb_backup/indxdb_dump.bin").exists());
+
+	tree.close().await.unwrap();
+}

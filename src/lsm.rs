@@ -1345,6 +1345,11 @@ impl Tree {
 			Self::migrate_from_v1(&opts)?;
 		}
 
+		// If the path contains an existing IndexedDB dump or store, automatically migrate it
+		if surrealkv_compat_indxdb::is_indxdb_dump_dir(&opts.path) {
+			Self::migrate_from_indxdb(&opts)?;
+		}
+
 		// Create all required directory structure
 		Self::create_directory_structure(&opts)?;
 
@@ -1517,6 +1522,76 @@ impl Tree {
 		}
 
 		log::info!("SurrealKV v1 to SurrealKV v2 automatic migration completed successfully!");
+		Ok(())
+	}
+
+	/// Automatically migrates an existing IndexedDB dump to SurrealKV v2 format.
+	fn migrate_from_indxdb(opts: &Options) -> Result<()> {
+		log::info!("Detected existing IndexedDB dump at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
+		let dump_file = if opts.path.is_dir() {
+			opts.path.join("indxdb_dump.bin")
+		} else {
+			opts.path.clone()
+		};
+
+		let records = surrealkv_compat_indxdb::read_dump(&dump_file).map_err(|e| {
+			Error::Other(format!("Failed to read IndexedDB dump for migration: {e}"))
+		})?;
+
+		log::info!(
+			"Read {} live records from IndexedDB dump. Creating backup and migrating...",
+			records.len()
+		);
+
+		// Create backup directory
+		let backup_dir = opts.path.join("_indxdb_backup");
+		create_dir_all(&backup_dir)?;
+
+		if dump_file.exists() {
+			let dest = backup_dir.join("indxdb_dump.bin");
+			let _ = std::fs::rename(&dump_file, dest);
+		}
+
+		// Now initialize directory structure
+		Self::create_directory_structure(opts)?;
+
+		if !records.is_empty() {
+			let table_id = 1;
+			let sst_path = opts.sstable_file_path(table_id);
+			let file = std::fs::File::create(&sst_path)?;
+			let opts_arc = Arc::new(opts.clone());
+			let mut writer =
+				crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&opts_arc), 0);
+
+			let mut last_seq = 0u64;
+			for (k, v) in records {
+				last_seq += 1;
+				let ikey = crate::InternalKey::new(k, last_seq, crate::InternalKeyKind::Set);
+				let val_encoded = crate::vlog::ValueLocation::with_inline_value(v).encode();
+				writer.add(ikey, &val_encoded)?;
+			}
+			let file_size = writer.finish()? as u64;
+
+			// Write manifest
+			let file: Arc<dyn crate::vfs::File> = Arc::new(std::fs::File::open(&sst_path)?);
+			let table = Arc::new(crate::sstable::table::Table::new(
+				table_id,
+				Arc::clone(&opts_arc),
+				file,
+				file_size,
+			)?);
+
+			let mut manifest = crate::levels::LevelManifest::new(Arc::clone(&opts_arc))?;
+			manifest.next_table_id.store(table_id + 1, std::sync::atomic::Ordering::Release);
+			manifest.last_sequence = last_seq;
+
+			let mut changeset = crate::levels::ManifestChangeSet::default();
+			changeset.new_tables.push((0, table));
+			manifest.apply_changeset(&changeset)?;
+			crate::levels::write_manifest_to_disk(&manifest)?;
+		}
+
+		log::info!("IndexedDB to SurrealKV v2 automatic migration completed successfully!");
 		Ok(())
 	}
 
