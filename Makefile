@@ -15,8 +15,8 @@ test:
 
 .PHONY: build-cli
 build-cli:
-	cargo build -p skv-cli
+	cargo build -p surrealkv-cli
 
 .PHONY: install-cli
 install-cli:
-	cargo install --path cli
+	cargo install --path crates/surrealkv-cli

@@ -97,7 +97,7 @@ use crate::{
 const TABLE_FOOTER_LENGTH: usize = 42;
 
 /// Full footer includes checksum: 42 + 8 = 50 bytes
-const TABLE_FULL_FOOTER_LENGTH: usize = TABLE_FOOTER_LENGTH + 8;
+pub(crate) const TABLE_FULL_FOOTER_LENGTH: usize = TABLE_FOOTER_LENGTH + 8;
 
 /// Magic number to identify valid SSTable files (arbitrary but unique)
 const TABLE_MAGIC_FOOTER_ENCODED: [u8; 8] = [0x57, 0xfb, 0x80, 0x8b, 0x24, 0x75, 0x47, 0xdb];
@@ -726,7 +726,7 @@ pub(crate) fn decompress_block(
 }
 
 /// Reads and decodes the footer from a file.
-fn read_footer(f: Arc<dyn File>, file_size: usize) -> Result<Footer> {
+pub(crate) fn read_footer(f: Arc<dyn File>, file_size: usize) -> Result<Footer> {
 	let buf = Footer::read_from(f, file_size)?;
 	Footer::decode(&buf)
 }
@@ -758,7 +758,7 @@ pub(crate) fn read_filter_block(
 	Ok(FilterBlockReader::new(buf, policy))
 }
 
-fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
+pub(crate) fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
 	let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set).encode();
 	let mut metaindexiter = metaix.iter()?;
 	metaindexiter.seek_internal(&meta_key)?;
