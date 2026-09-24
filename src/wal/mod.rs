@@ -147,11 +147,11 @@ const DEFAULT_FILE_SIZE: u64 = 100 * 1024 * 1024;
 #[derive(Clone)]
 pub struct Options {
 	/// The permission mode for creating directories (Unix only).
-	#[allow(dead_code)] // Used on Unix via #[cfg(unix)] in Wal::prepare_directory
+	#[cfg_attr(not(unix), allow(dead_code))]
 	pub(crate) dir_mode: Option<u32>,
 
 	/// The file mode to set for the segment file (Unix only).
-	#[allow(dead_code)] // Used on Unix via #[cfg(unix)] in Wal::open_wal_file
+	#[cfg_attr(not(unix), allow(dead_code))]
 	pub(crate) file_mode: Option<u32>,
 
 	/// The compression type to apply to the segment's data.
@@ -190,21 +190,21 @@ impl Options {
 	}
 
 	/// Sets the maximum file size.
-	#[allow(unused)]
+	#[cfg(test)]
 	pub(crate) fn with_max_file_size(mut self, max_file_size: u64) -> Self {
 		self.max_file_size = max_file_size;
 		self
 	}
 
 	/// Sets the compression type.
-	#[allow(unused)]
+	#[cfg(test)]
 	pub(crate) fn with_compression(mut self, compression_type: CompressionType) -> Self {
 		self.compression_type = compression_type;
 		self
 	}
 
 	/// Sets the file extension.
-	#[allow(unused)]
+	#[cfg(test)]
 	pub(crate) fn with_extension(mut self, extension: String) -> Self {
 		self.file_extension = Some(extension);
 		self

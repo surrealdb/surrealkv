@@ -10,12 +10,10 @@ use crate::{InternalKeyRange, Options, Result};
 /// Compaction priority strategy for selecting files to compact
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CompactionPriority {
-	#[allow(unused)]
 	/// Files whose range hasn't been compacted for the longest
 	OldestSmallestSeqFirst,
 
 	/// Files whose latest update is oldest
-	#[allow(unused)]
 	OldestLargestSeqFirst,
 
 	/// Larger files compensated by deletes (default)

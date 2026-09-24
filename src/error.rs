@@ -163,10 +163,8 @@ impl<T> From<std::sync::PoisonError<T>> for Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ErrorSeverity {
 	/// Error can be ignored
-	#[allow(unused)]
 	NoError = 0,
 	/// Error is recoverable, background work continues
-	#[allow(unused)]
 	SoftError = 1,
 	/// Error requires stopping writes, may auto-recover
 	HardError = 2,

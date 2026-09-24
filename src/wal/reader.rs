@@ -19,12 +19,6 @@ pub trait Reporter {
 	/// - `reason`: Description of the corruption
 	/// - `log_number`: The log number where corruption was found
 	fn corruption(&mut self, bytes: usize, reason: &str, log_number: u64);
-
-	/// Called when an old log record is encountered.
-	///
-	/// # Parameters
-	/// - `bytes`: Size of the old record
-	fn old_log_record(&mut self, bytes: usize);
 }
 
 /// Reader reads records from a single WAL file using block-based buffering.
@@ -80,7 +74,6 @@ impl Reader {
 	}
 
 	/// Creates a new Reader with custom options.
-	#[allow(dead_code)]
 	pub(crate) fn with_options(
 		file: File,
 		reporter: Option<Box<dyn Reporter>>,
@@ -113,18 +106,9 @@ impl Reader {
 	}
 
 	/// Reports corruption to the reporter if present.
-	#[allow(dead_code)]
 	fn report_corruption(&mut self, bytes: usize, reason: &str) {
 		if let Some(ref mut reporter) = self.reporter {
 			reporter.corruption(bytes, reason, self.log_number);
-		}
-	}
-
-	/// Reports an old log record to the reporter if present.
-	#[allow(dead_code)]
-	fn report_old_log_record(&mut self, bytes: usize) {
-		if let Some(ref mut reporter) = self.reporter {
-			reporter.old_log_record(bytes);
 		}
 	}
 

@@ -64,8 +64,6 @@ proptest = "1.4"
 # `#[expect]` attributes suppress the lint emission, but emit a warning if the expectation is unfulfilled.
 # This is useful to be notified when the lint is no longer triggered.
 # https://rust-lang.github.io/rust-clippy/master/#allow_attributes
-# TODO(stu): We should try to replace all of these with `#[expect]` instead. Setting to `allow` for now to avoid
-# more changes.
 allow_attributes = "allow"
 
 # Checks for code like `foo = bar.clone();`.
@@ -195,7 +193,6 @@ used_underscore_binding = "warn"
 
 # Checks for `.unwrap()` or `.unwrap_err()` calls on Results and `.unwrap()` call on `Option`s.
 # https://rust-lang.github.io/rust-clippy/master/index.html#unwrap_used
-# TODO(Farhan): This must be changed to `warn`.
 unwrap_used = "allow"
 
 [[bench]]

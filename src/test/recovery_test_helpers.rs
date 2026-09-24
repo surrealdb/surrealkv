@@ -14,38 +14,6 @@ use crate::{LSMIterator, Tree};
 pub struct RecoveryTestHelper;
 
 impl RecoveryTestHelper {
-	/// Fill data across multiple WAL segments by triggering memtable rotations
-	///
-	/// Returns the total number of keys written
-	#[allow(unused)]
-	pub async fn fill_multiple_wal_segments(
-		tree: &Tree,
-		wal_count: usize,
-		keys_per_wal: usize,
-	) -> usize {
-		let mut total_keys = 0;
-
-		for wal_idx in 0..wal_count {
-			for key_idx in 0..keys_per_wal {
-				let key = format!("key_{:05}", total_keys);
-				let value = format!("value_wal{}_key{}", wal_idx, key_idx);
-
-				let mut txn = tree.begin().unwrap();
-				txn.set(key.as_bytes(), value.as_bytes()).unwrap();
-				txn.commit().await.unwrap();
-
-				total_keys += 1;
-			}
-
-			// Trigger flush to rotate to next WAL (except for last iteration)
-			if wal_idx < wal_count - 1 {
-				tree.flush().unwrap();
-			}
-		}
-
-		total_keys
-	}
-
 	/// Count WAL files in directory
 	pub fn count_wal_files(wal_dir: &Path) -> usize {
 		if !wal_dir.exists() {
@@ -157,51 +125,6 @@ impl WalTestHelper {
 
 		wal.close().unwrap();
 		current_seq
-	}
-
-	/// Create a segment with a specific sequence range
-	#[allow(unused)]
-	pub fn create_segment_with_seq_range(
-		dir: &Path,
-		segment_id: u64,
-		seq_start: u64,
-		seq_end: u64,
-	) {
-		// If segment_id > 0, we need to create previous segments first
-		if segment_id > 0 {
-			let opts = Options::default();
-			let mut wal = Wal::open(dir, opts).unwrap();
-
-			// Rotate to reach the desired segment_id
-			for _ in 0..segment_id {
-				wal.rotate().unwrap();
-			}
-
-			// Now create the batch for this segment
-			let entry_count = (seq_end - seq_start + 1) as usize;
-			let mut batch = Batch::new(seq_start);
-			for i in 0..entry_count {
-				let key = format!("key{}", seq_start + i as u64);
-				let value = format!("value{}", seq_start + i as u64);
-				batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
-			}
-			wal.append(&batch.encode().unwrap()).unwrap();
-			wal.close().unwrap();
-		} else {
-			// Segment 0 - create directly
-			let opts = Options::default();
-			let mut wal = Wal::open(dir, opts).unwrap();
-
-			let entry_count = (seq_end - seq_start + 1) as usize;
-			let mut batch = Batch::new(seq_start);
-			for i in 0..entry_count {
-				let key = format!("key{}", seq_start + i as u64);
-				let value = format!("value{}", seq_start + i as u64);
-				batch.set(key.as_bytes().to_vec(), value.as_bytes().to_vec(), 0).unwrap();
-			}
-			wal.append(&batch.encode().unwrap()).unwrap();
-			wal.close().unwrap();
-		}
 	}
 
 	/// Corrupt a segment at a specific offset percentage
