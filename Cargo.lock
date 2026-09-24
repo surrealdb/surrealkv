@@ -1093,6 +1093,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "surrealkv-compat-rocksdb"
+version = "0.1.0"
+dependencies = [
+ "crc32fast",
+ "log",
+ "lz4_flex",
+ "snap",
+ "tempfile",
+ "thiserror",
+ "zstd",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.114"
 source = "registry+https://github.com/rust-lang/crates.io-index"

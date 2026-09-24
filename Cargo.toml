@@ -1,3 +1,9 @@
+[workspace]
+members = [
+	".",
+	"crates/surrealkv-compat-rocksdb",
+]
+
 [package]
 name = "surrealkv"
 publish = true
