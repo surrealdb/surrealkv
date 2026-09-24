@@ -5,9 +5,9 @@ build: check
 
 # This command checks the licenses of all dependencies, formats the code, and runs the Clippy linter.
 check:
-	cargo deny --all-features check licenses
+	cargo deny check licenses
 	cargo fmt --all -- --check
-	cargo clippy --all --all-targets
+	cargo clippy --workspace --all-targets -- -D warnings
 
 # This command runs the tests with backtrace enabled.
 test:
