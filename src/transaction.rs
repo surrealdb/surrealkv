@@ -275,12 +275,14 @@ impl Transaction {
 		let start_seq_num = core.seq_num();
 
 		// Register this txn's start_seq with the GC watermark tracker.
-		// Both read-write and write-only txns register here (write-only txns
-		// don't get a Snapshot, so SnapshotTracker alone wouldn't see them).
-		// See registration-race proof in the plan: visible_seq_num is
-		// strictly monotonic, so this load-then-register sequence cannot
-		// cause GC to advance past our start_seq.
-		let txn_guard = Some(core.active_txn_tracker.register(start_seq_num));
+		// Only mutating transactions (ReadWrite and WriteOnly) register here
+		// because ReadOnly transactions never commit or write, eliminating
+		// global write lock contention on the read path.
+		let txn_guard = if mode.is_read_only() {
+			None
+		} else {
+			Some(core.active_txn_tracker.register(start_seq_num))
+		};
 
 		let mut snapshot = None;
 		if !mode.is_write_only() {

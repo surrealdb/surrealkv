@@ -37,13 +37,23 @@
 //   enough to dominate.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
 
+const NUM_TXN_SHARDS: usize = 64;
+
+fn get_thread_shard_index() -> usize {
+	static SHARD_COUNTER: AtomicUsize = AtomicUsize::new(0);
+	thread_local! {
+		static SHARD_ID: usize = SHARD_COUNTER.fetch_add(1, Ordering::Relaxed);
+	}
+	SHARD_ID.with(|id| *id % NUM_TXN_SHARDS)
+}
+
 pub(crate) struct ActiveTxnTracker {
-	seqs: Arc<RwLock<BTreeSet<(u64, u64)>>>,
+	shards: Arc<[RwLock<BTreeSet<(u64, u64)>>; NUM_TXN_SHARDS]>,
 	next_id: AtomicU64,
 }
 
@@ -55,8 +65,12 @@ impl Default for ActiveTxnTracker {
 
 impl ActiveTxnTracker {
 	pub(crate) fn new() -> Self {
+		let shards: Vec<RwLock<BTreeSet<(u64, u64)>>> =
+			(0..NUM_TXN_SHARDS).map(|_| RwLock::new(BTreeSet::new())).collect();
+		let shards: Box<[RwLock<BTreeSet<(u64, u64)>>; NUM_TXN_SHARDS]> =
+			shards.into_boxed_slice().try_into().unwrap_or_else(|_| panic!("size mismatch"));
 		Self {
-			seqs: Arc::new(RwLock::new(BTreeSet::new())),
+			shards: Arc::from(shards),
 			next_id: AtomicU64::new(0),
 		}
 	}
@@ -66,22 +80,27 @@ impl ActiveTxnTracker {
 	pub(crate) fn register(self: &Arc<Self>, start_seq: u64) -> ActiveTxnGuard {
 		let id = self.next_id.fetch_add(1, Ordering::Relaxed);
 		let entry = (start_seq, id);
-		self.seqs.write().insert(entry);
+		let shard_idx = get_thread_shard_index();
+		self.shards[shard_idx].write().insert(entry);
 		ActiveTxnGuard {
 			tracker: Arc::clone(self),
 			entry,
+			shard_idx,
 			released: false,
 		}
 	}
 
 	/// Smallest `start_seq` currently registered. `None` if empty.
 	pub(crate) fn oldest(&self) -> Option<u64> {
-		self.seqs.read().first().map(|e| e.0)
+		self.shards
+			.iter()
+			.filter_map(|s| s.read().first().map(|e| e.0))
+			.min()
 	}
 
 	#[cfg(test)]
 	pub(crate) fn len(&self) -> usize {
-		self.seqs.read().len()
+		self.shards.iter().map(|s| s.read().len()).sum()
 	}
 }
 
@@ -90,6 +109,7 @@ impl ActiveTxnTracker {
 pub(crate) struct ActiveTxnGuard {
 	tracker: Arc<ActiveTxnTracker>,
 	entry: (u64, u64),
+	shard_idx: usize,
 	released: bool,
 }
 
@@ -97,7 +117,7 @@ impl ActiveTxnGuard {
 	/// Release the slot eagerly. Idempotent.
 	pub(crate) fn release(&mut self) {
 		if !self.released {
-			self.tracker.seqs.write().remove(&self.entry);
+			self.tracker.shards[self.shard_idx].write().remove(&self.entry);
 			self.released = true;
 		}
 	}
