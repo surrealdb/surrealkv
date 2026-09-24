@@ -447,6 +447,12 @@ impl<W: Write> TableWriter<W> {
 		Ok(())
 	}
 
+	/// Adds a range deletion to the table metadata without inserting into point-key data blocks.
+	pub(crate) fn add_range_deletion(&mut self, start: Key, end: Key, seq_num: u64) {
+		self.meta.properties.num_range_deletions += 1;
+		self.meta.range_deletions.push((start, end, seq_num));
+	}
+
 	/// Flushes the current data block and creates an index entry.
 	///
 	/// ## Index Entry Creation
