@@ -5049,7 +5049,10 @@ async fn test_vlog_files_persist_across_restart() {
 	for iteration in 1..=5 {
 		log::info!("=== Restart iteration {}/5 ===", iteration);
 
-		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let tree = match Tree::new(Arc::clone(&opts)) {
+			Ok(t) => t,
+			Err(e) => panic!("Tree::new failed in iteration {iteration}: {e:?}"),
+		};
 
 		// Count VLog files after restart (before adding new entries)
 		let vlog_dir = path.join("vlog");
