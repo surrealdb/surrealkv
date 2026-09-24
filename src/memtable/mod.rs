@@ -354,7 +354,7 @@ impl MemTable {
 		}
 	}
 
-	#[allow(unused)]
+	#[cfg(test)]
 	pub(crate) fn lsn(&self) -> u64 {
 		self.latest_seq_num.load(Ordering::Acquire)
 	}

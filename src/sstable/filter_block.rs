@@ -139,7 +139,7 @@ impl FilterBlockReader {
 		// Directly use the provided block offset as the block index.
 		let block_index = block_offset >> self.base_lg;
 
-		// TODO: What to do in this scenario?
+		// Conservatively assume key may be present if block index is beyond known filter offsets.
 		if block_index >= self.filter_offsets.len() {
 			return true;
 		}

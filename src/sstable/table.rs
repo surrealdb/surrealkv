@@ -858,7 +858,6 @@ pub(crate) struct Table {
 	pub id: u64,
 	pub file: Arc<dyn File>,
 	pub(crate) object_store: Arc<dyn crate::storage::ObjectStore>,
-	#[allow(unused)]
 	pub file_size: u64,
 
 	pub(crate) opts: Arc<Options>,

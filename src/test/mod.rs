@@ -4,11 +4,9 @@
 //! including WAL recovery, memtable flush, SST interaction, and manifest
 //! coordination.
 
-use std::collections::HashMap;
-
 use crate::snapshot::SnapshotIterator;
 use crate::vlog::ValueLocation;
-use crate::{InternalKey, Key, LSMIterator, Result, Value};
+use crate::{InternalKey, LSMIterator, Result};
 
 #[cfg(test)]
 pub mod atomic_memtable_tests;
@@ -150,87 +148,4 @@ fn collect_snapshot_reverse(iter: &mut SnapshotIterator) -> Result<Vec<(Internal
 		}
 	}
 	Ok(result)
-}
-
-/// Type alias for a map of keys to their version information
-/// Each key maps to a vector of (value, timestamp, is_tombstone) tuples
-#[allow(dead_code)]
-type KeyVersionsMap = HashMap<Key, Vec<(Vec<u8>, u64, bool)>>;
-
-/// Collects all entries from a history iterator
-/// Returns a vector of (key, value, timestamp, is_tombstone) tuples
-#[allow(dead_code)]
-fn collect_history_all(iter: &mut impl LSMIterator) -> crate::Result<Vec<(Key, Value, u64, bool)>> {
-	iter.seek_first()?;
-	let mut result = Vec::new();
-	while iter.valid() {
-		let key_ref = iter.key();
-		let is_tombstone = key_ref.is_tombstone();
-		// Tombstones have no value, so use empty vec
-		let value = if is_tombstone {
-			Vec::new()
-		} else {
-			iter.value()?
-		};
-		result.push((key_ref.user_key().to_vec(), value, key_ref.timestamp(), is_tombstone));
-		iter.next()?;
-	}
-	Ok(result)
-}
-
-/// Gets a point-in-time snapshot of key-values from a history iterator
-/// Returns the latest version of each key at or before the given timestamp
-///
-/// IMPORTANT: The iterator MUST be created with include_tombstones=true for this
-/// function to correctly handle deleted keys. If tombstones are not included,
-/// soft-deleted keys will incorrectly appear in the results.
-#[allow(dead_code)]
-fn point_in_time_from_history(
-	iter: &mut impl LSMIterator,
-	timestamp: u64,
-) -> crate::Result<Vec<(Key, Value)>> {
-	use std::collections::BTreeMap;
-
-	iter.seek_first()?;
-	// Track the latest entry for each key by timestamp (value, timestamp, is_tombstone)
-	let mut latest_entries: BTreeMap<Key, (Option<Value>, u64, bool)> = BTreeMap::new();
-
-	while iter.valid() {
-		let key_ref = iter.key();
-		let ts = key_ref.timestamp();
-		let key = key_ref.user_key().to_vec();
-		let is_tombstone = key_ref.is_tombstone();
-
-		// Only consider versions at or before the requested timestamp
-		if ts <= timestamp {
-			// Check if we need to update this key's entry (higher timestamp wins)
-			let should_update = match latest_entries.get(&key) {
-				None => true,
-				Some((_, existing_ts, _)) => ts > *existing_ts,
-			};
-
-			if should_update {
-				let value = if is_tombstone {
-					None
-				} else {
-					Some(iter.value()?)
-				};
-				latest_entries.insert(key.clone(), (value, ts, is_tombstone));
-			}
-		}
-
-		iter.next()?;
-	}
-
-	// Filter out tombstones - keys whose latest entry is a delete
-	Ok(latest_entries
-		.into_iter()
-		.filter_map(|(k, (v, _, is_tombstone))| {
-			if is_tombstone {
-				None
-			} else {
-				Some((k, v.unwrap()))
-			}
-		})
-		.collect())
 }

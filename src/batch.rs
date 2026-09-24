@@ -47,7 +47,6 @@ impl Batch {
 		}
 	}
 
-	// TODO: add a test for grow
 	pub(crate) fn grow(&mut self, record_size: u64) -> Result<()> {
 		if self.size + record_size > MAX_BATCH_SIZE {
 			return Err(Error::BatchTooLarge);

@@ -560,9 +560,8 @@ pub(crate) struct KMergeIterator<'iter> {
 	/// `iter_state` in order to ensure it is dropped before `iter_state`.
 	iterators: Vec<BoxedLSMIterator<'iter>>,
 
-	// Owned state
-	#[allow(dead_code)]
-	iter_state: Box<IterState>,
+	// Owned state retained for drop order and backing buffer lifetime
+	_iter_state: Box<IterState>,
 
 	/// Current winner index (None if exhausted)
 	winner: Option<usize>,
@@ -700,7 +699,7 @@ impl<'a> KMergeIterator<'a> {
 
 		Self {
 			iterators,
-			iter_state: boxed_state,
+			_iter_state: boxed_state,
 			winner: None,
 			active_count: 0,
 			direction: MergeDirection::Forward,
@@ -989,9 +988,8 @@ pub(crate) struct SnapshotIterator<'a> {
 	/// Sequence number for visibility
 	snapshot_seq_num: u64,
 
-	/// Core for resolving values
-	#[allow(dead_code)]
-	core: Arc<Core>,
+	/// Core handle retained for lifetime of in-flight iteration
+	_core: Arc<Core>,
 
 	/// Last user key seen (forward direction) - reusable buffer
 	last_key_fwd: Vec<u8>,
@@ -1046,7 +1044,7 @@ impl SnapshotIterator<'_> {
 		Ok(Self {
 			merge_iter,
 			snapshot_seq_num: seq_num,
-			core,
+			_core: core,
 			range_deletions,
 			last_key_fwd: Vec::new(),
 			buffered_back_key: Vec::new(),
@@ -1123,19 +1121,10 @@ impl SnapshotIterator<'_> {
 
 	/// Find the latest visible version of the next user key going backward.
 	///
-	/// Backward iteration sees the oldest version of each user key first
-	/// (lowest seq_num) and must walk back to the newest, picking the latest
-	/// version that is visible to this snapshot. If that latest version turns
-	/// out to be a tombstone (or no visible version exists at all), we must
-	/// skip the user key entirely and examine the next one back.
+	/// Finds the latest visible entry for the current user key during backward iteration.
 	///
-	/// This was previously implemented via mutual tail-recursion between
-	/// `find_latest_visible_backward` and `skip_to_valid_backward`. Each
-	/// fully-tombstoned (or fully-invisible) user key consumed two stack
-	/// frames, so a backward range scan over a long run of such keys --- a
-	/// pattern that occurs naturally after deletes against an MVCC store ---
-	/// would overflow the thread stack. The loop below is semantically
-	/// identical but uses O(1) stack regardless of how many user keys we skip.
+	/// Iterates iteratively in O(1) stack space, skipping keys covered by tombstones
+	/// or invisible to this snapshot until a valid live entry is found or the iterator exhausts.
 	fn find_latest_visible_backward(&mut self) -> Result<bool> {
 		loop {
 			// Position merge_iter at the start of the next user key to examine.

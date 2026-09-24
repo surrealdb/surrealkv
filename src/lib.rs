@@ -40,13 +40,18 @@ use std::fmt::Debug;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub use compaction::leveled::CompactionPriority;
 pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
 use sstable::bloom::LevelDBBloomFilter;
 pub use sstable::ribbon::RibbonFilter;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
-pub use crate::error::{Error, Result};
+pub use crate::error::{
+	BackgroundError, BackgroundErrorHandler, BackgroundErrorReason, Error, ErrorSeverity, Result,
+	WriteStallReason,
+};
 pub use crate::lsm::{Tree, TreeBuilder};
+pub use crate::stall::WriteStallInfo;
 pub use crate::transaction::{
 	Durability, HistoryOptions, Mode, ReadOptions, Transaction, WriteOptions,
 };

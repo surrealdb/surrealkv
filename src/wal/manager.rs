@@ -210,7 +210,7 @@ impl Wal {
 		Ok(CompressionType::None)
 	}
 
-	#[allow(unused_variables)] // opts used on Unix via #[cfg(unix)] below
+	#[cfg_attr(not(unix), allow(unused_variables))]
 	fn open_wal_file(file_path: &Path, opts: &Options) -> Result<File> {
 		let mut open_options = OpenOptions::new();
 		open_options.read(true).write(true).create(true).append(true);
@@ -226,7 +226,7 @@ impl Wal {
 		Ok(open_options.open(file_path)?)
 	}
 
-	#[allow(unused_variables)] // Parameters used on Unix via #[cfg(unix)] below
+	#[cfg_attr(not(unix), allow(unused_variables))]
 	fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
 		// Directory should already be created by Tree::new()
 		// Set permissions on Unix only; Windows NTFS uses ACLs and

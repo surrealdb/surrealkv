@@ -9,28 +9,18 @@ use crate::memtable::MemTable;
 use crate::wal::reader::{Reader, Reporter};
 use crate::wal::{get_segment_range, list_segment_ids, Error as WalError, SegmentRef};
 
-/// Default implementation of the Reporter trait for WAL recovery.
-///
-/// This reporter logs corruption events and tracks statistics about
+/// Default implementation of the Reporter trait for standard
 /// recovery operations.
 pub struct DefaultReporter {
-	/// The log number being processed
-	log_number: u64,
-
 	/// Count of corruption events encountered
 	corruption_count: usize,
-
-	/// Count of old log records encountered
-	old_record_count: usize,
 }
 
 impl DefaultReporter {
-	/// Creates a new DefaultReporter for the specified log number.
-	pub fn new(log_number: u64) -> Self {
+	/// Creates a new DefaultReporter.
+	pub fn new(_log_number: u64) -> Self {
 		Self {
-			log_number,
 			corruption_count: 0,
-			old_record_count: 0,
 		}
 	}
 }
@@ -39,11 +29,6 @@ impl Reporter for DefaultReporter {
 	fn corruption(&mut self, bytes: usize, reason: &str, log_number: u64) {
 		log::error!("Corruption in WAL {}: {} bytes lost - {}", log_number, bytes, reason);
 		self.corruption_count += 1;
-	}
-
-	fn old_log_record(&mut self, bytes: usize) {
-		log::warn!("Old log record encountered in WAL {}: {} bytes", self.log_number, bytes);
-		self.old_record_count += 1;
 	}
 }
 

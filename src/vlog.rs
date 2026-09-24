@@ -285,8 +285,7 @@ impl ValueLocation {
 		Ok(Self::new(meta, value, version))
 	}
 
-	/// Resolves the actual value, handling both inline and pointer cases
-	// TODO:: Check if this pattern copies the value unnecessarily.
+	/// Resolves the actual value, returning inline bytes directly or fetching from VLog.
 	pub(crate) fn resolve_value(self, vlog: Option<&Arc<VLog>>) -> Result<Value> {
 		if self.is_value_pointer() {
 			if let Some(vlog) = vlog {
@@ -497,8 +496,8 @@ impl VLogWriter {
 		Ok(ValuePointer::new(self.file_id, offset, key_len, value_len, crc32))
 	}
 
-	/// Flushes and syncs the writer (flush to OS cache + fsync to disk).
-	#[cfg_attr(not(test), allow(dead_code))]
+	/// Flushes and syncs the writer (test helper).
+	#[cfg(test)]
 	pub(crate) fn sync(&mut self) -> Result<()> {
 		self.writer.flush()?;
 		self.writer.get_ref().sync_all()?;

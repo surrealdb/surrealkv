@@ -21,8 +21,7 @@ use crate::{CompressionType, InternalKey, InternalKeyKind, Key, LSMIterator, Opt
 
 /// Test environment setup helpers
 struct TestEnv {
-	#[allow(unused)]
-	temp_dir: TempDir,
+	_temp_dir: TempDir,
 	options: Arc<Options>,
 }
 
@@ -44,7 +43,7 @@ impl TestEnv {
 		});
 
 		Self {
-			temp_dir,
+			_temp_dir: temp_dir,
 			options,
 		}
 	}
@@ -1330,8 +1329,6 @@ async fn test_compaction_with_large_keys_and_values() {
 	);
 }
 
-// TODO: add more tests for:
-// - Compaction with keys that are split across multiple tables
 #[test(tokio::test)]
 async fn test_compaction_respects_sequence_numbers() {
 	let env = TestEnv::new();
