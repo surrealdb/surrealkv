@@ -1,0 +1,18 @@
+[package]
+name = "surrealkv-compat-v1"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Pure-Rust reader and migrator for legacy SurrealKV V1 files"
+
+[dependencies]
+crc32fast = "1.2"
+lz4_flex = "0.12"
+snap = "1.0"
+zstd = { version = "0.13", default-features = false }
+thiserror = "2"
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3.10"
