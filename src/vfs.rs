@@ -28,6 +28,7 @@ impl File for InMemoryFile {
 }
 
 impl File for SysFile {
+	#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
 	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
 		#[cfg(unix)]
 		{

@@ -126,6 +126,7 @@ pub fn inspect_db<P: AsRef<Path>>(db_path: P) -> Result<DbInfo> {
 
 	// Check lock status
 	let lock_path = opts.path.join("LOCK");
+	#[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
 	let mut is_locked = false;
 	let mut lock_pid = None;
 

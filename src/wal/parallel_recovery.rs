@@ -6,6 +6,7 @@
 
 use std::fs::File;
 use std::path::Path;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -96,7 +97,7 @@ pub(crate) fn replay_segments_sync(
 			}
 			memtables.push((current_memtable, seg.id));
 		}
-		return Ok((max_seq, memtables));
+		Ok((max_seq, memtables))
 	}
 
 	#[cfg(not(target_arch = "wasm32"))]
@@ -124,6 +125,7 @@ pub(crate) fn replay_segments_sync(
 
 /// Replays a slice of segments in parallel using affinitypool, applying batches
 /// sequentially into memtables to maintain strict WAL order.
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn replay_segments_parallel(
 	segments: &[SegmentRef],
 	arena_size: usize,

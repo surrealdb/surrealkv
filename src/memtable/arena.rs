@@ -30,6 +30,7 @@ unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
 
 impl Arena {
+	#[cfg_attr(target_pointer_width = "32", allow(clippy::unnecessary_min_or_max))]
 	pub(crate) fn new(capacity: usize) -> Self {
 		let capacity = capacity.min(MAX_ARENA_SIZE);
 		let buf = vec![0u8; capacity].into_boxed_slice();
