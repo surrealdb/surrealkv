@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
-use crate::Key;
+use surrealkv::Key;
 
 #[derive(Debug, Clone)]
 pub enum Action {

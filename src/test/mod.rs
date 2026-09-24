@@ -43,8 +43,6 @@ pub mod recovery_test_helpers;
 #[cfg(test)]
 pub mod recovery_tests;
 #[cfg(test)]
-pub mod sim;
-#[cfg(test)]
 pub mod snapshot_tests;
 #[cfg(test)]
 pub mod sstable_tests;

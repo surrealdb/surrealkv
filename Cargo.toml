@@ -2,6 +2,7 @@
 members = [
 	".",
 	"crates/surrealkv-compat-rocksdb",
+	"crates/surrealkv-sim",
 ]
 
 [package]

@@ -11,7 +11,7 @@ check:
 
 # This command runs the tests with backtrace enabled.
 test:
-	RUST_BACKTRACE=1 cargo test
+	RUST_BACKTRACE=1 cargo test --workspace
 
 .PHONY: build-cli
 build-cli:
