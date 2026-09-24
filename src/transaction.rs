@@ -632,14 +632,20 @@ impl Transaction {
 
 		// RYOW semantics: Read your own writes. If the value is in the write set,
 		// return it.
-		let mut range_delete_entry = None;
+		let mut range_delete_entry: Option<&Entry> = None;
 		for (start, entries) in &self.write_set {
-			if let Some(entry) = entries.last() {
+			for entry in entries {
 				if entry.kind == InternalKeyKind::RangeDelete {
 					if let Some(ref end) = entry.value {
 						let k = key.as_slice();
 						if k >= start.as_slice() && k < end.as_slice() {
-							range_delete_entry = Some(entry);
+							if let Some(prev) = range_delete_entry {
+								if entry.seqno > prev.seqno {
+									range_delete_entry = Some(entry);
+								}
+							} else {
+								range_delete_entry = Some(entry);
+							}
 						}
 					}
 				}
@@ -1076,7 +1082,7 @@ impl Drop for Transaction {
 }
 
 /// Represents a pending write operation in a transaction's write set
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Entry {
 	/// The key being written
 	pub(crate) key: Key,

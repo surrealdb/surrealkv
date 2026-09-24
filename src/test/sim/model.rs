@@ -17,21 +17,31 @@ pub struct ModelDb {
 	version: u64,
 	/// History of committed key modifications by version: (version, modified_keys)
 	commit_log: Vec<(u64, Vec<Key>)>,
+	/// Versioned snapshot history for snapshot isolation reads
+	history: BTreeMap<u64, BTreeMap<Key, Vec<u8>>>,
 }
 
 impl ModelDb {
 	/// Creates a new empty reference model.
 	pub fn new() -> Self {
+		let mut history = BTreeMap::new();
+		history.insert(0, BTreeMap::new());
 		Self {
 			data: BTreeMap::new(),
 			version: 0,
 			commit_log: Vec::new(),
+			history,
 		}
 	}
 
 	/// Retrieves the value for a key from the committed state.
 	pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
 		self.data.get(key).cloned()
+	}
+
+	/// Retrieves the value for a key as of a specific historical version.
+	pub fn get_at_version(&self, key: &[u8], version: u64) -> Option<Vec<u8>> {
+		self.history.get(&version).and_then(|map| map.get(key).cloned())
 	}
 
 	/// Performs a range scan over the committed state.
@@ -59,6 +69,7 @@ impl ModelDb {
 		ModelTxn {
 			start_version: self.version,
 			ops: Vec::new(),
+			savepoints: Vec::new(),
 		}
 	}
 
@@ -107,13 +118,14 @@ impl ModelDb {
 
 		self.version += 1;
 		self.commit_log.push((self.version, modified_keys));
+		self.history.insert(self.version, self.data.clone());
 		Ok(())
 	}
 }
 
 /// Operation performed within a model transaction.
 #[derive(Debug, Clone)]
-enum ModelOp {
+pub enum ModelOp {
 	Put(Vec<u8>),
 	Delete,
 	DeleteRange(Key),
@@ -121,8 +133,9 @@ enum ModelOp {
 
 /// A transaction on the reference model.
 pub struct ModelTxn {
-	start_version: u64,
-	ops: Vec<(Key, ModelOp)>,
+	pub start_version: u64,
+	pub ops: Vec<(Key, ModelOp)>,
+	pub savepoints: Vec<usize>,
 }
 
 impl ModelTxn {
@@ -137,6 +150,39 @@ impl ModelTxn {
 	pub fn delete_range(&mut self, start: &[u8], end: &[u8]) {
 		if start < end {
 			self.ops.push((start.to_vec(), ModelOp::DeleteRange(end.to_vec())));
+		}
+	}
+
+	/// Read-Your-Own-Writes: reads within uncommitted transaction, falling back to committed state.
+	pub fn get(&self, key: &[u8], committed: &ModelDb) -> Option<Vec<u8>> {
+		for (k, op) in self.ops.iter().rev() {
+			if k == key {
+				return match op {
+					ModelOp::Put(v) => Some(v.clone()),
+					ModelOp::Delete => None,
+					ModelOp::DeleteRange(_) => None,
+				};
+			}
+			if let ModelOp::DeleteRange(end) = op {
+				if key >= k.as_slice() && key < end.as_slice() {
+					return None;
+				}
+			}
+		}
+		committed.get_at_version(key, self.start_version)
+	}
+
+	/// Pushes a savepoint and returns the savepoint number.
+	pub fn set_savepoint(&mut self) -> u32 {
+		let sp = self.savepoints.len() as u32;
+		self.savepoints.push(self.ops.len());
+		sp
+	}
+
+	/// Rolls back operations to the latest savepoint.
+	pub fn rollback_to_savepoint(&mut self) {
+		if let Some(len) = self.savepoints.pop() {
+			self.ops.truncate(len);
 		}
 	}
 }
