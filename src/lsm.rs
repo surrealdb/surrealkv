@@ -1327,14 +1327,16 @@ impl Tree {
 		// Validate options before creating the tree
 		opts.validate()?;
 
+		// If the path contains an existing RocksDB database, automatically migrate it in pure Rust
+		if surrealkv_compat_rocksdb::is_rocksdb_dir(&opts.path) {
+			Self::migrate_from_rocksdb(&opts)?;
+		}
+
 		// Create all required directory structure
 		Self::create_directory_structure(&opts)?;
 
 		// Create the core LSM tree components
 		let core = Core::new(Arc::clone(&opts))?;
-
-		// TODO: Add file to write options manifest
-		// TODO: Add version header in file similar to table in WAL
 
 		// Ensure directory changes are persisted
 		sync_directory_structure(&opts)?;
@@ -1342,6 +1344,82 @@ impl Tree {
 		Ok(Self {
 			core: Arc::new(core),
 		})
+	}
+
+	/// Automatically migrates an existing RocksDB database to SurrealKV v2 format in pure Rust.
+	fn migrate_from_rocksdb(opts: &Options) -> Result<()> {
+		log::info!("Detected existing RocksDB database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
+		let records = surrealkv_compat_rocksdb::read_all_latest(&opts.path).map_err(|e| {
+			Error::Other(format!("Failed to read RocksDB database for migration: {e}"))
+		})?;
+
+		log::info!("Read {} live records from RocksDB. Creating backup and migrating...", records.len());
+
+		// Create backup directory
+		let backup_dir = opts.path.join("_rocksdb_backup");
+		create_dir_all(&backup_dir)?;
+
+		// Move all RocksDB legacy files into backup
+		if let Ok(entries) = std::fs::read_dir(&opts.path) {
+			for entry in entries.flatten() {
+				let p = entry.path();
+				let name = entry.file_name().to_string_lossy().to_string();
+				if name == "_rocksdb_backup" {
+					continue;
+				}
+				// RocksDB files: CURRENT, MANIFEST-*, OPTIONS-*, IDENTITY, LOCK, *.sst, *.log, *.dbtmp
+				if name.starts_with("MANIFEST-")
+					|| name.starts_with("OPTIONS-")
+					|| name == "CURRENT"
+					|| name == "IDENTITY"
+					|| name == "LOCK"
+					|| name.ends_with(".sst")
+					|| name.ends_with(".log")
+					|| name.ends_with(".dbtmp")
+				{
+					let dest = backup_dir.join(&name);
+					let _ = std::fs::rename(&p, dest);
+				}
+			}
+		}
+
+		// Now initialize directory structure and populate with records
+		Self::create_directory_structure(opts)?;
+		let core = Core::new(Arc::new(opts.clone()))?;
+		let tree = Tree { core: Arc::new(core) };
+
+		if !records.is_empty() {
+			let mut tx = tree.begin_with_mode(Mode::ReadWrite)?;
+			for (k, v) in records {
+				tx.set(k, v)?;
+			}
+			if let Ok(handle) = tokio::runtime::Handle::try_current() {
+				std::thread::scope(|s| {
+					s.spawn(|| {
+						handle.block_on(tx.commit())
+					}).join().unwrap()
+				})?;
+			} else {
+				let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+				rt.block_on(tx.commit())?;
+			}
+		}
+
+		// Close temporary tree to flush WAL and seal manifest
+		let tree_clone = tree.clone();
+		if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			std::thread::scope(|s| {
+				s.spawn(|| {
+					handle.block_on(tree_clone.close())
+				}).join().unwrap()
+			})?;
+		} else {
+			let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+			rt.block_on(tree_clone.close())?;
+		}
+
+		log::info!("RocksDB to SurrealKV v2 automatic migration completed successfully!");
+		Ok(())
 	}
 
 	/// Creates all required directory structure for the LSM tree
