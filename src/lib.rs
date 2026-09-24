@@ -1,6 +1,7 @@
 pub mod autotune;
 mod batch;
-pub mod byteslice;
+pub use byteslice;
+pub use byteslice::ByteSlice;
 mod cache;
 mod checkpoint;
 mod clock;
@@ -114,6 +115,30 @@ impl IntoBytes for Box<[u8]> {
 
 	fn into_bytes(self) -> Value {
 		self.into_vec()
+	}
+}
+
+impl IntoBytes for ByteSlice {
+	#[inline]
+	fn as_slice(&self) -> &[u8] {
+		ByteSlice::as_slice(self)
+	}
+
+	#[inline]
+	fn into_bytes(self) -> Value {
+		self.to_vec()
+	}
+}
+
+impl IntoBytes for &ByteSlice {
+	#[inline]
+	fn as_slice(&self) -> &[u8] {
+		ByteSlice::as_slice(self)
+	}
+
+	#[inline]
+	fn into_bytes(self) -> Value {
+		self.to_vec()
 	}
 }
 
