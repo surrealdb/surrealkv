@@ -1383,39 +1383,41 @@ impl Tree {
 			}
 		}
 
-		// Now initialize directory structure and populate with records
+		// Now initialize directory structure
 		Self::create_directory_structure(opts)?;
-		let core = Core::new(Arc::new(opts.clone()))?;
-		let tree = Tree { core: Arc::new(core) };
 
 		if !records.is_empty() {
-			let mut tx = tree.begin_with_mode(Mode::ReadWrite)?;
-			for (k, v) in records {
-				tx.set(k, v)?;
-			}
-			if let Ok(handle) = tokio::runtime::Handle::try_current() {
-				std::thread::scope(|s| {
-					s.spawn(|| {
-						handle.block_on(tx.commit())
-					}).join().unwrap()
-				})?;
-			} else {
-				let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-				rt.block_on(tx.commit())?;
-			}
-		}
+			let table_id = 1;
+			let sst_path = opts.sstable_file_path(table_id);
+			let file = std::fs::File::create(&sst_path)?;
+			let opts_arc = Arc::new(opts.clone());
+			let mut writer = crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&opts_arc), 0);
 
-		// Close temporary tree to flush WAL and seal manifest
-		let tree_clone = tree.clone();
-		if let Ok(handle) = tokio::runtime::Handle::try_current() {
-			std::thread::scope(|s| {
-				s.spawn(|| {
-					handle.block_on(tree_clone.close())
-				}).join().unwrap()
-			})?;
-		} else {
-			let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
-			rt.block_on(tree_clone.close())?;
+			let mut seq = 1u64;
+			for (k, v) in records {
+				let ikey = crate::InternalKey::new(k, seq, crate::InternalKeyKind::Set);
+				writer.add(ikey, &v)?;
+				seq += 1;
+			}
+			let file_size = writer.finish()? as u64;
+
+			// Write manifest
+			let file: Arc<dyn crate::vfs::File> = Arc::new(std::fs::File::open(&sst_path)?);
+			let table = Arc::new(crate::sstable::table::Table::new(
+				table_id,
+				Arc::clone(&opts_arc),
+				file,
+				file_size,
+			)?);
+
+			let mut manifest = crate::levels::LevelManifest::new(Arc::clone(&opts_arc))?;
+			manifest.next_table_id.store(table_id + 1, std::sync::atomic::Ordering::Release);
+			manifest.last_sequence = seq;
+
+			let mut changeset = crate::levels::ManifestChangeSet::default();
+			changeset.new_tables.push((0, table));
+			manifest.apply_changeset(&changeset)?;
+			crate::levels::write_manifest_to_disk(&manifest)?;
 		}
 
 		log::info!("RocksDB to SurrealKV v2 automatic migration completed successfully!");
