@@ -4,6 +4,9 @@
 //! - `LogStore`: Optimized for the WAL (append-only sequential persistence, fast sync).
 //! - `ObjectStore`: Optimized for immutable SSTables (write once, seal, concurrent random reads).
 
+#[cfg(target_arch = "wasm32")]
+pub mod opfs;
+
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;

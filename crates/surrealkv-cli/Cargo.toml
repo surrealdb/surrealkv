@@ -14,6 +14,7 @@ path = "src/main.rs"
 surrealkv = { path = "../..", version = "0.21.3" }
 surrealkv-compat-rocksdb = { path = "../surrealkv-compat-rocksdb" }
 surrealkv-compat-v1 = { path = "../surrealkv-compat-v1" }
+surrealkv-compat-indxdb = { path = "../surrealkv-compat-indxdb" }
 clap = { version = "4.5", features = ["derive"] }
 colored = "2.1"
 indicatif = "0.17"

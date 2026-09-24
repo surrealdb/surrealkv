@@ -65,24 +65,61 @@ pub(crate) fn replay_segments_sync(
 	segments: &[SegmentRef],
 	arena_size: usize,
 ) -> Result<ParallelReplayResult> {
-	if let Ok(handle) = tokio::runtime::Handle::try_current() {
-		if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
-			return tokio::task::block_in_place(|| {
-				handle.block_on(replay_segments_parallel(segments, arena_size))
-			});
+	#[cfg(target_arch = "wasm32")]
+	{
+		let mut memtables = Vec::new();
+		let mut max_seq: Option<u64> = None;
+		for seg in segments {
+			let (seg_max, batches) = decode_segment_batches(&seg.file_path, seg.id)?;
+			if batches.is_empty() {
+				continue;
+			}
+			if seg_max > 0 {
+				max_seq = Some(max_seq.map_or(seg_max, |m| m.max(seg_max)));
+			}
+			let mut current_memtable = Arc::new(MemTable::new(arena_size));
+			for batch in batches {
+				match current_memtable.add(&batch) {
+					Ok(()) => {}
+					Err(Error::ArenaFull) => {
+						if current_memtable.is_empty() {
+							return Err(Error::Other(format!(
+								"Batch too large for memtable (arena_size={arena_size})"
+							)));
+						}
+						memtables.push((Arc::clone(&current_memtable), seg.id));
+						current_memtable = Arc::new(MemTable::new(arena_size));
+						current_memtable.add(&batch)?;
+					}
+					Err(e) => return Err(e),
+				}
+			}
+			memtables.push((current_memtable, seg.id));
 		}
+		return Ok((max_seq, memtables));
 	}
 
-	let segs = segments.to_vec();
-	std::thread::spawn(move || {
-		let rt = tokio::runtime::Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.map_err(|e| Error::Other(e.to_string()))?;
-		rt.block_on(replay_segments_parallel(&segs, arena_size))
-	})
-	.join()
-	.map_err(|_| Error::Other("Parallel WAL recovery thread panicked".to_string()))?
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+				return tokio::task::block_in_place(|| {
+					handle.block_on(replay_segments_parallel(segments, arena_size))
+				});
+			}
+		}
+
+		let segs = segments.to_vec();
+		std::thread::spawn(move || {
+			let rt = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.map_err(|e| Error::Other(format!("Failed to build temporary runtime: {e}")))?;
+			rt.block_on(replay_segments_parallel(&segs, arena_size))
+		})
+		.join()
+		.map_err(|_| Error::Other("WAL parallel recovery thread panicked".to_string()))?
+	}
 }
 
 /// Replays a slice of segments in parallel using affinitypool, applying batches

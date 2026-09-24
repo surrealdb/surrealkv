@@ -612,25 +612,30 @@ async fn cmd_migrate(source: &Path, destination: &Path) -> Result<()> {
 
 	let is_rocksdb = surrealkv_compat_rocksdb::is_rocksdb_dir(source);
 	let is_v1 = surrealkv_compat_v1::is_v1_dir(source);
+	let is_indxdb = surrealkv_compat_indxdb::is_indxdb_available(&source.to_string_lossy());
 
-	if !is_rocksdb && !is_v1 {
+	if !is_rocksdb && !is_v1 && !is_indxdb {
 		bail!(
-			"Source directory at {} is not a recognized RocksDB or SurrealKV V1 database",
+			"Source directory at {} is not a recognized RocksDB, SurrealKV V1, or IndexedDB database",
 			source.display()
 		);
 	}
 
 	let format_name = if is_rocksdb {
 		"RocksDB BlockBasedTable"
-	} else {
+	} else if is_v1 {
 		"SurrealKV V1"
+	} else {
+		"IndexedDB Store / Dump"
 	};
 	println!("Detected format: {}", format_name.bold().cyan());
 
 	let records = if is_rocksdb {
 		surrealkv_compat_rocksdb::read_all_latest(source)?
-	} else {
+	} else if is_v1 {
 		surrealkv_compat_v1::read_all_latest(source)?
+	} else {
+		surrealkv_compat_indxdb::read_all_latest(&source.to_string_lossy()).await?
 	};
 
 	println!("Read {} live records from source.", records.len());
