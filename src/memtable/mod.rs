@@ -390,6 +390,13 @@ impl MemTable {
 				table_writer.add(key, &sst_value)?;
 				iter.next()?;
 			}
+
+			// Flush range deletions into the SSTable metadata so they persist across restarts
+			let rd = self.range_deletions.read();
+			for (start, end, seq) in rd.iter() {
+				table_writer.add_range_deletion(start.clone(), end.clone(), *seq);
+			}
+
 			table_writer.finish()?;
 		}
 
