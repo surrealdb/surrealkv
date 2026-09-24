@@ -32,11 +32,23 @@ async fn main() {
 
 	let start = Instant::now();
 	let mut join_set = tokio::task::JoinSet::new();
+	let total_seeds = seeds.len();
+	let mut completed = 0;
+	let report_interval = (total_seeds / 10).max(100);
 
 	for seed in seeds {
 		while join_set.len() >= parallelism {
 			if let Some(res) = join_set.join_next().await {
 				res.unwrap();
+				completed += 1;
+				if completed % report_interval == 0 {
+					let el = start.elapsed();
+					let pct = (completed as f64 / total_seeds as f64) * 100.0;
+					let ops_sec = (completed * steps) as f64 / el.as_secs_f64();
+					println!(
+						"Progress: {completed}/{total_seeds} seeds ({pct:.1}%), {el:.1?} elapsed, {ops_sec:.0} ops/sec"
+					);
+				}
 			}
 		}
 
@@ -49,6 +61,15 @@ async fn main() {
 
 	while let Some(res) = join_set.join_next().await {
 		res.unwrap();
+		completed += 1;
+		if completed % report_interval == 0 && completed < total_seeds {
+			let el = start.elapsed();
+			let pct = (completed as f64 / total_seeds as f64) * 100.0;
+			let ops_sec = (completed * steps) as f64 / el.as_secs_f64();
+			println!(
+				"Progress: {completed}/{total_seeds} seeds ({pct:.1}%), {el:.1?} elapsed, {ops_sec:.0} ops/sec"
+			);
+		}
 	}
 
 	let elapsed = start.elapsed();
