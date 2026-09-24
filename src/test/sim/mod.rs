@@ -7,14 +7,14 @@ mod tests {
 	use super::harness::SimRunner;
 	use test_log::test;
 
-	#[test(tokio::test)]
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_dst_differential_seeds() {
 		// Read environment variables or default to a robust testing set
 		let steps: usize =
 			std::env::var("SURREALKV_SIM_STEPS").ok().and_then(|s| s.parse().ok()).unwrap_or(500);
 
 		let seed_count: usize =
-			std::env::var("SURREALKV_SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+			std::env::var("SURREALKV_SIM_SEEDS").ok().and_then(|s| s.parse().ok()).unwrap_or(50);
 
 		let base_seeds: Vec<u64> =
 			vec![1, 42, 1337, 2026, 99999, 777777, 1234567, 3141592, 2718281, 8888888];
@@ -28,10 +28,25 @@ mod tests {
 			extended
 		};
 
+		let parallelism = std::thread::available_parallelism().map_or(4, |n| n.get()).min(64);
+		let mut join_set = tokio::task::JoinSet::new();
+
 		for seed in seeds {
-			let mut runner = SimRunner::new();
-			runner.run(seed, steps).await;
-			runner.close().await;
+			while join_set.len() >= parallelism {
+				if let Some(res) = join_set.join_next().await {
+					res.unwrap();
+				}
+			}
+
+			join_set.spawn(async move {
+				let mut runner = SimRunner::new();
+				runner.run(seed, steps).await;
+				runner.close().await;
+			});
+		}
+
+		while let Some(res) = join_set.join_next().await {
+			res.unwrap();
 		}
 	}
 }
