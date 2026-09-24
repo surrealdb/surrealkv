@@ -142,7 +142,8 @@ To ensure clean engineering and prevent format churn over the cloud tier:
 5. **Phase 5 (Complete):** Engine & Block Format Optimizations (Zero-Copy aligned block format, Zstd dictionary compression, user-space W-TinyLFU cache, parallel WAL replay, Ribbon filters, ByteSlice SSO).
 6. **Phase 6 (Complete):** Resilience, Security, & Telemetry (Block-level TDE encryption, end-to-end xxHash3 scrubbing, zero-allocation telemetry).
 7. **Phase 7 (Complete):** Global Memory Accounting & Operational Excellence (Strict unified memory budget across MemTable/Cache/Ring, auto-tuning).
-8. **Phase 8 (Next):** Object-Storage Native (The Cloud Tier - S3/MinIO via `object_store` v0.14.2, atomic CAS manifest, zero-cost COW branching, PITR, tiered NVMe/S3 caching, and S3 orphan GC).
+8. **Phase 7.5 (Complete):** Legacy Engine Compatibility & Pure-Rust RocksDB Migration (`surrealkv-compat-rocksdb` crate, BlockBasedTable v2-v7 parser, automatic transparent zero-downtime RocksDB and SurrealKV V1 migration on startup).
+9. **Phase 8 (Next):** Object-Storage Native (The Cloud Tier - S3/MinIO via `object_store` v0.14.2, atomic CAS manifest, zero-cost COW branching, PITR, tiered NVMe/S3 caching, and S3 orphan GC).
 
 *Note: Solidifying block serialization, compression, encryption, and local caching **before** uploading to cloud object storage guarantees that remote SSTables are written in their final, zero-copy, high-density format from day one.*
 
@@ -213,6 +214,27 @@ Tie all in-memory components (Active Memtable, Immutable Memtables, Ring Buffer,
 
 ### Zero-Config Auto-Tuning
 Avoid "configuration hell." On startup, SurrealKV should query the OS for total system RAM and CPU core count, automatically calculating the optimal thread pool sizes, memtable capacities, and block cache limits. It will be fiercely optimized out-of-the-box, with manual overrides available but rarely necessary.
+
+---
+
+## Phase 7.5: Legacy Engine Compatibility & Pure-Rust RocksDB Migration
+Eliminate C++ RocksDB dependencies from SurrealDB, allowing `file://` and `rocksdb:` endpoints to default directly to SurrealKV V2 with zero human migration.
+
+- [x] **SurrealKV V1 In-Place Compatibility**:
+  - `TableFormat::LSMV1` detection in SSTable `Footer` parsing (16-byte trailer vs 8-byte trailer).
+  - Sequence number ordering automatically serves newest version on reads.
+  - Background compaction collapses historical versions down to single-version `LSMV2` format.
+- [x] **Pure-Rust RocksDB BlockBasedTable Reader (`surrealkv-compat-rocksdb`)**:
+  - Standalone pure-Rust crate with zero C++ or `librocksdb` dependencies.
+  - Supports modern RocksDB BlockBasedTable formats (v2 through v7).
+  - Decompresses Zstandard (`zstd`), Snappy (`snap`), LZ4 (`lz4_flex`), and uncompressed blocks.
+  - Auto-detects SurrealDB User-Defined Timestamps (UDT) via `OPTIONS-*` comparator inspection, stripping 8-byte timestamps to preserve clean user keys.
+  - Multi-SST K-way merge iterator resolving latest committed versions and dropping deleted tombstones.
+- [x] **Transparent Startup Auto-Migration**:
+  - `Tree::new(opts)` detects RocksDB markers (`CURRENT` pointing to `MANIFEST-*`).
+  - Sequentially streams all active records into newly created SurrealKV V2 SSTables via `TableWriter`.
+  - Atomically moves legacy RocksDB files into `_rocksdb_backup/` and writes `manifest/00000000000000000000.manifest`.
+  - Database opens seamlessly as pure SurrealKV V2 with zero user downtime.
 
 ---
 
