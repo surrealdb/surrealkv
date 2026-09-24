@@ -47,7 +47,7 @@ impl RocksDbDatabase {
 		sst_paths.sort();
 
 		// Auto-detect if SurrealDB user-defined timestamps are present
-		let has_user_timestamps = Self::detect_user_timestamps(&sst_paths);
+		let has_user_timestamps = Self::detect_user_timestamps(&path);
 
 		Ok(Self {
 			path,
@@ -56,25 +56,18 @@ impl RocksDbDatabase {
 		})
 	}
 
-	/// Inspects the first SSTable to detect if 8-byte timestamps are present.
-	fn detect_user_timestamps(sst_paths: &[PathBuf]) -> bool {
-		for sst in sst_paths {
-			if let Ok(mut reader) = SstReader::open(sst, false) {
-				for entry_res in reader.iter() {
-					if let Ok(entry) = entry_res {
-						// In SurrealDB, timestamps are monotonically increasing HLC or nanoseconds
-						// which are non-zero u64 values at the end of the key.
-						if entry.key.len() >= 8 {
-							let ts = u64::from_le_bytes(
-								entry.key[entry.key.len() - 8..].try_into().unwrap(),
-							);
-							// Non-zero timestamp in standard range indicates UDT
-							if ts > 1_000_000 {
-								return true;
-							}
+	/// Auto-detects whether SurrealDB user-defined timestamps are present by checking
+	/// RocksDB OPTIONS files.
+	fn detect_user_timestamps(path: &Path) -> bool {
+		if let Ok(entries) = fs::read_dir(path) {
+			for entry in entries.flatten() {
+				let name = entry.file_name().to_string_lossy().to_string();
+				if name.starts_with("OPTIONS-") {
+					if let Ok(content) = fs::read_to_string(entry.path()) {
+						if content.contains("comparator=surrealdb.TimestampComparator") {
+							return true;
 						}
 					}
-					break;
 				}
 			}
 		}
