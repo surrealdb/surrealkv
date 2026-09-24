@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::ops::Bound;
 use std::sync::Arc;
 
@@ -30,16 +30,19 @@ use crate::{
 /// removal, it checks if the version is visible to any snapshot using binary
 /// search. Versions visible to snapshots are preserved unless hidden by a newer
 /// version in the same visibility boundary.
-pub(crate) struct SnapshotTracker {
-	snapshots: Arc<RwLock<BTreeSet<u64>>>,
+const NUM_SNAPSHOT_SHARDS: usize = 64;
+
+fn get_thread_shard_index() -> usize {
+	static SHARD_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+	thread_local! {
+		static SHARD_ID: usize = SHARD_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+	}
+	SHARD_ID.with(|id| *id % NUM_SNAPSHOT_SHARDS)
 }
 
-impl Clone for SnapshotTracker {
-	fn clone(&self) -> Self {
-		Self {
-			snapshots: Arc::clone(&self.snapshots),
-		}
-	}
+#[derive(Clone)]
+pub(crate) struct SnapshotTracker {
+	shards: Arc<[RwLock<BTreeMap<u64, usize>>; NUM_SNAPSHOT_SHARDS]>,
 }
 
 impl Default for SnapshotTracker {
@@ -55,42 +58,69 @@ impl std::fmt::Debug for SnapshotTracker {
 }
 
 impl SnapshotTracker {
-	/// Creates a new empty snapshot tracker.
+	/// Creates a new empty snapshot tracker with 64 shards.
 	pub(crate) fn new() -> Self {
+		let shards: Vec<RwLock<BTreeMap<u64, usize>>> =
+			(0..NUM_SNAPSHOT_SHARDS).map(|_| RwLock::new(BTreeMap::new())).collect();
+		let shards: Box<[RwLock<BTreeMap<u64, usize>>; NUM_SNAPSHOT_SHARDS]> =
+			shards.into_boxed_slice().try_into().unwrap_or_else(|_| panic!("size mismatch"));
 		Self {
-			snapshots: Arc::new(RwLock::new(BTreeSet::new())),
+			shards: Arc::from(shards),
 		}
 	}
 
 	/// Registers a new snapshot with the given sequence number.
-	///
-	/// Called when a new snapshot is created. The sequence number is added
-	/// to the tracking set, ensuring compaction will preserve versions
-	/// visible to this snapshot.
-	pub(crate) fn register(&self, seq_num: u64) {
-		self.snapshots.write().insert(seq_num);
+	/// Returns the shard index assigned to this registration.
+	pub(crate) fn register(&self, seq_num: u64) -> usize {
+		let shard_idx = get_thread_shard_index();
+		let mut lock = self.shards[shard_idx].write();
+		*lock.entry(seq_num).or_insert(0) += 1;
+		shard_idx
 	}
 
-	/// Unregisters a snapshot with the given sequence number.
-	///
-	/// Called when a snapshot is dropped. Once all snapshots at or above
-	/// a certain sequence number are dropped, older versions become eligible
-	/// for garbage collection during compaction.
-	pub(crate) fn unregister(&self, seq_num: u64) {
-		self.snapshots.write().remove(&seq_num);
+	/// Unregisters a snapshot with the given sequence number and optional shard index.
+	pub(crate) fn unregister(&self, seq_num: u64, shard_idx: Option<usize>) {
+		if let Some(idx) = shard_idx {
+			let mut lock = self.shards[idx % NUM_SNAPSHOT_SHARDS].write();
+			if let std::collections::btree_map::Entry::Occupied(mut entry) = lock.entry(seq_num) {
+				if *entry.get() <= 1 {
+					entry.remove();
+				} else {
+					*entry.get_mut() -= 1;
+				}
+			}
+		} else {
+			for shard in self.shards.iter() {
+				let mut lock = shard.write();
+				if let std::collections::btree_map::Entry::Occupied(mut entry) = lock.entry(seq_num) {
+					if *entry.get() <= 1 {
+						entry.remove();
+					} else {
+						*entry.get_mut() -= 1;
+					}
+					break;
+				}
+			}
+		}
 	}
 
 	/// Returns all active snapshots as a sorted vector.
-	///
-	/// This is the primary method used by compaction. The returned vector
-	/// is sorted in ascending order.
 	pub(crate) fn get_all_snapshots(&self) -> Vec<u64> {
-		self.snapshots.read().iter().copied().collect()
+		let mut snapshots = Vec::new();
+		for shard in self.shards.iter() {
+			snapshots.extend(shard.read().keys().copied());
+		}
+		snapshots.sort_unstable();
+		snapshots.dedup();
+		snapshots
 	}
 
 	/// Returns the smallest active snapshot seq, if any.
 	pub(crate) fn first(&self) -> Option<u64> {
-		self.snapshots.read().first().copied()
+		self.shards
+			.iter()
+			.filter_map(|shard| shard.read().keys().next().copied())
+			.min()
 	}
 }
 
@@ -120,18 +150,20 @@ pub(crate) struct Snapshot {
 	/// Sequence number defining this snapshot's view of the data
 	/// Only data with seq_num <= this value is visible
 	pub(crate) seq_num: u64,
+
+	/// The shard index where this snapshot was registered
+	shard_idx: usize,
 }
 
 impl Snapshot {
 	/// Creates a new snapshot at the current sequence number
 	pub(crate) fn new(core: Arc<Core>, seq_num: u64) -> Self {
-		// Register this snapshot's sequence number so compaction knows
-		// to preserve versions visible to this snapshot
-		core.snapshot_tracker.register(seq_num);
+		let shard_idx = core.snapshot_tracker.register(seq_num);
 
 		Self {
 			core,
 			seq_num,
+			shard_idx,
 		}
 	}
 
@@ -502,7 +534,7 @@ impl Drop for Snapshot {
 	fn drop(&mut self) {
 		// Unregister this snapshot's sequence number so compaction can
 		// clean up versions no longer visible to any snapshot
-		self.core.snapshot_tracker.unregister(self.seq_num);
+		self.core.snapshot_tracker.unregister(self.seq_num, Some(self.shard_idx));
 	}
 }
 
@@ -983,10 +1015,7 @@ impl SnapshotIterator<'_> {
 	/// Creates a new iterator over a specific key range
 	fn new_from(core: Arc<Core>, seq_num: u64, range: InternalKeyRange) -> Result<Self> {
 		// Create a temporary snapshot to use the helper method
-		let snapshot = Snapshot {
-			core: Arc::clone(&core),
-			seq_num,
-		};
+		let snapshot = Snapshot::new(Arc::clone(&core), seq_num);
 		let iter_state = snapshot.collect_iter_state()?;
 
 		let merge_iter = KMergeIterator::new_from(iter_state, range);
@@ -2071,8 +2100,8 @@ mod tests {
 		assert_eq!(snapshots, vec![50, 75, 100, 150, 200]);
 
 		// Unregister some and verify order is maintained
-		tracker.unregister(100);
-		tracker.unregister(50);
+		tracker.unregister(100, None);
+		tracker.unregister(50, None);
 
 		let snapshots = tracker.get_all_snapshots();
 		assert_eq!(snapshots, vec![75, 150, 200]);
