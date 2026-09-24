@@ -1189,6 +1189,7 @@ impl Table {
 		TableIterator::new_with_comparator(self, range, comparator)
 	}
 
+	#[cfg(test)]
 	pub(crate) fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
 		self.is_user_key_in_range(key.user_key.as_slice())
 	}
