@@ -304,7 +304,7 @@ impl LevelManifest {
 			levels_vec.len()
 		);
 
-		// Validate last_sequence matches the maximum sequence number across all tables
+		// Validate last_sequence watermark is not exceeded by any table in the manifest
 		let computed_max_seq = levels_vec
 			.iter()
 			.flat_map(|level| level.tables.iter())
@@ -312,10 +312,9 @@ impl LevelManifest {
 			.max()
 			.unwrap_or(0);
 
-		if computed_max_seq != last_sequence {
+		if computed_max_seq > last_sequence {
 			return Err(Error::LoadManifestFail(format!(
-				"Manifest last_sequence mismatch: stored={}, computed from tables={}",
-				last_sequence, computed_max_seq
+				"Manifest last_sequence violation: table seq {computed_max_seq} exceeds manifest watermark {last_sequence}"
 			)));
 		}
 
