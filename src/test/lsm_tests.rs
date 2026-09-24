@@ -3937,14 +3937,9 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 	// Phase 2: Get valid SST IDs and create orphaned SSTs
 	let valid_sst_ids = {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
-		let ids = {
-			let manifest = tree.core.inner.level_manifest.read().unwrap();
-			let ids: Vec<u64> = manifest.iter().map(|t| t.id).collect();
-			drop(manifest);
-			ids
-		};
 		tree.close().await.unwrap();
-		ids
+		let manifest = LevelManifest::load_from_file(&opts.manifest_file_path(0), Arc::clone(&opts)).unwrap();
+		manifest.iter().map(|t| t.id).collect::<Vec<u64>>()
 	};
 
 	// Create multiple orphaned SST files
