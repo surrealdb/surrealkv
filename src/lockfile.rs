@@ -87,9 +87,9 @@ impl LockFile {
 		// Write process ID to lock file for debugging
 		let pid = process::id();
 		let content = format!("{}\n", pid);
-		file.set_len(0)
-			.and_then(|_| file.try_clone()?.write_all(content.as_bytes()))
-			.map_err(|e| Error::Io(Arc::new(e)))?;
+		file.set_len(0).map_err(|e| Error::Io(Arc::new(e)))?;
+		(&file).write_all(content.as_bytes()).map_err(|e| Error::Io(Arc::new(e)))?;
+		(&file).flush().map_err(|e| Error::Io(Arc::new(e)))?;
 
 		self.file = Some(file);
 		Ok(())
@@ -98,8 +98,9 @@ impl LockFile {
 	/// Releases the lock
 	#[cfg(not(target_arch = "wasm32"))]
 	pub fn release(&mut self) -> Result<()> {
-		if let Some(_file) = self.file.take() {
-			// File will be closed when dropped
+		if let Some(file) = self.file.take() {
+			let _ = fs2::FileExt::unlock(&file);
+			drop(file);
 		}
 		Ok(())
 	}

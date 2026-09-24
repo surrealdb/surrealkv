@@ -3,7 +3,7 @@ use std::fs::create_dir_all;
 #[cfg(not(target_os = "windows"))]
 use std::fs::File;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::Batch;
@@ -881,6 +881,9 @@ pub(crate) struct Core {
 
 	/// Handle to the background flusher task
 	pub(crate) flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+
+	/// Atomic flag indicating if the core has been closed
+	pub(crate) is_closed: AtomicBool,
 }
 
 impl std::ops::Deref for Core {
@@ -1143,6 +1146,7 @@ impl Core {
 			task_manager: Mutex::new(Some(task_manager)),
 			write_stall,
 			flusher_handle: Mutex::new(Some(flusher_handle)),
+			is_closed: AtomicBool::new(false),
 		};
 
 		log::info!("=== LSM tree initialization complete ===");
@@ -1215,6 +1219,10 @@ impl Core {
 	/// Unlike `make_room_for_write`, this does NOT rotate the WAL before
 	/// flushing. This prevents creating an empty WAL file on clean shutdown.
 	pub async fn close(&self) -> Result<()> {
+		if self.is_closed.swap(true, Ordering::SeqCst) {
+			return Ok(());
+		}
+
 		log::info!("Shutting down LSM tree...");
 
 		// Step 1: Shutdown the commit pipeline to stop accepting new writes
@@ -1654,17 +1662,19 @@ impl Drop for Tree {
 	fn drop(&mut self) {
 		#[cfg(not(target_arch = "wasm32"))]
 		{
-			// Native environment - use tokio
-			if let Ok(handle) = tokio::runtime::Handle::try_current() {
-				// Clone the Arc to move into the async task
-				let core = Arc::clone(&self.core);
-				handle.spawn(async move {
-					if let Err(err) = core.close().await {
-						log::error!("Error closing store: {}", err);
-					}
-				});
-			} else {
-				log::warn!("No runtime available for closing the store correctly");
+			// Only attempt async shutdown if the core is not already closed
+			if !self.core.is_closed.load(Ordering::SeqCst) {
+				if let Ok(handle) = tokio::runtime::Handle::try_current() {
+					// Clone the Arc to move into the async task
+					let core = Arc::clone(&self.core);
+					handle.spawn(async move {
+						if let Err(err) = core.close().await {
+							log::error!("Error closing store: {}", err);
+						}
+					});
+				} else {
+					log::warn!("No runtime available for closing the store correctly");
+				}
 			}
 		}
 	}
