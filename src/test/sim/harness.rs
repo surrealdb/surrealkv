@@ -177,7 +177,7 @@ impl SimRunner {
 
 					// Verify full state consistency after recovery
 					let rtx = self.store.as_ref().unwrap().begin().unwrap();
-					let mut iter = rtx.range(b"".as_slice(), b"\xff\xff\xff".as_slice()).unwrap();
+					let mut iter = rtx.range_with_options(&crate::ReadOptions::default()).unwrap();
 					let recovered_items = collect_transaction_all(&mut iter).unwrap();
 					let model_items = self.model.range(Bound::Unbounded, Bound::Unbounded);
 
