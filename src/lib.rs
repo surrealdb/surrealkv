@@ -9,6 +9,7 @@ mod compaction;
 mod comparator;
 mod compression;
 mod error;
+pub mod inspect;
 mod iter;
 mod levels;
 mod lockfile;

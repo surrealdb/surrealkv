@@ -4,6 +4,7 @@ members = [
 	"crates/surrealkv-compat-rocksdb",
 	"crates/surrealkv-compat-v1",
 	"crates/surrealkv-sim",
+	"crates/surrealkv-cli",
 ]
 
 [package]

@@ -1,0 +1,26 @@
+[package]
+name = "surrealkv-cli"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Operator and developer inspection, dump, and diagnostic CLI for SurrealKV"
+
+[[bin]]
+name = "skv"
+path = "src/main.rs"
+
+[dependencies]
+surrealkv = { path = "../..", version = "0.21.3" }
+surrealkv-compat-rocksdb = { path = "../surrealkv-compat-rocksdb" }
+surrealkv-compat-v1 = { path = "../surrealkv-compat-v1" }
+clap = { version = "4.5", features = ["derive"] }
+colored = "2.1"
+indicatif = "0.17"
+tabled = "0.16"
+anyhow = "1.0"
+tokio = { version = "1.36", features = ["full"] }
+crc32fast = "1.2"
+
+[dev-dependencies]
+tempfile = "3.10"
