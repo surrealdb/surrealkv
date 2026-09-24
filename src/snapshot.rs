@@ -168,78 +168,83 @@ impl Snapshot {
 	/// The search stops at the first version found with seq_num <= snapshot
 	/// seq_num.
 	pub(crate) fn get(&self, key: &[u8]) -> crate::Result<Option<(Value, u64)>> {
-		// self.core.get_internal(key, self.seq_num)
-		// Read locks
-		let active_lock = self.core.active_memtable.read()?;
-		let imm_lock = self.core.immutable_memtables.read()?;
-		let level_manifest = self.core.level_manifest.read()?;
-
-		// Collect any covering range tombstones across active, immutables, and tables
 		let mut max_range_delete_seq: Option<u64> = None;
-		for (start, end, seq) in active_lock.range_deletions.read().iter() {
-			if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
-				max_range_delete_seq = Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
-			}
-		}
-		for entry in imm_lock.iter() {
-			let memtable = &entry.memtable;
-			for (start, end, seq) in memtable.range_deletions.read().iter() {
-				if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
-					max_range_delete_seq = Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
-				}
-			}
-		}
-		for level in &level_manifest.levels {
-			for table in &level.tables {
-				for (start, end, seq) in table.range_deletions.read().iter() {
+
+		// 1. Check active memtable
+		{
+			let active_lock = self.core.active_memtable.read()?;
+			if active_lock.has_range_deletions() {
+				for (start, end, seq) in active_lock.range_deletions.read().iter() {
 					if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
-						max_range_delete_seq =
-							Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+						max_range_delete_seq = Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
 					}
 				}
 			}
-		}
 
-		// Check the active memtable for the key
-		if let Some(item) = active_lock.get(key.as_ref(), Some(self.seq_num)) {
-			if item.0.is_tombstone() {
-				return Ok(None); // Key is a tombstone, return None
-			}
-			if let Some(rseq) = max_range_delete_seq {
-				if item.0.seq_num() <= rseq {
-					return Ok(None);
-				}
-			}
-			return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
-		}
-		drop(active_lock);
-
-		// Check the immutable memtables for the key
-		for entry in imm_lock.iter().rev() {
-			let memtable = &entry.memtable;
-			if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
+			if let Some(item) = active_lock.get(key, Some(self.seq_num)) {
 				if item.0.is_tombstone() {
-					return Ok(None); // Key is a tombstone, return None
+					return Ok(None);
 				}
 				if let Some(rseq) = max_range_delete_seq {
 					if item.0.seq_num() <= rseq {
 						return Ok(None);
 					}
 				}
-				return Ok(Some((item.1, item.0.seq_num()))); // Key found, return the value
+				return Ok(Some((item.1, item.0.seq_num())));
 			}
 		}
-		drop(imm_lock);
+
+		// 2. Check immutable memtables
+		{
+			let imm_lock = self.core.immutable_memtables.read()?;
+			for entry in imm_lock.iter().rev() {
+				let memtable = &entry.memtable;
+				if memtable.has_range_deletions() {
+					for (start, end, seq) in memtable.range_deletions.read().iter() {
+						if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+							max_range_delete_seq =
+								Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+						}
+					}
+				}
+				if let Some(item) = memtable.get(key, Some(self.seq_num)) {
+					if item.0.is_tombstone() {
+						return Ok(None);
+					}
+					if let Some(rseq) = max_range_delete_seq {
+						if item.0.seq_num() <= rseq {
+							return Ok(None);
+						}
+					}
+					return Ok(Some((item.1, item.0.seq_num())));
+				}
+			}
+		}
+
+		// 3. Check SSTables in level manifest
+		let level_manifest = self.core.level_manifest.read()?;
+
+		for level in &level_manifest.levels {
+			for table in &level.tables {
+				if table.has_range_deletions() {
+					for (start, end, seq) in table.range_deletions.read().iter() {
+						if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+							max_range_delete_seq =
+								Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+						}
+					}
+				}
+			}
+		}
 
 		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set);
 
-		// Check the tables in each level for the key
-		for (level_idx, level) in (&level_manifest.levels).into_iter().enumerate() {
+		for (level_idx, level) in level_manifest.levels.get_levels().iter().enumerate() {
 			if level_idx == 0 {
-				// Level 0: Tables can overlap, check all
+				// Level 0: Tables can overlap, check newest to oldest (tables are sorted descending)
 				for table in level.tables.iter() {
-					if !table.is_key_in_key_range(&ikey) {
-						continue; // Skip this table if the key is not in its range
+					if !table.is_user_key_in_range(key) {
+						continue;
 					}
 
 					let maybe_item = table.get(&ikey)?;
@@ -247,44 +252,38 @@ impl Snapshot {
 					if let Some(item) = maybe_item {
 						let ikey = &item.0;
 						if ikey.is_tombstone() {
-							return Ok(None); // Key is a tombstone, return None
+							return Ok(None);
 						}
 						if let Some(rseq) = max_range_delete_seq {
 							if ikey.seq_num() <= rseq {
 								return Ok(None);
 							}
 						}
-						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
+						return Ok(Some((item.1, ikey.seq_num())));
 					}
 				}
 			} else {
-				// Level 1+: Non-overlapping, binary search for the one table
-				let query_range =
-					crate::user_range_to_internal_range(Bound::Included(key), Bound::Included(key));
-				let start_idx = level.find_first_overlapping_table(&query_range);
-				let end_idx = level.find_last_overlapping_table(&query_range);
-
-				// At most one table can contain this exact key
-				for table in &level.tables[start_idx..end_idx] {
+				// Level 1+: Non-overlapping, binary search for the one table with zero allocations
+				if let Some(table) = level.find_table_for_user_key(key, &self.core.opts.comparator) {
 					let maybe_item = table.get(&ikey)?;
 
 					if let Some(item) = maybe_item {
 						let ikey = &item.0;
 						if ikey.is_tombstone() {
-							return Ok(None); // Key is a tombstone, return None
+							return Ok(None);
 						}
 						if let Some(rseq) = max_range_delete_seq {
 							if ikey.seq_num() <= rseq {
 								return Ok(None);
 							}
 						}
-						return Ok(Some((item.1, ikey.seq_num()))); // Key found, return the value
+						return Ok(Some((item.1, ikey.seq_num())));
 					}
 				}
 			}
 		}
 
-		Ok(None) // Key not found in any memtable or table, return None
+		Ok(None)
 	}
 
 	/// Asynchronously gets a value from the snapshot.
@@ -294,12 +293,14 @@ impl Snapshot {
 		// 1. Check active memtable and collect range deletions
 		{
 			let active_lock = self.core.active_memtable.read()?;
-			for (start, end, seq) in active_lock.range_deletions.read().iter() {
-				if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
-					max_range_delete_seq = Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+			if active_lock.has_range_deletions() {
+				for (start, end, seq) in active_lock.range_deletions.read().iter() {
+					if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+						max_range_delete_seq = Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+					}
 				}
 			}
-			if let Some(item) = active_lock.get(key.as_ref(), Some(self.seq_num)) {
+			if let Some(item) = active_lock.get(key, Some(self.seq_num)) {
 				if item.0.is_tombstone() {
 					return Ok(None);
 				}
@@ -315,18 +316,17 @@ impl Snapshot {
 		// 2. Check immutable memtables and collect range deletions
 		{
 			let imm_lock = self.core.immutable_memtables.read()?;
-			for entry in imm_lock.iter() {
-				let memtable = &entry.memtable;
-				for (start, end, seq) in memtable.range_deletions.read().iter() {
-					if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
-						max_range_delete_seq =
-							Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
-					}
-				}
-			}
 			for entry in imm_lock.iter().rev() {
 				let memtable = &entry.memtable;
-				if let Some(item) = memtable.get(key.as_ref(), Some(self.seq_num)) {
+				if memtable.has_range_deletions() {
+					for (start, end, seq) in memtable.range_deletions.read().iter() {
+						if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+							max_range_delete_seq =
+								Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+						}
+					}
+				}
+				if let Some(item) = memtable.get(key, Some(self.seq_num)) {
 					if item.0.is_tombstone() {
 						return Ok(None);
 					}
@@ -346,10 +346,12 @@ impl Snapshot {
 			let level_manifest = self.core.level_manifest.read()?;
 			for level in &level_manifest.levels {
 				for table in &level.tables {
-					for (start, end, seq) in table.range_deletions.read().iter() {
-						if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
-							max_range_delete_seq =
-								Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+					if table.has_range_deletions() {
+						for (start, end, seq) in table.range_deletions.read().iter() {
+							if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+								max_range_delete_seq =
+									Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+							}
 						}
 					}
 				}
@@ -359,20 +361,12 @@ impl Snapshot {
 			for (level_idx, level) in level_manifest.levels.get_levels().iter().enumerate() {
 				if level_idx == 0 {
 					for table in level.tables.iter() {
-						if table.is_key_in_key_range(&ikey) {
+						if table.is_user_key_in_range(key) {
 							tables.push(Arc::clone(table));
 						}
 					}
-				} else {
-					let query_range = crate::user_range_to_internal_range(
-						Bound::Included(key),
-						Bound::Included(key),
-					);
-					let start_idx = level.find_first_overlapping_table(&query_range);
-					let end_idx = level.find_last_overlapping_table(&query_range);
-					for table in &level.tables[start_idx..end_idx] {
-						tables.push(Arc::clone(table));
-					}
+				} else if let Some(table) = level.find_table_for_user_key(key, &self.core.opts.comparator) {
+					tables.push(Arc::clone(table));
 				}
 			}
 			tables

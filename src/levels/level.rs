@@ -94,6 +94,36 @@ impl Level {
 		// Find the first table that is completely after the range
 		self.tables.partition_point(|table| !table.is_after_range(range))
 	}
+
+	/// Finds the single table that could contain the given user key in this level.
+	/// For Level 1+, tables have non-overlapping sorted key ranges.
+	pub(crate) fn find_table_for_user_key(
+		&self,
+		key: &[u8],
+		comparator: &Arc<dyn crate::comparator::Comparator>,
+	) -> Option<&Arc<Table>> {
+		if self.tables.is_empty() {
+			return None;
+		}
+		let idx = self.tables.partition_point(|table| {
+			if let Some(ref largest) = table.meta.largest_point {
+				comparator.compare(largest.user_key.as_slice(), key) == std::cmp::Ordering::Less
+			} else {
+				false
+			}
+		});
+		if idx < self.tables.len() {
+			let table = &self.tables[idx];
+			if let Some(ref smallest) = table.meta.smallest_point {
+				if comparator.compare(key, smallest.user_key.as_slice()) != std::cmp::Ordering::Less {
+					return Some(table);
+				}
+			} else {
+				return Some(table);
+			}
+		}
+		None
+	}
 }
 
 /// Represents all levels in the LSM tree

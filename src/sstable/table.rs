@@ -854,6 +854,7 @@ pub(crate) struct Table {
 	pub(crate) index_block: IndexType,
 	pub(crate) filter_reader: Option<FilterBlockReader>,
 	pub(crate) range_deletions: Arc<parking_lot::RwLock<Vec<(Key, Key, u64)>>>,
+	pub(crate) has_range_deletions: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Table {
@@ -895,6 +896,7 @@ impl Table {
 			None
 		};
 
+		let has_rd = !writer_metadata.range_deletions.is_empty();
 		Ok(Table {
 			id,
 			file,
@@ -906,6 +908,7 @@ impl Table {
 			range_deletions: Arc::new(parking_lot::RwLock::new(
 				writer_metadata.range_deletions.clone(),
 			)),
+			has_range_deletions: Arc::new(std::sync::atomic::AtomicBool::new(has_rd)),
 			meta: writer_metadata,
 		})
 	}
@@ -1106,15 +1109,31 @@ impl Table {
 	///   → Seek for "banana"
 	///   → If found and user_key matches → return value
 	/// ```
-	pub(crate) fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
-		let key_encoded = key.encode();
+	pub(crate) fn has_range_deletions(&self) -> bool {
+		self.has_range_deletions.load(std::sync::atomic::Ordering::Relaxed)
+	}
 
-		// Step 1: Bloom filter for early rejection
+	pub(crate) fn is_user_key_in_range(&self, key: &[u8]) -> bool {
+		let Some(smallest) = &self.meta.smallest_point else {
+			return true;
+		};
+		let Some(largest) = &self.meta.largest_point else {
+			return true;
+		};
+
+		self.opts.comparator.compare(key, smallest.user_key.as_slice()) >= Ordering::Equal
+			&& self.opts.comparator.compare(key, largest.user_key.as_slice()) <= Ordering::Equal
+	}
+
+	pub(crate) fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
+		// Step 1: Bloom filter for early rejection (NO encoding or allocation needed!)
 		if let Some(ref filters) = self.filter_reader {
 			if !filters.may_contain(key.user_key.as_slice(), 0) {
 				return Ok(None);
 			}
 		}
+
+		let key_encoded = key.encode();
 
 		let IndexType::Partitioned(partitioned_index) = &self.index_block;
 
@@ -1171,17 +1190,10 @@ impl Table {
 	}
 
 	pub(crate) fn is_key_in_key_range(&self, key: &InternalKey) -> bool {
-		let Some(smallest) = &self.meta.smallest_point else {
-			return true;
-		};
-		let Some(largest) = &self.meta.largest_point else {
-			return true;
-		};
-
-		self.opts.comparator.compare(key.user_key.as_slice(), &smallest.user_key) >= Ordering::Equal
-			&& self.opts.comparator.compare(key.user_key.as_slice(), &largest.user_key)
-				<= Ordering::Equal
+		self.is_user_key_in_range(key.user_key.as_slice())
 	}
+
+
 
 	/// Checks if this table is completely BEFORE the query range.
 	///

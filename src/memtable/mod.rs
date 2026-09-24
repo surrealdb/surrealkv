@@ -87,6 +87,7 @@ pub(crate) struct MemTable {
 	reserved: AtomicU64,
 	/// Tracked range tombstones: (start_key, end_key, seq_num)
 	pub(crate) range_deletions: parking_lot::RwLock<Vec<(Key, Key, u64)>>,
+	pub(crate) has_range_deletions: std::sync::atomic::AtomicBool,
 }
 
 impl Default for MemTable {
@@ -121,6 +122,7 @@ impl MemTable {
 			wal_number: AtomicU64::new(0),
 			reserved: AtomicU64::new(0),
 			range_deletions: parking_lot::RwLock::new(Vec::new()),
+			has_range_deletions: std::sync::atomic::AtomicBool::new(false),
 		}
 	}
 
@@ -137,14 +139,20 @@ impl MemTable {
 		self.wal_number.load(Ordering::Acquire)
 	}
 
+	pub(crate) fn has_range_deletions(&self) -> bool {
+		self.has_range_deletions.load(Ordering::Relaxed)
+	}
+
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
 		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 
 		// Check if covered by any range tombstone
 		let mut range_tombstone_seq: Option<u64> = None;
-		for (start, end, seq) in self.range_deletions.read().iter() {
-			if *seq <= max_seq && key >= start.as_slice() && key < end.as_slice() {
-				range_tombstone_seq = Some(range_tombstone_seq.map_or(*seq, |s| s.max(*seq)));
+		if self.has_range_deletions.load(Ordering::Relaxed) {
+			for (start, end, seq) in self.range_deletions.read().iter() {
+				if *seq <= max_seq && key >= start.as_slice() && key < end.as_slice() {
+					range_tombstone_seq = Some(range_tombstone_seq.map_or(*seq, |s| s.max(*seq)));
+				}
 			}
 		}
 
@@ -281,6 +289,7 @@ impl MemTable {
 					end_key.clone(),
 					current_seq_num,
 				));
+				self.has_range_deletions.store(true, Ordering::Release);
 			}
 
 			let ikey = InternalKey::new(entry.key.clone(), current_seq_num, entry.kind);
@@ -397,7 +406,11 @@ impl MemTable {
 		let file_size = file.size()?;
 
 		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);
-		created_table.range_deletions.write().extend(self.range_deletions.read().clone());
+		let rd = self.range_deletions.read();
+		if !rd.is_empty() {
+			created_table.range_deletions.write().extend(rd.clone());
+			created_table.has_range_deletions.store(true, Ordering::Release);
+		}
 		Ok((created_table, bptree_entries))
 	}
 
