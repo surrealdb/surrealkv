@@ -1194,8 +1194,6 @@ impl Table {
 		self.is_user_key_in_range(key.user_key.as_slice())
 	}
 
-
-
 	/// Checks if this table is completely BEFORE the query range.
 	///
 	/// Used to skip tables that can't possibly contain any keys in the range.

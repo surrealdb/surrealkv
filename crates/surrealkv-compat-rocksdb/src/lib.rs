@@ -13,7 +13,7 @@ pub mod varint;
 
 pub use database::{is_rocksdb_dir, DatabaseIter, RocksDbDatabase};
 pub use error::{Error, Result};
-pub use footer::{Footer, ROCKSDB_MAGIC, ROCKSDB_LEGACY_MAGIC};
+pub use footer::{Footer, ROCKSDB_LEGACY_MAGIC, ROCKSDB_MAGIC};
 pub use handle::BlockHandle;
 pub use table::{RocksDbEntry, SstReader};
 

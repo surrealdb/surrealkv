@@ -92,7 +92,8 @@ impl SnapshotTracker {
 		} else {
 			for shard in self.shards.iter() {
 				let mut lock = shard.write();
-				if let std::collections::btree_map::Entry::Occupied(mut entry) = lock.entry(seq_num) {
+				if let std::collections::btree_map::Entry::Occupied(mut entry) = lock.entry(seq_num)
+				{
 					if *entry.get() <= 1 {
 						entry.remove();
 					} else {
@@ -117,10 +118,7 @@ impl SnapshotTracker {
 
 	/// Returns the smallest active snapshot seq, if any.
 	pub(crate) fn first(&self) -> Option<u64> {
-		self.shards
-			.iter()
-			.filter_map(|shard| shard.read().keys().next().copied())
-			.min()
+		self.shards.iter().filter_map(|shard| shard.read().keys().next().copied()).min()
 	}
 }
 
@@ -208,7 +206,8 @@ impl Snapshot {
 			if active_lock.has_range_deletions() {
 				for (start, end, seq) in active_lock.range_deletions.read().iter() {
 					if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
-						max_range_delete_seq = Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+						max_range_delete_seq =
+							Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
 					}
 				}
 			}
@@ -296,7 +295,8 @@ impl Snapshot {
 				}
 			} else {
 				// Level 1+: Non-overlapping, binary search for the one table with zero allocations
-				if let Some(table) = level.find_table_for_user_key(key, &self.core.opts.comparator) {
+				if let Some(table) = level.find_table_for_user_key(key, &self.core.opts.comparator)
+				{
 					let maybe_item = table.get(&ikey)?;
 
 					if let Some(item) = maybe_item {
@@ -328,7 +328,8 @@ impl Snapshot {
 			if active_lock.has_range_deletions() {
 				for (start, end, seq) in active_lock.range_deletions.read().iter() {
 					if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
-						max_range_delete_seq = Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
+						max_range_delete_seq =
+							Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
 					}
 				}
 			}
@@ -380,7 +381,10 @@ impl Snapshot {
 				for table in &level.tables {
 					if table.has_range_deletions() {
 						for (start, end, seq) in table.range_deletions.read().iter() {
-							if *seq <= self.seq_num && key >= start.as_slice() && key < end.as_slice() {
+							if *seq <= self.seq_num
+								&& key >= start.as_slice()
+								&& key < end.as_slice()
+							{
 								max_range_delete_seq =
 									Some(max_range_delete_seq.map_or(*seq, |s| s.max(*seq)));
 							}
@@ -397,7 +401,9 @@ impl Snapshot {
 							tables.push(Arc::clone(table));
 						}
 					}
-				} else if let Some(table) = level.find_table_for_user_key(key, &self.core.opts.comparator) {
+				} else if let Some(table) =
+					level.find_table_for_user_key(key, &self.core.opts.comparator)
+				{
 					tables.push(Arc::clone(table));
 				}
 			}

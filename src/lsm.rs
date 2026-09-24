@@ -1353,7 +1353,10 @@ impl Tree {
 			Error::Other(format!("Failed to read RocksDB database for migration: {e}"))
 		})?;
 
-		log::info!("Read {} live records from RocksDB. Creating backup and migrating...", records.len());
+		log::info!(
+			"Read {} live records from RocksDB. Creating backup and migrating...",
+			records.len()
+		);
 
 		// Create backup directory
 		let backup_dir = opts.path.join("_rocksdb_backup");
@@ -1391,7 +1394,8 @@ impl Tree {
 			let sst_path = opts.sstable_file_path(table_id);
 			let file = std::fs::File::create(&sst_path)?;
 			let opts_arc = Arc::new(opts.clone());
-			let mut writer = crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&opts_arc), 0);
+			let mut writer =
+				crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&opts_arc), 0);
 
 			let mut last_seq = 0u64;
 			for (k, v) in records {
