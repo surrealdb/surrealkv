@@ -772,6 +772,15 @@ impl<'a> CompactionIterator<'a> {
 		}
 	}
 
+	pub(crate) fn with_range_deletions(mut self, range_deletions: Vec<(Key, Key, u64)>) -> Self {
+		self.active_range_deletions.extend(range_deletions);
+		self
+	}
+
+	pub(crate) fn active_range_deletions(&self) -> &[(Key, Key, u64)] {
+		&self.active_range_deletions
+	}
+
 	/// Initialize the iterator by seeking to the first entry.
 	fn initialize(&mut self) -> Result<()> {
 		self.merge_iter.seek_first()?;
@@ -1085,8 +1094,8 @@ impl<'a> CompactionIterator<'a> {
 			// ===== DETERMINE IF ENTRY IS STALE =====
 			// Stale entries are filtered out during compaction
 
-			let is_covered_by_range =
-				self.active_range_deletions.iter().any(|(start, end, rseq)| {
+			let is_covered_by_range = key.kind() != crate::InternalKeyKind::RangeDelete
+				&& self.active_range_deletions.iter().any(|(start, end, rseq)| {
 					*rseq >= seq_num
 						&& key.user_key.as_slice() >= start.as_slice()
 						&& key.user_key.as_slice() < end.as_slice()
