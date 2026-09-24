@@ -2,6 +2,7 @@
 members = [
 	".",
 	"crates/surrealkv-compat-rocksdb",
+	"crates/surrealkv-compat-v1",
 	"crates/surrealkv-sim",
 ]
 
@@ -24,6 +25,7 @@ rust-version = "1.86"
 
 [dependencies]
 surrealkv-compat-rocksdb = { path = "crates/surrealkv-compat-rocksdb" }
+surrealkv-compat-v1 = { path = "crates/surrealkv-compat-v1" }
 byteslice = { version = "0.1.0", path = "../byteslice" }
 affinitypool = "0.8.0"
 snap = "1.0.0"

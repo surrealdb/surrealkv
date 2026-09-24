@@ -1340,6 +1340,11 @@ impl Tree {
 			Self::migrate_from_rocksdb(&opts)?;
 		}
 
+		// If the path contains an existing SurrealKV v1 database, automatically migrate it
+		if surrealkv_compat_v1::is_v1_dir(&opts.path) {
+			Self::migrate_from_v1(&opts)?;
+		}
+
 		// Create all required directory structure
 		Self::create_directory_structure(&opts)?;
 
@@ -1434,6 +1439,84 @@ impl Tree {
 		}
 
 		log::info!("RocksDB to SurrealKV v2 automatic migration completed successfully!");
+		Ok(())
+	}
+
+	/// Automatically migrates an existing SurrealKV v1 database to SurrealKV v2 format.
+	fn migrate_from_v1(opts: &Options) -> Result<()> {
+		log::info!("Detected existing SurrealKV v1 database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
+		let records = surrealkv_compat_v1::read_all_latest(&opts.path).map_err(|e| {
+			Error::Other(format!("Failed to read SurrealKV v1 database for migration: {e}"))
+		})?;
+
+		log::info!(
+			"Read {} live records from SurrealKV v1. Creating backup and migrating...",
+			records.len()
+		);
+
+		// Create backup directory
+		let backup_dir = opts.path.join("_v1_backup");
+		create_dir_all(&backup_dir)?;
+
+		// Move all v1 legacy files into backup
+		if let Ok(entries) = std::fs::read_dir(&opts.path) {
+			for entry in entries.flatten() {
+				let p = entry.path();
+				let name = entry.file_name().to_string_lossy().to_string();
+				if name == "_v1_backup" {
+					continue;
+				}
+				if name.ends_with(".sst")
+					|| name.ends_with(".wal")
+					|| name.starts_with("MANIFEST")
+					|| name == "LOCK"
+				{
+					let dest = backup_dir.join(&name);
+					let _ = std::fs::rename(&p, dest);
+				}
+			}
+		}
+
+		// Now initialize directory structure
+		Self::create_directory_structure(opts)?;
+
+		if !records.is_empty() {
+			let table_id = 1;
+			let sst_path = opts.sstable_file_path(table_id);
+			let file = std::fs::File::create(&sst_path)?;
+			let opts_arc = Arc::new(opts.clone());
+			let mut writer =
+				crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&opts_arc), 0);
+
+			let mut last_seq = 0u64;
+			for (k, v) in records {
+				last_seq += 1;
+				let ikey = crate::InternalKey::new(k, last_seq, crate::InternalKeyKind::Set);
+				let val_encoded = crate::vlog::ValueLocation::with_inline_value(v).encode();
+				writer.add(ikey, &val_encoded)?;
+			}
+			let file_size = writer.finish()? as u64;
+
+			// Write manifest
+			let file: Arc<dyn crate::vfs::File> = Arc::new(std::fs::File::open(&sst_path)?);
+			let table = Arc::new(crate::sstable::table::Table::new(
+				table_id,
+				Arc::clone(&opts_arc),
+				file,
+				file_size,
+			)?);
+
+			let mut manifest = crate::levels::LevelManifest::new(Arc::clone(&opts_arc))?;
+			manifest.next_table_id.store(table_id + 1, std::sync::atomic::Ordering::Release);
+			manifest.last_sequence = last_seq;
+
+			let mut changeset = crate::levels::ManifestChangeSet::default();
+			changeset.new_tables.push((0, table));
+			manifest.apply_changeset(&changeset)?;
+			crate::levels::write_manifest_to_disk(&manifest)?;
+		}
+
+		log::info!("SurrealKV v1 to SurrealKV v2 automatic migration completed successfully!");
 		Ok(())
 	}
 
