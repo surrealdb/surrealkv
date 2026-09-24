@@ -1393,11 +1393,11 @@ impl Tree {
 			let opts_arc = Arc::new(opts.clone());
 			let mut writer = crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&opts_arc), 0);
 
-			let mut seq = 1u64;
+			let mut last_seq = 0u64;
 			for (k, v) in records {
-				let ikey = crate::InternalKey::new(k, seq, crate::InternalKeyKind::Set);
+				last_seq += 1;
+				let ikey = crate::InternalKey::new(k, last_seq, crate::InternalKeyKind::Set);
 				writer.add(ikey, &v)?;
-				seq += 1;
 			}
 			let file_size = writer.finish()? as u64;
 
@@ -1412,7 +1412,7 @@ impl Tree {
 
 			let mut manifest = crate::levels::LevelManifest::new(Arc::clone(&opts_arc))?;
 			manifest.next_table_id.store(table_id + 1, std::sync::atomic::Ordering::Release);
-			manifest.last_sequence = seq;
+			manifest.last_sequence = last_seq;
 
 			let mut changeset = crate::levels::ManifestChangeSet::default();
 			changeset.new_tables.push((0, table));
