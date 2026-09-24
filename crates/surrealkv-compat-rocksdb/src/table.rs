@@ -8,6 +8,7 @@ use crate::block::{Block, decompress_block};
 use crate::error::{Error, Result};
 use crate::footer::Footer;
 use crate::handle::BlockHandle;
+use crate::varint::decode_varint;
 
 /// A decoded key-value record from a RocksDB SSTable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,13 +51,49 @@ impl SstReader {
 
 		let comp_type = index_raw[index_handle.size as usize];
 		let decompressed = decompress_block(&index_raw[..index_handle.size as usize], comp_type)?;
-		let index_block = Block::new(decompressed)?;
 
 		let mut data_handles = Vec::new();
-		for entry in index_block.iter() {
-			let (_idx_key, val) = entry?;
-			let (handle, _) = BlockHandle::decode(&val, 0)?;
-			data_handles.push(handle);
+		if decompressed.len() >= 4 {
+			let n = decompressed.len();
+			let num_restarts = u32::from_le_bytes(decompressed[n - 4..].try_into().unwrap()) as usize;
+			let data_len = n.saturating_sub(4 + num_restarts * 4);
+			let mut offset = 0;
+			let mut curr_key = Vec::new();
+
+			while offset < data_len {
+				let (shared, n1) = decode_varint(&decompressed, offset).ok_or_else(|| {
+					Error::CorruptBlock {
+						offset: offset as u64,
+						reason: "Failed to decode index shared key length".to_string(),
+					}
+				})?;
+				offset += n1;
+
+				let (unshared, n2) = decode_varint(&decompressed, offset).ok_or_else(|| {
+					Error::CorruptBlock {
+						offset: offset as u64,
+						reason: "Failed to decode index unshared key length".to_string(),
+					}
+				})?;
+				offset += n2;
+
+				let shared = shared as usize;
+				let unshared = unshared as usize;
+
+				if offset + unshared > data_len {
+					break;
+				}
+
+				curr_key.truncate(shared);
+				curr_key.extend_from_slice(&decompressed[offset..offset + unshared]);
+				offset += unshared;
+
+				// In RocksDB BlockBasedTable index blocks, the value is the BlockHandle directly
+				let (handle, n3) = BlockHandle::decode(&decompressed, offset)?;
+				offset += n3;
+
+				data_handles.push(handle);
+			}
 		}
 
 		Ok(Self {
