@@ -5,12 +5,15 @@ use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::process;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
 use fs2::FileExt;
 
-use crate::error::{Error, Result}; // Use fs2 for file locking
+#[cfg(not(target_arch = "wasm32"))]
+use crate::error::Error;
+use crate::error::Result; // Use fs2 for file locking
 
 /// LockFile prevents multiple processes from accessing the same database
 /// directory
@@ -43,6 +46,7 @@ use crate::error::{Error, Result}; // Use fs2 for file locking
 /// lock when the process terminates (normal exit or crash).
 pub(crate) struct LockFile {
 	/// The path to the lock file
+	#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
 	path: PathBuf,
 	/// The lock file handle
 	#[cfg(not(target_arch = "wasm32"))]

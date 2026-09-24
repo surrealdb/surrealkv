@@ -10,7 +10,7 @@ use crate::Options;
 #[derive(Debug, Clone, Copy)]
 pub struct HardwareProfile {
 	pub cpu_cores: usize,
-	pub total_ram_bytes: usize,
+	pub total_ram_bytes: u64,
 }
 
 impl HardwareProfile {
@@ -20,7 +20,7 @@ impl HardwareProfile {
 
 		// Heuristic default RAM estimation if OS memory query is unavailable:
 		// Assume at least 4GB or 1GB per core
-		let total_ram_bytes = (cpu_cores * 1024 * 1024 * 1024).max(4 * 1024 * 1024 * 1024);
+		let total_ram_bytes = ((cpu_cores as u64) * 1024 * 1024 * 1024).max(4 * 1024 * 1024 * 1024);
 
 		Self {
 			cpu_cores,
@@ -39,12 +39,12 @@ impl HardwareProfile {
 		let block_cache_budget = (engine_memory * 5) / 10;
 
 		// 3. Set memtable size: scale with core count
-		let target_memtable_size = (memtable_budget / (self.cpu_cores.clamp(2, 8)))
-			.clamp(16 * 1024 * 1024, 128 * 1024 * 1024);
+		let target_memtable_size = (memtable_budget / (self.cpu_cores.clamp(2, 8) as u64))
+			.clamp(16 * 1024 * 1024, 128 * 1024 * 1024) as usize;
 		opts.max_memtable_size = target_memtable_size;
 
 		// 4. Set block cache size
-		opts.with_block_cache_capacity(block_cache_budget as u64)
+		opts.with_block_cache_capacity(block_cache_budget)
 	}
 }
 

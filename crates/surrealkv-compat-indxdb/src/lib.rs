@@ -9,8 +9,19 @@ pub mod error;
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
+
+#[cfg(all(test, target_arch = "wasm32"))]
+mod wasm_tests {
+	use super::*;
+	use wasm_bindgen_test::*;
+
+	#[wasm_bindgen_test]
+	fn test_indexeddb_check() {
+		let _ = is_indxdb_available("test_db");
+	}
+}
 
 use std::path::Path;
 

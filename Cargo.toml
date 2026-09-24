@@ -66,7 +66,7 @@ web-sys = { version = "0.3", features = [
 	"Window",
 ] }
 
-[dev-dependencies]
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 tempdir = "0.3"
 criterion = { version = "0.5.1", features = ["html_reports"] }
 tokio = { version = "1.39.2", features = ["full"] }
@@ -75,6 +75,9 @@ fastrand = "2.0.1"
 divan = "0.1.14"
 test-log = "0.2.18"
 proptest = "1.4"
+
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"
 
 [lints.clippy]
 

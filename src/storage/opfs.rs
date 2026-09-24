@@ -85,7 +85,7 @@ impl OpfsSyncFile {
 
 	/// Closes the sync access handle.
 	pub fn close(&self) {
-		let _ = self.handle.close();
+		self.handle.close();
 	}
 }
 
@@ -197,8 +197,8 @@ pub async fn open_opfs_sync_file(
 	file_name: &str,
 	create: bool,
 ) -> Result<OpfsSyncFile> {
-	let mut options = FileSystemGetFileOptions::new();
-	options.create(create);
+	let options = FileSystemGetFileOptions::new();
+	options.set_create(create);
 
 	let file_val = JsFuture::from(dir.get_file_handle_with_options(file_name, &options))
 		.await
