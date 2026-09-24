@@ -266,7 +266,7 @@ impl LevelManifest {
 		let mut levels_vec = Vec::with_capacity(level_data.len());
 
 		// Load all levels that exist in the manifest
-		for (level_idx, table_ids) in level_data.iter().enumerate() {
+		for table_ids in level_data.iter() {
 			let mut tables = Vec::with_capacity(table_ids.len());
 
 			for &table_id in table_ids {
@@ -280,9 +280,9 @@ impl LevelManifest {
 				}
 			}
 
-			// Validate sequence numbers based on level
-			if level_idx > 0 && !tables.is_empty() {
-				Self::validate_table_sequence_numbers(level_idx as u8, &tables)?;
+			// Validate sequence numbers for all tables in this level
+			if !tables.is_empty() {
+				Self::validate_table_sequence_numbers(&tables)?;
 			}
 
 			// Create the level with the loaded tables
@@ -330,7 +330,7 @@ impl LevelManifest {
 		})
 	}
 
-	fn validate_table_sequence_numbers(level_idx: u8, tables: &[Arc<Table>]) -> Result<()> {
+	fn validate_table_sequence_numbers(tables: &[Arc<Table>]) -> Result<()> {
 		// Basic sanity check for all tables
 		for table in tables {
 			// Ensure both sequence numbers exist (they should always be set together)
@@ -357,28 +357,6 @@ impl LevelManifest {
 					"Table {} has invalid sequence numbers: smallest({}) > largest({})",
 					table.id, smallest, largest
 				)));
-			}
-		}
-
-		// If we have multiple tables, check sequence continuity across all tables
-		if tables.len() > 1 {
-			for i in 0..tables.len() - 1 {
-				let current = &tables[i];
-				let next = &tables[i + 1];
-
-				// Check if sequence numbers maintain continuity
-				if let (Some(next_smallest), Some(current_largest)) =
-					(next.meta.smallest_seq_num, current.meta.largest_seq_num)
-				{
-					if next_smallest <= current_largest {
-						return Err(Error::LoadManifestFail(format!(
-							"Level {} tables have overlapping sequence numbers: Table {} ({:?}-{:?}) and Table {} ({:?}-{:?})",
-							level_idx,
-							current.id, current.meta.smallest_seq_num, current.meta.largest_seq_num,
-							next.id, next.meta.smallest_seq_num, next.meta.largest_seq_num
-						)));
-					}
-				}
 			}
 		}
 
