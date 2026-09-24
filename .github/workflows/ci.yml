@@ -57,6 +57,9 @@ jobs:
       - name: Run tests
         if: ${{ !contains(matrix.os, 'windows') }}
         # Skip tests on Windows as compaction tests and some file system operations are not supported
+        env:
+          SURREALKV_SIM_SEEDS: 500
+          SURREALKV_SIM_STEPS: 5000
         run: make test
 
   ci:
@@ -82,10 +85,10 @@ jobs:
         run: which cargo-deny || cargo install --debug --locked cargo-deny@0.14.24
 
       - name: License check
-        run: cargo deny --all-features check licenses
+        run: cargo deny check licenses
 
       - name: Clippy
-        run: cargo clippy -- -Dwarnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Build WASM
         run: |
           rustup target add wasm32-unknown-unknown
