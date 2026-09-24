@@ -141,23 +141,7 @@ impl Compactor {
 		// Open table only if one was created
 		let new_table = if table_created {
 			match self.open_table(new_table_id, &new_table_path) {
-				Ok(table) => {
-					let max_level = self.options.lopts.level_count - 1;
-					let is_bottom = input.target_level >= max_level;
-					if !is_bottom {
-						if let Ok(manifest) = self.options.level_manifest.read() {
-							for &tid in &input.tables_to_merge {
-								if let Some(t) = manifest.find_table_by_id(tid) {
-									table
-										.range_deletions
-										.write()
-										.extend(t.range_deletions.read().clone());
-								}
-							}
-						}
-					}
-					Some(table)
-				}
+				Ok(table) => Some(table),
 				Err(e) => {
 					// Guard will unhide tables on drop
 					return Err(e);
@@ -187,6 +171,18 @@ impl Compactor {
 		let mut writer =
 			TableWriter::new(file, table_id, Arc::clone(&self.options.lopts), input.target_level);
 
+		// Collect range deletions from all input tables being merged
+		let mut range_deletions = Vec::new();
+		if let Ok(manifest) = self.options.level_manifest.read() {
+			for &tid in &input.tables_to_merge {
+				if let Some(t) = manifest.find_table_by_id(tid) {
+					range_deletions.extend(t.range_deletions.read().clone());
+				}
+			}
+		}
+		range_deletions.sort_unstable();
+		range_deletions.dedup();
+
 		// Get active snapshots for snapshot-aware compaction
 		// This is a snapshot of the snapshot list at the start of compaction.
 		// Any snapshots created during compaction will be handled by the next compaction.
@@ -200,7 +196,8 @@ impl Compactor {
 			Arc::clone(&self.options.lopts.internal_comparator) as Arc<dyn Comparator>,
 			is_bottom_level,
 			snapshots,
-		);
+		)
+		.with_range_deletions(range_deletions);
 
 		let mut entries = 0;
 		for item in &mut comp_iter {
@@ -209,8 +206,13 @@ impl Compactor {
 			entries += 1;
 		}
 
-		if entries == 0 {
-			// No entries - drop writer and remove empty file
+		// Add active range deletions to table metadata so they are persisted on disk
+		for (start, end, seq) in comp_iter.active_range_deletions() {
+			writer.add_range_deletion(start.clone(), end.clone(), *seq);
+		}
+
+		if entries == 0 && comp_iter.active_range_deletions().is_empty() {
+			// No entries and no range deletions - drop writer and remove empty file
 			drop(writer);
 			let _ = std::fs::remove_file(path);
 			return Ok(false);
