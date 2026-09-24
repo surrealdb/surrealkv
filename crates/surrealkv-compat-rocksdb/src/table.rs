@@ -25,11 +25,13 @@ pub struct RocksDbEntry {
 	pub timestamp: Option<u64>,
 }
 
-/// Reader for a single RocksDB BlockBasedTable (.sst) file.
+/// Reader and iterator for a single RocksDB BlockBasedTable (.sst) file.
 pub struct SstReader {
 	file: File,
 	data_handles: Vec<BlockHandle>,
 	has_user_timestamps: bool,
+	handle_idx: usize,
+	current_block_iter: Option<crate::block::BlockIter>,
 }
 
 impl SstReader {
@@ -99,27 +101,13 @@ impl SstReader {
 			file,
 			data_handles,
 			has_user_timestamps,
-		})
-	}
-
-	/// Returns an iterator over all records in this SSTable in ascending order.
-	pub fn iter(&mut self) -> SstIter<'_> {
-		SstIter {
-			reader: self,
 			handle_idx: 0,
 			current_block_iter: None,
-		}
+		})
 	}
 }
 
-/// Iterator over key-value records across all data blocks in an SSTable.
-pub struct SstIter<'a> {
-	reader: &'a mut SstReader,
-	handle_idx: usize,
-	current_block_iter: Option<crate::block::BlockIter>,
-}
-
-impl Iterator for SstIter<'_> {
+impl Iterator for SstReader {
 	type Item = Result<RocksDbEntry>;
 
 	fn next(&mut self) -> Option<Self::Item> {
@@ -145,7 +133,7 @@ impl Iterator for SstIter<'_> {
 							let mut user_key = &raw_key[..trailer_offset];
 							let mut timestamp = None;
 
-							if self.reader.has_user_timestamps && user_key.len() >= 8 {
+							if self.has_user_timestamps && user_key.len() >= 8 {
 								let ts_offset = user_key.len() - 8;
 								let ts =
 									u64::from_le_bytes(user_key[ts_offset..].try_into().unwrap());
@@ -167,18 +155,18 @@ impl Iterator for SstIter<'_> {
 			}
 
 			// Advance to next data block
-			if self.handle_idx >= self.reader.data_handles.len() {
+			if self.handle_idx >= self.data_handles.len() {
 				return None;
 			}
 
-			let handle = self.reader.data_handles[self.handle_idx];
+			let handle = self.data_handles[self.handle_idx];
 			self.handle_idx += 1;
 
 			let mut raw_bytes = vec![0u8; (handle.size + 5) as usize];
-			if let Err(e) = self.reader.file.seek(SeekFrom::Start(handle.offset)) {
+			if let Err(e) = self.file.seek(SeekFrom::Start(handle.offset)) {
 				return Some(Err(Error::Io(e)));
 			}
-			if let Err(e) = self.reader.file.read_exact(&mut raw_bytes) {
+			if let Err(e) = self.file.read_exact(&mut raw_bytes) {
 				return Some(Err(Error::Io(e)));
 			}
 

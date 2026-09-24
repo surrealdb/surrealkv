@@ -76,7 +76,7 @@ impl RocksDbDatabase {
 
 	/// Returns all active, live (non-deleted) key-value records in strictly ascending
 	/// lexicographical order, with all older versions dropped.
-	pub fn iter_latest(&self) -> Result<DatabaseIter<'_>> {
+	pub fn iter_latest(&self) -> Result<DatabaseIter> {
 		let mut readers = Vec::with_capacity(self.sst_paths.len());
 		for p in &self.sst_paths {
 			readers.push(SstReader::open(p, self.has_user_timestamps)?);
@@ -97,26 +97,26 @@ impl RocksDbDatabase {
 }
 
 /// Item tracked in the K-way merge priority queue.
-struct MergeCursor<'a> {
+struct MergeCursor {
 	entry: RocksDbEntry,
-	iter: crate::table::SstIter<'a>,
+	iter: SstReader,
 }
 
-impl PartialEq for MergeCursor<'_> {
+impl PartialEq for MergeCursor {
 	fn eq(&self, other: &Self) -> bool {
 		self.entry.key == other.entry.key && self.entry.seq_num == other.entry.seq_num
 	}
 }
 
-impl Eq for MergeCursor<'_> {}
+impl Eq for MergeCursor {}
 
-impl PartialOrd for MergeCursor<'_> {
+impl PartialOrd for MergeCursor {
 	fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
 		Some(self.cmp(other))
 	}
 }
 
-impl Ord for MergeCursor<'_> {
+impl Ord for MergeCursor {
 	fn cmp(&self, other: &Self) -> Ordering {
 		// Min-heap on key (ascending)
 		match other.entry.key.cmp(&self.entry.key) {
@@ -131,25 +131,21 @@ impl Ord for MergeCursor<'_> {
 
 /// K-way merging iterator over multiple SSTables that collapses duplicate keys
 /// down to only their latest version, dropping deletion tombstones.
-pub struct DatabaseIter<'a> {
-	heap: BinaryHeap<MergeCursor<'a>>,
+pub struct DatabaseIter {
+	heap: BinaryHeap<MergeCursor>,
 	last_emitted_key: Option<Vec<u8>>,
 }
 
-impl<'a> DatabaseIter<'a> {
+impl DatabaseIter {
 	fn new(readers: Vec<SstReader>) -> Result<Self> {
 		let mut heap = BinaryHeap::new();
 
-		let boxed_readers: Vec<Box<SstReader>> = readers.into_iter().map(Box::new).collect();
-		let static_readers: &'a mut [Box<SstReader>] = Box::leak(boxed_readers.into_boxed_slice());
-
-		for reader in static_readers.iter_mut() {
-			let mut iter = reader.iter();
-			if let Some(entry_res) = iter.next() {
+		for mut reader in readers {
+			if let Some(entry_res) = reader.next() {
 				let entry = entry_res?;
 				heap.push(MergeCursor {
 					entry,
-					iter,
+					iter: reader,
 				});
 			}
 		}
@@ -161,7 +157,7 @@ impl<'a> DatabaseIter<'a> {
 	}
 }
 
-impl Iterator for DatabaseIter<'_> {
+impl Iterator for DatabaseIter {
 	type Item = Result<(Vec<u8>, Vec<u8>)>;
 
 	fn next(&mut self) -> Option<Self::Item> {
