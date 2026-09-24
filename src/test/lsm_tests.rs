@@ -3938,7 +3938,8 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 	let valid_sst_ids = {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		tree.close().await.unwrap();
-		let manifest = LevelManifest::load_from_file(&opts.manifest_file_path(0), Arc::clone(&opts)).unwrap();
+		let manifest =
+			LevelManifest::load_from_file(opts.manifest_file_path(0), Arc::clone(&opts)).unwrap();
 		manifest.iter().map(|t| t.id).collect::<Vec<u64>>()
 	};
 

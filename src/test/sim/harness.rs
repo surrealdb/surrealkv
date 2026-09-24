@@ -58,6 +58,30 @@ impl SimRunner {
 						mtx.set(&key, &val);
 					}
 				}
+				Action::TxnRead(id, key) => {
+					if let Some((ref stx, ref mtx)) = active_txns.get(&id) {
+						let s_val = stx.get(&key).unwrap();
+						let m_val = mtx.get(&key, &self.model);
+						assert_eq!(
+							s_val,
+							m_val,
+							"In-transaction read mismatch at seed {seed}, step {step}, txn {id} on key {:?}",
+							String::from_utf8_lossy(&key)
+						);
+					}
+				}
+				Action::SetSavepoint(id) => {
+					if let Some((ref mut stx, ref mut mtx)) = active_txns.get_mut(&id) {
+						stx.set_savepoint().unwrap();
+						mtx.set_savepoint();
+					}
+				}
+				Action::RollbackToSavepoint(id, _sp) => {
+					if let Some((ref mut stx, ref mut mtx)) = active_txns.get_mut(&id) {
+						stx.rollback_to_savepoint().unwrap();
+						mtx.rollback_to_savepoint();
+					}
+				}
 				Action::Delete(id, key) => {
 					if let Some((ref mut stx, ref mut mtx)) = active_txns.get_mut(&id) {
 						stx.delete(&key).unwrap();
@@ -134,6 +158,11 @@ impl SimRunner {
 						String::from_utf8_lossy(&start),
 						String::from_utf8_lossy(&end)
 					);
+				}
+				Action::Flush => {
+					if let Some(ref store) = self.store {
+						let _ = store.flush_wal(true);
+					}
 				}
 				Action::CrashAndRestart => {
 					// Drop all in-flight uncommitted transactions
