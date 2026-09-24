@@ -22,6 +22,7 @@ rust-version = "1.86"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+surrealkv-compat-rocksdb = { path = "crates/surrealkv-compat-rocksdb" }
 affinitypool = "0.8.0"
 snap = "1.0.0"
 zstd = { version = "0.13", default-features = false }
