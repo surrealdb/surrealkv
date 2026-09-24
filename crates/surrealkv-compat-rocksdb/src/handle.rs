@@ -26,11 +26,10 @@ impl BlockHandle {
 			reason: "Failed to decode BlockHandle offset varint".to_string(),
 		})?;
 
-		let (block_size, n2) =
-			decode_varint(buf, offset + n1).ok_or(Error::CorruptBlock {
-				offset: (offset + n1) as u64,
-				reason: "Failed to decode BlockHandle size varint".to_string(),
-			})?;
+		let (block_size, n2) = decode_varint(buf, offset + n1).ok_or(Error::CorruptBlock {
+			offset: (offset + n1) as u64,
+			reason: "Failed to decode BlockHandle size varint".to_string(),
+		})?;
 
 		Ok((Self::new(block_offset, block_size), n1 + n2))
 	}

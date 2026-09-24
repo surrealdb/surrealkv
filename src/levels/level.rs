@@ -115,7 +115,8 @@ impl Level {
 		if idx < self.tables.len() {
 			let table = &self.tables[idx];
 			if let Some(ref smallest) = table.meta.smallest_point {
-				if comparator.compare(key, smallest.user_key.as_slice()) != std::cmp::Ordering::Less {
+				if comparator.compare(key, smallest.user_key.as_slice()) != std::cmp::Ordering::Less
+				{
 					return Some(table);
 				}
 			} else {

@@ -18,9 +18,9 @@ pub fn decompress_block(compressed: &[u8], comp_type: u8) -> Result<Vec<u8>> {
 		}
 		4 => {
 			// kLZ4Compression / kLZ4HCCompression
-			lz4_flex::decompress_size_prepended(compressed).or_else(|_| {
-				lz4_flex::decompress(compressed, compressed.len() * 4)
-			}).map_err(|e| Error::DecompressionFailed(format!("LZ4: {e}")))
+			lz4_flex::decompress_size_prepended(compressed)
+				.or_else(|_| lz4_flex::decompress(compressed, compressed.len() * 4))
+				.map_err(|e| Error::DecompressionFailed(format!("LZ4: {e}")))
 		}
 		7 => {
 			// kZSTD
@@ -94,28 +94,34 @@ impl Iterator for BlockIter {
 
 		let (shared, n1) = match decode_varint(&self.data, self.offset) {
 			Some(v) => v,
-			None => return Some(Err(Error::CorruptBlock {
-				offset: self.offset as u64,
-				reason: "Failed to decode shared key length".to_string(),
-			})),
+			None => {
+				return Some(Err(Error::CorruptBlock {
+					offset: self.offset as u64,
+					reason: "Failed to decode shared key length".to_string(),
+				}))
+			}
 		};
 		self.offset += n1;
 
 		let (unshared, n2) = match decode_varint(&self.data, self.offset) {
 			Some(v) => v,
-			None => return Some(Err(Error::CorruptBlock {
-				offset: self.offset as u64,
-				reason: "Failed to decode unshared key length".to_string(),
-			})),
+			None => {
+				return Some(Err(Error::CorruptBlock {
+					offset: self.offset as u64,
+					reason: "Failed to decode unshared key length".to_string(),
+				}))
+			}
 		};
 		self.offset += n2;
 
 		let (val_len, n3) = match decode_varint(&self.data, self.offset) {
 			Some(v) => v,
-			None => return Some(Err(Error::CorruptBlock {
-				offset: self.offset as u64,
-				reason: "Failed to decode value length".to_string(),
-			})),
+			None => {
+				return Some(Err(Error::CorruptBlock {
+					offset: self.offset as u64,
+					reason: "Failed to decode value length".to_string(),
+				}))
+			}
 		};
 		self.offset += n3;
 

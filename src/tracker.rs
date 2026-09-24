@@ -44,6 +44,8 @@ use parking_lot::RwLock;
 
 const NUM_TXN_SHARDS: usize = 64;
 
+type TxnShard = RwLock<BTreeSet<(u64, u64)>>;
+
 fn get_thread_shard_index() -> usize {
 	static SHARD_COUNTER: AtomicUsize = AtomicUsize::new(0);
 	thread_local! {
@@ -53,7 +55,7 @@ fn get_thread_shard_index() -> usize {
 }
 
 pub(crate) struct ActiveTxnTracker {
-	shards: Arc<[RwLock<BTreeSet<(u64, u64)>>; NUM_TXN_SHARDS]>,
+	shards: Arc<[TxnShard; NUM_TXN_SHARDS]>,
 	next_id: AtomicU64,
 }
 
@@ -65,9 +67,9 @@ impl Default for ActiveTxnTracker {
 
 impl ActiveTxnTracker {
 	pub(crate) fn new() -> Self {
-		let shards: Vec<RwLock<BTreeSet<(u64, u64)>>> =
+		let shards: Vec<TxnShard> =
 			(0..NUM_TXN_SHARDS).map(|_| RwLock::new(BTreeSet::new())).collect();
-		let shards: Box<[RwLock<BTreeSet<(u64, u64)>>; NUM_TXN_SHARDS]> =
+		let shards: Box<[TxnShard; NUM_TXN_SHARDS]> =
 			shards.into_boxed_slice().try_into().unwrap_or_else(|_| panic!("size mismatch"));
 		Self {
 			shards: Arc::from(shards),
@@ -92,10 +94,7 @@ impl ActiveTxnTracker {
 
 	/// Smallest `start_seq` currently registered. `None` if empty.
 	pub(crate) fn oldest(&self) -> Option<u64> {
-		self.shards
-			.iter()
-			.filter_map(|s| s.read().first().map(|e| e.0))
-			.min()
+		self.shards.iter().filter_map(|s| s.read().first().map(|e| e.0)).min()
 	}
 
 	#[cfg(test)]

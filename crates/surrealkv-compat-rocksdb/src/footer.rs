@@ -3,7 +3,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 
-use crate::block::{Block, decompress_block};
+use crate::block::{decompress_block, Block};
 use crate::error::{Error, Result};
 use crate::handle::BlockHandle;
 
@@ -62,7 +62,8 @@ impl Footer {
 			file.read_exact(&mut meta_block_raw)?;
 
 			let comp_type = meta_block_raw[metaindex_size as usize];
-			let decompressed = decompress_block(&meta_block_raw[..metaindex_size as usize], comp_type)?;
+			let decompressed =
+				decompress_block(&meta_block_raw[..metaindex_size as usize], comp_type)?;
 			let meta_block = Block::new(decompressed)?;
 
 			let mut index_handle = None;

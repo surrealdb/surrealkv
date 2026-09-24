@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use crate::block::{Block, decompress_block};
+use crate::block::{decompress_block, Block};
 use crate::error::{Error, Result};
 use crate::footer::Footer;
 use crate::handle::BlockHandle;
@@ -55,26 +55,25 @@ impl SstReader {
 		let mut data_handles = Vec::new();
 		if decompressed.len() >= 4 {
 			let n = decompressed.len();
-			let num_restarts = u32::from_le_bytes(decompressed[n - 4..].try_into().unwrap()) as usize;
+			let num_restarts =
+				u32::from_le_bytes(decompressed[n - 4..].try_into().unwrap()) as usize;
 			let data_len = n.saturating_sub(4 + num_restarts * 4);
 			let mut offset = 0;
 			let mut curr_key = Vec::new();
 
 			while offset < data_len {
-				let (shared, n1) = decode_varint(&decompressed, offset).ok_or_else(|| {
-					Error::CorruptBlock {
+				let (shared, n1) =
+					decode_varint(&decompressed, offset).ok_or_else(|| Error::CorruptBlock {
 						offset: offset as u64,
 						reason: "Failed to decode index shared key length".to_string(),
-					}
-				})?;
+					})?;
 				offset += n1;
 
-				let (unshared, n2) = decode_varint(&decompressed, offset).ok_or_else(|| {
-					Error::CorruptBlock {
+				let (unshared, n2) =
+					decode_varint(&decompressed, offset).ok_or_else(|| Error::CorruptBlock {
 						offset: offset as u64,
 						reason: "Failed to decode index unshared key length".to_string(),
-					}
-				})?;
+					})?;
 				offset += n2;
 
 				let shared = shared as usize;
@@ -137,9 +136,8 @@ impl Iterator for SstIter<'_> {
 							}
 
 							let trailer_offset = raw_key.len() - 8;
-							let trailer = u64::from_le_bytes(
-								raw_key[trailer_offset..].try_into().unwrap(),
-							);
+							let trailer =
+								u64::from_le_bytes(raw_key[trailer_offset..].try_into().unwrap());
 							let seq_num = trailer >> 8;
 							let val_type = (trailer & 0xff) as u8;
 							let is_tombstone = val_type == 0; // 0 = kTypeDeletion
@@ -149,9 +147,8 @@ impl Iterator for SstIter<'_> {
 
 							if self.reader.has_user_timestamps && user_key.len() >= 8 {
 								let ts_offset = user_key.len() - 8;
-								let ts = u64::from_le_bytes(
-									user_key[ts_offset..].try_into().unwrap(),
-								);
+								let ts =
+									u64::from_le_bytes(user_key[ts_offset..].try_into().unwrap());
 								timestamp = Some(ts);
 								user_key = &user_key[..ts_offset];
 							}
