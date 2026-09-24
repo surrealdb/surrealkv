@@ -4,9 +4,16 @@
 //! Used for differential testing against SurrealKV: every read, range scan,
 //! and post-crash recovery is checked against `ModelDb` for 100% byte-for-byte equivalence.
 
-use crate::Key;
 use std::collections::BTreeMap;
 use std::ops::Bound;
+
+use surrealkv::Key;
+
+/// Error returned by the reference model oracle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModelError {
+	Conflict,
+}
 
 /// A simple, unoptimized in-memory reference model of a Key-Value store.
 #[derive(Debug, Default, Clone)]
@@ -74,7 +81,7 @@ impl ModelDb {
 	}
 
 	/// Attempts to commit a model transaction using first-committer-wins conflict detection.
-	pub fn commit(&mut self, txn: ModelTxn) -> Result<(), ()> {
+	pub fn commit(&mut self, txn: ModelTxn) -> Result<(), ModelError> {
 		if txn.ops.is_empty() {
 			return Ok(());
 		}
@@ -85,7 +92,7 @@ impl ModelDb {
 				for modified_key in keys {
 					for (op_key, _) in &txn.ops {
 						if op_key == modified_key {
-							return Err(()); // Write-write conflict!
+							return Err(ModelError::Conflict); // Write-write conflict!
 						}
 					}
 				}

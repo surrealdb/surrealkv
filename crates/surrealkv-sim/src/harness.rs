@@ -5,18 +5,34 @@ use std::ops::Bound;
 use std::path::PathBuf;
 use tempfile::TempDir;
 
-use crate::lsm::Tree;
-use crate::test::collect_transaction_all;
-use crate::TreeBuilder;
+use surrealkv::{LSMIterator, ReadOptions, Result, Transaction, Tree, TreeBuilder};
 
 use super::generator::{Action, WorkloadGenerator};
 use super::model::{ModelDb, ModelTxn};
+
+fn collect_transaction_all(iter: &mut impl LSMIterator) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+	iter.seek_first()?;
+	let mut result = Vec::new();
+	while iter.valid() {
+		let key = iter.key().user_key().to_vec();
+		let value = iter.value()?;
+		result.push((key, value));
+		iter.next()?;
+	}
+	Ok(result)
+}
 
 pub struct SimRunner {
 	store: Option<Tree>,
 	model: ModelDb,
 	db_path: PathBuf,
 	_temp_dir: TempDir,
+}
+
+impl Default for SimRunner {
+	fn default() -> Self {
+		Self::new()
+	}
 }
 
 impl SimRunner {
@@ -42,7 +58,7 @@ impl SimRunner {
 	/// Runs deterministic simulation for N actions and checks differential equivalence.
 	pub async fn run(&mut self, seed: u64, steps: usize) {
 		let mut gen = WorkloadGenerator::new(seed, 30);
-		let mut active_txns: HashMap<usize, (crate::Transaction, ModelTxn)> = HashMap::new();
+		let mut active_txns: HashMap<usize, (Transaction, ModelTxn)> = HashMap::new();
 
 		for step in 0..steps {
 			let action = gen.next_action();
@@ -177,7 +193,7 @@ impl SimRunner {
 
 					// Verify full state consistency after recovery
 					let rtx = self.store.as_ref().unwrap().begin().unwrap();
-					let mut iter = rtx.range_with_options(&crate::ReadOptions::default()).unwrap();
+					let mut iter = rtx.range_with_options(&ReadOptions::default()).unwrap();
 					let recovered_items = collect_transaction_all(&mut iter).unwrap();
 					let model_items = self.model.range(Bound::Unbounded, Bound::Unbounded);
 

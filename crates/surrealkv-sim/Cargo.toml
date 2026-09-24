@@ -1,0 +1,21 @@
+[package]
+name = "surrealkv-sim"
+version = "0.1.0"
+edition = "2021"
+publish = false
+license = "Apache-2.0"
+description = "Deterministic Simulation Testing (DST) and differential testing oracle for SurrealKV"
+
+[[bin]]
+name = "surrealkv-sim"
+path = "src/bin/sim.rs"
+
+[dependencies]
+surrealkv = { path = "../..", version = "0.21.3" }
+tokio = { version = "1.36", features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+rand = "0.9.2"
+tempfile = "3.10.1"
+
+[dev-dependencies]
+test-log = "0.2.18"
+tokio = { version = "1.39.2", features = ["full"] }
