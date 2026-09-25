@@ -35,7 +35,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Engine | Point Read (OPS) | Create (OPS) | Update (OPS) | Delete (OPS) | Scan (OPS) | Resting Memory | Peak Memory |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **SurrealKV** | **1,182,982** | **98,853** | **102,614** | **97,037** | **8,361** | **~328 MB** | 1.35 GB |
+| **SurrealKV** | **1,182,982** <img width="16" src="/img/rocket.png" alt="🚀"> | **98,853** <img width="16" src="/img/rocket.png" alt="🚀"> | **102,614** <img width="16" src="/img/rocket.png" alt="🚀"> | **97,037** <img width="16" src="/img/rocket.png" alt="🚀"> | **8,361** | **~328 MB** <img width="16" src="/img/rocket.png" alt="🚀"> | 1.35 GB |
 | RocksDB | 692,597 | 31,777 | 33,228 | 34,563 | 2,406 | ~356 MB | 393 MB |
 | Fjall | 767,353 | 1,327 | 1,315 | 1,173 | 385 | ~405 MB | 674 MB |
 | LMDB | 896,110 | 695 | 704 | 705 | 27,446 | ~421 MB | 558 MB |
