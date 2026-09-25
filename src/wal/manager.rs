@@ -140,7 +140,11 @@ impl Wal {
 		// Clone the fd before BufWriter consumes ownership. This cloned fd
 		// points to the same inode, so sync_all() on it will fsync all dirty
 		// pages for this file regardless of which fd wrote them.
-		let sync_fd = Arc::new(file.try_clone()?);
+		// On platforms without dup (like WASI), open the file path again.
+		let sync_fd = Arc::new(match file.try_clone() {
+			Ok(cloned) => cloned,
+			Err(_) => Self::open_wal_file(&file_path, opts)?,
+		});
 
 		// Get file size from the opened file handle
 		let existing_size = file.metadata()?.len();
@@ -482,7 +486,7 @@ impl WalManager {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use tempdir::TempDir;
 	use test_log::test;

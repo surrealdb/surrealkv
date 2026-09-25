@@ -130,7 +130,7 @@ impl Drop for LockFile {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use std::fs;
 	use std::sync::{Arc, Barrier};

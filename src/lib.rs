@@ -1,7 +1,6 @@
 pub mod autotune;
 mod batch;
-pub use byteslice;
-pub use byteslice::ByteSlice;
+pub use byteslice::{self, ByteSlice};
 mod cache;
 mod checkpoint;
 mod clock;
@@ -32,7 +31,7 @@ mod vfs;
 mod vlog;
 mod wal;
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod test;
 
 use std::cmp::Ordering;

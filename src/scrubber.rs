@@ -3,11 +3,12 @@
 //! Continually trickles through SSTable blocks, validating inline checksums
 //! to detect and alert on silent hardware bit-rot or media corruption.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 #[cfg(test)]
 use crate::error::Result;
 #[cfg(test)]
 use crate::sstable::table::Table;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct Scrubber {
 	running: AtomicBool,
@@ -55,7 +56,7 @@ impl Scrubber {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use super::*;
 

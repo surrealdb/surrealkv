@@ -15,8 +15,7 @@ use crate::error::{Error, Result};
 use crate::memtable::MemTable;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::DefaultReporter;
-use crate::wal::Error as WalError;
-use crate::wal::SegmentRef;
+use crate::wal::{Error as WalError, SegmentRef};
 
 /// Decodes a single WAL segment file into batches and the segment's maximum sequence number.
 pub(crate) fn decode_segment_batches(
@@ -194,11 +193,12 @@ pub(crate) async fn replay_segments_parallel(
 	Ok((res_seq, memtables))
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+	use tempfile::TempDir;
+
 	use super::*;
 	use crate::InternalKeyKind;
-	use tempfile::TempDir;
 
 	#[tokio::test]
 	async fn test_parallel_wal_replay_single_segment() {

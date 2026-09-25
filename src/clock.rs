@@ -37,10 +37,13 @@ pub struct DefaultLogicalClockInner {
 	/// Reference time when this clock was last synced with system clock
 	reference: RwLock<(u64, Instant)>,
 	/// Specifies whether timestamp syncing is enabled in the background
+	#[cfg_attr(target_family = "wasm", allow(dead_code))]
 	resync_enabled: AtomicBool,
 	/// Stores a handle to the current timestamp syncing background thread
+	#[cfg_attr(target_family = "wasm", allow(dead_code))]
 	resync_handle: Mutex<Option<JoinHandle<()>>>,
 	/// Interval at which the clock resyncs with the system clock
+	#[cfg_attr(target_family = "wasm", allow(dead_code))]
 	resync_interval: Duration,
 }
 
@@ -108,16 +111,20 @@ impl DefaultLogicalClock {
 
 	/// Shutdown the oracle resync, waiting for background threads to exit
 	fn shutdown(&self) {
-		// Disable timestamp resyncing
-		self.inner.resync_enabled.store(false, Ordering::Release);
-		// Wait for the timestamp resyncing thread to exit
-		if let Some(handle) = self.inner.resync_handle.lock().unwrap().take() {
-			handle.thread().unpark();
-			handle.join().unwrap();
+		#[cfg(not(target_family = "wasm"))]
+		{
+			// Disable timestamp resyncing
+			self.inner.resync_enabled.store(false, Ordering::Release);
+			// Take the thread handle and unpark the thread
+			if let Some(handle) = self.inner.resync_handle.lock().unwrap().take() {
+				handle.thread().unpark();
+				handle.join().unwrap();
+			}
 		}
 	}
 
 	/// Start the resyncing thread after creating the oracle
+	#[cfg(not(target_family = "wasm"))]
 	fn spawn_clock_sync(&self) {
 		// Clone the underlying clock inner
 		let inner = Arc::clone(&self.inner);
@@ -139,6 +146,11 @@ impl DefaultLogicalClock {
 		});
 		// Store and track the thread handle
 		*self.inner.resync_handle.lock().unwrap() = Some(handle);
+	}
+
+	#[cfg(target_family = "wasm")]
+	fn spawn_clock_sync(&self) {
+		// Background threads not supported on WASM
 	}
 }
 
