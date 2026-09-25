@@ -29,7 +29,7 @@ rust-version = "1.86"
 surrealkv-compat-rocksdb = { path = "crates/surrealkv-compat-rocksdb" }
 surrealkv-compat-v1 = { path = "crates/surrealkv-compat-v1" }
 surrealkv-compat-indxdb = { path = "crates/surrealkv-compat-indxdb" }
-byteslice = { version = "0.1.0", path = "../byteslice" }
+byteslice = "0.1.0"
 affinitypool = "0.8.0"
 snap = "1.0.0"
 zstd = { version = "0.13", default-features = false }
