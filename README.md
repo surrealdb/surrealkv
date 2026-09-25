@@ -1,7 +1,27 @@
-# SurrealKV
+<br>
 
-[![License](https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square)](https://github.com/surrealdb/surrealkv)
-[![Crates.io](https://img.shields.io/crates/v/surrealkv.svg?style=flat-square)](https://crates.io/crates/surrealkv)
+<p align="center">
+    <a href="https://surrealdb.com#gh-dark-mode-only" target="_blank">
+        <img width="200" src="/img/white/logo.svg" alt="SurrealKV Logo">
+    </a>
+    <a href="https://surrealdb.com#gh-light-mode-only" target="_blank">
+        <img width="200" src="/img/black/logo.svg" alt="SurrealKV Logo">
+    </a>
+</p>
+
+<p align="center">An embedded, non-blocking, async-native, key-value storage engine.</p>
+
+<br>
+
+<p align="center">
+	<a href="https://github.com/surrealdb/surrealkv"><img src="https://img.shields.io/badge/status-stable-ff00bb.svg?style=flat-square"></a>
+	&nbsp;
+	<a href="https://docs.rs/surrealkv/"><img src="https://img.shields.io/docsrs/surrealkv?style=flat-square"></a>
+	&nbsp;
+	<a href="https://crates.io/crates/surrealkv"><img src="https://img.shields.io/crates/v/surrealkv?style=flat-square"></a>
+	&nbsp;
+	<a href="https://github.com/surrealdb/surrealkv"><img src="https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square"></a>
+</p>
 
 SurrealKV is a high-performance, non-blocking, async-native, embedded key-value storage engine built on a modern Log-Structured Merge (LSM) tree architecture.
 
