@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs::create_dir_all;
-#[cfg(not(target_os = "windows"))]
+#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1388,7 +1388,8 @@ impl Tree {
 				if name == "_rocksdb_backup" {
 					continue;
 				}
-				// RocksDB files: CURRENT, MANIFEST-*, OPTIONS-*, IDENTITY, LOCK, *.sst, *.log, *.dbtmp
+				// RocksDB files: CURRENT, MANIFEST-*, OPTIONS-*, IDENTITY, LOCK, *.sst, *.log,
+				// *.dbtmp
 				if name.starts_with("MANIFEST-")
 					|| name.starts_with("OPTIONS-")
 					|| name == "CURRENT"
@@ -2045,11 +2046,9 @@ pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 		return Ok(());
 	}
 
-	// On Windows, calling sync_all() on a directory handle returns
-	// ERROR_ACCESS_DENIED (os error 5) because FlushFileBuffers requires
-	// GENERIC_WRITE, which is not available for directories. NTFS journals
-	// directory metadata automatically, so this is safe to skip.
-	#[cfg(not(target_os = "windows"))]
+	// On Windows and WASM/WASI, calling sync_all() on a directory handle is
+	// not supported by the underlying host/runtime.
+	#[cfg(not(any(target_os = "windows", target_family = "wasm")))]
 	{
 		let file = File::open(path)?;
 		debug_assert!(file.metadata()?.is_dir());

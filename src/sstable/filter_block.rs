@@ -35,7 +35,8 @@ impl FilterBlockWriter {
 	// Starts a new block at a given offset. This may trigger the generation of a
 	// new filter if necessary.
 	pub(crate) fn start_block(&mut self, block_offset: usize) {
-		let filter_index = block_offset / FILTER_BASE as usize; // Calculate the index of the filter for the current block.
+		let filter_index = block_offset / FILTER_BASE as usize; // Calculate the index of the filter
+														  // for the current block.
 		let filters_len = self.filter_offsets.len();
 		assert!(filter_index >= filters_len); // Ensure the filter index is not out of bounds.
 		while filter_index > self.filter_offsets.len() {
@@ -73,7 +74,9 @@ impl FilterBlockWriter {
 		let mut result = self.filters;
 		let offsets_offset = self.filter_offsets.len();
 		let mut ix = result.len();
-		result.resize(ix + 4 * self.filter_offsets.len() + 5, 0); // Resize the result to fit the offsets and the base log2 value.
+		result.resize(ix + 4 * self.filter_offsets.len() + 5, 0); // Resize the result to fit the
+															// offsets and the base log2
+															// value.
 
 		// Append per-filter offsets to the result.
 		for offset in self.filter_offsets {
@@ -159,7 +162,7 @@ impl FilterBlockReader {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use test_log::test;
 

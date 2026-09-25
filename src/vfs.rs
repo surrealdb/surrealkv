@@ -42,12 +42,31 @@ impl File for SysFile {
 				.map_err(|e| Error::Io(e.into()))
 		}
 
-		#[cfg(target_arch = "wasm32")]
+		#[cfg(target_os = "wasi")]
+		{
+			use std::os::fd::AsRawFd;
+			let fd = self.as_raw_fd();
+			let res = unsafe {
+				libc::pread(
+					fd,
+					buf.as_mut_ptr() as *mut libc::c_void,
+					buf.len(),
+					offset as libc::off_t,
+				)
+			};
+			if res < 0 {
+				Err(Error::Io(std::io::Error::last_os_error().into()))
+			} else {
+				Ok(res as usize)
+			}
+		}
+
+		#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 		{
 			Err(Error::Io(
 				std::io::Error::new(
 					std::io::ErrorKind::Unsupported,
-					"read_at is not supported on WASM",
+					"read_at is not supported on WASM without OPFS or WASI",
 				)
 				.into(),
 			))
