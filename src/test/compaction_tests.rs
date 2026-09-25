@@ -3186,3 +3186,44 @@ fn test_clean_cut_integration_no_expansion() {
 	);
 	assert!(selected.contains(&1), "File 1 should be the only selected file");
 }
+
+#[test]
+fn test_table_writer_add_zero_copy_vlog_check() {
+	use crate::vlog::{ValueLocation, ValuePointer};
+
+	const VALUE_SIZE: usize = 1024 * 1024;
+	let dir = tempfile::TempDir::new().unwrap();
+	let path = dir.path().join("test_zero_copy.sst");
+	let opts = Arc::new(Options::new());
+
+	let value = ValueLocation::with_inline_value(vec![0x5Au8; VALUE_SIZE]).encode();
+	let file = std::fs::File::create(&path).unwrap();
+	let mut writer = TableWriter::new(file, 1, Arc::clone(&opts), 1);
+
+	let key0 = InternalKey::new(b"key-a".to_vec(), 1, InternalKeyKind::Set);
+	writer.add(key0, &value).unwrap();
+
+	let file_size = writer.finish().unwrap();
+	assert!(file_size > 0);
+
+	// Also verify vlog pointer peek properly tracks oldest_vlog_file_id
+	let path2 = dir.path().join("test_vlog_peek.sst");
+	let ptr = ValuePointer::new(7, 2048, 8, 100, 0);
+	let ptr_value = ValueLocation::with_pointer(ptr).encode();
+	let file2 = std::fs::File::create(&path2).unwrap();
+	let mut writer2 = TableWriter::new(file2, 2, Arc::clone(&opts), 1);
+
+	let key1 = InternalKey::new(b"key-vlog".to_vec(), 2, InternalKeyKind::Set);
+	writer2.add(key1, &ptr_value).unwrap();
+	let size2 = writer2.finish().unwrap();
+
+	let read_file = std::fs::File::open(&path2).unwrap();
+	let table = crate::sstable::table::Table::new(
+		2,
+		Arc::clone(&opts),
+		Arc::new(read_file) as Arc<dyn crate::vfs::File>,
+		size2 as u64,
+	)
+	.unwrap();
+	assert_eq!(table.meta.properties.oldest_vlog_file_id, 7);
+}

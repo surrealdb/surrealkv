@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
@@ -723,8 +724,9 @@ pub(crate) struct CompactionIterator<'a> {
 	/// Buffer for versions that passed the filter and should be output.
 	///
 	/// After processing accumulated_versions, valid entries are moved here.
-	/// The advance() method drains this buffer before processing more input.
-	output_versions: Vec<(InternalKey, Value)>,
+	/// The advance() method drains this buffer front-first before processing
+	/// more input (a deque: Vec::remove(0) would memmove per pop).
+	output_versions: VecDeque<(InternalKey, Value)>,
 
 	/// Whether the iterator has been initialized.
 	initialized: bool,
@@ -765,7 +767,7 @@ impl<'a> CompactionIterator<'a> {
 			is_bottom_level,
 			current_user_key: Vec::new(),
 			accumulated_versions: Vec::new(),
-			output_versions: Vec::new(),
+			output_versions: VecDeque::new(),
 			initialized: false,
 			snapshots,
 			active_range_deletions: Vec::new(),
@@ -997,9 +999,14 @@ impl<'a> CompactionIterator<'a> {
 			return Ok(());
 		}
 
+		// Take ownership of the batch so entries can be MOVED into
+		// output_versions below instead of cloning every key and value; the
+		// buffer (and its capacity) is handed back at the end.
+		let mut versions = std::mem::take(&mut self.accumulated_versions);
+
 		// Sort by sequence number (descending) to get the latest version first
 		// Higher sequence number = more recent write
-		self.accumulated_versions.sort_by_key(|b| std::cmp::Reverse(b.0.seq_num()));
+		versions.sort_by_key(|b| std::cmp::Reverse(b.0.seq_num()));
 
 		// SAFETY NET: dedup physical duplicates that share an InternalKey
 		// (same user_key implied by accumulation pass + same seq_num).
@@ -1019,10 +1026,10 @@ impl<'a> CompactionIterator<'a> {
 		// keeps the first (sort is stable, so this is the row from the lowest
 		// level_idx — the newer source). In correct operation it deduplicates
 		// zero rows.
-		self.accumulated_versions.dedup_by_key(|b| b.0.seq_num());
+		versions.dedup_by_key(|b| b.0.seq_num());
 
 		// Register any range tombstones in accumulated versions
-		for (k, v) in &self.accumulated_versions {
+		for (k, v) in &versions {
 			if k.kind() == crate::InternalKeyKind::RangeDelete {
 				self.active_range_deletions.push((k.user_key.clone(), v.clone(), k.seq_num()));
 			}
@@ -1030,22 +1037,19 @@ impl<'a> CompactionIterator<'a> {
 
 		// Check if latest version is DELETE at bottom level
 		// If so, we can completely remove this key from the database
-		let latest_is_delete_at_bottom = self.is_bottom_level
-			&& !self.accumulated_versions.is_empty()
-			&& self.accumulated_versions[0].0.is_hard_delete_marker();
+		let latest_is_delete_at_bottom =
+			self.is_bottom_level && !versions.is_empty() && versions[0].0.is_hard_delete_marker();
 
 		// Check if any version is REPLACE
 		// REPLACE semantics: delete all older versions regardless of retention
-		let has_set_with_delete = self.accumulated_versions.iter().any(|(key, _)| key.is_replace());
+		let has_set_with_delete = versions.iter().any(|(key, _)| key.is_replace());
 
 		// Track the visibility of the previous (newer) version we processed.
 		// Used to detect when a newer version supersedes an older one.
 		let mut newer_version_visibility: Option<SnapshotVisibility> = None;
 
-		// We need to iterate with indices to access accumulated_versions
-		let len = self.accumulated_versions.len();
-		for i in 0..len {
-			let (key, value) = &self.accumulated_versions[i];
+		// Entries are moved out of the batch; kept ones go to output_versions.
+		for (i, (key, value)) in versions.drain(..).enumerate() {
 			let is_hard_delete = key.is_hard_delete_marker();
 			let is_replace = key.is_replace();
 			let is_latest = i == 0;
@@ -1160,15 +1164,16 @@ impl<'a> CompactionIterator<'a> {
 			};
 
 			if should_output {
-				self.output_versions.push((key.clone(), value.clone()));
+				self.output_versions.push_back((key, value));
 			}
 
 			// Update for next iteration (this version becomes the "newer" one)
 			newer_version_visibility = Some(current_visibility);
 		}
 
-		// Clear accumulated versions for the next key
-		self.accumulated_versions.clear();
+		// Hand the (now empty) buffer back so its capacity is reused for the
+		// next key's versions.
+		self.accumulated_versions = versions;
 		Ok(())
 	}
 
@@ -1244,10 +1249,9 @@ impl<'a> CompactionIterator<'a> {
 
 		loop {
 			// Priority 1: Return any pending output versions
-			if !self.output_versions.is_empty() {
-				// Remove from front to maintain sequence number order
-				// (already sorted descending by seq_num)
-				return Ok(Some(self.output_versions.remove(0)));
+			// (front-first to maintain descending seq_num order)
+			if let Some(entry) = self.output_versions.pop_front() {
+				return Ok(Some(entry));
 			}
 
 			// Priority 2: Check if merge iterator is exhausted
@@ -1256,8 +1260,8 @@ impl<'a> CompactionIterator<'a> {
 				if !self.accumulated_versions.is_empty() {
 					self.process_accumulated_versions()?;
 					// Return first output version if any
-					if !self.output_versions.is_empty() {
-						return Ok(Some(self.output_versions.remove(0)));
+					if let Some(entry) = self.output_versions.pop_front() {
+						return Ok(Some(entry));
 					}
 				}
 				return Ok(None);
@@ -1266,12 +1270,13 @@ impl<'a> CompactionIterator<'a> {
 			// Priority 3: Get next entry from merge iterator
 			// Extract to owned values to avoid borrow checker issues
 			let key_owned = self.merge_iter.current_key().to_owned();
-			let user_key_owned = key_owned.user_key.clone();
 			let value = self.merge_iter.current_value()?.to_vec();
 
-			// Check if this is a new user key
+			// Check if this is a new user key (bytewise, matching the
+			// grouping the rest of this iterator relies on). The user key is
+			// copied into current_user_key only when it changes, not per entry.
 			let is_new_key =
-				self.current_user_key.is_empty() || user_key_owned != self.current_user_key;
+				self.current_user_key.is_empty() || key_owned.user_key != self.current_user_key;
 
 			if is_new_key {
 				// Process accumulated versions of the previous key
@@ -1279,19 +1284,19 @@ impl<'a> CompactionIterator<'a> {
 					self.process_accumulated_versions()?;
 
 					// Start accumulating the new key
-					self.current_user_key = user_key_owned;
+					self.current_user_key.clone_from(&key_owned.user_key);
 					self.accumulated_versions.push((key_owned, value));
 
 					// Advance merge iterator for next iteration
 					self.merge_iter.next()?;
 
 					// Return first output version from processed key if any
-					if !self.output_versions.is_empty() {
-						return Ok(Some(self.output_versions.remove(0)));
+					if let Some(entry) = self.output_versions.pop_front() {
+						return Ok(Some(entry));
 					}
 				} else {
 					// First key - start accumulating
-					self.current_user_key = user_key_owned;
+					self.current_user_key.clone_from(&key_owned.user_key);
 					self.accumulated_versions.push((key_owned, value));
 
 					// Advance merge iterator for next iteration

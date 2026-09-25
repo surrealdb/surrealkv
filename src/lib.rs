@@ -866,6 +866,11 @@ impl InternalKey {
 	}
 
 	#[inline]
+	pub(crate) fn encoded_len(&self) -> usize {
+		self.user_key.len() + 8
+	}
+
+	#[inline]
 	pub(crate) fn seq_num(&self) -> u64 {
 		trailer_to_seq_num(self.trailer)
 	}

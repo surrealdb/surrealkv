@@ -966,3 +966,24 @@ async fn test_vlog_writer_reopen_append_only_behavior() {
 		);
 	}
 }
+
+#[test]
+fn test_peek_pointer_payload() {
+	use crate::vlog::{ValueLocation, ValuePointer};
+
+	let pointer = ValuePointer::new(42, 1024, 10, 256, 0);
+	let location = ValueLocation::with_pointer(pointer);
+	let encoded = location.encode();
+
+	let peeked = ValueLocation::peek_pointer_payload(&encoded);
+	assert!(peeked.is_some(), "expected pointer payload");
+	let decoded_ptr = ValuePointer::decode(peeked.unwrap()).unwrap();
+	assert_eq!(decoded_ptr.file_id, 42);
+	assert_eq!(decoded_ptr.offset, 1024);
+	assert_eq!(decoded_ptr.value_size, 256);
+
+	// Test with inline value: peek should return None
+	let inline_loc = ValueLocation::with_inline_value(b"regular inline value".to_vec());
+	let encoded_inline = inline_loc.encode();
+	assert!(ValueLocation::peek_pointer_payload(&encoded_inline).is_none());
+}

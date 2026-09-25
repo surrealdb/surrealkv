@@ -1520,8 +1520,7 @@ impl<'a> HistoryIterator<'a> {
 					);
 					self.inner.seek(&seek_key.encode())?;
 				} else if let Some(ref lower) = self.lower_bound {
-					let seek_key =
-						InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set);
+					let seek_key = InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set);
 					self.inner.seek(&seek_key.encode())?;
 				} else {
 					self.inner.seek_first()?;
