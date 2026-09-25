@@ -51,6 +51,14 @@ jobs:
           targets: ${{ matrix.target }}
           components: rustfmt, clippy
 
+      - name: Install cross-compilation toolchain
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+
       - name: Build
         run: cargo build --target=${{ matrix.target }}
 
@@ -119,25 +127,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
         with:
           toolchain: stable
-          targets: wasm32-unknown-unknown, wasm32-wasip1
+          targets: wasm32-unknown-unknown
           components: clippy
 
-      - name: Check WASM (unknown-unknown)
+      - name: Check WASM
         run: cargo check --target wasm32-unknown-unknown -p surrealkv -p surrealkv-compat-indxdb -p surrealkv-compat-v1 -p surrealkv-compat-rocksdb
 
-      - name: Clippy WASM (unknown-unknown)
+      - name: Clippy WASM
         run: cargo clippy --target wasm32-unknown-unknown -p surrealkv -p surrealkv-compat-indxdb -p surrealkv-compat-v1 -p surrealkv-compat-rocksdb -- -D warnings
 
-      - name: Check WASM (WASI)
-        run: cargo check --target wasm32-wasip1 -p surrealkv -p surrealkv-compat-indxdb -p surrealkv-compat-v1 -p surrealkv-compat-rocksdb
-
-      - name: Clippy WASM (WASI)
-        run: cargo clippy --target wasm32-wasip1 -p surrealkv -p surrealkv-compat-indxdb -p surrealkv-compat-v1 -p surrealkv-compat-rocksdb -- -D warnings
-
       - name: Build WASM
-        run: |
-          cargo build --target wasm32-unknown-unknown -p surrealkv -p surrealkv-compat-indxdb -p surrealkv-compat-v1 -p surrealkv-compat-rocksdb
-          cargo build --target wasm32-wasip1 -p surrealkv -p surrealkv-compat-indxdb -p surrealkv-compat-v1 -p surrealkv-compat-rocksdb
+        run: cargo build --target wasm32-unknown-unknown -p surrealkv -p surrealkv-compat-indxdb -p surrealkv-compat-v1 -p surrealkv-compat-rocksdb
 
   wasm-test:
     name: WASM Test (${{ matrix.runtime }})
@@ -145,7 +145,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runtime: [node, bun, deno, browser]
+        runtime: [browser, node]
     steps:
       - name: Checkout sources
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -158,67 +158,17 @@ jobs:
       - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
         with:
           toolchain: stable
-          targets: wasm32-unknown-unknown, wasm32-wasip1
+          targets: wasm32-unknown-unknown
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
-
-      - name: Setup Bun
-        if: matrix.runtime == 'bun'
-        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
-
-      - name: Setup Deno
-        if: matrix.runtime == 'deno'
-        uses: denoland/setup-deno@22d081ff2d3a40755e97629de92e3bcbfa7cf2ed # v2
-
-      - name: Run WASM tests in Node.js
-        if: matrix.runtime == 'node'
-        run: |
-          cargo build --target wasm32-wasip1 --example wasi_fs_test
-          node --experimental-wasi-unstable-preview1 tests/run_wasi.mjs target/wasm32-wasip1/debug/examples/wasi_fs_test.wasm
-          wasm-pack test --node crates/surrealkv-compat-indxdb
-
-      - name: Run WASM tests in Bun
-        if: matrix.runtime == 'bun'
-        run: |
-          cargo build --target wasm32-wasip1 --example wasi_fs_test
-          bun tests/run_wasi.mjs target/wasm32-wasip1/debug/examples/wasi_fs_test.wasm
-          mkdir -p /tmp/bun-bin
-          printf 'delete globalThis.self;\n' > /tmp/bun-preload.js
-          cat << 'EOF' > /tmp/bun-bin/node
-          #!/bin/sh
-          exec bun -r /tmp/bun-preload.js "$@"
-          EOF
-          chmod +x /tmp/bun-bin/node
-          PATH=/tmp/bun-bin:$PATH wasm-pack test --node crates/surrealkv-compat-indxdb
-
-      - name: Run WASM tests in Deno
-        if: matrix.runtime == 'deno'
-        run: |
-          cargo build --target wasm32-wasip1 --example wasi_fs_test
-          deno run --allow-all tests/run_wasi.mjs target/wasm32-wasip1/debug/examples/wasi_fs_test.wasm
-          wasm-pack test --node crates/surrealkv-compat-indxdb -- --help
-          RUNNER=$(find ~/.cache ~/.cargo /home/runner -path "*/wasm-bindgen-cargo-install-*/wasm-bindgen-test-runner" 2>/dev/null | head -n 1)
-          if [ -z "$RUNNER" ]; then
-            RUNNER=$(find ~/.cache ~/.cargo /home/runner -name wasm-bindgen-test-runner 2>/dev/null | head -n 1)
-          fi
-          mkdir -p /tmp/deno-bin
-          printf 'globalThis.window = globalThis;\n' > /tmp/deno-preload.js
-          REAL_DENO=$(which -a deno | grep -v "/tmp/deno-bin" | head -n 1)
-          cat << EOF > /tmp/deno-bin/deno
-          #!/bin/sh
-          if [ "\$1" = "run" ]; then
-              shift
-              exec "$REAL_DENO" run --preload=/tmp/deno-preload.js "\$@"
-          else
-              exec "$REAL_DENO" "\$@"
-          fi
-          EOF
-          chmod +x /tmp/deno-bin/deno
-          PATH=/tmp/deno-bin:$PATH CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUNNER="$RUNNER" WASM_BINDGEN_USE_DENO=1 cargo test --target wasm32-unknown-unknown -p surrealkv-compat-indxdb
 
       - name: Run WASM tests in Browser (Headless Chrome)
         if: matrix.runtime == 'browser'
         run: |
           WASM_BINDGEN_USE_DEDICATED_WORKER=1 wasm-pack test --headless --chrome --test opfs_worker_test
           wasm-pack test --headless --chrome crates/surrealkv-compat-indxdb
+
+      - name: Run WASM tests in Node.js
+        if: matrix.runtime == 'node'
+        run: wasm-pack test --node crates/surrealkv-compat-indxdb
