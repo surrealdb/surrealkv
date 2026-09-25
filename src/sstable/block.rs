@@ -341,7 +341,7 @@ impl BlockWriter {
 				let last_internal_key = InternalKey::decode(self.last_key.as_slice());
 				let current_internal_key = InternalKey::decode(key);
 
-				log::error!(
+				tracing::error!(
 					"[BLOCK] Key ordering violation detected!\n\
                     Last Key:\n\
                       User Key (UTF-8): {:?}\n\
@@ -553,7 +553,7 @@ impl BlockIterator {
 				size: block.len(),
 				min_size: 4,
 			});
-			log::error!("[BLOCK] {}", err);
+			tracing::error!("[BLOCK] {}", err);
 			return Err(err);
 		}
 
@@ -584,7 +584,7 @@ impl BlockIterator {
 					offset: start_point,
 					block_size: block.len(),
 				});
-				log::error!("[BLOCK] {}", err);
+				tracing::error!("[BLOCK] {}", err);
 				return Err(err);
 			}
 			*restart_point =
@@ -704,7 +704,7 @@ impl BlockIterator {
 				value_end,
 				restart_offset: self.restart_offset,
 			});
-			log::error!("[BLOCK] {}", err);
+			tracing::error!("[BLOCK] {}", err);
 			return Err(err);
 		}
 
@@ -801,7 +801,7 @@ impl BlockIterator {
 	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
 		if self.restart_points.is_empty() {
 			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
-			log::error!("[BLOCK] {}", err);
+			tracing::error!("[BLOCK] {}", err);
 			return Err(err);
 		}
 		self.seek_to_restart_point(0);
@@ -825,7 +825,7 @@ impl BlockIterator {
 		if self.restart_points.is_empty() {
 			self.reset();
 			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
-			log::error!("[BLOCK] {}", err);
+			tracing::error!("[BLOCK] {}", err);
 			return Err(err);
 		}
 
@@ -884,7 +884,7 @@ impl BlockIterator {
 				block_size: self.block.len(),
 				restart_offset: self.restart_offset,
 			});
-			log::error!("[BLOCK] {}", err);
+			tracing::error!("[BLOCK] {}", err);
 			return Err(err);
 		}
 
@@ -907,7 +907,7 @@ impl BlockIterator {
 					key_end,
 					block_len: self.block.len(),
 				});
-				log::error!("[BLOCK] {}", err);
+				tracing::error!("[BLOCK] {}", err);
 				return Err(err);
 			}
 
@@ -943,7 +943,7 @@ impl BlockIterator {
 		match self.seek_next_entry() {
 			Ok(()) => Ok(true),
 			Err(e) => {
-				log::error!("[BLOCK] Failed to advance: {}", e);
+				tracing::error!("[BLOCK] Failed to advance: {}", e);
 				Err(e)
 			}
 		}

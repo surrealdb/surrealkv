@@ -268,7 +268,7 @@ impl CommitPipeline {
 						}
 					}
 					Err(e) => {
-						log::error!("Error during group commit flush: {:?}", e);
+						tracing::error!("Error during group commit flush: {:?}", e);
 						self.ring.advance_taken(last_seq);
 						for tx in completion_senders {
 							let _ = tx.send(Err(Error::Io(

@@ -202,7 +202,7 @@ impl Reader {
 				let offset_within_block = error_offset % BLOCK_SIZE;
 
 				// Detailed error logging for debugging
-				log::error!(
+				tracing::error!(
 					"WAL corruption detected: \
 					log_number={}, \
 					error_offset={} (0x{:X}), \

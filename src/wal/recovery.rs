@@ -27,7 +27,7 @@ impl DefaultReporter {
 
 impl Reporter for DefaultReporter {
 	fn corruption(&mut self, bytes: usize, reason: &str, log_number: u64) {
-		log::error!("Corruption in WAL {}: {} bytes lost - {}", log_number, bytes, reason);
+		tracing::error!("Corruption in WAL {}: {} bytes lost - {}", log_number, bytes, reason);
 		self.corruption_count += 1;
 	}
 }
@@ -53,8 +53,8 @@ pub(crate) fn replay_wal(
 	min_wal_number: u64,
 	arena_size: usize,
 ) -> Result<ReplayResult> {
-	log::info!("Starting WAL recovery from directory: {:?}", wal_dir);
-	log::debug!(
+	tracing::debug!("Starting WAL recovery from directory: {:?}", wal_dir);
+	tracing::debug!(
 		"WAL recovery parameters: min_wal_number={}, arena_size={}",
 		min_wal_number,
 		arena_size
@@ -62,12 +62,12 @@ pub(crate) fn replay_wal(
 
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
-		log::debug!("WAL directory does not exist, skipping recovery");
+		tracing::debug!("WAL directory does not exist, skipping recovery");
 		return Ok((None, vec![]));
 	}
 
 	if list_segment_ids(wal_dir, Some("wal"))?.is_empty() {
-		log::debug!("No WAL segments found, skipping recovery");
+		tracing::debug!("No WAL segments found, skipping recovery");
 		return Ok((None, vec![]));
 	}
 
@@ -75,7 +75,7 @@ pub(crate) fn replay_wal(
 	let (first, last) = match get_segment_range(wal_dir, Some("wal")) {
 		Ok(range) => range,
 		Err(WalError::IO(ref io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
-			log::debug!("WAL segment range not found, skipping recovery");
+			tracing::debug!("WAL segment range not found, skipping recovery");
 			return Ok((None, vec![]));
 		}
 		Err(e) => return Err(e.into()),
@@ -83,7 +83,7 @@ pub(crate) fn replay_wal(
 
 	// If no segments, nothing to replay
 	if first > last {
-		log::debug!("No valid WAL segment range, skipping recovery");
+		tracing::debug!("No valid WAL segment range, skipping recovery");
 		return Ok((None, vec![]));
 	}
 
@@ -91,7 +91,7 @@ pub(crate) fn replay_wal(
 	let start_segment = std::cmp::max(first, min_wal_number);
 
 	if start_segment > last {
-		log::info!(
+		tracing::debug!(
 			"All WAL segments already flushed (last={:020}, min_log_number={:020})",
 			last,
 			min_wal_number
@@ -99,7 +99,7 @@ pub(crate) fn replay_wal(
 		return Ok((None, vec![]));
 	}
 
-	log::info!("Replaying WAL segments #{:020} to #{:020}", start_segment, last);
+	tracing::debug!("Replaying WAL segments #{:020} to #{:020}", start_segment, last);
 
 	// Track statistics
 	let mut max_seq_num: u64 = 0;
@@ -134,7 +134,7 @@ pub(crate) fn replay_wal(
 		let segment = match all_segments.iter().find(|seg| seg.id == segment_id) {
 			Some(seg) => seg,
 			None => {
-				log::warn!(
+				tracing::warn!(
 					"WAL segment #{:020} not found in range [{:020}..{:020}], skipping.",
 					segment_id,
 					start_segment,
@@ -144,7 +144,7 @@ pub(crate) fn replay_wal(
 			}
 		};
 
-		log::debug!("Processing WAL segment #{:020}", segment_id);
+		tracing::debug!("Processing WAL segment #{:020}", segment_id);
 
 		// Create a new memtable for this segment
 		let mut current_memtable = Arc::new(MemTable::new(arena_size));
@@ -171,7 +171,7 @@ pub(crate) fn replay_wal(
 
 					batches_in_segment += 1;
 
-					log::debug!(
+					tracing::debug!(
 						"Replayed batch from WAL #{:020}: seq_num={}, entries={}, offset={}",
 						segment_id,
 						batch_highest_seq_num,
@@ -195,7 +195,7 @@ pub(crate) fn replay_wal(
 								)));
 							}
 							// Save current memtable and create new one
-							log::warn!(
+							tracing::warn!(
 								"WAL segment #{:020} exceeds single memtable capacity, splitting",
 								segment_id
 							);
@@ -208,7 +208,7 @@ pub(crate) fn replay_wal(
 					}
 				}
 				Err(WalError::Corruption(err)) => {
-					log::error!(
+					tracing::error!(
 						"Corrupted WAL record detected in segment {:020} at offset {}: {}",
 						segment_id,
 						last_valid_offset,
@@ -233,7 +233,7 @@ pub(crate) fn replay_wal(
 		}
 
 		if batches_in_segment > 0 {
-			log::info!(
+			tracing::debug!(
 				"Replayed {} batches from WAL segment #{:020}",
 				batches_in_segment,
 				segment_id
@@ -250,7 +250,7 @@ pub(crate) fn replay_wal(
 		None
 	};
 
-	log::info!(
+	tracing::debug!(
 		"WAL recovery complete: {} batches across {} segments, {} memtables created, max_seq_num={:?}",
 		total_batches_replayed,
 		segments_processed,
@@ -300,7 +300,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 			Ok((record_data, _offset)) => {
 				// We have a valid batch, write it to the repair WAL
 				if let Err(e) = repair_wal.append(record_data) {
-					log::error!("Failed to write valid batch to repaired WAL: {e}");
+					tracing::error!("Failed to write valid batch to repaired WAL: {e}");
 					repair_failed = true;
 					break;
 				}
@@ -308,20 +308,20 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 			}
 			Err(WalError::Corruption(err)) => {
 				// Stop at the first corruption
-				log::error!(
+				tracing::error!(
                     "Stopped repair at corruption: {err}. Recovered {valid_batches_count} valid batches."
                 );
 				break;
 			}
 			Err(WalError::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
 				// End of segment reached
-				log::info!(
+				tracing::info!(
 					"Repair completed successfully. Recovered {valid_batches_count} valid batches."
 				);
 				break;
 			}
 			Err(err) => {
-				log::error!("Unexpected error during repair: {err}");
+				tracing::error!("Unexpected error during repair: {err}");
 				repair_failed = true;
 				break;
 			}
@@ -346,7 +346,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 		// No valid data
 		fs::remove_file(&segment_path)?;
 		fs::remove_dir_all(&repair_dir).ok();
-		log::info!("Deleted corrupted WAL segment {segment_id:020}.wal (no valid data)");
+		tracing::info!("Deleted corrupted WAL segment {segment_id:020}.wal (no valid data)");
 		return Ok(());
 	}
 
@@ -355,7 +355,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 	fs::remove_dir_all(&repair_dir).ok();
 	fsync_directory(wal_dir)?;
 
-	log::info!(
+	tracing::info!(
 		"Successfully repaired WAL segment {segment_id} with {valid_batches_count} valid batches."
 	);
 

@@ -111,7 +111,7 @@ impl Wal {
 		let active_log_number = std::cmp::max(min_log_number, highest_on_disk);
 
 		if active_log_number > min_log_number {
-			log::info!(
+			tracing::debug!(
 				"WAL: advancing from min_log_number {} to {} (highest existing segment)",
 				min_log_number,
 				active_log_number
@@ -294,13 +294,13 @@ impl Wal {
 					match fs::remove_file(&path) {
 						Ok(()) => {
 							removed_count += 1;
-							log::warn!(
+							tracing::warn!(
 								"Removed stale repair file from previous crashed repair: {}",
 								filename_str
 							);
 						}
 						Err(e) => {
-							log::error!(
+							tracing::error!(
 								"Failed to remove stale repair file {}: {}",
 								filename_str,
 								e
@@ -313,7 +313,7 @@ impl Wal {
 		}
 
 		if removed_count > 0 {
-			log::info!("Cleaned up {} stale .wal.repair files", removed_count);
+			tracing::debug!("Cleaned up {} stale .wal.repair files", removed_count);
 		}
 
 		Ok(())
@@ -342,7 +342,7 @@ impl Wal {
 			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "buf is empty")));
 		}
 
-		log::trace!("WAL append: log_number={}, bytes={}", self.active_log_number, rec.len());
+		tracing::trace!("WAL append: log_number={}, bytes={}", self.active_log_number, rec.len());
 
 		self.active_writer.add_record(rec)?;
 
@@ -382,7 +382,7 @@ impl Wal {
 		}
 
 		let log_number = self.active_log_number;
-		log::debug!("Closing WAL #{:020}", log_number);
+		tracing::debug!("Closing WAL #{:020}", log_number);
 
 		self.closed = true;
 
@@ -393,7 +393,7 @@ impl Wal {
 		crate::lsm::fsync_directory(&self.dir)
 			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
 
-		log::debug!("WAL #{:020} closed and synced successfully", log_number);
+		tracing::debug!("WAL #{:020} closed and synced successfully", log_number);
 
 		Ok(())
 	}
@@ -416,7 +416,7 @@ impl Wal {
 		// Update the log number
 		self.active_log_number += 1;
 
-		log::debug!("WAL rotating: {:020} -> {:020}", old_log_number, self.active_log_number);
+		tracing::debug!("WAL rotating: {:020} -> {:020}", old_log_number, self.active_log_number);
 
 		// Create a new Writer and sync fd for the new log number
 		let (new_writer, new_sync_fd) =
@@ -428,7 +428,7 @@ impl Wal {
 		crate::lsm::fsync_directory(&self.dir)
 			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
 
-		log::info!(
+		tracing::debug!(
 			"WAL rotated and fsynced: {:020} -> {:020}",
 			old_log_number,
 			self.active_log_number
@@ -958,7 +958,7 @@ mod tests {
 			let mut wal = Wal::open_with_min_log_number(wal_path, 1, opts).unwrap();
 
 			let active = wal.get_active_log_number();
-			log::info!("After open_with_min_log_number(1): active_log_number = {}", active);
+			tracing::debug!("After open_with_min_log_number(1): active_log_number = {}", active);
 
 			// KEY ASSERTION: WAL should open at highest segment, not min_log_number
 			assert_eq!(

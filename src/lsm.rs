@@ -273,14 +273,14 @@ impl CoreInner {
 				))
 			})?;
 
-		log::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
+		tracing::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
 		// Step 2: Prepare atomic changeset
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&table)));
 		changeset.log_number = Some(wal_number + 1);
 
-		log::debug!(
+		tracing::debug!(
 			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
 			table_id,
 			wal_number + 1,
@@ -314,7 +314,7 @@ impl CoreInner {
 		self.memory_controller.set_immutable_memtable_bytes(memtable_lock.total_size());
 		drop(memtable);
 
-		log::info!(
+		tracing::debug!(
 			"Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
 			table_id,
 			wal_number + 1,
@@ -343,7 +343,7 @@ impl CoreInner {
 			return Ok(());
 		}
 
-		log::debug!("rotate_memtable: rotating memtable size={}", active_memtable.size());
+		tracing::debug!("rotate_memtable: rotating memtable size={}", active_memtable.size());
 
 		// Step 2: Rotate WAL while STILL holding memtable write lock
 		let (flushed_wal_number, new_wal_number) = {
@@ -355,7 +355,7 @@ impl CoreInner {
 			let new_log_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
 
-			log::debug!(
+			tracing::debug!(
 				"WAL rotated during memtable rotation: {} -> {}",
 				old_log_number,
 				new_log_number
@@ -392,7 +392,7 @@ impl CoreInner {
 		drop(active_memtable);
 		drop(immutable_memtables);
 
-		log::debug!(
+		tracing::debug!(
 			"rotate_memtable: completed rotation, table_id={}, wal_number={}",
 			table_id,
 			flushed_wal_number
@@ -418,7 +418,7 @@ impl CoreInner {
 		let entry = match entry {
 			Some(e) => e,
 			None => {
-				log::debug!("flush_oldest_immutable_to_sst: no immutables to flush");
+				tracing::debug!("flush_oldest_immutable_to_sst: no immutables to flush");
 				return Ok(None);
 			}
 		};
@@ -427,14 +427,14 @@ impl CoreInner {
 		if entry.memtable.is_empty() {
 			let mut guard = self.immutable_memtables.write()?;
 			guard.remove(entry.table_id);
-			log::debug!(
+			tracing::debug!(
 				"flush_oldest_immutable_to_sst: skipped empty memtable table_id={}",
 				entry.table_id
 			);
 			return Ok(None);
 		}
 
-		log::debug!(
+		tracing::debug!(
 			"flush_oldest_immutable_to_sst: flushing table_id={}, wal_number={}",
 			entry.table_id,
 			entry.wal_number
@@ -454,7 +454,7 @@ impl CoreInner {
 		tokio::spawn(async move {
 			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
 				Ok(count) if count > 0 => {
-					log::info!(
+					tracing::debug!(
 						"Cleaned up {} old WAL segments (min_wal_to_keep={})",
 						count,
 						min_wal_to_keep
@@ -462,12 +462,12 @@ impl CoreInner {
 				}
 				Ok(_) => {}
 				Err(e) => {
-					log::warn!("Failed to clean up old WAL segments: {}", e);
+					tracing::warn!("Failed to clean up old WAL segments: {}", e);
 				}
 			}
 		});
 
-		log::debug!(
+		tracing::debug!(
 			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
 			table.id,
 			table.file_size
@@ -485,7 +485,7 @@ impl CoreInner {
 			count += 1;
 		}
 		if count > 0 {
-			log::debug!("flush_all_immutables_sync: flushed {} immutable memtables", count);
+			tracing::debug!("flush_all_immutables_sync: flushed {} immutable memtables", count);
 		}
 		Ok(())
 	}
@@ -600,7 +600,7 @@ impl CoreInner {
 	/// is set to current_wal + 1, indicating all data up to current WAL is
 	/// persisted.
 	fn flush_all_memtables_for_shutdown(&self) -> Result<()> {
-		log::info!("Flushing all memtables for shutdown...");
+		tracing::debug!("Flushing all memtables for shutdown...");
 
 		// STEP 1: Flush ALL immutable memtables FIRST (older data, lower table_ids)
 		// We need to collect them first to avoid holding the lock during I/O
@@ -611,7 +611,10 @@ impl CoreInner {
 
 		let immutable_count = immutables_to_flush.len();
 		if immutable_count > 0 {
-			log::info!("Flushing {} immutable memtable(s) first (older data)", immutable_count);
+			tracing::debug!(
+				"Flushing {} immutable memtable(s) first (older data)",
+				immutable_count
+			);
 		}
 
 		// Flush each immutable memtable using its pre-assigned table_id and WAL number
@@ -628,7 +631,7 @@ impl CoreInner {
 				// Skip empty memtables - just remove from tracking
 				let mut immutable_guard = self.immutable_memtables.write()?;
 				immutable_guard.remove(entry.table_id);
-				log::debug!("Skipped empty immutable memtable: table_id={}", entry.table_id);
+				tracing::debug!("Skipped empty immutable memtable: table_id={}", entry.table_id);
 				continue;
 			}
 
@@ -641,7 +644,7 @@ impl CoreInner {
 			)?;
 
 			flushed_count += 1;
-			log::debug!(
+			tracing::debug!(
 				"Flushed immutable memtable {}/{}: table_id={}, wal_number={}",
 				flushed_count,
 				immutable_count,
@@ -651,7 +654,7 @@ impl CoreInner {
 		}
 
 		if flushed_count > 0 {
-			log::info!("Flushed {} immutable memtable(s) successfully", flushed_count);
+			tracing::debug!("Flushed {} immutable memtable(s) successfully", flushed_count);
 		}
 
 		// STEP 2: Flush active memtable LAST (newest data, gets highest table_id)
@@ -661,7 +664,7 @@ impl CoreInner {
 		drop(active_memtable);
 
 		if !active_is_empty {
-			log::info!("Flushing active memtable last (newest data): size={}", active_size);
+			tracing::debug!("Flushing active memtable last (newest data): size={}", active_size);
 
 			// Use flush_memtable_and_update_manifest which:
 			// - Gets a new (highest) table_id
@@ -670,18 +673,18 @@ impl CoreInner {
 			// Fail-fast: return immediately on error
 			match self.flush_memtable_and_update_manifest(None)? {
 				Some(table) => {
-					log::info!(
+					tracing::debug!(
 						"Active memtable flushed: table_id={}, file_size={}",
 						table.id,
 						table.file_size
 					);
 				}
 				None => {
-					log::debug!("Active memtable was empty, skipped flush");
+					tracing::debug!("Active memtable was empty, skipped flush");
 				}
 			}
 		} else {
-			log::debug!("Active memtable is empty, skipping flush");
+			tracing::debug!("Active memtable is empty, skipping flush");
 
 			// Even if active is empty, we should update log_number if we flushed immutables
 			// This marks the WAL as safe to delete
@@ -705,14 +708,14 @@ impl CoreInner {
 					return Err(error);
 				}
 
-				log::debug!(
+				tracing::debug!(
 					"Updated manifest log_number to {} after immutable flushes",
 					current_wal + 1
 				);
 			}
 		}
 
-		log::info!("All memtables flushed successfully for shutdown");
+		tracing::debug!("All memtables flushed successfully for shutdown");
 		Ok(())
 	}
 
@@ -754,10 +757,10 @@ impl CoreInner {
 						match std::fs::remove_file(&path) {
 							Ok(_) => {
 								removed_count += 1;
-								log::info!("Removed orphaned SST file: table_id={}", table_id);
+								tracing::debug!("Removed orphaned SST file: table_id={}", table_id);
 							}
 							Err(e) => {
-								log::warn!(
+								tracing::warn!(
 									"Failed to remove orphaned SST table_id={}: {}",
 									table_id,
 									e
@@ -770,9 +773,9 @@ impl CoreInner {
 		}
 
 		if removed_count > 0 {
-			log::info!("Cleaned up {} orphaned SST files", removed_count);
+			tracing::debug!("Cleaned up {} orphaned SST files", removed_count);
 		} else {
-			log::debug!("No orphaned SST files found");
+			tracing::debug!("No orphaned SST files found");
 		}
 
 		Ok(())
@@ -799,11 +802,14 @@ impl CoreInner {
 		// If no SSTs reference VLog files yet, keep all files
 		// (This handles the fresh database case)
 		if min_oldest_vlog == 0 {
-			log::debug!("No SSTs with VLog references found, skipping VLog orphan cleanup");
+			tracing::debug!("No SSTs with VLog references found, skipping VLog orphan cleanup");
 			return Ok(());
 		}
 
-		log::info!("Cleaning up orphaned VLog files below min_oldest_vlog={}", min_oldest_vlog);
+		tracing::debug!(
+			"Cleaning up orphaned VLog files below min_oldest_vlog={}",
+			min_oldest_vlog
+		);
 
 		// Use the consolidated cleanup helper
 		cleanup_vlog(&self.vlog, min_oldest_vlog, "startup");
@@ -939,7 +945,7 @@ impl Core {
 				// Handle corruption based on recovery mode
 				match recovery_mode {
 					WalRecoveryMode::AbsoluteConsistency => {
-						log::error!(
+						tracing::error!(
 							"WAL corruption detected in segment {} at offset {}: {}. \
 							AbsoluteConsistency mode: failing immediately without repair.",
 							segment_id,
@@ -953,7 +959,7 @@ impl Core {
 						});
 					}
 					WalRecoveryMode::TolerateCorruptedWithRepair => {
-						log::warn!(
+						tracing::warn!(
 							"Detected WAL corruption in segment {} at offset {}: {}. Attempting repair...",
 							segment_id,
 							offset,
@@ -963,7 +969,7 @@ impl Core {
 						// Attempt repair
 						if let Err(repair_err) = repair_corrupted_wal_segment(wal_path, segment_id)
 						{
-							log::error!("Failed to repair WAL segment: {repair_err}");
+							tracing::error!("Failed to repair WAL segment: {repair_err}");
 							return Err(Error::Other(format!(
 								"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
 							)));
@@ -1001,7 +1007,10 @@ impl Core {
 		// Flush all memtables except the last to SST
 		let memtable_count = memtables.len();
 		if memtable_count > 1 {
-			log::info!("Recovery: flushing {} intermediate memtables to SST", memtable_count - 1);
+			tracing::debug!(
+				"Recovery: flushing {} intermediate memtables to SST",
+				memtable_count - 1
+			);
 			for (memtable, wal_number) in memtables.iter().take(memtable_count - 1) {
 				if !memtable.is_empty() {
 					flush_memtable(Arc::clone(memtable), *wal_number)?;
@@ -1022,7 +1031,7 @@ impl Core {
 			}
 			count
 		};
-		log::info!(
+		tracing::debug!(
 			"Recovery: setting last memtable (wal={}) as active with {} entries",
 			last_wal_number,
 			entry_count
@@ -1033,8 +1042,7 @@ impl Core {
 
 	/// Creates a new LSM tree with background task management
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
-		log::info!("=== Starting LSM tree initialization ===");
-		log::info!("Database path: {:?}", opts.path);
+		tracing::debug!("Initializing LSM tree at {:?}", opts.path);
 
 		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
 
@@ -1060,7 +1068,7 @@ impl Core {
 		let min_wal_number = inner.level_manifest.read()?.get_log_number();
 		let manifest_last_seq = inner.level_manifest.read()?.get_last_sequence();
 
-		log::info!(
+		tracing::debug!(
 			"Manifest state: log_number={}, last_sequence={}",
 			min_wal_number,
 			manifest_last_seq
@@ -1077,7 +1085,7 @@ impl Core {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = inner.level_manifest.read()?.next_table_id();
 				inner.flush_immutable_to_sst(Arc::clone(&memtable), table_id, wal_number)?;
-				log::info!(
+				tracing::debug!(
 					"Recovery: flushed memtable to SST table_id={}, wal_number={}",
 					table_id,
 					wal_number
@@ -1108,7 +1116,7 @@ impl Core {
 		let max_seq_num = match wal_seq_num_opt {
 			Some(wal_seq) => {
 				let effective = std::cmp::max(manifest_last_seq, wal_seq);
-				log::debug!(
+				tracing::debug!(
 					"WAL replayed: manifest_last_seq={}, wal_seq={}, using max={}",
 					manifest_last_seq,
 					wal_seq,
@@ -1117,7 +1125,10 @@ impl Core {
 				effective
 			}
 			None => {
-				log::debug!("WAL skipped or empty, using manifest_last_seq={}", manifest_last_seq);
+				tracing::debug!(
+					"WAL skipped or empty, using manifest_last_seq={}",
+					manifest_last_seq
+				);
 				manifest_last_seq
 			}
 		};
@@ -1156,7 +1167,7 @@ impl Core {
 			is_closed: AtomicBool::new(false),
 		};
 
-		log::info!("=== LSM tree initialization complete ===");
+		tracing::debug!("LSM tree initialization complete");
 
 		Ok(core)
 	}
@@ -1230,11 +1241,11 @@ impl Core {
 			return Ok(());
 		}
 
-		log::info!("Shutting down LSM tree...");
+		tracing::debug!("Shutting down LSM tree");
 
 		// Step 1: Shutdown the commit pipeline to stop accepting new writes
 		self.commit_pipeline.shutdown();
-		log::debug!("Commit pipeline shutdown complete");
+		tracing::debug!("Commit pipeline shutdown complete");
 
 		let handle = self.flusher_handle.lock().unwrap().take();
 		if let Some(handle) = handle {
@@ -1243,21 +1254,21 @@ impl Core {
 
 		// Step 2: Signal write stall controller - wake any stalled writers
 		self.write_stall.signal_shutdown();
-		log::debug!("Write stall shutdown signal sent");
+		tracing::debug!("Write stall shutdown signal sent");
 
 		// Step 3: Wait for and stop all background tasks
 		let task_manager = self.task_manager.lock().unwrap().take();
 		if let Some(task_manager) = task_manager {
-			log::debug!("Stopping background task manager...");
+			tracing::debug!("Stopping background task manager...");
 			task_manager.stop().await;
-			log::debug!("Background task manager stopped");
+			tracing::debug!("Background task manager stopped");
 		}
 
 		// Close the VLog if present
 		if let Some(ref vlog) = self.inner.vlog {
-			log::debug!("Closing VLog...");
+			tracing::debug!("Closing VLog...");
 			vlog.close()?;
-			log::debug!("VLog closed");
+			tracing::debug!("VLog closed");
 		}
 
 		// Step 3: Conditionally flush ALL memtables based on flush_on_close option
@@ -1265,14 +1276,14 @@ impl Core {
 		// to preserve SSTable ordering (older data = lower table_ids)
 		// IMPORTANT: We do NOT rotate the WAL here to avoid creating an empty WAL file
 		if self.inner.opts.flush_on_close {
-			log::info!("Flushing all memtables on shutdown (flush_on_close=true)");
+			tracing::debug!("Flushing all memtables on shutdown (flush_on_close=true)");
 
 			// Flush ALL memtables: immutables first (older data), then active (newest data)
 			self.inner.flush_all_memtables_for_shutdown().map_err(|e| {
 				Error::Other(format!("Failed to flush memtables during shutdown: {}", e))
 			})?;
 
-			log::info!("All memtables flushed successfully on shutdown");
+			tracing::debug!("All memtables flushed successfully on shutdown");
 		}
 
 		// Step 4: Close the WAL to ensure all data is flushed
@@ -1280,11 +1291,11 @@ impl Core {
 		// stopped NOTE: WAL must be closed BEFORE cleanup, otherwise cleanup may
 		// delete the active WAL file
 		let wal_log_number = self.inner.wal.read().get_active_log_number();
-		log::info!("Closing WAL: active_log_number={}", wal_log_number);
+		tracing::debug!("Closing WAL: active_log_number={}", wal_log_number);
 
 		let mut wal_guard = self.inner.wal.write();
 		wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
-		log::debug!("WAL #{:020} closed and synced", wal_log_number);
+		tracing::debug!("WAL #{:020} closed and synced", wal_log_number);
 		drop(wal_guard);
 
 		// Step 4.5: Clean up obsolete WAL files (synchronous cleanup)
@@ -1294,26 +1305,26 @@ impl Core {
 		let wal_dir = self.inner.wal.read().get_dir_path().to_path_buf();
 		let min_wal_to_keep = self.inner.level_manifest.read()?.get_log_number();
 
-		log::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
+		tracing::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
 
 		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
 			Ok(count) if count > 0 => {
-				log::info!("Cleaned up {} obsolete WAL files during shutdown", count);
+				tracing::debug!("Cleaned up {} obsolete WAL files during shutdown", count);
 			}
 			Ok(_) => {
-				log::debug!("No obsolete WAL files to clean up");
+				tracing::debug!("No obsolete WAL files to clean up");
 			}
 			Err(e) => {
-				log::warn!("Failed to clean up WAL files during shutdown: {}", e);
+				tracing::warn!("Failed to clean up WAL files during shutdown: {}", e);
 			}
 		}
 
 		// Step 5: Flush all directories to ensure durability
-		log::debug!("Syncing directory structure...");
+		tracing::debug!("Syncing directory structure...");
 		sync_directory_structure(&self.inner.opts).map_err(|e| {
 			Error::Other(format!("Failed to sync directories during shutdown: {}", e))
 		})?;
-		log::debug!("Directory sync complete");
+		tracing::debug!("Directory sync complete");
 
 		// Step 7: Release the database lock
 		let mut lockfile = self.inner.lockfile.lock()?;
@@ -1321,8 +1332,8 @@ impl Core {
 
 		// Log final state
 		let final_manifest = self.inner.level_manifest.read()?;
-		log::info!(
-			"=== LSM tree shutdown complete === log_number={}, last_sequence={}",
+		tracing::debug!(
+			"LSM tree shutdown complete: log_number={}, last_sequence={}",
 			final_manifest.get_log_number(),
 			final_manifest.get_last_sequence()
 		);
@@ -1373,12 +1384,12 @@ impl Tree {
 
 	/// Automatically migrates an existing RocksDB database to SurrealKV v2 format in pure Rust.
 	fn migrate_from_rocksdb(opts: &Options) -> Result<()> {
-		log::info!("Detected existing RocksDB database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
+		tracing::info!("Detected existing RocksDB database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
 		let records = surrealkv_compat_rocksdb::read_all_latest(&opts.path).map_err(|e| {
 			Error::Other(format!("Failed to read RocksDB database for migration: {e}"))
 		})?;
 
-		log::info!(
+		tracing::info!(
 			"Read {} live records from RocksDB. Creating backup and migrating...",
 			records.len()
 		);
@@ -1451,18 +1462,18 @@ impl Tree {
 			crate::levels::write_manifest_to_disk(&manifest)?;
 		}
 
-		log::info!("RocksDB to SurrealKV v2 automatic migration completed successfully!");
+		tracing::info!("RocksDB to SurrealKV v2 automatic migration completed successfully!");
 		Ok(())
 	}
 
 	/// Automatically migrates an existing SurrealKV v1 database to SurrealKV v2 format.
 	fn migrate_from_v1(opts: &Options) -> Result<()> {
-		log::info!("Detected existing SurrealKV v1 database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
+		tracing::info!("Detected existing SurrealKV v1 database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
 		let records = surrealkv_compat_v1::read_all_latest(&opts.path).map_err(|e| {
 			Error::Other(format!("Failed to read SurrealKV v1 database for migration: {e}"))
 		})?;
 
-		log::info!(
+		tracing::info!(
 			"Read {} live records from SurrealKV v1. Creating backup and migrating...",
 			records.len()
 		);
@@ -1529,13 +1540,13 @@ impl Tree {
 			crate::levels::write_manifest_to_disk(&manifest)?;
 		}
 
-		log::info!("SurrealKV v1 to SurrealKV v2 automatic migration completed successfully!");
+		tracing::info!("SurrealKV v1 to SurrealKV v2 automatic migration completed successfully!");
 		Ok(())
 	}
 
 	/// Automatically migrates an existing IndexedDB dump to SurrealKV v2 format.
 	fn migrate_from_indxdb(opts: &Options) -> Result<()> {
-		log::info!("Detected existing IndexedDB dump at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
+		tracing::info!("Detected existing IndexedDB dump at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
 		let dump_file = if opts.path.is_dir() {
 			opts.path.join("indxdb_dump.bin")
 		} else {
@@ -1546,7 +1557,7 @@ impl Tree {
 			Error::Other(format!("Failed to read IndexedDB dump for migration: {e}"))
 		})?;
 
-		log::info!(
+		tracing::info!(
 			"Read {} live records from IndexedDB dump. Creating backup and migrating...",
 			records.len()
 		);
@@ -1599,7 +1610,7 @@ impl Tree {
 			crate::levels::write_manifest_to_disk(&manifest)?;
 		}
 
-		log::info!("IndexedDB to SurrealKV v2 automatic migration completed successfully!");
+		tracing::info!("IndexedDB to SurrealKV v2 automatic migration completed successfully!");
 		Ok(())
 	}
 
@@ -1737,7 +1748,7 @@ impl Tree {
 					table_id,
 					wal_number,
 				)?;
-				log::info!(
+				tracing::debug!(
 					"Restore: flushed memtable to SST table_id={}, wal_number={}",
 					table_id,
 					wal_number
@@ -1835,11 +1846,11 @@ impl Drop for Tree {
 					let core = Arc::clone(&self.core);
 					handle.spawn(async move {
 						if let Err(err) = core.close().await {
-							log::error!("Error closing store: {}", err);
+							tracing::error!("Error closing store: {}", err);
 						}
 					});
 				} else {
-					log::warn!("No runtime available for closing the store correctly");
+					tracing::warn!("No runtime available for closing the store correctly");
 				}
 			}
 		}
@@ -2126,7 +2137,7 @@ pub(crate) fn cleanup_vlog(vlog: &Option<Arc<VLog>>, min_oldest_vlog: u32, conte
 	// Delete obsolete VLog files
 	if let Some(ref vlog) = vlog {
 		if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
-			log::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);
+			tracing::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);
 		}
 	}
 }

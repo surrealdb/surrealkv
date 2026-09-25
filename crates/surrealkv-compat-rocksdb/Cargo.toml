@@ -12,7 +12,6 @@ snap = "1.0"
 zstd = { version = "0.13", default-features = false }
 lz4_flex = "0.12"
 thiserror = "2"
-log = "0.4"
 
 [dev-dependencies]
 tempfile = "3.10"

@@ -430,7 +430,7 @@ async fn test_mixed_flushed_and_unflushed_wals() {
 		// Close without flushing B and C
 		tree.close().await.unwrap();
 
-		log::info!("Log number after flush: {}", log_number_after_flush);
+		tracing::info!("Log number after flush: {}", log_number_after_flush);
 	}
 
 	// Reopen and verify

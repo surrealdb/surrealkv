@@ -594,13 +594,13 @@ pub(crate) fn cleanup_old_segments(wal_dir: &Path, min_wal_number: u64) -> Resul
 			match fs::remove_file(&segment_path) {
 				Ok(_) => {
 					removed_count += 1;
-					log::debug!(
+					tracing::debug!(
 						"Removed flushed WAL segment {segment_id:020} (older than min {min_wal_number:020})"
 					);
 				}
 				Err(e) => {
 					// Log error but continue trying to remove other segments
-					log::warn!("Error removing old WAL segment {segment_id}: {e}");
+					tracing::warn!("Error removing old WAL segment {segment_id}: {e}");
 				}
 			}
 		}

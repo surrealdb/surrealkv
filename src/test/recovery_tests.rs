@@ -140,7 +140,7 @@ fn test_100_segments_recovery() {
 	WalTestHelper::verify_total_entry_count(&memtables, total_entries);
 
 	// Log performance metrics
-	log::info!(
+	tracing::info!(
 		"100 segments: create={:?}, replay={:?}, entries={}",
 		create_duration,
 		replay_duration,
@@ -181,8 +181,8 @@ fn test_single_large_vs_multiple_small_segments() {
 	WalTestHelper::verify_total_entry_count(&memtables1, total_entries);
 	WalTestHelper::verify_total_entry_count(&memtables2, total_entries);
 
-	log::info!("Single segment: create={:?}, replay={:?}", single_create, single_replay);
-	log::info!("Multiple segments: create={:?}, replay={:?}", multi_create, multi_replay);
+	tracing::info!("Single segment: create={:?}, replay={:?}", single_create, single_replay);
+	tracing::info!("Multiple segments: create={:?}, replay={:?}", multi_create, multi_replay);
 }
 
 // ============================================================================
@@ -1216,7 +1216,7 @@ fn test_many_small_batches() {
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 1000);
 
-	log::info!("1000 small batches replay time: {:?}", duration);
+	tracing::info!("1000 small batches replay time: {:?}", duration);
 }
 
 #[test]
@@ -1251,7 +1251,7 @@ fn test_few_large_batches() {
 	assert!(max_seq_opt.is_some());
 	WalTestHelper::verify_total_entry_count(&memtables, 1000);
 
-	log::info!("5 large batches replay time: {:?}", duration);
+	tracing::info!("5 large batches replay time: {:?}", duration);
 }
 
 #[test]
@@ -1276,7 +1276,7 @@ fn test_recovery_performance_scaling() {
 		let total_entries = seg_count * entries_per_segment;
 		WalTestHelper::verify_total_entry_count(&memtables, total_entries);
 
-		log::info!("{} segments, {} entries: {:?}", seg_count, total_entries, duration);
+		tracing::info!("{} segments, {} entries: {:?}", seg_count, total_entries, duration);
 	}
 }
 
