@@ -1512,17 +1512,16 @@ impl<'a> HistoryIterator<'a> {
 			MergeDirection::Forward => {
 				if self.ts_range.is_some() {
 					// Seek to (lower_bound or empty, ts_end) to skip entries above range
-					let ts = self.ts_range.map(|(_, end)| end).unwrap_or(u64::MAX);
+					let _ts = self.ts_range.map(|(_, end)| end).unwrap_or(u64::MAX);
 					let seek_key = InternalKey::new(
 						self.lower_bound.clone().unwrap_or_default(),
 						u64::MAX,
 						InternalKeyKind::Set,
-						ts,
 					);
 					self.inner.seek(&seek_key.encode())?;
 				} else if let Some(ref lower) = self.lower_bound {
 					let seek_key =
-						InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set, u64::MAX);
+						InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set);
 					self.inner.seek(&seek_key.encode())?;
 				} else {
 					self.inner.seek_first()?;
