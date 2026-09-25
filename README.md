@@ -33,13 +33,13 @@ It is designed as an independent, standalone key-value store suitable for high-t
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM, 4TB PCIe 4.0 NVMe SSD**, synchronous durability enabled with `--sync` via [`crud-bench`](https://github.com/surrealdb/crud-bench)):
 
-| Engine | Create (OPS) | Point Read (OPS) | Update (OPS) | Delete (OPS) | Scan (OPS) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **SurrealKV** | **83,877** | **901,082** | **10,334** | **81,430** | **10,423** |
-| RocksDB | 31,777 | 692,597 | 33,228 | 34,563 | 2,406 |
-| Fjall | 1,327 | 767,353 | 1,315 | 1,173 | 385 |
-| LMDB | 695 | 896,110 | 704 | 705 | 27,446 |
-| Libmdbx | 697 | 264,133 | 701 | 681 | 16,005 |
+| Engine | Point Read (OPS) | Create (OPS) | Update (OPS) | Delete (OPS) | Scan (OPS) | Peak Memory |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **SurrealKV** | **901,082** | **83,877** | **10,334** | **81,430** | **10,423** | 1.66 GB |
+| RocksDB | 692,597 | 31,777 | 33,228 | 34,563 | 2,406 | 393 MB |
+| Fjall | 767,353 | 1,327 | 1,315 | 1,173 | 385 | 674 MB |
+| LMDB | 896,110 | 695 | 704 | 705 | 27,446 | 558 MB |
+| Libmdbx | 264,133 | 697 | 701 | 681 | 16,005 | 616 MB |
 
 - **Creates (Writes)**: **2.64× faster** than RocksDB, **63× faster** than Fjall, and over **120× faster** than LMDB under synchronous disk persistence.
 - **Point Reads**: **~900,000 OPS** sustained — the fastest point-read throughput among all disk-backed engines tested.
