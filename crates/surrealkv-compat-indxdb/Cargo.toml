@@ -8,7 +8,6 @@ description = "Pure-Rust and WASM reader and migrator for SurrealDB legacy Index
 
 [dependencies]
 thiserror = "2"
-log = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

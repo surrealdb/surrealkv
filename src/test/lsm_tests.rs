@@ -3161,7 +3161,7 @@ async fn test_flush_all_memtables_on_close_ordering() {
 		tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
 		let sst_count_before_close = count_ssts();
-		log::info!("SST count before close: {}", sst_count_before_close);
+		tracing::info!("SST count before close: {}", sst_count_before_close);
 
 		// Write one more entry to ensure active memtable has data
 		let mut txn = tree.begin().unwrap();
@@ -3172,7 +3172,7 @@ async fn test_flush_all_memtables_on_close_ordering() {
 		tree.close().await.unwrap();
 
 		let sst_count_after_close = count_ssts();
-		log::info!("SST count after close: {}", sst_count_after_close);
+		tracing::info!("SST count after close: {}", sst_count_after_close);
 
 		// Should have at least one more SST from the close flush
 		assert!(
@@ -3319,7 +3319,7 @@ async fn test_wal_number_tracking_on_flush() {
 	// Get initial state
 	let initial_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 	let initial_wal_number = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
-	log::info!(
+	tracing::info!(
 		"Initial state: log_number={}, wal_number={}",
 		initial_log_number,
 		initial_wal_number
@@ -3349,7 +3349,7 @@ async fn test_wal_number_tracking_on_flush() {
 		new_wal_number,
 		initial_wal_number
 	);
-	log::info!(
+	tracing::info!(
 		"After first flush: log_number={}, new_wal_number={}",
 		after_flush_log,
 		new_wal_number
@@ -3368,7 +3368,7 @@ async fn test_wal_number_tracking_on_flush() {
 		new_wal_number + 1,
 		"log_number should be new_wal + 1 after second flush"
 	);
-	log::info!("After second flush: log_number={}", after_second_flush_log);
+	tracing::info!("After second flush: log_number={}", after_second_flush_log);
 
 	// Verify data survives close/reopen
 	tree.close().await.unwrap();
@@ -3405,7 +3405,7 @@ async fn test_memtable_wal_number_after_swap() {
 
 	// Track WAL numbers through explicit flush cycles
 	let wal_1 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
-	log::info!("Initial WAL number: {}", wal_1);
+	tracing::info!("Initial WAL number: {}", wal_1);
 
 	// Write data and flush
 	let mut txn = tree.begin().unwrap();
@@ -3415,7 +3415,7 @@ async fn test_memtable_wal_number_after_swap() {
 	tree.flush().unwrap();
 
 	let wal_2 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
-	log::info!("WAL number after first flush: {}", wal_2);
+	tracing::info!("WAL number after first flush: {}", wal_2);
 	assert!(wal_2 > wal_1, "WAL number should increase after flush: {} > {}", wal_2, wal_1);
 
 	// Write more and flush again
@@ -3426,7 +3426,7 @@ async fn test_memtable_wal_number_after_swap() {
 	tree.flush().unwrap();
 
 	let wal_3 = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
-	log::info!("WAL number after second flush: {}", wal_3);
+	tracing::info!("WAL number after second flush: {}", wal_3);
 	assert!(wal_3 > wal_2, "WAL number should increase after second flush: {} > {}", wal_3, wal_2);
 
 	// Verify data survives close/reopen
@@ -3478,7 +3478,7 @@ async fn test_wal_number_correct_after_reopen() {
 			txn.commit().await.unwrap();
 			tree.flush().unwrap();
 
-			log::info!(
+			tracing::info!(
 				"After flush {}: flushed WAL {}, new log_number={}",
 				i,
 				current_wal,
@@ -3490,7 +3490,7 @@ async fn test_wal_number_correct_after_reopen() {
 		last_flushed_wal = tree.core.inner.level_manifest.read().unwrap().get_log_number() - 1;
 		final_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 
-		log::info!(
+		tracing::info!(
 			"Before close: last_flushed_wal={}, final_log_number={}",
 			last_flushed_wal,
 			final_log_number
@@ -3506,7 +3506,7 @@ async fn test_wal_number_correct_after_reopen() {
 		let reopened_log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 		let active_wal_number = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
 
-		log::info!(
+		tracing::info!(
 			"After reopen: log_number={}, active_wal_number={}, last_flushed_wal={}",
 			reopened_log_number,
 			active_wal_number,
@@ -4224,7 +4224,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 
 		log_number_after_phase1 = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 		last_seq_after_phase1 = tree.core.inner.level_manifest.read().unwrap().get_last_sequence();
-		log::info!(
+		tracing::info!(
 			"Phase 1: After flush, log_number={}, last_seq={}",
 			log_number_after_phase1,
 			last_seq_after_phase1
@@ -4238,7 +4238,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 	// updated
 	let highest_segment_created;
 	{
-		log::info!("Phase 2: Creating additional WAL segments");
+		tracing::info!("Phase 2: Creating additional WAL segments");
 
 		// Find the highest existing segment on disk
 		let highest_existing: u64 = std::fs::read_dir(&wal_path)
@@ -4274,7 +4274,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 			wal.append(&batch.encode().unwrap()).unwrap();
 			wal.sync().unwrap();
 			wal.close().unwrap();
-			log::info!("Phase 2: Created segment {} with key2", segment_for_key2);
+			tracing::info!("Phase 2: Created segment {} with key2", segment_for_key2);
 		}
 
 		// Create segment for key3
@@ -4296,7 +4296,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 			wal.append(&batch.encode().unwrap()).unwrap();
 			wal.sync().unwrap();
 			wal.close().unwrap();
-			log::info!("Phase 2: Created segment {} with key3", segment_for_key3);
+			tracing::info!("Phase 2: Created segment {} with key3", segment_for_key3);
 		}
 
 		highest_segment_created = segment_for_key3;
@@ -4312,7 +4312,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 
 		active_wal_after_recovery = tree.core.inner.wal.read().get_active_log_number();
 		let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-		log::info!(
+		tracing::info!(
 			"Phase 3: active_wal={}, log_number={}, highest_created={}",
 			active_wal_after_recovery,
 			log_number,
@@ -4337,19 +4337,19 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key4_new_after_recovery", b"value4").unwrap();
 		txn.commit().await.unwrap();
-		log::info!("Phase 3: Wrote key4 to WAL segment {}", active_wal_after_recovery);
+		tracing::info!("Phase 3: Wrote key4 to WAL segment {}", active_wal_after_recovery);
 
 		// Flush - this updates log_number
 		tree.flush().unwrap();
 		let log_number_after_flush =
 			tree.core.inner.level_manifest.read().unwrap().get_log_number();
-		log::info!("Phase 3: After flush, log_number={}", log_number_after_flush);
+		tracing::info!("Phase 3: After flush, log_number={}", log_number_after_flush);
 
 		// Write more data that stays in WAL (not flushed)
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key5_unflushed", b"value5").unwrap();
 		txn.commit().await.unwrap();
-		log::info!("Phase 3: Wrote key5 (unflushed)");
+		tracing::info!("Phase 3: Wrote key5 (unflushed)");
 
 		// Close without flush (simulating crash)
 		tree.close().await.unwrap();
@@ -4380,7 +4380,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		let key5 = txn.get(b"key5_unflushed").unwrap();
 		assert_eq!(key5, Some(b"value5".to_vec()), "DATA LOSS BUG: key5 (unflushed) was lost!");
 
-		log::info!("Phase 4: All data verified - no data loss!");
+		tracing::info!("Phase 4: All data verified - no data loss!");
 
 		tree.close().await.unwrap();
 	}
@@ -5040,7 +5040,7 @@ async fn test_vlog_files_persist_across_restart() {
 			vlog_files_before_shutdown.len()
 		);
 
-		log::info!("VLog files before shutdown: {} files", vlog_files_before_shutdown.len());
+		tracing::info!("VLog files before shutdown: {} files", vlog_files_before_shutdown.len());
 
 		// Close the tree
 		tree.close().await.unwrap();
@@ -5051,7 +5051,7 @@ async fn test_vlog_files_persist_across_restart() {
 	let mut previous_vlog_count = vlog_files_before_shutdown.len();
 
 	for iteration in 1..=5 {
-		log::info!("=== Restart iteration {}/5 ===", iteration);
+		tracing::info!("=== Restart iteration {}/5 ===", iteration);
 
 		let tree = match Tree::new(Arc::clone(&opts)) {
 			Ok(t) => t,
@@ -5073,7 +5073,7 @@ async fn test_vlog_files_persist_across_restart() {
 			})
 			.collect();
 
-		log::info!(
+		tracing::info!(
 			"VLog files after restart {}: {} files (previous: {})",
 			iteration,
 			vlog_files_after_restart.len(),
@@ -5100,7 +5100,7 @@ async fn test_vlog_files_persist_across_restart() {
 			txn.commit().await.unwrap();
 		}
 
-		log::info!("Added 10 new entries (total records: {})", keys_and_values.len());
+		tracing::info!("Added 10 new entries (total records: {})", keys_and_values.len());
 
 		// Flush to persist new entries
 		tree.flush().unwrap();
@@ -5119,7 +5119,11 @@ async fn test_vlog_files_persist_across_restart() {
 			})
 			.collect();
 
-		log::info!("VLog files after flush {}: {} files", iteration, vlog_files_after_flush.len());
+		tracing::info!(
+			"VLog files after flush {}: {} files",
+			iteration,
+			vlog_files_after_flush.len()
+		);
 
 		// Update previous count for next iteration
 		previous_vlog_count = vlog_files_after_flush.len();
@@ -5137,7 +5141,11 @@ async fn test_vlog_files_persist_across_restart() {
 			);
 		}
 
-		log::info!("Verified all {} records after restart {}", keys_and_values.len(), iteration);
+		tracing::info!(
+			"Verified all {} records after restart {}",
+			keys_and_values.len(),
+			iteration
+		);
 
 		tree.close().await.unwrap();
 	}
@@ -5149,7 +5157,7 @@ async fn test_vlog_files_persist_across_restart() {
 		"Expected 1050 total records (1000 initial + 5*10 added)"
 	);
 
-	log::info!(
+	tracing::info!(
 		"All 5 restart iterations passed successfully with {} total records",
 		keys_and_values.len()
 	);

@@ -263,7 +263,7 @@ impl BackgroundErrorHandler {
 		if let Some(ref existing) = *current_error {
 			// Only update if new error is more severe
 			if severity <= existing.severity {
-				log::debug!(
+				tracing::debug!(
 					"Background error not updated: new severity {:?} <= existing {:?}, error: {:?}, reason: {:?}",
 					severity,
 					existing.severity,
@@ -283,7 +283,7 @@ impl BackgroundErrorHandler {
 		// Set stopped flag if severity is HardError or higher
 		if severity >= ErrorSeverity::HardError {
 			self.is_db_stopped.store(true, Ordering::Release);
-			log::error!(
+			tracing::error!(
 				"Background error (severity {:?}, reason {:?}, timestamp {:?}): {}",
 				severity,
 				bg_error.reason,
@@ -291,7 +291,7 @@ impl BackgroundErrorHandler {
 				error
 			);
 		} else {
-			log::warn!(
+			tracing::warn!(
 				"Background error (severity {:?}, reason {:?}, timestamp {:?}): {}",
 				severity,
 				bg_error.reason,
@@ -346,7 +346,7 @@ impl BackgroundErrorHandler {
 		*error = None;
 		drop(error);
 		self.is_db_stopped.store(false, Ordering::Release);
-		log::info!("Background error cleared");
+		tracing::debug!("Background error cleared");
 	}
 }
 

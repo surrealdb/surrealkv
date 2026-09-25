@@ -683,7 +683,7 @@ impl VLog {
 						);
 					}
 					Err(e) => {
-						log::error!("Failed to pre-open VLog file {file_name_str}: {e}");
+						tracing::error!("Failed to pre-open VLog file {file_name_str}: {e}");
 						return Err(Error::Io(Arc::new(e)));
 					}
 				}
@@ -728,7 +728,7 @@ impl VLog {
 		// Open and validate the file
 		let file_path = self.vlog_file_path(file_id);
 		let file = File::open(&file_path).map_err(|e| {
-			log::error!(
+			tracing::error!(
 				"Failed to open VLog file: file_id={}, path={:?}, error={}",
 				file_id,
 				file_path,
@@ -744,7 +744,7 @@ impl VLog {
 		let file_size = file
 			.metadata()
 			.map_err(|e| {
-				log::error!(
+				tracing::error!(
 					"Failed to get VLog file metadata: file_id={}, path={:?}, error={}",
 					file_id,
 					file_path,
@@ -761,7 +761,7 @@ impl VLog {
 			// Only validate header if file has content (not a new empty file)
 			let mut header_data = vec![0u8; VLogFileHeader::SIZE];
 			vfs::File::read_at(&file, 0, &mut header_data).map_err(|e| {
-				log::error!(
+				tracing::error!(
 					"Failed to read VLog header: file_id={}, path={:?}, error={}",
 					file_id,
 					file_path,
@@ -774,7 +774,7 @@ impl VLog {
 			})?;
 
 			let header = VLogFileHeader::decode(&header_data).map_err(|e| {
-				log::error!(
+				tracing::error!(
 					"Failed to decode VLog header: file_id={}, path={:?}, error={}",
 					file_id,
 					file_path,
@@ -787,7 +787,7 @@ impl VLog {
 			})?;
 
 			if !header.is_compatible() {
-				log::error!(
+				tracing::error!(
 					"Incompatible VLog file version: file_id={}, path={:?}, version={} (expected {})",
 					file_id, file_path, header.version, VLOG_FORMAT_VERSION
 				);
@@ -799,7 +799,7 @@ impl VLog {
 
 			// Validate header against current options
 			header.validate(file_id).map_err(|e| {
-				log::error!(
+				tracing::error!(
 					"VLog header validation failed: file_id={}, path={:?}, error={}",
 					file_id,
 					file_path,
@@ -837,7 +837,7 @@ impl VLog {
 
 		let mut entry_data_vec = vec![0u8; total_size as usize];
 		vfs::File::read_at(&*file, pointer.offset, &mut entry_data_vec).map_err(|e| {
-			log::error!("Failed to read VLog entry: pointer={:?}, error={}", pointer, e);
+			tracing::error!("Failed to read VLog entry: pointer={:?}, error={}", pointer, e);
 			Error::Other(format!(
 				"Failed to read VLog entry (file_id={}, offset={}, key_size={}, value_size={}): {}",
 				pointer.file_id, pointer.offset, pointer.key_size, pointer.value_size, e
@@ -859,7 +859,7 @@ impl VLog {
 		]);
 
 		if header_key_len != key_len || header_value_len != value_len {
-			log::error!(
+			tracing::error!(
 				"VLog header size mismatch: pointer={:?}, header_key_len={}, header_value_len={}",
 				pointer,
 				header_key_len,
@@ -885,7 +885,7 @@ impl VLog {
 
 		// Checksum verification
 		if self.checksum_level != VLogChecksumLevel::Disabled && stored_crc32 != pointer.checksum {
-			log::error!(
+			tracing::error!(
 				"VLog CRC32 mismatch (stored vs pointer): pointer={:?}, stored_crc32={}",
 				pointer,
 				stored_crc32
@@ -904,7 +904,7 @@ impl VLog {
 			hasher.update(value);
 			let calculated_crc32 = hasher.finalize();
 			if calculated_crc32 != pointer.checksum {
-				log::error!(
+				tracing::error!(
 					"VLog Key+Value CRC32 mismatch: pointer={:?}, calculated_crc32={}",
 					pointer,
 					calculated_crc32
@@ -956,7 +956,7 @@ impl VLog {
 			file_handles.remove(&file_id);
 			if let Some(vlog_file) = files_map.remove(&file_id) {
 				if let Err(e) = std::fs::remove_file(&vlog_file.path) {
-					log::error!(
+					tracing::error!(
 						"Failed to delete obsolete VLog file: file_id={}, path={:?}, error={}",
 						file_id,
 						vlog_file.path,
@@ -964,7 +964,7 @@ impl VLog {
 					);
 					// Continue with other files, don't fail the entire cleanup
 				} else {
-					log::info!(
+					tracing::debug!(
 						"Deleted obsolete VLog file: file_id={}, path={:?}",
 						file_id,
 						vlog_file.path

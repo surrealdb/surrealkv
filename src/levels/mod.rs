@@ -206,7 +206,7 @@ impl LevelManifest {
 		manifest_path: P,
 		opts: Arc<Options>,
 	) -> Result<Self> {
-		log::info!("Loading manifest from {:?}", manifest_path.as_ref());
+		tracing::debug!("Loading manifest from {:?}", manifest_path.as_ref());
 
 		// Read and parse the manifest file
 		let data = std::fs::read(&manifest_path)?;
@@ -232,7 +232,7 @@ impl LevelManifest {
 		level_manifest.read_exact(&mut u64_buf)?;
 		let last_sequence = u64::from_be_bytes(u64_buf);
 
-		log::debug!(
+		tracing::debug!(
 			"Manifest header: version={}, next_table_id={}, log_number={}, last_sequence={}",
 			version,
 			next_table_id,
@@ -274,7 +274,7 @@ impl LevelManifest {
 				match Self::load_table(table_id, Arc::clone(&opts)) {
 					Ok(table) => tables.push(table),
 					Err(err) => {
-						log::error!("Error loading table {table_id}: {err:?}");
+						tracing::error!("Error loading table {table_id}: {err:?}");
 						return Err(Error::LoadManifestFail(err.to_string()));
 					}
 				}
@@ -295,7 +295,7 @@ impl LevelManifest {
 		// Create and return the complete manifest
 		let total_tables: usize = levels_vec.iter().map(|l| l.tables.len()).sum();
 
-		log::info!(
+		tracing::debug!(
 			"Manifest loaded successfully: version={}, log_number={}, last_sequence={}, tables={}, levels={}",
 			version,
 			log_number,
@@ -630,7 +630,7 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 	let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
 	let total_tables: usize = manifest.levels.get_levels().iter().map(|l| l.tables.len()).sum();
 
-	log::debug!(
+	tracing::debug!(
 		"Writing manifest: version={}, log_number={}, last_sequence={}, next_table_id={}, total_tables={}",
 		manifest.manifest_format_version,
 		manifest.log_number,
@@ -659,6 +659,6 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 	}
 
 	replace_file_content(&manifest.path, &buf)?;
-	log::debug!("Manifest written successfully to {:?}", manifest.path);
+	tracing::debug!("Manifest written successfully to {:?}", manifest.path);
 	Ok(())
 }

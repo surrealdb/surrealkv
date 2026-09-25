@@ -73,7 +73,7 @@ impl TaskManager {
 					}
 
 					running.store(true, Ordering::SeqCst);
-					log::debug!("Memtable flush task starting");
+					tracing::debug!("Memtable flush task starting");
 
 					// Flush ALL pending immutable memtables in a loop
 					let mut flush_count = 0;
@@ -88,7 +88,7 @@ impl TaskManager {
 								}
 							}
 							Err(e) => {
-								log::error!("Memtable compaction task error: {e:?}");
+								tracing::error!("Memtable compaction task error: {e:?}");
 								core.error_handler()
 									.set_error(e, BackgroundErrorReason::MemtablaFlush);
 								write_stall.signal_shutdown();
@@ -98,14 +98,14 @@ impl TaskManager {
 					}
 
 					if flush_count > 0 {
-						log::debug!(
+						tracing::debug!(
 							"Memtable flush task completed: flushed {} memtables",
 							flush_count
 						);
 						// Trigger level compaction after successful flushes
 						level_notify.notify_one();
 					} else {
-						log::debug!("Memtable flush task: no immutables to flush");
+						tracing::debug!("Memtable flush task: no immutables to flush");
 					}
 
 					running.store(false, Ordering::SeqCst);
@@ -132,17 +132,17 @@ impl TaskManager {
 					}
 
 					running.store(true, Ordering::SeqCst);
-					log::debug!("Level compaction task starting");
+					tracing::debug!("Level compaction task starting");
 
 					// Use leveled compaction strategy
 					let strategy: Arc<dyn CompactionStrategy> =
 						Arc::new(Strategy::from_options(Arc::clone(&opts)));
 					if let Err(e) = core.compact(strategy) {
-						log::error!("Level compaction task error: {e:?}");
+						tracing::error!("Level compaction task error: {e:?}");
 						core.error_handler().set_error(e, BackgroundErrorReason::Compaction);
 						write_stall.signal_shutdown();
 					} else {
-						log::debug!("Level compaction completed successfully");
+						tracing::debug!("Level compaction completed successfully");
 						write_stall.signal_work_done();
 					}
 					running.store(false, Ordering::SeqCst);
@@ -196,7 +196,7 @@ impl TaskManager {
 		let task_handles = self.task_handles.lock().unwrap().take().unwrap();
 		for handle in task_handles {
 			if let Err(e) = handle.await {
-				log::error!("Error shutting down task: {e:?}");
+				tracing::error!("Error shutting down task: {e:?}");
 			}
 		}
 	}

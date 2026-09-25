@@ -541,7 +541,7 @@ impl<W: Write> TableWriter<W> {
 				let err = Error::from(SSTableError::FailedToGetSystemTime {
 					source: e.to_string(),
 				});
-				log::error!("[TABLE_WRITER] {}", err);
+				tracing::error!("[TABLE_WRITER] {}", err);
 				err
 			})?
 			.as_nanos();

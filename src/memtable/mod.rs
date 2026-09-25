@@ -338,7 +338,7 @@ impl MemTable {
 					"ArenaFull inside insert_into_memtable after a successful try_reserve; \
 					memtable_size_estimate is out of sync with skiplist node size"
 				);
-				log::error!("ArenaFull after reservation; memtable size estimator drift");
+				tracing::error!("ArenaFull after reservation; memtable size estimator drift");
 				Err(crate::Error::ArenaFull)
 			}
 		}

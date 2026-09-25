@@ -206,7 +206,7 @@ fn assert_utilization_in_range(
 ) {
 	let (estimate, actual) = measure(key_len, value_len, n_entries);
 	let ratio = (actual as f64) / (estimate as f64);
-	log::info!(
+	tracing::info!(
 		"utilization[{}] k={} v={} n={}: estimate={} actual={} ratio={:.3}",
 		label,
 		key_len,

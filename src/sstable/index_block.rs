@@ -448,7 +448,7 @@ impl Index {
 			let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex {
 				table_id: self.id,
 			});
-			log::error!("[INDEX] {}", err);
+			tracing::error!("[INDEX] {}", err);
 			return Err(err);
 		}
 
@@ -580,7 +580,7 @@ impl<'a> IndexIterator<'a> {
 			let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex {
 				table_id: self.index.id,
 			});
-			log::error!("[INDEX] {}", err);
+			tracing::error!("[INDEX] {}", err);
 			return Err(err);
 		}
 
@@ -605,7 +605,7 @@ impl<'a> IndexIterator<'a> {
 			let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex {
 				table_id: self.index.id,
 			});
-			log::error!("[INDEX] {}", err);
+			tracing::error!("[INDEX] {}", err);
 			return Err(err);
 		}
 
@@ -654,7 +654,7 @@ impl<'a> IndexIterator<'a> {
 			let err = Error::from(SSTableError::EmptyCorruptPartitionedIndex {
 				table_id: self.index.id,
 			});
-			log::error!("[INDEX] {}", err);
+			tracing::error!("[INDEX] {}", err);
 			return Err(err);
 		}
 

@@ -137,7 +137,7 @@ impl WriteStallController {
 				if let Some(reason) = stall_reason {
 					self.is_stalled.store(false, Ordering::Release);
 					let duration = stall_start.map(|s| s.elapsed()).unwrap_or(Duration::ZERO);
-					log::info!("Write stall cleared after {:?}", duration);
+					tracing::debug!("Write stall cleared after {:?}", duration);
 					return Ok(Some(WriteStallInfo {
 						reason,
 						current_value: stall_value,
@@ -183,7 +183,7 @@ impl WriteStallController {
 				stall_threshold = threshold;
 				stall_start = Some(Instant::now());
 				self.is_stalled.store(true, Ordering::Release);
-				log::warn!("Write stall: {:?} ({} >= {})", reason, value, threshold);
+				tracing::warn!("Write stall: {:?} ({} >= {})", reason, value, threshold);
 			}
 
 			// Wait
