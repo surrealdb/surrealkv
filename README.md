@@ -44,7 +44,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 - **Updates**: **102,614 OPS** (**3.09× faster** than RocksDB, **12.2× faster** than SlateDB, and **78× faster** than Fjall) with lock-free group commit.
 - **Creates (Writes)**: **98,853 OPS** (**3.11× faster** than RocksDB, **11.7× faster** than SlateDB, and **74× faster** than Fjall) under synchronous disk persistence.
-- **Point Reads**: **1.18M OPS** sustained — the fastest point-read throughput among all disk-backed engines tested (**4.33× faster** than SlateDB).
+- **Point Reads**: **1.18M OPS** sustained: the fastest point-read throughput among all disk-backed engines tested (**4.33× faster** than SlateDB).
 - **Deletes**: **97,037 OPS** (**2.81× faster** than RocksDB and **11.6× faster** than SlateDB) via high-efficiency tombstone append buffering.
 - **Range Scans**: **3.47× faster** than RocksDB and **7.74× faster** than SlateDB via zero-copy iterator merges and block-level restart points.
 
