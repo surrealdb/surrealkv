@@ -172,3 +172,69 @@ jobs:
       - name: Run WASM tests in Node.js
         if: matrix.runtime == 'node'
         run: wasm-pack test --node crates/surrealkv-compat-indxdb
+
+  apple-targets:
+    name: Apple Ecosystem (${{ matrix.target }})
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-ios
+          - aarch64-apple-ios-sim
+          - aarch64-apple-tvos
+          - aarch64-apple-tvos-sim
+          - aarch64-apple-visionos
+          - aarch64-apple-visionos-sim
+          - aarch64-apple-watchos
+          - aarch64-apple-watchos-sim
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --target ${{ matrix.target }}
+
+  android-target:
+    name: Android Ecosystem (aarch64-linux-android)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-linux-android
+
+      - name: Configure Android NDK toolchain
+        run: |
+          NDK_PATH="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          if [ -z "$NDK_PATH" ] || [ ! -d "$NDK_PATH" ]; then
+            NDK_PATH="$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1)"
+          fi
+          TOOLCHAIN="$NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64"
+          CLANG_BIN="$(find "$TOOLCHAIN/bin" -name "aarch64-linux-android*-clang" | grep -v '++' | sort -V | tail -n 1)"
+          LLVM_AR="$TOOLCHAIN/bin/llvm-ar"
+          echo "CC_aarch64_linux_android=$CLANG_BIN" >> $GITHUB_ENV
+          echo "AR_aarch64_linux_android=$LLVM_AR" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_AR=$LLVM_AR" >> $GITHUB_ENV
+          echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CLANG_BIN" >> $GITHUB_ENV
+
+      - name: Build
+        run: cargo build --target aarch64-linux-android
