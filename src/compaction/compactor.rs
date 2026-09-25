@@ -282,7 +282,7 @@ impl Compactor {
 	fn finish_output(&self, writer: TableWriter<SysFile>, id: u64, path: &Path) -> Result<()> {
 		writer.finish()?;
 		crate::vfs::fsync_file(path)?;
-		log::debug!("Compaction finished output table {id} at {}", path.display());
+		tracing::debug!("Compaction finished output table {id} at {}", path.display());
 		Ok(())
 	}
 

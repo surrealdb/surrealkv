@@ -238,7 +238,7 @@ impl PartitionedFilterReader {
 						bytes
 					}
 					Err(e) => {
-						log::warn!(
+						tracing::warn!(
 							"Failed to read filter partition for table {} at offset {offset}: {e}; \
 							 proceeding without the filter",
 							self.table_id
