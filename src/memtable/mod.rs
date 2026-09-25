@@ -14,8 +14,16 @@ use crate::error::Result;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::vlog::{VLog, ValueLocation};
-use crate::{InternalKey, InternalKeyRef, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX};
-use crate::{InternalKeyKind, Key};
+use crate::{
+	InternalKey,
+	InternalKeyKind,
+	InternalKeyRef,
+	Key,
+	LSMIterator,
+	Options,
+	Value,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+};
 
 /// Encoded bplustree entries: Vec of (encoded_key, encoded_value) pairs.
 pub(crate) type BPTreeEntries = Vec<(Vec<u8>, Vec<u8>)>;

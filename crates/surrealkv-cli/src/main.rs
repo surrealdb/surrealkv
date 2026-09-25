@@ -6,11 +6,10 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
-use tabled::settings::Style;
-use tabled::{Table as DisplayTable, Tabled};
-
 use surrealkv::inspect::{self, DbInfo, ManifestInfo, SstInfo};
 use surrealkv::{LSMIterator, TreeBuilder};
+use tabled::settings::Style;
+use tabled::{Table as DisplayTable, Tabled};
 
 #[derive(Parser)]
 #[command(

@@ -85,8 +85,18 @@ use crate::sstable::meta::TableMetadata;
 use crate::vfs::File;
 use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{
-	Comparator, CompressionType, FilterPolicy, InternalKey, InternalKeyKind, InternalKeyRange,
-	InternalKeyRef, Key, LSMIterator, Options, Value, INTERNAL_KEY_SEQ_NUM_MAX,
+	Comparator,
+	CompressionType,
+	FilterPolicy,
+	InternalKey,
+	InternalKeyKind,
+	InternalKeyRange,
+	InternalKeyRef,
+	Key,
+	LSMIterator,
+	Options,
+	Value,
+	INTERNAL_KEY_SEQ_NUM_MAX,
 };
 
 // =============================================================================
@@ -1099,7 +1109,7 @@ impl Table {
 			Ok(None)
 		}
 	}
-	///
+
 	/// ## Lookup Process
 	///
 	/// ```text

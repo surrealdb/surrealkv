@@ -23,7 +23,14 @@ use crate::vlog::{VLog, ValueLocation};
 use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
 use crate::{
-	Comparator, Error, FilterPolicy, Key, LSMIterator, Options, VLogChecksumLevel, Value,
+	Comparator,
+	Error,
+	FilterPolicy,
+	Key,
+	LSMIterator,
+	Options,
+	VLogChecksumLevel,
+	Value,
 	WalRecoveryMode,
 };
 

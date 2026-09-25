@@ -1,6 +1,10 @@
 use crate::error::{Error, Result};
 use crate::varint::{
-	decode_varint_u32, decode_varint_u64, put_varint_u32, put_varint_u64, varint_len_u64,
+	decode_varint_u32,
+	decode_varint_u64,
+	put_varint_u32,
+	put_varint_u64,
+	varint_len_u64,
 };
 use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
 use crate::{InternalKeyKind, Key, Value};

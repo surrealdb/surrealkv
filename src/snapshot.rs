@@ -12,8 +12,17 @@ use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::sstable::table::Table;
 use crate::{
-	BytewiseComparator, Comparator, InternalKey, InternalKeyComparator, InternalKeyKind,
-	InternalKeyRange, InternalKeyRef, Key, LSMIterator, TimestampComparator, Value,
+	BytewiseComparator,
+	Comparator,
+	InternalKey,
+	InternalKeyComparator,
+	InternalKeyKind,
+	InternalKeyRange,
+	InternalKeyRef,
+	Key,
+	LSMIterator,
+	TimestampComparator,
+	Value,
 };
 
 // ===== Snapshot Tracker =====
@@ -272,7 +281,8 @@ impl Snapshot {
 
 		for (level_idx, level) in level_manifest.levels.get_levels().iter().enumerate() {
 			if level_idx == 0 {
-				// Level 0: Tables can overlap, check newest to oldest (tables are sorted descending)
+				// Level 0: Tables can overlap, check newest to oldest (tables are sorted
+				// descending)
 				for table in level.tables.iter() {
 					if !table.is_user_key_in_range(key) {
 						continue;

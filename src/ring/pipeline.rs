@@ -1,7 +1,11 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+
 use tokio::sync::{oneshot, Notify};
 
+use super::bloom::BloomFilter;
+use super::queue::{CommitEntry, CommitQueue};
+use super::Ring;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::CoreInner;
@@ -10,10 +14,6 @@ use crate::storage::{AffinityLogStore, LogStore};
 use crate::task::TaskManager;
 use crate::vlog::ValueLocation;
 use crate::Key;
-
-use super::bloom::BloomFilter;
-use super::queue::{CommitEntry, CommitQueue};
-use super::Ring;
 
 /// Coordinates the lock-free commit ring, OCC conflict queue, and background flusher.
 pub(crate) struct CommitPipeline {

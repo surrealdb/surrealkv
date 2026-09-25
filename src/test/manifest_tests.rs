@@ -5,7 +5,10 @@ use std::sync::Arc;
 use test_log::test;
 
 use crate::levels::{
-	write_manifest_to_disk, LevelManifest, ManifestChangeSet, SnapshotInfo,
+	write_manifest_to_disk,
+	LevelManifest,
+	ManifestChangeSet,
+	SnapshotInfo,
 	MANIFEST_FORMAT_VERSION_V1,
 };
 use crate::sstable::table::{Table, TableWriter};

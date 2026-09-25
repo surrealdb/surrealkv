@@ -13,8 +13,11 @@ use bytes::Bytes;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-	FileSystemDirectoryHandle, FileSystemFileHandle, FileSystemGetFileOptions,
-	FileSystemReadWriteOptions, FileSystemSyncAccessHandle,
+	FileSystemDirectoryHandle,
+	FileSystemFileHandle,
+	FileSystemGetFileOptions,
+	FileSystemReadWriteOptions,
+	FileSystemSyncAccessHandle,
 };
 
 use crate::error::{Error, Result};

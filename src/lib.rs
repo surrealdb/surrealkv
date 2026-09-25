@@ -46,13 +46,23 @@ pub use sstable::ribbon::RibbonFilter;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
 pub use crate::error::{
-	BackgroundError, BackgroundErrorHandler, BackgroundErrorReason, Error, ErrorSeverity, Result,
+	BackgroundError,
+	BackgroundErrorHandler,
+	BackgroundErrorReason,
+	Error,
+	ErrorSeverity,
+	Result,
 	WriteStallReason,
 };
 pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::stall::WriteStallInfo;
 pub use crate::transaction::{
-	Durability, HistoryOptions, Mode, ReadOptions, Transaction, WriteOptions,
+	Durability,
+	HistoryOptions,
+	Mode,
+	ReadOptions,
+	Transaction,
+	WriteOptions,
 };
 
 /// An optimised trait for converting values to bytes only when needed

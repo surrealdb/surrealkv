@@ -2120,7 +2120,7 @@ async fn test_soft_delete_mixed_with_other_operations() {
 		tx.soft_delete(b"key1").unwrap(); // Soft delete
 		tx.delete(b"key2").unwrap(); // Hard delete
 		tx.set(b"key3", b"value3_updated").unwrap(); // Update
-											   // key4 remains unchanged
+													 // key4 remains unchanged
 		tx.commit().await.unwrap();
 	}
 

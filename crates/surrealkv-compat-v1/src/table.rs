@@ -62,7 +62,8 @@ impl V1TableReader {
 
 		for entry in index_entries {
 			if let Ok((handle, _)) = BlockHandle::decode(&entry.value) {
-				// Check if this handle points to a partition index block or directly to a data block
+				// Check if this handle points to a partition index block or directly to a data
+				// block
 				data_handles.push(handle);
 			}
 		}

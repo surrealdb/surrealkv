@@ -1,4 +1,5 @@
-//! Pure-Rust and WebAssembly reader and migrator for legacy SurrealDB IndexedDB (`indxdb://`) stores.
+//! Pure-Rust and WebAssembly reader and migrator for legacy SurrealDB IndexedDB (`indxdb://`)
+//! stores.
 //!
 //! Enables automated, transparent migration of existing browser `indxdb://` data
 //! into high-performance `file://` SurrealKV stores over OPFS without manual export/import scripts.
@@ -14,8 +15,9 @@ mod tests;
 
 #[cfg(all(test, target_arch = "wasm32"))]
 mod wasm_tests {
-	use super::*;
 	use wasm_bindgen_test::*;
+
+	use super::*;
 
 	#[wasm_bindgen_test]
 	fn test_indexeddb_check() {

@@ -1,4 +1,5 @@
-//! Pure-Rust compatibility reader and migration utilities for RocksDB BlockBasedTable format (v2 through v7).
+//! Pure-Rust compatibility reader and migration utilities for RocksDB BlockBasedTable format (v2
+//! through v7).
 //!
 //! Designed to allow SurrealKV and SurrealDB to start up directly from existing RocksDB
 //! databases without linking the C++ RocksDB library or requiring offline manual migrations.

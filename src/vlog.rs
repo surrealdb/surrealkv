@@ -489,7 +489,8 @@ impl VLogWriter {
 		// Write CRC32
 		self.writer.write_all(&crc32.to_be_bytes())?;
 
-		let entry_size = 8 + key.len() as u64 + value.len() as u64 + 4; // header + key + value + crc32
+		let entry_size = 8 + key.len() as u64 + value.len() as u64 + 4; // header + key + value +
+																		// crc32
 		self.current_offset += entry_size;
 		self.bytes_written += entry_size;
 

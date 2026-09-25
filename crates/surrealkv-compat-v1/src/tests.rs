@@ -45,7 +45,7 @@ fn test_footer_magic_validation() {
 	let mut buf = vec![0u8; 50];
 	buf[0] = 1; // format: LSMV1
 	buf[1] = 1; // checksum: crc32c
-			 // Fake valid block handles: (0, 100) -> 0x00, 0x64
+				// Fake valid block handles: (0, 100) -> 0x00, 0x64
 	buf[2] = 0;
 	buf[3] = 100;
 	buf[4] = 105;

@@ -10,8 +10,16 @@ use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::replay_wal;
 use crate::wal::{
-	cleanup_old_segments, get_segment_range, list_segment_ids, parse_segment_name, segment_name,
-	should_include_file, CompressionType, Options, RecordType, SegmentRef,
+	cleanup_old_segments,
+	get_segment_range,
+	list_segment_ids,
+	parse_segment_name,
+	segment_name,
+	should_include_file,
+	CompressionType,
+	Options,
+	RecordType,
+	SegmentRef,
 };
 use crate::LSMIterator;
 
