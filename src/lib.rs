@@ -56,6 +56,7 @@ pub use crate::error::{
 };
 pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::stall::WriteStallInfo;
+pub use crate::tde::{BlockCipher, CipherSuite, KeyManager, SoftwareKeyManager};
 pub use crate::transaction::{
 	Durability,
 	HistoryOptions,
@@ -272,6 +273,16 @@ pub struct Options {
 	/// Should be >= level0_max_files (compaction trigger).
 	/// Default: 12 (3x level0_max_files)
 	pub l0_stall_threshold: usize,
+
+	// Transparent Data Encryption (TDE) configuration
+	/// Key manager for transparent data encryption at rest (TDE).
+	/// When configured, blocks written to storage are encrypted.
+	/// Default: None (encryption disabled)
+	pub key_manager: Option<Arc<dyn KeyManager>>,
+	/// Active cipher suite to use for encryption.
+	/// Options: Aes256Gcm, XChaCha20Poly1305, ChaCha20Blake3.
+	/// Default: CipherSuite::Aes256Gcm
+	pub encryption_cipher: CipherSuite,
 }
 
 impl Default for Options {
@@ -316,6 +327,8 @@ impl Default for Options {
 			target_file_size: 64 * 1024 * 1024, // 64MB
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
+			key_manager: None,
+			encryption_cipher: CipherSuite::default(),
 		}
 	}
 }
@@ -343,6 +356,17 @@ impl Options {
 	pub fn with_comparator(mut self, value: Arc<dyn Comparator>) -> Self {
 		self.internal_comparator = Arc::new(InternalKeyComparator::new(Arc::clone(&value)));
 		self.comparator = value;
+		self
+	}
+
+	/// Configures Transparent Data Encryption (TDE) with the provided key manager and cipher suite.
+	pub fn with_encryption(
+		mut self,
+		key_manager: Arc<dyn KeyManager>,
+		cipher: CipherSuite,
+	) -> Self {
+		self.key_manager = Some(key_manager);
+		self.encryption_cipher = cipher;
 		self
 	}
 
