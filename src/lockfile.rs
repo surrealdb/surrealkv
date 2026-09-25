@@ -148,8 +148,10 @@ pub(crate) fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
 		LOCKFILE_EXCLUSIVE_LOCK,
 		LOCKFILE_FAIL_IMMEDIATELY,
 	};
+	use windows_sys::Win32::System::IO::OVERLAPPED;
+
 	let handle = file.as_raw_handle() as _;
-	let mut overlapped = std::mem::MaybeUninit::zeroed();
+	let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
 	let res = unsafe {
 		LockFileEx(
 			handle,
@@ -157,7 +159,7 @@ pub(crate) fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
 			0,
 			!0,
 			!0,
-			overlapped.as_mut_ptr(),
+			&mut overlapped,
 		)
 	};
 	if res == 0 {

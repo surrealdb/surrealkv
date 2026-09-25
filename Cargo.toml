@@ -51,7 +51,11 @@ tokio = { version = "1.36", features = ["rt-multi-thread"] }
 rustix = { version = "1.0", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = [
+	"Win32_Foundation",
+	"Win32_Storage_FileSystem",
+	"Win32_System_IO",
+] }
 
 [target.'cfg(target_os = "wasi")'.dependencies]
 libc = "0.2"
