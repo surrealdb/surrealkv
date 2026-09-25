@@ -35,10 +35,10 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Engine | Point Read (OPS) | Create (OPS) | Update (OPS) | Delete (OPS) | Scan (OPS) | Resting Memory | Peak Memory |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **SurrealKV** | **1,182,982** <img width="16" src="/img/rocket.png" alt="🚀"> | **98,853** <img width="16" src="/img/rocket.png" alt="🚀"> | **102,614** <img width="16" src="/img/rocket.png" alt="🚀"> | **97,037** <img width="16" src="/img/rocket.png" alt="🚀"> | **8,361** | **~328 MB** <img width="16" src="/img/rocket.png" alt="🚀"> | 1.35 GB |
-| RocksDB | 692,597 | 31,777 | 33,228 | 34,563 | 2,406 | ~356 MB | 393 MB |
+| **SurrealKV** | <nobr>**1,182,982**&nbsp;<img width="16" src="/img/rocket.png" alt="🚀"></nobr> | <nobr>**98,853**&nbsp;<img width="16" src="/img/rocket.png" alt="🚀"></nobr> | <nobr>**102,614**&nbsp;<img width="16" src="/img/rocket.png" alt="🚀"></nobr> | <nobr>**97,037**&nbsp;<img width="16" src="/img/rocket.png" alt="🚀"></nobr> | 8,361 | <nobr>**~328 MB**&nbsp;<img width="16" src="/img/rocket.png" alt="🚀"></nobr> | 1.35 GB |
+| RocksDB | 692,597 | 31,777 | 33,228 | 34,563 | 2,406 | ~356 MB | <nobr>**393 MB**&nbsp;<img width="16" src="/img/rocket.png" alt="🚀"></nobr> |
 | Fjall | 767,353 | 1,327 | 1,315 | 1,173 | 385 | ~405 MB | 674 MB |
-| LMDB | 896,110 | 695 | 704 | 705 | 27,446 | ~421 MB | 558 MB |
+| LMDB | 896,110 | 695 | 704 | 705 | <nobr>**27,446**&nbsp;<img width="16" src="/img/rocket.png" alt="🚀"></nobr> | ~421 MB | 558 MB |
 | Libmdbx | 264,133 | 697 | 701 | 681 | 16,005 | ~373 MB | 616 MB |
 
 - **Updates**: **102,614 OPS** (**3.09× faster** than RocksDB, **78× faster** than Fjall, and **145× faster** than LMDB) with lock-free group commit.
