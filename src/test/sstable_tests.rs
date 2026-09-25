@@ -73,7 +73,9 @@ fn test_table_builder() {
 	}
 
 	let actual = b.finish().unwrap();
-	assert_eq!(616, actual);
+	// Byte-exact pin of the writer output for this fixed input (updated for
+	// the partitioned filter: one filter partition block + filter index).
+	assert_eq!(647, actual);
 }
 
 #[test]

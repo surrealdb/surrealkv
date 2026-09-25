@@ -63,7 +63,23 @@ impl FilterPolicy for LevelDBBloomFilter {
 	}
 
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8> {
-		let n = keys.len();
+		// The key contributes to the filter only through its bloom hash, so
+		// building from keys and building from pre-computed hashes are
+		// bit-identical by construction.
+		let hashes: Vec<u64> = keys.iter().map(|key| Self::bloom_hash(key) as u64).collect();
+		self.create_filter_from_hashes(&hashes)
+	}
+
+	fn key_hash(&self, key: &[u8]) -> u64 {
+		Self::bloom_hash(key) as u64
+	}
+
+	fn filter_keys_per_partition(&self, partition_bytes: usize) -> usize {
+		((partition_bytes * 8) / self.bits_per_key.max(1)).max(1)
+	}
+
+	fn create_filter_from_hashes(&self, hashes: &[u64]) -> Vec<u8> {
+		let n = hashes.len();
 		if n == 0 {
 			return vec![];
 		}
@@ -78,13 +94,10 @@ impl FilterPolicy for LevelDBBloomFilter {
 		// Calculate number of hash functions
 		let k = (((self.bits_per_key as f64) * 0.7) as u32).clamp(1, 30);
 
-		for key in keys {
-			// Single hash computation per key
-			let h = Self::bloom_hash(key);
-
+		for h in hashes {
 			// Bit rotation for generating multiple hash values from single computation
-			let delta = h.rotate_left(15);
-			let mut hash = h;
+			let delta = (*h as u32).rotate_left(15);
+			let mut hash = *h as u32;
 
 			for _ in 0..k {
 				let bit_pos = (hash % (bits as u32)) as usize;

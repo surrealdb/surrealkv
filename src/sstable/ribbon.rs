@@ -36,7 +36,20 @@ impl FilterPolicy for RibbonFilter {
 	}
 
 	fn create_filter(&self, keys: &[Vec<u8>]) -> Vec<u8> {
-		let n = keys.len();
+		let hashes: Vec<u64> = keys.iter().map(|key| Self::hash64(key)).collect();
+		self.create_filter_from_hashes(&hashes)
+	}
+
+	fn key_hash(&self, key: &[u8]) -> u64 {
+		Self::hash64(key)
+	}
+
+	fn filter_keys_per_partition(&self, partition_bytes: usize) -> usize {
+		((partition_bytes * 8) / self.bits_per_key.max(1)).max(1)
+	}
+
+	fn create_filter_from_hashes(&self, hashes: &[u64]) -> Vec<u8> {
+		let n = hashes.len();
 		if n == 0 {
 			return vec![];
 		}
@@ -49,14 +62,13 @@ impl FilterPolicy for RibbonFilter {
 		// Calculate optimal number of probes per key inside the cache line
 		let k = (((self.bits_per_key as f64) * 0.7) as u32).clamp(1, 16);
 
-		for key in keys {
-			let h = Self::hash64(key);
+		for h in hashes {
 			// Top 32 bits select block index
 			let block_idx = ((h >> 32) % (num_blocks as u64)) as usize;
 			let block_offset = block_idx * CACHE_LINE_BYTES;
 
 			// Lower 32 bits generate bit positions inside the 512-bit cache line
-			let mut hash = h as u32;
+			let mut hash = *h as u32;
 			let delta = hash.rotate_left(15) | 1; // ensure odd delta
 
 			for _ in 0..k {

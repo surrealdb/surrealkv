@@ -455,6 +455,16 @@ impl BlockWriter {
 		Ok(self.buffer)
 	}
 
+	/// Releases unused buffer capacity. Called on finished blocks that are
+	/// retained in memory until the table completes (e.g. index partitions):
+	/// a finished partition may hold only a few hundred bytes of content in
+	/// a buffer pre-sized to the block size, and with many partitions the
+	/// retained empty capacity dominates the writer's memory.
+	pub(crate) fn shrink_to_fit(&mut self) {
+		self.buffer.shrink_to_fit();
+		self.restart_points.shrink_to_fit();
+	}
+
 	/// Estimates the current size including restart array.
 	pub(crate) fn size_estimate(&self) -> usize {
 		self.buffer.len() + self.restart_points.len() * 4 + 4
