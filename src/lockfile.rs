@@ -9,18 +9,15 @@ use std::process;
 use std::sync::Arc;
 
 #[cfg(not(target_arch = "wasm32"))]
-use fs2::FileExt;
-
-#[cfg(not(target_arch = "wasm32"))]
 use crate::error::Error;
-use crate::error::Result; // Use fs2 for file locking
+use crate::error::Result;
 
 /// LockFile prevents multiple processes from accessing the same database
 /// directory
 ///
 /// # How it works
 ///
-/// This implementation uses OS-level file locking (via the `fs2` crate) to
+/// This implementation uses OS-level file locking to
 /// ensure that only one process can hold the lock at a time. The lock file
 /// contains the PID of the process that currently holds the lock for debugging
 /// purposes.
@@ -79,8 +76,8 @@ impl LockFile {
 			.open(&self.path)
 			.map_err(|e| Error::Io(Arc::new(e)))?;
 
-		// Try to lock the file exclusively using fs2
-		file.try_lock_exclusive().map_err(|e| match e.kind() {
+		// Try to lock the file exclusively
+		try_lock_exclusive(&file).map_err(|e| match e.kind() {
 			ErrorKind::WouldBlock => Error::Other(format!(
 				"Database at {} is already locked by another process",
 				self.path.display()
@@ -103,7 +100,7 @@ impl LockFile {
 	#[cfg(not(target_arch = "wasm32"))]
 	pub fn release(&mut self) -> Result<()> {
 		if let Some(file) = self.file.take() {
-			let _ = fs2::FileExt::unlock(&file);
+			let _ = unlock(&file);
 			drop(file);
 		}
 		Ok(())
@@ -128,6 +125,70 @@ impl Drop for LockFile {
 		// Try to release the lock, but don't panic if it fails
 		let _ = self.release();
 	}
+}
+
+#[cfg(unix)]
+pub(crate) fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
+	use rustix::fs::{flock, FlockOperation};
+	flock(file, FlockOperation::NonBlockingLockExclusive).map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
+pub(crate) fn unlock(file: &File) -> std::io::Result<()> {
+	use rustix::fs::{flock, FlockOperation};
+	flock(file, FlockOperation::Unlock).map_err(std::io::Error::from)
+}
+
+#[cfg(windows)]
+pub(crate) fn try_lock_exclusive(file: &File) -> std::io::Result<()> {
+	use std::os::windows::io::AsRawHandle;
+
+	use windows_sys::Win32::Storage::FileSystem::{
+		LockFileEx,
+		LOCKFILE_EXCLUSIVE_LOCK,
+		LOCKFILE_FAIL_IMMEDIATELY,
+	};
+	let handle = file.as_raw_handle() as _;
+	let mut overlapped = std::mem::MaybeUninit::zeroed();
+	let res = unsafe {
+		LockFileEx(
+			handle,
+			LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+			0,
+			!0,
+			!0,
+			overlapped.as_mut_ptr(),
+		)
+	};
+	if res == 0 {
+		Err(std::io::Error::last_os_error())
+	} else {
+		Ok(())
+	}
+}
+
+#[cfg(windows)]
+pub(crate) fn unlock(file: &File) -> std::io::Result<()> {
+	use std::os::windows::io::AsRawHandle;
+
+	use windows_sys::Win32::Storage::FileSystem::UnlockFile;
+	let handle = file.as_raw_handle() as _;
+	let res = unsafe { UnlockFile(handle, 0, 0, !0, !0) };
+	if res == 0 {
+		Err(std::io::Error::last_os_error())
+	} else {
+		Ok(())
+	}
+}
+
+#[cfg(not(any(unix, windows, target_arch = "wasm32")))]
+pub(crate) fn try_lock_exclusive(_file: &File) -> std::io::Result<()> {
+	Ok(())
+}
+
+#[cfg(not(any(unix, windows, target_arch = "wasm32")))]
+pub(crate) fn unlock(_file: &File) -> std::io::Result<()> {
+	Ok(())
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

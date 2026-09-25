@@ -139,10 +139,11 @@ pub fn inspect_db<P: AsRef<Path>>(db_path: P) -> Result<DbInfo> {
 		// On non-wasm32, check if lock is actively held
 		#[cfg(not(target_arch = "wasm32"))]
 		{
-			use fs2::FileExt;
 			if let Ok(f) = fs::File::open(&lock_path) {
-				if f.try_lock_exclusive().is_err() {
+				if crate::lockfile::try_lock_exclusive(&f).is_err() {
 					is_locked = true;
+				} else {
+					let _ = crate::lockfile::unlock(&f);
 				}
 			}
 		}
