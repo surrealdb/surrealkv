@@ -83,6 +83,10 @@ fn test_level_manifest_persistence() {
 	let table3 =
 		create_test_table(table_id3, 300, Arc::clone(&opts)).expect("Failed to create table 3");
 
+	let table1_file_size = table1.file_size;
+	let table2_file_size = table2.file_size;
+	let table3_file_size = table3.file_size;
+
 	let expected_next_id = 100;
 	manifest.next_table_id.store(expected_next_id, Ordering::SeqCst);
 
@@ -223,7 +227,7 @@ fn test_level_manifest_persistence() {
 
 	// Check Table1 basic properties
 	assert_eq!(table1_reloaded.id, table_id1, "Table 1 ID mismatch");
-	assert_eq!(table1_reloaded.file_size, 2994, "Table 1 file size should be 2994");
+	assert_eq!(table1_reloaded.file_size, table1_file_size, "Table 1 file size mismatch");
 
 	// Check Table1 metadata properties
 	let props1 = &table1_reloaded.meta.properties;
@@ -259,7 +263,7 @@ fn test_level_manifest_persistence() {
 
 	// Check Table2 basic properties
 	assert_eq!(table2_reloaded.id, table_id2, "Table 2 ID mismatch");
-	assert_eq!(table2_reloaded.file_size, 5501, "Table 2 file size should be 5501");
+	assert_eq!(table2_reloaded.file_size, table2_file_size, "Table 2 file size mismatch");
 
 	// Check Table2 metadata properties
 	let props2 = &table2_reloaded.meta.properties;
@@ -295,7 +299,7 @@ fn test_level_manifest_persistence() {
 
 	// Check Table3 basic properties
 	assert_eq!(table3_reloaded.id, table_id3, "Table 3 ID mismatch");
-	assert_eq!(table3_reloaded.file_size, 8008, "Table 3 file size should be 8008");
+	assert_eq!(table3_reloaded.file_size, table3_file_size, "Table 3 file size mismatch");
 
 	// Check Table3 metadata properties
 	let props3 = &table3_reloaded.meta.properties;

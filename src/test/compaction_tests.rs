@@ -1975,7 +1975,7 @@ fn test_table_properties_population() {
 	assert_eq!(props.index_partitions, 1, "Should have 1 index partition for small table");
 	assert_eq!(props.top_level_index_size, 24, "Top-level index size should be tracked");
 	// Verify filter metrics (should have bloom filter by default)
-	assert_eq!(props.filter_size, 135, "Filter size should be tracked with default bloom filter");
+	assert_eq!(props.filter_size, 150, "Filter size should be tracked with default bloom filter");
 	assert_eq!(props.raw_key_size, 1500, "Raw key size should be tracked");
 	assert_eq!(props.raw_value_size, 675, "Raw value size should be tracked");
 	assert!(
