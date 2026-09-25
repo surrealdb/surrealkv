@@ -601,8 +601,7 @@ fn test_partitioned_index_boundary_keys() {
 			);
 			let result = table.get(&test_key).unwrap();
 			// Should find something (might be in previous partition)
-			if result.is_some() {
-				let (found_key, _) = result.unwrap();
+			if let Some((found_key, _)) = result {
 				assert!(found_key.user_key <= sep_key.user_key, "Found key should be <= separator");
 			}
 		}

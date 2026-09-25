@@ -1751,8 +1751,7 @@ fn test_get_with_lower_sequence_number() {
 	let lookup_key = InternalKey::new(Vec::from(user_key), 25, InternalKeyKind::Set);
 	let result = table.get(&lookup_key).unwrap();
 
-	if result.is_some() {
-		let (found_key, found_value) = result.unwrap();
+	if let Some((found_key, found_value)) = result {
 		panic!(
 			"BUG: Expected None, got key={}, seq_num={}, value={:?}",
 			String::from_utf8_lossy(&found_key.user_key),
@@ -4153,9 +4152,8 @@ fn test_table_get_nonexistent_keys() {
 		let seek_key = InternalKey::new(key_str.as_bytes().to_vec(), 100, InternalKeyKind::Set);
 		let result = table.get(&seek_key).unwrap();
 		// Should return None for keys that don't exist
-		if result.is_some() {
+		if let Some((found_key, _)) = result {
 			// If found, verify it's a valid key (might find next key)
-			let (found_key, _) = result.unwrap();
 			let found_str = std::str::from_utf8(&found_key.user_key).unwrap();
 			assert!(found_str.starts_with("key_"), "Found key {found_str} should be valid");
 		}
