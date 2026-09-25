@@ -52,7 +52,6 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 - **Async Native & Non-Blocking**: Fully concurrent, non-blocking commit pipeline built on lock-free ring buffers and optimistic concurrency control (OCC).
 - **Snapshot Isolation**: Multi-version concurrency control with non-blocking concurrent reads and isolated read transactions.
-- **Zero-Copy Slices (`byteslice`)**: Integrated with [`byteslice`](https://crates.io/crates/byteslice) for Small String Optimization (SSO) and 32-bit register-accelerated prefix key comparisons.
 - **Origin Private File System (OPFS)**: Native WebAssembly browser support using `FileSystemSyncAccessHandle` inside Web Workers for persistent client-side storage.
 - **Automated Zero-Effort Migration**: Automatically detects and migrates legacy databases on startup in pure Rust:
   - RocksDB BlockBasedTable formats (v2 through v7) via `surrealkv-compat-rocksdb`.
