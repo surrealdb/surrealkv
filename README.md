@@ -33,19 +33,20 @@ It is designed as an independent, standalone key-value store suitable for high-t
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM, 4TB PCIe 4.0 NVMe SSD**, synchronous durability enabled with `--sync` via [`crud-bench`](https://github.com/surrealdb/crud-bench)):
 
-| Engine | Point Read (OPS) | Create (OPS) | Update (OPS) | Delete (OPS) | Scan (OPS) | Peak Memory |
-| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **SurrealKV** | **1,182,982** | **98,853** | **102,614** | **97,037** | **8,361** | 1.35 GB |
-| RocksDB | 692,597 | 31,777 | 33,228 | 34,563 | 2,406 | 393 MB |
-| Fjall | 767,353 | 1,327 | 1,315 | 1,173 | 385 | 674 MB |
-| LMDB | 896,110 | 695 | 704 | 705 | 27,446 | 558 MB |
-| Libmdbx | 264,133 | 697 | 701 | 681 | 16,005 | 616 MB |
+| Engine | Point Read (OPS) | Create (OPS) | Update (OPS) | Delete (OPS) | Scan (OPS) | Resting Memory | Peak Memory |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **SurrealKV** | **1,182,982** | **98,853** | **102,614** | **97,037** | **8,361** | **~328 MB** | 1.35 GB |
+| RocksDB | 692,597 | 31,777 | 33,228 | 34,563 | 2,406 | ~356 MB | 393 MB |
+| Fjall | 767,353 | 1,327 | 1,315 | 1,173 | 385 | ~405 MB | 674 MB |
+| LMDB | 896,110 | 695 | 704 | 705 | 27,446 | ~421 MB | 558 MB |
+| Libmdbx | 264,133 | 697 | 701 | 681 | 16,005 | ~373 MB | 616 MB |
 
 - **Updates**: **102,614 OPS** (**3.09× faster** than RocksDB, **78× faster** than Fjall, and **145× faster** than LMDB) with lock-free group commit.
 - **Creates (Writes)**: **98,853 OPS** (**3.11× faster** than RocksDB and **74× faster** than Fjall) under synchronous disk persistence.
 - **Point Reads**: **1.18M OPS** sustained — the fastest point-read throughput among all disk-backed engines tested.
 - **Deletes**: **97,037 OPS** (**2.81× faster** than RocksDB) via high-efficiency tombstone append buffering.
 - **Range Scans**: **3.47× faster** than RocksDB via zero-copy iterator merges and block-level restart points.
+- **Memory Footprint**: Lowest resting memory at **~328 MB**; peak memory expands dynamically to buffer in-flight concurrent batches during high-throughput parallel commits.
 
 ---
 
