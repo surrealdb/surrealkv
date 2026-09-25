@@ -334,14 +334,17 @@ impl CommitPipeline {
 			processed_batches.push(processed);
 		}
 
-		// 2. Append all batches to WAL asynchronously via LogStore
+		// 2. Append all batches to WAL asynchronously via LogStore in a single write
 		if let Some(vlog_inst) = vlog {
 			vlog_inst.flush()?;
 		}
 
-		let mut wal_buffer = Vec::with_capacity(4096);
+		let total_capacity: usize = processed_batches.iter().map(|b| b.size as usize + 64).sum();
+		let mut wal_buffer = Vec::with_capacity(total_capacity);
 		for batch in &processed_batches {
 			batch.encode_into(&mut wal_buffer)?;
+		}
+		if !wal_buffer.is_empty() {
 			self.log_store.append(&wal_buffer).await?;
 		}
 		if sync {
@@ -352,19 +355,20 @@ impl CommitPipeline {
 		}
 
 		// 3. Apply to Active Memtable
+		let mut active = self.inner.active_memtable.read()?;
 		for batch in &processed_batches {
-			let res = {
-				let active = self.inner.active_memtable.read()?;
-				active.add(batch)
-			};
-
-			if let Err(Error::ArenaFull) = res {
-				self.inner.rotate_memtable()?;
-				if let Some(ref tm) = self.task_manager {
-					tm.wake_up_memtable();
+			match active.add(batch) {
+				Ok(()) => {}
+				Err(Error::ArenaFull) => {
+					drop(active);
+					self.inner.rotate_memtable()?;
+					if let Some(ref tm) = self.task_manager {
+						tm.wake_up_memtable();
+					}
+					active = self.inner.active_memtable.read()?;
+					active.add(batch)?;
 				}
-				let active = self.inner.active_memtable.read()?;
-				active.add(batch)?;
+				Err(e) => return Err(e),
 			}
 		}
 
