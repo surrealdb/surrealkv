@@ -172,6 +172,70 @@ while iter.valid() {
 
 ---
 
+## Transparent Data Encryption (TDE) & Key Rotation
+
+SurrealKV supports authenticated encryption at rest (AEAD) with self-describing block envelopes and online key rotation without downtime.
+
+### Supported Cipher Suites
+- `CipherSuite::Aes256Gcm` (default): Hardware-accelerated standard AEAD via AES-NI / ARMv8 crypto instructions.
+- `CipherSuite::XChaCha20Poly1305`: Constant-time software AEAD with an extended 192-bit nonce to eliminate nonce collision risk.
+- `CipherSuite::ChaCha20Blake3`: Committing AEAD construction combining ChaCha20 stream encryption with keyed BLAKE3 MAC for maximum throughput.
+
+### Configuration & Key Rotation Example
+
+```rust
+use std::sync::Arc;
+use surrealkv::{CipherSuite, Options, SoftwareKeyManager, TreeBuilder};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Initialize a KeyManager with a 256-bit (32-byte) master key
+    let initial_key = [0x42u8; 32];
+    let key_manager = Arc::new(SoftwareKeyManager::new(initial_key));
+
+    // 2. Configure Options with Transparent Data Encryption (TDE)
+    let opts = Options::new()
+        .with_path("data/encrypted_db".into())
+        .with_encryption(key_manager.clone(), CipherSuite::Aes256Gcm);
+
+    let tree = TreeBuilder::with_options(opts).build()?;
+
+    // Writes are transparently encrypted before hitting disk
+    {
+        let mut tx = tree.begin()?;
+        tx.set(b"secret:key", b"super_sensitive_data")?;
+        tx.commit().await?;
+    }
+
+    // 3. Online Key Rotation
+    // Add a new key and set it as the active key ID for subsequent writes
+    let rotated_key = [0x99u8; 32];
+    key_manager.add_key(2, rotated_key);
+    key_manager.set_active_key_id(2)?;
+
+    // New writes immediately use key ID 2
+    {
+        let mut tx = tree.begin()?;
+        tx.set(b"secret:new_key", b"data_under_rotated_key")?;
+        tx.commit().await?;
+    }
+
+    // Existing blocks with older key IDs remain transparently readable
+    // via self-describing authenticated envelope headers
+    {
+        let tx = tree.begin()?;
+        let val1 = tx.get(b"secret:key")?;
+        let val2 = tx.get(b"secret:new_key")?;
+        assert!(val1.is_some() && val2.is_some());
+    }
+
+    tree.close().await?;
+    Ok(())
+}
+```
+
+---
+
 ## Command-Line Tool (`skv`)
 
 The `skv` utility (`crates/surrealkv-cli`) provides inspection, diagnostics, and data migration capabilities:
