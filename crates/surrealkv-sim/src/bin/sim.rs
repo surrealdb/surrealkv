@@ -1,4 +1,5 @@
 use std::time::Instant;
+
 use surrealkv_sim::SimRunner;
 
 #[tokio::main]

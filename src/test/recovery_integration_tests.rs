@@ -297,8 +297,9 @@ async fn test_file_count_after_recovery() {
 	// Write data causing multiple flushes
 	{
 		let tree = create_tree(path.clone(), |b| {
-			b.with_max_memtable_size(4 * 1024) // Small enough to trigger ~5-6 automatic flushes with 150
-			                          // entries
+			b.with_max_memtable_size(4 * 1024) // Small enough to trigger ~5-6 automatic flushes
+			                                   // with 150
+			                                   // entries
 		});
 
 		for i in 0..150 {

@@ -1080,7 +1080,8 @@ impl<'a> CompactionIterator<'a> {
 
 				// Superseded = not latest AND in same visibility boundary AND allowed to drop
 				snapshot_allows_drop
-					&& !is_latest && self.same_visibility_boundary(newer_vis, current_visibility)
+					&& !is_latest
+					&& self.same_visibility_boundary(newer_vis, current_visibility)
 			} else {
 				// This is the first (newest) version - can't be superseded
 				false

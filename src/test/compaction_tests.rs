@@ -57,7 +57,8 @@ impl TestEnv {
 		let file = File::create(&table_path)?;
 
 		// Create a TableWriter
-		let mut writer = TableWriter::new(file, id, Arc::clone(&self.options), 0); // Test table, use L0
+		let mut writer = TableWriter::new(file, id, Arc::clone(&self.options), 0); // Test table,
+																				   // use L0
 
 		// Add entries to the table
 		for (key, value) in entries {
@@ -2351,7 +2352,7 @@ fn test_bytes_based_level_limits() {
 #[test]
 fn test_bottom_level_compaction() {
 	let env = TestEnv::new_with_levels(3); // 3 levels: L0, L1, L2 (L2 is bottom)
-										// Ensure manifest directory exists
+										   // Ensure manifest directory exists
 	std::fs::create_dir_all(env.options.manifest_dir()).unwrap();
 	let mut manifest = LevelManifest::new(Arc::clone(&env.options)).unwrap();
 

@@ -30,7 +30,8 @@ impl HardwareProfile {
 
 	/// Calculates optimal auto-tuned SurrealKV options for this hardware.
 	pub fn tune_options(&self, mut opts: Options) -> Options {
-		// 1. Allocate ~25% of system RAM to SurrealKV global memory budget (capped between 64MB and 16GB)
+		// 1. Allocate ~25% of system RAM to SurrealKV global memory budget (capped between 64MB and
+		//    16GB)
 		let engine_memory =
 			(self.total_ram_bytes / 4).clamp(64 * 1024 * 1024, 16 * 1024 * 1024 * 1024);
 

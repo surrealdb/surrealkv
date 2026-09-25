@@ -3,9 +3,9 @@
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::PathBuf;
-use tempfile::TempDir;
 
 use surrealkv::{LSMIterator, ReadOptions, Result, Transaction, Tree, TreeBuilder};
+use tempfile::TempDir;
 
 use super::generator::{Action, WorkloadGenerator};
 use super::model::{ModelDb, ModelTxn};

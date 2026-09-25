@@ -5,8 +5,17 @@ use std::sync::Arc;
 
 use super::writer::Writer;
 use super::{
-	get_segment_range, segment_name, BufferedFileWriter, CompressionType, Error, IOError, Options,
-	RecordType, Result, BLOCK_SIZE, HEADER_SIZE,
+	get_segment_range,
+	segment_name,
+	BufferedFileWriter,
+	CompressionType,
+	Error,
+	IOError,
+	Options,
+	RecordType,
+	Result,
+	BLOCK_SIZE,
+	HEADER_SIZE,
 };
 
 /// Write-Ahead Log (Wal) manager for coordinating WAL operations.

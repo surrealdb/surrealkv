@@ -10,7 +10,15 @@ use crate::lsm::{Core, CoreInner};
 use crate::test::collect_transaction_all;
 use crate::wal::list_segment_ids;
 use crate::{
-	Error, InternalKeyKind, Key, LSMIterator, Options, Tree, TreeBuilder, Value, WalRecoveryMode,
+	Error,
+	InternalKeyKind,
+	Key,
+	LSMIterator,
+	Options,
+	Tree,
+	TreeBuilder,
+	Value,
+	WalRecoveryMode,
 };
 
 fn create_temp_directory() -> TempDir {
@@ -2209,7 +2217,7 @@ async fn test_crash_before_flush_replays_wal() {
 
 	let opts = create_test_options(path.clone(), |opts| {
 		opts.max_memtable_size = 10 * 1024 * 1024; // Large memtable to prevent
-		                                     // auto-flush
+		                                           // auto-flush
 	});
 
 	// Phase 1: Write data and simulate crash (no clean shutdown)
@@ -5581,7 +5589,8 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 
 			for record_id in 0..NUM_RECORDS {
 				let is_odd = record_id % 2 == 1;
-				let delete_this_round = is_odd && (round % 4 == 0); // Delete odd records every 4th round
+				let delete_this_round = is_odd && (round % 4 == 0); // Delete odd records every 4th
+																	// round
 				let reinsert_this_round = is_odd && (round % 4 == 2); // Re-insert 2 rounds later
 
 				if delete_this_round {

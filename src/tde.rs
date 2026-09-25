@@ -3,10 +3,12 @@
 //! Provides authenticated encryption at rest (AES-256-GCM / ChaCha20-Poly1305 style)
 //! with key rotation support.
 
-use crate::error::{Error, Result};
-use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+use parking_lot::RwLock;
+
+use crate::error::{Error, Result};
 
 pub const KEY_ID_DEFAULT: u32 = 1;
 pub const NONCE_LEN: usize = 12;

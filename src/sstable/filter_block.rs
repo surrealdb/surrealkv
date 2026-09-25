@@ -35,13 +35,13 @@ impl FilterBlockWriter {
 	// Starts a new block at a given offset. This may trigger the generation of a
 	// new filter if necessary.
 	pub(crate) fn start_block(&mut self, block_offset: usize) {
-		let filter_index = block_offset / FILTER_BASE as usize; // Calculate the index of the filter for
-														  // the current block.
+		let filter_index = block_offset / FILTER_BASE as usize; // Calculate the index of the filter
+																// for the current block.
 		let filters_len = self.filter_offsets.len();
 		assert!(filter_index >= filters_len); // Ensure the filter index is not out of bounds.
 		while filter_index > self.filter_offsets.len() {
 			self.generate_filter(); // Generate filters until reaching the required
-			               // index.
+			                        // index.
 		}
 	}
 
@@ -74,8 +74,9 @@ impl FilterBlockWriter {
 		let mut result = self.filters;
 		let offsets_offset = self.filter_offsets.len();
 		let mut ix = result.len();
-		result.resize(ix + 4 * self.filter_offsets.len() + 5, 0); // Resize the result to fit the offsets
-															// and the base log2 value.
+		result.resize(ix + 4 * self.filter_offsets.len() + 5, 0); // Resize the result to fit the
+																  // offsets and the base log2
+																  // value.
 
 		// Append per-filter offsets to the result.
 		for offset in self.filter_offsets {
@@ -147,7 +148,7 @@ impl FilterBlockReader {
 		let start = self.filter_offsets[block_index] as usize; // Start of the filter in the data.
 		let limit = if block_index + 1 < self.filter_offsets.len() {
 			self.filter_offsets[block_index + 1] as usize // End of the filter in the
-		                                         // data.
+		                                                  // data.
 		} else {
 			// Subtract the filter offsets array (4 bytes per offset) + 4 bytes for offsets
 			// length + 1 byte for base log
@@ -161,7 +162,7 @@ impl FilterBlockReader {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use test_log::test;
 

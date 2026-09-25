@@ -1,8 +1,10 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use parking_lot::Mutex;
+use tokio::sync::oneshot;
+
 use crate::batch::Batch;
 use crate::error::Result;
-use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::oneshot;
 
 #[derive(Default)]
 pub(crate) struct SlotData {

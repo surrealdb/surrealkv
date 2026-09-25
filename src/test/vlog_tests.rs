@@ -5,8 +5,15 @@ use tempfile::TempDir;
 use test_log::test;
 
 use crate::vlog::{
-	VLog, VLogFileHeader, VLogWriter, ValueLocation, ValuePointer, BIT_VALUE_POINTER,
-	VALUE_LOCATION_VERSION, VALUE_POINTER_SIZE, VLOG_FORMAT_VERSION,
+	VLog,
+	VLogFileHeader,
+	VLogWriter,
+	ValueLocation,
+	ValuePointer,
+	BIT_VALUE_POINTER,
+	VALUE_LOCATION_VERSION,
+	VALUE_POINTER_SIZE,
+	VLOG_FORMAT_VERSION,
 };
 use crate::{CompressionType, Options, VLogChecksumLevel};
 
@@ -312,7 +319,8 @@ fn test_value_location_size_calculation() {
 	// Test VLog size
 	let pointer = ValuePointer::new(1, 100, 8, 256, 0x12345);
 	let vlog_location = ValueLocation::with_pointer(pointer);
-	assert_eq!(vlog_location.encoded_size(), 1 + 1 + VALUE_POINTER_SIZE); // meta + version + pointer
+	assert_eq!(vlog_location.encoded_size(), 1 + 1 + VALUE_POINTER_SIZE); // meta + version +
+	                                                                      // pointer
 }
 
 #[test(tokio::test)]

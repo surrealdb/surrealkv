@@ -1,8 +1,10 @@
-use super::bloom::BloomFilter;
-use crate::Key;
-use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::sync::Arc;
+
+use parking_lot::RwLock;
+
+use super::bloom::BloomFilter;
+use crate::Key;
 
 /// An entry in the OCC commit queue representing a committed (or in-flight) transaction.
 pub(crate) struct CommitEntry {

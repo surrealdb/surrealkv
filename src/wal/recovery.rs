@@ -362,7 +362,7 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 	Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
 	use std::fs;
 	use std::io::{Seek, Write};
@@ -394,8 +394,8 @@ mod tests {
 		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap(); // seq_num 100
 		batch1.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap(); // seq_num 101
 		batch1.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap(); // seq_num 102
-																// Highest sequence number should be
-																// 102
+																	  // Highest sequence number
+																	  // should be 102
 
 		// Batch 2: Starting at 200, with 4 entries (200, 201, 202, 203)
 		let mut batch2 = Batch::new(200);
@@ -403,8 +403,8 @@ mod tests {
 		batch2.set(b"key5".to_vec(), b"value5".to_vec(), 0).unwrap(); // seq_num 201
 		batch2.delete(b"key6".to_vec(), 0).unwrap(); // seq_num 202
 		batch2.set(b"key7".to_vec(), b"value7".to_vec(), 0).unwrap(); // seq_num 203
-																// Highest sequence number should be
-																// 203
+																	  // Highest sequence number
+																	  // should be 203
 
 		// Create WAL and rotate to create 2 segments
 		let opts = Options::default();
@@ -526,14 +526,14 @@ mod tests {
 		let mut batch1 = Batch::new(200); // Starting sequence number 200
 		batch1.set(b"key1".to_vec(), b"value1".to_vec(), 0).unwrap(); // seq_num 200
 		batch1.set(b"key2".to_vec(), b"value2".to_vec(), 0).unwrap(); // seq_num 201
-																// Highest sequence number should be
-																// 201
+																	  // Highest sequence number
+																	  // should be 201
 
 		let mut batch2 = Batch::new(300); // Starting sequence number 300
 		batch2.set(b"key3".to_vec(), b"value3".to_vec(), 0).unwrap(); // seq_num 300
 		batch2.set(b"key4".to_vec(), b"value4".to_vec(), 0).unwrap(); // seq_num 301
-																// Highest sequence number should be
-																// 301
+																	  // Highest sequence number
+																	  // should be 301
 
 		// Create WAL and rotate to create 2 segments
 		let opts = Options::default();

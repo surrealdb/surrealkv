@@ -1024,7 +1024,7 @@ async fn test_compression_per_level_with_different_levels() {
 	opts.compression_per_level = vec![CompressionType::SnappyCompression];
 	opts.level_count = 4; // L0, L1, L2, L3
 	opts.max_memtable_size = 1024 * 1024; // Force frequent flushes
-									   // L0: no compression, L1: no compression, L2+: Snappy
+										  // L0: no compression, L1: no compression, L2+: Snappy
 	opts.compression_per_level =
 		vec![CompressionType::None, CompressionType::None, CompressionType::SnappyCompression];
 

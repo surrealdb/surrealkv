@@ -54,7 +54,8 @@ struct KeyState {
 }
 
 /// Reads all live latest key-value pairs across all SSTables in a SurrealKV V1 database directory.
-/// Older historical versions and deleted tombstones are purged, leaving only the newest live values.
+/// Older historical versions and deleted tombstones are purged, leaving only the newest live
+/// values.
 pub fn read_all_latest<P: AsRef<Path>>(dir: P) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
 	let dir = dir.as_ref();
 	let mut sst_files = Vec::new();

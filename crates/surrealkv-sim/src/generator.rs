@@ -4,7 +4,6 @@ use std::collections::HashMap;
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
-
 use surrealkv::Key;
 
 #[derive(Debug, Clone)]
