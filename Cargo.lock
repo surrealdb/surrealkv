@@ -146,19 +146,19 @@ dependencies = [
 ]
 
 [[package]]
-name = "arenaskiplist"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f145446d02c5d1573972c2d562d2f397f37c79b3d1426f3cad8f18cac8bc4bf8"
-dependencies = [
- "fastrand",
-]
-
-[[package]]
 name = "arrayvec"
 version = "0.7.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
+
+[[package]]
+name = "artmap"
+version = "0.5.0"
+source = "git+https://github.com/surrealdb/artmap?branch=main#7b646353cb7826305410217334754a041e432676"
+dependencies = [
+ "byteslice",
+ "crossbeam-epoch",
+]
 
 [[package]]
 name = "async-task"
@@ -1441,7 +1441,7 @@ version = "0.21.4"
 dependencies = [
  "aes-gcm",
  "affinitypool",
- "arenaskiplist",
+ "artmap",
  "async-trait",
  "blake3",
  "bytes",
