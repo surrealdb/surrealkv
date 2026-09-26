@@ -2,12 +2,12 @@ use std::fs::File as SysFile;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-mod arena;
-mod skiplist;
+use arenaskiplist::{Arena, Error as SkiplistError, SkipList};
 
-use arena::Arena;
-pub(crate) use skiplist::max_entry_bytes;
-use skiplist::{Compare, Error as SkiplistError, Skiplist, SkiplistIterator};
+#[inline]
+pub(crate) const fn max_entry_bytes(key_len: usize, value_len: usize) -> u64 {
+	arenaskiplist::max_entry_bytes(key_len, value_len) as u64
+}
 
 use crate::batch::Batch;
 use crate::error::Result;
@@ -83,7 +83,7 @@ impl ImmutableMemtables {
 }
 
 pub(crate) struct MemTable {
-	skiplist: Skiplist,
+	skiplist: SkipList,
 	latest_seq_num: AtomicU64,
 	/// WAL number that was current when this memtable started receiving writes.
 	/// Used to determine which WALs can be safely deleted after flush.
@@ -121,9 +121,8 @@ impl Drop for ReservationGuard<'_> {
 
 impl MemTable {
 	pub(crate) fn new(arena_capacity: usize) -> Self {
-		let arena = Arc::new(Arena::new(arena_capacity));
-		let cmp: Compare = |a, b| a.cmp(b);
-		let skiplist = Skiplist::new(arena, cmp);
+		let arena = Arena::with_capacity(arena_capacity);
+		let skiplist = SkipList::new(arena);
 		MemTable {
 			skiplist,
 			latest_seq_num: AtomicU64::new(0),
@@ -165,17 +164,17 @@ impl MemTable {
 		}
 
 		let mut point_res: Option<(InternalKey, Value)> = None;
-		let mut iter = self.skiplist.iter();
-		iter.seek_ge(key);
+		let mut iter = self.skiplist.range(key..);
+		iter.first();
 
 		// Find the entry with highest sequence number <= max_seq
 		while iter.is_valid() {
-			let found_key = iter.key_bytes();
+			let found_key = iter.key().unwrap();
 			if found_key != key {
 				break; // Moved past our key
 			}
 
-			let found_trailer = iter.trailer();
+			let found_trailer = iter.version().unwrap();
 			let found_seq = found_trailer >> 8;
 
 			// Check if this entry's sequence number is <= requested seq_no
@@ -185,7 +184,7 @@ impl MemTable {
 					user_key: found_key.to_vec(),
 					trailer: found_trailer,
 				};
-				point_res = Some((internal_key, iter.value_bytes().to_vec()));
+				point_res = Some((internal_key, iter.value().unwrap().to_vec()));
 				break;
 			}
 
@@ -205,13 +204,11 @@ impl MemTable {
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
-		let mut iter = self.skiplist.iter();
-		iter.first();
-		!iter.is_valid()
+		self.skiplist.is_empty()
 	}
 
 	pub(crate) fn size(&self) -> usize {
-		self.skiplist.size() as usize
+		self.skiplist.size()
 	}
 
 	/// Arena capacity in bytes (total, including sentinel overhead).
@@ -329,7 +326,7 @@ impl MemTable {
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
 		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
 
-		match self.skiplist.add(&key.user_key, trailer, value) {
+		match self.skiplist.insert_with_version(&key.user_key, trailer, value) {
 			Ok(()) => Ok(()),
 			Err(SkiplistError::RecordExists) => Ok(()), // Duplicate is not an error in memtable
 			Err(SkiplistError::ArenaFull) => {
@@ -440,18 +437,20 @@ impl MemTable {
 		lower: Option<&[u8]>, // Inclusive, None = unbounded
 		upper: Option<&[u8]>, // Exclusive, None = unbounded
 	) -> MemTableIterator<'_> {
-		let mut iter = self.skiplist.new_iter(lower, upper);
+		let iter = match (lower, upper) {
+			(Some(l), Some(u)) => self.skiplist.range(l..u),
+			(Some(l), None) => self.skiplist.range(l..),
+			(None, Some(u)) => self.skiplist.range(..u),
+			(None, None) => self.skiplist.iter(),
+		};
 
-		// Pre-position for forward iteration
-		if let Some(lower_key) = lower {
-			iter.seek_ge(lower_key);
-		} else {
-			iter.first();
-		}
-
-		MemTableIterator {
+		let mut miter = MemTableIterator {
 			iter,
-		}
+			encoded_key_buf: Vec::new(),
+		};
+
+		let _ = miter.seek_first();
+		miter
 	}
 }
 
@@ -489,39 +488,72 @@ fn maybe_separate_to_vlog(
 }
 
 pub(crate) struct MemTableIterator<'a> {
-	iter: SkiplistIterator<'a>,
+	iter: arenaskiplist::Iter<'a>,
+	encoded_key_buf: Vec<u8>,
+}
+
+impl<'a> MemTableIterator<'a> {
+	fn populate_encoded_key(&mut self) {
+		if !self.iter.is_valid() {
+			return;
+		}
+		self.encoded_key_buf.clear();
+		if let (Some(k), Some(v)) = (self.iter.key(), self.iter.version()) {
+			self.encoded_key_buf.extend_from_slice(k);
+			self.encoded_key_buf.extend_from_slice(&v.to_be_bytes());
+		}
+	}
 }
 
 impl LSMIterator for MemTableIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
-		self.iter.seek(target)
+		let user_key = InternalKey::user_key_from_encoded(target);
+		self.iter.seek_ge(user_key);
+		self.populate_encoded_key();
+		Ok(self.valid())
 	}
 
 	fn seek_first(&mut self) -> Result<bool> {
-		self.iter.seek_first()
+		self.iter.first();
+		self.populate_encoded_key();
+		Ok(self.valid())
 	}
 
 	fn seek_last(&mut self) -> Result<bool> {
-		self.iter.seek_last()
+		arenaskiplist::Iter::last(&mut self.iter);
+		self.populate_encoded_key();
+		Ok(self.valid())
 	}
 
 	fn next(&mut self) -> Result<bool> {
-		self.iter.next()
+		if !self.valid() {
+			return Ok(false);
+		}
+		self.iter.advance();
+		self.populate_encoded_key();
+		Ok(self.valid())
 	}
 
 	fn prev(&mut self) -> Result<bool> {
-		self.iter.prev()
+		if !self.valid() {
+			return Ok(false);
+		}
+		self.iter.prev();
+		self.populate_encoded_key();
+		Ok(self.valid())
 	}
 
 	fn valid(&self) -> bool {
-		self.iter.valid()
+		self.iter.is_valid()
 	}
 
 	fn key(&self) -> InternalKeyRef<'_> {
-		self.iter.key()
+		debug_assert!(self.valid());
+		InternalKeyRef::from_encoded(&self.encoded_key_buf)
 	}
 
 	fn value_encoded(&self) -> Result<&[u8]> {
-		self.iter.value_encoded()
+		debug_assert!(self.valid());
+		Ok(self.iter.value().unwrap_or(&[]))
 	}
 }
