@@ -489,7 +489,7 @@ impl<'a> MemTableIterator<'a> {
 		while !cur.is_null() {
 			let leaf = unsafe { &*cur };
 			self.current_versions.push(cur);
-			let next_off = leaf.next_version_offset.load(Ordering::Acquire);
+			let next_off = leaf.next_version_offset.load(Ordering::Acquire) & !1;
 			if next_off == 0 {
 				break;
 			}
