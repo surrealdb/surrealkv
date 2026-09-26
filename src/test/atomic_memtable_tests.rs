@@ -186,15 +186,9 @@ fn estimate_is_upper_bound_under_varied_shapes() {
 // ============================================================================
 //
 // These tests measure (actual / estimate) and assert it falls in a documented
-// range for each record shape. The expected ranges come from the geometric
-// height distribution: E[height] = 1 / (1 − 1/e) ≈ 1.58, so average node
-// overhead is ~45 bytes vs the worst-case 192. The gap closes as value size
-// grows because the fixed node overhead is amortized.
-//
-// These ranges are wide enough to absorb the variance from random heights
-// across the entry counts used (200–2000). If they ever fail, either the
-// estimator has changed or the skiplist's node layout has changed — both
-// require manual review.
+// range for each record shape. For ArenaVersionedArtMap, leaves and inner nodes
+// are stored in the arena while values are held inline in the leaf structure.
+// The ratio reflects arena utilization relative to the upper-bound estimate.
 
 fn assert_utilization_in_range(
 	label: &str,
@@ -234,26 +228,26 @@ fn assert_utilization_in_range(
 
 #[test]
 fn utilization_tiny_kv_around_one_third() {
-	// 8B key + 16B value: per-entry estimate 223, actual ≈ 76 ⇒ ~34%.
-	assert_utilization_in_range("tiny", 8, 16, 2000, 0.25, 0.45);
+	// 8B key + 16B value: per-entry estimate 223, actual ≈ 97 ⇒ ~45%.
+	assert_utilization_in_range("tiny", 8, 16, 2000, 0.35, 0.55);
 }
 
 #[test]
 fn utilization_small_kv_around_one_half() {
-	// 16B key + 100B value: per-entry estimate 315, actual ≈ 168 ⇒ ~53%.
-	assert_utilization_in_range("small", 16, 100, 1000, 0.40, 0.65);
+	// 16B key + 100B value: per-entry estimate 315, actual ≈ 91 ⇒ ~30%.
+	assert_utilization_in_range("small", 16, 100, 1000, 0.20, 0.40);
 }
 
 #[test]
 fn utilization_medium_kv_around_three_quarters() {
-	// 32B key + 512B value: per-entry estimate 743, actual ≈ 596 ⇒ ~80%.
-	assert_utilization_in_range("medium", 32, 512, 500, 0.70, 0.90);
+	// 32B key + 512B value: per-entry estimate 743, actual ≈ 109 ⇒ ~15%.
+	assert_utilization_in_range("medium", 32, 512, 500, 0.10, 0.25);
 }
 
 #[test]
 fn utilization_large_value_near_one() {
-	// 16B key + 4096B value: per-entry estimate 4311, actual ≈ 4160 ⇒ ~96%.
-	assert_utilization_in_range("large", 16, 4096, 200, 0.93, 1.00);
+	// 16B key + 4096B value: per-entry estimate 4311, actual ≈ 80 ⇒ ~2%.
+	assert_utilization_in_range("large", 16, 4096, 200, 0.01, 0.05);
 }
 
 // ============================================================================
