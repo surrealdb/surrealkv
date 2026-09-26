@@ -16,7 +16,13 @@ use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::vlog::{VLog, ValueLocation};
 use crate::{
-	InternalKey, InternalKeyKind, InternalKeyRef, Key, LSMIterator, Options, Value,
+	InternalKey,
+	InternalKeyKind,
+	InternalKeyRef,
+	Key,
+	LSMIterator,
+	Options,
+	Value,
 	INTERNAL_KEY_SEQ_NUM_MAX,
 };
 
