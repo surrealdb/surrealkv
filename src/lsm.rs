@@ -328,6 +328,91 @@ impl CoreInner {
 		Ok(table)
 	}
 
+	/// Writes a batch directly to a new Level 0 SSTable without inserting into a memtable.
+	///
+	/// Used for batches that exceed `max_memtable_size` to avoid `ArenaFull` allocation
+	/// failures and unnecessary in-memory buffering.
+	pub(crate) fn write_batch_direct_to_l0_sst(
+		&self,
+		batch: &Batch,
+		table_id: u64,
+	) -> Result<Arc<Table>> {
+		let table_file_path = self.opts.sstable_file_path(table_id);
+		let mut range_deletions = Vec::new();
+		let mut point_entries = Vec::new();
+
+		for (_, entry, seq_num, _) in batch.entries_with_seq_nums()? {
+			if entry.kind == crate::InternalKeyKind::RangeDelete {
+				let end_key = entry.value.clone().unwrap_or_default();
+				range_deletions.push((entry.key.clone(), end_key, seq_num));
+			} else {
+				let ikey = crate::InternalKey::new(entry.key.clone(), seq_num, entry.kind);
+				point_entries.push((ikey, entry.value.clone()));
+			}
+		}
+
+		// Sort point entries by InternalKey comparator: user_key ASC, seq_num DESC
+		point_entries
+			.sort_by(|a, b| self.opts.internal_comparator.compare(&a.0.encode(), &b.0.encode()));
+
+		{
+			let file = std::fs::File::create(&table_file_path)?;
+			let mut table_writer =
+				crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&self.opts), 0);
+
+			for (key, val) in point_entries {
+				let val_bytes = val.as_deref().unwrap_or(&[]);
+				table_writer.add(key, val_bytes)?;
+			}
+
+			for (start, end, seq) in &range_deletions {
+				table_writer.add_range_deletion(start.clone(), end.clone(), *seq);
+			}
+
+			table_writer.finish()?;
+		}
+
+		if let Some(ref vlog) = self.vlog {
+			vlog.sync()?;
+		}
+
+		crate::vfs::fsync_file(&table_file_path)?;
+		crate::lsm::fsync_directory(self.opts.sstable_dir())?;
+		let file: Arc<dyn crate::vfs::File> = Arc::new(std::fs::File::open(&table_file_path)?);
+		let file_size = file.size()?;
+
+		let created_table =
+			Arc::new(Table::new(table_id, Arc::clone(&self.opts), file, file_size)?);
+		if !range_deletions.is_empty() {
+			created_table.range_deletions.write().extend(range_deletions);
+			created_table.has_range_deletions.store(true, Ordering::Release);
+		}
+
+		// Atomically commit new L0 table to manifest
+		let mut changeset = ManifestChangeSet::default();
+		changeset.new_tables.push((0, Arc::clone(&created_table)));
+
+		let mut manifest = self.level_manifest.write()?;
+		let rollback = manifest.apply_changeset(&changeset)?;
+		if let Err(e) = write_manifest_to_disk(&manifest) {
+			manifest.revert_changeset(rollback);
+			let error = Error::Other(format!(
+				"Failed to atomically update manifest for direct L0 flush table_id={}: {}",
+				table_id, e
+			));
+			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
+			return Err(error);
+		}
+
+		tracing::debug!(
+			"Direct-to-L0 flush completed: table_id={}, file_size={}",
+			created_table.id,
+			created_table.file_size
+		);
+
+		Ok(created_table)
+	}
+
 	/// Rotates the active memtable to the immutable queue WITHOUT flushing to SST.
 	/// This is a fast operation (no disk I/O) that:
 	/// 1. Rotates WAL to a new file

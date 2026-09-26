@@ -183,16 +183,15 @@ pub(crate) fn replay_wal(
 					match current_memtable.add(&batch) {
 						Ok(()) => {}
 						Err(Error::ArenaFull) => {
-							// `MemTable::add` is atomic: it either fully applies the
-							// batch or returns ArenaFull with the memtable unchanged
-							// (no partial prefix). If the active memtable is empty here,
-							// the batch alone exceeds arena capacity and no rotation
-							// will help — surface as fatal.
 							if current_memtable.is_empty() {
-								return Err(Error::Other(format!(
-									"Batch too large for memtable (batch size exceeds arena_size={})",
-									arena_size
-								)));
+								// Batch alone exceeds arena capacity: allocate an oversized
+								// memtable specifically for this batch so recovery succeeds.
+								let needed = batch.memtable_size_estimate() as usize + 4096;
+								let oversized = Arc::new(MemTable::new(needed));
+								oversized.add(&batch)?;
+								memtables.push((oversized, segment_id));
+								current_memtable = Arc::new(MemTable::new(arena_size));
+								continue;
 							}
 							// Save current memtable and create new one
 							tracing::warn!(
@@ -202,7 +201,13 @@ pub(crate) fn replay_wal(
 							memtables.push((Arc::clone(&current_memtable), segment_id));
 							current_memtable = Arc::new(MemTable::new(arena_size));
 							// Retry on fresh memtable
-							current_memtable.add(&batch)?;
+							if let Err(Error::ArenaFull) = current_memtable.add(&batch) {
+								let needed = batch.memtable_size_estimate() as usize + 4096;
+								let oversized = Arc::new(MemTable::new(needed));
+								oversized.add(&batch)?;
+								memtables.push((oversized, segment_id));
+								current_memtable = Arc::new(MemTable::new(arena_size));
+							}
 						}
 						Err(e) => return Err(e),
 					}
