@@ -147,9 +147,9 @@ dependencies = [
 
 [[package]]
 name = "arenaskiplist"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a97688fb0f855396bf8a850893c7e15c3b6f38cac36c8d42de5e96b67c3c7fe1"
+checksum = "f145446d02c5d1573972c2d562d2f397f37c79b3d1426f3cad8f18cac8bc4bf8"
 dependencies = [
  "fastrand",
 ]
