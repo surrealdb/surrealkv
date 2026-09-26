@@ -1,8 +1,10 @@
 use std::fs::File as SysFile;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use artmap::arena::node::VersionedLeaf;
+use artmap::arena::versioned_iter::ArenaVersionedRange;
 use artmap::arena::ArenaVersionedArtMap;
 
 #[inline]
@@ -402,10 +404,22 @@ impl MemTable {
 		lower: Option<&[u8]>, // Inclusive, None = unbounded
 		upper: Option<&[u8]>, // Exclusive, None = unbounded
 	) -> MemTableIterator<'_> {
+		let start = match lower {
+			Some(l) => Bound::Included(l.to_vec()),
+			None => Bound::Unbounded,
+		};
+		let end = match upper {
+			Some(u) => Bound::Excluded(u.to_vec()),
+			None => Bound::Unbounded,
+		};
+		let range = self.map.range((start, end));
+
 		let mut miter = MemTableIterator {
 			map: &self.map,
 			lower: lower.map(|l| l.to_vec()),
 			upper: upper.map(|u| u.to_vec()),
+			range,
+			direction: IterDirection::Forward,
 			current_user_key: None,
 			current_versions: Vec::new(),
 			version_idx: 0,
@@ -450,10 +464,18 @@ fn maybe_separate_to_vlog(
 	Ok(encoded_value.to_vec())
 }
 
+#[derive(Clone, Copy)]
+enum IterDirection {
+	Forward,
+	Backward,
+}
+
 pub(crate) struct MemTableIterator<'a> {
 	map: &'a ArenaVersionedArtMap<Key, Value>,
 	lower: Option<Vec<u8>>,
 	upper: Option<Vec<u8>>,
+	range: ArenaVersionedRange<'a, Key, Value>,
+	direction: IterDirection,
 	current_user_key: Option<Vec<u8>>,
 	current_versions: Vec<*const VersionedLeaf<Key, Value>>,
 	version_idx: usize,
@@ -502,26 +524,20 @@ impl LSMIterator for MemTableIterator<'_> {
 		};
 
 		let start_key = match &self.lower {
-			Some(l) if target_user_key < l.as_slice() => l.as_slice(),
-			_ => target_user_key,
+			Some(l) if target_user_key < l.as_slice() => l.clone(),
+			_ => target_user_key.to_vec(),
 		};
 
-		if let Some(ref u) = self.upper {
-			if start_key >= u.as_slice() {
-				self.clear_cursor();
-				return Ok(false);
-			}
-		}
+		let end = match &self.upper {
+			Some(u) => Bound::Excluded(u.clone()),
+			None => Bound::Unbounded,
+		};
 
-		let mut entry_opt = self.map.find_successor(start_key, true);
-		while let Some(entry) = entry_opt {
+		self.range = self.map.range((Bound::Included(start_key), end));
+		self.direction = IterDirection::Forward;
+
+		while let Some(entry) = self.range.next() {
 			let k = entry.key().as_slice();
-			if let Some(ref u) = self.upper {
-				if k >= u.as_slice() {
-					break;
-				}
-			}
-
 			self.collect_versions(entry.leaf_ptr());
 			self.current_user_key = Some(entry.key().clone());
 
@@ -540,8 +556,6 @@ impl LSMIterator for MemTableIterator<'_> {
 					self.populate_encoded_key();
 					return Ok(true);
 				}
-
-				entry_opt = self.map.find_successor(k, false);
 				continue;
 			} else {
 				self.version_idx = 0;
@@ -555,15 +569,17 @@ impl LSMIterator for MemTableIterator<'_> {
 	}
 
 	fn seek_first(&mut self) -> Result<bool> {
-		let start = self.lower.as_deref().unwrap_or(&[]);
-		if let Some(entry) = self.map.find_successor(start, true) {
-			let k = entry.key().as_slice();
-			if let Some(ref u) = self.upper {
-				if k >= u.as_slice() {
-					self.clear_cursor();
-					return Ok(false);
-				}
-			}
+		let start = match &self.lower {
+			Some(l) => Bound::Included(l.clone()),
+			None => Bound::Unbounded,
+		};
+		let end = match &self.upper {
+			Some(u) => Bound::Excluded(u.clone()),
+			None => Bound::Unbounded,
+		};
+		self.range = self.map.range((start, end));
+		self.direction = IterDirection::Forward;
+		if let Some(entry) = self.range.next() {
 			self.current_user_key = Some(entry.key().clone());
 			self.collect_versions(entry.leaf_ptr());
 			self.version_idx = 0;
@@ -576,18 +592,17 @@ impl LSMIterator for MemTableIterator<'_> {
 	}
 
 	fn seek_last(&mut self) -> Result<bool> {
-		let entry_opt = match &self.upper {
-			Some(u) => self.map.find_predecessor(u.as_slice(), false),
-			None => self.map.last_entry(),
+		let start = match &self.lower {
+			Some(l) => Bound::Included(l.clone()),
+			None => Bound::Unbounded,
 		};
-		if let Some(entry) = entry_opt {
-			let k = entry.key().as_slice();
-			if let Some(ref l) = self.lower {
-				if k < l.as_slice() {
-					self.clear_cursor();
-					return Ok(false);
-				}
-			}
+		let end = match &self.upper {
+			Some(u) => Bound::Excluded(u.clone()),
+			None => Bound::Unbounded,
+		};
+		self.range = self.map.range((start, end));
+		self.direction = IterDirection::Backward;
+		if let Some(entry) = self.range.next_back() {
 			self.current_user_key = Some(entry.key().clone());
 			self.collect_versions(entry.leaf_ptr());
 			self.version_idx = self.current_versions.len().saturating_sub(1);
@@ -611,14 +626,17 @@ impl LSMIterator for MemTableIterator<'_> {
 		}
 
 		let cur_key = self.current_user_key.as_ref().unwrap();
-		if let Some(next_entry) = self.map.find_successor(cur_key.as_slice(), false) {
-			let k = next_entry.key().as_slice();
-			if let Some(ref u) = self.upper {
-				if k >= u.as_slice() {
-					self.clear_cursor();
-					return Ok(false);
-				}
-			}
+
+		if matches!(self.direction, IterDirection::Backward) {
+			let end = match &self.upper {
+				Some(u) => Bound::Excluded(u.clone()),
+				None => Bound::Unbounded,
+			};
+			self.range = self.map.range((Bound::Excluded(cur_key.clone()), end));
+			self.direction = IterDirection::Forward;
+		}
+
+		if let Some(next_entry) = self.range.next() {
 			self.current_user_key = Some(next_entry.key().clone());
 			self.collect_versions(next_entry.leaf_ptr());
 			self.version_idx = 0;
@@ -642,14 +660,17 @@ impl LSMIterator for MemTableIterator<'_> {
 		}
 
 		let cur_key = self.current_user_key.as_ref().unwrap();
-		if let Some(prev_entry) = self.map.find_predecessor(cur_key.as_slice(), false) {
-			let k = prev_entry.key().as_slice();
-			if let Some(ref l) = self.lower {
-				if k < l.as_slice() {
-					self.clear_cursor();
-					return Ok(false);
-				}
-			}
+
+		if matches!(self.direction, IterDirection::Forward) {
+			let start = match &self.lower {
+				Some(l) => Bound::Included(l.clone()),
+				None => Bound::Unbounded,
+			};
+			self.range = self.map.range((start, Bound::Excluded(cur_key.clone())));
+			self.direction = IterDirection::Backward;
+		}
+
+		if let Some(prev_entry) = self.range.next_back() {
 			self.current_user_key = Some(prev_entry.key().clone());
 			self.collect_versions(prev_entry.leaf_ptr());
 			self.version_idx = self.current_versions.len().saturating_sub(1);
