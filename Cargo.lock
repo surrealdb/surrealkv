@@ -154,7 +154,7 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 [[package]]
 name = "artmap"
 version = "0.5.0"
-source = "git+https://github.com/surrealdb/artmap?branch=main#7b646353cb7826305410217334754a041e432676"
+source = "git+https://github.com/surrealdb/artmap?branch=main#11812ffafcaba5002fd8d3620def37dfd9fb072a"
 dependencies = [
  "byteslice",
  "crossbeam-epoch",
