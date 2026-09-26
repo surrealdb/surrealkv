@@ -26,10 +26,11 @@ rust-version = "1.86"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-surrealkv-compat-rocksdb = { path = "crates/surrealkv-compat-rocksdb" }
-surrealkv-compat-v1 = { path = "crates/surrealkv-compat-v1" }
-surrealkv-compat-indxdb = { path = "crates/surrealkv-compat-indxdb" }
-byteslice = "0.1.0"
+	surrealkv-compat-rocksdb = { path = "crates/surrealkv-compat-rocksdb" }
+	surrealkv-compat-v1 = { path = "crates/surrealkv-compat-v1" }
+	surrealkv-compat-indxdb = { path = "crates/surrealkv-compat-indxdb" }
+	arenaskiplist = "0.1.0"
+	byteslice = "0.1.0"
 affinitypool = "0.8.0"
 snap = "1.0.0"
 zstd = { version = "0.13", default-features = false }
