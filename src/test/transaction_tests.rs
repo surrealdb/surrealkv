@@ -2650,3 +2650,60 @@ async fn range_with_options_treats_missing_bounds_as_unbounded() {
 	assert_eq!(keys(&txn, None, Some(b"m2")), expect(&[b"a", b"m1"]));
 	assert_eq!(keys(&txn, None, None), expect(&[b"a", b"m1", b"m2", b"z", b"zz"]));
 }
+
+#[test(tokio::test)]
+async fn test_transaction_iter_and_scan_api() {
+	let (store, _temp_dir) = create_store();
+	{
+		let mut txn = store.begin().unwrap();
+		for k in [&b"k1"[..], b"k2", b"k3", b"k4", b"k5"] {
+			txn.set(k, b"val").unwrap();
+		}
+		txn.commit().await.unwrap();
+	}
+
+	let txn = store.begin().unwrap();
+	let expect = |ks: &[&[u8]]| ks.iter().map(|k| k.to_vec()).collect::<Vec<_>>();
+
+	// 1. tx.iter() full scan
+	let mut it = txn.iter().unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k1", b"k2", b"k3", b"k4", b"k5"]));
+
+	// 2. tx.scan(..) full scan
+	let mut it = txn.scan(..).unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k1", b"k2", b"k3", b"k4", b"k5"]));
+
+	// 3. tx.scan(start..end) half-open
+	let mut it = txn.scan(b"k2"..b"k4").unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k2", b"k3"]));
+
+	// 4. tx.scan(start..=end) inclusive
+	let mut it = txn.scan(b"k2"..=b"k4").unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k2", b"k3", b"k4"]));
+
+	// 5. tx.scan(start..) from
+	let mut it = txn.scan(b"k3"..).unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k3", b"k4", b"k5"]));
+
+	// 6. tx.scan(..end) to
+	let mut it = txn.scan(..b"k3").unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k1", b"k2"]));
+
+	// 7. tx.scan with &str
+	let mut it = txn.scan("k2".."k4").unwrap();
+	let collected =
+		collect_transaction_all(&mut it).unwrap().into_iter().map(|(k, _)| k).collect::<Vec<_>>();
+	assert_eq!(collected, expect(&[b"k2", b"k3"]));
+}
