@@ -354,21 +354,51 @@ impl CommitPipeline {
 			self.log_store.sync().await?;
 		}
 
-		// 3. Apply to Active Memtable
+		// 3. Apply to Active Memtable (or Direct-to-L0 Flush if oversized)
 		let mut active = self.inner.active_memtable.read()?;
 		for batch in &processed_batches {
-			match active.add(batch) {
-				Ok(()) => {}
-				Err(Error::ArenaFull) => {
+			let needed = batch.memtable_size_estimate();
+			if needed > self.inner.opts.max_memtable_size as u64 {
+				// Batch exceeds max_memtable_size: bypass memtable and flush directly to L0.
+				// First rotate any existing active memtable so earlier writes stay ordered before
+				// this L0 table.
+				if !active.is_empty() {
 					drop(active);
 					self.inner.rotate_memtable()?;
 					if let Some(ref tm) = self.task_manager {
 						tm.wake_up_memtable();
 					}
 					active = self.inner.active_memtable.read()?;
-					active.add(batch)?;
 				}
-				Err(e) => return Err(e),
+
+				let table_id = self.inner.level_manifest.read()?.next_table_id();
+				self.inner.write_batch_direct_to_l0_sst(batch, table_id)?;
+
+				if let Some(ref tm) = self.task_manager {
+					tm.wake_up_level();
+				}
+			} else {
+				match active.add(batch) {
+					Ok(()) => {}
+					Err(Error::ArenaFull) => {
+						drop(active);
+						self.inner.rotate_memtable()?;
+						if let Some(ref tm) = self.task_manager {
+							tm.wake_up_memtable();
+						}
+						active = self.inner.active_memtable.read()?;
+						if let Err(Error::ArenaFull) = active.add(batch) {
+							// If it still doesn't fit even in an empty fresh memtable,
+							// fallback to direct-to-L0 flush rather than failing hard.
+							let table_id = self.inner.level_manifest.read()?.next_table_id();
+							self.inner.write_batch_direct_to_l0_sst(batch, table_id)?;
+							if let Some(ref tm) = self.task_manager {
+								tm.wake_up_level();
+							}
+						}
+					}
+					Err(e) => return Err(e),
+				}
 			}
 		}
 
