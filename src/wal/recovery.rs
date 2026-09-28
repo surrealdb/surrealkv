@@ -32,6 +32,61 @@ impl Reporter for DefaultReporter {
 	}
 }
 
+/// Applies `batch` to `current_memtable`, handling the case where it doesn't fit.
+///
+/// On `Error::ArenaFull`:
+/// - If `current_memtable` is already empty, the batch alone exceeds `arena_size` (this
+///   happens when a live commit used the direct-to-L0 path for an oversized batch, see
+///   `CoreInner::write_batch_direct_to_l0_sst`, and a crash then forces WAL replay of
+///   that same batch). A dedicated memtable sized to fit exactly this batch is created
+///   and pushed to `memtables` so recovery can still succeed, instead of failing hard.
+/// - Otherwise, `current_memtable` is pushed to `memtables` as-is and a fresh,
+///   `arena_size`-capacity memtable is created and the batch retried on it; if the batch
+///   still doesn't fit on a fresh, empty memtable, the oversized-memtable fallback above
+///   is applied to it instead.
+///
+/// Returns the memtable that should keep receiving subsequent batches for this segment
+/// (either `current_memtable` unchanged, or a fresh `arena_size`-capacity replacement).
+pub(crate) fn apply_batch_with_oversized_fallback(
+	current_memtable: Arc<MemTable>,
+	batch: &Batch,
+	arena_size: usize,
+	segment_id: u64,
+	memtables: &mut Vec<(Arc<MemTable>, u64)>,
+) -> Result<Arc<MemTable>> {
+	match current_memtable.add(batch) {
+		Ok(()) => Ok(current_memtable),
+		Err(Error::ArenaFull) => {
+			if current_memtable.is_empty() {
+				let needed = batch.memtable_size_estimate() as usize + 4096;
+				let oversized = Arc::new(MemTable::new(needed));
+				oversized.add(batch)?;
+				memtables.push((oversized, segment_id));
+				return Ok(Arc::new(MemTable::new(arena_size)));
+			}
+
+			tracing::warn!(
+				"WAL segment #{:020} exceeds single memtable capacity, splitting",
+				segment_id
+			);
+			memtables.push((Arc::clone(&current_memtable), segment_id));
+			let fresh = Arc::new(MemTable::new(arena_size));
+			match fresh.add(batch) {
+				Ok(()) => Ok(fresh),
+				Err(Error::ArenaFull) => {
+					let needed = batch.memtable_size_estimate() as usize + 4096;
+					let oversized = Arc::new(MemTable::new(needed));
+					oversized.add(batch)?;
+					memtables.push((oversized, segment_id));
+					Ok(Arc::new(MemTable::new(arena_size)))
+				}
+				Err(e) => Err(e),
+			}
+		}
+		Err(e) => Err(e),
+	}
+}
+
 /// Replays the Write-Ahead Log (WAL) to recover recent writes.
 ///
 /// Creates one memtable per WAL segment, matching the original design where
@@ -179,38 +234,15 @@ pub(crate) fn replay_wal(
 						offset
 					);
 
-					// Apply batch to current memtable with ArenaFull handling
-					match current_memtable.add(&batch) {
-						Ok(()) => {}
-						Err(Error::ArenaFull) => {
-							if current_memtable.is_empty() {
-								// Batch alone exceeds arena capacity: allocate an oversized
-								// memtable specifically for this batch so recovery succeeds.
-								let needed = batch.memtable_size_estimate() as usize + 4096;
-								let oversized = Arc::new(MemTable::new(needed));
-								oversized.add(&batch)?;
-								memtables.push((oversized, segment_id));
-								current_memtable = Arc::new(MemTable::new(arena_size));
-								continue;
-							}
-							// Save current memtable and create new one
-							tracing::warn!(
-								"WAL segment #{:020} exceeds single memtable capacity, splitting",
-								segment_id
-							);
-							memtables.push((Arc::clone(&current_memtable), segment_id));
-							current_memtable = Arc::new(MemTable::new(arena_size));
-							// Retry on fresh memtable
-							if let Err(Error::ArenaFull) = current_memtable.add(&batch) {
-								let needed = batch.memtable_size_estimate() as usize + 4096;
-								let oversized = Arc::new(MemTable::new(needed));
-								oversized.add(&batch)?;
-								memtables.push((oversized, segment_id));
-								current_memtable = Arc::new(MemTable::new(arena_size));
-							}
-						}
-						Err(e) => return Err(e),
-					}
+					// Apply batch to current memtable, falling back to a dedicated
+					// oversized memtable if it (or a fresh replacement) can't hold it.
+					current_memtable = apply_batch_with_oversized_fallback(
+						current_memtable,
+						&batch,
+						arena_size,
+						segment_id,
+						&mut memtables,
+					)?;
 				}
 				Err(WalError::Corruption(err)) => {
 					tracing::error!(
@@ -1047,5 +1079,59 @@ mod tests {
 			}
 			assert_eq!(count, 1);
 		}
+	}
+
+	/// Regression test: with >= 2 WAL segments to replay, `replay_wal` delegates to
+	/// `parallel_recovery::replay_segments_sync`. Before the fix, that path still had
+	/// the old "fail hard when a batch alone exceeds arena_size" logic that
+	/// `replay_wal`'s own single-segment loop had already been fixed to handle
+	/// gracefully -- so this exact scenario (an oversized batch, in one of several
+	/// pending WAL segments, which is the common case after any WAL rotation before a
+	/// crash) made the whole database fail to open.
+	#[test]
+	fn test_multi_segment_recovery_with_oversized_batch_does_not_fail() {
+		let temp_dir = TempDir::new().unwrap();
+		let wal_dir = temp_dir.path();
+		fs::create_dir_all(wal_dir).unwrap();
+
+		let opts = Options::default();
+		let mut wal = Wal::open(wal_dir, opts).unwrap();
+
+		// Segment 0: a normal, small batch.
+		let mut batch0 = Batch::new(100);
+		batch0.set(b"key0".to_vec(), b"value0".to_vec(), 0).unwrap();
+		wal.append(&batch0.encode().unwrap()).unwrap();
+		wal.rotate().unwrap();
+
+		// Segment 1: a single batch whose own size exceeds `arena_size` -- what a live
+		// commit's direct-to-L0 path (`CoreInner::write_batch_direct_to_l0_sst`) would
+		// have durably written to the WAL before a crash.
+		let arena_size = 4096usize;
+		let big_value = vec![0xEFu8; arena_size * 2];
+		let mut batch1 = Batch::new(200);
+		batch1.set(b"key1".to_vec(), big_value.clone(), 0).unwrap();
+		wal.append(&batch1.encode().unwrap()).unwrap();
+		wal.close().unwrap();
+
+		let (max_seq_num_opt, memtables) = replay_wal(wal_dir, 0, arena_size).unwrap();
+
+		assert_eq!(max_seq_num_opt, Some(200));
+		assert_eq!(
+			memtables.len(),
+			2,
+			"expected one memtable for segment 0 and one oversized memtable for segment 1"
+		);
+
+		let (_ikey0, val0) = memtables
+			.iter()
+			.find_map(|(mt, _)| mt.get(b"key0", None))
+			.expect("key0 must be recovered");
+		assert_eq!(val0, b"value0".to_vec());
+
+		let (_ikey1, val1) = memtables
+			.iter()
+			.find_map(|(mt, _)| mt.get(b"key1", None))
+			.expect("key1 must be recovered");
+		assert_eq!(val1, big_value);
 	}
 }
