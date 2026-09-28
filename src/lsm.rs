@@ -332,21 +332,36 @@ impl CoreInner {
 	///
 	/// Used for batches that exceed `max_memtable_size` to avoid `ArenaFull` allocation
 	/// failures and unnecessary in-memory buffering.
+	///
+	/// `batch_wal_number` is the WAL segment number that `batch` was durably appended to
+	/// before this call (the caller must have already ensured that segment can never
+	/// receive another write — see `seal_active_wal_segment`). It is used to safely
+	/// advance the manifest's `log_number` so this WAL segment isn't replayed again on
+	/// the next restart, without skipping any *other* not-yet-flushed data that also
+	/// lives in that segment.
 	pub(crate) fn write_batch_direct_to_l0_sst(
 		&self,
 		batch: &Batch,
 		table_id: u64,
+		batch_wal_number: u64,
 	) -> Result<Arc<Table>> {
 		let table_file_path = self.opts.sstable_file_path(table_id);
 		let mut range_deletions = Vec::new();
 		let mut point_entries = Vec::new();
 
 		for (_, entry, seq_num, _) in batch.entries_with_seq_nums()? {
+			let ikey = crate::InternalKey::new(entry.key.clone(), seq_num, entry.kind);
 			if entry.kind == crate::InternalKeyKind::RangeDelete {
 				let end_key = entry.value.clone().unwrap_or_default();
-				range_deletions.push((entry.key.clone(), end_key, seq_num));
+				range_deletions.push((entry.key.clone(), end_key.clone(), seq_num));
+				// Range-delete entries are ALSO added as a point entry (start_key ->
+				// end_key), matching `MemTable::flush`'s behavior. Without this, the
+				// table's `smallest_point`/`largest_point` bounds (which range-scan
+				// pruning consults) would never cover the tombstone's start key, so a
+				// scan could skip this table entirely and resurrect data the tombstone
+				// was meant to hide.
+				point_entries.push((ikey, Some(end_key)));
 			} else {
-				let ikey = crate::InternalKey::new(entry.key.clone(), seq_num, entry.kind);
 				point_entries.push((ikey, entry.value.clone()));
 			}
 		}
@@ -388,11 +403,30 @@ impl CoreInner {
 			created_table.has_range_deletions.store(true, Ordering::Release);
 		}
 
-		// Atomically commit new L0 table to manifest
+		// Atomically commit new L0 table to manifest.
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&created_table)));
 
+		// Lock order: level_manifest -> immutable_memtables (matches flush_immutable_to_sst).
 		let mut manifest = self.level_manifest.write()?;
+
+		// Only advance `log_number` past `batch_wal_number` if no OLDER immutable
+		// memtable is still waiting to be flushed. `flush_immutable_to_sst` can bump
+		// `log_number` unconditionally because the immutable queue is always flushed
+		// oldest-first (so anything older is already gone by the time it runs); this
+		// path bypasses that queue entirely, so it must check explicitly. Getting this
+		// wrong in the other direction — advancing `log_number` while older data is
+		// still unflushed — would cause replay to silently skip that data after a
+		// crash, which is a strictly worse outcome than the replay-again-on-restart
+		// behavior this check exists to avoid.
+		let immutable_memtables = self.immutable_memtables.read()?;
+		let safe_to_advance_log_number =
+			immutable_memtables.first().is_none_or(|entry| entry.wal_number > batch_wal_number);
+		drop(immutable_memtables);
+		if safe_to_advance_log_number {
+			changeset.log_number = Some(batch_wal_number + 1);
+		}
+
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
 			manifest.revert_changeset(rollback);
@@ -484,6 +518,40 @@ impl CoreInner {
 		);
 
 		Ok(())
+	}
+
+	/// Ensures the WAL segment currently backing the active memtable can never receive
+	/// another write, and returns that WAL number.
+	///
+	/// Used before `write_batch_direct_to_l0_sst`, which advances `log_number` past the
+	/// returned WAL number once the batch is durably captured in a new L0 table. That
+	/// advance is only safe if no future write can land in the same WAL segment — this
+	/// method establishes that precondition. When the active memtable is non-empty,
+	/// `rotate_memtable` already does this as a side effect (it always rotates the WAL).
+	/// When the active memtable is empty, `rotate_memtable` is a no-op by design (to
+	/// avoid pointless WAL file churn), so this method rotates the WAL on its own instead.
+	pub(crate) fn seal_active_wal_segment(&self) -> Result<u64> {
+		// Hold the write lock for the whole check-and-rotate so no writer can land a
+		// batch in the segment we're about to seal in between the emptiness check and
+		// the rotation.
+		let active_memtable = self.active_memtable.write()?;
+		let sealed_wal_number = active_memtable.get_wal_number();
+
+		if !active_memtable.is_empty() {
+			drop(active_memtable);
+			self.rotate_memtable()?;
+			return Ok(sealed_wal_number);
+		}
+
+		let mut wal_guard = self.wal.write();
+		wal_guard.rotate().map_err(|e| {
+			Error::Other(format!("Failed to rotate WAL before direct-to-L0 flush: {}", e))
+		})?;
+		let new_wal_number = wal_guard.get_active_log_number();
+		drop(wal_guard);
+		active_memtable.set_wal_number(new_wal_number);
+
+		Ok(sealed_wal_number)
 	}
 
 	/// Flushes the oldest immutable memtable to an SSTable.
@@ -1103,8 +1171,27 @@ impl Core {
 			}
 		}
 
-		// Return the last memtable as the active one
+		// Return the last memtable as the active one — unless it's an oversized
+		// memtable that `replay_wal` allocated specifically to absorb a single batch
+		// that exceeded `arena_size` on its own (see the `ArenaFull` handling there).
+		// Such a memtable must never become the live active memtable: its capacity has
+		// nothing to do with `opts.max_memtable_size`, so it would silently blow
+		// through the configured memory bound for however long it stays active. Flush
+		// it immediately like the other recovered memtables instead.
 		let (last_memtable, last_wal_number) = memtables.into_iter().last().unwrap();
+		if last_memtable.arena_capacity() != arena_size {
+			tracing::debug!(
+				"Recovery: last memtable (wal={}) is oversized (arena_capacity={} != {}), \
+				flushing instead of activating",
+				last_wal_number,
+				last_memtable.arena_capacity(),
+				arena_size
+			);
+			if !last_memtable.is_empty() {
+				flush_memtable(last_memtable, last_wal_number)?;
+			}
+			return Ok((wal_seq_num_opt, None));
+		}
 		let entry_count = {
 			let mut iter = last_memtable.iter();
 			let mut count = 0;
