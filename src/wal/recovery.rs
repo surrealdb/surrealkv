@@ -35,15 +35,15 @@ impl Reporter for DefaultReporter {
 /// Applies `batch` to `current_memtable`, handling the case where it doesn't fit.
 ///
 /// On `Error::ArenaFull`:
-/// - If `current_memtable` is already empty, the batch alone exceeds `arena_size` (this
-///   happens when a live commit used the direct-to-L0 path for an oversized batch, see
-///   `CoreInner::write_batch_direct_to_l0_sst`, and a crash then forces WAL replay of
-///   that same batch). A dedicated memtable sized to fit exactly this batch is created
-///   and pushed to `memtables` so recovery can still succeed, instead of failing hard.
+/// - If `current_memtable` is already empty, the batch alone exceeds `arena_size` (this happens
+///   when a live commit used the direct-to-L0 path for an oversized batch, see
+///   `CoreInner::write_batch_direct_to_l0_sst`, and a crash then forces WAL replay of that same
+///   batch). A dedicated memtable sized to fit exactly this batch is created and pushed to
+///   `memtables` so recovery can still succeed, instead of failing hard.
 /// - Otherwise, `current_memtable` is pushed to `memtables` as-is and a fresh,
-///   `arena_size`-capacity memtable is created and the batch retried on it; if the batch
-///   still doesn't fit on a fresh, empty memtable, the oversized-memtable fallback above
-///   is applied to it instead.
+///   `arena_size`-capacity memtable is created and the batch retried on it; if the batch still
+///   doesn't fit on a fresh, empty memtable, the oversized-memtable fallback above is applied to it
+///   instead.
 ///
 /// Returns the memtable that should keep receiving subsequent batches for this segment
 /// (either `current_memtable` unchanged, or a fresh `arena_size`-capacity replacement).
