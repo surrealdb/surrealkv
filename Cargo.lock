@@ -246,9 +246,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "byteslice"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8330fa105fc493ba2c0f1e8f7a31201717ceffbf8b66dd3079e4a4c1ea20e097"
+checksum = "6eac0430a792a6df8f9bbb45667e9e6a6976beba6dad9fa2c0e98d86b6bde618"
 dependencies = [
  "bytes",
  "serde",
