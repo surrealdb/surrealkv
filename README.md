@@ -41,7 +41,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 | Fjall | 1,022,000 | 1,064 | 1,145 | 898 | 43 |
 | ReDB | — | — | — | — | — |
 | LMDB | 1,269,373 | 694 | 701 | 703 | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1,007** |
-| Libmdbx | — | — | — | — | — |
+| Libmdbx | 627,955 | 706 | 712 | 674 | 925 |
 
 - **Creates (Writes)**: **219,545 OPS** (**6.24× faster** than RocksDB, **26.5× faster** than SlateDB, and **206× faster** than Fjall) under synchronous disk persistence.
 - **Updates**: **199,730 OPS** (**5.43× faster** than RocksDB, **24.5× faster** than SlateDB, and **174× faster** than Fjall) with lock-free group commit.
@@ -61,7 +61,7 @@ Resting and peak memory are the lowest and highest process memory sampled across
 | Fjall | ~935 MB | 2.34 GB |
 | ReDB | — | — |
 | LMDB | ~1.06 GB | 1.38 GB |
-| Libmdbx | — | — |
+| Libmdbx | ~1.01 GB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.22 GB** |
 
 - **Resting Footprint**: **~611 MB** at rest, between SlateDB (**~406 MB**) and RocksDB (**~741 MB**).
 - **Dynamic Scaling**: Peak memory expands dynamically under high concurrency to buffer active batches during parallel commits, then contracts back to resting baseline.
