@@ -35,31 +35,33 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Engine | Point&nbsp;Read&nbsp;(OPS) | Create&nbsp;(OPS) | Update&nbsp;(OPS) | Delete&nbsp;(OPS) | Scan&nbsp;(OPS) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1,225,078** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**102,717** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**101,961** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**98,283** | 8,361 |
-| RocksDB | 692,597 | 31,777 | 33,228 | 34,563 | 2,406 |
-| Fjall | 767,353 | 1,327 | 1,315 | 1,173 | 385 |
-| SlateDB | 273,033 | 8,433 | 8,393 | 8,339 | 1,080 |
-| LMDB | 896,110 | 695 | 704 | 705 | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**27,446** |
-| Libmdbx | 264,133 | 697 | 701 | 681 | 16,005 |
+| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1,289,478** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**99,482** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**104,183** | 11,844 | 6,360 |
+| RocksDB | 692,257 | 34,233 | 35,652 | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**36,440** | 2,447 |
+| Fjall | 848,857 | 1,351 | 1,219 | 1,180 | 379 |
+| SlateDB | 279,526 | 9,039 | 8,792 | 8,847 | 1,109 |
+| LMDB | 924,010 | 692 | 701 | 704 | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**26,946** |
+| Libmdbx | 294,190 | 687 | 709 | 640 | 21,911 |
 
-- **Creates (Writes)**: **102,717 OPS** (**3.23× faster** than RocksDB, **12.2× faster** than SlateDB, and **77× faster** than Fjall) under synchronous disk persistence.
-- **Updates**: **101,961 OPS** (**3.07× faster** than RocksDB, **12.1× faster** than SlateDB, and **78× faster** than Fjall) with lock-free group commit.
-- **Point Reads**: **1.23M OPS** sustained: the fastest point-read throughput among all disk-backed engines tested (**1.77× faster** than RocksDB, **4.49× faster** than SlateDB).
-- **Deletes**: **98,283 OPS** (**2.84× faster** than RocksDB and **11.8× faster** than SlateDB) via high-efficiency tombstone append buffering.
-- **Range Scans**: **3.47× faster** than RocksDB and **7.74× faster** than SlateDB via zero-copy iterator merges and block-level restart points.
+- **Creates (Writes)**: **99,482 OPS** (**2.91× faster** than RocksDB, **11.0× faster** than SlateDB, and **74× faster** than Fjall) under synchronous disk persistence.
+- **Updates**: **104,183 OPS** (**2.92× faster** than RocksDB, **11.8× faster** than SlateDB, and **85× faster** than Fjall) with lock-free group commit.
+- **Point Reads**: **1.29M OPS** sustained: the fastest point-read throughput among all engines tested (**1.86× faster** than RocksDB, **1.40× faster** than LMDB, and **4.61× faster** than SlateDB).
+- **Deletes**: **11,844 OPS** (**1.34× faster** than SlateDB and **10× faster** than Fjall, but **3.1× slower** than RocksDB).
+- **Range Scans**: **2.60× faster** than RocksDB and **5.73× faster** than SlateDB via zero-copy iterator merges and block-level restart points.
 
 ### Memory Profile
 
+Resting and peak memory are the lowest and highest process memory sampled across the whole benchmark run.
+
 | Engine | Resting&nbsp;Memory | Peak&nbsp;Memory |
 | :--- | ---: | ---: |
-| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**~328 MB** | 1.10 GB |
-| RocksDB | ~356 MB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**393 MB** |
-| Fjall | ~405 MB | 674 MB |
-| SlateDB | ~449 MB | 1.71 GB |
-| LMDB | ~421 MB | 558 MB |
-| Libmdbx | ~373 MB | 616 MB |
+| **SurrealKV** | ~353 MB | 1.58 GB |
+| RocksDB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**~294 MB** | 1.10 GB |
+| Fjall | ~422 MB | 1.13 GB |
+| SlateDB | ~380 MB | 1.84 GB |
+| LMDB | ~382 MB | 877 MB |
+| Libmdbx | ~438 MB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**857 MB** |
 
-- **Resting Footprint**: Lowest idle memory footprint at **~328 MB**.
+- **Resting Footprint**: **~353 MB** at rest, the second-lowest of the engines tested after RocksDB (**~294 MB**).
 - **Dynamic Scaling**: Peak memory expands dynamically under high concurrency to buffer active batches during parallel commits, then contracts back to resting baseline.
 
 ---
