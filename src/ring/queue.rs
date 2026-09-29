@@ -1,24 +1,65 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use parking_lot::RwLock;
+use parking_lot::Mutex;
+use tokio::sync::{oneshot, OwnedSemaphorePermit};
 
 use super::bloom::BloomFilter;
+use super::commit_ring::RingEntry;
+use crate::batch::Batch;
+use crate::error::Result;
 use crate::Key;
 
-/// An entry in the OCC commit queue representing a committed (or in-flight) transaction.
+/// The committer is still validating: the entry may yet commit or abort.
+const IN_FLIGHT: u64 = 0;
+/// Validated and queued for the flusher, but not yet visible.
+const ACCEPTED: u64 = u64::MAX - 1;
+/// Aborted by a conflict, failed to flush, or a locked-read check that
+/// publishes no writes.
+const ABORTED: u64 = u64::MAX;
+// Any other state is the highest LSM sequence number of a commit that is
+// durable and visible (sequence numbers start at 1).
+
+/// Where a commit entry is in its lifecycle, as the flusher sees it.
+pub(crate) enum EntryState {
+	InFlight,
+	Accepted,
+	Complete,
+}
+
+/// What the flusher needs to make an accepted commit durable.
+pub(crate) struct Payload {
+	pub(crate) batch: Batch,
+	pub(crate) sync: bool,
+	pub(crate) complete_tx: oneshot::Sender<Result<()>>,
+	/// The restore epoch the commit was accepted in.
+	pub(crate) epoch: u64,
+}
+
+/// One transaction's slot in the commit ring: its write set for conflict
+/// detection, and its batch until the flusher takes it.
 pub(crate) struct CommitEntry {
-	pub(crate) seq_num: u64,
-	/// Sorted write keys for exact conflict checks if bloom filter matches.
-	pub(crate) keys: Arc<[Key]>,
-	/// Bloom filter over write keys for fast pre-checks.
-	pub(crate) bloom: BloomFilter,
-	/// Indicates whether this transaction aborted.
-	pub(crate) aborted: bool,
+	/// Sorted, deduplicated write keys for exact conflict checks.
+	keys: Box<[Key]>,
+	/// Bloom filter over the write keys for fast pre-checks.
+	bloom: BloomFilter,
+	/// `IN_FLIGHT`, `ACCEPTED`, `ABORTED`, or the visible commit's highest
+	/// sequence number.
+	state: AtomicU64,
+	/// Set before the entry is accepted, and taken by the flusher.
+	payload: Mutex<Option<Payload>>,
+	/// The committer's admission permit, released by the flusher only once
+	/// the ring's completed prefix has passed this entry.
+	permit: Mutex<Option<OwnedSemaphorePermit>>,
+}
+
+impl RingEntry for CommitEntry {
+	fn is_complete(&self) -> bool {
+		!matches!(self.state.load(Ordering::SeqCst), IN_FLIGHT | ACCEPTED)
+	}
 }
 
 impl CommitEntry {
-	pub(crate) fn new(seq_num: u64, mut keys: Vec<Key>) -> Self {
+	pub(crate) fn new(mut keys: Vec<Key>, permit: OwnedSemaphorePermit) -> Self {
 		keys.sort();
 		keys.dedup();
 		let mut bloom = BloomFilter::new();
@@ -26,11 +67,64 @@ impl CommitEntry {
 			bloom.insert(k);
 		}
 		Self {
-			seq_num,
-			keys: keys.into(),
+			keys: keys.into_boxed_slice(),
 			bloom,
-			aborted: false,
+			state: AtomicU64::new(IN_FLIGHT),
+			payload: Mutex::new(None),
+			permit: Mutex::new(Some(permit)),
 		}
+	}
+
+	pub(crate) fn keys(&self) -> &[Key] {
+		&self.keys
+	}
+
+	pub(crate) fn bloom(&self) -> &BloomFilter {
+		&self.bloom
+	}
+
+	pub(crate) fn state(&self) -> EntryState {
+		match self.state.load(Ordering::SeqCst) {
+			IN_FLIGHT => EntryState::InFlight,
+			ACCEPTED => EntryState::Accepted,
+			_ => EntryState::Complete,
+		}
+	}
+
+	/// Whether a transaction whose snapshot is `snapshot_seq` can ignore this
+	/// entry: it aborted, or it was already visible to the snapshot.
+	pub(crate) fn is_ignorable_at(&self, snapshot_seq: u64) -> bool {
+		match self.state.load(Ordering::SeqCst) {
+			ABORTED => true,
+			IN_FLIGHT | ACCEPTED => false,
+			max_seq => max_seq <= snapshot_seq,
+		}
+	}
+
+	/// Hands the batch to the flusher. The payload is stored before the state,
+	/// so a flusher that observes `ACCEPTED` always finds it.
+	pub(crate) fn accept(&self, payload: Payload) {
+		*self.payload.lock() = Some(payload);
+		self.state.store(ACCEPTED, Ordering::SeqCst);
+	}
+
+	pub(crate) fn abort(&self) {
+		self.state.store(ABORTED, Ordering::SeqCst);
+	}
+
+	/// Marks a durable, applied commit visible at `max_seq`. Must only be
+	/// called after `visible_seq_num` has covered `max_seq`.
+	pub(crate) fn make_visible(&self, max_seq: u64) {
+		debug_assert!(max_seq != IN_FLIGHT && max_seq < ACCEPTED);
+		self.state.store(max_seq, Ordering::SeqCst);
+	}
+
+	pub(crate) fn take_payload(&self) -> Option<Payload> {
+		self.payload.lock().take()
+	}
+
+	pub(crate) fn take_permit(&self) -> Option<OwnedSemaphorePermit> {
+		self.permit.lock().take()
 	}
 
 	/// Checks if this commit's write set is disjoint from another write set.
@@ -67,84 +161,6 @@ impl CommitEntry {
 
 	/// Checks if this commit's write set is disjoint from a read set.
 	pub(crate) fn is_disjoint_readset(&self, read_keys: &[Key], read_bloom: &BloomFilter) -> bool {
-		if self.bloom.is_empty() || read_bloom.is_empty() {
-			return true;
-		}
-
-		let mut any_possible = false;
-		for k in self.keys.iter() {
-			if read_bloom.may_contain(k) {
-				any_possible = true;
-				break;
-			}
-		}
-		if !any_possible {
-			return true;
-		}
-
-		for k in read_keys {
-			if self.keys.binary_search(k).is_ok() {
-				return false;
-			}
-		}
-
-		true
-	}
-}
-
-/// An OCC commit queue tracking recent commits using concurrent BTreeMap.
-pub(crate) struct CommitQueue {
-	queue: RwLock<BTreeMap<u64, Arc<CommitEntry>>>,
-}
-
-impl CommitQueue {
-	pub(crate) fn new() -> Self {
-		Self {
-			queue: RwLock::new(BTreeMap::new()),
-		}
-	}
-
-	/// Inserts a new commit entry into the queue.
-	pub(crate) fn insert(&self, entry: Arc<CommitEntry>) {
-		self.queue.write().insert(entry.seq_num, entry);
-	}
-
-	/// Checks if the given write and read sets conflict with any commits in (from_seq..to_seq].
-	pub(crate) fn check_conflicts(
-		&self,
-		from_seq: u64,
-		to_seq: u64,
-		write_keys: &[Key],
-		write_bloom: &BloomFilter,
-		read_keys: &[Key],
-		read_bloom: &BloomFilter,
-	) -> bool {
-		let queue = self.queue.read();
-		for (_, committed) in queue.range(from_seq + 1..=to_seq) {
-			if committed.aborted {
-				continue;
-			}
-
-			// Check write-write conflicts
-			if !write_keys.is_empty() && !committed.is_disjoint_writeset(write_keys, write_bloom) {
-				return false; // Conflict detected
-			}
-
-			// Check read-write conflicts (for locked reads / serializable validation)
-			if !read_keys.is_empty() && !committed.is_disjoint_readset(read_keys, read_bloom) {
-				return false; // Conflict detected
-			}
-		}
-
-		true // No conflicts
-	}
-
-	/// Trims the queue, removing entries older than `min_active_seq`.
-	pub(crate) fn prune(&self, min_active_seq: u64) {
-		let mut queue = self.queue.write();
-		let keys_to_remove: Vec<u64> = queue.range(..min_active_seq).map(|(&k, _)| k).collect();
-		for k in keys_to_remove {
-			queue.remove(&k);
-		}
+		self.is_disjoint_writeset(read_keys, read_bloom)
 	}
 }

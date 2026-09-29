@@ -15,6 +15,8 @@ pub mod batch_tests;
 #[cfg(test)]
 pub mod block_tests;
 #[cfg(test)]
+pub mod commit_pipeline_tests;
+#[cfg(test)]
 pub mod compaction_memory_proofs;
 #[cfg(test)]
 pub mod compaction_tests;

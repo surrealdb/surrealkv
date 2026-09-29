@@ -35,18 +35,18 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Engine | Point&nbsp;Read&nbsp;(OPS) | Create&nbsp;(OPS) | Update&nbsp;(OPS) | Delete&nbsp;(OPS) | Scan&nbsp;(OPS) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1,289,478** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**99,482** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**104,183** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**84,034** | 6,360 |
+| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1,440,502** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**156,638** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**177,110** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**225,318** | 8,356 |
 | RocksDB | 692,257 | 34,233 | 35,652 | 36,440 | 2,447 |
 | Fjall | 848,857 | 1,351 | 1,219 | 1,180 | 379 |
 | SlateDB | 279,526 | 9,039 | 8,792 | 8,847 | 1,109 |
 | LMDB | 924,010 | 692 | 701 | 704 | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**26,946** |
 | Libmdbx | 294,190 | 687 | 709 | 640 | 21,911 |
 
-- **Creates (Writes)**: **99,482 OPS** (**2.91× faster** than RocksDB, **11.0× faster** than SlateDB, and **74× faster** than Fjall) under synchronous disk persistence.
-- **Updates**: **104,183 OPS** (**2.92× faster** than RocksDB, **11.8× faster** than SlateDB, and **85× faster** than Fjall) with lock-free group commit.
-- **Point Reads**: **1.29M OPS** sustained: the fastest point-read throughput among all engines tested (**1.86× faster** than RocksDB, **1.40× faster** than LMDB, and **4.61× faster** than SlateDB).
-- **Deletes**: **84,034 OPS** (**2.31× faster** than RocksDB, **9.50× faster** than SlateDB, and **71× faster** than Fjall).
-- **Range Scans**: **2.60× faster** than RocksDB and **5.73× faster** than SlateDB via zero-copy iterator merges and block-level restart points.
+- **Creates (Writes)**: **156,638 OPS** (**4.58× faster** than RocksDB, **17.3× faster** than SlateDB, and **116× faster** than Fjall) under synchronous disk persistence.
+- **Updates**: **177,110 OPS** (**4.97× faster** than RocksDB, **20.1× faster** than SlateDB, and **145× faster** than Fjall) with lock-free group commit.
+- **Point Reads**: **1.44M OPS** sustained: the fastest point-read throughput among all engines tested (**2.08× faster** than RocksDB, **1.56× faster** than LMDB, and **5.15× faster** than SlateDB).
+- **Deletes**: **225,318 OPS** (**6.18× faster** than RocksDB, **25.5× faster** than SlateDB, and **191× faster** than Fjall).
+- **Range Scans**: **3.42× faster** than RocksDB and **7.53× faster** than SlateDB via zero-copy iterator merges and block-level restart points.
 
 ### Memory Profile
 
@@ -54,7 +54,7 @@ Resting and peak memory are the lowest and highest process memory sampled across
 
 | Engine | Resting&nbsp;Memory | Peak&nbsp;Memory |
 | :--- | ---: | ---: |
-| **SurrealKV** | ~353 MB | 1.58 GB |
+| **SurrealKV** | ~353 MB | 1.50 GB |
 | RocksDB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**~294 MB** | 1.10 GB |
 | Fjall | ~422 MB | 1.13 GB |
 | SlateDB | ~380 MB | 1.84 GB |

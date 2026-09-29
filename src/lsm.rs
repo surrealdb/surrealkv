@@ -118,11 +118,11 @@ pub(crate) struct CoreInner {
 	/// snapshot-aware compaction.
 	pub(crate) snapshot_tracker: SnapshotTracker,
 
-	/// Tracker for ALL active transaction `start_seq_num`s. Used as the
-	/// watermark source for `CommitOracle` GC. Separate from
-	/// `snapshot_tracker` because write-only txns need GC protection but
-	/// don't hold MVCC snapshots, and the oracle's required watermark may
-	/// advance faster than snapshot retention permits.
+	/// Pins held by every live mutating transaction on the commit ring's
+	/// retired watermark, so the ring entries in their conflict windows stay
+	/// reachable. Separate from `snapshot_tracker` because write-only txns
+	/// need this protection but don't hold MVCC snapshots, and read-only txns
+	/// hold snapshots but never commit.
 	pub(crate) active_txn_tracker: Arc<crate::tracker::ActiveTxnTracker>,
 
 	/// Value Log (VLog)
@@ -209,29 +209,6 @@ impl CoreInner {
 			.read()
 			.map(|m| m.levels.get_levels().first().map(|l| l.tables.len()).unwrap_or(0))
 			.unwrap_or(0)
-	}
-
-	/// Smallest `start_seq_num` of any currently-live transaction (read-write
-	/// snapshot OR write-only). Used by the `CommitOracle` as its GC
-	/// threshold: entries with `committed_seq < oldest_active_start_seq` can
-	/// be discarded because no live txn could prove non-conflict against them.
-	///
-	/// If no txns are alive, falls back to `visible_seq_num`. NOTE: this
-	/// fallback is unsafe-by-default — if a caller drives `Core::commit`
-	/// without first registering in `active_txn_tracker`, the fallback may
-	/// exceed that caller's snapshot. The commit pipeline clamps the value
-	/// returned here by the committing txn's `start_seq` (see
-	/// `CommitPipeline::commit`), which neutralizes the fallback for all
-	/// production paths.
-	pub(crate) fn oldest_active_start_seq(&self) -> u64 {
-		let snap = self.snapshot_tracker.first();
-		let txn = self.active_txn_tracker.oldest();
-		match (snap, txn) {
-			(Some(a), Some(b)) => a.min(b),
-			(Some(a), None) => a,
-			(None, Some(b)) => b,
-			(None, None) => self.visible_seq_num.load(Ordering::Acquire),
-		}
 	}
 
 	/// Flushes a memtable to SST and atomically updates the manifest.
@@ -1349,22 +1326,28 @@ impl Core {
 		batch: Batch,
 		sync: bool,
 		start_seq: u64,
+		window: u64,
 		read_set: &[Key],
 	) -> Result<()> {
 		// Commit the batch using the commit pipeline. `start_seq` is the
-		// transaction's snapshot seq (used by the oracle's write-write
-		// conflict check). The write keys are derived from `batch.entries`
-		// inside the pipeline — no duplicated parallel array. `read_set`
-		// carries locked-read keys that join the conflict check without
-		// being written.
-		self.commit_pipeline.commit(batch, sync, start_seq, read_set).await
+		// transaction's snapshot seq and `window` the start of its conflict
+		// window in the commit ring. The write keys are derived from
+		// `batch.entries` inside the pipeline — no duplicated parallel array.
+		// `read_set` carries locked-read keys that join the conflict check
+		// without being written.
+		self.commit_pipeline.commit(batch, sync, start_seq, window, read_set).await
 	}
 
-	pub(crate) fn check_conflicts(&self, keys: &[Key], start_seq: u64) -> Result<()> {
-		// Validate locked-read keys against the commit oracle without
-		// writing anything. Used by transactions whose commit carries only
-		// locked reads.
-		self.commit_pipeline.check_conflicts(keys, start_seq)
+	pub(crate) async fn check_conflicts(
+		&self,
+		keys: &[Key],
+		start_seq: u64,
+		window: u64,
+	) -> Result<()> {
+		// Validate locked-read keys against the commit ring without writing
+		// anything. Used by transactions whose commit carries only locked
+		// reads.
+		self.commit_pipeline.check_conflicts(keys, start_seq, window).await
 	}
 
 	pub(crate) fn seq_num(&self) -> u64 {

@@ -124,11 +124,6 @@ impl SnapshotTracker {
 		snapshots.dedup();
 		snapshots
 	}
-
-	/// Returns the smallest active snapshot seq, if any.
-	pub(crate) fn first(&self) -> Option<u64> {
-		self.shards.iter().filter_map(|shard| shard.read().keys().next().copied()).min()
-	}
 }
 
 // ===== Iterator State =====
