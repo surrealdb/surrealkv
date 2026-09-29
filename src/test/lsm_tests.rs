@@ -2888,7 +2888,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 	let path = temp_dir.path().to_path_buf();
 
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 1024;
+		opts.max_memtable_size = 4096;
 	});
 
 	let sst_dir = opts.sstable_dir();
@@ -3679,7 +3679,7 @@ async fn test_manifest_atomic_sst_and_log_number() {
 
 	// Use tiny threshold to ensure flush happens
 	let opts = create_test_options(path.clone(), |opts| {
-		opts.max_memtable_size = 1024;
+		opts.max_memtable_size = 4096;
 	});
 
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();

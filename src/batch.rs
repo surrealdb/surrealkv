@@ -179,8 +179,8 @@ impl Batch {
 		self.entries.is_empty()
 	}
 
-	/// Upper bound on the bytes this batch would consume in a memtable's skiplist arena.
-	/// Uses the worst-case per-entry overhead (max skiplist height + alignment padding),
+	/// Upper bound on the bytes this batch would consume in a memtable's arena.
+	/// Uses artmap's worst-case per-insert cost (see `memtable::max_entry_bytes`),
 	/// so the actual allocation cannot exceed this. Used by `MemTable::add` for atomic
 	/// preflight reservation.
 	pub(crate) fn memtable_size_estimate(&self) -> u64 {

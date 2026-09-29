@@ -3,13 +3,16 @@ use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use artmap::arena::node::VersionedLeaf;
-use artmap::arena::versioned_iter::ArenaVersionedRange;
-use artmap::arena::ArenaVersionedArtMap;
+use artmap::arena::{ArenaVersionedArtMap, ArenaVersionedEntryRef, ArenaVersionedRange};
 
+/// Upper bound on what one entry costs a memtable: the worst-case arena bytes
+/// of one insert (as reported by artmap) plus the value length. Keys and
+/// values live on the heap, so the value term is not arena space; it keeps
+/// the estimate proportional to the logical batch size, which is what the
+/// direct-to-L0 cutoff for oversized batches compares against.
 #[inline]
 pub(crate) const fn max_entry_bytes(key_len: usize, value_len: usize) -> u64 {
-	191 + key_len as u64 + value_len as u64
+	ArenaVersionedArtMap::<Key, Value>::max_insert_bytes(key_len) as u64 + value_len as u64
 }
 
 use crate::batch::Batch;
@@ -88,8 +91,15 @@ impl ImmutableMemtables {
 pub(crate) struct MemTable {
 	map: ArenaVersionedArtMap<Key, Value>,
 	latest_seq_num: AtomicU64,
+	/// WAL number that was current when this memtable started receiving writes.
+	/// Used to determine which WALs can be safely deleted after flush.
 	wal_number: AtomicU64,
+	/// Bytes reserved by in-flight `add` calls but not yet allocated in the
+	/// arena. Atomically updated by `try_reserve` / `release_reservation`
+	/// to ensure batch-atomic insertion: a batch either fits entirely (reservation
+	/// succeeds) or the memtable is left unchanged (reservation fails with ArenaFull).
 	reserved: AtomicU64,
+	/// Tracked range tombstones: (start_key, end_key, seq_num)
 	pub(crate) range_deletions: parking_lot::RwLock<Vec<(Key, Key, u64)>>,
 	pub(crate) has_range_deletions: std::sync::atomic::AtomicBool,
 }
@@ -188,7 +198,7 @@ impl MemTable {
 		self.map.arena().size()
 	}
 
-	/// Arena capacity in bytes (total, including sentinel overhead).
+	/// Arena capacity in bytes (total, including artmap's 64-byte null region).
 	pub(crate) fn arena_capacity(&self) -> usize {
 		self.map.arena().capacity()
 	}
@@ -296,16 +306,24 @@ impl MemTable {
 	/// Inserts a key-value pair into the memtable.
 	///
 	/// `MemTable::add` reserves arena space via `try_reserve` before calling this,
-	/// so `SkiplistError::ArenaFull` here would indicate the size estimator drifted
-	/// from the actual skiplist node size. We assert in debug, and fall through to
+	/// so `ArenaFull` here would indicate the size estimator drifted from
+	/// artmap's `max_insert_bytes`. We assert in debug, and fall through to
 	/// returning `ArenaFull` in release so the upstream rotate-and-retry path stays
 	/// as a safety net rather than corrupting state via panic.
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
 		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
-		if !self.map.insert_versioned(key.user_key.clone(), trailer, value.clone()) {
-			return Err(crate::Error::ArenaFull);
+		match self.map.try_insert(key.user_key.clone(), trailer, value.clone()) {
+			Ok(()) => Ok(()),
+			Err(_) => {
+				debug_assert!(
+					false,
+					"ArenaFull inside insert_into_memtable after a successful try_reserve; \
+					memtable_size_estimate is out of sync with the artmap arena"
+				);
+				tracing::error!("ArenaFull after reservation; memtable size estimator drift");
+				Err(crate::Error::ArenaFull)
+			}
 		}
-		Ok(())
 	}
 
 	/// Updates the latest sequence number in the memtable.
@@ -404,15 +422,10 @@ impl MemTable {
 		lower: Option<&[u8]>, // Inclusive, None = unbounded
 		upper: Option<&[u8]>, // Exclusive, None = unbounded
 	) -> MemTableIterator<'_> {
-		let start = match lower {
-			Some(l) => Bound::Included(l.to_vec()),
-			None => Bound::Unbounded,
-		};
-		let end = match upper {
-			Some(u) => Bound::Excluded(u.to_vec()),
-			None => Bound::Unbounded,
-		};
-		let range = self.map.range((start, end));
+		let range = self.map.range::<_, [u8]>((
+			lower.map_or(Bound::Unbounded, Bound::Included),
+			upper.map_or(Bound::Unbounded, Bound::Excluded),
+		));
 
 		let mut miter = MemTableIterator {
 			map: &self.map,
@@ -420,7 +433,7 @@ impl MemTable {
 			upper: upper.map(|u| u.to_vec()),
 			range,
 			direction: IterDirection::Forward,
-			current_user_key: None,
+			current_key: None,
 			current_versions: Vec::new(),
 			version_idx: 0,
 			encoded_key_buf: Vec::new(),
@@ -470,44 +483,69 @@ enum IterDirection {
 	Backward,
 }
 
+fn lower_bound(lower: &Option<Vec<u8>>) -> Bound<&[u8]> {
+	lower.as_deref().map_or(Bound::Unbounded, Bound::Included)
+}
+
+fn upper_bound(upper: &Option<Vec<u8>>) -> Bound<&[u8]> {
+	upper.as_deref().map_or(Bound::Unbounded, Bound::Excluded)
+}
+
+/// Iterates a memtable in internal-key order: user keys ascending, and each
+/// key's versions by trailer descending.
+///
+/// The artmap range yields one entry per user key; the cursor expands it into
+/// that key's version chain (captured when the entry was read, so concurrent
+/// inserts never reorder it) and steps through the versions before moving to
+/// the neighbouring key. Changing direction re-anchors the range just past the
+/// current key.
 pub(crate) struct MemTableIterator<'a> {
 	map: &'a ArenaVersionedArtMap<Key, Value>,
 	lower: Option<Vec<u8>>,
 	upper: Option<Vec<u8>>,
 	range: ArenaVersionedRange<'a, Key, Value>,
 	direction: IterDirection,
-	current_user_key: Option<Vec<u8>>,
-	current_versions: Vec<*const VersionedLeaf<Key, Value>>,
+	current_key: Option<&'a Key>,
+	/// `(trailer, value)` for each version of `current_key`, newest first.
+	current_versions: Vec<(u64, &'a Value)>,
 	version_idx: usize,
 	encoded_key_buf: Vec<u8>,
 }
 
 impl<'a> MemTableIterator<'a> {
-	fn collect_versions(&mut self, head_ptr: *const VersionedLeaf<Key, Value>) {
+	/// Positions the cursor on `entry`: on its newest version when moving
+	/// forward, its oldest when moving backward. Clears the cursor on `None`.
+	fn position(&mut self, entry: Option<ArenaVersionedEntryRef<'a, Key, Value>>) -> bool {
+		let Some(entry) = entry else {
+			self.clear_cursor();
+			return false;
+		};
+		self.current_key = Some(entry.key());
 		self.current_versions.clear();
-		let mut cur = head_ptr;
-		while !cur.is_null() {
-			let leaf = unsafe { &*cur };
-			self.current_versions.push(cur);
-			let next_off = leaf.next_version_offset.load(Ordering::Acquire) & !1;
-			if next_off == 0 {
-				break;
-			}
-			cur = self.map.arena().get_pointer(next_off) as *const VersionedLeaf<Key, Value>;
-		}
+		// Deletes are encoded in the trailer and stored as ordinary values, so
+		// the chain never holds an artmap tombstone; the filter is only a guard.
+		self.current_versions
+			.extend(entry.versions().filter_map(|v| v.value.map(|val| (v.version, val))));
+		self.version_idx = match self.direction {
+			IterDirection::Forward => 0,
+			IterDirection::Backward => self.current_versions.len().saturating_sub(1),
+		};
+		self.populate_encoded_key();
+		self.valid()
 	}
 
 	fn populate_encoded_key(&mut self) {
 		self.encoded_key_buf.clear();
-		if let Some(&leaf_ptr) = self.current_versions.get(self.version_idx) {
-			let leaf = unsafe { &*leaf_ptr };
-			self.encoded_key_buf.extend_from_slice(leaf.key.as_slice());
-			self.encoded_key_buf.extend_from_slice(&leaf.version.to_be_bytes());
+		if let (Some(key), Some(&(trailer, _))) =
+			(self.current_key, self.current_versions.get(self.version_idx))
+		{
+			self.encoded_key_buf.extend_from_slice(key);
+			self.encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 		}
 	}
 
 	fn clear_cursor(&mut self) {
-		self.current_user_key = None;
+		self.current_key = None;
 		self.current_versions.clear();
 		self.version_idx = 0;
 		self.encoded_key_buf.clear();
@@ -523,42 +561,22 @@ impl LSMIterator for MemTableIterator<'_> {
 			u64::MAX
 		};
 
-		let start_key = match &self.lower {
-			Some(l) if target_user_key < l.as_slice() => l.clone(),
-			_ => target_user_key.to_vec(),
+		let start = match self.lower.as_deref() {
+			Some(l) if target_user_key < l => l,
+			_ => target_user_key,
 		};
-
-		let end = match &self.upper {
-			Some(u) => Bound::Excluded(u.clone()),
-			None => Bound::Unbounded,
-		};
-
-		self.range = self.map.range((Bound::Included(start_key), end));
+		self.range = self.map.range::<_, [u8]>((Bound::Included(start), upper_bound(&self.upper)));
 		self.direction = IterDirection::Forward;
 
 		while let Some(entry) = self.range.next() {
-			let k = entry.key().as_slice();
-			self.collect_versions(entry.leaf_ptr());
-			self.current_user_key = Some(entry.key().clone());
-
-			if k == target_user_key {
-				let mut found_idx = None;
-				for (idx, &leaf_ptr) in self.current_versions.iter().enumerate() {
-					let leaf = unsafe { &*leaf_ptr };
-					if leaf.version <= target_trailer {
-						found_idx = Some(idx);
-						break;
-					}
-				}
-
-				if let Some(idx) = found_idx {
-					self.version_idx = idx;
-					self.populate_encoded_key();
-					return Ok(true);
-				}
-				continue;
-			} else {
-				self.version_idx = 0;
+			self.position(Some(entry));
+			if entry.key().as_slice() != target_user_key {
+				return Ok(true);
+			}
+			// Same user key: skip versions newer than the target trailer.
+			if let Some(idx) = self.current_versions.iter().position(|&(t, _)| t <= target_trailer)
+			{
+				self.version_idx = idx;
 				self.populate_encoded_key();
 				return Ok(true);
 			}
@@ -569,49 +587,19 @@ impl LSMIterator for MemTableIterator<'_> {
 	}
 
 	fn seek_first(&mut self) -> Result<bool> {
-		let start = match &self.lower {
-			Some(l) => Bound::Included(l.clone()),
-			None => Bound::Unbounded,
-		};
-		let end = match &self.upper {
-			Some(u) => Bound::Excluded(u.clone()),
-			None => Bound::Unbounded,
-		};
-		self.range = self.map.range((start, end));
+		self.range =
+			self.map.range::<_, [u8]>((lower_bound(&self.lower), upper_bound(&self.upper)));
 		self.direction = IterDirection::Forward;
-		if let Some(entry) = self.range.next() {
-			self.current_user_key = Some(entry.key().clone());
-			self.collect_versions(entry.leaf_ptr());
-			self.version_idx = 0;
-			self.populate_encoded_key();
-			Ok(true)
-		} else {
-			self.clear_cursor();
-			Ok(false)
-		}
+		let entry = self.range.next();
+		Ok(self.position(entry))
 	}
 
 	fn seek_last(&mut self) -> Result<bool> {
-		let start = match &self.lower {
-			Some(l) => Bound::Included(l.clone()),
-			None => Bound::Unbounded,
-		};
-		let end = match &self.upper {
-			Some(u) => Bound::Excluded(u.clone()),
-			None => Bound::Unbounded,
-		};
-		self.range = self.map.range((start, end));
+		self.range =
+			self.map.range::<_, [u8]>((lower_bound(&self.lower), upper_bound(&self.upper)));
 		self.direction = IterDirection::Backward;
-		if let Some(entry) = self.range.next_back() {
-			self.current_user_key = Some(entry.key().clone());
-			self.collect_versions(entry.leaf_ptr());
-			self.version_idx = self.current_versions.len().saturating_sub(1);
-			self.populate_encoded_key();
-			Ok(true)
-		} else {
-			self.clear_cursor();
-			Ok(false)
-		}
+		let entry = self.range.next_back();
+		Ok(self.position(entry))
 	}
 
 	fn next(&mut self) -> Result<bool> {
@@ -625,27 +613,16 @@ impl LSMIterator for MemTableIterator<'_> {
 			return Ok(true);
 		}
 
-		let cur_key = self.current_user_key.as_ref().unwrap();
-
 		if matches!(self.direction, IterDirection::Backward) {
-			let end = match &self.upper {
-				Some(u) => Bound::Excluded(u.clone()),
-				None => Bound::Unbounded,
-			};
-			self.range = self.map.range((Bound::Excluded(cur_key.clone()), end));
+			let cur = self.current_key.expect("a valid cursor has a key");
+			self.range = self
+				.map
+				.range::<_, [u8]>((Bound::Excluded(cur.as_slice()), upper_bound(&self.upper)));
 			self.direction = IterDirection::Forward;
 		}
 
-		if let Some(next_entry) = self.range.next() {
-			self.current_user_key = Some(next_entry.key().clone());
-			self.collect_versions(next_entry.leaf_ptr());
-			self.version_idx = 0;
-			self.populate_encoded_key();
-			Ok(true)
-		} else {
-			self.clear_cursor();
-			Ok(false)
-		}
+		let entry = self.range.next();
+		Ok(self.position(entry))
 	}
 
 	fn prev(&mut self) -> Result<bool> {
@@ -659,27 +636,16 @@ impl LSMIterator for MemTableIterator<'_> {
 			return Ok(true);
 		}
 
-		let cur_key = self.current_user_key.as_ref().unwrap();
-
 		if matches!(self.direction, IterDirection::Forward) {
-			let start = match &self.lower {
-				Some(l) => Bound::Included(l.clone()),
-				None => Bound::Unbounded,
-			};
-			self.range = self.map.range((start, Bound::Excluded(cur_key.clone())));
+			let cur = self.current_key.expect("a valid cursor has a key");
+			self.range = self
+				.map
+				.range::<_, [u8]>((lower_bound(&self.lower), Bound::Excluded(cur.as_slice())));
 			self.direction = IterDirection::Backward;
 		}
 
-		if let Some(prev_entry) = self.range.next_back() {
-			self.current_user_key = Some(prev_entry.key().clone());
-			self.collect_versions(prev_entry.leaf_ptr());
-			self.version_idx = self.current_versions.len().saturating_sub(1);
-			self.populate_encoded_key();
-			Ok(true)
-		} else {
-			self.clear_cursor();
-			Ok(false)
-		}
+		let entry = self.range.next_back();
+		Ok(self.position(entry))
 	}
 
 	fn valid(&self) -> bool {
@@ -693,7 +659,6 @@ impl LSMIterator for MemTableIterator<'_> {
 
 	fn value_encoded(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
-		let leaf = unsafe { &*self.current_versions[self.version_idx] };
-		Ok(leaf.value.as_slice())
+		Ok(self.current_versions[self.version_idx].1)
 	}
 }
