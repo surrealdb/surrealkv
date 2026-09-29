@@ -35,7 +35,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 | Engine | Point&nbsp;Read&nbsp;(OPS) | Create&nbsp;(OPS) | Update&nbsp;(OPS) | Delete&nbsp;(OPS) | Scan&nbsp;(OPS) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1,003,074** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**156,638** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**177,110** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**225,318** | 8,356 |
+| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1,440,502** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**156,638** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**177,110** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**225,318** | 8,356 |
 | RocksDB | 692,257 | 34,233 | 35,652 | 36,440 | 2,447 |
 | Fjall | 848,857 | 1,351 | 1,219 | 1,180 | 379 |
 | SlateDB | 279,526 | 9,039 | 8,792 | 8,847 | 1,109 |
@@ -44,7 +44,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 - **Creates (Writes)**: **156,638 OPS** (**4.58× faster** than RocksDB, **17.3× faster** than SlateDB, and **116× faster** than Fjall) under synchronous disk persistence.
 - **Updates**: **177,110 OPS** (**4.97× faster** than RocksDB, **20.1× faster** than SlateDB, and **145× faster** than Fjall) with lock-free group commit.
-- **Point Reads**: **1.00M OPS** sustained: the fastest point-read throughput among all engines tested (**1.45× faster** than RocksDB, **1.09× faster** than LMDB, and **3.59× faster** than SlateDB).
+- **Point Reads**: **1.44M OPS** sustained: the fastest point-read throughput among all engines tested (**2.08× faster** than RocksDB, **1.56× faster** than LMDB, and **5.15× faster** than SlateDB).
 - **Deletes**: **225,318 OPS** (**6.18× faster** than RocksDB, **25.5× faster** than SlateDB, and **191× faster** than Fjall).
 - **Range Scans**: **3.42× faster** than RocksDB and **7.53× faster** than SlateDB via zero-copy iterator merges and block-level restart points.
 
