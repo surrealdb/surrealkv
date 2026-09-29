@@ -1,12 +1,18 @@
 use std::fs::File as SysFile;
+use std::ops::Bound;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use arenaskiplist::{Arena, Error as SkiplistError, SkipList};
+use artmap::arena::{ArenaVersionedArtMap, ArenaVersionedEntryRef, ArenaVersionedRange};
 
+/// Upper bound on what one entry costs a memtable: the worst-case arena bytes
+/// of one insert (as reported by artmap) plus the value length. Keys and
+/// values live on the heap, so the value term is not arena space; it keeps
+/// the estimate proportional to the logical batch size, which is what the
+/// direct-to-L0 cutoff for oversized batches compares against.
 #[inline]
 pub(crate) const fn max_entry_bytes(key_len: usize, value_len: usize) -> u64 {
-	arenaskiplist::max_entry_bytes(key_len, value_len) as u64
+	ArenaVersionedArtMap::<Key, Value>::max_insert_bytes(key_len) as u64 + value_len as u64
 }
 
 use crate::batch::Batch;
@@ -83,13 +89,13 @@ impl ImmutableMemtables {
 }
 
 pub(crate) struct MemTable {
-	skiplist: SkipList,
+	map: ArenaVersionedArtMap<Key, Value>,
 	latest_seq_num: AtomicU64,
 	/// WAL number that was current when this memtable started receiving writes.
 	/// Used to determine which WALs can be safely deleted after flush.
 	wal_number: AtomicU64,
 	/// Bytes reserved by in-flight `add` calls but not yet allocated in the
-	/// skiplist arena. Atomically updated by `try_reserve` / `release_reservation`
+	/// arena. Atomically updated by `try_reserve` / `release_reservation`
 	/// to ensure batch-atomic insertion: a batch either fits entirely (reservation
 	/// succeeds) or the memtable is left unchanged (reservation fails with ArenaFull).
 	reserved: AtomicU64,
@@ -121,10 +127,9 @@ impl Drop for ReservationGuard<'_> {
 
 impl MemTable {
 	pub(crate) fn new(arena_capacity: usize) -> Self {
-		let arena = Arena::with_capacity(arena_capacity);
-		let skiplist = SkipList::new(arena);
+		let map = ArenaVersionedArtMap::with_capacity(arena_capacity);
 		MemTable {
-			skiplist,
+			map,
 			latest_seq_num: AtomicU64::new(0),
 			wal_number: AtomicU64::new(0),
 			reserved: AtomicU64::new(0),
@@ -152,6 +157,7 @@ impl MemTable {
 
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
 		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
+		let max_trailer = (max_seq << 8) | 0xFF;
 
 		// Check if covered by any range tombstone
 		let mut range_tombstone_seq: Option<u64> = None;
@@ -164,31 +170,12 @@ impl MemTable {
 		}
 
 		let mut point_res: Option<(InternalKey, Value)> = None;
-		let mut iter = self.skiplist.range(key..);
-		iter.first();
-
-		// Find the entry with highest sequence number <= max_seq
-		while iter.is_valid() {
-			let found_key = iter.key().unwrap();
-			if found_key != key {
-				break; // Moved past our key
-			}
-
-			let found_trailer = iter.version().unwrap();
-			let found_seq = found_trailer >> 8;
-
-			// Check if this entry's sequence number is <= requested seq_no
-			if found_seq <= max_seq {
-				// This is the newest version with seq <= max_seq
-				let internal_key = InternalKey {
-					user_key: found_key.to_vec(),
-					trailer: found_trailer,
-				};
-				point_res = Some((internal_key, iter.value().unwrap().to_vec()));
-				break;
-			}
-
-			iter.advance();
+		if let Some((found_trailer, val)) = self.map.get_version_le(key, max_trailer) {
+			let internal_key = InternalKey {
+				user_key: key.to_vec(),
+				trailer: found_trailer,
+			};
+			point_res = Some((internal_key, val));
 		}
 
 		if let Some(rseq) = range_tombstone_seq {
@@ -204,16 +191,16 @@ impl MemTable {
 	}
 
 	pub(crate) fn is_empty(&self) -> bool {
-		self.skiplist.is_empty()
+		self.map.is_empty()
 	}
 
 	pub(crate) fn size(&self) -> usize {
-		self.skiplist.size()
+		self.map.arena().size()
 	}
 
-	/// Arena capacity in bytes (total, including sentinel overhead).
+	/// Arena capacity in bytes (total, including artmap's 64-byte null region).
 	pub(crate) fn arena_capacity(&self) -> usize {
-		self.skiplist.arena_capacity()
+		self.map.arena().capacity()
 	}
 
 	/// Atomically reserve `bytes` of arena space for an upcoming batch insertion.
@@ -229,7 +216,7 @@ impl MemTable {
 		let capacity = self.arena_capacity() as u64;
 		loop {
 			let current = self.reserved.load(Ordering::Acquire);
-			let used = self.skiplist.size() as u64;
+			let used = self.size() as u64;
 			let avail = capacity.saturating_sub(used).saturating_sub(current);
 			if bytes > avail {
 				return Err(crate::Error::ArenaFull);
@@ -319,21 +306,19 @@ impl MemTable {
 	/// Inserts a key-value pair into the memtable.
 	///
 	/// `MemTable::add` reserves arena space via `try_reserve` before calling this,
-	/// so `SkiplistError::ArenaFull` here would indicate the size estimator drifted
-	/// from the actual skiplist node size. We assert in debug, and fall through to
+	/// so `ArenaFull` here would indicate the size estimator drifted from
+	/// artmap's `max_insert_bytes`. We assert in debug, and fall through to
 	/// returning `ArenaFull` in release so the upstream rotate-and-retry path stays
 	/// as a safety net rather than corrupting state via panic.
 	fn insert_into_memtable(&self, key: &InternalKey, value: &Value) -> Result<()> {
 		let trailer = (key.seq_num() << 8) | (key.kind() as u64);
-
-		match self.skiplist.insert_with_version(&key.user_key, trailer, value) {
+		match self.map.try_insert(key.user_key.clone(), trailer, value.clone()) {
 			Ok(()) => Ok(()),
-			Err(SkiplistError::RecordExists) => Ok(()), // Duplicate is not an error in memtable
-			Err(SkiplistError::ArenaFull) => {
+			Err(_) => {
 				debug_assert!(
 					false,
 					"ArenaFull inside insert_into_memtable after a successful try_reserve; \
-					memtable_size_estimate is out of sync with skiplist node size"
+					memtable_size_estimate is out of sync with the artmap arena"
 				);
 				tracing::error!("ArenaFull after reservation; memtable size estimator drift");
 				Err(crate::Error::ArenaFull)
@@ -437,15 +422,20 @@ impl MemTable {
 		lower: Option<&[u8]>, // Inclusive, None = unbounded
 		upper: Option<&[u8]>, // Exclusive, None = unbounded
 	) -> MemTableIterator<'_> {
-		let iter = match (lower, upper) {
-			(Some(l), Some(u)) => self.skiplist.range(l..u),
-			(Some(l), None) => self.skiplist.range(l..),
-			(None, Some(u)) => self.skiplist.range(..u),
-			(None, None) => self.skiplist.iter(),
-		};
+		let range = self.map.range::<_, [u8]>((
+			lower.map_or(Bound::Unbounded, Bound::Included),
+			upper.map_or(Bound::Unbounded, Bound::Excluded),
+		));
 
 		let mut miter = MemTableIterator {
-			iter,
+			map: &self.map,
+			lower: lower.map(|l| l.to_vec()),
+			upper: upper.map(|u| u.to_vec()),
+			range,
+			direction: IterDirection::Forward,
+			current_key: None,
+			current_versions: Vec::new(),
+			version_idx: 0,
 			encoded_key_buf: Vec::new(),
 		};
 
@@ -487,64 +477,179 @@ fn maybe_separate_to_vlog(
 	Ok(encoded_value.to_vec())
 }
 
+#[derive(Clone, Copy)]
+enum IterDirection {
+	Forward,
+	Backward,
+}
+
+fn lower_bound(lower: &Option<Vec<u8>>) -> Bound<&[u8]> {
+	lower.as_deref().map_or(Bound::Unbounded, Bound::Included)
+}
+
+fn upper_bound(upper: &Option<Vec<u8>>) -> Bound<&[u8]> {
+	upper.as_deref().map_or(Bound::Unbounded, Bound::Excluded)
+}
+
+/// Iterates a memtable in internal-key order: user keys ascending, and each
+/// key's versions by trailer descending.
+///
+/// The artmap range yields one entry per user key; the cursor expands it into
+/// that key's version chain (captured when the entry was read, so concurrent
+/// inserts never reorder it) and steps through the versions before moving to
+/// the neighbouring key. Changing direction re-anchors the range just past the
+/// current key.
 pub(crate) struct MemTableIterator<'a> {
-	iter: arenaskiplist::Iter<'a>,
+	map: &'a ArenaVersionedArtMap<Key, Value>,
+	lower: Option<Vec<u8>>,
+	upper: Option<Vec<u8>>,
+	range: ArenaVersionedRange<'a, Key, Value>,
+	direction: IterDirection,
+	current_key: Option<&'a Key>,
+	/// `(trailer, value)` for each version of `current_key`, newest first.
+	current_versions: Vec<(u64, &'a Value)>,
+	version_idx: usize,
 	encoded_key_buf: Vec<u8>,
 }
 
 impl<'a> MemTableIterator<'a> {
+	/// Positions the cursor on `entry`: on its newest version when moving
+	/// forward, its oldest when moving backward. Clears the cursor on `None`.
+	fn position(&mut self, entry: Option<ArenaVersionedEntryRef<'a, Key, Value>>) -> bool {
+		let Some(entry) = entry else {
+			self.clear_cursor();
+			return false;
+		};
+		self.current_key = Some(entry.key());
+		self.current_versions.clear();
+		// Deletes are encoded in the trailer and stored as ordinary values, so
+		// the chain never holds an artmap tombstone; the filter is only a guard.
+		self.current_versions
+			.extend(entry.versions().filter_map(|v| v.value.map(|val| (v.version, val))));
+		self.version_idx = match self.direction {
+			IterDirection::Forward => 0,
+			IterDirection::Backward => self.current_versions.len().saturating_sub(1),
+		};
+		self.populate_encoded_key();
+		self.valid()
+	}
+
 	fn populate_encoded_key(&mut self) {
-		if !self.iter.is_valid() {
-			return;
-		}
 		self.encoded_key_buf.clear();
-		if let (Some(k), Some(v)) = (self.iter.key(), self.iter.version()) {
-			self.encoded_key_buf.extend_from_slice(k);
-			self.encoded_key_buf.extend_from_slice(&v.to_be_bytes());
+		if let (Some(key), Some(&(trailer, _))) =
+			(self.current_key, self.current_versions.get(self.version_idx))
+		{
+			self.encoded_key_buf.extend_from_slice(key);
+			self.encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 		}
+	}
+
+	fn clear_cursor(&mut self) {
+		self.current_key = None;
+		self.current_versions.clear();
+		self.version_idx = 0;
+		self.encoded_key_buf.clear();
 	}
 }
 
 impl LSMIterator for MemTableIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
-		let user_key = InternalKey::user_key_from_encoded(target);
-		self.iter.seek_ge(user_key);
-		self.populate_encoded_key();
-		Ok(self.valid())
+		let target_user_key = InternalKey::user_key_from_encoded(target);
+		let target_trailer = if target.len() >= 8 {
+			u64::from_be_bytes(target[target.len() - 8..].try_into().unwrap_or([0xFF; 8]))
+		} else {
+			u64::MAX
+		};
+
+		let start = match self.lower.as_deref() {
+			Some(l) if target_user_key < l => l,
+			_ => target_user_key,
+		};
+		self.range = self.map.range::<_, [u8]>((Bound::Included(start), upper_bound(&self.upper)));
+		self.direction = IterDirection::Forward;
+
+		while let Some(entry) = self.range.next() {
+			self.position(Some(entry));
+			if entry.key().as_slice() != target_user_key {
+				return Ok(true);
+			}
+			// Same user key: skip versions newer than the target trailer.
+			if let Some(idx) = self.current_versions.iter().position(|&(t, _)| t <= target_trailer)
+			{
+				self.version_idx = idx;
+				self.populate_encoded_key();
+				return Ok(true);
+			}
+		}
+
+		self.clear_cursor();
+		Ok(false)
 	}
 
 	fn seek_first(&mut self) -> Result<bool> {
-		self.iter.first();
-		self.populate_encoded_key();
-		Ok(self.valid())
+		self.range =
+			self.map.range::<_, [u8]>((lower_bound(&self.lower), upper_bound(&self.upper)));
+		self.direction = IterDirection::Forward;
+		let entry = self.range.next();
+		Ok(self.position(entry))
 	}
 
 	fn seek_last(&mut self) -> Result<bool> {
-		arenaskiplist::Iter::last(&mut self.iter);
-		self.populate_encoded_key();
-		Ok(self.valid())
+		self.range =
+			self.map.range::<_, [u8]>((lower_bound(&self.lower), upper_bound(&self.upper)));
+		self.direction = IterDirection::Backward;
+		let entry = self.range.next_back();
+		Ok(self.position(entry))
 	}
 
 	fn next(&mut self) -> Result<bool> {
 		if !self.valid() {
 			return Ok(false);
 		}
-		self.iter.advance();
-		self.populate_encoded_key();
-		Ok(self.valid())
+
+		if self.version_idx + 1 < self.current_versions.len() {
+			self.version_idx += 1;
+			self.populate_encoded_key();
+			return Ok(true);
+		}
+
+		if matches!(self.direction, IterDirection::Backward) {
+			let cur = self.current_key.expect("a valid cursor has a key");
+			self.range = self
+				.map
+				.range::<_, [u8]>((Bound::Excluded(cur.as_slice()), upper_bound(&self.upper)));
+			self.direction = IterDirection::Forward;
+		}
+
+		let entry = self.range.next();
+		Ok(self.position(entry))
 	}
 
 	fn prev(&mut self) -> Result<bool> {
 		if !self.valid() {
 			return Ok(false);
 		}
-		self.iter.prev();
-		self.populate_encoded_key();
-		Ok(self.valid())
+
+		if self.version_idx > 0 {
+			self.version_idx -= 1;
+			self.populate_encoded_key();
+			return Ok(true);
+		}
+
+		if matches!(self.direction, IterDirection::Forward) {
+			let cur = self.current_key.expect("a valid cursor has a key");
+			self.range = self
+				.map
+				.range::<_, [u8]>((lower_bound(&self.lower), Bound::Excluded(cur.as_slice())));
+			self.direction = IterDirection::Backward;
+		}
+
+		let entry = self.range.next_back();
+		Ok(self.position(entry))
 	}
 
 	fn valid(&self) -> bool {
-		self.iter.is_valid()
+		self.version_idx < self.current_versions.len()
 	}
 
 	fn key(&self) -> InternalKeyRef<'_> {
@@ -554,6 +659,6 @@ impl LSMIterator for MemTableIterator<'_> {
 
 	fn value_encoded(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
-		Ok(self.iter.value().unwrap_or(&[]))
+		Ok(self.current_versions[self.version_idx].1)
 	}
 }

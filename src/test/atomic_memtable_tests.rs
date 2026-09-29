@@ -2,15 +2,14 @@
 //!
 //! These tests verify three properties of the preflight reservation:
 //!
-//! 1. **Formula correctness**: `max_entry_bytes(key_len, value_len)` returns the expected `199 +
-//!    key_len + value_len`.
+//! 1. **Formula correctness**: `max_entry_bytes(key_len, value_len)` returns artmap's worst-case
+//!    per-insert arena cost (`ArenaVersionedArtMap::max_insert_bytes(key_len)`) plus `value_len`.
 //! 2. **Upper-bound invariant**: actual arena allocation for any batch is always `≤` the estimate
 //!    computed from `max_entry_bytes`. This is what makes `try_reserve` safe: if a reservation
 //!    succeeds, the subsequent inserts cannot run out of arena space.
 //! 3. **Utilization gap**: the estimate is pessimistic — actual allocation uses less arena than the
-//!    estimate. These tests quantify the gap for common record shapes so regressions in the formula
-//!    (e.g. someone changing the skiplist node layout without recomputing `MAX_NODE_SIZE`) are
-//!    caught loudly.
+//!    estimate. These tests quantify the gap for common record shapes so changes in artmap's node
+//!    layout or in the estimator are caught loudly.
 //!
 //! They also cover the atomicity properties of `MemTable::add`:
 //! batch-on-arena-full leaves the memtable unchanged; concurrent `try_reserve`
@@ -20,19 +19,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 
+use artmap::arena::ArenaVersionedArtMap;
 use test_log::test;
 
 use crate::batch::Batch;
 use crate::memtable::{max_entry_bytes, MemTable};
-use crate::Error;
+use crate::{Error, Key, Value};
 
-/// Per-entry arena cost upper bound, as exposed by `max_entry_bytes`.
-/// Equal to `MAX_NODE_SIZE (184) + NODE_ALIGNMENT-1 (7)`.
-const ENTRY_OVERHEAD: u64 = 191;
+/// Bytes artmap reserves at the start of every arena as its null region, so
+/// a freshly constructed memtable reports this as its size.
+const ARENA_BASE_OVERHEAD: usize = 64;
 
-/// Bytes the skiplist sentinels consume in the arena at MemTable construction
-/// (two full-height nodes + 1 reserved offset). 191 per sentinel + 1.
-const SENTINEL_OVERHEAD: usize = 2 * (ENTRY_OVERHEAD as usize) + 1;
+/// Worst-case arena bytes one insert of a `key_len`-byte key can consume.
+fn insert_overhead(key_len: usize) -> u64 {
+	ArenaVersionedArtMap::<Key, Value>::max_insert_bytes(key_len) as u64
+}
 
 // ============================================================================
 // 1. Formula correctness
@@ -40,20 +41,28 @@ const SENTINEL_OVERHEAD: usize = 2 * (ENTRY_OVERHEAD as usize) + 1;
 
 #[test]
 fn max_entry_bytes_basic_inputs() {
-	// Zero-length key and value: just the worst-case node + alignment padding.
-	assert_eq!(max_entry_bytes(0, 0), ENTRY_OVERHEAD);
+	// Zero-length key and value: just artmap's worst-case insert.
+	assert_eq!(max_entry_bytes(0, 0), insert_overhead(0));
 	// Small entry.
-	assert_eq!(max_entry_bytes(10, 100), ENTRY_OVERHEAD + 110);
+	assert_eq!(max_entry_bytes(10, 100), insert_overhead(10) + 100);
 	// Larger entry.
-	assert_eq!(max_entry_bytes(100, 1000), ENTRY_OVERHEAD + 1100);
+	assert_eq!(max_entry_bytes(100, 1000), insert_overhead(100) + 1000);
 }
 
 #[test]
-fn max_entry_bytes_is_linear_in_key_len() {
-	let base = max_entry_bytes(0, 64);
+fn max_entry_bytes_is_monotonic_in_key_len() {
+	// Longer keys can need longer prefix chains, so the bound never shrinks.
+	let mut prev = max_entry_bytes(0, 64);
 	for k in [1usize, 10, 64, 256, 4096] {
-		assert_eq!(max_entry_bytes(k, 64), base + k as u64);
+		let cur = max_entry_bytes(k, 64);
+		assert!(cur >= prev, "estimate shrank from {} to {} at key_len={}", prev, cur, k);
+		prev = cur;
 	}
+}
+
+#[test]
+fn fresh_memtable_size_is_arena_base_overhead() {
+	assert_eq!(MemTable::new(64 * 1024).size(), ARENA_BASE_OVERHEAD);
 }
 
 #[test]
@@ -95,7 +104,7 @@ fn measure(key_len: usize, value_len: usize, n_entries: usize) -> (u64, usize) {
 	let estimate = max_entry_bytes(key_len, value_len) * (n_entries as u64);
 	// Provision plenty of headroom so the reservation succeeds regardless of
 	// how unrealistically pessimistic the estimate is for this shape.
-	let arena_size = estimate as usize + SENTINEL_OVERHEAD + 64 * 1024;
+	let arena_size = estimate as usize + ARENA_BASE_OVERHEAD + 64 * 1024;
 
 	let memtable = MemTable::new(arena_size);
 	let initial = memtable.size();
@@ -104,7 +113,7 @@ fn measure(key_len: usize, value_len: usize, n_entries: usize) -> (u64, usize) {
 	for i in 0..n_entries {
 		let mut key = vec![0u8; key_len];
 		// Stamp the index into the first few bytes of the key so entries
-		// are distinct (otherwise the skiplist deduplicates them).
+		// are distinct (otherwise the map stores them as versions of one key).
 		for (j, b) in (i as u64).to_le_bytes().iter().enumerate() {
 			if j < key.len() {
 				key[j] = *b;
@@ -162,8 +171,8 @@ fn estimate_is_upper_bound_on_actual_large_values() {
 #[test]
 fn estimate_is_upper_bound_under_varied_shapes() {
 	// A grid of shapes. The invariant must hold for every combination — if
-	// any cell fails, MAX_NODE_SIZE or NODE_ALIGNMENT has drifted from the
-	// real skiplist node layout.
+	// any cell fails, `max_entry_bytes` no longer covers what artmap
+	// actually allocates.
 	let key_lens = [1usize, 8, 32, 128, 512];
 	let value_lens = [0usize, 1, 16, 256, 4096];
 	for &k in &key_lens {
@@ -186,15 +195,14 @@ fn estimate_is_upper_bound_under_varied_shapes() {
 // ============================================================================
 //
 // These tests measure (actual / estimate) and assert it falls in a documented
-// range for each record shape. The expected ranges come from the geometric
-// height distribution: E[height] = 1 / (1 − 1/e) ≈ 1.58, so average node
-// overhead is ~45 bytes vs the worst-case 192. The gap closes as value size
-// grows because the fixed node overhead is amortized.
+// range for each record shape. ArenaVersionedArtMap puts inner nodes, leaves
+// and version nodes in the arena, but the key and value bytes (`Vec<u8>`) live
+// on the heap. The estimate is artmap's worst case for one insert (a prefix
+// chain, a split and one grown node of every size) plus the value length, so
+// utilization is low and falls further as values grow.
 //
-// These ranges are wide enough to absorb the variance from random heights
-// across the entry counts used (200–2000). If they ever fail, either the
-// estimator has changed or the skiplist's node layout has changed — both
-// require manual review.
+// If these ever fail, either the estimator or artmap's node layout has
+// changed — both require manual review.
 
 fn assert_utilization_in_range(
 	label: &str,
@@ -233,27 +241,27 @@ fn assert_utilization_in_range(
 }
 
 #[test]
-fn utilization_tiny_kv_around_one_third() {
-	// 8B key + 16B value: per-entry estimate 223, actual ≈ 76 ⇒ ~34%.
-	assert_utilization_in_range("tiny", 8, 16, 2000, 0.25, 0.45);
+fn utilization_tiny_kv() {
+	// 8B key + 16B value: per-entry estimate 2001, actual ≈ 96 ⇒ ~5%.
+	assert_utilization_in_range("tiny", 8, 16, 2000, 0.03, 0.10);
 }
 
 #[test]
-fn utilization_small_kv_around_one_half() {
-	// 16B key + 100B value: per-entry estimate 315, actual ≈ 168 ⇒ ~53%.
-	assert_utilization_in_range("small", 16, 100, 1000, 0.40, 0.65);
+fn utilization_small_kv() {
+	// 16B key + 100B value: per-entry estimate 2085, actual ≈ 90 ⇒ ~4%.
+	assert_utilization_in_range("small", 16, 100, 1000, 0.03, 0.10);
 }
 
 #[test]
-fn utilization_medium_kv_around_three_quarters() {
-	// 32B key + 512B value: per-entry estimate 743, actual ≈ 596 ⇒ ~80%.
-	assert_utilization_in_range("medium", 32, 512, 500, 0.70, 0.90);
+fn utilization_medium_kv() {
+	// 32B key + 512B value: per-entry estimate 2568, actual ≈ 107 ⇒ ~4%.
+	assert_utilization_in_range("medium", 32, 512, 500, 0.03, 0.10);
 }
 
 #[test]
-fn utilization_large_value_near_one() {
-	// 16B key + 4096B value: per-entry estimate 4311, actual ≈ 4160 ⇒ ~96%.
-	assert_utilization_in_range("large", 16, 4096, 200, 0.93, 1.00);
+fn utilization_large_value() {
+	// 16B key + 4096B value: per-entry estimate 6081, actual ≈ 81 ⇒ ~1%.
+	assert_utilization_in_range("large", 16, 4096, 200, 0.005, 0.04);
 }
 
 // ============================================================================
@@ -283,10 +291,10 @@ fn add_atomic_on_arena_full_leaves_memtable_unchanged() {
 #[test]
 fn add_atomic_after_partial_prefill_preserves_prior_entries() {
 	// Arena big enough for the prefill, too small for the second batch.
-	let arena_size = 16 * 1024;
+	let arena_size = 64 * 1024;
 	let memtable = MemTable::new(arena_size);
 
-	// Prefill with 8 entries of ~250 bytes each (estimate ≈ 2 KiB).
+	// Prefill with 8 entries of ~2 KiB estimate each (≈ 16 KiB total).
 	let mut prefill = Batch::new(1);
 	for i in 0..8u8 {
 		prefill.set(vec![i; 8], vec![0u8; 50], 0).unwrap();
@@ -351,11 +359,11 @@ fn add_releases_reservation_after_success() {
 fn add_releases_reservation_after_failure() {
 	// Same property after a failed add: reservation must be released so a
 	// later (fitting) batch can claim the space.
-	let memtable = MemTable::new(2 * 1024);
+	let memtable = MemTable::new(8 * 1024);
 
 	// First batch too large to fit — should fail cleanly.
 	let mut huge = Batch::new(1);
-	huge.set(vec![0u8; 8], vec![0u8; 4 * 1024], 0).unwrap();
+	huge.set(vec![0u8; 8], vec![0u8; 16 * 1024], 0).unwrap();
 	assert!(matches!(memtable.add(&huge), Err(Error::ArenaFull)));
 
 	// A small batch must still work.
@@ -371,11 +379,11 @@ fn add_releases_reservation_after_failure() {
 #[test]
 fn try_reserve_serializes_concurrent_callers() {
 	// Capacity sized for exactly 8 reservations of RESERVE_BYTES each, plus
-	// sentinel overhead and a small slack. Spawn many more threads than slots
+	// the arena's null region and a small slack. Spawn many more threads than slots
 	// and assert the count of Ok results doesn't exceed what's actually available.
 	const RESERVE_BYTES: u64 = 1024;
 	const SLOTS: u64 = 8;
-	let capacity = SENTINEL_OVERHEAD + (RESERVE_BYTES * SLOTS) as usize + 256;
+	let capacity = ARENA_BASE_OVERHEAD + (RESERVE_BYTES * SLOTS) as usize + 256;
 	let memtable = Arc::new(MemTable::new(capacity));
 
 	let success_count = Arc::new(AtomicUsize::new(0));

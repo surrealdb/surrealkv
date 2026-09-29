@@ -745,7 +745,7 @@ mod tests {
 			0,
 			"Test repair",
 			WalRecoveryMode::TolerateCorruptedWithRepair,
-			1024,
+			64 * 1024,
 			|_memtable, _wal_number| {
 				// Flush callback - not needed for this test
 				Ok(())
