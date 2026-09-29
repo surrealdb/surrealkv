@@ -338,6 +338,12 @@ pub struct Transaction {
 	/// The sequence number when this transaction started.
 	pub(crate) start_seq_num: u64,
 
+	/// The start of this transaction's conflict window in the commit ring:
+	/// every commit at or below it is visible at `start_seq_num`, and commit
+	/// validates against the commits after it. Unused by read-only
+	/// transactions.
+	commit_window: u64,
+
 	/// `savepoints` indicates the current number of stacked savepoints; zero
 	/// means none.
 	savepoints: u32,
@@ -346,8 +352,9 @@ pub struct Transaction {
 	/// transaction.
 	write_seqno: u32,
 
-	/// Registry slot in `Core::active_txn_tracker`. Drop unregisters the
-	/// `start_seq_num` from the GC watermark used by `CommitOracle`.
+	/// Registry slot in `Core::active_txn_tracker`, pinning the commit ring's
+	/// retired watermark at or below `commit_window` so the entries this
+	/// transaction validates against stay reachable. Drop unregisters it.
 	/// `Option<>` so that `rollback`/`commit` can release the slot promptly
 	/// rather than waiting for the `Transaction`'s own `Drop`.
 	txn_guard: Option<ActiveTxnGuard>,
@@ -378,18 +385,22 @@ impl Transaction {
 			durability,
 		} = opts;
 
-		// Get the current visible sequence number as our start point.
-		let start_seq_num = core.seq_num();
-
-		// Register this txn's start_seq with the GC watermark tracker.
-		// Only mutating transactions (ReadWrite and WriteOnly) register here
-		// because ReadOnly transactions never commit or write, eliminating
-		// global write lock contention on the read path.
-		let txn_guard = if mode.is_read_only() {
-			None
+		// Only mutating transactions (ReadWrite and WriteOnly) open a commit
+		// window, because ReadOnly transactions never commit or write,
+		// eliminating global write lock contention on the read path. The pin
+		// is registered before the window is read, so retirement can never
+		// pass the window.
+		let (txn_guard, commit_window) = if mode.is_read_only() {
+			(None, 0)
 		} else {
-			Some(core.active_txn_tracker.register(start_seq_num))
+			let pipeline = &core.commit_pipeline;
+			let guard = core.active_txn_tracker.register(pipeline.commit_pin());
+			(Some(guard), pipeline.commit_window())
 		};
+
+		// Get the current visible sequence number as our start point. Read
+		// after the window, so every commit at or below it is visible here.
+		let start_seq_num = core.seq_num();
 
 		let mut snapshot = None;
 		if !mode.is_write_only() {
@@ -405,6 +416,7 @@ impl Transaction {
 			durability,
 			closed: false,
 			start_seq_num,
+			commit_window,
 			savepoints: 0,
 			write_seqno: 0,
 			txn_guard,
@@ -1099,7 +1111,10 @@ impl Transaction {
 				return Ok(());
 			}
 			let read_set: Vec<Key> = std::mem::take(&mut self.read_set).into_keys().collect();
-			return self.core.check_conflicts(&read_set, self.start_seq_num);
+			return self
+				.core
+				.check_conflicts(&read_set, self.start_seq_num, self.commit_window)
+				.await;
 		}
 
 		// Create and prepare batch directly. `Batch::new(0)`: the
@@ -1141,7 +1156,9 @@ impl Transaction {
 		// seq alloc + oracle.publish + WAL atomically under `write_mutex`,
 		// then runs memtable apply OUTSIDE the lock.
 		let should_sync = self.durability == Durability::Immediate;
-		self.core.commit(batch, should_sync, self.start_seq_num, &read_set).await
+		self.core
+			.commit(batch, should_sync, self.start_seq_num, self.commit_window, &read_set)
+			.await
 	}
 
 	pub fn rollback(&mut self) {
