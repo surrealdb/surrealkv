@@ -242,25 +242,25 @@ fn assert_utilization_in_range(
 
 #[test]
 fn utilization_tiny_kv() {
-	// 8B key + 16B value: per-entry estimate 2017, actual ≈ 112 ⇒ ~6%.
+	// 8B key + 16B value: per-entry estimate 2001, actual ≈ 96 ⇒ ~5%.
 	assert_utilization_in_range("tiny", 8, 16, 2000, 0.03, 0.10);
 }
 
 #[test]
 fn utilization_small_kv() {
-	// 16B key + 100B value: per-entry estimate 2101, actual ≈ 106 ⇒ ~5%.
+	// 16B key + 100B value: per-entry estimate 2085, actual ≈ 90 ⇒ ~4%.
 	assert_utilization_in_range("small", 16, 100, 1000, 0.03, 0.10);
 }
 
 #[test]
 fn utilization_medium_kv() {
-	// 32B key + 512B value: per-entry estimate 2584, actual ≈ 123 ⇒ ~5%.
+	// 32B key + 512B value: per-entry estimate 2568, actual ≈ 107 ⇒ ~4%.
 	assert_utilization_in_range("medium", 32, 512, 500, 0.03, 0.10);
 }
 
 #[test]
 fn utilization_large_value() {
-	// 16B key + 4096B value: per-entry estimate 6097, actual ≈ 97 ⇒ ~2%.
+	// 16B key + 4096B value: per-entry estimate 6081, actual ≈ 81 ⇒ ~1%.
 	assert_utilization_in_range("large", 16, 4096, 200, 0.005, 0.04);
 }
 
