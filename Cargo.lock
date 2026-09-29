@@ -156,7 +156,7 @@ name = "artmap"
 version = "0.5.0"
 source = "git+https://github.com/surrealdb/artmap?branch=main#a6448930137980268f41f8b5283e2e3337b4792f"
 dependencies = [
- "byteslice",
+ "byteslice 0.1.0",
  "crossbeam-epoch",
 ]
 
@@ -249,6 +249,16 @@ name = "byteslice"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8330fa105fc493ba2c0f1e8f7a31201717ceffbf8b66dd3079e4a4c1ea20e097"
+dependencies = [
+ "bytes",
+ "serde",
+]
+
+[[package]]
+name = "byteslice"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6eac0430a792a6df8f9bbb45667e9e6a6976beba6dad9fa2c0e98d86b6bde618"
 dependencies = [
  "bytes",
  "serde",
@@ -1445,7 +1455,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
- "byteslice",
+ "byteslice 0.2.0",
  "chacha20",
  "chacha20poly1305",
  "crc32fast",

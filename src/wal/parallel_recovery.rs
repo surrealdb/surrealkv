@@ -14,7 +14,7 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::memtable::MemTable;
 use crate::wal::reader::Reader;
-use crate::wal::recovery::DefaultReporter;
+use crate::wal::recovery::{apply_batch_with_oversized_fallback, DefaultReporter};
 use crate::wal::{Error as WalError, SegmentRef};
 
 /// Decodes a single WAL segment file into batches and the segment's maximum sequence number.
@@ -79,20 +79,13 @@ pub(crate) fn replay_segments_sync(
 			}
 			let mut current_memtable = Arc::new(MemTable::new(arena_size));
 			for batch in batches {
-				match current_memtable.add(&batch) {
-					Ok(()) => {}
-					Err(Error::ArenaFull) => {
-						if current_memtable.is_empty() {
-							return Err(Error::Other(format!(
-								"Batch too large for memtable (arena_size={arena_size})"
-							)));
-						}
-						memtables.push((Arc::clone(&current_memtable), seg.id));
-						current_memtable = Arc::new(MemTable::new(arena_size));
-						current_memtable.add(&batch)?;
-					}
-					Err(e) => return Err(e),
-				}
+				current_memtable = apply_batch_with_oversized_fallback(
+					current_memtable,
+					&batch,
+					arena_size,
+					seg.id,
+					&mut memtables,
+				)?;
 			}
 			memtables.push((current_memtable, seg.id));
 		}
@@ -162,20 +155,13 @@ pub(crate) async fn replay_segments_parallel(
 
 		let mut current_memtable = Arc::new(MemTable::new(arena_size));
 		for batch in batches {
-			match current_memtable.add(&batch) {
-				Ok(()) => {}
-				Err(Error::ArenaFull) => {
-					if current_memtable.is_empty() {
-						return Err(Error::Other(format!(
-							"Batch too large for memtable (arena_size={arena_size})"
-						)));
-					}
-					memtables.push((Arc::clone(&current_memtable), segment_id));
-					current_memtable = Arc::new(MemTable::new(arena_size));
-					current_memtable.add(&batch)?;
-				}
-				Err(e) => return Err(e),
-			}
+			current_memtable = apply_batch_with_oversized_fallback(
+				current_memtable,
+				&batch,
+				arena_size,
+				segment_id,
+				&mut memtables,
+			)?;
 		}
 
 		if !current_memtable.is_empty() {

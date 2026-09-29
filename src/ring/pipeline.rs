@@ -360,23 +360,23 @@ impl CommitPipeline {
 			let needed = batch.memtable_size_estimate();
 			if needed > self.inner.opts.max_memtable_size as u64 {
 				// Batch exceeds max_memtable_size: bypass memtable and flush directly to L0.
-				// First rotate any existing active memtable so earlier writes stay ordered before
-				// this L0 table.
-				if !active.is_empty() {
-					drop(active);
-					self.inner.rotate_memtable()?;
-					if let Some(ref tm) = self.task_manager {
-						tm.wake_up_memtable();
-					}
-					active = self.inner.active_memtable.read()?;
+				// Seal the active memtable's WAL segment first (rotating it out if it holds
+				// earlier writes, or just rotating the WAL if it's already empty) so earlier
+				// writes stay ordered before this L0 table, and so no future write can land
+				// in the segment `write_batch_direct_to_l0_sst` is about to mark as captured.
+				drop(active);
+				let batch_wal_number = self.inner.seal_active_wal_segment()?;
+				if let Some(ref tm) = self.task_manager {
+					tm.wake_up_memtable();
 				}
 
 				let table_id = self.inner.level_manifest.read()?.next_table_id();
-				self.inner.write_batch_direct_to_l0_sst(batch, table_id)?;
+				self.inner.write_batch_direct_to_l0_sst(batch, table_id, batch_wal_number)?;
 
 				if let Some(ref tm) = self.task_manager {
 					tm.wake_up_level();
 				}
+				active = self.inner.active_memtable.read()?;
 			} else {
 				match active.add(batch) {
 					Ok(()) => {}
@@ -390,11 +390,20 @@ impl CommitPipeline {
 						if let Err(Error::ArenaFull) = active.add(batch) {
 							// If it still doesn't fit even in an empty fresh memtable,
 							// fallback to direct-to-L0 flush rather than failing hard.
+							// `active` is guaranteed empty here (freshly rotated), so seal
+							// its WAL segment too before advancing log_number past it.
+							drop(active);
+							let batch_wal_number = self.inner.seal_active_wal_segment()?;
 							let table_id = self.inner.level_manifest.read()?.next_table_id();
-							self.inner.write_batch_direct_to_l0_sst(batch, table_id)?;
+							self.inner.write_batch_direct_to_l0_sst(
+								batch,
+								table_id,
+								batch_wal_number,
+							)?;
 							if let Some(ref tm) = self.task_manager {
 								tm.wake_up_level();
 							}
+							active = self.inner.active_memtable.read()?;
 						}
 					}
 					Err(e) => return Err(e),
