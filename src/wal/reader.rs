@@ -39,7 +39,10 @@ pub(crate) struct Reader {
 	file: File,
 
 	/// Buffer holding the current block's data
-	buffer: Vec<u8>,
+	buffer: Box<[u8; BLOCK_SIZE]>,
+
+	/// End of valid buffer data.
+	buffer_end: usize,
 
 	/// Current read position within the buffer
 	buffer_offset: usize,
@@ -89,8 +92,9 @@ impl Reader {
 	) -> Self {
 		Reader {
 			file,
-			buffer: Vec::with_capacity(BLOCK_SIZE),
+			buffer: Box::new([0; BLOCK_SIZE]),
 			buffer_offset: 0,
+			buffer_end: 0,
 			end_of_buffer_offset: 0,
 			eof: false,
 			read_error: false,
@@ -122,7 +126,7 @@ impl Reader {
 
 	/// Returns the number of bytes remaining in the current buffer.
 	fn buffer_remaining(&self) -> usize {
-		self.buffer.len().saturating_sub(self.buffer_offset)
+		self.buffer_end - self.buffer_offset
 	}
 
 	/// Reads the next block from the file into the buffer.
@@ -137,28 +141,34 @@ impl Reader {
 		}
 
 		// Discard remaining bytes (padding) and read next full block
-		self.buffer.clear();
-		self.buffer.resize(BLOCK_SIZE, 0);
-
-		match self.file.read(&mut self.buffer) {
-			Ok(0) => {
-				self.eof = true;
-				self.buffer.clear();
-				Ok(false)
-			}
-			Ok(n) => {
-				self.buffer.truncate(n);
-				self.buffer_offset = 0;
-				self.end_of_buffer_offset += n;
-				if n < BLOCK_SIZE {
+		self.buffer_end = 0;
+		self.buffer_offset = 0;
+		loop {
+			match self.file.read(&mut self.buffer[self.buffer_end..]) {
+				Ok(0) => {
 					self.eof = true;
+
+					if self.buffer_end == 0 {
+						return Ok(false);
+					}
+
+					return Ok(true);
 				}
-				Ok(true)
-			}
-			Err(e) => {
-				self.read_error = true;
-				self.buffer.clear();
-				Err(Error::IO(IOError::new(e.kind(), &e.to_string())))
+				Ok(n) => {
+					self.buffer_end += n;
+					self.end_of_buffer_offset += n;
+
+					if self.buffer_end < BLOCK_SIZE {
+						continue;
+					}
+
+					return Ok(true);
+				}
+				Err(e) => {
+					self.read_error = true;
+					self.buffer_end = 0;
+					return Err(Error::IO(IOError::new(e.kind(), &e.to_string())));
+				}
 			}
 		}
 	}
@@ -224,7 +234,7 @@ impl Reader {
 					block_number,
 					offset_within_block,
 					self.buffer_offset,
-					self.buffer.len(),
+					self.buffer_end,
 					self.end_of_buffer_offset,
 					self.eof,
 					self.compression_type,
@@ -256,13 +266,21 @@ impl Reader {
 		loop {
 			// When < HEADER_SIZE bytes remain, discard them (padding) and read next block
 			if self.buffer_remaining() < WAL_RECORD_HEADER_SIZE {
+				if self.buffer_end != BLOCK_SIZE && self.buffer_remaining() > 0 {
+					// We are reading a partial block, and have data remaining so we are recovering
+					// from a torn write.
+					return Err(Error::IO(IOError::new(
+						io::ErrorKind::Other,
+						"partially written record",
+					)));
+				}
+
 				if !self.read_more()? {
 					return Err(Error::IO(IOError::new(
 						io::ErrorKind::UnexpectedEof,
 						"reached end of file",
 					)));
 				}
-				continue;
 			}
 
 			// Parse header from buffer
@@ -284,7 +302,7 @@ impl Reader {
 					}
 				}
 				// Discard rest of buffer and continue (read_more will be called next iteration)
-				self.buffer_offset = self.buffer.len();
+				self.buffer_offset = self.buffer_end;
 				continue;
 			}
 
@@ -1416,7 +1434,7 @@ mod tests {
 		// fragment
 		let truncated_len = BLOCK_SIZE + BLOCK_SIZE / 2; // ~1.5 blocks
 		let truncated_len = truncated_len.min(file_data.len() - 100); // Ensure we're removing
-																	  // something
+																// something
 		std::fs::write(file_path, &file_data[..truncated_len]).expect("should write file");
 
 		let file = File::open(file_path).expect("should open file");

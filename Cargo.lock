@@ -1539,6 +1539,7 @@ dependencies = [
  "tabled",
  "tempfile",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

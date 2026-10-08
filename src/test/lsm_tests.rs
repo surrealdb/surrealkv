@@ -2191,7 +2191,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 		let wal_path = opts.wal_dir();
 		let min_wal_number = log_number;
 
-		let (wal_seq_opt, _memtable_opt) = Core::replay_wal_with_repair(
+		let (wal_seq_opt, _memtable_opt, _) = Core::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Test",
@@ -2217,7 +2217,7 @@ async fn test_crash_before_flush_replays_wal() {
 
 	let opts = create_test_options(path.clone(), |opts| {
 		opts.max_memtable_size = 10 * 1024 * 1024; // Large memtable to prevent
-		                                           // auto-flush
+		                                     // auto-flush
 	});
 
 	// Phase 1: Write data and simulate crash (no clean shutdown)
@@ -5598,7 +5598,7 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 			for record_id in 0..NUM_RECORDS {
 				let is_odd = record_id % 2 == 1;
 				let delete_this_round = is_odd && (round % 4 == 0); // Delete odd records every 4th
-																	// round
+														// round
 				let reinsert_this_round = is_odd && (round % 4 == 2); // Re-insert 2 rounds later
 
 				if delete_this_round {

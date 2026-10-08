@@ -452,12 +452,10 @@ impl CommitPipeline {
 			vlog_inst.flush()?;
 		}
 
-		let total_capacity: usize = processed_batches.iter().map(|b| b.size as usize + 64).sum();
-		let mut wal_buffer = Vec::with_capacity(total_capacity);
+		let mut wal_buffer = Vec::new();
 		for batch in &processed_batches {
+			wal_buffer.clear();
 			batch.encode_into(&mut wal_buffer)?;
-		}
-		if !wal_buffer.is_empty() {
 			self.log_store.append(&wal_buffer).await?;
 		}
 		if sync {

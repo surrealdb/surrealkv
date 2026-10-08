@@ -1052,7 +1052,7 @@ impl Core {
 	/// * `flush_memtable` - Callback to flush intermediate memtables to SST
 	///
 	/// # Returns
-	/// * `(Option<max_seq_num>, Option<active_memtable>)`
+	/// * `(Option<max_seq_num>, Option<active_memtable>, did_recovery)`
 	pub(crate) fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		min_wal_number: u64,
@@ -1060,10 +1060,12 @@ impl Core {
 		recovery_mode: WalRecoveryMode,
 		arena_size: usize,
 		mut flush_memtable: F,
-	) -> Result<(Option<u64>, Option<Arc<MemTable>>)>
+	) -> Result<(Option<u64>, Option<Arc<MemTable>>, bool)>
 	where
 		F: FnMut(Arc<MemTable>, u64) -> Result<()>,
 	{
+		let mut did_recovery = false;
+
 		// Replay WAL - returns memtables per segment
 		let (wal_seq_num_opt, memtables) = match replay_wal(wal_path, min_wal_number, arena_size) {
 			Ok(result) => result,
@@ -1105,6 +1107,8 @@ impl Core {
 							)));
 						}
 
+						did_recovery = true;
+
 						// Retry after repair
 						match replay_wal(wal_path, min_wal_number, arena_size) {
 							Ok(result) => result,
@@ -1131,7 +1135,7 @@ impl Core {
 
 		// If no memtables, nothing was recovered
 		if memtables.is_empty() {
-			return Ok((None, None));
+			return Ok((None, None, did_recovery));
 		}
 
 		// Flush all memtables except the last to SST
@@ -1167,7 +1171,7 @@ impl Core {
 			if !last_memtable.is_empty() {
 				flush_memtable(last_memtable, last_wal_number)?;
 			}
-			return Ok((wal_seq_num_opt, None));
+			return Ok((wal_seq_num_opt, None, did_recovery));
 		}
 		let entry_count = {
 			let mut iter = last_memtable.iter();
@@ -1186,7 +1190,7 @@ impl Core {
 			entry_count
 		);
 
-		Ok((wal_seq_num_opt, Some(last_memtable)))
+		Ok((wal_seq_num_opt, Some(last_memtable), did_recovery))
 	}
 
 	/// Creates a new LSM tree with background task management
@@ -1224,7 +1228,7 @@ impl Core {
 		);
 
 		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
-		let (wal_seq_num_opt, recovered_memtable) = Self::replay_wal_with_repair(
+		let (wal_seq_num_opt, recovered_memtable, did_recovery) = Self::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Database startup",
@@ -1242,6 +1246,13 @@ impl Core {
 				Ok(())
 			},
 		)?;
+
+		if did_recovery {
+			// On recovery we rotate the log to ensure we write to a new clean wal.
+			// Required as inner opens a writer to a file which repair might replace
+			// so we need to either reopen or rotate the log.
+			inner.wal.write().rotate()?;
+		}
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
@@ -1889,7 +1900,7 @@ impl Tree {
 		}
 
 		// Replay any WAL entries that were restored
-		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_with_repair(
+		let (wal_seq_num_opt, recovered_memtable, did_recovery) = Core::replay_wal_with_repair(
 			&wal_path,
 			manifest_log_number,
 			"Database restore",
@@ -1911,6 +1922,10 @@ impl Tree {
 				Ok(())
 			},
 		)?;
+
+		if did_recovery {
+			self.core.inner.wal.write().rotate()?;
+		}
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
