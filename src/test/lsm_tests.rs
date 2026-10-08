@@ -2191,7 +2191,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 		let wal_path = opts.wal_dir();
 		let min_wal_number = log_number;
 
-		let (wal_seq_opt, _memtable_opt, _) = Core::replay_wal_with_repair(
+		let (wal_seq_opt, _memtable_opt) = Core::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Test",

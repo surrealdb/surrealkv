@@ -52,7 +52,7 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 	batch: &Batch,
 	arena_size: usize,
 	segment_id: u64,
-	memtables: &mut Vec<(Arc<MemTable>, u64)>,
+	memtables: &mut Vec<(Arc<MemTable>, bool, u64)>,
 ) -> Result<Arc<MemTable>> {
 	match current_memtable.add(batch) {
 		Ok(()) => Ok(current_memtable),
@@ -61,7 +61,7 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 				let needed = batch.memtable_size_estimate() as usize + 4096;
 				let oversized = Arc::new(MemTable::new(needed));
 				oversized.add(batch)?;
-				memtables.push((oversized, segment_id));
+				memtables.push((oversized, true, segment_id));
 				return Ok(Arc::new(MemTable::new(arena_size)));
 			}
 
@@ -69,7 +69,7 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 				"WAL segment #{:020} exceeds single memtable capacity, splitting",
 				segment_id
 			);
-			memtables.push((Arc::clone(&current_memtable), segment_id));
+			memtables.push((Arc::clone(&current_memtable), false, segment_id));
 			let fresh = Arc::new(MemTable::new(arena_size));
 			match fresh.add(batch) {
 				Ok(()) => Ok(fresh),
@@ -77,7 +77,7 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 					let needed = batch.memtable_size_estimate() as usize + 4096;
 					let oversized = Arc::new(MemTable::new(needed));
 					oversized.add(batch)?;
-					memtables.push((oversized, segment_id));
+					memtables.push((oversized, true, segment_id));
 					Ok(Arc::new(MemTable::new(arena_size)))
 				}
 				Err(e) => Err(e),
@@ -101,7 +101,7 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 /// * `Ok((Some(max_seq_num), memtables))` - Memtables with their WAL numbers
 /// * `Ok((None, vec![]))` - No data recovered
 /// * `Err(...)` - Error during replay
-type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, u64)>);
+type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>);
 
 pub(crate) fn replay_wal(
 	wal_dir: &Path,
@@ -162,7 +162,7 @@ pub(crate) fn replay_wal(
 	let mut segments_processed = 0;
 
 	// Collect memtables - one per WAL segment
-	let mut memtables: Vec<(Arc<MemTable>, u64)> = Vec::new();
+	let mut memtables: Vec<(Arc<MemTable>, bool, u64)> = Vec::new();
 
 	// Get all segments in the directory
 	let all_segments = SegmentRef::read_segments_from_directory(wal_dir, Some("wal"))?;
@@ -266,7 +266,7 @@ pub(crate) fn replay_wal(
 
 		// Save this segment's memtable if it has data
 		if !current_memtable.is_empty() {
-			memtables.push((current_memtable, segment_id));
+			memtables.push((current_memtable, false, segment_id));
 		}
 
 		if batches_in_segment > 0 {
@@ -477,7 +477,7 @@ mod tests {
 
 		// Verify the memtables contain entries from BOTH segments
 		let mut entry_count = 0;
-		for (memtable, _) in memtables {
+		for (memtable, _, _) in memtables {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
@@ -546,7 +546,7 @@ mod tests {
 
 		// Verify all 3 entries are in the memtables (from all 3 segments)
 		let mut entry_count = 0;
-		for (memtable, _) in memtables {
+		for (memtable, _, _) in memtables {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
@@ -605,7 +605,7 @@ mod tests {
 
 		// Verify all 4 entries from both segments are in the memtables
 		let mut entry_count = 0;
-		for (memtable, _) in memtables {
+		for (memtable, _, _) in memtables {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
@@ -666,7 +666,7 @@ mod tests {
 		drop(file);
 
 		// Test using Core::replay_wal_with_repair (the actual production flow)
-		let (max_seq_num, memtable_opt, _) = crate::lsm::Core::replay_wal_with_repair(
+		let (max_seq_num, memtable_opt) = crate::lsm::Core::replay_wal_with_repair(
 			wal_dir,
 			0,
 			"Test repair",
@@ -747,7 +747,7 @@ mod tests {
 		file.write_all(&data).unwrap(); // Data
 		drop(file);
 
-		let (max_seq_num, memtable_opt, did_recovery) = crate::lsm::Core::replay_wal_with_repair(
+		let (max_seq_num, memtable_opt) = crate::lsm::Core::replay_wal_with_repair(
 			wal_dir,
 			0,
 			"Test repair",
@@ -759,8 +759,6 @@ mod tests {
 			},
 		)
 		.unwrap();
-
-		assert!(did_recovery, "Should have ran recovery");
 
 		// Verify the repair worked correctly
 		// Since the third batch is corrupted, we should recover data from the first two
@@ -927,7 +925,7 @@ mod tests {
 
 		// Verify all 4 entries from both segments are recovered
 		let mut entry_count = 0;
-		for (memtable, _) in memtables {
+		for (memtable, _, _) in memtables {
 			let mut iter = memtable.iter();
 			while iter.valid() {
 				entry_count += 1;
@@ -1047,9 +1045,9 @@ mod tests {
 		assert_eq!(memtables.len(), 3, "Should create one memtable per WAL segment");
 
 		// Verify each memtable has correct WAL number
-		assert_eq!(memtables[0].1, 0, "First memtable should have WAL 0");
-		assert_eq!(memtables[1].1, 1, "Second memtable should have WAL 1");
-		assert_eq!(memtables[2].1, 2, "Third memtable should have WAL 2");
+		assert_eq!(memtables[0].2, 0, "First memtable should have WAL 0");
+		assert_eq!(memtables[1].2, 1, "Second memtable should have WAL 1");
+		assert_eq!(memtables[2].2, 2, "Third memtable should have WAL 2");
 
 		// Verify each memtable has correct data
 		{
@@ -1133,13 +1131,13 @@ mod tests {
 
 		let (_ikey0, val0) = memtables
 			.iter()
-			.find_map(|(mt, _)| mt.get(b"key0", None))
+			.find_map(|(mt, _, _)| mt.get(b"key0", None))
 			.expect("key0 must be recovered");
 		assert_eq!(val0, b"value0".to_vec());
 
 		let (_ikey1, val1) = memtables
 			.iter()
-			.find_map(|(mt, _)| mt.get(b"key1", None))
+			.find_map(|(mt, _, _)| mt.get(b"key1", None))
 			.expect("key1 must be recovered");
 		assert_eq!(val1, big_value);
 	}

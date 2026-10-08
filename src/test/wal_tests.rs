@@ -152,7 +152,7 @@ fn test_wal_replay_all_segments() {
 
 	// Count actual entries across ALL returned memtables
 	let mut entry_count = 0;
-	for (memtable, _) in memtables {
+	for (memtable, _, _) in memtables {
 		let mut iter = memtable.iter();
 		while iter.valid() {
 			entry_count += 1;

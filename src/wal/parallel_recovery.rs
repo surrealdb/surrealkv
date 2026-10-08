@@ -58,7 +58,7 @@ pub(crate) fn decode_segment_batches(
 	Ok((max_seq, batches))
 }
 
-pub(crate) type ParallelReplayResult = (Option<u64>, Vec<(Arc<MemTable>, u64)>);
+pub(crate) type ParallelReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>);
 
 /// Synchronous entry point for parallel segment replay.
 pub(crate) fn replay_segments_sync(
@@ -165,7 +165,7 @@ pub(crate) async fn replay_segments_parallel(
 		}
 
 		if !current_memtable.is_empty() {
-			memtables.push((current_memtable, segment_id));
+			memtables.push((current_memtable, false, segment_id));
 		}
 	}
 

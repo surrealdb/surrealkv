@@ -182,9 +182,9 @@ impl WalTestHelper {
 	}
 
 	/// Count total entries across all memtables
-	pub fn count_total_entries(memtables: &[(Arc<MemTable>, u64)]) -> usize {
+	pub fn count_total_entries(memtables: &[(Arc<MemTable>, bool, u64)]) -> usize {
 		let mut total_entries = 0;
-		for (memtable, _) in memtables {
+		for (memtable, _, _) in memtables {
 			let mut iter = memtable.iter();
 			iter.seek_first().unwrap();
 			while iter.valid() {
@@ -196,7 +196,7 @@ impl WalTestHelper {
 	}
 
 	/// Verify total entry count across all memtables
-	pub fn verify_total_entry_count(memtables: &[(Arc<MemTable>, u64)], expected: usize) {
+	pub fn verify_total_entry_count(memtables: &[(Arc<MemTable>, bool, u64)], expected: usize) {
 		let actual = Self::count_total_entries(memtables);
 		assert_eq!(
 			actual, expected,
@@ -207,11 +207,11 @@ impl WalTestHelper {
 
 	/// Verify that all memtables together contain expected keys
 	pub fn verify_entries_across_memtables(
-		memtables: &[(Arc<MemTable>, u64)],
+		memtables: &[(Arc<MemTable>, bool, u64)],
 		expected_keys: &[String],
 	) {
 		let mut found_keys = Vec::new();
-		for (memtable, _) in memtables {
+		for (memtable, _, _) in memtables {
 			let mut iter = memtable.iter();
 			iter.seek_first().unwrap();
 			while iter.valid() {
