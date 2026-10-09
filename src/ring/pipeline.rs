@@ -101,6 +101,20 @@ pub(super) const ADMISSION_PERMITS: u32 = (DEFAULT_COMMIT_RING_CAPACITY / 2) as 
 /// fenced: see `CommitPipeline::apply_fenced`.
 pub(crate) const UNFENCED_STALE_ROUNDS: u32 = 2;
 
+/// How many groups the flusher drains between two calls to `retire`.
+pub(crate) const RETIRE_EVERY_GROUPS: u32 = 16;
+
+/// How many ring entries the flusher drains between two calls to `retire`, if that comes
+/// before `RETIRE_EVERY_GROUPS` groups. A few huge groups would otherwise leave nearly the
+/// whole ring unretired (about 0.9 KB an entry) while the flusher is idle, and there is no
+/// timer to retire it later: this bounds what an idle ring holds to about this many entries.
+pub(crate) const RETIRE_EVERY_ENTRIES: u64 = 1024;
+
+/// Whether `retire` is due after the groups and entries drained since it last ran.
+fn retire_due(groups: u32, entries: u64) -> bool {
+	groups >= RETIRE_EVERY_GROUPS || entries >= RETIRE_EVERY_ENTRIES
+}
+
 /// Why `CommitPipeline::apply_run` stopped.
 enum ApplyStop {
 	/// Every remaining batch was applied.
@@ -193,6 +207,9 @@ pub(crate) struct CommitPipeline {
 	/// wait for the admitted commits.
 	#[cfg(test)]
 	shutdown_waits: AtomicU64,
+	/// Test-only observer called inside `retire`, between its two reads.
+	#[cfg(test)]
+	retire_gap: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 	/// Test-only failpoint: a WAL buffer of at least this many bytes is refused, as if the
 	/// allocator had none to give. `usize::MAX` disables it.
 	#[cfg(test)]
@@ -242,6 +259,8 @@ impl CommitPipeline {
 			#[cfg(test)]
 			shutdown_waits: AtomicU64::new(0),
 			#[cfg(test)]
+			retire_gap: Mutex::new(None),
+			#[cfg(test)]
 			wal_reserve_fails_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
 		}
 	}
@@ -276,6 +295,13 @@ impl CommitPipeline {
 	#[cfg(test)]
 	pub(crate) fn set_wal_reserve_fails_from(&self, bytes: usize) {
 		self.wal_reserve_fails_from.store(bytes, Ordering::Relaxed);
+	}
+
+	/// Installs (or clears) the observer called inside `retire` after it read the completed
+	/// prefix and before it scans the pinned transactions.
+	#[cfg(test)]
+	pub(crate) fn set_retire_gap_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+		*self.retire_gap.lock() = hook;
 	}
 
 	/// Installs (or clears) the observer called at each `PipelineHook` point.
@@ -329,8 +355,22 @@ impl CommitPipeline {
 	/// The value a mutating transaction pins in `active_txn_tracker` at
 	/// begin. Read before [`commit_window`](Self::commit_window), so the
 	/// retired watermark can never pass the window it then reads.
+	///
+	/// The pin and the window are two reads of the same monotonic completed
+	/// prefix, the pin first, so the pin is at most the window. `retire` reads
+	/// the completed prefix before it scans the pins, so the watermark stays
+	/// at or below every live window: a pin the scan sees bounds it by at
+	/// most that window, and a transaction the scan misses registers after it
+	/// and so reads its window from a prefix at least as high.
+	///
+	/// The pin must not be read from the retired watermark. `retire` sets the
+	/// watermark to the oldest pin (or the completed prefix, if lower), and a
+	/// pin read from the watermark is never above it, so while any mutating
+	/// transaction is live the watermark cannot move. Every lapped
+	/// `CommitEntry` then goes into the `overflow` map under its mutex (see
+	/// `publish`) and memory grows by about 0.7-0.8 KB per commit.
 	pub(crate) fn commit_pin(&self) -> u64 {
-		self.ring.taken()
+		self.ring.completed()
 	}
 
 	/// The start of a beginning transaction's conflict window: every commit
@@ -501,6 +541,9 @@ impl CommitPipeline {
 	/// Background flusher loop performing group commit.
 	async fn run_flusher(&self, mut drained: u64) {
 		// `drained` is the last ring sequence the flusher has consumed.
+		// Groups flushed, and ring entries drained, since `retire` last ran.
+		let mut groups_since_retire = 0u32;
+		let mut entries_since_retire = 0u64;
 		// Completes once every admission permit is back, which is once no commit is admitted
 		// and undecided. Only polled at shutdown.
 		let mut all_permits =
@@ -563,6 +606,8 @@ impl CommitPipeline {
 				self.notify_flusher.notified().await;
 				continue;
 			}
+			let entries = next - (drained + 1);
+			entries_since_retire += entries;
 			drained = next - 1;
 
 			if !group.is_empty() {
@@ -572,7 +617,18 @@ impl CommitPipeline {
 			// covers them and their permits may admit new claims.
 			self.ring.advance_completed();
 			drop(permits);
-			self.retire();
+			// Retirement only frees memory, and scanning the transaction pins costs
+			// far more than the rest of a small group, so do it every few groups, or
+			// sooner after a large number of entries. The watermark then lags, which is safe:
+			// `publish` keeps more lapped entries in the overflow map and `validate`
+			// treats a missing one as a conflict. There is no retire when the flusher
+			// parks, since that would bring back one per group for a lone writer.
+			groups_since_retire += 1;
+			if retire_due(groups_since_retire, entries_since_retire) {
+				groups_since_retire = 0;
+				entries_since_retire = 0;
+				self.retire();
+			}
 		}
 	}
 
@@ -639,12 +695,24 @@ impl CommitPipeline {
 		}
 	}
 
-	/// Advances the retired watermark to the oldest pinned transaction and
-	/// drops overflow entries that no live window can reach any more.
+	/// Advances the retired watermark to the oldest pin, or to the completed prefix if that is
+	/// lower. A transaction that read its pin before the scan and registers after it is not
+	/// seen, so the watermark may pass its pin, but never its window: the scan follows the read
+	/// of the completed prefix that bounds it, and that transaction reads its window from a
+	/// prefix at least as high.
+	///
+	/// Drops the overflow entries that no live window can reach any more.
 	fn retire(&self) {
 		// Read the completed prefix before scanning the pins: a transaction
 		// that registers after the scan reads its window after this value.
 		let completed = self.ring.completed();
+		#[cfg(test)]
+		{
+			let hook = self.retire_gap.lock().clone();
+			if let Some(hook) = hook {
+				hook();
+			}
+		}
 		let bound = match self.inner.active_txn_tracker.oldest() {
 			Some(pin) => pin.min(completed),
 			None => completed,
@@ -1157,4 +1225,29 @@ fn bloom_of(keys: &[Key]) -> BloomFilter {
 		bloom.insert(k);
 	}
 	bloom
+}
+
+#[cfg(test)]
+mod retire_due_tests {
+	use super::{retire_due, RETIRE_EVERY_ENTRIES, RETIRE_EVERY_GROUPS};
+
+	#[test]
+	fn retire_is_due_after_enough_groups_or_enough_entries() {
+		assert!(!retire_due(0, 0));
+		// A lone writer: 15 groups of one entry is not yet time.
+		assert!(!retire_due(RETIRE_EVERY_GROUPS - 1, u64::from(RETIRE_EVERY_GROUPS - 1)));
+		assert!(retire_due(RETIRE_EVERY_GROUPS, u64::from(RETIRE_EVERY_GROUPS)));
+		// A few huge groups: due on entries alone, well before the group count.
+		assert!(!retire_due(2, RETIRE_EVERY_ENTRIES - 1));
+		assert!(retire_due(2, RETIRE_EVERY_ENTRIES));
+		assert!(retire_due(1, RETIRE_EVERY_ENTRIES + 1));
+	}
+
+	#[test]
+	fn the_usual_group_sizes_do_not_retire_more_often_than_every_sixteen_groups() {
+		// 64 writers form groups of about 30 entries; 16 of them stay under the entry limit,
+		// so the entry trigger changes nothing at ordinary load.
+		assert!(u64::from(RETIRE_EVERY_GROUPS) * 64 <= RETIRE_EVERY_ENTRIES);
+		assert!(!retire_due(RETIRE_EVERY_GROUPS - 1, u64::from(RETIRE_EVERY_GROUPS - 1) * 64));
+	}
 }

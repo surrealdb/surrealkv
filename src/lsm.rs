@@ -137,11 +137,12 @@ pub(crate) struct CoreInner {
 	/// snapshot-aware compaction.
 	pub(crate) snapshot_tracker: SnapshotTracker,
 
-	/// Pins held by every live mutating transaction on the commit ring's
-	/// retired watermark, so the ring entries in their conflict windows stay
-	/// reachable. Separate from `snapshot_tracker` because write-only txns
-	/// need this protection but don't hold MVCC snapshots, and read-only txns
-	/// hold snapshots but never commit.
+	/// Pins of every live mutating transaction, which hold the commit ring's
+	/// retired watermark at or below their conflict windows, so the ring
+	/// entries in those windows stay reachable. Separate from
+	/// `snapshot_tracker` because write-only txns need this protection but
+	/// don't hold MVCC snapshots, and read-only txns hold snapshots but never
+	/// commit.
 	pub(crate) active_txn_tracker: Arc<crate::tracker::ActiveTxnTracker>,
 
 	/// Value Log (VLog)
