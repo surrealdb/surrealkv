@@ -412,12 +412,6 @@ impl CoreInner {
 	/// Used for batches that exceed `max_memtable_size` to avoid `ArenaFull` allocation
 	/// failures and unnecessary in-memory buffering.
 	///
-	/// Every immutable memtable still in the queue holds older writes than `batch`, so
-	/// they are all flushed first. Installing this table while one of them is pending
-	/// would put older data in L0 *after* newer data: an L0->L1 compaction that starts in
-	/// between moves this table to L1, and the older table that lands in L0 afterwards
-	/// then shadows it on reads.
-	///
 	/// `batch_wal_number` is the WAL segment number that `batch` was durably appended to
 	/// before this call (the caller must have already ensured that segment can never
 	/// receive another write — see `seal_active_wal_segment`). It is used to safely
@@ -435,13 +429,6 @@ impl CoreInner {
 		batch_wal_number: u64,
 		rest_wal_number: u64,
 	) -> Result<Arc<Table>> {
-		// Hold the flush lock until the table is installed, so the background flush task
-		// can't install anything in between.
-		let flush_guard = self.flush_lock.lock();
-		while !self.immutable_memtables.read()?.is_empty() {
-			self.flush_oldest_immutable_to_sst_locked(&flush_guard)?;
-		}
-
 		let table_file_path = self.opts.sstable_file_path(table_id);
 		let mut range_deletions = Vec::new();
 		let mut point_entries = Vec::new();
@@ -672,15 +659,7 @@ impl CoreInner {
 	/// Fails, flushing nothing, once a commit group stopped the database: see
 	/// `BackgroundErrorHandler::commit_group_error`.
 	fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
-		let flush_guard = self.flush_lock.lock();
-		self.flush_oldest_immutable_to_sst_locked(&flush_guard)
-	}
-
-	/// `flush_oldest_immutable_to_sst` for a caller that already holds `flush_lock`.
-	fn flush_oldest_immutable_to_sst_locked(
-		&self,
-		_flush_guard: &parking_lot::MutexGuard<'_, ()>,
-	) -> Result<Option<Arc<Table>>> {
+		let _flush = self.flush_lock.lock();
 		if let Some(error) = self.error_handler.commit_group_error() {
 			return Err(error);
 		}
