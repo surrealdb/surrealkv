@@ -130,6 +130,27 @@ impl AffinityLogStore {
 		}
 	}
 
+	/// Appends `data` as one record and returns the WAL segment it was written to.
+	///
+	/// The segment is read in the same critical section as the append. Rotating the
+	/// WAL needs the same lock, so the returned number is the segment the record
+	/// physically lives in, and the commit pipeline can compare it with the tag of
+	/// the memtable it is about to apply the record to.
+	#[cfg(test)]
+	pub(crate) fn append_returning_segment(&self, data: &[u8]) -> BoxFuture<'_, u64> {
+		let wal = Arc::clone(&self.wal);
+		let data = data.to_vec();
+		Box::pin(async move {
+			affinitypool::spawn(move || -> Result<u64> {
+				let mut guard = wal.write();
+				let segment = guard.get_active_log_number();
+				guard.append(&data).map_err(|e| crate::error::Error::Other(e.to_string()))?;
+				Ok(segment)
+			})
+			.await
+		})
+	}
+
 	/// Appends a group of records, `buf[ends[i - 1]..ends[i]]` being record `i`, as one WAL
 	/// record each, and returns the segment they were all written to together with the two
 	/// buffers, so the caller can reuse their allocations.

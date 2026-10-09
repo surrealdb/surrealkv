@@ -70,6 +70,12 @@ impl Writer {
 		self.dest.file_writes()
 	}
 
+	/// Test-only: whether anything was appended since the last successful fsync.
+	#[cfg(test)]
+	pub(crate) fn pending_sync(&self) -> bool {
+		self.dest.pending_sync()
+	}
+
 	/// Adds a record to the WAL.
 	///
 	/// The record is automatically fragmented if it doesn't fit in the current

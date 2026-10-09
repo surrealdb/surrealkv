@@ -9,20 +9,23 @@
 //! * the bytes of a group are the bytes one `add_record` per batch writes, for any mix of record
 //!   sizes, block positions and compression;
 //! * a crash image cut at any byte of a coalesced group recovers a prefix of whole records, and the
-//!   commits made after that recovery survive another crash.
+//!   commits made after that recovery survive another crash;
+//! * Immediate groups are fsynced before anyone is told, on the re-append path as well.
 //!
-//! Test-only instrumentation these tests need: the `BufferedFileWriter` failpoint
-//! `fail_after_ops` and the write counter `file_writes` (and the `Writer` / `Wal` forwarders).
+//! Test-only instrumentation these tests need: `BufferedFileWriter::pending_sync` (and the
+//! `Writer` / `Wal` forwarders), and the failpoint `fail_after_ops` and the write counter
+//! `file_writes`.
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tempdir::TempDir;
 use test_log::test;
 
 use crate::batch::Batch;
+use crate::ring::PipelineHook;
 use crate::vlog::ValueLocation;
 use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
@@ -118,6 +121,10 @@ fn records_with_ends(path: &Path) -> Vec<(u64, Batch)> {
 	}
 }
 
+fn user_keys(batch: &Batch) -> Vec<String> {
+	batch.entries.iter().map(|e| String::from_utf8(e.key.clone()).unwrap()).collect()
+}
+
 fn copy_dir(src: &Path, dst: &Path) {
 	fs::create_dir_all(dst).unwrap();
 	for entry in fs::read_dir(src).unwrap() {
@@ -148,15 +155,21 @@ fn active_segment(tree: &Tree) -> u64 {
 	tree.core.inner.wal.read().get_active_log_number()
 }
 
-/// The highest-numbered segment in `dir/wal`.
-fn last_segment(dir: &Path) -> PathBuf {
+fn segment_ids(dir: &Path) -> Vec<u64> {
 	let mut ids: Vec<u64> = fs::read_dir(dir.join("wal"))
 		.unwrap()
-		.map(|e| e.unwrap().path())
-		.filter(|p| p.extension().is_some_and(|ext| ext == "wal"))
-		.map(|p| p.file_stem().unwrap().to_str().unwrap().parse().unwrap())
+		.filter_map(|e| {
+			let name = e.unwrap().file_name().to_string_lossy().to_string();
+			name.strip_suffix(".wal").and_then(|s| s.parse().ok())
+		})
 		.collect();
 	ids.sort();
+	ids
+}
+
+/// The highest-numbered segment in `dir/wal`.
+fn last_segment(dir: &Path) -> PathBuf {
+	let ids = segment_ids(dir);
 	seg_path(dir, *ids.last().expect("a segment"))
 }
 
@@ -1081,6 +1094,318 @@ async fn a_failed_big_group_through_the_flusher_leaves_the_acked_bytes_and_the_n
 		release_lock(&reopened);
 	}
 	assert!(went_through, "the group never went through, so there is no control");
+}
+
+// ---------------------------------------------------------------------------
+// the re-append path
+// ---------------------------------------------------------------------------
+
+/// Appends the same group the way the straddling-group test in `wal_rotation_tests` does: a
+/// segment-filling prefill and then 24 commits as one group, which fills the arena part-way
+/// and so is appended once and its tail appended again after the rotation.
+async fn straddling_setup(path: &Path) -> (Arc<Tree>, Vec<(String, Vec<u8>)>, u64) {
+	let tree = Arc::new(Tree::new(opts(path, 4096)).unwrap());
+	stop_background_tasks(&tree).await;
+	let prefill: Vec<(String, Vec<u8>)> =
+		(0..10).map(|i| (format!("pre{i:03}"), payload(i, 100))).collect();
+	for (k, v) in &prefill {
+		put(&tree, k, v, Durability::Immediate).await;
+	}
+	let first = tree.core.inner.active_memtable.read().unwrap().get_wal_number();
+	(tree, prefill, first)
+}
+
+fn straddling_group() -> Vec<(String, Vec<u8>)> {
+	(0..24).map(|i| (format!("grp{i:03}"), payload(100 + i, 100))).collect()
+}
+
+/// Where the failure of a straddling group's appends is injected.
+#[derive(Clone, Copy, Debug)]
+enum Inject {
+	/// Into the first append (the whole group), before the group starts.
+	FirstAppend,
+	/// Into the second append (the stale tail, logged again in the new segment after the
+	/// rotation): the failpoint is armed on the new segment's writer when the repair round
+	/// starts.
+	SecondAppend,
+}
+
+/// A failure at every write of the two appends a straddling group makes (the whole group, then
+/// its tail after the rotation): the group fails as a unit, a failure in the first append
+/// leaves the first segment as it was and a failure in the second leaves the first segment
+/// holding the whole group and the second empty, and a record is never in a segment twice. A
+/// restart recovers every acknowledged commit; a group that failed in the second append is
+/// recovered whole (its first append was durable) and one that failed in the first not at all.
+async fn straddling_failure_sweep(inject: Inject) {
+	let mut went_through = false;
+	let mut failed_in_second = 0;
+	for fail_after in 0..400 {
+		let dir = TempDir::new("wal_group_crash").unwrap();
+		let live = dir.path().join("live");
+		let (tree, prefill, first) = straddling_setup(&live).await;
+		let pre_bytes = fs::read(seg_path(&live, first)).unwrap();
+		let group = straddling_group();
+
+		match inject {
+			Inject::FirstAppend => tree.core.inner.wal.write().fail_writes_after(fail_after),
+			Inject::SecondAppend => {
+				let inner = Arc::clone(&tree.core.inner);
+				let armed = Arc::new(Mutex::new(false));
+				tree.core.commit_pipeline.set_hook(Some(Arc::new(move |point| {
+					if let PipelineHook::BeforeApplyRound {
+						round: 1,
+					} = point
+					{
+						if !std::mem::replace(&mut *armed.lock().unwrap(), true) {
+							inner.wal.write().fail_writes_after(fail_after);
+						}
+					}
+				})));
+			}
+		}
+		let results = commit_group(&tree, &group, Durability::Immediate).await;
+		if results.iter().all(|r| r.is_ok()) {
+			assert!(
+				fail_after > 3,
+				"{inject:?}: the failpoint was not reached before {fail_after}"
+			);
+			went_through = true;
+			let tree = Arc::try_unwrap(tree).ok().expect("no other owner");
+			crash(tree);
+			break;
+		}
+		assert!(results.iter().all(|r| r.is_err()), "{inject:?} {fail_after}: {results:?}");
+
+		let ids = segment_ids(&live);
+		let first_records = records_with_ends(&seg_path(&live, first));
+		let in_first: Vec<String> = first_records.iter().flat_map(|(_, b)| user_keys(b)).collect();
+		let group_keys: Vec<String> = group.iter().map(|(k, _)| k.clone()).collect();
+		let second_failed = ids.contains(&(first + 1));
+		if second_failed {
+			failed_in_second += 1;
+			assert_eq!(
+				first_records.len(),
+				prefill.len() + group.len(),
+				"{inject:?} {fail_after}: the first append was whole"
+			);
+			assert_eq!(
+				fs::metadata(seg_path(&live, first + 1)).unwrap().len(),
+				0,
+				"{inject:?} {fail_after}: a failed re-append leaves the new segment empty"
+			);
+			assert!(in_first.ends_with(&group_keys));
+		} else {
+			assert_eq!(
+				fs::read(seg_path(&live, first)).unwrap(),
+				pre_bytes,
+				"{inject:?} {fail_after}: a failed first append leaves the segment as it was"
+			);
+		}
+		// Never twice in a segment.
+		for id in &ids {
+			let mut keys: Vec<String> = records_with_ends(&seg_path(&live, *id))
+				.iter()
+				.flat_map(|(_, b)| user_keys(b))
+				.collect();
+			let n = keys.len();
+			keys.sort();
+			keys.dedup();
+			assert_eq!(keys.len(), n, "{inject:?} {fail_after}: a record twice in segment {id}");
+		}
+		// The writer that failed is poisoned: nothing more is logged.
+		let later =
+			commit_group(&tree, &[("later".to_string(), payload(9, 50))], Durability::Immediate)
+				.await;
+		assert!(later[0].is_err(), "{inject:?} {fail_after}: poisoned");
+
+		let tree = Arc::try_unwrap(tree).ok().expect("no other owner");
+		crash(tree);
+		let reopened = Tree::new(opts(&live, 4096)).unwrap();
+		for (k, v) in &prefill {
+			assert_eq!(get(&reopened, k).as_deref(), Some(v.as_slice()), "{inject:?} {fail_after}");
+		}
+		// Whole or nothing: a failed group is never half recovered.
+		let recovered =
+			group.iter().filter(|(k, v)| get(&reopened, k).as_deref() == Some(v)).count();
+		assert!(
+			recovered == 0 || recovered == group.len(),
+			"{inject:?} {fail_after}: {recovered} of {} recovered",
+			group.len()
+		);
+		assert_eq!(recovered == group.len(), second_failed, "{inject:?} {fail_after}");
+		assert_eq!(get(&reopened, "later"), None);
+		mark_closed(&reopened);
+		release_lock(&reopened);
+	}
+	assert!(went_through, "{inject:?}: the group never went through, so there is no control");
+	match inject {
+		Inject::FirstAppend => assert_eq!(failed_in_second, 0),
+		Inject::SecondAppend => assert!(failed_in_second > 0, "no failure landed in the re-append"),
+	}
+}
+
+#[test(tokio::test)]
+async fn a_failure_in_the_first_append_of_a_straddling_group_fails_it_as_a_unit() {
+	straddling_failure_sweep(Inject::FirstAppend).await;
+}
+
+#[test(tokio::test)]
+async fn a_failure_in_the_re_append_of_a_straddling_group_fails_it_as_a_unit() {
+	straddling_failure_sweep(Inject::SecondAppend).await;
+}
+
+/// Every apply round of an Immediate group starts with nothing appended since the last fsync:
+/// at the group's WAL sync and at the start of every later round, which includes the rounds
+/// that follow a rotation and a re-append of stale records, a direct-to-L0 write, and a
+/// rotation by someone else. The Eventual control proves the probe can see an unsynced append.
+#[test(tokio::test)]
+async fn immediate_groups_are_fsynced_before_apply_on_every_path() {
+	for (name, foreign_rotation, oversized_in_the_middle) in [
+		("straddle", false, false),
+		("foreign rotation", true, false),
+		("direct to L0 mid group", false, true),
+	] {
+		for durability in [Durability::Immediate, Durability::Eventual] {
+			let dir = TempDir::new("wal_group_crash").unwrap();
+			let live = dir.path().join("live");
+			let (tree, _prefill, _first) = straddling_setup(&live).await;
+			let inner = Arc::clone(&tree.core.inner);
+
+			let unsynced = Arc::new(Mutex::new(Vec::new()));
+			let rounds = Arc::new(Mutex::new(0usize));
+			{
+				let (inner, unsynced, rounds) =
+					(Arc::clone(&inner), Arc::clone(&unsynced), Arc::clone(&rounds));
+				let rotated = Arc::new(Mutex::new(false));
+				tree.core.commit_pipeline.set_hook(Some(Arc::new(move |point| {
+					let wal = inner.wal.read();
+					match point {
+						PipelineHook::AfterWalSync {
+							..
+						} => {
+							unsynced.lock().unwrap().push(wal.pending_sync());
+							drop(wal);
+							if foreign_rotation
+								&& !std::mem::replace(&mut *rotated.lock().unwrap(), true)
+							{
+								inner.rotate_memtable().unwrap();
+							}
+						}
+						PipelineHook::BeforeApplyRound {
+							..
+						} => {
+							*rounds.lock().unwrap() += 1;
+							unsynced.lock().unwrap().push(wal.pending_sync());
+						}
+					}
+				})));
+			}
+
+			let mut group = straddling_group();
+			if oversized_in_the_middle {
+				group.truncate(6);
+				group[2].1 = vec![b'O'; 4096 + 600];
+			} else if foreign_rotation {
+				group.truncate(6);
+			}
+			for r in commit_group(&tree, &group, durability).await {
+				r.unwrap();
+			}
+			let seen = unsynced.lock().unwrap().clone();
+			assert!(*rounds.lock().unwrap() >= 2, "{name}: the group was repaired at least once");
+			match durability {
+				Durability::Immediate => assert!(
+					seen.iter().all(|pending| !pending),
+					"{name}: appended data was not fsynced when the group moved on: {seen:?}"
+				),
+				Durability::Eventual => assert!(
+					seen.iter().any(|pending| *pending),
+					"{name}: control: an Eventual group leaves data unsynced: {seen:?}"
+				),
+			}
+			let tree = Arc::try_unwrap(tree).ok().expect("no other owner");
+			crash(tree);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// concurrent writers and rotations: no record twice in a segment, sequence order kept
+// ---------------------------------------------------------------------------
+
+/// Writers commit Immediate singles while another task keeps rotating the memtable and a
+/// small arena fills by itself. Whatever interleaving: no segment holds a record twice, the
+/// sequence numbers in a segment only ever increase (re-appended records follow the group they
+/// belong to), and a crash image recovers every acknowledged commit.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn racing_writers_and_rotations_never_log_a_record_twice_into_one_segment() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(opts(&live, 8192)).unwrap());
+	stop_background_tasks(&tree).await;
+
+	let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+	let rotator = {
+		let (inner, stop) = (Arc::clone(&tree.core.inner), Arc::clone(&stop));
+		tokio::task::spawn_blocking(move || {
+			let mut n = 0u32;
+			while !stop.load(Ordering::Relaxed) {
+				inner.rotate_memtable().unwrap();
+				n += 1;
+				std::thread::sleep(std::time::Duration::from_micros(300));
+			}
+			n
+		})
+	};
+	let mut writers = Vec::new();
+	for w in 0..6usize {
+		let tree = Arc::clone(&tree);
+		writers.push(tokio::spawn(async move {
+			let mut acked = Vec::new();
+			for i in 0..120usize {
+				let key = format!("w{w}_{i:04}");
+				let value = payload(w * 1000 + i, 60 + (i % 7) * 200);
+				let mut txn = tree.begin().unwrap();
+				txn.set_durability(Durability::Immediate);
+				txn.set(key.as_bytes(), &value).unwrap();
+				if txn.commit().await.is_ok() {
+					acked.push((key, value));
+				}
+			}
+			acked
+		}));
+	}
+	let mut acked = Vec::new();
+	for w in writers {
+		acked.extend(w.await.unwrap());
+	}
+	stop.store(true, Ordering::Relaxed);
+	let rotations = rotator.await.unwrap();
+	assert!(rotations > 5, "only {rotations} rotations happened");
+	assert_eq!(acked.len(), 6 * 120, "no commit may fail in this test");
+
+	for id in segment_ids(&live) {
+		let records = records_with_ends(&seg_path(&live, id));
+		let mut seqs: Vec<u64> = records.iter().map(|(_, b)| b.starting_seq_num).collect();
+		let n = seqs.len();
+		assert!(
+			seqs.windows(2).all(|w| w[0] < w[1]),
+			"segment {id}: sequence numbers must increase: {seqs:?}"
+		);
+		seqs.dedup();
+		assert_eq!(seqs.len(), n, "segment {id}: a record twice");
+	}
+
+	let image = dir.path().join("image");
+	copy_dir(&live, &image);
+	let recovered = Tree::new(opts(&image, 8192)).unwrap();
+	for (k, v) in &acked {
+		assert_eq!(get(&recovered, k).as_deref(), Some(v.as_slice()), "{k} after a crash");
+	}
+	mark_closed(&recovered);
+	release_lock(&recovered);
+	mark_closed(&tree);
+	release_lock(&tree);
 }
 
 // ---------------------------------------------------------------------------

@@ -40,8 +40,9 @@ pub(crate) type BPTreeEntries = Vec<(Vec<u8>, Vec<u8>)>;
 pub(crate) struct ImmutableEntry {
 	/// The table ID that will be used for the SST file
 	pub table_id: u64,
-	/// The WAL number that was current when this memtable was active.
-	/// Used to determine which WALs can be safely deleted after flush.
+	/// The WAL segment this memtable is tagged with: every record applied to it
+	/// lies in this segment (the commit pipeline checks that before applying a
+	/// batch), so flushing it makes every segment up to this one deletable.
 	pub wal_number: u64,
 	/// The memtable data
 	pub memtable: Arc<MemTable>,
@@ -91,8 +92,14 @@ impl ImmutableMemtables {
 pub(crate) struct MemTable {
 	map: ArenaVersionedArtMap<Key, Value>,
 	latest_seq_num: AtomicU64,
-	/// WAL number that was current when this memtable started receiving writes.
-	/// Used to determine which WALs can be safely deleted after flush.
+	/// The WAL segment this memtable is tagged with. A batch is applied to a
+	/// memtable only if its WAL record was appended to this segment, verified
+	/// under the active-memtable lock that rotation also needs, so a flush that
+	/// moves the manifest's `log_number` past the tag never deletes a segment that
+	/// holds the only record of a batch still in a newer memtable. Used to
+	/// determine which WALs can be safely deleted after flush. (The memtable
+	/// recovered at startup is the exception: it may hold records of older
+	/// segments, but it is the oldest memtable and is flushed as a unit.)
 	wal_number: AtomicU64,
 	/// Bytes reserved by in-flight `add` calls but not yet allocated in the
 	/// arena. Atomically updated by `try_reserve` / `release_reservation`
@@ -203,6 +210,22 @@ impl MemTable {
 		self.map.arena().capacity()
 	}
 
+	/// Whether `bytes` more fit in the arena next to the `reserved` bytes already
+	/// claimed by in-flight inserts.
+	fn fits(&self, bytes: u64, reserved: u64) -> bool {
+		let used = self.size() as u64;
+		let avail = (self.arena_capacity() as u64).saturating_sub(used).saturating_sub(reserved);
+		bytes <= avail
+	}
+
+	/// Whether a batch needing `bytes` would be accepted by `add` right now.
+	///
+	/// Exact when nothing else is inserting concurrently, which is the case for the
+	/// commit flusher: it is the only writer of the active memtable.
+	pub(crate) fn can_fit(&self, bytes: u64) -> bool {
+		self.fits(bytes, self.reserved.load(Ordering::Acquire))
+	}
+
 	/// Atomically reserve `bytes` of arena space for an upcoming batch insertion.
 	///
 	/// On `Ok(())`, the caller has exclusive claim to `bytes` of arena space and
@@ -213,12 +236,9 @@ impl MemTable {
 	/// This is a CAS loop; spurious failures retry until either the reservation
 	/// succeeds or `ArenaFull` is observed against the freshest `reserved` value.
 	pub(crate) fn try_reserve(&self, bytes: u64) -> Result<()> {
-		let capacity = self.arena_capacity() as u64;
 		loop {
 			let current = self.reserved.load(Ordering::Acquire);
-			let used = self.size() as u64;
-			let avail = capacity.saturating_sub(used).saturating_sub(current);
-			if bytes > avail {
+			if !self.fits(bytes, current) {
 				return Err(crate::Error::ArenaFull);
 			}
 			if self

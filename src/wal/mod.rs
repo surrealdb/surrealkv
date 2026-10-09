@@ -547,6 +547,12 @@ impl BufferedFileWriter {
 		self.writer.buffer().is_empty()
 	}
 
+	/// Test-only: whether anything was appended since the last successful fsync.
+	#[cfg(test)]
+	pub(crate) fn pending_sync(&self) -> bool {
+		self.pending_sync
+	}
+
 	/// Drops everything still buffered and cuts the file back to `len`, the end
 	/// of the last complete record.
 	///

@@ -430,6 +430,12 @@ impl Wal {
 		self.active_writer.file_writes()
 	}
 
+	/// Test-only: whether anything was appended to the active segment since its last fsync.
+	#[cfg(test)]
+	pub(crate) fn pending_sync(&self) -> bool {
+		self.active_writer.pending_sync()
+	}
+
 	pub(crate) fn close(&mut self) -> Result<()> {
 		if self.closed {
 			return Ok(());

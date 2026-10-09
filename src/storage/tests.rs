@@ -51,3 +51,35 @@ async fn test_affinity_log_store() {
 	store.append(b"wal entry 2").await.unwrap();
 	store.sync().await.unwrap();
 }
+
+#[tokio::test]
+async fn test_affinity_log_store_append_returning_segment() {
+	let temp_dir = TempDir::new().unwrap();
+	let wal = Arc::new(parking_lot::RwLock::new(
+		crate::wal::manager::Wal::open(temp_dir.path(), crate::wal::Options::default()).unwrap(),
+	));
+	let store = AffinityLogStore::new(Arc::clone(&wal));
+	let first = wal.read().get_active_log_number();
+
+	assert_eq!(store.append_returning_segment(b"before-a").await.unwrap(), first);
+	assert_eq!(store.append_returning_segment(b"before-b").await.unwrap(), first);
+
+	// A rotation between two appends: the next record reports the new segment.
+	wal.write().rotate().unwrap();
+	assert_eq!(store.append_returning_segment(b"after").await.unwrap(), first + 1);
+	assert_eq!(store.append_returning_segment(b"after-2").await.unwrap(), first + 1);
+	store.sync().await.unwrap();
+
+	// Each record is in the segment it was reported in, and only there.
+	let segment =
+		|id: u64| std::fs::read(temp_dir.path().join(crate::wal::segment_name(id, "wal"))).unwrap();
+	let contains = |bytes: &[u8], needle: &[u8]| bytes.windows(needle.len()).any(|w| w == needle);
+	assert!(contains(&segment(first), b"before-a") && contains(&segment(first), b"before-b"));
+	assert!(!contains(&segment(first), b"after"));
+	assert!(contains(&segment(first + 1), b"after") && contains(&segment(first + 1), b"after-2"));
+	assert!(!contains(&segment(first + 1), b"before-a"));
+
+	// An append that fails reports the error, not a segment.
+	wal.write().close().unwrap();
+	assert!(store.append_returning_segment(b"closed").await.is_err());
+}

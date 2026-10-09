@@ -541,10 +541,12 @@ fn observe_wal_groups(tree: &Tree) -> Arc<std::sync::Mutex<Vec<usize>>> {
 	let sizes = Arc::new(std::sync::Mutex::new(Vec::new()));
 	let sink = Arc::clone(&sizes);
 	tree.core.commit_pipeline.set_hook(Some(Arc::new(move |point| {
-		let PipelineHook::AfterWalSync {
+		if let PipelineHook::AfterWalSync {
 			batches,
-		} = point;
-		sink.lock().unwrap().push(batches);
+		} = point
+		{
+			sink.lock().unwrap().push(batches);
+		}
 	})));
 	sizes
 }
