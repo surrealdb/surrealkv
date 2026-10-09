@@ -1052,7 +1052,7 @@ impl Core {
 	/// * `flush_memtable` - Callback to flush intermediate memtables to SST
 	///
 	/// # Returns
-	/// * `(Option<max_seq_num>, Option<active_memtable>)`
+	/// * `(Option<max_seq_num>, Option<active_memtable>, did_recovery)`
 	pub(crate) fn replay_wal_with_repair<F>(
 		wal_path: &Path,
 		min_wal_number: u64,
@@ -1141,7 +1141,7 @@ impl Core {
 				"Recovery: flushing {} intermediate memtables to SST",
 				memtable_count - 1
 			);
-			for (memtable, wal_number) in memtables.iter().take(memtable_count - 1) {
+			for (memtable, _, wal_number) in memtables.iter().take(memtable_count - 1) {
 				if !memtable.is_empty() {
 					flush_memtable(Arc::clone(memtable), *wal_number)?;
 				}
@@ -1155,8 +1155,8 @@ impl Core {
 		// nothing to do with `opts.max_memtable_size`, so it would silently blow
 		// through the configured memory bound for however long it stays active. Flush
 		// it immediately like the other recovered memtables instead.
-		let (last_memtable, last_wal_number) = memtables.into_iter().last().unwrap();
-		if last_memtable.arena_capacity() != arena_size {
+		let (last_memtable, oversized, last_wal_number) = memtables.into_iter().last().unwrap();
+		if oversized {
 			tracing::debug!(
 				"Recovery: last memtable (wal={}) is oversized (arena_capacity={} != {}), \
 				flushing instead of activating",
@@ -1242,6 +1242,11 @@ impl Core {
 				Ok(())
 			},
 		)?;
+
+		// Always continue in a fresh segment: replay may have repaired (replaced) the
+		// segment the writer was opened on, or flushed it and moved the manifest's
+		// log number past it.
+		inner.wal.write().rotate()?;
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
@@ -1911,6 +1916,11 @@ impl Tree {
 				Ok(())
 			},
 		)?;
+
+		// Always continue in a fresh segment: replay may have repaired (replaced) the
+		// segment the writer was opened on, or flushed it and moved the manifest's
+		// log number past it.
+		self.core.inner.wal.write().rotate()?;
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {

@@ -1484,7 +1484,6 @@ dependencies = [
  "aes-gcm",
  "affinitypool",
  "artmap",
- "async-trait",
  "blake3",
  "bytes",
  "byteslice",
@@ -1539,6 +1538,7 @@ dependencies = [
  "tabled",
  "tempfile",
  "tokio",
+ "tracing-subscriber",
 ]
 
 [[package]]

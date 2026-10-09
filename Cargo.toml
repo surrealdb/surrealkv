@@ -40,7 +40,6 @@ parking_lot = "0.12.1"
 bytes = "1.11.1"
 rand = "0.9.2"
 tokio = { version = "1.36", features = ["rt", "sync", "macros", "time"] }
-async-trait = "0.1.82"
 tracing = "0.1"
 lz4_flex = "0.12.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }

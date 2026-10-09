@@ -69,8 +69,6 @@ impl Batch {
 	}
 
 	pub(crate) fn encode_into(&self, encoded: &mut Vec<u8>) -> Result<()> {
-		encoded.clear();
-
 		// Write version (1 byte)
 		encoded.push(self.version);
 

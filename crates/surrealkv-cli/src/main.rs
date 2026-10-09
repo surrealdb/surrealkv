@@ -10,6 +10,9 @@ use surrealkv::inspect::{self, DbInfo, ManifestInfo, SstInfo};
 use surrealkv::{LSMIterator, TreeBuilder};
 use tabled::settings::Style;
 use tabled::{Table as DisplayTable, Tabled};
+use tracing_subscriber::layer::SubscriberExt as _;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser)]
 #[command(
@@ -205,6 +208,8 @@ struct WalFileRow {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+	tracing_subscriber::registry().with(fmt::layer()).with(EnvFilter::from_default_env()).init();
+
 	let cli = Cli::parse();
 
 	match cli.command {
