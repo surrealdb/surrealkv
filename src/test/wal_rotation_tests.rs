@@ -1194,7 +1194,8 @@ async fn shape_arena_oversized_batch_with_an_empty_memtable() {
 
 /// The same group shapes with the background flush stopped (control): the
 /// segments that hold the records are all retained, so nothing is lost from the
-/// WAL, except where the direct-to-L0 write advanced `log_number` itself.
+/// WAL, except where the direct-to-L0 write flushed the memtables it sealed and
+/// advanced `log_number` itself.
 #[test(tokio::test)]
 async fn direct_l0_mid_group_with_the_flusher_stopped() {
 	within(async {
@@ -1221,11 +1222,14 @@ async fn direct_l0_mid_group_with_the_flusher_stopped() {
 			r.as_ref().unwrap();
 		});
 		assert_eq!(groups.lock().unwrap().sizes, vec![3]);
-		// A direct-to-L0 write first flushes every pending immutable memtable (#423's
-		// `flush_lock` path in `write_batch_direct_to_l0_sst`), so the memtable the seal
-		// rotated out is flushed to an L0 table before the oversized batch's own table.
-		assert_eq!(n_sst(&tree), 2, "A's memtable and then the oversized batch are in L0 tables");
-		assert_eq!(n_imm(&tree), 0, "A's memtable was rotated by the seal and flushed first");
+		assert_eq!(n_sst(&tree), 2, "A's memtable and the oversized batch are in L0 tables");
+		assert_eq!(n_imm(&tree), 0, "A's memtable was rotated by the seal and flushed before it");
+		// The memtables and the segments are compared below for the keys the memtables hold:
+		// the batch behind the oversized one is the only one left in memory.
+		assert!(
+			tree.core.inner.active_memtable.read().unwrap().get(&group[2].0, None).is_some(),
+			"the batch behind the oversized one is in the active memtable"
+		);
 
 		let keys: Vec<Vec<u8>> = prefill.iter().chain(&group).map(|(k, _)| k.clone()).collect();
 		assert_records_match_memtable_tags(&tree, &path, &keys, "direct L0 mid-group");

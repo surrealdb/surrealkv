@@ -63,9 +63,6 @@ const RUNAWAY_ROUND: usize = 60;
 /// A pair of a key and its value.
 type Pair = (Vec<u8>, Vec<u8>);
 
-/// For each key, the records (segment, starting sequence number) that held it.
-type Logged = BTreeMap<Vec<u8>, HashSet<(u64, u64)>>;
-
 // ---------------------------------------------------------------------------
 // helpers
 // ---------------------------------------------------------------------------
@@ -434,7 +431,8 @@ struct SealedGroup {
 	group: Vec<(String, Vec<u8>)>,
 	/// In how many memtables the group is expected to end up at least.
 	memtables: usize,
-	/// How many L0 tables the batches that cannot go to a memtable are written to.
+	/// How many L0 tables the group is expected to leave: one for every batch that cannot go to a
+	/// memtable, and one for the memtable that such a batch seals when it holds anything.
 	l0_tables: usize,
 	/// Whether the group is overtaken often enough to be fenced.
 	fenced: bool,
@@ -491,8 +489,7 @@ impl SealedGroup {
 		assert_eq!(
 			tree.core.inner.level_manifest.read().unwrap().levels.total_tables(),
 			l0_tables,
-			"{what} {durability:?}: only the batches that cannot go to a memtable, and the memtables \
-			 rotated out before them, are written to tables"
+			"{what} {durability:?}: a memtable that filled up is rotated, not written to a table"
 		);
 		assert_segments_ordered(&live, what);
 		assert_eq!(
@@ -538,16 +535,14 @@ fn sealed_groups() -> Vec<SealedGroup> {
 			l0_tables: 0,
 			fenced: true,
 		},
-		// A batch that cannot go to a memtable, in the middle: written to an L0 table.
+		// A batch that cannot go to a memtable, in the middle: written to an L0 table, after the
+		// memtable that holds the batches before it.
 		SealedGroup {
 			what: "oversized in the middle",
 			max_memtable_size: SMALL,
 			vlog: false,
 			group: oversized_in_the_middle,
 			memtables: 1,
-			// The oversized batch's own table, and the memtable the seal rotated out before it:
-			// a direct-to-L0 write first flushes every pending immutable memtable (#423's
-			// `flush_lock` path in `write_batch_direct_to_l0_sst`).
 			l0_tables: 2,
 			fenced: true,
 		},
@@ -819,43 +814,7 @@ fn nothing_behind_an_oversized_batch_is_logged_before_it_is_through() {
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, SMALL, false)).unwrap());
 		stop_background_tasks(&tree).await;
-		// A direct-to-L0 write flushes the pending immutable memtables first, which removes their
-		// WAL segments, so the records that were logged are collected as the rounds go by instead
-		// of being counted in the segments that are left at the end.
-		let logged: Arc<Mutex<Logged>> = Arc::default();
-		let collect = {
-			let (live, logged) = (live.clone(), Arc::clone(&logged));
-			move || {
-				let mut logged = logged.lock().unwrap();
-				for (id, batches) in segments(&live) {
-					for batch in batches {
-						for entry in &batch.entries {
-							logged
-								.entry(entry.key.clone())
-								.or_default()
-								.insert((id, batch.starting_seq_num));
-						}
-					}
-				}
-			}
-		};
-		// The flush that does it removes the segments only after the table is on disk, so the
-		// records are collected there too.
-		let before_flush = collect.clone();
-		*tree.core.inner.flush_hook.lock() = Some(Arc::new(move |_| {
-			before_flush();
-			Ok(())
-		}));
-		let inner = Arc::clone(&tree.core.inner);
-		let at_round = collect.clone();
-		let probe = install(
-			&tree,
-			move |_| {
-				at_round();
-				inner.seal_active_wal_segment().unwrap();
-			},
-			|| {},
-		);
+		let probe = seal_when(&tree, |_| true);
 
 		let mut group = entries(0, 9, 100);
 		for (i, entry) in group.iter_mut().enumerate() {
@@ -864,7 +823,6 @@ fn nothing_behind_an_oversized_batch_is_logged_before_it_is_through() {
 			}
 		}
 		commit_all(&tree, &group, Durability::Immediate, &probe, "oversized").await;
-		collect();
 		assert_segments_ordered(&live, "oversized");
 		for (i, (k, v)) in group.iter().enumerate() {
 			assert_eq!(get(&tree, k.as_bytes()).as_ref(), Some(v), "{k}");
@@ -873,8 +831,7 @@ fn nothing_behind_an_oversized_batch_is_logged_before_it_is_through() {
 				_ if i % 2 == 1 => 1,
 				_ => 2,
 			};
-			let copies = logged.lock().unwrap().get(k.as_bytes()).map_or(0, HashSet::len);
-			assert_eq!(copies, expected, "{k}: copies in the WAL");
+			assert_eq!(copies_of(&live, k.as_bytes()), expected, "{k}: copies in the WAL");
 		}
 		assert_eq!(recover_image(&live, SMALL, false), pairs(&group));
 		dispose(&tree);

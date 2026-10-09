@@ -10,10 +10,10 @@
 //!   full arena in the middle must still apply every batch exactly once and never log or write a
 //!   spent one.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tempdir::TempDir;
 use test_log::test;
@@ -763,41 +763,6 @@ fn records_by_sequence(dir: &Path) -> BTreeMap<u64, usize> {
 	counts
 }
 
-/// The WAL records seen so far, as (segment, starting sequence number) pairs. A write to L0
-/// flushes the pending immutable memtables first, and the flush removes the WAL segments it made
-/// obsolete, so the records that were logged are collected before every flush and once more at
-/// the end, instead of being counted in the segments that are left.
-type SeenRecords = Arc<Mutex<BTreeSet<(u64, u64)>>>;
-
-fn see_records(seen: &SeenRecords, dir: &Path) {
-	let mut seen = seen.lock().unwrap();
-	for (id, path) in wal_segments(dir) {
-		for record in decode_segment_batches(&path, id).unwrap().1 {
-			seen.insert((id, record.starting_seq_num));
-		}
-	}
-}
-
-/// Collects the records of the WAL under `dir` before each flush of `tree`.
-fn see_records_before_flushes(tree: &Tree, dir: &Path) -> SeenRecords {
-	let seen = SeenRecords::default();
-	let (hook_seen, dir) = (Arc::clone(&seen), dir.to_path_buf());
-	*tree.core.inner.flush_hook.lock() = Some(Arc::new(move |_| {
-		see_records(&hook_seen, &dir);
-		Ok(())
-	}));
-	seen
-}
-
-/// How many records were seen for each starting sequence number.
-fn seen_by_sequence(seen: &SeenRecords) -> BTreeMap<u64, usize> {
-	let mut counts = BTreeMap::new();
-	for (_, seq) in seen.lock().unwrap().iter() {
-		*counts.entry(*seq).or_insert(0) += 1;
-	}
-	counts
-}
-
 /// A spent batch, logged or written to L0, would carry empty keys.
 fn assert_no_spent_record(dir: &Path) {
 	for record in wal_batches(dir) {
@@ -893,10 +858,12 @@ async fn the_flusher_applies_a_repaired_group_of_commits_exactly_once() {
 }
 
 /// An oversized batch in the middle of a group is written to L0, which seals the WAL segment the
-/// group was logged in. The batches before it were applied (they are spent, and their records
-/// are where the memtable that holds them expects them), the oversized one needs no second
-/// record, and the batches after it are logged again, in the segment of the memtable that takes
-/// them. Nothing is logged for a batch that was moved out.
+/// group was logged in, and flushes the memtable that holds the batches before it. The batches
+/// before it were applied (they are spent, and their records are where the memtable that holds
+/// them expects them), the oversized one needs no second record, and the batches after it are
+/// logged again, in the segment of the memtable that takes them. Nothing is logged for a batch
+/// that was moved out. The segment the group was logged in stays until a later flush: the records
+/// of the batches that were not applied yet are pinned while the group runs.
 #[test(tokio::test)]
 async fn an_oversized_batch_in_the_middle_of_a_group_logs_only_the_batches_after_it_again() {
 	let dir = TempDir::new("alloc_diet").unwrap();
@@ -912,14 +879,12 @@ async fn an_oversized_batch_in_the_middle_of_a_group_logs_only_the_batches_after
 		small("m4"),
 	];
 	let batches = stamped(&tree, &group);
-	let seen = see_records_before_flushes(&tree, dir.path());
 	tree.core.commit_pipeline.flush_group(&batches, true).await.unwrap();
 	publish_all(&tree);
-	see_records(&seen, dir.path());
 
 	let first = batches[0].starting_seq_num;
 	assert_eq!(
-		seen_by_sequence(&seen),
+		records_by_sequence(dir.path()),
 		BTreeMap::from([
 			(first, 1),
 			(first + 1, 1),
@@ -931,9 +896,11 @@ async fn an_oversized_batch_in_the_middle_of_a_group_logs_only_the_batches_after
 		 and the ones after it again"
 	);
 	assert_no_spent_record(dir.path());
-	// Two tables: the oversized batch's own, and the memtable that held the batches before it,
-	// which the direct-to-L0 write flushes first so that it cannot shadow the new table.
-	assert_eq!(tree.core.inner.level_manifest.read().unwrap().get_all_tables().len(), 2);
+	assert_eq!(
+		tree.core.inner.level_manifest.read().unwrap().get_all_tables().len(),
+		2,
+		"the memtable of the batches before the oversized one, and the oversized one"
+	);
 	assert_tree_equals(&tree, &group, "oversized in the middle");
 	crash(tree);
 	assert_recovers_to(dir.path(), false, &group, "recovery").await;
@@ -1030,9 +997,12 @@ async fn a_batch_that_does_not_fit_an_empty_memtable_is_written_to_l0_whole() {
 	tree.core.commit_pipeline.flush_group(&batches, true).await.unwrap();
 	publish_all(&tree);
 
-	// Two tables: the batch's own, and the memtable that held "before", which the direct-to-L0
-	// write flushes first so that it cannot shadow the new table.
-	assert_eq!(tree.core.inner.level_manifest.read().unwrap().get_all_tables().len(), 2);
+	assert_eq!(
+		tree.core.inner.level_manifest.read().unwrap().get_all_tables().len(),
+		2,
+		"the memtable of the batch before it, and the batch"
+	);
+	assert!(!records_by_sequence(dir.path()).is_empty(), "control: the WAL holds the group");
 	assert_no_spent_record(dir.path());
 	assert_tree_equals(&tree, &group, "a batch for L0 that fits no arena");
 	crash(tree);
@@ -1073,12 +1043,19 @@ async fn a_value_log_group_is_sized_after_its_values_are_replaced_by_pointers() 
 		publish_all(&tree);
 
 		let tables = tree.core.inner.level_manifest.read().unwrap().get_all_tables().len();
-		// Without the value log the huge value goes to L0, and the direct-to-L0 write flushes
-		// the memtable that held the batches before it first (one table more).
-		let expected = usize::from(!vlog) * 2;
 		assert_eq!(
-			tables, expected,
-			"vlog={vlog}: only without the value log is the huge value too big for a memtable"
+			tables,
+			if vlog {
+				0
+			} else {
+				2
+			},
+			"vlog={vlog}: only without the value log is the huge value too big for a memtable, and \
+			 then it is written to a table after the memtable of the batches before it"
+		);
+		assert!(
+			!records_by_sequence(dir.path()).is_empty(),
+			"vlog={vlog}: control: the WAL holds the group"
 		);
 		assert_no_spent_record(dir.path());
 		assert_tree_equals(&tree, &group, &format!("vlog={vlog}"));

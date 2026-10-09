@@ -31,7 +31,7 @@ use test_log::test;
 
 use super::{collect_transaction_all, collect_transaction_reverse};
 use crate::compaction::leveled::Strategy;
-use crate::lsm::CompactionOperations;
+use crate::lsm::{CompactionOperations, FlushHook};
 use crate::ring::{CommitStage, PipelineHook, UNFENCED_STALE_ROUNDS};
 use crate::{BackgroundErrorReason, Durability, Error, ErrorSeverity, Mode, Options, Result, Tree};
 
@@ -323,6 +323,9 @@ enum Failure {
 	/// An oversized batch went to an L0 table, and then the re-append of the batches after it
 	/// fails.
 	AfterDirectL0,
+	/// The flush of the memtable that an oversized batch sealed, which comes before the batch is
+	/// written, fails after the batches in front of it were applied to that memtable.
+	FlushBeforeDirectL0,
 	/// The append of a fenced round fails.
 	FencedWrite,
 	/// The fsync of a fenced round fails.
@@ -332,7 +335,9 @@ enum Failure {
 impl Failure {
 	fn group(self) -> Entries {
 		match self {
-			Failure::DirectL0 | Failure::AfterDirectL0 => group_with_oversized(),
+			Failure::DirectL0 | Failure::AfterDirectL0 | Failure::FlushBeforeDirectL0 => {
+				group_with_oversized()
+			}
 			Failure::SecondDirectL0 => {
 				vec![
 					("big0".to_string(), vec![NEW; SMALL + 1000]),
@@ -347,7 +352,10 @@ impl Failure {
 	fn rounds(self) -> usize {
 		match self {
 			Failure::ReappendWrite | Failure::ReappendSync | Failure::AfterDirectL0 => 2,
-			Failure::RotationSync | Failure::RotationCreate | Failure::DirectL0 => 1,
+			Failure::RotationSync
+			| Failure::RotationCreate
+			| Failure::DirectL0
+			| Failure::FlushBeforeDirectL0 => 1,
 			Failure::SecondDirectL0 => 2,
 			// Rounds 1 to `UNFENCED_STALE_ROUNDS + 1` are overtaken by a rotation, the next is
 			// fenced.
@@ -361,6 +369,7 @@ impl Failure {
 			Failure::ReappendWrite | Failure::AfterDirectL0 | Failure::FencedWrite => {
 				Some("injected write failure")
 			}
+			Failure::FlushBeforeDirectL0 => Some("injected flush failure"),
 			Failure::ReappendSync | Failure::RotationSync | Failure::FencedSync => {
 				Some("injected fsync failure")
 			}
@@ -409,6 +418,11 @@ fn inject(tree: &Tree, failure: Failure) -> Arc<Injected> {
 					let blocker = seg_path(&inner.opts.path, next);
 					fs::create_dir(&blocker).unwrap();
 					seen.blockers.lock().unwrap().push(blocker);
+				}
+				Failure::FlushBeforeDirectL0 if round == 0 => {
+					let hook: FlushHook =
+						Arc::new(|_| Err(Error::Other("injected flush failure".into())));
+					*inner.flush_hook.lock() = Some(hook);
 				}
 				Failure::DirectL0 | Failure::SecondDirectL0 if round == 0 => {
 					// Table ids come from a counter. Sealing a memtable that holds something queues
@@ -468,6 +482,7 @@ async fn run(failure: Failure, mix: Mix) {
 	let injected = inject(&tree, failure);
 	let results = commit_group(&tree, &group, mix).await;
 	tree.core.commit_pipeline.set_hook(None);
+	*tree.core.inner.flush_hook.lock() = None;
 	injected.remove_blockers();
 
 	// Every committer of the group is told, whatever it asked for, and told why.
@@ -479,42 +494,46 @@ async fn run(failure: Failure, mix: Mix) {
 	}
 	assert_eq!(injected.rounds.load(Ordering::SeqCst), failure.rounds(), "{what}: rounds");
 
-	// The failure came after a batch was applied: something of the group is in a memtable (or, for
-	// the second oversized batch, in an L0 table).
-	//
-	// An oversized batch flushes every memtable that is queued before it goes to its table, so
-	// the memtable that holds what precedes it in the group, or the base keys, is a table too:
-	// one more table than the oversized batch's own.
-	if failure == Failure::AfterDirectL0 {
-		assert_eq!(
-			tree.core.inner.l0_file_count(),
-			2,
-			"{what}: the oversized batch is in a table, and the batches before it in another"
-		);
-		// Everything that was applied is in those tables: the batches after the oversized one
-		// were not applied, as their re-append failed.
-		assert!(in_memtables(&tree, &group).is_empty(), "{what}");
-	} else if failure == Failure::SecondDirectL0 {
-		assert_eq!(
-			tree.core.inner.l0_file_count(),
-			2,
-			"{what}: the first batch is in a table, and the base keys in another"
-		);
-		assert!(in_memtables(&tree, &group).is_empty(), "{what}");
-	} else if failure == Failure::DirectL0 {
-		// The batches of the group before the oversized one were in the memtable that was
-		// flushed before the oversized batch's table was written: they are in a table, and the
-		// oversized batch's table is the one that failed.
-		assert_eq!(
-			tree.core.inner.l0_file_count(),
-			1,
-			"{what}: the batches before the oversized one are in a table"
-		);
-		assert!(in_memtables(&tree, &group).is_empty(), "{what}: nothing is left in a memtable");
-	} else {
-		let applied = in_memtables(&tree, &group);
-		assert!(!applied.is_empty(), "{what}: nothing was applied before the failure");
-		assert!(applied.len() < fresh(&group).len(), "{what}: the group was applied in full");
+	// The failure came after a batch was applied: something of the group is in a memtable, or, once
+	// an oversized batch was written, in an L0 table. That write flushes the memtable it seals
+	// first, so the batches before it are in a table too, and no memtable holds any of the group.
+	let tables = tree.core.inner.l0_file_count();
+	match failure {
+		Failure::DirectL0 => {
+			assert_eq!(tables, 1, "{what}: the batches before the oversized one are in a table");
+			assert!(in_memtables(&tree, &group).is_empty(), "{what}");
+		}
+		Failure::AfterDirectL0 => {
+			assert_eq!(
+				tables, 2,
+				"{what}: the batches before the oversized one and the oversized batch are in tables"
+			);
+			assert!(in_memtables(&tree, &group).is_empty(), "{what}");
+		}
+		Failure::SecondDirectL0 => {
+			assert_eq!(
+				tables, 2,
+				"{what}: the base keys, which the first batch sealed and flushed, and the first batch \
+				 are in tables"
+			);
+			assert!(in_memtables(&tree, &group).is_empty(), "{what}");
+		}
+		Failure::FlushBeforeDirectL0 => {
+			assert_eq!(tables, 0, "{what}: the flush failed, so no table was written");
+			assert_eq!(
+				tree.core.inner.immutable_count(),
+				1,
+				"{what}: the memtable of the batches before the oversized one is still queued"
+			);
+			let applied = in_memtables(&tree, &group);
+			assert!(!applied.is_empty(), "{what}: nothing was applied before the failure");
+			assert!(applied.len() < fresh(&group).len(), "{what}: the group was applied in full");
+		}
+		_ => {
+			let applied = in_memtables(&tree, &group);
+			assert!(!applied.is_empty(), "{what}: nothing was applied before the failure");
+			assert!(applied.len() < fresh(&group).len(), "{what}: the group was applied in full");
+		}
 	}
 
 	// The database is stopped, for the reason and with the severity that say so.
@@ -598,6 +617,17 @@ async fn a_mid_group_rotation_that_cannot_open_its_segment_stops_the_database() 
 async fn a_failed_direct_write_to_l0_after_part_of_the_group_was_applied_stops_the_database() {
 	for mix in ALL_MIXES {
 		run(Failure::DirectL0, mix).await;
+	}
+}
+
+/// The flush that comes before the write of an oversized batch fails with part of the group applied
+/// to the memtable it flushes: the group stops the database like any other that fails then, and
+/// the memtable stays queued.
+#[test(tokio::test)]
+async fn a_failed_flush_before_a_direct_write_after_part_of_the_group_was_applied_stops_the_database(
+) {
+	for mix in ALL_MIXES {
+		run(Failure::FlushBeforeDirectL0, mix).await;
 	}
 }
 
@@ -1015,12 +1045,11 @@ async fn a_compaction_cannot_replace_what_readers_see_with_what_was_never_publis
 		stop_error(&result, "the group");
 	}
 	tree.core.commit_pipeline.set_hook(None);
-	// The oversized batch flushed the memtable that holds the batches before it first, so the
-	// group left two tables: that one and the oversized batch's own.
 	assert_eq!(
 		tree.core.inner.l0_file_count(),
 		3,
-		"the old table, the batches before the oversized one, and the oversized batch's"
+		"the old table, the one the batches before the oversized batch were flushed to, and the \
+		 oversized batch's"
 	);
 	assert_eq!(get(&tree, "big10"), Some(old.clone()));
 
