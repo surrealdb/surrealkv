@@ -150,6 +150,7 @@ fn mark_closed(tree: &Tree) {
 
 fn release_lock(tree: &Tree) {
 	tree.core.inner.lockfile.lock().unwrap().release().unwrap();
+	tree.core.abort_background_tasks();
 }
 
 /// Disposes of a tree that was only ever crashed in a copy.

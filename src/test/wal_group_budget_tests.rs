@@ -57,6 +57,7 @@ pub(super) fn mark_closed(tree: &Tree) {
 
 pub(super) fn release_lock(tree: &Tree) {
 	tree.core.inner.lockfile.lock().unwrap().release().unwrap();
+	tree.core.abort_background_tasks();
 }
 
 pub(super) fn copy_dir(src: &Path, dst: &Path) {
