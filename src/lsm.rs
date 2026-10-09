@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::batch::Batch;
-use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
+use crate::checkpoint::{CheckpointGate, CheckpointMetadata, DatabaseCheckpoint};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
@@ -1224,6 +1224,11 @@ pub(crate) struct Core {
 
 	/// Held while `close` runs, so that a second caller waits for the first to finish.
 	closing: tokio::sync::Mutex<()>,
+
+	/// Lets `close` wait for the checkpoints that are running and refuse the ones that follow. A
+	/// checkpoint holds it for its whole run, before it takes any lock of `CoreInner`, and `close`
+	/// waits on it holding nothing but `closing`.
+	pub(crate) checkpoints: CheckpointGate,
 }
 
 impl std::ops::Deref for Core {
@@ -1538,6 +1543,7 @@ impl Core {
 			flusher_handle: Mutex::new(Some(flusher_handle)),
 			is_closed: AtomicBool::new(false),
 			closing: tokio::sync::Mutex::new(()),
+			checkpoints: CheckpointGate::default(),
 		};
 
 		tracing::debug!("LSM tree initialization complete");
@@ -1625,6 +1631,9 @@ impl Core {
 	///
 	/// # Shutdown Sequence
 	///
+	/// 0. Checkpoints - refuses new ones, and waits for those running, which flush memtables and
+	///    copy files that the steps below close or release. Takes no thread, and a `close` that is
+	///    dropped meanwhile can be called again.
 	/// 1. Commit pipeline shutdown - refuses new commits, and waits until every commit already
 	///    admitted has been decided
 	/// 2. Background tasks stopped - waits for ongoing operations
@@ -1640,9 +1649,14 @@ impl Core {
 	/// flushing. This prevents creating an empty WAL file on clean shutdown.
 	pub async fn close(&self) -> Result<()> {
 		let _closing = self.closing.lock().await;
-		if self.is_closed.swap(true, Ordering::SeqCst) {
+		if self.is_closed.load(Ordering::SeqCst) {
 			return Ok(());
 		}
+
+		// Step 0: Wait for the checkpoints that are running. Closing is marked after the wait,
+		// so a `close` that is dropped during it leaves a tree that a second call closes.
+		self.checkpoints.close().await;
+		self.is_closed.store(true, Ordering::SeqCst);
 
 		tracing::debug!("Shutting down LSM tree");
 
@@ -2083,14 +2097,22 @@ impl Tree {
 	/// - Checkpoint metadata
 	///
 	/// # Arguments
-	/// * `checkpoint_dir` - Directory where the checkpoint will be created
+	/// * `checkpoint_dir` - Directory where the checkpoint will be created. It may exist, holding
+	///   an earlier checkpoint for instance. It must not be the database directory, lie inside it
+	///   or contain it, however it is spelled (links and relative paths are resolved), or the call
+	///   fails with [`Error::InvalidArgument`] before anything is changed.
 	///
 	/// # Returns
 	/// Metadata about the created checkpoint
+	///
+	/// # Closing
+	/// [`Tree::close`] waits for the checkpoints that are running. One that begins after `close`
+	/// has fails without touching `checkpoint_dir`.
 	pub fn create_checkpoint<P: AsRef<Path>>(
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
+		let _running = self.core.checkpoints.enter()?;
 		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
 		let result = checkpoint.create_checkpoint(checkpoint_dir);
 
@@ -2234,7 +2256,9 @@ impl Tree {
 	}
 
 	/// Closes the tree. Commits already admitted finish first, each with its real outcome, and a
-	/// commit that begins after the close fails with [`Error::PipelineStall`].
+	/// commit that begins once the commit pipeline is shut down fails with
+	/// [`Error::PipelineStall`]. Checkpoints that are running finish first, before the pipeline is
+	/// shut down, and one that begins after the close fails.
 	pub async fn close(&self) -> Result<()> {
 		self.core.close().await
 	}

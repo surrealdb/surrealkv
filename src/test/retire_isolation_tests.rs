@@ -1125,11 +1125,12 @@ async fn savepoints_decide_which_locked_reads_conflict_across_laps() {
 /// conflicts across laps are found, disjoint transactions commit, and the retained entries drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn restore_with_a_transaction_open_leaves_validation_and_retire_working() {
-	let (store, dir) = create_store();
+	let (store, _dir) = create_store();
 	let pipeline = &store.core.commit_pipeline;
 	commit_unique(&store, "base", 10).await;
 	store.flush().unwrap();
-	let checkpoint = dir.path().join("checkpoint");
+	let checkpoints = TempDir::new("retire_checkpoint").unwrap();
+	let checkpoint = checkpoints.path().join("checkpoint");
 	store.create_checkpoint(&checkpoint).unwrap();
 
 	let mut before = store.begin().unwrap();

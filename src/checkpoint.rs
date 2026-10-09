@@ -1,6 +1,6 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,6 +25,109 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 	}
 
 	Ok(())
+}
+
+/// Resolves the links, `.` and `..` of `path`, which need not exist. Components are followed one
+/// at a time and canonicalized while they exist; the ones after the first that does not are plain
+/// names that creating the directory would make, so a `..` among them is resolved by name.
+fn resolve(path: &Path) -> std::io::Result<PathBuf> {
+	let path = if path.is_absolute() {
+		path.to_path_buf()
+	} else {
+		std::env::current_dir()?.join(path)
+	};
+	let mut resolved = PathBuf::new();
+	for component in path.components() {
+		match component {
+			Component::CurDir => {}
+			Component::ParentDir => {
+				resolved.pop();
+			}
+			component => {
+				resolved.push(component);
+				match fs::canonicalize(&resolved) {
+					Ok(canonical) => resolved = canonical,
+					Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+					Err(e) => return Err(e),
+				}
+			}
+		}
+	}
+	Ok(resolved)
+}
+
+/// Keeps `Core::close` and the checkpoints from running at the same time.
+///
+/// A checkpoint holds a [`CheckpointGuard`] for as long as it runs. `close` refuses the
+/// checkpoints that would begin after it and waits for the ones running, without holding a
+/// thread: a checkpoint is synchronous and needs nothing from a runtime to finish.
+#[derive(Default)]
+pub(crate) struct CheckpointGate {
+	state: parking_lot::Mutex<GateState>,
+	/// Wakes `close` when the last running checkpoint ends.
+	idle: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct GateState {
+	running: usize,
+	closed: bool,
+}
+
+/// A checkpoint that is running; see [`CheckpointGate`].
+pub(crate) struct CheckpointGuard<'a> {
+	gate: &'a CheckpointGate,
+}
+
+impl CheckpointGate {
+	/// Lets a checkpoint begin, unless `close` has.
+	pub(crate) fn enter(&self) -> Result<CheckpointGuard<'_>> {
+		let mut state = self.state.lock();
+		if state.closed {
+			return Err(Error::Other(
+				"Cannot create a checkpoint: the tree is closing or closed".to_string(),
+			));
+		}
+		state.running += 1;
+		Ok(CheckpointGuard {
+			gate: self,
+		})
+	}
+
+	/// Refuses the checkpoints that begin from now on and waits for the ones running. Only
+	/// `Core::close` calls it, one caller at a time, so a single wake-up is enough. If the future
+	/// is dropped before the wait is over, checkpoints are allowed again.
+	pub(crate) async fn close(&self) {
+		let reopen = Reopen(self);
+		self.state.lock().closed = true;
+		while self.running() > 0 {
+			self.idle.notified().await;
+		}
+		std::mem::forget(reopen);
+	}
+
+	fn running(&self) -> usize {
+		self.state.lock().running
+	}
+}
+
+/// Allows checkpoints again when dropped; see [`CheckpointGate::close`].
+struct Reopen<'a>(&'a CheckpointGate);
+
+impl Drop for Reopen<'_> {
+	fn drop(&mut self) {
+		self.0.state.lock().closed = false;
+	}
+}
+
+impl Drop for CheckpointGuard<'_> {
+	fn drop(&mut self) {
+		let mut state = self.gate.state.lock();
+		state.running -= 1;
+		if state.closed && state.running == 0 {
+			self.gate.idle.notify_one();
+		}
+	}
 }
 
 /// Current checkpoint metadata format version
@@ -197,6 +300,9 @@ impl DatabaseCheckpoint {
 
 		let checkpoint_path = checkpoint_dir.as_ref();
 
+		// Before anything is created, flushed or replaced
+		self.check_destination(checkpoint_path)?;
+
 		// Create checkpoint directory
 		fs::create_dir_all(checkpoint_path).map_err(|e| Error::Io(Arc::new(e)))?;
 
@@ -255,6 +361,41 @@ impl DatabaseCheckpoint {
 		self.write_checkpoint_metadata(checkpoint_path, &metadata)?;
 
 		Ok(metadata)
+	}
+
+	/// Refuses a destination that is the database directory or one of its subdirectories, lies
+	/// inside one, or contains one, which a checkpoint would write over. So are the entries of an
+	/// existing destination that a checkpoint writes (`sstables`, `wal`, `manifest`, `vlog` and
+	/// the metadata file) when they are links into the database. Links and relative paths are
+	/// resolved first. An existing directory, an earlier checkpoint's included, is accepted.
+	fn check_destination(&self, destination: &Path) -> Result<()> {
+		let io = |e| Error::Io(Arc::new(e));
+		let opts = &self.core.opts;
+		let mut live = Vec::new();
+		for dir in [
+			opts.path.clone(),
+			opts.sstable_dir(),
+			opts.wal_dir(),
+			opts.manifest_dir(),
+			opts.vlog_dir(),
+		] {
+			live.push(resolve(&dir).map_err(io)?);
+		}
+		let entries = ["sstables", "wal", "manifest", "vlog", CHECKPOINT_METADATA_FILE];
+		let written = std::iter::once(destination.to_path_buf())
+			.chain(entries.iter().map(|entry| destination.join(entry)));
+		for path in written {
+			let resolved = resolve(&path).map_err(io)?;
+			if live.iter().any(|dir| resolved.starts_with(dir) || dir.starts_with(&resolved)) {
+				return Err(Error::InvalidArgument(format!(
+					"Checkpoint destination {} overlaps the database at {}: it must be a directory \
+					 that neither lies inside the database nor contains it",
+					destination.display(),
+					opts.path.display()
+				)));
+			}
+		}
+		Ok(())
 	}
 
 	/// Calls the test hook, if one is set, for `stage`.
@@ -348,9 +489,15 @@ impl DatabaseCheckpoint {
 				Err(e) => return Err(Error::Io(Arc::new(e))),
 			}
 
-			// Create hard link if possible (faster), otherwise copy
-			if fs::hard_link(&source_path, &dest_path).is_err() {
-				fs::copy(&source_path, &dest_path).map_err(|e| Error::Io(Arc::new(e)))?;
+			// Create hard link if possible (faster), otherwise copy. A name that exists now was
+			// linked by a checkpoint running at the same time, and copying over it would truncate
+			// the live SSTable.
+			match fs::hard_link(&source_path, &dest_path) {
+				Ok(()) => {}
+				Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+				Err(_) => {
+					fs::copy(&source_path, &dest_path).map_err(|e| Error::Io(Arc::new(e)))?;
+				}
 			}
 
 			// Add to size count
