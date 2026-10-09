@@ -550,6 +550,85 @@ fn a_failed_append_inside_a_multi_fragment_record_leaves_nothing_behind() {
 	append_failure_sweep(100_000, 10);
 }
 
+/// `value_lens` as a group of records: one buffer, where each ends, and their keys.
+fn wal_group(first_seq: u64, value_lens: &[usize]) -> (Vec<u8>, Vec<usize>, Vec<String>) {
+	let mut buf = Vec::new();
+	let mut ends = Vec::new();
+	let mut keys = Vec::new();
+	for (i, len) in value_lens.iter().enumerate() {
+		let key = format!("group{i}");
+		buf.extend(wal_record(first_seq + i as u64, &key, *len));
+		ends.push(buf.len());
+		keys.push(key);
+	}
+	(buf, ends, keys)
+}
+
+/// The same as `append_failure_sweep` for a group appended in one call: a failure at any
+/// write leaves none of the group in the segment, not even the records that were complete
+/// when the write failed, because none of the group was acknowledged.
+fn append_group_failure_sweep(value_lens: &[usize], min_failure_points: usize) {
+	for fail_after in 0..200 {
+		let dir = TempDir::new().unwrap();
+		let segment = dir.path().join(SEGMENT);
+		let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+		for i in 0..3 {
+			wal.append(&wal_record(i + 1, &format!("acked{i}"), 100)).unwrap();
+		}
+		let acked_len = file_len(&segment);
+
+		wal.fail_writes_after(fail_after);
+		let (buf, ends, keys) = wal_group(4, value_lens);
+		let result = wal.append_group(&buf, &ends);
+		if result.is_ok() {
+			// Past the last write of this group: the control, which recovers all of it.
+			assert!(
+				fail_after >= min_failure_points,
+				"the group has only {fail_after} failure points, expected {min_failure_points}"
+			);
+			let mut want: Vec<String> = (0..3).map(|i| format!("acked{i}")).collect();
+			want.extend(keys);
+			assert_eq!(recovered_keys(dir.path()), want);
+			return;
+		}
+
+		let at = format!("failure after {fail_after} writes of a group of {value_lens:?}");
+		assert_eq!(file_len(&segment), acked_len, "{at}: part of the group is left in the segment");
+		assert!(
+			wal.append_group(&buf, &ends).is_err()
+				&& wal.append(&wal_record(5, "later", 100)).is_err(),
+			"{at}: a poisoned writer must refuse further appends"
+		);
+		assert_eq!(file_len(&segment), acked_len, "{at}: a refused append wrote to the segment");
+
+		// The segment is still sound for recovery, and a rotation replaces the writer.
+		wal.rotate().unwrap();
+		wal.append(&wal_record(6, "after", 100)).unwrap();
+		wal.close().unwrap();
+		assert_eq!(
+			recovered_keys(dir.path()),
+			["acked0", "acked1", "acked2", "after"],
+			"{at}: recovery must see exactly the acknowledged records"
+		);
+	}
+	panic!("the group append never succeeded");
+}
+
+/// Three records are six appends and a flush, so the group can fail at seven points, each
+/// with the records before it complete in the buffer.
+#[test]
+fn a_failed_group_of_small_records_leaves_nothing_behind() {
+	append_group_failure_sweep(&[64, 64, 64], 7);
+}
+
+/// A group that crosses a 32 KiB block and fills the write buffer more than once: a
+/// failure at a later write finds the earlier part of the group already in the file, and
+/// the segment is still cut back to where the group started.
+#[test]
+fn a_failed_group_spanning_blocks_leaves_nothing_behind() {
+	append_group_failure_sweep(&[64, 40_000, 64, 100_000], 21);
+}
+
 /// A record whose append failed was never acknowledged. It must not come back
 /// at recovery because a later flush wrote out what was left in the buffer.
 #[test]

@@ -517,6 +517,9 @@ pub struct BufferedFileWriter {
 	/// before one fails.
 	#[cfg(test)]
 	fail_after_ops: Option<usize>,
+	/// Test-only count of the `write(2)` calls that reached the file, see `file_writes`.
+	#[cfg(test)]
+	file_writes: usize,
 }
 
 impl BufferedFileWriter {
@@ -529,6 +532,8 @@ impl BufferedFileWriter {
 			len,
 			#[cfg(test)]
 			fail_after_ops: None,
+			#[cfg(test)]
+			file_writes: 0,
 		}
 	}
 
@@ -575,6 +580,21 @@ impl BufferedFileWriter {
 		self.fail_after_ops = Some(ops);
 	}
 
+	/// How many `write(2)` calls have reached the file: one for every flush of a non-empty
+	/// buffer, and one more for an append that was too long for the buffer, which makes
+	/// `BufWriter` write the buffer out and then the data itself if it is a buffer long.
+	#[cfg(test)]
+	pub(crate) fn file_writes(&self) -> usize {
+		self.file_writes
+	}
+
+	#[cfg(test)]
+	fn count_flush(&mut self) {
+		if !self.writer.buffer().is_empty() {
+			self.file_writes += 1;
+		}
+	}
+
 	#[cfg(test)]
 	fn injected_failure(&mut self) -> Result<()> {
 		match self.fail_after_ops.as_mut() {
@@ -595,7 +615,14 @@ impl WritableFile for BufferedFileWriter {
 	fn append(&mut self, data: &[u8]) -> Result<()> {
 		#[cfg(test)]
 		self.injected_failure()?;
+		#[cfg(test)]
+		let buffered = self.writer.buffer().len();
 		self.writer.write_all(data)?;
+		#[cfg(test)]
+		if self.writer.buffer().len() != buffered + data.len() {
+			self.file_writes +=
+				usize::from(buffered > 0) + usize::from(data.len() >= self.writer.capacity());
+		}
 		self.pending_sync = true;
 		if let Some(len) = self.len.as_mut() {
 			*len += data.len() as u64;
@@ -606,6 +633,8 @@ impl WritableFile for BufferedFileWriter {
 	fn flush(&mut self) -> Result<()> {
 		#[cfg(test)]
 		self.injected_failure()?;
+		#[cfg(test)]
+		self.count_flush();
 		self.writer.flush()?;
 		Ok(())
 	}
@@ -614,6 +643,8 @@ impl WritableFile for BufferedFileWriter {
 		if !self.pending_sync {
 			return Ok(());
 		}
+		#[cfg(test)]
+		self.count_flush();
 		self.writer.flush()?;
 		self.writer.get_ref().sync_all()?;
 		self.pending_sync = false;

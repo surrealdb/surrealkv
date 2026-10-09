@@ -71,6 +71,19 @@ impl Batch {
 		Ok(encoded)
 	}
 
+	/// A capacity hint for `encode_into`: the entry sizes `grow` tracks, the header, and slack
+	/// for the value pointer flags and for a timestamp varint longer than the 8 bytes `grow`
+	/// counts. Only a hint: `size` is not tracked for decoded batches, and a batch holding value
+	/// pointers encodes longer, in which case the buffer simply grows.
+	pub(crate) fn encoded_len_hint(&self) -> usize {
+		self.size as usize + 16 + self.entries.len() * 3
+	}
+
+	/// Appends the encoding of this batch to `encoded`, after whatever it already holds.
+	///
+	/// This never clears the buffer, so a caller that frames several batches into one buffer
+	/// has to remember where each one ends: one WAL record is one batch, and `decode` rejects
+	/// bytes past the end of it.
 	pub(crate) fn encode_into(&self, encoded: &mut Vec<u8>) -> Result<()> {
 		// Write version (1 byte)
 		encoded.push(self.version);
