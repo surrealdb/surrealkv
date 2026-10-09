@@ -404,6 +404,41 @@ async fn a_commit_that_panics_after_claiming_does_not_wedge_the_pipeline() {
 	assert!(read(&reopened, "panicked").is_none());
 }
 
+/// The flusher is spawned when the tree is opened, but it first runs when the runtime next polls
+/// it. A commit that fails before then is aborted, and its guard advances the completed prefix over
+/// its entry. The flusher must still take that entry's admission permit, or `close()` waits for
+/// it forever. On a current-thread runtime the commit runs to its failure on the test's own task,
+/// before the flusher has been polled.
+#[test(tokio::test(flavor = "current_thread"))]
+async fn a_commit_that_fails_before_the_flusher_first_runs_does_not_wedge_close() {
+	let dir = TempDir::new("close_race").unwrap();
+	let opts = options(dir.path());
+	let tree = Arc::new(Tree::new(Arc::clone(&opts)).unwrap());
+	fail_first_commit_at(&tree, CommitStage::Validated);
+
+	let mut txn = tree.begin().unwrap();
+	txn.set(b"panicked", b"panicked").unwrap();
+	let mut commit = Box::pin(txn.commit());
+	let mut cx = Context::from_waker(Waker::noop());
+	let polled =
+		std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| commit.as_mut().poll(&mut cx)));
+	assert!(polled.is_err(), "the commit must fail in its first poll, before the flusher runs");
+	drop(commit);
+
+	assert_eq!(tree.core.commit_pipeline.watermarks().0, 1, "the aborted entry is complete");
+	resolves(
+		"the commit after the panic",
+		spawn_commit(&tree, "next".into(), Durability::Immediate),
+	)
+	.await
+	.unwrap();
+	resolves("close()", spawn_close(&tree)).await.unwrap();
+
+	let reopened = reopen(tree, &opts);
+	assert_present(&reopened, ["next".to_string()]);
+	assert!(read(&reopened, "panicked").is_none());
+}
+
 /// A commit that holds an admission permit when `close()` begins and then dies before it claims
 /// an entry gives its permit back to the semaphore and does nothing else. That alone has to be
 /// enough for the flusher, which waits for every permit, to see that nothing is left.

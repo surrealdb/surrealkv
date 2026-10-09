@@ -316,8 +316,13 @@ impl CommitPipeline {
 	/// Starts the background flusher task.
 	pub(crate) fn start_flusher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
 		let pipeline = Arc::clone(self);
+		// The flusher's position is read here, not when the task is first polled. A commit that
+		// fails before then has its entry aborted, and its own guard advances the completed
+		// prefix over it. A flusher that started past that entry would never take its permit,
+		// and `close` waits for every permit.
+		let drained = self.ring.completed();
 		tokio::spawn(async move {
-			pipeline.run_flusher().await;
+			pipeline.run_flusher(drained).await;
 		})
 	}
 
@@ -494,9 +499,8 @@ impl CommitPipeline {
 	}
 
 	/// Background flusher loop performing group commit.
-	async fn run_flusher(&self) {
-		// The last ring sequence the flusher has consumed.
-		let mut drained = self.ring.completed();
+	async fn run_flusher(&self, mut drained: u64) {
+		// `drained` is the last ring sequence the flusher has consumed.
 		// Completes once every admission permit is back, which is once no commit is admitted
 		// and undecided. Only polled at shutdown.
 		let mut all_permits =
