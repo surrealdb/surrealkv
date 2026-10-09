@@ -54,6 +54,17 @@ fn completed(store: &Tree) -> u64 {
 	store.core.commit_pipeline.ring.completed()
 }
 
+/// Waits until the completed prefix reaches ring sequence `n`: a committer is woken before the
+/// flusher advances the prefix over its entry, so it can lag the last commit that returned.
+async fn wait_for_completed(store: &Tree, n: u64) {
+	within(30, "the completed prefix to reach the last commit", async {
+		while completed(store) < n {
+			tokio::time::sleep(Duration::from_millis(1)).await;
+		}
+	})
+	.await;
+}
+
 fn taken(store: &Tree) -> u64 {
 	store.core.commit_pipeline.ring.taken()
 }
@@ -815,7 +826,7 @@ async fn retired_watermark_never_passes_a_live_window_and_unique_writers_never_c
 	})
 	.await;
 	assert_eq!(committed.load(Ordering::Relaxed), tasks * iters);
-	assert!(completed(&store) >= tasks * iters);
+	wait_for_completed(&store, tasks * iters).await;
 }
 
 // ---------------------------------------------------------------------------------------------
