@@ -59,6 +59,10 @@ pub mod transaction_tests;
 #[cfg(test)]
 pub mod vlog_tests;
 #[cfg(test)]
+pub mod wal_decode_tests;
+#[cfg(test)]
+pub mod wal_rotation_tests;
+#[cfg(test)]
 pub mod wal_tests;
 
 /// Collects all (key, value) pairs from an LSMIterator into a Vec

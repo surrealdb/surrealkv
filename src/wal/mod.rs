@@ -510,26 +510,102 @@ pub trait WritableFile: Send {
 pub struct BufferedFileWriter {
 	writer: BufWriter<File>,
 	pending_sync: bool,
+	/// Length of the file once everything buffered is written, or `None` if it
+	/// could not be read when the writer was created.
+	len: Option<u64>,
+	/// Fault injection for tests: how many more appends and flushes succeed
+	/// before one fails.
+	#[cfg(test)]
+	fail_after_ops: Option<usize>,
 }
 
 impl BufferedFileWriter {
 	/// Creates a new BufferedFileWriter with the specified buffer size.
 	pub fn new(file: File, buffer_size: usize) -> Self {
+		let len = file.metadata().ok().map(|m| m.len());
 		Self {
 			writer: BufWriter::with_capacity(buffer_size, file),
 			pending_sync: false,
+			len,
+			#[cfg(test)]
+			fail_after_ops: None,
+		}
+	}
+
+	/// Length of the file once everything buffered is written, if known.
+	pub(crate) fn len(&self) -> Option<u64> {
+		self.len
+	}
+
+	/// Whether everything appended has reached the file.
+	pub(crate) fn is_flushed(&self) -> bool {
+		self.writer.buffer().is_empty()
+	}
+
+	/// Drops everything still buffered and cuts the file back to `len`, the end
+	/// of the last complete record.
+	///
+	/// `len` must not be past the end of the file.
+	pub(crate) fn truncate(&mut self, len: u64) -> Result<()> {
+		// Rebuild the buffer around the same file. The old one is taken apart rather than
+		// dropped, because dropping a `BufWriter` writes out what it still holds.
+		let capacity = self.writer.capacity();
+		let file = self.writer.get_ref().try_clone()?;
+		let stale = std::mem::replace(&mut self.writer, BufWriter::with_capacity(capacity, file));
+		drop(stale.into_parts());
+
+		let file = self.writer.get_ref();
+		if len > file.metadata()?.len() {
+			return Err(Error::IO(IOError::new(
+				io::ErrorKind::InvalidInput,
+				"refusing to extend the file while truncating it",
+			)));
+		}
+		file.set_len(len)?;
+		file.sync_all()?;
+		self.len = Some(len);
+		self.pending_sync = false;
+		Ok(())
+	}
+
+	/// Makes the append or flush after the next `ops` of them fail once, as a
+	/// full disk would.
+	#[cfg(test)]
+	pub(crate) fn fail_after_ops(&mut self, ops: usize) {
+		self.fail_after_ops = Some(ops);
+	}
+
+	#[cfg(test)]
+	fn injected_failure(&mut self) -> Result<()> {
+		match self.fail_after_ops.as_mut() {
+			Some(0) => {
+				self.fail_after_ops = None;
+				Err(Error::IO(IOError::new(io::ErrorKind::Other, "injected write failure")))
+			}
+			Some(ops) => {
+				*ops -= 1;
+				Ok(())
+			}
+			None => Ok(()),
 		}
 	}
 }
 
 impl WritableFile for BufferedFileWriter {
 	fn append(&mut self, data: &[u8]) -> Result<()> {
+		#[cfg(test)]
+		self.injected_failure()?;
 		self.writer.write_all(data)?;
 		self.pending_sync = true;
+		if let Some(len) = self.len.as_mut() {
+			*len += data.len() as u64;
+		}
 		Ok(())
 	}
 
 	fn flush(&mut self) -> Result<()> {
+		#[cfg(test)]
+		self.injected_failure()?;
 		self.writer.flush()?;
 		Ok(())
 	}

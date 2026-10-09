@@ -28,6 +28,10 @@ pub struct Writer {
 
 	/// The compression type to use for records.
 	compression_type: CompressionType,
+
+	/// Set when an append failed. The writer then refuses appends until it is
+	/// replaced, which a rotation does.
+	poisoned: bool,
 }
 
 impl Writer {
@@ -48,7 +52,15 @@ impl Writer {
 			block_offset,
 			manual_flush,
 			compression_type,
+			poisoned: false,
 		}
+	}
+
+	/// Makes the write after the next `ops` of them fail once (see
+	/// [`BufferedFileWriter::fail_after_ops`]).
+	#[cfg(test)]
+	pub(crate) fn fail_after_ops(&mut self, ops: usize) {
+		self.dest.fail_after_ops(ops);
 	}
 
 	/// Adds a record to the WAL.
@@ -64,6 +76,10 @@ impl Writer {
 	/// - Ok(()) if successful.
 	/// - Err if an I/O error occurs.
 	pub fn add_record(&mut self, slice: &[u8]) -> Result<()> {
+		self.guard_append(|writer| writer.write_record(slice))
+	}
+
+	fn write_record(&mut self, slice: &[u8]) -> Result<()> {
 		// Compress data if compression is enabled
 		let compressed;
 		let data_to_write = if self.compression_type == CompressionType::Lz4 {
@@ -118,6 +134,10 @@ impl Writer {
 	///
 	/// This should be called before any data records are written.
 	pub fn add_compression_type_record(&mut self) -> Result<()> {
+		self.guard_append(|writer| writer.write_compression_type_record())
+	}
+
+	fn write_compression_type_record(&mut self) -> Result<()> {
 		// Should be the first record
 		if self.block_offset != 0 {
 			return Err(Error::IO(IOError::new(
@@ -162,6 +182,42 @@ impl Writer {
 	pub fn close(&mut self) -> Result<()> {
 		self.sync()?;
 		self.dest.close()
+	}
+
+	/// Runs an append. If it fails, part of a record may be in the segment, and
+	/// recovery stops at the first damaged record, so every record acknowledged
+	/// after it would be dropped. The segment is cut back to the last complete
+	/// record, and the writer refuses further appends until a rotation replaces
+	/// it: a disk that failed once may fail again, and if the cut itself failed
+	/// the state of the segment is unknown.
+	fn guard_append<T>(&mut self, append: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+		if self.poisoned {
+			return Err(Error::IO(IOError::new(
+				io::ErrorKind::Other,
+				"WAL writer is poisoned by an earlier failed append",
+			)));
+		}
+
+		// With bytes still buffered the file is shorter than the writer's length, and
+		// cutting it there would extend it.
+		let last_good_len = self.dest.len().filter(|_| self.dest.is_flushed());
+		let last_good_block_offset = self.block_offset;
+
+		let result = append(self);
+		if result.is_err() {
+			self.poisoned = true;
+			match last_good_len.map(|len| self.dest.truncate(len)) {
+				Some(Ok(())) => self.block_offset = last_good_block_offset,
+				Some(Err(e)) => {
+					tracing::error!("Failed to cut a partial record off the WAL segment: {e}")
+				}
+				None => tracing::error!(
+					"A WAL append failed with the segment length unknown, \
+					so a partial record may remain"
+				),
+			}
+		}
+		result
 	}
 
 	/// Switches to a new block if there's not enough space for a header.

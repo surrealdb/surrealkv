@@ -376,6 +376,13 @@ impl Wal {
 		Arc::clone(&self.sync_fd)
 	}
 
+	/// Makes the write to the active segment after the next `ops` of them fail
+	/// once, as a full disk would.
+	#[cfg(test)]
+	pub(crate) fn fail_writes_after(&mut self, ops: usize) {
+		self.active_writer.fail_after_ops(ops);
+	}
+
 	pub(crate) fn close(&mut self) -> Result<()> {
 		if self.closed {
 			return Ok(());
@@ -408,33 +415,41 @@ impl Wal {
 	}
 
 	/// Explicitly rotates the active WAL to a new file.
+	///
+	/// The active log number and writer only change once the new segment exists
+	/// and its directory entry is durable, so a failed rotation leaves the WAL
+	/// exactly as it was. The memtable tags and the segment a record is logged in
+	/// are both read from the active log number, and they must never run ahead of
+	/// the writer.
+	///
+	/// The old segment is synced first, and a failure of that sync fails the
+	/// rotation.
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
 		let old_log_number = self.active_log_number;
+		let new_log_number = old_log_number + 1;
 
 		self.active_writer.sync()?;
 
-		// Update the log number
-		self.active_log_number += 1;
-
-		tracing::debug!("WAL rotating: {:020} -> {:020}", old_log_number, self.active_log_number);
+		tracing::debug!("WAL rotating: {:020} -> {:020}", old_log_number, new_log_number);
 
 		// Create a new Writer and sync fd for the new log number
-		let (new_writer, new_sync_fd) =
-			Self::create_writer(&self.dir, self.active_log_number, &self.opts)?;
-		self.active_writer = new_writer;
-		self.sync_fd = new_sync_fd;
+		let (new_writer, new_sync_fd) = Self::create_writer(&self.dir, new_log_number, &self.opts)?;
 
 		// Fsync the directory to ensure new file is visible after crash
 		crate::lsm::fsync_directory(&self.dir)
 			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
 
+		self.active_writer = new_writer;
+		self.sync_fd = new_sync_fd;
+		self.active_log_number = new_log_number;
+
 		tracing::debug!(
 			"WAL rotated and fsynced: {:020} -> {:020}",
 			old_log_number,
-			self.active_log_number
+			new_log_number
 		);
 
-		Ok(self.active_log_number)
+		Ok(new_log_number)
 	}
 }
 
