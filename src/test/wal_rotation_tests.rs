@@ -1993,6 +1993,9 @@ async fn writers_racing_rotations_flushes_and_checkpoints_lose_nothing() {
 		let gate = Arc::new(tokio::sync::RwLock::new(()));
 		let acked_all: Arc<Mutex<Vec<Pair>>> = Arc::new(Mutex::new(Vec::new()));
 		let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+		// How many rounds the foreign actor has finished, so the writers can run until it has raced
+		// them.
+		let rounds_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 		let runtime = tokio::runtime::Handle::current();
 
 		let foreign = {
@@ -2000,6 +2003,7 @@ async fn writers_racing_rotations_flushes_and_checkpoints_lose_nothing() {
 			let gate = Arc::clone(&gate);
 			let acked_all = Arc::clone(&acked_all);
 			let done = Arc::clone(&done);
+			let rounds_done = Arc::clone(&rounds_done);
 			let scratch = scratch.path().to_path_buf();
 			let path = path.clone();
 			std::thread::spawn(move || {
@@ -2036,6 +2040,7 @@ async fn writers_racing_rotations_flushes_and_checkpoints_lose_nothing() {
 						_ => {}
 					}
 					round += 1;
+					rounds_done.store(round, Ordering::Release);
 					std::thread::sleep(Duration::from_millis(4));
 				}
 				(images, checkpoints, round)
@@ -2048,13 +2053,17 @@ async fn writers_racing_rotations_flushes_and_checkpoints_lose_nothing() {
 			let tree = Arc::clone(&tree);
 			let gate = Arc::clone(&gate);
 			let acked_all = Arc::clone(&acked_all);
+			let rounds_done = Arc::clone(&rounds_done);
 			handles.push(tokio::spawn(async move {
 				let durability = if w % 2 == 0 {
 					Durability::Immediate
 				} else {
 					Durability::Eventual
 				};
-				for j in 0..60 {
+				// At least 60 commits, and more until the foreign actor has raced the writers for 8
+				// rounds, however fast the writers are.
+				let mut j = 0;
+				while j < 60 || (rounds_done.load(Ordering::Acquire) < 8 && j < 900) {
 					let i = w * 1000 + j;
 					let _running = gate.read().await;
 					let mut txn = tree.begin().unwrap();
@@ -2062,6 +2071,7 @@ async fn writers_racing_rotations_flushes_and_checkpoints_lose_nothing() {
 					txn.set(key_of(i), val_of(i)).unwrap();
 					txn.commit().await.unwrap();
 					acked_all.lock().unwrap().push(pair_of(i));
+					j += 1;
 				}
 			}));
 		}
@@ -2080,7 +2090,7 @@ async fn writers_racing_rotations_flushes_and_checkpoints_lose_nothing() {
 		assert!(!images.is_empty() && !checkpoints.is_empty());
 
 		let acked: Vec<_> = acked_all.lock().unwrap().clone();
-		assert_eq!(acked.len(), writers * 60);
+		assert!(acked.len() >= writers * 60);
 		assert!(missing_in(&tree, &acked).is_empty(), "the live tree lost acknowledged writes");
 
 		for (n, image) in images.iter().enumerate() {
