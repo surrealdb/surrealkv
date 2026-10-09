@@ -361,7 +361,10 @@ async fn test_direct_l0_flush_does_not_let_older_memtable_shadow_it() {
 	batch.set(b"key".to_vec(), value, 0).unwrap();
 	let table_id = tree.core.inner.level_manifest.read().unwrap().next_table_id();
 	let batch_wal_number = tree.core.inner.seal_active_wal_segment().unwrap();
-	tree.core.inner.write_batch_direct_to_l0_sst(&batch, table_id, batch_wal_number).unwrap();
+	tree.core
+		.inner
+		.write_batch_direct_to_l0_sst(&batch, table_id, batch_wal_number, u64::MAX)
+		.unwrap();
 	tree.core.inner.visible_seq_num.store(seq, Ordering::Release);
 
 	assert!(

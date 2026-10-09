@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use std::{fmt, io};
 
@@ -47,6 +47,12 @@ pub enum Error {
 	TableIDCollision(u64),
 	TableNotFound(u64),
 	PipelineStall,
+	/// A commit group failed after part of it was applied, and the database stopped. Whether the
+	/// commits of that group took effect is decided by recovery when the database is opened
+	/// again, so a commit of that group that fails with this error has an unknown outcome. A
+	/// commit that was refused because the database had stopped did not start. Reads of data that
+	/// was already visible keep working.
+	DatabaseStopped(String),
 	Other(String), // Other errors
 	NoSnapshot,
 	CommitFail(String),
@@ -104,6 +110,7 @@ impl fmt::Display for Error {
 			Self::TableIDCollision(id) => write!(f, "CRITICAL ERROR: Table ID collision detected. New table ID {id} conflicts with a table ID in the merge list."),
 			Self::TableNotFound(id) => write!(f, "Table not found: {id}"),
 			Self::PipelineStall => write!(f, "Pipeline stall"),
+			Self::DatabaseStopped(err) => write!(f, "Database stopped: {err}"),
             Self::Other(err) => write!(f, "Other error: {err}"),
             Self::NoSnapshot => write!(f, "No snapshot available"),
             Self::CommitFail(err) => write!(f, "Commit failed: {err}"),
@@ -185,6 +192,8 @@ pub enum BackgroundErrorReason {
 	MemtablaFlush,
 	Compaction,
 	ManifestWrite,
+	/// A commit group failed after part of it was applied to a memtable or an L0 table.
+	CommitGroup,
 }
 
 /// Reason for write stall - used for logging and metrics.
@@ -211,6 +220,9 @@ pub struct BackgroundErrorHandler {
 	bg_error: RwLock<Option<BackgroundError>>,
 	/// Fast atomic flag for write path checks
 	is_db_stopped: AtomicBool,
+	/// The error of the commit group that stopped the database, kept apart from `bg_error`
+	/// because an error of higher severity stored first keeps its place there.
+	commit_group_stop: OnceLock<Error>,
 	/// Stats tracking
 	error_count: AtomicU64,
 }
@@ -221,6 +233,7 @@ impl BackgroundErrorHandler {
 		Self {
 			bg_error: RwLock::new(None),
 			is_db_stopped: AtomicBool::new(false),
+			commit_group_stop: OnceLock::new(),
 			error_count: AtomicU64::new(0),
 		}
 	}
@@ -228,6 +241,10 @@ impl BackgroundErrorHandler {
 	/// Classify error severity based on error type and context
 	fn classify_error(error: &Error, reason: BackgroundErrorReason) -> ErrorSeverity {
 		match (reason, error) {
+			// A memtable or a table holds batches that were never published: the process
+			// cannot go on
+			(BackgroundErrorReason::CommitGroup, _) => ErrorSeverity::Unrecoverable,
+
 			// Corruption errors are unrecoverable
 			(_, Error::Corruption(_) | Error::CorruptedBlock(_) | Error::ManifestCorruption(_)) => {
 				ErrorSeverity::Unrecoverable
@@ -324,6 +341,23 @@ impl BackgroundErrorHandler {
 		}
 
 		Ok(())
+	}
+
+	/// Records that a commit group failed after part of it was applied: every commit fails with
+	/// `error` from now on, and `commit_group_error` returns it.
+	pub(crate) fn stop_commit_group(&self, error: Error) {
+		let _ = self.commit_group_stop.set(error.clone());
+		self.set_error(error, BackgroundErrorReason::CommitGroup);
+	}
+
+	/// The error that stopped the database because a commit group failed after part of it was
+	/// applied, if one did.
+	///
+	/// A memtable or a table then holds batches of the group that were never published. Nothing
+	/// may move them to a table, compact tables that hold them, or checkpoint them: the WAL keeps
+	/// the group for recovery, and a table that held only some of it would split it.
+	pub(crate) fn commit_group_error(&self) -> Option<Error> {
+		self.commit_group_stop.get().cloned()
 	}
 
 	/// Get the current background error, if any

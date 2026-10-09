@@ -86,6 +86,9 @@ struct FlushScratch {
 	wal_buf: Vec<u8>,
 	/// Where each record in `wal_buf` ends.
 	wal_ends: Vec<usize>,
+	/// Whether a batch of the group is in a memtable or an L0 table already. A failure from then
+	/// on cannot leave nothing of the group behind.
+	applied: bool,
 	/// Retired overflow entries between leaving the map and being dropped. Empty between steps,
 	/// and at most `RETIRED_FREE_CHUNK` long.
 	retired: Vec<Arc<CommitEntry>>,
@@ -117,6 +120,7 @@ impl FlushScratch {
 		recycle(&mut self.segments, MAX_SCRATCH_ELEMENTS);
 		recycle(&mut self.wal_buf, MAX_SCRATCH_BYTES);
 		recycle(&mut self.wal_ends, MAX_SCRATCH_ELEMENTS);
+		self.applied = false;
 	}
 }
 
@@ -252,6 +256,9 @@ enum ApplyStop {
 	Stale {
 		active_tag: u64,
 	},
+	/// The memtable took part of the next batch and then failed, which it only does if its size
+	/// estimate drifted from what the batch needs.
+	Torn(Error),
 }
 
 /// Holds an entry its committer claimed until the committer has a verdict for it. If the
@@ -843,8 +850,16 @@ impl CommitPipeline {
 	/// Assigns LSM sequence numbers to a group of accepted entries in ring
 	/// order, makes them durable and visible, and completes their commits. Drains
 	/// `scratch.group`, and leaves the rest of `scratch` for the caller to recycle.
+	///
+	/// A group that fails before any of it is applied fails whole and leaves nothing behind. One
+	/// that fails after part of it was applied cannot be taken back: the batches in the memtables
+	/// would become readable with the next group that publishes. It stops the database instead,
+	/// see `stop_database`, and no sequence number past it is ever published.
 	async fn flush_entries(&self, scratch: &mut FlushScratch) {
 		let epoch = self.restore_epoch.load(Ordering::SeqCst);
+		// A stopped database commits nothing more: entries accepted before it stopped fail like
+		// the commits that come after.
+		let stopped = self.inner.error_handler.check_error().err();
 		// Out of the scratch while `flush_group_with` borrows the rest of it.
 		let mut batches = std::mem::take(&mut scratch.batches);
 		let mut need_sync = false;
@@ -855,6 +870,11 @@ impl CommitPipeline {
 				complete_tx,
 				epoch: accepted_in,
 			} = payload;
+			if let Some(error) = &stopped {
+				entry.abort();
+				let _ = complete_tx.send(Err(error.clone()));
+				continue;
+			}
 			if accepted_in != epoch {
 				// Accepted before a restore: never apply it to the restored state.
 				entry.abort();
@@ -874,7 +894,13 @@ impl CommitPipeline {
 			return;
 		}
 
-		let result = self.flush_group_with(&mut batches, need_sync, scratch).await;
+		let result = match self.flush_group_with(&mut batches, need_sync, scratch).await {
+			Err(cause) if scratch.applied => Err(self.stop_database(&cause)),
+			result => {
+				self.inner.group_wal_pin.store(u64::MAX, Ordering::Release);
+				result
+			}
+		};
 		let applied = result.is_ok() && self.restore_epoch.load(Ordering::SeqCst) == epoch;
 		if applied {
 			// Visibility first: an entry may only be marked visible, and so
@@ -897,12 +923,40 @@ impl CommitPipeline {
 			let _ = complete_tx.send(match &result {
 				Ok(()) if applied => Ok(()),
 				Ok(()) => Err(Error::PipelineStall),
+				Err(e @ Error::DatabaseStopped(_)) => Err(e.clone()),
 				Err(e) => Err(Error::Io(
 					std::io::Error::other(format!("Group commit failed: {e}")).into(),
 				)),
 			});
 		}
 		scratch.batches = batches;
+	}
+
+	/// Stops the database after a group failed with `cause` once part of it was applied, and
+	/// returns the error that tells every committer of the group so.
+	///
+	/// What was applied stays in the memtables, where the next group that publishes would make it
+	/// readable, so nothing is published past the group: the error is recorded as a hard
+	/// background error, which fails every commit that comes after, and the flusher fails the ones
+	/// that were accepted already. A reader keeps seeing what was visible, and recovery decides
+	/// the outcome of the group when the database is opened again. The WAL segment that holds
+	/// the group's records stays pinned (`CoreInner::group_wal_pin`), so recovery finds the
+	/// group whole or not at all. The memtables are not flushed and no table is compacted from
+	/// here on, see `BackgroundErrorHandler::commit_group_error`.
+	///
+	/// Writers stalled for a flush or a compaction are woken, as they are when one fails: the
+	/// stopped database runs neither.
+	///
+	/// A restore replaces the memtables and the WAL, and so drops what the group applied, but it
+	/// does not lift the stop: commits fail until the database is opened again.
+	fn stop_database(&self, cause: &Error) -> Error {
+		let error = Error::DatabaseStopped(format!(
+			"a commit group failed after part of it was applied, and whether its commits took \
+			 effect is decided by recovery when the database is opened again: {cause}"
+		));
+		self.inner.error_handler.stop_commit_group(error.clone());
+		self.write_stall.signal_shutdown();
+		error
 	}
 
 	/// Advances the retired watermark to the oldest pin, or to the completed prefix if that is
@@ -967,7 +1021,9 @@ impl CommitPipeline {
 	#[cfg(test)]
 	pub(crate) async fn flush_group(&self, batches: &[Batch], sync: bool) -> Result<()> {
 		let mut owned = batches.to_vec();
-		self.flush_group_with(&mut owned, sync, &mut FlushScratch::default()).await
+		let result = self.flush_group_with(&mut owned, sync, &mut FlushScratch::default()).await;
+		self.inner.group_wal_pin.store(u64::MAX, Ordering::Release);
+		result
 	}
 
 	/// Flushes a group of batches to WAL and applies them to the Memtable. Encodes the values
@@ -978,6 +1034,10 @@ impl CommitPipeline {
 	/// ones from the first that is not applied on are whole. Nothing reads a batch that was
 	/// applied, and a batch that is not applied (one written to L0, one of a failed group)
 	/// keeps its keys and values.
+	///
+	/// `scratch.applied` is set as soon as a batch is in a memtable or an L0 table. A failure
+	/// before that leaves nothing of the group behind; the caller stops the database for one
+	/// after it, see `flush_entries`.
 	async fn flush_group_with(
 		&self,
 		batches: &mut [Batch],
@@ -1027,6 +1087,7 @@ impl CommitPipeline {
 			segments,
 			wal_buf,
 			wal_ends,
+			applied,
 			..
 		} = scratch;
 		// The worst-case memtable size of each batch, computed once for the oversized test, the
@@ -1111,6 +1172,10 @@ impl CommitPipeline {
 			{
 				return Err(Error::PipelineStall);
 			}
+			// A flush must not move `log_number` past the oldest segment that holds a record of
+			// a batch that is not applied yet: once part of the group is applied, that record
+			// may be the only copy.
+			self.inner.group_wal_pin.store(oldest_segment(&segments[at..]), Ordering::Release);
 			#[cfg(test)]
 			{
 				self.fire(PipelineHook::BeforeApplyRound {
@@ -1128,10 +1193,15 @@ impl CommitPipeline {
 			};
 			if next > at {
 				stale_rounds = 0;
+				*applied = true;
 			}
 			at = next;
 			match stop {
 				ApplyStop::Done => {}
+				ApplyStop::Torn(e) => {
+					*applied = true;
+					return Err(e);
+				}
 				// Bypass the memtable: the batch exceeds `max_memtable_size`, or it cannot
 				// fit even an empty memtable (rotating an empty memtable is a no-op, so
 				// retrying would never end).
@@ -1139,7 +1209,8 @@ impl CommitPipeline {
 				| ApplyStop::ArenaFull {
 					empty: true,
 				} => {
-					self.write_direct_to_l0(&batches[at])?;
+					self.write_direct_to_l0(&batches[at], oldest_segment(&segments[at + 1..]))?;
+					*applied = true;
 					at += 1;
 					stale_rounds = 0;
 				}
@@ -1318,7 +1389,7 @@ impl CommitPipeline {
 						},
 					));
 				}
-				Err(e) => return Err(e),
+				Err(e) => return Ok((at, ApplyStop::Torn(e))),
 			}
 		}
 		Ok((at, ApplyStop::Done))
@@ -1372,15 +1443,21 @@ impl CommitPipeline {
 	/// The active memtable's WAL segment is sealed first (rotated out if it holds
 	/// earlier writes, or just rotated if it is empty), so earlier writes stay
 	/// ordered before the table and no later write can land in the segment that
-	/// `write_batch_direct_to_l0_sst` marks as captured.
-	fn write_direct_to_l0(&self, batch: &Batch) -> Result<()> {
+	/// `write_batch_direct_to_l0_sst` marks as captured. `rest_wal_number` is the oldest segment
+	/// that holds the record of a batch of the group that comes after this one.
+	fn write_direct_to_l0(&self, batch: &Batch, rest_wal_number: u64) -> Result<()> {
 		let sealed_wal_number = self.inner.seal_active_wal_segment()?;
 		if let Some(ref tm) = self.task_manager {
 			tm.wake_up_memtable();
 		}
 
 		let table_id = self.inner.level_manifest.read()?.next_table_id();
-		self.inner.write_batch_direct_to_l0_sst(batch, table_id, sealed_wal_number)?;
+		self.inner.write_batch_direct_to_l0_sst(
+			batch,
+			table_id,
+			sealed_wal_number,
+			rest_wal_number,
+		)?;
 
 		if let Some(ref tm) = self.task_manager {
 			tm.wake_up_level();
@@ -1415,6 +1492,12 @@ impl CommitPipeline {
 		let retained = std::mem::take(&mut *self.overflow.lock());
 		drop(retained);
 	}
+}
+
+/// The oldest of the WAL segments `segments` that hold the records of the batches that are not
+/// applied yet, `u64::MAX` if there are none.
+fn oldest_segment(segments: &[u64]) -> u64 {
+	segments.iter().copied().min().unwrap_or(u64::MAX)
 }
 
 /// Encodes, one record each, the batches whose record is not in the segment `tag` into the
@@ -2126,7 +2209,8 @@ mod scratch_tests {
 	/// `apply_run` moves a batch into the memtable on the strength of the size it is given. If
 	/// that size was wrong and the arena runs out after a successful reservation, the batch is
 	/// partly moved, and applying it again (which `ArenaFull` would mean) would insert empty
-	/// keys. It has to be a hard error, whatever the arena says.
+	/// keys. It has to stop the group as `Torn`, a hard error that is neither retried nor counted
+	/// as applied, whatever the arena says.
 	#[tokio::test]
 	async fn apply_run_fails_hard_instead_of_retrying_when_a_size_was_wrong() {
 		let dir = TempDir::new("scratch").unwrap();
@@ -2150,9 +2234,12 @@ mod scratch_tests {
 		let mut batches = [batch];
 		let outcome = pipeline.apply_run(&mut batches, &[100], &[false], &[tag], 0);
 		match outcome {
-			Err(Error::Other(message)) => assert!(message.contains("drift"), "{message}"),
-			Err(e) => panic!("expected Error::Other, got {e:?}"),
+			Ok((at, ApplyStop::Torn(Error::Other(message)))) => {
+				assert!(message.contains("drift"), "{message}");
+				assert_eq!(at, 0, "the batch that was partly moved is not counted as applied");
+			}
 			Ok((at, _)) => panic!("applied or retried, stopped at {at}"),
+			Err(e) => panic!("expected a torn stop, got {e:?}"),
 		}
 		tree.core.is_closed.store(true, Ordering::SeqCst);
 	}
