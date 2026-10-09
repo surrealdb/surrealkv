@@ -7,6 +7,7 @@
 //! while fsynced files must survive intact. The `vfs::sync_tracker` ledger
 //! records which files were made durable via `vfs::fsync_file`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tempdir::TempDir;
@@ -14,6 +15,9 @@ use test_log::test;
 
 use crate::batch::Batch;
 use crate::compaction::leveled::Strategy;
+use crate::lsm::CoreInner;
+use crate::ring::CommitPipeline;
+use crate::storage::{AffinityLogStore, BoxFuture, LogStore};
 use crate::vfs::sync_tracker;
 use crate::{Error, Options, Tree};
 
@@ -283,7 +287,7 @@ async fn crash_after_memtable_fills_mid_group_must_not_lose_the_rest_of_the_grou
 
 	// One group of single-entry batches, together far larger than one memtable.
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
-	let first_seq = tree.core.inner.visible_seq_num.load(std::sync::atomic::Ordering::Acquire) + 1;
+	let first_seq = tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1;
 	let batches: Vec<Batch> = (0..KEYS)
 		.map(|i| {
 			let mut batch = Batch::new(first_seq + i);
@@ -306,4 +310,85 @@ async fn crash_after_memtable_fills_mid_group_must_not_lose_the_rest_of_the_grou
 	for i in 0..KEYS {
 		assert!(txn.get(key(i).as_bytes()).unwrap().is_some(), "{} was lost", key(i));
 	}
+}
+
+/// A WAL log store that rotates the memtable and flushes it right after its first
+/// append, the way a concurrent `create_checkpoint` can.
+struct RotateAfterFirstAppend {
+	log_store: AffinityLogStore,
+	core: Arc<CoreInner>,
+	fired: AtomicBool,
+}
+
+impl std::fmt::Debug for RotateAfterFirstAppend {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("RotateAfterFirstAppend").finish()
+	}
+}
+
+impl LogStore for RotateAfterFirstAppend {
+	fn append(&self, data: &[u8]) -> BoxFuture<'_, u64> {
+		let append = self.log_store.append(data);
+		Box::pin(async move {
+			let offset = append.await?;
+			if !self.fired.swap(true, Ordering::SeqCst) {
+				self.core.rotate_memtable()?;
+				self.core.flush_all_immutables_sync()?;
+			}
+			Ok(offset)
+		})
+	}
+
+	fn sync(&self) -> BoxFuture<'_, ()> {
+		self.log_store.sync()
+	}
+
+	fn size(&self) -> BoxFuture<'_, u64> {
+		self.log_store.size()
+	}
+}
+
+/// A memtable rotation from outside the commit flusher (a checkpoint) can land while
+/// a run of batches is being appended to the WAL. The run's records then sit in the
+/// segment of the memtable that was just rotated out and flushed, which moved
+/// `log_number` past that segment, so the run must not just be applied to the new
+/// memtable: a crash before that one is flushed would lose it.
+#[test(tokio::test)]
+async fn crash_after_rotation_during_wal_append_must_not_lose_the_run() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		flush_on_close: false,
+		..Default::default()
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	// Something for the rotation to rotate out.
+	{
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"before", b"value").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let mut pipeline = CommitPipeline::new(
+		Arc::clone(&tree.core.inner),
+		Arc::clone(&tree.core.write_stall),
+		None,
+		tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1,
+	);
+	pipeline.log_store = Arc::new(RotateAfterFirstAppend {
+		log_store: AffinityLogStore::new(Arc::clone(&tree.core.inner.wal.inner)),
+		core: Arc::clone(&tree.core.inner),
+		fired: AtomicBool::new(false),
+	});
+
+	let mut batch = Batch::new(tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1);
+	batch.set(b"run".to_vec(), b"value".to_vec(), 0).unwrap();
+	pipeline.flush_group(&[batch], true).await.unwrap();
+	crash(tree);
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let txn = tree.begin().unwrap();
+	assert!(txn.get(b"before").unwrap().is_some(), "before was lost");
+	assert!(txn.get(b"run").unwrap().is_some(), "run was lost");
 }

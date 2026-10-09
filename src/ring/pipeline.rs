@@ -487,10 +487,22 @@ impl CommitPipeline {
 				run_len += 1;
 			}
 			let (run, rest) = remaining.split_at(run_len);
-			self.append_to_wal(run, sync).await?;
-			let active = self.inner.active_memtable.read()?;
-			for batch in run {
-				active.add(batch)?;
+			loop {
+				self.append_to_wal(run, sync).await?;
+				let current = self.inner.active_memtable.read()?;
+				if Arc::ptr_eq(&current, &active) {
+					for batch in run {
+						current.add(batch)?;
+					}
+					break;
+				}
+				// Something outside the flusher (a checkpoint) rotated the memtable while
+				// the append was in flight, so the run's records may be in the segment of
+				// a memtable that's being flushed, past which log_number then advances.
+				// Write the run again into the current segment, which the new memtable
+				// owns. Replaying the records twice is harmless. The new memtable started
+				// empty, so the run fits.
+				active = Arc::clone(&current);
 			}
 			remaining = rest;
 		}
