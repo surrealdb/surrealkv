@@ -15,6 +15,10 @@ pub mod batch_tests;
 #[cfg(test)]
 pub mod block_tests;
 #[cfg(test)]
+pub mod checkpoint_close_tests;
+#[cfg(test)]
+pub mod checkpoint_destination_tests;
+#[cfg(test)]
 pub mod checkpoint_flush_tests;
 #[cfg(test)]
 pub mod close_race_tests;
