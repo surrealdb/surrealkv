@@ -191,7 +191,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Transparent Data Encryption (not yet available)
 
-The cipher primitives are implemented and unit-tested but are not connected to the SSTable, WAL or value-log write paths, so configuring a key manager does not encrypt anything. Use volume or filesystem encryption (LUKS, FileVault, BitLocker, encrypted cloud volumes) for encryption at rest today.
+The cipher primitives are implemented and unit-tested but are not connected to the SSTable, WAL or value-log write paths. `TreeBuilder::build()` returns an error if a key manager is configured, so data is never written unencrypted by accident. Use volume or filesystem encryption (LUKS, FileVault, BitLocker, encrypted cloud volumes) for encryption at rest today.
 
 ---
 

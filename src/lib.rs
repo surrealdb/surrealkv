@@ -283,12 +283,13 @@ pub struct Options {
 	// Transparent Data Encryption (TDE) configuration
 	/// Key manager reserved for transparent data encryption at rest (TDE), which is not
 	/// implemented yet. The cipher primitives are not wired into any SSTable, WAL or value-log
-	/// path, so nothing would be encrypted.
+	/// path, so nothing would be encrypted. Building a tree with a key manager set returns
+	/// `Error::InvalidArgument` instead of writing plaintext.
 	/// Default: None
 	pub key_manager: Option<Arc<dyn KeyManager>>,
 	/// Cipher suite reserved for encryption at rest. Has no effect until encryption is
 	/// implemented.
-	/// Options: Aes256Gcm, XChaCha20Poly1305, ChaCha20Blake3.
+	/// Options: Aes256Gcm, XChaCha20Poly1305.
 	/// Default: CipherSuite::Aes256Gcm
 	pub encryption_cipher: CipherSuite,
 }
@@ -370,7 +371,8 @@ impl Options {
 	/// Reserved for Transparent Data Encryption (TDE), which is not implemented yet.
 	///
 	/// The cipher primitives are not wired into any SSTable, WAL or value-log path, so this
-	/// would encrypt nothing.
+	/// would encrypt nothing. Building a tree with a key manager set fails with
+	/// `Error::InvalidArgument` rather than writing plaintext.
 	pub fn with_encryption(
 		mut self,
 		key_manager: Arc<dyn KeyManager>,
@@ -646,6 +648,21 @@ impl Options {
 	/// This should be called when the store starts to catch configuration
 	/// errors early
 	pub fn validate(&self) -> Result<()> {
+		// Encryption at rest is not wired into any SSTable, WAL or value-log path yet, so a
+		// configured key manager would be accepted and then ignored, leaving every file in
+		// plaintext. Refuse here, which is the first thing `Tree::new` does, so a rejection
+		// creates nothing on disk. Compiled out only for this crate's own unit tests and under
+		// the non-default `encryption-preview` feature, which exist to build the missing parts.
+		#[cfg(not(any(test, feature = "encryption-preview")))]
+		if self.key_manager.is_some() {
+			return Err(Error::InvalidArgument(
+				"Encryption at rest is not implemented yet: the key manager would be accepted \
+				 but no SSTable, WAL or value-log data would be encrypted. Refusing to open \
+				 rather than write plaintext; remove the key manager."
+					.to_string(),
+			));
+		}
+
 		// Validate versioned queries configuration
 		if self.enable_versioning {
 			// Versioned queries require VLog to be enabled
