@@ -345,6 +345,10 @@ pub(crate) struct CommitPipeline {
 	/// allocator had none to give. `usize::MAX` disables it.
 	#[cfg(test)]
 	wal_reserve_fails_from: std::sync::atomic::AtomicUsize,
+	/// Test-only failpoint: the memtable estimate of every batch falls this many bytes short of
+	/// what it needs, as if the size estimator had drifted. 0 disables it.
+	#[cfg(test)]
+	estimate_shortfall: AtomicU64,
 	/// Test-only observer called at the start of every `free_retired`.
 	#[cfg(test)]
 	free_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -412,6 +416,8 @@ impl CommitPipeline {
 			#[cfg(test)]
 			wal_reserve_fails_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
 			#[cfg(test)]
+			estimate_shortfall: AtomicU64::new(0),
+			#[cfg(test)]
 			free_hook: Mutex::new(None),
 			#[cfg(test)]
 			free_stats: Mutex::new(FreeStats::default()),
@@ -448,6 +454,13 @@ impl CommitPipeline {
 	#[cfg(test)]
 	pub(crate) fn set_wal_reserve_fails_from(&self, bytes: usize) {
 		self.wal_reserve_fails_from.store(bytes, Ordering::Relaxed);
+	}
+
+	/// Makes the memtable estimate of every batch `bytes` bytes short of what it needs, so that a
+	/// memtable which looks as if it has room runs out of it part way through a batch. 0 lifts it.
+	#[cfg(test)]
+	pub(crate) fn set_estimate_shortfall(&self, bytes: u64) {
+		self.estimate_shortfall.store(bytes, Ordering::Relaxed);
 	}
 
 	/// Test observer: whether the entry at `seq` has been accepted and waits for the flusher.
@@ -1097,6 +1110,15 @@ impl CommitPipeline {
 		estimates.extend(batches.iter().map(|batch| batch.memtable_size_estimate()));
 		oversized.clear();
 		oversized.extend(estimates.iter().map(|bytes| *bytes > max_memtable_size));
+		#[cfg(test)]
+		{
+			let shortfall = self.estimate_shortfall.load(Ordering::Relaxed);
+			if shortfall > 0 {
+				estimates
+					.iter_mut()
+					.for_each(|bytes| *bytes = bytes.saturating_sub(shortfall).max(1));
+			}
+		}
 
 		// If the first batch does not fit what is left of the active memtable, rotate
 		// now, so it is logged in the segment of the memtable that will receive it.
