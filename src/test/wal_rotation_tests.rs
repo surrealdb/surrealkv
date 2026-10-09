@@ -173,6 +173,7 @@ fn mark_closed(tree: &Tree) {
 
 fn release_lock(tree: &Tree) {
 	tree.core.inner.lockfile.lock().unwrap().release().unwrap();
+	tree.core.abort_background_tasks();
 }
 
 async fn stop_background_tasks(tree: &Tree) {
