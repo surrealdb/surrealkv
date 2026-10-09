@@ -75,6 +75,8 @@ pub mod stall_tests;
 #[cfg(test)]
 pub mod transaction_tests;
 #[cfg(test)]
+pub mod vlog_floor_tests;
+#[cfg(test)]
 pub mod vlog_tests;
 #[cfg(test)]
 pub mod wal_decode_tests;
