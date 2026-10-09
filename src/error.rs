@@ -12,6 +12,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// It includes various variants to represent different types of errors that can
 /// occur.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Error {
 	Abort,              // The operation was aborted
 	Io(Arc<io::Error>), // An I/O error occurred
@@ -53,6 +54,9 @@ pub enum Error {
 	Corruption(String), // Data corruption detected
 	ManifestCorruption(String), /* Manifest inconsistency detected (e.g., log_number exceeds
 	                     * WAL segments) */
+	/// No manifest exists but the directory holds database files, so opening
+	/// would start a new database over them and discard them.
+	ManifestMissing(String),
 	InvalidArgument(String),
 	InvalidTag(String),
 	InterleavedIteration, // Interleaved iteration not supported
@@ -106,6 +110,7 @@ impl fmt::Display for Error {
             Self::LoadManifestFail(err) => write!(f, "Failed to load manifest: {err}"),
             Self::Corruption(err) => write!(f, "Data corruption detected: {err}"),
             Self::ManifestCorruption(err) => write!(f, "Manifest corruption detected: {err}"),
+            Self::ManifestMissing(err) => write!(f, "Manifest missing: {err}"),
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::InterleavedIteration => write!(f, "Interleaved iteration not supported: cannot mix next() and next_back() on same iterator"),

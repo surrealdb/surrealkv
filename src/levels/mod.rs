@@ -34,6 +34,66 @@ pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64)
 	Ok(())
 }
 
+/// Refuses to open a directory that holds database files but has no usable
+/// manifest.
+///
+/// An absent manifest otherwise means "create a new database": `LevelManifest::new`
+/// writes an empty one, WAL replay can overwrite table 1, and the startup orphan
+/// cleanup deletes every SSTable the new manifest does not list. A manifest that
+/// is present but cannot be decoded is reported here too, so that nothing (a
+/// directory, the lock file, a migration) has been created or moved by the time
+/// the open fails. Only a directory without any SSTable, WAL segment or value
+/// log file may be initialised.
+///
+/// Reads only. Must run before anything else in `Tree::new` touches the directory.
+pub(crate) fn check_manifest_before_open(opts: &Options) -> Result<()> {
+	let manifest_path = opts.manifest_file_path(0);
+
+	if manifest_path.try_exists()? {
+		let data = std::fs::read(&manifest_path)?;
+		return DecodedManifest::decode(data).map(drop).map_err(|e| {
+			Error::ManifestCorruption(format!(
+				"{} cannot be decoded: {e}. Restore it from a backup; the data files have not been touched.",
+				manifest_path.display()
+			))
+		});
+	}
+
+	let sstables = count_files_with_extension(&opts.sstable_dir(), "sst")?;
+	let wal_segments = count_files_with_extension(&opts.wal_dir(), "wal")?;
+	let vlog_files = count_files_with_extension(&opts.vlog_dir(), "vlog")?;
+	if sstables + wal_segments + vlog_files == 0 {
+		return Ok(());
+	}
+
+	Err(Error::ManifestMissing(format!(
+		"there is no manifest at {} but {} holds database files ({sstables} SSTable(s), \
+		 {wal_segments} WAL segment(s), {vlog_files} value log file(s)). Refusing to open it as a \
+		 new database, which would discard them. Restore the manifest from a backup, or move the \
+		 data files away to start empty.",
+		manifest_path.display(),
+		opts.path.display()
+	)))
+}
+
+/// Counts the files in `dir` with the given extension. A missing directory
+/// holds none.
+fn count_files_with_extension(dir: &Path, extension: &str) -> Result<usize> {
+	let entries = match std::fs::read_dir(dir) {
+		Ok(entries) => entries,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+		Err(e) => return Err(e.into()),
+	};
+
+	let mut count = 0;
+	for entry in entries {
+		if entry?.path().extension().is_some_and(|ext| ext == extension) {
+			count += 1;
+		}
+	}
+	Ok(count)
+}
+
 /// Current manifest format version
 pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
 
@@ -147,6 +207,77 @@ pub(crate) struct LevelManifest {
 	pub(crate) last_sequence: u64,
 }
 
+/// The contents of a manifest file, decoded without opening the tables it lists.
+struct DecodedManifest {
+	version: u16,
+	next_table_id: u64,
+	log_number: u64,
+	last_sequence: u64,
+	/// Table ids of each level
+	level_data: Vec<Vec<u64>>,
+	snapshots: Vec<SnapshotInfo>,
+}
+
+impl DecodedManifest {
+	fn decode(data: Vec<u8>) -> Result<Self> {
+		let mut level_manifest = Cursor::new(data);
+
+		// Read versioned manifest format
+		let mut u16_buf = [0u8; 2];
+		level_manifest.read_exact(&mut u16_buf)?;
+		let version = u16::from_be_bytes(u16_buf);
+		if version != MANIFEST_FORMAT_VERSION_V1 {
+			return Err(Error::LoadManifestFail(format!(
+				"Unsupported manifest format version: {version}. Expected: {MANIFEST_FORMAT_VERSION_V1}"
+			)));
+		}
+
+		let mut u64_buf = [0u8; 8];
+		level_manifest.read_exact(&mut u64_buf)?;
+		let next_table_id = u64::from_be_bytes(u64_buf);
+
+		level_manifest.read_exact(&mut u64_buf)?;
+		let log_number = u64::from_be_bytes(u64_buf);
+
+		level_manifest.read_exact(&mut u64_buf)?;
+		let last_sequence = u64::from_be_bytes(u64_buf);
+
+		tracing::debug!(
+			"Manifest header: version={}, next_table_id={}, log_number={}, last_sequence={}",
+			version,
+			next_table_id,
+			log_number,
+			last_sequence
+		);
+
+		// Read levels data
+		let level_data = Levels::decode(&mut level_manifest)?;
+
+		// Read snapshots
+		let mut u32_buf = [0u8; 4];
+		level_manifest.read_exact(&mut u32_buf)?;
+		let snapshot_count = u32::from_be_bytes(u32_buf);
+		let mut snapshots = Vec::new();
+		for _ in 0..snapshot_count {
+			level_manifest.read_exact(&mut u32_buf)?;
+			let snapshot_len = u32::from_be_bytes(u32_buf) as usize;
+			let mut snapshot_bytes = vec![0u8; snapshot_len];
+			level_manifest.read_exact(&mut snapshot_bytes)?;
+			let snapshot = SnapshotInfo::decode(&snapshot_bytes)?;
+			snapshots.push(snapshot);
+		}
+
+		Ok(Self {
+			version,
+			next_table_id,
+			log_number,
+			last_sequence,
+			level_data,
+			snapshots,
+		})
+	}
+}
+
 impl LevelManifest {
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		assert!(opts.level_count > 0, "level_count should be >= 1");
@@ -210,55 +341,17 @@ impl LevelManifest {
 
 		// Read and parse the manifest file
 		let data = std::fs::read(&manifest_path)?;
-		let mut level_manifest = Cursor::new(data);
-
-		// Read versioned manifest format
-		let mut u16_buf = [0u8; 2];
-		level_manifest.read_exact(&mut u16_buf)?;
-		let version = u16::from_be_bytes(u16_buf);
-		if version != MANIFEST_FORMAT_VERSION_V1 {
-			return Err(Error::LoadManifestFail(format!(
-				"Unsupported manifest format version: {version}. Expected: {MANIFEST_FORMAT_VERSION_V1}"
-			)));
-		}
-
-		let mut u64_buf = [0u8; 8];
-		level_manifest.read_exact(&mut u64_buf)?;
-		let next_table_id = u64::from_be_bytes(u64_buf);
-
-		level_manifest.read_exact(&mut u64_buf)?;
-		let log_number = u64::from_be_bytes(u64_buf);
-
-		level_manifest.read_exact(&mut u64_buf)?;
-		let last_sequence = u64::from_be_bytes(u64_buf);
-
-		tracing::debug!(
-			"Manifest header: version={}, next_table_id={}, log_number={}, last_sequence={}",
+		let DecodedManifest {
 			version,
 			next_table_id,
 			log_number,
-			last_sequence
-		);
+			last_sequence,
+			level_data,
+			snapshots,
+		} = DecodedManifest::decode(data)?;
 
 		// Validate log_number against actual WAL segments BEFORE proceeding
 		validate_wal_log_number(&opts.wal_dir(), log_number)?;
-
-		// Read levels data
-		let level_data = Levels::decode(&mut level_manifest)?;
-
-		// Read snapshots
-		let mut u32_buf = [0u8; 4];
-		level_manifest.read_exact(&mut u32_buf)?;
-		let snapshot_count = u32::from_be_bytes(u32_buf);
-		let mut snapshots = Vec::new();
-		for _ in 0..snapshot_count {
-			level_manifest.read_exact(&mut u32_buf)?;
-			let snapshot_len = u32::from_be_bytes(u32_buf) as usize;
-			let mut snapshot_bytes = vec![0u8; snapshot_len];
-			level_manifest.read_exact(&mut snapshot_bytes)?;
-			let snapshot = SnapshotInfo::decode(&snapshot_bytes)?;
-			snapshots.push(snapshot);
-		}
 
 		// Now convert the level data into actual Level objects with Table instances
 		// Use the actual number of levels from the manifest, not the configured level

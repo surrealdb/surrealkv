@@ -407,6 +407,11 @@ async fn test_oversized_recovery_memtable_does_not_become_active() {
 	// oversized-memtable fallback.
 	let wal_dir = opts.wal_dir();
 	std::fs::create_dir_all(&wal_dir).unwrap();
+	// The engine writes the manifest before it creates any WAL segment, so a crash can
+	// only leave a segment next to an existing manifest. Opening a directory that has
+	// WAL segments but no manifest is refused rather than treated as a new database.
+	std::fs::create_dir_all(opts.manifest_dir()).unwrap();
+	crate::levels::LevelManifest::new(Arc::new(opts.clone())).unwrap();
 	let big_value = vec![0xEFu8; MAX_MEMTABLE * 2];
 	// Values are stored `ValueLocation`-encoded (even inline ones) by the normal
 	// commit path (`flush_group`, before they ever reach the WAL) -- replicate that
