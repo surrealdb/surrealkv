@@ -9,7 +9,7 @@ use super::bloom::BloomFilter;
 use super::commit_ring::{CommitRing, SlotRead, DEFAULT_COMMIT_RING_CAPACITY};
 use super::queue::{CommitEntry, EntryState, Payload};
 use super::sync::backoff;
-use crate::batch::{Batch, MAX_BATCH_SIZE};
+use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::CoreInner;
 use crate::memtable::MemTable;
@@ -151,15 +151,22 @@ fn group_has_room(entries: usize, group_bytes: usize, bytes: usize) -> bool {
 	entries == 0 || group_bytes.saturating_add(bytes) <= MAX_GROUP_BYTES
 }
 
-/// Reserves room for `bytes` bytes in `buf`, which is empty, and fails when the allocator
-/// refuses, where `Vec::reserve` aborts the process. Exactly `bytes`, not the doubling that
-/// `reserve` rounds up to, so the buffer stays within what `MAX_SCRATCH_BYTES` keeps.
+/// Reserves room for `additional` more bytes in `buf`, and fails when the allocator refuses,
+/// where `Vec::reserve` aborts the process. Exactly `additional`, not the doubling that `reserve`
+/// rounds up to.
 ///
-/// Only the group's buffer is reserved this way. Wrapping a value and compressing a record
-/// allocate per batch, with the ordinary allocator.
+/// The allocations that a batch of any size makes before its record is logged are made this way,
+/// so that a refusal fails the group before anything of it is appended: the group's buffer and
+/// the wrapping of a value here, and the blocks of a compressed record in the WAL writer.
+fn try_reserve_bytes(buf: &mut Vec<u8>, additional: usize) -> Result<()> {
+	buf.try_reserve_exact(additional).map_err(|e| Error::Io(Arc::new(std::io::Error::from(e))))
+}
+
+/// Reserves room for `bytes` bytes in `buf`, which is empty, see `try_reserve_bytes`. Exactly
+/// `bytes`, so the buffer stays within what `MAX_SCRATCH_BYTES` keeps.
 fn try_reserve_wal(buf: &mut Vec<u8>, bytes: usize) -> Result<()> {
 	debug_assert!(buf.is_empty(), "a reservation made after encoding would not be exact");
-	buf.try_reserve_exact(bytes).map_err(|e| Error::Io(Arc::new(std::io::Error::from(e))))
+	try_reserve_bytes(buf, bytes)
 }
 
 /// Folds `permit` into `merged`, so that a group gives its admission permits back with one
@@ -1435,8 +1442,9 @@ impl CommitPipeline {
 	///
 	/// The stale batches go to the WAL as one group, so they land in one segment. They are
 	/// encoded into the group's own buffers, which the first append gave back with room for the
-	/// whole group. Nothing is reserved here, because part of the group is already applied and
-	/// the step must not fail for want of memory.
+	/// whole group. Nothing is reserved for them, because part of the group is already applied.
+	/// On a compressed segment the append still allocates the blocks of its records, and fails
+	/// as it does for an I/O error.
 	#[allow(clippy::too_many_arguments)]
 	async fn reappend_stale(
 		&self,
@@ -1600,6 +1608,10 @@ fn tag_mismatch(segments: &[u64], tag: u64) -> Error {
 /// In place, so an entry's key and value are not copied. This used to build a second batch
 /// entry by entry, which cloned every key and value and encoded each value into a third
 /// allocation. `batch.size` stays what `add_record` would have computed for the new values.
+///
+/// Growing a value by the two bytes allocates when it has no room to spare, which for a large
+/// value is a large allocation. If the allocator refuses, this fails with the values before it
+/// wrapped and the rest as they were: the caller fails the group and does not log the batch.
 fn encode_values(batch: &mut Batch, vlog: Option<&Arc<VLog>>, vlog_threshold: usize) -> Result<()> {
 	// What a value adds to `Batch::size`: its length, and the varint that gives it.
 	let value_size = |len: usize| varint_len_u64(len as u64) as u64 + len as u64;
@@ -1622,7 +1634,7 @@ fn encode_values(batch: &mut Batch, vlog: Option<&Arc<VLog>>, vlog_threshold: us
 			_ => {
 				// `ValueLocation::with_inline_value(value).encode()`, without the copies.
 				let len = value.len();
-				value.reserve_exact(2);
+				try_reserve_bytes(value, 2)?;
 				value.resize(len + 2, 0);
 				value.copy_within(0..len, 2);
 				value[0] = 0;
@@ -1632,7 +1644,7 @@ fn encode_values(batch: &mut Batch, vlog: Option<&Arc<VLog>>, vlog_threshold: us
 		batch.size = batch.size - size_before + value_size(value.len());
 	}
 	// The two bytes of every wrapped value count against the limit `add_record` enforces.
-	if batch.size > MAX_BATCH_SIZE {
+	if batch.exceeds_max_size() {
 		return Err(Error::BatchTooLarge);
 	}
 	Ok(())
@@ -1651,6 +1663,7 @@ mod encode_values_tests {
 	use tempdir::TempDir;
 
 	use super::*;
+	use crate::batch::{ENCODED_ENTRY_SLACK, ENCODED_HEADER_SIZE, MAX_BATCH_SIZE};
 	use crate::vlog::ValuePointer;
 	use crate::{Options, Tree};
 
@@ -1810,8 +1823,10 @@ mod encode_values_tests {
 		// One entry: a set of a 10 byte value under a 3 byte key, which `add_record` counts as
 		// kind, key length, key, value length, value and 8 for the timestamp.
 		const ENTRY: u64 = 1 + 1 + 3 + 1 + 10 + 8;
+		// The largest size at which the wrapped batch still fits: its size grows by two bytes.
+		let last_fit = MAX_BATCH_SIZE - 2 - ENCODED_HEADER_SIZE - ENCODED_ENTRY_SLACK;
 
-		for size in [MAX_BATCH_SIZE - 3, MAX_BATCH_SIZE - 2, MAX_BATCH_SIZE - 1, MAX_BATCH_SIZE] {
+		for size in [last_fit - 1, last_fit, last_fit + 1, last_fit + 2] {
 			let mut batch = Batch::new(0);
 			batch.set(b"key".to_vec(), vec![1u8; 10], 0).unwrap();
 			assert_eq!(batch.size, ENTRY);
@@ -1830,7 +1845,7 @@ mod encode_values_tests {
 			);
 
 			assert_eq!(in_place.is_err(), copied.is_err(), "batch of {size} bytes");
-			assert_eq!(in_place.is_err(), size + 2 > MAX_BATCH_SIZE, "batch of {size} bytes");
+			assert_eq!(in_place.is_err(), size > last_fit, "batch of {size} bytes");
 			if let Err(e) = in_place {
 				assert!(matches!(e, Error::BatchTooLarge), "got {e:?}");
 			}

@@ -464,6 +464,20 @@ impl Write for Sink {
 	}
 }
 
+/// The lengths of the key and the value of an entry as its header and its pointer store them, a
+/// `u32` each. An entry with a longer key or value is refused: a cast would store a length that
+/// wrapped around, and the entry could not be read back.
+pub(crate) fn entry_lens(key: usize, value: usize) -> Result<(u32, u32)> {
+	match (u32::try_from(key), u32::try_from(value)) {
+		(Ok(key), Ok(value)) => Ok((key, value)),
+		_ => Err(Error::InvalidArgument(format!(
+			"a VLog entry takes a key and a value of at most {} bytes each, got a key of {key} \
+			 bytes and a value of {value} bytes",
+			u32::MAX
+		))),
+	}
+}
+
 /// Writer for a single VLog file
 pub(crate) struct VLogWriter {
 	/// Buffered writer for the file
@@ -546,8 +560,7 @@ impl VLogWriter {
 			))));
 		}
 
-		let key_len = key.len() as u32;
-		let value_len = value.len() as u32;
+		let (key_len, value_len) = entry_lens(key.len(), value.len())?;
 		let offset = self.current_offset;
 
 		// Calculate CRC32 of key + value
@@ -556,7 +569,7 @@ impl VLogWriter {
 		hasher.update(value);
 		let crc32 = hasher.finalize();
 
-		if let Err(e) = self.write_entry(key, value, crc32) {
+		if let Err(e) = self.write_entry(key, value, (key_len, value_len), crc32) {
 			if let Err(cut) = self.cut_back(offset) {
 				tracing::error!(
 					"Failed to cut a partial entry off VLog file {}, poisoning its writer: {cut}",
@@ -575,10 +588,16 @@ impl VLogWriter {
 		Ok(ValuePointer::new(self.file_id, offset, key_len, value_len, crc32))
 	}
 
-	fn write_entry(&mut self, key: &[u8], value: &[u8], crc32: u32) -> Result<()> {
+	fn write_entry(
+		&mut self,
+		key: &[u8],
+		value: &[u8],
+		(key_len, value_len): (u32, u32),
+		crc32: u32,
+	) -> Result<()> {
 		// Write header: [key_len: 4 bytes][value_len: 4 bytes]
-		self.writer.write_all(&(key.len() as u32).to_be_bytes())?;
-		self.writer.write_all(&(value.len() as u32).to_be_bytes())?;
+		self.writer.write_all(&key_len.to_be_bytes())?;
+		self.writer.write_all(&value_len.to_be_bytes())?;
 
 		// Write key
 		self.writer.write_all(key)?;
