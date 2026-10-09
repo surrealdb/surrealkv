@@ -2,7 +2,10 @@ use std::fmt;
 use std::fs::{self, read_dir, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::PoisonError;
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 
 use crc32fast::Hasher;
 
@@ -500,16 +503,126 @@ pub trait WritableFile: Send {
 	fn flush(&mut self) -> Result<()>;
 
 	/// Syncs all data to disk (flush + fsync).
+	///
+	/// After a failed fsync the file refuses every later sync, see `SyncGate`.
 	fn sync(&mut self) -> Result<()>;
 
 	/// Closes the file, flushing and syncing any remaining buffered data.
 	fn close(&mut self) -> Result<()>;
 }
 
+/// The error of every append and sync on a segment after one of its fsyncs failed.
+pub(crate) fn sync_poisoned() -> Error {
+	Error::IO(IOError::new(
+		io::ErrorKind::Other,
+		"WAL writer is poisoned by an earlier failed sync",
+	))
+}
+
+/// The fsyncs of one WAL segment: the writer's own, and the ones `WalManager::sync` makes
+/// outside the WAL lock through a clone of the file.
+///
+/// They never overlap, and none runs after one failed. The kernel reports a writeback error
+/// to a single fsync and drops the pages it could not write, so a second fsync, or one that
+/// overlaps the failing one, can report success for data that never reached the disk, and
+/// everything acknowledged after it would sit behind a hole that recovery stops at. A failed
+/// fsync therefore ends the segment: its writer refuses every later append and sync, and
+/// only a rotation, whose new segment has a gate of its own, lets commits through again.
+///
+/// A leaf lock: an fsync holds nothing but the gate, so it is safe to take under the WAL lock.
+#[derive(Default)]
+pub(crate) struct SyncGate {
+	/// Held across each fsync.
+	serial: parking_lot::Mutex<()>,
+	/// Set by the first fsync that fails, never cleared.
+	failed: AtomicBool,
+	/// Fault injection for tests: how many more fsyncs succeed before one fails.
+	#[cfg(test)]
+	fail_after: parking_lot::Mutex<Option<usize>>,
+	/// Test-only observer called inside every fsync, with the gate held.
+	#[cfg(test)]
+	observer: parking_lot::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+	/// Test-only count of the calls that reached the gate, the ones waiting for it included.
+	#[cfg(test)]
+	arrivals: AtomicUsize,
+}
+
+impl SyncGate {
+	/// Whether an fsync of the segment has failed.
+	pub(crate) fn failed(&self) -> bool {
+		self.failed.load(Ordering::Acquire)
+	}
+
+	/// fsyncs `file`, unless an earlier fsync of the segment failed. The first failure is
+	/// returned as it happened, and every later call fails with [`sync_poisoned`].
+	pub(crate) fn sync(&self, file: &File) -> Result<()> {
+		#[cfg(test)]
+		self.arrivals.fetch_add(1, Ordering::SeqCst);
+		let _serial = self.serial.lock();
+		if self.failed() {
+			return Err(sync_poisoned());
+		}
+		let result = self.fsync(file);
+		if result.is_err() {
+			self.failed.store(true, Ordering::Release);
+		}
+		result
+	}
+
+	fn fsync(&self, file: &File) -> Result<()> {
+		#[cfg(test)]
+		{
+			let observer = self.observer.lock().clone();
+			if let Some(observer) = observer {
+				observer();
+			}
+			self.injected_failure()?;
+		}
+		file.sync_all()?;
+		Ok(())
+	}
+
+	/// Makes the fsync after the next `syncs` of them fail once, as a failing disk would.
+	#[cfg(test)]
+	pub(crate) fn fail_after(&self, syncs: usize) {
+		*self.fail_after.lock() = Some(syncs);
+	}
+
+	/// Installs (or clears) the observer called inside every fsync.
+	#[cfg(test)]
+	pub(crate) fn set_observer(&self, observer: Option<Arc<dyn Fn() + Send + Sync>>) {
+		*self.observer.lock() = observer;
+	}
+
+	/// How many calls reached the gate so far, the ones waiting for it included.
+	#[cfg(test)]
+	pub(crate) fn arrivals(&self) -> usize {
+		self.arrivals.load(Ordering::SeqCst)
+	}
+
+	#[cfg(test)]
+	fn injected_failure(&self) -> Result<()> {
+		let mut fail_after = self.fail_after.lock();
+		match fail_after.as_mut() {
+			Some(0) => {
+				*fail_after = None;
+				Err(Error::IO(IOError::new(io::ErrorKind::Other, "injected fsync failure")))
+			}
+			Some(syncs) => {
+				*syncs -= 1;
+				Ok(())
+			}
+			None => Ok(()),
+		}
+	}
+}
+
 /// Buffered file writer wrapping BufWriter<File>.
 pub struct BufferedFileWriter {
 	writer: BufWriter<File>,
 	pending_sync: bool,
+	/// Shared with the clone of the file `WalManager::sync` fsyncs through.
+	gate: Arc<SyncGate>,
 	/// Length of the file once everything buffered is written, or `None` if it
 	/// could not be read when the writer was created.
 	len: Option<u64>,
@@ -529,6 +642,7 @@ impl BufferedFileWriter {
 		Self {
 			writer: BufWriter::with_capacity(buffer_size, file),
 			pending_sync: false,
+			gate: Arc::default(),
 			len,
 			#[cfg(test)]
 			fail_after_ops: None,
@@ -545,6 +659,16 @@ impl BufferedFileWriter {
 	/// Whether everything appended has reached the file.
 	pub(crate) fn is_flushed(&self) -> bool {
 		self.writer.buffer().is_empty()
+	}
+
+	/// The gate every fsync of this file goes through.
+	pub(crate) fn gate(&self) -> Arc<SyncGate> {
+		Arc::clone(&self.gate)
+	}
+
+	/// Whether an fsync of the file failed, which ends its use for appends and syncs.
+	pub(crate) fn sync_failed(&self) -> bool {
+		self.gate.failed()
 	}
 
 	/// Test-only: whether anything was appended since the last successful fsync.
@@ -573,7 +697,7 @@ impl BufferedFileWriter {
 			)));
 		}
 		file.set_len(len)?;
-		file.sync_all()?;
+		self.gate.sync(file)?;
 		self.len = Some(len);
 		self.pending_sync = false;
 		Ok(())
@@ -646,13 +770,17 @@ impl WritableFile for BufferedFileWriter {
 	}
 
 	fn sync(&mut self) -> Result<()> {
+		// Ahead of the shortcut: after a failed fsync nothing is synced, whatever is pending.
+		if self.gate.failed() {
+			return Err(sync_poisoned());
+		}
 		if !self.pending_sync {
 			return Ok(());
 		}
 		#[cfg(test)]
 		self.count_flush();
 		self.writer.flush()?;
-		self.writer.get_ref().sync_all()?;
+		self.gate.sync(self.writer.get_ref())?;
 		self.pending_sync = false;
 		Ok(())
 	}

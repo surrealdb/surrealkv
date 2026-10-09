@@ -1,14 +1,17 @@
 use std::io;
+use std::sync::Arc;
 
 use crc32fast::Hasher;
 
 use super::{
+	sync_poisoned,
 	BufferedFileWriter,
 	CompressionType,
 	Error,
 	IOError,
 	RecordType,
 	Result,
+	SyncGate,
 	WritableFile,
 	BLOCK_SIZE,
 	HEADER_SIZE,
@@ -30,7 +33,8 @@ pub struct Writer {
 	compression_type: CompressionType,
 
 	/// Set when an append failed. The writer then refuses appends until it is
-	/// replaced, which a rotation does.
+	/// replaced, which a rotation does. A failed fsync is tracked by the file's
+	/// `SyncGate` instead, because the fsyncs outside the WAL lock record it too.
 	poisoned: bool,
 }
 
@@ -74,6 +78,16 @@ impl Writer {
 	#[cfg(test)]
 	pub(crate) fn pending_sync(&self) -> bool {
 		self.dest.pending_sync()
+	}
+
+	/// Whether an fsync of the segment failed. The writer then refuses every append and sync.
+	pub(crate) fn sync_failed(&self) -> bool {
+		self.dest.sync_failed()
+	}
+
+	/// The gate every fsync of the segment goes through.
+	pub(crate) fn sync_gate(&self) -> Arc<SyncGate> {
+		self.dest.gate()
 	}
 
 	/// Adds a record to the WAL.
@@ -223,7 +237,8 @@ impl Writer {
 
 	/// Syncs data to disk (slow, durable).
 	///
-	/// Should be called when durability is required (e.g., transaction commit).
+	/// Should be called when durability is required (e.g., transaction commit). If the fsync
+	/// fails, the writer refuses every later append and sync, see `SyncGate`.
 	pub fn sync(&mut self) -> Result<()> {
 		self.dest.sync() // Slow: flush + fsync to disk
 	}
@@ -240,7 +255,12 @@ impl Writer {
 	/// record, and the writer refuses further appends until a rotation replaces
 	/// it: a disk that failed once may fail again, and if the cut itself failed
 	/// the state of the segment is unknown.
+	///
+	/// A segment whose fsync failed takes no append either.
 	fn guard_append<T>(&mut self, append: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+		if self.dest.sync_failed() {
+			return Err(sync_poisoned());
+		}
 		if self.poisoned {
 			return Err(Error::IO(IOError::new(
 				io::ErrorKind::Other,

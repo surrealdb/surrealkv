@@ -89,6 +89,17 @@ pub trait CompactionOperations: Send + Sync {
 /// Read locks and write locks follow the same ordering.
 /// If a function needs multiple locks, it must acquire them in this order.
 /// See `rotate_memtable()`, `flush_immutable_to_sst()` for examples.
+///
+/// The WAL's own lock (`wal`) is a leaf: nothing is acquired while it is held, except the
+/// segment's fsync gate, which is itself a leaf, so it can be taken after any of the locks above
+/// or on its own. Rotation takes it under `active_memtable` (`rotate_memtable()`,
+/// `seal_active_wal_segment()`), and so does the shutdown flush. Everything else takes it alone,
+/// and some of it from pool threads: the commit pipeline for every append and every fsync of a
+/// commit group (`AffinityLogStore`), and `flush_wal`, `close` and restore. It is held across the
+/// fsync of a commit group, but not across the one `WalManager::sync` makes, which goes through
+/// the gate instead. The commit pipeline compares the segment it appended to with the tag of the
+/// active memtable under `active_memtable.read()`, which rotation needs exclusively, so a record
+/// is never applied to a memtable tagged with a different segment.
 pub(crate) struct CoreInner {
 	/// The active memtable (write buffer) that receives all new writes.
 	///
@@ -1414,6 +1425,10 @@ impl Core {
 	/// If `sync` is true, also fsyncs to disk for durability.
 	/// This is safe to call concurrently with ongoing transactions.
 	///
+	/// If the fsync fails, the WAL segment in use refuses every later append and sync: the
+	/// kernel may have dropped the data it could not write, and a second fsync can report
+	/// success for it. Commits fail until the WAL rotates or the database is reopened.
+	///
 	/// # Order of Operations
 	///
 	/// VLog is flushed first (contains data referenced by WAL), then WAL.
@@ -1515,9 +1530,14 @@ impl Core {
 		let wal_log_number = self.inner.wal.read().get_active_log_number();
 		tracing::debug!("Closing WAL: active_log_number={}", wal_log_number);
 
+		// A WAL that cannot be closed (the fsync of its segment failed) does not keep the rest of
+		// the shutdown from running: its error is returned at the end.
 		let mut wal_guard = self.inner.wal.write();
-		wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)))?;
-		tracing::debug!("WAL #{:020} closed and synced", wal_log_number);
+		let wal_closed =
+			wal_guard.close().map_err(|e| Error::Other(format!("Failed to close WAL: {}", e)));
+		if wal_closed.is_ok() {
+			tracing::debug!("WAL #{:020} closed and synced", wal_log_number);
+		}
 		drop(wal_guard);
 
 		// Step 4.5: Clean up obsolete WAL files (synchronous cleanup)
@@ -1560,7 +1580,7 @@ impl Core {
 			final_manifest.get_last_sequence()
 		);
 
-		Ok(())
+		wal_closed
 	}
 }
 
@@ -2060,6 +2080,10 @@ impl Tree {
 	///
 	/// If `sync` is false, only flushes to OS buffer cache (faster but
 	/// not durable across power loss).
+	///
+	/// If the fsync fails, the WAL segment in use refuses every later write and sync, because
+	/// the kernel may have dropped the data it could not write and a second fsync can report
+	/// success for it. Commits fail until the WAL rotates or the database is reopened.
 	///
 	/// This is safe to call concurrently with ongoing transactions.
 	pub fn flush_wal(&self, sync: bool) -> Result<()> {

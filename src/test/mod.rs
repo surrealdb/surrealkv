@@ -61,6 +61,8 @@ pub mod vlog_tests;
 #[cfg(test)]
 pub mod wal_decode_tests;
 #[cfg(test)]
+pub mod wal_fsync_poison_tests;
+#[cfg(test)]
 pub mod wal_group_commit_tests;
 #[cfg(test)]
 pub mod wal_group_crash_tests;

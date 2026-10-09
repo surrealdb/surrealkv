@@ -443,7 +443,9 @@ impl CommitPipeline {
 			let _ = complete_tx.send(match &result {
 				Ok(()) if applied => Ok(()),
 				Ok(()) => Err(Error::PipelineStall),
-				Err(_) => Err(Error::Io(std::io::Error::other("Group commit failed").into())),
+				Err(e) => Err(Error::Io(
+					std::io::Error::other(format!("Group commit failed: {e}")).into(),
+				)),
 			});
 		}
 	}

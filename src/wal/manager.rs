@@ -14,6 +14,7 @@ use super::{
 	Options,
 	RecordType,
 	Result,
+	SyncGate,
 	BLOCK_SIZE,
 	HEADER_SIZE,
 };
@@ -25,6 +26,7 @@ pub struct Wal {
 
 	/// Cloned file descriptor for the active WAL file, used to perform
 	/// fsync outside the write lock so concurrent appends are not blocked.
+	/// The fsync goes through the segment's `SyncGate`, see `sync_handle`.
 	sync_fd: Arc<File>,
 
 	/// The log number of the currently active Writer.
@@ -407,14 +409,18 @@ impl Wal {
 		self.active_writer.write_buffer()
 	}
 
-	/// Returns a clone of the sync file descriptor Arc.
-	///
-	/// The caller can use this to perform `sync_all()` outside the WAL write
-	/// lock, allowing concurrent appends to proceed during the slow fsync.
+	/// Returns what the caller needs to fsync the active segment outside the WAL
+	/// write lock, allowing concurrent appends to proceed during the slow fsync.
 	/// This is safe because fsync operates on the inode — all dirty pages
 	/// from any fd pointing to the same file are persisted.
-	pub(crate) fn sync_fd(&self) -> Arc<File> {
-		Arc::clone(&self.sync_fd)
+	///
+	/// The handle belongs to the segment it was taken for: if the WAL rotates before the
+	/// fsync, it still syncs that segment, and a failure poisons only that segment's writer.
+	pub(crate) fn sync_handle(&self) -> SyncHandle {
+		SyncHandle {
+			file: Arc::clone(&self.sync_fd),
+			gate: self.active_writer.sync_gate(),
+		}
 	}
 
 	/// Makes the write to the active segment after the next `ops` of them fail
@@ -434,6 +440,26 @@ impl Wal {
 	#[cfg(test)]
 	pub(crate) fn pending_sync(&self) -> bool {
 		self.active_writer.pending_sync()
+	}
+
+	/// Makes the fsync of the active segment after the next `syncs` of them fail once, as a
+	/// failing disk would.
+	#[cfg(test)]
+	pub(crate) fn fail_syncs_after(&mut self, syncs: usize) {
+		self.active_writer.sync_gate().fail_after(syncs);
+	}
+
+	/// Installs (or clears) an observer called inside every fsync of the active segment, with
+	/// the segment's fsyncs held up for as long as it runs.
+	#[cfg(test)]
+	pub(crate) fn set_sync_observer(&mut self, observer: Option<Arc<dyn Fn() + Send + Sync>>) {
+		self.active_writer.sync_gate().set_observer(observer);
+	}
+
+	/// Test-only: whether an fsync of the active segment failed, which poisons its writer.
+	#[cfg(test)]
+	pub(crate) fn sync_failed(&self) -> bool {
+		self.active_writer.sync_failed()
 	}
 
 	pub(crate) fn close(&mut self) -> Result<()> {
@@ -475,13 +501,21 @@ impl Wal {
 	/// are both read from the active log number, and they must never run ahead of
 	/// the writer.
 	///
-	/// The old segment is synced first, and a failure of that sync fails the
-	/// rotation.
+	/// The old segment is synced first. If that fails, the rotation fails and the
+	/// segment's writer is poisoned. A segment whose fsync already failed is not synced
+	/// again, because the retry could report success for pages the kernel dropped, and the
+	/// rotation goes ahead: it is how a poisoned writer is replaced. What the segment holds
+	/// past its last good fsync was never acknowledged as durable, and the failure was
+	/// reported to whoever ran into it. Its tail may be damaged after a crash. In the default
+	/// recovery mode that is repaired by cutting the segment back to its valid prefix before
+	/// the segments after it are replayed.
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
 		let old_log_number = self.active_log_number;
 		let new_log_number = old_log_number + 1;
 
-		self.active_writer.sync()?;
+		if !self.active_writer.sync_failed() {
+			self.active_writer.sync()?;
+		}
 
 		tracing::debug!("WAL rotating: {:020} -> {:020}", old_log_number, new_log_number);
 
@@ -515,6 +549,33 @@ impl Drop for Wal {
 	}
 }
 
+/// What `WalManager::sync` fsyncs through outside the WAL lock: a clone of the active
+/// segment's file and the segment's `SyncGate`.
+pub(crate) struct SyncHandle {
+	file: Arc<File>,
+	gate: Arc<SyncGate>,
+}
+
+impl SyncHandle {
+	/// fsyncs the segment. Fails if an earlier fsync of it failed.
+	pub(crate) fn sync(&self) -> Result<()> {
+		self.gate.sync(&self.file)
+	}
+
+	/// Makes the fsync of the segment after the next `syncs` of them fail once.
+	#[cfg(test)]
+	pub(crate) fn fail_after(&self, syncs: usize) {
+		self.gate.fail_after(syncs);
+	}
+
+	/// How many fsyncs of the segment were asked for so far, the ones still waiting for an
+	/// fsync in flight included. Read without the WAL lock, which a waiting fsync may hold.
+	#[cfg(test)]
+	pub(crate) fn arrivals(&self) -> usize {
+		self.gate.arrivals()
+	}
+}
+
 /// Thread-safe WAL handle that encapsulates lock management.
 ///
 /// Provides `sync()` and `flush()` methods that manage the internal
@@ -534,15 +595,20 @@ impl WalManager {
 
 	/// Syncs WAL data to disk using two-phase pattern:
 	/// 1. Under write lock: flush BufWriter to OS page cache
-	/// 2. Outside lock: fsync to disk via pre-cloned fd
+	/// 2. Outside lock: fsync to disk via pre-cloned fd, through the segment's `SyncGate`
+	///
+	/// Appends, and a rotation, may run between the two phases. The fsync belongs to the segment
+	/// of the first phase: if it fails, that segment's writer is poisoned, so an append that
+	/// landed in the meantime is never acknowledged by a later fsync (the gate makes it wait for
+	/// this one and then fail), and a rotation that got there first has already synced the
+	/// segment and leaves the new one alone.
 	pub(crate) fn sync(&self) -> Result<()> {
-		let sync_fd = {
+		let handle = {
 			let mut wal = self.inner.write();
 			wal.flush()?;
-			wal.sync_fd()
+			wal.sync_handle()
 		};
-		sync_fd.sync_all().map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
-		Ok(())
+		handle.sync()
 	}
 
 	/// Flushes WAL buffer to OS page cache (no fsync).
