@@ -322,6 +322,7 @@ fn options(path: &Path, vlog: bool) -> Arc<Options> {
 fn crash(tree: Tree) {
 	tree.core.inner.lockfile.lock().unwrap().release().unwrap();
 	tree.core.is_closed.store(true, Ordering::SeqCst);
+	tree.core.abort_background_tasks();
 	drop(tree);
 }
 
