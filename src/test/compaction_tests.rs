@@ -13,7 +13,7 @@ use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::CompactionIterator;
 use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
-use crate::memtable::ImmutableMemtables;
+use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
 use crate::vlog::ValueLocation;
@@ -213,6 +213,7 @@ fn create_compaction_options(
 	CompactionOptions {
 		lopts: opts,
 		level_manifest: manifest,
+		active_memtable: Arc::new(RwLock::new(Arc::new(MemTable::default()))),
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 		vlog: Some(vlog),
 		error_handler: Arc::new(BackgroundErrorHandler::new()),

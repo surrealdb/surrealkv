@@ -1,6 +1,6 @@
 use std::fs::File as SysFile;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use artmap::arena::{ArenaVersionedArtMap, ArenaVersionedEntryRef, ArenaVersionedRange};
@@ -19,7 +19,7 @@ use crate::batch::Batch;
 use crate::error::Result;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
-use crate::vlog::{VLog, ValueLocation};
+use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::{
 	InternalKey,
 	InternalKeyKind,
@@ -112,6 +112,9 @@ pub(crate) struct MemTable {
 	/// recovered at startup is the exception: it may hold records of older
 	/// segments, but it is the oldest memtable and is flushed as a unit.)
 	wal_number: AtomicU64,
+	/// The smallest value log file id any value of this memtable points into, `u32::MAX` while
+	/// none does. Lowered before the values of a batch are inserted, never raised.
+	min_vlog_file_id: AtomicU32,
 	/// Bytes reserved by in-flight `add` calls but not yet allocated in the
 	/// arena. Atomically updated by `try_reserve` / `release_reservation`
 	/// to ensure batch-atomic insertion: a batch either fits entirely (reservation
@@ -150,6 +153,7 @@ impl MemTable {
 			map,
 			latest_seq_num: AtomicU64::new(0),
 			wal_number: AtomicU64::new(0),
+			min_vlog_file_id: AtomicU32::new(u32::MAX),
 			reserved: AtomicU64::new(0),
 			range_deletions: parking_lot::RwLock::new(Vec::new()),
 			has_range_deletions: std::sync::atomic::AtomicBool::new(false),
@@ -167,6 +171,15 @@ impl MemTable {
 	/// Returns 0 if the WAL number has not been set.
 	pub(crate) fn get_wal_number(&self) -> u64 {
 		self.wal_number.load(Ordering::Acquire)
+	}
+
+	/// The smallest value log file any value of this memtable points into, if one does. A value
+	/// log file is deleted only once no table and no memtable has a pointer into it.
+	pub(crate) fn min_vlog_file_id(&self) -> Option<u32> {
+		match self.min_vlog_file_id.load(Ordering::Acquire) {
+			u32::MAX => None,
+			file_id => Some(file_id),
+		}
 	}
 
 	pub(crate) fn has_range_deletions(&self) -> bool {
@@ -291,6 +304,7 @@ impl MemTable {
 			memtable: self,
 			bytes: needed,
 		};
+		self.note_vlog_pointers(batch);
 		let highest_seq_num = self.apply_batch_to_memtable(batch)?;
 		self.update_latest_sequence_number(highest_seq_num);
 		Ok(())
@@ -312,6 +326,7 @@ impl MemTable {
 			memtable: self,
 			bytes: needed,
 		};
+		self.note_vlog_pointers(batch);
 		let start_seq_num = batch.starting_seq_num;
 		for (i, entry) in batch.entries.iter_mut().enumerate() {
 			let seq_num = start_seq_num + i as u64;
@@ -339,6 +354,25 @@ impl MemTable {
 		}
 		self.update_latest_sequence_number(batch.get_highest_seq_num());
 		Ok(())
+	}
+
+	/// Lowers `min_vlog_file_id` to the smallest file `batch` points into. `add` and `add_owned`
+	/// run it before the entries are inserted, so a pointer is never in the memtable without the
+	/// minimum covering it. The commit pipeline runs it for a batch it logged and did not apply:
+	/// recovery replays the record, and the memtable keeps the files it points into for as long
+	/// as the WAL segment of that record may be replayed. The end key of a range delete is not a
+	/// value.
+	pub(crate) fn note_vlog_pointers(&self, batch: &Batch) {
+		let files = batch
+			.entries
+			.iter()
+			.filter(|entry| entry.kind != InternalKeyKind::RangeDelete)
+			.filter_map(|entry| ValueLocation::peek_pointer_payload(entry.value.as_deref()?))
+			.filter_map(|payload| ValuePointer::decode(payload).ok())
+			.map(|pointer| pointer.file_id);
+		if let Some(file_id) = files.min() {
+			self.min_vlog_file_id.fetch_min(file_id, Ordering::Release);
+		}
 	}
 
 	/// Applies the batch of operations to the in-memory table (memtable).
@@ -435,6 +469,14 @@ impl MemTable {
 	) -> Result<(Arc<Table>, BPTreeEntries)> {
 		let table_file_path = lsm_opts.sstable_file_path(table_id);
 		let mut bptree_entries = Vec::new();
+
+		// Values above the threshold go to the VLog while the table is written, into the file
+		// that is active now or a newer one, and no table points into them until it is
+		// registered: the memtable stays counted for those files until then.
+		if let Some(vlog) = vlog {
+			self.min_vlog_file_id
+				.fetch_min(vlog.active_writer_id.load(Ordering::SeqCst), Ordering::Release);
+		}
 
 		{
 			let file = SysFile::create(&table_file_path)?;
