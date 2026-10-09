@@ -11,6 +11,9 @@ use crate::{InternalKeyKind, Key, Value};
 
 pub(crate) const MAX_BATCH_SIZE: u64 = 1 << 32;
 pub(crate) const BATCH_VERSION: u8 = 1;
+/// The fewest bytes an entry takes in an encoded batch: kind, key length, value
+/// length and timestamp (one byte each when empty), and its value pointer flag.
+const MIN_ENTRY_SIZE: usize = 5;
 /// Represents a single entry in a batch
 #[derive(Debug, Clone)]
 pub(crate) struct BatchEntry {
@@ -220,7 +223,11 @@ impl Batch {
 			.map(move |(i, entry)| (i, entry, self.starting_seq_num + i as u64, entry.timestamp)))
 	}
 
-	/// Decode a batch from encoded data
+	/// Decode a batch from encoded data.
+	///
+	/// Every read is bounds-checked and the whole record must be consumed, so a
+	/// malformed record is an error rather than a panic or a batch that is
+	/// silently shorter than what was written.
 	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
 		if data.is_empty() {
 			return Err(Error::InvalidBatchRecord);
@@ -245,12 +252,17 @@ impl Batch {
 			decode_varint_u32(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 		pos += bytes_read;
 
+		// A count the rest of the record cannot hold is garbage. Reject it before it sizes
+		// an allocation.
+		if count as usize > (data.len() - pos) / MIN_ENTRY_SIZE {
+			return Err(Error::InvalidBatchRecord);
+		}
+
 		// Read entries
 		let mut entries = Vec::with_capacity(count as usize);
 		for _ in 0..count {
 			// Read kind
-			let kind_byte = data[pos];
-			pos += 1;
+			let kind_byte = take(data, &mut pos, 1)?[0];
 			let kind = InternalKeyKind::from(kind_byte);
 			if kind == InternalKeyKind::Invalid {
 				return Err(Error::InvalidBatchRecord);
@@ -261,17 +273,14 @@ impl Batch {
 			let (key_len, bytes_read) =
 				decode_varint_u64(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
-			let key = data[pos..pos + key_len as usize].to_vec();
-			pos += key_len as usize;
+			let key = take(data, &mut pos, key_len)?.to_vec();
 
 			// Read value length and value
 			let (value_len, bytes_read) =
 				decode_varint_u64(&data[pos..]).ok_or(Error::InvalidBatchRecord)?;
 			pos += bytes_read;
 			let value = if value_len > 0 {
-				let val = data[pos..pos + value_len as usize].to_vec();
-				pos += value_len as usize;
-				Some(val)
+				Some(take(data, &mut pos, value_len)?.to_vec())
 			} else {
 				None
 			};
@@ -292,16 +301,20 @@ impl Batch {
 		// Read value pointers
 		let mut valueptrs = Vec::with_capacity(count as usize);
 		for _ in 0..count {
-			let has_pointer = data[pos];
-			pos += 1;
-			let valueptr = if has_pointer == 1 {
-				let ptr_data = &data[pos..pos + VALUE_POINTER_SIZE];
-				pos += VALUE_POINTER_SIZE;
-				Some(ValuePointer::decode(ptr_data)?)
-			} else {
-				None
+			let valueptr = match take(data, &mut pos, 1)?[0] {
+				0 => None,
+				1 => {
+					let ptr_data = take(data, &mut pos, VALUE_POINTER_SIZE as u64)?;
+					Some(ValuePointer::decode(ptr_data)?)
+				}
+				_ => return Err(Error::InvalidBatchRecord),
 			};
 			valueptrs.push(valueptr);
+		}
+
+		// Bytes left over would be silently dropped.
+		if pos != data.len() {
+			return Err(Error::InvalidBatchRecord);
 		}
 
 		Ok(Self {
@@ -312,4 +325,15 @@ impl Batch {
 			size: 0, // Decoded batches don't track size
 		})
 	}
+}
+
+/// Reads `len` bytes at `*pos` and advances past them, or fails if the record
+/// ends first.
+fn take<'a>(data: &'a [u8], pos: &mut usize, len: u64) -> Result<&'a [u8]> {
+	let len = usize::try_from(len).map_err(|_| Error::InvalidBatchRecord)?;
+	let end =
+		pos.checked_add(len).filter(|&end| end <= data.len()).ok_or(Error::InvalidBatchRecord)?;
+	let bytes = &data[*pos..end];
+	*pos = end;
+	Ok(bytes)
 }
