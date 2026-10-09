@@ -12,6 +12,7 @@ use super::sync::backoff;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::CoreInner;
+use crate::memtable::MemTable;
 use crate::stall::WriteStallController;
 use crate::storage::{AffinityLogStore, LogStore};
 use crate::task::TaskManager;
@@ -31,20 +32,23 @@ pub(crate) enum PipelineHook {
 	},
 	/// An apply round is about to start. Round 0 is the first; later rounds
 	/// start after the group was repaired or moved on (a rotation, a re-append
-	/// of stale records, or a direct-to-L0 write).
+	/// of stale records, a switch to a fenced round, or a direct-to-L0 write).
 	BeforeApplyRound {
 		round: usize,
 	},
+	/// A fenced round holds the active memtable's read guard and has logged the batches that were
+	/// stale, and synced them if the group syncs. It has not applied anything yet.
+	BeforeFencedApply,
 }
 
 #[cfg(test)]
 pub(crate) type PipelineHookFn = Arc<dyn Fn(PipelineHook) + Send + Sync>;
 
 /// How many times in a row a group may find its records in a segment other than the active
-/// memtable's tag, with nothing applied in between, and log them again. One pass past a
-/// rotation fixes it. A group that is still stale after that many passes fails: rotations keep
-/// overtaking it, or the tag is one that no rotation will make equal to the segment.
-const MAX_STALE_ROUNDS: u32 = 8;
+/// memtable's tag, with nothing applied in between, and log them again off the memtable's lock.
+/// One pass past a rotation fixes it. If rotations keep overtaking the group, the next pass is
+/// fenced: see `CommitPipeline::apply_fenced`.
+pub(crate) const UNFENCED_STALE_ROUNDS: u32 = 2;
 
 /// Why `CommitPipeline::apply_run` stopped.
 enum ApplyStop {
@@ -597,11 +601,13 @@ impl CommitPipeline {
 		// lands it in the current segment. The old record is stale: nothing relies
 		// on it, and it goes away with its segment.
 		//
-		// A rotation can come between the append and the apply again, so this repeats.
-		// A group that is found stale `MAX_STALE_ROUNDS` times in a row, with nothing
-		// applied in between, is failed instead of logged again.
+		// A rotation can come between the append and the apply again. A group that was
+		// overtaken `UNFENCED_STALE_ROUNDS` times in a row appends the rest again under
+		// the read lock and applies it there, where no rotation can interrupt: a group
+		// whose records are logged is not failed for want of a quiet moment.
 		let mut at = 0;
 		let mut stale_rounds = 0;
+		let mut fenced = false;
 		#[cfg(test)]
 		let mut round = 0;
 		while at < n {
@@ -620,7 +626,19 @@ impl CommitPipeline {
 				round += 1;
 			}
 
-			let (next, stop) = self.apply_run(&processed_batches, &oversized, &segments, at)?;
+			let (next, stop) = if fenced {
+				self.apply_fenced(
+					&processed_batches,
+					&oversized,
+					&mut segments,
+					at,
+					sync,
+					&mut wal_buf,
+					&mut wal_ends,
+				)?
+			} else {
+				self.apply_run(&processed_batches, &oversized, &segments, at)?
+			};
 			if next > at {
 				stale_rounds = 0;
 			}
@@ -649,25 +667,41 @@ impl CommitPipeline {
 				ApplyStop::Stale {
 					active_tag,
 				} => {
-					if stale_rounds == MAX_STALE_ROUNDS {
+					// A fenced round logs the stale batches under the guard that fixes the tag,
+					// so it is never stale. A tag that the WAL cannot have is not a race either:
+					// no rotation will bring them together. Fail the group rather than log it
+					// again.
+					if fenced || !self.tag_is_possible(&segments[at..], active_tag) {
 						return Err(tag_mismatch(&segments[at..], active_tag));
 					}
-					stale_rounds += 1;
-					self.reappend_stale(
-						&processed_batches[at..],
-						&oversized[at..],
-						&mut segments[at..],
-						active_tag,
-						sync,
-						&mut wal_buf,
-						&mut wal_ends,
-					)
-					.await?;
+					if stale_rounds == UNFENCED_STALE_ROUNDS {
+						fenced = true;
+					} else {
+						stale_rounds += 1;
+						self.reappend_stale(
+							&processed_batches[at..],
+							&oversized[at..],
+							&mut segments[at..],
+							active_tag,
+							sync,
+							&mut wal_buf,
+							&mut wal_ends,
+						)
+						.await?;
+					}
 				}
 			}
 		}
 
 		Ok(())
+	}
+
+	/// Whether `tag`, which the active memtable had a moment ago, can be explained by the WAL: a
+	/// rotation only moves the WAL on, and the tag with it, so the tag is neither behind a segment
+	/// that a record was logged in nor ahead of the active segment.
+	fn tag_is_possible(&self, segments: &[u64], tag: u64) -> bool {
+		segments.iter().all(|&segment| segment <= tag)
+			&& tag <= self.inner.wal.read().get_active_log_number()
 	}
 
 	/// Whether a batch that needs `bytes` of memtable does not fit what is left of a
@@ -691,6 +725,71 @@ impl CommitPipeline {
 		from: usize,
 	) -> Result<(usize, ApplyStop)> {
 		let active = self.inner.active_memtable.read()?;
+		Self::apply_to(&active, batches, oversized, segments, from)
+	}
+
+	/// Like [`apply_run`](Self::apply_run), but first logs again the batches whose record is not in
+	/// the segment the memtable is tagged with (see `encode_stale`), and holds the read guard from
+	/// there until the batches are applied.
+	///
+	/// A rotation takes the write guard and then the WAL lock, so under the read guard the WAL's
+	/// active segment is the memtable's tag and stays so: what is logged now is in the segment
+	/// the batches are applied to, and nothing can make it stale first. A group that rotations
+	/// keep overtaking makes progress this way. Not every group does it, because the guard is
+	/// held across an append and an fsync, which run on the flusher's thread instead of the
+	/// pool's. A group that syncs is synced before anything of it is applied, as everywhere else.
+	///
+	/// If the active segment is not the tag, no rotation will bring them together, and the group
+	/// fails before anything more is logged.
+	///
+	/// Synchronous like `apply_run`, for the same reason.
+	#[allow(clippy::too_many_arguments)]
+	fn apply_fenced(
+		&self,
+		batches: &[Batch],
+		oversized: &[bool],
+		segments: &mut [u64],
+		from: usize,
+		sync: bool,
+		wal_buf: &mut Vec<u8>,
+		wal_ends: &mut Vec<usize>,
+	) -> Result<(usize, ApplyStop)> {
+		let active = self.inner.active_memtable.read()?;
+		let tag = active.get_wal_number();
+		let stale = encode_stale(
+			&batches[from..],
+			&oversized[from..],
+			&segments[from..],
+			tag,
+			wal_buf,
+			wal_ends,
+		)?;
+		if !stale.is_empty() {
+			let mut wal = self.inner.wal.write();
+			if wal.get_active_log_number() != tag {
+				return Err(tag_mismatch(&segments[from..], tag));
+			}
+			let segment = wal.append_group(wal_buf, wal_ends)?;
+			if sync {
+				wal.sync()?;
+			}
+			for j in stale {
+				segments[from + j] = segment;
+			}
+		}
+		#[cfg(test)]
+		self.fire(PipelineHook::BeforeFencedApply);
+		Self::apply_to(&active, batches, oversized, segments, from)
+	}
+
+	/// The loop of `apply_run`, on the memtable the caller holds the read guard of.
+	fn apply_to(
+		active: &MemTable,
+		batches: &[Batch],
+		oversized: &[bool],
+		segments: &[u64],
+		from: usize,
+	) -> Result<(usize, ApplyStop)> {
 		let tag = active.get_wal_number();
 		let mut at = from;
 		while at < batches.len() {
@@ -836,8 +935,8 @@ fn encode_stale(
 	Ok(stale)
 }
 
-/// The error of a group whose records stay in segments other than the active memtable's tag
-/// however often they are logged again.
+/// The error of a group whose records are in segments that no rotation will make the active
+/// memtable's tag: the tag is wrong, and logging the group again would not help.
 fn tag_mismatch(segments: &[u64], tag: u64) -> Error {
 	Error::Other(format!(
 		"WAL segment and memtable tag mismatch: records in segments {segments:?}, active \

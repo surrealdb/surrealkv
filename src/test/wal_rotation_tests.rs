@@ -370,6 +370,7 @@ fn observe_groups(tree: &Tree) -> Arc<Mutex<GroupLog>> {
 				sink.lock().unwrap().repair_rounds += 1;
 			}
 		}
+		PipelineHook::BeforeFencedApply => {}
 	})));
 	log
 }

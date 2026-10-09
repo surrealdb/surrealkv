@@ -69,6 +69,8 @@ pub mod wal_group_crash_tests;
 #[cfg(test)]
 pub mod wal_rotation_tests;
 #[cfg(test)]
+pub mod wal_stale_rounds_tests;
+#[cfg(test)]
 pub mod wal_tests;
 #[cfg(test)]
 pub mod wal_torn_tail_tests;

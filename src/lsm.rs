@@ -93,13 +93,16 @@ pub trait CompactionOperations: Send + Sync {
 /// The WAL's own lock (`wal`) is a leaf: nothing is acquired while it is held, except the
 /// segment's fsync gate, which is itself a leaf, so it can be taken after any of the locks above
 /// or on its own. Rotation takes it under `active_memtable` (`rotate_memtable()`,
-/// `seal_active_wal_segment()`), and so does the shutdown flush. Everything else takes it alone,
-/// and some of it from pool threads: the commit pipeline for every append and every fsync of a
-/// commit group (`AffinityLogStore`), and `flush_wal`, `close` and restore. It is held across the
-/// fsync of a commit group, but not across the one `WalManager::sync` makes, which goes through
-/// the gate instead. The commit pipeline compares the segment it appended to with the tag of the
-/// active memtable under `active_memtable.read()`, which rotation needs exclusively, so a record
-/// is never applied to a memtable tagged with a different segment.
+/// `seal_active_wal_segment()`), and so do the shutdown flush and the commit pipeline's fenced
+/// round. Everything else takes it alone, and some of it from pool threads: the commit pipeline
+/// for every append and every fsync of a commit group (`AffinityLogStore`), and `flush_wal`,
+/// `close` and restore. It is held across the fsync of a commit group, but not across the one
+/// `WalManager::sync` makes, which goes through the gate instead. The commit pipeline compares
+/// the segment it appended to with the tag of the active memtable under
+/// `active_memtable.read()`, which rotation needs exclusively, so a record is never applied to a
+/// memtable tagged with a different segment. A group that rotations keep overtaking appends
+/// under `active_memtable.read()` and then the WAL lock instead, in the same order as rotation,
+/// and applies under the same read guard.
 pub(crate) struct CoreInner {
 	/// The active memtable (write buffer) that receives all new writes.
 	///
