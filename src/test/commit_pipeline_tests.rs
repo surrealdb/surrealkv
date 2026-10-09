@@ -382,8 +382,17 @@ async fn a_burst_of_huge_groups_is_retired_without_waiting_for_more_groups() {
 				txn.commit().await.unwrap();
 			}));
 		}
-		tokio::time::sleep(Duration::from_millis(250)).await;
+		// Every committer of the burst is accepted behind the first group. The flusher is let go
+		// before the check, so that a burst that never gets there fails the test instead of
+		// leaving the flusher parked.
+		let pipeline = &store.core.commit_pipeline;
+		let deadline = std::time::Instant::now() + Duration::from_secs(60);
+		while pipeline.accepted_waiting() < burst && std::time::Instant::now() < deadline {
+			tokio::time::sleep(Duration::from_millis(1)).await;
+		}
+		let piled_up = pipeline.accepted_waiting() >= burst;
 		hold.store(false, Ordering::SeqCst);
+		assert!(piled_up, "round {round}: the burst was not accepted behind the first group");
 		for handle in handles {
 			handle.await.unwrap();
 		}

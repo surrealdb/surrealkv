@@ -55,7 +55,7 @@ fn overflow_len(store: &Tree) -> usize {
 /// worker hands its queue over first: a task the flusher woke just before it parked sits in the
 /// worker's own slot, which no other worker takes from, and would not run until the flusher is
 /// released.
-fn park_until(go: impl Fn() -> bool) {
+pub(crate) fn park_until(go: impl Fn() -> bool) {
 	let deadline = Instant::now() + Duration::from_secs(60);
 	tokio::task::block_in_place(|| {
 		while !go() && Instant::now() < deadline {
@@ -66,7 +66,7 @@ fn park_until(go: impl Fn() -> bool) {
 
 /// Sets a gate to a value when dropped, so that a test which fails while the flusher is parked
 /// on the gate lets it go on the way out.
-struct OpenOnDrop(Arc<AtomicUsize>, usize);
+pub(crate) struct OpenOnDrop(pub(crate) Arc<AtomicUsize>, pub(crate) usize);
 
 impl Drop for OpenOnDrop {
 	fn drop(&mut self) {
@@ -150,7 +150,8 @@ async fn completed_prefix_caught_up(store: &Tree) {
 /// Parks the flusher in a retire, so that the commit that started it is the last one anyone
 /// makes: nothing follows it but the free of what it passed.
 struct ParkedRetire {
-	/// 0 armed, 1 the flusher is parked in a retire, 2 released
+	/// 0 armed, 1 the flusher is parked in a retire, 2 released, 3 the flusher left the retire's
+	/// gap
 	gate: Arc<AtomicUsize>,
 	_open: OpenOnDrop,
 }
@@ -162,6 +163,7 @@ impl ParkedRetire {
 		store.core.commit_pipeline.set_retire_gap_hook(Some(Arc::new(move || {
 			if hook_gate.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
 				park_until(|| hook_gate.load(Ordering::SeqCst) == 2);
+				hook_gate.store(3, Ordering::SeqCst);
 			}
 		})));
 		Self {
@@ -170,19 +172,54 @@ impl ParkedRetire {
 		}
 	}
 
-	/// Commits until a retire is under way, and not one more.
-	async fn commit_until_parked(&self, store: &Tree) {
+	/// Parks the flusher in a retire, with commits made one after the other until one starts it,
+	/// and lets it go. A retire counts its groups afresh and a commit made on its own is a group,
+	/// so the next retire follows the `RETIRE_EVERY_GROUPS`th commit after this one, whose ring
+	/// sequence is returned for `commit_until_parked`. Meant for a time when a retire is harmless,
+	/// such as while a transaction holds the watermark: the commits that provoke it cannot tell
+	/// when it will come.
+	async fn next_retire_follows(&self, store: &Arc<Tree>) -> u64 {
 		self.gate.store(0, Ordering::SeqCst);
-		let mut commits = 0;
-		while self.gate.load(Ordering::SeqCst) != 1 {
-			commit_unique(store, "n", 1).await;
-			commits += 1;
-			assert!(commits <= 4 * RETIRE_EVERY_GROUPS, "no retire after {commits} commits");
-			let deadline = Instant::now() + Duration::from_millis(50);
-			while self.gate.load(Ordering::SeqCst) != 1 && Instant::now() < deadline {
-				tokio::time::sleep(Duration::from_millis(1)).await;
+		// A commit made just before the retire begins waits behind it, until it is let go
+		let mut last = None;
+		within(60, "a retire to park the flusher", async {
+			let mut n = 0;
+			while self.gate.load(Ordering::SeqCst) != 1 {
+				let store = Arc::clone(store);
+				let commit =
+					tokio::spawn(
+						async move { commit_unique(&store, &format!("sync{n}_"), 1).await },
+					);
+				while !commit.is_finished() && self.gate.load(Ordering::SeqCst) != 1 {
+					tokio::time::sleep(Duration::from_millis(1)).await;
+				}
+				last = Some(commit);
+				n += 1;
 			}
+		})
+		.await;
+		// Parked in the retire that follows the entry the completed prefix ends at
+		let retired_at = store.core.commit_pipeline.ring.completed();
+		self.release();
+		if let Some(commit) = last {
+			commit.await.unwrap();
 		}
+		// The next retire must not find the gap armed before this one has left it
+		until(30, "the flusher to leave the retire", || self.gate.load(Ordering::SeqCst) == 3)
+			.await;
+		retired_at + u64::from(RETIRE_EVERY_GROUPS)
+	}
+
+	/// Commits, one after the other, up to the commit `due` that the next retire follows (see
+	/// `next_retire_follows`), and waits for the flusher to park in that retire: the last commit
+	/// is the one that started it, and no commit follows.
+	async fn commit_until_parked(&self, store: &Tree, due: u64) {
+		let ring = &store.core.commit_pipeline.ring;
+		self.gate.store(0, Ordering::SeqCst);
+		while ring.published() < due {
+			commit_unique(store, "n", 1).await;
+		}
+		until(30, "a retire to park the flusher", || self.gate.load(Ordering::SeqCst) == 1).await;
 	}
 
 	fn release(&self) {
@@ -363,8 +400,9 @@ async fn the_ring_slots_a_retire_passed_are_released_when_no_commit_follows() {
 	// The ring is full of entries the transaction holds, and few of them were lapped
 	commit_many(&store, "fill", CAP + CAP / 8).await;
 	completed_prefix_caught_up(&store).await;
+	let due = retire.next_retire_follows(&store).await;
 	drop(held);
-	retire.commit_until_parked(&store).await;
+	retire.commit_until_parked(&store, due).await;
 	let lapped = overflow_len(&store);
 	let held_slots = pipeline.ring.occupied();
 	assert!(lapped < 2 * RETIRED_FREE_CHUNK, "setup: {lapped} lapped entries are many chunks");
@@ -397,8 +435,11 @@ async fn the_flusher_parks_once_nothing_is_left_to_free() {
 	tokio::time::sleep(Duration::from_millis(300)).await;
 	assert_eq!(calls.load(Ordering::SeqCst), quiet, "the flusher woke up on its own");
 
+	let due = retire.next_retire_follows(&store).await;
+	flusher_is_quiet(&calls).await;
+	let quiet = calls.load(Ordering::SeqCst);
 	drop(held);
-	retire.commit_until_parked(&store).await;
+	retire.commit_until_parked(&store, due).await;
 	let retained = overflow_len(&store);
 	assert!(retained > 8 * RETIRED_FREE_CHUNK, "setup: {retained} entries are not many chunks");
 	retire.release();

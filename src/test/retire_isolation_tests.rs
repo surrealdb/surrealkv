@@ -22,7 +22,8 @@ use tempdir::TempDir;
 
 use crate::batch::Batch;
 use crate::lsm::Tree;
-use crate::ring::{PipelineHook, COMMIT_RING_CAPACITY, RETIRE_EVERY_GROUPS};
+use crate::ring::{PipelineHook, ADMISSION_PERMITS, COMMIT_RING_CAPACITY, RETIRE_EVERY_GROUPS};
+use crate::test::retire_free_tests::{park_until, OpenOnDrop};
 use crate::{Error, InternalKeyKind, Key, Mode, TreeBuilder};
 
 const CAP: u64 = COMMIT_RING_CAPACITY as u64;
@@ -41,19 +42,6 @@ pub(crate) async fn within<T>(secs: u64, what: &str, fut: impl Future<Output = T
 	}
 }
 
-/// Commits `n` single-key transactions one after the other, so each is its own group.
-pub(crate) async fn commit_unique(store: &Tree, tag: &str, n: u64) {
-	for i in 0..n {
-		let mut txn = store.begin().unwrap();
-		txn.set(format!("{tag}{i}").as_bytes(), b"v").unwrap();
-		txn.commit().await.unwrap();
-	}
-}
-
-fn completed(store: &Tree) -> u64 {
-	store.core.commit_pipeline.ring.completed()
-}
-
 /// Waits until the completed prefix reaches ring sequence `n`: a committer is woken before the
 /// flusher advances the prefix over its entry, so it can lag the last commit that returned.
 async fn wait_for_completed(store: &Tree, n: u64) {
@@ -63,6 +51,38 @@ async fn wait_for_completed(store: &Tree, n: u64) {
 		}
 	})
 	.await;
+}
+
+/// Waits until the retired watermark is within `RETIRE_EVERY_GROUPS` of the completed prefix, as
+/// it is once the flusher has finished its last pass: it advances the prefix before it retires, so
+/// a read right after the last commit can fall between the two.
+pub(crate) async fn retire_caught_up(store: &Tree) {
+	let pipeline = &store.core.commit_pipeline;
+	within(30, "the retired watermark to catch up with the completed prefix", async {
+		loop {
+			let (completed, taken, _) = pipeline.watermarks();
+			if completed.saturating_sub(taken) <= u64::from(RETIRE_EVERY_GROUPS) {
+				break;
+			}
+			tokio::time::sleep(Duration::from_millis(1)).await;
+		}
+	})
+	.await;
+}
+
+/// Commits `n` single-key transactions one after the other, so each is its own group. The watchdog
+/// is on each commit, not on the run: how long a run takes depends on the machine, and only a
+/// commit that stalls is a failure.
+pub(crate) async fn commit_unique(store: &Tree, tag: &str, n: u64) {
+	for i in 0..n {
+		let mut txn = store.begin().unwrap();
+		txn.set(format!("{tag}{i}").as_bytes(), b"v").unwrap();
+		within(30, &format!("commit {tag}{i}"), txn.commit()).await.unwrap();
+	}
+}
+
+fn completed(store: &Tree) -> u64 {
+	store.core.commit_pipeline.ring.completed()
 }
 
 fn taken(store: &Tree) -> u64 {
@@ -610,13 +630,13 @@ async fn a_transaction_that_begins_inside_retire_is_not_passed() {
 
 	// 0 armed, 1 the flusher is parked in the gap, 2 released, 3 the flusher left the gap
 	let gate = Arc::new(AtomicUsize::new(3));
+	// A failing assertion lets the flusher go on the way out
+	let _open = OpenOnDrop(Arc::clone(&gate), 2);
 	let hook: Arc<dyn Fn() + Send + Sync> = {
 		let gate = Arc::clone(&gate);
 		Arc::new(move || {
 			if gate.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
-				while gate.load(Ordering::SeqCst) != 2 {
-					std::thread::sleep(Duration::from_millis(1));
-				}
+				park_until(|| gate.load(Ordering::SeqCst) == 2);
 				gate.store(3, Ordering::SeqCst);
 			}
 		})
@@ -625,23 +645,24 @@ async fn a_transaction_that_begins_inside_retire_is_not_passed() {
 
 	for round in 0..10 {
 		gate.store(0, Ordering::SeqCst);
-		// Sequential commits, one group each, until a retire runs and parks in the gap
-		let mut parked = false;
-		for i in 0..(2 * RETIRE_EVERY_GROUPS) {
-			if gate.load(Ordering::SeqCst) == 1 {
-				parked = true;
-				break;
+		// Commits that only validate a locked read, one after the other, until a retire runs and
+		// parks in the gap. The committer decides such an entry itself, so none of them can wait
+		// behind the parked flusher, as a commit with writes would if the retire only began after
+		// it returned. Not a `Transaction`: its pin would stay registered for a moment after the
+		// commit returns, and a scan in that moment would hide the bug this test is after.
+		within(30, "a retire to park the flusher", async {
+			let read_set = [b"drive".to_vec()];
+			while gate.load(Ordering::SeqCst) != 1 {
+				let (start_seq, window) = (store.core.seq_num(), completed(&store));
+				store
+					.core
+					.commit(Batch::new(0), false, start_seq, window, &read_set)
+					.await
+					.unwrap();
+				tokio::time::sleep(Duration::from_millis(1)).await;
 			}
-			// Not a `Transaction`: its pin would stay registered for a moment after the commit
-			// returns, and a scan in that moment would hide the bug this test is after.
-			let key = format!("drive{round}_{i}");
-			raw_commit(&store, key.as_bytes(), store.core.seq_num(), completed(&store), &[])
-				.await
-				.unwrap();
-			// The retire follows the group that woke the committer
-			tokio::time::sleep(Duration::from_millis(1)).await;
-		}
-		assert!(parked || gate.load(Ordering::SeqCst) == 1, "round {round}: no retire ran");
+		})
+		.await;
 
 		// Begin in the gap, then move the completed prefix past the window
 		let x = store.begin().unwrap();
@@ -660,8 +681,9 @@ async fn a_transaction_that_begins_inside_retire_is_not_passed() {
 			}
 		})
 		.await;
-		// The retire finishes right after the hook returns
-		tokio::time::sleep(Duration::from_millis(20)).await;
+		// The retire finishes right after the hook returns, and a commit made now is a group the
+		// flusher takes only after it has
+		commit_unique(&store, "barrier", 1).await;
 		assert!(
 			taken(&store) <= window,
 			"round {round}: retired watermark {} passed the live window {window}",
@@ -683,15 +705,14 @@ async fn begin_while_a_commit_is_decided_but_not_complete_still_conflicts() {
 
 	// 0 armed, 1 the flusher is parked after logging, 2 released
 	let gate = Arc::new(AtomicUsize::new(0));
+	let _open = OpenOnDrop(Arc::clone(&gate), 2);
 	let hook: Arc<dyn Fn(PipelineHook) + Send + Sync> = {
 		let gate = Arc::clone(&gate);
 		Arc::new(move |point| {
 			if matches!(point, PipelineHook::AfterWalSync { .. })
 				&& gate.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok()
 			{
-				while gate.load(Ordering::SeqCst) != 2 {
-					std::thread::sleep(Duration::from_millis(1));
-				}
+				park_until(|| gate.load(Ordering::SeqCst) == 2);
 			}
 		})
 	};
@@ -826,6 +847,7 @@ async fn retired_watermark_never_passes_a_live_window_and_unique_writers_never_c
 	})
 	.await;
 	assert_eq!(committed.load(Ordering::Relaxed), tasks * iters);
+	// A committer is woken before the flusher advances the completed prefix over its entry.
 	wait_for_completed(&store, tasks * iters).await;
 }
 
@@ -833,41 +855,55 @@ async fn retired_watermark_never_passes_a_live_window_and_unique_writers_never_c
 // (4) Liveness: burst, then silence
 // ---------------------------------------------------------------------------------------------
 
-/// A burst that fills the whole ring in fewer than `RETIRE_EVERY_GROUPS` groups never retires,
-/// and the flusher then goes idle with a full ring of unretired entries. Nothing a committer
-/// waits for depends on `retire`: a publisher waits only for the previous occupant of its slot
-/// to be complete, and permits come back when the completed prefix passes an entry. So new
-/// committers, with a transaction still open, must all proceed.
+/// Parks the flusher after the WAL write of every group until every commit it could take next is
+/// accepted: all that are still to complete out of `total`, or as many as admission holds if that
+/// is fewer. A group then takes all that admission has let in, however slowly the committers run,
+/// so two groups in a row take at least `ADMISSION_PERMITS` commits, or all that is left. Returns
+/// the number of groups begun.
+///
+/// The hook gives its worker's queue away before it parks, so that a task the flusher woke just
+/// before does not wait in a slot that only the parked worker would serve.
+pub(crate) fn gather_groups(store: &Tree, total: u64) -> Arc<AtomicUsize> {
+	let groups = Arc::new(AtomicUsize::new(0));
+	let hook_groups = Arc::clone(&groups);
+	// A weak handle: the pipeline owns the hook
+	let pipeline = Arc::downgrade(&store.core.commit_pipeline);
+	store.core.commit_pipeline.set_hook(Some(Arc::new(move |point| {
+		if !matches!(point, PipelineHook::AfterWalSync { .. }) {
+			return;
+		}
+		hook_groups.fetch_add(1, Ordering::SeqCst);
+		let Some(pipeline) = pipeline.upgrade() else {
+			return;
+		};
+		let gathered = || {
+			let pending = total.saturating_sub(pipeline.ring.completed());
+			pipeline.accepted_waiting() as u64 >= pending.min(ADMISSION_PERMITS as u64)
+		};
+		let deadline = Instant::now() + Duration::from_secs(60);
+		tokio::task::block_in_place(|| {
+			while !gathered() && Instant::now() < deadline {
+				std::thread::sleep(Duration::from_millis(1));
+			}
+		});
+	})));
+	groups
+}
+
+/// A burst that fills the whole ring while a transaction is open retires nothing past that
+/// transaction, and the flusher then goes idle with a full ring of unretired entries. Nothing a
+/// committer waits for depends on `retire`: a publisher waits only for the previous occupant of
+/// its slot to be complete, and permits come back when the completed prefix passes an entry. So
+/// new committers, with the transaction still open, must all proceed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn burst_then_silence_never_stalls_new_committers() {
 	let (store, _dir) = create_store();
 	let pipeline = &store.core.commit_pipeline;
 
-	// The flusher dawdles after each group so that committers pile up behind it and every
-	// group is large: the burst takes only a handful of groups. It waits until every commit
-	// that can be admitted at once, or all that are left of the burst, is accepted and waiting,
-	// and gives up after 500 ms, so that the group count does not depend on how busy the
-	// machine is.
-	let burst = CAP + CAP / 2;
-	let groups = Arc::new(AtomicUsize::new(0));
-	let hook: Arc<dyn Fn(PipelineHook) + Send + Sync> = {
-		let groups = Arc::clone(&groups);
-		let store = Arc::clone(&store);
-		Arc::new(move |point| {
-			if matches!(point, PipelineHook::AfterWalSync { .. }) {
-				groups.fetch_add(1, Ordering::SeqCst);
-				let pipeline = &store.core.commit_pipeline;
-				let admitted = (CAP / 2).min(burst.saturating_sub(pipeline.ring.completed()));
-				let deadline = Instant::now() + Duration::from_millis(500);
-				while pipeline.accepted_waiting() < admitted as usize && Instant::now() < deadline {
-					std::thread::sleep(Duration::from_millis(1));
-				}
-			}
-		})
-	};
-	pipeline.set_hook(Some(hook));
-
 	let held = store.begin().unwrap();
+	let burst = CAP + CAP / 2;
+	// Every group is as large as admission allows: the burst takes only a handful of groups.
+	let groups = gather_groups(&store, burst);
 	let tasks: Vec<_> = (0..burst)
 		.map(|i| {
 			let store = Arc::clone(&store);
@@ -886,14 +922,18 @@ async fn burst_then_silence_never_stalls_new_committers() {
 	.await;
 	pipeline.set_hook(None);
 
+	// Two groups in a row take at least `ADMISSION_PERMITS` commits, or all that is left
 	let burst_groups = groups.load(Ordering::SeqCst);
+	let bound = 2 * burst.div_ceil(ADMISSION_PERMITS as u64) as usize;
 	assert!(
-		burst_groups < RETIRE_EVERY_GROUPS as usize,
-		"setup: the burst took {burst_groups} groups, so retire may have run"
+		burst_groups <= bound,
+		"setup: the burst took {burst_groups} groups, more than the {bound} the gather allows"
 	);
+	// A committer is woken before the flusher advances the completed prefix over its entry.
+	wait_for_completed(&store, burst).await;
 	let (c0, t0, o0) = pipeline.watermarks();
 	assert_eq!(pipeline.ring.occupied(), CAP as usize, "the ring is full of unretired entries");
-	assert_eq!(t0, 0, "nothing has retired yet");
+	assert_eq!(t0, 0, "the open transaction holds the retired watermark");
 	eprintln!("after burst: groups={burst_groups} completed={c0} taken={t0} overflow={o0}");
 
 	// Silence: no backstop retires while the flusher is idle
@@ -902,7 +942,7 @@ async fn burst_then_silence_never_stalls_new_committers() {
 	assert_eq!(pipeline.ring.occupied(), CAP as usize);
 
 	// New committers, one transaction still open, must not stall
-	within(30, "sequential commits after silence", commit_unique(&store, "after", 64)).await;
+	commit_unique(&store, "after", 64).await;
 	let concurrent: Vec<_> = (0..2 * CAP)
 		.map(|i| {
 			let store = Arc::clone(&store);
@@ -925,8 +965,9 @@ async fn burst_then_silence_never_stalls_new_committers() {
 	drop(held);
 	commit_unique(&store, "drain", 2 * u64::from(RETIRE_EVERY_GROUPS)).await;
 	overflow_drained(&store).await;
+	retire_caught_up(&store).await;
 	let (c, t, o) = pipeline.watermarks();
-	assert!(c - t <= u64::from(RETIRE_EVERY_GROUPS), "taken {t} lags completed {c}");
+	assert!(c.saturating_sub(t) <= u64::from(RETIRE_EVERY_GROUPS), "taken {t} lags completed {c}");
 	assert_eq!(o, 0, "overflow drains once nothing can reach it");
 }
 
@@ -965,7 +1006,7 @@ async fn a_burst_of_conflict_aborts_leaves_no_permit_stuck() {
 	assert!(ok.load(Ordering::Relaxed) >= 1);
 
 	tokio::time::sleep(Duration::from_millis(200)).await;
-	within(30, "commits after the aborts", commit_unique(&store, "after", 2 * CAP)).await;
+	commit_unique(&store, "after", 2 * CAP).await;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1158,8 +1199,12 @@ async fn restore_with_a_transaction_open_leaves_validation_and_retire_working() 
 
 	commit_unique(&store, "drain", 2 * u64::from(RETIRE_EVERY_GROUPS)).await;
 	overflow_drained(&store).await;
+	retire_caught_up(&store).await;
 	let (completed, taken, overflow) = pipeline.watermarks();
-	assert!(completed - taken <= u64::from(RETIRE_EVERY_GROUPS), "{taken} lags {completed}");
+	assert!(
+		completed.saturating_sub(taken) <= u64::from(RETIRE_EVERY_GROUPS),
+		"{taken} lags {completed}"
+	);
 	assert_eq!(overflow, 0);
 }
 
