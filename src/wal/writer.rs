@@ -682,4 +682,50 @@ mod tests {
 		assert!(writes <= large.len() / 2, "{writes} writes for {} records", large.len());
 		assert_eq!(read_records(&temp_dir.path().join("large.wal")), large);
 	}
+
+	/// The block of a record is the one `lz4_flex::compress_prepend_size` makes, whatever the
+	/// record holds, so segments written before the block was made in place read as they did.
+	#[test]
+	fn an_lz4_block_is_the_one_lz4_flex_makes() {
+		let mut records: Vec<Vec<u8>> = [0, 1, 2, 17, 100, 4_096, 70_000, 300_000]
+			.into_iter()
+			.enumerate()
+			.map(|(i, len)| payload(i, len))
+			.collect();
+		records.extend([0, 1, 100, 70_000, 300_000].map(|len| vec![b'z'; len]));
+		records.push((0..50_000u32).flat_map(|i| (i % 251).to_le_bytes()).collect());
+		for record in records {
+			let (_, size) = lz4_block_size(record.len()).unwrap();
+			let mut blocks = Vec::with_capacity(size);
+			push_lz4_block(&mut blocks, &record).unwrap();
+			assert_eq!(blocks.capacity(), size, "no room was asked for beyond the bound");
+			assert_eq!(
+				blocks,
+				lz4_flex::compress_prepend_size(&record),
+				"a record of {} bytes",
+				record.len()
+			);
+			assert_eq!(lz4_flex::decompress_size_prepended(&blocks).unwrap(), record);
+		}
+	}
+
+	/// An LZ4 block says the length of its record in a `u32`: a longer record is refused, and
+	/// the longest one that is not has a block that is addressable.
+	#[test]
+	fn an_lz4_block_refuses_a_record_longer_than_its_length_field_says() {
+		assert_eq!(lz4_block_size(0).map(|(prefix, _)| prefix), Some(0));
+		assert_eq!(lz4_block_size(1).map(|(prefix, _)| prefix), Some(1));
+		#[cfg(target_pointer_width = "64")]
+		{
+			let longest = u32::MAX as usize;
+			let (prefix, size) = lz4_block_size(longest).unwrap();
+			assert_eq!(prefix, u32::MAX);
+			assert_eq!(size, get_maximum_output_size(longest) + LZ4_LEN_SIZE);
+			for len in [longest + 1, longest + 2, 1 << 33, usize::MAX] {
+				assert!(lz4_block_size(len).is_none(), "a record of {len} bytes");
+			}
+		}
+		#[cfg(not(target_pointer_width = "64"))]
+		assert!(lz4_block_size(usize::MAX).is_none());
+	}
 }

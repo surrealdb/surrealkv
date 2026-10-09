@@ -757,6 +757,12 @@ impl CommitPipeline {
 		Ok(())
 	}
 
+	/// The flusher loop, for a test to poll on its own thread.
+	#[cfg(test)]
+	pub(crate) async fn run_flusher_in_test(&self) {
+		self.run_flusher(self.ring.completed()).await;
+	}
+
 	/// Background flusher loop performing group commit.
 	async fn run_flusher(&self, mut drained: u64) {
 		// `drained` is the last ring sequence the flusher has consumed.

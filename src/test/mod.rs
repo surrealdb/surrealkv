@@ -9,6 +9,8 @@ use crate::vlog::ValueLocation;
 use crate::{InternalKey, LSMIterator, Result};
 
 #[cfg(test)]
+pub mod alloc_limits_tests;
+#[cfg(test)]
 pub mod atomic_memtable_tests;
 #[cfg(test)]
 pub mod batch_tests;

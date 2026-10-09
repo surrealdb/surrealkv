@@ -29,10 +29,12 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
+use super::compaction_memory_proofs::RefuseAllocations;
 use super::{collect_transaction_all, collect_transaction_reverse};
 use crate::compaction::leveled::Strategy;
 use crate::lsm::{CompactionOperations, FlushHook};
 use crate::ring::{CommitStage, PipelineHook, UNFENCED_STALE_ROUNDS};
+use crate::wal::CompressionType;
 use crate::{BackgroundErrorReason, Durability, Error, ErrorSeverity, Mode, Options, Result, Tree};
 
 /// A memtable that holds about 21 small commits, so that a group of 30 fills it part-way.
@@ -170,6 +172,14 @@ fn numbered(count: usize) -> Entries {
 /// A group of 30 commits: with `SMALL`, it fills a memtable part-way.
 fn group() -> Entries {
 	numbered(30)
+}
+
+/// The length of the value of the commit that `Failure::ReappendCompress` logs again.
+const REAPPENDED: usize = 1700;
+
+/// The bytes that the WAL writer reserves for the block of a record of `len` bytes.
+fn block_capacity(len: usize) -> usize {
+	lz4_flex::block::get_maximum_output_size(len) + 4
 }
 
 /// A group of 20 commits with an oversized one in the middle, which bypasses the memtable.
@@ -311,6 +321,9 @@ enum Failure {
 	ReappendWrite,
 	/// The fsync of that re-append fails.
 	ReappendSync,
+	/// The segment the re-append goes to is compressed, and the allocator refuses the block that
+	/// its record is compressed into.
+	ReappendCompress,
 	/// The fsync of the old segment, in the rotation in the middle of the group, fails.
 	RotationSync,
 	/// The rotation in the middle of the group cannot create the new segment.
@@ -344,6 +357,14 @@ impl Failure {
 					("big1".to_string(), vec![NEW; SMALL + 1000]),
 				]
 			}
+			// The first commit is applied to what is left of the memtable, the second does not
+			// fit it, so the memtable rotates and the second is logged again on its own.
+			Failure::ReappendCompress => {
+				vec![
+					("first".to_string(), vec![NEW; REAPPENDED / 2]),
+					("second".to_string(), vec![NEW; REAPPENDED]),
+				]
+			}
 			_ => group(),
 		}
 	}
@@ -351,7 +372,10 @@ impl Failure {
 	/// The apply rounds the group gets through before it fails, the failing one included.
 	fn rounds(self) -> usize {
 		match self {
-			Failure::ReappendWrite | Failure::ReappendSync | Failure::AfterDirectL0 => 2,
+			Failure::ReappendWrite
+			| Failure::ReappendSync
+			| Failure::ReappendCompress
+			| Failure::AfterDirectL0 => 2,
 			Failure::RotationSync
 			| Failure::RotationCreate
 			| Failure::DirectL0
@@ -370,6 +394,7 @@ impl Failure {
 				Some("injected write failure")
 			}
 			Failure::FlushBeforeDirectL0 => Some("injected flush failure"),
+			Failure::ReappendCompress => Some("out of memory"),
 			Failure::ReappendSync | Failure::RotationSync | Failure::FencedSync => {
 				Some("injected fsync failure")
 			}
@@ -386,9 +411,16 @@ struct Injected {
 	rounds: AtomicUsize,
 	/// Directories that stand where the file a step creates should go.
 	blockers: Mutex<Vec<PathBuf>>,
+	/// The refusal of an allocation, while it is armed.
+	refusal: Mutex<Option<RefuseAllocations>>,
 }
 
 impl Injected {
+	/// The allocator takes allocations of every size again.
+	fn lift_refusal(&self) {
+		self.refusal.lock().unwrap().take();
+	}
+
 	fn remove_blockers(&self) {
 		for blocker in self.blockers.lock().unwrap().drain(..) {
 			fs::remove_dir(blocker).unwrap();
@@ -413,6 +445,14 @@ fn inject(tree: &Tree, failure: Failure) -> Arc<Injected> {
 					inner.wal.write().fail_writes_after(0)
 				}
 				Failure::ReappendSync if round == 1 => inner.wal.write().fail_syncs_after(0),
+				// The record of the second commit is the batch with its value wrapped, a little
+				// more than the value. Its block is the one allocation of its size, and the one
+				// the re-append makes: the first append, of both records, allocated a larger one.
+				Failure::ReappendCompress if round == 1 => {
+					let record = REAPPENDED + 2 + "second".len() + 40;
+					let sizes = block_capacity(record - 40)..=block_capacity(record + 40);
+					*seen.refusal.lock().unwrap() = Some(RefuseAllocations::of_size(sizes));
+				}
 				Failure::RotationCreate if round == 0 => {
 					let next = inner.wal.read().get_active_log_number() + 1;
 					let blocker = seg_path(&inner.opts.path, next);
@@ -474,6 +514,16 @@ async fn run(failure: Failure, mix: Mix) {
 	for result in commit_group(&tree, &base(), Mix::Immediate).await {
 		result.unwrap();
 	}
+	if failure == Failure::ReappendCompress {
+		// The segments the WAL opens from now on are compressed. The memtable of the base keys is
+		// queued, and the keys are committed again into a compressed segment, so that the active
+		// memtable has room left for the first commit of the group and not for the second.
+		tree.core.inner.wal.write().set_compression_of_new_segments(CompressionType::Lz4);
+		tree.core.inner.rotate_memtable().unwrap();
+		for result in commit_group(&tree, &base(), Mix::Immediate).await {
+			result.unwrap();
+		}
+	}
 	let visible = tree.core.seq_num();
 	let before = scan(&tree);
 	assert_eq!(before.len(), 10);
@@ -484,6 +534,7 @@ async fn run(failure: Failure, mix: Mix) {
 	tree.core.commit_pipeline.set_hook(None);
 	*tree.core.inner.flush_hook.lock() = None;
 	injected.remove_blockers();
+	injected.lift_refusal();
 
 	// Every committer of the group is told, whatever it asked for, and told why.
 	assert_eq!(results.len(), group.len());
@@ -596,6 +647,16 @@ async fn a_failed_reappend_after_part_of_the_group_was_applied_stops_the_databas
 async fn a_failed_fsync_of_the_reappend_after_part_of_the_group_was_applied_stops_the_database() {
 	for mix in SYNCED_MIXES {
 		run(Failure::ReappendSync, mix).await;
+	}
+}
+
+/// A segment whose records are compressed makes the re-append allocate: when the allocator refuses
+/// the block of a record, the re-append fails like one that cannot write, and the group stops the
+/// database.
+#[test(tokio::test)]
+async fn a_refused_block_in_the_reappend_after_part_of_the_group_was_applied_stops_the_database() {
+	for mix in ALL_MIXES {
+		run(Failure::ReappendCompress, mix).await;
 	}
 }
 
