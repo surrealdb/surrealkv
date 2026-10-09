@@ -115,6 +115,50 @@ fn retire_due(groups: u32, entries: u64) -> bool {
 	groups >= RETIRE_EVERY_GROUPS || entries >= RETIRE_EVERY_ENTRIES
 }
 
+/// How many retired entries the flusher frees between two groups, from the overflow map, and at
+/// least that many from the ring. A transaction that stayed open for many laps of the ring leaves
+/// the map holding every entry the ring overwrote meanwhile, and the ring itself holds a lap of
+/// them once it ends. Freeing one costs a fraction of a microsecond, so freeing them all at once
+/// would stall every commit behind the flusher for as long as they are many. They go in chunks
+/// instead, and the flusher keeps going while it has nothing else to do.
+pub(crate) const RETIRED_FREE_CHUNK: usize = 256;
+
+/// How many ring slots the flusher releases after a group that drained `entries` entries. A
+/// retire passes as many slots as the groups since the last one drained, so releasing a fixed
+/// chunk per group would fall behind from about `RETIRED_FREE_CHUNK` entries a group and leave
+/// up to the whole ring holding retired entries for as long as the load lasts. Twice the group's
+/// own size keeps up, and costs a small part of what the group costs itself.
+fn retired_slots_per_step(entries: u64) -> u64 {
+	(RETIRED_FREE_CHUNK as u64).max(entries.saturating_mul(2))
+}
+
+/// Removes up to `limit` entries of `overflow` whose sequence is at or below `taken`, lowest
+/// first, and drops them after the mutex is released. Returns how many it dropped and whether
+/// more are left at or below `taken`. `freed` is the buffer they pass through, empty on entry.
+///
+/// The entries at or below `taken` are out of every live window's reach and nothing reads them,
+/// so leaving some for a later call is safe, and none above `taken` is ever removed.
+fn free_retired_from<V>(
+	overflow: &Mutex<BTreeMap<u64, V>>,
+	taken: u64,
+	limit: usize,
+	freed: &mut Vec<V>,
+) -> (usize, bool) {
+	let more = {
+		let mut overflow = overflow.lock();
+		while freed.len() < limit {
+			match overflow.first_entry() {
+				Some(entry) if *entry.key() <= taken => freed.push(entry.remove()),
+				_ => break,
+			}
+		}
+		overflow.first_key_value().is_some_and(|(seq, _)| *seq <= taken)
+	};
+	let count = freed.len();
+	freed.clear();
+	(count, more)
+}
+
 /// Why `CommitPipeline::apply_run` stopped.
 enum ApplyStop {
 	/// Every remaining batch was applied.
@@ -172,7 +216,9 @@ pub(crate) struct CommitPipeline {
 	pub(crate) ring: CommitRing<CommitEntry>,
 	/// Entries that a lap of the ring overwrote while a live conflict window
 	/// could still reach them, keyed by ring sequence. Only long-lived
-	/// transactions, whose window spans more than a lap, ever read it.
+	/// transactions, whose window spans more than a lap, ever read it. Entries
+	/// at or below the retired watermark are garbage, which `free_retired`
+	/// removes a chunk at a time.
 	overflow: Mutex<BTreeMap<u64, Arc<CommitEntry>>>,
 	/// Admission permits, one per claimed entry, released only once the
 	/// completed prefix has passed it. At most half the ring's capacity of
@@ -214,6 +260,24 @@ pub(crate) struct CommitPipeline {
 	/// allocator had none to give. `usize::MAX` disables it.
 	#[cfg(test)]
 	wal_reserve_fails_from: std::sync::atomic::AtomicUsize,
+	/// Test-only observer called at the start of every `free_retired`.
+	#[cfg(test)]
+	free_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+	/// Test-only record of what `free_retired` freed.
+	#[cfg(test)]
+	free_stats: Mutex<FreeStats>,
+}
+
+/// What `free_retired` has done so far.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FreeStats {
+	/// The calls that freed at least one entry.
+	pub(crate) steps: usize,
+	/// The entries freed in all.
+	pub(crate) total: usize,
+	/// The most entries one call freed.
+	pub(crate) most: usize,
 }
 
 pub(crate) struct RestoreGuard<'a> {
@@ -262,6 +326,10 @@ impl CommitPipeline {
 			retire_gap: Mutex::new(None),
 			#[cfg(test)]
 			wal_reserve_fails_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
+			#[cfg(test)]
+			free_hook: Mutex::new(None),
+			#[cfg(test)]
+			free_stats: Mutex::new(FreeStats::default()),
 		}
 	}
 
@@ -297,11 +365,57 @@ impl CommitPipeline {
 		self.wal_reserve_fails_from.store(bytes, Ordering::Relaxed);
 	}
 
+	/// Test observer: whether the entry at `seq` has been accepted and waits for the flusher.
+	#[cfg(test)]
+	pub(crate) fn is_accepted(&self, seq: u64) -> bool {
+		matches!(
+			self.ring.read(seq, |entry| matches!(entry.state(), EntryState::Accepted)),
+			SlotRead::Ready(true)
+		)
+	}
+
+	/// Test observer: how many entries of the overflow map the retired watermark has passed.
+	#[cfg(test)]
+	pub(crate) fn retired_in_overflow(&self) -> usize {
+		self.overflow.lock().range(..=self.ring.taken()).count()
+	}
+
+	/// Test observer: panics if the ring lapped an entry above the retired watermark that the
+	/// overflow map does not hold. One that is missing and at or below the watermark by the time
+	/// it is looked for was freed legitimately.
+	#[cfg(test)]
+	pub(crate) fn assert_lapped_entries_are_kept(&self) {
+		let lapped = self.ring.published().saturating_sub(self.ring.capacity());
+		for seq in (self.ring.taken() + 1)..=lapped {
+			// Never hold the map's mutex while reading a slot: `publish` takes them the other
+			// way round.
+			if matches!(self.ring.read(seq, |_| ()), SlotRead::Gone)
+				&& !self.overflow.lock().contains_key(&seq)
+			{
+				let taken = self.ring.taken();
+				assert!(seq <= taken, "lapped entry {seq} above the watermark {taken} was freed");
+			}
+		}
+	}
+
 	/// Installs (or clears) the observer called inside `retire` after it read the completed
 	/// prefix and before it scans the pinned transactions.
 	#[cfg(test)]
 	pub(crate) fn set_retire_gap_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
 		*self.retire_gap.lock() = hook;
+	}
+
+	/// Installs (or clears) the observer called at the start of every `free_retired`, before it
+	/// takes anything out of the overflow map.
+	#[cfg(test)]
+	pub(crate) fn set_free_retired_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+		*self.free_hook.lock() = hook;
+	}
+
+	/// What `free_retired` has freed so far.
+	#[cfg(test)]
+	pub(crate) fn free_stats(&self) -> FreeStats {
+		*self.free_stats.lock()
 	}
 
 	/// Installs (or clears) the observer called at each `PipelineHook` point.
@@ -548,6 +662,11 @@ impl CommitPipeline {
 		// and undecided. Only polled at shutdown.
 		let mut all_permits =
 			std::pin::pin!(Arc::clone(&self.admission).acquire_many_owned(ADMISSION_PERMITS));
+		// Whether retired entries may still be waiting in the overflow map.
+		let mut retired_pending = false;
+		// The retired overflow entries between leaving the map and being dropped. Empty between
+		// steps, and at most `RETIRED_FREE_CHUNK` long.
+		let mut retired: Vec<Arc<CommitEntry>> = Vec::new();
 		loop {
 			// Gather the contiguous decided entries after `drained`, with the permits to
 			// release once the completed prefix passes them. The group stops before the entry
@@ -602,6 +721,13 @@ impl CommitPipeline {
 					}
 					continue;
 				}
+				if retired_pending {
+					// Nothing to flush: carry on freeing instead of parking with the
+					// memory held, yielding so that the committers get to run.
+					retired_pending = self.free_retired(&mut retired, 0);
+					tokio::task::yield_now().await;
+					continue;
+				}
 				// Wait for new published or decided entries
 				self.notify_flusher.notified().await;
 				continue;
@@ -628,6 +754,12 @@ impl CommitPipeline {
 				groups_since_retire = 0;
 				entries_since_retire = 0;
 				self.retire();
+				retired_pending = true;
+			}
+			// One chunk per group, so that the entries a long-lived transaction left behind
+			// do not stall the commits that follow it.
+			if retired_pending {
+				retired_pending = self.free_retired(&mut retired, entries);
 			}
 		}
 	}
@@ -701,7 +833,7 @@ impl CommitPipeline {
 	/// of the completed prefix that bounds it, and that transaction reads its window from a
 	/// prefix at least as high.
 	///
-	/// Drops the overflow entries that no live window can reach any more.
+	/// The ring slots and overflow entries it passes are left for `free_retired`.
 	fn retire(&self) {
 		// Read the completed prefix before scanning the pins: a transaction
 		// that registers after the scan reads its window after this value.
@@ -717,12 +849,36 @@ impl CommitPipeline {
 			Some(pin) => pin.min(completed),
 			None => completed,
 		};
-		self.ring.advance_taken(bound);
-		let taken = self.ring.taken();
-		let mut overflow = self.overflow.lock();
-		if overflow.first_key_value().is_some_and(|(s, _)| *s <= taken) {
-			*overflow = overflow.split_off(&(taken + 1));
+		self.ring.raise_taken(bound);
+	}
+
+	/// Frees one chunk of the ring slots and one chunk of the overflow entries that the retired
+	/// watermark has passed, and reports whether more of either are left. `entries` is how many
+	/// ring entries the group before it drained, which scales the ring's chunk, and `freed` is
+	/// the buffer the overflow entries go through, empty on entry.
+	///
+	/// What validation reads is above the watermark, so which of the entries at or below it are
+	/// still held does not matter to it, and the rest can wait for the next call.
+	fn free_retired(&self, freed: &mut Vec<Arc<CommitEntry>>, entries: u64) -> bool {
+		#[cfg(test)]
+		{
+			let hook = self.free_hook.lock().clone();
+			if let Some(hook) = hook {
+				hook();
+			}
 		}
+		let more_slots = self.ring.release_retired(retired_slots_per_step(entries));
+		#[cfg_attr(not(test), allow(unused_variables))]
+		let (count, more) =
+			free_retired_from(&self.overflow, self.ring.taken(), RETIRED_FREE_CHUNK, freed);
+		#[cfg(test)]
+		if count > 0 {
+			let mut stats = self.free_stats.lock();
+			stats.steps += 1;
+			stats.total += count;
+			stats.most = stats.most.max(count);
+		}
+		more_slots || more
 	}
 
 	/// Flushes a group of batches to WAL and applies them to the Memtable.
@@ -1173,7 +1329,9 @@ impl CommitPipeline {
 		self.restore_epoch.fetch_add(1, Ordering::SeqCst);
 		self.log_seq_num.store(seq + 1, Ordering::SeqCst);
 		self.inner.visible_seq_num.store(seq, Ordering::SeqCst);
-		self.overflow.lock().clear();
+		// Dropped once the mutex is released
+		let retained = std::mem::take(&mut *self.overflow.lock());
+		drop(retained);
 	}
 }
 
@@ -1225,6 +1383,195 @@ fn bloom_of(keys: &[Key]) -> BloomFilter {
 		bloom.insert(k);
 	}
 	bloom
+}
+
+#[cfg(test)]
+mod free_retired_tests {
+	use std::collections::BTreeMap;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::Arc;
+
+	use parking_lot::Mutex;
+
+	use super::super::commit_ring::{CommitRing, RingEntry};
+	use super::{
+		free_retired_from,
+		retire_due,
+		retired_slots_per_step,
+		RETIRED_FREE_CHUNK,
+		RETIRE_EVERY_ENTRIES,
+	};
+
+	fn map(keys: impl IntoIterator<Item = u64>) -> Mutex<BTreeMap<u64, u64>> {
+		Mutex::new(keys.into_iter().map(|k| (k, k)).collect())
+	}
+
+	fn keys(map: &Mutex<BTreeMap<u64, u64>>) -> Vec<u64> {
+		map.lock().keys().copied().collect()
+	}
+
+	#[test]
+	fn frees_at_most_the_limit_lowest_first() {
+		let overflow = map(1..=10);
+		let mut freed = Vec::new();
+		assert_eq!(free_retired_from(&overflow, 8, 3, &mut freed), (3, true));
+		assert_eq!(keys(&overflow), (4..=10).collect::<Vec<_>>());
+		assert_eq!(free_retired_from(&overflow, 8, 3, &mut freed), (3, true));
+		assert_eq!(keys(&overflow), (7..=10).collect::<Vec<_>>());
+		// Two left at or below 8, and the limit is not reached
+		assert_eq!(free_retired_from(&overflow, 8, 3, &mut freed), (2, false));
+		assert_eq!(keys(&overflow), vec![9, 10]);
+		assert!(freed.is_empty(), "the buffer is handed back empty");
+	}
+
+	#[test]
+	fn never_frees_above_taken() {
+		let overflow = map([5, 6, 7, 20, 21]);
+		let mut freed = Vec::new();
+		assert_eq!(free_retired_from(&overflow, 4, 100, &mut freed), (0, false));
+		assert_eq!(free_retired_from(&overflow, 7, 100, &mut freed), (3, false));
+		assert_eq!(keys(&overflow), vec![20, 21]);
+		assert_eq!(free_retired_from(&overflow, 19, usize::MAX, &mut freed), (0, false));
+		assert_eq!(keys(&overflow), vec![20, 21]);
+		// The watermark itself is retired
+		assert_eq!(free_retired_from(&overflow, 20, 100, &mut freed), (1, false));
+		assert_eq!(keys(&overflow), vec![21]);
+	}
+
+	#[test]
+	fn reports_more_exactly_when_an_entry_at_or_below_taken_is_left() {
+		let overflow = map([1, 2, 3, 9]);
+		let mut freed = Vec::new();
+		// Exactly the retired entries: nothing is left, though the limit is reached
+		assert_eq!(free_retired_from(&overflow, 3, 3, &mut freed), (3, false));
+		// An entry above the watermark is not "more"
+		assert_eq!(free_retired_from(&overflow, 3, 3, &mut freed), (0, false));
+		assert_eq!(free_retired_from(&overflow, 9, 0, &mut freed), (0, true));
+		assert_eq!(free_retired_from(&overflow, 9, 1, &mut freed), (1, false));
+		assert_eq!(
+			free_retired_from(&Mutex::new(BTreeMap::<u64, u64>::new()), 9, 1, &mut freed),
+			(0, false)
+		);
+	}
+
+	#[test]
+	fn repeated_calls_free_exactly_the_entries_at_or_below_taken() {
+		let mut rng = fastrand::Rng::with_seed(0x5eed);
+		for _ in 0..500 {
+			let keys_in: Vec<u64> = (0..rng.usize(0..200)).map(|_| rng.u64(1..400)).collect();
+			let overflow = map(keys_in.iter().copied());
+			let (taken, limit) = (rng.u64(0..420), rng.usize(1..40));
+			let before = keys(&overflow);
+			let mut freed = Vec::new();
+			let mut calls = 0;
+			let mut total = 0;
+			loop {
+				let (count, more) = free_retired_from(&overflow, taken, limit, &mut freed);
+				assert!(count <= limit, "freed {count} with a limit of {limit}");
+				total += count;
+				calls += 1;
+				if !more {
+					break;
+				}
+				assert_eq!(count, limit, "more must mean the limit was reached");
+			}
+			let retired = before.iter().filter(|k| **k <= taken).count();
+			assert_eq!(total, retired);
+			assert_eq!(calls, retired.div_ceil(limit).max(1));
+			assert_eq!(
+				keys(&overflow),
+				before.into_iter().filter(|k| *k > taken).collect::<Vec<_>>()
+			);
+		}
+	}
+
+	/// The ring slots a retire has passed and the flusher has not released yet, with the ring at
+	/// the size production uses and driven the way the flusher drives it: groups of a fixed size,
+	/// a retire every `RETIRE_EVERY_GROUPS` of them or `RETIRE_EVERY_ENTRIES` entries, and one
+	/// release step after each group. They must not pile up, whatever the size of the group: a
+	/// step of a fixed number of slots falls behind from about `RETIRED_FREE_CHUNK` entries a
+	/// group, and leaves retired entries in most of the ring for as long as the load lasts.
+	#[test]
+	fn retired_slots_are_released_as_fast_as_groups_retire_them() {
+		struct Entry;
+		impl RingEntry for Entry {
+			fn is_complete(&self) -> bool {
+				true
+			}
+		}
+
+		const CAPACITY: u64 = 65536;
+		for group in [1u64, 100, 256, 257, 300, 512, 1024, 4096] {
+			let ring = CommitRing::<Entry>::new(CAPACITY as usize, 1);
+			let (mut groups, mut entries, mut sampled) = (0u32, 0u64, 0u64);
+			let mut worst = 0;
+			while ring.published() < 3 * CAPACITY {
+				for _ in 0..group {
+					let seq = ring.claim();
+					ring.publish(seq, Arc::new(Entry));
+				}
+				ring.advance_published();
+				ring.advance_completed();
+				groups += 1;
+				entries += group;
+				if retire_due(groups, entries) {
+					(groups, entries) = (0, 0);
+					ring.raise_taken(ring.completed());
+				}
+				ring.release_retired(retired_slots_per_step(group));
+				// Counting the slots costs a lap of the ring, so only now and then
+				if ring.published() >= sampled + 4096 {
+					sampled = ring.published();
+					let unretired = (ring.published() - ring.taken()).min(CAPACITY) as usize;
+					worst = worst.max(ring.occupied().saturating_sub(unretired));
+				}
+			}
+			let bound = RETIRE_EVERY_ENTRIES + group + RETIRED_FREE_CHUNK as u64;
+			assert!(
+				worst as u64 <= bound,
+				"with groups of {group}, {worst} slots were retired and not yet released (more than {bound})"
+			);
+		}
+	}
+
+	/// An entry is dropped when the overflow map is no longer locked, so a drop that takes a while
+	/// never holds up a committer evicting into the map or validating against it.
+	#[test]
+	fn drops_the_entries_after_the_mutex_is_released() {
+		struct Probe {
+			map: Arc<Mutex<BTreeMap<u64, Probe>>>,
+			locked_when_dropped: Arc<AtomicUsize>,
+		}
+		impl Drop for Probe {
+			fn drop(&mut self) {
+				if self.map.try_lock().is_none() {
+					self.locked_when_dropped.fetch_add(1, Ordering::SeqCst);
+				}
+			}
+		}
+
+		let overflow = Arc::new(Mutex::new(BTreeMap::new()));
+		let locked_when_dropped = Arc::new(AtomicUsize::new(0));
+		for seq in 1..=8u64 {
+			let probe = Probe {
+				map: Arc::clone(&overflow),
+				locked_when_dropped: Arc::clone(&locked_when_dropped),
+			};
+			overflow.lock().insert(seq, probe);
+		}
+		let mut freed = Vec::new();
+		assert_eq!(free_retired_from(&overflow, 6, 4, &mut freed), (4, true));
+		assert_eq!(free_retired_from(&overflow, 6, 4, &mut freed), (2, false));
+		assert_eq!(overflow.lock().len(), 2);
+		assert_eq!(
+			locked_when_dropped.load(Ordering::SeqCst),
+			0,
+			"entries were dropped while the overflow map was locked"
+		);
+		// The two left are dropped with the map, which breaks the cycle through `Probe::map`
+		let rest = std::mem::take(&mut *overflow.lock());
+		drop(rest);
+	}
 }
 
 #[cfg(test)]

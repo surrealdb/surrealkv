@@ -8,8 +8,10 @@ pub(crate) use pipeline::CommitPipeline;
 #[cfg(test)]
 pub(crate) use pipeline::{
 	CommitStage,
+	FreeStats,
 	PipelineHook,
 	MAX_GROUP_BYTES,
+	RETIRED_FREE_CHUNK,
 	RETIRE_EVERY_ENTRIES,
 	RETIRE_EVERY_GROUPS,
 	UNFENCED_STALE_ROUNDS,

@@ -51,6 +51,8 @@ pub mod recovery_test_helpers;
 #[cfg(test)]
 pub mod recovery_tests;
 #[cfg(test)]
+pub mod retire_free_tests;
+#[cfg(test)]
 pub mod retire_isolation_tests;
 #[cfg(test)]
 pub mod snapshot_tests;
