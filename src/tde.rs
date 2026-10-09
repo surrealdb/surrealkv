@@ -1,7 +1,11 @@
-//! Transparent Data Encryption (TDE) for SSTable and WAL blocks.
+//! Cipher primitives for Transparent Data Encryption (TDE). Encryption at rest is not
+//! implemented yet.
 //!
-//! Provides authenticated encryption at rest (AEAD) with key rotation support
-//! and configurable cipher suites:
+//! The primitives here (AEAD with key rotation through a key manager) are not wired into any
+//! SSTable, WAL or value-log path, so nothing the database writes is encrypted. The envelope
+//! format and the cipher suites are not final.
+//!
+//! Cipher suites:
 //! - AES-256-GCM (Hardware-accelerated standard AEAD)
 //! - XChaCha20-Poly1305 (Constant-time software AEAD with 192-bit nonce)
 //! - ChaCha20-BLAKE3 (High-throughput committing AEAD with keyed BLAKE3 MAC)

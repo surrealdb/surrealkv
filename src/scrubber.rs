@@ -1,7 +1,8 @@
-//! Background data integrity scrubber.
+//! Planned background data integrity scrubber. It is not implemented yet.
 //!
-//! Continually trickles through SSTable blocks, validating inline checksums
-//! to detect and alert on silent hardware bit-rot or media corruption.
+//! This module is compiled only for tests. Nothing starts it, so no database verifies its
+//! blocks in the background. The intended design is to trickle through SSTable blocks,
+//! validating inline checksums to detect silent hardware bit-rot or media corruption.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

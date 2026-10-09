@@ -112,6 +112,19 @@ jobs:
       - name: Format
         run: cargo +nightly fmt --all -- --check
 
+  readme:
+    name: README Sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Regenerate CARGO.md
+        run: make readme
+
+      - name: Check CARGO.md matches README.md (run make readme to fix)
+        run: git diff --exit-code -- CARGO.md
+
   wasm-check:
     name: WASM Check & Clippy
     runs-on: ubuntu-latest

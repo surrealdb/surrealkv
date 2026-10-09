@@ -96,7 +96,8 @@ pub struct FlightRecorder {
 	pub cache_hits: AtomicU64,
 	/// Cache misses in block cache
 	pub cache_misses: AtomicU64,
-	/// Corrupted blocks detected by scrubber
+	/// Corrupted blocks detected by the planned background scrubber. The scrubber is not
+	/// implemented yet, so nothing updates this counter and it stays at zero.
 	pub corrupted_blocks_detected: AtomicU64,
 }
 
