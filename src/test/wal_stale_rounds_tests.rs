@@ -878,6 +878,10 @@ fn nothing_behind_an_oversized_batch_is_logged_before_it_is_through() {
 // inside the fence
 // ---------------------------------------------------------------------------
 
+fn fsynced_vlog_files(under: &Path) -> Vec<PathBuf> {
+	crate::vlog::SYNCED_VLOG_FILES.lock().iter().filter(|p| p.starts_with(under)).cloned().collect()
+}
+
 /// What a fenced round looked like at the point it had logged what was stale and had not
 /// applied anything yet.
 #[derive(Debug)]
@@ -889,11 +893,13 @@ struct Fence {
 	wal_segment: u64,
 	/// Whether anything was appended to the active segment since its last fsync.
 	pending_sync: bool,
+	/// The value log files that had been fsynced.
+	synced_vlog_files: Vec<PathBuf>,
 }
 
-fn observe_fence(tree: &Tree) -> (Arc<Probe>, Arc<Mutex<Vec<Fence>>>) {
+fn observe_fence(tree: &Tree, live: &Path) -> (Arc<Probe>, Arc<Mutex<Vec<Fence>>>) {
 	let seen = Arc::new(Mutex::new(Vec::new()));
-	let (inner, sink) = (Arc::clone(&tree.core.inner), Arc::clone(&seen));
+	let (inner, sink, live) = (Arc::clone(&tree.core.inner), Arc::clone(&seen), live.to_path_buf());
 	let sealing = Arc::clone(&inner);
 	let probe = install(
 		tree,
@@ -912,6 +918,7 @@ fn observe_fence(tree: &Tree) -> (Arc<Probe>, Arc<Mutex<Vec<Fence>>>) {
 				tag,
 				wal_segment: wal.get_active_log_number(),
 				pending_sync: wal.pending_sync(),
+				synced_vlog_files: fsynced_vlog_files(&live),
 			});
 		},
 	);
@@ -919,9 +926,10 @@ fn observe_fence(tree: &Tree) -> (Arc<Probe>, Arc<Mutex<Vec<Fence>>>) {
 }
 
 /// A fenced round holds the memtable's read guard from the re-append to the apply, the WAL's
-/// active segment is the memtable's tag, and an Immediate group is fsynced before it is applied,
-/// in every fenced round of a group that spans several memtables too. The Eventual control leaves
-/// the append unsynced, so the probe can see one.
+/// active segment is the memtable's tag, and an Immediate group is fsynced (the WAL segment, and
+/// the value log files its pointers use) before it is applied, in every fenced round of a group
+/// that spans several memtables too. The Eventual control leaves the append unsynced, so the
+/// probe can see one.
 #[test]
 fn a_fenced_round_has_synced_what_it_logged_and_holds_the_guard_until_it_applies() {
 	bounded(false, async {
@@ -940,7 +948,7 @@ fn a_fenced_round_has_synced_what_it_logged_and_holds_the_guard_until_it_applies
 			let live = dir.path().join("live");
 			let tree = Arc::new(Tree::new(opts(&live, max_memtable_size, vlog)).unwrap());
 			stop_background_tasks(&tree).await;
-			let (probe, seen) = observe_fence(&tree);
+			let (probe, seen) = observe_fence(&tree, &live);
 
 			commit_all(&tree, &group, durability, &probe, &what).await;
 			let seen = seen.lock().unwrap();
@@ -956,6 +964,12 @@ fn a_fenced_round_has_synced_what_it_logged_and_holds_the_guard_until_it_applies
 					durability == Durability::Eventual,
 					"{what}: {fence:?}"
 				);
+				if vlog && durability == Durability::Immediate {
+					assert!(
+						!fence.synced_vlog_files.is_empty(),
+						"{what}: the value log was not fsynced before the apply: {fence:?}"
+					);
+				}
 			}
 			dispose(&tree);
 		}

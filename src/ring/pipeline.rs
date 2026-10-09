@@ -995,6 +995,17 @@ impl CommitPipeline {
 			encode_values(batch, vlog, vlog_threshold)?;
 		}
 
+		// The values reach the OS before any record that points to them, and a group that syncs
+		// has them on disk first. Its records are then never logged ahead of their values, and a
+		// failed sync fails the group before the WAL has been touched.
+		if let Some(vlog_inst) = vlog {
+			if sync {
+				vlog_inst.sync()?;
+			} else {
+				vlog_inst.flush()?;
+			}
+		}
+
 		// 2. Append the batches to the WAL asynchronously, one record per batch, in one call
 		// for the whole group, then sync once.
 		//
@@ -1010,10 +1021,6 @@ impl CommitPipeline {
 		//
 		// The segment the records landed in is kept: step 3 only applies a batch to a
 		// memtable tagged with that segment.
-		if let Some(vlog_inst) = vlog {
-			vlog_inst.flush()?;
-		}
-
 		let FlushScratch {
 			estimates,
 			oversized,
@@ -1065,9 +1072,6 @@ impl CommitPipeline {
 		*wal_buf = buf;
 		*wal_ends = ends;
 		if sync {
-			if let Some(vlog_inst) = vlog {
-				vlog_inst.sync()?;
-			}
 			self.log_store.sync().await?;
 		}
 		#[cfg(test)]

@@ -1439,11 +1439,17 @@ impl Core {
 	///
 	/// # Order of Operations
 	///
-	/// VLog is flushed first (contains data referenced by WAL), then WAL.
+	/// VLog is flushed (or synced) first (contains data referenced by WAL), then WAL.
 	/// This ensures that if WAL contains a ValuePointer, the referenced
 	/// VLog data is at least as durable.
 	pub(crate) fn flush_wal(&self, sync: bool) -> Result<()> {
-		// VLog is NOT synced here — VLog writes are deferred to memtable flush.
+		if let Some(ref vlog) = self.vlog {
+			if sync {
+				vlog.sync()?;
+			} else {
+				vlog.flush()?;
+			}
+		}
 		if sync {
 			self.wal.sync()?;
 		} else {

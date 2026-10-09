@@ -1129,6 +1129,53 @@ async fn a_damaged_segment_that_is_not_the_last_is_repaired_once_and_stays_repai
 	finish(&tree);
 }
 
+/// A failed group whose values went to the value log: the log is fsynced before the WAL, so a
+/// record of the failed group that a crash image still holds never points at a value that is
+/// not there. Every value of an acknowledged group reads back whole.
+#[test(tokio::test)]
+async fn a_failed_group_with_value_log_values_never_dangles_in_a_crash_image() {
+	let dir = TempDir::new("wal_fsync").unwrap();
+	let live = dir.path().join("live");
+	let vlog_opts = |path: &Path| {
+		Arc::new(Options {
+			path: path.to_path_buf(),
+			flush_on_close: false,
+			enable_vlog: true,
+			vlog_value_threshold: 64,
+			..Default::default()
+		})
+	};
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	stop_background_tasks(&tree).await;
+	mark_closed(&tree);
+
+	let blobs = |prefix: &str, fill: u8| -> Vec<(String, Vec<u8>)> {
+		(0..4).map(|i| (format!("{prefix}{i}"), vec![fill; 300])).collect()
+	};
+	let acked = blobs("acked", b'a');
+	commit_ok(&tree, &acked, Durability::Immediate).await;
+	arm(&tree, 0);
+	let doomed = blobs("doomed", b'd');
+	all_failed(&commit_group(&tree, &doomed, Durability::Immediate).await);
+	tree.core.inner.rotate_memtable().unwrap();
+	let later = blobs("later", b'l');
+	commit_ok(&tree, &later, Durability::Immediate).await;
+
+	let image = dir.path().join("image");
+	copy_dir(&live, &image);
+	let reopened = Tree::new(vlog_opts(&image)).unwrap();
+	for (key, value) in acked.iter().chain(&later) {
+		assert_eq!(get(&reopened, key).as_deref(), Some(value.as_slice()), "{key}");
+	}
+	for (key, value) in &doomed {
+		if let Some(read) = get(&reopened, key) {
+			assert_eq!(&read, value, "{key}: the record is there and its value is not");
+		}
+	}
+	finish(&reopened);
+	finish(&tree);
+}
+
 // ---------------------------------------------------------------------------
 // concurrent appends and rotations around the out-of-lock fsync
 // ---------------------------------------------------------------------------

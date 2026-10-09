@@ -214,6 +214,11 @@ fn hold_every_group(tree: &Tree) -> Flusher {
 	hold_groups(tree, true, || {})
 }
 
+/// As `hold_first_group`, calling `probe` at the WAL step of every group, before it is held.
+fn hold_first_group_with(tree: &Tree, probe: impl Fn() + Send + Sync + 'static) -> Flusher {
+	hold_groups(tree, false, probe)
+}
+
 fn hold_groups(tree: &Tree, every: bool, probe: impl Fn() + Send + Sync + 'static) -> Flusher {
 	let groups = Arc::new(Mutex::new(Vec::new()));
 	let reached = Arc::new(AtomicUsize::new(0));
@@ -1078,8 +1083,55 @@ async fn split_groups_count_their_entries_towards_the_retire_interval() {
 }
 
 // ---------------------------------------------------------------------------
-// a crash at every group boundary
+// the value log, and a crash at every group boundary
 // ---------------------------------------------------------------------------
+
+/// With a value log, every group of a split pile-up fsyncs the value log before its WAL step
+/// ends, and so before any of its commits is applied or acknowledged: the fsyncs of the tree's
+/// value log files that have happened grow at every group.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn every_split_group_fsyncs_the_value_log_before_it_is_applied() {
+	const COMMITS: usize = 10;
+	let dir = TempDir::new("wal_group_budget").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(options(&live, true)).unwrap());
+	let pipeline = &tree.core.commit_pipeline;
+	let synced = Arc::new(Mutex::new(Vec::new()));
+	let flusher = {
+		let (synced, under) = (Arc::clone(&synced), live.clone());
+		hold_first_group_with(&tree, move || {
+			let files = crate::vlog::SYNCED_VLOG_FILES.lock();
+			synced.lock().unwrap().push(files.iter().filter(|p| p.starts_with(&under)).count());
+		})
+	};
+
+	let first = ("first".to_string(), value_of(0, 100));
+	let gate = commit(&tree, &first.0, first.1.clone());
+	until("the flusher to hold its first group", || flusher.is_held()).await;
+	let items: Vec<(String, Vec<u8>)> =
+		(0..COMMITS).map(|i| (format!("big_{i:02}"), value_of(i + 1, MIB))).collect();
+	let handles = queue_in_order(&tree, &items, 1).await;
+	let hints: Vec<usize> = items.iter().map(|(k, v)| hint_of(k, v)).collect();
+	let plan = group_plan(&hints);
+	assert!(plan.len() > 1, "control: the pile-up is several groups: {plan:?}");
+
+	flusher.release();
+	outcome(gate).await.unwrap();
+	assert_all_acked(handles).await;
+	let mut expected_groups = vec![1];
+	expected_groups.extend(&plan);
+	assert_eq!(flusher.groups(), expected_groups);
+	let synced = synced.lock().unwrap().clone();
+	assert_eq!(synced.len(), expected_groups.len());
+	assert!(
+		synced.windows(2).all(|pair| pair[0] < pair[1]),
+		"the value log was not fsynced for every group: {synced:?}"
+	);
+
+	pipeline.set_hook(None);
+	mark_closed(&tree);
+	release_lock(&tree);
+}
 
 /// The flusher is held at the end of the WAL step of every group in turn. At each boundary the
 /// directory is copied and the copy recovered: it holds a prefix of the commits in ring order, at

@@ -584,13 +584,24 @@ impl SyncHandle {
 /// descriptor, allowing concurrent WAL appends to proceed.
 pub(crate) struct WalManager {
 	pub(crate) inner: Arc<parking_lot::RwLock<Wal>>,
+	/// Test-only: the fsyncs `sync` has completed.
+	#[cfg(test)]
+	fsyncs: std::sync::atomic::AtomicUsize,
 }
 
 impl WalManager {
 	pub(crate) fn new(wal: Wal) -> Self {
 		Self {
 			inner: Arc::new(parking_lot::RwLock::new(wal)),
+			#[cfg(test)]
+			fsyncs: std::sync::atomic::AtomicUsize::new(0),
 		}
+	}
+
+	/// Test-only: the fsyncs `sync` has completed.
+	#[cfg(test)]
+	pub(crate) fn fsyncs(&self) -> usize {
+		self.fsyncs.load(std::sync::atomic::Ordering::SeqCst)
 	}
 
 	/// Syncs WAL data to disk using two-phase pattern:
@@ -608,7 +619,10 @@ impl WalManager {
 			wal.flush()?;
 			wal.sync_handle()
 		};
-		handle.sync()
+		handle.sync()?;
+		#[cfg(test)]
+		self.fsyncs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		Ok(())
 	}
 
 	/// Flushes WAL buffer to OS page cache (no fsync).

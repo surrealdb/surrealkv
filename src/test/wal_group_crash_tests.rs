@@ -11,11 +11,15 @@
 //! * a crash image cut at any byte of a coalesced group recovers a prefix of whole records, and the
 //!   commits made after that recovery survive another crash;
 //! * Immediate groups are fsynced before anyone is told, on the re-append path as well;
+//! * the values a WAL record points to are fsynced before the record is logged by a group that
+//!   syncs, in every value log file the group wrote to, and a sync of the WAL (`flush_wal`, close,
+//!   a memtable flush) syncs them too;
+//! * a failed value log write leaves nothing in the file, and the commits after it read back;
 //! * the flusher's reused buffers never carry bytes from one group into the next.
 //!
 //! Test-only instrumentation these tests need: `BufferedFileWriter::pending_sync` (and the
-//! `Writer` / `Wal` forwarders), and the failpoint `fail_after_ops` and the write counter
-//! `file_writes`.
+//! `Writer` / `Wal` forwarders), `WalManager::fsyncs`, `vlog::SYNCED_VLOG_FILES`, and the
+//! failpoints `VLog::fail_writes_after`, `VLog::fail_next_sync` and `VLog::set_sync_gap`.
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -562,6 +566,7 @@ mod short_write {
 
 	extern "C" {
 		fn setrlimit(resource: i32, rlp: *const Rlimit) -> i32;
+		fn getrlimit(resource: i32, rlp: *mut Rlimit) -> i32;
 		fn signal(signum: i32, handler: usize) -> usize;
 	}
 
@@ -580,6 +585,35 @@ mod short_write {
 				cur: bytes,
 				max: bytes,
 			};
+			assert_eq!(setrlimit(RLIMIT_FSIZE, &limit), 0);
+		}
+	}
+
+	/// Like `limit_file_size`, but only the soft limit, so it can be lifted again with
+	/// `lift_file_size_limit` (a transient failure: space that comes back).
+	fn soft_limit_file_size(bytes: u64) {
+		// SAFETY: as `limit_file_size`.
+		unsafe {
+			signal(SIGXFSZ, SIG_IGN);
+			let mut limit = Rlimit {
+				cur: 0,
+				max: 0,
+			};
+			assert_eq!(getrlimit(RLIMIT_FSIZE, &mut limit), 0);
+			limit.cur = bytes.min(limit.max);
+			assert_eq!(setrlimit(RLIMIT_FSIZE, &limit), 0);
+		}
+	}
+
+	fn lift_file_size_limit() {
+		// SAFETY: as `limit_file_size`.
+		unsafe {
+			let mut limit = Rlimit {
+				cur: 0,
+				max: 0,
+			};
+			assert_eq!(getrlimit(RLIMIT_FSIZE, &mut limit), 0);
+			limit.cur = limit.max;
 			assert_eq!(setrlimit(RLIMIT_FSIZE, &limit), 0);
 		}
 	}
@@ -672,6 +706,150 @@ mod short_write {
 
 		let tree = Arc::try_unwrap(tree).ok().expect("the writers are done");
 		crash(tree);
+	}
+
+	/// Child, vlog: a transient write failure in the middle of a large value of the value log,
+	/// then space comes back and a commit is acknowledged. That commit's value must read back.
+	#[test(tokio::test)]
+	async fn short_write_child_vlog() {
+		let Some(dir) = std::env::var_os(CHILD_DIR) else {
+			return;
+		};
+		let live = PathBuf::from(dir).join("vlog_tree");
+		let tree = Arc::new(
+			Tree::new(Arc::new(Options {
+				path: live.clone(),
+				flush_on_close: false,
+				enable_vlog: true,
+				vlog_value_threshold: 100,
+				..Default::default()
+			}))
+			.unwrap(),
+		);
+		let big = |i: usize| payload(700 + i, 100_000);
+		for i in 1..=2 {
+			put(&tree, &format!("k{i}"), &big(i), Durability::Immediate).await;
+		}
+		let size = fs::metadata(&vlog_files(&live)[0]).unwrap().len();
+		// The next value fits, the one after it crosses the limit part-way.
+		soft_limit_file_size(size + 150_000);
+		put(&tree, "k3", &big(3), Durability::Immediate).await;
+		let mut txn = tree.begin().unwrap();
+		txn.set_durability(Durability::Immediate);
+		txn.set(b"k4", big(4)).unwrap();
+		assert!(txn.commit().await.is_err(), "k4 crosses the limit and must fail");
+		// Space comes back.
+		lift_file_size_limit();
+		put(&tree, "k5", &big(5), Durability::Immediate).await;
+		let mut bad = Vec::new();
+		for i in [1usize, 2, 3, 5] {
+			let got = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+				tree.begin_with_mode(Mode::ReadOnly).unwrap().get(format!("k{i}").as_bytes())
+			}));
+			match got {
+				Ok(Ok(Some(v))) if v == big(i) => {}
+				Ok(Ok(Some(v))) => {
+					let first_diff = v.iter().zip(big(i)).position(|(a, b)| *a != b);
+					let is_the_failed_value = v.len() >= 40_000 && v[..40_000] == big(4)[..40_000];
+					bad.push(format!(
+						"k{i}: {} bytes, first difference at {first_diff:?}, starts with the failed k4 value: {is_the_failed_value}",
+						v.len()
+					));
+				}
+				other => {
+					bad.push(format!("k{i}: {:?}", other.map(|r| r.map(|v| v.map(|v| v.len())))))
+				}
+			}
+		}
+		let tree = Arc::try_unwrap(tree).ok().expect("the writers are done");
+		crash(tree);
+		assert!(
+			bad.is_empty(),
+			"acknowledged commits whose value does not read back after a transient vlog write \
+			 failure: {bad:?}"
+		);
+	}
+
+	/// A failed `write` in the middle of a vlog entry leaves part of the entry in the file. The
+	/// next entry must not be written after it, or its pointer, which names the offset the failed
+	/// entry started at, would point into the failed value. Run with a real short write.
+	#[test(tokio::test)]
+	async fn a_transient_vlog_write_failure_does_not_corrupt_the_next_acknowledged_value() {
+		if std::env::var_os(CHILD_DIR).is_some() {
+			return;
+		}
+		let dir = TempDir::new("wal_group_crash").unwrap();
+		let out = std::process::Command::new(std::env::current_exe().unwrap())
+			.args([
+				"--exact",
+				"test::wal_group_crash_tests::short_write::short_write_child_vlog",
+				"--test-threads=1",
+			])
+			.env(CHILD_DIR, dir.path())
+			.output()
+			.unwrap();
+		let stdout = String::from_utf8_lossy(&out.stdout);
+		let stderr = String::from_utf8_lossy(&out.stderr);
+		assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+		assert!(stdout.contains("1 passed"), "the child must have run:\n{stdout}");
+	}
+
+	/// Child, vlog level: the buffer of the writer holds an entry that fills it exactly, and the
+	/// disk is full when the next append has to write it out.
+	#[test]
+	fn short_write_child_vlog_full_buffer() {
+		let Some(dir) = std::env::var_os(CHILD_DIR) else {
+			return;
+		};
+		let opts = Options {
+			path: PathBuf::from(dir).join("vlog_full_buffer"),
+			vlog_max_file_size: 1 << 30,
+			vlog_checksum_verification: crate::VLogChecksumLevel::Full,
+			..Default::default()
+		};
+		fs::create_dir_all(opts.vlog_dir()).unwrap();
+		let vlog = crate::vlog::VLog::new(Arc::new(opts)).unwrap();
+		let seed = vlog.append(b"seed", b"seed").unwrap();
+		vlog.flush().unwrap();
+		let flushed = fs::metadata(vlog.vlog_file_path(seed.file_id)).unwrap().len();
+
+		// 8 bytes of header, a key of 5 bytes and 4 bytes of checksum fill the 8 KiB buffer.
+		let filling = payload(1, 8 * 1024 - 8 - 5 - 4);
+		soft_limit_file_size(flushed);
+		let buffered = vlog.append(b"key-1", &filling).unwrap();
+		assert!(vlog.append(b"key-2", &payload(2, 100)).is_err(), "the full buffer hits the limit");
+		lift_file_size_limit();
+		let after = vlog.append(b"key-3", &payload(3, 100)).unwrap();
+		vlog.sync().unwrap();
+		assert_eq!(vlog.get(&after).unwrap(), payload(3, 100));
+		assert!(
+			vlog.get(&buffered).is_ok_and(|got| got == filling),
+			"the entry that was in the buffer when a later append failed is lost"
+		);
+	}
+
+	/// A failed append that has to write out a full buffer does not lose the entry in it: the cut
+	/// that follows keeps it in the buffer without writing it, which would fail again while the
+	/// disk is full. Run with a real write failure.
+	#[test(tokio::test)]
+	async fn a_failed_append_behind_a_full_vlog_buffer_keeps_the_entry_in_it() {
+		if std::env::var_os(CHILD_DIR).is_some() {
+			return;
+		}
+		let dir = TempDir::new("wal_group_crash").unwrap();
+		let out = std::process::Command::new(std::env::current_exe().unwrap())
+			.args([
+				"--exact",
+				"test::wal_group_crash_tests::short_write::short_write_child_vlog_full_buffer",
+				"--test-threads=1",
+			])
+			.env(CHILD_DIR, dir.path())
+			.output()
+			.unwrap();
+		let stdout = String::from_utf8_lossy(&out.stdout);
+		let stderr = String::from_utf8_lossy(&out.stderr);
+		assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+		assert!(stdout.contains("1 passed"), "the child must have run:\n{stdout}");
 	}
 
 	/// Runs the two children under a file size limit in a process of their own (the limit is
@@ -1514,6 +1692,797 @@ async fn racing_writers_and_rotations_never_log_a_record_twice_into_one_segment(
 	release_lock(&recovered);
 	mark_closed(&tree);
 	release_lock(&tree);
+}
+
+// ---------------------------------------------------------------------------
+// vlog values and the WAL record that points to them
+// ---------------------------------------------------------------------------
+
+fn vlog_opts(path: &Path) -> Arc<Options> {
+	Arc::new(Options {
+		path: path.to_path_buf(),
+		flush_on_close: false,
+		enable_vlog: true,
+		vlog_value_threshold: 100,
+		vlog_max_file_size: 64 * 1024,
+		..Default::default()
+	})
+}
+
+fn fsynced_vlog_files(under: &Path) -> Vec<PathBuf> {
+	crate::vlog::SYNCED_VLOG_FILES.lock().iter().filter(|p| p.starts_with(under)).cloned().collect()
+}
+
+fn vlog_files(under: &Path) -> Vec<PathBuf> {
+	let mut files: Vec<PathBuf> = fs::read_dir(under.join("vlog"))
+		.map(|rd| rd.map(|e| e.unwrap().path()).collect())
+		.unwrap_or_default();
+	files.sort();
+	files
+}
+
+/// Control for the test below: with every value of an Immediate group in one vlog file, that
+/// file is fsynced before the group is acknowledged (so the probe works).
+#[test(tokio::test)]
+async fn control_vlog_values_of_an_immediate_group_are_fsynced() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	let entries: Vec<(String, Vec<u8>)> =
+		(0..2).map(|i| (format!("v{i}"), payload(i, 10_000))).collect();
+	for r in commit_group(&tree, &entries, Durability::Immediate).await {
+		r.unwrap();
+	}
+	let files = vlog_files(&live);
+	assert_eq!(files.len(), 1, "{files:?}");
+	let synced = fsynced_vlog_files(&live);
+	assert!(synced.contains(&files[0]), "{synced:?} vs {files:?}");
+	let tree = Arc::try_unwrap(tree).ok().expect("no other owner");
+	crash(tree);
+}
+
+/// An Immediate group whose values cross a vlog file rollover: the values before the rollover
+/// are in the old file. Every vlog file the group wrote to must be fsynced before the WAL
+/// record that points into it is, or a power loss after the acknowledgement leaves a record
+/// whose value is gone. The file the writer rolled over from is not the one that is active when
+/// the group syncs, and is fsynced with it all the same.
+#[test(tokio::test)]
+async fn vlog_values_of_an_immediate_group_are_fsynced_across_a_rollover() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	// 64 KiB per file: two 40 KB values fit the first file, and the third rolls over.
+	let entries: Vec<(String, Vec<u8>)> =
+		(0..3).map(|i| (format!("v{i}"), payload(i, 40_000))).collect();
+	for r in commit_group(&tree, &entries, Durability::Immediate).await {
+		r.unwrap();
+	}
+	let files = vlog_files(&live);
+	assert!(files.len() >= 2, "the group must have crossed a rollover: {files:?}");
+	let synced = fsynced_vlog_files(&live);
+	for file in &files {
+		assert!(
+			synced.contains(file),
+			"{} holds values of an acknowledged Immediate commit and was never fsynced \
+			 (fsynced: {synced:?})",
+			file.display()
+		);
+	}
+	let tree = Arc::try_unwrap(tree).ok().expect("no other owner");
+	crash(tree);
+}
+
+/// `Tree::flush_wal(true)` guarantees the durability of every commit before it: the WAL record
+/// of an Eventual commit with a large value points into the vlog, and that value is only
+/// flushed to the OS until something fsyncs it, so after a power loss the record could survive
+/// without its value.
+#[test(tokio::test)]
+async fn flush_wal_sync_fsyncs_the_vlog_values_the_wal_points_into() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	put(&tree, "big", &payload(1, 10_000), Durability::Eventual).await;
+	tree.flush_wal(true).unwrap();
+	let files = vlog_files(&live);
+	assert_eq!(files.len(), 1);
+	let synced = fsynced_vlog_files(&live);
+	assert!(
+		synced.contains(&files[0]),
+		"the WAL was fsynced but the vlog file its record points into was not: {synced:?}"
+	);
+	let tree = Arc::try_unwrap(tree).ok().expect("no other owner");
+	crash(tree);
+}
+
+/// A vlog entry, as (key, value).
+type VlogEntry = (Vec<u8>, Vec<u8>);
+
+/// The entries of a vlog file, and the length of the whole entries: the length of the file if it
+/// holds nothing but whole entries.
+fn vlog_entries(path: &Path) -> (Vec<VlogEntry>, usize) {
+	let bytes = fs::read(path).unwrap();
+	let mut at = crate::vlog::VLogFileHeader::new(0, 0, 0).encode().len();
+	let mut entries = Vec::new();
+	while at + 8 <= bytes.len() {
+		let key_len = u32::from_be_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+		let value_len = u32::from_be_bytes(bytes[at + 4..at + 8].try_into().unwrap()) as usize;
+		let (key_at, value_at) = (at + 8, at + 8 + key_len);
+		let end = value_at + value_len + 4;
+		if end > bytes.len() {
+			break;
+		}
+		let mut crc = crc32fast::Hasher::new();
+		crc.update(&bytes[key_at..value_at + value_len]);
+		if crc.finalize().to_be_bytes() != bytes[end - 4..end] {
+			break;
+		}
+		entries.push((
+			bytes[key_at..value_at].to_vec(),
+			bytes[value_at..value_at + value_len].to_vec(),
+		));
+		at = end;
+	}
+	(entries, at)
+}
+
+fn vlog_of(tree: &Tree) -> &Arc<crate::vlog::VLog> {
+	tree.core.inner.vlog.as_ref().expect("the tree has a value log")
+}
+
+/// Whether every `(key, value)` reads back from `tree`, and none of the `absent` keys exists.
+fn reads_back(tree: &Tree, present: &[(String, Vec<u8>)], absent: &[String]) -> Result<(), String> {
+	for (key, value) in present {
+		match tree.begin_with_mode(Mode::ReadOnly).unwrap().get(key.as_bytes()) {
+			Ok(Some(got)) if got == *value => {}
+			Ok(Some(got)) => return Err(format!("{key}: another value of {} bytes", got.len())),
+			other => return Err(format!("{key}: {:?}", other.map(|v| v.map(|v| v.len())))),
+		}
+	}
+	for key in absent {
+		if let Some(got) = get(tree, key) {
+			return Err(format!("{key} exists with {} bytes", got.len()));
+		}
+	}
+	Ok(())
+}
+
+/// A crash image of `live` (a copy of the directory), opened with `open`: every `present` key
+/// reads back from it, and no `absent` key exists.
+fn assert_crash_image(
+	open: fn(&Path) -> Arc<Options>,
+	live: &Path,
+	image: &Path,
+	present: &[(String, Vec<u8>)],
+	absent: &[String],
+) {
+	copy_dir(live, image);
+	let recovered = Tree::new(open(image)).unwrap();
+	reads_back(&recovered, present, absent).expect("the crash image");
+	mark_closed(&recovered);
+	release_lock(&recovered);
+}
+
+/// A write that fails part-way through the value of one commit (a full disk takes part of the
+/// write), and the commits after it once there is space again: the failed commit is not
+/// acknowledged, the later ones are, and their values read back, in the live tree and in a crash
+/// image, whose WAL holds their pointers. The failed entry's bytes are cut off the vlog file.
+#[test(tokio::test)]
+async fn a_failed_vlog_write_does_not_corrupt_the_acknowledged_values_after_it() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	let value = |i: usize| payload(700 + i, 30_000);
+	let ok = |i: usize| (format!("k{i}"), value(i));
+	for i in 1..=2 {
+		put(&tree, &ok(i).0, &ok(i).1, Durability::Immediate).await;
+	}
+
+	vlog_of(&tree).fail_writes_after(10_000);
+	let mut txn = tree.begin().unwrap();
+	txn.set_durability(Durability::Immediate);
+	txn.set(b"k3", value(3)).unwrap();
+	assert!(txn.commit().await.is_err(), "k3 crosses the failure and must fail");
+	for i in 4..=5 {
+		put(&tree, &ok(i).0, &ok(i).1, Durability::Immediate).await;
+	}
+
+	let present: Vec<_> = [1, 2, 4, 5].into_iter().map(ok).collect();
+	let absent = vec!["k3".to_string()];
+	reads_back(&tree, &present, &absent).expect("the live tree");
+	assert_crash_image(vlog_opts, &live, &dir.path().join("image"), &present, &absent);
+
+	for file in vlog_files(&live) {
+		let (entries, whole) = vlog_entries(&file);
+		assert_eq!(
+			whole as u64,
+			fs::metadata(&file).unwrap().len(),
+			"{file:?} holds only whole entries"
+		);
+		assert!(entries.iter().all(|(key, _)| !key.starts_with(b"k3")), "no byte of k3 is left");
+	}
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A write failure in the middle of the vlog entries of a group fails the group as a unit: no
+/// commit of it is acknowledged, its WAL segment is as it was (nothing was logged), and the
+/// entries it already appended are whole, unreferenced bytes in the vlog file that the commits
+/// after it simply follow.
+#[test(tokio::test)]
+async fn a_vlog_write_failure_in_the_middle_of_a_group_fails_it_and_logs_nothing() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	let first = ("first".to_string(), payload(1, 20_000));
+	put(&tree, &first.0, &first.1, Durability::Immediate).await;
+	let segment = seg_path(&live, active_segment(&tree));
+	let logged = fs::read(&segment).unwrap();
+
+	let group: Vec<(String, Vec<u8>)> =
+		(0..3).map(|i| (format!("g{i}"), payload(10 + i, 20_000))).collect();
+	// The first entry of the group is written whole, the second is cut.
+	vlog_of(&tree).fail_writes_after(30_000);
+	for result in commit_group(&tree, &group, Durability::Immediate).await {
+		assert!(result.is_err(), "no commit of the group is acknowledged");
+	}
+	assert_eq!(fs::read(&segment).unwrap(), logged, "a group that failed logged nothing");
+
+	let later = ("later".to_string(), payload(99, 20_000));
+	put(&tree, &later.0, &later.1, Durability::Immediate).await;
+	let present = vec![first.clone(), later.clone()];
+	let absent: Vec<String> = group.iter().map(|(key, _)| key.clone()).collect();
+	reads_back(&tree, &present, &absent).expect("the live tree");
+	assert_crash_image(vlog_opts, &live, &dir.path().join("image"), &present, &absent);
+
+	let files = vlog_files(&live);
+	let (entries, whole) = vlog_entries(&files[0]);
+	assert_eq!(whole as u64, fs::metadata(&files[0]).unwrap().len(), "only whole entries");
+	let values: Vec<&Vec<u8>> = entries.iter().map(|(_, value)| value).collect();
+	assert_eq!(
+		values,
+		vec![&first.1, &group[0].1, &later.1],
+		"the entry of the group that was whole stays as an orphan; the cut one is gone"
+	);
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A vlog that fails to fsync fails an Immediate group before it writes to the WAL, so a
+/// record that was reported failed cannot be replayed after a crash, and a record that is in
+/// the WAL never points at a value that is not on disk.
+#[test(tokio::test)]
+async fn a_failed_vlog_fsync_fails_the_group_before_the_wal_is_written() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	let first = ("first".to_string(), payload(1, 10_000));
+	put(&tree, &first.0, &first.1, Durability::Immediate).await;
+	let segment = seg_path(&live, active_segment(&tree));
+	let logged = fs::read(&segment).unwrap();
+
+	let group: Vec<(String, Vec<u8>)> =
+		(0..3).map(|i| (format!("g{i}"), payload(10 + i, 10_000))).collect();
+	vlog_of(&tree).fail_next_sync();
+	for result in commit_group(&tree, &group, Durability::Immediate).await {
+		assert!(result.is_err(), "no commit of the group is acknowledged");
+	}
+	assert_eq!(fs::read(&segment).unwrap(), logged, "a group that failed logged nothing");
+
+	let later = ("later".to_string(), payload(99, 10_000));
+	put(&tree, &later.0, &later.1, Durability::Immediate).await;
+	let absent: Vec<String> = group.iter().map(|(key, _)| key.clone()).collect();
+	assert_crash_image(vlog_opts, &live, &dir.path().join("image"), &[first, later], &absent);
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// Three Eventual commits of 40 KB into vlog files of 64 KB: the third rolls the file over.
+/// Nothing is fsynced by them, the rollover included.
+async fn eventual_commits_across_a_rollover(live: &Path) -> Arc<Tree> {
+	let tree = Arc::new(Tree::new(vlog_opts(live)).unwrap());
+	for i in 0..3 {
+		put(&tree, &format!("e{i}"), &payload(i, 40_000), Durability::Eventual).await;
+	}
+	assert_eq!(vlog_files(live).len(), 2, "the third value rolled the file over");
+	assert!(fsynced_vlog_files(live).is_empty(), "an Eventual commit fsyncs nothing");
+	tree
+}
+
+fn assert_both_vlog_files_fsynced(live: &Path, when: &str) {
+	let synced = fsynced_vlog_files(live);
+	for file in vlog_files(live) {
+		assert!(
+			synced.contains(&file),
+			"{} was not fsynced {when} (fsynced: {synced:?})",
+			file.display()
+		);
+	}
+}
+
+/// An Immediate commit that follows Eventual ones fsyncs the value log file they rolled over
+/// from: its WAL fsync makes their records durable, and so their values have to be.
+#[test(tokio::test)]
+async fn an_immediate_commit_fsyncs_the_vlog_file_eventual_commits_rolled_over_from() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	put(&tree, "immediate", &payload(9, 10_000), Durability::Immediate).await;
+	assert_both_vlog_files_fsynced(&live, "by the Immediate commit");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// `flush_wal(true)` fsyncs every vlog file with values that the WAL points into, not only the
+/// active one.
+#[test(tokio::test)]
+async fn flush_wal_sync_fsyncs_the_vlog_file_eventual_commits_rolled_over_from() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	tree.flush_wal(true).unwrap();
+	assert_both_vlog_files_fsynced(&live, "by flush_wal(true)");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// Closing the tree fsyncs every vlog file before the WAL is closed, the one rolled over from
+/// too.
+#[test(tokio::test)]
+async fn close_fsyncs_every_vlog_file() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	tree.close().await.unwrap();
+	assert_both_vlog_files_fsynced(&live, "by close");
+}
+
+/// A memtable flush fsyncs every vlog file before the SST that points into them is installed and
+/// the WAL segment it replaces can be deleted.
+#[test(tokio::test)]
+async fn a_memtable_flush_fsyncs_every_vlog_file() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	tree.flush().unwrap();
+	assert_both_vlog_files_fsynced(&live, "by the memtable flush");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+fn len_of(path: &Path) -> u64 {
+	fs::metadata(path).unwrap().len()
+}
+
+/// `flush_wal(true)` fsyncs the vlog before the WAL: when the vlog is fsynced the WAL is not, so
+/// a record is never durable ahead of its value, and a vlog that cannot be fsynced fails the call
+/// before the WAL is fsynced.
+#[test(tokio::test)]
+async fn flush_wal_sync_fsyncs_the_vlog_before_the_wal() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	put(&tree, "first", &payload(1, 10_000), Durability::Eventual).await;
+	let inner = Arc::clone(&tree.core.inner);
+	let vlog = inner.vlog.as_ref().unwrap();
+	let before = inner.wal.fsyncs();
+
+	let at_vlog_sync = Arc::new(Mutex::new(None));
+	{
+		let (inner, at_vlog_sync) = (Arc::downgrade(&inner), Arc::clone(&at_vlog_sync));
+		vlog.set_sync_gap(Some(Arc::new(move || {
+			*at_vlog_sync.lock().unwrap() = Some(inner.upgrade().unwrap().wal.fsyncs());
+		})));
+	}
+	tree.flush_wal(true).unwrap();
+	vlog.set_sync_gap(None);
+	assert_eq!(*at_vlog_sync.lock().unwrap(), Some(before), "the WAL was fsynced before the vlog");
+	assert_eq!(inner.wal.fsyncs(), before + 1, "the probe: flush_wal(true) fsyncs the WAL");
+
+	put(&tree, "second", &payload(2, 10_000), Durability::Eventual).await;
+	vlog.fail_next_sync();
+	assert!(tree.flush_wal(true).is_err(), "the vlog fsync failed");
+	assert_eq!(inner.wal.fsyncs(), before + 1, "the WAL was fsynced although the vlog was not");
+	drop(inner);
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// `flush_wal(false)` flushes the vlog buffer to the OS, as its documentation says, and fsyncs
+/// nothing.
+#[test(tokio::test)]
+async fn flush_wal_without_sync_flushes_the_vlog_buffer_and_fsyncs_nothing() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	put(&tree, "big", &payload(1, 10_000), Durability::Eventual).await;
+	let vlog = vlog_of(&tree);
+	let file = vlog_files(&live).remove(0);
+	let pointer = vlog.append(b"direct", &[7u8; 300]).unwrap();
+	assert_eq!(len_of(&file), pointer.offset, "the entry is still in the buffer");
+
+	tree.flush_wal(false).unwrap();
+	assert_eq!(len_of(&file), pointer.offset + pointer.total_entry_size(), "the entry was written");
+	assert!(fsynced_vlog_files(&live).is_empty(), "flush_wal(false) fsyncs nothing");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A group that syncs fsyncs the vlog after it wrote its values to it, not before: when the last
+/// fsync of each file started, the file was as long as it is now.
+#[test(tokio::test)]
+async fn an_immediate_group_fsyncs_its_vlog_values_after_it_wrote_them() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	// A writer and a file that have been fsynced before, so that an fsync which came first would
+	// not find the file missing.
+	put(&tree, "warm-up", &payload(9, 10_000), Durability::Immediate).await;
+	let lengths: Arc<Mutex<Vec<(PathBuf, u64)>>> = Arc::default();
+	{
+		let (lengths, vlog_dir) = (Arc::clone(&lengths), live.join("vlog"));
+		vlog_of(&tree).set_sync_gap(Some(Arc::new(move || {
+			let mut lengths = lengths.lock().unwrap();
+			lengths.clear();
+			for entry in fs::read_dir(&vlog_dir).unwrap() {
+				let path = entry.unwrap().path();
+				lengths.push((path.clone(), len_of(&path)));
+			}
+		})));
+	}
+	let entries: Vec<(String, Vec<u8>)> =
+		(0..3).map(|i| (format!("k{i}"), payload(i, 40_000))).collect();
+	for result in commit_group(&tree, &entries, Durability::Immediate).await {
+		result.unwrap();
+	}
+
+	let files = vlog_files(&live);
+	assert_eq!(files.len(), 2, "the values rolled the file over");
+	let lengths = lengths.lock().unwrap().clone();
+	for file in files {
+		let at_the_fsync = lengths.iter().find(|(path, _)| *path == file).map(|(_, len)| *len);
+		assert_eq!(
+			at_the_fsync,
+			Some(len_of(&file)),
+			"{} grew after the last fsync that was meant to cover it",
+			file.display()
+		);
+	}
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A batch too big for a memtable is written straight to an L0 table, which points into the
+/// vlog files of its values (several here: the batch is bigger than a file). Every one of them is
+/// fsynced before the table is installed, not only the active one, though the commit is Eventual
+/// and nothing else fsyncs them.
+#[test(tokio::test)]
+async fn an_oversized_batch_written_straight_to_l0_fsyncs_every_vlog_file() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(
+		Tree::new(Arc::new(Options {
+			max_memtable_size: 64 * 1024,
+			..Arc::try_unwrap(vlog_opts(&live)).ok().unwrap()
+		}))
+		.unwrap(),
+	);
+	let mut txn = tree.begin().unwrap();
+	txn.set_durability(Durability::Eventual);
+	for i in 0..1_000 {
+		txn.set(format!("oversized_key_{i:06}").as_bytes(), payload(i, 300)).unwrap();
+	}
+	txn.commit().await.unwrap();
+
+	let tables = tree.core.inner.level_manifest.read().unwrap().get_all_tables().len();
+	assert!(tables > 0, "the batch went straight to an L0 table");
+	let files = vlog_files(&live);
+	assert!(files.len() >= 3, "the values of the batch are in several files: {files:?}");
+	let synced = fsynced_vlog_files(&live);
+	for file in &files {
+		assert!(
+			synced.contains(file),
+			"{} was not fsynced before the table that points into it was installed: {synced:?}",
+			file.display()
+		);
+	}
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A value log write that fails while the group is being flushed to the OS (the value is small
+/// enough to sit in the buffer until then), not while it is appended. The failed commit is not
+/// acknowledged, the entry it appended stays whole in the file behind the next commit's, and
+/// every acknowledged value is where its pointer says.
+#[test(tokio::test)]
+async fn a_failed_flush_of_a_buffered_vlog_value_fails_the_commit_and_the_next_ones_read_back() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	let mut present = Vec::new();
+	for i in 0..2 {
+		put(&tree, &format!("a{i}"), &payload(i, 1_500), Durability::Eventual).await;
+		present.push((format!("a{i}"), payload(i, 1_500)));
+	}
+
+	// The next flush takes 100 bytes of the buffered entry and then fails.
+	vlog_of(&tree).fail_writes_after(100);
+	let failed = [("failed".to_string(), payload(50, 1_500))];
+	assert!(commit_group(&tree, &failed, Durability::Eventual).await[0].is_err());
+	assert_eq!(get(&tree, "failed"), None);
+
+	for i in 2..5 {
+		put(&tree, &format!("a{i}"), &payload(i, 1_500), Durability::Eventual).await;
+		present.push((format!("a{i}"), payload(i, 1_500)));
+	}
+	let absent = vec!["failed".to_string()];
+	reads_back(&tree, &present, &absent).expect("the live tree");
+	for file in vlog_files(&live) {
+		assert_eq!(
+			vlog_entries(&file).1 as u64,
+			len_of(&file),
+			"{file:?} holds only whole entries"
+		);
+	}
+	assert_crash_image(vlog_opts, &live, &dir.path().join("image"), &present, &absent);
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// The first fsync of a sync is the one of the file the writer rolled over from. When it fails,
+/// the Immediate group fails before it logs anything, and the commit after it fsyncs that file
+/// again.
+#[test(tokio::test)]
+async fn a_failed_fsync_of_the_vlog_file_rolled_over_from_is_retried_by_the_next_commit() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	let present: Vec<_> = (0..3).map(|i| (format!("e{i}"), payload(i, 40_000))).collect();
+	let files = vlog_files(&live);
+	let segment = seg_path(&live, active_segment(&tree));
+	let logged = fs::read(&segment).unwrap();
+
+	vlog_of(&tree).fail_next_sync();
+	let failed = [("failed".to_string(), payload(60, 10_000))];
+	assert!(commit_group(&tree, &failed, Durability::Immediate).await[0].is_err());
+	assert_eq!(fs::read(&segment).unwrap(), logged, "a failed fsync logs nothing");
+	assert!(!fsynced_vlog_files(&live).contains(&files[0]), "the old file's fsync failed");
+
+	put(&tree, "later", &payload(61, 10_000), Durability::Immediate).await;
+	assert_both_vlog_files_fsynced(&live, "by the commit after the failed one");
+	let present: Vec<_> =
+		present.into_iter().chain([("later".to_string(), payload(61, 10_000))]).collect();
+	assert_crash_image(
+		vlog_opts,
+		&live,
+		&dir.path().join("image"),
+		&present,
+		&["failed".to_string()],
+	);
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A writer that is poisoned when an Immediate group arrives is replaced by a new file, and the
+/// file it leaves is fsynced by that group: the group's WAL fsync makes the records of the
+/// Eventual commits before it durable.
+#[test(tokio::test)]
+async fn an_immediate_commit_after_a_poisoned_vlog_writer_fsyncs_the_file_it_left() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	put(&tree, "e0", &payload(0, 10_000), Durability::Eventual).await;
+	vlog_of(&tree).writer.write().as_mut().unwrap().poison();
+	put(&tree, "i0", &payload(1, 10_000), Durability::Immediate).await;
+
+	assert_eq!(vlog_files(&live).len(), 2);
+	assert_both_vlog_files_fsynced(&live, "by the Immediate commit");
+	let present =
+		vec![("e0".to_string(), payload(0, 10_000)), ("i0".to_string(), payload(1, 10_000))];
+	assert_crash_image(vlog_opts, &live, &dir.path().join("image"), &present, &[]);
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// Sealing a WAL segment fsyncs it, so the values its Eventual records point to have to be
+/// fsynced with it: after a power loss a record could survive without its value.
+#[test(tokio::test)]
+#[ignore = "Wal::rotate fsyncs the sealed segment without syncing the vlog first"]
+async fn sealing_a_wal_segment_fsyncs_the_vlog_values_its_records_point_into() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	// No memtable flush may run behind the test's back: it would fsync the vlog itself.
+	stop_background_tasks(&tree).await;
+	tree.core.inner.rotate_memtable().unwrap();
+	assert_both_vlog_files_fsynced(&live, "by the rotation that fsynced the segment");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+fn model_opts(path: &Path) -> Arc<Options> {
+	Arc::new(Options {
+		path: path.to_path_buf(),
+		flush_on_close: false,
+		enable_vlog: true,
+		vlog_value_threshold: 100,
+		vlog_max_file_size: 48 * 1024,
+		max_memtable_size: 200_000,
+		memtable_stall_threshold: 100_000,
+		level0_max_files: 10_000,
+		l0_stall_threshold: 10_000,
+		..Default::default()
+	})
+}
+
+/// A random run of commits (Eventual and Immediate, values from a few bytes to 40 KB, one to
+/// three keys each) with value log write failures and fsync failures armed at random, `flush_wal`
+/// and memtable flushes in between, against a model of what was acknowledged. After every step
+/// the live tree, and every few steps a crash image, must hold exactly the model: every
+/// acknowledged value, and nothing of a commit that failed.
+#[test(tokio::test)]
+async fn random_commits_with_vlog_failures_match_the_model_live_and_in_crash_images() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(model_opts(&live)).unwrap());
+	// No memtable flush behind the test's back: a failure armed here would land in it.
+	stop_background_tasks(&tree).await;
+
+	let mut rng = Rng(0x9E37_79B9 ^ 0x1_0000_0001);
+	let mut model: Vec<(String, Vec<u8>)> = Vec::new();
+	let mut failed: Vec<String> = Vec::new();
+	let (mut acknowledged, mut rejected) = (0, 0);
+	for step in 0..40usize {
+		match rng.below(12) {
+			0 => {
+				tree.flush_wal(rng.below(2) == 0).ok();
+			}
+			1 => {
+				tree.flush().ok();
+			}
+			_ => {
+				if rng.below(4) == 0 {
+					vlog_of(&tree).fail_writes_after(rng.below(30_000));
+				}
+				if rng.below(8) == 0 {
+					vlog_of(&tree).fail_next_sync();
+				}
+				let durability = if rng.below(2) == 0 {
+					Durability::Eventual
+				} else {
+					Durability::Immediate
+				};
+				let mut txn = tree.begin().unwrap();
+				txn.set_durability(durability);
+				let mut writes = Vec::new();
+				for n in 0..1 + rng.below(3) {
+					// A new key, or one of the last few again.
+					let key = if rng.below(3) == 0 && step > 3 {
+						format!("k{}", step - 1 - rng.below(3))
+					} else {
+						format!("k{step}_{n}")
+					};
+					let len = match rng.below(4) {
+						0 => 5 + rng.below(90),
+						1 => 101 + rng.below(3_000),
+						2 => 8_000 + rng.below(4_000),
+						_ => 20_000 + rng.below(20_000),
+					};
+					let value = payload(step * 10 + n, len);
+					txn.set(key.as_bytes(), &value).unwrap();
+					writes.push((key, value));
+				}
+				if txn.commit().await.is_ok() {
+					acknowledged += 1;
+					model.retain(|(key, _)| writes.iter().all(|(written, _)| written != key));
+					model.extend(writes);
+				} else {
+					rejected += 1;
+					failed.extend(writes.into_iter().map(|(key, _)| key));
+				}
+			}
+		}
+
+		let absent: Vec<String> =
+			failed.iter().filter(|key| model.iter().all(|(k, _)| k != *key)).cloned().collect();
+		reads_back(&tree, &model, &[]).unwrap_or_else(|e| panic!("step {step}, live: {e}"));
+		if step % 8 == 7 {
+			let image = dir.path().join(format!("image{step}"));
+			assert_crash_image(model_opts, &live, &image, &model, &absent);
+			fs::remove_dir_all(&image).unwrap();
+		}
+	}
+	assert!(rejected > 2 && acknowledged > 12, "{acknowledged} acknowledged, {rejected} failed");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+const POOL_CHILD: &str = "SKV_VLOG_POOL_CHILD";
+
+/// Writers (Eventual and Immediate, values of 5 to 30 KB into vlog files of 48 KB, memtables of
+/// 200 KB, so rotations and memtable flushes run), `flush_wal` and `flush` callers and the
+/// background tasks all run at once on a multi-threaded runtime: nothing deadlocks or fails, and
+/// every acknowledged value is in the live tree and in a crash image.
+async fn writers_flush_wal_and_memtable_flushes_together() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(model_opts(&live)).unwrap());
+	let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+	let writers: Vec<_> = (0..4usize)
+		.map(|w| {
+			let tree = Arc::clone(&tree);
+			tokio::spawn(async move {
+				let mut rng = Rng(0xABCD + w as u64);
+				let mut acked = Vec::new();
+				for n in 0..30usize {
+					let (key, value) =
+						(format!("w{w}_{n}"), payload(w * 1000 + n, 5_000 + rng.below(25_000)));
+					let durability = if rng.below(3) == 0 {
+						Durability::Immediate
+					} else {
+						Durability::Eventual
+					};
+					put(&tree, &key, &value, durability).await;
+					acked.push((key, value));
+				}
+				acked
+			})
+		})
+		.collect();
+	let flusher = {
+		let (tree, stop) = (Arc::clone(&tree), Arc::clone(&stop));
+		tokio::task::spawn_blocking(move || {
+			let mut rounds = 0;
+			while !stop.load(Ordering::SeqCst) {
+				tree.flush_wal(rounds % 2 == 0).unwrap();
+				if rounds % 5 == 4 {
+					tree.flush().unwrap();
+				}
+				rounds += 1;
+				std::thread::sleep(std::time::Duration::from_millis(2));
+			}
+			rounds
+		})
+	};
+
+	let mut acked = Vec::new();
+	let all = async {
+		for writer in writers {
+			acked.extend(writer.await.unwrap());
+		}
+	};
+	tokio::time::timeout(std::time::Duration::from_secs(120), all)
+		.await
+		.expect("the writers did not finish: a lock is held");
+	stop.store(true, Ordering::SeqCst);
+	assert!(flusher.await.unwrap() > 3, "the flush_wal caller must have run");
+
+	reads_back(&tree, &acked, &[]).expect("the live tree");
+	tree.flush_wal(true).unwrap();
+	assert_crash_image(model_opts, &live, &dir.path().join("image"), &acked, &[]);
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn writers_flush_wal_and_memtable_flushes_together_neither_deadlock_nor_lose_values() {
+	if std::env::var_os(POOL_CHILD).is_none() {
+		writers_flush_wal_and_memtable_flushes_together().await;
+	}
+}
+
+/// The same in a process of its own with a global affinitypool installed, as a server has: the
+/// WAL appends and fsyncs then run on pool threads, while the vlog is fsynced inline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn child_writers_flush_wal_and_memtable_flushes_with_a_global_pool() {
+	if std::env::var_os(POOL_CHILD).is_some() {
+		affinitypool::Builder::new().worker_threads(2).build().build_global().unwrap();
+		writers_flush_wal_and_memtable_flushes_together().await;
+	}
+}
+
+#[test]
+fn writers_flush_wal_and_memtable_flushes_with_a_global_pool() {
+	if std::env::var_os(POOL_CHILD).is_some() {
+		return;
+	}
+	let out = std::process::Command::new(std::env::current_exe().unwrap())
+		.args([
+			"--exact",
+			"test::wal_group_crash_tests::child_writers_flush_wal_and_memtable_flushes_with_a_global_pool",
+			"--test-threads=1",
+		])
+		.env(POOL_CHILD, "1")
+		.output()
+		.unwrap();
+	let stdout = String::from_utf8_lossy(&out.stdout);
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(out.status.success(), "child failed:\n{stdout}\n{stderr}");
+	assert!(stdout.contains("1 passed"), "the child must have run:\n{stdout}");
 }
 
 // ---------------------------------------------------------------------------
