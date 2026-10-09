@@ -1484,7 +1484,6 @@ dependencies = [
  "aes-gcm",
  "affinitypool",
  "artmap",
- "async-trait",
  "blake3",
  "bytes",
  "byteslice",

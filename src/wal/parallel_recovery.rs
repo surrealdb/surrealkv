@@ -87,7 +87,7 @@ pub(crate) fn replay_segments_sync(
 					&mut memtables,
 				)?;
 			}
-			memtables.push((current_memtable, seg.id));
+			memtables.push((current_memtable, false, seg.id));
 		}
 		Ok((max_seq, memtables))
 	}
