@@ -64,6 +64,8 @@ pub mod wal_decode_tests;
 pub mod wal_rotation_tests;
 #[cfg(test)]
 pub mod wal_tests;
+#[cfg(test)]
+pub mod wal_torn_tail_tests;
 
 /// Collects all (key, value) pairs from an LSMIterator into a Vec
 /// Assumes iterator is already positioned (e.g., after seek_first or seek)
