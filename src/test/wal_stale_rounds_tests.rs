@@ -1456,16 +1456,19 @@ impl Storm {
 			}
 		}
 		let probe = {
-			let rotations = Arc::clone(&rotations);
+			let inner = Arc::clone(&tree.core.inner);
 			install(
 				&tree,
 				move |_| {
 					if !gated {
 						return;
 					}
-					let seen = rotations.load(Ordering::SeqCst);
+					// Wait for the active segment to change, so the records of this group are in an
+					// older one by the time they are applied. A rotation of an empty memtable
+					// changes nothing, so the number of rotations would not guarantee it.
+					let seen = inner.wal.read().get_active_log_number();
 					let waited = Instant::now();
-					while rotations.load(Ordering::SeqCst) == seen
+					while inner.wal.read().get_active_log_number() == seen
 						&& waited.elapsed() < Duration::from_secs(5)
 					{
 						std::thread::sleep(Duration::from_micros(100));
