@@ -118,6 +118,15 @@ impl CommitEntry {
 		self.state.store(ABORTED, Ordering::SeqCst);
 	}
 
+	/// Aborts the entry unless it was decided, and returns whether it did.
+	pub(crate) fn abort_if_in_flight(&self) -> bool {
+		self.state.load(Ordering::SeqCst) == IN_FLIGHT
+			&& self
+				.state
+				.compare_exchange(IN_FLIGHT, ABORTED, Ordering::SeqCst, Ordering::SeqCst)
+				.is_ok()
+	}
+
 	/// Marks a durable, applied commit visible at `max_seq`. Must only be
 	/// called after `visible_seq_num` has covered `max_seq`.
 	pub(crate) fn make_visible(&self, max_seq: u64) {

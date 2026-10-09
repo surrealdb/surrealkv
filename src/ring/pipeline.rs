@@ -44,6 +44,24 @@ pub(crate) enum PipelineHook {
 #[cfg(test)]
 pub(crate) type PipelineHookFn = Arc<dyn Fn(PipelineHook) + Send + Sync>;
 
+/// Observation points in a committer's path through `commit`, so tests can hold a commit at an
+/// exact step while the pipeline shuts down.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitStage {
+	/// The commit passed the shutdown and write stall checks and has not asked for admission.
+	Entered,
+	/// The commit holds an admission permit and has not claimed a ring sequence.
+	Admitted,
+	/// The commit claimed its sequence and validated, and has not been accepted.
+	Validated,
+	/// The commit was accepted and waits for the flusher.
+	Accepted,
+}
+
+#[cfg(test)]
+pub(crate) type CommitHookFn = Arc<dyn Fn(CommitStage) + Send + Sync>;
+
 /// The most bytes of batches the flusher gathers into one group, as `Batch::encoded_len_hint`
 /// counts them, unless the first entry alone is bigger: that entry is a group of its own.
 ///
@@ -73,6 +91,10 @@ fn try_reserve_wal(buf: &mut Vec<u8>, bytes: usize) -> Result<()> {
 	buf.try_reserve_exact(bytes).map_err(|e| Error::Io(Arc::new(std::io::Error::from(e))))
 }
 
+/// How many commits may be admitted at once: one admission permit each. At most half the
+/// ring's capacity of entries then sit above the completed prefix.
+pub(super) const ADMISSION_PERMITS: u32 = (DEFAULT_COMMIT_RING_CAPACITY / 2) as u32;
+
 /// How many times in a row a group may find its records in a segment other than the active
 /// memtable's tag, with nothing applied in between, and log them again off the memtable's lock.
 /// One pass past a rotation fixes it. If rotations keep overtaking the group, the next pass is
@@ -94,6 +116,24 @@ enum ApplyStop {
 	Stale {
 		active_tag: u64,
 	},
+}
+
+/// Holds an entry its committer claimed until the committer has a verdict for it. If the
+/// committer goes away first the entry is aborted, so that the flusher, which drains the
+/// ring in order, is not left waiting at it forever. The window from the claim to the
+/// verdict holds no await, so only a panic can end it early.
+struct ClaimGuard<'a> {
+	pipeline: &'a CommitPipeline,
+	entry: &'a CommitEntry,
+}
+
+impl Drop for ClaimGuard<'_> {
+	fn drop(&mut self) {
+		if self.entry.abort_if_in_flight() {
+			self.pipeline.ring.advance_completed();
+			self.pipeline.notify_flusher.notify_one();
+		}
+	}
 }
 
 /// Coordinates OCC conflict detection over the commit ring with the
@@ -124,7 +164,8 @@ pub(crate) struct CommitPipeline {
 	/// completed prefix has passed it. At most half the ring's capacity of
 	/// entries therefore sit above the completed prefix, so the previous
 	/// occupant of a slot being claimed is always complete and publishing
-	/// never waits on the flusher.
+	/// never waits on the flusher. At shutdown the flusher takes every permit,
+	/// which tells it that no admitted commit is left, and closes the semaphore.
 	admission: Arc<Semaphore>,
 	pub(crate) inner: Arc<CoreInner>,
 	pub(crate) write_stall: Arc<WriteStallController>,
@@ -145,6 +186,13 @@ pub(crate) struct CommitPipeline {
 	/// Test-only observer of `flush_group` steps.
 	#[cfg(test)]
 	hook: Mutex<Option<PipelineHookFn>>,
+	/// Test-only observer of a committer's steps.
+	#[cfg(test)]
+	commit_hook: Mutex<Option<CommitHookFn>>,
+	/// Test-only count of the times the flusher found nothing to drain at shutdown and began to
+	/// wait for the admitted commits.
+	#[cfg(test)]
+	shutdown_waits: AtomicU64,
 	/// Test-only failpoint: a WAL buffer of at least this many bytes is refused, as if the
 	/// allocator had none to give. `usize::MAX` disables it.
 	#[cfg(test)]
@@ -169,7 +217,7 @@ impl CommitPipeline {
 		start_seq: u64,
 	) -> Self {
 		let ring = CommitRing::new(DEFAULT_COMMIT_RING_CAPACITY, 1);
-		let admission = Arc::new(Semaphore::new(DEFAULT_COMMIT_RING_CAPACITY / 2));
+		let admission = Arc::new(Semaphore::new(ADMISSION_PERMITS as usize));
 		let notify_flusher = Arc::new(Notify::new());
 		let seq = start_seq.max(1);
 		let log_store = Arc::new(AffinityLogStore::new(Arc::clone(&inner.wal.inner)));
@@ -189,6 +237,10 @@ impl CommitPipeline {
 			log_store,
 			#[cfg(test)]
 			hook: Mutex::new(None),
+			#[cfg(test)]
+			commit_hook: Mutex::new(None),
+			#[cfg(test)]
+			shutdown_waits: AtomicU64::new(0),
 			#[cfg(test)]
 			wal_reserve_fails_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
 		}
@@ -241,6 +293,26 @@ impl CommitPipeline {
 		}
 	}
 
+	/// Installs (or clears) the observer called at each `CommitStage`.
+	#[cfg(test)]
+	pub(crate) fn set_commit_hook(&self, hook: Option<CommitHookFn>) {
+		*self.commit_hook.lock() = hook;
+	}
+
+	#[cfg(test)]
+	fn fire_commit(&self, stage: CommitStage) {
+		let hook = self.commit_hook.lock().clone();
+		if let Some(hook) = hook {
+			hook(stage);
+		}
+	}
+
+	/// How many times the flusher began to wait, at shutdown, for the admitted commits.
+	#[cfg(test)]
+	pub(crate) fn shutdown_waits(&self) -> u64 {
+		self.shutdown_waits.load(Ordering::SeqCst)
+	}
+
 	/// Starts the background flusher task.
 	pub(crate) fn start_flusher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
 		let pipeline = Arc::clone(self);
@@ -274,17 +346,21 @@ impl CommitPipeline {
 		if read_keys.is_empty() {
 			return Ok(());
 		}
+		if self.shutdown.load(Ordering::Acquire) {
+			return Err(Error::PipelineStall);
+		}
 		let read_bloom = bloom_of(read_keys);
 		let permit =
 			Arc::clone(&self.admission).acquire_owned().await.map_err(|_| Error::PipelineStall)?;
-		// The claimed sequence bounds the window; the entry publishes nothing.
+		// The claimed sequence bounds the window; the entry publishes nothing, so the guard
+		// aborts it once it is validated.
 		let entry = Arc::new(CommitEntry::new(Vec::new(), permit));
 		let seq = self.publish(&entry);
-		let result = self.validate(&entry, seq, start_seq, window, read_keys, &read_bloom);
-		entry.abort();
-		self.ring.advance_completed();
-		self.notify_flusher.notify_one();
-		result
+		let _claim = ClaimGuard {
+			pipeline: self,
+			entry: &entry,
+		};
+		self.validate(&entry, seq, start_seq, window, read_keys, &read_bloom)
 	}
 
 	/// Commits a batch through the commit ring and the group-commit flusher.
@@ -311,6 +387,9 @@ impl CommitPipeline {
 		// Write stall backpressure
 		self.write_stall.check().await?;
 
+		#[cfg(test)]
+		self.fire_commit(CommitStage::Entered);
+
 		// The last suspension point before the entry is claimed: from here to
 		// the verdict nothing awaits, so a cancelled commit can never leave a
 		// claimed entry unpublished or undecided.
@@ -321,19 +400,23 @@ impl CommitPipeline {
 		if self.restoring.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
+		#[cfg(test)]
+		self.fire_commit(CommitStage::Admitted);
 
 		let write_keys: Vec<Key> = batch.entries.iter().map(|e| e.key.clone()).collect();
 		let read_bloom = bloom_of(read_set);
 		let entry = Arc::new(CommitEntry::new(write_keys, permit));
 		let seq = self.publish(&entry);
 
-		if let Err(e) = self.validate(&entry, seq, start_seq, window, read_set, &read_bloom) {
-			entry.abort();
-			self.ring.advance_completed();
-			self.notify_flusher.notify_one();
-			return Err(e);
-		}
+		// A conflict aborts the entry, and so does a committer that fails before its verdict.
+		let claim = ClaimGuard {
+			pipeline: self,
+			entry: &entry,
+		};
+		self.validate(&entry, seq, start_seq, window, read_set, &read_bloom)?;
 
+		#[cfg(test)]
+		self.fire_commit(CommitStage::Validated);
 		let (complete_tx, complete_rx) = oneshot::channel();
 		entry.accept(Payload {
 			batch,
@@ -341,7 +424,11 @@ impl CommitPipeline {
 			complete_tx,
 			epoch: self.restore_epoch.load(Ordering::SeqCst),
 		});
+		// The entry is decided, and the flusher takes it from here.
+		drop(claim);
 		self.notify_flusher.notify_one();
+		#[cfg(test)]
+		self.fire_commit(CommitStage::Accepted);
 
 		// Await durability & memtable application
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
@@ -410,9 +497,11 @@ impl CommitPipeline {
 	async fn run_flusher(&self) {
 		// The last ring sequence the flusher has consumed.
 		let mut drained = self.ring.completed();
+		// Completes once every admission permit is back, which is once no commit is admitted
+		// and undecided. Only polled at shutdown.
+		let mut all_permits =
+			std::pin::pin!(Arc::clone(&self.admission).acquire_many_owned(ADMISSION_PERMITS));
 		loop {
-			let shutdown = self.shutdown.load(Ordering::Acquire);
-
 			// Gather the contiguous decided entries after `drained`, with the permits to
 			// release once the completed prefix passes them. The group stops before the entry
 			// that would take it past `MAX_GROUP_BYTES`. That entry is still accepted and in the
@@ -448,8 +537,23 @@ impl CommitPipeline {
 			}
 
 			if next == drained + 1 {
-				if shutdown {
-					break;
+				if self.shutdown.load(Ordering::Acquire) {
+					#[cfg(test)]
+					self.shutdown_waits.fetch_add(1, Ordering::SeqCst);
+					// Nothing to drain, but a commit that was admitted before the shutdown may
+					// still be on its way to the ring. A permit is held from admission until
+					// the flusher has drained the entry, so once every permit is back, all of
+					// them were decided and no more can arrive.
+					tokio::select! {
+						all = &mut all_permits => {
+							// Commits still waiting for a permit fail instead of getting one.
+							self.admission.close();
+							drop(all);
+							break;
+						}
+						() = self.notify_flusher.notified() => {}
+					}
+					continue;
 				}
 				// Wait for new published or decided entries
 				self.notify_flusher.notified().await;
@@ -974,8 +1078,10 @@ impl CommitPipeline {
 		Ok(())
 	}
 
-	/// Shuts down the pipeline. The flusher makes every commit already
-	/// accepted durable before it exits.
+	/// Shuts down the pipeline. New commits fail at once. The flusher decides every commit that
+	/// was admitted before, making the accepted ones durable, and only then exits. A commit that
+	/// was handed a permit while it queued for admission, and whose future is then neither polled
+	/// nor dropped, keeps the flusher waiting for it.
 	pub(crate) fn shutdown(&self) {
 		self.shutdown.store(true, Ordering::Release);
 		self.notify_flusher.notify_one();

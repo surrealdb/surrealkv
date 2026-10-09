@@ -1085,6 +1085,9 @@ pub(crate) struct Core {
 
 	/// Atomic flag indicating if the core has been closed
 	pub(crate) is_closed: AtomicBool,
+
+	/// Held while `close` runs, so that a second caller waits for the first to finish.
+	closing: tokio::sync::Mutex<()>,
 }
 
 impl std::ops::Deref for Core {
@@ -1383,6 +1386,7 @@ impl Core {
 			write_stall,
 			flusher_handle: Mutex::new(Some(flusher_handle)),
 			is_closed: AtomicBool::new(false),
+			closing: tokio::sync::Mutex::new(()),
 		};
 
 		tracing::debug!("LSM tree initialization complete");
@@ -1460,11 +1464,12 @@ impl Core {
 	}
 
 	/// Safely closes the LSM tree by shutting down all components in the
-	/// correct order.
+	/// correct order. A call that arrives while another is closing waits for it.
 	///
 	/// # Shutdown Sequence
 	///
-	/// 1. Commit pipeline shutdown - stops accepting new writes
+	/// 1. Commit pipeline shutdown - refuses new commits, and waits until every commit already
+	///    admitted has been decided
 	/// 2. Background tasks stopped - waits for ongoing operations
 	/// 3. Active memtable flush - if flush_on_close enabled AND memtable non-empty, flush to SST
 	///    (NO WAL rotation)
@@ -1477,13 +1482,15 @@ impl Core {
 	/// Unlike `make_room_for_write`, this does NOT rotate the WAL before
 	/// flushing. This prevents creating an empty WAL file on clean shutdown.
 	pub async fn close(&self) -> Result<()> {
+		let _closing = self.closing.lock().await;
 		if self.is_closed.swap(true, Ordering::SeqCst) {
 			return Ok(());
 		}
 
 		tracing::debug!("Shutting down LSM tree");
 
-		// Step 1: Shutdown the commit pipeline to stop accepting new writes
+		// Step 1: Shutdown the commit pipeline to stop accepting new writes. The flusher exits
+		// once every commit admitted before the shutdown is decided.
 		self.commit_pipeline.shutdown();
 		tracing::debug!("Commit pipeline shutdown complete");
 
@@ -2043,6 +2050,8 @@ impl Tree {
 		Ok(metadata)
 	}
 
+	/// Closes the tree. Commits already admitted finish first, each with its real outcome, and a
+	/// commit that begins after the close fails with [`Error::PipelineStall`].
 	pub async fn close(&self) -> Result<()> {
 		self.core.close().await
 	}
