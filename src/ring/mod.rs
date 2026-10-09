@@ -5,7 +5,7 @@ mod queue;
 mod sync;
 
 pub(crate) use pipeline::CommitPipeline;
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub(crate) use pipeline::{
 	CommitStage,
 	FreeStats,

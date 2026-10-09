@@ -1509,7 +1509,7 @@ fn bloom_of(keys: &[Key]) -> BloomFilter {
 	bloom
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod encode_values_tests {
 	use tempdir::TempDir;
 
@@ -1701,7 +1701,7 @@ mod encode_values_tests {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod free_retired_tests {
 	use std::collections::BTreeMap;
 	use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1890,7 +1890,7 @@ mod free_retired_tests {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod retire_due_tests {
 	use super::{retire_due, RETIRE_EVERY_ENTRIES, RETIRE_EVERY_GROUPS};
 
@@ -1915,7 +1915,7 @@ mod retire_due_tests {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod group_budget_tests {
 	use super::*;
 
@@ -1954,7 +1954,7 @@ mod group_budget_tests {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod scratch_tests {
 	use tempdir::TempDir;
 
@@ -2154,7 +2154,7 @@ mod scratch_tests {
 	}
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod permit_merge_tests {
 	use std::sync::atomic::AtomicUsize;
 	use std::time::{Duration, Instant};
