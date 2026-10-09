@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -63,6 +64,9 @@ pub enum Error {
 	/// No manifest exists but the directory holds database files, so opening
 	/// would start a new database over them and discard them.
 	ManifestMissing(String),
+	/// The manifest was being replaced when a step failed from the rename on, so the file on disk
+	/// is either the old manifest or the new one, and the new one may not be durable.
+	ManifestWriteUncertain(String),
 	InvalidArgument(String),
 	InvalidTag(String),
 	InterleavedIteration, // Interleaved iteration not supported
@@ -118,6 +122,7 @@ impl fmt::Display for Error {
             Self::Corruption(err) => write!(f, "Data corruption detected: {err}"),
             Self::ManifestCorruption(err) => write!(f, "Manifest corruption detected: {err}"),
             Self::ManifestMissing(err) => write!(f, "Manifest missing: {err}"),
+            Self::ManifestWriteUncertain(err) => write!(f, "Manifest write outcome unknown: {err}"),
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::InterleavedIteration => write!(f, "Interleaved iteration not supported: cannot mix next() and next_back() on same iterator"),
@@ -216,12 +221,13 @@ pub struct BackgroundError {
 
 /// Handler for background errors that propagates errors to user operations
 pub struct BackgroundErrorHandler {
-	/// Current background error (None = no error)
-	bg_error: RwLock<Option<BackgroundError>>,
+	/// The current error of each reason, at most one per reason
+	bg_errors: RwLock<Vec<BackgroundError>>,
 	/// Fast atomic flag for write path checks
 	is_db_stopped: AtomicBool,
-	/// The error of the commit group that stopped the database, kept apart from `bg_error`
-	/// because an error of higher severity stored first keeps its place there.
+	/// The error of the commit group that stopped the database, kept apart from `bg_errors` so
+	/// that a flush, a compaction or a checkpoint can refuse to run without taking the lock, and
+	/// so that no recovery can end it.
 	commit_group_stop: OnceLock<Error>,
 	/// Stats tracking
 	error_count: AtomicU64,
@@ -231,7 +237,7 @@ impl BackgroundErrorHandler {
 	/// Creates a new background error handler
 	pub fn new() -> Self {
 		Self {
-			bg_error: RwLock::new(None),
+			bg_errors: RwLock::new(Vec::new()),
 			is_db_stopped: AtomicBool::new(false),
 			commit_group_stop: OnceLock::new(),
 			error_count: AtomicU64::new(0),
@@ -256,6 +262,9 @@ impl BackgroundErrorHandler {
 			// Corrupted table metadata is unrecoverable
 			(_, Error::CorruptedTableMetadata(_)) => ErrorSeverity::Unrecoverable,
 
+			// The manifest on disk may not be the one in memory: nothing may be retried on it
+			(_, Error::ManifestWriteUncertain(_)) => ErrorSeverity::FatalError,
+
 			// I/O errors during memtable flush are fatal
 			(BackgroundErrorReason::MemtablaFlush, Error::Io(_)) => ErrorSeverity::FatalError,
 
@@ -270,8 +279,21 @@ impl BackgroundErrorHandler {
 		}
 	}
 
+	/// The most severe error, the earliest of those equally severe.
+	fn most_severe(errors: &[BackgroundError]) -> Option<&BackgroundError> {
+		errors.iter().min_by_key(|e| (Reverse(e.severity), e.timestamp))
+	}
+
+	/// Sets the stopped flag from `errors`, which the caller holds the lock of.
+	fn update_stopped(&self, errors: &[BackgroundError]) {
+		let stopped = errors.iter().any(|e| e.severity >= ErrorSeverity::HardError);
+		self.is_db_stopped.store(stopped, Ordering::Release);
+	}
+
 	/// Set a background error. This is called by background tasks when they encounter errors.
-	pub fn set_error(&self, error: Error, reason: BackgroundErrorReason) {
+	/// Returns the severity of the error now recorded for `reason`: the new error's, or that of
+	/// the more severe one it did not replace.
+	pub fn set_error(&self, error: Error, reason: BackgroundErrorReason) -> ErrorSeverity {
 		let severity = Self::classify_error(&error, reason);
 		let bg_error = BackgroundError {
 			error: error.clone(),
@@ -280,11 +302,11 @@ impl BackgroundErrorHandler {
 			timestamp: Instant::now(),
 		};
 
-		// Update the error (only if severity is higher than current)
-		let mut current_error = self.bg_error.write();
-		if let Some(ref existing) = *current_error {
-			// Only update if new error is more severe
-			if severity <= existing.severity {
+		// An error of a reason replaces the one it has only if it is more severe, and one reason
+		// never hides another's: each is ended by its own recovery
+		let mut errors = self.bg_errors.write();
+		match errors.iter_mut().find(|e| e.reason == reason) {
+			Some(existing) if severity <= existing.severity => {
 				tracing::debug!(
 					"Background error not updated: new severity {:?} <= existing {:?}, error: {:?}, reason: {:?}",
 					severity,
@@ -292,19 +314,18 @@ impl BackgroundErrorHandler {
 					error.to_string(),
 					reason
 				);
-				return;
+				return existing.severity;
 			}
+			Some(existing) => *existing = bg_error.clone(),
+			None => errors.push(bg_error.clone()),
 		}
-
-		*current_error = Some(bg_error.clone());
-		drop(current_error);
+		self.update_stopped(&errors);
+		drop(errors);
 
 		// Update stats
 		self.error_count.fetch_add(1, Ordering::Relaxed);
 
-		// Set stopped flag if severity is HardError or higher
 		if severity >= ErrorSeverity::HardError {
-			self.is_db_stopped.store(true, Ordering::Release);
 			tracing::error!(
 				"Background error (severity {:?}, reason {:?}, timestamp {:?}): {}",
 				severity,
@@ -321,6 +342,31 @@ impl BackgroundErrorHandler {
 				error
 			);
 		}
+		severity
+	}
+
+	/// Ends the error recorded for `reason` once the work that failed has succeeded, so that
+	/// writes are accepted again. Only an error that may auto-recover (below `FatalError`) is
+	/// ended: a fatal one stays, and so does the error of any other reason, however it compares.
+	/// Returns whether an error was ended.
+	pub(crate) fn recover(&self, reason: BackgroundErrorReason) -> bool {
+		let mut errors = self.bg_errors.write();
+		let Some(at) = errors
+			.iter()
+			.position(|e| e.reason == reason && e.severity < ErrorSeverity::FatalError)
+		else {
+			return false;
+		};
+		let recovered = errors.remove(at);
+		self.update_stopped(&errors);
+		drop(errors);
+		tracing::info!(
+			"Background error recovered (severity {:?}, reason {:?}): {}",
+			recovered.severity,
+			recovered.reason,
+			recovered.error
+		);
+		true
 	}
 
 	/// Check if the database is stopped due to a background error.
@@ -333,8 +379,8 @@ impl BackgroundErrorHandler {
 		}
 
 		// Slow path: get the actual error
-		let bg_error = self.bg_error.read();
-		if let Some(ref error) = *bg_error {
+		let errors = self.bg_errors.read();
+		if let Some(error) = Self::most_severe(&errors) {
 			if error.severity >= ErrorSeverity::HardError {
 				return Err(error.error.clone());
 			}
@@ -363,7 +409,7 @@ impl BackgroundErrorHandler {
 	/// Get the current background error, if any
 	#[cfg(test)]
 	pub fn get_error(&self) -> Option<BackgroundError> {
-		self.bg_error.read().clone()
+		Self::most_severe(&self.bg_errors.read()).cloned()
 	}
 
 	/// Check if database is stopped (fast path, lock-free)
@@ -381,9 +427,9 @@ impl BackgroundErrorHandler {
 	/// Clear the background error (for recovery scenarios)
 	#[cfg(test)]
 	pub fn clear_error(&self) {
-		let mut error = self.bg_error.write();
-		*error = None;
-		drop(error);
+		let mut errors = self.bg_errors.write();
+		errors.clear();
+		drop(errors);
 		self.is_db_stopped.store(false, Ordering::Release);
 		tracing::debug!("Background error cleared");
 	}

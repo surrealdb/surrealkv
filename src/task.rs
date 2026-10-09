@@ -1,15 +1,21 @@
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 
 use crate::compaction::leveled::Strategy;
 use crate::compaction::CompactionStrategy;
-use crate::error::BackgroundErrorReason;
+use crate::error::{BackgroundErrorReason, ErrorSeverity};
 use crate::lsm::CompactionOperations;
 use crate::stall::WriteStallController;
 use crate::Options;
+
+/// The wait before a failed memtable flush is run again; it doubles with every failure.
+const FLUSH_RETRY_MIN: Duration = Duration::from_millis(50);
+/// The longest wait between two attempts at a memtable flush.
+const FLUSH_RETRY_MAX: Duration = Duration::from_secs(2);
 
 /// Manages background tasks for the LSM tree
 pub(crate) struct TaskManager {
@@ -64,7 +70,8 @@ impl TaskManager {
 			let write_stall = Arc::clone(&write_stall);
 
 			let handle = tokio::spawn(async move {
-				loop {
+				let error_handler = core.error_handler();
+				'task: loop {
 					// Wait for notification
 					notify.notified().await;
 
@@ -77,10 +84,14 @@ impl TaskManager {
 
 					// Flush ALL pending immutable memtables in a loop
 					let mut flush_count = 0;
+					let mut retry_wait = FLUSH_RETRY_MIN;
 					loop {
 						match core.compact_memtable() {
 							Ok(()) => {
 								flush_count += 1;
+								retry_wait = FLUSH_RETRY_MIN;
+								// A flush that succeeds ends the failure of the one before it
+								error_handler.recover(BackgroundErrorReason::MemtablaFlush);
 								write_stall.signal_work_done();
 								// Check if there are more immutables to flush
 								if !core.has_pending_immutables() {
@@ -89,10 +100,26 @@ impl TaskManager {
 							}
 							Err(e) => {
 								tracing::error!("Memtable compaction task error: {e:?}");
-								core.error_handler()
+								let severity = error_handler
 									.set_error(e, BackgroundErrorReason::MemtablaFlush);
-								write_stall.signal_shutdown();
-								break;
+								// A database a commit group stopped refuses every flush for good,
+								// so there is nothing to retry.
+								if severity >= ErrorSeverity::FatalError
+									|| error_handler.commit_group_error().is_some()
+								{
+									write_stall.signal_shutdown();
+									break;
+								}
+								// The memtable stays queued and the manifest is as it was,
+								// so the flush is run again until it succeeds. Commits fail
+								// meanwhile, and the writers stalled on it are let go.
+								write_stall.signal_failure();
+								let _ = tokio::time::timeout(retry_wait, notify.notified()).await;
+								if stop_flag.load(Ordering::SeqCst) {
+									running.store(false, Ordering::SeqCst);
+									break 'task;
+								}
+								retry_wait = (retry_wait * 2).min(FLUSH_RETRY_MAX);
 							}
 						}
 					}

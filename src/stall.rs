@@ -1,6 +1,6 @@
 //! Write stall controller for backpressure management.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -76,6 +76,9 @@ pub struct WriteStallController {
 	/// Shutdown flag - checked in stall loop for graceful exit
 	shutdown: AtomicBool,
 
+	/// Counts `signal_failure` calls: a stalled writer gives up when it changes while it waits
+	failures: AtomicU64,
+
 	/// Provider for live stall count readings
 	provider: Arc<dyn WriteStallCountProvider>,
 
@@ -89,6 +92,7 @@ impl WriteStallController {
 			stall_cleared: Notify::new(),
 			is_stalled: AtomicBool::new(false),
 			shutdown: AtomicBool::new(false),
+			failures: AtomicU64::new(0),
 			provider,
 			thresholds,
 		}
@@ -97,7 +101,8 @@ impl WriteStallController {
 	/// Check stall conditions and wait if stalled. Called before each write.
 	///
 	/// Returns `Ok(Some(WriteStallInfo))` if was stalled and then cleared,
-	/// `Ok(None)` if not stalled, `Err(Error::PipelineStall)` on shutdown.
+	/// `Ok(None)` if not stalled, `Err(Error::PipelineStall)` on shutdown or when a failure is
+	/// signalled while waiting.
 	///
 	/// Re-reads counts each iteration because background work (flushes,
 	/// compactions) may complete while waiting.
@@ -112,14 +117,17 @@ impl WriteStallController {
 		let mut stall_reason: Option<WriteStallReason> = None;
 		let mut stall_value: usize = 0;
 		let mut stall_threshold: usize = 0;
+		let failures = self.failures.load(Ordering::Acquire);
 
 		loop {
 			// Create Notified FIRST to register for wakeups.
 			// Any notify_waiters() call after this point will wake us.
 			let notified = self.stall_cleared.notified();
 
-			// Check shutdown
-			if self.shutdown.load(Ordering::Acquire) {
+			// Check shutdown, and a failure signalled since this writer began to wait
+			if self.shutdown.load(Ordering::Acquire)
+				|| self.failures.load(Ordering::Acquire) != failures
+			{
 				if stall_reason.is_some() {
 					self.is_stalled.store(false, Ordering::Release);
 				}
@@ -200,6 +208,13 @@ impl WriteStallController {
 	/// Signal shutdown - wakes all stalled writers to exit.
 	pub fn signal_shutdown(&self) {
 		self.shutdown.store(true, Ordering::Release);
+		self.stall_cleared.notify_waiters();
+	}
+
+	/// Signal a failure that may pass - wakes the stalled writers to exit like `signal_shutdown`,
+	/// but does not refuse the writers that come after.
+	pub fn signal_failure(&self) {
+		self.failures.fetch_add(1, Ordering::Release);
 		self.stall_cleared.notify_waiters();
 	}
 
