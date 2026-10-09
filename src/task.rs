@@ -288,6 +288,12 @@ mod tests {
 		level_delay_ms: u64,
 		fail_memtable: Arc<AtomicBool>,
 		fail_level: Arc<AtomicBool>,
+		/// The next calls of `compact_memtable` that fail, as `fail_memtable` does
+		memtable_failures: AtomicUsize,
+		/// Whether a failed `compact_memtable` is an I/O error, which is fatal
+		memtable_failure_is_io: AtomicBool,
+		memtable_attempts: AtomicUsize,
+		error_handler: Arc<BackgroundErrorHandler>,
 	}
 
 	impl MockCoreInner {
@@ -299,6 +305,10 @@ mod tests {
 				level_delay_ms: 20,
 				fail_memtable: Arc::new(AtomicBool::new(false)),
 				fail_level: Arc::new(AtomicBool::new(false)),
+				memtable_failures: AtomicUsize::new(0),
+				memtable_failure_is_io: AtomicBool::new(false),
+				memtable_attempts: AtomicUsize::new(0),
+				error_handler: Arc::new(BackgroundErrorHandler::new()),
 			}
 		}
 
@@ -310,6 +320,10 @@ mod tests {
 				level_delay_ms,
 				fail_memtable: Arc::new(AtomicBool::new(false)),
 				fail_level: Arc::new(AtomicBool::new(false)),
+				memtable_failures: AtomicUsize::new(0),
+				memtable_failure_is_io: AtomicBool::new(false),
+				memtable_attempts: AtomicUsize::new(0),
+				error_handler: Arc::new(BackgroundErrorHandler::new()),
 			}
 		}
 	}
@@ -321,8 +335,28 @@ mod tests {
 				std::hint::spin_loop();
 			}
 
+			self.memtable_attempts.fetch_add(1, Ordering::SeqCst);
+
 			// Check if should fail
-			if self.fail_memtable.load(Ordering::SeqCst) {
+			let mut left = self.memtable_failures.load(Ordering::SeqCst);
+			let failing = loop {
+				if left == 0 {
+					break false;
+				}
+				match self.memtable_failures.compare_exchange(
+					left,
+					left - 1,
+					Ordering::SeqCst,
+					Ordering::SeqCst,
+				) {
+					Ok(_) => break true,
+					Err(now) => left = now,
+				}
+			};
+			if failing || self.fail_memtable.load(Ordering::SeqCst) {
+				if self.memtable_failure_is_io.load(Ordering::SeqCst) {
+					return Err(Error::Io(Arc::new(std::io::Error::other("memtable error"))));
+				}
 				return Err(Error::Other("memtable error".into()));
 			}
 
@@ -348,7 +382,7 @@ mod tests {
 		}
 
 		fn error_handler(&self) -> Arc<BackgroundErrorHandler> {
-			Arc::new(BackgroundErrorHandler::new())
+			Arc::clone(&self.error_handler)
 		}
 
 		fn has_pending_immutables(&self) -> bool {
@@ -661,7 +695,7 @@ mod tests {
 		let level_count = core.level_compactions.load(Ordering::SeqCst);
 		println!("After wake_up_level with success: level_count={level_count}");
 
-		task_manager.stop().await;
+		stop_within_a_bound(task_manager).await;
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -688,15 +722,121 @@ mod tests {
 		// Make next memtable compaction succeed
 		core.fail_memtable.store(false, Ordering::SeqCst);
 
-		// Trigger another compaction
-		task_manager.wake_up_memtable();
-		time::sleep(Duration::from_millis(100)).await;
-
-		// This should succeed
-		assert_eq!(core.memtable_compactions.load(Ordering::SeqCst), 1);
+		// The task runs the failed flush again by itself, and that succeeds
+		wait_for(|| core.memtable_compactions.load(Ordering::SeqCst) == 1).await;
 
 		// Task should still be responsive after error
+		stop_within_a_bound(task_manager).await;
+	}
+
+	/// Waits for `condition`, which the tasks make true.
+	async fn wait_for(condition: impl Fn() -> bool) {
+		time::timeout(Duration::from_secs(10), async {
+			while !condition() {
+				time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await
+		.expect("timed out waiting for the background task");
+	}
+
+	/// Stops the tasks, failing the test if a flush that keeps failing is not let go of.
+	async fn stop_within_a_bound(task_manager: TaskManager) {
+		time::timeout(Duration::from_secs(10), task_manager.stop())
+			.await
+			.expect("stop returns while a flush is waiting to be retried");
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_failed_memtable_flush_is_retried_until_it_succeeds() {
+		let core = Arc::new(MockCoreInner::new());
+		core.memtable_failures.store(2, Ordering::SeqCst);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			test_write_stall(),
+		);
+
+		task_manager.wake_up_memtable();
+		wait_for(|| core.memtable_compactions.load(Ordering::SeqCst) == 1).await;
+
+		assert_eq!(core.memtable_attempts.load(Ordering::SeqCst), 3);
+		// The failure was recorded once, and the success ended it.
+		assert_eq!(core.error_handler.error_count(), 1);
+		assert!(core.error_handler.check_error().is_ok());
 		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_fatal_memtable_flush_failure_is_not_retried() {
+		let write_stall = test_write_stall();
+		let core = Arc::new(MockCoreInner::new());
+		core.fail_memtable.store(true, Ordering::SeqCst);
+		core.memtable_failure_is_io.store(true, Ordering::SeqCst);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			Arc::clone(&write_stall),
+		);
+
+		task_manager.wake_up_memtable();
+		wait_for(|| core.error_handler.is_db_stopped()).await;
+		time::sleep(Duration::from_millis(300)).await;
+
+		assert_eq!(core.memtable_attempts.load(Ordering::SeqCst), 1);
+		// A fatal failure refuses every writer after it, and no success ends it.
+		assert!(write_stall.check().await.is_err());
+		core.fail_memtable.store(false, Ordering::SeqCst);
+		task_manager.wake_up_memtable();
+		wait_for(|| core.memtable_compactions.load(Ordering::SeqCst) == 1).await;
+		assert!(core.error_handler.check_error().is_err());
+		task_manager.stop().await;
+	}
+
+	/// A flush that fails once a commit group stopped the database is refused for good, not a
+	/// failure that passes: it is not run again, and a later success does not end the stop.
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_flush_failing_on_a_database_a_commit_group_stopped_is_not_retried() {
+		let write_stall = test_write_stall();
+		let core = Arc::new(MockCoreInner::new());
+		core.error_handler.stop_commit_group(Error::DatabaseStopped("group".into()));
+		core.fail_memtable.store(true, Ordering::SeqCst);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			Arc::clone(&write_stall),
+		);
+
+		task_manager.wake_up_memtable();
+		wait_for(|| core.memtable_attempts.load(Ordering::SeqCst) >= 1).await;
+		// The first wait of a retry is 50 ms: a retry would have run again by now.
+		time::sleep(Duration::from_millis(400)).await;
+		assert_eq!(core.memtable_attempts.load(Ordering::SeqCst), 1);
+
+		// A flush that succeeds on a later wake ends its own failure, not the stop.
+		core.fail_memtable.store(false, Ordering::SeqCst);
+		task_manager.wake_up_memtable();
+		wait_for(|| core.memtable_compactions.load(Ordering::SeqCst) == 1).await;
+		assert!(matches!(core.error_handler.check_error(), Err(Error::DatabaseStopped(_))));
+		assert!(core.error_handler.commit_group_error().is_some());
+		assert!(write_stall.check().await.is_err(), "writers stay refused");
+		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_stop_does_not_wait_for_a_flush_that_keeps_failing() {
+		let core = Arc::new(MockCoreInner::new());
+		core.fail_memtable.store(true, Ordering::SeqCst);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			test_write_stall(),
+		);
+
+		task_manager.wake_up_memtable();
+		wait_for(|| core.memtable_attempts.load(Ordering::SeqCst) >= 3).await;
+
+		stop_within_a_bound(task_manager).await;
 	}
 
 	struct AboveThresholdProvider {
@@ -787,7 +927,7 @@ mod tests {
 			"Stalled writer should return Err(PipelineStall) after flush failure"
 		);
 
-		task_manager.stop().await;
+		stop_within_a_bound(task_manager).await;
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]

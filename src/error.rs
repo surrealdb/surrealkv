@@ -519,6 +519,113 @@ mod tests {
 	}
 
 	#[test]
+	fn test_recover_ends_the_recoverable_error_of_its_reason() {
+		let handler = BackgroundErrorHandler::new();
+
+		let severity =
+			handler.set_error(Error::Other("flush".into()), BackgroundErrorReason::MemtablaFlush);
+		assert_eq!(severity, ErrorSeverity::HardError);
+		assert!(handler.is_db_stopped());
+
+		assert!(handler.recover(BackgroundErrorReason::MemtablaFlush));
+		assert!(!handler.is_db_stopped());
+		assert!(handler.check_error().is_ok());
+		assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush), "nothing is left to end");
+	}
+
+	#[test]
+	fn test_recover_leaves_a_fatal_error() {
+		let handler = BackgroundErrorHandler::new();
+
+		let severity = handler.set_error(
+			Error::ManifestWriteUncertain("renamed".into()),
+			BackgroundErrorReason::MemtablaFlush,
+		);
+		assert_eq!(severity, ErrorSeverity::FatalError);
+
+		assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush));
+		assert!(handler.is_db_stopped());
+		assert!(handler.check_error().is_err());
+	}
+
+	#[test]
+	fn test_recover_leaves_an_equally_severe_error_of_another_reason() {
+		let handler = BackgroundErrorHandler::new();
+		// Recorded first: recovering the flush must not take it for the flush's own.
+		handler.set_error(Error::Other("compaction".into()), BackgroundErrorReason::Compaction);
+		handler.set_error(Error::Other("flush".into()), BackgroundErrorReason::MemtablaFlush);
+
+		assert!(handler.recover(BackgroundErrorReason::MemtablaFlush));
+		assert!(handler.is_db_stopped());
+		assert_eq!(handler.get_error().unwrap().reason, BackgroundErrorReason::Compaction);
+		assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush));
+		assert!(handler.check_error().is_err());
+	}
+
+	#[test]
+	fn test_recover_leaves_a_more_severe_error_of_another_reason() {
+		let handler = BackgroundErrorHandler::new();
+		handler.set_error(Error::Other("flush".into()), BackgroundErrorReason::MemtablaFlush);
+		handler.set_error(
+			Error::Io(Arc::new(std::io::Error::other("compaction"))),
+			BackgroundErrorReason::Compaction,
+		);
+
+		assert!(handler.recover(BackgroundErrorReason::MemtablaFlush));
+		assert!(handler.is_db_stopped());
+		let remaining = handler.get_error().unwrap();
+		assert_eq!(remaining.reason, BackgroundErrorReason::Compaction);
+		assert_eq!(remaining.severity, ErrorSeverity::FatalError);
+	}
+
+	/// The recovery of a flush ends the flush's own error, never the stop a commit group caused:
+	/// whichever came first, the database stays stopped and reports the group's error.
+	#[test]
+	fn test_recover_never_ends_the_stop_of_a_commit_group() {
+		for flush_first in [true, false] {
+			let handler = BackgroundErrorHandler::new();
+			let group = || Error::DatabaseStopped("group".into());
+			if flush_first {
+				handler
+					.set_error(Error::Other("flush".into()), BackgroundErrorReason::MemtablaFlush);
+				handler.stop_commit_group(group());
+			} else {
+				handler.stop_commit_group(group());
+				handler
+					.set_error(Error::Other("flush".into()), BackgroundErrorReason::MemtablaFlush);
+			}
+
+			assert!(handler.recover(BackgroundErrorReason::MemtablaFlush), "{flush_first}");
+			assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush), "{flush_first}");
+			assert!(!handler.recover(BackgroundErrorReason::CommitGroup), "{flush_first}");
+			assert!(handler.is_db_stopped(), "{flush_first}");
+			assert!(
+				matches!(handler.check_error(), Err(Error::DatabaseStopped(_))),
+				"{flush_first}"
+			);
+			assert!(handler.commit_group_error().is_some(), "{flush_first}");
+			assert_eq!(handler.get_error().unwrap().reason, BackgroundErrorReason::CommitGroup);
+		}
+	}
+
+	/// A flush error that is more severe than the stop's own cannot hide it either: the stop stays
+	/// on record, and is what is reported once the flush error is ended.
+	#[test]
+	fn test_a_flush_error_does_not_hide_the_stop_of_a_commit_group() {
+		let handler = BackgroundErrorHandler::new();
+		handler.stop_commit_group(Error::DatabaseStopped("group".into()));
+		let severity = handler.set_error(
+			Error::Io(Arc::new(std::io::Error::other("flush"))),
+			BackgroundErrorReason::MemtablaFlush,
+		);
+		assert_eq!(severity, ErrorSeverity::FatalError);
+
+		assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush), "a fatal one stays");
+		assert!(matches!(handler.check_error(), Err(Error::DatabaseStopped(_))));
+		assert!(handler.commit_group_error().is_some());
+	}
+
+	#[test]
 	fn test_clear_error() {
 		let handler = BackgroundErrorHandler::new();
 
@@ -531,5 +638,110 @@ mod tests {
 		handler.clear_error();
 		assert!(!handler.is_db_stopped());
 		assert!(handler.check_error().is_ok());
+	}
+
+	/// A less severe error of a reason does not replace the more severe one it has, and the
+	/// recovery of that reason does not end it.
+	#[test]
+	fn a_less_severe_error_of_a_reason_does_not_replace_a_more_severe_one() {
+		let handler = BackgroundErrorHandler::new();
+		let fatal = handler.set_error(
+			Error::ManifestWriteUncertain("renamed".into()),
+			BackgroundErrorReason::MemtablaFlush,
+		);
+		assert_eq!(fatal, ErrorSeverity::FatalError);
+
+		let hard =
+			handler.set_error(Error::Other("flush".into()), BackgroundErrorReason::MemtablaFlush);
+		assert_eq!(hard, ErrorSeverity::FatalError, "the severity reported is the one on record");
+
+		let current = handler.get_error().unwrap();
+		assert_eq!(current.severity, ErrorSeverity::FatalError);
+		assert!(matches!(current.error, Error::ManifestWriteUncertain(_)));
+		assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush));
+		assert!(handler.is_db_stopped());
+	}
+
+	/// An error that comes after a recovery stops the database again.
+	#[test]
+	fn an_error_after_a_recovery_stops_the_database_again() {
+		let handler = BackgroundErrorHandler::new();
+		handler.set_error(Error::Other("first".into()), BackgroundErrorReason::MemtablaFlush);
+		assert!(handler.recover(BackgroundErrorReason::MemtablaFlush));
+		assert!(handler.check_error().is_ok());
+
+		handler.set_error(Error::Other("second".into()), BackgroundErrorReason::MemtablaFlush);
+		assert!(handler.is_db_stopped());
+		let error = handler.check_error().expect_err("the second failure stops the database");
+		assert!(error.to_string().contains("second"), "{error}");
+	}
+
+	/// Of the errors of several reasons, the one reported is the most severe, whichever came first.
+	#[test]
+	fn the_error_reported_is_the_most_severe_of_those_of_every_reason() {
+		let hard = || Error::Other("hard".into());
+		let fatal = || Error::Io(Arc::new(std::io::Error::other("fatal")));
+		for hard_first in [true, false] {
+			let handler = BackgroundErrorHandler::new();
+			if hard_first {
+				handler.set_error(hard(), BackgroundErrorReason::MemtablaFlush);
+				handler.set_error(fatal(), BackgroundErrorReason::Compaction);
+			} else {
+				handler.set_error(fatal(), BackgroundErrorReason::Compaction);
+				handler.set_error(hard(), BackgroundErrorReason::MemtablaFlush);
+			}
+			let current = handler.get_error().unwrap();
+			assert_eq!(current.severity, ErrorSeverity::FatalError, "hard first: {hard_first}");
+			let reported = handler.check_error().expect_err("the database is stopped");
+			assert!(reported.to_string().contains("fatal"), "hard first: {hard_first}: {reported}");
+		}
+	}
+
+	/// A burst of failures and recoveries from several threads leaves the handler consistent: the
+	/// fast flag says what the errors it holds say.
+	#[test]
+	fn the_error_handler_stays_consistent_under_concurrent_failures_and_recoveries() {
+		for round in 0..20 {
+			let handler = Arc::new(BackgroundErrorHandler::new());
+			let mut threads = Vec::new();
+			for t in 0..6usize {
+				let handler = Arc::clone(&handler);
+				threads.push(std::thread::spawn(move || {
+					for n in 0..400usize {
+						let reason = match (t + n) % 3 {
+							0 => BackgroundErrorReason::MemtablaFlush,
+							1 => BackgroundErrorReason::Compaction,
+							_ => BackgroundErrorReason::ManifestWrite,
+						};
+						match (t * 7 + n) % 5 {
+							0 => {
+								handler.set_error(Error::Other("hard".into()), reason);
+							}
+							1 => {
+								handler.set_error(
+									Error::ManifestWriteUncertain("fatal".into()),
+									reason,
+								);
+							}
+							_ => {
+								handler.recover(reason);
+							}
+						}
+						let _ = handler.check_error();
+					}
+				}));
+			}
+			for thread in threads {
+				thread.join().unwrap();
+			}
+			let stopped =
+				handler.get_error().is_some_and(|e| e.severity >= ErrorSeverity::HardError);
+			assert_eq!(
+				handler.is_db_stopped(),
+				stopped,
+				"round {round}: the flag and the errors differ"
+			);
+			assert_eq!(handler.check_error().is_err(), stopped, "round {round}");
+		}
 	}
 }

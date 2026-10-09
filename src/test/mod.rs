@@ -55,6 +55,12 @@ pub mod manifest_missing_tests;
 #[cfg(test)]
 pub mod manifest_tests;
 #[cfg(test)]
+pub mod manifest_write_failure_tests;
+#[cfg(test)]
+pub mod manifest_write_retry_tests;
+#[cfg(test)]
+pub mod manifest_write_stop_tests;
+#[cfg(test)]
 pub mod memtable_tests;
 #[cfg(test)]
 pub mod recovery_integration_tests;

@@ -714,12 +714,10 @@ async fn a_failed_flush_leaves_the_memtable_and_its_wal_segment(failure: Failure
 			"{failure:?}: the SST is on disk"
 		);
 	}
-	if !matches!(failure, Failure::ManifestReplace) {
-		assert!(
-			tree.core.inner.error_handler.check_error().is_ok(),
-			"{failure:?}: a flush that fails before the manifest is touched records no error"
-		);
-	}
+	assert!(
+		tree.core.inner.error_handler.check_error().is_ok(),
+		"{failure:?}: a flush its caller runs records no background error"
+	);
 	assert_contents(&tree, &expected, "the live tree after the failed flushes");
 
 	// A crash here: the files as they are, without the obstacle the test put there.
