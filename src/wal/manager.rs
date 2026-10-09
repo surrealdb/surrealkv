@@ -509,11 +509,18 @@ impl Wal {
 	/// reported to whoever ran into it. Its tail may be damaged after a crash. In the default
 	/// recovery mode that is repaired by cutting the segment back to its valid prefix before
 	/// the segments after it are replayed.
-	pub(crate) fn rotate(&mut self) -> Result<u64> {
+	///
+	/// `before_sync` runs just before that fsync, under the caller's WAL lock, so no record
+	/// can be appended after it and before the fsync. It is where the caller makes durable what
+	/// the records point to: none may reach the disk ahead of it. It does not run for a segment
+	/// whose fsync already failed, which is not fsynced again, and an error from it fails the
+	/// rotation with the WAL as it was.
+	pub(crate) fn rotate_with(&mut self, before_sync: impl FnOnce() -> Result<()>) -> Result<u64> {
 		let old_log_number = self.active_log_number;
 		let new_log_number = old_log_number + 1;
 
 		if !self.active_writer.sync_failed() {
+			before_sync()?;
 			self.active_writer.sync()?;
 		}
 
@@ -537,6 +544,12 @@ impl Wal {
 		);
 
 		Ok(new_log_number)
+	}
+
+	/// Test-only: [`rotate_with`](Self::rotate_with) with nothing to run before the fsync.
+	#[cfg(test)]
+	pub(crate) fn rotate(&mut self) -> Result<u64> {
+		self.rotate_with(|| Ok(()))
 	}
 }
 

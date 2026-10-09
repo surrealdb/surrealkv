@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crc32fast::Hasher;
@@ -14,6 +14,12 @@ use crate::{vfs, CompressionType, Options, VLogChecksumLevel, Value};
 /// Test-only: the VLog files whose fsync completed, in order.
 #[cfg(test)]
 pub(crate) static SYNCED_VLOG_FILES: parking_lot::Mutex<Vec<PathBuf>> =
+	parking_lot::Mutex::new(Vec::new());
+
+/// Test-only: for every fsync of a VLog file that completed, the file and the length it had just
+/// before the fsync, which is how much of it the fsync is sure to have made durable.
+#[cfg(test)]
+pub(crate) static SYNCED_VLOG_LENGTHS: parking_lot::Mutex<Vec<(PathBuf, u64)>> =
 	parking_lot::Mutex::new(Vec::new());
 
 /// VLog format version
@@ -672,6 +678,41 @@ impl VLogWriter {
 	}
 }
 
+/// A count of changes that an fsync has to cover, and how many of them an fsync that completed
+/// covers.
+///
+/// An fsync settles what it covers only once it has succeeded. One that is still in flight, or
+/// that failed, leaves its changes pending, so a caller that asks meanwhile fsyncs them itself
+/// instead of relying on it.
+#[derive(Default)]
+struct Pending {
+	changed: AtomicU64,
+	synced: AtomicU64,
+}
+
+impl Pending {
+	fn mark(&self) {
+		self.changed.fetch_add(1, Ordering::SeqCst);
+	}
+
+	fn count(&self) -> u64 {
+		self.changed.load(Ordering::SeqCst)
+	}
+
+	/// Whether an fsync has completed on the first `count` changes.
+	fn covers(&self, count: u64) -> bool {
+		self.synced.load(Ordering::SeqCst) >= count
+	}
+
+	fn settle(&self, count: u64) {
+		self.synced.fetch_max(count, Ordering::SeqCst);
+	}
+
+	fn is_clean(&self) -> bool {
+		self.covers(self.count())
+	}
+}
+
 /// Value Log (VLog) for WiscKey-style key-value separation with GC
 ///
 /// This implementation includes:
@@ -701,6 +742,13 @@ pub(crate) struct VLog {
 	/// Files the writer rolled over from, until an fsync of each has succeeded: their bytes
 	/// reached the OS but may not be on disk. Locked after `writer`, never before it.
 	unsynced: Mutex<Vec<(u32, Arc<File>)>>,
+
+	/// The entries appended, marked under the `writer` lock, and how many of them a completed
+	/// fsync covers.
+	appended: Pending,
+
+	/// The files created, whose directory entry a completed fsync of the directory covers.
+	created: Pending,
 
 	/// Maps file_id to VLogFile metadata
 	files_map: RwLock<HashMap<u32, Arc<VLogFile>>>,
@@ -748,6 +796,8 @@ impl VLog {
 			active_writer_id: AtomicU32::new(0),
 			writer: RwLock::new(None),
 			unsynced: Mutex::new(Vec::new()),
+			appended: Pending::default(),
+			created: Pending::default(),
 			files_map: RwLock::new(HashMap::new()),
 			file_handles: RwLock::new(HashMap::new()),
 			opts,
@@ -770,7 +820,9 @@ impl VLog {
 		if writer.as_ref().is_none_or(|w| w.needs_replacing(self.max_file_size)) {
 			self.roll_over(&mut writer)?;
 		}
-		writer.as_mut().expect("a writer was just installed").append(key, value)
+		let pointer = writer.as_mut().expect("a writer was just installed").append(key, value)?;
+		self.appended.mark();
+		Ok(pointer)
 	}
 
 	/// Replaces the active writer with one for a new file.
@@ -805,6 +857,7 @@ impl VLog {
 		self.active_writer_id.store(file_id, Ordering::SeqCst);
 
 		self.unsynced.lock().extend(old);
+		self.created.mark();
 		*active = Some(new_writer);
 		Ok(())
 	}
@@ -880,6 +933,9 @@ impl VLog {
 			)?;
 			self.active_writer_id.store(highest_file_id, Ordering::SeqCst);
 			*self.writer.write() = Some(writer);
+			// What an earlier run left in the file may not be on disk yet: the first sync
+			// covers it.
+			self.appended.mark();
 		}
 
 		// println!(
@@ -1176,14 +1232,14 @@ impl VLog {
 	}
 
 	/// Syncs all data to disk: the active file and every file the writer rolled over from
-	/// that is not synced yet.
+	/// that is not synced yet, then the directory if a file was created since it was last synced.
 	///
 	/// The write lock is held only for the BufWriter flush (draining the internal buffer to
 	/// OS page cache, ~microseconds). The expensive fsync is performed outside the lock using
 	/// pre-cloned file descriptors, allowing concurrent VLog appends to proceed.
 	pub(crate) fn sync(&self) -> Result<()> {
-		// Phase 1: Under write lock — flush BufWriter and grab the sync fds
-		let (queued, active) = {
+		// Phase 1: Under write lock — flush BufWriter and grab the sync fds, and what they cover
+		let (queued, active, appended, created) = {
 			let mut guard = self.writer.write();
 			let active = match guard.as_mut() {
 				Some(writer) => {
@@ -1192,7 +1248,7 @@ impl VLog {
 				}
 				None => None,
 			};
-			(self.unsynced.lock().clone(), active)
+			(self.unsynced.lock().clone(), active, self.appended.count(), self.created.count())
 			// write lock released here
 		};
 		#[cfg(test)]
@@ -1216,7 +1272,29 @@ impl VLog {
 		if let Some((file_id, fd)) = &active {
 			self.fsync(*file_id, fd)?;
 		}
+
+		// A file's fsync does not make its name durable everywhere: the directory is fsynced
+		// once for the files created since it last was, and not by the commit that rolled the
+		// log over, which fsyncs nothing.
+		if !self.created.covers(created) {
+			crate::lsm::fsync_directory(&self.path)?;
+			self.created.settle(created);
+		}
+		self.appended.settle(appended);
 		Ok(())
+	}
+
+	/// [`sync`](Self::sync), unless every entry appended is covered by an fsync that has
+	/// completed: then there is nothing to make durable, and no fsync is made.
+	///
+	/// A sync still in flight does not count, so a caller that arrives while one runs fsyncs
+	/// itself. What counts is what this process appended, and what the active file held when the
+	/// log was opened.
+	pub(crate) fn sync_dirty(&self) -> Result<()> {
+		if self.appended.is_clean() {
+			return Ok(());
+		}
+		self.sync()
 	}
 
 	fn fsync(&self, file_id: u32, fd: &File) -> Result<()> {
@@ -1224,10 +1302,15 @@ impl VLog {
 		if self.fail_next_sync.swap(false, Ordering::SeqCst) {
 			return Err(Error::Io(Arc::new(io::Error::other("injected fsync failure"))));
 		}
+		#[cfg(test)]
+		let len = fd.metadata().map(|m| m.len()).unwrap_or(0);
 		fd.sync_all()?;
 		tracing::trace!("Synced VLog file {file_id}");
 		#[cfg(test)]
-		SYNCED_VLOG_FILES.lock().push(self.vlog_file_path(file_id));
+		{
+			SYNCED_VLOG_FILES.lock().push(self.vlog_file_path(file_id));
+			SYNCED_VLOG_LENGTHS.lock().push((self.vlog_file_path(file_id), len));
+		}
 		Ok(())
 	}
 
