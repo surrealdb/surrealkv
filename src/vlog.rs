@@ -1314,6 +1314,13 @@ impl VLog {
 		Ok(())
 	}
 
+	/// Test-only: how many times the log's directory has been fsynced, by anyone.
+	#[cfg(test)]
+	pub(crate) fn dir_syncs(&self) -> usize {
+		let dir = self.path.canonicalize().unwrap_or_else(|_| self.path.clone());
+		crate::lsm::SYNCED_DIRECTORIES.lock().iter().filter(|synced| **synced == dir).count()
+	}
+
 	/// Test-only: makes the next fsync of [`sync`](Self::sync) fail, as a failing disk does.
 	#[cfg(test)]
 	pub(crate) fn fail_next_sync(&self) {

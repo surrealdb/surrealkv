@@ -67,6 +67,10 @@ pub mod retire_free_tests;
 #[cfg(test)]
 pub mod retire_isolation_tests;
 #[cfg(test)]
+pub mod rotate_vlog_order_tests;
+#[cfg(test)]
+pub mod rotate_vlog_race_tests;
+#[cfg(test)]
 pub mod snapshot_tests;
 #[cfg(test)]
 pub mod sstable_tests;

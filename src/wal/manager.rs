@@ -1221,4 +1221,79 @@ mod tests {
 		wal.close().unwrap();
 		assert!(wal.append_group(&buf, &ends).is_err(), "a closed WAL takes no group");
 	}
+
+	/// `before_sync` runs once, before the old segment's fsync, and the rotation goes on to the
+	/// new segment.
+	#[test]
+	fn test_rotate_with_runs_the_hook_before_the_fsync() {
+		let temp_dir = create_temp_directory();
+		let mut wal = Wal::open(temp_dir.path(), Options::default()).unwrap();
+		wal.append(&[1, 2, 3]).unwrap();
+
+		let events = Arc::new(parking_lot::Mutex::new(Vec::new()));
+		let observed = Arc::clone(&events);
+		wal.set_sync_observer(Some(Arc::new(move || observed.lock().push("fsync"))));
+		let hooked = Arc::clone(&events);
+		let rotated = wal.rotate_with(|| {
+			hooked.lock().push("hook");
+			Ok(())
+		});
+		assert_eq!(rotated.unwrap(), 1);
+		assert_eq!(*events.lock(), ["hook", "fsync"]);
+		assert_eq!(wal.get_active_log_number(), 1);
+		wal.close().unwrap();
+	}
+
+	/// A hook that fails fails the rotation before the segment is fsynced or anything is created:
+	/// the WAL is as it was, takes appends, and rotates when the hook works.
+	#[test]
+	fn test_rotate_with_a_failing_hook_leaves_the_wal_as_it_was() {
+		let temp_dir = create_temp_directory();
+		let mut wal = Wal::open(temp_dir.path(), Options::default()).unwrap();
+		wal.append(&[1, 2, 3]).unwrap();
+		wal.flush().unwrap();
+		let len = segment_len(temp_dir.path(), 0);
+		assert!(len > 0, "the segment holds the record");
+
+		let fsyncs = Arc::new(parking_lot::Mutex::new(0));
+		let observed = Arc::clone(&fsyncs);
+		wal.set_sync_observer(Some(Arc::new(move || *observed.lock() += 1)));
+		let failure =
+			|| Err(Error::IO(IOError::new(io::ErrorKind::Other, "injected hook failure")));
+		assert!(wal.rotate_with(failure).is_err());
+		assert_eq!(*fsyncs.lock(), 0, "the segment was not fsynced");
+		assert_eq!(wal.get_active_log_number(), 0);
+		assert!(!temp_dir.path().join("00000000000000000001.wal").exists());
+		assert!(wal.pending_sync(), "nothing was synced");
+		assert!(!wal.sync_failed(), "the failure of the hook is not a failed fsync");
+		assert_eq!(segment_len(temp_dir.path(), 0), len);
+
+		wal.append(&[4, 5, 6]).unwrap();
+		assert_eq!(wal.rotate_with(|| Ok(())).unwrap(), 1);
+		assert_eq!(*fsyncs.lock(), 1);
+		wal.close().unwrap();
+	}
+
+	/// A segment whose fsync failed is replaced without its hook: it is not fsynced again, so
+	/// there is nothing for the hook to come before.
+	#[test]
+	fn test_rotate_with_skips_the_hook_for_a_poisoned_segment() {
+		let temp_dir = create_temp_directory();
+		let mut wal = Wal::open(temp_dir.path(), Options::default()).unwrap();
+		wal.append(&[1, 2, 3]).unwrap();
+		wal.fail_syncs_after(0);
+		assert!(wal.sync().is_err());
+		assert!(wal.sync_failed());
+
+		let ran = Arc::new(parking_lot::Mutex::new(false));
+		let hooked = Arc::clone(&ran);
+		let rotated = wal.rotate_with(|| {
+			*hooked.lock() = true;
+			Ok(())
+		});
+		assert_eq!(rotated.unwrap(), 1);
+		assert!(!*ran.lock(), "the hook ran for a segment that is not fsynced");
+		assert!(!wal.sync_failed());
+		wal.close().unwrap();
+	}
 }

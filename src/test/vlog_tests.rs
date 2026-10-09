@@ -1270,6 +1270,159 @@ async fn a_failed_sync_leaves_the_rolled_over_file_queued() {
 	assert!(synced.contains(&vlog.vlog_file_path(2)), "{synced:?}");
 }
 
+/// `sync_dirty` fsyncs what an append or a rollover left unsynced, once, and nothing when there is
+/// none: not for a log that has no file, and not for one a sync has covered.
+#[test(tokio::test)]
+async fn a_sync_dirty_fsyncs_only_what_is_unsynced() {
+	let (vlog, dir, _) = create_test_vlog(Some(Options {
+		vlog_max_file_size: 1024,
+		vlog_checksum_verification: VLogChecksumLevel::Full,
+		..Default::default()
+	}));
+	vlog.sync_dirty().unwrap();
+	assert!(synced_under(dir.path()).is_empty(), "a log with no file has nothing to fsync");
+
+	let first = vlog.append(b"key-0", &value_of(0, 600)).unwrap();
+	let old = vlog.vlog_file_path(first.file_id);
+	vlog.sync_dirty().unwrap();
+	assert_eq!(synced_under(dir.path()), std::slice::from_ref(&old));
+	vlog.sync_dirty().unwrap();
+	assert_eq!(
+		synced_under(dir.path()),
+		std::slice::from_ref(&old),
+		"a covered file is not fsynced again"
+	);
+
+	// Two more entries roll the file over: the old file and the new one are both unsynced.
+	vlog.append(b"key-1", &value_of(1, 600)).unwrap();
+	let last = vlog.append(b"key-2", &value_of(2, 600)).unwrap();
+	let new = vlog.vlog_file_path(last.file_id);
+	assert_ne!(old, new);
+	vlog.sync_dirty().unwrap();
+	let synced = synced_under(dir.path());
+	assert_eq!(synced.len(), 3, "{synced:?}");
+	assert!(synced[1..].contains(&old) && synced[1..].contains(&new), "{synced:?}");
+	vlog.sync_dirty().unwrap();
+	assert_eq!(synced_under(dir.path()), synced, "nothing is dirty after the sync");
+
+	// An append to the file that is active creates no file, and leaves it dirty all the same.
+	vlog.append(b"key-3", &value_of(3, 100)).unwrap();
+	vlog.sync_dirty().unwrap();
+	assert_eq!(synced_under(dir.path())[synced.len()..], [new]);
+	vlog.sync_dirty().unwrap();
+	assert_eq!(synced_under(dir.path()).len(), synced.len() + 1);
+
+	// A plain sync covers what it fsyncs, so the next `sync_dirty` has nothing to do.
+	vlog.append(b"key-4", &value_of(4, 100)).unwrap();
+	vlog.sync().unwrap();
+	let after_sync = synced_under(dir.path()).len();
+	vlog.sync_dirty().unwrap();
+	assert_eq!(synced_under(dir.path()).len(), after_sync);
+}
+
+/// A sync that fails covers nothing: the next `sync_dirty` fsyncs everything the failed one was
+/// meant to, the files it did not reach included.
+#[test(tokio::test)]
+async fn a_failed_sync_leaves_the_log_dirty() {
+	let (vlog, dir, entries) = vlog_across_a_rollover();
+	vlog.fail_next_sync();
+	assert!(vlog.sync_dirty().is_err());
+	assert!(synced_under(dir.path()).is_empty());
+
+	vlog.sync_dirty().unwrap();
+	let synced = synced_under(dir.path());
+	assert!(synced.contains(&vlog.vlog_file_path(entries[0].0.file_id)), "{synced:?}");
+	assert!(synced.contains(&vlog.vlog_file_path(2)), "{synced:?}");
+	let count = synced.len();
+	vlog.sync_dirty().unwrap();
+	assert_eq!(synced_under(dir.path()).len(), count);
+}
+
+/// A `sync_dirty` that arrives while a sync has its fds and has not fsynced yet fsyncs itself: the
+/// bytes are not covered until that fsync has completed, and a caller that returned on the
+/// strength of one in flight could seal a WAL segment ahead of its values.
+#[test(tokio::test)]
+async fn a_sync_dirty_that_overlaps_a_sync_fsyncs_itself() {
+	let (vlog, dir, entries) = vlog_across_a_rollover();
+	let vlog = Arc::new(vlog);
+	let (old, new) = (vlog.vlog_file_path(entries[0].0.file_id), vlog.vlog_file_path(2));
+	let seen = Arc::new(Mutex::new(None));
+	let entered = Arc::new(AtomicBool::new(false));
+	let (overlapping, under) = (Arc::downgrade(&vlog), dir.path().to_path_buf());
+	let hook_seen = Arc::clone(&seen);
+	vlog.set_sync_gap(Some(Arc::new(move || {
+		if entered.swap(true, Ordering::SeqCst) {
+			return;
+		}
+		let (overlapping, under) = (overlapping.upgrade().unwrap(), under.clone());
+		*hook_seen.lock().unwrap() = Some(on_another_thread(move || {
+			let before = synced_under(&under).len();
+			overlapping.sync_dirty().unwrap();
+			synced_under(&under)[before..].to_vec()
+		}));
+	})));
+	vlog.sync().unwrap();
+
+	let seen = seen.lock().unwrap().take().expect("the second sync ran");
+	assert!(
+		seen.contains(&old) && seen.contains(&new),
+		"the overlapping call returned early: {seen:?}"
+	);
+}
+
+/// A log reopened on files an earlier run wrote has the active file's bytes to cover: they may
+/// have been in the page cache only. The first `sync_dirty` fsyncs it, and then there is nothing.
+#[test(tokio::test)]
+async fn a_reopened_log_fsyncs_its_active_file_once() {
+	let (vlog, dir, opts) = create_test_vlog(None);
+	let pointer = vlog.append(b"key", &value_of(1, 600)).unwrap();
+	vlog.sync().unwrap();
+	let file = vlog.vlog_file_path(pointer.file_id);
+	drop(vlog);
+
+	let before = synced_under(dir.path()).len();
+	let reopened = VLog::new(opts).unwrap();
+	reopened.sync_dirty().unwrap();
+	assert_eq!(synced_under(dir.path())[before..], [file]);
+	reopened.sync_dirty().unwrap();
+	assert_eq!(synced_under(dir.path()).len(), before + 1);
+	assert_eq!(reopened.get(&pointer).unwrap(), value_of(1, 600));
+}
+
+/// The directory is fsynced by the sync that follows the creation of a file, once, and by no
+/// append or rollover: those fsync nothing. A sync that fails before it gets to the directory
+/// leaves it for the next one.
+#[test(tokio::test)]
+async fn a_sync_fsyncs_the_directory_once_for_the_files_created_since_the_last() {
+	let (vlog, _dir, _) = create_test_vlog(Some(Options {
+		vlog_max_file_size: 1024,
+		vlog_checksum_verification: VLogChecksumLevel::Full,
+		..Default::default()
+	}));
+	let base = vlog.dir_syncs();
+	for i in 0..3u8 {
+		vlog.append(format!("key-{i}").as_bytes(), &value_of(i, 600)).unwrap();
+	}
+	assert_eq!(vlog.dir_syncs() - base, 0, "appends and rollovers do not fsync the directory");
+
+	vlog.fail_next_sync();
+	assert!(vlog.sync().is_err());
+	assert_eq!(vlog.dir_syncs() - base, 0, "the directory is synced after the files");
+	vlog.sync().unwrap();
+	assert_eq!(vlog.dir_syncs() - base, 1);
+	vlog.sync().unwrap();
+	vlog.sync_dirty().unwrap();
+	assert_eq!(vlog.dir_syncs() - base, 1, "no file was created since");
+
+	// A fourth entry fits the file that is active and fills it; the fifth rolls over to a third.
+	vlog.append(b"key-3", &value_of(3, 600)).unwrap();
+	vlog.sync().unwrap();
+	assert_eq!(vlog.dir_syncs() - base, 1, "an append creates no file");
+	vlog.append(b"key-4", &value_of(4, 600)).unwrap();
+	vlog.sync_dirty().unwrap();
+	assert_eq!(vlog.dir_syncs() - base, 2, "the third file's name is made durable");
+}
+
 /// A rollover whose flush of the old file fails is an error, and the old file's entries are not
 /// lost: the writer stays where it is, and the next append rolls over after all.
 #[test(tokio::test)]
