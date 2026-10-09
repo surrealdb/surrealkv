@@ -10,10 +10,10 @@
 //!   full arena in the middle must still apply every batch exactly once and never log or write a
 //!   spent one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tempdir::TempDir;
 use test_log::test;
@@ -763,6 +763,41 @@ fn records_by_sequence(dir: &Path) -> BTreeMap<u64, usize> {
 	counts
 }
 
+/// The WAL records seen so far, as (segment, starting sequence number) pairs. A write to L0
+/// flushes the pending immutable memtables first, and the flush removes the WAL segments it made
+/// obsolete, so the records that were logged are collected before every flush and once more at
+/// the end, instead of being counted in the segments that are left.
+type SeenRecords = Arc<Mutex<BTreeSet<(u64, u64)>>>;
+
+fn see_records(seen: &SeenRecords, dir: &Path) {
+	let mut seen = seen.lock().unwrap();
+	for (id, path) in wal_segments(dir) {
+		for record in decode_segment_batches(&path, id).unwrap().1 {
+			seen.insert((id, record.starting_seq_num));
+		}
+	}
+}
+
+/// Collects the records of the WAL under `dir` before each flush of `tree`.
+fn see_records_before_flushes(tree: &Tree, dir: &Path) -> SeenRecords {
+	let seen = SeenRecords::default();
+	let (hook_seen, dir) = (Arc::clone(&seen), dir.to_path_buf());
+	*tree.core.inner.flush_hook.lock() = Some(Arc::new(move |_| {
+		see_records(&hook_seen, &dir);
+		Ok(())
+	}));
+	seen
+}
+
+/// How many records were seen for each starting sequence number.
+fn seen_by_sequence(seen: &SeenRecords) -> BTreeMap<u64, usize> {
+	let mut counts = BTreeMap::new();
+	for (_, seq) in seen.lock().unwrap().iter() {
+		*counts.entry(*seq).or_insert(0) += 1;
+	}
+	counts
+}
+
 /// A spent batch, logged or written to L0, would carry empty keys.
 fn assert_no_spent_record(dir: &Path) {
 	for record in wal_batches(dir) {
@@ -877,12 +912,14 @@ async fn an_oversized_batch_in_the_middle_of_a_group_logs_only_the_batches_after
 		small("m4"),
 	];
 	let batches = stamped(&tree, &group);
+	let seen = see_records_before_flushes(&tree, dir.path());
 	tree.core.commit_pipeline.flush_group(&batches, true).await.unwrap();
 	publish_all(&tree);
+	see_records(&seen, dir.path());
 
 	let first = batches[0].starting_seq_num;
 	assert_eq!(
-		records_by_sequence(dir.path()),
+		seen_by_sequence(&seen),
 		BTreeMap::from([
 			(first, 1),
 			(first + 1, 1),

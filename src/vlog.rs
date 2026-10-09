@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crc32fast::Hasher;
@@ -718,6 +718,18 @@ pub(crate) struct VLog {
 	/// Test-only: runs in `sync` between taking the fds and fsyncing them.
 	#[cfg(test)]
 	sync_gap: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+
+	/// Number of live [`VLogPin`]s. While there is one, no file is deleted.
+	pins: AtomicUsize,
+}
+
+/// Keeps a [`VLog`] from deleting files until it is dropped.
+pub(crate) struct VLogPin<'a>(&'a VLog);
+
+impl Drop for VLogPin<'_> {
+	fn drop(&mut self) {
+		self.0.pins.fetch_sub(1, Ordering::SeqCst);
+	}
 }
 
 impl VLog {
@@ -743,6 +755,7 @@ impl VLog {
 			fail_next_sync: std::sync::atomic::AtomicBool::new(false),
 			#[cfg(test)]
 			sync_gap: Mutex::new(None),
+			pins: AtomicUsize::new(0),
 		};
 
 		// PRE-FILL ALL EXISTING FILE HANDLES ON STARTUP
@@ -1087,17 +1100,30 @@ impl VLog {
 		Ok(value_bytes)
 	}
 
+	/// Keeps every file in place until the pin is dropped. A checkpoint takes one while it holds
+	/// the manifest and copies the files after releasing it, so a flush or a compaction cannot
+	/// delete files that the checkpointed tables point into in between.
+	pub(crate) fn pin_files(&self) -> VLogPin<'_> {
+		self.pins.fetch_add(1, Ordering::SeqCst);
+		VLogPin(self)
+	}
+
 	/// Cleans up obsolete vlog files based on the global minimum oldest_vlog_file_id.
 	///
 	/// A vlog file is safe to delete when:
 	/// - Its file_id < min_oldest_vlog (no SST references values in it)
 	/// - It is not the active writer
 	/// - No iterators are active
+	/// - No [`VLogPin`] is held
 	///
 	/// This implements the "global minimum" GC approach where files are deleted
-	/// once no SST can possibly reference them. If iterators are active, cleanup
-	/// is skipped and will be retried on the next GC trigger.
+	/// once no SST can possibly reference them. If iterators are active or a pin is
+	/// held, cleanup is skipped and will be retried on the next GC trigger.
 	pub(crate) fn cleanup_obsolete_files(&self, min_oldest_vlog: u32) -> Result<()> {
+		if self.pins.load(Ordering::SeqCst) > 0 {
+			return Ok(());
+		}
+
 		let active = self.active_writer_id.load(Ordering::SeqCst);
 
 		// Collect files that are safe to delete
