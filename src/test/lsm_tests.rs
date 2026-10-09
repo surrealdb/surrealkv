@@ -2759,8 +2759,8 @@ async fn test_wal_file_reuse_across_restarts() {
 
 #[test_log::test(tokio::test)]
 async fn test_wal_append_after_crash_recovery() {
-	// This test verifies that after a crash (no flush), WAL is reused and appended
-	// to
+	// This test verifies that after a crash (no flush), recovery continues in a
+	// fresh WAL segment while the crashed segment is still replayed
 	let temp_dir = TempDir::new("test").unwrap();
 	let path = temp_dir.path().to_path_buf();
 
@@ -2769,13 +2769,14 @@ async fn test_wal_append_after_crash_recovery() {
 	});
 
 	// Phase 1: Write data and simulate crash (no clean shutdown)
-	let manifest_log = {
+	let (manifest_log, wal_num_before_crash) = {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key1", b"value1").unwrap();
 		txn.commit().await.unwrap();
 
 		let manifest_log = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+		let wal_num_before_crash = tree.core.inner.wal.read().get_active_log_number();
 
 		// Simulate crash: drop without close (but release lock)
 		{
@@ -2784,23 +2785,32 @@ async fn test_wal_append_after_crash_recovery() {
 		}
 		drop(tree);
 
-		manifest_log
+		(manifest_log, wal_num_before_crash)
 	};
 
 	// Verify manifest didn't change (no flush happened)
 	let manifest = LevelManifest::new(Arc::clone(&opts)).unwrap();
 	assert_eq!(manifest.get_log_number(), manifest_log, "Manifest should not change on crash");
 
-	// Phase 2: Reopen and verify WAL is reused (SAME number)
+	// Phase 2: Reopen and verify recovery rotated to a fresh WAL segment
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		let wal_num_after_reopen = tree.core.inner.wal.read().get_active_log_number();
 
-		// CRITICAL: WAL number should be SAME as before (appending to existing)
-		assert_eq!(wal_num_after_reopen, 0, "WAL should reuse existing file #0 since log_number=0");
+		// The crashed segment is never appended to; recovery continues in the next one
+		assert_eq!(
+			wal_num_after_reopen,
+			wal_num_before_crash + 1,
+			"WAL should rotate to a fresh segment after crash recovery"
+		);
 
-		// Write another transaction to same WAL
+		// Data from the crashed segment must still be recovered
+		let txn = tree.begin().unwrap();
+		assert_eq!(txn.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+		drop(txn);
+
+		// Write another transaction to the new WAL
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"key2", b"value2").unwrap();
 		txn.commit().await.unwrap();
@@ -2813,6 +2823,16 @@ async fn test_wal_append_after_crash_recovery() {
 			"Should still be using same WAL file"
 		);
 
+		tree.close().await.unwrap();
+	}
+
+	// Phase 3: Verify both keys survive another reopen
+	{
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		let txn = tree.begin().unwrap();
+		assert_eq!(txn.get(b"key1").unwrap(), Some(b"value1".to_vec()));
+		assert_eq!(txn.get(b"key2").unwrap(), Some(b"value2".to_vec()));
+		drop(txn);
 		tree.close().await.unwrap();
 	}
 }
@@ -3519,11 +3539,12 @@ async fn test_wal_number_correct_after_reopen() {
 			"log_number should be preserved after reopen"
 		);
 
-		// Active memtable's WAL number should be exactly log_number
-		// because WAL opens starting from log_number
+		// WAL opens at log_number and then rotates to a fresh segment, so the
+		// active memtable's WAL number should be exactly log_number + 1
 		assert_eq!(
-			active_wal_number, reopened_log_number,
-			"Active memtable WAL number should equal log_number on fresh open"
+			active_wal_number,
+			reopened_log_number + 1,
+			"Active memtable WAL number should equal log_number + 1 on fresh open"
 		);
 
 		// Active WAL number should be greater than the last flushed WAL
@@ -3535,11 +3556,12 @@ async fn test_wal_number_correct_after_reopen() {
 			last_flushed_wal
 		);
 
-		// More specifically, it should be exactly last_flushed_wal + 1
+		// More specifically, it should be exactly last_flushed_wal + 2
+		// (log_number = last_flushed_wal + 1, plus the rotation on open)
 		assert_eq!(
 			active_wal_number,
-			last_flushed_wal + 1,
-			"Active WAL number should be last_flushed_wal + 1"
+			last_flushed_wal + 2,
+			"Active WAL number should be last_flushed_wal + 2"
 		);
 
 		tree.close().await.unwrap();
@@ -4154,7 +4176,8 @@ async fn test_wal_incremental_number_after_flush_and_reopen() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		let wal_num_before = tree.core.inner.wal.read().get_active_log_number();
-		assert_eq!(wal_num_before, 0, "Fresh database should start at WAL #0");
+		// WAL #0 is created on open and immediately rotated to WAL #1
+		assert_eq!(wal_num_before, 1, "Fresh database should start at WAL #1");
 
 		let mut txn = tree.begin().unwrap();
 		txn.set(b"test_key", b"test_value").unwrap();
@@ -4319,11 +4342,14 @@ async fn test_recovery_with_manually_created_wal_segments() {
 			highest_segment_created
 		);
 
-		// KEY ASSERTION: WAL should open at highest segment, not log_number
+		// KEY ASSERTION: WAL should open at the highest segment (not log_number) and
+		// then rotate past it, so new writes never land in a replayed segment
 		assert_eq!(
-			active_wal_after_recovery, highest_segment_created,
-			"BUG: WAL opened at {} but should open at highest segment {} to prevent data loss",
-			active_wal_after_recovery, highest_segment_created
+			active_wal_after_recovery,
+			highest_segment_created + 1,
+			"BUG: WAL active at {} but should be past highest segment {} to prevent data loss",
+			active_wal_after_recovery,
+			highest_segment_created
 		);
 
 		// Verify initial recovery worked
