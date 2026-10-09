@@ -10,7 +10,8 @@
 //!   sizes, block positions and compression;
 //! * a crash image cut at any byte of a coalesced group recovers a prefix of whole records, and the
 //!   commits made after that recovery survive another crash;
-//! * Immediate groups are fsynced before anyone is told, on the re-append path as well.
+//! * Immediate groups are fsynced before anyone is told, on the re-append path as well;
+//! * the flusher's reused buffers never carry bytes from one group into the next.
 //!
 //! Test-only instrumentation these tests need: `BufferedFileWriter::pending_sync` (and the
 //! `Writer` / `Wal` forwarders), and the failpoint `fail_after_ops` and the write counter
@@ -1095,6 +1096,111 @@ async fn a_failed_big_group_through_the_flusher_leaves_the_acked_bytes_and_the_n
 		release_lock(&reopened);
 	}
 	assert!(went_through, "the group never went through, so there is no control");
+}
+
+/// The flusher keeps one set of buffers from group to group. Groups of every size in an order
+/// that follows a large one with a tiny one (the large buffer is dropped, the tiny group must
+/// not see any of its bytes), and a small one with a bigger one, committed with both
+/// durabilities. The segment holds exactly the commits, in order, one record each, and is
+/// byte-identical to the same records framed one `add_record` at a time.
+#[test(tokio::test)]
+async fn flusher_buffers_never_leak_bytes_between_groups_and_the_segment_is_the_per_record_framing()
+{
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(opts(&live, BIG)).unwrap());
+	let seen = Arc::new(Mutex::new(Vec::new()));
+	{
+		let seen = Arc::clone(&seen);
+		tree.core.commit_pipeline.set_hook(Some(Arc::new(move |point| {
+			if let PipelineHook::AfterWalSync {
+				batches,
+			} = point
+			{
+				seen.lock().unwrap().push(batches);
+			}
+		})));
+	}
+
+	// (commits in the group, value length): the 1.2 MB and 1.4 MB groups are within what the
+	// flusher keeps buffers at, and are followed by tiny ones that must not see their bytes. The
+	// 6 MB commit is a group of its own and past it, so its buffer is dropped and a tiny group
+	// follows it too.
+	let plan: [(usize, usize); 15] = [
+		(64, 40),
+		(1, 40),
+		(3, 400_000),
+		(1, 6_000_000),
+		(1, 10),
+		(200, 20),
+		(2, 700_000),
+		(1, 1),
+		(5, 5),
+		(7, 70_000),
+		(1, 3),
+		(32, 300),
+		(4, 33_000),
+		(1, 2),
+		(9, 9),
+	];
+	let mut expected: Vec<(String, Vec<u8>)> = Vec::new();
+	for (g, (n, len)) in plan.iter().enumerate() {
+		let entries: Vec<(String, Vec<u8>)> =
+			(0..*n).map(|i| (format!("g{g:02}_{i:03}"), payload(g * 1000 + i, *len))).collect();
+		let durability = if g % 2 == 0 {
+			Durability::Immediate
+		} else {
+			Durability::Eventual
+		};
+		for r in commit_group(&tree, &entries, durability).await {
+			r.unwrap();
+		}
+		expected.extend(entries);
+	}
+	assert!(
+		seen.lock().unwrap().iter().copied().max().unwrap() > 100,
+		"some group must have been large: {:?}",
+		seen.lock().unwrap()
+	);
+
+	let segment = seg_path(&live, active_segment(&tree));
+	let records = records_with_ends(&segment);
+	assert_eq!(records.len(), expected.len(), "one record per commit, no extra, none missing");
+	let mut raw = Vec::new();
+	{
+		let mut reader = Reader::new(File::open(&segment).unwrap());
+		while let Ok((rec, _)) = reader.read() {
+			raw.push(rec.to_vec());
+		}
+	}
+	for ((_, batch), (k, v)) in records.iter().zip(&expected) {
+		assert_eq!(batch.entries.len(), 1);
+		assert_eq!(&user_keys(batch)[0], k, "the order of the commits");
+		let location = ValueLocation::decode(batch.entries[0].value.as_ref().unwrap()).unwrap();
+		assert_eq!(&location.value, v, "{k}");
+	}
+
+	// The same records through `add_record`: the same bytes.
+	let reference = dir.path().join("reference.wal");
+	{
+		let mut w = new_writer(&reference, CompressionType::None);
+		for rec in &raw {
+			w.add_record(rec).unwrap();
+		}
+	}
+	assert_eq!(fs::read(&segment).unwrap(), fs::read(&reference).unwrap());
+
+	// And a crash image recovers all of it.
+	let image = dir.path().join("image");
+	copy_dir(&live, &image);
+	let recovered = Tree::new(opts(&image, BIG)).unwrap();
+	for (k, v) in &expected {
+		assert_eq!(get(&recovered, k).as_deref(), Some(v.as_slice()), "{k}");
+	}
+	mark_closed(&recovered);
+	release_lock(&recovered);
+	let tree = Arc::try_unwrap(tree).ok().expect("no other owner");
+	crash(tree);
 }
 
 // ---------------------------------------------------------------------------

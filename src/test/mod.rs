@@ -29,6 +29,8 @@ pub mod crash_consistency_tests;
 #[cfg(test)]
 pub mod direct_l0_flush_tests;
 #[cfg(test)]
+pub mod flusher_alloc_diet_tests;
+#[cfg(test)]
 pub mod index_block_tests;
 #[cfg(test)]
 pub mod iterator_semantics_tests;
