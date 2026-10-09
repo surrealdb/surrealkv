@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tempdir::TempDir;
 use test_log::test;
 
+use crate::batch::Batch;
 use crate::compaction::leveled::Strategy;
 use crate::vfs::sync_tracker;
 use crate::{Error, Options, Tree};
@@ -207,5 +208,102 @@ async fn manifest_referencing_zero_byte_sst_fails_cleanly() {
 			);
 		}
 		Err(other) => panic!("expected LoadManifestFail, got: {other}"),
+	}
+}
+
+/// Drops `tree` the way a crash would: no close, no flush.
+fn crash(tree: Tree) {
+	{
+		let mut lockfile = tree.core.inner.lockfile.lock().unwrap();
+		lockfile.release().unwrap();
+	}
+	drop(tree);
+}
+
+/// Recovery splits a WAL segment over several memtables when it holds more than
+/// one memtable's worth, e.g. after `max_memtable_size` shrank between restarts.
+/// Flushing the first part must not advance `log_number` past the segment: the
+/// rest of it is still only in the WAL, and the next recovery would skip it.
+#[test(tokio::test)]
+async fn crash_after_recovery_splits_a_wal_segment_must_not_lose_its_tail() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let path = temp_dir.path().to_path_buf();
+	let opts_with = |max_memtable_size| {
+		Arc::new(Options {
+			path: path.clone(),
+			max_memtable_size,
+			flush_on_close: false,
+			..Default::default()
+		})
+	};
+	let key = |i: u32| format!("key_{i:04}");
+	const KEYS: u32 = 200;
+
+	// Fill one WAL segment with a large memtable, then crash.
+	let tree = Tree::new(opts_with(4 * 1024 * 1024)).unwrap();
+	for i in 0..KEYS {
+		let mut txn = tree.begin().unwrap();
+		txn.set(key(i).as_bytes(), &[0xAB; 100]).unwrap();
+		txn.commit().await.unwrap();
+	}
+	crash(tree);
+
+	// Recover with a memtable far too small for that segment, which splits it, and
+	// crash again before the last part (now the active memtable) is flushed.
+	let tree = Tree::new(opts_with(16 * 1024)).unwrap();
+	assert!(
+		tree.core.inner.l0_file_count() > 0,
+		"recovery should have flushed part of the split segment"
+	);
+	crash(tree);
+
+	let tree = Tree::new(opts_with(4 * 1024 * 1024)).unwrap();
+	let txn = tree.begin().unwrap();
+	for i in 0..KEYS {
+		assert!(txn.get(key(i).as_bytes()).unwrap().is_some(), "{} was lost", key(i));
+	}
+}
+
+/// A commit group is written to the WAL as a whole and then applied batch by batch.
+/// If the memtable filled up midway and rotated (rotating the WAL with it), the
+/// rest of the group landed in a memtable tagged with the *next* WAL segment, while
+/// its records sat in the previous one. Flushing the older memtable then advanced
+/// `log_number` past that segment, so a crash lost the rest of the group.
+#[test(tokio::test)]
+async fn crash_after_memtable_fills_mid_group_must_not_lose_the_rest_of_the_group() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		max_memtable_size: 16 * 1024,
+		flush_on_close: false,
+		..Default::default()
+	});
+	let key = |i: u64| format!("key_{i:04}");
+	const KEYS: u64 = 200;
+
+	// One group of single-entry batches, together far larger than one memtable.
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let first_seq = tree.core.inner.visible_seq_num.load(std::sync::atomic::Ordering::Acquire) + 1;
+	let batches: Vec<Batch> = (0..KEYS)
+		.map(|i| {
+			let mut batch = Batch::new(first_seq + i);
+			batch.set(key(i).into_bytes(), vec![0xAB; 100], 0).unwrap();
+			batch
+		})
+		.collect();
+	tree.core.commit_pipeline.flush_group(&batches, true).await.unwrap();
+	assert!(
+		!tree.core.inner.immutable_memtables.read().unwrap().is_empty(),
+		"the group should have filled at least one memtable"
+	);
+
+	// Flush the filled memtables (but not the active one), then crash.
+	tree.core.inner.flush_all_immutables_sync().unwrap();
+	crash(tree);
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let txn = tree.begin().unwrap();
+	for i in 0..KEYS {
+		assert!(txn.get(key(i).as_bytes()).unwrap().is_some(), "{} was lost", key(i));
 	}
 }

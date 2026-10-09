@@ -143,6 +143,11 @@ pub(crate) struct CoreInner {
 
 	/// Global memory controller accounting memory across memtables, ring buffer, and cache.
 	pub(crate) memory_controller: Arc<crate::memory::MemoryController>,
+
+	/// Serializes flushes of the immutable queue, so the background flush task and a
+	/// direct-to-L0 write (which must flush everything older first) never pick the same
+	/// memtable or install tables out of order. Acquired before any lock listed above.
+	flush_lock: parking_lot::Mutex<()>,
 }
 
 impl CoreInner {
@@ -197,6 +202,7 @@ impl CoreInner {
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
 			memory_controller,
+			flush_lock: parking_lot::Mutex::new(()),
 		})
 	}
 
@@ -222,7 +228,10 @@ impl CoreInner {
 	/// # Arguments
 	/// * `memtable` - The memtable to flush
 	/// * `table_id` - Table ID for the new SST
-	/// * `wal_number` - WAL number to mark as flushed (log_number = wal_number + 1)
+	/// * `log_number` - The new manifest log_number: the oldest WAL segment that may still hold
+	///   data not yet in an SST once this memtable is flushed. For a memtable from the immutable
+	///   queue this is its `wal_number + 1`, as the queue is flushed oldest-first and each memtable
+	///   owns its WAL segments.
 	///
 	/// # Returns
 	/// The flushed SSTable
@@ -230,7 +239,7 @@ impl CoreInner {
 		&self,
 		memtable: Arc<MemTable>,
 		table_id: u64,
-		wal_number: u64,
+		log_number: u64,
 	) -> Result<Arc<Table>> {
 		let collect_bptree = false;
 
@@ -255,14 +264,9 @@ impl CoreInner {
 		// Step 2: Prepare atomic changeset
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&table)));
-		changeset.log_number = Some(wal_number + 1);
+		changeset.log_number = Some(log_number);
 
-		tracing::debug!(
-			"Changeset prepared: table_id={}, log_number={} (WAL #{:020} flushed)",
-			table_id,
-			wal_number + 1,
-			wal_number
-		);
+		tracing::debug!("Changeset prepared: table_id={}, log_number={}", table_id, log_number);
 
 		// Step 4: Apply changeset atomically
 		// Lock order: level_manifest → immutable_memtables
@@ -274,9 +278,7 @@ impl CoreInner {
 			manifest.revert_changeset(rollback);
 			let error = Error::Other(format!(
 				"Failed to atomically update manifest: table_id={}, log_number={}: {}",
-				table_id,
-				wal_number + 1,
-				e
+				table_id, log_number, e
 			));
 			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
 			return Err(error);
@@ -294,7 +296,7 @@ impl CoreInner {
 		tracing::debug!(
 			"Manifest updated atomically: table_id={}, log_number={}, last_sequence={}",
 			table_id,
-			wal_number + 1,
+			log_number,
 			manifest.get_last_sequence()
 		);
 
@@ -310,6 +312,12 @@ impl CoreInner {
 	/// Used for batches that exceed `max_memtable_size` to avoid `ArenaFull` allocation
 	/// failures and unnecessary in-memory buffering.
 	///
+	/// Every immutable memtable still in the queue holds older writes than `batch`, so
+	/// they are all flushed first. Installing this table while one of them is pending
+	/// would put older data in L0 *after* newer data: an L0->L1 compaction that starts in
+	/// between moves this table to L1, and the older table that lands in L0 afterwards
+	/// then shadows it on reads.
+	///
 	/// `batch_wal_number` is the WAL segment number that `batch` was durably appended to
 	/// before this call (the caller must have already ensured that segment can never
 	/// receive another write — see `seal_active_wal_segment`). It is used to safely
@@ -322,6 +330,13 @@ impl CoreInner {
 		table_id: u64,
 		batch_wal_number: u64,
 	) -> Result<Arc<Table>> {
+		// Hold the flush lock until the table is installed, so the background flush task
+		// can't install anything in between.
+		let flush_guard = self.flush_lock.lock();
+		while !self.immutable_memtables.read()?.is_empty() {
+			self.flush_oldest_immutable_to_sst_locked(&flush_guard)?;
+		}
+
 		let table_file_path = self.opts.sstable_file_path(table_id);
 		let mut range_deletions = Vec::new();
 		let mut point_entries = Vec::new();
@@ -539,6 +554,15 @@ impl CoreInner {
 	/// 2. Flushes it to SST via flush_immutable_to_sst (which also removes from queue)
 	/// 3. Schedules async WAL cleanup
 	fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
+		let flush_guard = self.flush_lock.lock();
+		self.flush_oldest_immutable_to_sst_locked(&flush_guard)
+	}
+
+	/// `flush_oldest_immutable_to_sst` for a caller that already holds `flush_lock`.
+	fn flush_oldest_immutable_to_sst_locked(
+		&self,
+		_flush_guard: &parking_lot::MutexGuard<'_, ()>,
+	) -> Result<Option<Arc<Table>>> {
 		// Get the oldest immutable entry (clone to release lock before I/O)
 		let entry = {
 			let guard = self.immutable_memtables.read()?;
@@ -574,7 +598,7 @@ impl CoreInner {
 		let table = self.flush_immutable_to_sst(
 			Arc::clone(&entry.memtable),
 			entry.table_id,
-			entry.wal_number,
+			entry.wal_number + 1,
 		)?;
 
 		// Schedule async WAL cleanup
@@ -702,7 +726,7 @@ impl CoreInner {
 		let table = self.flush_immutable_to_sst(
 			Arc::clone(&flushed_memtable),
 			table_id,
-			wal_that_was_flushed,
+			wal_that_was_flushed + 1,
 		)?;
 
 		Ok(Some(table))
@@ -770,7 +794,7 @@ impl CoreInner {
 			self.flush_immutable_to_sst(
 				Arc::clone(&entry.memtable),
 				entry.table_id,
-				entry.wal_number,
+				entry.wal_number + 1,
 			)?;
 
 			flushed_count += 1;
@@ -1049,7 +1073,8 @@ impl Core {
 	/// * `context` - Context string for error messages
 	/// * `recovery_mode` - How to handle corruption
 	/// * `arena_size` - Size for memtable arenas
-	/// * `flush_memtable` - Callback to flush intermediate memtables to SST
+	/// * `flush_memtable` - Callback to flush intermediate memtables to SST, given the memtable and
+	///   the manifest `log_number` to set once it is flushed
 	///
 	/// # Returns
 	/// * `(Option<max_seq_num>, Option<active_memtable>, did_recovery)`
@@ -1134,16 +1159,21 @@ impl Core {
 			return Ok((None, None));
 		}
 
-		// Flush all memtables except the last to SST
+		// Flush all memtables except the last to SST. A WAL segment can be split over
+		// several memtables (see `apply_batch_with_oversized_fallback`), so flushing one
+		// may only advance `log_number` to the segment of the memtable after it: that is
+		// the oldest segment still holding data that isn't in an SST yet. Advancing past
+		// its own segment instead would make the next recovery skip the rest of it.
 		let memtable_count = memtables.len();
 		if memtable_count > 1 {
 			tracing::debug!(
 				"Recovery: flushing {} intermediate memtables to SST",
 				memtable_count - 1
 			);
-			for (memtable, _, wal_number) in memtables.iter().take(memtable_count - 1) {
+			for (i, (memtable, _, _)) in memtables.iter().enumerate().take(memtable_count - 1) {
 				if !memtable.is_empty() {
-					flush_memtable(Arc::clone(memtable), *wal_number)?;
+					let next_wal_number = memtables[i + 1].2;
+					flush_memtable(Arc::clone(memtable), next_wal_number)?;
 				}
 			}
 		}
@@ -1165,7 +1195,7 @@ impl Core {
 				arena_size
 			);
 			if !last_memtable.is_empty() {
-				flush_memtable(last_memtable, last_wal_number)?;
+				flush_memtable(last_memtable, last_wal_number + 1)?;
 			}
 			return Ok((wal_seq_num_opt, None));
 		}
@@ -1230,14 +1260,14 @@ impl Core {
 			"Database startup",
 			opts.wal_recovery_mode,
 			opts.max_memtable_size,
-			|memtable, wal_number| {
+			|memtable, log_number| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = inner.level_manifest.read()?.next_table_id();
-				inner.flush_immutable_to_sst(Arc::clone(&memtable), table_id, wal_number)?;
+				inner.flush_immutable_to_sst(Arc::clone(&memtable), table_id, log_number)?;
 				tracing::debug!(
-					"Recovery: flushed memtable to SST table_id={}, wal_number={}",
+					"Recovery: flushed memtable to SST table_id={}, log_number={}",
 					table_id,
-					wal_number
+					log_number
 				);
 				Ok(())
 			},
@@ -1900,18 +1930,18 @@ impl Tree {
 			"Database restore",
 			self.core.inner.opts.wal_recovery_mode,
 			self.core.inner.opts.max_memtable_size,
-			|memtable, wal_number| {
+			|memtable, log_number| {
 				// Flush intermediate memtable to SST during recovery
 				let table_id = self.core.inner.level_manifest.read()?.next_table_id();
 				self.core.inner.flush_immutable_to_sst(
 					Arc::clone(&memtable),
 					table_id,
-					wal_number,
+					log_number,
 				)?;
 				tracing::debug!(
-					"Restore: flushed memtable to SST table_id={}, wal_number={}",
+					"Restore: flushed memtable to SST table_id={}, log_number={}",
 					table_id,
-					wal_number
+					log_number
 				);
 				Ok(())
 			},

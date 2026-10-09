@@ -1,8 +1,11 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tempdir::TempDir;
 use test_log::test;
 
+use crate::compaction::leveled::Strategy;
+use crate::vlog::ValueLocation;
 use crate::{Options, Tree, TreeBuilder};
 
 fn create_temp_directory() -> TempDir {
@@ -321,59 +324,63 @@ async fn test_direct_l0_flush_advances_log_number_so_wal_segment_is_not_replayed
 	}
 }
 
-/// Regression test: advancing `log_number` after a direct-to-L0 flush must never skip
-/// an OLDER immutable memtable that is still waiting to be flushed. Getting this wrong
-/// would silently drop that memtable's data on the next WAL replay after a crash --
-/// strictly worse than the duplicate-replay bug this log_number advance exists to fix.
+/// Regression test: a direct-to-L0 flush must flush every older immutable memtable
+/// first. If it installs its table while an older memtable is still pending, an L0->L1
+/// compaction that runs in between moves the newer table to L1, and the older table
+/// that lands in L0 afterwards shadows it: reads return the older value.
 #[test(tokio::test)]
-async fn test_direct_l0_flush_does_not_advance_log_number_past_unflushed_older_memtable() {
+async fn test_direct_l0_flush_does_not_let_older_memtable_shadow_it() {
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
-	const MAX_MEMTABLE: usize = 64 * 1024;
-	let tree = TreeBuilder::new()
-		.with_path(path.clone())
-		.with_max_memtable_size(MAX_MEMTABLE)
-		.build()
-		.unwrap();
+	let opts = Arc::new(Options {
+		path,
+		max_memtable_size: 64 * 1024,
+		level0_max_files: 1,
+		..Default::default()
+	});
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
-	// Commit a small batch, then rotate it into the immutable queue WITHOUT flushing
-	// it to SST, simulating a still-pending flush from an earlier WAL segment.
+	// Commit the old value, then rotate it into the immutable queue WITHOUT flushing
+	// it to SST, simulating a flush that's still pending.
 	{
 		let mut txn = tree.begin().unwrap();
-		txn.set(b"pending_key", b"pending_value").unwrap();
+		txn.set(b"key", b"old").unwrap();
 		txn.commit().await.unwrap();
 	}
 	tree.core.inner.rotate_memtable().unwrap();
 	let pending_wal_number = {
 		let immutables = tree.core.inner.immutable_memtables.read().unwrap();
-		let entry = immutables.first().expect("expected one still-unflushed immutable memtable");
-		entry.wal_number
+		immutables.first().expect("expected a still-unflushed immutable memtable").wal_number
 	};
 
-	let log_number_before = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-
-	// Directly exercise write_batch_direct_to_l0_sst as if a *later* WAL segment's
-	// oversized batch were being flushed while the older immutable memtable above is
-	// still unflushed.
-	let mut batch = crate::batch::Batch::new(1000);
-	batch.set(b"direct_key".to_vec(), b"direct_value".to_vec(), 0).unwrap();
-
+	// Write the new value straight to L0, as a later oversized batch would.
+	let seq = tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1;
+	let mut batch = crate::batch::Batch::new(seq);
+	let value = ValueLocation::with_inline_value(b"new".to_vec()).encode();
+	batch.set(b"key".to_vec(), value, 0).unwrap();
 	let table_id = tree.core.inner.level_manifest.read().unwrap().next_table_id();
-	let batch_wal_number = tree.core.inner.wal.read().get_active_log_number();
-	assert!(
-		batch_wal_number >= pending_wal_number,
-		"the direct-flushed batch's WAL segment should be at or after the pending memtable's"
-	);
+	let batch_wal_number = tree.core.inner.seal_active_wal_segment().unwrap();
 	tree.core.inner.write_batch_direct_to_l0_sst(&batch, table_id, batch_wal_number).unwrap();
+	tree.core.inner.visible_seq_num.store(seq, Ordering::Release);
 
-	let log_number_after = tree.core.inner.level_manifest.read().unwrap().get_log_number();
-	assert_eq!(
-		log_number_after, log_number_before,
-		"log_number must stay untouched while an older immutable memtable is still pending \
-		(log_number_after={log_number_after}, pending_wal_number={pending_wal_number}) -- \
-		advancing it would make WAL replay silently skip \"pending_key\"'s segment after a crash"
+	assert!(
+		tree.core.inner.immutable_memtables.read().unwrap().is_empty(),
+		"the older memtable must be flushed before the direct-to-L0 table is installed"
 	);
+	let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	assert!(
+		log_number > batch_wal_number && batch_wal_number >= pending_wal_number,
+		"with nothing older pending, log_number must move past the batch's segment \
+		(log_number={log_number}, batch_wal_number={batch_wal_number})"
+	);
+
+	// Compact L0 into L1, then flush whatever is still pending.
+	tree.compact(Arc::new(Strategy::from_options(Arc::clone(&opts)))).unwrap();
+	tree.flush().unwrap();
+
+	let txn = tree.begin().unwrap();
+	assert_eq!(txn.get(b"key").unwrap(), Some(b"new".to_vec()));
 }
 
 /// Regression test: an oversized memtable that `replay_wal` allocates specifically to

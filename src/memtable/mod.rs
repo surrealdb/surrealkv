@@ -236,6 +236,14 @@ impl MemTable {
 		}
 	}
 
+	/// Whether `try_reserve(bytes)` would currently succeed, without reserving anything.
+	pub(crate) fn has_room_for(&self, bytes: u64) -> bool {
+		let capacity = self.arena_capacity() as u64;
+		let used = self.size() as u64;
+		let reserved = self.reserved.load(Ordering::Acquire);
+		bytes <= capacity.saturating_sub(used).saturating_sub(reserved)
+	}
+
 	/// Release `bytes` previously claimed by `try_reserve`.
 	pub(crate) fn release_reservation(&self, bytes: u64) {
 		self.reserved.fetch_sub(bytes, Ordering::AcqRel);
