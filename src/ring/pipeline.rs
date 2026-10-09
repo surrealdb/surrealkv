@@ -44,6 +44,35 @@ pub(crate) enum PipelineHook {
 #[cfg(test)]
 pub(crate) type PipelineHookFn = Arc<dyn Fn(PipelineHook) + Send + Sync>;
 
+/// The most bytes of batches the flusher gathers into one group, as `Batch::encoded_len_hint`
+/// counts them, unless the first entry alone is bigger: that entry is a group of its own.
+///
+/// A group is encoded into one contiguous WAL buffer of its size, next to the batches themselves,
+/// so without a bound a few concurrent multi-GiB commits need that much contiguous memory at
+/// once. 4 MiB is about 4 ms of sequential write at 1 GB/s, on the order of the fsync that
+/// follows it: a bigger group saves little more per commit and adds to the latency of every
+/// commit in it. Groups of small commits are far below it, so only a pile-up of large commits
+/// reaches the bound.
+pub(crate) const MAX_GROUP_BYTES: usize = 4 << 20;
+
+/// Whether the next entry, of `bytes`, joins a group that holds `entries` entries of
+/// `group_bytes` bytes between them. A group takes at least one entry, and after that entries
+/// only while it stays within `MAX_GROUP_BYTES`.
+fn group_has_room(entries: usize, group_bytes: usize, bytes: usize) -> bool {
+	entries == 0 || group_bytes.saturating_add(bytes) <= MAX_GROUP_BYTES
+}
+
+/// Reserves room for `bytes` bytes in `buf`, which is empty, and fails when the allocator
+/// refuses, where `Vec::reserve` aborts the process. Exactly `bytes`, not the doubling that
+/// `reserve` rounds up to.
+///
+/// Only the group's buffer is reserved this way. Wrapping a value and compressing a record
+/// allocate per batch, with the ordinary allocator.
+fn try_reserve_wal(buf: &mut Vec<u8>, bytes: usize) -> Result<()> {
+	debug_assert!(buf.is_empty(), "a reservation made after encoding would not be exact");
+	buf.try_reserve_exact(bytes).map_err(|e| Error::Io(Arc::new(std::io::Error::from(e))))
+}
+
 /// How many times in a row a group may find its records in a segment other than the active
 /// memtable's tag, with nothing applied in between, and log them again off the memtable's lock.
 /// One pass past a rotation fixes it. If rotations keep overtaking the group, the next pass is
@@ -78,7 +107,8 @@ enum ApplyStop {
 /// Validation touches only the slots it reads, never a shared lock, so its
 /// cost is parallel in the number of commits in flight.
 ///
-/// The flusher drains accepted entries in ring order, assigns their LSM
+/// The flusher drains accepted entries in ring order, in groups of at most
+/// `MAX_GROUP_BYTES` (a group always takes its first entry), assigns their LSM
 /// sequence numbers in that same order, writes and syncs the WAL, applies the
 /// memtable, advances `visible_seq_num`, and only then marks the entries
 /// visible and advances the ring's completed prefix. A transaction that reads
@@ -115,6 +145,10 @@ pub(crate) struct CommitPipeline {
 	/// Test-only observer of `flush_group` steps.
 	#[cfg(test)]
 	hook: Mutex<Option<PipelineHookFn>>,
+	/// Test-only failpoint: a WAL buffer of at least this many bytes is refused, as if the
+	/// allocator had none to give. `usize::MAX` disables it.
+	#[cfg(test)]
+	wal_reserve_fails_from: std::sync::atomic::AtomicUsize,
 }
 
 pub(crate) struct RestoreGuard<'a> {
@@ -155,7 +189,41 @@ impl CommitPipeline {
 			log_store,
 			#[cfg(test)]
 			hook: Mutex::new(None),
+			#[cfg(test)]
+			wal_reserve_fails_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
 		}
+	}
+
+	/// Test observer: the completed prefix, the retired watermark and the length of the
+	/// overflow map.
+	#[cfg(test)]
+	pub(crate) fn watermarks(&self) -> (u64, u64, usize) {
+		(self.ring.completed(), self.ring.taken(), self.overflow.lock().len())
+	}
+
+	/// Test observer: how many entries above the completed prefix are accepted, whether the
+	/// flusher holds them or not.
+	#[cfg(test)]
+	pub(crate) fn accepted_waiting(&self) -> usize {
+		let (from, to) = (self.ring.completed() + 1, self.ring.published());
+		(from..=to)
+			.filter(|seq| {
+				matches!(self.ring.get(*seq), SlotRead::Ready(e) if matches!(e.state(), EntryState::Accepted))
+			})
+			.count()
+	}
+
+	/// Test observer: the admission permits not held by a claimed entry.
+	#[cfg(test)]
+	pub(crate) fn free_permits(&self) -> usize {
+		self.admission.available_permits()
+	}
+
+	/// Makes every WAL buffer of at least `bytes` bytes fail to allocate, as it would with no
+	/// memory left. `usize::MAX` lifts it.
+	#[cfg(test)]
+	pub(crate) fn set_wal_reserve_fails_from(&self, bytes: usize) {
+		self.wal_reserve_fails_from.store(bytes, Ordering::Relaxed);
 	}
 
 	/// Installs (or clears) the observer called at each `PipelineHook` point.
@@ -345,16 +413,25 @@ impl CommitPipeline {
 		loop {
 			let shutdown = self.shutdown.load(Ordering::Acquire);
 
-			// Gather every contiguous decided entry after `drained`, with the
-			// permits to release once the completed prefix passes them.
+			// Gather the contiguous decided entries after `drained`, with the permits to
+			// release once the completed prefix passes them. The group stops before the entry
+			// that would take it past `MAX_GROUP_BYTES`. That entry is still accepted and in the
+			// ring, and starts the next group: the flusher parks only when a pass finds nothing,
+			// and a group always takes its first entry.
 			let mut group: Vec<(Arc<CommitEntry>, Payload)> = Vec::new();
 			let mut permits = Vec::new();
+			let mut group_bytes = 0usize;
 			let mut next = drained + 1;
 			loop {
 				match self.ring.get(next) {
 					SlotRead::Ready(entry) => match entry.state() {
 						EntryState::InFlight => break,
 						EntryState::Accepted => {
+							let bytes = entry.payload_bytes();
+							if !group_has_room(group.len(), group_bytes, bytes) {
+								break;
+							}
+							group_bytes = group_bytes.saturating_add(bytes);
 							let payload =
 								entry.take_payload().expect("accepted entries carry a payload");
 							permits.extend(entry.take_permit());
@@ -561,8 +638,12 @@ impl CommitPipeline {
 		}
 
 		let n = processed_batches.len();
-		let mut wal_buf =
-			Vec::with_capacity(processed_batches.iter().map(Batch::encoded_len_hint).sum());
+		// A refused reservation fails the group here, before anything is appended to the WAL.
+		let mut wal_buf = Vec::new();
+		self.reserve_wal_buf(
+			&mut wal_buf,
+			processed_batches.iter().map(Batch::encoded_len_hint).sum(),
+		)?;
 		let mut wal_ends = Vec::with_capacity(n);
 		for batch in &processed_batches {
 			batch.encode_into(&mut wal_buf)?;
@@ -704,6 +785,18 @@ impl CommitPipeline {
 			&& tag <= self.inner.wal.read().get_active_log_number()
 	}
 
+	/// Reserves room for `bytes` bytes in the empty `buf`, see `try_reserve_wal`.
+	fn reserve_wal_buf(&self, buf: &mut Vec<u8>, bytes: usize) -> Result<()> {
+		#[cfg(test)]
+		{
+			let fails_from = self.wal_reserve_fails_from.load(Ordering::Relaxed);
+			if fails_from != usize::MAX && bytes >= fails_from {
+				return Err(Error::Io(Arc::new(std::io::ErrorKind::OutOfMemory.into())));
+			}
+		}
+		try_reserve_wal(buf, bytes)
+	}
+
 	/// Whether a batch that needs `bytes` of memtable does not fit what is left of a
 	/// non-empty active memtable, so the memtable has to rotate before the batch is logged.
 	fn needs_rotation_for(&self, bytes: u64) -> Result<bool> {
@@ -827,7 +920,9 @@ impl CommitPipeline {
 	/// log needs no second pass: its entries were synced with the first.
 	///
 	/// The stale batches go to the WAL as one group, so they land in one segment. They are
-	/// encoded into the group's own buffers, which the first append gave back.
+	/// encoded into the group's own buffers, which the first append gave back with room for the
+	/// whole group. Nothing is reserved here, because part of the group is already applied and
+	/// the step must not fail for want of memory.
 	#[allow(clippy::too_many_arguments)]
 	async fn reappend_stale(
 		&self,
@@ -909,7 +1004,9 @@ impl CommitPipeline {
 /// first oversized batch: it is written to an L0 table instead, which makes its record redundant
 /// and seals the segment, so a record behind it would be stale again before it could be applied.
 ///
-/// The buffers are the group's own, which the first append gave back.
+/// The buffers are the group's own, which the first append gave back with room for the whole
+/// group, so nothing is reserved: part of the group may be applied already, and the step must not
+/// fail for want of memory.
 fn encode_stale(
 	batches: &[Batch],
 	oversized: &[bool],

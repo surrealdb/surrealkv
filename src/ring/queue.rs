@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, OwnedSemaphorePermit};
@@ -47,6 +47,10 @@ pub(crate) struct CommitEntry {
 	state: AtomicU64,
 	/// Set before the entry is accepted, and taken by the flusher.
 	payload: Mutex<Option<Payload>>,
+	/// The encoded size of the payload's batch as `Batch::encoded_len_hint` estimates it, stored
+	/// before the entry is accepted. The flusher reads it to bound a group without locking the
+	/// payload. Zero until then.
+	bytes: AtomicUsize,
 	/// The committer's admission permit, released by the flusher only once
 	/// the ring's completed prefix has passed this entry.
 	permit: Mutex<Option<OwnedSemaphorePermit>>,
@@ -71,6 +75,7 @@ impl CommitEntry {
 			bloom,
 			state: AtomicU64::new(IN_FLIGHT),
 			payload: Mutex::new(None),
+			bytes: AtomicUsize::new(0),
 			permit: Mutex::new(Some(permit)),
 		}
 	}
@@ -101,9 +106,10 @@ impl CommitEntry {
 		}
 	}
 
-	/// Hands the batch to the flusher. The payload is stored before the state,
-	/// so a flusher that observes `ACCEPTED` always finds it.
+	/// Hands the batch to the flusher. The payload and its size are stored before the state,
+	/// so a flusher that observes `ACCEPTED` always finds them.
 	pub(crate) fn accept(&self, payload: Payload) {
+		self.bytes.store(payload.batch.encoded_len_hint(), Ordering::Relaxed);
 		*self.payload.lock() = Some(payload);
 		self.state.store(ACCEPTED, Ordering::SeqCst);
 	}
@@ -117,6 +123,11 @@ impl CommitEntry {
 	pub(crate) fn make_visible(&self, max_seq: u64) {
 		debug_assert!(max_seq != IN_FLIGHT && max_seq < ACCEPTED);
 		self.state.store(max_seq, Ordering::SeqCst);
+	}
+
+	/// The estimated encoded size of an accepted entry's batch.
+	pub(crate) fn payload_bytes(&self) -> usize {
+		self.bytes.load(Ordering::Relaxed)
 	}
 
 	pub(crate) fn take_payload(&self) -> Option<Payload> {
