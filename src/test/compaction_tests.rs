@@ -218,6 +218,8 @@ fn create_compaction_options(
 		vlog: Some(vlog),
 		error_handler: Arc::new(BackgroundErrorHandler::new()),
 		snapshot_tracker: SnapshotTracker::new(),
+		visible_seq_num: Arc::new(AtomicU64::new(u64::MAX)),
+		after_horizon_hook: None,
 	}
 }
 
@@ -1891,7 +1893,7 @@ fn test_tombstone_propagation_journey() {
 		Box::new(value_table.iter(None).unwrap()) as Box<dyn LSMIterator>,
 	];
 	let mut comp_iter_non_bottom =
-		CompactionIterator::new(iterators, create_comparator(), false, vec![]);
+		CompactionIterator::all_published(iterators, create_comparator(), false, vec![]);
 	let non_bottom_result: Vec<_> = comp_iter_non_bottom.by_ref().map(|r| r.unwrap()).collect();
 
 	// Non-bottom level should preserve tombstone
@@ -1906,7 +1908,7 @@ fn test_tombstone_propagation_journey() {
 		Box::new(value_table.iter(None).unwrap()) as Box<dyn LSMIterator>,
 	];
 	let mut comp_iter_bottom =
-		CompactionIterator::new(iterators, create_comparator(), true, vec![]);
+		CompactionIterator::all_published(iterators, create_comparator(), true, vec![]);
 	let bottom_result: Vec<_> = comp_iter_bottom.by_ref().map(|r| r.unwrap()).collect();
 
 	// Bottom level should filter out tombstones

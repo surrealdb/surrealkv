@@ -1313,8 +1313,10 @@ impl CompactionOperations for CoreInner {
 	/// - Removes deleted entries to reclaim space
 	/// - Maintains the level invariants (size ratios and key ranges)
 	fn compact(&self, strategy: Arc<dyn CompactionStrategy>) -> Result<()> {
-		// A compaction keeps only the newest version of a key. If that is one that was never
-		// published, it drops the version readers can see.
+		// A stopped database moves no table: a table may hold batches of the group that failed, and
+		// recovery has to find the group as it was left. A compaction that was already running
+		// keeps what readers can see, because it keeps every version above the visible sequence
+		// number.
 		if let Some(error) = self.error_handler.commit_group_error() {
 			return Err(error);
 		}

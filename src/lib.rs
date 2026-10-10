@@ -980,6 +980,7 @@ impl InternalKey {
 		is_hard_delete_marker(self.kind())
 	}
 
+	#[cfg(all(test, not(target_arch = "wasm32")))]
 	#[inline]
 	pub(crate) fn is_replace(&self) -> bool {
 		is_replace_kind(self.kind())

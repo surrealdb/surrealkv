@@ -1175,14 +1175,11 @@ fn many_writers_over_live_background_tasks_see_exactly_what_was_acknowledged() {
 // ---------------------------------------------------------------------------
 
 /// A compaction that starts after an oversized batch of the group went to an L0 table, as the
-/// level task does right after the write, and before the group fails, keeps only the newest
-/// version of the key: the one that is never published. Read-write committers register a snapshot
-/// that keeps the older version, so the committers here are write-only.
-///
-/// Compaction does not treat the visible sequence number as a snapshot, so a compaction that is
-/// already running when the group fails can still take the visible version of a key.
+/// level task does right after the write, and before the group fails, finds a version of the key
+/// that was never published above the one readers see. It keeps both. Read-write committers
+/// register a snapshot that keeps the older version in any case, so the committers here are
+/// write-only.
 #[test(tokio::test)]
-#[ignore = "known gap: a compaction that started before the stop does not keep the visible version"]
 async fn a_compaction_that_ran_before_the_failure_does_not_take_the_visible_version() {
 	compaction_before_the_failure(true).await;
 }
