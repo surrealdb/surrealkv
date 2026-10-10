@@ -41,6 +41,22 @@ impl StallThresholds {
 	}
 }
 
+/// Waits for a pacing delay, which is a few hundred microseconds at most.
+///
+/// The wait happens on a thread of the blocking pool and not on a tokio timer, so that a runtime
+/// that was built without the time driver, which is what `tokio::runtime::Builder` gives unless
+/// `enable_time` or `enable_all` is called, does not panic in the commit path.
+#[cfg(not(target_arch = "wasm32"))]
+async fn pace(delay: Duration) {
+	let _ = tokio::task::spawn_blocking(move || std::thread::sleep(delay)).await;
+}
+
+/// There are no threads to block on wasm32, so the delay is a timer there, as it was.
+#[cfg(target_arch = "wasm32")]
+async fn pace(delay: Duration) {
+	tokio::time::sleep(delay).await;
+}
+
 /// Trait for getting current stall condition counts.
 /// Implementors provide live resource counts that the controller
 /// checks against its configured thresholds.
@@ -166,7 +182,7 @@ impl WriteStallController {
 				}
 
 				if pacing_micros > 0 {
-					tokio::time::sleep(Duration::from_micros(pacing_micros)).await;
+					pace(Duration::from_micros(pacing_micros)).await;
 				}
 
 				return Ok(None);

@@ -537,3 +537,29 @@ async fn test_memtable_rotation_under_concurrent_load() {
 	};
 	tree.close().await.unwrap();
 }
+
+/// A write that is close to a stall is paced by a short delay. The delay must not need the time
+/// driver of the runtime, which a runtime built without `enable_time` does not have.
+#[test]
+fn test_pacing_does_not_need_the_time_driver() {
+	for multi_thread in [false, true] {
+		let mut builder = if multi_thread {
+			let mut builder = tokio::runtime::Builder::new_multi_thread();
+			builder.worker_threads(2);
+			builder
+		} else {
+			tokio::runtime::Builder::new_current_thread()
+		};
+		let runtime = builder.build().unwrap();
+		runtime.block_on(async {
+			// One memtable below the limit of four, above the soft limit of two.
+			let provider = Arc::new(MockStallCountProvider::new(3, 0));
+			let controller = WriteStallController::new(provider, StallThresholds::new(4, 12));
+			let started = std::time::Instant::now();
+			assert!(controller.check().await.unwrap().is_none());
+			let paced = started.elapsed();
+			assert!(paced >= Duration::from_micros(200), "the write was not paced: {paced:?}");
+			assert!(paced < Duration::from_secs(5), "the pacing took {paced:?}");
+		});
+	}
+}
