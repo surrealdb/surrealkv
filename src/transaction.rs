@@ -361,6 +361,12 @@ pub struct Transaction {
 }
 
 impl Transaction {
+	/// Test observer: the start of this transaction's conflict window in the commit ring.
+	#[cfg(test)]
+	pub(crate) fn commit_window_for_test(&self) -> u64 {
+		self.commit_window
+	}
+
 	/// Bump the write sequence number and return it.
 	fn next_write_seqno(&mut self) -> u32 {
 		self.write_seqno += 1;

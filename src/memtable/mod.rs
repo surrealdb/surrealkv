@@ -285,6 +285,51 @@ impl MemTable {
 		Ok(())
 	}
 
+	/// As [`add`](Self::add), but moves the keys and values of `batch` into the memtable
+	/// instead of cloning them, and takes the batch's `memtable_size_estimate` from the caller,
+	/// which has already computed it.
+	///
+	/// On `Err(ArenaFull)` the batch is untouched, as with `add`. On `Ok(())` its entries are
+	/// spent: their keys are empty and their values `None`, and only `count()` is still
+	/// meaningful. Any other error means the estimate drifted from the arena after a successful
+	/// reservation, which cannot happen. It is `Error::Other`, not `ArenaFull`: the pipeline
+	/// retries `ArenaFull` with the same batch, and a batch that is partly spent would insert
+	/// empty keys.
+	pub(crate) fn add_owned(&self, batch: &mut Batch, needed: u64) -> Result<()> {
+		self.try_reserve(needed)?;
+		let _guard = ReservationGuard {
+			memtable: self,
+			bytes: needed,
+		};
+		let start_seq_num = batch.starting_seq_num;
+		for (i, entry) in batch.entries.iter_mut().enumerate() {
+			let seq_num = start_seq_num + i as u64;
+			if entry.kind == InternalKeyKind::RangeDelete {
+				let end_key = entry.value.clone().unwrap_or_default();
+				self.range_deletions.write().push((entry.key.clone(), end_key, seq_num));
+				self.has_range_deletions.store(true, Ordering::Release);
+			}
+
+			let trailer = (seq_num << 8) | (entry.kind as u64);
+			let value = entry.value.take();
+			let has_value = value.is_some();
+			// A delete stores an empty value.
+			let inserted = self.map.try_insert(
+				std::mem::take(&mut entry.key),
+				trailer,
+				value.unwrap_or_default(),
+			);
+			if let Err(full) = inserted {
+				entry.key = full.key;
+				entry.value = has_value.then_some(full.value);
+				tracing::error!("ArenaFull after reservation; memtable size estimator drift");
+				return Err(crate::Error::Other("memtable size estimate drift".to_string()));
+			}
+		}
+		self.update_latest_sequence_number(batch.get_highest_seq_num());
+		Ok(())
+	}
+
 	/// Applies the batch of operations to the in-memory table (memtable).
 	/// Returns (total_record_size, highest_seq_num_used).
 	fn apply_batch_to_memtable(&self, batch: &Batch) -> Result<u64> {

@@ -30,7 +30,10 @@
 //!
 //! Once the retired prefix passes an entry, its slot releases the entry but
 //! keeps its sequence number, so retired commits stop pinning memory while
-//! waiting a lap to be overwritten. The retired prefix never passes the
+//! waiting a lap to be overwritten. The release is not part of retiring: a
+//! large retired range is released a bounded number of slots at a time
+//! ([`CommitRing::release_retired`]), and until then the entry is still
+//! readable, though nothing reads it. The retired prefix never passes the
 //! completed prefix, so a released entry was complete, and a slot that
 //! holds its own sequence number without an entry reads as gone.
 
@@ -104,6 +107,9 @@ pub(crate) struct CommitRing<T> {
 	/// The highest sequence number that has been retired: no live or future
 	/// transaction's conflict window reaches at or below it.
 	taken: CachePadded<AtomicU64>,
+	/// The highest sequence number whose slot `release_retired` has visited,
+	/// never above `taken`.
+	released: CachePadded<AtomicU64>,
 }
 
 impl<T: RingEntry> CommitRing<T> {
@@ -128,6 +134,7 @@ impl<T: RingEntry> CommitRing<T> {
 			published: CachePadded::new(AtomicU64::new(start - 1)),
 			completed: CachePadded::new(AtomicU64::new(start - 1)),
 			taken: CachePadded::new(AtomicU64::new(start - 1)),
+			released: CachePadded::new(AtomicU64::new(start - 1)),
 		}
 	}
 
@@ -283,22 +290,39 @@ impl<T: RingEntry> CommitRing<T> {
 		}
 	}
 
-	/// Advances the retired watermark `taken`, releasing the entries it
-	/// passes so that retired slots stop pinning memory.
+	/// Raises the retired watermark `taken`. It releases nothing, however far it
+	/// moves: [`release_retired`](Self::release_retired) does.
 	///
 	/// The caller must guarantee that no live or future conflict window
 	/// reaches at or below `new_taken`. The watermark is also clamped to the
 	/// completed prefix, which keeps released slots out of the completed
 	/// prefix's own scan and makes every released entry a complete one.
-	pub(crate) fn advance_taken(&self, new_taken: u64) {
+	pub(crate) fn raise_taken(&self, new_taken: u64) {
 		let new_taken = new_taken.min(self.completed());
-		let prev = self.taken.fetch_max(new_taken, Ordering::SeqCst);
-		// Concurrent advances release disjoint ranges, and only the most
-		// recent lap of sequences can still hold an entry
-		let from = prev.max(new_taken.saturating_sub(self.capacity));
-		for seq in (from + 1)..=new_taken {
+		self.taken.fetch_max(new_taken, Ordering::SeqCst);
+	}
+
+	/// Releases the entries of up to `limit` slots that the retired watermark
+	/// has passed, lowest first, so that retired slots stop pinning memory,
+	/// and reports whether more are left.
+	pub(crate) fn release_retired(&self, limit: u64) -> bool {
+		let taken = self.taken();
+		// Only the most recent lap of sequences can still hold an entry
+		let from = self.released.load(Ordering::SeqCst).max(taken.saturating_sub(self.capacity));
+		let to = taken.min(from.saturating_add(limit));
+		for seq in (from + 1)..=to {
 			self.release(seq);
 		}
+		// Releasing a slot twice is harmless, so concurrent callers need no more than this
+		self.released.fetch_max(to, Ordering::SeqCst);
+		to < taken
+	}
+
+	/// Raises the retired watermark and releases every slot it passes.
+	#[cfg(test)]
+	pub(crate) fn advance_taken(&self, new_taken: u64) {
+		self.raise_taken(new_taken);
+		self.release_retired(u64::MAX);
 	}
 
 	/// Drops the entry of a retired sequence, keeping its sequence number.
@@ -638,6 +662,58 @@ mod tests {
 		advance(&ring);
 		assert_eq!(ring.published(), 5);
 		assert_eq!(ring.completed(), 5);
+	}
+
+	#[test]
+	fn raise_taken_releases_nothing() {
+		let ring = CommitRing::new(8, 1);
+		commit_all(&ring, 5);
+		ring.raise_taken(4);
+		assert_eq!(ring.taken(), 4);
+		assert_eq!(ring.occupied(), 5);
+		assert_eq!(seq_of(ring.get(1)), Some(1));
+	}
+
+	#[test]
+	fn release_retired_visits_at_most_the_limit_lowest_first() {
+		let ring = CommitRing::new(64, 1);
+		commit_all(&ring, 40);
+		ring.raise_taken(40);
+		assert!(ring.release_retired(16));
+		assert_eq!(ring.occupied(), 24);
+		assert!(is_gone(&ring.get(16)));
+		assert_eq!(seq_of(ring.get(17)), Some(17));
+		assert!(ring.release_retired(16));
+		assert_eq!(ring.occupied(), 8);
+		// The last eight are fewer than the limit
+		assert!(!ring.release_retired(16));
+		assert_eq!(ring.occupied(), 0);
+		assert!(!ring.release_retired(16));
+		assert_eq!(ring.taken(), 40);
+	}
+
+	#[test]
+	fn release_retired_never_passes_the_watermark() {
+		let ring = CommitRing::new(8, 1);
+		commit_all(&ring, 6);
+		ring.raise_taken(3);
+		assert!(!ring.release_retired(100));
+		assert_eq!(ring.occupied(), 3);
+		assert_eq!(seq_of(ring.get(4)), Some(4));
+		// The next call carries on from where the last one stopped
+		ring.raise_taken(6);
+		assert!(!ring.release_retired(100));
+		assert_eq!(ring.occupied(), 0);
+	}
+
+	#[test]
+	fn release_retired_skips_what_a_later_lap_overwrote() {
+		let ring = CommitRing::new(4, 1);
+		commit_all(&ring, 40);
+		ring.raise_taken(40);
+		// Only the last lap can hold entries, however many sequences were retired
+		assert!(!ring.release_retired(4));
+		assert_eq!(ring.occupied(), 0);
 	}
 
 	#[test]

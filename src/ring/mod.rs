@@ -5,8 +5,17 @@ mod queue;
 mod sync;
 
 pub(crate) use pipeline::CommitPipeline;
-#[cfg(test)]
-pub(crate) use pipeline::{CommitStage, PipelineHook, MAX_GROUP_BYTES, UNFENCED_STALE_ROUNDS};
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub(crate) use pipeline::{
+	CommitStage,
+	FreeStats,
+	PipelineHook,
+	MAX_GROUP_BYTES,
+	RETIRED_FREE_CHUNK,
+	RETIRE_EVERY_ENTRIES,
+	RETIRE_EVERY_GROUPS,
+	UNFENCED_STALE_ROUNDS,
+};
 
 /// The commit ring's capacity, for tests that need to lap it.
 #[cfg(test)]

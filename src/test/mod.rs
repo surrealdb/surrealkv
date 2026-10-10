@@ -29,6 +29,8 @@ pub mod crash_consistency_tests;
 #[cfg(test)]
 pub mod direct_l0_flush_tests;
 #[cfg(test)]
+pub mod flusher_alloc_diet_tests;
+#[cfg(test)]
 pub mod index_block_tests;
 #[cfg(test)]
 pub mod iterator_semantics_tests;
@@ -50,6 +52,10 @@ pub mod recovery_integration_tests;
 pub mod recovery_test_helpers;
 #[cfg(test)]
 pub mod recovery_tests;
+#[cfg(test)]
+pub mod retire_free_tests;
+#[cfg(test)]
+pub mod retire_isolation_tests;
 #[cfg(test)]
 pub mod snapshot_tests;
 #[cfg(test)]

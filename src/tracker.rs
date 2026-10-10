@@ -1,40 +1,30 @@
-// Tracks every live transaction's `start_seq_num` for the commit oracle's GC.
+// Tracks the pin of every live mutating transaction, for the commit ring's retire.
 //
-// Distinct from `SnapshotTracker`:
-//   - `SnapshotTracker` registers only read-bearing snapshots; it drives compaction MVCC retention.
-//   - `ActiveTxnTracker` registers every transaction including write-only ones (which have no
-//     `Snapshot`); it drives oracle map GC. The oracle's required watermark can advance faster than
-//     compaction's, so the two stay separate.
+// A mutating transaction (ReadWrite or WriteOnly) registers the completed prefix of the commit
+// ring that it read when it began (`CommitPipeline::commit_pin`). The flusher's `retire` scans
+// the oldest pin to decide how far the ring's retired watermark may advance. Read-only
+// transactions open no conflict window and do not register.
 //
-// Lock-free `SkipSet<(start_seq, unique_id)>`. `unique_id` differentiates
-// concurrent transactions that happen to share a `start_seq` so `remove`
-// in `Drop` doesn't collide.
+// Distinct from `SnapshotTracker`, which registers only read-bearing snapshots and drives
+// compaction's MVCC retention. The two watermarks advance independently, so the trackers stay
+// separate.
 //
-// Registration race window (KNOWN, DOCUMENTED, NOT FIXED PROTOCOL-SIDE):
-//   `Transaction::new` does
-//     `start_seq = visible_seq_num.load(); tracker.register(start_seq);`
-//   with no synchronization spanning the two operations. If the thread is
-//   preempted between them and a concurrent commit fires the oracle's GC
-//   body with `oldest_active > start_seq` (because no other live txn has
-//   `start_seq <= our start_seq` at that moment), `kept_since` rises past
-//   our `start_seq`. Our subsequent `oracle.check` then returns
-//   `TransactionRetry`.
+// A sharded set of `(pin, unique_id)`. `unique_id` differentiates concurrent transactions that
+// share a pin, so that `remove` in `Drop` does not collide.
 //
-//   This is benign:
-//     - `TransactionRetry` is already part of the public API contract and callers of
-//       `Transaction::commit` are required to retry.
-//     - On retry, `start_seq` is reloaded fresh and the race window does not re-apply.
-//     - Worst-case cost per occurrence: one extra `begin()` call, no I/O.
-//     - The race fires only when (a) `commits_since_gc` reaches `GC_INTERVAL` during the
-//       load+register window (typically microseconds), AND (b) no other live txn pins the
-//       oldest_active below our `start_seq`. Combined probability is low.
+// What the retired watermark is held to:
+//   It stays at or below the conflict WINDOW of every live mutating transaction, which is what
+//   validation needs, since a window reaches every entry above it. It does not stay at or below
+//   the oldest pin. `Transaction::new` reads the pin, registers it, then reads the window, with
+//   nothing spanning the three steps. A `retire` whose scan runs before the registration does
+//   not see the transaction, and may pass its pin as far as the completed prefix it read before
+//   the scan. The window is read after the registration from the same monotonic prefix, so it
+//   is at least that high. A scan that does see the pin is bounded by it, and the pin is read
+//   before the window, so it is at most the window.
 //
-//   Protocol-side fixes considered and rejected: every variant (mutex gate
-//   around load+register, retry loop, lock-free placeholder-then-update)
-//   adds ~10ns or more to every `begin()`. The cost arithmetic doesn't
-//   favor preventing a sub-1500ns/sec event by paying ~1ms/sec across all
-//   begins. Revisit if production benchmarks show the race firing often
-//   enough to dominate.
+//   An entry the watermark has not passed is kept where validation looks for it, in its ring
+//   slot or, once a lap has overwritten the slot, in the overflow map. A missing one counts as
+//   a conflict, so a watermark that lags costs memory and never correctness.
 
 use std::collections::BTreeSet;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -77,11 +67,11 @@ impl ActiveTxnTracker {
 		}
 	}
 
-	/// Register a transaction's start_seq. Returns an RAII guard whose `Drop`
+	/// Register a transaction's pin. Returns an RAII guard whose `Drop`
 	/// unregisters the entry.
-	pub(crate) fn register(self: &Arc<Self>, start_seq: u64) -> ActiveTxnGuard {
+	pub(crate) fn register(self: &Arc<Self>, pin: u64) -> ActiveTxnGuard {
 		let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-		let entry = (start_seq, id);
+		let entry = (pin, id);
 		let shard_idx = get_thread_shard_index();
 		self.shards[shard_idx].write().insert(entry);
 		ActiveTxnGuard {
@@ -92,7 +82,7 @@ impl ActiveTxnTracker {
 		}
 	}
 
-	/// Smallest `start_seq` currently registered. `None` if empty.
+	/// Smallest pin currently registered. `None` if empty.
 	pub(crate) fn oldest(&self) -> Option<u64> {
 		self.shards.iter().filter_map(|s| s.read().first().map(|e| e.0)).min()
 	}

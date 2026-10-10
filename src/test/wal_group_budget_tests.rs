@@ -25,7 +25,13 @@ use test_log::test;
 use tokio::task::JoinHandle;
 
 use crate::batch::Batch;
-use crate::ring::{PipelineHook, COMMIT_RING_CAPACITY, MAX_GROUP_BYTES};
+use crate::ring::{
+	PipelineHook,
+	COMMIT_RING_CAPACITY,
+	MAX_GROUP_BYTES,
+	RETIRE_EVERY_ENTRIES,
+	RETIRE_EVERY_GROUPS,
+};
 use crate::wal::parallel_recovery::decode_segment_batches;
 use crate::{Durability, Error, InternalKeyKind, Mode, Options, Tree};
 
@@ -152,6 +158,8 @@ pub(super) struct Flusher {
 	reached: Arc<AtomicUsize>,
 	/// Whether the flusher is parked in the hook.
 	held: Arc<AtomicBool>,
+	/// Whether the next group is held.
+	armed: Arc<AtomicBool>,
 	/// Whether the WAL had unsynced bytes at the end of an Immediate group's WAL step.
 	unsynced: Arc<Mutex<Vec<bool>>>,
 	/// At the same points: the free admission permits, and the entries published but not yet
@@ -171,6 +179,11 @@ impl Flusher {
 
 	pub(super) fn groups(&self) -> Vec<usize> {
 		self.groups.lock().unwrap().clone()
+	}
+
+	/// Holds the next group too, once the one held is released.
+	fn arm(&self) {
+		self.armed.store(true, Ordering::SeqCst);
 	}
 
 	pub(super) fn release(&self) {
@@ -248,6 +261,7 @@ fn hold_groups(tree: &Tree, every: bool, probe: impl Fn() + Send + Sync + 'stati
 		groups,
 		reached,
 		held,
+		armed,
 		unsynced,
 		permits,
 		release,
@@ -932,7 +946,7 @@ async fn admission_exhausted_by_accepted_and_aborted_entries_drains_through_spli
 }
 
 // ---------------------------------------------------------------------------
-// a ring that is lapped
+// a ring that is lapped, and the retire interval
 // ---------------------------------------------------------------------------
 
 /// More commits than the ring has slots, behind a held flusher, so the ring is lapped while the
@@ -994,6 +1008,69 @@ async fn a_pile_up_that_laps_the_ring_is_split_and_the_ring_stays_consistent() {
 		assert_eq!(pair[1].starting_seq_num, pair[0].starting_seq_num + 1, "contiguous");
 	}
 	assert_recovers(&live, &dir.path().join("image"), false, &all, &[], "lapped ring");
+
+	pipeline.set_hook(None);
+	mark_closed(&tree);
+	release_lock(&tree);
+}
+
+/// Retire is due after `RETIRE_EVERY_ENTRIES` drained entries as well as after
+/// `RETIRE_EVERY_GROUPS` groups, and a group that is cut drains only the entries it took. Waves
+/// of commits that each split into two groups drain more than the entry limit in fewer groups
+/// than the group limit, so the retired watermark moves only if the flusher counts the entries
+/// of every group it forms.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn split_groups_count_their_entries_towards_the_retire_interval() {
+	const WAVE: usize = 300;
+	const WAVES: usize = 5;
+	const VALUE: usize = 16 * 1024;
+	let _watchdog =
+		ProcessWatchdog::start("split_groups_count_their_entries_towards_the_retire_interval");
+	let permits = COMMIT_RING_CAPACITY / 2;
+	let dir = TempDir::new("wal_group_budget").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(options(&live, false)).unwrap());
+	let pipeline = &tree.core.commit_pipeline;
+	let flusher = hold_first_group(&tree);
+	let per_group = MAX_GROUP_BYTES / hint_of("w0_0000", &value_of(1, VALUE));
+	assert!(per_group < WAVE && WAVE < 2 * per_group, "control: a wave is two groups");
+	let groups_per_wave = 3;
+	assert!(WAVES * groups_per_wave < RETIRE_EVERY_GROUPS as usize, "control: too few groups");
+	assert!(
+		(WAVES * (1 + WAVE)) as u64 >= RETIRE_EVERY_ENTRIES,
+		"control: enough entries for the entry limit"
+	);
+
+	let mut expected_groups = Vec::new();
+	for wave in 0..WAVES {
+		if wave > 0 {
+			flusher.arm();
+		}
+		// Begun after the waves before it completed, so the transactions of this wave pin the
+		// retired watermark no lower than where they ended.
+		let gate = commit(&tree, &format!("gate_{wave}"), value_of(wave, 100));
+		until("the flusher to hold a group", || flusher.is_held()).await;
+		let items: Vec<(String, Vec<u8>)> = (0..WAVE)
+			.map(|i| (format!("w{wave}_{i:04}"), value_of(wave * WAVE + i + 1, VALUE)))
+			.collect();
+		let handles: Vec<_> = items.iter().map(|(k, v)| commit(&tree, k, v.clone())).collect();
+		until("the wave to be accepted", || pipeline.accepted_waiting() == 1 + WAVE).await;
+		flusher.release();
+		outcome(gate).await.unwrap();
+		assert_all_acked(handles).await;
+		until("every permit to come back", || pipeline.free_permits() == permits).await;
+		expected_groups.extend([1, per_group, WAVE - per_group]);
+	}
+	assert_eq!(flusher.groups(), expected_groups);
+
+	let (completed, taken, _) = pipeline.watermarks();
+	assert_eq!(completed as usize, WAVES * (1 + WAVE));
+	assert!(taken <= completed);
+	assert!(
+		taken > 0,
+		"{completed} entries were drained in {} groups and nothing was retired",
+		expected_groups.len()
+	);
 
 	pipeline.set_hook(None);
 	mark_closed(&tree);
