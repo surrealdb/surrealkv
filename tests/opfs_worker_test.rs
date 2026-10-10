@@ -19,8 +19,6 @@
 //!
 //! The browser keeps OPFS in its profile, so every test uses names no other test or run uses and
 //! removes its files with `remove_and_verify`, which also proves that every handle was closed.
-//! Tests marked `#[ignore]` document behaviour of the backend that is wrong; run them with
-//! `-- --include-ignored` to see the failure.
 
 #![cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 
@@ -717,7 +715,6 @@ async fn a_closed_file_rejects_reads_writes_and_flushes_and_keeps_its_data() {
 }
 
 #[wasm_bindgen_test]
-#[ignore = "dropping an OpfsSyncFile without calling close() keeps the exclusive handle, so the file cannot be opened again"]
 async fn dropping_an_unclosed_file_releases_its_exclusive_handle() {
 	let root = root().await;
 	let name = unique_name("drop-unclosed", "bin");
@@ -725,11 +722,32 @@ async fn dropping_an_unclosed_file_releases_its_exclusive_handle() {
 	file.write_at(0, b"abc").unwrap();
 	drop(file);
 
-	// Nothing refers to the file any more, so it must be possible to open it again. Today the
-	// browser still sees an open handle and answers NoModificationAllowedError.
+	// Nothing refers to the file any more, so it must be possible to open it again. A handle
+	// that was left open would make the browser answer NoModificationAllowedError.
 	let again = open_opfs_sync_file(&root, &name, false).await;
 	assert!(again.is_ok(), "reopening after a drop failed: {:?}", again.err());
 	again.unwrap().close();
+	remove_and_verify(&root, &name).await;
+}
+
+#[wasm_bindgen_test]
+async fn dropping_a_file_that_was_closed_does_not_touch_the_handle_that_replaced_it() {
+	let root = root().await;
+	let name = unique_name("drop-closed", "bin");
+	let first = create(&root, &name).await;
+	first.write_at(0, b"abc").unwrap();
+	first.close();
+
+	// The file is free again, a second handle takes it, and only then the first one is dropped.
+	// The drop of a handle that is already closed must neither throw nor release the second one.
+	let second = reopen(&root, &name).await;
+	drop(first);
+	let err = expect_err(open_opfs_sync_file(&root, &name, false).await, "a third handle");
+	assert!(err.contains("NoModificationAllowedError"), "{err}");
+	second.write_at(3, b"def").unwrap();
+	assert_eq!(read_all(&second), b"abcdef");
+
+	second.close();
 	remove_and_verify(&root, &name).await;
 }
 

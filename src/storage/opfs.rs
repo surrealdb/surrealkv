@@ -6,7 +6,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -25,9 +25,13 @@ use crate::storage::{BoxFuture, LogStore, ObjectStore};
 use crate::vfs::File;
 
 /// Synchronous file handle wrapping OPFS `FileSystemSyncAccessHandle`.
+///
+/// The browser gives the handle exclusive access to the file until it is closed, so the file is
+/// closed when this value is dropped, whether or not `close` was called before.
 pub struct OpfsSyncFile {
 	handle: FileSystemSyncAccessHandle,
 	size_cache: AtomicU64,
+	closed: AtomicBool,
 }
 
 unsafe impl Send for OpfsSyncFile {}
@@ -48,6 +52,7 @@ impl OpfsSyncFile {
 		Self {
 			handle,
 			size_cache: AtomicU64::new(initial_size),
+			closed: AtomicBool::new(false),
 		}
 	}
 
@@ -90,9 +95,20 @@ impl OpfsSyncFile {
 		Ok(self.size_cache.load(Ordering::Acquire))
 	}
 
-	/// Closes the sync access handle.
+	/// Closes the sync access handle. Closing a file again, or dropping it after it was closed,
+	/// does nothing.
 	pub fn close(&self) {
-		self.handle.close();
+		if !self.closed.swap(true, Ordering::AcqRel) {
+			self.handle.close();
+		}
+	}
+}
+
+impl Drop for OpfsSyncFile {
+	/// An exclusive handle that is never closed stays locked in the browser, and then the file
+	/// can neither be opened nor removed again.
+	fn drop(&mut self) {
+		self.close();
 	}
 }
 
