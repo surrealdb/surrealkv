@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -126,7 +127,10 @@ impl File for OpfsSyncFile {
 #[derive(Debug)]
 pub struct OpfsLogStore {
 	file: Arc<OpfsSyncFile>,
-	offset: AtomicU64,
+	/// Where the log ends: the offset after the last record that was written. A record takes its
+	/// place in the log when its append is first polled, and the end only moves once the record is
+	/// in the file.
+	end: Mutex<u64>,
 }
 
 impl OpfsLogStore {
@@ -134,20 +138,24 @@ impl OpfsLogStore {
 		let initial_size = file.size().unwrap_or(0);
 		Self {
 			file,
-			offset: AtomicU64::new(initial_size),
+			end: Mutex::new(initial_size),
 		}
 	}
 }
 
 impl LogStore for OpfsLogStore {
 	fn append(&self, data: &[u8]) -> BoxFuture<'_, u64> {
-		let len = data.len() as u64;
-		let write_offset = self.offset.fetch_add(len, Ordering::SeqCst);
-		let file = Arc::clone(&self.file);
 		let data = data.to_vec();
 		Box::pin(async move {
-			file.write_at(write_offset, &data)?;
-			Ok(write_offset + len)
+			// The record is placed and written in one step, with no await in between, under a lock
+			// that serializes the appends. A future that is dropped before it is polled has not
+			// touched the log, so it leaves no hole behind, and a write that fails leaves the end
+			// where it was, so no later record lands after bytes that were never written.
+			let mut end = self.end.lock();
+			let start = *end;
+			self.file.write_at(start, &data)?;
+			*end = start + data.len() as u64;
+			Ok(*end)
 		})
 	}
 
@@ -160,7 +168,7 @@ impl LogStore for OpfsLogStore {
 	}
 
 	fn size(&self) -> BoxFuture<'_, u64> {
-		let cur = self.offset.load(Ordering::Acquire);
+		let cur = *self.end.lock();
 		Box::pin(async move { Ok(cur) })
 	}
 }

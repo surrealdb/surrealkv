@@ -14,9 +14,6 @@
 //! 2. OPFS log store: layout in the file, out-of-order polling, durability across a reopen.
 //! 3. OPFS object store: reading what a log store wrote, empty files.
 //! 4. Closed files: operations fail instead of pretending to succeed.
-//!
-//! Tests marked `#[ignore]` document behaviour of the backend that is wrong; run them with
-//! `-- --include-ignored` to see the failure.
 
 #![cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
 
@@ -222,6 +219,37 @@ async fn append_futures_polled_in_the_reverse_order_still_do_not_overlap() {
 }
 
 #[wasm_bindgen_test]
+async fn an_append_takes_its_place_in_the_log_when_it_is_polled_and_dropped_ones_leave_no_trace() {
+	let root = root().await;
+	let name = unique_name("log-poll-order", "log");
+	let file = Arc::new(create(&root, &name).await);
+	let store = OpfsLogStore::new(Arc::clone(&file));
+
+	let (rec_a, rec_b, rec_c, rec_d) =
+		(pattern(21, 5), pattern(22, 6), pattern(23, 7), pattern(24, 8));
+	let a = store.append(&rec_a);
+	let b = store.append(&rec_b);
+	let c = store.append(&rec_c);
+	let d = store.append(&rec_d);
+
+	// Creating a future reserves nothing: the log is as empty as before.
+	assert_eq!(store.size().await.unwrap(), 0, "size() with four futures that were not polled");
+	assert!(read_all(&file).is_empty(), "the file with four futures that were not polled");
+
+	// The records go to the log in the order the futures are polled, and the ones that are
+	// dropped never go in.
+	drop(b);
+	assert_eq!(d.await.unwrap(), 8);
+	drop(c);
+	assert_eq!(a.await.unwrap(), 13);
+	assert_eq!(store.size().await.unwrap(), 13);
+	assert!(read_all(&file) == [&rec_d[..], &rec_a[..]].concat(), "d then a, nothing else");
+
+	file.close();
+	remove_and_verify(&root, &name).await;
+}
+
+#[wasm_bindgen_test]
 async fn synced_appends_survive_a_close_and_reopen_and_the_log_continues_at_its_end() {
 	const SEED: u64 = 0x1063;
 	let root = root().await;
@@ -378,7 +406,6 @@ async fn sync_append_and_read_on_a_closed_file_fail_instead_of_pretending_to_suc
 }
 
 #[wasm_bindgen_test]
-#[ignore = "a failed OpfsLogStore::append still advances size(), as if the record had been written"]
 async fn a_failed_append_does_not_advance_the_size_of_the_log() {
 	let root = root().await;
 	let name = unique_name("log-failed-append", "log");
@@ -389,8 +416,7 @@ async fn a_failed_append_does_not_advance_the_size_of_the_log() {
 	file.close();
 	assert!(log.append(b"abc").await.is_err(), "the append on a closed file fails");
 
-	// Nothing was written, so the log still ends where it did. Today size() is 8, three bytes
-	// past the end of the data.
+	// Nothing was written, so the log still ends where it did, not three bytes past the data.
 	assert_eq!(log.size().await.unwrap(), 5, "size() after a failed append");
 
 	let again = reopen(&root, &name).await;
@@ -400,7 +426,6 @@ async fn a_failed_append_does_not_advance_the_size_of_the_log() {
 }
 
 #[wasm_bindgen_test]
-#[ignore = "an append future dropped before it is polled reserves its byte range and leaves a hole of zeros in the log"]
 async fn an_append_future_dropped_unpolled_leaves_no_hole_in_the_log() {
 	let root = root().await;
 	let name = unique_name("log-dropped-append", "log");
