@@ -147,6 +147,33 @@ async fn test_shutdown_during_stall() {
 }
 
 #[test(tokio::test)]
+async fn test_failure_releases_stalled_writers_but_not_later_ones() {
+	let provider = Arc::new(MockStallCountProvider::new(2, 0));
+	let controller =
+		Arc::new(WriteStallController::new(Arc::clone(&provider) as _, default_thresholds()));
+
+	let stalled = Arc::clone(&controller);
+	let writer = tokio::spawn(async move { stalled.check().await });
+	time::sleep(Duration::from_millis(50)).await;
+	assert!(controller.is_stalled());
+
+	// A failure that may pass lets the writer waiting then go, with an error.
+	controller.signal_failure();
+	let result = time::timeout(Duration::from_secs(2), writer).await.unwrap().unwrap();
+	assert!(matches!(result.unwrap_err(), Error::PipelineStall));
+
+	// A writer that comes after it waits for the stall to clear, and then goes through.
+	let later = Arc::clone(&controller);
+	let writer = tokio::spawn(async move { later.check().await });
+	time::sleep(Duration::from_millis(50)).await;
+	assert!(!writer.is_finished(), "a failure that may pass does not refuse later writers");
+	provider.set_counts(0, 0);
+	controller.signal_work_done();
+	let result = time::timeout(Duration::from_secs(2), writer).await.unwrap().unwrap();
+	assert!(result.unwrap().is_some());
+}
+
+#[test(tokio::test)]
 async fn test_stall_wakes_on_signal() {
 	let provider = Arc::new(MockStallCountProvider::new(1, 5)); // Below threshold
 	let controller = Arc::new(WriteStallController::new(

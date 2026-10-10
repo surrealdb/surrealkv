@@ -666,12 +666,98 @@ impl LevelManifest {
 	}
 }
 
-/// Safely updates a file's content.
-pub(crate) fn replace_file_content<P: AsRef<Path>>(
-	file_path: P,
-	new_content: &[u8],
+/// Test-only: the step of `replace_file_content` that an injected failure stops at.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReplaceFailure {
+	/// Before the rename: the old file is untouched.
+	BeforeRename,
+	/// After the rename, as a failed fsync of the file or its directory does: the new file is in
+	/// place and may not be durable.
+	AfterRename,
+}
+
+#[cfg(test)]
+struct Failpoint {
+	path: PathBuf,
+	at: ReplaceFailure,
+	/// Replacements of `path` that succeed first.
+	skip: usize,
+	/// Replacements that fail after those, `usize::MAX` for every one.
+	times: usize,
+}
+
+#[cfg(test)]
+static FAILPOINTS: parking_lot::Mutex<Vec<Failpoint>> = parking_lot::Mutex::new(Vec::new());
+
+/// Test-only: after `skip` more replacements of `path` succeed, the next `times` fail at `at`
+/// (`usize::MAX` for all of them). The failpoint belongs to `path`, so tests running side by side
+/// do not meet each other's.
+#[cfg(test)]
+pub(crate) fn fail_replacements(path: &Path, at: ReplaceFailure, skip: usize, times: usize) {
+	let mut failpoints = FAILPOINTS.lock();
+	failpoints.retain(|f| f.path != path);
+	failpoints.push(Failpoint {
+		path: path.to_path_buf(),
+		at,
+		skip,
+		times,
+	});
+}
+
+/// Test-only: removes the failpoint of `path`.
+#[cfg(test)]
+pub(crate) fn heal_replacements(path: &Path) {
+	FAILPOINTS.lock().retain(|f| f.path != path);
+}
+
+/// Test-only: counts this replacement of `path` against its failpoint and says where it fails.
+#[cfg(test)]
+fn injected_failure(path: &Path) -> Option<ReplaceFailure> {
+	let mut failpoints = FAILPOINTS.lock();
+	let failpoint = failpoints.iter_mut().find(|f| f.path == path)?;
+	if failpoint.skip > 0 {
+		failpoint.skip -= 1;
+		return None;
+	}
+	let at = failpoint.at;
+	if failpoint.times != usize::MAX {
+		failpoint.times -= 1;
+		if failpoint.times == 0 {
+			failpoints.retain(|f| f.path != path);
+		}
+	}
+	Some(at)
+}
+
+/// Writes `content` to the temporary file `path`, syncs it and gives it `permissions`.
+fn write_temp_file(
+	path: &Path,
+	content: &[u8],
+	permissions: Option<std::fs::Permissions>,
 ) -> std::io::Result<()> {
+	{
+		let mut temp_file = SysFile::create(path)?;
+		temp_file.write_all(content)?;
+		temp_file.sync_all()?;
+	}
+
+	// Apply original permissions to temp file if they exist
+	if let Some(permissions) = permissions {
+		std::fs::set_permissions(path, permissions)?;
+	}
+	Ok(())
+}
+
+/// Safely updates a file's content.
+///
+/// A failure before the rename is an `Error::Io` and leaves the file as it was. A failure from
+/// the rename on is an `Error::ManifestWriteUncertain`: the new content may be in place, and
+/// until the directory is synced a crash may bring the old content back.
+pub(crate) fn replace_file_content<P: AsRef<Path>>(file_path: P, new_content: &[u8]) -> Result<()> {
 	let target_path = file_path.as_ref();
+	#[cfg(test)]
+	let injected = injected_failure(target_path);
 	let directory = target_path
 		.parent()
 		.ok_or(std::io::Error::new(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
@@ -684,36 +770,43 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(
 	// Get original file permissions if the file exists
 	let original_permissions = std::fs::metadata(target_path).ok().map(|m| m.permissions());
 
-	// Create and write to the temporary file
-	{
-		let mut temp_file = SysFile::create(&temp_path)?;
-		temp_file.write_all(new_content)?;
-		temp_file.sync_all()?;
+	let staged = write_temp_file(&temp_path, new_content, original_permissions);
+	#[cfg(test)]
+	let staged = staged.and_then(|()| match injected {
+		Some(ReplaceFailure::BeforeRename) => {
+			Err(std::io::Error::other("injected failure before the rename"))
+		}
+		_ => Ok(()),
+	});
+	if let Err(e) = staged {
+		// Clean up temp file: the target was not touched
+		let _ = std::fs::remove_file(&temp_path);
+		return Err(e.into());
 	}
 
-	// Apply original permissions to temp file if they exist
-	if let Some(permissions) = original_permissions {
-		if let Err(e) = std::fs::set_permissions(&temp_path, permissions) {
-			// Clean up temp file on permission error
-			let _ = std::fs::remove_file(&temp_path);
-			return Err(e);
-		}
-	}
+	let uncertain = |e: std::io::Error| {
+		Error::ManifestWriteUncertain(format!("replacing {}: {e}", target_path.display()))
+	};
 
 	// Atomically replace the target file with the temporary file
 	if let Err(e) = std::fs::rename(&temp_path, target_path) {
 		// Clean up temp file on rename failure
 		let _ = std::fs::remove_file(&temp_path);
-		return Err(e);
+		return Err(uncertain(e));
 	}
 
-	let updated_file = crate::vfs::open_for_sync(target_path)?;
-	updated_file.sync_all()?;
+	#[cfg(test)]
+	if injected == Some(ReplaceFailure::AfterRename) {
+		return Err(uncertain(std::io::Error::other("injected failure after the rename")));
+	}
+
+	let updated_file = crate::vfs::open_for_sync(target_path).map_err(uncertain)?;
+	updated_file.sync_all().map_err(uncertain)?;
 
 	// Make the rename itself durable: without a parent-directory fsync, a
 	// crash can revert the directory entry to the old file even though the
 	// new content was synced.
-	crate::lsm::fsync_directory(directory)?;
+	crate::lsm::fsync_directory(directory).map_err(uncertain)?;
 
 	Ok(())
 }

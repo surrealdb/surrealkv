@@ -189,6 +189,11 @@ pub(crate) struct CoreInner {
 	/// are orphans.
 	pub(crate) manifest_loaded_from_disk: bool,
 
+	/// Set when a flush's manifest write failed from the rename on: the manifest on disk may list
+	/// a table the one in memory does not. The next flush writes the one in memory again before
+	/// it writes a table, which would otherwise rewrite the file of a table the disk may list.
+	manifest_uncertain: AtomicBool,
+
 	/// Test-only observer called by `flush_immutable_to_sst` once the SST is on disk and before
 	/// the manifest is updated. An error from it fails the flush.
 	#[cfg(test)]
@@ -260,6 +265,7 @@ impl CoreInner {
 			group_wal_pin: AtomicU64::new(u64::MAX),
 			memory_controller,
 			manifest_loaded_from_disk,
+			manifest_uncertain: AtomicBool::new(false),
 			#[cfg(test)]
 			flush_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
@@ -296,6 +302,10 @@ impl CoreInner {
 	/// 3. Atomically applying the changeset to the manifest
 	/// 4. Removing the memtable from immutable_memtables tracking
 	///
+	/// A failure leaves the memtable tracked and the manifest in memory as it was, so the flush
+	/// can be run again. It is for the caller to say whether the failure stops the database.
+	/// A failure of the manifest write from the rename on is an `Error::ManifestWriteUncertain`.
+	///
 	/// It deletes no value-log files: recovery flushes the memtables it rebuilds one by one while
 	/// the ones after them are held outside the queue, and the files those point into must stay.
 	/// The flush of the queue does it, see `flush_oldest_immutable_to_sst`.
@@ -328,6 +338,8 @@ impl CoreInner {
 		hold: u64,
 	) -> Result<Arc<Table>> {
 		let collect_bptree = false;
+
+		self.settle_manifest()?;
 
 		// Step 1: Flush memtable to SST (with VLog separation for large values)
 		let (table, _bptree_entries) = memtable
@@ -384,12 +396,13 @@ impl CoreInner {
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
 			manifest.revert_changeset(rollback);
-			let error = Error::Other(format!(
-				"Failed to atomically update manifest: table_id={}, log_number={}: {}",
-				table_id, log_number, e
+			return Err(self.manifest_write_error(
+				e,
+				format!(
+					"Failed to atomically update manifest: table_id={}, log_number={}",
+					table_id, log_number
+				),
 			));
-			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
-			return Err(error);
 		}
 
 		// Remove successfully flushed memtable from immutables tracking. The
@@ -409,6 +422,31 @@ impl CoreInner {
 		);
 
 		Ok(table)
+	}
+
+	/// The error for a failed write of the manifest. An uncertain write keeps its kind, which
+	/// the background task does not retry, and makes the next flush settle the manifest first.
+	fn manifest_write_error(&self, error: Error, context: String) -> Error {
+		match error {
+			Error::ManifestWriteUncertain(_) => {
+				self.manifest_uncertain.store(true, Ordering::Release);
+				error
+			}
+			error => Error::Other(format!("{context}: {error}")),
+		}
+	}
+
+	/// Writes the manifest in memory to disk again if the last write of it was uncertain, so that
+	/// the disk holds exactly the tables in memory before a flush writes the file of one.
+	fn settle_manifest(&self) -> Result<()> {
+		if !self.manifest_uncertain.load(Ordering::Acquire) {
+			return Ok(());
+		}
+		let manifest = self.level_manifest.write()?;
+		write_manifest_to_disk(&manifest)
+			.map_err(|e| self.manifest_write_error(e, "Failed to settle the manifest".into()))?;
+		self.manifest_uncertain.store(false, Ordering::Release);
+		Ok(())
 	}
 
 	/// Writes a batch directly to a new Level 0 SSTable without inserting into a memtable.
@@ -995,13 +1033,10 @@ impl CoreInner {
 				let rollback = manifest.apply_changeset(&changeset)?;
 				if let Err(e) = write_manifest_to_disk(&manifest) {
 					manifest.revert_changeset(rollback);
-					let error = Error::Other(format!(
+					return Err(Error::Other(format!(
 						"Failed to update manifest log_number after immutable flush: {}",
 						e
-					));
-					self.error_handler
-						.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
-					return Err(error);
+					)));
 				}
 
 				tracing::debug!(
