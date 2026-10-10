@@ -7,12 +7,17 @@
 //! while fsynced files must survive intact. The `vfs::sync_tracker` ledger
 //! records which files were made durable via `vfs::fsync_file`.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use tempdir::TempDir;
 use test_log::test;
 
+use crate::batch::Batch;
 use crate::compaction::leveled::Strategy;
+use crate::lsm::CoreInner;
+use crate::ring::CommitPipeline;
+use crate::storage::{AffinityLogStore, BoxFuture, LogStore};
 use crate::vfs::sync_tracker;
 use crate::{Error, Options, Tree};
 
@@ -208,4 +213,182 @@ async fn manifest_referencing_zero_byte_sst_fails_cleanly() {
 		}
 		Err(other) => panic!("expected LoadManifestFail, got: {other}"),
 	}
+}
+
+/// Drops `tree` the way a crash would: no close, no flush.
+fn crash(tree: Tree) {
+	{
+		let mut lockfile = tree.core.inner.lockfile.lock().unwrap();
+		lockfile.release().unwrap();
+	}
+	drop(tree);
+}
+
+/// Recovery splits a WAL segment over several memtables when it holds more than
+/// one memtable's worth, e.g. after `max_memtable_size` shrank between restarts.
+/// Flushing the first part must not advance `log_number` past the segment: the
+/// rest of it is still only in the WAL, and the next recovery would skip it.
+#[test(tokio::test)]
+async fn crash_after_recovery_splits_a_wal_segment_must_not_lose_its_tail() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let path = temp_dir.path().to_path_buf();
+	let opts_with = |max_memtable_size| {
+		Arc::new(Options {
+			path: path.clone(),
+			max_memtable_size,
+			flush_on_close: false,
+			..Default::default()
+		})
+	};
+	let key = |i: u32| format!("key_{i:04}");
+	const KEYS: u32 = 200;
+
+	// Fill one WAL segment with a large memtable, then crash.
+	let tree = Tree::new(opts_with(4 * 1024 * 1024)).unwrap();
+	for i in 0..KEYS {
+		let mut txn = tree.begin().unwrap();
+		txn.set(key(i).as_bytes(), &[0xAB; 100]).unwrap();
+		txn.commit().await.unwrap();
+	}
+	crash(tree);
+
+	// Recover with a memtable far too small for that segment, which splits it, and
+	// crash again before the last part (now the active memtable) is flushed.
+	let tree = Tree::new(opts_with(16 * 1024)).unwrap();
+	assert!(
+		tree.core.inner.l0_file_count() > 0,
+		"recovery should have flushed part of the split segment"
+	);
+	crash(tree);
+
+	let tree = Tree::new(opts_with(4 * 1024 * 1024)).unwrap();
+	let txn = tree.begin().unwrap();
+	for i in 0..KEYS {
+		assert!(txn.get(key(i).as_bytes()).unwrap().is_some(), "{} was lost", key(i));
+	}
+}
+
+/// A commit group is written to the WAL as a whole and then applied batch by batch.
+/// If the memtable filled up midway and rotated (rotating the WAL with it), the
+/// rest of the group landed in a memtable tagged with the *next* WAL segment, while
+/// its records sat in the previous one. Flushing the older memtable then advanced
+/// `log_number` past that segment, so a crash lost the rest of the group.
+#[test(tokio::test)]
+async fn crash_after_memtable_fills_mid_group_must_not_lose_the_rest_of_the_group() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		max_memtable_size: 16 * 1024,
+		flush_on_close: false,
+		..Default::default()
+	});
+	let key = |i: u64| format!("key_{i:04}");
+	const KEYS: u64 = 200;
+
+	// One group of single-entry batches, together far larger than one memtable.
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let first_seq = tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1;
+	let batches: Vec<Batch> = (0..KEYS)
+		.map(|i| {
+			let mut batch = Batch::new(first_seq + i);
+			batch.set(key(i).into_bytes(), vec![0xAB; 100], 0).unwrap();
+			batch
+		})
+		.collect();
+	tree.core.commit_pipeline.flush_group(&batches, true).await.unwrap();
+	assert!(
+		!tree.core.inner.immutable_memtables.read().unwrap().is_empty(),
+		"the group should have filled at least one memtable"
+	);
+
+	// Flush the filled memtables (but not the active one), then crash.
+	tree.core.inner.flush_all_immutables_sync().unwrap();
+	crash(tree);
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let txn = tree.begin().unwrap();
+	for i in 0..KEYS {
+		assert!(txn.get(key(i).as_bytes()).unwrap().is_some(), "{} was lost", key(i));
+	}
+}
+
+/// A WAL log store that rotates the memtable and flushes it right after its first
+/// append, the way a concurrent `create_checkpoint` can.
+struct RotateAfterFirstAppend {
+	log_store: AffinityLogStore,
+	core: Arc<CoreInner>,
+	fired: AtomicBool,
+}
+
+impl std::fmt::Debug for RotateAfterFirstAppend {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("RotateAfterFirstAppend").finish()
+	}
+}
+
+impl LogStore for RotateAfterFirstAppend {
+	fn append(&self, data: &[u8]) -> BoxFuture<'_, u64> {
+		let append = self.log_store.append(data);
+		Box::pin(async move {
+			let offset = append.await?;
+			if !self.fired.swap(true, Ordering::SeqCst) {
+				self.core.rotate_memtable()?;
+				self.core.flush_all_immutables_sync()?;
+			}
+			Ok(offset)
+		})
+	}
+
+	fn sync(&self) -> BoxFuture<'_, ()> {
+		self.log_store.sync()
+	}
+
+	fn size(&self) -> BoxFuture<'_, u64> {
+		self.log_store.size()
+	}
+}
+
+/// A memtable rotation from outside the commit flusher (a checkpoint) can land while
+/// a run of batches is being appended to the WAL. The run's records then sit in the
+/// segment of the memtable that was just rotated out and flushed, which moved
+/// `log_number` past that segment, so the run must not just be applied to the new
+/// memtable: a crash before that one is flushed would lose it.
+#[test(tokio::test)]
+async fn crash_after_rotation_during_wal_append_must_not_lose_the_run() {
+	let temp_dir = TempDir::new("test").unwrap();
+	let opts = Arc::new(Options {
+		path: temp_dir.path().to_path_buf(),
+		flush_on_close: false,
+		..Default::default()
+	});
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	// Something for the rotation to rotate out.
+	{
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"before", b"value").unwrap();
+		txn.commit().await.unwrap();
+	}
+
+	let mut pipeline = CommitPipeline::new(
+		Arc::clone(&tree.core.inner),
+		Arc::clone(&tree.core.write_stall),
+		None,
+		tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1,
+	);
+	pipeline.log_store = Arc::new(RotateAfterFirstAppend {
+		log_store: AffinityLogStore::new(Arc::clone(&tree.core.inner.wal.inner)),
+		core: Arc::clone(&tree.core.inner),
+		fired: AtomicBool::new(false),
+	});
+
+	let mut batch = Batch::new(tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1);
+	batch.set(b"run".to_vec(), b"value".to_vec(), 0).unwrap();
+	pipeline.flush_group(&[batch], true).await.unwrap();
+	crash(tree);
+
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let txn = tree.begin().unwrap();
+	assert!(txn.get(b"before").unwrap().is_some(), "before was lost");
+	assert!(txn.get(b"run").unwrap().is_some(), "run was lost");
 }

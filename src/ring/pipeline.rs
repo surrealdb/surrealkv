@@ -402,7 +402,7 @@ impl CommitPipeline {
 	}
 
 	/// Flushes a group of batches to WAL and applies them to the Memtable.
-	async fn flush_group(&self, batches: &[Batch], sync: bool) -> Result<()> {
+	pub(crate) async fn flush_group(&self, batches: &[Batch], sync: bool) -> Result<()> {
 		// 1. Process batches: separate large values to VLog if enabled (WiscKey WAL bypass)
 		// and encode for WAL
 		let vlog_threshold = self.inner.opts.vlog_value_threshold;
@@ -447,81 +447,105 @@ impl CommitPipeline {
 			processed_batches.push(processed);
 		}
 
-		// 2. Append all batches to WAL asynchronously via LogStore in a single write
 		if let Some(vlog_inst) = vlog {
 			vlog_inst.flush()?;
 		}
 
+		// 2. Write the batches to the WAL and apply them to the active memtable, a run at
+		// a time. All of a memtable's data must sit in WAL segments up to its own, since
+		// flushing it advances the manifest's log_number past that segment. So when a
+		// batch doesn't fit, the memtable (and with it the WAL) is rotated *before* the
+		// batch is written to the WAL, never between the write and the apply.
+		let max_memtable_size = self.inner.opts.max_memtable_size as u64;
+		let mut remaining = &processed_batches[..];
+		while let Some(batch) = remaining.first() {
+			let needed = batch.memtable_size_estimate();
+			let mut active = Arc::clone(&*self.inner.active_memtable.read()?);
+			if needed <= max_memtable_size && !active.has_room_for(needed) {
+				self.inner.rotate_memtable()?;
+				if let Some(ref tm) = self.task_manager {
+					tm.wake_up_memtable();
+				}
+				active = Arc::clone(&*self.inner.active_memtable.read()?);
+			}
+			if needed > max_memtable_size || !active.has_room_for(needed) {
+				// Doesn't fit even in an empty memtable: bypass it and flush directly to L0.
+				self.write_direct_to_l0(batch, sync).await?;
+				remaining = &remaining[1..];
+				continue;
+			}
+
+			// Take the following batches along for as long as they fit too.
+			let mut run_size = needed;
+			let mut run_len = 1;
+			for next in &remaining[1..] {
+				let next_needed = next.memtable_size_estimate();
+				if !active.has_room_for(run_size + next_needed) {
+					break;
+				}
+				run_size += next_needed;
+				run_len += 1;
+			}
+			let (run, rest) = remaining.split_at(run_len);
+			loop {
+				self.append_to_wal(run, sync).await?;
+				let current = self.inner.active_memtable.read()?;
+				if Arc::ptr_eq(&current, &active) {
+					for batch in run {
+						current.add(batch)?;
+					}
+					break;
+				}
+				// Something outside the flusher (a checkpoint) rotated the memtable while
+				// the append was in flight, so the run's records may be in the segment of
+				// a memtable that's being flushed, past which log_number then advances.
+				// Write the run again into the current segment, which the new memtable
+				// owns. Replaying the records twice is harmless. The new memtable started
+				// empty, so the run fits.
+				active = Arc::clone(&current);
+			}
+			remaining = rest;
+		}
+
+		Ok(())
+	}
+
+	/// Appends `batches` to the WAL in order, syncing it (and the VLog) if `sync`.
+	async fn append_to_wal(&self, batches: &[Batch], sync: bool) -> Result<()> {
 		let mut wal_buffer = Vec::new();
-		for batch in &processed_batches {
+		for batch in batches {
 			wal_buffer.clear();
 			batch.encode_into(&mut wal_buffer)?;
 			self.log_store.append(&wal_buffer).await?;
 		}
 		if sync {
-			if let Some(vlog_inst) = vlog {
+			if let Some(vlog_inst) = self.inner.vlog.as_ref() {
 				vlog_inst.sync()?;
 			}
 			self.log_store.sync().await?;
 		}
+		Ok(())
+	}
 
-		// 3. Apply to Active Memtable (or Direct-to-L0 Flush if oversized)
-		let mut active = self.inner.active_memtable.read()?;
-		for batch in &processed_batches {
-			let needed = batch.memtable_size_estimate();
-			if needed > self.inner.opts.max_memtable_size as u64 {
-				// Batch exceeds max_memtable_size: bypass memtable and flush directly to L0.
-				// Seal the active memtable's WAL segment first (rotating it out if it holds
-				// earlier writes, or just rotating the WAL if it's already empty) so earlier
-				// writes stay ordered before this L0 table, and so no future write can land
-				// in the segment `write_batch_direct_to_l0_sst` is about to mark as captured.
-				drop(active);
-				let batch_wal_number = self.inner.seal_active_wal_segment()?;
-				if let Some(ref tm) = self.task_manager {
-					tm.wake_up_memtable();
-				}
-
-				let table_id = self.inner.level_manifest.read()?.next_table_id();
-				self.inner.write_batch_direct_to_l0_sst(batch, table_id, batch_wal_number)?;
-
-				if let Some(ref tm) = self.task_manager {
-					tm.wake_up_level();
-				}
-				active = self.inner.active_memtable.read()?;
-			} else {
-				match active.add(batch) {
-					Ok(()) => {}
-					Err(Error::ArenaFull) => {
-						drop(active);
-						self.inner.rotate_memtable()?;
-						if let Some(ref tm) = self.task_manager {
-							tm.wake_up_memtable();
-						}
-						active = self.inner.active_memtable.read()?;
-						if let Err(Error::ArenaFull) = active.add(batch) {
-							// If it still doesn't fit even in an empty fresh memtable,
-							// fallback to direct-to-L0 flush rather than failing hard.
-							// `active` is guaranteed empty here (freshly rotated), so seal
-							// its WAL segment too before advancing log_number past it.
-							drop(active);
-							let batch_wal_number = self.inner.seal_active_wal_segment()?;
-							let table_id = self.inner.level_manifest.read()?.next_table_id();
-							self.inner.write_batch_direct_to_l0_sst(
-								batch,
-								table_id,
-								batch_wal_number,
-							)?;
-							if let Some(ref tm) = self.task_manager {
-								tm.wake_up_level();
-							}
-							active = self.inner.active_memtable.read()?;
-						}
-					}
-					Err(e) => return Err(e),
-				}
-			}
+	/// Commits a batch too large for a memtable straight to a new L0 table.
+	///
+	/// The batch gets a WAL segment of its own: the current one is sealed (rotating the
+	/// memtable out if it holds writes) before the append and again after it, so
+	/// `write_batch_direct_to_l0_sst` can mark that segment as captured without skipping
+	/// any other write.
+	async fn write_direct_to_l0(&self, batch: &Batch, sync: bool) -> Result<()> {
+		self.inner.seal_active_wal_segment()?;
+		if let Some(ref tm) = self.task_manager {
+			tm.wake_up_memtable();
 		}
+		self.append_to_wal(std::slice::from_ref(batch), sync).await?;
+		let batch_wal_number = self.inner.seal_active_wal_segment()?;
 
+		let table_id = self.inner.level_manifest.read()?.next_table_id();
+		self.inner.write_batch_direct_to_l0_sst(batch, table_id, batch_wal_number)?;
+		if let Some(ref tm) = self.task_manager {
+			tm.wake_up_level();
+		}
 		Ok(())
 	}
 
