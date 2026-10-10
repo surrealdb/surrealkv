@@ -1862,9 +1862,6 @@ async fn values_that_only_the_wal_points_to_survive_a_restart_next_to_orphans() 
 /// Commits that are larger than a memtable and go straight to level 0, as a bulk load makes
 /// them: the value log is collected as the older rounds are compacted away, like any other.
 #[test(tokio::test)]
-#[ignore = "a commit written straight to level 0 lowers the bound of the empty active memtable, \
-            which is never rotated while every commit goes straight to level 0: the bound stays at \
-            the first such commit's file and no value-log file is ever deleted"]
 async fn commits_that_go_straight_to_level_0_do_not_pin_the_value_log() {
 	let dir = TempDir::new("vlog_gc_oversized").unwrap();
 	let tree = quiet_tree_with(Options {

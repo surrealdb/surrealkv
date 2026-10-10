@@ -788,6 +788,12 @@ pub(crate) struct VLog {
 
 	/// Number of live [`VLogPin`]s. While there is one, no file is deleted.
 	pins: AtomicUsize,
+
+	/// The file that the commit group in flight started in, `u32::MAX` while there is none. Set
+	/// by [`pin_group`](Self::pin_group), by the one flusher (and by the test-only `flush_group`,
+	/// which must not run beside it): a second group at a time would release the pin of the
+	/// first.
+	group_floor: AtomicU32,
 }
 
 /// Keeps a [`VLog`] from deleting files until it is dropped.
@@ -796,6 +802,16 @@ pub(crate) struct VLogPin<'a>(&'a VLog);
 impl Drop for VLogPin<'_> {
 	fn drop(&mut self) {
 		self.0.pins.fetch_sub(1, Ordering::SeqCst);
+	}
+}
+
+/// Keeps a [`VLog`] from deleting the files that the values of a commit group are written to
+/// until it is dropped, see [`VLog::pin_group`].
+pub(crate) struct VLogGroupPin<'a>(&'a VLog);
+
+impl Drop for VLogGroupPin<'_> {
+	fn drop(&mut self) {
+		self.0.group_floor.store(u32::MAX, Ordering::SeqCst);
 	}
 }
 
@@ -825,6 +841,7 @@ impl VLog {
 			#[cfg(test)]
 			sync_gap: Mutex::new(None),
 			pins: AtomicUsize::new(0),
+			group_floor: AtomicU32::new(u32::MAX),
 		};
 
 		// PRE-FILL ALL EXISTING FILE HANDLES ON STARTUP
@@ -1210,6 +1227,39 @@ impl VLog {
 	pub(crate) fn pin_files(&self) -> VLogPin<'_> {
 		self.pins.fetch_add(1, Ordering::SeqCst);
 		VLogPin(self)
+	}
+
+	/// Pins the files that the values of a commit group are about to be written to. The flusher
+	/// takes it before it appends the first value of the group and drops it once the group is in
+	/// a memtable or a table, or, for a group that failed with its records logged, once the
+	/// active memtable accounts for the files they point into. Every value of the group goes to
+	/// the file that is active now or a later one.
+	///
+	/// Between the first append and that point the values are in no table and in no memtable, so
+	/// the bound of a cleanup (`lsm::vlog_floor`) cannot see them. [`unregistered_floor`]
+	/// (Self::unregistered_floor) makes the cleanup keep them.
+	pub(crate) fn pin_group(&self) -> VLogGroupPin<'_> {
+		self.group_floor.store(self.active_writer_id.load(Ordering::SeqCst), Ordering::SeqCst);
+		VLogGroupPin(self)
+	}
+
+	/// The smallest file that a cleanup may not delete, whatever the tables and memtables say:
+	/// the files of values that no table and no memtable points into yet. A cleanup reads it
+	/// before it reads them, for the argument that it is enough:
+	///
+	/// - A group that started before the active file was read has its pin read next, if it is still
+	///   held. Its values are in files at or above the pin.
+	/// - A group that released its pin before it was read has put its values into a memtable or a
+	///   table first (the release is sequentially consistent, and the reads of the bound that
+	///   follow see what came before it).
+	/// - A group that starts after the pin was read appends to files at or above the active file
+	///   that was read first, since the active file only grows.
+	///
+	/// The active file comes first for the third case: read after the pin, it could already be a
+	/// file that such a group rolled over to, and the files of the group below it would go.
+	pub(crate) fn unregistered_floor(&self) -> u32 {
+		let active = self.active_writer_id.load(Ordering::SeqCst);
+		active.min(self.group_floor.load(Ordering::SeqCst))
 	}
 
 	/// Cleans up obsolete vlog files based on the global minimum file id that anything points into.

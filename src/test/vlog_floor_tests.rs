@@ -1007,6 +1007,62 @@ async fn an_oversized_commit_keeps_its_files_while_it_flushes_a_queued_memtable(
 	crash(&tree);
 }
 
+/// Whether the pin of a commit group is held: the values of a group are written to files after
+/// the one that was active when it started, so with a rollover in the group a pin that is still
+/// held is below the active file.
+fn group_pinned(tree: &Tree) -> bool {
+	let vlog = tree.core.inner.vlog.as_ref().unwrap();
+	vlog.unregistered_floor() < vlog.active_writer_id.load(Ordering::SeqCst)
+}
+
+/// The pin that keeps the files of a group until they are in a memtable or a table is released
+/// when the group is done, and a committer that is told its commit is done finds it released:
+/// after a commit that went to a memtable, and after one that went straight to a table.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn the_pin_of_a_commit_group_is_released_when_the_commit_is_done() {
+	let root = TempDir::new("vlog_floor_group_pin").unwrap();
+	let tree = quiet_tree(&root.path().join("live")).await;
+	let vlog = tree.core.inner.vlog.as_ref().unwrap();
+
+	put(&tree, 0..4, 1).await;
+	assert!(vlog.active_writer_id.load(Ordering::SeqCst) >= 2, "the group rolled over");
+	assert!(!group_pinned(&tree), "a commit that went to a memtable");
+
+	let started_in = vlog.active_writer_id.load(Ordering::SeqCst);
+	put_oversized(&tree, &[10, 11, 12], 2).await;
+	assert!(vlog.active_writer_id.load(Ordering::SeqCst) > started_in, "the group rolled over");
+	assert!(!group_pinned(&tree), "a commit that went straight to a table");
+	crash(&tree);
+}
+
+/// The pin is released when the group fails too, once the active memtable accounts for the
+/// files its records point into: a pin that stayed would keep the log from ever being cleaned.
+#[cfg(unix)]
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn the_pin_of_a_commit_group_is_released_when_the_group_fails() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let root = TempDir::new("vlog_floor_group_pin_failed").unwrap();
+	let live = root.path().join("live");
+	let tree = quiet_tree(&live).await;
+	let active_min = || tree.core.inner.active_memtable.read().unwrap().min_vlog_file_id();
+	assert_eq!(active_min(), None, "nothing points into the value log yet");
+
+	let sstables = live.join("sstables");
+	std::fs::set_permissions(&sstables, std::fs::Permissions::from_mode(0o555)).unwrap();
+	let outcome = put_oversized_outcome(&tree, &[500, 501, 502]).await;
+	std::fs::set_permissions(&sstables, std::fs::Permissions::from_mode(0o755)).unwrap();
+	assert!(outcome.is_err(), "the table of the oversized batch cannot be created");
+
+	assert!(!group_pinned(&tree), "a group that failed");
+	assert_eq!(
+		active_min(),
+		Some(vlog_files(&live)[0]),
+		"the active memtable accounts for the files of the failed group"
+	);
+	crash(&tree);
+}
+
 /// What a group that failed after its record was logged leaves behind, then a table written past
 /// it twice, a compaction that drops the first one's values and so every file older than the
 /// second one's, and a crash. `fail` says whether the group's fsync fails or the group is
