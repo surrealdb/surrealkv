@@ -4,7 +4,9 @@
 //! of the same file can report success for them. A commit acknowledged by such an fsync would sit
 //! behind a hole, and recovery stops at the first hole. So the first failed fsync ends the
 //! segment: every later append and sync on it fails, and only a rotation (a new segment, a new
-//! writer) lets commits through again, exactly as for a failed append.
+//! writer) lets commits through again, exactly as for a failed append. The commit pipeline does
+//! it before it logs its next group, and the segment that replaces one whose fsync failed is held
+//! until the memtables of the failed segment are in tables (see `wal_replace_tests`).
 //!
 //! Every fsync call site is covered: the flusher's group sync, the sync of re-appended stale
 //! records, `flush_wal(true)` (an fsync outside the WAL lock), `close`, the sync of the old
@@ -342,7 +344,8 @@ fn a_poisoned_writer_with_nothing_pending_still_refuses_to_sync() {
 }
 
 /// A segment poisoned by a failed fsync is replaced by a rotation, the way one poisoned by a
-/// failed append is, and the new segment takes appends and syncs.
+/// failed append is. The new segment is held, because what the failed one holds is of unknown
+/// durability: it refuses appends and syncs until the hold is released, and takes them after.
 #[test]
 fn a_rotation_replaces_a_writer_poisoned_by_a_failed_fsync() {
 	let dir = TempDir::new("wal_fsync").unwrap();
@@ -365,6 +368,9 @@ fn a_rotation_replaces_a_writer_poisoned_by_a_failed_fsync() {
 	assert_eq!(*calls.lock().unwrap(), 0, "and the segment that failed is not fsynced again");
 
 	assert!(!wal.sync_failed());
+	assert!(wal.append(&wal_record(4, "after")).unwrap_err().to_string().contains("held"));
+	assert!(wal.sync().unwrap_err().to_string().contains("held"));
+	wal.release_hold(1);
 	wal.append(&wal_record(4, "after")).unwrap();
 	wal.sync().unwrap();
 	wal.close().unwrap();
@@ -387,6 +393,7 @@ fn a_failed_fsync_of_the_old_segment_fails_the_rotation_once() {
 	assert!(wal.append(&wal_record(2, "b")).is_err(), "the segment is poisoned now");
 
 	assert_eq!(wal.rotate().unwrap(), 1);
+	wal.release_hold(1);
 	wal.append(&wal_record(3, "c")).unwrap();
 	wal.sync().unwrap();
 	wal.close().unwrap();
@@ -413,6 +420,7 @@ fn a_failed_fsync_of_the_cut_after_a_failed_append_poisons_the_segment() {
 	wal.set_sync_observer(Some(Arc::new(move || *counter.lock().unwrap() += 1)));
 	assert_eq!(wal.rotate().unwrap(), 1);
 	assert_eq!(*calls.lock().unwrap(), 0, "the segment that failed is not fsynced again");
+	wal.release_hold(1);
 	wal.append(&wal_record(3, "after")).unwrap();
 	wal.close().unwrap();
 	assert_eq!(wal_keys(dir.path()), ["acked", "after"]);
@@ -496,14 +504,15 @@ async fn a_failed_group_fsync_fails_every_waiter_and_applies_nothing() {
 	finish(&tree);
 }
 
-/// After the failure later commits fail instead of being acknowledged by a retried fsync, with
-/// either durability, and so does `flush_wal(true)`. The segment is not written to again and
-/// the data the failed fsync left pending stays pending.
+/// After the failure `flush_wal(true)` fails instead of retrying the fsync, and no commit is
+/// acknowledged by a retried fsync either: the next commit replaces the segment, and the segment
+/// that failed is not written to again. The data the failed fsync left pending stays pending.
 #[test(tokio::test)]
-async fn later_commits_fail_instead_of_retrying_the_fsync() {
+async fn later_commits_replace_the_segment_instead_of_retrying_the_fsync() {
 	let dir = TempDir::new("wal_fsync").unwrap();
 	let tree = open_tree(dir.path()).await;
-	let segment = seg_path(dir.path(), active(&tree));
+	let first = active(&tree);
+	let segment = seg_path(dir.path(), first);
 
 	commit_ok(&tree, &pairs("acked", 2, b'a'), Durability::Immediate).await;
 	arm(&tree, 0);
@@ -512,24 +521,25 @@ async fn later_commits_fail_instead_of_retrying_the_fsync() {
 	assert!(len_after_failure > 0, "the failed group is in the segment");
 	assert!(pending_sync(&tree), "the fsync that failed left its data pending");
 
-	for round in 0..3 {
-		for durability in [Durability::Immediate, Durability::Eventual] {
-			let key = format!("later{round}{durability:?}");
-			let results = commit_group(&tree, &[(key.clone(), vec![b'l'; 40])], durability).await;
-			let errors = all_failed(&results);
-			assert!(
-				errors[0].contains("poisoned by an earlier failed sync"),
-				"{durability:?}: {}",
-				errors[0]
-			);
-			assert_eq!(get(&tree, &key), None);
-		}
+	for _ in 0..3 {
 		let err = tree.flush_wal(true).unwrap_err();
 		assert!(err.to_string().contains("poisoned by an earlier failed sync"), "{err}");
 	}
 	assert!(tree.flush_wal(false).is_ok(), "a flush to the OS cache is not an fsync");
-	assert_eq!(file_len(&segment), len_after_failure, "a poisoned segment takes no bytes");
-	assert!(pending_sync(&tree), "and no retry cleared what the failed fsync left pending");
+	assert_eq!(active(&tree), first, "nothing but a commit replaces the segment");
+
+	for durability in [Durability::Immediate, Durability::Eventual] {
+		let key = format!("later{durability:?}");
+		let results = commit_group(&tree, &[(key.clone(), vec![b'l'; 40])], durability).await;
+		assert!(results[0].is_ok(), "{durability:?}: {results:?}");
+		assert_eq!(get(&tree, &key), Some(vec![b'l'; 40]));
+	}
+	assert_eq!(active(&tree), first + 1);
+	assert!(!segment.exists(), "its memtable is in a table, so the segment that failed is removed");
+	for (key, value) in pairs("acked", 2, b'a') {
+		assert_eq!(get(&tree, &key), Some(value), "{key}");
+	}
+	tree.flush_wal(true).unwrap();
 	finish(&tree);
 }
 
@@ -555,8 +565,9 @@ async fn eventual_commits_never_reach_the_fsync_and_stay_readable_after_a_failur
 	finish(&tree);
 }
 
-/// A rotation clears the poison of a failed fsync as it clears the one of a failed append: the
-/// next group goes into the new segment and is acknowledged, and flush_wal(true) works again.
+/// A rotation replaces the poisoned writer of a failed fsync as it replaces the one of a failed
+/// append, with a held one: it refuses `flush_wal(true)` until the next group, which flushes the
+/// memtable of the failed segment and releases it, goes into the new segment and is acknowledged.
 #[test(tokio::test)]
 async fn a_rotation_clears_the_poison_of_a_failed_fsync() {
 	let dir = TempDir::new("wal_fsync").unwrap();
@@ -568,11 +579,13 @@ async fn a_rotation_clears_the_poison_of_a_failed_fsync() {
 	arm(&tree, 0);
 	let doomed = pairs("doomed", 4, b'd');
 	all_failed(&commit_group(&tree, &doomed, Durability::Immediate).await);
-	all_failed(&commit_group(&tree, &pairs("later", 1, b'l'), Durability::Immediate).await);
 	assert!(tree.flush_wal(true).is_err());
 
 	tree.core.inner.rotate_memtable().unwrap();
 	assert!(!tree.core.inner.wal.read().sync_failed());
+	assert!(tree.core.inner.wal.read().is_held());
+	let err = tree.flush_wal(true).unwrap_err();
+	assert!(err.to_string().contains("WAL segment is held"), "{err}");
 	let again = pairs("again", 3, b'g');
 	commit_ok(&tree, &again, Durability::Immediate).await;
 	commit_ok(&tree, &pairs("eventual", 2, b'e'), Durability::Eventual).await;
@@ -646,12 +659,11 @@ async fn an_eventual_commit_in_a_group_with_an_immediate_one_fails_with_it() {
 	finish(&tree);
 }
 
-/// The flusher rotates before it logs a batch that does not fit what is left of a non-empty
-/// memtable, and a rotation replaces a poisoned segment. So the first commit that does not fit is
-/// acknowledged in a new segment with nobody asking for a rotation. Besides a checkpoint, it is
-/// the only way a running database leaves the poison: with an empty memtable, or a batch that is
-/// larger than the whole memtable (it is logged first), the database stays write-dead until a
-/// restart.
+/// The flusher replaces a poisoned segment before it logs a group, and only then looks at whether
+/// the batch fits what is left of the memtable. The memtable of the failed segment is flushed
+/// when it is replaced, so a commit larger than what was left of it is acknowledged in the new
+/// segment without a second rotation, and the data the failed segment held reads back from a
+/// table.
 #[test(tokio::test)]
 async fn a_commit_that_does_not_fit_the_memtable_replaces_the_poisoned_segment() {
 	let dir = TempDir::new("wal_fsync").unwrap();
@@ -662,15 +674,15 @@ async fn a_commit_that_does_not_fit_the_memtable_replaces_the_poisoned_segment()
 
 	arm(&tree, 0);
 	assert!(commit_one(&tree, "doomed", Durability::Immediate).await.is_err());
-	assert!(commit_one(&tree, "doomed2", Durability::Immediate).await.is_err());
 	assert!(sync_failed(&tree));
 	assert_eq!(active(&tree), first);
 
 	let mut txn = tree.begin().unwrap();
 	txn.set(b"big", &[b'b'; 1800]).unwrap();
 	txn.commit().await.unwrap();
-	assert_eq!(active(&tree), first + 1, "rotated by the commit");
+	assert_eq!(active(&tree), first + 1, "replaced by the commit");
 	assert!(!sync_failed(&tree));
+	assert_eq!(tree.core.inner.l0_file_count(), 1);
 	assert_eq!(get(&tree, "big"), Some(vec![b'b'; 1800]));
 	assert_eq!(get(&tree, "doomed"), None);
 	for (key, value) in &prefill {
@@ -712,7 +724,8 @@ async fn a_checkpoint_replaces_a_poisoned_segment_and_leaves_out_the_failed_grou
 }
 
 /// `flush_wal(true)` fsyncs outside the WAL lock. A failure there poisons the segment just the
-/// same: the retry fails instead of succeeding, and so does every commit.
+/// same: the retry fails instead of succeeding. The next commit replaces the segment, after
+/// which `flush_wal(true)` works again.
 #[test(tokio::test)]
 async fn a_failed_flush_wal_poisons_the_segment() {
 	let dir = TempDir::new("wal_fsync").unwrap();
@@ -727,10 +740,13 @@ async fn a_failed_flush_wal_poisons_the_segment() {
 	let err = tree.flush_wal(true).unwrap_err();
 	assert!(err.to_string().contains("poisoned by an earlier failed sync"), "retry: {err}");
 	for durability in [Durability::Immediate, Durability::Eventual] {
-		all_failed(&commit_group(&tree, &pairs("later", 1, b'l'), durability).await);
+		let key = format!("later{durability:?}");
+		commit_group(&tree, &[(key, vec![b'l'; 40])], durability)
+			.await
+			.into_iter()
+			.for_each(|result| result.unwrap());
 	}
 
-	tree.core.inner.rotate_memtable().unwrap();
 	tree.flush_wal(true).unwrap();
 	commit_ok(&tree, &pairs("again", 2, b'g'), Durability::Immediate).await;
 	finish(&tree);
@@ -774,14 +790,15 @@ async fn a_failed_fsync_of_a_reappended_group_fails_it_and_poisons_the_new_segme
 		assert_eq!(get(&tree, key), None, "{key}");
 	}
 	tree.core.commit_pipeline.set_hook(None);
-	all_failed(&commit_group(&tree, &pairs("later", 1, b'l'), Durability::Immediate).await);
 
 	// Nothing was applied to the new memtable, so `rotate_memtable` is a no-op and leaves the
-	// poison, as it does for a failed append; sealing the segment rotates it anyway.
+	// poison, as it does for a failed append. The next commit replaces the segment, and the
+	// memtable the rotation queued is flushed before it is acknowledged.
 	tree.core.inner.rotate_memtable().unwrap();
 	assert!(tree.core.inner.wal.read().sync_failed());
-	tree.core.inner.seal_active_wal_segment().unwrap();
 	commit_ok(&tree, &pairs("again", 1, b'g'), Durability::Immediate).await;
+	assert_eq!(active(&tree), first + 2);
+	assert_eq!(tree.core.inner.immutable_count(), 0);
 	for (key, value) in &acked {
 		assert_eq!(get(&tree, key).as_deref(), Some(value.as_slice()), "{key}");
 	}
@@ -789,7 +806,8 @@ async fn a_failed_fsync_of_a_reappended_group_fails_it_and_poisons_the_new_segme
 }
 
 /// A rotation whose fsync of the old segment fails is an error, leaves the active memtable
-/// where it was, and poisons the writer. The next rotation goes ahead.
+/// where it was, and poisons the writer. The next commit replaces the segment, flushing the
+/// memtable first.
 #[test(tokio::test)]
 async fn a_failed_fsync_in_a_memtable_rotation_leaves_the_memtable_in_place() {
 	let dir = TempDir::new("wal_fsync").unwrap();
@@ -805,12 +823,12 @@ async fn a_failed_fsync_in_a_memtable_rotation_leaves_the_memtable_in_place() {
 	assert_eq!(active(&tree), first);
 	assert_eq!(tree.core.inner.active_memtable.read().unwrap().get_wal_number(), first);
 	assert_eq!(tree.core.inner.immutable_count(), 0);
-	all_failed(&commit_group(&tree, &pairs("doomed", 1, b'd'), Durability::Immediate).await);
 
-	tree.core.inner.rotate_memtable().unwrap();
+	commit_ok(&tree, &pairs("next", 2, b'n'), Durability::Immediate).await;
 	assert_eq!(active(&tree), first + 1);
 	assert_eq!(tree.core.inner.active_memtable.read().unwrap().get_wal_number(), first + 1);
-	assert_eq!(tree.core.inner.immutable_count(), 1);
+	assert_eq!(tree.core.inner.immutable_count(), 0);
+	assert_eq!(tree.core.inner.l0_file_count(), 1);
 	commit_ok(&tree, &pairs("again", 2, b'g'), Durability::Immediate).await;
 	for (key, value) in &eventual {
 		assert_eq!(get(&tree, key).as_deref(), Some(value.as_slice()), "{key}");
@@ -893,15 +911,13 @@ struct Failed {
 	eventual_end: u64,
 	/// Where the records of the failed group end.
 	record_ends: Vec<u64>,
-	/// Commits made after the failure that were acknowledged. There must be none: they would sit
-	/// behind the failed group in its segment, and a hole there takes them with it.
-	later_acked: Vec<String>,
 }
 
 /// An acknowledged Immediate group, an Eventual commit and then an Immediate group whose fsync
-/// fails, on a tree that is then left as it is. `rotate` rotates it afterwards and acknowledges
-/// another group in the new segment. Returns the id of the segment that was damaged.
-async fn fail_a_group(live: &Path, rotate: bool) -> (Arc<Tree>, u64, Failed) {
+/// fails, on a tree that is then left as it is: the next commit would replace the segment, flush
+/// the memtable and remove the segment, so the images are taken from it now. Returns the id of the
+/// segment that was damaged.
+async fn fail_a_group(live: &Path) -> (Arc<Tree>, u64, Failed) {
 	let tree = open_tree(live).await;
 	let damaged = active(&tree);
 	let segment = seg_path(live, damaged);
@@ -920,48 +936,16 @@ async fn fail_a_group(live: &Path, rotate: bool) -> (Arc<Tree>, u64, Failed) {
 		acked_end,
 		eventual_end,
 		record_ends: group_records.iter().map(|(end, _)| *end).collect(),
-		later_acked: Vec::new(),
 	};
 	assert_eq!(failed.group, ["doomed0", "doomed1", "doomed2", "doomed3"]);
-
-	let later = pairs("later", 2, b'l');
-	let results = commit_group(&tree, &later, Durability::Immediate).await;
-	let failed = Failed {
-		later_acked: later
-			.iter()
-			.zip(&results)
-			.filter(|(_, result)| result.is_ok())
-			.map(|((key, _), _)| key.clone())
-			.collect(),
-		..failed
-	};
-
-	if rotate {
-		tree.core.inner.rotate_memtable().unwrap();
-		commit_ok(&tree, &pairs("again", 3, b'g'), Durability::Immediate).await;
-	}
 	(tree, damaged, failed)
 }
 
 /// Every acknowledged commit is recovered with its value, and of the failed group a prefix of
 /// whole records: nothing torn, nothing out of order.
-fn assert_recovered(
-	image: &Tree,
-	failed: &Failed,
-	acknowledged_later: bool,
-	eventual_kept: bool,
-	at: &str,
-) {
+fn assert_recovered(image: &Tree, failed: &Failed, eventual_kept: bool, at: &str) {
 	for (key, value) in pairs("acked", 3, b'a') {
 		assert_eq!(get(image, &key), Some(value), "{at}: {key} was acknowledged");
-	}
-	if acknowledged_later {
-		for (key, value) in pairs("again", 3, b'g') {
-			assert_eq!(get(image, &key), Some(value), "{at}: {key} was acknowledged");
-		}
-	}
-	for key in &failed.later_acked {
-		assert_eq!(get(image, key), Some(vec![b'l'; 40]), "{at}: {key} was acknowledged");
 	}
 	if eventual_kept {
 		assert_eq!(get(image, "eventual0"), Some(vec![b'e'; 40]), "{at}");
@@ -981,74 +965,68 @@ fn assert_recovered(
 /// the segment cut or zeroed at every record boundary of the failed group and inside each
 /// record, and the Eventual commit gone with it. Every acknowledged group is recovered in all of
 /// them; the failed group is wholly there or wholly absent in the live copy and in the images
-/// that drop all of it, and a prefix of whole records otherwise. Run with the failed segment
-/// last, and with a rotation and an acknowledged group after it.
+/// that drop all of it, and a prefix of whole records otherwise. The failed segment is the last
+/// one.
 #[test(tokio::test)]
 async fn a_crash_after_a_failed_fsync_recovers_every_acknowledged_group() {
-	for rotate in [false, true] {
-		let root = TempDir::new("wal_fsync").unwrap();
-		let live = root.path().join("live");
-		let (tree, damaged, failed) = fail_a_group(&live, rotate).await;
+	let root = TempDir::new("wal_fsync").unwrap();
+	let live = root.path().join("live");
+	let (tree, damaged, failed) = fail_a_group(&live).await;
 
-		let mut damages = vec![
-			Damage::None,
-			Damage::CutAt(failed.eventual_end),
-			Damage::CutAt(failed.acked_end),
-			Damage::ZeroFrom(failed.eventual_end),
-			Damage::ZeroFrom(failed.acked_end),
-		];
-		let mut start = failed.eventual_end;
-		for end in &failed.record_ends {
-			damages.push(Damage::CutAt(*end));
-			damages.push(Damage::CutAt(start + (end - start) / 2));
-			damages.push(Damage::ZeroFrom(*end));
-			start = *end;
-		}
-
-		for (n, damage) in damages.into_iter().enumerate() {
-			let image = root.path().join(format!("image{n}"));
-			copy_dir(&live, &image);
-			let segment = seg_path(&image, damaged);
-			let at = format!("rotate={rotate}, {damage:?}");
-			match damage {
-				Damage::None => {}
-				Damage::CutAt(at) => set_len(&segment, at),
-				Damage::ZeroFrom(from) => zero_range(&segment, from, file_len(&segment)),
-			}
-			let eventual_kept = match damage {
-				Damage::None => true,
-				Damage::CutAt(at) | Damage::ZeroFrom(at) => at >= failed.eventual_end,
-			};
-
-			let reopened = reopen(&image);
-			assert_recovered(&reopened, &failed, rotate, eventual_kept, &at);
-			let present = failed.group.iter().filter(|k| get(&reopened, k).is_some()).count();
-			match damage {
-				// Nothing was dropped: every byte of the failed group is in the segment.
-				Damage::None => assert_eq!(present, failed.group.len(), "{at}"),
-				Damage::CutAt(cut) | Damage::ZeroFrom(cut) if cut <= failed.eventual_end => {
-					assert_eq!(present, 0, "{at}: the group was dropped whole")
-				}
-				_ => {}
-			}
-
-			// The recovered database takes commits again, and keeps them across another restart.
-			if !rotate {
-				let tree = Arc::new(reopened);
-				commit_ok(&tree, &pairs("fresh", 2, b'f'), Durability::Immediate).await;
-				finish(&tree);
-				let again = reopen(&image);
-				for (key, value) in pairs("fresh", 2, b'f') {
-					assert_eq!(get(&again, &key), Some(value), "{at}: {key}");
-				}
-				assert_recovered(&again, &failed, false, eventual_kept, &at);
-				finish(&again);
-			} else {
-				finish(&reopened);
-			}
-		}
-		finish(&tree);
+	let mut damages = vec![
+		Damage::None,
+		Damage::CutAt(failed.eventual_end),
+		Damage::CutAt(failed.acked_end),
+		Damage::ZeroFrom(failed.eventual_end),
+		Damage::ZeroFrom(failed.acked_end),
+	];
+	let mut start = failed.eventual_end;
+	for end in &failed.record_ends {
+		damages.push(Damage::CutAt(*end));
+		damages.push(Damage::CutAt(start + (end - start) / 2));
+		damages.push(Damage::ZeroFrom(*end));
+		start = *end;
 	}
+
+	for (n, damage) in damages.into_iter().enumerate() {
+		let image = root.path().join(format!("image{n}"));
+		copy_dir(&live, &image);
+		let segment = seg_path(&image, damaged);
+		let at = format!("{damage:?}");
+		match damage {
+			Damage::None => {}
+			Damage::CutAt(at) => set_len(&segment, at),
+			Damage::ZeroFrom(from) => zero_range(&segment, from, file_len(&segment)),
+		}
+		let eventual_kept = match damage {
+			Damage::None => true,
+			Damage::CutAt(at) | Damage::ZeroFrom(at) => at >= failed.eventual_end,
+		};
+
+		let reopened = reopen(&image);
+		assert_recovered(&reopened, &failed, eventual_kept, &at);
+		let present = failed.group.iter().filter(|k| get(&reopened, k).is_some()).count();
+		match damage {
+			// Nothing was dropped: every byte of the failed group is in the segment.
+			Damage::None => assert_eq!(present, failed.group.len(), "{at}"),
+			Damage::CutAt(cut) | Damage::ZeroFrom(cut) if cut <= failed.eventual_end => {
+				assert_eq!(present, 0, "{at}: the group was dropped whole")
+			}
+			_ => {}
+		}
+
+		// The recovered database takes commits again, and keeps them across another restart.
+		let tree = Arc::new(reopened);
+		commit_ok(&tree, &pairs("fresh", 2, b'f'), Durability::Immediate).await;
+		finish(&tree);
+		let again = reopen(&image);
+		for (key, value) in pairs("fresh", 2, b'f') {
+			assert_eq!(get(&again, &key), Some(value), "{at}: {key}");
+		}
+		assert_recovered(&again, &failed, eventual_kept, &at);
+		finish(&again);
+	}
+	finish(&tree);
 }
 
 fn assert_all(tree: &Tree, entries: &[(String, Vec<u8>)], at: &str) {
@@ -1066,45 +1044,48 @@ enum Dropped {
 	Hole(u64, u64),
 }
 
-/// An image of a failed group followed by a rotation and acknowledged groups, damaged as above,
-/// reopened with the default recovery: everything acknowledged is back, the database takes new
-/// commits, and a second restart still has all of it. The first restart repairs the damaged
-/// segment, which is not the last one.
+/// A failed group in a segment whose memtables are all in tables. Replacing the segment flushes
+/// nothing, so it stays on disk while groups are acknowledged behind it. An image of that,
+/// damaged as above and reopened with the default recovery: everything acknowledged is back, the
+/// database takes new commits, and a second restart still has all of it. The first restart
+/// repairs the damaged segment, which is not the last one.
 #[test(tokio::test)]
 async fn a_damaged_segment_that_is_not_the_last_is_repaired_once_and_stays_repaired() {
 	let root = TempDir::new("wal_fsync").unwrap();
 	let live = root.path().join("live");
 	let tree = open_tree(&live).await;
-	let damaged_id = active(&tree);
-	let segment = seg_path(&live, damaged_id);
 
 	let acked = pairs("acked", 3, b'a');
 	commit_ok(&tree, &acked, Durability::Immediate).await;
-	let acked_end = file_len(&segment);
-	commit_ok(&tree, &pairs("eventual", 2, b'e'), Durability::Eventual).await;
-	let eventual_end = file_len(&segment);
+	tree.core.inner.rotate_memtable().unwrap();
+	tree.core.inner.flush_all_immutables_sync().unwrap();
+	let damaged_id = active(&tree);
+	let segment = seg_path(&live, damaged_id);
+	assert_eq!(file_len(&segment), 0);
+
 	arm(&tree, 0);
 	all_failed(&commit_group(&tree, &pairs("doomed", 4, b'd'), Durability::Immediate).await);
 	let doomed_end = file_len(&segment);
-	tree.core.inner.rotate_memtable().unwrap();
+	assert!(doomed_end > 200, "{doomed_end}");
 	let again = pairs("again", 3, b'g');
 	commit_ok(&tree, &again, Durability::Immediate).await;
+	assert_eq!(active(&tree), damaged_id + 1);
+	assert!(segment.exists(), "nothing was flushed, so the segment that failed stays");
 	// An Eventual commit and an Immediate one in the new segment, behind the damaged one.
 	commit_ok(&tree, &pairs("tail", 2, b't'), Durability::Eventual).await;
 	let last = pairs("last", 1, b'z');
 	commit_ok(&tree, &last, Durability::Immediate).await;
 
 	let damages = [
-		Dropped::Cut(acked_end),
-		Dropped::Cut(eventual_end),
-		Dropped::Cut(eventual_end + 11),
+		Dropped::Cut(0),
+		Dropped::Cut(11),
+		Dropped::Cut(doomed_end / 2),
 		Dropped::Cut(doomed_end - 3),
-		Dropped::ZeroTail(acked_end),
-		Dropped::ZeroTail(eventual_end + 11),
-		Dropped::Hole(acked_end, eventual_end),
-		Dropped::Hole(acked_end + 5, acked_end + 300),
-		Dropped::Hole(eventual_end, doomed_end - 1),
-		Dropped::Hole(eventual_end + 20, eventual_end + 21),
+		Dropped::ZeroTail(0),
+		Dropped::ZeroTail(doomed_end / 2),
+		Dropped::Hole(5, 100),
+		Dropped::Hole(doomed_end / 2, doomed_end - 1),
+		Dropped::Hole(20, 21),
 	];
 	for (n, damage) in damages.into_iter().enumerate() {
 		let at = format!("{damage:?}");
@@ -1165,6 +1146,22 @@ async fn a_failed_group_with_value_log_values_never_dangles_in_a_crash_image() {
 	arm(&tree, 0);
 	let doomed = blobs("doomed", b'd');
 	all_failed(&commit_group(&tree, &doomed, Durability::Immediate).await);
+
+	// The segment holds the failed group until the next commit replaces it and the memtable is
+	// flushed, so the image of it is taken first.
+	let failed_image = dir.path().join("failed_image");
+	copy_dir(&live, &failed_image);
+	let reopened = Tree::new(vlog_opts(&failed_image)).unwrap();
+	for (key, value) in &acked {
+		assert_eq!(get(&reopened, key).as_deref(), Some(value.as_slice()), "{key}");
+	}
+	for (key, value) in &doomed {
+		if let Some(read) = get(&reopened, key) {
+			assert_eq!(&read, value, "{key}: the record is there and its value is not");
+		}
+	}
+	finish(&reopened);
+
 	tree.core.inner.rotate_memtable().unwrap();
 	let later = blobs("later", b'l');
 	commit_ok(&tree, &later, Durability::Immediate).await;
@@ -1174,11 +1171,6 @@ async fn a_failed_group_with_value_log_values_never_dangles_in_a_crash_image() {
 	let reopened = Tree::new(vlog_opts(&image)).unwrap();
 	for (key, value) in acked.iter().chain(&later) {
 		assert_eq!(get(&reopened, key).as_deref(), Some(value.as_slice()), "{key}");
-	}
-	for (key, value) in &doomed {
-		if let Some(read) = get(&reopened, key) {
-			assert_eq!(&read, value, "{key}: the record is there and its value is not");
-		}
 	}
 	finish(&reopened);
 	finish(&tree);
@@ -1269,7 +1261,7 @@ async fn a_commit_appended_during_a_failing_out_of_lock_fsync_is_not_acknowledge
 	let commit = {
 		let tree = Arc::clone(&tree);
 		tokio::spawn(async move {
-			commit_group(&tree, &pairs("during", 3, b'u'), Durability::Immediate).await
+			commit_group(&tree, &pairs("during", 1, b'u'), Durability::Immediate).await
 		})
 	};
 	// The append is not held up by the fsync in flight, which holds no WAL lock, and the fsync
@@ -1292,7 +1284,7 @@ async fn a_commit_appended_during_a_failing_out_of_lock_fsync_is_not_acknowledge
 	assert!(errors[0].contains("poisoned by an earlier failed sync"), "{}", errors[0]);
 	assert_eq!(pause.calls.load(Ordering::SeqCst), 1, "the commit's fsync never reached the file");
 	assert_eq!(tree.core.inner.visible_seq_num.load(Ordering::SeqCst), visible);
-	for (key, _) in pairs("during", 3, b'u') {
+	for (key, _) in pairs("during", 1, b'u') {
 		assert_eq!(get(&tree, &key), None, "{key}");
 	}
 	finish(&tree);
@@ -1430,15 +1422,89 @@ impl Outcomes {
 	}
 }
 
+/// An image of the data directory, with the keys that were acknowledged before it was taken.
+type Snapshots = Vec<(PathBuf, Vec<String>)>;
+
+/// The first record of every segment of `dir` that was not acknowledged, as `(segment id, offset)`.
+/// Panics if a record that was acknowledged sits behind one that was not in the same segment,
+/// which is the hole recovery would stop at.
+fn first_failed_records(dir: &Path, failed: &HashSet<&str>, at: &str) -> Vec<(u64, u64)> {
+	let mut segments: Vec<PathBuf> = fs::read_dir(dir.join("wal"))
+		.unwrap()
+		.map(|e| e.unwrap().path())
+		.filter(|p| p.extension().is_some_and(|ext| ext == "wal"))
+		.collect();
+	segments.sort();
+	let mut first_failed = Vec::new();
+	for segment in &segments {
+		let mut start = 0;
+		let mut hole = None;
+		for (end, batch) in records_with_ends(segment) {
+			let keys = keys_of(&batch);
+			let any_failed = keys.iter().any(|k| failed.contains(k.as_str()));
+			if hole.is_none() && any_failed {
+				hole = Some(start);
+			}
+			if hole.is_some() && !any_failed {
+				panic!(
+					"{at}: {keys:?} was acknowledged behind a failed record in {}",
+					segment.display()
+				);
+			}
+			start = end;
+		}
+		if let Some(hole) = hole {
+			let id: u64 =
+				segment.file_stem().unwrap().to_str().unwrap().parse().expect("segment id");
+			first_failed.push((id, hole));
+		}
+	}
+	first_failed
+}
+
+/// Reopens copies of `dir` as they are, and with each segment cut, or zero-filled, from its first
+/// record that was not acknowledged: every key of `acknowledged` is recovered. Returns how many
+/// segments held a failed record.
+fn recover_acknowledged(
+	root: &Path,
+	dir: &Path,
+	failed: &HashSet<&str>,
+	acknowledged: &[String],
+	damages: &[&str],
+	at: &str,
+) -> usize {
+	let first_failed = first_failed_records(dir, failed, at);
+	for (n, damage) in damages.iter().enumerate() {
+		let image = root.join(format!("{}-image{n}", at.replace(' ', "-")));
+		copy_dir(dir, &image);
+		for (id, hole) in &first_failed {
+			let segment = seg_path(&image, *id);
+			match *damage {
+				"cut" => set_len(&segment, *hole),
+				"zero" => zero_range(&segment, *hole, file_len(&segment)),
+				_ => {}
+			}
+		}
+		let reopened = reopen(&image);
+		for key in acknowledged {
+			assert!(get(&reopened, key).is_some(), "{at}, {damage}: {key} was acknowledged");
+		}
+		finish(&reopened);
+	}
+	first_failed.len()
+}
+
 /// Single-key Immediate commits from several tasks, `flush_wal(true)` from a thread, and a thread
-/// that replaces the WAL segment whenever its fsync failed and arms the next two segments to fail
-/// too, all against failing fsyncs. Whatever the interleaving:
+/// that arms the next two segments to fail too once the commit path has replaced a failed one by
+/// itself, all against failing fsyncs. Whatever the interleaving:
 ///
 /// - a commit that failed is not readable, and one that was acknowledged is;
 /// - in no segment is a record that was acknowledged behind one that was not, which is the hole
 ///   recovery would stop at;
 /// - every acknowledged commit is recovered from the live files and from images in which each
-///   segment is cut, or zero-filled, from its first record that was not acknowledged.
+///   segment is cut, or zero-filled, from its first record that was not acknowledged. The images
+///   include one taken inside every flush of a memtable of a replaced segment, where the failed
+///   segment still exists, and everything acknowledged by then is recovered from it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn acknowledged_commits_never_sit_behind_a_failed_one_under_concurrent_failures() {
 	// `(first fsync to fail, flush_wal(true) thread running)`. Without that thread the first
@@ -1449,13 +1515,46 @@ async fn acknowledged_commits_never_sit_behind_a_failed_one_under_concurrent_fai
 		let root = TempDir::new("wal_fsync").unwrap();
 		let live = root.path().join("live");
 		let tree = open_tree(&live).await;
+		tree.core.commit_pipeline.set_replace_backoff(Duration::ZERO, Duration::ZERO);
 		let outcomes = Arc::new(Mutex::new(Outcomes::default()));
 		let base = pairs("base", 3, b'a');
 		commit_ok(&tree, &base, Durability::Immediate).await;
+
+		// An image of the directory, and what was acknowledged before it was taken, inside every
+		// flush of a memtable of a failed segment.
+		let snapshots: Arc<Mutex<Snapshots>> = Arc::default();
+		{
+			let (outcomes, snapshots, live) =
+				(Arc::clone(&outcomes), Arc::clone(&snapshots), live.clone());
+			let root = root.path().to_path_buf();
+			*tree.core.inner.flush_hook.lock() = Some(Arc::new(move |_| {
+				let mut acknowledged: Vec<String> =
+					pairs("base", 3, b'a').into_iter().map(|(key, _)| key).collect();
+				acknowledged.extend(
+					outcomes
+						.lock()
+						.unwrap()
+						.commits
+						.iter()
+						.filter(|(_, ok)| *ok)
+						.map(|(key, _)| key.clone()),
+				);
+				let mut snapshots = snapshots.lock().unwrap();
+				let image = root.join(format!("snapshot{}", snapshots.len()));
+				copy_dir(&live, &image);
+				snapshots.push((image, acknowledged));
+				Ok(())
+			}));
+		}
+		let initial = active(&tree);
 		arm(&tree, fail_at);
 
 		let stop = Arc::new(AtomicBool::new(false));
 		let _stop_on_failure = SetOnDrop(Arc::clone(&stop));
+		// Set once every failure of the script is armed. Which thread meets a failure first, a
+		// committer or the `flush_wal(true)` thread, is up to the scheduler, so the number of
+		// failed commits cannot be what the round waits for when that thread runs.
+		let all_armed = Arc::new(AtomicBool::new(false));
 		let mut writers = Vec::new();
 		for writer in 0..4 {
 			let (tree, outcomes, stop) =
@@ -1488,14 +1587,21 @@ async fn acknowledged_commits_never_sit_behind_a_failed_one_under_concurrent_fai
 			}));
 		}
 		{
-			let (tree, stop) = (Arc::clone(&tree), Arc::clone(&stop));
+			let (tree, stop, all_armed) =
+				(Arc::clone(&tree), Arc::clone(&stop), Arc::clone(&all_armed));
 			threads.push(spawn_bounded(move || {
-				// Three segments are replaced, the last of them armed to fail never.
+				// Three segments are replaced by the commit path, the last of them armed to fail
+				// never.
 				let mut next = [Some(2usize), Some(0), None].into_iter();
+				let mut seen = initial;
 				while !stop.load(Ordering::Acquire) {
-					if sync_failed(&tree) && tree.core.inner.seal_active_wal_segment().is_ok() {
-						if let Some(Some(syncs)) = next.next() {
-							arm(&tree, syncs);
+					let now = active(&tree);
+					if now != seen {
+						seen = now;
+						match next.next() {
+							Some(Some(syncs)) => arm(&tree, syncs),
+							Some(None) => all_armed.store(true, Ordering::Release),
+							None => {}
 						}
 					}
 					std::thread::sleep(Duration::from_millis(2));
@@ -1507,7 +1613,9 @@ async fn acknowledged_commits_never_sit_behind_a_failed_one_under_concurrent_fai
 		loop {
 			{
 				let outcomes = outcomes.lock().unwrap();
-				if outcomes.acknowledged_after_first_failure() >= 12 && outcomes.failures() >= 2 {
+				let failed_enough =
+					outcomes.failures() >= 2 || (with_flush && all_armed.load(Ordering::Acquire));
+				if outcomes.acknowledged_after_first_failure() >= 12 && failed_enough {
 					break;
 				}
 			}
@@ -1536,7 +1644,8 @@ async fn acknowledged_commits_never_sit_behind_a_failed_one_under_concurrent_fai
 			finished(thread);
 		}
 
-		let outcomes = Arc::try_unwrap(outcomes).ok().unwrap().into_inner().unwrap();
+		*tree.core.inner.flush_hook.lock() = None;
+		let outcomes = std::mem::take(&mut *outcomes.lock().unwrap());
 		let mut acknowledged: Vec<String> = base.iter().map(|(key, _)| key.clone()).collect();
 		acknowledged.extend(outcomes.commits.iter().filter(|(_, ok)| *ok).map(|(k, _)| k.clone()));
 
@@ -1548,69 +1657,37 @@ async fn acknowledged_commits_never_sit_behind_a_failed_one_under_concurrent_fai
 			}
 		}
 
-		// Segments: no acknowledged record behind a failed one.
+		// Segments and images: no acknowledged record behind a failed one, and everything
+		// acknowledged is recovered, from the live files and from the images taken inside the
+		// flushes.
 		let failed: HashSet<&str> =
 			outcomes.commits.iter().filter(|(_, ok)| !*ok).map(|(k, _)| k.as_str()).collect();
-		let mut segments: Vec<PathBuf> = fs::read_dir(live.join("wal"))
-			.unwrap()
-			.map(|e| e.unwrap().path())
-			.filter(|p| p.extension().is_some_and(|ext| ext == "wal"))
-			.collect();
-		segments.sort();
-		let mut first_failed: Vec<(u64, u64)> = Vec::new();
-		for segment in &segments {
-			let mut start = 0;
-			let mut hole = None;
-			for (end, batch) in records_with_ends(segment) {
-				let keys = keys_of(&batch);
-				let any_failed = keys.iter().any(|k| failed.contains(k.as_str()));
-				if hole.is_none() && any_failed {
-					hole = Some(start);
-				}
-				if hole.is_some() && !any_failed {
-					panic!(
-						"round {round}: {keys:?} was acknowledged behind a failed record in {}",
-						segment.display()
-					);
-				}
-				start = end;
-			}
-			if let Some(hole) = hole {
-				let id: u64 =
-					segment.file_stem().unwrap().to_str().unwrap().parse().expect("segment id");
-				first_failed.push((id, hole));
-			}
-		}
-		failed_records_seen += first_failed.len();
-		if !with_flush {
-			assert!(!first_failed.is_empty(), "round {round}: a failed group left no record");
-		}
-
-		// Images: the live files, and each segment cut or zero-filled from its first failed record.
-		let images: &[&str] = if round == 1 {
+		let damages: &[&str] = if round == 1 {
 			&["live", "cut", "zero"]
 		} else {
 			&["live", "zero"]
 		};
-		for (n, damage) in images.iter().enumerate() {
-			let image = root.path().join(format!("image{n}"));
-			copy_dir(&live, &image);
-			for (id, hole) in &first_failed {
-				let segment = seg_path(&image, *id);
-				match *damage {
-					"cut" => set_len(&segment, *hole),
-					"zero" => zero_range(&segment, *hole, file_len(&segment)),
-					_ => {}
-				}
-			}
-			let reopened = reopen(&image);
-			for key in &acknowledged {
-				assert!(
-					get(&reopened, key).is_some(),
-					"round {round}, {damage}: {key} was acknowledged"
-				);
-			}
-			finish(&reopened);
+		let mut seen_in_round = recover_acknowledged(
+			root.path(),
+			&live,
+			&failed,
+			&acknowledged,
+			damages,
+			&format!("round {round} live"),
+		);
+		for (n, (snapshot, acknowledged_by_then)) in snapshots.lock().unwrap().iter().enumerate() {
+			seen_in_round += recover_acknowledged(
+				root.path(),
+				snapshot,
+				&failed,
+				acknowledged_by_then,
+				damages,
+				&format!("round {round} snapshot {n}"),
+			);
+		}
+		failed_records_seen += seen_in_round;
+		if !with_flush {
+			assert!(seen_in_round > 0, "round {round}: a failed group left no record");
 		}
 		finish(&tree);
 	}

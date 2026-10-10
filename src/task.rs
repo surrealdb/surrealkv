@@ -12,10 +12,11 @@ use crate::lsm::CompactionOperations;
 use crate::stall::WriteStallController;
 use crate::Options;
 
-/// The wait before a failed memtable flush is run again; it doubles with every failure.
-const FLUSH_RETRY_MIN: Duration = Duration::from_millis(50);
+/// The wait before a failed memtable flush is run again; it doubles with every failure. The
+/// commit pipeline spaces out the replacements of a failed WAL segment the same way.
+pub(crate) const FLUSH_RETRY_MIN: Duration = Duration::from_millis(50);
 /// The longest wait between two attempts at a memtable flush.
-const FLUSH_RETRY_MAX: Duration = Duration::from_secs(2);
+pub(crate) const FLUSH_RETRY_MAX: Duration = Duration::from_secs(2);
 
 /// Manages background tasks for the LSM tree
 pub(crate) struct TaskManager {

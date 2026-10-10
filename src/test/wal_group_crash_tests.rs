@@ -176,12 +176,6 @@ fn segment_ids(dir: &Path) -> Vec<u64> {
 	ids
 }
 
-/// The highest-numbered segment in `dir/wal`.
-fn last_segment(dir: &Path) -> PathBuf {
-	let ids = segment_ids(dir);
-	seg_path(dir, *ids.last().expect("a segment"))
-}
-
 fn opts(path: &Path, max_memtable_size: usize) -> Arc<Options> {
 	Arc::new(Options {
 		path: path.to_path_buf(),
@@ -705,8 +699,10 @@ mod short_write {
 		}
 		let later =
 			commit_group(&tree, &[("later".to_string(), vec![1; 10])], Durability::Immediate).await;
-		assert!(later[0].is_err(), "the poisoned writer takes no more");
-		assert_eq!(fs::read(&segment).unwrap(), acked_bytes);
+		assert!(later[0].is_ok(), "the next commit replaces the segment");
+		// The segment that failed is not written to again; the background flush of its memtable
+		// removes it.
+		assert!(!segment.exists() || fs::read(&segment).unwrap() == acked_bytes);
 
 		let tree = Arc::try_unwrap(tree).ok().expect("the writers are done");
 		crash(tree);
@@ -884,10 +880,17 @@ mod short_write {
 		);
 
 		let live = dir.path().join("tree");
-		let segment = last_segment(&live);
-		let records = records_with_ends(&segment);
-		assert_eq!(records.len(), 5, "only the acknowledged commits are in the segment");
-		assert_eq!(fs::metadata(&segment).unwrap().len(), records.last().unwrap().0);
+		let mut keys = Vec::new();
+		for id in segment_ids(&live) {
+			let segment = seg_path(&live, id);
+			let records = records_with_ends(&segment);
+			assert_eq!(fs::metadata(&segment).unwrap().len(), records.last().map_or(0, |r| r.0));
+			keys.extend(records.iter().flat_map(|(_, batch)| user_keys(batch)));
+		}
+		assert!(
+			keys.iter().all(|key| key.starts_with("acked") || key == "later"),
+			"only the acknowledged commits are in the segments: {keys:?}"
+		);
 		let reopened = Tree::new(opts(&live, BIG)).unwrap();
 		for i in 0..5 {
 			assert_eq!(
@@ -898,7 +901,7 @@ mod short_write {
 		for i in 0..8 {
 			assert_eq!(get(&reopened, &format!("doomed{i}")), None);
 		}
-		assert_eq!(get(&reopened, "later"), None);
+		assert_eq!(get(&reopened, "later"), Some(vec![1; 10]));
 		mark_closed(&reopened);
 		release_lock(&reopened);
 	}
@@ -1177,10 +1180,10 @@ async fn zeroed_tail_of_a_block_crossing_group_sampled() {
 
 /// Through the real flusher, a group of large values fails at every possible write: every
 /// waiter gets the error, the segment is byte-for-byte what it was before the group, nothing of
-/// the group is readable, and the writer is poisoned. Replacing the writer (a rotation) lets
-/// the next group through, and that group's segment holds exactly its own records: nothing of
-/// the failed group (its buffer is dropped, not retained) and nothing of the group before it.
-/// A restart recovers exactly the acknowledged commits.
+/// the group is readable, and the writer is poisoned. The next group replaces the writer, and the
+/// segment that replaces it holds exactly its own records: nothing of the failed group (its
+/// buffer is dropped, not retained) and nothing of the group before it. A restart recovers
+/// exactly the acknowledged commits.
 #[test(tokio::test)]
 async fn a_failed_big_group_through_the_flusher_leaves_the_acked_bytes_and_the_next_group_clean() {
 	let lens = [40_000usize, 5, 33_000, 70_000, 7];
@@ -1228,20 +1231,16 @@ async fn a_failed_big_group_through_the_flusher_leaves_the_acked_bytes_and_the_n
 		for (k, _) in &doomed {
 			assert_eq!(get(&tree, k), None, "fail_after={fail_after}: {k}");
 		}
-		// Poisoned: later groups fail too, and leave the segment alone.
-		for round in 0..3 {
-			let later = commit_group(
-				&tree,
-				&[(format!("later{round}"), payload(7, 50))],
-				Durability::Immediate,
-			)
-			.await;
-			assert!(later[0].is_err(), "fail_after={fail_after}: poisoned");
+		// Poisoned: the next group replaces the segment and leaves the one that failed alone.
+		let laters: Vec<(String, Vec<u8>)> =
+			(0..3).map(|round| (format!("later{round}"), payload(7, 50))).collect();
+		for later in &laters {
+			let results =
+				commit_group(&tree, std::slice::from_ref(later), Durability::Immediate).await;
+			assert!(results[0].is_ok(), "fail_after={fail_after}: {results:?}");
 		}
 		assert_eq!(fs::read(&segment).unwrap(), acked_bytes);
 
-		// A rotation replaces the writer.
-		tree.core.inner.rotate_memtable().unwrap();
 		let again: Vec<(String, Vec<u8>)> = (0..3)
 			.map(|i| (format!("again{i}"), payload(70 + i, [12usize, 9_000, 3][i])))
 			.collect();
@@ -1259,16 +1258,17 @@ async fn a_failed_big_group_through_the_flusher_leaves_the_acked_bytes_and_the_n
 				)
 			})
 			.collect();
+		let expected: Vec<(String, Vec<u8>)> = laters.iter().chain(&again).cloned().collect();
 		assert_eq!(
-			got, again,
-			"fail_after={fail_after}: the next segment holds its own group only"
+			got, expected,
+			"fail_after={fail_after}: the next segment holds its own groups only"
 		);
 		assert_eq!(fs::read(&segment).unwrap(), acked_bytes);
 
 		let tree = Arc::try_unwrap(tree).ok().expect("no other owner");
 		crash(tree);
 		let reopened = Tree::new(opts(&live, BIG)).unwrap();
-		for (k, v) in acked.iter().chain(&again) {
+		for (k, v) in acked.iter().chain(&laters).chain(&again) {
 			assert_eq!(get(&reopened, k).as_deref(), Some(v.as_slice()), "fail_after={fail_after}");
 		}
 		for (k, _) in doomed.iter() {
@@ -1501,11 +1501,12 @@ async fn straddling_failure_sweep(inject: Inject) {
 			keys.dedup();
 			assert_eq!(keys.len(), n, "{inject:?} {fail_after}: a record twice in segment {id}");
 		}
-		// The writer that failed is poisoned: nothing more is logged.
+		// The writer that failed is poisoned, and the next commit replaces its segment. A group
+		// that failed in its re-append had part of it applied, which stops the database instead.
 		let later =
 			commit_group(&tree, &[("later".to_string(), payload(9, 50))], Durability::Immediate)
 				.await;
-		assert!(later[0].is_err(), "{inject:?} {fail_after}: poisoned");
+		assert_eq!(later[0].is_ok(), !second_failed, "{inject:?} {fail_after}: {later:?}");
 
 		let tree = Arc::try_unwrap(tree).ok().expect("no other owner");
 		crash(tree);
@@ -1522,7 +1523,8 @@ async fn straddling_failure_sweep(inject: Inject) {
 			group.len()
 		);
 		assert_eq!(recovered == group.len(), second_failed, "{inject:?} {fail_after}");
-		assert_eq!(get(&reopened, "later"), None);
+		let later = (!second_failed).then(|| payload(9, 50));
+		assert_eq!(get(&reopened, "later"), later, "{inject:?} {fail_after}");
 		mark_closed(&reopened);
 		release_lock(&reopened);
 	}
@@ -1586,7 +1588,10 @@ async fn immediate_groups_are_fsynced_before_apply_on_every_path() {
 							*rounds.lock().unwrap() += 1;
 							unsynced.lock().unwrap().push(wal.pending_sync());
 						}
-						PipelineHook::BeforeFencedApply => {}
+						PipelineHook::BeforeFencedApply
+						| PipelineHook::BeforeWalHeal
+						| PipelineHook::AfterWalReplace
+						| PipelineHook::AfterWalHeal => {}
 					}
 				})));
 			}

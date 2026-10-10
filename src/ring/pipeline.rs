@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
@@ -15,7 +16,7 @@ use crate::lsm::CoreInner;
 use crate::memtable::MemTable;
 use crate::stall::WriteStallController;
 use crate::storage::{AffinityLogStore, LogStore};
-use crate::task::TaskManager;
+use crate::task::{TaskManager, FLUSH_RETRY_MAX, FLUSH_RETRY_MIN};
 use crate::varint::varint_len_u64;
 use crate::vlog::{VLog, ValueLocation, VALUE_LOCATION_VERSION};
 use crate::{InternalKey, InternalKeyKind, Key};
@@ -40,6 +41,14 @@ pub(crate) enum PipelineHook {
 	/// A fenced round holds the active memtable's read guard and has logged the batches that were
 	/// stale, and synced them if the group syncs. It has not applied anything yet.
 	BeforeFencedApply,
+	/// A group found its WAL segment failed or held and is about to heal it, before the restore
+	/// check and before anything is rotated or flushed.
+	BeforeWalHeal,
+	/// The failed WAL segment was replaced and the memtables of the failed segment are not yet
+	/// flushed.
+	AfterWalReplace,
+	/// The WAL is ready for the group, healed or not, and the group has logged nothing yet.
+	AfterWalHeal,
 }
 
 #[cfg(test)]
@@ -286,6 +295,68 @@ impl Drop for ClaimGuard<'_> {
 	}
 }
 
+/// Spaces out the replacements of a failed WAL segment while no group is acknowledged between
+/// them. The first replacement after an acknowledged group is immediate. Each one that follows
+/// waits twice as long as the one before, from `FLUSH_RETRY_MIN` up to `FLUSH_RETRY_MAX`, and
+/// groups that come sooner fail without touching the WAL. A disk that keeps failing therefore
+/// costs a bounded rate of new segments, not a bounded number of them.
+struct ReplaceBackoff {
+	/// The replacements begun since a group was last acknowledged. A replacement that fails
+	/// counts.
+	attempts: AtomicU32,
+	/// No replacement begins before this instant.
+	not_before: Mutex<Option<Instant>>,
+	/// The shortest and the longest wait.
+	delays: Mutex<(Duration, Duration)>,
+}
+
+impl ReplaceBackoff {
+	fn new() -> Self {
+		Self {
+			attempts: AtomicU32::new(0),
+			not_before: Mutex::new(None),
+			delays: Mutex::new((FLUSH_RETRY_MIN, FLUSH_RETRY_MAX)),
+		}
+	}
+
+	/// Fails if a replacement began too recently for another one to.
+	fn admit(&self, now: Instant) -> Result<()> {
+		match *self.not_before.lock() {
+			Some(until) if now < until => Err(Error::Other(format!(
+				"the WAL segment failed and was replaced {} time(s) without a commit succeeding; \
+				 the next replacement is due in {} ms",
+				self.attempts.load(Ordering::Relaxed),
+				(until - now).as_millis()
+			))),
+			_ => Ok(()),
+		}
+	}
+
+	/// Counts a replacement that begins at `now`, and sets when the next may begin.
+	fn begin(&self, now: Instant) {
+		let attempts = self.attempts.fetch_add(1, Ordering::Relaxed) + 1;
+		let (min, max) = *self.delays.lock();
+		let wait = min.saturating_mul(1 << (attempts - 1).min(16)).min(max);
+		*self.not_before.lock() = Some(now + wait);
+	}
+
+	/// A group was acknowledged: the next replacement is immediate again.
+	fn reset(&self) {
+		if self.attempts.load(Ordering::Relaxed) != 0 {
+			self.attempts.store(0, Ordering::Relaxed);
+			*self.not_before.lock() = None;
+		}
+	}
+
+	/// Sets the shortest and the longest wait, and forgets the replacements counted so far.
+	#[cfg(test)]
+	fn set_delays(&self, min: Duration, max: Duration) {
+		*self.delays.lock() = (min, max);
+		self.attempts.store(0, Ordering::Relaxed);
+		*self.not_before.lock() = None;
+	}
+}
+
 /// Coordinates OCC conflict detection over the commit ring with the
 /// background flusher that makes accepted commits durable and visible.
 ///
@@ -335,6 +406,8 @@ pub(crate) struct CommitPipeline {
 	/// Asynchronous log store interface for the WAL. The concrete type, because the
 	/// pipeline needs the segment each record was appended to.
 	pub(crate) log_store: Arc<AffinityLogStore>,
+	/// Spaces out the replacements of a failed WAL segment, see `heal_wal`.
+	replace_backoff: ReplaceBackoff,
 	/// Test-only observer of `flush_group` steps.
 	#[cfg(test)]
 	hook: Mutex<Option<PipelineHookFn>>,
@@ -412,6 +485,7 @@ impl CommitPipeline {
 			restoring: AtomicBool::new(false),
 			restore_epoch: AtomicU64::new(0),
 			log_store,
+			replace_backoff: ReplaceBackoff::new(),
 			#[cfg(test)]
 			hook: Mutex::new(None),
 			#[cfg(test)]
@@ -521,6 +595,13 @@ impl CommitPipeline {
 	#[cfg(test)]
 	pub(crate) fn free_stats(&self) -> FreeStats {
 		*self.free_stats.lock()
+	}
+
+	/// Sets the shortest and the longest wait between two replacements of a failed WAL segment, and
+	/// forgets the replacements counted so far.
+	#[cfg(test)]
+	pub(crate) fn set_replace_backoff(&self, min: Duration, max: Duration) {
+		self.replace_backoff.set_delays(min, max);
 	}
 
 	/// Installs (or clears) the observer called at each `PipelineHook` point.
@@ -929,6 +1010,7 @@ impl CommitPipeline {
 		};
 		let applied = result.is_ok() && self.restore_epoch.load(Ordering::SeqCst) == epoch;
 		if applied {
+			self.replace_backoff.reset();
 			// Visibility first: an entry may only be marked visible, and so
 			// fall below a new transaction's window, once `visible_seq_num`
 			// covers it.
@@ -1071,6 +1153,11 @@ impl CommitPipeline {
 	/// `scratch.applied` is set as soon as a batch is in a memtable or an L0 table. A failure
 	/// before that leaves nothing of the group behind; the caller stops the database for one
 	/// after it, see `flush_entries`.
+	///
+	/// A WAL segment that failed is replaced first, see `heal_wal`. No commit is logged, or
+	/// acknowledged, behind the unflushed memtables of a segment whose fsync failed, with one
+	/// exception: a group that is part way through its apply when its segment fails stops the
+	/// database, because the segment that replaces it is held and refuses the group's records.
 	async fn flush_group_with(
 		&self,
 		batches: &mut [Batch],
@@ -1078,6 +1165,8 @@ impl CommitPipeline {
 		scratch: &mut FlushScratch,
 	) -> Result<()> {
 		let epoch = self.restore_epoch.load(Ordering::SeqCst);
+
+		self.heal_wal(epoch).await?;
 
 		// 1. Process batches: separate large values to VLog if enabled (WiscKey WAL bypass)
 		// and encode for WAL
@@ -1294,6 +1383,107 @@ impl CommitPipeline {
 			}
 		}
 
+		Ok(())
+	}
+
+	/// Gets the WAL ready for a group: replaces a segment whose append or fsync failed, and waits
+	/// for the writer that replaces a segment whose fsync failed to be released.
+	///
+	/// A failed segment refuses every append, and only a rotation replaces its writer. Nothing else
+	/// in the commit path rotates one, least of all when the active memtable is empty, so the
+	/// groups that follow a failure would all fail until the database was reopened. The
+	/// check is made at the start of the next group, when nothing of it is logged or applied
+	/// and no segment is pinned: every failure that poisons a segment is seen here, whichever
+	/// path it came from, and the group that finds one reports it. Nothing heals an idle database.
+	///
+	/// The records of a segment whose fsync failed are of unknown durability, and the segment is
+	/// not synced again, so the writer that replaces it is held until the memtables tagged with
+	/// it are in tables (see `Wal::rotate_with`). They are flushed here, off the runtime's
+	/// thread, and the hold is released once the queue has none of them. A flush that fails fails
+	/// the group, which has logged nothing, and the next group tries again; the background task
+	/// flushes the same memtables on its own and records its own failures. Whatever rotated the
+	/// segment, a held writer refuses the group's append, so no group is acknowledged ahead of
+	/// those memtables.
+	///
+	/// Replacements that follow each other without a group in between are spaced out, see
+	/// `ReplaceBackoff`. A restore, or a database a commit group stopped, is never healed.
+	///
+	/// What this means for durability:
+	/// - the commits of the group that failed stay failed, but if their records reached the
+	///   segment, recovery decides their outcome, and a commit that returned an error can take
+	///   effect when the database is next opened;
+	/// - the segment that failed stays on disk until the memtables tagged with it are flushed. A
+	///   crash can leave it damaged while later segments hold acknowledged commits, which
+	///   `WalRecoveryMode::AbsoluteConsistency` refuses to open, as it refuses a damaged last
+	///   segment;
+	/// - a disk that keeps failing makes new segments at a bounded rate, at most one per
+	///   `FLUSH_RETRY_MAX`, and none is removed before a later flush passes its number.
+	async fn heal_wal(&self, epoch: u64) -> Result<()> {
+		let (poisoned, held) = {
+			let wal = self.inner.wal.read();
+			(wal.needs_replacement(), wal.is_held())
+		};
+		if poisoned || held {
+			self.replace_and_release_wal(epoch, poisoned).await?;
+		}
+		#[cfg(test)]
+		self.fire(PipelineHook::AfterWalHeal);
+		Ok(())
+	}
+
+	/// The part of `heal_wal` for a segment that failed or a writer that is held.
+	async fn replace_and_release_wal(&self, epoch: u64, poisoned: bool) -> Result<()> {
+		if let Some(error) = self.inner.error_handler.commit_group_error() {
+			return Err(error);
+		}
+
+		let now = Instant::now();
+		self.replace_backoff.admit(now)?;
+		#[cfg(test)]
+		self.fire(PipelineHook::BeforeWalHeal);
+		let restored = || {
+			self.restoring.load(Ordering::Acquire)
+				|| self.restore_epoch.load(Ordering::SeqCst) != epoch
+		};
+		if restored() {
+			return Err(Error::PipelineStall);
+		}
+		self.replace_backoff.begin(now);
+		debug_assert_eq!(self.inner.group_wal_pin.load(Ordering::Acquire), u64::MAX);
+
+		if poisoned {
+			if let Some(queued) = self.inner.replace_failed_wal()? {
+				if queued {
+					if let Some(ref tm) = self.task_manager {
+						tm.wake_up_memtable();
+					}
+				}
+				#[cfg(test)]
+				self.fire(PipelineHook::AfterWalReplace);
+			}
+		}
+
+		if !self.inner.try_release_wal_hold()? {
+			let inner = Arc::clone(&self.inner);
+			let flushed = affinitypool::spawn(move || inner.flush_all_immutables_sync()).await;
+			if let Err(e) = flushed {
+				if let Some(ref tm) = self.task_manager {
+					tm.wake_up_memtable();
+				}
+				return Err(Error::Other(format!(
+					"Failed to flush the memtables of the failed WAL segment: {e}"
+				)));
+			}
+			if !self.inner.try_release_wal_hold()? {
+				return Err(Error::Other(
+					"the memtables of the failed WAL segment are not yet in tables".into(),
+				));
+			}
+		}
+
+		if restored() {
+			return Err(Error::PipelineStall);
+		}
 		Ok(())
 	}
 

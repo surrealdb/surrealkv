@@ -473,6 +473,9 @@ async fn a_crash_image_at_every_hook_of_a_group_with_a_direct_batch_recovers_a_p
 					round,
 				} => (*take)(format!("before apply round {round}")),
 				PipelineHook::BeforeFencedApply => (*take)("before the fenced apply".to_string()),
+				PipelineHook::BeforeWalHeal
+				| PipelineHook::AfterWalReplace
+				| PipelineHook::AfterWalHeal => {}
 			})));
 		}
 		{

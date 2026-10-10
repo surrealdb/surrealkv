@@ -5,6 +5,7 @@ use crc32fast::Hasher;
 use lz4_flex::block::{compress_into, get_maximum_output_size};
 
 use super::{
+	segment_held,
 	sync_poisoned,
 	BufferedFileWriter,
 	CompressionType,
@@ -37,6 +38,11 @@ pub struct Writer {
 	/// replaced, which a rotation does. A failed fsync is tracked by the file's
 	/// `SyncGate` instead, because the fsyncs outside the WAL lock record it too.
 	poisoned: bool,
+
+	/// Set on the writer that replaces a segment whose fsync failed: the segments below this
+	/// number hold records of unknown durability, so the writer refuses every append and sync
+	/// until the memtables tagged with them are in tables and the hold is released.
+	held: Option<u64>,
 }
 
 impl Writer {
@@ -58,6 +64,7 @@ impl Writer {
 			manual_flush,
 			compression_type,
 			poisoned: false,
+			held: None,
 		}
 	}
 
@@ -84,6 +91,28 @@ impl Writer {
 	/// Whether an fsync of the segment failed. The writer then refuses every append and sync.
 	pub(crate) fn sync_failed(&self) -> bool {
 		self.dest.sync_failed()
+	}
+
+	/// Whether an append or an fsync of the segment failed, so that only a replacement of the
+	/// writer lets commits through.
+	pub(crate) fn is_poisoned(&self) -> bool {
+		self.poisoned || self.dest.sync_failed()
+	}
+
+	/// Holds the writer: it refuses every append and sync until `release_hold`, because the
+	/// segments below `below` are not all in tables.
+	pub(crate) fn hold(&mut self, below: u64) {
+		self.held = Some(below);
+	}
+
+	/// The segment number below which everything must be in tables for the hold to end.
+	pub(crate) fn held(&self) -> Option<u64> {
+		self.held
+	}
+
+	/// Ends the hold.
+	pub(crate) fn release_hold(&mut self) {
+		self.held = None;
 	}
 
 	/// The gate every fsync of the segment goes through.
@@ -284,6 +313,9 @@ impl Writer {
 	/// Should be called when durability is required (e.g., transaction commit). If the fsync
 	/// fails, the writer refuses every later append and sync, see `SyncGate`.
 	pub fn sync(&mut self) -> Result<()> {
+		if self.held.is_some() {
+			return Err(segment_held());
+		}
 		self.dest.sync() // Slow: flush + fsync to disk
 	}
 
@@ -300,8 +332,12 @@ impl Writer {
 	/// it: a disk that failed once may fail again, and if the cut itself failed
 	/// the state of the segment is unknown.
 	///
-	/// A segment whose fsync failed takes no append either.
+	/// A segment whose fsync failed takes no append either, and neither does a held one. The
+	/// refusal comes first, so it cuts nothing and poisons nothing.
 	fn guard_append<T>(&mut self, append: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+		if self.held.is_some() {
+			return Err(segment_held());
+		}
 		if self.dest.sync_failed() {
 			return Err(sync_poisoned());
 		}

@@ -373,7 +373,10 @@ fn install(
 		}
 		PipelineHook::AfterWalSync {
 			..
-		} => {}
+		}
+		| PipelineHook::BeforeWalHeal
+		| PipelineHook::AfterWalReplace
+		| PipelineHook::AfterWalHeal => {}
 	})));
 	probe
 }
@@ -1133,8 +1136,8 @@ fn a_rotation_queued_for_the_memtable_waits_through_the_log_and_the_sync() {
 
 /// A re-append that fails after `ops` appends and flushes of the WAL writer in the fenced round,
 /// whatever it had written by then: the group fails as a unit, the segment is exactly as it was,
-/// the memtable has nothing of the group, the writer refuses more until the WAL rotates, and a
-/// crash image holds the group whole or not at all.
+/// the memtable has nothing of the group, the writer refuses more until the next commit replaces
+/// its segment, and a crash image holds the group whole or not at all.
 #[test]
 fn a_re_append_that_fails_anywhere_in_the_fence_leaves_the_segment_as_it_was() {
 	bounded(false, async {
@@ -1198,10 +1201,10 @@ fn a_re_append_that_fails_anywhere_in_the_fence_leaves_the_segment_as_it_was() {
 					group.len()
 				);
 			}
-			// The writer stays poisoned until the WAL rotates.
+			// The next commit replaces the poisoned segment, with nothing in the memtable to flush.
 			tree.core.commit_pipeline.set_hook(None);
 			let later = commit_group(&tree, &entries(1, 1, 50), Durability::Immediate).await;
-			assert!(later[0].is_err(), "ops {ops}: a poisoned writer refuses the next commit");
+			assert!(later[0].is_ok(), "ops {ops}: the next commit replaces the segment: {later:?}");
 			tree.core.inner.seal_active_wal_segment().unwrap();
 			for r in commit_group(&tree, &entries(1, 1, 50), Durability::Immediate).await {
 				r.unwrap();

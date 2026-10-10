@@ -650,8 +650,8 @@ async fn a_group_under_32_kib_is_one_write() {
 
 /// A group whose append fails fails as a whole: every waiter gets the error, nothing is
 /// acknowledged or readable, and the segment is cut back to where the group started, at
-/// every point the append can fail at. Later commits fail cleanly too (the writer is
-/// poisoned until a rotation), and a restart recovers the acknowledged commits only.
+/// every point the append can fail at. The next commit replaces the poisoned segment and is
+/// acknowledged, and a restart recovers the acknowledged commits only.
 #[test(tokio::test)]
 async fn a_failing_group_aborts_every_waiter_and_acknowledges_nothing() {
 	// Eight commits of one small batch each are 16 appends and a flush: 17 points to fail at,
@@ -699,8 +699,10 @@ async fn a_failing_group_aborts_every_waiter_and_acknowledges_nothing() {
 		}
 		let later =
 			commit_group(&tree, &[(key_of(2, 0), vec![b'l'; 40])], Durability::Immediate).await;
-		assert!(later[0].is_err(), "fail_after={fail_after}: the poisoned writer takes no more");
-		assert_eq!(std::fs::metadata(&segment).unwrap().len(), acked_len);
+		assert!(later[0].is_ok(), "fail_after={fail_after}: the next commit replaces the segment");
+		// The segment that failed is not written to again; the background flush of its memtable
+		// removes it.
+		assert!(!segment.exists() || std::fs::metadata(&segment).unwrap().len() == acked_len);
 
 		release_lock(&tree);
 		mark_closed(&tree);
@@ -711,9 +713,15 @@ async fn a_failing_group_aborts_every_waiter_and_acknowledges_nothing() {
 			for (k, v) in &acked {
 				assert_eq!(txn.get(k.as_bytes()).unwrap().as_deref(), Some(v.as_slice()));
 			}
-			for (k, _) in doomed.iter().chain(&[(key_of(2, 0), vec![])]) {
+			for (k, _) in &doomed {
 				assert_eq!(txn.get(k.as_bytes()).unwrap(), None, "fail_after={fail_after}: {k}");
 			}
+			let k = key_of(2, 0);
+			assert_eq!(
+				txn.get(k.as_bytes()).unwrap(),
+				Some(vec![b'l'; 40]),
+				"fail_after={fail_after}"
+			);
 		}
 		mark_closed(&reopened);
 		release_lock(&reopened);

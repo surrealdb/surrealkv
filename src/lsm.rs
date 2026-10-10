@@ -4,7 +4,7 @@ use std::fs::create_dir_all;
 use std::fs::File;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, RwLockWriteGuard};
 
 use crate::batch::Batch;
 use crate::checkpoint::{CheckpointGate, CheckpointMetadata, DatabaseCheckpoint};
@@ -101,8 +101,10 @@ pub trait CompactionOperations: Send + Sync {
 /// rotation that opening a tree and a restore make to continue in a fresh segment takes them the
 /// same way.
 /// The WAL lock is taken under `active_memtable` by rotation (`rotate_memtable()`,
-/// `seal_active_wal_segment()`), and so do the shutdown flush and the commit pipeline's fenced
-/// round. Everything else takes it alone, and some of it from pool threads: the commit pipeline
+/// `seal_active_wal_segment()`, `replace_failed_wal()`), and so do the shutdown flush, the
+/// release of a held writer (`try_release_wal_hold()`, which reads the immutable queue under
+/// `active_memtable` too, never under the WAL lock) and the commit pipeline's fenced round.
+/// Everything else takes it alone, and some of it from pool threads: the commit pipeline
 /// for every append and every fsync of a commit group (`AffinityLogStore`), and `flush_wal`,
 /// `close` and restore. It is held across the fsync of a commit group, but not across the one
 /// `WalManager::sync` makes, which goes through the gate instead. The commit pipeline compares
@@ -585,12 +587,22 @@ impl CoreInner {
 	/// The actual SST flush happens asynchronously via background task.
 	pub(crate) fn rotate_memtable(&self) -> Result<()> {
 		// Step 1: Acquire WRITE lock upfront to prevent race conditions
-		let mut active_memtable = self.active_memtable.write()?;
+		let active_memtable = self.active_memtable.write()?;
 
 		if active_memtable.is_empty() {
 			return Ok(());
 		}
 
+		self.rotate_memtable_locked(active_memtable)
+	}
+
+	/// Rotates the non-empty active memtable under the write guard the caller holds, which it
+	/// keeps until the memtable is queued: whoever holds it sees the queue only shrink, see
+	/// `try_release_wal_hold`.
+	fn rotate_memtable_locked(
+		&self,
+		mut active_memtable: RwLockWriteGuard<'_, Arc<MemTable>>,
+	) -> Result<()> {
 		tracing::debug!("rotate_memtable: rotating memtable size={}", active_memtable.size());
 
 		// Step 2: Rotate WAL while STILL holding memtable write lock
@@ -697,6 +709,57 @@ impl CoreInner {
 		active_memtable.set_wal_number(new_wal_number);
 
 		Ok(sealed_wal_number)
+	}
+
+	/// Replaces the WAL segment if its writer refuses appends after a failed append or fsync, and
+	/// returns whether it did. `Some(true)` means the active memtable was queued, tagged with the
+	/// segment that failed; it is not flushed here.
+	///
+	/// The active memtable is held for the whole replacement, which excludes every other rotation.
+	/// A memtable with data is rotated with the WAL. An empty one stays, and takes the tag of the
+	/// new segment under the same guard, so a batch is still only applied to a memtable tagged
+	/// with the segment of its record. A rotation that fails changes nothing: the next call tries
+	/// again.
+	///
+	/// If the fsync of the segment failed, the new writer is held, see `Wal::rotate_with`.
+	pub(crate) fn replace_failed_wal(&self) -> Result<Option<bool>> {
+		let active_memtable = self.active_memtable.write()?;
+		if !self.wal.read().needs_replacement() {
+			return Ok(None);
+		}
+
+		let replace_error = |e: &dyn std::fmt::Display| {
+			Error::Other(format!("Failed to replace the failed WAL segment: {e}"))
+		};
+		if active_memtable.is_empty() {
+			let mut wal_guard = self.wal.write();
+			self.rotate_wal(&mut wal_guard).map_err(|e| replace_error(&e))?;
+			let new_wal_number = wal_guard.get_active_log_number();
+			drop(wal_guard);
+			active_memtable.set_wal_number(new_wal_number);
+			return Ok(Some(false));
+		}
+
+		self.rotate_memtable_locked(active_memtable).map_err(|e| replace_error(&e))?;
+		Ok(Some(true))
+	}
+
+	/// Ends the hold of the WAL writer once no memtable tagged with a segment below the hold's
+	/// bound is queued, and returns whether the writer is free of it.
+	///
+	/// A rotation queues the memtable it retires while it holds the active memtable's write guard,
+	/// which is held here too, so the queue can only shrink between the check and the release.
+	pub(crate) fn try_release_wal_hold(&self) -> Result<bool> {
+		let _active_memtable = self.active_memtable.write()?;
+		let Some(below) = self.wal.read().hold_below() else {
+			return Ok(true);
+		};
+		let pending = self.immutable_memtables.read()?.iter().any(|e| e.wal_number < below);
+		if pending {
+			return Ok(false);
+		}
+		self.wal.write().release_hold(below);
+		Ok(true)
 	}
 
 	/// Flushes the oldest immutable memtable to an SSTable.
@@ -1590,7 +1653,9 @@ impl Core {
 	///
 	/// If the fsync fails, the WAL segment in use refuses every later append and sync: the
 	/// kernel may have dropped the data it could not write, and a second fsync can report
-	/// success for it. Commits fail until the WAL rotates or the database is reopened.
+	/// success for it. The next commit replaces the segment. The segment that replaces it is held
+	/// until the memtables of the failed segment are in tables, and `flush_wal(true)` fails until
+	/// then without touching the disk.
 	///
 	/// # Order of Operations
 	///
@@ -1598,6 +1663,9 @@ impl Core {
 	/// This ensures that if WAL contains a ValuePointer, the referenced
 	/// VLog data is at least as durable.
 	pub(crate) fn flush_wal(&self, sync: bool) -> Result<()> {
+		if sync && self.wal.read().is_held() {
+			return Err(wal::segment_held().into());
+		}
 		if let Some(ref vlog) = self.vlog {
 			if sync {
 				vlog.sync()?;
@@ -1704,6 +1772,10 @@ impl Core {
 			})?;
 
 			tracing::debug!("All memtables flushed successfully on shutdown");
+
+			// The memtables of a failed segment are in tables now, so a held writer can be
+			// closed. One that cannot be released reports the hold when the WAL is closed.
+			let _ = self.inner.try_release_wal_hold();
 		}
 
 		// Step 4: Close the WAL to ensure all data is flushed

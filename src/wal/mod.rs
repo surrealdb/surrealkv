@@ -519,6 +519,14 @@ pub(crate) fn sync_poisoned() -> Error {
 	))
 }
 
+/// The error of every append and sync on a segment that is held, see `Writer::hold`.
+pub(crate) fn segment_held() -> Error {
+	Error::IO(IOError::new(
+		io::ErrorKind::Other,
+		"WAL segment is held until the memtables of the failed segment are in tables",
+	))
+}
+
 /// The fsyncs of one WAL segment: the writer's own, and the ones `WalManager::sync` makes
 /// outside the WAL lock through a clone of the file.
 ///
@@ -527,7 +535,9 @@ pub(crate) fn sync_poisoned() -> Error {
 /// overlaps the failing one, can report success for data that never reached the disk, and
 /// everything acknowledged after it would sit behind a hole that recovery stops at. A failed
 /// fsync therefore ends the segment: its writer refuses every later append and sync, and
-/// only a rotation, whose new segment has a gate of its own, lets commits through again.
+/// only a rotation, whose new segment has a gate of its own, lets commits through again. The
+/// commit pipeline replaces such a segment before it logs its next group, and the segment that
+/// replaces it is held, see `Wal::rotate_with`.
 ///
 /// A leaf lock: an fsync holds nothing but the gate, so it is safe to take under the WAL lock.
 #[derive(Default)]
