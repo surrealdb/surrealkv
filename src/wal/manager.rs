@@ -468,6 +468,32 @@ impl Wal {
 		self.active_writer.sync_failed()
 	}
 
+	/// Whether an append or an fsync of the active segment failed, so that its writer refuses
+	/// every append until a rotation replaces it.
+	pub(crate) fn needs_replacement(&self) -> bool {
+		self.active_writer.is_poisoned()
+	}
+
+	/// Whether the active writer is held, see `rotate_with`.
+	pub(crate) fn is_held(&self) -> bool {
+		self.active_writer.held().is_some()
+	}
+
+	/// The segment number below which everything must be in tables for the hold of the active
+	/// writer to end, if it is held.
+	pub(crate) fn hold_below(&self) -> Option<u64> {
+		self.active_writer.held()
+	}
+
+	/// Ends the hold of the active writer if it is the one for `below`, the bound the caller read
+	/// with `hold_below` while it checked that the segments below it are in tables. A hold that
+	/// was set again since is left alone.
+	pub(crate) fn release_hold(&mut self, below: u64) {
+		if self.active_writer.held() == Some(below) {
+			self.active_writer.release_hold();
+		}
+	}
+
 	pub(crate) fn close(&mut self) -> Result<()> {
 		if self.closed {
 			return Ok(());
@@ -516,16 +542,26 @@ impl Wal {
 	/// recovery mode that is repaired by cutting the segment back to its valid prefix before
 	/// the segments after it are replayed.
 	///
+	/// Records of unknown durability in that segment must not be left behind records that are
+	/// acknowledged after them, so the new writer is held: it refuses every append and sync
+	/// until the caller releases it, once the memtables tagged with the failed segment are in
+	/// tables. Whether the sync was skipped, and so whether the writer is held, is read once, under
+	/// the lock the caller holds, together with the decision to skip the sync, so every rotation
+	/// gets it, whoever makes it. A writer that is held already is empty and is not synced; its
+	/// successor inherits the hold, with its bound.
+	///
 	/// `before_sync` runs just before that fsync, under the caller's WAL lock, so no record
 	/// can be appended after it and before the fsync. It is where the caller makes durable what
 	/// the records point to: none may reach the disk ahead of it. It does not run for a segment
-	/// whose fsync already failed, which is not fsynced again, and an error from it fails the
-	/// rotation with the WAL as it was.
+	/// whose fsync already failed, which is not fsynced again, nor for one that is held, and an
+	/// error from it fails the rotation with the WAL as it was.
 	pub(crate) fn rotate_with(&mut self, before_sync: impl FnOnce() -> Result<()>) -> Result<u64> {
 		let old_log_number = self.active_log_number;
 		let new_log_number = old_log_number + 1;
 
-		if !self.active_writer.sync_failed() {
+		let held = self.active_writer.held();
+		let sync_failed = self.active_writer.sync_failed();
+		if !sync_failed && held.is_none() {
 			before_sync()?;
 			self.active_writer.sync()?;
 		}
@@ -533,12 +569,16 @@ impl Wal {
 		tracing::debug!("WAL rotating: {:020} -> {:020}", old_log_number, new_log_number);
 
 		// Create a new Writer and sync fd for the new log number
-		let (new_writer, new_sync_fd) = Self::create_writer(&self.dir, new_log_number, &self.opts)?;
+		let (mut new_writer, new_sync_fd) =
+			Self::create_writer(&self.dir, new_log_number, &self.opts)?;
 
 		// Fsync the directory to ensure new file is visible after crash
 		crate::lsm::fsync_directory(&self.dir)
 			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
 
+		if sync_failed || held.is_some() {
+			new_writer.hold(held.unwrap_or(new_log_number));
+		}
 		self.active_writer = new_writer;
 		self.sync_fd = new_sync_fd;
 		self.active_log_number = new_log_number;
@@ -635,6 +675,11 @@ impl WalManager {
 	pub(crate) fn sync(&self) -> Result<()> {
 		let handle = {
 			let mut wal = self.inner.write();
+			// A held segment has nothing to sync, and a sync that finds nothing pending must
+			// not read as success for the segment it replaced.
+			if wal.is_held() {
+				return Err(super::segment_held());
+			}
 			wal.flush()?;
 			wal.sync_handle()
 		};
@@ -1300,6 +1345,8 @@ mod tests {
 		assert_eq!(rotated.unwrap(), 1);
 		assert!(!*ran.lock(), "the hook ran for a segment that is not fsynced");
 		assert!(!wal.sync_failed());
+		assert_eq!(wal.hold_below(), Some(1), "the segment that replaces it is held");
+		wal.release_hold(1);
 		wal.close().unwrap();
 	}
 }

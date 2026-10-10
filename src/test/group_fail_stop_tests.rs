@@ -628,12 +628,19 @@ async fn run(failure: Failure, mix: Mix) {
 	assert_group_recovered(&recovered, &group, &what);
 
 	// The database still shuts down, the WAL having been rotated to a segment of its own by now.
+	// A segment whose fsync failed was replaced by a held one, which a stopped database never
+	// releases, so the close reports it once the rest of the shutdown is done.
 	tree.core.is_closed.store(false, Ordering::SeqCst);
 	tree.core.task_manager.lock().unwrap().take();
-	tokio::time::timeout(Duration::from_secs(30), tree.core.close())
+	let closed = tokio::time::timeout(Duration::from_secs(30), tree.core.close())
 		.await
-		.unwrap_or_else(|_| panic!("{what}: close does not end"))
-		.unwrap_or_else(|e| panic!("{what}: close of a stopped database failed: {e}"));
+		.unwrap_or_else(|_| panic!("{what}: close does not end"));
+	if failure.cause().is_some_and(|cause| cause.contains("fsync")) {
+		let error = closed.expect_err("the WAL is held").to_string();
+		assert!(error.contains("WAL segment is held"), "{what}: {error}");
+	} else {
+		closed.unwrap_or_else(|e| panic!("{what}: close of a stopped database failed: {e}"));
+	}
 }
 
 #[test(tokio::test)]

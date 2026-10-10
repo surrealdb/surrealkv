@@ -649,7 +649,7 @@ fn a_failed_append_is_never_resurrected() {
 }
 
 /// The same through the whole tree: a commit whose WAL append fails is an
-/// error, later commits fail cleanly, and a restart recovers exactly the
+/// error, the next commit replaces the segment, and a restart recovers exactly the
 /// commits that were acknowledged.
 #[test_log::test(tokio::test)]
 async fn tree_recovers_exactly_the_acknowledged_commits_after_a_failed_append() {
@@ -680,12 +680,14 @@ async fn tree_recovers_exactly_the_acknowledged_commits_after_a_failed_append() 
 	assert!(matches!(outcome, Ok(Err(_))), "the commit must report the failed append: {outcome:?}");
 	assert_eq!(file_len(&segment), acked_len, "no part of the failed record may stay");
 
-	// The writer is poisoned: later commits fail rather than land after damage.
+	// The writer is poisoned: the next commit replaces the segment, so it never lands after
+	// damage. The segment that failed is not written to again, and is gone once the background
+	// flush of its memtable has run.
 	let mut txn = tree.begin().unwrap();
 	txn.set(b"later", &[b'z'; 64]).unwrap();
 	let outcome = tokio::time::timeout(Duration::from_secs(20), txn.commit()).await;
-	assert!(matches!(outcome, Ok(Err(_))), "a later commit must fail cleanly: {outcome:?}");
-	assert_eq!(file_len(&segment), acked_len);
+	assert!(matches!(outcome, Ok(Ok(()))), "a later commit must succeed: {outcome:?}");
+	assert!(!segment.exists() || file_len(&segment) == acked_len);
 
 	tree.core.inner.lockfile.lock().unwrap().release().unwrap();
 	drop(tree);
@@ -697,5 +699,5 @@ async fn tree_recovers_exactly_the_acknowledged_commits_after_a_failed_append() 
 		assert_eq!(txn.get(format!("acked{i}").as_bytes()).unwrap(), Some(vec![b'x'; 64]));
 	}
 	assert_eq!(txn.get(b"failed").unwrap(), None);
-	assert_eq!(txn.get(b"later").unwrap(), None);
+	assert_eq!(txn.get(b"later").unwrap(), Some(vec![b'z'; 64]));
 }
