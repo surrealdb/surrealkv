@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
 use crate::levels::LevelManifest;
-use crate::lsm::CoreInner;
+use crate::lsm::{fsync_directory, CoreInner};
 use crate::Options;
 
 /// Recursively copies a directory and all its contents
@@ -129,6 +129,59 @@ impl Drop for CheckpointGuard<'_> {
 			self.gate.idle.notify_one();
 		}
 	}
+}
+
+/// The file a restore keeps in the database directory from before it removes the files of the
+/// database until every file of the checkpoint is back on disk. It holds the path of the
+/// checkpoint.
+const RESTORE_MARKER_FILE: &str = "RESTORE_IN_PROGRESS";
+
+/// Refuses to open a directory in which a restore did not finish. A restore removes the tables,
+/// the WAL, the manifest and the value log before it copies the checkpoint's files back, so what
+/// an interrupted one leaves is an empty directory, or a part of the checkpoint, which would open
+/// as an empty database or as a wrong one. Reads only, like `check_manifest_before_open`.
+pub(crate) fn check_restore_finished(opts: &Options) -> Result<()> {
+	let marker = opts.path.join(RESTORE_MARKER_FILE);
+	if !marker.try_exists()? {
+		return Ok(());
+	}
+	let checkpoint = fs::read_to_string(&marker).unwrap_or_default();
+	Err(Error::RestoreInterrupted(format!(
+		"a restore of the checkpoint '{}' into {} did not finish, or is still running in another \
+		 process: the files of the database are neither the database as it was nor the \
+		 checkpoint, so it is not opened and nothing was changed. Restore the checkpoint into an \
+		 empty directory instead. Only if no restore is running and the files are known to be the \
+		 restored database, remove {} to open it.",
+		checkpoint.trim(),
+		opts.path.display(),
+		marker.display()
+	)))
+}
+
+/// Syncs the files below `dir`, and then the directories, so that what was copied or linked there
+/// is on disk. A directory that does not exist has nothing to sync. What is neither a file nor a
+/// directory, a named pipe for instance, is left alone: opening it waits for the other end.
+fn sync_below(dir: &Path) -> std::io::Result<()> {
+	let entries = match fs::read_dir(dir) {
+		Ok(entries) => entries,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(e) => return Err(e),
+	};
+	for entry in entries {
+		let entry = entry?;
+		let kind = entry.file_type()?;
+		if kind.is_dir() {
+			sync_below(&entry.path())?;
+		} else if kind.is_file() {
+			// A read-only handle syncs everywhere but on Windows, which wants write access.
+			fs::OpenOptions::new()
+				.read(true)
+				.write(cfg!(windows))
+				.open(entry.path())?
+				.sync_all()?;
+		}
+	}
+	fsync_directory(dir)
 }
 
 /// Current checkpoint metadata format version
@@ -447,6 +500,12 @@ impl DatabaseCheckpoint {
 
 	/// Restores the database from a checkpoint directory.
 	/// This will overwrite the current database state
+	///
+	/// The checkpoint is validated first, and one that cannot be restored is refused before
+	/// anything of the database is touched. From the first removal until its files are back and
+	/// synced, a marker file in the database directory makes opening the directory fail with
+	/// [`Error::RestoreInterrupted`]. A restore that failed in between is repeated on the open
+	/// database; one that crashed is repeated into an empty directory.
 	pub fn restore_from_checkpoint<P: AsRef<Path>>(
 		&self,
 		checkpoint_dir: P,
@@ -458,6 +517,10 @@ impl DatabaseCheckpoint {
 
 		// Everything the restore needs is read before anything of the database is removed
 		self.validate_checkpoint(checkpoint_path)?;
+
+		// From here the files of the database are not the database: if the restore stops before
+		// `finish_restore`, the next open is refused instead of reading what is left
+		self.begin_restore(checkpoint_path)?;
 
 		// Clear current database state
 		self.clear_current_state()?;
@@ -494,6 +557,8 @@ impl DatabaseCheckpoint {
 
 		// Restore VLog directories if they exist in the checkpoint
 		self.restore_vlog_directories(checkpoint_path)?;
+
+		self.finish_restore()?;
 
 		#[cfg(test)]
 		self.reach(CheckpointStage::RestoreFilesCopied);
@@ -546,6 +611,34 @@ impl DatabaseCheckpoint {
 		}
 
 		Ok(())
+	}
+
+	/// Marks the database directory as being restored, durably, before a file of the database is
+	/// removed. A marker left by an earlier restore that stopped is written again.
+	fn begin_restore(&self, checkpoint_path: &Path) -> Result<()> {
+		let io = |e| Error::Io(Arc::new(e));
+		let marker = self.core.opts.path.join(RESTORE_MARKER_FILE);
+		let checkpoint = resolve(checkpoint_path).unwrap_or_else(|_| checkpoint_path.to_path_buf());
+		let mut file = File::create(&marker).map_err(io)?;
+		file.write_all(checkpoint.display().to_string().as_bytes()).map_err(io)?;
+		file.sync_all().map_err(io)?;
+		fsync_directory(&self.core.opts.path).map_err(io)
+	}
+
+	/// Ends a restore: the files of the checkpoint are on disk, and only then is the marker
+	/// removed, so that a crash leaves either the marker or a complete database.
+	fn finish_restore(&self) -> Result<()> {
+		let io = |e| Error::Io(Arc::new(e));
+		let opts = &self.core.opts;
+		for dir in [opts.sstable_dir(), opts.wal_dir(), opts.manifest_dir(), opts.vlog_dir()] {
+			sync_below(&dir).map_err(io)?;
+		}
+		// The names of those directories are entries of this one, and without their own sync a
+		// crash could keep the removal of the marker and lose them, which opens as an empty
+		// database
+		fsync_directory(&opts.path).map_err(io)?;
+		fs::remove_file(opts.path.join(RESTORE_MARKER_FILE)).map_err(io)?;
+		fsync_directory(&opts.path).map_err(io)
 	}
 
 	/// Flushes all memtables to ensure checkpoint consistency

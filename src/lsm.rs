@@ -1954,9 +1954,10 @@ impl Tree {
 		// Validate options before creating the tree
 		opts.validate()?;
 
-		// Fail before anything is created or moved if the directory holds database files
-		// but no usable manifest. This must stay ahead of the migrations, the directory
-		// creation and the lock file.
+		// Fail before anything is created or moved if a restore into the directory did not
+		// finish, or if it holds database files but no usable manifest. These must stay ahead
+		// of the migrations, the directory creation and the lock file.
+		crate::checkpoint::check_restore_finished(&opts)?;
 		check_manifest_before_open(&opts)?;
 
 		// If the path contains an existing RocksDB database, automatically migrate it in pure Rust
