@@ -25,6 +25,13 @@ rust-version = "1.86"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+# Compiles out the guard in `Options::validate` that rejects a configured key manager, so the
+# unfinished encryption work can be exercised. Encryption at rest is not implemented yet: data
+# written under this feature has no compatibility promise and may be unreadable by any other
+# build. Never enable it in production, and do not document it.
+encryption-preview = []
+
 [dependencies]
 surrealkv-compat-rocksdb = { path = "crates/surrealkv-compat-rocksdb" }
 surrealkv-compat-v1 = { path = "crates/surrealkv-compat-v1" }
@@ -45,9 +52,6 @@ lz4_flex = "0.12.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
-chacha20 = { version = "0.10", default-features = false }
-blake3 = { version = "1.8", default-features = false, features = ["std"] }
-subtle = { version = "2.6", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.36", features = ["rt-multi-thread"] }

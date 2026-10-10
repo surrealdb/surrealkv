@@ -20,3 +20,8 @@ build-cli:
 .PHONY: install-cli
 install-cli:
 	cargo install --path crates/surrealkv-cli
+
+# This command regenerates CARGO.md, the crates.io readme, from README.md.
+.PHONY: readme
+readme:
+	scripts/sync-crate-readme.sh

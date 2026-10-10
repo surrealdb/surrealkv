@@ -98,6 +98,34 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
   
+  # The guard that rejects a key manager is compiled out under this non-default feature, so
+  # build and test it here to keep that path from rotting.
+  encryption-preview:
+    name: Encryption preview feature
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --deny warnings
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: Clippy
+        run: cargo clippy -p surrealkv --all-targets --features encryption-preview -- -D warnings
+
+      - name: Test
+        run: cargo test -p surrealkv --features encryption-preview --lib --test encryption_preview
+
   format:
     runs-on: ubuntu-latest
     steps:
@@ -111,6 +139,19 @@ jobs:
 
       - name: Format
         run: cargo +nightly fmt --all -- --check
+
+  readme:
+    name: README Sync
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Regenerate CARGO.md
+        run: make readme
+
+      - name: Check CARGO.md matches README.md (run make readme to fix)
+        run: git diff --exit-code -- CARGO.md
 
   wasm-check:
     name: WASM Check & Clippy

@@ -6,13 +6,11 @@
     </a>
 </p>
 
-<p align="center">An embedded, non-blocking, async-native, key-value storage engine.</p>
+<p align="center">An embedded key-value storage engine with an async commit pipeline.</p>
 
 <br>
 
 <p align="center">
-	<a href="https://github.com/surrealdb/surrealkv"><img src="https://img.shields.io/badge/status-stable-ff00bb.svg?style=flat-square"></a>
-	&nbsp;
 	<a href="https://docs.rs/surrealkv/"><img src="https://img.shields.io/docsrs/surrealkv?style=flat-square"></a>
 	&nbsp;
 	<a href="https://crates.io/crates/surrealkv"><img src="https://img.shields.io/crates/v/surrealkv?style=flat-square"></a>
@@ -20,13 +18,15 @@
 	<a href="https://github.com/surrealdb/surrealkv"><img src="https://img.shields.io/badge/license-Apache_License_2.0-00bfff.svg?style=flat-square"></a>
 </p>
 
-SurrealKV is a high-performance, non-blocking, async-native, embedded key-value storage engine built on a modern Log-Structured Merge (LSM) tree architecture.
+SurrealKV is a high-performance, embedded key-value storage engine built on a modern Log-Structured Merge (LSM) tree architecture. Commits go through an asynchronous commit pipeline; point reads and iteration are synchronous, and `get_async` is available as an opt-in asynchronous point read.
 
-It is designed as an independent, standalone key-value store suitable for high-throughput server workloads, embedded systems, desktop applications, and browser WebAssembly environments over the Origin Private File System (OPFS).
+It is designed as an independent, standalone key-value store suitable for high-throughput server workloads, embedded systems, and desktop applications. Storage primitives for browser WebAssembly over the Origin Private File System (OPFS) are included, but are not yet wired into `Tree`.
 
 ---
 
 ## Performance
+
+> Write throughput depends on durability: the default is `Durability::Eventual`, where a commit does not wait for an fsync, while these numbers were produced with `--sync`.
 
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM, 4TB PCIe 4.0 NVMe SSD**, 500,000 keys across 48 concurrent worker threads with 128 clients, synchronous durability enabled with `--sync` via [`crud-bench`](https://github.com/surrealdb/crud-bench)):
 
@@ -44,7 +44,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 - **Updates**: **199,730 OPS** (**5.43× faster** than RocksDB, **24.5× faster** than SlateDB, **144× faster** than ReDB, and **174× faster** than Fjall) with lock-free group commit.
 - **Point Reads**: **6.75M OPS** sustained (**5.32× faster** than LMDB, **7.80× faster** than RocksDB, **20.3× faster** than ReDB, and **76.2× faster** than SlateDB).
 - **Deletes**: **253,717 OPS** (**6.80× faster** than RocksDB, **30.9× faster** than SlateDB, **184× faster** than ReDB, and **283× faster** than Fjall).
-- **Range Scans**: **1.80× faster** than ReDB, **3.01× faster** than RocksDB, **5.42× faster** than SlateDB, and **10.3× faster** than Fjall via zero-copy iterator merges and block-level restart points.
+- **Range Scans**: **1.80× faster** than ReDB, **3.01× faster** than RocksDB, **5.42× faster** than SlateDB, and **10.3× faster** than Fjall via zero-copy iterator merges and block-level restart points. LMDB (**1,007 OPS**) and Libmdbx (**925 OPS**) are faster at scans than SurrealKV (**438 OPS**), by **2.30×** and **2.11×**.
 
 ### Memory Profile
 
@@ -67,16 +67,16 @@ Resting and peak memory are the lowest and highest process memory sampled across
 
 ## Features
 
-- **Async Native & Non-Blocking**: Fully concurrent, non-blocking commit pipeline built on lock-free ring buffers and optimistic concurrency control (OCC).
+- **Async Commit Pipeline**: Concurrent commit pipeline built on lock-free ring buffers and optimistic concurrency control (OCC), awaited asynchronously. Point reads and iteration are synchronous; `get_async` is an opt-in asynchronous point read.
 - **Snapshot Isolation**: Multi-version concurrency control with non-blocking concurrent reads and isolated read transactions.
-- **Origin Private File System (OPFS)**: Native WebAssembly browser support using `FileSystemSyncAccessHandle` inside Web Workers for persistent client-side storage.
+- **Origin Private File System (OPFS) Primitives**: `LogStore` and `ObjectStore` implementations over `FileSystemSyncAccessHandle` for Web Workers (`surrealkv::storage::opfs`, `wasm32` only). They are not yet wired into `Tree`, so a `Tree` does not persist to OPFS yet.
 - **Automated Zero-Effort Migration**: Automatically detects and migrates legacy databases on startup in pure Rust:
   - RocksDB BlockBasedTable formats (v2 through v7) via `surrealkv-compat-rocksdb`.
   - SurrealKV V1 stores via `surrealkv-compat-v1`.
-  - Browser IndexedDB (`indxdb://`) stores via `surrealkv-compat-indxdb`.
-- **Value Log Separation (WiscKey)**: Separates large values from the LSM tree to minimize write amplification during leveled compaction.
-- **Data Integrity & Bitrot Scrubber**: Continuous background verification of CRC32 block checksums across all SSTables.
-- **Deterministic Simulation Tested (DST)**: Verified against an in-memory linearizable model oracle across 25,000,000 operations with zero divergences.
+  - Browser IndexedDB (`indxdb://`) data from an exported IndexedDB dump via `surrealkv-compat-indxdb`.
+- **Value Log Separation (WiscKey)**: Opt-in via `with_enable_vlog(true)`. Values larger than `vlog_value_threshold` (1 KiB by default) are stored outside the LSM tree to minimize write amplification during leveled compaction.
+- **Data Integrity**: CRC32 checksums on SSTable blocks and WAL records, verified when they are read from disk, plus the offline `skv scrub` sweep of SSTable data blocks. Continuous background scrubbing is not implemented yet.
+- **Deterministic Simulation Tested (DST)**: Differentially tested against an in-memory reference model, with every divergence failing the run: 500 seeds of 5,000 steps each (2,500,000 operations) in every CI run.
 
 ---
 
@@ -99,17 +99,17 @@ surrealkv/
 
 ## Quick Start
 
-Add SurrealKV to your `Cargo.toml`:
+This README describes the engine on the `main` branch, which has not been released yet. The `0.21.x` versions of `surrealkv` on crates.io are the previous engine, so `surrealkv = "0.21"` does not give you what is described here. Until the next release, depend on this repository directly:
 
 ```toml
 [dependencies]
-surrealkv = "0.21"
+surrealkv = { git = "https://github.com/surrealdb/surrealkv" }
 tokio = { version = "1", features = ["full"] }
 ```
 
 ### Basic Usage
 
-```rust
+```rust,no_run
 use surrealkv::TreeBuilder;
 
 #[tokio::main]
@@ -141,99 +141,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
+Commits use `Durability::Eventual` by default, so a commit does not wait for an fsync. Call `tx.set_durability(Durability::Immediate)` before `commit()` to make a commit durable before it returns.
+
 ---
 
 ## Range Scans & Iteration
 
-SurrealKV provides a cursor-based iterator API supporting forward and backward traversal:
+SurrealKV provides a cursor-based iterator API supporting forward and backward traversal. The iterator methods come from the `LSMIterator` trait, which must be in scope:
 
-```rust
-let tx = tree.begin()?;
+```rust,no_run
+use surrealkv::{LSMIterator, TreeBuilder};
 
-// Forward scan [start .. end)
-let mut iter = tx.range(b"user:000", b"user:999")?;
-iter.seek_first()?;
-while iter.valid() {
-    let key = iter.key();
-    let value = iter.value()?;
-    println!("{:?} => {:?}", key.user_key(), value);
-    iter.next()?;
-}
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let tree = TreeBuilder::new()
+        .with_path("data/mydb".into())
+        .build()?;
 
-// Backward scan
-let mut iter = tx.range(b"user:000", b"user:999")?;
-iter.seek_last()?;
-while iter.valid() {
-    let key = iter.key();
-    let value = iter.value()?;
-    println!("{:?} => {:?}", key.user_key(), value);
-    iter.prev()?;
+    let tx = tree.begin()?;
+
+    // Forward scan [start .. end)
+    let mut iter = tx.range(b"user:000", b"user:999")?;
+    iter.seek_first()?;
+    while iter.valid() {
+        let key = iter.key();
+        let value = iter.value()?;
+        println!("{:?} => {:?}", key.user_key(), value);
+        iter.next()?;
+    }
+
+    // Backward scan
+    let mut iter = tx.range(b"user:000", b"user:999")?;
+    iter.seek_last()?;
+    while iter.valid() {
+        let key = iter.key();
+        let value = iter.value()?;
+        println!("{:?} => {:?}", key.user_key(), value);
+        iter.prev()?;
+    }
+
+    Ok(())
 }
 ```
 
 ---
 
-## Transparent Data Encryption (TDE) & Key Rotation
+## Transparent Data Encryption (not yet available)
 
-SurrealKV supports authenticated encryption at rest (AEAD) with self-describing block envelopes and online key rotation without downtime.
-
-### Supported Cipher Suites
-- `CipherSuite::Aes256Gcm` (default): Hardware-accelerated standard AEAD via AES-NI / ARMv8 crypto instructions.
-- `CipherSuite::XChaCha20Poly1305`: Constant-time software AEAD with an extended 192-bit nonce to eliminate nonce collision risk.
-- `CipherSuite::ChaCha20Blake3`: Committing AEAD construction combining ChaCha20 stream encryption with keyed BLAKE3 MAC for maximum throughput.
-
-### Configuration & Key Rotation Example
-
-```rust
-use std::sync::Arc;
-use surrealkv::{CipherSuite, Options, SoftwareKeyManager, TreeBuilder};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Initialize a KeyManager with a 256-bit (32-byte) master key
-    let initial_key = [0x42u8; 32];
-    let key_manager = Arc::new(SoftwareKeyManager::new(initial_key));
-
-    // 2. Configure Options with Transparent Data Encryption (TDE)
-    let opts = Options::new()
-        .with_path("data/encrypted_db".into())
-        .with_encryption(key_manager.clone(), CipherSuite::Aes256Gcm);
-
-    let tree = TreeBuilder::with_options(opts).build()?;
-
-    // Writes are transparently encrypted before hitting disk
-    {
-        let mut tx = tree.begin()?;
-        tx.set(b"secret:key", b"super_sensitive_data")?;
-        tx.commit().await?;
-    }
-
-    // 3. Online Key Rotation
-    // Add a new key and set it as the active key ID for subsequent writes
-    let rotated_key = [0x99u8; 32];
-    key_manager.add_key(2, rotated_key);
-    key_manager.set_active_key_id(2)?;
-
-    // New writes immediately use key ID 2
-    {
-        let mut tx = tree.begin()?;
-        tx.set(b"secret:new_key", b"data_under_rotated_key")?;
-        tx.commit().await?;
-    }
-
-    // Existing blocks with older key IDs remain transparently readable
-    // via self-describing authenticated envelope headers
-    {
-        let tx = tree.begin()?;
-        let val1 = tx.get(b"secret:key")?;
-        let val2 = tx.get(b"secret:new_key")?;
-        assert!(val1.is_some() && val2.is_some());
-    }
-
-    tree.close().await?;
-    Ok(())
-}
-```
+The cipher primitives are implemented and unit-tested but are not connected to the SSTable, WAL or value-log write paths. `TreeBuilder::build()` returns an error if a key manager is configured, so data is never written unencrypted by accident. Use volume or filesystem encryption (LUKS, FileVault, BitLocker, encrypted cloud volumes) for encryption at rest today.
 
 ---
 
@@ -254,7 +209,7 @@ skv manifest path/to/db
 # Deep inspection of an SSTable file with checksum verification
 skv sst path/to/db/sstables/00000000000000000001.sst --dump-keys --verify-checksum
 
-# Full CRC32 integrity sweep across all database blocks
+# CRC32 integrity sweep across all SSTable data blocks
 skv scrub path/to/db
 
 # Point lookups and range scans
@@ -267,13 +222,11 @@ skv migrate path/to/rocksdb_dir path/to/new_surrealkv_db
 
 ---
 
-## WebAssembly & Browser Persistence (OPFS)
+## WebAssembly & OPFS Storage Primitives
 
-SurrealKV supports WebAssembly (`wasm32-unknown-unknown`) inside browser Web Workers over the Origin Private File System (OPFS):
+SurrealKV builds for WebAssembly (`wasm32-unknown-unknown`). On that target, `surrealkv::storage::opfs` provides `LogStore` and `ObjectStore` implementations over the Origin Private File System (OPFS), using `FileSystemSyncAccessHandle` inside Web Workers.
 
-- Uses `FileSystemSyncAccessHandle` for synchronous, zero-copy block reads and writes.
-- Prevents UI thread blocking by running I/O in worker contexts.
-- Automatically handles browser quota and sync handles.
+These are storage primitives only. They are not yet wired into `Tree`, which opens its WAL, SSTable and value-log files through `std::fs`, so a `Tree` cannot persist to OPFS today. CI builds the crate for `wasm32-unknown-unknown` and tests the OPFS primitives in headless Chrome, but it does not run a `Tree` on that target.
 
 To compile for WebAssembly:
 
@@ -285,12 +238,19 @@ RUSTFLAGS="--cfg getrandom_backend=\"wasm_js\"" cargo build --target wasm32-unkn
 
 ## Platform Support
 
-| Operating System | Architectures | Status |
+| Operating System | Architecture | Tier |
 | :--- | :--- | :--- |
-| **Linux** | `x86_64`, `aarch64` | Tier 1 (Full async I/O, `io_uring` & threadpool) |
-| **macOS / Darwin** | `x86_64`, `aarch64` (Apple Silicon) | Tier 1 (Full async I/O via `affinitypool`) |
-| **Windows** | `x86_64` | Tier 1 (Full support) |
-| **WebAssembly** | `wasm32-unknown-unknown` | Tier 1 (Browser OPFS & Web Workers) |
+| **Linux** | `x86_64` | Tier 1 |
+| **Linux** | `aarch64` | Tier 2 |
+| **macOS / Darwin** | `aarch64` (Apple Silicon) | Tier 1 |
+| **macOS / Darwin** | `x86_64` | Tier 2 |
+| **Windows** | `x86_64` | Tier 2 |
+| **WebAssembly** | `wasm32-unknown-unknown` | Tier 2 |
+
+- **Tier 1**: built and tested in CI.
+- **Tier 2**: built in CI, but the test suite is not run on that target. Windows tests are skipped, and the Linux `aarch64` and macOS `x86_64` builds are cross-compiled while the tests run on the CI runner's own architecture. For WebAssembly only the OPFS storage primitives are tested (in headless Chrome); `Tree` is not run.
+
+WAL appends and syncs, `get_async` block reads and parallel WAL replay go through `affinitypool`, which runs them on a worker pool when the host application installs one and otherwise inline on the calling thread. SurrealKV does not install a pool itself. Point reads and iteration are plain synchronous `pread` calls on the calling thread. `io_uring` is not used.
 
 ---
 

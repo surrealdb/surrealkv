@@ -16,12 +16,17 @@ mod lsm;
 pub mod memory;
 mod memtable;
 mod ring;
-pub mod scrubber;
+// The background scrubber is planned, not implemented: nothing constructs it outside tests.
+#[cfg(test)]
+mod scrubber;
 mod snapshot;
 mod sstable;
 mod stall;
 pub mod storage;
 mod task;
+// Reachable only because `Options::key_manager` is a public field. Encryption at rest is not
+// implemented, so keep it out of the documented API.
+#[doc(hidden)]
 pub mod tde;
 pub mod telemetry;
 mod tracker;
@@ -56,6 +61,7 @@ pub use crate::error::{
 };
 pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::stall::WriteStallInfo;
+#[doc(hidden)]
 pub use crate::tde::{BlockCipher, CipherSuite, KeyManager, SoftwareKeyManager};
 pub use crate::transaction::{
 	Durability,
@@ -275,12 +281,15 @@ pub struct Options {
 	pub l0_stall_threshold: usize,
 
 	// Transparent Data Encryption (TDE) configuration
-	/// Key manager for transparent data encryption at rest (TDE).
-	/// When configured, blocks written to storage are encrypted.
-	/// Default: None (encryption disabled)
+	/// Key manager reserved for transparent data encryption at rest (TDE), which is not
+	/// implemented yet. The cipher primitives are not wired into any SSTable, WAL or value-log
+	/// path, so nothing would be encrypted. Building a tree with a key manager set returns
+	/// `Error::InvalidArgument` instead of writing plaintext.
+	/// Default: None
 	pub key_manager: Option<Arc<dyn KeyManager>>,
-	/// Active cipher suite to use for encryption.
-	/// Options: Aes256Gcm, XChaCha20Poly1305, ChaCha20Blake3.
+	/// Cipher suite reserved for encryption at rest. Has no effect until encryption is
+	/// implemented.
+	/// Options: Aes256Gcm, XChaCha20Poly1305.
 	/// Default: CipherSuite::Aes256Gcm
 	pub encryption_cipher: CipherSuite,
 }
@@ -359,7 +368,11 @@ impl Options {
 		self
 	}
 
-	/// Configures Transparent Data Encryption (TDE) with the provided key manager and cipher suite.
+	/// Reserved for Transparent Data Encryption (TDE), which is not implemented yet.
+	///
+	/// The cipher primitives are not wired into any SSTable, WAL or value-log path, so this
+	/// would encrypt nothing. Building a tree with a key manager set fails with
+	/// `Error::InvalidArgument` rather than writing plaintext.
 	pub fn with_encryption(
 		mut self,
 		key_manager: Arc<dyn KeyManager>,
@@ -481,7 +494,7 @@ impl Options {
 	/// Values smaller than this threshold are stored inline in SSTables.
 	/// Values larger than or equal to this threshold are stored in VLog files.
 	///
-	/// Default: 4096 (4KB)
+	/// Default: 1024 (1KB)
 	///
 	/// # Example
 	///
@@ -635,6 +648,21 @@ impl Options {
 	/// This should be called when the store starts to catch configuration
 	/// errors early
 	pub fn validate(&self) -> Result<()> {
+		// Encryption at rest is not wired into any SSTable, WAL or value-log path yet, so a
+		// configured key manager would be accepted and then ignored, leaving every file in
+		// plaintext. Refuse here, which is the first thing `Tree::new` does, so a rejection
+		// creates nothing on disk. Compiled out only for this crate's own unit tests and under
+		// the non-default `encryption-preview` feature, which exist to build the missing parts.
+		#[cfg(not(any(test, feature = "encryption-preview")))]
+		if self.key_manager.is_some() {
+			return Err(Error::InvalidArgument(
+				"Encryption at rest is not implemented yet: the key manager would be accepted \
+				 but no SSTable, WAL or value-log data would be encrypted. Refusing to open \
+				 rather than write plaintext; remove the key manager."
+					.to_string(),
+			));
+		}
+
 		// Validate versioned queries configuration
 		if self.enable_versioning {
 			// Versioned queries require VLog to be enabled
@@ -1177,3 +1205,9 @@ pub trait LSMIterator {
 		Ok(self.value_encoded()?.to_vec())
 	}
 }
+
+// Compiles the Rust code blocks in the README as doctests, so the examples
+// cannot drift from the API without `cargo test --doc` failing.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;

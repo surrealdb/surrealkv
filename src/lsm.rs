@@ -2175,7 +2175,7 @@ impl TreeBuilder {
 	/// Values smaller than this threshold are stored inline in SSTables.
 	/// Values larger than or equal to this threshold are stored in VLog files.
 	///
-	/// Default: 4096 (4KB)
+	/// Default: 1024 (1KB)
 	///
 	/// # Example
 	///
