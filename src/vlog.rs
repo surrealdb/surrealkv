@@ -775,6 +775,10 @@ pub(crate) struct VLog {
 	/// Cached open file handles for reading
 	pub(crate) file_handles: RwLock<HashMap<u32, Arc<File>>>,
 
+	/// Bumped, under the `file_handles` lock, by every [`reload`](Self::reload): a handle that
+	/// was opened before it belongs to a file that was replaced, and is not cached.
+	generation: AtomicU64,
+
 	/// Options for VLog configuration
 	pub(crate) opts: Arc<Options>,
 
@@ -835,6 +839,7 @@ impl VLog {
 			created: Pending::default(),
 			files_map: RwLock::new(HashMap::new()),
 			file_handles: RwLock::new(HashMap::new()),
+			generation: AtomicU64::new(0),
 			opts,
 			#[cfg(test)]
 			fail_next_sync: std::sync::atomic::AtomicBool::new(false),
@@ -900,15 +905,42 @@ impl VLog {
 
 	/// Pre-fills the file_handles cache with all existing VLog files
 	fn prefill_file_handles(&self) -> Result<()> {
-		let entries = match std::fs::read_dir(&self.path) {
-			Ok(entries) => entries,
-			Err(_) => return Ok(()), // Directory doesn't exist yet
+		let Some((highest_file_id, highest_file_path)) = self.load_files()? else {
+			return Ok(());
 		};
 
-		let mut max_file_id: Option<u32> = None;
-		let mut max_file_path: Option<PathBuf> = None;
-		let mut file_handles = self.file_handles.write();
+		// Found existing files, set next_file_id to one past the highest existing file ID
+		self.next_file_id.store(highest_file_id + 1, Ordering::SeqCst);
+
+		// Set the last file up as the active writer
+		let writer = VLogWriter::new(
+			&highest_file_path,
+			highest_file_id,
+			self.opts.vlog_max_file_size,
+			CompressionType::None as u8,
+		)?;
+		self.active_writer_id.store(highest_file_id, Ordering::SeqCst);
+		*self.writer.write() = Some(writer);
+		// What an earlier run left in the file may not be on disk yet: the first sync
+		// covers it.
+		self.appended.mark();
+
+		Ok(())
+	}
+
+	/// Opens and validates every file in the log's directory, registers it in `file_handles` and
+	/// `files_map`, and returns the one with the highest id. A directory that does not exist
+	/// holds none.
+	fn load_files(&self) -> Result<Option<(u32, PathBuf)>> {
+		let entries = match std::fs::read_dir(&self.path) {
+			Ok(entries) => entries,
+			Err(_) => return Ok(None), // Directory doesn't exist yet
+		};
+
+		let mut highest: Option<(u32, PathBuf)> = None;
+		// The order `cleanup_obsolete_files` takes them in
 		let mut files_map = self.files_map.write();
+		let mut file_handles = self.file_handles.write();
 
 		for entry in entries {
 			let entry = entry?;
@@ -921,9 +953,8 @@ impl VLog {
 				let file_size = entry.metadata()?.len();
 
 				// Track the file with maximum ID for active writer setup
-				if max_file_id.is_none_or(|current_max| file_id >= current_max) {
-					max_file_id = Some(file_id);
-					max_file_path = Some(file_path.clone());
+				if highest.as_ref().is_none_or(|(current_max, _)| file_id >= *current_max) {
+					highest = Some((file_id, file_path.clone()));
 				}
 
 				// Pre-open the file handle and validate header
@@ -954,43 +985,52 @@ impl VLog {
 			}
 		}
 
-		// Set next_file_id based on whether we found existing files
-		if let Some(highest_file_id) = max_file_id {
-			// Found existing files, set next_file_id to one past the highest existing file
-			// ID
-			self.next_file_id.store(highest_file_id + 1, Ordering::SeqCst);
+		Ok(highest)
+	}
 
-			// Set the last file up as the active writer
-			let writer = VLogWriter::new(
-				&max_file_path.unwrap(),
-				highest_file_id,
-				self.opts.vlog_max_file_size,
-				CompressionType::None as u8,
-			)?;
-			self.active_writer_id.store(highest_file_id, Ordering::SeqCst);
-			*self.writer.write() = Some(writer);
-			// What an earlier run left in the file may not be on disk yet: the first sync
-			// covers it.
-			self.appended.mark();
+	/// Replaces everything the log knows about its files by what its directory holds now, after
+	/// a restore replaced the directory. The writer, the handles and the file registry belong to
+	/// files that are gone, and a file id that the restored directory has again would otherwise
+	/// be read through, and appended to by, the old file.
+	///
+	/// The log has no writer afterwards, so the next append starts a file of its own, one past
+	/// the highest id found, and never one of the restored files. The caller keeps appends out
+	/// while it runs: it holds the commit pipeline's admission and the flush lock.
+	pub(crate) fn reload(&self) -> Result<()> {
+		// Before the directory is read: a checkpoint without a value log leaves none.
+		std::fs::create_dir_all(&self.path)?;
+
+		let mut writer = self.writer.write();
+		// What the old writer still buffers goes to a file that was removed.
+		*writer = None;
+		self.unsynced.lock().clear();
+		{
+			let mut files_map = self.files_map.write();
+			let mut file_handles = self.file_handles.write();
+			files_map.clear();
+			file_handles.clear();
+			self.generation.fetch_add(1, Ordering::SeqCst);
 		}
 
-		// println!(
-		//     "Pre-filled {} VLog file handles, next_file_id set to {}",
-		//     file_handles.len(),
-		//     max_file_id + 1
-		// );
-
+		let highest = self.load_files()?;
+		self.next_file_id.store(highest.map_or(1, |(id, _)| id + 1), Ordering::SeqCst);
+		self.active_writer_id.store(0, Ordering::SeqCst);
+		// The files were copied in, and neither they nor the directory entries are known to be
+		// on disk: the first sync covers them.
+		self.appended.mark();
+		self.created.mark();
 		Ok(())
 	}
 
 	/// Retrieves (and caches) an open file handle for the given file ID
 	fn get_file_handle(&self, file_id: u32) -> Result<Arc<File>> {
-		{
+		let generation = {
 			let handles = self.file_handles.read();
 			if let Some(handle) = handles.get(&file_id) {
 				return Ok(Arc::clone(handle));
 			}
-		}
+			self.generation.load(Ordering::SeqCst)
+		};
 
 		// Open and validate the file
 		let file_path = self.vlog_file_path(file_id);
@@ -1082,6 +1122,11 @@ impl VLog {
 		let handle = Arc::new(file);
 
 		let mut handles = self.file_handles.write();
+		// The file may have been replaced while it was opened: the caller reads what it opened,
+		// and it is not kept for the file that has this id now.
+		if self.generation.load(Ordering::SeqCst) != generation {
+			return Ok(handle);
+		}
 		// Another thread might have inserted it while we were opening the file
 		let entry = handles.entry(file_id).or_insert_with(|| Arc::clone(&handle));
 		Ok(Arc::clone(entry))

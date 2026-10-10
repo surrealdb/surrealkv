@@ -109,6 +109,13 @@ impl BlockCache {
 		}
 	}
 
+	/// Drops every entry. Blocks are keyed by table id and offset, and value-log values by file
+	/// id and offset, and a restore hands the same ids out again for other files: an entry that
+	/// outlived it would be served for a file it was never read from.
+	pub(crate) fn clear(&self) {
+		self.data.clear();
+	}
+
 	/// Returns the capacity of the cache in bytes.
 	#[cfg(test)]
 	pub(crate) fn capacity(&self) -> u64 {

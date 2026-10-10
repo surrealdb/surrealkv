@@ -262,8 +262,9 @@ pub(crate) enum CheckpointStage {
 	/// Every file of the checkpoint is back in place. The in-memory state, which is still the
 	/// state from before the restore, is not reloaded.
 	RestoreFilesCopied,
-	/// The in-memory manifest is the restored one, and the memtables and the WAL are still the
-	/// ones from before the restore.
+	/// The in-memory manifest, the active memtable and the immutable queue were replaced together:
+	/// the manifest is the restored one and the memtables are empty. The WAL and the sequence
+	/// numbers are still the ones from before the restore.
 	RestoreManifestSwapped,
 }
 

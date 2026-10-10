@@ -684,7 +684,6 @@ async fn commits_after_a_restore_continue_from_the_restored_sequence_and_the_ora
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore leaves the value log writing to its deleted files: large values committed afterwards are unreadable"]
 async fn commits_after_a_restore_continue_from_the_restored_sequence_with_a_value_log() {
 	after_the_restore(true).await;
 }
@@ -693,7 +692,6 @@ async fn commits_after_a_restore_continue_from_the_restored_sequence_with_a_valu
 /// id of a table from before it. The blocks that were cached for the old table must not be served
 /// for the new one.
 #[test(tokio::test)]
-#[ignore = "a restore does not clear the block cache: a table written afterwards under a reused id is read through the blocks cached for the old table"]
 async fn a_table_id_reused_after_a_restore_does_not_serve_the_blocks_cached_for_the_old_table() {
 	let mut w = build(false).await;
 	// Reads that fill the block cache with the blocks of the tables written after the checkpoint,
@@ -752,13 +750,11 @@ async fn large_values_after_a_restore(crash: bool) {
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore leaves the value log writing to its deleted files: large values committed afterwards are unreadable"]
 async fn large_values_committed_after_a_restore_are_readable_and_survive_a_reopen() {
 	large_values_after_a_restore(false).await;
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore leaves the value log writing to its deleted files: large values committed afterwards are lost in a crash"]
 async fn large_values_committed_after_a_restore_survive_a_crash() {
 	large_values_after_a_restore(true).await;
 }
@@ -978,7 +974,6 @@ async fn writers_racing_a_restore_never_land_a_commit_that_returned_an_error() {
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[ignore = "a restore leaves the value log writing to its deleted files: large values acknowledged after the restore are unreadable"]
 async fn writers_racing_a_restore_leave_the_checkpoint_plus_the_commits_after_it_with_a_value_log()
 {
 	writers_during_a_restore(true, true).await;
@@ -1291,7 +1286,6 @@ async fn readers_begun_before_a_restore_never_see_a_value_of_neither_state_with_
 /// both: old memtable rows over restored tables would show keys that the checkpoint does not hold
 /// next to values it does.
 #[test(tokio::test)]
-#[ignore = "a transaction begun after a restore swapped the manifest and before it replaced the memtables reads the old memtable over the restored tables"]
 async fn readers_begun_between_the_manifest_swap_and_the_memtable_swap_see_one_state() {
 	let w = build(false).await;
 	let seen: Arc<Mutex<Option<Result<Model, String>>>> = Arc::new(Mutex::new(None));
@@ -1477,8 +1471,10 @@ async fn a_compaction_that_resumes_after_a_restore_with_a_value_log_keeps_the_va
 
 /// A flush that starts while a restore runs waits for it, and finds a queue that the restore
 /// emptied: no table of the pre-restore memtable is written or listed. Once with the files
-/// removed, and once with the manifest already replaced and the memtables not: the flush lock is
-/// held through the whole restore, not only through its first step.
+/// removed, and once with the manifest and the memtables already replaced, which the restore does
+/// in one step: the flush lock is held through the whole restore, not only through its first
+/// step, which the background flush shows, as it takes the lock before it reads the queue. A
+/// flush of the queue that begins after the swap has nothing to flush and returns at once.
 #[test(tokio::test)]
 async fn a_flush_that_starts_during_a_restore_waits_for_it_and_adds_no_table() {
 	for stage in [CheckpointStage::RestoreCleared, CheckpointStage::RestoreManifestSwapped] {
@@ -1494,10 +1490,12 @@ async fn a_flush_that_starts_during_a_restore_waits_for_it_and_adds_no_table() {
 		gate.arrived(&format!("{stage:?}"));
 		let inner = Arc::clone(&w.tree.core.inner);
 		let flushing = on_thread(move || inner.flush_all_immutables_sync());
-		assert!(
-			!flushing.finishes_within(GRACE),
-			"{stage:?}: a flush ran while the restore held the flush lock"
-		);
+		if stage == CheckpointStage::RestoreCleared {
+			assert!(
+				!flushing.finishes_within(GRACE),
+				"{stage:?}: a flush ran while the restore held the flush lock"
+			);
+		}
 		let inner = Arc::clone(&w.tree.core.inner);
 		let background = on_thread(move || inner.compact_memtable());
 		assert!(
@@ -1851,7 +1849,6 @@ async fn acknowledged_commits_after_a_restore_survive_a_crash() {
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore leaves the value log writing to its deleted files: large values committed afterwards are lost in a crash"]
 async fn acknowledged_commits_after_a_restore_survive_a_crash_with_a_value_log() {
 	acknowledged_commits_survive_a_crash(true).await;
 }
@@ -2097,7 +2094,6 @@ async fn restoring_an_older_checkpoint_after_a_newer_one_and_back() {
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore leaves the value log writing to its deleted files: large values committed afterwards are unreadable"]
 async fn restoring_an_older_checkpoint_after_a_newer_one_and_back_with_a_value_log() {
 	restoring_in_every_order(true).await;
 }
@@ -2235,7 +2231,6 @@ async fn a_restore_replays_the_wal_of_a_checkpoint_and_continues_in_a_segment_of
 /// A checkpoint of another tree has tables under the ids of the tables the target has read, and
 /// the restore must not leave the target reading through the blocks it cached for its own tables.
 #[test(tokio::test)]
-#[ignore = "a restore does not clear the block cache: tables of the restored checkpoint are read through blocks cached for the old tables with the same ids"]
 async fn restoring_the_checkpoint_of_another_tree_serves_its_tables_and_not_cached_blocks() {
 	let source_dir = TempDir::new("restore_conc_source").unwrap();
 	let roots = TempDir::new("restore_conc_source_ckpt").unwrap();
@@ -2256,7 +2251,6 @@ async fn restoring_the_checkpoint_of_another_tree_serves_its_tables_and_not_cach
 /// each compaction runs the collection), seeded and bounded. After each restore the tree is the
 /// checkpoint exactly, and after the work it holds what the work wrote.
 #[test(tokio::test)]
-#[ignore = "a restore does not clear the block cache: tables written after a restore are read through the blocks cached for the old tables with the same ids"]
 async fn restoring_between_rounds_of_work_that_collects_the_value_log() {
 	let mut w = build(true).await;
 	let seed = 0x5EED_0000_0000_1357u64;

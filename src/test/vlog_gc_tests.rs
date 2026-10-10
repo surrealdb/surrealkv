@@ -1550,9 +1550,6 @@ async fn a_checkpoint_that_holds_the_manifest_keeps_every_file_until_its_copy_is
 /// A checkpoint restored into a live tree of its own reads every value, and the values written
 /// after it go to files that are not any of the restored ones.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
-#[ignore = "restore_from_checkpoint replaces the value-log files but not the log's state (active \
-            writer, next file id, handles): values written after a restore get pointers into \
-            file ids that the restored files also have, and read back as other bytes"]
 async fn a_checkpoint_restored_into_a_live_tree_reads_every_value_and_new_values_get_new_files() {
 	let dir = TempDir::new("vlog_gc_restore_source").unwrap();
 	let ckpt = TempDir::new("vlog_gc_restore_copy").unwrap();

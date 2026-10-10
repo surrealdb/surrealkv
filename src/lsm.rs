@@ -2325,14 +2325,42 @@ impl Tree {
 
 		// Step 2: Reload in-memory state to match restored files
 
-		// Create a new LevelManifest from the current path
+		// Read from disk with no lock held.
 		let new_levels = LevelManifest::new(Arc::clone(&self.core.inner.opts))?;
 
-		// Replace the current levels with the reloaded ones
-		{
-			let mut levels_guard = self.core.inner.level_manifest.write()?;
-			*levels_guard = new_levels;
+		// The files of the value log were replaced: the log's writer, its handles and its next
+		// file id belong to the ones that are gone. Before the swap below, so that a reader of the
+		// restored tables never finds a handle of the old file with the same id.
+		if let Some(ref vlog) = self.core.inner.vlog {
+			vlog.reload()?;
 		}
+
+		// Swap the manifest, the active memtable and the immutable queue in one step, under all
+		// three locks in the order the rest of the code takes them: a reader, a flush or a
+		// compaction sees the old state or the restored one, never the restored tables under a
+		// memtable from before the restore (which is discarded, as the restore intends).
+		let replaced = {
+			let inner = &self.core.inner;
+			let mut active_memtable = inner.active_memtable.write()?;
+			let mut levels_guard = inner.level_manifest.write()?;
+			let mut immutable_memtables = inner.immutable_memtables.write()?;
+			let replaced = (
+				std::mem::replace(&mut *levels_guard, new_levels),
+				std::mem::replace(
+					&mut *active_memtable,
+					Arc::new(MemTable::new(inner.opts.max_memtable_size)),
+				),
+				std::mem::take(&mut *immutable_memtables),
+			);
+			inner.memory_controller.set_active_memtable_bytes(0);
+			inner.memory_controller.set_immutable_memtable_bytes(0);
+			// Under the locks, so that nothing reads a restored table before the blocks cached
+			// for the tables and the value-log files that had its id are gone.
+			inner.opts.block_cache.clear();
+			replaced
+		};
+		// Dropped with no lock held
+		drop(replaced);
 
 		#[cfg(test)]
 		{
@@ -2340,18 +2368,6 @@ impl Tree {
 			if let Some(hook) = hook {
 				hook(crate::checkpoint::CheckpointStage::RestoreManifestSwapped);
 			}
-		}
-
-		// Clear the current memtables since they would be stale after restore
-		// This discards any pending writes, which is correct for restore operations
-		{
-			let mut active_memtable = self.core.inner.active_memtable.write()?;
-			*active_memtable = Arc::new(MemTable::new(self.core.inner.opts.max_memtable_size));
-		}
-
-		{
-			let mut immutable_memtables = self.core.inner.immutable_memtables.write()?;
-			*immutable_memtables = ImmutableMemtables::default();
 		}
 
 		// Reopen the WAL from the restored directory
