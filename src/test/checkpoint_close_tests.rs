@@ -1236,6 +1236,7 @@ async fn a_checkpoint_racing_close_is_a_valid_copy_or_a_clean_refusal() {
 				at_stage(match stage {
 					CheckpointStage::SstablesCopied => 1,
 					CheckpointStage::ManifestReleased => 2,
+					_ => unreachable!("this test creates checkpoints and restores none"),
 				});
 			}));
 			let (for_flushes, on_checkpoint) =

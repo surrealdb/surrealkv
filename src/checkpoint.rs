@@ -254,6 +254,17 @@ pub(crate) enum CheckpointStage {
 	SstablesCopied,
 	/// The manifest is released and the value log is not copied.
 	ManifestReleased,
+	/// `restore_from_checkpoint` removed the SSTables, the WAL, the manifest and the value log of
+	/// the database, and copied nothing yet.
+	RestoreCleared,
+	/// The SSTables and the WAL are copied, and the manifest and the value log are not.
+	RestoreSstablesCopied,
+	/// Every file of the checkpoint is back in place. The in-memory state, which is still the
+	/// state from before the restore, is not reloaded.
+	RestoreFilesCopied,
+	/// The in-memory manifest is the restored one, and the memtables and the WAL are still the
+	/// ones from before the restore.
+	RestoreManifestSwapped,
 }
 
 /// See `CoreInner::checkpoint_hook`.
@@ -437,6 +448,9 @@ impl DatabaseCheckpoint {
 		// Clear current database state
 		self.clear_current_state()?;
 
+		#[cfg(test)]
+		self.reach(CheckpointStage::RestoreCleared);
+
 		// Restore SSTables
 		let sstables_source = checkpoint_path.join("sstables");
 		let sstables_dest = self.core.opts.sstable_dir();
@@ -451,6 +465,9 @@ impl DatabaseCheckpoint {
 			Self::copy_directory_sync(&wal_source, &wal_dest)?;
 		}
 
+		#[cfg(test)]
+		self.reach(CheckpointStage::RestoreSstablesCopied);
+
 		// Restore level manifest directory
 		let manifest_source = checkpoint_path.join("manifest");
 		let manifest_dest = self.core.opts.manifest_dir();
@@ -463,6 +480,9 @@ impl DatabaseCheckpoint {
 
 		// Restore VLog directories if they exist in the checkpoint
 		self.restore_vlog_directories(checkpoint_path)?;
+
+		#[cfg(test)]
+		self.reach(CheckpointStage::RestoreFilesCopied);
 
 		Ok(metadata)
 	}
