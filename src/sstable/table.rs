@@ -429,12 +429,15 @@ impl<W: Write> TableWriter<W> {
 		// Track minimum vlog file_id if value is a vlog pointer. Peek the
 		// meta byte instead of decoding: ValueLocation::decode copies the
 		// entire value, which in this per-entry path costs a full copy of
-		// every byte streamed through flush/compaction.
-		if let Some(payload) = ValueLocation::peek_pointer_payload(val) {
-			if let Ok(pointer) = ValuePointer::decode(payload) {
-				let file_id = pointer.file_id;
-				self.min_vlog_file_id =
-					Some(self.min_vlog_file_id.map_or(file_id, |min| min.min(file_id)));
+		// every byte streamed through flush/compaction. The value of a range
+		// delete is its end key, never a pointer.
+		if key.kind() != InternalKeyKind::RangeDelete {
+			if let Some(payload) = ValueLocation::peek_pointer_payload(val) {
+				if let Ok(pointer) = ValuePointer::decode(payload) {
+					let file_id = pointer.file_id;
+					self.min_vlog_file_id =
+						Some(self.min_vlog_file_id.map_or(file_id, |min| min.min(file_id)));
+				}
 			}
 		}
 

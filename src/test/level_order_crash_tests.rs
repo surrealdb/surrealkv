@@ -1847,13 +1847,11 @@ async fn a_memtable_holding_only_a_range_delete_flushes_to_an_l0_table_that_hide
 	finish(db.tree);
 }
 
-/// A range delete whose end key is one byte long cannot be flushed: the flush decodes the end key
-/// stored in the range delete's entry as an encoded value, and a value needs two bytes. Every flush
-/// of that memtable fails, so the commits behind it eventually stall. Keys of two bytes or more
-/// are not affected, which is why the other tests here use them.
+/// A range delete whose end key is one byte long is flushed like any other: the end key stored in
+/// the entry of the range delete is not an encoded value, and the flush must not decode it as
+/// one (a value needs two bytes, so every flush of that memtable would fail and the commits
+/// behind it would eventually stall).
 #[test(tokio::test)]
-#[ignore = "flushing a memtable with a range delete whose end key is one byte fails with an IO \
-            error (failed to fill whole buffer): the flush decodes the end key as a ValueLocation"]
 async fn a_memtable_holding_a_range_delete_with_a_one_byte_end_key_flushes() {
 	let mut db = Db::open(Shape::WIDE).await;
 	db.put_all(&["a1", "a2", "b1", "b2"], "old").await;
@@ -1864,7 +1862,72 @@ async fn a_memtable_holding_a_range_delete_with_a_one_byte_end_key_flushes() {
 	db.assert_reads("a range delete with a one-byte end key").await;
 	assert_eq!(db.get("a1"), None);
 	assert_eq!(db.get("b1").as_deref(), Some(&b"old:b1"[..]));
+	{
+		let manifest = db.tree.core.inner.level_manifest.read().unwrap();
+		let front = &manifest.levels.get_levels()[0].tables[0];
+		let held: BTreeSet<(Vec<u8>, Vec<u8>)> =
+			front.range_deletions.read().iter().map(|(a, b, _)| (a.clone(), b.clone())).collect();
+		assert_eq!(
+			held,
+			BTreeSet::from([(b"a".to_vec(), b"b".to_vec())]),
+			"the table holds the range delete as it was written"
+		);
+	}
+	verify(&db.image("a one-byte range delete end key"), Shape::WIDE).await;
 	finish(db.tree);
+}
+
+/// The end key of a range delete is never moved to the value log, however long it is: a flush that
+/// treated it as a value would store a pointer in its place and the range delete would end at the
+/// bytes of that pointer, in the table and in the metadata that the reads use.
+#[test(tokio::test)]
+async fn a_range_delete_with_an_end_key_above_the_vlog_threshold_keeps_its_end_key() {
+	let dir = TempDir::new("level-order-vlog-end").unwrap();
+	let opts = Arc::new(Options {
+		path: dir.path().to_path_buf(),
+		flush_on_close: false,
+		enable_vlog: true,
+		vlog_value_threshold: 8,
+		max_memtable_size: 4 << 20,
+		level0_max_files: 10_000,
+		memtable_stall_threshold: 10_000,
+		l0_stall_threshold: 10_000,
+		..Default::default()
+	});
+	let tree = open_stopped(Arc::clone(&opts)).await;
+	// The first byte has the value-pointer bit clear, as that of an encoded inline value does.
+	let end = vec![b'b'; 64];
+	let mut txn = tree.begin().unwrap();
+	for key in ["a1", "b1", "d1"] {
+		txn.set(key.as_bytes(), vec![b'v'; 32].as_slice()).unwrap();
+	}
+	txn.commit().await.unwrap();
+	tree.flush().unwrap();
+	let mut txn = tree.begin().unwrap();
+	txn.delete_range(b"a".as_slice(), end.as_slice()).unwrap();
+	txn.commit().await.unwrap();
+	tree.flush().unwrap();
+	{
+		let manifest = tree.core.inner.level_manifest.read().unwrap();
+		let front = &manifest.levels.get_levels()[0].tables[0];
+		let written = BTreeSet::from([(b"a".to_vec(), end.clone())]);
+		let held: BTreeSet<(Vec<u8>, Vec<u8>)> =
+			front.range_deletions.read().iter().map(|(a, b, _)| (a.clone(), b.clone())).collect();
+		assert_eq!(held, written, "the range delete as written");
+		let on_disk: BTreeSet<(Vec<u8>, Vec<u8>)> =
+			front.meta.range_deletions.iter().map(|(a, b, _)| (a.clone(), b.clone())).collect();
+		assert_eq!(on_disk, written, "the metadata of the table holds the same range delete");
+		assert_eq!(front.meta.range_deletions.len(), 1, "and holds it once");
+	}
+	let read = |tree: &Tree| {
+		let txn = tree.begin_with_mode(Mode::ReadOnly).unwrap();
+		["a1", "b1", "d1"].map(|key| txn.get(key.as_bytes()).unwrap())
+	};
+	assert_eq!(read(&tree), [None, None, Some(vec![b'v'; 32])]);
+	finish(tree);
+	let tree = open_stopped(opts).await;
+	assert_eq!(read(&tree), [None, None, Some(vec![b'v'; 32])], "after a reopen");
+	finish(tree);
 }
 
 /// A range delete flushed on its own and compacted into L1 puts a table among the tables of L1
