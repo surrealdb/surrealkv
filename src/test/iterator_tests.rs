@@ -9,7 +9,7 @@ use crate::iter::{BoxedLSMIterator, CompactionIterator, MergingIterator};
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::vlog::{VLog, ValueLocation};
-use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, VLogChecksumLevel, Value};
+use crate::{InternalKey, InternalKeyKind, Key, LSMIterator, Options, VLogChecksumLevel, Value};
 
 /// Global counter for generating unique table IDs in tests
 static TEST_TABLE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -2273,4 +2273,234 @@ fn test_snapshot_compaction_with_versioning_enabled() {
 	assert_eq!(result.len(), 2, "Latest and snapshot-visible should be kept");
 	assert!(result.contains(&("key1".to_string(), 100)));
 	assert!(result.contains(&("key1".to_string(), 50)));
+}
+
+// ---------------------------------------------------------------------------
+// the visibility horizon
+// ---------------------------------------------------------------------------
+
+type Version = (&'static str, u64, InternalKeyKind);
+
+/// `(user key, sequence number)` of every version a compaction kept.
+type Kept = Vec<(String, u64)>;
+
+/// Compacts `versions` through the production constructor and returns what is kept, as
+/// `(user key, sequence number)`, together with the range deletions the iterator ends up with.
+/// A range delete entry holds its end key `z` as its value, and is supplied as a range deletion
+/// too if `supply` says so, as a table that holds it would.
+fn compact_at(
+	versions: &[Version],
+	is_bottom_level: bool,
+	snapshots: Vec<u64>,
+	horizon: u64,
+	supply: bool,
+) -> (Kept, Vec<(Key, Key, u64)>) {
+	let mut items: Vec<(InternalKey, Value)> = versions
+		.iter()
+		.map(|(key, seq, kind)| {
+			let value = if *kind == InternalKeyKind::RangeDelete {
+				b"z".to_vec()
+			} else {
+				b"v".to_vec()
+			};
+			(create_internal_key(key, *seq, *kind), value)
+		})
+		.collect();
+	items.sort_by(|a, b| a.0.user_key.cmp(&b.0.user_key).then(b.0.seq_num().cmp(&a.0.seq_num())));
+	let ranges: Vec<(Key, Key, u64)> = if supply {
+		items
+			.iter()
+			.filter(|(key, _)| key.kind() == InternalKeyKind::RangeDelete)
+			.map(|(key, value)| (key.user_key.clone(), value.clone(), key.seq_num()))
+			.collect()
+	} else {
+		Vec::new()
+	};
+	let mut comp_iter = CompactionIterator::new(
+		vec![build_table_iterator(items)],
+		create_comparator(),
+		is_bottom_level,
+		snapshots,
+		horizon,
+	)
+	.with_range_deletions(ranges);
+	let kept = comp_iter
+		.by_ref()
+		.map(|item| {
+			let (key, _) = item.unwrap();
+			(String::from_utf8_lossy(&key.user_key).to_string(), key.seq_num())
+		})
+		.collect();
+	(kept, comp_iter.active_range_deletions().to_vec())
+}
+
+fn kept(entries: &[(&str, u64)]) -> Kept {
+	entries.iter().map(|(key, seq)| (key.to_string(), *seq)).collect()
+}
+
+const SET: InternalKeyKind = InternalKeyKind::Set;
+const DELETE: InternalKeyKind = InternalKeyKind::Delete;
+const RANGE_DELETE: InternalKeyKind = InternalKeyKind::RangeDelete;
+
+/// Every version above the horizon is kept, and so is the newest one at or below it: readers
+/// that are not snapshots read it. Only the versions under that one go.
+#[test]
+fn test_horizon_keeps_every_version_above_it_and_the_newest_below() {
+	let versions = [("k", 12, SET), ("k", 11, SET), ("k", 8, SET), ("k", 5, SET)];
+	let (out, _) = compact_at(&versions, false, vec![], 10, false);
+	assert_eq!(out, kept(&[("k", 12), ("k", 11), ("k", 8)]));
+
+	// Nothing is published: everything stays.
+	let (out, _) = compact_at(&versions, false, vec![], 0, false);
+	assert_eq!(out, kept(&[("k", 12), ("k", 11), ("k", 8), ("k", 5)]));
+
+	// Everything is published: the newest version is the only one that readers can need.
+	let (out, _) = compact_at(&versions, false, vec![], 12, false);
+	assert_eq!(out, kept(&[("k", 12)]));
+	let (out, _) = compact_at(&versions, false, vec![], u64::MAX, false);
+	assert_eq!(out, kept(&[("k", 12)]));
+}
+
+/// A snapshot above the horizon does not let the iterator drop a version above the horizon.
+#[test]
+fn test_horizon_below_a_snapshot_keeps_the_versions_above_it() {
+	let versions = [("k", 12, SET), ("k", 11, SET), ("k", 8, SET)];
+	let (out, _) = compact_at(&versions, false, vec![11], 10, false);
+	assert_eq!(out, kept(&[("k", 12), ("k", 11), ("k", 8)]));
+}
+
+/// A version that a snapshot reads stays, below the horizon as well.
+#[test]
+fn test_horizon_keeps_what_a_snapshot_reads() {
+	let versions = [("k", 12, SET), ("k", 9, SET), ("k", 7, SET), ("k", 3, SET)];
+	let (out, _) = compact_at(&versions, false, vec![4, 8], 12, false);
+	assert_eq!(out, kept(&[("k", 12), ("k", 7), ("k", 3)]));
+}
+
+/// A delete above the horizon hides nothing yet, so the value under it stays at the bottom
+/// level, where a delete drops everything under it once the delete is published.
+#[test]
+fn test_bottom_level_delete_above_the_horizon_keeps_the_value() {
+	let versions = [("k", 12, DELETE), ("k", 5, SET)];
+	let (out, _) = compact_at(&versions, true, vec![], 10, false);
+	assert_eq!(out, kept(&[("k", 12), ("k", 5)]));
+
+	let versions = [("k", 8, DELETE), ("k", 5, SET)];
+	let (out, _) = compact_at(&versions, true, vec![], 10, false);
+	assert_eq!(out, kept(&[]));
+}
+
+/// A delete between a value above the horizon and the value below it hides the one below from
+/// readers at the horizon, and at the bottom level it is dropped, as there is nothing under it.
+#[test]
+fn test_bottom_level_delete_under_a_value_above_the_horizon() {
+	let versions = [("k", 12, SET), ("k", 8, DELETE), ("k", 5, SET)];
+	let (out, _) = compact_at(&versions, true, vec![], 10, false);
+	assert_eq!(out, kept(&[("k", 12)]));
+
+	// Above the bottom level, it masks the value in the levels below.
+	let (out, _) = compact_at(&versions, false, vec![], 10, false);
+	assert_eq!(out, kept(&[("k", 12), ("k", 8)]));
+
+	// With the delete above the horizon too, readers at the horizon read the value under it.
+	let versions = [("k", 12, SET), ("k", 11, DELETE), ("k", 5, SET)];
+	let (out, _) = compact_at(&versions, true, vec![], 10, false);
+	assert_eq!(out, kept(&[("k", 12), ("k", 11), ("k", 5)]));
+
+	// Published, a snapshot at the delete reads it, which leaves nothing under it to hide.
+	let (out, _) = compact_at(&versions, true, vec![11], 12, false);
+	assert_eq!(out, kept(&[("k", 12)]));
+	let (out, _) = compact_at(&versions, false, vec![11], 12, false);
+	assert_eq!(out, kept(&[("k", 12), ("k", 11)]));
+}
+
+/// A snapshot that reads the value under a delete keeps the value, and the delete stays above
+/// it for the readers after it.
+#[test]
+fn test_bottom_level_delete_stays_above_a_value_a_snapshot_reads() {
+	let versions = [("k", 100, DELETE), ("k", 50, SET)];
+	let (out, _) = compact_at(&versions, true, vec![60], 100, false);
+	assert_eq!(out, kept(&[("k", 100), ("k", 50)]));
+
+	// Without the snapshot, both go.
+	let (out, _) = compact_at(&versions, true, vec![], 100, false);
+	assert_eq!(out, kept(&[]));
+}
+
+/// A range delete covers a version only when readers at its sequence number see it: it has to
+/// be at or below the horizon, and no snapshot may sit between the version and the range delete.
+#[test]
+fn test_range_delete_covers_only_what_readers_cannot_read() {
+	let versions = [("k", 5, SET)];
+	let ranges = |horizon, snapshots| {
+		let mut items = vec![("a", 9, RANGE_DELETE)];
+		items.extend_from_slice(&versions);
+		compact_at(&items, false, snapshots, horizon, true).0
+	};
+
+	// Above the horizon, the range delete hides nothing yet.
+	assert_eq!(ranges(8, vec![]), kept(&[("a", 9), ("k", 5)]));
+	// Published, it covers the version.
+	assert_eq!(ranges(12, vec![]), kept(&[("a", 9)]));
+	// A snapshot between the version and the range delete reads the version.
+	assert_eq!(ranges(12, vec![6]), kept(&[("a", 9), ("k", 5)]));
+	// A snapshot at the range delete, or below the version, does not.
+	assert_eq!(ranges(12, vec![9]), kept(&[("a", 9)]));
+	assert_eq!(ranges(12, vec![4]), kept(&[("a", 9)]));
+}
+
+/// A range delete entry is a delete: at the bottom level the entry may go, and the range
+/// deletion stays in the output whatever the horizon, whether or not a table supplied it.
+#[test]
+fn test_range_delete_entries_and_range_deletions() {
+	let versions = [("b", 9, RANGE_DELETE), ("b", 5, SET), ("c", 4, SET)];
+	for supply in [true, false] {
+		for horizon in [3, 12] {
+			for bottom in [false, true] {
+				let (out, ranges) = compact_at(&versions, bottom, vec![], horizon, supply);
+				let what = format!("supply {supply}, horizon {horizon}, bottom {bottom}");
+				assert!(
+					ranges.contains(&(b"b".to_vec(), b"z".to_vec(), 9)),
+					"{what}: the range deletion is never dropped: {ranges:?}"
+				);
+				let expected = match (horizon, bottom) {
+					// Not published: nothing is covered, and the entry hides the value below
+					// it only from readers at 9 and above.
+					(3, _) => kept(&[("b", 9), ("b", 5), ("c", 4)]),
+					// Published: "b" 5 and "c" are covered, and the entry is the oldest kept.
+					(_, false) => kept(&[("b", 9)]),
+					(_, true) => kept(&[]),
+				};
+				assert_eq!(out, expected, "{what}");
+			}
+		}
+	}
+}
+
+/// A replace is an ordinary version for compaction: it keeps the one under it when it is above
+/// the horizon or a snapshot reads that one, and drops it otherwise.
+#[test]
+fn test_replace_follows_the_horizon_and_snapshots() {
+	let versions = [("k", 12, InternalKeyKind::Replace), ("k", 5, SET)];
+	let (out, _) = compact_at(&versions, false, vec![], 10, false);
+	assert_eq!(out, kept(&[("k", 12), ("k", 5)]));
+
+	let versions = [("k", 10, InternalKeyKind::Replace), ("k", 5, SET)];
+	let (out, _) = compact_at(&versions, false, vec![], 10, false);
+	assert_eq!(out, kept(&[("k", 10)]));
+	let (out, _) = compact_at(&versions, false, vec![7], 10, false);
+	assert_eq!(out, kept(&[("k", 10), ("k", 5)]));
+}
+
+/// A horizon above every version, as the helper of the tests above passes, drops what the
+/// iterator dropped before the horizon existed.
+#[test]
+fn test_published_input_keeps_the_newest_version() {
+	let versions = [("a", 12, SET), ("a", 11, DELETE), ("a", 5, SET), ("b", 7, SET), ("b", 3, SET)];
+	for bottom in [false, true] {
+		let (published, _) = compact_at(&versions, bottom, vec![], u64::MAX, false);
+		let (far_above, _) = compact_at(&versions, bottom, vec![], 1000, false);
+		assert_eq!(published, kept(&[("a", 12), ("b", 7)]), "bottom {bottom}");
+		assert_eq!(far_above, published, "bottom {bottom}");
+	}
 }
