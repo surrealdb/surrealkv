@@ -15,7 +15,7 @@ use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::leveled::Strategy;
 use crate::error::BackgroundErrorHandler;
 use crate::levels::{write_manifest_to_disk, LevelManifest, Levels, MANIFEST_FORMAT_VERSION_V1};
-use crate::memtable::ImmutableMemtables;
+use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
@@ -161,6 +161,7 @@ fn build_l0_store(
 	let compaction_options = CompactionOptions {
 		lopts: Arc::clone(&opts),
 		level_manifest: Arc::clone(&manifest),
+		active_memtable: Arc::new(RwLock::new(Arc::new(MemTable::default()))),
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 		vlog: None,
 		error_handler: Arc::new(BackgroundErrorHandler::new()),

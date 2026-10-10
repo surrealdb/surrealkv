@@ -292,6 +292,10 @@ impl CoreInner {
 	/// 3. Atomically applying the changeset to the manifest
 	/// 4. Removing the memtable from immutable_memtables tracking
 	///
+	/// It deletes no value-log files: recovery flushes the memtables it rebuilds one by one while
+	/// the ones after them are held outside the queue, and the files those point into must stay.
+	/// The flush of the queue does it, see `flush_oldest_immutable_to_sst`.
+	///
 	/// # Arguments
 	/// * `memtable` - The memtable to flush
 	/// * `table_id` - Table ID for the new SST
@@ -399,10 +403,6 @@ impl CoreInner {
 			log_number,
 			manifest.get_last_sequence()
 		);
-
-		// After successful manifest commit, cleanup obsolete vlog files
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-		cleanup_vlog(&self.vlog, min_oldest_vlog, "flush");
 
 		Ok(table)
 	}
@@ -653,6 +653,7 @@ impl CoreInner {
 	/// 3. Flushes it to SST via flush_immutable_to_sst (which also removes from queue)
 	/// 4. Removes the WAL segments the flush made obsolete, on the caller's thread, so it needs no
 	///    runtime
+	/// 5. Deletes the VLog files that nothing points into any more
 	///
 	/// A failed flush leaves the memtable in the queue and releases the lock, so it can be retried.
 	///
@@ -723,6 +724,8 @@ impl CoreInner {
 				tracing::warn!("Failed to clean up old WAL segments: {}", e);
 			}
 		}
+
+		self.cleanup_vlog("flush");
 
 		tracing::debug!(
 			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
@@ -1061,40 +1064,20 @@ impl CoreInner {
 		Ok(())
 	}
 
-	/// Cleans up orphaned VLog files that are not referenced by any SST.
+	/// Deletes the VLog files that no table and no memtable points into, see [`cleanup_vlog`].
 	///
-	/// After a crash, there may be VLog files that:
-	/// 1. Were written but never referenced by an SST (write crashed before flush)
-	/// 2. Are no longer referenced because all referencing SSTs were compacted away
-	///
-	/// This method computes the minimum oldest_vlog_file_id across all live SSTs
-	/// and removes any VLog files below that threshold.
-	///
-	/// SAFETY: This must be called after manifest is loaded and SSTs are known.
-	fn cleanup_orphaned_vlog_files(&self) -> Result<()> {
-		if self.vlog.is_none() {
-			return Ok(()); // No VLog, nothing to clean up
-		}
-
-		let manifest = self.level_manifest.read()?;
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-
-		// If no SSTs reference VLog files yet, keep all files
-		// (This handles the fresh database case)
-		if min_oldest_vlog == 0 {
-			tracing::debug!("No SSTs with VLog references found, skipping VLog orphan cleanup");
-			return Ok(());
-		}
-
-		tracing::debug!(
-			"Cleaning up orphaned VLog files below min_oldest_vlog={}",
-			min_oldest_vlog
+	/// After a crash there may be files that no record points to (written, but their batch never
+	/// logged), or that every table pointing into them was compacted away. At startup this runs
+	/// after the manifest is loaded and the WAL is replayed, so the memtable rebuilt from the WAL
+	/// accounts for the files its records point into.
+	fn cleanup_vlog(&self, context: &str) {
+		cleanup_vlog(
+			&self.vlog,
+			&self.active_memtable,
+			&self.level_manifest,
+			&self.immutable_memtables,
+			context,
 		);
-
-		// Use the consolidated cleanup helper
-		cleanup_vlog(&self.vlog, min_oldest_vlog, "startup");
-
-		Ok(())
 	}
 
 	/// Resolves a value, checking if it's a VLog pointer and retrieving from
@@ -1482,8 +1465,8 @@ impl Core {
 		inner.cleanup_orphaned_sst_files()?;
 
 		// Clean up any orphaned VLog files that are no longer referenced by any SST
-		// SAFETY: This must happen AFTER manifest is loaded so we know which SSTs exist
-		inner.cleanup_orphaned_vlog_files()?;
+		// SAFETY: This must happen AFTER manifest is loaded and the WAL is replayed
+		inner.cleanup_vlog("startup");
 
 		// Trigger level compaction check at startup
 		task_manager.wake_up_level();
@@ -2525,24 +2508,71 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 
 // ===== VLog and Versioned Index Cleanup Helpers =====
 
+/// The bound of a VLog cleanup: the smallest file id that a table or a memtable that is not
+/// flushed yet points into. A file below it holds nothing that can be read any more. It is 0,
+/// and nothing is deleted, while no table points into the VLog.
+///
+/// The active slot is read-locked first and stays locked until the end, then the manifest and the
+/// queue, together, in the order a flush takes them in. The slot is read last: a batch applied
+/// before a table was registered is counted, and a rotation, which needs the slot exclusively,
+/// cannot move the memtable between the queue and the slot while the bound is read. A flush
+/// registers its table and takes the memtable out of the queue under both locks, so the memtable
+/// of a flush that is under way stays counted until its table is in the manifest.
+///
+/// The files of a batch that is encoded but not in a memtable or a table yet are newer than every
+/// file the bound reads: the flusher encodes one group at a time and the VLog appends to its
+/// newest file. A group that fails after it was logged lowers the active memtable's bound, since
+/// recovery replays its records.
+pub(crate) fn vlog_floor(
+	active: &RwLock<Arc<MemTable>>,
+	manifest: &RwLock<LevelManifest>,
+	immutables: &RwLock<ImmutableMemtables>,
+) -> Result<u32> {
+	let active = active.read()?;
+	let manifest = manifest.read()?;
+	let immutables = immutables.read()?;
+	let queued = immutables.iter().filter_map(|entry| entry.memtable.min_vlog_file_id());
+	Ok(active
+		.min_vlog_file_id()
+		.into_iter()
+		.chain(queued)
+		.fold(manifest.min_oldest_vlog_file_id(), u32::min))
+}
+
 /// Cleans up obsolete VLog files.
 ///
-/// This function should be called after compaction, flush, or during startup recovery.
+/// This function should be called after compaction, flush, or during startup recovery, with no
+/// lock held.
 ///
 /// # Arguments
 /// * `vlog` - The VLog instance (if value separation is enabled)
-/// * `min_oldest_vlog` - Minimum oldest_vlog_file_id across all live SSTs
+/// * `active`, `manifest`, `immutables` - What points into the VLog, see [`vlog_floor`]
 /// * `context` - Description of the calling context (e.g., "flush", "compaction", "startup")
-pub(crate) fn cleanup_vlog(vlog: &Option<Arc<VLog>>, min_oldest_vlog: u32, context: &str) {
-	// Skip cleanup if no SSTs reference VLog files yet (fresh database case)
-	if min_oldest_vlog == 0 {
+pub(crate) fn cleanup_vlog(
+	vlog: &Option<Arc<VLog>>,
+	active: &RwLock<Arc<MemTable>>,
+	manifest: &RwLock<LevelManifest>,
+	immutables: &RwLock<ImmutableMemtables>,
+	context: &str,
+) {
+	let Some(vlog) = vlog else {
+		return;
+	};
+	let floor = match vlog_floor(active, manifest, immutables) {
+		Ok(floor) => floor,
+		Err(e) => {
+			tracing::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);
+			return;
+		}
+	};
+
+	// Skip cleanup if no table references VLog files yet (fresh database case)
+	if floor == 0 {
 		return;
 	}
 
 	// Delete obsolete VLog files
-	if let Some(ref vlog) = vlog {
-		if let Err(e) = vlog.cleanup_obsolete_files(min_oldest_vlog) {
-			tracing::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);
-		}
+	if let Err(e) = vlog.cleanup_obsolete_files(floor) {
+		tracing::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);
 	}
 }

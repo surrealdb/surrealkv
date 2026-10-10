@@ -1108,16 +1108,17 @@ impl VLog {
 		VLogPin(self)
 	}
 
-	/// Cleans up obsolete vlog files based on the global minimum oldest_vlog_file_id.
+	/// Cleans up obsolete vlog files based on the global minimum file id that anything points into.
 	///
 	/// A vlog file is safe to delete when:
-	/// - Its file_id < min_oldest_vlog (no SST references values in it)
+	/// - Its file_id < min_oldest_vlog (no SST and no unflushed memtable has a value in it, see
+	///   `lsm::vlog_floor`)
 	/// - It is not the active writer
 	/// - No iterators are active
 	/// - No [`VLogPin`] is held
 	///
 	/// This implements the "global minimum" GC approach where files are deleted
-	/// once no SST can possibly reference them. If iterators are active or a pin is
+	/// once nothing can possibly reference them. If iterators are active or a pin is
 	/// held, cleanup is skipped and will be retried on the next GC trigger.
 	pub(crate) fn cleanup_obsolete_files(&self, min_oldest_vlog: u32) -> Result<()> {
 		if self.pins.load(Ordering::SeqCst) > 0 {

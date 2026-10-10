@@ -7,7 +7,7 @@ use crate::error::{BackgroundErrorHandler, Result};
 use crate::iter::{BoxedLSMIterator, CompactionIterator};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lsm::{cleanup_vlog, CoreInner};
-use crate::memtable::ImmutableMemtables;
+use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
@@ -49,6 +49,7 @@ impl Drop for HiddenTablesGuard {
 pub(crate) struct CompactionOptions {
 	pub(crate) lopts: Arc<LSMOptions>,
 	pub(crate) level_manifest: Arc<RwLock<LevelManifest>>,
+	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable>>>,
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 	pub(crate) vlog: Option<Arc<VLog>>,
 	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
@@ -65,6 +66,7 @@ impl CompactionOptions {
 		Self {
 			lopts: Arc::clone(&tree.opts),
 			level_manifest: Arc::clone(&tree.level_manifest),
+			active_memtable: Arc::clone(&tree.active_memtable),
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			vlog: tree.vlog.clone(),
 			error_handler: Arc::clone(&tree.error_handler),
@@ -152,6 +154,16 @@ impl Compactor {
 		self.update_manifest(input, new_tables, &mut guard)?;
 
 		self.cleanup_old_tables(input);
+
+		// After successful manifest commit, cleanup obsolete vlog files, with the manifest and the
+		// queue released: what is unflushed also points into the value log.
+		cleanup_vlog(
+			&self.options.vlog,
+			&self.options.active_memtable,
+			&self.options.level_manifest,
+			&self.options.immutable_memtables,
+			"compaction",
+		);
 
 		Ok(())
 	}
@@ -334,10 +346,6 @@ impl Compactor {
 
 		// Commit guard - tables are now properly handled in manifest
 		guard.commit();
-
-		// After successful manifest commit, cleanup obsolete vlog files
-		let min_oldest_vlog = manifest.min_oldest_vlog_file_id();
-		cleanup_vlog(&self.options.vlog, min_oldest_vlog, "compaction");
 
 		Ok(())
 	}

@@ -927,6 +927,13 @@ impl CommitPipeline {
 		} else {
 			if let Err(e) = &result {
 				tracing::error!("Error during group commit flush: {:?}", e);
+				// The group may be in the WAL, and recovery replays it: the files its values
+				// were written to stay until that segment goes. The batches that were applied
+				// are spent, and their memtable holds what they pointed into.
+				let active = self.inner.active_memtable.read().unwrap_or_else(|e| e.into_inner());
+				for batch in &batches {
+					active.note_vlog_pointers(batch);
+				}
 			}
 			for (entry, _) in &scratch.entries {
 				entry.abort();
@@ -1477,8 +1484,15 @@ impl CommitPipeline {
 	/// in a table by then, and the segment that holds the records of the batches that are not
 	/// applied yet stays pinned (`CoreInner::group_wal_pin`), so recovery still finds the group
 	/// whole.
+	///
+	/// The values of `batch` are in the value log already, and no table or memtable points into
+	/// them until its table is registered. The flushes make cleanups of the value log, and the
+	/// tables they register can point into newer files only (a memtable that holds inline
+	/// values separates them in its flush), so the active memtable keeps the files of `batch`
+	/// for as long as its record can be replayed, as it does for a group that failed.
 	fn write_direct_to_l0(&self, batch: &Batch, rest_wal_number: u64) -> Result<()> {
 		let sealed_wal_number = self.inner.seal_active_wal_segment()?;
+		self.inner.active_memtable.read()?.note_vlog_pointers(batch);
 		if let Some(ref tm) = self.task_manager {
 			tm.wake_up_memtable();
 		}
