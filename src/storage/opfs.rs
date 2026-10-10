@@ -222,12 +222,35 @@ pub async fn get_opfs_root() -> Result<FileSystemDirectoryHandle> {
 	Ok(dir_val.unchecked_into())
 }
 
+/// Whether this context can create sync access handles. `createSyncAccessHandle` exists only in
+/// a dedicated worker. Calling it anywhere else throws a `TypeError` that the generated binding
+/// does not catch, and that aborts the WebAssembly instance.
+fn sync_access_handles_available() -> bool {
+	let global = js_sys::global();
+	let Ok(constructor) = js_sys::Reflect::get(&global, &"FileSystemFileHandle".into()) else {
+		return false;
+	};
+	let Ok(prototype) = js_sys::Reflect::get(&constructor, &"prototype".into()) else {
+		return false;
+	};
+	js_sys::Reflect::has(&prototype, &"createSyncAccessHandle".into()).unwrap_or(false)
+}
+
 /// Opens or creates an OPFS synchronous access file handle.
+///
+/// Fails, without creating the file, when this context cannot open sync access handles, for
+/// example on the main thread of a page.
 pub async fn open_opfs_sync_file(
 	dir: &FileSystemDirectoryHandle,
 	file_name: &str,
 	create: bool,
 ) -> Result<OpfsSyncFile> {
+	if !sync_access_handles_available() {
+		return Err(Error::Other(format!(
+			"Failed to open {file_name}: sync access handles exist only in a dedicated worker"
+		)));
+	}
+
 	let options = FileSystemGetFileOptions::new();
 	options.set_create(create);
 
