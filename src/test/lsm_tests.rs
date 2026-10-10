@@ -314,7 +314,8 @@ async fn test_checkpoint_functionality() {
 	tree.flush().unwrap();
 
 	// Create checkpoint
-	let checkpoint_dir = temp_dir.path().join("checkpoint");
+	let checkpoint_root = create_temp_directory();
+	let checkpoint_dir = checkpoint_root.path().join("checkpoint");
 	let metadata = tree.create_checkpoint(&checkpoint_dir).unwrap();
 
 	// Verify checkpoint metadata and structure
@@ -398,7 +399,8 @@ async fn test_checkpoint_restore_discards_pending_writes() {
 	tree.flush().unwrap();
 
 	// Create checkpoint
-	let checkpoint_dir = temp_dir.path().join("checkpoint");
+	let checkpoint_root = create_temp_directory();
+	let checkpoint_dir = checkpoint_root.path().join("checkpoint");
 	let metadata = tree.create_checkpoint(&checkpoint_dir).unwrap();
 	assert_eq!(metadata.sequence_number, 5);
 
@@ -2051,7 +2053,8 @@ async fn test_checkpoint_with_vlog() {
 	tree.flush().unwrap();
 
 	// Create checkpoint
-	let checkpoint_dir = temp_dir.path().join("checkpoint");
+	let checkpoint_root = create_temp_directory();
+	let checkpoint_dir = checkpoint_root.path().join("checkpoint");
 	let metadata = tree.create_checkpoint(&checkpoint_dir).unwrap();
 
 	// Verify checkpoint metadata

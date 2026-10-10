@@ -1700,7 +1700,8 @@ async fn active_memtable_tag_equals_the_wal_number_after_every_transition() {
 		txn.commit().await.unwrap();
 		tag_matches(&tree, "a direct-to-L0 write");
 
-		let checkpoint = dir.path().join("checkpoint");
+		let checkpoints = TempDir::new("wal_rotation_checkpoint").unwrap();
+		let checkpoint = checkpoints.path().join("checkpoint");
 		tree.create_checkpoint(&checkpoint).unwrap();
 		tag_matches(&tree, "a checkpoint");
 		write_keys(&tree, 60..70, Durability::Immediate).await;
