@@ -94,6 +94,10 @@ pub trait CompactionOperations: Send + Sync {
 /// them: a flush, the shutdown flush and a restore hold it while they take the others, and
 /// nothing waits for it while holding one of them.
 ///
+/// `compactions` comes before them too: a compaction holds it shared from the moment it picks its
+/// tables to the removal of what it made obsolete, and takes the locks above under it, and a
+/// restore holds it exclusively. Nothing waits for it while holding any of them.
+///
 /// The WAL's own lock (`wal`) sits below every lock above. Under it are taken only the segment's
 /// fsync gate, which is a leaf, and, by a rotation (`rotate_wal()`), the value log's writer lock
 /// and its list of unsynced files, which nothing holds while it waits for the WAL lock: the commit
@@ -134,6 +138,15 @@ pub(crate) struct CoreInner {
 	/// checkpoint and the shutdown flush never flush one memtable twice and always take the
 	/// oldest one first, and a restore never replaces the manifest under a flush.
 	pub(crate) flush_lock: parking_lot::Mutex<()>,
+
+	/// Held shared by every compaction for its whole run, and exclusively by a restore. A
+	/// compaction names its inputs and takes the ids of its outputs from the manifest it picked
+	/// from, writes the outputs, and then applies a changeset to the manifest and deletes the
+	/// input files by id. A restore replaces the manifest, the table files and the ids: a
+	/// compaction that went on would delete the restored tables that have the ids of its inputs,
+	/// write over the ones that have the ids of its outputs, and list what it made in a manifest
+	/// it was not computed from.
+	pub(crate) compactions: parking_lot::RwLock<()>,
 
 	/// The level structure managing all SSTables on disk.
 	///
@@ -277,6 +290,7 @@ impl CoreInner {
 			active_memtable,
 			immutable_memtables,
 			flush_lock: parking_lot::Mutex::new(()),
+			compactions: parking_lot::RwLock::new(()),
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
 			active_txn_tracker: Arc::new(crate::tracker::ActiveTxnTracker::new()),
@@ -1329,6 +1343,9 @@ impl CompactionOperations for CoreInner {
 			return Err(error);
 		}
 
+		// Kept for the whole run, so that a restore waits for it, see `compactions`.
+		let _running = self.compactions.read();
+
 		// Create compaction options from the current LSM tree state
 		let options = CompactionOptions::from(self);
 
@@ -2318,6 +2335,10 @@ impl Tree {
 
 		// A flush in flight would add its table to the manifest this replaces.
 		let _flush = self.core.inner.flush_lock.lock();
+
+		// A compaction in flight would delete, write over and list tables of the manifest this
+		// replaces: wait for it, and keep the next one from starting until the restore is done.
+		let _compactions = self.core.inner.compactions.write();
 
 		// Step 1: Restore files from checkpoint
 		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));

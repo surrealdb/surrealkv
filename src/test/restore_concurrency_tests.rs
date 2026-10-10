@@ -1422,13 +1422,11 @@ async fn a_compaction_that_resumes_after_a_restore_from_its_outputs_stage_leaves
 }
 
 #[test(tokio::test)]
-#[ignore = "a compaction running during a restore applies its changeset to the restored manifest: a table id reused by a flush is listed twice and the checkpoint's tables are dropped"]
 async fn a_compaction_whose_output_id_a_flush_reuses_after_a_restore_leaves_the_checkpoint() {
 	restore_during_a_compaction(CompactionStage::OutputsDurable, 2).await;
 }
 
 #[test(tokio::test)]
-#[ignore = "a compaction running during a restore deletes the restored tables that have the ids of its inputs, so the manifest lists missing files"]
 async fn a_compaction_that_resumes_after_a_restore_from_its_manifest_stage_leaves_the_checkpoint() {
 	restore_during_a_compaction(CompactionStage::ManifestWritten, 0).await;
 }
@@ -1463,6 +1461,70 @@ async fn a_compaction_that_resumes_after_a_restore_with_a_value_log_keeps_the_va
 	let tree = w.reopen().await;
 	assert_exact(&tree, &w.at_ckpt, "after the reopen");
 	tree.close().await.unwrap();
+}
+
+/// A restore does not begin to replace the database while a compaction is running, whichever
+/// stage the compaction is parked at: it waits for it, and the compaction finishes against the
+/// state it began with. A compaction that applies its changeset to the restored manifest, or
+/// removes restored tables by the ids of its inputs, needs to run across the restore, which the
+/// restore excludes.
+#[test(tokio::test)]
+async fn a_restore_waits_for_a_compaction_that_is_running_at_every_stage() {
+	for stage in [
+		CompactionStage::OutputsDurable,
+		CompactionStage::ManifestWritten,
+		CompactionStage::InputsRemoved,
+		CompactionStage::VlogCleaned,
+	] {
+		let mut w = build(false).await;
+		let gate = park_compaction_at(&w.tree, stage);
+		let compaction = compact_call(&w.tree, &w.opts);
+		gate.arrived(&format!("{stage:?}"));
+		let restoring = restore_call(&w.tree, &w.ckpt);
+		assert!(
+			!restoring.finishes_within(GRACE),
+			"{stage:?}: the restore ran while a compaction was parked in the middle of its work"
+		);
+		gate.release();
+		compaction.wait().unwrap();
+		restoring.wait().unwrap();
+		assert_eq!(gate.hits(), 1, "{stage:?}: the compaction reached the stage once");
+		clear_hooks(&w.tree);
+		assert_eq!(table_ids(&w.tree), w.tables_at_ckpt, "{stage:?}: the checkpoint's tables");
+		assert_eq!(sst_files(&w.opts), w.tables_at_ckpt, "{stage:?}: only those are files");
+		assert_exact(&w.tree, &w.at_ckpt, &format!("{stage:?}: after both"));
+		let tree = w.reopen().await;
+		assert_exact(&tree, &w.at_ckpt, &format!("{stage:?}: after the reopen"));
+		tree.close().await.unwrap();
+	}
+}
+
+/// A compaction that begins while a restore is parked in the middle of it waits for the restore,
+/// and then compacts the restored tables.
+#[test(tokio::test)]
+async fn a_compaction_that_begins_during_a_restore_waits_and_compacts_the_restored_tables() {
+	for stage in [CheckpointStage::RestoreCleared, CheckpointStage::RestoreManifestSwapped] {
+		let mut w = build(false).await;
+		let gate = park_checkpoint_at(&w.tree, stage);
+		let restoring = restore_call(&w.tree, &w.ckpt);
+		gate.arrived(&format!("{stage:?}"));
+		let compaction = compact_call(&w.tree, &w.opts);
+		assert!(
+			!compaction.finishes_within(GRACE),
+			"{stage:?}: a compaction ran while the restore replaced the database"
+		);
+		gate.release();
+		restoring.wait().unwrap();
+		compaction.wait().unwrap();
+		assert_eq!(gate.hits(), 1, "{stage:?}: the stage was reached once");
+		clear_hooks(&w.tree);
+		assert_tables_on_disk(&w.tree, &w.opts, &format!("{stage:?}: after both"));
+		assert_exact(&w.tree, &w.at_ckpt, &format!("{stage:?}: after both"));
+		let tree = w.reopen().await;
+		assert_tables_on_disk(&tree, &w.opts, &format!("{stage:?}: after the reopen"));
+		assert_exact(&tree, &w.at_ckpt, &format!("{stage:?}: after the reopen"));
+		tree.close().await.unwrap();
+	}
 }
 
 // ---------------------------------------------------------------------------
