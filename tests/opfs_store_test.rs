@@ -22,7 +22,7 @@ mod opfs_common;
 use std::sync::Arc;
 
 use opfs_common::*;
-use surrealkv::storage::opfs::{OpfsLogStore, OpfsObjectStore};
+use surrealkv::storage::opfs::{open_opfs_sync_file, OpfsLogStore, OpfsObjectStore};
 use surrealkv::storage::{LogStore, MemLogStore, MemObjectStore, ObjectStore};
 use wasm_bindgen_test::*;
 
@@ -421,6 +421,60 @@ async fn a_failed_append_does_not_advance_the_size_of_the_log() {
 
 	let again = reopen(&root, &name).await;
 	assert_eq!(read_all(&again), b"12345");
+	again.close();
+	remove_and_verify(&root, &name).await;
+}
+
+#[wasm_bindgen_test]
+async fn failed_appends_leave_the_end_of_the_log_where_it_was() {
+	let root = root().await;
+	let name = unique_name("log-failed-appends", "log");
+	let file = Arc::new(create(&root, &name).await);
+	let log = OpfsLogStore::new(Arc::clone(&file));
+
+	assert_eq!(log.append(b"12345").await.unwrap(), 5);
+	let before_the_close = log.append(b"abc");
+	let empty = log.append(b"");
+	file.close();
+
+	// Placing a record happens when its future is polled, so the one created before the close
+	// fails like the ones created after it, and none of them moves the end of the log. (Whether an
+	// empty append on a closed file fails is left open, a backend may return early for it.)
+	assert!(before_the_close.await.is_err(), "an append created before the close");
+	let _ = empty.await;
+	assert_eq!(log.size().await.unwrap(), 5, "size() after the append that was created first");
+	for round in 0..3 {
+		assert!(log.append(b"defg").await.is_err(), "append {round} on a closed file");
+		assert_eq!(log.size().await.unwrap(), 5, "size() after {} failed appends", round + 1);
+	}
+
+	let again = reopen(&root, &name).await;
+	assert_eq!(read_all(&again), b"12345");
+	again.close();
+	remove_and_verify(&root, &name).await;
+}
+
+#[wasm_bindgen_test]
+async fn the_file_stays_open_until_the_last_store_over_it_is_dropped() {
+	let root = root().await;
+	let name = unique_name("stores-drop", "log");
+	let file = Arc::new(create(&root, &name).await);
+	let log = OpfsLogStore::new(Arc::clone(&file));
+	let object = OpfsObjectStore::new(Arc::clone(&file));
+	assert_eq!(log.append(b"abcdef").await.unwrap(), 6);
+
+	// Neither the owner of the file nor one of the two stores is the last reference to it, so the
+	// browser keeps the handle, and the other store still works.
+	drop(file);
+	drop(log);
+	let err = expect_err(open_opfs_sync_file(&root, &name, false).await, "a second handle");
+	assert!(err.contains("NoModificationAllowedError"), "{err}");
+	assert_eq!(object.read_at(1, 3).await.unwrap().as_ref(), b"bcd");
+
+	// The last store goes, and with it the handle: the file can be opened and removed again.
+	drop(object);
+	let again = reopen(&root, &name).await;
+	assert_eq!(read_all(&again), b"abcdef");
 	again.close();
 	remove_and_verify(&root, &name).await;
 }
