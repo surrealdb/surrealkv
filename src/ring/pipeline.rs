@@ -2385,8 +2385,10 @@ mod permit_merge_tests {
 
 		until("the flusher to hold its first group", || held.load(Ordering::SeqCst)).await;
 		until("admission to run out", || pipeline.admission.available_permits() == 0).await;
-		// Let the commits that took the last permits be accepted into the ring.
-		tokio::time::sleep(Duration::from_millis(50)).await;
+		until("the commits that took the permits to be accepted", || {
+			pipeline.accepted_waiting() == permits
+		})
+		.await;
 		release_tx.send(()).unwrap();
 
 		for handle in handles {

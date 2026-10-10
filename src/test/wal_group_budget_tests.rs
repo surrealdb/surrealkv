@@ -909,8 +909,10 @@ async fn admission_exhausted_by_accepted_and_aborted_entries_drains_through_spli
 		.await;
 	}
 	conflicting.push(conflict(stale.pop().unwrap()));
-	until("admission to run out", || pipeline.free_permits() == 0).await;
-	assert_eq!(pipeline.ring.published(), permits as u64);
+	// A commit takes its permit before it claims its entry, so the permits run out first
+	until("the last aborted entry to be published", || pipeline.ring.published() == permits as u64)
+		.await;
+	assert_eq!(pipeline.free_permits(), 0, "every permit is held");
 	assert_eq!(pipeline.accepted_waiting(), 1 + bigs);
 
 	// These wait for a permit.
