@@ -189,6 +189,12 @@ impl DatabaseCheckpoint {
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
+		// A database a commit group stopped holds batches that were never published, which a
+		// checkpoint would carry into the state it restores.
+		if let Some(error) = self.core.error_handler.commit_group_error() {
+			return Err(error);
+		}
+
 		let checkpoint_path = checkpoint_dir.as_ref();
 
 		// Create checkpoint directory

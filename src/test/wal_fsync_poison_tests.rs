@@ -34,7 +34,7 @@ use crate::wal::{
 	Options as WalOptions,
 	BLOCK_SIZE,
 };
-use crate::{Durability, InternalKeyKind, Mode, Options, Tree};
+use crate::{Durability, Error, InternalKeyKind, Mode, Options, Tree};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -177,6 +177,14 @@ fn all_failed(results: &[crate::Result<()>]) -> Vec<String> {
 			Err(e) => e.to_string(),
 		})
 		.collect()
+}
+
+/// Every commit of a group that was stopped by a failure after part of it was applied got the
+/// error that says so.
+fn all_stopped(results: &[crate::Result<()>]) {
+	for result in results {
+		assert!(matches!(result, Err(Error::DatabaseStopped(_))), "{result:?}");
+	}
 }
 
 /// Every record of a segment with the offset it ends at, decoded as a batch. A segment that is
@@ -1624,13 +1632,11 @@ fn readable(tree: &Tree, group: &[(String, Vec<u8>)]) -> Vec<String> {
 }
 
 /// A group that straddles a memtable fill is applied up to the fill, the memtable rotates, and the
-/// rest is logged again in the new segment and synced there. If that fsync fails, the whole group
-/// is reported failed, but the part that was applied already sits in the memtable, and the next
-/// commit that advances the visible sequence number makes it readable. The same goes for a failed
-/// append in the second log: it is not specific to fsync.
+/// rest is logged again in the new segment and synced there. If that fsync fails, the part that was
+/// applied already sits in the memtable and cannot be taken back, so the database stops: the group
+/// is reported failed in full and nothing is published past it, which would make that part
+/// readable. The same goes for a failed append in the second log: it is not specific to fsync.
 #[test(tokio::test)]
-#[ignore = "pre-existing: a group that fails after part of it was applied is reported failed in \
-            full, and the part that was applied becomes readable"]
 async fn nothing_of_a_group_that_failed_while_being_logged_again_becomes_readable() {
 	let dir = TempDir::new("wal_fsync").unwrap();
 	let tree = open_small_tree(dir.path()).await;
@@ -1651,14 +1657,18 @@ async fn nothing_of_a_group_that_failed_while_being_logged_again_becomes_readabl
 	})));
 
 	let group = pairs("group", 30, b'g');
-	all_failed(&commit_group(&tree, &group, Durability::Immediate).await);
+	all_stopped(&commit_group(&tree, &group, Durability::Immediate).await);
 	tree.core.commit_pipeline.set_hook(None);
 	assert!(sync_failed(&tree), "the fsync of the new segment failed");
 	assert_eq!(readable(&tree, &group), Vec::<String>::new(), "right after the failure");
 
-	// A commit in a new segment publishes a sequence number above the failed group's.
+	// A commit in a new segment would publish a sequence number above the failed group's, if the
+	// database took it.
 	tree.core.inner.seal_active_wal_segment().unwrap();
-	commit_one(&tree, "later", Durability::Immediate).await.unwrap();
+	assert!(matches!(
+		commit_one(&tree, "later", Durability::Immediate).await,
+		Err(Error::DatabaseStopped(_))
+	));
 	assert_eq!(readable(&tree, &group), Vec::<String>::new(), "after a later commit");
 	finish(&tree);
 }
@@ -1666,20 +1676,21 @@ async fn nothing_of_a_group_that_failed_while_being_logged_again_becomes_readabl
 /// The same with an Eventual group, which has no fsync of its own: the rotation in the middle of
 /// the group fsyncs the old segment, and that fsync fails.
 #[test(tokio::test)]
-#[ignore = "pre-existing: a group that fails after part of it was applied is reported failed in \
-            full, and the part that was applied becomes readable"]
 async fn nothing_of_a_group_whose_mid_group_rotation_failed_becomes_readable() {
 	let dir = TempDir::new("wal_fsync").unwrap();
 	let tree = open_small_tree(dir.path()).await;
 
 	arm(&tree, 0);
 	let group = pairs("group", 30, b'g');
-	all_failed(&commit_group(&tree, &group, Durability::Eventual).await);
+	all_stopped(&commit_group(&tree, &group, Durability::Eventual).await);
 	assert_eq!(readable(&tree, &group), Vec::<String>::new(), "right after the failure");
 
 	// The next rotation goes ahead without fsyncing the segment that failed.
 	tree.core.inner.rotate_memtable().unwrap();
-	commit_one(&tree, "later", Durability::Immediate).await.unwrap();
+	assert!(matches!(
+		commit_one(&tree, "later", Durability::Immediate).await,
+		Err(Error::DatabaseStopped(_))
+	));
 	assert_eq!(readable(&tree, &group), Vec::<String>::new(), "after a later commit");
 	finish(&tree);
 }
