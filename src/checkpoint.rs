@@ -309,10 +309,26 @@ impl DatabaseCheckpoint {
 		// Step 1: Flush all memtables to ensure consistency
 		self.flush_all_memtables()?;
 
+		// The SSTables copied below are the ones of the manifest in memory and the manifest file
+		// is copied from disk. After a write of the manifest by a flush or a direct table that
+		// failed from the rename on, the file may list a table the one in memory does not, so
+		// the one in memory is written again first. A compaction's manifest write is not
+		// covered.
+		self.core.settle_manifest()?;
+
 		// Steps 2-6 read one version of the manifest: holding its lock keeps a flush or a
 		// compaction from adding or removing tables, or rewriting the manifest file, while the
 		// SSTables and the manifest are copied.
 		let levels_guard = self.core.level_manifest.read()?;
+
+		// A write that failed from the rename on since the settle sets the flag while it holds the
+		// manifest lock, so with the lock held and the flag clear the file and the tables agree.
+		// The settle is not repeated: a checkpoint does not wait for writers that keep failing.
+		if self.core.manifest_uncertain() {
+			return Err(Error::ManifestWriteUncertain(
+				"the manifest was not written again before it was copied".into(),
+			));
+		}
 
 		// A flush or a compaction deletes the value-log files it made obsolete as soon as it can
 		// take the manifest, which is before the value log is copied below. The pin, taken while

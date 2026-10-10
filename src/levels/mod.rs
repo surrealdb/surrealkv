@@ -685,6 +685,9 @@ struct Failpoint {
 	skip: usize,
 	/// Replacements that fail after those, `usize::MAX` for every one.
 	times: usize,
+	/// Where each replacement fails, in order, after `skip`; the failpoint ends with the last one.
+	/// Empty for one that fails `times` replacements at `at`.
+	sequence: std::collections::VecDeque<ReplaceFailure>,
 }
 
 #[cfg(test)]
@@ -702,7 +705,32 @@ pub(crate) fn fail_replacements(path: &Path, at: ReplaceFailure, skip: usize, ti
 		at,
 		skip,
 		times,
+		sequence: std::collections::VecDeque::new(),
 	});
+}
+
+/// Test-only: the replacements of `path` fail one after the other at the steps in `steps`, and
+/// those after them succeed. Unlike `fail_replacements` it lets one replacement land (fail after
+/// the rename) and the next fail before it.
+#[cfg(test)]
+pub(crate) fn fail_replacements_sequence(path: &Path, steps: &[ReplaceFailure]) {
+	let mut failpoints = FAILPOINTS.lock();
+	failpoints.retain(|f| f.path != path);
+	if let Some(&at) = steps.first() {
+		failpoints.push(Failpoint {
+			path: path.to_path_buf(),
+			at,
+			skip: 0,
+			times: 0,
+			sequence: steps.iter().copied().collect(),
+		});
+	}
+}
+
+/// Test-only: whether `path` has a failpoint that has not failed all its replacements yet.
+#[cfg(test)]
+pub(crate) fn replacements_pending(path: &Path) -> bool {
+	FAILPOINTS.lock().iter().any(|f| f.path == path)
 }
 
 /// Test-only: removes the failpoint of `path`.
@@ -719,6 +747,12 @@ fn injected_failure(path: &Path) -> Option<ReplaceFailure> {
 	if failpoint.skip > 0 {
 		failpoint.skip -= 1;
 		return None;
+	}
+	if let Some(at) = failpoint.sequence.pop_front() {
+		if failpoint.sequence.is_empty() {
+			failpoints.retain(|f| f.path != path);
+		}
+		return Some(at);
 	}
 	let at = failpoint.at;
 	if failpoint.times != usize::MAX {

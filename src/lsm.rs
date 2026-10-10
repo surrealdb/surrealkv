@@ -10,7 +10,7 @@ use crate::batch::Batch;
 use crate::checkpoint::{CheckpointGate, CheckpointMetadata, DatabaseCheckpoint};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::CompactionStrategy;
-use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
+use crate::error::{BackgroundErrorHandler, Result};
 use crate::levels::{
 	check_manifest_before_open,
 	write_manifest_to_disk,
@@ -191,9 +191,10 @@ pub(crate) struct CoreInner {
 	/// are orphans.
 	pub(crate) manifest_loaded_from_disk: bool,
 
-	/// Set when a flush's manifest write failed from the rename on: the manifest on disk may list
-	/// a table the one in memory does not. The next flush writes the one in memory again before
-	/// it writes a table, which would otherwise rewrite the file of a table the disk may list.
+	/// Set when a flush's or a direct table's manifest write failed from the rename on: the
+	/// manifest on disk may list a table the one in memory does not. The next flush, direct table
+	/// or checkpoint writes the one in memory again first, which a flush would otherwise follow
+	/// by rewriting the file of a table the disk may list.
 	manifest_uncertain: AtomicBool,
 
 	/// Test-only observer called by `flush_immutable_to_sst` once the SST is on disk and before
@@ -201,9 +202,23 @@ pub(crate) struct CoreInner {
 	#[cfg(test)]
 	pub(crate) flush_hook: parking_lot::Mutex<Option<FlushHook>>,
 
+	/// Test-only observer called by `write_batch_direct_to_l0_sst` once its table is open and
+	/// before the manifest is updated. An error from it fails the write.
+	#[cfg(test)]
+	pub(crate) direct_table_hook: parking_lot::Mutex<Option<FlushHook>>,
+
 	/// Test-only observer called by `create_checkpoint` at each of its stages.
 	#[cfg(test)]
 	pub(crate) checkpoint_hook: parking_lot::Mutex<Option<crate::checkpoint::CheckpointHook>>,
+}
+
+/// What a failed `write_batch_direct_to_l0_sst` leaves behind.
+#[derive(Default)]
+struct DirectL0Progress {
+	/// The file of the table was created, so it is this write's to remove.
+	created: bool,
+	/// The manifest on disk may list the table, so its file must stay.
+	table_may_be_listed: bool,
 }
 
 /// See `CoreInner::flush_hook`; the argument is the table id.
@@ -270,6 +285,8 @@ impl CoreInner {
 			manifest_uncertain: AtomicBool::new(false),
 			#[cfg(test)]
 			flush_hook: parking_lot::Mutex::new(None),
+			#[cfg(test)]
+			direct_table_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
 			checkpoint_hook: parking_lot::Mutex::new(None),
 		})
@@ -426,6 +443,11 @@ impl CoreInner {
 		Ok(table)
 	}
 
+	/// Whether the manifest on disk may list a table the one in memory does not.
+	pub(crate) fn manifest_uncertain(&self) -> bool {
+		self.manifest_uncertain.load(Ordering::Acquire)
+	}
+
 	/// The error for a failed write of the manifest. An uncertain write keeps its kind, which
 	/// the background task does not retry, and makes the next flush settle the manifest first.
 	fn manifest_write_error(&self, error: Error, context: String) -> Error {
@@ -440,7 +462,7 @@ impl CoreInner {
 
 	/// Writes the manifest in memory to disk again if the last write of it was uncertain, so that
 	/// the disk holds exactly the tables in memory before a flush writes the file of one.
-	fn settle_manifest(&self) -> Result<()> {
+	pub(crate) fn settle_manifest(&self) -> Result<()> {
 		if !self.manifest_uncertain.load(Ordering::Acquire) {
 			return Ok(());
 		}
@@ -466,12 +488,68 @@ impl CoreInner {
 	/// `rest_wal_number` is the oldest segment that holds the record of a batch of the same
 	/// commit group that is not applied yet, `u64::MAX` if there is none: `log_number` is not
 	/// moved past it either, see `group_wal_pin`.
+	///
+	/// A write that fails fails the commit, or its group, through the error of the group, and
+	/// records no background error: the caller is a committer, which hears of it, like the one of
+	/// a flush that a checkpoint runs. A group that failed after part of it was applied stops the
+	/// database, which `flush_entries` decides. The manifest is written again first if the last
+	/// write of it was uncertain, and a failure of that write fails this one before a table
+	/// exists. The file of a failed write is removed, with one exception: a manifest write that
+	/// failed from the rename on, whose manifest in memory could not be written again at once,
+	/// may have been listed by the manifest on disk, and its file is kept until the manifest is
+	/// written again or the database is opened. A failure leaves at most that one file, as
+	/// nothing is created while the manifest cannot be written. The record of the batch stays in
+	/// the segment that was sealed, so the commit that failed is whole or absent after a crash.
+	///
+	/// The values of `batch` are in files of the value log that the active memtable keeps
+	/// (`note_vlog_pointers`) until it is flushed, and a flush writes the manifest from memory
+	/// before it deletes any file, as the compaction does. A manifest on disk that lists a kept
+	/// table is therefore replaced before the files that table points into can go.
 	pub(crate) fn write_batch_direct_to_l0_sst(
 		&self,
 		batch: &Batch,
 		table_id: u64,
 		batch_wal_number: u64,
 		rest_wal_number: u64,
+	) -> Result<Arc<Table>> {
+		self.settle_manifest()?;
+
+		let mut progress = DirectL0Progress::default();
+		let result = self.install_direct_l0_table(
+			batch,
+			table_id,
+			batch_wal_number,
+			rest_wal_number,
+			&mut progress,
+		);
+		if result.is_err() && progress.created {
+			if progress.table_may_be_listed {
+				tracing::warn!(
+					"Kept the table file of a failed direct L0 write that the manifest may list: table_id={}",
+					table_id
+				);
+			} else if let Err(e) = std::fs::remove_file(self.opts.sstable_file_path(table_id)) {
+				if e.kind() != std::io::ErrorKind::NotFound {
+					tracing::warn!(
+						"Failed to remove the table file of a failed direct L0 write: table_id={}: {}",
+						table_id,
+						e
+					);
+				}
+			}
+		}
+		result
+	}
+
+	/// Writes the table of `write_batch_direct_to_l0_sst` and registers it in the manifest, and
+	/// says in `progress` what a failure leaves behind.
+	fn install_direct_l0_table(
+		&self,
+		batch: &Batch,
+		table_id: u64,
+		batch_wal_number: u64,
+		rest_wal_number: u64,
+		progress: &mut DirectL0Progress,
 	) -> Result<Arc<Table>> {
 		let table_file_path = self.opts.sstable_file_path(table_id);
 		let mut range_deletions = Vec::new();
@@ -500,6 +578,7 @@ impl CoreInner {
 
 		{
 			let file = std::fs::File::create(&table_file_path)?;
+			progress.created = true;
 			let mut table_writer =
 				crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&self.opts), 0);
 
@@ -528,6 +607,14 @@ impl CoreInner {
 		if !range_deletions.is_empty() {
 			created_table.range_deletions.write().extend(range_deletions);
 			created_table.has_range_deletions.store(true, Ordering::Release);
+		}
+
+		#[cfg(test)]
+		{
+			let hook = self.direct_table_hook.lock().clone();
+			if let Some(hook) = hook {
+				hook(table_id)?;
+			}
 		}
 
 		// Atomically commit new L0 table to manifest.
@@ -561,11 +648,18 @@ impl CoreInner {
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
 			manifest.revert_changeset(rollback);
-			let error = Error::Other(format!(
-				"Failed to atomically update manifest for direct L0 flush table_id={}: {}",
-				table_id, e
-			));
-			self.error_handler.set_error(error.clone(), BackgroundErrorReason::ManifestWrite);
+			let error = self.manifest_write_error(
+				e,
+				format!(
+					"Failed to update the manifest for the direct L0 table table_id={table_id}"
+				),
+			);
+			drop(manifest);
+			if matches!(error, Error::ManifestWriteUncertain(_)) {
+				// The manifest on disk may list the table: write the one in memory again, which
+				// does not. Until that works the file stays.
+				progress.table_may_be_listed = self.settle_manifest().is_err();
+			}
 			return Err(error);
 		}
 
