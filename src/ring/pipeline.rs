@@ -1689,6 +1689,11 @@ impl CommitPipeline {
 	/// applied yet stays pinned (`CoreInner::group_wal_pin`), so recovery still finds the group
 	/// whole.
 	///
+	/// A table that cannot be written or registered in the manifest fails the same way and
+	/// records no background error, see `CoreInner::write_batch_direct_to_l0_sst`. The record of
+	/// the batch is in the segment that was sealed, so the commit that failed is whole or absent
+	/// after a crash.
+	///
 	/// The values of `batch` are in the value log already, and no table or memtable points into
 	/// them until its table is registered. The flushes make cleanups of the value log, and the
 	/// tables they register can point into newer files only (a memtable that holds inline
