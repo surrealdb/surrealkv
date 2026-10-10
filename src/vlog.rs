@@ -1,15 +1,20 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Cursor, Read, Write};
+use std::io::{self, BufWriter, Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crc32fast::Hasher;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::error::{Error, Result};
 use crate::{vfs, CompressionType, Options, VLogChecksumLevel, Value};
+
+/// Test-only: the VLog files whose fsync completed, in order.
+#[cfg(test)]
+pub(crate) static SYNCED_VLOG_FILES: parking_lot::Mutex<Vec<PathBuf>> =
+	parking_lot::Mutex::new(Vec::new());
 
 /// VLog format version
 pub const VLOG_FORMAT_VERSION: u16 = 1;
@@ -414,19 +419,65 @@ impl VLogFile {
 	}
 }
 
+/// The file a [`VLogWriter`] writes to. In tests a write can be made to fail, as a full disk
+/// does.
+struct Sink {
+	file: File,
+	/// Bytes the file still takes before one write fails.
+	#[cfg(test)]
+	fail_after: Option<usize>,
+}
+
+impl Sink {
+	fn new(file: File) -> Self {
+		Self {
+			file,
+			#[cfg(test)]
+			fail_after: None,
+		}
+	}
+}
+
+impl Write for Sink {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		#[cfg(test)]
+		if let Some(left) = self.fail_after {
+			if left == 0 {
+				self.fail_after = None;
+				return Err(io::Error::other("injected write failure"));
+			}
+			let written = self.file.write(&buf[..buf.len().min(left)])?;
+			self.fail_after = Some(left - written);
+			return Ok(written);
+		}
+		self.file.write(buf)
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		self.file.flush()
+	}
+}
+
 /// Writer for a single VLog file
 pub(crate) struct VLogWriter {
 	/// Buffered writer for the file
-	writer: BufWriter<File>,
+	writer: BufWriter<Sink>,
 	/// Cloned file descriptor for fsync outside the write lock.
 	/// Points to the same inode as the BufWriter's file.
 	sync_fd: Arc<File>,
-	/// Current offset in the file
+	/// Current offset in the file: its length once everything buffered is written
 	pub(crate) current_offset: u64,
 	/// ID of this VLog file
 	file_id: u32,
 	/// Total bytes written to this file
 	bytes_written: u64,
+	/// Set when an append failed and the file could not be cut back to the end of the last
+	/// complete entry. The writer then refuses appends, and the log replaces it on its next
+	/// append.
+	poisoned: bool,
+	/// Test-only: the next cut of a failed append fails.
+	#[cfg(test)]
+	fail_cut_back: bool,
 }
 
 impl VLogWriter {
@@ -445,7 +496,7 @@ impl VLogWriter {
 		let sync_fd = Arc::new(file.try_clone()?);
 
 		let current_offset = file.metadata()?.len();
-		let mut writer = BufWriter::new(file);
+		let mut writer = BufWriter::new(Sink::new(file));
 
 		// If this is a new file, write the header
 		if !file_exists || current_offset == 0 {
@@ -468,6 +519,9 @@ impl VLogWriter {
 			current_offset,
 			file_id,
 			bytes_written: current_offset,
+			poisoned: false,
+			#[cfg(test)]
+			fail_cut_back: false,
 		})
 	}
 
@@ -475,7 +529,17 @@ impl VLogWriter {
 	/// Layout: +--------+-----+-------+-------+
 	///         | header  | key | value | crc32 |
 	///         +--------+-----+-------+--------+
+	///
+	/// A failed append leaves the file as it was: the part of the entry that reached the
+	/// buffer or the file is cut off, so the next entry starts where its pointer says. If the
+	/// cut fails too, the writer is poisoned.
 	pub(crate) fn append(&mut self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
+		if self.poisoned {
+			return Err(Error::Io(Arc::new(io::Error::other(
+				"VLog writer is poisoned by an earlier failed append",
+			))));
+		}
+
 		let key_len = key.len() as u32;
 		let value_len = value.len() as u32;
 		let offset = self.current_offset;
@@ -486,18 +550,16 @@ impl VLogWriter {
 		hasher.update(value);
 		let crc32 = hasher.finalize();
 
-		// Write header: [key_len: 4 bytes][value_len: 4 bytes]
-		self.writer.write_all(&key_len.to_be_bytes())?;
-		self.writer.write_all(&value_len.to_be_bytes())?;
-
-		// Write key
-		self.writer.write_all(key)?;
-
-		// Write value
-		self.writer.write_all(value)?;
-
-		// Write CRC32
-		self.writer.write_all(&crc32.to_be_bytes())?;
+		if let Err(e) = self.write_entry(key, value, crc32) {
+			if let Err(cut) = self.cut_back(offset) {
+				tracing::error!(
+					"Failed to cut a partial entry off VLog file {}, poisoning its writer: {cut}",
+					self.file_id
+				);
+				self.poisoned = true;
+			}
+			return Err(e);
+		}
 
 		let entry_size = 8 + key.len() as u64 + value.len() as u64 + 4; // header + key + value +
 																		// crc32
@@ -507,11 +569,88 @@ impl VLogWriter {
 		Ok(ValuePointer::new(self.file_id, offset, key_len, value_len, crc32))
 	}
 
+	fn write_entry(&mut self, key: &[u8], value: &[u8], crc32: u32) -> Result<()> {
+		// Write header: [key_len: 4 bytes][value_len: 4 bytes]
+		self.writer.write_all(&(key.len() as u32).to_be_bytes())?;
+		self.writer.write_all(&(value.len() as u32).to_be_bytes())?;
+
+		// Write key
+		self.writer.write_all(key)?;
+
+		// Write value
+		self.writer.write_all(value)?;
+
+		// Write CRC32
+		self.writer.write_all(&crc32.to_be_bytes())?;
+		Ok(())
+	}
+
+	/// Cuts everything after the first `len` bytes of the file's stream (the file followed by
+	/// the buffer) off: the bytes of an entry whose append failed.
+	///
+	/// Entries before it may still be partly in the buffer, with pointers that were already
+	/// handed out, so the buffer is kept up to `len` and not dropped. What is kept goes into a
+	/// buffer that has room for it, as a buffer that the bytes fill would write them straight to
+	/// the file, where they could fail again. Once the file has been cut, nothing that follows
+	/// touches the disk, so a failed cut loses no entry that was appended before.
+	fn cut_back(&mut self, len: u64) -> Result<()> {
+		#[cfg(test)]
+		if std::mem::take(&mut self.fail_cut_back) {
+			return Err(Error::Io(Arc::new(io::Error::other("injected cut failure"))));
+		}
+		let on_disk = self.sync_fd.metadata()?.len();
+		let sink = Sink::new(self.sync_fd.try_clone()?);
+		if on_disk > len {
+			// The entries before are all in the file, so what is buffered belongs to the failed
+			// one.
+			self.sync_fd.set_len(len)?;
+		}
+
+		// Rebuild the buffer around the same file. The old one is taken apart rather than
+		// dropped, because dropping a `BufWriter` writes out what it still holds.
+		let kept = len.saturating_sub(on_disk) as usize;
+		let capacity = self.writer.capacity().max(kept + 1);
+		let stale = std::mem::replace(&mut self.writer, BufWriter::with_capacity(capacity, sink));
+		let (_, buffered) = stale.into_parts();
+		if kept > 0 {
+			let lost = || Error::Io(Arc::new(io::Error::other("a VLog buffer was lost")));
+			let buffered = buffered.map_err(|_| lost())?;
+			self.writer.write_all(buffered.get(..kept).ok_or_else(lost)?)?;
+		}
+		Ok(())
+	}
+
+	/// Whether the next append belongs in another file: this one is full, or its writer is
+	/// poisoned.
+	fn needs_replacing(&self, max_file_size: u64) -> bool {
+		self.poisoned || self.size() >= max_file_size
+	}
+
+	/// Test-only: the file takes `bytes` more bytes and then one write fails, as a full disk
+	/// makes it. Whatever is buffered reaches the file up to that point, as a short write does.
+	#[cfg(test)]
+	pub(crate) fn fail_writes_after(&mut self, bytes: usize) {
+		self.writer.get_mut().fail_after = Some(bytes);
+	}
+
+	/// Test-only: the next cut of a failed append fails, as a file that cannot be truncated
+	/// does.
+	#[cfg(test)]
+	pub(crate) fn fail_next_cut_back(&mut self) {
+		self.fail_cut_back = true;
+	}
+
+	/// Test-only: marks the writer as one whose failed append could not be cut back.
+	#[cfg(test)]
+	pub(crate) fn poison(&mut self) {
+		self.poisoned = true;
+	}
+
 	/// Flushes and syncs the writer (test helper).
 	#[cfg(test)]
 	pub(crate) fn sync(&mut self) -> Result<()> {
 		self.writer.flush()?;
-		self.writer.get_ref().sync_all()?;
+		self.writer.get_ref().file.sync_all()?;
 		Ok(())
 	}
 
@@ -559,6 +698,10 @@ pub(crate) struct VLog {
 	/// Writer for the current active file
 	pub(crate) writer: RwLock<Option<VLogWriter>>,
 
+	/// Files the writer rolled over from, until an fsync of each has succeeded: their bytes
+	/// reached the OS but may not be on disk. Locked after `writer`, never before it.
+	unsynced: Mutex<Vec<(u32, Arc<File>)>>,
+
 	/// Maps file_id to VLogFile metadata
 	files_map: RwLock<HashMap<u32, Arc<VLogFile>>>,
 
@@ -567,6 +710,26 @@ pub(crate) struct VLog {
 
 	/// Options for VLog configuration
 	pub(crate) opts: Arc<Options>,
+
+	/// Test-only: the next fsync of a file fails.
+	#[cfg(test)]
+	fail_next_sync: std::sync::atomic::AtomicBool,
+
+	/// Test-only: runs in `sync` between taking the fds and fsyncing them.
+	#[cfg(test)]
+	sync_gap: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+
+	/// Number of live [`VLogPin`]s. While there is one, no file is deleted.
+	pins: AtomicUsize,
+}
+
+/// Keeps a [`VLog`] from deleting files until it is dropped.
+pub(crate) struct VLogPin<'a>(&'a VLog);
+
+impl Drop for VLogPin<'_> {
+	fn drop(&mut self) {
+		self.0.pins.fetch_sub(1, Ordering::SeqCst);
+	}
 }
 
 impl VLog {
@@ -584,9 +747,15 @@ impl VLog {
 			next_file_id: AtomicU32::new(1),
 			active_writer_id: AtomicU32::new(0),
 			writer: RwLock::new(None),
+			unsynced: Mutex::new(Vec::new()),
 			files_map: RwLock::new(HashMap::new()),
 			file_handles: RwLock::new(HashMap::new()),
 			opts,
+			#[cfg(test)]
+			fail_next_sync: std::sync::atomic::AtomicBool::new(false),
+			#[cfg(test)]
+			sync_gap: Mutex::new(None),
+			pins: AtomicUsize::new(0),
 		};
 
 		// PRE-FILL ALL EXISTING FILE HANDLES ON STARTUP
@@ -597,41 +766,47 @@ impl VLog {
 
 	/// Appends a key+value pair to the log and returns a ValuePointer
 	pub(crate) fn append(&self, key: &[u8], value: &[u8]) -> Result<ValuePointer> {
-		// Ensure we have a writer
-		let _new_file_created = {
-			let mut writer = self.writer.write();
+		let mut writer = self.writer.write();
+		if writer.as_ref().is_none_or(|w| w.needs_replacing(self.max_file_size)) {
+			self.roll_over(&mut writer)?;
+		}
+		writer.as_mut().expect("a writer was just installed").append(key, value)
+	}
 
-			if writer.is_none() || writer.as_ref().unwrap().size() >= self.max_file_size {
-				// Create new file
-				let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
-				let file_path = self.vlog_file_path(file_id);
-				let new_writer = VLogWriter::new(
-					&file_path,
-					file_id,
-					self.opts.vlog_max_file_size,
-					CompressionType::None as u8,
-				)?;
-
-				// Register the new file for GC safety
-				self.register_vlog_file(file_id, file_path, 0); // Start with size 0
-
-				// Update the active writer ID
-				self.active_writer_id.store(file_id, Ordering::SeqCst);
-
-				*writer = Some(new_writer);
-				true
-			} else {
-				false
+	/// Replaces the active writer with one for a new file.
+	///
+	/// The old file is flushed first, and a failure of that flush is an error: dropping its
+	/// writer would swallow it and lose entries that pointers were already handed out for. It
+	/// is not fsynced here, which would stall every commit behind it, but queued for the next
+	/// [`sync`](Self::sync).
+	fn roll_over(&self, active: &mut Option<VLogWriter>) -> Result<()> {
+		let old = match active.as_mut() {
+			Some(writer) => {
+				writer.flush()?;
+				Some((writer.file_id, writer.sync_fd()))
 			}
+			None => None,
 		};
 
-		// Now append the key+value pair
-		let mut writer = self.writer.write();
-		let writer = writer.as_mut().unwrap();
+		// Create new file
+		let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
+		let file_path = self.vlog_file_path(file_id);
+		let new_writer = VLogWriter::new(
+			&file_path,
+			file_id,
+			self.opts.vlog_max_file_size,
+			CompressionType::None as u8,
+		)?;
 
-		let pointer = writer.append(key, value)?;
+		// Register the new file for GC safety
+		self.register_vlog_file(file_id, file_path, 0); // Start with size 0
 
-		Ok(pointer)
+		// Update the active writer ID
+		self.active_writer_id.store(file_id, Ordering::SeqCst);
+
+		self.unsynced.lock().extend(old);
+		*active = Some(new_writer);
+		Ok(())
 	}
 
 	/// Pre-fills the file_handles cache with all existing VLog files
@@ -925,17 +1100,30 @@ impl VLog {
 		Ok(value_bytes)
 	}
 
+	/// Keeps every file in place until the pin is dropped. A checkpoint takes one while it holds
+	/// the manifest and copies the files after releasing it, so a flush or a compaction cannot
+	/// delete files that the checkpointed tables point into in between.
+	pub(crate) fn pin_files(&self) -> VLogPin<'_> {
+		self.pins.fetch_add(1, Ordering::SeqCst);
+		VLogPin(self)
+	}
+
 	/// Cleans up obsolete vlog files based on the global minimum oldest_vlog_file_id.
 	///
 	/// A vlog file is safe to delete when:
 	/// - Its file_id < min_oldest_vlog (no SST references values in it)
 	/// - It is not the active writer
 	/// - No iterators are active
+	/// - No [`VLogPin`] is held
 	///
 	/// This implements the "global minimum" GC approach where files are deleted
-	/// once no SST can possibly reference them. If iterators are active, cleanup
-	/// is skipped and will be retried on the next GC trigger.
+	/// once no SST can possibly reference them. If iterators are active or a pin is
+	/// held, cleanup is skipped and will be retried on the next GC trigger.
 	pub(crate) fn cleanup_obsolete_files(&self, min_oldest_vlog: u32) -> Result<()> {
+		if self.pins.load(Ordering::SeqCst) > 0 {
+			return Ok(());
+		}
+
 		let active = self.active_writer_id.load(Ordering::SeqCst);
 
 		// Collect files that are safe to delete
@@ -949,6 +1137,7 @@ impl VLog {
 		}
 
 		// No active iterators, safe to delete
+		self.unsynced.lock().retain(|(id, _)| !to_delete.contains(id));
 		let mut files_map = self.files_map.write();
 		let mut file_handles = self.file_handles.write();
 
@@ -976,10 +1165,6 @@ impl VLog {
 		Ok(())
 	}
 
-	/// Syncs all data to disk.
-	///
-	/// The write lock is held only for the BufWriter flush (draining the
-	/// internal buffer to OS page cache, ~microseconds). The expensive
 	/// Flushes buffered data in the active writer to OS page cache.
 	pub(crate) fn flush(&self) -> Result<()> {
 		let mut guard = self.writer.write();
@@ -989,26 +1174,80 @@ impl VLog {
 		Ok(())
 	}
 
-	/// fsync is performed outside the lock using a pre-cloned file
-	/// descriptor, allowing concurrent VLog appends to proceed.
+	/// Syncs all data to disk: the active file and every file the writer rolled over from
+	/// that is not synced yet.
+	///
+	/// The write lock is held only for the BufWriter flush (draining the internal buffer to
+	/// OS page cache, ~microseconds). The expensive fsync is performed outside the lock using
+	/// pre-cloned file descriptors, allowing concurrent VLog appends to proceed.
 	pub(crate) fn sync(&self) -> Result<()> {
-		// Phase 1: Under write lock — flush BufWriter and grab sync fd
-		let sync_fd = {
+		// Phase 1: Under write lock — flush BufWriter and grab the sync fds
+		let (queued, active) = {
 			let mut guard = self.writer.write();
-			if let Some(ref mut writer) = *guard {
-				writer.flush()?;
-				Some(writer.sync_fd())
-			} else {
-				None
-			}
+			let active = match guard.as_mut() {
+				Some(writer) => {
+					writer.flush()?;
+					Some((writer.file_id, writer.sync_fd()))
+				}
+				None => None,
+			};
+			(self.unsynced.lock().clone(), active)
 			// write lock released here
 		};
+		#[cfg(test)]
+		{
+			let gap = self.sync_gap.lock().clone();
+			if let Some(gap) = gap {
+				gap();
+			}
+		}
 
-		// Phase 2: Outside lock — fsync to disk (slow, doesn't block appends)
-		if let Some(fd) = sync_fd {
-			fd.sync_all()?;
+		// Phase 2: Outside lock — fsync to disk (slow, doesn't block appends). A rolled-over
+		// file leaves the queue only once its fsync has succeeded, so a failed sync is retried,
+		// and a sync that overlaps another fsyncs the file itself, as the other's fsync may
+		// still be in flight. Only a file that was queued when the fds were taken may leave it:
+		// the active file is queued again by a rollover after that, for bytes this fsync may
+		// not cover.
+		for (file_id, fd) in &queued {
+			self.fsync(*file_id, fd)?;
+			self.unsynced.lock().retain(|(id, _)| id != file_id);
+		}
+		if let Some((file_id, fd)) = &active {
+			self.fsync(*file_id, fd)?;
 		}
 		Ok(())
+	}
+
+	fn fsync(&self, file_id: u32, fd: &File) -> Result<()> {
+		#[cfg(test)]
+		if self.fail_next_sync.swap(false, Ordering::SeqCst) {
+			return Err(Error::Io(Arc::new(io::Error::other("injected fsync failure"))));
+		}
+		fd.sync_all()?;
+		tracing::trace!("Synced VLog file {file_id}");
+		#[cfg(test)]
+		SYNCED_VLOG_FILES.lock().push(self.vlog_file_path(file_id));
+		Ok(())
+	}
+
+	/// Test-only: makes the next fsync of [`sync`](Self::sync) fail, as a failing disk does.
+	#[cfg(test)]
+	pub(crate) fn fail_next_sync(&self) {
+		self.fail_next_sync.store(true, Ordering::SeqCst);
+	}
+
+	/// Test-only: sets what runs in [`sync`](Self::sync) between taking the fds and fsyncing
+	/// them, with no lock held.
+	#[cfg(test)]
+	pub(crate) fn set_sync_gap(&self, gap: Option<Arc<dyn Fn() + Send + Sync>>) {
+		*self.sync_gap.lock() = gap;
+	}
+
+	/// Test-only: makes the active file take `bytes` more bytes and then fail one write, as a
+	/// full disk does (see [`VLogWriter::fail_writes_after`]).
+	#[cfg(test)]
+	pub(crate) fn fail_writes_after(&self, bytes: usize) {
+		self.writer.write().as_mut().expect("a file was written to").fail_writes_after(bytes);
 	}
 
 	/// Registers a VLog file in the files map for tracking

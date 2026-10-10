@@ -90,6 +90,10 @@ pub trait CompactionOperations: Send + Sync {
 /// If a function needs multiple locks, it must acquire them in this order.
 /// See `rotate_memtable()`, `flush_immutable_to_sst()` for examples.
 ///
+/// `flush_lock`, which serializes the flushes of the immutable queue, comes before all of
+/// them: a flush, the shutdown flush and a restore hold it while they take the others, and
+/// nothing waits for it while holding one of them.
+///
 /// The WAL's own lock (`wal`) is a leaf: nothing is acquired while it is held, except the
 /// segment's fsync gate, which is itself a leaf, so it can be taken after any of the locks above
 /// or on its own. Rotation takes it under `active_memtable` (`rotate_memtable()`,
@@ -119,6 +123,11 @@ pub(crate) struct CoreInner {
 	/// memtables continue serving reads while waiting for background threads
 	/// to flush them to disk as SSTables.
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
+
+	/// Held for the whole of a flush of the immutable queue, so the background task, a
+	/// checkpoint and the shutdown flush never flush one memtable twice and always take the
+	/// oldest one first, and a restore never replaces the manifest under a flush.
+	pub(crate) flush_lock: parking_lot::Mutex<()>,
 
 	/// The level structure managing all SSTables on disk.
 	///
@@ -164,16 +173,24 @@ pub(crate) struct CoreInner {
 	/// Global memory controller accounting memory across memtables, ring buffer, and cache.
 	pub(crate) memory_controller: Arc<crate::memory::MemoryController>,
 
-	/// Serializes flushes of the immutable queue, so the background flush task and a
-	/// direct-to-L0 write (which must flush everything older first) never pick the same
-	/// memtable or install tables out of order. Acquired before any lock listed above.
-	flush_lock: parking_lot::Mutex<()>,
-
 	/// Whether the manifest was read from disk in this run, as opposed to created by it.
 	/// A manifest created in this run lists no tables, so it cannot say which SSTables
 	/// are orphans.
 	pub(crate) manifest_loaded_from_disk: bool,
+
+	/// Test-only observer called by `flush_immutable_to_sst` once the SST is on disk and before
+	/// the manifest is updated. An error from it fails the flush.
+	#[cfg(test)]
+	pub(crate) flush_hook: parking_lot::Mutex<Option<FlushHook>>,
+
+	/// Test-only observer called by `create_checkpoint` at each of its stages.
+	#[cfg(test)]
+	pub(crate) checkpoint_hook: parking_lot::Mutex<Option<crate::checkpoint::CheckpointHook>>,
 }
+
+/// See `CoreInner::flush_hook`; the argument is the table id.
+#[cfg(test)]
+pub(crate) type FlushHook = Arc<dyn Fn(u64) -> Result<()> + Send + Sync>;
 
 impl CoreInner {
 	/// Creates a new LSM tree core instance
@@ -220,6 +237,7 @@ impl CoreInner {
 			opts,
 			active_memtable,
 			immutable_memtables,
+			flush_lock: parking_lot::Mutex::new(()),
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
 			active_txn_tracker: Arc::new(crate::tracker::ActiveTxnTracker::new()),
@@ -229,8 +247,11 @@ impl CoreInner {
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
 			memory_controller,
-			flush_lock: parking_lot::Mutex::new(()),
 			manifest_loaded_from_disk,
+			#[cfg(test)]
+			flush_hook: parking_lot::Mutex::new(None),
+			#[cfg(test)]
+			checkpoint_hook: parking_lot::Mutex::new(None),
 		})
 	}
 
@@ -258,8 +279,8 @@ impl CoreInner {
 	/// * `table_id` - Table ID for the new SST
 	/// * `log_number` - The new manifest log_number: the oldest WAL segment that may still hold
 	///   data not yet in an SST once this memtable is flushed. For a memtable from the immutable
-	///   queue this is its `wal_number + 1`, as the queue is flushed oldest-first and each memtable
-	///   owns its WAL segments.
+	///   queue this is its `wal_number + 1`. It is held back to the oldest WAL segment of any other
+	///   memtable still queued, as a memtable can be queued ahead of this one.
 	///
 	/// # Returns
 	/// The flushed SSTable
@@ -289,17 +310,32 @@ impl CoreInner {
 
 		tracing::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
 
+		#[cfg(test)]
+		{
+			let hook = self.flush_hook.lock().clone();
+			if let Some(hook) = hook {
+				hook(table.id)?;
+			}
+		}
+
 		// Step 2: Prepare atomic changeset
 		let mut changeset = ManifestChangeSet::default();
 		changeset.new_tables.push((0, Arc::clone(&table)));
-		changeset.log_number = Some(log_number);
-
-		tracing::debug!("Changeset prepared: table_id={}, log_number={}", table_id, log_number);
 
 		// Step 4: Apply changeset atomically
 		// Lock order: level_manifest → immutable_memtables
 		let mut manifest = self.level_manifest.write()?;
 		let mut memtable_lock = self.immutable_memtables.write()?;
+
+		// A memtable queued ahead of this one (a checkpoint can rotate while the shutdown flush
+		// runs) keeps its WAL segment: `log_number` only moves forward, so passing the segment
+		// would lose the memtable if the process died before its flush.
+		let log_number = memtable_lock
+			.oldest_wal_number_except(Some(table_id))
+			.map_or(log_number, |oldest| oldest.min(log_number));
+		changeset.log_number = Some(log_number);
+
+		tracing::debug!("Changeset prepared: table_id={}, log_number={}", table_id, log_number);
 
 		let rollback = manifest.apply_changeset(&changeset)?;
 		if let Err(e) = write_manifest_to_disk(&manifest) {
@@ -575,12 +611,18 @@ impl CoreInner {
 	}
 
 	/// Flushes the oldest immutable memtable to an SSTable.
-	/// Returns Ok(Some(table)) if a memtable was flushed, Ok(None) if queue was empty.
+	/// Returns Ok(Some(table)) if a memtable was flushed, Ok(None) if queue was empty (or the
+	/// oldest memtable was empty and was dropped).
 	///
 	/// This method:
-	/// 1. Gets the oldest entry from immutable queue (lowest table_id)
-	/// 2. Flushes it to SST via flush_immutable_to_sst (which also removes from queue)
-	/// 3. Schedules async WAL cleanup
+	/// 1. Takes `flush_lock`, so a flush that is already running finishes first and its memtable is
+	///    out of the queue when the oldest entry is read
+	/// 2. Gets the oldest entry from immutable queue (lowest table_id)
+	/// 3. Flushes it to SST via flush_immutable_to_sst (which also removes from queue)
+	/// 4. Removes the WAL segments the flush made obsolete, on the caller's thread, so it needs no
+	///    runtime
+	///
+	/// A failed flush leaves the memtable in the queue and releases the lock, so it can be retried.
 	fn flush_oldest_immutable_to_sst(&self) -> Result<Option<Arc<Table>>> {
 		let flush_guard = self.flush_lock.lock();
 		self.flush_oldest_immutable_to_sst_locked(&flush_guard)
@@ -629,25 +671,23 @@ impl CoreInner {
 			entry.wal_number + 1,
 		)?;
 
-		// Schedule async WAL cleanup
+		// Clean up the WAL segments the flush made obsolete
 		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
 		let min_wal_to_keep = entry.wal_number + 1;
 
-		tokio::spawn(async move {
-			match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
-				Ok(count) if count > 0 => {
-					tracing::debug!(
-						"Cleaned up {} old WAL segments (min_wal_to_keep={})",
-						count,
-						min_wal_to_keep
-					);
-				}
-				Ok(_) => {}
-				Err(e) => {
-					tracing::warn!("Failed to clean up old WAL segments: {}", e);
-				}
+		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+			Ok(count) if count > 0 => {
+				tracing::debug!(
+					"Cleaned up {} old WAL segments (min_wal_to_keep={})",
+					count,
+					min_wal_to_keep
+				);
 			}
-		});
+			Ok(_) => {}
+			Err(e) => {
+				tracing::warn!("Failed to clean up old WAL segments: {}", e);
+			}
+		}
 
 		tracing::debug!(
 			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
@@ -658,13 +698,22 @@ impl CoreInner {
 		Ok(Some(table))
 	}
 
-	/// Flushes ALL immutable memtables synchronously.
+	/// Flushes the immutable memtables that are queued when it is called, synchronously.
 	/// Used by Tree::flush() and checkpoint for forced/sync flush.
-	/// Blocks until all immutables are written to SST.
+	/// Blocks until they are all in tables, including one that another flush had started. Ones
+	/// rotated meanwhile are left to the background task: waiting for them too would keep a
+	/// checkpoint of a tree under steady writes from ever finishing.
 	pub(crate) fn flush_all_immutables_sync(&self) -> Result<()> {
+		let Some(newest) = self.immutable_memtables.read()?.iter().next_back().map(|e| e.table_id)
+		else {
+			return Ok(());
+		};
 		let mut count = 0;
-		while self.flush_oldest_immutable_to_sst()?.is_some() {
-			count += 1;
+		// `Ok(None)` can also mean an empty memtable was dropped, so the queue says when to stop.
+		while self.immutable_memtables.read()?.first().is_some_and(|e| e.table_id <= newest) {
+			if self.flush_oldest_immutable_to_sst()?.is_some() {
+				count += 1;
+			}
 		}
 		if count > 0 {
 			tracing::debug!("flush_all_immutables_sync: flushed {} immutable memtables", count);
@@ -784,6 +833,9 @@ impl CoreInner {
 	fn flush_all_memtables_for_shutdown(&self) -> Result<()> {
 		tracing::debug!("Flushing all memtables for shutdown...");
 
+		// A checkpoint on another thread may still be flushing the same queue.
+		let _flush = self.flush_lock.lock();
+
 		// STEP 1: Flush ALL immutable memtables FIRST (older data, lower table_ids)
 		// We need to collect them first to avoid holding the lock during I/O
 		let immutables_to_flush: Vec<ImmutableEntry> = {
@@ -872,12 +924,16 @@ impl CoreInner {
 			// This marks the WAL as safe to delete
 			if flushed_count > 0 {
 				let current_wal = self.wal.read().get_active_log_number();
+
+				// A memtable rotated after the queue was read keeps its WAL segment.
+				let mut manifest = self.level_manifest.write()?;
+				let log_number =
+					self.immutable_memtables.read()?.log_number_after(None, current_wal);
 				let changeset = ManifestChangeSet {
-					log_number: Some(current_wal + 1),
+					log_number: Some(log_number),
 					..Default::default()
 				};
 
-				let mut manifest = self.level_manifest.write()?;
 				let rollback = manifest.apply_changeset(&changeset)?;
 				if let Err(e) = write_manifest_to_disk(&manifest) {
 					manifest.revert_changeset(rollback);
@@ -892,7 +948,7 @@ impl CoreInner {
 
 				tracing::debug!(
 					"Updated manifest log_number to {} after immutable flushes",
-					current_wal + 1
+					log_number
 				);
 			}
 		}
@@ -1439,11 +1495,17 @@ impl Core {
 	///
 	/// # Order of Operations
 	///
-	/// VLog is flushed first (contains data referenced by WAL), then WAL.
+	/// VLog is flushed (or synced) first (contains data referenced by WAL), then WAL.
 	/// This ensures that if WAL contains a ValuePointer, the referenced
 	/// VLog data is at least as durable.
 	pub(crate) fn flush_wal(&self, sync: bool) -> Result<()> {
-		// VLog is NOT synced here — VLog writes are deferred to memtable flush.
+		if let Some(ref vlog) = self.vlog {
+			if sync {
+				vlog.sync()?;
+			} else {
+				vlog.flush()?;
+			}
+		}
 		if sync {
 			self.wal.sync()?;
 		} else {
@@ -1933,7 +1995,17 @@ impl Tree {
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
 		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
-		checkpoint.create_checkpoint(checkpoint_dir)
+		let result = checkpoint.create_checkpoint(checkpoint_dir);
+
+		// The checkpoint flushed memtables on this thread, which the background tasks did not
+		// see: the level-0 tables it added may need compacting, and writers may be waiting for
+		// either.
+		if let Some(task_manager) = self.core.task_manager.lock().unwrap().as_ref() {
+			task_manager.wake_up_level();
+		}
+		self.core.write_stall.signal_work_done();
+
+		result
 	}
 
 	/// Restores the database from a checkpoint directory.
@@ -1949,6 +2021,9 @@ impl Tree {
 		// apply phase) will finish against the soon-to-be-replaced memtable —
 		// their data is intentionally discarded by the restore.
 		let _write_guard = self.core.commit_pipeline.lock_writes();
+
+		// A flush in flight would add its table to the manifest this replaces.
+		let _flush = self.core.inner.flush_lock.lock();
 
 		// Step 1: Restore files from checkpoint
 		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));

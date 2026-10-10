@@ -82,6 +82,23 @@ impl ImmutableMemtables {
 		self.0.is_empty()
 	}
 
+	/// The log number to record once the memtable written to WAL segment `wal_number` is in a
+	/// table: `wal_number + 1`, held back to the oldest segment of any other queued memtable (the
+	/// one with table id `flushed`, if it is queued, does not count).
+	pub(crate) fn log_number_after(&self, flushed: Option<u64>, wal_number: u64) -> u64 {
+		self.oldest_wal_number_except(flushed)
+			.map_or(wal_number + 1, |oldest| oldest.min(wal_number + 1))
+	}
+
+	/// The oldest WAL segment of any queued memtable other than the one with table id `flushed`.
+	pub(crate) fn oldest_wal_number_except(&self, flushed: Option<u64>) -> Option<u64> {
+		self.0
+			.iter()
+			.filter(|entry| Some(entry.table_id) != flushed)
+			.map(|entry| entry.wal_number)
+			.min()
+	}
+
 	/// Returns the oldest (first) immutable memtable entry.
 	/// Entries are sorted by table_id, so the first entry is the oldest.
 	pub(crate) fn first(&self) -> Option<&ImmutableEntry> {

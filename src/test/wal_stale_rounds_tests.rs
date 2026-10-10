@@ -839,6 +839,13 @@ fn nothing_behind_an_oversized_batch_is_logged_before_it_is_through() {
 				}
 			}
 		};
+		// The flush that does it removes the segments only after the table is on disk, so the
+		// records are collected there too.
+		let before_flush = collect.clone();
+		*tree.core.inner.flush_hook.lock() = Some(Arc::new(move |_| {
+			before_flush();
+			Ok(())
+		}));
 		let inner = Arc::clone(&tree.core.inner);
 		let at_round = collect.clone();
 		let probe = install(
@@ -878,6 +885,10 @@ fn nothing_behind_an_oversized_batch_is_logged_before_it_is_through() {
 // inside the fence
 // ---------------------------------------------------------------------------
 
+fn fsynced_vlog_files(under: &Path) -> Vec<PathBuf> {
+	crate::vlog::SYNCED_VLOG_FILES.lock().iter().filter(|p| p.starts_with(under)).cloned().collect()
+}
+
 /// What a fenced round looked like at the point it had logged what was stale and had not
 /// applied anything yet.
 #[derive(Debug)]
@@ -889,11 +900,13 @@ struct Fence {
 	wal_segment: u64,
 	/// Whether anything was appended to the active segment since its last fsync.
 	pending_sync: bool,
+	/// The value log files that had been fsynced.
+	synced_vlog_files: Vec<PathBuf>,
 }
 
-fn observe_fence(tree: &Tree) -> (Arc<Probe>, Arc<Mutex<Vec<Fence>>>) {
+fn observe_fence(tree: &Tree, live: &Path) -> (Arc<Probe>, Arc<Mutex<Vec<Fence>>>) {
 	let seen = Arc::new(Mutex::new(Vec::new()));
-	let (inner, sink) = (Arc::clone(&tree.core.inner), Arc::clone(&seen));
+	let (inner, sink, live) = (Arc::clone(&tree.core.inner), Arc::clone(&seen), live.to_path_buf());
 	let sealing = Arc::clone(&inner);
 	let probe = install(
 		tree,
@@ -912,6 +925,7 @@ fn observe_fence(tree: &Tree) -> (Arc<Probe>, Arc<Mutex<Vec<Fence>>>) {
 				tag,
 				wal_segment: wal.get_active_log_number(),
 				pending_sync: wal.pending_sync(),
+				synced_vlog_files: fsynced_vlog_files(&live),
 			});
 		},
 	);
@@ -919,9 +933,10 @@ fn observe_fence(tree: &Tree) -> (Arc<Probe>, Arc<Mutex<Vec<Fence>>>) {
 }
 
 /// A fenced round holds the memtable's read guard from the re-append to the apply, the WAL's
-/// active segment is the memtable's tag, and an Immediate group is fsynced before it is applied,
-/// in every fenced round of a group that spans several memtables too. The Eventual control leaves
-/// the append unsynced, so the probe can see one.
+/// active segment is the memtable's tag, and an Immediate group is fsynced (the WAL segment, and
+/// the value log files its pointers use) before it is applied, in every fenced round of a group
+/// that spans several memtables too. The Eventual control leaves the append unsynced, so the
+/// probe can see one.
 #[test]
 fn a_fenced_round_has_synced_what_it_logged_and_holds_the_guard_until_it_applies() {
 	bounded(false, async {
@@ -940,7 +955,7 @@ fn a_fenced_round_has_synced_what_it_logged_and_holds_the_guard_until_it_applies
 			let live = dir.path().join("live");
 			let tree = Arc::new(Tree::new(opts(&live, max_memtable_size, vlog)).unwrap());
 			stop_background_tasks(&tree).await;
-			let (probe, seen) = observe_fence(&tree);
+			let (probe, seen) = observe_fence(&tree, &live);
 
 			commit_all(&tree, &group, durability, &probe, &what).await;
 			let seen = seen.lock().unwrap();
@@ -956,6 +971,12 @@ fn a_fenced_round_has_synced_what_it_logged_and_holds_the_guard_until_it_applies
 					durability == Durability::Eventual,
 					"{what}: {fence:?}"
 				);
+				if vlog && durability == Durability::Immediate {
+					assert!(
+						!fence.synced_vlog_files.is_empty(),
+						"{what}: the value log was not fsynced before the apply: {fence:?}"
+					);
+				}
 			}
 			dispose(&tree);
 		}
@@ -1374,6 +1395,8 @@ enum Rotator {
 	Seal,
 	/// `rotate_memtable`.
 	Memtable,
+	/// `Tree::create_checkpoint`, which rotates a non-empty memtable and flushes it.
+	Checkpoint,
 }
 
 struct Storm {
@@ -1423,16 +1446,34 @@ impl Storm {
 		let stop = Arc::new(AtomicBool::new(false));
 		let rotations = Arc::new(AtomicU64::new(0));
 		let mut threads = Vec::new();
-		for rotator in rotators {
+		let checkpoints = dir.path().join("checkpoints");
+		for (n, rotator) in rotators.into_iter().enumerate() {
 			let (tree, stop, rotations) =
 				(Arc::clone(&tree), Arc::clone(&stop), Arc::clone(&rotations));
+			let checkpoints = checkpoints.clone();
+			let runtime = tokio::runtime::Handle::current();
 			threads.push(std::thread::spawn(move || {
+				// A checkpoint spawns the clean-up of the WAL segments it flushed.
+				let _entered = runtime.enter();
+				let mut taken = 0;
 				while !stop.load(Ordering::Relaxed) {
 					match rotator {
 						Rotator::Seal => {
 							tree.core.inner.seal_active_wal_segment().unwrap();
 						}
 						Rotator::Memtable => tree.core.inner.rotate_memtable().unwrap(),
+						Rotator::Checkpoint => {
+							// The copy of the WAL directory races the clean-up of the segments
+							// the previous checkpoint flushed: a segment may be gone by the
+							// time it is copied. That is not what is tested here.
+							match tree.create_checkpoint(checkpoints.join(format!("{n}_{taken}"))) {
+								Ok(_) => {}
+								Err(crate::Error::Io(e))
+									if e.kind() == std::io::ErrorKind::NotFound => {}
+								Err(e) => panic!("checkpoint failed: {e:?}"),
+							}
+							taken += 1;
+						}
 					}
 					rotations.fetch_add(1, Ordering::SeqCst);
 					std::thread::sleep(Duration::from_millis(1));
@@ -1577,6 +1618,21 @@ fn an_ungated_rotation_storm_never_fails_a_logged_commit() {
 fn a_rotation_storm_never_fails_a_logged_commit_on_a_current_thread_runtime() {
 	bounded(false, async {
 		Storm::new("current thread storm", 3, 4).run().await;
+	});
+}
+
+/// The rotations are real checkpoints (rotate, flush to SST, copy) next to seals: a checkpoint
+/// holds the memtable's write guard only for the rotation itself, and the flush that follows
+/// races the flusher.
+#[test]
+fn a_storm_of_checkpoints_and_seals_never_fails_a_logged_commit() {
+	bounded(true, async {
+		Storm {
+			rotators: vec![Rotator::Checkpoint, Rotator::Seal],
+			..Storm::new("checkpoint storm", 3, 6)
+		}
+		.run()
+		.await;
 	});
 }
 

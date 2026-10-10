@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{Error, Result};
+use crate::levels::LevelManifest;
 use crate::lsm::CoreInner;
 
 /// Recursively copies a directory and all its contents
@@ -142,6 +143,20 @@ impl CheckpointMetadata {
 	}
 }
 
+/// Where `create_checkpoint` calls `CoreInner::checkpoint_hook`.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CheckpointStage {
+	/// The SSTables are copied, and the manifest, which is still held, is not.
+	SstablesCopied,
+	/// The manifest is released and the value log is not copied.
+	ManifestReleased,
+}
+
+/// See `CoreInner::checkpoint_hook`.
+#[cfg(test)]
+pub(crate) type CheckpointHook = Arc<dyn Fn(CheckpointStage) + Send + Sync>;
+
 /// Database checkpoint manager for creating consistent point-in-time snapshots
 pub(crate) struct DatabaseCheckpoint {
 	/// Reference to the LSM core
@@ -182,11 +197,18 @@ impl DatabaseCheckpoint {
 		// Step 1: Flush all memtables to ensure consistency
 		self.flush_all_memtables()?;
 
+		// Steps 2-6 read one version of the manifest: holding its lock keeps a flush or a
+		// compaction from adding or removing tables, or rewriting the manifest file, while the
+		// SSTables and the manifest are copied.
+		let levels_guard = self.core.level_manifest.read()?;
+
+		// A flush or a compaction deletes the value-log files it made obsolete as soon as it can
+		// take the manifest, which is before the value log is copied below. The pin, taken while
+		// the manifest is held, defers that until the copy is done.
+		let _vlog_pin = self.core.vlog.as_ref().map(|vlog| vlog.pin_files());
+
 		// Step 2: Get current sequence number from the manifest
-		let sequence_number = {
-			let levels_guard = self.core.level_manifest.read()?;
-			levels_guard.get_last_sequence()
-		};
+		let sequence_number = levels_guard.get_last_sequence();
 
 		// Step 3: Create checkpoint subdirectories
 		let sstables_dir = checkpoint_path.join("sstables");
@@ -195,13 +217,20 @@ impl DatabaseCheckpoint {
 		fs::create_dir_all(&wal_dir).map_err(|e| Error::Io(Arc::new(e)))?;
 
 		// Step 4: Copy all SSTables
-		let (sstable_count, sstables_size) = self.copy_sstables(&sstables_dir)?;
+		let (sstable_count, sstables_size) = self.copy_sstables(&levels_guard, &sstables_dir)?;
 
 		// Step 5: Copy WAL segments
 		self.create_new_wal(&wal_dir)?;
 
+		#[cfg(test)]
+		self.reach(CheckpointStage::SstablesCopied);
+
 		// Step 6: Copy level manifest
 		let manifest_size = self.copy_level_manifest(checkpoint_path)?;
+		drop(levels_guard);
+
+		#[cfg(test)]
+		self.reach(CheckpointStage::ManifestReleased);
 
 		// Step 7: Copy VLog directories if enabled
 		let vlog_size = self.copy_vlog_directories(checkpoint_path)?;
@@ -220,6 +249,15 @@ impl DatabaseCheckpoint {
 		self.write_checkpoint_metadata(checkpoint_path, &metadata)?;
 
 		Ok(metadata)
+	}
+
+	/// Calls the test hook, if one is set, for `stage`.
+	#[cfg(test)]
+	fn reach(&self, stage: CheckpointStage) {
+		let hook = self.core.checkpoint_hook.lock().clone();
+		if let Some(hook) = hook {
+			hook(stage);
+		}
 	}
 
 	/// Restores the database from a checkpoint directory.
@@ -281,14 +319,13 @@ impl DatabaseCheckpoint {
 		self.core.flush_all_immutables_sync()
 	}
 
-	/// Copies all SSTables to the checkpoint directory
-	fn copy_sstables(&self, dest_dir: &Path) -> Result<(usize, u64)> {
-		let levels_guard = self.core.level_manifest.read()?;
+	/// Copies all SSTables of `levels` to the checkpoint directory
+	fn copy_sstables(&self, levels: &LevelManifest, dest_dir: &Path) -> Result<(usize, u64)> {
 		let mut total_size = 0u64;
 		let mut count = 0usize;
 
 		// Use the iterator method to iterate over all tables
-		for table in levels_guard.iter() {
+		for table in levels.iter() {
 			// Construct the source path using the table ID, similar to load_table
 			let source_path = self.core.opts.sstable_file_path(table.id);
 
@@ -296,6 +333,14 @@ impl DatabaseCheckpoint {
 				.file_name()
 				.ok_or_else(|| Error::Other("Invalid SSTable path".to_string()))?;
 			let dest_path = dest_dir.join(filename);
+
+			// A file left by an earlier checkpoint into this directory may be a link to the live
+			// SSTable, which copying over it would truncate.
+			match fs::remove_file(&dest_path) {
+				Ok(()) => {}
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+				Err(e) => return Err(Error::Io(Arc::new(e))),
+			}
 
 			// Create hard link if possible (faster), otherwise copy
 			if fs::hard_link(&source_path, &dest_path).is_err() {

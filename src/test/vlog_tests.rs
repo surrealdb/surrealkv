@@ -1,5 +1,8 @@
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tempfile::TempDir;
 use test_log::test;
@@ -11,6 +14,7 @@ use crate::vlog::{
 	ValueLocation,
 	ValuePointer,
 	BIT_VALUE_POINTER,
+	SYNCED_VLOG_FILES,
 	VALUE_LOCATION_VERSION,
 	VALUE_POINTER_SIZE,
 	VLOG_FORMAT_VERSION,
@@ -986,4 +990,520 @@ fn test_peek_pointer_payload() {
 	let inline_loc = ValueLocation::with_inline_value(b"regular inline value".to_vec());
 	let encoded_inline = inline_loc.encode();
 	assert!(ValueLocation::peek_pointer_payload(&encoded_inline).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// a failed write, a rollover and an fsync
+// ---------------------------------------------------------------------------
+
+fn entry_bytes(key: &[u8], value: &[u8]) -> Vec<u8> {
+	let mut bytes = Vec::new();
+	bytes.extend_from_slice(&(key.len() as u32).to_be_bytes());
+	bytes.extend_from_slice(&(value.len() as u32).to_be_bytes());
+	bytes.extend_from_slice(key);
+	bytes.extend_from_slice(value);
+	let mut hasher = crc32fast::Hasher::new();
+	hasher.update(key);
+	hasher.update(value);
+	bytes.extend_from_slice(&hasher.finalize().to_be_bytes());
+	bytes
+}
+
+fn value_of(seed: u8, len: usize) -> Vec<u8> {
+	(0..len).map(|i| seed.wrapping_add((i % 251) as u8)).collect()
+}
+
+fn header_len() -> usize {
+	VLogFileHeader::new(0, 0, 0).encode().len()
+}
+
+/// The failure points a sweep over `total` bytes tries: the first and last bytes, the bytes
+/// around each of `edges`, and a stride in between.
+fn failure_points(total: usize, edges: &[usize]) -> Vec<usize> {
+	let mut points: Vec<usize> = (0..12).chain(total.saturating_sub(12)..=total).collect();
+	for edge in edges {
+		points.extend(edge.saturating_sub(6)..=edge + 6);
+	}
+	points.extend((0..total).step_by(1_999));
+	points.retain(|point| *point <= total);
+	points.sort_unstable();
+	points.dedup();
+	points
+}
+
+/// A write that fails in the middle of an entry, wherever that is (in the buffer's flush of the
+/// entries before it, or in the write of the entry itself), leaves exactly the entries that were
+/// appended: the file and the buffer are cut back, the entries before it survive whole, and the
+/// entries after it are where their pointers say.
+#[test]
+fn a_failed_append_leaves_exactly_the_entries_that_were_appended() {
+	let dir = TempDir::new().unwrap();
+	// (value length of the entry before the failing one, of the failing one)
+	let shapes = [(100, 100), (8_000, 300), (6_000, 6_000), (6_000, 20_000), (20_000, 20_000)];
+	let (mut failed_appends, mut failed_flushes) = (0, 0);
+	for (shape, (before, failing)) in shapes.into_iter().enumerate() {
+		let total = 8 + 5 + before + 4 + 8 + 5 + failing + 4;
+		let edges = [8 + 5 + before + 4, 8192, 8192 + 13, total - 4];
+		for point in failure_points(total, &edges) {
+			let path = dir.path().join(format!("{shape}_{point}.vlog"));
+			let mut writer =
+				VLogWriter::new(&path, 1, 1 << 30, CompressionType::None as u8).unwrap();
+			let mut expected = Vec::new();
+			let mut pointers = Vec::new();
+			let appends = [
+				(&b"key-a"[..], value_of(1, before)),
+				(&b"key-b"[..], value_of(2, failing)),
+				(&b"key-c"[..], value_of(3, 700)),
+			];
+			writer.fail_writes_after(point);
+			for (key, value) in &appends {
+				match writer.append(key, value) {
+					Ok(pointer) => {
+						expected.push(entry_bytes(key, value));
+						pointers.push(pointer);
+					}
+					Err(_) => failed_appends += 1,
+				}
+			}
+			// Whatever is still buffered reaches the file, and a failed flush is retried.
+			if writer.flush().is_err() {
+				failed_flushes += 1;
+				writer.flush().unwrap();
+			}
+			let after = writer.append(b"key-d", &value_of(4, 50)).unwrap();
+			expected.push(entry_bytes(b"key-d", &value_of(4, 50)));
+			pointers.push(after);
+			writer.flush().unwrap();
+
+			let bytes = std::fs::read(&path).unwrap();
+			let stream: Vec<u8> = expected.concat();
+			assert_eq!(
+				&bytes[header_len()..],
+				stream.as_slice(),
+				"shape {shape}, failure after {point} bytes: the file is not exactly the entries \
+				 that were appended"
+			);
+			assert_eq!(writer.current_offset, bytes.len() as u64, "shape {shape}, point {point}");
+			for (pointer, entry) in pointers.iter().zip(&expected) {
+				let at = pointer.offset as usize;
+				assert_eq!(
+					&bytes[at..at + entry.len()],
+					entry.as_slice(),
+					"shape {shape}, point {point}: a pointer does not point at its entry"
+				);
+			}
+		}
+	}
+	assert!(failed_appends > 100, "the sweep must fail appends: {failed_appends}");
+	assert!(failed_flushes > 10, "the sweep must fail flushes too: {failed_flushes}");
+}
+
+/// A failed append whose cut fails too poisons the writer, which takes no more, and the next
+/// append to the log goes to a new file. What was appended before the failure reads back, and so
+/// does the append after it.
+#[test(tokio::test)]
+async fn a_failed_cut_poisons_the_writer_and_the_next_append_goes_to_a_new_file() {
+	let (vlog, _dir, _) = create_test_vlog(None);
+	let first = vlog.append(b"key-a", &value_of(1, 300)).unwrap();
+	{
+		let mut guard = vlog.writer.write();
+		let writer = guard.as_mut().unwrap();
+		writer.fail_writes_after(100);
+		writer.fail_next_cut_back();
+	}
+	assert!(vlog.writer.write().as_mut().unwrap().append(b"key-b", &value_of(2, 20_000)).is_err());
+	assert!(
+		vlog.writer.write().as_mut().unwrap().append(b"key-c", b"x").is_err(),
+		"a writer whose file could not be cut back takes no append"
+	);
+
+	let third = vlog.append(b"key-d", &value_of(4, 300)).unwrap();
+	assert_ne!(first.file_id, third.file_id, "the poisoned file is not written to again");
+	assert_eq!(vlog.active_writer_id.load(Ordering::SeqCst), third.file_id);
+	vlog.sync().unwrap();
+	assert_eq!(vlog.get(&first).unwrap(), value_of(1, 300));
+	assert_eq!(vlog.get(&third).unwrap(), value_of(4, 300));
+}
+
+fn synced_under(dir: &Path) -> Vec<PathBuf> {
+	SYNCED_VLOG_FILES.lock().iter().filter(|path| path.starts_with(dir)).cloned().collect()
+}
+
+/// A vlog whose files hold two entries of 600 bytes before they roll over, with three entries
+/// appended: two files.
+fn vlog_across_a_rollover() -> (VLog, TempDir, Vec<(ValuePointer, Vec<u8>)>) {
+	let (vlog, dir, _) = create_test_vlog(Some(Options {
+		vlog_max_file_size: 1024,
+		vlog_checksum_verification: VLogChecksumLevel::Full,
+		..Default::default()
+	}));
+	let mut entries = Vec::new();
+	for i in 0..3u8 {
+		let value = value_of(i, 600);
+		entries.push((vlog.append(format!("key-{i}").as_bytes(), &value).unwrap(), value));
+	}
+	assert_eq!(entries[0].0.file_id, entries[1].0.file_id);
+	assert_ne!(entries[1].0.file_id, entries[2].0.file_id, "the third entry rolls the file over");
+	(vlog, dir, entries)
+}
+
+/// The file the writer rolled over from is fsynced by the next sync, once, and not again by the
+/// ones after it.
+#[test(tokio::test)]
+async fn a_sync_fsyncs_the_file_the_writer_rolled_over_from_once() {
+	let (vlog, dir, entries) = vlog_across_a_rollover();
+	let (old, new) = (vlog.vlog_file_path(entries[0].0.file_id), vlog.vlog_file_path(2));
+	assert!(synced_under(dir.path()).is_empty(), "a rollover does not fsync by itself");
+
+	vlog.sync().unwrap();
+	let first = synced_under(dir.path());
+	assert!(first.len() == 2 && first.contains(&old) && first.contains(&new), "{first:?}");
+	vlog.sync().unwrap();
+	assert_eq!(synced_under(dir.path())[2..], [new], "the second sync fsyncs the active file only");
+	for (pointer, value) in &entries {
+		assert_eq!(&vlog.get(pointer).unwrap(), value);
+	}
+}
+
+/// Runs `f` on a thread of its own and waits for it: a call that blocks on a lock the caller
+/// holds fails the test instead of hanging it.
+fn on_another_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+	let (done, wait) = std::sync::mpsc::channel();
+	std::thread::spawn(move || {
+		let _ = done.send(f());
+	});
+	wait.recv_timeout(Duration::from_secs(20)).expect("the call did not return: a lock is held")
+}
+
+/// A rollover that happens while a sync is between taking its fds and fsyncing them queues the
+/// file again, for the bytes the sync may not cover. The sync must leave that entry in the
+/// queue, so that the next one fsyncs the file once more.
+#[test(tokio::test)]
+async fn a_sync_leaves_a_file_that_rolled_over_while_it_ran_queued() {
+	let (vlog, dir, _) = create_test_vlog(Some(Options {
+		vlog_max_file_size: 1024,
+		vlog_checksum_verification: VLogChecksumLevel::Full,
+		..Default::default()
+	}));
+	let vlog = Arc::new(vlog);
+	let first = vlog.append(b"key-0", &value_of(0, 600)).unwrap();
+	let file = vlog.vlog_file_path(first.file_id);
+
+	let appender = Arc::downgrade(&vlog);
+	vlog.set_sync_gap(Some(Arc::new(move || {
+		// Fills the file the sync is about to fsync, and rolls over from it.
+		let appender = appender.upgrade().unwrap();
+		on_another_thread(move || {
+			appender.append(b"key-1", &value_of(1, 600)).unwrap();
+			appender.append(b"key-2", &value_of(2, 600)).unwrap();
+		});
+	})));
+	vlog.sync().unwrap();
+	vlog.set_sync_gap(None);
+	vlog.sync().unwrap();
+
+	let synced = synced_under(dir.path());
+	assert_eq!(
+		synced.iter().filter(|path| **path == file).count(),
+		2,
+		"the file the writer rolled over from during a sync is fsynced by the next one: {synced:?}"
+	);
+}
+
+/// A sync that runs while another has its fds and has not fsynced yet (an Immediate group's sync
+/// during a memtable flush's) fsyncs the file the writer rolled over from itself: it does not
+/// return, and acknowledge a commit, on the strength of an fsync that is still in flight in the
+/// other.
+#[test(tokio::test)]
+async fn a_sync_that_overlaps_another_fsyncs_the_rolled_over_file_itself() {
+	let (vlog, dir, entries) = vlog_across_a_rollover();
+	let vlog = Arc::new(vlog);
+	let (old, new) = (vlog.vlog_file_path(entries[0].0.file_id), vlog.vlog_file_path(2));
+	let seen = Arc::new(Mutex::new(None));
+	let entered = Arc::new(AtomicBool::new(false));
+	let (overlapping, under) = (Arc::downgrade(&vlog), dir.path().to_path_buf());
+	let hook_seen = Arc::clone(&seen);
+	vlog.set_sync_gap(Some(Arc::new(move || {
+		if entered.swap(true, Ordering::SeqCst) {
+			return;
+		}
+		let (overlapping, under) = (overlapping.upgrade().unwrap(), under.clone());
+		*hook_seen.lock().unwrap() = Some(on_another_thread(move || {
+			let before = synced_under(&under).len();
+			overlapping.sync().unwrap();
+			synced_under(&under)[before..].to_vec()
+		}));
+	})));
+	vlog.sync().unwrap();
+
+	let seen = seen.lock().unwrap().take().expect("the second sync ran");
+	assert!(
+		seen.contains(&old),
+		"the overlapping sync did not fsync the rolled over file: {seen:?}"
+	);
+	assert!(seen.contains(&new), "the overlapping sync did not fsync the active file: {seen:?}");
+}
+
+/// A file that is deleted is not fsynced afterwards.
+#[test(tokio::test)]
+async fn a_deleted_file_is_not_fsynced_by_the_next_sync() {
+	let (vlog, dir, entries) = vlog_across_a_rollover();
+	let (old, new) = (vlog.vlog_file_path(entries[0].0.file_id), vlog.vlog_file_path(2));
+	vlog.cleanup_obsolete_files(2).unwrap();
+	assert!(!old.exists());
+	vlog.sync().unwrap();
+	assert_eq!(synced_under(dir.path()), vec![new]);
+}
+
+/// A sync that fails leaves the file the writer rolled over from queued, so the next one
+/// fsyncs it.
+#[test(tokio::test)]
+async fn a_failed_sync_leaves_the_rolled_over_file_queued() {
+	let (vlog, dir, entries) = vlog_across_a_rollover();
+	vlog.fail_next_sync();
+	assert!(vlog.sync().is_err());
+	assert!(synced_under(dir.path()).is_empty());
+
+	vlog.sync().unwrap();
+	let synced = synced_under(dir.path());
+	assert!(synced.contains(&vlog.vlog_file_path(entries[0].0.file_id)), "{synced:?}");
+	assert!(synced.contains(&vlog.vlog_file_path(2)), "{synced:?}");
+}
+
+/// A rollover whose flush of the old file fails is an error, and the old file's entries are not
+/// lost: the writer stays where it is, and the next append rolls over after all.
+#[test(tokio::test)]
+async fn a_failed_flush_at_a_rollover_is_not_swallowed() {
+	let (vlog, _dir, _) = create_test_vlog(Some(Options {
+		vlog_max_file_size: 1024,
+		vlog_checksum_verification: VLogChecksumLevel::Full,
+		..Default::default()
+	}));
+	let values: Vec<Vec<u8>> = (0..3u8).map(|i| value_of(i, 600)).collect();
+	let first = vlog.append(b"key-0", &values[0]).unwrap();
+	let second = vlog.append(b"key-1", &values[1]).unwrap();
+	assert_eq!(first.file_id, second.file_id);
+
+	vlog.fail_writes_after(0);
+	assert!(vlog.append(b"key-2", &values[2]).is_err(), "the flush of the old file failed");
+	assert_eq!(vlog.active_writer_id.load(Ordering::SeqCst), first.file_id);
+	assert!(!vlog.vlog_file_path(first.file_id + 1).exists(), "no new file was started");
+
+	let third = vlog.append(b"key-2", &values[2]).unwrap();
+	assert_ne!(third.file_id, first.file_id);
+	vlog.sync().unwrap();
+	for (pointer, value) in [(&first, &values[0]), (&second, &values[1]), (&third, &values[2])] {
+		assert_eq!(&vlog.get(pointer).unwrap(), value);
+	}
+}
+
+/// A deterministic generator, so a failing seed can be replayed.
+struct Rng(u64);
+
+impl Rng {
+	fn next(&mut self) -> u64 {
+		self.0 ^= self.0 << 13;
+		self.0 ^= self.0 >> 7;
+		self.0 ^= self.0 << 17;
+		self.0
+	}
+
+	fn below(&mut self, n: usize) -> usize {
+		(self.next() % n as u64) as usize
+	}
+}
+
+/// Appends, write failures at any byte, poisoned writers, rollovers (also failed ones), flushes,
+/// syncs and failed syncs in a random order, against a model:
+/// * every file is its header followed by exactly the entries whose append returned `Ok`, each at
+///   the offset its pointer names, and every value reads back;
+/// * a sync that returns `Ok` has fsynced every file that was written to since the last one that
+///   did.
+#[test]
+fn a_random_sequence_of_appends_failures_rollovers_and_syncs_matches_the_model() {
+	let sizes = [0usize, 1, 40, 40, 300, 700, 700, 2_000, 4_000, 8_180, 8_192, 9_000, 15_000];
+	let (mut failed_appends, mut failed_syncs, mut rollovers) = (0, 0, 0);
+	for seed in 1..=4u64 {
+		let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+		let (vlog, dir, _) = create_test_vlog(Some(Options {
+			vlog_max_file_size: 20_000,
+			vlog_checksum_verification: VLogChecksumLevel::Full,
+			..Default::default()
+		}));
+		let mut files: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+		let mut pointers: Vec<(ValuePointer, Vec<u8>)> = Vec::new();
+		let mut dirty: BTreeSet<u32> = BTreeSet::new();
+
+		let sync = |dirty: &mut BTreeSet<u32>| -> bool {
+			let before = synced_under(dir.path()).len();
+			if vlog.sync().is_err() {
+				return false;
+			}
+			let fsynced = synced_under(dir.path())[before..].to_vec();
+			for id in dirty.iter() {
+				assert!(
+					fsynced.contains(&vlog.vlog_file_path(*id)),
+					"seed {seed}: a sync that succeeded did not fsync file {id}, written to \
+					 since the last one that did: {fsynced:?}"
+				);
+			}
+			dirty.clear();
+			true
+		};
+
+		for step in 0..120usize {
+			match rng.below(16) {
+				0..=8 => {
+					let key = format!("key-{step}").into_bytes();
+					let value = value_of(step as u8, sizes[rng.below(sizes.len())]);
+					let result = vlog.append(&key, &value);
+					let active = vlog.active_writer_id.load(Ordering::SeqCst);
+					if active != 0 {
+						dirty.insert(active);
+					}
+					match result {
+						Ok(pointer) => {
+							let file = files.entry(pointer.file_id).or_default();
+							assert_eq!(
+								pointer.offset as usize,
+								header_len() + file.len(),
+								"seed {seed}, step {step}: the pointer is not where the entry goes"
+							);
+							file.extend(entry_bytes(&key, &value));
+							dirty.insert(pointer.file_id);
+							pointers.push((pointer, value));
+						}
+						Err(_) => failed_appends += 1,
+					}
+				}
+				9 | 10 => {
+					if vlog.active_writer_id.load(Ordering::SeqCst) != 0 {
+						// Mostly a failure inside what is buffered, which is the hard case.
+						let after = match rng.below(4) {
+							0 => rng.below(40),
+							1 => rng.below(700),
+							2 => rng.below(9_000),
+							_ => rng.below(20_000),
+						};
+						vlog.fail_writes_after(after);
+					}
+				}
+				11 | 12 => {
+					let _ = vlog.flush();
+				}
+				13 => {
+					if !sync(&mut dirty) {
+						failed_syncs += 1;
+					}
+				}
+				14 => {
+					if let Some(writer) = vlog.writer.write().as_mut() {
+						writer.poison();
+					}
+				}
+				_ => {
+					if vlog.active_writer_id.load(Ordering::SeqCst) != 0 {
+						vlog.fail_next_sync();
+						if !sync(&mut dirty) {
+							failed_syncs += 1;
+						}
+					}
+				}
+			}
+		}
+
+		// Whatever failpoint is still armed fires at most once more: retry until a sync takes.
+		assert!(
+			(0..8).any(|_| sync(&mut dirty)),
+			"seed {seed}: no sync succeeded once the failpoints were spent"
+		);
+
+		rollovers += files.len().saturating_sub(1);
+		for (id, expected) in &files {
+			let bytes = std::fs::read(vlog.vlog_file_path(*id)).unwrap();
+			assert_eq!(
+				&bytes[header_len()..],
+				expected.as_slice(),
+				"seed {seed}: file {id} is not exactly the entries that were appended to it"
+			);
+		}
+		for (pointer, value) in &pointers {
+			assert_eq!(&vlog.get(pointer).unwrap(), value, "seed {seed}: {pointer:?}");
+		}
+	}
+	assert!(failed_appends > 8, "the sequences must fail appends: {failed_appends}");
+	assert!(failed_syncs > 8, "the sequences must fail syncs: {failed_syncs}");
+	assert!(rollovers > 15, "the sequences must roll over: {rollovers}");
+}
+
+/// Appenders that roll the file over all the time, a thread that syncs and a thread that flushes,
+/// at once: nothing deadlocks (the rollover takes the queue lock under the writer lock, the sync
+/// takes it under the writer lock and again after it), every entry reads back, and every file
+/// that holds one has been fsynced by the time the last sync returned.
+#[test]
+fn concurrent_appends_syncs_and_flushes_neither_deadlock_nor_lose_an_entry() {
+	let (vlog, dir, _) = create_test_vlog(Some(Options {
+		vlog_max_file_size: 16 * 1024,
+		vlog_checksum_verification: VLogChecksumLevel::Full,
+		..Default::default()
+	}));
+	let vlog = Arc::new(vlog);
+	let done = Arc::new(AtomicBool::new(false));
+
+	let appended = on_another_thread({
+		let (vlog, done) = (Arc::clone(&vlog), Arc::clone(&done));
+		move || {
+			let appenders: Vec<_> = (0..3u8)
+				.map(|thread| {
+					let vlog = Arc::clone(&vlog);
+					std::thread::spawn(move || {
+						(0..150usize)
+							.map(|i| {
+								let key = format!("t{thread}-{i}").into_bytes();
+								let seed = thread.wrapping_mul(31).wrapping_add(i as u8);
+								let value = value_of(seed, 200 + i * 7);
+								(vlog.append(&key, &value).unwrap(), value)
+							})
+							.collect::<Vec<_>>()
+					})
+				})
+				.collect();
+			let syncer = {
+				let (vlog, done) = (Arc::clone(&vlog), Arc::clone(&done));
+				std::thread::spawn(move || {
+					let mut syncs = 0;
+					while !done.load(Ordering::SeqCst) && syncs < 25 {
+						vlog.sync().unwrap();
+						syncs += 1;
+					}
+				})
+			};
+			let flusher = {
+				let (vlog, done) = (Arc::clone(&vlog), Arc::clone(&done));
+				std::thread::spawn(move || {
+					while !done.load(Ordering::SeqCst) {
+						vlog.flush().unwrap();
+						std::thread::yield_now();
+					}
+				})
+			};
+			let appended: Vec<_> = appenders.into_iter().flat_map(|h| h.join().unwrap()).collect();
+			done.store(true, Ordering::SeqCst);
+			syncer.join().unwrap();
+			flusher.join().unwrap();
+			appended
+		}
+	});
+
+	vlog.sync().unwrap();
+	let synced = synced_under(dir.path());
+	assert_eq!(appended.len(), 450);
+	for (pointer, value) in &appended {
+		assert_eq!(&vlog.get(pointer).unwrap(), value, "{pointer:?}");
+		assert!(
+			synced.contains(&vlog.vlog_file_path(pointer.file_id)),
+			"file {} was never fsynced",
+			pointer.file_id
+		);
+	}
 }
