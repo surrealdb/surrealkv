@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -55,6 +56,41 @@ fn resolve(path: &Path) -> std::io::Result<PathBuf> {
 		}
 	}
 	Ok(resolved)
+}
+
+/// The destinations that the checkpoints of this process are writing, by resolved path.
+static DESTINATIONS: parking_lot::Mutex<BTreeSet<PathBuf>> =
+	parking_lot::Mutex::new(BTreeSet::new());
+
+/// Wakes the checkpoints that wait for a destination when one is released.
+static DESTINATION_RELEASED: parking_lot::Condvar = parking_lot::Condvar::new();
+
+/// The right to write one checkpoint directory. A checkpoint removes and writes the files of the
+/// directory and ends with its metadata file, so two that wrote the same directory at once would
+/// leave the files of one beside the metadata of the other. A checkpoint waits here for the one
+/// that is writing the destination, and the guard is released on every path, errors and panics
+/// included. Taken before any other lock, so that waiting for a destination never holds one.
+struct DestinationGuard {
+	path: PathBuf,
+}
+
+impl DestinationGuard {
+	fn acquire(path: PathBuf) -> Self {
+		let mut busy = DESTINATIONS.lock();
+		while !busy.insert(path.clone()) {
+			DESTINATION_RELEASED.wait(&mut busy);
+		}
+		Self {
+			path,
+		}
+	}
+}
+
+impl Drop for DestinationGuard {
+	fn drop(&mut self) {
+		DESTINATIONS.lock().remove(&self.path);
+		DESTINATION_RELEASED.notify_all();
+	}
 }
 
 /// Keeps `Core::close` and the checkpoints from running at the same time.
@@ -349,7 +385,8 @@ impl DatabaseCheckpoint {
 		}
 	}
 
-	/// Creates a new database checkpoint at the specified directory.
+	/// Creates a new database checkpoint at the specified directory. A checkpoint into a
+	/// directory that another checkpoint of this process is writing waits for it.
 	///
 	/// This creates a consistent point-in-time snapshot that includes:
 	/// - All SSTables from all levels
@@ -377,6 +414,11 @@ impl DatabaseCheckpoint {
 
 		// Before anything is created, flushed or replaced
 		self.check_destination(checkpoint_path)?;
+
+		// One checkpoint at a time writes a directory: the others wait here, holding nothing
+		let _destination = DestinationGuard::acquire(
+			resolve(checkpoint_path).map_err(|e| Error::Io(Arc::new(e)))?,
+		);
 
 		// Create checkpoint directory
 		fs::create_dir_all(checkpoint_path).map_err(|e| Error::Io(Arc::new(e)))?;

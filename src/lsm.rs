@@ -2276,7 +2276,8 @@ impl Tree {
 	/// * `checkpoint_dir` - Directory where the checkpoint will be created. It may exist, holding
 	///   an earlier checkpoint for instance. It must not be the database directory, lie inside it
 	///   or contain it, however it is spelled (links and relative paths are resolved), or the call
-	///   fails with [`Error::InvalidArgument`] before anything is changed.
+	///   fails with [`Error::InvalidArgument`] before anything is changed. Checkpoints of this
+	///   process into the same directory run one after the other.
 	///
 	/// # Returns
 	/// Metadata about the created checkpoint
