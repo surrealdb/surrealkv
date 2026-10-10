@@ -1951,7 +1951,6 @@ async fn a_torn_or_unsupported_metadata_file_is_refused_and_the_target_is_untouc
 /// A metadata file that a power cut left zero-filled (it has its length, and its blocks were never
 /// written) describes no checkpoint: restore refuses it, and the target keeps its data.
 #[test(tokio::test)]
-#[ignore = "restore_from_checkpoint accepts a zero-filled CHECKPOINT_METADATA file as version 0: from_bytes only rejects versions above 1 and restore never calls is_compatible"]
 async fn a_zero_filled_metadata_file_is_refused_and_the_target_is_untouched() {
 	let (source, _dir, _state) = source_with_data(false).await;
 	let out = TempDir::new("ckpt_conc_zeroed").unwrap();

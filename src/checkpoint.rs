@@ -207,8 +207,9 @@ impl CheckpointMetadata {
 			.map_err(|e| Error::Other(format!("Failed to read version: {e}")))?;
 		let version = u32::from_be_bytes(u32_buf);
 
-		// Check if we can handle this version
-		if version > CHECKPOINT_VERSION {
+		// Only the version this build writes is known: a file of version 0 is what a metadata
+		// file that a power cut left zero-filled reads as.
+		if version != CHECKPOINT_VERSION {
 			return Err(Error::Other(format!(
 				"Unsupported checkpoint version: {version}. Current version: {CHECKPOINT_VERSION}"
 			)));
@@ -235,6 +236,15 @@ impl CheckpointMetadata {
 			.read_exact(&mut u64_buf)
 			.map_err(|e| Error::Other(format!("Failed to read total_size: {e}")))?;
 		let total_size = u64::from_be_bytes(u64_buf);
+
+		// The format has a fixed size: more bytes than that are not a metadata file of this version
+		let read = reader.position() as usize;
+		if read != data.len() {
+			return Err(Error::Other(format!(
+				"Invalid checkpoint metadata: {} bytes, expected {read}",
+				data.len()
+			)));
+		}
 
 		Ok(Self {
 			version,
@@ -773,6 +783,25 @@ mod tests {
 		let result = CheckpointMetadata::from_bytes(&future_data);
 		assert!(result.is_err());
 		assert!(result.unwrap_err().to_string().contains("Unsupported checkpoint version"));
+	}
+
+	#[test]
+	fn a_metadata_file_of_version_zero_is_refused() {
+		let error = CheckpointMetadata::from_bytes(&[0u8; 36]).unwrap_err();
+		assert!(error.to_string().contains("Unsupported checkpoint version: 0"), "{error}");
+	}
+
+	#[test]
+	fn a_metadata_file_of_another_size_is_refused() {
+		let bytes = CheckpointMetadata::new(100, 200, 300, 400).to_bytes().unwrap();
+		for len in 0..bytes.len() {
+			assert!(CheckpointMetadata::from_bytes(&bytes[..len]).is_err(), "{len} bytes");
+		}
+		let mut longer = bytes.clone();
+		longer.push(0);
+		let error = CheckpointMetadata::from_bytes(&longer).unwrap_err();
+		assert!(error.to_string().contains("Invalid checkpoint metadata"), "{error}");
+		assert!(CheckpointMetadata::from_bytes(&bytes).is_ok());
 	}
 
 	#[test]
