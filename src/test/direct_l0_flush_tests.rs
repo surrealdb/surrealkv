@@ -1,11 +1,9 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tempdir::TempDir;
 use test_log::test;
 
 use crate::compaction::leveled::Strategy;
-use crate::vlog::ValueLocation;
 use crate::{Options, Tree, TreeBuilder};
 
 fn create_temp_directory() -> TempDir {
@@ -324,10 +322,14 @@ async fn test_direct_l0_flush_advances_log_number_so_wal_segment_is_not_replayed
 	}
 }
 
-/// Regression test: a direct-to-L0 flush must flush every older immutable memtable
-/// first. If it installs its table while an older memtable is still pending, an L0->L1
-/// compaction that runs in between moves the newer table to L1, and the older table
-/// that lands in L0 afterwards shadows it: reads return the older value.
+/// Regression test: a commit written straight to L0 must have every older immutable
+/// memtable flushed before its table is installed. If it installs its table while an
+/// older memtable is still pending, an L0->L1 compaction that runs in between moves the
+/// newer table to L1, and the older table that lands in L0 afterwards shadows it: reads
+/// return the older value.
+///
+/// The commit goes through the commit pipeline, which flushes the queue before it writes
+/// the table, and nothing else flushes here: the background tasks are stopped.
 #[test(tokio::test)]
 async fn test_direct_l0_flush_does_not_let_older_memtable_shadow_it() {
 	let temp_dir = create_temp_directory();
@@ -340,6 +342,8 @@ async fn test_direct_l0_flush_does_not_let_older_memtable_shadow_it() {
 		..Default::default()
 	});
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	let tasks = tree.core.task_manager.lock().unwrap().take().unwrap();
+	tasks.stop().await;
 
 	// Commit the old value, then rotate it into the immutable queue WITHOUT flushing
 	// it to SST, simulating a flush that's still pending.
@@ -353,19 +357,16 @@ async fn test_direct_l0_flush_does_not_let_older_memtable_shadow_it() {
 		let immutables = tree.core.inner.immutable_memtables.read().unwrap();
 		immutables.first().expect("expected a still-unflushed immutable memtable").wal_number
 	};
+	let log_number_before = tree.core.inner.level_manifest.read().unwrap().get_log_number();
+	assert!(log_number_before <= pending_wal_number);
 
-	// Write the new value straight to L0, as a later oversized batch would.
-	let seq = tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1;
-	let mut batch = crate::batch::Batch::new(seq);
-	let value = ValueLocation::with_inline_value(b"new".to_vec()).encode();
-	batch.set(b"key".to_vec(), value, 0).unwrap();
-	let table_id = tree.core.inner.level_manifest.read().unwrap().next_table_id();
-	let batch_wal_number = tree.core.inner.seal_active_wal_segment().unwrap();
-	tree.core
-		.inner
-		.write_batch_direct_to_l0_sst(&batch, table_id, batch_wal_number, u64::MAX)
-		.unwrap();
-	tree.core.inner.visible_seq_num.store(seq, Ordering::Release);
+	// Write the new value straight to L0: it does not fit a memtable.
+	let new_value = vec![b'n'; 128 * 1024];
+	{
+		let mut txn = tree.begin().unwrap();
+		txn.set(b"key", &new_value).unwrap();
+		txn.commit().await.unwrap();
+	}
 
 	assert!(
 		tree.core.inner.immutable_memtables.read().unwrap().is_empty(),
@@ -373,9 +374,9 @@ async fn test_direct_l0_flush_does_not_let_older_memtable_shadow_it() {
 	);
 	let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 	assert!(
-		log_number > batch_wal_number && batch_wal_number >= pending_wal_number,
-		"with nothing older pending, log_number must move past the batch's segment \
-		(log_number={log_number}, batch_wal_number={batch_wal_number})"
+		log_number > pending_wal_number,
+		"with nothing older pending, log_number must move past the flushed memtable's segment \
+		(log_number={log_number}, pending_wal_number={pending_wal_number})"
 	);
 
 	// Compact L0 into L1, then flush whatever is still pending.
@@ -383,7 +384,7 @@ async fn test_direct_l0_flush_does_not_let_older_memtable_shadow_it() {
 	tree.flush().unwrap();
 
 	let txn = tree.begin().unwrap();
-	assert_eq!(txn.get(b"key").unwrap(), Some(b"new".to_vec()));
+	assert_eq!(txn.get(b"key").unwrap(), Some(new_value));
 }
 
 /// Regression test: an oversized memtable that `replay_wal` allocates specifically to

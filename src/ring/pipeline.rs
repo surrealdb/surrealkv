@@ -1467,11 +1467,25 @@ impl CommitPipeline {
 	/// ordered before the table and no later write can land in the segment that
 	/// `write_batch_direct_to_l0_sst` marks as captured. `rest_wal_number` is the oldest segment
 	/// that holds the record of a batch of the group that comes after this one.
+	///
+	/// Reads take a key from the memtables before the tables, so the earlier writes, in the
+	/// memtable just sealed and in any queued ahead of it, are flushed to tables first. Their
+	/// sequence numbers put those tables behind this one, and nothing older is left in memory
+	/// to be read in front of it. A flush that fails fails the commit before its table is
+	/// written, and stops the database if part of the group was applied already, like any other
+	/// failure then (see `stop_database`). The batches of the group applied ahead of this one are
+	/// in a table by then, and the segment that holds the records of the batches that are not
+	/// applied yet stays pinned (`CoreInner::group_wal_pin`), so recovery still finds the group
+	/// whole.
 	fn write_direct_to_l0(&self, batch: &Batch, rest_wal_number: u64) -> Result<()> {
 		let sealed_wal_number = self.inner.seal_active_wal_segment()?;
 		if let Some(ref tm) = self.task_manager {
 			tm.wake_up_memtable();
 		}
+		// The queue shrank by however many were flushed, failed or not.
+		let flushed = self.inner.flush_all_immutables_sync();
+		self.write_stall.signal_work_done();
+		flushed?;
 
 		let table_id = self.inner.level_manifest.read()?.next_table_id();
 		self.inner.write_batch_direct_to_l0_sst(

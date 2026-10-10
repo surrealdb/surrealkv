@@ -31,6 +31,10 @@ pub mod crash_consistency_tests;
 #[cfg(test)]
 pub mod direct_l0_flush_tests;
 #[cfg(test)]
+pub mod direct_l0_group_tests;
+#[cfg(test)]
+pub mod direct_l0_read_order_tests;
+#[cfg(test)]
 pub mod flusher_alloc_diet_tests;
 #[cfg(test)]
 pub mod group_fail_stop_edge_tests;
