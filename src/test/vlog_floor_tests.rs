@@ -25,6 +25,7 @@ use crate::compaction::leveled::Strategy;
 use crate::levels::write_manifest_to_disk;
 use crate::lsm::{cleanup_vlog, vlog_floor, CompactionOperations, FlushHook};
 use crate::memtable::MemTable;
+use crate::ring::PipelineHook;
 use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{Durability, InternalKeyKind, Mode, Options, Tree};
 
@@ -552,7 +553,7 @@ fn a_moved_batch_is_accounted_for_before_its_values_can_be_read() {
 // ---------------------------------------------------------------------------
 
 /// The bound is the smallest file any table or any memtable points into, whichever has it, and
-/// nothing is deleted while no table points into the value log.
+/// nothing is deleted while no table was written.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_bound_is_the_smallest_file_of_any_table_or_memtable() {
 	let dir = TempDir::new("vlog_floor_bound").unwrap();
@@ -637,6 +638,115 @@ async fn the_bound_stays_below_a_queued_memtable_until_its_table_is_registered()
 	flusher.join().unwrap().unwrap();
 	assert_eq!(table_ids(&tree).len(), 2);
 	assert_eq!(floor(&tree), first, "the memtable's table points into its files");
+	crash(&tree);
+}
+
+/// Tables were written and none of them points into the value log (they hold inline values
+/// only): nothing is held back by them, which is not the same as no table having been written.
+/// Whatever a memtable points into is still the bound, and the active file is never taken.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn tables_that_point_nowhere_hold_nothing_back_but_a_fresh_database_deletes_nothing() {
+	let dir = TempDir::new("vlog_floor_nowhere").unwrap();
+	let tree = open(dir.path(), NEVER_ROTATING);
+	assert_eq!(floor(&tree), 0, "no table was written yet");
+
+	commit(&tree, &[(b"inline".to_vec(), small(0, 1))], Durability::Immediate).await.unwrap();
+	flush_to_tables(&tree);
+	assert_eq!(table_ids(&tree).len(), 1);
+	assert_eq!(tables_min(&tree), 0, "the table points into no file");
+	assert_eq!(floor(&tree), u32::MAX, "tables were written and nothing points into the log");
+
+	// What an unflushed memtable points into is kept, as before.
+	put(&tree, 0..4, 1).await;
+	let first = vlog_files(dir.path())[0];
+	assert_eq!(floor(&tree), first, "an active memtable");
+
+	// The active file is never taken, whatever the bound is.
+	tree.core.inner.vlog.as_ref().unwrap().cleanup_obsolete_files(u32::MAX).unwrap();
+	assert_eq!(
+		vlog_files(dir.path()),
+		vec![tree.core.inner.vlog.as_ref().unwrap().active_writer_id.load(Ordering::SeqCst)]
+	);
+	crash(&tree);
+}
+
+/// A table that was opened from disk and names no file may point into the log all the same, as
+/// the tables of a database written by an older version do: nothing is deleted until a
+/// compaction has written the table again.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_table_opened_from_disk_that_names_no_file_keeps_the_log_until_it_is_rewritten() {
+	let root = TempDir::new("vlog_floor_unknown").unwrap();
+	let live = root.path().join("live");
+	let tree = quiet_tree(&live).await;
+	for round in 1..=2 {
+		commit(&tree, &[(key_of(round), small(round, 1))], Durability::Immediate).await.unwrap();
+		flush_to_tables(&tree);
+	}
+	// Files that nothing points into: the restart cannot tell them from the files of a table
+	// that does not say.
+	roll_past(&tree, 3);
+	let files = vlog_files(&live);
+	assert!(files.len() >= 3, "files nothing points into: {files:?}");
+	let image = root.path().join("image");
+	copy_dir_all(&live, &image);
+	crash(&tree);
+
+	let reopened = quiet_tree(&image).await;
+	assert_eq!(floor(&reopened), 0, "the tables were opened from disk");
+	cleanup(&reopened);
+	assert_eq!(vlog_files(&image), files, "nothing was deleted");
+
+	// The compaction writes the tables again, and they say what they point into.
+	compact(&reopened);
+	assert_eq!(floor(&reopened), u32::MAX);
+	cleanup(&reopened);
+	assert_eq!(
+		vlog_files(&image),
+		vec![reopened.core.inner.vlog.as_ref().unwrap().active_writer_id.load(Ordering::SeqCst)],
+		"only the active file is left"
+	);
+	crash(&reopened);
+}
+
+/// A commit group whose values are in the value log and in no memtable or table yet, while a
+/// cleanup finds nothing that points into the log (the tables hold inline values only): the bound
+/// is above every file, and only the pin of the group keeps the files that the group rolled over
+/// from. The cleanup runs where the group has been logged and nothing is applied.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_cleanup_that_finds_nothing_pointing_into_the_log_keeps_the_files_of_a_group_in_flight() {
+	let root = TempDir::new("vlog_floor_in_flight").unwrap();
+	let live = root.path().join("live");
+	let tree = quiet_tree(&live).await;
+	commit(&tree, &[(b"inline".to_vec(), small(0, 1))], Durability::Immediate).await.unwrap();
+	flush_to_tables(&tree);
+	assert_eq!(floor(&tree), u32::MAX, "nothing points into the log");
+
+	let during = Arc::new(Mutex::new(None));
+	{
+		let inner = Arc::clone(&tree.core.inner);
+		let (during, live) = (Arc::clone(&during), live.clone());
+		tree.core.commit_pipeline.set_hook(Some(Arc::new(move |point| {
+			if let PipelineHook::AfterWalSync {
+				..
+			} = point
+			{
+				cleanup_vlog(
+					&inner.vlog,
+					&inner.active_memtable,
+					&inner.level_manifest,
+					&inner.immutable_memtables,
+					"in flight",
+				);
+				*during.lock().unwrap() = Some(vlog_files(&live));
+			}
+		})));
+	}
+	let written = put(&tree, 0..6, 1).await;
+	tree.core.commit_pipeline.set_hook(None);
+
+	let during = during.lock().unwrap().take().expect("the group was logged");
+	assert!(during.len() >= 3, "the group rolled over: {during:?}");
+	assert_reads(&tree, &written, "after the commit");
 	crash(&tree);
 }
 

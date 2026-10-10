@@ -466,8 +466,9 @@ impl LevelManifest {
 		let file_size = file.size()?;
 
 		// Create and return the table
-		let table = Arc::new(Table::new(table_id, opts, file, file_size)?);
-		Ok(table)
+		let mut table = Table::new(table_id, opts, file, file_size)?;
+		table.vlog_pointers_unknown = table.meta.properties.oldest_vlog_file_id == 0;
+		Ok(Arc::new(table))
 	}
 
 	fn depth(&self) -> u8 {
@@ -498,6 +499,29 @@ impl LevelManifest {
 			})
 			.min()
 			.unwrap_or(0)
+	}
+
+	/// What the tables say about the value log, for [`crate::lsm::vlog_floor`]. The smallest file
+	/// any of them points into, and if none does:
+	/// - `u32::MAX`, when tables were written and none points into the log: nothing is held back by
+	///   them, and the files that nothing else points into can go;
+	/// - 0, when no table was written yet (a fresh database), or a table that was opened from disk
+	///   does not name a file and may point into the log all the same, see
+	///   `Table::vlog_pointers_unknown`: nothing is deleted. The table of a database written by an
+	///   older version is that, until a compaction rewrites it.
+	///
+	/// A table was written once `last_sequence` is above 0: it follows the tables that are
+	/// registered, and stays when they are compacted away. The ids of tables are no sign of it,
+	/// they are handed out when a memtable is rotated.
+	pub(crate) fn vlog_floor_of_tables(&self) -> u32 {
+		match self.min_oldest_vlog_file_id() {
+			0 if self.last_sequence > 0
+				&& !self.iter().any(|table| table.vlog_pointers_unknown) =>
+			{
+				u32::MAX
+			}
+			oldest => oldest,
+		}
 	}
 
 	pub(crate) fn get_all_tables(&self) -> HashMap<u64, Arc<Table>> {

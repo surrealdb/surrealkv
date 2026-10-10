@@ -2170,8 +2170,6 @@ async fn the_value_log_stays_within_a_small_multiple_of_the_live_data_under_chur
 /// Deleting every key and compacting leaves no value that anything can read: the value log
 /// shrinks to the active file.
 #[test(tokio::test)]
-#[ignore = "when every key is deleted no table points into the value log, the bound is 0 and the \
-            cleanup does nothing: the files of the deleted values are never removed"]
 async fn deleting_every_value_lets_the_value_log_shrink_to_the_active_file() {
 	let dir = TempDir::new("vlog_gc_delete_all").unwrap();
 	let tree = quiet_tree(dir.path()).await;

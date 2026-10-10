@@ -1266,8 +1266,9 @@ impl VLog {
 	///
 	/// A vlog file is safe to delete when:
 	/// - Its file_id < min_oldest_vlog (no SST and no unflushed memtable has a value in it, see
-	///   `lsm::vlog_floor`)
-	/// - It is not the active writer
+	///   `lsm::vlog_floor`, and no commit group is about to, see
+	///   [`unregistered_floor`](Self::unregistered_floor))
+	/// - It is below the active writer's file
 	/// - No iterators are active
 	/// - No [`VLogPin`] is held
 	///
@@ -1279,12 +1280,15 @@ impl VLog {
 			return Ok(());
 		}
 
-		let active = self.active_writer_id.load(Ordering::SeqCst);
+		// The bound is capped at the active file, the newest one that can be deleted: a rollover
+		// registers the file it creates before it makes it the active one, and a bound of
+		// `u32::MAX` (nothing points into the log) would otherwise take that file along.
+		let bound = min_oldest_vlog.min(self.active_writer_id.load(Ordering::SeqCst));
 
 		// Collect files that are safe to delete
 		let to_delete: Vec<u32> = {
 			let files_map = self.files_map.read();
-			files_map.keys().filter(|&&id| id < min_oldest_vlog && id != active).copied().collect()
+			files_map.keys().filter(|&&id| id < bound).copied().collect()
 		};
 
 		if to_delete.is_empty() {

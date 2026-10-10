@@ -2788,8 +2788,11 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 // ===== VLog and Versioned Index Cleanup Helpers =====
 
 /// The bound of a VLog cleanup: the smallest file id that a table or a memtable that is not
-/// flushed yet points into. A file below it holds nothing that can be read any more. It is 0,
-/// and nothing is deleted, while no table points into the VLog.
+/// flushed yet points into. A file below it holds nothing that can be read any more. It is
+/// `u32::MAX` when tables were written and nothing points into the VLog, any more or ever: every
+/// file but the active one is below it, see [`cleanup_vlog`]. It is 0, and nothing is deleted,
+/// while no table was written yet, or a table opened from disk may point into the VLog without
+/// saying so, see `LevelManifest::vlog_floor_of_tables`.
 ///
 /// The active slot is read-locked first and stays locked until the end, then the manifest and the
 /// queue, together, in the order a flush takes them in. The slot is read last: a batch applied
@@ -2816,7 +2819,7 @@ pub(crate) fn vlog_floor(
 		.min_vlog_file_id()
 		.into_iter()
 		.chain(queued)
-		.fold(manifest.min_oldest_vlog_file_id(), u32::min))
+		.fold(manifest.vlog_floor_of_tables(), u32::min))
 }
 
 /// Cleans up obsolete VLog files.
@@ -2849,7 +2852,8 @@ pub(crate) fn cleanup_vlog(
 		}
 	};
 
-	// Skip cleanup if no table references VLog files yet (fresh database case)
+	// Nothing is below 0: no table was written yet (fresh database), or one may point into the
+	// VLog without saying so.
 	if floor == 0 {
 		return;
 	}
