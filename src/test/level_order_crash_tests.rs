@@ -34,8 +34,11 @@
 //! * the next-level tables that share only a boundary key with a compaction's input, and the
 //!   versions that snapshots retain, which an output must not cut in two
 //!   (`a_compaction_takes_the_next_level_tables...`, `all_the_versions_of_a_key...`), and a
-//!   bottom-level table that a range delete emptied (`a_bottom_level_table_emptied...`, and the
-//!   ignored `a_scan_works_in_a_tree_with_a_bottom_level_table_emptied...`);
+//!   bottom-level table that a range delete emptied, which leaves a table with a range deletion and
+//!   no point that point reads and scans must get through (`a_bottom_level_table_emptied...`,
+//!   `a_scan_works_in_a_tree_with_a_bottom_level_table_emptied...`,
+//!   `a_read_past_the_last_key_works_in_a_level_whose_last_table_has_no_points`, and the next
+//!   compaction into that level, `a_compaction_into_a_bottom_level_that_holds_a_table_without...`);
 //! * L0 order across a restart: a compaction of a subset of L0, the WAL segments of several
 //!   memtables flushed by recovery, a flush after the reopen (`the_remaining_l0_tables...`,
 //!   `recovery_flushes_of_several_wal_segments...`, `a_flush_after_a_reopen...`);
@@ -43,8 +46,9 @@
 //!   (`the_manifest_on_disk_lists_l0...`); `last_sequence` is restored so that a write after a
 //!   reopen outranks every table (`last_sequence_is_restored...`);
 //! * a memtable that holds only a range deletion, flushed and compacted into L1, and the range
-//!   delete whose end key is one byte long, which cannot be flushed (`a_memtable_holding...`,
-//!   `a_range_delete_flushed_on_its_own...`);
+//!   delete whose end key is one byte long, or longer than the value log threshold, which is
+//!   flushed as it is (`a_memtable_holding...`, `a_range_delete_flushed_on_its_own...`,
+//!   `a_range_delete_with_an_end_key_above...`);
 //! * a deterministic randomised sweep against a `BTreeMap` model, one test per seed
 //!   (`sweep_seed_*`).
 //!
@@ -666,7 +670,8 @@ fn sst_ids_on_disk(dir: &Path) -> BTreeSet<u64> {
 /// * L0 is ordered by the rule of `Level::insert`: the largest sequence number of a table, newest
 ///   first;
 /// * the tables of L1 and deeper that hold point keys are sorted by smallest key, and their key
-///   ranges are pairwise disjoint (all versions of a key are in one table);
+///   ranges are pairwise disjoint (all versions of a key are in one table), and the tables without
+///   points (a range deletion and nothing else) come after all of them;
 /// * the key range and the sequence range in the metadata of a table are what the table holds, and
 ///   `last_sequence` is at least the largest sequence number of every table;
 /// * the manifest on disk lists what the manifest in memory does, and its `next_table_id` is past
@@ -732,6 +737,13 @@ fn check_invariants(tree: &Tree, ctx: &str) {
 					String::from_utf8_lossy(&prev.user_key),
 					pair[1].id,
 					String::from_utf8_lossy(&next.user_key)
+				);
+			}
+			if let Some(first) = level.tables.iter().position(|t| !t.has_points()) {
+				assert!(
+					level.tables[first..].iter().all(|t| !t.has_points()),
+					"{ctx}: L{li} has a table with points after the table {} without points",
+					level.tables[first].id
 				);
 			}
 		}
@@ -2003,9 +2015,12 @@ fn tables_without_points(tree: &Tree) -> usize {
 
 /// In the bottom level a compaction drops the entry of a range delete once it has dropped what the
 /// range delete covered, and a table whose every key was covered comes out with no point at all:
-/// only the range delete in its metadata. Such a table has no key range, and the tables of the
-/// level on either side of it must stay reachable by point reads, in the live tree and in a copy
-/// that is reopened. (A scan over such a tree is the subject of the ignored test below.)
+/// only the range delete in its metadata. The compaction keeps it: it takes the tables of the
+/// level that overlap the one point the range delete has (its start key), and the tables it did
+/// not take, or the levels above, may hold other keys of the range. Such a table has no key range,
+/// and the tables of the level on either side of it must stay reachable by point reads, in the
+/// live tree and in a copy that is reopened. (A scan over such a tree is the subject of a test
+/// below.)
 #[test(tokio::test)]
 async fn a_bottom_level_table_emptied_by_a_range_delete_leaves_the_tables_around_it_readable() {
 	let (mut db, keys, bounds) = db_with_a_split_bottom_level().await;
@@ -2047,12 +2062,10 @@ async fn a_bottom_level_table_emptied_by_a_range_delete_leaves_the_tables_around
 }
 
 /// The point read of a key that sorts after every key of the bottom level, in a bottom level whose
-/// last table has no points. The level is searched by the end keys of its tables, a table without
-/// points has none and is taken to be the one that could hold the key, and the read opens it: it
-/// fails with `EmptyCorruptPartitionedIndex` instead of finding nothing, on both read paths.
+/// last table has no points. The level is searched by the end keys of its tables, and a table
+/// without points has none: the read has to find nothing, on both read paths, and not open that
+/// table (it has no index to search, which a read of it reports as `EmptyCorruptPartitionedIndex`).
 #[test(tokio::test)]
-#[ignore = "a point read of a key past the last key of a level fails with EmptyCorruptPartitionedIndex \
-            when the last table of the level has a range delete and no point"]
 async fn a_read_past_the_last_key_works_in_a_level_whose_last_table_has_no_points() {
 	let (mut db, _keys, bounds) = db_with_a_split_bottom_level().await;
 	let (first, end) = (bounds[1].0.clone(), bounds[2].0.clone());
@@ -2074,12 +2087,10 @@ async fn a_read_past_the_last_key_works_in_a_level_whose_last_table_has_no_point
 }
 
 /// The scan of the tree of the test above: a table with only a range delete in it has no data
-/// blocks, and a scan that opens an iterator on it fails with `EmptyCorruptPartitionedIndex`
-/// (point reads never open one), so no range scan works any more once a compaction made such a
-/// table. The compaction itself writes the table on purpose (it keeps the range delete).
+/// blocks, and an iterator on it has to be empty, not to fail with `EmptyCorruptPartitionedIndex`
+/// (a point read never opens an iterator), or no range scan would work any more once a compaction
+/// made such a table. The compaction writes the table on purpose (it keeps the range delete).
 #[test(tokio::test)]
-#[ignore = "a scan fails with EmptyCorruptPartitionedIndex once a bottom-level compaction has left \
-            a table with a range delete and no point"]
 async fn a_scan_works_in_a_tree_with_a_bottom_level_table_emptied_by_a_range_delete() {
 	let (mut db, _keys, bounds) = db_with_a_split_bottom_level().await;
 	let (first, end) = (bounds[1].0.clone(), bounds[2].0.clone());
@@ -2096,6 +2107,43 @@ async fn a_scan_works_in_a_tree_with_a_bottom_level_table_emptied_by_a_range_del
 	drop(iter);
 	assert_scan_in(&txn, &db.model, "a table without points in L3");
 	drop(txn);
+	finish(db.tree);
+}
+
+/// A table without points in the bottom level overlaps every range, so that the next compaction
+/// into that level takes it: its range delete goes on in the outputs, and a key written after the
+/// range delete, inside its range, stays visible while the covered ones stay deleted. The
+/// compaction must read the table (an iterator over it is empty), and the invariants hold at every
+/// step, in the live tree and after a reopen.
+#[test(tokio::test)]
+async fn a_compaction_into_a_bottom_level_that_holds_a_table_without_points_merges_it() {
+	let (mut db, _keys, bounds) = db_with_a_split_bottom_level().await;
+	let (first, end) = (bounds[1].0.clone(), bounds[2].0.clone());
+	db.del_range(&first, &end).await;
+	db.flush();
+	db.compact_level(0);
+	db.compact_level(1);
+	db.compact_level(2);
+	assert_eq!(tables_without_points(&db.tree), 1);
+	check_invariants(&db.tree, "a table without points in L3");
+
+	// Newer than the range delete: inside its range, and past the last key of the level.
+	let inside = format!("{first}x");
+	db.put_padded(&inside, "new", 300).await;
+	db.put_padded("n99", "last", 300).await;
+	db.flush();
+	db.compact_level(0);
+	db.compact_level(1);
+	db.compact_level(2);
+	assert_eq!(tables_without_points(&db.tree), 0, "the compaction merged it: {:?}", db.layout());
+	check_invariants(&db.tree, "after the compaction into L3");
+	assert_eq!(db.get(&inside).as_deref(), Some(value_of(&inside, "new", 300).as_slice()));
+	assert_eq!(db.get(&first), None, "the range delete still hides what it covered");
+	let txn = db.tree.begin_with_mode(Mode::ReadOnly).unwrap();
+	assert_point_reads_in(&txn, &db.model, &db.universe, "after the compaction into L3").await;
+	assert_scan_in(&txn, &db.model, "after the compaction into L3");
+	drop(txn);
+	verify(&db.image("a table without points merged away"), Shape::SPLIT).await;
 	finish(db.tree);
 }
 
@@ -2131,22 +2179,25 @@ struct SweepKind {
 	max_bytes_for_level: u64,
 	/// Whether the workload has range deletes.
 	range_deletes: bool,
+	/// Whether the compactions of the workload reach the bottom level.
+	reaches_bottom: bool,
 }
 
 impl SweepKind {
 	/// Three levels and a small L1: the compactions reach the bottom level, where tombstones are
-	/// dropped. No range deletes: a range delete compacted into the bottom level can leave a
-	/// table with no points, which a scan cannot read (see the ignored tests above).
+	/// dropped and range deletes are compacted.
 	const BOTTOM: SweepKind = SweepKind {
 		shape: Shape::SPLIT_SHALLOW,
 		max_bytes_for_level: 1024,
-		range_deletes: false,
+		range_deletes: true,
+		reaches_bottom: true,
 	};
 	/// Four levels, range deletes: the compactions reach L2 at most, never the bottom level.
 	const SHALLOW: SweepKind = SweepKind {
 		shape: Shape::SPLIT,
 		max_bytes_for_level: 4096,
 		range_deletes: true,
+		reaches_bottom: false,
 	};
 }
 
@@ -2337,7 +2388,7 @@ async fn sweep(seed: u64, kind: SweepKind) -> SweepStats {
 		stats.stage_images >= 4,
 		"seed {seed:#x} took no images inside a compaction: {stats:?}"
 	);
-	if !kind.range_deletes {
+	if kind.reaches_bottom {
 		let bottom = kind.shape.level_count as usize - 1;
 		assert_eq!(
 			stats.deepest, bottom,

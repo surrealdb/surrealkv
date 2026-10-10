@@ -1144,6 +1144,10 @@ impl Table {
 		&self,
 		key: &InternalKey,
 	) -> Result<Option<(InternalKey, Value)>> {
+		if self.holds_only_range_deletions() {
+			return Ok(None);
+		}
+
 		let key_encoded = key.encode();
 
 		// Step 1: Bloom filter for early rejection
@@ -1224,7 +1228,26 @@ impl Table {
 		self.has_range_deletions.load(std::sync::atomic::Ordering::Relaxed)
 	}
 
+	/// Whether the table holds point entries.
+	pub(crate) fn has_points(&self) -> bool {
+		self.meta.smallest_point.is_some() || self.meta.properties.num_entries > 0
+	}
+
+	/// Whether the table holds range deletions and nothing else.
+	///
+	/// A compaction into the bottom level that drops every point but keeps a range deletion
+	/// writes such a table: no data block, an empty index and no key range. Its range deletions
+	/// are read from the metadata of every table, so a point read or a scan has nothing to look
+	/// for in it, and it reads as empty. A table with no entry of any kind is never written, and
+	/// the reads of one still report its empty index as corrupt.
+	pub(crate) fn holds_only_range_deletions(&self) -> bool {
+		!self.has_points() && !self.meta.range_deletions.is_empty()
+	}
+
 	pub(crate) fn is_user_key_in_range(&self, key: &[u8]) -> bool {
+		if self.holds_only_range_deletions() {
+			return false;
+		}
 		let Some(smallest) = &self.meta.smallest_point else {
 			return true;
 		};
@@ -1237,6 +1260,10 @@ impl Table {
 	}
 
 	pub(crate) fn get(&self, key: &InternalKey) -> Result<Option<(InternalKey, Value)>> {
+		if self.holds_only_range_deletions() {
+			return Ok(None);
+		}
+
 		let key_encoded = key.encode();
 
 		// Step 1: Bloom filter for early rejection
@@ -1767,6 +1794,11 @@ impl<'a> TableIterator<'a> {
 	///
 	/// Edge case: If ("apple", 0) actually exists, we land on it and advance.
 	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
+		// A table of range deletions alone has no data block to position on.
+		if self.table.holds_only_range_deletions() {
+			self.mark_exhausted();
+			return Ok(());
+		}
 		self.exhausted = false;
 
 		let lower_bound = self.range.0.clone();
@@ -1859,6 +1891,10 @@ impl<'a> TableIterator<'a> {
 	/// Result: ("apple", 3) - last entry with user_key < "banana" ✓
 	/// ```
 	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
+		if self.table.holds_only_range_deletions() {
+			self.mark_exhausted();
+			return Ok(());
+		}
 		self.exhausted = false;
 
 		let upper_bound = self.range.1.clone();
@@ -2011,6 +2047,10 @@ impl<'a> TableIterator<'a> {
 
 impl LSMIterator for TableIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
+		if self.table.holds_only_range_deletions() {
+			self.mark_exhausted();
+			return Ok(false);
+		}
 		self.exhausted = false;
 		self.seek_internal(target)?;
 

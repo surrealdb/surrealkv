@@ -653,8 +653,11 @@ impl<'a> KMergeIterator<'a> {
 				// Level 0: Tables can overlap, so we check all but skip those completely
 				// outside range
 				for table in &level.tables {
-					// Skip tables completely before or after the range
-					if table.is_before_range(&query_range) || table.is_after_range(&query_range) {
+					// Skip tables completely before or after the range, and those without points
+					if !table.has_points()
+						|| table.is_before_range(&query_range)
+						|| table.is_after_range(&query_range)
+					{
 						continue;
 					}
 					// Skip tables outside timestamp range (if specified)
