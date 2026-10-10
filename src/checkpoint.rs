@@ -413,6 +413,12 @@ impl DatabaseCheckpoint {
 		// Step 2: Get current sequence number from the manifest
 		let sequence_number = levels_guard.get_last_sequence();
 
+		// An earlier checkpoint's metadata file would make this directory look finished while
+		// its files are replaced one by one, and an interrupted checkpoint would restore with
+		// the values of the old one missing. It goes before anything is copied, and the new one
+		// is written after everything else.
+		self.remove_stale_metadata(checkpoint_path)?;
+
 		// Step 3: Create checkpoint subdirectories
 		let sstables_dir = checkpoint_path.join("sstables");
 		let wal_dir = checkpoint_path.join("wal");
@@ -438,7 +444,16 @@ impl DatabaseCheckpoint {
 		// Step 7: Copy VLog directories if enabled
 		let vlog_size = self.copy_vlog_directories(checkpoint_path)?;
 
-		// Step 8: Create checkpoint metadata
+		// Step 8: Make the files of the checkpoint durable before the metadata that says they are
+		// all there
+		for dir in ["sstables", "wal", "manifest", "vlog"] {
+			sync_below(&checkpoint_path.join(dir)).map_err(|e| Error::Io(Arc::new(e)))?;
+		}
+		// The names of those directories are entries of this one: synced here, so that the
+		// metadata file cannot be on disk without them
+		fsync_directory(checkpoint_path).map_err(|e| Error::Io(Arc::new(e)))?;
+
+		// Step 9: Create checkpoint metadata
 		let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
 		let metadata = CheckpointMetadata::new(
@@ -448,7 +463,7 @@ impl DatabaseCheckpoint {
 			sstables_size + manifest_size + vlog_size,
 		);
 
-		// Step 9: Write metadata file
+		// Step 10: Write metadata file
 		self.write_checkpoint_metadata(checkpoint_path, &metadata)?;
 
 		Ok(metadata)
@@ -797,18 +812,36 @@ impl DatabaseCheckpoint {
 		Ok(())
 	}
 
-	/// Writes checkpoint metadata to a file
+	/// Removes the metadata file of an earlier checkpoint in `checkpoint_dir`, and makes the
+	/// removal durable before the files it described are replaced.
+	fn remove_stale_metadata(&self, checkpoint_dir: &Path) -> Result<()> {
+		let io = |e| Error::Io(Arc::new(e));
+		match fs::remove_file(checkpoint_dir.join(CHECKPOINT_METADATA_FILE)) {
+			Ok(()) => {}
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+			Err(e) => return Err(io(e)),
+		}
+		fsync_directory(checkpoint_dir).map_err(io)
+	}
+
+	/// Writes checkpoint metadata to a file, and syncs it and the directories that name it
 	fn write_checkpoint_metadata(
 		&self,
 		checkpoint_dir: &Path,
 		metadata: &CheckpointMetadata,
 	) -> Result<()> {
+		let io = |e| Error::Io(Arc::new(e));
 		let metadata_path = checkpoint_dir.join(CHECKPOINT_METADATA_FILE);
-		let mut file = File::create(&metadata_path).map_err(|e| Error::Io(Arc::new(e)))?;
+		let mut file = File::create(&metadata_path).map_err(io)?;
 
 		let data = metadata.to_bytes()?;
-		file.write_all(&data).map_err(|e| Error::Io(Arc::new(e)))?;
-		file.flush().map_err(|e| Error::Io(Arc::new(e)))?;
+		file.write_all(&data).map_err(io)?;
+		file.sync_all().map_err(io)?;
+		fsync_directory(checkpoint_dir).map_err(io)?;
+		// The checkpoint directory itself, if this checkpoint created it
+		if let Some(parent) = checkpoint_dir.parent() {
+			fsync_directory(parent).map_err(io)?;
+		}
 
 		Ok(())
 	}

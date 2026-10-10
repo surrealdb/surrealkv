@@ -1991,9 +1991,6 @@ async fn a_checkpoint_with_an_empty_manifest_is_refused_and_the_target_is_untouc
 /// a restore of such an image does, it must not hand out a state that is neither the older
 /// checkpoint nor the newer one: it is refused, or every value is there.
 #[test(tokio::test)]
-#[ignore = "an interrupted checkpoint over an older one in the same directory keeps the old metadata \
-            file, so restore accepts a manifest that points into value-log files the interrupted \
-            checkpoint did not copy yet"]
 async fn an_interrupted_checkpoint_over_an_older_one_is_refused_or_restores_a_whole_state() {
 	let dir = TempDir::new("ckpt_conc_reuse_crash").unwrap();
 	let out = TempDir::new("ckpt_conc_reuse_crash_out").unwrap();
@@ -2018,10 +2015,15 @@ async fn an_interrupted_checkpoint_over_an_older_one_is_refused_or_restores_a_wh
 	tree.create_checkpoint(&cp).unwrap();
 	assert_eq!(images.calls.load(Ordering::SeqCst), 2);
 	clear_hooks(&tree);
-	assert!(
-		images.at_manifest.join("CHECKPOINT_METADATA").exists(),
-		"the older metadata file is still there at the second stage"
-	);
+	// The older metadata file is gone before anything is copied, so the directory is no
+	// checkpoint until the new one is complete.
+	for image in [&images.at_sstables, &images.at_manifest] {
+		assert!(
+			!image.join("CHECKPOINT_METADATA").exists(),
+			"the older metadata file is still there at {}",
+			image.display()
+		);
+	}
 
 	for (name, image) in
 		[("after_the_tables", &images.at_sstables), ("after_the_manifest", &images.at_manifest)]
@@ -2416,5 +2418,43 @@ async fn a_checkpoint_into_a_directory_that_holds_another_history_with_the_same_
 		finish(copy).await;
 		finish(other).await;
 		finish(tree).await;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 8. what a checkpoint makes durable
+// ---------------------------------------------------------------------------
+
+/// The directories that hold the files of a checkpoint, the checkpoint's own, and the one that
+/// holds it are synced by the time the call returns, so that the names of the files are on disk
+/// with the metadata file that says they are all there.
+#[test(tokio::test)]
+async fn a_checkpoint_syncs_the_directories_that_hold_its_files() {
+	for vlog in [false, true] {
+		let (source, _dir, _state) = source_with_data(vlog).await;
+		let out = TempDir::new("ckpt_conc_sync").unwrap();
+		let cp = out.path().join("cp");
+		source.create_checkpoint(&cp).unwrap();
+		let synced = crate::lsm::SYNCED_DIRECTORIES.lock().clone();
+		let mut dirs = vec![
+			out.path().to_path_buf(),
+			cp.clone(),
+			cp.join("sstables"),
+			cp.join("wal"),
+			cp.join("manifest"),
+		];
+		if vlog {
+			dirs.push(cp.join("vlog"));
+		}
+		for dir in dirs {
+			let dir = dir.canonicalize().unwrap();
+			assert!(synced.contains(&dir), "vlog {vlog}: {} was not synced", dir.display());
+		}
+		// Once before the metadata file is written, for the names of the directories, and once
+		// after it, for the name of the file.
+		let root = cp.canonicalize().unwrap();
+		let syncs = synced.iter().filter(|dir| **dir == root).count();
+		assert!(syncs >= 2, "vlog {vlog}: the checkpoint directory was synced {syncs} time(s)");
+		finish(source).await;
 	}
 }
