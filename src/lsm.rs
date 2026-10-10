@@ -1429,6 +1429,18 @@ impl Core {
 		Ok(())
 	}
 
+	/// Test-only: ends the flusher and the background tasks the way a crash does, so that a tree
+	/// a test abandons does not stay alive until the runtime is dropped.
+	#[cfg(all(test, not(target_arch = "wasm32")))]
+	pub(crate) fn abort_background_tasks(&self) {
+		if let Some(handle) = self.flusher_handle.lock().unwrap().take() {
+			handle.abort();
+		}
+		if let Some(task_manager) = self.task_manager.lock().unwrap().take() {
+			task_manager.abort();
+		}
+	}
+
 	/// Safely closes the LSM tree by shutting down all components in the
 	/// correct order.
 	///

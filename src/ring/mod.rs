@@ -5,6 +5,8 @@ mod queue;
 mod sync;
 
 pub(crate) use pipeline::CommitPipeline;
+#[cfg(test)]
+pub(crate) use pipeline::PipelineHook;
 
 /// The commit ring's capacity, for tests that need to lap it.
 #[cfg(test)]

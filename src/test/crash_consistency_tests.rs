@@ -15,9 +15,7 @@ use test_log::test;
 
 use crate::batch::Batch;
 use crate::compaction::leveled::Strategy;
-use crate::lsm::CoreInner;
-use crate::ring::CommitPipeline;
-use crate::storage::{AffinityLogStore, BoxFuture, LogStore};
+use crate::ring::PipelineHook;
 use crate::vfs::sync_tracker;
 use crate::{Error, Options, Tree};
 
@@ -312,42 +310,6 @@ async fn crash_after_memtable_fills_mid_group_must_not_lose_the_rest_of_the_grou
 	}
 }
 
-/// A WAL log store that rotates the memtable and flushes it right after its first
-/// append, the way a concurrent `create_checkpoint` can.
-struct RotateAfterFirstAppend {
-	log_store: AffinityLogStore,
-	core: Arc<CoreInner>,
-	fired: AtomicBool,
-}
-
-impl std::fmt::Debug for RotateAfterFirstAppend {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("RotateAfterFirstAppend").finish()
-	}
-}
-
-impl LogStore for RotateAfterFirstAppend {
-	fn append(&self, data: &[u8]) -> BoxFuture<'_, u64> {
-		let append = self.log_store.append(data);
-		Box::pin(async move {
-			let offset = append.await?;
-			if !self.fired.swap(true, Ordering::SeqCst) {
-				self.core.rotate_memtable()?;
-				self.core.flush_all_immutables_sync()?;
-			}
-			Ok(offset)
-		})
-	}
-
-	fn sync(&self) -> BoxFuture<'_, ()> {
-		self.log_store.sync()
-	}
-
-	fn size(&self) -> BoxFuture<'_, u64> {
-		self.log_store.size()
-	}
-}
-
 /// A memtable rotation from outside the commit flusher (a checkpoint) can land while
 /// a run of batches is being appended to the WAL. The run's records then sit in the
 /// segment of the memtable that was just rotated out and flushed, which moved
@@ -370,21 +332,28 @@ async fn crash_after_rotation_during_wal_append_must_not_lose_the_run() {
 		txn.commit().await.unwrap();
 	}
 
-	let mut pipeline = CommitPipeline::new(
-		Arc::clone(&tree.core.inner),
-		Arc::clone(&tree.core.write_stall),
-		None,
-		tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1,
-	);
-	pipeline.log_store = Arc::new(RotateAfterFirstAppend {
-		log_store: AffinityLogStore::new(Arc::clone(&tree.core.inner.wal.inner)),
-		core: Arc::clone(&tree.core.inner),
-		fired: AtomicBool::new(false),
-	});
+	// Rotate the memtable and flush it right after the group's WAL append (and sync), the
+	// way a concurrent `create_checkpoint` can: the hook fires after the append and before
+	// anything is applied to a memtable.
+	let fired = Arc::new(AtomicBool::new(false));
+	{
+		let core = Arc::clone(&tree.core.inner);
+		let fired = Arc::clone(&fired);
+		tree.core.commit_pipeline.set_hook(Some(Arc::new(move |point| {
+			if matches!(point, PipelineHook::AfterWalSync { .. })
+				&& !fired.swap(true, Ordering::SeqCst)
+			{
+				core.rotate_memtable().unwrap();
+				core.flush_all_immutables_sync().unwrap();
+			}
+		})));
+	}
 
 	let mut batch = Batch::new(tree.core.inner.visible_seq_num.load(Ordering::Acquire) + 1);
 	batch.set(b"run".to_vec(), b"value".to_vec(), 0).unwrap();
-	pipeline.flush_group(&[batch], true).await.unwrap();
+	tree.core.commit_pipeline.flush_group(&[batch], true).await.unwrap();
+	assert!(fired.load(Ordering::SeqCst), "the rotation hook should have fired");
+	tree.core.commit_pipeline.set_hook(None);
 	crash(tree);
 
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();

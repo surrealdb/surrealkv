@@ -18,6 +18,51 @@ use crate::task::TaskManager;
 use crate::vlog::ValueLocation;
 use crate::Key;
 
+/// Observation points inside `flush_group`, so tests can act at an exact step
+/// of a commit group (for example rotate the memtable between the WAL sync and
+/// the memtable apply) instead of racing the flusher.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum PipelineHook {
+	/// The group's WAL records are appended and, if the group syncs, synced;
+	/// nothing is applied to a memtable yet.
+	AfterWalSync {
+		batches: usize,
+	},
+	/// An apply round is about to start. Round 0 is the first; later rounds
+	/// start after the group was repaired or moved on (a rotation, a re-append
+	/// of stale records, or a direct-to-L0 write).
+	BeforeApplyRound {
+		round: usize,
+	},
+}
+
+#[cfg(test)]
+pub(crate) type PipelineHookFn = Arc<dyn Fn(PipelineHook) + Send + Sync>;
+
+/// How many times in a row a group may find its records in a segment other than the active
+/// memtable's tag, with nothing applied in between, and log them again. One pass past a
+/// rotation fixes it. A group that is still stale after that many passes fails: rotations keep
+/// overtaking it, or the tag is one that no rotation will make equal to the segment.
+const MAX_STALE_ROUNDS: u32 = 8;
+
+/// Why `CommitPipeline::apply_run` stopped.
+enum ApplyStop {
+	/// Every remaining batch was applied.
+	Done,
+	/// The next batch exceeds `max_memtable_size`.
+	Oversized,
+	/// The next batch does not fit the active memtable, which is empty or not.
+	ArenaFull {
+		empty: bool,
+	},
+	/// The next batch was logged in a different segment than the one the active
+	/// memtable is tagged with.
+	Stale {
+		active_tag: u64,
+	},
+}
+
 /// Coordinates OCC conflict detection over the commit ring with the
 /// background flusher that makes accepted commits durable and visible.
 ///
@@ -60,8 +105,12 @@ pub(crate) struct CommitPipeline {
 	/// Bumped by every restore; commits accepted in an earlier epoch are not
 	/// applied to the restored state.
 	restore_epoch: AtomicU64,
-	/// Asynchronous log store interface for the WAL.
-	pub(crate) log_store: Arc<dyn LogStore>,
+	/// Asynchronous log store interface for the WAL. The concrete type, because the
+	/// pipeline needs the segment each record was appended to.
+	pub(crate) log_store: Arc<AffinityLogStore>,
+	/// Test-only observer of `flush_group` steps.
+	#[cfg(test)]
+	hook: Mutex<Option<PipelineHookFn>>,
 }
 
 pub(crate) struct RestoreGuard<'a> {
@@ -85,8 +134,7 @@ impl CommitPipeline {
 		let admission = Arc::new(Semaphore::new(DEFAULT_COMMIT_RING_CAPACITY / 2));
 		let notify_flusher = Arc::new(Notify::new());
 		let seq = start_seq.max(1);
-		let log_store: Arc<dyn LogStore> =
-			Arc::new(AffinityLogStore::new(Arc::clone(&inner.wal.inner)));
+		let log_store = Arc::new(AffinityLogStore::new(Arc::clone(&inner.wal.inner)));
 
 		Self {
 			ring,
@@ -101,6 +149,23 @@ impl CommitPipeline {
 			restoring: AtomicBool::new(false),
 			restore_epoch: AtomicU64::new(0),
 			log_store,
+			#[cfg(test)]
+			hook: Mutex::new(None),
+		}
+	}
+
+	/// Installs (or clears) the observer called at each `PipelineHook` point.
+	#[cfg(test)]
+	pub(crate) fn set_hook(&self, hook: Option<PipelineHookFn>) {
+		*self.hook.lock() = hook;
+	}
+
+	#[cfg(test)]
+	fn fire(&self, point: PipelineHook) {
+		// Clone out of the mutex first: the observer may block or call back in.
+		let hook = self.hook.lock().clone();
+		if let Some(hook) = hook {
+			hook(point);
 		}
 	}
 
@@ -403,6 +468,8 @@ impl CommitPipeline {
 
 	/// Flushes a group of batches to WAL and applies them to the Memtable.
 	pub(crate) async fn flush_group(&self, batches: &[Batch], sync: bool) -> Result<()> {
+		let epoch = self.restore_epoch.load(Ordering::SeqCst);
+
 		// 1. Process batches: separate large values to VLog if enabled (WiscKey WAL bypass)
 		// and encode for WAL
 		let vlog_threshold = self.inner.opts.vlog_value_threshold;
@@ -447,102 +514,264 @@ impl CommitPipeline {
 			processed_batches.push(processed);
 		}
 
+		// 2. Append the batches to the WAL asynchronously, one record per batch, in one call
+		// for the whole group, then sync once.
+		//
+		// Recovery decodes exactly one batch per record (`Batch::decode` rejects bytes
+		// past the end of the batch), so the group goes to the WAL as the end offset of
+		// every record next to the bytes of all of them, never as one record. Encoding
+		// appends to the shared buffer, so every batch of the group is in it: all of them
+		// are applied and acknowledged.
+		//
+		// The group is all or nothing. If anything fails, the WAL cuts the segment back to
+		// where it was before the group and refuses further appends, so no record of a group
+		// that was reported failed can be replayed after a crash.
+		//
+		// The segment the records landed in is kept: step 3 only applies a batch to a
+		// memtable tagged with that segment.
 		if let Some(vlog_inst) = vlog {
 			vlog_inst.flush()?;
 		}
 
-		// 2. Write the batches to the WAL and apply them to the active memtable, a run at
-		// a time. All of a memtable's data must sit in WAL segments up to its own, since
-		// flushing it advances the manifest's log_number past that segment. So when a
-		// batch doesn't fit, the memtable (and with it the WAL) is rotated *before* the
-		// batch is written to the WAL, never between the write and the apply.
+		// The worst-case memtable size of each batch, computed once for the oversized test and
+		// the rotation check.
 		let max_memtable_size = self.inner.opts.max_memtable_size as u64;
-		let mut remaining = &processed_batches[..];
-		while let Some(batch) = remaining.first() {
-			let needed = batch.memtable_size_estimate();
-			let mut active = Arc::clone(&*self.inner.active_memtable.read()?);
-			if needed <= max_memtable_size && !active.has_room_for(needed) {
-				self.inner.rotate_memtable()?;
-				if let Some(ref tm) = self.task_manager {
-					tm.wake_up_memtable();
-				}
-				active = Arc::clone(&*self.inner.active_memtable.read()?);
+		let estimates: Vec<u64> =
+			processed_batches.iter().map(Batch::memtable_size_estimate).collect();
+		let oversized: Vec<bool> =
+			estimates.iter().map(|bytes| *bytes > max_memtable_size).collect();
+
+		// If the first batch does not fit what is left of the active memtable, rotate
+		// now, so it is logged in the segment of the memtable that will receive it.
+		// This is only an optimisation for the common case (a lone writer then never
+		// logs a record twice): every other case is repaired in step 3, because the
+		// estimate is a worst case, so how far a group gets into a memtable is only
+		// known by applying it.
+		if oversized.first() == Some(&false) && self.needs_rotation_for(estimates[0])? {
+			self.inner.rotate_memtable()?;
+			if let Some(ref tm) = self.task_manager {
+				tm.wake_up_memtable();
 			}
-			if needed > max_memtable_size || !active.has_room_for(needed) {
-				// Doesn't fit even in an empty memtable: bypass it and flush directly to L0.
-				self.write_direct_to_l0(batch, sync).await?;
-				remaining = &remaining[1..];
-				continue;
+		}
+
+		let n = processed_batches.len();
+		let mut wal_buf =
+			Vec::with_capacity(processed_batches.iter().map(Batch::encoded_len_hint).sum());
+		let mut wal_ends = Vec::with_capacity(n);
+		for batch in &processed_batches {
+			batch.encode_into(&mut wal_buf)?;
+			wal_ends.push(wal_buf.len());
+		}
+		// One lock, one hand-off to the pool and one write for the group, and still one WAL
+		// record per batch. The WAL only rotates under the lock the append holds, so the
+		// whole group is in one segment. The buffers go to the pool and come back, and are
+		// dropped instead if the append fails.
+		let (segment, mut wal_buf, mut wal_ends) =
+			self.log_store.append_group_returning_segment(wal_buf, wal_ends).await?;
+		let mut segments = vec![segment; n];
+		if sync {
+			if let Some(vlog_inst) = vlog {
+				vlog_inst.sync()?;
+			}
+			self.log_store.sync().await?;
+		}
+		#[cfg(test)]
+		self.fire(PipelineHook::AfterWalSync {
+			batches: n,
+		});
+
+		// 3. Apply to the active memtable (or direct-to-L0 flush if oversized).
+		//
+		// A batch is applied to a memtable only if its WAL record is in the segment
+		// that memtable is tagged with. Flushing the memtable tagged N moves the
+		// manifest's `log_number` past N and deletes segment N, so a batch applied to
+		// a memtable tagged N + 1 whose only record is in segment N would be lost by
+		// a crash before that memtable is flushed. The comparison is made under the
+		// active memtable's read lock, which a rotation needs exclusively, so the tag
+		// cannot change between the check and the insert.
+		//
+		// A batch whose record is in an older segment (a rotation, a direct-to-L0
+		// write or a checkpoint happened after the append) is appended again, which
+		// lands it in the current segment. The old record is stale: nothing relies
+		// on it, and it goes away with its segment.
+		//
+		// A rotation can come between the append and the apply again, so this repeats.
+		// A group that is found stale `MAX_STALE_ROUNDS` times in a row, with nothing
+		// applied in between, is failed instead of logged again.
+		let mut at = 0;
+		let mut stale_rounds = 0;
+		#[cfg(test)]
+		let mut round = 0;
+		while at < n {
+			// A restore replaces the WAL and the memtables underneath this group:
+			// stop before logging anything more into the restored WAL.
+			if self.restoring.load(Ordering::Acquire)
+				|| self.restore_epoch.load(Ordering::SeqCst) != epoch
+			{
+				return Err(Error::PipelineStall);
+			}
+			#[cfg(test)]
+			{
+				self.fire(PipelineHook::BeforeApplyRound {
+					round,
+				});
+				round += 1;
 			}
 
-			// Take the following batches along for as long as they fit too.
-			let mut run_size = needed;
-			let mut run_len = 1;
-			for next in &remaining[1..] {
-				let next_needed = next.memtable_size_estimate();
-				if !active.has_room_for(run_size + next_needed) {
-					break;
-				}
-				run_size += next_needed;
-				run_len += 1;
+			let (next, stop) = self.apply_run(&processed_batches, &oversized, &segments, at)?;
+			if next > at {
+				stale_rounds = 0;
 			}
-			let (run, rest) = remaining.split_at(run_len);
-			loop {
-				self.append_to_wal(run, sync).await?;
-				let current = self.inner.active_memtable.read()?;
-				if Arc::ptr_eq(&current, &active) {
-					for batch in run {
-						current.add(batch)?;
+			at = next;
+			match stop {
+				ApplyStop::Done => {}
+				// Bypass the memtable: the batch exceeds `max_memtable_size`, or it cannot
+				// fit even an empty memtable (rotating an empty memtable is a no-op, so
+				// retrying would never end).
+				ApplyStop::Oversized
+				| ApplyStop::ArenaFull {
+					empty: true,
+				} => {
+					self.write_direct_to_l0(&processed_batches[at])?;
+					at += 1;
+					stale_rounds = 0;
+				}
+				ApplyStop::ArenaFull {
+					empty: false,
+				} => {
+					self.inner.rotate_memtable()?;
+					if let Some(ref tm) = self.task_manager {
+						tm.wake_up_memtable();
 					}
-					break;
 				}
-				// Something outside the flusher (a checkpoint) rotated the memtable while
-				// the append was in flight, so the run's records may be in the segment of
-				// a memtable that's being flushed, past which log_number then advances.
-				// Write the run again into the current segment, which the new memtable
-				// owns. Replaying the records twice is harmless. The new memtable started
-				// empty, so the run fits.
-				active = Arc::clone(&current);
+				ApplyStop::Stale {
+					active_tag,
+				} => {
+					if stale_rounds == MAX_STALE_ROUNDS {
+						return Err(tag_mismatch(&segments[at..], active_tag));
+					}
+					stale_rounds += 1;
+					self.reappend_stale(
+						&processed_batches[at..],
+						&oversized[at..],
+						&mut segments[at..],
+						active_tag,
+						sync,
+						&mut wal_buf,
+						&mut wal_ends,
+					)
+					.await?;
+				}
 			}
-			remaining = rest;
 		}
 
 		Ok(())
 	}
 
-	/// Appends `batches` to the WAL in order, syncing it (and the VLog) if `sync`.
-	async fn append_to_wal(&self, batches: &[Batch], sync: bool) -> Result<()> {
-		let mut wal_buffer = Vec::new();
-		for batch in batches {
-			wal_buffer.clear();
-			batch.encode_into(&mut wal_buffer)?;
-			self.log_store.append(&wal_buffer).await?;
+	/// Whether a batch that needs `bytes` of memtable does not fit what is left of a
+	/// non-empty active memtable, so the memtable has to rotate before the batch is logged.
+	fn needs_rotation_for(&self, bytes: u64) -> Result<bool> {
+		let active = self.inner.active_memtable.read()?;
+		Ok(!active.is_empty() && !active.can_fit(bytes))
+	}
+
+	/// Applies `batches[from..]` to the active memtable under one read guard and
+	/// returns the index it got to and why it stopped. `oversized` says which batches
+	/// are too big for a memtable and `segments` where each batch's record is.
+	///
+	/// Synchronous on purpose: no lock guard may live across an await in the
+	/// flusher, which runs as a spawned task.
+	fn apply_run(
+		&self,
+		batches: &[Batch],
+		oversized: &[bool],
+		segments: &[u64],
+		from: usize,
+	) -> Result<(usize, ApplyStop)> {
+		let active = self.inner.active_memtable.read()?;
+		let tag = active.get_wal_number();
+		let mut at = from;
+		while at < batches.len() {
+			if oversized[at] {
+				return Ok((at, ApplyStop::Oversized));
+			}
+			if segments[at] != tag {
+				return Ok((
+					at,
+					ApplyStop::Stale {
+						active_tag: tag,
+					},
+				));
+			}
+			match active.add(&batches[at]) {
+				Ok(()) => at += 1,
+				Err(Error::ArenaFull) => {
+					return Ok((
+						at,
+						ApplyStop::ArenaFull {
+							empty: active.is_empty(),
+						},
+					));
+				}
+				Err(e) => return Err(e),
+			}
+		}
+		Ok((at, ApplyStop::Done))
+	}
+
+	/// Appends again the batches whose record is not in the segment the active memtable is
+	/// tagged with (see `encode_stale`), and syncs if the group syncs.
+	///
+	/// A record already in that segment is never appended a second time. The value
+	/// log needs no second pass: its entries were synced with the first.
+	///
+	/// The stale batches go to the WAL as one group, so they land in one segment. They are
+	/// encoded into the group's own buffers, which the first append gave back.
+	#[allow(clippy::too_many_arguments)]
+	async fn reappend_stale(
+		&self,
+		batches: &[Batch],
+		oversized: &[bool],
+		segments: &mut [u64],
+		active_tag: u64,
+		sync: bool,
+		wal_buf: &mut Vec<u8>,
+		wal_ends: &mut Vec<usize>,
+	) -> Result<()> {
+		let stale = encode_stale(batches, oversized, segments, active_tag, wal_buf, wal_ends)?;
+		if stale.is_empty() {
+			return Ok(());
+		}
+		let (segment, buf, ends) = self
+			.log_store
+			.append_group_returning_segment(std::mem::take(wal_buf), std::mem::take(wal_ends))
+			.await?;
+		*wal_buf = buf;
+		*wal_ends = ends;
+		for j in stale {
+			segments[j] = segment;
 		}
 		if sync {
-			if let Some(vlog_inst) = self.inner.vlog.as_ref() {
-				vlog_inst.sync()?;
-			}
 			self.log_store.sync().await?;
 		}
 		Ok(())
 	}
 
-	/// Commits a batch too large for a memtable straight to a new L0 table.
+	/// Writes `batch` straight to a new L0 table, bypassing the memtable.
 	///
-	/// The batch gets a WAL segment of its own: the current one is sealed (rotating the
-	/// memtable out if it holds writes) before the append and again after it, so
-	/// `write_batch_direct_to_l0_sst` can mark that segment as captured without skipping
-	/// any other write.
-	async fn write_direct_to_l0(&self, batch: &Batch, sync: bool) -> Result<()> {
-		self.inner.seal_active_wal_segment()?;
+	/// The active memtable's WAL segment is sealed first (rotated out if it holds
+	/// earlier writes, or just rotated if it is empty), so earlier writes stay
+	/// ordered before the table and no later write can land in the segment that
+	/// `write_batch_direct_to_l0_sst` marks as captured.
+	fn write_direct_to_l0(&self, batch: &Batch) -> Result<()> {
+		let sealed_wal_number = self.inner.seal_active_wal_segment()?;
 		if let Some(ref tm) = self.task_manager {
 			tm.wake_up_memtable();
 		}
-		self.append_to_wal(std::slice::from_ref(batch), sync).await?;
-		let batch_wal_number = self.inner.seal_active_wal_segment()?;
 
 		let table_id = self.inner.level_manifest.read()?.next_table_id();
-		self.inner.write_batch_direct_to_l0_sst(batch, table_id, batch_wal_number)?;
+		self.inner.write_batch_direct_to_l0_sst(batch, table_id, sealed_wal_number)?;
+
 		if let Some(ref tm) = self.task_manager {
 			tm.wake_up_level();
 		}
@@ -572,6 +801,46 @@ impl CommitPipeline {
 		self.inner.visible_seq_num.store(seq, Ordering::SeqCst);
 		self.overflow.lock().clear();
 	}
+}
+
+/// Encodes, one record each, the batches whose record is not in the segment `tag` into the
+/// emptied `wal_buf` and `wal_ends`, and returns the index of each of these batches. Stops at the
+/// first oversized batch: it is written to an L0 table instead, which makes its record redundant
+/// and seals the segment, so a record behind it would be stale again before it could be applied.
+///
+/// The buffers are the group's own, which the first append gave back.
+fn encode_stale(
+	batches: &[Batch],
+	oversized: &[bool],
+	segments: &[u64],
+	tag: u64,
+	wal_buf: &mut Vec<u8>,
+	wal_ends: &mut Vec<usize>,
+) -> Result<Vec<usize>> {
+	wal_buf.clear();
+	wal_ends.clear();
+	let mut stale = Vec::new();
+	for j in 0..batches.len() {
+		if oversized[j] {
+			break;
+		}
+		if segments[j] == tag {
+			continue;
+		}
+		batches[j].encode_into(wal_buf)?;
+		wal_ends.push(wal_buf.len());
+		stale.push(j);
+	}
+	Ok(stale)
+}
+
+/// The error of a group whose records stay in segments other than the active memtable's tag
+/// however often they are logged again.
+fn tag_mismatch(segments: &[u64], tag: u64) -> Error {
+	Error::Other(format!(
+		"WAL segment and memtable tag mismatch: records in segments {segments:?}, active \
+		 memtable tagged {tag}"
+	))
 }
 
 fn bloom_of(keys: &[Key]) -> BloomFilter {

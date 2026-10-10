@@ -175,6 +175,18 @@ impl TaskManager {
 		}
 	}
 
+	/// Test-only: ends the background tasks without waiting for them, the way a crash does, so
+	/// that a tree a test abandons does not stay alive until the runtime is dropped.
+	#[cfg(all(test, not(target_arch = "wasm32")))]
+	pub(crate) fn abort(&self) {
+		self.stop_flag.store(true, Ordering::SeqCst);
+		if let Some(handles) = self.task_handles.lock().unwrap().take() {
+			for handle in handles {
+				handle.abort();
+			}
+		}
+	}
+
 	pub async fn stop(&self) {
 		// Set the stop flag to prevent new operations from starting
 		self.stop_flag.store(true, Ordering::SeqCst);

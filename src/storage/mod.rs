@@ -129,6 +129,53 @@ impl AffinityLogStore {
 			wal,
 		}
 	}
+
+	/// Appends `data` as one record and returns the WAL segment it was written to.
+	///
+	/// The segment is read in the same critical section as the append. Rotating the
+	/// WAL needs the same lock, so the returned number is the segment the record
+	/// physically lives in, and the commit pipeline can compare it with the tag of
+	/// the memtable it is about to apply the record to.
+	#[cfg(test)]
+	pub(crate) fn append_returning_segment(&self, data: &[u8]) -> BoxFuture<'_, u64> {
+		let wal = Arc::clone(&self.wal);
+		let data = data.to_vec();
+		Box::pin(async move {
+			affinitypool::spawn(move || -> Result<u64> {
+				let mut guard = wal.write();
+				let segment = guard.get_active_log_number();
+				guard.append(&data).map_err(|e| crate::error::Error::Other(e.to_string()))?;
+				Ok(segment)
+			})
+			.await
+		})
+	}
+
+	/// Appends a group of records, `buf[ends[i - 1]..ends[i]]` being record `i`, as one WAL
+	/// record each, and returns the segment they were all written to together with the two
+	/// buffers, so the caller can reuse their allocations.
+	///
+	/// One lock acquisition, one hand-off to the pool and, for a group of up to 32 KiB, one
+	/// `write(2)`, for any number of records. The segment is read in the same critical section
+	/// as the append, and rotating the WAL needs the same lock, so it is the one every record
+	/// of the group physically lives in. The group is all or nothing, see `Wal::append_group`.
+	/// The buffers move into the closure by value, so the group is not copied for the hop to
+	/// the pool.
+	pub(crate) async fn append_group_returning_segment(
+		&self,
+		buf: Vec<u8>,
+		ends: Vec<usize>,
+	) -> Result<(u64, Vec<u8>, Vec<usize>)> {
+		let wal = Arc::clone(&self.wal);
+		affinitypool::spawn(move || -> Result<(u64, Vec<u8>, Vec<usize>)> {
+			let mut guard = wal.write();
+			let segment = guard
+				.append_group(&buf, &ends)
+				.map_err(|e| crate::error::Error::Other(e.to_string()))?;
+			Ok((segment, buf, ends))
+		})
+		.await
+	}
 }
 
 impl LogStore for AffinityLogStore {

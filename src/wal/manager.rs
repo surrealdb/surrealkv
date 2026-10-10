@@ -350,6 +350,47 @@ impl Wal {
 		Ok(0)
 	}
 
+	/// Appends several records, `buf[ends[i - 1]..ends[i]]` being record `i` (`ends[-1]` is 0),
+	/// to the active segment, and returns the segment they were all written to.
+	///
+	/// Each record is framed exactly as `append` frames it, so the segment holds the same
+	/// bytes as one `append` per record, but the group reaches the file in one write (one
+	/// per 32 KiB of framed data at most). All or nothing: a failure cuts the segment back to
+	/// where it was before the first record and poisons the writer, see `Writer::add_records`.
+	/// Nothing is written, and the writer is not poisoned, if a record is empty or `ends` is
+	/// not an increasing list of offsets into `buf`.
+	///
+	/// The WAL only rotates through `&mut self`, so the whole group lands in one segment, the
+	/// one returned: the caller holds the lock this is called under and rotation needs.
+	pub(crate) fn append_group(&mut self, buf: &[u8], ends: &[usize]) -> Result<u64> {
+		if self.closed {
+			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "WAL is closed")));
+		}
+
+		let mut start = 0;
+		for &end in ends {
+			if end <= start || end > buf.len() {
+				return Err(Error::IO(IOError::new(
+					io::ErrorKind::Other,
+					"empty or out of range record in a group append",
+				)));
+			}
+			start = end;
+		}
+
+		tracing::trace!(
+			"WAL group append: log_number={}, records={}, bytes={}",
+			self.active_log_number,
+			ends.len(),
+			start
+		);
+
+		if !ends.is_empty() {
+			self.active_writer.add_records(buf, ends)?;
+		}
+		Ok(self.active_log_number)
+	}
+
 	pub(crate) fn sync(&mut self) -> Result<()> {
 		if self.closed {
 			return Ok(());
@@ -374,6 +415,25 @@ impl Wal {
 	/// from any fd pointing to the same file are persisted.
 	pub(crate) fn sync_fd(&self) -> Arc<File> {
 		Arc::clone(&self.sync_fd)
+	}
+
+	/// Makes the write to the active segment after the next `ops` of them fail
+	/// once, as a full disk would.
+	#[cfg(test)]
+	pub(crate) fn fail_writes_after(&mut self, ops: usize) {
+		self.active_writer.fail_after_ops(ops);
+	}
+
+	/// How many `write(2)` calls have reached the active segment.
+	#[cfg(test)]
+	pub(crate) fn file_writes(&self) -> usize {
+		self.active_writer.file_writes()
+	}
+
+	/// Test-only: whether anything was appended to the active segment since its last fsync.
+	#[cfg(test)]
+	pub(crate) fn pending_sync(&self) -> bool {
+		self.active_writer.pending_sync()
 	}
 
 	pub(crate) fn close(&mut self) -> Result<()> {
@@ -408,33 +468,41 @@ impl Wal {
 	}
 
 	/// Explicitly rotates the active WAL to a new file.
+	///
+	/// The active log number and writer only change once the new segment exists
+	/// and its directory entry is durable, so a failed rotation leaves the WAL
+	/// exactly as it was. The memtable tags and the segment a record is logged in
+	/// are both read from the active log number, and they must never run ahead of
+	/// the writer.
+	///
+	/// The old segment is synced first, and a failure of that sync fails the
+	/// rotation.
 	pub(crate) fn rotate(&mut self) -> Result<u64> {
 		let old_log_number = self.active_log_number;
+		let new_log_number = old_log_number + 1;
 
 		self.active_writer.sync()?;
 
-		// Update the log number
-		self.active_log_number += 1;
-
-		tracing::debug!("WAL rotating: {:020} -> {:020}", old_log_number, self.active_log_number);
+		tracing::debug!("WAL rotating: {:020} -> {:020}", old_log_number, new_log_number);
 
 		// Create a new Writer and sync fd for the new log number
-		let (new_writer, new_sync_fd) =
-			Self::create_writer(&self.dir, self.active_log_number, &self.opts)?;
-		self.active_writer = new_writer;
-		self.sync_fd = new_sync_fd;
+		let (new_writer, new_sync_fd) = Self::create_writer(&self.dir, new_log_number, &self.opts)?;
 
 		// Fsync the directory to ensure new file is visible after crash
 		crate::lsm::fsync_directory(&self.dir)
 			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
 
+		self.active_writer = new_writer;
+		self.sync_fd = new_sync_fd;
+		self.active_log_number = new_log_number;
+
 		tracing::debug!(
 			"WAL rotated and fsynced: {:020} -> {:020}",
 			old_log_number,
-			self.active_log_number
+			new_log_number
 		);
 
-		Ok(self.active_log_number)
+		Ok(new_log_number)
 	}
 }
 
@@ -983,5 +1051,81 @@ mod tests {
 
 			wal.close().unwrap();
 		}
+	}
+
+	/// `sizes` as records of that many bytes each: one buffer and where each one ends.
+	fn group(sizes: &[usize]) -> (Vec<u8>, Vec<usize>) {
+		let mut buf = Vec::new();
+		let mut ends = Vec::new();
+		for (i, size) in sizes.iter().enumerate() {
+			buf.extend(std::iter::repeat_n(i as u8 + 1, *size));
+			ends.push(buf.len());
+		}
+		(buf, ends)
+	}
+
+	fn segment_len(dir: &Path, log_number: u64) -> u64 {
+		fs::metadata(dir.join(format!("{log_number:020}.wal"))).unwrap().len()
+	}
+
+	/// A group is the records of one `append` each in one write, the segment it reports is
+	/// the one it was written to, and a rotation between two groups moves the report on.
+	#[test]
+	fn test_append_group() {
+		let temp_dir = create_temp_directory();
+		let mut wal = Wal::open(temp_dir.path(), Options::default()).unwrap();
+		let first = wal.get_active_log_number();
+
+		let (buf, ends) = group(&[10, 200, 3, 4000]);
+		assert_eq!(wal.append_group(&buf, &ends).unwrap(), first);
+		assert_eq!(wal.file_writes(), 1, "four small records are one write");
+
+		// The same records one `append` at a time are one write each, and the same bytes.
+		let other = create_temp_directory();
+		let mut one_by_one = Wal::open(other.path(), Options::default()).unwrap();
+		let mut start = 0;
+		for end in &ends {
+			one_by_one.append(&buf[start..*end]).unwrap();
+			start = *end;
+		}
+		assert_eq!(one_by_one.file_writes(), ends.len());
+		assert_eq!(segment_len(temp_dir.path(), first), segment_len(other.path(), first));
+		assert_eq!(
+			fs::read(temp_dir.path().join("00000000000000000000.wal")).unwrap(),
+			fs::read(other.path().join("00000000000000000000.wal")).unwrap()
+		);
+
+		wal.rotate().unwrap();
+		assert_eq!(wal.append_group(&buf, &ends).unwrap(), first + 1);
+		wal.close().unwrap();
+	}
+
+	/// A call that cannot be a group of records writes nothing and does not poison the
+	/// writer: there is nothing to cut off, so the next append works.
+	#[test]
+	fn test_append_group_rejects_malformed_input_without_writing() {
+		let temp_dir = create_temp_directory();
+		let mut wal = Wal::open(temp_dir.path(), Options::default()).unwrap();
+		wal.append(&[1, 2, 3]).unwrap();
+		let len = segment_len(temp_dir.path(), 0);
+
+		let (buf, ends) = group(&[10, 20, 30]);
+		assert!(wal.append_group(&buf, &[0, 10, 60]).is_err(), "an empty first record");
+		assert!(wal.append_group(&buf, &[10, 10, 60]).is_err(), "an empty record");
+		assert!(wal.append_group(&buf, &[30, 10, 60]).is_err(), "ends that go backwards");
+		assert!(wal.append_group(&buf, &[10, 30, 61]).is_err(), "an end past the buffer");
+		assert!(wal.append_group(&[], &[1]).is_err(), "an end past an empty buffer");
+		assert_eq!(segment_len(temp_dir.path(), 0), len, "nothing was written");
+		assert_eq!(wal.file_writes(), 1, "nothing reached the file");
+
+		// An empty group is a no-op, not an error.
+		assert_eq!(wal.append_group(&buf, &[]).unwrap(), 0);
+		assert_eq!(segment_len(temp_dir.path(), 0), len);
+
+		assert!(wal.append_group(&buf, &ends).is_ok(), "the writer is not poisoned");
+		assert!(wal.append(&[4, 5, 6]).is_ok());
+
+		wal.close().unwrap();
+		assert!(wal.append_group(&buf, &ends).is_err(), "a closed WAL takes no group");
 	}
 }
