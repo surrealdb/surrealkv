@@ -1227,6 +1227,29 @@ fn run_reader(
 	Ok(())
 }
 
+/// The lowest value-log file id in `dir`, or 0 when there is none.
+fn oldest_vlog_file(dir: &Path) -> u32 {
+	let Ok(listing) = std::fs::read_dir(dir.join("vlog")) else {
+		return 0;
+	};
+	listing
+		.filter_map(|e| {
+			let name = e.ok()?.file_name().to_string_lossy().into_owned();
+			name.strip_suffix(".vlog")?.parse::<u32>().ok()
+		})
+		.min()
+		.unwrap_or(0)
+}
+
+/// Wakes the tree's compaction task. A flush by hand does not: only a flush by the background
+/// task does, and a hand flush that takes the memtable first leaves the task asleep, so that no
+/// compaction runs (a checkpoint wakes it for the same reason).
+fn wake_compactor(tree: &Tree) {
+	if let Some(task_manager) = tree.core.task_manager.lock().unwrap().as_ref() {
+		task_manager.wake_up_level();
+	}
+}
+
 /// Reader threads hammer `get` and scans while writers overwrite the keys and the tree flushes
 /// and compacts. With `manual_compaction` the tree does not compact by itself and a thread of
 /// the test flushes and compacts by hand; otherwise the tree compacts in the background and the
@@ -1301,21 +1324,19 @@ async fn readers_race_everything(manual_compaction: bool) {
 					tree.compact(Arc::new(Strategy::from_options(Arc::clone(&opts))))
 						.expect("a compaction by hand");
 				} else {
+					wake_compactor(&tree);
 					cleanup(&tree);
 				}
-				if let Ok(listing) = std::fs::read_dir(path.join("vlog")) {
-					let ids = listing.filter_map(|e| {
-						let name = e.ok()?.file_name().to_string_lossy().into_owned();
-						name.strip_suffix(".vlog")?.parse::<u32>().ok()
-					});
-					oldest_seen = oldest_seen.max(ids.min().unwrap_or(0));
-					collected.fetch_max(oldest_seen, Ordering::SeqCst);
-				}
+				oldest_seen = oldest_seen.max(oldest_vlog_file(&path));
+				collected.fetch_max(oldest_seen, Ordering::SeqCst);
 				rounds += 1;
 				count.store(rounds, Ordering::SeqCst);
 				// Pacing, not synchronization: a round with nothing to do is cheap.
 				std::thread::sleep(Duration::from_millis(1));
 			}
+			// The oldest file only moves up, so a last look sees whatever the loop missed.
+			oldest_seen = oldest_seen.max(oldest_vlog_file(&path));
+			collected.fetch_max(oldest_seen, Ordering::SeqCst);
 			(rounds, oldest_seen)
 		})
 	};
@@ -1342,7 +1363,17 @@ async fn readers_race_everything(manual_compaction: bool) {
 						}
 						txn.commit().await.unwrap();
 					}
-					if ver >= MAX_ROUNDS || (ver >= ROUNDS && ready()) {
+					if ver >= ROUNDS && ready() {
+						return ver;
+					}
+					if ver >= MAX_ROUNDS {
+						// No more writes, so that the value log does not grow without bound, but
+						// the tree and the threads go on, and the compaction that this much
+						// data needs gets the time it needs.
+						let deadline = std::time::Instant::now() + STUCK / 2;
+						while !ready() && std::time::Instant::now() < deadline {
+							tokio::time::sleep(Duration::from_millis(5)).await;
+						}
 						return ver;
 					}
 					ver += 1;
@@ -1368,7 +1399,15 @@ async fn readers_race_everything(manual_compaction: bool) {
 		assert!(count >= 3, "reader {n} made {count} reads");
 	}
 	assert!(rounds >= 2, "the manual thread ran {rounds} rounds");
-	assert!(oldest_seen > 1, "the value log was collected while the writers ran: {oldest_seen}");
+	assert!(
+		oldest_seen > 1,
+		"the value log was not collected while the writers ran: oldest file {oldest_seen}, writer \
+		 rounds {finals:?}, {rounds} rounds by hand, {} level-0 tables, {} files in the value log, \
+		 readers' reads {:?}",
+		l0_tables(&tree),
+		std::fs::read_dir(dir.path().join("vlog")).map(|d| d.count()).unwrap_or(0),
+		ops.iter().map(|c| c.load(Ordering::SeqCst)).collect::<Vec<_>>(),
+	);
 
 	// Now: nothing runs but this test.
 	stop_background_tasks(&tree).await;
