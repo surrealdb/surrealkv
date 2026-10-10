@@ -47,7 +47,8 @@ impl Debug for OpfsSyncFile {
 }
 
 impl OpfsSyncFile {
-	/// Creates a new `OpfsSyncFile` from a browser `FileSystemSyncAccessHandle`.
+	/// Creates a new `OpfsSyncFile` from a browser `FileSystemSyncAccessHandle`. The file takes
+	/// the handle over: it is closed when the file is closed or dropped.
 	pub fn new(handle: FileSystemSyncAccessHandle) -> Self {
 		let initial_size = handle.get_size().unwrap_or(0.0) as u64;
 		Self {
