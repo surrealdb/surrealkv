@@ -202,6 +202,11 @@ pub(crate) struct CoreInner {
 	#[cfg(test)]
 	pub(crate) flush_hook: parking_lot::Mutex<Option<FlushHook>>,
 
+	/// Test-only observer called by `write_batch_direct_to_l0_sst` once its table is open and
+	/// before the manifest is updated. An error from it fails the write.
+	#[cfg(test)]
+	pub(crate) direct_table_hook: parking_lot::Mutex<Option<FlushHook>>,
+
 	/// Test-only observer called by `create_checkpoint` at each of its stages.
 	#[cfg(test)]
 	pub(crate) checkpoint_hook: parking_lot::Mutex<Option<crate::checkpoint::CheckpointHook>>,
@@ -280,6 +285,8 @@ impl CoreInner {
 			manifest_uncertain: AtomicBool::new(false),
 			#[cfg(test)]
 			flush_hook: parking_lot::Mutex::new(None),
+			#[cfg(test)]
+			direct_table_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
 			checkpoint_hook: parking_lot::Mutex::new(None),
 		})
@@ -600,6 +607,14 @@ impl CoreInner {
 		if !range_deletions.is_empty() {
 			created_table.range_deletions.write().extend(range_deletions);
 			created_table.has_range_deletions.store(true, Ordering::Release);
+		}
+
+		#[cfg(test)]
+		{
+			let hook = self.direct_table_hook.lock().clone();
+			if let Some(hook) = hook {
+				hook(table_id)?;
+			}
 		}
 
 		// Atomically commit new L0 table to manifest.

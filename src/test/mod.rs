@@ -40,6 +40,8 @@ pub mod crash_consistency_tests;
 pub mod direct_l0_flush_tests;
 #[cfg(test)]
 pub mod direct_l0_group_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod direct_l0_manifest_failure_tests;
 #[cfg(test)]
 pub mod direct_l0_read_order_tests;
 #[cfg(test)]
