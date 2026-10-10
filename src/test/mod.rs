@@ -15,6 +15,8 @@ pub mod batch_tests;
 #[cfg(test)]
 pub mod block_tests;
 #[cfg(test)]
+pub mod close_race_tests;
+#[cfg(test)]
 pub mod commit_pipeline_tests;
 #[cfg(test)]
 pub mod compaction_memory_proofs;
@@ -61,11 +63,19 @@ pub mod vlog_tests;
 #[cfg(test)]
 pub mod wal_decode_tests;
 #[cfg(test)]
+pub mod wal_fsync_poison_tests;
+#[cfg(test)]
+pub mod wal_group_budget_failure_tests;
+#[cfg(test)]
+pub mod wal_group_budget_tests;
+#[cfg(test)]
 pub mod wal_group_commit_tests;
 #[cfg(test)]
 pub mod wal_group_crash_tests;
 #[cfg(test)]
 pub mod wal_rotation_tests;
+#[cfg(test)]
+pub mod wal_stale_rounds_tests;
 #[cfg(test)]
 pub mod wal_tests;
 #[cfg(test)]

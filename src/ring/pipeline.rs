@@ -12,6 +12,7 @@ use super::sync::backoff;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::CoreInner;
+use crate::memtable::MemTable;
 use crate::stall::WriteStallController;
 use crate::storage::{AffinityLogStore, LogStore};
 use crate::task::TaskManager;
@@ -31,20 +32,74 @@ pub(crate) enum PipelineHook {
 	},
 	/// An apply round is about to start. Round 0 is the first; later rounds
 	/// start after the group was repaired or moved on (a rotation, a re-append
-	/// of stale records, or a direct-to-L0 write).
+	/// of stale records, a switch to a fenced round, or a direct-to-L0 write).
 	BeforeApplyRound {
 		round: usize,
 	},
+	/// A fenced round holds the active memtable's read guard and has logged the batches that were
+	/// stale, and synced them if the group syncs. It has not applied anything yet.
+	BeforeFencedApply,
 }
 
 #[cfg(test)]
 pub(crate) type PipelineHookFn = Arc<dyn Fn(PipelineHook) + Send + Sync>;
 
+/// Observation points in a committer's path through `commit`, so tests can hold a commit at an
+/// exact step while the pipeline shuts down.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitStage {
+	/// The commit passed the shutdown and write stall checks and has not asked for admission.
+	Entered,
+	/// The commit holds an admission permit and has not claimed a ring sequence.
+	Admitted,
+	/// The commit claimed its sequence and validated, and has not been accepted.
+	Validated,
+	/// The commit was accepted and waits for the flusher.
+	Accepted,
+}
+
+#[cfg(test)]
+pub(crate) type CommitHookFn = Arc<dyn Fn(CommitStage) + Send + Sync>;
+
+/// The most bytes of batches the flusher gathers into one group, as `Batch::encoded_len_hint`
+/// counts them, unless the first entry alone is bigger: that entry is a group of its own.
+///
+/// A group is encoded into one contiguous WAL buffer of its size, next to the batches themselves,
+/// so without a bound a few concurrent multi-GiB commits need that much contiguous memory at
+/// once. 4 MiB is about 4 ms of sequential write at 1 GB/s, on the order of the fsync that
+/// follows it: a bigger group saves little more per commit and adds to the latency of every
+/// commit in it. Groups of small commits are far below it, so only a pile-up of large commits
+/// reaches the bound.
+pub(crate) const MAX_GROUP_BYTES: usize = 4 << 20;
+
+/// Whether the next entry, of `bytes`, joins a group that holds `entries` entries of
+/// `group_bytes` bytes between them. A group takes at least one entry, and after that entries
+/// only while it stays within `MAX_GROUP_BYTES`.
+fn group_has_room(entries: usize, group_bytes: usize, bytes: usize) -> bool {
+	entries == 0 || group_bytes.saturating_add(bytes) <= MAX_GROUP_BYTES
+}
+
+/// Reserves room for `bytes` bytes in `buf`, which is empty, and fails when the allocator
+/// refuses, where `Vec::reserve` aborts the process. Exactly `bytes`, not the doubling that
+/// `reserve` rounds up to.
+///
+/// Only the group's buffer is reserved this way. Wrapping a value and compressing a record
+/// allocate per batch, with the ordinary allocator.
+fn try_reserve_wal(buf: &mut Vec<u8>, bytes: usize) -> Result<()> {
+	debug_assert!(buf.is_empty(), "a reservation made after encoding would not be exact");
+	buf.try_reserve_exact(bytes).map_err(|e| Error::Io(Arc::new(std::io::Error::from(e))))
+}
+
+/// How many commits may be admitted at once: one admission permit each. At most half the
+/// ring's capacity of entries then sit above the completed prefix.
+pub(super) const ADMISSION_PERMITS: u32 = (DEFAULT_COMMIT_RING_CAPACITY / 2) as u32;
+
 /// How many times in a row a group may find its records in a segment other than the active
-/// memtable's tag, with nothing applied in between, and log them again. One pass past a
-/// rotation fixes it. A group that is still stale after that many passes fails: rotations keep
-/// overtaking it, or the tag is one that no rotation will make equal to the segment.
-const MAX_STALE_ROUNDS: u32 = 8;
+/// memtable's tag, with nothing applied in between, and log them again off the memtable's lock.
+/// One pass past a rotation fixes it. If rotations keep overtaking the group, the next pass is
+/// fenced: see `CommitPipeline::apply_fenced`.
+pub(crate) const UNFENCED_STALE_ROUNDS: u32 = 2;
 
 /// Why `CommitPipeline::apply_run` stopped.
 enum ApplyStop {
@@ -63,6 +118,24 @@ enum ApplyStop {
 	},
 }
 
+/// Holds an entry its committer claimed until the committer has a verdict for it. If the
+/// committer goes away first the entry is aborted, so that the flusher, which drains the
+/// ring in order, is not left waiting at it forever. The window from the claim to the
+/// verdict holds no await, so only a panic can end it early.
+struct ClaimGuard<'a> {
+	pipeline: &'a CommitPipeline,
+	entry: &'a CommitEntry,
+}
+
+impl Drop for ClaimGuard<'_> {
+	fn drop(&mut self) {
+		if self.entry.abort_if_in_flight() {
+			self.pipeline.ring.advance_completed();
+			self.pipeline.notify_flusher.notify_one();
+		}
+	}
+}
+
 /// Coordinates OCC conflict detection over the commit ring with the
 /// background flusher that makes accepted commits durable and visible.
 ///
@@ -74,7 +147,8 @@ enum ApplyStop {
 /// Validation touches only the slots it reads, never a shared lock, so its
 /// cost is parallel in the number of commits in flight.
 ///
-/// The flusher drains accepted entries in ring order, assigns their LSM
+/// The flusher drains accepted entries in ring order, in groups of at most
+/// `MAX_GROUP_BYTES` (a group always takes its first entry), assigns their LSM
 /// sequence numbers in that same order, writes and syncs the WAL, applies the
 /// memtable, advances `visible_seq_num`, and only then marks the entries
 /// visible and advances the ring's completed prefix. A transaction that reads
@@ -90,7 +164,8 @@ pub(crate) struct CommitPipeline {
 	/// completed prefix has passed it. At most half the ring's capacity of
 	/// entries therefore sit above the completed prefix, so the previous
 	/// occupant of a slot being claimed is always complete and publishing
-	/// never waits on the flusher.
+	/// never waits on the flusher. At shutdown the flusher takes every permit,
+	/// which tells it that no admitted commit is left, and closes the semaphore.
 	admission: Arc<Semaphore>,
 	pub(crate) inner: Arc<CoreInner>,
 	pub(crate) write_stall: Arc<WriteStallController>,
@@ -111,6 +186,17 @@ pub(crate) struct CommitPipeline {
 	/// Test-only observer of `flush_group` steps.
 	#[cfg(test)]
 	hook: Mutex<Option<PipelineHookFn>>,
+	/// Test-only observer of a committer's steps.
+	#[cfg(test)]
+	commit_hook: Mutex<Option<CommitHookFn>>,
+	/// Test-only count of the times the flusher found nothing to drain at shutdown and began to
+	/// wait for the admitted commits.
+	#[cfg(test)]
+	shutdown_waits: AtomicU64,
+	/// Test-only failpoint: a WAL buffer of at least this many bytes is refused, as if the
+	/// allocator had none to give. `usize::MAX` disables it.
+	#[cfg(test)]
+	wal_reserve_fails_from: std::sync::atomic::AtomicUsize,
 }
 
 pub(crate) struct RestoreGuard<'a> {
@@ -131,7 +217,7 @@ impl CommitPipeline {
 		start_seq: u64,
 	) -> Self {
 		let ring = CommitRing::new(DEFAULT_COMMIT_RING_CAPACITY, 1);
-		let admission = Arc::new(Semaphore::new(DEFAULT_COMMIT_RING_CAPACITY / 2));
+		let admission = Arc::new(Semaphore::new(ADMISSION_PERMITS as usize));
 		let notify_flusher = Arc::new(Notify::new());
 		let seq = start_seq.max(1);
 		let log_store = Arc::new(AffinityLogStore::new(Arc::clone(&inner.wal.inner)));
@@ -151,7 +237,45 @@ impl CommitPipeline {
 			log_store,
 			#[cfg(test)]
 			hook: Mutex::new(None),
+			#[cfg(test)]
+			commit_hook: Mutex::new(None),
+			#[cfg(test)]
+			shutdown_waits: AtomicU64::new(0),
+			#[cfg(test)]
+			wal_reserve_fails_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
 		}
+	}
+
+	/// Test observer: the completed prefix, the retired watermark and the length of the
+	/// overflow map.
+	#[cfg(test)]
+	pub(crate) fn watermarks(&self) -> (u64, u64, usize) {
+		(self.ring.completed(), self.ring.taken(), self.overflow.lock().len())
+	}
+
+	/// Test observer: how many entries above the completed prefix are accepted, whether the
+	/// flusher holds them or not.
+	#[cfg(test)]
+	pub(crate) fn accepted_waiting(&self) -> usize {
+		let (from, to) = (self.ring.completed() + 1, self.ring.published());
+		(from..=to)
+			.filter(|seq| {
+				matches!(self.ring.get(*seq), SlotRead::Ready(e) if matches!(e.state(), EntryState::Accepted))
+			})
+			.count()
+	}
+
+	/// Test observer: the admission permits not held by a claimed entry.
+	#[cfg(test)]
+	pub(crate) fn free_permits(&self) -> usize {
+		self.admission.available_permits()
+	}
+
+	/// Makes every WAL buffer of at least `bytes` bytes fail to allocate, as it would with no
+	/// memory left. `usize::MAX` lifts it.
+	#[cfg(test)]
+	pub(crate) fn set_wal_reserve_fails_from(&self, bytes: usize) {
+		self.wal_reserve_fails_from.store(bytes, Ordering::Relaxed);
 	}
 
 	/// Installs (or clears) the observer called at each `PipelineHook` point.
@@ -169,11 +293,36 @@ impl CommitPipeline {
 		}
 	}
 
+	/// Installs (or clears) the observer called at each `CommitStage`.
+	#[cfg(test)]
+	pub(crate) fn set_commit_hook(&self, hook: Option<CommitHookFn>) {
+		*self.commit_hook.lock() = hook;
+	}
+
+	#[cfg(test)]
+	fn fire_commit(&self, stage: CommitStage) {
+		let hook = self.commit_hook.lock().clone();
+		if let Some(hook) = hook {
+			hook(stage);
+		}
+	}
+
+	/// How many times the flusher began to wait, at shutdown, for the admitted commits.
+	#[cfg(test)]
+	pub(crate) fn shutdown_waits(&self) -> u64 {
+		self.shutdown_waits.load(Ordering::SeqCst)
+	}
+
 	/// Starts the background flusher task.
 	pub(crate) fn start_flusher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
 		let pipeline = Arc::clone(self);
+		// The flusher's position is read here, not when the task is first polled. A commit that
+		// fails before then has its entry aborted, and its own guard advances the completed
+		// prefix over it. A flusher that started past that entry would never take its permit,
+		// and `close` waits for every permit.
+		let drained = self.ring.completed();
 		tokio::spawn(async move {
-			pipeline.run_flusher().await;
+			pipeline.run_flusher(drained).await;
 		})
 	}
 
@@ -202,17 +351,21 @@ impl CommitPipeline {
 		if read_keys.is_empty() {
 			return Ok(());
 		}
+		if self.shutdown.load(Ordering::Acquire) {
+			return Err(Error::PipelineStall);
+		}
 		let read_bloom = bloom_of(read_keys);
 		let permit =
 			Arc::clone(&self.admission).acquire_owned().await.map_err(|_| Error::PipelineStall)?;
-		// The claimed sequence bounds the window; the entry publishes nothing.
+		// The claimed sequence bounds the window; the entry publishes nothing, so the guard
+		// aborts it once it is validated.
 		let entry = Arc::new(CommitEntry::new(Vec::new(), permit));
 		let seq = self.publish(&entry);
-		let result = self.validate(&entry, seq, start_seq, window, read_keys, &read_bloom);
-		entry.abort();
-		self.ring.advance_completed();
-		self.notify_flusher.notify_one();
-		result
+		let _claim = ClaimGuard {
+			pipeline: self,
+			entry: &entry,
+		};
+		self.validate(&entry, seq, start_seq, window, read_keys, &read_bloom)
 	}
 
 	/// Commits a batch through the commit ring and the group-commit flusher.
@@ -239,6 +392,9 @@ impl CommitPipeline {
 		// Write stall backpressure
 		self.write_stall.check().await?;
 
+		#[cfg(test)]
+		self.fire_commit(CommitStage::Entered);
+
 		// The last suspension point before the entry is claimed: from here to
 		// the verdict nothing awaits, so a cancelled commit can never leave a
 		// claimed entry unpublished or undecided.
@@ -249,19 +405,23 @@ impl CommitPipeline {
 		if self.restoring.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
+		#[cfg(test)]
+		self.fire_commit(CommitStage::Admitted);
 
 		let write_keys: Vec<Key> = batch.entries.iter().map(|e| e.key.clone()).collect();
 		let read_bloom = bloom_of(read_set);
 		let entry = Arc::new(CommitEntry::new(write_keys, permit));
 		let seq = self.publish(&entry);
 
-		if let Err(e) = self.validate(&entry, seq, start_seq, window, read_set, &read_bloom) {
-			entry.abort();
-			self.ring.advance_completed();
-			self.notify_flusher.notify_one();
-			return Err(e);
-		}
+		// A conflict aborts the entry, and so does a committer that fails before its verdict.
+		let claim = ClaimGuard {
+			pipeline: self,
+			entry: &entry,
+		};
+		self.validate(&entry, seq, start_seq, window, read_set, &read_bloom)?;
 
+		#[cfg(test)]
+		self.fire_commit(CommitStage::Validated);
 		let (complete_tx, complete_rx) = oneshot::channel();
 		entry.accept(Payload {
 			batch,
@@ -269,7 +429,11 @@ impl CommitPipeline {
 			complete_tx,
 			epoch: self.restore_epoch.load(Ordering::SeqCst),
 		});
+		// The entry is decided, and the flusher takes it from here.
+		drop(claim);
 		self.notify_flusher.notify_one();
+		#[cfg(test)]
+		self.fire_commit(CommitStage::Accepted);
 
 		// Await durability & memtable application
 		complete_rx.await.map_err(|_| Error::PipelineStall)?
@@ -335,22 +499,32 @@ impl CommitPipeline {
 	}
 
 	/// Background flusher loop performing group commit.
-	async fn run_flusher(&self) {
-		// The last ring sequence the flusher has consumed.
-		let mut drained = self.ring.completed();
+	async fn run_flusher(&self, mut drained: u64) {
+		// `drained` is the last ring sequence the flusher has consumed.
+		// Completes once every admission permit is back, which is once no commit is admitted
+		// and undecided. Only polled at shutdown.
+		let mut all_permits =
+			std::pin::pin!(Arc::clone(&self.admission).acquire_many_owned(ADMISSION_PERMITS));
 		loop {
-			let shutdown = self.shutdown.load(Ordering::Acquire);
-
-			// Gather every contiguous decided entry after `drained`, with the
-			// permits to release once the completed prefix passes them.
+			// Gather the contiguous decided entries after `drained`, with the permits to
+			// release once the completed prefix passes them. The group stops before the entry
+			// that would take it past `MAX_GROUP_BYTES`. That entry is still accepted and in the
+			// ring, and starts the next group: the flusher parks only when a pass finds nothing,
+			// and a group always takes its first entry.
 			let mut group: Vec<(Arc<CommitEntry>, Payload)> = Vec::new();
 			let mut permits = Vec::new();
+			let mut group_bytes = 0usize;
 			let mut next = drained + 1;
 			loop {
 				match self.ring.get(next) {
 					SlotRead::Ready(entry) => match entry.state() {
 						EntryState::InFlight => break,
 						EntryState::Accepted => {
+							let bytes = entry.payload_bytes();
+							if !group_has_room(group.len(), group_bytes, bytes) {
+								break;
+							}
+							group_bytes = group_bytes.saturating_add(bytes);
 							let payload =
 								entry.take_payload().expect("accepted entries carry a payload");
 							permits.extend(entry.take_permit());
@@ -367,8 +541,23 @@ impl CommitPipeline {
 			}
 
 			if next == drained + 1 {
-				if shutdown {
-					break;
+				if self.shutdown.load(Ordering::Acquire) {
+					#[cfg(test)]
+					self.shutdown_waits.fetch_add(1, Ordering::SeqCst);
+					// Nothing to drain, but a commit that was admitted before the shutdown may
+					// still be on its way to the ring. A permit is held from admission until
+					// the flusher has drained the entry, so once every permit is back, all of
+					// them were decided and no more can arrive.
+					tokio::select! {
+						all = &mut all_permits => {
+							// Commits still waiting for a permit fail instead of getting one.
+							self.admission.close();
+							drop(all);
+							break;
+						}
+						() = self.notify_flusher.notified() => {}
+					}
+					continue;
 				}
 				// Wait for new published or decided entries
 				self.notify_flusher.notified().await;
@@ -443,7 +632,9 @@ impl CommitPipeline {
 			let _ = complete_tx.send(match &result {
 				Ok(()) if applied => Ok(()),
 				Ok(()) => Err(Error::PipelineStall),
-				Err(_) => Err(Error::Io(std::io::Error::other("Group commit failed").into())),
+				Err(e) => Err(Error::Io(
+					std::io::Error::other(format!("Group commit failed: {e}")).into(),
+				)),
 			});
 		}
 	}
@@ -555,8 +746,12 @@ impl CommitPipeline {
 		}
 
 		let n = processed_batches.len();
-		let mut wal_buf =
-			Vec::with_capacity(processed_batches.iter().map(Batch::encoded_len_hint).sum());
+		// A refused reservation fails the group here, before anything is appended to the WAL.
+		let mut wal_buf = Vec::new();
+		self.reserve_wal_buf(
+			&mut wal_buf,
+			processed_batches.iter().map(Batch::encoded_len_hint).sum(),
+		)?;
 		let mut wal_ends = Vec::with_capacity(n);
 		for batch in &processed_batches {
 			batch.encode_into(&mut wal_buf)?;
@@ -595,11 +790,13 @@ impl CommitPipeline {
 		// lands it in the current segment. The old record is stale: nothing relies
 		// on it, and it goes away with its segment.
 		//
-		// A rotation can come between the append and the apply again, so this repeats.
-		// A group that is found stale `MAX_STALE_ROUNDS` times in a row, with nothing
-		// applied in between, is failed instead of logged again.
+		// A rotation can come between the append and the apply again. A group that was
+		// overtaken `UNFENCED_STALE_ROUNDS` times in a row appends the rest again under
+		// the read lock and applies it there, where no rotation can interrupt: a group
+		// whose records are logged is not failed for want of a quiet moment.
 		let mut at = 0;
 		let mut stale_rounds = 0;
+		let mut fenced = false;
 		#[cfg(test)]
 		let mut round = 0;
 		while at < n {
@@ -618,7 +815,19 @@ impl CommitPipeline {
 				round += 1;
 			}
 
-			let (next, stop) = self.apply_run(&processed_batches, &oversized, &segments, at)?;
+			let (next, stop) = if fenced {
+				self.apply_fenced(
+					&processed_batches,
+					&oversized,
+					&mut segments,
+					at,
+					sync,
+					&mut wal_buf,
+					&mut wal_ends,
+				)?
+			} else {
+				self.apply_run(&processed_batches, &oversized, &segments, at)?
+			};
 			if next > at {
 				stale_rounds = 0;
 			}
@@ -647,25 +856,53 @@ impl CommitPipeline {
 				ApplyStop::Stale {
 					active_tag,
 				} => {
-					if stale_rounds == MAX_STALE_ROUNDS {
+					// A fenced round logs the stale batches under the guard that fixes the tag,
+					// so it is never stale. A tag that the WAL cannot have is not a race either:
+					// no rotation will bring them together. Fail the group rather than log it
+					// again.
+					if fenced || !self.tag_is_possible(&segments[at..], active_tag) {
 						return Err(tag_mismatch(&segments[at..], active_tag));
 					}
-					stale_rounds += 1;
-					self.reappend_stale(
-						&processed_batches[at..],
-						&oversized[at..],
-						&mut segments[at..],
-						active_tag,
-						sync,
-						&mut wal_buf,
-						&mut wal_ends,
-					)
-					.await?;
+					if stale_rounds == UNFENCED_STALE_ROUNDS {
+						fenced = true;
+					} else {
+						stale_rounds += 1;
+						self.reappend_stale(
+							&processed_batches[at..],
+							&oversized[at..],
+							&mut segments[at..],
+							active_tag,
+							sync,
+							&mut wal_buf,
+							&mut wal_ends,
+						)
+						.await?;
+					}
 				}
 			}
 		}
 
 		Ok(())
+	}
+
+	/// Whether `tag`, which the active memtable had a moment ago, can be explained by the WAL: a
+	/// rotation only moves the WAL on, and the tag with it, so the tag is neither behind a segment
+	/// that a record was logged in nor ahead of the active segment.
+	fn tag_is_possible(&self, segments: &[u64], tag: u64) -> bool {
+		segments.iter().all(|&segment| segment <= tag)
+			&& tag <= self.inner.wal.read().get_active_log_number()
+	}
+
+	/// Reserves room for `bytes` bytes in the empty `buf`, see `try_reserve_wal`.
+	fn reserve_wal_buf(&self, buf: &mut Vec<u8>, bytes: usize) -> Result<()> {
+		#[cfg(test)]
+		{
+			let fails_from = self.wal_reserve_fails_from.load(Ordering::Relaxed);
+			if fails_from != usize::MAX && bytes >= fails_from {
+				return Err(Error::Io(Arc::new(std::io::ErrorKind::OutOfMemory.into())));
+			}
+		}
+		try_reserve_wal(buf, bytes)
 	}
 
 	/// Whether a batch that needs `bytes` of memtable does not fit what is left of a
@@ -689,6 +926,71 @@ impl CommitPipeline {
 		from: usize,
 	) -> Result<(usize, ApplyStop)> {
 		let active = self.inner.active_memtable.read()?;
+		Self::apply_to(&active, batches, oversized, segments, from)
+	}
+
+	/// Like [`apply_run`](Self::apply_run), but first logs again the batches whose record is not in
+	/// the segment the memtable is tagged with (see `encode_stale`), and holds the read guard from
+	/// there until the batches are applied.
+	///
+	/// A rotation takes the write guard and then the WAL lock, so under the read guard the WAL's
+	/// active segment is the memtable's tag and stays so: what is logged now is in the segment
+	/// the batches are applied to, and nothing can make it stale first. A group that rotations
+	/// keep overtaking makes progress this way. Not every group does it, because the guard is
+	/// held across an append and an fsync, which run on the flusher's thread instead of the
+	/// pool's. A group that syncs is synced before anything of it is applied, as everywhere else.
+	///
+	/// If the active segment is not the tag, no rotation will bring them together, and the group
+	/// fails before anything more is logged.
+	///
+	/// Synchronous like `apply_run`, for the same reason.
+	#[allow(clippy::too_many_arguments)]
+	fn apply_fenced(
+		&self,
+		batches: &[Batch],
+		oversized: &[bool],
+		segments: &mut [u64],
+		from: usize,
+		sync: bool,
+		wal_buf: &mut Vec<u8>,
+		wal_ends: &mut Vec<usize>,
+	) -> Result<(usize, ApplyStop)> {
+		let active = self.inner.active_memtable.read()?;
+		let tag = active.get_wal_number();
+		let stale = encode_stale(
+			&batches[from..],
+			&oversized[from..],
+			&segments[from..],
+			tag,
+			wal_buf,
+			wal_ends,
+		)?;
+		if !stale.is_empty() {
+			let mut wal = self.inner.wal.write();
+			if wal.get_active_log_number() != tag {
+				return Err(tag_mismatch(&segments[from..], tag));
+			}
+			let segment = wal.append_group(wal_buf, wal_ends)?;
+			if sync {
+				wal.sync()?;
+			}
+			for j in stale {
+				segments[from + j] = segment;
+			}
+		}
+		#[cfg(test)]
+		self.fire(PipelineHook::BeforeFencedApply);
+		Self::apply_to(&active, batches, oversized, segments, from)
+	}
+
+	/// The loop of `apply_run`, on the memtable the caller holds the read guard of.
+	fn apply_to(
+		active: &MemTable,
+		batches: &[Batch],
+		oversized: &[bool],
+		segments: &[u64],
+		from: usize,
+	) -> Result<(usize, ApplyStop)> {
 		let tag = active.get_wal_number();
 		let mut at = from;
 		while at < batches.len() {
@@ -726,7 +1028,9 @@ impl CommitPipeline {
 	/// log needs no second pass: its entries were synced with the first.
 	///
 	/// The stale batches go to the WAL as one group, so they land in one segment. They are
-	/// encoded into the group's own buffers, which the first append gave back.
+	/// encoded into the group's own buffers, which the first append gave back with room for the
+	/// whole group. Nothing is reserved here, because part of the group is already applied and
+	/// the step must not fail for want of memory.
 	#[allow(clippy::too_many_arguments)]
 	async fn reappend_stale(
 		&self,
@@ -778,8 +1082,10 @@ impl CommitPipeline {
 		Ok(())
 	}
 
-	/// Shuts down the pipeline. The flusher makes every commit already
-	/// accepted durable before it exits.
+	/// Shuts down the pipeline. New commits fail at once. The flusher decides every commit that
+	/// was admitted before, making the accepted ones durable, and only then exits. A commit that
+	/// was handed a permit while it queued for admission, and whose future is then neither polled
+	/// nor dropped, keeps the flusher waiting for it.
 	pub(crate) fn shutdown(&self) {
 		self.shutdown.store(true, Ordering::Release);
 		self.notify_flusher.notify_one();
@@ -808,7 +1114,9 @@ impl CommitPipeline {
 /// first oversized batch: it is written to an L0 table instead, which makes its record redundant
 /// and seals the segment, so a record behind it would be stale again before it could be applied.
 ///
-/// The buffers are the group's own, which the first append gave back.
+/// The buffers are the group's own, which the first append gave back with room for the whole
+/// group, so nothing is reserved: part of the group may be applied already, and the step must not
+/// fail for want of memory.
 fn encode_stale(
 	batches: &[Batch],
 	oversized: &[bool],
@@ -834,8 +1142,8 @@ fn encode_stale(
 	Ok(stale)
 }
 
-/// The error of a group whose records stay in segments other than the active memtable's tag
-/// however often they are logged again.
+/// The error of a group whose records are in segments that no rotation will make the active
+/// memtable's tag: the tag is wrong, and logging the group again would not help.
 fn tag_mismatch(segments: &[u64], tag: u64) -> Error {
 	Error::Other(format!(
 		"WAL segment and memtable tag mismatch: records in segments {segments:?}, active \

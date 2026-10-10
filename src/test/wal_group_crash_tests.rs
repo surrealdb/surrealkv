@@ -1298,6 +1298,7 @@ async fn immediate_groups_are_fsynced_before_apply_on_every_path() {
 							*rounds.lock().unwrap() += 1;
 							unsynced.lock().unwrap().push(wal.pending_sync());
 						}
+						PipelineHook::BeforeFencedApply => {}
 					}
 				})));
 			}
