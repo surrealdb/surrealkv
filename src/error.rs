@@ -30,6 +30,8 @@ pub enum Error {
 	TableMetadataNotFound,
 	Wal(String),
 	BlockNotFound,
+	/// The batch of a commit encodes to more bytes than one WAL record can hold, `u32::MAX`.
+	/// Nothing of it reaches the WAL.
 	BatchTooLarge,
 	InvalidBatchRecord,
 	TransactionWriteConflict,
@@ -98,7 +100,7 @@ impl fmt::Display for Error {
             Self::TableMetadataNotFound => write!(f, "Table metadata not found"),
             Self::Wal(err) => write!(f, "WAL error: {err}"),
             Self::BlockNotFound => write!(f, "Block not found"),
-            Self::BatchTooLarge => write!(f, "Batch too large"),
+            Self::BatchTooLarge => write!(f, "Batch too large: a batch encodes to at most {} bytes", u32::MAX),
             Self::InvalidBatchRecord => write!(f, "Invalid batch record"),
             Self::TransactionWriteConflict => write!(f, "Transaction write conflict"),
             Self::TransactionRetry => write!(f, "Transaction retry required: snapshot is older than the commit oracle's GC window"),

@@ -9,11 +9,30 @@ use crate::varint::{
 use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
 use crate::{InternalKeyKind, Key, Value};
 
-pub(crate) const MAX_BATCH_SIZE: u64 = 1 << 32;
+/// The most bytes a batch may encode to: a WAL record is one batch, and the LZ4 block of a
+/// compressed record says its length as a `u32`. `Batch::grow` refuses a record that would take
+/// the batch past it, and `Batch::exceeds_max_size` is the same test on a whole batch.
+pub(crate) const MAX_BATCH_SIZE: u64 = u32::MAX as u64;
+/// The bytes of an encoded batch ahead of its entries, at most: the version, and the varints of
+/// the sequence number (10 bytes) and of the entry count (5 bytes). An entry counts for 11 bytes
+/// at the least, so the count of a batch at the limit fits the `u32` it is written as.
+pub(crate) const ENCODED_HEADER_SIZE: u64 = 1 + 10 + 5;
+/// The bytes an entry takes in an encoded batch beyond what `Batch::grow` counts for it, at
+/// most: a timestamp varint of up to 10 bytes where `grow` counts 8, and its value pointer flag.
+pub(crate) const ENCODED_ENTRY_SLACK: u64 = 2 + 1;
+const _: () = assert!(MAX_BATCH_SIZE <= u32::MAX as u64);
 pub(crate) const BATCH_VERSION: u8 = 1;
 /// The fewest bytes an entry takes in an encoded batch: kind, key length, value
 /// length and timestamp (one byte each when empty), and its value pointer flag.
 const MIN_ENTRY_SIZE: usize = 5;
+
+/// An upper bound on the bytes that a batch of `entries` entries, whose `grow` size is `size`,
+/// encodes to when none of them holds a value pointer.
+fn encoded_len_bound(size: u64, entries: usize) -> u64 {
+	size.saturating_add(ENCODED_HEADER_SIZE)
+		.saturating_add(ENCODED_ENTRY_SLACK.saturating_mul(entries as u64))
+}
+
 /// Represents a single entry in a batch
 #[derive(Debug, Clone)]
 pub(crate) struct BatchEntry {
@@ -54,11 +73,14 @@ impl Batch {
 		}
 	}
 
+	/// Counts a record of `record_size` bytes in the batch, or refuses it with `BatchTooLarge`
+	/// if the batch would then encode to more than `MAX_BATCH_SIZE`.
 	pub(crate) fn grow(&mut self, record_size: u64) -> Result<()> {
-		if self.size + record_size > MAX_BATCH_SIZE {
+		let size = self.size.saturating_add(record_size);
+		if encoded_len_bound(size, self.entries.len() + 1) > MAX_BATCH_SIZE {
 			return Err(Error::BatchTooLarge);
 		}
-		self.size += record_size;
+		self.size = size;
 		self.entries.reserve(1);
 		self.valueptrs.reserve(1);
 		Ok(())
@@ -76,7 +98,14 @@ impl Batch {
 	/// counts. Only a hint: `size` is not tracked for decoded batches, and a batch holding value
 	/// pointers encodes longer, in which case the buffer simply grows.
 	pub(crate) fn encoded_len_hint(&self) -> usize {
-		self.size as usize + 16 + self.entries.len() * 3
+		usize::try_from(encoded_len_bound(self.size, self.entries.len())).unwrap_or(usize::MAX)
+	}
+
+	/// Whether the batch encodes to more bytes than one WAL record can hold, see
+	/// `MAX_BATCH_SIZE`. `grow` keeps a batch from getting there, but the flusher changes the
+	/// values of a batch (it wraps them, or replaces them by a pointer), which can.
+	pub(crate) fn exceeds_max_size(&self) -> bool {
+		encoded_len_bound(self.size, self.entries.len()) > MAX_BATCH_SIZE
 	}
 
 	/// Appends the encoding of this batch to `encoded`, after whatever it already holds.

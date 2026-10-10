@@ -27,19 +27,36 @@ use crate::{InternalKey, InternalKeyKind, LSMIterator, Options, INTERNAL_KEY_SEQ
 // Tracks live heap bytes per thread so a test can measure the residency of
 // exactly the allocations it performs, independent of tests on other
 // threads. Attribution is by allocating/freeing thread, which is exact for
-// the single-threaded measurements below.
+// the single-threaded measurements below. It also counts the allocations of
+// a thread and can make a range of sizes fail on it, for the tests of the
+// commit path.
 
 thread_local! {
 	static LIVE_BYTES: Cell<i64> = const { Cell::new(0) };
 	static HIGH_WATER: Cell<i64> = const { Cell::new(0) };
+	/// The allocations this thread made, see `count_allocations`.
+	static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
+	/// The sizes, as an inclusive range, that this thread's allocator refuses, see
+	/// `RefuseAllocations`. The default range is empty.
+	static REFUSED: Cell<(usize, usize)> = const { Cell::new((usize::MAX, 0)) };
 }
 
 struct CountingAllocator;
 
 unsafe impl GlobalAlloc for CountingAllocator {
 	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+		let refused = REFUSED
+			.try_with(|range| {
+				let (from, to) = range.get();
+				(from..=to).contains(&layout.size())
+			})
+			.unwrap_or(false);
+		if refused {
+			return std::ptr::null_mut();
+		}
 		let ptr = System.alloc(layout);
 		if !ptr.is_null() {
+			let _ = ALLOCATIONS.try_with(|c| c.set(c.get() + 1));
 			let _ = LIVE_BYTES.try_with(|c| {
 				let live = c.get() + layout.size() as i64;
 				c.set(live);
@@ -64,6 +81,33 @@ static COUNTING_ALLOCATOR: CountingAllocator = CountingAllocator;
 
 fn live_bytes() -> i64 {
 	LIVE_BYTES.with(|c| c.get())
+}
+
+/// Runs `f` and returns what it returned with the number of allocations this thread made while
+/// it ran. A `realloc` counts as one, as the allocator does not override it.
+pub(super) fn count_allocations<R>(f: impl FnOnce() -> R) -> (R, u64) {
+	let before = ALLOCATIONS.with(|c| c.get());
+	let result = f();
+	(result, ALLOCATIONS.with(|c| c.get()) - before)
+}
+
+/// While it lives, an allocation of a size in the range fails on this thread, as it does when
+/// the allocator has no memory to give. A fallible reservation then returns an error, and an
+/// infallible one aborts the process. Exactly the sizes of one allocation can be named, so that
+/// no other allocation of the thread is affected, and nothing of the size ever has to exist.
+pub(super) struct RefuseAllocations;
+
+impl RefuseAllocations {
+	pub(super) fn of_size(sizes: std::ops::RangeInclusive<usize>) -> Self {
+		REFUSED.with(|range| range.set((*sizes.start(), *sizes.end())));
+		Self
+	}
+}
+
+impl Drop for RefuseAllocations {
+	fn drop(&mut self) {
+		REFUSED.with(|range| range.set((usize::MAX, 0)));
+	}
 }
 
 /// Resets the live-heap high-water mark to the current live level;

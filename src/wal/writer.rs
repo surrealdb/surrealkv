@@ -2,6 +2,7 @@ use std::io;
 use std::sync::Arc;
 
 use crc32fast::Hasher;
+use lz4_flex::block::{compress_into, get_maximum_output_size};
 
 use super::{
 	sync_poisoned,
@@ -103,6 +104,8 @@ impl Writer {
 	/// - Ok(()) if successful.
 	/// - Err if an I/O error occurs.
 	pub fn add_record(&mut self, slice: &[u8]) -> Result<()> {
+		let compressed = self.compress_records(slice, &[slice.len()])?;
+		let slice = compressed.as_ref().map_or(slice, |(blocks, _)| &blocks[..]);
 		self.guard_append(|writer| writer.write_record(slice))
 	}
 
@@ -116,7 +119,14 @@ impl Writer {
 	///
 	/// The caller guarantees that every record is non-empty and that `ends` is increasing and
 	/// within `buf`.
+	///
+	/// A record that cannot be compressed, for want of memory or because it is too long for an LZ4
+	/// block, fails the call before anything is appended: the segment is untouched and the writer
+	/// is not poisoned.
 	pub fn add_records(&mut self, buf: &[u8], ends: &[usize]) -> Result<()> {
+		let compressed = self.compress_records(buf, ends)?;
+		let (buf, ends) =
+			compressed.as_ref().map_or((buf, ends), |(blocks, ends)| (&blocks[..], &ends[..]));
 		self.guard_append(|writer| {
 			// Every append ends in a flush, so the file length is known and the segment can be
 			// cut back to it. Checked once the writer is known not to be poisoned: a failed
@@ -145,20 +155,12 @@ impl Writer {
 		Ok(())
 	}
 
-	/// Frames `slice` into the buffer without flushing it. Everything that makes a record
-	/// what it is on disk happens here: compression, fragmentation, padding and the headers,
-	/// so a group of records can only ever be framed the way a single one is.
-	fn write_record_unflushed(&mut self, slice: &[u8]) -> Result<()> {
-		// Compress data if compression is enabled
-		let compressed;
-		let data_to_write = if self.compression_type == CompressionType::Lz4 {
-			compressed = lz4_flex::compress_prepend_size(slice);
-			&compressed[..]
-		} else {
-			slice
-		};
-
-		let mut ptr = data_to_write;
+	/// Frames `data`, compressed already if the segment is, into the buffer without flushing it.
+	/// Everything else that makes a record what it is on disk happens here: fragmentation,
+	/// padding and the headers, so a group of records can only ever be framed the way a single
+	/// one is.
+	fn write_record_unflushed(&mut self, data: &[u8]) -> Result<()> {
+		let mut ptr = data;
 		let mut begin = true;
 
 		// Fragment the record if necessary and emit it
@@ -192,6 +194,48 @@ impl Writer {
 		}
 
 		Ok(())
+	}
+
+	/// The records of `buf` (`buf[ends[i - 1]..ends[i]]` being record `i`) as the bytes that go
+	/// into the segment: one LZ4 block per record, joined, with where each ends, if the segment
+	/// is compressed. `None` if it is not, and the caller's own bytes go in as they are.
+	///
+	/// A separate step, done before an append is guarded, so that a failure here cannot poison
+	/// the writer. The room for every block is reserved at once and exactly, and fallibly, so the
+	/// blocks themselves cannot abort the process (`lz4_flex` still allocates its small hash
+	/// table for each record). A record that an LZ4 block cannot describe is an error.
+	fn compress_records(
+		&self,
+		buf: &[u8],
+		ends: &[usize],
+	) -> Result<Option<(Vec<u8>, Vec<usize>)>> {
+		if self.compression_type != CompressionType::Lz4 {
+			return Ok(None);
+		}
+
+		let records = || {
+			ends.iter().scan(0, |start, &end| {
+				let record = &buf[*start..end];
+				*start = end;
+				Some(record)
+			})
+		};
+		let mut capacity = 0usize;
+		for record in records() {
+			let (_, block) = lz4_block_size(record.len()).ok_or_else(record_too_long)?;
+			capacity = capacity.checked_add(block).ok_or_else(record_too_long)?;
+		}
+		let mut blocks = Vec::new();
+		blocks.try_reserve_exact(capacity).map_err(|e| Error::from(io::Error::from(e)))?;
+		let mut block_ends = Vec::new();
+		block_ends.try_reserve_exact(ends.len()).map_err(|e| Error::from(io::Error::from(e)))?;
+
+		for record in records() {
+			// Into the room reserved above, so nothing here allocates.
+			push_lz4_block(&mut blocks, record)?;
+			block_ends.push(blocks.len());
+		}
+		Ok(Some((blocks, block_ends)))
 	}
 
 	/// Adds a compression type record at the start of the WAL.
@@ -347,6 +391,37 @@ impl Writer {
 
 		Ok(())
 	}
+}
+
+/// The bytes of the length that an LZ4 block of a record starts with.
+const LZ4_LEN_SIZE: usize = 4;
+
+fn record_too_long() -> Error {
+	Error::IO(IOError::new(io::ErrorKind::InvalidInput, "record is too long for an LZ4 block"))
+}
+
+/// The length that the LZ4 block of a record of `len` bytes starts with, and the most bytes the
+/// block takes, that length included. `None` if the record is longer than a `u32` can say, or
+/// the block would not be addressable.
+fn lz4_block_size(len: usize) -> Option<(u32, usize)> {
+	let prefix = u32::try_from(len).ok()?;
+	// `get_maximum_output_size` multiplies `len` by 110, which would wrap where `usize` is narrow.
+	let block = (len <= usize::MAX / 110).then(|| get_maximum_output_size(len))?;
+	Some((prefix, block.checked_add(LZ4_LEN_SIZE)?))
+}
+
+/// Appends the LZ4 block of `record` to `blocks`: the length of the record as a little-endian
+/// `u32`, which `lz4_flex::decompress_size_prepended` reads, and the compressed bytes. Allocates
+/// only if `blocks` lacks room for the most the block can take.
+fn push_lz4_block(blocks: &mut Vec<u8>, record: &[u8]) -> Result<()> {
+	let (prefix, size) = lz4_block_size(record.len()).ok_or_else(record_too_long)?;
+	let at = blocks.len();
+	blocks.extend_from_slice(&prefix.to_le_bytes());
+	blocks.resize(at + size, 0);
+	let written = compress_into(record, &mut blocks[at + LZ4_LEN_SIZE..])
+		.map_err(|e| Error::IO(IOError::new(io::ErrorKind::InvalidData, &e.to_string())))?;
+	blocks.truncate(at + LZ4_LEN_SIZE + written);
+	Ok(())
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -606,5 +681,51 @@ mod tests {
 		);
 		assert!(writes <= large.len() / 2, "{writes} writes for {} records", large.len());
 		assert_eq!(read_records(&temp_dir.path().join("large.wal")), large);
+	}
+
+	/// The block of a record is the one `lz4_flex::compress_prepend_size` makes, whatever the
+	/// record holds, so segments written before the block was made in place read as they did.
+	#[test]
+	fn an_lz4_block_is_the_one_lz4_flex_makes() {
+		let mut records: Vec<Vec<u8>> = [0, 1, 2, 17, 100, 4_096, 70_000, 300_000]
+			.into_iter()
+			.enumerate()
+			.map(|(i, len)| payload(i, len))
+			.collect();
+		records.extend([0, 1, 100, 70_000, 300_000].map(|len| vec![b'z'; len]));
+		records.push((0..50_000u32).flat_map(|i| (i % 251).to_le_bytes()).collect());
+		for record in records {
+			let (_, size) = lz4_block_size(record.len()).unwrap();
+			let mut blocks = Vec::with_capacity(size);
+			push_lz4_block(&mut blocks, &record).unwrap();
+			assert_eq!(blocks.capacity(), size, "no room was asked for beyond the bound");
+			assert_eq!(
+				blocks,
+				lz4_flex::compress_prepend_size(&record),
+				"a record of {} bytes",
+				record.len()
+			);
+			assert_eq!(lz4_flex::decompress_size_prepended(&blocks).unwrap(), record);
+		}
+	}
+
+	/// An LZ4 block says the length of its record in a `u32`: a longer record is refused, and
+	/// the longest one that is not has a block that is addressable.
+	#[test]
+	fn an_lz4_block_refuses_a_record_longer_than_its_length_field_says() {
+		assert_eq!(lz4_block_size(0).map(|(prefix, _)| prefix), Some(0));
+		assert_eq!(lz4_block_size(1).map(|(prefix, _)| prefix), Some(1));
+		#[cfg(target_pointer_width = "64")]
+		{
+			let longest = u32::MAX as usize;
+			let (prefix, size) = lz4_block_size(longest).unwrap();
+			assert_eq!(prefix, u32::MAX);
+			assert_eq!(size, get_maximum_output_size(longest) + LZ4_LEN_SIZE);
+			for len in [longest + 1, longest + 2, 1 << 33, usize::MAX] {
+				assert!(lz4_block_size(len).is_none(), "a record of {len} bytes");
+			}
+		}
+		#[cfg(not(target_pointer_width = "64"))]
+		assert!(lz4_block_size(usize::MAX).is_none());
 	}
 }

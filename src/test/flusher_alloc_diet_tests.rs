@@ -11,18 +11,22 @@
 //!   spent one.
 
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::{pin, Pin};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 use tempdir::TempDir;
 use test_log::test;
 
 use super::collect_transaction_all;
+use super::compaction_memory_proofs::count_allocations;
 use crate::batch::Batch;
 use crate::clock::LogicalClock;
 use crate::memtable::{max_entry_bytes, MemTable};
-use crate::ring::PipelineHook;
+use crate::ring::{CommitPipeline, PipelineHook};
 use crate::vlog::ValueLocation;
 use crate::wal::parallel_recovery::decode_segment_batches;
 use crate::{
@@ -1424,4 +1428,160 @@ fn add_owned_reports_a_drifting_estimate_as_an_error_that_is_not_arena_full() {
 	assert_eq!(contents(&memtable).len(), failed);
 	// The reservation is given back all the same.
 	assert!(memtable.can_fit((memtable.arena_capacity() - memtable.size()) as u64));
+}
+
+// ---------------------------------------------------------------------------
+// the allocations of the flusher
+// ---------------------------------------------------------------------------
+
+/// What the flusher allocates in steady state for a group of small commits, counted with the
+/// thread-local counter of the test allocator.
+///
+/// The real `run_flusher` is polled by hand on the calling thread, over a pipeline of its own
+/// that shares the tree's WAL and memtables: the commits are polled to the point where they are
+/// accepted (so they are one group), and then one poll of the flusher gathers the group, logs
+/// it, applies it and completes it. Only that poll is counted, so the commits' own allocations
+/// are not. The WAL append runs inline, as no global pool is installed; with one, the append and
+/// the fsync run on a pool thread and are not counted here, and neither is anything the
+/// committers allocate. The value log is off.
+///
+/// Every group is of `size` commits of `entries` entries each. A value with `spare` set has the
+/// two bytes that wrap it already in its capacity, as one that the committer built so has: the
+/// flusher then has nothing to grow. Without it the value has no room to spare, as most values
+/// arrive, and wrapping it is a reallocation. Returns the count for each of `groups` groups
+/// after a warm-up, in which buffers reach their size and one-time state is set up.
+async fn allocations_per_group(
+	size: usize,
+	entries: usize,
+	sync: bool,
+	spare: bool,
+	groups: usize,
+) -> Vec<u64> {
+	const WARM_UP: usize = 8;
+	// Formatting an event allocates, and would be counted if a subscriber were installed.
+	let _quiet = tracing::subscriber::set_default(tracing::subscriber::NoSubscriber::default());
+
+	let dir = TempDir::new("alloc_diet").unwrap();
+	let tree = Tree::new(Arc::new(Options {
+		path: dir.path().to_path_buf(),
+		flush_on_close: false,
+		..Default::default()
+	}))
+	.unwrap();
+	let live = &tree.core.commit_pipeline;
+	let pipeline =
+		CommitPipeline::new(Arc::clone(&live.inner), Arc::clone(&live.write_stall), None, 1);
+	let group_size = Arc::new(AtomicUsize::new(0));
+	let seen = Arc::clone(&group_size);
+	pipeline.set_hook(Some(Arc::new(move |point| {
+		if let PipelineHook::AfterWalSync {
+			batches,
+		} = point
+		{
+			seen.store(batches, Ordering::SeqCst);
+		}
+	})));
+
+	let cx = &mut Context::from_waker(Waker::noop());
+	let mut flusher = pin!(pipeline.run_flusher_in_test());
+	assert!(flusher.as_mut().poll(cx).is_pending(), "the flusher waits for the first commit");
+
+	let mut counts = Vec::new();
+	let mut written = 0u64;
+	for group in 0..WARM_UP + groups {
+		let mut commits: Vec<Pin<Box<dyn Future<Output = crate::Result<()>> + '_>>> = Vec::new();
+		for _ in 0..size {
+			let mut batch = Batch::new(0);
+			for _ in 0..entries {
+				written += 1;
+				let mut value = Vec::with_capacity(100 + 2 * usize::from(spare));
+				value.resize(100, 7u8);
+				batch
+					.add_record(
+						InternalKeyKind::Set,
+						format!("key{written:010}").into_bytes(),
+						Some(value),
+						written,
+					)
+					.unwrap();
+			}
+			let window = pipeline.commit_window();
+			let start_seq = live.inner.visible_seq_num.load(Ordering::SeqCst);
+			let mut commit = Box::pin(pipeline.commit(batch, sync, start_seq, window, &[]));
+			assert!(commit.as_mut().poll(cx).is_pending(), "the commit waits for the flusher");
+			commits.push(commit);
+		}
+
+		let (poll, allocations) = count_allocations(|| flusher.as_mut().poll(cx));
+		assert!(poll.is_pending(), "the flusher waits for the next commit");
+		assert_eq!(group_size.load(Ordering::SeqCst), size, "group {group}: one group of commits");
+		for mut commit in commits {
+			match commit.as_mut().poll(cx) {
+				Poll::Ready(result) => result.unwrap(),
+				Poll::Pending => panic!(
+					"group {group} was not completed by one poll: this needs the WAL append to run \
+					 inline, which it does not in a process with a global affinity pool"
+				),
+			}
+		}
+		if group >= WARM_UP {
+			counts.push(allocations);
+		}
+	}
+	assert_eq!(live.inner.visible_seq_num.load(Ordering::SeqCst), written, "every entry applied");
+	pipeline.set_hook(None);
+	crash(tree);
+	counts
+}
+
+/// A group of small commits allocates a constant number of times, whatever its size, as long as
+/// its values have room for the bytes that wrap them. Measured on this tree, per group: none
+/// without an fsync, one with (the boxed future of the sync), and now and then one more in a
+/// group that runs `retire`. The bound is 4, which leaves room for what the platform adds, and
+/// still fails for a single allocation per entry from a group of 8: the gather, the encoding,
+/// the log, the apply and the completion allocate nothing per commit or per entry.
+///
+/// The values that arrive without room to spare cost one reallocation each, which is the only
+/// allocation per entry there is: a group of `n` entries counts `n` more, no matter how its
+/// commits and entries divide it.
+#[tokio::test]
+async fn a_group_of_small_commits_allocates_a_constant_number_of_times() {
+	const PER_GROUP: u64 = 4;
+	// Long enough to run `retire` twice, which is every 16 groups.
+	const GROUPS: usize = 34;
+	for (size, entries) in [(1, 1), (8, 1), (64, 1), (8, 4)] {
+		// An fsync is slow and adds the same one allocation to any group: the smallest and the
+		// largest group are enough to see it.
+		let syncs: &[bool] = if entries == 1 && size != 8 {
+			&[false, true]
+		} else {
+			&[false]
+		};
+		for &sync in syncs {
+			let counts = tokio::task::unconstrained(allocations_per_group(
+				size, entries, sync, true, GROUPS,
+			))
+			.await;
+			assert!(
+				counts.iter().all(|count| *count <= PER_GROUP),
+				"{size} commits of {entries} entries, sync {sync}, values with room: more than \
+				 {PER_GROUP} allocations a group: {counts:?}"
+			);
+
+			let counts = tokio::task::unconstrained(allocations_per_group(
+				size, entries, sync, false, GROUPS,
+			))
+			.await;
+			let bound = (size * entries) as u64 + PER_GROUP;
+			assert!(
+				counts.iter().all(|count| *count <= bound),
+				"{size} commits of {entries} entries, sync {sync}, values without room: more \
+				 than {bound} allocations a group: {counts:?}"
+			);
+			assert!(
+				counts.iter().all(|count| *count >= (size * entries) as u64),
+				"control: the reallocation of every value is counted: {counts:?}"
+			);
+		}
+	}
 }

@@ -475,21 +475,21 @@ impl CoreInner {
 		let mut range_deletions = Vec::new();
 		let mut point_entries = Vec::new();
 
+		// The values are borrowed from the batch, not copied: a batch that takes this path is
+		// larger than a memtable, and a second copy of its values doubles what it needs.
 		for (_, entry, seq_num, _) in batch.entries_with_seq_nums()? {
 			let ikey = crate::InternalKey::new(entry.key.clone(), seq_num, entry.kind);
+			let value = entry.value.as_deref().unwrap_or(&[]);
 			if entry.kind == crate::InternalKeyKind::RangeDelete {
-				let end_key = entry.value.clone().unwrap_or_default();
-				range_deletions.push((entry.key.clone(), end_key.clone(), seq_num));
-				// Range-delete entries are ALSO added as a point entry (start_key ->
-				// end_key), matching `MemTable::flush`'s behavior. Without this, the
-				// table's `smallest_point`/`largest_point` bounds (which range-scan
-				// pruning consults) would never cover the tombstone's start key, so a
-				// scan could skip this table entirely and resurrect data the tombstone
-				// was meant to hide.
-				point_entries.push((ikey, Some(end_key)));
-			} else {
-				point_entries.push((ikey, entry.value.clone()));
+				range_deletions.push((entry.key.clone(), value.to_vec(), seq_num));
 			}
+			// Range-delete entries are ALSO added as a point entry (start_key ->
+			// end_key), matching `MemTable::flush`'s behavior. Without this, the
+			// table's `smallest_point`/`largest_point` bounds (which range-scan
+			// pruning consults) would never cover the tombstone's start key, so a
+			// scan could skip this table entirely and resurrect data the tombstone
+			// was meant to hide.
+			point_entries.push((ikey, value));
 		}
 
 		// Sort point entries by InternalKey comparator: user_key ASC, seq_num DESC
@@ -502,8 +502,7 @@ impl CoreInner {
 				crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&self.opts), 0);
 
 			for (key, val) in point_entries {
-				let val_bytes = val.as_deref().unwrap_or(&[]);
-				table_writer.add(key, val_bytes)?;
+				table_writer.add(key, val)?;
 			}
 
 			for (start, end, seq) in &range_deletions {

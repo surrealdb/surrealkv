@@ -456,6 +456,12 @@ impl Wal {
 		self.active_writer.sync_gate().set_observer(observer);
 	}
 
+	/// Makes the segments that a rotation creates from now on use `compression_type`.
+	#[cfg(test)]
+	pub(crate) fn set_compression_of_new_segments(&mut self, compression_type: CompressionType) {
+		self.opts.compression_type = compression_type;
+	}
+
 	/// Test-only: whether an fsync of the active segment failed, which poisons its writer.
 	#[cfg(test)]
 	pub(crate) fn sync_failed(&self) -> bool {
