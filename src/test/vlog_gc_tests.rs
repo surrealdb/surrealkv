@@ -2121,11 +2121,9 @@ async fn a_truncated_value_log_file_fails_the_reads_beyond_the_cut_with_checksum
 	truncated_file_case(VLogChecksumLevel::Full).await;
 }
 
-/// The default level does not verify checksums, and a read of an entry that is cut short by the
-/// end of its file takes the bytes that are missing from the buffer's zeros.
+/// The default level does not verify checksums, so nothing but the length of what was read tells
+/// an entry that the end of its file cuts short from one that was written.
 #[test(tokio::test)]
-#[ignore = "a value-log entry cut short by the end of its file reads as the value with a zeroed \
-            tail when checksums are not verified: the length that read_at returned is not checked"]
 async fn a_truncated_value_log_file_fails_the_reads_beyond_the_cut_without_checksums() {
 	truncated_file_case(VLogChecksumLevel::Disabled).await;
 }

@@ -1085,14 +1085,43 @@ impl VLog {
 		let value_len = pointer.value_size;
 		let total_size = pointer.total_entry_size();
 
+		// `read_at` may return fewer bytes than asked for, and returns none at the end of the
+		// file: read until the entry is complete or the file ends. An entry that the end of its
+		// file cuts short is an error, not a value whose tail is the zeros of the buffer: without
+		// checksum verification nothing else would tell them apart from what was written.
 		let mut entry_data_vec = vec![0u8; total_size as usize];
-		vfs::File::read_at(&*file, pointer.offset, &mut entry_data_vec).map_err(|e| {
-			tracing::error!("Failed to read VLog entry: pointer={:?}, error={}", pointer, e);
-			Error::Other(format!(
-				"Failed to read VLog entry (file_id={}, offset={}, key_size={}, value_size={}): {}",
-				pointer.file_id, pointer.offset, pointer.key_size, pointer.value_size, e
-			))
-		})?;
+		let mut filled = 0;
+		while filled < entry_data_vec.len() {
+			let read = vfs::File::read_at(
+				&*file,
+				pointer.offset + filled as u64,
+				&mut entry_data_vec[filled..],
+			)
+			.map_err(|e| {
+				tracing::error!("Failed to read VLog entry: pointer={:?}, error={}", pointer, e);
+				Error::Other(format!(
+					"Failed to read VLog entry (file_id={}, offset={}, key_size={}, value_size={}): {}",
+					pointer.file_id, pointer.offset, pointer.key_size, pointer.value_size, e
+				))
+			})?;
+			if read == 0 {
+				break;
+			}
+			filled += read;
+		}
+		if filled < entry_data_vec.len() {
+			tracing::error!(
+				"VLog entry cut short by the end of its file: pointer={:?}, read {} of {} bytes",
+				pointer,
+				filled,
+				total_size
+			);
+			return Err(Error::Corruption(format!(
+				"VLog entry cut short by the end of its file (file_id={}, offset={}): read {} of {} \
+				 bytes",
+				pointer.file_id, pointer.offset, filled, total_size
+			)));
+		}
 
 		// Verify header sizes
 		let header_key_len = u32::from_be_bytes([
