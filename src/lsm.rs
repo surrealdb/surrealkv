@@ -94,9 +94,13 @@ pub trait CompactionOperations: Send + Sync {
 /// them: a flush, the shutdown flush and a restore hold it while they take the others, and
 /// nothing waits for it while holding one of them.
 ///
-/// The WAL's own lock (`wal`) is a leaf: nothing is acquired while it is held, except the
-/// segment's fsync gate, which is itself a leaf, so it can be taken after any of the locks above
-/// or on its own. Rotation takes it under `active_memtable` (`rotate_memtable()`,
+/// The WAL's own lock (`wal`) sits below every lock above. Under it are taken only the segment's
+/// fsync gate, which is a leaf, and, by a rotation (`rotate_wal()`), the value log's writer lock
+/// and its list of unsynced files, which nothing holds while it waits for the WAL lock: the commit
+/// pipeline appends to the value log before it takes the WAL lock and never holds both. The
+/// rotation that opening a tree and a restore make to continue in a fresh segment takes them the
+/// same way.
+/// The WAL lock is taken under `active_memtable` by rotation (`rotate_memtable()`,
 /// `seal_active_wal_segment()`), and so do the shutdown flush and the commit pipeline's fenced
 /// round. Everything else takes it alone, and some of it from pool threads: the commit pipeline
 /// for every append and every fsync of a commit group (`AffinityLogStore`), and `flush_wal`,
@@ -556,7 +560,7 @@ impl CoreInner {
 		let (flushed_wal_number, new_wal_number) = {
 			let mut wal_guard = self.wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
-			wal_guard.rotate().map_err(|e| {
+			self.rotate_wal(&mut wal_guard).map_err(|e| {
 				Error::Other(format!("Failed to rotate WAL before memtable rotation: {}", e))
 			})?;
 			let new_log_number = wal_guard.get_active_log_number();
@@ -608,6 +612,22 @@ impl CoreInner {
 		Ok(())
 	}
 
+	/// Rotates the WAL under the guard the caller holds, with the value log synced before the
+	/// old segment is: its records point into the value log, and none may be durable ahead of its
+	/// value. Nothing is fsynced if no value is unsynced.
+	///
+	/// The value log's locks are taken inside the WAL lock. Nothing that holds one of them waits
+	/// for the WAL lock: the commit pipeline appends to the value log before it takes the WAL
+	/// lock, and never holds both.
+	fn rotate_wal(&self, wal: &mut Wal) -> wal::Result<u64> {
+		wal.rotate_with(|| match self.vlog {
+			Some(ref vlog) => {
+				vlog.sync_dirty().map_err(|e| std::io::Error::other(e.to_string()).into())
+			}
+			None => Ok(()),
+		})
+	}
+
 	/// Ensures the WAL segment currently backing the active memtable can never receive
 	/// another write, and returns that WAL number.
 	///
@@ -632,7 +652,7 @@ impl CoreInner {
 		}
 
 		let mut wal_guard = self.wal.write();
-		wal_guard.rotate().map_err(|e| {
+		self.rotate_wal(&mut wal_guard).map_err(|e| {
 			Error::Other(format!("Failed to rotate WAL before direct-to-L0 flush: {}", e))
 		})?;
 		let new_wal_number = wal_guard.get_active_log_number();
@@ -1404,8 +1424,12 @@ impl Core {
 
 		// Always continue in a fresh segment: replay may have repaired (replaced) the
 		// segment the writer was opened on, or flushed it and moved the manifest's
-		// log number past it.
-		inner.wal.write().rotate()?;
+		// log number past it. Like every rotation it goes through `rotate_wal()`, which
+		// syncs the value log first if it holds unsynced values.
+		{
+			let mut wal_guard = inner.wal.write();
+			inner.rotate_wal(&mut wal_guard)?;
+		}
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
@@ -2136,8 +2160,12 @@ impl Tree {
 
 		// Always continue in a fresh segment: replay may have repaired (replaced) the
 		// segment the writer was opened on, or flushed it and moved the manifest's
-		// log number past it.
-		self.core.inner.wal.write().rotate()?;
+		// log number past it. Like every rotation it goes through `rotate_wal()`, which
+		// syncs the value log first if it holds unsynced values.
+		{
+			let mut wal_guard = self.core.inner.wal.write();
+			self.core.inner.rotate_wal(&mut wal_guard)?;
+		}
 
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
@@ -2443,6 +2471,12 @@ impl Default for TreeBuilder {
 		Self::new()
 	}
 }
+
+/// Test-only: the directories `fsync_directory` has synced, canonicalized, in order.
+#[cfg(test)]
+pub(crate) static SYNCED_DIRECTORIES: parking_lot::Mutex<Vec<std::path::PathBuf>> =
+	parking_lot::Mutex::new(Vec::new());
+
 /// Syncs a directory to ensure all changes are persisted to disk
 pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 	let path = path.as_ref();
@@ -2460,6 +2494,9 @@ pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 		debug_assert!(file.metadata()?.is_dir());
 		file.sync_all()?;
 	}
+
+	#[cfg(test)]
+	SYNCED_DIRECTORIES.lock().push(path.canonicalize()?);
 
 	Ok(())
 }

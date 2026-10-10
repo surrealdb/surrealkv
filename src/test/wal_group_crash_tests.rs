@@ -14,12 +14,16 @@
 //! * the values a WAL record points to are fsynced before the record is logged by a group that
 //!   syncs, in every value log file the group wrote to, and a sync of the WAL (`flush_wal`, close,
 //!   a memtable flush) syncs them too;
+//! * sealing a WAL segment (a memtable rotation, a checkpoint, a write straight to L0) fsyncs the
+//!   value log first, only when it holds unsynced bytes, and a vlog fsync that fails fails the
+//!   rotation and leaves the WAL as it was;
 //! * a failed value log write leaves nothing in the file, and the commits after it read back;
 //! * the flusher's reused buffers never carry bytes from one group into the next.
 //!
 //! Test-only instrumentation these tests need: `BufferedFileWriter::pending_sync` (and the
-//! `Writer` / `Wal` forwarders), `WalManager::fsyncs`, `vlog::SYNCED_VLOG_FILES`, and the
-//! failpoints `VLog::fail_writes_after`, `VLog::fail_next_sync` and `VLog::set_sync_gap`.
+//! `Writer` / `Wal` forwarders), `WalManager::fsyncs`, `vlog::SYNCED_VLOG_FILES`,
+//! `VLog::dir_syncs`, and the failpoints `VLog::fail_writes_after`, `VLog::fail_next_sync` and
+//! `VLog::set_sync_gap`.
 
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -2273,7 +2277,6 @@ async fn an_immediate_commit_after_a_poisoned_vlog_writer_fsyncs_the_file_it_lef
 /// Sealing a WAL segment fsyncs it, so the values its Eventual records point to have to be
 /// fsynced with it: after a power loss a record could survive without its value.
 #[test(tokio::test)]
-#[ignore = "Wal::rotate fsyncs the sealed segment without syncing the vlog first"]
 async fn sealing_a_wal_segment_fsyncs_the_vlog_values_its_records_point_into() {
 	let dir = TempDir::new("wal_group_crash").unwrap();
 	let live = dir.path().join("live");
@@ -2282,6 +2285,354 @@ async fn sealing_a_wal_segment_fsyncs_the_vlog_values_its_records_point_into() {
 	stop_background_tasks(&tree).await;
 	tree.core.inner.rotate_memtable().unwrap();
 	assert_both_vlog_files_fsynced(&live, "by the rotation that fsynced the segment");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// What the value log looked like at an fsync of a WAL segment: the files it had, and the ones an
+/// fsync had completed on by then.
+type VlogAtWalFsync = (Vec<PathBuf>, Vec<PathBuf>);
+
+/// Records the state of the value log at every fsync of the segment that is active now. The
+/// observer runs inside the segment's fsync gate, and in a rotation under the WAL lock too, so it
+/// takes nothing but the ledger of the value log's fsyncs. No value log file is fsynced before the
+/// test arms this, so a file that is in the ledger by then was fsynced after all of its bytes were
+/// written.
+fn watch_wal_fsyncs(tree: &Tree, live: &Path) -> Arc<Mutex<Vec<VlogAtWalFsync>>> {
+	let seen: Arc<Mutex<Vec<VlogAtWalFsync>>> = Arc::default();
+	let (log, live) = (Arc::clone(&seen), live.to_path_buf());
+	tree.core.inner.wal.write().set_sync_observer(Some(Arc::new(move || {
+		log.lock().unwrap().push((vlog_files(&live), fsynced_vlog_files(&live)));
+	})));
+	seen
+}
+
+/// The watched segment was fsynced, and every time every value log file it could point into had
+/// been fsynced before.
+fn assert_vlog_fsynced_before_wal(seen: &Mutex<Vec<VlogAtWalFsync>>, when: &str) {
+	let seen = seen.lock().unwrap();
+	assert!(!seen.is_empty(), "{when}: the segment was not fsynced");
+	for (files, synced) in seen.iter() {
+		assert!(files.len() >= 2, "{when}: the vlog rolled over: {files:?}");
+		for file in files {
+			assert!(
+				synced.contains(file),
+				"{when}: the segment was fsynced while {} was not (fsynced: {synced:?})",
+				file.display()
+			);
+		}
+	}
+}
+
+/// Eventual commits across a vlog rollover, with the background tasks stopped (a memtable flush
+/// fsyncs the vlog itself) and the fsyncs of the WAL segment watched.
+async fn rolled_over_and_watched(live: &Path) -> (Arc<Tree>, Arc<Mutex<Vec<VlogAtWalFsync>>>) {
+	let tree = eventual_commits_across_a_rollover(live).await;
+	stop_background_tasks(&tree).await;
+	let seen = watch_wal_fsyncs(&tree, live);
+	(tree, seen)
+}
+
+/// The image of `live` after a power loss that kept every value log file with an fsync behind it
+/// and none of the bytes of the others, which the page cache alone held.
+fn power_loss_image(live: &Path, image: &Path) {
+	copy_dir(live, image);
+	let synced = fsynced_vlog_files(live);
+	for file in vlog_files(live) {
+		if !synced.contains(&file) {
+			set_len(&image.join("vlog").join(file.file_name().unwrap()), 0);
+		}
+	}
+}
+
+/// A power loss image of `live` recovers every `present` key: the records of the sealed segment
+/// point into value log files that survived.
+fn assert_power_loss_image(live: &Path, image: &Path, present: &[(String, Vec<u8>)]) {
+	power_loss_image(live, image);
+	let recovered = Tree::new(vlog_opts(image)).unwrap();
+	reads_back(&recovered, present, &[]).expect("the power loss image");
+	mark_closed(&recovered);
+	release_lock(&recovered);
+}
+
+/// A rotation of the memtable (what a checkpoint and a full memtable do) fsyncs the vlog before
+/// the segment it seals, not after, and not only afterwards through the flush.
+#[test(tokio::test)]
+async fn a_memtable_rotation_fsyncs_the_vlog_before_the_segment() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let (tree, seen) = rolled_over_and_watched(&live).await;
+	tree.core.inner.rotate_memtable().unwrap();
+	assert_vlog_fsynced_before_wal(&seen, "rotate_memtable");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// The flusher rotates when the next batch does not fit the memtable. Eventual commits, which
+/// fsync nothing themselves, are what the rotation makes durable, so the values come first.
+#[test(tokio::test)]
+async fn a_rotation_by_the_flusher_fsyncs_the_vlog_before_the_segment() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(
+		Tree::new(Arc::new(Options {
+			max_memtable_size: 64 * 1024,
+			..Arc::try_unwrap(vlog_opts(&live)).ok().unwrap()
+		}))
+		.unwrap(),
+	);
+	stop_background_tasks(&tree).await;
+	let seen = watch_wal_fsyncs(&tree, &live);
+	let first = active_segment(&tree);
+	let mut i = 0;
+	while active_segment(&tree) == first {
+		put(&tree, &format!("size{i:05}"), &payload(i, 300), Durability::Eventual).await;
+		i += 1;
+		assert!(i < 5_000, "the memtable never filled");
+	}
+	assert_vlog_fsynced_before_wal(&seen, "a rotation by the flusher");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A checkpoint flushes the memtable, which rotates the WAL first.
+#[test(tokio::test)]
+async fn a_checkpoint_fsyncs_the_vlog_before_the_segment_it_seals() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let (tree, seen) = rolled_over_and_watched(&live).await;
+	tree.create_checkpoint(dir.path().join("checkpoint")).unwrap();
+	assert_vlog_fsynced_before_wal(&seen, "a checkpoint");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A batch too big for a memtable seals the segment its own record is in before it is written
+/// to a table: an empty memtable's segment is rotated on its own, and a memtable that holds
+/// earlier commits is rotated out. Both fsync the segment, and the table's own sync of the value
+/// log comes after that.
+#[test(tokio::test)]
+async fn sealing_for_a_direct_l0_write_fsyncs_the_vlog_before_the_segment() {
+	for with_earlier_commit in [false, true] {
+		let dir = TempDir::new("wal_group_crash").unwrap();
+		let live = dir.path().join("live");
+		let tree = Arc::new(
+			Tree::new(Arc::new(Options {
+				max_memtable_size: 64 * 1024,
+				..Arc::try_unwrap(vlog_opts(&live)).ok().unwrap()
+			}))
+			.unwrap(),
+		);
+		stop_background_tasks(&tree).await;
+		if with_earlier_commit {
+			put(&tree, "earlier", &payload(7, 300), Durability::Eventual).await;
+		}
+		let seen = watch_wal_fsyncs(&tree, &live);
+		let mut txn = tree.begin().unwrap();
+		txn.set_durability(Durability::Eventual);
+		for i in 0..1_000 {
+			txn.set(format!("oversized_key_{i:06}").as_bytes(), payload(i, 300)).unwrap();
+		}
+		txn.commit().await.unwrap();
+		assert!(!tree.core.inner.level_manifest.read().unwrap().get_all_tables().is_empty());
+		assert_vlog_fsynced_before_wal(
+			&seen,
+			if with_earlier_commit {
+				"a direct write after an earlier commit"
+			} else {
+				"a direct write into an empty memtable"
+			},
+		);
+		crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+	}
+}
+
+/// `close` fsyncs the vlog before it fsyncs the segment it closes (a control).
+#[test(tokio::test)]
+async fn close_fsyncs_the_vlog_before_the_segment() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	let seen = watch_wal_fsyncs(&tree, &live);
+	tree.close().await.unwrap();
+	assert_vlog_fsynced_before_wal(&seen, "close");
+}
+
+/// An Immediate commit fsyncs the vlog files that Eventual commits rolled over from before it
+/// fsyncs the segment (a control).
+#[test(tokio::test)]
+async fn an_immediate_commit_fsyncs_the_vlog_before_the_segment() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let (tree, seen) = rolled_over_and_watched(&live).await;
+	put(&tree, "immediate", &payload(9, 10_000), Durability::Immediate).await;
+	assert_vlog_fsynced_before_wal(&seen, "an Immediate commit");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// Eventual commits, then a rotation, then a power loss: the segment the rotation sealed is on
+/// disk, and so are the value log files its records point into. The image keeps only what was
+/// fsynced.
+#[test(tokio::test)]
+async fn a_power_loss_after_an_eventual_commit_and_a_rotation_leaves_no_dangling_pointer() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	stop_background_tasks(&tree).await;
+	tree.core.inner.rotate_memtable().unwrap();
+	let present: Vec<_> = (0..3).map(|i| (format!("e{i}"), payload(i, 40_000))).collect();
+	assert_power_loss_image(&live, &dir.path().join("image"), &present);
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A vlog fsync that fails during a rotation fails the rotation and nothing else: the WAL has the
+/// same segment, the same bytes, nothing fsynced and no poison, the memtable has the same
+/// segment and its commits, and nothing was created. The rotation after it fsyncs the vlog
+/// again, fsyncs the segment, and succeeds, and the commits in between survive a power loss.
+#[test(tokio::test)]
+async fn a_failed_vlog_fsync_fails_the_rotation_and_leaves_the_wal_as_it_was() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let (tree, seen) = rolled_over_and_watched(&live).await;
+	let inner = Arc::clone(&tree.core.inner);
+	let first = active_segment(&tree);
+	let segment = seg_path(&live, first);
+	let logged = fs::read(&segment).unwrap();
+	assert!(!logged.is_empty(), "the commits are in the active segment");
+	let segments = segment_ids(&live);
+
+	vlog_of(&tree).fail_next_sync();
+	assert!(inner.rotate_memtable().is_err(), "the vlog fsync failed");
+	assert!(seen.lock().unwrap().is_empty(), "the segment was fsynced after the vlog failed");
+	assert_eq!(inner.wal.read().get_active_log_number(), first);
+	assert_eq!(segment_ids(&live), segments, "no segment was created");
+	assert_eq!(fs::read(&segment).unwrap(), logged, "the segment was not touched");
+	assert!(inner.wal.read().pending_sync(), "the segment was not fsynced");
+	assert!(!inner.wal.read().sync_failed(), "a vlog failure does not poison the WAL");
+	{
+		let active = inner.active_memtable.read().unwrap();
+		assert_eq!(active.get_wal_number(), first);
+		assert!(!active.is_empty(), "the memtable still holds the commits");
+	}
+	assert!(inner.immutable_memtables.read().unwrap().is_empty());
+
+	// Commits go on in the same segment, and the next rotation succeeds.
+	put(&tree, "after", &payload(11, 40_000), Durability::Eventual).await;
+	inner.rotate_memtable().unwrap();
+	assert_vlog_fsynced_before_wal(&seen, "the rotation after the failed one");
+	assert_eq!(inner.wal.read().get_active_log_number(), first + 1);
+	let mut sealed_and_new = segments.clone();
+	sealed_and_new.push(first + 1);
+	assert_eq!(segment_ids(&live), sealed_and_new);
+
+	let present: Vec<_> = (0..3)
+		.map(|i| (format!("e{i}"), payload(i, 40_000)))
+		.chain([("after".to_string(), payload(11, 40_000))])
+		.collect();
+	assert_power_loss_image(&live, &dir.path().join("image"), &present);
+	drop(inner);
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A segment poisoned by a failed fsync is not fsynced by its rotation, so the rotation has
+/// nothing to wait for the vlog for: one that cannot fsync must not keep the poisoned segment
+/// from being replaced.
+#[test(tokio::test)]
+async fn a_rotation_replacing_a_poisoned_segment_does_not_need_the_vlog() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = Arc::new(Tree::new(vlog_opts(&live)).unwrap());
+	stop_background_tasks(&tree).await;
+	put(&tree, "e0", &payload(0, 10_000), Durability::Eventual).await;
+	tree.core.inner.wal.write().fail_syncs_after(0);
+	assert!(tree.flush_wal(true).is_err());
+	assert!(tree.core.inner.wal.read().sync_failed());
+
+	// The vlog holds something unsynced for a hook to find, and its next fsync fails.
+	let vlog = vlog_of(&tree);
+	vlog.append(b"unsynced", &payload(1, 300)).unwrap();
+	vlog.fail_next_sync();
+	tree.core.inner.rotate_memtable().unwrap();
+	assert!(!tree.core.inner.wal.read().sync_failed(), "the rotation replaced the segment");
+	assert!(vlog.sync().is_err(), "the rotation never asked the vlog for an fsync");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A vlog file's name is made durable with its contents: by whatever fsyncs the value log next,
+/// once, and not by the Eventual commits that created the file, which fsync nothing.
+#[test(tokio::test)]
+async fn the_vlog_directory_is_fsynced_with_the_files_created_since_it_was_last() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	stop_background_tasks(&tree).await;
+	let inner = Arc::clone(&tree.core.inner);
+	let vlog = vlog_of(&tree);
+	// The directory was fsynced when the tree was opened.
+	let base = vlog.dir_syncs();
+	assert_eq!(inner.wal.fsyncs(), 0);
+	assert!(inner.wal.read().pending_sync());
+
+	tree.flush_wal(true).unwrap();
+	assert_eq!(vlog.dir_syncs() - base, 1, "the second file's name is made durable");
+	tree.flush_wal(true).unwrap();
+	assert_eq!(vlog.dir_syncs() - base, 1, "and not again when no file was created");
+
+	// 40 KB each: the first fills the second file, the second goes to a third.
+	for i in 3..5 {
+		put(&tree, &format!("e{i}"), &payload(i, 40_000), Durability::Eventual).await;
+	}
+	assert_eq!(vlog_files(&live).len(), 3);
+	assert_eq!(vlog.dir_syncs() - base, 1, "a commit does not fsync the directory");
+	inner.rotate_memtable().unwrap();
+	assert_eq!(vlog.dir_syncs() - base, 2, "a rotation makes the third file's name durable too");
+	drop(inner);
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A value appended to a vlog file that was fsynced already, with no file created since, is
+/// unsynced all the same: the rotation fsyncs the file again before it seals the segment.
+#[test(tokio::test)]
+async fn a_rotation_fsyncs_a_vlog_file_that_took_a_value_after_its_last_fsync() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	stop_background_tasks(&tree).await;
+	tree.flush_wal(true).unwrap();
+	let active = vlog_files(&live).pop().unwrap();
+	let fsyncs_of =
+		|file: &PathBuf| fsynced_vlog_files(&live).iter().filter(|f| *f == file).count();
+	let before = fsyncs_of(&active);
+
+	put(&tree, "late", &payload(8, 10_000), Durability::Eventual).await;
+	assert_eq!(vlog_files(&live).len(), 2, "the value went to the file that was active");
+	tree.core.inner.rotate_memtable().unwrap();
+	assert_eq!(fsyncs_of(&active), before + 1, "the rotation fsynced the file the value is in");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+}
+
+/// A rotation costs the vlog nothing when everything it holds is fsynced: a clean tree does not
+/// pay for a second fsync of the same bytes, and a tree that has no value log file does not
+/// create one.
+#[test(tokio::test)]
+async fn a_rotation_fsyncs_no_vlog_file_when_none_is_dirty() {
+	let dir = TempDir::new("wal_group_crash").unwrap();
+	let live = dir.path().join("live");
+	let tree = eventual_commits_across_a_rollover(&live).await;
+	stop_background_tasks(&tree).await;
+	tree.flush_wal(true).unwrap();
+	let fsynced = fsynced_vlog_files(&live);
+	assert_eq!(fsynced.len(), 2, "the probe: flush_wal(true) fsyncs both files: {fsynced:?}");
+	put(&tree, "inline", b"small", Durability::Eventual).await;
+	tree.core.inner.rotate_memtable().unwrap();
+	assert_eq!(fsynced_vlog_files(&live), fsynced, "the rotation fsynced a clean vlog");
+	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
+
+	let other = dir.path().join("inline_only");
+	let tree = Arc::new(Tree::new(vlog_opts(&other)).unwrap());
+	stop_background_tasks(&tree).await;
+	let first = active_segment(&tree);
+	put(&tree, "inline", b"small", Durability::Eventual).await;
+	tree.core.inner.rotate_memtable().unwrap();
+	assert!(vlog_files(&other).is_empty(), "no value reached the vlog");
+	assert!(fsynced_vlog_files(&other).is_empty());
+	assert_eq!(active_segment(&tree), first + 1, "the rotation ran");
 	crash(Arc::try_unwrap(tree).ok().expect("no other owner"));
 }
 
