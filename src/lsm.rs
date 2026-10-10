@@ -11,7 +11,12 @@ use crate::checkpoint::{CheckpointMetadata, DatabaseCheckpoint};
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Result};
-use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
+use crate::levels::{
+	check_manifest_before_open,
+	write_manifest_to_disk,
+	LevelManifest,
+	ManifestChangeSet,
+};
 use crate::lockfile::LockFile;
 use crate::memtable::{ImmutableEntry, ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
@@ -148,6 +153,11 @@ pub(crate) struct CoreInner {
 	/// direct-to-L0 write (which must flush everything older first) never pick the same
 	/// memtable or install tables out of order. Acquired before any lock listed above.
 	flush_lock: parking_lot::Mutex<()>,
+
+	/// Whether the manifest was read from disk in this run, as opposed to created by it.
+	/// A manifest created in this run lists no tables, so it cannot say which SSTables
+	/// are orphans.
+	pub(crate) manifest_loaded_from_disk: bool,
 }
 
 impl CoreInner {
@@ -161,7 +171,9 @@ impl CoreInner {
 		// Initialize immutable memtables
 		let immutable_memtables = Arc::new(RwLock::new(ImmutableMemtables::default()));
 
-		// Initialize level manifest FIRST to get log_number
+		// Initialize level manifest FIRST to get log_number. Whether it exists must be read
+		// first, because `LevelManifest::new` creates one when it does not.
+		let manifest_loaded_from_disk = opts.manifest_file_path(0).exists();
 		let manifest = LevelManifest::new(Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
 
@@ -203,6 +215,7 @@ impl CoreInner {
 			visible_seq_num,
 			memory_controller,
 			flush_lock: parking_lot::Mutex::new(()),
+			manifest_loaded_from_disk,
 		})
 	}
 
@@ -881,6 +894,13 @@ impl CoreInner {
 	/// (containing both SST addition and log_number update) never completed.
 	/// In that case, the WAL is still alive and will replay the data.
 	fn cleanup_orphaned_sst_files(&self) -> Result<()> {
+		// Every SSTable on disk looks orphaned to a manifest that was just created, so
+		// this would delete the whole database.
+		if !self.manifest_loaded_from_disk {
+			tracing::debug!("Manifest was created in this run, skipping orphaned SST cleanup");
+			return Ok(());
+		}
+
 		let sstable_dir = self.opts.sstable_dir();
 
 		if !sstable_dir.exists() {
@@ -1542,6 +1562,11 @@ impl Tree {
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
 		// Validate options before creating the tree
 		opts.validate()?;
+
+		// Fail before anything is created or moved if the directory holds database files
+		// but no usable manifest. This must stay ahead of the migrations, the directory
+		// creation and the lock file.
+		check_manifest_before_open(&opts)?;
 
 		// If the path contains an existing RocksDB database, automatically migrate it in pure Rust
 		if surrealkv_compat_rocksdb::is_rocksdb_dir(&opts.path) {
