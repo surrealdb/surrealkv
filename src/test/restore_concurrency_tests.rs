@@ -1882,7 +1882,12 @@ async fn a_crash_right_after_a_restore_recovers_the_checkpoint() {
 /// database is untouched: it still holds what it held, its files are the same, and it holds it
 /// after a close and a reopen. Every problem found is reported together.
 async fn bad_checkpoint(what: &str, spoil: impl FnOnce(&Path)) {
-	let w = build(false).await;
+	bad_checkpoint_with(false, what, spoil).await;
+}
+
+/// `bad_checkpoint` for a tree with or without a value log.
+async fn bad_checkpoint_with(vlog: bool, what: &str, spoil: impl FnOnce(&Path)) {
+	let w = build(vlog).await;
 	spoil(&w.ckpt);
 	let files = fingerprint(&w.path);
 	let outcome = w.tree.restore_from_checkpoint(&w.ckpt);
@@ -1915,7 +1920,7 @@ async fn bad_checkpoint(what: &str, spoil: impl FnOnce(&Path)) {
 	if let Err(e) = w.tree.close().await {
 		problems.push(format!("the database does not close after the failed restore: {e:?}"));
 	}
-	match Tree::new(options(&w.path, false)) {
+	match Tree::new(options(&w.path, vlog)) {
 		Err(e) => {
 			problems.push(format!("the database does not open after the failed restore: {e:?}"))
 		}
@@ -1982,7 +1987,6 @@ async fn a_restore_of_a_checkpoint_of_an_unsupported_version_fails_and_leaves_th
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore of a checkpoint that cannot be loaded fails only after it removed the database's files, leaving a database that does not open"]
 async fn a_restore_of_a_checkpoint_missing_a_listed_table_fails_and_leaves_the_database() {
 	bad_checkpoint("a listed table is missing", |ckpt| {
 		std::fs::remove_file(&checkpoint_tables(ckpt)[0]).unwrap();
@@ -1991,7 +1995,6 @@ async fn a_restore_of_a_checkpoint_missing_a_listed_table_fails_and_leaves_the_d
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore of a checkpoint that cannot be loaded fails only after it removed the database's files, leaving a database that does not open"]
 async fn a_restore_of_a_checkpoint_with_a_truncated_table_fails_and_leaves_the_database() {
 	bad_checkpoint("a table is truncated", |ckpt| {
 		let table = checkpoint_tables(ckpt)[0].clone();
@@ -2004,7 +2007,6 @@ async fn a_restore_of_a_checkpoint_with_a_truncated_table_fails_and_leaves_the_d
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore of a checkpoint that cannot be loaded fails only after it removed the database's files, leaving a database that does not open"]
 async fn a_restore_of_a_checkpoint_without_a_tables_directory_fails_and_leaves_the_database() {
 	bad_checkpoint("no sstables directory", |ckpt| {
 		std::fs::remove_dir_all(ckpt.join("sstables")).unwrap();
@@ -2013,10 +2015,59 @@ async fn a_restore_of_a_checkpoint_without_a_tables_directory_fails_and_leaves_t
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore of a checkpoint that cannot be loaded fails only after it removed the database's files, leaving a database that does not open"]
 async fn a_restore_of_a_checkpoint_without_a_manifest_fails_and_leaves_the_database() {
 	bad_checkpoint("no manifest directory", |ckpt| {
 		std::fs::remove_dir_all(ckpt.join("manifest")).unwrap();
+	})
+	.await;
+}
+
+/// A table that is as long as it was and is not a table: its footer does not decode.
+#[test(tokio::test)]
+async fn a_restore_of_a_checkpoint_with_a_table_of_garbage_fails_and_leaves_the_database() {
+	bad_checkpoint("a table is garbage", |ckpt| {
+		let table = checkpoint_tables(ckpt)[0].clone();
+		let len = std::fs::metadata(&table).unwrap().len() as usize;
+		std::fs::remove_file(&table).unwrap();
+		std::fs::write(&table, vec![0x5au8; len]).unwrap();
+	})
+	.await;
+}
+
+/// A manifest that has its bytes and does not decode.
+#[test(tokio::test)]
+async fn a_restore_of_a_checkpoint_with_a_garbage_manifest_fails_and_leaves_the_database() {
+	bad_checkpoint("the manifest is garbage", |ckpt| {
+		let manifest = ckpt.join("manifest").join(format!("{:020}.manifest", 0));
+		let len = std::fs::metadata(&manifest).unwrap().len() as usize;
+		std::fs::write(&manifest, vec![0xffu8; len]).unwrap();
+	})
+	.await;
+}
+
+/// The tables of a checkpoint point into the value log it copied, and a checkpoint without it
+/// would restore into a database whose reads of large values fail.
+#[test(tokio::test)]
+async fn a_restore_of_a_checkpoint_without_its_value_log_fails_and_leaves_the_database() {
+	bad_checkpoint_with(true, "no value log directory", |ckpt| {
+		std::fs::remove_dir_all(ckpt.join("vlog")).unwrap();
+	})
+	.await;
+}
+
+#[test(tokio::test)]
+async fn a_restore_of_a_checkpoint_whose_value_log_files_are_gone_fails_and_leaves_the_database() {
+	bad_checkpoint_with(true, "the value log files are gone", |ckpt| {
+		let mut files: Vec<PathBuf> = std::fs::read_dir(ckpt.join("vlog"))
+			.unwrap()
+			.map(|e| e.unwrap().path())
+			.filter(|p| p.extension().is_some_and(|e| e == "vlog"))
+			.collect();
+		files.sort();
+		assert!(!files.is_empty(), "setup: the checkpoint holds value log files");
+		for file in files {
+			std::fs::remove_file(file).unwrap();
+		}
 	})
 	.await;
 }

@@ -1968,9 +1968,6 @@ async fn a_zero_filled_metadata_file_is_refused_and_the_target_is_untouched() {
 /// file that was never synced may come back empty) is refused by restore without taking the
 /// target's data: the restore reads everything it needs before it replaces anything.
 #[test(tokio::test)]
-#[ignore = "restore_from_checkpoint clears the target's tables, WAL, manifest and value log before it \
-            reads the checkpoint's manifest, so a checkpoint with an empty manifest file is refused \
-            only after the target database was destroyed"]
 async fn a_checkpoint_with_an_empty_manifest_is_refused_and_the_target_is_untouched() {
 	let (source, _dir, _state) = source_with_data(false).await;
 	let out = TempDir::new("ckpt_conc_manifest").unwrap();

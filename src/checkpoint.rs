@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::error::{Error, Result};
 use crate::levels::LevelManifest;
 use crate::lsm::CoreInner;
+use crate::Options;
 
 /// Recursively copies a directory and all its contents
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -455,6 +456,9 @@ impl DatabaseCheckpoint {
 		// Verify checkpoint exists and is valid
 		let metadata = self.read_checkpoint_metadata(checkpoint_path)?;
 
+		// Everything the restore needs is read before anything of the database is removed
+		self.validate_checkpoint(checkpoint_path)?;
+
 		// Clear current database state
 		self.clear_current_state()?;
 
@@ -495,6 +499,53 @@ impl DatabaseCheckpoint {
 		self.reach(CheckpointStage::RestoreFilesCopied);
 
 		Ok(metadata)
+	}
+
+	/// Refuses a checkpoint that cannot be restored: one without its tables or manifest
+	/// directory, whose manifest does not load, or one of whose listed tables is missing or
+	/// damaged. Reads only, and runs before a restore removes anything, so a refused checkpoint
+	/// leaves the database as it was.
+	///
+	/// The manifest is loaded with the loader a restore uses afterwards, from the checkpoint's
+	/// own directory and with a block cache of its own: the live cache is keyed by table id, and
+	/// the checkpoint's tables must not leave blocks in it under the ids of the live ones.
+	fn validate_checkpoint(&self, checkpoint_path: &Path) -> Result<()> {
+		let unusable = |what: String| {
+			Error::InvalidArgument(format!(
+				"{} is not a usable checkpoint: {what}",
+				checkpoint_path.display()
+			))
+		};
+
+		for dir in ["sstables", "manifest"] {
+			if !checkpoint_path.join(dir).is_dir() {
+				return Err(unusable(format!("it has no {dir} directory")));
+			}
+		}
+
+		let opts = Arc::new(
+			Options {
+				path: checkpoint_path.to_path_buf(),
+				..(*self.core.opts).clone()
+			}
+			.with_block_cache_capacity(1 << 20),
+		);
+		let manifest_file = opts.manifest_file_path(0);
+		if !manifest_file.is_file() {
+			return Err(unusable("it has no manifest file".to_string()));
+		}
+		let levels = LevelManifest::load_from_file(&manifest_file, Arc::clone(&opts))
+			.map_err(|e| unusable(format!("its manifest and tables do not load: {e}")))?;
+
+		// The tables read their values from the value-log files the checkpoint copied
+		let oldest = levels.min_oldest_vlog_file_id();
+		if oldest > 0 && !opts.vlog_file_path(u64::from(oldest)).is_file() {
+			return Err(unusable(format!(
+				"its tables point into the value log, which has no file {oldest}"
+			)));
+		}
+
+		Ok(())
 	}
 
 	/// Flushes all memtables to ensure checkpoint consistency
