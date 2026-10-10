@@ -592,15 +592,28 @@ impl Probe {
 		if let Some(action) = action {
 			action(stage);
 		}
-		if stage == CompactionStage::OutputsDurable
-			&& self
-				.failures
-				.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-				.is_ok()
-		{
+		if stage == CompactionStage::OutputsDurable && self.take_failure() {
 			return Err(Error::Io(std::io::Error::other("injected compaction failure").into()));
 		}
 		Ok(())
+	}
+
+	/// Uses up one of the injected failures, if any is left. A compare-exchange loop, because the
+	/// atomic read-modify-write helper was renamed between toolchains.
+	fn take_failure(&self) -> bool {
+		loop {
+			let left = self.failures.load(Ordering::SeqCst);
+			if left == 0 {
+				return false;
+			}
+			if self
+				.failures
+				.compare_exchange(left, left - 1, Ordering::SeqCst, Ordering::SeqCst)
+				.is_ok()
+			{
+				return true;
+			}
+		}
 	}
 
 	fn fired(&self) -> Vec<CompactionStage> {
