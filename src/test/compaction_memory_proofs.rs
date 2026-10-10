@@ -210,6 +210,8 @@ fn build_l0_store(
 		vlog: None,
 		error_handler: Arc::new(BackgroundErrorHandler::new()),
 		snapshot_tracker: SnapshotTracker::new(),
+		visible_seq_num: Arc::new(AtomicU64::new(u64::MAX)),
+		after_horizon_hook: None,
 	};
 	let compactor = Compactor::new(compaction_options, strategy);
 

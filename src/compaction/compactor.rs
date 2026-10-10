@@ -1,5 +1,6 @@
 use std::fs::File as SysFile;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
@@ -59,6 +60,15 @@ pub(crate) struct CompactionOptions {
 	/// sequence numbers. Versions visible to any active snapshot must be
 	/// preserved (unless hidden by a newer version in the same visibility boundary).
 	pub(crate) snapshot_tracker: SnapshotTracker,
+	/// The highest sequence number that is visible to readers.
+	///
+	/// A version above it was not published, and a reader that is not a registered snapshot
+	/// reads at this sequence number or above. A compaction keeps every version above it, and the
+	/// newest one at or below it.
+	pub(crate) visible_seq_num: Arc<AtomicU64>,
+	/// Runs between the read of `visible_seq_num` and the read of the snapshot list.
+	#[cfg(test)]
+	pub(crate) after_horizon_hook: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl CompactionOptions {
@@ -71,6 +81,9 @@ impl CompactionOptions {
 			vlog: tree.vlog.clone(),
 			error_handler: Arc::clone(&tree.error_handler),
 			snapshot_tracker: tree.snapshot_tracker.clone(),
+			visible_seq_num: Arc::clone(&tree.visible_seq_num),
+			#[cfg(test)]
+			after_horizon_hook: None,
 		}
 	}
 }
@@ -168,6 +181,28 @@ impl Compactor {
 		Ok(())
 	}
 
+	/// Reads the visibility horizon and the active snapshots for snapshot-aware compaction.
+	///
+	/// The horizon is the visible sequence number, and it is read BEFORE the snapshot list. A
+	/// publication that comes between the two reads then raises the visible sequence number
+	/// only after the horizon was fixed: a snapshot registered by then is in the list, and one
+	/// registered later was taken from a visible sequence number that is the horizon or above.
+	/// A transaction takes its sequence number before it registers it, so one that does so
+	/// between the two reads can still be missed. It must be the visible sequence number and
+	/// never the log sequence number, which runs ahead of publication. A restore can lower the
+	/// visible sequence number, which only makes a compaction keep more.
+	///
+	/// Any snapshots created during compaction will be handled by the next compaction.
+	fn read_horizon_and_snapshots(&self) -> (u64, Vec<u64>) {
+		let horizon = self.options.visible_seq_num.load(Ordering::Acquire);
+		#[cfg(test)]
+		if let Some(hook) = &self.options.after_horizon_hook {
+			hook();
+		}
+		let snapshots = self.options.snapshot_tracker.get_all_snapshots();
+		(horizon, snapshots)
+	}
+
 	/// Writes the merged stream into one or more output SSTs, rolling over to
 	/// a new file whenever the current output reaches
 	/// `Options::target_file_size`. Rollover happens only at user-key
@@ -195,10 +230,7 @@ impl Compactor {
 		range_deletions.sort_unstable();
 		range_deletions.dedup();
 
-		// Get active snapshots for snapshot-aware compaction
-		// This is a snapshot of the snapshot list at the start of compaction.
-		// Any snapshots created during compaction will be handled by the next compaction.
-		let snapshots = self.options.snapshot_tracker.get_all_snapshots();
+		let (horizon, snapshots) = self.read_horizon_and_snapshots();
 
 		// Create a compaction iterator that filters tombstones and respects snapshots
 		let max_level = self.options.lopts.level_count - 1;
@@ -208,6 +240,7 @@ impl Compactor {
 			Arc::clone(&self.options.lopts.internal_comparator) as Arc<dyn Comparator>,
 			is_bottom_level,
 			snapshots,
+			horizon,
 		)
 		.with_range_deletions(range_deletions.clone());
 

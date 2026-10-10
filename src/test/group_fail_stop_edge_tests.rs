@@ -17,10 +17,21 @@ use std::time::Duration;
 use tempdir::TempDir;
 use test_log::test;
 
-use super::{collect_transaction_all, collect_transaction_reverse};
-use crate::lsm::CompactionOperations;
+use super::{collect_all, collect_transaction_all, collect_transaction_reverse};
+use crate::compaction::leveled::Strategy;
+use crate::lsm::{CompactionOperations, CoreInner};
 use crate::ring::{CommitStage, PipelineHook};
-use crate::{BackgroundErrorReason, Durability, Error, Mode, Options, Result, Tree};
+use crate::{
+	BackgroundErrorReason,
+	Durability,
+	Error,
+	InternalKeyKind,
+	Mode,
+	Options,
+	Result,
+	Transaction,
+	Tree,
+};
 
 /// A memtable that holds about 21 small commits.
 const SMALL: usize = 4096;
@@ -1175,14 +1186,11 @@ fn many_writers_over_live_background_tasks_see_exactly_what_was_acknowledged() {
 // ---------------------------------------------------------------------------
 
 /// A compaction that starts after an oversized batch of the group went to an L0 table, as the
-/// level task does right after the write, and before the group fails, keeps only the newest
-/// version of the key: the one that is never published. Read-write committers register a snapshot
-/// that keeps the older version, so the committers here are write-only.
-///
-/// Compaction does not treat the visible sequence number as a snapshot, so a compaction that is
-/// already running when the group fails can still take the visible version of a key.
+/// level task does right after the write, and before the group fails, finds a version of the key
+/// that was never published above the one readers see. It keeps both. Read-write committers
+/// register a snapshot that keeps the older version in any case, so the committers here are
+/// write-only.
 #[test(tokio::test)]
-#[ignore = "known gap: a compaction that started before the stop does not keep the visible version"]
 async fn a_compaction_that_ran_before_the_failure_does_not_take_the_visible_version() {
 	compaction_before_the_failure(true).await;
 }
@@ -1194,8 +1202,6 @@ async fn a_compaction_before_the_failure_keeps_what_a_read_write_committer_pins(
 }
 
 async fn compaction_before_the_failure(write_only: bool) {
-	use crate::compaction::leveled::Strategy;
-
 	let dir = TempDir::new("group_fail_stop").unwrap();
 	let options = Arc::new(Options {
 		level0_max_files: 2,
@@ -1212,11 +1218,14 @@ async fn compaction_before_the_failure(write_only: bool) {
 	let inner = Arc::clone(&tree.core.inner);
 	let strategy: Arc<dyn crate::compaction::CompactionStrategy> =
 		Arc::new(Strategy::from_options(Arc::clone(&options)));
+	let snapshots = Arc::new(Mutex::new(None));
+	let seen = Arc::clone(&snapshots);
 	tree.core.commit_pipeline.set_hook(Some(Arc::new(move |point| {
 		if let PipelineHook::BeforeApplyRound {
 			round: 1,
 		} = point
 		{
+			*seen.lock().unwrap() = Some(inner.snapshot_tracker.get_all_snapshots());
 			inner.compact(Arc::clone(&strategy)).unwrap();
 			assert_eq!(inner.l0_file_count(), 0, "the compaction merged the tables");
 			inner.wal.write().fail_writes_after(0);
@@ -1232,8 +1241,485 @@ async fn compaction_before_the_failure(write_only: bool) {
 	tree.core.commit_pipeline.set_hook(None);
 	all_stopped(&results, "the group");
 
+	let snapshots =
+		snapshots.lock().unwrap().take().expect("the compaction ran between the rounds");
+	assert_eq!(
+		snapshots.is_empty(),
+		write_only,
+		"only a read-write committer pins the old version: {snapshots:?}"
+	);
 	assert_eq!(get(&tree, "big10"), Some(old), "the version readers saw before is gone");
 	crash(&tree);
+}
+
+// ---------------------------------------------------------------------------
+// a compaction between the rounds of a group
+// ---------------------------------------------------------------------------
+
+/// What one transaction of a group does to its key.
+#[derive(Clone)]
+enum Op {
+	Set(Vec<u8>),
+	Delete,
+	/// Deletes the key and the ones after it up to the key it names, which stays.
+	DeleteRange(String),
+}
+
+type Ops = Vec<(String, Op)>;
+
+fn sets(entries: &Entries) -> Ops {
+	entries.iter().map(|(key, value)| (key.clone(), Op::Set(value.clone()))).collect()
+}
+
+async fn commit_op_write_only(tree: Arc<Tree>, key: String, op: Op) -> Result<()> {
+	let mut txn = tree.begin_with_mode(Mode::WriteOnly).unwrap();
+	txn.set_durability(Durability::Immediate);
+	match op {
+		Op::Set(value) => txn.set(key.as_bytes(), &value).unwrap(),
+		Op::Delete => txn.delete(key.as_bytes()).unwrap(),
+		Op::DeleteRange(end) => txn.delete_range(key.as_bytes(), end.as_bytes()).unwrap(),
+	}
+	txn.commit().await
+}
+
+fn multi_thread() -> tokio::runtime::Runtime {
+	tokio::runtime::Builder::new_multi_thread().worker_threads(4).enable_all().build().unwrap()
+}
+
+/// Commits `ops` as one group of write-only transactions and calls `window` between the first
+/// and the second round of the group: what the first round applied is not published, and the
+/// memtable it filled was rotated. Returns the result of every commit of the group, and how
+/// often `window` ran, which is once if the group needed a second round.
+///
+/// The flusher takes whatever is in the ring when it looks, and the committers do not all arrive
+/// before it does. A commit of its own goes first, and the flusher is held after it logged that
+/// one while the others queue up behind it: they are then one group. The committers are
+/// write-only, because a read-write one registers a snapshot, which keeps the version that
+/// `window` compacts.
+async fn held_group(
+	tree: &Arc<Tree>,
+	ops: &Ops,
+	window: impl Fn() + Send + Sync + 'static,
+) -> (Vec<Result<()>>, usize) {
+	let accepted = Arc::new(AtomicUsize::new(0));
+	{
+		let accepted = Arc::clone(&accepted);
+		tree.core.commit_pipeline.set_commit_hook(Some(Arc::new(move |stage| {
+			if stage == CommitStage::Accepted {
+				accepted.fetch_add(1, Ordering::SeqCst);
+			}
+		})));
+	}
+	let primer_logged = Arc::new(AtomicBool::new(false));
+	let ran = Arc::new(AtomicUsize::new(0));
+	let first = AtomicBool::new(true);
+	let wanted = ops.len() + 1;
+	let (queued, logged, rounds) =
+		(Arc::clone(&accepted), Arc::clone(&primer_logged), Arc::clone(&ran));
+	// The hook never panics: that would end the flusher, and every committer would wait for its
+	// verdict until the deadline.
+	tree.core.commit_pipeline.set_hook(Some(Arc::new(move |point| match point {
+		PipelineHook::AfterWalSync {
+			..
+		} if first.swap(false, Ordering::SeqCst) => {
+			logged.store(true, Ordering::SeqCst);
+			tokio::task::block_in_place(|| {
+				let started = std::time::Instant::now();
+				while queued.load(Ordering::SeqCst) < wanted
+					&& started.elapsed() < Duration::from_secs(20)
+				{
+					std::thread::sleep(Duration::from_millis(1));
+				}
+			});
+		}
+		PipelineHook::BeforeApplyRound {
+			round: 1,
+		} => {
+			rounds.fetch_add(1, Ordering::SeqCst);
+			window();
+		}
+		_ => {}
+	})));
+	let primer = tokio::spawn(commit_one_write_only(
+		Arc::clone(tree),
+		"primer".to_string(),
+		vec![OLD; 40],
+		Durability::Immediate,
+	));
+	within("the flusher to log the first commit", async {
+		while !primer_logged.load(Ordering::SeqCst) {
+			tokio::time::sleep(Duration::from_millis(1)).await;
+		}
+	})
+	.await;
+	// One commit at a time, each accepted before the next is spawned: the scheduler would
+	// otherwise decide the order of the group, and with it which commits are applied before the
+	// rotation.
+	let mut handles = Vec::new();
+	for (n, (key, op)) in ops.iter().enumerate() {
+		handles.push(tokio::spawn(commit_op_write_only(Arc::clone(tree), key.clone(), op.clone())));
+		within("a commit to be accepted", async {
+			while accepted.load(Ordering::SeqCst) < n + 2 {
+				tokio::time::sleep(Duration::from_millis(1)).await;
+			}
+		})
+		.await;
+	}
+	let mut results = Vec::new();
+	for handle in handles {
+		results.push(within("a committer", handle).await.unwrap());
+	}
+	within("the first commit", primer).await.unwrap().unwrap();
+	tree.core.commit_pipeline.set_hook(None);
+	tree.core.commit_pipeline.set_commit_hook(None);
+	(results, ran.load(Ordering::SeqCst))
+}
+
+type Versions = BTreeMap<String, Vec<(u64, InternalKeyKind)>>;
+
+/// What the window of a held group saw.
+#[derive(Default)]
+struct Seen {
+	/// The snapshots registered when the compaction started: none.
+	snapshots: Vec<u64>,
+	visible: u64,
+	/// The highest sequence number given to a batch.
+	logged: u64,
+	immutable: usize,
+	l0_before: usize,
+	l0_after: usize,
+	errors: Vec<String>,
+	versions: Versions,
+	/// What a reader that begins after the compaction reads for `base0` to `base2`.
+	reads: Vec<Option<Vec<u8>>>,
+	/// That reader, which stays open across the publication.
+	reader: Option<Transaction>,
+}
+
+/// Every version of every key that the tables hold, newest first.
+fn versions_by_key(inner: &CoreInner) -> Versions {
+	let manifest = inner.level_manifest.read().unwrap();
+	let mut out: Versions = BTreeMap::new();
+	for table in manifest.iter() {
+		let mut iter = table.iter(None).unwrap();
+		for (key, _) in collect_all(&mut iter).unwrap() {
+			out.entry(String::from_utf8(key.user_key.clone()).unwrap())
+				.or_default()
+				.push((key.seq_num(), key.kind()));
+		}
+	}
+	for versions in out.values_mut() {
+		versions.sort_by_key(|v| std::cmp::Reverse(v.0));
+	}
+	out
+}
+
+fn strategy(options: &Arc<Options>) -> Arc<dyn crate::compaction::CompactionStrategy> {
+	Arc::new(Strategy::from_options(Arc::clone(options)))
+}
+
+/// Flushes the memtable the rotation queued to an L0 table, as the background task does,
+/// compacts the L0 tables, and records what is where and what a new reader reads. Never panics.
+fn compact_in_window(tree: &Arc<Tree>, options: &Arc<Options>, seen: &Mutex<Seen>) {
+	let inner = &tree.core.inner;
+	let mut now = Seen {
+		snapshots: inner.snapshot_tracker.get_all_snapshots(),
+		visible: tree.core.seq_num(),
+		logged: tree.core.commit_pipeline.log_seq_num.load(Ordering::SeqCst) - 1,
+		immutable: inner.immutable_count(),
+		..Default::default()
+	};
+	if let Err(e) = CompactionOperations::compact_memtable(&**inner) {
+		now.errors.push(format!("flush: {e}"));
+	}
+	now.l0_before = inner.l0_file_count();
+	if let Err(e) = inner.compact(strategy(options)) {
+		now.errors.push(format!("compact: {e}"));
+	}
+	now.l0_after = inner.l0_file_count();
+	now.versions = versions_by_key(inner);
+	now.reads = (0..3).map(|i| get(tree, &format!("base{i}"))).collect();
+	now.reader = tree.begin_with_mode(Mode::ReadOnly).ok();
+	*seen.lock().unwrap() = now;
+}
+
+/// The checks that make a test of the window mean something: the group was one group, it was
+/// applied and not published, the rotation queued one memtable that went to an L0 table next to
+/// the one of the base keys, the compaction merged both, and no snapshot was open.
+fn assert_window(seen: &Seen, ran: usize, ops: &Ops) {
+	assert_eq!(ran, 1, "the group needed exactly one second round");
+	assert!(seen.errors.is_empty(), "{:?}", seen.errors);
+	assert_eq!(seen.snapshots, Vec::<u64>::new(), "a snapshot keeps the old version alive");
+	assert_eq!(seen.logged, seen.visible + ops.len() as u64, "the group is applied, not published");
+	assert_eq!(seen.immutable, 1, "the rotation queued one memtable");
+	assert_eq!(seen.l0_before, 2, "the flush wrote a table next to the one of the base keys");
+	assert_eq!(seen.l0_after, 0, "the compaction merged both");
+}
+
+/// A compaction needs L0 tables to merge and keys that reach the tables an earlier one wrote.
+/// Two commits of `base9`, each in a table of its own, give it both. Returns the versions of
+/// every key that the tables hold.
+async fn compact_after_publication(tree: &Arc<Tree>, options: &Arc<Options>) -> Versions {
+	for _ in 0..2 {
+		commit_one_write_only(
+			Arc::clone(tree),
+			"base9".into(),
+			vec![NEW; 40],
+			Durability::Immediate,
+		)
+		.await
+		.unwrap();
+		tree.flush().unwrap();
+	}
+	let inner = &tree.core.inner;
+	assert!(inner.l0_file_count() >= options.level0_max_files);
+	inner.compact(strategy(options)).unwrap();
+	assert_eq!(inner.l0_file_count(), 0);
+	versions_by_key(inner)
+}
+
+/// What a reader sees after the group was published: the base, the commit before it, and the
+/// group on top.
+fn expected_after(group: &Entries) -> BTreeMap<String, Vec<u8>> {
+	let mut expected: BTreeMap<String, Vec<u8>> = base().into_iter().collect();
+	expected.insert("primer".into(), vec![OLD; 40]);
+	expected.extend(group.iter().cloned());
+	expected
+}
+
+fn old_value() -> Option<Vec<u8>> {
+	Some(vec![OLD; 40])
+}
+
+struct Window {
+	tree: Arc<Tree>,
+	options: Arc<Options>,
+	seen: Arc<Mutex<Seen>>,
+}
+
+/// A tree whose L0 holds the base keys, with the options of a compaction that merges two tables.
+async fn window_tree(dir: &Path, level_count: u8) -> Window {
+	let options = Arc::new(Options {
+		level0_max_files: 2,
+		level_count,
+		..opts(dir)
+	});
+	let tree = open((*options).clone()).await;
+	for result in commit_group_write_only(&tree, &base(), Durability::Immediate).await {
+		result.unwrap();
+	}
+	tree.flush().unwrap();
+	assert_eq!(tree.core.inner.l0_file_count(), 1);
+	Window {
+		tree,
+		options,
+		seen: Arc::new(Mutex::new(Seen::default())),
+	}
+}
+
+impl Window {
+	/// Runs `ops` as a held group with a compaction in the window, which also fails the WAL if
+	/// `fail` says so.
+	async fn run(&self, ops: &Ops, fail: bool) -> (Vec<Result<()>>, usize) {
+		let (tree, options, seen) =
+			(Arc::clone(&self.tree), Arc::clone(&self.options), Arc::clone(&self.seen));
+		held_group(&self.tree, ops, move || {
+			compact_in_window(&tree, &options, &seen);
+			if fail {
+				tree.core.inner.wal.write().fail_writes_after(0);
+			}
+		})
+		.await
+	}
+
+	/// Checks what the window saw and returns the reader it left open.
+	fn check(&self, ran: usize, ops: &Ops) -> Transaction {
+		let mut seen = self.seen.lock().unwrap();
+		assert_window(&seen, ran, ops);
+		let first_bytes: Vec<_> = seen.reads.iter().map(|r| r.as_ref().map(|v| v[0])).collect();
+		assert_eq!(
+			first_bytes,
+			vec![Some(OLD); 3],
+			"what a reader that began after the compaction reads"
+		);
+		seen.reader.take().unwrap()
+	}
+}
+
+/// A memtable that was rotated in the middle of a group goes to an L0 table, with the versions of
+/// the group that were applied and are not published, and a compaction then merges it with the
+/// table that holds the versions readers see. It keeps both: dropping the older one leaves the
+/// readers that begin before the group is published, and hold their snapshot across it, with
+/// nothing to read. Once the group is published and no reader is left, the next compaction that
+/// reaches the key keeps one version.
+#[test]
+fn a_compaction_between_a_mid_group_flush_and_the_publication_keeps_the_visible_version() {
+	multi_thread().block_on(async {
+		let dir = TempDir::new("group_fail_stop").unwrap();
+		let window = window_tree(dir.path(), 6).await;
+		let tree = &window.tree;
+		let group = group();
+		let (results, ran) = window.run(&sets(&group), false).await;
+		for result in &results {
+			result.as_ref().unwrap();
+		}
+		let reader = window.check(ran, &sets(&group));
+		{
+			let seen = window.seen.lock().unwrap();
+			for key in ["base0", "base1", "base2"] {
+				let versions = &seen.versions[key];
+				assert_eq!(
+					versions.iter().map(|v| v.1).collect::<Vec<_>>(),
+					vec![InternalKeyKind::Set; 2],
+					"{key}: the version the group wrote and the one readers see: {versions:?}"
+				);
+			}
+		}
+
+		// The group is published.
+		assert_eq!(scan(tree), expected_after(&group));
+		for i in 0..3 {
+			assert_eq!(
+				reader.get(format!("base{i}").as_bytes()).unwrap(),
+				old_value(),
+				"base{i} for the reader that began before the publication"
+			);
+		}
+		drop(reader);
+
+		let versions = compact_after_publication(tree, &window.options).await;
+		for (key, versions) in &versions {
+			assert_eq!(versions.len(), 1, "{key}: {versions:?}");
+		}
+		assert_eq!(get(tree, "base0"), Some(vec![NEW; 40]));
+		crash(tree);
+	});
+}
+
+/// The same window, ending in the failure of the group: the readers still read every value that
+/// was acknowledged, and recovery finds the group whole.
+#[test]
+fn a_compaction_between_a_mid_group_flush_and_a_failed_group_keeps_the_visible_version() {
+	multi_thread().block_on(async {
+		let dir = TempDir::new("group_fail_stop").unwrap();
+		let window = window_tree(dir.path(), 6).await;
+		let tree = &window.tree;
+		let group = group();
+		let (results, ran) = window.run(&sets(&group), true).await;
+		all_stopped(&results, "the group");
+		let reader = window.check(ran, &sets(&group));
+
+		let mut before: BTreeMap<String, Vec<u8>> = base().into_iter().collect();
+		before.insert("primer".into(), vec![OLD; 40]);
+		assert_eq!(scan(tree), before, "nothing of the group is readable");
+		for i in 0..3 {
+			assert_eq!(get(tree, &format!("base{i}")), old_value(), "base{i}");
+			assert_eq!(reader.get(format!("base{i}").as_bytes()).unwrap(), old_value(), "base{i}");
+		}
+		drop(reader);
+
+		assert_recovered(
+			&recover_image(dir.path(), &window.options),
+			&before,
+			&group,
+			"after the compaction",
+		);
+		crash(tree);
+	});
+}
+
+/// A delete above the visible sequence number, in the same window, at the bottom level: a
+/// compaction drops the values under a delete there, and a reader that begins before the group is
+/// published still has to read them.
+#[test]
+fn a_delete_above_the_visible_sequence_number_does_not_make_a_compaction_drop_the_value() {
+	multi_thread().block_on(async {
+		let dir = TempDir::new("group_fail_stop").unwrap();
+		let window = window_tree(dir.path(), 2).await;
+		let tree = &window.tree;
+		let mut ops = sets(&group());
+		for (key, op) in ops.iter_mut().take(3) {
+			assert!(key.starts_with("base"));
+			*op = Op::Delete;
+		}
+		let (results, ran) = window.run(&ops, false).await;
+		for result in &results {
+			result.as_ref().unwrap();
+		}
+		let reader = window.check(ran, &ops);
+		{
+			let seen = window.seen.lock().unwrap();
+			for key in ["base0", "base1", "base2"] {
+				let kinds: Vec<_> = seen.versions[key].iter().map(|v| v.1).collect();
+				assert_eq!(
+					kinds,
+					vec![InternalKeyKind::Delete, InternalKeyKind::Set],
+					"{key}: the delete and the value under it"
+				);
+			}
+		}
+
+		let mut expected = expected_after(&group());
+		for i in 0..3 {
+			expected.remove(&format!("base{i}"));
+		}
+		assert_eq!(scan(tree), expected, "the deletes are published");
+		assert_eq!(reader.get(&b"base0"[..]).unwrap(), old_value());
+		drop(reader);
+
+		let versions = compact_after_publication(tree, &window.options).await;
+		for i in 0..3 {
+			assert!(!versions.contains_key(&format!("base{i}")), "base{i}: {versions:?}");
+		}
+		crash(tree);
+	});
+}
+
+/// The same with a range delete: it applies to a reader only once the group is published, and a
+/// compaction must not drop the values it covers before that.
+#[test]
+fn a_range_delete_above_the_visible_sequence_number_does_not_make_a_compaction_drop_the_values() {
+	multi_thread().block_on(async {
+		let dir = TempDir::new("group_fail_stop").unwrap();
+		let window = window_tree(dir.path(), 2).await;
+		let tree = &window.tree;
+		let mut ops = sets(&group());
+		ops[0] = ("base0".to_string(), Op::DeleteRange("base3".to_string()));
+		ops[1] = ("group1".to_string(), Op::Set(vec![NEW; 40]));
+		ops[2] = ("group2".to_string(), Op::Set(vec![NEW; 40]));
+		let (results, ran) = window.run(&ops, false).await;
+		for result in &results {
+			result.as_ref().unwrap();
+		}
+		let reader = window.check(ran, &ops);
+
+		let written: Entries = ops
+			.iter()
+			.filter_map(|(key, op)| match op {
+				Op::Set(value) => Some((key.clone(), value.clone())),
+				_ => None,
+			})
+			.collect();
+		let mut expected = expected_after(&written);
+		for i in 0..3 {
+			expected.remove(&format!("base{i}"));
+		}
+		assert_eq!(scan(tree), expected, "the range delete is published");
+		assert_eq!(reader.get(&b"base1"[..]).unwrap(), old_value());
+		drop(reader);
+
+		let versions = compact_after_publication(tree, &window.options).await;
+		for i in 0..3 {
+			assert!(!versions.contains_key(&format!("base{i}")), "base{i}: {versions:?}");
+		}
+		let manifest = tree.core.inner.level_manifest.read().unwrap();
+		assert!(
+			manifest.iter().any(|t| t.range_deletions.read().iter().any(|r| r.0 == b"base0")),
+			"the range deletion stays in a table"
+		);
+		drop(manifest);
+		crash(tree);
+	});
 }
 
 // ---------------------------------------------------------------------------

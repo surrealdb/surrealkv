@@ -28,6 +28,8 @@ pub mod close_race_tests;
 pub mod commit_pipeline_gate_tests;
 #[cfg(test)]
 pub mod commit_pipeline_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod compaction_horizon_tests;
 #[cfg(test)]
 pub mod compaction_memory_proofs;
 #[cfg(test)]

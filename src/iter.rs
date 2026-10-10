@@ -23,21 +23,22 @@ pub(crate) enum SnapshotVisibility {
 	/// boundary used for compaction grouping.
 	///
 	/// This version must be preserved unless a newer version exists in the
-	/// same visibility boundary (in which case the newer version supersedes it).
+	/// same visibility boundary and is published (in which case the newer version
+	/// supersedes it).
 	BoundedBySnapshot(u64),
 
 	/// No active snapshots exist.
 	///
-	/// When there are no snapshots, visibility is determined solely by
-	/// retention rules. Only the latest version needs to be kept (unless
-	/// versioning is enabled).
+	/// When there are no snapshots, only readers that are not snapshots remain: they
+	/// read at the horizon or above, so the newest version at or below the horizon is the
+	/// last one that is needed.
 	NoActiveSnapshots,
 
 	/// Version has a sequence number higher than all active snapshots.
 	///
 	/// This version was written after all currently active snapshots were created,
 	/// so it is not visible to any existing snapshot. It can be dropped
-	/// if a newer version exists in the same visibility boundary.
+	/// if a newer, published version exists in the same visibility boundary.
 	NewerThanAllSnapshots,
 }
 
@@ -696,8 +697,7 @@ pub(crate) struct CompactionIterator<'a> {
 	/// Whether this compaction is at the bottom level of the LSM-tree.
 	///
 	/// At the bottom level:
-	/// - DELETE tombstones can be dropped (no older data below)
-	/// - All versions of deleted keys can be removed
+	/// - A DELETE tombstone that is the oldest version kept can be dropped (no older data below)
 	///
 	/// At non-bottom levels:
 	/// - Tombstones must be preserved to mask data in lower levels
@@ -736,8 +736,18 @@ pub(crate) struct CompactionIterator<'a> {
 	///
 	/// Used to implement snapshot-aware compaction. Versions visible to any
 	/// active snapshot must be preserved. The list is sorted in ascending
-	/// order for efficient binary search.
+	/// order for efficient binary search. It must be read after the horizon.
 	snapshots: Vec<u64>,
+
+	/// The visibility horizon: the sequence number of the newest version that readers can see.
+	///
+	/// A reader that is not registered as a snapshot, or that has not started yet, reads at
+	/// this sequence number or above. A version above it was not published, so no reader can
+	/// see it, and it must neither be dropped nor allowed to supersede the versions below it.
+	horizon: u64,
+
+	/// Scratch space: whether each of the sorted versions of the current key is kept.
+	keep: Vec<bool>,
 
 	/// Active range tombstones accumulated during compaction: (start_key, end_key, seq_num)
 	active_range_deletions: Vec<(Key, Key, u64)>,
@@ -754,11 +764,13 @@ impl<'a> CompactionIterator<'a> {
 	/// * `retention_period_ns` - How long to keep old versions
 	/// * `clock` - Time source for retention calculations
 	/// * `snapshots` - Sorted list of active snapshot sequence numbers
+	/// * `horizon` - The visible sequence number, read before `snapshots` was
 	pub(crate) fn new(
 		iterators: Vec<BoxedLSMIterator<'a>>,
 		cmp: Arc<dyn Comparator>,
 		is_bottom_level: bool,
 		snapshots: Vec<u64>,
+		horizon: u64,
 	) -> Self {
 		let merge_iter = MergingIterator::new(iterators, cmp);
 
@@ -770,8 +782,21 @@ impl<'a> CompactionIterator<'a> {
 			output_versions: VecDeque::new(),
 			initialized: false,
 			snapshots,
+			horizon,
+			keep: Vec::new(),
 			active_range_deletions: Vec::new(),
 		}
+	}
+
+	/// A compaction iterator for input that is entirely published.
+	#[cfg(all(test, not(target_arch = "wasm32")))]
+	pub(crate) fn all_published(
+		iterators: Vec<BoxedLSMIterator<'a>>,
+		cmp: Arc<dyn Comparator>,
+		is_bottom_level: bool,
+		snapshots: Vec<u64>,
+	) -> Self {
+		Self::new(iterators, cmp, is_bottom_level, snapshots, u64::MAX)
 	}
 
 	pub(crate) fn with_range_deletions(mut self, range_deletions: Vec<(Key, Key, u64)>) -> Self {
@@ -908,56 +933,96 @@ impl<'a> CompactionIterator<'a> {
 		matches!(visibility, SnapshotVisibility::BoundedBySnapshot(_))
 	}
 
+	/// Whether some snapshot has a sequence number in `[lo, hi)`.
+	///
+	/// Such a snapshot reads the version at `lo` rather than the one at `hi` or above.
+	fn snapshot_in(&self, lo: u64, hi: u64) -> bool {
+		let idx = self.snapshots.partition_point(|&s| s < lo);
+		self.snapshots.get(idx).is_some_and(|&s| s < hi)
+	}
+
+	/// Whether a range deletion hides the version of `user_key` at `seq_num` from every reader.
+	///
+	/// A range deletion applies to a reader at its sequence number or above, and the horizon is
+	/// the lowest sequence number a reader that is not a snapshot reads at, so a range deletion
+	/// above the horizon hides nothing yet. A snapshot below the range deletion and not below
+	/// the version reads the version, and the range deletion does not apply to it.
+	fn is_covered_by_range(&self, user_key: &[u8], seq_num: u64) -> bool {
+		self.active_range_deletions.iter().any(|(start, end, rseq)| {
+			*rseq >= seq_num
+				&& *rseq <= self.horizon
+				&& user_key >= start.as_slice()
+				&& user_key < end.as_slice()
+				&& !self.snapshot_in(seq_num, *rseq)
+		})
+	}
+
 	/// Process all accumulated versions of the current key.
 	///
-	/// This is the heart of compaction logic. It decides:
-	/// - Which versions to keep (output_versions)
-	/// - Which versions to discard (delete_list, discard_stats)
+	/// This is the heart of compaction logic. It decides which versions to keep
+	/// (`output_versions`) and which to discard.
 	///
-	/// # Snapshot-Aware Compaction
+	/// # Who reads a version
 	///
-	/// Before applying retention rules, we check snapshot visibility:
-	/// - A version visible to an active snapshot MUST be preserved
-	/// - Exception: A version can be dropped if a newer version exists in the same snapshot
-	///   "boundary" (both visible to the same earliest snapshot). The newer version supersedes the
-	///   older one.
+	/// A version is read by every reader whose sequence number lies in `[version, newer)`, where
+	/// `newer` is the sequence number of the next newer version of the key. A reader is either
+	/// a registered snapshot, or it reads at the horizon or above: the readers that have not
+	/// registered, or have not started. A version is therefore dropped only when
+	///
+	/// - no snapshot lies in `[version, newer)`: it shares its visibility boundary with the newer
+	///   version, and
+	/// - the newer version is at or below the horizon: no other reader can read the older one.
+	///
+	/// Every version above the horizon is kept: nothing can see it yet, and the version below it
+	/// is still the one readers see. The newest version at or below the horizon is kept in
+	/// turn, and it is that version that drops the ones under it.
 	///
 	/// # Decision Matrix
 	///
 	/// ```text
-	/// ┌─────────────────┬───────────────┬────────────────┬──────────────────┐
-	/// │ Scenario        │ Bottom Level? │ Versioning?    │ Action           │
-	/// ├─────────────────┼───────────────┼────────────────┼──────────────────┤
-	/// │ Visible to snap │ any           │ any            │ KEEP (unless hidden) │
-	/// │ Hidden by newer │ any           │ any            │ DROP             │
-	/// │ Latest PUT      │ any           │ any            │ KEEP             │
-	/// │ Latest DELETE   │ YES           │ any            │ DROP ALL         │
-	/// │ Latest DELETE   │ NO            │ any            │ KEEP (tombstone) │
-	/// │ Latest REPLACE  │ any           │ any            │ KEEP, drop older │
-	/// │ Older PUT       │ any           │ NO             │ DROP             │
-	/// │ Older PUT       │ any           │ YES, in window │ KEEP             │
-	/// │ Older PUT       │ any           │ YES, expired   │ DROP             │
-	/// └─────────────────┴───────────────┴────────────────┴──────────────────┘
+	/// ┌────────────────────────────┬───────────────┬──────────────────────────────┐
+	/// │ Scenario                   │ Bottom Level? │ Action                       │
+	/// ├────────────────────────────┼───────────────┼──────────────────────────────┤
+	/// │ Newer version above horizon│ any           │ KEEP                         │
+	/// │ Snapshot in [version,newer)│ any           │ KEEP                         │
+	/// │ Newer version at or below  │ any           │ DROP                         │
+	/// │ horizon, same boundary     │               │                              │
+	/// │ Covered by range deletion  │ any           │ DROP                         │
+	/// │ Oldest kept, is a delete   │ YES           │ DROP                         │
+	/// │ Oldest kept, is a delete   │ NO            │ KEEP (masks lower levels)    │
+	/// └────────────────────────────┴───────────────┴──────────────────────────────┘
 	/// ```
+	///
+	/// A range deletion entry counts as a delete here. The range deletion itself is never
+	/// dropped: it is registered in `active_range_deletions` before its entry is considered,
+	/// and every output carries all of them.
 	///
 	/// # Example: Snapshot-Aware Compaction
 	///
 	/// ```text
-	/// Snapshots: [50, 150]
+	/// Snapshots: [50, 150], horizon: 200
 	///
 	/// Input:
-	///   ("key1", seq=200, PUT, "v4")  → NewerThanAllSnapshots
-	///   ("key1", seq=100, PUT, "v3")  → BoundedBySnapshot(150)
-	///   ("key1", seq=80,  PUT, "v2")  → BoundedBySnapshot(150) - same boundary as v3!
-	///   ("key1", seq=30,  PUT, "v1")  → BoundedBySnapshot(50)
-	///
-	/// Snapshot visibility analysis:
-	///   - v4: Latest, keep
-	///   - v3: Bounded by snap 150, different boundary from v4, KEEP
-	///   - v2: Same boundary as v3 (both bounded by 150), DROP (superseded by v3)
-	///   - v1: Bounded by snap 50, different boundary, KEEP
+	///   ("key1", seq=200, PUT, "v4")  → newest, KEEP
+	///   ("key1", seq=100, PUT, "v3")  → BoundedBySnapshot(150), KEEP
+	///   ("key1", seq=80,  PUT, "v2")  → BoundedBySnapshot(150), same boundary as v3: DROP
+	///   ("key1", seq=30,  PUT, "v1")  → BoundedBySnapshot(50), KEEP
 	///
 	/// Output: [v4, v3, v1]
+	/// ```
+	///
+	/// # Example: Versions Above the Horizon
+	///
+	/// ```text
+	/// Snapshots: [], horizon: 10
+	///
+	/// Input:
+	///   ("key1", seq=12, PUT, "v3")  → above the horizon, KEEP
+	///   ("key1", seq=11, PUT, "v2")  → newer version is above the horizon, KEEP
+	///   ("key1", seq=8,  PUT, "v1")  → newer version is above the horizon, KEEP
+	///   ("key1", seq=5,  PUT, "v0")  → v1 is at or below the horizon, DROP
+	///
+	/// Output: [v3, v2, v1]
 	/// ```
 	///
 	/// # Example: DELETE at Bottom Level
@@ -967,32 +1032,17 @@ impl<'a> CompactionIterator<'a> {
 	///   ("key1", seq=100, DELETE)
 	///   ("key1", seq=50,  PUT, "value")
 	///
-	/// At bottom level:
-	///   - Latest is DELETE → can drop everything
+	/// At bottom level, no snapshots, horizon: 100:
+	///   - the PUT is dropped, the DELETE is then the oldest version kept and is dropped
 	///   - Output: []
-	///   - delete_list: [seq=100, seq=50]
+	///
+	/// At bottom level, snapshot: 60:
+	///   - the snapshot reads the PUT, so it is kept, and so is the DELETE above it
+	///   - Output: [DELETE, PUT]
 	///
 	/// At non-bottom level:
 	///   - Must keep tombstone to mask lower levels
 	///   - Output: [("key1", seq=100, DELETE)]
-	///   - delete_list: [seq=50]
-	/// ```
-	///
-	/// # Example: Versioning with Retention
-	///
-	/// ```text
-	/// Input:
-	///   ("key1", seq=100, PUT, "v3", timestamp=now)
-	///   ("key1", seq=50,  PUT, "v2", timestamp=now-30min)
-	///   ("key1", seq=20,  PUT, "v1", timestamp=now-2hours)
-	///
-	/// With versioning=true, retention=1hour, no snapshots:
-	///   - seq=100: age=0, KEEP (latest)
-	///   - seq=50:  age=30min < 1hour, KEEP (within retention)
-	///   - seq=20:  age=2hours > 1hour, DROP (expired)
-	///
-	/// Output: [seq=100, seq=50]
-	/// delete_list: [seq=20]
 	/// ```
 	fn process_accumulated_versions(&mut self) -> Result<()> {
 		if self.accumulated_versions.is_empty() {
@@ -1013,12 +1063,10 @@ impl<'a> CompactionIterator<'a> {
 		//
 		// `MemTable::add` is atomic via `try_reserve` (see memtable/mod.rs),
 		// so two SSTs containing rows with identical `(user_key, seq_num)`
-		// should no longer be possible. Originally (PR #383) this dedup was
-		// the fix for a production HardError: with `enable_versioning=true`
-		// and `NoActiveSnapshots`, `snapshot_allows_drop` is `false`, so the
-		// visibility-based `superseded` check below cannot drop equal-seq
-		// duplicates, and `BlockBuilder::add` would then abort the SST flush
-		// with `Error::KeyNotInOrder`.
+		// should no longer be possible. Were there such rows, the visibility
+		// checks below would keep both of them whenever the horizon is below
+		// their sequence number, and `BlockBuilder::add` would abort the SST
+		// flush with `Error::KeyNotInOrder`.
 		//
 		// This dedup remains in place as defense-in-depth against any future
 		// code path that re-introduces equal-seq duplicates. After sorting by
@@ -1035,145 +1083,64 @@ impl<'a> CompactionIterator<'a> {
 			}
 		}
 
-		// Check if latest version is DELETE at bottom level
-		// If so, we can completely remove this key from the database
-		let latest_is_delete_at_bottom =
-			self.is_bottom_level && !versions.is_empty() && versions[0].0.is_hard_delete_marker();
+		let mut keep = std::mem::take(&mut self.keep);
+		keep.clear();
 
-		// Check if any version is REPLACE
-		// REPLACE semantics: delete all older versions regardless of retention
-		let has_set_with_delete = versions.iter().any(|(key, _)| key.is_replace());
+		// The sequence number and visibility of the previous (newer) version.
+		let mut newer: Option<(u64, SnapshotVisibility)> = None;
 
-		// Track the visibility of the previous (newer) version we processed.
-		// Used to detect when a newer version supersedes an older one.
-		let mut newer_version_visibility: Option<SnapshotVisibility> = None;
-
-		// Entries are moved out of the batch; kept ones go to output_versions.
-		for (i, (key, value)) in versions.drain(..).enumerate() {
-			let is_hard_delete = key.is_hard_delete_marker();
-			let is_replace = key.is_replace();
-			let is_latest = i == 0;
+		for (key, _) in &versions {
 			let seq_num = key.seq_num();
+			let visibility = self.find_earliest_visible_snapshot(seq_num)?;
 
-			// ===== SNAPSHOT-AWARE COMPACTION =====
-			//
-			// Goal: Drop old versions that no snapshot needs to see.
-			//
-			// A version is "superseded" when:
-			//   1. A newer version of the same key exists
-			//   2. Both versions have the same visibility boundary (i.e., visible to the same
-			//      earliest snapshot, or both invisible to all snapshots)
-			//   3. Therefore, any snapshot that could see the old version will see the newer one
-			//      instead - the old version is redundant
-			//
-			// Exception: When versioning is enabled and no snapshots exist, we keep
-			// old versions based on retention policy, not snapshot visibility.
-
-			let current_visibility = self.find_earliest_visible_snapshot(seq_num)?;
-
-			// Check if this version is superseded by a newer version
-			let superseded = if let Some(newer_vis) = newer_version_visibility {
-				// Can we drop superseded versions in this scenario?
-				let snapshot_allows_drop = match current_visibility {
-					// Active snapshots exist - use visibility boundaries to decide
-					SnapshotVisibility::BoundedBySnapshot(_) => true,
-					SnapshotVisibility::NewerThanAllSnapshots => true,
-					// No snapshots - single-version KV drops superseded versions
-					SnapshotVisibility::NoActiveSnapshots => true,
-				};
-
-				// Superseded = not latest AND in same visibility boundary AND allowed to drop
-				snapshot_allows_drop
-					&& !is_latest
-					&& self.same_visibility_boundary(newer_vis, current_visibility)
-			} else {
-				// This is the first (newest) version - can't be superseded
-				false
+			// A version is exposed when it is the newest, or the version above it is not
+			// published: a reader that is not a snapshot reads it. Otherwise it is superseded
+			// by the newer version when no snapshot lies between the two.
+			let (exposed, superseded) = match newer {
+				Some((newer_seq, newer_vis)) if newer_seq <= self.horizon => {
+					(false, self.same_visibility_boundary(newer_vis, visibility))
+				}
+				_ => (true, false),
 			};
 
-			// Is this version required by an active snapshot?
-			// (Only matters if not already superseded by a newer version)
-			let required_by_snapshot =
-				!superseded && self.must_preserve_for_snapshot(current_visibility);
+			// What is neither exposed nor superseded has a snapshot between it and the newer
+			// version, as the visibility of the newer version differs.
+			let required = !superseded && self.must_preserve_for_snapshot(visibility);
+			debug_assert!(exposed || superseded || required);
 
-			// ===== DETERMINE IF ENTRY IS STALE =====
-			// Stale entries are filtered out during compaction
+			let covered = key.kind() != crate::InternalKeyKind::RangeDelete
+				&& self.is_covered_by_range(&key.user_key, seq_num);
 
-			let is_covered_by_range = key.kind() != crate::InternalKeyKind::RangeDelete
-				&& self.active_range_deletions.iter().any(|(start, end, rseq)| {
-					*rseq >= seq_num
-						&& key.user_key.as_slice() >= start.as_slice()
-						&& key.user_key.as_slice() < end.as_slice()
-				});
-
-			let should_mark_stale = if is_covered_by_range {
-				true
-			} else if superseded {
-				// Superseded: a newer version in the same visibility boundary
-				// makes this version redundant - safe to drop
-				true
-			} else if latest_is_delete_at_bottom {
-				// DELETE at bottom level: mark ALL versions as stale
-				// The entire key is being removed from the database
-				true
-			} else if required_by_snapshot {
-				// Required by snapshot: an active snapshot needs this version - keep it
-				false
-			} else if is_latest && !is_hard_delete && !is_replace {
-				// Latest PUT: never stale (will be output)
-				false
-			} else if is_latest && is_hard_delete && self.is_bottom_level {
-				// Latest DELETE at bottom: stale (won't be output)
-				true
-			} else if is_latest && is_hard_delete && !self.is_bottom_level {
-				// Latest DELETE at non-bottom: not stale (tombstone preserved)
-				false
-			} else if is_latest && is_replace {
-				// Latest REPLACE: not stale (will be output)
-				false
-			} else if is_hard_delete {
-				// Older DELETE: always stale (only latest tombstone matters)
-				true
-			} else if has_set_with_delete && !is_replace {
-				// REPLACE found: all older non-REPLACE versions are stale
-				true
-			} else {
-				// Older PUT: check versioning and retention
-				// Single-version KV: only the latest version matters,
-				// all older superseded versions are stale
-				true
-			};
-
-			// ===== DETERMINE IF ENTRY SHOULD BE OUTPUT =====
-
-			let should_output = if superseded {
-				// Superseded by newer version: don't output
-				false
-			} else if latest_is_delete_at_bottom {
-				// DELETE at bottom: output NOTHING
-				false
-			} else if should_mark_stale {
-				// Stale entries: don't output
-				false
-			} else if required_by_snapshot {
-				// Snapshot requires it: output
-				true
-			} else {
-				// Single-version KV: only output latest
-				is_latest
-			};
-
-			if should_output {
-				self.output_versions.push_back((key, value));
-			}
-
-			// Update for next iteration (this version becomes the "newer" one)
-			newer_version_visibility = Some(current_visibility);
+			keep.push(!covered && (exposed || required));
+			newer = Some((seq_num, visibility));
 		}
 
-		// Hand the (now empty) buffer back so its capacity is reused for the
-		// next key's versions.
+		// At the bottom level nothing lies below, so a delete that is the oldest version kept
+		// hides nothing and goes, and so does the next one it uncovers. A delete above a version
+		// that is kept stays: it hides that version from the readers above it.
+		if self.is_bottom_level {
+			for (idx, (key, _)) in versions.iter().enumerate().rev() {
+				if !keep[idx] {
+					continue;
+				}
+				if !key.is_hard_delete_marker() {
+					break;
+				}
+				keep[idx] = false;
+			}
+		}
+
+		// Entries are moved out of the batch; kept ones go to output_versions.
+		for (entry, kept) in versions.drain(..).zip(keep.iter().copied()) {
+			if kept {
+				self.output_versions.push_back(entry);
+			}
+		}
+
+		// Hand the (now empty) buffers back so their capacity is reused for the next key's
+		// versions.
 		self.accumulated_versions = versions;
+		self.keep = keep;
 		Ok(())
 	}
 

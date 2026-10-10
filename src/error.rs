@@ -54,7 +54,9 @@ pub enum Error {
 	/// commits of that group took effect is decided by recovery when the database is opened
 	/// again, so a commit of that group that fails with this error has an unknown outcome. A
 	/// commit that was refused because the database had stopped did not start. Reads of data that
-	/// was already visible keep working.
+	/// was already visible keep working, including after a compaction that ran while the group was
+	/// applied: a compaction keeps every version above the visible sequence number, and the newest
+	/// one at or below it.
 	DatabaseStopped(String),
 	Other(String), // Other errors
 	NoSnapshot,
@@ -404,6 +406,13 @@ impl BackgroundErrorHandler {
 	/// A memtable or a table then holds batches of the group that were never published. Nothing
 	/// may move them to a table, compact tables that hold them, or checkpoint them: the WAL keeps
 	/// the group for recovery, and a table that held only some of it would split it.
+	///
+	/// A compaction that overlapped the group before it failed keeps those batches, and the
+	/// version of each of their keys that readers can see. That is one extra version per key of
+	/// the group in flight, kept until a later compaction rewrites the key after the group was
+	/// published; at the bottom level a cold key can keep it indefinitely. A stopped database
+	/// admits no further compaction, so nothing is added after the stop, and a reopen publishes
+	/// whatever recovery finds.
 	pub(crate) fn commit_group_error(&self) -> Option<Error> {
 		self.commit_group_stop.get().cloned()
 	}
