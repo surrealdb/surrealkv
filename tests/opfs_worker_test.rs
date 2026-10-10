@@ -298,7 +298,6 @@ async fn zero_length_reads_and_writes_inside_the_file_change_nothing() {
 }
 
 #[wasm_bindgen_test]
-#[ignore = "a zero-length write_at beyond the end makes size() report the offset while the file keeps its real length"]
 async fn a_zero_length_write_beyond_the_end_does_not_change_the_reported_size() {
 	let root = root().await;
 	let name = unique_name("zero-length-beyond", "bin");
@@ -703,8 +702,8 @@ async fn a_closed_file_rejects_reads_writes_and_flushes_and_keeps_its_data() {
 	let err = expect_err(file.flush(), "flush on a closed file");
 	assert!(err.contains("InvalidStateError"), "{err}");
 	// An empty read is no exception. (An empty write is deliberately not asserted: the browser
-	// does reject it, but returning early for empty buffers is the natural fix for the ignored
-	// zero-length-write defect above and must stay possible.)
+	// does reject it, but a backend may also return early for empty buffers, and that must stay
+	// possible.)
 	let err = expect_err(file.read_at(0, &mut []), "an empty read_at on a closed file");
 	assert!(err.contains("InvalidStateError"), "{err}");
 	assert_eq!(file.size().unwrap(), 40, "a failed write must not move the reported size");

@@ -70,8 +70,12 @@ impl OpfsSyncFile {
 			.handle
 			.write_with_u8_array_and_options(buf, &options)
 			.map_err(|e| Error::Other(format!("OPFS write error: {:?}", e)))?;
-		let new_end = offset + bytes_written as u64;
-		self.size_cache.fetch_max(new_end, Ordering::Release);
+		// The browser ignores a write of nothing, so it does not extend the file up to `offset`
+		// and the cached size must not move either.
+		if bytes_written > 0.0 {
+			let new_end = offset + bytes_written as u64;
+			self.size_cache.fetch_max(new_end, Ordering::Release);
+		}
 		Ok(bytes_written as usize)
 	}
 
