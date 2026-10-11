@@ -29,6 +29,7 @@ mod header;
 mod identity;
 mod kdf;
 mod keys;
+mod manifest;
 mod random;
 mod suite;
 #[cfg(test)]
@@ -40,6 +41,18 @@ pub use header::{CryptoHeader, HEADER_LEN, HEADER_MAGIC, HEADER_VERSION};
 pub use identity::{DbId, FileIdentity, FileKind, DB_ID_LEN};
 pub use kdf::{FileKey, FILE_KEY_LEN};
 pub use keys::{KeyManager, KeyState, SoftwareKeyManager, ROOT_KEY_LEN};
+pub use manifest::{
+	describe_manifest,
+	describe_manifest_file,
+	is_cut_inside_manifest_magic,
+	is_sealed_manifest,
+	open_manifest,
+	seal_manifest,
+	ManifestDescription,
+	MANIFEST_CONTAINER_VERSION,
+	MANIFEST_MAGIC,
+	MANIFEST_PREFIX_LEN,
+};
 pub use random::{fresh_salt, SALT_LEN};
 pub use suite::{hardware_aes_available, CipherPreference, CipherSuite};
 /// The wrapper `KeyManager::root_key` returns roots in, re-exported so that an implementation
