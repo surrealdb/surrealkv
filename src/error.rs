@@ -256,6 +256,14 @@ pub enum EncryptionError {
 	/// does not belong to the file kind. A programming error, never produced by file contents
 	/// alone.
 	InvalidInput(&'static str),
+	/// Encryption is configured, but the database, or the checkpoint that is being restored into
+	/// it, is not encrypted. Encryption is chosen when a database is created and is never added
+	/// to one that exists, so this is refused and nothing is changed. A plaintext file inside a
+	/// database that is encrypted is `PlaintextInEncryptedDb`.
+	NotEncrypted,
+	/// A checkpoint is encrypted with another cipher suite than the database it is restored into.
+	/// A database keeps the suite that was chosen when it was created.
+	SuiteMismatch,
 }
 
 impl EncryptionError {
@@ -305,6 +313,14 @@ impl fmt::Display for EncryptionError {
 				write!(f, "refusing to seal at a position that would repeat a nonce")
 			}
 			Self::InvalidInput(reason) => write!(f, "invalid encryption input: {reason}"),
+			Self::NotEncrypted => write!(
+				f,
+				"the data is not encrypted but encryption is configured, and encryption cannot be \
+				 added to a database that exists"
+			),
+			Self::SuiteMismatch => {
+				write!(f, "the data uses another cipher suite than the database")
+			}
 		}
 	}
 }
@@ -907,6 +923,8 @@ mod tests {
 			EncryptionError::FileIdMismatch,
 			EncryptionError::PositionReuse,
 			EncryptionError::InvalidInput("a block kind that does not belong to the file kind"),
+			EncryptionError::NotEncrypted,
+			EncryptionError::SuiteMismatch,
 		]
 	}
 
@@ -926,6 +944,8 @@ mod tests {
 			EncryptionError::FileIdMismatch => 11,
 			EncryptionError::PositionReuse => 12,
 			EncryptionError::InvalidInput(_) => 13,
+			EncryptionError::NotEncrypted => 14,
+			EncryptionError::SuiteMismatch => 15,
 		}
 	}
 
@@ -933,7 +953,7 @@ mod tests {
 	fn every_encryption_error_variant_is_listed_once_per_shape() {
 		let mut seen: Vec<usize> = every_encryption_error().iter().map(position).collect();
 		seen.dedup();
-		assert_eq!(seen, (0..=13).collect::<Vec<_>>());
+		assert_eq!(seen, (0..=15).collect::<Vec<_>>());
 	}
 
 	#[test]
