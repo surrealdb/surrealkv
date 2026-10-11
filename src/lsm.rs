@@ -770,7 +770,7 @@ impl CoreInner {
 			let mut wal_guard = self.wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
 			self.rotate_wal(&mut wal_guard).map_err(|e| {
-				Error::Other(format!("Failed to rotate WAL before memtable rotation: {}", e))
+				Self::rotation_error("Failed to rotate WAL before memtable rotation", e)
 			})?;
 			let new_log_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
@@ -864,7 +864,7 @@ impl CoreInner {
 
 		let mut wal_guard = self.wal.write();
 		self.rotate_wal(&mut wal_guard).map_err(|e| {
-			Error::Other(format!("Failed to rotate WAL before direct-to-L0 flush: {}", e))
+			Self::rotation_error("Failed to rotate WAL before direct-to-L0 flush", e)
 		})?;
 		let new_wal_number = wal_guard.get_active_log_number();
 		drop(wal_guard);
@@ -897,15 +897,29 @@ impl CoreInner {
 		};
 		if active_memtable.is_empty() {
 			let mut wal_guard = self.wal.write();
-			self.rotate_wal(&mut wal_guard).map_err(|e| replace_error(&e))?;
+			self.rotate_wal(&mut wal_guard)
+				.map_err(|e| Self::rotation_error("Failed to replace the failed WAL segment", e))?;
 			let new_wal_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
 			active_memtable.set_wal_number(new_wal_number);
 			return Ok(Some(false));
 		}
 
-		self.rotate_memtable_locked(active_memtable).map_err(|e| replace_error(&e))?;
+		self.rotate_memtable_locked(active_memtable).map_err(|e| match e {
+			Error::Encryption(_) => e,
+			e => replace_error(&e),
+		})?;
 		Ok(Some(true))
+	}
+
+	/// The error of a rotation of the WAL that failed. An encryption error keeps its type: a key
+	/// that could not be had may be asked for again, and no other of them may, which a text does
+	/// not say.
+	fn rotation_error(what: &str, error: wal::Error) -> Error {
+		match error {
+			wal::Error::Encryption(error) => Error::Encryption(error),
+			error => Error::Other(format!("{what}: {error}")),
+		}
 	}
 
 	/// Ends the hold of the WAL writer once no memtable tagged with a segment below the hold's
