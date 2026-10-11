@@ -98,6 +98,16 @@ pub trait CompactionOperations: Send + Sync {
 /// tables to the removal of what it made obsolete, and takes the locks above under it, and a
 /// restore holds it exclusively. Nothing waits for it while holding any of them.
 ///
+/// `rotations`, which serializes the rotations of the memtable and the WAL with a restore, comes
+/// before `active_memtable`, and after `flush_lock` and `compactions`, which a restore takes first
+/// and a rotation never takes. A rotation takes it with nothing else held, except the checkpoint
+/// gate when a checkpoint's flush rotates, and nothing waits for it while holding
+/// `active_memtable` or a lock below it.
+///
+/// A checkpoint takes the checkpoint gate shared (`CheckpointGate::enter()`) before any of them
+/// and a restore takes it exclusively before any of them, so the two never overlap and neither
+/// waits for the gate while holding a lock the other needs.
+///
 /// The commit pipeline takes two of them outside the flush path: a commit group's direct level-0
 /// write holds `flush_lock` with nothing else held and takes the others under it, as a flush
 /// does, and a group's publication holds the `active_memtable` read guard alone, with no lock
@@ -108,7 +118,8 @@ pub trait CompactionOperations: Send + Sync {
 /// and its list of unsynced files, which nothing holds while it waits for the WAL lock: the commit
 /// pipeline appends to the value log before it takes the WAL lock and never holds both. The
 /// rotation that opening a tree and a restore make to continue in a fresh segment takes them the
-/// same way.
+/// same way. A restore holds the value log's writer lock too, from before it removes the files
+/// until it has reloaded the log, and takes no other lock in between.
 /// The WAL lock is taken under `active_memtable` by rotation (`rotate_memtable()`,
 /// `seal_active_wal_segment()`, `replace_failed_wal()`), and so do the shutdown flush, the
 /// release of a held writer (`try_release_wal_hold()`, which reads the immutable queue under
@@ -152,6 +163,17 @@ pub(crate) struct CoreInner {
 	/// write over the ones that have the ids of its outputs, and list what it made in a manifest
 	/// it was not computed from.
 	pub(crate) compactions: parking_lot::RwLock<()>,
+
+	/// Held for the whole of a rotation of the memtable and the WAL (`rotate_memtable()`,
+	/// `seal_active_wal_segment()`, `replace_failed_wal()`), taken before the active memtable's
+	/// write lock, and by a restore from before it removes the files until it has reopened the
+	/// WAL. A rotation creates the next WAL segment, and a restore removes the directory of the
+	/// WAL and writes it again: a segment created between the restore's listing of the
+	/// directory and its removal fails the restore with `DirectoryNotEmpty` after part of the
+	/// database is gone, and one that the old WAL creates in the restored directory is
+	/// replayed with the restored ones. The active memtable's lock cannot serve, a restore
+	/// would hold it, against every reader, for as long as it copies files.
+	pub(crate) rotations: parking_lot::Mutex<()>,
 
 	/// The level structure managing all SSTables on disk.
 	///
@@ -296,6 +318,7 @@ impl CoreInner {
 			immutable_memtables,
 			flush_lock: parking_lot::Mutex::new(()),
 			compactions: parking_lot::RwLock::new(()),
+			rotations: parking_lot::Mutex::new(()),
 			level_manifest,
 			snapshot_tracker: SnapshotTracker::new(),
 			active_txn_tracker: Arc::new(crate::tracker::ActiveTxnTracker::new()),
@@ -707,6 +730,9 @@ impl CoreInner {
 	///
 	/// The actual SST flush happens asynchronously via background task.
 	pub(crate) fn rotate_memtable(&self) -> Result<()> {
+		// Before the memtable's lock, and held until the memtable is queued: see `rotations`.
+		let _rotation = self.rotations.lock();
+
 		// Step 1: Acquire WRITE lock upfront to prevent race conditions
 		let active_memtable = self.active_memtable.write()?;
 
@@ -719,7 +745,7 @@ impl CoreInner {
 
 	/// Rotates the non-empty active memtable under the write guard the caller holds, which it
 	/// keeps until the memtable is queued: whoever holds it sees the queue only shrink, see
-	/// `try_release_wal_hold`.
+	/// `try_release_wal_hold`. The caller holds `rotations` too.
 	fn rotate_memtable_locked(
 		&self,
 		mut active_memtable: RwLockWriteGuard<'_, Arc<MemTable>>,
@@ -809,6 +835,9 @@ impl CoreInner {
 	/// When the active memtable is empty, `rotate_memtable` is a no-op by design (to
 	/// avoid pointless WAL file churn), so this method rotates the WAL on its own instead.
 	pub(crate) fn seal_active_wal_segment(&self) -> Result<u64> {
+		// Before the memtable's lock: see `rotations`.
+		let _rotation = self.rotations.lock();
+
 		// Hold the write lock for the whole check-and-rotate so no writer can land a
 		// batch in the segment we're about to seal in between the emptiness check and
 		// the rotation.
@@ -816,8 +845,7 @@ impl CoreInner {
 		let sealed_wal_number = active_memtable.get_wal_number();
 
 		if !active_memtable.is_empty() {
-			drop(active_memtable);
-			self.rotate_memtable()?;
+			self.rotate_memtable_locked(active_memtable)?;
 			return Ok(sealed_wal_number);
 		}
 
@@ -844,6 +872,8 @@ impl CoreInner {
 	///
 	/// If the fsync of the segment failed, the new writer is held, see `Wal::rotate_with`.
 	pub(crate) fn replace_failed_wal(&self) -> Result<Option<bool>> {
+		// Before the memtable's lock: see `rotations`.
+		let _rotation = self.rotations.lock();
 		let active_memtable = self.active_memtable.write()?;
 		if !self.wal.read().needs_replacement() {
 			return Ok(None);
@@ -2305,6 +2335,10 @@ impl Tree {
 	/// # Closing
 	/// [`Tree::close`] waits for the checkpoints that are running. One that begins after `close`
 	/// has fails without touching `checkpoint_dir`.
+	///
+	/// # Restoring
+	/// A checkpoint that begins while [`Tree::restore_from_checkpoint`] runs waits for it, and a
+	/// restore waits for the checkpoints that are running.
 	pub fn create_checkpoint<P: AsRef<Path>>(
 		&self,
 		checkpoint_dir: P,
@@ -2325,10 +2359,19 @@ impl Tree {
 	}
 
 	/// Restores the database from a checkpoint directory.
+	///
+	/// Waits for the checkpoints of this tree that are running, and for the flushes, compactions
+	/// and rotations of the memtable and the WAL that are, and keeps the ones that begin meanwhile
+	/// waiting until the restore is over.
 	pub fn restore_from_checkpoint<P: AsRef<Path>>(
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
+		// A checkpoint of this tree that is running copies the files this replaces, and takes the
+		// locks below to flush: wait for it, before anything else so that commits are not refused
+		// meanwhile, and keep the next one from starting until the restore is done.
+		let _checkpoints = self.core.checkpoints.exclude();
+
 		// Block new commits from entering the critical section for the duration
 		// of the restore. The restore is a multi-step rewrite of nearly all
 		// in-memory state (manifest, memtables, WAL, seq counters, oracle); a
@@ -2345,20 +2388,31 @@ impl Tree {
 		// replaces: wait for it, and keep the next one from starting until the restore is done.
 		let _compactions = self.core.inner.compactions.write();
 
+		// A rotation in flight would create a WAL segment in a directory this removes, or, once
+		// the WAL is replaced, in the restored one. Held until the WAL is reopened and moved on to
+		// a segment of its own.
+		let _rotations = self.core.inner.rotations.lock();
+
+		// A group that began before the restore appends its values to the value log, and rolls it
+		// over to a new file, from the flusher: keep it from creating one while the directory is
+		// removed and written again. Held until the log is reloaded, and no lock is taken in
+		// between.
+		let vlog_writer = self.core.inner.vlog.as_ref().map(|vlog| (vlog, vlog.hold_writer()));
+
 		// Step 1: Restore files from checkpoint
 		let checkpoint = DatabaseCheckpoint::new(Arc::clone(&self.core.inner));
 		let metadata = checkpoint.restore_from_checkpoint(checkpoint_dir)?;
 
 		// Step 2: Reload in-memory state to match restored files
 
-		// Read from disk with no lock held.
+		// Read from disk with none of the locks of the state held.
 		let new_levels = LevelManifest::new(Arc::clone(&self.core.inner.opts))?;
 
 		// The files of the value log were replaced: the log's writer, its handles and its next
 		// file id belong to the ones that are gone. Before the swap below, so that a reader of the
 		// restored tables never finds a handle of the old file with the same id.
-		if let Some(ref vlog) = self.core.inner.vlog {
-			vlog.reload()?;
+		if let Some((vlog, writer)) = vlog_writer {
+			vlog.reload(writer)?;
 		}
 
 		// Swap the manifest, the active memtable and the immutable queue in one step, under all
@@ -2485,6 +2539,7 @@ impl Tree {
 		// locks released, so that it commits instead of finding the restore still running.
 		#[allow(clippy::used_underscore_binding)]
 		{
+			drop(_rotations);
 			drop(_compactions);
 			drop(_flush);
 			drop(_write_guard);

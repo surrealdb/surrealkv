@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crc32fast::Hasher;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 
 use crate::error::{Error, Result};
 use crate::{vfs, CompressionType, Options, VLogChecksumLevel, Value};
@@ -988,19 +988,34 @@ impl VLog {
 		Ok(highest)
 	}
 
+	/// Keeps every append, and with it every roll over to a new file, out until the guard is
+	/// dropped or given to [`reload`](Self::reload). A restore holds it from before it removes the
+	/// directory of the log: a group that began before the restore and writes its values meanwhile
+	/// would create a file in the directory while it is removed, which fails the restore half
+	/// way, or in the restored one, under the id of a restored file or one that it does not have.
+	///
+	/// The lock sits below the WAL's, as a rotation takes it: the holder takes no other lock until
+	/// it has given the guard to `reload`.
+	pub(crate) fn hold_writer(&self) -> RwLockWriteGuard<'_, Option<VLogWriter>> {
+		self.writer.write()
+	}
+
 	/// Replaces everything the log knows about its files by what its directory holds now, after
 	/// a restore replaced the directory. The writer, the handles and the file registry belong to
 	/// files that are gone, and a file id that the restored directory has again would otherwise
 	/// be read through, and appended to by, the old file.
 	///
 	/// The log has no writer afterwards, so the next append starts a file of its own, one past
-	/// the highest id found, and never one of the restored files. The caller keeps appends out
-	/// while it runs: it holds the commit pipeline's admission and the flush lock.
-	pub(crate) fn reload(&self) -> Result<()> {
+	/// the highest id found, and never one of the restored files. `writer` is the guard that
+	/// [`hold_writer`](Self::hold_writer) returned before the directory was replaced, and keeps
+	/// appends out until the log is loaded.
+	pub(crate) fn reload(
+		&self,
+		mut writer: RwLockWriteGuard<'_, Option<VLogWriter>>,
+	) -> Result<()> {
 		// Before the directory is read: a checkpoint without a value log leaves none.
 		std::fs::create_dir_all(&self.path)?;
 
-		let mut writer = self.writer.write();
 		// What the old writer still buffers goes to a file that was removed.
 		*writer = None;
 		self.unsynced.lock().clear();

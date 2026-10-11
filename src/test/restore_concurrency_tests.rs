@@ -1629,6 +1629,138 @@ async fn a_flush_parked_before_it_lists_its_table_does_not_leak_it_into_a_restor
 	tree.close().await.unwrap();
 }
 
+/// A rotation of the memtable and the WAL that begins while a restore runs waits for it: the
+/// restore removes the directory of the WAL and writes it again, and a rotation creates a segment
+/// in it. The rotation then finds the restored tree, and the tree is the checkpoint.
+#[test(tokio::test)]
+async fn a_rotation_that_begins_during_a_restore_waits_for_it() {
+	for stage in [
+		CheckpointStage::RestoreCleared,
+		CheckpointStage::RestoreFilesCopied,
+		CheckpointStage::RestoreManifestSwapped,
+	] {
+		let mut w = build(false).await;
+		let gate = park_checkpoint_at(&w.tree, stage);
+		let restoring = restore_call(&w.tree, &w.ckpt);
+		gate.arrived(&format!("{stage:?}"));
+		let inner = Arc::clone(&w.tree.core.inner);
+		let rotating = on_thread(move || inner.rotate_memtable());
+		let inner = Arc::clone(&w.tree.core.inner);
+		let sealing = on_thread(move || inner.seal_active_wal_segment());
+		assert!(!rotating.finishes_within(GRACE), "{stage:?}: a rotation ran during the restore");
+		assert!(!sealing.finishes_within(GRACE), "{stage:?}: a seal ran during the restore");
+		gate.release();
+		restoring.wait().unwrap();
+		rotating.wait().unwrap();
+		sealing.wait().unwrap();
+		assert_eq!(gate.hits(), 1, "{stage:?}: the stage was reached once");
+		clear_hooks(&w.tree);
+		assert_exact(&w.tree, &w.at_ckpt, &format!("{stage:?}: after both"));
+		let mut m = w.at_ckpt.clone();
+		apply(&w.tree, &mut m, sets(300..305, "n", false)).await.unwrap();
+		let tree = w.reopen().await;
+		assert_exact_with_extra(&tree, &m, &format!("{stage:?}: after the reopen"));
+		tree.close().await.unwrap();
+	}
+}
+
+/// A value-log append that begins while a restore runs waits for it, and so does the roll over to
+/// a new file that it may make: a group that began before the restore would otherwise create a
+/// file in the directory that the restore removes, or in the restored one.
+#[test(tokio::test)]
+async fn a_value_log_append_that_begins_during_a_restore_waits_for_it() {
+	for stage in [
+		CheckpointStage::RestoreCleared,
+		CheckpointStage::RestoreSstablesCopied,
+		CheckpointStage::RestoreFilesCopied,
+	] {
+		let mut w = build(true).await;
+		let gate = park_checkpoint_at(&w.tree, stage);
+		let restoring = restore_call(&w.tree, &w.ckpt);
+		gate.arrived(&format!("{stage:?}"));
+		let vlog = Arc::clone(w.tree.core.inner.vlog.as_ref().unwrap());
+		let appending = on_thread(move || vlog.append(b"a key", &[7u8; 4096]));
+		assert!(
+			!appending.finishes_within(GRACE),
+			"{stage:?}: a value was appended while the restore replaced the log"
+		);
+		gate.release();
+		restoring.wait().unwrap();
+		appending.wait().unwrap();
+		assert_eq!(gate.hits(), 1, "{stage:?}: the stage was reached once");
+		clear_hooks(&w.tree);
+		assert_exact(&w.tree, &w.at_ckpt, &format!("{stage:?}: after both"));
+		let tree = w.reopen().await;
+		assert_exact(&tree, &w.at_ckpt, &format!("{stage:?}: after the reopen"));
+		tree.close().await.unwrap();
+	}
+}
+
+/// A restore that begins while a checkpoint of the same tree is parked in the middle of it waits
+/// for the checkpoint, which is then the state from before the restore, whole. Commits are not
+/// refused meanwhile.
+#[test(tokio::test)]
+async fn a_restore_waits_for_a_checkpoint_that_is_running() {
+	let mut w = build(false).await;
+	let second = TempDir::new("restore_conc_second").unwrap();
+	let second_dir = second.path().join("ckpt");
+	let gate = park_checkpoint_at(&w.tree, CheckpointStage::SstablesCopied);
+	let checkpointing = checkpoint_call(&w.tree, &second_dir);
+	gate.arrived("SstablesCopied");
+	let restoring = restore_call(&w.tree, &w.ckpt);
+	assert!(
+		!restoring.finishes_within(GRACE),
+		"the restore ran under a checkpoint of the same tree"
+	);
+	let mut m = w.before.clone();
+	tokio::time::timeout(WATCHDOG, apply(&w.tree, &mut m, sets(300..303, "waiting", false)))
+		.await
+		.expect("a commit hung while the restore waited for the checkpoint")
+		.expect("a commit was refused while the restore waited for the checkpoint");
+	gate.release();
+	checkpointing.wait().expect("the checkpoint failed");
+	restoring.wait().unwrap();
+	assert_eq!(gate.hits(), 1, "the checkpoint reached its stage once");
+	clear_hooks(&w.tree);
+	let opened = open_checkpoint_copy(&second_dir, false)
+		.unwrap_or_else(|e| panic!("the checkpoint does not open: {e:?}"));
+	assert!(opened == w.before, "the checkpoint is not the state from before the restore");
+	assert_exact(&w.tree, &w.at_ckpt, "the live tree after both");
+	let tree = w.reopen().await;
+	assert_exact(&tree, &w.at_ckpt, "after the reopen");
+	tree.close().await.unwrap();
+}
+
+/// A checkpoint that begins while a restore runs waits for it, and is the restored state, whole.
+#[test(tokio::test)]
+async fn a_checkpoint_that_begins_during_a_restore_waits_for_it() {
+	for stage in [CheckpointStage::RestoreCleared, CheckpointStage::RestoreFilesCopied] {
+		let mut w = build(false).await;
+		let second = TempDir::new("restore_conc_second").unwrap();
+		let second_dir = second.path().join("ckpt");
+		let gate = park_checkpoint_at(&w.tree, stage);
+		let restoring = restore_call(&w.tree, &w.ckpt);
+		gate.arrived(&format!("{stage:?}"));
+		let checkpointing = checkpoint_call(&w.tree, &second_dir);
+		assert!(
+			!checkpointing.finishes_within(GRACE),
+			"{stage:?}: a checkpoint ran while the restore replaced the database"
+		);
+		gate.release();
+		restoring.wait().unwrap();
+		checkpointing.wait().unwrap_or_else(|e| panic!("{stage:?}: the checkpoint failed: {e:?}"));
+		assert_eq!(gate.hits(), 1, "{stage:?}: the stage was reached once");
+		clear_hooks(&w.tree);
+		let opened = open_checkpoint_copy(&second_dir, false)
+			.unwrap_or_else(|e| panic!("{stage:?}: the checkpoint does not open: {e:?}"));
+		assert!(opened == w.at_ckpt, "{stage:?}: the checkpoint is not the restored state");
+		assert_exact(&w.tree, &w.at_ckpt, &format!("{stage:?}: the live tree after both"));
+		let tree = w.reopen().await;
+		assert_exact(&tree, &w.at_ckpt, &format!("{stage:?}: after the reopen"));
+		tree.close().await.unwrap();
+	}
+}
+
 /// Opens a copy of a checkpoint directory as a database and returns what it holds.
 fn open_checkpoint_copy(ckpt: &Path, vlog: bool) -> Result<Model, Error> {
 	let copy = TempDir::new("restore_conc_ckpt_copy").unwrap();
@@ -2496,8 +2628,9 @@ async fn a_writer_stalled_on_level_zero_files_resumes_when_a_restore_removes_the
 /// Iterators, flushes, compactions and restores that run at the same time make progress: the
 /// iterators take the active memtable, the manifest and the immutable queue together, and the
 /// restore, a flush and a compaction take them for writing in the same order. A flush by hand
-/// rotates the memtable and the WAL, which a restore does not exclude: unless `serial`, the two
-/// take turns.
+/// rotates the memtable and the WAL, which a restore excludes: with `serial` the two take turns,
+/// and without it they overlap, the restore waiting for a rotation that is running and the
+/// rotation for a restore.
 async fn readers_and_writers_of_the_tree_state_run_together(serial: bool) {
 	let w = build(false).await;
 	let turns = Arc::new(Mutex::new(()));
@@ -2571,10 +2704,6 @@ async fn iterators_flushes_compactions_and_restores_that_run_together_do_not_dea
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[ignore = "a rotation of the memtable and the WAL that runs while a restore removes and copies \
-            the files (a checkpoint, a commit group) creates a file in a directory the restore is \
-            removing: the restore fails with 'Directory not empty' after it has deleted part of \
-            the database"]
 async fn a_restore_that_runs_while_the_memtable_rotates_does_not_fail_half_way() {
 	readers_and_writers_of_the_tree_state_run_together(false).await;
 }
