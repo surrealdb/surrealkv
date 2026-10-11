@@ -17,6 +17,20 @@
 //! what keeps the two apart. It is checked before the key is touched, so damage in those bytes is
 //! media corruption, and a tag that fails with the CRC intact is a key (or a forgery).
 //!
+//! An entry of a sealed file is a single AEAD message, with nothing about it in the clear:
+//!
+//! ```text
+//! key length (4)  key  value  tag (16)      (the first three are encrypted)
+//! ```
+//!
+//! It is sealed at the byte offset of the entry in the file, which is its nonce slot, so an entry
+//! cannot be moved, and with the id of the file and the database in its associated data, so
+//! neither can it leave its file. The length of the key is sealed with the entry so that a
+//! pointer cannot move the boundary between the key and the value, and the length of the whole
+//! entry is the length that its pointer gives, so no length is stored beside it. What an offline
+//! reader still sees is where each entry ends, which is what the next entry's position says,
+//! and so the size of every key and value taken together.
+//!
 //! The version of a sealed file is the plaintext version with the top bit set. A reader that
 //! does not know sealed files finds a version it does not support and stops, instead of reading
 //! ciphertext as entries, and a later change of the plaintext version moves both together.
@@ -24,10 +38,21 @@
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::{VLogFileHeader, VLOG_FORMAT_VERSION};
+use super::{entry_lens, VLogFileHeader, ValuePointer, VLOG_FORMAT_VERSION};
 use crate::error::{EncryptionError, Error, Result};
-use crate::tde::{CryptoHeader, EncryptionContext, FileCipher, FileKind, HEADER_LEN};
+use crate::tde::{
+	BlockContext,
+	BlockKind,
+	CryptoHeader,
+	EncryptionContext,
+	FileCipher,
+	FileKind,
+	HEADER_LEN,
+	TAG_LEN,
+};
+use crate::CompressionType;
 
 /// The `version` of the file header of a sealed file.
 pub(super) const SEALED_VERSION: u16 = VLOG_FORMAT_VERSION | 0x8000;
@@ -46,6 +71,17 @@ const MAGIC: [u8; 4] = VLogFileHeader::MAGIC.to_be_bytes();
 
 /// How many other names are tried for a file that is set aside before giving up.
 const ASIDE_ATTEMPTS: u32 = 1000;
+
+/// Length of the length of the key, which opens what an entry seals.
+pub(super) const KEY_LEN_PREFIX: usize = 4;
+
+/// What a sealed entry adds to its key and value: the length of the key, and the tag. Both suites
+/// have a tag of the same length.
+pub(super) const ENTRY_OVERHEAD: usize = KEY_LEN_PREFIX + TAG_LEN;
+
+/// The compression byte that an entry is sealed with. Entries are stored as they are given, and
+/// the byte is part of what the entry is bound to.
+const ENTRY_COMPRESSION: u8 = CompressionType::None as u8;
 
 /// The header of a new sealed file, and the cipher that seals its entries.
 ///
@@ -192,6 +228,91 @@ pub(super) fn is_torn(file: &[u8]) -> bool {
 	matches!(CryptoHeader::decode(crypto), Err(EncryptionError::MalformedHeader))
 }
 
+/// What an entry seals before it is sealed: the length of the key, the key and the value, in a
+/// buffer that has room for the tag as well, so that sealing does not move it.
+///
+/// A refused allocation is an error here, before any position is taken, and leaves the writer as
+/// it was.
+pub(super) fn frame(key: &[u8], value: &[u8]) -> Result<Vec<u8>> {
+	let (key_len, _) = entry_lens(key.len(), value.len())?;
+	let size = key
+		.len()
+		.checked_add(value.len())
+		.and_then(|content| content.checked_add(ENTRY_OVERHEAD))
+		.ok_or_else(|| Error::InvalidArgument("a VLog entry is too large".to_string()))?;
+	let mut entry = Vec::new();
+	entry.try_reserve_exact(size).map_err(|e| Error::Io(Arc::new(io::Error::from(e))))?;
+	entry.extend_from_slice(&key_len.to_be_bytes());
+	entry.extend_from_slice(key);
+	entry.extend_from_slice(value);
+	Ok(entry)
+}
+
+/// Seals an entry that [`frame`] made, in place, for the position `offset` of its file: the
+/// ciphertext followed by the tag is what is stored.
+///
+/// The cipher takes the position for good the moment it is asked, and refuses a position that is
+/// not after the last one it took, so a caller that tries again after a failure is told no,
+/// instead of sealing different bytes under a nonce that was used.
+pub(super) fn seal(cipher: &FileCipher, offset: u64, entry: &mut Vec<u8>) -> Result<()> {
+	let at = BlockContext::new(BlockKind::VlogEntry, offset, ENTRY_COMPRESSION);
+	Ok(cipher.seal_append(&at, entry)?)
+}
+
+/// Opens an entry that was read from the file for `pointer`, and returns its value.
+///
+/// Nothing in `stored` is looked at before it has authenticated, except to compute its CRC-32,
+/// which is checked first because it is cheap: a mismatch means the bytes are not what was
+/// written, a pointer to something else, or damage, and is told apart from a failure of the tag,
+/// where the bytes are what the pointer says and the key or the file is not.
+///
+/// The pointer is not trusted either: its sizes must give the length of what was read, and the
+/// length of the key, which was sealed with the entry, must be the one the pointer gives.
+pub(super) fn open_entry(
+	cipher: &FileCipher,
+	pointer: &ValuePointer,
+	mut stored: Vec<u8>,
+) -> Result<Vec<u8>> {
+	let place = || format!("file_id={}, offset={}", pointer.file_id, pointer.offset);
+	if u64::try_from(stored.len()).ok() != Some(pointer.total_entry_size()) {
+		return Err(Error::Corruption(format!(
+			"A sealed VLog entry ({}) is {} bytes and its pointer gives other sizes",
+			place(),
+			stored.len()
+		)));
+	}
+	if crc32fast::hash(&stored) != pointer.checksum {
+		return Err(Error::Corruption(format!(
+			"CRC32 mismatch of a sealed VLog entry ({})",
+			place()
+		)));
+	}
+
+	let at = BlockContext::new(BlockKind::VlogEntry, pointer.offset, ENTRY_COMPRESSION);
+	let sealed_len = cipher.open_suffix(&at, &mut stored)?.len();
+	stored.truncate(sealed_len);
+
+	let key_len = stored.first_chunk::<KEY_LEN_PREFIX>().map(|prefix| u32::from_be_bytes(*prefix));
+	let value_start = match key_len {
+		Some(key_len) if key_len == pointer.key_size => KEY_LEN_PREFIX + key_len as usize,
+		_ => {
+			return Err(Error::Corruption(format!(
+				"The pointer to a sealed VLog entry ({}) gives another length of the key than \
+				 the entry",
+				place()
+			)))
+		}
+	};
+	if value_start > stored.len() {
+		return Err(Error::Corruption(format!(
+			"A sealed VLog entry ({}) is too short for its key",
+			place()
+		)));
+	}
+	stored.drain(..value_start);
+	Ok(stored)
+}
+
 /// Renames a file that must not be used, and must not be lost, to a name that the log does not
 /// read: `<name>.torn`, or `<name>.torn.1` and so on if that is taken. Returns the new path.
 pub(super) fn set_aside(path: &Path) -> io::Result<PathBuf> {
@@ -217,7 +338,7 @@ mod tests {
 	use tempfile::TempDir;
 
 	use super::*;
-	use crate::tde::{CipherSuite, DbId, SoftwareKeyManager};
+	use crate::tde::{CipherSuite, DbId, FileIdentity, FileKey, SoftwareKeyManager};
 
 	const SUITES: [CipherSuite; 2] = [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305];
 	const FILE_ID: u32 = 0x0102_0304;
@@ -263,15 +384,15 @@ mod tests {
 		open_header(ctx, FILE_ID, bytes)
 	}
 
-	fn encryption_error(result: Result<FileCipher>) -> EncryptionError {
+	fn encryption_error<T>(result: Result<T>) -> EncryptionError {
 		match result {
 			Err(Error::Encryption(e)) => e,
 			Err(other) => panic!("expected an encryption error, got {other:?}"),
-			Ok(_) => panic!("expected an encryption error, the header opened"),
+			Ok(_) => panic!("expected an encryption error, it succeeded"),
 		}
 	}
 
-	fn is_corruption(result: Result<FileCipher>) -> bool {
+	fn is_corruption<T>(result: Result<T>) -> bool {
 		matches!(result, Err(Error::Corruption(_)))
 	}
 
@@ -598,6 +719,322 @@ mod tests {
 		let opts = crate::Options::default();
 		for name in ["00000000000000000003.vlog.torn", "00000000000000000003.vlog.torn.1"] {
 			assert_eq!(opts.extract_vlog_file_id(name), None, "{name}");
+		}
+	}
+	// The vectors below come from an independent computation (OpenSSL's AES-256-GCM and
+	// ChaCha20-Poly1305, with HChaCha20 for the extended nonce, and the standard library's HMAC
+	// for HKDF-SHA256 and zlib's CRC-32): the file key and the header key from the root, the salt
+	// and the identity, the associated data and the nonce from the position, and the CRC-32 of
+	// the stored bytes. Inputs: root bytes 00..1f, salt bytes 20..3f, database id bytes a0..af,
+	// key id 1, file id 0x0A0B0C0D, created_at 0x0123456789ABCDEF, max_file_size 0x01000000.
+	// Two entries per suite: the key "canary-key-1" with the 32 bytes 40..5f, at offset 127, and
+	// an empty key with an empty value after it, at 191.
+	const HEADER_AES: &str = "564c4f4780010a0b0c0d0123456789abcdef0000000001000000000000000022\
+		f45a8e534b5444010102000000000100000000a0a1a2a3a4a5a6a7a8a9aaabac\
+		adaeaf000000000a0b0c0d202122232425262728292a2b2c2d2e2f3031323334\
+		35363738393a3b3c3d3e3f01ec24a91b60f89a99ad684fe7b589893376d34a";
+	const ENTRY_0_AES: &str = "331116114ab8c10f4a4d6f00171aee5c3bfd819c35752cc34732b0de4eeff467\
+		9a159fa5133965b611d35e2a7904d1938c39a896981f740c68848824a9e0cb4d";
+	const ENTRY_0_AES_CRC: u32 = 0xb0d74020;
+	const ENTRY_1_AES: &str = "78dff77a60d1cdca93e8363f6f783b44a0b7df13";
+	const ENTRY_1_AES_CRC: u32 = 0x10a5bd58;
+	const HEADER_XCHACHA: &str = "564c4f4780010a0b0c0d0123456789abcdef0000000001000000000000000022\
+		f45a8e534b5444010202000000000100000000a0a1a2a3a4a5a6a7a8a9aaabac\
+		adaeaf000000000a0b0c0d202122232425262728292a2b2c2d2e2f3031323334\
+		35363738393a3b3c3d3e3f2c53c1514d14a2c170bd259fb0aa8970bd84cbf5";
+	const ENTRY_0_XCHACHA: &str =
+		"81d69f2c996dadf7cf07e37f0bac24f03e12f2c261bf6208496c46abbd61636b\
+		2680987fd3181dec2c79d82c40c4a58dfe06a15291cc2509fd749f7ab0f23f32";
+	const ENTRY_0_XCHACHA_CRC: u32 = 0x0803d573;
+	const ENTRY_1_XCHACHA: &str = "0e98dc1b67ba2cbdeb53cd56849c1f45786f3673";
+	const ENTRY_1_XCHACHA_CRC: u32 = 0x5049ec30;
+
+	const KAT_FILE_ID: u32 = 0x0A0B_0C0D;
+
+	fn kat_root() -> [u8; 32] {
+		std::array::from_fn(|i| i as u8)
+	}
+
+	fn kat_salt() -> [u8; 32] {
+		std::array::from_fn(|i| 0x20 + i as u8)
+	}
+
+	fn kat_db() -> DbId {
+		DbId::from_bytes(std::array::from_fn(|i| 0xA0 + i as u8))
+	}
+
+	/// The cipher of the file of the vectors, which seals if `can_seal` and otherwise only opens.
+	fn kat_cipher(suite: CipherSuite, can_seal: bool) -> FileCipher {
+		let identity =
+			FileIdentity::new(suite, FileKind::Vlog, 1, u64::from(KAT_FILE_ID), kat_db());
+		FileCipher::new(FileKey::derive_for_test(&kat_root(), kat_salt(), identity, can_seal))
+			.unwrap()
+	}
+
+	fn unhex(hex: &str) -> Vec<u8> {
+		(0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect()
+	}
+
+	fn hex(bytes: &[u8]) -> String {
+		bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+	}
+
+	#[test]
+	fn the_header_and_the_entries_match_independently_computed_vectors() {
+		let entries: [(&[u8], Vec<u8>); 2] =
+			[(&b"canary-key-1"[..], (0x40u8..0x60).collect()), (&b""[..], Vec::new())];
+		let cases = [
+			(
+				CipherSuite::Aes256Gcm,
+				HEADER_AES,
+				[(ENTRY_0_AES, ENTRY_0_AES_CRC), (ENTRY_1_AES, ENTRY_1_AES_CRC)],
+			),
+			(
+				CipherSuite::XChaCha20Poly1305,
+				HEADER_XCHACHA,
+				[(ENTRY_0_XCHACHA, ENTRY_0_XCHACHA_CRC), (ENTRY_1_XCHACHA, ENTRY_1_XCHACHA_CRC)],
+			),
+		];
+		for (suite, header, stored) in cases {
+			// The header says what the computation put into it, and opens under the key.
+			let header = unhex(header);
+			assert_eq!(header.len(), SEALED_HEADER_LEN);
+			let file_header = VLogFileHeader::decode(&header[..31]).unwrap();
+			assert_eq!(file_header.version, 0x8001);
+			assert_eq!(file_header.file_id, KAT_FILE_ID);
+			assert_eq!(file_header.created_at, 0x0123_4567_89AB_CDEF);
+			assert_eq!(file_header.max_file_size, 0x0100_0000);
+			assert_eq!(file_header.compression, 0);
+			let ctx = EncryptionContext::new(
+				Arc::new(SoftwareKeyManager::new(kat_root())),
+				kat_db(),
+				suite,
+			);
+			open_header(&ctx, KAT_FILE_ID, &header).unwrap();
+
+			// The entries are what sealing them gives, and open as the pointers say.
+			let writer = kat_cipher(suite, true);
+			let reader = kat_cipher(suite, false);
+			let mut offset = SEALED_HEADER_LEN as u64;
+			for ((key, value), (expected, crc)) in entries.iter().zip(stored) {
+				let expected = unhex(expected);
+				let mut entry = frame(key, value).unwrap();
+				seal(&writer, offset, &mut entry).unwrap();
+				assert_eq!(hex(&entry), hex(&expected), "{suite:?}, the entry at {offset}");
+				assert_eq!(crc32fast::hash(&entry), crc);
+
+				let pointer = ValuePointer::sealed(
+					KAT_FILE_ID,
+					offset,
+					key.len() as u32,
+					value.len() as u32,
+					crc,
+				);
+				assert_eq!(pointer.total_entry_size(), expected.len() as u64);
+				assert_eq!(open_entry(&reader, &pointer, expected.clone()).unwrap(), *value);
+				offset += expected.len() as u64;
+			}
+		}
+	}
+
+	#[test]
+	fn a_sealed_entry_is_as_long_as_its_pointer_says() {
+		for suite in SUITES {
+			let (writer, reader) = (kat_cipher(suite, true), kat_cipher(suite, false));
+			let mut offset = 127u64;
+			for (key_len, value_len) in
+				[(0usize, 0usize), (1, 0), (0, 1), (5, 100), (12, 0), (300, 7)]
+			{
+				let (key, value) = (vec![b'k'; key_len], vec![b'v'; value_len]);
+				let mut entry = frame(&key, &value).unwrap();
+				assert_eq!(entry.len(), 4 + key_len + value_len, "the length of the key and both");
+				assert!(entry.capacity() >= entry.len() + 16, "room for the tag");
+				seal(&writer, offset, &mut entry).unwrap();
+				assert_eq!(entry.len(), 4 + key_len + value_len + 16);
+
+				let pointer = ValuePointer::sealed(
+					1,
+					offset,
+					key_len as u32,
+					value_len as u32,
+					crc32fast::hash(&entry),
+				);
+				assert_eq!(pointer.total_entry_size(), entry.len() as u64);
+				offset += entry.len() as u64;
+				assert_eq!(open_entry(&reader, &pointer, entry).unwrap(), value);
+			}
+		}
+		assert_eq!(frame(b"", b"").unwrap(), [0, 0, 0, 0]);
+		assert_eq!(frame(b"ab", b"c").unwrap(), [0, 0, 0, 2, b'a', b'b', b'c']);
+	}
+
+	#[test]
+	fn the_size_of_an_entry_depends_on_whether_its_pointer_says_it_is_sealed() {
+		let plain = ValuePointer::new(1, 0, 3, 5, 0);
+		let sealed = ValuePointer::sealed(1, 0, 3, 5, 0);
+		assert!(!plain.is_sealed() && sealed.is_sealed());
+		// A plaintext entry: both lengths, the key, the value and the CRC. A sealed one: the
+		// length of the key, the key, the value and the tag.
+		assert_eq!(plain.total_entry_size(), 8 + 3 + 5 + 4);
+		assert_eq!(sealed.total_entry_size(), 4 + 3 + 5 + 16);
+		for suite in SUITES {
+			assert_eq!(suite.tag_len(), 16, "the pointer does not know the suite");
+		}
+
+		// The pointer is the same 25 bytes, and says which kind it is in its first byte.
+		let encoded = sealed.encode();
+		assert_eq!(encoded.len(), 25);
+		assert_eq!(encoded[0], 2);
+		assert_eq!(ValuePointer::decode(&encoded).unwrap(), sealed);
+		assert_eq!(plain.encode()[0], 1);
+
+		// Sizes that are all the wire allows cannot overflow.
+		let largest = ValuePointer::sealed(1, 0, u32::MAX, u32::MAX, 0);
+		assert_eq!(largest.total_entry_size(), 2 * u64::from(u32::MAX) + 20);
+	}
+
+	#[test]
+	fn every_changed_byte_of_a_sealed_entry_is_caught_before_anything_is_decoded() {
+		for suite in SUITES {
+			let (writer, reader) = (kat_cipher(suite, true), kat_cipher(suite, false));
+			let mut stored = frame(b"key", b"value-bytes").unwrap();
+			seal(&writer, 200, &mut stored).unwrap();
+			let pointer = ValuePointer::sealed(1, 200, 3, 11, crc32fast::hash(&stored));
+			assert_eq!(open_entry(&reader, &pointer, stored.clone()).unwrap(), b"value-bytes");
+
+			for at in 0..stored.len() {
+				let mut bad = stored.clone();
+				bad[at] ^= 0x80;
+				// The CRC that the pointer holds is what stops it first.
+				assert!(
+					is_corruption(open_entry(&reader, &pointer, bad.clone())),
+					"{suite:?}, byte {at}"
+				);
+				// With the CRC made to fit, as if the pointer had been changed along with it, it is
+				// the tag.
+				let fitted = ValuePointer {
+					checksum: crc32fast::hash(&bad),
+					..pointer.clone()
+				};
+				assert_eq!(
+					encryption_error(open_entry(&reader, &fitted, bad)),
+					EncryptionError::AuthenticationFailed,
+					"{suite:?}, byte {at}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn a_pointer_that_lies_about_where_or_what_the_entry_is_does_not_open_it() {
+		for suite in SUITES {
+			let (writer, reader) = (kat_cipher(suite, true), kat_cipher(suite, false));
+			let mut stored = frame(b"key", b"value-bytes").unwrap();
+			seal(&writer, 200, &mut stored).unwrap();
+			let honest = ValuePointer::sealed(1, 200, 3, 11, crc32fast::hash(&stored));
+
+			// Another position: the nonce and the associated data differ, and the bytes and their
+			// CRC do not.
+			for offset in [0u64, 1, 127, 199, 201, 216, 4096, u64::MAX] {
+				let moved = ValuePointer {
+					offset,
+					..honest.clone()
+				};
+				assert_eq!(
+					encryption_error(open_entry(&reader, &moved, stored.clone())),
+					EncryptionError::AuthenticationFailed,
+					"{suite:?}, offset {offset}"
+				);
+			}
+
+			// Another file, with another salt, so another key.
+			let identity =
+				FileIdentity::new(suite, FileKind::Vlog, 1, u64::from(KAT_FILE_ID), kat_db());
+			let elsewhere =
+				FileCipher::new(FileKey::derive_for_test(&kat_root(), [0x77; 32], identity, false))
+					.unwrap();
+			assert_eq!(
+				encryption_error(open_entry(&elsewhere, &honest, stored.clone())),
+				EncryptionError::AuthenticationFailed
+			);
+
+			// The boundary between the key and the value moved, with the whole as long as it was:
+			// the bytes are authentic and the length that was sealed with them says otherwise.
+			for (key_size, value_size) in [(4, 10), (2, 12), (0, 14), (14, 0)] {
+				let shifted = ValuePointer {
+					key_size,
+					value_size,
+					..honest.clone()
+				};
+				assert_eq!(shifted.total_entry_size(), honest.total_entry_size());
+				assert!(
+					is_corruption(open_entry(&reader, &shifted, stored.clone())),
+					"{suite:?}, key {key_size} value {value_size}"
+				);
+			}
+
+			// Sizes that give another length than what was read, however large, and a pointer to a
+			// plaintext entry: nothing is opened and nothing is allocated for them.
+			for (key_size, value_size) in [(3, 12), (3, 10), (0, 0), (u32::MAX, u32::MAX)] {
+				let longer = ValuePointer {
+					key_size,
+					value_size,
+					..honest.clone()
+				};
+				assert!(is_corruption(open_entry(&reader, &longer, stored.clone())));
+			}
+			let plain = ValuePointer::new(1, 200, 3, 11, honest.checksum);
+			assert!(is_corruption(open_entry(&reader, &plain, stored.clone())));
+			assert!(is_corruption(open_entry(&reader, &honest, Vec::new())));
+			assert!(is_corruption(open_entry(
+				&reader,
+				&honest,
+				stored[..stored.len() - 1].to_vec()
+			)));
+		}
+	}
+
+	#[test]
+	fn a_position_is_sealed_once() {
+		for suite in SUITES {
+			let writer = kat_cipher(suite, true);
+			let mut first = frame(b"a", b"1").unwrap();
+			seal(&writer, 127, &mut first).unwrap();
+
+			// The same position and the ones before it, which is what a retry at the offset that a
+			// failed write left behind would ask for, are refused and leave the entry as it was.
+			for offset in [127u64, 126, 0] {
+				let mut other = frame(b"b", b"2").unwrap();
+				let before = other.clone();
+				assert_eq!(
+					encryption_error(seal(&writer, offset, &mut other)),
+					EncryptionError::PositionReuse,
+					"{suite:?}, offset {offset}"
+				);
+				assert_eq!(other, before);
+			}
+			let mut later = frame(b"c", b"3").unwrap();
+			seal(&writer, 128, &mut later).unwrap();
+
+			// A cipher made to open cannot seal, and neither can the cipher of another kind of
+			// file.
+			let mut entry = frame(b"d", b"4").unwrap();
+			let reader = kat_cipher(suite, false);
+			assert!(matches!(
+				encryption_error(seal(&reader, 1000, &mut entry)),
+				EncryptionError::InvalidInput(_)
+			));
+			let sst = FileCipher::new(FileKey::derive_for_test(
+				&kat_root(),
+				kat_salt(),
+				FileIdentity::new(suite, FileKind::Sst, 1, 1, kat_db()),
+				true,
+			))
+			.unwrap();
+			assert!(matches!(
+				encryption_error(seal(&sst, 1000, &mut entry)),
+				EncryptionError::InvalidInput(_)
+			));
 		}
 	}
 }

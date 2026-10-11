@@ -348,6 +348,11 @@ pub(crate) struct ValuePointer {
 	pub checksum: u32,
 }
 
+/// The version of a pointer to an entry that is sealed: its key and value are one AEAD message
+/// in the file, and it is longer than the entry of a plaintext log by the length of the key
+/// and the tag. A pointer is still the same 25 bytes.
+pub const VALUE_POINTER_SEALED_VERSION: u8 = 2;
+
 impl ValuePointer {
 	/// Creates a new ValuePointer
 	pub(crate) fn new(
@@ -365,6 +370,28 @@ impl ValuePointer {
 			value_size,
 			checksum,
 		}
+	}
+
+	/// Creates a pointer to a sealed entry. `checksum` is the CRC-32 of the entry as it is stored,
+	/// ciphertext and tag included, and the sizes are those of the key and the value.
+	// The writer of the commit that follows makes them.
+	#[allow(dead_code)]
+	pub(crate) fn sealed(
+		file_id: u32,
+		offset: u64,
+		key_size: u32,
+		value_size: u32,
+		checksum: u32,
+	) -> Self {
+		Self {
+			version: VALUE_POINTER_SEALED_VERSION,
+			..Self::new(file_id, offset, key_size, value_size, checksum)
+		}
+	}
+
+	/// Whether the pointer is to a sealed entry, see [`VALUE_POINTER_SEALED_VERSION`].
+	pub(crate) fn is_sealed(&self) -> bool {
+		self.version == VALUE_POINTER_SEALED_VERSION
 	}
 
 	/// Encodes the pointer as bytes for storage
@@ -408,9 +435,17 @@ impl ValuePointer {
 		})
 	}
 
-	/// Calculates the total entry size (header + key + value + crc32)
+	/// The size of the entry in its file. A plaintext entry is a header with both lengths, the
+	/// key, the value and a crc32. A sealed one has no header, as nothing about it is in the
+	/// clear: its length is what the pointer says, and the length of the key, the key, the
+	/// value and the tag are one message.
 	pub(crate) fn total_entry_size(&self) -> u64 {
-		8 + self.key_size as u64 + self.value_size as u64 + 4
+		let content = self.key_size as u64 + self.value_size as u64;
+		if self.is_sealed() {
+			sealed::ENTRY_OVERHEAD as u64 + content
+		} else {
+			8 + content + 4
+		}
 	}
 }
 
