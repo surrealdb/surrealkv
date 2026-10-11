@@ -6,6 +6,7 @@
 //! stopped before it is decompressed. It is not a cipher.
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
@@ -388,6 +389,62 @@ fn a_sink_whose_write_failed_writes_nothing_more() {
 	}
 	assert_eq!(writer.calls, 2, "no write was attempted after the one that failed");
 	assert_eq!(writer.written, b"hello");
+}
+
+/// Seals nothing and adds nothing, and fails its `fail_on`th call of `seal`. It counts the calls.
+struct FailingSealer {
+	calls: AtomicUsize,
+	fail_on: usize,
+}
+
+impl BlockSealer for FailingSealer {
+	fn overhead(&self) -> usize {
+		0
+	}
+
+	fn seal(&self, _: &BlockContext, _: &mut Vec<u8>) -> Result<()> {
+		let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+		if call == self.fail_on {
+			return Err(Error::Other("the key could not be had".into()));
+		}
+		Ok(())
+	}
+
+	fn open(&self, _: &BlockContext, _: &mut Vec<u8>) -> Result<()> {
+		Ok(())
+	}
+}
+
+#[test]
+fn a_sink_whose_sealer_failed_does_not_ask_it_for_that_position_again() {
+	let sealer = Arc::new(FailingSealer {
+		calls: AtomicUsize::new(0),
+		fail_on: 2,
+	});
+	let shared: Arc<FailingSealer> = Arc::clone(&sealer);
+	let mut file = Vec::new();
+	{
+		let mut sink = BlockSink::with_protection(&mut file, Protection::Sealed(shared));
+		sink.write_block(BlockKind::Data, b"hello".to_vec(), CompressionType::None).unwrap();
+		assert_eq!(sink.offset(), 14);
+
+		// The second block fails in the sealer, at the position 14.
+		let err = sink
+			.write_block(BlockKind::Data, b"world".to_vec(), CompressionType::None)
+			.unwrap_err();
+		assert!(matches!(err, Error::Other(_)), "{err:?}");
+		assert_eq!(sink.offset(), 14, "the position was not taken");
+
+		// Another block would be sealed at the same position: it is refused, and the sealer is
+		// not asked, though it would now succeed.
+		assert!(sink
+			.write_block(BlockKind::MetaIndex, b"again".to_vec(), CompressionType::None)
+			.is_err());
+		let footer = Footer::new(BlockHandle::new(0, 5), BlockHandle::new(0, 5));
+		assert!(sink.write_footer(&footer).is_err());
+	}
+	assert_eq!(sealer.calls.load(Ordering::SeqCst), 2);
+	assert_eq!(file.len(), 14, "nothing was written after the block that failed");
 }
 
 // ========== A sealed table ==========

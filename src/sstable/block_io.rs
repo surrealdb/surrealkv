@@ -546,14 +546,17 @@ fn into_block(contents: Vec<u8>, comparator: Arc<dyn Comparator>) -> Result<Bloc
 /// one goes.
 ///
 /// A block is compressed, sealed if the file has a sealer, and followed by its trailer. Its
-/// position is that of the running end of the file and is never used twice: a write that fails
-/// leaves the sink refusing all that follows, since what is in the file after it is not known.
+/// position is that of the running end of the file and is never used twice: a block that fails
+/// once its position was given to the sealer, whether in sealing, in making its trailer or in
+/// the write, leaves the sink refusing all that follows, since what is in the file after it is
+/// not known, and the position cannot be taken again.
 pub(crate) struct BlockSink<W: Write> {
 	writer: W,
 	protection: Protection,
 	/// Where the next block goes.
 	offset: usize,
-	/// A write failed, and so no position after it can be trusted.
+	/// A block failed after its position was given to the sealer, or a write failed: no position
+	/// after it can be trusted, and none may be taken twice.
 	failed: bool,
 }
 
@@ -590,19 +593,23 @@ impl<W: Write> BlockSink<W> {
 			return Err(Error::Other("a write to the table failed earlier".into()));
 		}
 
-		let mut payload = compress_block(contents, compression)?;
+		let payload = compress_block(contents, compression)?;
 		let offset = self.offset;
 		let compression = compression as u8;
-		if let Protection::Sealed(sealer) = &self.protection {
-			let context = BlockContext {
-				kind,
-				offset: offset as u64,
-				compression,
+
+		// From the moment that a sealer is asked to seal at `offset`, that position is spoken
+		// for: a cipher that derives its nonce from it must not be asked for it again with other
+		// bytes, whether the seal itself failed, or the trailer could not be made, or the write
+		// did not happen. Nothing is written for such a block, so the sink ends here.
+		let (payload, trailer) =
+			match Self::frame(&self.protection, kind, offset, compression, payload) {
+				Ok(framed) => framed,
+				Err(e) => {
+					self.failed = true;
+					return Err(e);
+				}
 			};
-			sealer.seal(&context, &mut payload)?;
-		}
 		let layout = self.protection.layout();
-		let trailer = Trailer::encode(layout, &payload, compression)?;
 
 		let written = self
 			.writer
@@ -614,6 +621,27 @@ impl<W: Write> BlockSink<W> {
 		}
 		self.offset = offset + payload.len() + layout.len();
 		Ok(BlockHandle::new(offset, payload.len()))
+	}
+
+	/// Seals a compressed block that is to go at `offset`, if the file has a sealer, and makes the
+	/// trailer that follows it.
+	fn frame(
+		protection: &Protection,
+		kind: BlockKind,
+		offset: usize,
+		compression: u8,
+		mut payload: Vec<u8>,
+	) -> Result<(Vec<u8>, Trailer)> {
+		if let Protection::Sealed(sealer) = protection {
+			let context = BlockContext {
+				kind,
+				offset: offset as u64,
+				compression,
+			};
+			sealer.seal(&context, &mut payload)?;
+		}
+		let trailer = Trailer::encode(protection.layout(), &payload, compression)?;
+		Ok((payload, trailer))
 	}
 
 	/// Writes the footer, which is the one part of the file that is not a block, flushes, and
