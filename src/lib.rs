@@ -63,6 +63,7 @@ pub use crate::error::{
 };
 pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::stall::WriteStallInfo;
+use crate::tde::EncryptionContext;
 #[doc(hidden)]
 pub use crate::tde::{CipherPreference, CipherSuite, KeyManager, KeyState, SoftwareKeyManager};
 pub use crate::transaction::{
@@ -295,6 +296,13 @@ pub struct Options {
 	/// Options: Auto, Suite(Aes256Gcm), Suite(XChaCha20Poly1305).
 	/// Default: CipherPreference::Auto
 	pub encryption_cipher: CipherPreference,
+	/// The encryption context a database resolves once it has read its descriptor: the key
+	/// manager, the suite and the database identity. It is set by the engine after the manifest
+	/// is read, and every writer and reader of a file takes its cipher from it. It is a public
+	/// field only so that code outside the crate can keep building `Options` with
+	/// `..Default::default()`.
+	#[doc(hidden)]
+	pub encryption_context: Option<Arc<EncryptionContext>>,
 }
 
 impl Default for Options {
@@ -341,6 +349,7 @@ impl Default for Options {
 			l0_stall_threshold: 12,
 			key_manager: None,
 			encryption_cipher: CipherPreference::default(),
+			encryption_context: None,
 		}
 	}
 }
@@ -383,6 +392,21 @@ impl Options {
 	) -> Self {
 		self.key_manager = Some(key_manager);
 		self.encryption_cipher = cipher.into();
+		self
+	}
+
+	/// The resolved encryption context, if this database is encrypted.
+	// The writers and readers of each file kind take it in the commits that follow.
+	#[allow(dead_code)]
+	pub(crate) fn encryption_context(&self) -> Option<&Arc<EncryptionContext>> {
+		self.encryption_context.as_ref()
+	}
+
+	/// Sets the resolved encryption context. The engine calls this once, with the identity and
+	/// the suite that the database's descriptor names, before any file is opened.
+	#[allow(dead_code)]
+	pub(crate) fn with_encryption_context(mut self, context: Arc<EncryptionContext>) -> Self {
+		self.encryption_context = Some(context);
 		self
 	}
 
