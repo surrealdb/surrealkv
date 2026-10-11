@@ -89,6 +89,8 @@ pub mod recovery_test_helpers;
 #[cfg(test)]
 pub mod recovery_tests;
 #[cfg(test)]
+pub mod reference_writer;
+#[cfg(test)]
 pub mod restore_concurrency_tests;
 #[cfg(test)]
 pub mod retire_free_tests;
@@ -100,6 +102,8 @@ pub mod rotate_vlog_order_tests;
 pub mod rotate_vlog_race_tests;
 #[cfg(test)]
 pub mod snapshot_tests;
+#[cfg(test)]
+pub mod sstable_layout_tests;
 #[cfg(test)]
 pub mod sstable_tests;
 #[cfg(test)]
