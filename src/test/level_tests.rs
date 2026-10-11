@@ -637,8 +637,8 @@ mod min_oldest_vlog_file_id_tests {
 // TABLES WITHOUT POINTS
 // ============================================================================
 
-/// A table of range deletions alone, as a compaction into the bottom level writes one when it
-/// drops every point and keeps a range deletion: no data block, an empty index, no key range.
+/// A table of range deletions alone, as a compaction writes one when it drops every point and
+/// keeps a range deletion: no data block, an empty index, no key range.
 mod table_without_points_tests {
 	use super::*;
 	use crate::LSMIterator;

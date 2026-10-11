@@ -1235,11 +1235,15 @@ impl Table {
 
 	/// Whether the table holds range deletions and nothing else.
 	///
-	/// A compaction into the bottom level that drops every point but keeps a range deletion
-	/// writes such a table: no data block, an empty index and no key range. Its range deletions
-	/// are read from the metadata of every table, so a point read or a scan has nothing to look
-	/// for in it, and it reads as empty. A table with no entry of any kind is never written, and
-	/// the reads of one still report its empty index as corrupt.
+	/// A compaction that drops every point but keeps a range deletion writes such a table: no
+	/// data block, an empty index and no key range. That happens in the bottom level, where the
+	/// range deletion covers every point and its own entry is dropped; in a level above it,
+	/// where tables that carry a range deletion are compacted without the table that holds its
+	/// entry; and in L0 of a tree of one level, which is the bottom level.
+	///
+	/// Its range deletions are read from the metadata of every table, so a point read or a scan
+	/// has nothing to look for in it, and it reads as empty. A table with no entry of any kind
+	/// is never written, and the reads of one still report its empty index as corrupt.
 	pub(crate) fn holds_only_range_deletions(&self) -> bool {
 		!self.has_points() && !self.meta.range_deletions.is_empty()
 	}

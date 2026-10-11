@@ -2268,6 +2268,74 @@ async fn a_table_without_points_above_the_bottom_level_is_read_and_compacted_on(
 	finish(db.tree);
 }
 
+/// Compacts all of L0 into L0: what the strategy does in a tree of one level.
+struct SameLevel;
+
+impl CompactionStrategy for SameLevel {
+	fn pick_levels(&self, manifest: &LevelManifest) -> crate::Result<CompactionChoice> {
+		let tables_to_merge =
+			manifest.levels.get_levels()[0].tables.iter().map(|t| t.id).collect::<Vec<_>>();
+		Ok(CompactionChoice::Merge(CompactionInput {
+			tables_to_merge,
+			source_level: 0,
+			target_level: 0,
+		}))
+	}
+}
+
+/// In a tree of one level the compaction rewrites L0 as the bottom level, and a range delete
+/// that covers every key leaves a table without points in L0, where the tables are ordered by
+/// sequence number and not by key. It has to read as empty, load again, stay behind the newer
+/// tables, and be merged away by the next compaction.
+#[test(tokio::test)]
+async fn a_table_without_points_in_l0_of_a_one_level_tree_is_read_and_compacted_on() {
+	let shape = Shape {
+		target_file_size: 700,
+		level_count: 1,
+	};
+	let mut db = Db::open(shape).await;
+	for i in 0..6 {
+		db.put_padded(&format!("n{i:02}"), "old", 300).await;
+	}
+	db.flush();
+	db.del_range("n00", "n99").await;
+	db.flush();
+	db.tree.compact(Arc::new(SameLevel)).unwrap();
+	assert_eq!(
+		tables_without_points_in(&db.tree, 0).len(),
+		1,
+		"the table the range delete emptied: {:?}",
+		db.layout()
+	);
+	assert_eq!(db.layout()[0].len(), 1, "it is the only table: {:?}", db.layout());
+	check_invariants(&db.tree, "a table without points in L0");
+	db.assert_reads("a table without points in L0").await;
+	let image = db.image("a table without points in L0");
+	verify(&image, shape).await;
+
+	// A newer table goes in front of it, and a compaction merges it away.
+	db.put_padded("n03", "new", 300).await;
+	db.flush();
+	check_invariants(&db.tree, "a flush in front of a table without points");
+	db.assert_reads("a flush in front of a table without points").await;
+	db.tree.compact(Arc::new(SameLevel)).unwrap();
+	assert!(tables_without_points_in(&db.tree, 0).is_empty(), "{:?}", db.layout());
+	check_invariants(&db.tree, "a compaction of L0 that took the table without points");
+	db.assert_reads("a compaction of L0 that took the table without points").await;
+	verify(&db.image("a table without points merged away in L0"), shape).await;
+	finish(db.tree);
+
+	// The same from the image: the table was loaded from the manifest, and a flush goes in front.
+	let mut db = Db::continue_from(&image, shape).await;
+	assert_eq!(tables_without_points_in(&db.tree, 0).len(), 1);
+	db.put_padded("n04", "again", 300).await;
+	db.flush();
+	db.tree.compact(Arc::new(SameLevel)).unwrap();
+	check_invariants(&db.tree, "after a reopen");
+	db.assert_reads("after a reopen").await;
+	finish(db.tree);
+}
+
 /// The end key of a range delete is not a value: bytes that read like a pointer into the value log
 /// must not make the table remember the value log file that they name.
 #[test]
