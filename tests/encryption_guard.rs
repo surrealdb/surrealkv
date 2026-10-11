@@ -10,11 +10,25 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use surrealkv::{CipherSuite, Error, KeyManager, Options, SoftwareKeyManager, Tree, TreeBuilder};
+use surrealkv::{
+	CipherPreference,
+	CipherSuite,
+	Error,
+	KeyManager,
+	Options,
+	SoftwareKeyManager,
+	Tree,
+	TreeBuilder,
+};
 
-const SUITES: [CipherSuite; 2] = [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305];
+/// Every way of asking for a cipher, including leaving the choice to the library.
+const SUITES: [CipherPreference; 3] = [
+	CipherPreference::Auto,
+	CipherPreference::Suite(CipherSuite::Aes256Gcm),
+	CipherPreference::Suite(CipherSuite::XChaCha20Poly1305),
+];
 
-fn options_with_key_manager(path: &Path, suite: CipherSuite) -> Options {
+fn options_with_key_manager(path: &Path, suite: CipherPreference) -> Options {
 	let key_manager: Arc<dyn KeyManager> = Arc::new(SoftwareKeyManager::new([0x5a; 32]));
 	Options::new().with_path(path.to_path_buf()).with_encryption(key_manager, suite)
 }
@@ -73,7 +87,8 @@ async fn rejected_build_leaves_an_existing_directory_untouched() {
 	let db_path = dir.path().join("db");
 	std::fs::create_dir(&db_path).unwrap();
 
-	let opts = options_with_key_manager(&db_path, CipherSuite::default()).with_enable_vlog(true);
+	let opts =
+		options_with_key_manager(&db_path, CipherPreference::default()).with_enable_vlog(true);
 	assert_encryption_refused(expect_err(TreeBuilder::with_options(opts).build()));
 
 	let entries = std::fs::read_dir(&db_path).unwrap().count();
@@ -96,7 +111,7 @@ async fn rejected_build_does_not_block_a_plain_build_at_the_same_path() {
 	let dir = tempfile::tempdir().unwrap();
 	let db_path = dir.path().join("db");
 
-	let opts = options_with_key_manager(&db_path, CipherSuite::default());
+	let opts = options_with_key_manager(&db_path, CipherPreference::default());
 	assert_encryption_refused(expect_err(TreeBuilder::with_options(opts).build()));
 	assert!(!db_path.exists());
 

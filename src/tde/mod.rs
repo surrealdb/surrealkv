@@ -41,7 +41,7 @@ pub use identity::{DbId, FileIdentity, FileKind, DB_ID_LEN};
 pub use kdf::{FileKey, FILE_KEY_LEN};
 pub use keys::{KeyManager, KeyState, SoftwareKeyManager, ROOT_KEY_LEN};
 pub use random::{fresh_salt, SALT_LEN};
-pub use suite::{hardware_aes_available, CipherSuite};
+pub use suite::{hardware_aes_available, CipherPreference, CipherSuite};
 /// The wrapper `KeyManager::root_key` returns roots in, re-exported so that an implementation
 /// does not need a dependency on the exact version of `zeroize` this crate uses.
 pub use zeroize::Zeroizing;
@@ -57,15 +57,19 @@ mod tests {
 	use crate::Options;
 
 	#[test]
-	fn options_carry_the_key_manager_and_the_cipher_suite() {
+	fn options_carry_the_key_manager_and_the_cipher_preference() {
 		let opts = Options::default();
 		assert!(opts.key_manager.is_none());
-		assert_eq!(opts.encryption_cipher, CipherSuite::Aes256Gcm);
+		assert_eq!(opts.encryption_cipher, CipherPreference::Auto);
 
 		let km: Arc<dyn KeyManager> = Arc::new(SoftwareKeyManager::new([0x33; ROOT_KEY_LEN]));
-		let opts = Options::new().with_encryption(km, CipherSuite::XChaCha20Poly1305);
-		let km = opts.key_manager.as_ref().expect("the key manager was configured");
-		assert_eq!(km.active_key_id(), KEY_ID_DEFAULT);
-		assert_eq!(opts.encryption_cipher, CipherSuite::XChaCha20Poly1305);
+		let opts = Options::new().with_encryption(Arc::clone(&km), CipherSuite::XChaCha20Poly1305);
+		let configured = opts.key_manager.as_ref().expect("the key manager was configured");
+		assert_eq!(configured.active_key_id(), KEY_ID_DEFAULT);
+		assert_eq!(opts.encryption_cipher, CipherPreference::Suite(CipherSuite::XChaCha20Poly1305));
+
+		// A preference is accepted as it is, so the choice can be left to the library.
+		let opts = Options::new().with_encryption(km, CipherPreference::Auto);
+		assert_eq!(opts.encryption_cipher, CipherPreference::Auto);
 	}
 }

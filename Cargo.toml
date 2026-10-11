@@ -247,3 +247,7 @@ unwrap_used = "allow"
 [[bench]]
 name = "alloc_bench"
 harness = false
+
+[[bench]]
+name = "tde_bench"
+harness = false

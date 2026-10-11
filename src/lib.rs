@@ -64,7 +64,7 @@ pub use crate::error::{
 pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::stall::WriteStallInfo;
 #[doc(hidden)]
-pub use crate::tde::{CipherSuite, KeyManager, KeyState, SoftwareKeyManager};
+pub use crate::tde::{CipherPreference, CipherSuite, KeyManager, KeyState, SoftwareKeyManager};
 pub use crate::transaction::{
 	Durability,
 	HistoryOptions,
@@ -289,11 +289,12 @@ pub struct Options {
 	/// `Error::InvalidArgument` instead of writing plaintext.
 	/// Default: None
 	pub key_manager: Option<Arc<dyn KeyManager>>,
-	/// Cipher suite reserved for encryption at rest. Has no effect until encryption is
-	/// implemented.
-	/// Options: Aes256Gcm, XChaCha20Poly1305.
-	/// Default: CipherSuite::Aes256Gcm
-	pub encryption_cipher: CipherSuite,
+	/// Cipher suite preference reserved for encryption at rest. Has no effect until encryption is
+	/// implemented. `Auto` lets the library pick AES-256-GCM when the CPU has AES instructions
+	/// and XChaCha20-Poly1305 otherwise, once, when a database is created.
+	/// Options: Auto, Suite(Aes256Gcm), Suite(XChaCha20Poly1305).
+	/// Default: CipherPreference::Auto
+	pub encryption_cipher: CipherPreference,
 }
 
 impl Default for Options {
@@ -339,7 +340,7 @@ impl Default for Options {
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
 			key_manager: None,
-			encryption_cipher: CipherSuite::default(),
+			encryption_cipher: CipherPreference::default(),
 		}
 	}
 }
@@ -378,10 +379,10 @@ impl Options {
 	pub fn with_encryption(
 		mut self,
 		key_manager: Arc<dyn KeyManager>,
-		cipher: CipherSuite,
+		cipher: impl Into<CipherPreference>,
 	) -> Self {
 		self.key_manager = Some(key_manager);
-		self.encryption_cipher = cipher;
+		self.encryption_cipher = cipher.into();
 		self
 	}
 

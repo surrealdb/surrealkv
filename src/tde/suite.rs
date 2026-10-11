@@ -7,13 +7,12 @@ use crate::error::EncryptionError;
 /// The discriminant is the suite id stored in file headers. Id 3 was assigned to a suite that
 /// was removed before any release; it is reserved and must never be reused for another
 /// construction, so a stray id 3 can only ever be rejected and never misread.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 #[repr(u8)]
 pub enum CipherSuite {
 	/// AES-256-GCM authenticated encryption (12-byte nonce, 16-byte tag).
 	/// Standard AEAD accelerated by hardware crypto instructions.
-	#[default]
 	Aes256Gcm = 1,
 	/// XChaCha20-Poly1305 authenticated encryption (24-byte nonce, 16-byte tag).
 	/// High-performance constant-time software cipher with 192-bit nonce.
@@ -71,6 +70,38 @@ impl CipherSuite {
 	/// the suite they were written with. On WebAssembly it is always XChaCha20-Poly1305.
 	pub fn resolve_auto() -> Self {
 		Self::for_hardware_aes(hardware_aes_available())
+	}
+}
+
+/// How the suite of a new database is chosen.
+///
+/// This is only a preference. The suite that is persisted, and that readers and writers use, is
+/// always a concrete [`CipherSuite`], so an unresolved `Auto` can never reach a file header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum CipherPreference {
+	/// Let the library pick for the CPU when the database is created, see
+	/// [`CipherSuite::resolve_auto`].
+	#[default]
+	Auto,
+	/// Use this suite.
+	Suite(CipherSuite),
+}
+
+impl CipherPreference {
+	/// The suite to create a database with. For `Auto` this asks the CPU, so call it once, when
+	/// the database is created, and persist the answer.
+	pub fn resolve(self) -> CipherSuite {
+		match self {
+			Self::Auto => CipherSuite::resolve_auto(),
+			Self::Suite(suite) => suite,
+		}
+	}
+}
+
+impl From<CipherSuite> for CipherPreference {
+	fn from(suite: CipherSuite) -> Self {
+		Self::Suite(suite)
 	}
 }
 
@@ -139,6 +170,17 @@ mod tests {
 		let resolved = CipherSuite::resolve_auto();
 		assert_eq!(resolved, CipherSuite::for_hardware_aes(hardware_aes_available()));
 		assert_eq!(resolved, CipherSuite::resolve_auto());
+	}
+
+	#[test]
+	fn a_preference_resolves_to_a_concrete_suite() {
+		assert_eq!(CipherPreference::default(), CipherPreference::Auto);
+		assert_eq!(CipherPreference::Auto.resolve(), CipherSuite::resolve_auto());
+		for suite in [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305] {
+			let preference = CipherPreference::from(suite);
+			assert_eq!(preference, CipherPreference::Suite(suite));
+			assert_eq!(preference.resolve(), suite);
+		}
 	}
 
 	#[test]
