@@ -926,6 +926,158 @@ mod tests {
 		}
 	}
 
+	fn unhex(text: &str) -> Vec<u8> {
+		let digits: Vec<u8> = text.bytes().filter(u8::is_ascii_hexdigit).collect();
+		assert_eq!(digits.len() % 2, 0, "odd number of hex digits");
+		digits
+			.chunks(2)
+			.map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+			.collect()
+	}
+
+	fn hex(bytes: &[u8]) -> String {
+		bytes.iter().map(|b| format!("{b:02x}")).collect()
+	}
+
+	/// Seals `plaintext` with the raw AEAD of `suite` under `key`, nonce and aad given, and
+	/// checks that it opens again.
+	fn seal_with_raw_aead(
+		suite: CipherSuite,
+		key: &[u8],
+		nonce: &[u8],
+		aad: &[u8],
+		plaintext: &[u8],
+	) -> (Vec<u8>, [u8; TAG_LEN]) {
+		let primitive = Primitive::new(suite, key.try_into().unwrap()).unwrap();
+		let mut data = plaintext.to_vec();
+		let tag = primitive.seal(nonce, aad, &mut data).unwrap();
+		let mut opened = data.clone();
+		primitive.open(nonce, aad, &mut opened, &tag).unwrap();
+		assert_eq!(opened, plaintext);
+		(data, tag)
+	}
+
+	// NIST CAVP `gcmEncryptExtIV256.rsp` (the vector with a 16 byte plaintext and a 16 byte
+	// additional data input that opens the set), as copied into the test data of the `aes-gcm`
+	// crate. A published vector for the primitive, checked through the code path that seals
+	// every block.
+	#[test]
+	fn aes_256_gcm_matches_a_published_nist_vector() {
+		let key = unhex("92e11dcdaa866f5ce790fd24501f92509aacf4cb8b1339d50c9c1240935dd08b");
+		let nonce = unhex("ac93a1a6145299bde902f21a");
+		let aad = unhex("1e0889016f67601c8ebea4943bc23ad6");
+		let plaintext = unhex("2d71bcfa914e4ac045b2aa60955fad24");
+		let (ciphertext, tag) =
+			seal_with_raw_aead(CipherSuite::Aes256Gcm, &key, &nonce, &aad, &plaintext);
+		assert_eq!(hex(&ciphertext), "8995ae2e6df3dbf96fac7b7137bae67f");
+		assert_eq!(hex(&tag), "eca5aa77d51d4a0a14d9c51e1da474ab");
+	}
+
+	// draft-irtf-cfrg-xchacha, appendix A.3.1 (the same key, associated data and plaintext as
+	// RFC 8439 section 2.8.2, with a 24 byte nonce).
+	#[test]
+	fn xchacha20_poly1305_matches_the_published_ietf_draft_vector() {
+		let key: Vec<u8> = (0x80..0xA0).collect();
+		let nonce: Vec<u8> = (0x40..0x58).collect();
+		let aad = unhex("50515253c0c1c2c3c4c5c6c7");
+		let plaintext = b"Ladies and Gentlemen of the class of '99: If I could offer you only one \
+			tip for the future, sunscreen would be it.";
+		let (ciphertext, tag) =
+			seal_with_raw_aead(CipherSuite::XChaCha20Poly1305, &key, &nonce, &aad, plaintext);
+		assert_eq!(
+			hex(&ciphertext),
+			"bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa644\
+			0bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e\
+			3f3fac2bc369488f76b2383565d3fff921f9664c97637da9768812f615c68b13b52e"
+		);
+		assert_eq!(hex(&tag), "c0875924c1c7987947deafd8780acf49");
+	}
+
+	// Independently computed with the pure-Python AEADs that reproduce the two vectors above:
+	// the file key from HKDF-SHA256 (root bytes 00..1f, salt bytes 20..3f, database id a0..af,
+	// see the vectors in `kdf`), the associated data and nonce written out from the layouts in
+	// this module's documentation, and the seal of the 32 plaintext bytes 40..5f (or none).
+	#[test]
+	fn sealed_blocks_match_independently_computed_vectors() {
+		let root: [u8; ROOT_KEY_LEN] = std::array::from_fn(|i| i as u8);
+		let salt: [u8; SALT_LEN] = std::array::from_fn(|i| 0x20 + i as u8);
+		let plaintext: Vec<u8> = (0x40..0x60).collect();
+		let sst = FileIdentity::new(
+			CipherSuite::Aes256Gcm,
+			FileKind::Sst,
+			7,
+			0x0102_0304_0506_0708,
+			db_id(),
+		);
+		let wal = FileIdentity::new(
+			CipherSuite::XChaCha20Poly1305,
+			FileKind::Wal,
+			0x0102_0304,
+			0x1112_1314_1516_1718,
+			db_id(),
+		);
+		let manifest = FileIdentity {
+			file_kind: FileKind::Manifest,
+			..sst
+		};
+
+		// (identity, context, plaintext, file key, aad, nonce, ciphertext, tag)
+		let vectors = [
+			(
+				sst,
+				BlockContext::new(BlockKind::SstData, 0x1000, 1),
+				&plaintext[..],
+				"d3a5ed5726eeb620450fb06ddc47108429797b14203abf18727421ddd1af4064",
+				"01010101000000070102030405060708a0a1a2a3a4a5a6a7a8a9aaabacadaeaf\
+				 00000000000010000100000000000000",
+				"000000000000000000001000",
+				"689bb5e65e684ca8e9f66d485f4578df8a309d40f13be3b11eef275d4ecf1a97",
+				"33c922ca3c9525daa476151a4bf11efe",
+			),
+			(
+				wal,
+				BlockContext::new(BlockKind::WalBatch, 1, 0),
+				&plaintext[..],
+				"012d010e7f0155632efd20c9a6db17348ddef98976eda0e9a2f67b2b04a612bb",
+				"01020308010203041112131415161718a0a1a2a3a4a5a6a7a8a9aaabacadaeaf\
+				 00000000000000010000000000000000",
+				"000000000000000000000000000000000000000000000001",
+				"5bb6247108fddfb324a3e36347e1d3eaca125fbbfda3ec5588460defc909a98d",
+				"d1ab67534b5ffd12ce98064f04650100",
+			),
+			(
+				manifest,
+				BlockContext::new(BlockKind::ManifestBody, 0, 0),
+				&[],
+				"18c40e412b1550c3bf42bbd3399f0adc204fac609b972f61c3498b96a8d1cbc6",
+				"01010409000000070102030405060708a0a1a2a3a4a5a6a7a8a9aaabacadaeaf\
+				 00000000000000000000000000000000",
+				"000000000000000000000000",
+				"",
+				"1b6c7365fa2f8313296b095b8b8ead40",
+			),
+		];
+		for (i, (identity, context, plaintext, dek, aad, nonce, ciphertext, tag)) in
+			vectors.into_iter().enumerate()
+		{
+			let key = FileKey::derive_for_test(&root, salt, identity, true);
+			assert_eq!(hex(&key.dek_for_test()), dek, "vector {i}: file key");
+			assert_eq!(hex(&context.aad(&identity)), aad, "vector {i}: associated data");
+			let (bytes, len) = nonce_for(identity.suite, context.position());
+			assert_eq!(hex(&bytes[..len]), nonce, "vector {i}: nonce");
+
+			let cipher = FileCipher::new(key).unwrap();
+			let mut sealed = plaintext.to_vec();
+			cipher.seal_append(&context, &mut sealed).unwrap();
+			assert_eq!(hex(&sealed), format!("{ciphertext}{tag}"), "vector {i}: sealed block");
+
+			// And back, through a reader that only derives its key from the header's contents.
+			let reader =
+				FileCipher::new(FileKey::derive_for_test(&root, salt, identity, false)).unwrap();
+			assert_eq!(reader.open_suffix(&context, &mut sealed).unwrap(), plaintext, "vector {i}");
+		}
+	}
+
 	#[test]
 	fn ciphers_and_keys_can_be_shared_between_threads() {
 		fn assert_send_sync<T: Send + Sync>() {}
