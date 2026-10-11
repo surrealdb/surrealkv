@@ -540,6 +540,11 @@ impl Reader {
 						offset: at,
 					});
 				}
+				// The look-ahead reads at positions of its own. Where such a read moves the cursor
+				// of the file (Windows), the next block is still read from where this one ended.
+				self.file
+					.seek(SeekFrom::Start(self.end_of_buffer_offset as u64))
+					.map_err(|e| physical(&format!("reading ahead failed: {e}")))?;
 				self.buffer_offset = self.buffer_end;
 				continue;
 			}
