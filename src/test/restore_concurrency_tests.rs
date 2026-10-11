@@ -1975,6 +1975,127 @@ async fn a_restore_that_fails_after_it_removed_the_files_leaves_the_marker() {
 	abandon(&w.tree);
 }
 
+/// The marker is written before the first file is removed: a restore that cannot write it fails
+/// with the database as it was. A directory is where the marker goes.
+#[test(tokio::test)]
+async fn a_restore_that_cannot_write_its_marker_removes_nothing() {
+	let w = build(false).await;
+	std::fs::create_dir(w.path.join(MARKER)).unwrap();
+	let files = fingerprint(&w.path);
+	let outcome = w.tree.restore_from_checkpoint(&w.ckpt);
+	assert!(outcome.is_err(), "a restore that could not mark the directory went on: {outcome:?}");
+	assert_eq!(fingerprint(&w.path), files, "the failed restore changed the files");
+	assert_exact_with_extra(&w.tree, &w.before, "the database after the refused restore");
+	abandon(&w.tree);
+}
+
+/// A checkpoint of another tree of this process that wants the directory a restore reads waits for
+/// the restore: the files the restore copies are the ones it validated. Without that, the
+/// checkpoint replaces them one by one between the validation and the copy.
+#[test(tokio::test)]
+async fn a_checkpoint_into_the_directory_a_restore_reads_waits_for_the_restore() {
+	let w = build(false).await;
+	let other_dir = TempDir::new("restore_conc_other").unwrap();
+	let other = open(options(other_dir.path(), false));
+	let mut other_model = Model::new();
+	apply(&other, &mut other_model, sets(0..20, "z", false)).await.unwrap();
+
+	let writer = Arc::new(Mutex::new(None));
+	let waited = Arc::new(AtomicBool::new(false));
+	let (o, ckpt) = (Arc::clone(&other), w.ckpt.clone());
+	let (slot, waiting) = (Arc::clone(&writer), Arc::clone(&waited));
+	*w.tree.core.inner.checkpoint_hook.lock() = Some(Arc::new(move |stage| {
+		if stage == CheckpointStage::RestoreCleared {
+			let (o, ckpt) = (Arc::clone(&o), ckpt.clone());
+			let handle = std::thread::spawn(move || o.create_checkpoint(&ckpt));
+			let deadline = Instant::now() + GRACE;
+			while !handle.is_finished() && Instant::now() < deadline {
+				std::thread::sleep(Duration::from_millis(2));
+			}
+			waiting.store(!handle.is_finished(), Ordering::SeqCst);
+			*slot.lock().unwrap() = Some(handle);
+		}
+	}));
+	let restored = w.tree.restore_from_checkpoint(&w.ckpt);
+	clear_hooks(&w.tree);
+	let handle = writer.lock().unwrap().take().expect("the restore reached RestoreCleared");
+	assert!(
+		waited.load(Ordering::SeqCst),
+		"a checkpoint rewrote the directory while a restore was reading it"
+	);
+	restored.unwrap();
+	assert_exact(&w.tree, &w.at_ckpt, "the restore of the checkpoint that was there");
+	let written = handle.join().unwrap().expect("the checkpoint that waited");
+
+	// The directory now holds the other tree's state
+	let fresh = TempDir::new("restore_conc_fresh").unwrap();
+	let tree = open(options(fresh.path(), false));
+	let metadata = tree.restore_from_checkpoint(&w.ckpt).unwrap();
+	assert_eq!(metadata.sequence_number, written.sequence_number);
+	assert_exact(&tree, &other_model, "the checkpoint that waited");
+	abandon(&tree);
+	abandon(&other);
+	abandon(&w.tree);
+}
+
+/// A restore does not wait for a checkpoint that is writing the directory: it holds the flush
+/// lock, which the checkpoint takes while it holds the directory, and it is refused with the
+/// database as it was.
+#[test(tokio::test)]
+async fn a_restore_from_a_directory_a_checkpoint_is_writing_is_refused_and_leaves_the_database() {
+	let w = build(false).await;
+	let other_dir = TempDir::new("restore_conc_other").unwrap();
+	let other = open(options(other_dir.path(), false));
+	let mut other_model = Model::new();
+	apply(&other, &mut other_model, sets(0..20, "z", false)).await.unwrap();
+
+	let (gate, pass) = (mpsc::channel(), mpsc::channel::<()>());
+	let (reached, release) = (gate.0, Mutex::new(pass.1));
+	*other.core.inner.checkpoint_hook.lock() = Some(Arc::new(move |stage| {
+		if stage == CheckpointStage::ManifestReleased {
+			reached.send(()).unwrap();
+			let _ = release.lock().unwrap().recv_timeout(WATCHDOG);
+		}
+	}));
+	let (o, ckpt) = (Arc::clone(&other), w.ckpt.clone());
+	let writer = std::thread::spawn(move || o.create_checkpoint(&ckpt));
+	gate.1.recv_timeout(WATCHDOG).expect("the checkpoint reached ManifestReleased");
+
+	let files = fingerprint(&w.path);
+	let outcome = w.tree.restore_from_checkpoint(&w.ckpt);
+	let refused =
+		matches!(&outcome, Err(Error::InvalidArgument(why)) if why.contains("being written"));
+	pass.0.send(()).unwrap();
+	writer.join().unwrap().unwrap();
+	assert!(refused, "the restore of a directory that is being written: {outcome:?}");
+	assert_eq!(fingerprint(&w.path), files, "the refused restore changed the files");
+	assert_exact(&w.tree, &w.before, "the database after the refused restore");
+	abandon(&other);
+	abandon(&w.tree);
+}
+
+/// The checkpoint of a database that holds nothing restores, and leaves an empty database that
+/// opens again.
+#[test(tokio::test)]
+async fn the_checkpoint_of_an_empty_database_restores_and_empties_the_target() {
+	for vlog in [false, true] {
+		let w = build(vlog).await;
+		let empty_dir = TempDir::new("restore_conc_empty").unwrap();
+		let empty = open(options(empty_dir.path(), vlog));
+		let root = TempDir::new("restore_conc_empty_ckpt").unwrap();
+		let ckpt = root.path().join("empty");
+		empty.create_checkpoint(&ckpt).unwrap();
+		w.tree.restore_from_checkpoint(&ckpt).unwrap();
+		assert_exact(&w.tree, &Model::new(), &format!("vlog {vlog}: after the restore"));
+		assert!(!w.path.join(MARKER).exists(), "vlog {vlog}: the marker is left");
+		w.tree.close().await.unwrap();
+		let reopened = open(options(&w.path, vlog));
+		assert_exact(&reopened, &Model::new(), &format!("vlog {vlog}: after a reopen"));
+		abandon(&reopened);
+		abandon(&empty);
+	}
+}
+
 /// The commits that are acknowledged after a restore are in the WAL that the restore reopened:
 /// a crash image taken right after them recovers the checkpoint and exactly those commits.
 async fn acknowledged_commits_survive_a_crash(vlog: bool) {

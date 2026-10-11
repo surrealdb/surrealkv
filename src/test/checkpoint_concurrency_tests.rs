@@ -1835,6 +1835,31 @@ async fn a_failed_checkpoint_lets_the_next_one_into_its_destination() {
 	finish(source).await;
 }
 
+/// A checkpoint that panics gives its destination back too: the next one into it is not left
+/// waiting.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_checkpoint_that_panics_lets_the_next_one_into_its_destination() {
+	let (source, _dir, state) = source_with_data(false).await;
+	let out = TempDir::new("ckpt_conc_panic").unwrap();
+	let cp = out.path().join("cp");
+	*source.core.inner.checkpoint_hook.lock() = Some(Arc::new(|stage| {
+		if stage == CheckpointStage::SstablesCopied {
+			panic!("a panic inside the checkpoint");
+		}
+	}));
+	let outcome = catch_unwind(AssertUnwindSafe(|| source.create_checkpoint(&cp)));
+	assert!(outcome.is_err(), "the hook did not panic the checkpoint");
+	clear_hooks(&source);
+
+	let metadata = checkpoint(&source, &cp).wait().unwrap();
+	let target = out.path().join("restored");
+	let (copy, outcome) = restored(&cp, &target, false).await;
+	assert_eq!(outcome.unwrap().sequence_number, metadata.sequence_number);
+	assert_contents(&copy, &state, "the checkpoint after the one that panicked");
+	finish(copy).await;
+	finish(source).await;
+}
+
 // ---------------------------------------------------------------------------
 // 5. interrupted and damaged checkpoint directories
 // ---------------------------------------------------------------------------

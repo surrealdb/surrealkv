@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -58,37 +58,77 @@ fn resolve(path: &Path) -> std::io::Result<PathBuf> {
 	Ok(resolved)
 }
 
-/// The destinations that the checkpoints of this process are writing, by resolved path.
-static DESTINATIONS: parking_lot::Mutex<BTreeSet<PathBuf>> =
-	parking_lot::Mutex::new(BTreeSet::new());
+/// What the checkpoints and the restores of this process are doing to a checkpoint directory, by
+/// resolved path.
+#[derive(Clone, Copy)]
+enum Use {
+	/// A checkpoint is writing it.
+	Writing,
+	/// This many restores are reading it.
+	Reading(usize),
+}
+
+static DESTINATIONS: parking_lot::Mutex<BTreeMap<PathBuf, Use>> =
+	parking_lot::Mutex::new(BTreeMap::new());
 
 /// Wakes the checkpoints that wait for a destination when one is released.
 static DESTINATION_RELEASED: parking_lot::Condvar = parking_lot::Condvar::new();
 
-/// The right to write one checkpoint directory. A checkpoint removes and writes the files of the
-/// directory and ends with its metadata file, so two that wrote the same directory at once would
-/// leave the files of one beside the metadata of the other. A checkpoint waits here for the one
-/// that is writing the destination, and the guard is released on every path, errors and panics
-/// included. Taken before any other lock, so that waiting for a destination never holds one.
+/// The right to write one checkpoint directory, or to read it for a restore. A checkpoint removes
+/// and writes the files of the directory and ends with its metadata file, so two that wrote the
+/// same directory at once would leave the files of one beside the metadata of the other, and a
+/// restore that read it meanwhile would copy a mixture. A checkpoint waits here for the one that
+/// is writing the destination and for the restores that read it; a restore does not wait, for it
+/// holds the flush lock, which a checkpoint takes after it holds its destination: it is refused
+/// instead. The guard is released on every path, errors and panics included. A checkpoint takes it
+/// before any other lock, so that waiting for a destination never holds one.
 struct DestinationGuard {
 	path: PathBuf,
+	writing: bool,
 }
 
 impl DestinationGuard {
 	fn acquire(path: PathBuf) -> Self {
 		let mut busy = DESTINATIONS.lock();
-		while !busy.insert(path.clone()) {
+		while busy.contains_key(&path) {
 			DESTINATION_RELEASED.wait(&mut busy);
 		}
+		busy.insert(path.clone(), Use::Writing);
 		Self {
 			path,
+			writing: true,
 		}
+	}
+
+	/// Takes the directory for reading, or returns `None` if a checkpoint is writing it. Never
+	/// waits.
+	fn try_read(path: PathBuf) -> Option<Self> {
+		let mut busy = DESTINATIONS.lock();
+		match busy.get(&path).copied() {
+			Some(Use::Writing) => return None,
+			Some(Use::Reading(n)) => busy.insert(path.clone(), Use::Reading(n + 1)),
+			None => busy.insert(path.clone(), Use::Reading(1)),
+		};
+		Some(Self {
+			path,
+			writing: false,
+		})
 	}
 }
 
 impl Drop for DestinationGuard {
 	fn drop(&mut self) {
-		DESTINATIONS.lock().remove(&self.path);
+		let mut busy = DESTINATIONS.lock();
+		match busy.get(&self.path).copied() {
+			Some(Use::Reading(n)) if !self.writing && n > 1 => {
+				busy.insert(self.path.clone(), Use::Reading(n - 1));
+				return;
+			}
+			_ => {
+				busy.remove(&self.path);
+			}
+		}
+		drop(busy);
 		DESTINATION_RELEASED.notify_all();
 	}
 }
@@ -192,6 +232,15 @@ pub(crate) fn check_restore_finished(opts: &Options) -> Result<()> {
 		opts.path.display(),
 		marker.display()
 	)))
+}
+
+/// The directory that holds `dir`: the current directory for a name that has no parent part,
+/// whose `parent` is the empty path, which names nothing that can be synced.
+fn parent_directory(dir: &Path) -> Option<&Path> {
+	match dir.parent() {
+		Some(parent) if parent.as_os_str().is_empty() => Some(Path::new(".")),
+		parent => parent,
+	}
 }
 
 /// Syncs the files below `dir`, and then the directories, so that what was copied or linked there
@@ -386,7 +435,8 @@ impl DatabaseCheckpoint {
 	}
 
 	/// Creates a new database checkpoint at the specified directory. A checkpoint into a
-	/// directory that another checkpoint of this process is writing waits for it.
+	/// directory that another checkpoint of this process is writing, or that a restore of this
+	/// process is reading, waits for it.
 	///
 	/// This creates a consistent point-in-time snapshot that includes:
 	/// - All SSTables from all levels
@@ -562,12 +612,29 @@ impl DatabaseCheckpoint {
 	/// anything of the database is touched. From the first removal until its files are back and
 	/// synced, a marker file in the database directory makes opening the directory fail with
 	/// [`Error::RestoreInterrupted`]. A restore that failed in between is repeated on the open
-	/// database; one that crashed is repeated into an empty directory.
+	/// database; one that crashed is repeated into an empty directory. A directory that a
+	/// checkpoint of this process is writing is refused with [`Error::InvalidArgument`].
 	pub fn restore_from_checkpoint<P: AsRef<Path>>(
 		&self,
 		checkpoint_dir: P,
 	) -> Result<CheckpointMetadata> {
 		let checkpoint_path = checkpoint_dir.as_ref();
+
+		// A checkpoint of this process that is writing the directory replaces its files one by one,
+		// and a restore that read them meanwhile would copy a mixture. It is refused rather than
+		// waited for: see `DestinationGuard`.
+		// A path that cannot be resolved is used as it is: restoring never needed it resolved, and
+		// a checkpoint that writes the directory has resolved it, or has failed.
+		let _source = DestinationGuard::try_read(
+			resolve(checkpoint_path).unwrap_or_else(|_| checkpoint_path.to_path_buf()),
+		)
+		.ok_or_else(|| {
+			Error::InvalidArgument(format!(
+				"{} is being written by a checkpoint of this process: it cannot be restored until \
+				 that checkpoint is done",
+				checkpoint_path.display()
+			))
+		})?;
 
 		// Verify checkpoint exists and is valid
 		let metadata = self.read_checkpoint_metadata(checkpoint_path)?;
@@ -881,7 +948,7 @@ impl DatabaseCheckpoint {
 		file.sync_all().map_err(io)?;
 		fsync_directory(checkpoint_dir).map_err(io)?;
 		// The checkpoint directory itself, if this checkpoint created it
-		if let Some(parent) = checkpoint_dir.parent() {
+		if let Some(parent) = parent_directory(checkpoint_dir) {
 			fsync_directory(parent).map_err(io)?;
 		}
 
@@ -1002,6 +1069,32 @@ mod tests {
 		let result = CheckpointMetadata::from_bytes(&future_data);
 		assert!(result.is_err());
 		assert!(result.unwrap_err().to_string().contains("Unsupported checkpoint version"));
+	}
+
+	#[test]
+	fn the_parent_of_a_relative_name_is_the_current_directory() {
+		assert_eq!(parent_directory(Path::new("cp")), Some(Path::new(".")));
+		assert_eq!(parent_directory(Path::new("out/cp")), Some(Path::new("out")));
+		assert_eq!(parent_directory(Path::new("/out/cp")), Some(Path::new("/out")));
+		assert_eq!(parent_directory(Path::new("/")), None);
+	}
+
+	#[test]
+	fn a_directory_is_read_by_many_and_written_by_one() {
+		let dir = PathBuf::from("/a/directory/only/this/test/uses");
+		let first = DestinationGuard::try_read(dir.clone()).unwrap();
+		let second = DestinationGuard::try_read(dir.clone()).unwrap();
+		drop(first);
+		assert!(DESTINATIONS.lock().contains_key(&dir), "one reader is left");
+		drop(second);
+		assert!(!DESTINATIONS.lock().contains_key(&dir), "no reader is left");
+		let writer = DestinationGuard::acquire(dir.clone());
+		assert!(
+			DestinationGuard::try_read(dir.clone()).is_none(),
+			"no reading while it is written"
+		);
+		drop(writer);
+		assert!(DestinationGuard::try_read(dir).is_some());
 	}
 
 	#[test]
