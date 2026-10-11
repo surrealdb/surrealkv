@@ -25,7 +25,7 @@ use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vlog::{VLog, ValueLocation};
-use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
+use crate::wal::recovery::{repair_corrupted_wal_segment_with, replay_wal_with};
 use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
 use crate::{
 	Comparator,
@@ -300,8 +300,11 @@ impl CoreInner {
 		// Initialize WAL starting from manifest.log_number
 		let wal_path = opts.wal_dir();
 		// This avoids creating intermediate empty WAL files
-		let wal_instance =
-			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+		let wal_instance = Wal::open_with_min_log_number(
+			&wal_path,
+			manifest_log_number,
+			wal::Options::for_tree(&opts),
+		)?;
 
 		// Starts at 0 since no commits have happened yet.
 		let visible_seq_num = Arc::new(AtomicU64::new(0));
@@ -1472,12 +1475,39 @@ impl std::ops::Deref for Core {
 }
 
 impl Core {
+	/// Replays a plaintext WAL, see [`replay_wal_in`](Self::replay_wal_in).
+	#[cfg(test)]
+	pub(crate) fn replay_wal_with_repair<F>(
+		wal_path: &Path,
+		min_wal_number: u64,
+		context: &str,
+		recovery_mode: WalRecoveryMode,
+		arena_size: usize,
+		flush_memtable: F,
+	) -> Result<(Option<u64>, Option<Arc<MemTable>>)>
+	where
+		F: FnMut(Arc<MemTable>, u64, bool) -> Result<()>,
+	{
+		Self::replay_wal_in(
+			&wal::WalContext::plaintext(),
+			wal_path,
+			min_wal_number,
+			context,
+			recovery_mode,
+			arena_size,
+			flush_memtable,
+		)
+	}
+
 	/// Replays WAL with configurable corruption handling.
 	///
 	/// Creates one memtable per WAL segment. Flushes all but the last memtable
 	/// to SST via the provided callback. Returns the last memtable as active.
 	///
+	/// Every replay of a tree (open and restore) goes through here with the context of the tree.
+	///
 	/// # Arguments
+	/// * `wal_context` - Whether the segments are sealed, and under what
 	/// * `wal_path` - Path to WAL directory
 	/// * `min_wal_number` - Minimum WAL to replay
 	/// * `context` - Context string for error messages
@@ -1489,7 +1519,9 @@ impl Core {
 	///
 	/// # Returns
 	/// * `(Option<max_seq_num>, Option<active_memtable>, did_recovery)`
-	pub(crate) fn replay_wal_with_repair<F>(
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) fn replay_wal_in<F>(
+		wal_context: &wal::WalContext,
 		wal_path: &Path,
 		min_wal_number: u64,
 		context: &str,
@@ -1501,7 +1533,12 @@ impl Core {
 		F: FnMut(Arc<MemTable>, u64, bool) -> Result<()>,
 	{
 		// Replay WAL - returns memtables per segment
-		let (wal_seq_num_opt, memtables) = match replay_wal(wal_path, min_wal_number, arena_size) {
+		let (wal_seq_num_opt, memtables) = match replay_wal_with(
+			wal_context,
+			wal_path,
+			min_wal_number,
+			arena_size,
+		) {
 			Ok(result) => result,
 			Err(Error::WalCorruption {
 				segment_id,
@@ -1533,7 +1570,8 @@ impl Core {
 						);
 
 						// Attempt repair
-						if let Err(repair_err) = repair_corrupted_wal_segment(wal_path, segment_id)
+						if let Err(repair_err) =
+							repair_corrupted_wal_segment_with(wal_context, wal_path, segment_id)
 						{
 							tracing::error!("Failed to repair WAL segment: {repair_err}");
 							return Err(Error::Other(format!(
@@ -1542,7 +1580,7 @@ impl Core {
 						}
 
 						// Retry after repair
-						match replay_wal(wal_path, min_wal_number, arena_size) {
+						match replay_wal_with(wal_context, wal_path, min_wal_number, arena_size) {
 							Ok(result) => result,
 							Err(Error::WalCorruption {
 								segment_id: seg_id,
@@ -1665,7 +1703,8 @@ impl Core {
 		);
 
 		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
-		let (wal_seq_num_opt, recovered_memtable) = Self::replay_wal_with_repair(
+		let (wal_seq_num_opt, recovered_memtable) = Self::replay_wal_in(
+			&wal::WalContext::for_options(&opts),
 			&wal_path,
 			min_wal_number,
 			"Database startup",
@@ -2505,13 +2544,14 @@ impl Tree {
 			let new_wal = Wal::open_with_min_log_number(
 				&wal_path,
 				manifest_log_number,
-				wal::Options::default(),
+				wal::Options::for_tree(&self.core.inner.opts),
 			)?;
 			*wal_guard = new_wal;
 		}
 
 		// Replay any WAL entries that were restored
-		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_with_repair(
+		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_in(
+			&wal::WalContext::for_options(&self.core.inner.opts),
 			&wal_path,
 			manifest_log_number,
 			"Database restore",

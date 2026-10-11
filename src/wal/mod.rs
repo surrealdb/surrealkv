@@ -9,6 +9,8 @@ use std::sync::{Arc, PoisonError};
 
 use crc32fast::Hasher;
 
+use crate::tde::EncryptionContext;
+
 pub mod manager;
 pub(crate) mod parallel_recovery;
 pub mod reader;
@@ -143,12 +145,61 @@ const DEFAULT_FILE_MODE: u32 = 0o644;
 /// Default maximum size of the segment file (100MB).
 const DEFAULT_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
+/// What a WAL needs to know about encryption to write, read and repair its segments.
+///
+/// The default is plaintext. A tree builds one with [`WalContext::for_options`] and nothing else
+/// decides whether segments are sealed, so every place that opens a WAL, replays one or repairs one
+/// is handed the same answer. A site that forgot to take it would read or write plaintext in an
+/// encrypted tree, which is why the plaintext constructor is for tests.
+///
+/// Cheap to clone, and shared by the workers that decode segments in parallel.
+#[derive(Clone, Default)]
+pub(crate) struct WalContext {
+	/// What creates and opens the encrypted files of the database, if the WAL is sealed.
+	// Read by the sealed paths of the writer, the reader and recovery.
+	#[allow(dead_code)]
+	cipher: Option<Arc<EncryptionContext>>,
+}
+
+impl WalContext {
+	/// A plaintext WAL. Only tests build one this way: a tree takes its context from its options.
+	#[cfg(test)]
+	pub(crate) fn plaintext() -> Self {
+		Self::default()
+	}
+
+	/// The context of the WAL of the tree that `opts` configure: sealed if the options carry a
+	/// resolved encryption context, plaintext otherwise.
+	pub(crate) fn for_options(opts: &crate::Options) -> Self {
+		Self {
+			cipher: opts.encryption_context().cloned(),
+		}
+	}
+
+	/// Whether the segments of this WAL are sealed.
+	#[allow(dead_code)]
+	pub(crate) fn is_sealed(&self) -> bool {
+		self.cipher.is_some()
+	}
+}
+
+impl fmt::Debug for WalContext {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("WalContext").field("sealed", &self.cipher.is_some()).finish()
+	}
+}
+
 /// Options for configuring a WAL segment.
 ///
 /// This struct provides configuration options for WAL segments, including
 /// file permissions, compression settings, metadata, and file size limits.
 #[derive(Clone)]
 pub struct Options {
+	/// Whether the segments are sealed, and under what.
+	// Read by the writer of sealed segments.
+	#[allow(dead_code)]
+	pub(crate) context: WalContext,
+
 	/// The permission mode for creating directories (Unix only).
 	#[cfg_attr(not(unix), allow(dead_code))]
 	pub(crate) dir_mode: Option<u32>,
@@ -170,6 +221,7 @@ pub struct Options {
 impl Default for Options {
 	fn default() -> Self {
 		Options {
+			context: WalContext::default(),
 			dir_mode: Some(0o750),
 			file_mode: Some(DEFAULT_FILE_MODE),
 			compression_type: CompressionType::None,
@@ -180,6 +232,15 @@ impl Default for Options {
 }
 
 impl Options {
+	/// The options of the WAL of the tree that `opts` configure: the one constructor that a tree's
+	/// own sites (open, restore, repair) use.
+	pub(crate) fn for_tree(opts: &crate::Options) -> Self {
+		Self {
+			context: WalContext::for_options(opts),
+			..Self::default()
+		}
+	}
+
 	/// Validates the options.
 	pub(crate) fn validate(&self) -> Result<()> {
 		if self.max_file_size == 0 {

@@ -15,16 +15,28 @@ use crate::error::{Error, Result};
 use crate::memtable::MemTable;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::{apply_batch_with_oversized_fallback, DefaultReporter};
-use crate::wal::{Error as WalError, SegmentRef};
+use crate::wal::{Error as WalError, SegmentRef, WalContext};
 
-/// Decodes a single WAL segment file into batches and the segment's maximum sequence number.
+/// Decodes a single plaintext WAL segment file into batches and the segment's maximum sequence
+/// number.
+#[cfg(test)]
 pub(crate) fn decode_segment_batches(
+	file_path: &Path,
+	segment_id: u64,
+) -> Result<(u64, Vec<Batch>)> {
+	decode_segment_batches_with(&WalContext::plaintext(), file_path, segment_id)
+}
+
+/// Decodes a single WAL segment file, read as `context` says, into batches and the segment's
+/// maximum sequence number.
+pub(crate) fn decode_segment_batches_with(
+	context: &WalContext,
 	file_path: &Path,
 	segment_id: u64,
 ) -> Result<(u64, Vec<Batch>)> {
 	let file = File::open(file_path)?;
 	let reporter = Box::new(DefaultReporter::new(segment_id));
-	let mut reader = Reader::with_options(file, Some(reporter), segment_id);
+	let mut reader = Reader::with_context(file, Some(reporter), segment_id, context);
 
 	let mut batches = Vec::new();
 	let mut max_seq = 0u64;
@@ -62,6 +74,7 @@ pub(crate) type ParallelReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u
 
 /// Synchronous entry point for parallel segment replay.
 pub(crate) fn replay_segments_sync(
+	context: &WalContext,
 	segments: &[SegmentRef],
 	arena_size: usize,
 ) -> Result<ParallelReplayResult> {
@@ -70,7 +83,7 @@ pub(crate) fn replay_segments_sync(
 		let mut memtables = Vec::new();
 		let mut max_seq: Option<u64> = None;
 		for seg in segments {
-			let (seg_max, batches) = decode_segment_batches(&seg.file_path, seg.id)?;
+			let (seg_max, batches) = decode_segment_batches_with(context, &seg.file_path, seg.id)?;
 			if batches.is_empty() {
 				continue;
 			}
@@ -97,18 +110,19 @@ pub(crate) fn replay_segments_sync(
 		if let Ok(handle) = tokio::runtime::Handle::try_current() {
 			if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
 				return tokio::task::block_in_place(|| {
-					handle.block_on(replay_segments_parallel(segments, arena_size))
+					handle.block_on(replay_segments_parallel(context, segments, arena_size))
 				});
 			}
 		}
 
 		let segs = segments.to_vec();
+		let context = context.clone();
 		std::thread::spawn(move || {
 			let rt = tokio::runtime::Builder::new_current_thread()
 				.enable_all()
 				.build()
 				.map_err(|e| Error::Other(format!("Failed to build temporary runtime: {e}")))?;
-			rt.block_on(replay_segments_parallel(&segs, arena_size))
+			rt.block_on(replay_segments_parallel(&context, &segs, arena_size))
 		})
 		.join()
 		.map_err(|_| Error::Other("WAL parallel recovery thread panicked".to_string()))?
@@ -119,6 +133,7 @@ pub(crate) fn replay_segments_sync(
 /// sequentially into memtables to maintain strict WAL order.
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn replay_segments_parallel(
+	context: &WalContext,
 	segments: &[SegmentRef],
 	arena_size: usize,
 ) -> Result<ParallelReplayResult> {
@@ -131,7 +146,8 @@ pub(crate) async fn replay_segments_parallel(
 	for seg in segments {
 		let path = seg.file_path.clone();
 		let id = seg.id;
-		let task = affinitypool::spawn(move || decode_segment_batches(&path, id));
+		let context = context.clone();
+		let task = affinitypool::spawn(move || decode_segment_batches_with(&context, &path, id));
 		decode_tasks.push(task);
 	}
 
@@ -215,7 +231,8 @@ mod tests {
 			file_path: wal_path,
 		};
 
-		let (max_seq, memtables) = replay_segments_parallel(&[seg], 1024 * 1024).await.unwrap();
+		let (max_seq, memtables) =
+			replay_segments_parallel(&WalContext::plaintext(), &[seg], 1024 * 1024).await.unwrap();
 		assert_eq!(max_seq, Some(10));
 		assert_eq!(memtables.len(), 1);
 

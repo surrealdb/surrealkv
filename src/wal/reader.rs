@@ -11,6 +11,7 @@ use crate::wal::{
 	IOError,
 	RecordType,
 	Result,
+	WalContext,
 	BLOCK_SIZE,
 	HEADER_SIZE as WAL_RECORD_HEADER_SIZE,
 };
@@ -76,21 +77,30 @@ pub(crate) struct Reader {
 
 	/// Whether compression type record has been read
 	compression_type_record_read: bool,
+
+	/// Whether the segment is read as sealed, and under what.
+	// Read by the sealed path of the reader.
+	#[allow(dead_code)]
+	context: WalContext,
 }
 
 impl Reader {
-	/// Creates a new Reader from a File with default settings.
+	/// Creates a new Reader of a plaintext segment from a File with default settings.
+	#[cfg(test)]
 	pub(crate) fn new(file: File) -> Self {
-		Self::with_options(file, None, 0)
+		Self::with_context(file, None, 0, &WalContext::plaintext())
 	}
 
-	/// Creates a new Reader with custom options.
-	pub(crate) fn with_options(
+	/// Creates a reader of the segment `log_number` for a WAL whose segments are as `context`
+	/// says.
+	pub(crate) fn with_context(
 		file: File,
 		reporter: Option<Box<dyn Reporter>>,
 		log_number: u64,
+		context: &WalContext,
 	) -> Self {
 		Reader {
+			context: context.clone(),
 			file,
 			buffer: Box::new([0; BLOCK_SIZE]),
 			buffer_offset: 0,
