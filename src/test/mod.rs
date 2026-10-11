@@ -21,6 +21,8 @@ pub mod block_read_tests;
 #[cfg(test)]
 pub mod block_tests;
 #[cfg(test)]
+pub mod cache_namespace_tests;
+#[cfg(test)]
 pub mod checkpoint_close_tests;
 #[cfg(test)]
 pub mod checkpoint_concurrency_tests;

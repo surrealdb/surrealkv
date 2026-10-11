@@ -775,8 +775,11 @@ pub(crate) struct VLog {
 	/// Cached open file handles for reading
 	pub(crate) file_handles: RwLock<HashMap<u32, Arc<File>>>,
 
-	/// Bumped, under the `file_handles` lock, by every [`reload`](Self::reload): a handle that
-	/// was opened before it belongs to a file that was replaced, and is not cached.
+	/// Replaced, under the `file_handles` lock, by every [`reload`](Self::reload): a handle that
+	/// was opened before it belongs to a file that was replaced, and is not cached. It is drawn
+	/// from the same counter as the identity of a table instance, so that no other log, nor any
+	/// generation of this one, has the same value: logs that are given clones of one `Options`
+	/// share a block cache, and the values of one must not be found under the key of another.
 	generation: AtomicU64,
 
 	/// Options for VLog configuration
@@ -839,7 +842,7 @@ impl VLog {
 			created: Pending::default(),
 			files_map: RwLock::new(HashMap::new()),
 			file_handles: RwLock::new(HashMap::new()),
-			generation: AtomicU64::new(0),
+			generation: AtomicU64::new(crate::cache::next_instance_id()),
 			opts,
 			#[cfg(test)]
 			fail_next_sync: std::sync::atomic::AtomicBool::new(false),
@@ -1024,7 +1027,7 @@ impl VLog {
 			let mut file_handles = self.file_handles.write();
 			files_map.clear();
 			file_handles.clear();
-			self.generation.fetch_add(1, Ordering::SeqCst);
+			self.generation.store(crate::cache::next_instance_id(), Ordering::SeqCst);
 		}
 
 		let highest = self.load_files()?;
@@ -1038,7 +1041,10 @@ impl VLog {
 	}
 
 	/// The key under which the block cache keeps the values of file `file_id` of the log as it is
-	/// now: a reload makes the same file id another file, so it is part of the key.
+	/// now: a reload makes the same file id another file, and another log has files of the same
+	/// ids, so the generation, which is not the generation of any other log, is part of the key.
+	/// The generation takes the upper 32 bits, which a process would need to make over four
+	/// billion tables and logs to fill.
 	pub(crate) fn cache_id(&self, file_id: u32) -> u64 {
 		(self.generation.load(Ordering::SeqCst) << 32) | u64::from(file_id)
 	}
