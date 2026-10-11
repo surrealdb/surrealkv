@@ -203,6 +203,10 @@ jobs:
 
       - name: Install wasm-pack
         uses: jetli/wasm-pack-action@0d096b08b4e5a7de8c28de67e11e945404e9eefa # v0.4.0
+        with:
+          # Pinned: with the default, the action once installed wasm-pack v0.9.1, which does not
+          # accept `--test`, and the browser step failed before it ran any test.
+          version: v0.15.0
 
       - name: Run WASM tests in Browser (Headless Chrome)
         if: matrix.runtime == 'browser'
