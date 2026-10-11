@@ -75,6 +75,8 @@ pub mod level_tests;
 #[cfg(test)]
 pub mod lsm_tests;
 #[cfg(test)]
+pub mod manifest_encryption_tests;
+#[cfg(test)]
 pub mod manifest_missing_tests;
 #[cfg(test)]
 pub mod manifest_tests;

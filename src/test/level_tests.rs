@@ -512,6 +512,7 @@ fn create_test_manifest(levels: Vec<Level>) -> LevelManifest {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	}
 }
 

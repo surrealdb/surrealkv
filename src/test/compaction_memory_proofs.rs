@@ -197,6 +197,7 @@ fn build_l0_store(
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: (num_tables * entries_per_table) as u64,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
