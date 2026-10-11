@@ -702,6 +702,66 @@ fn only_the_newest_file_can_be_set_aside_and_only_for_a_header_that_was_not_comp
 	assert_eq!(snapshot(&opts.vlog_dir()), before);
 }
 
+/// The directory lists its files in an order of its own, so a log that renames the file a crash cut
+/// off as soon as it reaches it renames it before a key that does not fit has been refused, or not,
+/// depending on where the file system puts it. Whichever it is, a log that is refused changes
+/// nothing, and the file is set aside once the log has opened.
+#[test]
+fn a_torn_file_is_set_aside_only_when_every_other_file_has_opened() {
+	for suite in SUITES {
+		let ctx = context(suite);
+		let other_db = Arc::new(EncryptionContext::new(
+			Arc::new(SoftwareKeyManager::new([0x11; 32])),
+			DbId::from_bytes([0xD1; 16]),
+			suite,
+		));
+		let km = Arc::new(SoftwareKeyManager::new([0x11; 32]));
+		km.add_key(2, [0x22; 32]).unwrap();
+		km.set_active_key_id(2).unwrap();
+		km.retire_key(1).unwrap();
+		let retired = Arc::new(EncryptionContext::new(km, db_id(), suite));
+
+		// Nothing, and a part of a header: each is torn when it is the newest file.
+		for torn_len in [0, 50] {
+			let dir = TempDir::new().unwrap();
+			let opts = options(dir.path(), Some(&ctx));
+			let pointers = make_file(&opts, &ctx, 1, &[(b"key", b"value")]);
+			let header = std::fs::read(opts.vlog_file_path(1)).unwrap()[..127].to_vec();
+			std::fs::write(opts.vlog_file_path(2), &header[..torn_len]).unwrap();
+			let before = snapshot(&opts.vlog_dir());
+
+			let refused = [
+				(Some(context_with_root(suite, 0x99)), EncryptionError::WrongKey),
+				(Some(Arc::clone(&other_db)), EncryptionError::DbIdMismatch),
+				(Some(Arc::clone(&retired)), EncryptionError::KeyRetired),
+				(None, EncryptionError::NotConfigured),
+			];
+			for (refusing, expected) in refused {
+				let result = VLog::new(options(dir.path(), refusing.as_ref()));
+				assert_eq!(encryption_error(result), expected, "{suite:?}, {torn_len} bytes");
+				assert_eq!(
+					snapshot(&opts.vlog_dir()),
+					before,
+					"{suite:?}, {torn_len} bytes: a log that was refused changed the directory"
+				);
+			}
+
+			// Opened with the key of the files, the other file is read and the torn one is set
+			// aside.
+			let vlog = VLog::new(Arc::clone(&opts)).unwrap();
+			assert_eq!(vlog.get(&pointers[0]).unwrap(), b"value");
+			assert_eq!(vlog.next_file_id.load(Ordering::SeqCst), 3);
+			let after = snapshot(&opts.vlog_dir());
+			assert_eq!(
+				after.get("00000000000000000002.vlog.torn"),
+				Some(&header[..torn_len].to_vec()),
+				"{suite:?}, {torn_len} bytes: set aside with its bytes"
+			);
+			assert_eq!(after.len(), 2, "the file with an entry and the file that was set aside");
+		}
+	}
+}
+
 #[test]
 fn a_name_the_log_set_aside_is_not_read_as_a_file() {
 	let dir = TempDir::new().unwrap();

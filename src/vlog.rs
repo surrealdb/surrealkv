@@ -1148,6 +1148,8 @@ impl VLog {
 	/// that is sealed and no longer there, so that its id is not used again. Only the newest
 	/// file can be that, and only a header that is incomplete or damaged and is no longer than a
 	/// header counts: whatever fails to authenticate is an error and leaves every file as it is.
+	/// The file is renamed only after every other file has opened, so a log that fails on a key
+	/// that does not fit changes nothing, whichever order the directory lists the files in.
 	fn load_files(&self) -> Result<Option<Newest>> {
 		let entries = match std::fs::read_dir(&self.path) {
 			Ok(entries) => entries,
@@ -1170,6 +1172,10 @@ impl VLog {
 		};
 
 		let mut newest = None;
+		// The newest file, if a crash left it without a complete header. Nothing is renamed until
+		// every other file has opened: the files come in whatever order the directory lists them,
+		// and a log that then fails on a key that does not fit must leave the directory as it was.
+		let mut torn = None;
 		// The order `cleanup_obsolete_files` takes them in
 		let mut files_map = self.files_map.write();
 		let mut file_handles = self.file_handles.write();
@@ -1177,13 +1183,7 @@ impl VLog {
 		for (file_id, file_path, file_size) in found {
 			let is_newest = file_id == newest_id;
 			if is_newest && self.is_torn(&file_path, file_size)? {
-				self.set_aside(file_id, &file_path)?;
-				newest = Some(Newest {
-					id: file_id,
-					path: file_path,
-					sealed: true,
-					present: false,
-				});
+				torn = Some((file_id, file_path));
 				continue;
 			}
 
@@ -1231,6 +1231,17 @@ impl VLog {
 					return Err(Error::Io(Arc::new(e)));
 				}
 			}
+		}
+
+		// Every other file opened, so no key was refused and nothing is in doubt but this file.
+		if let Some((file_id, file_path)) = torn {
+			self.set_aside(file_id, &file_path)?;
+			newest = Some(Newest {
+				id: file_id,
+				path: file_path,
+				sealed: true,
+				present: false,
+			});
 		}
 
 		Ok(newest)
