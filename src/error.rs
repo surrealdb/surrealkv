@@ -235,9 +235,12 @@ pub enum EncryptionError {
 	AuthenticationFailed,
 	/// The file uses a cipher suite this build does not support, or one that is reserved.
 	UnsupportedSuite,
-	/// The file uses an encryption format version this build does not support.
+	/// The file uses an encryption format version, or a feature of the format, that this build
+	/// does not support. A header whose checksum matched but that uses what this version leaves
+	/// unused is reported as this and not as damage.
 	UnsupportedVersion,
-	/// The encryption header is truncated, damaged or not well formed.
+	/// The encryption header is truncated, fails its checksum or is otherwise not well formed.
+	/// A checksum failure is media corruption, which is told apart from a wrong key on purpose.
 	MalformedHeader,
 	/// The key provider could not supply what was asked of it.
 	KeyProvider(KeyProviderFailure),

@@ -152,7 +152,7 @@ mod tests {
 
 	#[test]
 	fn the_reserved_and_unassigned_ids_are_rejected() {
-		// Id 3 belonged to a suite removed before release and must never be handed out again.
+		// Id 3 belonged to a suite that was dropped and must never be handed out again.
 		for id in [0u8, 3, 4, 5, 127, 255] {
 			assert_eq!(
 				CipherSuite::from_id(id).unwrap_err(),

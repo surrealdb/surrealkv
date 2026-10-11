@@ -27,7 +27,9 @@
 //!
 //! The wrapped key length is for a later mode in which a key service wraps the file key and the
 //! wrapped key follows the header. Version 1 has none, so a header with a non-zero length is
-//! refused instead of being read as if the key were derived.
+//! refused as `UnsupportedVersion` instead of being read as if the key were derived. The same goes
+//! for a file kind this build does not know and for reserved bytes that are not zero: the CRC
+//! matched, so they were written on purpose by a later format, and must not be counted as bit rot.
 //!
 //! # Authentication
 //!
@@ -91,7 +93,10 @@ impl CryptoHeader {
 	/// Makes the header of a file whose key was just generated, spending the key's header key.
 	///
 	/// `covered` is whatever else the file wants authenticated along with the header, such as the
-	/// fields of its own header; it is not stored here, and `verify` needs the same bytes.
+	/// fields of its own header; it is not stored here, and `verify` needs the same bytes. It has
+	/// no checksum of its own in this header, so damage in those bytes is reported by `verify` as
+	/// `WrongKey`: a file whose own header can rot must check the checksum of that header before
+	/// calling `verify`, so that bit rot is not mistaken for a wrong key.
 	///
 	/// Fails with `InvalidInput` for a key made for an existing file, and with `PositionReuse`
 	/// if the key's header key was already used.
@@ -128,8 +133,11 @@ impl CryptoHeader {
 	/// Checks, in this order: the magic and a supported version (`UnsupportedVersion`, decided
 	/// before anything else so that a later version may lay out the rest differently), the length
 	/// and the CRC (`MalformedHeader`, media corruption), then a supported suite
-	/// (`UnsupportedSuite`), a known file kind, zero reserved bytes, a zero wrapped key length and
-	/// a non-zero salt (`MalformedHeader`). It never indexes past the input.
+	/// (`UnsupportedSuite`), and a known file kind, zero reserved bytes and a zero wrapped key
+	/// length, each of which is `UnsupportedVersion`: the CRC matched, so the header was written
+	/// that way, by a later version of the format that uses what version 1 leaves unused, and it
+	/// is no sign of media corruption. A zero salt is `MalformedHeader`. It never indexes past the
+	/// input.
 	pub fn decode(bytes: &[u8]) -> Result<Self, EncryptionError> {
 		let mut start = Cursor(bytes);
 		if start.take::<4>()? != HEADER_MAGIC {
@@ -150,16 +158,17 @@ impl CryptoHeader {
 		fields.take::<4>()?; // magic, checked
 		fields.take::<1>()?; // version, checked
 		let suite = CipherSuite::from_id(fields.take::<1>()?[0])?;
-		let file_kind = FileKind::from_id(fields.take::<1>()?[0])?;
+		let file_kind = FileKind::from_id(fields.take::<1>()?[0])
+			.map_err(|_| EncryptionError::UnsupportedVersion)?;
 		if fields.take::<1>()? != [0] {
-			return Err(EncryptionError::MalformedHeader);
+			return Err(EncryptionError::UnsupportedVersion);
 		}
 		let key_id = u32::from_be_bytes(fields.take::<4>()?);
 		if fields.take::<2>()? != [0, 0] {
-			return Err(EncryptionError::MalformedHeader);
+			return Err(EncryptionError::UnsupportedVersion);
 		}
 		if fields.take::<2>()? != [0, 0] {
-			return Err(EncryptionError::MalformedHeader);
+			return Err(EncryptionError::UnsupportedVersion);
 		}
 		let db_id = DbId::from_bytes(fields.take::<DB_ID_LEN>()?);
 		let file_id = u64::from_be_bytes(fields.take::<8>()?);
@@ -449,26 +458,26 @@ mod tests {
 			assert_eq!(decode(&|h| h[6] = kind).unwrap().identity.file_kind, expected);
 		}
 		assert_eq!(decode(&|h| h[6] = 4).unwrap().identity.file_kind, FileKind::Manifest);
+		// What the CRC vouches for and this version does not know is a later format, not bit rot:
+		// a file kind that was never assigned, reserved bytes that are not zero, and a wrapped key.
 		for kind in [0u8, 5, 255] {
 			assert_eq!(
 				decode(&|h| h[6] = kind).unwrap_err(),
-				EncryptionError::MalformedHeader,
+				EncryptionError::UnsupportedVersion,
 				"kind {kind}"
 			);
 		}
-		// Reserved bytes must be zero.
 		for at in [7usize, 14, 15] {
 			assert_eq!(
 				decode(&|h| h[at] = 1).unwrap_err(),
-				EncryptionError::MalformedHeader,
+				EncryptionError::UnsupportedVersion,
 				"reserved byte {at}"
 			);
 		}
-		// A wrapped key length is not something version 1 can read.
 		for at in [12usize, 13] {
 			assert_eq!(
 				decode(&|h| h[at] = 1).unwrap_err(),
-				EncryptionError::MalformedHeader,
+				EncryptionError::UnsupportedVersion,
 				"wrapped length byte {at}"
 			);
 		}
