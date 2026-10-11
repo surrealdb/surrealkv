@@ -246,9 +246,8 @@ pub enum EncryptionError {
 	/// The file is not the file the caller expected: its header names another file kind or id.
 	/// This is what a file that was renamed or copied over another looks like.
 	FileIdMismatch,
-	/// A seal was asked for at a position that is not strictly after the last one sealed with
-	/// the same file key, or with a key that can no longer be used to seal. Sealing there would
-	/// repeat a nonce.
+	/// A seal was asked for at a position that is not strictly after the last one sealed under
+	/// the same file key. Sealing there would repeat a nonce.
 	PositionReuse,
 	/// The caller passed arguments that cannot be sealed or opened, such as a block kind that
 	/// does not belong to the file kind. A programming error, never produced by file contents

@@ -51,6 +51,59 @@ impl CipherSuite {
 			Self::XChaCha20Poly1305 => 16,
 		}
 	}
+
+	/// The suite the library picks when the caller leaves the choice open, given whether the CPU
+	/// has hardware AES: AES-256-GCM if it does, XChaCha20-Poly1305 if not, since AES without
+	/// hardware support is both slow and harder to make constant-time.
+	pub const fn for_hardware_aes(hardware_aes: bool) -> Self {
+		if hardware_aes {
+			Self::Aes256Gcm
+		} else {
+			Self::XChaCha20Poly1305
+		}
+	}
+
+	/// The suite for a new database when the caller leaves the choice open, resolved for the CPU
+	/// this runs on.
+	///
+	/// Call it once, when the database is created, and persist the result: the answer depends on
+	/// the machine, so it must never be asked again for an existing database, whose files stay in
+	/// the suite they were written with. On WebAssembly it is always XChaCha20-Poly1305.
+	pub fn resolve_auto() -> Self {
+		Self::for_hardware_aes(hardware_aes_available())
+	}
+}
+
+/// Whether this CPU has the instructions AES-256-GCM needs to be fast and constant-time: AES
+/// rounds and carry-less multiplication for GHASH. Detected at run time on x86, x86-64 and
+/// aarch64, always true on Apple's aarch64 and always false elsewhere, which includes
+/// WebAssembly.
+pub fn hardware_aes_available() -> bool {
+	detect_hardware_aes()
+}
+
+#[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+fn detect_hardware_aes() -> bool {
+	std::arch::is_x86_feature_detected!("aes") && std::arch::is_x86_feature_detected!("pclmulqdq")
+}
+
+// Every aarch64 CPU Apple has made implements the AES and polynomial multiply instructions, so
+// there is nothing to detect and no reliance on the standard library's detection support on each
+// of Apple's operating systems.
+#[cfg(all(target_arch = "aarch64", target_vendor = "apple"))]
+fn detect_hardware_aes() -> bool {
+	true
+}
+
+#[cfg(all(target_arch = "aarch64", not(target_vendor = "apple")))]
+fn detect_hardware_aes() -> bool {
+	std::arch::is_aarch64_feature_detected!("aes")
+		&& std::arch::is_aarch64_feature_detected!("pmull")
+}
+
+#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+fn detect_hardware_aes() -> bool {
+	false
 }
 
 #[cfg(test)]
@@ -76,6 +129,23 @@ mod tests {
 				"id {id}"
 			);
 		}
+	}
+
+	#[test]
+	fn auto_picks_aes_only_with_hardware_support() {
+		assert_eq!(CipherSuite::for_hardware_aes(true), CipherSuite::Aes256Gcm);
+		assert_eq!(CipherSuite::for_hardware_aes(false), CipherSuite::XChaCha20Poly1305);
+		// The resolver is the same rule applied to this machine, and answers the same every time.
+		let resolved = CipherSuite::resolve_auto();
+		assert_eq!(resolved, CipherSuite::for_hardware_aes(hardware_aes_available()));
+		assert_eq!(resolved, CipherSuite::resolve_auto());
+	}
+
+	#[test]
+	#[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
+	fn targets_without_aes_instructions_resolve_to_xchacha() {
+		assert!(!hardware_aes_available());
+		assert_eq!(CipherSuite::resolve_auto(), CipherSuite::XChaCha20Poly1305);
 	}
 
 	#[test]

@@ -10,16 +10,34 @@
 //!
 //! A [`KeyManager`] hands out one 32 byte root key per key id and says which ids may still be
 //! used. Roots are never used to encrypt data: the engine mixes each root with a fresh random
-//! salt and the identity of the file into a key of its own for every file, so two files never
-//! share a key whatever a manager returns.
+//! salt and the identity of the file into a key of its own for every file ([`FileKey`]), so two
+//! files never share a key whatever a manager returns.
+//!
+//! # Blocks
+//!
+//! A [`FileCipher`] is built from a file key and seals or opens the blocks of that file in place
+//! with a detached tag. Each block is bound, through its associated data, to the database, the
+//! kind and id of the file, the key id, its position and what it holds ([`BlockContext`]), and
+//! its nonce is derived from its position. A cipher refuses to seal at a position that is not
+//! after the last one it sealed, and only a cipher built from a freshly generated key can seal at
+//! all. The exact layouts are documented on [`BlockContext::aad`] and in the module that holds
+//! them.
 
+mod cipher;
+mod identity;
+mod kdf;
 mod keys;
+mod random;
 mod suite;
 #[cfg(test)]
 mod testutil;
 
+pub use cipher::{BlockContext, BlockKind, FileCipher, AAD_LEN, TAG_LEN};
+pub use identity::{DbId, FileIdentity, FileKind, DB_ID_LEN};
+pub use kdf::{FileKey, FILE_KEY_LEN};
 pub use keys::{KeyManager, KeyState, SoftwareKeyManager, ROOT_KEY_LEN};
-pub use suite::CipherSuite;
+pub use random::{fresh_salt, SALT_LEN};
+pub use suite::{hardware_aes_available, CipherSuite};
 
 /// The key id a [`SoftwareKeyManager`] gives the key it is created with.
 pub const KEY_ID_DEFAULT: u32 = 1;

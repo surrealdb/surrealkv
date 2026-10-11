@@ -1,0 +1,457 @@
+//! The key of one file, derived from a root key, a fresh salt and the identity of the file.
+//!
+//! The engine owns key uniqueness, not the key manager. Whatever root a manager returns, even
+//! the same bytes for every id, a file key is
+//!
+//! ```text
+//! HKDF-SHA256(ikm = root, salt = salt32, info = LABEL || suite(1) || file_kind(1)
+//!                                              || key_id(4, BE) || file_id(8, BE) || db_id(16))
+//! ```
+//!
+//! with `LABEL = "surrealkv/tde/v1/dek"`, expanded to 32 bytes. The salt is drawn from the OS
+//! random number generator for every writer, so two files never share a key unless the
+//! generator fails.
+
+use std::fmt;
+
+use hkdf::Hkdf;
+use sha2::Sha256;
+use zeroize::Zeroizing;
+
+use super::identity::{DbId, FileIdentity, FileKind, DB_ID_LEN};
+use super::keys::{KeyManager, KeyState, ROOT_KEY_LEN};
+use super::random::{fresh_salt, SALT_LEN};
+use super::suite::CipherSuite;
+use crate::error::EncryptionError;
+
+/// Length in bytes of a file key.
+pub const FILE_KEY_LEN: usize = 32;
+
+/// Context label of the key that seals a file's data.
+const DEK_LABEL: &[u8] = b"surrealkv/tde/v1/dek";
+
+/// Length of the `info` input: the label, suite, file kind, key id, file id and database id.
+const INFO_LEN: usize = DEK_LABEL.len() + 1 + 1 + 4 + 8 + DB_ID_LEN;
+
+/// The key of one file, and the identity and salt it was derived for.
+///
+/// Single-use on purpose: it is not `Clone` and is consumed by `FileCipher::new`. Only a key
+/// made by [`generate`](Self::generate), which draws the salt itself, can be used to seal; a
+/// key rebuilt from an existing file's header can only open, because sealing with it would
+/// start a new nonce sequence under a key that has already been used.
+///
+/// It prints no key material.
+pub struct FileKey {
+	identity: FileIdentity,
+	salt: [u8; SALT_LEN],
+	dek: Zeroizing<[u8; FILE_KEY_LEN]>,
+	can_seal: bool,
+}
+
+impl fmt::Debug for FileKey {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("FileKey")
+			.field("identity", &self.identity)
+			.field("can_seal", &self.can_seal)
+			.finish_non_exhaustive()
+	}
+}
+
+impl FileKey {
+	/// The key for a file that is about to be written, under the manager's active key.
+	///
+	/// Draws a fresh salt from the OS random number generator, which is why a key made here can
+	/// seal. Fails with `KeyRetired` if the active key is not in the active state, with
+	/// `UnknownKeyId` if the manager does not know it, with whatever `root_key` fails with, and
+	/// with `KeyProvider(RandomSource)` if no salt could be drawn.
+	pub fn generate(
+		key_manager: &dyn KeyManager,
+		db_id: DbId,
+		suite: CipherSuite,
+		file_kind: FileKind,
+		file_id: u64,
+	) -> Result<Self, EncryptionError> {
+		let key_id = key_manager.active_key_id();
+		match key_manager.key_state(key_id) {
+			KeyState::Active => {}
+			KeyState::DecryptOnly | KeyState::Retired => return Err(EncryptionError::KeyRetired),
+			KeyState::Unknown => return Err(EncryptionError::UnknownKeyId),
+		}
+		let root = key_manager.root_key(key_id)?;
+		let salt = fresh_salt()?;
+		let identity = FileIdentity::new(suite, file_kind, key_id, file_id, db_id);
+		Self::derive(&root, salt, identity, true)
+	}
+
+	/// The key of an existing file, from the identity and salt its header records, which can
+	/// open the file but not seal anything.
+	///
+	/// Fails with `UnknownKeyId` or `KeyRetired` if the key the file names cannot be used to
+	/// read, with `MalformedHeader` for an all-zero salt, and with whatever `root_key` fails
+	/// with. A key that was derived from a header that does not belong to the file is not
+	/// detected here: that is what authenticating the header is for.
+	pub fn for_reading(
+		key_manager: &dyn KeyManager,
+		identity: FileIdentity,
+		salt: [u8; SALT_LEN],
+	) -> Result<Self, EncryptionError> {
+		if salt.iter().all(|&byte| byte == 0) {
+			return Err(EncryptionError::MalformedHeader);
+		}
+		match key_manager.key_state(identity.key_id) {
+			KeyState::Active | KeyState::DecryptOnly => {}
+			KeyState::Retired => return Err(EncryptionError::KeyRetired),
+			KeyState::Unknown => return Err(EncryptionError::UnknownKeyId),
+		}
+		let root = key_manager.root_key(identity.key_id)?;
+		Self::derive(&root, salt, identity, false)
+	}
+
+	/// The identity the key was derived for.
+	pub const fn identity(&self) -> FileIdentity {
+		self.identity
+	}
+
+	/// The salt the key was derived with, which goes into the file header.
+	pub const fn salt(&self) -> &[u8; SALT_LEN] {
+		&self.salt
+	}
+
+	/// Whether a cipher made from this key may seal.
+	pub const fn can_seal(&self) -> bool {
+		self.can_seal
+	}
+
+	/// Splits the key for `FileCipher::new`, which is the only thing allowed to use it.
+	pub(super) fn into_parts(self) -> (FileIdentity, Zeroizing<[u8; FILE_KEY_LEN]>, bool) {
+		(self.identity, self.dek, self.can_seal)
+	}
+
+	fn derive(
+		root: &[u8; ROOT_KEY_LEN],
+		salt: [u8; SALT_LEN],
+		identity: FileIdentity,
+		can_seal: bool,
+	) -> Result<Self, EncryptionError> {
+		let hkdf = Hkdf::<Sha256>::new(Some(&salt), root);
+		let mut dek = Zeroizing::new([0u8; FILE_KEY_LEN]);
+		// Expanding to 32 bytes is far below the 255 blocks HKDF allows, so this does not fail;
+		// it is an error rather than a panic because nothing derived from a failed expansion may
+		// be used.
+		hkdf.expand(&info(DEK_LABEL, &identity), &mut *dek)
+			.map_err(|_| EncryptionError::InvalidInput("the file key could not be derived"))?;
+		Ok(Self {
+			identity,
+			salt,
+			dek,
+			can_seal,
+		})
+	}
+
+	/// The key derived from an explicit root and salt, so tests can compare against vectors.
+	#[cfg(test)]
+	pub(crate) fn derive_for_test(
+		root: &[u8; ROOT_KEY_LEN],
+		salt: [u8; SALT_LEN],
+		identity: FileIdentity,
+		can_seal: bool,
+	) -> Self {
+		Self::derive(root, salt, identity, can_seal).unwrap()
+	}
+
+	/// A copy of the file key, for tests that compare keys or look for them in output.
+	#[cfg(test)]
+	pub(crate) fn dek_for_test(&self) -> [u8; FILE_KEY_LEN] {
+		*self.dek
+	}
+}
+
+/// The HKDF `info` input: `label || suite(1) || file_kind(1) || key_id(4, BE) || file_id(8, BE) ||
+/// db_id(16)`.
+fn info(label: &[u8], identity: &FileIdentity) -> Vec<u8> {
+	let mut info = Vec::with_capacity(INFO_LEN);
+	info.extend_from_slice(label);
+	info.push(identity.suite.id());
+	info.push(identity.file_kind.id());
+	info.extend_from_slice(&identity.key_id.to_be_bytes());
+	info.extend_from_slice(&identity.file_id.to_be_bytes());
+	info.extend_from_slice(identity.db_id.as_bytes());
+	info
+}
+
+#[cfg(test)]
+mod tests {
+	use std::collections::HashMap;
+
+	use super::*;
+	use crate::tde::testutil::assert_leaks_no_bytes;
+	use crate::tde::SoftwareKeyManager;
+
+	const ROOT: [u8; ROOT_KEY_LEN] = {
+		let mut root = [0u8; ROOT_KEY_LEN];
+		let mut i = 0;
+		while i < ROOT_KEY_LEN {
+			root[i] = i as u8;
+			i += 1;
+		}
+		root
+	};
+
+	const SALT: [u8; SALT_LEN] = {
+		let mut salt = [0u8; SALT_LEN];
+		let mut i = 0;
+		while i < SALT_LEN {
+			salt[i] = 0x20 + i as u8;
+			i += 1;
+		}
+		salt
+	};
+
+	fn db_id() -> DbId {
+		DbId::from_bytes(std::array::from_fn(|i| 0xA0 + i as u8))
+	}
+
+	fn identity_a() -> FileIdentity {
+		FileIdentity::new(CipherSuite::Aes256Gcm, FileKind::Sst, 7, 0x0102_0304_0506_0708, db_id())
+	}
+
+	fn identity_b() -> FileIdentity {
+		FileIdentity::new(
+			CipherSuite::XChaCha20Poly1305,
+			FileKind::Wal,
+			0x0102_0304,
+			0x1112_1314_1516_1718,
+			db_id(),
+		)
+	}
+
+	fn hex(bytes: &[u8]) -> String {
+		bytes.iter().map(|b| format!("{b:02x}")).collect()
+	}
+
+	#[test]
+	fn the_info_input_is_the_label_then_the_identity_in_big_endian() {
+		// Written out byte by byte, independently of `info`: the label, the suite, the file
+		// kind, the key id, the file id and the database id.
+		let mut expected = b"surrealkv/tde/v1/dek".to_vec();
+		expected.extend_from_slice(&[0x01, 0x01]);
+		expected.extend_from_slice(&[0x00, 0x00, 0x00, 0x07]);
+		expected.extend_from_slice(&[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+		expected.extend_from_slice(&(0xA0u8..0xB0).collect::<Vec<_>>());
+		assert_eq!(info(DEK_LABEL, &identity_a()), expected);
+		assert_eq!(expected.len(), INFO_LEN);
+		assert_eq!(INFO_LEN, 50);
+	}
+
+	// Expected values from an independent HKDF-SHA256 written with Python's `hmac` and
+	// `hashlib` (checked against RFC 5869 test case 1): `PRK = HMAC(salt, root)`,
+	// `OKM = HMAC(PRK, info || 0x01)`, with root bytes 00..1f, salt bytes 20..3f and database
+	// id bytes a0..af.
+	#[test]
+	fn the_file_key_matches_independently_computed_hkdf_vectors() {
+		let a = FileKey::derive_for_test(&ROOT, SALT, identity_a(), true);
+		assert_eq!(
+			hex(&a.dek_for_test()),
+			"d3a5ed5726eeb620450fb06ddc47108429797b14203abf18727421ddd1af4064"
+		);
+		let b = FileKey::derive_for_test(&ROOT, SALT, identity_b(), true);
+		assert_eq!(
+			hex(&b.dek_for_test()),
+			"012d010e7f0155632efd20c9a6db17348ddef98976eda0e9a2f67b2b04a612bb"
+		);
+	}
+
+	#[test]
+	fn every_field_of_the_identity_and_the_salt_and_the_root_changes_the_key() {
+		let base = FileKey::derive_for_test(&ROOT, SALT, identity_a(), true).dek_for_test();
+		let id = identity_a();
+		let mut other_db = *id.db_id.as_bytes();
+		other_db[15] ^= 1;
+		let variants = [
+			FileIdentity {
+				suite: CipherSuite::XChaCha20Poly1305,
+				..id
+			},
+			FileIdentity {
+				file_kind: FileKind::Vlog,
+				..id
+			},
+			FileIdentity {
+				key_id: 8,
+				..id
+			},
+			FileIdentity {
+				file_id: id.file_id + 1,
+				..id
+			},
+			FileIdentity {
+				db_id: DbId::from_bytes(other_db),
+				..id
+			},
+		];
+		for (i, variant) in variants.into_iter().enumerate() {
+			let derived = FileKey::derive_for_test(&ROOT, SALT, variant, true).dek_for_test();
+			assert_ne!(derived, base, "identity variant {i} left the key unchanged");
+		}
+		let mut salt = SALT;
+		salt[0] ^= 1;
+		assert_ne!(FileKey::derive_for_test(&ROOT, salt, id, true).dek_for_test(), base);
+		let mut root = ROOT;
+		root[31] ^= 1;
+		assert_ne!(FileKey::derive_for_test(&root, SALT, id, true).dek_for_test(), base);
+		// Whether the key may seal is not an input.
+		assert_eq!(FileKey::derive_for_test(&ROOT, SALT, id, false).dek_for_test(), base);
+	}
+
+	/// A manager that is as hostile as the trait allows: one root for every key id, and
+	/// nothing about the files it is asked for.
+	struct ConstantRoot {
+		active: u32,
+	}
+
+	impl KeyManager for ConstantRoot {
+		fn active_key_id(&self) -> u32 {
+			self.active
+		}
+
+		fn key_state(&self, _key_id: u32) -> KeyState {
+			KeyState::Active
+		}
+
+		fn root_key(&self, _key_id: u32) -> Result<Zeroizing<[u8; ROOT_KEY_LEN]>, EncryptionError> {
+			Ok(Zeroizing::new([0x42; ROOT_KEY_LEN]))
+		}
+	}
+
+	#[test]
+	fn a_manager_returning_a_constant_root_still_yields_distinct_file_keys() {
+		let km = ConstantRoot {
+			active: 1,
+		};
+		let mut seen = HashMap::new();
+		for round in 0..4 {
+			// The same file identity every time: only the salt the engine draws can differ.
+			let key =
+				FileKey::generate(&km, db_id(), CipherSuite::Aes256Gcm, FileKind::Sst, 9).unwrap();
+			let previous = seen.insert(key.dek_for_test(), *key.salt());
+			assert!(previous.is_none(), "round {round} repeated a file key");
+		}
+		// A second key id under the same constant root gives yet another key, even for the same
+		// salt, because the key id is part of the derivation.
+		let one = FileKey::derive_for_test(
+			&[0x42; ROOT_KEY_LEN],
+			SALT,
+			FileIdentity::new(CipherSuite::Aes256Gcm, FileKind::Sst, 1, 9, db_id()),
+			true,
+		);
+		let two = FileKey::derive_for_test(
+			&[0x42; ROOT_KEY_LEN],
+			SALT,
+			FileIdentity::new(CipherSuite::Aes256Gcm, FileKind::Sst, 2, 9, db_id()),
+			true,
+		);
+		assert_ne!(one.dek_for_test(), two.dek_for_test());
+	}
+
+	#[test]
+	fn generate_draws_a_fresh_non_zero_salt_each_time() {
+		let km = SoftwareKeyManager::new([0x11; ROOT_KEY_LEN]);
+		let first =
+			FileKey::generate(&km, db_id(), CipherSuite::Aes256Gcm, FileKind::Wal, 3).unwrap();
+		let second =
+			FileKey::generate(&km, db_id(), CipherSuite::Aes256Gcm, FileKind::Wal, 3).unwrap();
+		assert_ne!(first.salt(), second.salt());
+		assert_ne!(first.salt(), &[0u8; SALT_LEN]);
+		assert!(first.can_seal() && second.can_seal());
+		assert_eq!(first.identity().key_id, 1);
+		assert_eq!(first.identity().file_id, 3);
+		assert_eq!(first.identity().db_id, db_id());
+	}
+
+	#[test]
+	fn generate_only_writes_under_an_active_key() {
+		let km = SoftwareKeyManager::new([0x11; ROOT_KEY_LEN]);
+		km.add_key(2, [0x22; ROOT_KEY_LEN]).unwrap();
+		let generate = |km: &dyn KeyManager| {
+			FileKey::generate(km, db_id(), CipherSuite::Aes256Gcm, FileKind::Sst, 1)
+				.map(|key| key.identity().key_id)
+		};
+		assert_eq!(generate(&km).unwrap(), 1);
+		km.set_active_key_id(2).unwrap();
+		assert_eq!(generate(&km).unwrap(), 2);
+
+		/// A manager whose active key id is in the given state, whatever the id.
+		struct Stuck(KeyState);
+		impl KeyManager for Stuck {
+			fn active_key_id(&self) -> u32 {
+				1
+			}
+
+			fn key_state(&self, _key_id: u32) -> KeyState {
+				self.0
+			}
+
+			fn root_key(
+				&self,
+				_key_id: u32,
+			) -> Result<Zeroizing<[u8; ROOT_KEY_LEN]>, EncryptionError> {
+				Ok(Zeroizing::new([0x55; ROOT_KEY_LEN]))
+			}
+		}
+		assert_eq!(
+			generate(&Stuck(KeyState::DecryptOnly)).unwrap_err(),
+			EncryptionError::KeyRetired
+		);
+		assert_eq!(generate(&Stuck(KeyState::Retired)).unwrap_err(), EncryptionError::KeyRetired);
+		assert_eq!(generate(&Stuck(KeyState::Unknown)).unwrap_err(), EncryptionError::UnknownKeyId);
+	}
+
+	#[test]
+	fn a_key_rebuilt_for_reading_equals_the_writers_key_but_cannot_seal() {
+		let km = SoftwareKeyManager::new([0x11; ROOT_KEY_LEN]);
+		let writer =
+			FileKey::generate(&km, db_id(), CipherSuite::XChaCha20Poly1305, FileKind::Vlog, 12)
+				.unwrap();
+		let reader = FileKey::for_reading(&km, writer.identity(), *writer.salt()).unwrap();
+		assert_eq!(reader.dek_for_test(), writer.dek_for_test());
+		assert_eq!(reader.identity(), writer.identity());
+		assert_eq!(reader.salt(), writer.salt());
+		assert!(writer.can_seal());
+		assert!(!reader.can_seal());
+	}
+
+	#[test]
+	fn for_reading_refuses_what_it_cannot_read() {
+		let km = SoftwareKeyManager::new([0x11; ROOT_KEY_LEN]);
+		km.add_key(2, [0x22; ROOT_KEY_LEN]).unwrap();
+		km.retire_key(2).unwrap();
+		km.add_key(3, [0x33; ROOT_KEY_LEN]).unwrap();
+		let identity =
+			|key_id| FileIdentity::new(CipherSuite::Aes256Gcm, FileKind::Sst, key_id, 5, db_id());
+
+		// A decrypt-only key reads fine.
+		FileKey::for_reading(&km, identity(3), SALT).unwrap();
+		assert_eq!(
+			FileKey::for_reading(&km, identity(2), SALT).unwrap_err(),
+			EncryptionError::KeyRetired
+		);
+		assert_eq!(
+			FileKey::for_reading(&km, identity(9), SALT).unwrap_err(),
+			EncryptionError::UnknownKeyId
+		);
+		assert_eq!(
+			FileKey::for_reading(&km, identity(1), [0; SALT_LEN]).unwrap_err(),
+			EncryptionError::MalformedHeader
+		);
+	}
+
+	#[test]
+	fn a_file_key_prints_no_key_material() {
+		let key = FileKey::derive_for_test(&ROOT, SALT, identity_a(), true);
+		let secret = key.dek_for_test();
+		for text in [format!("{key:?}"), format!("{key:#?}")] {
+			assert_leaks_no_bytes(&text, &[&secret, &ROOT]);
+			assert!(text.contains("FileKey"), "{text}");
+		}
+	}
+}
