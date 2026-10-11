@@ -5,6 +5,7 @@ use crc32fast::Hasher;
 use lz4_flex::block::{compress_into, get_maximum_output_size};
 
 use super::{
+	sealed,
 	segment_held,
 	sync_poisoned,
 	BufferedFileWriter,
@@ -18,6 +19,18 @@ use super::{
 	BLOCK_SIZE,
 	HEADER_SIZE,
 };
+use crate::tde::{FileCipher, TAG_LEN};
+
+/// What a writer of a sealed segment seals its batches with.
+struct Sealer {
+	/// The cipher of the segment. It cannot be cloned, and no other cipher of the segment can
+	/// seal: the key is made for one writer.
+	cipher: FileCipher,
+
+	/// The index of the next batch of the segment, which is also the position it is sealed at. It
+	/// moves on before a batch is sealed and is never given back, whatever happens to the batch.
+	next_index: u64,
+}
 
 /// Writer for WAL records.
 pub struct Writer {
@@ -43,6 +56,9 @@ pub struct Writer {
 	/// number hold records of unknown durability, so the writer refuses every append and sync
 	/// until the memtables tagged with them are in tables and the hold is released.
 	held: Option<u64>,
+
+	/// What seals the batches of the segment, if the segment is sealed.
+	sealer: Option<Sealer>,
 }
 
 impl Writer {
@@ -65,7 +81,44 @@ impl Writer {
 			compression_type,
 			poisoned: false,
 			held: None,
+			sealer: None,
 		}
+	}
+
+	/// Starts a sealed segment on the new, empty file behind `dest`: writes its header record, and
+	/// makes it durable before the writer is returned, so that no batch is appended, and none can
+	/// be acknowledged, to a segment whose header may not survive a crash.
+	///
+	/// `header` and `cipher` come from `sealed::new_header`, which draws the salt: a segment never
+	/// reuses one. If anything here fails the file is the caller's to dispose of; nothing was
+	/// sealed under its key.
+	pub(crate) fn start_sealed(
+		dest: BufferedFileWriter,
+		header: &[u8; sealed::HEADER_PAYLOAD_LEN],
+		cipher: FileCipher,
+		compression_type: CompressionType,
+	) -> Result<Self> {
+		let mut writer = Self::new(dest, false, compression_type, 0);
+		writer.sealer = Some(Sealer {
+			cipher,
+			next_index: sealed::FIRST_INDEX,
+		});
+		writer.emit_physical_record(RecordType::SegmentHeader, header)?;
+		writer.write_buffer()?;
+		writer.dest.sync()?;
+		Ok(writer)
+	}
+
+	/// Test-only: the index that the next batch of a sealed segment is sealed at.
+	#[cfg(test)]
+	pub(crate) fn next_index(&self) -> Option<u64> {
+		self.sealer.as_ref().map(|sealer| sealer.next_index)
+	}
+
+	/// Test-only: the smallest position that the cipher of a sealed segment would still seal.
+	#[cfg(test)]
+	pub(crate) fn cipher_next_position(&self) -> Option<u64> {
+		self.sealer.as_ref().map(|sealer| sealer.cipher.next_position())
 	}
 
 	/// Makes the write after the next `ops` of them fail once (see
@@ -133,6 +186,9 @@ impl Writer {
 	/// - Ok(()) if successful.
 	/// - Err if an I/O error occurs.
 	pub fn add_record(&mut self, slice: &[u8]) -> Result<()> {
+		if self.sealer.is_some() {
+			return self.add_sealed(slice, &[slice.len()]);
+		}
 		let compressed = self.compress_records(slice, &[slice.len()])?;
 		let slice = compressed.as_ref().map_or(slice, |(blocks, _)| &blocks[..]);
 		self.guard_append(|writer| writer.write_record(slice))
@@ -153,6 +209,9 @@ impl Writer {
 	/// block, fails the call before anything is appended: the segment is untouched and the writer
 	/// is not poisoned.
 	pub fn add_records(&mut self, buf: &[u8], ends: &[usize]) -> Result<()> {
+		if self.sealer.is_some() {
+			return self.add_sealed(buf, ends);
+		}
 		let compressed = self.compress_records(buf, ends)?;
 		let (buf, ends) =
 			compressed.as_ref().map_or((buf, ends), |(blocks, ends)| (&blocks[..], &ends[..]));
@@ -171,6 +230,81 @@ impl Writer {
 			}
 			Ok(())
 		})
+	}
+
+	/// Adds batches to a sealed segment, `buf[ends[i - 1]..ends[i]]` being batch `i`: each is
+	/// compressed if the segment is, sealed as a message of its own with the next index, and the
+	/// sealed records are framed and appended together, as the plaintext ones are.
+	///
+	/// Nothing is sealed in a writer that cannot append. A batch that cannot be compressed fails
+	/// the call before an index is taken, like a plaintext one, and so does an allocation that is
+	/// refused. From the first index on, every failure ends the writer: an index that was taken is
+	/// never taken again, and a segment never gets a second batch under an index that a failed
+	/// append may have left in the file, so the next batch goes to a segment of its own, under a
+	/// salt of its own. If the append fails after the sealing, the segment is cut back as a
+	/// plaintext one is, so that the batches that were not acknowledged are not in it; the indices
+	/// are used up all the same.
+	fn add_sealed(&mut self, buf: &[u8], ends: &[usize]) -> Result<()> {
+		self.check_writable()?;
+		let compressed = self.compress_records(buf, ends)?;
+		let (buf, ends) =
+			compressed.as_ref().map_or((buf, ends), |(blocks, ends)| (&blocks[..], &ends[..]));
+		let (sealed, sealed_ends) = self.seal_records(buf, ends)?;
+		self.guard_append(|writer| {
+			debug_assert!(writer.dest.is_flushed());
+			let mut start = 0;
+			for &end in &sealed_ends {
+				writer.write_record_unflushed(&sealed[start..end])?;
+				start = end;
+			}
+			if !writer.manual_flush {
+				writer.write_buffer()?;
+			}
+			Ok(())
+		})
+	}
+
+	/// Seals the records of `buf` (`buf[ends[i - 1]..ends[i]]` being record `i`) one by one, at
+	/// consecutive indices, into one buffer with where each sealed record ends.
+	///
+	/// The room is reserved first, exactly and fallibly, so the sealing itself allocates nothing
+	/// and a refused allocation fails the call with no index taken. Every index is taken before the
+	/// record is sealed with it, and a record that cannot be sealed ends the writer.
+	fn seal_records(&mut self, buf: &[u8], ends: &[usize]) -> Result<(Vec<u8>, Vec<usize>)> {
+		let compression = self.compression_type;
+		let Some(sealer) = self.sealer.as_mut() else {
+			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "the segment is not sealed")));
+		};
+
+		let total = ends
+			.len()
+			.checked_mul(TAG_LEN)
+			.and_then(|tags| tags.checked_add(buf.len()))
+			.ok_or_else(record_too_long)?;
+		let mut sealed = Vec::new();
+		sealed.try_reserve_exact(total).map_err(|e| Error::from(io::Error::from(e)))?;
+		let mut sealed_ends = Vec::new();
+		sealed_ends.try_reserve_exact(ends.len()).map_err(|e| Error::from(io::Error::from(e)))?;
+
+		let mut start = 0;
+		for &end in ends {
+			let index = sealer.next_index;
+			sealer.next_index = index.saturating_add(1);
+
+			let from = sealed.len();
+			sealed.extend_from_slice(&buf[start..end]);
+			start = end;
+			let at = sealed::record_context(index, compression);
+			match sealer.cipher.seal_detached(&at, &mut sealed[from..]) {
+				Ok(tag) => sealed.extend_from_slice(&tag),
+				Err(e) => {
+					self.poisoned = true;
+					return Err(e.into());
+				}
+			}
+			sealed_ends.push(sealed.len());
+		}
+		Ok((sealed, sealed_ends))
 	}
 
 	fn write_record(&mut self, slice: &[u8]) -> Result<()> {
@@ -335,18 +469,7 @@ impl Writer {
 	/// A segment whose fsync failed takes no append either, and neither does a held one. The
 	/// refusal comes first, so it cuts nothing and poisons nothing.
 	fn guard_append<T>(&mut self, append: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
-		if self.held.is_some() {
-			return Err(segment_held());
-		}
-		if self.dest.sync_failed() {
-			return Err(sync_poisoned());
-		}
-		if self.poisoned {
-			return Err(Error::IO(IOError::new(
-				io::ErrorKind::Other,
-				"WAL writer is poisoned by an earlier failed append",
-			)));
-		}
+		self.check_writable()?;
 
 		// With bytes still buffered the file is shorter than the writer's length, and
 		// cutting it there would extend it.
@@ -368,6 +491,24 @@ impl Writer {
 			}
 		}
 		result
+	}
+
+	/// Whether the writer takes an append: it is not held, no fsync of the segment failed and no
+	/// append did. The refusals come in this order, and none of them touches the segment.
+	fn check_writable(&self) -> Result<()> {
+		if self.held.is_some() {
+			return Err(segment_held());
+		}
+		if self.dest.sync_failed() {
+			return Err(sync_poisoned());
+		}
+		if self.poisoned {
+			return Err(Error::IO(IOError::new(
+				io::ErrorKind::Other,
+				"WAL writer is poisoned by an earlier failed append",
+			)));
+		}
+		Ok(())
 	}
 
 	/// Switches to a new block if there's not enough space for a header.

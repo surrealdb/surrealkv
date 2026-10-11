@@ -172,7 +172,11 @@ impl From<io::Error> for Error {
 
 impl From<crate::wal::Error> for Error {
 	fn from(err: crate::wal::Error) -> Self {
-		Error::Wal(err.to_string())
+		match err {
+			// Keeps its type: whoever handles it must tell a key from damage.
+			crate::wal::Error::Encryption(err) => Error::Encryption(err),
+			err => Error::Wal(err.to_string()),
+		}
 	}
 }
 

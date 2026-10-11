@@ -2,8 +2,12 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::vec::Vec;
 
+use crate::error::EncryptionError;
+use crate::tde::FileCipher;
+use crate::vfs::File as VfsFile;
 use crate::wal::{
 	calculate_crc32,
+	sealed,
 	validate_record_type,
 	CompressionType,
 	CorruptionError,
@@ -28,6 +32,26 @@ pub trait Reporter {
 	/// - `reason`: Description of the corruption
 	/// - `log_number`: The log number where corruption was found
 	fn corruption(&mut self, bytes: usize, reason: &str, log_number: u64);
+}
+
+/// What a reader of a sealed segment knows once it has read and authenticated the header of the
+/// segment.
+struct SealedSegment {
+	/// Opens the batches of the segment. It cannot seal.
+	cipher: FileCipher,
+
+	/// How the batches of the segment were compressed before they were sealed.
+	compression: CompressionType,
+
+	/// The index of the last batch that was read, 0 before the first: the position the next one is
+	/// opened at is one more. The reader counts, because the index is not stored.
+	index: u64,
+}
+
+/// An error that says the bytes are not what a writer wrote, as a torn write leaves them: the
+/// reader reports it as corruption, which recovery may repair if nothing valid follows it.
+fn physical(what: &str) -> Error {
+	Error::IO(IOError::new(io::ErrorKind::Other, what))
 }
 
 /// Reader reads records from a single WAL file using block-based buffering.
@@ -79,9 +103,13 @@ pub(crate) struct Reader {
 	compression_type_record_read: bool,
 
 	/// Whether the segment is read as sealed, and under what.
-	// Read by the sealed path of the reader.
-	#[allow(dead_code)]
 	context: WalContext,
+
+	/// The header of the segment, once it is read: only a sealed segment has one.
+	sealed: Option<SealedSegment>,
+
+	/// Where in the file the physical record that was last looked at begins.
+	record_start: usize,
 }
 
 impl Reader {
@@ -101,6 +129,8 @@ impl Reader {
 	) -> Self {
 		Reader {
 			context: context.clone(),
+			sealed: None,
+			record_start: 0,
 			file,
 			buffer: Box::new([0; BLOCK_SIZE]),
 			buffer_offset: 0,
@@ -215,6 +245,38 @@ impl Reader {
 					}
 				}
 
+				// A key, a tag that fails, or a record that was written on purpose and that a
+				// writer of the segment does not write: not damage, so never
+				// reported as corruption, which is what recovery repairs.
+				if e.is_integrity_failure() {
+					self.err = Some(e.clone());
+					return Err(e);
+				}
+
+				// Damage in a sealed segment that is followed by records that pass their checksum
+				// is not the end of a torn write: something was lost from the
+				// middle.
+				if self.context.is_sealed() {
+					let followed = match self
+						.valid_record_in_later_blocks(self.record_start / BLOCK_SIZE + 1)
+					{
+						Ok(followed) => followed,
+						Err(failure) => {
+							self.err = Some(failure.clone());
+							return Err(failure);
+						}
+					};
+					if followed {
+						let gap = Error::IndexGap {
+							segment_id: self.log_number,
+							offset: self.record_start as u64,
+						};
+						tracing::error!("WAL index gap: {gap}");
+						self.err = Some(gap.clone());
+						return Err(gap);
+					}
+				}
+
 				// Calculate error offset and gather debugging info
 				let error_offset = self.end_of_buffer_offset - self.buffer_remaining();
 				let file_size = self.file.seek(SeekFrom::End(0)).unwrap_or(0);
@@ -270,10 +332,20 @@ impl Reader {
 	}
 
 	fn next(&mut self) -> Result<()> {
+		if self.context.is_sealed() {
+			self.next_sealed()
+		} else {
+			self.next_plain()
+		}
+	}
+
+	fn next_plain(&mut self) -> Result<()> {
 		self.rec.clear();
 		let mut fragment_index = 0;
 
 		loop {
+			self.record_start = self.end_of_buffer_offset - self.buffer_remaining();
+
 			// When < HEADER_SIZE bytes remain, discard them (padding) and read next block
 			if self.buffer_remaining() < WAL_RECORD_HEADER_SIZE {
 				if self.buffer_end != BLOCK_SIZE && self.buffer_remaining() > 0 {
@@ -297,6 +369,13 @@ impl Reader {
 
 			// Parse header from buffer
 			let (crc, length, type_byte) = self.parse_header();
+
+			// A segment that starts with the header record of a sealed segment is not a plaintext
+			// segment, and nothing in it is read as one: a WAL that is not configured for
+			// encryption does not repair it either.
+			if type_byte == RecordType::SegmentHeader as u8 && self.record_start == 0 {
+				return Err(EncryptionError::NotConfigured.into());
+			}
 			self.cur_rec_type = RecordType::from_u8(type_byte)?;
 
 			// If the type is Empty (0), it's a padded block.
@@ -381,6 +460,237 @@ impl Reader {
 		}
 
 		Ok(())
+	}
+
+	/// Makes sure that the header of a record is in the buffer. `false` means that the next block
+	/// was just read, and the caller looks again.
+	fn header_in_buffer(&mut self) -> Result<bool> {
+		self.record_start = self.end_of_buffer_offset - self.buffer_remaining();
+		if self.buffer_remaining() >= WAL_RECORD_HEADER_SIZE {
+			return Ok(true);
+		}
+		if self.buffer_end != BLOCK_SIZE && self.buffer_remaining() > 0 {
+			// A partial block with data remaining: recovering from a torn write.
+			return Err(physical("partially written record"));
+		}
+		if !self.read_more()? {
+			return Err(Error::IO(IOError::new(
+				io::ErrorKind::UnexpectedEof,
+				"reached end of file",
+			)));
+		}
+		Ok(false)
+	}
+
+	/// Reads the next batch of a sealed segment: the physical records of it are put together as
+	/// they are in a plaintext one, and then, before anything is decompressed or decoded, opened
+	/// at the next index.
+	///
+	/// What is damage and what is not is decided here. A physical record that fails its checksum,
+	/// that is cut short or zeroed, is damage of the kind a torn write leaves (the caller of `read`
+	/// turns it into an index gap if records that pass their checksum follow it). A record that
+	/// passes its checksum and is not a batch, or is out of sequence, was written on purpose by
+	/// someone who is not a writer of the segment, and so is a batch that fails to authenticate:
+	/// neither is damage and neither is ever repaired.
+	fn next_sealed(&mut self) -> Result<()> {
+		if self.sealed.is_none() {
+			self.read_segment_header()?;
+		}
+
+		self.rec.clear();
+		let mut fragment_index = 0;
+
+		loop {
+			if !self.header_in_buffer()? {
+				continue;
+			}
+			let at = self.record_start as u64;
+			let (crc, length, type_byte) = self.parse_header();
+			let length = usize::from(length);
+
+			if type_byte == RecordType::Empty as u8 {
+				// A writer never frames a record of this type, so this is a zeroed part of the
+				// file: padding at the end of the segment, or a block that was lost.
+				if crc != 0 || length != 0 {
+					return Err(physical("a record of type zero that is not zero"));
+				}
+				let rest = self.buffer.get(self.buffer_offset..self.buffer_end).unwrap_or(&[]);
+				if rest.iter().any(|&byte| byte != 0) {
+					return Err(physical("non-zero byte in padding area"));
+				}
+				if self.valid_record_in_later_blocks(self.record_start / BLOCK_SIZE + 1)? {
+					return Err(Error::IndexGap {
+						segment_id: self.log_number,
+						offset: at,
+					});
+				}
+				self.buffer_offset = self.buffer_end;
+				continue;
+			}
+
+			let fits = length <= self.buffer_remaining();
+			let data =
+				self.buffer.get(self.buffer_offset..self.buffer_offset + length).filter(|_| fits);
+			let checksum_holds =
+				data.is_some_and(|data| calculate_crc32(&[type_byte], data) == crc);
+
+			// A sealed segment holds batches and nothing else once its header is read.
+			let is_batch_fragment = [
+				RecordType::Full as u8,
+				RecordType::First as u8,
+				RecordType::Middle as u8,
+				RecordType::Last as u8,
+			]
+			.contains(&type_byte);
+			if !is_batch_fragment {
+				return Err(if checksum_holds {
+					Error::Unexpected {
+						segment_id: self.log_number,
+						offset: at,
+						what: "a record of a kind that a sealed segment does not hold",
+					}
+				} else {
+					physical("invalid record type")
+				});
+			}
+			if !fits {
+				return Err(physical("bad record length - exceeds block boundary"));
+			}
+			if !checksum_holds {
+				return Err(physical("checksum mismatch"));
+			}
+
+			let record_type = RecordType::from_u8(type_byte)?;
+			if validate_record_type(record_type, fragment_index).is_err() {
+				return Err(Error::Unexpected {
+					segment_id: self.log_number,
+					offset: at,
+					what: "a record out of sequence",
+				});
+			}
+
+			if let Some(data) = data {
+				self.rec.extend_from_slice(data);
+			}
+			self.buffer_offset += length;
+			if record_type == RecordType::Last || record_type == RecordType::Full {
+				break;
+			}
+			fragment_index += 1;
+		}
+
+		// The sealed bytes are all there and each fragment passed its checksum. Whether they are
+		// what was written is for the tag to say, and nothing is decompressed, decoded or
+		// trusted before it does.
+		let at = self.record_start as u64;
+		let Some(segment) = self.sealed.as_mut() else {
+			return Err(Error::Unexpected {
+				segment_id: self.log_number,
+				offset: at,
+				what: "a batch before the header of the segment",
+			});
+		};
+		segment.index = segment.index.saturating_add(1);
+		let context = sealed::record_context(segment.index, segment.compression);
+		let plain_len = segment.cipher.open_suffix(&context, &mut self.rec)?.len();
+		self.rec.truncate(plain_len);
+
+		if segment.compression == CompressionType::Lz4 {
+			// It authenticated, so what does not decompress is what a writer of the segment wrote.
+			self.rec = sealed::decompress(&self.rec).map_err(|_| Error::Unexpected {
+				segment_id: self.log_number,
+				offset: at,
+				what: "a batch that authenticated does not decompress",
+			})?;
+		}
+		Ok(())
+	}
+
+	/// Reads the header record of a sealed segment, which must be the first record of the file, and
+	/// authenticates the segment under the key it names.
+	///
+	/// A file that ends before the header does, or whose header is zeroed or fails its checksum, is
+	/// damage of the kind that a crash during the creation of the segment leaves. A header that
+	/// passes its checksum and does not open is never damage: it is a key, a database, a segment
+	/// number or a format that this reader cannot use, and a first record that is not a header is a
+	/// plaintext segment.
+	fn read_segment_header(&mut self) -> Result<()> {
+		let Some(context) = self.context.encryption().cloned() else {
+			return Err(EncryptionError::NotConfigured.into());
+		};
+
+		while !self.header_in_buffer().map_err(|e| match e {
+			// A segment with nothing in it has no header, which is not the clean end of a log.
+			Error::IO(ref io) if io.kind() == io::ErrorKind::UnexpectedEof => {
+				physical("the segment has no header")
+			}
+			e => e,
+		})? {}
+
+		let (crc, length, type_byte) = self.parse_header();
+		let length = usize::from(length);
+		match type_byte {
+			t if t == RecordType::SegmentHeader as u8 => {}
+			t if t == RecordType::Empty as u8 => {
+				return Err(physical("zeros where the header of the segment should be"));
+			}
+			// The first record of a plaintext segment, or the record of its compression.
+			1..=4 | 9 => return Err(EncryptionError::PlaintextInEncryptedDb.into()),
+			_ => return Err(EncryptionError::UnsupportedVersion.into()),
+		}
+		if length > self.buffer_remaining() {
+			return Err(physical("bad record length - exceeds block boundary"));
+		}
+		let Some(payload) = self.buffer.get(self.buffer_offset..self.buffer_offset + length) else {
+			return Err(physical("bad record length - exceeds block boundary"));
+		};
+		if calculate_crc32(&[type_byte], payload) != crc {
+			return Err(physical("checksum mismatch"));
+		}
+
+		let (cipher, compression) = sealed::open_header(&context, self.log_number, payload)?;
+		self.buffer_offset += length;
+		self.compression_type = compression;
+		self.sealed = Some(SealedSegment {
+			cipher,
+			compression,
+			index: 0,
+		});
+		Ok(())
+	}
+
+	/// Whether a physical record that passes its checksum starts a block from `first_block` on,
+	/// the first of the blocks after damage. A record starts every block, a continuation of the one
+	/// before it or a record of its own, so looking at the start of each block finds data that
+	/// follows damage, and finds none after what a torn write left, which has nothing behind it.
+	///
+	/// Reads through its own positions and leaves the reader as it was.
+	fn valid_record_in_later_blocks(&self, first_block: usize) -> Result<bool> {
+		let io_error = |e: crate::error::Error| physical(&format!("reading ahead failed: {e}"));
+		let size = VfsFile::size(&self.file).map_err(io_error)?;
+		let mut block = vec![0u8; BLOCK_SIZE];
+		let mut at = (first_block as u64).saturating_mul(BLOCK_SIZE as u64);
+		while at < size {
+			let read = VfsFile::read_up_to(&self.file, at, &mut block).map_err(io_error)?;
+			if let Some((head, rest)) =
+				block.get(..read).and_then(|got| got.split_first_chunk::<WAL_RECORD_HEADER_SIZE>())
+			{
+				let crc = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+				let length = usize::from(u16::from_be_bytes([head[4], head[5]]));
+				let kind = head[6];
+				let is_batch_fragment =
+					(RecordType::Full as u8..=RecordType::Last as u8).contains(&kind);
+				if is_batch_fragment {
+					if let Some(payload) = rest.get(..length) {
+						if calculate_crc32(&[kind], payload) == crc {
+							return Ok(true);
+						}
+					}
+				}
+			}
+			at = at.saturating_add(BLOCK_SIZE as u64);
+		}
+		Ok(false)
 	}
 }
 

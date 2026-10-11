@@ -330,6 +330,15 @@ pub(crate) fn repair_corrupted_wal_segment_with(
 	use crate::wal::reader::Reader;
 	use crate::wal::Options;
 
+	// The plaintext repair below reads and writes plaintext, and deletes a segment that holds no
+	// valid record: it must never run on a sealed segment, which a key that does not fit makes look
+	// like one. Sealed segments are repaired by their own code.
+	if context.is_sealed() {
+		return Err(crate::error::Error::Other(format!(
+			"WAL segment {segment_id:020}.wal is sealed and is not repaired"
+		)));
+	}
+
 	// Build segment paths
 	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
 

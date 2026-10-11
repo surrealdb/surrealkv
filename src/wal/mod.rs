@@ -9,12 +9,14 @@ use std::sync::{Arc, PoisonError};
 
 use crc32fast::Hasher;
 
+use crate::error::EncryptionError;
 use crate::tde::EncryptionContext;
 
 pub mod manager;
 pub(crate) mod parallel_recovery;
 pub mod reader;
 pub mod recovery;
+pub(crate) mod sealed;
 pub mod writer;
 
 pub use manager::Wal;
@@ -91,6 +93,10 @@ pub enum RecordType {
 	// Metadata record types
 	/// Indicates the compression type used for subsequent records.
 	SetCompressionType = 9,
+
+	/// The first record of a sealed segment, which holds its encryption header. A plaintext
+	/// segment never has one, and a sealed segment has no other record of the metadata types.
+	SegmentHeader = 10,
 }
 
 impl RecordType {
@@ -107,6 +113,7 @@ impl RecordType {
 			3 => Ok(RecordType::Middle),
 			4 => Ok(RecordType::Last),
 			9 => Ok(RecordType::SetCompressionType),
+			10 => Ok(RecordType::SegmentHeader),
 			_ => Err(Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Invalid Record Type"))),
 		}
 	}
@@ -156,8 +163,6 @@ const DEFAULT_FILE_SIZE: u64 = 100 * 1024 * 1024;
 #[derive(Clone, Default)]
 pub(crate) struct WalContext {
 	/// What creates and opens the encrypted files of the database, if the WAL is sealed.
-	// Read by the sealed paths of the writer, the reader and recovery.
-	#[allow(dead_code)]
 	cipher: Option<Arc<EncryptionContext>>,
 }
 
@@ -166,6 +171,15 @@ impl WalContext {
 	#[cfg(test)]
 	pub(crate) fn plaintext() -> Self {
 		Self::default()
+	}
+
+	/// A sealed WAL under `context`. Only tests build one this way: a tree takes its context from
+	/// its options.
+	#[cfg(test)]
+	pub(crate) fn sealed(context: Arc<EncryptionContext>) -> Self {
+		Self {
+			cipher: Some(context),
+		}
 	}
 
 	/// The context of the WAL of the tree that `opts` configure: sealed if the options carry a
@@ -177,9 +191,13 @@ impl WalContext {
 	}
 
 	/// Whether the segments of this WAL are sealed.
-	#[allow(dead_code)]
 	pub(crate) fn is_sealed(&self) -> bool {
 		self.cipher.is_some()
+	}
+
+	/// What creates and opens the encrypted files of the database, if the WAL is sealed.
+	pub(crate) fn encryption(&self) -> Option<&Arc<EncryptionContext>> {
+		self.cipher.as_ref()
 	}
 }
 
@@ -196,8 +214,6 @@ impl fmt::Debug for WalContext {
 #[derive(Clone)]
 pub struct Options {
 	/// Whether the segments are sealed, and under what.
-	// Read by the writer of sealed segments.
-	#[allow(dead_code)]
 	pub(crate) context: WalContext,
 
 	/// The permission mode for creating directories (Unix only).
@@ -289,6 +305,32 @@ pub enum Error {
 	Poison(String),
 	RecordTooLarge,
 	SegmentNotFound,
+	/// A key, a header or an authentication tag said no. Never damage, so never a reason to repair
+	/// or delete anything.
+	Encryption(EncryptionError),
+	/// A sealed segment holds records that pass their checksum after a block that is zero-filled
+	/// or damaged, or a segment of the sequence is missing: data was lost from the middle of
+	/// the WAL, which is not what a torn write at its end looks like.
+	IndexGap {
+		segment_id: u64,
+		offset: u64,
+	},
+	/// Something that passes its checksum, and so was written on purpose, and that a writer of
+	/// this segment never writes: a record of another kind, one out of sequence, one that does not
+	/// decompress after it authenticated.
+	Unexpected {
+		segment_id: u64,
+		offset: u64,
+		what: &'static str,
+	},
+}
+
+impl Error {
+	/// Whether the error is a statement about keys or about what was written on purpose, as
+	/// opposed to damage. Recovery never repairs, rewrites or deletes a segment for one.
+	pub(crate) fn is_integrity_failure(&self) -> bool {
+		matches!(self, Error::Encryption(_) | Error::IndexGap { .. } | Error::Unexpected { .. })
+	}
 }
 
 impl fmt::Display for Error {
@@ -304,6 +346,23 @@ impl fmt::Display for Error {
 				write!(f, "Record is too large to fit in a segment. Increase max segment size")
 			}
 			Error::SegmentNotFound => write!(f, "Segment not found"),
+			Error::Encryption(err) => write!(f, "Encryption error: {err}"),
+			Error::IndexGap {
+				segment_id,
+				offset,
+			} => write!(
+				f,
+				"Index gap in segment {segment_id:020} at offset {offset}: records that pass their \
+				 checksum follow a zero-filled or damaged block, or a segment is missing"
+			),
+			Error::Unexpected {
+				segment_id,
+				offset,
+				what,
+			} => write!(
+				f,
+				"Unexpected content in segment {segment_id:020} at offset {offset}: {what}"
+			),
 		}
 	}
 }
@@ -316,6 +375,12 @@ impl From<io::Error> for Error {
 			kind: e.kind(),
 			message: e.to_string(),
 		})
+	}
+}
+
+impl From<EncryptionError> for Error {
+	fn from(e: EncryptionError) -> Error {
+		Error::Encryption(e)
 	}
 }
 

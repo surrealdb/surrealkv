@@ -6,6 +6,8 @@ use std::sync::Arc;
 use super::writer::Writer;
 use super::{
 	get_segment_range,
+	list_segment_ids,
+	sealed,
 	segment_name,
 	BufferedFileWriter,
 	CompressionType,
@@ -18,16 +20,19 @@ use super::{
 	BLOCK_SIZE,
 	HEADER_SIZE,
 };
+use crate::error::EncryptionError;
+use crate::tde::EncryptionContext;
 
 /// Write-Ahead Log (Wal) manager for coordinating WAL operations.
 pub struct Wal {
-	/// The currently active Writer for writing records.
-	active_writer: Writer,
+	/// The currently active Writer for writing records. `None` only in a sealed WAL that was
+	/// opened and has not made its first segment yet, see `open_with_min_log_number`.
+	active_writer: Option<Writer>,
 
 	/// Cloned file descriptor for the active WAL file, used to perform
 	/// fsync outside the write lock so concurrent appends are not blocked.
 	/// The fsync goes through the segment's `SyncGate`, see `sync_handle`.
-	sync_fd: Arc<File>,
+	sync_fd: Option<Arc<File>>,
 
 	/// The log number of the currently active Writer.
 	active_log_number: u64,
@@ -54,6 +59,10 @@ impl Wal {
 		// Clean up any stale .wal.repair files from previous crashed repair attempts
 		Self::cleanup_stale_repair_files(dir)?;
 
+		if let Some(context) = opts.context.encryption() {
+			return Self::open_sealed(dir, 0, opts.clone(), context);
+		}
+
 		// Determine the active log number
 		let active_log_number = Self::calculate_active_log_number(dir)?;
 
@@ -61,8 +70,8 @@ impl Wal {
 		let (active_writer, sync_fd) = Self::create_writer(dir, active_log_number, &opts)?;
 
 		Ok(Self {
-			active_writer,
-			sync_fd,
+			active_writer: Some(active_writer),
+			sync_fd: Some(sync_fd),
 			active_log_number,
 			dir: dir.to_path_buf(),
 			opts,
@@ -100,6 +109,10 @@ impl Wal {
 		// Clean up any stale .wal.repair files from previous crashed repair attempts
 		Self::cleanup_stale_repair_files(dir)?;
 
+		if let Some(context) = opts.context.encryption() {
+			return Self::open_sealed(dir, min_log_number, opts.clone(), context);
+		}
+
 		// Use max of min_log_number and highest existing segment on disk.
 		// This prevents writing to an old segment that could be skipped on recovery.
 		//
@@ -124,8 +137,43 @@ impl Wal {
 		let (active_writer, sync_fd) = Self::create_writer(dir, active_log_number, &opts)?;
 
 		Ok(Self {
-			active_writer,
-			sync_fd,
+			active_writer: Some(active_writer),
+			sync_fd: Some(sync_fd),
+			active_log_number,
+			dir: dir.to_path_buf(),
+			opts,
+			closed: false,
+		})
+	}
+
+	/// Opens a sealed WAL: no segment is created and none is opened for appending.
+	///
+	/// A segment of a sealed WAL is never appended to after the process that wrote it is gone: a
+	/// restart writes to a segment of its own, under a salt of its own, and this is the one thing
+	/// that keeps a position of a segment's key from being sealed twice across runs. It is also
+	/// made only once the segments of the WAL were replayed, because creating a file is not
+	/// something that a key that does not fit may have caused: nothing in the directory changes
+	/// until then. The number it will have is reserved here, past every segment on disk and not
+	/// before `min_log_number`, and the file is created by the first rotation or the first
+	/// append.
+	fn open_sealed(
+		dir: &Path,
+		min_log_number: u64,
+		opts: Options,
+		context: &EncryptionContext,
+	) -> Result<Self> {
+		let active_log_number = match list_segment_ids(dir, Some("wal"))?.last() {
+			Some(&highest) => std::cmp::max(min_log_number, highest.saturating_add(1)),
+			None => min_log_number,
+		};
+
+		// The key of the segments that will be made. Asked for here, where waiting on a key
+		// provider is allowed, and not when a segment is made.
+		context.prepare(&[context.key_manager().active_key_id()])?;
+
+		Ok(Self {
+			active_writer: None,
+			sync_fd: None,
 			active_log_number,
 			dir: dir.to_path_buf(),
 			opts,
@@ -141,6 +189,10 @@ impl Wal {
 	/// file. The sync fd can be used to perform fsync outside the WAL write
 	/// lock, allowing concurrent appends to proceed during the slow fsync.
 	fn create_writer(dir: &Path, log_number: u64, opts: &Options) -> Result<(Writer, Arc<File>)> {
+		if let Some(context) = opts.context.encryption() {
+			return Self::create_sealed_writer(dir, log_number, opts, context);
+		}
+
 		let extension = opts.file_extension.as_deref().unwrap_or("wal");
 		let file_name = segment_name(log_number, extension);
 		let file_path = dir.join(&file_name);
@@ -188,6 +240,90 @@ impl Wal {
 		}
 	}
 
+	/// Creates the segment `log_number` of a sealed WAL, with its header written and fsynced and
+	/// the directory entry durable, and returns its writer.
+	///
+	/// The file is created exclusively: one that is already there is an error and is left alone,
+	/// never appended to. The header, with a salt that is drawn now, is made before the file is, so
+	/// a key that cannot be had leaves nothing behind, and every segment that is created, a retry
+	/// of the same number included, has a key of its own. If anything fails once the file exists it
+	/// is removed again: it is this call's, it holds nothing but the header this call wrote, and no
+	/// position was sealed under its key, so a later attempt may take the same number.
+	fn create_sealed_writer(
+		dir: &Path,
+		log_number: u64,
+		opts: &Options,
+		context: &EncryptionContext,
+	) -> Result<(Writer, Arc<File>)> {
+		let extension = opts.file_extension.as_deref().unwrap_or("wal");
+		let file_path = dir.join(segment_name(log_number, extension));
+
+		let (header, cipher) = sealed::new_header(context, log_number, opts.compression_type)?;
+		let file = Self::create_new_wal_file(&file_path, opts)?;
+
+		let started = Self::start_sealed_segment(
+			dir,
+			&file_path,
+			file,
+			&header,
+			cipher,
+			opts.compression_type,
+			opts,
+		);
+		if started.is_err() {
+			if let Err(e) = fs::remove_file(&file_path) {
+				tracing::error!(
+					"A WAL segment that could not be started was left behind as {file_path:?}: {e}"
+				);
+			}
+		}
+		started
+	}
+
+	/// The part of `create_sealed_writer` after the file was created. The file is closed again
+	/// when this returns an error, which the caller then removes.
+	fn start_sealed_segment(
+		dir: &Path,
+		file_path: &Path,
+		file: File,
+		header: &[u8; sealed::HEADER_PAYLOAD_LEN],
+		cipher: crate::tde::FileCipher,
+		compression_type: CompressionType,
+		opts: &Options,
+	) -> Result<(Writer, Arc<File>)> {
+		// Clone the fd before BufWriter consumes ownership, see `create_writer`.
+		let sync_fd = Arc::new(match file.try_clone() {
+			Ok(cloned) => cloned,
+			Err(_) => Self::open_wal_file(file_path, opts)?,
+		});
+		let writer = Writer::start_sealed(
+			BufferedFileWriter::new(file, BLOCK_SIZE),
+			header,
+			cipher,
+			compression_type,
+		)?;
+		crate::lsm::fsync_directory(dir)
+			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
+		Ok((writer, sync_fd))
+	}
+
+	/// Creates the file of a segment, which must not exist yet.
+	#[cfg_attr(not(unix), allow(unused_variables))]
+	fn create_new_wal_file(file_path: &Path, opts: &Options) -> Result<File> {
+		let mut open_options = OpenOptions::new();
+		open_options.read(true).write(true).create_new(true).append(true);
+
+		#[cfg(unix)]
+		{
+			use std::os::unix::fs::OpenOptionsExt;
+			if let Some(file_mode) = opts.file_mode {
+				open_options.mode(file_mode);
+			}
+		}
+
+		Ok(open_options.open(file_path)?)
+	}
+
 	/// Detects the compression type used in an existing WAL file.
 	///
 	/// Reads the first record's header. If it's a SetCompressionType record,
@@ -210,6 +346,12 @@ impl Wal {
 		// Parse the record type from header byte 6
 		let record_type_byte = header[6];
 		let record_type = RecordType::from_u8(record_type_byte)?;
+
+		// A sealed segment is not appended to by a WAL that is not sealed, and nothing is done
+		// to it: the open fails, and the segment stays as it is.
+		if record_type == RecordType::SegmentHeader {
+			return Err(EncryptionError::NotConfigured.into());
+		}
 
 		if record_type == RecordType::SetCompressionType {
 			// Read the compression type byte (length is in bytes 4-5)
@@ -346,7 +488,7 @@ impl Wal {
 
 		tracing::trace!("WAL append: log_number={}, bytes={}", self.active_log_number, rec.len());
 
-		self.active_writer.add_record(rec)?;
+		self.active_writer_for_append()?.add_record(rec)?;
 
 		// Return 0 for now (offset tracking can be added if needed)
 		Ok(0)
@@ -388,16 +530,29 @@ impl Wal {
 		);
 
 		if !ends.is_empty() {
-			self.active_writer.add_records(buf, ends)?;
+			self.active_writer_for_append()?.add_records(buf, ends)?;
 		}
 		Ok(self.active_log_number)
+	}
+
+	/// The writer of the active segment, which a sealed WAL that has none yet makes first: the
+	/// first append creates the segment whose number was reserved when the WAL was opened.
+	fn active_writer_for_append(&mut self) -> Result<&mut Writer> {
+		if self.active_writer.is_none() {
+			let (writer, sync_fd) =
+				Self::create_writer(&self.dir, self.active_log_number, &self.opts)?;
+			self.active_writer = Some(writer);
+			self.sync_fd = Some(sync_fd);
+		}
+		self.active_writer.as_mut().ok_or(Error::SegmentNotFound)
 	}
 
 	pub(crate) fn sync(&mut self) -> Result<()> {
 		if self.closed {
 			return Ok(());
 		}
-		self.active_writer.sync()
+		// A WAL that has no segment yet has nothing to sync.
+		self.active_writer.as_mut().map_or(Ok(()), Writer::sync)
 	}
 
 	/// Flushes buffered WAL data to OS cache (not to disk).
@@ -406,7 +561,7 @@ impl Wal {
 		if self.closed {
 			return Ok(());
 		}
-		self.active_writer.write_buffer()
+		self.active_writer.as_mut().map_or(Ok(()), Writer::write_buffer)
 	}
 
 	/// Returns what the caller needs to fsync the active segment outside the WAL
@@ -418,8 +573,11 @@ impl Wal {
 	/// fsync, it still syncs that segment, and a failure poisons only that segment's writer.
 	pub(crate) fn sync_handle(&self) -> SyncHandle {
 		SyncHandle {
-			file: Arc::clone(&self.sync_fd),
-			gate: self.active_writer.sync_gate(),
+			target: self
+				.active_writer
+				.as_ref()
+				.zip(self.sync_fd.as_ref())
+				.map(|(writer, file)| (Arc::clone(file), writer.sync_gate())),
 		}
 	}
 
@@ -427,33 +585,39 @@ impl Wal {
 	/// once, as a full disk would.
 	#[cfg(test)]
 	pub(crate) fn fail_writes_after(&mut self, ops: usize) {
-		self.active_writer.fail_after_ops(ops);
+		if let Some(writer) = self.active_writer.as_mut() {
+			writer.fail_after_ops(ops);
+		}
 	}
 
 	/// How many `write(2)` calls have reached the active segment.
 	#[cfg(test)]
 	pub(crate) fn file_writes(&self) -> usize {
-		self.active_writer.file_writes()
+		self.active_writer.as_ref().map_or(0, Writer::file_writes)
 	}
 
 	/// Test-only: whether anything was appended to the active segment since its last fsync.
 	#[cfg(test)]
 	pub(crate) fn pending_sync(&self) -> bool {
-		self.active_writer.pending_sync()
+		self.active_writer.as_ref().is_some_and(Writer::pending_sync)
 	}
 
 	/// Makes the fsync of the active segment after the next `syncs` of them fail once, as a
 	/// failing disk would.
 	#[cfg(test)]
 	pub(crate) fn fail_syncs_after(&mut self, syncs: usize) {
-		self.active_writer.sync_gate().fail_after(syncs);
+		if let Some(writer) = self.active_writer.as_ref() {
+			writer.sync_gate().fail_after(syncs);
+		}
 	}
 
 	/// Installs (or clears) an observer called inside every fsync of the active segment, with
 	/// the segment's fsyncs held up for as long as it runs.
 	#[cfg(test)]
 	pub(crate) fn set_sync_observer(&mut self, observer: Option<Arc<dyn Fn() + Send + Sync>>) {
-		self.active_writer.sync_gate().set_observer(observer);
+		if let Some(writer) = self.active_writer.as_ref() {
+			writer.sync_gate().set_observer(observer);
+		}
 	}
 
 	/// Makes the segments that a rotation creates from now on use `compression_type`.
@@ -462,35 +626,57 @@ impl Wal {
 		self.opts.compression_type = compression_type;
 	}
 
+	/// Test-only: the index that the next batch of the active sealed segment is sealed at.
+	#[cfg(test)]
+	pub(crate) fn next_index(&self) -> Option<u64> {
+		self.active_writer.as_ref().and_then(Writer::next_index)
+	}
+
+	/// Test-only: the smallest position that the cipher of the active sealed segment would still
+	/// seal.
+	#[cfg(test)]
+	pub(crate) fn cipher_next_position(&self) -> Option<u64> {
+		self.active_writer.as_ref().and_then(Writer::cipher_next_position)
+	}
+
+	/// Test-only: whether the first segment of the WAL exists yet, which a sealed WAL makes on
+	/// its first rotation or append.
+	#[cfg(test)]
+	pub(crate) fn has_segment(&self) -> bool {
+		self.active_writer.is_some()
+	}
+
 	/// Test-only: whether an fsync of the active segment failed, which poisons its writer.
 	#[cfg(test)]
 	pub(crate) fn sync_failed(&self) -> bool {
-		self.active_writer.sync_failed()
+		self.active_writer.as_ref().is_some_and(Writer::sync_failed)
 	}
 
 	/// Whether an append or an fsync of the active segment failed, so that its writer refuses
 	/// every append until a rotation replaces it.
 	pub(crate) fn needs_replacement(&self) -> bool {
-		self.active_writer.is_poisoned()
+		self.active_writer.as_ref().is_some_and(Writer::is_poisoned)
 	}
 
 	/// Whether the active writer is held, see `rotate_with`.
 	pub(crate) fn is_held(&self) -> bool {
-		self.active_writer.held().is_some()
+		self.hold_below().is_some()
 	}
 
 	/// The segment number below which everything must be in tables for the hold of the active
 	/// writer to end, if it is held.
 	pub(crate) fn hold_below(&self) -> Option<u64> {
-		self.active_writer.held()
+		self.active_writer.as_ref().and_then(Writer::held)
 	}
 
 	/// Ends the hold of the active writer if it is the one for `below`, the bound the caller read
 	/// with `hold_below` while it checked that the segments below it are in tables. A hold that
 	/// was set again since is left alone.
 	pub(crate) fn release_hold(&mut self, below: u64) {
-		if self.active_writer.held() == Some(below) {
-			self.active_writer.release_hold();
+		if let Some(writer) = self.active_writer.as_mut() {
+			if writer.held() == Some(below) {
+				writer.release_hold();
+			}
 		}
 	}
 
@@ -505,7 +691,11 @@ impl Wal {
 		self.closed = true;
 
 		// Sync and close the active writer (already fsyncs file data)
-		self.active_writer.close()?;
+		let Some(writer) = self.active_writer.as_mut() else {
+			// A sealed WAL that never made a segment has written nothing.
+			return Ok(());
+		};
+		writer.close()?;
 
 		// Fsync the directory to persist metadata changes
 		crate::lsm::fsync_directory(&self.dir)
@@ -557,13 +747,23 @@ impl Wal {
 	/// error from it fails the rotation with the WAL as it was.
 	pub(crate) fn rotate_with(&mut self, before_sync: impl FnOnce() -> Result<()>) -> Result<u64> {
 		let old_log_number = self.active_log_number;
+
+		let Some(active) = self.active_writer.as_mut() else {
+			// A sealed WAL that has no segment yet: there is nothing to sync and no record for
+			// `before_sync` to make safe, and the number that is reserved is the one that is
+			// made, so that the numbers of the segments have no gap.
+			let (writer, sync_fd) = Self::create_writer(&self.dir, old_log_number, &self.opts)?;
+			self.active_writer = Some(writer);
+			self.sync_fd = Some(sync_fd);
+			return Ok(old_log_number);
+		};
 		let new_log_number = old_log_number + 1;
 
-		let held = self.active_writer.held();
-		let sync_failed = self.active_writer.sync_failed();
+		let held = active.held();
+		let sync_failed = active.sync_failed();
 		if !sync_failed && held.is_none() {
 			before_sync()?;
-			self.active_writer.sync()?;
+			active.sync()?;
 		}
 
 		tracing::debug!("WAL rotating: {:020} -> {:020}", old_log_number, new_log_number);
@@ -572,15 +772,19 @@ impl Wal {
 		let (mut new_writer, new_sync_fd) =
 			Self::create_writer(&self.dir, new_log_number, &self.opts)?;
 
-		// Fsync the directory to ensure new file is visible after crash
-		crate::lsm::fsync_directory(&self.dir)
-			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
+		// Fsync the directory to ensure new file is visible after crash. A sealed segment did it
+		// before it was handed over: it must not fail after the file is there, or the number
+		// would be taken by a file that nothing refers to.
+		if !self.opts.context.is_sealed() {
+			crate::lsm::fsync_directory(&self.dir)
+				.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
+		}
 
 		if sync_failed || held.is_some() {
 			new_writer.hold(held.unwrap_or(new_log_number));
 		}
-		self.active_writer = new_writer;
-		self.sync_fd = new_sync_fd;
+		self.active_writer = Some(new_writer);
+		self.sync_fd = Some(new_sync_fd);
 		self.active_log_number = new_log_number;
 
 		tracing::debug!(
@@ -611,27 +815,33 @@ impl Drop for Wal {
 /// What `WalManager::sync` fsyncs through outside the WAL lock: a clone of the active
 /// segment's file and the segment's `SyncGate`.
 pub(crate) struct SyncHandle {
-	file: Arc<File>,
-	gate: Arc<SyncGate>,
+	/// The file and its gate, `None` for a sealed WAL that has no segment yet, which has nothing
+	/// to sync.
+	target: Option<(Arc<File>, Arc<SyncGate>)>,
 }
 
 impl SyncHandle {
 	/// fsyncs the segment. Fails if an earlier fsync of it failed.
 	pub(crate) fn sync(&self) -> Result<()> {
-		self.gate.sync(&self.file)
+		match &self.target {
+			Some((file, gate)) => gate.sync(file),
+			None => Ok(()),
+		}
 	}
 
 	/// Makes the fsync of the segment after the next `syncs` of them fail once.
 	#[cfg(test)]
 	pub(crate) fn fail_after(&self, syncs: usize) {
-		self.gate.fail_after(syncs);
+		if let Some((_, gate)) = &self.target {
+			gate.fail_after(syncs);
+		}
 	}
 
 	/// How many fsyncs of the segment were asked for so far, the ones still waiting for an
 	/// fsync in flight included. Read without the WAL lock, which a waiting fsync may hold.
 	#[cfg(test)]
 	pub(crate) fn arrivals(&self) -> usize {
-		self.gate.arrivals()
+		self.target.as_ref().map_or(0, |(_, gate)| gate.arrivals())
 	}
 }
 
