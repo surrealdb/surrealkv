@@ -3,10 +3,8 @@
 //!
 //! `FileSystemSyncAccessHandle` exists only in dedicated workers, so on the main thread the
 //! backend cannot open a sync file at all. What does work there is `get_opfs_root` and the
-//! directory handle it returns, and that is what the passing tests cover. The one test that opens
-//! a sync file asserts the behaviour a caller needs, a clean error, and is ignored because the
-//! backend throws an uncatchable JavaScript exception instead; run it with `-- --include-ignored`
-//! to see that.
+//! directory handle it returns, and most of the tests cover that. The one test that opens a sync
+//! file asserts the behaviour a caller needs, a clean error and no file left behind.
 //!
 //! The target selects the main thread itself, so it is independent of
 //! `WASM_BINDGEN_USE_DEDICATED_WORKER`.
@@ -91,19 +89,19 @@ async fn get_opfs_root_can_be_awaited_concurrently_on_the_main_thread() {
 }
 
 #[wasm_bindgen_test]
-#[ignore = "open_opfs_sync_file on the main thread throws an uncatchable JavaScript exception instead of returning an error"]
 async fn opening_a_sync_file_on_the_main_thread_returns_an_error_instead_of_throwing() {
 	let root = root().await;
 	let name = unique_name("window-sync", "bin");
 
 	// The browser has no createSyncAccessHandle on a window. A caller must get an Err it can
-	// handle. Today the call into the browser is not guarded, so a TypeError
-	// ("createSyncAccessHandle is not a function") escapes and aborts the WebAssembly instance.
-	let result = open_opfs_sync_file(&root, &name, true).await;
-	assert!(result.is_err(), "a sync file cannot exist on the main thread");
-
-	// Remove the empty entry that getFileHandle(create = true) made on the way, if any.
-	if file_handle(&root, &name, false).await.is_ok() {
-		JsFuture::from(root.remove_entry(&name)).await.expect("remove the leftover entry");
+	// handle, not a TypeError ("createSyncAccessHandle is not a function") that aborts the
+	// WebAssembly instance.
+	for create in [true, false] {
+		let result = open_opfs_sync_file(&root, &name, create).await;
+		assert!(result.is_err(), "a sync file cannot exist on the main thread, create = {create}");
 	}
+
+	// The failed attempts did not make the file entry either.
+	let err = file_handle(&root, &name, false).await.expect_err("an entry that was never made");
+	assert!(text(&err).contains("NotFoundError"), "{}", text(&err));
 }

@@ -564,13 +564,17 @@ impl MemTable {
 
 /// During flush, decide whether to separate a value to VLog or keep inline in SST.
 /// Handles backward compat: entries already containing VLog pointers pass through.
+///
+/// The value of a range delete is its raw end key, not an encoded value: it is never decoded or
+/// separated. Decoding needs two bytes, so a one-byte end key would fail the flush for good, and
+/// an end key longer than the threshold would be moved to the VLog and lose its meaning.
 fn maybe_separate_to_vlog(
 	encoded_value: &[u8],
 	key: &InternalKey,
 	vlog: Option<&Arc<VLog>>,
 	vlog_threshold: usize,
 ) -> Result<Vec<u8>> {
-	if encoded_value.is_empty() {
+	if encoded_value.is_empty() || key.kind() == InternalKeyKind::RangeDelete {
 		return Ok(encoded_value.to_vec());
 	}
 

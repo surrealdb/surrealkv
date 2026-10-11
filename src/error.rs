@@ -71,6 +71,9 @@ pub enum Error {
 	/// The manifest was being replaced when a step failed from the rename on, so the file on disk
 	/// is either the old manifest or the new one, and the new one may not be durable.
 	ManifestWriteUncertain(String),
+	/// A restore from a checkpoint began to replace the files of the database and did not finish,
+	/// so they are neither the database as it was nor the checkpoint.
+	RestoreInterrupted(String),
 	InvalidArgument(String),
 	InvalidTag(String),
 	InterleavedIteration, // Interleaved iteration not supported
@@ -127,6 +130,7 @@ impl fmt::Display for Error {
             Self::ManifestCorruption(err) => write!(f, "Manifest corruption detected: {err}"),
             Self::ManifestMissing(err) => write!(f, "Manifest missing: {err}"),
             Self::ManifestWriteUncertain(err) => write!(f, "Manifest write outcome unknown: {err}"),
+            Self::RestoreInterrupted(err) => write!(f, "Restore interrupted: {err}"),
             Self::InvalidArgument(err) => write!(f, "Invalid argument: {err}"),
             Self::InvalidTag(err) => write!(f, "Invalid tag: {err}"),
             Self::InterleavedIteration => write!(f, "Interleaved iteration not supported: cannot mix next() and next_back() on same iterator"),

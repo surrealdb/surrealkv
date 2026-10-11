@@ -632,3 +632,145 @@ mod min_oldest_vlog_file_id_tests {
 		assert_eq!(manifest.min_oldest_vlog_file_id(), 4);
 	}
 }
+
+// ============================================================================
+// TABLES WITHOUT POINTS
+// ============================================================================
+
+/// A table of range deletions alone, as a compaction writes one when it drops every point and
+/// keeps a range deletion: no data block, an empty index, no key range.
+mod table_without_points_tests {
+	use super::*;
+	use crate::LSMIterator;
+
+	fn create_table_without_points(id: u64, opts: Arc<Options>) -> Arc<Table> {
+		let mut buf = Vec::new();
+		let mut writer = TableWriter::new(&mut buf, id, Arc::clone(&opts), 3);
+		writer.add_range_deletion(b"b".to_vec(), b"y".to_vec(), 7);
+		let size = writer.finish().unwrap();
+		let file: Arc<dyn crate::vfs::File> = Arc::new(buf);
+		Arc::new(Table::new(id, opts, file, size as u64).unwrap())
+	}
+
+	fn ids(level: &Level) -> Vec<u64> {
+		level.tables.iter().map(|t| t.id).collect()
+	}
+
+	#[test]
+	fn the_table_has_a_range_deletion_and_no_points() {
+		let table = create_table_without_points(9, Arc::new(Options::default()));
+		assert!(!table.has_points());
+		assert!(table.holds_only_range_deletions());
+		assert!(table.has_range_deletions());
+		assert!(table.meta.smallest_point.is_none() && table.meta.largest_point.is_none());
+		assert_eq!(*table.range_deletions.read(), vec![(b"b".to_vec(), b"y".to_vec(), 7)]);
+		let with_points = create_test_table(1, &["a", "c"], Arc::new(Options::default()));
+		assert!(with_points.has_points() && !with_points.holds_only_range_deletions());
+	}
+
+	#[test]
+	fn a_get_finds_nothing_and_does_not_fail() {
+		let table = create_table_without_points(9, Arc::new(Options::default()));
+		let key = InternalKey::new(b"c".to_vec(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Set);
+		assert!(table.get(&key).unwrap().is_none());
+		assert!(!table.is_user_key_in_range(b"c"));
+	}
+
+	#[tokio::test]
+	async fn an_async_get_finds_nothing_and_does_not_fail() {
+		let table = create_table_without_points(9, Arc::new(Options::default()));
+		let key = InternalKey::new(b"c".to_vec(), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Set);
+		assert!(table.get_async(&key).await.unwrap().is_none());
+	}
+
+	#[test]
+	fn an_iterator_is_empty_in_both_directions_and_after_every_seek() {
+		let table = create_table_without_points(9, Arc::new(Options::default()));
+		let bounded = make_range(Some((b"a", true)), Some((b"z", false)));
+		for range in [None, Some(bounded)] {
+			let mut iter = table.iter(range).unwrap();
+			assert!(!iter.valid());
+			assert!(!iter.seek_first().unwrap() && !iter.valid());
+			assert!(!iter.seek_last().unwrap() && !iter.valid());
+			assert!(!iter.seek(b"c").unwrap() && !iter.valid());
+			assert!(!iter.next().unwrap() && !iter.prev().unwrap());
+		}
+		let mut fresh = table.iter(None).unwrap();
+		assert!(!fresh.next().unwrap(), "next on an iterator that was never positioned");
+		let mut fresh = table.iter(None).unwrap();
+		assert!(!fresh.prev().unwrap(), "prev on an iterator that was never positioned");
+	}
+
+	#[test]
+	fn it_sorts_after_the_tables_with_points_whatever_the_order_of_insertion() {
+		let opts = Arc::new(Options::default());
+		let mut level = Level::default();
+		level.insert_sorted_by_key(create_test_table(1, &["a", "b"], Arc::clone(&opts)));
+		level.insert_sorted_by_key(create_table_without_points(9, Arc::clone(&opts)));
+		assert_eq!(ids(&level), vec![1, 9]);
+		// Tables with points go in front of it, in key order, and not behind it.
+		level.insert_sorted_by_key(create_test_table(4, &["h", "i"], Arc::clone(&opts)));
+		level.insert_sorted_by_key(create_test_table(3, &["d", "e"], Arc::clone(&opts)));
+		level.insert_sorted_by_key(create_test_table(5, &["p", "q"], Arc::clone(&opts)));
+		assert_eq!(ids(&level), vec![1, 3, 4, 5, 9]);
+		// A second one goes after the first.
+		level.insert_sorted_by_key(create_table_without_points(10, Arc::clone(&opts)));
+		assert_eq!(ids(&level), vec![1, 3, 4, 5, 9, 10]);
+	}
+
+	#[test]
+	fn a_search_for_a_key_never_returns_it() {
+		let opts = Arc::new(Options::default());
+		let mut level = Level::default();
+		level.insert_sorted_by_key(create_test_table(1, &["a", "c"], Arc::clone(&opts)));
+		level.insert_sorted_by_key(create_test_table(2, &["f", "h"], Arc::clone(&opts)));
+		level.insert_sorted_by_key(create_table_without_points(9, Arc::clone(&opts)));
+		let cmp = Arc::clone(&opts.comparator);
+		let found = |key: &[u8]| level.find_table_for_user_key(key, &cmp).map(|t| t.id);
+		assert_eq!(found(b"a"), Some(1));
+		assert_eq!(found(b"b"), Some(1));
+		assert_eq!(found(b"c"), Some(1));
+		assert_eq!(found(b"d"), None, "in the gap between two tables");
+		assert_eq!(found(b"f"), Some(2));
+		assert_eq!(found(b"h"), Some(2));
+		assert_eq!(found(b"i"), None, "past the last key of the level, where the table sits");
+		assert_eq!(found(b"zz"), None);
+		assert_eq!(found(b"0"), None, "before the first key");
+	}
+
+	#[test]
+	fn a_scan_range_never_selects_it() {
+		let opts = Arc::new(Options::default());
+		let mut level = Level::default();
+		level.insert_sorted_by_key(create_test_table(1, &["a", "c"], Arc::clone(&opts)));
+		level.insert_sorted_by_key(create_test_table(2, &["f", "h"], Arc::clone(&opts)));
+		level.insert_sorted_by_key(create_table_without_points(9, Arc::clone(&opts)));
+		let selected = |range: InternalKeyRange| {
+			let (start, end) = (
+				level.find_first_overlapping_table(&range),
+				level.find_last_overlapping_table(&range),
+			);
+			assert!(start <= end, "the slice {start}..{end} is not a slice");
+			level.tables[start..end].iter().map(|t| t.id).collect::<Vec<_>>()
+		};
+		assert_eq!(selected(make_range(None, None)), vec![1, 2]);
+		assert_eq!(selected(make_range(Some((b"b", true)), Some((b"g", true)))), vec![1, 2]);
+		assert_eq!(selected(make_range(Some((b"d", true)), Some((b"e", true)))), Vec::<u64>::new());
+		assert_eq!(selected(make_range(Some((b"x", true)), Some((b"z", true)))), Vec::<u64>::new());
+		assert_eq!(selected(make_range(Some((b"x", true)), None)), Vec::<u64>::new());
+		assert_eq!(selected(make_range(None, Some((b"b", true)))), vec![1]);
+	}
+
+	#[test]
+	fn a_compaction_still_takes_it_with_the_next_level_tables() {
+		// It overlaps every range, so that a compaction into its level merges it: its range
+		// deletions then go on to the outputs, and the table with them.
+		let opts = Arc::new(Options::default());
+		let mut level = Level::default();
+		level.insert_sorted_by_key(create_test_table(1, &["a", "c"], Arc::clone(&opts)));
+		level.insert_sorted_by_key(create_table_without_points(9, Arc::clone(&opts)));
+		let range = make_range(Some((b"x", true)), Some((b"z", true)));
+		let taken: Vec<u64> = level.overlapping_tables(&range).map(|t| t.id).collect();
+		assert_eq!(taken, vec![9]);
+	}
+}

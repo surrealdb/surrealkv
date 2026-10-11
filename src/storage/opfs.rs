@@ -6,10 +6,11 @@
 #![cfg(target_arch = "wasm32")]
 
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
+use parking_lot::Mutex;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
@@ -25,9 +26,13 @@ use crate::storage::{BoxFuture, LogStore, ObjectStore};
 use crate::vfs::File;
 
 /// Synchronous file handle wrapping OPFS `FileSystemSyncAccessHandle`.
+///
+/// The browser gives the handle exclusive access to the file until it is closed, so the file is
+/// closed when this value is dropped, whether or not `close` was called before.
 pub struct OpfsSyncFile {
 	handle: FileSystemSyncAccessHandle,
 	size_cache: AtomicU64,
+	closed: AtomicBool,
 }
 
 unsafe impl Send for OpfsSyncFile {}
@@ -42,12 +47,14 @@ impl Debug for OpfsSyncFile {
 }
 
 impl OpfsSyncFile {
-	/// Creates a new `OpfsSyncFile` from a browser `FileSystemSyncAccessHandle`.
+	/// Creates a new `OpfsSyncFile` from a browser `FileSystemSyncAccessHandle`. The file takes
+	/// the handle over: it is closed when the file is closed or dropped.
 	pub fn new(handle: FileSystemSyncAccessHandle) -> Self {
 		let initial_size = handle.get_size().unwrap_or(0.0) as u64;
 		Self {
 			handle,
 			size_cache: AtomicU64::new(initial_size),
+			closed: AtomicBool::new(false),
 		}
 	}
 
@@ -70,8 +77,12 @@ impl OpfsSyncFile {
 			.handle
 			.write_with_u8_array_and_options(buf, &options)
 			.map_err(|e| Error::Other(format!("OPFS write error: {:?}", e)))?;
-		let new_end = offset + bytes_written as u64;
-		self.size_cache.fetch_max(new_end, Ordering::Release);
+		// The browser ignores a write of nothing, so it does not extend the file up to `offset`
+		// and the cached size must not move either.
+		if bytes_written > 0.0 {
+			let new_end = offset + bytes_written as u64;
+			self.size_cache.fetch_max(new_end, Ordering::Release);
+		}
 		Ok(bytes_written as usize)
 	}
 
@@ -86,9 +97,20 @@ impl OpfsSyncFile {
 		Ok(self.size_cache.load(Ordering::Acquire))
 	}
 
-	/// Closes the sync access handle.
+	/// Closes the sync access handle. Closing a file again, or dropping it after it was closed,
+	/// does nothing.
 	pub fn close(&self) {
-		self.handle.close();
+		if !self.closed.swap(true, Ordering::AcqRel) {
+			self.handle.close();
+		}
+	}
+}
+
+impl Drop for OpfsSyncFile {
+	/// An exclusive handle that is never closed stays locked in the browser, and then the file
+	/// can neither be opened nor removed again.
+	fn drop(&mut self) {
+		self.close();
 	}
 }
 
@@ -106,7 +128,10 @@ impl File for OpfsSyncFile {
 #[derive(Debug)]
 pub struct OpfsLogStore {
 	file: Arc<OpfsSyncFile>,
-	offset: AtomicU64,
+	/// Where the log ends: the offset after the last record that was written. A record takes its
+	/// place in the log when its append is first polled, and the end only moves once the record is
+	/// in the file.
+	end: Mutex<u64>,
 }
 
 impl OpfsLogStore {
@@ -114,20 +139,24 @@ impl OpfsLogStore {
 		let initial_size = file.size().unwrap_or(0);
 		Self {
 			file,
-			offset: AtomicU64::new(initial_size),
+			end: Mutex::new(initial_size),
 		}
 	}
 }
 
 impl LogStore for OpfsLogStore {
 	fn append(&self, data: &[u8]) -> BoxFuture<'_, u64> {
-		let len = data.len() as u64;
-		let write_offset = self.offset.fetch_add(len, Ordering::SeqCst);
-		let file = Arc::clone(&self.file);
 		let data = data.to_vec();
 		Box::pin(async move {
-			file.write_at(write_offset, &data)?;
-			Ok(write_offset + len)
+			// The record is placed and written in one step, with no await in between, under a lock
+			// that serializes the appends. A future that is dropped before it is polled has not
+			// touched the log, so it leaves no hole behind, and a write that fails leaves the end
+			// where it was, so no later record lands after bytes that were never written.
+			let mut end = self.end.lock();
+			let start = *end;
+			self.file.write_at(start, &data)?;
+			*end = start + data.len() as u64;
+			Ok(*end)
 		})
 	}
 
@@ -140,7 +169,7 @@ impl LogStore for OpfsLogStore {
 	}
 
 	fn size(&self) -> BoxFuture<'_, u64> {
-		let cur = self.offset.load(Ordering::Acquire);
+		let cur = *self.end.lock();
 		Box::pin(async move { Ok(cur) })
 	}
 }
@@ -194,12 +223,35 @@ pub async fn get_opfs_root() -> Result<FileSystemDirectoryHandle> {
 	Ok(dir_val.unchecked_into())
 }
 
+/// Whether this context can create sync access handles. `createSyncAccessHandle` exists only in
+/// a dedicated worker. Calling it anywhere else throws a `TypeError` that the generated binding
+/// does not catch, and that aborts the WebAssembly instance.
+fn sync_access_handles_available() -> bool {
+	let global = js_sys::global();
+	let Ok(constructor) = js_sys::Reflect::get(&global, &"FileSystemFileHandle".into()) else {
+		return false;
+	};
+	let Ok(prototype) = js_sys::Reflect::get(&constructor, &"prototype".into()) else {
+		return false;
+	};
+	js_sys::Reflect::has(&prototype, &"createSyncAccessHandle".into()).unwrap_or(false)
+}
+
 /// Opens or creates an OPFS synchronous access file handle.
+///
+/// Fails, without creating the file, when this context cannot open sync access handles, for
+/// example on the main thread of a page.
 pub async fn open_opfs_sync_file(
 	dir: &FileSystemDirectoryHandle,
 	file_name: &str,
 	create: bool,
 ) -> Result<OpfsSyncFile> {
+	if !sync_access_handles_available() {
+		return Err(Error::Other(format!(
+			"Failed to open {file_name}: sync access handles exist only in a dedicated worker"
+		)));
+	}
+
 	let options = FileSystemGetFileOptions::new();
 	options.set_create(create);
 
