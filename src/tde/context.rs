@@ -4,6 +4,8 @@
 use std::fmt;
 use std::sync::Arc;
 
+use parking_lot::Mutex;
+
 use super::cipher::FileCipher;
 use super::header::CryptoHeader;
 use super::identity::{DbId, FileKind};
@@ -20,6 +22,9 @@ pub struct EncryptionContext {
 	key_manager: Arc<dyn KeyManager>,
 	db_id: DbId,
 	suite: CipherSuite,
+	/// The key ids the manager has been asked to make available, shared by the clones of the
+	/// context so that the database as a whole asks once for each.
+	prepared: Arc<Mutex<Vec<u32>>>,
 }
 
 impl fmt::Debug for EncryptionContext {
@@ -41,6 +46,7 @@ impl EncryptionContext {
 			key_manager,
 			db_id,
 			suite,
+			prepared: Arc::default(),
 		}
 	}
 
@@ -60,10 +66,70 @@ impl EncryptionContext {
 	}
 
 	/// Makes the roots of `key_ids` available, which may be slow: call it when the database is
-	/// opened, with the active key id and every key id found in the files, and again when the keys
-	/// in use change. Creating and opening files afterwards never waits on a key provider.
+	/// opened, with the active key id and every key id found in the files. Creating and opening
+	/// files afterwards never waits on a key provider.
+	///
+	/// The manager is asked for each key id once: an id that an earlier call made available is not
+	/// asked for again, by this context or by a clone of it, so a database whose files are all
+	/// under one key asks once however many files it opens, and nothing that happens after the
+	/// open reaches a provider. A call that fails marks nothing. To ask again, because the keys in
+	/// use changed or because the manager lost what it had, call [`refresh`](Self::refresh).
 	pub fn prepare(&self, key_ids: &[u32]) -> Result<(), EncryptionError> {
-		self.key_manager.prepare(key_ids)
+		let mut missing: Vec<u32> = Vec::new();
+		{
+			let done = self.prepared.lock();
+			for &key_id in key_ids {
+				if !done.contains(&key_id) && !missing.contains(&key_id) {
+					missing.push(key_id);
+				}
+			}
+		}
+		if missing.is_empty() {
+			return Ok(());
+		}
+		self.key_manager.prepare(&missing)?;
+		self.mark_prepared(&missing);
+		Ok(())
+	}
+
+	/// Asks the manager for the roots of `key_ids` whether or not they were asked for before. For
+	/// when the keys in use changed, or a manager that serves its roots from a cache has lost one.
+	pub fn refresh(&self, key_ids: &[u32]) -> Result<(), EncryptionError> {
+		self.key_manager.prepare(key_ids)?;
+		self.mark_prepared(key_ids);
+		Ok(())
+	}
+
+	/// Asks the manager again for the active key and for every key that was asked for before.
+	///
+	/// The active key must be made available, and its failure is the answer. A key that was asked
+	/// for before and that the manager has retired or no longer knows is left out of what the
+	/// context remembers, since nothing can be opened with it any more, and is not an error here.
+	pub fn refresh_in_use(&self) -> Result<(), EncryptionError> {
+		let active = self.key_manager.active_key_id();
+		self.refresh(&[active])?;
+		let others: Vec<u32> =
+			self.prepared.lock().iter().copied().filter(|&key_id| key_id != active).collect();
+		for key_id in others {
+			match self.key_manager.prepare(&[key_id]) {
+				Ok(()) => {}
+				Err(EncryptionError::KeyRetired | EncryptionError::UnknownKeyId) => {
+					self.prepared.lock().retain(|&done| done != key_id);
+				}
+				Err(err) => return Err(err),
+			}
+		}
+		Ok(())
+	}
+
+	/// Remembers that the manager made the roots of `key_ids` available.
+	fn mark_prepared(&self, key_ids: &[u32]) {
+		let mut done = self.prepared.lock();
+		for &key_id in key_ids {
+			if !done.contains(&key_id) {
+				done.push(key_id);
+			}
+		}
 	}
 
 	/// Starts a new file of `file_kind` and id `file_id` under the active key: draws a fresh salt,
@@ -398,6 +464,139 @@ mod tests {
 			let err = ctx.open_file_from_bytes(bytes, FileKind::Sst, 1, b"").unwrap_err();
 			assert_eq!(err, EncryptionError::MalformedHeader, "{bytes:?}");
 		}
+	}
+
+	/// A manager that says which key ids it was asked to prepare and can refuse to.
+	struct Counting {
+		inner: SoftwareKeyManager,
+		asked: parking_lot::Mutex<Vec<Vec<u32>>>,
+		refuse: std::sync::atomic::AtomicBool,
+	}
+
+	impl Counting {
+		fn new() -> Arc<Self> {
+			Arc::new(Self {
+				inner: SoftwareKeyManager::new([0x11; ROOT_KEY_LEN]),
+				asked: parking_lot::Mutex::new(Vec::new()),
+				refuse: std::sync::atomic::AtomicBool::new(false),
+			})
+		}
+
+		fn asked(&self) -> Vec<Vec<u32>> {
+			self.asked.lock().clone()
+		}
+	}
+
+	impl KeyManager for Counting {
+		fn active_key_id(&self) -> u32 {
+			self.inner.active_key_id()
+		}
+
+		fn key_state(&self, key_id: u32) -> KeyState {
+			self.inner.key_state(key_id)
+		}
+
+		fn root_key(&self, key_id: u32) -> Result<Zeroizing<[u8; ROOT_KEY_LEN]>, EncryptionError> {
+			self.inner.root_key(key_id)
+		}
+
+		fn prepare(&self, key_ids: &[u32]) -> Result<(), EncryptionError> {
+			self.asked.lock().push(key_ids.to_vec());
+			if self.refuse.load(std::sync::atomic::Ordering::SeqCst) {
+				return Err(EncryptionError::KeyProvider(
+					crate::error::KeyProviderFailure::Unavailable,
+				));
+			}
+			self.inner.prepare(key_ids)
+		}
+	}
+
+	fn counting_context(km: &Arc<Counting>) -> EncryptionContext {
+		EncryptionContext::new(Arc::<Counting>::clone(km), db_id(), CipherSuite::Aes256Gcm)
+	}
+
+	#[test]
+	fn a_key_id_is_asked_for_once_by_the_context_and_its_clones() {
+		let km = Counting::new();
+		km.inner.add_key(2, [0x22; ROOT_KEY_LEN]).unwrap();
+		let ctx = counting_context(&km);
+		let clone = ctx.clone();
+
+		ctx.prepare(&[1, 2, 1]).unwrap();
+		assert_eq!(km.asked(), vec![vec![1, 2]], "an id once, in the order given");
+
+		// Neither the context nor a clone asks again for what was made available, and a call that
+		// has nothing new does not reach the manager at all.
+		ctx.prepare(&[2]).unwrap();
+		clone.prepare(&[1, 2]).unwrap();
+		ctx.prepare(&[]).unwrap();
+		assert_eq!(km.asked(), vec![vec![1, 2]]);
+
+		// A new id is asked for alone.
+		km.inner.add_key(3, [0x33; ROOT_KEY_LEN]).unwrap();
+		clone.prepare(&[1, 3]).unwrap();
+		assert_eq!(km.asked(), vec![vec![1, 2], vec![3]]);
+		ctx.prepare(&[3]).unwrap();
+		assert_eq!(km.asked().len(), 2, "the clone's answer is the context's too");
+
+		// A context of another database that shares the manager asks for itself.
+		let other = EncryptionContext::new(
+			Arc::<Counting>::clone(&km),
+			DbId::from_bytes([0xD1; 16]),
+			CipherSuite::Aes256Gcm,
+		);
+		other.prepare(&[1]).unwrap();
+		assert_eq!(km.asked().len(), 3);
+	}
+
+	#[test]
+	fn a_preparation_that_failed_is_asked_for_again() {
+		let km = Counting::new();
+		let ctx = counting_context(&km);
+		km.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+		let err = ctx.prepare(&[1]).unwrap_err();
+		assert!(err.is_retryable(), "{err:?}");
+
+		km.refuse.store(false, std::sync::atomic::Ordering::SeqCst);
+		ctx.prepare(&[1]).unwrap();
+		assert_eq!(km.asked(), vec![vec![1], vec![1]], "nothing was remembered of the failure");
+
+		// An id that the manager refuses for good is not remembered either.
+		assert_eq!(ctx.prepare(&[1, 9]).unwrap_err(), EncryptionError::UnknownKeyId);
+		assert_eq!(ctx.prepare(&[9]).unwrap_err(), EncryptionError::UnknownKeyId);
+		assert_eq!(km.asked().len(), 4);
+	}
+
+	#[test]
+	fn a_refresh_asks_again_and_the_keys_in_use_are_asked_for_with_the_active_one_first() {
+		let km = Counting::new();
+		km.inner.add_key(2, [0x22; ROOT_KEY_LEN]).unwrap();
+		km.inner.add_key(3, [0x33; ROOT_KEY_LEN]).unwrap();
+		let ctx = counting_context(&km);
+		ctx.prepare(&[1, 2]).unwrap();
+		ctx.refresh(&[1]).unwrap();
+		assert_eq!(km.asked(), vec![vec![1, 2], vec![1]]);
+
+		// The active key moved to one that was never asked for: it is asked for first, and then the
+		// keys that were in use, one at a time.
+		km.inner.set_active_key_id(3).unwrap();
+		ctx.refresh_in_use().unwrap();
+		assert_eq!(km.asked()[2..].to_vec(), vec![vec![3], vec![1], vec![2]]);
+		// It is in use now, so a preparation of it asks nothing.
+		ctx.prepare(&[3]).unwrap();
+		assert_eq!(km.asked().len(), 5);
+
+		// A key that was retired is not an error and is not asked for again afterwards.
+		km.inner.retire_key(1).unwrap();
+		ctx.refresh_in_use().unwrap();
+		let after_retiring = km.asked().len();
+		ctx.refresh_in_use().unwrap();
+		assert_eq!(km.asked().len() - after_retiring, 2, "only the active key and key 2 are left");
+
+		// A manager that cannot be reached is the answer for the active key, and for the others.
+		km.refuse.store(true, std::sync::atomic::Ordering::SeqCst);
+		let err = ctx.refresh_in_use().unwrap_err();
+		assert!(err.is_retryable(), "{err:?}");
 	}
 
 	#[test]
