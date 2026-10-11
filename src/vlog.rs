@@ -1344,6 +1344,12 @@ impl VLog {
 	/// This implements the "global minimum" GC approach where files are deleted
 	/// once nothing can possibly reference them. If iterators are active or a pin is
 	/// held, cleanup is skipped and will be retried on the next GC trigger.
+	///
+	/// It picks the files to delete by id and removes them by id, and it takes the bound as an
+	/// argument, so it must not overlap a [`reload`](Self::reload): ids mean other files after it,
+	/// and a bound from before it is no bound for the restored tables. Every caller holds
+	/// `flush_lock` or `compactions` (or runs before the tree is shared), which a restore holds
+	/// from before it replaces the directory until it is done.
 	pub(crate) fn cleanup_obsolete_files(&self, min_oldest_vlog: u32) -> Result<()> {
 		if self.pins.load(Ordering::SeqCst) > 0 {
 			return Ok(());
@@ -1436,9 +1442,14 @@ impl VLog {
 		// still be in flight. Only a file that was queued when the fds were taken may leave it:
 		// the active file is queued again by a rollover after that, for bytes this fsync may
 		// not cover.
+		//
+		// An entry is the descriptor that was queued, not its id: a sync that outlasts a reload
+		// fsyncs a file that is gone, and the log may have queued a file of the same id since,
+		// whose bytes this fsync did not cover. `queued` keeps the descriptors alive, so one
+		// cannot be freed and its address reused while this runs.
 		for (file_id, fd) in &queued {
 			self.fsync(*file_id, fd)?;
-			self.unsynced.lock().retain(|(id, _)| id != file_id);
+			self.unsynced.lock().retain(|(_, entry)| !Arc::ptr_eq(entry, fd));
 		}
 		if let Some((file_id, fd)) = &active {
 			self.fsync(*file_id, fd)?;
@@ -1490,6 +1501,13 @@ impl VLog {
 	pub(crate) fn dir_syncs(&self) -> usize {
 		let dir = self.path.canonicalize().unwrap_or_else(|_| self.path.clone());
 		crate::lsm::SYNCED_DIRECTORIES.lock().iter().filter(|synced| **synced == dir).count()
+	}
+
+	/// Test-only: the ids of the files that wait for an fsync because the writer rolled over from
+	/// them, in the order they were queued.
+	#[cfg(test)]
+	pub(crate) fn unsynced_file_ids(&self) -> Vec<u32> {
+		self.unsynced.lock().iter().map(|(id, _)| *id).collect()
 	}
 
 	/// Test-only: makes the next fsync of [`sync`](Self::sync) fail, as a failing disk does.

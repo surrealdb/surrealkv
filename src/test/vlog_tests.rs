@@ -1211,6 +1211,74 @@ async fn a_sync_leaves_a_file_that_rolled_over_while_it_ran_queued() {
 	);
 }
 
+/// A sync that began before a restore and ends after it must leave the queue entry of a file of
+/// the restored log alone, whatever its id. A restore starts the ids again one past the highest
+/// file it restored, so a file that the log queued since can have the id of the one the sync
+/// fsynced, and its bytes are not covered by that fsync. Taking the entry off by id would leave
+/// the file out of every later sync, and the values that were reported durable in it not on disk.
+///
+/// The restore runs in the gap of the sync, with the sync holding the descriptor of old file 2 and
+/// not having fsynced it: the sync removes its entry only after its fsync, which is the same
+/// window as a restore that runs in the middle of the fsync.
+#[test(tokio::test)]
+async fn a_sync_that_outlasts_a_reload_leaves_the_queued_file_that_has_the_id_it_fsynced() {
+	let (vlog, dir, _) = create_test_vlog(Some(Options {
+		vlog_max_file_size: 1024,
+		vlog_checksum_verification: VLogChecksumLevel::Full,
+		..Default::default()
+	}));
+	let vlog = Arc::new(vlog);
+	// Two entries fill a file: the third rolls over to file 2, and a sync fsyncs file 1 and
+	// takes it off the queue. The fourth fills file 2 and the fifth rolls over to file 3: file 2
+	// is queued.
+	for i in 0..3u8 {
+		vlog.append(format!("key-{i}").as_bytes(), &value_of(i, 600)).unwrap();
+	}
+	vlog.sync().unwrap();
+	for i in 3..5u8 {
+		vlog.append(format!("key-{i}").as_bytes(), &value_of(i, 600)).unwrap();
+	}
+	assert_eq!(vlog.unsynced_file_ids(), vec![2], "the writer rolled over from file 2");
+	let file = vlog.vlog_file_path(2);
+
+	let log = Arc::downgrade(&vlog);
+	vlog.set_sync_gap(Some(Arc::new(move || {
+		let log = log.upgrade().unwrap();
+		on_another_thread(move || {
+			// The restore: its directory holds file 1 and not 2 and 3, and the log is reloaded.
+			let held = log.hold_writer();
+			for id in [2, 3] {
+				std::fs::remove_file(log.vlog_file_path(id)).unwrap();
+			}
+			log.reload(held).unwrap();
+			assert_eq!(log.next_file_id.load(Ordering::SeqCst), 2, "one past the restored file");
+			// The first append creates file 2 again, and the third rolls over from it.
+			for i in 0..3u8 {
+				log.append(format!("new-{i}").as_bytes(), &value_of(i, 500)).unwrap();
+			}
+			assert_eq!(log.unsynced_file_ids(), vec![2], "the new file 2 is queued");
+		});
+	})));
+	vlog.sync().unwrap();
+	vlog.set_sync_gap(None);
+	assert_eq!(
+		vlog.unsynced_file_ids(),
+		vec![2],
+		"the sync took the new file 2 off the queue for the fsync of the file that was 2"
+	);
+
+	let before = synced_under(dir.path()).len();
+	vlog.sync_dirty().unwrap();
+	let synced = synced_under(dir.path());
+	assert!(
+		synced[before..].contains(&file),
+		"the next sync did not fsync the new file 2, which the sync that ran across the reload \
+		 did not cover: {:?}",
+		&synced[before..]
+	);
+	assert!(vlog.unsynced_file_ids().is_empty(), "and the file leaves the queue once it has");
+}
+
 /// A sync that runs while another has its fds and has not fsynced yet (an Immediate group's sync
 /// during a memtable flush's) fsyncs the file the writer rolled over from itself: it does not
 /// return, and acknowledge a commit, on the strength of an fsync that is still in flight in the
