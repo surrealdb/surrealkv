@@ -1854,9 +1854,9 @@ impl Core {
 	///
 	/// # Shutdown Sequence
 	///
-	/// 0. Checkpoints - refuses new ones, and waits for those running, which flush memtables and
-	///    copy files that the steps below close or release. Takes no thread, and a `close` that is
-	///    dropped meanwhile can be called again.
+	/// 0. Checkpoints and restores - refuses new ones, and waits for those running, which flush
+	///    memtables and copy or replace files that the steps below close or release. Takes no
+	///    thread, and a `close` that is dropped meanwhile can be called again.
 	/// 1. Commit pipeline shutdown - refuses new commits, and waits until every commit already
 	///    admitted has been decided
 	/// 2. Background tasks stopped - waits for ongoing operations
@@ -1876,8 +1876,9 @@ impl Core {
 			return Ok(());
 		}
 
-		// Step 0: Wait for the checkpoints that are running. Closing is marked after the wait,
-		// so a `close` that is dropped during it leaves a tree that a second call closes.
+		// Step 0: Wait for the checkpoints and the restore that are running. Closing is marked
+		// after the wait, so a `close` that is dropped during it leaves a tree that a second call
+		// closes.
 		self.checkpoints.close().await;
 		self.is_closed.store(true, Ordering::SeqCst);
 
@@ -2338,7 +2339,7 @@ impl Tree {
 	///
 	/// # Restoring
 	/// A checkpoint that begins while [`Tree::restore_from_checkpoint`] runs waits for it, and a
-	/// restore waits for the checkpoints that are running.
+	/// restore waits for the checkpoints that are running. Restores of the same tree take turns.
 	pub fn create_checkpoint<P: AsRef<Path>>(
 		&self,
 		checkpoint_dir: P,
@@ -2362,7 +2363,8 @@ impl Tree {
 	///
 	/// Waits for the checkpoints of this tree that are running, and for the flushes, compactions
 	/// and rotations of the memtable and the WAL that are, and keeps the ones that begin meanwhile
-	/// waiting until the restore is over.
+	/// waiting until the restore is over. [`Tree::close`] waits for a restore that runs, and a
+	/// restore that begins once `close` has fails without touching the database.
 	pub fn restore_from_checkpoint<P: AsRef<Path>>(
 		&self,
 		checkpoint_dir: P,
@@ -2370,7 +2372,7 @@ impl Tree {
 		// A checkpoint of this tree that is running copies the files this replaces, and takes the
 		// locks below to flush: wait for it, before anything else so that commits are not refused
 		// meanwhile, and keep the next one from starting until the restore is done.
-		let _checkpoints = self.core.checkpoints.exclude();
+		let _checkpoints = self.core.checkpoints.exclude()?;
 
 		// Block new commits from entering the critical section for the duration
 		// of the restore. The restore is a multi-step rewrite of nearly all
@@ -2551,8 +2553,8 @@ impl Tree {
 
 	/// Closes the tree. Commits already admitted finish first, each with its real outcome, and a
 	/// commit that begins once the commit pipeline is shut down fails with
-	/// [`Error::PipelineStall`]. Checkpoints that are running finish first, before the pipeline is
-	/// shut down, and one that begins after the close fails.
+	/// [`Error::PipelineStall`]. Checkpoints that are running, and a restore that runs, finish
+	/// first, before the pipeline is shut down, and one that begins after the close fails.
 	pub async fn close(&self) -> Result<()> {
 		self.core.close().await
 	}

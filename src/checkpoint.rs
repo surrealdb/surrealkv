@@ -62,11 +62,14 @@ fn resolve(path: &Path) -> std::io::Result<PathBuf> {
 /// checkpoints that would begin after it and waits for the ones running, without holding a
 /// thread: a checkpoint is synchronous and needs nothing from a runtime to finish.
 ///
-/// A restore of the same tree excludes the checkpoints too, see [`exclude`](Self::exclude).
+/// A restore of the same tree excludes the checkpoints too, see [`exclude`](Self::exclude), and
+/// `close` waits for the restore that runs and refuses the ones that would begin after it: a
+/// restore that went on under a close would replace the files of a database that the close
+/// releases to other processes.
 #[derive(Default)]
 pub(crate) struct CheckpointGate {
 	state: parking_lot::Mutex<GateState>,
-	/// Wakes `close` when the last running checkpoint ends.
+	/// Wakes `close` when the last running checkpoint, or the restore that runs, ends.
 	idle: tokio::sync::Notify,
 	/// Wakes the restores that wait for the last running checkpoint to end, and the checkpoints
 	/// that wait for the last restore to be over.
@@ -77,9 +80,14 @@ pub(crate) struct CheckpointGate {
 struct GateState {
 	running: usize,
 	closed: bool,
-	/// The restores that wait for the running checkpoints or run. No checkpoint begins while there
-	/// is one, so that a restore is not kept waiting by checkpoints that follow one another.
+	/// The restores that wait for the running checkpoints or for the restore that runs, or run. No
+	/// checkpoint begins while there is one, so that a restore is not kept waiting by checkpoints
+	/// that follow one another.
 	restores: usize,
+	/// A restore holds the exclusion. Restores take turns: they refuse the commits with one flag
+	/// that the end of a restore clears, so a second restore that began its work before the first
+	/// one's end would replace the files with the commits admitted.
+	excluding: bool,
 }
 
 /// A checkpoint that is running; see [`CheckpointGate`].
@@ -107,37 +115,53 @@ impl CheckpointGate {
 		})
 	}
 
-	/// Refuses the checkpoints that begin from now on and waits for the ones running. Only
-	/// `Core::close` calls it, one caller at a time, so a single wake-up is enough. If the future
-	/// is dropped before the wait is over, checkpoints are allowed again.
+	/// Refuses the checkpoints and the restores that begin from now on and waits for the
+	/// checkpoints running and the restore that runs. Only `Core::close` calls it, one caller at
+	/// a time, so a single wake-up is enough. If the future is dropped before the wait is over,
+	/// checkpoints and restores are allowed again.
 	pub(crate) async fn close(&self) {
 		let reopen = Reopen(self);
 		self.state.lock().closed = true;
-		while self.running() > 0 {
+		while self.busy() {
 			self.idle.notified().await;
 		}
 		std::mem::forget(reopen);
 	}
 
-	fn running(&self) -> usize {
-		self.state.lock().running
+	/// Whether a checkpoint runs, or a restore holds the exclusion.
+	fn busy(&self) -> bool {
+		let state = self.state.lock();
+		state.running > 0 || state.excluding
 	}
 
-	/// Waits for the checkpoints that are running and keeps the ones that begin from now on
-	/// waiting, until the guard is dropped. A restore replaces the files that a checkpoint copies,
-	/// and one that went on under it would copy the files of two databases into a checkpoint that
-	/// opens, with no error. A restore takes it before any other lock: a checkpoint holds its
-	/// guard from its first step, and flushes under the locks that the restore takes next, so
-	/// waiting for it after them would deadlock.
-	pub(crate) fn exclude(&self) -> CheckpointExclusion<'_> {
+	/// Waits for the checkpoints that are running and for the restore that holds the exclusion,
+	/// and keeps the checkpoints that begin from now on waiting, until the guard is dropped. A
+	/// restore replaces the files that a checkpoint copies, and one that went on under it would
+	/// copy the files of two databases into a checkpoint that opens, with no error. A restore
+	/// takes it before any other lock: a checkpoint holds its guard from its first step, and
+	/// flushes under the locks that the restore takes next, so waiting for it after them would
+	/// deadlock.
+	///
+	/// Fails, changing nothing, if `close` has begun: `close` releases the database to other
+	/// processes, and a restore that went on after it would replace their files.
+	pub(crate) fn exclude(&self) -> Result<CheckpointExclusion<'_>> {
 		let mut state = self.state.lock();
 		state.restores += 1;
-		while state.running > 0 {
+		while state.running > 0 || state.excluding {
 			self.turns.wait(&mut state);
 		}
-		CheckpointExclusion {
-			gate: self,
+		if state.closed {
+			state.restores -= 1;
+			// The checkpoints that waited for it find the gate closed.
+			self.turns.notify_all();
+			return Err(Error::Other(
+				"Cannot restore from a checkpoint: the tree is closing or closed".to_string(),
+			));
 		}
+		state.excluding = true;
+		Ok(CheckpointExclusion {
+			gate: self,
+		})
 	}
 }
 
@@ -150,9 +174,12 @@ impl Drop for CheckpointExclusion<'_> {
 	fn drop(&mut self) {
 		let mut state = self.gate.state.lock();
 		state.restores -= 1;
-		if state.restores == 0 {
-			self.gate.turns.notify_all();
+		state.excluding = false;
+		if state.closed {
+			self.gate.idle.notify_one();
 		}
+		// The next restore, or the checkpoints that waited for the last one.
+		self.gate.turns.notify_all();
 	}
 }
 
