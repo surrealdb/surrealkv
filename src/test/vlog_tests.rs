@@ -1173,7 +1173,15 @@ fn on_another_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) 
 	std::thread::spawn(move || {
 		let _ = done.send(f());
 	});
-	wait.recv_timeout(Duration::from_secs(20)).expect("the call did not return: a lock is held")
+	match wait.recv_timeout(Duration::from_secs(20)) {
+		Ok(result) => result,
+		Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+			panic!("the call did not return: a lock is held")
+		}
+		Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+			panic!("the call panicked, see its message above")
+		}
+	}
 }
 
 /// A rollover that happens while a sync is between taking its fds and fsyncing them queues the
@@ -1208,6 +1216,153 @@ async fn a_sync_leaves_a_file_that_rolled_over_while_it_ran_queued() {
 		synced.iter().filter(|path| **path == file).count(),
 		2,
 		"the file the writer rolled over from during a sync is fsynced by the next one: {synced:?}"
+	);
+}
+
+/// A sync that began before a restore and ends after it must leave the queue entry of a file of
+/// the restored log alone, whatever its id. A restore starts the ids again one past the highest
+/// file it restored, so a file that the log queued since can have the id of the one the sync
+/// fsynced, and its bytes are not covered by that fsync. Taking the entry off by id would leave
+/// the file out of every later sync, and the values that were reported durable in it not on disk.
+///
+/// The restore runs in the gap of the sync, with the sync holding the descriptor of old file 2 and
+/// not having fsynced it: the sync removes its entry only after its fsync, which is the same
+/// window as a restore that runs in the middle of the fsync.
+#[test(tokio::test)]
+async fn a_sync_that_outlasts_a_reload_leaves_the_queued_file_that_has_the_id_it_fsynced() {
+	let (vlog, dir, _) = create_test_vlog(Some(Options {
+		vlog_max_file_size: 1024,
+		vlog_checksum_verification: VLogChecksumLevel::Full,
+		..Default::default()
+	}));
+	let vlog = Arc::new(vlog);
+	// Two entries fill a file: the third rolls over to file 2, and a sync fsyncs file 1 and
+	// takes it off the queue. The fourth fills file 2 and the fifth rolls over to file 3: file 2
+	// is queued.
+	for i in 0..3u8 {
+		vlog.append(format!("key-{i}").as_bytes(), &value_of(i, 600)).unwrap();
+	}
+	vlog.sync().unwrap();
+	for i in 3..5u8 {
+		vlog.append(format!("key-{i}").as_bytes(), &value_of(i, 600)).unwrap();
+	}
+	assert_eq!(vlog.unsynced_file_ids(), vec![2], "the writer rolled over from file 2");
+	let file = vlog.vlog_file_path(2);
+
+	let log = Arc::downgrade(&vlog);
+	vlog.set_sync_gap(Some(Arc::new(move || {
+		let log = log.upgrade().unwrap();
+		on_another_thread(move || {
+			// The restore: its directory holds file 1 and not 2 and 3, and the log is reloaded.
+			let held = log.hold_writer();
+			for id in [2, 3] {
+				std::fs::remove_file(log.vlog_file_path(id)).unwrap();
+			}
+			log.reload(held).unwrap();
+			assert_eq!(log.next_file_id.load(Ordering::SeqCst), 2, "one past the restored file");
+			// The first append creates file 2 again, and the third rolls over from it.
+			for i in 0..3u8 {
+				log.append(format!("new-{i}").as_bytes(), &value_of(i, 500)).unwrap();
+			}
+			assert_eq!(log.unsynced_file_ids(), vec![2], "the new file 2 is queued");
+		});
+	})));
+	vlog.sync().unwrap();
+	vlog.set_sync_gap(None);
+	assert_eq!(
+		vlog.unsynced_file_ids(),
+		vec![2],
+		"the sync took the new file 2 off the queue for the fsync of the file that was 2"
+	);
+
+	let before = synced_under(dir.path()).len();
+	vlog.sync_dirty().unwrap();
+	let synced = synced_under(dir.path());
+	assert!(
+		synced[before..].contains(&file),
+		"the next sync did not fsync the new file 2, which the sync that ran across the reload \
+		 did not cover: {:?}",
+		&synced[before..]
+	);
+	assert!(vlog.unsynced_file_ids().is_empty(), "and the file leaves the queue once it has");
+}
+
+/// A sync that began before a reload settles what the log had appended and created when it
+/// began, and nothing after: the entries appended to the restored log and its new file are still
+/// to be made durable, and the `sync_dirty` that a WAL rotation makes before it seals a segment
+/// must fsync them instead of returning because a sync that ran across the reload completed.
+#[test(tokio::test)]
+async fn a_sync_that_outlasts_a_reload_does_not_settle_what_came_after_it() {
+	let (vlog, dir, _) = create_test_vlog(Some(Options {
+		vlog_max_file_size: 1024,
+		vlog_checksum_verification: VLogChecksumLevel::Full,
+		..Default::default()
+	}));
+	let vlog = Arc::new(vlog);
+	// Nothing is synced yet: the sync below has an entry and a file creation to settle.
+	vlog.append(b"key-0", &value_of(0, 100)).unwrap();
+	vlog.append(b"key-1", &value_of(1, 100)).unwrap();
+
+	let log = Arc::downgrade(&vlog);
+	vlog.set_sync_gap(Some(Arc::new(move || {
+		let log = log.upgrade().unwrap();
+		on_another_thread(move || {
+			// The restored directory holds no file: the ids start again at 1.
+			let held = log.hold_writer();
+			std::fs::remove_file(log.vlog_file_path(1)).unwrap();
+			log.reload(held).unwrap();
+			assert_eq!(log.next_file_id.load(Ordering::SeqCst), 1);
+			log.append(b"new-0", &value_of(2, 100)).unwrap();
+		});
+	})));
+	vlog.sync().unwrap();
+	vlog.set_sync_gap(None);
+
+	let (files, directories) = (synced_under(dir.path()).len(), vlog.dir_syncs());
+	vlog.sync_dirty().unwrap();
+	let synced = synced_under(dir.path());
+	assert!(
+		synced[files..].contains(&vlog.vlog_file_path(1)),
+		"the sync that ran across the reload settled the entry that the new file 1 holds, which \
+		 it did not fsync: {:?}",
+		&synced[files..]
+	);
+	assert!(
+		vlog.dir_syncs() > directories,
+		"the sync that ran across the reload settled the creation of the new file 1, whose name \
+		 it did not fsync"
+	);
+	vlog.sync_dirty().unwrap();
+	assert_eq!(synced_under(dir.path()).len(), synced.len(), "and the next one has nothing left");
+}
+
+/// A reload makes a file id the id of the restored file: a read through a pointer of the restored
+/// log finds the restored value, and the handle and the cached value of the file that had the id
+/// are not used for it.
+#[test(tokio::test)]
+async fn a_reload_makes_the_reads_of_a_file_id_go_to_the_restored_file() {
+	let (vlog, _dir, _) = create_test_vlog(None);
+	let old = vlog.append(b"key", &value_of(1, 300)).unwrap();
+	vlog.sync().unwrap();
+	assert_eq!(vlog.get(&old).unwrap(), value_of(1, 300), "reads and caches the old file 1");
+
+	// The restored directory has a file 1 of its own, with an entry at the same offset.
+	let (other, _other_dir, _) = create_test_vlog(None);
+	let restored = other.append(b"key", &value_of(2, 300)).unwrap();
+	other.sync().unwrap();
+	assert_eq!((restored.file_id, restored.offset), (old.file_id, old.offset));
+	assert_ne!(restored.checksum, old.checksum);
+
+	let held = vlog.hold_writer();
+	std::fs::remove_file(vlog.vlog_file_path(1)).unwrap();
+	std::fs::copy(other.vlog_file_path(1), vlog.vlog_file_path(1)).unwrap();
+	vlog.reload(held).unwrap();
+
+	assert_eq!(vlog.get(&restored).unwrap(), value_of(2, 300), "the restored file is read");
+	assert_ne!(
+		vlog.get(&old).ok(),
+		Some(value_of(1, 300)),
+		"the value of the old file 1 was served for the pointer into it after the reload"
 	);
 }
 
