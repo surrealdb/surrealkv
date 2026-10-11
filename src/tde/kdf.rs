@@ -1,7 +1,8 @@
 //! The key of one file, derived from a root key, a fresh salt and the identity of the file.
 //!
-//! The engine owns key uniqueness, not the key manager. Whatever root a manager returns, even
-//! the same bytes for every id, a file key is
+//! No key manager decides which key a file is sealed under: the engine always derives it, so a
+//! manager cannot make two files share one, even by returning the same root for every id. A file
+//! key is
 //!
 //! ```text
 //! HKDF-SHA256(ikm = root, salt = salt32, info = LABEL || suite(1) || file_kind(1)
@@ -26,7 +27,7 @@ use super::identity::{DbId, FileIdentity, FileKind, DB_ID_LEN};
 use super::keys::{KeyManager, KeyState, ROOT_KEY_LEN};
 use super::random::{fresh_salt, SALT_LEN};
 use super::suite::CipherSuite;
-use crate::error::EncryptionError;
+use crate::error::{EncryptionError, KeyProviderFailure};
 
 /// Length in bytes of a file key.
 pub const FILE_KEY_LEN: usize = 32;
@@ -39,6 +40,9 @@ const HDR_LABEL: &[u8] = b"surrealkv/tde/v1/hdr";
 
 /// Length of the `info` input: the label, suite, file kind, key id, file id and database id.
 const INFO_LEN: usize = DEK_LABEL.len() + 1 + 1 + 4 + 8 + DB_ID_LEN;
+
+/// How often the active key is looked up again when a rotation moves it between two questions.
+const ACTIVE_KEY_ATTEMPTS: usize = 4;
 
 /// The key of one file, and the identity and salt it was derived for.
 ///
@@ -73,7 +77,9 @@ impl FileKey {
 	/// Draws a fresh salt from the OS random number generator, which is why a key made here can
 	/// seal. Fails with `KeyRetired` if the active key is not in the active state, with
 	/// `UnknownKeyId` if the manager does not know it, with whatever `root_key` fails with, and
-	/// with `KeyProvider(RandomSource)` if no salt could be drawn.
+	/// with `KeyProvider(RandomSource)` if no salt could be drawn. If the active key keeps
+	/// changing while it is looked up, which only a manager that rotates continuously does, it
+	/// fails with the retryable `KeyProvider(Unavailable)`.
 	pub fn generate(
 		key_manager: &dyn KeyManager,
 		db_id: DbId,
@@ -81,13 +87,7 @@ impl FileKey {
 		file_kind: FileKind,
 		file_id: u64,
 	) -> Result<Self, EncryptionError> {
-		let key_id = key_manager.active_key_id();
-		match key_manager.key_state(key_id) {
-			KeyState::Active => {}
-			KeyState::DecryptOnly | KeyState::Retired => return Err(EncryptionError::KeyRetired),
-			KeyState::Unknown => return Err(EncryptionError::UnknownKeyId),
-		}
-		let root = key_manager.root_key(key_id)?;
+		let (key_id, root) = active_root(key_manager)?;
 		let salt = fresh_salt()?;
 		let identity = FileIdentity::new(suite, file_kind, key_id, file_id, db_id);
 		Self::derive(&root, salt, identity, true)
@@ -188,6 +188,34 @@ impl FileKey {
 	}
 }
 
+/// The active key id and its root, read from the manager.
+///
+/// The manager answers `active_key_id`, `key_state` and `root_key` separately, so a rotation can
+/// land between them: the id that was active a moment ago is decrypt-only by the time its state is
+/// read. That is not a retired key, and failing the commit that happened to start a file at that
+/// moment would turn an ordinary rotation into an error that is not retryable. A refusal is
+/// therefore taken at its word only if the active key is still the one that was asked about;
+/// otherwise the lookup starts again, a few times.
+fn active_root(
+	key_manager: &dyn KeyManager,
+) -> Result<(u32, Zeroizing<[u8; ROOT_KEY_LEN]>), EncryptionError> {
+	for _ in 0..ACTIVE_KEY_ATTEMPTS {
+		let key_id = key_manager.active_key_id();
+		let outcome = match key_manager.key_state(key_id) {
+			KeyState::Active => key_manager.root_key(key_id),
+			KeyState::DecryptOnly | KeyState::Retired => Err(EncryptionError::KeyRetired),
+			KeyState::Unknown => Err(EncryptionError::UnknownKeyId),
+		};
+		match outcome {
+			Ok(root) => return Ok((key_id, root)),
+			Err(EncryptionError::KeyRetired | EncryptionError::UnknownKeyId)
+				if key_manager.active_key_id() != key_id => {}
+			Err(err) => return Err(err),
+		}
+	}
+	Err(EncryptionError::KeyProvider(KeyProviderFailure::Unavailable))
+}
+
 /// One 32 byte key out of the extraction, for `label`.
 fn expand(
 	hkdf: &Hkdf<Sha256>,
@@ -218,6 +246,7 @@ fn info(label: &[u8], identity: &FileIdentity) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
 	use std::collections::HashMap;
+	use std::sync::atomic::{AtomicU32, Ordering};
 
 	use super::*;
 	use crate::tde::testutil::assert_leaks_no_bytes;
@@ -473,6 +502,77 @@ mod tests {
 		);
 		assert_eq!(generate(&Stuck(KeyState::Retired)).unwrap_err(), EncryptionError::KeyRetired);
 		assert_eq!(generate(&Stuck(KeyState::Unknown)).unwrap_err(), EncryptionError::UnknownKeyId);
+	}
+
+	/// A manager that is rotated while a file is being started: the first time it is asked which
+	/// key is active it says key 1, every later time key 2, and from then on key 1 is decrypt-only.
+	struct RotatedMidLookup {
+		asked: AtomicU32,
+	}
+
+	impl KeyManager for RotatedMidLookup {
+		fn active_key_id(&self) -> u32 {
+			if self.asked.fetch_add(1, Ordering::SeqCst) == 0 {
+				1
+			} else {
+				2
+			}
+		}
+
+		fn key_state(&self, key_id: u32) -> KeyState {
+			if key_id == 2 {
+				KeyState::Active
+			} else {
+				KeyState::DecryptOnly
+			}
+		}
+
+		fn root_key(&self, key_id: u32) -> Result<Zeroizing<[u8; ROOT_KEY_LEN]>, EncryptionError> {
+			Ok(Zeroizing::new([key_id as u8; ROOT_KEY_LEN]))
+		}
+	}
+
+	#[test]
+	fn a_rotation_between_two_questions_to_the_manager_is_not_a_retired_key() {
+		let km = RotatedMidLookup {
+			asked: AtomicU32::new(0),
+		};
+		let key =
+			FileKey::generate(&km, db_id(), CipherSuite::Aes256Gcm, FileKind::Wal, 6).unwrap();
+		assert_eq!(key.identity().key_id, 2);
+		assert!(key.can_seal());
+	}
+
+	/// A manager whose active key changes every time it is asked, which no manager does for long.
+	struct AlwaysRotating {
+		asked: AtomicU32,
+	}
+
+	impl KeyManager for AlwaysRotating {
+		fn active_key_id(&self) -> u32 {
+			self.asked.fetch_add(1, Ordering::SeqCst)
+		}
+
+		fn key_state(&self, _key_id: u32) -> KeyState {
+			KeyState::DecryptOnly
+		}
+
+		fn root_key(&self, _key_id: u32) -> Result<Zeroizing<[u8; ROOT_KEY_LEN]>, EncryptionError> {
+			Ok(Zeroizing::new([0x55; ROOT_KEY_LEN]))
+		}
+	}
+
+	#[test]
+	fn a_key_that_keeps_changing_under_the_lookup_is_a_retryable_failure() {
+		let km = AlwaysRotating {
+			asked: AtomicU32::new(0),
+		};
+		let err =
+			FileKey::generate(&km, db_id(), CipherSuite::Aes256Gcm, FileKind::Wal, 6).unwrap_err();
+		assert_eq!(err, EncryptionError::KeyProvider(KeyProviderFailure::Unavailable));
+		assert!(err.is_retryable());
+		// It gave up after a few questions instead of asking for ever.
+		assert!(km.asked.load(Ordering::SeqCst) <= 2 * ACTIVE_KEY_ATTEMPTS as u32);
 	}
 
 	#[test]
