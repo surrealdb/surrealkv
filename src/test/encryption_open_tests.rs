@@ -30,7 +30,7 @@ use crate::tde::{
 	Zeroizing,
 	ROOT_KEY_LEN,
 };
-use crate::{Error, Mode, Options, Tree};
+use crate::{Error, Mode, Options, Tree, TreeBuilder};
 
 pub(super) const SUITES: [CipherSuite; 2] =
 	[CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305];
@@ -687,4 +687,26 @@ async fn opening_an_encrypted_database_never_leaves_a_copy_of_its_data_in_the_cl
 		.chain(files_with_extension(&opts.vlog_dir(), "vlog"))
 		.collect();
 	assert!(files.iter().any(|file| contains(&fs::read(file).unwrap(), b"ev-canary")));
+}
+
+#[tokio::test]
+async fn the_options_that_a_build_returns_do_not_carry_one_database_into_another() {
+	for suite in SUITES {
+		let dir = TempDir::new().unwrap();
+		let first = options(&dir.path().join("first")).with_encryption(manager(), suite);
+		let (tree, kept) = TreeBuilder::with_options(first).build_with_options().unwrap();
+		tree.close().await.unwrap();
+
+		// What comes back is what was given, with no identity in it.
+		assert!(kept.encryption_context().is_none(), "{suite:?}");
+		let one = describe_manifest_file(kept.manifest_file_path(0)).unwrap().db_id.unwrap();
+
+		// Used again for another directory, it makes another database, with an identity of its own.
+		let second = (*kept).clone().with_path(dir.path().join("second"));
+		let second_manifest = second.manifest_file_path(0);
+		let (tree, _) = TreeBuilder::with_options(second).build_with_options().unwrap();
+		tree.close().await.unwrap();
+		let two = describe_manifest_file(second_manifest).unwrap().db_id.unwrap();
+		assert_ne!(one, two, "{suite:?}");
+	}
 }

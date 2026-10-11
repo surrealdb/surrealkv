@@ -2852,9 +2852,11 @@ impl TreeBuilder {
 	/// This is useful when you need to keep a reference to the options
 	/// after creating the tree.
 	pub fn build_with_options(self) -> Result<(Tree, Arc<Options>)> {
-		let tree = Tree::new(Arc::new(self.opts))?;
-		// The options the tree runs with, which hold the encryption of the database if it has any
-		let opts = Arc::clone(&tree.core.inner.opts);
+		// The options as they were given, and not the ones the tree runs with: those carry the
+		// identity of the database they were opened for, and a caller that moves them to another
+		// path would make a second database with the first one's identity.
+		let opts = Arc::new(self.opts);
+		let tree = Tree::new(Arc::clone(&opts))?;
 		Ok((tree, opts))
 	}
 }
