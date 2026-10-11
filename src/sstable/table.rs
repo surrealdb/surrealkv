@@ -920,6 +920,9 @@ pub enum IndexType {
 #[derive(Clone)]
 pub(crate) struct Table {
 	pub id: u64,
+	/// The key of this instance's blocks in the block cache: unlike `id`, never given to another
+	/// table, see `cache::next_instance_id`.
+	cache_id: u64,
 	pub file: Arc<dyn File>,
 	pub(crate) object_store: Arc<dyn crate::storage::ObjectStore>,
 	pub file_size: u64,
@@ -966,10 +969,12 @@ impl Table {
 		// Step 1: Read footer
 		let footer = read_footer(Arc::clone(&file), file_size as usize)?;
 
+		let cache_id = crate::cache::next_instance_id();
+
 		// Step 2: Load partitioned index
 		let index_block = {
 			let partitioned_index =
-				Index::new(id, Arc::clone(&opts), Arc::clone(&file), &footer.index)?;
+				Index::new(id, cache_id, Arc::clone(&opts), Arc::clone(&file), &footer.index)?;
 			IndexType::Partitioned(partitioned_index)
 		};
 
@@ -998,6 +1003,7 @@ impl Table {
 			{
 				TableFilter::Partitioned(PartitionedFilterReader::new(
 					id,
+					cache_id,
 					Arc::clone(&opts),
 					Arc::clone(&file),
 					&handle,
@@ -1021,6 +1027,7 @@ impl Table {
 		let has_rd = !writer_metadata.range_deletions.is_empty();
 		Ok(Table {
 			id,
+			cache_id,
 			file,
 			object_store,
 			file_size,
@@ -1064,7 +1071,8 @@ impl Table {
 	/// Reads a data block, using cache if available.
 	pub(crate) fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		// Check cache first
-		if let Some(block) = self.opts.block_cache.get_data_block(self.id, location.offset() as u64)
+		if let Some(block) =
+			self.opts.block_cache.get_data_block(self.cache_id, location.offset() as u64)
 		{
 			return Ok(block);
 		}
@@ -1078,7 +1086,11 @@ impl Table {
 		let b = Arc::new(b);
 
 		// Insert into cache
-		self.opts.block_cache.insert_data_block(self.id, location.offset() as u64, Arc::clone(&b));
+		self.opts.block_cache.insert_data_block(
+			self.cache_id,
+			location.offset() as u64,
+			Arc::clone(&b),
+		);
 
 		Ok(b)
 	}
@@ -1094,7 +1106,7 @@ impl Table {
 	) -> Result<Arc<Block>> {
 		// Check history cache first
 		if let Some(block) =
-			self.opts.block_cache.get_data_block_history(self.id, location.offset() as u64)
+			self.opts.block_cache.get_data_block_history(self.cache_id, location.offset() as u64)
 		{
 			return Ok(block);
 		}
@@ -1105,7 +1117,7 @@ impl Table {
 
 		// Insert into history cache
 		self.opts.block_cache.insert_data_block_history(
-			self.id,
+			self.cache_id,
 			location.offset() as u64,
 			Arc::clone(&b),
 		);
@@ -1116,7 +1128,8 @@ impl Table {
 	/// Reads a data block asynchronously, using cache if available.
 	pub(crate) async fn read_block_async(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		// Check cache first
-		if let Some(block) = self.opts.block_cache.get_data_block(self.id, location.offset() as u64)
+		if let Some(block) =
+			self.opts.block_cache.get_data_block(self.cache_id, location.offset() as u64)
 		{
 			return Ok(block);
 		}
@@ -1141,7 +1154,11 @@ impl Table {
 		let b = Arc::new(Block::new(block, Arc::clone(&self.opts.internal_comparator)));
 
 		// Insert into cache
-		self.opts.block_cache.insert_data_block(self.id, location.offset() as u64, Arc::clone(&b));
+		self.opts.block_cache.insert_data_block(
+			self.cache_id,
+			location.offset() as u64,
+			Arc::clone(&b),
+		);
 
 		Ok(b)
 	}

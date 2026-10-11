@@ -113,7 +113,8 @@ async fn test_vlog_caching() {
 	assert_eq!(retrieved1, retrieved2);
 
 	// Verify that the cache contains the value
-	let cached_value = vlog.opts.block_cache.get_vlog(pointer.file_id, pointer.offset);
+	let cached_value =
+		vlog.opts.block_cache.get_vlog(vlog.cache_id(pointer.file_id), pointer.offset);
 	assert!(cached_value.is_some());
 	assert_eq!(cached_value.unwrap(), value);
 }

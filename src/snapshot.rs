@@ -173,15 +173,16 @@ impl Snapshot {
 	/// This is a helper method used by both iterators and optimized operations
 	/// like count
 	pub(crate) fn collect_iter_state(&self) -> Result<IterState> {
-		let active = self.core.active_memtable.read()?.clone();
-		let immutable = self
-			.core
-			.immutable_memtables
-			.read()?
-			.iter()
-			.map(|entry| Arc::clone(&entry.memtable))
-			.collect();
-		let levels = self.core.level_manifest.read()?.levels.clone();
+		// The three locks are held together, in the order everything else takes them: a restore
+		// replaces the memtables and the manifest under all of them, and a state read one lock
+		// at a time could be the memtable from before it over the tables it restored.
+		let active_guard = self.core.active_memtable.read()?;
+		let levels_guard = self.core.level_manifest.read()?;
+		let immutable_guard = self.core.immutable_memtables.read()?;
+		let active = Arc::clone(&active_guard);
+		let immutable = immutable_guard.iter().map(|entry| Arc::clone(&entry.memtable)).collect();
+		let levels = levels_guard.levels.clone();
+		drop((immutable_guard, levels_guard, active_guard));
 
 		Ok(IterState {
 			active,
@@ -1030,24 +1031,20 @@ impl SnapshotIterator<'_> {
 		let snapshot = Snapshot::new(Arc::clone(&core), seq_num);
 		let iter_state = snapshot.collect_iter_state()?;
 
-		let merge_iter = KMergeIterator::new_from(iter_state, range);
-
+		// From the state the iterator reads, not from the tree again: a restore in between would
+		// give it the range deletions of the state that replaced it.
 		let mut range_deletions = Vec::new();
-		if let Ok(active) = core.active_memtable.read() {
-			range_deletions.extend(active.range_deletions.read().clone());
+		range_deletions.extend(iter_state.active.range_deletions.read().clone());
+		for memtable in &iter_state.immutable {
+			range_deletions.extend(memtable.range_deletions.read().clone());
 		}
-		if let Ok(imm) = core.immutable_memtables.read() {
-			for entry in imm.iter() {
-				range_deletions.extend(entry.memtable.range_deletions.read().clone());
+		for level in &iter_state.levels {
+			for table in &level.tables {
+				range_deletions.extend(table.range_deletions.read().clone());
 			}
 		}
-		if let Ok(manifest) = core.level_manifest.read() {
-			for level in &manifest.levels {
-				for table in &level.tables {
-					range_deletions.extend(table.range_deletions.read().clone());
-				}
-			}
-		}
+
+		let merge_iter = KMergeIterator::new_from(iter_state, range);
 
 		Ok(Self {
 			merge_iter,
