@@ -326,7 +326,10 @@ async fn a_checkpoint_that_was_taken_while_the_value_log_was_written_is_valid() 
 		live.close().await.unwrap();
 
 		// Only the newest file can be that: one with a newer file after it is a file that is
-		// damaged, and the checkpoint is refused as one that is not usable, with nothing cleared.
+		// damaged, and nothing is cleared. Two ways, as the checks reach them. A file whose header
+		// is the cut copy of another file's header (here, of `newest`, under the ids after it) does
+		// not say that it is the file it is named: that is damage, and the checkpoint is not
+		// usable.
 		let live = Tree::new(encrypted(&root, manager(), suite)).unwrap();
 		let before = snapshot(&root);
 		let damaged = checkpoints.path().join("damaged");
@@ -338,6 +341,18 @@ async fn a_checkpoint_that_was_taken_while_the_value_log_was_written_is_valid() 
 			matches!(&err, Error::InvalidArgument(message) if message.contains("not a usable checkpoint")),
 			"{suite:?}: {err:?}"
 		);
+		assert!(snapshot(&root) == before, "{suite:?}: a refused restore changed the files");
+
+		// A file of its own id whose header ends before its crypto header does, with a newer file
+		// (empty, as one that was just created) after it: the header is well formed as far as it
+		// goes, and what is missing is the part that the key is checked with, so the error is the
+		// one of an encryption header that is cut, kept as it is like the one of a table.
+		let cut_older = checkpoints.path().join("cut-older");
+		copy_dir(&cp, &cut_older);
+		fs::write(vlog_path(&cut_older, newest), &header[..100]).unwrap();
+		fs::write(vlog_path(&cut_older, newest + 1), b"").unwrap();
+		let err = live.restore_from_checkpoint(&cut_older).unwrap_err();
+		assert_eq!(encryption_error(err, "restore"), EncryptionError::MalformedHeader, "{suite:?}");
 		assert!(snapshot(&root) == before, "{suite:?}: a refused restore changed the files");
 		live.close().await.unwrap();
 	}
