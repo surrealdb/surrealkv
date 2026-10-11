@@ -51,6 +51,7 @@
 //! gets is the contents of a block, or a `Block` made of them.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
@@ -277,6 +278,17 @@ pub(crate) struct BlockSource {
 	/// The key under which the block cache keeps the blocks that this source reads, see
 	/// `cache_id`.
 	cache_id: u64,
+	/// What was read from the file, shared by the clones.
+	reads: Arc<ReadCounters>,
+}
+
+/// How much a source asked of its file. A request is counted when it is made, which is a read of
+/// a block with its trailer, of the footer, or of a legacy filter, so what a short read costs
+/// the file over and above that is not in it.
+#[derive(Default)]
+struct ReadCounters {
+	requests: AtomicU64,
+	bytes: AtomicU64,
 }
 
 /// A block that was checked against everything that its file can say about it, and that is
@@ -307,7 +319,28 @@ impl BlockSource {
 			file_size,
 			protection,
 			cache_id: crate::cache::next_instance_id(),
+			reads: Arc::new(ReadCounters::default()),
 		}
+	}
+
+	/// The number of reads of the file that this source and its clones asked for: the footer when
+	/// the table was opened, and a block with its trailer for each block that was not found in
+	/// the block cache. A test of a feature that is meant to change what is read can assert that
+	/// reads happened, and how many.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn raw_reads(&self) -> u64 {
+		self.reads.requests.load(Ordering::Relaxed)
+	}
+
+	/// The number of bytes that `raw_reads` asked for.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn raw_read_bytes(&self) -> u64 {
+		self.reads.bytes.load(Ordering::Relaxed)
+	}
+
+	fn count_read(&self, len: usize) {
+		self.reads.requests.fetch_add(1, Ordering::Relaxed);
+		self.reads.bytes.fetch_add(len as u64, Ordering::Relaxed);
 	}
 
 	/// The identity under which the block cache keeps the blocks that are read through this
@@ -358,6 +391,7 @@ impl BlockSource {
 			}));
 		}
 		let mut buf = [0u8; TABLE_FULL_FOOTER_LENGTH];
+		self.count_read(buf.len());
 		self.file.read_exact_at(self.file_size - footer_len, &mut buf)?;
 		Footer::decode(&buf)
 	}
@@ -385,6 +419,7 @@ impl BlockSource {
 	/// Reads the block at `handle` with its trailer, in one request.
 	fn fetch(&self, handle: &BlockHandle) -> Result<Vec<u8>> {
 		let mut unit = vec![0u8; self.extent(handle, self.layout().len())?];
+		self.count_read(unit.len());
 		self.file.read_exact_at(handle.offset() as u64, &mut unit)?;
 		Ok(unit)
 	}
@@ -393,6 +428,7 @@ impl BlockSource {
 	async fn fetch_async(&self, handle: &BlockHandle) -> Result<Vec<u8>> {
 		let len = self.extent(handle, self.layout().len())?;
 		let offset = handle.offset() as u64;
+		self.count_read(len);
 		let bytes = self.store.read_at(offset, len).await?;
 		if bytes.len() != len {
 			return Err(short_read(offset, len, bytes.len()));
@@ -471,6 +507,7 @@ impl BlockSource {
 			return Err(Error::Corruption("a table with sealed blocks has a legacy filter".into()));
 		}
 		let mut buf = vec![0u8; self.extent(handle, 0)?];
+		self.count_read(buf.len());
 		self.file.read_exact_at(handle.offset() as u64, &mut buf)?;
 		Ok(buf)
 	}

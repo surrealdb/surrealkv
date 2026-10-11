@@ -13,16 +13,32 @@ use crate::sstable::table::{mask, Table, TableWriter, TABLE_FULL_FOOTER_LENGTH};
 use crate::vfs::File;
 use crate::{InternalKey, InternalKeyKind, Options, INTERNAL_KEY_SEQ_NUM_MAX};
 
-/// Counts the `read_at` calls that reach it.
+/// Counts the `read_at` calls that reach it, and the bytes that they return.
 struct CountingFile {
 	inner: Vec<u8>,
 	reads: Arc<AtomicU64>,
+	bytes: Arc<AtomicU64>,
+}
+
+impl CountingFile {
+	/// A file of `inner`, and the counters of the reads and of the bytes that it is asked for.
+	fn new(inner: Vec<u8>) -> (Self, Arc<AtomicU64>, Arc<AtomicU64>) {
+		let (reads, bytes) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+		let file = Self {
+			inner,
+			reads: Arc::clone(&reads),
+			bytes: Arc::clone(&bytes),
+		};
+		(file, reads, bytes)
+	}
 }
 
 impl File for CountingFile {
 	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
 		self.reads.fetch_add(1, Ordering::Relaxed);
-		self.inner.read_at(offset, buf)
+		let read = self.inner.read_at(offset, buf)?;
+		self.bytes.fetch_add(read as u64, Ordering::Relaxed);
+		Ok(read)
 	}
 
 	fn size(&self) -> Result<u64> {
@@ -182,28 +198,72 @@ fn a_block_is_one_read_and_a_cached_block_is_none() {
 	let opts = Arc::new(Options::default());
 	let bytes = build_table(&opts, 50);
 	let size = bytes.len() as u64;
-	let reads = Arc::new(AtomicU64::new(0));
-	let file = CountingFile {
-		inner: bytes,
-		reads: Arc::clone(&reads),
-	};
+	let (file, reads, bytes_read) = CountingFile::new(bytes);
 
 	// The footer, the top-level index, the meta-index and the top-level index of the filter:
 	// four reads. Reading each block as three (the block, its compression type, its checksum)
 	// took ten.
 	let table = Table::new(1, Arc::clone(&opts), Arc::new(file), size).unwrap();
 	assert_eq!(reads.load(Ordering::Relaxed), 4);
+	// The table counts what it asks of the file, and the file agrees.
+	assert_eq!(table.raw_reads(), 4);
+	assert_eq!(table.raw_read_bytes(), bytes_read.load(Ordering::Relaxed));
 
 	// A key that is there: the filter partition, the index partition and the data block.
 	reads.store(0, Ordering::Relaxed);
 	assert!(table.get(&lookup_key(7)).unwrap().is_some());
 	assert_eq!(reads.load(Ordering::Relaxed), 3);
+	assert_eq!(table.raw_reads(), 4 + 3);
+	assert_eq!(table.raw_read_bytes(), bytes_read.load(Ordering::Relaxed));
 
 	// Everything it needed is in the cache now.
 	reads.store(0, Ordering::Relaxed);
 	assert!(table.get(&lookup_key(7)).unwrap().is_some());
 	assert!(table.get(&lookup_key(8)).unwrap().is_some());
 	assert_eq!(reads.load(Ordering::Relaxed), 0);
+	assert_eq!(table.raw_reads(), 4 + 3);
+}
+
+#[test]
+fn the_clones_of_a_table_count_their_reads_together() {
+	let opts = Arc::new(Options::default());
+	let bytes = build_table(&opts, 50);
+	let size = bytes.len() as u64;
+	let (file, reads, _) = CountingFile::new(bytes);
+
+	let table = Table::new(1, Arc::clone(&opts), Arc::new(file), size).unwrap();
+	let clone = table.clone();
+	assert_eq!(clone.raw_reads(), 4);
+
+	// A read through the clone is one of the table's, and finds nothing in the cache that the
+	// table did not put there.
+	assert!(clone.get(&lookup_key(7)).unwrap().is_some());
+	assert_eq!(table.raw_reads(), 7);
+	assert_eq!(clone.raw_reads(), 7);
+	assert_eq!(reads.load(Ordering::Relaxed), 7);
+	assert!(table.get(&lookup_key(7)).unwrap().is_some());
+	assert_eq!(table.raw_reads(), 7);
+}
+
+#[tokio::test]
+async fn the_asynchronous_path_counts_its_reads_and_makes_one_for_a_block() {
+	let opts = Arc::new(Options::default());
+	let bytes = build_table(&opts, 50);
+	let size = bytes.len() as u64;
+	let (file, reads, bytes_read) = CountingFile::new(bytes);
+
+	let table = Table::new(1, Arc::clone(&opts), Arc::new(file), size).unwrap();
+	reads.store(0, Ordering::Relaxed);
+
+	// The filter partition and the index partition are read where they are, and the data block
+	// through the object store.
+	assert!(table.get_async(&lookup_key(7)).await.unwrap().is_some());
+	assert_eq!(reads.load(Ordering::Relaxed), 3);
+	assert_eq!(table.raw_reads(), 4 + 3);
+	assert_eq!(table.raw_read_bytes(), bytes_read.load(Ordering::Relaxed));
+
+	assert!(table.get_async(&lookup_key(7)).await.unwrap().is_some());
+	assert_eq!(table.raw_reads(), 4 + 3);
 }
 
 #[test]

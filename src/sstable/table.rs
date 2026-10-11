@@ -959,6 +959,19 @@ impl Table {
 		Ok(None)
 	}
 
+	/// The number of reads of the table's file that were asked for, by the table, its clones and
+	/// its index and filter, see `BlockSource::raw_reads`.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn raw_reads(&self) -> u64 {
+		self.source.raw_reads()
+	}
+
+	/// The number of bytes that `raw_reads` asked for.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn raw_read_bytes(&self) -> u64 {
+		self.source.raw_read_bytes()
+	}
+
 	/// Reads a data block, using cache if available.
 	pub(crate) fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		// Check cache first
