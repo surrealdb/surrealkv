@@ -67,6 +67,7 @@ use std::sync::Arc;
 use crate::error::{EncryptionError, Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle};
 use crate::sstable::error::SSTableError;
+use crate::sstable::sealed::SstSealer;
 use crate::sstable::table::{
 	compress_block,
 	decompress_block,
@@ -79,6 +80,7 @@ use crate::sstable::table::{
 	TABLE_FULL_FOOTER_LENGTH,
 };
 use crate::storage::{AffinityObjectStore, ObjectStore};
+use crate::tde::{EncryptionContext, FileKind, HEADER_LEN};
 use crate::vfs::{short_read, File};
 use crate::{Comparator, CompressionType};
 
@@ -404,25 +406,63 @@ impl BlockSource {
 		self.cache_id
 	}
 
-	/// Opens a table file: reads its footer and returns it with the source that reads its
-	/// blocks, for both the synchronous and the asynchronous paths. The layout of the blocks is
-	/// the one that the footer says.
+	/// Opens the file of table `id` of a database: reads its footer and, if the table is sealed,
+	/// its header, and returns them with the source that reads its blocks, for both the
+	/// synchronous and the asynchronous paths. No block is read, parsed or decoded before it is
+	/// decided here whether the table may be read at all.
 	///
-	/// This is the way to open a table that nobody holds a key for, so it opens a file whose footer
-	/// says that its blocks are plain, and refuses one that says that they are sealed: there is
-	/// nothing here to open them with. A footer is not authenticated, and whoever can write the
-	/// file can make it say that its blocks are plain, with checksums that anyone can compute. A
-	/// database whose tables are meant to be sealed therefore cannot use this function: it must
-	/// refuse a footer that says plain, which is what the opener of tables with a key is for.
+	/// `context` is the encryption of the database, and `None` for a database that has none. The
+	/// footer is not authenticated, and whoever can write the file can make it say that its blocks
+	/// are plain, with checksums that anyone can compute, so what the footer says is checked
+	/// against what the database is and never taken for what the file is:
+	///
+	/// | footer | database | |
+	/// |--------|----------|---|
+	/// | plain  | not encrypted | opened |
+	/// | plain  | encrypted | `PlaintextInEncryptedDb`, a hard error that is not a reason to repair |
+	/// | sealed | not encrypted | `NotConfigured` |
+	/// | sealed | encrypted | the header must be that of this database, of an SSTable and of table `id`, under a key the database can read with, and authentic: `DbIdMismatch`, `FileIdMismatch`, `UnknownKeyId`, `KeyRetired` or `WrongKey` otherwise |
+	///
+	/// None of them is raised after a block was read, and a sealed table is only ever read through
+	/// the cipher that its header opened.
+	pub(crate) fn open_table(
+		file: Arc<dyn File>,
+		file_size: u64,
+		id: u64,
+		context: Option<&Arc<EncryptionContext>>,
+	) -> Result<(Self, Footer)> {
+		let mut source = Self::new(file, file_size);
+		let footer = source.read_footer()?;
+		match (footer.checksum, context) {
+			(ChecksumType::CRC32c, None) => {}
+			(ChecksumType::CRC32c, Some(_)) => {
+				return Err(Error::Encryption(EncryptionError::PlaintextInEncryptedDb));
+			}
+			(ChecksumType::SealedCRC32c, None) => {
+				return Err(Error::Encryption(EncryptionError::NotConfigured));
+			}
+			(ChecksumType::SealedCRC32c, Some(context)) => {
+				let header = source.read_header()?;
+				let cipher = context.open_file_from_bytes(&header, FileKind::Sst, id, &[])?;
+				source.protection = Protection::Sealed(Arc::new(SstSealer::new(cipher)));
+				source.blocks_start = HEADER_LEN as u64;
+			}
+		}
+		Ok((source, footer))
+	}
+
+	/// Opens a table file that nobody holds a key for: a table whose footer says that its blocks
+	/// are plain is opened, and one that says that they are sealed is refused, since there is
+	/// nothing here to open it with.
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn open(file: Arc<dyn File>, file_size: u64) -> Result<(Self, Footer)> {
-		Self::open_with(file, file_size, |footer| match footer.checksum {
-			ChecksumType::CRC32c => Ok(Protection::Plain),
-			ChecksumType::SealedCRC32c => Err(Error::Encryption(EncryptionError::NotConfigured)),
-		})
+		Self::open_table(file, file_size, 0, None)
 	}
 
 	/// Opens a table file as `open` does, with `protection_for` choosing how its blocks are
-	/// protected once its footer is known.
+	/// protected once its footer is known, which is how a test gives a table the layout that it
+	/// wants without a key.
+	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn open_with(
 		file: Arc<dyn File>,
 		file_size: u64,
@@ -453,6 +493,23 @@ impl BlockSource {
 		self.count_read(buf.len());
 		self.file.read_exact_at(self.file_size - footer_len, &mut buf)?;
 		Footer::decode(&buf)
+	}
+
+	/// The header of a sealed table, which is the first thing that is read of the file after the
+	/// footer. A file that cannot hold a header and a footer is refused before a read is made, so
+	/// the header is never made of the bytes of the footer.
+	fn read_header(&self) -> Result<[u8; HEADER_LEN]> {
+		let min_size = HEADER_LEN + TABLE_FULL_FOOTER_LENGTH;
+		if self.file_size < min_size as u64 {
+			return Err(Error::from(SSTableError::FileTooSmall {
+				file_size: self.file_size as usize,
+				min_size,
+			}));
+		}
+		let mut buf = [0u8; HEADER_LEN];
+		self.count_read(buf.len());
+		self.file.read_exact_at(0, &mut buf)?;
+		Ok(buf)
 	}
 
 	/// The length of the block at `handle` with its trailer, if all of it lies in the part of

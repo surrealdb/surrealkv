@@ -366,6 +366,12 @@ impl LevelManifest {
 				// Load the actual table from disk
 				match Self::load_table(table_id, Arc::clone(&opts)) {
 					Ok(table) => tables.push(table),
+					// A table that cannot be opened with the key is not a damaged manifest,
+					// and says so to the caller.
+					Err(err @ Error::Encryption(_)) => {
+						tracing::error!("Error loading table {table_id}: {err:?}");
+						return Err(err);
+					}
 					Err(err) => {
 						tracing::error!("Error loading table {table_id}: {err:?}");
 						return Err(Error::LoadManifestFail(err.to_string()));

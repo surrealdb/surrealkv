@@ -7,23 +7,31 @@
 //!
 //! Tables here are small, since sealing in an unoptimised build is slow.
 
+use std::ops::Bound;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use crate::error::{EncryptionError, Error, KeyProviderFailure};
+use crate::sstable::block::BlockHandle;
 use crate::sstable::block_io::{
 	BlockContext,
 	BlockKind,
 	BlockSealer,
 	BlockSink,
+	BlockSource,
 	FileStart,
 	FileStarter,
+	Trailer,
+	TrailerLayout,
 };
 use crate::sstable::sealed::SstSealer;
 use crate::sstable::table::{
 	decompress_block,
 	ChecksumType,
 	Footer,
+	IndexType,
+	Table,
+	TableFilter,
 	TableWriter,
 	TABLE_FULL_FOOTER_LENGTH,
 };
@@ -41,8 +49,16 @@ use crate::tde::{
 	HEADER_LEN,
 	ROOT_KEY_LEN,
 };
-use crate::test::block_io_tests::extents_from_the_end;
-use crate::{CompressionType, InternalKey, InternalKeyKind, Options};
+use crate::test::block_io_tests::{extents_from_the_end, RecordingFile};
+use crate::{
+	CompressionType,
+	InternalKey,
+	InternalKeyKind,
+	InternalKeyRange,
+	LSMIterator,
+	Options,
+	INTERNAL_KEY_SEQ_NUM_MAX,
+};
 
 const SUITES: [CipherSuite; 2] = [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305];
 const COMPRESSIONS: [CompressionType; 3] =
@@ -715,4 +731,361 @@ fn a_sealer_of_a_table_that_was_read_cannot_seal() {
 	let err = sealer.seal(&at, &mut block).unwrap_err();
 	assert!(matches!(err, Error::Encryption(EncryptionError::InvalidInput(_))), "{err:?}");
 	assert_eq!(block, b"bytes", "a refused seal leaves the block as it was");
+}
+
+// ========== Reading a sealed table ==========
+
+fn lookup(i: usize) -> InternalKey {
+	InternalKey::new(key_of(i), INTERNAL_KEY_SEQ_NUM_MAX, InternalKeyKind::Set)
+}
+
+/// Opens `file` as table `id` of the database that `opts` belong to, as the engine does.
+fn open_table(opts: &Arc<Options>, file: &[u8], id: u64) -> crate::error::Result<Table> {
+	Table::new(id, Arc::clone(opts), Arc::new(file.to_vec()), file.len() as u64)
+}
+
+fn encryption_error(result: crate::error::Result<Table>) -> EncryptionError {
+	match result {
+		Err(Error::Encryption(err)) => err,
+		Err(other) => panic!("expected an encryption error, got {other:?}"),
+		Ok(_) => panic!("the table was opened"),
+	}
+}
+
+/// The `(user key, value)` entries that a scan of `table` over `range` returns, forwards.
+fn scan(table: &Table, range: Option<InternalKeyRange>) -> Vec<(Vec<u8>, Vec<u8>)> {
+	let mut iter = table.iter(range).unwrap();
+	iter.seek_first().unwrap();
+	let mut found = Vec::new();
+	while iter.valid() {
+		found.push((iter.key().user_key().to_vec(), iter.value_encoded().unwrap().to_vec()));
+		iter.next().unwrap();
+	}
+	found
+}
+
+#[test]
+fn a_sealed_table_is_read_back_whatever_its_suite_its_compression_and_its_filter() {
+	for suite in SUITES {
+		for compression in COMPRESSIONS {
+			for filter in [true, false] {
+				let what = format!("{suite:?}, {compression:?}, filter {filter}");
+				let ctx = context(suite);
+				let opts = options(Some(&ctx), compression, filter);
+				let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+				let table = open_table(&opts, &file, TABLE_ID).unwrap();
+
+				// The table has more than one partition of the index and of the filter, so that
+				// what is read below is more than one block of each kind.
+				let IndexType::Partitioned(index) = &table.index_block;
+				assert!(index.blocks.len() > 2, "{what}");
+				match (&table.filter, filter) {
+					(TableFilter::Partitioned(filters), true) => {
+						assert!(filters.num_partitions() > 2, "{what}")
+					}
+					(TableFilter::None, false) => {}
+					_ => panic!("{what}: the table has not the filter that was asked for"),
+				}
+				assert_eq!(table.meta.properties.id, TABLE_ID, "{what}");
+				assert_eq!(table.meta.properties.num_entries, KEYS as u64, "{what}");
+
+				for i in 0..KEYS {
+					let (key, value) = table.get(&lookup(i)).unwrap().expect("the key is there");
+					assert_eq!(key.user_key, key_of(i), "{what}");
+					assert_eq!(value, value_of(i), "{what}");
+				}
+				// A key before the first, between two, and after the last.
+				for absent in [&b"aaa"[..], &b"key0050x"[..], &b"zzz"[..]] {
+					let key = InternalKey::new(
+						absent.to_vec(),
+						INTERNAL_KEY_SEQ_NUM_MAX,
+						InternalKeyKind::Set,
+					);
+					assert!(table.get(&key).unwrap().is_none(), "{what}");
+				}
+
+				let all = scan(&table, None);
+				assert_eq!(all.len(), KEYS, "{what}");
+				for (i, (key, value)) in all.iter().enumerate() {
+					assert_eq!((key, value), (&key_of(i), &value_of(i)), "{what}");
+				}
+				let range = (Bound::Included(lookup(10)), Bound::Excluded(lookup(20)));
+				let inside: Vec<Vec<u8>> =
+					scan(&table, Some(range)).into_iter().map(|(key, _)| key).collect();
+				assert_eq!(inside, (10..20).map(key_of).collect::<Vec<_>>(), "{what}");
+
+				// And backwards.
+				let mut iter = table.iter(None).unwrap();
+				iter.seek_last().unwrap();
+				let mut backwards = Vec::new();
+				while iter.valid() {
+					backwards.push(iter.key().user_key().to_vec());
+					iter.prev().unwrap();
+				}
+				assert_eq!(backwards, (0..KEYS).rev().map(key_of).collect::<Vec<_>>(), "{what}");
+			}
+		}
+	}
+}
+
+#[tokio::test]
+async fn the_asynchronous_path_reads_the_blocks_of_a_sealed_table() {
+	for suite in SUITES {
+		let ctx = context(suite);
+		let opts = options(Some(&ctx), CompressionType::SnappyCompression, true);
+		let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+		let table = open_table(&opts, &file, TABLE_ID).unwrap();
+
+		for i in (0..KEYS).step_by(7) {
+			let (_, value) = table.get_async(&lookup(i)).await.unwrap().expect("the key is there");
+			assert_eq!(value, value_of(i), "{suite:?}");
+		}
+	}
+}
+
+#[test]
+fn a_sealed_table_of_range_deletions_alone_is_read_back() {
+	for suite in SUITES {
+		let ctx = context(suite);
+		let opts = options(Some(&ctx), CompressionType::None, true);
+		let input = Input {
+			points: Vec::new(),
+			range_deletions: vec![(b"a".to_vec(), b"z".to_vec(), 7)],
+		};
+		let file = write_table(&opts, TABLE_ID, &input);
+		let table = open_table(&opts, &file, TABLE_ID).unwrap();
+
+		assert!(table.holds_only_range_deletions(), "{suite:?}");
+		assert_eq!(table.meta.range_deletions, input.range_deletions, "{suite:?}");
+		assert!(table.get(&lookup(0)).unwrap().is_none());
+	}
+}
+
+// ========== A table is opened for the database that it belongs to ==========
+
+fn footer_range(file: &[u8]) -> (u64, usize) {
+	((file.len() - TABLE_FULL_FOOTER_LENGTH) as u64, TABLE_FULL_FOOTER_LENGTH)
+}
+
+const HEADER_RANGE: (u64, usize) = (0, HEADER_LEN);
+
+#[test]
+fn a_table_is_refused_by_a_database_of_the_other_kind_after_reading_only_its_footer() {
+	let ctx = context(CipherSuite::Aes256Gcm);
+	let encrypted = options(Some(&ctx), CompressionType::None, true);
+	let plain = options(None, CompressionType::None, true);
+	let sealed_file = write_table(&encrypted, TABLE_ID, &many_points(KEYS));
+	let plain_file = write_table(&plain, TABLE_ID, &many_points(KEYS));
+
+	// A sealed table in a database that has no key.
+	let file = RecordingFile::new(sealed_file.clone());
+	let size = sealed_file.len() as u64;
+	let err = encryption_error(Table::new(TABLE_ID, Arc::clone(&plain), file.shared(), size));
+	assert_eq!(err, EncryptionError::NotConfigured);
+	assert_eq!(file.reads(), vec![footer_range(&sealed_file)]);
+
+	// A plain table in an encrypted database is not read as a plain table, whatever its checksums
+	// say: it is refused, and nothing of it is parsed.
+	let file = RecordingFile::new(plain_file.clone());
+	let size = plain_file.len() as u64;
+	let err = encryption_error(Table::new(TABLE_ID, Arc::clone(&encrypted), file.shared(), size));
+	assert_eq!(err, EncryptionError::PlaintextInEncryptedDb);
+	assert_eq!(file.reads(), vec![footer_range(&plain_file)]);
+
+	// The two that are not refused: each database opens its own kind of table, with the footer
+	// first and then, for the sealed one, the header.
+	let file = RecordingFile::new(plain_file.clone());
+	assert!(Table::new(TABLE_ID, Arc::clone(&plain), file.shared(), size).is_ok());
+	assert_eq!(file.reads()[0], footer_range(&plain_file));
+	let file = RecordingFile::new(sealed_file.clone());
+	let size = sealed_file.len() as u64;
+	assert!(Table::new(TABLE_ID, Arc::clone(&encrypted), file.shared(), size).is_ok());
+	assert_eq!(file.reads()[..2], [footer_range(&sealed_file), HEADER_RANGE]);
+}
+
+/// The contexts that are wrong for a table that was written for `TABLE_ID` under key 1 of
+/// `manager()`, and what each is refused with.
+fn wrong_contexts(suite: CipherSuite) -> Vec<(&'static str, Arc<Options>, u64, EncryptionError)> {
+	let with = |ctx: &Arc<EncryptionContext>| options(Some(ctx), CompressionType::None, true);
+
+	// Another key behind the same key id.
+	let other_root = context_for(Arc::new(SoftwareKeyManager::new([0x99; ROOT_KEY_LEN])), suite);
+	// The same key, in another database.
+	let other_db = Arc::new(EncryptionContext::new(manager(), DbId::from_bytes([0xD6; 16]), suite));
+	// A manager that has never held key 1.
+	let without_the_key = {
+		let km = SoftwareKeyManager::new([0x42; ROOT_KEY_LEN]);
+		km.add_key(2, [0x43; ROOT_KEY_LEN]).unwrap();
+		km.set_active_key_id(2).unwrap();
+		km.retire_key(1).unwrap();
+		context_for(Arc::new(km), suite)
+	};
+
+	vec![
+		("another key", with(&other_root), TABLE_ID, EncryptionError::WrongKey),
+		("another database", with(&other_db), TABLE_ID, EncryptionError::DbIdMismatch),
+		("a retired key", with(&without_the_key), TABLE_ID, EncryptionError::KeyRetired),
+		("another table id", with(&context(suite)), TABLE_ID + 1, EncryptionError::FileIdMismatch),
+	]
+}
+
+#[test]
+fn a_sealed_table_is_refused_by_the_wrong_database_or_key_after_reading_its_footer_and_header() {
+	for suite in SUITES {
+		let ctx = context(suite);
+		let opts = options(Some(&ctx), CompressionType::None, true);
+		let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+		let size = file.len() as u64;
+
+		for (what, wrong, id, expected) in wrong_contexts(suite) {
+			let recorded = RecordingFile::new(file.clone());
+			let err = encryption_error(Table::new(id, wrong, recorded.shared(), size));
+			assert_eq!(err, expected, "{suite:?}: {what}");
+			assert_eq!(
+				recorded.reads(),
+				vec![footer_range(&file), HEADER_RANGE],
+				"{suite:?}: {what}: nothing but the footer and the header was read"
+			);
+		}
+
+		// The right context opens it, and so does one whose key was rotated since: files stay
+		// readable under a key that is no longer the active one.
+		assert!(open_table(&opts, &file, TABLE_ID).is_ok());
+		let km = manager();
+		let rotated = context_for(Arc::<SoftwareKeyManager>::clone(&km), suite);
+		let rotated_opts = options(Some(&rotated), CompressionType::None, true);
+		let file = write_table(&rotated_opts, TABLE_ID, &many_points(KEYS));
+		km.add_key(2, [0x43; ROOT_KEY_LEN]).unwrap();
+		km.set_active_key_id(2).unwrap();
+		let table = open_table(&rotated_opts, &file, TABLE_ID).unwrap();
+		assert_eq!(table.get(&lookup(3)).unwrap().unwrap().1, value_of(3));
+	}
+}
+
+// ========== A damaged filter ==========
+
+/// The blocks of a table with the kind of each, found by following the handles from the footer
+/// through the reader of the engine, which opens `file` as table `id` of the database of `opts`.
+fn walk(opts: &Arc<Options>, file: &[u8], id: u64) -> Vec<(BlockKind, BlockHandle)> {
+	let size = file.len() as u64;
+	let (source, footer) =
+		BlockSource::open_table(Arc::new(file.to_vec()), size, id, opts.encryption_context())
+			.unwrap();
+	let comparator = || Arc::clone(&opts.internal_comparator);
+	let entries = |kind: BlockKind, handle: &BlockHandle| -> Vec<(Vec<u8>, Vec<u8>)> {
+		let block = source.read_block(kind, handle, comparator()).unwrap();
+		let mut iter = block.iter().unwrap();
+		iter.seek_to_first().unwrap();
+		let mut found = Vec::new();
+		while iter.is_valid() {
+			found.push((iter.key_bytes().to_vec(), iter.value_bytes().to_vec()));
+			iter.advance().unwrap();
+		}
+		found
+	};
+
+	let mut blocks = vec![
+		(BlockKind::TopLevelIndex, footer.index.clone()),
+		(BlockKind::MetaIndex, footer.meta_index.clone()),
+	];
+	for (_, partition) in entries(BlockKind::TopLevelIndex, &footer.index) {
+		let (partition, _) = BlockHandle::decode(&partition).unwrap();
+		for (_, data) in entries(BlockKind::IndexPartition, &partition) {
+			blocks.push((BlockKind::Data, BlockHandle::decode(&data).unwrap().0));
+		}
+		blocks.push((BlockKind::IndexPartition, partition));
+	}
+	for (key, value) in entries(BlockKind::MetaIndex, &footer.meta_index) {
+		if InternalKey::decode(&key).user_key.starts_with(b"partitionedfilter.") {
+			let (filter_index, _) = BlockHandle::decode(&value).unwrap();
+			for (_, partition) in entries(BlockKind::FilterIndex, &filter_index) {
+				blocks
+					.push((BlockKind::FilterPartition, BlockHandle::decode(&partition).unwrap().0));
+			}
+			blocks.push((BlockKind::FilterIndex, filter_index));
+		}
+	}
+	blocks.sort_by_key(|(_, handle)| handle.offset);
+	blocks
+}
+
+/// `file` with a bit flipped `at` bytes into the block at `handle`. With `fix_trailer` the trailer
+/// of the block is made again to say that the block is as it is, as someone who has no key can,
+/// and the damage is then for the seal to find and not for the checksum.
+fn flip(
+	file: &[u8],
+	handle: &BlockHandle,
+	at: usize,
+	layout: TrailerLayout,
+	fix_trailer: bool,
+) -> Vec<u8> {
+	let mut damaged = file.to_vec();
+	damaged[handle.offset + at] ^= 0x01;
+	if fix_trailer {
+		let end = handle.offset + handle.size;
+		let compression = damaged[end];
+		let trailer = Trailer::encode(layout, &damaged[handle.offset..end], compression).unwrap();
+		damaged[end..end + layout.len()].copy_from_slice(trailer.as_slice());
+	}
+	damaged
+}
+
+fn first_of(blocks: &[(BlockKind, BlockHandle)], kind: BlockKind) -> BlockHandle {
+	blocks.iter().find(|(k, _)| *k == kind).expect("the table has a block of the kind").1.clone()
+}
+
+#[test]
+fn a_filter_partition_that_cannot_be_read_is_skipped_in_a_plain_table_as_it_always_was() {
+	let opts = options(None, CompressionType::None, true);
+	let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+	let partition = first_of(&walk(&opts, &file, TABLE_ID), BlockKind::FilterPartition);
+	let damaged = flip(&file, &partition, 0, TrailerLayout::Plain, false);
+
+	let table = open_table(&opts, &damaged, TABLE_ID).unwrap();
+	assert_eq!(table.filter_reads_degraded(), 0);
+	// The filter is only an optimisation: the lookup is answered without it, and the number of
+	// those that were is kept.
+	assert_eq!(table.get(&lookup(0)).unwrap().unwrap().1, value_of(0));
+	assert!(table.filter_reads_degraded() > 0);
+}
+
+#[tokio::test]
+async fn a_filter_partition_that_is_damaged_but_not_forged_is_skipped_in_a_sealed_table_too() {
+	// Without the key nobody can make a partition that opens, and a partition that fails its
+	// checksum is what bit rot looks like: the lookup does not need the filter.
+	let ctx = context(CipherSuite::Aes256Gcm);
+	let opts = options(Some(&ctx), CompressionType::None, true);
+	let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+	let partition = first_of(&walk(&opts, &file, TABLE_ID), BlockKind::FilterPartition);
+	let damaged = flip(&file, &partition, 0, TrailerLayout::Sealed, false);
+
+	let table = open_table(&opts, &damaged, TABLE_ID).unwrap();
+	assert_eq!(table.get(&lookup(0)).unwrap().unwrap().1, value_of(0));
+	assert_eq!(table.get_async(&lookup(1)).await.unwrap().unwrap().1, value_of(1));
+	assert!(table.filter_reads_degraded() > 0);
+}
+
+#[tokio::test]
+async fn a_filter_partition_that_fails_authentication_is_an_error_and_not_a_maybe() {
+	for suite in SUITES {
+		let ctx = context(suite);
+		let opts = options(Some(&ctx), CompressionType::None, true);
+		let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+		let partition = first_of(&walk(&opts, &file, TABLE_ID), BlockKind::FilterPartition);
+		// The checksum is right: only the seal can tell.
+		let damaged = flip(&file, &partition, 0, TrailerLayout::Sealed, true);
+
+		let table = open_table(&opts, &damaged, TABLE_ID).unwrap();
+		let err = table.get(&lookup(0)).unwrap_err();
+		assert!(
+			matches!(err, Error::Encryption(EncryptionError::AuthenticationFailed)),
+			"{suite:?}: {err:?}"
+		);
+		let err = table.get_async(&lookup(0)).await.unwrap_err();
+		assert!(
+			matches!(err, Error::Encryption(EncryptionError::AuthenticationFailed)),
+			"{suite:?}: {err:?}"
+		);
+		assert_eq!(table.filter_reads_degraded(), 0, "{suite:?}: nothing was skipped");
+	}
 }

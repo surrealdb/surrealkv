@@ -38,6 +38,7 @@
 //! (every partition containing any version of a user key contains that
 //! user key's hash).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::sstable::block::BlockHandle;
@@ -156,6 +157,10 @@ pub(crate) struct PartitionedFilterReader {
 	/// Filter partition handles with their separator keys, ascending —
 	/// mirrors `Index.blocks` for the data index.
 	partitions: Vec<BlockHandleWithKey>,
+
+	/// How many partitions could not be read and were answered as "maybe" instead, shared by
+	/// the clones of the reader.
+	degraded: Arc<AtomicU64>,
 }
 
 impl PartitionedFilterReader {
@@ -192,6 +197,7 @@ impl PartitionedFilterReader {
 			policy,
 			source,
 			partitions,
+			degraded: Arc::new(AtomicU64::new(0)),
 		})
 	}
 
@@ -200,13 +206,30 @@ impl PartitionedFilterReader {
 		self.partitions.len()
 	}
 
+	/// The number of lookups that were answered "maybe" because the partition of their filter
+	/// could not be read.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn degraded_reads(&self) -> u64 {
+		self.degraded.load(Ordering::Relaxed)
+	}
+
 	/// Returns whether `user_key` may be present, selecting the filter
 	/// partition with the same search the data index uses for
-	/// `encoded_internal_key`. Errors degrade to "maybe" (true): lookups
-	/// stay correct and merely lose the bloom short-circuit.
-	pub(crate) fn may_contain(&self, encoded_internal_key: &[u8], user_key: &[u8]) -> bool {
+	/// `encoded_internal_key`.
+	///
+	/// A partition that cannot be read degrades to "maybe" (true): lookups
+	/// stay correct and merely lose the bloom short-circuit. The exception is
+	/// a partition that failed authentication, which is an error: the bytes
+	/// were changed by someone who does not have the key, or are not the ones
+	/// of this file, and a table whose blocks are sealed does not go on
+	/// reading as if they were not. What is degraded is counted and logged.
+	pub(crate) fn may_contain(
+		&self,
+		encoded_internal_key: &[u8],
+		user_key: &[u8],
+	) -> crate::Result<bool> {
 		if self.partitions.is_empty() {
-			return true;
+			return Ok(true);
 		}
 
 		// Same partition_point search as Index::find_block_handle_by_key.
@@ -218,7 +241,7 @@ impl PartitionedFilterReader {
 			// Beyond the last separator: leave the verdict to the data
 			// index (which will find nothing) rather than reasoning about
 			// successor-key edge cases here.
-			return true;
+			return Ok(true);
 		};
 
 		let offset = partition.handle.offset() as u64;
@@ -237,17 +260,19 @@ impl PartitionedFilterReader {
 					);
 					bytes
 				}
+				Err(e @ crate::Error::Encryption(_)) => return Err(e),
 				Err(e) => {
+					self.degraded.fetch_add(1, Ordering::Relaxed);
 					tracing::warn!(
 						"Failed to read filter partition for table {} at offset {offset}: {e}; \
 							 proceeding without the filter",
 						self.table_id
 					);
-					return true;
+					return Ok(true);
 				}
 			}
 		};
 
-		self.policy.may_contain(&bits, user_key)
+		Ok(self.policy.may_contain(&bits, user_key))
 	}
 }

@@ -861,14 +861,19 @@ pub(crate) enum TableFilter {
 }
 
 impl Table {
-	/// Opens an SSTable file for reading.
+	/// Opens the file of table `id` for reading.
+	///
+	/// A sealed table is opened only by a database that is encrypted, with the key of its file, and
+	/// a plain table only by one that is not: see `BlockSource::open_table`. Every table of a
+	/// database is opened here, whether a flush, a compaction or a manifest wrote it.
 	pub(crate) fn new(
 		id: u64,
 		opts: Arc<Options>,
 		file: Arc<dyn File>,
 		file_size: u64,
 	) -> Result<Table> {
-		let (source, footer) = BlockSource::open(file, file_size)?;
+		let (source, footer) =
+			BlockSource::open_table(file, file_size, id, opts.encryption_context())?;
 		Self::from_source(id, opts, file_size, source, footer)
 	}
 
@@ -1008,6 +1013,16 @@ impl Table {
 		self.source.raw_read_bytes()
 	}
 
+	/// The number of lookups that were answered without the filter of the table because one of
+	/// its partitions could not be read.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn filter_reads_degraded(&self) -> u64 {
+		match &self.filter {
+			TableFilter::Partitioned(filters) => filters.degraded_reads(),
+			TableFilter::None | TableFilter::Legacy(_) => 0,
+		}
+	}
+
 	/// Reads a data block, using cache if available.
 	pub(crate) fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		// Check cache first
@@ -1110,7 +1125,7 @@ impl Table {
 				}
 			}
 			TableFilter::Partitioned(filters) => {
-				if !filters.may_contain(&key_encoded, key.user_key.as_slice()) {
+				if !filters.may_contain(&key_encoded, key.user_key.as_slice())? {
 					return Ok(None);
 				}
 			}
@@ -1230,7 +1245,7 @@ impl Table {
 				}
 			}
 			TableFilter::Partitioned(filters) => {
-				if !filters.may_contain(&key_encoded, key.user_key.as_slice()) {
+				if !filters.may_contain(&key_encoded, key.user_key.as_slice())? {
 					return Ok(None);
 				}
 			}
