@@ -790,7 +790,7 @@ pub enum IndexType {
 pub(crate) struct Table {
 	pub id: u64,
 	/// The key of this instance's blocks in the block cache: unlike `id`, never given to another
-	/// table, see `cache::next_instance_id`.
+	/// table, see `BlockSource::cache_id`.
 	cache_id: u64,
 	/// Reads the footer and the blocks of the table's file.
 	pub(crate) source: BlockSource,
@@ -860,12 +860,12 @@ impl Table {
 	) -> Result<Table> {
 		// Step 1: The footer was read when the source was opened
 
-		let cache_id = crate::cache::next_instance_id();
+		let cache_id = source.cache_id();
 
 		// Step 2: Load partitioned index
 		let index_block = {
 			let partitioned_index =
-				Index::new(id, cache_id, Arc::clone(&opts), source.clone(), &footer.index)?;
+				Index::new(id, Arc::clone(&opts), source.clone(), &footer.index)?;
 			IndexType::Partitioned(partitioned_index)
 		};
 
@@ -894,7 +894,6 @@ impl Table {
 			{
 				TableFilter::Partitioned(PartitionedFilterReader::new(
 					id,
-					cache_id,
 					Arc::clone(&opts),
 					source.clone(),
 					&handle,

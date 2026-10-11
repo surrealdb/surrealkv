@@ -274,6 +274,9 @@ pub(crate) struct BlockSource {
 	store: Arc<dyn ObjectStore>,
 	file_size: u64,
 	protection: Protection,
+	/// The key under which the block cache keeps the blocks that this source reads, see
+	/// `cache_id`.
+	cache_id: u64,
 }
 
 /// A block that was checked against everything that its file can say about it, and that is
@@ -303,7 +306,18 @@ impl BlockSource {
 			store,
 			file_size,
 			protection,
+			cache_id: crate::cache::next_instance_id(),
 		}
+	}
+
+	/// The identity under which the block cache keeps the blocks that are read through this
+	/// source and its clones, which is never the identity of another source: a table id names a
+	/// file of a manifest and can come back for another file, but a source is made once, for the
+	/// file that it was given, and the id of the instance is not given again. The readers of the
+	/// index and the filter take it from here instead of being told, so a reader cannot be built
+	/// to look for the blocks of another table.
+	pub(crate) fn cache_id(&self) -> u64 {
+		self.cache_id
 	}
 
 	/// Opens a table file: reads its footer and returns it with the source that reads its

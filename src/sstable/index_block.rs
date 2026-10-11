@@ -376,8 +376,6 @@ impl IndexWriter {
 #[derive(Clone)]
 pub(crate) struct Index {
 	pub(crate) id: u64,
-	/// The key of the table instance's blocks in the block cache, see `Table::cache_id`.
-	pub(crate) cache_id: u64,
 	pub(crate) opts: Arc<Options>,
 
 	/// Partition block handles with their separator keys
@@ -399,7 +397,6 @@ impl Index {
 	/// 4. Store in `blocks` vector for binary search during lookups
 	pub(crate) fn new(
 		id: u64,
-		cache_id: u64,
 		opt: Arc<Options>,
 		source: BlockSource,
 		location: &BlockHandle,
@@ -430,7 +427,6 @@ impl Index {
 
 		Ok(Index {
 			id,
-			cache_id,
 			opts: opt,
 			blocks,
 			source,
@@ -507,7 +503,7 @@ impl Index {
 	pub(crate) fn load_block(&self, block_handle: &BlockHandleWithKey) -> Result<Arc<Block>> {
 		// Check cache first
 		if let Some(block) =
-			self.opts.block_cache.get_index_block(self.cache_id, block_handle.offset())
+			self.opts.block_cache.get_index_block(self.source.cache_id(), block_handle.offset())
 		{
 			return Ok(block);
 		}
@@ -522,7 +518,7 @@ impl Index {
 
 		// Insert into cache
 		self.opts.block_cache.insert_index_block(
-			self.cache_id,
+			self.source.cache_id(),
 			block_handle.offset(),
 			Arc::clone(&block),
 		);

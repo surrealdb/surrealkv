@@ -149,8 +149,6 @@ impl PartitionedFilterWriter {
 #[derive(Clone)]
 pub(crate) struct PartitionedFilterReader {
 	table_id: u64,
-	/// The key of the table instance's blocks in the block cache, see `Table::cache_id`.
-	cache_id: u64,
 	opts: Arc<Options>,
 	policy: Arc<dyn FilterPolicy>,
 	source: BlockSource,
@@ -164,7 +162,6 @@ impl PartitionedFilterReader {
 	/// Parses the filter top-level index block at `location`.
 	pub(crate) fn new(
 		table_id: u64,
-		cache_id: u64,
 		opts: Arc<Options>,
 		source: BlockSource,
 		location: &BlockHandle,
@@ -191,7 +188,6 @@ impl PartitionedFilterReader {
 
 		Ok(Self {
 			table_id,
-			cache_id,
 			opts,
 			policy,
 			source,
@@ -226,30 +222,31 @@ impl PartitionedFilterReader {
 		};
 
 		let offset = partition.handle.offset() as u64;
-		let bits =
-			if let Some(bits) = self.opts.block_cache.get_filter_partition(self.cache_id, offset) {
-				bits
-			} else {
-				match self.source.read_contents(BlockKind::FilterPartition, &partition.handle) {
-					Ok(bytes) => {
-						let bytes = Arc::new(bytes);
-						self.opts.block_cache.insert_filter_partition(
-							self.cache_id,
-							offset,
-							Arc::clone(&bytes),
-						);
-						bytes
-					}
-					Err(e) => {
-						tracing::warn!(
-							"Failed to read filter partition for table {} at offset {offset}: {e}; \
-							 proceeding without the filter",
-							self.table_id
-						);
-						return true;
-					}
+		let cache_id = self.source.cache_id();
+		let bits = if let Some(bits) = self.opts.block_cache.get_filter_partition(cache_id, offset)
+		{
+			bits
+		} else {
+			match self.source.read_contents(BlockKind::FilterPartition, &partition.handle) {
+				Ok(bytes) => {
+					let bytes = Arc::new(bytes);
+					self.opts.block_cache.insert_filter_partition(
+						cache_id,
+						offset,
+						Arc::clone(&bytes),
+					);
+					bytes
 				}
-			};
+				Err(e) => {
+					tracing::warn!(
+						"Failed to read filter partition for table {} at offset {offset}: {e}; \
+							 proceeding without the filter",
+						self.table_id
+					);
+					return true;
+				}
+			}
+		};
 
 		self.policy.may_contain(&bits, user_key)
 	}
