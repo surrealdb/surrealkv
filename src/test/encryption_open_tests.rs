@@ -710,3 +710,48 @@ async fn the_options_that_a_build_returns_do_not_carry_one_database_into_another
 		assert_ne!(one, two, "{suite:?}");
 	}
 }
+
+#[tokio::test]
+async fn an_open_that_the_value_log_refuses_makes_no_segment_of_the_log_and_changes_no_file() {
+	for suite in SUITES {
+		let dir = TempDir::new().unwrap();
+		let root = dir.path().join("db");
+		let opts = Arc::new(
+			Options {
+				flush_on_close: true,
+				..options(&root)
+			}
+			.with_encryption(manager(), suite),
+		);
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		write(&tree, '1', 0..KEYS).await;
+		tree.close().await.unwrap();
+
+		// The close flushed everything into tables. A segment of the write-ahead log that is left
+		// is removed, so that an open has to make one, which an open that is refused must not.
+		for segment in files_with_extension(&opts.wal_dir(), "wal") {
+			fs::remove_file(segment).unwrap();
+		}
+
+		// A file of the value log in the clear, taken from a database that is not encrypted, is
+		// one that an encrypted database refuses. Its id is a newer one than any the log has.
+		let plain_dir = TempDir::new().unwrap();
+		let plain_opts = plain(plain_dir.path());
+		let tree = Tree::new(Arc::clone(&plain_opts)).unwrap();
+		write(&tree, '1', 0..KEYS).await;
+		tree.close().await.unwrap();
+		let in_the_clear = files_with_extension(&plain_opts.vlog_dir(), "vlog");
+		assert!(!in_the_clear.is_empty(), "{suite:?}");
+		fs::copy(&in_the_clear[0], opts.vlog_file_path(99)).unwrap();
+
+		let before = snapshot(&root);
+		let err = open_error(&opts);
+		assert_eq!(
+			encryption_error(err, "a file in the clear"),
+			EncryptionError::PlaintextInEncryptedDb,
+			"{suite:?}"
+		);
+		assert!(snapshot(&root) == before, "{suite:?}: a refused open changed the database");
+		assert!(files_with_extension(&opts.wal_dir(), "wal").is_empty(), "{suite:?}");
+	}
+}

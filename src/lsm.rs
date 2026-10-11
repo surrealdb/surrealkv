@@ -288,6 +288,15 @@ impl CoreInner {
 		let manifest = LevelManifest::new(Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
 
+		// The value log is opened before the WAL is: opening the WAL makes a segment and removes
+		// what a repair left, and an open that the value log refuses (a file in the clear in an
+		// encrypted database, or one that the key does not open) must not have done either.
+		let vlog = if opts.enable_vlog {
+			Some(Arc::new(VLog::new(Arc::clone(&opts))?))
+		} else {
+			None
+		};
+
 		// Initialize WAL starting from manifest.log_number
 		let wal_path = opts.wal_dir();
 		// This avoids creating intermediate empty WAL files
@@ -305,11 +314,6 @@ impl CoreInner {
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
-		let vlog = if opts.enable_vlog {
-			Some(Arc::new(VLog::new(Arc::clone(&opts))?))
-		} else {
-			None
-		};
 		let memory_controller = Arc::new(crate::memory::MemoryController::default());
 
 		Ok(Self {
