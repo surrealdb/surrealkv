@@ -176,6 +176,8 @@ proptest! {
 	fn changing_anything_a_block_is_bound_to_fails_authentication(
 		case in arb_case(),
 		which in 0u8..10,
+		// Which single bit of the chosen field is flipped, taken modulo the width of the field.
+		bit in 0u32..128,
 	) {
 		// The block-kind change below stays within SSTable blocks, which are the file kind that
 		// has several.
@@ -185,7 +187,10 @@ proptest! {
 		let mut identity = case.identity;
 		let mut context = case.context();
 		match which {
-			0 => context = BlockContext::new(case.block_kind, case.position ^ 1, case.compression),
+			0 => {
+				let position = case.position ^ (1u64 << (bit % 64));
+				context = BlockContext::new(case.block_kind, position, case.compression);
+			}
 			1 => {
 				let other = if case.block_kind == BlockKind::SstData {
 					BlockKind::SstMetaIndex
@@ -194,12 +199,15 @@ proptest! {
 				};
 				context = BlockContext::new(other, case.position, case.compression);
 			}
-			2 => context = BlockContext::new(case.block_kind, case.position, case.compression ^ 1),
-			3 => identity.file_id ^= 1,
-			4 => identity.key_id ^= 1,
+			2 => {
+				let compression = case.compression ^ (1u8 << (bit % 8));
+				context = BlockContext::new(case.block_kind, case.position, compression);
+			}
+			3 => identity.file_id ^= 1u64 << (bit % 64),
+			4 => identity.key_id ^= 1u32 << (bit % 32),
 			5 => {
 				let mut db = *identity.db_id.as_bytes();
-				db[0] ^= 1;
+				db[(bit / 8) as usize] ^= 1u8 << (bit % 8);
 				identity.db_id = DbId::from_bytes(db);
 			}
 			6 => {
@@ -209,8 +217,8 @@ proptest! {
 					CipherSuite::Aes256Gcm
 				};
 			}
-			7 => salt[0] ^= 1,
-			8 => root[0] ^= 1,
+			7 => salt[(bit / 8) as usize] ^= 1u8 << (bit % 8),
+			8 => root[(bit / 8) as usize] ^= 1u8 << (bit % 8),
 			_ => {
 				// Read as a vlog entry of another file kind.
 				identity.file_kind = FileKind::Vlog;

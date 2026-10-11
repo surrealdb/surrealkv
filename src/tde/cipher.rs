@@ -710,6 +710,79 @@ mod tests {
 		}
 	}
 
+	/// A cipher over a fixed key that does not depend on the identity, so that two of them differ
+	/// only in the associated data and the nonce. `FileKey` always derives from the identity,
+	/// which hides whether the associated data binds a field on its own.
+	fn cipher_over_a_fixed_key(identity: FileIdentity) -> FileCipher {
+		FileCipher {
+			primitive: Primitive::new(identity.suite, &[0x77; FILE_KEY_LEN]).unwrap(),
+			identity,
+			can_seal: true,
+			next_position: AtomicU64::new(0),
+		}
+	}
+
+	#[test]
+	fn the_associated_data_alone_binds_each_field_of_the_file_identity() {
+		for suite in SUITES {
+			let base = identity(suite, FileKind::Sst);
+			let context = sst_data(4096);
+			let plaintext = b"one key, several identities";
+			let sealed = sealed(&cipher_over_a_fixed_key(base), &context, plaintext);
+
+			// Control: the same identity opens it, so only the identity can be what fails below.
+			let mut control = sealed.clone();
+			assert_eq!(
+				cipher_over_a_fixed_key(base).open_suffix(&context, &mut control).unwrap(),
+				plaintext
+			);
+
+			let mut other_db = *base.db_id.as_bytes();
+			other_db[0] ^= 0x80;
+			let variants = [
+				(
+					"file id",
+					FileIdentity {
+						file_id: base.file_id ^ (1 << 63),
+						..base
+					},
+					context,
+				),
+				(
+					"key id",
+					FileIdentity {
+						key_id: base.key_id ^ (1 << 31),
+						..base
+					},
+					context,
+				),
+				(
+					"db id",
+					FileIdentity {
+						db_id: DbId::from_bytes(other_db),
+						..base
+					},
+					context,
+				),
+				(
+					"file kind",
+					FileIdentity {
+						file_kind: FileKind::Vlog,
+						..base
+					},
+					BlockContext::new(BlockKind::VlogEntry, 4096, 1),
+				),
+			];
+			for (what, variant, context) in variants {
+				let mut copy = sealed.clone();
+				let err =
+					cipher_over_a_fixed_key(variant).open_suffix(&context, &mut copy).unwrap_err();
+				assert_eq!(err, EncryptionError::AuthenticationFailed, "{suite:?}: {what}");
+				assert_eq!(copy, sealed, "{suite:?}: {what} modified the data it rejected");
+			}
+		}
+	}
+
 	#[test]
 	fn flipping_any_bit_of_a_sealed_block_fails_authentication() {
 		for suite in SUITES {
