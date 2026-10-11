@@ -36,6 +36,10 @@ use crate::Error;
 
 const CAP: u64 = COMMIT_RING_CAPACITY as u64;
 
+/// How long a `ParkedRetire` holds the flusher once it has left the gap, before the retire reads
+/// the transaction pins.
+const AFTER_THE_GAP: Duration = Duration::from_millis(20);
+
 // The tests lap the ring and need several chunks to a lap of it.
 const _: () = assert!(4 * RETIRED_FREE_CHUNK <= COMMIT_RING_CAPACITY);
 
@@ -154,6 +158,11 @@ async fn completed_prefix_caught_up(store: &Tree) {
 /// looked at who is open, and a transaction that ends while it is parked is one the retire does
 /// not see. That is the only moment at which a test may end the transaction that holds the
 /// watermark: once the flusher has left the gap, nothing says whether it has read the pins yet.
+/// A flusher the machine descheduled right there reads them late, which is how a test that ended
+/// the transaction on seeing the gate at 3 once failed on a loaded runner. The hook therefore
+/// holds the flusher for `AFTER_THE_GAP` after it leaves the gap, so that a test which ends the
+/// transaction promptly on seeing 3 fails at once. One that waits longer than that first is not
+/// caught, nor is a test that parks a retire with a hook of its own.
 struct ParkedRetire {
 	/// 0 armed, 1 the flusher is parked in a retire, 2 released, 3 the flusher left the retire's
 	/// gap, which is not to say that the retire has read the pins
@@ -169,6 +178,8 @@ impl ParkedRetire {
 			if hook_gate.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
 				park_until(|| hook_gate.load(Ordering::SeqCst) == 2);
 				hook_gate.store(3, Ordering::SeqCst);
+				// Long enough for a test task that polls every millisecond to act first
+				tokio::task::block_in_place(|| std::thread::sleep(AFTER_THE_GAP));
 			}
 		})));
 		Self {
