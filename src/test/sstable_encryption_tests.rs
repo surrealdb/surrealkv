@@ -508,14 +508,14 @@ fn a_table_written_again_under_the_same_id_is_another_file_with_another_key() {
 // ========== Taking the key ==========
 
 /// A key manager that counts the roots it is asked for, and that can be made to fail.
-struct FlakyManager {
+pub(crate) struct FlakyManager {
 	inner: SoftwareKeyManager,
 	unavailable: AtomicBool,
 	roots: AtomicUsize,
 }
 
 impl FlakyManager {
-	fn new() -> Arc<Self> {
+	pub(crate) fn new() -> Arc<Self> {
 		Arc::new(Self {
 			inner: SoftwareKeyManager::new([0x42; ROOT_KEY_LEN]),
 			unavailable: AtomicBool::new(false),
@@ -527,7 +527,7 @@ impl FlakyManager {
 		self.roots.load(Ordering::SeqCst)
 	}
 
-	fn set_unavailable(&self, unavailable: bool) {
+	pub(crate) fn set_unavailable(&self, unavailable: bool) {
 		self.unavailable.store(unavailable, Ordering::SeqCst);
 	}
 }

@@ -419,11 +419,14 @@ impl CoreInner {
 				self.opts.vlog_value_threshold,
 				collect_bptree,
 			)
-			.map_err(|e| {
-				Error::Other(format!(
+			.map_err(|e| match e {
+				// An encryption error keeps its type: a key that could not be had may be asked for
+				// again, and no other of them may, which a text does not say.
+				Error::Encryption(_) => e,
+				e => Error::Other(format!(
 					"Failed to flush memtable to SST table_id={}: {}",
 					table_id, e
-				))
+				)),
 			})?;
 
 		tracing::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);

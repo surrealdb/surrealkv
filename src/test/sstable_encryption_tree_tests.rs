@@ -14,11 +14,11 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use crate::compaction::leveled::Strategy;
-use crate::error::EncryptionError;
+use crate::error::{EncryptionError, KeyProviderFailure};
 use crate::sstable::block_io::{BlockKind, TrailerLayout};
 use crate::sstable::table::{ChecksumType, Footer, TABLE_FULL_FOOTER_LENGTH};
 use crate::tde::{CipherSuite, CryptoHeader, DbId, EncryptionContext, SoftwareKeyManager};
-use crate::test::sstable_encryption_tests::{first_of, flip, walk};
+use crate::test::sstable_encryption_tests::{first_of, flip, walk, FlakyManager};
 use crate::{Error, Options, Tree};
 
 const SUITES: [CipherSuite; 2] = [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305];
@@ -198,6 +198,55 @@ async fn the_tables_that_a_flush_and_a_compaction_write_are_sealed_and_read_back
 		}
 		tree.close().await.unwrap();
 	}
+}
+
+#[tokio::test]
+async fn a_key_that_cannot_be_had_is_the_error_of_the_flush_and_the_flush_can_be_tried_again() {
+	let dir = TempDir::new().unwrap();
+	let key_manager = FlakyManager::new();
+	let ctx = Arc::new(EncryptionContext::new(
+		Arc::<FlakyManager>::clone(&key_manager),
+		DbId::from_bytes([0xD5; 16]),
+		CipherSuite::Aes256Gcm,
+	));
+	let opts = options(dir.path(), Some(&ctx), DEFAULT_MEMTABLE);
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+
+	let mut txn = tree.begin().unwrap();
+	for i in 0..KEYS {
+		txn.set(key(i), value('1', i)).unwrap();
+	}
+	txn.commit().await.unwrap();
+	let check = |tree: &Tree| {
+		let txn = tree.begin().unwrap();
+		for i in 0..KEYS {
+			assert_eq!(txn.get(key(i).as_slice()).unwrap(), Some(value('1', i)), "key {i}");
+		}
+	};
+
+	// The provider is away: the flush fails with that error, as it is, and not with a text that
+	// says that a write failed. The data is where it was, and no table was registered.
+	key_manager.set_unavailable(true);
+	let err = tree.flush().unwrap_err();
+	assert!(
+		matches!(
+			&err,
+			Error::Encryption(EncryptionError::KeyProvider(KeyProviderFailure::Unavailable))
+		),
+		"{err:?}"
+	);
+	assert!(err.to_string().contains("unavailable"), "{err}");
+	assert!(table_ids(&tree).is_empty());
+	check(&tree);
+
+	// It is back, and the same flush is tried again: the table is written, sealed, and read.
+	key_manager.set_unavailable(false);
+	tree.flush().unwrap();
+	let files = table_files(&tree, &opts);
+	assert_eq!(files.len(), 1);
+	assert_sealed(&files[0]);
+	check(&tree);
+	tree.close().await.unwrap();
 }
 
 #[tokio::test]
