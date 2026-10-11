@@ -54,8 +54,10 @@ pub use crate::error::{
 	BackgroundError,
 	BackgroundErrorHandler,
 	BackgroundErrorReason,
+	EncryptionError,
 	Error,
 	ErrorSeverity,
+	KeyProviderFailure,
 	Result,
 	WriteStallReason,
 };

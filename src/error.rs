@@ -84,6 +84,9 @@ pub enum Error {
 		message: String,
 	},
 	SSTable(crate::sstable::error::SSTableError), // SSTable-specific errors
+	/// Encryption at rest failed: a key problem, an authentication failure or an unreadable
+	/// encryption header. None of these is ever repaired by dropping data.
+	Encryption(EncryptionError),
 }
 
 // Implementation of Display trait for Error
@@ -140,6 +143,7 @@ impl fmt::Display for Error {
                 segment_id, offset, message
             ),
             Self::SSTable(err) => write!(f, "SSTable error: {err}"),
+            Self::Encryption(err) => write!(f, "Encryption error: {err}"),
         }
 	}
 }
@@ -178,11 +182,132 @@ impl From<crate::sstable::error::SSTableError> for Error {
 	}
 }
 
+impl From<EncryptionError> for Error {
+	fn from(err: EncryptionError) -> Self {
+		Error::Encryption(err)
+	}
+}
+
 impl<T> From<std::sync::PoisonError<T>> for Error {
 	fn from(_err: std::sync::PoisonError<T>) -> Self {
 		Error::Other("Lock poisoned - another thread panicked while holding the lock".to_string())
 	}
 }
+
+/// Why a key provider could not hand out key material.
+///
+/// Carries no free text on purpose: a provider's own message can name key ids or account
+/// identifiers, and this type ends up in logs through `Debug`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyProviderFailure {
+	/// The provider could not be reached or is throttling. Trying again later may succeed.
+	Unavailable,
+	/// The provider answered and refused, or failed. Trying again will not help.
+	Failed,
+	/// The operating system's random number generator failed, so no fresh per-file key
+	/// material could be drawn.
+	RandomSource,
+}
+
+/// Why encrypted data could not be written or read.
+///
+/// The texts name no key id, no key material and no path, so they are safe to log. Every one of
+/// these is a statement about keys, headers or authentication, never about the shape of the data
+/// that follows, so none of them may be answered by repairing or deleting a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EncryptionError {
+	/// A file is encrypted but no key manager is configured.
+	NotConfigured,
+	/// A plaintext file was found in a database that is encrypted.
+	PlaintextInEncryptedDb,
+	/// The key manager has never held the key id the file names.
+	UnknownKeyId,
+	/// The key the file names has been retired, so its data can no longer be read, or a new file
+	/// was about to be written under a key that is not active.
+	KeyRetired,
+	/// The file header is intact but does not authenticate under the configured key, so the key
+	/// is not the one the file was written with.
+	WrongKey,
+	/// Sealed bytes failed authentication: they were corrupted, changed, or moved to another
+	/// file, position or kind.
+	AuthenticationFailed,
+	/// The file uses a cipher suite this build does not support, or one that is reserved.
+	UnsupportedSuite,
+	/// The file uses an encryption format version this build does not support.
+	UnsupportedVersion,
+	/// The encryption header is truncated, damaged or not well formed.
+	MalformedHeader,
+	/// The key provider could not supply what was asked of it.
+	KeyProvider(KeyProviderFailure),
+	/// The file belongs to a different database than the one that is open.
+	DbIdMismatch,
+	/// The file is not the file the caller expected: its header names another file kind or id.
+	/// This is what a file that was renamed or copied over another looks like.
+	FileIdMismatch,
+	/// A seal was asked for at a position that is not strictly after the last one sealed with
+	/// the same file key, or with a key that can no longer be used to seal. Sealing there would
+	/// repeat a nonce.
+	PositionReuse,
+	/// The caller passed arguments that cannot be sealed or opened, such as a block kind that
+	/// does not belong to the file kind. A programming error, never produced by file contents
+	/// alone.
+	InvalidInput(&'static str),
+}
+
+impl EncryptionError {
+	/// Whether trying the same operation again later may succeed. Only a provider that is
+	/// temporarily unavailable qualifies; everything else is a fact about the files or the keys.
+	pub const fn is_retryable(&self) -> bool {
+		matches!(self, Self::KeyProvider(KeyProviderFailure::Unavailable))
+	}
+}
+
+impl fmt::Display for KeyProviderFailure {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Unavailable => write!(f, "the key provider is unavailable"),
+			Self::Failed => write!(f, "the key provider failed"),
+			Self::RandomSource => write!(f, "the system random number generator failed"),
+		}
+	}
+}
+
+impl fmt::Display for EncryptionError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::NotConfigured => {
+				write!(f, "the data is encrypted but no key manager is configured")
+			}
+			Self::PlaintextInEncryptedDb => {
+				write!(f, "a plaintext file was found in an encrypted database")
+			}
+			Self::UnknownKeyId => {
+				write!(f, "the key manager does not know the key the data was encrypted with")
+			}
+			Self::KeyRetired => write!(f, "the key is retired and cannot be used"),
+			Self::WrongKey => {
+				write!(f, "wrong key: the encryption header does not authenticate under it")
+			}
+			Self::AuthenticationFailed => {
+				write!(f, "authentication failed: the data is corrupt, was changed, or was moved")
+			}
+			Self::UnsupportedSuite => write!(f, "unsupported cipher suite"),
+			Self::UnsupportedVersion => write!(f, "unsupported encryption format version"),
+			Self::MalformedHeader => write!(f, "malformed encryption header"),
+			Self::KeyProvider(failure) => write!(f, "key provider error: {failure}"),
+			Self::DbIdMismatch => write!(f, "the file belongs to a different database"),
+			Self::FileIdMismatch => write!(f, "the file is not the one that was expected"),
+			Self::PositionReuse => {
+				write!(f, "refusing to seal at a position that would repeat a nonce")
+			}
+			Self::InvalidInput(reason) => write!(f, "invalid encryption input: {reason}"),
+		}
+	}
+}
+
+impl std::error::Error for EncryptionError {}
 
 /// Error severity levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -758,5 +883,102 @@ mod tests {
 			);
 			assert_eq!(handler.check_error().is_err(), stopped, "round {round}");
 		}
+	}
+
+	/// Every variant, so the checks below cover a variant added later: the exhaustive match in
+	/// `position` stops compiling until the new one is listed here.
+	fn every_encryption_error() -> Vec<EncryptionError> {
+		vec![
+			EncryptionError::NotConfigured,
+			EncryptionError::PlaintextInEncryptedDb,
+			EncryptionError::UnknownKeyId,
+			EncryptionError::KeyRetired,
+			EncryptionError::WrongKey,
+			EncryptionError::AuthenticationFailed,
+			EncryptionError::UnsupportedSuite,
+			EncryptionError::UnsupportedVersion,
+			EncryptionError::MalformedHeader,
+			EncryptionError::KeyProvider(KeyProviderFailure::Unavailable),
+			EncryptionError::KeyProvider(KeyProviderFailure::Failed),
+			EncryptionError::KeyProvider(KeyProviderFailure::RandomSource),
+			EncryptionError::DbIdMismatch,
+			EncryptionError::FileIdMismatch,
+			EncryptionError::PositionReuse,
+			EncryptionError::InvalidInput("a block kind that does not belong to the file kind"),
+		]
+	}
+
+	fn position(err: &EncryptionError) -> usize {
+		match err {
+			EncryptionError::NotConfigured => 0,
+			EncryptionError::PlaintextInEncryptedDb => 1,
+			EncryptionError::UnknownKeyId => 2,
+			EncryptionError::KeyRetired => 3,
+			EncryptionError::WrongKey => 4,
+			EncryptionError::AuthenticationFailed => 5,
+			EncryptionError::UnsupportedSuite => 6,
+			EncryptionError::UnsupportedVersion => 7,
+			EncryptionError::MalformedHeader => 8,
+			EncryptionError::KeyProvider(_) => 9,
+			EncryptionError::DbIdMismatch => 10,
+			EncryptionError::FileIdMismatch => 11,
+			EncryptionError::PositionReuse => 12,
+			EncryptionError::InvalidInput(_) => 13,
+		}
+	}
+
+	#[test]
+	fn every_encryption_error_variant_is_listed_once_per_shape() {
+		let mut seen: Vec<usize> = every_encryption_error().iter().map(position).collect();
+		seen.dedup();
+		assert_eq!(seen, (0..=13).collect::<Vec<_>>());
+	}
+
+	#[test]
+	fn encryption_errors_convert_into_the_crate_error_and_keep_their_identity() {
+		for err in every_encryption_error() {
+			let converted: Error = err.clone().into();
+			match &converted {
+				Error::Encryption(inner) => assert_eq!(inner, &err),
+				other => panic!("{err:?} converted to {other:?}"),
+			}
+			// The crate error is cloned across background tasks, so the payload must survive it.
+			match converted.clone() {
+				Error::Encryption(inner) => assert_eq!(inner, err),
+				other => panic!("{err:?} cloned to {other:?}"),
+			}
+			assert!(converted.to_string().ends_with(&err.to_string()), "{converted}");
+			assert!(converted.to_string().starts_with("Encryption error: "), "{converted}");
+		}
+	}
+
+	#[test]
+	fn encryption_error_texts_name_no_key_id_path_or_secret() {
+		for err in every_encryption_error() {
+			let shown = err.to_string();
+			assert!(!shown.is_empty());
+			// A key id, a file id or a byte of key material would show up as a digit, and an
+			// absolute path as a separator.
+			assert!(!shown.chars().any(|c| c.is_ascii_digit()), "digit in {shown:?}");
+			assert!(!shown.contains('/') && !shown.contains('\\'), "path in {shown:?}");
+			// Debug must not carry more than the variant either.
+			let debugged = format!("{err:?}");
+			assert!(!debugged.chars().any(|c| c.is_ascii_digit()), "digit in {debugged:?}");
+		}
+	}
+
+	#[test]
+	fn only_an_unavailable_key_provider_is_worth_retrying() {
+		for err in every_encryption_error() {
+			let expected = err == EncryptionError::KeyProvider(KeyProviderFailure::Unavailable);
+			assert_eq!(err.is_retryable(), expected, "{err:?}");
+		}
+	}
+
+	#[test]
+	fn encryption_errors_are_a_plain_std_error() {
+		fn assert_error<E: std::error::Error + Clone + Send + Sync + 'static>() {}
+		assert_error::<EncryptionError>();
+		assert_error::<Error>();
 	}
 }
