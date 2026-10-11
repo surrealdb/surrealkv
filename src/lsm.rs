@@ -58,6 +58,13 @@ pub trait CompactionOperations: Send + Sync {
 
 	/// Returns true if there are immutable memtables pending flush.
 	fn has_pending_immutables(&self) -> bool;
+
+	/// Asks the key manager again for the keys the database uses, which a task that is about to
+	/// try again after a key provider failed does first, and which may wait on the provider. Does
+	/// nothing for a database that is not encrypted.
+	fn prepare_keys(&self) -> Result<()> {
+		Ok(())
+	}
 }
 
 // ===== Core LSM Tree Implementation =====
@@ -1432,6 +1439,13 @@ impl CompactionOperations for CoreInner {
 
 	fn has_pending_immutables(&self) -> bool {
 		self.immutable_memtables.read().map(|guard| !guard.is_empty()).unwrap_or(false)
+	}
+
+	fn prepare_keys(&self) -> Result<()> {
+		match self.opts.encryption_context() {
+			Some(context) => Ok(context.refresh_in_use()?),
+			None => Ok(()),
+		}
 	}
 }
 

@@ -276,6 +276,49 @@ impl EncryptionError {
 	pub const fn is_retryable(&self) -> bool {
 		matches!(self, Self::KeyProvider(KeyProviderFailure::Unavailable))
 	}
+
+	/// The class the background tasks sort this error into, see
+	/// [`BackgroundErrorHandler::classify_error`]. The match is exhaustive on purpose: an error
+	/// added later has to be given a class here before the crate builds, and has none by default.
+	pub(crate) const fn class(&self) -> EncryptionClass {
+		match self {
+			Self::KeyProvider(KeyProviderFailure::Unavailable) => EncryptionClass::Retryable,
+			Self::WrongKey
+			| Self::UnknownKeyId
+			| Self::KeyRetired
+			| Self::NotConfigured
+			| Self::NotEncrypted
+			| Self::PlaintextInEncryptedDb
+			| Self::DbIdMismatch
+			| Self::SuiteMismatch
+			| Self::FileIdMismatch
+			| Self::UnsupportedSuite
+			| Self::UnsupportedVersion
+			| Self::MalformedHeader
+			| Self::KeyProvider(KeyProviderFailure::Failed) => EncryptionClass::Key,
+			Self::AuthenticationFailed | Self::PositionReuse => EncryptionClass::Integrity,
+			Self::KeyProvider(KeyProviderFailure::RandomSource) | Self::InvalidInput(_) => {
+				EncryptionClass::Fatal
+			}
+		}
+	}
+}
+
+/// What a failure of encryption at rest says about what to do next. See
+/// [`BackgroundErrorHandler::classify_error`] for what each class does to a background task.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncryptionClass {
+	/// The key provider could not be reached. Asking again later may work.
+	Retryable,
+	/// The configuration, the key or the files do not fit one another. Asking again changes
+	/// nothing, and no file is to be repaired or removed because of it.
+	Key,
+	/// Sealed bytes failed to authenticate, or a seal was refused for reusing a position. Not a
+	/// fact about the key, and not damage that a repair could tell from tampering.
+	Integrity,
+	/// The environment cannot provide what sealing needs, or the code asked for what cannot be
+	/// sealed.
+	Fatal,
 }
 
 impl fmt::Display for KeyProviderFailure {
@@ -399,12 +442,38 @@ impl BackgroundErrorHandler {
 		}
 	}
 
-	/// Classify error severity based on error type and context
+	/// Classify error severity based on error type and context.
+	///
+	/// A failure of encryption at rest (`Error::Encryption`) is sorted by what it says, and the
+	/// class decides what a background task does with it:
+	///
+	/// | class | errors | severity | tried again | what follows |
+	/// |---|---|---|---|---|
+	/// | retryable | `KeyProvider(Unavailable)` | soft | yes, after the capped backoff | nothing stops; the work waits for the provider |
+	/// | key | `WrongKey`, `UnknownKeyId`, `KeyRetired`, `NotConfigured`, `NotEncrypted`, `PlaintextInEncryptedDb`, `DbIdMismatch`, `SuiteMismatch`, `FileIdMismatch`, `UnsupportedSuite`, `UnsupportedVersion`, `MalformedHeader`, `KeyProvider(Failed)` | hard | no | writes stop, with this error |
+	/// | integrity | `AuthenticationFailed`, `PositionReuse` | unrecoverable | no | writes stop until the database is opened again, reported as this class |
+	/// | fatal | `KeyProvider(RandomSource)`, `InvalidInput` | fatal | no | writes stop for good |
+	///
+	/// No class repairs, moves or removes a file: that is not something a task does when it fails,
+	/// and a key that does not fit says nothing about the files. The error keeps its type all the
+	/// way here, and its text names no key, key id or path.
+	///
+	/// A soft error is recorded and does not stop writes, so a provider that is away for a while
+	/// costs the database nothing but the flushes and compactions that wait for it, and the stall
+	/// that follows if they wait long enough. A hard one stops writes, and the first flush that
+	/// succeeds afterwards ends it, as it ends any hard error.
 	fn classify_error(error: &Error, reason: BackgroundErrorReason) -> ErrorSeverity {
 		match (reason, error) {
 			// A memtable or a table holds batches that were never published: the process
 			// cannot go on
 			(BackgroundErrorReason::CommitGroup, _) => ErrorSeverity::Unrecoverable,
+
+			(_, Error::Encryption(err)) => match err.class() {
+				EncryptionClass::Retryable => ErrorSeverity::SoftError,
+				EncryptionClass::Key => ErrorSeverity::HardError,
+				EncryptionClass::Integrity => ErrorSeverity::Unrecoverable,
+				EncryptionClass::Fatal => ErrorSeverity::FatalError,
+			},
 
 			// Corruption errors are unrecoverable
 			(_, Error::Corruption(_) | Error::CorruptedBlock(_) | Error::ManifestCorruption(_)) => {
@@ -431,6 +500,32 @@ impl BackgroundErrorHandler {
 
 			// Default: treat as hard error for safety
 			_ => ErrorSeverity::HardError,
+		}
+	}
+
+	/// Whether a background task that failed with `error` tries the work again, `severity` being
+	/// what `set_error` answered for it.
+	///
+	/// A memtable flush is tried again after any error below `FatalError`, as it always was, with
+	/// one exception: an encryption error that trying again cannot cure (a key that does not fit, a
+	/// failed authentication) is not, because every attempt would create the table again, write the
+	/// large values to the value log again and fail at the same place. A compaction is tried again
+	/// only for an error of the retryable class, while the error on record for it is soft: every
+	/// other compaction error stops the database, as it always did.
+	pub(crate) fn retries(
+		error: &Error,
+		severity: ErrorSeverity,
+		reason: BackgroundErrorReason,
+	) -> bool {
+		match (reason, error) {
+			(BackgroundErrorReason::MemtablaFlush, Error::Encryption(err)) => {
+				err.is_retryable() && severity < ErrorSeverity::FatalError
+			}
+			(BackgroundErrorReason::MemtablaFlush, _) => severity < ErrorSeverity::FatalError,
+			(BackgroundErrorReason::Compaction, Error::Encryption(err)) => {
+				err.is_retryable() && severity < ErrorSeverity::HardError
+			}
+			_ => false,
 		}
 	}
 
@@ -505,11 +600,20 @@ impl BackgroundErrorHandler {
 	/// ended: a fatal one stays, and so does the error of any other reason, however it compares.
 	/// Returns whether an error was ended.
 	pub(crate) fn recover(&self, reason: BackgroundErrorReason) -> bool {
+		self.recover_below(reason, ErrorSeverity::FatalError)
+	}
+
+	/// Like [`recover`](Self::recover), but ends only a soft error: one that stopped nothing, such
+	/// as a key provider that was away. A compaction that fails for any other reason leaves its
+	/// error on record for good, and a later compaction that works does not end it.
+	pub(crate) fn recover_soft(&self, reason: BackgroundErrorReason) -> bool {
+		self.recover_below(reason, ErrorSeverity::HardError)
+	}
+
+	/// Ends the error recorded for `reason` if its severity is below `limit`.
+	fn recover_below(&self, reason: BackgroundErrorReason, limit: ErrorSeverity) -> bool {
 		let mut errors = self.bg_errors.write();
-		let Some(at) = errors
-			.iter()
-			.position(|e| e.reason == reason && e.severity < ErrorSeverity::FatalError)
-		else {
+		let Some(at) = errors.iter().position(|e| e.reason == reason && e.severity < limit) else {
 			return false;
 		};
 		let recovered = errors.remove(at);
@@ -1006,5 +1110,206 @@ mod tests {
 		fn assert_error<E: std::error::Error + Clone + Send + Sync + 'static>() {}
 		assert_error::<EncryptionError>();
 		assert_error::<Error>();
+	}
+
+	/// The class of every variant, written out: the table in the documentation of
+	/// `classify_error`, as a test.
+	fn expected_class(err: &EncryptionError) -> EncryptionClass {
+		use EncryptionError as E;
+		use KeyProviderFailure as K;
+		match err {
+			E::KeyProvider(K::Unavailable) => EncryptionClass::Retryable,
+			E::WrongKey
+			| E::UnknownKeyId
+			| E::KeyRetired
+			| E::NotConfigured
+			| E::NotEncrypted
+			| E::PlaintextInEncryptedDb
+			| E::DbIdMismatch
+			| E::SuiteMismatch
+			| E::FileIdMismatch
+			| E::UnsupportedSuite
+			| E::UnsupportedVersion
+			| E::MalformedHeader
+			| E::KeyProvider(K::Failed) => EncryptionClass::Key,
+			E::AuthenticationFailed | E::PositionReuse => EncryptionClass::Integrity,
+			E::KeyProvider(K::RandomSource) | E::InvalidInput(_) => EncryptionClass::Fatal,
+		}
+	}
+
+	#[test]
+	fn every_encryption_error_is_in_the_class_the_table_says() {
+		for err in every_encryption_error() {
+			assert_eq!(err.class(), expected_class(&err), "{err:?}");
+		}
+	}
+
+	#[test]
+	fn only_the_retryable_class_is_retryable() {
+		for err in every_encryption_error() {
+			assert_eq!(err.is_retryable(), err.class() == EncryptionClass::Retryable, "{err:?}");
+		}
+	}
+
+	#[test]
+	fn an_encryption_error_has_the_severity_of_its_class_whatever_the_reason() {
+		let reasons = [
+			BackgroundErrorReason::MemtablaFlush,
+			BackgroundErrorReason::Compaction,
+			BackgroundErrorReason::ManifestWrite,
+		];
+		for err in every_encryption_error() {
+			let expected = match expected_class(&err) {
+				EncryptionClass::Retryable => ErrorSeverity::SoftError,
+				EncryptionClass::Key => ErrorSeverity::HardError,
+				EncryptionClass::Integrity => ErrorSeverity::Unrecoverable,
+				EncryptionClass::Fatal => ErrorSeverity::FatalError,
+			};
+			for reason in reasons {
+				let severity =
+					BackgroundErrorHandler::classify_error(&Error::Encryption(err.clone()), reason);
+				assert_eq!(severity, expected, "{err:?} {reason:?}");
+			}
+			// A group that failed after part of it was applied is not about keys, whatever failed.
+			assert_eq!(
+				BackgroundErrorHandler::classify_error(
+					&Error::Encryption(err.clone()),
+					BackgroundErrorReason::CommitGroup
+				),
+				ErrorSeverity::Unrecoverable,
+				"{err:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn a_flush_is_tried_again_unless_the_error_says_that_trying_again_is_no_use() {
+		let reason = BackgroundErrorReason::MemtablaFlush;
+		for err in every_encryption_error() {
+			let error = Error::Encryption(err.clone());
+			let severity = BackgroundErrorHandler::classify_error(&error, reason);
+			assert_eq!(
+				BackgroundErrorHandler::retries(&error, severity, reason),
+				err.is_retryable(),
+				"{err:?}"
+			);
+		}
+		// What is not an encryption error keeps the rule it had: below fatal, tried again.
+		let other = Error::Other("flush".into());
+		assert!(BackgroundErrorHandler::retries(&other, ErrorSeverity::HardError, reason));
+		assert!(!BackgroundErrorHandler::retries(&other, ErrorSeverity::FatalError, reason));
+		let io = Error::Io(Arc::new(std::io::Error::other("flush")));
+		assert!(!BackgroundErrorHandler::retries(&io, ErrorSeverity::FatalError, reason));
+		// A key error that can be cured is not tried again once something fatal is on record.
+		let soft = Error::Encryption(EncryptionError::KeyProvider(KeyProviderFailure::Unavailable));
+		assert!(BackgroundErrorHandler::retries(&soft, ErrorSeverity::SoftError, reason));
+		assert!(!BackgroundErrorHandler::retries(&soft, ErrorSeverity::FatalError, reason));
+	}
+
+	#[test]
+	fn a_compaction_is_tried_again_only_for_a_key_provider_that_is_away() {
+		let reason = BackgroundErrorReason::Compaction;
+		for err in every_encryption_error() {
+			let error = Error::Encryption(err.clone());
+			let severity = BackgroundErrorHandler::classify_error(&error, reason);
+			assert_eq!(
+				BackgroundErrorHandler::retries(&error, severity, reason),
+				err.is_retryable(),
+				"{err:?}"
+			);
+		}
+		// As before, any other error of a compaction ends it for good.
+		for error in
+			[Error::Other("merge".into()), Error::Io(Arc::new(std::io::Error::other("io")))]
+		{
+			for severity in [ErrorSeverity::HardError, ErrorSeverity::FatalError] {
+				assert!(!BackgroundErrorHandler::retries(&error, severity, reason), "{error:?}");
+			}
+		}
+		// A hard error on record for the compaction is not lifted by a soft one that follows.
+		let soft = Error::Encryption(EncryptionError::KeyProvider(KeyProviderFailure::Unavailable));
+		assert!(!BackgroundErrorHandler::retries(&soft, ErrorSeverity::HardError, reason));
+		// The reasons that are not a task of their own are never tried again by the tasks.
+		assert!(!BackgroundErrorHandler::retries(
+			&soft,
+			ErrorSeverity::SoftError,
+			BackgroundErrorReason::ManifestWrite
+		));
+		assert!(!BackgroundErrorHandler::retries(
+			&soft,
+			ErrorSeverity::SoftError,
+			BackgroundErrorReason::CommitGroup
+		));
+	}
+
+	/// What each class does to the handler: a provider that is away does not stop writes, a key
+	/// that does not fit does, and only the first of them ends when the work succeeds.
+	#[test]
+	fn a_provider_that_is_away_does_not_stop_writes_and_the_other_classes_do() {
+		for err in every_encryption_error() {
+			let handler = BackgroundErrorHandler::new();
+			let error = Error::Encryption(err.clone());
+			handler.set_error(error.clone(), BackgroundErrorReason::MemtablaFlush);
+			match expected_class(&err) {
+				EncryptionClass::Retryable => {
+					assert!(!handler.is_db_stopped(), "{err:?}");
+					assert!(handler.check_error().is_ok(), "{err:?}");
+					assert!(handler.recover(BackgroundErrorReason::MemtablaFlush), "{err:?}");
+				}
+				EncryptionClass::Key => {
+					assert!(handler.is_db_stopped(), "{err:?}");
+					// The commits that are refused are told why, with the type of the error.
+					assert!(
+						matches!(handler.check_error(), Err(Error::Encryption(ref got)) if *got == err),
+						"{err:?}"
+					);
+					// A later flush that works ends it, as it ends any hard error.
+					assert!(handler.recover(BackgroundErrorReason::MemtablaFlush), "{err:?}");
+					assert!(!handler.is_db_stopped(), "{err:?}");
+				}
+				EncryptionClass::Integrity | EncryptionClass::Fatal => {
+					assert!(handler.is_db_stopped(), "{err:?}");
+					assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush), "{err:?}");
+					assert!(
+						matches!(handler.check_error(), Err(Error::Encryption(ref got)) if *got == err),
+						"{err:?}"
+					);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn an_authentication_failure_is_reported_as_a_class_of_its_own() {
+		let handler = BackgroundErrorHandler::new();
+		let severity = handler.set_error(
+			Error::Encryption(EncryptionError::AuthenticationFailed),
+			BackgroundErrorReason::Compaction,
+		);
+		assert_eq!(severity, ErrorSeverity::Unrecoverable);
+		let recorded = handler.get_error().unwrap();
+		assert_eq!(recorded.reason, BackgroundErrorReason::Compaction);
+		assert!(matches!(recorded.error, Error::Encryption(EncryptionError::AuthenticationFailed)));
+
+		// Not the severity of a wrong key, which is told apart from it.
+		let wrong_key = BackgroundErrorHandler::classify_error(
+			&Error::Encryption(EncryptionError::WrongKey),
+			BackgroundErrorReason::Compaction,
+		);
+		assert_eq!(wrong_key, ErrorSeverity::HardError);
+		assert_ne!(wrong_key, severity);
+	}
+
+	#[test]
+	fn what_is_recorded_for_an_encryption_error_names_no_key_and_no_path() {
+		for err in every_encryption_error() {
+			let handler = BackgroundErrorHandler::new();
+			handler.set_error(Error::Encryption(err.clone()), BackgroundErrorReason::Compaction);
+			let recorded = handler.get_error().unwrap().error;
+			for shown in [recorded.to_string(), format!("{recorded:?}")] {
+				assert!(!shown.chars().any(|c| c.is_ascii_digit()), "digit in {shown:?}");
+				assert!(!shown.contains('/') && !shown.contains('\\'), "path in {shown:?}");
+			}
+		}
 	}
 }
