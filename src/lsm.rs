@@ -2480,6 +2480,14 @@ impl Tree {
 		// prevents false write-write conflicts for new post-restore txns.
 		self.core.commit_pipeline.reset_for_restore(max_seq_num);
 
+		// The queue of immutable memtables and the level-0 tables that a writer was stalled on are
+		// the restored ones now, and nothing else wakes a writer on an idle tree. Woken with the
+		// locks released, so that it commits instead of finding the restore still running.
+		drop(_compactions);
+		drop(_flush);
+		drop(_write_guard);
+		self.core.write_stall.signal_work_done();
+
 		Ok(metadata)
 	}
 

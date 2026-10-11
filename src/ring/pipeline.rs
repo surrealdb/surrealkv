@@ -435,6 +435,9 @@ pub(crate) struct CommitPipeline {
 	/// what it needs, as if the size estimator had drifted. 0 disables it.
 	#[cfg(test)]
 	estimate_shortfall: AtomicU64,
+	/// Test-only observer called when a group's flush returned and nothing is published yet.
+	#[cfg(test)]
+	publish_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 	/// Test-only observer called at the start of every `free_retired`.
 	#[cfg(test)]
 	free_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
@@ -504,6 +507,8 @@ impl CommitPipeline {
 			wal_reserve_fails_from: std::sync::atomic::AtomicUsize::new(usize::MAX),
 			#[cfg(test)]
 			estimate_shortfall: AtomicU64::new(0),
+			#[cfg(test)]
+			publish_hook: Mutex::new(None),
 			#[cfg(test)]
 			free_hook: Mutex::new(None),
 			#[cfg(test)]
@@ -588,6 +593,13 @@ impl CommitPipeline {
 	#[cfg(test)]
 	pub(crate) fn set_retire_gap_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
 		*self.retire_gap.lock() = hook;
+	}
+
+	/// Installs (or clears) the observer called once a group's flush returned, whatever applied
+	/// is in a memtable, and before anything of the group is published.
+	#[cfg(test)]
+	pub(crate) fn set_publish_hook(&self, hook: Option<Arc<dyn Fn() + Send + Sync>>) {
+		*self.publish_hook.lock() = hook;
 	}
 
 	/// Installs (or clears) the observer called at the start of every `free_retired`, before it
@@ -1022,6 +1034,13 @@ impl CommitPipeline {
 				result
 			}
 		};
+		#[cfg(test)]
+		{
+			let hook = self.publish_hook.lock().clone();
+			if let Some(hook) = hook {
+				hook();
+			}
+		}
 		// Published under the active memtable's read guard, which a restore needs exclusively to
 		// replace the memtables and bump the epoch: a group that is still in the epoch it began
 		// in publishes before the swap, and one that is not publishes nothing, so a sequence

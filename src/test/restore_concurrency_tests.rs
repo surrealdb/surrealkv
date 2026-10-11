@@ -2355,3 +2355,202 @@ async fn restoring_between_rounds_of_work_that_collects_the_value_log() {
 	assert_exact(&tree, &w.at_ckpt, &format!("seed {seed:#x}: after the reopen"));
 	tree.close().await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// state that outlives a restore in a reader or in a group
+// ---------------------------------------------------------------------------
+
+/// An iterator that was made before a restore holds the tables of the old manifest, and reads
+/// their blocks when it is first used. Those blocks must not be served for a table of the
+/// restored database that has the same id, whenever the iterator reads them.
+#[test(tokio::test)]
+async fn an_iterator_that_reads_the_old_tables_after_a_restore_does_not_poison_the_reused_ids() {
+	let mut w = build(false).await;
+	let old_ids = table_ids(&w.tree);
+	let t = w.tree.begin_with_mode(Mode::ReadOnly).unwrap();
+	let mut it = t.iter().unwrap();
+
+	w.tree.restore_from_checkpoint(&w.ckpt).unwrap();
+	let mut m = w.at_ckpt.clone();
+	apply(&w.tree, &mut m, sets(60..100, "n", false)).await.unwrap();
+	apply(&w.tree, &mut m, sets(10..30, "n", false)).await.unwrap();
+	apply(&w.tree, &mut m, dels(30..40)).await.unwrap();
+	w.tree.flush().unwrap();
+	let reused: Vec<u64> =
+		table_ids(&w.tree).into_iter().filter(|id| old_ids.contains(id)).collect();
+	assert!(
+		reused.iter().any(|id| !w.tables_at_ckpt.contains(id)),
+		"setup: a table id from before the restore is used again ({old_ids:?} -> {:?})",
+		table_ids(&w.tree)
+	);
+
+	// The old iterator reads the blocks of its tables now, after the restore cleared the cache.
+	it.seek_first().unwrap();
+	let mut rows = 0;
+	while it.valid() {
+		let _ = it.value();
+		if it.next().is_err() {
+			break;
+		}
+		rows += 1;
+	}
+	println!("the old iterator read {rows} rows");
+	drop(it);
+	drop(t);
+
+	assert_exact_with_extra(&w.tree, &m, "reads of the reused ids after the old iterator ran");
+	let tree = w.reopen().await;
+	assert_exact_with_extra(&tree, &m, "after the reopen");
+	tree.close().await.unwrap();
+}
+
+/// A group that applied to the memtable before a restore, and publishes after it, publishes
+/// nothing: a sequence number from before the restore must not reach `visible_seq_num`, which the
+/// restore reset, or the commits of the restored database would be read at a sequence number that
+/// is ahead of them.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_group_applied_before_a_restore_publishes_nothing_after_it() {
+	let mut w = build(false).await;
+	let (gate, pass) = gate();
+	w.tree.core.commit_pipeline.set_publish_hook(Some(pass));
+	let held = commit_task(&w.tree, "applied_before_the_restore");
+	gate.arrived("BeforePublish");
+
+	let restoring = restore_call(&w.tree, &w.ckpt);
+	assert!(
+		restoring.finishes_within(WATCHDOG),
+		"the restore waited for the group that is about to publish"
+	);
+	restoring.wait().unwrap();
+	assert_eq!(w.tree.core.seq_num(), w.ckpt_seq, "the restore resets the visible sequence number");
+	gate.release();
+	let held = tokio::time::timeout(WATCHDOG, held)
+		.await
+		.expect("the held commit never returned")
+		.unwrap();
+	w.tree.core.commit_pipeline.set_publish_hook(None);
+	assert!(is_stall(&held), "the group that applied before the restore returned {held:?}");
+	assert_eq!(
+		w.tree.core.seq_num(),
+		w.ckpt_seq,
+		"a group of the old database published its sequence number into the restored one"
+	);
+	assert_exact(&w.tree, &w.at_ckpt, "after the group published");
+
+	let mut m = w.at_ckpt.clone();
+	apply(&w.tree, &mut m, sets(300..303, "after", false)).await.unwrap();
+	assert_eq!(w.tree.core.seq_num(), w.ckpt_seq + 3, "the next commit continues from the restore");
+	assert_exact_with_extra(&w.tree, &m, "after the restore");
+	let tree = w.reopen().await;
+	assert_exact_with_extra(&tree, &m, "after the reopen");
+	tree.close().await.unwrap();
+}
+
+/// A writer that waits for level-0 files to be compacted resumes when a restore replaces them by
+/// fewer: the restore changes what the stall waits on, and nothing else will wake the writer on an
+/// idle tree.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_writer_stalled_on_level_zero_files_resumes_when_a_restore_removes_them() {
+	let dir = TempDir::new("restore_conc_stall").unwrap();
+	let ckpt_root = TempDir::new("restore_conc_stall_ckpt").unwrap();
+	let opts = Arc::new(Options {
+		level0_max_files: 3,
+		l0_stall_threshold: 3,
+		..(*options(dir.path(), false)).clone()
+	});
+	let tree = open(Arc::clone(&opts));
+	let mut m = Model::new();
+	apply(&tree, &mut m, sets(0..10, "a", false)).await.unwrap();
+	tree.flush().unwrap();
+	let ckpt = ckpt_root.path().join("ckpt");
+	tree.create_checkpoint(&ckpt).unwrap();
+	assert_eq!(table_ids(&tree).len(), 1, "setup: the checkpoint holds one table");
+	for (range, gen) in [(10..20, "b"), (20..30, "c")] {
+		apply(&tree, &mut m, sets(range, gen, false)).await.unwrap();
+		tree.flush().unwrap();
+	}
+	assert_eq!(table_ids(&tree).len(), 3, "setup: the tree is at its level-0 stall threshold");
+
+	let writer = commit_task(&tree, "stalled_writer");
+	let deadline = Instant::now() + WATCHDOG;
+	while !tree.core.write_stall.is_stalled() {
+		assert!(Instant::now() < deadline, "setup: the writer never stalled");
+		tokio::time::sleep(Duration::from_millis(2)).await;
+	}
+
+	let restoring = restore_call(&tree, &ckpt);
+	assert!(restoring.finishes_within(WATCHDOG), "the restore did not finish");
+	restoring.wait().unwrap();
+	let outcome = tokio::time::timeout(WATCHDOG, writer)
+		.await
+		.expect("the stalled writer never resumed after the restore removed what it waited on")
+		.unwrap();
+	outcome.expect("the writer that was stalled commits once the restore is over");
+	assert!(!tree.core.write_stall.is_stalled(), "the tree is still stalled after the restore");
+	let mut t = txn(&tree);
+	t.set(&b"after"[..], &b"the stall"[..]).unwrap();
+	t.commit().await.unwrap();
+	tree.close().await.unwrap();
+}
+
+/// Iterators, flushes, compactions and restores that run at the same time make progress: the
+/// iterators take the active memtable, the manifest and the immutable queue together, and the
+/// restore, a flush and a compaction take them for writing in the same order.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn iterators_flushes_compactions_and_restores_that_run_together_do_not_deadlock() {
+	let w = build(false).await;
+	let stop = Arc::new(AtomicBool::new(false));
+	let mut calls = Vec::new();
+	for _ in 0..3 {
+		let (tree, stop) = (Arc::clone(&w.tree), Arc::clone(&stop));
+		calls.push(on_thread(move || {
+			let mut rounds = 0u64;
+			while !stop.load(Ordering::SeqCst) {
+				let t = tree.begin_with_mode(Mode::ReadOnly).unwrap();
+				if let Ok(mut it) = t.iter() {
+					if it.seek_first().is_ok() {
+						for _ in 0..8 {
+							if !it.valid() || it.next().is_err() {
+								break;
+							}
+						}
+					}
+				}
+				rounds += 1;
+			}
+			rounds
+		}));
+	}
+	let (tree, stop2, opts) = (Arc::clone(&w.tree), Arc::clone(&stop), Arc::clone(&w.opts));
+	let maintenance = on_thread(move || {
+		let mut rounds = 0u64;
+		while !stop2.load(Ordering::SeqCst) {
+			let _ = tree.flush();
+			let _ = tree.compact(eager(&opts));
+			rounds += 1;
+		}
+		rounds
+	});
+	let mut m = w.at_ckpt.clone();
+	let deadline = Instant::now() + Duration::from_secs(3);
+	let mut restores = 0;
+	while Instant::now() < deadline {
+		let restoring = restore_call(&w.tree, &w.ckpt);
+		assert!(restoring.finishes_within(WATCHDOG), "a restore did not finish: a deadlock");
+		restoring.wait().unwrap();
+		restores += 1;
+		apply(&w.tree, &mut m, sets(100..110, "x", false)).await.unwrap();
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+	stop.store(true, Ordering::SeqCst);
+	for call in calls {
+		assert!(call.finishes_within(WATCHDOG), "an iterator thread never finished: a deadlock");
+		call.wait();
+	}
+	assert!(maintenance.finishes_within(WATCHDOG), "the flush and compaction thread hung");
+	maintenance.wait();
+	println!("{restores} restores");
+	w.tree.restore_from_checkpoint(&w.ckpt).unwrap();
+	assert_exact(&w.tree, &w.at_ckpt, "after the last restore");
+	w.tree.close().await.unwrap();
+}
