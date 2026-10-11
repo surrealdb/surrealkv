@@ -475,13 +475,10 @@ async fn a_restore_reads_the_wal_of_the_checkpoint_with_the_key_of_the_live_tree
 		let tree = Tree::new(Arc::clone(&live_options)).unwrap();
 		put(&tree, "one", &GOOD).await;
 		tree.create_checkpoint(&checkpoint).unwrap();
-		// The number that the segments of the checkpoint begin at, read from the manifest of the
-		// checkpoint itself: after a version (2 bytes) and the next table id (8) it is the log
-		// number.
-		let manifest = tree_options(&checkpoint, Some(&enc), WalRecoveryMode::AbsoluteConsistency)
-			.manifest_file_path(0);
-		let manifest = fs::read(manifest).unwrap();
-		let log_number = u64::from_be_bytes(manifest[10..18].try_into().unwrap());
+		// The number that the segments of the checkpoint begin at. The checkpoint flushed first and
+		// the commit below only appends to the WAL, so it is the number of the live manifest now;
+		// the manifest of an encrypted database is sealed and cannot be parsed from its bytes.
+		let log_number = tree.core.inner.level_manifest.read().unwrap().get_log_number();
 		put(&tree, "two", &GOOD).await;
 
 		// A sealed segment in the WAL of the checkpoint, where the log number says it begins: what
