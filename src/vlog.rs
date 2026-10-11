@@ -788,6 +788,12 @@ pub(crate) struct VLog {
 
 	/// Number of live [`VLogPin`]s. While there is one, no file is deleted.
 	pins: AtomicUsize,
+
+	/// The file that the commit group in flight started in, `u32::MAX` while there is none. Set
+	/// by [`pin_group`](Self::pin_group), by the one flusher (and by the test-only `flush_group`,
+	/// which must not run beside it): a second group at a time would release the pin of the
+	/// first.
+	group_floor: AtomicU32,
 }
 
 /// Keeps a [`VLog`] from deleting files until it is dropped.
@@ -796,6 +802,16 @@ pub(crate) struct VLogPin<'a>(&'a VLog);
 impl Drop for VLogPin<'_> {
 	fn drop(&mut self) {
 		self.0.pins.fetch_sub(1, Ordering::SeqCst);
+	}
+}
+
+/// Keeps a [`VLog`] from deleting the files that the values of a commit group are written to
+/// until it is dropped, see [`VLog::pin_group`].
+pub(crate) struct VLogGroupPin<'a>(&'a VLog);
+
+impl Drop for VLogGroupPin<'_> {
+	fn drop(&mut self) {
+		self.0.group_floor.store(u32::MAX, Ordering::SeqCst);
 	}
 }
 
@@ -825,6 +841,7 @@ impl VLog {
 			#[cfg(test)]
 			sync_gap: Mutex::new(None),
 			pins: AtomicUsize::new(0),
+			group_floor: AtomicU32::new(u32::MAX),
 		};
 
 		// PRE-FILL ALL EXISTING FILE HANDLES ON STARTUP
@@ -1085,14 +1102,43 @@ impl VLog {
 		let value_len = pointer.value_size;
 		let total_size = pointer.total_entry_size();
 
+		// `read_at` may return fewer bytes than asked for, and returns none at the end of the
+		// file: read until the entry is complete or the file ends. An entry that the end of its
+		// file cuts short is an error, not a value whose tail is the zeros of the buffer: without
+		// checksum verification nothing else would tell them apart from what was written.
 		let mut entry_data_vec = vec![0u8; total_size as usize];
-		vfs::File::read_at(&*file, pointer.offset, &mut entry_data_vec).map_err(|e| {
-			tracing::error!("Failed to read VLog entry: pointer={:?}, error={}", pointer, e);
-			Error::Other(format!(
-				"Failed to read VLog entry (file_id={}, offset={}, key_size={}, value_size={}): {}",
-				pointer.file_id, pointer.offset, pointer.key_size, pointer.value_size, e
-			))
-		})?;
+		let mut filled = 0;
+		while filled < entry_data_vec.len() {
+			let read = vfs::File::read_at(
+				&*file,
+				pointer.offset + filled as u64,
+				&mut entry_data_vec[filled..],
+			)
+			.map_err(|e| {
+				tracing::error!("Failed to read VLog entry: pointer={:?}, error={}", pointer, e);
+				Error::Other(format!(
+					"Failed to read VLog entry (file_id={}, offset={}, key_size={}, value_size={}): {}",
+					pointer.file_id, pointer.offset, pointer.key_size, pointer.value_size, e
+				))
+			})?;
+			if read == 0 {
+				break;
+			}
+			filled += read;
+		}
+		if filled < entry_data_vec.len() {
+			tracing::error!(
+				"VLog entry cut short by the end of its file: pointer={:?}, read {} of {} bytes",
+				pointer,
+				filled,
+				total_size
+			);
+			return Err(Error::Corruption(format!(
+				"VLog entry cut short by the end of its file (file_id={}, offset={}): read {} of {} \
+				 bytes",
+				pointer.file_id, pointer.offset, filled, total_size
+			)));
+		}
 
 		// Verify header sizes
 		let header_key_len = u32::from_be_bytes([
@@ -1183,12 +1229,46 @@ impl VLog {
 		VLogPin(self)
 	}
 
+	/// Pins the files that the values of a commit group are about to be written to. The flusher
+	/// takes it before it appends the first value of the group and drops it once the group is in
+	/// a memtable or a table, or, for a group that failed with its records logged, once the
+	/// active memtable accounts for the files they point into. Every value of the group goes to
+	/// the file that is active now or a later one.
+	///
+	/// Between the first append and that point the values are in no table and in no memtable, so
+	/// the bound of a cleanup (`lsm::vlog_floor`) cannot see them. [`unregistered_floor`]
+	/// (Self::unregistered_floor) makes the cleanup keep them.
+	pub(crate) fn pin_group(&self) -> VLogGroupPin<'_> {
+		self.group_floor.store(self.active_writer_id.load(Ordering::SeqCst), Ordering::SeqCst);
+		VLogGroupPin(self)
+	}
+
+	/// The smallest file that a cleanup may not delete, whatever the tables and memtables say:
+	/// the files of values that no table and no memtable points into yet. A cleanup reads it
+	/// before it reads them, for the argument that it is enough:
+	///
+	/// - A group that started before the active file was read has its pin read next, if it is still
+	///   held. Its values are in files at or above the pin.
+	/// - A group that released its pin before it was read has put its values into a memtable or a
+	///   table first (the release is sequentially consistent, and the reads of the bound that
+	///   follow see what came before it).
+	/// - A group that starts after the pin was read appends to files at or above the active file
+	///   that was read first, since the active file only grows.
+	///
+	/// The active file comes first for the third case: read after the pin, it could already be a
+	/// file that such a group rolled over to, and the files of the group below it would go.
+	pub(crate) fn unregistered_floor(&self) -> u32 {
+		let active = self.active_writer_id.load(Ordering::SeqCst);
+		active.min(self.group_floor.load(Ordering::SeqCst))
+	}
+
 	/// Cleans up obsolete vlog files based on the global minimum file id that anything points into.
 	///
 	/// A vlog file is safe to delete when:
 	/// - Its file_id < min_oldest_vlog (no SST and no unflushed memtable has a value in it, see
-	///   `lsm::vlog_floor`)
-	/// - It is not the active writer
+	///   `lsm::vlog_floor`, and no commit group is about to, see
+	///   [`unregistered_floor`](Self::unregistered_floor))
+	/// - It is below the active writer's file
 	/// - No iterators are active
 	/// - No [`VLogPin`] is held
 	///
@@ -1200,12 +1280,15 @@ impl VLog {
 			return Ok(());
 		}
 
-		let active = self.active_writer_id.load(Ordering::SeqCst);
+		// The bound is capped at the active file, the newest one that can be deleted: a rollover
+		// registers the file it creates before it makes it the active one, and a bound of
+		// `u32::MAX` (nothing points into the log) would otherwise take that file along.
+		let bound = min_oldest_vlog.min(self.active_writer_id.load(Ordering::SeqCst));
 
 		// Collect files that are safe to delete
 		let to_delete: Vec<u32> = {
 			let files_map = self.files_map.read();
-			files_map.keys().filter(|&&id| id < min_oldest_vlog && id != active).copied().collect()
+			files_map.keys().filter(|&&id| id < bound).copied().collect()
 		};
 
 		if to_delete.is_empty() {

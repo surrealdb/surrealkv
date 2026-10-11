@@ -1001,6 +1001,9 @@ impl CommitPipeline {
 			return;
 		}
 
+		// The values of the group go to the value log in `flush_group_with`, ahead of anything
+		// that points into them: a cleanup keeps their files until the pin is dropped, below.
+		let vlog_pin = self.inner.vlog.as_ref().map(|vlog| vlog.pin_group());
 		let result = match self.flush_group_with(&mut batches, need_sync, scratch).await {
 			Err(cause) if scratch.applied => Err(self.stop_database(&cause)),
 			result => {
@@ -1034,6 +1037,11 @@ impl CommitPipeline {
 				entry.abort();
 			}
 		}
+		// A group that was applied is in a memtable or in a table, and one that failed is
+		// accounted for by the active memtable: what points into the files of its values is
+		// there for a cleanup to find. The commits are completed after this, so a committer
+		// that is told its commit is done finds the pin released.
+		drop(vlog_pin);
 		for complete_tx in scratch.waiters.drain(..) {
 			let _ = complete_tx.send(match &result {
 				Ok(()) if applied => Ok(()),
@@ -1136,6 +1144,7 @@ impl CommitPipeline {
 	#[cfg(test)]
 	pub(crate) async fn flush_group(&self, batches: &[Batch], sync: bool) -> Result<()> {
 		let mut owned = batches.to_vec();
+		let _vlog_pin = self.inner.vlog.as_ref().map(|vlog| vlog.pin_group());
 		let result = self.flush_group_with(&mut owned, sync, &mut FlushScratch::default()).await;
 		self.inner.group_wal_pin.store(u64::MAX, Ordering::Release);
 		result
@@ -1697,11 +1706,21 @@ impl CommitPipeline {
 	/// The values of `batch` are in the value log already, and no table or memtable points into
 	/// them until its table is registered. The flushes make cleanups of the value log, and the
 	/// tables they register can point into newer files only (a memtable that holds inline
-	/// values separates them in its flush), so the active memtable keeps the files of `batch`
-	/// for as long as its record can be replayed, as it does for a group that failed.
+	/// values separates them in its flush). The pin of the group (`VLog::pin_group`) keeps the
+	/// files of `batch` through them and through the registration of its table, and is released
+	/// once the group is done, whichever way this ends. It is not the active memtable that
+	/// accounts for them: that memtable is empty, and stays so while every commit is oversized,
+	/// so a bound that it lowered would not rise again.
+	///
+	/// A failure needs no more: `flush_entries` accounts for the batches of a failed group on the
+	/// active memtable, since their records may be replayed, and only then drops the pin. After
+	/// a registration the table points into the files. A copy of the record that a crash replays
+	/// (`log_number` is held below its segment) points into the same files, and replay is a
+	/// suffix of the WAL: every newer version of the keys of the batch is logged in the same
+	/// segment or a later one, so it is replayed after the record and shadows it in the recovered
+	/// memtable. A shadowed pointer is never read, a flush copies it and a compaction drops it.
 	fn write_direct_to_l0(&self, batch: &Batch, rest_wal_number: u64) -> Result<()> {
 		let sealed_wal_number = self.inner.seal_active_wal_segment()?;
-		self.inner.active_memtable.read()?.note_vlog_pointers(batch);
 		if let Some(ref tm) = self.task_manager {
 			tm.wake_up_memtable();
 		}

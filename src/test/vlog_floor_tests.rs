@@ -25,6 +25,7 @@ use crate::compaction::leveled::Strategy;
 use crate::levels::write_manifest_to_disk;
 use crate::lsm::{cleanup_vlog, vlog_floor, CompactionOperations, FlushHook};
 use crate::memtable::MemTable;
+use crate::ring::PipelineHook;
 use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{Durability, InternalKeyKind, Mode, Options, Tree};
 
@@ -552,7 +553,7 @@ fn a_moved_batch_is_accounted_for_before_its_values_can_be_read() {
 // ---------------------------------------------------------------------------
 
 /// The bound is the smallest file any table or any memtable points into, whichever has it, and
-/// nothing is deleted while no table points into the value log.
+/// nothing is deleted while no table was written.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_bound_is_the_smallest_file_of_any_table_or_memtable() {
 	let dir = TempDir::new("vlog_floor_bound").unwrap();
@@ -637,6 +638,115 @@ async fn the_bound_stays_below_a_queued_memtable_until_its_table_is_registered()
 	flusher.join().unwrap().unwrap();
 	assert_eq!(table_ids(&tree).len(), 2);
 	assert_eq!(floor(&tree), first, "the memtable's table points into its files");
+	crash(&tree);
+}
+
+/// Tables were written and none of them points into the value log (they hold inline values
+/// only): nothing is held back by them, which is not the same as no table having been written.
+/// Whatever a memtable points into is still the bound, and the active file is never taken.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn tables_that_point_nowhere_hold_nothing_back_but_a_fresh_database_deletes_nothing() {
+	let dir = TempDir::new("vlog_floor_nowhere").unwrap();
+	let tree = open(dir.path(), NEVER_ROTATING);
+	assert_eq!(floor(&tree), 0, "no table was written yet");
+
+	commit(&tree, &[(b"inline".to_vec(), small(0, 1))], Durability::Immediate).await.unwrap();
+	flush_to_tables(&tree);
+	assert_eq!(table_ids(&tree).len(), 1);
+	assert_eq!(tables_min(&tree), 0, "the table points into no file");
+	assert_eq!(floor(&tree), u32::MAX, "tables were written and nothing points into the log");
+
+	// What an unflushed memtable points into is kept, as before.
+	put(&tree, 0..4, 1).await;
+	let first = vlog_files(dir.path())[0];
+	assert_eq!(floor(&tree), first, "an active memtable");
+
+	// The active file is never taken, whatever the bound is.
+	tree.core.inner.vlog.as_ref().unwrap().cleanup_obsolete_files(u32::MAX).unwrap();
+	assert_eq!(
+		vlog_files(dir.path()),
+		vec![tree.core.inner.vlog.as_ref().unwrap().active_writer_id.load(Ordering::SeqCst)]
+	);
+	crash(&tree);
+}
+
+/// A table that was opened from disk and names no file may point into the log all the same, as
+/// the tables of a database written by an older version do: nothing is deleted until a
+/// compaction has written the table again.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_table_opened_from_disk_that_names_no_file_keeps_the_log_until_it_is_rewritten() {
+	let root = TempDir::new("vlog_floor_unknown").unwrap();
+	let live = root.path().join("live");
+	let tree = quiet_tree(&live).await;
+	for round in 1..=2 {
+		commit(&tree, &[(key_of(round), small(round, 1))], Durability::Immediate).await.unwrap();
+		flush_to_tables(&tree);
+	}
+	// Files that nothing points into: the restart cannot tell them from the files of a table
+	// that does not say.
+	roll_past(&tree, 3);
+	let files = vlog_files(&live);
+	assert!(files.len() >= 3, "files nothing points into: {files:?}");
+	let image = root.path().join("image");
+	copy_dir_all(&live, &image);
+	crash(&tree);
+
+	let reopened = quiet_tree(&image).await;
+	assert_eq!(floor(&reopened), 0, "the tables were opened from disk");
+	cleanup(&reopened);
+	assert_eq!(vlog_files(&image), files, "nothing was deleted");
+
+	// The compaction writes the tables again, and they say what they point into.
+	compact(&reopened);
+	assert_eq!(floor(&reopened), u32::MAX);
+	cleanup(&reopened);
+	assert_eq!(
+		vlog_files(&image),
+		vec![reopened.core.inner.vlog.as_ref().unwrap().active_writer_id.load(Ordering::SeqCst)],
+		"only the active file is left"
+	);
+	crash(&reopened);
+}
+
+/// A commit group whose values are in the value log and in no memtable or table yet, while a
+/// cleanup finds nothing that points into the log (the tables hold inline values only): the bound
+/// is above every file, and only the pin of the group keeps the files that the group rolled over
+/// from. The cleanup runs where the group has been logged and nothing is applied.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_cleanup_that_finds_nothing_pointing_into_the_log_keeps_the_files_of_a_group_in_flight() {
+	let root = TempDir::new("vlog_floor_in_flight").unwrap();
+	let live = root.path().join("live");
+	let tree = quiet_tree(&live).await;
+	commit(&tree, &[(b"inline".to_vec(), small(0, 1))], Durability::Immediate).await.unwrap();
+	flush_to_tables(&tree);
+	assert_eq!(floor(&tree), u32::MAX, "nothing points into the log");
+
+	let during = Arc::new(Mutex::new(None));
+	{
+		let inner = Arc::clone(&tree.core.inner);
+		let (during, live) = (Arc::clone(&during), live.clone());
+		tree.core.commit_pipeline.set_hook(Some(Arc::new(move |point| {
+			if let PipelineHook::AfterWalSync {
+				..
+			} = point
+			{
+				cleanup_vlog(
+					&inner.vlog,
+					&inner.active_memtable,
+					&inner.level_manifest,
+					&inner.immutable_memtables,
+					"in flight",
+				);
+				*during.lock().unwrap() = Some(vlog_files(&live));
+			}
+		})));
+	}
+	let written = put(&tree, 0..6, 1).await;
+	tree.core.commit_pipeline.set_hook(None);
+
+	let during = during.lock().unwrap().take().expect("the group was logged");
+	assert!(during.len() >= 3, "the group rolled over: {during:?}");
+	assert_reads(&tree, &written, "after the commit");
 	crash(&tree);
 }
 
@@ -1004,6 +1114,62 @@ async fn an_oversized_commit_keeps_its_files_while_it_flushes_a_queued_memtable(
 
 	// Nothing was read before, so no value is in the block cache to hide a deleted file.
 	assert_reads(&tree, &expected, "after the oversized commit");
+	crash(&tree);
+}
+
+/// Whether the pin of a commit group is held: the values of a group are written to files after
+/// the one that was active when it started, so with a rollover in the group a pin that is still
+/// held is below the active file.
+fn group_pinned(tree: &Tree) -> bool {
+	let vlog = tree.core.inner.vlog.as_ref().unwrap();
+	vlog.unregistered_floor() < vlog.active_writer_id.load(Ordering::SeqCst)
+}
+
+/// The pin that keeps the files of a group until they are in a memtable or a table is released
+/// when the group is done, and a committer that is told its commit is done finds it released:
+/// after a commit that went to a memtable, and after one that went straight to a table.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn the_pin_of_a_commit_group_is_released_when_the_commit_is_done() {
+	let root = TempDir::new("vlog_floor_group_pin").unwrap();
+	let tree = quiet_tree(&root.path().join("live")).await;
+	let vlog = tree.core.inner.vlog.as_ref().unwrap();
+
+	put(&tree, 0..4, 1).await;
+	assert!(vlog.active_writer_id.load(Ordering::SeqCst) >= 2, "the group rolled over");
+	assert!(!group_pinned(&tree), "a commit that went to a memtable");
+
+	let started_in = vlog.active_writer_id.load(Ordering::SeqCst);
+	put_oversized(&tree, &[10, 11, 12], 2).await;
+	assert!(vlog.active_writer_id.load(Ordering::SeqCst) > started_in, "the group rolled over");
+	assert!(!group_pinned(&tree), "a commit that went straight to a table");
+	crash(&tree);
+}
+
+/// The pin is released when the group fails too, once the active memtable accounts for the
+/// files its records point into: a pin that stayed would keep the log from ever being cleaned.
+#[cfg(unix)]
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn the_pin_of_a_commit_group_is_released_when_the_group_fails() {
+	use std::os::unix::fs::PermissionsExt;
+
+	let root = TempDir::new("vlog_floor_group_pin_failed").unwrap();
+	let live = root.path().join("live");
+	let tree = quiet_tree(&live).await;
+	let active_min = || tree.core.inner.active_memtable.read().unwrap().min_vlog_file_id();
+	assert_eq!(active_min(), None, "nothing points into the value log yet");
+
+	let sstables = live.join("sstables");
+	std::fs::set_permissions(&sstables, std::fs::Permissions::from_mode(0o555)).unwrap();
+	let outcome = put_oversized_outcome(&tree, &[500, 501, 502]).await;
+	std::fs::set_permissions(&sstables, std::fs::Permissions::from_mode(0o755)).unwrap();
+	assert!(outcome.is_err(), "the table of the oversized batch cannot be created");
+
+	assert!(!group_pinned(&tree), "a group that failed");
+	assert_eq!(
+		active_min(),
+		Some(vlog_files(&live)[0]),
+		"the active memtable accounts for the files of the failed group"
+	);
 	crash(&tree);
 }
 
@@ -1491,6 +1657,158 @@ async fn cleanups_racing_commits_rotations_flushes_and_compactions_lose_nothing(
 #[ignore = "slow: 60 rounds of three writers against rotations, compactions and cleanups, about 20 s"]
 async fn cleanups_racing_commits_rotations_flushes_and_compactions_for_long_lose_nothing() {
 	cleanups_racing_everything(60).await;
+}
+
+/// Writers commit a value that goes to the value log and delete it again, while threads rotate,
+/// flush, compact and clean up in a loop. The tables that the compactions write hold tombstones
+/// and small entries only, so whenever nothing unflushed points into the log the bound of a
+/// cleanup is every file but the active one: what keeps a value that was acknowledged is the
+/// memtable that holds it, the pin of the group that is writing it, or the table that was
+/// registered for it. It must read back right after the commit, and the log must be gone but for
+/// the active file once the writers are done and the tables are compacted.
+///
+/// This is a regression net for the bound as a whole, not a proof of any one of those: the window
+/// of a group between its first append and its apply is too short for threads to hit reliably, so
+/// the pin of a group is held by
+/// `a_cleanup_that_finds_nothing_pointing_into_the_log_keeps_the_files_of_a_group_in_flight`
+/// and `an_oversized_commit_keeps_its_files_while_it_flushes_a_queued_memtable`.
+async fn cleanups_racing_commits_while_the_tables_point_nowhere(rounds: usize) {
+	const WRITERS: usize = 3;
+
+	let root = TempDir::new("vlog_floor_race_nowhere").unwrap();
+	let live = root.path().join("live");
+	let tree = open(&live, SMALL_MEMTABLE);
+	// A table exists, and points nowhere: the bound is no longer 0 for a database with no table.
+	commit(&tree, &[(b"inline".to_vec(), small(0, 0))], Durability::Immediate).await.unwrap();
+	flush_to_tables(&tree);
+	assert_eq!(floor(&tree), u32::MAX);
+
+	let stop = Arc::new(AtomicBool::new(false));
+	let mut threads = Vec::new();
+	for _ in 0..2 {
+		let (tree, stop) = (Arc::clone(&tree), Arc::clone(&stop));
+		threads.push(std::thread::spawn(move || {
+			while !stop.load(Ordering::Relaxed) {
+				cleanup(&tree);
+			}
+		}));
+	}
+	{
+		let (tree, stop) = (Arc::clone(&tree), Arc::clone(&stop));
+		threads.push(std::thread::spawn(move || {
+			while !stop.load(Ordering::Relaxed) {
+				let _ = tree.core.inner.rotate_memtable();
+				let _ = tree.core.inner.flush_all_immutables_sync();
+				std::thread::sleep(Duration::from_millis(3));
+			}
+		}));
+	}
+	{
+		let (tree, stop) = (Arc::clone(&tree), Arc::clone(&stop));
+		threads.push(std::thread::spawn(move || {
+			while !stop.load(Ordering::Relaxed) {
+				let opts = Arc::new(Options {
+					level0_max_files: 2,
+					..Default::default()
+				});
+				let _ = tree.compact(Arc::new(Strategy::from_options(opts)));
+				std::thread::sleep(Duration::from_millis(5));
+			}
+		}));
+	}
+
+	let mut writers = Vec::new();
+	for w in 0..WRITERS {
+		let tree = Arc::clone(&tree);
+		writers.push(tokio::spawn(async move {
+			for round in 0..rounds {
+				let i = w * 10 + round % 6;
+				let value = big(i, round);
+				commit(&tree, &[(key_of(i), value.clone())], Durability::Immediate).await.unwrap();
+				assert_eq!(
+					get(&tree, &key_of(i)).unwrap().as_deref(),
+					Some(value.as_slice()),
+					"writer {w}, round {round}: a value that was acknowledged does not read back"
+				);
+				let mut txn = tree.begin().unwrap();
+				txn.set_durability(Durability::Immediate);
+				txn.delete(key_of(i)).unwrap();
+				txn.commit().await.unwrap();
+
+				if round % 10 == 9 {
+					// An oversized batch: its values are written for a table of their own.
+					let mut entries = Vec::new();
+					for j in 0..3 {
+						entries.push((format!("ov_{w}_{round}_{j}").into_bytes(), big(j, round)));
+					}
+					for j in 0..100 {
+						entries.push((
+							format!("pad_{w}_{round}_{j:03}").into_bytes(),
+							small(j, round),
+						));
+					}
+					commit(&tree, &entries, Durability::Immediate).await.unwrap();
+					let written: Contents = entries.iter().take(3).cloned().collect();
+					assert_reads(&tree, &written, "an oversized commit that was acknowledged");
+					let mut txn = tree.begin().unwrap();
+					txn.set_durability(Durability::Immediate);
+					for key in written.keys() {
+						txn.delete(key.clone()).unwrap();
+					}
+					txn.commit().await.unwrap();
+				}
+			}
+		}));
+	}
+	let all = async {
+		for writer in writers {
+			writer.await.unwrap();
+		}
+	};
+	tokio::time::timeout(Duration::from_secs(240), all)
+		.await
+		.expect("the writers finished: no commit, rotation, flush or cleanup is stuck");
+	stop.store(true, Ordering::Relaxed);
+	for thread in threads {
+		thread.join().unwrap();
+	}
+
+	// Everything the writers wrote is deleted: with the tables compacted, nothing points into
+	// the log, and every file but the active one goes.
+	// A compaction needs two tables in level 0: a small entry in each round makes the second.
+	for round in 0..3 {
+		commit(&tree, &[(b"settle".to_vec(), small(0, round))], Durability::Immediate)
+			.await
+			.unwrap();
+		flush_to_tables(&tree);
+		compact(&tree);
+	}
+	cleanup(&tree);
+	let active = tree.core.inner.vlog.as_ref().unwrap().active_writer_id.load(Ordering::SeqCst);
+	let tables: Vec<_> = {
+		let manifest = tree.core.inner.level_manifest.read().unwrap();
+		manifest
+			.levels
+			.get_levels()
+			.iter()
+			.enumerate()
+			.flat_map(|(level, l)| {
+				l.tables.iter().map(move |t| (level, t.id, t.meta.properties.oldest_vlog_file_id))
+			})
+			.collect()
+	};
+	assert_eq!(
+		vlog_files(&live),
+		vec![active],
+		"only the active file is left; tables (level, id, oldest file): {tables:?}, floor {}",
+		floor(&tree)
+	);
+	crash(&tree);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn cleanups_racing_commits_while_the_tables_point_nowhere_lose_nothing() {
+	cleanups_racing_commits_while_the_tables_point_nowhere(40).await;
 }
 
 // ---------------------------------------------------------------------------

@@ -509,10 +509,10 @@ impl CoreInner {
 	/// nothing is created while the manifest cannot be written. The record of the batch stays in
 	/// the segment that was sealed, so the commit that failed is whole or absent after a crash.
 	///
-	/// The values of `batch` are in files of the value log that the active memtable keeps
-	/// (`note_vlog_pointers`) until it is flushed, and a flush writes the manifest from memory
-	/// before it deletes any file, as the compaction does. A manifest on disk that lists a kept
-	/// table is therefore replaced before the files that table points into can go.
+	/// The values of `batch` are in files of the value log that the pin of the commit group
+	/// keeps until the table is registered (`VLog::pin_group`), and a flush writes the manifest
+	/// from memory before it deletes any file, as the compaction does. A manifest on disk that
+	/// lists a kept table is therefore replaced before the files that table points into can go.
 	pub(crate) fn write_batch_direct_to_l0_sst(
 		&self,
 		batch: &Batch,
@@ -2788,8 +2788,11 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 // ===== VLog and Versioned Index Cleanup Helpers =====
 
 /// The bound of a VLog cleanup: the smallest file id that a table or a memtable that is not
-/// flushed yet points into. A file below it holds nothing that can be read any more. It is 0,
-/// and nothing is deleted, while no table points into the VLog.
+/// flushed yet points into. A file below it holds nothing that can be read any more. It is
+/// `u32::MAX` when tables were written and nothing points into the VLog, any more or ever: every
+/// file but the active one is below it, see [`cleanup_vlog`]. It is 0, and nothing is deleted,
+/// while no table was written yet, or a table opened from disk may point into the VLog without
+/// saying so, see `LevelManifest::vlog_floor_of_tables`.
 ///
 /// The active slot is read-locked first and stays locked until the end, then the manifest and the
 /// queue, together, in the order a flush takes them in. The slot is read last: a batch applied
@@ -2798,10 +2801,11 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 /// registers its table and takes the memtable out of the queue under both locks, so the memtable
 /// of a flush that is under way stays counted until its table is in the manifest.
 ///
-/// The files of a batch that is encoded but not in a memtable or a table yet are newer than every
-/// file the bound reads: the flusher encodes one group at a time and the VLog appends to its
-/// newest file. A group that fails after it was logged lowers the active memtable's bound, since
-/// recovery replays its records.
+/// The files of a batch that is encoded but not in a memtable or a table yet are not in the
+/// bound: [`cleanup_vlog`] takes the pin of the commit group with it, which the flusher holds from
+/// before the first value of the group is appended until the group is applied (see
+/// `VLog::unregistered_floor`). A group that fails after it was logged lowers the active
+/// memtable's bound, since recovery replays its records, before its pin is released.
 pub(crate) fn vlog_floor(
 	active: &RwLock<Arc<MemTable>>,
 	manifest: &RwLock<LevelManifest>,
@@ -2815,7 +2819,7 @@ pub(crate) fn vlog_floor(
 		.min_vlog_file_id()
 		.into_iter()
 		.chain(queued)
-		.fold(manifest.min_oldest_vlog_file_id(), u32::min))
+		.fold(manifest.vlog_floor_of_tables(), u32::min))
 }
 
 /// Cleans up obsolete VLog files.
@@ -2837,15 +2841,19 @@ pub(crate) fn cleanup_vlog(
 	let Some(vlog) = vlog else {
 		return;
 	};
+	// Before the bound: it is what keeps the files of a commit group that no table and no
+	// memtable points into yet, see `VLog::unregistered_floor`.
+	let unregistered = vlog.unregistered_floor();
 	let floor = match vlog_floor(active, manifest, immutables) {
-		Ok(floor) => floor,
+		Ok(floor) => floor.min(unregistered),
 		Err(e) => {
 			tracing::warn!("Failed to cleanup obsolete vlog files during {}: {}", context, e);
 			return;
 		}
 	};
 
-	// Skip cleanup if no table references VLog files yet (fresh database case)
+	// Nothing is below 0: no table was written yet (fresh database), or one may point into the
+	// VLog without saying so.
 	if floor == 0 {
 		return;
 	}

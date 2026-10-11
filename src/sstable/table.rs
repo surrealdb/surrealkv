@@ -931,6 +931,12 @@ pub(crate) struct Table {
 	pub(crate) filter: TableFilter,
 	pub(crate) range_deletions: Arc<parking_lot::RwLock<Vec<(Key, Key, u64)>>>,
 	pub(crate) has_range_deletions: Arc<std::sync::atomic::AtomicBool>,
+
+	/// Set for a table that was opened from disk and names no value-log file
+	/// (`oldest_vlog_file_id` is 0): the table may still point into the log, because the
+	/// property was not kept by older versions, which stored a sequence number of 0 in its
+	/// place. A table written by this process has the property right.
+	pub(crate) vlog_pointers_unknown: bool,
 }
 
 /// Per-file bloom filter reader, dispatched on which meta-index entry the
@@ -1026,6 +1032,7 @@ impl Table {
 			)),
 			has_range_deletions: Arc::new(std::sync::atomic::AtomicBool::new(has_rd)),
 			meta: writer_metadata,
+			vlog_pointers_unknown: false,
 		})
 	}
 
