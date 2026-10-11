@@ -59,6 +59,10 @@ pub struct Writer {
 
 	/// What seals the batches of the segment, if the segment is sealed.
 	sealer: Option<Sealer>,
+
+	/// Set when an append failed and the segment could not be cut back to its last whole record,
+	/// so that it may hold the start of a record, or whole records that were never acknowledged.
+	uncut: bool,
 }
 
 impl Writer {
@@ -82,6 +86,7 @@ impl Writer {
 			poisoned: false,
 			held: None,
 			sealer: None,
+			uncut: false,
 		}
 	}
 
@@ -107,6 +112,18 @@ impl Writer {
 		writer.write_buffer()?;
 		writer.dest.sync()?;
 		Ok(writer)
+	}
+
+	/// Whether the segment is sealed and an append failed in it without the segment being cut back,
+	/// so that it may end in damage that records acknowledged after it would sit behind.
+	pub(crate) fn left_uncut(&self) -> bool {
+		self.sealer.is_some() && self.uncut
+	}
+
+	/// Test-only: makes the next cut back of the segment fail.
+	#[cfg(test)]
+	pub(crate) fn fail_truncate(&mut self) {
+		self.dest.fail_truncate();
 	}
 
 	/// Test-only: the index that the next batch of a sealed segment is sealed at.
@@ -491,12 +508,16 @@ impl Writer {
 			match last_good_len.map(|len| self.dest.truncate(len)) {
 				Some(Ok(())) => self.block_offset = last_good_block_offset,
 				Some(Err(e)) => {
+					self.uncut = true;
 					tracing::error!("Failed to cut a partial record off the WAL segment: {e}")
 				}
-				None => tracing::error!(
-					"A WAL append failed with the segment length unknown, \
-					so a partial record may remain"
-				),
+				None => {
+					self.uncut = true;
+					tracing::error!(
+						"A WAL append failed with the segment length unknown, \
+						so a partial record may remain"
+					)
+				}
 			}
 		}
 		result

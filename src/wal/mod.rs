@@ -786,6 +786,9 @@ pub struct BufferedFileWriter {
 	/// before one fails.
 	#[cfg(test)]
 	fail_after_ops: Option<usize>,
+	/// Fault injection for tests: the next cut back of the file fails.
+	#[cfg(test)]
+	fail_truncate: bool,
 	/// Test-only count of the `write(2)` calls that reached the file, see `file_writes`.
 	#[cfg(test)]
 	file_writes: usize,
@@ -802,6 +805,8 @@ impl BufferedFileWriter {
 			len,
 			#[cfg(test)]
 			fail_after_ops: None,
+			#[cfg(test)]
+			fail_truncate: false,
 			#[cfg(test)]
 			file_writes: 0,
 		}
@@ -838,6 +843,11 @@ impl BufferedFileWriter {
 	///
 	/// `len` must not be past the end of the file.
 	pub(crate) fn truncate(&mut self, len: u64) -> Result<()> {
+		#[cfg(test)]
+		if std::mem::take(&mut self.fail_truncate) {
+			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "injected cut failure")));
+		}
+
 		// Rebuild the buffer around the same file. The old one is taken apart rather than
 		// dropped, because dropping a `BufWriter` writes out what it still holds.
 		let capacity = self.writer.capacity();
@@ -864,6 +874,12 @@ impl BufferedFileWriter {
 	#[cfg(test)]
 	pub(crate) fn fail_after_ops(&mut self, ops: usize) {
 		self.fail_after_ops = Some(ops);
+	}
+
+	/// Makes the next cut back of the file fail once.
+	#[cfg(test)]
+	pub(crate) fn fail_truncate(&mut self) {
+		self.fail_truncate = true;
 	}
 
 	/// How many `write(2)` calls have reached the file: one for every flush of a non-empty

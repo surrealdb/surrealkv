@@ -662,6 +662,14 @@ impl Wal {
 		}
 	}
 
+	/// Test-only: makes the next cut back of the active segment fail once.
+	#[cfg(test)]
+	pub(crate) fn fail_truncate(&mut self) {
+		if let Some(writer) = self.active_writer.as_mut() {
+			writer.fail_truncate();
+		}
+	}
+
 	/// Test-only: makes the creation of the next sealed segment fail at `fault`, once.
 	#[cfg(test)]
 	pub(crate) fn fail_next_creation(&mut self, fault: super::CreationFault) {
@@ -790,6 +798,7 @@ impl Wal {
 
 		let held = active.held();
 		let sync_failed = active.sync_failed();
+		let uncut = active.left_uncut();
 		if !sync_failed && held.is_none() {
 			before_sync()?;
 			active.sync()?;
@@ -809,7 +818,11 @@ impl Wal {
 				.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
 		}
 
-		if sync_failed || held.is_some() {
+		// A sealed segment that could not be cut back after a failed append may end in damage. A
+		// recovery that finds damage in a segment that later ones follow does not repair it, so
+		// what replaces it takes no commit until its memtables are in tables, as after a failed
+		// fsync, and the segment is below the log number by the time the first one is logged.
+		if sync_failed || held.is_some() || uncut {
 			new_writer.hold(held.unwrap_or(new_log_number));
 		}
 		self.active_writer = Some(new_writer);

@@ -247,6 +247,50 @@ fn a_count_that_goes_back_is_refused_by_the_cipher_and_ends_the_writer() {
 }
 
 // ---------------------------------------------------------------------------
+// a segment that could not be cut back
+// ---------------------------------------------------------------------------
+
+/// A sealed segment that took a failed append and could not be cut back may end in damage. A
+/// recovery does not repair damage in a segment that others follow, so the segment that replaces it
+/// is held as one is after a failed fsync, until the memtables of the old one are in tables. A
+/// plaintext segment is repaired by recovery wherever the damage is, and is replaced as it was.
+#[test]
+fn a_sealed_segment_that_could_not_be_cut_back_is_replaced_by_a_held_one() {
+	for suite in SUITES {
+		let dir = TempDir::new().unwrap();
+		let enc = context(suite);
+		let mut wal = Wal::open(dir.path(), sealed_options(&enc, CompressionType::None)).unwrap();
+		wal.append(&record(0, 50)).unwrap();
+		wal.fail_writes_after(1);
+		wal.fail_truncate();
+		assert!(wal.append(&record(1, 70)).is_err());
+		assert!(wal.needs_replacement());
+		assert!(!wal.sync_failed(), "no fsync failed: it is the cut that did");
+		assert_eq!(wal.next_index(), Some(3));
+
+		assert_eq!(wal.rotate().unwrap(), 1);
+		assert_eq!(wal.hold_below(), Some(1), "{suite:?}: the replacement is held");
+		assert!(wal.append(b"held").is_err());
+		wal.release_hold(1);
+		wal.append(b"released").unwrap();
+		wal.close().unwrap();
+		let read = read_records(&sealed_context(&enc), &segment_path(dir.path(), 1), 1).unwrap();
+		assert_eq!(read, vec![b"released".to_vec()]);
+	}
+
+	// The same failure of a plaintext segment is replaced by a segment that is not held.
+	let dir = TempDir::new().unwrap();
+	let mut wal = Wal::open(dir.path(), crate::wal::Options::default()).unwrap();
+	wal.append(&record(0, 50)).unwrap();
+	wal.fail_writes_after(1);
+	wal.fail_truncate();
+	assert!(wal.append(&record(1, 70)).is_err());
+	assert!(wal.needs_replacement());
+	assert_eq!(wal.rotate().unwrap(), 1);
+	assert_eq!(wal.hold_below(), None);
+}
+
+// ---------------------------------------------------------------------------
 // making a segment fails
 // ---------------------------------------------------------------------------
 
