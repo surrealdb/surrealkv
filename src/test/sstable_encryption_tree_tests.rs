@@ -15,8 +15,10 @@ use tempfile::TempDir;
 
 use crate::compaction::leveled::Strategy;
 use crate::error::EncryptionError;
+use crate::sstable::block_io::{BlockKind, TrailerLayout};
 use crate::sstable::table::{ChecksumType, Footer, TABLE_FULL_FOOTER_LENGTH};
 use crate::tde::{CipherSuite, CryptoHeader, DbId, EncryptionContext, SoftwareKeyManager};
+use crate::test::sstable_encryption_tests::{first_of, flip, walk};
 use crate::{Error, Options, Tree};
 
 const SUITES: [CipherSuite; 2] = [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305];
@@ -443,5 +445,37 @@ async fn a_plain_checkpoint_is_not_restored_into_an_encrypted_database() {
 	let txn = tree.begin().unwrap();
 	assert_eq!(txn.get(key(0).as_slice()).unwrap(), Some(value('2', 0)));
 	drop(txn);
+	tree.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_table_that_was_changed_on_disk_is_an_error_that_repairs_and_removes_nothing() {
+	let dir = TempDir::new().unwrap();
+	let ctx = context(CipherSuite::XChaCha20Poly1305);
+	let opts = options(dir.path(), Some(&ctx), DEFAULT_MEMTABLE);
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	write_round(&tree, '1', 0, KEYS).await;
+	write_round(&tree, '2', 0, KEYS / 2).await;
+	let ids = table_ids(&tree);
+	tree.close().await.unwrap();
+
+	// A bit of the meta-index of a table is changed, and the checksum of the block is made again,
+	// by someone who does not have the key.
+	let id = ids[0];
+	let path = opts.sstable_file_path(id);
+	let bytes = fs::read(&path).unwrap();
+	let meta = first_of(&walk(&opts, &bytes, id), BlockKind::MetaIndex);
+	fs::write(&path, flip(&bytes, &meta, meta.size / 2, TrailerLayout::Sealed, true)).unwrap();
+	let before = snapshot(&opts);
+
+	let err = open_error(&opts);
+	assert!(matches!(err, Error::Encryption(EncryptionError::AuthenticationFailed)), "{err:?}");
+	// The table is not repaired, replaced or removed, and nor is anything else.
+	assert!(snapshot(&opts) == before, "a refused open changed the files of the database");
+
+	// The table as it was is the database again.
+	fs::write(&path, &bytes).unwrap();
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	read_every_key(&tree);
 	tree.close().await.unwrap();
 }

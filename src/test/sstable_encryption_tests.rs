@@ -966,7 +966,7 @@ fn a_sealed_table_is_refused_by_the_wrong_database_or_key_after_reading_its_foot
 
 /// The blocks of a table with the kind of each, found by following the handles from the footer
 /// through the reader of the engine, which opens `file` as table `id` of the database of `opts`.
-fn walk(opts: &Arc<Options>, file: &[u8], id: u64) -> Vec<(BlockKind, BlockHandle)> {
+pub(crate) fn walk(opts: &Arc<Options>, file: &[u8], id: u64) -> Vec<(BlockKind, BlockHandle)> {
 	let size = file.len() as u64;
 	let (source, footer) =
 		BlockSource::open_table(Arc::new(file.to_vec()), size, id, opts.encryption_context())
@@ -1012,7 +1012,7 @@ fn walk(opts: &Arc<Options>, file: &[u8], id: u64) -> Vec<(BlockKind, BlockHandl
 /// `file` with a bit flipped `at` bytes into the block at `handle`. With `fix_trailer` the trailer
 /// of the block is made again to say that the block is as it is, as someone who has no key can,
 /// and the damage is then for the seal to find and not for the checksum.
-fn flip(
+pub(crate) fn flip(
 	file: &[u8],
 	handle: &BlockHandle,
 	at: usize,
@@ -1030,7 +1030,7 @@ fn flip(
 	damaged
 }
 
-fn first_of(blocks: &[(BlockKind, BlockHandle)], kind: BlockKind) -> BlockHandle {
+pub(crate) fn first_of(blocks: &[(BlockKind, BlockHandle)], kind: BlockKind) -> BlockHandle {
 	blocks.iter().find(|(k, _)| *k == kind).expect("the table has a block of the kind").1.clone()
 }
 
@@ -1155,4 +1155,349 @@ fn a_scrub_does_not_count_a_sealed_table_as_damaged_and_does_not_pass_it_either(
 	assert_eq!(report.corrupt_blocks, 0, "a table that cannot be read is not a damaged one");
 	assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
 	assert!(report.errors[0].contains("not verified"), "{}", report.errors[0]);
+}
+
+// ========== Tampering ==========
+
+const ALL_KINDS: [BlockKind; 6] = [
+	BlockKind::Data,
+	BlockKind::IndexPartition,
+	BlockKind::TopLevelIndex,
+	BlockKind::FilterPartition,
+	BlockKind::FilterIndex,
+	BlockKind::MetaIndex,
+];
+
+fn is_authentication_failure(err: &Error) -> bool {
+	matches!(err, Error::Encryption(EncryptionError::AuthenticationFailed))
+}
+
+/// Reads every key of the table, and says how many reads failed. A read either gives the value
+/// that was written or fails with an authentication failure: anything else is a table that is
+/// made to say what it does not hold, or that fails in another way than it must.
+fn failed_reads(table: &Table) -> usize {
+	let mut failed = 0;
+	for i in 0..KEYS {
+		match table.get(&lookup(i)) {
+			Ok(Some((_, value))) => assert_eq!(value, value_of(i), "key {i} has another value"),
+			Ok(None) => panic!("key {i} was lost without an error"),
+			Err(err) if is_authentication_failure(&err) => failed += 1,
+			Err(err) => panic!("key {i}: {err:?}"),
+		}
+	}
+	failed
+}
+
+fn try_scan(table: &Table) -> crate::error::Result<usize> {
+	let mut iter = table.iter(None)?;
+	iter.seek_first()?;
+	let mut seen = 0;
+	while iter.valid() {
+		seen += 1;
+		iter.next()?;
+	}
+	Ok(seen)
+}
+
+#[test]
+fn a_flipped_bit_in_a_block_of_any_kind_fails_authentication_and_the_failure_reaches_the_caller() {
+	for suite in SUITES {
+		let ctx = context(suite);
+		let opts = options(Some(&ctx), CompressionType::SnappyCompression, true);
+		let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+		let blocks = walk(&opts, &file, TABLE_ID);
+		for kind in ALL_KINDS {
+			assert!(blocks.iter().any(|(k, _)| *k == kind), "{suite:?}: no {kind:?}");
+		}
+
+		for (kind, handle) in &blocks {
+			// The first byte, one in the middle and the last, which is in the tag. The trailer is
+			// made again each time, as someone who does not have the key can.
+			for at in [0, handle.size / 2, handle.size - 1] {
+				let what = format!("{suite:?}: {kind:?} at {}, byte {at}", handle.offset);
+				let damaged = flip(&file, handle, at, TrailerLayout::Sealed, true);
+				match kind {
+					// Read when the table is opened: it does not open.
+					BlockKind::TopLevelIndex | BlockKind::MetaIndex | BlockKind::FilterIndex => {
+						let err = encryption_error(open_table(&opts, &damaged, TABLE_ID));
+						assert_eq!(err, EncryptionError::AuthenticationFailed, "{what}");
+					}
+					// Read when a key in it is: those reads fail, the others do not.
+					BlockKind::Data | BlockKind::IndexPartition | BlockKind::FilterPartition => {
+						let table = open_table(&opts, &damaged, TABLE_ID).unwrap();
+						assert!(failed_reads(&table) > 0, "{what}: no read failed");
+						if *kind != BlockKind::FilterPartition {
+							// A scan reads the data and the index, and stops with the error and
+							// not with what it found before it.
+							let err = try_scan(&table).unwrap_err();
+							assert!(is_authentication_failure(&err), "{what}: {err:?}");
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
+#[test]
+fn a_flipped_bit_whose_checksum_was_not_made_again_is_damage_and_not_a_forgery() {
+	let ctx = context(CipherSuite::Aes256Gcm);
+	let opts = options(Some(&ctx), CompressionType::None, true);
+	let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+	let blocks = walk(&opts, &file, TABLE_ID);
+
+	let data = first_of(&blocks, BlockKind::Data);
+	let damaged = flip(&file, &data, 3, TrailerLayout::Sealed, false);
+	let table = open_table(&opts, &damaged, TABLE_ID).unwrap();
+	let err = table.get(&lookup(0)).unwrap_err();
+	assert!(
+		matches!(
+			err,
+			Error::SSTable(crate::sstable::error::SSTableError::ChecksumVerificationFailed { .. })
+		),
+		"{err:?}"
+	);
+
+	let meta = first_of(&blocks, BlockKind::MetaIndex);
+	let damaged = flip(&file, &meta, 3, TrailerLayout::Sealed, false);
+	let err = open_table(&opts, &damaged, TABLE_ID).err().expect("the table does not open");
+	assert!(matches!(err, Error::SSTable(_)), "{err:?}");
+}
+
+#[test]
+fn a_changed_compression_byte_fails_authentication_before_anything_is_decompressed() {
+	for compression in [CompressionType::None, CompressionType::SnappyCompression] {
+		let ctx = context(CipherSuite::XChaCha20Poly1305);
+		let opts = options(Some(&ctx), compression, true);
+		let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+		let data = first_of(&walk(&opts, &file, TABLE_ID), BlockKind::Data);
+
+		for other in [0u8, 1, 2, 7] {
+			let end = data.offset + data.size;
+			if file[end] == other {
+				continue;
+			}
+			// The byte is changed and the checksum is made again to cover it, so the block is, to
+			// anything that does not hold the key, a block that was compressed as the byte says.
+			let mut damaged = file.clone();
+			damaged[end] = other;
+			let trailer =
+				Trailer::encode(TrailerLayout::Sealed, &damaged[data.offset..end], other).unwrap();
+			damaged[end..end + TrailerLayout::Sealed.len()].copy_from_slice(trailer.as_slice());
+
+			let table = open_table(&opts, &damaged, TABLE_ID).unwrap();
+			let err = table.get(&lookup(0)).unwrap_err();
+			assert!(is_authentication_failure(&err), "{compression:?}, byte {other}: {err:?}");
+		}
+	}
+}
+
+// ========== Transplants ==========
+
+/// The data block that holds key 0 of each file, as the unit (block and trailer) that sits where it
+/// does in the file.
+fn unit_at<'a>(file: &'a [u8], handle: &BlockHandle) -> &'a [u8] {
+	&file[handle.offset..handle.offset + handle.size + TrailerLayout::Sealed.len()]
+}
+
+#[test]
+fn a_block_copied_to_another_place_or_another_kind_in_its_own_file_does_not_open() {
+	for suite in SUITES {
+		let ctx = context(suite);
+		let opts = options(Some(&ctx), CompressionType::None, true);
+		let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+		let blocks = walk(&opts, &file, TABLE_ID);
+		let data = first_of(&blocks, BlockKind::Data);
+
+		// A copy of the block, with its trailer, in front of the footer: a valid block of the
+		// file at every other level, and in a place that it was not sealed for.
+		let footer_at = file.len() - TABLE_FULL_FOOTER_LENGTH;
+		let mut moved = file[..footer_at].to_vec();
+		moved.extend_from_slice(unit_at(&file, &data));
+		moved.extend_from_slice(&file[footer_at..]);
+		let size = moved.len() as u64;
+		let (source, _) =
+			BlockSource::open_table(Arc::new(moved), size, TABLE_ID, opts.encryption_context())
+				.unwrap();
+
+		let comparator = || Arc::clone(&opts.internal_comparator);
+		let copy = BlockHandle::new(footer_at, data.size);
+		// At the place that it was sealed for it opens, and nowhere else.
+		assert!(source.read_block(BlockKind::Data, &data, comparator()).is_ok());
+		let err = source.read_contents(BlockKind::Data, &copy).unwrap_err();
+		assert!(is_authentication_failure(&err), "{suite:?}: moved: {err:?}");
+
+		// And it is not another kind of block where it is.
+		for kind in ALL_KINDS.into_iter().filter(|kind| *kind != BlockKind::Data) {
+			let err = source.read_contents(kind, &data).unwrap_err();
+			assert!(is_authentication_failure(&err), "{suite:?}: read as {kind:?}: {err:?}");
+		}
+	}
+}
+
+#[test]
+fn a_block_of_another_file_of_the_same_key_does_not_open_wherever_it_is_put() {
+	for suite in SUITES {
+		let ctx = context(suite);
+		let opts = options(Some(&ctx), CompressionType::None, true);
+		let input = many_points(KEYS);
+		let original = write_table(&opts, TABLE_ID, &input);
+		let blocks = walk(&opts, &original, TABLE_ID);
+
+		// Tables that are the same to the byte, but for what the key makes of them: another table
+		// under the same key id, a table written again under the same id, and the same table of
+		// another database that shares the key.
+		let other_database =
+			Arc::new(EncryptionContext::new(manager(), DbId::from_bytes([0xD6; 16]), suite));
+		let other_database_opts = options(Some(&other_database), CompressionType::None, true);
+		let twins: Vec<(&str, Arc<Options>, u64, Vec<u8>)> = vec![
+			(
+				"another table",
+				Arc::clone(&opts),
+				TABLE_ID + 1,
+				write_table(&opts, TABLE_ID + 1, &input),
+			),
+			(
+				"the same table again",
+				Arc::clone(&opts),
+				TABLE_ID,
+				write_table(&opts, TABLE_ID, &input),
+			),
+			(
+				"another database",
+				Arc::clone(&other_database_opts),
+				TABLE_ID,
+				write_table(&other_database_opts, TABLE_ID, &input),
+			),
+		];
+
+		for (what, twin_opts, id, twin) in twins {
+			// The same blocks in the same places: a block of the original can be put in the twin
+			// exactly where the twin has its own.
+			assert_eq!(walk(&twin_opts, &twin, id), blocks, "{suite:?}: {what}");
+
+			for kind in ALL_KINDS {
+				let handle = first_of(&blocks, kind);
+				let mut mixed = twin.clone();
+				mixed[handle.offset..handle.offset + handle.size + TrailerLayout::Sealed.len()]
+					.copy_from_slice(unit_at(&original, &handle));
+				let table = open_table(&twin_opts, &mixed, id);
+				match kind {
+					BlockKind::TopLevelIndex | BlockKind::MetaIndex | BlockKind::FilterIndex => {
+						let err = encryption_error(table);
+						assert_eq!(
+							err,
+							EncryptionError::AuthenticationFailed,
+							"{suite:?}: {what}: {kind:?}"
+						);
+					}
+					_ => {
+						let table = table.unwrap();
+						assert!(failed_reads(&table) > 0, "{suite:?}: {what}: {kind:?}");
+					}
+				}
+			}
+		}
+	}
+}
+
+// ========== The header ==========
+
+fn with_fixed_header_crc(mut file: Vec<u8>) -> Vec<u8> {
+	let crc = crc32fast::hash(&file[..HEADER_LEN - 4]);
+	file[HEADER_LEN - 4..HEADER_LEN].copy_from_slice(&crc.to_be_bytes());
+	file
+}
+
+#[test]
+fn a_header_with_a_flipped_bit_is_an_encryption_error_for_every_bit_and_names_what_it_can() {
+	for suite in SUITES {
+		let ctx = context(suite);
+		let opts = options(Some(&ctx), CompressionType::None, true);
+		let file = write_table(&opts, TABLE_ID, &many_points(10));
+
+		for at in 0..HEADER_LEN {
+			for fix_crc in [false, true] {
+				// A flipped bit of the checksum that is then made right again is the header that it
+				// was: not a case.
+				if fix_crc && at >= HEADER_LEN - 4 {
+					continue;
+				}
+				let mut damaged = file.clone();
+				damaged[at] ^= 0x01;
+				if fix_crc {
+					damaged = with_fixed_header_crc(damaged);
+				}
+				let what = format!("{suite:?}: header byte {at}, checksum made again: {fix_crc}");
+				let err = encryption_error(open_table(&opts, &damaged, TABLE_ID));
+
+				// What a field that was changed in a header that still has its checksum is.
+				let expected = match (at, fix_crc) {
+					// The checksum: the header is damaged.
+					(88..=91, _) => Some(EncryptionError::MalformedHeader),
+					// Not made again: the header is damaged, but for the magic and the version,
+					// which are looked at before the checksum.
+					(0..=3, _) => Some(EncryptionError::MalformedHeader),
+					(4, _) => Some(EncryptionError::UnsupportedVersion),
+					(_, false) => Some(EncryptionError::MalformedHeader),
+					// Made again: the fields that name the database, the file and the key.
+					(8..=11, true) => Some(EncryptionError::UnknownKeyId),
+					(16..=31, true) => Some(EncryptionError::DbIdMismatch),
+					(32..=39, true) => Some(EncryptionError::FileIdMismatch),
+					// The salt and the tag: the key, or what it makes of the header, is not the
+					// one.
+					(40..=87, true) => Some(EncryptionError::WrongKey),
+					// The suite, the kind and what is reserved: a format that this is not.
+					_ => None,
+				};
+				if let Some(expected) = expected {
+					assert_eq!(err, expected, "{what}");
+				}
+			}
+		}
+	}
+}
+
+// ========== Truncation ==========
+
+#[test]
+fn a_sealed_table_cut_short_anywhere_is_an_error_and_never_a_table() {
+	let ctx = context(CipherSuite::Aes256Gcm);
+	let opts = options(Some(&ctx), CompressionType::None, true);
+	let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+	let size = file.len();
+	let footer = file[size - TABLE_FULL_FOOTER_LENGTH..].to_vec();
+
+	// Where something starts or ends: the header, each block and the footer, and a byte either
+	// side of each.
+	let mut boundaries = vec![0, HEADER_LEN, size - TABLE_FULL_FOOTER_LENGTH, size];
+	boundaries
+		.extend(extents_from_the_end(&file, HEADER_LEN).into_iter().map(|(offset, _)| offset));
+	let mut cuts: Vec<usize> = boundaries
+		.iter()
+		.flat_map(|b| [b.saturating_sub(1), *b, b + 1])
+		.filter(|cut| *cut < size)
+		.collect();
+	cuts.extend([1, 49, 50, 51, 91, 92, 93, 141, 142, 143]);
+	cuts.sort_unstable();
+	cuts.dedup();
+
+	for cut in cuts {
+		// The file as a crash or a short copy leaves it.
+		let truncated = file[..cut].to_vec();
+		assert!(open_table(&opts, &truncated, TABLE_ID).is_err(), "cut at {cut} was opened");
+
+		// And with the footer put back on the end of what is left: a footer that names blocks that
+		// are not there, or are not where they were, is as good as none.
+		let mut refooted = file[..cut.min(size - TABLE_FULL_FOOTER_LENGTH)].to_vec();
+		refooted.extend_from_slice(&footer);
+		if refooted != file {
+			assert!(
+				open_table(&opts, &refooted, TABLE_ID).is_err(),
+				"cut at {cut} with the footer put back was opened"
+			);
+		}
+	}
+	// The control: the whole file opens.
+	assert!(open_table(&opts, &file, TABLE_ID).is_ok());
 }
