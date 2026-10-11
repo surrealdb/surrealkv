@@ -266,6 +266,104 @@ fn a_key_that_was_retired_is_refused_for_what_it_is_and_nothing_changes() {
 	);
 }
 
+/// The tail of the last segment was cut, which the right key repairs in the default mode. Whatever
+/// else a recovery finds, a key that does not fit is found first, and nothing is repaired for it.
+#[test]
+fn a_torn_tail_is_not_repaired_by_a_wal_whose_key_does_not_fit() {
+	for suite in SUITES {
+		let template = TempDir::new().unwrap();
+		let enc = context(suite);
+		build(template.path(), &enc, CompressionType::None, &standard_plan());
+		let cut = |dir: &Path| {
+			let bytes = read(dir, 2);
+			let (at, length) = *batch_records(&bytes).last().unwrap();
+			write(dir, 2, &bytes[..at + HEADER_SIZE + length / 2]);
+		};
+
+		let cases = [
+			(
+				"another root",
+				sealed_context(&context_of([0x99; 32], DB, suite)),
+				EncryptionError::WrongKey,
+			),
+			(
+				"another database",
+				sealed_context(&context_of(ROOT, [0xD1; 16], suite)),
+				EncryptionError::DbIdMismatch,
+			),
+			("no key", WalContext::plaintext(), EncryptionError::NotConfigured),
+		];
+		for (what, wrong, expected) in cases {
+			assert_refused_everywhere(
+				template.path(),
+				&wrong,
+				&format!("{suite:?}, {what}, with a cut tail"),
+				cut,
+				|error| is_encryption(error, &expected),
+			);
+		}
+
+		// With the right key the same tail is a tear, and the default mode repairs it.
+		let dir = work_copy(template.path());
+		cut(dir.path());
+		let recovered = recover(
+			&sealed_context(&enc),
+			dir.path(),
+			WalRecoveryMode::TolerateCorruptedWithRepair,
+		)
+		.unwrap();
+		recovered.assert_keys(&KEYS, &keys_without("c2"), "the right key");
+	}
+}
+
+/// A segment that fails to authenticate decides the recovery, wherever the tear is: the tear of the
+/// last segment is not repaired when an earlier segment is refused, and a tear after a record that
+/// fails to authenticate is not one.
+#[test]
+fn a_tear_is_not_repaired_when_a_record_before_it_fails_to_authenticate() {
+	for suite in SUITES {
+		let template = TempDir::new().unwrap();
+		let enc = context(suite);
+		build(template.path(), &enc, CompressionType::None, &standard_plan());
+		let context = sealed_context(&enc);
+
+		let cut_last = |dir: &Path| {
+			let bytes = read(dir, 2);
+			let (at, length) = *batch_records(&bytes).last().unwrap();
+			write(dir, 2, &bytes[..at + HEADER_SIZE + length / 2]);
+		};
+		// A record of a segment, changed, with its checksum made again.
+		let change = |dir: &Path, segment: u64, which: usize| {
+			let mut bytes = read(dir, segment);
+			let (at, _) = batch_records(&bytes)[which];
+			bytes[at + HEADER_SIZE + 3] ^= 0x01;
+			fix_checksum(&mut bytes, at);
+			write(dir, segment, &bytes);
+		};
+
+		assert_refused_everywhere(
+			template.path(),
+			&context,
+			&format!("{suite:?}, a cut last segment after a changed record in the one before"),
+			|dir| {
+				change(dir, 1, 1);
+				cut_last(dir);
+			},
+			|error| is_encryption(error, &EncryptionError::AuthenticationFailed),
+		);
+		assert_refused_everywhere(
+			template.path(),
+			&context,
+			&format!("{suite:?}, a cut last record after a changed record of the same segment"),
+			|dir| {
+				change(dir, 2, 0);
+				cut_last(dir);
+			},
+			|error| is_encryption(error, &EncryptionError::AuthenticationFailed),
+		);
+	}
+}
+
 /// A WAL that has no key is not one that may repair a sealed segment, whatever else is wrong with
 /// it: the plaintext repair deletes a segment that holds no valid record, and a sealed segment
 /// whose first bytes rotted holds none that a plaintext reader can read. What tells it apart is the
