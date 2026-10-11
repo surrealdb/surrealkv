@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
+use crate::error::{EncryptionError, Error};
 use crate::tde::{CipherSuite, DbId, EncryptionContext, SoftwareKeyManager};
 use crate::{CompressionType, Mode, Options, Tree};
 
@@ -51,6 +52,15 @@ fn open_tree(
 	compression: CompressionType,
 	threshold: usize,
 ) -> Tree {
+	try_open_tree(path, ctx, compression, threshold).unwrap()
+}
+
+fn try_open_tree(
+	path: &Path,
+	ctx: Option<&Arc<EncryptionContext>>,
+	compression: CompressionType,
+	threshold: usize,
+) -> crate::Result<Tree> {
 	let mut opts = Options {
 		path: path.to_path_buf(),
 		enable_vlog: true,
@@ -61,7 +71,7 @@ fn open_tree(
 		..Default::default()
 	};
 	opts.encryption_context = ctx.cloned();
-	Tree::new(Arc::new(opts)).unwrap()
+	Tree::new(Arc::new(opts))
 }
 
 async fn commit_all(tree: &Tree, entries: &[(Vec<u8>, Vec<u8>)]) {
@@ -251,5 +261,80 @@ async fn a_checkpoint_copies_sealed_files_as_they_are_and_a_restore_brings_them_
 		assert_eq!(salts(&after).len(), after.len(), "no two files share a salt");
 		assert_sealed_and_free_of_markers(&after, "after the restore");
 		tree.close().await.unwrap();
+	}
+}
+
+/// What a reader of the files meets once the log is sealed: a byte that changed is an error, for
+/// the one entry that holds it, and never a value that is not the one that was written.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_changed_byte_in_a_sealed_log_fails_that_read_and_returns_no_wrong_value() {
+	for suite in SUITES {
+		let dir = TempDir::new().unwrap();
+		let ctx = context(suite);
+		let entries = canaries(0..3);
+		let tree = open_tree(dir.path(), Some(&ctx), CompressionType::None, 64);
+		commit_all(&tree, &entries).await;
+		tree.flush().unwrap();
+		tree.close().await.unwrap();
+		drop(tree);
+
+		// One byte in the ciphertext of the first entry of the first file, which starts where the
+		// header ends, at 127, and is longer than 40 bytes: a value of 144 bytes and a key.
+		let path = dir.path().join("vlog").join("00000000000000000001.vlog");
+		let mut bytes = std::fs::read(&path).unwrap();
+		assert!(bytes.len() > 127 + 3 * 144, "three values in one file");
+		bytes[127 + 40] ^= 0x01;
+		std::fs::write(&path, &bytes).unwrap();
+
+		let tree = open_tree(dir.path(), Some(&ctx), CompressionType::None, 64);
+		let txn = tree.begin_with_mode(Mode::ReadOnly).unwrap();
+		let mut failed = 0;
+		for (key, value) in &entries {
+			match txn.get(key) {
+				Ok(found) => assert_eq!(found.as_ref(), Some(value), "{suite:?}: a wrong value"),
+				Err(_) => failed += 1,
+			}
+		}
+		assert_eq!(failed, 1, "{suite:?}: the entry that holds the byte, and no other");
+		drop(txn);
+		tree.close().await.unwrap();
+	}
+}
+
+/// A key that does not fit is an error of its kind at the tree, and the files of the log are left
+/// as they were.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_tree_opened_with_a_key_that_does_not_fit_is_refused_and_leaves_the_log_alone() {
+	for suite in SUITES {
+		let dir = TempDir::new().unwrap();
+		let ctx = context(suite);
+		let entries = canaries(0..3);
+		let tree = open_tree(dir.path(), Some(&ctx), CompressionType::None, 64);
+		commit_all(&tree, &entries).await;
+		tree.flush().unwrap();
+		tree.close().await.unwrap();
+		drop(tree);
+		let before = vlog_files(dir.path());
+		assert!(!before.is_empty());
+
+		let wrong = Arc::new(EncryptionContext::new(
+			Arc::new(SoftwareKeyManager::new([0x99; 32])),
+			DbId::from_bytes([0xD0; 16]),
+			suite,
+		));
+		let refused = try_open_tree(dir.path(), Some(&wrong), CompressionType::None, 64).err();
+		assert!(
+			matches!(refused, Some(Error::Encryption(EncryptionError::WrongKey))),
+			"{suite:?}: {refused:?}"
+		);
+		assert_eq!(vlog_files(dir.path()), before, "{suite:?}: the log was changed");
+
+		// Without any key at all the files are the other kind's.
+		let none = try_open_tree(dir.path(), None, CompressionType::None, 64).err();
+		assert!(
+			matches!(none, Some(Error::Encryption(EncryptionError::NotConfigured))),
+			"{suite:?}: {none:?}"
+		);
+		assert_eq!(vlog_files(dir.path()), before, "{suite:?}: the log was changed");
 	}
 }
