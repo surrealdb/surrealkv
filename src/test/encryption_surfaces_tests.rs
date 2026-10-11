@@ -60,12 +60,12 @@ async fn a_manifest_that_cannot_be_sealed_is_the_error_of_the_flush_and_is_not_w
 			.filter(|entry| entry.file_name().to_string_lossy().starts_with(".tmp_"))
 			.count();
 		assert_eq!(strays, 0, "{suite:?}");
-		read(&tree, &rounds('1', 0..KEYS));
-
-		// The provider is back, and the flush that is tried again writes the table and the
-		// manifest.
+		// The provider is back before the data is read, because reading a value opens its
+		// value-log file, which asks the provider for the root. The flush that is tried again then
+		// writes the table and the manifest.
 		*tree.core.inner.flush_hook.lock() = None;
 		flaky.set_unavailable(false);
+		read(&tree, &rounds('1', 0..KEYS));
 		tree.flush().unwrap();
 		assert_ne!(fs::read(&manifest).unwrap(), before, "{suite:?}");
 		assert!(tree.core.inner.level_manifest.read().unwrap().iter().next().is_some());
