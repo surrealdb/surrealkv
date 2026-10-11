@@ -1819,7 +1819,6 @@ async fn image_never_a_plausible_wrong_database(stage: CheckpointStage) {
 }
 
 #[test(tokio::test)]
-#[ignore = "an image of a crash right after a restore removed the database state opens as an empty database instead of being refused"]
 async fn a_crash_after_the_state_is_cleared_must_not_open_as_an_empty_database() {
 	image_never_a_plausible_wrong_database(CheckpointStage::RestoreCleared).await;
 }
@@ -1827,6 +1826,274 @@ async fn a_crash_after_the_state_is_cleared_must_not_open_as_an_empty_database()
 #[test(tokio::test)]
 async fn a_crash_with_the_tables_copied_never_opens_as_a_wrong_database() {
 	image_never_a_plausible_wrong_database(CheckpointStage::RestoreSstablesCopied).await;
+}
+
+/// The file a restore keeps in the database directory while the files of the database are not
+/// the database or the checkpoint.
+const MARKER: &str = "RESTORE_IN_PROGRESS";
+
+/// The marker is there from before the first file is removed until every file of the checkpoint is
+/// back, and not before or after.
+#[test(tokio::test)]
+async fn a_restore_marks_the_directory_from_before_it_removes_anything_until_every_file_is_back() {
+	for vlog in [false, true] {
+		let w = build(vlog).await;
+		assert!(!w.path.join(MARKER).exists(), "vlog {vlog}: a marker before the restore");
+		let images = TempDir::new("restore_conc_images").unwrap();
+		let (taken, _) = restore_taking_images(&w, images.path());
+		for (stage, marked) in [
+			(CheckpointStage::RestoreCleared, true),
+			(CheckpointStage::RestoreSstablesCopied, true),
+			(CheckpointStage::RestoreFilesCopied, false),
+			(CheckpointStage::RestoreManifestSwapped, false),
+		] {
+			let image = &taken[&format!("{stage:?}")];
+			assert_eq!(
+				image.join(MARKER).exists(),
+				marked,
+				"vlog {vlog}: the marker at {stage:?}, which is {marked} when files are missing"
+			);
+		}
+		assert!(!w.path.join(MARKER).exists(), "vlog {vlog}: a marker after the restore");
+		abandon(&w.tree);
+	}
+}
+
+/// The database directory is synced after the files of the checkpoint are back and before the
+/// marker is removed, and again after: the names of the directories that were removed and made
+/// again are entries of it, and the removal of the marker must not be on disk without them.
+#[test(tokio::test)]
+async fn a_restore_syncs_the_database_directory_before_it_removes_the_marker() {
+	let w = build(false).await;
+	let root = w.path.canonicalize().unwrap();
+	let at = Arc::new(Mutex::new(BTreeMap::new()));
+	let seen = Arc::clone(&at);
+	*w.tree.core.inner.checkpoint_hook.lock() = Some(Arc::new(move |stage| {
+		if matches!(stage, CheckpointStage::RestoreCleared | CheckpointStage::RestoreFilesCopied) {
+			let synced = crate::lsm::SYNCED_DIRECTORIES.lock().len();
+			seen.lock().unwrap().insert(format!("{stage:?}"), synced);
+		}
+	}));
+	w.tree.restore_from_checkpoint(&w.ckpt).unwrap();
+	clear_hooks(&w.tree);
+	let at = at.lock().unwrap().clone();
+	assert_eq!(at.len(), 2, "both stages were reached: {at:?}");
+	let synced = crate::lsm::SYNCED_DIRECTORIES.lock()
+		[at["RestoreCleared"]..at["RestoreFilesCopied"]]
+		.to_vec();
+	let syncs = synced.iter().filter(|dir| **dir == root).count();
+	assert!(
+		syncs >= 2,
+		"the database directory was synced {syncs} time(s) between the removal and the end of the \
+		 restore, and the marker is removed between two of them"
+	);
+	abandon(&w.tree);
+}
+
+/// A directory with the marker is refused at open, with an error that says so, and the files are
+/// as they were: nothing is created, moved or deleted.
+#[test(tokio::test)]
+async fn an_interrupted_restore_is_refused_at_open_and_the_directory_is_left_alone() {
+	for stage in [CheckpointStage::RestoreCleared, CheckpointStage::RestoreSstablesCopied] {
+		let (w, _images, taken) = images_of_a_restore(false).await;
+		let image = &taken[&format!("{stage:?}")];
+		let before = fingerprint(image);
+		assert!(image.join(MARKER).exists(), "setup: {stage:?} is marked");
+		match Tree::new(options(image, false)) {
+			Err(Error::RestoreInterrupted(why)) => {
+				assert!(why.contains(MARKER), "{stage:?}: the error names the marker: {why}");
+				assert!(
+					why.contains(&*image.to_string_lossy()),
+					"{stage:?}: the error names the directory: {why}"
+				);
+			}
+			Err(e) => panic!("{stage:?}: refused with {e:?}"),
+			Ok(tree) => {
+				abandon(&tree);
+				panic!("{stage:?}: an interrupted restore opened");
+			}
+		}
+		assert_eq!(fingerprint(image), before, "{stage:?}: the refused open changed the files");
+		abandon(&w.tree);
+	}
+}
+
+/// What an operator does with an interrupted restore: restores the checkpoint into an empty
+/// directory, or, for a directory they know to be whole, removes the marker. After the marker is
+/// removed the directory opens, and restoring the checkpoint on it gives the checkpoint.
+#[test(tokio::test)]
+async fn an_interrupted_restore_is_repeated_in_an_empty_directory_or_after_the_marker_is_removed() {
+	let (w, _images, taken) = images_of_a_restore(false).await;
+
+	// An empty directory
+	let fresh = TempDir::new("restore_conc_fresh").unwrap();
+	let tree = open(options(fresh.path(), false));
+	tree.restore_from_checkpoint(&w.ckpt).unwrap();
+	assert_exact(&tree, &w.at_ckpt, "restoring into an empty directory");
+	assert!(!fresh.path().join(MARKER).exists());
+	abandon(&tree);
+
+	// The directory of a crash right after the removal, with the marker removed
+	let image = &taken["RestoreCleared"];
+	assert!(Tree::new(options(image, false)).is_err());
+	std::fs::remove_file(image.join(MARKER)).unwrap();
+	let tree = open(options(image, false));
+	assert_exact(&tree, &Model::new(), "the cleared directory opens as an empty database");
+	tree.restore_from_checkpoint(&w.ckpt).unwrap();
+	assert_exact(&tree, &w.at_ckpt, "restoring on the directory whose marker was removed");
+	assert!(!image.join(MARKER).exists(), "the marker is back after the restore");
+	tree.close().await.unwrap();
+	let reopened = open(options(image, false));
+	assert_exact(&reopened, &w.at_ckpt, "after the restore and a reopen");
+	abandon(&reopened);
+
+	// A crash after the last file and before the marker was removed: the files are the checkpoint
+	let image = &taken["RestoreFilesCopied"];
+	std::fs::write(image.join(MARKER), b"the checkpoint").unwrap();
+	assert!(matches!(Tree::new(options(image, false)), Err(Error::RestoreInterrupted(_))));
+	std::fs::remove_file(image.join(MARKER)).unwrap();
+	let tree = open(options(image, false));
+	assert_exact(&tree, &w.at_ckpt, "files back, marker removed");
+	abandon(&tree);
+	abandon(&w.tree);
+}
+
+/// A restore that fails after it removed the files leaves the marker, and the directory is not
+/// opened afterwards. The checkpoint passes the validation and fails to copy: its `wal` is a
+/// file.
+#[test(tokio::test)]
+async fn a_restore_that_fails_after_it_removed_the_files_leaves_the_marker() {
+	let w = build(false).await;
+	std::fs::remove_dir_all(w.ckpt.join("wal")).unwrap();
+	std::fs::write(w.ckpt.join("wal"), b"not a directory").unwrap();
+	let outcome = w.tree.restore_from_checkpoint(&w.ckpt);
+	assert!(outcome.is_err(), "the copy of a file as a directory succeeded: {outcome:?}");
+	assert!(w.path.join(MARKER).exists(), "the failed restore left no marker");
+	let image = TempDir::new("restore_conc_image").unwrap();
+	copy_dir(&w.path, image.path());
+	assert!(matches!(Tree::new(options(image.path(), false)), Err(Error::RestoreInterrupted(_))));
+	abandon(&w.tree);
+}
+
+/// The marker is written before the first file is removed: a restore that cannot write it fails
+/// with the database as it was. A directory is where the marker goes.
+#[test(tokio::test)]
+async fn a_restore_that_cannot_write_its_marker_removes_nothing() {
+	let w = build(false).await;
+	std::fs::create_dir(w.path.join(MARKER)).unwrap();
+	let files = fingerprint(&w.path);
+	let outcome = w.tree.restore_from_checkpoint(&w.ckpt);
+	assert!(outcome.is_err(), "a restore that could not mark the directory went on: {outcome:?}");
+	assert_eq!(fingerprint(&w.path), files, "the failed restore changed the files");
+	assert_exact_with_extra(&w.tree, &w.before, "the database after the refused restore");
+	abandon(&w.tree);
+}
+
+/// A checkpoint of another tree of this process that wants the directory a restore reads waits for
+/// the restore: the files the restore copies are the ones it validated. Without that, the
+/// checkpoint replaces them one by one between the validation and the copy.
+#[test(tokio::test)]
+async fn a_checkpoint_into_the_directory_a_restore_reads_waits_for_the_restore() {
+	let w = build(false).await;
+	let other_dir = TempDir::new("restore_conc_other").unwrap();
+	let other = open(options(other_dir.path(), false));
+	let mut other_model = Model::new();
+	apply(&other, &mut other_model, sets(0..20, "z", false)).await.unwrap();
+
+	let writer = Arc::new(Mutex::new(None));
+	let waited = Arc::new(AtomicBool::new(false));
+	let (o, ckpt) = (Arc::clone(&other), w.ckpt.clone());
+	let (slot, waiting) = (Arc::clone(&writer), Arc::clone(&waited));
+	*w.tree.core.inner.checkpoint_hook.lock() = Some(Arc::new(move |stage| {
+		if stage == CheckpointStage::RestoreCleared {
+			let (o, ckpt) = (Arc::clone(&o), ckpt.clone());
+			let handle = std::thread::spawn(move || o.create_checkpoint(&ckpt));
+			let deadline = Instant::now() + GRACE;
+			while !handle.is_finished() && Instant::now() < deadline {
+				std::thread::sleep(Duration::from_millis(2));
+			}
+			waiting.store(!handle.is_finished(), Ordering::SeqCst);
+			*slot.lock().unwrap() = Some(handle);
+		}
+	}));
+	let restored = w.tree.restore_from_checkpoint(&w.ckpt);
+	clear_hooks(&w.tree);
+	let handle = writer.lock().unwrap().take().expect("the restore reached RestoreCleared");
+	assert!(
+		waited.load(Ordering::SeqCst),
+		"a checkpoint rewrote the directory while a restore was reading it"
+	);
+	restored.unwrap();
+	assert_exact(&w.tree, &w.at_ckpt, "the restore of the checkpoint that was there");
+	let written = handle.join().unwrap().expect("the checkpoint that waited");
+
+	// The directory now holds the other tree's state
+	let fresh = TempDir::new("restore_conc_fresh").unwrap();
+	let tree = open(options(fresh.path(), false));
+	let metadata = tree.restore_from_checkpoint(&w.ckpt).unwrap();
+	assert_eq!(metadata.sequence_number, written.sequence_number);
+	assert_exact(&tree, &other_model, "the checkpoint that waited");
+	abandon(&tree);
+	abandon(&other);
+	abandon(&w.tree);
+}
+
+/// A restore does not wait for a checkpoint that is writing the directory: it holds the flush
+/// lock, which the checkpoint takes while it holds the directory, and it is refused with the
+/// database as it was.
+#[test(tokio::test)]
+async fn a_restore_from_a_directory_a_checkpoint_is_writing_is_refused_and_leaves_the_database() {
+	let w = build(false).await;
+	let other_dir = TempDir::new("restore_conc_other").unwrap();
+	let other = open(options(other_dir.path(), false));
+	let mut other_model = Model::new();
+	apply(&other, &mut other_model, sets(0..20, "z", false)).await.unwrap();
+
+	let (gate, pass) = (mpsc::channel(), mpsc::channel::<()>());
+	let (reached, release) = (gate.0, Mutex::new(pass.1));
+	*other.core.inner.checkpoint_hook.lock() = Some(Arc::new(move |stage| {
+		if stage == CheckpointStage::ManifestReleased {
+			reached.send(()).unwrap();
+			let _ = release.lock().unwrap().recv_timeout(WATCHDOG);
+		}
+	}));
+	let (o, ckpt) = (Arc::clone(&other), w.ckpt.clone());
+	let writer = std::thread::spawn(move || o.create_checkpoint(&ckpt));
+	gate.1.recv_timeout(WATCHDOG).expect("the checkpoint reached ManifestReleased");
+
+	let files = fingerprint(&w.path);
+	let outcome = w.tree.restore_from_checkpoint(&w.ckpt);
+	let refused =
+		matches!(&outcome, Err(Error::InvalidArgument(why)) if why.contains("being written"));
+	pass.0.send(()).unwrap();
+	writer.join().unwrap().unwrap();
+	assert!(refused, "the restore of a directory that is being written: {outcome:?}");
+	assert_eq!(fingerprint(&w.path), files, "the refused restore changed the files");
+	assert_exact(&w.tree, &w.before, "the database after the refused restore");
+	abandon(&other);
+	abandon(&w.tree);
+}
+
+/// The checkpoint of a database that holds nothing restores, and leaves an empty database that
+/// opens again.
+#[test(tokio::test)]
+async fn the_checkpoint_of_an_empty_database_restores_and_empties_the_target() {
+	for vlog in [false, true] {
+		let w = build(vlog).await;
+		let empty_dir = TempDir::new("restore_conc_empty").unwrap();
+		let empty = open(options(empty_dir.path(), vlog));
+		let root = TempDir::new("restore_conc_empty_ckpt").unwrap();
+		let ckpt = root.path().join("empty");
+		empty.create_checkpoint(&ckpt).unwrap();
+		w.tree.restore_from_checkpoint(&ckpt).unwrap();
+		assert_exact(&w.tree, &Model::new(), &format!("vlog {vlog}: after the restore"));
+		assert!(!w.path.join(MARKER).exists(), "vlog {vlog}: the marker is left");
+		w.tree.close().await.unwrap();
+		let reopened = open(options(&w.path, vlog));
+		assert_exact(&reopened, &Model::new(), &format!("vlog {vlog}: after a reopen"));
+		abandon(&reopened);
+		abandon(&empty);
+	}
 }
 
 /// The commits that are acknowledged after a restore are in the WAL that the restore reopened:
@@ -1882,7 +2149,12 @@ async fn a_crash_right_after_a_restore_recovers_the_checkpoint() {
 /// database is untouched: it still holds what it held, its files are the same, and it holds it
 /// after a close and a reopen. Every problem found is reported together.
 async fn bad_checkpoint(what: &str, spoil: impl FnOnce(&Path)) {
-	let w = build(false).await;
+	bad_checkpoint_with(false, what, spoil).await;
+}
+
+/// `bad_checkpoint` for a tree with or without a value log.
+async fn bad_checkpoint_with(vlog: bool, what: &str, spoil: impl FnOnce(&Path)) {
+	let w = build(vlog).await;
 	spoil(&w.ckpt);
 	let files = fingerprint(&w.path);
 	let outcome = w.tree.restore_from_checkpoint(&w.ckpt);
@@ -1915,7 +2187,7 @@ async fn bad_checkpoint(what: &str, spoil: impl FnOnce(&Path)) {
 	if let Err(e) = w.tree.close().await {
 		problems.push(format!("the database does not close after the failed restore: {e:?}"));
 	}
-	match Tree::new(options(&w.path, false)) {
+	match Tree::new(options(&w.path, vlog)) {
 		Err(e) => {
 			problems.push(format!("the database does not open after the failed restore: {e:?}"))
 		}
@@ -1982,7 +2254,6 @@ async fn a_restore_of_a_checkpoint_of_an_unsupported_version_fails_and_leaves_th
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore of a checkpoint that cannot be loaded fails only after it removed the database's files, leaving a database that does not open"]
 async fn a_restore_of_a_checkpoint_missing_a_listed_table_fails_and_leaves_the_database() {
 	bad_checkpoint("a listed table is missing", |ckpt| {
 		std::fs::remove_file(&checkpoint_tables(ckpt)[0]).unwrap();
@@ -1991,7 +2262,6 @@ async fn a_restore_of_a_checkpoint_missing_a_listed_table_fails_and_leaves_the_d
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore of a checkpoint that cannot be loaded fails only after it removed the database's files, leaving a database that does not open"]
 async fn a_restore_of_a_checkpoint_with_a_truncated_table_fails_and_leaves_the_database() {
 	bad_checkpoint("a table is truncated", |ckpt| {
 		let table = checkpoint_tables(ckpt)[0].clone();
@@ -2004,7 +2274,6 @@ async fn a_restore_of_a_checkpoint_with_a_truncated_table_fails_and_leaves_the_d
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore of a checkpoint that cannot be loaded fails only after it removed the database's files, leaving a database that does not open"]
 async fn a_restore_of_a_checkpoint_without_a_tables_directory_fails_and_leaves_the_database() {
 	bad_checkpoint("no sstables directory", |ckpt| {
 		std::fs::remove_dir_all(ckpt.join("sstables")).unwrap();
@@ -2013,10 +2282,59 @@ async fn a_restore_of_a_checkpoint_without_a_tables_directory_fails_and_leaves_t
 }
 
 #[test(tokio::test)]
-#[ignore = "a restore of a checkpoint that cannot be loaded fails only after it removed the database's files, leaving a database that does not open"]
 async fn a_restore_of_a_checkpoint_without_a_manifest_fails_and_leaves_the_database() {
 	bad_checkpoint("no manifest directory", |ckpt| {
 		std::fs::remove_dir_all(ckpt.join("manifest")).unwrap();
+	})
+	.await;
+}
+
+/// A table that is as long as it was and is not a table: its footer does not decode.
+#[test(tokio::test)]
+async fn a_restore_of_a_checkpoint_with_a_table_of_garbage_fails_and_leaves_the_database() {
+	bad_checkpoint("a table is garbage", |ckpt| {
+		let table = checkpoint_tables(ckpt)[0].clone();
+		let len = std::fs::metadata(&table).unwrap().len() as usize;
+		std::fs::remove_file(&table).unwrap();
+		std::fs::write(&table, vec![0x5au8; len]).unwrap();
+	})
+	.await;
+}
+
+/// A manifest that has its bytes and does not decode.
+#[test(tokio::test)]
+async fn a_restore_of_a_checkpoint_with_a_garbage_manifest_fails_and_leaves_the_database() {
+	bad_checkpoint("the manifest is garbage", |ckpt| {
+		let manifest = ckpt.join("manifest").join(format!("{:020}.manifest", 0));
+		let len = std::fs::metadata(&manifest).unwrap().len() as usize;
+		std::fs::write(&manifest, vec![0xffu8; len]).unwrap();
+	})
+	.await;
+}
+
+/// The tables of a checkpoint point into the value log it copied, and a checkpoint without it
+/// would restore into a database whose reads of large values fail.
+#[test(tokio::test)]
+async fn a_restore_of_a_checkpoint_without_its_value_log_fails_and_leaves_the_database() {
+	bad_checkpoint_with(true, "no value log directory", |ckpt| {
+		std::fs::remove_dir_all(ckpt.join("vlog")).unwrap();
+	})
+	.await;
+}
+
+#[test(tokio::test)]
+async fn a_restore_of_a_checkpoint_whose_value_log_files_are_gone_fails_and_leaves_the_database() {
+	bad_checkpoint_with(true, "the value log files are gone", |ckpt| {
+		let mut files: Vec<PathBuf> = std::fs::read_dir(ckpt.join("vlog"))
+			.unwrap()
+			.map(|e| e.unwrap().path())
+			.filter(|p| p.extension().is_some_and(|e| e == "vlog"))
+			.collect();
+		files.sort();
+		assert!(!files.is_empty(), "setup: the checkpoint holds value log files");
+		for file in files {
+			std::fs::remove_file(file).unwrap();
+		}
 	})
 	.await;
 }

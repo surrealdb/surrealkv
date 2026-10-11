@@ -19,9 +19,11 @@
 //!    files its manifest lists. On Linux a named pipe in the place of a file the checkpoint writes
 //!    also holds it inside the copy of the manifest and of the value log, where no hook reaches.
 //! 3. A checkpoint during value-log churn and background compaction.
-//! 4. Two checkpoints into the same directory: nothing serializes them, so what is checked is that
-//!    the directory they leave restores to a whole state, and a name that one of them links while
-//!    the other has it free is not copied over the live table (Linux only, it races two threads).
+//! 4. Two checkpoints into the same directory run one after the other, so the directory they leave
+//!    restores to the state of the one that ran last, with its own metadata file; one that fails
+//!    lets the next in, and checkpoints into other directories do not wait. A name that another
+//!    writer of the directory links while a checkpoint has it free, a checkpoint of another process
+//!    for instance, is not copied over the live table (Linux only, it races two threads).
 //! 5. The directory of a checkpoint that was interrupted, or damaged afterwards: restore refuses
 //!    it, and a refused restore leaves the target database alone.
 //! 6. Hard links: the live tree deletes the tables a checkpoint links, and a tree restored from the
@@ -1530,11 +1532,11 @@ async fn checkpoints_during_value_log_churn_and_background_compaction_read_back_
 // 4. two checkpoints into the same directory
 // ---------------------------------------------------------------------------
 
-/// Nothing serializes checkpoints that write one directory, so what the directory holds after
-/// two of them ran at the same time is the contract: a checkpoint that restores, whole
-/// transactions, a prefix of each writer's, bounded by what the writers did around both calls,
-/// at the sequence number of one of the two checkpoints. Repeated, with writers running. That the
-/// metadata file may belong to the other checkpoint is the subject of the ignored test below.
+/// Checkpoints that write one directory run one after the other, so what the directory holds
+/// after two of them were called at the same time is the contract: a checkpoint that restores,
+/// whole transactions, a prefix of each writer's, bounded by what the writers did around both
+/// calls, at the sequence number of one of the two checkpoints, with the metadata file of the
+/// one that ran last. Repeated, with writers running.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
 async fn two_checkpoints_at_once_into_the_same_directory_leave_one_that_restores_whole() {
 	let shape = Shape {
@@ -1635,8 +1637,7 @@ async fn two_checkpoints_at_once_into_the_same_directory_leave_one_that_restores
 			);
 		}
 		let restored_sequence = copy.core.seq_num();
-		// The files are one checkpoint's, and the metadata file is one checkpoint's too, not
-		// necessarily the same one: the slower writes its own last, see
+		// The files are one checkpoint's, and so is the metadata file: see
 		// `the_metadata_a_slow_checkpoint_leaves_in_a_shared_directory_describes_its_files`.
 		let returned: Vec<u64> = results.iter().map(|m| m.sequence_number).collect();
 		assert!(
@@ -1645,12 +1646,11 @@ async fn two_checkpoints_at_once_into_the_same_directory_leave_one_that_restores
 			 checkpoints returned {returned:?}",
 			shape.seed
 		);
-		assert!(
-			returned.contains(&metadata.sequence_number),
-			"round {round} (seed {}): the metadata file reports {}, and the two checkpoints \
-			 returned {returned:?}",
-			shape.seed,
-			metadata.sequence_number
+		assert_eq!(
+			metadata.sequence_number, restored_sequence,
+			"round {round} (seed {}): the metadata file reports {}, and the files hold a state at \
+			 {restored_sequence}",
+			shape.seed, metadata.sequence_number
 		);
 		assert!(
 			visible_before <= restored_sequence && restored_sequence < log_seq_after,
@@ -1680,9 +1680,10 @@ async fn two_checkpoints_at_once_into_the_same_directory_leave_one_that_restores
 	finish(tree).await;
 }
 
-/// What a checkpoint that finishes while another into the same directory is between its manifest
-/// and its metadata leaves: the slower one writes its older metadata last, over the files of the
-/// newer one. Returns the state of the newer one, both metadata, and the directory.
+/// What two checkpoints into one directory leave when the second begins while the first is between
+/// its manifest and its metadata: the second waits for the first, so the newer state is written
+/// last, with the newer metadata. Returns the state of the newer one, both metadata, and the
+/// directory.
 async fn same_directory_slow_and_fast(
 	vlog: bool,
 ) -> (Contents, CheckpointMetadata, CheckpointMetadata, TempDir, PathBuf) {
@@ -1697,18 +1698,24 @@ async fn same_directory_slow_and_fast(
 	let slow = checkpoint(&tree, &cp);
 	assert_eq!(gate.next(REACHED), Some(0), "the slow checkpoint released the manifest");
 
-	// More commits, and a second checkpoint that runs from start to end meanwhile.
+	// More commits, and a second checkpoint into the same directory, which has to wait.
 	let mut newer = state.clone();
 	put(&tree, 150..300, 2, &mut newer).await;
 	remove(&tree, 0..30, &mut newer).await;
-	let fast = checkpoint(&tree, &cp).wait().unwrap();
+	let fast = checkpoint(&tree, &cp);
 	assert!(
-		gate.next(GRACE).is_some(),
-		"the second checkpoint did not reach the stage the first is parked at"
+		gate.next(GRACE).is_none(),
+		"the second checkpoint wrote the directory while the first was still writing it"
 	);
+	assert!(!fast.is_finished(), "the second checkpoint finished while the first was parked");
 
 	gate.release();
 	let slow = slow.wait().unwrap();
+	let fast = fast.wait().unwrap();
+	assert!(
+		gate.next(GRACE).is_some(),
+		"the second checkpoint did not reach the stage the first was parked at"
+	);
 	assert!(slow.sequence_number < fast.sequence_number, "{slow:?} {fast:?}");
 	finish(tree).await;
 	drop(dir);
@@ -1729,11 +1736,10 @@ async fn a_slow_checkpoint_over_a_faster_one_into_the_same_directory_leaves_a_wh
 	}
 }
 
-/// The metadata file of the directory describes the files in it: the slower checkpoint writes its
-/// metadata last, and it must not report an older sequence number than the manifest it sits
-/// beside.
+/// The metadata file of the directory describes the files in it: it must not report an older
+/// sequence number than the manifest it sits beside, as it did when the slower checkpoint wrote
+/// its metadata last, over the files of the newer one.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[ignore = "a checkpoint that finishes late into a directory another one already completed writes its older metadata file over the newer files, so the sequence number in CHECKPOINT_METADATA differs from the one of the manifest beside it"]
 async fn the_metadata_a_slow_checkpoint_leaves_in_a_shared_directory_describes_its_files() {
 	let (_newer, _slow, fast, out, cp) = same_directory_slow_and_fast(false).await;
 	let target = out.path().join("restored");
@@ -1745,6 +1751,113 @@ async fn the_metadata_a_slow_checkpoint_leaves_in_a_shared_directory_describes_i
 		"the metadata file describes an older state than the files beside it"
 	);
 	finish(copy).await;
+}
+
+/// The directory is one destination however it is spelled: a second checkpoint that names it with
+/// a `..` waits for the first just the same, and the files it leaves are its own.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_checkpoint_waits_for_the_one_writing_its_destination_however_the_path_is_spelled() {
+	let dir = TempDir::new("ckpt_conc_spelled").unwrap();
+	let out = TempDir::new("ckpt_conc_spelled_out").unwrap();
+	let tree = open(dir.path(), false);
+	let mut state = Contents::new();
+	put(&tree, 0..100, 1, &mut state).await;
+	let cp = out.path().join("cp");
+
+	let gate = gate_checkpoint(&tree, CheckpointStage::ManifestReleased);
+	let first = checkpoint(&tree, &cp);
+	assert_eq!(gate.next(REACHED), Some(0), "the first checkpoint released the manifest");
+	put(&tree, 100..150, 2, &mut state).await;
+	let spelled = out.path().join("cp").join("..").join("cp");
+	let second = checkpoint(&tree, &spelled);
+	assert!(
+		gate.next(GRACE).is_none(),
+		"the second checkpoint wrote the directory while the first was still writing it"
+	);
+	assert!(!second.is_finished());
+
+	gate.release();
+	let first = first.wait().unwrap();
+	let second = second.wait().unwrap();
+	assert!(first.sequence_number < second.sequence_number, "{first:?} {second:?}");
+	let target = out.path().join("restored");
+	let (copy, outcome) = restored(&cp, &target, false).await;
+	assert_eq!(outcome.unwrap().sequence_number, second.sequence_number);
+	assert_contents(&copy, &state, "the directory of the second checkpoint");
+	finish(copy).await;
+	finish(tree).await;
+}
+
+/// Only the destination is shared: a checkpoint into another directory runs to its end while the
+/// first is parked inside its own.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_checkpoint_into_another_directory_does_not_wait_for_a_parked_one() {
+	let dir = TempDir::new("ckpt_conc_other").unwrap();
+	let out = TempDir::new("ckpt_conc_other_out").unwrap();
+	let tree = open(dir.path(), false);
+	let mut state = Contents::new();
+	put(&tree, 0..100, 1, &mut state).await;
+
+	let gate = gate_checkpoint(&tree, CheckpointStage::ManifestReleased);
+	let parked = checkpoint(&tree, &out.path().join("parked"));
+	assert_eq!(gate.next(REACHED), Some(0), "the first checkpoint released the manifest");
+	let other = checkpoint(&tree, &out.path().join("other"));
+	let deadline = Instant::now() + REACHED / 3;
+	while !other.is_finished() && Instant::now() < deadline {
+		std::thread::sleep(Duration::from_millis(2));
+	}
+	let finished = other.is_finished();
+	gate.release();
+	assert!(finished, "a checkpoint into another directory waited for the parked one");
+	other.wait().unwrap();
+	parked.wait().unwrap();
+	finish(tree).await;
+}
+
+/// A checkpoint that fails gives its destination back: the next one into it is not left waiting.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_failed_checkpoint_lets_the_next_one_into_its_destination() {
+	let (source, _dir, state) = source_with_data(false).await;
+	let out = TempDir::new("ckpt_conc_failed").unwrap();
+	let cp = out.path().join("cp");
+	// A file where the directory should be: the checkpoint fails once it holds the destination.
+	std::fs::write(&cp, b"not a directory").unwrap();
+	let failed = checkpoint(&source, &cp).wait();
+	assert!(failed.is_err(), "a checkpoint into a file succeeded: {failed:?}");
+	std::fs::remove_file(&cp).unwrap();
+
+	let metadata = checkpoint(&source, &cp).wait().unwrap();
+	let target = out.path().join("restored");
+	let (copy, outcome) = restored(&cp, &target, false).await;
+	assert_eq!(outcome.unwrap().sequence_number, metadata.sequence_number);
+	assert_contents(&copy, &state, "the checkpoint after the failed one");
+	finish(copy).await;
+	finish(source).await;
+}
+
+/// A checkpoint that panics gives its destination back too: the next one into it is not left
+/// waiting.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_checkpoint_that_panics_lets_the_next_one_into_its_destination() {
+	let (source, _dir, state) = source_with_data(false).await;
+	let out = TempDir::new("ckpt_conc_panic").unwrap();
+	let cp = out.path().join("cp");
+	*source.core.inner.checkpoint_hook.lock() = Some(Arc::new(|stage| {
+		if stage == CheckpointStage::SstablesCopied {
+			panic!("a panic inside the checkpoint");
+		}
+	}));
+	let outcome = catch_unwind(AssertUnwindSafe(|| source.create_checkpoint(&cp)));
+	assert!(outcome.is_err(), "the hook did not panic the checkpoint");
+	clear_hooks(&source);
+
+	let metadata = checkpoint(&source, &cp).wait().unwrap();
+	let target = out.path().join("restored");
+	let (copy, outcome) = restored(&cp, &target, false).await;
+	assert_eq!(outcome.unwrap().sequence_number, metadata.sequence_number);
+	assert_contents(&copy, &state, "the checkpoint after the one that panicked");
+	finish(copy).await;
+	finish(source).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1951,7 +2064,6 @@ async fn a_torn_or_unsupported_metadata_file_is_refused_and_the_target_is_untouc
 /// A metadata file that a power cut left zero-filled (it has its length, and its blocks were never
 /// written) describes no checkpoint: restore refuses it, and the target keeps its data.
 #[test(tokio::test)]
-#[ignore = "restore_from_checkpoint accepts a zero-filled CHECKPOINT_METADATA file as version 0: from_bytes only rejects versions above 1 and restore never calls is_compatible"]
 async fn a_zero_filled_metadata_file_is_refused_and_the_target_is_untouched() {
 	let (source, _dir, _state) = source_with_data(false).await;
 	let out = TempDir::new("ckpt_conc_zeroed").unwrap();
@@ -1969,9 +2081,6 @@ async fn a_zero_filled_metadata_file_is_refused_and_the_target_is_untouched() {
 /// file that was never synced may come back empty) is refused by restore without taking the
 /// target's data: the restore reads everything it needs before it replaces anything.
 #[test(tokio::test)]
-#[ignore = "restore_from_checkpoint clears the target's tables, WAL, manifest and value log before it \
-            reads the checkpoint's manifest, so a checkpoint with an empty manifest file is refused \
-            only after the target database was destroyed"]
 async fn a_checkpoint_with_an_empty_manifest_is_refused_and_the_target_is_untouched() {
 	let (source, _dir, _state) = source_with_data(false).await;
 	let out = TempDir::new("ckpt_conc_manifest").unwrap();
@@ -1995,9 +2104,6 @@ async fn a_checkpoint_with_an_empty_manifest_is_refused_and_the_target_is_untouc
 /// a restore of such an image does, it must not hand out a state that is neither the older
 /// checkpoint nor the newer one: it is refused, or every value is there.
 #[test(tokio::test)]
-#[ignore = "an interrupted checkpoint over an older one in the same directory keeps the old metadata \
-            file, so restore accepts a manifest that points into value-log files the interrupted \
-            checkpoint did not copy yet"]
 async fn an_interrupted_checkpoint_over_an_older_one_is_refused_or_restores_a_whole_state() {
 	let dir = TempDir::new("ckpt_conc_reuse_crash").unwrap();
 	let out = TempDir::new("ckpt_conc_reuse_crash_out").unwrap();
@@ -2022,10 +2128,15 @@ async fn an_interrupted_checkpoint_over_an_older_one_is_refused_or_restores_a_wh
 	tree.create_checkpoint(&cp).unwrap();
 	assert_eq!(images.calls.load(Ordering::SeqCst), 2);
 	clear_hooks(&tree);
-	assert!(
-		images.at_manifest.join("CHECKPOINT_METADATA").exists(),
-		"the older metadata file is still there at the second stage"
-	);
+	// The older metadata file is gone before anything is copied, so the directory is no
+	// checkpoint until the new one is complete.
+	for image in [&images.at_sstables, &images.at_manifest] {
+		assert!(
+			!image.join("CHECKPOINT_METADATA").exists(),
+			"the older metadata file is still there at {}",
+			image.display()
+		);
+	}
 
 	for (name, image) in
 		[("after_the_tables", &images.at_sstables), ("after_the_manifest", &images.at_manifest)]
@@ -2420,5 +2531,43 @@ async fn a_checkpoint_into_a_directory_that_holds_another_history_with_the_same_
 		finish(copy).await;
 		finish(other).await;
 		finish(tree).await;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// 8. what a checkpoint makes durable
+// ---------------------------------------------------------------------------
+
+/// The directories that hold the files of a checkpoint, the checkpoint's own, and the one that
+/// holds it are synced by the time the call returns, so that the names of the files are on disk
+/// with the metadata file that says they are all there.
+#[test(tokio::test)]
+async fn a_checkpoint_syncs_the_directories_that_hold_its_files() {
+	for vlog in [false, true] {
+		let (source, _dir, _state) = source_with_data(vlog).await;
+		let out = TempDir::new("ckpt_conc_sync").unwrap();
+		let cp = out.path().join("cp");
+		source.create_checkpoint(&cp).unwrap();
+		let synced = crate::lsm::SYNCED_DIRECTORIES.lock().clone();
+		let mut dirs = vec![
+			out.path().to_path_buf(),
+			cp.clone(),
+			cp.join("sstables"),
+			cp.join("wal"),
+			cp.join("manifest"),
+		];
+		if vlog {
+			dirs.push(cp.join("vlog"));
+		}
+		for dir in dirs {
+			let dir = dir.canonicalize().unwrap();
+			assert!(synced.contains(&dir), "vlog {vlog}: {} was not synced", dir.display());
+		}
+		// Once before the metadata file is written, for the names of the directories, and once
+		// after it, for the name of the file.
+		let root = cp.canonicalize().unwrap();
+		let syncs = synced.iter().filter(|dir| **dir == root).count();
+		assert!(syncs >= 2, "vlog {vlog}: the checkpoint directory was synced {syncs} time(s)");
+		finish(source).await;
 	}
 }
