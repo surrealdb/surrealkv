@@ -42,7 +42,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::sstable::block::BlockHandle;
-use crate::sstable::block_io::{BlockKind, BlockSource};
+use crate::sstable::block_io::{BlockKind, BlockSource, TrailerLayout};
+use crate::sstable::error::SSTableError;
 use crate::sstable::index_block::BlockHandleWithKey;
 use crate::{FilterPolicy, Options};
 
@@ -219,10 +220,13 @@ impl PartitionedFilterReader {
 	///
 	/// A partition that cannot be read degrades to "maybe" (true): lookups
 	/// stay correct and merely lose the bloom short-circuit. The exception is
-	/// a partition that failed authentication, which is an error: the bytes
-	/// were changed by someone who does not have the key, or are not the ones
-	/// of this file, and a table whose blocks are sealed does not go on
-	/// reading as if they were not. What is degraded is counted and logged.
+	/// a table whose blocks are sealed: there only what damage looks like
+	/// degrades, which is a failed read and a checksum that does not match.
+	/// A partition that failed authentication, or whose checksum is right but
+	/// whose trailer is not, was changed by someone who computed the
+	/// checksum again, or is not the one of this file, and a table whose
+	/// blocks are sealed does not go on reading as if it were. What is
+	/// degraded is counted and logged.
 	pub(crate) fn may_contain(
 		&self,
 		encoded_internal_key: &[u8],
@@ -261,6 +265,11 @@ impl PartitionedFilterReader {
 					bytes
 				}
 				Err(e @ crate::Error::Encryption(_)) => return Err(e),
+				Err(e)
+					if self.source.layout() == TrailerLayout::Sealed && !looks_like_damage(&e) =>
+				{
+					return Err(e);
+				}
 				Err(e) => {
 					self.degraded.fetch_add(1, Ordering::Relaxed);
 					tracing::warn!(
@@ -275,4 +284,16 @@ impl PartitionedFilterReader {
 
 		Ok(self.policy.may_contain(&bits, user_key))
 	}
+}
+
+/// Whether a failed read of a block of a sealed table is what damage to the file looks like:
+/// the file could not be read, or the checksum of the block does not match its bytes. Whoever
+/// changes a sealed block without the key can make a checksum right, and what they leave is an
+/// authentication failure or a trailer that disagrees with the handle, so those are never damage.
+fn looks_like_damage(error: &crate::Error) -> bool {
+	matches!(
+		error,
+		crate::Error::Io(_)
+			| crate::Error::SSTable(SSTableError::ChecksumVerificationFailed { .. })
+	)
 }

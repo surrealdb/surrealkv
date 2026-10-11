@@ -24,9 +24,11 @@ use crate::sstable::block_io::{
 	Trailer,
 	TrailerLayout,
 };
+use crate::sstable::error::SSTableError;
 use crate::sstable::sealed::SstSealer;
 use crate::sstable::table::{
 	decompress_block,
+	mask,
 	ChecksumType,
 	Footer,
 	IndexType,
@@ -1084,6 +1086,36 @@ async fn a_filter_partition_that_fails_authentication_is_an_error_and_not_a_mayb
 		let err = table.get_async(&lookup(0)).await.unwrap_err();
 		assert!(
 			matches!(err, Error::Encryption(EncryptionError::AuthenticationFailed)),
+			"{suite:?}: {err:?}"
+		);
+		assert_eq!(table.filter_reads_degraded(), 0, "{suite:?}: nothing was skipped");
+	}
+}
+
+#[test]
+fn a_filter_partition_whose_trailer_was_changed_and_whose_checksum_was_made_again_is_an_error() {
+	// Bit rot does not make a checksum right. A trailer that says another length than the handle
+	// does, under a checksum that covers it, was written by someone, and is not a filter that can
+	// be skipped like one that rotted.
+	for suite in SUITES {
+		let ctx = context(suite);
+		let opts = options(Some(&ctx), CompressionType::None, true);
+		let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+		let partition = first_of(&walk(&opts, &file, TABLE_ID), BlockKind::FilterPartition);
+
+		// The trailer is the compression byte, the length in four bytes and the checksum, which
+		// covers the block and the two before it.
+		let end = partition.offset + partition.size;
+		let mut damaged = file.clone();
+		let longer = u32::try_from(partition.size).unwrap() + 1;
+		damaged[end + 1..end + 5].copy_from_slice(&longer.to_le_bytes());
+		let crc = mask(crc32fast::hash(&damaged[partition.offset..end + 5]));
+		damaged[end + 5..end + 9].copy_from_slice(&crc.to_le_bytes());
+
+		let table = open_table(&opts, &damaged, TABLE_ID).unwrap();
+		let err = table.get(&lookup(0)).unwrap_err();
+		assert!(
+			matches!(err, Error::SSTable(SSTableError::TrailerLengthMismatch { .. })),
 			"{suite:?}: {err:?}"
 		);
 		assert_eq!(table.filter_reads_degraded(), 0, "{suite:?}: nothing was skipped");
