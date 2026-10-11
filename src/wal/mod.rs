@@ -207,6 +207,19 @@ impl fmt::Debug for WalContext {
 	}
 }
 
+/// Test-only: where the creation of the next sealed segment is made to fail, as a disk that fails
+/// would.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreationFault {
+	/// The write of the header record fails.
+	HeaderWrite,
+	/// The fsync of the header fails.
+	HeaderSync,
+	/// The fsync of the directory fails, after the header is durable.
+	Directory,
+}
+
 /// Options for configuring a WAL segment.
 ///
 /// This struct provides configuration options for WAL segments, including
@@ -215,6 +228,10 @@ impl fmt::Debug for WalContext {
 pub struct Options {
 	/// Whether the segments are sealed, and under what.
 	pub(crate) context: WalContext,
+
+	/// Test-only: where the creation of the next sealed segment fails, once.
+	#[cfg(test)]
+	pub(crate) creation_fault: Arc<parking_lot::Mutex<Option<CreationFault>>>,
 
 	/// The permission mode for creating directories (Unix only).
 	#[cfg_attr(not(unix), allow(dead_code))]
@@ -238,6 +255,8 @@ impl Default for Options {
 	fn default() -> Self {
 		Options {
 			context: WalContext::default(),
+			#[cfg(test)]
+			creation_fault: Arc::default(),
 			dir_mode: Some(0o750),
 			file_mode: Some(DEFAULT_FILE_MODE),
 			compression_type: CompressionType::None,

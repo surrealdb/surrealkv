@@ -169,7 +169,7 @@ pub(crate) fn snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
 }
 
 /// The names of the files of `dir`.
-fn names(dir: &Path) -> Vec<String> {
+pub(crate) fn names(dir: &Path) -> Vec<String> {
 	snapshot(dir).into_keys().collect()
 }
 

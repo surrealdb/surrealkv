@@ -296,12 +296,26 @@ impl Wal {
 			Ok(cloned) => cloned,
 			Err(_) => Self::open_wal_file(file_path, opts)?,
 		});
-		let writer = Writer::start_sealed(
-			BufferedFileWriter::new(file, BLOCK_SIZE),
-			header,
-			cipher,
-			compression_type,
-		)?;
+		#[cfg(test)]
+		let fault = opts.creation_fault.lock().take();
+
+		#[cfg_attr(not(test), allow(unused_mut))]
+		let mut dest = BufferedFileWriter::new(file, BLOCK_SIZE);
+		#[cfg(test)]
+		match fault {
+			Some(super::CreationFault::HeaderWrite) => dest.fail_after_ops(0),
+			Some(super::CreationFault::HeaderSync) => dest.gate().fail_after(0),
+			_ => {}
+		}
+
+		let writer = Writer::start_sealed(dest, header, cipher, compression_type)?;
+		#[cfg(test)]
+		if fault == Some(super::CreationFault::Directory) {
+			return Err(Error::IO(IOError::new(
+				io::ErrorKind::Other,
+				"injected directory failure",
+			)));
+		}
 		crate::lsm::fsync_directory(dir)
 			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
 		Ok((writer, sync_fd))
@@ -637,6 +651,21 @@ impl Wal {
 	#[cfg(test)]
 	pub(crate) fn cipher_next_position(&self) -> Option<u64> {
 		self.active_writer.as_ref().and_then(Writer::cipher_next_position)
+	}
+
+	/// Test-only: sets the index that the next batch of the active sealed segment is sealed at,
+	/// as a bug that rewinds the count would.
+	#[cfg(test)]
+	pub(crate) fn set_next_index(&mut self, index: u64) {
+		if let Some(writer) = self.active_writer.as_mut() {
+			writer.set_next_index(index);
+		}
+	}
+
+	/// Test-only: makes the creation of the next sealed segment fail at `fault`, once.
+	#[cfg(test)]
+	pub(crate) fn fail_next_creation(&mut self, fault: super::CreationFault) {
+		*self.opts.creation_fault.lock() = Some(fault);
 	}
 
 	/// Test-only: whether the first segment of the WAL exists yet, which a sealed WAL makes on

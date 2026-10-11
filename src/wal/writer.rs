@@ -115,6 +115,15 @@ impl Writer {
 		self.sealer.as_ref().map(|sealer| sealer.next_index)
 	}
 
+	/// Test-only: sets the index that the next batch of a sealed segment is sealed at, as a bug
+	/// that rewinds the count would.
+	#[cfg(test)]
+	pub(crate) fn set_next_index(&mut self, index: u64) {
+		if let Some(sealer) = self.sealer.as_mut() {
+			sealer.next_index = index;
+		}
+	}
+
 	/// Test-only: the smallest position that the cipher of a sealed segment would still seal.
 	#[cfg(test)]
 	pub(crate) fn cipher_next_position(&self) -> Option<u64> {
