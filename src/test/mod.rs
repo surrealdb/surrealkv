@@ -19,6 +19,8 @@ pub mod block_tests;
 #[cfg(test)]
 pub mod checkpoint_close_tests;
 #[cfg(test)]
+pub mod checkpoint_concurrency_tests;
+#[cfg(test)]
 pub mod checkpoint_destination_tests;
 #[cfg(test)]
 pub mod checkpoint_flush_tests;
@@ -28,6 +30,8 @@ pub mod close_race_tests;
 pub mod commit_pipeline_gate_tests;
 #[cfg(test)]
 pub mod commit_pipeline_tests;
+#[cfg(test)]
+pub mod compaction_crash_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod compaction_horizon_tests;
 #[cfg(test)]
@@ -59,6 +63,8 @@ pub mod iterator_semantics_tests;
 #[cfg(test)]
 pub mod iterator_tests;
 #[cfg(test)]
+pub mod level_order_crash_tests;
+#[cfg(test)]
 pub mod level_tests;
 #[cfg(test)]
 pub mod lsm_tests;
@@ -81,6 +87,8 @@ pub mod recovery_test_helpers;
 #[cfg(test)]
 pub mod recovery_tests;
 #[cfg(test)]
+pub mod restore_concurrency_tests;
+#[cfg(test)]
 pub mod retire_free_tests;
 #[cfg(test)]
 pub mod retire_isolation_tests;
@@ -98,6 +106,8 @@ pub mod stall_tests;
 pub mod transaction_tests;
 #[cfg(test)]
 pub mod vlog_floor_tests;
+#[cfg(test)]
+pub mod vlog_gc_tests;
 #[cfg(test)]
 pub mod vlog_tests;
 #[cfg(test)]

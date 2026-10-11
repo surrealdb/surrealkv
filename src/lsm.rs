@@ -210,6 +210,12 @@ pub(crate) struct CoreInner {
 	/// Test-only observer called by `create_checkpoint` at each of its stages.
 	#[cfg(test)]
 	pub(crate) checkpoint_hook: parking_lot::Mutex<Option<crate::checkpoint::CheckpointHook>>,
+
+	/// Test-only observer that each compaction reads when it starts and calls at its stages; see
+	/// `CompactionStage`.
+	#[cfg(test)]
+	pub(crate) compaction_stage_hook:
+		parking_lot::Mutex<Option<crate::compaction::compactor::CompactionStageHook>>,
 }
 
 /// What a failed `write_batch_direct_to_l0_sst` leaves behind.
@@ -289,6 +295,8 @@ impl CoreInner {
 			direct_table_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
 			checkpoint_hook: parking_lot::Mutex::new(None),
+			#[cfg(test)]
+			compaction_stage_hook: parking_lot::Mutex::new(None),
 		})
 	}
 
@@ -2324,6 +2332,14 @@ impl Tree {
 		{
 			let mut levels_guard = self.core.inner.level_manifest.write()?;
 			*levels_guard = new_levels;
+		}
+
+		#[cfg(test)]
+		{
+			let hook = self.core.inner.checkpoint_hook.lock().clone();
+			if let Some(hook) = hook {
+				hook(crate::checkpoint::CheckpointStage::RestoreManifestSwapped);
+			}
 		}
 
 		// Clear the current memtables since they would be stale after restore

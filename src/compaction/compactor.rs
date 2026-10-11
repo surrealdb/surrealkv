@@ -15,6 +15,28 @@ use crate::vfs::File;
 use crate::vlog::VLog;
 use crate::{Comparator, Options as LSMOptions};
 
+/// Where a compaction calls `CompactionOptions::stage_hook`, in the order it reaches them. No
+/// lock is held at any of them.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompactionStage {
+	/// The output tables and the SSTable directory are fsynced, and the manifest still lists the
+	/// inputs. An error from the hook fails the compaction here: the inputs stay in place and the
+	/// outputs are left on disk.
+	OutputsDurable,
+	/// The manifest that lists the outputs instead of the inputs is on disk and in memory. The
+	/// input files and the obsolete value-log files are still on disk.
+	ManifestWritten,
+	/// The input files are removed, and the obsolete value-log files are still on disk.
+	InputsRemoved,
+	/// The value-log files that no table or memtable needs any more are removed.
+	VlogCleaned,
+}
+
+/// See `CompactionOptions::stage_hook`. Only an error returned at `OutputsDurable` is used.
+#[cfg(test)]
+pub(crate) type CompactionStageHook = Arc<dyn Fn(CompactionStage) -> Result<()> + Send + Sync>;
+
 /// RAII guard to ensure tables are unhidden if compaction fails
 struct HiddenTablesGuard {
 	level_manifest: Arc<RwLock<LevelManifest>>,
@@ -69,6 +91,9 @@ pub(crate) struct CompactionOptions {
 	/// Runs between the read of `visible_seq_num` and the read of the snapshot list.
 	#[cfg(test)]
 	pub(crate) after_horizon_hook: Option<Arc<dyn Fn() + Send + Sync>>,
+	/// Called at each `CompactionStage`; `CompactionOptions::from` takes the tree's hook.
+	#[cfg(test)]
+	pub(crate) stage_hook: Option<CompactionStageHook>,
 }
 
 impl CompactionOptions {
@@ -84,6 +109,8 @@ impl CompactionOptions {
 			visible_seq_num: Arc::clone(&tree.visible_seq_num),
 			#[cfg(test)]
 			after_horizon_hook: None,
+			#[cfg(test)]
+			stage_hook: tree.compaction_stage_hook.lock().clone(),
 		}
 	}
 }
@@ -150,6 +177,9 @@ impl Compactor {
 			}
 		};
 
+		#[cfg(test)]
+		self.reach(CompactionStage::OutputsDurable)?;
+
 		// Open the finished outputs
 		let mut new_tables = Vec::with_capacity(outputs.len());
 		for (id, path) in &outputs {
@@ -166,7 +196,13 @@ impl Compactor {
 		// Update manifest - this will commit the guard on success
 		self.update_manifest(input, new_tables, &mut guard)?;
 
+		#[cfg(test)]
+		let _ = self.reach(CompactionStage::ManifestWritten);
+
 		self.cleanup_old_tables(input);
+
+		#[cfg(test)]
+		let _ = self.reach(CompactionStage::InputsRemoved);
 
 		// After successful manifest commit, cleanup obsolete vlog files, with the manifest and the
 		// queue released: what is unflushed also points into the value log.
@@ -178,7 +214,19 @@ impl Compactor {
 			"compaction",
 		);
 
+		#[cfg(test)]
+		let _ = self.reach(CompactionStage::VlogCleaned);
+
 		Ok(())
+	}
+
+	/// Calls the test hook, if one is set, for `stage`.
+	#[cfg(test)]
+	fn reach(&self, stage: CompactionStage) -> Result<()> {
+		match &self.options.stage_hook {
+			Some(hook) => hook(stage),
+			None => Ok(()),
+		}
 	}
 
 	/// Reads the visibility horizon and the active snapshots for snapshot-aware compaction.
@@ -315,7 +363,10 @@ impl Compactor {
 			// Durability: the directory entries of all outputs must be
 			// durable BEFORE the manifest (fsynced in update_manifest)
 			// references them (surrealdb/surrealdb#7426).
-			crate::lsm::fsync_directory(self.options.lopts.sstable_dir())?;
+			crate::lsm::fsync_directory(self.options.lopts.sstable_dir()).inspect(|()| {
+				#[cfg(test)]
+				directory_syncs::record(&self.options.lopts.sstable_dir());
+			})?;
 		}
 
 		Ok(outputs)
@@ -403,5 +454,32 @@ impl Compactor {
 		let file_size = file.size()?;
 
 		Ok(Arc::new(Table::new(table_id, Arc::clone(&self.options.lopts), file, file_size)?))
+	}
+}
+
+/// Test-only ledger of the SSTable directories a compaction made durable with a directory fsync.
+///
+/// A directory fsync leaves nothing a test can look at, so the compaction records each one it
+/// completes. A crash simulation uses the count to tell whether the directory entries of the
+/// outputs of a compaction were durable at the time of the image.
+#[cfg(test)]
+pub(crate) mod directory_syncs {
+	use std::collections::HashMap;
+	use std::path::{Path, PathBuf};
+	use std::sync::{LazyLock, Mutex};
+
+	static SYNCS: LazyLock<Mutex<HashMap<PathBuf, usize>>> = LazyLock::new(Default::default);
+
+	fn key(path: &Path) -> PathBuf {
+		path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+	}
+
+	pub(crate) fn record(dir: &Path) {
+		*SYNCS.lock().unwrap().entry(key(dir)).or_default() += 1;
+	}
+
+	/// How many directory fsyncs of `dir` a compaction has completed.
+	pub(crate) fn count(dir: &Path) -> usize {
+		SYNCS.lock().unwrap().get(&key(dir)).copied().unwrap_or(0)
 	}
 }

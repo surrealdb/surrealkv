@@ -220,6 +220,7 @@ fn create_compaction_options(
 		snapshot_tracker: SnapshotTracker::new(),
 		visible_seq_num: Arc::new(AtomicU64::new(u64::MAX)),
 		after_horizon_hook: None,
+		stage_hook: None,
 	}
 }
 

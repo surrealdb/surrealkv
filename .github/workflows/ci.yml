@@ -207,7 +207,15 @@ jobs:
       - name: Run WASM tests in Browser (Headless Chrome)
         if: matrix.runtime == 'browser'
         run: |
-          WASM_BINDGEN_USE_DEDICATED_WORKER=1 wasm-pack test --headless --chrome --test opfs_worker_test
+          # Every tests/opfs_*.rs target runs in headless Chrome. Each one picks its own context
+          # (a dedicated worker, or the main thread for opfs_window_test) with
+          # wasm_bindgen_test_configure!, and the default below only covers a target that does not.
+          # The runner gives a whole test binary 20 seconds by default.
+          for test in tests/opfs_*.rs; do
+            name=$(basename "$test" .rs)
+            echo "Running $name"
+            WASM_BINDGEN_TEST_TIMEOUT=120 WASM_BINDGEN_USE_DEDICATED_WORKER=1 wasm-pack test --headless --chrome --test "$name"
+          done
           wasm-pack test --headless --chrome crates/surrealkv-compat-indxdb
 
       - name: Run WASM tests in Node.js
