@@ -149,9 +149,14 @@ async fn completed_prefix_caught_up(store: &Tree) {
 
 /// Parks the flusher in a retire, so that the commit that started it is the last one anyone
 /// makes: nothing follows it but the free of what it passed.
+///
+/// The gap is in front of the scan of the transaction pins, so a flusher parked there has not yet
+/// looked at who is open, and a transaction that ends while it is parked is one the retire does
+/// not see. That is the only moment at which a test may end the transaction that holds the
+/// watermark: once the flusher has left the gap, nothing says whether it has read the pins yet.
 struct ParkedRetire {
 	/// 0 armed, 1 the flusher is parked in a retire, 2 released, 3 the flusher left the retire's
-	/// gap
+	/// gap, which is not to say that the retire has read the pins
 	gate: Arc<AtomicUsize>,
 	_open: OpenOnDrop,
 }
@@ -177,7 +182,8 @@ impl ParkedRetire {
 	/// so the next retire follows the `RETIRE_EVERY_GROUPS`th commit after this one, whose ring
 	/// sequence is returned for `commit_until_parked`. Meant for a time when a retire is harmless,
 	/// such as while a transaction holds the watermark: the commits that provoke it cannot tell
-	/// when it will come.
+	/// when it will come. The transaction must stay open until `commit_until_parked` has parked
+	/// the flusher: this retire is let go, not finished, when this returns.
 	async fn next_retire_follows(&self, store: &Arc<Tree>) -> u64 {
 		self.gate.store(0, Ordering::SeqCst);
 		// A commit made just before the retire begins waits behind it, until it is let go
@@ -204,15 +210,20 @@ impl ParkedRetire {
 		if let Some(commit) = last {
 			commit.await.unwrap();
 		}
-		// The next retire must not find the gap armed before this one has left it
-		until(30, "the flusher to leave the retire", || self.gate.load(Ordering::SeqCst) == 3)
-			.await;
+		// The next retire must not find the gap armed before this one has left it. It may still
+		// be about to read the pins when this returns.
+		until(30, "the flusher to leave the retire's gap", || {
+			self.gate.load(Ordering::SeqCst) == 3
+		})
+		.await;
 		retired_at + u64::from(RETIRE_EVERY_GROUPS)
 	}
 
 	/// Commits, one after the other, up to the commit `due` that the next retire follows (see
 	/// `next_retire_follows`), and waits for the flusher to park in that retire: the last commit
-	/// is the one that started it, and no commit follows.
+	/// is the one that started it, and no commit follows. This is where a test ends the transaction
+	/// that holds the watermark, if the retire is to pass what it held: the retire has not read
+	/// the pins, and reads them once `release` lets it go.
 	async fn commit_until_parked(&self, store: &Tree, due: u64) {
 		let ring = &store.core.commit_pipeline.ring;
 		self.gate.store(0, Ordering::SeqCst);
@@ -244,7 +255,9 @@ struct FreedBeforeTheNextGroup {
 /// Parks the flusher inside the first retire after a long-lived transaction ends, with the next
 /// commit queued behind it, and returns how much it freed by the time that commit's group
 /// began. The commit is accepted before the flusher resumes, so nothing but the retire (and
-/// whatever it leaves for later) runs in between.
+/// whatever it leaves for later) runs in between. The transaction ends while the flusher is parked,
+/// in front of the scan of the pins: every retire before it ran with the transaction open, however
+/// late the flusher was in finishing the retire that follows the last commit of the fill.
 async fn freed_before_the_next_group(store: &Arc<Tree>) -> FreedBeforeTheNextGroup {
 	let pipeline = &store.core.commit_pipeline;
 	// 0 armed, 1 the flusher is parked in the retire, 2 released
@@ -263,12 +276,8 @@ async fn freed_before_the_next_group(store: &Arc<Tree>) -> FreedBeforeTheNextGro
 	commit_many(store, "fill", 12 * CAP).await;
 	let (_, _, retained) = pipeline.watermarks();
 	assert!(retained as u64 > 10 * CAP, "setup: only {retained} entries are kept");
-	// The flusher is done with the retire that follows the last commit
-	completed_prefix_caught_up(store).await;
-	tokio::time::sleep(Duration::from_millis(100)).await;
 
 	gate.store(0, Ordering::SeqCst);
-	drop(held);
 	// Commits make the flusher retire. The one that follows the retire waits for it.
 	let driver = {
 		let store = Arc::clone(store);
@@ -277,6 +286,7 @@ async fn freed_before_the_next_group(store: &Arc<Tree>) -> FreedBeforeTheNextGro
 		})
 	};
 	until(30, "a retire to park the flusher", || gate.load(Ordering::SeqCst) == 1).await;
+	drop(held);
 	let next = completed(store) + 1;
 	until(10, "the next commit to be accepted", || pipeline.is_accepted(next)).await;
 	// What the flusher holds now, with the commit that waits behind the retire published
@@ -389,7 +399,10 @@ async fn retired_entries_are_freed_a_chunk_at_a_time_until_none_remain() {
 /// A retire that passes more ring slots than one chunk, with almost nothing in the overflow map
 /// and no commit after it, leaves the slots to the flusher while it has nothing to flush: the
 /// idle ring holds only what has not been retired. The flusher is parked in the retire so that
-/// the last commit is the one that triggers it, and no group follows to release a chunk.
+/// the last commit is the one that triggers it, and no group follows to release a chunk. The
+/// transaction that holds the watermark ends while the flusher is parked, before the retire reads
+/// the pins, so that this is the first retire to pass the ring: ended any earlier, it could be an
+/// earlier retire that does, and the ring would be empty by the time the last one parks.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_ring_slots_a_retire_passed_are_released_when_no_commit_follows() {
 	let (store, _dir) = create_store();
@@ -401,12 +414,12 @@ async fn the_ring_slots_a_retire_passed_are_released_when_no_commit_follows() {
 	commit_many(&store, "fill", CAP + CAP / 8).await;
 	completed_prefix_caught_up(&store).await;
 	let due = retire.next_retire_follows(&store).await;
-	drop(held);
 	retire.commit_until_parked(&store, due).await;
 	let lapped = overflow_len(&store);
 	let held_slots = pipeline.ring.occupied();
 	assert!(lapped < 2 * RETIRED_FREE_CHUNK, "setup: {lapped} lapped entries are many chunks");
 	assert!(held_slots > 3 * RETIRED_FREE_CHUNK, "setup: {held_slots} slots are not many chunks");
+	drop(held);
 	retire.release();
 
 	until(30, "the retired ring slots to be released", || pipeline.ring.occupied() <= 2).await;
@@ -437,11 +450,12 @@ async fn the_flusher_parks_once_nothing_is_left_to_free() {
 
 	let due = retire.next_retire_follows(&store).await;
 	flusher_is_quiet(&calls).await;
-	let quiet = calls.load(Ordering::SeqCst);
-	drop(held);
 	retire.commit_until_parked(&store, due).await;
 	let retained = overflow_len(&store);
 	assert!(retained > 8 * RETIRED_FREE_CHUNK, "setup: {retained} entries are not many chunks");
+	// Nothing calls `free_retired` while the flusher is parked in front of it
+	let quiet = calls.load(Ordering::SeqCst);
+	drop(held);
 	retire.release();
 	overflow_drained(&store).await;
 	assert!(calls.load(Ordering::SeqCst) > quiet, "setup: nothing was freed");
