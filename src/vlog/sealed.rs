@@ -202,6 +202,13 @@ pub(crate) fn is_sealed_start(head: &[u8]) -> bool {
 		&& head.get(MAGIC.len()..MAGIC.len() + 2) == Some(&SEALED_VERSION.to_be_bytes()[..])
 }
 
+/// Whether `head`, the start of a file, is the start of a plaintext file's header: its magic and
+/// its version. A file that is shorter than that is not recognised.
+pub(crate) fn is_plain_start(head: &[u8]) -> bool {
+	head.starts_with(&MAGIC)
+		&& head.get(MAGIC.len()..MAGIC.len() + 2) == Some(&VLOG_FORMAT_VERSION.to_be_bytes()[..])
+}
+
 /// Whether the whole of a file that is no longer than a sealed header is what a crash during its
 /// creation leaves: nothing, zeros, a part of a header, or a whole header that is damaged. Such a
 /// file holds no entry, because the header is made durable before the first entry is written.

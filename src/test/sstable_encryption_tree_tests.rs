@@ -486,12 +486,10 @@ async fn a_plain_checkpoint_is_not_restored_into_an_encrypted_database() {
 	write_round(&tree, '2', 0, KEYS).await;
 	let before = snapshot(&opts);
 
-	// The checkpoint is refused before anything of the database is touched.
+	// The checkpoint is refused before anything of the database is touched, as one that is not
+	// encrypted, which is not the same as one that is damaged.
 	let err = tree.restore_from_checkpoint(&checkpoint).unwrap_err();
-	assert!(
-		matches!(&err, Error::InvalidArgument(message) if message.contains("not a usable checkpoint")),
-		"{err:?}"
-	);
+	assert!(matches!(&err, Error::Encryption(EncryptionError::NotEncrypted)), "{err:?}");
 	assert!(snapshot(&opts) == before, "a refused restore changed the files of the database");
 	let txn = tree.begin().unwrap();
 	assert_eq!(txn.get(key(0).as_slice()).unwrap(), Some(value('2', 0)));

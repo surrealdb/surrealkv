@@ -5,9 +5,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::error::{Error, Result};
-use crate::levels::LevelManifest;
+use crate::error::{EncryptionError, Error, Result};
+use crate::levels::{check_manifest_mode, LevelManifest};
 use crate::lsm::{fsync_directory, CoreInner};
+use crate::tde::EncryptionContext;
+use crate::vlog::sealed;
 use crate::Options;
 
 /// Recursively copies a directory and all its contents
@@ -342,6 +344,42 @@ fn sync_below(dir: &Path) -> std::io::Result<()> {
 		}
 	}
 	fsync_directory(dir)
+}
+
+/// Whether a value-log file of a checkpoint, whose first bytes are `head` and whose length is
+/// `len`, is of the kind that a database with the encryption `live` reads, see
+/// `DatabaseCheckpoint::check_vlog_mode`.
+///
+/// In a database that is encrypted a sealed file must be of this database and open with its key,
+/// and a plaintext file is `PlaintextInEncryptedDb`. In one that is not, a sealed file is
+/// `NotConfigured`.
+fn check_vlog_head(
+	live: Option<&EncryptionContext>,
+	id: u32,
+	is_newest: bool,
+	len: u64,
+	head: &[u8],
+) -> Result<()> {
+	let Some(context) = live else {
+		return if sealed::is_sealed_start(head) {
+			Err(EncryptionError::NotConfigured.into())
+		} else {
+			Ok(())
+		};
+	};
+	// A file that was cut off before its header was whole holds no entry. The whole of such a file
+	// is in `head`, which is at most a header long.
+	if is_newest && len <= sealed::SEALED_HEADER_LEN as u64 && sealed::is_torn(head) {
+		return Ok(());
+	}
+	if sealed::is_sealed_start(head) {
+		// The database, the file, the key and the tag, the order in which the log checks them.
+		return sealed::open_header(context, id, head, true).map(drop);
+	}
+	if sealed::is_plain_start(head) {
+		return Err(EncryptionError::PlaintextInEncryptedDb.into());
+	}
+	Err(Error::Corruption(format!("VLog file {id} of the checkpoint is not a value-log file")))
 }
 
 /// Current checkpoint metadata format version
@@ -799,8 +837,29 @@ impl DatabaseCheckpoint {
 		if !manifest_file.is_file() {
 			return Err(unusable("it has no manifest file".to_string()));
 		}
-		let levels = LevelManifest::load_from_file(&manifest_file, Arc::clone(&opts))
-			.map_err(|e| unusable(format!("its manifest and tables do not load: {e}")))?;
+
+		// Whether the checkpoint is encrypted, and is of this database and its suite, is read
+		// from the start of its manifest and of its value-log files, before anything of it is
+		// opened and without a key. An encryption error is the answer as it is: a checkpoint of
+		// another kind is not a damaged one, and none of them is a reason to remove anything.
+		let live = self.core.opts.encryption_context();
+		check_manifest_mode(live.map(Arc::as_ref), &manifest_file).map_err(|e| match e {
+			Error::Encryption(_) => e,
+			e => unusable(format!("its manifest is not usable: {e}")),
+		})?;
+		self.check_vlog_mode(checkpoint_path, live.map(Arc::as_ref)).map_err(|e| match e {
+			Error::Encryption(_) => e,
+			e => unusable(format!("its value log is not usable: {e}")),
+		})?;
+
+		// The tables are opened with the key of this database, which a checkpoint of it needs, and
+		// a table that does not open for want of one says so, and is not called damaged.
+		let levels = LevelManifest::load_from_file(&manifest_file, Arc::clone(&opts)).map_err(
+			|e| match e {
+				Error::Encryption(_) => e,
+				e => unusable(format!("its manifest and tables do not load: {e}")),
+			},
+		)?;
 
 		// The tables read their values from the value-log files the checkpoint copied
 		let oldest = levels.min_oldest_vlog_file_id();
@@ -810,6 +869,50 @@ impl DatabaseCheckpoint {
 			)));
 		}
 
+		Ok(())
+	}
+
+	/// Refuses a checkpoint whose value-log files are not of the kind of this database: sealed
+	/// files where it is not encrypted, plaintext files where it is, or sealed files of another
+	/// database or that its key does not open. A restore replaces the log of the database and then
+	/// reloads it, and a file that the reload refuses would leave nothing to go back to, so what
+	/// the reload would refuse is found here, from the first bytes of each file and without
+	/// building a log over the checkpoint, which could set a file aside inside it. Reads only.
+	///
+	/// A checkpoint copies the file that the writer of the log is appending to as it is at that
+	/// moment, which may be one that is cut off inside its header: it holds no entry, and the
+	/// reload sets it aside. Only the newest file can be that, as in the log itself.
+	fn check_vlog_mode(
+		&self,
+		checkpoint_path: &Path,
+		live: Option<&EncryptionContext>,
+	) -> Result<()> {
+		let io = |e| Error::Io(Arc::new(e));
+		let entries = match fs::read_dir(checkpoint_path.join("vlog")) {
+			Ok(entries) => entries,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+			Err(e) => return Err(io(e)),
+		};
+		let mut files = Vec::new();
+		for entry in entries {
+			let entry = entry.map_err(io)?;
+			if let Some(id) =
+				self.core.opts.extract_vlog_file_id(&entry.file_name().to_string_lossy())
+			{
+				files.push((id, entry.path()));
+			}
+		}
+		let Some(newest) = files.iter().map(|(id, _)| *id).max() else {
+			return Ok(());
+		};
+
+		for (id, path) in files {
+			let file = File::open(&path).map_err(io)?;
+			let len = file.metadata().map_err(io)?.len();
+			let mut head = Vec::with_capacity(sealed::SEALED_HEADER_LEN);
+			file.take(sealed::SEALED_HEADER_LEN as u64).read_to_end(&mut head).map_err(io)?;
+			check_vlog_head(live, id, id == newest, len, &head)?;
+		}
 		Ok(())
 	}
 

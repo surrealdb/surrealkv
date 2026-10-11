@@ -57,6 +57,8 @@ pub mod direct_l0_manifest_failure_tests;
 #[cfg(test)]
 pub mod direct_l0_read_order_tests;
 #[cfg(test)]
+pub mod encryption_checkpoint_tests;
+#[cfg(test)]
 pub mod encryption_open_tests;
 #[cfg(test)]
 pub mod flusher_alloc_diet_tests;

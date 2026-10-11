@@ -259,7 +259,7 @@ mod iter;
 mod level;
 mod mode;
 
-pub(crate) use mode::resolve_encryption;
+pub(crate) use mode::{check_manifest_mode, resolve_encryption};
 
 pub type HiddenSet = HashSet<u64>;
 

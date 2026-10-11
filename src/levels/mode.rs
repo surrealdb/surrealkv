@@ -121,6 +121,43 @@ pub(crate) fn resolve_encryption(opts: Arc<Options>) -> Result<Arc<Options>> {
 	Ok(with_context(opts, context))
 }
 
+/// Says whether the manifest at `manifest_path`, a checkpoint's, is of the kind that the database
+/// with the encryption `live` is: for the same database, with the same suite, or, if `live` is
+/// `None`, not encrypted. Reads the start of the file, needs no key and writes nothing.
+///
+/// A checkpoint that is not encrypted, for a database that is, is `NotEncrypted`. One that is
+/// encrypted, for a database that is not, is `NotConfigured`. One of another database is
+/// `DbIdMismatch` and one of another suite `SuiteMismatch`, after the database, which is told
+/// first. What cannot be told apart from damage without a key is left to the loader that opens
+/// the checkpoint with the key.
+pub(crate) fn check_manifest_mode(
+	live: Option<&EncryptionContext>,
+	manifest_path: &Path,
+) -> Result<()> {
+	let head = read_prefix(manifest_path)?.unwrap_or_default();
+	check_head_mode(live, &head)
+}
+
+/// The decision of [`check_manifest_mode`] for the first bytes of a manifest.
+fn check_head_mode(live: Option<&EncryptionContext>, head: &[u8]) -> Result<()> {
+	let kind = manifest_kind(head);
+	match (kind, live) {
+		(ManifestKind::Sealed, None) => Err(EncryptionError::NotConfigured.into()),
+		(ManifestKind::Sealed, Some(live)) => {
+			let described = describe_manifest(head)?;
+			if described.db_id != Some(live.db_id()) {
+				return Err(EncryptionError::DbIdMismatch.into());
+			}
+			if described.suite != Some(live.suite()) {
+				return Err(EncryptionError::SuiteMismatch.into());
+			}
+			Ok(())
+		}
+		(_, None) => Ok(()),
+		(kind, Some(_)) => Err(refuse_unsealed_manifest(kind)),
+	}
+}
+
 /// The context of a database that is being created: an identity that no other database has, and
 /// the suite that the preference resolves to, here and never again, since the answer depends on
 /// the machine and the database keeps it for good.

@@ -32,28 +32,29 @@ use crate::tde::{
 };
 use crate::{Error, Mode, Options, Tree};
 
-const SUITES: [CipherSuite; 2] = [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305];
+pub(super) const SUITES: [CipherSuite; 2] =
+	[CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305];
 
-const ROOT: [u8; ROOT_KEY_LEN] = [0x42; ROOT_KEY_LEN];
+pub(super) const ROOT: [u8; ROOT_KEY_LEN] = [0x42; ROOT_KEY_LEN];
 
-const KEYS: usize = 24;
+pub(super) const KEYS: usize = 24;
 
-fn key(i: usize) -> Vec<u8> {
+pub(super) fn key(i: usize) -> Vec<u8> {
 	format!("ek-{i:03}").into_bytes()
 }
 
 /// A value that is long enough to be moved to the value log, and holds a marker.
-fn value(round: char, i: usize) -> Vec<u8> {
+pub(super) fn value(round: char, i: usize) -> Vec<u8> {
 	format!("ev-canary-{round}-{i:03}-{}", "x".repeat(80)).into_bytes()
 }
 
-fn manager() -> Arc<SoftwareKeyManager> {
+pub(super) fn manager() -> Arc<SoftwareKeyManager> {
 	Arc::new(SoftwareKeyManager::new(ROOT))
 }
 
 /// Options of a database in `dir` whose values of 64 bytes or more go to the value log, and which
 /// does not flush when it is closed, so that a close leaves what was committed to the log.
-fn options(dir: &Path) -> Options {
+pub(super) fn options(dir: &Path) -> Options {
 	Options {
 		path: dir.to_path_buf(),
 		enable_vlog: true,
@@ -67,7 +68,7 @@ fn options(dir: &Path) -> Options {
 	}
 }
 
-fn encrypted(
+pub(super) fn encrypted(
 	dir: &Path,
 	key_manager: Arc<dyn KeyManager>,
 	preference: impl Into<CipherPreference>,
@@ -75,11 +76,11 @@ fn encrypted(
 	Arc::new(options(dir).with_encryption(key_manager, preference))
 }
 
-fn plain(dir: &Path) -> Arc<Options> {
+pub(super) fn plain(dir: &Path) -> Arc<Options> {
 	Arc::new(options(dir))
 }
 
-async fn write(tree: &Tree, round: char, range: Range<usize>) {
+pub(super) async fn write(tree: &Tree, round: char, range: Range<usize>) {
 	let mut txn = tree.begin().unwrap();
 	for i in range {
 		txn.set(key(i), value(round, i)).unwrap();
@@ -88,7 +89,7 @@ async fn write(tree: &Tree, round: char, range: Range<usize>) {
 }
 
 /// Reads every key of `expected`, which says in which round each was last written.
-fn read(tree: &Tree, expected: &BTreeMap<usize, char>) {
+pub(super) fn read(tree: &Tree, expected: &BTreeMap<usize, char>) {
 	let txn = tree.begin_with_mode(Mode::ReadOnly).unwrap();
 	for (&i, &round) in expected {
 		let found = txn.get(key(i).as_slice()).unwrap();
@@ -96,13 +97,17 @@ fn read(tree: &Tree, expected: &BTreeMap<usize, char>) {
 	}
 }
 
-fn rounds(round: char, range: Range<usize>) -> BTreeMap<usize, char> {
+pub(super) fn rounds(round: char, range: Range<usize>) -> BTreeMap<usize, char> {
 	range.map(|i| (i, round)).collect()
 }
 
 /// A database in `dir` that is created with `key_manager` and `suite`, holds `KEYS` keys in a
 /// table and in the value log, and some more in the log of the write-ahead log, and is closed.
-async fn create(dir: &Path, key_manager: Arc<dyn KeyManager>, suite: CipherSuite) -> Arc<Options> {
+pub(super) async fn create(
+	dir: &Path,
+	key_manager: Arc<dyn KeyManager>,
+	suite: CipherSuite,
+) -> Arc<Options> {
 	let opts = encrypted(dir, key_manager, suite);
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 	write(&tree, '1', 0..KEYS).await;
@@ -113,7 +118,7 @@ async fn create(dir: &Path, key_manager: Arc<dyn KeyManager>, suite: CipherSuite
 }
 
 /// Every file and directory under `root`, with the bytes of the files.
-fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+pub(super) fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
 	fn visit(dir: &Path, found: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
 		for entry in fs::read_dir(dir).unwrap().flatten() {
 			let path = entry.path();
@@ -134,7 +139,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
 	found
 }
 
-fn files_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
+pub(super) fn files_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
 	let Ok(entries) = fs::read_dir(dir) else {
 		return Vec::new();
 	};
@@ -147,18 +152,18 @@ fn files_with_extension(dir: &Path, extension: &str) -> Vec<PathBuf> {
 	files
 }
 
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+pub(super) fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 	haystack.windows(needle.len()).any(|window| window == needle)
 }
 
-fn open_error(opts: &Arc<Options>) -> Error {
+pub(super) fn open_error(opts: &Arc<Options>) -> Error {
 	match Tree::new(Arc::clone(opts)) {
 		Ok(_) => panic!("the database was opened"),
 		Err(err) => err,
 	}
 }
 
-fn encryption_error(err: Error, what: &str) -> EncryptionError {
+pub(super) fn encryption_error(err: Error, what: &str) -> EncryptionError {
 	match err {
 		Error::Encryption(inner) => inner,
 		other => panic!("{what}: expected an encryption error, got {other:?}"),
