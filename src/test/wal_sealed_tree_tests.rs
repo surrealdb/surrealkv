@@ -219,10 +219,19 @@ async fn the_markers_are_in_the_wal_of_a_plaintext_tree_so_that_their_absence_me
 
 /// Compression is applied before sealing, and what is compressed is sealed as well; the control is
 /// the same segment in plaintext, which still holds the first of each marker.
+///
+/// LZ4 keeps a string as it is only where nothing before it in the record repeats a piece of it,
+/// and the value marker repeats the start of the key marker. So each canary is written twice, with
+/// the key first and with the value first: the start of a record is always kept, and the control
+/// finds each marker where it starts one.
 #[test]
 fn a_compressed_segment_hides_the_markers_as_well_and_the_control_shows_them() {
-	let records: Vec<Vec<u8>> =
-		canaries().into_iter().map(|(key, value)| [key.into_bytes(), value].concat()).collect();
+	let records: Vec<Vec<u8>> = canaries()
+		.into_iter()
+		.flat_map(|(key, value)| {
+			[[key.clone().into_bytes(), value.clone()].concat(), [value, key.into_bytes()].concat()]
+		})
+		.collect();
 	for suite in SUITES {
 		let sealed_dir = TempDir::new().unwrap();
 		let enc = context(suite);
