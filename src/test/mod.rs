@@ -15,6 +15,8 @@ pub mod atomic_memtable_tests;
 #[cfg(test)]
 pub mod batch_tests;
 #[cfg(test)]
+pub mod block_io_tests;
+#[cfg(test)]
 pub mod block_read_tests;
 #[cfg(test)]
 pub mod block_tests;

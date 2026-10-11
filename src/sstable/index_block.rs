@@ -84,10 +84,9 @@ use std::io::Write;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
-use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
-use crate::sstable::block_io::BlockSource;
+use crate::sstable::block::{Block, BlockHandle, BlockIterator, BlockWriter};
+use crate::sstable::block_io::{BlockKind, BlockSink, BlockSource};
 use crate::sstable::error::SSTableError;
-use crate::sstable::table::{compress_block, write_block_at_offset};
 use crate::{CompressionType, Options};
 
 // =============================================================================
@@ -269,16 +268,6 @@ impl IndexWriter {
 		last_key
 	}
 
-	fn write_compressed_block<W: Write>(
-		writer: &mut W,
-		block: BlockData,
-		compression_type: CompressionType,
-		offset: usize,
-	) -> Result<(BlockHandle, usize)> {
-		let compressed_block = compress_block(block, compression_type)?;
-		write_block_at_offset(writer, compressed_block, compression_type, offset)
-	}
-
 	/// Writes all partition blocks and the top-level index to the file.
 	///
 	/// ## Process
@@ -292,6 +281,8 @@ impl IndexWriter {
 	/// 4. Return top-level index handle
 	/// ```
 	///
+	/// The blocks go through `sink`, which says where each one is.
+	///
 	/// ## Why last_key for Top-Level Entries?
 	///
 	/// The top-level index uses the LAST KEY of each partition block.
@@ -301,11 +292,10 @@ impl IndexWriter {
 	/// - Any key <= last_key might be in this partition
 	pub(crate) fn finish<W: Write>(
 		&mut self,
-		writer: &mut W,
+		sink: &mut BlockSink<W>,
 		compression_type: CompressionType,
-		mut offset: usize,
-	) -> Result<(BlockHandle, usize)> {
-		let start_offset = offset;
+	) -> Result<BlockHandle> {
+		let start_offset = sink.offset();
 
 		// Finish current block if it has entries
 		if self.current_block.entries() > 0 {
@@ -345,9 +335,8 @@ impl IndexWriter {
 			}
 
 			// Write partition block to file
-			let (block_handle, new_offset) =
-				Self::write_compressed_block(writer, block_data, compression_type, offset)?;
-			offset = new_offset;
+			let block_handle =
+				sink.write_block(BlockKind::IndexPartition, block_data, compression_type)?;
 
 			// Add to top-level: separator_key → partition_handle
 			top_level_index.add(&separator_key, &block_handle.encode())?;
@@ -356,12 +345,12 @@ impl IndexWriter {
 		// Write top-level index block
 		let top_level_data = top_level_index.finish()?;
 		self.top_level_index_size = top_level_data.len() as u64;
-		let (handle, final_offset) =
-			Self::write_compressed_block(writer, top_level_data, compression_type, offset)?;
+		let handle =
+			sink.write_block(BlockKind::TopLevelIndex, top_level_data, compression_type)?;
 
-		self.index_size = (final_offset - start_offset) as u64;
+		self.index_size = (sink.offset() - start_offset) as u64;
 
-		Ok((handle, final_offset))
+		Ok(handle)
 	}
 }
 
@@ -416,7 +405,11 @@ impl Index {
 		location: &BlockHandle,
 	) -> Result<Self> {
 		// Read and parse the top-level index block
-		let block = source.read_block(location, Arc::clone(&opt.internal_comparator))?;
+		let block = source.read_block(
+			BlockKind::TopLevelIndex,
+			location,
+			Arc::clone(&opt.internal_comparator),
+		)?;
 
 		let mut iter = block.iter()?;
 		let mut blocks = Vec::new();
@@ -520,9 +513,11 @@ impl Index {
 		}
 
 		// Cache miss: read from disk
-		let block_data = self
-			.source
-			.read_block(&block_handle.handle, Arc::clone(&self.opts.internal_comparator))?;
+		let block_data = self.source.read_block(
+			BlockKind::IndexPartition,
+			&block_handle.handle,
+			Arc::clone(&self.opts.internal_comparator),
+		)?;
 		let block = Arc::new(block_data);
 
 		// Insert into cache

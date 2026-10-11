@@ -41,7 +41,7 @@
 use std::sync::Arc;
 
 use crate::sstable::block::BlockHandle;
-use crate::sstable::block_io::BlockSource;
+use crate::sstable::block_io::{BlockKind, BlockSource};
 use crate::sstable::index_block::BlockHandleWithKey;
 use crate::{FilterPolicy, Options};
 
@@ -170,7 +170,11 @@ impl PartitionedFilterReader {
 		location: &BlockHandle,
 		policy: Arc<dyn FilterPolicy>,
 	) -> crate::Result<Self> {
-		let block = source.read_block(location, Arc::clone(&opts.internal_comparator))?;
+		let block = source.read_block(
+			BlockKind::FilterIndex,
+			location,
+			Arc::clone(&opts.internal_comparator),
+		)?;
 
 		let mut partitions = Vec::new();
 		let mut iter = block.iter()?;
@@ -226,7 +230,7 @@ impl PartitionedFilterReader {
 			if let Some(bits) = self.opts.block_cache.get_filter_partition(self.cache_id, offset) {
 				bits
 			} else {
-				match self.source.read_contents(&partition.handle) {
+				match self.source.read_contents(BlockKind::FilterPartition, &partition.handle) {
 					Ok(bytes) => {
 						let bytes = Arc::new(bytes);
 						self.opts.block_cache.insert_filter_partition(

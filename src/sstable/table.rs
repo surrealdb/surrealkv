@@ -72,13 +72,14 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crc32fast::Hasher as Crc32;
 use snap::raw::max_compress_len;
 
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
-use crate::sstable::block_io::BlockSource;
+#[cfg(test)]
+use crate::sstable::block_io::Protection;
+use crate::sstable::block_io::{BlockKind, BlockSink, BlockSource};
 use crate::sstable::error::SSTableError;
 use crate::sstable::filter_block::FilterBlockReader;
 use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
@@ -311,15 +312,13 @@ impl Footer {
 /// Index entry: separator="b" → DataBlock 1 handle
 /// ```
 pub(crate) struct TableWriter<W: Write> {
-	writer: W,
+	/// Writes the blocks and the footer, and knows where the next block goes.
+	sink: BlockSink<W>,
 	opts: Arc<Options>,
 	compression_selector: CompressionSelector,
 	target_level: u8,
 
 	pub(crate) meta: TableMetadata,
-
-	/// Current write offset in the file
-	offset: usize,
 
 	/// Last key of the previous block (for ordering validation)
 	prev_block_last_key: Vec<u8>,
@@ -349,6 +348,16 @@ pub(crate) struct TableWriter<W: Write> {
 
 impl<W: Write> TableWriter<W> {
 	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
+		Self::with_sink(BlockSink::new(writer), id, opts, target_level)
+	}
+
+	/// A writer that writes its blocks through `sink`.
+	pub(crate) fn with_sink(
+		sink: BlockSink<W>,
+		id: u64,
+		opts: Arc<Options>,
+		target_level: u8,
+	) -> Self {
 		let fb = opts
 			.filter_policy
 			.clone()
@@ -361,11 +370,10 @@ impl<W: Write> TableWriter<W> {
 		meta.properties.compression = compression_selector.select_compression(target_level);
 
 		TableWriter {
-			writer,
+			sink,
 			opts: Arc::clone(&opts),
 			compression_selector,
 			target_level,
-			offset: 0,
 			meta,
 			prev_block_last_key: Vec::new(),
 
@@ -387,7 +395,7 @@ impl<W: Write> TableWriter<W> {
 	/// over to a new output file.
 	pub(crate) fn estimated_file_size(&self) -> u64 {
 		let pending = self.data_block.as_ref().map_or(0, |b| b.size_estimate());
-		(self.offset + pending) as u64
+		(self.sink.offset() + pending) as u64
 	}
 
 	/// Adds a key-value pair to the table.
@@ -505,7 +513,7 @@ impl<W: Write> TableWriter<W> {
 		// Compress and write the block
 		let contents = block.finish()?;
 		let compression_type = self.compression_selector.select_compression(self.target_level);
-		let handle = self.write_compressed_block(contents, compression_type)?;
+		let handle = self.write_block(BlockKind::Data, contents, compression_type)?;
 
 		// Add index entry: separator_key → block_handle. If the filter's
 		// current partition is full, ask the index to cut here so filter and
@@ -596,13 +604,17 @@ impl<W: Write> TableWriter<W> {
 				);
 				let mut filter_bytes_total = 0u64;
 				for (separator, bits) in partitions {
-					let handle = self.write_compressed_block(bits, CompressionType::None)?;
+					let handle =
+						self.write_block(BlockKind::FilterPartition, bits, CompressionType::None)?;
 					filter_bytes_total += handle.size as u64;
 					filter_index.add(&separator, &handle.encode())?;
 				}
 				let filter_index_data = filter_index.finish()?;
-				let fi_handle =
-					self.write_compressed_block(filter_index_data, CompressionType::None)?;
+				let fi_handle = self.write_block(
+					BlockKind::FilterIndex,
+					filter_index_data,
+					CompressionType::None,
+				)?;
 				self.meta.properties.filter_size = filter_bytes_total + fi_handle.size as u64;
 				filter_index_entry = Some((filter_name, fi_handle));
 			}
@@ -610,9 +622,7 @@ impl<W: Write> TableWriter<W> {
 
 		// Write partitioned index blocks and top-level index
 		let compression_type = self.compression_selector.select_compression(self.target_level);
-		let (ix_handle, new_offset) =
-			self.partitioned_index.finish(&mut self.writer, compression_type, self.offset)?;
-		self.offset = new_offset;
+		let ix_handle = self.partitioned_index.finish(&mut self.sink, compression_type)?;
 
 		// Record index statistics
 		self.meta.properties.index_size = self.partitioned_index.index_size();
@@ -635,34 +645,22 @@ impl<W: Write> TableWriter<W> {
 
 		// Write meta index block
 		let meta_block = meta_ix_block.finish()?;
-		let meta_ix_handle = self.write_compressed_block(meta_block, CompressionType::None)?;
+		let meta_ix_handle =
+			self.write_block(BlockKind::MetaIndex, meta_block, CompressionType::None)?;
 
 		// Write footer
 		let footer = Footer::new(meta_ix_handle, ix_handle);
-		let mut buf = vec![0u8; TABLE_FULL_FOOTER_LENGTH];
-		footer.encode(&mut buf);
-
-		self.offset += self.writer.write(&buf[..])?;
-		self.writer.flush()?;
-		Ok(self.offset)
+		self.sink.write_footer(&footer)
 	}
 
-	/// Compresses and writes a block, returning its handle.
-	fn write_compressed_block(
+	/// Compresses and writes a block of the given kind, returning its handle.
+	fn write_block(
 		&mut self,
+		kind: BlockKind,
 		block_data: BlockData,
 		compression_type: CompressionType,
 	) -> Result<BlockHandle> {
-		let compressed_block = compress_block(block_data, compression_type)?;
-		let (handle, new_offset) = write_block_at_offset(
-			&mut self.writer,
-			compressed_block,
-			compression_type,
-			self.offset,
-		)?;
-		self.offset = new_offset;
-
-		Ok(handle)
+		self.sink.write_block(kind, block_data, compression_type)
 	}
 
 	fn update_meta_properties(&mut self, key: &InternalKey, value: &[u8]) {
@@ -705,33 +703,6 @@ impl<W: Write> TableWriter<W> {
 // BLOCK I/O UTILITIES
 // =============================================================================
 
-/// Writes a block to the file with compression type and checksum.
-///
-/// ## Block Format on Disk
-///
-/// ```text
-/// +------------------+-------------------+-----------------+
-/// | Block Data       | Compression Type  | Masked CRC32    |
-/// | (variable)       | (1 byte)          | (4 bytes)       |
-/// +------------------+-------------------+-----------------+
-/// ```
-pub(crate) fn write_block_at_offset<W: Write>(
-	writer: &mut W,
-	block: BlockData,
-	compression_type: CompressionType,
-	offset: usize,
-) -> Result<(BlockHandle, usize)> {
-	let cksum = calculate_checksum(&block, compression_type);
-	writer.write_all(&block)?;
-	writer.write_all(&[compression_type as u8; BLOCK_COMPRESS_LEN])?;
-	writer.write_all(&mask(cksum.finalize()).to_le_bytes())?;
-
-	let handle = BlockHandle::new(offset, block.len());
-	let new_offset = offset + block.len() + BLOCK_CKSUM_LEN + BLOCK_COMPRESS_LEN;
-
-	Ok((handle, new_offset))
-}
-
 /// Compresses block data using the specified compression type.
 pub(crate) fn compress_block(
 	raw_block: BlockData,
@@ -766,14 +737,6 @@ pub(crate) fn decompress_block(
 			.map_err(|e| Error::Decompression(e.to_string())),
 		CompressionType::None => Ok(Vec::from(compressed_block)),
 	}
-}
-
-/// Calculates CRC32 checksum for a block.
-pub(crate) fn calculate_checksum(block: &[u8], compression_type: CompressionType) -> Crc32 {
-	let mut cksum = Crc32::new();
-	cksum.update(block);
-	cksum.update(&[compression_type as u8; BLOCK_COMPRESS_LEN]);
-	cksum
 }
 
 pub(crate) fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
@@ -869,8 +832,33 @@ impl Table {
 		file: Arc<dyn File>,
 		file_size: u64,
 	) -> Result<Table> {
-		// Step 1: Read footer
 		let (source, footer) = BlockSource::open(file, file_size)?;
+		Self::from_source(id, opts, file_size, source, footer)
+	}
+
+	/// Opens a table file whose blocks are protected as `protection_for` says once the footer is
+	/// read, which a table with sealed blocks needs and `new` does not.
+	#[cfg(test)]
+	pub(crate) fn open_with(
+		id: u64,
+		opts: Arc<Options>,
+		file: Arc<dyn File>,
+		file_size: u64,
+		protection_for: impl FnOnce(&Footer) -> Result<Protection>,
+	) -> Result<Table> {
+		let (source, footer) = BlockSource::open_with(file, file_size, protection_for)?;
+		Self::from_source(id, opts, file_size, source, footer)
+	}
+
+	/// Opens a table from the source of its blocks and its footer.
+	fn from_source(
+		id: u64,
+		opts: Arc<Options>,
+		file_size: u64,
+		source: BlockSource,
+		footer: Footer,
+	) -> Result<Table> {
+		// Step 1: The footer was read when the source was opened
 
 		let cache_id = crate::cache::next_instance_id();
 
@@ -882,8 +870,11 @@ impl Table {
 		};
 
 		// Step 3: Load meta index block
-		let metaindexblock =
-			source.read_block(&footer.meta_index, Arc::clone(&opts.internal_comparator))?;
+		let metaindexblock = source.read_block(
+			BlockKind::MetaIndex,
+			&footer.meta_index,
+			Arc::clone(&opts.internal_comparator),
+		)?;
 
 		// Step 4: Extract metadata
 		let writer_metadata =
@@ -979,7 +970,11 @@ impl Table {
 		}
 
 		// Cache miss: read from disk
-		let b = self.source.read_block(location, Arc::clone(&self.opts.internal_comparator))?;
+		let b = self.source.read_block(
+			BlockKind::Data,
+			location,
+			Arc::clone(&self.opts.internal_comparator),
+		)?;
 		let b = Arc::new(b);
 
 		// Insert into cache
@@ -1009,7 +1004,7 @@ impl Table {
 		}
 
 		// Cache miss: read from disk
-		let b = self.source.read_block(location, comparator)?;
+		let b = self.source.read_block(BlockKind::Data, location, comparator)?;
 		let b = Arc::new(b);
 
 		// Insert into history cache
@@ -1034,7 +1029,7 @@ impl Table {
 		// The block and its trailer are read in one request through the object store
 		let block = self
 			.source
-			.read_block_async(location, Arc::clone(&self.opts.internal_comparator))
+			.read_block_async(BlockKind::Data, location, Arc::clone(&self.opts.internal_comparator))
 			.await?;
 		let b = Arc::new(block);
 

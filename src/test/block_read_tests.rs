@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::sstable::block::BlockHandle;
-use crate::sstable::block_io::BlockSource;
+use crate::sstable::block_io::{BlockKind, BlockSource};
 use crate::sstable::error::SSTableError;
 use crate::sstable::table::{mask, Table, TableWriter, TABLE_FULL_FOOTER_LENGTH};
 use crate::vfs::File;
@@ -213,7 +213,7 @@ fn a_handle_that_does_not_fit_the_file_is_refused_before_anything_is_read_or_all
 
 	let refused = |handle: BlockHandle| {
 		matches!(
-			source.read_contents(&handle),
+			source.read_contents(BlockKind::Data, &handle),
 			Err(Error::SSTable(SSTableError::BlockHandleOutOfBounds { .. }))
 		)
 	};
@@ -227,7 +227,7 @@ fn a_handle_that_does_not_fit_the_file_is_refused_before_anything_is_read_or_all
 	assert!(refused(BlockHandle::new(0, 946)));
 	assert!(refused(BlockHandle::new(100, 846)));
 	assert!(matches!(
-		source.read_block(&BlockHandle::new(0, usize::MAX / 2), Arc::clone(&cmp)),
+		source.read_block(BlockKind::Data, &BlockHandle::new(0, usize::MAX / 2), Arc::clone(&cmp)),
 		Err(Error::SSTable(SSTableError::BlockHandleOutOfBounds { .. }))
 	));
 }
@@ -238,7 +238,7 @@ async fn the_asynchronous_path_refuses_a_handle_that_does_not_fit_the_file() {
 	let cmp = Arc::clone(&Options::default().internal_comparator);
 
 	for handle in [BlockHandle::new(0, usize::MAX / 2), BlockHandle::new(100, 846)] {
-		let result = source.read_block_async(&handle, Arc::clone(&cmp)).await;
+		let result = source.read_block_async(BlockKind::Data, &handle, Arc::clone(&cmp)).await;
 		assert!(
 			matches!(result, Err(Error::SSTable(SSTableError::BlockHandleOutOfBounds { .. }))),
 			"{handle:?}"
@@ -251,7 +251,7 @@ fn a_block_that_ends_where_the_footer_begins_is_read() {
 	// The block of 945 bytes and its trailer end exactly at the footer, so the handle is
 	// accepted, and it is the checksum that refuses the zeros.
 	let source = BlockSource::new(Arc::new(vec![0u8; 1000]), 1000);
-	let result = source.read_contents(&BlockHandle::new(0, 945));
+	let result = source.read_contents(BlockKind::Data, &BlockHandle::new(0, 945));
 	assert!(
 		matches!(
 			result,
@@ -267,7 +267,7 @@ fn a_block_that_ends_where_the_footer_begins_is_read() {
 fn a_file_that_is_shorter_than_its_size_is_an_error_not_a_block_of_zeros() {
 	// 200 bytes of file, a size of 1000 and a handle that is inside the size and past the file.
 	let source = BlockSource::new(Arc::new(vec![0u8; 200]), 1000);
-	let err = source.read_contents(&BlockHandle::new(100, 400)).unwrap_err();
+	let err = source.read_contents(BlockKind::Data, &BlockHandle::new(100, 400)).unwrap_err();
 	assert!(is_unexpected_eof(&err), "{err:?}");
 }
 
@@ -275,7 +275,7 @@ fn a_file_that_is_shorter_than_its_size_is_an_error_not_a_block_of_zeros() {
 async fn the_asynchronous_path_reports_a_file_that_is_shorter_than_its_size() {
 	let source = BlockSource::new(Arc::new(vec![0u8; 200]), 1000);
 	let cmp = Arc::clone(&Options::default().internal_comparator);
-	let result = source.read_block_async(&BlockHandle::new(100, 400), cmp).await;
+	let result = source.read_block_async(BlockKind::Data, &BlockHandle::new(100, 400), cmp).await;
 	let err = result.err().expect("a block past the end of the file is an error");
 	assert!(is_unexpected_eof(&err), "{err:?}");
 }
@@ -325,10 +325,10 @@ fn a_block_that_is_too_small_to_decode_is_an_error_not_a_panic() {
 	let source = BlockSource::new(Arc::new(file), size);
 
 	let handle = BlockHandle::new(0, 3);
-	assert_eq!(source.read_contents(&handle).unwrap(), contents);
+	assert_eq!(source.read_contents(BlockKind::Data, &handle).unwrap(), contents);
 
 	let cmp = Arc::clone(&Options::default().internal_comparator);
-	let result = source.read_block(&handle, cmp);
+	let result = source.read_block(BlockKind::Data, &handle, cmp);
 	assert!(
 		matches!(
 			result,
