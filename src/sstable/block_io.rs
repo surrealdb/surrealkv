@@ -218,9 +218,6 @@ pub(crate) fn verify_trailer(layout: TrailerLayout, unit: &[u8], block_offset: u
 /// What a sealer is told about the block that it seals or opens, which is what it binds to the
 /// block besides the file that it keeps: where the block is, what it is for, and how it was
 /// compressed.
-///
-/// No sealer is built yet, so nothing reads these fields outside of tests.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BlockContext {
 	pub(crate) kind: BlockKind,
@@ -258,7 +255,6 @@ pub(crate) enum Protection {
 	/// A CRC32 and nothing else, with the plain trailer.
 	Plain,
 	/// Sealed blocks with the sealed trailer.
-	#[cfg_attr(not(test), allow(dead_code))]
 	Sealed(Arc<dyn BlockSealer>),
 }
 
@@ -298,7 +294,6 @@ pub(crate) struct FileStart {
 pub(crate) trait FileStarter: Send + Sync {
 	/// The length of the header that `start` returns. The first block of the file goes after
 	/// it, so the sink knows where blocks are before it has asked for the header.
-	#[cfg_attr(not(test), allow(dead_code))]
 	fn header_len(&self) -> usize;
 
 	/// Makes the start of the file. A sink calls it once, and ends if it fails.
@@ -650,7 +645,6 @@ impl<W: Write> BlockSink<W> {
 	/// A sink for a file that begins with the header that `starter` makes, and whose blocks are
 	/// sealed by what the starter returns with it. Nothing is asked of the starter, and nothing
 	/// is written, until the first block or the footer is.
-	#[cfg_attr(not(test), allow(dead_code))]
 	pub(crate) fn deferred(writer: W, starter: Box<dyn FileStarter>) -> Self {
 		Self {
 			writer,

@@ -10,6 +10,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use surrealkv::tde::{DbId, EncryptionContext};
 use surrealkv::{
 	CipherPreference,
 	CipherSuite,
@@ -104,6 +105,37 @@ fn validate_rejects_key_manager() {
 		let opts = options_with_key_manager(Path::new("unused"), suite);
 		assert_encryption_refused(opts.validate().unwrap_err());
 	}
+}
+
+/// A context that the engine resolved, set on the options by hand and with no key manager: the
+/// SSTables would be sealed and the other files would not, so it is refused like a key manager.
+fn options_with_context(path: &Path) -> Options {
+	let key_manager: Arc<dyn KeyManager> = Arc::new(SoftwareKeyManager::new([0x5a; 32]));
+	let context = EncryptionContext::new(
+		key_manager,
+		DbId::from_bytes([0x07; 16]),
+		CipherSuite::XChaCha20Poly1305,
+	);
+	let mut opts = Options::new().with_path(path.to_path_buf());
+	opts.encryption_context = Some(Arc::new(context));
+	opts
+}
+
+#[test]
+fn validate_rejects_a_resolved_encryption_context() {
+	let opts = options_with_context(Path::new("unused"));
+	assert!(opts.key_manager.is_none());
+	assert_encryption_refused(opts.validate().unwrap_err());
+}
+
+#[tokio::test]
+async fn build_rejects_a_resolved_encryption_context_and_creates_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	let db_path = dir.path().join("db");
+
+	let opts = options_with_context(&db_path);
+	assert_encryption_refused(expect_err(TreeBuilder::with_options(opts).build()));
+	assert!(!db_path.exists(), "a rejected build must not create the directory");
 }
 
 #[tokio::test]

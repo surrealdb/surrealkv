@@ -1,9 +1,10 @@
 //! Tests of the trailer layouts, of `BlockSink` and `BlockSource`, and of what they do with a
 //! sealer.
 //!
-//! There is no real sealer yet. `ToySealer` is one that is good enough to tell the tests whether
-//! the seam gives a sealer what it must be given, and whether a block that does not open is
-//! stopped before it is decompressed. It is not a cipher.
+//! The sealer of a table is `SstSealer`, which is tested with the real ciphers in
+//! `sstable_encryption_tests`. `ToySealer` is one that is good enough to tell the tests here
+//! whether the seam gives a sealer what it must be given, and whether a block that does not open
+//! is stopped before it is decompressed. It is not a cipher.
 
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -974,7 +975,7 @@ fn a_header_that_is_not_as_long_as_it_was_said_to_be_is_refused() {
 /// The blocks of a sealed file, `(offset, size)` in file order, found from its end with nothing
 /// but the trailers: the trailer before the footer says how long the last block is, which is
 /// where the one before it ends, and so on up to the header. Every checksum is checked here.
-fn extents_from_the_end(file: &[u8], header_len: usize) -> Vec<(usize, usize)> {
+pub(crate) fn extents_from_the_end(file: &[u8], header_len: usize) -> Vec<(usize, usize)> {
 	let mut extents = Vec::new();
 	let mut end = file.len() - TABLE_FULL_FOOTER_LENGTH;
 	while end > header_len {

@@ -7,4 +7,5 @@ pub(crate) mod index_block;
 pub(crate) mod meta;
 pub(crate) mod partitioned_filter;
 pub(crate) mod ribbon;
+pub(crate) mod sealed;
 pub(crate) mod table;

@@ -89,6 +89,7 @@ use crate::sstable::filter_block::FilterBlockReader;
 use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
 use crate::sstable::meta::TableMetadata;
 use crate::sstable::partitioned_filter::{PartitionedFilterReader, PartitionedFilterWriter};
+use crate::sstable::sealed::SstStarter;
 use crate::vfs::File;
 use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{
@@ -369,8 +370,21 @@ pub(crate) struct TableWriter<W: Write> {
 }
 
 impl<W: Write> TableWriter<W> {
+	/// A writer of table `id`. If the options carry the encryption context of the database the
+	/// table is sealed, and its file is started when its first block is written: the key of the
+	/// file is taken then, so a key that cannot be had is the error of `add` or `finish` and
+	/// not of this call, and no key is held by a writer that never writes.
+	///
+	/// Every writer takes a key of its own, also for an id that was used before: a table that is
+	/// written again after a crash, or by a compaction that was retried, is another file.
 	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
-		Self::with_sink(BlockSink::new(writer), id, opts, target_level)
+		let sink = match opts.encryption_context() {
+			Some(context) => {
+				BlockSink::deferred(writer, Box::new(SstStarter::new(Arc::clone(context), id)))
+			}
+			None => BlockSink::new(writer),
+		};
+		Self::with_sink(sink, id, opts, target_level)
 	}
 
 	/// A writer that writes its blocks through `sink`.

@@ -107,6 +107,8 @@ pub mod rotate_vlog_race_tests;
 #[cfg(test)]
 pub mod snapshot_tests;
 #[cfg(test)]
+pub mod sstable_encryption_tests;
+#[cfg(test)]
 pub mod sstable_layout_tests;
 #[cfg(test)]
 pub mod sstable_tests;

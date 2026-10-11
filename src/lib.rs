@@ -396,8 +396,7 @@ impl Options {
 	}
 
 	/// The resolved encryption context, if this database is encrypted.
-	// The writers and readers of each file kind take it in the commits that follow.
-	#[allow(dead_code)]
+	// The writers and readers of SSTables take it, and those of the other kinds of file will.
 	pub(crate) fn encryption_context(&self) -> Option<&Arc<EncryptionContext>> {
 		self.encryption_context.as_ref()
 	}
@@ -675,13 +674,15 @@ impl Options {
 	/// This should be called when the store starts to catch configuration
 	/// errors early
 	pub fn validate(&self) -> Result<()> {
-		// Encryption at rest is not wired into any SSTable, WAL or value-log path yet, so a
-		// configured key manager would be accepted and then ignored, leaving every file in
-		// plaintext. Refuse here, which is the first thing `Tree::new` does, so a rejection
-		// creates nothing on disk. Compiled out only for this crate's own unit tests and under
-		// the non-default `encryption-preview` feature, which exist to build the missing parts.
+		// Encryption at rest is not wired into every SSTable, WAL or value-log path yet, so a
+		// configured key manager would be accepted and then leave files in plaintext. Refuse
+		// here, which is the first thing `Tree::new` does, so a rejection creates nothing on
+		// disk. A resolved context is refused as well: it is a public field, and it is what
+		// makes the tables sealed while the other files would not be. Compiled out only for this
+		// crate's own unit tests and under the non-default `encryption-preview` feature, which
+		// exist to build the missing parts.
 		#[cfg(not(any(test, feature = "encryption-preview")))]
-		if self.key_manager.is_some() {
+		if self.key_manager.is_some() || self.encryption_context.is_some() {
 			return Err(Error::InvalidArgument(
 				"Encryption at rest is not implemented yet: the key manager would be accepted \
 				 but no SSTable, WAL or value-log data would be encrypted. Refusing to open \
