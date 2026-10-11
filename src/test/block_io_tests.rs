@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::error::{Error, Result};
+use crate::error::{EncryptionError, Error, KeyProviderFailure, Result};
 use crate::sstable::block::BlockHandle;
 use crate::sstable::block_io::{
 	verify_trailer,
@@ -18,6 +18,8 @@ use crate::sstable::block_io::{
 	BlockSealer,
 	BlockSink,
 	BlockSource,
+	FileStart,
+	FileStarter,
 	Protection,
 	Trailer,
 	TrailerLayout,
@@ -25,7 +27,15 @@ use crate::sstable::block_io::{
 	SEALED_TRAILER_LEN,
 };
 use crate::sstable::error::SSTableError;
-use crate::sstable::table::{mask, Footer, Table, TableWriter, TABLE_FULL_FOOTER_LENGTH};
+use crate::sstable::table::{
+	mask,
+	ChecksumType,
+	Footer,
+	Table,
+	TableWriter,
+	TABLE_FULL_FOOTER_LENGTH,
+};
+use crate::vfs::File;
 use crate::{CompressionType, InternalKey, InternalKeyKind, Options, INTERNAL_KEY_SEQ_NUM_MAX};
 
 const ALL_KINDS: [BlockKind; 6] = [
@@ -289,10 +299,23 @@ fn a_unit_shorter_than_its_trailer_is_an_error() {
 // ========== The bytes that a sink writes ==========
 
 /// What the footer holds for a table whose meta-index is the handle `(meta, 0)` and whose
-/// top-level index is the handle `(0, 5)`: format 1, checksum 1, the handles as varints, zeros
-/// up to byte 42 and the magic number.
-fn expected_footer(meta_offset: u8) -> String {
-	format!("0101{meta_offset:02x}000005{}57fb808b247547db", "00".repeat(36))
+/// top-level index is the handle `(0, 5)`: format 1, the checksum type that says how the blocks
+/// are laid out, the handles as varints, zeros up to byte 42 and the magic number.
+fn expected_footer(checksum_type: u8, meta_offset: u8) -> String {
+	expected_footer_of(checksum_type, (meta_offset, 0), (0, 5))
+}
+
+/// The footer of a table with the handles `meta` and `index`, which are small enough to be one
+/// byte each in a varint.
+fn expected_footer_of(checksum_type: u8, meta: (u8, u8), index: (u8, u8)) -> String {
+	format!(
+		"01{checksum_type:02x}{:02x}{:02x}{:02x}{:02x}{}57fb808b247547db",
+		meta.0,
+		meta.1,
+		index.0,
+		index.1,
+		"00".repeat(36)
+	)
 }
 
 #[test]
@@ -308,7 +331,7 @@ fn a_sink_writes_blocks_with_the_plain_trailer_and_a_footer() {
 	assert_eq!((first, second), (BlockHandle::new(0, 5), BlockHandle::new(10, 0)));
 	assert_eq!(size, 65);
 	let expected =
-		[hex("68656c6c6f"), hex("00b7980055"), hex("00dd8e9e81"), hex(&expected_footer(10))]
+		[hex("68656c6c6f"), hex("00b7980055"), hex("00dd8e9e81"), hex(&expected_footer(1, 10))]
 			.concat();
 	assert_eq!(file, expected);
 }
@@ -329,7 +352,7 @@ fn a_sink_with_a_sealer_writes_blocks_with_the_sealed_trailer_and_a_footer() {
 		hex("68656c6c6f"),
 		hex("0005000000984f0510"),
 		hex("00000000001d77be90"),
-		hex(&expected_footer(14)),
+		hex(&expected_footer(2, 14)),
 	]
 	.concat();
 	assert_eq!(file, expected);
@@ -734,4 +757,481 @@ fn a_table_with_sealed_blocks_has_no_legacy_filter() {
 	let sealer = ToySealer::new(9);
 	let (_, handles, source) = sealed_file(&sealer);
 	assert!(source.read_legacy_filter(&handles[0]).is_err());
+}
+
+// ========== A file that begins with a header ==========
+
+const TOY_HEADER: &[u8] = b"toy-header";
+
+/// Starts a file with `TOY_HEADER` and a sealer that it shares with the test, and counts how many
+/// times it was asked to. It can fail, and it can say that its header is not the length that it
+/// has.
+struct ToyStarter {
+	sealer: Arc<ToySealer>,
+	declared_len: usize,
+	fail: bool,
+	calls: Arc<AtomicUsize>,
+}
+
+impl ToyStarter {
+	fn boxed(sealer: &Arc<ToySealer>) -> (Box<Self>, Arc<AtomicUsize>) {
+		Self::with(sealer, TOY_HEADER.len(), false)
+	}
+
+	fn with(
+		sealer: &Arc<ToySealer>,
+		declared_len: usize,
+		fail: bool,
+	) -> (Box<Self>, Arc<AtomicUsize>) {
+		let calls = Arc::new(AtomicUsize::new(0));
+		let starter = Box::new(Self {
+			sealer: Arc::clone(sealer),
+			declared_len,
+			fail,
+			calls: Arc::clone(&calls),
+		});
+		(starter, calls)
+	}
+}
+
+impl FileStarter for ToyStarter {
+	fn header_len(&self) -> usize {
+		self.declared_len
+	}
+
+	fn start(self: Box<Self>) -> Result<FileStart> {
+		self.calls.fetch_add(1, Ordering::SeqCst);
+		if self.fail {
+			return Err(Error::Encryption(EncryptionError::KeyProvider(
+				KeyProviderFailure::Unavailable,
+			)));
+		}
+		let sealer: Arc<ToySealer> = Arc::clone(&self.sealer);
+		Ok(FileStart {
+			header: TOY_HEADER.to_vec(),
+			sealer,
+		})
+	}
+}
+
+/// The table of `write_table` written into a file that begins with `TOY_HEADER`.
+fn write_table_after_a_header(opts: &Arc<Options>, sealer: &Arc<ToySealer>) -> Vec<u8> {
+	let mut file = Vec::new();
+	{
+		let (starter, _) = ToyStarter::boxed(sealer);
+		let sink = BlockSink::deferred(&mut file, starter);
+		let mut writer = TableWriter::with_sink(sink, 1, Arc::clone(opts), 0);
+		for i in 0..KEYS {
+			let key = InternalKey::new(
+				format!("key{i:04}").into_bytes(),
+				(i + 1) as u64,
+				InternalKeyKind::Set,
+			);
+			writer.add(key, &value(i)).unwrap();
+		}
+		writer.finish().unwrap();
+	}
+	file
+}
+
+#[test]
+fn a_sink_with_a_starter_writes_the_header_first_and_the_blocks_after_it() {
+	let sealer = ToySealer::new(5);
+	let (starter, calls) = ToyStarter::boxed(&sealer);
+	let mut file = Vec::new();
+	{
+		let mut sink = BlockSink::deferred(&mut file, starter);
+
+		// Nothing was asked of the starter and nothing was written, and the sink knows where the
+		// first block goes.
+		assert_eq!(sink.offset(), TOY_HEADER.len());
+		assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+		// A block of 5 bytes is 21 once sealed, and its trailer is 9.
+		let first =
+			sink.write_block(BlockKind::Data, b"hello".to_vec(), CompressionType::None).unwrap();
+		assert_eq!(calls.load(Ordering::SeqCst), 1);
+		assert_eq!(first, BlockHandle::new(10, 21));
+		assert_eq!(sink.offset(), 40);
+		let second =
+			sink.write_block(BlockKind::MetaIndex, Vec::new(), CompressionType::None).unwrap();
+		assert_eq!(second, BlockHandle::new(40, 16));
+
+		let size = sink.write_footer(&Footer::new(second, first)).unwrap();
+		assert_eq!(size, 40 + 16 + SEALED_TRAILER_LEN + TABLE_FULL_FOOTER_LENGTH);
+		assert_eq!(calls.load(Ordering::SeqCst), 1, "a file is started once");
+	}
+
+	assert_eq!(file.len(), 115);
+	assert_eq!(&file[..TOY_HEADER.len()], TOY_HEADER);
+	// The footer says that the blocks are sealed, whatever footer the caller gave the sink, and
+	// holds the handles and nothing else.
+	assert_eq!(file[65..], hex(&expected_footer_of(2, (40, 16), (10, 21))));
+	assert_eq!(sealer.sealed(), vec![(BlockKind::Data, 10, 21), (BlockKind::MetaIndex, 40, 16)]);
+}
+
+#[test]
+fn a_sink_that_is_not_written_to_does_not_start_its_file() {
+	let sealer = ToySealer::new(5);
+	let (starter, calls) = ToyStarter::boxed(&sealer);
+	let mut file = Vec::new();
+	drop(BlockSink::deferred(&mut file, starter));
+	assert_eq!(calls.load(Ordering::SeqCst), 0);
+	assert!(file.is_empty());
+}
+
+#[test]
+fn a_file_without_a_block_is_started_by_its_footer() {
+	let sealer = ToySealer::new(5);
+	let (starter, calls) = ToyStarter::boxed(&sealer);
+	let mut file = Vec::new();
+	let size = {
+		let mut sink = BlockSink::deferred(&mut file, starter);
+		sink.write_footer(&Footer::new(BlockHandle::new(10, 0), BlockHandle::new(10, 0))).unwrap()
+	};
+	assert_eq!(calls.load(Ordering::SeqCst), 1);
+	assert_eq!(size, TOY_HEADER.len() + TABLE_FULL_FOOTER_LENGTH);
+	assert_eq!(file.len(), size);
+	assert_eq!(&file[..TOY_HEADER.len()], TOY_HEADER);
+	assert_eq!(file[10..], hex(&expected_footer_of(2, (10, 0), (10, 0))));
+}
+
+#[test]
+fn a_starter_that_fails_ends_the_sink_and_nothing_is_written() {
+	let sealer = ToySealer::new(5);
+	let (starter, calls) = ToyStarter::with(&sealer, TOY_HEADER.len(), true);
+	let mut file = Vec::new();
+	{
+		let mut sink = BlockSink::deferred(&mut file, starter);
+		let err = sink
+			.write_block(BlockKind::Data, b"hello".to_vec(), CompressionType::None)
+			.unwrap_err();
+		// The failure is the one the starter had, so a caller can tell a key that was not
+		// available from damage.
+		assert!(
+			matches!(
+				err,
+				Error::Encryption(EncryptionError::KeyProvider(KeyProviderFailure::Unavailable))
+			),
+			"{err:?}"
+		);
+		assert_eq!(sink.offset(), TOY_HEADER.len());
+
+		// The sink does not try again: a file is started once, and a failure ends it.
+		assert!(sink
+			.write_block(BlockKind::Data, b"hello".to_vec(), CompressionType::None)
+			.is_err());
+		let footer = Footer::new(BlockHandle::new(10, 0), BlockHandle::new(10, 0));
+		assert!(sink.write_footer(&footer).is_err());
+	}
+	assert_eq!(calls.load(Ordering::SeqCst), 1);
+	assert!(file.is_empty(), "nothing is written for a file that could not be started");
+	assert!(sealer.sealed().is_empty());
+}
+
+#[test]
+fn a_header_that_cannot_be_written_ends_the_sink_before_a_block_is_sealed() {
+	let sealer = ToySealer::new(5);
+	let (starter, _) = ToyStarter::boxed(&sealer);
+	let mut writer = FailingWriter {
+		written: Vec::new(),
+		calls: 0,
+		fail_on: 1,
+	};
+	{
+		let mut sink = BlockSink::deferred(&mut writer, starter);
+		assert!(sink
+			.write_block(BlockKind::Data, b"hello".to_vec(), CompressionType::None)
+			.is_err());
+		assert!(sink
+			.write_block(BlockKind::Data, b"hello".to_vec(), CompressionType::None)
+			.is_err());
+	}
+	assert_eq!(writer.calls, 1, "no write was attempted after the one that failed");
+	assert!(writer.written.is_empty());
+	assert!(sealer.sealed().is_empty(), "no block was sealed in a file that has no header");
+}
+
+#[test]
+fn a_header_that_is_not_as_long_as_it_was_said_to_be_is_refused() {
+	// The first block goes where the sink was told, so a header of another length would put the
+	// positions that blocks are sealed for and the offsets in their handles in different places.
+	for declared in [TOY_HEADER.len() - 1, TOY_HEADER.len() + 1] {
+		let sealer = ToySealer::new(5);
+		let (starter, _) = ToyStarter::with(&sealer, declared, false);
+		let mut file = Vec::new();
+		{
+			let mut sink = BlockSink::deferred(&mut file, starter);
+			assert!(sink
+				.write_block(BlockKind::Data, b"hello".to_vec(), CompressionType::None)
+				.is_err());
+		}
+		assert!(file.is_empty(), "declared {declared}");
+		assert!(sealer.sealed().is_empty(), "declared {declared}");
+	}
+}
+
+/// The blocks of a sealed file, `(offset, size)` in file order, found from its end with nothing
+/// but the trailers: the trailer before the footer says how long the last block is, which is
+/// where the one before it ends, and so on up to the header. Every checksum is checked here.
+fn extents_from_the_end(file: &[u8], header_len: usize) -> Vec<(usize, usize)> {
+	let mut extents = Vec::new();
+	let mut end = file.len() - TABLE_FULL_FOOTER_LENGTH;
+	while end > header_len {
+		let trailer = &file[end - SEALED_TRAILER_LEN..end];
+		let len = u32::from_le_bytes(trailer[1..5].try_into().unwrap()) as usize;
+		let start = (end - SEALED_TRAILER_LEN)
+			.checked_sub(len)
+			.expect("a block that is longer than the file");
+		let stored = u32::from_le_bytes(trailer[5..9].try_into().unwrap());
+		let crc = stored.wrapping_sub(0xa282_ead8).rotate_left(15);
+		assert_eq!(crc32fast::hash(&file[start..end - 4]), crc, "checksum of the block at {start}");
+		extents.push((start, len));
+		end = start;
+	}
+	assert_eq!(end, header_len, "the first block starts where the header ends");
+	extents.reverse();
+	extents
+}
+
+#[test]
+fn every_byte_of_a_file_with_a_header_belongs_to_the_header_a_block_or_the_footer() {
+	for compression in [CompressionType::None, CompressionType::SnappyCompression] {
+		let opts = table_options(compression);
+		let sealer = ToySealer::new(0x33);
+		let file = write_table_after_a_header(&opts, &sealer);
+
+		// The header, then blocks that follow one another, then the footer.
+		assert_eq!(&file[..TOY_HEADER.len()], TOY_HEADER);
+		let extents = extents_from_the_end(&file, TOY_HEADER.len());
+		let sealed = sealer.sealed();
+		let mut ordered: Vec<(BlockKind, usize, usize)> =
+			sealed.iter().map(|(kind, offset, len)| (*kind, *offset as usize, *len)).collect();
+		ordered.sort_by_key(|(_, offset, _)| *offset);
+		assert_eq!(
+			ordered.iter().map(|(_, offset, len)| (*offset, *len)).collect::<Vec<_>>(),
+			extents,
+			"{compression:?}: the blocks that the sealer was asked for are the ones in the file"
+		);
+		let mut next = TOY_HEADER.len();
+		for (offset, len) in &extents {
+			assert_eq!(*offset, next);
+			next = offset + len + SEALED_TRAILER_LEN;
+		}
+		assert_eq!(next, file.len() - TABLE_FULL_FOOTER_LENGTH);
+
+		// All six kinds are there, and in the order that they are written in.
+		let kinds: Vec<BlockKind> = ordered.iter().map(|(kind, ..)| *kind).collect();
+		assert_eq!(kinds.first(), Some(&BlockKind::Data));
+		assert_eq!(kinds[kinds.len() - 2..], [BlockKind::TopLevelIndex, BlockKind::MetaIndex]);
+		for kind in ALL_KINDS {
+			assert!(kinds.contains(&kind), "{compression:?}: no {kind:?} block");
+		}
+	}
+}
+
+#[test]
+fn a_table_written_after_a_header_is_read_back() {
+	for compression in [CompressionType::None, CompressionType::SnappyCompression] {
+		let opts = table_options(compression);
+		let sealer = ToySealer::new(0x33);
+		let file = write_table_after_a_header(&opts, &sealer);
+		let size = file.len() as u64;
+
+		let (source, footer) =
+			BlockSource::open_with(Arc::new(file), size, |_| Ok(sealed_by(&sealer))).unwrap();
+		let source = source.after_header(TOY_HEADER.len() as u64);
+		let table = Table::from_source(1, Arc::clone(&opts), size, source, footer).unwrap();
+		for i in 0..KEYS {
+			let (key, found) = table.get(&lookup(i)).unwrap().expect("the key is in the table");
+			assert_eq!(key.user_key, format!("key{i:04}").into_bytes(), "{compression:?}");
+			assert_eq!(found, value(i), "{compression:?}");
+		}
+	}
+}
+
+#[tokio::test]
+async fn a_handle_that_names_bytes_of_the_header_is_refused() {
+	let sealer = ToySealer::new(5);
+	let (starter, _) = ToyStarter::boxed(&sealer);
+	let mut file = Vec::new();
+	let handle = {
+		let mut sink = BlockSink::deferred(&mut file, starter);
+		let handle = sink
+			.write_block(BlockKind::Data, "abcdefgh".repeat(5).into_bytes(), CompressionType::None)
+			.unwrap();
+		sink.write_footer(&Footer::new(handle.clone(), handle.clone())).unwrap();
+		handle
+	};
+	assert_eq!(handle.offset, TOY_HEADER.len());
+	let size = file.len() as u64;
+	let source = BlockSource::with_protection(Arc::new(file), size, sealed_by(&sealer))
+		.after_header(TOY_HEADER.len() as u64);
+	let comparator = Arc::clone(&Options::default().internal_comparator);
+
+	// The block is where its handle says.
+	assert_eq!(
+		source.read_contents(BlockKind::Data, &handle).unwrap(),
+		"abcdefgh".repeat(5).into_bytes()
+	);
+
+	// A handle at any byte of the header, or that starts in it and ends in the first block, is not
+	// a block, and the sealer is not asked to open it.
+	let asked = sealer.opened().len();
+	for offset in [0, 1, TOY_HEADER.len() - 1] {
+		let forged = BlockHandle::new(offset, handle.size);
+		let err = source.read_contents(BlockKind::Data, &forged).unwrap_err();
+		assert!(
+			matches!(
+				err,
+				Error::SSTable(SSTableError::BlockHandleOutOfBounds {
+					first_block: 10,
+					..
+				})
+			),
+			"offset {offset}: {err:?}"
+		);
+		let err = source
+			.read_block_async(BlockKind::Data, &forged, Arc::clone(&comparator))
+			.await
+			.err()
+			.expect("a handle into the header is an error");
+		assert!(
+			matches!(err, Error::SSTable(SSTableError::BlockHandleOutOfBounds { .. })),
+			"offset {offset}: {err:?}"
+		);
+	}
+	assert_eq!(sealer.opened().len(), asked);
+}
+
+// ========== The footer of a sealed table ==========
+
+/// The footer decoder as it was before there were sealed tables, kept as it was: a table that is
+/// written now has to be refused by the reader that exists in the field, which is that one. It
+/// returns the format and the checksum type as the bytes that it accepted, and the handles.
+fn frozen_footer_decode(buf: &[u8]) -> Result<(u8, u8, BlockHandle, BlockHandle)> {
+	const MAGIC: [u8; 8] = [0x57, 0xfb, 0x80, 0x8b, 0x24, 0x75, 0x47, 0xdb];
+	const FOOTER_LENGTH: usize = 42;
+
+	if buf.len() < FOOTER_LENGTH {
+		return Err(Error::from(SSTableError::FooterTooShort {
+			footer_len: buf.len(),
+		}));
+	}
+	let magic = &buf[buf.len() - MAGIC.len()..];
+	if magic != MAGIC {
+		return Err(Error::from(SSTableError::BadMagicNumber {
+			magic: magic.to_vec(),
+		}));
+	}
+	let format = match buf[0] {
+		1 => 1,
+		_ => return Err(Error::InvalidTableFormat),
+	};
+	let checksum = match buf[1] {
+		1 => 1,
+		_ => {
+			return Err(Error::from(SSTableError::InvalidChecksumType {
+				checksum_type: buf[1],
+			}))
+		}
+	};
+	let (meta_index, metalen) = BlockHandle::decode(&buf[2..])?;
+	if metalen == 0 {
+		return Err(Error::from(SSTableError::BadMetaIndexBlockHandle));
+	}
+	let (index, _) = BlockHandle::decode(&buf[2 + metalen..])?;
+	Ok((format, checksum, meta_index, index))
+}
+
+fn footer_of(file: &[u8]) -> &[u8] {
+	&file[file.len() - TABLE_FULL_FOOTER_LENGTH..]
+}
+
+#[test]
+fn a_reader_that_predates_sealed_tables_refuses_their_footer() {
+	let opts = table_options(CompressionType::None);
+	let sealer = ToySealer::new(5);
+	let sealed = write_table_after_a_header(&opts, &sealer);
+	let plain = write_table(&opts, Protection::Plain);
+
+	// The control: the old decoder reads the footer of a plain table.
+	let (format, checksum, ..) = frozen_footer_decode(footer_of(&plain)).unwrap();
+	assert_eq!((format, checksum), (1, 1));
+	assert_eq!(Footer::decode(footer_of(&plain)).unwrap().checksum, ChecksumType::CRC32c);
+
+	// The sealed one is an error and not a table with checksums that fail, and the error is
+	// raised by the footer, before anything else of the file is looked at.
+	let result = frozen_footer_decode(footer_of(&sealed));
+	assert!(
+		matches!(
+			result,
+			Err(Error::SSTable(SSTableError::InvalidChecksumType {
+				checksum_type: 2
+			}))
+		),
+		"{result:?}"
+	);
+	let footer = Footer::decode(footer_of(&sealed)).unwrap();
+	assert_eq!(footer.checksum, ChecksumType::SealedCRC32c);
+	assert_eq!(footer.checksum as u8, 2);
+}
+
+/// Reads of a file, as `(offset, length)` in the order that they were asked for.
+pub(crate) struct RecordingFile {
+	bytes: Vec<u8>,
+	reads: Mutex<Vec<(u64, usize)>>,
+}
+
+impl RecordingFile {
+	pub(crate) fn new(bytes: Vec<u8>) -> Arc<Self> {
+		Arc::new(Self {
+			bytes,
+			reads: Mutex::new(Vec::new()),
+		})
+	}
+
+	pub(crate) fn reads(&self) -> Vec<(u64, usize)> {
+		self.reads.lock().unwrap().clone()
+	}
+
+	/// The file as what a table is opened over.
+	pub(crate) fn shared(self: &Arc<Self>) -> Arc<dyn File> {
+		Arc::<Self>::clone(self)
+	}
+}
+
+impl File for RecordingFile {
+	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+		self.reads.lock().unwrap().push((offset, buf.len()));
+		self.bytes.read_at(offset, buf)
+	}
+
+	fn size(&self) -> Result<u64> {
+		self.bytes.size()
+	}
+}
+
+#[test]
+fn a_sealed_table_is_refused_by_the_opener_that_has_no_key_after_reading_only_its_footer() {
+	let opts = table_options(CompressionType::None);
+	let sealer = ToySealer::new(5);
+	let sealed = write_table_after_a_header(&opts, &sealer);
+	let size = sealed.len() as u64;
+
+	let file = RecordingFile::new(sealed);
+	let result = Table::new(1, Arc::clone(&opts), file.shared(), size);
+	assert!(
+		matches!(result, Err(Error::Encryption(EncryptionError::NotConfigured))),
+		"{:?}",
+		result.err()
+	);
+	assert_eq!(
+		file.reads(),
+		vec![(size - TABLE_FULL_FOOTER_LENGTH as u64, TABLE_FULL_FOOTER_LENGTH)]
+	);
+	assert!(sealer.opened().is_empty());
+
+	let result = BlockSource::open(file, size);
+	assert!(matches!(result, Err(Error::Encryption(EncryptionError::NotConfigured))));
 }

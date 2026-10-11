@@ -31,14 +31,24 @@
 //! `BlockSealer` made of the block after it was compressed, and the compression byte stays
 //! outside of it, so the sealer is given it to bind.
 //!
-//! Nothing writes the sealed layout in a build that has no sealer. A table has the plain layout
-//! unless whoever opens it, or writes it, says otherwise.
+//! A table has the plain layout unless whoever opens it, or writes it, says otherwise. The footer
+//! says which layout the blocks of a file have (`ChecksumType`), and a file with the sealed one
+//! also begins with a header, so its blocks start after it:
+//!
+//! ```text
+//! Plain:   [block][block]...[block][footer]
+//! Sealed:  [header][sealed block][sealed block]...[sealed block][footer]
+//! ```
+//!
+//! Every byte of a file between its start and its footer belongs to exactly one of the header
+//! and the blocks, and a handle that names bytes of the header is refused. The footer and the
+//! header are the only parts that are not blocks, and neither holds anything secret.
 //!
 //! ## What is checked before bytes are used
 //!
-//! - The handle must lie inside the part of the file that holds blocks, which ends where the footer
-//!   begins. This is checked before the buffer is allocated, so a handle that was damaged cannot
-//!   ask for gigabytes.
+//! - The handle must lie inside the part of the file that holds blocks, which starts after the
+//!   header if the file has one and ends where the footer begins. This is checked before the buffer
+//!   is allocated, so a handle that was damaged cannot ask for gigabytes.
 //! - The read must return every byte that was asked for. A file may return fewer bytes than the
 //!   buffer holds without being at its end, and a file that ends early is an error rather than a
 //!   buffer with a tail of zeros.
@@ -54,7 +64,7 @@ use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::error::{Error, Result};
+use crate::error::{EncryptionError, Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle};
 use crate::sstable::error::SSTableError;
 use crate::sstable::table::{
@@ -259,6 +269,40 @@ impl Protection {
 			Self::Sealed(_) => TrailerLayout::Sealed,
 		}
 	}
+
+	/// What the footer of a file with this protection says about its blocks.
+	pub(crate) fn checksum_type(&self) -> ChecksumType {
+		match self {
+			Self::Plain => ChecksumType::CRC32c,
+			Self::Sealed(_) => ChecksumType::SealedCRC32c,
+		}
+	}
+}
+
+/// What a file starts with and how its blocks are sealed, which is only known when the file
+/// is started.
+pub(crate) struct FileStart {
+	/// The bytes that come before the first block, written as they are.
+	pub(crate) header: Vec<u8>,
+	/// Seals the blocks of this file and no other. It is made for the file, so that a position in
+	/// the file is never given to it for another.
+	pub(crate) sealer: Arc<dyn BlockSealer>,
+}
+
+/// Starts the file of a sink when it is first written to, instead of when the sink is made.
+///
+/// Starting a sealed file takes a key, which can fail, and a table writer is made where there is
+/// nowhere to report that. A sink that was given a starter asks it for the start of the file
+/// when its first block or its footer is to be written, so the failure is the failure of that
+/// call, and nothing is written for a file that could not be started.
+pub(crate) trait FileStarter: Send + Sync {
+	/// The length of the header that `start` returns. The first block of the file goes after
+	/// it, so the sink knows where blocks are before it has asked for the header.
+	#[cfg_attr(not(test), allow(dead_code))]
+	fn header_len(&self) -> usize;
+
+	/// Makes the start of the file. A sink calls it once, and ends if it fails.
+	fn start(self: Box<Self>) -> Result<FileStart>;
 }
 
 // =============================================================================
@@ -275,6 +319,8 @@ pub(crate) struct BlockSource {
 	store: Arc<dyn ObjectStore>,
 	file_size: u64,
 	protection: Protection,
+	/// Where the first block of the file starts: after its header, if it has one.
+	blocks_start: u64,
 	/// The key under which the block cache keeps the blocks that this source reads, see
 	/// `cache_id`.
 	cache_id: u64,
@@ -318,9 +364,19 @@ impl BlockSource {
 			store,
 			file_size,
 			protection,
+			blocks_start: 0,
 			cache_id: crate::cache::next_instance_id(),
 			reads: Arc::new(ReadCounters::default()),
 		}
+	}
+
+	/// The same source for a file whose first block starts at `header_len` instead of at its
+	/// first byte, which is what a file that begins with a header is. No handle may name a byte
+	/// before it.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn after_header(mut self, header_len: u64) -> Self {
+		self.blocks_start = header_len;
+		self
 	}
 
 	/// The number of reads of the file that this source and its clones asked for: the footer when
@@ -357,13 +413,16 @@ impl BlockSource {
 	/// blocks, for both the synchronous and the asynchronous paths. The layout of the blocks is
 	/// the one that the footer says.
 	///
-	/// A footer is not authenticated, and whoever can write the file can make it say that its
-	/// blocks are plain, with checksums that anyone can compute. A database whose tables are meant
-	/// to be sealed therefore cannot use this function as it is: it must refuse a footer that
-	/// says plain, which is what `open_with` is for.
+	/// This is the way to open a table that nobody holds a key for, so it opens a file whose footer
+	/// says that its blocks are plain, and refuses one that says that they are sealed: there is
+	/// nothing here to open them with. A footer is not authenticated, and whoever can write the
+	/// file can make it say that its blocks are plain, with checksums that anyone can compute. A
+	/// database whose tables are meant to be sealed therefore cannot use this function: it must
+	/// refuse a footer that says plain, which is what the opener of tables with a key is for.
 	pub(crate) fn open(file: Arc<dyn File>, file_size: u64) -> Result<(Self, Footer)> {
 		Self::open_with(file, file_size, |footer| match footer.checksum {
 			ChecksumType::CRC32c => Ok(Protection::Plain),
+			ChecksumType::SealedCRC32c => Err(Error::Encryption(EncryptionError::NotConfigured)),
 		})
 	}
 
@@ -402,18 +461,21 @@ impl BlockSource {
 	}
 
 	/// The length of the block at `handle` with its trailer, if all of it lies in the part of
-	/// the file that holds blocks. `trailer_len` is what follows the block.
+	/// the file that holds blocks, which is after the header and before the footer.
+	/// `trailer_len` is what follows the block.
 	fn extent(&self, handle: &BlockHandle, trailer_len: usize) -> Result<usize> {
 		let limit = self.file_size.saturating_sub(TABLE_FULL_FOOTER_LENGTH as u64);
+		let first = self.blocks_start;
 		let (offset, size) = (handle.offset() as u64, handle.size() as u64);
 		let end = size.checked_add(trailer_len as u64).and_then(|len| len.checked_add(offset));
 		// The length that is read is a `usize`, which is 32 bits on some targets: a size that
 		// passes the test against the file can still not take its trailer in that width.
 		match (end, handle.size().checked_add(trailer_len)) {
-			(Some(end), Some(len)) if end <= limit => Ok(len),
+			(Some(end), Some(len)) if offset >= first && end <= limit => Ok(len),
 			_ => Err(Error::from(SSTableError::BlockHandleOutOfBounds {
 				block_offset: offset,
 				block_size: size,
+				first_block: first,
 				limit,
 			})),
 		}
@@ -550,9 +612,16 @@ fn into_block(contents: Vec<u8>, comparator: Arc<dyn Comparator>) -> Result<Bloc
 /// once its position was given to the sealer, whether in sealing, in making its trailer or in
 /// the write, leaves the sink refusing all that follows, since what is in the file after it is
 /// not known, and the position cannot be taken again.
+///
+/// A file may begin with a header, which a starter makes when the file is first written to: the
+/// header goes first and the first block after it, and `offset` counts the header from the
+/// beginning. The footer says which layout the blocks have, so the sink writes it and the caller
+/// does not choose.
 pub(crate) struct BlockSink<W: Write> {
 	writer: W,
 	protection: Protection,
+	/// Makes the start of the file when it is first written to, until then.
+	starter: Option<Box<dyn FileStarter>>,
 	/// Where the next block goes.
 	offset: usize,
 	/// A block failed after its position was given to the sealer, or a write failed: no position
@@ -566,13 +635,58 @@ impl<W: Write> BlockSink<W> {
 		Self::with_protection(writer, Protection::Plain)
 	}
 
-	/// A sink for blocks that are protected as `protection` says.
+	/// A sink for blocks that are protected as `protection` says, in a file that begins with its
+	/// first block.
 	pub(crate) fn with_protection(writer: W, protection: Protection) -> Self {
 		Self {
 			writer,
 			protection,
+			starter: None,
 			offset: 0,
 			failed: false,
+		}
+	}
+
+	/// A sink for a file that begins with the header that `starter` makes, and whose blocks are
+	/// sealed by what the starter returns with it. Nothing is asked of the starter, and nothing
+	/// is written, until the first block or the footer is.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn deferred(writer: W, starter: Box<dyn FileStarter>) -> Self {
+		Self {
+			writer,
+			protection: Protection::Plain,
+			offset: starter.header_len(),
+			starter: Some(starter),
+			failed: false,
+		}
+	}
+
+	/// Starts the file if it has a starter that was not asked yet: writes its header, and takes
+	/// its sealer for the blocks. A failure ends the sink, and the starter is not asked again, so
+	/// a key that was made for this file is never used for another.
+	fn start(&mut self) -> Result<()> {
+		let Some(starter) = self.starter.take() else {
+			return Ok(());
+		};
+		let result = starter.start().and_then(|start| {
+			// The first block goes where the sink was told that it would.
+			if start.header.len() != self.offset {
+				return Err(Error::Other(
+					"the header of a table is not the length that it was told".into(),
+				));
+			}
+			self.writer.write_all(&start.header)?;
+			Ok(start.sealer)
+		});
+		match result {
+			Ok(sealer) => {
+				self.protection = Protection::Sealed(sealer);
+				Ok(())
+			}
+			Err(e) => {
+				self.failed = true;
+				Err(e)
+			}
 		}
 	}
 
@@ -592,6 +706,7 @@ impl<W: Write> BlockSink<W> {
 		if self.failed {
 			return Err(Error::Other("a write to the table failed earlier".into()));
 		}
+		self.start()?;
 
 		let payload = compress_block(contents, compression)?;
 		let offset = self.offset;
@@ -644,12 +759,17 @@ impl<W: Write> BlockSink<W> {
 		Ok((payload, trailer))
 	}
 
-	/// Writes the footer, which is the one part of the file that is not a block, flushes, and
-	/// returns the size of the file.
+	/// Writes the footer, which is the one part of the file that is neither a block nor the
+	/// header, flushes, and returns the size of the file.
 	pub(crate) fn write_footer(&mut self, footer: &Footer) -> Result<usize> {
 		if self.failed {
 			return Err(Error::Other("a write to the table failed earlier".into()));
 		}
+		self.start()?;
+		// The layout of the blocks is that of the file, so it is not for the caller to say: a
+		// sealed file must not be written with a footer that says its blocks are plain.
+		let mut footer = footer.clone();
+		footer.checksum = self.protection.checksum_type();
 		let mut buf = [0u8; TABLE_FULL_FOOTER_LENGTH];
 		footer.encode(&mut buf);
 		let written = self.writer.write_all(&buf).and_then(|()| self.writer.flush());

@@ -83,10 +83,12 @@ pub enum SSTableError {
 		block_offset: u64,
 	},
 	/// A block handle names bytes that are not inside the part of the file that holds blocks,
-	/// which ends where the footer begins.
+	/// which starts after the header, if the file has one, and ends where the footer begins.
 	BlockHandleOutOfBounds {
 		block_offset: u64,
 		block_size: u64,
+		/// Where the first block of the file starts.
+		first_block: u64,
 		limit: u64,
 	},
 	/// The length in the trailer of a sealed block is not the length that its handle gives.
@@ -311,12 +313,13 @@ impl fmt::Display for SSTableError {
 			SSTableError::BlockHandleOutOfBounds {
 				block_offset,
 				block_size,
+				first_block,
 				limit,
 			} => {
 				write!(
 					f,
-					"block at {} of {} bytes (and its trailer) does not fit in the {} bytes before the footer",
-					block_offset, block_size, limit
+					"block at {} of {} bytes (and its trailer) does not fit between the first block at {} and the footer at {}",
+					block_offset, block_size, first_block, limit
 				)
 			}
 

@@ -27,6 +27,10 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! A sealed table, which is what the checksum type of its footer says, has a header before its
+//! first data block and sealed blocks, see `block_io`. The footer is never sealed and never holds
+//! anything secret: it is two block handles, the format and the layout of the blocks.
+//!
 //! ## Key Concept: Separator Keys
 //!
 //! Index entries use "separator keys" as upper bounds, NOT the actual last key.
@@ -148,9 +152,21 @@ pub(crate) fn unmask(masked: u32) -> u32 {
 // TABLE FORMAT TYPES
 // =============================================================================
 
+/// How the blocks of a table are checked, which the footer says and which fixes the layout of
+/// every block of the file.
+///
+/// The second value is not a different checksum: it is the signal that a table is sealed. Its
+/// blocks are authenticated ciphertext followed by the trailer of nine bytes, and the file begins
+/// with a header. It is a value of this byte, and not a flag somewhere else in the footer, because
+/// a reader that does not know it must stop at the footer: bytes that were ignored, such as the
+/// padding, would be read as a plain table by a reader that has never heard of sealing.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ChecksumType {
+	/// Plain blocks, each followed by its compression type and a masked CRC32.
 	CRC32c = 1,
+	/// Sealed blocks, each followed by its compression type, its length and a masked CRC32. The
+	/// CRC is the same one, and it only tells damage from tampering, which the seal tells.
+	SealedCRC32c = 2,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -179,7 +195,7 @@ impl TableFormat {
 /// Offset  Size  Field
 /// ------  ----  -----
 /// 0       1     Format version (1 = LSMV1)
-/// 1       1     Checksum type (1 = CRC32c)
+/// 1       1     Checksum type (1 = CRC32c, 2 = sealed blocks)
 /// 2       16    Meta index block handle (varint encoded offset + size)
 /// 18      16    Index block handle (varint encoded offset + size)
 /// 34      8     Padding (zeros)
@@ -192,6 +208,11 @@ impl TableFormat {
 /// 2. Verify magic number
 /// 3. Decode block handles
 /// 4. Use handles to read index and meta blocks
+///
+/// The footer is the one part of a table that is read before anything can be checked, and
+/// nothing authenticates it: whoever can write the file can write any footer. What it says about
+/// the layout of the blocks is therefore a claim that the reader of a database whose tables are
+/// sealed must not take at its word.
 #[derive(Debug, Clone)]
 pub(crate) struct Footer {
 	pub format: TableFormat,
@@ -231,6 +252,7 @@ impl Footer {
 		let format = TableFormat::from_u8(buf[0])?;
 		let checksum = match buf[1] {
 			1 => ChecksumType::CRC32c,
+			2 => ChecksumType::SealedCRC32c,
 			_ => {
 				return Err(Error::from(SSTableError::InvalidChecksumType {
 					checksum_type: buf[1],
@@ -851,7 +873,7 @@ impl Table {
 	}
 
 	/// Opens a table from the source of its blocks and its footer.
-	fn from_source(
+	pub(crate) fn from_source(
 		id: u64,
 		opts: Arc<Options>,
 		file_size: u64,
