@@ -19,9 +19,9 @@
 //! +----------------------+-----------------+-----------------+
 //!
 //! Sealed (9 bytes):
-//! +-------------------------+-----------------+-----------+-----------------+
+//! +----------------------------+-----------------+-----------+-----------------+
 //! | sealed block (handle.size) | compression (1) | len (4)   | masked CRC (4)  |
-//! +-------------------------+-----------------+-----------+-----------------+
+//! +----------------------------+-----------------+-----------+-----------------+
 //! ```
 //!
 //! The CRC32 covers every byte before it, so in the sealed layout it covers the sealed block, the
@@ -356,6 +356,11 @@ impl BlockSource {
 	/// Opens a table file: reads its footer and returns it with the source that reads its
 	/// blocks, for both the synchronous and the asynchronous paths. The layout of the blocks is
 	/// the one that the footer says.
+	///
+	/// A footer is not authenticated, and whoever can write the file can make it say that its
+	/// blocks are plain, with checksums that anyone can compute. A database whose tables are meant
+	/// to be sealed therefore cannot use this function as it is: it must refuse a footer that
+	/// says plain, which is what `open_with` is for.
 	pub(crate) fn open(file: Arc<dyn File>, file_size: u64) -> Result<(Self, Footer)> {
 		Self::open_with(file, file_size, |footer| match footer.checksum {
 			ChecksumType::CRC32c => Ok(Protection::Plain),
