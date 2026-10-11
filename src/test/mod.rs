@@ -22,6 +22,8 @@ pub mod block_read_tests;
 pub mod block_tests;
 #[cfg(test)]
 pub mod cache_namespace_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod canary;
 #[cfg(test)]
 pub mod checkpoint_close_tests;
 #[cfg(test)]
