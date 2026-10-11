@@ -2147,6 +2147,152 @@ async fn a_compaction_into_a_bottom_level_that_holds_a_table_without_points_merg
 	finish(db.tree);
 }
 
+/// Compacts the tables `ids` of level `source` into the level below it, and no other table.
+struct Explicit {
+	ids: Vec<u64>,
+	source: u8,
+}
+
+impl CompactionStrategy for Explicit {
+	fn pick_levels(&self, _manifest: &LevelManifest) -> crate::Result<CompactionChoice> {
+		Ok(CompactionChoice::Merge(CompactionInput {
+			tables_to_merge: self.ids.clone(),
+			source_level: self.source,
+			target_level: self.source + 1,
+		}))
+	}
+}
+
+/// The ids of the tables of level `level` that hold a range delete and no point.
+fn tables_without_points_in(tree: &Tree, level: usize) -> Vec<u64> {
+	let manifest = tree.core.inner.level_manifest.read().unwrap();
+	manifest.levels.get_levels()[level]
+		.tables
+		.iter()
+		.filter(|t| !t.has_points() && t.has_range_deletions())
+		.map(|t| t.id)
+		.collect()
+}
+
+/// A tree whose L1 holds a table that carries a range delete over its points and not the entry of
+/// the range delete, so that compacting it into L2 drops every point and leaves a table of a range
+/// delete alone in a level above the bottom one. The range delete came down while a reader
+/// below it was open, which kept the versions that the reader reads under it; once the reader is
+/// gone a compaction of those tables alone has the range delete in their metadata and not its
+/// entry.
+async fn db_with_a_table_without_points_in_l2() -> Db {
+	let mut db = Db::open(Shape::SPLIT).await;
+	let keys: Vec<String> = (0..12).map(|i| format!("n{i:02}")).collect();
+	for key in &keys {
+		db.put_padded(key, "old", 300).await;
+	}
+	db.flush();
+	db.compact_level(0);
+	let bounds = table_bounds(&db.tree, 1);
+	assert!(bounds.len() >= 3, "L1 holds several tables: {bounds:?}");
+
+	// Every key is written again, and a range delete covers two tables of L1 and part of a third.
+	// The compaction of L0 takes all of L1, keeps the version the reader reads of every key, and
+	// cuts its output where it is full: the output tables inside the range delete carry it in
+	// their metadata, and only the one with its start key holds its entry.
+	let reader = db.snapshot();
+	for key in &keys {
+		db.put_padded(key, "new", 300).await;
+	}
+	let (first, end) = (bounds[1].0.clone(), bounds[3].0.clone());
+	db.del_range(&first, &end).await;
+	db.flush();
+	db.compact_level(0);
+	let (txn, model, universe) = &reader;
+	assert_reads_in(txn, model, universe, "the reader below the range delete").await;
+	drop(reader);
+
+	// The tables of L1 that the range delete covers from end to end, and do not hold its entry.
+	let covered: Vec<u64> = {
+		let manifest = db.tree.core.inner.level_manifest.read().unwrap();
+		manifest.levels.get_levels()[1]
+			.tables
+			.iter()
+			.filter(|t| match (&t.meta.smallest_point, &t.meta.largest_point) {
+				(Some(lo), Some(hi)) => {
+					lo.user_key.as_slice() > first.as_bytes()
+						&& hi.user_key.as_slice() < end.as_bytes()
+				}
+				_ => false,
+			})
+			.map(|t| t.id)
+			.collect()
+	};
+	assert!(!covered.is_empty(), "a table of L1 inside the range delete: {:?}", db.layout());
+	db.tree
+		.compact(Arc::new(Explicit {
+			ids: covered,
+			source: 1,
+		}))
+		.unwrap();
+	assert_eq!(
+		tables_without_points_in(&db.tree, 2).len(),
+		1,
+		"the table the range delete emptied: {:?}",
+		db.layout()
+	);
+	db
+}
+
+/// The compaction that drops every point of a table, with the range delete that covers them in
+/// the metadata of the table and its entry elsewhere, leaves a table without points in a level
+/// above the bottom one too. It has to read as empty there, and a compaction into its level and a
+/// compaction of it into the level below it both have to work.
+#[test(tokio::test)]
+async fn a_table_without_points_above_the_bottom_level_is_read_and_compacted_on() {
+	let db = db_with_a_table_without_points_in_l2().await;
+	check_invariants(&db.tree, "a table without points in L2");
+	db.assert_reads("a table without points in L2").await;
+	let image = db.image("a table without points in L2");
+	verify(&image, Shape::SPLIT).await;
+
+	// A compaction of another table of L1 into L2 takes it and merges it away.
+	db.compact_level(1);
+	check_invariants(&db.tree, "a compaction into the level of a table without points");
+	db.assert_reads("a compaction into the level of a table without points").await;
+	finish(db.tree);
+
+	// The table by itself, as the source of a compaction: it goes on to L3.
+	let db = Db::continue_from(&image, Shape::SPLIT).await;
+	assert_eq!(tables_without_points_in(&db.tree, 2).len(), 1);
+	db.compact_level(2);
+	assert!(tables_without_points_in(&db.tree, 2).is_empty());
+	check_invariants(&db.tree, "a table without points compacted down");
+	db.assert_reads("a table without points compacted down").await;
+	verify(&db.image("a table without points compacted down"), Shape::SPLIT).await;
+	finish(db.tree);
+}
+
+/// The end key of a range delete is not a value: bytes that read like a pointer into the value log
+/// must not make the table remember the value log file that they name.
+#[test]
+fn a_range_delete_entry_does_not_set_the_oldest_value_log_file_of_its_table() {
+	use crate::vlog::{ValueLocation, ValuePointer};
+	use crate::{InternalKey, InternalKeyKind};
+
+	let opts = Arc::new(Options::default());
+	let mut buf = Vec::new();
+	let mut writer = crate::sstable::table::TableWriter::new(&mut buf, 1, Arc::clone(&opts), 0);
+	let like_a_pointer = ValueLocation::with_pointer(ValuePointer::new(3, 0, 1, 1, 0)).encode();
+	writer
+		.add(InternalKey::new(b"a".to_vec(), 5, InternalKeyKind::RangeDelete), &like_a_pointer)
+		.unwrap();
+	let real_pointer = ValueLocation::with_pointer(ValuePointer::new(9, 0, 1, 1, 0)).encode();
+	writer.add(InternalKey::new(b"c".to_vec(), 4, InternalKeyKind::Set), &real_pointer).unwrap();
+	let size = writer.finish().unwrap();
+	let file: Arc<dyn crate::vfs::File> = Arc::new(buf);
+	let table = Table::new(1, opts, file, size as u64).unwrap();
+	assert_eq!(
+		table.meta.properties.oldest_vlog_file_id, 9,
+		"only the value that is a pointer names a file"
+	);
+}
+
 // ---------------------------------------------------------------------------
 // the randomised sweep
 // ---------------------------------------------------------------------------
