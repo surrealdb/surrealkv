@@ -8,12 +8,13 @@ use std::sync::Arc;
 use crc32fast::Hasher;
 use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 
-use crate::error::{Error, Result};
+use crate::error::{EncryptionError, Error, Result};
+use crate::tde::{EncryptionContext, FileCipher};
 use crate::{vfs, CompressionType, Options, VLogChecksumLevel, Value};
 
-// The writer and the reader of the commits that follow use all of it.
+// What the writer of the commit that follows uses is not used yet.
 #[allow(dead_code)]
-mod sealed;
+pub(crate) mod sealed;
 
 /// Test-only: the VLog files whose fsync completed, in order.
 #[cfg(test)]
@@ -315,11 +316,14 @@ impl ValueLocation {
 		if self.is_value_pointer() {
 			if let Some(vlog) = vlog {
 				let pointer = ValuePointer::decode(&self.value)?;
-				vlog.get(&pointer).map_err(|e| {
-					Error::Other(format!(
+				vlog.get(&pointer).map_err(|e| match e {
+					// A failed authentication is not a missing value: the caller tells them
+					// apart, so the error is not turned into text.
+					Error::Encryption(_) => e,
+					e => Error::Other(format!(
 						"Failed to resolve value from VLog: {e}. ValuePointer: {:?}",
 						pointer
-					))
+					)),
 				})
 			} else {
 				Err(Error::Other("VLog not available for pointer resolution".to_string()))
@@ -447,6 +451,14 @@ impl ValuePointer {
 			8 + content + 4
 		}
 	}
+}
+
+/// A file of the log that is open for reading: the handle, and for a sealed file the cipher that
+/// opens its entries, which is made from its header once, when the file is first opened, and
+/// goes when the handle does.
+pub(crate) struct OpenFile {
+	file: File,
+	cipher: Option<FileCipher>,
 }
 
 /// Represents a VLog file that can be read from
@@ -812,7 +824,7 @@ pub(crate) struct VLog {
 	files_map: RwLock<HashMap<u32, Arc<VLogFile>>>,
 
 	/// Cached open file handles for reading
-	pub(crate) file_handles: RwLock<HashMap<u32, Arc<File>>>,
+	pub(crate) file_handles: RwLock<HashMap<u32, Arc<OpenFile>>>,
 
 	/// Replaced, under the `file_handles` lock, by every [`reload`](Self::reload): a handle that
 	/// was opened before it belongs to a file that was replaced, and is not cached. It is drawn
@@ -861,7 +873,23 @@ impl Drop for VLogGroupPin<'_> {
 	}
 }
 
+/// The newest file of a log, as [`VLog::load_files`] leaves it.
+struct Newest {
+	id: u32,
+	path: PathBuf,
+	/// Its entries are sealed, or it was set aside as a file that a crash left half made: either
+	/// way nothing is ever appended to it.
+	sealed: bool,
+	/// The file is still where it was, and not set aside.
+	present: bool,
+}
+
 impl VLog {
+	/// The encryption the log's files are sealed with, if it is configured with any.
+	fn encryption(&self) -> Option<&EncryptionContext> {
+		self.opts.encryption_context().map(|context| &**context)
+	}
+
 	/// Returns the file path for a VLog file with the given ID
 	pub(crate) fn vlog_file_path(&self, file_id: u32) -> PathBuf {
 		self.opts.vlog_file_path(file_id as u64)
@@ -869,6 +897,15 @@ impl VLog {
 
 	/// Creates a new VLog instance
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		// A key manager that was never turned into the database's context would leave the
+		// log in plaintext without saying so.
+		if opts.key_manager.is_some() && opts.encryption_context().is_none() {
+			return Err(Error::InvalidArgument(
+				"A key manager is configured but the encryption of the database was not resolved: \
+				 refusing to write a value log in plaintext"
+					.to_string(),
+			));
+		}
 		let vlog = Self {
 			path: opts.vlog_dir(),
 			max_file_size: opts.vlog_max_file_size,
@@ -915,6 +952,13 @@ impl VLog {
 	/// is not fsynced here, which would stall every commit behind it, but queued for the next
 	/// [`sync`](Self::sync).
 	fn roll_over(&self, active: &mut Option<VLogWriter>) -> Result<()> {
+		if self.encryption().is_some() {
+			// Sealed files are read and not written yet. A plaintext file must not be started in
+			// a log that is configured with encryption.
+			return Err(
+				EncryptionError::InvalidInput("a sealed value log is not written yet").into()
+			);
+		}
 		let old = match active.as_mut() {
 			Some(writer) => {
 				writer.flush()?;
@@ -947,21 +991,38 @@ impl VLog {
 
 	/// Pre-fills the file_handles cache with all existing VLog files
 	fn prefill_file_handles(&self) -> Result<()> {
-		let Some((highest_file_id, highest_file_path)) = self.load_files()? else {
+		let Some(newest) = self.load_files()? else {
 			return Ok(());
 		};
 
 		// Found existing files, set next_file_id to one past the highest existing file ID
-		self.next_file_id.store(highest_file_id + 1, Ordering::SeqCst);
+		self.next_file_id.store(newest.id + 1, Ordering::SeqCst);
+
+		if newest.sealed {
+			// A sealed file is never appended to again. Its key is the one of the writer that
+			// made it, and the positions that writer sealed at are spoken for, so a writer that
+			// picked the file up would start sealing over them again. The first append starts a
+			// file of its own, with a salt of its own, and until then the newest file is only
+			// read.
+			self.active_writer_id.store(newest.id, Ordering::SeqCst);
+			if newest.present {
+				// What an earlier run left in the file may not be on disk yet, and there is no
+				// writer to hold a descriptor for the first sync to use.
+				let file = vfs::open_for_sync(&newest.path)?;
+				self.unsynced.lock().push((newest.id, Arc::new(file)));
+			}
+			self.appended.mark();
+			return Ok(());
+		}
 
 		// Set the last file up as the active writer
 		let writer = VLogWriter::new(
-			&highest_file_path,
-			highest_file_id,
+			&newest.path,
+			newest.id,
 			self.opts.vlog_max_file_size,
 			CompressionType::None as u8,
 		)?;
-		self.active_writer_id.store(highest_file_id, Ordering::SeqCst);
+		self.active_writer_id.store(newest.id, Ordering::SeqCst);
 		*self.writer.write() = Some(writer);
 		// What an earlier run left in the file may not be on disk yet: the first sync
 		// covers it.
@@ -973,61 +1034,163 @@ impl VLog {
 	/// Opens and validates every file in the log's directory, registers it in `file_handles` and
 	/// `files_map`, and returns the one with the highest id. A directory that does not exist
 	/// holds none.
-	fn load_files(&self) -> Result<Option<(u32, PathBuf)>> {
+	///
+	/// A log of sealed files may find a crash's leftover as its newest file: a file that the
+	/// crash cut off before its header was complete, and which therefore holds no entry. It is
+	/// set aside under another name, never deleted, and the newest file is reported as one
+	/// that is sealed and no longer there, so that its id is not used again. Only the newest
+	/// file can be that, and only a header that is incomplete or damaged and is no longer than a
+	/// header counts: whatever fails to authenticate is an error and leaves every file as it is.
+	fn load_files(&self) -> Result<Option<Newest>> {
 		let entries = match std::fs::read_dir(&self.path) {
 			Ok(entries) => entries,
 			Err(_) => return Ok(None), // Directory doesn't exist yet
 		};
 
-		let mut highest: Option<(u32, PathBuf)> = None;
+		// Which file is the newest has to be known before any is opened
+		let mut found = Vec::new();
+		for entry in entries {
+			let entry = entry?;
+			let file_name = entry.file_name();
+
+			// Look for VLog files
+			if let Some(file_id) = self.opts.extract_vlog_file_id(&file_name.to_string_lossy()) {
+				found.push((file_id, entry.path(), entry.metadata()?.len()));
+			}
+		}
+		let Some(newest_id) = found.iter().map(|(file_id, ..)| *file_id).max() else {
+			return Ok(None);
+		};
+
+		let mut newest = None;
 		// The order `cleanup_obsolete_files` takes them in
 		let mut files_map = self.files_map.write();
 		let mut file_handles = self.file_handles.write();
 
-		for entry in entries {
-			let entry = entry?;
-			let file_name = entry.file_name();
-			let file_name_str = file_name.to_string_lossy();
+		for (file_id, file_path, file_size) in found {
+			let is_newest = file_id == newest_id;
+			if is_newest && self.is_torn(&file_path, file_size)? {
+				self.set_aside(file_id, &file_path)?;
+				newest = Some(Newest {
+					id: file_id,
+					path: file_path,
+					sealed: true,
+					present: false,
+				});
+				continue;
+			}
 
-			// Look for VLog files
-			if let Some(file_id) = self.opts.extract_vlog_file_id(&file_name_str) {
-				let file_path = entry.path();
-				let file_size = entry.metadata()?.len();
-
-				// Track the file with maximum ID for active writer setup
-				if highest.as_ref().is_none_or(|(current_max, _)| file_id >= *current_max) {
-					highest = Some((file_id, file_path.clone()));
-				}
-
-				// Pre-open the file handle and validate header
-				match File::open(&file_path) {
-					Ok(file) => {
-						// Validate file header for existing files
-						if file_size > 0 {
-							let mut header_data = vec![0u8; VLogFileHeader::SIZE];
-							vfs::File::read_at(&file, 0, &mut header_data)?;
-							let header = VLogFileHeader::decode(&header_data)?;
+			// Pre-open the file handle and validate header
+			match File::open(&file_path) {
+				Ok(file) => {
+					let mut cipher = None;
+					// Validate file header for existing files
+					if file_size > 0 {
+						let mut header_data = vec![0u8; VLogFileHeader::SIZE];
+						vfs::File::read_at(&file, 0, &mut header_data)?;
+						let header = VLogFileHeader::decode(&header_data)?;
+						cipher = self.open_layout(&file, &header, file_id, true)?;
+						if cipher.is_none() {
 							header.validate(file_id)?;
 						}
-
-						let handle = Arc::new(file);
-						file_handles.insert(file_id, handle);
-
-						// Also register in files_map
-						files_map.insert(
-							file_id,
-							Arc::new(VLogFile::new(file_id, file_path, file_size)),
-						);
+					} else if self.encryption().is_some() {
+						return Err(Error::Corruption(format!(
+							"VLog file {file_id} of a sealed log is empty and is not its newest file"
+						)));
 					}
-					Err(e) => {
-						tracing::error!("Failed to pre-open VLog file {file_name_str}: {e}");
-						return Err(Error::Io(Arc::new(e)));
+
+					if is_newest {
+						newest = Some(Newest {
+							id: file_id,
+							path: file_path.clone(),
+							sealed: cipher.is_some(),
+							present: true,
+						});
 					}
+					file_handles.insert(
+						file_id,
+						Arc::new(OpenFile {
+							file,
+							cipher,
+						}),
+					);
+
+					// Also register in files_map
+					files_map
+						.insert(file_id, Arc::new(VLogFile::new(file_id, file_path, file_size)));
+				}
+				Err(e) => {
+					tracing::error!("Failed to pre-open VLog file {file_path:?}: {e}");
+					return Err(Error::Io(Arc::new(e)));
 				}
 			}
 		}
 
-		Ok(highest)
+		Ok(newest)
+	}
+
+	/// Checks what the header of a file says about how its entries are stored against what the
+	/// log is configured for, and opens a sealed file. Returns the cipher that opens its entries,
+	/// or `None` for the plaintext file of a log without encryption, whose header the caller goes
+	/// on to check.
+	///
+	/// A log reads files of one kind. One that is configured with encryption refuses a plaintext
+	/// file and one that is not refuses a sealed file, and the file is the same afterwards:
+	/// neither is damage, and neither is a reason to repair. `prepare` asks the key manager to
+	/// make the key of the file available first, which is for when the log is opened and not for
+	/// a read, which a manager must not make wait.
+	fn open_layout(
+		&self,
+		file: &File,
+		header: &VLogFileHeader,
+		file_id: u32,
+		prepare: bool,
+	) -> Result<Option<FileCipher>> {
+		let sealed = header.version == sealed::SEALED_VERSION;
+		let Some(context) = self.encryption() else {
+			return if sealed {
+				Err(EncryptionError::NotConfigured.into())
+			} else {
+				Ok(None)
+			};
+		};
+		if !sealed {
+			return Err(if header.version == VLOG_FORMAT_VERSION {
+				EncryptionError::PlaintextInEncryptedDb.into()
+			} else {
+				Error::Corruption(format!(
+					"Incompatible VLog file version (file_id={file_id}): {}",
+					header.version
+				))
+			});
+		}
+		let mut head = vec![0u8; sealed::SEALED_HEADER_LEN];
+		let read = vfs::File::read_up_to(file, 0, &mut head)?;
+		head.truncate(read);
+		sealed::open_header(context, file_id, &head, prepare).map(Some)
+	}
+
+	/// Whether `path`, the newest file of the log, is what a crash during its creation leaves,
+	/// see [`sealed::is_torn`]. Only a log of sealed files can have such a file.
+	fn is_torn(&self, path: &Path, file_size: u64) -> Result<bool> {
+		if self.encryption().is_none() || file_size > sealed::SEALED_HEADER_LEN as u64 {
+			return Ok(false);
+		}
+		Ok(sealed::is_torn(&std::fs::read(path)?))
+	}
+
+	/// Renames a file that a crash left without a complete header, which holds no entry, to a
+	/// name that the log does not read.
+	fn set_aside(&self, file_id: u32, path: &Path) -> Result<()> {
+		let to = sealed::set_aside(path)?;
+		tracing::warn!(
+			"VLog file {file_id} was cut off before its header was complete and holds no entry: \
+			 it was set aside as {to:?}"
+		);
+		if let Err(e) = crate::lsm::fsync_directory(&self.path) {
+			tracing::warn!("Failed to sync the VLog directory after setting a file aside: {e}");
+		}
+		Ok(())
 	}
 
 	/// Keeps every append, and with it every roll over to a new file, out until the guard is
@@ -1070,7 +1233,7 @@ impl VLog {
 		}
 
 		let highest = self.load_files()?;
-		self.next_file_id.store(highest.map_or(1, |(id, _)| id + 1), Ordering::SeqCst);
+		self.next_file_id.store(highest.map_or(1, |newest| newest.id + 1), Ordering::SeqCst);
 		self.active_writer_id.store(0, Ordering::SeqCst);
 		// The files were copied in, and neither they nor the directory entries are known to be
 		// on disk: the first sync covers them.
@@ -1089,7 +1252,7 @@ impl VLog {
 	}
 
 	/// Retrieves (and caches) an open file handle for the given file ID
-	fn get_file_handle(&self, file_id: u32) -> Result<Arc<File>> {
+	fn get_file_handle(&self, file_id: u32) -> Result<Arc<OpenFile>> {
 		let generation = {
 			let handles = self.file_handles.read();
 			if let Some(handle) = handles.get(&file_id) {
@@ -1130,6 +1293,7 @@ impl VLog {
 			})?
 			.len();
 
+		let mut cipher = None;
 		if file_size > 0 {
 			// Only validate header if file has content (not a new empty file)
 			let mut header_data = vec![0u8; VLogFileHeader::SIZE];
@@ -1159,33 +1323,43 @@ impl VLog {
 				))
 			})?;
 
-			if !header.is_compatible() {
-				tracing::error!(
-					"Incompatible VLog file version: file_id={}, path={:?}, version={} (expected {})",
-					file_id, file_path, header.version, VLOG_FORMAT_VERSION
-				);
-				return Err(Error::Corruption(format!(
-					"Incompatible VLog file version (file_id={}, path={:?}): {} (expected {})",
-					file_id, file_path, header.version, VLOG_FORMAT_VERSION
-				)));
-			}
+			// A sealed file is checked as a whole when it is opened, and what it says about how
+			// its entries are stored is checked against what the log is configured for.
+			cipher = self.open_layout(&file, &header, file_id, false)?;
+			if cipher.is_none() {
+				if !header.is_compatible() {
+					tracing::error!(
+						"Incompatible VLog file version: file_id={}, path={:?}, version={} (expected {})",
+						file_id, file_path, header.version, VLOG_FORMAT_VERSION
+					);
+					return Err(Error::Corruption(format!(
+						"Incompatible VLog file version (file_id={}, path={:?}): {} (expected {})",
+						file_id, file_path, header.version, VLOG_FORMAT_VERSION
+					)));
+				}
 
-			// Validate header against current options
-			header.validate(file_id).map_err(|e| {
-				tracing::error!(
-					"VLog header validation failed: file_id={}, path={:?}, error={}",
-					file_id,
-					file_path,
-					e
-				);
-				Error::Other(format!(
-					"VLog header validation failed (file_id={}, path={:?}): {}",
-					file_id, file_path, e
-				))
-			})?;
+				// Validate header against current options
+				header.validate(file_id).map_err(|e| {
+					tracing::error!(
+						"VLog header validation failed: file_id={}, path={:?}, error={}",
+						file_id,
+						file_path,
+						e
+					);
+					Error::Other(format!(
+						"VLog header validation failed (file_id={}, path={:?}): {}",
+						file_id, file_path, e
+					))
+				})?;
+			}
+		} else if self.encryption().is_some() {
+			return Err(Error::Corruption(format!("VLog file {file_id} of a sealed log is empty")));
 		}
 
-		let handle = Arc::new(file);
+		let handle = Arc::new(OpenFile {
+			file,
+			cipher,
+		});
 
 		let mut handles = self.file_handles.write();
 		// The file may have been replaced while it was opened: the caller reads what it opened,
@@ -1209,7 +1383,23 @@ impl VLog {
 			return Ok(cached_value);
 		}
 
-		let file = self.get_file_handle(pointer.file_id)?;
+		let handle = self.get_file_handle(pointer.file_id)?;
+		match (&handle.cipher, pointer.is_sealed()) {
+			(Some(cipher), true) => {
+				return self.get_sealed(&handle.file, cipher, pointer, cache_id)
+			}
+			(None, false) => {}
+			(Some(_), false) | (None, true) => {
+				// A pointer and a file that disagree about whether entries are sealed: the
+				// entry is not read as the one kind or the other.
+				return Err(Error::Corruption(format!(
+					"The pointer and the file disagree about whether the entry is sealed \
+					 (file_id={}, offset={})",
+					pointer.file_id, pointer.offset
+				)));
+			}
+		}
+		let file = &handle.file;
 
 		// Read the entire entry in a single call using sizes from the pointer
 		let key_len = pointer.key_size;
@@ -1224,7 +1414,7 @@ impl VLog {
 		let mut filled = 0;
 		while filled < entry_data_vec.len() {
 			let read = vfs::File::read_at(
-				&*file,
+				file,
 				pointer.offset + filled as u64,
 				&mut entry_data_vec[filled..],
 			)
@@ -1333,6 +1523,46 @@ impl VLog {
 		self.opts.block_cache.insert_vlog(cache_id, pointer.offset, value_bytes.clone());
 
 		Ok(value_bytes)
+	}
+
+	/// Reads the value of a sealed entry. What is read is checked against the pointer's CRC-32 and
+	/// authenticated before anything of it is looked at, whatever `checksum_level` is: the tag
+	/// is the verification, and it is not an option.
+	fn get_sealed(
+		&self,
+		file: &File,
+		cipher: &FileCipher,
+		pointer: &ValuePointer,
+		cache_id: u64,
+	) -> Result<Value> {
+		let cut_short = || {
+			Error::Corruption(format!(
+				"VLog entry cut short by the end of its file (file_id={}, offset={})",
+				pointer.file_id, pointer.offset
+			))
+		};
+
+		// The size of the allocation is bounded by the file, not by what a pointer claims.
+		let total = pointer.total_entry_size();
+		let end = pointer.offset.checked_add(total).ok_or_else(cut_short)?;
+		if end > file.metadata()?.len() {
+			return Err(cut_short());
+		}
+		let size = usize::try_from(total).map_err(|_| cut_short())?;
+		let mut stored = Vec::new();
+		stored.try_reserve_exact(size).map_err(|e| Error::Io(Arc::new(io::Error::from(e))))?;
+		stored.resize(size, 0);
+		match vfs::File::read_exact_at(file, pointer.offset, &mut stored) {
+			Ok(()) => {}
+			Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {
+				return Err(cut_short())
+			}
+			Err(e) => return Err(e),
+		}
+
+		let value = sealed::open_entry(cipher, pointer, stored)?;
+		self.opts.block_cache.insert_vlog(cache_id, pointer.offset, value.clone());
+		Ok(value)
 	}
 
 	/// Keeps every file in place until the pin is dropped. A checkpoint takes one while it holds

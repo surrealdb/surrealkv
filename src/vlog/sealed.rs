@@ -55,7 +55,7 @@ use crate::tde::{
 use crate::CompressionType;
 
 /// The `version` of the file header of a sealed file.
-pub(super) const SEALED_VERSION: u16 = VLOG_FORMAT_VERSION | 0x8000;
+pub(crate) const SEALED_VERSION: u16 = VLOG_FORMAT_VERSION | 0x8000;
 
 /// Length of the file header that every value-log file starts with.
 const FILE_HEADER_LEN: usize = VLogFileHeader::SIZE;
@@ -64,7 +64,7 @@ const FILE_HEADER_LEN: usize = VLogFileHeader::SIZE;
 const CHECKSUM_LEN: usize = 4;
 
 /// Length of the header of a sealed file, where its first entry starts.
-pub(super) const SEALED_HEADER_LEN: usize = FILE_HEADER_LEN + CHECKSUM_LEN + HEADER_LEN;
+pub(crate) const SEALED_HEADER_LEN: usize = FILE_HEADER_LEN + CHECKSUM_LEN + HEADER_LEN;
 
 /// The first bytes of every value-log file, plaintext or sealed.
 const MAGIC: [u8; 4] = VLogFileHeader::MAGIC.to_be_bytes();
@@ -73,11 +73,11 @@ const MAGIC: [u8; 4] = VLogFileHeader::MAGIC.to_be_bytes();
 const ASIDE_ATTEMPTS: u32 = 1000;
 
 /// Length of the length of the key, which opens what an entry seals.
-pub(super) const KEY_LEN_PREFIX: usize = 4;
+pub(crate) const KEY_LEN_PREFIX: usize = 4;
 
 /// What a sealed entry adds to its key and value: the length of the key, and the tag. Both suites
 /// have a tag of the same length.
-pub(super) const ENTRY_OVERHEAD: usize = KEY_LEN_PREFIX + TAG_LEN;
+pub(crate) const ENTRY_OVERHEAD: usize = KEY_LEN_PREFIX + TAG_LEN;
 
 /// The compression byte that an entry is sealed with. Entries are stored as they are given, and
 /// the byte is part of what the entry is bound to.
@@ -121,7 +121,7 @@ fn encode_header(
 /// If writing or syncing the header fails, the file that was just created is set aside under
 /// another name, which keeps a later start from finding a log file without a header between
 /// two that have one. It holds nothing and is never deleted.
-pub(super) fn create(
+pub(crate) fn create(
 	path: &Path,
 	file_id: u32,
 	max_file_size: u64,
@@ -161,10 +161,15 @@ pub(super) fn create(
 /// is a statement about the bytes and none of it needs a key, so damage is never reported as
 /// a wrong key. Any failure of the last step is a key, a different database or file, or a forgery,
 /// and is never a reason to touch the file.
-pub(super) fn open_header(
+///
+/// `prepare` asks the key manager to make the key that the header names available before it is
+/// used, which may wait on a key provider. A log does that when it is opened, and never for a
+/// read, which a manager must not make wait.
+pub(crate) fn open_header(
 	ctx: &EncryptionContext,
 	file_id: u32,
 	head: &[u8],
+	prepare: bool,
 ) -> Result<FileCipher> {
 	let too_short = || Error::Corruption(format!("VLog file {file_id} ends inside its header"));
 	let (fixed, rest) = head.split_first_chunk::<FILE_HEADER_LEN>().ok_or_else(too_short)?;
@@ -184,6 +189,9 @@ pub(super) fn open_header(
 	file_header.validate(file_id)?;
 
 	let crypto = CryptoHeader::decode(rest)?;
+	if prepare {
+		ctx.prepare(&[crypto.identity.key_id])?;
+	}
 	Ok(ctx.open_file(&crypto, FileKind::Vlog, u64::from(file_id), fixed)?)
 }
 
@@ -194,7 +202,7 @@ pub(super) fn open_header(
 /// What it must not be is a file whose header is intact and whose key does not fit, a plaintext
 /// file or a file of a later format: those are never torn, however short. A header counts as
 /// intact when both of its checksums hold, and a wrong key leaves them as they are.
-pub(super) fn is_torn(file: &[u8]) -> bool {
+pub(crate) fn is_torn(file: &[u8]) -> bool {
 	if file.len() > SEALED_HEADER_LEN {
 		return false;
 	}
@@ -233,7 +241,7 @@ pub(super) fn is_torn(file: &[u8]) -> bool {
 ///
 /// A refused allocation is an error here, before any position is taken, and leaves the writer as
 /// it was.
-pub(super) fn frame(key: &[u8], value: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn frame(key: &[u8], value: &[u8]) -> Result<Vec<u8>> {
 	let (key_len, _) = entry_lens(key.len(), value.len())?;
 	let size = key
 		.len()
@@ -254,7 +262,7 @@ pub(super) fn frame(key: &[u8], value: &[u8]) -> Result<Vec<u8>> {
 /// The cipher takes the position for good the moment it is asked, and refuses a position that is
 /// not after the last one it took, so a caller that tries again after a failure is told no,
 /// instead of sealing different bytes under a nonce that was used.
-pub(super) fn seal(cipher: &FileCipher, offset: u64, entry: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn seal(cipher: &FileCipher, offset: u64, entry: &mut Vec<u8>) -> Result<()> {
 	let at = BlockContext::new(BlockKind::VlogEntry, offset, ENTRY_COMPRESSION);
 	Ok(cipher.seal_append(&at, entry)?)
 }
@@ -268,7 +276,7 @@ pub(super) fn seal(cipher: &FileCipher, offset: u64, entry: &mut Vec<u8>) -> Res
 ///
 /// The pointer is not trusted either: its sizes must give the length of what was read, and the
 /// length of the key, which was sealed with the entry, must be the one the pointer gives.
-pub(super) fn open_entry(
+pub(crate) fn open_entry(
 	cipher: &FileCipher,
 	pointer: &ValuePointer,
 	mut stored: Vec<u8>,
@@ -315,7 +323,7 @@ pub(super) fn open_entry(
 
 /// Renames a file that must not be used, and must not be lost, to a name that the log does not
 /// read: `<name>.torn`, or `<name>.torn.1` and so on if that is taken. Returns the new path.
-pub(super) fn set_aside(path: &Path) -> io::Result<PathBuf> {
+pub(crate) fn set_aside(path: &Path) -> io::Result<PathBuf> {
 	let mut base = path.as_os_str().to_owned();
 	base.push(".torn");
 	let mut target = PathBuf::from(&base);
@@ -381,7 +389,7 @@ mod tests {
 	}
 
 	fn open(ctx: &EncryptionContext, bytes: &[u8]) -> Result<FileCipher> {
-		open_header(ctx, FILE_ID, bytes)
+		open_header(ctx, FILE_ID, bytes, true)
 	}
 
 	fn encryption_error<T>(result: Result<T>) -> EncryptionError {
@@ -521,7 +529,7 @@ mod tests {
 		let ctx = context(CipherSuite::Aes256Gcm);
 		let (_, bytes) = made(&dir, &ctx);
 		// Opened as the file with the next id: the id in the header is not the name of the file.
-		assert!(is_corruption(open_header(&ctx, FILE_ID + 1, &bytes)));
+		assert!(is_corruption(open_header(&ctx, FILE_ID + 1, &bytes, false)));
 
 		// Rewritten to say it is that file, checksum included: the encryption header still names
 		// the old id.
@@ -529,7 +537,7 @@ mod tests {
 		renamed[6..10].copy_from_slice(&(FILE_ID + 1).to_be_bytes());
 		let renamed = with_fixed_file_crc(renamed);
 		assert_eq!(
-			encryption_error(open_header(&ctx, FILE_ID + 1, &renamed)),
+			encryption_error(open_header(&ctx, FILE_ID + 1, &renamed, false)),
 			EncryptionError::FileIdMismatch
 		);
 	}
@@ -810,7 +818,7 @@ mod tests {
 				kat_db(),
 				suite,
 			);
-			open_header(&ctx, KAT_FILE_ID, &header).unwrap();
+			open_header(&ctx, KAT_FILE_ID, &header, false).unwrap();
 
 			// The entries are what sealing them gives, and open as the pointers say.
 			let writer = kat_cipher(suite, true);
