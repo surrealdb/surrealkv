@@ -77,3 +77,54 @@ fn test_cli_basic_workflow() {
 		.expect("Failed to execute get");
 	assert!(!out.status.success());
 }
+
+/// A file that is a sealed table as far as a tool without a key can tell: bytes, and a footer
+/// whose checksum type says that the blocks of the table are sealed.
+fn sealed_table_without_a_key() -> Vec<u8> {
+	let mut footer = vec![0u8; 50];
+	footer[0] = 1; // format
+	footer[1] = 2; // checksum type: sealed blocks
+	footer[2..6].copy_from_slice(&[0, 5, 0, 5]); // the handles of the meta-index and the index
+	footer[42..].copy_from_slice(&[0x57, 0xfb, 0x80, 0x8b, 0x24, 0x75, 0x47, 0xdb]);
+	let mut file = vec![0u8; 300];
+	file.extend_from_slice(&footer);
+	file
+}
+
+#[test]
+fn test_cli_sst_refuses_a_sealed_table_and_says_why() {
+	let temp_dir = TempDir::new().unwrap();
+	let path = temp_dir.path().join("sealed.sst");
+	std::fs::write(&path, sealed_table_without_a_key()).unwrap();
+
+	let out = Command::new(env!("CARGO_BIN_EXE_skv"))
+		.args(["sst", path.to_str().unwrap()])
+		.output()
+		.expect("Failed to execute sst");
+
+	// An error and not a panic, which would exit with 101.
+	assert_eq!(out.status.code(), Some(1));
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(stderr.contains("no key manager"), "{stderr}");
+	assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[test]
+fn test_cli_scrub_does_not_pass_a_database_with_a_sealed_table() {
+	let temp_dir = TempDir::new().unwrap();
+	let tables = temp_dir.path().join("sstables");
+	std::fs::create_dir_all(&tables).unwrap();
+	std::fs::write(tables.join(format!("{:020}.sst", 1)), sealed_table_without_a_key()).unwrap();
+
+	let out = Command::new(env!("CARGO_BIN_EXE_skv"))
+		.args(["scrub", temp_dir.path().to_str().unwrap()])
+		.output()
+		.expect("Failed to execute scrub");
+
+	// It did not verify the table, and it does not say that the table is damaged.
+	assert_eq!(out.status.code(), Some(1));
+	assert!(!String::from_utf8_lossy(&out.stdout).contains("SCRUB PASSED"));
+	let stderr = String::from_utf8_lossy(&out.stderr);
+	assert!(stderr.contains("SCRUB INCOMPLETE"), "{stderr}");
+	assert!(!stderr.contains("SCRUB FAILED"), "{stderr}");
+}

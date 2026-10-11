@@ -307,3 +307,141 @@ async fn a_plain_database_is_not_opened_as_an_encrypted_one_and_nothing_is_chang
 	read_every_key(&tree);
 	tree.close().await.unwrap();
 }
+
+// ========== Neighbours of the tables ==========
+
+#[tokio::test]
+async fn a_foreign_database_is_not_migrated_into_an_encrypted_one() {
+	use surrealkv_compat_v1::{V1_FOOTER_TOTAL_LEN, V1_MAGIC_FOOTER};
+
+	let ctx = context(CipherSuite::Aes256Gcm);
+	let key_manager: Arc<dyn crate::KeyManager> = Arc::new(SoftwareKeyManager::new([0x42; 32]));
+
+	// The directory of each store that is migrated, with what the migration would move.
+	let rocksdb = TempDir::new().unwrap();
+	fs::write(rocksdb.path().join("CURRENT"), b"MANIFEST-000001\n").unwrap();
+	fs::write(rocksdb.path().join("MANIFEST-000001"), b"not a real rocksdb manifest").unwrap();
+
+	let v1 = TempDir::new().unwrap();
+	let mut table = vec![0u8; V1_FOOTER_TOTAL_LEN];
+	table[V1_FOOTER_TOTAL_LEN - V1_MAGIC_FOOTER.len()..].copy_from_slice(&V1_MAGIC_FOOTER);
+	fs::write(v1.path().join("000001.sst"), &table).unwrap();
+
+	let indxdb = TempDir::new().unwrap();
+	surrealkv_compat_indxdb::export_dump(
+		indxdb.path().join("indxdb_dump.bin"),
+		&[(b"user:001".to_vec(), b"Alice".to_vec())],
+	)
+	.unwrap();
+
+	let cases = [
+		(&rocksdb, "CURRENT", "_rocksdb_backup", "RocksDB"),
+		(&v1, "000001.sst", "_v1_backup", "SurrealKV v1"),
+		(&indxdb, "indxdb_dump.bin", "_indxdb_backup", "IndexedDB"),
+	];
+	for (dir, original, backup, store) in cases {
+		// Configured with a resolved context, and with a key manager alone.
+		let with_context = options(dir.path(), Some(&ctx), DEFAULT_MEMTABLE);
+		let with_key_manager = Arc::new(
+			Options {
+				path: dir.path().to_path_buf(),
+				..Default::default()
+			}
+			.with_encryption(Arc::clone(&key_manager), CipherSuite::Aes256Gcm),
+		);
+		for opts in [with_context, with_key_manager] {
+			let err = open_error(&opts);
+			assert!(
+				matches!(&err, Error::InvalidArgument(message)
+					if message.contains(store) && message.contains("encrypted")),
+				"{store}: {err:?}"
+			);
+			// Nothing was read, moved or created.
+			assert!(dir.path().join(original).exists(), "{store}: {original} was moved");
+			assert!(!dir.path().join(backup).exists(), "{store}: a backup was made");
+			assert!(!opts.sstable_dir().exists(), "{store}: the database was created");
+			assert!(!opts.manifest_dir().exists(), "{store}: the database was created");
+		}
+	}
+}
+
+/// The names of the files of `dir` with their bytes.
+fn files_of(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+	fs::read_dir(dir)
+		.unwrap()
+		.flatten()
+		.map(|entry| {
+			(entry.file_name().to_string_lossy().into_owned(), fs::read(entry.path()).unwrap())
+		})
+		.collect()
+}
+
+#[tokio::test]
+async fn a_checkpoint_of_an_encrypted_database_holds_its_sealed_tables_and_restores_with_the_key() {
+	for suite in SUITES {
+		let dir = TempDir::new().unwrap();
+		let checkpoints = TempDir::new().unwrap();
+		let checkpoint = checkpoints.path().join("checkpoint");
+		let ctx = context(suite);
+		let opts = options(dir.path(), Some(&ctx), DEFAULT_MEMTABLE);
+		let tree = Tree::new(Arc::clone(&opts)).unwrap();
+		write_round(&tree, '1', 0, KEYS).await;
+		write_round(&tree, '2', 0, KEYS / 2).await;
+		tree.create_checkpoint(&checkpoint).unwrap();
+
+		// The tables are copied as they are: the same bytes, sealed under the same keys.
+		let copied = files_of(&checkpoint.join("sstables"));
+		assert!(!copied.is_empty());
+		for path in table_files(&tree, &opts) {
+			let name = path.file_name().unwrap().to_string_lossy().into_owned();
+			assert!(copied[&name] == fs::read(&path).unwrap(), "{suite:?}: {name}");
+			assert_sealed(&checkpoint.join("sstables").join(&name));
+		}
+
+		// Restoring it into the database that it was taken from brings back what was there.
+		write_round(&tree, '3', 0, KEYS).await;
+		tree.restore_from_checkpoint(&checkpoint).unwrap();
+		read_every_key(&tree);
+		for path in table_files(&tree, &opts) {
+			assert_sealed(&path);
+		}
+		tree.close().await.unwrap();
+
+		// The checkpoint is a database that opens with the key. It is opened after the restore
+		// has read it, since opening a database may write in its directory.
+		let copy_opts = options(&checkpoint, Some(&ctx), DEFAULT_MEMTABLE);
+		let copy = Tree::new(Arc::clone(&copy_opts)).unwrap();
+		read_every_key(&copy);
+		copy.close().await.unwrap();
+	}
+}
+
+#[tokio::test]
+async fn a_plain_checkpoint_is_not_restored_into_an_encrypted_database() {
+	let plain_dir = TempDir::new().unwrap();
+	let checkpoints = TempDir::new().unwrap();
+	let checkpoint = checkpoints.path().join("checkpoint");
+	let plain = Tree::new(options(plain_dir.path(), None, DEFAULT_MEMTABLE)).unwrap();
+	write_round(&plain, '1', 0, KEYS).await;
+	plain.create_checkpoint(&checkpoint).unwrap();
+	plain.close().await.unwrap();
+
+	let dir = TempDir::new().unwrap();
+	let ctx = context(CipherSuite::Aes256Gcm);
+	let opts = options(dir.path(), Some(&ctx), DEFAULT_MEMTABLE);
+	let tree = Tree::new(Arc::clone(&opts)).unwrap();
+	write_round(&tree, '2', 0, KEYS).await;
+	let before = snapshot(&opts);
+
+	// The checkpoint is refused before anything of the database is touched.
+	let err = tree.restore_from_checkpoint(&checkpoint).unwrap_err();
+	assert!(
+		matches!(&err, Error::InvalidArgument(message) if message.contains("not a usable checkpoint")),
+		"{err:?}"
+	);
+	assert!(snapshot(&opts) == before, "a refused restore changed the files of the database");
+	let txn = tree.begin().unwrap();
+	assert_eq!(txn.get(key(0).as_slice()).unwrap(), Some(value('2', 0)));
+	drop(txn);
+	tree.close().await.unwrap();
+}

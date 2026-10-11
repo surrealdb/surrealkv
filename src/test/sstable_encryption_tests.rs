@@ -1089,3 +1089,70 @@ async fn a_filter_partition_that_fails_authentication_is_an_error_and_not_a_mayb
 		assert_eq!(table.filter_reads_degraded(), 0, "{suite:?}: nothing was skipped");
 	}
 }
+
+// ========== Tools ==========
+
+/// A file that is a sealed table as far as anything that does not hold a key can see: bytes, and
+/// a footer whose checksum type says that the blocks are sealed.
+fn forged_sealed_table() -> Vec<u8> {
+	let mut footer = [0u8; TABLE_FULL_FOOTER_LENGTH];
+	Footer::new(BlockHandle::new(0, 5), BlockHandle::new(0, 5)).encode(&mut footer);
+	footer[1] = ChecksumType::SealedCRC32c as u8;
+	let mut file = vec![0u8; 300];
+	file.extend_from_slice(&footer);
+	file
+}
+
+#[test]
+fn the_inspection_of_a_sealed_table_without_a_key_is_an_error_and_not_a_panic() {
+	let ctx = context(CipherSuite::Aes256Gcm);
+	let opts = options(Some(&ctx), CompressionType::None, true);
+	let real = write_table(&opts, TABLE_ID, &many_points(KEYS));
+
+	let dir = tempfile::TempDir::new().unwrap();
+	let real_path = dir.path().join("real.sst");
+	let forged_path = dir.path().join("forged.sst");
+	std::fs::write(&real_path, &real).unwrap();
+	std::fs::write(&forged_path, forged_sealed_table()).unwrap();
+
+	for path in [&real_path, &forged_path] {
+		for (dump_keys, verify) in [(false, false), (true, true)] {
+			let err = crate::inspect::dump_sst(path, dump_keys, verify).unwrap_err();
+			assert!(
+				matches!(err, Error::Encryption(EncryptionError::NotConfigured)),
+				"{}: {err:?}",
+				path.display()
+			);
+			// The text says what is the matter, without a path, a key id or any key.
+			assert!(err.to_string().contains("no key manager"), "{err}");
+		}
+	}
+}
+
+#[test]
+fn a_scrub_does_not_count_a_sealed_table_as_damaged_and_does_not_pass_it_either() {
+	let ctx = context(CipherSuite::XChaCha20Poly1305);
+	let sealed_opts = options(Some(&ctx), CompressionType::None, true);
+	let plain_opts = options(None, CompressionType::None, true);
+
+	let dir = tempfile::TempDir::new().unwrap();
+	let tables = dir.path().join("sstables");
+	std::fs::create_dir_all(&tables).unwrap();
+	std::fs::write(
+		tables.join(format!("{:020}.sst", 1)),
+		write_table(&sealed_opts, 1, &many_points(KEYS)),
+	)
+	.unwrap();
+	std::fs::write(
+		tables.join(format!("{:020}.sst", 2)),
+		write_table(&plain_opts, 2, &many_points(KEYS)),
+	)
+	.unwrap();
+
+	let report = crate::inspect::scrub_db(dir.path()).unwrap();
+	assert_eq!(report.total_tables, 2);
+	assert_eq!(report.verified_tables, 1, "only the plain table was verified");
+	assert_eq!(report.corrupt_blocks, 0, "a table that cannot be read is not a damaged one");
+	assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+	assert!(report.errors[0].contains("not verified"), "{}", report.errors[0]);
+}

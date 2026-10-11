@@ -289,6 +289,9 @@ pub fn dump_manifest<P: AsRef<Path>>(path: P) -> Result<ManifestInfo> {
 }
 
 /// Dumps deep inspection information from an SSTable.
+///
+/// A table whose blocks are sealed cannot be read without the key of its database, and nothing
+/// here takes one: it is refused with `Error::Encryption`, before any of its blocks is read.
 pub fn dump_sst<P: AsRef<Path>>(
 	path: P,
 	dump_keys: bool,
@@ -437,6 +440,13 @@ pub fn scrub_db<P: AsRef<Path>>(db_path: P) -> Result<ScrubReport> {
 					if let Some(blocks) = info.verified_blocks {
 						report.total_blocks += blocks;
 					}
+				}
+				// A sealed table cannot be read without a key: it is not verified, which is not
+				// the same as damaged.
+				Err(e @ Error::Encryption(_)) => {
+					report
+						.errors
+						.push(format!("{}: not verified, it cannot be read: {e}", p.display()));
 				}
 				Err(e) => {
 					report.corrupt_blocks += 1;

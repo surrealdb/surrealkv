@@ -2042,8 +2042,24 @@ impl Tree {
 		})
 	}
 
+	/// Refuses to migrate a database of another store into one that is meant to be encrypted. A
+	/// migration moves the old files into a backup directory inside this one, so that a copy of the
+	/// old database stays there in the clear, and writes what it migrates without the key. It is
+	/// refused before anything is read or moved.
+	fn refuse_migration_into_an_encrypted_database(opts: &Options, source: &str) -> Result<()> {
+		if opts.key_manager.is_some() || opts.encryption_context().is_some() {
+			return Err(Error::InvalidArgument(format!(
+				"A {source} database cannot be migrated into an encrypted database: the migration \
+				 keeps a plaintext copy of the old database in this directory and does not \
+				 encrypt what it writes. Migrate it without a key manager."
+			)));
+		}
+		Ok(())
+	}
+
 	/// Automatically migrates an existing RocksDB database to SurrealKV v2 format in pure Rust.
 	fn migrate_from_rocksdb(opts: &Options) -> Result<()> {
+		Self::refuse_migration_into_an_encrypted_database(opts, "RocksDB")?;
 		tracing::info!("Detected existing RocksDB database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
 		let records = surrealkv_compat_rocksdb::read_all_latest(&opts.path).map_err(|e| {
 			Error::Other(format!("Failed to read RocksDB database for migration: {e}"))
@@ -2128,6 +2144,7 @@ impl Tree {
 
 	/// Automatically migrates an existing SurrealKV v1 database to SurrealKV v2 format.
 	fn migrate_from_v1(opts: &Options) -> Result<()> {
+		Self::refuse_migration_into_an_encrypted_database(opts, "SurrealKV v1")?;
 		tracing::info!("Detected existing SurrealKV v1 database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
 		let records = surrealkv_compat_v1::read_all_latest(&opts.path).map_err(|e| {
 			Error::Other(format!("Failed to read SurrealKV v1 database for migration: {e}"))
@@ -2206,6 +2223,7 @@ impl Tree {
 
 	/// Automatically migrates an existing IndexedDB dump to SurrealKV v2 format.
 	fn migrate_from_indxdb(opts: &Options) -> Result<()> {
+		Self::refuse_migration_into_an_encrypted_database(opts, "IndexedDB")?;
 		tracing::info!("Detected existing IndexedDB dump at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
 		let dump_file = if opts.path.is_dir() {
 			opts.path.join("indxdb_dump.bin")
