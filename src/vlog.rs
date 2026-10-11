@@ -12,8 +12,6 @@ use crate::error::{EncryptionError, Error, Result};
 use crate::tde::{EncryptionContext, FileCipher};
 use crate::{vfs, CompressionType, Options, VLogChecksumLevel, Value};
 
-// What the writer of the commit that follows uses is not used yet.
-#[allow(dead_code)]
 pub(crate) mod sealed;
 
 /// Test-only: the VLog files whose fsync completed, in order.
@@ -378,8 +376,6 @@ impl ValuePointer {
 
 	/// Creates a pointer to a sealed entry. `checksum` is the CRC-32 of the entry as it is stored,
 	/// ciphertext and tag included, and the sizes are those of the key and the value.
-	// The writer of the commit that follows makes them.
-	#[allow(dead_code)]
 	pub(crate) fn sealed(
 		file_id: u32,
 		offset: u64,
@@ -543,9 +539,12 @@ pub(crate) struct VLogWriter {
 	/// Total bytes written to this file
 	bytes_written: u64,
 	/// Set when an append failed and the file could not be cut back to the end of the last
-	/// complete entry. The writer then refuses appends, and the log replaces it on its next
-	/// append.
+	/// complete entry, or when an append to a sealed file failed at all. The writer then
+	/// refuses appends, and the log replaces it on its next append.
 	poisoned: bool,
+	/// The cipher that seals the entries of a sealed file, which is the only thing that seals
+	/// in it: `None` for a plaintext file.
+	cipher: Option<FileCipher>,
 	/// Test-only: the next cut of a failed append fails.
 	#[cfg(test)]
 	fail_cut_back: bool,
@@ -567,6 +566,22 @@ impl VLogWriter {
 		let sync_fd = Arc::new(file.try_clone()?);
 
 		let current_offset = file.metadata()?.len();
+		if current_offset > 0 {
+			// A sealed file is never appended to by a writer that does not seal: its entries
+			// would be plaintext in the middle of ciphertext, and the sealing writer of the file
+			// is gone, so no other may pick up where it stopped.
+			//
+			// The handle above can only append, so the start of the file is read through
+			// another one.
+			let mut start = [0u8; 6];
+			let read = vfs::File::read_up_to(&File::open(path)?, 0, &mut start)?;
+			if sealed::is_sealed_start(&start[..read]) {
+				return Err(EncryptionError::InvalidInput(
+					"a sealed value-log file is never reopened for appending",
+				)
+				.into());
+			}
+		}
 		let mut writer = BufWriter::new(Sink::new(file));
 
 		// If this is a new file, write the header
@@ -591,6 +606,33 @@ impl VLogWriter {
 			file_id,
 			bytes_written: current_offset,
 			poisoned: false,
+			cipher: None,
+			#[cfg(test)]
+			fail_cut_back: false,
+		})
+	}
+
+	/// Creates the writer of a new sealed file, which is as long as its header and has its
+	/// header on disk. The file must not exist: the writer seals under a key that is its own, and
+	/// no writer ever picks a file up again.
+	pub(crate) fn create_sealed(
+		path: &Path,
+		file_id: u32,
+		max_file_size: u64,
+		compression: u8,
+		context: &EncryptionContext,
+	) -> Result<Self> {
+		let (file, cipher) = sealed::create(path, file_id, max_file_size, compression, context)?;
+		let sync_fd = Arc::new(file.try_clone()?);
+		let header_len = sealed::SEALED_HEADER_LEN as u64;
+		Ok(Self {
+			writer: BufWriter::new(Sink::new(file)),
+			sync_fd,
+			current_offset: header_len,
+			file_id,
+			bytes_written: header_len,
+			poisoned: false,
+			cipher: Some(cipher),
 			#[cfg(test)]
 			fail_cut_back: false,
 		})
@@ -612,6 +654,9 @@ impl VLogWriter {
 		}
 
 		let (key_len, value_len) = entry_lens(key.len(), value.len())?;
+		if self.cipher.is_some() {
+			return self.append_sealed(key, value, (key_len, value_len));
+		}
 		let offset = self.current_offset;
 
 		// Calculate CRC32 of key + value
@@ -637,6 +682,48 @@ impl VLogWriter {
 		self.bytes_written += entry_size;
 
 		Ok(ValuePointer::new(self.file_id, offset, key_len, value_len, crc32))
+	}
+
+	/// Appends an entry to a sealed file.
+	///
+	/// The entry is sealed at its offset, which is its nonce slot, and a position is sealed once
+	/// per key: so the position is spoken for the moment it is given to the cipher, before any
+	/// byte is written, and the writer is poisoned until the append has gone through. Any way out
+	/// of here but the end, a failed seal or a failed or partial write, leaves it poisoned, and the
+	/// log then starts a file of its own, with a key of its own. The file cannot be cut back and
+	/// tried again the way a plaintext one is: the position that the failed entry had would be
+	/// sealed a second time with other bytes, which under the same key and nonce leaks what the
+	/// two entries have in common. What an earlier append left in the buffer is still written.
+	fn append_sealed(
+		&mut self,
+		key: &[u8],
+		value: &[u8],
+		(key_len, value_len): (u32, u32),
+	) -> Result<ValuePointer> {
+		let offset = self.current_offset;
+
+		// What can fail without taking the position: the allocation, and an offset that does
+		// not fit.
+		let mut entry = sealed::frame(key, value)?;
+		let stored_len = (entry.len() + crate::tde::TAG_LEN) as u64;
+		let next = offset.checked_add(stored_len).ok_or_else(|| {
+			Error::InvalidArgument("The offset in a VLog file does not fit in 64 bits".to_string())
+		})?;
+
+		// From here the position is spoken for, whatever happens to the entry.
+		self.poisoned = true;
+		self.current_offset = next;
+		self.bytes_written += stored_len;
+
+		let cipher = self.cipher.as_ref().ok_or_else(|| {
+			Error::Other("a sealed append was made on a writer without a cipher".to_string())
+		})?;
+		sealed::seal(cipher, offset, &mut entry)?;
+		let checksum = crc32fast::hash(&entry);
+		self.writer.write_all(&entry)?;
+
+		self.poisoned = false;
+		Ok(ValuePointer::sealed(self.file_id, offset, key_len, value_len, checksum))
 	}
 
 	fn write_entry(
@@ -714,6 +801,13 @@ impl VLogWriter {
 	#[cfg(test)]
 	pub(crate) fn fail_next_cut_back(&mut self) {
 		self.fail_cut_back = true;
+	}
+
+	/// Test-only: the first position that may still be sealed in a sealed file, which is one past
+	/// the last that was given to the cipher.
+	#[cfg(test)]
+	pub(crate) fn next_position_to_seal(&self) -> Option<u64> {
+		self.cipher.as_ref().map(|cipher| cipher.next_position())
 	}
 
 	/// Test-only: marks the writer as one whose failed append could not be cut back.
@@ -952,13 +1046,6 @@ impl VLog {
 	/// is not fsynced here, which would stall every commit behind it, but queued for the next
 	/// [`sync`](Self::sync).
 	fn roll_over(&self, active: &mut Option<VLogWriter>) -> Result<()> {
-		if self.encryption().is_some() {
-			// Sealed files are read and not written yet. A plaintext file must not be started in
-			// a log that is configured with encryption.
-			return Err(
-				EncryptionError::InvalidInput("a sealed value log is not written yet").into()
-			);
-		}
 		let old = match active.as_mut() {
 			Some(writer) => {
 				writer.flush()?;
@@ -970,12 +1057,28 @@ impl VLog {
 		// Create new file
 		let file_id = self.next_file_id.fetch_add(1, Ordering::SeqCst);
 		let file_path = self.vlog_file_path(file_id);
-		let new_writer = VLogWriter::new(
-			&file_path,
-			file_id,
-			self.opts.vlog_max_file_size,
-			CompressionType::None as u8,
-		)?;
+		let new_writer = match self.encryption() {
+			Some(context) => {
+				// A sealed file starts with a new salt and a header that is on disk, and its name
+				// is on disk too before anything is written to it: a restart that found entries
+				// in a file whose name was lost would not find the file the pointers name.
+				let writer = VLogWriter::create_sealed(
+					&file_path,
+					file_id,
+					self.opts.vlog_max_file_size,
+					CompressionType::None as u8,
+					context,
+				)?;
+				crate::lsm::fsync_directory(&self.path)?;
+				writer
+			}
+			None => VLogWriter::new(
+				&file_path,
+				file_id,
+				self.opts.vlog_max_file_size,
+				CompressionType::None as u8,
+			)?,
+		};
 
 		// Register the new file for GC safety
 		self.register_vlog_file(file_id, file_path, 0); // Start with size 0
@@ -985,6 +1088,10 @@ impl VLog {
 
 		self.unsynced.lock().extend(old);
 		self.created.mark();
+		if self.encryption().is_some() {
+			// The directory was fsynced above, and that covers every file created before it.
+			self.created.settle(self.created.count());
+		}
 		*active = Some(new_writer);
 		Ok(())
 	}
