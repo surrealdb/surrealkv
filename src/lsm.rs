@@ -509,6 +509,9 @@ impl CoreInner {
 				self.manifest_uncertain.store(true, Ordering::Release);
 				error
 			}
+			// A manifest that could not be sealed was not written: the key was not to be had, and
+			// whether it may be asked for again is what its type says, which text does not.
+			Error::Encryption(_) => error,
 			error => Error::Other(format!("{context}: {error}")),
 		}
 	}
@@ -1249,10 +1252,14 @@ impl CoreInner {
 				let rollback = manifest.apply_changeset(&changeset)?;
 				if let Err(e) = write_manifest_to_disk(&manifest) {
 					manifest.revert_changeset(rollback);
-					return Err(Error::Other(format!(
-						"Failed to update manifest log_number after immutable flush: {}",
-						e
-					)));
+					return Err(match e {
+						// A manifest that could not be sealed keeps the error of the key.
+						Error::Encryption(_) => e,
+						e => Error::Other(format!(
+							"Failed to update manifest log_number after immutable flush: {}",
+							e
+						)),
+					});
 				}
 
 				tracing::debug!(
@@ -1927,8 +1934,10 @@ impl Core {
 			tracing::debug!("Flushing all memtables on shutdown (flush_on_close=true)");
 
 			// Flush ALL memtables: immutables first (older data), then active (newest data)
-			self.inner.flush_all_memtables_for_shutdown().map_err(|e| {
-				Error::Other(format!("Failed to flush memtables during shutdown: {}", e))
+			self.inner.flush_all_memtables_for_shutdown().map_err(|e| match e {
+				// A key that could not be had stays what it is, for the caller of `close`.
+				Error::Encryption(_) => e,
+				e => Error::Other(format!("Failed to flush memtables during shutdown: {}", e)),
 			})?;
 
 			tracing::debug!("All memtables flushed successfully on shutdown");

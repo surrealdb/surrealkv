@@ -61,6 +61,8 @@ pub mod encryption_checkpoint_tests;
 #[cfg(test)]
 pub mod encryption_open_tests;
 #[cfg(test)]
+pub mod encryption_surfaces_tests;
+#[cfg(test)]
 pub mod flusher_alloc_diet_tests;
 #[cfg(test)]
 pub mod group_fail_stop_edge_tests;
