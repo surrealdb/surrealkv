@@ -406,19 +406,17 @@ impl BlockSource {
 	fn extent(&self, handle: &BlockHandle, trailer_len: usize) -> Result<usize> {
 		let limit = self.file_size.saturating_sub(TABLE_FULL_FOOTER_LENGTH as u64);
 		let (offset, size) = (handle.offset() as u64, handle.size() as u64);
-		let fits = size
-			.checked_add(trailer_len as u64)
-			.and_then(|len| len.checked_add(offset))
-			.is_some_and(|end| end <= limit);
-		if !fits {
-			return Err(Error::from(SSTableError::BlockHandleOutOfBounds {
+		let end = size.checked_add(trailer_len as u64).and_then(|len| len.checked_add(offset));
+		// The length that is read is a `usize`, which is 32 bits on some targets: a size that
+		// passes the test against the file can still not take its trailer in that width.
+		match (end, handle.size().checked_add(trailer_len)) {
+			(Some(end), Some(len)) if end <= limit => Ok(len),
+			_ => Err(Error::from(SSTableError::BlockHandleOutOfBounds {
 				block_offset: offset,
 				block_size: size,
 				limit,
-			}));
+			})),
 		}
-		// The sum is at most `limit`, so it fits where the handle's own size did.
-		Ok(handle.size() + trailer_len)
 	}
 
 	/// Reads the block at `handle` with its trailer, in one request.
