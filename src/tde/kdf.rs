@@ -11,6 +11,10 @@
 //! with `LABEL = "surrealkv/tde/v1/dek"`, expanded to 32 bytes. The salt is drawn from the OS
 //! random number generator for every writer, so two files never share a key unless the
 //! generator fails.
+//!
+//! The tag of the file header is made with a second key from the same extraction, whose label is
+//! `"surrealkv/tde/v1/hdr"` and whose other inputs are the same. It is a different key, so the
+//! header's tag never uses one of the data key's nonces, and it is used for exactly one message.
 
 use std::fmt;
 
@@ -30,6 +34,9 @@ pub const FILE_KEY_LEN: usize = 32;
 /// Context label of the key that seals a file's data.
 const DEK_LABEL: &[u8] = b"surrealkv/tde/v1/dek";
 
+/// Context label of the key that authenticates a file's header. Same length as `DEK_LABEL`.
+const HDR_LABEL: &[u8] = b"surrealkv/tde/v1/hdr";
+
 /// Length of the `info` input: the label, suite, file kind, key id, file id and database id.
 const INFO_LEN: usize = DEK_LABEL.len() + 1 + 1 + 4 + 8 + DB_ID_LEN;
 
@@ -45,6 +52,9 @@ pub struct FileKey {
 	identity: FileIdentity,
 	salt: [u8; SALT_LEN],
 	dek: Zeroizing<[u8; FILE_KEY_LEN]>,
+	/// The key that authenticates the file header, `None` once it has been used: it makes or
+	/// checks exactly one tag.
+	header_key: Option<Zeroizing<[u8; FILE_KEY_LEN]>>,
 	can_seal: bool,
 }
 
@@ -127,6 +137,15 @@ impl FileKey {
 		(self.identity, self.dek, self.can_seal)
 	}
 
+	/// Hands out the key that authenticates the file header, once. A second request fails with
+	/// `PositionReuse`: the header has a single nonce slot, so a second message under the same key
+	/// would repeat the nonce and break the authenticity of both tags.
+	pub(super) fn take_header_key(
+		&mut self,
+	) -> Result<Zeroizing<[u8; FILE_KEY_LEN]>, EncryptionError> {
+		self.header_key.take().ok_or(EncryptionError::PositionReuse)
+	}
+
 	fn derive(
 		root: &[u8; ROOT_KEY_LEN],
 		salt: [u8; SALT_LEN],
@@ -134,16 +153,13 @@ impl FileKey {
 		can_seal: bool,
 	) -> Result<Self, EncryptionError> {
 		let hkdf = Hkdf::<Sha256>::new(Some(&salt), root);
-		let mut dek = Zeroizing::new([0u8; FILE_KEY_LEN]);
-		// Expanding to 32 bytes is far below the 255 blocks HKDF allows, so this does not fail;
-		// it is an error rather than a panic because nothing derived from a failed expansion may
-		// be used.
-		hkdf.expand(&info(DEK_LABEL, &identity), &mut *dek)
-			.map_err(|_| EncryptionError::InvalidInput("the file key could not be derived"))?;
+		let dek = expand(&hkdf, DEK_LABEL, &identity)?;
+		let header_key = expand(&hkdf, HDR_LABEL, &identity)?;
 		Ok(Self {
 			identity,
 			salt,
 			dek,
+			header_key: Some(header_key),
 			can_seal,
 		})
 	}
@@ -159,11 +175,31 @@ impl FileKey {
 		Self::derive(root, salt, identity, can_seal).unwrap()
 	}
 
+	/// A copy of the header key, which is gone once it has been used.
+	#[cfg(test)]
+	pub(crate) fn header_key_for_test(&self) -> Option<[u8; FILE_KEY_LEN]> {
+		self.header_key.as_ref().map(|key| **key)
+	}
+
 	/// A copy of the file key, for tests that compare keys or look for them in output.
 	#[cfg(test)]
 	pub(crate) fn dek_for_test(&self) -> [u8; FILE_KEY_LEN] {
 		*self.dek
 	}
+}
+
+/// One 32 byte key out of the extraction, for `label`.
+fn expand(
+	hkdf: &Hkdf<Sha256>,
+	label: &[u8],
+	identity: &FileIdentity,
+) -> Result<Zeroizing<[u8; FILE_KEY_LEN]>, EncryptionError> {
+	let mut key = Zeroizing::new([0u8; FILE_KEY_LEN]);
+	// Expanding to 32 bytes is far below the 255 blocks HKDF allows, so this does not fail; it is
+	// an error rather than a panic because nothing derived from a failed expansion may be used.
+	hkdf.expand(&info(label, identity), &mut *key)
+		.map_err(|_| EncryptionError::InvalidInput("the file key could not be derived"))?;
+	Ok(key)
 }
 
 /// The HKDF `info` input: `label || suite(1) || file_kind(1) || key_id(4, BE) || file_id(8, BE) ||
@@ -258,6 +294,39 @@ mod tests {
 		assert_eq!(
 			hex(&b.dek_for_test()),
 			"012d010e7f0155632efd20c9a6db17348ddef98976eda0e9a2f67b2b04a612bb"
+		);
+	}
+
+	// The same computation with the label "surrealkv/tde/v1/hdr", for the key that authenticates
+	// the file header.
+	#[test]
+	fn the_header_key_matches_independently_computed_hkdf_vectors() {
+		let a = FileKey::derive_for_test(&ROOT, SALT, identity_a(), true);
+		assert_eq!(
+			hex(&a.header_key_for_test().unwrap()),
+			"907fef4f9da88c4a503b41582c6fc6533cf6429d2dd29295a17336e78a5c4be0"
+		);
+		let b = FileKey::derive_for_test(&ROOT, SALT, identity_b(), true);
+		assert_eq!(
+			hex(&b.header_key_for_test().unwrap()),
+			"3b43c6f8527f85b8653cf74624cd135e33bb8230cd20149d7e5e36eea174f297"
+		);
+		// A different key from the data key, whatever the inputs.
+		assert_ne!(a.header_key_for_test().unwrap(), a.dek_for_test());
+		assert_ne!(b.header_key_for_test().unwrap(), b.dek_for_test());
+	}
+
+	#[test]
+	fn the_header_key_can_be_taken_once() {
+		let mut key = FileKey::derive_for_test(&ROOT, SALT, identity_a(), true);
+		let expected = key.header_key_for_test().unwrap();
+		assert_eq!(*key.take_header_key().unwrap(), expected);
+		assert!(key.header_key_for_test().is_none());
+		assert_eq!(key.take_header_key().unwrap_err(), EncryptionError::PositionReuse);
+		// The data key is not affected.
+		assert_eq!(
+			key.dek_for_test(),
+			FileKey::derive_for_test(&ROOT, SALT, identity_a(), true).dek_for_test()
 		);
 	}
 
@@ -449,8 +518,9 @@ mod tests {
 	fn a_file_key_prints_no_key_material() {
 		let key = FileKey::derive_for_test(&ROOT, SALT, identity_a(), true);
 		let secret = key.dek_for_test();
+		let header_secret = key.header_key_for_test().unwrap();
 		for text in [format!("{key:?}"), format!("{key:#?}")] {
-			assert_leaks_no_bytes(&text, &[&secret, &ROOT]);
+			assert_leaks_no_bytes(&text, &[&secret, &header_secret, &ROOT]);
 			assert!(text.contains("FileKey"), "{text}");
 		}
 	}

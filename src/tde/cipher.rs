@@ -270,6 +270,33 @@ impl Primitive {
 	}
 }
 
+/// The tag of a file header: an AEAD seal of no plaintext with `header` as the associated data,
+/// under the key made for the header and the all-zero nonce of position 0.
+///
+/// The key is a different one from the file's data key and is used for this one message, so the
+/// nonce can never repeat under it and never collides with a data block's.
+pub(super) fn seal_header_tag(
+	suite: CipherSuite,
+	key: &[u8; FILE_KEY_LEN],
+	header: &[u8],
+) -> Result<[u8; TAG_LEN], EncryptionError> {
+	let primitive = Primitive::new(suite, key)?;
+	let (nonce, len) = nonce_for(suite, 0);
+	primitive.seal(&nonce[..len], header, &mut [])
+}
+
+/// Checks a header tag made by [`seal_header_tag`]. A mismatch is `AuthenticationFailed`.
+pub(super) fn open_header_tag(
+	suite: CipherSuite,
+	key: &[u8; FILE_KEY_LEN],
+	header: &[u8],
+	tag: &[u8; TAG_LEN],
+) -> Result<(), EncryptionError> {
+	let primitive = Primitive::new(suite, key)?;
+	let (nonce, len) = nonce_for(suite, 0);
+	primitive.open(&nonce[..len], header, &mut [], tag)
+}
+
 /// Seals and opens the blocks of one file. Built from a [`FileKey`], which it consumes.
 ///
 /// The key schedule is built once, so it is cheap to keep for the life of a file and to share:

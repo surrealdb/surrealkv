@@ -24,6 +24,8 @@
 //! them.
 
 mod cipher;
+mod context;
+mod header;
 mod identity;
 mod kdf;
 mod keys;
@@ -33,6 +35,8 @@ mod suite;
 mod testutil;
 
 pub use cipher::{BlockContext, BlockKind, FileCipher, AAD_LEN, TAG_LEN};
+pub use context::EncryptionContext;
+pub use header::{CryptoHeader, HEADER_LEN, HEADER_MAGIC, HEADER_VERSION};
 pub use identity::{DbId, FileIdentity, FileKind, DB_ID_LEN};
 pub use kdf::{FileKey, FILE_KEY_LEN};
 pub use keys::{KeyManager, KeyState, SoftwareKeyManager, ROOT_KEY_LEN};
