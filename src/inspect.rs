@@ -328,7 +328,10 @@ pub fn dump_sst<P: AsRef<Path>>(
 
 	let IndexType::Partitioned(ref partitioned) = table.index_block;
 	let mut index_iter = IndexIterator::new(partitioned);
-	index_iter.seek_to_first()?;
+	// A table of range deletions alone has no data block and an empty index.
+	if !table.holds_only_range_deletions() {
+		index_iter.seek_to_first()?;
+	}
 
 	while index_iter.valid() {
 		let handle = index_iter.block_handle()?;

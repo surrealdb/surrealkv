@@ -347,6 +347,10 @@ impl Compactor {
 		} else if !comp_iter.active_range_deletions().is_empty() {
 			// No point entries were produced, but active range deletions exist.
 			// Write a single output SST containing the range deletions so they are preserved.
+			// This holds at the bottom level too: a range deletion has one point entry, at its
+			// start key, so the tables of the level that were taken are those around that key,
+			// and the tables that were not, or the levels above, may hold other keys it covers.
+			// The table has no data block and no key range (`Table::has_points`).
 			let id = self.options.level_manifest.read()?.next_table_id();
 			let path = self.get_table_path(id);
 			let file = SysFile::create(&path)?;

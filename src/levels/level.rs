@@ -52,13 +52,19 @@ impl Level {
 	/// Inserts a new table sorted by smallest key (ascending)
 	/// Tables cannot overlap, enables O(log n) binary search for range queries
 	/// Using for Level 1+ where tables have non-overlapping key ranges
+	///
+	/// A table without points (see `Table::has_points`) has no key to sort by: it goes after the
+	/// tables that have points, so the binary searches over the level see them in order and it
+	/// stays at the end.
 	pub(crate) fn insert_sorted_by_key(&mut self, table: Arc<Table>) {
 		let insert_pos = self.tables.partition_point(|existing| {
 			match (&existing.meta.smallest_point, &table.meta.smallest_point) {
 				(Some(existing_smallest), Some(new_smallest)) => {
 					existing_smallest.user_key < new_smallest.user_key
 				}
-				_ => true,
+				(Some(_), None) => true,
+				(None, Some(_)) => false,
+				(None, None) => true,
 			}
 		});
 		self.tables.insert(insert_pos, table);
@@ -90,9 +96,12 @@ impl Level {
 
 	/// Finds the index after the last table that could potentially overlap with
 	/// the given range. Returns the exclusive end index for iteration.
+	///
+	/// A table without points is after every range: it sorts last and holds nothing to scan (its
+	/// range deletions are read from the metadata of every table).
 	pub(crate) fn find_last_overlapping_table(&self, range: &InternalKeyRange) -> usize {
 		// Find the first table that is completely after the range
-		self.tables.partition_point(|table| !table.is_after_range(range))
+		self.tables.partition_point(|table| table.has_points() && !table.is_after_range(range))
 	}
 
 	/// Finds the single table that could contain the given user key in this level.
@@ -112,16 +121,12 @@ impl Level {
 				false
 			}
 		});
-		if idx < self.tables.len() {
-			let table = &self.tables[idx];
-			if let Some(ref smallest) = table.meta.smallest_point {
-				if comparator.compare(key, smallest.user_key.as_slice()) != std::cmp::Ordering::Less
-				{
-					return Some(table);
-				}
-			} else {
-				return Some(table);
-			}
+		// The search lands on a table without points when the key is after every key of the
+		// level: no table holds it.
+		let table = self.tables.get(idx)?;
+		let smallest = table.meta.smallest_point.as_ref()?;
+		if comparator.compare(key, smallest.user_key.as_slice()) != std::cmp::Ordering::Less {
+			return Some(table);
 		}
 		None
 	}

@@ -1984,10 +1984,6 @@ async fn a_range_tombstone_alone_survives_a_compaction_crash() {
 /// merge has no point entry to write: the compaction has either no output, or one table that holds
 /// the range deletion alone. Every image reopens to the keys deleted, and the live tree scans.
 #[test(tokio::test)]
-#[ignore = "product defect: the table of range deletions alone that write_merged_table writes when \
-            every point is covered has an empty partitioned index, and a point get that reaches it \
-            fails with SSTable(EmptyCorruptPartitionedIndex), on the live tree right after the \
-            compaction"]
 async fn a_bottom_level_compaction_whose_points_are_all_covered_by_a_range_tombstone_recovers() {
 	let dir = TempDir::new("cc-db").unwrap();
 	let images = TempDir::new("cc-images").unwrap();
