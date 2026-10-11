@@ -2,9 +2,9 @@
 //! writes straight to level zero make are sealed, a reopen reads them with the key, and a
 //! database is never opened with a key that is not its own.
 //!
-//! Only the tables are sealed at this point. The write-ahead log, the value log and the manifest
-//! of these databases are plain, so what is checked of the files is the files of the tables, and
-//! what is checked of a refused open is that it changed nothing.
+//! What is checked of the files is the files of the tables, and what is checked of a refused
+//! open is that it changed nothing. The manifest and the value log of these databases are sealed
+//! too, and the write-ahead log is not yet.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -344,11 +344,13 @@ async fn a_plain_database_is_not_opened_as_an_encrypted_one_and_nothing_is_chang
 		assert!(contains(bytes, b"tv-canary"), "the control: a plain table holds its values");
 	}
 
+	// The manifest says that the database is not encrypted, which is found before any table is
+	// read: encryption is chosen when a database is created and is never added to one.
 	for suite in SUITES {
 		let encrypted = options(dir.path(), Some(&context(suite)), DEFAULT_MEMTABLE);
 		let err = open_error(&encrypted);
 		assert!(
-			matches!(err, Error::Encryption(EncryptionError::PlaintextInEncryptedDb)),
+			matches!(err, Error::Encryption(EncryptionError::NotEncrypted)),
 			"{suite:?}: {err:?}"
 		);
 	}

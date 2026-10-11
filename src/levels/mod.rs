@@ -138,14 +138,25 @@ pub(crate) fn unseal_manifest(
 	};
 	match manifest_kind(&data) {
 		ManifestKind::Sealed => open_manifest(context, &data),
-		ManifestKind::Plain => Err(EncryptionError::NotEncrypted.into()),
-		ManifestKind::CutShort => Err(Error::ManifestCorruption(
+		kind => Err(refuse_unsealed_manifest(kind)),
+	}
+}
+
+/// The error for a manifest that is not an encrypted one, where the database is encrypted: not
+/// being encrypted is a statement about the database, and a file that is not even a manifest is
+/// damage.
+pub(crate) fn refuse_unsealed_manifest(kind: ManifestKind) -> Error {
+	match kind {
+		ManifestKind::Plain => EncryptionError::NotEncrypted.into(),
+		// Not a reason to refuse a manifest, so never asked for one.
+		ManifestKind::Sealed => EncryptionError::InvalidInput("the manifest is encrypted").into(),
+		ManifestKind::CutShort => Error::ManifestCorruption(
 			"the manifest is cut short: it ends before its first header".to_string(),
-		)),
-		ManifestKind::Unknown => Err(Error::ManifestCorruption(
+		),
+		ManifestKind::Unknown => Error::ManifestCorruption(
 			"the manifest begins with neither a version nor the magic of an encrypted manifest"
 				.to_string(),
-		)),
+		),
 	}
 }
 
@@ -246,6 +257,9 @@ pub(crate) struct ChangeSetRollback {
 
 mod iter;
 mod level;
+mod mode;
+
+pub(crate) use mode::resolve_encryption;
 
 pub type HiddenSet = HashSet<u64>;
 

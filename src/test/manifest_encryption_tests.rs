@@ -111,7 +111,7 @@ fn with_fixed_header_crc(mut bytes: Vec<u8>) -> Vec<u8> {
 
 /// What the frozen loader reads of a manifest.
 #[derive(Debug)]
-struct OldManifest {
+pub(super) struct OldManifest {
 	next_table_id: u64,
 	last_sequence: u64,
 	levels: Vec<Vec<u64>>,
@@ -121,7 +121,7 @@ struct OldManifest {
 /// How a manifest was read before manifests could be encrypted, written out here from the format
 /// and not from the code that reads it now: the version first, which must be 1, then the three
 /// counters, the tables of each level and the snapshots. It stands for a binary of that time.
-fn frozen_old_decode(data: &[u8]) -> Result<OldManifest, String> {
+pub(super) fn frozen_old_decode(data: &[u8]) -> Result<OldManifest, String> {
 	let mut reader = std::io::Cursor::new(data);
 	let mut read = |len: usize| -> Result<Vec<u8>, String> {
 		let mut bytes = vec![0u8; len];

@@ -2014,6 +2014,11 @@ impl Tree {
 		// finish, or if it holds database files but no usable manifest. These must stay ahead
 		// of the migrations, the directory creation and the lock file.
 		crate::checkpoint::check_restore_finished(&opts)?;
+
+		// Whether the database is encrypted is read from its manifest, and the key checked by
+		// opening it, before anything is created or moved. This writes nothing: an encrypted
+		// database that is new writes its first manifest, sealed, before any other file.
+		let opts = crate::levels::resolve_encryption(opts)?;
 		check_manifest_before_open(&opts)?;
 
 		// If the path contains an existing RocksDB database, automatically migrate it in pure Rust
@@ -2838,8 +2843,9 @@ impl TreeBuilder {
 	/// This is useful when you need to keep a reference to the options
 	/// after creating the tree.
 	pub fn build_with_options(self) -> Result<(Tree, Arc<Options>)> {
-		let opts = Arc::new(self.opts);
-		let tree = Tree::new(Arc::clone(&opts))?;
+		let tree = Tree::new(Arc::new(self.opts))?;
+		// The options the tree runs with, which hold the encryption of the database if it has any
+		let opts = Arc::clone(&tree.core.inner.opts);
 		Ok((tree, opts))
 	}
 }
