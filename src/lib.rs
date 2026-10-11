@@ -64,7 +64,7 @@ pub use crate::error::{
 pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::stall::WriteStallInfo;
 #[doc(hidden)]
-pub use crate::tde::{BlockCipher, CipherSuite, KeyManager, SoftwareKeyManager};
+pub use crate::tde::{CipherSuite, KeyManager, KeyState, SoftwareKeyManager};
 pub use crate::transaction::{
 	Durability,
 	HistoryOptions,

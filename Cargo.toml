@@ -52,6 +52,7 @@ lz4_flex = "0.12.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 aes-gcm = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+zeroize = { version = "1.8", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.36", features = ["rt-multi-thread"] }
