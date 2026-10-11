@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -24,14 +24,7 @@ use crate::tde::{
 	Zeroizing,
 };
 use crate::vlog::sealed::{self, SEALED_HEADER_LEN};
-use crate::vlog::{
-	VLog,
-	VLogWriter,
-	ValueLocation,
-	ValuePointer,
-	SYNCED_VLOG_FILES,
-	SYNCED_VLOG_LENGTHS,
-};
+use crate::vlog::{VLog, VLogWriter, ValueLocation, ValuePointer, SYNCED_VLOG_LENGTHS};
 use crate::{Options, VLogChecksumLevel};
 
 const SUITES: [CipherSuite; 2] = [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305];
@@ -142,10 +135,6 @@ fn with_crc_of(pointer: &ValuePointer, file: &Path) -> ValuePointer {
 	}
 }
 
-fn synced_under(dir: &Path) -> Vec<PathBuf> {
-	SYNCED_VLOG_FILES.lock().iter().filter(|path| path.starts_with(dir)).cloned().collect()
-}
-
 #[test]
 fn a_sealed_log_reads_back_what_was_sealed() {
 	for suite in SUITES {
@@ -197,11 +186,20 @@ fn the_newest_sealed_file_is_fsynced_by_the_first_sync() {
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let opts = options(dir.path(), Some(&ctx));
 	make_file(&opts, &ctx, 1, &[(b"k", b"v")]);
+	let path = opts.vlog_file_path(1);
+	// Creating the file fsynced it with nothing in it but its header, which is not what is looked
+	// for: the length that an fsync of the whole file records is longer.
+	let length = std::fs::metadata(&path).unwrap().len();
+	assert!(length > SEALED_HEADER_LEN as u64, "the file holds an entry");
 	let vlog = VLog::new(Arc::clone(&opts)).unwrap();
 	assert_eq!(vlog.unsynced_file_ids(), vec![1], "a run may have left it unsynced");
+	assert!(!SYNCED_VLOG_LENGTHS.lock().contains(&(path.clone(), length)), "not synced yet");
 
 	vlog.sync().unwrap();
-	assert!(synced_under(dir.path()).contains(&opts.vlog_file_path(1)));
+	assert!(
+		SYNCED_VLOG_LENGTHS.lock().contains(&(path, length)),
+		"the first sync fsynced the file that no writer holds"
+	);
 	assert!(vlog.unsynced_file_ids().is_empty());
 }
 
@@ -488,9 +486,12 @@ fn a_pointer_and_a_file_that_disagree_about_being_sealed_read_nothing() {
 	writer.flush().unwrap();
 	drop(writer);
 	let vlog = VLog::new(Arc::clone(&opts)).unwrap();
-	assert_eq!(vlog.get(&pointer).unwrap(), b"value");
+	// The pointer that lies comes first. A value that a read has put in the cache is found by the
+	// file and the offset alone, so once the honest pointer had been read, the lying one would be
+	// answered from the cache and would never reach the file.
 	let sealed = ValuePointer::sealed(1, pointer.offset, 3, 5, pointer.checksum);
 	assert!(is_corruption(vlog.get(&sealed)));
+	assert_eq!(vlog.get(&pointer).unwrap(), b"value");
 }
 
 #[test]
