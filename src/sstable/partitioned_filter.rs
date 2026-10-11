@@ -41,9 +41,8 @@
 use std::sync::Arc;
 
 use crate::sstable::block::BlockHandle;
+use crate::sstable::block_io::BlockSource;
 use crate::sstable::index_block::BlockHandleWithKey;
-use crate::sstable::table::read_verified_raw_block;
-use crate::vfs::File;
 use crate::{FilterPolicy, Options};
 
 // =============================================================================
@@ -154,7 +153,7 @@ pub(crate) struct PartitionedFilterReader {
 	cache_id: u64,
 	opts: Arc<Options>,
 	policy: Arc<dyn FilterPolicy>,
-	file: Arc<dyn File>,
+	source: BlockSource,
 
 	/// Filter partition handles with their separator keys, ascending —
 	/// mirrors `Index.blocks` for the data index.
@@ -167,15 +166,11 @@ impl PartitionedFilterReader {
 		table_id: u64,
 		cache_id: u64,
 		opts: Arc<Options>,
-		file: Arc<dyn File>,
+		source: BlockSource,
 		location: &BlockHandle,
 		policy: Arc<dyn FilterPolicy>,
 	) -> crate::Result<Self> {
-		let block = crate::sstable::table::read_table_block(
-			Arc::clone(&opts.internal_comparator),
-			Arc::clone(&file),
-			location,
-		)?;
+		let block = source.read_block(location, Arc::clone(&opts.internal_comparator))?;
 
 		let mut partitions = Vec::new();
 		let mut iter = block.iter()?;
@@ -195,7 +190,7 @@ impl PartitionedFilterReader {
 			cache_id,
 			opts,
 			policy,
-			file,
+			source,
 			partitions,
 		})
 	}
@@ -231,7 +226,7 @@ impl PartitionedFilterReader {
 			if let Some(bits) = self.opts.block_cache.get_filter_partition(self.cache_id, offset) {
 				bits
 			} else {
-				match read_verified_raw_block(Arc::clone(&self.file), &partition.handle) {
+				match self.source.read_contents(&partition.handle) {
 					Ok(bytes) => {
 						let bytes = Arc::new(bytes);
 						self.opts.block_cache.insert_filter_partition(

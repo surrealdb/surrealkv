@@ -78,6 +78,7 @@ use snap::raw::max_compress_len;
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
+use crate::sstable::block_io::BlockSource;
 use crate::sstable::error::SSTableError;
 use crate::sstable::filter_block::FilterBlockReader;
 use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
@@ -88,7 +89,6 @@ use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{
 	Comparator,
 	CompressionType,
-	FilterPolicy,
 	InternalKey,
 	InternalKeyKind,
 	InternalKeyRange,
@@ -209,35 +209,20 @@ impl Footer {
 		}
 	}
 
-	/// Reads the footer bytes from the end of the file.
-	pub(crate) fn read_from(reader: Arc<dyn File>, file_size: usize) -> Result<Vec<u8>> {
-		if file_size < TABLE_FULL_FOOTER_LENGTH {
-			return Err(Error::from(SSTableError::FileTooSmall {
-				file_size,
-				min_size: TABLE_FULL_FOOTER_LENGTH,
+	/// Decodes a footer from raw bytes.
+	pub(crate) fn decode(buf: &[u8]) -> Result<Footer> {
+		// The length is checked first: the magic number is read from the end of the buffer.
+		if buf.len() < TABLE_FOOTER_LENGTH {
+			return Err(Error::from(SSTableError::FooterTooShort {
+				footer_len: buf.len(),
 			}));
 		}
 
-		let mut buf = vec![0; TABLE_FULL_FOOTER_LENGTH];
-		let offset = file_size - TABLE_FULL_FOOTER_LENGTH;
-		reader.read_at(offset as u64, &mut buf)?;
-
-		Ok(buf)
-	}
-
-	/// Decodes a footer from raw bytes.
-	pub(crate) fn decode(buf: &[u8]) -> Result<Footer> {
 		// Step 1: Validate magic number (last 8 bytes)
 		let magic = &buf[buf.len() - TABLE_MAGIC_FOOTER_ENCODED.len()..];
 		if magic != TABLE_MAGIC_FOOTER_ENCODED {
 			return Err(Error::from(SSTableError::BadMagicNumber {
 				magic: magic.to_vec(),
-			}));
-		}
-
-		if buf.len() < TABLE_FOOTER_LENGTH {
-			return Err(Error::from(SSTableError::FooterTooShort {
-				footer_len: buf.len(),
 			}));
 		}
 
@@ -783,37 +768,12 @@ pub(crate) fn decompress_block(
 	}
 }
 
-/// Reads and decodes the footer from a file.
-pub(crate) fn read_footer(f: Arc<dyn File>, file_size: usize) -> Result<Footer> {
-	let buf = Footer::read_from(f, file_size)?;
-	Footer::decode(&buf)
-}
-
-/// Reads raw bytes at a block handle's location.
-fn read_bytes(f: Arc<dyn File>, location: &BlockHandle) -> Result<Vec<u8>> {
-	let mut buf = vec![0; location.size()];
-	f.read_at(location.offset() as u64, &mut buf).map(|_| buf)
-}
-
 /// Calculates CRC32 checksum for a block.
 pub(crate) fn calculate_checksum(block: &[u8], compression_type: CompressionType) -> Crc32 {
 	let mut cksum = Crc32::new();
 	cksum.update(block);
 	cksum.update(&[compression_type as u8; BLOCK_COMPRESS_LEN]);
 	cksum
-}
-
-/// Reads a filter block from the file.
-pub(crate) fn read_filter_block(
-	src: Arc<dyn File>,
-	location: &BlockHandle,
-	policy: Arc<dyn FilterPolicy>,
-) -> Result<FilterBlockReader> {
-	if location.size() == 0 {
-		return Err(Error::FilterBlockEmpty);
-	}
-	let buf = read_bytes(src, location)?;
-	Ok(FilterBlockReader::new(buf, policy))
 }
 
 pub(crate) fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
@@ -828,60 +788,6 @@ pub(crate) fn read_writer_meta_properties(metaix: &Block) -> Result<Option<Table
 		return Ok(Some(TableMetadata::decode(buf_bytes)?));
 	}
 	Ok(None)
-}
-
-/// Reads and verifies a table block from the file.
-pub(crate) fn read_table_block(
-	comparator: Arc<dyn Comparator>,
-	f: Arc<dyn File>,
-	location: &BlockHandle,
-) -> Result<Block> {
-	let block = read_verified_raw_block(f, location)?;
-	Ok(Block::new(block, comparator))
-}
-
-/// Reads, checksum-verifies, and decompresses a block's raw bytes without
-/// interpreting them as a restart-encoded `Block` (used for bloom filter
-/// partitions, which have their own encoding).
-pub(crate) fn read_verified_raw_block(f: Arc<dyn File>, location: &BlockHandle) -> Result<Vec<u8>> {
-	// Read block data
-	let buf = read_bytes(Arc::clone(&f), location)?;
-
-	// Read compression type (1 byte after block data)
-	let compress = read_bytes(
-		Arc::clone(&f),
-		&BlockHandle::new(location.offset() + location.size(), BLOCK_COMPRESS_LEN),
-	)?;
-
-	// Read checksum (4 bytes after compression type)
-	let cksum = read_bytes(
-		Arc::clone(&f),
-		&BlockHandle::new(
-			location.offset() + location.size() + BLOCK_COMPRESS_LEN,
-			BLOCK_CKSUM_LEN,
-		),
-	)?;
-
-	// Verify checksum
-	let cksum_val = u32::from_le_bytes(
-		cksum.as_slice().try_into().map_err(|_| SSTableError::CorruptedBlockHandle)?,
-	);
-	if !verify_table_block(&buf, compress[0], unmask(cksum_val)) {
-		return Err(Error::from(SSTableError::ChecksumVerificationFailed {
-			block_offset: location.offset() as u64,
-		}));
-	}
-
-	// Decompress
-	decompress_block(&buf, CompressionType::try_from(compress[0])?)
-}
-
-/// Verifies a block's checksum.
-fn verify_table_block(block: &[u8], compression_type: u8, want: u32) -> bool {
-	let mut cksum = Crc32::new();
-	cksum.update(block);
-	cksum.update(&[compression_type; BLOCK_COMPRESS_LEN]);
-	cksum.finalize() == want
 }
 
 // =============================================================================
@@ -923,8 +829,8 @@ pub(crate) struct Table {
 	/// The key of this instance's blocks in the block cache: unlike `id`, never given to another
 	/// table, see `cache::next_instance_id`.
 	cache_id: u64,
-	pub file: Arc<dyn File>,
-	pub(crate) object_store: Arc<dyn crate::storage::ObjectStore>,
+	/// Reads the footer and the blocks of the table's file.
+	pub(crate) source: BlockSource,
 	pub file_size: u64,
 
 	pub(crate) opts: Arc<Options>,
@@ -963,27 +869,21 @@ impl Table {
 		file: Arc<dyn File>,
 		file_size: u64,
 	) -> Result<Table> {
-		let object_store: Arc<dyn crate::storage::ObjectStore> =
-			Arc::new(crate::storage::AffinityObjectStore::new(Arc::clone(&file)));
-
 		// Step 1: Read footer
-		let footer = read_footer(Arc::clone(&file), file_size as usize)?;
+		let (source, footer) = BlockSource::open(file, file_size)?;
 
 		let cache_id = crate::cache::next_instance_id();
 
 		// Step 2: Load partitioned index
 		let index_block = {
 			let partitioned_index =
-				Index::new(id, cache_id, Arc::clone(&opts), Arc::clone(&file), &footer.index)?;
+				Index::new(id, cache_id, Arc::clone(&opts), source.clone(), &footer.index)?;
 			IndexType::Partitioned(partitioned_index)
 		};
 
 		// Step 3: Load meta index block
-		let metaindexblock = read_table_block(
-			Arc::clone(&opts.internal_comparator),
-			Arc::clone(&file),
-			&footer.meta_index,
-		)?;
+		let metaindexblock =
+			source.read_block(&footer.meta_index, Arc::clone(&opts.internal_comparator))?;
 
 		// Step 4: Extract metadata
 		let writer_metadata =
@@ -1005,18 +905,20 @@ impl Table {
 					id,
 					cache_id,
 					Arc::clone(&opts),
-					Arc::clone(&file),
+					source.clone(),
 					&handle,
 					Arc::clone(policy),
 				)?)
 			} else if let Some(handle) =
 				Self::find_meta_handle(&metaindexblock, &format!("filter.{name}"))?
 			{
-				TableFilter::Legacy(read_filter_block(
-					Arc::clone(&file),
-					&handle,
+				if handle.size() == 0 {
+					return Err(Error::FilterBlockEmpty);
+				}
+				TableFilter::Legacy(FilterBlockReader::new(
+					source.read_legacy_filter(&handle)?,
 					Arc::clone(policy),
-				)?)
+				))
 			} else {
 				TableFilter::None
 			}
@@ -1028,8 +930,7 @@ impl Table {
 		Ok(Table {
 			id,
 			cache_id,
-			file,
-			object_store,
+			source,
 			file_size,
 			opts,
 			filter,
@@ -1078,11 +979,7 @@ impl Table {
 		}
 
 		// Cache miss: read from disk
-		let b = read_table_block(
-			Arc::clone(&self.opts.internal_comparator),
-			Arc::clone(&self.file),
-			location,
-		)?;
+		let b = self.source.read_block(location, Arc::clone(&self.opts.internal_comparator))?;
 		let b = Arc::new(b);
 
 		// Insert into cache
@@ -1112,7 +1009,7 @@ impl Table {
 		}
 
 		// Cache miss: read from disk
-		let b = read_table_block(comparator, Arc::clone(&self.file), location)?;
+		let b = self.source.read_block(location, comparator)?;
 		let b = Arc::new(b);
 
 		// Insert into history cache
@@ -1134,24 +1031,12 @@ impl Table {
 			return Ok(block);
 		}
 
-		// Read whole block + compress byte + checksum via ObjectStore asynchronously
-		let total_len = location.size() + BLOCK_COMPRESS_LEN + BLOCK_CKSUM_LEN;
-		let raw_bytes = self.object_store.read_at(location.offset() as u64, total_len).await?;
-
-		let buf = &raw_bytes[..location.size()];
-		let compress = &raw_bytes[location.size()..location.size() + BLOCK_COMPRESS_LEN];
-		let cksum = &raw_bytes[location.size() + BLOCK_COMPRESS_LEN..];
-
-		let cksum_val =
-			u32::from_le_bytes(cksum.try_into().map_err(|_| SSTableError::CorruptedBlockHandle)?);
-		if !verify_table_block(buf, compress[0], unmask(cksum_val)) {
-			return Err(Error::from(SSTableError::ChecksumVerificationFailed {
-				block_offset: location.offset() as u64,
-			}));
-		}
-
-		let block = decompress_block(buf, CompressionType::try_from(compress[0])?)?;
-		let b = Arc::new(Block::new(block, Arc::clone(&self.opts.internal_comparator)));
+		// The block and its trailer are read in one request through the object store
+		let block = self
+			.source
+			.read_block_async(location, Arc::clone(&self.opts.internal_comparator))
+			.await?;
+		let b = Arc::new(block);
 
 		// Insert into cache
 		self.opts.block_cache.insert_data_block(

@@ -1,24 +1,73 @@
 use std::fs::File as SysFile;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
 /// Read-only random-access file abstraction for SSTable blocks.
 pub trait File: Send + Sync {
 	/// Reads bytes from the given offset into the buffer.
+	///
+	/// Like `pread`, this may return fewer bytes than the buffer holds without being at the end
+	/// of the file. Callers that need the whole buffer use `read_exact_at`.
 	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
 
 	/// Returns total file size in bytes.
 	fn size(&self) -> Result<u64>;
+
+	/// Reads until the buffer is full or the file ends, and returns how many bytes were read.
+	/// The count is short of the buffer only at the end of the file. A read that was interrupted
+	/// is retried.
+	fn read_up_to(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+		let mut filled = 0;
+		while filled < buf.len() {
+			let at = offset.checked_add(filled as u64).ok_or_else(|| {
+				Error::Io(Arc::new(std::io::Error::new(
+					std::io::ErrorKind::InvalidInput,
+					"read offset overflows",
+				)))
+			})?;
+			match self.read_at(at, &mut buf[filled..]) {
+				Ok(0) => break,
+				// A reader that claims more than it was asked for cannot move the position
+				// past the buffer.
+				Ok(n) => filled += n.min(buf.len() - filled),
+				Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+				Err(e) => return Err(e),
+			}
+		}
+		Ok(filled)
+	}
+
+	/// Fills the buffer from the given offset, or fails: a file that ends first is an
+	/// `UnexpectedEof` I/O error and the contents of the buffer are unspecified.
+	fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+		let read = self.read_up_to(offset, buf)?;
+		if read < buf.len() {
+			return Err(short_read(offset, buf.len(), read));
+		}
+		Ok(())
+	}
+}
+
+/// The error for a read that found the file ending before the bytes that were asked for.
+pub(crate) fn short_read(offset: u64, wanted: usize, got: usize) -> Error {
+	Error::Io(Arc::new(std::io::Error::new(
+		std::io::ErrorKind::UnexpectedEof,
+		format!("short read: wanted {wanted} bytes at offset {offset}, the file has {got}"),
+	)))
 }
 
 pub type InMemoryFile = Vec<u8>;
 
 impl File for InMemoryFile {
 	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
-		let start = offset as usize;
-		let end = std::cmp::min(start + buf.len(), self.len());
-		let bytes_read = end - start;
-		buf[..bytes_read].copy_from_slice(&self[start..end]);
+		// An offset at or past the end reads nothing, as `pread` does, and a request near
+		// `u64::MAX` cannot overflow.
+		let Some(rest) = usize::try_from(offset).ok().and_then(|start| self.get(start..)) else {
+			return Ok(0);
+		};
+		let bytes_read = rest.len().min(buf.len());
+		buf[..bytes_read].copy_from_slice(&rest[..bytes_read]);
 		Ok(bytes_read)
 	}
 

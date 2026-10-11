@@ -1,4 +1,5 @@
 pub(crate) mod block;
+pub(crate) mod block_io;
 pub(crate) mod bloom;
 pub(crate) mod error;
 pub(crate) mod filter_block;

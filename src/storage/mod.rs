@@ -33,7 +33,8 @@ pub trait LogStore: Send + Sync + Debug {
 
 /// Trait for immutable object/page storage (SSTables).
 pub trait ObjectStore: Send + Sync + Debug {
-	/// Reads a range of bytes `[offset..offset + len)` from the object.
+	/// Reads a range of bytes `[offset..offset + len)` from the object. The result is shorter
+	/// than `len` only where the object ends.
 	fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'_, Bytes>;
 
 	/// Returns total size of the object in bytes.
@@ -247,8 +248,11 @@ impl ObjectStore for AffinityObjectStore {
 		let file = Arc::clone(&self.file);
 		Box::pin(async move {
 			affinitypool::spawn(move || -> Result<Bytes> {
+				// Short only at the end of the file, like the other stores: the tail of the
+				// buffer is never left as zeros that were not read.
 				let mut buf = vec![0u8; len];
-				file.read_at(offset, &mut buf)?;
+				let read = file.read_up_to(offset, &mut buf)?;
+				buf.truncate(read);
 				Ok(Bytes::from(buf))
 			})
 			.await

@@ -82,6 +82,13 @@ pub enum SSTableError {
 	ChecksumVerificationFailed {
 		block_offset: u64,
 	},
+	/// A block handle names bytes that are not inside the part of the file that holds blocks,
+	/// which ends where the footer begins.
+	BlockHandleOutOfBounds {
+		block_offset: u64,
+		block_size: u64,
+		limit: u64,
+	},
 
 	// BlockHandle decoding errors
 	FailedToDecodeBlockHandle {
@@ -257,6 +264,17 @@ impl fmt::Display for SSTableError {
 				block_offset,
 			} => {
 				write!(f, "checksum verification failed for block at {}", block_offset)
+			}
+			SSTableError::BlockHandleOutOfBounds {
+				block_offset,
+				block_size,
+				limit,
+			} => {
+				write!(
+					f,
+					"block at {} of {} bytes (and its trailer) does not fit in the {} bytes before the footer",
+					block_offset, block_size, limit
+				)
 			}
 
 			// BlockHandle decoding errors

@@ -4,6 +4,7 @@ use std::vec;
 use test_log::test;
 
 use crate::sstable::block::BlockHandle;
+use crate::sstable::block_io::BlockSource;
 use crate::sstable::index_block::{BlockHandleWithKey, Index, IndexWriter};
 use crate::vfs::File;
 use crate::{
@@ -139,7 +140,7 @@ fn test_find_block_handle_by_key() {
 			BlockHandleWithKey::new(sep_f.clone(), BlockHandle::new(10, 10)),
 			BlockHandleWithKey::new(sep_j.clone(), BlockHandle::new(20, 10)),
 		],
-		file: Arc::clone(&f),
+		source: BlockSource::new(Arc::clone(&f), 0),
 	};
 
 	// A list of tuples where the first element is the encoded internal key to find,
@@ -195,7 +196,7 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 			BlockHandleWithKey::new(sep_foo_20, BlockHandle::new(100, 100)),
 			BlockHandleWithKey::new(sep_g, BlockHandle::new(200, 100)),
 		],
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	// Test cases: (query_key, expected_partition_index)
@@ -283,7 +284,7 @@ fn test_find_block_handle_by_key_different_user_keys() {
 			BlockHandleWithKey::new(sep_d, BlockHandle::new(100, 100)),
 			BlockHandleWithKey::new(sep_e, BlockHandle::new(200, 100)),
 		],
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	let test_cases = vec![
@@ -358,7 +359,7 @@ fn test_find_block_handle_returns_correct_partition_index() {
 			.enumerate()
 			.map(|(i, sep)| BlockHandleWithKey::new(sep.clone(), BlockHandle::new(i * 100, 100)))
 			.collect(),
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	// Query for each separator key and verify correct index is returned
@@ -389,7 +390,7 @@ fn test_partition_lookup_empty_partition_returns_none() {
 		cache_id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep, BlockHandle::new(0, 100))],
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	// Query for key beyond the single partition
@@ -412,7 +413,7 @@ fn test_partition_lookup_single_partition() {
 		cache_id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	// Query before the separator
@@ -454,7 +455,7 @@ fn test_partition_lookup_exact_separator_match() {
 			BlockHandleWithKey::new(sep_b.clone(), BlockHandle::new(100, 100)),
 			BlockHandleWithKey::new(sep_c, BlockHandle::new(200, 100)),
 		],
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	// Query exactly "bbb" at same seq

@@ -85,9 +85,9 @@ use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
+use crate::sstable::block_io::BlockSource;
 use crate::sstable::error::SSTableError;
-use crate::sstable::table::{compress_block, read_table_block, write_block_at_offset};
-use crate::vfs::File;
+use crate::sstable::table::{compress_block, write_block_at_offset};
 use crate::{CompressionType, Options};
 
 // =============================================================================
@@ -395,7 +395,8 @@ pub(crate) struct Index {
 	/// Sorted by separator key in ascending order
 	pub(crate) blocks: Vec<BlockHandleWithKey>,
 
-	pub(crate) file: Arc<dyn File>,
+	/// Reads the partition blocks.
+	pub(crate) source: BlockSource,
 }
 
 impl Index {
@@ -411,12 +412,11 @@ impl Index {
 		id: u64,
 		cache_id: u64,
 		opt: Arc<Options>,
-		f: Arc<dyn File>,
+		source: BlockSource,
 		location: &BlockHandle,
 	) -> Result<Self> {
 		// Read and parse the top-level index block
-		let block =
-			read_table_block(Arc::clone(&opt.internal_comparator), Arc::clone(&f), location)?;
+		let block = source.read_block(location, Arc::clone(&opt.internal_comparator))?;
 
 		let mut iter = block.iter()?;
 		let mut blocks = Vec::new();
@@ -440,7 +440,7 @@ impl Index {
 			cache_id,
 			opts: opt,
 			blocks,
-			file: Arc::clone(&f),
+			source,
 		})
 	}
 
@@ -520,11 +520,9 @@ impl Index {
 		}
 
 		// Cache miss: read from disk
-		let block_data = read_table_block(
-			Arc::clone(&self.opts.internal_comparator),
-			Arc::clone(&self.file),
-			&block_handle.handle,
-		)?;
+		let block_data = self
+			.source
+			.read_block(&block_handle.handle, Arc::clone(&self.opts.internal_comparator))?;
 		let block = Arc::new(block_data);
 
 		// Insert into cache
