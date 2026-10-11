@@ -266,6 +266,63 @@ fn a_key_that_was_retired_is_refused_for_what_it_is_and_nothing_changes() {
 	);
 }
 
+/// A WAL that has no key is not one that may repair a sealed segment, whatever else is wrong with
+/// it: the plaintext repair deletes a segment that holds no valid record, and a sealed segment
+/// whose first bytes rotted holds none that a plaintext reader can read. What tells it apart is the
+/// start of the encryption header in its first record, which a rotted type byte leaves in place.
+#[test]
+fn a_sealed_segment_whose_type_byte_rotted_is_still_refused_by_a_wal_that_has_no_key() {
+	for suite in SUITES {
+		// One segment, so that nothing but the rot decides what a reader without a key makes of it.
+		let template = TempDir::new().unwrap();
+		let enc = context(suite);
+		let plan: Plan = vec![standard_plan().remove(0)];
+		build(template.path(), &enc, CompressionType::None, &plan);
+		let keyless = WalContext::plaintext();
+
+		for rotted in [0x0B_u8, 0x00, 0x01, 0xFF] {
+			let spoil = |dir: &Path| {
+				let mut bytes = read(dir, 0);
+				bytes[6] = rotted;
+				write(dir, 0, &bytes);
+			};
+			assert_refused_everywhere(
+				template.path(),
+				&keyless,
+				&format!("{suite:?}, type byte {rotted:#x}"),
+				spoil,
+				|error| is_encryption(error, &EncryptionError::NotConfigured),
+			);
+
+			// So is the open of the WAL for appending, which builds a plaintext writer on the file
+			// that it finds last, whatever the type byte says it is.
+			let dir = work_copy(template.path());
+			spoil(dir.path());
+			let before = snapshot(dir.path());
+			let opened =
+				Wal::open_with_min_log_number(dir.path(), 0, crate::wal::Options::default());
+			assert!(
+				matches!(
+					opened.err(),
+					Some(crate::wal::Error::Encryption(EncryptionError::NotConfigured))
+				),
+				"{suite:?}, type byte {rotted:#x}"
+			);
+			assert_eq!(snapshot(dir.path()), before, "{suite:?}, type byte {rotted:#x}");
+
+			// The repair is refused as well, on its own: it is where the deletion would be.
+			let dir = work_copy(template.path());
+			spoil(dir.path());
+			let before = snapshot(dir.path());
+			let error = crate::wal::recovery::repair_corrupted_wal_segment(dir.path(), 0)
+				.expect_err("a keyless repair of a sealed segment must be refused");
+			assert!(is_encryption(&error, &EncryptionError::NotConfigured), "{error}");
+			assert_eq!(snapshot(dir.path()), before, "{suite:?}, type byte {rotted:#x}");
+			assert!(!dir.path().join("repair_temp").exists());
+		}
+	}
+}
+
 // ---------------------------------------------------------------------------
 // tags: a record that was changed
 // ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::vec::Vec;
 
 use crate::error::EncryptionError;
-use crate::tde::FileCipher;
+use crate::tde::{FileCipher, HEADER_MAGIC};
 use crate::vfs::File as VfsFile;
 use crate::wal::{
 	calculate_crc32,
@@ -374,7 +374,9 @@ impl Reader {
 			// A segment that starts with the header record of a sealed segment is not a plaintext
 			// segment, and nothing in it is read as one: a WAL that is not configured for
 			// encryption does not repair it either.
-			if type_byte == RecordType::SegmentHeader as u8 && self.record_start == 0 {
+			if self.record_start == 0
+				&& (type_byte == RecordType::SegmentHeader as u8 || self.payload_is_crypto_header())
+			{
 				return Err(EncryptionError::NotConfigured.into());
 			}
 			self.cur_rec_type = RecordType::from_u8(type_byte)?;
@@ -461,6 +463,17 @@ impl Reader {
 		}
 
 		Ok(())
+	}
+
+	/// Whether the payload that starts at the current position begins like an encryption header.
+	/// The first record of a plaintext segment is never one, and a sealed segment whose type byte
+	/// rotted is still told apart from damage by it.
+	fn payload_is_crypto_header(&self) -> bool {
+		self.buffer.get(self.buffer_offset..self.buffer_offset + HEADER_MAGIC.len()).is_some_and(
+			|magic| {
+				self.buffer_offset + HEADER_MAGIC.len() <= self.buffer_end && magic == HEADER_MAGIC
+			},
+		)
 	}
 
 	/// Makes sure that the header of a record is in the buffer. `false` means that the next block

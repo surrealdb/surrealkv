@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -357,15 +357,21 @@ impl Wal {
 			Err(e) => return Err(Error::IO(IOError::new(e.kind(), &e.to_string()))),
 		}
 
+		// A sealed segment is not appended to by a WAL that is not sealed, and nothing is done
+		// to it: the open fails, and the segment stays as it is. It is known by the type of its
+		// first record or by the start of the encryption header that is the payload of that
+		// record, which stays when the type byte rots.
+		let mut payload_start = [0u8; 4];
+		let sealed_by_magic = file.read_exact(&mut payload_start).is_ok()
+			&& payload_start == crate::tde::HEADER_MAGIC;
+		file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+		if header[6] == RecordType::SegmentHeader as u8 || sealed_by_magic {
+			return Err(EncryptionError::NotConfigured.into());
+		}
+
 		// Parse the record type from header byte 6
 		let record_type_byte = header[6];
 		let record_type = RecordType::from_u8(record_type_byte)?;
-
-		// A sealed segment is not appended to by a WAL that is not sealed, and nothing is done
-		// to it: the open fails, and the segment stays as it is.
-		if record_type == RecordType::SegmentHeader {
-			return Err(EncryptionError::NotConfigured.into());
-		}
 
 		if record_type == RecordType::SetCompressionType {
 			// Read the compression type byte (length is in bytes 4-5)

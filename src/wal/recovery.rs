@@ -316,6 +316,23 @@ pub(crate) fn replay_wal_with(
 	Ok((result, memtables))
 }
 
+/// Whether the file at `path` starts the way a sealed segment does: the type of the header record
+/// or the start of the encryption header that is its payload. A WAL that is not sealed has no
+/// business repairing such a file, whatever else is wrong with it, and the plaintext repair deletes
+/// a segment that holds no valid record. A file that does not exist is not one.
+fn segment_looks_sealed(path: &Path) -> Result<bool> {
+	use std::io::Read;
+
+	let mut head = Vec::new();
+	match File::open(path) {
+		Ok(file) => file.take(11).read_to_end(&mut head)?,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+		Err(e) => return Err(e.into()),
+	};
+	Ok(head.get(6) == Some(&(crate::wal::RecordType::SegmentHeader as u8))
+		|| head.get(7..11) == Some(&crate::tde::HEADER_MAGIC[..]))
+}
+
 /// Repairs a plaintext segment, see [`repair_corrupted_wal_segment_with`].
 #[cfg(test)]
 pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
@@ -340,6 +357,9 @@ pub(crate) fn repair_corrupted_wal_segment_with(
 	// like one. Sealed segments are repaired by their own code, which deletes nothing.
 	if context.is_sealed() {
 		return crate::wal::sealed_recovery::repair(context, wal_dir, segment_id);
+	}
+	if segment_looks_sealed(&wal_dir.join(format!("{segment_id:020}.wal")))? {
+		return Err(crate::error::EncryptionError::NotConfigured.into());
 	}
 
 	// Build segment paths
