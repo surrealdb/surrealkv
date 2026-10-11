@@ -454,11 +454,21 @@ async fn a_restore_that_did_not_finish_is_reported_before_any_key_is_looked_at()
 		// no file: its files are neither the database nor the checkpoint, and the key is of no
 		// use to it.
 		let wrong = Arc::new(SoftwareKeyManager::new([0x43; ROOT_KEY_LEN]));
-		for opts in
-			[Arc::clone(&opts), encrypted(dir.path(), wrong, suite), Arc::new(options(dir.path()))]
-		{
+		for (opts, keyed) in [
+			(Arc::clone(&opts), true),
+			(encrypted(dir.path(), wrong, suite), true),
+			(Arc::new(options(dir.path())), false),
+		] {
 			let err = open_error(&opts);
-			assert!(matches!(err, Error::RestoreInterrupted(_)), "{suite:?}: {err:?}");
+			// Where a key manager is configured the advice is not to restore into an empty
+			// directory, which would be a database of its own that the checkpoint is not of.
+			match &err {
+				Error::RestoreInterrupted(message) => {
+					assert_eq!(message.contains("copy the directory of the checkpoint"), keyed);
+					assert_eq!(message.contains("into an empty directory instead"), !keyed);
+				}
+				other => panic!("{suite:?}: {other:?}"),
+			}
 			assert!(snapshot(dir.path()) == before, "{suite:?}: a refused open changed the files");
 		}
 

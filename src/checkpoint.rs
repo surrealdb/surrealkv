@@ -299,12 +299,20 @@ pub(crate) fn check_restore_finished(opts: &Options) -> Result<()> {
 		return Ok(());
 	}
 	let checkpoint = fs::read_to_string(&marker).unwrap_or_default();
+	// An empty directory is a database of its own when it is opened with a key manager, with an
+	// identity that no checkpoint of another database has, and a restore refuses that.
+	let advice = if opts.key_manager.is_some() || opts.encryption_context().is_some() {
+		"The database is encrypted, and a checkpoint of it is restored only into the database it \
+		 was taken from: copy the directory of the checkpoint to an empty place and open it there \
+		 instead."
+	} else {
+		"Restore the checkpoint into an empty directory instead."
+	};
 	Err(Error::RestoreInterrupted(format!(
 		"a restore of the checkpoint '{}' into {} did not finish, or is still running in another \
 		 process: the files of the database are neither the database as it was nor the \
-		 checkpoint, so it is not opened and nothing was changed. Restore the checkpoint into an \
-		 empty directory instead. Only if no restore is running and the files are known to be the \
-		 restored database, remove {} to open it.",
+		 checkpoint, so it is not opened and nothing was changed. {advice} Only if no restore is \
+		 running and the files are known to be the restored database, remove {} to open it.",
 		checkpoint.trim(),
 		opts.path.display(),
 		marker.display()
@@ -728,6 +736,11 @@ impl DatabaseCheckpoint {
 	/// [`Error::RestoreInterrupted`]. A restore that failed in between is repeated on the open
 	/// database; one that crashed is repeated into an empty directory. A directory that a
 	/// checkpoint of this process is writing is refused with [`Error::InvalidArgument`].
+	///
+	/// A checkpoint of an encrypted database is restored only into the database it was taken
+	/// from: another database has an identity of its own, and a checkpoint of another one is
+	/// refused with [`EncryptionError::DbIdMismatch`](crate::EncryptionError::DbIdMismatch). To
+	/// recover it elsewhere, copy the directory of the checkpoint and open it.
 	pub fn restore_from_checkpoint<P: AsRef<Path>>(
 		&self,
 		checkpoint_dir: P,
