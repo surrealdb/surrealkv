@@ -161,14 +161,23 @@ impl AffinityLogStore {
 	/// of the group physically lives in. The group is all or nothing, see `Wal::append_group`.
 	/// The buffers move into the closure by value, so the group is not copied for the hop to
 	/// the pool.
+	///
+	/// `admit` is asked once the WAL lock is held, and the group is refused with
+	/// `Error::PipelineStall`, without anything written, if it says no. Whoever replaces the
+	/// WAL does so under the same lock, so a group that was not refused is in the WAL that it
+	/// asked.
 	pub(crate) async fn append_group_returning_segment(
 		&self,
 		buf: Vec<u8>,
 		ends: Vec<usize>,
+		admit: impl FnOnce() -> bool + Send + 'static,
 	) -> Result<(u64, Vec<u8>, Vec<usize>)> {
 		let wal = Arc::clone(&self.wal);
 		affinitypool::spawn(move || -> Result<(u64, Vec<u8>, Vec<usize>)> {
 			let mut guard = wal.write();
+			if !admit() {
+				return Err(crate::error::Error::PipelineStall);
+			}
 			let segment = guard
 				.append_group(&buf, &ends)
 				.map_err(|e| crate::error::Error::Other(e.to_string()))?;

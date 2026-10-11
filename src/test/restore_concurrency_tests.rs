@@ -968,7 +968,6 @@ async fn writers_racing_a_restore_leave_the_checkpoint_plus_the_commits_after_it
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[ignore = "a commit that fails during a restore, with an error, can still land in the restored database"]
 async fn writers_racing_a_restore_never_land_a_commit_that_returned_an_error() {
 	writers_during_a_restore(false, false).await;
 }
@@ -1035,6 +1034,9 @@ enum Park {
 	AfterWalSync,
 	/// The first apply round passed that check and is about to apply the group.
 	BeforeApplyRound,
+	/// The WAL is ready for a group that has logged nothing yet: it appends to whichever WAL the
+	/// restore leaves.
+	AfterWalHeal,
 }
 
 /// Holds the flusher at `park`, the first time it gets there.
@@ -1044,6 +1046,7 @@ fn park_flusher_at(tree: &Tree, park: Park) -> Gate {
 		let here = matches!(
 			(park, point),
 			(Park::AfterWalSync, PipelineHook::AfterWalSync { .. })
+				| (Park::AfterWalHeal, PipelineHook::AfterWalHeal)
 				| (
 					Park::BeforeApplyRound,
 					PipelineHook::BeforeApplyRound {
@@ -1136,13 +1139,19 @@ async fn commits_in_the_pipeline_when_a_restore_runs_fail_and_leave_nothing() {
 
 /// A group that passed the restore check of its apply round when the restore ran is not
 /// acknowledged: the restore replaced the database it was logged for.
+/// A group that has logged nothing when the restore runs appends to the WAL the restore reopened:
+/// it is refused there, and neither is acknowledged nor replayed when the database is opened.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_commit_that_logs_after_a_restore_replaced_the_wal_is_refused_and_never_replayed() {
+	commits_in_the_pipeline_across_a_restore(Park::AfterWalHeal, true).await;
+}
+
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_commit_applied_across_a_restore_is_not_acknowledged() {
 	commits_in_the_pipeline_across_a_restore(Park::BeforeApplyRound, false).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-#[ignore = "a group that is applied after a restore replaced the memtable lands in the restored database, though its commits fail"]
 async fn a_commit_applied_across_a_restore_leaves_nothing_in_the_restored_database() {
 	commits_in_the_pipeline_across_a_restore(Park::BeforeApplyRound, true).await;
 }

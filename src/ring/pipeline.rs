@@ -98,6 +98,9 @@ struct FlushScratch {
 	/// Whether a batch of the group is in a memtable or an L0 table already. A failure from then
 	/// on cannot leave nothing of the group behind.
 	applied: bool,
+	/// The restore epoch the group began in, read once by whoever forms the group: every step of
+	/// it that reaches shared state is refused once a restore has replaced that state.
+	epoch: u64,
 	/// Retired overflow entries between leaving the map and being dropped. Empty between steps,
 	/// and at most `RETIRED_FREE_CHUNK` long.
 	retired: Vec<Arc<CommitEntry>>,
@@ -399,10 +402,13 @@ pub(crate) struct CommitPipeline {
 	/// flusher (and restore), in ring order.
 	pub(crate) log_seq_num: AtomicU64,
 	/// Flag used to pause all incoming commits during a full restore from checkpoint.
-	pub(crate) restoring: AtomicBool,
+	pub(crate) restoring: Arc<AtomicBool>,
 	/// Bumped by every restore; commits accepted in an earlier epoch are not
-	/// applied to the restored state.
-	restore_epoch: AtomicU64,
+	/// applied to the restored state. A restore bumps it under the active memtable's write lock,
+	/// when it replaces the memtables and the manifest (`fence_inflight`), and again once the
+	/// sequence numbers are reset, so a group that began in an earlier epoch cannot log, apply or
+	/// publish anything afterwards: see `epoch_holds`.
+	restore_epoch: Arc<AtomicU64>,
 	/// Asynchronous log store interface for the WAL. The concrete type, because the
 	/// pipeline needs the segment each record was appended to.
 	pub(crate) log_store: Arc<AffinityLogStore>,
@@ -482,8 +488,8 @@ impl CommitPipeline {
 			notify_flusher,
 			shutdown: AtomicBool::new(false),
 			log_seq_num: AtomicU64::new(seq),
-			restoring: AtomicBool::new(false),
-			restore_epoch: AtomicU64::new(0),
+			restoring: Arc::new(AtomicBool::new(false)),
+			restore_epoch: Arc::new(AtomicU64::new(0)),
 			log_store,
 			replace_backoff: ReplaceBackoff::new(),
 			#[cfg(test)]
@@ -1004,25 +1010,40 @@ impl CommitPipeline {
 		// The values of the group go to the value log in `flush_group_with`, ahead of anything
 		// that points into them: a cleanup keeps their files until the pin is dropped, below.
 		let vlog_pin = self.inner.vlog.as_ref().map(|vlog| vlog.pin_group());
+		scratch.epoch = epoch;
 		let result = match self.flush_group_with(&mut batches, need_sync, scratch).await {
-			Err(cause) if scratch.applied => Err(self.stop_database(&cause)),
+			// What was applied before a restore replaced the memtables went with them: only a
+			// failure in the epoch the group began in leaves it in the memtables that readers see.
+			Err(cause) if scratch.applied && self.epoch_holds(epoch) => {
+				Err(self.stop_database(&cause))
+			}
 			result => {
 				self.inner.group_wal_pin.store(u64::MAX, Ordering::Release);
 				result
 			}
 		};
-		let applied = result.is_ok() && self.restore_epoch.load(Ordering::SeqCst) == epoch;
-		if applied {
-			self.replace_backoff.reset();
-			// Visibility first: an entry may only be marked visible, and so
-			// fall below a new transaction's window, once `visible_seq_num`
-			// covers it.
-			let highest = scratch.entries.last().map(|(_, max)| *max).unwrap_or_default();
-			self.inner.visible_seq_num.store(highest, Ordering::SeqCst);
-			for (entry, max) in &scratch.entries {
-				entry.make_visible(*max);
+		// Published under the active memtable's read guard, which a restore needs exclusively to
+		// replace the memtables and bump the epoch: a group that is still in the epoch it began
+		// in publishes before the swap, and one that is not publishes nothing, so a sequence
+		// number from before the restore never reaches `visible_seq_num` after the restore reset
+		// it.
+		let applied = result.is_ok() && {
+			let _active = self.inner.active_memtable.read().unwrap_or_else(|e| e.into_inner());
+			let current = self.epoch_holds(epoch);
+			if current {
+				self.replace_backoff.reset();
+				// Visibility first: an entry may only be marked visible, and so
+				// fall below a new transaction's window, once `visible_seq_num`
+				// covers it.
+				let highest = scratch.entries.last().map(|(_, max)| *max).unwrap_or_default();
+				self.inner.visible_seq_num.store(highest, Ordering::SeqCst);
+				for (entry, max) in &scratch.entries {
+					entry.make_visible(*max);
+				}
 			}
-		} else {
+			current
+		};
+		if !applied {
 			if let Err(e) = &result {
 				tracing::error!("Error during group commit flush: {:?}", e);
 				// The group may be in the WAL, and recovery replays it: the files its values
@@ -1145,7 +1166,11 @@ impl CommitPipeline {
 	pub(crate) async fn flush_group(&self, batches: &[Batch], sync: bool) -> Result<()> {
 		let mut owned = batches.to_vec();
 		let _vlog_pin = self.inner.vlog.as_ref().map(|vlog| vlog.pin_group());
-		let result = self.flush_group_with(&mut owned, sync, &mut FlushScratch::default()).await;
+		let mut scratch = FlushScratch {
+			epoch: self.restore_epoch.load(Ordering::SeqCst),
+			..Default::default()
+		};
+		let result = self.flush_group_with(&mut owned, sync, &mut scratch).await;
 		self.inner.group_wal_pin.store(u64::MAX, Ordering::Release);
 		result
 	}
@@ -1173,7 +1198,9 @@ impl CommitPipeline {
 		sync: bool,
 		scratch: &mut FlushScratch,
 	) -> Result<()> {
-		let epoch = self.restore_epoch.load(Ordering::SeqCst);
+		// The epoch of whoever formed the group, not a fresh read: a restore between the two
+		// would make a group of commits accepted before it look like one that began after it.
+		let epoch = scratch.epoch;
 
 		self.heal_wal(epoch).await?;
 
@@ -1266,7 +1293,11 @@ impl CommitPipeline {
 		// dropped instead if the append fails.
 		let (segment, buf, ends) = self
 			.log_store
-			.append_group_returning_segment(std::mem::take(wal_buf), std::mem::take(wal_ends))
+			.append_group_returning_segment(
+				std::mem::take(wal_buf),
+				std::mem::take(wal_ends),
+				self.may_log(epoch),
+			)
 			.await?;
 		segments.clear();
 		segments.resize(n, segment);
@@ -1326,10 +1357,10 @@ impl CommitPipeline {
 
 			let (next, stop) = if fenced {
 				self.apply_fenced(
-					batches, estimates, oversized, segments, at, sync, wal_buf, wal_ends,
+					batches, estimates, oversized, segments, at, sync, wal_buf, wal_ends, epoch,
 				)?
 			} else {
-				self.apply_run(batches, estimates, oversized, segments, at)?
+				self.apply_run(batches, estimates, oversized, segments, at, epoch)?
 			};
 			if next > at {
 				stale_rounds = 0;
@@ -1349,7 +1380,11 @@ impl CommitPipeline {
 				| ApplyStop::ArenaFull {
 					empty: true,
 				} => {
-					self.write_direct_to_l0(&batches[at], oldest_segment(&segments[at + 1..]))?;
+					self.write_direct_to_l0(
+						&batches[at],
+						oldest_segment(&segments[at + 1..]),
+						epoch,
+					)?;
 					*applied = true;
 					at += 1;
 					stale_rounds = 0;
@@ -1385,6 +1420,7 @@ impl CommitPipeline {
 							sync,
 							wal_buf,
 							wal_ends,
+							epoch,
 						)
 						.await?;
 					}
@@ -1537,8 +1573,15 @@ impl CommitPipeline {
 		oversized: &[bool],
 		segments: &[u64],
 		from: usize,
+		epoch: u64,
 	) -> Result<(usize, ApplyStop)> {
 		let active = self.inner.active_memtable.read()?;
+		// A restore replaces the memtable under the write guard and bumps the epoch there: a
+		// group that holds the read guard in its epoch applies to the memtable that the restore
+		// then drops, and one that finds another epoch applies nothing.
+		if !self.epoch_holds(epoch) {
+			return Err(Error::PipelineStall);
+		}
 		Self::apply_to(&active, batches, estimates, oversized, segments, from)
 	}
 
@@ -1568,8 +1611,13 @@ impl CommitPipeline {
 		sync: bool,
 		wal_buf: &mut Vec<u8>,
 		wal_ends: &mut Vec<usize>,
+		epoch: u64,
 	) -> Result<(usize, ApplyStop)> {
 		let active = self.inner.active_memtable.read()?;
+		// See `apply_run`
+		if !self.epoch_holds(epoch) {
+			return Err(Error::PipelineStall);
+		}
 		let tag = active.get_wal_number();
 		let stale = encode_stale(
 			&batches[from..],
@@ -1583,6 +1631,9 @@ impl CommitPipeline {
 			let mut wal = self.inner.wal.write();
 			if wal.get_active_log_number() != tag {
 				return Err(tag_mismatch(&segments[from..], tag));
+			}
+			if !self.may_log(epoch)() {
+				return Err(Error::PipelineStall);
 			}
 			let segment = wal.append_group(wal_buf, wal_ends)?;
 			if sync {
@@ -1660,6 +1711,7 @@ impl CommitPipeline {
 		sync: bool,
 		wal_buf: &mut Vec<u8>,
 		wal_ends: &mut Vec<usize>,
+		epoch: u64,
 	) -> Result<()> {
 		let stale = encode_stale(batches, oversized, segments, active_tag, wal_buf, wal_ends)?;
 		if stale.is_empty() {
@@ -1667,7 +1719,11 @@ impl CommitPipeline {
 		}
 		let (segment, buf, ends) = self
 			.log_store
-			.append_group_returning_segment(std::mem::take(wal_buf), std::mem::take(wal_ends))
+			.append_group_returning_segment(
+				std::mem::take(wal_buf),
+				std::mem::take(wal_ends),
+				self.may_log(epoch),
+			)
 			.await?;
 		*wal_buf = buf;
 		*wal_ends = ends;
@@ -1719,7 +1775,7 @@ impl CommitPipeline {
 	/// suffix of the WAL: every newer version of the keys of the batch is logged in the same
 	/// segment or a later one, so it is replayed after the record and shadows it in the recovered
 	/// memtable. A shadowed pointer is never read, a flush copies it and a compaction drops it.
-	fn write_direct_to_l0(&self, batch: &Batch, rest_wal_number: u64) -> Result<()> {
+	fn write_direct_to_l0(&self, batch: &Batch, rest_wal_number: u64, epoch: u64) -> Result<()> {
 		let sealed_wal_number = self.inner.seal_active_wal_segment()?;
 		if let Some(ref tm) = self.task_manager {
 			tm.wake_up_memtable();
@@ -1729,18 +1785,43 @@ impl CommitPipeline {
 		self.write_stall.signal_work_done();
 		flushed?;
 
-		let table_id = self.inner.level_manifest.read()?.next_table_id();
-		self.inner.write_batch_direct_to_l0_sst(
-			batch,
-			table_id,
-			sealed_wal_number,
-			rest_wal_number,
-		)?;
+		// A restore holds the flush lock from before it replaces the files until it replaced the
+		// manifest, and bumps the epoch under it. Under the lock the group is either wholly ahead
+		// of the restore, and its table goes with the database that is replaced, or it finds
+		// another epoch, and neither creates a file in the restored directory nor lists a table in
+		// the restored manifest.
+		{
+			let _flush = self.inner.flush_lock.lock();
+			if !self.epoch_holds(epoch) {
+				return Err(Error::PipelineStall);
+			}
+			let table_id = self.inner.level_manifest.read()?.next_table_id();
+			self.inner.write_batch_direct_to_l0_sst(
+				batch,
+				table_id,
+				sealed_wal_number,
+				rest_wal_number,
+			)?;
+		}
 
 		if let Some(ref tm) = self.task_manager {
 			tm.wake_up_level();
 		}
 		Ok(())
+	}
+
+	/// Whether a restore has not replaced the state of the group that began in `epoch`.
+	fn epoch_holds(&self, epoch: u64) -> bool {
+		self.restore_epoch.load(Ordering::SeqCst) == epoch
+	}
+
+	/// Whether a group that began in `epoch` may append to the WAL, for the append to ask under
+	/// the WAL lock. A restore replaces the WAL under that lock after it bumped the epoch, and
+	/// refuses what comes while it runs through `restoring`: a record appended to the WAL that the
+	/// restore reopened would be replayed into the restored database, whatever the group is told.
+	fn may_log(&self, epoch: u64) -> impl FnOnce() -> bool + Send + 'static {
+		let (restoring, current) = (Arc::clone(&self.restoring), Arc::clone(&self.restore_epoch));
+		move || !restoring.load(Ordering::SeqCst) && current.load(Ordering::SeqCst) == epoch
 	}
 
 	/// Shuts down the pipeline. New commits fail at once. The flusher decides every commit that
@@ -1758,6 +1839,14 @@ impl CommitPipeline {
 		RestoreGuard {
 			restoring: &self.restoring,
 		}
+	}
+
+	/// Makes every group that began before it stale. A restore calls it under the active
+	/// memtable's write lock, in the same step that replaces the memtables and the manifest: a
+	/// group that applies or publishes under the read guard did so before the swap, and every
+	/// later step of it is refused.
+	pub(crate) fn fence_inflight(&self) {
+		self.restore_epoch.fetch_add(1, Ordering::SeqCst);
 	}
 
 	/// Resets the pipeline for restore. Commits accepted before the restore
@@ -2517,7 +2606,8 @@ mod scratch_tests {
 				.unwrap();
 		}
 		let mut batches = [batch];
-		let outcome = pipeline.apply_run(&mut batches, &[100], &[false], &[tag], 0);
+		let epoch = pipeline.restore_epoch.load(Ordering::SeqCst);
+		let outcome = pipeline.apply_run(&mut batches, &[100], &[false], &[tag], 0, epoch);
 		match outcome {
 			Ok((at, ApplyStop::Torn(Error::Other(message)))) => {
 				assert!(message.contains("drift"), "{message}");

@@ -98,6 +98,11 @@ pub trait CompactionOperations: Send + Sync {
 /// tables to the removal of what it made obsolete, and takes the locks above under it, and a
 /// restore holds it exclusively. Nothing waits for it while holding any of them.
 ///
+/// The commit pipeline takes two of them outside the flush path: a commit group's direct level-0
+/// write holds `flush_lock` with nothing else held and takes the others under it, as a flush
+/// does, and a group's publication holds the `active_memtable` read guard alone, with no lock
+/// under it.
+///
 /// The WAL's own lock (`wal`) sits below every lock above. Under it are taken only the segment's
 /// fsync gate, which is a leaf, and, by a rotation (`rotate_wal()`), the value log's writer lock
 /// and its list of unsynced files, which nothing holds while it waits for the WAL lock: the commit
@@ -2365,6 +2370,9 @@ impl Tree {
 			let mut active_memtable = inner.active_memtable.write()?;
 			let mut levels_guard = inner.level_manifest.write()?;
 			let mut immutable_memtables = inner.immutable_memtables.write()?;
+			// Under the active memtable's write lock: a commit group that applies or publishes
+			// under its read guard did so before this, and anything it does after is refused.
+			self.core.commit_pipeline.fence_inflight();
 			let replaced = (
 				std::mem::replace(&mut *levels_guard, new_levels),
 				std::mem::replace(
