@@ -1490,6 +1490,137 @@ fn a_header_with_a_flipped_bit_is_an_encryption_error_for_every_bit_and_names_wh
 	}
 }
 
+// ========== The footer ==========
+
+/// `file` with the footer of a sealed table that names `meta` and `index`, written as the writer
+/// writes one, which is all that someone who has no key needs to make another footer.
+fn with_footer(file: &[u8], meta: &BlockHandle, index: &BlockHandle) -> Vec<u8> {
+	let mut footer = Footer::new(meta.clone(), index.clone());
+	footer.checksum = ChecksumType::SealedCRC32c;
+	let mut changed = file.to_vec();
+	let at = changed.len() - TABLE_FULL_FOOTER_LENGTH;
+	footer.encode(&mut changed[at..]);
+	changed
+}
+
+/// `file` with the byte of its footer that says how its blocks are laid out set to `byte`.
+fn with_checksum_type(file: &[u8], byte: u8) -> Vec<u8> {
+	let mut changed = file.to_vec();
+	let at = changed.len() - TABLE_FULL_FOOTER_LENGTH + 1;
+	changed[at] = byte;
+	changed
+}
+
+#[test]
+fn a_footer_that_names_another_block_cannot_make_a_sealed_table_say_what_it_does_not() {
+	// The footer is the one part of the file that nothing seals, so it can be written by anyone.
+	// What it names is read, and a block opens only as the kind that it was sealed as, where it
+	// was sealed.
+	for suite in SUITES {
+		let ctx = context(suite);
+		let opts = options(Some(&ctx), CompressionType::None, true);
+		let file = write_table(&opts, TABLE_ID, &many_points(KEYS));
+		let blocks = walk(&opts, &file, TABLE_ID);
+		let footer = footer_of(&file);
+		let (meta, index) = (footer.meta_index.clone(), footer.index.clone());
+
+		// The control: the footer made again is the footer that was there.
+		assert!(with_footer(&file, &meta, &index) == file, "{suite:?}");
+
+		// Each names the blocks that the table has, with the sizes that they have, so that nothing
+		// is out of bounds and the trailers are right: only what each block was sealed as, and
+		// where, can tell.
+		let named = |kind: BlockKind| first_of(&blocks, kind);
+		let cases = [
+			("the two handles swapped", index.clone(), meta.clone()),
+			("the index named as a data block", meta.clone(), named(BlockKind::Data)),
+			(
+				"the index named as an index partition",
+				meta.clone(),
+				named(BlockKind::IndexPartition),
+			),
+			(
+				"the meta-index named as a filter partition",
+				named(BlockKind::FilterPartition),
+				index.clone(),
+			),
+		];
+		for (what, meta_handle, index_handle) in cases {
+			let changed = with_footer(&file, &meta_handle, &index_handle);
+			let err = encryption_error(open_table(&opts, &changed, TABLE_ID));
+			assert_eq!(err, EncryptionError::AuthenticationFailed, "{suite:?}: {what}");
+		}
+
+		// A handle that names the header, or bytes that are not a block, is not read as one. The
+		// meta-index is the last block, so one byte more than it has is not in the file.
+		let in_the_header = BlockHandle::new(0, 20);
+		let too_long = BlockHandle::new(meta.offset, meta.size + 1);
+		let too_short = BlockHandle::new(meta.offset, meta.size - 1);
+		let off_by_one = BlockHandle::new(meta.offset + 1, meta.size);
+		for (what, changed) in [
+			("the index in the header", with_footer(&file, &meta, &in_the_header)),
+			("the meta-index in the header", with_footer(&file, &in_the_header, &index)),
+			("a meta-index that is one byte too long", with_footer(&file, &too_long, &index)),
+			("a meta-index that is one byte too short", with_footer(&file, &too_short, &index)),
+			("a meta-index that starts one byte late", with_footer(&file, &off_by_one, &index)),
+		] {
+			let err = open_table(&opts, &changed, TABLE_ID)
+				.err()
+				.unwrap_or_else(|| panic!("{suite:?}: {what}: the table was opened"));
+			assert!(matches!(err, Error::SSTable(_) | Error::Encryption(_)), "{what}: {err:?}");
+		}
+		let err = open_table(&opts, &with_footer(&file, &meta, &in_the_header), TABLE_ID)
+			.err()
+			.expect("a handle into the header is an error");
+		assert!(
+			matches!(err, Error::SSTable(SSTableError::BlockHandleOutOfBounds { .. })),
+			"{suite:?}: {err:?}"
+		);
+	}
+}
+
+#[test]
+fn a_footer_that_says_the_other_layout_does_not_make_a_table_the_other_kind() {
+	for suite in SUITES {
+		let ctx = context(suite);
+		let encrypted = options(Some(&ctx), CompressionType::None, true);
+		let plain = options(None, CompressionType::None, true);
+		let sealed_file = write_table(&encrypted, TABLE_ID, &many_points(KEYS));
+		let plain_file = write_table(&plain, TABLE_ID, &many_points(KEYS));
+
+		// A plain table whose footer says that it is sealed, in a database that has a key: what is
+		// at the start of the file is not a header, and nothing of the table is read.
+		let forged = with_checksum_type(&plain_file, ChecksumType::SealedCRC32c as u8);
+		let err = encryption_error(open_table(&encrypted, &forged, TABLE_ID));
+		assert_eq!(err, EncryptionError::MalformedHeader, "{suite:?}");
+		// And in one that has none.
+		let err = encryption_error(open_table(&plain, &forged, TABLE_ID));
+		assert_eq!(err, EncryptionError::NotConfigured, "{suite:?}");
+
+		// A sealed table whose footer says that it is plain, which is how it would be read as a
+		// table whose bytes are what they seem. A database that has a key refuses it for that, and
+		// one that has none finds that its blocks are not what a plain block is, and stops there.
+		let forged = with_checksum_type(&sealed_file, ChecksumType::CRC32c as u8);
+		let err = encryption_error(open_table(&encrypted, &forged, TABLE_ID));
+		assert_eq!(err, EncryptionError::PlaintextInEncryptedDb, "{suite:?}");
+		let err = open_table(&plain, &forged, TABLE_ID).err().expect("the table was opened");
+		assert!(matches!(err, Error::SSTable(_)), "{suite:?}: {err:?}");
+
+		// A layout that no version knows.
+		for byte in [0u8, 3, 0x82, 0xff] {
+			for file in [&sealed_file, &plain_file] {
+				let err = open_table(&encrypted, &with_checksum_type(file, byte), TABLE_ID)
+					.err()
+					.expect("the table was opened");
+				assert!(
+					matches!(err, Error::SSTable(SSTableError::InvalidChecksumType { .. })),
+					"{suite:?}: byte {byte}: {err:?}"
+				);
+			}
+		}
+	}
+}
+
 // ========== Truncation ==========
 
 #[test]
