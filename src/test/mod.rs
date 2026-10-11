@@ -157,6 +157,8 @@ pub mod wal_replace_tests;
 #[cfg(test)]
 pub mod wal_rotation_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_sealed_recovery_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod wal_sealed_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod wal_sealed_writer_tests;

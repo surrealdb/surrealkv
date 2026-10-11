@@ -110,6 +110,9 @@ pub(crate) struct Reader {
 
 	/// Where in the file the physical record that was last looked at begins.
 	record_start: usize,
+
+	/// The length that the header of that record gave, if its header was read.
+	parsed_length: Option<usize>,
 }
 
 impl Reader {
@@ -131,6 +134,7 @@ impl Reader {
 			context: context.clone(),
 			sealed: None,
 			record_start: 0,
+			parsed_length: None,
 			file,
 			buffer: Box::new([0; BLOCK_SIZE]),
 			buffer_offset: 0,
@@ -152,7 +156,6 @@ impl Reader {
 	///
 	/// This is set when a SetCompressionType record is read from the file.
 	/// Returns `CompressionType::None` if no compression record was found.
-	#[cfg(test)]
 	pub(crate) fn get_compression_type(&self) -> CompressionType {
 		self.compression_type
 	}
@@ -257,9 +260,7 @@ impl Reader {
 				// is not the end of a torn write: something was lost from the
 				// middle.
 				if self.context.is_sealed() {
-					let followed = match self
-						.valid_record_in_later_blocks(self.record_start / BLOCK_SIZE + 1)
-					{
+					let followed = match self.records_follow() {
 						Ok(followed) => followed,
 						Err(failure) => {
 							self.err = Some(failure.clone());
@@ -501,12 +502,14 @@ impl Reader {
 		let mut fragment_index = 0;
 
 		loop {
+			self.parsed_length = None;
 			if !self.header_in_buffer()? {
 				continue;
 			}
 			let at = self.record_start as u64;
 			let (crc, length, type_byte) = self.parse_header();
 			let length = usize::from(length);
+			self.parsed_length = Some(length);
 
 			if type_byte == RecordType::Empty as u8 {
 				// A writer never frames a record of this type, so this is a zeroed part of the
@@ -609,26 +612,23 @@ impl Reader {
 	/// Reads the header record of a sealed segment, which must be the first record of the file, and
 	/// authenticates the segment under the key it names.
 	///
-	/// A file that ends before the header does, or whose header is zeroed or fails its checksum, is
-	/// damage of the kind that a crash during the creation of the segment leaves. A header that
-	/// passes its checksum and does not open is never damage: it is a key, a database, a segment
-	/// number or a format that this reader cannot use, and a first record that is not a header is a
-	/// plaintext segment.
+	/// A file with nothing in it is the end of a log that has no records: a crash right after the
+	/// segment was created leaves one, and it holds nothing that could be lost. A file that ends
+	/// inside the header, or whose header is zeroed or fails its checksum, is damage of the kind a
+	/// crash during the creation of the segment leaves. A header that passes its checksum and does
+	/// not open is never damage: it is a key, a database, a segment number or a format that this
+	/// reader cannot use, and a first record that is not a header is a plaintext segment.
 	fn read_segment_header(&mut self) -> Result<()> {
 		let Some(context) = self.context.encryption().cloned() else {
 			return Err(EncryptionError::NotConfigured.into());
 		};
 
-		while !self.header_in_buffer().map_err(|e| match e {
-			// A segment with nothing in it has no header, which is not the clean end of a log.
-			Error::IO(ref io) if io.kind() == io::ErrorKind::UnexpectedEof => {
-				physical("the segment has no header")
-			}
-			e => e,
-		})? {}
+		self.parsed_length = None;
+		while !self.header_in_buffer()? {}
 
 		let (crc, length, type_byte) = self.parse_header();
 		let length = usize::from(length);
+		self.parsed_length = Some(length);
 		match type_byte {
 			t if t == RecordType::SegmentHeader as u8 => {}
 			t if t == RecordType::Empty as u8 => {
@@ -659,38 +659,68 @@ impl Reader {
 		Ok(())
 	}
 
-	/// Whether a physical record that passes its checksum starts a block from `first_block` on,
-	/// the first of the blocks after damage. A record starts every block, a continuation of the one
-	/// before it or a record of its own, so looking at the start of each block finds data that
-	/// follows damage, and finds none after what a torn write left, which has nothing behind it.
+	/// Whether records that pass their checksum follow the damage that was just found. A tear that
+	/// a crash leaves has nothing behind it, so what follows it is not one: data was lost from the
+	/// middle, or someone cut into the segment.
+	///
+	/// Two places are looked at: where the next record of the same block would begin, if the
+	/// header of the record that failed could be read, and the start of every block after it. A
+	/// record starts every block, a continuation of the one before it or a record of its own.
 	///
 	/// Reads through its own positions and leaves the reader as it was.
+	fn records_follow(&self) -> Result<bool> {
+		if let Some(length) = self.parsed_length {
+			let next = self.record_start + WAL_RECORD_HEADER_SIZE + length;
+			if self.valid_record_at(next)? {
+				return Ok(true);
+			}
+			// The header record of a sealed segment has a length that is always the same, which is
+			// where the first batch is even if the length that was read is not to be believed.
+			if self.record_start == 0 && self.valid_record_at(sealed::HEADER_RECORD_LEN)? {
+				return Ok(true);
+			}
+		}
+		self.valid_record_in_later_blocks(self.record_start / BLOCK_SIZE + 1)
+	}
+
+	/// Whether a physical record that passes its checksum starts a block from `first_block` on.
 	fn valid_record_in_later_blocks(&self, first_block: usize) -> Result<bool> {
-		let io_error = |e: crate::error::Error| physical(&format!("reading ahead failed: {e}"));
-		let size = VfsFile::size(&self.file).map_err(io_error)?;
-		let mut block = vec![0u8; BLOCK_SIZE];
+		let size = self.file_size()?;
 		let mut at = (first_block as u64).saturating_mul(BLOCK_SIZE as u64);
 		while at < size {
-			let read = VfsFile::read_up_to(&self.file, at, &mut block).map_err(io_error)?;
-			if let Some((head, rest)) =
-				block.get(..read).and_then(|got| got.split_first_chunk::<WAL_RECORD_HEADER_SIZE>())
-			{
-				let crc = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
-				let length = usize::from(u16::from_be_bytes([head[4], head[5]]));
-				let kind = head[6];
-				let is_batch_fragment =
-					(RecordType::Full as u8..=RecordType::Last as u8).contains(&kind);
-				if is_batch_fragment {
-					if let Some(payload) = rest.get(..length) {
-						if calculate_crc32(&[kind], payload) == crc {
-							return Ok(true);
-						}
-					}
-				}
+			if self.valid_record_at(at as usize)? {
+				return Ok(true);
 			}
 			at = at.saturating_add(BLOCK_SIZE as u64);
 		}
 		Ok(false)
+	}
+
+	fn file_size(&self) -> Result<u64> {
+		VfsFile::size(&self.file).map_err(|e| physical(&format!("reading ahead failed: {e}")))
+	}
+
+	/// Whether a physical record of a batch (a full record or a fragment of one) that passes its
+	/// checksum starts at the file offset `at`, and lies within its block.
+	fn valid_record_at(&self, at: usize) -> Result<bool> {
+		let room = BLOCK_SIZE - at % BLOCK_SIZE;
+		if room < WAL_RECORD_HEADER_SIZE || (at as u64) >= self.file_size()? {
+			return Ok(false);
+		}
+		let mut bytes = vec![0u8; room];
+		let read = VfsFile::read_up_to(&self.file, at as u64, &mut bytes)
+			.map_err(|e| physical(&format!("reading ahead failed: {e}")))?;
+		let Some((head, rest)) =
+			bytes.get(..read).and_then(|got| got.split_first_chunk::<WAL_RECORD_HEADER_SIZE>())
+		else {
+			return Ok(false);
+		};
+		let crc = u32::from_be_bytes([head[0], head[1], head[2], head[3]]);
+		let length = usize::from(u16::from_be_bytes([head[4], head[5]]));
+		let kind = head[6];
+		let is_batch_fragment = (RecordType::Full as u8..=RecordType::Last as u8).contains(&kind);
+		Ok(is_batch_fragment
+			&& rest.get(..length).is_some_and(|payload| calculate_crc32(&[kind], payload) == crc))
 	}
 }
 

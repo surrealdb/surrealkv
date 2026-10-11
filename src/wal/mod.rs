@@ -17,6 +17,7 @@ pub(crate) mod parallel_recovery;
 pub mod reader;
 pub mod recovery;
 pub(crate) mod sealed;
+pub(crate) mod sealed_recovery;
 pub mod writer;
 
 pub use manager::Wal;

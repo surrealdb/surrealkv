@@ -101,7 +101,7 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 /// * `Ok((Some(max_seq_num), memtables))` - Memtables with their WAL numbers
 /// * `Ok((None, vec![]))` - No data recovered
 /// * `Err(...)` - Error during replay
-type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>);
+pub(crate) type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>);
 
 /// Replays a plaintext WAL, see [`replay_wal_with`].
 #[cfg(test)]
@@ -126,6 +126,11 @@ pub(crate) fn replay_wal_with(
 		min_wal_number,
 		arena_size
 	);
+
+	// A sealed WAL is replayed by its own code, which fails on anything that is not a tear.
+	if context.is_sealed() {
+		return crate::wal::sealed_recovery::replay(context, wal_dir, min_wal_number, arena_size);
+	}
 
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
@@ -332,11 +337,9 @@ pub(crate) fn repair_corrupted_wal_segment_with(
 
 	// The plaintext repair below reads and writes plaintext, and deletes a segment that holds no
 	// valid record: it must never run on a sealed segment, which a key that does not fit makes look
-	// like one. Sealed segments are repaired by their own code.
+	// like one. Sealed segments are repaired by their own code, which deletes nothing.
 	if context.is_sealed() {
-		return Err(crate::error::Error::Other(format!(
-			"WAL segment {segment_id:020}.wal is sealed and is not repaired"
-		)));
+		return crate::wal::sealed_recovery::repair(context, wal_dir, segment_id);
 	}
 
 	// Build segment paths

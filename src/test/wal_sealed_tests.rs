@@ -27,6 +27,7 @@ use crate::tde::{
 use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
 use crate::wal::{
+	calculate_crc32,
 	sealed,
 	segment_name,
 	CompressionType,
@@ -148,6 +149,15 @@ pub(crate) fn physical_records(bytes: &[u8]) -> Vec<(usize, u8, usize)> {
 		block += 1;
 	}
 	found
+}
+
+/// Sets the checksum of the physical record at `at` to what its type and payload give, as someone
+/// who changed the record without the key can.
+pub(crate) fn fix_checksum(bytes: &mut [u8], at: usize) {
+	let length = usize::from(u16::from_be_bytes([bytes[at + 4], bytes[at + 5]]));
+	let crc =
+		calculate_crc32(&[bytes[at + 6]], &bytes[at + HEADER_SIZE..at + HEADER_SIZE + length]);
+	bytes[at..at + 4].copy_from_slice(&crc.to_be_bytes());
 }
 
 /// Every file under `dir`, by path relative to it, with its bytes.

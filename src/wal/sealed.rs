@@ -50,6 +50,10 @@ const COVERED_LEN: usize = 2;
 /// The length of the payload of the `SegmentHeader` record.
 pub(crate) const HEADER_PAYLOAD_LEN: usize = HEADER_LEN + COVERED_LEN;
 
+/// The length of the header record of a sealed segment, framing included: where its first batch
+/// begins.
+pub(crate) const HEADER_RECORD_LEN: usize = super::HEADER_SIZE + HEADER_PAYLOAD_LEN;
+
 /// The index of the first batch of a segment. Position 0 of a file key is not used by a WAL.
 pub(crate) const FIRST_INDEX: u64 = 1;
 

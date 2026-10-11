@@ -15,6 +15,7 @@ use crate::error::{Error, Result};
 use crate::memtable::MemTable;
 use crate::wal::reader::Reader;
 use crate::wal::recovery::{apply_batch_with_oversized_fallback, DefaultReporter};
+use crate::wal::sealed_recovery::{self, DecodedSegment};
 use crate::wal::{Error as WalError, SegmentRef, WalContext};
 
 /// Decodes a single plaintext WAL segment file into batches and the segment's maximum sequence
@@ -68,6 +69,70 @@ pub(crate) fn decode_segment_batches_with(
 	}
 
 	Ok((max_seq, batches))
+}
+
+/// Decodes the sealed segments of `segments`, in order: in parallel on the workers of the pool if
+/// there are several, where each worker has the context, and the first failure that is not a tear
+/// is the error. Nothing is read through a worker that was not given the context.
+pub(crate) fn decode_sealed_segments(
+	context: &WalContext,
+	segments: &[SegmentRef],
+) -> Result<Vec<DecodedSegment>> {
+	let decode = |segment: &SegmentRef| {
+		sealed_recovery::decode_segment(context, &segment.file_path, segment.id)
+	};
+	if segments.len() <= 1 {
+		return segments.iter().map(decode).collect();
+	}
+
+	#[cfg(target_arch = "wasm32")]
+	{
+		segments.iter().map(decode).collect()
+	}
+
+	#[cfg(not(target_arch = "wasm32"))]
+	{
+		if let Ok(handle) = tokio::runtime::Handle::try_current() {
+			if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+				return tokio::task::block_in_place(|| {
+					handle.block_on(decode_sealed_segments_parallel(context, segments))
+				});
+			}
+		}
+
+		let segs = segments.to_vec();
+		let context = context.clone();
+		std::thread::spawn(move || {
+			let rt = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.map_err(|e| Error::Other(format!("Failed to build temporary runtime: {e}")))?;
+			rt.block_on(decode_sealed_segments_parallel(&context, &segs))
+		})
+		.join()
+		.map_err(|_| Error::Other("WAL parallel recovery thread panicked".to_string()))?
+	}
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn decode_sealed_segments_parallel(
+	context: &WalContext,
+	segments: &[SegmentRef],
+) -> Result<Vec<DecodedSegment>> {
+	let mut tasks = Vec::with_capacity(segments.len());
+	for segment in segments {
+		let path = segment.file_path.clone();
+		let id = segment.id;
+		let context = context.clone();
+		tasks.push(affinitypool::spawn(move || {
+			sealed_recovery::decode_segment(&context, &path, id)
+		}));
+	}
+	let mut decoded = Vec::with_capacity(tasks.len());
+	for task in tasks {
+		decoded.push(task.await?);
+	}
+	Ok(decoded)
 }
 
 pub(crate) type ParallelReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>);
