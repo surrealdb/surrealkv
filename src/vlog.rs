@@ -11,6 +11,10 @@ use parking_lot::{Mutex, RwLock, RwLockWriteGuard};
 use crate::error::{Error, Result};
 use crate::{vfs, CompressionType, Options, VLogChecksumLevel, Value};
 
+// The writer and the reader of the commits that follow use all of it.
+#[allow(dead_code)]
+mod sealed;
+
 /// Test-only: the VLog files whose fsync completed, in order.
 #[cfg(test)]
 pub(crate) static SYNCED_VLOG_FILES: parking_lot::Mutex<Vec<PathBuf>> =
