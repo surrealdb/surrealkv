@@ -1,5 +1,4 @@
-#[cfg(test)]
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use quick_cache::sync::Cache as QCache;
@@ -24,9 +23,21 @@ pub(crate) enum Item {
 	Filter(Arc<Value>),
 }
 
+/// Hands out the identity under which one instance of a table keeps its blocks in the cache.
+///
+/// A table id names a file of a manifest, and a restore hands the same ids out again for other
+/// files while a reader that began before it still holds, and reads, the tables it had. Blocks
+/// keyed by the id of such a table would be served for the table that has its id now. Keyed by
+/// instance, they are unreachable for it.
+pub(crate) fn next_instance_id() -> u64 {
+	static NEXT: AtomicU64 = AtomicU64::new(1);
+	NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Cache key with kind-based differentiation.
 /// - kind: Differentiates between data blocks, index blocks, and VLog values
-/// - id: table_id for blocks, file_id for VLog
+/// - id: the table instance (`next_instance_id`) for blocks, the log's generation and the file id
+///   for VLog values, see `VLog::cache_id`
 /// - offset: Block or value offset within the file
 #[derive(Eq, std::hash::Hash, PartialEq)]
 pub(crate) struct CacheKey {
@@ -109,9 +120,10 @@ impl BlockCache {
 		}
 	}
 
-	/// Drops every entry. Blocks are keyed by table id and offset, and value-log values by file
-	/// id and offset, and a restore hands the same ids out again for other files: an entry that
-	/// outlived it would be served for a file it was never read from.
+	/// Drops every entry, which a restore does for the memory: the entries of the tables and the
+	/// value-log files that it replaced are not reachable any more (blocks are keyed by table
+	/// instance and value-log values by the log's generation, so a reader that is still reading
+	/// the old files cannot fill the cache for the restored ones), and would only be evicted.
 	pub(crate) fn clear(&self) {
 		self.data.clear();
 	}
@@ -138,8 +150,8 @@ impl BlockCache {
 	}
 
 	/// Inserts a VLog value into the cache.
-	pub(crate) fn insert_vlog(&self, file_id: u32, offset: u64, value: Value) {
-		self.data.insert((KIND_VLOG, file_id as u64, offset).into(), Item::VLog(value));
+	pub(crate) fn insert_vlog(&self, id: u64, offset: u64, value: Value) {
+		self.data.insert((KIND_VLOG, id, offset).into(), Item::VLog(value));
 	}
 
 	/// Inserts a bloom-filter partition (raw bytes) into the cache.
@@ -217,8 +229,8 @@ impl BlockCache {
 	}
 
 	/// Retrieves a VLog value from the cache.
-	pub(crate) fn get_vlog(&self, file_id: u32, offset: u64) -> Option<Value> {
-		let key = (KIND_VLOG, file_id as u64, &offset);
+	pub(crate) fn get_vlog(&self, id: u64, offset: u64) -> Option<Value> {
+		let key = (KIND_VLOG, id, &offset);
 		let item = self.data.get(&key);
 
 		#[cfg(test)]

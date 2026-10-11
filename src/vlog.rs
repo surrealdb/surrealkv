@@ -1022,6 +1022,12 @@ impl VLog {
 		Ok(())
 	}
 
+	/// The key under which the block cache keeps the values of file `file_id` of the log as it is
+	/// now: a reload makes the same file id another file, so it is part of the key.
+	pub(crate) fn cache_id(&self, file_id: u32) -> u64 {
+		(self.generation.load(Ordering::SeqCst) << 32) | u64::from(file_id)
+	}
+
 	/// Retrieves (and caches) an open file handle for the given file ID
 	fn get_file_handle(&self, file_id: u32) -> Result<Arc<File>> {
 		let generation = {
@@ -1134,9 +1140,12 @@ impl VLog {
 
 	/// Retrieves a value using a ValuePointer
 	pub(crate) fn get(&self, pointer: &ValuePointer) -> Result<Value> {
+		// Fixed before anything is read: a restore that reloads the log while this call reads a
+		// file of the old one leaves what it reads under the key of the old log.
+		let cache_id = self.cache_id(pointer.file_id);
+
 		// Check unified block cache first
-		if let Some(cached_value) = self.opts.block_cache.get_vlog(pointer.file_id, pointer.offset)
-		{
+		if let Some(cached_value) = self.opts.block_cache.get_vlog(cache_id, pointer.offset) {
 			return Ok(cached_value);
 		}
 
@@ -1261,7 +1270,7 @@ impl VLog {
 		let value_bytes = entry_data_vec[value_start..crc_start].to_vec();
 
 		// Cache the value in unified block cache for future reads
-		self.opts.block_cache.insert_vlog(pointer.file_id, pointer.offset, value_bytes.clone());
+		self.opts.block_cache.insert_vlog(cache_id, pointer.offset, value_bytes.clone());
 
 		Ok(value_bytes)
 	}

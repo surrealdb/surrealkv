@@ -150,6 +150,8 @@ impl PartitionedFilterWriter {
 #[derive(Clone)]
 pub(crate) struct PartitionedFilterReader {
 	table_id: u64,
+	/// The key of the table instance's blocks in the block cache, see `Table::cache_id`.
+	cache_id: u64,
 	opts: Arc<Options>,
 	policy: Arc<dyn FilterPolicy>,
 	file: Arc<dyn File>,
@@ -163,6 +165,7 @@ impl PartitionedFilterReader {
 	/// Parses the filter top-level index block at `location`.
 	pub(crate) fn new(
 		table_id: u64,
+		cache_id: u64,
 		opts: Arc<Options>,
 		file: Arc<dyn File>,
 		location: &BlockHandle,
@@ -189,6 +192,7 @@ impl PartitionedFilterReader {
 
 		Ok(Self {
 			table_id,
+			cache_id,
 			opts,
 			policy,
 			file,
@@ -224,14 +228,14 @@ impl PartitionedFilterReader {
 
 		let offset = partition.handle.offset() as u64;
 		let bits =
-			if let Some(bits) = self.opts.block_cache.get_filter_partition(self.table_id, offset) {
+			if let Some(bits) = self.opts.block_cache.get_filter_partition(self.cache_id, offset) {
 				bits
 			} else {
 				match read_verified_raw_block(Arc::clone(&self.file), &partition.handle) {
 					Ok(bytes) => {
 						let bytes = Arc::new(bytes);
 						self.opts.block_cache.insert_filter_partition(
-							self.table_id,
+							self.cache_id,
 							offset,
 							Arc::clone(&bytes),
 						);

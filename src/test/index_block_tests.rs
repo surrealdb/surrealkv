@@ -132,6 +132,7 @@ fn test_find_block_handle_by_key() {
 	// Initialize Index with predefined blocks using encoded internal keys
 	let index = Index {
 		id: 0,
+		cache_id: 0,
 		opts,
 		blocks: vec![
 			BlockHandleWithKey::new(sep_c.clone(), BlockHandle::new(0, 10)),
@@ -187,6 +188,7 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 
 	let index = Index {
 		id: 0,
+		cache_id: 0,
 		opts,
 		blocks: vec![
 			BlockHandleWithKey::new(sep_foo_60, BlockHandle::new(0, 100)),
@@ -274,6 +276,7 @@ fn test_find_block_handle_by_key_different_user_keys() {
 
 	let index = Index {
 		id: 0,
+		cache_id: 0,
 		opts,
 		blocks: vec![
 			BlockHandleWithKey::new(sep_b, BlockHandle::new(0, 100)),
@@ -348,6 +351,7 @@ fn test_find_block_handle_returns_correct_partition_index() {
 
 	let index = Index {
 		id: 0,
+		cache_id: 0,
 		opts,
 		blocks: sep_keys
 			.iter()
@@ -382,6 +386,7 @@ fn test_partition_lookup_empty_partition_returns_none() {
 
 	let index = Index {
 		id: 0,
+		cache_id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep, BlockHandle::new(0, 100))],
 		file: f,
@@ -404,6 +409,7 @@ fn test_partition_lookup_single_partition() {
 
 	let index = Index {
 		id: 0,
+		cache_id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
 		file: f,
@@ -441,6 +447,7 @@ fn test_partition_lookup_exact_separator_match() {
 
 	let index = Index {
 		id: 0,
+		cache_id: 0,
 		opts,
 		blocks: vec![
 			BlockHandleWithKey::new(sep_a, BlockHandle::new(0, 100)),
