@@ -303,6 +303,93 @@ async fn many_tasks_appending_to_one_log_store_never_overlap_or_leave_holes() {
 	remove_and_verify(&root, &name).await;
 }
 
+#[wasm_bindgen_test]
+async fn appends_dropped_unpolled_among_the_polled_ones_of_many_tasks_leave_no_hole() {
+	const TASKS: usize = 8;
+	const RECORDS: usize = 60;
+	const SEED: u64 = 0xD409;
+	let root = root().await;
+	let name = unique_name("shared-log-dropped", "log");
+	let file = Arc::new(create(&root, &name).await);
+	let log = Arc::new(OpfsLogStore::new(Arc::clone(&file)));
+	let steps: StepLog = Rc::default();
+
+	// Every record is `[task, sequence (u16 le), payload length (u8), payload]`. A task creates
+	// two futures per record, yields while it holds both, drops the first without polling it and
+	// awaits the second, so the other tasks create, drop and poll their own in between. Only the
+	// awaited records may be in the log, back to back.
+	let mut tasks = Vec::new();
+	for id in 0..TASKS {
+		let (log, steps) = (Arc::clone(&log), Rc::clone(&steps));
+		tasks.push(spawn(async move {
+			let mut rng = Rng::new(SEED + id as u64);
+			let mut written = Vec::new();
+			for seq in 0..RECORDS {
+				let record_of = |rng: &mut Rng, tag: u8| {
+					let payload = pattern(rng.next_u64(), rng.below(120) as usize);
+					let mut record = vec![id as u8];
+					record.extend_from_slice(&(seq as u16).to_le_bytes());
+					record.push(payload.len() as u8);
+					record.extend_from_slice(&payload);
+					record.push(tag);
+					record
+				};
+				let lost = record_of(&mut rng, 0xEE);
+				let kept = record_of(&mut rng, 0xAA);
+				let dropped = log.append(&lost);
+				let append = log.append(&kept);
+				yield_now().await;
+				drop(dropped);
+				let end = append.await.map_err(failed("append"))?;
+				steps.borrow_mut().push(id);
+				written.push((end, kept));
+				yield_now().await;
+			}
+			Ok::<_, String>(written)
+		}));
+	}
+	let mut written = Vec::new();
+	for (id, task) in tasks.into_iter().enumerate() {
+		written.push(finished(&format!("appending task {id}"), task).await);
+	}
+
+	let steps: Vec<usize> = steps.borrow().clone();
+	assert_eq!(steps.len(), TASKS * RECORDS);
+	assert!(
+		task_switches(&steps) >= TASKS * RECORDS / 2,
+		"the tasks ran one after the other: {} switches",
+		task_switches(&steps)
+	);
+
+	let bytes = read_all(&file);
+	let total: usize = written.iter().flatten().map(|(_, record)| record.len()).sum();
+	assert_eq!(bytes.len(), total, "the log is exactly the awaited records, no hole, no lost one");
+	assert_eq!(log.size().await.unwrap(), total as u64);
+	assert_eq!(file.size().unwrap(), total as u64);
+	for (end, record) in written.iter().flatten() {
+		assert_eq!(
+			&bytes[*end as usize - record.len()..*end as usize],
+			&record[..],
+			"record ending at {end}"
+		);
+	}
+	// Parsed front to back, every record must end with the tag of a record that was awaited.
+	let mut position = 0;
+	let mut parsed = 0;
+	while position < bytes.len() {
+		let len = bytes[position + 3] as usize;
+		let tag = bytes[position + 4 + len];
+		assert_eq!(tag, 0xAA, "a record that was dropped unpolled is in the log at {position}");
+		position += 5 + len;
+		parsed += 1;
+	}
+	assert_eq!(position, bytes.len(), "the last record ends exactly at the end of the log");
+	assert_eq!(parsed, TASKS * RECORDS);
+
+	file.close();
+	remove_and_verify(&root, &name).await;
+}
+
 // ---------------------------------------------------------------------------------------------
 // 4. Racing opens, concurrent root
 // ---------------------------------------------------------------------------------------------
