@@ -108,3 +108,148 @@ fn check_unlisted_table(context: &EncryptionContext, path: &Path) -> Result<()> 
 	}
 	Ok(())
 }
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+	use std::sync::Arc;
+
+	use tempfile::TempDir;
+
+	use super::*;
+	use crate::tde::{CipherSuite, DbId, FileKind, SoftwareKeyManager};
+
+	fn context(db: u8) -> EncryptionContext {
+		EncryptionContext::new(
+			Arc::new(SoftwareKeyManager::new([0x31; 32])),
+			DbId::from_bytes([db; 16]),
+			CipherSuite::XChaCha20Poly1305,
+		)
+	}
+
+	/// The header that a table of the database `db` starts with.
+	fn header_of(db: u8) -> [u8; HEADER_LEN] {
+		let (header, _) = context(db).create_file(FileKind::Sst, 9, &[]).unwrap();
+		header.encode()
+	}
+
+	/// What `check_unlisted_table` says about a file that holds `bytes`, for the database 0xD1.
+	fn verdict(bytes: &[u8]) -> Option<EncryptionError> {
+		let dir = TempDir::new().unwrap();
+		let path = dir.path().join("00000000000000000009.sst");
+		std::fs::write(&path, bytes).unwrap();
+		match check_unlisted_table(&context(0xD1), &path) {
+			Ok(()) => None,
+			Err(Error::Encryption(error)) => Some(error),
+			Err(other) => panic!("not an encryption error: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn what_a_crash_leaves_behind_is_this_databases_to_clean() {
+		let whole = header_of(0xD1);
+		let with_blocks = [whole.as_slice(), &[0xEE; 50]].concat();
+		let cases: Vec<(&str, Vec<u8>)> = vec![
+			("an empty file", Vec::new()),
+			("zeros", vec![0; 300]),
+			("the first byte of the magic", HEADER_MAGIC[..1].to_vec()),
+			("most of the magic", HEADER_MAGIC[..3].to_vec()),
+			("a header cut before the database", whole[..20].to_vec()),
+			("a header cut one byte before the end of the database", whole[..31].to_vec()),
+			("a header cut after the database", whole[..40].to_vec()),
+			("a whole header", whole.to_vec()),
+			("a header and blocks", with_blocks),
+		];
+		for (what, bytes) in cases {
+			assert_eq!(verdict(&bytes), None, "{what}");
+		}
+	}
+
+	#[test]
+	fn anything_else_is_refused_with_the_error_that_names_it() {
+		let theirs = header_of(0xD2);
+		let mut rotted = header_of(0xD1);
+		// A byte of the salt, which the checksum of the header covers.
+		rotted[40] ^= 1;
+		let mut later = header_of(0xD1);
+		// The version of the format, which is told before the checksum is looked at.
+		later[4] = 2;
+		let cases: Vec<(&str, Vec<u8>, EncryptionError)> = vec![
+			("another database", theirs.to_vec(), EncryptionError::DbIdMismatch),
+			(
+				"another database, cut just after its id",
+				theirs[..32].to_vec(),
+				EncryptionError::DbIdMismatch,
+			),
+			("a header with a changed bit", rotted.to_vec(), EncryptionError::MalformedHeader),
+			("a header of another version", later.to_vec(), EncryptionError::UnsupportedVersion),
+			(
+				"a file in the clear",
+				b"the first block of a table in the clear".to_vec(),
+				EncryptionError::PlaintextInEncryptedDb,
+			),
+			(
+				"two bytes that are not the magic",
+				b"SX".to_vec(),
+				EncryptionError::PlaintextInEncryptedDb,
+			),
+			(
+				"a magic that is not the magic",
+				b"SKTX".to_vec(),
+				EncryptionError::PlaintextInEncryptedDb,
+			),
+		];
+		for (what, bytes, wanted) in cases {
+			assert_eq!(verdict(&bytes), Some(wanted), "{what}");
+		}
+	}
+
+	#[test]
+	fn a_file_that_is_gone_is_a_clean_up_that_is_done() {
+		let dir = TempDir::new().unwrap();
+		let gone = dir.path().join("00000000000000000009.sst");
+		assert!(check_unlisted_table(&context(0xD1), &gone).is_ok());
+	}
+
+	#[test]
+	fn the_plan_names_what_this_database_left_and_refuses_everything_if_one_file_is_not_its_own() {
+		let dir = TempDir::new().unwrap();
+		let opts = Options {
+			path: dir.path().to_path_buf(),
+			..Default::default()
+		}
+		.with_encryption_context(Arc::new(context(0xD1)));
+		std::fs::create_dir_all(opts.sstable_dir()).unwrap();
+		let table = |id: u64| opts.sstable_dir().join(format!("{id:020}.sst"));
+		let planned = |opts: &Options, live: &HashSet<u64>| -> Vec<u64> {
+			let mut ids: Vec<u64> =
+				plan_cleanup(opts, live).unwrap().into_iter().map(|(id, _)| id).collect();
+			ids.sort_unstable();
+			ids
+		};
+
+		// Table 1 is listed. Tables 2 and 3 are what a flush that did not finish leaves, and
+		// a file that is not named like a table is nobody's business.
+		std::fs::write(table(1), header_of(0xD1)).unwrap();
+		std::fs::write(table(2), header_of(0xD1)).unwrap();
+		std::fs::write(table(3), b"").unwrap();
+		std::fs::write(opts.sstable_dir().join("notes.txt"), b"not a table").unwrap();
+		let live = HashSet::from([1u64]);
+		assert_eq!(planned(&opts, &live), vec![2, 3]);
+
+		// One table of another database, and nothing is planned for deletion, the tables that
+		// are this database's included. Nothing was deleted by asking either.
+		std::fs::write(table(4), header_of(0xD2)).unwrap();
+		let refused = plan_cleanup(&opts, &live).unwrap_err();
+		assert!(matches!(refused, Error::Encryption(EncryptionError::DbIdMismatch)), "{refused:?}");
+		for id in 1..=4 {
+			assert!(table(id).exists(), "{id}");
+		}
+
+		// A database that is not encrypted is answered by the names, as it always was.
+		let plain = Options {
+			path: dir.path().to_path_buf(),
+			..Default::default()
+		};
+		assert_eq!(planned(&plain, &live), vec![2, 3, 4]);
+	}
+}
