@@ -107,6 +107,8 @@ pub mod manifest_write_stop_tests;
 #[cfg(test)]
 pub mod memtable_tests;
 #[cfg(test)]
+pub mod orphan_cleanup_tests;
+#[cfg(test)]
 pub mod recovery_integration_tests;
 #[cfg(test)]
 pub mod recovery_test_helpers;

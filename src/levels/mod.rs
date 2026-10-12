@@ -292,8 +292,10 @@ pub(crate) struct ChangeSetRollback {
 mod iter;
 mod level;
 mod mode;
+mod orphans;
 
 pub(crate) use mode::{check_manifest_mode, resolve_encryption};
+pub(crate) use orphans::plan_cleanup as plan_orphan_cleanup;
 
 pub type HiddenSet = HashSet<u64>;
 

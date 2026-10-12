@@ -13,6 +13,7 @@ use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::levels::{
 	check_manifest_before_open,
+	plan_orphan_cleanup,
 	write_manifest_to_disk,
 	LevelManifest,
 	ManifestChangeSet,
@@ -299,6 +300,15 @@ impl CoreInner {
 		let manifest_loaded_from_disk = opts.manifest_file_path(0).exists();
 		let manifest = LevelManifest::new(Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
+
+		// Whether the table files that the manifest does not list are this database's is read
+		// before anything of the log or the value log is opened, so that a table of another
+		// database, which the clean-up after the replay would delete, refuses the open with
+		// nothing changed.
+		if manifest_loaded_from_disk && opts.encryption_context().is_some() {
+			let live: HashSet<u64> = manifest.get_all_tables().keys().copied().collect();
+			plan_orphan_cleanup(&opts, &live)?;
+		}
 
 		// The value log is opened before the WAL is: opening the WAL makes a segment and removes
 		// what a repair left, and an open that the value log refuses (a file in the clear in an
@@ -1333,6 +1343,19 @@ impl CoreInner {
 		let live_table_ids: HashSet<u64> = live_tables.keys().copied().collect();
 		drop(manifest);
 
+		// In a database that is encrypted, the files that the manifest does not list are read
+		// first, and none is deleted if one of them is not this database's: see
+		// `plan_orphan_cleanup`. One that is not is cleaned by the names, as it always was.
+		let removable: Option<HashSet<u64>> = match self.opts.encryption_context() {
+			Some(_) => Some(
+				plan_orphan_cleanup(&self.opts, &live_table_ids)?
+					.into_iter()
+					.map(|(id, _)| id)
+					.collect(),
+			),
+			None => None,
+		};
+
 		// Scan SST directory for orphaned files
 		let entries = std::fs::read_dir(&sstable_dir)?;
 		let mut removed_count = 0;
@@ -1346,7 +1369,9 @@ impl CoreInner {
 			if filename_str.ends_with(".sst") && filename_str.len() == 24 {
 				if let Ok(table_id) = filename_str[..20].parse::<u64>() {
 					// Delete if not in manifest
-					if !live_table_ids.contains(&table_id) {
+					if !live_table_ids.contains(&table_id)
+						&& removable.as_ref().is_none_or(|removable| removable.contains(&table_id))
+					{
 						let path = entry.path();
 						match std::fs::remove_file(&path) {
 							Ok(_) => {
