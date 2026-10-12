@@ -516,7 +516,8 @@ async fn a_table_that_fails_authentication_in_a_compaction_is_reported_as_such_a
 		for dir in [resolved.sstable_dir(), resolved.manifest_dir()] {
 			let now = snapshot(&dir);
 			for (file, content) in &before {
-				if file.starts_with(&dir) {
+				// The snapshot of a directory lists what it holds, not the directory itself.
+				if file.starts_with(&dir) && *file != dir {
 					assert_eq!(now.get(file), Some(content), "{suite:?}: {}", file.display());
 				}
 			}
