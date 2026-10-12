@@ -51,7 +51,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 Range scans over the same dataset, as scans per second: limit and skip scans, and counts over the full key range.
 
-| Engine | &nbsp;&nbsp;&nbsp;&nbsp;Limit&nbsp;(OPS) | Keys,&nbsp;Limit&nbsp;(OPS) | Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Keys,&nbsp;Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Full&nbsp;Count&nbsp;(OPS) |
+| Engine | &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;Limit&nbsp;(OPS) | Keys,&nbsp;Limit&nbsp;(OPS) | Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Keys,&nbsp;Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Full&nbsp;Count&nbsp;(OPS) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
 | **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**903,668** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2,196,367** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**107,597** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**109,787** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**413** |
 | RocksDB | 852,661 | 852,866 | 35,321 | 35,704 | 160 |
