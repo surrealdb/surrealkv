@@ -29,33 +29,33 @@ It is designed as an independent, standalone key-value store suitable for high-t
 
 ## Performance
 
-Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM, 4TB PCIe 4.0 NVMe SSD**, 500,000 keys across 48 concurrent worker threads with 128 clients, synchronous durability enabled with `--sync` via [`crud-bench`](https://github.com/surrealdb/crud-bench)):
+Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM, 4TB PCIe 4.0 NVMe SSD**, 500,000 keys across 48 concurrent worker threads with 128 clients, and 5,000,000 iterations of each range scan, synchronous durability enabled with `--sync` via [`crud-bench`](https://github.com/surrealdb/crud-bench); each figure is a single run, and engines marked - are being re-measured):
 
 | Engine | Point&nbsp;Read&nbsp;(OPS) | Create&nbsp;(OPS) | Update&nbsp;(OPS) | Delete&nbsp;(OPS) | Scan&nbsp;(OPS) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**6,748,647** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**219,545** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**199,730** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**253,717** | 438 |
-| RocksDB | 864,757 | 35,183 | 36,764 | 37,291 | 145 |
-| SlateDB | 88,566 | 8,276 | 8,145 | 8,217 | 81 |
-| Fjall | 1,022,000 | 1,064 | 1,145 | 898 | 43 |
-| ReDB | 333,229 | 1,289 | 1,387 | 1,380 | 243 |
-| LMDB | 1,269,373 | 694 | 701 | 703 | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1,007** |
-| Libmdbx | 627,955 | 706 | 712 | 674 | 925 |
+| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**6,985,826** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**150,251** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**160,043** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**63,282** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**903,668** |
+| RocksDB | 855,851 | 8,568 | 36,263 | 32,043 | 852,661 |
+| SlateDB | 92,303 | 8,257 | 8,122 | 8,242 | 17,985 |
+| Fjall | - | - | - | - | - |
+| ReDB | - | - | - | - | - |
+| LMDB | - | - | - | - | - |
+| Libmdbx | - | - | - | - | - |
 
-- **Creates (Writes)**: **219,545 OPS** (**6.24× faster** than RocksDB, **26.5× faster** than SlateDB, **170× faster** than ReDB, and **206× faster** than Fjall).
-- **Updates**: **199,730 OPS** (**5.43× faster** than RocksDB, **24.5× faster** than SlateDB, **144× faster** than ReDB, and **174× faster** than Fjall).
-- **Point Reads**: **6.75M OPS** sustained (**5.32× faster** than LMDB, **7.80× faster** than RocksDB, **20.3× faster** than ReDB, and **76.2× faster** than SlateDB).
-- **Deletes**: **253,717 OPS** (**6.80× faster** than RocksDB, **30.9× faster** than SlateDB, **184× faster** than ReDB, and **283× faster** than Fjall).
-- **Range Scans**: **1.80× faster** than ReDB, **3.01× faster** than RocksDB, **5.42× faster** than SlateDB, and **10.3× faster** than Fjall via zero-copy iterator merges and block-level restart points. LMDB (**1,007 OPS**) and Libmdbx (**925 OPS**) are faster at scans than SurrealKV (**438 OPS**), by **2.30×** and **2.11×**. See [Scan Profile](#scan-profile) for other kinds of range scan.
+- **Creates (Writes)**: **150,251 OPS**: **17.5× faster** than RocksDB and **18.2× faster** than SlateDB.
+- **Updates**: **160,043 OPS**: **4.41× faster** than RocksDB and **19.7× faster** than SlateDB.
+- **Point Reads**: **6.99M OPS** sustained: **8.16× faster** than RocksDB and **75.7× faster** than SlateDB.
+- **Deletes**: **63,282 OPS**: **1.97× faster** than RocksDB and **7.68× faster** than SlateDB.
+- **Range Scans**: **903,668 OPS** on `select(*) limit(100)` scans via zero-copy iterator merges and block-level restart points: **1.06× faster** than RocksDB and **50.2× faster** than SlateDB. See [Scan Profile](#scan-profile) for other kinds of range scan.
 
 ### Scan Profile
 
-Range scans over the same dataset, as scans per second: limit and skip scans, and counts over the full key range. These figures are pending and will be filled in once the benchmarks are complete.
+Range scans over the same dataset, as scans per second: limit and skip scans, and counts over the full key range.
 
-| Engine | Limit&nbsp;(OPS) | Keys,&nbsp;Limit&nbsp;(OPS) | Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Keys,&nbsp;Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Full&nbsp;Count&nbsp;(OPS) |
+| Engine | &nbsp;&nbsp;&nbsp;&nbsp;Limit&nbsp;(OPS) | Keys,&nbsp;Limit&nbsp;(OPS) | Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Keys,&nbsp;Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Full&nbsp;Count&nbsp;(OPS) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **SurrealKV** | - | - | - | - | - |
-| RocksDB | - | - | - | - | - |
-| SlateDB | - | - | - | - | - |
+| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**903,668** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2,196,367** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**107,597** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**109,787** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**413** |
+| RocksDB | 852,661 | 852,866 | 35,321 | 35,704 | 160 |
+| SlateDB | 17,985 | 17,985 | 6,596 | 6,602 | 82.0 |
 | Fjall | - | - | - | - | - |
 | ReDB | - | - | - | - | - |
 | LMDB | - | - | - | - | - |
@@ -71,16 +71,16 @@ Resting and peak memory are the lowest and highest process memory sampled across
 
 | Engine | Resting&nbsp;Memory | Peak&nbsp;Memory |
 | :--- | ---: | ---: |
-| **SurrealKV** | ~611 MB | 3.13 GB |
-| RocksDB | ~741 MB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.22 GB** |
-| SlateDB | ~406 MB | 3.41 GB |
-| Fjall | ~935 MB | 2.34 GB |
-| ReDB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**~367 MB** | 3.03 GB |
-| LMDB | ~1.06 GB | 1.38 GB |
-| Libmdbx | ~1.01 GB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.22 GB** |
+| **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**433 MiB** | 2.45 GiB |
+| RocksDB | 792 MiB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.09 GiB** |
+| SlateDB | 482 MiB | 3.81 GiB |
+| Fjall | - | - |
+| ReDB | - | - |
+| LMDB | - | - |
+| Libmdbx | - | - |
 
-- **Resting Footprint**: **~611 MB** at rest, the third-lowest of the engines tested, after ReDB (**~367 MB**) and SlateDB (**~406 MB**).
-- **Dynamic Scaling**: Peak memory expands dynamically under high concurrency to buffer active batches during parallel commits, then contracts back to resting baseline.
+- **Resting Footprint**: **433 MiB** at rest, the lowest of the engines measured so far.
+- **Dynamic Scaling**: Peak memory rises under high concurrency, when parallel commits buffer active batches.
 
 ---
 
