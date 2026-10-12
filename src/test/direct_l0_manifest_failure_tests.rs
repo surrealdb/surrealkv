@@ -457,6 +457,51 @@ async fn a_failed_direct_commit_leaves_no_table_file_and_keeps_log_number() {
 	abandon(&tree);
 }
 
+/// A failed direct commit is not replayed underneath the commits that follow it. Its committer was
+/// told it failed, and the next commit overwrites one of its keys without having seen it: if a
+/// crash brought it back, the other key would read what it wrote while this one did not. So the
+/// next group moves `log_number` past the segment of its record before it logs anything, whether
+/// the direct commit sealed a memtable with writes in it or an empty one.
+async fn a_failed_direct_commit_is_not_replayed_under_a_later_commit(seeded: bool) {
+	let dir = TempDir::new("direct_manifest_replay").unwrap();
+	let images = TempDir::new("direct_manifest_replay_image").unwrap();
+	let tree = open_tree(dir.path(), false, false).await;
+	let mut model = Model::new();
+	if seeded {
+		seed(&tree, &mut model, 1).await;
+	}
+	let manifest = manifest_path(&tree);
+	let _healed = Healed(manifest.clone());
+	let armer = install_armer(&tree);
+	armer.arm(&[ReplaceFailure::BeforeRename]);
+
+	let failed = vec![(key(0), big_value(2)), (key(1), value_of(2, 100))];
+	commit_entries(&tree, &failed).await.expect_err("the manifest write fails");
+	assert_eq!(armer.calls(), 1, "the failure landed on the direct write");
+	let sealed = tree.core.inner.active_memtable.read().unwrap().get_wal_number() - 1;
+	assert!(log_number(&tree) <= sealed, "the failed commit is in a segment that is replayed");
+
+	commit_small(&tree, &mut model, 1, 3).await;
+	assert!(log_number(&tree) > sealed, "the next commit moved log_number past the failed one");
+	assert_eq!(tree.core.inner.unapplied_group_below.load(Ordering::SeqCst), 0);
+	assert_healthy(&tree, "after the next commit");
+	assert_same(&all_keys(&tree), &model, "the failed commit is not readable");
+
+	let image = crash_image(&tree, images.path(), "next").await;
+	assert_recovers(&image, &model, &[failed], "the image after the next commit");
+	abandon(&tree);
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_failed_direct_commit_after_writes_is_not_replayed_under_a_later_commit() {
+	a_failed_direct_commit_is_not_replayed_under_a_later_commit(true).await;
+}
+
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_failed_direct_commit_on_an_empty_memtable_is_not_replayed_under_a_later_commit() {
+	a_failed_direct_commit_is_not_replayed_under_a_later_commit(false).await;
+}
+
 /// An error after the file of the table is written, other than a failed manifest write, removes
 /// the file. A path that cannot be created is not the file of this write and is left alone.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
