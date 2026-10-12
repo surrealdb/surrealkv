@@ -45,8 +45,8 @@ const EXIT_INCONSISTENT: u8 = 3;
 	              and changes nothing. The key is a file with the 32 byte root key of key id 1, as \
 	              32 raw bytes or 64 hex digits: pass it with --key-file <PATH> or set SKV_KEY_FILE \
 	              to its path. On Unix the file must not be readable by every user. `enc-info` \
-	              needs no key. Encryption is a preview, and a key is only used by a build that \
-	              has the `encryption-preview` feature."
+	              needs no key. A key is only used by a build that has the `encryption` feature, \
+	              which is on by default."
 )]
 struct Cli {
 	#[command(subcommand)]
@@ -157,8 +157,8 @@ fn hint_for(error: &anyhow::Error) -> Option<&'static str> {
 				if message.contains("not enabled in this build") =>
 			{
 				return Some(
-					"This build of skv cannot use a key. Encryption is a preview: build skv with \
-					 `--features encryption-preview` to read encrypted data. `enc-info` needs no \
+					"This build of skv cannot use a key. Build skv with the `encryption` feature \
+					 (on by default) to read encrypted data. `enc-info` needs no \
 					 key.",
 				);
 			}

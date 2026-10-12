@@ -1,6 +1,5 @@
-//! Counterpart of `encryption_guard.rs`: the non-default `encryption-preview` feature compiles
-//! the guard out, so a key manager is accepted. Run in CI so the feature-gated path keeps
-//! building and the feature keeps doing what it says.
+//! Counterpart of `encryption_guard.rs`: the `encryption` feature (on by default) compiles
+//! the guard out, so a key manager is accepted.
 //!
 //! The first test only pins that the guard is removed, for every way of asking for a cipher. The
 //! rest take a database with a key manager through the public interface alone and look at the
@@ -10,7 +9,7 @@
 //! Every file of the database is sealed: the manifest, the tables, the value log and the
 //! write-ahead log. A database that is not closed cleanly is recovered from its log with the key.
 
-#![cfg(all(not(target_arch = "wasm32"), feature = "encryption-preview"))]
+#![cfg(all(not(target_arch = "wasm32"), feature = "encryption"))]
 
 use std::collections::BTreeMap;
 use std::fs;
