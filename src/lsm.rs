@@ -1711,21 +1711,6 @@ impl Core {
 
 		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
 
-		// Create the write stall controller with the provider and thresholds
-		let thresholds =
-			StallThresholds::new(opts.memtable_stall_threshold, opts.l0_stall_threshold);
-		let write_stall = Arc::new(crate::stall::WriteStallController::new(
-			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
-			thresholds,
-		));
-
-		// Initialize background task manager
-		let task_manager = Arc::new(TaskManager::new(
-			Arc::clone(&inner) as Arc<dyn CompactionOperations>,
-			Arc::clone(&opts),
-			Arc::clone(&write_stall),
-		));
-
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
 
@@ -1821,6 +1806,34 @@ impl Core {
 		// Set visible sequence number (in-memory, will be persisted on next flush)
 		inner.visible_seq_num.store(max_seq_num, Ordering::Release);
 
+		// Clean up any orphaned SST files from previous crashes
+		// SAFETY: This must happen AFTER WAL replay so data is recovered
+		// but BEFORE any new flushes that might create new SSTs
+		inner.cleanup_orphaned_sst_files()?;
+
+		// Clean up any orphaned VLog files that are no longer referenced by any SST
+		// SAFETY: This must happen AFTER manifest is loaded and the WAL is replayed
+		inner.cleanup_vlog("startup");
+
+		// Nothing that can fail is left, so the tasks and the flusher are started only now: a tree
+		// whose open fails keeps none of them, which would hold the lock of the database and keep
+		// it from being opened again in this process.
+
+		// Create the write stall controller with the provider and thresholds
+		let thresholds =
+			StallThresholds::new(opts.memtable_stall_threshold, opts.l0_stall_threshold);
+		let write_stall = Arc::new(crate::stall::WriteStallController::new(
+			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
+			thresholds,
+		));
+
+		// Initialize background task manager
+		let task_manager = Arc::new(TaskManager::new(
+			Arc::clone(&inner) as Arc<dyn CompactionOperations>,
+			Arc::clone(&opts),
+			Arc::clone(&write_stall),
+		));
+
 		// Initialize the CommitPipeline for lock-free OCC commits and background flushing.
 		let commit_pipeline = Arc::new(crate::ring::CommitPipeline::new(
 			Arc::clone(&inner),
@@ -1830,15 +1843,6 @@ impl Core {
 		));
 
 		let flusher_handle = commit_pipeline.start_flusher();
-
-		// Clean up any orphaned SST files from previous crashes
-		// SAFETY: This must happen AFTER WAL replay so data is recovered
-		// but BEFORE any new flushes that might create new SSTs
-		inner.cleanup_orphaned_sst_files()?;
-
-		// Clean up any orphaned VLog files that are no longer referenced by any SST
-		// SAFETY: This must happen AFTER manifest is loaded and the WAL is replayed
-		inner.cleanup_vlog("startup");
 
 		// Trigger level compaction check at startup
 		task_manager.wake_up_level();

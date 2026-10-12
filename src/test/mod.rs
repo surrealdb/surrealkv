@@ -71,6 +71,8 @@ pub mod encryption_surfaces_tests;
 #[cfg(test)]
 pub mod encryption_typed_errors_tests;
 #[cfg(test)]
+pub mod failed_open_tests;
+#[cfg(test)]
 pub mod flusher_alloc_diet_tests;
 #[cfg(test)]
 pub mod group_fail_stop_edge_tests;
