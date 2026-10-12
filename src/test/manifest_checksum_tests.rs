@@ -5,6 +5,7 @@ use std::sync::Arc;
 use crate::levels::{
 	DecodedManifest,
 	SnapshotInfo,
+	MANIFEST_FORMAT_VERSION,
 	MANIFEST_FORMAT_VERSION_V1,
 	MANIFEST_TRAILER_LEN,
 	MANIFEST_TRAILER_MAGIC,
@@ -93,7 +94,7 @@ async fn test_manifest_checksum_written_and_verified() {
 	assert_eq!(magic, &MANIFEST_TRAILER_MAGIC);
 
 	let decoded = DecodedManifest::decode(raw_bytes.clone()).expect("decode manifest");
-	assert_eq!(decoded.version, MANIFEST_FORMAT_VERSION_V1);
+	assert_eq!(decoded.version, MANIFEST_FORMAT_VERSION);
 
 	// Reopen succeeds with validated trailer
 	let tree2 = Tree::new(Arc::clone(&opts)).expect("reopen tree");
@@ -155,7 +156,7 @@ async fn test_legacy_manifest_without_trailer_accepted_and_upgraded_on_write() {
 
 	// Verify decode accepts legacy bytes
 	let decoded = DecodedManifest::decode(legacy_bytes.clone()).expect("legacy decode");
-	assert_eq!(decoded.version, MANIFEST_FORMAT_VERSION_V1);
+	assert_eq!(decoded.version, MANIFEST_FORMAT_VERSION);
 
 	// Overwrite the on-disk file with legacy bytes
 	fs::write(&manifest_path, &legacy_bytes).expect("write legacy manifest");
@@ -174,7 +175,7 @@ async fn test_legacy_manifest_without_trailer_accepted_and_upgraded_on_write() {
 	let upgraded = fs::read(&manifest_path).expect("read upgraded manifest");
 	assert_eq!(&upgraded[upgraded.len() - 8..], &MANIFEST_TRAILER_MAGIC);
 	let decoded_upgraded = DecodedManifest::decode(upgraded).expect("decode upgraded");
-	assert_eq!(decoded_upgraded.version, MANIFEST_FORMAT_VERSION_V1);
+	assert_eq!(decoded_upgraded.version, MANIFEST_FORMAT_VERSION);
 }
 
 #[tokio::test]
@@ -196,10 +197,16 @@ async fn test_legacy_decoder_compatibility() {
 	// New decoder
 	let new_decoded = DecodedManifest::decode(raw_bytes.clone()).expect("new decode");
 
-	// Legacy 0.21.4 decoder on the exact same checksummed bytes
-	let legacy_decoded = decode_legacy_manifest_v0_21_4(&raw_bytes).expect("legacy decode");
+	// Legacy 0.21.4 decoder on the same checksummed bytes: the layout is the one it reads, with
+	// the trailer after it, and only the version differs. It refuses the version of the current
+	// format, as a binary of that time must, and reads the same bytes with the version it knows.
+	assert!(decode_legacy_manifest_v0_21_4(&raw_bytes).is_err());
+	let mut as_v1 = raw_bytes;
+	as_v1[..2].copy_from_slice(&MANIFEST_FORMAT_VERSION_V1.to_be_bytes());
+	let legacy_decoded = decode_legacy_manifest_v0_21_4(&as_v1).expect("legacy decode");
 
-	assert_eq!(new_decoded.version, legacy_decoded.version);
+	assert_eq!(new_decoded.version, MANIFEST_FORMAT_VERSION);
+	assert_eq!(legacy_decoded.version, MANIFEST_FORMAT_VERSION_V1);
 	assert_eq!(new_decoded.next_table_id, legacy_decoded.next_table_id);
 	assert_eq!(new_decoded.log_number, legacy_decoded.log_number);
 	assert_eq!(new_decoded.last_sequence, legacy_decoded.last_sequence);

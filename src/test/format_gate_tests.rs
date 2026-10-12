@@ -95,10 +95,26 @@ fn manifest_version(opts: &Options) -> u16 {
 	u16::from_be_bytes([bytes[0], bytes[1]])
 }
 
+/// Writes `version` into the manifest, and the checksum trailer again if it has one: the version
+/// is part of what the checksum covers.
 fn set_manifest_version(opts: &Options, version: u16) {
+	use crate::levels::{calculate_manifest_crc, MANIFEST_TRAILER_LEN, MANIFEST_TRAILER_MAGIC};
+
 	let path = opts.manifest_file_path(0);
 	let mut bytes = fs::read(&path).unwrap();
+	let trailer = bytes.len() >= MANIFEST_TRAILER_LEN
+		&& bytes[bytes.len() - MANIFEST_TRAILER_MAGIC.len()..] == MANIFEST_TRAILER_MAGIC;
+	if trailer {
+		bytes.truncate(bytes.len() - MANIFEST_TRAILER_LEN);
+	}
 	bytes[..2].copy_from_slice(&version.to_be_bytes());
+	if trailer {
+		let body_len = bytes.len() as u32;
+		let crc = calculate_manifest_crc(&bytes);
+		bytes.extend_from_slice(&body_len.to_be_bytes());
+		bytes.extend_from_slice(&crc.to_be_bytes());
+		bytes.extend_from_slice(&MANIFEST_TRAILER_MAGIC);
+	}
 	fs::write(&path, bytes).unwrap();
 }
 
