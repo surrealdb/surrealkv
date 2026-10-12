@@ -235,7 +235,7 @@ fn options(config: Config, flavor: Flavor, path: &Path, mode: WalRecoveryMode) -
 
 /// A tree whose background tasks are stopped, so that nothing is flushed or compacted behind the
 /// test's back, and that is marked closed: a drop of it must not spawn a close.
-async fn open_stopped(opts: Arc<Options>) -> Tree {
+pub(super) async fn open_stopped(opts: Arc<Options>) -> Tree {
 	let tree = Tree::new(opts).unwrap();
 	let tasks = tree.core.task_manager.lock().unwrap().clone().unwrap();
 	tasks.stop().await;
@@ -244,7 +244,7 @@ async fn open_stopped(opts: Arc<Options>) -> Tree {
 }
 
 /// Ends a tree the way a crash does: no close and no flush.
-fn crash(tree: &Tree) {
+pub(super) fn crash(tree: &Tree) {
 	tree.core.is_closed.store(true, Ordering::SeqCst);
 	tree.core.inner.lockfile.lock().unwrap().release().unwrap();
 	tree.core.abort_background_tasks();
@@ -260,7 +260,7 @@ fn newest_segment(wal: &Path) -> PathBuf {
 	segments.pop().expect("the WAL has a segment")
 }
 
-fn set_len(path: &Path, len: u64) {
+pub(super) fn set_len(path: &Path, len: u64) {
 	fs::OpenOptions::new().write(true).open(path).unwrap().set_len(len).unwrap();
 }
 
