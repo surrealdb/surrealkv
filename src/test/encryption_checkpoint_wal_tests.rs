@@ -75,8 +75,10 @@ async fn a_segment_of_the_wal_of_a_checkpoint_that_is_not_of_this_database_is_re
 		let live_cp = checkpoints.path().join("live");
 		let live = tree_with_checkpoint(&encrypted(&live_root, manager(), suite), &live_cp).await;
 
-		// A segment of another database that has its own identity, and a segment of this one under
-		// the number of another: both are sealed and both open with the key of this database.
+		// A segment of another database, which has its own identity and was sealed under a root of
+		// its own, and a segment of this one under the number of another. Both are sealed. The
+		// database is told before the key is asked, so the first is refused for its database and
+		// not for its root, and the second is refused for its number.
 		let (foreign_name, foreign) = sealed_segment(&dir.path().join("foreign"), suite).await;
 		let own = {
 			let opts = encrypted(&live_root, manager(), suite);

@@ -1414,6 +1414,26 @@ mod tests {
 	}
 
 	#[test]
+	fn a_segment_that_the_key_of_this_database_does_not_open_is_refused_as_a_wrong_key() {
+		use crate::tde::{CipherSuite, DbId, SoftwareKeyManager};
+
+		// The same database and the same number, sealed under a root that is not the one the
+		// database is opened with: the database and the number are right, the tag is not.
+		let head = sealed_head(0xD1, 7);
+		let other_root = EncryptionContext::new(
+			Arc::new(SoftwareKeyManager::new([0x32; 32])),
+			DbId::from_bytes([0xD1; 16]),
+			CipherSuite::XChaCha20Poly1305,
+		);
+		assert_eq!(
+			encryption_of(check_wal_head(Some(&other_root), 7, &head)),
+			Some(EncryptionError::WrongKey)
+		);
+		// The control: the root it was sealed under opens it.
+		assert_eq!(encryption_of(check_wal_head(Some(&context_of(0xD1)), 7, &head)), None);
+	}
+
+	#[test]
 	fn the_type_of_the_first_record_is_not_what_decides_that_a_segment_is_sealed() {
 		let ours = context_of(0xD1);
 		// A type byte that rotted: the start of the encryption header still says what it is.
