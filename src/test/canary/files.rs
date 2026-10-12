@@ -9,6 +9,13 @@
 //! the WAL its header record, every manifest its magic. A file that is none of those must be one
 //! of the few that hold no user data, which are named here, and anything else is a finding.
 //!
+//! The same pass looks at the one thing about a sealed file that is visible without a key and that
+//! its security rests on: the salt in its header. Every writer of a file draws a salt of its own,
+//! so two files that carry one salt are copies of each other, or the earlier is the start of the
+//! later, as a checkpoint's copy of a file that has grown since is. Two files with one salt and
+//! different bytes are two writers that sealed under one key, and under positional nonces that
+//! is the failure that cannot be allowed.
+//!
 //! The image of a directory is what a refused open is compared against: the name and the bytes
 //! of every file, taken before and after.
 
@@ -16,10 +23,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::{fs, io};
 
-use super::scan::{scan_dir, Needles};
+use super::scan::{scan_dir, Needle, Needles};
 use crate::sstable::table::{ChecksumType, Footer, TABLE_FULL_FOOTER_LENGTH};
-use crate::tde::{is_sealed_manifest, CryptoHeader};
-use crate::vlog::sealed::is_sealed_start;
+use crate::tde::{is_sealed_manifest, CryptoHeader, HEADER_LEN, MANIFEST_PREFIX_LEN, SALT_LEN};
+use crate::vlog::sealed::{is_sealed_start, SEALED_HEADER_LEN};
 use crate::wal::{RecordType, HEADER_SIZE};
 
 /// The files that a database or a checkpoint has and that hold nothing of what a user wrote: the
@@ -116,10 +123,106 @@ pub(crate) fn unsealed_files(root: &Path) -> io::Result<Vec<String>> {
 	Ok(wrong)
 }
 
-/// Fails the test, saying which files, if `root` holds a file that is not sealed.
+/// Where the header of the encryption of a file of class `class` starts, if it has one.
+fn crypto_header_at(class: Class) -> Option<usize> {
+	match class {
+		// The header is the first thing in a table, and in a log it follows the header of the log.
+		Class::Table => Some(0),
+		Class::ValueLog => Some(SEALED_HEADER_LEN - HEADER_LEN),
+		// In the first record of a segment, after the header of the record.
+		Class::Segment => Some(HEADER_SIZE),
+		Class::Manifest => Some(MANIFEST_PREFIX_LEN - HEADER_LEN),
+		Class::NoUserData => None,
+	}
+}
+
+/// The salt that a sealed file was keyed with: none for a file that is not sealed or whose header
+/// is not whole, which another check reports.
+fn salt_of(class: Class, bytes: &[u8]) -> Option<[u8; SALT_LEN]> {
+	let at = crypto_header_at(class)?;
+	let header = bytes.get(at..at.checked_add(HEADER_LEN)?)?;
+	CryptoHeader::decode(header).ok().map(|header| header.salt)
+}
+
+/// The files under `root` that were keyed with one salt and are not the same bytes: of the files
+/// that share a salt, each must be the start of the next longer one (a copy is the whole of it, a
+/// checkpoint's copy of a file that has grown since is its start). Empty if all is as it should be.
+pub(crate) fn files_that_share_a_salt(root: &Path) -> io::Result<Vec<String>> {
+	let nothing = Needles::new(Vec::new());
+	let scan = scan_dir(root, &nothing)?;
+	let mut by_salt: BTreeMap<[u8; SALT_LEN], Vec<(PathBuf, Vec<u8>)>> = BTreeMap::new();
+	for file in &scan.files {
+		let Some(class) = class_of(&file.path) else {
+			continue;
+		};
+		let bytes = fs::read(root.join(&file.path))?;
+		if let Some(salt) = salt_of(class, &bytes) {
+			by_salt.entry(salt).or_default().push((file.path.clone(), bytes));
+		}
+	}
+	let mut wrong = Vec::new();
+	for files in by_salt.values_mut() {
+		files.sort_by_key(|(_, bytes)| bytes.len());
+		for pair in files.windows(2) {
+			let ((shorter, start), (longer, whole)) = (&pair[0], &pair[1]);
+			if !whole.starts_with(start) {
+				wrong.push(format!(
+					"{} and {} have one salt and are not a copy of each other, nor is the one the \
+					 start of the other",
+					shorter.display(),
+					longer.display()
+				));
+			}
+		}
+	}
+	Ok(wrong)
+}
+
+/// Fails the test, saying which files, if `root` holds a file that is not sealed, or two that
+/// were keyed with one salt without being copies.
 pub(crate) fn assert_every_file_is_sealed(root: &Path, what: &str) {
 	let wrong = unsealed_files(root).unwrap();
 	assert!(wrong.is_empty(), "{what}: {} file(s) are not sealed: {wrong:?}", wrong.len());
+	let shared = files_that_share_a_salt(root).unwrap();
+	assert!(shared.is_empty(), "{what}: a salt is shared: {shared:?}");
+}
+
+/// Where, under `root`, any of `keys` is: the label of the key, the offset and the file. A key is
+/// held in memory and by the key manager, and no file may hold it. `keys` are the bytes of root
+/// keys, each at least as long as a needle may be short. Fails if there is no file to look at.
+pub(crate) fn keys_in_files(root: &Path, keys: &[(&str, &[u8])]) -> io::Result<Vec<String>> {
+	let needles = Needles::new(
+		keys.iter()
+			.enumerate()
+			.map(|(group, (label, bytes))| Needle {
+				group,
+				label: (*label).to_string(),
+				bytes: bytes.to_vec(),
+			})
+			.collect(),
+	);
+	let scan = scan_dir(root, &needles)?;
+	if scan.files.is_empty() {
+		return Err(io::Error::other("there was no file to look at"));
+	}
+	Ok(scan
+		.findings
+		.iter()
+		.map(|finding| {
+			format!(
+				"{} at {} in {}",
+				needles.get(finding.needle).label,
+				finding.offset,
+				finding.file.display()
+			)
+		})
+		.collect())
+}
+
+/// Fails the test, saying where, if any of `keys` is in a file under `root`.
+pub(crate) fn assert_holds_no_key(root: &Path, keys: &[(&str, &[u8])], what: &str) {
+	let found = keys_in_files(root, keys).unwrap();
+	assert!(found.is_empty(), "{what}: a key is in a file: {found:?}");
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +483,69 @@ mod tests {
 		}
 		fs::write(copy.path().join("wal").join("00000000000000000099.wal"), b"").unwrap();
 		assert!(unsealed_files(copy.path()).unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn two_files_that_share_a_salt_are_copies_or_the_start_of_one_another() {
+		let sealed = TempDir::new().unwrap();
+		database(sealed.path(), Some(CipherSuite::XChaCha20Poly1305)).await;
+		let root = TempDir::new().unwrap();
+		copy_tree(sealed.path(), root.path());
+		assert!(files_that_share_a_salt(root.path()).unwrap().is_empty());
+
+		// A copy of a table under another name, and a copy of a log that has grown since: neither
+		// is two writers, and both are let through.
+		let table = last_file(root.path(), "sstables", "sst");
+		let copy = root.path().join("sstables").join("00000000000000000098.sst");
+		fs::copy(&table, &copy).unwrap();
+		let log = last_file(root.path(), "vlog", "vlog");
+		let mut grown = fs::read(&log).unwrap();
+		grown.extend_from_slice(b"entries that came later");
+		fs::write(root.path().join("vlog").join("00000000000000000098.vlog"), grown).unwrap();
+		assert!(files_that_share_a_salt(root.path()).unwrap().is_empty());
+		assert_every_file_is_sealed(root.path(), "copies");
+
+		// The same salt over other bytes is what the check is for: one byte of the first block of
+		// the copy is not the byte of the original, and the two are named.
+		let mut changed = fs::read(&table).unwrap();
+		changed[HEADER_LEN + 1] ^= 0x01;
+		fs::write(&copy, changed).unwrap();
+		let shared = files_that_share_a_salt(root.path()).unwrap();
+		assert_eq!(shared.len(), 1, "{shared:?}");
+		assert!(shared[0].contains("00000000000000000098.sst"), "{shared:?}");
+		assert!(shared[0].contains(&*table.file_name().unwrap().to_string_lossy()), "{shared:?}");
+
+		// A log whose start is not the start of the other log is the same.
+		fs::copy(&table, &copy).unwrap();
+		let mut other = fs::read(&log).unwrap();
+		other.push(0);
+		other[SEALED_HEADER_LEN + 1] ^= 0x01;
+		fs::write(root.path().join("vlog").join("00000000000000000098.vlog"), other).unwrap();
+		let shared = files_that_share_a_salt(root.path()).unwrap();
+		assert_eq!(shared.len(), 1, "{shared:?}");
+		assert!(shared[0].contains(".vlog"), "{shared:?}");
+	}
+
+	#[tokio::test]
+	async fn a_key_in_a_file_is_found_and_a_key_that_is_in_none_is_not() {
+		let dir = TempDir::new().unwrap();
+		database(dir.path(), Some(CipherSuite::Aes256Gcm)).await;
+		let key = *b"a root key that nothing writes 1";
+		let keys: [(&str, &[u8]); 1] = [("the root key", &key[..])];
+		assert_holds_no_key(dir.path(), &keys, "an encrypted database");
+
+		// The same database with the key in a file of its own is found, whatever the file is
+		// called, and the finding names the key, the file and where in it.
+		fs::write(dir.path().join("wal").join("notes.tmp"), [&b"junk"[..], &key[..]].concat())
+			.unwrap();
+		let found = keys_in_files(dir.path(), &keys).unwrap();
+		assert_eq!(found.len(), 1, "{found:?}");
+		assert!(found[0].starts_with("the root key at 4 in wal"), "{found:?}");
+		assert!(found[0].ends_with("notes.tmp"), "{found:?}");
+
+		// A directory with no file is an error, and not "no key": nothing was looked at.
+		let empty = TempDir::new().unwrap();
+		assert!(keys_in_files(empty.path(), &keys).is_err());
 	}
 
 	#[test]

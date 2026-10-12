@@ -56,7 +56,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
-use super::files::{copy_tree, files_of, last_file, DirImage};
+use super::files::{assert_holds_no_key, copy_tree, files_of, last_file, DirImage};
 use super::matrix::{crash, open_stopped, set_len};
 use crate::error::{EncryptionError, Error};
 use crate::sstable::block_io::{BlockKind, TrailerLayout};
@@ -79,7 +79,10 @@ const SUITES: [CipherSuite; 2] = [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20
 const MODES: [WalRecoveryMode; 2] =
 	[WalRecoveryMode::AbsoluteConsistency, WalRecoveryMode::TolerateCorruptedWithRepair];
 
-const ROOT: [u8; 32] = [0x31; 32];
+/// The root keys of the databases. They are not runs of one byte, so that a file that holds one
+/// was written with it, and the databases are scanned for them.
+const ROOT: [u8; 32] = *b"root key of the refusal matrix 1";
+const ROOT_2: [u8; 32] = *b"second root key of the refusal 2";
 
 /// What a database is made with: whether it has a value log.
 #[derive(Clone, Copy)]
@@ -450,6 +453,14 @@ async fn a_key_that_does_not_fit_is_refused_with_its_error_and_no_file_changes()
 		let tables = tables_db(suite, &Auth::Right).await;
 		let wal = wal_db(suite).await;
 		let plain = tables_db(suite, &Auth::None).await;
+		// The key of these databases is in no file of either.
+		for (name, path) in [("tables", tables.dir.path()), ("wal", wal.path())] {
+			assert_holds_no_key(
+				path,
+				&[("the root key", &ROOT[..])],
+				&format!("{suite:?}, {name}"),
+			);
+		}
 
 		for (name, path, shape) in
 			[("tables", tables.dir.path(), WITH_LOG), ("wal", wal.path(), WITHOUT_LOG)]
@@ -968,7 +979,7 @@ async fn rotated_db(suite: CipherSuite) -> Db {
 	expected.extend(second);
 	tree.close().await.unwrap();
 
-	keys.add_key(2, [0x22; 32]).unwrap();
+	keys.add_key(2, ROOT_2).unwrap();
 	keys.set_active_key_id(2).unwrap();
 	let opts = options(dir.path(), WITH_LOG, WalRecoveryMode::AbsoluteConsistency, suite, &auth);
 	let tree = Tree::new(opts).unwrap();
@@ -989,6 +1000,11 @@ async fn rotated_db(suite: CipherSuite) -> Db {
 async fn a_key_that_rotated_is_needed_until_it_is_retired_and_then_the_database_is_refused() {
 	for suite in SUITES {
 		let db = rotated_db(suite).await;
+		assert_holds_no_key(
+			db.dir.path(),
+			&[("the root of key 1", &ROOT[..]), ("the root of key 2", &ROOT_2[..])],
+			&format!("{suite:?}, written under two keys"),
+		);
 		let pristine = Pristine {
 			path: db.dir.path(),
 			shape: WITH_LOG,
@@ -1006,7 +1022,7 @@ async fn a_key_that_rotated_is_needed_until_it_is_retired_and_then_the_database_
 
 		// Key 1 is retired: the manifest opens, and the first table does not.
 		let retired = Arc::new(SoftwareKeyManager::new(ROOT));
-		retired.add_key(2, [0x22; 32]).unwrap();
+		retired.add_key(2, ROOT_2).unwrap();
 		retired.set_active_key_id(2).unwrap();
 		retired.retire_key(1).unwrap();
 		pristine.refuse(
@@ -1020,7 +1036,7 @@ async fn a_key_that_rotated_is_needed_until_it_is_retired_and_then_the_database_
 		// Key 1 is decrypt-only, which is what it is after a rotation: every file is read, the
 		// ones under key 1 and the ones under key 2.
 		let both = Arc::new(SoftwareKeyManager::new(ROOT));
-		both.add_key(2, [0x22; 32]).unwrap();
+		both.add_key(2, ROOT_2).unwrap();
 		both.set_active_key_id(2).unwrap();
 		for mode in MODES {
 			let work = work_copy(db.dir.path());

@@ -497,7 +497,14 @@ impl Markers {
 	/// The needles of every marker drawn so far: the group of a needle is the index of its
 	/// marker.
 	pub(crate) fn needles(&self) -> Needles {
-		let items = self
+		self.needles_with(&[])
+	}
+
+	/// The needles of every marker, and then each of `extra`, which is a label and bytes that are
+	/// no marker and that no file may hold either, such as the root key of a database. Each is a
+	/// group of its own, numbered after the markers.
+	pub(crate) fn needles_with(&self, extra: &[(&str, &[u8])]) -> Needles {
+		let mut items: Vec<Needle> = self
 			.list
 			.iter()
 			.enumerate()
@@ -509,6 +516,13 @@ impl Markers {
 				})
 			})
 			.collect();
+		for (at, (label, bytes)) in extra.iter().enumerate() {
+			items.push(Needle {
+				group: self.list.len() + at,
+				label: (*label).to_string(),
+				bytes: bytes.to_vec(),
+			});
+		}
 		Needles::new(items)
 	}
 }
@@ -994,6 +1008,37 @@ mod tests {
 		stream[10..22].copy_from_slice(&markers.get(7).pieces[2]);
 		let found = scan_bytes(&stream, &needles);
 		assert_eq!(found, vec![(10, 7 * PIECES + 2)]);
+	}
+
+	#[test]
+	fn a_key_that_is_not_text_is_found_like_a_marker_and_has_a_group_of_its_own() {
+		let mut markers = Markers::new(5);
+		markers.mint("one");
+		markers.mint("two");
+		// Bytes that no text has, and that a file would hold if a key were written to it.
+		let key: [u8; 32] = std::array::from_fn(|at| (at as u8).wrapping_mul(37).wrapping_add(200));
+		let needles = markers.needles_with(&[("the key", &key[..])]);
+		assert_eq!(needles.len(), 2 * PIECES + 1);
+		let last = needles.get(2 * PIECES);
+		assert_eq!(
+			(last.group, last.label.as_str(), last.bytes.as_slice()),
+			(2, "the key", &key[..])
+		);
+
+		let mut stream = vec![0u8; 100];
+		stream[17..49].copy_from_slice(&key);
+		stream[60..96].copy_from_slice(&markers.get(1).text());
+		for chunk in [1usize, 5, 31, 32, 33, 100] {
+			let (_, mut found) = scan_reader(Cursor::new(&stream), &needles, chunk).unwrap();
+			found.sort_unstable();
+			assert_eq!(
+				found,
+				vec![(17, 2 * PIECES), (60, PIECES), (72, PIECES + 1), (84, PIECES + 2)],
+				"chunk {chunk}"
+			);
+		}
+		// A key that is in no file, and a half of it that is, are not found.
+		assert!(scan_bytes(&stream[..40], &needles).is_empty());
 	}
 
 	#[test]

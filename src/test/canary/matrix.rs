@@ -40,6 +40,11 @@
 //! that has nothing. The encrypted run is also held to having files in the directories where the
 //! control is asked to find each marker, so that "found nothing" is never "had nothing to look at".
 //!
+//! The encrypted run is looked at for two more things that a scan for markers cannot say. The
+//! root key of its key manager is searched for in every file, with the markers, since a key that
+//! was written to a file would be found there. And no two files of the run may have been keyed
+//! with one salt unless they are copies, one of the other: see `files`.
+//!
 //! What the control may ask is only what is certain. Where a flush and a recovery can each leave
 //! data (after a recovery), it asks for either; after a flush or a compaction it asks for the
 //! values that are live, since an overwritten version may go; and it never asks for the bounds of
@@ -93,7 +98,10 @@ use crate::tde::{CipherSuite, SoftwareKeyManager};
 use crate::test::sstable_encryption_tests::walk;
 use crate::{CompressionType, Durability, Mode, Options, Tree, WalRecoveryMode};
 
-const ROOT: [u8; 32] = [0x5C; 32];
+/// The root key of every encrypted database of the matrix. It is not a run of one byte, so that
+/// finding it in a file means that it was written there, and every encrypted scan looks for it
+/// as well as for the markers.
+const ROOT: [u8; 32] = *b"root key of the canary matrix 01";
 
 /// The value log takes a value longer than this.
 const THRESHOLD: usize = 64;
@@ -525,8 +533,11 @@ impl Run {
 			// What was committed but is still in a buffer of the WAL or the log is not in a file.
 			tree.flush_wal(false).unwrap();
 		}
-		let needles = self.markers.needles();
 		let what = self.name(step);
+		let needles = match self.flavor {
+			Flavor::Plain => self.markers.needles(),
+			Flavor::Sealed(_) => self.markers.needles_with(&[("the root key", &ROOT[..])]),
+		};
 		let scan = match self.flavor {
 			Flavor::Plain => {
 				// What reads a table: the options that its blocks are decoded with, made once.
