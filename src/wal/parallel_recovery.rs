@@ -135,7 +135,7 @@ async fn decode_sealed_segments_parallel(
 	Ok(decoded)
 }
 
-pub(crate) type ParallelReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>);
+pub(crate) type ParallelReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>, usize, usize);
 
 /// Synchronous entry point for parallel segment replay.
 pub(crate) fn replay_segments_sync(
@@ -147,6 +147,8 @@ pub(crate) fn replay_segments_sync(
 	{
 		let mut memtables = Vec::new();
 		let mut max_seq: Option<u64> = None;
+		let mut total_batches = 0;
+		let mut segments_processed = 0;
 		for seg in segments {
 			let (seg_max, batches) = decode_segment_batches_with(context, &seg.file_path, seg.id)?;
 			if batches.is_empty() {
@@ -155,6 +157,8 @@ pub(crate) fn replay_segments_sync(
 			if seg_max > 0 {
 				max_seq = Some(max_seq.map_or(seg_max, |m| m.max(seg_max)));
 			}
+			segments_processed += 1;
+			total_batches += batches.len();
 			let mut current_memtable = Arc::new(MemTable::new(arena_size));
 			for batch in batches {
 				current_memtable = apply_batch_with_oversized_fallback(
@@ -167,7 +171,7 @@ pub(crate) fn replay_segments_sync(
 			}
 			memtables.push((current_memtable, false, seg.id));
 		}
-		Ok((max_seq, memtables))
+		Ok((max_seq, memtables, total_batches, segments_processed))
 	}
 
 	#[cfg(not(target_arch = "wasm32"))]
@@ -203,7 +207,7 @@ pub(crate) async fn replay_segments_parallel(
 	arena_size: usize,
 ) -> Result<ParallelReplayResult> {
 	if segments.is_empty() {
-		return Ok((None, Vec::new()));
+		return Ok((None, Vec::new(), 0, 0));
 	}
 
 	// 1. Concurrently decode all WAL segments in parallel on worker threads
@@ -225,6 +229,8 @@ pub(crate) async fn replay_segments_parallel(
 	// 2. Sequentially populate memtables from ordered segments
 	let global_max_seq = AtomicU64::new(0);
 	let mut memtables = Vec::new();
+	let mut total_batches = 0;
+	let mut segments_processed = 0;
 
 	for (seg_idx, (seg_max_seq, batches)) in decoded_segments.into_iter().enumerate() {
 		let segment_id = segments[seg_idx].id;
@@ -233,6 +239,8 @@ pub(crate) async fn replay_segments_parallel(
 		}
 
 		global_max_seq.fetch_max(seg_max_seq, Ordering::SeqCst);
+		segments_processed += 1;
+		total_batches += batches.len();
 
 		let mut current_memtable = Arc::new(MemTable::new(arena_size));
 		for batch in batches {
@@ -257,7 +265,7 @@ pub(crate) async fn replay_segments_parallel(
 		None
 	};
 
-	Ok((res_seq, memtables))
+	Ok((res_seq, memtables, total_batches, segments_processed))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -296,10 +304,12 @@ mod tests {
 			file_path: wal_path,
 		};
 
-		let (max_seq, memtables) =
+		let (max_seq, memtables, total_batches, segments_processed) =
 			replay_segments_parallel(&WalContext::plaintext(), &[seg], 1024 * 1024).await.unwrap();
 		assert_eq!(max_seq, Some(10));
 		assert_eq!(memtables.len(), 1);
+		assert_eq!(total_batches, 1);
+		assert_eq!(segments_processed, 1);
 
 		let val = memtables[0].0.get(b"k1", None).unwrap();
 		assert_eq!(val.1, b"v1");

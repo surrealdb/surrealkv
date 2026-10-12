@@ -36,7 +36,7 @@ use crate::wal::{
 	Options as WalOptions,
 	BLOCK_SIZE,
 };
-use crate::{Durability, Error, InternalKeyKind, Mode, Options, Tree};
+use crate::{Durability, Error, InternalKeyKind, Mode, Options, Tree, WalRecoveryMode};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -890,6 +890,12 @@ fn reopen(image: &Path) -> Tree {
 	Tree::new(opts(image)).unwrap()
 }
 
+fn reopen_with_mode(image: &Path, mode: WalRecoveryMode) -> Result<Tree, Error> {
+	let mut o = (*opts(image)).clone();
+	o.wal_recovery_mode = mode;
+	Tree::new(Arc::new(o))
+}
+
 /// What each image of the damaged segment is: the copy of the live segment, or the segment with
 /// what the failed fsync left behind dropped in one way or another.
 #[derive(Debug, Clone, Copy)]
@@ -1046,9 +1052,9 @@ enum Dropped {
 
 /// A failed group in a segment whose memtables are all in tables. Replacing the segment flushes
 /// nothing, so it stays on disk while groups are acknowledged behind it. An image of that,
-/// damaged as above and reopened with the default recovery: everything acknowledged is back, the
-/// database takes new commits, and a second restart still has all of it. The first restart
-/// repairs the damaged segment, which is not the last one.
+/// damaged as above: default TolerateTornTail recovery refuses automatic repair because an older
+/// segment cannot have a torn tail. With explicit SalvageValidPrefix recovery: everything
+/// acknowledged is back, the database takes new commits, and a second restart still has all of it.
 #[test(tokio::test)]
 async fn a_damaged_segment_that_is_not_the_last_is_repaired_once_and_stays_repaired() {
 	let root = TempDir::new("wal_fsync").unwrap();
@@ -1098,7 +1104,19 @@ async fn a_damaged_segment_that_is_not_the_last_is_repaired_once_and_stays_repai
 			Dropped::Hole(from, to) => zero_range(&damaged, from, to),
 		}
 
-		let first = Arc::new(reopen(&image));
+		// Under default TolerateTornTail, if corruption is detected in an older segment,
+		// automatic repair is refused. In that case, reopen with explicit SalvageValidPrefix.
+		let first = match reopen_with_mode(&image, WalRecoveryMode::TolerateTornTail) {
+			Ok(tree) => Arc::new(tree),
+			Err(default_err) => {
+				assert!(
+					default_err.to_string().contains("older segment")
+						|| default_err.to_string().contains("interior corruption"),
+					"{at}: {default_err}"
+				);
+				Arc::new(reopen_with_mode(&image, WalRecoveryMode::SalvageValidPrefix).unwrap())
+			}
+		};
 		mark_closed(&first);
 		assert_all(&first, &acked, &at);
 		assert_all(&first, &again, &at);

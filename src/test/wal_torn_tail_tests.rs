@@ -861,3 +861,216 @@ async fn compressed_segment_with_no_valid_record_does_not_lose_later_commits() {
 		crash(tree);
 	}
 }
+
+// ---------------------------------------------------------------------------
+// damage classification, torn tail vs interior corruption, and quarantine
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_default_mode_is_tolerate_torn_tail() {
+	assert_eq!(WalRecoveryMode::default(), WalRecoveryMode::TolerateTornTail);
+}
+
+#[test_log::test(tokio::test)]
+async fn test_default_tolerate_torn_tail_trims_and_reports() {
+	let dir = TempDir::new().unwrap();
+	let o = opts(dir.path(), WalRecoveryMode::default());
+
+	let tree = Tree::new(Arc::clone(&o)).unwrap();
+	let wal = wal_path(&o, active_segment(&tree));
+	for i in 0..5 {
+		put(&tree, &format!("good{i}"), &GOOD).await;
+	}
+	let valid_len = file_len(&wal);
+
+	// Append a partial record at tail
+	put(&tree, "torn", &[b'y'; 64]).await;
+	crash(tree);
+	set_len(&wal, valid_len + 15); // cut halfway through the "torn" record
+
+	// Reopen with default mode (TolerateTornTail)
+	let tree = Tree::new(Arc::clone(&o)).expect("TolerateTornTail should repair torn tail at EOF");
+	for i in 0..5 {
+		assert_eq!(get(&tree, &format!("good{i}")).as_deref(), Some(&GOOD[..]));
+	}
+	assert!(get(&tree, "torn").is_none());
+
+	let report = tree.recovery_report();
+	assert_eq!(report.records_dropped, 0, "No valid records were dropped");
+	assert!(report.bytes_trimmed > 0, "Bytes trimmed should be > 0");
+	assert_eq!(report.quarantined_files.len(), 1, "Exactly one quarantined file");
+	assert!(report.quarantined_files[0].exists(), "Quarantined file exists");
+	assert!(report.quarantined_files[0].to_string_lossy().ends_with(".wal.corrupt"));
+
+	crash(tree);
+}
+
+#[test_log::test(tokio::test)]
+async fn test_tolerate_torn_tail_refuses_interior_corruption() {
+	let dir = TempDir::new().unwrap();
+	let o_default = opts(dir.path(), WalRecoveryMode::TolerateTornTail);
+
+	let tree = Tree::new(Arc::clone(&o_default)).unwrap();
+	let wal = wal_path(&o_default, active_segment(&tree));
+	put(&tree, "batch1", &GOOD).await;
+	let after_batch1 = file_len(&wal);
+	put(&tree, "batch2", &GOOD).await;
+	let _after_batch2 = file_len(&wal);
+	put(&tree, "batch3", &GOOD).await;
+	crash(tree);
+
+	// Corrupt batch2 in the middle of the file (interior corruption; batch3 remains intact after
+	// it)
+	{
+		use std::fs::OpenOptions;
+		use std::io::Seek;
+		let mut file = OpenOptions::new().write(true).open(&wal).unwrap();
+		file.seek(std::io::SeekFrom::Start(after_batch1 + 2)).unwrap();
+		// Overwrite record length/crc with garbage
+		file.write_all(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap();
+	}
+
+	let file_size_before = file_len(&wal);
+
+	// Attempt open with TolerateTornTail - must fail because batch3 is intact after corruption!
+	let err = Tree::new(Arc::clone(&o_default))
+		.err()
+		.expect("TolerateTornTail must refuse interior corruption");
+	let err_msg = err.to_string();
+	assert!(
+		err_msg.contains("interior corruption") || err_msg.contains("intact record"),
+		"Error must mention interior corruption or intact records: {err_msg}"
+	);
+
+	// The file must NOT have been modified or truncated by the refused repair!
+	assert_eq!(file_len(&wal), file_size_before, "WAL must not be modified when repair is refused");
+
+	// Now open with SalvageValidPrefix - must succeed and salvage batch1
+	let o_salvage = opts(dir.path(), WalRecoveryMode::SalvageValidPrefix);
+	let tree = Tree::new(Arc::clone(&o_salvage)).expect("SalvageValidPrefix must succeed");
+	assert_eq!(get(&tree, "batch1").as_deref(), Some(&GOOD[..]));
+	assert!(get(&tree, "batch2").is_none());
+	assert!(get(&tree, "batch3").is_none());
+
+	let report = tree.recovery_report();
+	assert!(report.records_dropped >= 1, "At least 1 intact record was dropped: {:?}", report);
+	assert!(report.bytes_trimmed > 0);
+	assert_eq!(report.quarantined_files.len(), 1);
+
+	crash(tree);
+}
+
+#[test_log::test(tokio::test)]
+async fn test_tolerate_torn_tail_refuses_corruption_in_older_segment() {
+	let dir = TempDir::new().unwrap();
+	let o_default = opts(dir.path(), WalRecoveryMode::TolerateTornTail);
+
+	let tree = Tree::new(Arc::clone(&o_default)).unwrap();
+	let first = active_segment(&tree);
+	put(&tree, "seg0_key", &GOOD).await;
+	rotate_wal(&tree);
+	put(&tree, "seg1_key", &GOOD).await;
+	crash(tree);
+
+	let seg0_wal = wal_path(&o_default, first);
+	// Corrupt tail of segment 0 (which is an older segment, not the newest!)
+	let seg0_len = file_len(&seg0_wal);
+	set_len(&seg0_wal, seg0_len - 5);
+
+	// Reopen with TolerateTornTail - must refuse because seg0 is an older segment
+	let err = Tree::new(Arc::clone(&o_default))
+		.err()
+		.expect("TolerateTornTail must refuse corruption in older segment");
+	let err_msg = err.to_string();
+	assert!(
+		err_msg.contains("older segment") || err_msg.contains("interior corruption"),
+		"Error must mention older segment: {err_msg}"
+	);
+
+	// Open with SalvageValidPrefix - allowed to repair
+	let o_salvage = opts(dir.path(), WalRecoveryMode::SalvageValidPrefix);
+	let tree =
+		Tree::new(Arc::clone(&o_salvage)).expect("SalvageValidPrefix can repair older segment");
+	assert!(get(&tree, "seg0_key").is_none());
+	assert_eq!(get(&tree, "seg1_key").as_deref(), Some(&GOOD[..]));
+	crash(tree);
+}
+
+#[test_log::test(tokio::test)]
+async fn test_quarantine_rotation_retention() {
+	use crate::wal::recovery::quarantine_wal_segment;
+
+	let dir = TempDir::new().unwrap();
+	let wal_dir = dir.path().join("wal");
+	fs::create_dir_all(&wal_dir).unwrap();
+
+	let seg0 = wal_dir.join("00000000000000000000.wal");
+	fs::write(&seg0, b"original content").unwrap();
+
+	// Quarantine 1st time
+	let q0 = quarantine_wal_segment(&wal_dir, 0).unwrap();
+	assert_eq!(q0, wal_dir.join("00000000000000000000.wal.corrupt"));
+	assert!(q0.exists());
+
+	// Modify and quarantine 2nd time
+	fs::write(&seg0, b"content v2").unwrap();
+	let q1 = quarantine_wal_segment(&wal_dir, 0).unwrap();
+	assert_eq!(q1, wal_dir.join("00000000000000000000.wal.corrupt"));
+	assert_eq!(
+		fs::read(wal_dir.join("00000000000000000000.wal.corrupt.1")).unwrap(),
+		b"original content"
+	);
+	assert_eq!(fs::read(&q1).unwrap(), b"content v2");
+
+	// Modify and quarantine 3rd time
+	fs::write(&seg0, b"content v3").unwrap();
+	let q2 = quarantine_wal_segment(&wal_dir, 0).unwrap();
+	assert_eq!(
+		fs::read(wal_dir.join("00000000000000000000.wal.corrupt.2")).unwrap(),
+		b"original content"
+	);
+	assert_eq!(
+		fs::read(wal_dir.join("00000000000000000000.wal.corrupt.1")).unwrap(),
+		b"content v2"
+	);
+	assert_eq!(fs::read(&q2).unwrap(), b"content v3");
+
+	// Modify and quarantine 4th time: oldest (.corrupt.2, "original content") should be evicted
+	fs::write(&seg0, b"content v4").unwrap();
+	let q3 = quarantine_wal_segment(&wal_dir, 0).unwrap();
+	assert_eq!(
+		fs::read(wal_dir.join("00000000000000000000.wal.corrupt.2")).unwrap(),
+		b"content v2"
+	);
+	assert_eq!(
+		fs::read(wal_dir.join("00000000000000000000.wal.corrupt.1")).unwrap(),
+		b"content v3"
+	);
+	assert_eq!(fs::read(&q3).unwrap(), b"content v4");
+	assert!(!wal_dir.join("00000000000000000000.wal.corrupt.3").exists());
+}
+
+#[test_log::test(tokio::test)]
+async fn test_zero_valid_segment_truncated_in_place_not_deleted() {
+	let dir = TempDir::new().unwrap();
+	let o = opts(dir.path(), WalRecoveryMode::TolerateTornTail);
+
+	let tree = Tree::new(Arc::clone(&o)).unwrap();
+	let wal = wal_path(&o, active_segment(&tree));
+	// Write a single incomplete record (only 3 bytes of header)
+	crash(tree);
+	fs::write(&wal, [0x01, 0x00, 0x05]).unwrap();
+
+	let tree = Tree::new(Arc::clone(&o)).expect("Must recover 0-valid segment");
+	// The segment must still exist on disk with length 0
+	assert!(wal.exists(), "0-valid segment file must not be deleted");
+	assert_eq!(file_len(&wal), 0, "0-valid segment must be truncated to 0 length");
+
+	// New commits must work
+	put(&tree, "key_after", &NEW).await;
+	crash(tree);
+
+	let tree = Tree::new(Arc::clone(&o)).expect("Recovery after new commits");
+	assert_eq!(get(&tree, "key_after").as_deref(), Some(&NEW[..]));
+	crash(tree);
+}

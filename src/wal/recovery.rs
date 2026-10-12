@@ -1,13 +1,58 @@
-use std::fs::File;
-use std::path::Path;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::fsync_directory;
 use crate::memtable::MemTable;
+use crate::wal::manager::Wal;
 use crate::wal::reader::{Reader, Reporter};
-use crate::wal::{get_segment_range, list_segment_ids, Error as WalError, SegmentRef, WalContext};
+use crate::wal::{
+	calculate_crc32,
+	get_segment_range,
+	list_segment_ids,
+	CompressionType,
+	Error as WalError,
+	RecordType,
+	SegmentRef,
+	WalContext,
+	BLOCK_SIZE,
+	HEADER_SIZE,
+};
+
+/// Detailed summary of actions taken during WAL recovery.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WalRecoveryReport {
+	/// Number of WAL segments replayed during recovery.
+	pub segments_replayed: usize,
+	/// Number of valid records/batches replayed across all segments.
+	pub records_replayed: usize,
+	/// Number of intact records dropped due to repair/salvage.
+	pub records_dropped: usize,
+	/// Number of bytes trimmed from WAL segment(s).
+	pub bytes_trimmed: u64,
+	/// Quarantined backup files created before modifying corrupted segments.
+	pub quarantined_files: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WalDamage {
+	/// A torn tail at the end of the last segment with no valid records following it.
+	TornTail {
+		last_valid_offset: usize,
+		file_size: u64,
+	},
+	/// Interior corruption: valid records follow the corruption, or corruption occurs in an older
+	/// segment.
+	InteriorCorruption {
+		last_valid_offset: usize,
+		intact_records_after: usize,
+		is_last_segment: bool,
+		file_size: u64,
+	},
+}
 
 /// Default implementation of the Reporter trait for standard
 /// recovery operations.
@@ -102,24 +147,15 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 /// * `Ok((None, vec![]))` - No data recovered
 /// * `Err(...)` - Error during replay
 pub(crate) type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>);
+pub(crate) type ReplayInnerResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>, usize, usize);
 
-/// Replays a plaintext WAL, see [`replay_wal_with`].
-#[cfg(test)]
-pub(crate) fn replay_wal(
-	wal_dir: &Path,
-	min_wal_number: u64,
-	arena_size: usize,
-) -> Result<ReplayResult> {
-	replay_wal_with(&WalContext::plaintext(), wal_dir, min_wal_number, arena_size)
-}
-
-/// Replays the WAL whose segments are as `context` says.
-pub(crate) fn replay_wal_with(
+/// Replays the WAL whose segments are as `context` says, and counts what it replayed.
+pub(crate) fn replay_wal_inner_with(
 	context: &WalContext,
 	wal_dir: &Path,
 	min_wal_number: u64,
 	arena_size: usize,
-) -> Result<ReplayResult> {
+) -> Result<ReplayInnerResult> {
 	tracing::debug!("Starting WAL recovery from directory: {:?}", wal_dir);
 	tracing::debug!(
 		"WAL recovery parameters: min_wal_number={}, arena_size={}",
@@ -127,20 +163,25 @@ pub(crate) fn replay_wal_with(
 		arena_size
 	);
 
-	// A sealed WAL is replayed by its own code, which fails on anything that is not a tear.
+	// A sealed WAL is replayed by its own code, which fails on anything that is not a tear. It
+	// does not count the batches it replays.
 	if context.is_sealed() {
-		return crate::wal::sealed_recovery::replay(context, wal_dir, min_wal_number, arena_size);
+		let (max_seq, memtables) =
+			crate::wal::sealed_recovery::replay(context, wal_dir, min_wal_number, arena_size)?;
+		let segments =
+			memtables.iter().map(|(_, _, id)| *id).collect::<std::collections::HashSet<_>>();
+		return Ok((max_seq, memtables, 0, segments.len()));
 	}
 
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
 		tracing::debug!("WAL directory does not exist, skipping recovery");
-		return Ok((None, vec![]));
+		return Ok((None, vec![], 0, 0));
 	}
 
 	if list_segment_ids(wal_dir, Some("wal"))?.is_empty() {
 		tracing::debug!("No WAL segments found, skipping recovery");
-		return Ok((None, vec![]));
+		return Ok((None, vec![], 0, 0));
 	}
 
 	// Get range of segment IDs (looking for .wal files)
@@ -148,7 +189,7 @@ pub(crate) fn replay_wal_with(
 		Ok(range) => range,
 		Err(WalError::IO(ref io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
 			tracing::debug!("WAL segment range not found, skipping recovery");
-			return Ok((None, vec![]));
+			return Ok((None, vec![], 0, 0));
 		}
 		Err(e) => return Err(e.into()),
 	};
@@ -156,7 +197,7 @@ pub(crate) fn replay_wal_with(
 	// If no segments, nothing to replay
 	if first > last {
 		tracing::debug!("No valid WAL segment range, skipping recovery");
-		return Ok((None, vec![]));
+		return Ok((None, vec![], 0, 0));
 	}
 
 	// Determine the range of segments to replay
@@ -168,7 +209,7 @@ pub(crate) fn replay_wal_with(
 			last,
 			min_wal_number
 		);
-		return Ok((None, vec![]));
+		return Ok((None, vec![], 0, 0));
 	}
 
 	tracing::debug!("Replaying WAL segments #{:020} to #{:020}", start_segment, last);
@@ -313,16 +354,26 @@ pub(crate) fn replay_wal_with(
 		result
 	);
 
-	Ok((result, memtables))
+	Ok((result, memtables, total_batches_replayed, segments_processed))
+}
+
+/// Replays a plaintext WAL.
+#[cfg(test)]
+pub(crate) fn replay_wal(
+	wal_dir: &Path,
+	min_wal_number: u64,
+	arena_size: usize,
+) -> Result<ReplayResult> {
+	let (max_seq, memtables, _, _) =
+		replay_wal_inner_with(&WalContext::plaintext(), wal_dir, min_wal_number, arena_size)?;
+	Ok((max_seq, memtables))
 }
 
 /// Whether the file at `path` starts the way a sealed segment does: the type of the header record
 /// or the start of the encryption header that is its payload. A WAL that is not sealed has no
-/// business repairing such a file, whatever else is wrong with it, and the plaintext repair deletes
-/// a segment that holds no valid record. A file that does not exist is not one.
+/// business repairing such a file, whatever else is wrong with it. A file that does not exist is
+/// not one.
 fn segment_looks_sealed(path: &Path) -> Result<bool> {
-	use std::io::Read;
-
 	let mut head = Vec::new();
 	match File::open(path) {
 		Ok(file) => file.take(11).read_to_end(&mut head)?,
@@ -332,137 +383,268 @@ fn segment_looks_sealed(path: &Path) -> Result<bool> {
 	Ok(crate::wal::sealed::starts_like_sealed(&head))
 }
 
-/// Repairs a plaintext segment, see [`repair_corrupted_wal_segment_with`].
-#[cfg(test)]
-pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
-	repair_corrupted_wal_segment_with(&WalContext::plaintext(), wal_dir, segment_id)
+fn is_valid_batch_payload(payload: &[u8], compression: CompressionType) -> bool {
+	if Batch::decode(payload).is_ok() {
+		return true;
+	}
+	if compression == CompressionType::Lz4 {
+		lz4_flex::decompress_size_prepended(payload)
+			.map(|decompressed| Batch::decode(&decompressed).is_ok())
+			.unwrap_or(false)
+	} else {
+		lz4_flex::decompress_size_prepended(payload)
+			.map(|decompressed| Batch::decode(&decompressed).is_ok())
+			.unwrap_or(false)
+	}
 }
 
-/// Repairs the segment `segment_id` of the WAL whose segments are as `context` says, by keeping
-/// the records before the damage.
-pub(crate) fn repair_corrupted_wal_segment_with(
-	context: &WalContext,
-	wal_dir: &Path,
-	segment_id: usize,
-) -> Result<()> {
-	use std::fs;
-
-	use crate::wal::manager::Wal;
-	use crate::wal::reader::Reader;
-	use crate::wal::Options;
-
-	// The plaintext repair below reads and writes plaintext, and deletes a segment that holds no
-	// valid record: it must never run on a sealed segment, which a key that does not fit makes look
-	// like one. Sealed segments are repaired by their own code, which deletes nothing.
-	if context.is_sealed() {
-		return crate::wal::sealed_recovery::repair(context, wal_dir, segment_id);
-	}
-	if segment_looks_sealed(&wal_dir.join(format!("{segment_id:020}.wal")))? {
-		return Err(crate::error::EncryptionError::NotConfigured.into());
+fn try_validate_record(
+	data: &[u8],
+	start_offset: u64,
+	pos: usize,
+	compression: CompressionType,
+) -> Option<usize> {
+	if pos + HEADER_SIZE > data.len() {
+		return None;
 	}
 
-	// Build segment paths
-	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
+	let abs_pos = start_offset + pos as u64;
+	let offset_in_block = (abs_pos % BLOCK_SIZE as u64) as usize;
 
-	// Verify the corrupted segment exists
-	if !segment_path.exists() {
-		return Err(crate::error::Error::Other(format!(
-			"WAL segment {segment_id:020}.wal does not exist"
-		)));
+	if offset_in_block + HEADER_SIZE > BLOCK_SIZE {
+		return None;
 	}
 
-	// Create a repair directory for the new WAL file
-	let repair_dir = wal_dir.join("repair_temp");
+	let header = &data[pos..pos + HEADER_SIZE];
+	let crc = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+	let length = u16::from_be_bytes([header[4], header[5]]) as usize;
+	let type_byte = header[6];
 
-	// If a repair failed the directory could still exists.
-	// Instead of continuing we remove the dir and start the recovery from scratch.
-	if repair_dir.exists() {
-		fs::remove_dir_all(&repair_dir)?;
+	if offset_in_block + HEADER_SIZE + length > BLOCK_SIZE
+		|| pos + HEADER_SIZE + length > data.len()
+	{
+		return None;
 	}
 
-	fs::create_dir_all(&repair_dir)?;
+	let payload = &data[pos + HEADER_SIZE..pos + HEADER_SIZE + length];
+	let expected_crc = calculate_crc32(&[type_byte], payload);
+	if crc != expected_crc {
+		return None;
+	}
 
-	// Create a new Wal for writing the repaired data
-	// We'll write to a temp directory then move the file
-	let opts = Options {
-		context: context.clone(),
-		..Options::default()
-	};
-	let mut repair_wal = Wal::open(&repair_dir, opts)?;
+	if type_byte == RecordType::Full as u8 {
+		if is_valid_batch_payload(payload, compression) {
+			return Some(pos + HEADER_SIZE + length);
+		}
+		return None;
+	}
 
-	// Open the original segment file
-	let file = fs::File::open(&segment_path)?;
-	let mut reader = Reader::with_context(file, None, segment_id as u64, context);
+	if type_byte == RecordType::First as u8 {
+		let mut accumulated = payload.to_vec();
+		let mut cur_pos = pos + HEADER_SIZE + length;
 
-	let mut valid_batches_count = 0;
-	let mut repair_failed = false;
+		loop {
+			let cur_abs_pos = start_offset + cur_pos as u64;
+			let cur_offset_in_block = (cur_abs_pos % BLOCK_SIZE as u64) as usize;
 
-	// Read valid batches from original and write them to the repair WAL
-	loop {
-		match reader.read() {
-			Ok((record_data, _offset)) => {
-				// We have a valid batch, write it to the repair WAL
-				if let Err(e) = repair_wal.append(record_data) {
-					tracing::error!("Failed to write valid batch to repaired WAL: {e}");
-					repair_failed = true;
-					break;
+			let remaining_in_block = BLOCK_SIZE - cur_offset_in_block;
+			if remaining_in_block < HEADER_SIZE {
+				if cur_pos + remaining_in_block > data.len() {
+					return None;
 				}
-				valid_batches_count += 1;
+				let padding = &data[cur_pos..cur_pos + remaining_in_block];
+				if !padding.iter().all(|&b| b == 0) {
+					return None;
+				}
+				cur_pos += remaining_in_block;
+			} else if cur_pos + HEADER_SIZE <= data.len()
+				&& data[cur_pos + 6] == RecordType::Empty as u8
+			{
+				if cur_pos + remaining_in_block > data.len() {
+					return None;
+				}
+				cur_pos += remaining_in_block;
 			}
-			Err(WalError::Corruption(err)) => {
-				// Stop at the first corruption
-				tracing::error!(
-                    "Stopped repair at corruption: {err}. Recovered {valid_batches_count} valid batches."
-                );
-				break;
+
+			if cur_pos + HEADER_SIZE > data.len() {
+				return None;
 			}
-			Err(WalError::IO(err)) if err.kind() == std::io::ErrorKind::UnexpectedEof => {
-				// End of segment reached
-				tracing::info!(
-					"Repair completed successfully. Recovered {valid_batches_count} valid batches."
-				);
-				break;
+
+			let frag_abs_pos = start_offset + cur_pos as u64;
+			let frag_offset_in_block = (frag_abs_pos % BLOCK_SIZE as u64) as usize;
+			if frag_offset_in_block + HEADER_SIZE > BLOCK_SIZE {
+				return None;
 			}
-			Err(err) => {
-				tracing::error!("Unexpected error during repair: {err}");
-				repair_failed = true;
-				break;
+
+			let frag_header = &data[cur_pos..cur_pos + HEADER_SIZE];
+			let frag_crc = u32::from_be_bytes([
+				frag_header[0],
+				frag_header[1],
+				frag_header[2],
+				frag_header[3],
+			]);
+			let frag_length = u16::from_be_bytes([frag_header[4], frag_header[5]]) as usize;
+			let frag_type = frag_header[6];
+
+			if frag_offset_in_block + HEADER_SIZE + frag_length > BLOCK_SIZE
+				|| cur_pos + HEADER_SIZE + frag_length > data.len()
+			{
+				return None;
+			}
+
+			let frag_payload = &data[cur_pos + HEADER_SIZE..cur_pos + HEADER_SIZE + frag_length];
+			let frag_expected_crc = calculate_crc32(&[frag_type], frag_payload);
+			if frag_crc != frag_expected_crc {
+				return None;
+			}
+
+			if frag_type == RecordType::Middle as u8 {
+				accumulated.extend_from_slice(frag_payload);
+				cur_pos += HEADER_SIZE + frag_length;
+				continue;
+			} else if frag_type == RecordType::Last as u8 {
+				accumulated.extend_from_slice(frag_payload);
+				cur_pos += HEADER_SIZE + frag_length;
+				if is_valid_batch_payload(&accumulated, compression) {
+					return Some(cur_pos);
+				} else {
+					return None;
+				}
+			} else {
+				return None;
 			}
 		}
 	}
 
-	// Close the repair WAL
-	repair_wal.close()?;
+	None
+}
 
-	// The repaired WAL was written to repair_temp/00000000000000000000.wal
-	let temp_wal_path = repair_dir.join("00000000000000000000.wal");
-
-	if repair_failed {
-		// Clean up
-		fs::remove_dir_all(&repair_dir).ok();
-		return Err(crate::error::Error::Other(format!(
-			"Failed to repair WAL segment {segment_id}. Original segment unchanged."
-		)));
+/// Scans the WAL segment file starting at `start_offset` for valid records.
+/// Returns the number of intact records found after `start_offset`.
+pub(crate) fn scan_valid_records_after(file_path: &Path, start_offset: u64) -> Result<usize> {
+	let mut file = File::open(file_path)?;
+	let file_size = file.metadata()?.len();
+	if start_offset >= file_size {
+		return Ok(0);
 	}
 
-	if valid_batches_count == 0 {
-		// No valid data
-		fs::remove_file(&segment_path)?;
-		fs::remove_dir_all(&repair_dir).ok();
-		tracing::info!("Deleted corrupted WAL segment {segment_id:020}.wal (no valid data)");
-		return Ok(());
+	let compression = Wal::detect_compression_type(file_path).unwrap_or(CompressionType::None);
+
+	file.seek(SeekFrom::Start(start_offset))?;
+	let mut data = Vec::new();
+	file.read_to_end(&mut data)?;
+
+	let mut intact_count = 0;
+	let mut pos = 0;
+
+	while pos + HEADER_SIZE <= data.len() {
+		let abs_pos = start_offset + pos as u64;
+		let offset_in_block = (abs_pos % BLOCK_SIZE as u64) as usize;
+
+		// Header cannot cross a block boundary
+		if offset_in_block + HEADER_SIZE > BLOCK_SIZE {
+			let bytes_to_next_block = BLOCK_SIZE - offset_in_block;
+			pos += bytes_to_next_block;
+			continue;
+		}
+
+		if let Some(next_pos) = try_validate_record(&data, start_offset, pos, compression) {
+			intact_count += 1;
+			pos = next_pos;
+		} else {
+			pos += 1;
+		}
 	}
 
-	// Replace the original with repaired version
-	fs::rename(&temp_wal_path, &segment_path)?;
-	fs::remove_dir_all(&repair_dir).ok();
+	Ok(intact_count)
+}
+
+pub(crate) fn classify_wal_damage(
+	file_path: &Path,
+	last_valid_offset: usize,
+	is_last_segment: bool,
+) -> Result<WalDamage> {
+	let metadata = fs::metadata(file_path)?;
+	let file_size = metadata.len();
+
+	let intact_records_after = scan_valid_records_after(file_path, last_valid_offset as u64)?;
+
+	if is_last_segment && intact_records_after == 0 {
+		Ok(WalDamage::TornTail {
+			last_valid_offset,
+			file_size,
+		})
+	} else {
+		Ok(WalDamage::InteriorCorruption {
+			last_valid_offset,
+			intact_records_after,
+			is_last_segment,
+			file_size,
+		})
+	}
+}
+
+pub(crate) fn quarantine_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<PathBuf> {
+	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
+	if !segment_path.exists() {
+		return Err(Error::Other(format!("WAL segment {segment_id:020}.wal does not exist")));
+	}
+
+	// Retention: keep the last 3 quarantine files per segment ID:
+	// <id>.wal.corrupt, <id>.wal.corrupt.1, <id>.wal.corrupt.2
+	let corrupt_base = wal_dir.join(format!("{segment_id:020}.wal.corrupt"));
+	let corrupt_1 = wal_dir.join(format!("{segment_id:020}.wal.corrupt.1"));
+	let corrupt_2 = wal_dir.join(format!("{segment_id:020}.wal.corrupt.2"));
+
+	if corrupt_2.exists() {
+		let _ = fs::remove_file(&corrupt_2);
+	}
+	if corrupt_1.exists() {
+		let _ = fs::rename(&corrupt_1, &corrupt_2);
+	}
+	if corrupt_base.exists() {
+		let _ = fs::rename(&corrupt_base, &corrupt_1);
+	}
+
+	fs::copy(&segment_path, &corrupt_base)?;
 	fsync_directory(wal_dir)?;
 
-	tracing::info!(
-		"Successfully repaired WAL segment {segment_id} with {valid_batches_count} valid batches."
-	);
+	Ok(corrupt_base)
+}
 
-	Ok(())
+pub(crate) fn repair_corrupted_wal_segment(
+	wal_dir: &Path,
+	segment_id: usize,
+	last_valid_offset: usize,
+) -> Result<(PathBuf, u64)> {
+	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
+	if !segment_path.exists() {
+		return Err(Error::Other(format!("WAL segment {segment_id:020}.wal does not exist")));
+	}
+	// This truncates plaintext at an offset of plaintext: it never runs on a sealed segment, which
+	// a key that does not fit makes look like a damaged one.
+	if segment_looks_sealed(&segment_path)? {
+		return Err(crate::error::EncryptionError::NotConfigured.into());
+	}
+
+	// 1. Quarantine original segment before modifying it
+	let quarantine_path = quarantine_wal_segment(wal_dir, segment_id)?;
+
+	// 2. Open file for in-place truncation on the same inode
+	let file = OpenOptions::new().write(true).open(&segment_path)?;
+	let old_len = file.metadata()?.len();
+	file.set_len(last_valid_offset as u64)?;
+	file.sync_all()?;
+	fsync_directory(wal_dir)?;
+
+	// 3. Clean up stale repair directory if present
+	let repair_dir = wal_dir.join("repair_temp");
+	if repair_dir.exists() {
+		let _ = fs::remove_dir_all(&repair_dir);
+	}
+
+	let bytes_trimmed = old_len.saturating_sub(last_valid_offset as u64);
+	Ok((quarantine_path, bytes_trimmed))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -682,7 +864,7 @@ mod tests {
 		fs::create_dir_all(wal_dir).unwrap();
 
 		// Test repair of non-existent segment
-		let result = repair_corrupted_wal_segment(wal_dir, 999);
+		let result = repair_corrupted_wal_segment(wal_dir, 999, 0);
 		assert!(result.is_err(), "Should fail when segment doesn't exist");
 	}
 
@@ -725,7 +907,7 @@ mod tests {
 		drop(file);
 
 		// Test using Core::replay_wal_with_repair (the actual production flow)
-		let (max_seq_num, memtable_opt) = crate::lsm::Core::replay_wal_with_repair(
+		let (max_seq_num, memtable_opt, _report) = crate::lsm::Core::replay_wal_with_repair(
 			wal_dir,
 			0,
 			"Test repair",
@@ -806,7 +988,7 @@ mod tests {
 		file.write_all(&data).unwrap(); // Data
 		drop(file);
 
-		let (max_seq_num, memtable_opt) = crate::lsm::Core::replay_wal_with_repair(
+		let (max_seq_num, memtable_opt, _report) = crate::lsm::Core::replay_wal_with_repair(
 			wal_dir,
 			0,
 			"Test repair",

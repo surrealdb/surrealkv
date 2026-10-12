@@ -22,6 +22,7 @@ pub mod writer;
 
 pub use manager::Wal;
 pub(crate) use manager::WalManager;
+pub use recovery::WalRecoveryReport;
 
 // ===== Format Constants and Types =====
 

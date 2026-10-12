@@ -216,7 +216,7 @@ fn replay(
 	mode: WalRecoveryMode,
 ) -> crate::Result<[bool; 3]> {
 	let mut memtables = Vec::new();
-	let (_, active) = Core::replay_wal_in(
+	let (_, active, _) = Core::replay_wal_in(
 		&WalContext::sealed(Arc::clone(enc)),
 		wal_dir,
 		0,
