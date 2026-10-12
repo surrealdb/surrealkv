@@ -158,6 +158,8 @@ pub mod vlog_tests;
 pub mod wal_context_tests;
 #[cfg(test)]
 pub mod wal_decode_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_foreign_segment_tests;
 #[cfg(test)]
 pub mod wal_fsync_poison_tests;
 #[cfg(test)]

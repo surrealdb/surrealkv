@@ -28,18 +28,33 @@
 //!
 //! The batch is compressed before it is sealed, as a size and an LZ4 block, if the header says so.
 
+use std::fs::File;
+use std::io::Read;
+use std::path::Path;
+
 use crate::error::EncryptionError;
 use crate::tde::{
 	BlockContext,
 	BlockKind,
 	CryptoHeader,
+	DbId,
 	EncryptionContext,
 	FileCipher,
 	FileKind,
 	HEADER_LEN,
 	HEADER_MAGIC,
 };
-use crate::wal::{CompressionType, Error, IOError, Result};
+use crate::wal::{
+	calculate_crc32,
+	list_segment_ids,
+	segment_name,
+	CompressionType,
+	Error,
+	IOError,
+	RecordType,
+	Result,
+	HEADER_SIZE,
+};
 
 /// The format of a sealed segment that this build writes and reads.
 pub(crate) const FORMAT_VERSION: u8 = 1;
@@ -62,6 +77,92 @@ pub(crate) fn starts_like_sealed(head: &[u8]) -> bool {
 	head.get(6) == Some(&(super::RecordType::SegmentHeader as u8))
 		|| head.get(super::HEADER_SIZE..super::HEADER_SIZE + HEADER_MAGIC.len())
 			== Some(&HEADER_MAGIC[..])
+}
+
+/// Says from the first record of a segment, `record`, whether the segment can be a segment of the
+/// database `db_id`. It needs no key, and it speaks only when it is sure: a segment that is not
+/// this database's is told by a first record that passes its checksum, so that damage, a write that
+/// was cut short and a segment that was never written are not mistaken for one, and none of them is
+/// refused here.
+///
+/// Fails with `DbIdMismatch` for a header record whose encryption header is whole and well formed
+/// and names another database, and with `PlaintextInEncryptedDb` for a record of a kind that a
+/// segment in the clear starts with. Everything else is left to the reader, which says it in the
+/// order it always did: a header that does not decode, a key that does not fit, a segment of
+/// another number.
+///
+/// A WAL is opened by reading the segments from the log number on, and the ones below it are
+/// deleted without being read, so this is how a segment that is not the database's, put there by
+/// an operator or left by a restore of another database, is told from one that is merely old.
+pub(crate) fn check_first_record(
+	db_id: DbId,
+	record: &[u8],
+) -> std::result::Result<(), EncryptionError> {
+	let Some((frame, rest)) = record.split_first_chunk::<HEADER_SIZE>() else {
+		return Ok(());
+	};
+	let [crc0, crc1, crc2, crc3, length0, length1, kind] = *frame;
+	let length = usize::from(u16::from_be_bytes([length0, length1]));
+	let Some(payload) = rest.get(..length) else {
+		return Ok(());
+	};
+	if calculate_crc32(&[kind], payload) != u32::from_be_bytes([crc0, crc1, crc2, crc3]) {
+		return Ok(());
+	}
+
+	if kind == RecordType::SegmentHeader as u8 {
+		let named = payload.get(..HEADER_LEN).and_then(|bytes| CryptoHeader::decode(bytes).ok());
+		return match named {
+			Some(header) if header.identity.db_id != db_id => Err(EncryptionError::DbIdMismatch),
+			_ => Ok(()),
+		};
+	}
+	let in_the_clear = [
+		RecordType::Full,
+		RecordType::First,
+		RecordType::Middle,
+		RecordType::Last,
+		RecordType::SetCompressionType,
+	]
+	.iter()
+	.any(|&plain| plain as u8 == kind);
+	if in_the_clear {
+		return Err(EncryptionError::PlaintextInEncryptedDb);
+	}
+	Ok(())
+}
+
+/// Reads the first record of the segment at `path`, no more than it holds, and says what
+/// [`check_first_record`] says of it. A file that is gone, or that has no whole record, says
+/// nothing.
+pub(crate) fn check_segment_file(db_id: DbId, path: &Path) -> crate::error::Result<()> {
+	let mut file = match File::open(path) {
+		Ok(file) => file,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+		Err(e) => return Err(e.into()),
+	};
+	// The header of the record says how much of the payload there is to read.
+	let mut record = Vec::with_capacity(HEADER_RECORD_LEN);
+	file.by_ref().take(HEADER_SIZE as u64).read_to_end(&mut record)?;
+	if let Some(&[_, _, _, _, length0, length1, _]) = record.first_chunk::<HEADER_SIZE>() {
+		let length = u64::from(u16::from_be_bytes([length0, length1]));
+		file.by_ref().take(length).read_to_end(&mut record)?;
+	}
+	Ok(check_first_record(db_id, &record)?)
+}
+
+/// Looks at every segment in `wal_dir` with [`check_segment_file`], the ones below the log number
+/// of the database included, and fails with the first that is not a segment of the database
+/// `db_id`. Reads only. A directory that cannot be listed is not this check's to report: opening
+/// the log lists it again and says what is wrong.
+pub(crate) fn check_directory(db_id: DbId, wal_dir: &Path) -> crate::error::Result<()> {
+	let Ok(ids) = list_segment_ids(wal_dir, Some("wal")) else {
+		return Ok(());
+	};
+	for id in ids {
+		check_segment_file(db_id, &wal_dir.join(segment_name(id, "wal")))?;
+	}
+	Ok(())
 }
 
 /// The index of the first batch of a segment. Position 0 of a file key is not used by a WAL.

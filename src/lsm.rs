@@ -27,7 +27,7 @@ use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vlog::{VLog, ValueLocation};
 use crate::wal::recovery::{repair_corrupted_wal_segment_with, replay_wal_with};
-use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
+use crate::wal::{self, cleanup_old_segments_for, Wal, WalManager};
 use crate::{
 	Comparator,
 	Error,
@@ -305,9 +305,16 @@ impl CoreInner {
 		// before anything of the log or the value log is opened, so that a table of another
 		// database, which the clean-up after the replay would delete, refuses the open with
 		// nothing changed.
-		if manifest_loaded_from_disk && opts.encryption_context().is_some() {
-			let live: HashSet<u64> = manifest.get_all_tables().keys().copied().collect();
-			plan_orphan_cleanup(&opts, &live)?;
+		if manifest_loaded_from_disk {
+			if let Some(context) = opts.encryption_context() {
+				let live: HashSet<u64> = manifest.get_all_tables().keys().copied().collect();
+				plan_orphan_cleanup(&opts, &live)?;
+				// The same for the segments of the log. The ones from the log number on are read by
+				// the replay, which refuses another database's, but the ones below it are only
+				// deleted by number, and a manifest that names another database, or a segment that
+				// was put there, would have them deleted without anyone having read them.
+				wal::sealed::check_directory(context.db_id(), &opts.wal_dir())?;
+			}
 		}
 
 		// The value log is opened before the WAL is: opening the WAL makes a segment and removes
@@ -1031,7 +1038,11 @@ impl CoreInner {
 			self.group_wal_pin.load(Ordering::Acquire),
 		);
 
-		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+		match cleanup_old_segments_for(
+			self.opts.encryption_context().map(Arc::as_ref),
+			&wal_dir,
+			min_wal_to_keep,
+		) {
 			Ok(count) if count > 0 => {
 				tracing::debug!(
 					"Cleaned up {} old WAL segments (min_wal_to_keep={})",
@@ -2087,7 +2098,11 @@ impl Core {
 
 		tracing::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
 
-		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+		match cleanup_old_segments_for(
+			self.inner.opts.encryption_context().map(Arc::as_ref),
+			&wal_dir,
+			min_wal_to_keep,
+		) {
 			Ok(count) if count > 0 => {
 				tracing::debug!("Cleaned up {} obsolete WAL files during shutdown", count);
 			}

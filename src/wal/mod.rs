@@ -983,7 +983,25 @@ impl WritableFile for BufferedFileWriter {
 /// # Returns
 ///
 /// A result with the count of removed segments or an error
+#[cfg(test)]
 pub(crate) fn cleanup_old_segments(wal_dir: &Path, min_wal_number: u64) -> Result<usize> {
+	cleanup_old_segments_for(None, wal_dir, min_wal_number)
+}
+
+/// Like `cleanup_old_segments`, for the WAL of a database that is encrypted if `context` is given.
+///
+/// A segment is removed by its number, and without being read: it is below the log number, so the
+/// database has no use for it. In an encrypted database that is not enough to know that it is the
+/// database's. The segments of another database that shares the key, or one that is not sealed at
+/// all, that someone put there, or left behind by a restore from the wrong place, are not looked at
+/// by the replay either, which starts at the log number. Each segment is therefore read from its
+/// first record (see `sealed::check_first_record`) before it is removed, and one that is not this
+/// database's is left where it is and said so, since nothing here knows what it is.
+pub(crate) fn cleanup_old_segments_for(
+	context: Option<&EncryptionContext>,
+	wal_dir: &Path,
+	min_wal_number: u64,
+) -> Result<usize> {
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
 		return Ok(0);
@@ -1006,6 +1024,16 @@ pub(crate) fn cleanup_old_segments(wal_dir: &Path, min_wal_number: u64) -> Resul
 	for segment_id in segment_ids {
 		if segment_id < min_wal_number {
 			let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
+
+			if let Some(context) = context {
+				if let Err(e) = sealed::check_segment_file(context.db_id(), &segment_path) {
+					tracing::error!(
+						"Kept the WAL segment {segment_id:020}, which is below the log number: \
+						 it is not a segment of this database: {e}"
+					);
+					continue;
+				}
+			}
 
 			match fs::remove_file(&segment_path) {
 				Ok(_) => {
