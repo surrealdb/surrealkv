@@ -61,6 +61,8 @@ pub mod encryption_background_tests;
 #[cfg(test)]
 pub mod encryption_checkpoint_tests;
 #[cfg(test)]
+pub mod encryption_checkpoint_wal_tests;
+#[cfg(test)]
 pub mod encryption_commit_path_tests;
 #[cfg(test)]
 pub mod encryption_open_tests;

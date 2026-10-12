@@ -37,6 +37,7 @@ use crate::tde::{
 	FileCipher,
 	FileKind,
 	HEADER_LEN,
+	HEADER_MAGIC,
 };
 use crate::wal::{CompressionType, Error, IOError, Result};
 
@@ -53,6 +54,15 @@ pub(crate) const HEADER_PAYLOAD_LEN: usize = HEADER_LEN + COVERED_LEN;
 /// The length of the header record of a sealed segment, framing included: where its first batch
 /// begins.
 pub(crate) const HEADER_RECORD_LEN: usize = super::HEADER_SIZE + HEADER_PAYLOAD_LEN;
+
+/// Whether the first bytes of a segment, `head`, are those of a sealed one: the type of the header
+/// record, or the start of the encryption header that is its payload, which a type byte that was
+/// damaged does not hide. Needs no key, and says nothing about whether the segment can be opened.
+pub(crate) fn starts_like_sealed(head: &[u8]) -> bool {
+	head.get(6) == Some(&(super::RecordType::SegmentHeader as u8))
+		|| head.get(super::HEADER_SIZE..super::HEADER_SIZE + HEADER_MAGIC.len())
+			== Some(&HEADER_MAGIC[..])
+}
 
 /// The index of the first batch of a segment. Position 0 of a file key is not used by a WAL.
 pub(crate) const FIRST_INDEX: u64 = 1;

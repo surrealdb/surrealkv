@@ -38,7 +38,7 @@ use crate::{Error, Options, Tree};
 
 /// A copy of the directory `from` at `to`: the files are copied and not linked, so changing the
 /// copy never changes the database that a checkpoint linked its tables from.
-fn copy_dir(from: &Path, to: &Path) {
+pub(super) fn copy_dir(from: &Path, to: &Path) {
 	fs::create_dir_all(to).unwrap();
 	for entry in fs::read_dir(from).unwrap().flatten() {
 		let target = to.join(entry.file_name());
@@ -52,7 +52,7 @@ fn copy_dir(from: &Path, to: &Path) {
 
 /// A tree of `opts` that holds `KEYS` keys of round 1 in tables, and a checkpoint of it in
 /// `checkpoint`.
-async fn tree_with_checkpoint(opts: &Arc<Options>, checkpoint: &Path) -> Tree {
+pub(super) async fn tree_with_checkpoint(opts: &Arc<Options>, checkpoint: &Path) -> Tree {
 	let tree = Tree::new(Arc::clone(opts)).unwrap();
 	write(&tree, '1', 0..KEYS).await;
 	tree.flush().unwrap();

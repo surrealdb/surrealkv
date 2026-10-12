@@ -329,8 +329,7 @@ fn segment_looks_sealed(path: &Path) -> Result<bool> {
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
 		Err(e) => return Err(e.into()),
 	};
-	Ok(head.get(6) == Some(&(crate::wal::RecordType::SegmentHeader as u8))
-		|| head.get(7..11) == Some(&crate::tde::HEADER_MAGIC[..]))
+	Ok(crate::wal::sealed::starts_like_sealed(&head))
 }
 
 /// Repairs a plaintext segment, see [`repair_corrupted_wal_segment_with`].
