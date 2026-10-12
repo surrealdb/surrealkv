@@ -33,7 +33,7 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 
 ### With synchronous durability
 
-Every commit is flushed to disk before it returns (each figure is a single run).
+Every commit is fully durable and flushed to disk before it returns (each figure is a single run).
 
 | Engine | Point&nbsp;Read&nbsp;(OPS) | Create&nbsp;(OPS) | Update&nbsp;(OPS) | Delete&nbsp;(OPS) | Scan&nbsp;(OPS) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
