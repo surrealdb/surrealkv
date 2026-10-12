@@ -5,7 +5,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use crate::compaction::leveled::Strategy;
-use crate::levels::{validate_wal_log_number, LevelManifest};
+use crate::levels::{validate_wal_log_number, LevelManifest, MANIFEST_TRAILER_LEN};
 use crate::lsm::{Core, CoreInner};
 use crate::test::collect_transaction_all;
 use crate::wal::list_segment_ids;
@@ -5855,7 +5855,8 @@ async fn test_recovery_detects_corrupt_log_number() {
 		// Write corrupted log_number (u64) - set to 999999
 		corrupted.extend_from_slice(&999999u64.to_be_bytes());
 		// Copy rest of the file (last_sequence and beyond)
-		corrupted.extend_from_slice(&data[18..]);
+		corrupted.extend_from_slice(&data[18..data.len() - MANIFEST_TRAILER_LEN]);
+		append_manifest_trailer(&mut corrupted);
 
 		// Write corrupted manifest
 		std::fs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
@@ -5968,7 +5969,8 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 		corrupted.extend_from_slice(&data[0..2]); // version (u16)
 		corrupted.extend_from_slice(&data[2..10]); // next_table_id (u64)
 		corrupted.extend_from_slice(&(max_wal + 100).to_be_bytes()); // corrupted log_number
-		corrupted.extend_from_slice(&data[18..]); // rest of file
+		corrupted.extend_from_slice(&data[18..data.len() - MANIFEST_TRAILER_LEN]); // rest of body
+		append_manifest_trailer(&mut corrupted);
 
 		std::fs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
 	}
@@ -6013,4 +6015,14 @@ async fn test_auto_migration_from_indxdb_dump() {
 	assert!(temp_dir.path().join("_indxdb_backup/indxdb_dump.bin").exists());
 
 	tree.close().await.unwrap();
+}
+
+/// Appends the checksum trailer to the body of a manifest that a test edited, so that the edit
+/// is what is read and not a mismatch of the checksum.
+fn append_manifest_trailer(body: &mut Vec<u8>) {
+	let len = body.len() as u32;
+	let crc = crate::levels::calculate_manifest_crc(body);
+	body.extend_from_slice(&len.to_be_bytes());
+	body.extend_from_slice(&crc.to_be_bytes());
+	body.extend_from_slice(&crate::levels::MANIFEST_TRAILER_MAGIC);
 }
