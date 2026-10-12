@@ -44,7 +44,7 @@ fn context(km: &Arc<SwitchManager>, suite: CipherSuite) -> Arc<EncryptionContext
 
 /// Options of a database in `path` with a memtable that holds a few commits, and a value log, if
 /// there is one, whose files are full after one value.
-fn options(path: &Path, enc: &Arc<EncryptionContext>, vlog: bool) -> Arc<Options> {
+pub(super) fn options(path: &Path, enc: &Arc<EncryptionContext>, vlog: bool) -> Arc<Options> {
 	Arc::new(
 		Options {
 			path: path.to_path_buf(),
@@ -65,7 +65,7 @@ fn options(path: &Path, enc: &Arc<EncryptionContext>, vlog: bool) -> Arc<Options
 /// A tree whose background tasks are stopped, so that nothing is flushed or removed behind the
 /// test's back, and that is marked closed: the test ends it with `crash`. Shared through an `Arc`,
 /// never `Tree::clone`: dropping any clone spawns a close.
-async fn open(opts: Arc<Options>) -> Arc<Tree> {
+pub(super) async fn open(opts: Arc<Options>) -> Arc<Tree> {
 	let tree = Arc::new(Tree::new(opts).unwrap());
 	let tasks = tree.core.task_manager.lock().unwrap().clone().unwrap();
 	tasks.stop().await;

@@ -1602,9 +1602,15 @@ impl Core {
 							repair_corrupted_wal_segment_with(wal_context, wal_path, segment_id)
 						{
 							tracing::error!("Failed to repair WAL segment: {repair_err}");
-							return Err(Error::Other(format!(
-								"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
-							)));
+							return Err(match repair_err {
+								// A key that could not be had, the repair of a sealed segment needs
+								// one, is not a segment that could not be repaired, and may be asked
+								// for again: it keeps its type.
+								Error::Encryption(_) => repair_err,
+								repair_err => Error::Other(format!(
+									"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
+								)),
+							});
 						}
 
 						// Retry after repair
@@ -1620,9 +1626,12 @@ impl Core {
 								)));
 							}
 							Err(retry_err) => {
-								return Err(Error::Other(format!(
-									"{context} failed: WAL replay failed after repair. {retry_err}"
-								)));
+								return Err(match retry_err {
+									Error::Encryption(_) => retry_err,
+									retry_err => Error::Other(format!(
+										"{context} failed: WAL replay failed after repair. {retry_err}"
+									)),
+								});
 							}
 						}
 					}
