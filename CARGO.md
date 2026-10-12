@@ -44,7 +44,25 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 - **Updates**: **199,730 OPS** (**5.43× faster** than RocksDB, **24.5× faster** than SlateDB, **144× faster** than ReDB, and **174× faster** than Fjall) in the `--sync` run (provisional, see above).
 - **Point Reads**: **6.75M OPS** sustained (**5.32× faster** than LMDB, **7.80× faster** than RocksDB, **20.3× faster** than ReDB, and **76.2× faster** than SlateDB).
 - **Deletes**: **253,717 OPS** (**6.80× faster** than RocksDB, **30.9× faster** than SlateDB, **184× faster** than ReDB, and **283× faster** than Fjall), also provisional.
-- **Range Scans**: **1.80× faster** than ReDB, **3.01× faster** than RocksDB, **5.42× faster** than SlateDB, and **10.3× faster** than Fjall via zero-copy iterator merges and block-level restart points. LMDB (**1,007 OPS**) and Libmdbx (**925 OPS**) are faster at scans than SurrealKV (**438 OPS**), by **2.30×** and **2.11×**.
+- **Range Scans**: **1.80× faster** than ReDB, **3.01× faster** than RocksDB, **5.42× faster** than SlateDB, and **10.3× faster** than Fjall via zero-copy iterator merges and block-level restart points. LMDB (**1,007 OPS**) and Libmdbx (**925 OPS**) are faster at scans than SurrealKV (**438 OPS**), by **2.30×** and **2.11×**. See [Scan Profile](#scan-profile) for other kinds of range scan.
+
+### Scan Profile
+
+Range scans over the same dataset, as scans per second: limit and skip scans, and counts over the full key range. These figures are pending and will be filled in once the benchmarks are complete.
+
+| Engine | Limit&nbsp;(OPS) | Keys,&nbsp;Limit&nbsp;(OPS) | Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Keys,&nbsp;Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Full&nbsp;Count&nbsp;(OPS) |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **SurrealKV** | - | - | - | - | - |
+| RocksDB | - | - | - | - | - |
+| SlateDB | - | - | - | - | - |
+| Fjall | - | - | - | - | - |
+| ReDB | - | - | - | - | - |
+| LMDB | - | - | - | - | - |
+| Libmdbx | - | - | - | - | - |
+
+- **Limit**: `select(*) limit(100)` returns the first 100 key-value pairs of the range. **Keys, Limit** (`select(id) limit(100)`) returns only the keys.
+- **Skip + Limit**: `select(*) start(5000) limit(100)` walks and discards 5,000 entries before returning 100. **Keys, Skip + Limit** returns only the keys.
+- **Full Count**: `count()` visits every key in the range.
 
 ### Memory Profile
 
