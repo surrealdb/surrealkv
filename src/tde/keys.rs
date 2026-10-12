@@ -204,7 +204,8 @@ impl SoftwareKeyManager {
 	/// between the processes of one group is how a service is usually deployed. The file is
 	/// opened once and everything is decided from what was opened, and at most
 	/// [`KEY_FILE_MAX_LEN`] bytes of it are read, into memory that is wiped. A file that is not a
-	/// regular file, such as a directory, is refused before it is read.
+	/// regular file, such as a directory or a named pipe, is refused before it is opened, so
+	/// that a pipe is not waited for. A link is the file that it leads to.
 	///
 	/// Fails with `Error::Io` if the file cannot be read, `Error::InvalidArgument` if it is not a
 	/// regular file or can be reached by every user, and `Error::Encryption` with
@@ -334,20 +335,28 @@ fn decode_key(input: &[u8]) -> Result<Zeroizing<[u8; ROOT_KEY_LEN]>, EncryptionE
 	decode_hex(input)
 }
 
+fn not_a_regular_file(path: &Path) -> Error {
+	Error::InvalidArgument(format!("the key file {} is not a regular file", path.display()))
+}
+
 /// Reads the key file at `path`, see `SoftwareKeyManager::from_key_file`.
 fn read_key_file(
 	path: &Path,
 	check_permissions: bool,
 ) -> crate::error::Result<Zeroizing<[u8; ROOT_KEY_LEN]>> {
+	// What the name leads to is looked at before it is opened, because opening a named pipe waits
+	// for whoever writes to it, and a path that was given as a key file must not stop a tool for
+	// good. This is no decision: it can be wrong a moment later, and what is opened is judged
+	// again below.
+	if !std::fs::metadata(path)?.is_file() {
+		return Err(not_a_regular_file(path));
+	}
 	let file = File::open(path)?;
 	// Everything below is decided from what was opened, not from the name, which can be pointed
 	// at another file between two calls.
 	let metadata = file.metadata()?;
 	if !metadata.is_file() {
-		return Err(Error::InvalidArgument(format!(
-			"the key file {} is not a regular file",
-			path.display()
-		)));
+		return Err(not_a_regular_file(path));
 	}
 	#[cfg(unix)]
 	if check_permissions {
@@ -853,6 +862,27 @@ mod tests {
 					"{what}: {err:?}"
 				);
 			}
+		}
+
+		/// A named pipe is not a key file, and is refused without being opened: opening one that
+		/// nobody writes to would wait for good, so this test would not end on code that did.
+		#[cfg(unix)]
+		#[test]
+		fn a_named_pipe_is_refused_and_not_waited_for() {
+			let dir = TempDir::new().unwrap();
+			let path = dir.path().join("pipe.key");
+			let made = std::process::Command::new("mkfifo").arg(&path).status().unwrap();
+			assert!(made.success(), "mkfifo failed: {made}");
+			set_mode(&path, 0o600);
+
+			let err = SoftwareKeyManager::from_key_file(&path).expect_err("a pipe");
+			let Error::InvalidArgument(message) = &err else {
+				panic!("expected InvalidArgument, got {err:?}");
+			};
+			assert!(message.contains("not a regular file"), "{message}");
+			let err = SoftwareKeyManager::from_key_file_ignoring_permissions(&path)
+				.expect_err("a pipe, whatever its permissions are");
+			assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
 		}
 
 		#[test]
