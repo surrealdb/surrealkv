@@ -808,6 +808,10 @@ impl DatabaseCheckpoint {
 		// Verify checkpoint exists and is valid
 		let metadata = self.read_checkpoint_metadata(checkpoint_path)?;
 
+		// Refuse a checkpoint this engine cannot restore before anything is deleted: the restore
+		// replaces the live files and only reads the checkpoint's tables on the next open.
+		crate::migrate::legacy::refuse_legacy_checkpoint(checkpoint_path, &self.core.opts)?;
+
 		// Everything the restore needs is read before anything of the database is removed
 		self.validate_checkpoint(checkpoint_path)?;
 
@@ -926,6 +930,20 @@ impl DatabaseCheckpoint {
 			return Err(unusable(format!(
 				"its tables point into the value log, which has no file {oldest}"
 			)));
+		}
+
+		// A tree opened without a value log cannot read a pointer, and the restore would copy the
+		// files in and report success while every such read failed until the directory was
+		// opened again. A table that names no file but may point into the log counts as one that
+		// does, see `Table::vlog_pointers_unknown`.
+		let points_into_the_log =
+			oldest > 0 || levels.iter().any(|table| table.vlog_pointers_unknown);
+		if points_into_the_log && self.core.vlog.is_none() {
+			return Err(unusable(
+				"its tables hold values in a value log, and this tree was opened without one: \
+				 open it with the value log enabled and restore the checkpoint again"
+					.to_string(),
+			));
 		}
 
 		Ok(())

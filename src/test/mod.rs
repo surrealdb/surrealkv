@@ -88,6 +88,8 @@ pub mod encryption_typed_errors_tests;
 pub mod failed_open_tests;
 #[cfg(test)]
 pub mod flusher_alloc_diet_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod format_gate_tests;
 #[cfg(test)]
 pub mod group_fail_stop_edge_tests;
 #[cfg(test)]
@@ -100,6 +102,8 @@ pub mod inspect_encryption_tests;
 pub mod iterator_semantics_tests;
 #[cfg(test)]
 pub mod iterator_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod legacy_migration_tests;
 #[cfg(test)]
 pub mod level_order_crash_tests;
 #[cfg(test)]
@@ -138,6 +142,8 @@ pub mod restore_concurrency_tests;
 pub mod retire_free_tests;
 #[cfg(test)]
 pub mod retire_isolation_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod rocksdb_migration_tests;
 #[cfg(test)]
 pub mod rotate_vlog_order_tests;
 #[cfg(test)]
@@ -162,6 +168,10 @@ pub mod tde_tests;
 pub mod transaction_tests;
 #[cfg(test)]
 pub mod tree_builder_encryption_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod value_location_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod versioning_tests;
 #[cfg(test)]
 pub mod vlog_floor_tests;
 #[cfg(test)]

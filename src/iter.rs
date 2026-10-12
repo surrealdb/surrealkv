@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::error::{Error, Result};
+use crate::vlog::ValueLocation;
 use crate::{Comparator, InternalKey, InternalKeyRef, Key, LSMIterator, Value};
 
 // ============================================================================
@@ -659,7 +660,9 @@ impl LSMIterator for MergingIterator<'_> {
 // versioning=true, retention=1hour:
 //   ("apple", seq=100, age=0)      → keep (latest)
 //   ("apple", seq=50,  age=30min)  → keep (within retention)
-//   ("apple", seq=20,  age=2hours) → discard (outside retention)
+//   ("apple", seq=20,  age=2hours) → keep (the newest older than the period: what a read at
+//                                    the start of the period sees)
+//   ("apple", seq=10,  age=3hours) → discard (outside retention, and not that version)
 // ```
 //
 
@@ -690,6 +693,96 @@ impl LSMIterator for MergingIterator<'_> {
 ///                    │   (deduplicated)    │
 ///                    └─────────────────────┘
 /// ```
+/// The version a read at `since` sees, among the `versions` of a key, which are newest write
+/// first, for a reader at sequence number `bound`: the one with the newest timestamp before
+/// `since`, and the newest write among those of that timestamp.
+///
+/// The reader sees what was written at or before it. A range deletion it sees, of which
+/// `range_deletes` are the sequence numbers of those that cover the key, hides what was written
+/// before it. A barrier it sees hides what is written before the barrier: a hard delete is not a
+/// version and ends the search, and a replace is one that does. `unknown` are the versions whose
+/// time is only known to be at least what `times` says.
+fn history_base(
+	versions: &[(InternalKey, Value)],
+	since: u64,
+	times: &[u64],
+	unknown: &[bool],
+	bound: u64,
+	range_deletes: &[u64],
+) -> Option<usize> {
+	let mut base: Option<(u64, usize)> = None;
+	for (idx, (key, _)) in versions.iter().enumerate() {
+		let seq = key.seq_num();
+		if seq > bound || range_deletes.iter().any(|&rseq| rseq > seq && rseq <= bound) {
+			continue;
+		}
+		let kind = key.kind();
+		if matches!(kind, crate::InternalKeyKind::Delete | crate::InternalKeyKind::RangeDelete) {
+			break;
+		}
+		let ts = times[idx];
+		// Newest write first, so a version of the same timestamp as the best is not newer. One
+		// whose time is not known is kept for being in the period, and is no one's base.
+		if !unknown[idx] && ts < since && base.is_none_or(|(best, _)| ts > best) {
+			base = Some((ts, idx));
+		}
+		if kind == crate::InternalKeyKind::Replace {
+			break;
+		}
+	}
+	base.map(|(_, idx)| idx)
+}
+
+/// The encoded value of a version that was written without a time, stamped with `time`, or `None`
+/// if it cannot be: the value is not one that this engine encoded.
+///
+/// A version without a time reads as written when the versions before it were, so what it reads
+/// at changes if a compaction drops them. At the bottom level every older version is read, the
+/// time it reads at is known, and it is made the version's own: a later compaction can then drop
+/// what it was inferred from and read the same.
+fn stamp_value(kind: crate::InternalKeyKind, value: &[u8], time: u64) -> Option<Value> {
+	if kind == crate::InternalKeyKind::SoftDelete && value.is_empty() {
+		// A soft delete of a tree that was not versioned has no value at all
+		let mut stamped = Vec::with_capacity(2 + crate::vlog::VALUE_TIMESTAMP_SIZE);
+		stamped.extend_from_slice(&[
+			crate::vlog::BIT_HAS_TIMESTAMP,
+			crate::vlog::VALUE_LOCATION_VERSION,
+		]);
+		stamped.extend_from_slice(&time.to_be_bytes());
+		return Some(stamped);
+	}
+	ValueLocation::decode(value).ok().map(|location| location.with_timestamp(Some(time)).encode())
+}
+
+/// Which versions of a key a compaction keeps, beyond the ones that readers can see.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum History {
+	/// The versions readers can see, and no more: the newest, and what a snapshot reads.
+	Latest,
+	/// Every version, for a versioned tree that keeps its history for ever.
+	All,
+	/// The versions written at or after a time, and the newest one before it: what a read at
+	/// that time sees. For a versioned tree that keeps its history for a period.
+	Since(u64),
+}
+
+/// Buffers that `CompactionIterator::decide_history` fills for each key, kept between keys so
+/// that deciding what history holds costs no allocation once they have grown.
+#[derive(Default)]
+struct HistoryScratch {
+	hidden: Vec<bool>,
+	stamps: Vec<Option<u64>>,
+	times: Vec<u64>,
+	unknown: Vec<bool>,
+	range_deletes: Vec<u64>,
+	events: Vec<u64>,
+	bounds: Vec<u64>,
+	bases: Vec<usize>,
+	/// The time to stamp each sorted version with, if it is kept: set for a version without one
+	/// when the compaction reads every version older than it, see `stamp_value`.
+	restamp: Vec<Option<u64>>,
+}
+
 pub(crate) struct CompactionIterator<'a> {
 	/// The underlying merge iterator that provides sorted input.
 	merge_iter: MergingIterator<'a>,
@@ -749,8 +842,26 @@ pub(crate) struct CompactionIterator<'a> {
 	/// Scratch space: whether each of the sorted versions of the current key is kept.
 	keep: Vec<bool>,
 
+	/// Scratch space: whether a period of history holds each of the sorted versions of the
+	/// current key, see `decide_history`. Empty for a key of one version, or without history.
+	retained: Vec<bool>,
+
+	/// Scratch space: whether a range deletion hides each of the sorted versions of the key.
+	covered: Vec<bool>,
+
+	/// Scratch space of `decide_history`.
+	scratch: HistoryScratch,
+
 	/// Active range tombstones accumulated during compaction: (start_key, end_key, seq_num)
 	active_range_deletions: Vec<(Key, Key, u64)>,
+
+	/// Range deletions of tables the compaction does not read. They are not the compaction's to
+	/// drop or to carry, but a reader reads them, so they decide which versions of a key that it
+	/// reads are history: they are only looked at to choose the versions a period keeps.
+	history_range_deletions: Vec<(Key, Key, u64)>,
+
+	/// The history of a key that is kept, see [`History`].
+	history: History,
 }
 
 impl<'a> CompactionIterator<'a> {
@@ -784,8 +895,19 @@ impl<'a> CompactionIterator<'a> {
 			snapshots,
 			horizon,
 			keep: Vec::new(),
+			retained: Vec::new(),
+			covered: Vec::new(),
+			scratch: HistoryScratch::default(),
 			active_range_deletions: Vec::new(),
+			history_range_deletions: Vec::new(),
+			history: History::Latest,
 		}
+	}
+
+	/// Keeps the history of every key as `history` says, as well as what readers can see.
+	pub(crate) fn with_history(mut self, history: History) -> Self {
+		self.history = history;
+		self
 	}
 
 	/// A compaction iterator for input that is entirely published.
@@ -797,6 +919,16 @@ impl<'a> CompactionIterator<'a> {
 		snapshots: Vec<u64>,
 	) -> Self {
 		Self::new(iterators, cmp, is_bottom_level, snapshots, u64::MAX)
+	}
+
+	/// Sets the range deletions of tables that this compaction does not read, see
+	/// `history_range_deletions`.
+	pub(crate) fn with_history_range_deletions(
+		mut self,
+		range_deletions: Vec<(Key, Key, u64)>,
+	) -> Self {
+		self.history_range_deletions = range_deletions;
+		self
 	}
 
 	pub(crate) fn with_range_deletions(mut self, range_deletions: Vec<(Key, Key, u64)>) -> Self {
@@ -1089,7 +1221,19 @@ impl<'a> CompactionIterator<'a> {
 		// The sequence number and visibility of the previous (newer) version.
 		let mut newer: Option<(u64, SnapshotVisibility)> = None;
 
-		for (key, _) in &versions {
+		// What a period of history holds. A key of one version is its newest: it is kept, as it
+		// is exposed, and there is nothing to decide.
+		let mut retained = std::mem::take(&mut self.retained);
+		retained.clear();
+		self.scratch.restamp.clear();
+		self.scratch.hidden.clear();
+		if self.history != History::Latest && versions.len() > 1 {
+			self.decide_history(&versions, &mut retained);
+		}
+		let mut covered_flags = std::mem::take(&mut self.covered);
+		covered_flags.clear();
+
+		for (idx, (key, _)) in versions.iter().enumerate() {
 			let seq_num = key.seq_num();
 			let visibility = self.find_earliest_visible_snapshot(seq_num)?;
 
@@ -1111,8 +1255,46 @@ impl<'a> CompactionIterator<'a> {
 			let covered = key.kind() != crate::InternalKeyKind::RangeDelete
 				&& self.is_covered_by_range(&key.user_key, seq_num);
 
-			keep.push(!covered && (exposed || required));
+			let kind = key.kind();
+			let barrier = matches!(
+				kind,
+				crate::InternalKeyKind::Delete
+					| crate::InternalKeyKind::RangeDelete
+					| crate::InternalKeyKind::Replace
+			);
+			let retained = retained.get(idx).copied().unwrap_or(false);
+			// A barrier that is dropped shows what is below it, in the tables that this
+			// compaction does not read, as history again: it stays where there is anything below.
+			// (one that a newer barrier hides from every reader is not read, and what is kept of
+			// what lies below it is decided by the rule that follows)
+			let hidden_barrier = self.scratch.hidden.get(idx).copied().unwrap_or(false);
+			let barrier_kept = self.history != History::Latest
+				&& barrier
+				&& !self.is_bottom_level
+				&& !hidden_barrier;
+
+			keep.push(!covered && (exposed || required || retained || barrier_kept));
+			covered_flags.push(covered);
 			newer = Some((seq_num, visibility));
+		}
+
+		// A barrier stays for as long as a version below it is kept, whichever rule kept that
+		// version: a snapshot that reads it, or a period of history that holds it. Without the
+		// barrier the readers above it would see what it hides.
+		if self.history != History::Latest {
+			let mut kept_below = false;
+			for (idx, (key, _)) in versions.iter().enumerate().rev() {
+				let barrier = matches!(
+					key.kind(),
+					crate::InternalKeyKind::Delete
+						| crate::InternalKeyKind::RangeDelete
+						| crate::InternalKeyKind::Replace
+				);
+				if barrier && kept_below && !keep[idx] && !covered_flags[idx] {
+					keep[idx] = true;
+				}
+				kept_below |= keep[idx];
+			}
 		}
 
 		// At the bottom level nothing lies below, so a delete that is the oldest version kept
@@ -1131,8 +1313,13 @@ impl<'a> CompactionIterator<'a> {
 		}
 
 		// Entries are moved out of the batch; kept ones go to output_versions.
-		for (entry, kept) in versions.drain(..).zip(keep.iter().copied()) {
+		for (idx, (mut entry, kept)) in versions.drain(..).zip(keep.iter().copied()).enumerate() {
 			if kept {
+				if let Some(Some(time)) = self.scratch.restamp.get(idx).copied() {
+					if let Some(stamped) = stamp_value(entry.0.kind(), &entry.1, time) {
+						entry.1 = stamped;
+					}
+				}
 				self.output_versions.push_back(entry);
 			}
 		}
@@ -1141,7 +1328,187 @@ impl<'a> CompactionIterator<'a> {
 		// versions.
 		self.accumulated_versions = versions;
 		self.keep = keep;
+		self.retained = retained;
+		self.covered = covered_flags;
 		Ok(())
+	}
+
+	/// Decides which of the `versions` of a key, which are newest first, a period of history
+	/// holds, and sets `retained` to one flag for each.
+	///
+	/// A hard delete or a replace hides what is below it from `history`, so a version below one
+	/// is not history, for the readers that read the barrier. A reader whose sequence number is
+	/// below the barrier's still has the version in its history, and so does one that reads at
+	/// the horizon when the barrier is above it: only the closest barrier above a version
+	/// matters, as a snapshot that lies below a farther one lies below the nearer as well, or
+	/// reads the nearer first.
+	///
+	/// With `History::All` everything that is not hidden is held. With `History::Since` that is
+	/// what was written at or after the time the period starts at, and the version a read at that
+	/// time sees, for every reader there is: the readers that read the newest versions, one at the
+	/// horizon, and each snapshot, which sees only the versions written at or before it, and the
+	/// range deletions at or before it, so the newest in time of what it sees is not always the
+	/// same one.
+	fn decide_history(&mut self, versions: &[(InternalKey, Value)], retained: &mut Vec<bool>) {
+		let mut sc = std::mem::take(&mut self.scratch);
+		let is_barrier = |kind: crate::InternalKeyKind| {
+			matches!(
+				kind,
+				crate::InternalKeyKind::Delete
+					| crate::InternalKeyKind::RangeDelete
+					| crate::InternalKeyKind::Replace
+			)
+		};
+
+		sc.hidden.clear();
+		let mut closest_barrier: Option<u64> = None;
+		for (key, _) in versions {
+			let seq = key.seq_num();
+			sc.hidden.push(
+				closest_barrier.is_some_and(|barrier| {
+					barrier <= self.horizon && !self.snapshot_in(seq, barrier)
+				}),
+			);
+			if is_barrier(key.kind()) {
+				closest_barrier = Some(seq);
+			}
+		}
+		retained.extend(sc.hidden.iter().map(|hidden| !hidden));
+
+		if let History::Since(since) = self.history {
+			// The range deletions that cover this key, whichever table they are in: a reader
+			// reads them all, so what they hide is not history for it.
+			sc.range_deletes.clear();
+			let user_key = versions[0].0.user_key.as_slice();
+			sc.range_deletes.extend(
+				self.active_range_deletions
+					.iter()
+					.chain(self.history_range_deletions.iter())
+					.filter(|(start, end, _)| {
+						user_key >= start.as_slice() && user_key < end.as_slice()
+					})
+					.map(|(_, _, rseq)| *rseq),
+			);
+			// The same range deletion is in every table that a compaction wrote it to
+			sc.range_deletes.sort_unstable();
+			sc.range_deletes.dedup();
+
+			// The time of each version: what it was stamped with, or, for one written while the
+			// tree was not versioned, that of the versions written before it that a reader of it
+			// reads.
+			sc.stamps.clear();
+			sc.stamps.extend(
+				versions.iter().map(|(key, value)| ValueLocation::entry_time(key.kind(), value)),
+			);
+			if sc.range_deletes.is_empty() {
+				ValueLocation::infer_times_into(
+					versions.len(),
+					|idx| (sc.stamps[idx], is_barrier(versions[idx].0.kind())),
+					&mut sc.times,
+				);
+			} else {
+				// A range deletion that a reader of the version reads hides what is written
+				// before it from the reader, so it hides it from the inference as well.
+				sc.times.clear();
+				for idx in 0..versions.len() {
+					let time = match sc.stamps[idx] {
+						Some(time) => time,
+						// A barrier takes what is written before it away before it is given a
+						// time, so one without a time reads at 0, and the time of a hard delete
+						// is never used
+						None if is_barrier(versions[idx].0.kind()) => 0,
+						None => {
+							let reader = versions[idx].0.seq_num();
+							let mut newest = 0u64;
+							for older in (idx + 1..versions.len()).rev() {
+								let seq = versions[older].0.seq_num();
+								if sc.range_deletes.iter().any(|&rseq| rseq > seq && rseq <= reader)
+								{
+									continue;
+								}
+								if is_barrier(versions[older].0.kind()) {
+									newest = 0;
+								}
+								if let Some(time) = sc.stamps[older] {
+									newest = newest.max(time);
+								}
+							}
+							newest
+						}
+					};
+					sc.times.push(time);
+				}
+			}
+
+			// A version without a time is given that of the versions written before it, and a
+			// compaction above the bottom level does not read all of them: the time is not less
+			// than what it makes of it, and can be any more.
+			sc.unknown.clear();
+			let bottom = self.is_bottom_level;
+			sc.unknown.extend(sc.stamps.iter().zip(versions).map(|(stamp, (key, _))| {
+				!bottom
+					&& stamp.is_none()
+					&& !matches!(
+						key.kind(),
+						crate::InternalKeyKind::Delete | crate::InternalKeyKind::RangeDelete
+					)
+			}));
+
+			// Two readers between the same two events see the same, so one stands for both: of
+			// the events (a version, or a range deletion that covers the key), those that a
+			// reader reads exactly up to. The readers are the newest versions, the horizon and
+			// the snapshots.
+			sc.events.clear();
+			sc.events.extend(versions.iter().map(|(key, _)| key.seq_num()));
+			sc.events.extend(sc.range_deletes.iter().copied());
+			sc.events.sort_unstable();
+			sc.events.dedup();
+			sc.bounds.clear();
+			for (at, &event) in sc.events.iter().enumerate() {
+				let read = match sc.events.get(at + 1) {
+					None => true,
+					Some(&next) => {
+						self.snapshot_in(event, next)
+							|| (event <= self.horizon && self.horizon < next)
+					}
+				};
+				if read {
+					sc.bounds.push(event);
+				}
+			}
+			sc.bases.clear();
+			for &bound in &sc.bounds {
+				if let Some(base) =
+					history_base(versions, since, &sc.times, &sc.unknown, bound, &sc.range_deletes)
+				{
+					sc.bases.push(base);
+				}
+			}
+
+			// At the bottom level every older version is read, and the time of a version without
+			// one is known: it is stamped if it is kept.
+			sc.restamp.clear();
+			if self.is_bottom_level {
+				sc.restamp.extend(sc.stamps.iter().zip(&sc.times).zip(versions).map(
+					|((stamp, time), (key, _))| {
+						(stamp.is_none()
+							&& matches!(
+								key.kind(),
+								crate::InternalKeyKind::Set
+									| crate::InternalKeyKind::SoftDelete
+									| crate::InternalKeyKind::Replace
+							))
+						.then_some(*time)
+					},
+				));
+			}
+
+			for (idx, kept) in retained.iter_mut().enumerate() {
+				*kept =
+					*kept && (sc.times[idx] >= since || sc.unknown[idx] || sc.bases.contains(&idx));
+			}
+		}
+		self.scratch = sc;
 	}
 
 	/// Advance to the next output entry.

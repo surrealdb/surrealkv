@@ -33,7 +33,13 @@ pub const VALUE_POINTER_SIZE: usize = 25;
 
 /// Bit flags for meta operations
 pub const BIT_VALUE_POINTER: u8 = 1; // Set if the value is NOT stored directly next to key
+/// Set if an 8-byte big-endian timestamp follows the version byte. The timestamp is the
+/// version's own time (a commit time, or one the caller chose with `set_at`), kept with the value
+/// so that the internal key stays flat. Absent from entries written without one.
+pub const BIT_HAS_TIMESTAMP: u8 = 2;
 pub const VALUE_LOCATION_VERSION: u8 = 1;
+/// Size of the timestamp that follows the version byte when `BIT_HAS_TIMESTAMP` is set.
+pub(crate) const VALUE_TIMESTAMP_SIZE: usize = 8;
 pub const VALUE_POINTER_VERSION: u8 = 1;
 
 /// VLog file header with comprehensive metadata
@@ -211,23 +217,109 @@ impl VLogFileHeader {
 }
 /// ValueLocation represents the value info that can be associated with a key,
 /// including the internal Meta field for various flags and operations.
+///
+/// Encoded layout: `meta (1) | version (1) | timestamp (8, only if BIT_HAS_TIMESTAMP) | value`.
+/// Every reader of encoded bytes goes through this type (`decode`, `peek_pointer_payload`,
+/// `peek_timestamp`) so that the optional timestamp never shifts a payload offset by accident.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ValueLocation {
-	/// Meta flags for various operations (value pointer etc.)
+	/// Meta flags for various operations (value pointer etc.). `BIT_HAS_TIMESTAMP` is never
+	/// kept here: it is implied by `timestamp` and set on encode.
 	pub meta: u8,
 	/// The actual value data
 	pub value: Value,
 	/// Version number for the value
 	pub version: u8,
+	/// The version's own timestamp, if it was stored with one
+	pub timestamp: Option<u64>,
 }
 
 impl ValueLocation {
 	/// Creates a new ValueLocation
 	pub(crate) fn new(meta: u8, value: Value, version: u8) -> Self {
 		Self {
-			meta,
+			meta: meta & !BIT_HAS_TIMESTAMP,
 			value,
 			version,
+			timestamp: None,
+		}
+	}
+
+	/// Sets the timestamp stored with the value.
+	pub(crate) fn with_timestamp(mut self, timestamp: Option<u64>) -> Self {
+		self.timestamp = timestamp;
+		self
+	}
+
+	/// Length of the header of an encoded ValueLocation with this meta byte: everything before
+	/// the value.
+	fn header_len(meta: u8) -> usize {
+		if meta & BIT_HAS_TIMESTAMP != 0 {
+			2 + VALUE_TIMESTAMP_SIZE
+		} else {
+			2
+		}
+	}
+
+	/// The time a version was written at, from the encoded value of the entry of a key of kind
+	/// `kind`: the timestamp stored with it, or `None` for what has none. A version written
+	/// while the tree was not versioned has none, and neither has a hard delete, which is a
+	/// barrier and not a version. The value of a range delete is its end key, not an encoded
+	/// value, so it is never read for one.
+	pub(crate) fn entry_time(kind: crate::InternalKeyKind, encoded_value: &[u8]) -> Option<u64> {
+		if matches!(kind, crate::InternalKeyKind::RangeDelete | crate::InternalKeyKind::Delete) {
+			return None;
+		}
+		Self::peek_timestamp(encoded_value)
+	}
+
+	/// The times of the versions of a key, which are given newest write first as the time each was
+	/// stamped with, if it was, and whether it is a barrier (a hard delete or a replace).
+	///
+	/// A version that has no time was written while the tree was not versioned, between versions
+	/// that have: it reads as written at the newest time of the versions written before it, so as
+	/// after them and at the same time as the latest of them. A tree that was versioned, then not,
+	/// then versioned again, reads what it was written without versioning as the newest writes,
+	/// and a database that never was reads it as written at 0. Nothing below a barrier counts.
+	pub(crate) fn infer_times(versions: &[(Option<u64>, bool)]) -> Vec<u64> {
+		let mut times = Vec::new();
+		Self::infer_times_into(versions.len(), |idx| versions[idx], &mut times);
+		times
+	}
+
+	/// As `infer_times`, for `count` versions given by `version`, into `times`, whose capacity is
+	/// reused.
+	pub(crate) fn infer_times_into(
+		count: usize,
+		version: impl Fn(usize) -> (Option<u64>, bool),
+		times: &mut Vec<u64>,
+	) {
+		times.clear();
+		times.resize(count, 0);
+		let mut newest = 0u64;
+		for idx in (0..count).rev() {
+			let (stamp, barrier) = version(idx);
+			if barrier {
+				newest = 0;
+			}
+			times[idx] = match stamp {
+				Some(time) => {
+					newest = newest.max(time);
+					time
+				}
+				None => newest,
+			};
+		}
+	}
+
+	/// Returns the timestamp of an ENCODED ValueLocation, if it carries one.
+	pub(crate) fn peek_timestamp(data: &[u8]) -> Option<u64> {
+		match data.first() {
+			Some(meta) if meta & BIT_HAS_TIMESTAMP != 0 => {
+				let bytes = data.get(2..2 + VALUE_TIMESTAMP_SIZE)?;
+				Some(u64::from_be_bytes(bytes.try_into().ok()?))
+			}
+			_ => None,
 		}
 	}
 
@@ -249,18 +341,25 @@ impl ValueLocation {
 
 	/// Returns the pointer payload of an ENCODED ValueLocation when its meta
 	/// byte has the value-pointer bit set, without copying the value bytes.
-	/// Layout: meta (1 byte), version (1 byte), value.
+	/// Layout: meta (1 byte), version (1 byte), timestamp (8 bytes, if the meta byte says so),
+	/// value. The payload starts after the timestamp, so a pointer is found whether or not the
+	/// entry carries one.
 	pub(crate) fn peek_pointer_payload(data: &[u8]) -> Option<&[u8]> {
 		match data.first() {
-			Some(meta) if meta & BIT_VALUE_POINTER != 0 => data.get(2..),
+			Some(&meta) if meta & BIT_VALUE_POINTER != 0 => data.get(Self::header_len(meta)..),
 			_ => None,
 		}
 	}
 
 	/// Calculates the encoded size of this ValueLocation
 	pub(crate) fn encoded_size(&self) -> usize {
-		// meta (1 byte) + version (1 byte) + value length
-		1 + 1 + self.value.len()
+		// meta (1 byte) + version (1 byte) + optional timestamp + value length
+		let timestamp = if self.timestamp.is_some() {
+			VALUE_TIMESTAMP_SIZE
+		} else {
+			0
+		};
+		1 + 1 + timestamp + self.value.len()
 	}
 
 	/// Encodes the ValueLocation into a byte vector
@@ -272,11 +371,21 @@ impl ValueLocation {
 
 	/// Encodes the ValueLocation into a writer
 	pub(crate) fn encode_into<W: Write>(&self, writer: &mut W) -> Result<()> {
-		// Write meta byte
-		writer.write_all(&[self.meta])?;
+		// Write meta byte, with the timestamp bit set exactly when a timestamp follows
+		let meta = if self.timestamp.is_some() {
+			self.meta | BIT_HAS_TIMESTAMP
+		} else {
+			self.meta & !BIT_HAS_TIMESTAMP
+		};
+		writer.write_all(&[meta])?;
 
 		// Write version as u8
 		writer.write_all(&[self.version])?;
+
+		// Write the timestamp
+		if let Some(timestamp) = self.timestamp {
+			writer.write_all(&timestamp.to_be_bytes())?;
+		}
 
 		// Write value
 		writer.write_all(&self.value)?;
@@ -302,11 +411,25 @@ impl ValueLocation {
 		reader.read_exact(&mut version_buf)?;
 		let version = version_buf[0];
 
+		// Read the timestamp
+		let timestamp = if meta & BIT_HAS_TIMESTAMP != 0 {
+			let mut timestamp_buf = [0u8; VALUE_TIMESTAMP_SIZE];
+			reader.read_exact(&mut timestamp_buf).map_err(|_| {
+				Error::Corruption(
+					"a value location says it has a timestamp but is too short to hold it"
+						.to_string(),
+				)
+			})?;
+			Some(u64::from_be_bytes(timestamp_buf))
+		} else {
+			None
+		};
+
 		// Read remaining data as value
 		let mut value = Vec::new();
 		reader.read_to_end(&mut value)?;
 
-		Ok(Self::new(meta, value, version))
+		Ok(Self::new(meta, value, version).with_timestamp(timestamp))
 	}
 
 	/// Resolves the actual value, returning inline bytes directly or fetching from VLog.

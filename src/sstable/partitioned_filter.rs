@@ -13,7 +13,7 @@
 //! drains them into finished filter bits at every index-partition cut, so
 //! builder memory is O(one partition) regardless of file size.
 //!
-//! ## On-disk layout (all inside the existing LSMV1 container)
+//! ## On-disk layout (all inside the existing LSMV1/LSMV2 container)
 //!
 //! ```text
 //! [data blocks...]

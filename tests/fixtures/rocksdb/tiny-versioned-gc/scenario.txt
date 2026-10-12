@@ -1,0 +1,3 @@
+30 keys, versioned, history trimmed by full_history_ts_low and a bottommost compaction (test fixture)
+versioned=true
+keys=30

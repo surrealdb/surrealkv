@@ -1473,9 +1473,6 @@ impl CompactionOperations for CoreInner {
 		let compactor = Compactor::new(options, strategy);
 		compactor.compact()?;
 
-		// // Clean deleted versions from versioned index after compaction
-		// self.clean_expired_versions()?;
-
 		Ok(())
 	}
 
@@ -2239,25 +2236,36 @@ impl Tree {
 		opts.validate()?;
 
 		// Fail before anything is created or moved if a restore into the directory did not
-		// finish, or if it holds database files but no usable manifest. These must stay ahead
-		// of the migrations, the directory creation and the lock file.
+		// finish. This must stay ahead of the migrations, the directory creation and the lock
+		// file.
 		crate::checkpoint::check_restore_finished(&opts)?;
 
 		// Whether the database is encrypted is read from its manifest, and the key checked by
 		// opening it, before anything is created or moved. This writes nothing: an encrypted
 		// database that is new writes its first manifest, sealed, before any other file.
 		let opts = crate::levels::resolve_encryption(opts)?;
+
+		// A RocksDB database written by SurrealDB is migrated next, and a migration that was
+		// interrupted is finished or undone: it has to come before anything looks for a manifest,
+		// which a RocksDB directory does not have.
+		if let Some(report) = crate::migrate::rocksdb::migrate_if_needed(&opts)? {
+			tracing::info!("migrated a RocksDB database: {report:?}");
+		}
+
+		// Fail before anything is created or moved if the directory holds database files
+		// but no usable manifest. This must stay ahead of the other migrations, the directory
+		// creation and the lock file.
 		check_manifest_before_open(&opts)?;
 
-		// If the path contains an existing RocksDB database, automatically migrate it in pure Rust
-		if surrealkv_compat_rocksdb::is_rocksdb_dir(&opts.path) {
-			Self::migrate_from_rocksdb(&opts)?;
+		// A database written by SurrealKV v0.x is migrated to the current format before
+		// anything else reads it, with every version and timestamp it holds.
+		if let Some(report) = crate::migrate::legacy::migrate_if_needed(&opts)? {
+			tracing::info!("migrated a SurrealKV v0.x database: {report:?}");
 		}
 
-		// If the path contains an existing SurrealKV v1 database, automatically migrate it
-		if surrealkv_compat_v1::is_v1_dir(&opts.path) {
-			Self::migrate_from_v1(&opts)?;
-		}
+		// Values that live in the value log can only be read with it. A directory that holds
+		// value-log files holds such values, whatever the options of this open say.
+		let opts = Self::opts_with_existing_value_log(opts)?;
 
 		// If the path contains an existing IndexedDB dump or store, automatically migrate it
 		if surrealkv_compat_indxdb::is_indxdb_dump_dir(&opts.path) {
@@ -2267,8 +2275,17 @@ impl Tree {
 		// Create all required directory structure
 		Self::create_directory_structure(&opts)?;
 
-		// Create the core LSM tree components
-		let core = Core::new(Arc::clone(&opts))?;
+		// Create the core LSM tree components. A manifest that says it is current but lists a
+		// table in the legacy layout can only come from a migration whose marker was lost: finish
+		// it, then try again.
+		let core = match Core::new(Arc::clone(&opts)) {
+			Err(Error::LegacyFormat(_))
+				if crate::migrate::legacy::migrate_forced(&opts)?.is_some() =>
+			{
+				Core::new(Arc::clone(&opts))?
+			}
+			other => other?,
+		};
 
 		// Ensure directory changes are persisted
 		sync_directory_structure(&opts)?;
@@ -2282,7 +2299,10 @@ impl Tree {
 	/// migration moves the old files into a backup directory inside this one, so that a copy of the
 	/// old database stays there in the clear, and writes what it migrates without the key. It is
 	/// refused before anything is read or moved.
-	fn refuse_migration_into_an_encrypted_database(opts: &Options, source: &str) -> Result<()> {
+	pub(crate) fn refuse_migration_into_an_encrypted_database(
+		opts: &Options,
+		source: &str,
+	) -> Result<()> {
 		if opts.key_manager.is_some() || opts.encryption_context().is_some() {
 			return Err(Error::InvalidArgument(format!(
 				"A {source} database cannot be migrated into an encrypted database: the migration \
@@ -2293,168 +2313,29 @@ impl Tree {
 		Ok(())
 	}
 
-	/// Automatically migrates an existing RocksDB database to SurrealKV v2 format in pure Rust.
-	fn migrate_from_rocksdb(opts: &Options) -> Result<()> {
-		Self::refuse_migration_into_an_encrypted_database(opts, "RocksDB")?;
-		tracing::info!("Detected existing RocksDB database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
-		let records = surrealkv_compat_rocksdb::read_all_latest(&opts.path).map_err(|e| {
-			Error::Other(format!("Failed to read RocksDB database for migration: {e}"))
-		})?;
-
-		tracing::info!(
-			"Read {} live records from RocksDB. Creating backup and migrating...",
-			records.len()
+	/// Returns `opts` with the value log enabled if the directory already holds value-log files.
+	/// Pointers into them would otherwise fail to resolve, and the files would never be collected.
+	fn opts_with_existing_value_log(opts: Arc<Options>) -> Result<Arc<Options>> {
+		if opts.enable_vlog {
+			return Ok(opts);
+		}
+		let has_files = match std::fs::read_dir(opts.vlog_dir()) {
+			Ok(entries) => {
+				entries.flatten().any(|e| e.path().extension().is_some_and(|ext| ext == "vlog"))
+			}
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+			Err(e) => return Err(e.into()),
+		};
+		if !has_files {
+			return Ok(opts);
+		}
+		tracing::warn!(
+			"{:?} holds value-log files, so the value log is enabled although the options disable it",
+			opts.path
 		);
-
-		// Create backup directory
-		let backup_dir = opts.path.join("_rocksdb_backup");
-		create_dir_all(&backup_dir)?;
-
-		// Move all RocksDB legacy files into backup
-		if let Ok(entries) = std::fs::read_dir(&opts.path) {
-			for entry in entries.flatten() {
-				let p = entry.path();
-				let name = entry.file_name().to_string_lossy().to_string();
-				if name == "_rocksdb_backup" {
-					continue;
-				}
-				// RocksDB files: CURRENT, MANIFEST-*, OPTIONS-*, IDENTITY, LOCK, *.sst, *.log,
-				// *.dbtmp
-				if name.starts_with("MANIFEST-")
-					|| name.starts_with("OPTIONS-")
-					|| name == "CURRENT"
-					|| name == "IDENTITY"
-					|| name == "LOCK"
-					|| name.ends_with(".sst")
-					|| name.ends_with(".log")
-					|| name.ends_with(".dbtmp")
-				{
-					let dest = backup_dir.join(&name);
-					let _ = std::fs::rename(&p, dest);
-				}
-			}
-		}
-
-		// Now initialize directory structure
-		Self::create_directory_structure(opts)?;
-
-		if !records.is_empty() {
-			let table_id = 1;
-			let sst_path = opts.sstable_file_path(table_id);
-			let file = std::fs::File::create(&sst_path)?;
-			let opts_arc = Arc::new(opts.clone());
-			let mut writer =
-				crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&opts_arc), 0);
-
-			let mut last_seq = 0u64;
-			for (k, v) in records {
-				last_seq += 1;
-				let ikey = crate::InternalKey::new(k, last_seq, crate::InternalKeyKind::Set);
-				let val_encoded = crate::vlog::ValueLocation::with_inline_value(v).encode();
-				writer.add(ikey, &val_encoded)?;
-			}
-			let file_size = writer.finish()? as u64;
-
-			// Write manifest
-			let file: Arc<dyn crate::vfs::File> = Arc::new(std::fs::File::open(&sst_path)?);
-			let table = Arc::new(crate::sstable::table::Table::new(
-				table_id,
-				Arc::clone(&opts_arc),
-				file,
-				file_size,
-			)?);
-
-			let mut manifest = crate::levels::LevelManifest::new(Arc::clone(&opts_arc))?;
-			manifest.next_table_id.store(table_id + 1, std::sync::atomic::Ordering::Release);
-			manifest.last_sequence = last_seq;
-
-			let mut changeset = crate::levels::ManifestChangeSet::default();
-			changeset.new_tables.push((0, table));
-			manifest.apply_changeset(&changeset)?;
-			crate::levels::write_manifest_to_disk(&manifest)?;
-		}
-
-		tracing::info!("RocksDB to SurrealKV v2 automatic migration completed successfully!");
-		Ok(())
-	}
-
-	/// Automatically migrates an existing SurrealKV v1 database to SurrealKV v2 format.
-	fn migrate_from_v1(opts: &Options) -> Result<()> {
-		Self::refuse_migration_into_an_encrypted_database(opts, "SurrealKV v1")?;
-		tracing::info!("Detected existing SurrealKV v1 database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
-		let records = surrealkv_compat_v1::read_all_latest(&opts.path).map_err(|e| {
-			Error::Other(format!("Failed to read SurrealKV v1 database for migration: {e}"))
-		})?;
-
-		tracing::info!(
-			"Read {} live records from SurrealKV v1. Creating backup and migrating...",
-			records.len()
-		);
-
-		// Create backup directory
-		let backup_dir = opts.path.join("_v1_backup");
-		create_dir_all(&backup_dir)?;
-
-		// Move all v1 legacy files into backup
-		if let Ok(entries) = std::fs::read_dir(&opts.path) {
-			for entry in entries.flatten() {
-				let p = entry.path();
-				let name = entry.file_name().to_string_lossy().to_string();
-				if name == "_v1_backup" {
-					continue;
-				}
-				if name.ends_with(".sst")
-					|| name.ends_with(".wal")
-					|| name.starts_with("MANIFEST")
-					|| name == "LOCK"
-				{
-					let dest = backup_dir.join(&name);
-					let _ = std::fs::rename(&p, dest);
-				}
-			}
-		}
-
-		// Now initialize directory structure
-		Self::create_directory_structure(opts)?;
-
-		if !records.is_empty() {
-			let table_id = 1;
-			let sst_path = opts.sstable_file_path(table_id);
-			let file = std::fs::File::create(&sst_path)?;
-			let opts_arc = Arc::new(opts.clone());
-			let mut writer =
-				crate::sstable::table::TableWriter::new(file, table_id, Arc::clone(&opts_arc), 0);
-
-			let mut last_seq = 0u64;
-			for (k, v) in records {
-				last_seq += 1;
-				let ikey = crate::InternalKey::new(k, last_seq, crate::InternalKeyKind::Set);
-				let val_encoded = crate::vlog::ValueLocation::with_inline_value(v).encode();
-				writer.add(ikey, &val_encoded)?;
-			}
-			let file_size = writer.finish()? as u64;
-
-			// Write manifest
-			let file: Arc<dyn crate::vfs::File> = Arc::new(std::fs::File::open(&sst_path)?);
-			let table = Arc::new(crate::sstable::table::Table::new(
-				table_id,
-				Arc::clone(&opts_arc),
-				file,
-				file_size,
-			)?);
-
-			let mut manifest = crate::levels::LevelManifest::new(Arc::clone(&opts_arc))?;
-			manifest.next_table_id.store(table_id + 1, std::sync::atomic::Ordering::Release);
-			manifest.last_sequence = last_seq;
-
-			let mut changeset = crate::levels::ManifestChangeSet::default();
-			changeset.new_tables.push((0, table));
-			manifest.apply_changeset(&changeset)?;
-			crate::levels::write_manifest_to_disk(&manifest)?;
-		}
-
-		tracing::info!("SurrealKV v1 to SurrealKV v2 automatic migration completed successfully!");
-		Ok(())
+		let mut enabled = (*opts).clone();
+		enabled.enable_vlog = true;
+		Ok(Arc::new(enabled))
 	}
 
 	/// Automatically migrates an existing IndexedDB dump to SurrealKV v2 format.
@@ -3089,17 +2970,11 @@ impl TreeBuilder {
 		self
 	}
 
-	/// Enables or disables versioned queries with timestamp tracking
+	/// Enables or disables versioned queries: every write is stamped with its timestamp, and
+	/// versions are kept for `Transaction::get_at` and `Transaction::history`, for `retention_ns`
+	/// nanoseconds, or for ever if that is 0. See `Options::with_versioning`.
 	pub fn with_versioning(mut self, enable: bool, retention_ns: u64) -> Self {
 		self.opts = self.opts.with_versioning(enable, retention_ns);
-		self
-	}
-
-	/// Enables or disables the B+tree versioned index for timestamp-based queries.
-	/// When disabled, versioned queries will scan the LSM tree directly.
-	/// Requires `with_versioning` to be called first with `enable = true`.
-	pub fn with_versioned_index(mut self, enable: bool) -> Self {
-		self.opts = self.opts.with_versioned_index(enable);
 		self
 	}
 
@@ -3275,8 +3150,8 @@ fn sync_directory_structure(opts: &Options) -> Result<()> {
 /// flushed yet points into. A file below it holds nothing that can be read any more. It is
 /// `u32::MAX` when tables were written and nothing points into the VLog, any more or ever: every
 /// file but the active one is below it, see [`cleanup_vlog`]. It is 0, and nothing is deleted,
-/// while no table was written yet, or a table opened from disk may point into the VLog without
-/// saying so, see `LevelManifest::vlog_floor_of_tables`.
+/// while no table was written yet, or a table of an older engine opened from disk may point into
+/// the VLog without saying so, see `LevelManifest::vlog_floor_of_tables`.
 ///
 /// The active slot is read-locked first and stays locked until the end, then the manifest and the
 /// queue, together, in the order a flush takes them in. The slot is read last: a batch applied

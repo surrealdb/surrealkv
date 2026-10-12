@@ -170,18 +170,99 @@ pub enum ChecksumType {
 	SealedCRC32c = 2,
 }
 
+/// The table format recorded in the footer.
+///
+/// Both formats share one container (blocks, checksums, partitioned index, filters, table
+/// metadata); they differ in the layout of the internal keys inside it.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum TableFormat {
+	/// Written by SurrealKV up to v0.21.4, `user_key ‖ trailer ‖ timestamp` (16-byte suffix), and
+	/// by development builds of the current engine between the removal of the key timestamp
+	/// and the introduction of `LSMV2`, with the flat layout. The footer cannot tell the two
+	/// apart, the keys do: this code reads the flat ones, and refuses the others
+	/// (`Error::LegacyFormat`), which are read by the standalone `surrealkv-compat-v1` and
+	/// converted by `crate::migrate`.
 	LSMV1 = 1,
+	/// Written since the introduction of this format: the flat layout, `user_key ‖ trailer`
+	/// (8-byte suffix), always.
+	LSMV2 = 2,
 }
 
 impl TableFormat {
 	pub(crate) fn from_u8(val: u8) -> Result<Self> {
 		match val {
 			1 => Ok(TableFormat::LSMV1),
+			2 => Ok(TableFormat::LSMV2),
 			_ => Err(Error::InvalidTableFormat),
 		}
 	}
+}
+
+/// The key under which the table writer stores the table properties in the meta-index block.
+const META_PROPERTIES_KEY: &[u8] = b"meta";
+
+/// Length of the suffix of an internal key of this engine: the trailer.
+const FLAT_SUFFIX_LEN: usize = 8;
+/// Length of the suffix of an internal key of LSMV1, the format of SurrealKV up to v0.21.4: the
+/// trailer and the timestamp of the write.
+const LEGACY_SUFFIX_LEN: usize = 16;
+
+/// Refuses the table whose meta-index block is `metaix` if its keys are in the layout of LSMV1.
+///
+/// This code does not read that layout: `Tree::new` converts such tables to LSMV2 with the help of
+/// `surrealkv-compat-v1` before it opens them, and a table that is met here has not been, so it
+/// is refused instead of being misread. Nothing but the length of a key is looked at.
+///
+/// Neither the footer nor the table properties record the layout, but the writer stores the
+/// properties under the internal key of the literal user key `meta`, so the length of that one
+/// key is exactly `4 + suffix`: 12 bytes when flat, 20 when LSMV1. A user key cannot influence
+/// it, which is why this beats sniffing data keys. The meta-index block is never compressed.
+fn refuse_legacy_keys(id: u64, format: TableFormat, metaix: &Block) -> Result<()> {
+	let mut iter = metaix.iter()?;
+	iter.seek_to_first()?;
+	while iter.is_valid() {
+		let key = iter.key_bytes();
+		if key.starts_with(META_PROPERTIES_KEY) {
+			return match key.len() - META_PROPERTIES_KEY.len() {
+				FLAT_SUFFIX_LEN => Ok(()),
+				// LSMV2 tables are flat by definition, and no engine wrote this under an LSMV2
+				// footer: the file was changed.
+				LEGACY_SUFFIX_LEN if format == TableFormat::LSMV2 => {
+					Err(Error::CorruptedTableMetadata(format!(
+						"table {id}: the footer says LSMV2 but the keys use the layout of LSMV1"
+					)))
+				}
+				LEGACY_SUFFIX_LEN => Err(Error::LegacyFormat(format!(
+					"table {id} is in LSMV1, the format of SurrealKV up to v0.21.4; open the \
+					 database directory with Tree::new to convert it"
+				))),
+				other => Err(Error::CorruptedTableMetadata(format!(
+					"the table properties key has a {other}-byte suffix, expected \
+					 {FLAT_SUFFIX_LEN} or {LEGACY_SUFFIX_LEN}"
+				))),
+			};
+		}
+		iter.advance()?;
+	}
+	Err(Error::TableMetadataNotFound)
+}
+
+/// Opens the footer and meta-index block of the table in `file` and refuses it, as `Table::new`
+/// does, if it is in LSMV1. Reads only those two: no index, filter or data block, so it is cheap
+/// enough to ask of every table of a directory before anything of it is replaced.
+pub(crate) fn refuse_legacy_table(
+	id: u64,
+	opts: &Options,
+	file: Arc<dyn File>,
+	file_size: u64,
+) -> Result<()> {
+	let (source, footer) = BlockSource::open_table(file, file_size, id, opts.encryption_context())?;
+	let metaix = source.read_block(
+		BlockKind::MetaIndex,
+		&footer.meta_index,
+		Arc::clone(&opts.internal_comparator),
+	)?;
+	refuse_legacy_keys(id, footer.format, &metaix)
 }
 
 // =============================================================================
@@ -195,7 +276,7 @@ impl TableFormat {
 /// ```text
 /// Offset  Size  Field
 /// ------  ----  -----
-/// 0       1     Format version (1 = LSMV1)
+/// 0       1     Format version (1 = LSMV1, 2 = LSMV2)
 /// 1       1     Checksum type (1 = CRC32c, 2 = sealed blocks)
 /// 2       16    Meta index block handle (varint encoded offset + size)
 /// 18      16    Index block handle (varint encoded offset + size)
@@ -227,7 +308,7 @@ impl Footer {
 		Footer {
 			meta_index: metaix,
 			index,
-			format: TableFormat::LSMV1,
+			format: TableFormat::LSMV2,
 			checksum: ChecksumType::CRC32c,
 		}
 	}
@@ -280,7 +361,7 @@ impl Footer {
 	/// Encodes the footer into a byte buffer.
 	pub(crate) fn encode(&self, dst: &mut [u8]) {
 		match self.format {
-			TableFormat::LSMV1 => {
+			TableFormat::LSMV1 | TableFormat::LSMV2 => {
 				dst[..TABLE_FOOTER_LENGTH].fill(0);
 
 				// Format version (1 byte)
@@ -714,9 +795,22 @@ impl<W: Write> TableWriter<W> {
 		props.raw_key_size += key.size() as u64;
 		props.raw_value_size += value.len() as u64;
 
-		let ts = 0;
-		props.oldest_key_time = Some(props.oldest_key_time.map_or(ts, |t| t.min(ts)));
-		props.newest_key_time = Some(props.newest_key_time.map_or(ts, |t| t.max(ts)));
+		// The times of the versions the table holds, which `history` uses to leave out a table
+		// whose versions are all outside the range it was asked for. A barrier hides the versions
+		// under it whatever its own time, and a version without a time reads as written when the
+		// versions before it were, which this table cannot say: a table that holds either can
+		// never be left out, it spans every time.
+		let (oldest, newest) = match key.kind() {
+			InternalKeyKind::Delete | InternalKeyKind::RangeDelete | InternalKeyKind::Replace => {
+				(0, u64::MAX)
+			}
+			kind => match ValueLocation::entry_time(kind, value) {
+				Some(ts) => (ts, ts),
+				None => (0, u64::MAX),
+			},
+		};
+		props.oldest_key_time = Some(props.oldest_key_time.map_or(oldest, |t| t.min(oldest)));
+		props.newest_key_time = Some(props.newest_key_time.map_or(newest, |t| t.max(newest)));
 
 		if key.kind() == InternalKeyKind::RangeDelete {
 			props.num_range_deletions += 1;
@@ -782,7 +876,11 @@ pub(crate) fn read_writer_meta_properties(metaix: &Block) -> Result<Option<Table
 
 	if metaindexiter.is_valid() {
 		let k = metaindexiter.key();
-		assert_eq!(k.user_key(), b"meta");
+		if k.user_key() != META_PROPERTIES_KEY {
+			return Err(Error::CorruptedTableMetadata(
+				"the meta-index entry found for the table properties has another key".to_string(),
+			));
+		}
 		let buf_bytes = metaindexiter.value_encoded()?;
 		return Ok(Some(TableMetadata::decode(buf_bytes)?));
 	}
@@ -840,10 +938,16 @@ pub(crate) struct Table {
 	pub(crate) range_deletions: Arc<parking_lot::RwLock<Vec<(Key, Key, u64)>>>,
 	pub(crate) has_range_deletions: Arc<std::sync::atomic::AtomicBool>,
 
+	/// The format of the file, from its footer.
+	pub(crate) format: TableFormat,
+
 	/// Set for a table that was opened from disk and names no value-log file
-	/// (`oldest_vlog_file_id` is 0): the table may still point into the log, because the
-	/// property was not kept by older versions, which stored a sequence number of 0 in its
-	/// place. A table written by this process has the property right.
+	/// (`oldest_vlog_file_id` is 0) although it was written by an engine that may not have kept
+	/// the property right: the table may still point into the log. SurrealKV before v0.20 stored
+	/// a sequence number of 0 in the place of the property, and development builds of the
+	/// current engine before `TableFormat::LSMV2` are not known to have kept it either. A table
+	/// of `LSMV2`, which every writer of this engine produces, has the property right: 0 means
+	/// that it points into no file. See `LevelManifest::load_table`.
 	pub(crate) vlog_pointers_unknown: bool,
 }
 
@@ -903,19 +1007,22 @@ impl Table {
 
 		let cache_id = source.cache_id();
 
-		// Step 2: Load partitioned index
-		let index_block = {
-			let partitioned_index =
-				Index::new(id, Arc::clone(&opts), source.clone(), &footer.index)?;
-			IndexType::Partitioned(partitioned_index)
-		};
-
-		// Step 3: Load meta index block
+		// Step 2: Load meta index block, and refuse a table in LSMV1 before anything keyed by its
+		// keys is read. Opening a database through `Tree::new` converts such tables first, so
+		// this only meets one on a path that bypasses the conversion.
 		let metaindexblock = source.read_block(
 			BlockKind::MetaIndex,
 			&footer.meta_index,
 			Arc::clone(&opts.internal_comparator),
 		)?;
+		refuse_legacy_keys(id, footer.format, &metaindexblock)?;
+
+		// Step 3: Load partitioned index
+		let index_block = {
+			let partitioned_index =
+				Index::new(id, Arc::clone(&opts), source.clone(), &footer.index)?;
+			IndexType::Partitioned(partitioned_index)
+		};
 
 		// Step 4: Extract metadata
 		let writer_metadata =
@@ -971,6 +1078,7 @@ impl Table {
 			)),
 			has_range_deletions: Arc::new(std::sync::atomic::AtomicBool::new(has_rd)),
 			meta: writer_metadata,
+			format: footer.format,
 			vlog_pointers_unknown: false,
 		})
 	}

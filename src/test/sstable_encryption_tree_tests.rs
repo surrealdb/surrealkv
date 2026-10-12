@@ -365,8 +365,6 @@ async fn a_plain_database_is_not_opened_as_an_encrypted_one_and_nothing_is_chang
 
 #[tokio::test]
 async fn a_foreign_database_is_not_migrated_into_an_encrypted_one() {
-	use surrealkv_compat_v1::{V1_FOOTER_TOTAL_LEN, V1_MAGIC_FOOTER};
-
 	let ctx = context(CipherSuite::Aes256Gcm);
 	let key_manager: Arc<dyn crate::KeyManager> = Arc::new(SoftwareKeyManager::new([0x42; 32]));
 
@@ -374,11 +372,6 @@ async fn a_foreign_database_is_not_migrated_into_an_encrypted_one() {
 	let rocksdb = TempDir::new().unwrap();
 	fs::write(rocksdb.path().join("CURRENT"), b"MANIFEST-000001\n").unwrap();
 	fs::write(rocksdb.path().join("MANIFEST-000001"), b"not a real rocksdb manifest").unwrap();
-
-	let v1 = TempDir::new().unwrap();
-	let mut table = vec![0u8; V1_FOOTER_TOTAL_LEN];
-	table[V1_FOOTER_TOTAL_LEN - V1_MAGIC_FOOTER.len()..].copy_from_slice(&V1_MAGIC_FOOTER);
-	fs::write(v1.path().join("000001.sst"), &table).unwrap();
 
 	let indxdb = TempDir::new().unwrap();
 	surrealkv_compat_indxdb::export_dump(
@@ -389,7 +382,6 @@ async fn a_foreign_database_is_not_migrated_into_an_encrypted_one() {
 
 	let cases = [
 		(&rocksdb, "CURRENT", "_rocksdb_backup", "RocksDB"),
-		(&v1, "000001.sst", "_v1_backup", "SurrealKV v1"),
 		(&indxdb, "indxdb_dump.bin", "_indxdb_backup", "IndexedDB"),
 	];
 	for (dir, original, backup, store) in cases {

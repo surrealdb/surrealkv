@@ -213,8 +213,17 @@ fn count_files_with_extension(dir: &Path, extension: &str) -> Result<usize> {
 	Ok(count)
 }
 
-/// Current manifest format version
+/// The manifest format written up to SurrealKV v0.21.x, and by development builds of the current
+/// engine until `MANIFEST_FORMAT_VERSION_V2`. The layout is identical to V2.
 pub const MANIFEST_FORMAT_VERSION_V1: u16 = 1;
+
+/// The manifest format written since SurrealKV introduced `TableFormat::LSMV2`. The byte layout
+/// is the same as V1; the version exists so that a binary that only knows V1, which would
+/// misread the flat-key tables a V2 manifest lists, refuses the directory instead.
+pub const MANIFEST_FORMAT_VERSION_V2: u16 = 2;
+
+/// The manifest format version this code writes.
+pub const MANIFEST_FORMAT_VERSION: u16 = MANIFEST_FORMAT_VERSION_V2;
 
 /// Snapshot information stored in the manifest
 #[derive(Debug, Clone)]
@@ -359,6 +368,36 @@ pub(crate) struct DecodedManifest {
 }
 
 impl DecodedManifest {
+	/// Encodes the manifest in the layout `write_manifest_to_disk` writes and `decode` reads. Used
+	/// by the migration, which has to rewrite a manifest whose tables it cannot open.
+	pub(crate) fn encode(&self) -> Result<Vec<u8>> {
+		let mut buf = Vec::new();
+		buf.extend_from_slice(&self.version.to_be_bytes());
+		buf.extend_from_slice(&self.next_table_id.to_be_bytes());
+		buf.extend_from_slice(&self.log_number.to_be_bytes());
+		buf.extend_from_slice(&self.last_sequence.to_be_bytes());
+		buf.push(self.level_data.len() as u8);
+		for level in &self.level_data {
+			buf.extend_from_slice(&(level.len() as u32).to_be_bytes());
+			for id in level {
+				buf.extend_from_slice(&id.to_be_bytes());
+			}
+		}
+		buf.extend_from_slice(&(self.snapshots.len() as u32).to_be_bytes());
+		for snapshot in &self.snapshots {
+			let bytes = snapshot.encode()?;
+			buf.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+			buf.extend_from_slice(&bytes);
+		}
+		// Append the checksum trailer, as `write_manifest_to_disk` does
+		let body_len = buf.len() as u32;
+		let crc = calculate_manifest_crc(&buf);
+		buf.extend_from_slice(&body_len.to_be_bytes());
+		buf.extend_from_slice(&crc.to_be_bytes());
+		buf.extend_from_slice(&MANIFEST_TRAILER_MAGIC);
+		Ok(buf)
+	}
+
 	pub(crate) fn decode(data: Vec<u8>) -> Result<Self> {
 		let mut level_manifest = Cursor::new(&data);
 
@@ -366,9 +405,10 @@ impl DecodedManifest {
 		let mut u16_buf = [0u8; 2];
 		level_manifest.read_exact(&mut u16_buf)?;
 		let version = u16::from_be_bytes(u16_buf);
-		if version != MANIFEST_FORMAT_VERSION_V1 {
+		if version != MANIFEST_FORMAT_VERSION_V1 && version != MANIFEST_FORMAT_VERSION_V2 {
 			return Err(Error::LoadManifestFail(format!(
-				"Unsupported manifest format version: {version}. Expected: {MANIFEST_FORMAT_VERSION_V1}"
+				"Unsupported manifest format version: {version}. Expected: \
+				 {MANIFEST_FORMAT_VERSION_V1} or {MANIFEST_FORMAT_VERSION_V2}"
 			)));
 		}
 
@@ -480,7 +520,7 @@ impl LevelManifest {
 			levels,
 			hidden_set: HashSet::with_capacity(10),
 			next_table_id,
-			manifest_format_version: MANIFEST_FORMAT_VERSION_V1,
+			manifest_format_version: MANIFEST_FORMAT_VERSION,
 			snapshots: Vec::new(),
 			log_number: 0,
 			last_sequence: 0,
@@ -568,6 +608,7 @@ impl LevelManifest {
 						tracing::error!("Error loading table {table_id}: {err:?}");
 						return Err(err);
 					}
+					Err(err @ Error::LegacyFormat(_)) => return Err(err),
 					Err(err) => {
 						tracing::error!("Error loading table {table_id}: {err:?}");
 						return Err(Error::LoadManifestFail(err.to_string()));
@@ -677,7 +718,11 @@ impl LevelManifest {
 
 		// Create and return the table
 		let mut table = Table::new(table_id, opts, file, file_size)?;
-		table.vlog_pointers_unknown = table.meta.properties.oldest_vlog_file_id == 0;
+		// A table of the current format has the property right, so naming no file means that it
+		// points into none. Only a table of an older engine, which may not have kept it, is
+		// unknown: it keeps the value log until a compaction writes it again.
+		table.vlog_pointers_unknown = table.meta.properties.oldest_vlog_file_id == 0
+			&& table.format != crate::sstable::table::TableFormat::LSMV2;
 		Ok(Arc::new(table))
 	}
 
@@ -711,25 +756,25 @@ impl LevelManifest {
 			.unwrap_or(0)
 	}
 
-	/// What the tables say about the value log, for [`crate::lsm::vlog_floor`]. The smallest file
-	/// any of them points into, and if none does:
-	/// - `u32::MAX`, when tables were written and none points into the log: nothing is held back by
-	///   them, and the files that nothing else points into can go;
-	/// - 0, when no table was written yet (a fresh database), or a table that was opened from disk
-	///   does not name a file and may point into the log all the same, see
-	///   `Table::vlog_pointers_unknown`: nothing is deleted. The table of a database written by an
-	///   older version is that, until a compaction rewrites it.
+	/// What the tables say about the value log, for [`crate::lsm::vlog_floor`]:
+	/// - 0, and nothing is deleted, when a table that was opened from disk names no file and may
+	///   point into the log all the same, see `Table::vlog_pointers_unknown`, whatever the other
+	///   tables say: its files are below theirs, or are theirs. The table of a database written by
+	///   an older engine is that, until a compaction rewrites it;
+	/// - otherwise the smallest file any table points into;
+	/// - if none does, `u32::MAX` when tables were written, as they then hold nothing back and the
+	///   files that nothing else points into can go, and 0 when no table was written yet (a fresh
+	///   database).
 	///
 	/// A table was written once `last_sequence` is above 0: it follows the tables that are
 	/// registered, and stays when they are compacted away. The ids of tables are no sign of it,
 	/// they are handed out when a memtable is rotated.
 	pub(crate) fn vlog_floor_of_tables(&self) -> u32 {
+		if self.iter().any(|table| table.vlog_pointers_unknown) {
+			return 0;
+		}
 		match self.min_oldest_vlog_file_id() {
-			0 if self.last_sequence > 0
-				&& !self.iter().any(|table| table.vlog_pointers_unknown) =>
-			{
-				u32::MAX
-			}
+			0 if self.last_sequence > 0 => u32::MAX,
 			oldest => oldest,
 		}
 	}
@@ -1095,8 +1140,10 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 
 	let mut buf = Vec::new();
 
-	// Write header
-	buf.extend_from_slice(&manifest.manifest_format_version.to_be_bytes());
+	// Write header. Every manifest this code writes is of the current version, including one
+	// that was loaded as V1: its tables are all in a layout V1 binaries cannot read in place.
+	let version = manifest.manifest_format_version.max(MANIFEST_FORMAT_VERSION);
+	buf.extend_from_slice(&version.to_be_bytes());
 	buf.extend_from_slice(&next_table_id.to_be_bytes());
 	buf.extend_from_slice(&manifest.log_number.to_be_bytes());
 	buf.extend_from_slice(&manifest.last_sequence.to_be_bytes());

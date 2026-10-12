@@ -27,6 +27,13 @@ pub enum Error {
 	InvalidFilename(String),
 	CorruptedTableMetadata(String),
 	InvalidTableFormat,
+	/// A table or database is stored in a legacy layout that this code does not read in place.
+	/// Opening the database with `Tree::new` migrates it; this is returned by paths that cannot
+	/// (a checkpoint restore, a direct table open).
+	LegacyFormat(String),
+	/// Migrating a database written by an older version or another engine failed. The database
+	/// was left as it was or as a restartable half-migrated state; opening it again resumes.
+	MigrationFailed(String),
 	TableMetadataNotFound,
 	Wal(String),
 	BlockNotFound,
@@ -105,6 +112,8 @@ impl fmt::Display for Error {
             Self::InvalidFilename(err) => write!(f, "Invalid filename: {err}"),
             Self::CorruptedTableMetadata(err) => write!(f, "Corrupted table metadata: {err}"),
             Self::InvalidTableFormat => write!(f, "Invalid table format"),
+            Self::LegacyFormat(err) => write!(f, "Legacy format: {err}"),
+            Self::MigrationFailed(err) => write!(f, "Migration failed: {err}"),
             Self::TableMetadataNotFound => write!(f, "Table metadata not found"),
             Self::Wal(err) => write!(f, "WAL error: {err}"),
             Self::BlockNotFound => write!(f, "Block not found"),

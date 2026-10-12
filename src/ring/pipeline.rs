@@ -18,7 +18,13 @@ use crate::stall::WriteStallController;
 use crate::storage::{AffinityLogStore, LogStore};
 use crate::task::{TaskManager, FLUSH_RETRY_MAX, FLUSH_RETRY_MIN};
 use crate::varint::varint_len_u64;
-use crate::vlog::{VLog, ValueLocation, VALUE_LOCATION_VERSION};
+use crate::vlog::{
+	VLog,
+	ValueLocation,
+	BIT_HAS_TIMESTAMP,
+	VALUE_LOCATION_VERSION,
+	VALUE_TIMESTAMP_SIZE,
+};
 use crate::{InternalKey, InternalKeyKind, Key};
 
 /// Observation points inside `flush_group`, so tests can act at an exact step
@@ -112,12 +118,12 @@ const MAX_SCRATCH_ELEMENTS: usize = 32 * 1024;
 
 /// The same for the WAL buffer, in bytes: a burst of large batches does not pin its memory either.
 ///
-/// A quarter over `MAX_GROUP_BYTES`. Wrapping a value adds two bytes to what the gather counted,
-/// and an entry counts for 14 bytes at the least, so a group at the budget reserves at most
-/// 4.57 MiB (a seventh over). A cap below that frees the buffer after every group of the
-/// smallest entries, and the quarter keeps the most a tree holds on to at 5 MiB. The buffer is
-/// grown to what a group needs and no more, so what is kept is the largest group seen.
-const MAX_SCRATCH_BYTES: usize = MAX_GROUP_BYTES + MAX_GROUP_BYTES / 4;
+/// Twice `MAX_GROUP_BYTES`. Wrapping a value adds two bytes to what the gather counted, ten if
+/// it is stamped with its timestamp, and an entry counts for 14 bytes at the least, so a group at
+/// the budget reserves at most 6.9 MiB (a 24 over 14). A cap below that frees the buffer after
+/// every group of the smallest entries of a versioned tree. The buffer is grown to what a group
+/// needs and no more, so what is kept is the largest group seen.
+const MAX_SCRATCH_BYTES: usize = 2 * MAX_GROUP_BYTES;
 
 impl FlushScratch {
 	/// Empties every buffer for the next group, and gives back the allocation of one that a
@@ -1231,9 +1237,10 @@ impl CommitPipeline {
 		// and encode for WAL
 		let vlog_threshold = self.inner.opts.vlog_value_threshold;
 		let vlog = self.inner.vlog.as_ref();
+		let stamp = self.inner.opts.enable_versioning;
 
 		for batch in batches.iter_mut() {
-			encode_values(batch, vlog, vlog_threshold)?;
+			encode_values(batch, vlog, vlog_threshold, stamp)?;
 		}
 
 		// The values reach the OS before any record that points to them, and a group that syncs
@@ -1941,14 +1948,25 @@ fn tag_mismatch(segments: &[u64], tag: u64) -> Error {
 /// a value above `vlog_threshold` is appended to the value log and replaced by a pointer to it.
 /// A range delete keeps its end key as is.
 ///
+/// With `stamp`, which a versioned tree sets, the entry's timestamp goes in front of the value
+/// too, in the `ValueLocation`, so that the logged record and the memtable and the tables it
+/// ends up in all carry it. A soft delete has no value and is a version of its own, so it gets an
+/// empty value with the timestamp. A hard delete is a barrier and has no time.
+///
 /// In place, so an entry's key and value are not copied. This used to build a second batch
 /// entry by entry, which cloned every key and value and encoded each value into a third
 /// allocation. `batch.size` stays what `add_record` would have computed for the new values.
 ///
-/// Growing a value by the two bytes allocates when it has no room to spare, which for a large
-/// value is a large allocation. If the allocator refuses, this fails with the values before it
-/// wrapped and the rest as they were: the caller fails the group and does not log the batch.
-fn encode_values(batch: &mut Batch, vlog: Option<&Arc<VLog>>, vlog_threshold: usize) -> Result<()> {
+/// Growing a value by the bytes of its header allocates when it has no room to spare, which for
+/// a large value is a large allocation. If the allocator refuses, this fails with the values
+/// before it wrapped and the rest as they were: the caller fails the group and does not log the
+/// batch.
+fn encode_values(
+	batch: &mut Batch,
+	vlog: Option<&Arc<VLog>>,
+	vlog_threshold: usize,
+	stamp: bool,
+) -> Result<()> {
 	// What a value adds to `Batch::size`: its length, and the varint that gives it.
 	let value_size = |len: usize| varint_len_u64(len as u64) as u64 + len as u64;
 	let starting_seq_num = batch.starting_seq_num;
@@ -1956,30 +1974,52 @@ fn encode_values(batch: &mut Batch, vlog: Option<&Arc<VLog>>, vlog_threshold: us
 		if entry.kind == InternalKeyKind::RangeDelete {
 			continue;
 		}
-		let Some(value) = entry.value.as_mut() else {
+		let timestamp = stamp.then_some(entry.timestamp);
+		if entry.value.is_none() {
+			if let (Some(timestamp), InternalKeyKind::SoftDelete) = (timestamp, entry.kind) {
+				let mut value = Vec::new();
+				try_reserve_bytes(&mut value, 2 + VALUE_TIMESTAMP_SIZE)?;
+				value.extend_from_slice(&[BIT_HAS_TIMESTAMP, VALUE_LOCATION_VERSION]);
+				value.extend_from_slice(&timestamp.to_be_bytes());
+				batch.size = batch.size - value_size(0) + value_size(value.len());
+				entry.value = Some(value);
+			}
 			continue;
-		};
+		}
+		let value = entry.value.as_mut().expect("checked above");
 		let size_before = value_size(value.len());
 		match vlog {
 			Some(vlog) if value.len() > vlog_threshold => {
 				let ikey =
 					InternalKey::new(entry.key.clone(), starting_seq_num + i as u64, entry.kind);
 				let pointer = vlog.append(&ikey.encode(), value)?;
-				*value = ValueLocation::with_pointer(pointer).encode();
+				*value = ValueLocation::with_pointer(pointer).with_timestamp(timestamp).encode();
 			}
 			_ => {
-				// `ValueLocation::with_inline_value(value).encode()`, without the copies.
+				// `ValueLocation::with_inline_value(value).with_timestamp(timestamp).encode()`,
+				// without the copies.
 				let len = value.len();
-				try_reserve_bytes(value, 2)?;
-				value.resize(len + 2, 0);
-				value.copy_within(0..len, 2);
-				value[0] = 0;
+				let header = if timestamp.is_some() {
+					2 + VALUE_TIMESTAMP_SIZE
+				} else {
+					2
+				};
+				try_reserve_bytes(value, header)?;
+				value.resize(len + header, 0);
+				value.copy_within(0..len, header);
 				value[1] = VALUE_LOCATION_VERSION;
+				match timestamp {
+					Some(timestamp) => {
+						value[0] = BIT_HAS_TIMESTAMP;
+						value[2..header].copy_from_slice(&timestamp.to_be_bytes());
+					}
+					None => value[0] = 0,
+				}
 			}
 		}
 		batch.size = batch.size - size_before + value_size(value.len());
 	}
-	// The two bytes of every wrapped value count against the limit `add_record` enforces.
+	// The bytes of every wrapped value count against the limit `add_record` enforces.
 	if batch.exceeds_max_size() {
 		return Err(Error::BatchTooLarge);
 	}
@@ -2005,16 +2045,19 @@ mod encode_values_tests {
 
 	/// What the flusher built before `encode_values`: a second batch, entry by entry, with
 	/// every value wrapped in an inline `ValueLocation`.
-	fn copying_reference(batch: &Batch) -> Batch {
+	fn copying_reference(batch: &Batch, stamp: bool) -> Batch {
 		let mut processed = Batch::new(batch.starting_seq_num);
 		for (_, entry, _seq_num, timestamp) in batch.entries_with_seq_nums().unwrap() {
+			let stamped = stamp.then_some(timestamp);
 			let encoded_value = if entry.kind == InternalKeyKind::RangeDelete {
 				entry.value.clone()
+			} else if entry.value.is_none() && stamp && entry.kind == InternalKeyKind::SoftDelete {
+				// A soft delete is a version of its own: it keeps the time it happened at.
+				Some(ValueLocation::with_inline_value(Vec::new()).with_timestamp(stamped).encode())
 			} else {
-				entry
-					.value
-					.as_ref()
-					.map(|value| ValueLocation::with_inline_value(value.clone()).encode())
+				entry.value.as_ref().map(|value| {
+					ValueLocation::with_inline_value(value.clone()).with_timestamp(stamped).encode()
+				})
 			};
 			processed.add_record(entry.kind, entry.key.clone(), encoded_value, timestamp).unwrap();
 		}
@@ -2023,17 +2066,23 @@ mod encode_values_tests {
 
 	#[test]
 	fn encoding_values_in_place_logs_the_same_bytes_as_copying_them() {
+		for stamp in [false, true] {
+			encoding_values_in_place_logs_the_same_bytes_as_copying_them_with(stamp);
+		}
+	}
+
+	fn encoding_values_in_place_logs_the_same_bytes_as_copying_them_with(stamp: bool) {
 		for entries in 0..6usize {
 			for value_len in [0usize, 1, 2, 7, 8, 9, 125, 126, 127, 128, 129, 1000, 16_381, 16_383]
 				.into_iter()
 				.chain([16_384, 70_000])
 			{
-				for kind_offset in 0..5usize {
+				for kind_offset in 0..6usize {
 					let mut batch = Batch::new(0);
 					for i in 0..entries {
 						let key = vec![i as u8; 1 + i];
 						let ts = 100 + i as u64;
-						match (i + kind_offset) % 5 {
+						match (i + kind_offset) % 6 {
 							0 => batch.set(key, vec![0xAB; value_len], ts).unwrap(),
 							1 => batch.delete(key, ts).unwrap(),
 							2 => batch
@@ -2047,6 +2096,10 @@ mod encode_values_tests {
 							3 => batch
 								.add_record(InternalKeyKind::Set, key, Some(Vec::new()), ts)
 								.unwrap(),
+							// A soft delete as a transaction writes it, with no value
+							5 => batch
+								.add_record(InternalKeyKind::SoftDelete, key, None::<Vec<u8>>, ts)
+								.unwrap(),
 							_ => batch
 								.add_record(
 									InternalKeyKind::SoftDelete,
@@ -2059,15 +2112,17 @@ mod encode_values_tests {
 					}
 					batch.set_starting_seq_num(41);
 
-					let expected = copying_reference(&batch);
+					let expected = copying_reference(&batch, stamp);
 					let mut expected_bytes = Vec::new();
 					expected.encode_into(&mut expected_bytes).unwrap();
 
-					encode_values(&mut batch, None, usize::MAX).unwrap();
+					encode_values(&mut batch, None, usize::MAX, stamp).unwrap();
 					let mut actual_bytes = Vec::new();
 					batch.encode_into(&mut actual_bytes).unwrap();
 
-					let what = format!("entries={entries} value_len={value_len} {kind_offset}");
+					let what = format!(
+						"stamp={stamp} entries={entries} value_len={value_len} {kind_offset}"
+					);
 					assert_eq!(actual_bytes, expected_bytes, "{what}");
 					assert_eq!(batch.size, expected.size, "{what}");
 					assert_eq!(batch.encoded_len_hint(), expected.encoded_len_hint(), "{what}");
@@ -2111,7 +2166,7 @@ mod encode_values_tests {
 		batch.set_starting_seq_num(1000);
 		let original = batch.clone();
 
-		encode_values(&mut batch, Some(vlog), THRESHOLD).unwrap();
+		encode_values(&mut batch, Some(vlog), THRESHOLD, false).unwrap();
 		vlog.flush().unwrap();
 
 		for (i, (got, was)) in batch.entries.iter().zip(&original.entries).enumerate() {
@@ -2167,7 +2222,7 @@ mod encode_values_tests {
 			batch.set(b"key".to_vec(), vec![1u8; 10], 0).unwrap();
 			assert_eq!(batch.size, ENTRY);
 			batch.size = size;
-			let in_place = encode_values(&mut batch, None, usize::MAX);
+			let in_place = encode_values(&mut batch, None, usize::MAX, false);
 
 			// What the copying flusher did: `add_record` of the wrapped value on a new batch
 			// that already held the rest of the size.
@@ -2593,18 +2648,35 @@ mod scratch_tests {
 	/// kept buffer has to cover that.
 	#[test]
 	fn the_cap_on_the_wal_buffer_covers_a_group_of_the_smallest_entries_at_the_budget() {
-		let mut batch = Batch::new(0);
-		// 14 bytes an entry: its kind, a one byte key length and value length, the timestamp and
-		// the slack that the hint adds.
-		while batch.encoded_len_hint() + 14 <= MAX_GROUP_BYTES {
-			batch.add_record(InternalKeyKind::Set, Vec::new(), Some(Vec::new()), 0).unwrap();
+		for stamp in [false, true] {
+			let mut batch = Batch::new(0);
+			// 14 bytes an entry: its kind, a one byte key length and value length, the
+			// timestamp and the slack that the hint adds.
+			while batch.encoded_len_hint() + 14 <= MAX_GROUP_BYTES {
+				batch.add_record(InternalKeyKind::Set, Vec::new(), Some(Vec::new()), 0).unwrap();
+			}
+			assert!(batch.encoded_len_hint() <= MAX_GROUP_BYTES, "the gather lets it into a group");
+			encode_values(&mut batch, None, usize::MAX, stamp).unwrap();
+			let needs = batch.encoded_len_hint();
+			assert!(
+				needs > MAX_GROUP_BYTES + (64 << 10),
+				"wrapping adds more than 64 KiB: {needs}"
+			);
+			// Two bytes an entry over 14, or ten
+			let over = if stamp {
+				10
+			} else {
+				2
+			};
+			assert!(
+				needs <= MAX_GROUP_BYTES + MAX_GROUP_BYTES / 14 * over + 14 * over,
+				"stamp {stamp}: {needs}"
+			);
+			assert!(
+				needs <= MAX_SCRATCH_BYTES,
+				"stamp {stamp}: a group at the budget is kept: {needs}"
+			);
 		}
-		assert!(batch.encoded_len_hint() <= MAX_GROUP_BYTES, "the gather lets it into a group");
-		encode_values(&mut batch, None, usize::MAX).unwrap();
-		let needs = batch.encoded_len_hint();
-		assert!(needs > MAX_GROUP_BYTES + (64 << 10), "wrapping adds more than 64 KiB: {needs}");
-		assert!(needs <= MAX_GROUP_BYTES + MAX_GROUP_BYTES / 7 + 14, "a seventh over: {needs}");
-		assert!(needs <= MAX_SCRATCH_BYTES, "a group at the budget is kept: {needs}");
 	}
 
 	/// `apply_run` moves a batch into the memtable on the strength of the size it is given. If

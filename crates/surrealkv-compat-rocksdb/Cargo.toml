@@ -3,15 +3,18 @@ name = "surrealkv-compat-rocksdb"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
-description = "Pure-Rust reader and migrator for RocksDB BlockBasedTable (v2-v7) SSTables"
+description = "Pure-Rust reader of RocksDB databases written by SurrealDB, for migration to SurrealKV"
 readme = "README.md"
 
 [dependencies]
-crc32fast = "1.2"
 snap = "1.0"
 zstd = { version = "0.13", default-features = false }
 lz4_flex = "0.12"
+xxhash-rust = { version = "0.8", features = ["xxh32", "xxh64", "xxh3"] }
 thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.0", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3.10"

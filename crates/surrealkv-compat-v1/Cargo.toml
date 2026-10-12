@@ -4,13 +4,15 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 license = "Apache-2.0"
-description = "Pure-Rust reader and migrator for legacy SurrealKV V1 files"
+description = "Standalone reader of SurrealKV LSMV1 databases (v0.20 to v0.21.4), for conversion to LSMV2"
 
+# The checksum and compression this reads are exactly what v0.20.0 to v0.21.4 used: CRC-32 for
+# table blocks and log records (`crc32fast`), snappy for table blocks (`snap`) and LZ4 for log
+# records (`lz4_flex`). Nothing in those releases used zstd.
 [dependencies]
 crc32fast = "1.2"
 lz4_flex = "0.12"
 snap = "1.0"
-zstd = { version = "0.13", default-features = false }
 thiserror = "2"
 
 [dev-dependencies]

@@ -331,14 +331,14 @@ enum Commands {
 		key_args: KeyArgs,
 	},
 
-	/// Explicitly migrate a RocksDB or SurrealKV V1 store to V2
+	/// Explicitly migrate a RocksDB or SurrealKV (up to v0.21.4) store to the current format
 	///
 	/// An encrypted destination is refused: a migration writes without a key.
 	Migrate {
-		/// Source database path (RocksDB or SurrealKV V1)
+		/// Source database path (RocksDB, or SurrealKV up to v0.21.4)
 		source: PathBuf,
 
-		/// Destination SurrealKV V2 database path
+		/// Destination SurrealKV database path
 		destination: PathBuf,
 	},
 
@@ -932,6 +932,43 @@ fn cmd_scrub(path: &Path, key_args: &KeyArgs) -> Result<ExitCode> {
 	Ok(ExitCode::FAILURE)
 }
 
+/// The real, absolute path of `path`, which may not exist yet: its longest existing ancestor is
+/// resolved and the rest appended.
+fn resolve(path: &Path) -> Result<PathBuf> {
+	let absolute = std::path::absolute(path)?;
+	let mut existing = absolute.as_path();
+	let mut rest = Vec::new();
+	loop {
+		if let Ok(real) = std::fs::canonicalize(existing) {
+			return Ok(rest.iter().rev().fold(real, |path, part| path.join(part)));
+		}
+		match (existing.parent(), existing.file_name()) {
+			(Some(parent), Some(name)) => {
+				rest.push(name.to_owned());
+				existing = parent;
+			}
+			_ => return Ok(absolute),
+		}
+	}
+}
+
+/// Copies the database directory `source` into `destination`, subdirectories and all, except its
+/// lock file.
+fn copy_database_directory(source: &Path, destination: &Path) -> Result<()> {
+	std::fs::create_dir_all(destination)?;
+	for entry in std::fs::read_dir(source)? {
+		let entry = entry?;
+		let name = entry.file_name();
+		let target = destination.join(&name);
+		if entry.file_type()?.is_dir() {
+			copy_database_directory(&entry.path(), &target)?;
+		} else if entry.file_type()?.is_file() && name != "LOCK" {
+			std::fs::copy(entry.path(), target)?;
+		}
+	}
+	Ok(())
+}
+
 async fn cmd_migrate(source: &Path, destination: &Path) -> Result<()> {
 	println!("{}", "=== SurrealKV Offline Migration Tool ===".bold().cyan());
 	println!("Source:      {}", source.display().to_string().yellow());
@@ -949,32 +986,107 @@ async fn cmd_migrate(source: &Path, destination: &Path) -> Result<()> {
 	}
 
 	let is_rocksdb = surrealkv_compat_rocksdb::is_rocksdb_dir(source);
-	let is_v1 = surrealkv_compat_v1::is_v1_dir(source);
+	let is_lsmv1 = !is_rocksdb && surrealkv_compat_v1::is_lsmv1_dir(source);
 	let is_indxdb = surrealkv_compat_indxdb::is_indxdb_available(&source.to_string_lossy());
 
-	if !is_rocksdb && !is_v1 && !is_indxdb {
+	if !is_rocksdb && !is_lsmv1 && !is_indxdb {
 		bail!(
-			"Source directory at {} is not a recognized RocksDB, SurrealKV V1, or IndexedDB database",
+			"Source directory at {} is not a recognized RocksDB, SurrealKV (up to v0.21.4), or IndexedDB database",
 			source.display()
 		);
 	}
 
 	let format_name = if is_rocksdb {
 		"RocksDB BlockBasedTable"
-	} else if is_v1 {
-		"SurrealKV V1"
+	} else if is_lsmv1 {
+		"SurrealKV LSMV1 (up to v0.21.4)"
 	} else {
 		"IndexedDB Store / Dump"
 	};
 	println!("Detected format: {}", format_name.bold().cyan());
 
-	let records = if is_rocksdb {
-		surrealkv_compat_rocksdb::read_all_latest(source)?
-	} else if is_v1 {
-		surrealkv_compat_v1::read_all_latest(source)?
-	} else {
-		surrealkv_compat_indxdb::read_all_latest(&source.to_string_lossy()).await?
-	};
+	if is_rocksdb || is_lsmv1 {
+		// Copy the files and open the copy: opening a RocksDB database, or one that SurrealKV
+		// wrote up to v0.21.4, migrates it, with the versions and timestamps of a versioned one,
+		// and leaves the source untouched.
+		//
+		// Nothing is created until the paths are known to be safe: a destination that is, holds or
+		// sits inside the source would have the copy overwrite or mix with the database.
+		let source_real = std::fs::canonicalize(source)?;
+		let destination_real = resolve(destination)?;
+		if source_real.starts_with(&destination_real) || destination_real.starts_with(&source_real)
+		{
+			bail!(
+				"the destination {} and the source {} overlap; give a directory of its own",
+				destination.display(),
+				source.display()
+			);
+		}
+		if destination_real.is_dir() && std::fs::read_dir(&destination_real)?.next().is_some() {
+			bail!("the destination {} is not empty", destination.display());
+		}
+		// Hold RocksDB's lock on the source while it is copied: a live process would be writing to
+		// the files, and the copy would be of a database that never existed. A source that cannot
+		// be locked for another reason, a read-only backup, is copied without it. A database of
+		// SurrealKV has no such lock to take from here: it must not be open in another process
+		// while it is copied.
+		let lock_file = source.join("LOCK");
+		let had_lock_file = lock_file.exists();
+		let lock = if is_rocksdb {
+			match surrealkv_compat_rocksdb::lock_directory(source) {
+				Ok(lock) => Some(lock),
+				Err(e @ surrealkv_compat_rocksdb::Error::InUse(_)) => {
+					return Err(anyhow::Error::new(e).context(
+						"the RocksDB database is open in a process; stop it and try again",
+					));
+				}
+				Err(e) => {
+					eprintln!("{} {e}; copying without the lock", "Warning:".yellow().bold());
+					None
+				}
+			}
+		} else {
+			None
+		};
+		if is_rocksdb {
+			std::fs::create_dir_all(destination)?;
+			for entry in std::fs::read_dir(source)? {
+				let entry = entry?;
+				let name = entry.file_name().to_string_lossy().to_string();
+				if entry.file_type()?.is_file() && name != "LOCK" && name != "LOG" {
+					std::fs::copy(entry.path(), destination.join(&name))?;
+				}
+			}
+		} else {
+			// A database of LSMV1 is a set of directories: manifest, sstables, wal, vlog.
+			copy_database_directory(source, destination)?;
+		}
+		drop(lock);
+		if is_rocksdb && !had_lock_file {
+			// Taking the lock created it; the source is left as it was found.
+			let _ = std::fs::remove_file(&lock_file);
+		}
+		let tree = TreeBuilder::new()
+			.with_path(destination.to_path_buf())
+			.build()
+			.context("Failed to migrate the database")?;
+		tree.close().await?;
+		// The migration keeps the files it replaced in the directory. Here they are only the copy
+		// this command made, and the source is untouched.
+		let kept = destination.join(if is_rocksdb {
+			"_rocksdb_backup"
+		} else {
+			"_surrealkv_v0_backup"
+		});
+		if kept.is_dir() {
+			std::fs::remove_dir_all(&kept)?;
+		}
+		println!("{}", "Migration successfully completed to SurrealKV V2!".green().bold());
+		println!("The source at {} was not changed.", source.display());
+		return Ok(());
+	}
+
+	let records = surrealkv_compat_indxdb::read_all_latest(&source.to_string_lossy()).await?;
 
 	println!("Read {} live records from source.", records.len());
 

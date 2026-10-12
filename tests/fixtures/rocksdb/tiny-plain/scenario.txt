@@ -1,0 +1,3 @@
+24 keys, unversioned (test fixture)
+versioned=false
+keys=24

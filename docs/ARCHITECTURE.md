@@ -130,7 +130,6 @@ database_path/
 ├── vlog/                   # Value log files (if enabled)
 │   ├── 00000000000000000001.vlog
 │   └── 00000000000000000002.vlog
-├── versioned_index/        # B+tree index (if enabled)
 └── LOCK                    # Lock file
 ```
 
@@ -433,10 +432,10 @@ MVCC provides the following:
 Every key stored in SurrealKV is an `InternalKey` that combines the user-provided key with version metadata. This encoding is central to how MVCC works:
 
 ```
-┌──────────────────┬───────────────────┬──────────────────┐
-│    user_key      │    trailer (8B)   │  timestamp (8B)  │
-│   (variable)     │  seq_num | kind   │   nanoseconds    │
-└──────────────────┴───────────────────┴──────────────────┘
+┌──────────────────┬───────────────────┐
+│    user_key      │    trailer (8B)   │
+│   (variable)     │  seq_num | kind   │
+└──────────────────┴───────────────────┘
 
 trailer = (seq_num << 8) | kind
 
@@ -449,7 +448,7 @@ kind values:
 
 The **trailer** packs the sequence number and operation kind into 8 bytes. The sequence number occupies the upper 56 bits, and the kind occupies the lower 8 bits. This encoding allows efficient comparison: keys are sorted first by user key, then by sequence number (descending), so the newest version appears first.
 
-The **timestamp** (optional, enabled with versioning) stores the application-provided timestamp in nanoseconds. This enables point-in-time queries using actual wall-clock times rather than internal sequence numbers.
+The **timestamp** of a version of a versioned tree is not part of the key: it is stored with the value, in the `ValueLocation` that every stored value is wrapped in (see Versioned Queries below). This enables point-in-time queries using actual wall-clock times rather than internal sequence numbers, while keys are ordered by sequence number only.
 
 **Operation Kinds Explained:**
 
@@ -493,116 +492,127 @@ The Oracle is responsible for:
 
 When two transactions both modify the same key, the Oracle ensures only one can commit. The first to call commit wins; the second receives a conflict error and must retry.
 
+### Versioned Queries
+
+A tree built with `with_versioning(true, retention_ns)` keeps the history of its keys, and answers
+`Transaction::get_at(key, ts)` and `Transaction::history(start, end)`.
+
+**A version is a write with a timestamp.** Every write of a versioned tree is stamped with the time
+it was given (`set_at`, `WriteOptions::with_timestamp`) or with the time of its commit, in
+nanoseconds. A time of 0 is the time of the commit. The stamp is kept with the value, in the `ValueLocation` that every stored value is
+wrapped in:
+
+```text
+meta (1) | version (1) | timestamp (8, big endian, if meta has BIT_HAS_TIMESTAMP) | value
+```
+
+The stamp is added when the batch is encoded for the WAL, so the WAL record, the memtable, the
+tables and a replay after a crash all carry it, and a value that is moved to the value log keeps
+it in its pointer. A soft delete has no value and is a version of its own: it is stored as an empty
+value with its timestamp. A hard delete is not a version but a barrier, and has no timestamp. A
+tree that is not versioned writes no stamp, and stores values exactly as it always did.
+
+Nothing else is needed: versioning requires neither the value log nor an index. Whether the tree
+is versioned decides whether `get_at` and `history` can be asked for, and how compaction treats
+old versions.
+
+**A version without a timestamp** was written while the tree was not versioned. It reads as
+written when the versions written before it were: it takes the newest time of those below it, and
+as the newest write it comes first among versions of that time. So a database that is opened
+versioned, then not, then versioned again reads what was written in between as the newest writes,
+never as older than the versions before them, though without a time of its own. In a database
+that was never versioned there are none before it, and it reads as written at 0. A table
+that holds one records the whole span of times, 0 to the end, and `history` never leaves it out.
+A compaction of a tree that is versioned gives it the time it reads at, as its own, when it keeps
+it at the bottom level under a retention period (with a retention of 0 nothing is dropped, and
+it stays as it is). A compaction of a tree that is not versioned keeps one version of a key and
+does not: it drops what the time was taken from, as it drops the history, and a tree that is
+versioned again reads what is left at the times that are left.
+
+**Storage order is write order.** The LSM orders the versions of a key by sequence number, newest
+first, whatever their timestamps. A timestamp can go backwards: a version can be written for a
+time in the past (a backfill), after versions of later times.
+
+**Query order is time order.** `history` returns the versions of a key from the newest timestamp to
+the oldest, and the newest write first among versions of one timestamp. It reads the visible
+versions of a key, applies the barriers, orders them, and returns them (forwards or backwards). The
+first version at or before a time is therefore the version at that time, which is what
+`get_at(key, ts)` returns and what a point-in-time scan takes. Within a key:
+
+- a hard delete as the newest write erases the key: it has no history;
+- a hard delete below that hides every version written before it, whatever its time;
+- a range delete does the same for every key it covers, for a reader that reads it: `get_at` and
+  `history` agree with a plain read;
+- a replace is a version, and hides every version written before it;
+- the timestamp range of `HistoryOptions` and the tombstone option only decide what is returned,
+  after the barriers are applied.
+
+A write of the transaction that is not committed is placed among the versions of the snapshot by
+its timestamp, and is a version of the key as it will be once committed. A transaction is atomic,
+so what it writes to a key at one time is one version of it: the last of its writes. The others
+are states that no reader could have seen, and they are in no history, whether a savepoint kept
+them apart or not (a savepoint keeps them in the write set so that a rollback can give them back,
+and the rule is applied when the writes are read and when they are committed). Writes at different
+times are different versions, and so are those of different transactions at one time. A write
+that is to be stamped with the time of its commit is newer than every version that exists: it is
+reported with the timestamp `u64::MAX`, so that the timestamps of `history` descend and a read at
+any past time does not see it. A hard delete, a replace or a range delete of the transaction hides
+what was written before it, in the snapshot and in the transaction alike, and a replace that a
+write of the same time supersedes still does. What the transaction reads of its own writes is
+the same whichever way it reads: `get`, `get_async`, `get_at`, `history`, and a scan or an
+iterator in either direction all see its writes and its range deletes, and a range delete of the
+transaction hides the keys of the snapshot that it covers. `HistoryOptions::limit` counts the
+transaction's versions and the snapshot's together, and is one budget for a walk that turns
+round.
+
+In a tree that is not versioned there is no history for a hard delete to wipe, and a write over
+a hard delete of the same key in the same savepoint is one overwrite of the key, as it always
+was.
+
+`get_at` reads the versions of one key once, oldest write first, and holds only the best so far.
+`history` reads, orders and holds the versions of one key at a time, so a key with a very long
+history, kept for ever, is held in memory whole while it is returned.
+
+A table records the oldest and the newest timestamp of the versions it holds, and `history` with a
+timestamp range does not read a table whose versions all lie before the range. Tables after the
+range are read: a version without a timestamp reads as written when the versions before it were,
+and those can be in such a table. A table that holds a hard delete, a range delete, a replace or
+a version without a timestamp is never skipped, since it hides versions in other tables whatever
+its own time.
+
 ### Version Retention
 
-By default, compaction drops old versions as soon as they are no longer visible to any active snapshot. When versioning is enabled (`with_versioning(true, retention_ns)`), the behavior changes:
+By default, compaction drops old versions as soon as they are no longer visible to any active
+snapshot. A versioned tree also keeps its history:
 
-- **All versions are preserved** during compaction, not just the latest
-- **Retention period**: Versions older than `retention_ns` nanoseconds may be garbage collected
-- **Unlimited retention**: Setting `retention_ns = 0` keeps all versions forever
+- **`retention_ns = 0` keeps every version** for ever.
+- **A retention period** keeps the versions written at or after `now - retention_ns`, and the one
+  version that a read at that time sees: the version with the newest timestamp before it, and the
+  newest write among those of that timestamp. Versions older than that are dropped. A snapshot
+  reads only what was written at or before it, so the version it reads at that time is kept for
+  it as well: the readers there are (the newest versions, the horizon, each snapshot) each keep
+  their own. A version that a range deletion the reader sees hides from it is never that
+  reader's. A range deletion is in the table of its start key, and a compaction reads the tables
+  that overlap its keys, so it also looks at the range deletions of the tables it does not read
+  that cover keys it reads: the readers read them.
+- **A version without a timestamp** (written while the tree was not versioned) reads as written
+  when the versions before it were, and a compaction above the bottom level does not read all of
+  them: the time it infers is not more than the real one and can be less, so it keeps such a
+  version, and the version a read at the start of the period would see without it, until the
+  version reaches the bottom level, where every older version is read and the time is exact. A
+  version without a timestamp that a compaction at the bottom level keeps is given the time it
+  read at, as its own, so that it reads the same when the versions it took the time from go.
+- **A hard delete or a replace is a barrier**: a version written before it is not history for a
+  reader that reads the barrier. A reader whose snapshot lies between the two still has the version
+  in its history, and so does one that reads at the horizon when the barrier is above it, so the
+  version is kept while one does. A barrier is kept for as long as a version below it is kept, and
+  a hard delete, a range delete or a replace that a reader reads is kept, above the bottom level,
+  for as long as there can be versions below it in tables the compaction does not read. One that a
+  newer barrier hides from every reader is not kept for that.
+- What readers can see is kept as it always was: the newest version, and the versions that active
+  snapshots read. Flushing a memtable keeps every version it holds.
 
-This enables time-travel queries where applications can read the database state at any historical timestamp within the retention window.
-
-### Versioned Storage Architecture
-
-When versioning is enabled, SurrealKV automatically configures the storage layer to support efficient historical queries. The key insight is that all values are stored in the VLog, and indexes (both LSM and optional B+tree) store only value pointers. This architecture enables multiple index structures on top of a single value store.
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                     VERSIONED STORAGE ARCHITECTURE                          │
-│                                                                             │
-│  When versioning is enabled, all values are stored in VLog.                 │
-│  Indexes store only value pointers, enabling multiple index structures.     │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                        INDEX LAYER                                  │    │
-│  │                                                                     │    │
-│  │   ┌───────────────────┐         ┌───────────────────┐               │    │
-│  │   │  LSM Tree Index   │         │  B+Tree Index     │               │    │
-│  │   │  (always present) │         │  (optional)       │               │    │
-│  │   │                   │         │                   │               │    │
-│  │   │  InternalKey ──►  │         │  InternalKey ──►  │               │    │
-│  │   │  ValuePointer     │         │  ValuePointer     │               │    │
-│  │   └─────────┬─────────┘         └─────────┬─────────┘               │    │
-│  │             │                             │                         │    │
-│  │             └──────────────┬──────────────┘                         │    │
-│  │                            │                                        │    │
-│  └────────────────────────────┼────────────────────────────────────────┘    │
-│                               │                                             │
-│                               ▼                                             │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                        VALUE LOG (VLog)                             │    │
-│  │                                                                     │    │
-│  │   All versioned entries stored here (vlog_value_threshold = 0)      │    │
-│  │                                                                     │    │
-│  │   ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐                   │    │
-│  │   │ Entry 1 │ │ Entry 2 │ │ Entry 3 │ │ Entry 4 │ ...               │    │
-│  │   │ v1 of A │ │ v2 of A │ │ v1 of B │ │ v3 of A │                   │    │
-│  │   └─────────┘ └─────────┘ └─────────┘ └─────────┘                   │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
-**Configuration:**
-
-When `with_versioning(true, retention_ns)` is called:
-- VLog is automatically enabled
-- `vlog_value_threshold` is set to 0, so all values go to VLog
-- The LSM tree stores `(InternalKey → ValuePointer)` instead of inline values
-
-**Two Query Modes:**
-
-| Mode | Configuration | Query Method |
-|------|---------------|--------------|
-| LSM-only | `with_versioning(true, retention_ns)` | K-way merge across all LSM components |
-| B+tree indexed | + `with_versioned_index(true)` | Direct B+tree lookup |
-
-**LSM-based Versioned Queries:**
-
-When using LSM-only versioning, the `history()` API uses a `KMergeIterator` that gathers iterators from:
-- Active memtable
-- All immutable memtables (pending flush)
-- All SSTable levels (L0, L1, L2, ...)
-
-These are merged using a k-way merge that returns entries sorted by (user_key, seq_num descending). Finding all versions of a key requires scanning all levels.
-
-**B+tree Versioned Queries:**
-
-When `with_versioned_index(true)` is also enabled, versioned queries go directly to the B+tree which stores all `(InternalKey → ValuePointer)` entries. The B+tree keeps entries sorted, so all versions of a key are contiguous and can be retrieved with a single seek.
-
-The B+tree implementation uses a disk-based page management approach, with the handling of large entries drawing inspiration from SQLite's overflow page design.
-
-**Why Use B+tree Index:**
-
-The motivation for the optional B+tree index:
-- LSM stores keys across multiple SSTables; finding all versions requires checking every level
-- B+tree consolidates all versions in a single sorted structure
-- Single index lookup vs. merging N sources (where N = memtables + SSTables)
-
-**B+tree Trade-offs:**
-
-| Pros | Cons |
-|------|------|
-| Single index lookup instead of k-way merge | Slow insertion (in-place modified tree on disk) |
-| Fast point and range queries for history | Insert performance slows during LSM writes |
-| All versions of a key are contiguous | Every LSM write also updates B+tree |
-
-**Timestamp Ordering Limitation:**
-
-When using LSM-only versioning (without B+tree index), timestamps inserted "back in time" will not be read correctly. This occurs because:
-- LSM orders entries by `(user_key ASC, seq_num DESC)`
-- Point-in-time queries (`get_at`) find the first entry with `seq_num <= snapshot_seq` where `timestamp <= query_timestamp`
-- A later-inserted entry with an earlier timestamp will have a higher sequence number, causing it to be returned instead of the correct historical value
-
-To support out-of-order timestamp inserts, enable the B+tree index with `with_versioned_index(true)`. The B+tree stores entries sorted by `(user_key, timestamp)` and supports in-place updates, correctly handling historical data insertion.
-
-**Read-after-Write Consistency:**
-
-Currently, the B+tree index is updated synchronously during LSM writes, providing read-after-write consistency for versioned queries. A recently written version is immediately visible via the `history()` API.
-
-**Future Work:**
-
-Async indexing could improve write performance by decoupling B+tree updates from the LSM write path. However, this would require relaxing the read-after-write consistency guarantee (recently written versions may not be immediately visible via B+tree queries). This is a potential optimization for future versions.
+The time the period starts at is read from the tree's clock once for a whole compaction.
 
 ---
 
@@ -989,14 +999,6 @@ Any VLog file with `file_id < min_oldest_vlog` is safe to delete because no SSTa
 └─────────────────────────────────────────────────────────────────────────────┘
                                        │
                                        ▼
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                         VERSIONED INDEX CLEANUP                             │
-│                                                                             │
-│  If versioned_index (B+tree) is enabled:                                    │
-│    - Scan B+tree entries for stale VLog pointers                            │
-│    - Remove entries where pointer.file_id < min_oldest_vlog                 │
-│    - Uses read-scan + batched-write-delete for concurrency safety           │
-└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### GC Components
@@ -1006,7 +1008,6 @@ Any VLog file with `file_id < min_oldest_vlog` is safe to delete because no SSTa
 | **oldest_vlog_file_id** | SST metadata tracking oldest VLog file referenced | SST properties |
 | **min_oldest_vlog_file_id()** | Computes global minimum across all SSTs | `LevelManifest` method |
 | **iterator_count** | Safety counter for active readers | `VLog` struct |
-| **cleanup_stale_versioned_index()** | Removes stale B+tree entries | `CoreInner` method |
 
 ### GC Trigger Points
 
@@ -1035,15 +1036,6 @@ VLog files cannot be deleted while readers might access them. The `iterator_coun
 - If `iterator_count > 0`, deletion is deferred to startup cleanup
 
 This prevents the race condition where GC deletes a file that an in-flight read is about to access.
-
-**Versioned Index Cleanup:**
-
-When the optional B+tree versioned index is enabled, it stores `(InternalKey → ValuePointer)` entries. After VLog files are deleted, stale entries pointing to those files must be removed:
-
-1. **Read Phase**: Scan the B+tree under a read lock, collecting keys with `pointer.file_id < min_oldest_vlog`
-2. **Delete Phase**: Remove collected keys in batches under brief write locks
-
-This two-phase approach avoids holding locks during the full scan, allowing concurrent writes.
 
 ---
 

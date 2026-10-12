@@ -462,37 +462,24 @@ async fn orphan_cleanup_is_skipped_for_a_manifest_created_in_this_run() {
 // Foreign-format directories are migrated, not refused
 // ---------------------------------------------------------------------------
 
-/// Their files sit at the top level, where the manifest check does not look,
-/// and the migration moves them aside before it creates the manifest itself.
-/// The foreign databases here hold no records: only the detection, the move
-/// into the backup directory and the hand-over to a normal open are exercised.
+/// Their files sit at the top level, where the manifest check does not look. A directory that
+/// looks like RocksDB but whose MANIFEST cannot be read is refused and left exactly as it was:
+/// moving it aside and starting empty, which an earlier version did, would lose the database. The
+/// real migration, with real RocksDB databases, is tested in `rocksdb_migration_tests`.
 #[test(tokio::test)]
-async fn rocksdb_directory_is_still_migrated() {
+async fn a_rocksdb_directory_that_cannot_be_read_is_refused_untouched() {
 	let dir = TempDir::new().unwrap();
 	fs::write(dir.path().join("CURRENT"), b"MANIFEST-000001\n").unwrap();
 	fs::write(dir.path().join("MANIFEST-000001"), b"not a real rocksdb manifest").unwrap();
 
-	initialise_and_use(&plain_options(dir.path())).await;
+	let err = Tree::new(plain_options(dir.path())).err().expect("an unreadable RocksDB database");
+	assert!(matches!(err, Error::MigrationFailed(_)), "{err:?}");
 
-	assert!(dir.path().join("_rocksdb_backup/CURRENT").exists());
-	assert!(dir.path().join("_rocksdb_backup/MANIFEST-000001").exists());
-	assert!(!dir.path().join("CURRENT").exists());
-}
-
-#[test(tokio::test)]
-async fn surrealkv_v1_directory_is_still_migrated() {
-	use surrealkv_compat_v1::{V1_FOOTER_TOTAL_LEN, V1_MAGIC_FOOTER};
-
-	let dir = TempDir::new().unwrap();
-	// The detector only looks for the footer magic at the end of an SSTable.
-	let mut table = vec![0u8; V1_FOOTER_TOTAL_LEN];
-	table[V1_FOOTER_TOTAL_LEN - V1_MAGIC_FOOTER.len()..].copy_from_slice(&V1_MAGIC_FOOTER);
-	fs::write(dir.path().join("000001.sst"), &table).unwrap();
-
-	initialise_and_use(&plain_options(dir.path())).await;
-
-	assert_eq!(fs::read(dir.path().join("_v1_backup/000001.sst")).unwrap(), table);
-	assert!(!dir.path().join("000001.sst").exists());
+	assert_eq!(fs::read(dir.path().join("CURRENT")).unwrap(), b"MANIFEST-000001\n");
+	assert!(dir.path().join("MANIFEST-000001").exists());
+	assert!(!dir.path().join("_rocksdb_backup").exists());
+	assert!(!dir.path().join("MIGRATING_ROCKSDB").exists());
+	assert!(!dir.path().join("manifest").exists(), "no database was created over it");
 }
 
 /// The migrated database is an ordinary database afterwards: losing its

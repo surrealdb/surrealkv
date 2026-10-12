@@ -1,0 +1,3 @@
+24 keys, versioned, killed before any flush (test fixture)
+versioned=true
+keys=24

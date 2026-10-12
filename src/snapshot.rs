@@ -11,6 +11,7 @@ use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
 use crate::sstable::table::Table;
+use crate::vlog::ValueLocation;
 use crate::{
 	BytewiseComparator,
 	Comparator,
@@ -21,7 +22,6 @@ use crate::{
 	InternalKeyRef,
 	Key,
 	LSMIterator,
-	TimestampComparator,
 	Value,
 };
 
@@ -135,6 +135,51 @@ pub(crate) struct IterState {
 	pub immutable: Vec<Arc<MemTable>>,
 	/// All levels containing SSTables
 	pub levels: Levels,
+}
+
+impl IterState {
+	/// The range deletions of every memtable and table of the state, `(start, end, seq)`: those
+	/// that cover `key` if it is given. Of the memtables and tables, only those that have any
+	/// are looked in.
+	pub(crate) fn range_deletions(&self, key: Option<&[u8]>) -> Vec<(Key, Key, u64)> {
+		let mut range_deletions = Vec::new();
+		let covers = |start: &Key, end: &Key| {
+			key.is_none_or(|key| key >= start.as_slice() && key < end.as_slice())
+		};
+		let mut add = |list: &[(Key, Key, u64)]| {
+			range_deletions
+				.extend(list.iter().filter(|(start, end, _)| covers(start, end)).cloned());
+		};
+		for memtable in std::iter::once(&self.active).chain(&self.immutable) {
+			if memtable.has_range_deletions() {
+				add(&memtable.range_deletions.read());
+			}
+		}
+		for level in &self.levels {
+			for table in &level.tables {
+				if table.has_range_deletions() {
+					add(&table.range_deletions.read());
+				}
+			}
+		}
+		range_deletions
+	}
+}
+
+/// Whether a range deletion that the snapshot at `snapshot_seq` reads hides the version of
+/// `user_key` written at `seq`: one written before it, or with it.
+fn covered_by_range(
+	range_deletions: &[(Key, Key, u64)],
+	snapshot_seq: u64,
+	user_key: &[u8],
+	seq: u64,
+) -> bool {
+	range_deletions.iter().any(|(start, end, rseq)| {
+		seq <= *rseq
+			&& *rseq <= snapshot_seq
+			&& user_key >= start.as_slice()
+			&& user_key < end.as_slice()
+	})
 }
 
 // ===== Snapshot Implementation =====
@@ -450,11 +495,10 @@ impl Snapshot {
 		SnapshotIterator::new_from(Arc::clone(&self.core), self.seq_num, internal_range)
 	}
 
-	/// Creates a unified history iterator that works with both LSM and B+tree backends.
+	/// Creates a history iterator: every version of every key in the range, newest first within
+	/// a key, over the memtables and the tables.
 	///
-	/// When `enable_versioned_index` is true, merges memtable iterators (unflushed data)
-	/// with B+tree iterator (flushed data with value pointers) via KMergeIterator.
-	/// When false, uses KMergeIterator over memtables + SSTables.
+	/// A version's timestamp is stored with its value, and the iterator's `key()` reports it.
 	///
 	/// # Arguments
 	/// * `lower` - Optional lower bound key (inclusive)
@@ -482,10 +526,12 @@ impl Snapshot {
 			upper.map(Bound::Excluded).unwrap_or(Bound::Unbounded),
 		);
 		let iter_state = self.collect_iter_state()?;
+		let range_deletions = iter_state.range_deletions(None);
 
 		Ok(HistoryIterator::new_lsm(
 			self.seq_num,
 			iter_state,
+			range_deletions,
 			range,
 			include_tombstones,
 			ts_range,
@@ -495,51 +541,104 @@ impl Snapshot {
 		))
 	}
 
-	/// Queries for a specific key at a specific timestamp.
+	/// Queries for a specific key at a specific timestamp: the version of it that `get_at`
+	/// answers with, with its time. `None` if the key has no version at or before `timestamp`,
+	/// and a version without a value if that is a soft delete.
 	/// Only returns data visible to this snapshot (seq_num <= snapshot.seq_num).
 	///
-	/// Uses the unified `history_iter()` for both B+tree and LSM backends.
-	pub(crate) fn get_at(&self, key: &[u8], timestamp: u64) -> Result<Option<Value>> {
-		// Use unified history iterator for both backends
-		let mut iter = self.history_iter(Some(key), None, true, None, None)?;
-		iter.seek_first()?;
-
-		// Track the best match (latest version at or before requested timestamp)
-		let mut best_value: Option<Value> = None;
-		let mut best_timestamp: u64 = 0;
-
-		while iter.valid() {
-			let entry_key = iter.key();
-
-			// Stop if we've moved past our key
-			if entry_key.user_key() != key {
-				break;
-			}
-
-			// Only consider versions visible to this snapshot
-			if entry_key.seq_num() > self.seq_num {
-				iter.next()?;
-				continue;
-			}
-
-			let entry_ts = entry_key.timestamp();
-
-			// Only consider versions at or before the requested timestamp
-			if entry_ts <= timestamp && entry_ts >= best_timestamp {
-				if entry_key.is_tombstone() {
-					// Key was deleted at this timestamp
-					best_value = None;
-				} else {
-					best_value = Some(self.core.resolve_value(iter.value_encoded()?)?);
-				}
-				best_timestamp = entry_ts;
-			}
-
-			iter.next()?;
+	/// The answer is the version with the newest timestamp that is at or before `timestamp`, and
+	/// the newest write among versions of one timestamp: the first version `history` returns
+	/// that is not after `timestamp`. A version written without a timestamp, by a database that
+	/// had none or while versioning was off, counts as written when the versions before it
+	/// were. A hard delete and a range delete hide every version written before them, whatever
+	/// their time: the key has no history before it.
+	///
+	/// The versions of the key are read once, oldest write first, and only the best so far is
+	/// held: a version that has no time reads as written when the ones before it were, which is
+	/// known as they come in that order.
+	pub(crate) fn version_at(&self, key: &[u8], timestamp: u64) -> Result<Option<SnapshotVersion>> {
+		if !self.core.opts.enable_versioning {
+			return Err(Error::InvalidArgument("Versioning not enabled".to_string()));
 		}
 
-		Ok(best_value)
+		let mut upper = key.to_vec();
+		upper.push(0);
+		let range = crate::user_range_to_internal_range(
+			Bound::Included(key),
+			Bound::Excluded(upper.as_slice()),
+		);
+		let iter_state = self.collect_iter_state()?;
+		let range_deletions = iter_state.range_deletions(Some(key));
+		let mut merge = KMergeIterator::new_from(iter_state, range);
+		// After every version of the key: the next key's first entry, or the end. Going back from
+		// there reads the versions of the key from the oldest write to the newest.
+		merge.seek(&InternalKey::new(key.to_vec(), 0, InternalKeyKind::Set).encode())?;
+		if merge.valid() {
+			merge.prev()?;
+		} else {
+			merge.seek_last()?;
+		}
+
+		// `(time, is a tombstone, encoded value)` of the best version so far, and the newest time
+		// of the versions read.
+		let mut best: Option<(u64, bool, Vec<u8>)> = None;
+		let mut newest = 0u64;
+		while merge.valid() {
+			let key_ref = merge.key();
+			if key_ref.user_key() != key {
+				break;
+			}
+			let seq = key_ref.seq_num();
+			if seq > self.seq_num || covered_by_range(&range_deletions, self.seq_num, key, seq) {
+				merge.prev()?;
+				continue;
+			}
+			// A hard delete hides every version written before it.
+			if key_ref.is_hard_delete_marker() {
+				best = None;
+				newest = 0;
+				merge.prev()?;
+				continue;
+			}
+			// So does a replace, which is a version too.
+			if key_ref.is_replace() {
+				best = None;
+				newest = 0;
+			}
+			let value = merge.value_encoded()?;
+			let time = match ValueLocation::entry_time(key_ref.kind(), value) {
+				Some(time) => {
+					newest = newest.max(time);
+					time
+				}
+				None => newest,
+			};
+			// Oldest write first: a version of the same time as the best is newer.
+			if time <= timestamp && best.as_ref().is_none_or(|(best_time, ..)| time >= *best_time) {
+				best = Some((time, key_ref.is_tombstone(), value.to_vec()));
+			}
+			merge.prev()?;
+		}
+
+		match best {
+			Some((time, false, value)) => Ok(Some(SnapshotVersion {
+				time,
+				value: Some(self.core.resolve_value(&value)?),
+			})),
+			Some((time, true, _)) => Ok(Some(SnapshotVersion {
+				time,
+				value: None,
+			})),
+			None => Ok(None),
+		}
 	}
+}
+
+/// A version of a key as a snapshot holds it: when it was written, and its value, or none if it
+/// is a soft delete.
+pub(crate) struct SnapshotVersion {
+	pub(crate) time: u64,
+	pub(crate) value: Option<Value>,
 }
 
 impl Drop for Snapshot {
@@ -548,6 +647,23 @@ impl Drop for Snapshot {
 		// clean up versions no longer visible to any snapshot
 		self.core.snapshot_tracker.unregister(self.seq_num, Some(self.shard_idx));
 	}
+}
+
+/// Whether every version a table holds is older than the timestamp range, so that the table has
+/// nothing to add to a history of that range.
+///
+/// Only the tables before the range can be left out, and not those after it: a version written
+/// without a time reads as written when the versions before it were, which can be those of a table
+/// that lies after the range, and without the table it would read as written at a time inside it.
+/// A table before the range can only give a time that is before it as well, whatever is read of it.
+/// A table that holds a hard delete, a replace, or a version without a time records no times, and
+/// is never left out.
+fn table_lies_before(table: &crate::sstable::table::Table, ts_range: Option<(u64, u64)>) -> bool {
+	let Some((ts_start, _)) = ts_range else {
+		return false;
+	};
+	let props = &table.meta.properties;
+	matches!((props.newest_key_time, props.oldest_key_time), (Some(newest), Some(_)) if newest < ts_start)
 }
 
 /// Direction of iteration for KMergeIterator
@@ -594,15 +710,16 @@ impl<'a> KMergeIterator<'a> {
 		Self::new_with_comparator(iter_state, internal_range, cmp, None)
 	}
 
-	/// Creates a new KMergeIterator with TimestampComparator for history queries.
-	/// This enables timestamp-based seek optimization when timestamps are monotonic with seq_nums.
+	/// Creates a new KMergeIterator for history queries. The versions of a key are in the order
+	/// of their sequence numbers, newest first, as everywhere else; tables whose timestamps all
+	/// lie outside `ts_range` are not read.
 	pub(crate) fn new_for_history(
 		iter_state: IterState,
 		internal_range: InternalKeyRange,
 		ts_range: Option<(u64, u64)>,
 	) -> Self {
 		let cmp: Arc<dyn Comparator> =
-			Arc::new(TimestampComparator::new(Arc::new(BytewiseComparator::default())));
+			Arc::new(InternalKeyComparator::new(Arc::new(BytewiseComparator::default())));
 		Self::new_with_comparator(iter_state, internal_range, cmp, ts_range)
 	}
 
@@ -661,16 +778,9 @@ impl<'a> KMergeIterator<'a> {
 					{
 						continue;
 					}
-					// Skip tables outside timestamp range (if specified)
-					if let Some((ts_start, ts_end)) = ts_range {
-						let props = &table.meta.properties;
-						if let (Some(newest), Some(oldest)) =
-							(props.newest_key_time, props.oldest_key_time)
-						{
-							if newest < ts_start || oldest > ts_end {
-								continue;
-							}
-						}
+					// Skip tables whose versions all lie before the timestamp range (if specified)
+					if table_lies_before(table, ts_range) {
+						continue;
 					}
 					// Use custom comparator for table iteration
 					if let Ok(table_iter) =
@@ -685,16 +795,9 @@ impl<'a> KMergeIterator<'a> {
 				let end_idx = level.find_last_overlapping_table(&query_range);
 
 				for table in &level.tables[start_idx..end_idx] {
-					// Skip tables outside timestamp range (if specified)
-					if let Some((ts_start, ts_end)) = ts_range {
-						let props = &table.meta.properties;
-						if let (Some(newest), Some(oldest)) =
-							(props.newest_key_time, props.oldest_key_time)
-						{
-							if newest < ts_start || oldest > ts_end {
-								continue;
-							}
-						}
+					// Skip tables whose versions all lie before the timestamp range (if specified)
+					if table_lies_before(table, ts_range) {
+						continue;
 					}
 					// Use custom comparator for table iteration
 					if let Ok(table_iter) =
@@ -1356,24 +1459,48 @@ impl LSMIterator for SnapshotIterator<'_> {
 	}
 }
 
-// ===== B+Tree History Iterator =====
+// ===== History Iterator =====
 
-/// A streaming iterator over the B+tree versioned index.
-///
-/// This struct holds both the RwLock read guard and the BPlusTreeIterator together,
-/// allowing true streaming iteration without collecting results into memory.
-///
-/// # Safety
-/// This is a self-referential struct. The iterator borrows from the guarded tree.
-
-// ===== Unified History Iterator =====
-
+/// A version in the history of a key, as the iterator holds it.
 #[derive(Clone)]
 struct BufferedEntry {
+	/// The encoded internal key: the user key and the trailer.
 	key: Vec<u8>,
 	value: Vec<u8>,
+	/// The time the version was written at, see `InternalKeyRef::timestamp`.
+	timestamp: u64,
+	/// The sequence number of the write.
+	seq: u64,
 }
 
+/// A visible version of a key, as read from the tables and the memtables.
+struct Version {
+	is_hard_delete: bool,
+	is_replace: bool,
+	is_tombstone: bool,
+	/// The time the version was stamped with, if it was.
+	stamp: Option<u64>,
+	/// Whether the version is to be returned, if no barrier hides it: it is in the timestamp
+	/// range, and is not a tombstone that is not asked for. The value of one that is not is not
+	/// copied. For a version that has no stamp, whose time is only known with the others of its
+	/// key, `make_group` decides this.
+	wanted: bool,
+	entry: BufferedEntry,
+}
+
+/// Iterates the versions of the keys of a range: keys in order, and for each key its versions
+/// from the newest timestamp to the oldest, and the newest write first among versions of the same
+/// timestamp. This is the order a versioned read needs: the first version at or before a time is
+/// the version at that time. It is not the order the versions are stored in, which is the order
+/// of their sequence numbers; the timestamp of a write can be older than an earlier write's.
+///
+/// The versions of one key are read, ordered and held together, and the iterator moves through
+/// them, forwards or backwards, and on to the neighbouring key.
+///
+/// A hard delete hides every version below it, whatever its time, and a replace hides every
+/// version below it but is itself a version. Below means written before, by sequence number: the
+/// barriers are found in storage order, before the timestamp range and the tombstones are taken
+/// out of what is returned.
 pub struct HistoryIterator<'a> {
 	inner: KMergeIterator<'a>,
 	snapshot_seq_num: u64,
@@ -1382,15 +1509,17 @@ pub struct HistoryIterator<'a> {
 	initialized: bool,
 	lower_bound: Option<Vec<u8>>,
 	upper_bound: Option<Vec<u8>>,
-	// === Forward iteration state (streaming) ===
-	current_user_key: Vec<u8>,
-	first_visible_seen: bool,
-	latest_is_hard_delete: bool,
-	barrier_seen: bool, // True once we hit HARD_DELETE or REPLACE
 
-	// === Backward iteration state (buffered) ===
-	backward_buffer: Vec<BufferedEntry>,
-	backward_buffer_index: Option<usize>,
+	/// The versions of the current key that are returned, in the order they are returned in
+	/// going forwards.
+	group: Vec<BufferedEntry>,
+	/// The user key of `group`.
+	group_key: Vec<u8>,
+	/// The entry of `group` the iterator is on, if it is on one.
+	pos: Option<usize>,
+
+	/// The range deletions of the state the iterator reads: `(start, end, seq)`.
+	range_deletions: Vec<(Key, Key, u64)>,
 
 	// === Filtering options ===
 	ts_range: Option<(u64, u64)>, // (start_ts, end_ts) inclusive
@@ -1401,11 +1530,10 @@ pub struct HistoryIterator<'a> {
 
 impl<'a> HistoryIterator<'a> {
 	/// Creates a HistoryIterator from a pre-built KMergeIterator.
-	/// Used for both the versioned-index path (memtables + bplustree) and
-	/// the LSM-only path (memtables + SSTables).
 	#[allow(clippy::too_many_arguments)]
 	pub(crate) fn new(
 		merge_iter: KMergeIterator<'a>,
+		range_deletions: Vec<(Key, Key, u64)>,
 		seq_num: u64,
 		include_tombstones: bool,
 		lower: Option<&[u8]>,
@@ -1414,6 +1542,7 @@ impl<'a> HistoryIterator<'a> {
 		limit: Option<usize>,
 	) -> Self {
 		Self {
+			range_deletions,
 			inner: merge_iter,
 			snapshot_seq_num: seq_num,
 			include_tombstones,
@@ -1421,12 +1550,9 @@ impl<'a> HistoryIterator<'a> {
 			initialized: false,
 			lower_bound: lower.map(|b| b.to_vec()),
 			upper_bound: upper.map(|b| b.to_vec()),
-			current_user_key: Vec::new(),
-			first_visible_seen: false,
-			latest_is_hard_delete: false,
-			barrier_seen: false,
-			backward_buffer: Vec::new(),
-			backward_buffer_index: None,
+			group: Vec::new(),
+			group_key: Vec::new(),
+			pos: None,
 			ts_range,
 			limit,
 			entries_returned: 0,
@@ -1438,6 +1564,7 @@ impl<'a> HistoryIterator<'a> {
 	pub(crate) fn new_lsm(
 		seq_num: u64,
 		iter_state: IterState,
+		range_deletions: Vec<(Key, Key, u64)>,
 		range: InternalKeyRange,
 		include_tombstones: bool,
 		ts_range: Option<(u64, u64)>,
@@ -1445,37 +1572,34 @@ impl<'a> HistoryIterator<'a> {
 		lower: Option<&[u8]>,
 		upper: Option<&[u8]>,
 	) -> Self {
-		// Use TimestampComparator for history queries with timestamp range
-		// This enables efficient timestamp-based seeks when timestamps are monotonic with seq_nums
+		// A timestamp range lets whole tables be skipped, see `KMergeIterator::new_for_history`
 		let inner = if ts_range.is_some() {
 			KMergeIterator::new_for_history(iter_state, range, ts_range)
 		} else {
 			KMergeIterator::new_from(iter_state, range)
 		};
 
-		Self::new(inner, seq_num, include_tombstones, lower, upper, ts_range, limit)
-	}
-
-	fn reset_forward_state(&mut self) {
-		self.current_user_key.clear();
-		self.first_visible_seen = false;
-		self.latest_is_hard_delete = false;
-		self.barrier_seen = false;
-	}
-
-	fn clear_backward_buffer(&mut self) {
-		self.backward_buffer.clear();
-		self.backward_buffer_index = None;
+		Self::new(
+			inner,
+			range_deletions,
+			seq_num,
+			include_tombstones,
+			lower,
+			upper,
+			ts_range,
+			limit,
+		)
 	}
 
 	/// Everything `reset_all_state` clears EXCEPT the `limit` budget counter.
 	///
 	/// `limit_reached` is cleared here rather than preserved because it is a
-	/// derived flag: `skip_to_valid_forward` and `collect_user_key_backward`
-	/// re-raise it from `entries_returned` against `limit` on the way out.
+	/// derived flag: it is raised again from `entries_returned` against `limit` as soon as the
+	/// iterator is asked to move on.
 	fn reset_position_state(&mut self) {
-		self.reset_forward_state();
-		self.clear_backward_buffer();
+		self.group.clear();
+		self.group_key.clear();
+		self.pos = None;
 		self.limit_reached = false;
 	}
 
@@ -1497,36 +1621,24 @@ impl<'a> HistoryIterator<'a> {
 			self.entries_returned = 0;
 		}
 
-		// NOTE: `initialized` is set inside each arm, AFTER the inner seek, to
-		// match the originals and `seek()` below. On the success path the
-		// placement is invisible, but hoisting it above the seek would leave the
-		// iterator `initialized` on a seek error, so a later `next()` would take
-		// the normal-iteration branch and report `Ok(false)` instead of retrying
-		// via `seek_first()`.
+		// NOTE: `initialized` is set AFTER the inner seek, so that a seek error leaves the
+		// iterator uninitialized, and a later `next()` retries via `seek_first()` instead of
+		// reporting `Ok(false)`.
 		match direction {
 			MergeDirection::Forward => {
-				if self.ts_range.is_some() {
-					// Seek to (lower_bound or empty, ts_end) to skip entries above range
-					let _ts = self.ts_range.map(|(_, end)| end).unwrap_or(u64::MAX);
-					let seek_key = InternalKey::new(
-						self.lower_bound.clone().unwrap_or_default(),
-						u64::MAX,
-						InternalKeyKind::Set,
-					);
-					self.inner.seek(&seek_key.encode())?;
-				} else if let Some(ref lower) = self.lower_bound {
+				if let Some(ref lower) = self.lower_bound {
 					let seek_key = InternalKey::new(lower.clone(), u64::MAX, InternalKeyKind::Set);
 					self.inner.seek(&seek_key.encode())?;
 				} else {
 					self.inner.seek_first()?;
 				}
 				self.initialized = true;
-				self.skip_to_valid_forward()
+				self.settle_forward()
 			}
 			MergeDirection::Backward => {
 				self.inner.seek_last()?;
 				self.initialized = true;
-				self.collect_user_key_backward()
+				self.settle_backward()
 			}
 		}
 	}
@@ -1559,61 +1671,14 @@ impl<'a> HistoryIterator<'a> {
 		self.inner.prev()
 	}
 
-	/// Skip all remaining entries for the current user_key.
-	/// Returns true if positioned on a new user_key, false if iterator exhausted.
-	fn skip_to_next_user_key(&mut self) -> Result<bool> {
-		let current = self.current_user_key.clone();
-		while self.inner_valid() {
-			if self.inner_key().user_key() != current.as_slice() {
-				return Ok(true);
-			}
-			self.inner_next()?;
+	fn in_ts_range(&self, timestamp: u64) -> bool {
+		match self.ts_range {
+			Some((ts_start, ts_end)) => timestamp >= ts_start && timestamp <= ts_end,
+			None => true,
 		}
-		Ok(false)
-	}
-
-	/// With ts_range, seek to (next_user_key, ts_end) to skip entries above range.
-	/// Without ts_range, linearly scan past entries with the same user_key.
-	/// Returns true if positioned on a new user_key, false if iterator exhausted.
-	fn advance_to_next_user_key(&mut self) -> Result<bool> {
-		// Only optimize with ts_range
-		let _ts_end = match self.ts_range {
-			Some((_, end)) => end,
-			None => return self.skip_to_next_user_key(),
-		};
-
-		let current = self.current_user_key.clone();
-
-		// Advance to find next user_key
-		while self.inner_valid() {
-			let next_key_vec = self.inner_key().user_key().to_vec();
-			if next_key_vec != current {
-				// Found next key - seek to (next_key, ts_end) to skip entries above range
-				let seek_key = InternalKey::new(next_key_vec, u64::MAX, InternalKeyKind::Set);
-				self.inner.seek(&seek_key.encode())?;
-				return Ok(self.inner_valid());
-			}
-			self.inner_next()?;
-		}
-		Ok(false)
 	}
 
 	// --- Bounds checking ---
-	// KMergeIterator handles bounds via InternalKeyRange, but upper_bound
-	// is still needed for the merged bplustree path where the bplustree
-	// iterator doesn't have native range support.
-
-	fn within_upper_bound(&self) -> bool {
-		if let Some(ref upper) = self.upper_bound {
-			if self.inner_valid() {
-				self.inner_key().user_key() < upper.as_slice()
-			} else {
-				false
-			}
-		} else {
-			true
-		}
-	}
 
 	fn user_key_within_lower_bound(&self, user_key: &[u8]) -> bool {
 		match &self.lower_bound {
@@ -1629,349 +1694,258 @@ impl<'a> HistoryIterator<'a> {
 		}
 	}
 
-	// === FORWARD ITERATION (Streaming) ===
+	// --- The versions of a key ---
 
-	/// Skip to next valid entry in forward direction.
-	///
-	/// Barriers (first one wins):
-	/// - HARD_DELETE: skip it and everything older
-	/// - REPLACE: output it, skip everything older
-	fn skip_to_valid_forward(&mut self) -> Result<bool> {
-		while self.inner_valid() {
-			// Check limit before returning any entry
-			if let Some(limit) = self.limit {
-				if self.entries_returned >= limit {
-					self.limit_reached = true;
-					return Ok(false);
-				}
+	/// The version the inner iterator is at, if the snapshot can see it: a range deletion that
+	/// the snapshot reads hides what was written before it, as it does for a read.
+	fn read_version(&self) -> Result<Option<Version>> {
+		let key_ref = self.inner_key();
+		let seq = key_ref.seq_num();
+		if seq > self.snapshot_seq_num
+			|| covered_by_range(
+				&self.range_deletions,
+				self.snapshot_seq_num,
+				key_ref.user_key(),
+				seq,
+			) {
+			return Ok(None);
+		}
+		let value = self.inner_value()?;
+		let stamp = ValueLocation::entry_time(key_ref.kind(), value);
+		let is_tombstone = key_ref.is_tombstone();
+		let wanted = match stamp {
+			Some(timestamp) => {
+				self.in_ts_range(timestamp) && (self.include_tombstones || !is_tombstone)
 			}
+			None => true,
+		};
+		Ok(Some(Version {
+			is_hard_delete: key_ref.is_hard_delete_marker(),
+			is_replace: key_ref.is_replace(),
+			is_tombstone,
+			stamp,
+			wanted,
+			entry: BufferedEntry {
+				key: key_ref.encoded().to_vec(),
+				value: if wanted {
+					value.to_vec()
+				} else {
+					Vec::new()
+				},
+				timestamp: stamp.unwrap_or(0),
+				seq,
+			},
+		}))
+	}
 
-			if !self.within_upper_bound() {
+	/// Makes the versions of `user_key`, which are given newest write first, the current group.
+	///
+	/// - A hard delete as the newest version erases the key: it has no history.
+	/// - A hard delete below that hides every version under it and is not returned itself.
+	/// - A replace is returned, and hides every version under it.
+	///
+	/// This holds whatever the timestamp range is, which only decides what is returned, and
+	/// whether tombstones are asked for.
+	fn make_group(&mut self, user_key: Vec<u8>, mut versions: Vec<Version>) {
+		self.group.clear();
+		self.group_key = user_key;
+
+		// The same write can be in a table and in a memtable that recovery rebuilt from the log
+		// of that table: it is one version.
+		versions.dedup_by_key(|version| version.entry.seq);
+
+		if versions.first().is_none_or(|latest| latest.is_hard_delete) {
+			return;
+		}
+		// The time of a version that has no stamp is that of the versions written before it.
+		let stamps: Vec<(Option<u64>, bool)> = versions
+			.iter()
+			.map(|version| (version.stamp, version.is_hard_delete || version.is_replace))
+			.collect();
+		let times = ValueLocation::infer_times(&stamps);
+		for (version, time) in versions.into_iter().zip(times) {
+			if version.is_hard_delete {
+				break;
+			}
+			let replace = version.is_replace;
+			let wanted = if version.stamp.is_some() {
+				version.wanted
+			} else {
+				self.in_ts_range(time) && (self.include_tombstones || !version.is_tombstone)
+			};
+			if wanted {
+				let mut entry = version.entry;
+				entry.timestamp = time;
+				self.group.push(entry);
+			}
+			if replace {
+				break;
+			}
+		}
+
+		// Newest timestamp first, and the newest write first among versions of one timestamp.
+		// For versions written with increasing timestamps this is the order they were written
+		// in, reversed, and the sort finds them in order.
+		self.group.sort_by(|a, b| b.timestamp.cmp(&a.timestamp).then(b.seq.cmp(&a.seq)));
+	}
+
+	/// Reads the versions of the next key that has any to return, going forwards. The inner
+	/// iterator is at the first entry of a key, or past the end; it is left at the first entry of
+	/// the key after the one read. Returns whether there is such a key, and leaves `pos` unset.
+	fn load_group_forward(&mut self) -> Result<bool> {
+		self.group.clear();
+		self.pos = None;
+		while self.inner_valid() {
+			let user_key = self.inner_key().user_key().to_vec();
+			if !self.user_key_within_upper_bound(&user_key) {
 				return Ok(false);
 			}
-
-			let (user_key_vec, seq_num, timestamp, is_hard_delete, is_replace, is_tombstone) = {
-				let key_ref = self.inner_key();
-				(
-					key_ref.user_key().to_vec(),
-					key_ref.seq_num(),
-					key_ref.timestamp(),
-					key_ref.is_hard_delete_marker(),
-					key_ref.is_replace(),
-					key_ref.is_tombstone(),
-				)
-			};
-
-			// Skip keys below lower_bound
-			if !self.user_key_within_lower_bound(&user_key_vec) {
-				self.inner_next()?;
-				continue;
-			}
-
-			// Detect user_key change → reset state
-			if user_key_vec != self.current_user_key {
-				self.current_user_key = user_key_vec;
-				self.first_visible_seen = false;
-				self.latest_is_hard_delete = false;
-				self.barrier_seen = false;
-			}
-
-			// Skip invisible versions
-			if seq_num > self.snapshot_seq_num {
-				self.inner_next()?;
-				continue;
-			}
-
-			// Skip entries outside timestamp range
-			if let Some((ts_start, ts_end)) = self.ts_range {
-				if timestamp > ts_end {
-					// Above range - skip, next entries might be in range
-					self.inner_next()?;
-					continue;
-				}
-				if timestamp < ts_start {
-					// Below range - all remaining entries for this key are also below
-					// (timestamps are ordered descending within a key).
-					// Skip to next user_key with optimization for B+tree.
-					if !self.advance_to_next_user_key()? {
-						return Ok(false);
+			let wanted = self.user_key_within_lower_bound(&user_key);
+			let mut versions = Vec::new();
+			while self.inner_valid() && self.inner_key().user_key() == user_key.as_slice() {
+				if wanted {
+					if let Some(version) = self.read_version()? {
+						versions.push(version);
 					}
-					continue;
+				}
+				self.inner_next()?;
+			}
+			if wanted {
+				self.make_group(user_key, versions);
+				if !self.group.is_empty() {
+					return Ok(true);
 				}
 			}
-
-			// First visible entry → check for HARD_DELETE as latest
-			if !self.first_visible_seen {
-				self.first_visible_seen = true;
-				if is_hard_delete {
-					self.latest_is_hard_delete = true;
-				}
-			}
-
-			// Rule 1: HARD_DELETE as latest → skip entire key
-			if self.latest_is_hard_delete {
-				self.inner_next()?;
-				continue;
-			}
-
-			// Rule 2: Already past a barrier → skip everything older
-			if self.barrier_seen {
-				self.inner_next()?;
-				continue;
-			}
-
-			// Rule 3: Hit HARD_DELETE barrier (not latest)
-			// Skip this entry and mark barrier
-			if is_hard_delete {
-				self.barrier_seen = true;
-				self.inner_next()?;
-				continue;
-			}
-
-			// Rule 4: Hit REPLACE barrier
-			// Output this entry, then mark barrier for older entries
-			if is_replace {
-				self.barrier_seen = true;
-				// Don't skip - fall through to output
-			}
-
-			// Rule 5: Soft DELETE (tombstone) filtering
-			if !self.include_tombstones && is_tombstone {
-				self.inner_next()?;
-				continue;
-			}
-
-			// Found valid entry - increment counter
-			self.entries_returned += 1;
-			return Ok(true);
 		}
 		Ok(false)
 	}
 
-	// === BACKWARD ITERATION (Buffered) ===
-
-	/// Collect all visible versions of current user key, apply filtering,
-	/// and populate backward_buffer.
-	///
-	/// After this call, inner iterator is at previous user key (or invalid).
-	fn collect_user_key_backward(&mut self) -> Result<bool> {
-		self.backward_buffer.clear();
-
-		if !self.inner_valid() {
-			return Ok(false);
-		}
-
-		let user_key = self.inner_key().user_key().to_vec();
-
-		if !self.user_key_within_lower_bound(&user_key) {
-			return Ok(false);
-		}
-
-		if !self.user_key_within_upper_bound(&user_key) {
+	/// Reads the versions of the previous key that has any to return, going backwards. The inner
+	/// iterator is at the last entry of a key, or before the start; it is left at the last entry
+	/// of the key before the one read.
+	fn load_group_backward(&mut self) -> Result<bool> {
+		self.group.clear();
+		self.pos = None;
+		while self.inner_valid() {
+			let user_key = self.inner_key().user_key().to_vec();
+			if !self.user_key_within_lower_bound(&user_key) {
+				return Ok(false);
+			}
+			let wanted = self.user_key_within_upper_bound(&user_key);
+			// Going backwards the versions of a key come oldest write first.
+			let mut versions = Vec::new();
 			while self.inner_valid() && self.inner_key().user_key() == user_key.as_slice() {
+				if wanted {
+					if let Some(version) = self.read_version()? {
+						versions.push(version);
+					}
+				}
 				self.inner_prev()?;
 			}
-			return self.collect_user_key_backward();
-		}
-
-		// Collect all visible versions
-		// Backward storage order: (user_key DESC, seq_num ASC) → oldest first
-		struct VersionInfo {
-			is_hard_delete: bool,
-			is_replace: bool,
-			is_tombstone: bool,
-			encoded_key: Vec<u8>,
-			value: Vec<u8>,
-		}
-		let mut versions: Vec<VersionInfo> = Vec::new();
-
-		while self.inner_valid() {
-			let key_ref = self.inner_key();
-
-			if key_ref.user_key() != user_key.as_slice() {
-				break;
-			}
-
-			let seq_num = key_ref.seq_num();
-			let timestamp = key_ref.timestamp();
-
-			// Check visibility and timestamp range
-			let visible = seq_num <= self.snapshot_seq_num;
-			let in_ts_range = match self.ts_range {
-				Some((ts_start, ts_end)) => timestamp >= ts_start && timestamp <= ts_end,
-				None => true,
-			};
-
-			if visible && in_ts_range {
-				versions.push(VersionInfo {
-					is_hard_delete: key_ref.is_hard_delete_marker(),
-					is_replace: key_ref.is_replace(),
-					is_tombstone: key_ref.is_tombstone(),
-					encoded_key: key_ref.encoded().to_vec(),
-					value: self.inner_value()?.to_vec(),
-				});
-			}
-
-			self.inner_prev()?;
-		}
-
-		if versions.is_empty() {
-			return Ok(false);
-		}
-
-		// versions are in seq_num ASC order (oldest first, newest last)
-		// Latest visible is the LAST element
-		let latest = versions.last().unwrap();
-
-		// Rule 1: HARD_DELETE as latest → skip entire key
-		if latest.is_hard_delete {
-			return Ok(false);
-		}
-
-		// Rule 2: Find first barrier from newest (search from end to start)
-		// Barrier can be HARD_DELETE or REPLACE
-		let mut barrier_idx: Option<usize> = None;
-		let mut barrier_is_hard_delete = false;
-
-		for i in (0..versions.len()).rev() {
-			if versions[i].is_hard_delete {
-				barrier_idx = Some(i);
-				barrier_is_hard_delete = true;
-				break;
-			}
-			if versions[i].is_replace {
-				barrier_idx = Some(i);
-				barrier_is_hard_delete = false;
-				break;
+			if wanted {
+				versions.reverse();
+				self.make_group(user_key, versions);
+				if !self.group.is_empty() {
+					return Ok(true);
+				}
 			}
 		}
+		Ok(false)
+	}
 
-		// Determine valid range based on barrier
-		let valid_start_idx = match barrier_idx {
-			Some(idx) if barrier_is_hard_delete => idx + 1, // Exclude HARD_DELETE and older
-			Some(idx) => idx,                               // Include REPLACE, exclude older
-			None => 0,                                      // No barrier, include all
-		};
-
-		// Output versions[valid_start_idx..] in ASC order (oldest first for backward)
-		for v in versions.into_iter().skip(valid_start_idx) {
-			// Skip HARD_DELETE markers (shouldn't happen after valid_start_idx, but be safe)
-			if v.is_hard_delete {
-				continue;
-			}
-
-			// Tombstone filtering
-			if !self.include_tombstones && v.is_tombstone {
-				continue;
-			}
-
-			self.backward_buffer.push(BufferedEntry {
-				key: v.encoded_key,
-				value: v.value,
-			});
-		}
-
-		if self.backward_buffer.is_empty() {
-			return Ok(false);
-		}
-
-		// Truncate buffer to respect limit
+	/// Moves onto `pos` of the group, if the `limit` budget has any left.
+	fn step_to(&mut self, pos: usize) -> bool {
 		if let Some(limit) = self.limit {
-			let remaining = limit.saturating_sub(self.entries_returned);
-			if remaining == 0 {
-				self.backward_buffer.clear();
+			if self.entries_returned >= limit {
+				self.limit_reached = true;
+				return false;
+			}
+		}
+		self.entries_returned += 1;
+		self.pos = Some(pos);
+		true
+	}
+
+	fn settle_forward(&mut self) -> Result<bool> {
+		if self.load_group_forward()? {
+			Ok(self.step_to(0))
+		} else {
+			Ok(false)
+		}
+	}
+
+	fn settle_backward(&mut self) -> Result<bool> {
+		if self.load_group_backward()? {
+			Ok(self.step_to(self.group.len() - 1))
+		} else {
+			Ok(false)
+		}
+	}
+
+	/// Puts the inner iterator at the first entry of the key after the group's, which is where
+	/// going forwards loads the next group from: every version of the key sorts before the
+	/// internal key of sequence number 0.
+	fn position_inner_after_group(&mut self) -> Result<()> {
+		let target = InternalKey::new(self.group_key.clone(), 0, InternalKeyKind::Set);
+		self.inner.seek(&target.encode())?;
+		Ok(())
+	}
+
+	/// Puts the inner iterator at the last entry of the key before the group's, which is where
+	/// going backwards loads the next group from.
+	fn position_inner_before_group(&mut self) -> Result<()> {
+		let target = InternalKey::new(self.group_key.clone(), u64::MAX, InternalKeyKind::Set);
+		self.inner.seek(&target.encode())?;
+		if self.inner_valid() {
+			self.inner_prev()?;
+		} else {
+			self.inner.seek_last()?;
+		}
+		Ok(())
+	}
+
+	fn step_forward(&mut self) -> Result<bool> {
+		let Some(pos) = self.pos else {
+			return Ok(false);
+		};
+		if self.direction == MergeDirection::Backward {
+			// The inner iterator is before the group: put it after.
+			self.direction = MergeDirection::Forward;
+			self.position_inner_after_group()?;
+		}
+		if pos + 1 < self.group.len() {
+			return Ok(self.step_to(pos + 1));
+		}
+		// Past the last version of the key: on to the next key. Not on an entry meanwhile, so
+		// that a spent budget leaves the iterator where it was.
+		if let Some(limit) = self.limit {
+			if self.entries_returned >= limit {
 				self.limit_reached = true;
 				return Ok(false);
 			}
-			if self.backward_buffer.len() > remaining {
-				self.backward_buffer.truncate(remaining);
+		}
+		self.settle_forward()
+	}
+
+	fn step_backward(&mut self) -> Result<bool> {
+		let Some(pos) = self.pos else {
+			return Ok(false);
+		};
+		if self.direction != MergeDirection::Backward {
+			// The inner iterator is after the group: put it before.
+			self.direction = MergeDirection::Backward;
+			self.position_inner_before_group()?;
+		}
+		if pos > 0 {
+			return Ok(self.step_to(pos - 1));
+		}
+		if let Some(limit) = self.limit {
+			if self.entries_returned >= limit {
+				self.limit_reached = true;
+				return Ok(false);
 			}
 		}
-
-		// Pre-increment entries_returned by buffer size
-		// (all buffered entries will be yielded before next collect)
-		self.entries_returned += self.backward_buffer.len();
-
-		// Start yielding from index 0 (oldest in valid range)
-		self.backward_buffer_index = Some(0);
-
-		Ok(true)
-	}
-
-	fn advance_backward(&mut self) -> Result<bool> {
-		if let Some(idx) = self.backward_buffer_index {
-			if idx + 1 < self.backward_buffer.len() {
-				self.backward_buffer_index = Some(idx + 1);
-				return Ok(true);
-			}
-		}
-
-		// Buffer exhausted, load previous user key
-		self.collect_user_key_backward()
-	}
-
-	fn buffered_key(&self) -> InternalKeyRef<'_> {
-		let idx = self.backward_buffer_index.unwrap();
-		InternalKeyRef::from_encoded(&self.backward_buffer[idx].key)
-	}
-
-	fn buffered_value(&self) -> &[u8] {
-		let idx = self.backward_buffer_index.unwrap();
-		&self.backward_buffer[idx].value
-	}
-
-	fn has_buffered_entry(&self) -> bool {
-		matches!(self.backward_buffer_index, Some(idx) if idx < self.backward_buffer.len())
-	}
-
-	/// Switch from backward to forward direction.
-	/// Uses seek-based repositioning to avoid KMergeIterator direction-switch complexity.
-	fn reverse_to_forward(&mut self) -> Result<bool> {
-		self.direction = MergeDirection::Forward;
-		self.reset_forward_state();
-
-		if !self.has_buffered_entry() {
-			self.clear_backward_buffer();
-			return Ok(false);
-		}
-
-		// Get current position from backward buffer
-		let current_internal_key = self.buffered_key().encoded().to_vec();
-		self.clear_backward_buffer();
-
-		// Seek to current position - this resets KMergeIterator to Forward mode
-		self.inner.seek(&current_internal_key)?;
-
-		if !self.inner_valid() {
-			return Ok(false);
-		}
-
-		// Move past current entry to get the NEXT entry in forward direction
-		self.inner_next()?;
-
-		// Find next valid entry
-		self.skip_to_valid_forward()
-	}
-
-	/// Switch from forward to backward direction.
-	///
-	/// In forward mode, inner is positioned at the current entry. We call prev() to move
-	/// to the previous user key, then collect that key's versions for backward iteration.
-	/// This matches SnapshotIterator's forward_to_backward behavior.
-	fn forward_to_backward(&mut self) -> Result<bool> {
-		self.direction = MergeDirection::Backward;
-		self.clear_backward_buffer();
-
-		if !self.inner_valid() {
-			return Ok(false);
-		}
-
-		// Move backward from current position to previous user key.
-		// SnapshotIterator does the same: merge_iter.prev() from current position.
-		self.inner_prev()?;
-
-		// Collect user key at new position
-		self.collect_user_key_backward()
+		self.settle_backward()
 	}
 }
 
@@ -1982,7 +1956,7 @@ impl LSMIterator for HistoryIterator<'_> {
 
 		self.inner.seek(target)?;
 		self.initialized = true;
-		self.skip_to_valid_forward()
+		self.settle_forward()
 	}
 
 	fn seek_first(&mut self) -> Result<bool> {
@@ -1997,47 +1971,18 @@ impl LSMIterator for HistoryIterator<'_> {
 		if !self.initialized {
 			return self.seek_first();
 		}
-
-		// Direction change: backward → forward
-		if self.direction == MergeDirection::Backward {
-			return self.reverse_to_forward();
-		}
-
-		// Normal forward iteration
-		if !self.inner_valid() {
-			return Ok(false);
-		}
-
-		self.inner_next()?;
-		self.skip_to_valid_forward()
+		self.step_forward()
 	}
 
 	fn prev(&mut self) -> Result<bool> {
 		if !self.initialized {
 			return self.seek_last();
 		}
-
-		// Direction change: forward → backward
-		if self.direction != MergeDirection::Backward {
-			return self.forward_to_backward();
-		}
-
-		// Normal backward iteration
-		if !self.has_buffered_entry() && !self.inner_valid() {
-			return Ok(false);
-		}
-
-		self.advance_backward()
+		self.step_backward()
 	}
 
 	fn valid(&self) -> bool {
-		if self.limit_reached {
-			return false;
-		}
-		match self.direction {
-			MergeDirection::Forward => self.inner_valid() && self.within_upper_bound(),
-			MergeDirection::Backward => self.has_buffered_entry(),
-		}
+		!self.limit_reached && self.pos.is_some()
 	}
 
 	/// Overridden because `seek_first`/`seek_last` here begin with
@@ -2045,14 +1990,6 @@ impl LSMIterator for HistoryIterator<'_> {
 	/// `limit` budget. That is right for a seek the *user* asked for and wrong for
 	/// an internal re-anchor, which continues a traversal that has already spent
 	/// part of the budget.
-	///
-	/// Note this deliberately does NOT branch on `limit_reached`. That flag is
-	/// only ever set inside `skip_to_valid_forward`'s `while self.inner_valid()`
-	/// loop and inside `collect_user_key_backward` past its early returns, so when
-	/// the data runs dry at or before the limit the iterator goes invalid with the
-	/// flag still `false` and the budget already spent. Preserving the counter is
-	/// correct in both cases and needs no such test; the collect below re-derives
-	/// the flag from the remaining budget.
 	fn reanchor_first(&mut self) -> Result<bool> {
 		self.reanchor(MergeDirection::Forward)
 	}
@@ -2063,18 +2000,13 @@ impl LSMIterator for HistoryIterator<'_> {
 
 	fn key(&self) -> InternalKeyRef<'_> {
 		debug_assert!(self.valid());
-		match self.direction {
-			MergeDirection::Forward => self.inner_key(),
-			MergeDirection::Backward => self.buffered_key(),
-		}
+		let entry = &self.group[self.pos.expect("a valid iterator is on an entry")];
+		InternalKeyRef::from_encoded(&entry.key).with_timestamp(entry.timestamp)
 	}
 
 	fn value_encoded(&self) -> Result<&[u8]> {
 		debug_assert!(self.valid());
-		match self.direction {
-			MergeDirection::Forward => self.inner_value(),
-			MergeDirection::Backward => Ok(self.buffered_value()),
-		}
+		Ok(&self.group[self.pos.expect("a valid iterator is on an entry")].value)
 	}
 }
 

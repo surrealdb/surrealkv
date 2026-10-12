@@ -17,6 +17,7 @@ mod lockfile;
 mod lsm;
 pub mod memory;
 mod memtable;
+mod migrate;
 mod ring;
 // The background scrubber is planned, not implemented: nothing constructs it outside tests.
 #[cfg(test)]
@@ -47,7 +48,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 pub use compaction::leveled::CompactionPriority;
-pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator, TimestampComparator};
+pub use comparator::{BytewiseComparator, Comparator, InternalKeyComparator};
 use sstable::bloom::LevelDBBloomFilter;
 pub use sstable::ribbon::RibbonFilter;
 
@@ -245,14 +246,13 @@ pub struct Options {
 	pub vlog_value_threshold: usize,
 
 	// Versioned query configuration
-	/// If true, enables versioned queries with timestamp tracking
+	/// If true, every write is stamped with a timestamp, stored with its value, and versions
+	/// are kept for `get_at` and `history` instead of only the newest one.
 	pub enable_versioning: bool,
-	/// If true, creates a B+tree index for timestamp-based queries.
-	/// Requires enable_versioning to be true.
-	/// When false, versioned queries will scan the LSM tree directly.
-	pub enable_versioned_index: bool,
-	/// History retention period in nanoseconds (0 means no retention limit)
-	/// Default: 0 (no retention limit)
+	/// How long old versions are kept, in nanoseconds, when `enable_versioning` is set. A
+	/// version is kept while it is younger than this, and so is the newest version that is
+	/// older, which is what a read at the start of the period sees. 0 keeps every version.
+	/// Default: 0
 	pub versioned_history_retention_ns: u64,
 	/// Logical clock for time-based operations
 	pub(crate) clock: Arc<dyn LogicalClock>,
@@ -353,7 +353,6 @@ impl Default for Options {
 			enable_vlog: false,
 			vlog_value_threshold: 1024, // 1KB default
 			enable_versioning: false,
-			enable_versioned_index: false,
 			versioned_history_retention_ns: 0, // No retention limit by default
 			clock,
 			flush_on_close: true,
@@ -572,26 +571,19 @@ impl Options {
 		self
 	}
 
-	/// Enables or disables versioned queries with timestamp tracking
-	/// When enabled, automatically configures VLog and value threshold for
-	/// optimal versioned query support
-	pub fn with_versioning(mut self, value: bool, retention_ns: u64) -> Self {
+	/// Enables or disables versioned queries.
+	///
+	/// A versioned tree stamps every write with its timestamp (the commit time, or the one given
+	/// to `set_at`), keeps the stamp with the value, and keeps old versions for
+	/// `Transaction::get_at` and `Transaction::history` for `retention_ns` nanoseconds, or for
+	/// ever if that is 0. It needs no value log and no index: values are stored as they are in
+	/// an unversioned tree, with the eight bytes of the stamp and two for a header; a soft delete
+	/// has no value and is stored as those ten bytes.
+	///
+	/// A time of 0, given to `set_at` or in `WriteOptions`, is the time of the commit.
+	pub const fn with_versioning(mut self, value: bool, retention_ns: u64) -> Self {
 		self.enable_versioning = value;
 		self.versioned_history_retention_ns = retention_ns;
-		if value {
-			// Versioned queries require VLog to be enabled
-			self.enable_vlog = true;
-			// All values should go to VLog for versioned queries
-			self.vlog_value_threshold = 0;
-		}
-		self
-	}
-
-	/// Enables or disables the B+tree versioned index for timestamp-based queries.
-	/// When disabled, versioned queries will scan the LSM tree directly.
-	/// Requires `enable_versioning` to be true for this to have any effect.
-	pub const fn with_versioned_index(mut self, value: bool) -> Self {
-		self.enable_versioned_index = value;
 		self
 	}
 
@@ -720,32 +712,6 @@ impl Options {
 				 `encryption-preview` feature, and its formats are not final. Refusing to open \
 				 with a key manager; remove the key manager."
 					.to_string(),
-			));
-		}
-
-		// Validate versioned queries configuration
-		if self.enable_versioning {
-			// Versioned queries require VLog to be enabled
-			if !self.enable_vlog {
-				return Err(Error::InvalidArgument(
-					"Versioned queries require VLog to be enabled. Set enable_vlog to true."
-						.to_string(),
-				));
-			}
-
-			// Versioned queries don't work well with value threshold (values should go to
-			// VLog)
-			if self.vlog_value_threshold > 0 {
-				return Err(Error::InvalidArgument(
-					"Versioned queries require all values to be stored in VLog. Set vlog_value_threshold to 0.".to_string(),
-				));
-			}
-		}
-
-		// Validate versioned index requires versioning to be enabled
-		if self.enable_versioned_index && !self.enable_versioning {
-			return Err(Error::InvalidArgument(
-				"Versioned index requires versioning to be enabled. Call with_versioning(true, retention_ns) first.".to_string(),
 			));
 		}
 
@@ -1079,6 +1045,9 @@ impl PartialOrd for InternalKey {
 #[derive(Clone, Copy)]
 pub struct InternalKeyRef<'a> {
 	encoded: &'a [u8],
+	/// The time the version was written at: kept with its value, so only an iterator that has
+	/// read the value can say. 0 where there is none.
+	timestamp: u64,
 }
 
 impl<'a> InternalKeyRef<'a> {
@@ -1087,7 +1056,15 @@ impl<'a> InternalKeyRef<'a> {
 		debug_assert!(encoded.len() >= 8);
 		Self {
 			encoded,
+			timestamp: 0,
 		}
+	}
+
+	/// The same key, with the time its version was written at.
+	#[inline]
+	pub(crate) fn with_timestamp(mut self, timestamp: u64) -> Self {
+		self.timestamp = timestamp;
+		self
 	}
 
 	#[inline]
@@ -1110,9 +1087,14 @@ impl<'a> InternalKeyRef<'a> {
 		InternalKey::seq_num_from_encoded(self.encoded)
 	}
 
+	/// The time this version was written at, in nanoseconds: what `set_at` was given, or the time
+	/// of the commit. A version written while the tree was not versioned reads at the time of the
+	/// versions written before it, and at 0 if there are none. A write of a transaction that is to
+	/// be given the time of its commit reports `u64::MAX` until it is committed. 0 from an
+	/// iterator that does not report times: only `Transaction::history` does.
 	#[inline]
 	pub fn timestamp(&self) -> u64 {
-		0
+		self.timestamp
 	}
 
 	#[inline]

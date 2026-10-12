@@ -50,7 +50,7 @@ impl Properties {
 	pub(crate) fn new() -> Self {
 		Properties {
 			id: 0,
-			table_format: TableFormat::LSMV1,
+			table_format: TableFormat::LSMV2,
 			num_entries: 0,
 			num_deletions: 0,
 			data_size: 0,

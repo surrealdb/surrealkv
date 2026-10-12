@@ -101,7 +101,10 @@ async fn a_tree_says_which_key_covers_which_files() {
 		assert_eq!(counted_under(&status, 1), expected, "{suite:?}");
 		assert!(expected.iter().all(|(files, bytes)| *files > 0 && *bytes > 0), "{expected:?}");
 		assert!(!status.keys[0].covers_no_files());
-		assert_eq!(status.keys[0].total().files, expected.iter().map(|(files, _)| files).sum());
+		assert_eq!(
+			status.keys[0].total().files,
+			expected.iter().map(|(files, _)| files).sum::<u64>()
+		);
 		assert!(status.key(2).is_none());
 
 		// Everything is where it should be.
