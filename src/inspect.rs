@@ -4,6 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub use crate::describe::{describe_file, is_encrypted, CryptoSummary, FileDescription, FileState};
 use crate::error::{Error, Result};
 use crate::levels::LevelManifest;
 use crate::sstable::index_block::IndexIterator;

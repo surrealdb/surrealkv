@@ -7,6 +7,7 @@ mod clock;
 mod compaction;
 mod comparator;
 mod compression;
+mod describe;
 mod error;
 pub mod inspect;
 mod iter;
