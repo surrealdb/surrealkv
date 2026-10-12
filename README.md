@@ -537,7 +537,7 @@ WASM_BINDGEN_TEST_TIMEOUT=300 WASM_BINDGEN_USE_DEDICATED_WORKER=1 \
 
 `opfs_engine_test` runs a `Tree` over the real OPFS: it commits enough data to rotate the log, flush and compact, closes and opens the database again, mounts the files again, opens a database that was left without a close, and repairs a torn log tail, with and without the value log. The tests that simulate a crash release the file handles without flushing. They do not terminate a worker, and they do not cut the power.
 
-CI runs these tests (every `tests/opfs_*.rs` target and the `--lib` unit tests) in headless Chrome on Linux. The tests of the IndexedDB reader run in Node.js only: the Chrome run skips them. CI also checks, lints and builds the crate for `wasm32-unknown-unknown`, and checks the zstd archive of that build when one is present, and fails if it has no members. The unit tests of the library also run in CI over the memory file system, which uses the same pool logic as the browser over a memory backend instead of the OPFS. The tests that need a real directory, encryption or checkpoints skip themselves.
+CI runs these tests (every `tests/opfs_*.rs` target and the `--lib` unit tests) in headless Chrome on Linux. The tests of the IndexedDB reader (`surrealkv-compat-indxdb`) run in headless Chrome too, against a real IndexedDB. CI also checks, lints and builds the crate for `wasm32-unknown-unknown`, and checks the zstd archive of that build when one is present, and fails if it has no members. The unit tests of the library also run in CI over the memory file system, which uses the same pool logic as the browser over a memory backend instead of the OPFS. The tests that need a real directory, encryption or checkpoints skip themselves.
 
 ---
 

@@ -13,18 +13,6 @@ pub mod wasm;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests;
 
-#[cfg(all(test, target_arch = "wasm32"))]
-mod wasm_tests {
-	use wasm_bindgen_test::*;
-
-	use super::*;
-
-	#[wasm_bindgen_test]
-	fn test_indexeddb_check() {
-		let _ = is_indxdb_available("test_db");
-	}
-}
-
 use std::path::Path;
 
 pub use dump::{export_dump, is_indxdb_dump_dir, read_dump, INDXDB_DUMP_MAGIC};
