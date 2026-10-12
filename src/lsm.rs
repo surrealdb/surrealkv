@@ -249,7 +249,7 @@ pub(crate) struct CoreInner {
 	/// manifest on disk may list a table the one in memory does not. The next flush, direct table
 	/// or checkpoint writes the one in memory again first, which a flush would otherwise follow
 	/// by rewriting the file of a table the disk may list.
-	manifest_uncertain: AtomicBool,
+	pub(crate) manifest_uncertain: Arc<AtomicBool>,
 
 	/// Test-only observer called by `flush_immutable_to_sst` once the SST is on disk and before
 	/// the manifest is updated. An error from it fails the flush.
@@ -375,7 +375,7 @@ impl CoreInner {
 			group_wal_pin: AtomicU64::new(u64::MAX),
 			memory_controller,
 			manifest_loaded_from_disk,
-			manifest_uncertain: AtomicBool::new(false),
+			manifest_uncertain: Arc::new(AtomicBool::new(false)),
 			#[cfg(test)]
 			flush_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
@@ -550,16 +550,7 @@ impl CoreInner {
 	/// The error for a failed write of the manifest. An uncertain write keeps its kind, which
 	/// the background task does not retry, and makes the next flush settle the manifest first.
 	fn manifest_write_error(&self, error: Error, context: String) -> Error {
-		match error {
-			Error::ManifestWriteUncertain(_) => {
-				self.manifest_uncertain.store(true, Ordering::Release);
-				error
-			}
-			// A manifest that could not be sealed was not written: the key was not to be had, and
-			// whether it may be asked for again is what its type says, which text does not.
-			Error::Encryption(_) => error,
-			error => Error::Other(format!("{context}: {error}")),
-		}
+		crate::levels::manifest_write_error(&self.manifest_uncertain, error, &context)
 	}
 
 	/// Writes the manifest in memory to disk again if the last write of it was uncertain, so that
@@ -1466,6 +1457,11 @@ impl CompactionOperations for CoreInner {
 		if let Some(error) = self.error_handler.commit_group_error() {
 			return Err(error);
 		}
+
+		// The manifest is not settled here: the compaction writes the manifest in memory itself,
+		// which settles it if that works and leaves it unsettled, with the outputs kept, if not.
+		// Settling first would let a compaction heal or fail a manifest that the flush that left it
+		// unsettled has yet to see.
 
 		// Kept for the whole run, so that a restore waits for it, see `compactions`.
 		let _running = self.compactions.read();
@@ -2911,6 +2907,21 @@ impl Tree {
 	/// Returns the report of actions taken during WAL recovery at database open.
 	pub fn recovery_report(&self) -> WalRecoveryReport {
 		self.core.inner.recovery_report.read().clone()
+	}
+
+	/// Returns the current background error, if any.
+	pub fn background_error(&self) -> Option<crate::error::BackgroundError> {
+		self.core.inner.error_handler.get_error()
+	}
+
+	/// Returns the total count of background errors encountered.
+	pub fn background_error_count(&self) -> u64 {
+		self.core.inner.error_handler.error_count()
+	}
+
+	/// Returns true if the database is stopped due to a fatal or unrecoverable background error.
+	pub fn is_stopped(&self) -> bool {
+		self.core.inner.error_handler.is_db_stopped()
 	}
 }
 

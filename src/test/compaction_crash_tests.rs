@@ -1263,9 +1263,9 @@ async fn a_compaction_that_fails_after_its_outputs_are_written_loses_nothing_and
 		);
 		verify_data(&tree, &model, &format!("{shape:?}: after the failed compaction"));
 		let orphans: Vec<u64> = ssts(&db).difference(&files_before).copied().collect();
-		assert!(orphans.len() >= 2, "{shape:?}: the failed outputs stay on disk: {orphans:?}");
+		assert!(orphans.is_empty(), "{shape:?}: the failed outputs are cleaned up: {orphans:?}");
 
-		// A crash after the failure: the image holds the old manifest and the failed outputs.
+		// A crash after the failure: the image holds the old manifest and no failed outputs.
 		let after_failure =
 			take_image(&db, &images.path().join("after-failure"), CompactionStage::OutputsDurable);
 		assert_eq!(read_manifest(&after_failure.dir).levels, before, "{shape:?}: the manifest");
@@ -1288,9 +1288,8 @@ async fn a_compaction_that_fails_after_its_outputs_are_written_loses_nothing_and
 		);
 		assert_no_duplicates(&after, &format!("{shape:?}: after the retry"));
 		verify_data(&tree, &model, &format!("{shape:?}: after the retry"));
-		let mut files = flatten(&after);
-		files.extend(orphans.iter().copied());
-		assert_eq!(ssts(&db), files, "{shape:?}: the failed outputs are all that is left over");
+		let files = flatten(&after);
+		assert_eq!(ssts(&db), files, "{shape:?}: no failed outputs are left over");
 
 		for image in retry.images() {
 			assert_raw_image(&image, &plan, &[], &orphans);
@@ -1354,7 +1353,6 @@ async fn a_failed_manifest_write_inside_a_compaction_leaves_the_tree_and_the_dir
 			"{what}: a compaction whose manifest write failed goes no further ({error})"
 		);
 		let orphans: Vec<u64> = ssts(&db).difference(&files_before).copied().collect();
-		assert!(orphans.len() >= 2, "{what}: the outputs stay on disk: {orphans:?}");
 		assert!(
 			fs::read_dir(manifest.parent().unwrap()).unwrap().count() == 1,
 			"{what}: a temporary manifest was left beside the manifest"
@@ -1365,6 +1363,7 @@ async fn a_failed_manifest_write_inside_a_compaction_leaves_the_tree_and_the_dir
 		match at {
 			ReplaceFailure::BeforeRename => {
 				assert!(matches!(error, Error::Io(_)), "{what}: {error:?}");
+				assert!(orphans.is_empty(), "{what}: the outputs are cleaned up: {orphans:?}");
 				assert_eq!(
 					fs::read(&manifest).unwrap(),
 					manifest_before,
@@ -1380,6 +1379,10 @@ async fn a_failed_manifest_write_inside_a_compaction_leaves_the_tree_and_the_dir
 			}
 			ReplaceFailure::AfterRename => {
 				assert!(matches!(error, Error::ManifestWriteUncertain(_)), "{what}: {error:?}");
+				assert!(
+					orphans.len() >= 2,
+					"{what}: the outputs stay on disk because manifest is uncertain: {orphans:?}"
+				);
 				assert_ne!(
 					fs::read(&manifest).unwrap(),
 					manifest_before,

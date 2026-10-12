@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File as SysFile;
 use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1141,5 +1141,25 @@ pub(crate) fn sweep_stale_manifest_temp_files(dir: &Path) {
 				let _ = std::fs::remove_file(entry.path());
 			}
 		}
+	}
+}
+
+/// Helper to handle manifest write errors. If the error is `ManifestWriteUncertain`,
+/// records the uncertainty in `manifest_uncertain` and preserves the error variant.
+/// Otherwise wraps it in `Error::Other` with context.
+pub(crate) fn manifest_write_error(
+	manifest_uncertain: &AtomicBool,
+	error: Error,
+	context: &str,
+) -> Error {
+	match error {
+		Error::ManifestWriteUncertain(_) => {
+			manifest_uncertain.store(true, Ordering::Release);
+			error
+		}
+		// A manifest that could not be sealed was not written: the key was not to be had, and
+		// whether it may be asked for again is what its type says, which text does not.
+		Error::Encryption(_) => error,
+		error => Error::Other(format!("{context}: {error}")),
 	}
 }
