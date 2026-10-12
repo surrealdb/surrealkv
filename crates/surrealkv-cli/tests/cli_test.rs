@@ -272,8 +272,16 @@ fn key_file(dir: &Path, name: &str, bytes: &[u8], mode: u32) -> PathBuf {
 	path
 }
 
+/// The tool, with no key file named by the environment of whoever runs the tests: a test that
+/// wants one sets it itself, and one that does not must not find the one of a developer.
+fn skv_command() -> Command {
+	let mut command = Command::new(env!("CARGO_BIN_EXE_skv"));
+	command.env_remove("SKV_KEY_FILE");
+	command
+}
+
 fn skv(args: &[&str]) -> Output {
-	Command::new(env!("CARGO_BIN_EXE_skv")).args(args).output().expect("Failed to execute skv")
+	skv_command().args(args).output().expect("Failed to execute skv")
 }
 
 fn stdout(out: &Output) -> String {
@@ -465,11 +473,7 @@ fn test_cli_a_key_file_that_is_not_a_key_is_refused_with_the_reason() {
 	assert!(stderr(&out).contains("Failed to load the key file"), "{}", stderr(&out));
 
 	// And so does the environment variable, which names a file and is read when there is no flag.
-	let out = Command::new(env!("CARGO_BIN_EXE_skv"))
-		.args(["sst", table])
-		.env("SKV_KEY_FILE", &short)
-		.output()
-		.unwrap();
+	let out = skv_command().args(["sst", table]).env("SKV_KEY_FILE", &short).output().unwrap();
 	assert_eq!(out.status.code(), Some(1));
 	assert!(stderr(&out).contains("Failed to load the key file"), "{}", stderr(&out));
 	assert_eq!(snapshot(db.path()), before);
@@ -513,7 +517,7 @@ fn test_cli_without_the_preview_feature_a_key_is_refused_by_the_guard_and_the_fl
 	let before = snapshot(db.path());
 
 	for (what, key) in [("raw", &good), ("hex", &hex)] {
-		let out = Command::new(env!("CARGO_BIN_EXE_skv"))
+		let out = skv_command()
 			.args(["sst", table, "--key-file", key.to_str().unwrap()])
 			.env("RUST_LOG", "trace")
 			.output()
@@ -527,7 +531,7 @@ fn test_cli_without_the_preview_feature_a_key_is_refused_by_the_guard_and_the_fl
 
 	// The flag is read before the environment: with a good file in the flag, a bad one in the
 	// environment is not looked at, and the answer is the guard's and not a key that is not one.
-	let out = Command::new(env!("CARGO_BIN_EXE_skv"))
+	let out = skv_command()
 		.args(["sst", table, "--key-file", good.to_str().unwrap()])
 		.env("SKV_KEY_FILE", &bad)
 		.output()
@@ -568,7 +572,7 @@ mod with_the_preview_feature {
 		// Read with it, and through the variable that names the file.
 		let out = skv(&["get", db_path, "k1", "--key-file", key_path]);
 		assert_eq!(stdout(&out).trim(), "v1", "{}", stderr(&out));
-		let out = Command::new(env!("CARGO_BIN_EXE_skv"))
+		let out = skv_command()
 			.args(["scan", db_path, "--prefix", "k"])
 			.env("SKV_KEY_FILE", &key)
 			.output()
@@ -597,6 +601,28 @@ mod with_the_preview_feature {
 		assert_eq!(out.status.code(), Some(0), "{}{}", stdout(&out), stderr(&out));
 		assert!(stdout(&out).contains("SCRUB PASSED"), "{}", stdout(&out));
 		assert_no_key(&out, "scrub");
+
+		// With every level of logging on, nothing that a command prints holds the key, in any form,
+		// whatever it does with it: reading, listing, verifying, and writing a commit that is
+		// sealed and flushed when the process ends.
+		let table = fs::read_dir(db.join("sstables")).unwrap().flatten().map(|e| e.path()).min();
+		let table = table.expect("a table");
+		let table = table.to_str().unwrap();
+		let traced: Vec<Vec<&str>> = vec![
+			vec!["get", db_path, "k1", "--key-file", key_path],
+			vec!["scan", db_path, "--key-file", key_path],
+			vec!["inspect", db_path, "--key-file", key_path],
+			vec!["manifest", db_path, "--key-file", key_path],
+			vec!["wal", db_path, "--key-file", key_path],
+			vec!["sst", table, "--dump-keys", "--verify-checksum", "--key-file", key_path],
+			vec!["scrub", db_path, "--key-file", key_path],
+			vec!["put", db_path, "k4", "v4", "--key-file", key_path],
+		];
+		for args in traced {
+			let out = skv_command().args(&args).env("RUST_LOG", "trace").output().unwrap();
+			assert_eq!(out.status.code(), Some(0), "{}: {}{}", args[0], stdout(&out), stderr(&out));
+			assert_no_key(&out, args[0]);
+		}
 
 		// A byte of the first block of a table is changed: the header of 92 bytes comes first, and
 		// the first block follows it. Each write above was a process of its own and flushed on
