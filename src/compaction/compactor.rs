@@ -1,10 +1,10 @@
 use std::fs::File as SysFile;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
-use crate::error::{BackgroundErrorHandler, Result};
+use crate::error::{Error, Result};
 use crate::iter::{BoxedLSMIterator, CompactionIterator, History};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lsm::{cleanup_vlog, CoreInner};
@@ -22,7 +22,7 @@ use crate::{Comparator, Options as LSMOptions};
 pub(crate) enum CompactionStage {
 	/// The output tables and the SSTable directory are fsynced, and the manifest still lists the
 	/// inputs. An error from the hook fails the compaction here: the inputs stay in place and the
-	/// outputs are left on disk.
+	/// partial outputs are cleaned up.
 	OutputsDurable,
 	/// The manifest that lists the outputs instead of the inputs is on disk and in memory. The
 	/// input files and the obsolete value-log files are still on disk.
@@ -75,7 +75,7 @@ pub(crate) struct CompactionOptions {
 	pub(crate) active_memtable: Arc<RwLock<Arc<MemTable>>>,
 	pub(crate) immutable_memtables: Arc<RwLock<ImmutableMemtables>>,
 	pub(crate) vlog: Option<Arc<VLog>>,
-	pub(crate) error_handler: Arc<BackgroundErrorHandler>,
+	pub(crate) manifest_uncertain: Arc<AtomicBool>,
 	/// Snapshot tracker for snapshot-aware compaction.
 	///
 	/// During compaction, we query this to get the list of active snapshot
@@ -104,7 +104,7 @@ impl CompactionOptions {
 			active_memtable: Arc::clone(&tree.active_memtable),
 			immutable_memtables: Arc::clone(&tree.immutable_memtables),
 			vlog: tree.vlog.clone(),
-			error_handler: Arc::clone(&tree.error_handler),
+			manifest_uncertain: Arc::clone(&tree.manifest_uncertain),
 			snapshot_tracker: tree.snapshot_tracker.clone(),
 			visible_seq_num: Arc::clone(&tree.visible_seq_num),
 			#[cfg(test)]
@@ -178,7 +178,10 @@ impl Compactor {
 		};
 
 		#[cfg(test)]
-		self.reach(CompactionStage::OutputsDurable)?;
+		if let Err(e) = self.reach(CompactionStage::OutputsDurable) {
+			Self::cleanup_outputs(&outputs);
+			return Err(e);
+		}
 
 		// Open the finished outputs
 		let mut new_tables = Vec::with_capacity(outputs.len());
@@ -186,15 +189,24 @@ impl Compactor {
 			match self.open_table(*id, path) {
 				Ok(table) => new_tables.push(table),
 				Err(e) => {
-					// Guard will unhide tables on drop; the already-written
-					// output files are removed as orphans on next startup.
+					// Guard will unhide tables on drop; clean up outputs so they
+					// don't linger on disk as orphans.
+					drop(new_tables);
+					Self::cleanup_outputs(&outputs);
 					return Err(e);
 				}
 			}
 		}
 
 		// Update manifest - this will commit the guard on success
-		self.update_manifest(input, new_tables, &mut guard)?;
+		if let Err(e) = self.update_manifest(input, new_tables, &mut guard) {
+			// If manifest write was uncertain, do not delete outputs because on-disk
+			// manifest might already reference them.
+			if !matches!(e, Error::ManifestWriteUncertain(_)) {
+				Self::cleanup_outputs(&outputs);
+			}
+			return Err(e);
+		}
 
 		#[cfg(test)]
 		let _ = self.reach(CompactionStage::ManifestWritten);
@@ -353,83 +365,103 @@ impl Compactor {
 		let mut current: Option<(TableWriter<SysFile>, u64, PathBuf)> = None;
 		let mut prev_user_key: Vec<u8> = Vec::new();
 
-		for item in &mut comp_iter {
-			let (key, value) = item?;
+		let result = (|| -> Result<()> {
+			for item in &mut comp_iter {
+				let (key, value) = item?;
 
-			// Roll over once the current output is full, but only when the
-			// user key changes: versions of one key must never span files.
-			let roll = current.as_ref().is_some_and(|(w, _, _)| {
-				w.estimated_file_size() >= target_file_size
-					&& key.user_key.as_slice() != prev_user_key.as_slice()
-			});
-			if roll {
-				if let Some((mut w, id, path)) = current.take() {
-					for (start, end, seq) in &range_deletions {
-						w.add_range_deletion(start.clone(), end.clone(), *seq);
+				// Roll over once the current output is full, but only when the
+				// user key changes: versions of one key must never span files.
+				let roll = current.as_ref().is_some_and(|(w, _, _)| {
+					w.estimated_file_size() >= target_file_size
+						&& key.user_key.as_slice() != prev_user_key.as_slice()
+				});
+				if roll {
+					if let Some((mut w, id, path)) = current.take() {
+						for (start, end, seq) in &range_deletions {
+							w.add_range_deletion(start.clone(), end.clone(), *seq);
+						}
+						self.finish_output(w, id, &path)?;
+						outputs.push((id, path));
 					}
-					self.finish_output(w, id, &path)?;
-					outputs.push((id, path));
 				}
+
+				// Open the next output lazily so we never create empty files.
+				let (w, ..) = match &mut current {
+					Some(c) => c,
+					None => {
+						let id = self.options.level_manifest.read()?.next_table_id();
+						let path = self.get_table_path(id);
+						let file = SysFile::create(&path)?;
+						let writer = TableWriter::new(
+							file,
+							id,
+							Arc::clone(&self.options.lopts),
+							input.target_level,
+						);
+						current.insert((writer, id, path))
+					}
+				};
+
+				prev_user_key.clear();
+				prev_user_key.extend_from_slice(key.user_key.as_slice());
+				w.add(key, &value)?;
 			}
 
-			// Open the next output lazily so we never create empty files.
-			let (w, ..) = match &mut current {
-				Some(c) => c,
-				None => {
-					let id = self.options.level_manifest.read()?.next_table_id();
-					let path = self.get_table_path(id);
-					let file = SysFile::create(&path)?;
-					let writer = TableWriter::new(
-						file,
-						id,
-						Arc::clone(&self.options.lopts),
-						input.target_level,
-					);
-					current.insert((writer, id, path))
+			if let Some((mut w, id, path)) = current.take() {
+				for (start, end, seq) in comp_iter.active_range_deletions() {
+					w.add_range_deletion(start.clone(), end.clone(), *seq);
 				}
-			};
-
-			prev_user_key.clear();
-			prev_user_key.extend_from_slice(key.user_key.as_slice());
-			w.add(key, &value)?;
-		}
-
-		if let Some((mut w, id, path)) = current.take() {
-			for (start, end, seq) in comp_iter.active_range_deletions() {
-				w.add_range_deletion(start.clone(), end.clone(), *seq);
+				self.finish_output(w, id, &path)?;
+				outputs.push((id, path));
+			} else if !comp_iter.active_range_deletions().is_empty() {
+				// No point entries were produced, but active range deletions exist.
+				// Write a single output SST containing the range deletions so they are preserved.
+				// This holds at the bottom level too: a range deletion has one point entry, at its
+				// start key, so the tables of the level that were taken are those around that key,
+				// and the tables that were not, or the levels above, may hold other keys it covers.
+				// The table has no data block and no key range (`Table::has_points`).
+				let id = self.options.level_manifest.read()?.next_table_id();
+				let path = self.get_table_path(id);
+				let file = SysFile::create(&path)?;
+				let mut writer =
+					TableWriter::new(file, id, Arc::clone(&self.options.lopts), input.target_level);
+				for (start, end, seq) in comp_iter.active_range_deletions() {
+					writer.add_range_deletion(start.clone(), end.clone(), *seq);
+				}
+				self.finish_output(writer, id, &path)?;
+				outputs.push((id, path));
 			}
-			self.finish_output(w, id, &path)?;
-			outputs.push((id, path));
-		} else if !comp_iter.active_range_deletions().is_empty() {
-			// No point entries were produced, but active range deletions exist.
-			// Write a single output SST containing the range deletions so they are preserved.
-			// This holds at the bottom level too: a range deletion has one point entry, at its
-			// start key, so the tables of the level that were taken are those around that key,
-			// and the tables that were not, or the levels above, may hold other keys it covers.
-			// The table has no data block and no key range (`Table::has_points`).
-			let id = self.options.level_manifest.read()?.next_table_id();
-			let path = self.get_table_path(id);
-			let file = SysFile::create(&path)?;
-			let mut writer =
-				TableWriter::new(file, id, Arc::clone(&self.options.lopts), input.target_level);
-			for (start, end, seq) in comp_iter.active_range_deletions() {
-				writer.add_range_deletion(start.clone(), end.clone(), *seq);
+
+			if !outputs.is_empty() {
+				// Durability: the directory entries of all outputs must be
+				// durable BEFORE the manifest (fsynced in update_manifest)
+				// references them (surrealdb/surrealdb#7426).
+				crate::lsm::fsync_directory(self.options.lopts.sstable_dir()).inspect(|()| {
+					#[cfg(test)]
+					directory_syncs::record(&self.options.lopts.sstable_dir());
+				})?;
 			}
-			self.finish_output(writer, id, &path)?;
-			outputs.push((id, path));
-		}
 
-		if !outputs.is_empty() {
-			// Durability: the directory entries of all outputs must be
-			// durable BEFORE the manifest (fsynced in update_manifest)
-			// references them (surrealdb/surrealdb#7426).
-			crate::lsm::fsync_directory(self.options.lopts.sstable_dir()).inspect(|()| {
-				#[cfg(test)]
-				directory_syncs::record(&self.options.lopts.sstable_dir());
-			})?;
-		}
+			Ok(())
+		})();
 
-		Ok(outputs)
+		match result {
+			Ok(()) => Ok(outputs),
+			Err(e) => {
+				if let Some((w, _id, path)) = current.take() {
+					drop(w);
+					let _ = std::fs::remove_file(&path);
+				}
+				Self::cleanup_outputs(&outputs);
+				Err(e)
+			}
+		}
+	}
+
+	fn cleanup_outputs(outputs: &[(u64, PathBuf)]) {
+		for (_id, path) in outputs {
+			let _ = std::fs::remove_file(path);
+		}
 	}
 
 	/// Finishes one compaction output and makes its contents durable. The
@@ -479,9 +511,9 @@ impl Compactor {
 		// Write manifest to disk - if this fails, revert in-memory state
 		if let Err(e) = write_manifest_to_disk(&manifest) {
 			manifest.revert_changeset(rollback);
-			self.options
-				.error_handler
-				.set_error(e.clone(), crate::error::BackgroundErrorReason::ManifestWrite);
+			if let Error::ManifestWriteUncertain(_) = &e {
+				self.options.manifest_uncertain.store(true, Ordering::Release);
+			}
 			return Err(e);
 		}
 

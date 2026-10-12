@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, RwLock};
 
 use tempfile::TempDir;
@@ -10,7 +10,7 @@ use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::leveled::{CompactionPriority, Strategy};
 use crate::compaction::{CompactionChoice, CompactionStrategy};
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
-use crate::error::{BackgroundErrorHandler, Result};
+use crate::error::Result;
 use crate::iter::CompactionIterator;
 use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
 use crate::memtable::{ImmutableMemtables, MemTable};
@@ -217,7 +217,7 @@ fn create_compaction_options(
 		active_memtable: Arc::new(RwLock::new(Arc::new(MemTable::default()))),
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 		vlog: Some(vlog),
-		error_handler: Arc::new(BackgroundErrorHandler::new()),
+		manifest_uncertain: Arc::new(AtomicBool::new(false)),
 		snapshot_tracker: SnapshotTracker::new(),
 		visible_seq_num: Arc::new(AtomicU64::new(u64::MAX)),
 		after_horizon_hook: None,

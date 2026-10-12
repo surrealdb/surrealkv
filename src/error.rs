@@ -471,7 +471,7 @@ impl BackgroundErrorHandler {
 	/// costs the database nothing but the flushes and compactions that wait for it, and the stall
 	/// that follows if they wait long enough. A hard one stops writes, and the first flush that
 	/// succeeds afterwards ends it, as it ends any hard error.
-	fn classify_error(error: &Error, reason: BackgroundErrorReason) -> ErrorSeverity {
+	pub(crate) fn classify_error(error: &Error, reason: BackgroundErrorReason) -> ErrorSeverity {
 		match (reason, error) {
 			// A memtable or a table holds batches that were never published: the process
 			// cannot go on
@@ -485,9 +485,13 @@ impl BackgroundErrorHandler {
 			},
 
 			// Corruption errors are unrecoverable
-			(_, Error::Corruption(_) | Error::CorruptedBlock(_) | Error::ManifestCorruption(_)) => {
-				ErrorSeverity::Unrecoverable
-			}
+			(
+				_,
+				Error::Corruption(_)
+				| Error::CorruptedBlock(_)
+				| Error::ManifestCorruption(_)
+				| Error::SSTable(_),
+			) => ErrorSeverity::Unrecoverable,
 
 			// Table ID collision is a critical consistency error
 			(_, Error::TableIDCollision(_)) => ErrorSeverity::Unrecoverable,
@@ -501,8 +505,9 @@ impl BackgroundErrorHandler {
 			// I/O errors during memtable flush are fatal
 			(BackgroundErrorReason::MemtablaFlush, Error::Io(_)) => ErrorSeverity::FatalError,
 
-			// I/O errors during compaction are fatal
-			(BackgroundErrorReason::Compaction, Error::Io(_)) => ErrorSeverity::FatalError,
+			// Retryable compaction errors are soft errors: background work continues and
+			// retries, writes continue until L0 stall threshold is reached
+			(BackgroundErrorReason::Compaction, _) => ErrorSeverity::SoftError,
 
 			// Manifest write I/O is fatal
 			(BackgroundErrorReason::ManifestWrite, Error::Io(_)) => ErrorSeverity::FatalError,
@@ -519,8 +524,8 @@ impl BackgroundErrorHandler {
 	/// one exception: an encryption error that trying again cannot cure (a key that does not fit, a
 	/// failed authentication) is not, because every attempt would create the table again, write the
 	/// large values to the value log again and fail at the same place. A compaction is tried again
-	/// only for an error of the retryable class, while the error on record for it is soft: every
-	/// other compaction error stops the database, as it always did.
+	/// after any error that is soft, and after an encryption error only if it is of the retryable
+	/// class: every other error stops the database.
 	pub(crate) fn retries(
 		error: &Error,
 		severity: ErrorSeverity,
@@ -534,6 +539,7 @@ impl BackgroundErrorHandler {
 			(BackgroundErrorReason::Compaction, Error::Encryption(err)) => {
 				err.is_retryable() && severity < ErrorSeverity::HardError
 			}
+			(BackgroundErrorReason::Compaction, _) => severity == ErrorSeverity::SoftError,
 			_ => false,
 		}
 	}
@@ -682,19 +688,16 @@ impl BackgroundErrorHandler {
 	}
 
 	/// Get the current background error, if any
-	#[cfg(test)]
 	pub fn get_error(&self) -> Option<BackgroundError> {
 		Self::most_severe(&self.bg_errors.read()).cloned()
 	}
 
 	/// Check if database is stopped (fast path, lock-free)
-	#[cfg(test)]
 	pub fn is_db_stopped(&self) -> bool {
 		self.is_db_stopped.load(Ordering::Acquire)
 	}
 
 	/// Get the error count
-	#[cfg(test)]
 	pub fn error_count(&self) -> u64 {
 		self.error_count.load(Ordering::Relaxed)
 	}
@@ -827,12 +830,12 @@ mod tests {
 	fn test_recover_leaves_an_equally_severe_error_of_another_reason() {
 		let handler = BackgroundErrorHandler::new();
 		// Recorded first: recovering the flush must not take it for the flush's own.
-		handler.set_error(Error::Other("compaction".into()), BackgroundErrorReason::Compaction);
+		handler.set_error(Error::Other("manifest".into()), BackgroundErrorReason::ManifestWrite);
 		handler.set_error(Error::Other("flush".into()), BackgroundErrorReason::MemtablaFlush);
 
 		assert!(handler.recover(BackgroundErrorReason::MemtablaFlush));
 		assert!(handler.is_db_stopped());
-		assert_eq!(handler.get_error().unwrap().reason, BackgroundErrorReason::Compaction);
+		assert_eq!(handler.get_error().unwrap().reason, BackgroundErrorReason::ManifestWrite);
 		assert!(!handler.recover(BackgroundErrorReason::MemtablaFlush));
 		assert!(handler.check_error().is_err());
 	}
@@ -842,7 +845,7 @@ mod tests {
 		let handler = BackgroundErrorHandler::new();
 		handler.set_error(Error::Other("flush".into()), BackgroundErrorReason::MemtablaFlush);
 		handler.set_error(
-			Error::Io(Arc::new(std::io::Error::other("compaction"))),
+			Error::ManifestWriteUncertain("compaction".into()),
 			BackgroundErrorReason::Compaction,
 		);
 
@@ -851,6 +854,28 @@ mod tests {
 		let remaining = handler.get_error().unwrap();
 		assert_eq!(remaining.reason, BackgroundErrorReason::Compaction);
 		assert_eq!(remaining.severity, ErrorSeverity::FatalError);
+	}
+
+	#[test]
+	fn test_compaction_retryable_error_is_soft_error_and_recovers() {
+		let handler = BackgroundErrorHandler::new();
+		let severity = handler.set_error(
+			Error::Io(Arc::new(std::io::Error::other("disk transient"))),
+			BackgroundErrorReason::Compaction,
+		);
+		assert_eq!(severity, ErrorSeverity::SoftError);
+		// Soft error does NOT stop the database: writes continue until stall gate
+		assert!(!handler.is_db_stopped());
+		assert!(handler.check_error().is_ok());
+
+		// Error is visible via get_error
+		let err = handler.get_error().unwrap();
+		assert_eq!(err.reason, BackgroundErrorReason::Compaction);
+		assert_eq!(err.severity, ErrorSeverity::SoftError);
+
+		// Recovery ends the soft error
+		assert!(handler.recover(BackgroundErrorReason::Compaction));
+		assert!(handler.get_error().is_none());
 	}
 
 	/// The recovery of a flush ends the flush's own error, never the stop a commit group caused:
@@ -955,7 +980,7 @@ mod tests {
 	#[test]
 	fn the_error_reported_is_the_most_severe_of_those_of_every_reason() {
 		let hard = || Error::Other("hard".into());
-		let fatal = || Error::Io(Arc::new(std::io::Error::other("fatal")));
+		let fatal = || Error::ManifestWriteUncertain("fatal".into());
 		for hard_first in [true, false] {
 			let handler = BackgroundErrorHandler::new();
 			if hard_first {
@@ -1227,10 +1252,12 @@ mod tests {
 				"{err:?}"
 			);
 		}
-		// As before, any other error of a compaction ends it for good.
+		// Any other error of a compaction is tried again while it is soft, and ends it when it is
+		// not.
 		for error in
 			[Error::Other("merge".into()), Error::Io(Arc::new(std::io::Error::other("io")))]
 		{
+			assert!(BackgroundErrorHandler::retries(&error, ErrorSeverity::SoftError, reason));
 			for severity in [ErrorSeverity::HardError, ErrorSeverity::FatalError] {
 				assert!(!BackgroundErrorHandler::retries(&error, severity, reason), "{error:?}");
 			}

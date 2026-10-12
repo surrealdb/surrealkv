@@ -18,6 +18,11 @@ pub(crate) const FLUSH_RETRY_MIN: Duration = Duration::from_millis(50);
 /// The longest wait between two attempts at a memtable flush.
 pub(crate) const FLUSH_RETRY_MAX: Duration = Duration::from_secs(2);
 
+/// The wait before a failed level compaction is run again; it doubles with every failure.
+pub(crate) const COMPACTION_RETRY_MIN: Duration = Duration::from_millis(50);
+/// The longest wait between two attempts at a level compaction.
+pub(crate) const COMPACTION_RETRY_MAX: Duration = Duration::from_secs(2);
+
 /// Manages background tasks for the LSM tree
 pub(crate) struct TaskManager {
 	/// Flag to signal tasks to stop
@@ -85,7 +90,7 @@ impl TaskManager {
 
 					// Flush ALL pending immutable memtables in a loop
 					let mut flush_count = 0;
-					let mut retry_wait = FLUSH_RETRY_MIN;
+					let mut retry_wait = COMPACTION_RETRY_MIN;
 					loop {
 						match core.compact_memtable() {
 							Ok(()) => {
@@ -188,7 +193,7 @@ impl TaskManager {
 					let strategy: Arc<dyn CompactionStrategy> =
 						Arc::new(Strategy::from_options(Arc::clone(&opts)));
 					let error_handler = core.error_handler();
-					let mut retry_wait = FLUSH_RETRY_MIN;
+					let mut retry_wait = COMPACTION_RETRY_MIN;
 					loop {
 						match core.compact(Arc::clone(&strategy)) {
 							Ok(()) => {
@@ -208,7 +213,8 @@ impl TaskManager {
 									&e,
 									severity,
 									BackgroundErrorReason::Compaction,
-								) {
+								) || error_handler.commit_group_error().is_some()
+								{
 									write_stall.signal_shutdown();
 									break;
 								}
@@ -226,7 +232,7 @@ impl TaskManager {
 									running.store(false, Ordering::SeqCst);
 									break 'task;
 								}
-								retry_wait = (retry_wait * 2).min(FLUSH_RETRY_MAX);
+								retry_wait = (retry_wait * 2).min(COMPACTION_RETRY_MAX);
 							}
 						}
 					}
@@ -362,6 +368,10 @@ mod tests {
 		level_attempts: AtomicUsize,
 		/// The times the tasks asked for the keys again
 		prepares: AtomicUsize,
+		/// The next calls of `compact` that fail, as `fail_level` does
+		level_failures: AtomicUsize,
+		/// Whether a failed `compact` is fatal
+		level_failure_is_fatal: AtomicBool,
 		error_handler: Arc<BackgroundErrorHandler>,
 	}
 
@@ -387,6 +397,8 @@ mod tests {
 				level_error: std::sync::Mutex::new(None),
 				level_attempts: AtomicUsize::new(0),
 				prepares: AtomicUsize::new(0),
+				level_failures: AtomicUsize::new(0),
+				level_failure_is_fatal: AtomicBool::new(false),
 				error_handler: Arc::new(BackgroundErrorHandler::new()),
 			}
 		}
@@ -463,7 +475,25 @@ mod tests {
 			}
 
 			// Check if should fail
-			if self.fail_level.load(Ordering::SeqCst) {
+			let mut left = self.level_failures.load(Ordering::SeqCst);
+			let failing = loop {
+				if left == 0 {
+					break false;
+				}
+				match self.level_failures.compare_exchange(
+					left,
+					left - 1,
+					Ordering::SeqCst,
+					Ordering::SeqCst,
+				) {
+					Ok(_) => break true,
+					Err(now) => left = now,
+				}
+			};
+			if failing || self.fail_level.load(Ordering::SeqCst) {
+				if self.level_failure_is_fatal.load(Ordering::SeqCst) {
+					return Err(Error::ManifestWriteUncertain("level fatal error".into()));
+				}
 				return Err(Error::Other("level error".into()));
 			}
 
@@ -920,6 +950,48 @@ mod tests {
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_failed_level_compaction_is_retried_until_it_succeeds() {
+		let core = Arc::new(MockCoreInner::new());
+		core.level_failures.store(2, Ordering::SeqCst);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			test_write_stall(),
+		);
+
+		task_manager.wake_up_level();
+		wait_for(|| core.level_compactions.load(Ordering::SeqCst) == 1).await;
+
+		assert_eq!(core.level_attempts.load(Ordering::SeqCst), 3);
+		// The failure was recorded once, and the success recovered from it.
+		assert_eq!(core.error_handler.error_count(), 1);
+		assert!(core.error_handler.check_error().is_ok());
+		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_fatal_level_compaction_failure_is_not_retried() {
+		let write_stall = test_write_stall();
+		let core = Arc::new(MockCoreInner::new());
+		core.fail_level.store(true, Ordering::SeqCst);
+		core.level_failure_is_fatal.store(true, Ordering::SeqCst);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			Arc::clone(&write_stall),
+		);
+
+		task_manager.wake_up_level();
+		wait_for(|| core.error_handler.is_db_stopped()).await;
+		time::sleep(Duration::from_millis(400)).await;
+		assert_eq!(core.level_attempts.load(Ordering::SeqCst), 1);
+
+		assert!(matches!(core.error_handler.check_error(), Err(Error::ManifestWriteUncertain(_))));
+		assert!(write_stall.check().await.is_err(), "writers stay refused");
+		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
 	async fn test_stop_does_not_wait_for_a_flush_that_keeps_failing() {
 		let core = Arc::new(MockCoreInner::new());
 		core.fail_memtable.store(true, Ordering::SeqCst);
@@ -988,7 +1060,7 @@ mod tests {
 			"Stalled writer should return Err(PipelineStall) after compaction failure"
 		);
 
-		task_manager.stop().await;
+		stop_within_a_bound(task_manager).await;
 	}
 
 	#[test(tokio::test(flavor = "multi_thread"))]
@@ -1060,7 +1132,7 @@ mod tests {
 			assert!(writer_result.is_err(), "Writer {i} should return Err(PipelineStall)");
 		}
 
-		task_manager.stop().await;
+		stop_within_a_bound(task_manager).await;
 	}
 
 	// ===== Encryption errors =====
@@ -1287,13 +1359,14 @@ mod tests {
 		}
 	}
 
-	/// What was not a key error keeps what it had: a compaction that fails stops the database, and
-	/// a later compaction that works does not end that.
+	/// A fatal compaction failure keeps what it had: it stops the database, and a later compaction
+	/// that works does not end that.
 	#[test(tokio::test(flavor = "multi_thread"))]
-	async fn test_a_compaction_failure_that_is_not_a_key_error_still_stops_the_database_for_good() {
+	async fn test_a_compaction_failure_that_is_fatal_still_stops_the_database_for_good() {
 		let write_stall = test_write_stall();
 		let core = Arc::new(MockCoreInner::new());
 		core.fail_level.store(true, Ordering::SeqCst);
+		core.level_failure_is_fatal.store(true, Ordering::SeqCst);
 		let task_manager = TaskManager::new(
 			Arc::clone(&core) as Arc<dyn CompactionOperations>,
 			Arc::new(Options::default()),

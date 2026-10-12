@@ -377,10 +377,10 @@ async fn a_flush_that_recovers_does_not_clear_another_failure() {
 	let manifest = manifest_path(&tree);
 	let _healed = Healed(manifest.clone());
 	let handler = Arc::clone(&tree.core.inner.error_handler);
-	let hard = || Error::Other("injected compaction failure".into());
-	let fatal = || Error::Io(Arc::new(std::io::Error::other("injected compaction failure")));
+	let hard = || Error::Other("injected manifest failure".into());
+	let fatal = || Error::Io(Arc::new(std::io::Error::other("injected manifest failure")));
 
-	// Each round: a compaction failure of the given kind comes `first`, or while the flush is
+	// Each round: a manifest write failure of the given kind comes `first`, or while the flush is
 	// failing, and the flush recovers.
 	for (round, (error, first)) in
 		[(hard as fn() -> Error, true), (fatal, true), (hard, false), (fatal, false)]
@@ -390,7 +390,7 @@ async fn a_flush_that_recovers_does_not_clear_another_failure() {
 		handler.clear_error();
 		expected.extend(put(&tree, 200 * (round + 1)..200 * (round + 2)).await);
 		if first {
-			handler.set_error(error(), BackgroundErrorReason::Compaction);
+			handler.set_error(error(), BackgroundErrorReason::ManifestWrite);
 		}
 		let retry = park_attempt(&tree, 2);
 		fail_replacements(&manifest, ReplaceFailure::BeforeRename, 0, 1);
@@ -398,14 +398,14 @@ async fn a_flush_that_recovers_does_not_clear_another_failure() {
 		assert!(retry.is_reached(), "round {round}: the failed flush is retried");
 		if !first {
 			assert_eq!(handler.get_error().unwrap().reason, BackgroundErrorReason::MemtablaFlush);
-			handler.set_error(error(), BackgroundErrorReason::Compaction);
+			handler.set_error(error(), BackgroundErrorReason::ManifestWrite);
 		}
 		retry.release();
 		wait_until("the flush to succeed", || immutables(&tree) == 0).await;
 		tokio::time::sleep(GRACE).await;
 
-		let failure = handler.get_error().expect("the compaction failure is still there");
-		assert_eq!(failure.reason, BackgroundErrorReason::Compaction, "round {round}");
+		let failure = handler.get_error().expect("the manifest failure is still there");
+		assert_eq!(failure.reason, BackgroundErrorReason::ManifestWrite, "round {round}");
 		assert!(handler.check_error().is_err(), "round {round}: the database stays stopped");
 	}
 	assert_contents(&tree, &expected, "the stopped tree");
