@@ -185,15 +185,20 @@ async fn a_group_that_a_key_problem_refuses_before_it_is_applied_fails_and_the_d
 			assert_eq!(get(&tree, key), None, "{what}: {key}");
 		}
 
-		// A crash image: the group was never logged, so recovery does not find it.
+		// A crash image. The group may have been logged before the rotation that needed the key,
+		// and a commit that failed is not promised to be absent from a recovery (an error does
+		// not mean not applied), so recovery finds the whole group or none of it, and the commit
+		// before it either way.
 		let image = dir.path().join("image");
 		copy_dir(&live, &image);
 		km.set(Mode::Up);
 		let recovered = Tree::new(options(&image, &enc, false)).unwrap();
 		assert_eq!(get(&recovered, "first"), Some(vec![b'v'; 2500]), "{what}");
-		for (key, _) in &group {
-			assert_eq!(get(&recovered, key), None, "{what}: {key} after recovery");
-		}
+		let found: Vec<Option<Vec<u8>>> =
+			group.iter().map(|(key, _)| get(&recovered, key)).collect();
+		let none = found.iter().all(|value| value.is_none());
+		let all = found.iter().all(|value| value.as_deref() == Some(&[b'v'; 2500][..]));
+		assert!(none || all, "{what}: a recovery found part of the group");
 		crash(&recovered);
 
 		// The provider is back: the same group goes through, and so does the next commit.
