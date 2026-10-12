@@ -53,8 +53,8 @@ use sstable::bloom::LevelDBBloomFilter;
 pub use sstable::ribbon::RibbonFilter;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
-// The types of `Tree::encryption_status`, hidden with the types they are made of until their shape
-// is settled.
+// The types of `Tree::encryption_status`, hidden with the types they are made of until their
+// shape is settled.
 #[doc(hidden)]
 pub use crate::encryption_status::{EncryptionStatus, FileTotals, KeyUsage};
 pub use crate::error::{
