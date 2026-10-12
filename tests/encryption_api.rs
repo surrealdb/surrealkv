@@ -1,8 +1,8 @@
 //! The encryption building blocks as a downstream crate sees them: a key manager written outside
 //! this crate, the engine-facing context, and the error type.
 //!
-//! Nothing here touches a database: encryption at rest is not wired into one yet. These tests
-//! pin what an embedder or the next layer can rely on without `cfg(test)` access.
+//! Nothing here touches a database: these tests pin the building blocks that an embedder or the
+//! engine can rely on without `cfg(test)` access.
 
 #![cfg(not(target_arch = "wasm32"))]
 

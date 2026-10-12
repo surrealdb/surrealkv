@@ -2,9 +2,9 @@
 //! log, what a checkpoint copies and a restore brings back, and that none of the keys and values
 //! are in any file of the log.
 //!
-//! The context is put in the options directly, as the engine will when it has read a database's
-//! descriptor, so only the value log is sealed in these trees: the tables and the WAL are not
-//! covered here, and what is looked at is the directory of the log. The data is kept small: AEAD
+//! The context is put in the options directly, as the engine does once it has read a database's
+//! descriptor. The tables and the write-ahead log of these trees are sealed too, and what is
+//! looked at here is the directory of the value log. The data is kept small: AEAD
 //! runs at a few MB/s in the debug profile.
 
 use std::collections::{BTreeMap, BTreeSet};

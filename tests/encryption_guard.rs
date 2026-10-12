@@ -1,6 +1,6 @@
 //! A configured key manager must make `build` fail instead of silently writing plaintext.
 //!
-//! Encryption at rest is not wired into any SSTable, WAL or value-log path yet. These tests
+//! Encryption at rest is a preview and is not enabled in this build. These tests
 //! link against the library the way a downstream crate does, so `cfg(test)` is not set on it
 //! and the guard is active. They are compiled out when the non-default `encryption-preview`
 //! feature removes the guard.

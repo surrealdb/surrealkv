@@ -2,8 +2,8 @@
 //! and the key manager it is given, whether the database is encrypted and which key it needs, and
 //! that a refusal never changes a file.
 //!
-//! The surfaces that are sealed at this point are the manifest, the tables and the value log. The
-//! write-ahead log is not yet, so no check here looks for a marker in it.
+//! The surfaces that are sealed are the manifest, the tables, the value log and the write-ahead
+//! log, and every check of the files here looks at all of them.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -672,13 +672,11 @@ async fn opening_an_encrypted_database_never_leaves_a_copy_of_its_data_in_the_cl
 
 		// A migration moves what it found into a backup directory of the database, in the clear,
 		// and a database that is encrypted is never one: there is no such directory, and what is
-		// in the directories that are sealed is free of any marker. The write-ahead log is not
-		// sealed yet, and is not looked at.
+		// in any file of the database, the write-ahead log included, is free of any marker.
 		for (path, content) in snapshot(&root) {
 			let name = path.file_name().unwrap().to_string_lossy().into_owned();
 			assert!(!(name.starts_with('_') && name.ends_with("_backup")), "{path:?}");
-			let in_log = path.starts_with(opts.wal_dir());
-			if let (Some(bytes), false) = (content, in_log) {
+			if let Some(bytes) = content {
 				assert!(!contains(&bytes, b"ev-canary") && !contains(&bytes, b"ek-00"), "{path:?}");
 			}
 		}

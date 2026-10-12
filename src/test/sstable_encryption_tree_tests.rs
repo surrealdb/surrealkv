@@ -3,8 +3,8 @@
 //! database is never opened with a key that is not its own.
 //!
 //! What is checked of the files is the files of the tables, and what is checked of a refused
-//! open is that it changed nothing. The manifest and the value log of these databases are sealed
-//! too, and the write-ahead log is not yet.
+//! open is that it changed nothing. The manifest, the value log and the write-ahead log of these
+//! databases are sealed too.
 
 use std::collections::BTreeMap;
 use std::fs;

@@ -1,10 +1,11 @@
 //! Building blocks for encryption at rest (transparent data encryption, TDE).
 //!
-//! Encryption at rest is not implemented yet. Nothing the database writes goes through this
-//! module, and opening a database with a key manager configured is refused by
-//! `Options::validate`, so data is never written unencrypted by accident. The types here are
-//! the foundation the SSTable, value-log, WAL and manifest writers will be built on, and none
-//! of their formats is frozen.
+//! Every file of an encrypted database goes through this module: the manifest, the SSTables, the
+//! value log and the write-ahead log are sealed with the ciphers here, under keys the engine
+//! derives for each file, and each starts with a header, or for the manifest a container, that
+//! names the database, the file and the key. Encryption is a preview: `Options::validate` refuses
+//! a key manager unless the crate is built with the `encryption-preview` feature, and none of the
+//! formats is frozen.
 //!
 //! # Keys
 //!
@@ -14,6 +15,9 @@
 //! files never share a key whatever a manager returns.
 //!
 //! # Blocks
+//!
+//! A database makes its keys available once, when it is opened ([`EncryptionContext::prepare`]),
+//! so that creating a file afterwards never waits on a key provider.
 //!
 //! A [`FileCipher`] is built from a file key and seals or opens the blocks of that file in place
 //! with a detached tag. Each block is bound, through its associated data, to the database, the

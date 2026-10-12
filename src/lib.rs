@@ -24,8 +24,8 @@ mod sstable;
 mod stall;
 pub mod storage;
 mod task;
-// Reachable only because `Options::key_manager` is a public field. Encryption at rest is not
-// implemented, so keep it out of the documented API.
+// Reachable only because `Options::key_manager` is a public field. Encryption at rest is a
+// preview, so keep it out of the documented API.
 #[doc(hidden)]
 pub mod tde;
 pub mod telemetry;
@@ -284,15 +284,17 @@ pub struct Options {
 	pub l0_stall_threshold: usize,
 
 	// Transparent Data Encryption (TDE) configuration
-	/// Key manager reserved for transparent data encryption at rest (TDE), which is not
-	/// implemented yet. The cipher primitives are not wired into any SSTable, WAL or value-log
-	/// path, so nothing would be encrypted. Building a tree with a key manager set returns
-	/// `Error::InvalidArgument` instead of writing plaintext.
+	/// Key manager for transparent data encryption at rest (TDE). A database that is created with
+	/// one is encrypted for good: its manifest, tables, value log and write-ahead log are sealed
+	/// under keys derived from it, and a database that was created without one cannot be given
+	/// one. Encryption is a preview: a key manager is refused with `Error::InvalidArgument` unless
+	/// the crate is built with the `encryption-preview` feature, and the formats are not final.
 	/// Default: None
 	pub key_manager: Option<Arc<dyn KeyManager>>,
-	/// Cipher suite preference reserved for encryption at rest. Has no effect until encryption is
-	/// implemented. `Auto` lets the library pick AES-256-GCM when the CPU has AES instructions
-	/// and XChaCha20-Poly1305 otherwise, once, when a database is created.
+	/// Cipher suite preference for a database that is created encrypted. `Auto` lets the library
+	/// pick AES-256-GCM when the CPU has AES instructions and XChaCha20-Poly1305 otherwise, once,
+	/// when the database is created. The suite is then kept in the database, and a database that
+	/// exists ignores this.
 	/// Options: Auto, Suite(Aes256Gcm), Suite(XChaCha20Poly1305).
 	/// Default: CipherPreference::Auto
 	pub encryption_cipher: CipherPreference,
@@ -380,11 +382,13 @@ impl Options {
 		self
 	}
 
-	/// Reserved for Transparent Data Encryption (TDE), which is not implemented yet.
+	/// Creates the database encrypted at rest with the keys of `key_manager`, or opens the one that
+	/// is, which needs the same keys. Every file of the database is sealed: the manifest, the
+	/// tables, the value log and the write-ahead log. `cipher` is the suite a new database uses,
+	/// and an existing one keeps its own.
 	///
-	/// The cipher primitives are not wired into any SSTable, WAL or value-log path, so this
-	/// would encrypt nothing. Building a tree with a key manager set fails with
-	/// `Error::InvalidArgument` rather than writing plaintext.
+	/// Encryption is a preview: unless the crate is built with the `encryption-preview` feature,
+	/// building a tree with a key manager set fails with `Error::InvalidArgument`.
 	pub fn with_encryption(
 		mut self,
 		key_manager: Arc<dyn KeyManager>,
@@ -688,19 +692,18 @@ impl Options {
 	/// This should be called when the store starts to catch configuration
 	/// errors early
 	pub fn validate(&self) -> Result<()> {
-		// Encryption at rest is not wired into every SSTable, WAL or value-log path yet, so a
-		// configured key manager would be accepted and then leave files in plaintext. Refuse
+		// Encryption at rest is a preview and is not enabled in this build: its formats are not
+		// final, so a database that was sealed by it would not be one that a release reads. Refuse
 		// here, which is the first thing `Tree::new` does, so a rejection creates nothing on
 		// disk. A resolved context is refused as well: it is a public field, and it is what
-		// makes the tables sealed while the other files would not be. Compiled out only for this
-		// crate's own unit tests and under the non-default `encryption-preview` feature, which
-		// exist to build the missing parts.
+		// makes the files sealed. Compiled out only for this crate's own unit tests and under the
+		// non-default `encryption-preview` feature.
 		#[cfg(not(any(test, feature = "encryption-preview")))]
 		if self.key_manager.is_some() || self.encryption_context.is_some() {
 			return Err(Error::InvalidArgument(
-				"Encryption at rest is not implemented yet: the key manager would be accepted \
-				 but no SSTable, WAL or value-log data would be encrypted. Refusing to open \
-				 rather than write plaintext; remove the key manager."
+				"Encryption at rest is not enabled in this build: it is a preview behind the \
+				 `encryption-preview` feature, and its formats are not final. Refusing to open \
+				 with a key manager; remove the key manager."
 					.to_string(),
 			));
 		}
