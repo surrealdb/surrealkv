@@ -2985,6 +2985,55 @@ impl TreeBuilder {
 		self
 	}
 
+	/// Creates the database encrypted at rest with the keys of `key_manager`, or opens the one that
+	/// is. It is [`Options::with_encryption`] for a builder: every file of the database is sealed,
+	/// the manifest, the tables, the value log and the write-ahead log.
+	///
+	/// # Creating and opening
+	///
+	/// Whether a database is encrypted is decided once, when it is created, and is read from its
+	/// manifest every time it is opened.
+	///
+	/// - At a path that holds no database, `build` creates one that is encrypted. It is given an
+	///   identity of its own and the cipher suite that `cipher` names, and `Auto` is resolved then
+	///   and never again: AES-256-GCM on a machine with hardware support for it, XChaCha20-Poly1305
+	///   on one without. Both are written to the manifest, which is the first file of the database,
+	///   sealed under the key that `key_manager` says is active. No file exists under an identity
+	///   before the manifest that names it is on disk.
+	/// - At the path of a database that is encrypted, `build` opens it, with the suite it was
+	///   created with, and `cipher` is not looked at. The manager must hold the key that sealed the
+	///   manifest, and every other key that a file of the database names. A key that does not fit
+	///   is refused by name (`Error::Encryption` with `WrongKey`, `UnknownKeyId` or `KeyRetired`)
+	///   before anything is changed, and a database is never repaired or deleted because of a key.
+	/// - At the path of a database that was created without a key, `build` fails with
+	///   `NotEncrypted`: encryption is never added to a database that exists, and no migration from
+	///   another store is done into an encrypted database.
+	/// - A database that is encrypted cannot be opened without a key manager: `build` fails with
+	///   `NotConfigured`.
+	///
+	/// # Keys
+	///
+	/// The key manager owns the keys, and the database keeps none: a root key is not written to any
+	/// file. **A key that is lost is data that is lost.** There is no copy to recover it from, and
+	/// every file that was written under a key is unreadable without it, the checkpoints and
+	/// backups of the database included. New files are written under the key that the manager
+	/// says is active, and an older key must stay with the manager for as long as any file or any
+	/// checkpoint that was written under it is wanted: see `Tree::encryption_status`.
+	///
+	/// # Preview
+	///
+	/// Encryption is a preview. Unless the crate is built with the `encryption-preview` feature,
+	/// `build` with a key manager fails with `Error::InvalidArgument` and creates nothing, and the
+	/// formats of the files are not final: do not use it for data that is meant to be kept.
+	pub fn with_encryption(
+		mut self,
+		key_manager: Arc<dyn crate::tde::KeyManager>,
+		cipher: impl Into<crate::tde::CipherPreference>,
+	) -> Self {
+		self.opts = self.opts.with_encryption(key_manager, cipher);
+		self
+	}
+
 	/// Builds the LSM tree with the configured options.
 	///
 	/// This method ensures type safety by using the same key type K

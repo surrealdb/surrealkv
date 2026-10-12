@@ -153,6 +153,21 @@ async fn rejected_build_does_not_block_a_plain_build_at_the_same_path() {
 	tree.close().await.unwrap();
 }
 
+/// The entry point of the builder is the one of the options, and is refused the same way: with the
+/// error, and with nothing created.
+#[tokio::test]
+async fn the_builder_entry_point_for_encryption_is_refused_and_creates_nothing() {
+	for suite in SUITES {
+		let dir = tempfile::tempdir().unwrap();
+		let db_path = dir.path().join("db");
+		let key_manager: Arc<dyn KeyManager> = Arc::new(SoftwareKeyManager::new([0x5a; 32]));
+		let builder =
+			TreeBuilder::new().with_path(db_path.clone()).with_encryption(key_manager, suite);
+		assert_encryption_refused(expect_err(builder.build()));
+		assert!(!db_path.exists(), "a rejected build must not create the directory");
+	}
+}
+
 /// A tool that decrypts is held to the guard that a tree is, so a build that cannot make an
 /// encrypted database does not read one either. The refusal comes before any file is looked at:
 /// none of the paths here exists.

@@ -155,6 +155,8 @@ pub mod tde_tests;
 #[cfg(test)]
 pub mod transaction_tests;
 #[cfg(test)]
+pub mod tree_builder_encryption_tests;
+#[cfg(test)]
 pub mod vlog_floor_tests;
 #[cfg(test)]
 pub mod vlog_gc_tests;
