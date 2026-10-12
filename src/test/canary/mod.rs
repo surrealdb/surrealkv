@@ -155,12 +155,22 @@
 //!   `encryption_open_tests::a_database_written_under_two_keys_needs_both_and_a_key_that_was_retired_is_refused`,
 //!   `vlog_sealed_tests::a_key_that_does_not_fit_is_an_error_and_never_a_reason_to_touch_a_file`.
 //!
-//! **Not claimed.** A manifest of another database under the same key that lists no table of the
-//! directory: it is taken for the database, and the tables it does not list are then removed as
-//! orphans. The manifest in `refusal` lists tables that exist, which are refused for their
-//! database. A database whose only key is decrypt-only: it is not tested. An open that is not
-//! refused is not unchanged, since it makes a segment of the WAL; the cases of a damaged file
-//! that the open does not reach allow that and nothing else.
+//! - A file that names another database and that the manifest does not reach is refused, kept and
+//!   never deleted as an old file: a table that the manifest does not list
+//!   (`orphan_cleanup_tests::a_table_of_another_database_refuses_the_open_and_nothing_is_deleted`),
+//!   and a segment of the WAL below the log number, which no replay reads and which is deleted by
+//!   its number (`wal_foreign_segment_tests::a_segment_of_another_database_below_the_log_number_refuses_the_open_and_changes_nothing`,
+//!   `wal_foreign_segment_tests::a_manifest_of_another_database_does_not_have_the_segments_of_this_one_deleted`,
+//!   `wal_foreign_segment_tests::a_segment_of_another_database_that_appears_while_the_database_is_open_is_kept`).
+//!   What a crash of this database leaves, a file that is empty, zeros or cut short, is cleaned as
+//!   it always was (`wal_foreign_segment_tests::what_this_database_left_behind_below_the_log_number_is_opened_over_and_deleted`).
+//!
+//! **Not claimed.** That the manifest is this database's: the identity of an opened database is
+//! what its manifest says, so a manifest of another database that is put in place of this one's is
+//! taken for the database, and what is refused is each file that names a database other than the
+//! one that the manifest does. A database whose only key is decrypt-only: it is not tested. An
+//! open that is not refused is not unchanged, since it makes a segment of the WAL; the cases of a
+//! damaged file that the open does not reach allow that and nothing else.
 //!
 //! ## Plaintext files are unchanged
 //!
@@ -208,10 +218,14 @@
 //!   `encryption_checkpoint_tests::the_value_log_of_a_checkpoint_is_checked_from_its_first_bytes_before_anything_is_cleared`,
 //!   `sstable_encryption_tree_tests::a_plain_checkpoint_is_not_restored_into_an_encrypted_database`.
 //!
+//! - A segment of another database, of another number, or in the clear in the WAL of a checkpoint
+//!   is refused before anything is cleared
+//!   (`encryption_checkpoint_wal_tests::a_segment_of_the_wal_of_a_checkpoint_that_is_not_of_this_database_is_refused_before_anything_is_cleared`).
+//!
 //! **Not claimed.** A restore of a checkpoint into another database or an empty directory: a
-//! checkpoint of an encrypted database is a database, and is opened where it is. A sealed
-//! segment of another database in the WAL of a checkpoint is not looked at before the restore
-//! replaces the files.
+//! checkpoint of an encrypted database is a database, and is opened where it is. The tables that
+//! a checkpoint holds and its manifest does not list are copied by a restore and refused by the
+//! next open if they are another database's.
 //!
 //! ## No plaintext copy in a migration backup
 //!

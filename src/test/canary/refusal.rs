@@ -43,10 +43,12 @@
 //!
 //! # What is not in here
 //!
-//! A manifest of another database under the same key that lists no table: it is accepted as the
-//! database, and the tables that it does not list are then removed as orphans. The foreign
-//! manifest below lists tables that exist, which the open then refuses for their database. The
-//! gap is in the notes of this package and not in a test that would have to pass.
+//! A manifest of another database under the same key is accepted as the database, since the
+//! identity of a database is its manifest's. What is refused is each file that names a database
+//! other than the manifest's. The foreign manifest below lists tables that exist, which the open
+//! refuses for their database; the tables that a manifest does not list, and the segments of the
+//! WAL below its log number, are refused for theirs in `orphan_cleanup_tests` and
+//! `wal_foreign_segment_tests`.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -375,6 +377,22 @@ enum Outcome {
 	Opened(Reads),
 }
 
+/// Fails if the text of `error`, as it is shown and as it is debugged, which is what a log line or
+/// a caller that did not ask for the data gets, holds a key or a value of the database. Keys that
+/// are too short to be told from the words of a message are left out.
+fn assert_names_no_data(error: &Error, expected: &BTreeMap<Vec<u8>, Vec<u8>>) {
+	const SHORTEST: usize = 6;
+	let text = format!("{error}\n{error:?}").into_bytes();
+	for (key, value) in expected {
+		for datum in [key, value] {
+			assert!(
+				datum.len() < SHORTEST || !text.windows(datum.len()).any(|window| window == datum),
+				"an error names the data of the database: {error:?}"
+			);
+		}
+	}
+}
+
 /// Opens the database, and, if it opens, reads every key of `expected`.
 async fn open_and_read(
 	path: &Path,
@@ -387,7 +405,10 @@ async fn open_and_read(
 	let opts = options(path, shape, mode, suite, auth);
 	let tree = match Tree::new(opts) {
 		Ok(tree) => tree,
-		Err(error) => return Outcome::Refused(error),
+		Err(error) => {
+			assert_names_no_data(&error, expected);
+			return Outcome::Refused(error);
+		}
 	};
 	let mut reads = Reads {
 		failures: Vec::new(),
@@ -401,7 +422,10 @@ async fn open_and_read(
 				Ok(Some(found)) if found == *value => {}
 				Ok(Some(_)) => reads.wrong.push(key.clone()),
 				Ok(None) => reads.missing.push(key.clone()),
-				Err(error) => reads.failures.push(error),
+				Err(error) => {
+					assert_names_no_data(&error, expected);
+					reads.failures.push(error);
+				}
 			}
 		}
 	}
