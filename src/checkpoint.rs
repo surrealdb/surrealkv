@@ -1000,7 +1000,10 @@ impl DatabaseCheckpoint {
 			let Ok((id, Some(extension))) = crate::wal::parse_segment_name(&name) else {
 				continue;
 			};
-			if extension != "wal" || !entry.file_type().map_err(io)?.is_file() {
+			// The path, not the entry: a segment that is a link is read through by the restore that
+			// copies it and by the replay that follows, as it is by the listing of the log, so it
+			// is looked at as the file it leads to.
+			if extension != "wal" || !entry.path().is_file() {
 				continue;
 			}
 			let mut head = Vec::with_capacity(crate::wal::sealed::HEADER_RECORD_LEN);

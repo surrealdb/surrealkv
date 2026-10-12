@@ -132,3 +132,35 @@ async fn a_sealed_segment_in_the_wal_of_a_checkpoint_of_a_database_that_is_not_e
 	read(&live, &rounds('1', 0..KEYS));
 	live.close().await.unwrap();
 }
+
+/// A segment that is a link to a file elsewhere is read through by the restore that copies it and
+/// by the replay that follows, so what it leads to is looked at as well: a link is no way round the
+/// check.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_segment_of_the_wal_of_a_checkpoint_that_is_a_link_is_looked_at_as_the_file_it_leads_to()
+{
+	let suite = CipherSuite::XChaCha20Poly1305;
+	let dir = TempDir::new().unwrap();
+	let checkpoints = TempDir::new().unwrap();
+	let live_root = dir.path().join("live");
+	let live_cp = checkpoints.path().join("live");
+	let live = tree_with_checkpoint(&encrypted(&live_root, manager(), suite), &live_cp).await;
+
+	// A segment of another database, which is not in the checkpoint but is linked from it.
+	let (name, foreign) = sealed_segment(&dir.path().join("foreign"), suite).await;
+	let elsewhere = dir.path().join("elsewhere.bin");
+	fs::write(&elsewhere, &foreign).unwrap();
+	let linked = checkpoints.path().join("linked");
+	copy_dir(&live_cp, &linked);
+	let wal = linked.join("wal");
+	fs::create_dir_all(&wal).unwrap();
+	std::os::unix::fs::symlink(&elsewhere, wal.join(&name)).unwrap();
+
+	let before = snapshot(&live_root);
+	let err = live.restore_from_checkpoint(&linked).unwrap_err();
+	assert_eq!(encryption_error(err, "linked"), EncryptionError::DbIdMismatch);
+	assert!(snapshot(&live_root) == before, "a refused restore changed the files");
+	read(&live, &rounds('1', 0..KEYS));
+	live.close().await.unwrap();
+}
