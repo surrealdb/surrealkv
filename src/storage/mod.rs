@@ -124,6 +124,16 @@ impl std::fmt::Debug for AffinityLogStore {
 	}
 }
 
+/// The error of a failed append or sync of the WAL, for the committer. As text, as it always was,
+/// except an encryption error, which keeps its type: a seal that was refused is not an I/O error,
+/// and the committer has to be able to tell.
+fn log_error(error: crate::wal::Error) -> crate::error::Error {
+	match error {
+		crate::wal::Error::Encryption(error) => crate::error::Error::Encryption(error),
+		error => crate::error::Error::Other(error.to_string()),
+	}
+}
+
 impl AffinityLogStore {
 	pub fn new(wal: Arc<parking_lot::RwLock<crate::wal::manager::Wal>>) -> Self {
 		Self {
@@ -145,7 +155,7 @@ impl AffinityLogStore {
 			affinitypool::spawn(move || -> Result<u64> {
 				let mut guard = wal.write();
 				let segment = guard.get_active_log_number();
-				guard.append(&data).map_err(|e| crate::error::Error::Other(e.to_string()))?;
+				guard.append(&data).map_err(log_error)?;
 				Ok(segment)
 			})
 			.await
@@ -179,9 +189,7 @@ impl AffinityLogStore {
 			if !admit() {
 				return Err(crate::error::Error::PipelineStall);
 			}
-			let segment = guard
-				.append_group(&buf, &ends)
-				.map_err(|e| crate::error::Error::Other(e.to_string()))?;
+			let segment = guard.append_group(&buf, &ends).map_err(log_error)?;
 			Ok((segment, buf, ends))
 		})
 		.await
@@ -195,7 +203,7 @@ impl LogStore for AffinityLogStore {
 		Box::pin(async move {
 			affinitypool::spawn(move || -> Result<u64> {
 				let mut guard = wal.write();
-				guard.append(&data).map_err(|e| crate::error::Error::Other(e.to_string()))
+				guard.append(&data).map_err(log_error)
 			})
 			.await
 		})
@@ -206,7 +214,7 @@ impl LogStore for AffinityLogStore {
 		Box::pin(async move {
 			affinitypool::spawn(move || -> Result<()> {
 				let mut guard = wal.write();
-				guard.sync().map_err(|e| crate::error::Error::Other(e.to_string()))
+				guard.sync().map_err(log_error)
 			})
 			.await
 		})

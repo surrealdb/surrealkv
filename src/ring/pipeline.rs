@@ -1087,6 +1087,10 @@ impl CommitPipeline {
 				Ok(()) if applied => Ok(()),
 				Ok(()) => Err(Error::PipelineStall),
 				Err(e @ Error::DatabaseStopped(_)) => Err(e.clone()),
+				// A key that could not be had, or a seal that was refused, is told to every
+				// committer of the group as it is: whether to try the commit again depends on
+				// which.
+				Err(e @ Error::Encryption(_)) => Err(e.clone()),
 				Err(e) => Err(Error::Io(
 					std::io::Error::other(format!("Group commit failed: {e}")).into(),
 				)),
@@ -1534,9 +1538,13 @@ impl CommitPipeline {
 				if let Some(ref tm) = self.task_manager {
 					tm.wake_up_memtable();
 				}
-				return Err(Error::Other(format!(
-					"Failed to flush the memtables of the failed WAL segment: {e}"
-				)));
+				return Err(match e {
+					// Whether the group may be tried again depends on the key error.
+					Error::Encryption(_) => e,
+					e => Error::Other(format!(
+						"Failed to flush the memtables of the failed WAL segment: {e}"
+					)),
+				});
 			}
 			if !self.inner.try_release_wal_hold()? {
 				return Err(Error::Other(

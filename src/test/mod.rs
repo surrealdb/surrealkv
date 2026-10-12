@@ -59,6 +59,7 @@ pub mod direct_l0_read_order_tests;
 #[cfg(test)]
 pub mod encryption_background_tests;
 pub mod encryption_checkpoint_tests;
+pub mod encryption_commit_path_tests;
 #[cfg(test)]
 pub mod encryption_open_tests;
 #[cfg(test)]
