@@ -62,13 +62,13 @@ Commits are not flushed to disk before they return (each figure is a single run)
 | Fjall | 992,874 | 62,608 | 64,059 | 2,676 | 132,698 |
 | ReDB | 779,262 | 35,171 | 35,805 | 65,686 | 561,837 |
 | LMDB | 1,461,261 | 127,045 | 163,099 | 157,965 | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**1,192,772** |
-| Libmdbx | - | - | - | - | - |
+| Libmdbx | 613,904 | 24,378 | 5,026 | 11,521 | 384,128 |
 
-- **Creates (Writes)**: **321,715 OPS**: **1.88× slower** than RocksDB, **51.0× faster** than SlateDB, **5.14× faster** than Fjall, **9.15× faster** than ReDB, and **2.53× faster** than LMDB.
-- **Updates**: **274,172 OPS**: **2.22× slower** than RocksDB, **43.2× faster** than SlateDB, **4.28× faster** than Fjall, **7.66× faster** than ReDB, and **1.68× faster** than LMDB.
-- **Point Reads**: **6.99M OPS** sustained: **8.26× faster** than RocksDB, **72.5× faster** than SlateDB, **7.04× faster** than Fjall, **8.97× faster** than ReDB, and **4.79× faster** than LMDB.
-- **Deletes**: **307,034 OPS**: **2.41× slower** than RocksDB, **48.1× faster** than SlateDB, **115× faster** than Fjall, **4.67× faster** than ReDB, and **1.94× faster** than LMDB.
-- **Range Scans**: **896,366 OPS** on `select(*) limit(100)` scans: **1.05× faster** than RocksDB, **34.2× faster** than SlateDB, **6.75× faster** than Fjall, **1.60× faster** than ReDB, and **1.33× slower** than LMDB. See [Scan Profile](#scan-profile) for other kinds of range scan.
+- **Creates (Writes)**: **321,715 OPS**: **1.88× slower** than RocksDB, **51.0× faster** than SlateDB, **5.14× faster** than Fjall, **9.15× faster** than ReDB, **2.53× faster** than LMDB, and **13.2× faster** than Libmdbx.
+- **Updates**: **274,172 OPS**: **2.22× slower** than RocksDB, **43.2× faster** than SlateDB, **4.28× faster** than Fjall, **7.66× faster** than ReDB, **1.68× faster** than LMDB, and **54.6× faster** than Libmdbx.
+- **Point Reads**: **6.99M OPS** sustained: **8.26× faster** than RocksDB, **72.5× faster** than SlateDB, **7.04× faster** than Fjall, **8.97× faster** than ReDB, **4.79× faster** than LMDB, and **11.4× faster** than Libmdbx.
+- **Deletes**: **307,034 OPS**: **2.41× slower** than RocksDB, **48.1× faster** than SlateDB, **115× faster** than Fjall, **4.67× faster** than ReDB, **1.94× faster** than LMDB, and **26.7× faster** than Libmdbx.
+- **Range Scans**: **896,366 OPS** on `select(*) limit(100)` scans: **1.05× faster** than RocksDB, **34.2× faster** than SlateDB, **6.75× faster** than Fjall, **1.60× faster** than ReDB, **1.33× slower** than LMDB, and **2.33× faster** than Libmdbx. See [Scan Profile](#scan-profile) for other kinds of range scan.
 
 ### Scan Profile
 
@@ -82,7 +82,7 @@ Range scans over the same dataset, as scans per second, without synchronous dura
 | Fjall | 132,698 | 151,861 | 4,335 | 4,383 | 42.4 |
 | ReDB | 561,837 | 571,629 | 44,438 | 44,462 | 249 |
 | LMDB | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**1,192,772** | 1,195,166 | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**549,220** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**552,090** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**902** |
-| Libmdbx | - | - | - | - | - |
+| Libmdbx | 384,128 | 260,769 | 183,361 | 185,073 | 848 |
 
 - **Limit**: `select(*) limit(100)` returns the first 100 key-value pairs of the range. **Keys, Limit** (`select(id) limit(100)`) returns only the keys.
 - **Skip + Limit**: `select(*) start(5000) limit(100)` walks and discards 5,000 entries before returning 100. **Keys, Skip + Limit** returns only the keys.
@@ -100,7 +100,7 @@ Resting and peak memory are the lowest and highest process memory sampled across
 | Fjall | 627 MiB | 1.71 GiB |
 | ReDB | 257 MiB | 2.17 GiB |
 | LMDB | 776 MiB | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**826 MiB** |
-| Libmdbx | - | - |
+| Libmdbx | 40.98 GiB | 117.71 GiB |
 
 - **Resting Footprint**: **221 MiB** at rest, the lowest of the engines tested.
 - **Dynamic Scaling**: Peak memory rises under high concurrency, when parallel commits buffer active batches.
