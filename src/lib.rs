@@ -27,8 +27,8 @@ mod sstable;
 mod stall;
 pub mod storage;
 mod task;
-// Reachable only because `Options::key_manager` is a public field. Encryption at rest is a
-// preview, so keep it out of the documented API.
+// Reachable only because `Options::key_manager` is a public field. The key manager, the cipher
+// types and the errors are re-exported at the root, so keep the module out of the documented API.
 #[doc(hidden)]
 pub mod tde;
 pub mod telemetry;
@@ -53,8 +53,8 @@ use sstable::bloom::LevelDBBloomFilter;
 pub use sstable::ribbon::RibbonFilter;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
-// The types of `Tree::encryption_status`, hidden with the types they are made of until
-// encryption is no longer a preview.
+// The types of `Tree::encryption_status`, hidden with the types they are made of until their
+// shape is settled.
 #[doc(hidden)]
 pub use crate::encryption_status::{EncryptionStatus, FileTotals, KeyUsage};
 pub use crate::error::{
@@ -302,8 +302,8 @@ pub struct Options {
 	/// Key manager for transparent data encryption at rest (TDE). A database that is created with
 	/// one is encrypted for good: its manifest, tables, value log and write-ahead log are sealed
 	/// under keys derived from it, and a database that was created without one cannot be given
-	/// one. Encryption is a preview: a key manager is refused with `Error::InvalidArgument` unless
-	/// the crate is built with the `encryption-preview` feature, and the formats are not final.
+	/// one. Needs the `encryption` feature, which is on by default: without it a key manager is
+	/// refused with `Error::InvalidArgument`.
 	/// Default: None
 	pub key_manager: Option<Arc<dyn KeyManager>>,
 	/// Cipher suite preference for a database that is created encrypted. `Auto` lets the library
@@ -401,8 +401,8 @@ impl Options {
 	/// tables, the value log and the write-ahead log. `cipher` is the suite a new database uses,
 	/// and an existing one keeps its own.
 	///
-	/// Encryption is a preview: unless the crate is built with the `encryption-preview` feature,
-	/// building a tree with a key manager set fails with `Error::InvalidArgument`.
+	/// Needs the `encryption` feature, which is on by default: without it, building a tree with a
+	/// key manager set fails with `Error::InvalidArgument`.
 	pub fn with_encryption(
 		mut self,
 		key_manager: Arc<dyn KeyManager>,
@@ -699,18 +699,17 @@ impl Options {
 	/// This should be called when the store starts to catch configuration
 	/// errors early
 	pub fn validate(&self) -> Result<()> {
-		// Encryption at rest is a preview and is not enabled in this build: its formats are not
-		// final, so a database that was sealed by it would not be one that a release reads. Refuse
-		// here, which is the first thing `Tree::new` does, so a rejection creates nothing on
-		// disk. A resolved context is refused as well: it is a public field, and it is what
+		// A build without the `encryption` feature must not seal anything, so it refuses a key
+		// manager rather than writing plaintext to a database that was asked to be encrypted.
+		// Refuse here, which is the first thing `Tree::new` does, so a rejection creates nothing
+		// on disk. A resolved context is refused as well: it is a public field, and it is what
 		// makes the files sealed. Compiled out only for this crate's own unit tests and under the
-		// non-default `encryption-preview` feature.
-		#[cfg(not(any(test, feature = "encryption-preview")))]
+		// `encryption` feature, which is on by default.
+		#[cfg(not(any(test, feature = "encryption")))]
 		if self.key_manager.is_some() || self.encryption_context.is_some() {
 			return Err(Error::InvalidArgument(
-				"Encryption at rest is not enabled in this build: it is a preview behind the \
-				 `encryption-preview` feature, and its formats are not final. Refusing to open \
-				 with a key manager; remove the key manager."
+				"Encryption at rest is not enabled in this build: it needs the `encryption` \
+				 feature. Refusing to open with a key manager; remove the key manager."
 					.to_string(),
 			));
 		}

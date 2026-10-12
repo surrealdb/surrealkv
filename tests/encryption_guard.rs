@@ -1,11 +1,11 @@
 //! A configured key manager must make `build` fail instead of silently writing plaintext.
 //!
-//! Encryption at rest is a preview and is not enabled in this build. These tests
+//! Encryption at rest is not enabled in a build without the `encryption` feature. These tests
 //! link against the library the way a downstream crate does, so `cfg(test)` is not set on it
-//! and the guard is active. They are compiled out when the non-default `encryption-preview`
-//! feature removes the guard.
+//! and the guard is active. They are compiled out when the `encryption` feature, on by default,
+//! removes the guard. Run them with `--no-default-features`.
 
-#![cfg(all(not(target_arch = "wasm32"), not(feature = "encryption-preview")))]
+#![cfg(all(not(target_arch = "wasm32"), not(feature = "encryption")))]
 
 use std::path::Path;
 use std::sync::Arc;

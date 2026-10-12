@@ -237,6 +237,12 @@ pub(crate) struct CoreInner {
 	/// failed would reach recovery in part.
 	pub(crate) group_wal_pin: AtomicU64,
 
+	/// The WAL segments below this one may hold the records of a commit group that failed with
+	/// none of it applied, 0 when there is none. Its committers were told it failed, so no later
+	/// group may be logged while recovery could still replay it: it would come back underneath
+	/// commits that never saw it. See `drop_unapplied_group`.
+	pub(crate) unapplied_group_below: AtomicU64,
+
 	/// Global memory controller accounting memory across memtables, ring buffer, and cache.
 	pub(crate) memory_controller: Arc<crate::memory::MemoryController>,
 
@@ -373,6 +379,7 @@ impl CoreInner {
 			error_handler: Arc::new(BackgroundErrorHandler::new()),
 			visible_seq_num,
 			group_wal_pin: AtomicU64::new(u64::MAX),
+			unapplied_group_below: AtomicU64::new(0),
 			memory_controller,
 			manifest_loaded_from_disk,
 			manifest_uncertain: Arc::new(AtomicBool::new(false)),
@@ -940,6 +947,62 @@ impl CoreInner {
 			e => replace_error(&e),
 		})?;
 		Ok(Some(true))
+	}
+
+	/// Moves `log_number` to `below`, the bound of `unapplied_group_below`, so that recovery
+	/// replays none of the segments that may hold the records of the commit group that failed, and
+	/// clears the bound. `current` says whether a restore has replaced the database since; it is
+	/// asked under `flush_lock`, which a restore holds while it replaces the manifest.
+	///
+	/// Every memtable tagged with one of those segments is flushed first: the active one is
+	/// rotated out if it is tagged below the bound, and the queue is flushed. A failure leaves the
+	/// bound where it was, and the next group tries again before it logs anything.
+	pub(crate) fn drop_unapplied_group(
+		&self,
+		below: u64,
+		current: impl Fn() -> bool,
+	) -> Result<()> {
+		if self.active_memtable.read()?.get_wal_number() < below {
+			self.seal_active_wal_segment()?;
+		}
+		self.flush_all_immutables_sync()?;
+
+		let _flush = self.flush_lock.lock();
+		if !current() {
+			return Err(Error::PipelineStall);
+		}
+		// Lock order: level_manifest -> immutable_memtables (matches flush_immutable_to_sst).
+		let mut manifest = self.level_manifest.write()?;
+		if manifest.get_log_number() < below {
+			if self.immutable_memtables.read()?.iter().any(|entry| entry.wal_number < below) {
+				return Err(Error::Other(
+					"a memtable of a WAL segment that holds the records of a failed commit group \
+					 is not in a table yet"
+						.into(),
+				));
+			}
+			let changeset = ManifestChangeSet {
+				log_number: Some(below),
+				..Default::default()
+			};
+			let rollback = manifest.apply_changeset(&changeset)?;
+			if let Err(e) = write_manifest_to_disk(&manifest) {
+				manifest.revert_changeset(rollback);
+				return Err(self.manifest_write_error(
+					e,
+					format!("Failed to move log_number past a failed commit group: {below}"),
+				));
+			}
+			// The manifest in memory is on disk whole, whatever an earlier write left there.
+			self.manifest_uncertain.store(false, Ordering::Release);
+		}
+		let _ = self.unapplied_group_below.compare_exchange(
+			below,
+			0,
+			Ordering::AcqRel,
+			Ordering::Acquire,
+		);
+		Ok(())
 	}
 
 	/// The error of a rotation of the WAL that failed. An encryption error keeps its type: a key
@@ -2701,7 +2764,7 @@ impl Tree {
 	/// it is back. It may wait on the provider, and does nothing for a database that is not
 	/// encrypted.
 	///
-	/// Part of the encryption preview, and kept out of the documented interface until it is not.
+	/// Kept out of the documented interface until its shape is settled.
 	#[doc(hidden)]
 	pub fn prepare_keys(&self) -> Result<()> {
 		self.core.inner.prepare_keys()
@@ -2716,7 +2779,7 @@ impl Tree {
 	/// key id that a file names, and of the active one, is the key manager's. A database that
 	/// is not encrypted is answered at once, with nothing counted.
 	///
-	/// The shape of the answer is not settled while encryption is a preview, which is why it is
+	/// The shape of the answer is not settled, which is why it is
 	/// hidden from the documentation with the types that it is made of.
 	#[doc(hidden)]
 	pub fn encryption_status(&self) -> Result<crate::EncryptionStatus> {
@@ -3031,9 +3094,9 @@ impl TreeBuilder {
 	/// says is active, and an older key must stay with the manager for as long as any file or any
 	/// checkpoint that was written under it is wanted: see `Tree::encryption_status`.
 	///
-	/// # Preview
+	/// # Feature
 	///
-	/// Encryption is a preview. Unless the crate is built with the `encryption-preview` feature,
+	/// Encryption needs the `encryption` feature, which is on by default. Without it,
 	/// `build` with a key manager fails with `Error::InvalidArgument` and creates nothing, and the
 	/// formats of the files are not final: do not use it for data that is meant to be kept.
 	pub fn with_encryption(

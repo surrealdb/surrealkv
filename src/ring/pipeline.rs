@@ -982,10 +982,12 @@ impl CommitPipeline {
 	/// order, makes them durable and visible, and completes their commits. Drains
 	/// `scratch.group`, and leaves the rest of `scratch` for the caller to recycle.
 	///
-	/// A group that fails before any of it is applied fails whole and leaves nothing behind. One
-	/// that fails after part of it was applied cannot be taken back: the batches in the memtables
-	/// would become readable with the next group that publishes. It stops the database instead,
-	/// see `stop_database`, and no sequence number past it is ever published.
+	/// A group that fails before any of it is applied fails whole and leaves nothing behind that
+	/// a later commit can be ordered after: if its records reached the WAL, no later group is
+	/// logged until recovery can no longer replay them, see `drop_unapplied_group`. One that fails
+	/// after part of it was applied cannot be taken back: the batches in the memtables would
+	/// become readable with the next group that publishes. It stops the database instead, see
+	/// `stop_database`, and no sequence number past it is ever published.
 	async fn flush_entries(&self, scratch: &mut FlushScratch) {
 		let epoch = self.restore_epoch.load(Ordering::SeqCst);
 		// A stopped database commits nothing more: entries accepted before it stopped fail like
@@ -1037,6 +1039,12 @@ impl CommitPipeline {
 			}
 			result => {
 				self.inner.group_wal_pin.store(u64::MAX, Ordering::Release);
+				// A restore replaced the WAL the records were logged in.
+				if result.is_err() && self.epoch_holds(epoch) {
+					if let Some(newest) = scratch.segments.iter().max() {
+						self.inner.unapplied_group_below.fetch_max(newest + 1, Ordering::AcqRel);
+					}
+				}
 				result
 			}
 		};
@@ -1213,9 +1221,11 @@ impl CommitPipeline {
 	/// applied, and a batch that is not applied (one written to L0, one of a failed group)
 	/// keeps its keys and values.
 	///
-	/// `scratch.applied` is set as soon as a batch is in a memtable or an L0 table. A failure
-	/// before that leaves nothing of the group behind; the caller stops the database for one
-	/// after it, see `flush_entries`.
+	/// `scratch.applied` is set as soon as a batch is in a memtable or an L0 table, and
+	/// `scratch.segments` once the group's records are in the WAL. A failure before the first
+	/// leaves nothing of the group in the memtables or the tables, and the caller makes sure
+	/// that its records are not replayed underneath a later group; the caller stops the database
+	/// for a failure after it, see `flush_entries`.
 	///
 	/// A WAL segment that failed is replaced first, see `heal_wal`. No commit is logged, or
 	/// acknowledged, behind the unflushed memtables of a segment whose fsync failed, with one
@@ -1486,7 +1496,8 @@ impl CommitPipeline {
 	/// What this means for durability:
 	/// - the commits of the group that failed stay failed, but if their records reached the
 	///   segment, recovery decides their outcome, and a commit that returned an error can take
-	///   effect when the database is next opened;
+	///   effect when the database is next opened, though only if no later group was logged first
+	///   (see `drop_unapplied_group`);
 	/// - the segment that failed stays on disk until the memtables tagged with it are flushed. A
 	///   crash can leave it damaged while later segments hold acknowledged commits, which
 	///   `WalRecoveryMode::AbsoluteConsistency` refuses to open, as it refuses a damaged last
@@ -1501,8 +1512,49 @@ impl CommitPipeline {
 		if poisoned || held {
 			self.replace_and_release_wal(epoch, poisoned).await?;
 		}
+		self.drop_unapplied_group(epoch).await?;
 		#[cfg(test)]
 		self.fire(PipelineHook::AfterWalHeal);
+		Ok(())
+	}
+
+	/// Makes sure recovery replays none of the records of a group that failed after they were
+	/// logged and before any of it was applied (`CoreInner::unapplied_group_below`), before this
+	/// group logs anything.
+	///
+	/// Its committers were told it failed, and the commits after it were decided without it: a
+	/// crash that replayed it would bring it back underneath them, where a later commit may have
+	/// overwritten one of its keys and not another. So the memtables tagged with its segments are
+	/// flushed and `log_number` is moved past them, see `CoreInner::drop_unapplied_group`. A
+	/// failure fails this group, which has logged nothing, and the next group tries again. A
+	/// crash before it is done may replay the group, as its committers were told it might, but
+	/// with no commit after it.
+	async fn drop_unapplied_group(&self, epoch: u64) -> Result<()> {
+		let below = self.inner.unapplied_group_below.load(Ordering::Acquire);
+		if below == 0 {
+			return Ok(());
+		}
+		if let Some(error) = self.inner.error_handler.commit_group_error() {
+			return Err(error);
+		}
+		let inner = Arc::clone(&self.inner);
+		let current = Arc::clone(&self.restore_epoch);
+		let dropped = affinitypool::spawn(move || {
+			inner.drop_unapplied_group(below, || current.load(Ordering::SeqCst) == epoch)
+		})
+		.await;
+		if let Err(e) = dropped {
+			if let Some(ref tm) = self.task_manager {
+				tm.wake_up_memtable();
+			}
+			return Err(match e {
+				// Whether the group may be tried again depends on the key error.
+				Error::Encryption(_) | Error::PipelineStall => e,
+				e => Error::Other(format!(
+					"Failed to drop the records of a failed commit group from the WAL: {e}"
+				)),
+			});
+		}
 		Ok(())
 	}
 
@@ -1887,6 +1939,8 @@ impl CommitPipeline {
 	/// fail rather than land in the restored state.
 	pub(crate) fn reset_for_restore(&self, seq: u64) {
 		self.restore_epoch.fetch_add(1, Ordering::SeqCst);
+		// The restore replaced the WAL that held the records of a group that failed.
+		self.inner.unapplied_group_below.store(0, Ordering::Release);
 		self.log_seq_num.store(seq + 1, Ordering::SeqCst);
 		self.inner.visible_seq_num.store(seq, Ordering::SeqCst);
 		// Dropped once the mutex is released

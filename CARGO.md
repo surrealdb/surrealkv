@@ -91,6 +91,7 @@ Resting and peak memory are the lowest and highest process memory sampled across
   - SurrealKV v0.20 and v0.21 databases, migrated when they are opened: the retained versions with their sequence numbers and timestamps, and the unflushed write-ahead log. The old files are kept in `_surrealkv_v0_backup/`.
   - RocksDB databases written by SurrealDB (RocksDB 8 to 11, read without linking RocksDB) via `surrealkv-compat-rocksdb`: a database that SurrealDB ran in versioned mode is migrated with the versions it stores and their timestamps (converted from SurrealDB's hybrid logical clock to nanoseconds); any other keeps the newest value of each key. Blob files and the write-ahead log are read. The database must not be open in RocksDB while it is migrated, and its files are kept in `_rocksdb_backup/`. A tree opened with `with_versioning(true, retention_ns)` keeps those versions as its retention says, and answers `get_at` and `history` for them.
   - Browser IndexedDB (`indxdb://`) data from an exported IndexedDB dump via `surrealkv-compat-indxdb`.
+- **Encryption at Rest**: Transparent data encryption of the manifest, SSTables, value log and write-ahead log with AES-256-GCM or XChaCha20-Poly1305, under per-file keys derived from a root key that you provide through a `KeyManager`. See [Transparent Data Encryption](#transparent-data-encryption).
 - **Value Log Separation (WiscKey)**: Opt-in via `with_enable_vlog(true)`. Values larger than `vlog_value_threshold` (1 KiB by default) are stored outside the LSM tree to minimize write amplification during leveled compaction.
 - **Data Integrity**: CRC32 checksums on SSTable blocks and WAL records, verified when they are read from disk, plus the offline `skv scrub` sweep of SSTable data blocks. Continuous background scrubbing is not implemented yet.
 - **Deterministic Simulation Tested (DST)**: Differentially tested against an in-memory reference model, with every divergence failing the run: 500 seeds of 5,000 steps each (2,500,000 operations) in every CI run.
@@ -203,11 +204,178 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ---
 
-## Transparent Data Encryption (not yet available)
+## Transparent Data Encryption
 
-The cipher primitives are implemented and unit-tested but are not connected to the SSTable, WAL or value-log write paths. `TreeBuilder::build()` returns an error if a key manager is configured, so data is never written unencrypted by accident. Use volume or filesystem encryption (LUKS, FileVault, BitLocker, encrypted cloud volumes) for encryption at rest today.
+A database created with a key manager is encrypted at rest. Every file is sealed: the manifest, the SSTables, the value log and the write-ahead log, and so are checkpoints. Nothing else changes for the application: reads, writes, transactions and iteration work as before.
 
----
+- **Ciphers**: AES-256-GCM, or XChaCha20-Poly1305 on a CPU without AES instructions. `CipherPreference::Auto` picks one when the database is created and the choice is stored in it. Pick one yourself with `CipherSuite::Aes256Gcm` or `CipherSuite::XChaCha20Poly1305`.
+- **Keys**: a `KeyManager` owns the 32 byte root keys and the database keeps none. Roots never encrypt data: every file gets a key of its own, derived from the root, a fresh random salt and the identity of the file.
+- **Authenticated**: every block is bound to its database, file, key and position, so a block that is moved, replayed or edited is refused and never returned as data.
+- **Fixed at creation**: encryption cannot be added to a database that exists, and an encrypted database cannot be opened without its key. Neither is ever repaired or deleted because of a key.
+- **Not hidden**: file names, file sizes and access timing are visible to anyone who can read the directory.
+
+> **A key that is lost is data that is lost.** There is no copy to recover it from, and every file, checkpoint and backup written under a key is unreadable without it. The on-disk formats are not frozen yet, so do not rely on them for data that must survive an upgrade without a backup.
+
+The `encryption` feature is on by default. Build with `default-features = false` to compile it out: a build without it refuses a key manager with `Error::InvalidArgument` and creates nothing, so data is never written unencrypted by accident.
+
+### Create or open an encrypted database
+
+The key is a file with 32 raw bytes or 64 hex digits. Create one that only you can read:
+
+```bash
+openssl rand -hex 32 > mydb.key && chmod 600 mydb.key
+```
+
+Then give it to the builder. The same code creates the database and opens it again, and an existing database keeps the cipher it was created with:
+
+```rust,no_run
+use std::sync::Arc;
+
+use surrealkv::{CipherPreference, SoftwareKeyManager, TreeBuilder};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // On Unix, a key file that every user can read is refused.
+    let keys = Arc::new(SoftwareKeyManager::from_key_file("mydb.key")?);
+
+    let tree = TreeBuilder::new()
+        .with_path("data/mydb".into())
+        .with_encryption(keys, CipherPreference::Auto)
+        .build()?;
+
+    let mut tx = tree.begin()?;
+    tx.set(b"user:001", b"Alice")?;
+    tx.commit().await?;
+
+    tree.close().await?;
+    Ok(())
+}
+```
+
+`with_encryption` is also available on `Options` for code that builds its options first.
+
+### Choose the cipher
+
+```rust,no_run
+use std::sync::Arc;
+
+use surrealkv::{CipherSuite, SoftwareKeyManager, TreeBuilder};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let keys = Arc::new(SoftwareKeyManager::from_hex(
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+    )?);
+
+    // The cipher is used when the database is created, and kept in it after that.
+    let _tree = TreeBuilder::new()
+        .with_path("data/mydb".into())
+        .with_encryption(keys, CipherSuite::XChaCha20Poly1305)
+        .build()?;
+    Ok(())
+}
+```
+
+A key in source code is for tests. Read it from a file, or from your key management service, in a real deployment.
+
+### Rotate the key
+
+New files are written under the active key, and files written under an older key stay readable while its key is decrypt-only. Keep an old key for as long as any file or checkpoint written under it is wanted.
+
+```rust,no_run
+use std::sync::Arc;
+
+use surrealkv::{CipherPreference, SoftwareKeyManager, TreeBuilder};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let keys = Arc::new(SoftwareKeyManager::from_key_file("mydb.key")?); // key id 1
+
+    // Register a second key and make it the one that new files are written under.
+    // Key id 1 becomes decrypt-only.
+    keys.add_key(2, [0x42; 32])?; // use a random key from a secure source
+    keys.set_active_key_id(2)?;
+
+    // Every key id that a file names must be held by the manager when the database is opened.
+    let _tree = TreeBuilder::new()
+        .with_path("data/mydb".into())
+        .with_encryption(keys, CipherPreference::Auto)
+        .build()?;
+    Ok(())
+}
+```
+
+### Use your own key management service
+
+`SoftwareKeyManager` keeps roots in memory, which suits tests and small deployments. To keep them in a KMS or an HSM, implement `KeyManager`. The trait is called on the commit path, so `active_key_id`, `key_state` and `root_key` must answer from memory. Do the slow work of fetching roots in `prepare`, which the engine calls when the database is opened.
+
+```rust,no_run
+use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
+
+use surrealkv::tde::Zeroizing;
+use surrealkv::{EncryptionError, KeyManager, KeyState, TreeBuilder};
+
+struct KmsKeys {
+    active: u32,
+    cache: RwLock<HashMap<u32, Zeroizing<[u8; 32]>>>,
+}
+
+impl KmsKeys {
+    /// Fetches a root from your provider. Slow, so it is only called from `prepare`.
+    fn fetch(&self, _key_id: u32) -> Result<[u8; 32], EncryptionError> {
+        unimplemented!("call your key management service")
+    }
+}
+
+impl KeyManager for KmsKeys {
+    fn active_key_id(&self) -> u32 {
+        self.active
+    }
+
+    fn key_state(&self, key_id: u32) -> KeyState {
+        match (key_id == self.active, self.cache.read().unwrap().contains_key(&key_id)) {
+            (true, _) => KeyState::Active,
+            (false, true) => KeyState::DecryptOnly,
+            (false, false) => KeyState::Unknown,
+        }
+    }
+
+    fn root_key(&self, key_id: u32) -> Result<Zeroizing<[u8; 32]>, EncryptionError> {
+        match self.cache.read().unwrap().get(&key_id) {
+            Some(root) => Ok(Zeroizing::new(**root)),
+            None => Err(EncryptionError::UnknownKeyId),
+        }
+    }
+
+    fn prepare(&self, key_ids: &[u32]) -> Result<(), EncryptionError> {
+        for &id in key_ids {
+            let root = self.fetch(id)?;
+            self.cache.write().unwrap().insert(id, Zeroizing::new(root));
+        }
+        Ok(())
+    }
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let keys = Arc::new(KmsKeys { active: 1, cache: RwLock::new(HashMap::new()) });
+    let _tree = TreeBuilder::new()
+        .with_path("data/mydb".into())
+        .with_encryption(keys, surrealkv::CipherPreference::Auto)
+        .build()?;
+    Ok(())
+}
+```
+
+A wrong or missing key is refused by name, before anything is changed: `Error::Encryption` carries `WrongKey`, `UnknownKeyId`, `KeyRetired`, `NotConfigured` (an encrypted database opened without a key manager) or `NotEncrypted` (a key given to a database that was created without one).
+
+### Encrypted databases and `skv`
+
+`skv` reads encrypted databases when it is given the key file with `--key-file` or `SKV_KEY_FILE`. The variable holds a path, never a key. `skv enc-info` lists which cipher and keys a database uses, and needs no key.
+
+```bash
+skv enc-info path/to/db
+skv inspect path/to/db --key-file mydb.key
+SKV_KEY_FILE=mydb.key skv scan path/to/db --prefix "user:"
+```
 
 ## Command-Line Tool (`skv`)
 

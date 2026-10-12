@@ -338,6 +338,11 @@ async fn an_empty_memtable_does_not_wedge_after_a_failed_fsync_or_append() {
 			let recovered = reopen(&image);
 			assert!(get(&recovered, "next").is_some(), "{at}: acknowledged, recovered");
 			assert!(get(&recovered, "after").is_some(), "{at}: acknowledged, recovered");
+			assert_eq!(
+				get(&recovered, "failed"),
+				None,
+				"{at}: a commit reported failed is not replayed behind ones acknowledged after it"
+			);
 			finish(&recovered);
 			finish(&tree);
 		}

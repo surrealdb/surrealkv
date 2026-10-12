@@ -3,8 +3,8 @@
 //! Every file of an encrypted database goes through this module: the manifest, the SSTables, the
 //! value log and the write-ahead log are sealed with the ciphers here, under keys the engine
 //! derives for each file, and each starts with a header, or for the manifest a container, that
-//! names the database, the file and the key. Encryption is a preview: `Options::validate` refuses
-//! a key manager unless the crate is built with the `encryption-preview` feature, and none of the
+//! names the database, the file and the key. Encryption needs the `encryption` feature, on by
+//! default: `Options::validate` refuses a key manager without it. None of the
 //! formats is frozen.
 //!
 //! # Keys
