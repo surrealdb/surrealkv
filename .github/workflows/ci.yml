@@ -126,6 +126,14 @@ jobs:
       - name: Test
         run: cargo test -p surrealkv --features encryption-preview --lib --test encryption_preview
 
+      # The command line tool with the same guard compiled out: it reads and writes encrypted
+      # databases only in this build, so its tests of that run here and nowhere else.
+      - name: Clippy (skv)
+        run: cargo clippy -p surrealkv-cli --all-targets --features encryption-preview -- -D warnings
+
+      - name: Test (skv)
+        run: cargo test -p surrealkv-cli --features encryption-preview
+
   format:
     runs-on: ubuntu-latest
     steps:

@@ -1,29 +1,161 @@
 use std::path::{Path, PathBuf};
+use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
-use surrealkv::inspect::{self, DbInfo, ManifestInfo, SstInfo};
-use surrealkv::{LSMIterator, TreeBuilder};
+use surrealkv::inspect::{self, CryptoSummary, DbInfo, EncryptionStatus, ManifestInfo, SstInfo};
+use surrealkv::{
+	CipherPreference,
+	CipherSuite,
+	EncryptionError,
+	KeyManager,
+	LSMIterator,
+	Options,
+	SoftwareKeyManager,
+	TreeBuilder,
+};
 use tabled::settings::Style;
 use tabled::{Table as DisplayTable, Tabled};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{fmt, EnvFilter};
 
+/// The environment variable that names the key file, like `--key-file`. It holds a path and never
+/// a key: a key in an environment variable or on a command line is visible to every process that
+/// can list them, and is inherited by every child process.
+const KEY_FILE_ENV: &str = "SKV_KEY_FILE";
+
+/// What an exit status of `enc-info` says: 0 for a directory whose files are consistent, this for
+/// one that is not. 1 is for what could not be read at all, and 2 is clap's for a command line
+/// that is not one.
+const EXIT_INCONSISTENT: u8 = 3;
+
 #[derive(Parser)]
 #[command(
 	name = "skv",
 	author = "SurrealDB Team",
 	version,
-	about = "Operator and developer inspection, dump, and diagnostic CLI for SurrealKV"
+	about = "Operator and developer inspection, dump, and diagnostic CLI for SurrealKV",
+	after_help = "Encrypted databases: a command that opens a database or a file refuses an \
+	              encrypted one unless it is given its key, with a message and a non-zero status, \
+	              and changes nothing. The key is a file with the 32 byte root key of key id 1, as \
+	              32 raw bytes or 64 hex digits: pass it with --key-file <PATH> or set SKV_KEY_FILE \
+	              to its path. On Unix the file must not be readable by every user. `enc-info` \
+	              needs no key. Encryption is a preview, and a key is only used by a build that \
+	              has the `encryption-preview` feature."
 )]
 struct Cli {
 	#[command(subcommand)]
 	command: Commands,
+}
+
+/// How a command is given the key of an encrypted database.
+#[derive(Args, Debug, Clone, Default)]
+struct KeyArgs {
+	/// File that holds the 32 byte root key of the database, key id 1, as 32 raw bytes or 64 hex
+	/// digits. SKV_KEY_FILE names it as well. The key itself is never taken from the command
+	/// line or from the environment
+	#[arg(long, value_name = "PATH")]
+	key_file: Option<PathBuf>,
+
+	/// Accept a key file that every user can read, which is refused on Unix by default
+	#[arg(long, default_value_t = false)]
+	allow_insecure_key_file: bool,
+}
+
+impl KeyArgs {
+	/// The key manager that holds the key that `--key-file`, or `SKV_KEY_FILE` if there is no
+	/// flag, names, if either does. The key is read here, once, into memory that the manager wipes,
+	/// and nothing but the manager holds it.
+	fn manager(&self) -> Result<Option<Arc<SoftwareKeyManager>>> {
+		let path = match &self.key_file {
+			Some(path) => path.clone(),
+			None => match std::env::var_os(KEY_FILE_ENV).filter(|value| !value.is_empty()) {
+				Some(value) => PathBuf::from(value),
+				None => return Ok(None),
+			},
+		};
+		let manager = if self.allow_insecure_key_file {
+			SoftwareKeyManager::from_key_file_ignoring_permissions(&path)
+		} else {
+			SoftwareKeyManager::from_key_file(&path)
+		}
+		.with_context(|| format!("Failed to load the key file {}", path.display()))?;
+		Ok(Some(Arc::new(manager)))
+	}
+}
+
+/// The options to inspect with: those of a database that has no key, or that are given the key.
+fn inspect_options(key: &Option<Arc<SoftwareKeyManager>>) -> Options {
+	let options = Options::new();
+	match key {
+		Some(manager) => options.with_encryption(
+			Arc::<SoftwareKeyManager>::clone(manager) as Arc<dyn KeyManager>,
+			CipherPreference::Auto,
+		),
+		None => options,
+	}
+}
+
+/// A builder for the database at `path`, with its key if there is one.
+fn tree_builder(path: &Path, key: &Option<Arc<SoftwareKeyManager>>) -> TreeBuilder {
+	let builder = TreeBuilder::new().with_path(path.to_path_buf());
+	match key {
+		Some(manager) => builder.with_encryption(
+			Arc::<SoftwareKeyManager>::clone(manager) as Arc<dyn KeyManager>,
+			CipherPreference::Auto,
+		),
+		None => builder,
+	}
+}
+
+/// What to do about an error, for an operator, when it is one of an encrypted database.
+fn hint_for(error: &anyhow::Error) -> Option<&'static str> {
+	for cause in error.chain() {
+		match cause.downcast_ref::<surrealkv::Error>() {
+			Some(surrealkv::Error::Encryption(EncryptionError::NotConfigured)) => {
+				return Some(
+					"This is an encrypted database or file. Pass the file that holds its key with \
+					 --key-file <PATH>, or set SKV_KEY_FILE to its path. Nothing was changed.",
+				);
+			}
+			Some(surrealkv::Error::Encryption(
+				EncryptionError::WrongKey
+				| EncryptionError::UnknownKeyId
+				| EncryptionError::KeyRetired,
+			)) => {
+				return Some(
+					"The key that was given does not open this database or file. Check which key \
+					 file it is: skv holds one key, key id 1. Nothing was changed.",
+				);
+			}
+			Some(surrealkv::Error::Encryption(
+				EncryptionError::NotEncrypted | EncryptionError::PlaintextInEncryptedDb,
+			)) => {
+				return Some(
+					"A key was given for data that is not encrypted, or the other way round: \
+					 encryption is chosen when a database is created and is never added to one \
+					 that exists. Leave out --key-file and SKV_KEY_FILE for a database that is \
+					 not encrypted. Nothing was changed.",
+				);
+			}
+			Some(surrealkv::Error::InvalidArgument(message))
+				if message.contains("not enabled in this build") =>
+			{
+				return Some(
+					"This build of skv cannot use a key. Encryption is a preview: build skv with \
+					 `--features encryption-preview` to read encrypted data. `enc-info` needs no \
+					 key.",
+				);
+			}
+			_ => {}
+		}
+	}
+	None
 }
 
 #[derive(Subcommand)]
@@ -32,12 +164,30 @@ enum Commands {
 	Inspect {
 		/// Path to database directory
 		path: PathBuf,
+
+		#[command(flatten)]
+		key_args: KeyArgs,
+	},
+
+	/// Say which keys cover which files of a database, without a key
+	///
+	/// Reads only the headers at the start of the files: whether the database is encrypted, its
+	/// cipher suite and identity, and for each key id how many files and bytes of each kind it
+	/// covers. Exit status 0 if its files are consistent, 3 if a warning was found, such as a
+	/// file in the clear in an encrypted database or a file of another database, and 1 if it
+	/// cannot be read.
+	EncInfo {
+		/// Path to database directory
+		path: PathBuf,
 	},
 
 	/// Dump and analyze LevelManifest state and SSTable hierarchy
 	Manifest {
 		/// Path to database directory or MANIFEST file
 		path: PathBuf,
+
+		#[command(flatten)]
+		key_args: KeyArgs,
 	},
 
 	/// Dump and verify an individual SSTable (.sst file)
@@ -49,7 +199,8 @@ enum Commands {
 		#[arg(long, default_value_t = false)]
 		dump_keys: bool,
 
-		/// Recalculate and verify CRC32 for every data block
+		/// Recalculate and verify the checksum of every block, of every kind, and with a key
+		/// authenticate the blocks of an encrypted table
 		#[arg(long, default_value_t = false)]
 		verify_checksum: bool,
 
@@ -60,12 +211,18 @@ enum Commands {
 		/// Only count entries without displaying details
 		#[arg(long, default_value_t = false)]
 		count_only: bool,
+
+		#[command(flatten)]
+		key_args: KeyArgs,
 	},
 
 	/// Dump and decode WAL segments
 	Wal {
 		/// Path to database directory or wal/ directory
 		path: PathBuf,
+
+		#[command(flatten)]
+		key_args: KeyArgs,
 	},
 
 	/// Perform a point read for a key
@@ -79,6 +236,9 @@ enum Commands {
 		/// Treat key and value as hexadecimal strings
 		#[arg(long, default_value_t = false)]
 		hex: bool,
+
+		#[command(flatten)]
+		key_args: KeyArgs,
 	},
 
 	/// Scan a range or prefix of keys
@@ -109,6 +269,9 @@ enum Commands {
 		/// Treat keys and values as hexadecimal strings
 		#[arg(long, default_value_t = false)]
 		hex: bool,
+
+		#[command(flatten)]
+		key_args: KeyArgs,
 	},
 
 	/// Insert or update a key-value pair
@@ -125,6 +288,9 @@ enum Commands {
 		/// Treat key and value as hexadecimal strings
 		#[arg(long, default_value_t = false)]
 		hex: bool,
+
+		#[command(flatten)]
+		key_args: KeyArgs,
 	},
 
 	/// Delete a key
@@ -138,15 +304,26 @@ enum Commands {
 		/// Treat key as hexadecimal string
 		#[arg(long, default_value_t = false)]
 		hex: bool,
+
+		#[command(flatten)]
+		key_args: KeyArgs,
 	},
 
-	/// Verify CRC32 checksums across all SSTable blocks in the database
+	/// Verify the checksum of every block of every SSTable in the database
+	///
+	/// With a key, the blocks of an encrypted table are authenticated as well. Without one a
+	/// sealed table is reported as not verified, never as corrupt.
 	Scrub {
 		/// Path to database directory
 		path: PathBuf,
+
+		#[command(flatten)]
+		key_args: KeyArgs,
 	},
 
 	/// Explicitly migrate a RocksDB or SurrealKV V1 store to V2
+	///
+	/// An encrypted destination is refused: a migration writes without a key.
 	Migrate {
 		/// Source database path (RocksDB or SurrealKV V1)
 		source: PathBuf,
@@ -167,6 +344,9 @@ enum Commands {
 		/// Number of concurrent workers
 		#[arg(long, default_value_t = 8)]
 		concurrency: usize,
+
+		#[command(flatten)]
+		key_args: KeyArgs,
 	},
 }
 
@@ -206,22 +386,57 @@ struct WalFileRow {
 	size_kb: String,
 }
 
+#[derive(Tabled)]
+struct SealedWalFileRow {
+	#[tabled(rename = "WAL Segment File")]
+	file_name: String,
+	#[tabled(rename = "Size (Bytes)")]
+	size: u64,
+	#[tabled(rename = "Key ID")]
+	key_id: String,
+	#[tabled(rename = "Batches")]
+	batches: String,
+	#[tabled(rename = "Torn")]
+	torn: String,
+}
+
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
 	tracing_subscriber::registry().with(fmt::layer()).with(EnvFilter::from_default_env()).init();
 
 	let cli = Cli::parse();
+	match run(cli).await {
+		Ok(code) => code,
+		Err(error) => {
+			// What the default of a `main` that returns an error prints, and a hint when the error
+			// is one of an encrypted database.
+			eprintln!("Error: {error:?}");
+			if let Some(hint) = hint_for(&error) {
+				eprintln!("\n{hint}");
+			}
+			ExitCode::FAILURE
+		}
+	}
+}
 
+async fn run(cli: Cli) -> Result<ExitCode> {
 	match cli.command {
 		Commands::Inspect {
 			path,
+			key_args,
 		} => {
-			cmd_inspect(&path)?;
+			cmd_inspect(&path, &key_args)?;
+		}
+		Commands::EncInfo {
+			path,
+		} => {
+			return cmd_enc_info(&path);
 		}
 		Commands::Manifest {
 			path,
+			key_args,
 		} => {
-			cmd_manifest(&path)?;
+			cmd_manifest(&path, &key_args)?;
 		}
 		Commands::Sst {
 			path,
@@ -229,20 +444,23 @@ async fn main() -> Result<()> {
 			verify_checksum,
 			hex,
 			count_only,
+			key_args,
 		} => {
-			cmd_sst(&path, dump_keys, verify_checksum, hex, count_only)?;
+			cmd_sst(&path, dump_keys, verify_checksum, hex, count_only, &key_args)?;
 		}
 		Commands::Wal {
 			path,
+			key_args,
 		} => {
-			cmd_wal(&path)?;
+			cmd_wal(&path, &key_args)?;
 		}
 		Commands::Get {
 			path,
 			key,
 			hex,
+			key_args,
 		} => {
-			cmd_get(&path, &key, hex).await?;
+			return cmd_get(&path, &key, hex, &key_args).await;
 		}
 		Commands::Scan {
 			path,
@@ -252,28 +470,32 @@ async fn main() -> Result<()> {
 			limit,
 			keys_only,
 			hex,
+			key_args,
 		} => {
-			cmd_scan(&path, start, end, prefix, limit, keys_only, hex).await?;
+			cmd_scan(&path, start, end, prefix, limit, keys_only, hex, &key_args).await?;
 		}
 		Commands::Put {
 			path,
 			key,
 			value,
 			hex,
+			key_args,
 		} => {
-			cmd_put(&path, &key, &value, hex).await?;
+			cmd_put(&path, &key, &value, hex, &key_args).await?;
 		}
 		Commands::Delete {
 			path,
 			key,
 			hex,
+			key_args,
 		} => {
-			cmd_delete(&path, &key, hex).await?;
+			cmd_delete(&path, &key, hex, &key_args).await?;
 		}
 		Commands::Scrub {
 			path,
+			key_args,
 		} => {
-			cmd_scrub(&path)?;
+			return cmd_scrub(&path, &key_args);
 		}
 		Commands::Migrate {
 			source,
@@ -285,20 +507,39 @@ async fn main() -> Result<()> {
 			path,
 			keys,
 			concurrency,
+			key_args,
 		} => {
-			cmd_bench(&path, keys, concurrency).await?;
+			cmd_bench(&path, keys, concurrency, &key_args).await?;
 		}
 	}
 
-	Ok(())
+	Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_inspect(path: &Path) -> Result<()> {
+/// How a suite is called.
+fn suite_name(suite: CipherSuite) -> String {
+	match suite {
+		CipherSuite::Aes256Gcm => "AES-256-GCM".to_string(),
+		CipherSuite::XChaCha20Poly1305 => "XChaCha20-Poly1305".to_string(),
+		other => format!("{other:?}"),
+	}
+}
+
+/// What the header of an encrypted file says, in a line.
+fn encryption_line(header: &CryptoSummary) -> String {
+	format!("{}, key id {}, database {}", suite_name(header.suite), header.key_id, header.db_id)
+}
+
+fn cmd_inspect(path: &Path, key_args: &KeyArgs) -> Result<()> {
 	println!("{}", "=== SurrealKV Database Inspection ===".bold().cyan());
 	println!("Path: {}", path.display().to_string().yellow());
 
-	let info: DbInfo = inspect::inspect_db(path)
+	let key = key_args.manager()?;
+	let info: DbInfo = inspect::inspect_db_with_options(path, &inspect_options(&key))
 		.with_context(|| format!("Failed to inspect database at {}", path.display()))?;
+	if let Some(header) = &info.encryption {
+		println!("Encryption:       {}", encryption_line(header));
+	}
 
 	println!("Manifest Version: {}", info.manifest_version);
 	println!("Next Table ID:    {}", info.next_table_id);
@@ -333,9 +574,10 @@ fn cmd_inspect(path: &Path) -> Result<()> {
 	Ok(())
 }
 
-fn cmd_manifest(path: &Path) -> Result<()> {
+fn cmd_manifest(path: &Path, key_args: &KeyArgs) -> Result<()> {
 	println!("{}", "=== LevelManifest State ===".bold().cyan());
-	let info: ManifestInfo = inspect::dump_manifest(path)
+	let key = key_args.manager()?;
+	let info: ManifestInfo = inspect::dump_manifest_with_options(path, &inspect_options(&key))
 		.with_context(|| format!("Failed to dump manifest at {}", path.display()))?;
 
 	println!("Manifest Format Version: {}", info.version);
@@ -383,12 +625,25 @@ fn cmd_sst(
 	verify_checksum: bool,
 	hex: bool,
 	count_only: bool,
+	key_args: &KeyArgs,
 ) -> Result<()> {
 	println!("{}", "=== SSTable File Inspection ===".bold().cyan());
 	println!("File: {}", path.display().to_string().yellow());
 
-	let info: SstInfo = inspect::dump_sst(path, dump_keys || count_only, verify_checksum)
-		.with_context(|| format!("Failed to inspect SSTable at {}", path.display()))?;
+	let key = key_args.manager()?;
+	let info: SstInfo = inspect::dump_sst_with_options(
+		path,
+		dump_keys || count_only,
+		verify_checksum,
+		&inspect_options(&key),
+	)
+	.with_context(|| format!("Failed to inspect SSTable at {}", path.display()))?;
+	if let Some(id) = info.table_id {
+		println!("Table ID:           {id}");
+	}
+	if let Some(header) = &info.encryption {
+		println!("Encryption:         {}", encryption_line(header));
+	}
 
 	println!("File Size:          {} bytes", info.file_size);
 	println!("Format Version:     {}", info.format_version);
@@ -426,9 +681,10 @@ fn cmd_sst(
 	Ok(())
 }
 
-fn cmd_wal(path: &Path) -> Result<()> {
+fn cmd_wal(path: &Path, key_args: &KeyArgs) -> Result<()> {
 	println!("{}", "=== WAL Segments Inspection ===".bold().cyan());
-	let info = inspect::dump_wal(path)
+	let key = key_args.manager()?;
+	let info = inspect::dump_wal_with_options(path, &inspect_options(&key))
 		.with_context(|| format!("Failed to inspect WAL at {}", path.display()))?;
 
 	println!(
@@ -437,19 +693,38 @@ fn cmd_wal(path: &Path) -> Result<()> {
 		info.segment_files.len()
 	);
 
-	let rows: Vec<WalFileRow> = info
-		.segment_files
-		.into_iter()
-		.map(|s| WalFileRow {
-			file_name: s.file_name,
-			size: s.file_size,
-			size_kb: format!("{:.2}", s.file_size as f64 / 1024.0),
-		})
-		.collect();
-
-	if rows.is_empty() {
+	if info.segment_files.is_empty() {
 		println!("\n{}", "No WAL segments found.".yellow());
+	} else if info.segment_files.iter().any(|s| s.encryption.is_some()) {
+		// A log that is sealed also says which key each segment is under, and how many batches
+		// were read from it with the key.
+		let rows: Vec<SealedWalFileRow> = info
+			.segment_files
+			.into_iter()
+			.map(|s| SealedWalFileRow {
+				file_name: s.file_name,
+				size: s.file_size,
+				key_id: s.encryption.map_or_else(|| "-".to_string(), |e| e.key_id.to_string()),
+				batches: s.batches.map_or_else(|| "-".to_string(), |b| b.to_string()),
+				torn: if s.torn {
+					"yes".to_string()
+				} else {
+					"no".to_string()
+				},
+			})
+			.collect();
+		let table = DisplayTable::new(rows).with(Style::rounded()).to_string();
+		println!("{table}");
 	} else {
+		let rows: Vec<WalFileRow> = info
+			.segment_files
+			.into_iter()
+			.map(|s| WalFileRow {
+				file_name: s.file_name,
+				size: s.file_size,
+				size_kb: format!("{:.2}", s.file_size as f64 / 1024.0),
+			})
+			.collect();
 		let table = DisplayTable::new(rows).with(Style::rounded()).to_string();
 		println!("{table}");
 	}
@@ -457,30 +732,37 @@ fn cmd_wal(path: &Path) -> Result<()> {
 	Ok(())
 }
 
-async fn cmd_get(path: &Path, key_str: &str, hex: bool) -> Result<()> {
+async fn cmd_get(path: &Path, key_str: &str, hex: bool, key_args: &KeyArgs) -> Result<ExitCode> {
 	let key_bytes = parse_input_bytes(key_str, hex)?;
-	let tree = TreeBuilder::new()
-		.with_path(path.to_path_buf())
-		.build()
-		.context("Failed to open database")?;
+	let key = key_args.manager()?;
+	let tree = tree_builder(path, &key).build().context("Failed to open database")?;
 
 	let tx = tree.begin()?;
 	let val = tx.get(&key_bytes)?;
+	drop(tx);
 
-	match val {
+	// The status is returned and not exited with, so that the tree is closed, and the key that it
+	// holds is wiped, on the way out.
+	let found = match val {
 		Some(v) => {
 			println!("{}", format_bytes(&v, hex));
+			true
 		}
 		None => {
 			eprintln!("{}", "(not found)".yellow());
-			std::process::exit(1);
+			false
 		}
-	}
+	};
 
 	tree.close().await?;
-	Ok(())
+	Ok(if found {
+		ExitCode::SUCCESS
+	} else {
+		ExitCode::FAILURE
+	})
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn cmd_scan(
 	path: &Path,
 	start: Option<String>,
@@ -489,11 +771,10 @@ async fn cmd_scan(
 	limit: usize,
 	keys_only: bool,
 	hex: bool,
+	key_args: &KeyArgs,
 ) -> Result<()> {
-	let tree = TreeBuilder::new()
-		.with_path(path.to_path_buf())
-		.build()
-		.context("Failed to open database")?;
+	let key = key_args.manager()?;
+	let tree = tree_builder(path, &key).build().context("Failed to open database")?;
 
 	let tx = tree.begin()?;
 
@@ -542,14 +823,18 @@ async fn cmd_scan(
 	Ok(())
 }
 
-async fn cmd_put(path: &Path, key_str: &str, val_str: &str, hex: bool) -> Result<()> {
+async fn cmd_put(
+	path: &Path,
+	key_str: &str,
+	val_str: &str,
+	hex: bool,
+	key_args: &KeyArgs,
+) -> Result<()> {
 	let key_bytes = parse_input_bytes(key_str, hex)?;
 	let val_bytes = parse_input_bytes(val_str, hex)?;
 
-	let tree = TreeBuilder::new()
-		.with_path(path.to_path_buf())
-		.build()
-		.context("Failed to open database")?;
+	let key = key_args.manager()?;
+	let tree = tree_builder(path, &key).build().context("Failed to open database")?;
 
 	let mut tx = tree.begin()?;
 	tx.set(&key_bytes, &val_bytes)?;
@@ -560,13 +845,11 @@ async fn cmd_put(path: &Path, key_str: &str, val_str: &str, hex: bool) -> Result
 	Ok(())
 }
 
-async fn cmd_delete(path: &Path, key_str: &str, hex: bool) -> Result<()> {
+async fn cmd_delete(path: &Path, key_str: &str, hex: bool, key_args: &KeyArgs) -> Result<()> {
 	let key_bytes = parse_input_bytes(key_str, hex)?;
 
-	let tree = TreeBuilder::new()
-		.with_path(path.to_path_buf())
-		.build()
-		.context("Failed to open database")?;
+	let key = key_args.manager()?;
+	let tree = tree_builder(path, &key).build().context("Failed to open database")?;
 
 	let mut tx = tree.begin()?;
 	tx.delete(&key_bytes)?;
@@ -577,48 +860,83 @@ async fn cmd_delete(path: &Path, key_str: &str, hex: bool) -> Result<()> {
 	Ok(())
 }
 
-fn cmd_scrub(path: &Path) -> Result<()> {
+fn cmd_scrub(path: &Path, key_args: &KeyArgs) -> Result<ExitCode> {
 	println!("{}", "=== SurrealKV Checksum Integrity Scrub ===".bold().cyan());
 	println!("Database: {}", path.display().to_string().yellow());
 
-	let report = inspect::scrub_db(path)
+	let key = key_args.manager()?;
+	let report = inspect::scrub_db_with_options(path, &inspect_options(&key))
 		.with_context(|| format!("Failed to scrub database at {}", path.display()))?;
+	// A database that is encrypted, and was looked at without a key, has not been verified,
+	// whatever its tables are or are not: it may hold none, and its log and value log are not
+	// tables.
+	let unread = key.is_none() && inspect::is_encrypted(path).unwrap_or(false);
 
 	println!("Total SSTables:    {}", report.total_tables);
 	println!("Verified SSTables: {}", report.verified_tables);
+	if report.not_verified_tables > 0 {
+		println!("Not verified:      {} SSTables", report.not_verified_tables);
+	}
 	println!("Verified Blocks:   {}", report.total_blocks);
+	let blocks = &report.blocks;
+	println!(
+		"  data {}, index partitions {}, top-level index {}, filter partitions {}, filter index {}, meta-index {}",
+		blocks.data,
+		blocks.index_partitions,
+		blocks.top_level_index,
+		blocks.filter_partitions,
+		blocks.filter_index,
+		blocks.meta_index
+	);
 
-	if report.corrupt_blocks == 0 && report.errors.is_empty() {
+	if report.corrupt_blocks == 0 && report.errors.is_empty() && !unread {
 		println!(
 			"\n{} All {} blocks in {} tables verified without corruption.",
 			"SCRUB PASSED:".green().bold(),
 			report.total_blocks,
 			report.verified_tables
 		);
-		Ok(())
-	} else {
-		if report.corrupt_blocks == 0 {
-			// Nothing was found damaged: some tables could not be read, which is for the errors to
-			// say.
-			eprintln!("\n{} Some tables could not be verified.", "SCRUB INCOMPLETE:".red().bold());
-		} else {
+		return Ok(ExitCode::SUCCESS);
+	}
+
+	if report.corrupt_blocks == 0 {
+		// Nothing was found damaged: some tables could not be read, which is for the errors to
+		// say.
+		eprintln!("\n{} Some tables could not be verified.", "SCRUB INCOMPLETE:".red().bold());
+		if unread {
 			eprintln!(
-				"\n{} Detected {} corrupted blocks!",
-				"SCRUB FAILED:".red().bold(),
-				report.corrupt_blocks
+				"  - the database is encrypted and no key was given, so nothing of it was verified: \
+				 pass --key-file <PATH> or set {KEY_FILE_ENV}"
 			);
 		}
-		for err in report.errors {
-			eprintln!("  - {}", err.red());
-		}
-		std::process::exit(1);
+	} else {
+		eprintln!(
+			"\n{} Found damage in {} tables!",
+			"SCRUB FAILED:".red().bold(),
+			report.corrupt_blocks
+		);
 	}
+	for err in report.errors {
+		eprintln!("  - {}", err.red());
+	}
+	Ok(ExitCode::FAILURE)
 }
 
 async fn cmd_migrate(source: &Path, destination: &Path) -> Result<()> {
 	println!("{}", "=== SurrealKV Offline Migration Tool ===".bold().cyan());
 	println!("Source:      {}", source.display().to_string().yellow());
 	println!("Destination: {}", destination.display().to_string().green());
+
+	// A migration writes without a key, and the destination of a database that is encrypted is not
+	// one that it may be written into. Said before anything of the source is looked at, which can
+	// take long.
+	if destination.exists() && inspect::is_encrypted(destination).unwrap_or(false) {
+		bail!(
+			"The destination {} is an encrypted database. A migration writes without a key and is \
+			 never done into an encrypted database: choose an empty directory",
+			destination.display()
+		);
+	}
 
 	let is_rocksdb = surrealkv_compat_rocksdb::is_rocksdb_dir(source);
 	let is_v1 = surrealkv_compat_v1::is_v1_dir(source);
@@ -690,17 +1008,15 @@ async fn cmd_migrate(source: &Path, destination: &Path) -> Result<()> {
 	Ok(())
 }
 
-async fn cmd_bench(path: &Path, keys: usize, concurrency: usize) -> Result<()> {
+async fn cmd_bench(path: &Path, keys: usize, concurrency: usize, key_args: &KeyArgs) -> Result<()> {
 	println!("{}", "=== SurrealKV Micro-Benchmark ===".bold().cyan());
 	println!("Path:        {}", path.display().to_string().yellow());
 	println!("Keys:        {keys}");
 	println!("Concurrency: {concurrency}");
 
+	let key = key_args.manager()?;
 	let tree = Arc::new(
-		TreeBuilder::new()
-			.with_path(path.to_path_buf())
-			.build()
-			.context("Failed to open database for benchmark")?,
+		tree_builder(path, &key).build().context("Failed to open database for benchmark")?,
 	);
 
 	let start = Instant::now();
@@ -763,6 +1079,88 @@ async fn cmd_bench(path: &Path, keys: usize, concurrency: usize) -> Result<()> {
 	Ok(())
 }
 
+fn cmd_enc_info(path: &Path) -> Result<ExitCode> {
+	println!("{}", "=== SurrealKV Encryption Info ===".bold().cyan());
+	println!("Path: {}", path.display().to_string().yellow());
+
+	let report = inspect::encryption_report(path).with_context(|| {
+		format!("Failed to read the encryption of the database at {}", path.display())
+	})?;
+	print_encryption_report(&report);
+
+	if report.is_consistent() {
+		Ok(ExitCode::SUCCESS)
+	} else {
+		eprintln!(
+			"\n{} The files of this database are not consistent: {} warning(s).",
+			"INCONSISTENT:".red().bold(),
+			report.warnings.len()
+		);
+		Ok(ExitCode::from(EXIT_INCONSISTENT))
+	}
+}
+
+/// The files and bytes of a kind of file, in a phrase.
+fn totals_phrase(totals: &inspect::FileTotals) -> String {
+	format!("{} file(s), {} bytes", totals.files, totals.bytes)
+}
+
+fn print_encryption_report(report: &EncryptionStatus) {
+	if !report.encrypted {
+		println!("Encrypted:        {}", "no".green());
+	} else {
+		println!("Encrypted:        {}", "yes".green().bold());
+		if let Some(suite) = report.suite {
+			println!("Cipher suite:     {}", suite_name(suite));
+		}
+		if let Some(db_id) = &report.db_id {
+			println!("Database id:      {db_id}");
+		}
+		if let Some(key_id) = report.manifest_key_id {
+			println!("Manifest key id:  {key_id}");
+		}
+	}
+
+	if !report.keys.is_empty() {
+		println!("\n{}", "Files under each key id:".bold());
+		for usage in &report.keys {
+			println!("Key {}:", usage.key_id);
+			println!("  manifest: {}", totals_phrase(&usage.manifest));
+			println!("  tables: {}", totals_phrase(&usage.tables));
+			println!("  value log: {}", totals_phrase(&usage.value_log));
+			println!("  WAL: {}", totals_phrase(&usage.wal));
+		}
+		println!(
+			"A key may be retired only when it covers no file here, is not the key of the \
+			 manifest, and no checkpoint or backup needs it."
+		);
+	}
+	if report.unattributed.files > 0 {
+		println!(
+			"Files whose header could not be read, or that are empty or cut short: {}",
+			totals_phrase(&report.unattributed)
+		);
+	}
+	if report.plaintext.files > 0 {
+		println!(
+			"Files in the clear in an encrypted database: {}",
+			totals_phrase(&report.plaintext)
+		);
+	}
+	if !report.notes.is_empty() {
+		println!("\n{}", "Notes:".bold());
+		for note in &report.notes {
+			println!("  - {note}");
+		}
+	}
+	if !report.warnings.is_empty() {
+		println!("\n{}", "Warnings:".bold());
+		for warning in &report.warnings {
+			println!("  {} {warning}", "WARNING:".yellow().bold());
+		}
+	}
+}
+
 fn parse_input_bytes(input: &str, hex: bool) -> Result<Vec<u8>> {
 	if hex {
 		let clean = input.trim_start_matches("0x").trim();
@@ -790,14 +1188,19 @@ fn format_bytes(bytes: &[u8], hex: bool) -> String {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
-	if !s.len().is_multiple_of(2) {
+	// Decoded as bytes: a string that holds a character of more than one byte is not hex, and
+	// cutting it in pairs of bytes would cut it inside a character.
+	let (pairs, odd) = s.as_bytes().as_chunks::<2>();
+	if !odd.is_empty() {
 		bail!("Hex string must have an even length");
 	}
-	let mut bytes = Vec::with_capacity(s.len() / 2);
-	for i in (0..s.len()).step_by(2) {
-		let byte = u8::from_str_radix(&s[i..i + 2], 16)
-			.map_err(|e| anyhow::anyhow!("Invalid hex digit at {i}: {e}"))?;
-		bytes.push(byte);
+	let mut bytes = Vec::with_capacity(pairs.len());
+	for (i, &[high, low]) in pairs.iter().enumerate() {
+		let (Some(high), Some(low)) = ((high as char).to_digit(16), (low as char).to_digit(16))
+		else {
+			bail!("Invalid hex digit at {}", i * 2);
+		};
+		bytes.push(((high << 4) | low) as u8);
 	}
 	Ok(bytes)
 }
