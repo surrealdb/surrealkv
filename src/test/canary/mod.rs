@@ -38,7 +38,8 @@
 //! for every table compression, with the value log off, on with small values and on with large
 //! ones, with eventual and immediate commits, under both suites, in the WAL alone, after a
 //! rotation, after a torn tail was repaired, flushed, compacted, written straight to level zero,
-//! in the value log, in a checkpoint and after a restore. Every file is of a sealed kind.
+//! in the value log, in a checkpoint and after a restore. Every file is of a sealed kind, and the
+//! root key of the key manager is in none.
 //!
 //! - `matrix::no_marker_is_in_any_file_of_a_database_whose_tables_are_not_compressed`,
 //!   `matrix::no_marker_is_in_any_file_of_a_database_whose_tables_are_compressed_with_snappy`,
@@ -51,6 +52,10 @@
 //! - `scan::tests::*` (a marker in each kind of place and name, split by a read boundary at every
 //!   offset, in a large file, behind a link that is not followed, and a directory with none) and
 //!   `files::tests::*`.
+//! - `files::tests::a_key_in_a_file_is_found_and_a_key_that_is_in_none_is_not` and
+//!   `scan::tests::a_key_that_is_not_text_is_found_like_a_marker_and_has_a_group_of_its_own`: the
+//!   search for the root key, which every encrypted run of `matrix` and the databases of `refusal`
+//!   make, finds a key where one is, and is not a search of no file.
 //! - Older, of one surface each: `sstable_encryption_tests::no_marker_is_anywhere_in_a_sealed_table_but_every_one_is_in_it_when_it_is_opened`,
 //!   `vlog_sealed_tree_tests::the_values_a_commit_separates_are_sealed_and_no_key_or_value_is_in_the_log`,
 //!   `wal_sealed_tree_tests::no_key_and_no_value_is_in_any_byte_of_the_wal_of_a_sealed_tree`,
@@ -70,6 +75,38 @@
 //! A table that was compressed in the clear holds no marker in its raw bytes where the codec
 //! codes literals (zstd): the control for it reads the blocks, and the check of what each file
 //! is covers the encrypted side.
+//!
+//! ## One salt for each writer
+//!
+//! Under positional nonces a file is safe as long as no two writers seal under one key, and the key
+//! of a file is made from a salt that each writer draws for itself. What can be seen of that
+//! without a key is the salt in the header of each file: no two files of an encrypted database,
+//! of its checkpoint or of what a restore leaves carry one salt unless one is a copy of the other,
+//! or the start of it, as a checkpoint's copy of a file that has grown since is. Every observation
+//! of `matrix` makes the check, which is after a repair of a torn tail (the segment that was
+//! cut and the one that replaces it), a checkpoint and a restore, and a restart, none of which may
+//! bring a salt back.
+//!
+//! - `matrix::*` (the check is part of `files::assert_every_file_is_sealed`, which every encrypted
+//!   observation makes) and
+//!   `files::tests::two_files_that_share_a_salt_are_copies_or_the_start_of_one_another`, which
+//!   shows that the check fails for two files of one salt and different bytes.
+//! - Older, for each writer:
+//!   `manifest_encryption_tests::every_write_of_the_manifest_is_sealed_under_a_new_salt`,
+//!   `manifest_encryption_tests::a_write_that_is_tried_again_after_a_failure_is_sealed_under_a_new_salt`,
+//!   `wal_sealed_tests::a_rotation_starts_a_segment_with_a_header_and_a_salt_of_its_own`,
+//!   `wal_sealed_writer_tests::a_tree_replaces_a_failed_sealed_segment_with_one_that_has_its_own_salt`,
+//!   `vlog_sealed_tests::a_restart_never_reopens_a_sealed_file_and_starts_a_new_one_with_a_new_salt`,
+//!   `vlog_sealed_tests::a_write_that_fails_anywhere_never_gives_a_position_out_twice`,
+//!   `vlog_sealed_tests::a_writer_that_is_asked_to_seal_a_position_again_is_refused_and_poisoned`,
+//!   `block_io_tests::a_sink_whose_sealer_failed_does_not_ask_it_for_that_position_again`,
+//!   `tde_tests::threads_racing_through_the_same_positions_never_seal_one_twice`.
+//!
+//! **Not claimed.** That a position is sealed once in a file: two different messages at one
+//! position of one file cannot be told from a file that was written once, without the key, so that
+//! is for the cipher, which refuses a position that is not after the last, and for the tests of
+//! each writer above. A salt that comes twice from a broken or a cloned random source: two files
+//! that carry it and are not copies are found, which is all that can be seen.
 //!
 //! ## AEAD integrity
 //!
