@@ -7,6 +7,8 @@ mod clock;
 mod compaction;
 mod comparator;
 mod compression;
+mod describe;
+mod encryption_status;
 mod error;
 pub mod inspect;
 mod iter;
@@ -50,6 +52,10 @@ use sstable::bloom::LevelDBBloomFilter;
 pub use sstable::ribbon::RibbonFilter;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
+// The types of `Tree::encryption_status`, hidden with the types they are made of until
+// encryption is no longer a preview.
+#[doc(hidden)]
+pub use crate::encryption_status::{EncryptionStatus, FileTotals, KeyUsage};
 pub use crate::error::{
 	BackgroundError,
 	BackgroundErrorHandler,

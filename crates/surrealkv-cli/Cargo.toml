@@ -10,6 +10,13 @@ description = "Operator and developer inspection, dump, and diagnostic CLI for S
 name = "skv"
 path = "src/main.rs"
 
+[features]
+# Builds the tool on the library with the guard that refuses a key manager compiled out, so that
+# it can read and write encrypted databases while encryption is a preview. Off by default, so
+# that `cargo test --workspace` links the library with the guard in place. Never use it for
+# data that is meant to be kept: the formats are not final.
+encryption-preview = ["surrealkv/encryption-preview"]
+
 [dependencies]
 surrealkv = { path = "../..", version = "0.21.3" }
 surrealkv-compat-rocksdb = { path = "../surrealkv-compat-rocksdb" }

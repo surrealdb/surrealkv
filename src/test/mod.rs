@@ -51,6 +51,8 @@ pub mod compression_tests;
 #[cfg(test)]
 pub mod crash_consistency_tests;
 #[cfg(test)]
+pub mod describe_tests;
+#[cfg(test)]
 pub mod direct_l0_flush_tests;
 #[cfg(test)]
 pub mod direct_l0_group_tests;
@@ -75,6 +77,8 @@ pub mod encryption_open_tests;
 #[cfg(test)]
 pub mod encryption_prepare_tests;
 #[cfg(test)]
+pub mod encryption_status_tests;
+#[cfg(test)]
 pub mod encryption_surfaces_tests;
 #[cfg(test)]
 pub mod encryption_typed_errors_tests;
@@ -88,6 +92,8 @@ pub mod group_fail_stop_edge_tests;
 pub mod group_fail_stop_tests;
 #[cfg(test)]
 pub mod index_block_tests;
+#[cfg(test)]
+pub mod inspect_encryption_tests;
 #[cfg(test)]
 pub mod iterator_semantics_tests;
 #[cfg(test)]
@@ -133,6 +139,8 @@ pub mod rotate_vlog_order_tests;
 #[cfg(test)]
 pub mod rotate_vlog_race_tests;
 #[cfg(test)]
+pub mod scrub_encryption_tests;
+#[cfg(test)]
 pub mod snapshot_tests;
 #[cfg(test)]
 pub mod sstable_encryption_tests;
@@ -148,6 +156,8 @@ pub mod stall_tests;
 pub mod tde_tests;
 #[cfg(test)]
 pub mod transaction_tests;
+#[cfg(test)]
+pub mod tree_builder_encryption_tests;
 #[cfg(test)]
 pub mod vlog_floor_tests;
 #[cfg(test)]

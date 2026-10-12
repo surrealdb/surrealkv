@@ -2734,6 +2734,30 @@ impl Tree {
 		self.core.inner.prepare_keys()
 	}
 
+	/// Says whether the database is encrypted, with which suite, and which keys cover how many
+	/// files and bytes of each kind. It is made from the headers at the start of the files and
+	/// from the key manager, and reads no block and no key: it opens each file, one after the
+	/// other, to read its first bytes, so call it where a blocking call is allowed.
+	///
+	/// It is what to ask before a key is destroyed, see [`EncryptionStatus`]. The state of every
+	/// key id that a file names, and of the active one, is the key manager's. A database that
+	/// is not encrypted is answered at once, with nothing counted.
+	///
+	/// The shape of the answer is not settled while encryption is a preview, which is why it is
+	/// hidden from the documentation with the types that it is made of.
+	#[doc(hidden)]
+	pub fn encryption_status(&self) -> Result<crate::EncryptionStatus> {
+		let opts = &self.core.inner.opts;
+		match opts.encryption_context() {
+			None => Ok(crate::EncryptionStatus::not_encrypted()),
+			Some(context) => crate::encryption_status::scan_database(
+				&opts.path,
+				Some(context.key_manager().as_ref()),
+				Some((context.db_id(), context.suite())),
+			),
+		}
+	}
+
 	/// Closes the tree. Commits already admitted finish first, each with its real outcome, and a
 	/// commit that begins once the commit pipeline is shut down fails with
 	/// [`Error::PipelineStall`]. Checkpoints that are running, and a restore that runs, finish
@@ -2982,6 +3006,55 @@ impl TreeBuilder {
 	/// Set the L0 stall threshold.
 	pub fn with_l0_stall_threshold(mut self, value: usize) -> Self {
 		self.opts = self.opts.with_l0_stall_threshold(value);
+		self
+	}
+
+	/// Creates the database encrypted at rest with the keys of `key_manager`, or opens the one that
+	/// is. It is [`Options::with_encryption`] for a builder: every file of the database is sealed,
+	/// the manifest, the tables, the value log and the write-ahead log.
+	///
+	/// # Creating and opening
+	///
+	/// Whether a database is encrypted is decided once, when it is created, and is read from its
+	/// manifest every time it is opened.
+	///
+	/// - At a path that holds no database, `build` creates one that is encrypted. It is given an
+	///   identity of its own and the cipher suite that `cipher` names, and `Auto` is resolved then
+	///   and never again: AES-256-GCM on a machine with hardware support for it, XChaCha20-Poly1305
+	///   on one without. Both are written to the manifest, which is the first file of the database,
+	///   sealed under the key that `key_manager` says is active. No file exists under an identity
+	///   before the manifest that names it is on disk.
+	/// - At the path of a database that is encrypted, `build` opens it, with the suite it was
+	///   created with, and `cipher` is not looked at. The manager must hold the key that sealed the
+	///   manifest, and every other key that a file of the database names. A key that does not fit
+	///   is refused by name (`Error::Encryption` with `WrongKey`, `UnknownKeyId` or `KeyRetired`)
+	///   before anything is changed, and a database is never repaired or deleted because of a key.
+	/// - At the path of a database that was created without a key, `build` fails with
+	///   `NotEncrypted`: encryption is never added to a database that exists, and no migration from
+	///   another store is done into an encrypted database.
+	/// - A database that is encrypted cannot be opened without a key manager: `build` fails with
+	///   `NotConfigured`.
+	///
+	/// # Keys
+	///
+	/// The key manager owns the keys, and the database keeps none: a root key is not written to any
+	/// file. **A key that is lost is data that is lost.** There is no copy to recover it from, and
+	/// every file that was written under a key is unreadable without it, the checkpoints and
+	/// backups of the database included. New files are written under the key that the manager
+	/// says is active, and an older key must stay with the manager for as long as any file or any
+	/// checkpoint that was written under it is wanted: see `Tree::encryption_status`.
+	///
+	/// # Preview
+	///
+	/// Encryption is a preview. Unless the crate is built with the `encryption-preview` feature,
+	/// `build` with a key manager fails with `Error::InvalidArgument` and creates nothing, and the
+	/// formats of the files are not final: do not use it for data that is meant to be kept.
+	pub fn with_encryption(
+		mut self,
+		key_manager: Arc<dyn crate::tde::KeyManager>,
+		cipher: impl Into<crate::tde::CipherPreference>,
+	) -> Self {
+		self.opts = self.opts.with_encryption(key_manager, cipher);
 		self
 	}
 

@@ -481,7 +481,7 @@ impl BlockSource {
 
 	/// The footer is the only thing in a table that is not a block, and the only read that is
 	/// made without a handle.
-	fn read_footer(&self) -> Result<Footer> {
+	pub(crate) fn read_footer(&self) -> Result<Footer> {
 		let footer_len = TABLE_FULL_FOOTER_LENGTH as u64;
 		if self.file_size < footer_len {
 			return Err(Error::from(SSTableError::FileTooSmall {

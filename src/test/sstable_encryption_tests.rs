@@ -67,8 +67,8 @@ const COMPRESSIONS: [CompressionType; 3] =
 	[CompressionType::None, CompressionType::SnappyCompression, CompressionType::ZstdCompression];
 
 /// The id of the tables that these tests write, and the number of keys of the larger ones.
-const TABLE_ID: u64 = 7;
-const KEYS: usize = 120;
+pub(crate) const TABLE_ID: u64 = 7;
+pub(crate) const KEYS: usize = 120;
 
 // ========== Contexts, options and tables ==========
 
@@ -84,12 +84,12 @@ fn context_for(key_manager: Arc<dyn KeyManager>, suite: CipherSuite) -> Arc<Encr
 	Arc::new(EncryptionContext::new(key_manager, db_id(), suite))
 }
 
-fn context(suite: CipherSuite) -> Arc<EncryptionContext> {
+pub(crate) fn context(suite: CipherSuite) -> Arc<EncryptionContext> {
 	context_for(manager(), suite)
 }
 
 /// Options for tables of a few blocks of each kind, sealed if a context is given.
-fn options(
+pub(crate) fn options(
 	context: Option<&Arc<EncryptionContext>>,
 	compression: CompressionType,
 	filter: bool,
@@ -112,7 +112,7 @@ fn options(
 
 /// What is written to a table: points in order, and range deletions.
 #[derive(Clone, Default)]
-struct Input {
+pub(crate) struct Input {
 	points: Vec<(InternalKey, Vec<u8>)>,
 	range_deletions: Vec<(Vec<u8>, Vec<u8>, u64)>,
 }
@@ -129,16 +129,24 @@ fn point(i: usize) -> (InternalKey, Vec<u8>) {
 	(InternalKey::new(key_of(i), (i + 1) as u64, InternalKeyKind::Set), value_of(i))
 }
 
-fn many_points(n: usize) -> Input {
+pub(crate) fn many_points(n: usize) -> Input {
 	Input {
 		points: (0..n).map(point).collect(),
 		range_deletions: Vec::new(),
 	}
 }
 
+/// A table of range deletions alone: no point, so no data block, and an index with nothing in it.
+pub(crate) fn range_deletions_alone() -> Input {
+	Input {
+		points: Vec::new(),
+		range_deletions: vec![(b"a".to_vec(), b"z".to_vec(), 7)],
+	}
+}
+
 /// Writes `input` as table `id` through `TableWriter::new`, which is what the engine does, and
 /// returns the file.
-fn write_table(opts: &Arc<Options>, id: u64, input: &Input) -> Vec<u8> {
+pub(crate) fn write_table(opts: &Arc<Options>, id: u64, input: &Input) -> Vec<u8> {
 	let mut buf = Vec::new();
 	let size = {
 		let mut writer = TableWriter::new(&mut buf, id, Arc::clone(opts), 0);
