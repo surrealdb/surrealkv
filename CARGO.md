@@ -52,7 +52,7 @@ Every commit is flushed to disk before it returns (each figure is a single run).
 
 ### Without synchronous durability
 
-Commits are not flushed to disk before they return (each figure is a single run, and engines marked - are still being measured).
+Commits are not flushed to disk before they return (each figure is a single run).
 
 | Engine | Point&nbsp;Read&nbsp;(OPS) | Create&nbsp;(OPS) | Update&nbsp;(OPS) | Delete&nbsp;(OPS) | Scan&nbsp;(OPS) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
