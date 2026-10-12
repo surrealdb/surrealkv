@@ -538,9 +538,12 @@ impl LevelManifest {
 			snapshots,
 		} = DecodedManifest::decode(data)?;
 
-		// Sweep stale temporary manifest files left behind by uncompleted writes
-		if let Some(parent) = manifest_path.as_ref().parent() {
-			sweep_stale_manifest_temp_files(parent);
+		// Sweep stale temporary manifest files left behind by uncompleted writes. An encrypted
+		// database never deletes what it did not write: such a file may hold a sealed manifest.
+		if encryption.is_none() {
+			if let Some(parent) = manifest_path.as_ref().parent() {
+				sweep_stale_manifest_temp_files(parent);
+			}
 		}
 
 		// Validate log_number against actual WAL segments BEFORE proceeding
