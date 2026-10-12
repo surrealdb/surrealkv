@@ -149,7 +149,7 @@ fn test_cli_scrub_does_not_pass_a_database_with_a_sealed_table() {
 // that is sealed, and tables, value-log files and log segments that begin with a real encryption
 // header for the database. What follows the header is not data, so they can be described and
 // refused and not read, which is all that these tests ask of them: reading a database with its key
-// is for the build that has the preview feature, below.
+// is for the build that has the encryption feature, below.
 
 /// A root key whose bytes are none of them text, so that no form of it can be mistaken for
 /// anything else that the tool prints.
@@ -497,16 +497,16 @@ fn test_cli_a_key_file_that_every_user_can_read_is_refused_unless_that_is_chosen
 	assert_no_key(&out, "an open key file");
 
 	// Said so, the key is read, and what comes next is for the rest of the tool: in a build
-	// without the preview feature, the guard that no build of this tool gets round.
+	// without the encryption feature, the guard that no build of this tool gets round.
 	let out = skv(&["sst", table, "--key-file", open_path, "--allow-insecure-key-file"]);
 	assert_eq!(out.status.code(), Some(1));
 	assert!(!stderr(&out).contains("can be reached by every user"), "{}", stderr(&out));
 	assert_no_key(&out, "an open key file that is accepted");
 }
 
-#[cfg(not(feature = "encryption-preview"))]
+#[cfg(not(feature = "encryption"))]
 #[test]
-fn test_cli_without_the_preview_feature_a_key_is_refused_by_the_guard_and_the_flag_wins() {
+fn test_cli_without_the_encryption_feature_a_key_is_refused_by_the_guard_and_the_flag_wins() {
 	let db = encrypted_database(0xD1, CipherSuite::Aes256Gcm);
 	let table = db.path().join("sstables").join(format!("{:020}.sst", 1));
 	let table = table.to_str().unwrap();
@@ -525,7 +525,7 @@ fn test_cli_without_the_preview_feature_a_key_is_refused_by_the_guard_and_the_fl
 		assert_eq!(out.status.code(), Some(1), "{what}");
 		let err = stderr(&out);
 		assert!(err.contains("not enabled in this build"), "{what}: {err}");
-		assert!(err.contains("encryption-preview"), "{what}: {err}");
+		assert!(err.contains("`encryption` feature"), "{what}: {err}");
 		assert_no_key(&out, what);
 	}
 
@@ -542,13 +542,13 @@ fn test_cli_without_the_preview_feature_a_key_is_refused_by_the_guard_and_the_fl
 	assert_eq!(snapshot(db.path()), before);
 }
 
-// ========== With the preview feature ==========
+// ========== With the encryption feature ==========
 //
 // A build of the tool with the guard compiled out reads and writes encrypted databases. These run
 // in the job that builds it, and make the database with the tool itself.
 
-#[cfg(feature = "encryption-preview")]
-mod with_the_preview_feature {
+#[cfg(feature = "encryption")]
+mod with_the_encryption_feature {
 	use super::*;
 
 	/// The suite that the database below is created with is the one that the library picks for the

@@ -2764,7 +2764,7 @@ impl Tree {
 	/// it is back. It may wait on the provider, and does nothing for a database that is not
 	/// encrypted.
 	///
-	/// Part of the encryption preview, and kept out of the documented interface until it is not.
+	/// Kept out of the documented interface until its shape is settled.
 	#[doc(hidden)]
 	pub fn prepare_keys(&self) -> Result<()> {
 		self.core.inner.prepare_keys()
@@ -2779,7 +2779,7 @@ impl Tree {
 	/// key id that a file names, and of the active one, is the key manager's. A database that
 	/// is not encrypted is answered at once, with nothing counted.
 	///
-	/// The shape of the answer is not settled while encryption is a preview, which is why it is
+	/// The shape of the answer is not settled, which is why it is
 	/// hidden from the documentation with the types that it is made of.
 	#[doc(hidden)]
 	pub fn encryption_status(&self) -> Result<crate::EncryptionStatus> {
@@ -3094,9 +3094,9 @@ impl TreeBuilder {
 	/// says is active, and an older key must stay with the manager for as long as any file or any
 	/// checkpoint that was written under it is wanted: see `Tree::encryption_status`.
 	///
-	/// # Preview
+	/// # Feature
 	///
-	/// Encryption is a preview. Unless the crate is built with the `encryption-preview` feature,
+	/// Encryption needs the `encryption` feature, which is on by default. Without it,
 	/// `build` with a key manager fails with `Error::InvalidArgument` and creates nothing, and the
 	/// formats of the files are not final: do not use it for data that is meant to be kept.
 	pub fn with_encryption(

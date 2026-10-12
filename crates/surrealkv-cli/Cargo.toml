@@ -11,14 +11,13 @@ name = "skv"
 path = "src/main.rs"
 
 [features]
-# Builds the tool on the library with the guard that refuses a key manager compiled out, so that
-# it can read and write encrypted databases while encryption is a preview. Off by default, so
-# that `cargo test --workspace` links the library with the guard in place. Never use it for
-# data that is meant to be kept: the formats are not final.
-encryption-preview = ["surrealkv/encryption-preview"]
+default = ["encryption"]
+# Builds the tool on the library with encryption at rest, so that it can read and write encrypted
+# databases. Without it a key is refused by the library's guard.
+encryption = ["surrealkv/encryption"]
 
 [dependencies]
-surrealkv = { path = "../..", version = "0.21.3" }
+surrealkv = { path = "../..", version = "0.21.3", default-features = false }
 surrealkv-compat-rocksdb = { path = "../surrealkv-compat-rocksdb" }
 surrealkv-compat-v1 = { path = "../surrealkv-compat-v1" }
 surrealkv-compat-indxdb = { path = "../surrealkv-compat-indxdb" }

@@ -19,7 +19,7 @@
 //! # Running them
 //!
 //! They are in the library's own tests, so they run in the normal lib tests and in the
-//! `encryption-preview` job, on Linux and macOS, and are only built on Windows, where CI runs no
+//! `encryption` job, on Linux and macOS, and are only built on Windows, where CI runs no
 //! tests. They are gated out of the wasm build as a whole. The one test that is for Unix alone
 //! is the scan that is shown not to follow a symbolic link: it is `#[cfg(unix)]` inside `scan`.
 //! None is ignored and none depends on timing. The markers are drawn from a seed that is in every

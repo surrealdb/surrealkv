@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use crate::describe::{describe_file, is_encrypted, CryptoSummary, FileDescription, FileState};
-// The shape of the encryption status is not settled while encryption is a preview, and it is
+// The shape of the encryption status is not settled, and it is
 // made of types that are hidden: it is hidden from the documentation too.
 #[doc(hidden)]
 pub use crate::encryption_status::{EncryptionStatus, FileTotals, KeyUsage};

@@ -98,10 +98,10 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
   
-  # The guard that rejects a key manager is compiled out under this non-default feature, so
-  # build and test it here to keep that path from rotting.
-  encryption-preview:
-    name: Encryption preview feature
+  # Encryption is on by default, so the normal jobs cover it. Build and test without it here, to
+  # keep the guard that rejects a key manager from rotting.
+  no-encryption:
+    name: Without the encryption feature
     runs-on: ubuntu-latest
     env:
       RUSTFLAGS: --deny warnings
@@ -121,18 +121,18 @@ jobs:
           components: clippy
 
       - name: Clippy
-        run: cargo clippy -p surrealkv --all-targets --features encryption-preview -- -D warnings
+        run: cargo clippy -p surrealkv --all-targets --no-default-features -- -D warnings
 
       - name: Test
-        run: cargo test -p surrealkv --features encryption-preview --lib --test encryption_preview
+        run: cargo test -p surrealkv --no-default-features --test encryption_guard
 
-      # The command line tool with the same guard compiled out: it reads and writes encrypted
-      # databases only in this build, so its tests of that run here and nowhere else.
+      # The command line tool built on the library without encryption: a key is refused by the
+      # guard, and the tests of that run here and nowhere else.
       - name: Clippy (skv)
-        run: cargo clippy -p surrealkv-cli --all-targets --features encryption-preview -- -D warnings
+        run: cargo clippy -p surrealkv-cli --all-targets --no-default-features -- -D warnings
 
       - name: Test (skv)
-        run: cargo test -p surrealkv-cli --features encryption-preview
+        run: cargo test -p surrealkv-cli --no-default-features
 
   format:
     runs-on: ubuntu-latest
