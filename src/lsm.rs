@@ -2660,6 +2660,19 @@ impl Tree {
 		Ok(metadata)
 	}
 
+	/// Asks the key manager again for the keys this database uses: the key that new files are
+	/// written under, and every key that its files were found to use.
+	///
+	/// A database asks for them when it is opened, and creating a file afterwards, a segment of the
+	/// log, a file of the value log or a table, never waits on a key provider. Call this after the
+	/// key manager changed which key new files are written under, so that the new key is there
+	/// before a commit needs it, and after a commit failed with a key provider that was away, once
+	/// it is back. It may wait on the provider, and does nothing for a database that is not
+	/// encrypted.
+	pub fn prepare_keys(&self) -> Result<()> {
+		self.core.inner.prepare_keys()
+	}
+
 	/// Closes the tree. Commits already admitted finish first, each with its real outcome, and a
 	/// commit that begins once the commit pipeline is shut down fails with
 	/// [`Error::PipelineStall`]. Checkpoints that are running, and a restore that runs, finish

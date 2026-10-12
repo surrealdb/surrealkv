@@ -23,6 +23,40 @@ use crate::vfs::File;
 use crate::wal::list_segment_ids;
 use crate::{Options, Result};
 
+/// Makes the key that the table `table_id`, whose file is `file`, was sealed under available from
+/// the key manager, which may wait on a provider, and which a database that has only ever used the
+/// key it is opened with does not ask for again: see `EncryptionContext::prepare`.
+///
+/// Only the start of the file is read, and nothing is decided here that the open of the table does
+/// not decide again, in its own order: a file that is not sealed, whose header does not decode or
+/// is not the header of this table of this database is left to `Table::new`, which names what is
+/// wrong with it. The answer here is only the manager's, for a key that the header names.
+fn prepare_key_of_table(
+	file: &Arc<dyn File>,
+	file_size: u64,
+	table_id: u64,
+	context: &EncryptionContext,
+) -> Result<()> {
+	use crate::tde::{CryptoHeader, FileKind, HEADER_LEN};
+
+	if file_size < HEADER_LEN as u64 {
+		return Ok(());
+	}
+	let mut head = [0u8; HEADER_LEN];
+	file.read_exact_at(0, &mut head)?;
+	let Ok(header) = CryptoHeader::decode(&head) else {
+		return Ok(());
+	};
+	let identity = header.identity;
+	if identity.db_id != context.db_id()
+		|| identity.file_kind != FileKind::Sst
+		|| identity.file_id != table_id
+	{
+		return Ok(());
+	}
+	Ok(context.prepare(&[identity.key_id])?)
+}
+
 /// Validates that the manifest's log_number doesn't exceed actual WAL segments on disk.
 /// This detects manifest corruption that could cause silent data loss.
 pub(crate) fn validate_wal_log_number(wal_path: &Path, manifest_log_number: u64) -> Result<()> {
@@ -574,6 +608,13 @@ impl LevelManifest {
 		let file = SysFile::open(&table_file_path)?;
 		let file: Arc<dyn File> = Arc::new(file);
 		let file_size = file.size()?;
+
+		// The key of a table written under an older key than the one that is active is made
+		// available here, while the database is opened or restored, and not when its first block
+		// is read.
+		if let Some(context) = opts.encryption_context() {
+			prepare_key_of_table(&file, file_size, table_id, context)?;
+		}
 
 		// Create and return the table
 		let mut table = Table::new(table_id, opts, file, file_size)?;
