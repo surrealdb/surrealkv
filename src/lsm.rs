@@ -1458,16 +1458,10 @@ impl CompactionOperations for CoreInner {
 			return Err(error);
 		}
 
-		// A compaction that cannot settle the manifest yet changes nothing, and tries again: the
-		// manifest stays unsettled, so it is a failure that passes and not one that stops the
-		// database, as it is not for the flush that settles it. A key that could not be had keeps
-		// its type.
-		self.settle_manifest().map_err(|error| match error {
-			Error::Encryption(_) => error,
-			error => {
-				Error::Other(format!("Failed to settle the manifest before compaction: {error}"))
-			}
-		})?;
+		// The manifest is not settled here: the compaction writes the manifest in memory itself,
+		// which settles it if that works and leaves it unsettled, with the outputs kept, if not.
+		// Settling first would let a compaction heal or fail a manifest that the flush that left it
+		// unsettled has yet to see.
 
 		// Kept for the whole run, so that a restore waits for it, see `compactions`.
 		let _running = self.compactions.read();
