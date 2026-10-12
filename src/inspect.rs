@@ -5,17 +5,23 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use crate::describe::{describe_file, is_encrypted, CryptoSummary, FileDescription, FileState};
-use crate::error::{Error, Result};
+use crate::error::{EncryptionError, Error, Result};
 use crate::levels::LevelManifest;
 use crate::sstable::index_block::IndexIterator;
 use crate::sstable::table::{IndexType, Table, TABLE_FULL_FOOTER_LENGTH};
+use crate::tde::EncryptionContext;
 use crate::vfs::File;
+use crate::wal::sealed_recovery::{decode_segment, SegmentEnd};
+use crate::wal::WalContext;
 use crate::{LSMIterator, Options};
 
 /// General database storage inspection summary.
 #[derive(Debug, Clone)]
 pub struct DbInfo {
 	pub path: PathBuf,
+	/// What the header of the manifest says about the encryption of the database, if it is
+	/// encrypted: its suite, the key that wrote the manifest and its identity.
+	pub encryption: Option<CryptoSummary>,
 	pub manifest_version: u16,
 	pub next_table_id: u64,
 	pub log_number: u64,
@@ -72,8 +78,13 @@ pub struct SnapshotSummary {
 #[derive(Debug, Clone)]
 pub struct SstInfo {
 	pub path: PathBuf,
+	/// The id of the table, from the name of its file, `{id:020}.sst`, if the name is one.
+	pub table_id: Option<u64>,
+	/// What the header of the table says about its encryption, if its blocks are sealed.
+	pub encryption: Option<CryptoSummary>,
 	pub file_size: u64,
 	pub format_version: u8,
+	/// The checksum type that the footer of the table says: 1 for plain blocks, 2 for sealed ones.
 	pub checksum_type: u8,
 	pub total_entries: u64,
 	pub raw_key_size: u64,
@@ -105,6 +116,13 @@ pub struct WalInfo {
 pub struct WalSegmentSummary {
 	pub file_name: String,
 	pub file_size: u64,
+	/// What the header of the segment says about its encryption, if it is sealed.
+	pub encryption: Option<CryptoSummary>,
+	/// The number of batches in the segment, counted by decoding it. Only for a sealed segment
+	/// that was read with its key: a plaintext one is not decoded.
+	pub batches: Option<usize>,
+	/// Whether a sealed segment that was decoded ends in a write that was cut short.
+	pub torn: bool,
 }
 
 /// Comprehensive database integrity scrub report.
@@ -117,13 +135,89 @@ pub struct ScrubReport {
 	pub errors: Vec<String>,
 }
 
+/// Refuses options that name a key where this build does not take one, as opening a database
+/// with them would: an inspection that decrypts is held to the same guard as a database that
+/// writes, so a build that cannot make an encrypted database does not read one either.
+fn check_encryption_options(options: &Options) -> Result<()> {
+	if options.key_manager.is_some() || options.encryption_context.is_some() {
+		options.validate()?;
+	}
+	Ok(())
+}
+
+/// Whether the options give the inspection a key: a key manager, or a context that the caller
+/// resolved for the database it expects.
+fn holds_a_key(options: &Options) -> bool {
+	options.key_manager.is_some() || options.encryption_context.is_some()
+}
+
+/// The options to read the files of the database in `db_dir` with. With a key, the identity and
+/// the suite of the database are the ones its manifest names, which is opened to check the key:
+/// a key that does not fit, or a manifest that is not encrypted, is the error of the call and
+/// nothing has been read of any other file. Reads only.
+///
+/// A directory that has no manifest has no identity to take, and its options are returned as
+/// they were given: what is read from it then takes its identity from the file it reads.
+fn options_for_database(db_dir: &Path, options: &Options) -> Result<Arc<Options>> {
+	check_encryption_options(options)?;
+	let mut opts = options.clone();
+	opts.path = db_dir.to_path_buf();
+	let opts = Arc::new(opts);
+	if !holds_a_key(&opts) || !opts.manifest_file_path(0).exists() {
+		return Ok(opts);
+	}
+	crate::levels::resolve_encryption(opts)
+}
+
+/// The table id that the name of a file gives: `{id:020}.sst`, twenty digits and the extension.
+fn table_id_of(path: &Path) -> Option<u64> {
+	let name = path.file_name()?.to_str()?;
+	let digits = name.strip_suffix(".sst")?;
+	if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+		return None;
+	}
+	digits.parse().ok()
+}
+
+/// The number of a segment of the log that the name of a file gives: `{id:020}.wal`.
+fn segment_id_of(name: &str) -> Option<u64> {
+	let digits = name.strip_suffix(".wal")?;
+	if digits.len() != 20 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+		return None;
+	}
+	digits.parse().ok()
+}
+
+/// The database directory and the manifest that a path names: the directory itself, or a file
+/// of the manifest directory, which is two levels down.
+fn database_directory(path: &Path) -> PathBuf {
+	if path.is_dir() {
+		path.to_path_buf()
+	} else {
+		path.parent().and_then(|parent| parent.parent()).unwrap_or(path).to_path_buf()
+	}
+}
+
 /// Inspects a database directory and returns overall storage health.
+///
+/// A database that is encrypted is refused with `Error::Encryption(NotConfigured)`: nothing here
+/// has a key. See [`inspect_db_with_options`].
 pub fn inspect_db<P: AsRef<Path>>(db_path: P) -> Result<DbInfo> {
+	inspect_db_with_options(db_path, &Options::default())
+}
+
+/// Inspects a database directory as [`inspect_db`] does, with the key manager of `options`, if it
+/// has one, to read a database that is encrypted. The path of `options` is not used: the argument
+/// says which database is inspected.
+///
+/// With a key the database is the one that its manifest names, and the key must open it
+/// (`WrongKey`, `UnknownKeyId`, `KeyRetired`); a database that is not encrypted is refused as
+/// `NotEncrypted`, since encryption is never added to a database that exists. Nothing is written,
+/// and in a build that does not take a key manager at all the call is refused with
+/// `Error::InvalidArgument`, as the opening of a database is.
+pub fn inspect_db_with_options<P: AsRef<Path>>(db_path: P, options: &Options) -> Result<DbInfo> {
 	let path = db_path.as_ref().to_path_buf();
-	let opts = Arc::new(Options {
-		path: path.clone(),
-		..Default::default()
-	});
+	let opts = options_for_database(&path, options)?;
 
 	// Check lock status
 	let lock_path = opts.path.join("LOCK");
@@ -186,6 +280,7 @@ pub fn inspect_db<P: AsRef<Path>>(db_path: P) -> Result<DbInfo> {
 	if !manifest_path.exists() {
 		return Ok(DbInfo {
 			path,
+			encryption: None,
 			manifest_version: 0,
 			next_table_id: 0,
 			log_number: 0,
@@ -200,6 +295,7 @@ pub fn inspect_db<P: AsRef<Path>>(db_path: P) -> Result<DbInfo> {
 		});
 	}
 
+	let encryption = describe_file(&manifest_path)?.crypto().copied();
 	let manifest = LevelManifest::load_from_file(&manifest_path, opts)?;
 	let mut total_tables = 0;
 	let mut levels = Vec::new();
@@ -217,6 +313,7 @@ pub fn inspect_db<P: AsRef<Path>>(db_path: P) -> Result<DbInfo> {
 
 	Ok(DbInfo {
 		path,
+		encryption,
 		manifest_version: manifest.manifest_format_version,
 		next_table_id: manifest.next_table_id.load(std::sync::atomic::Ordering::Relaxed),
 		log_number: manifest.log_number,
@@ -232,19 +329,25 @@ pub fn inspect_db<P: AsRef<Path>>(db_path: P) -> Result<DbInfo> {
 }
 
 /// Dumps detailed manifest state.
+///
+/// An encrypted manifest is refused with `Error::Encryption(NotConfigured)`: nothing here has a
+/// key. See [`dump_manifest_with_options`].
 pub fn dump_manifest<P: AsRef<Path>>(path: P) -> Result<ManifestInfo> {
-	let p = path.as_ref();
-	let db_dir = if p.is_dir() {
-		p.to_path_buf()
-	} else {
-		p.parent().and_then(|parent| parent.parent()).unwrap_or(p).to_path_buf()
-	};
+	dump_manifest_with_options(path, &Options::default())
+}
 
-	let opts = Arc::new(Options {
-		path: db_dir,
-		..Default::default()
-	});
-
+/// Dumps the manifest as [`dump_manifest`] does, opening it with the key manager of `options`, if
+/// it has one, when the database is encrypted. The path of `options` is not used.
+///
+/// The manifest is opened with the key (`WrongKey`, `UnknownKeyId` and `KeyRetired` otherwise),
+/// and the tables that it lists are opened with the identity that it names, so a table of another
+/// database is `DbIdMismatch`. Nothing is written. In a build that does not take a key manager
+/// the call is refused with `Error::InvalidArgument`.
+pub fn dump_manifest_with_options<P: AsRef<Path>>(
+	path: P,
+	options: &Options,
+) -> Result<ManifestInfo> {
+	let opts = options_for_database(&database_directory(path.as_ref()), options)?;
 	let manifest_path = opts.manifest_file_path(0);
 	let manifest = LevelManifest::load_from_file(&manifest_path, opts)?;
 
@@ -292,13 +395,63 @@ pub fn dump_manifest<P: AsRef<Path>>(path: P) -> Result<ManifestInfo> {
 /// Dumps deep inspection information from an SSTable.
 ///
 /// A table whose blocks are sealed cannot be read without the key of its database, and nothing
-/// here takes one: it is refused with `Error::Encryption`, before any of its blocks is read.
+/// here takes one: it is refused with `Error::Encryption`, before any of its blocks is read. See
+/// [`dump_sst_with_options`].
 pub fn dump_sst<P: AsRef<Path>>(
 	path: P,
 	dump_keys: bool,
 	verify_checksum: bool,
 ) -> Result<SstInfo> {
+	dump_sst_with_options(path, dump_keys, verify_checksum, &Options::default())
+}
+
+/// The options to read the table described by `described` with. Without a key they are the
+/// options as they were given. With one, a table that is not encrypted is refused
+/// (`NotEncrypted`, as a database that is encrypted refuses a plaintext file), and a sealed one is
+/// read with the context that the options carry, if the caller gave one for the database it
+/// expects, and otherwise with a context made from what the file says about itself: the database
+/// and suite in its own header, since a table that is looked at alone belongs to no manifest. A
+/// header that cannot be read is the error of the call.
+fn options_for_table(options: &Options, described: &FileDescription) -> Result<Options> {
+	let mut opts = options.clone();
+	if !holds_a_key(options) {
+		return Ok(opts);
+	}
+	match &described.state {
+		FileState::Sealed(summary) if opts.encryption_context.is_none() => {
+			if let Some(key_manager) = opts.key_manager.clone() {
+				let context = EncryptionContext::new(key_manager, summary.db_id, summary.suite);
+				opts = opts.with_encryption_context(Arc::new(context));
+			}
+		}
+		FileState::Sealed(_) | FileState::Unfinished => {}
+		FileState::Damaged(e) => return Err(e.clone().into()),
+		FileState::Plaintext => return Err(EncryptionError::NotEncrypted.into()),
+	}
+	Ok(opts)
+}
+
+/// Dumps deep inspection information from an SSTable as [`dump_sst`] does, with the key manager
+/// of `options` to read a table whose blocks are sealed.
+///
+/// The table is the one that its file name says, `{id:020}.sst`: a sealed table is opened as that
+/// table and refuses a file that was renamed (`FileIdMismatch`), and a sealed table whose name is
+/// not one is refused, since nothing says which table it is meant to be. The checksum type is the
+/// one in the footer of the file. A table that is alone belongs to no manifest, so its database
+/// and suite are those of its own header, unless `options` carry a context that was resolved
+/// for the database that the caller expects, which then must be that of the file
+/// (`DbIdMismatch`). The key must open the file (`WrongKey`, `UnknownKeyId`, `KeyRetired`), and a
+/// block that does not authenticate is `AuthenticationFailed`. A table that is not encrypted is
+/// refused when a key is given. In a build that does not take a key manager the call is refused
+/// with `Error::InvalidArgument`.
+pub fn dump_sst_with_options<P: AsRef<Path>>(
+	path: P,
+	dump_keys: bool,
+	verify_checksum: bool,
+	options: &Options,
+) -> Result<SstInfo> {
 	let path = path.as_ref().to_path_buf();
+	check_encryption_options(options)?;
 	let sys_file = fs::File::open(&path)?;
 	let file_size = sys_file.metadata()?.len();
 
@@ -306,13 +459,35 @@ pub fn dump_sst<P: AsRef<Path>>(
 		return Err(Error::Corruption("SSTable file is too small for footer".into()));
 	}
 
-	let file: Arc<dyn File> = Arc::new(sys_file);
-	let opts = Arc::new(Options {
-		path: path.parent().and_then(|p| p.parent()).unwrap_or(&path).to_path_buf(),
-		..Default::default()
-	});
+	let described = describe_file(&path)?;
+	let table_id = table_id_of(&path);
+	let mut opts = options_for_table(options, &described)?;
+	// What a sealed table is bound to is its own id, which only its name says here. Without a
+	// key it is refused by its footer before that matters.
+	if holds_a_key(options) && described.is_encrypted() && table_id.is_none() {
+		return Err(Error::InvalidArgument(format!(
+			"cannot tell which table {} is: a table that is encrypted is read as the table that \
+			 its file name says, {{id:020}}.sst",
+			path.display()
+		)));
+	}
+	opts.path = path.parent().and_then(|p| p.parent()).unwrap_or(&path).to_path_buf();
 
-	let table = Table::new(1, opts, Arc::clone(&file), file_size)?;
+	// The key that the header names is made available before the table is opened, which a key
+	// provider may need time for, as the opening of a database does for each table it lists. Only
+	// for a header that is this database's and this table's, so that a table that is not is refused
+	// as what it is, in the order that opening it decides.
+	if let (Some(context), FileState::Sealed(summary), Some(id)) =
+		(opts.encryption_context(), &described.state, table_id)
+	{
+		if summary.db_id == context.db_id() && summary.file_id == id {
+			context.prepare(&[summary.key_id])?;
+		}
+	}
+
+	let file: Arc<dyn File> = Arc::new(sys_file);
+	let table = Table::new(table_id.unwrap_or(0), Arc::new(opts), Arc::clone(&file), file_size)?;
+	let footer = table.source.read_footer()?;
 
 	let props = &table.meta.properties;
 	let total_entries = props.num_entries;
@@ -364,9 +539,11 @@ pub fn dump_sst<P: AsRef<Path>>(
 
 	Ok(SstInfo {
 		path,
+		table_id,
+		encryption: described.crypto().copied(),
 		file_size,
 		format_version: props.table_format as u8,
-		checksum_type: 1, // CRC32c
+		checksum_type: footer.checksum as u8,
 		total_entries,
 		raw_key_size,
 		raw_value_size,
@@ -384,7 +561,29 @@ pub fn dump_sst<P: AsRef<Path>>(
 }
 
 /// Dumps summary of WAL segments.
+///
+/// A log that has a sealed segment is refused with `Error::Encryption(NotConfigured)`: nothing
+/// here has a key. See [`dump_wal_with_options`].
 pub fn dump_wal<P: AsRef<Path>>(path: P) -> Result<WalInfo> {
+	dump_wal_with_options(path, &Options::default())
+}
+
+/// Dumps the segments of a log as [`dump_wal`] does, and with the key manager of `options` reads
+/// the segments that are sealed: each is decoded, which authenticates every batch in it, and the
+/// number of batches in it is reported.
+///
+/// The path is a database directory, its `wal` directory, or a file in it. The database of a
+/// sealed log is the one that its manifest names, if the path is a database directory or the
+/// `wal` directory of one that has a manifest, and otherwise the one that the first sealed
+/// segment names in its own header, so that a segment of another database is `DbIdMismatch`. The
+/// key must open each segment (`WrongKey`, `UnknownKeyId`, `KeyRetired`), and a batch that does not
+/// authenticate is `AuthenticationFailed`. A segment that ends in a write that was cut short is
+/// reported as torn, and nothing is repaired, moved or written. With a key, a log with no sealed
+/// segment is refused as not encrypted (`NotEncrypted`), and one that mixes sealed and plaintext
+/// segments as `PlaintextInEncryptedDb`. In a build that does not take a key manager the call is
+/// refused with `Error::InvalidArgument`.
+pub fn dump_wal_with_options<P: AsRef<Path>>(path: P, options: &Options) -> Result<WalInfo> {
+	check_encryption_options(options)?;
 	let p = path.as_ref();
 	let wal_dir = if p.is_dir() && p.join("wal").exists() {
 		p.join("wal")
@@ -394,30 +593,112 @@ pub fn dump_wal<P: AsRef<Path>>(path: P) -> Result<WalInfo> {
 		p.parent().unwrap_or(p).to_path_buf()
 	};
 
-	let mut segment_files = Vec::new();
-	let mut total_bytes = 0;
-
-	if let Ok(entries) = fs::read_dir(wal_dir) {
+	let mut segments = Vec::new();
+	if let Ok(entries) = fs::read_dir(&wal_dir) {
 		for e in entries.flatten() {
 			let name = e.file_name().to_string_lossy().to_string();
 			if name.ends_with(".wal") {
 				if let Ok(meta) = e.metadata() {
-					let len = meta.len();
-					total_bytes += len;
-					segment_files.push(WalSegmentSummary {
-						file_name: name,
-						file_size: len,
-					});
+					segments.push((name, e.path(), meta.len()));
 				}
 			}
 		}
 	}
+	segments.sort_by(|a, b| a.0.cmp(&b.0));
 
-	segment_files.sort_by(|a, b| a.file_name.cmp(&b.file_name));
+	let mut described = Vec::with_capacity(segments.len());
+	for (_, segment_path, _) in &segments {
+		described.push(describe_file(segment_path)?);
+	}
+	let sealed = described.iter().filter(|segment| segment.is_encrypted()).count();
+	let plain = described.iter().filter(|segment| segment.state == FileState::Plaintext).count();
+
+	// Nothing is read of what cannot be opened: a log that is sealed needs a key before anything
+	// is said of it, as the database does. A segment with nothing in it, which is what a crash
+	// leaves when a segment was made and not yet written, is of neither kind.
+	if sealed > 0 && !holds_a_key(options) {
+		return Err(EncryptionError::NotConfigured.into());
+	}
+	if holds_a_key(options) {
+		if sealed == 0 && plain > 0 {
+			return Err(EncryptionError::NotEncrypted.into());
+		}
+		if sealed > 0 && plain > 0 {
+			return Err(EncryptionError::PlaintextInEncryptedDb.into());
+		}
+		if let Some(FileState::Damaged(e)) = described
+			.iter()
+			.map(|segment| &segment.state)
+			.find(|s| matches!(s, FileState::Damaged(_)))
+		{
+			return Err(e.clone().into());
+		}
+	}
+
+	let wal = if sealed > 0 {
+		Some(wal_context(&wal_dir, options, &described)?)
+	} else {
+		None
+	};
+
+	let mut total_bytes = 0;
+	let mut segment_files = Vec::with_capacity(segments.len());
+	for ((name, segment_path, len), description) in segments.into_iter().zip(&described) {
+		total_bytes += len;
+		let mut batches = None;
+		let mut torn = false;
+		if let Some(wal) = &wal {
+			let id = segment_id_of(&name).ok_or_else(|| {
+				Error::InvalidArgument(format!(
+					"cannot tell which segment {name} is: a segment that is encrypted is read as \
+					 the segment that its file name says, {{id:020}}.wal"
+				))
+			})?;
+			let decoded = decode_segment(wal, &segment_path, id)?;
+			batches = Some(decoded.batches.len());
+			torn = matches!(decoded.end, SegmentEnd::Torn { .. });
+		}
+		segment_files.push(WalSegmentSummary {
+			file_name: name,
+			file_size: len,
+			encryption: description.crypto().copied(),
+			batches,
+			torn,
+		});
+	}
+
 	Ok(WalInfo {
 		segment_files,
 		total_bytes,
 	})
+}
+
+/// The context to decode the sealed segments in `wal_dir` with: the one that the options carry if
+/// the caller resolved one, the database that the manifest next to the directory names if there
+/// is one, and otherwise the database and suite of the first sealed segment's own header.
+fn wal_context(
+	wal_dir: &Path,
+	options: &Options,
+	described: &[FileDescription],
+) -> Result<WalContext> {
+	let database = wal_dir.parent().map(Path::to_path_buf);
+	let opts = match database {
+		Some(db_dir) if holds_a_key(options) && db_dir.join("manifest").is_dir() => {
+			options_for_database(&db_dir, options)?
+		}
+		_ => Arc::new(options.clone()),
+	};
+	if opts.encryption_context().is_some() {
+		return WalContext::for_options(&opts);
+	}
+	let (Some(key_manager), Some(first)) =
+		(opts.key_manager.clone(), described.iter().find_map(|segment| segment.crypto()))
+	else {
+		return Err(EncryptionError::MalformedHeader.into());
+	};
+	let context = EncryptionContext::new(key_manager, first.db_id, first.suite);
+	let opts = (*opts).clone().with_encryption_context(Arc::new(context));
+	WalContext::for_options(&opts)
 }
 
 /// Comprehensively verifies CRC32 checksums of all active SSTables in a database.

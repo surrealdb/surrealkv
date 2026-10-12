@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use surrealkv::tde::{DbId, EncryptionContext};
 use surrealkv::{
+	inspect,
 	CipherPreference,
 	CipherSuite,
 	Error,
@@ -150,6 +151,24 @@ async fn rejected_build_does_not_block_a_plain_build_at_the_same_path() {
 	let tree = TreeBuilder::new().with_path(db_path.clone()).build().unwrap();
 	assert!(db_path.join("manifest").exists());
 	tree.close().await.unwrap();
+}
+
+/// A tool that decrypts is held to the guard that a tree is, so a build that cannot make an
+/// encrypted database does not read one either. The refusal comes before any file is looked at:
+/// none of the paths here exists.
+#[test]
+fn an_inspection_with_a_key_manager_is_refused_before_a_file_is_read() {
+	let dir = tempfile::tempdir().unwrap();
+	let options = options_with_key_manager(dir.path(), CipherPreference::default());
+	let nowhere = dir.path().join("nowhere");
+
+	assert_encryption_refused(
+		inspect::dump_sst_with_options(nowhere.join("1.sst"), false, false, &options).unwrap_err(),
+	);
+	assert_encryption_refused(inspect::dump_manifest_with_options(&nowhere, &options).unwrap_err());
+	assert_encryption_refused(inspect::dump_wal_with_options(&nowhere, &options).unwrap_err());
+	assert_encryption_refused(inspect::inspect_db_with_options(&nowhere, &options).unwrap_err());
+	assert!(!nowhere.exists());
 }
 
 /// Control: without a key manager the same builder, path and options open and work normally,
