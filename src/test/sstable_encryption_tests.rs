@@ -136,6 +136,14 @@ pub(crate) fn many_points(n: usize) -> Input {
 	}
 }
 
+/// A table of range deletions alone: no point, so no data block, and an index with nothing in it.
+pub(crate) fn range_deletions_alone() -> Input {
+	Input {
+		points: Vec::new(),
+		range_deletions: vec![(b"a".to_vec(), b"z".to_vec(), 7)],
+	}
+}
+
 /// Writes `input` as table `id` through `TableWriter::new`, which is what the engine does, and
 /// returns the file.
 pub(crate) fn write_table(opts: &Arc<Options>, id: u64, input: &Input) -> Vec<u8> {

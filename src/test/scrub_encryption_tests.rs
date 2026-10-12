@@ -18,6 +18,7 @@ use super::sstable_encryption_tests::{
 	flip,
 	many_points,
 	options,
+	range_deletions_alone,
 	walk,
 	write_table,
 	KEYS,
@@ -136,6 +137,44 @@ fn a_scrub_counts_the_blocks_of_all_six_kinds_of_a_plain_and_of_a_sealed_table()
 			assert_eq!(scrubbed.total_blocks, in_plain.total());
 			assert!(scrubbed.errors.is_empty(), "{scrubbed:?}");
 		}
+	}
+}
+
+#[test]
+fn a_table_of_range_deletions_alone_is_verified_and_is_not_said_to_be_damaged() {
+	// It has no data block and an index with no entry, which a walk from its footer must find
+	// empty and not corrupt: a database whose tables are healthy must pass its scrub.
+	for suite in SUITES {
+		let ctx = context(suite);
+		let sealed_opts = options(Some(&ctx), CompressionType::None, true);
+		let plain_opts = options(None, CompressionType::None, true);
+		let sealed = write_table(&sealed_opts, TABLE_ID, &range_deletions_alone());
+		let plain = write_table(&plain_opts, TABLE_ID, &range_deletions_alone());
+		let in_sealed = counts_of(&walk(&sealed_opts, &sealed, TABLE_ID));
+		let in_plain = counts_of(&walk(&plain_opts, &plain, TABLE_ID));
+		for counts in [&in_sealed, &in_plain] {
+			assert_eq!((counts.top_level_index, counts.meta_index), (1, 1), "{counts:?}");
+			assert_eq!(
+				(
+					counts.data,
+					counts.index_partitions,
+					counts.filter_partitions,
+					counts.filter_index
+				),
+				(0, 0, 0, 0),
+				"{counts:?}"
+			);
+		}
+
+		let scrubbed = scrub_one(&sealed, TABLE_ID, &keyed(suite));
+		assert_eq!(outcome(&scrubbed), (1, 0, 0), "{suite:?}: {scrubbed:?}");
+		assert_eq!(scrubbed.blocks, in_sealed, "{suite:?}");
+		assert!(scrubbed.errors.is_empty(), "{scrubbed:?}");
+
+		let scrubbed = scrub_one(&plain, TABLE_ID, &Options::default());
+		assert_eq!(outcome(&scrubbed), (1, 0, 0), "{scrubbed:?}");
+		assert_eq!(scrubbed.blocks, in_plain);
+		assert!(scrubbed.errors.is_empty(), "{scrubbed:?}");
 	}
 }
 
