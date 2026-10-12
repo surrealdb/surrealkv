@@ -2734,6 +2734,30 @@ impl Tree {
 		self.core.inner.prepare_keys()
 	}
 
+	/// Says whether the database is encrypted, with which suite, and which keys cover how many
+	/// files and bytes of each kind. It is made from the headers at the start of the files and
+	/// from the key manager, and reads no block and no key: it opens each file, one after the
+	/// other, to read its first bytes, so call it where a blocking call is allowed.
+	///
+	/// It is what to ask before a key is destroyed, see [`EncryptionStatus`]. The state of every
+	/// key id that a file names, and of the active one, is the key manager's. A database that
+	/// is not encrypted is answered at once, with nothing counted.
+	///
+	/// The shape of the answer is not settled while encryption is a preview, which is why it is
+	/// hidden from the documentation with the types that it is made of.
+	#[doc(hidden)]
+	pub fn encryption_status(&self) -> Result<crate::EncryptionStatus> {
+		let opts = &self.core.inner.opts;
+		match opts.encryption_context() {
+			None => Ok(crate::EncryptionStatus::not_encrypted()),
+			Some(context) => crate::encryption_status::scan_database(
+				&opts.path,
+				Some(context.key_manager().as_ref()),
+				Some((context.db_id(), context.suite())),
+			),
+		}
+	}
+
 	/// Closes the tree. Commits already admitted finish first, each with its real outcome, and a
 	/// commit that begins once the commit pipeline is shut down fails with
 	/// [`Error::PipelineStall`]. Checkpoints that are running, and a restore that runs, finish

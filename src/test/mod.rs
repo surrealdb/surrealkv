@@ -77,6 +77,8 @@ pub mod encryption_open_tests;
 #[cfg(test)]
 pub mod encryption_prepare_tests;
 #[cfg(test)]
+pub mod encryption_status_tests;
+#[cfg(test)]
 pub mod encryption_surfaces_tests;
 #[cfg(test)]
 pub mod encryption_typed_errors_tests;

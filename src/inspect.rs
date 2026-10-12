@@ -5,6 +5,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub use crate::describe::{describe_file, is_encrypted, CryptoSummary, FileDescription, FileState};
+// The shape of the encryption status is not settled while encryption is a preview, and it is
+// made of types that are hidden: it is hidden from the documentation too.
+#[doc(hidden)]
+pub use crate::encryption_status::{EncryptionStatus, FileTotals, KeyUsage};
 use crate::error::{EncryptionError, Error, Result};
 use crate::levels::LevelManifest;
 use crate::sstable::index_block::IndexIterator;
@@ -153,6 +157,20 @@ pub struct ScrubReport {
 	pub not_verified_tables: usize,
 	/// What was found, a line for each table that is damaged or was not verified.
 	pub errors: Vec<String>,
+}
+
+/// Says from the headers of the files of the database at `db_path` whether it is encrypted, which
+/// suite and database it has, and which keys cover how many files and bytes of each kind, without
+/// a key and without reading a block. Whatever is not as it should be is listed in the warnings: a
+/// file in the clear in an encrypted database, a file of another database or suite, a header that
+/// cannot be read. See [`EncryptionStatus`], which says when a key may be retired, and which is
+/// what `Tree::encryption_status` gives for a database that is open, with the state of each key.
+///
+/// The key states and the active key are not known to a report that is made from files alone, and
+/// are left out.
+#[doc(hidden)]
+pub fn encryption_report<P: AsRef<Path>>(db_path: P) -> Result<EncryptionStatus> {
+	crate::encryption_status::scan_database(db_path.as_ref(), None, None)
 }
 
 /// Refuses options that name a key where this build does not take one, as opening a database
