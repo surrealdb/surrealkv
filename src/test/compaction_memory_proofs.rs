@@ -6,14 +6,13 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::fs::File as SysFile;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tempfile::TempDir;
 
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::leveled::Strategy;
-use crate::error::BackgroundErrorHandler;
 use crate::levels::{write_manifest_to_disk, LevelManifest, Levels, MANIFEST_FORMAT_VERSION_V1};
 use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
@@ -209,7 +208,7 @@ fn build_l0_store(
 		active_memtable: Arc::new(RwLock::new(Arc::new(MemTable::default()))),
 		immutable_memtables: Arc::new(RwLock::new(ImmutableMemtables::default())),
 		vlog: None,
-		error_handler: Arc::new(BackgroundErrorHandler::new()),
+		manifest_uncertain: Arc::new(AtomicBool::new(false)),
 		snapshot_tracker: SnapshotTracker::new(),
 		visible_seq_num: Arc::new(AtomicU64::new(u64::MAX)),
 		after_horizon_hook: None,
