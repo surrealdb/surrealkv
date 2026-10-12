@@ -45,7 +45,7 @@ fn test_footer() {
 	assert_eq!(f2.meta_index.size(), 4);
 	assert_eq!(f2.index.offset(), 55);
 	assert_eq!(f2.index.size(), 5);
-	assert_eq!(f2.format, TableFormat::LSMV1);
+	assert_eq!(f2.format, TableFormat::LSMV2);
 	assert_eq!(f2.checksum, ChecksumType::CRC32c);
 }
 
@@ -4018,7 +4018,7 @@ fn test_table_properties_persistence() {
 
 	// Basic properties
 	assert_eq!(props.id, table_id, "Table ID should match");
-	assert_eq!(props.table_format, TableFormat::LSMV1, "Table format should be LSMV1");
+	assert_eq!(props.table_format, TableFormat::LSMV2, "Table format should be LSMV2");
 	assert_eq!(props.num_entries, 50, "Number of entries should be 50");
 	assert_eq!(props.item_count, 50, "Item count should be 50");
 	assert_eq!(props.key_count, 50, "Key count should be 50");
@@ -4057,9 +4057,10 @@ fn test_table_properties_persistence() {
 	assert!(props.block_size > 0, "Block size should be tracked");
 	assert!(props.block_count > 0, "Block count should be tracked");
 
-	// Time metrics (timestamps are 0 in this test)
+	// Time metrics: the table holds range deletes and values that have no time, so it spans every
+	// time and is never left out of a history query
 	assert_eq!(props.oldest_key_time, Some(0), "Oldest key time should be 0");
-	assert_eq!(props.newest_key_time, Some(0), "Newest key time should be 0");
+	assert_eq!(props.newest_key_time, Some(u64::MAX), "Newest key time should be the end of time");
 
 	// Range deletion metrics
 	assert_eq!(props.num_range_deletions, 5, "Should have 5 range deletions");
@@ -4806,7 +4807,8 @@ fn test_single_entry_metadata() {
 
 	// Single entry with specific values
 	let internal_key = InternalKey::new(b"only_key".to_vec(), 42, InternalKeyKind::Set);
-	writer.add(internal_key, b"only_value").unwrap();
+	let value = crate::vlog::ValueLocation::with_inline_value(b"only_value".to_vec()).encode();
+	writer.add(internal_key, &value).unwrap();
 
 	let size = writer.finish().unwrap();
 	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
@@ -4816,9 +4818,30 @@ fn test_single_entry_metadata() {
 	assert_eq!(table.meta.largest_seq_num, Some(42));
 	assert_eq!(table.meta.properties.seqnos, (42, 42));
 
-	// Both oldest and newest should be 0 (in-tree timestamps removed in V2)
+	// The value has no time, which only the versions written before it could say: the table
+	// spans every time.
 	assert_eq!(table.meta.properties.oldest_key_time, Some(0));
-	assert_eq!(table.meta.properties.newest_key_time, Some(0));
+	assert_eq!(table.meta.properties.newest_key_time, Some(u64::MAX));
+}
+
+/// A table of stamped values records the times of the versions it holds.
+#[test]
+fn test_stamped_entries_set_the_times_of_the_table() {
+	let opts = default_opts();
+	let mut buffer = Vec::new();
+	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
+	for (key, seq, time) in [("a", 3u64, 500u64), ("b", 2, 100), ("c", 1, 300)] {
+		let value = crate::vlog::ValueLocation::with_inline_value(b"v".to_vec())
+			.with_timestamp(Some(time))
+			.encode();
+		writer
+			.add(InternalKey::new(key.as_bytes().to_vec(), seq, InternalKeyKind::Set), &value)
+			.unwrap();
+	}
+	let size = writer.finish().unwrap();
+	let table = Table::new(1, opts, wrap_buffer(buffer), size as u64).unwrap();
+	assert_eq!(table.meta.properties.oldest_key_time, Some(100));
+	assert_eq!(table.meta.properties.newest_key_time, Some(500));
 }
 
 /// Tests that metadata survives encode/decode roundtrip with edge values.
@@ -4883,12 +4906,15 @@ fn test_all_zero_timestamps() {
 	let mut buffer = Vec::new();
 	let mut writer = TableWriter::new(&mut buffer, 1, Arc::clone(&opts), 0);
 
-	// All entries have timestamp = 0
+	// All entries are stamped with timestamp = 0
 	for i in 0..5 {
 		let key = format!("key_{i:02}");
 		let internal_key =
 			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
-		writer.add(internal_key, b"value").unwrap();
+		let value = crate::vlog::ValueLocation::with_inline_value(b"value".to_vec())
+			.with_timestamp(Some(0))
+			.encode();
+		writer.add(internal_key, &value).unwrap();
 	}
 
 	let size = writer.finish().unwrap();

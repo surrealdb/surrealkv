@@ -812,6 +812,9 @@ pub fn scrub_db_with_options<P: AsRef<Path>>(db_path: P, options: &Options) -> R
 					report.blocks.add(counts);
 				}
 			}
+			// A table of an older format is intact: it is read once the database is opened,
+			// which migrates it, and a count of corrupted blocks would say otherwise.
+			Err(e @ Error::LegacyFormat(_)) => return Err(e),
 			Err(e) => match &e {
 				Error::Encryption(error) => match not_verified(error) {
 					Some(why) => {

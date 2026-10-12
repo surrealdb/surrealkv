@@ -69,10 +69,11 @@ Resting and peak memory are the lowest and highest process memory sampled across
 
 - **Async Commit Pipeline**: Concurrent commit pipeline built on lock-free ring buffers and optimistic concurrency control (OCC), awaited asynchronously. Point reads and iteration are synchronous; `get_async` is an opt-in asynchronous point read.
 - **Snapshot Isolation**: Multi-version concurrency control with non-blocking concurrent reads and isolated read transactions.
+- **Versioned Queries**: Opt in with `with_versioning(true, retention_ns)`. Every write is stamped with its timestamp (`set_at`, or the time of the commit) and kept with its value. `get_at(key, ts)` reads a key as of a time, `history` returns every version of a key newest timestamp first, with its timestamp, and compaction keeps the versions for the retention period, or for ever with `0`. Versions can be written for a time in the past. It needs no value log and no index.
 - **Origin Private File System (OPFS) Primitives**: `LogStore` and `ObjectStore` implementations over `FileSystemSyncAccessHandle` for Web Workers (`surrealkv::storage::opfs`, `wasm32` only). They are not yet wired into `Tree`, so a `Tree` does not persist to OPFS yet.
-- **Automated Zero-Effort Migration**: Automatically detects and migrates legacy databases on startup in pure Rust:
-  - RocksDB BlockBasedTable formats (v2 through v7) via `surrealkv-compat-rocksdb`.
-  - SurrealKV V1 stores via `surrealkv-compat-v1`.
+- **Automated Zero-Effort Migration**: Opening an existing database converts it. The conversion is one way: the original files are moved to a backup directory inside it, but the backup is not a rollback point (the value log is shared, and its garbage collection follows the new tables), and a database that this version has opened can no longer be opened by an earlier release. Take a copy of the directory first if you may need to go back:
+  - SurrealKV v0.20 and v0.21 databases, migrated when they are opened: the retained versions with their sequence numbers and timestamps, and the unflushed write-ahead log. The old files are kept in `_surrealkv_v0_backup/`.
+  - RocksDB databases written by SurrealDB (RocksDB 8 to 11, read without linking RocksDB) via `surrealkv-compat-rocksdb`: a database that SurrealDB ran in versioned mode is migrated with the versions it stores and their timestamps (converted from SurrealDB's hybrid logical clock to nanoseconds); any other keeps the newest value of each key. Blob files and the write-ahead log are read. The database must not be open in RocksDB while it is migrated, and its files are kept in `_rocksdb_backup/`. A tree opened with `with_versioning(true, retention_ns)` keeps those versions as its retention says, and answers `get_at` and `history` for them.
   - Browser IndexedDB (`indxdb://`) data from an exported IndexedDB dump via `surrealkv-compat-indxdb`.
 - **Value Log Separation (WiscKey)**: Opt-in via `with_enable_vlog(true)`. Values larger than `vlog_value_threshold` (1 KiB by default) are stored outside the LSM tree to minimize write amplification during leveled compaction.
 - **Data Integrity**: CRC32 checksums on SSTable blocks and WAL records, verified when they are read from disk, plus the offline `skv scrub` sweep of SSTable data blocks. Continuous background scrubbing is not implemented yet.
@@ -90,8 +91,8 @@ surrealkv/
 └── crates/
     ├── surrealkv-cli/                      (Operator and developer diagnostic tool: `skv`)
     ├── surrealkv-sim/                      (Deterministic Simulation Testing & Differential Testing Harness)
-    ├── surrealkv-compat-rocksdb/           (Pure-Rust RocksDB BlockBasedTable v2-v7 Reader & Migrator)
-    ├── surrealkv-compat-v1/                (Pure-Rust SurrealKV V1 Reader & Migrator)
+    ├── surrealkv-compat-rocksdb/           (Pure-Rust Reader of SurrealDB's RocksDB databases, for migration)
+    ├── surrealkv-compat-v1/                (Standalone reader of LSMV1 databases (SurrealKV up to v0.21.4); the core converts them to LSMV2 when it opens them)
     └── surrealkv-compat-indxdb/            (Pure-Rust & WASM IndexedDB Reader & Migrator)
 ```
 
@@ -216,7 +217,7 @@ skv scrub path/to/db
 skv get path/to/db "user:001"
 skv scan path/to/db --prefix "user:"
 
-# Offline migration from RocksDB or SurrealKV V1
+# Offline migration of a RocksDB or SurrealKV (up to v0.21.4) database into a new directory (a SurrealKV database is also migrated in place when it is opened)
 skv migrate path/to/rocksdb_dir path/to/new_surrealkv_db
 ```
 

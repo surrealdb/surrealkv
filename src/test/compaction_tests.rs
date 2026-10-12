@@ -1975,7 +1975,7 @@ fn test_table_properties_population() {
 
 	// Verify Properties fields
 	assert_eq!(props.id, table_id);
-	assert_eq!(props.table_format, TableFormat::LSMV1);
+	assert_eq!(props.table_format, TableFormat::LSMV2);
 	assert_eq!(props.num_entries, 100);
 	assert_eq!(props.item_count, 100);
 	assert_eq!(props.key_count, 100);
@@ -1997,9 +1997,10 @@ fn test_table_properties_population() {
 		"Raw sizes should be == data_size"
 	);
 
-	// Verify time metrics (timestamps are 0 in this test)
-	assert_eq!(props.oldest_key_time, Some(0), "Oldest key time is 0 in test");
-	assert_eq!(props.newest_key_time, Some(0), "Newest key time is 0 in test");
+	// Verify time metrics: the table holds range deletes, which hide versions in other tables
+	// whatever their own time, so it spans every time and is never left out of a history query
+	assert_eq!(props.oldest_key_time, Some(0), "Oldest key time is 0");
+	assert_eq!(props.newest_key_time, Some(u64::MAX), "Newest key time is the end of time");
 
 	// Verify range deletion metrics
 	assert_eq!(props.num_range_deletions, 5, "Should have 5 range deletions (every 20th key)");

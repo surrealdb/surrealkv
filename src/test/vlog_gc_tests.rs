@@ -1583,6 +1583,66 @@ async fn a_checkpoint_restored_into_a_live_tree_reads_every_value_and_new_values
 	crash(&tree);
 }
 
+/// A tree opened without a value log cannot read a pointer. A checkpoint whose tables hold values
+/// in the value log is refused before anything of the tree is removed, instead of restoring and
+/// reporting success while every such read fails until the directory is opened again.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn a_checkpoint_with_values_in_the_value_log_is_refused_by_a_tree_without_one() {
+	let dir = TempDir::new("vlog_gc_restore_refused_source").unwrap();
+	let ckpt = TempDir::new("vlog_gc_restore_refused_copy").unwrap();
+	let target = TempDir::new("vlog_gc_restore_refused_target").unwrap();
+	let dest = ckpt.path().join("copy");
+	let tree = quiet_tree(dir.path()).await;
+	two_rounds_in_two_tables(&tree).await;
+	tree.create_checkpoint(&dest).unwrap();
+
+	let other = quiet_tree_with(Options {
+		enable_vlog: false,
+		..base_options(target.path())
+	})
+	.await;
+	let mut kept = Model::default();
+	put_and_flush(&other, &mut kept, 500..510, 7).await;
+
+	let err = other.restore_from_checkpoint(&dest).expect_err("the tree has no value log");
+	assert!(matches!(&err, crate::Error::InvalidArgument(m) if m.contains("value log")), "{err:?}");
+	assert!(!target.path().join("RESTORE_IN_PROGRESS").exists(), "nothing was started");
+	assert_model(&other, &kept, "after the refused restore");
+	crash(&other);
+	crash(&tree);
+}
+
+/// A checkpoint of a tree with a value log whose tables point into none restores into a tree
+/// without one: nothing in it needs the log.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
+async fn a_checkpoint_with_no_pointers_restores_into_a_tree_without_a_value_log() {
+	let dir = TempDir::new("vlog_gc_restore_inline_source").unwrap();
+	let ckpt = TempDir::new("vlog_gc_restore_inline_copy").unwrap();
+	let target = TempDir::new("vlog_gc_restore_inline_target").unwrap();
+	let dest = ckpt.path().join("copy");
+	let tree = quiet_tree(dir.path()).await;
+	let mut model = Model::default();
+	let mut inline = Contents::new();
+	for i in 0..8 {
+		inline.insert(key_of(i), format!("inline_{i}").into_bytes());
+	}
+	let entries: Vec<_> = inline.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+	commit(&tree, &entries, Durability::Immediate).await.unwrap();
+	model.put(inline);
+	flush_to_tables(&tree);
+	tree.create_checkpoint(&dest).unwrap();
+
+	let other = quiet_tree_with(Options {
+		enable_vlog: false,
+		..base_options(target.path())
+	})
+	.await;
+	other.restore_from_checkpoint(&dest).unwrap();
+	assert_model(&other, &model, "after the restore");
+	crash(&other);
+	crash(&tree);
+}
+
 // ---------------------------------------------------------------------------
 // 5. crashes around the cleanup
 // ---------------------------------------------------------------------------

@@ -1575,11 +1575,12 @@ dependencies = [
 name = "surrealkv-compat-rocksdb"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
  "lz4_flex",
+ "rustix",
  "snap",
  "tempfile",
  "thiserror",
+ "xxhash-rust",
  "zstd",
 ]
 
@@ -1592,7 +1593,6 @@ dependencies = [
  "snap",
  "tempfile",
  "thiserror",
- "zstd",
 ]
 
 [[package]]

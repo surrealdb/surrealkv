@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{BackgroundErrorHandler, Result};
-use crate::iter::{BoxedLSMIterator, CompactionIterator};
+use crate::iter::{BoxedLSMIterator, CompactionIterator, History};
 use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
 use crate::lsm::{cleanup_vlog, CoreInner};
 use crate::memtable::{ImmutableMemtables, MemTable};
@@ -283,6 +283,60 @@ impl Compactor {
 		// Create a compaction iterator that filters tombstones and respects snapshots
 		let max_level = self.options.lopts.level_count - 1;
 		let is_bottom_level = input.target_level >= max_level;
+		// A versioned tree keeps the history of its keys, as long as its retention says. The time
+		// the period starts at is read once for the whole compaction.
+		let lopts = &self.options.lopts;
+		let history = if !lopts.enable_versioning {
+			History::Latest
+		} else if lopts.versioned_history_retention_ns == 0 {
+			History::All
+		} else {
+			History::Since(lopts.clock.now().saturating_sub(lopts.versioned_history_retention_ns))
+		};
+		// A period of history keeps the version a read at its start sees, and readers read the
+		// range deletions of every table, whereas a range deletion is in the table of its start
+		// key and a compaction reads the tables that overlap its keys: those of the tables it
+		// does not read, that cover keys it reads, are needed to know which versions are history.
+		let mut history_range_deletions = Vec::new();
+		if matches!(history, History::Since(_)) {
+			if let Ok(manifest) = self.options.level_manifest.read() {
+				let reads: std::collections::HashSet<u64> =
+					input.tables_to_merge.iter().copied().collect();
+				let (mut lowest, mut highest): (Option<Vec<u8>>, Option<Vec<u8>>) = (None, None);
+				for &tid in &input.tables_to_merge {
+					let Some(t) = manifest.find_table_by_id(tid) else {
+						continue;
+					};
+					let (Some(small), Some(large)) =
+						(t.meta.smallest_point.as_ref(), t.meta.largest_point.as_ref())
+					else {
+						continue;
+					};
+					if lowest.as_ref().is_none_or(|l| small.user_key < *l) {
+						lowest = Some(small.user_key.clone());
+					}
+					if highest.as_ref().is_none_or(|h| large.user_key > *h) {
+						highest = Some(large.user_key.clone());
+					}
+				}
+				if let (Some(lowest), Some(highest)) = (lowest, highest) {
+					for table in manifest.iter() {
+						if reads.contains(&table.meta.properties.id) {
+							continue;
+						}
+						for (start, end, seq) in table.range_deletions.read().iter() {
+							// [start, end) meets [lowest, highest]
+							if *start <= highest && *end > lowest {
+								history_range_deletions.push((start.clone(), end.clone(), *seq));
+							}
+						}
+					}
+				}
+			}
+		}
+		// Every table that a compaction wrote a range deletion to has it
+		history_range_deletions.sort_unstable();
+		history_range_deletions.dedup();
 		let mut comp_iter = CompactionIterator::new(
 			merge_iter,
 			Arc::clone(&self.options.lopts.internal_comparator) as Arc<dyn Comparator>,
@@ -290,6 +344,8 @@ impl Compactor {
 			snapshots,
 			horizon,
 		)
+		.with_history(history)
+		.with_history_range_deletions(history_range_deletions)
 		.with_range_deletions(range_deletions.clone());
 
 		let target_file_size = self.options.lopts.target_file_size;

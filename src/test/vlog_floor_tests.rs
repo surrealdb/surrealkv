@@ -26,6 +26,7 @@ use crate::levels::write_manifest_to_disk;
 use crate::lsm::{cleanup_vlog, vlog_floor, CompactionOperations, FlushHook};
 use crate::memtable::MemTable;
 use crate::ring::PipelineHook;
+use crate::sstable::table::{TableFormat, TABLE_FULL_FOOTER_LENGTH};
 use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{Durability, InternalKeyKind, Mode, Options, Tree};
 
@@ -241,6 +242,20 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 			std::fs::copy(entry.path(), &to).unwrap();
 		}
 	}
+}
+
+/// Stamps table `id` of the database in `dir` as written by an engine before `TableFormat::LSMV2`,
+/// as the tables of the older engines are, which may not have kept the value-log property: the
+/// footer carries a magic number but no checksum.
+fn stamp_as_older(dir: &Path, id: u64) {
+	use std::io::{Seek, SeekFrom, Write};
+
+	let path = dir.join("sstables").join(format!("{id:020}.sst"));
+	let len = std::fs::metadata(&path).unwrap().len();
+	let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+	file.seek(SeekFrom::Start(len - TABLE_FULL_FOOTER_LENGTH as u64)).unwrap();
+	file.write_all(&[TableFormat::LSMV1 as u8]).unwrap();
+	file.sync_all().unwrap();
 }
 
 /// Rotates the active memtable into the queue and flushes the queue.
@@ -670,11 +685,12 @@ async fn tables_that_point_nowhere_hold_nothing_back_but_a_fresh_database_delete
 	crash(&tree);
 }
 
-/// A table that was opened from disk and names no file may point into the log all the same, as
-/// the tables of a database written by an older version do: nothing is deleted until a
-/// compaction has written the table again.
+/// A table of an older engine that was opened from disk and names no file may point into the log
+/// all the same, as the tables of SurrealKV before v0.20 do, which kept no such property: nothing
+/// is deleted until a compaction has written the table again. The footer says which engine wrote
+/// a table: the older tables are stamped as such here.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
-async fn a_table_opened_from_disk_that_names_no_file_keeps_the_log_until_it_is_rewritten() {
+async fn a_table_of_an_older_engine_that_names_no_file_keeps_the_log_until_it_is_rewritten() {
 	let root = TempDir::new("vlog_floor_unknown").unwrap();
 	let live = root.path().join("live");
 	let tree = quiet_tree(&live).await;
@@ -690,6 +706,9 @@ async fn a_table_opened_from_disk_that_names_no_file_keeps_the_log_until_it_is_r
 	let image = root.path().join("image");
 	copy_dir_all(&live, &image);
 	crash(&tree);
+	for id in table_ids(&tree) {
+		stamp_as_older(&image, id);
+	}
 
 	let reopened = quiet_tree(&image).await;
 	assert_eq!(floor(&reopened), 0, "the tables were opened from disk");
@@ -705,6 +724,86 @@ async fn a_table_opened_from_disk_that_names_no_file_keeps_the_log_until_it_is_r
 		vec![reopened.core.inner.vlog.as_ref().unwrap().active_writer_id.load(Ordering::SeqCst)],
 		"only the active file is left"
 	);
+	crash(&reopened);
+}
+
+/// The tables this engine writes say what they point into, and a table that names no file points
+/// into none: reopened, the log that nothing points into is collected at once, instead of waiting
+/// for a compaction to write every such table again.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_table_of_this_engine_that_names_no_file_points_nowhere_after_a_restart() {
+	let root = TempDir::new("vlog_floor_known").unwrap();
+	let live = root.path().join("live");
+	let tree = quiet_tree(&live).await;
+	let mut expected = Contents::new();
+	for round in 1..=2 {
+		let entry = (key_of(round), small(round, 1));
+		commit(&tree, std::slice::from_ref(&entry), Durability::Immediate).await.unwrap();
+		expected.insert(entry.0, entry.1);
+		flush_to_tables(&tree);
+	}
+	roll_past(&tree, 3);
+	assert!(vlog_files(&live).len() >= 3);
+	let image = root.path().join("image");
+	copy_dir_all(&live, &image);
+	crash(&tree);
+
+	let reopened = quiet_tree(&image).await;
+	assert_eq!(tables_min(&reopened), 0, "the tables point into no file");
+	assert_eq!(floor(&reopened), u32::MAX, "and are known to");
+	cleanup(&reopened);
+	assert_eq!(
+		vlog_files(&image),
+		vec![reopened.core.inner.vlog.as_ref().unwrap().active_writer_id.load(Ordering::SeqCst)],
+		"only the active file is left"
+	);
+	assert_reads(&reopened, &expected, "after the cleanup");
+	crash(&reopened);
+}
+
+/// What the tables that name a file say does not settle what a table of an older engine that
+/// names none points into: its files can be below theirs. The bound is 0 while it is there, and
+/// the files below the others' are kept until a compaction has written it again.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_table_of_an_older_engine_that_names_no_file_holds_the_log_back_next_to_tables_that_do() {
+	let root = TempDir::new("vlog_floor_mixed").unwrap();
+	let live = root.path().join("live");
+	let tree = quiet_tree(&live).await;
+	let mut expected = Contents::new();
+	let entry = (b"inline".to_vec(), small(0, 1));
+	commit(&tree, std::slice::from_ref(&entry), Durability::Immediate).await.unwrap();
+	expected.insert(entry.0, entry.1);
+	flush_to_tables(&tree);
+	let older = table_ids(&tree)[0];
+	// Files that nothing points into, and a table that points into the ones after them. The
+	// cleanup the flush runs is held off, so that the image has the files below it.
+	roll_past(&tree, 3);
+	let pin = tree.core.inner.vlog.as_ref().unwrap().pin_files();
+	expected.extend(put(&tree, 0..4, 1).await);
+	flush_to_tables(&tree);
+	let named = tables_min(&tree);
+	assert!(named > 4, "the second table names a file past the others: {named}");
+	let files = vlog_files(&live);
+	assert!(files[0] < named, "files below it: {files:?}");
+	let image = root.path().join("image");
+	copy_dir_all(&live, &image);
+	drop(pin);
+	crash(&tree);
+	stamp_as_older(&image, older);
+
+	let reopened = quiet_tree(&image).await;
+	assert_eq!(tables_min(&reopened), named, "one table names a file, and the other none");
+	assert_eq!(floor(&reopened), 0, "the table that names none may point below it");
+	cleanup(&reopened);
+	assert_eq!(vlog_files(&image), files, "nothing was deleted");
+	assert_reads(&reopened, &expected, "reopened");
+
+	compact(&reopened);
+	assert_eq!(floor(&reopened), named, "the table is written again, and says what it holds");
+	cleanup(&reopened);
+	let left = vlog_files(&image);
+	assert!(left.iter().all(|&file| file >= named), "files below {named} are left: {left:?}");
+	assert_reads(&reopened, &expected, "after the compaction");
 	crash(&reopened);
 }
 

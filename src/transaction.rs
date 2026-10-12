@@ -99,8 +99,8 @@ impl Default for TransactionOptions {
 /// like set() and delete().
 #[derive(Default, Debug, Clone, PartialEq)]
 pub struct WriteOptions {
-	/// Optional timestamp for the write operation. If None, uses the current
-	/// timestamp.
+	/// Optional timestamp for the write operation, in nanoseconds. If None, uses the time of the
+	/// commit, and so does 0. A tree that is not versioned does not keep it.
 	pub timestamp: Option<u64>,
 }
 
@@ -322,6 +322,10 @@ pub struct Transaction {
 	/// savepoints and rollbacks.
 	pub(crate) write_set: BTreeMap<Key, Vec<Entry>>,
 
+	/// How many range deletes the write set holds, so that a read that has no use for them does
+	/// not look through the write set for any.
+	range_deletes: usize,
+
 	/// `read_set` holds the keys registered via [`get_for_update`] for
 	/// commit-time conflict validation, each mapped to the savepoint number
 	/// at which it was first registered. These keys join the write-set keys
@@ -418,6 +422,7 @@ impl Transaction {
 			snapshot,
 			core,
 			write_set: BTreeMap::new(),
+			range_deletes: 0,
 			read_set: BTreeMap::new(),
 			durability,
 			closed: false,
@@ -438,7 +443,8 @@ impl Transaction {
 		self.set_with_options(key, value, &WriteOptions::default())
 	}
 
-	/// Inserts a key-value pair at with a specific timestamp.
+	/// Inserts a key-value pair with a specific timestamp, in nanoseconds, which a tree that is
+	/// not versioned does not keep. A timestamp of 0 is the time of the commit.
 	pub fn set_at<K, V>(&mut self, key: K, value: V, timestamp: u64) -> Result<()>
 	where
 		K: IntoBytes,
@@ -567,6 +573,49 @@ impl Transaction {
 		Ok(())
 	}
 
+	/// The range deletes of the write set, as `(start, end, seqno)`.
+	fn pending_range_deletes(&self) -> Vec<(&[u8], &[u8], u32)> {
+		if self.range_deletes == 0 {
+			return Vec::new();
+		}
+		self.write_set
+			.iter()
+			.flat_map(|(start, entries)| {
+				entries.iter().filter_map(move |entry| {
+					(entry.kind == InternalKeyKind::RangeDelete)
+						.then_some(entry.value.as_deref())
+						.flatten()
+						.map(|end| (start.as_slice(), end, entry.seqno))
+				})
+			})
+			.collect()
+	}
+
+	/// The latest range delete of the write set that covers `key`, if there is one.
+	fn pending_range_delete(&self, key: &[u8]) -> Option<&Entry> {
+		if self.range_deletes == 0 {
+			return None;
+		}
+		let mut latest: Option<&Entry> = None;
+		for (start, entries) in &self.write_set {
+			for entry in entries {
+				if entry.kind != InternalKeyKind::RangeDelete {
+					continue;
+				}
+				let Some(end) = entry.value.as_ref() else {
+					continue;
+				};
+				if key >= start.as_slice()
+					&& key < end.as_slice()
+					&& latest.is_none_or(|prev| entry.seqno > prev.seqno)
+				{
+					latest = Some(entry);
+				}
+			}
+		}
+		latest
+	}
+
 	/// Gets a value for a key if it exists.
 	pub fn get<K>(&self, key: K) -> Result<Option<Value>>
 	where
@@ -646,30 +695,51 @@ impl Transaction {
 			return Err(Error::InvalidArgument("Versioned queries not enabled".to_string()));
 		}
 
-		// RYOW: Check write set first for uncommitted writes
-		if let Some(entries) = self.write_set.get(key.as_slice()) {
-			if let Some(entry) = entries.last() {
-				// Hard delete wipes all history - return None regardless of timestamp
-				if entry.is_hard_delete() {
-					return Ok(None);
-				}
-
-				// Write set entry is visible if its timestamp <= query timestamp
-				if entry.timestamp <= timestamp {
-					if entry.is_tombstone() {
-						return Ok(None);
-					}
-					return Ok(entry.value.clone());
-				}
-				// entry.timestamp > timestamp: write is "from the future", check storage
+		// RYOW: the version of the write set that answers at `timestamp`, as it would once
+		// committed. A write of the transaction at a time that has not come is not a candidate,
+		// and one to be stamped with the time of its commit is after every time that has passed.
+		let range_delete = self.pending_range_delete(key.as_slice());
+		// What the snapshot holds for the key is hidden by a delete of the transaction
+		let mut snapshot_hidden = range_delete.is_some();
+		let mut best: Option<&Entry> = None;
+		for entry in self.write_set.get(key.as_slice()).into_iter().flatten() {
+			// A range delete of the transaction that came after the write hides it
+			if range_delete.is_some_and(|r| r.seqno > entry.seqno) {
+				continue;
+			}
+			// A hard delete wipes all history before it, and a replace as well
+			if entry.is_hard_delete() {
+				best = None;
+				snapshot_hidden = true;
+				continue;
+			}
+			if entry.kind == InternalKeyKind::Replace {
+				best = None;
+				snapshot_hidden = true;
+			}
+			let time = entry.effective_timestamp();
+			// Of versions of one time the newest write is the answer
+			if time <= timestamp && best.is_none_or(|b| time >= b.effective_timestamp()) {
+				best = Some(entry);
 			}
 		}
 
-		// Query the versioned index through the snapshot
-		match &self.snapshot {
-			Some(snapshot) => snapshot.get_at(key.as_slice(), timestamp),
-			None => Err(Error::NoSnapshot),
-		}
+		// What the snapshot holds of the key, as of the time
+		let stored = match &self.snapshot {
+			Some(_) if snapshot_hidden => None,
+			Some(snapshot) => snapshot.version_at(key.as_slice(), timestamp)?,
+			None => return Err(Error::NoSnapshot),
+		};
+
+		// A write of the transaction is newer than a stored version of the same time
+		let version = match (best, stored) {
+			(Some(entry), Some(stored)) if stored.time > entry.effective_timestamp() => {
+				stored.value
+			}
+			(Some(entry), _) => (!entry.is_tombstone()).then(|| entry.value.clone()).flatten(),
+			(None, stored) => stored.and_then(|stored| stored.value),
+		};
+		Ok(version)
 	}
 
 	/// Asynchronously gets a value for a key from the database.
@@ -688,19 +758,7 @@ impl Transaction {
 			return Err(Error::TransactionWriteOnly);
 		}
 
-		let mut range_delete_entry = None;
-		for (start, entries) in &self.write_set {
-			if let Some(entry) = entries.last() {
-				if entry.kind == InternalKeyKind::RangeDelete {
-					if let Some(ref end) = entry.value {
-						let k = key_slice;
-						if k >= start.as_slice() && k < end.as_slice() {
-							range_delete_entry = Some(entry);
-						}
-					}
-				}
-			}
-		}
+		let range_delete_entry = self.pending_range_delete(key_slice);
 
 		if let Some(last_entry) = self.write_set.get(key_slice).and_then(|entries| entries.last()) {
 			if let Some(r) = range_delete_entry {
@@ -749,25 +807,7 @@ impl Transaction {
 
 		// RYOW semantics: Read your own writes. If the value is in the write set,
 		// return it.
-		let mut range_delete_entry: Option<&Entry> = None;
-		for (start, entries) in &self.write_set {
-			for entry in entries {
-				if entry.kind == InternalKeyKind::RangeDelete {
-					if let Some(ref end) = entry.value {
-						let k = key.as_slice();
-						if k >= start.as_slice() && k < end.as_slice() {
-							if let Some(prev) = range_delete_entry {
-								if entry.seqno > prev.seqno {
-									range_delete_entry = Some(entry);
-								}
-							} else {
-								range_delete_entry = Some(entry);
-							}
-						}
-					}
-				}
-			}
-		}
+		let range_delete_entry = self.pending_range_delete(key.as_slice());
 
 		if let Some(last_entry) =
 			self.write_set.get(key.as_slice()).and_then(|entries| entries.last())
@@ -851,7 +891,8 @@ impl Transaction {
 
 	/// Gets keys in a key range at a specific timestamp.
 	///
-	/// Gets keys and values in a range, at the current timestamp.
+	/// Gets the newest value of each key in a range, as of the transaction, with the writes of the
+	/// transaction itself.
 	///
 	/// Returns a cursor-based iterator implementing `LSMIterator` with explicit
 	/// seek/next/prev methods. Use `seek_first()` to position at the first key,
@@ -867,13 +908,12 @@ impl Transaction {
 	/// iter.seek_first()?;
 	/// while iter.valid() {
 	///     let key = iter.key().user_key();
-	///     let ts = iter.key().timestamp();
 	///     let value = iter.value()?;
 	///     iter.next()?;
 	/// }
 	///
 	/// // Or seek to a specific key:
-	/// iter.seek(b"foo")?;  // Position at first version of "foo"
+	/// iter.seek(b"foo")?;  // Position at "foo", or the first key after it
 	/// ```
 	pub fn range<K>(&self, start: K, end: K) -> Result<impl LSMIterator + '_>
 	where
@@ -902,11 +942,11 @@ impl Transaction {
 
 	/// Returns a unified history iterator over ALL versions of keys in the range.
 	///
-	/// Returns an iterator implementing `LSMIterator`, providing a unified
-	/// streaming API regardless of whether the B+tree index is enabled.
-	///
-	/// - If B+tree index is enabled: Uses streaming B+tree iteration
-	/// - If B+tree index is disabled: Uses LSM-based versioned iteration
+	/// Returns an iterator implementing `LSMIterator`. The versions of a key come newest
+	/// timestamp first, and the newest write first among those of one timestamp; the keys come in
+	/// order. A write of the transaction that is to be given the time of its commit is reported
+	/// at `u64::MAX` until it is committed, and a version written while the tree was not
+	/// versioned is reported at the time it reads at, that of the versions written before it.
 	///
 	/// # Arguments
 	/// * `start` - Start key (inclusive)
@@ -969,7 +1009,7 @@ impl Transaction {
 			Some(end.as_slice()),
 			opts.include_tombstones,
 			opts.ts_range,
-			opts.limit,
+			None,
 		)?;
 
 		// RYOW: Collect write-set entries in the key range
@@ -978,34 +1018,72 @@ impl Transaction {
 		let mut hard_delete_keys: std::collections::HashSet<&[u8]> =
 			std::collections::HashSet::new();
 
+		// The range deletes of the transaction: they hide what the snapshot holds for the keys
+		// they cover, as a hard delete does for its key.
+		let pending_ranges = self.pending_range_deletes();
+
 		for (key, entry_list) in
 			self.write_set.range(start.as_slice().to_vec()..end.as_slice().to_vec())
 		{
-			if let Some(entry) = entry_list.last() {
-				// Hard deletes wipe all history - track them separately
-				if entry.is_hard_delete() {
-					hard_delete_keys.insert(key.as_slice());
-					// Hard deletes are never returned (even with include_tombstones)
+			// Every write of the transaction to the key is a version, oldest write first, but
+			// for those that another write of the same time supersedes
+			// (a write at the time of the commit is not one at the time it is reported at)
+			let superseded = Entry::superseded(entry_list, |entry| {
+				(entry.timestamp == Entry::COMMIT_TIME, entry.effective_timestamp())
+			});
+			let mut versions: Vec<&Entry> = Vec::new();
+			for (at, entry) in entry_list.iter().enumerate() {
+				let superseded =
+					superseded.as_ref().map_or(Superseded::Kept, |outcome| outcome[at]);
+				// A range delete of the transaction that came after the write hides it
+				if pending_ranges.iter().any(|(s, e, seqno)| {
+					*seqno > entry.seqno && key.as_slice() >= *s && key.as_slice() < *e
+				}) {
 					continue;
 				}
-
-				// Filter by timestamp range if specified
-				if let Some((ts_start, ts_end)) = opts.ts_range {
-					if entry.timestamp >= ts_start && entry.timestamp <= ts_end {
-						write_set_entries.push((key, entry));
-					}
-				} else {
-					write_set_entries.push((key, entry));
+				// Hard deletes wipe all history before them - track them separately. They are
+				// never returned (even with include_tombstones).
+				if entry.is_hard_delete() {
+					hard_delete_keys.insert(key.as_slice());
+					versions.clear();
+					continue;
+				}
+				// A replace is a version, and wipes the history before it
+				if entry.kind == InternalKeyKind::Replace {
+					hard_delete_keys.insert(key.as_slice());
+					versions.clear();
+				}
+				if superseded == Superseded::Kept {
+					versions.push(entry);
 				}
 			}
+			// Newest timestamp first, and the newest write first among those of one timestamp
+			versions.sort_by(|a, b| {
+				b.effective_timestamp().cmp(&a.effective_timestamp()).then(b.seqno.cmp(&a.seqno))
+			});
+			for entry in versions {
+				// Filter by timestamp range if specified
+				if let Some((ts_start, ts_end)) = opts.ts_range {
+					let timestamp = entry.effective_timestamp();
+					if timestamp < ts_start || timestamp > ts_end {
+						continue;
+					}
+				}
+				write_set_entries.push((key, entry));
+			}
 		}
+
+		let pending_ranges: Vec<(Vec<u8>, Vec<u8>)> =
+			pending_ranges.into_iter().map(|(s, e, _)| (s.to_vec(), e.to_vec())).collect();
 
 		Ok(TransactionHistoryIterator::new(
 			inner,
 			Arc::clone(&self.core),
 			write_set_entries,
 			hard_delete_keys,
+			pending_ranges,
 			opts.include_tombstones,
+			opts.limit,
 		))
 	}
 
@@ -1028,41 +1106,79 @@ impl Transaction {
 
 		// Add the entry to the write set
 		let key = e.key.clone();
+		if e.kind == InternalKeyKind::RangeDelete {
+			self.range_deletes += 1;
+		}
 
 		match self.write_set.entry(key) {
 			BTreeEntry::Occupied(mut oe) => {
 				let entries = oe.get_mut();
-				// If the latest existing value for this key belongs to the same
-				// savepoint as the value we are about to write, then we can
-				// overwrite it with the new value (same savepoint = same transaction state).
-				// For different savepoints, we add a new entry to support savepoint rollbacks.
-				//
-				// Exception: When using explicit timestamps (set_at), entries with
-				// different timestamps should be preserved as separate versions, not replaced.
-				if let Some(last_entry) = entries.last() {
-					if last_entry.savepoint_no == e.savepoint_no
-						&& last_entry.kind != InternalKeyKind::RangeDelete
-						&& e.kind != InternalKeyKind::RangeDelete
-					{
-						let last_has_explicit_ts = last_entry.timestamp != Entry::COMMIT_TIME;
-						let new_has_explicit_ts = e.timestamp != Entry::COMMIT_TIME;
-
-						if last_has_explicit_ts
-							&& new_has_explicit_ts
-							&& last_entry.timestamp != e.timestamp
-						{
-							// Different explicit timestamps - keep both versions
+				// A write that the transaction's latest write to this key makes irrelevant
+				// replaces it, as long as both are of the same savepoint: those of different
+				// savepoints stay apart so that a rollback to a savepoint can restore what was
+				// there before it. Otherwise this adds an entry, and what one version of the
+				// key at one time leaves out of the others is decided when the writes are read
+				// or committed, see `Entry::superseded`.
+				let savepoint = e.savepoint_no;
+				if self.core.opts.enable_versioning {
+					match e.kind {
+						// A hard delete or a replace wipes the history of the key, so it makes
+						// every earlier write of the savepoint irrelevant. A range delete under
+						// the key hides what is written before it, and stays.
+						InternalKeyKind::Delete | InternalKeyKind::Replace => {
+							entries.retain(|earlier| {
+								earlier.savepoint_no != savepoint
+									|| earlier.kind == InternalKeyKind::RangeDelete
+							});
 							entries.push(e);
-						} else {
-							// Same timestamp or using commit time - replace
-							*entries.last_mut().unwrap() = e;
 						}
-					} else {
-						// Different savepoint or range delete - add new entry
-						entries.push(e);
+						// A version replaces one that was written at the same time. A hard
+						// delete or a replace is not replaced by it, as that would leave the
+						// history before it in place.
+						InternalKeyKind::Set | InternalKeyKind::SoftDelete => {
+							// Of the last few writes, the one of the same time, which this
+							// supersedes (or a hard delete or a replace after it hides): a key
+							// that is written at a few times in turn stays as short as they are
+							let from = entries.len().saturating_sub(8);
+							let same_time = entries[from..]
+								.iter()
+								.rposition(|earlier| {
+									earlier.savepoint_no == savepoint
+										&& matches!(
+											earlier.kind,
+											InternalKeyKind::Set | InternalKeyKind::SoftDelete
+										)
+										&& earlier.timestamp == e.timestamp
+								})
+								.map(|at| from + at);
+							match same_time {
+								Some(at) if at + 1 == entries.len() => entries[at] = e,
+								Some(at) => {
+									entries.remove(at);
+									entries.push(e);
+								}
+								None => entries.push(e),
+							}
+						}
+						_ => entries.push(e),
 					}
 				} else {
-					entries.push(e);
+					// Without versioning there is no history for a hard delete to wipe or for
+					// times to tell apart: a write replaces the latest one of its savepoint,
+					// unless both were given different times.
+					let replaces = entries.last().is_some_and(|last| {
+						last.savepoint_no == savepoint
+							&& last.kind != InternalKeyKind::RangeDelete
+							&& e.kind != InternalKeyKind::RangeDelete
+							&& !(last.timestamp != Entry::COMMIT_TIME
+								&& e.timestamp != Entry::COMMIT_TIME
+								&& last.timestamp != e.timestamp)
+					});
+					if replaces {
+						*entries.last_mut().unwrap() = e;
+					} else {
+						entries.push(e);
+					}
 				}
 			}
 			BTreeEntry::Vacant(ve) => {
@@ -1139,12 +1255,47 @@ impl Transaction {
 
 		// Extract the vector of entries for the current transaction,
 		// respecting the insertion order recorded with Entry::seqno.
-		let mut latest_writes: Vec<Entry> =
-			std::mem::take(&mut self.write_set).into_values().flatten().collect();
-		latest_writes.sort_by_key(|a| a.seqno);
-
 		// Generate a single timestamp for this commit
 		let commit_timestamp = self.core.opts.clock.now();
+
+		// What a transaction writes to a key at one time is one version of it: the last of its
+		// writes, and not the states in between that a savepoint kept apart.
+		let mut latest_writes: Vec<Entry> = Vec::new();
+		let versioned = self.core.opts.enable_versioning;
+		for (_, entries) in std::mem::take(&mut self.write_set) {
+			// A tree that is not versioned has no history for more than one version of a key to
+			// be in: its writes are logged as they are.
+			if !versioned {
+				latest_writes.extend(entries);
+				continue;
+			}
+			let outcome = Entry::superseded(&entries, |entry| {
+				(
+					false,
+					if entry.timestamp == Entry::COMMIT_TIME {
+						commit_timestamp
+					} else {
+						entry.timestamp
+					},
+				)
+			});
+			let Some(outcome) = outcome else {
+				latest_writes.extend(entries);
+				continue;
+			};
+			for (mut entry, outcome) in entries.into_iter().zip(outcome) {
+				match outcome {
+					Superseded::Kept => {}
+					Superseded::Dropped => continue,
+					Superseded::BarrierOnly => {
+						entry.kind = InternalKeyKind::Delete;
+						entry.value = None;
+					}
+				}
+				latest_writes.push(entry);
+			}
+		}
+		latest_writes.sort_by_key(|a| a.seqno);
 
 		// Add all entries to the batch
 		for entry in latest_writes {
@@ -1170,6 +1321,7 @@ impl Transaction {
 	pub fn rollback(&mut self) {
 		self.closed = true;
 		self.write_set.clear();
+		self.range_deletes = 0;
 		self.read_set.clear();
 		self.snapshot.take();
 		self.savepoints = 0;
@@ -1232,6 +1384,12 @@ impl Transaction {
 
 		// Remove keys with no entries left after the rollback above.
 		self.write_set.retain(|_, entries| !entries.is_empty());
+		self.range_deletes = self
+			.write_set
+			.values()
+			.flatten()
+			.filter(|entry| entry.kind == InternalKeyKind::RangeDelete)
+			.count();
 
 		// Release locked reads first acquired since the last call to
 		// set_savepoint().
@@ -1294,6 +1452,17 @@ impl Entry {
 		}
 	}
 
+	/// The time of the write for ordering and reporting: its own, or, for one that is to be
+	/// stamped with the time of the commit, the newest there is: it is after every version that
+	/// exists, and only a read at the end of time sees it.
+	fn effective_timestamp(&self) -> u64 {
+		if self.timestamp == Self::COMMIT_TIME {
+			u64::MAX
+		} else {
+			self.timestamp
+		}
+	}
+
 	/// Checks if this entry represents a deletion (tombstone)
 	fn is_tombstone(&self) -> bool {
 		let kind = self.kind;
@@ -1311,6 +1480,72 @@ impl Entry {
 	fn is_hard_delete(&self) -> bool {
 		self.kind == InternalKeyKind::Delete || self.kind == InternalKeyKind::RangeDelete
 	}
+
+	/// Whether this entry is a version of its key, a write that has a time: a hard delete and a
+	/// range delete are not.
+	fn is_version(&self) -> bool {
+		matches!(
+			self.kind,
+			InternalKeyKind::Set | InternalKeyKind::SoftDelete | InternalKeyKind::Replace
+		)
+	}
+
+	/// What becomes of each of the writes of a transaction to one key, in the order they were
+	/// done in, once a version that another of them supersedes is taken out; `None` if there is
+	/// nothing to take out.
+	///
+	/// A transaction is atomic: what it writes to a key at one time is one version of it, the
+	/// last of its writes, and the others are states that no one could have read, whether
+	/// they were done under another savepoint or not. Writes at different times are different
+	/// versions. `time_of` tells the time a write is given, and whether it is that of the commit
+	/// that is not known yet: those of two writes are the same when both parts are.
+	///
+	/// A replace that another write supersedes is not a version any more, but it still wipes
+	/// the history of the key.
+	fn superseded(
+		entries: &[Entry],
+		time_of: impl Fn(&Entry) -> (bool, u64),
+	) -> Option<Vec<Superseded>> {
+		if entries.len() < 2 {
+			return None;
+		}
+		let mut outcome: Option<Vec<Superseded>> = None;
+		// A key is written once or twice, or a few times: a set is for one written many times
+		let mut few: Vec<(bool, u64)> = Vec::new();
+		let mut many = std::collections::HashSet::new();
+		let mut first_of_its_time = |time: (bool, u64)| {
+			if entries.len() <= 16 {
+				let new = !few.contains(&time);
+				few.push(time);
+				new
+			} else {
+				many.insert(time)
+			}
+		};
+		for (at, entry) in entries.iter().enumerate().rev() {
+			if entry.is_version() && !first_of_its_time(time_of(entry)) {
+				outcome.get_or_insert_with(|| vec![Superseded::Kept; entries.len()])[at] =
+					if entry.kind == InternalKeyKind::Replace {
+						Superseded::BarrierOnly
+					} else {
+						Superseded::Dropped
+					};
+			}
+		}
+		outcome
+	}
+}
+
+/// What `Entry::superseded` makes of a write.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Superseded {
+	/// The write stands.
+	Kept,
+	/// The write is not a version: another one of the same time follows it.
+	Dropped,
+	/// A replace that is not a version any more, and wipes the history before it as a hard
+	/// delete does.
+	BarrierOnly,
 }
 
 /// Current source for the transaction iterator
@@ -1438,6 +1673,10 @@ pub(crate) struct TransactionRangeIterator<'a> {
 	/// Write-set entries for the range (collected, filtered for tombstones on access)
 	write_set_entries: Vec<(&'a Key, &'a Entry)>,
 
+	/// The ranges that the transaction deleted, `(start, end)`: the keys of the snapshot they
+	/// cover are not part of what the transaction reads, whichever of them the write set holds.
+	pending_ranges: Vec<(&'a [u8], &'a [u8])>,
+
 	/// Current position in write-set entries.
 	/// None means write-set is exhausted/not positioned.
 	/// Uses single index for both forward and backward iteration.
@@ -1491,16 +1730,26 @@ impl<'a> TransactionRangeIterator<'a> {
 			lower.map_or(Bound::Unbounded, Bound::Included),
 			upper.map_or(Bound::Unbounded, Bound::Excluded),
 		);
+		// A range delete of the write set can start before the range that is read
+		let ranges = tx.pending_range_deletes();
 		for (key, entry_list) in tx.write_set.range::<Key, _>(ws_range) {
 			if let Some(entry) = entry_list.last() {
+				// A range delete that came after the write hides it
+				if ranges.iter().any(|(start, end, seqno)| {
+					*seqno > entry.seqno && key.as_slice() >= *start && key.as_slice() < *end
+				}) {
+					continue;
+				}
 				write_set_entries.push((key, entry));
 			}
 		}
+		let pending_ranges = ranges.into_iter().map(|(start, end, _)| (start, end)).collect();
 
 		Ok(Self {
 			snapshot_iter,
 			core,
 			write_set_entries,
+			pending_ranges,
 			ws_pos: None,
 			is_key_equal: false,
 			current_source: CurrentSource::None,
@@ -1591,11 +1840,23 @@ impl<'a> TransactionRangeIterator<'a> {
 		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 	}
 
+	/// Whether the transaction deleted the key of the snapshot with a range delete.
+	fn snapshot_key_hidden(&self) -> bool {
+		!self.pending_ranges.is_empty() && self.snapshot_iter.valid() && {
+			let key = self.snapshot_iter.key().user_key();
+			self.pending_ranges.iter().any(|(start, end)| key >= *start && key < *end)
+		}
+	}
+
 	/// Position to minimum of two sources (forward merge).
 	/// Sets is_key_equal = true when both sources are at the same user key.
 	fn position_to_min(&mut self) -> Result<bool> {
 		loop {
 			self.is_key_equal = false;
+			if self.snapshot_key_hidden() {
+				self.snapshot_iter.next()?;
+				continue;
+			}
 			let snap_valid = self.snapshot_iter.valid();
 			let ws_valid = self.ws_valid();
 
@@ -1649,6 +1910,10 @@ impl<'a> TransactionRangeIterator<'a> {
 	fn position_to_max(&mut self) -> Result<bool> {
 		loop {
 			self.is_key_equal = false;
+			if self.snapshot_key_hidden() {
+				self.snapshot_iter.prev()?;
+				continue;
+			}
 			let snap_valid = self.snapshot_iter.valid();
 			let ws_valid = self.ws_valid();
 
@@ -1960,18 +2225,12 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 /// └─────────────────────────────────────────────────────────────┘
 /// ```
 ///
-/// ## Write-set Position Invariant
+/// ## Write-set position
 ///
-/// The write-set uses two pointers to track the valid range:
-/// ```text
-/// [ws_pos, ws_pos_back) = valid range
-/// ```
-///
-/// **Invariant**: `ws_pos <= ws_pos_back` must always hold.
-///
-/// - Forward iteration advances `ws_pos` upward
-/// - Backward iteration advances `ws_pos_back` downward
-/// - All seek operations reset BOTH pointers to restore the full range
+/// The write-set entries are one flat list, sorted by key, then by timestamp (newest first) and
+/// the newest write first among those of one timestamp, so that the list is merged with the
+/// versions of the snapshot as one more sorted source. A single index, `ws_pos`, walks it in
+/// either direction, and a seek puts it back at the start or the end.
 pub(crate) struct TransactionHistoryIterator<'a> {
 	// === Core data sources ===
 	/// History iterator from snapshot - provides committed data.
@@ -1986,11 +2245,12 @@ pub(crate) struct TransactionHistoryIterator<'a> {
 	/// These are the transaction's uncommitted writes that should be
 	/// visible to reads within the same transaction.
 	///
-	/// Assumption: one entry per key (latest write wins within transaction).
+	/// One entry for each version of a key that the transaction writes: what it writes to a key at
+	/// one time is one version, the last of its writes, see `Entry::superseded`.
 	/// Note: Hard delete entries are excluded (they go to `hard_delete_keys`).
 	write_set_entries: Vec<(&'a Key, &'a Entry)>,
 
-	/// Keys that have hard deletes in write-set.
+	/// Keys that have hard deletes or replaces in write-set.
 	///
 	/// Hard deletes differ from tombstones:
 	/// - **Tombstone**: Marks key as deleted at a specific timestamp. Old versions are still
@@ -2009,14 +2269,14 @@ pub(crate) struct TransactionHistoryIterator<'a> {
 	/// ```
 	hard_delete_keys: std::collections::HashSet<&'a [u8]>,
 
+	/// The `(start, end)` of the range deletes of the write set: the snapshot's versions of the
+	/// keys they cover are not part of the history the transaction sees.
+	pending_ranges: Vec<(Vec<u8>, Vec<u8>)>,
+
 	/// Current position in write-set entries.
 	/// None means write-set is exhausted/not positioned.
 	/// Uses single index for both forward and backward iteration.
 	ws_pos: Option<usize>,
-
-	/// True when snapshot and write-set are positioned at the same (key, timestamp).
-	/// When true, advancing must move both sources together.
-	is_key_equal: bool,
 
 	/// Which source provided the current entry.
 	current_source: CurrentSource,
@@ -2044,8 +2304,15 @@ pub(crate) struct TransactionHistoryIterator<'a> {
 	/// Result: [("x", 50, "alive")]  ← Tombstone skipped
 	/// ```
 	include_tombstones: bool,
-}
 
+	/// The most entries to yield in a traversal, counting those of the write set and those of
+	/// the snapshot alike.
+	limit: Option<usize>,
+
+	/// Entries yielded since the traversal began: a seek begins one, a step in either
+	/// direction continues it.
+	entries_returned: usize,
+}
 impl<'a> TransactionHistoryIterator<'a> {
 	/// Creates a new history iterator with RYOW support.
 	///
@@ -2061,21 +2328,39 @@ impl<'a> TransactionHistoryIterator<'a> {
 		core: Arc<Core>,
 		write_set_entries: Vec<(&'a Key, &'a Entry)>,
 		hard_delete_keys: std::collections::HashSet<&'a [u8]>,
+		pending_ranges: Vec<(Vec<u8>, Vec<u8>)>,
 		include_tombstones: bool,
+		limit: Option<usize>,
 	) -> Self {
 		Self {
 			inner,
 			core,
 			write_set_entries,
 			hard_delete_keys,
+			pending_ranges,
 			ws_pos: None,
-			is_key_equal: false,
 			current_source: CurrentSource::None,
 			ws_encoded_key_buf: Vec::new(),
 			direction: MergeDirection::Forward,
 			initialized: false,
 			include_tombstones,
+			limit,
+			entries_returned: 0,
 		}
+	}
+
+	/// Counts the entry the iterator has been positioned at against the limit: once the budget
+	/// is spent the iterator is no longer valid, and steps in either direction stay so.
+	fn spend(&mut self, positioned: bool) -> bool {
+		if !positioned {
+			return false;
+		}
+		if self.limit.is_some_and(|limit| self.entries_returned >= limit) {
+			self.current_source = CurrentSource::None;
+			return false;
+		}
+		self.entries_returned += 1;
+		true
 	}
 
 	// =========================================================================
@@ -2093,10 +2378,21 @@ impl<'a> TransactionHistoryIterator<'a> {
 		self.write_set_entries[self.ws_pos.unwrap()].0.as_slice()
 	}
 
-	/// Get current write-set timestamp.
+	/// The time of the current write-set entry: its own, or the newest there is for one that is
+	/// to be stamped with the time of its commit, see `Entry::effective_timestamp`.
 	fn ws_timestamp(&self) -> u64 {
 		debug_assert!(self.ws_valid());
-		self.write_set_entries[self.ws_pos.unwrap()].1.timestamp
+		self.write_set_entries[self.ws_pos.unwrap()].1.effective_timestamp()
+	}
+
+	/// Whether the snapshot's versions of `user_key` are left out of the history: the
+	/// transaction erased the key, or a range it deleted covers it.
+	fn snapshot_key_hidden(&self, user_key: &[u8]) -> bool {
+		self.hard_delete_keys.contains(user_key)
+			|| self
+				.pending_ranges
+				.iter()
+				.any(|(start, end, ..)| user_key >= start.as_slice() && user_key < end.as_slice())
 	}
 
 	/// Check if current write-set entry is a tombstone.
@@ -2177,27 +2473,9 @@ impl<'a> TransactionHistoryIterator<'a> {
 	///
 	/// # Ordering: (user_key ASC, timestamp DESC)
 	///
-	/// Returns the entry that should come first in forward iteration order.
-	///
-	/// ## Merge Algorithm
-	///
-	/// ```text
-	///     Snapshot          Write-set
-	///     ┌───┐             ┌───┐
-	///     │ A │─┐       ┌───│ B │
-	///     └───┘ │       │   └───┘
-	///           ▼       ▼
-	///         ┌───────────┐
-	///         │  Compare  │
-	///         │ Pick MIN  │
-	///         └─────┬─────┘
-	///               │
-	///               ▼
-	///          Return winner
-	///          (advance winner's pointer on next call)
-	/// ```
-	///
-	/// ## Key Comparison Rules
+	/// The versions of a key come newest timestamp first, as the snapshot's history returns
+	/// them, and a write of the transaction is placed among them by its timestamp, ahead of a
+	/// version of the same timestamp: it is the newer write.
 	///
 	/// ```text
 	/// ┌────────────────────────────────────────────────────────┐
@@ -2205,194 +2483,105 @@ impl<'a> TransactionHistoryIterator<'a> {
 	/// ├────────────────────────────────────────────────────────┤
 	/// │ hist < ws  → return Snapshot  (hist key comes first)   │
 	/// │ hist > ws  → return WriteSet  (ws key comes first)     │
-	/// │ hist = ws  → compare timestamps (same key, pick newer) │
-	/// │   hist_ts > ws_ts → return Snapshot (hist is newer)    │
-	/// │   hist_ts < ws_ts → return WriteSet (ws is newer)      │
-	/// │   hist_ts = ws_ts → WriteSet wins (RYOW), skip Snapshot│
+	/// │ hist = ws  → compare timestamps (same key)             │
+	/// │   ws_ts >= hist_ts → return WriteSet                   │
+	/// │   ws_ts <  hist_ts → return Snapshot                   │
 	/// └────────────────────────────────────────────────────────┘
 	/// ```
 	///
-	/// ## RYOW (Read Your Own Writes)
-	///
-	/// When both sources have the same (key, timestamp), the write-set
-	/// entry wins and the snapshot entry is skipped. This ensures the
-	/// transaction sees its own writes.
-	///
-	/// ```text
-	/// Snapshot:   ("x", 50, "snap")
-	/// Write-set:  ("x", 50, "ws")
-	///
-	/// Same key, same timestamp → WriteSet wins, skip Snapshot
-	/// Result: [("x", 50, "ws")]  ← Only transaction's version
-	/// ```
+	/// A write-set tombstone is a version of its own when tombstones are asked for, and left out
+	/// when they are not: it does not hide the versions in the snapshot, which `history` lists.
 	fn position_to_min(&mut self) -> Result<bool> {
 		loop {
-			self.is_key_equal = false;
 			let hist_valid = self.inner.valid();
 			let ws_valid = self.ws_valid();
 
 			// Skip snapshot entries for hard-deleted keys.
 			if hist_valid {
 				let hist_key = self.inner.key().user_key();
-				if self.hard_delete_keys.contains(hist_key) {
+				if self.snapshot_key_hidden(hist_key) {
 					self.inner.next()?;
 					continue;
 				}
 			}
 
-			self.current_source = match (hist_valid, ws_valid) {
-				(false, false) => CurrentSource::None,
-				(true, false) => CurrentSource::Snapshot,
-				(false, true) => {
-					if !self.include_tombstones && self.ws_is_tombstone() {
-						self.advance_ws();
-						continue;
-					}
-					self.populate_ws_encoded_key();
-					CurrentSource::WriteSet
+			let ws_first = match (hist_valid, ws_valid) {
+				(false, false) => {
+					self.current_source = CurrentSource::None;
+					return Ok(false);
 				}
+				(true, false) => false,
+				(false, true) => true,
 				(true, true) => {
-					let hist_key = self.inner.key().user_key();
-					let hist_ts = self.inner.key().timestamp();
-					let ws_key = self.ws_key();
-					let ws_ts = self.ws_timestamp();
-
-					match hist_key.cmp(ws_key) {
-						Ordering::Less => CurrentSource::Snapshot,
-						Ordering::Greater => {
-							if !self.include_tombstones && self.ws_is_tombstone() {
-								self.advance_ws();
-								continue;
-							}
-							self.populate_ws_encoded_key();
-							CurrentSource::WriteSet
-						}
-						Ordering::Equal => {
-							match hist_ts.cmp(&ws_ts) {
-								Ordering::Greater => CurrentSource::Snapshot,
-								Ordering::Less => {
-									if !self.include_tombstones && self.ws_is_tombstone() {
-										self.advance_ws();
-										continue;
-									}
-									self.populate_ws_encoded_key();
-									CurrentSource::WriteSet
-								}
-								Ordering::Equal => {
-									// RYOW: same (key, timestamp) - set is_key_equal
-									self.is_key_equal = true;
-									if !self.include_tombstones && self.ws_is_tombstone() {
-										// Tombstone masks snapshot - skip both
-										self.inner.next()?;
-										self.advance_ws();
-										self.is_key_equal = false;
-										continue;
-									}
-									self.populate_ws_encoded_key();
-									CurrentSource::WriteSet
-								}
-							}
-						}
+					let hist = self.inner.key();
+					match self.ws_key().cmp(hist.user_key()) {
+						Ordering::Less => true,
+						Ordering::Greater => false,
+						Ordering::Equal => self.ws_timestamp() >= hist.timestamp(),
 					}
 				}
 			};
-			return Ok(self.current_source != CurrentSource::None);
+
+			if !ws_first {
+				self.current_source = CurrentSource::Snapshot;
+				return Ok(true);
+			}
+			if !self.include_tombstones && self.ws_is_tombstone() {
+				self.advance_ws();
+				continue;
+			}
+			self.populate_ws_encoded_key();
+			self.current_source = CurrentSource::WriteSet;
+			return Ok(true);
 		}
 	}
 
 	/// Position to the maximum of snapshot and write-set (backward merge).
 	///
-	/// # Ordering: (user_key DESC, timestamp ASC)
-	///
-	/// Returns the entry that should come first in backward iteration order.
-	/// This is the mirror of `position_to_min` with reversed comparisons.
-	///
-	/// ## Key Comparison Rules (Backward)
-	///
-	/// ```text
-	/// ┌────────────────────────────────────────────────────────┐
-	/// │ hist_key vs ws_key                                     │
-	/// ├────────────────────────────────────────────────────────┤
-	/// │ hist > ws  → return Snapshot  (hist key comes first)   │
-	/// │ hist < ws  → return WriteSet  (ws key comes first)     │
-	/// │ hist = ws  → compare timestamps (same key, pick older) │
-	/// │   hist_ts < ws_ts → return Snapshot (hist is older)    │
-	/// │   hist_ts > ws_ts → return WriteSet (ws is older)      │
-	/// │   hist_ts = ws_ts → WriteSet wins (RYOW), skip Snapshot│
-	/// └────────────────────────────────────────────────────────┘
-	/// ```
+	/// This is the mirror of `position_to_min`: the versions of a key come oldest timestamp
+	/// first, and a write of the transaction follows a version of the same timestamp.
 	fn position_to_max(&mut self) -> Result<bool> {
 		loop {
-			self.is_key_equal = false;
 			let hist_valid = self.inner.valid();
 			let ws_valid = self.ws_valid();
 
 			// Skip snapshot entries for hard-deleted keys
 			if hist_valid {
 				let hist_key = self.inner.key().user_key();
-				if self.hard_delete_keys.contains(hist_key) {
+				if self.snapshot_key_hidden(hist_key) {
 					self.inner.prev()?;
 					continue;
 				}
 			}
 
-			self.current_source = match (hist_valid, ws_valid) {
-				(false, false) => CurrentSource::None,
-				(true, false) => CurrentSource::Snapshot,
-				(false, true) => {
-					if !self.include_tombstones && self.ws_is_tombstone() {
-						self.advance_ws();
-						continue;
-					}
-					self.populate_ws_encoded_key();
-					CurrentSource::WriteSet
+			let ws_first = match (hist_valid, ws_valid) {
+				(false, false) => {
+					self.current_source = CurrentSource::None;
+					return Ok(false);
 				}
+				(true, false) => false,
+				(false, true) => true,
 				(true, true) => {
-					let hist_key = self.inner.key().user_key();
-					let hist_ts = self.inner.key().timestamp();
-					let ws_key = self.ws_key();
-					let ws_ts = self.ws_timestamp();
-
-					match hist_key.cmp(ws_key) {
-						Ordering::Greater => CurrentSource::Snapshot,
-						Ordering::Less => {
-							if !self.include_tombstones && self.ws_is_tombstone() {
-								self.advance_ws();
-								continue;
-							}
-							self.populate_ws_encoded_key();
-							CurrentSource::WriteSet
-						}
-						Ordering::Equal => {
-							match hist_ts.cmp(&ws_ts) {
-								Ordering::Less => CurrentSource::Snapshot,
-								Ordering::Greater => {
-									if !self.include_tombstones && self.ws_is_tombstone() {
-										self.advance_ws();
-										continue;
-									}
-									self.populate_ws_encoded_key();
-									CurrentSource::WriteSet
-								}
-								Ordering::Equal => {
-									// RYOW: same (key, timestamp) - set is_key_equal
-									self.is_key_equal = true;
-									if !self.include_tombstones && self.ws_is_tombstone() {
-										// Tombstone masks snapshot - skip both
-										self.inner.prev()?;
-										self.advance_ws();
-										self.is_key_equal = false;
-										continue;
-									}
-									self.populate_ws_encoded_key();
-									CurrentSource::WriteSet
-								}
-							}
-						}
+					let hist = self.inner.key();
+					match self.ws_key().cmp(hist.user_key()) {
+						Ordering::Greater => true,
+						Ordering::Less => false,
+						Ordering::Equal => self.ws_timestamp() < hist.timestamp(),
 					}
 				}
 			};
-			return Ok(self.current_source != CurrentSource::None);
+
+			if !ws_first {
+				self.current_source = CurrentSource::Snapshot;
+				return Ok(true);
+			}
+			if !self.include_tombstones && self.ws_is_tombstone() {
+				self.advance_ws();
+				continue;
+			}
+			self.populate_ws_encoded_key();
+			self.current_source = CurrentSource::WriteSet;
+			return Ok(true);
 		}
 	}
 
@@ -2410,12 +2599,13 @@ impl<'a> TransactionHistoryIterator<'a> {
 	pub fn seek_first(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.initialized = true;
-		self.is_key_equal = false;
 
+		self.entries_returned = 0;
 		self.inner.seek_first()?;
 		self.seek_ws_first();
 
-		self.position_to_min()
+		let positioned = self.position_to_min()?;
+		Ok(self.spend(positioned))
 	}
 
 	/// Seek to the last entry in backward order.
@@ -2432,12 +2622,13 @@ impl<'a> TransactionHistoryIterator<'a> {
 	pub fn seek_last(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Backward;
 		self.initialized = true;
-		self.is_key_equal = false;
 
+		self.entries_returned = 0;
 		self.inner.seek_last()?;
 		self.seek_ws_last();
 
-		self.position_to_max()
+		let positioned = self.position_to_max()?;
+		Ok(self.spend(positioned))
 	}
 
 	/// Move to the next entry in forward order.
@@ -2458,7 +2649,6 @@ impl<'a> TransactionHistoryIterator<'a> {
 		// Direction change: backward → forward
 		if self.direction != MergeDirection::Forward {
 			self.direction = MergeDirection::Forward;
-			self.is_key_equal = false;
 
 			reanchor_other_source(
 				&mut self.inner,
@@ -2467,35 +2657,21 @@ impl<'a> TransactionHistoryIterator<'a> {
 				self.current_source,
 				MergeDirection::Forward,
 			)?;
-
-			// Check if now at equal (key, timestamp)
-			if self.inner.valid()
-				&& self.ws_valid()
-				&& self.inner.key().user_key() == self.ws_key()
-				&& self.inner.key().timestamp() == self.ws_timestamp()
-			{
-				self.is_key_equal = true;
-			}
 		}
 
-		// Advance CURRENT source (or both if is_key_equal)
-		if self.is_key_equal {
-			self.inner.next()?;
-			self.advance_ws();
-			self.is_key_equal = false;
-		} else {
-			match self.current_source {
-				CurrentSource::Snapshot => {
-					self.inner.next()?;
-				}
-				CurrentSource::WriteSet => {
-					self.advance_ws();
-				}
-				CurrentSource::None => return Ok(false),
+		// Advance the current source
+		match self.current_source {
+			CurrentSource::Snapshot => {
+				self.inner.next()?;
 			}
+			CurrentSource::WriteSet => {
+				self.advance_ws();
+			}
+			CurrentSource::None => return Ok(false),
 		}
 
-		self.position_to_min()
+		let positioned = self.position_to_min()?;
+		Ok(self.spend(positioned))
 	}
 
 	/// Move to the previous entry in backward order.
@@ -2515,7 +2691,6 @@ impl<'a> TransactionHistoryIterator<'a> {
 		// Direction change: forward → backward
 		if self.direction != MergeDirection::Backward {
 			self.direction = MergeDirection::Backward;
-			self.is_key_equal = false;
 
 			reanchor_other_source(
 				&mut self.inner,
@@ -2524,35 +2699,21 @@ impl<'a> TransactionHistoryIterator<'a> {
 				self.current_source,
 				MergeDirection::Backward,
 			)?;
-
-			// Check if now at equal (key, timestamp)
-			if self.inner.valid()
-				&& self.ws_valid()
-				&& self.inner.key().user_key() == self.ws_key()
-				&& self.inner.key().timestamp() == self.ws_timestamp()
-			{
-				self.is_key_equal = true;
-			}
 		}
 
-		// Advance CURRENT source (or both if is_key_equal)
-		if self.is_key_equal {
-			self.inner.prev()?;
-			self.advance_ws();
-			self.is_key_equal = false;
-		} else {
-			match self.current_source {
-				CurrentSource::Snapshot => {
-					self.inner.prev()?;
-				}
-				CurrentSource::WriteSet => {
-					self.advance_ws();
-				}
-				CurrentSource::None => return Ok(false),
+		// Advance the current source
+		match self.current_source {
+			CurrentSource::Snapshot => {
+				self.inner.prev()?;
 			}
+			CurrentSource::WriteSet => {
+				self.advance_ws();
+			}
+			CurrentSource::None => return Ok(false),
 		}
 
-		self.position_to_max()
+		let positioned = self.position_to_max()?;
+		Ok(self.spend(positioned))
 	}
 
 	/// Check if positioned on a valid entry.
@@ -2578,17 +2739,18 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.initialized = true;
-		self.is_key_equal = false;
 
 		// Encode user key with MAX trailer for >= seek
 		let mut encoded = target.to_vec();
 		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
+		self.entries_returned = 0;
 		self.inner.seek(&encoded)?;
 
 		// Position write-set at first entry >= target
 		self.seek_ws(target);
 
-		self.position_to_min()
+		let positioned = self.position_to_min()?;
+		Ok(self.spend(positioned))
 	}
 
 	fn seek_first(&mut self) -> Result<bool> {
@@ -2619,7 +2781,8 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 		debug_assert!(self.valid());
 		match self.current_source {
 			CurrentSource::Snapshot => self.inner.key(),
-			CurrentSource::WriteSet => InternalKeyRef::from_encoded(&self.ws_encoded_key_buf),
+			CurrentSource::WriteSet => InternalKeyRef::from_encoded(&self.ws_encoded_key_buf)
+				.with_timestamp(self.ws_timestamp()),
 			CurrentSource::None => panic!("key() called on invalid iterator"),
 		}
 	}

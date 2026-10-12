@@ -25,6 +25,7 @@ use crate::levels::{
 	ManifestKind,
 	ReplaceFailure,
 	SnapshotInfo,
+	MANIFEST_FORMAT_VERSION,
 };
 use crate::tde::{
 	is_sealed_manifest,
@@ -120,7 +121,9 @@ pub(super) struct OldManifest {
 
 /// How a manifest was read before manifests could be encrypted, written out here from the format
 /// and not from the code that reads it now: the version first, which must be 1, then the three
-/// counters, the tables of each level and the snapshots. It stands for a binary of that time.
+/// counters, the tables of each level and the snapshots. It stands for a binary of that time,
+/// which refuses the manifest of the current version (2) on its first two bytes: use
+/// `as_version_1` for the layout.
 pub(super) fn frozen_old_decode(data: &[u8]) -> Result<OldManifest, String> {
 	let mut reader = std::io::Cursor::new(data);
 	let mut read = |len: usize| -> Result<Vec<u8>, String> {
@@ -159,6 +162,14 @@ pub(super) fn frozen_old_decode(data: &[u8]) -> Result<OldManifest, String> {
 	})
 }
 
+/// The manifest `plain`, of the current version, with the version of the format that SurrealKV up
+/// to v0.21.4 wrote: the layout of the two is the same, and only the number differs.
+fn as_version_1(plain: &[u8]) -> Vec<u8> {
+	let mut bytes = plain.to_vec();
+	bytes[..2].copy_from_slice(&1u16.to_be_bytes());
+	bytes
+}
+
 #[test]
 fn the_manifest_of_an_encrypted_database_is_sealed_and_its_body_is_what_a_plaintext_one_holds() {
 	for suite in SUITES {
@@ -177,7 +188,7 @@ fn the_manifest_of_an_encrypted_database_is_sealed_and_its_body_is_what_a_plaint
 		manifest.encryption = None;
 		write_manifest_to_disk(&manifest).unwrap();
 		let plain = fs::read(&path).unwrap();
-		assert_eq!(plain[..2], [0, 1], "{suite:?}");
+		assert_eq!(plain[..2], MANIFEST_FORMAT_VERSION.to_be_bytes(), "{suite:?}");
 		assert_eq!(open_manifest(&ctx, &sealed).unwrap(), plain, "{suite:?}");
 		assert_eq!(sealed.len(), plain.len() + MANIFEST_PREFIX_LEN + 16, "{suite:?}");
 
@@ -205,9 +216,9 @@ fn a_manifest_without_a_context_is_the_bytes_that_a_plaintext_database_always_ha
 	let opts = options(dir.path(), None);
 	LevelManifest::new(Arc::clone(&opts)).unwrap();
 
-	// Version 1, next table id 1, log number 0, last sequence 0, three levels without tables, and
-	// no snapshots: written out here, not taken from the code that writes it.
-	let mut expected = vec![0u8, 1];
+	// The current version, next table id 1, log number 0, last sequence 0, three levels without
+	// tables, and no snapshots: written out here, not taken from the code that writes it.
+	let mut expected = MANIFEST_FORMAT_VERSION.to_be_bytes().to_vec();
 	expected.extend_from_slice(&1u64.to_be_bytes());
 	expected.extend_from_slice(&0u64.to_be_bytes());
 	expected.extend_from_slice(&0u64.to_be_bytes());
@@ -221,7 +232,10 @@ fn a_manifest_without_a_context_is_the_bytes_that_a_plaintext_database_always_ha
 	written.extend_from_slice(&crate::levels::calculate_manifest_crc(&expected).to_be_bytes());
 	written.extend_from_slice(b"SKVMNFST");
 	assert_eq!(fs::read(opts.manifest_file_path(0)).unwrap(), written);
-	assert!(frozen_old_decode(&expected).is_ok());
+	// The layout is the one that was always written; only the version is not the one that a binary
+	// of that time knows, and it refuses it.
+	assert!(frozen_old_decode(&as_version_1(&expected)).is_ok());
+	assert!(frozen_old_decode(&expected).unwrap_err().contains("Unsupported manifest format"));
 }
 
 #[test]
@@ -348,14 +362,14 @@ fn a_loader_that_does_not_know_encryption_fails_at_the_manifest_with_nothing_els
 
 		// The frozen loader reads what a plaintext database wrote, which is what the sealed one
 		// holds, and it is the first thing a binary of that time reads of a database.
-		let old = frozen_old_decode(&plain).unwrap();
+		let old = frozen_old_decode(&as_version_1(&plain)).unwrap();
 		assert_eq!(
 			(old.next_table_id, old.last_sequence, old.levels.len(), old.snapshots),
 			(42, 17, 3, 1)
 		);
 
 		// An encrypted manifest does not begin with the version that it reads first.
-		assert_ne!(sealed[..2], [0, 1], "{suite:?}");
+		assert_ne!(sealed[..2], MANIFEST_FORMAT_VERSION.to_be_bytes(), "{suite:?}");
 		let err = frozen_old_decode(&sealed).unwrap_err();
 		assert!(err.contains("Unsupported manifest format version"), "{suite:?}: {err}");
 	}

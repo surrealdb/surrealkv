@@ -9,7 +9,7 @@ use crate::levels::{
 	LevelManifest,
 	ManifestChangeSet,
 	SnapshotInfo,
-	MANIFEST_FORMAT_VERSION_V1,
+	MANIFEST_FORMAT_VERSION_V2,
 };
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
@@ -136,7 +136,7 @@ fn test_level_manifest_persistence() {
 		"Next table ID not persisted correctly"
 	);
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
 		"Manifest version not persisted correctly"
 	);
 	assert_eq!(loaded_manifest.snapshots.len(), 2, "Snapshots not persisted correctly");
@@ -187,7 +187,7 @@ fn test_level_manifest_persistence() {
 		"Next table ID not loaded correctly in new manifest"
 	);
 	assert_eq!(
-		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
+		new_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
 		"Manifest version not loaded correctly"
 	);
 	assert_eq!(new_manifest.snapshots.len(), 2, "Snapshots not loaded correctly");
@@ -333,18 +333,18 @@ fn test_level_manifest_persistence() {
 	// Verify table format and compression are set correctly
 	assert_eq!(
 		props1.table_format,
-		crate::sstable::table::TableFormat::LSMV1,
-		"Table 1 format should be LSMV1"
+		crate::sstable::table::TableFormat::LSMV2,
+		"Table 1 format should be LSMV2"
 	);
 	assert_eq!(
 		props2.table_format,
-		crate::sstable::table::TableFormat::LSMV1,
-		"Table 2 format should be LSMV1"
+		crate::sstable::table::TableFormat::LSMV2,
+		"Table 2 format should be LSMV2"
 	);
 	assert_eq!(
 		props3.table_format,
-		crate::sstable::table::TableFormat::LSMV1,
-		"Table 3 format should be LSMV1"
+		crate::sstable::table::TableFormat::LSMV2,
+		"Table 3 format should be LSMV2"
 	);
 
 	// Verify no deletions in test tables
@@ -695,10 +695,11 @@ fn test_manifest_v1_with_log_number_and_last_sequence() {
 	// Reload and verify
 	let loaded_manifest = LevelManifest::new(opts).expect("Failed to reload manifest");
 
-	// Verify format version is still V1
+	// Every manifest this code writes is of the current version, whatever the in-memory
+	// manifest was created or loaded as.
 	assert_eq!(
-		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V1,
-		"Should be V1 format"
+		loaded_manifest.manifest_format_version, MANIFEST_FORMAT_VERSION_V2,
+		"Should be V2 format"
 	);
 
 	// Verify new fields persisted correctly

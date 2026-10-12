@@ -158,8 +158,6 @@ async fn the_manifest_that_follows_the_last_flush_of_a_shutdown_keeps_the_error_
 #[tokio::test]
 async fn a_database_of_another_store_in_the_directory_of_an_encrypted_one_is_not_migrated_into_it()
 {
-	use surrealkv_compat_v1::{V1_FOOTER_TOTAL_LEN, V1_MAGIC_FOOTER};
-
 	let dir = TempDir::new().unwrap();
 	let km = manager();
 	let opts =
@@ -167,8 +165,6 @@ async fn a_database_of_another_store_in_the_directory_of_an_encrypted_one_is_not
 
 	// What each migration would take for a database of its own, and the directory it would move it
 	// to, in the clear.
-	let mut v1_table = vec![0u8; V1_FOOTER_TOTAL_LEN];
-	v1_table[V1_FOOTER_TOTAL_LEN - V1_MAGIC_FOOTER.len()..].copy_from_slice(&V1_MAGIC_FOOTER);
 	type Place = Box<dyn Fn(&std::path::Path)>;
 	let cases: Vec<(&str, &str, Place)> = vec![
 		(
@@ -178,11 +174,6 @@ async fn a_database_of_another_store_in_the_directory_of_an_encrypted_one_is_not
 				fs::write(root.join("CURRENT"), b"MANIFEST-000001\n").unwrap();
 				fs::write(root.join("MANIFEST-000001"), b"not a real rocksdb manifest").unwrap();
 			}),
-		),
-		(
-			"SurrealKV v1",
-			"_v1_backup",
-			Box::new(move |root| fs::write(root.join("000001.sst"), &v1_table).unwrap()),
 		),
 		(
 			"IndexedDB",
@@ -210,7 +201,7 @@ async fn a_database_of_another_store_in_the_directory_of_an_encrypted_one_is_not
 		assert!(!dir.path().join(backup).exists(), "{store}: a backup was made");
 
 		// Without the foreign files, which are removed again, the database opens as it was.
-		for name in ["CURRENT", "MANIFEST-000001", "000001.sst", "indxdb_dump.bin"] {
+		for name in ["CURRENT", "MANIFEST-000001", "indxdb_dump.bin"] {
 			let _ = fs::remove_file(dir.path().join(name));
 		}
 		let tree = Tree::new(encrypted(
@@ -226,4 +217,44 @@ async fn a_database_of_another_store_in_the_directory_of_an_encrypted_one_is_not
 		});
 		tree.close().await.unwrap();
 	}
+}
+
+fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+	fs::create_dir_all(to).unwrap();
+	for entry in fs::read_dir(from).unwrap().flatten() {
+		let target = to.join(entry.file_name());
+		if entry.file_type().unwrap().is_dir() {
+			copy_dir(&entry.path(), &target);
+		} else {
+			fs::copy(entry.path(), target).unwrap();
+		}
+	}
+}
+
+/// A database written by SurrealKV v0.21.4 (LSMV1) is converted by a migration that writes without
+/// a key and keeps the old files in the clear, so it is never converted into an encrypted
+/// database. A plaintext manifest, which is what such a database has, is refused when the
+/// database is opened with a key, before the migration is asked; the migration also refuses on
+/// its own, before it reads, locks or moves anything.
+#[tokio::test]
+async fn a_v0_x_database_is_not_migrated_into_an_encrypted_one() {
+	let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+		.join("tests/fixtures/legacy/v0.21.4/tiny-plain/db");
+	let dir = TempDir::new().unwrap();
+	copy_dir(&fixture, dir.path());
+	let before = snapshot(dir.path());
+	let opts = encrypted(dir.path(), manager() as Arc<dyn KeyManager>, CipherSuite::Aes256Gcm);
+
+	let err = open_error(&opts);
+	assert!(matches!(err, Error::Encryption(EncryptionError::NotEncrypted)), "{err:?}");
+	assert!(snapshot(dir.path()) == before, "a refused open changed the directory");
+
+	let err = crate::migrate::legacy::migrate_if_needed(&opts)
+		.expect_err("the migration is refused for an encrypted database");
+	assert!(
+		matches!(&err, Error::InvalidArgument(message)
+			if message.contains("SurrealKV v0.x") && message.contains("encrypted")),
+		"{err:?}"
+	);
+	assert!(snapshot(dir.path()) == before, "a refused migration changed the directory");
 }

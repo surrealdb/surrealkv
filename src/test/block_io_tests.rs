@@ -300,8 +300,8 @@ fn a_unit_shorter_than_its_trailer_is_an_error() {
 // ========== The bytes that a sink writes ==========
 
 /// What the footer holds for a table whose meta-index is the handle `(meta, 0)` and whose
-/// top-level index is the handle `(0, 5)`: format 1, the checksum type that says how the blocks
-/// are laid out, the handles as varints, zeros up to byte 42 and the magic number.
+/// top-level index is the handle `(0, 5)`: format 2 (LSMV2), the checksum type that says how the
+/// blocks are laid out, the handles as varints, zeros up to byte 42 and the magic number.
 fn expected_footer(checksum_type: u8, meta_offset: u8) -> String {
 	expected_footer_of(checksum_type, (meta_offset, 0), (0, 5))
 }
@@ -310,7 +310,7 @@ fn expected_footer(checksum_type: u8, meta_offset: u8) -> String {
 /// byte each in a varint.
 fn expected_footer_of(checksum_type: u8, meta: (u8, u8), index: (u8, u8)) -> String {
 	format!(
-		"01{checksum_type:02x}{:02x}{:02x}{:02x}{:02x}{}57fb808b247547db",
+		"02{checksum_type:02x}{:02x}{:02x}{:02x}{:02x}{}57fb808b247547db",
 		meta.0,
 		meta.1,
 		index.0,
@@ -1108,7 +1108,8 @@ async fn a_handle_that_names_bytes_of_the_header_is_refused() {
 // ========== The footer of a sealed table ==========
 
 /// The footer decoder as it was before there were sealed tables, kept as it was: a table that is
-/// written now has to be refused by the reader that exists in the field, which is that one. It
+/// written now has to be refused by the reader that exists in the field, which is that one: the
+/// reader of SurrealKV v0.21.4, which knows the table format 1 (LSMV1) and nothing else. It
 /// returns the format and the checksum type as the bytes that it accepted, and the handles.
 fn frozen_footer_decode(buf: &[u8]) -> Result<(u8, u8, BlockHandle, BlockHandle)> {
 	const MAGIC: [u8; 8] = [0x57, 0xfb, 0x80, 0x8b, 0x24, 0x75, 0x47, 0xdb];
@@ -1156,14 +1157,26 @@ fn a_reader_that_predates_sealed_tables_refuses_their_footer() {
 	let sealed = write_table_after_a_header(&opts, &sealer);
 	let plain = write_table(&opts, Protection::Plain);
 
-	// The control: the old decoder reads the footer of a plain table.
-	let (format, checksum, ..) = frozen_footer_decode(footer_of(&plain)).unwrap();
-	assert_eq!((format, checksum), (1, 1));
+	// The old decoder knows the format of its time and not LSMV2, which every table written now
+	// is: a plain table is refused, by the byte of the format, before anything else of the file is
+	// looked at, and so is a sealed one.
+	let result = frozen_footer_decode(footer_of(&plain));
+	assert!(matches!(result, Err(Error::InvalidTableFormat)), "{result:?}");
 	assert_eq!(Footer::decode(footer_of(&plain)).unwrap().checksum, ChecksumType::CRC32c);
-
-	// The sealed one is an error and not a table with checksums that fail, and the error is
-	// raised by the footer, before anything else of the file is looked at.
 	let result = frozen_footer_decode(footer_of(&sealed));
+	assert!(matches!(result, Err(Error::InvalidTableFormat)), "{result:?}");
+
+	// The control, for what the old decoder says of the part that sealing added: the same
+	// footers with the format of its time are read as plain, and refused as sealed, by the byte of
+	// the checksum type.
+	let as_lsmv1 = |footer: &[u8]| {
+		let mut footer = footer.to_vec();
+		footer[0] = 1;
+		footer
+	};
+	let (format, checksum, ..) = frozen_footer_decode(&as_lsmv1(footer_of(&plain))).unwrap();
+	assert_eq!((format, checksum), (1, 1));
+	let result = frozen_footer_decode(&as_lsmv1(footer_of(&sealed)));
 	assert!(
 		matches!(
 			result,

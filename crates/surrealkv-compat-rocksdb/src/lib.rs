@@ -1,34 +1,37 @@
-//! Pure-Rust compatibility reader and migration utilities for RocksDB BlockBasedTable format (v2
-//! through v7).
+//! A pure-Rust reader of the RocksDB databases SurrealDB writes, for migrating them to SurrealKV.
 //!
-//! Designed to allow SurrealKV and SurrealDB to start up directly from existing RocksDB
-//! databases without linking the C++ RocksDB library or requiring offline manual migrations.
+//! It reads what RocksDB's own recovery would: the live tables the MANIFEST lists, the blob files
+//! their values live in, and the write-ahead logs that no table covers. With the timestamp
+//! comparator SurrealDB uses in versioned mode it yields every stored version with its timestamp.
+//!
+//! It refuses, with [`Error::Unsupported`], anything it does not handle, instead of reading it
+//! wrongly: other comparators, other column families, range deletes, merge operands, tables
+//! without their timestamps, compression it cannot decode.
 
-pub mod block;
-pub mod database;
-pub mod error;
-pub mod footer;
-pub mod handle;
-pub mod table;
-pub mod varint;
+mod blob;
+mod checksum;
+mod coding;
+mod compression;
+mod db;
+mod error;
+mod lock;
+mod log;
+mod manifest;
+mod sst;
+mod wal;
 
-pub use database::{is_rocksdb_dir, DatabaseIter, RocksDbDatabase};
+pub use blob::{BlobFiles, BlobRef};
+pub use db::{
+	is_rocksdb_dir,
+	Payload,
+	RocksDb,
+	Version,
+	VersionKind,
+	Versions,
+	BYTEWISE_COMPARATOR,
+	TIMESTAMP_COMPARATOR,
+};
 pub use error::{Error, Result};
-pub use footer::{Footer, ROCKSDB_LEGACY_MAGIC, ROCKSDB_MAGIC};
-pub use handle::BlockHandle;
-pub use table::{RocksDbEntry, SstReader};
-
-#[cfg(test)]
-mod tests;
-
-use std::path::Path;
-
-/// Reads all live (non-deleted) latest key-value pairs from a RocksDB directory in pure Rust.
-pub fn read_all_latest<P: AsRef<Path>>(path: P) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-	let db = RocksDbDatabase::open(path)?;
-	let mut records = Vec::new();
-	for item in db.iter_latest()? {
-		records.push(item?);
-	}
-	Ok(records)
-}
+pub use lock::{lock_directory, DirectoryLock};
+pub use manifest::{ManifestState, TableFile};
+pub use sst::{Properties, TableReader};

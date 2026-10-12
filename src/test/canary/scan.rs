@@ -571,7 +571,7 @@ mod tests {
 			"vlog/00000000000000000002.vlog.torn",
 			"sstables/00000000000000000009.sst",
 			"_rocksdb_backup/CURRENT",
-			"_v1_backup/deep/er/and/deeper/000001.sst",
+			"_surrealkv_v0_backup/deep/er/and/deeper/000001.sst",
 			"RESTORE_IN_PROGRESS",
 			"no-extension",
 			".hidden",

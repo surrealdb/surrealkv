@@ -1,0 +1,3 @@
+24 keys, versioned, tables plus WAL tail (test fixture)
+versioned=true
+keys=24

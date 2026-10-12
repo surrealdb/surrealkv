@@ -181,7 +181,7 @@ fn entries(bytes: &[u8], handle: &BlockHandle, opts: &Options) -> Vec<(Vec<u8>, 
 fn read_footer(bytes: &[u8]) -> (BlockHandle, BlockHandle) {
 	let footer = &bytes[bytes.len() - TABLE_FULL_FOOTER_LENGTH..];
 	assert_eq!(&footer[42..], &[0x57, 0xfb, 0x80, 0x8b, 0x24, 0x75, 0x47, 0xdb]);
-	assert_eq!((footer[0], footer[1]), (1, 1), "format and checksum type");
+	assert_eq!((footer[0], footer[1]), (2, 1), "format (LSMV2) and checksum type");
 	let (meta_index, meta_len) = BlockHandle::decode(&footer[2..]).unwrap();
 	let (index, index_len) = BlockHandle::decode(&footer[2 + meta_len..]).unwrap();
 	assert!(footer[2 + meta_len + index_len..42].iter().all(|b| *b == 0), "footer padding");

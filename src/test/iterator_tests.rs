@@ -5,7 +5,7 @@ use tempfile::TempDir;
 use test_log::test;
 
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
-use crate::iter::{BoxedLSMIterator, CompactionIterator, MergingIterator};
+use crate::iter::{BoxedLSMIterator, CompactionIterator, History, MergingIterator};
 use crate::sstable::table::{Table, TableWriter};
 use crate::vfs::File;
 use crate::vlog::{VLog, ValueLocation};
@@ -2503,4 +2503,436 @@ fn test_published_input_keeps_the_newest_version() {
 		assert_eq!(published, kept(&[("a", 12), ("b", 7)]), "bottom {bottom}");
 		assert_eq!(far_above, published, "bottom {bottom}");
 	}
+}
+
+// ---------------------------------------------------------------------------
+// the history a versioned tree keeps
+// ---------------------------------------------------------------------------
+
+/// A version for the tests of the history a compaction keeps: `(key, sequence number, kind, time)`.
+type TimedVersion<'a> = (&'a str, u64, InternalKeyKind, u64);
+
+fn compact_history(
+	versions: &[TimedVersion],
+	is_bottom_level: bool,
+	history: History,
+) -> Vec<(String, u64)> {
+	compact_history_for(versions, is_bottom_level, history, vec![], u64::MAX)
+}
+
+fn compact_history_for(
+	versions: &[TimedVersion],
+	is_bottom_level: bool,
+	history: History,
+	snapshots: Vec<u64>,
+	horizon: u64,
+) -> Vec<(String, u64)> {
+	compact_history_with(versions, is_bottom_level, history, snapshots, horizon, vec![])
+}
+
+/// As `compact_history_for`, with the range deletions of tables that the compaction does not read.
+fn compact_history_with(
+	versions: &[TimedVersion],
+	is_bottom_level: bool,
+	history: History,
+	snapshots: Vec<u64>,
+	horizon: u64,
+	unread_range_deletions: Vec<(Vec<u8>, Vec<u8>, u64)>,
+) -> Vec<(String, u64)> {
+	compact_history_stamped(
+		versions,
+		is_bottom_level,
+		history,
+		snapshots,
+		horizon,
+		unread_range_deletions,
+	)
+	.into_iter()
+	.map(|(key, seq, _)| (key, seq))
+	.collect()
+}
+
+/// As `compact_history_with`, with the time each kept version is stamped with.
+fn compact_history_stamped(
+	versions: &[TimedVersion],
+	is_bottom_level: bool,
+	history: History,
+	snapshots: Vec<u64>,
+	horizon: u64,
+	unread_range_deletions: Vec<(Vec<u8>, Vec<u8>, u64)>,
+) -> Vec<(String, u64, Option<u64>)> {
+	let mut items: Vec<(InternalKey, Value)> = versions
+		.iter()
+		.map(|(key, seq, kind, ts)| {
+			let value = match kind {
+				InternalKeyKind::Delete => Vec::new(),
+				// The end of the range, which is the raw value of a range deletion
+				InternalKeyKind::RangeDelete => b"a2".to_vec(),
+				_ => ValueLocation::with_inline_value(b"v".to_vec())
+					.with_timestamp((*ts != 0).then_some(*ts))
+					.encode(),
+			};
+			(create_internal_key(key, *seq, *kind), value)
+		})
+		.collect();
+	items.sort_by(|a, b| a.0.user_key.cmp(&b.0.user_key).then(b.0.seq_num().cmp(&a.0.seq_num())));
+	CompactionIterator::new(
+		vec![build_table_iterator(items)],
+		create_comparator(),
+		is_bottom_level,
+		snapshots,
+		horizon,
+	)
+	.with_history(history)
+	.with_history_range_deletions(unread_range_deletions)
+	.map(|item| {
+		let (key, value) = item.unwrap();
+		(
+			String::from_utf8_lossy(&key.user_key).to_string(),
+			key.seq_num(),
+			ValueLocation::entry_time(key.kind(), &value),
+		)
+	})
+	.collect()
+}
+
+/// A tree that keeps its history for ever keeps every version, and one that does not keeps the
+/// newest.
+#[test]
+fn test_history_all_keeps_every_version() {
+	let versions = [("a", 10, SET, 100), ("a", 9, SET, 90), ("a", 5, SET, 50), ("b", 7, SET, 70)];
+	assert_eq!(
+		compact_history(&versions, false, History::All),
+		kept(&[("a", 10), ("a", 9), ("a", 5), ("b", 7)])
+	);
+	assert_eq!(
+		compact_history(&versions, true, History::All),
+		kept(&[("a", 10), ("a", 9), ("a", 5), ("b", 7)])
+	);
+	assert_eq!(compact_history(&versions, false, History::Latest), kept(&[("a", 10), ("b", 7)]));
+}
+
+/// A hard delete erases what is below it from the history. It is kept where there can be
+/// versions below it in tables the compaction does not read, and dropped at the bottom when
+/// nothing is left under it.
+#[test]
+fn test_history_all_keeps_a_hard_delete_above_the_bottom_and_drops_what_it_hides() {
+	let versions = [("a", 12, SET, 120), ("a", 11, DELETE, 0), ("a", 5, SET, 50)];
+	assert_eq!(compact_history(&versions, false, History::All), kept(&[("a", 12), ("a", 11)]));
+	assert_eq!(compact_history(&versions, true, History::All), kept(&[("a", 12)]));
+}
+
+/// With a retention, the versions from the time the period starts at are kept, and the one with
+/// the newest time before it: what a read at that time sees.
+#[test]
+fn test_history_since_keeps_the_period_and_the_version_it_starts_at() {
+	let versions = [
+		("a", 9, SET, 130),
+		("a", 8, SET, 110),
+		("a", 7, SET, 90),
+		("a", 6, SET, 80),
+		("a", 5, SET, 70),
+		// Only old versions: the newest is what a read sees, and is kept as the newest.
+		("b", 4, SET, 20),
+		("b", 3, SET, 10),
+	];
+	assert_eq!(
+		compact_history(&versions, false, History::Since(100)),
+		kept(&[("a", 9), ("a", 8), ("a", 7), ("b", 4)])
+	);
+	// A period that starts before everything keeps everything.
+	assert_eq!(compact_history(&versions, false, History::Since(0)).len(), versions.len());
+}
+
+/// A version can be written for a time before an earlier write's. The version a read at the
+/// start of the period sees has the newest time before it, whenever it was written.
+#[test]
+fn test_history_since_picks_the_base_by_time_and_not_by_the_order_of_writing() {
+	let versions = [
+		// Written last, and for a time long ago: kept as the newest write.
+		("a", 9, SET, 50),
+		("a", 8, SET, 120),
+		// The base: the newest time before 100, and the later write of the two at that time.
+		("a", 7, SET, 90),
+		("a", 6, SET, 90),
+		("a", 5, SET, 60),
+	];
+	assert_eq!(
+		compact_history(&versions, false, History::Since(100)),
+		kept(&[("a", 9), ("a", 8), ("a", 7)])
+	);
+}
+
+/// What a barrier hides is not history, whatever its time.
+#[test]
+fn test_history_since_drops_what_a_hard_delete_hides_even_inside_the_period() {
+	let versions = [("a", 10, SET, 120), ("a", 9, DELETE, 0), ("a", 8, SET, 110)];
+	assert_eq!(
+		compact_history(&versions, false, History::Since(100)),
+		kept(&[("a", 10), ("a", 9)])
+	);
+	assert_eq!(compact_history(&versions, false, History::All), kept(&[("a", 10), ("a", 9)]));
+}
+
+/// A version written without a time, by a tree that was not versioned, counts as written when the
+/// versions before it were: with none stamped before it, at 0.
+#[test]
+fn test_history_since_reads_versions_without_a_time_that_nothing_stamped_precedes_as_written_at_0()
+{
+	let versions = [("a", 10, SET, 150), ("a", 9, SET, 0), ("a", 8, SET, 0)];
+	// At the bottom every version there is is read, and the time is exact
+	assert_eq!(
+		compact_history(&versions, true, History::Since(100)),
+		kept(&[("a", 10), ("a", 9)]),
+		"the newest of the versions without a time is the base"
+	);
+	// Above it, a version without a time is kept, as it may be newer than it can be told
+	assert_eq!(
+		compact_history(&versions, false, History::Since(100)),
+		kept(&[("a", 10), ("a", 9), ("a", 8)])
+	);
+}
+
+const REPLACE: InternalKeyKind = InternalKeyKind::Replace;
+
+/// A snapshot below a hard delete still has the versions under it in its history, and the delete
+/// is kept for as long as one of them is: without it the readers above would see them again.
+#[test]
+fn test_history_keeps_a_hard_delete_above_a_version_a_snapshot_reads() {
+	let versions = [("a", 12, SET, 120), ("a", 11, DELETE, 0), ("a", 5, SET, 50)];
+	for history in [History::All, History::Since(100)] {
+		for bottom in [false, true] {
+			assert_eq!(
+				compact_history_for(&versions, bottom, history, vec![6], u64::MAX),
+				kept(&[("a", 12), ("a", 11), ("a", 5)]),
+				"{history:?}, bottom {bottom}"
+			);
+		}
+	}
+	// The same for a replace that is not itself history any more.
+	let versions = [("a", 13, SET, 90), ("a", 11, REPLACE, 60), ("a", 5, SET, 50)];
+	assert_eq!(
+		compact_history_for(&versions, true, History::Since(100), vec![6], u64::MAX),
+		kept(&[("a", 13), ("a", 11), ("a", 5)])
+	);
+}
+
+/// What a barrier hides is hidden from the readers that read the barrier. A snapshot below it
+/// has the older versions in its history, so retention 0 keeps them.
+#[test]
+fn test_history_all_keeps_the_versions_below_a_barrier_that_a_snapshot_reads() {
+	let versions = [("a", 20, DELETE, 0), ("a", 10, SET, 100), ("a", 9, SET, 90)];
+	assert_eq!(
+		compact_history_for(&versions, false, History::All, vec![15], u64::MAX),
+		kept(&[("a", 20), ("a", 10), ("a", 9)])
+	);
+	// With no snapshot below the barrier they are hidden from everyone.
+	assert_eq!(
+		compact_history_for(&versions, false, History::All, vec![25], u64::MAX),
+		kept(&[("a", 20)])
+	);
+	// A barrier above the horizon is not read yet: a reader at the horizon has them.
+	assert_eq!(
+		compact_history_for(&versions, false, History::All, vec![], 15),
+		kept(&[("a", 20), ("a", 10), ("a", 9)])
+	);
+}
+
+/// A version without a time reads as written when the versions before it were: it takes the
+/// newest time of the versions written before it.
+#[test]
+fn test_history_since_takes_the_time_of_a_version_without_one_from_the_versions_before_it() {
+	// The newest write has no time and reads as written at 200: it is inside the period, and so
+	// is the version that gave it the time.
+	let versions = [("a", 10, SET, 0), ("a", 9, SET, 200), ("a", 8, SET, 150)];
+	assert_eq!(
+		compact_history(&versions, true, History::Since(100)),
+		kept(&[("a", 10), ("a", 9), ("a", 8)])
+	);
+	// Written at 50 and after a write at 50: the later of the two is the version at the start of
+	// the period.
+	let versions = [("a", 10, SET, 0), ("a", 9, SET, 50), ("a", 8, SET, 20)];
+	assert_eq!(compact_history(&versions, true, History::Since(100)), kept(&[("a", 10)]));
+	// Above the bottom the time of the version without one is only known to be at least that, so
+	// the version it supersedes at 50 is kept as well
+	assert_eq!(
+		compact_history(&versions, false, History::Since(100)),
+		kept(&[("a", 10), ("a", 9)])
+	);
+}
+
+/// A snapshot reads the versions written before it, so the version it reads at the start of the
+/// period is the newest in time among those, which is not always the one that every reader
+/// reads. Each snapshot keeps its own.
+#[test]
+fn test_history_since_keeps_the_version_each_snapshot_reads_at_the_start_of_the_period() {
+	// Written at 250, backfilled at 100 before a snapshot at 7, and backfilled at 300 after it,
+	// with a version in the period on top. The snapshot reads 250 at the start of the period.
+	let versions =
+		[("a", 20, SET, 900), ("a", 9, SET, 300), ("a", 6, SET, 100), ("a", 5, SET, 250)];
+	assert_eq!(
+		compact_history_for(&versions, false, History::Since(600), vec![7], u64::MAX),
+		kept(&[("a", 20), ("a", 9), ("a", 6), ("a", 5)])
+	);
+	// Without the snapshot the version at 250 is no one's.
+	assert_eq!(
+		compact_history_for(&versions, false, History::Since(600), vec![], u64::MAX),
+		kept(&[("a", 20), ("a", 9)])
+	);
+}
+
+/// The version a read at the start of the period sees is the newest in time of what the reader
+/// sees: a version that a range deletion hides is not that, and the one it hides it from is
+/// kept.
+#[test]
+fn test_history_since_does_not_take_a_version_a_range_deletion_hides_as_the_one_at_the_start() {
+	let versions = [
+		("a0", 121, InternalKeyKind::RangeDelete, 0),
+		("a1", 133, SET, 770),
+		("a1", 128, SET, 200),
+		("a1", 124, SET, 740),
+		("a1", 119, SET, 450),
+	];
+	assert_eq!(
+		compact_history(&versions, false, History::Since(510)),
+		kept(&[("a0", 121), ("a1", 133), ("a1", 128), ("a1", 124)])
+	);
+}
+
+/// A range deletion is in the table of its start key, and a compaction reads the tables that
+/// overlap its keys, so one that covers the keys it reads can be in a table it does not read.
+/// Readers read it all the same: what it hides is not history, and is not the version a read at
+/// the start of the period sees.
+#[test]
+fn test_history_since_knows_the_range_deletions_of_the_tables_it_does_not_read() {
+	let versions =
+		[("a1", 40, SET, 150), ("a1", 30, SET, 60), ("a1", 25, SET, 70), ("a1", 10, SET, 90)];
+	let unread = vec![(b"a0".to_vec(), b"a2".to_vec(), 20)];
+	// The version at 90 was written before the range deletion, so it is hidden: the version at
+	// 70 is the one a read at 100 sees.
+	assert_eq!(
+		compact_history_with(&versions, false, History::Since(100), vec![], u64::MAX, unread),
+		kept(&[("a1", 40), ("a1", 25)])
+	);
+	// Without it the version at 90 is the one.
+	assert_eq!(
+		compact_history_for(&versions, false, History::Since(100), vec![], u64::MAX),
+		kept(&[("a1", 40), ("a1", 10)])
+	);
+}
+
+/// A version without a time reads as written when the versions before it that a reader of it
+/// reads were: a range deletion that the reader reads hides the ones before it.
+#[test]
+fn test_history_since_infers_the_time_of_a_version_without_one_past_a_range_deletion() {
+	// Written after a range deletion that hid a version at 900, and with a version at 60 below
+	// it: the version without a time reads as written at 60, the time of the version at 60 and
+	// newer than it, so it is the one at the start of the period and the version at 60 is not.
+	// The version at 900 that the range deletion hides is kept for what it was stamped with,
+	// which costs space and nothing else.
+	let versions = [("a1", 30, SET, 0), ("a1", 25, SET, 60), ("a1", 15, SET, 900)];
+	let unread = vec![(b"a0".to_vec(), b"a2".to_vec(), 20)];
+	assert_eq!(
+		compact_history_with(&versions, true, History::Since(100), vec![], u64::MAX, unread),
+		kept(&[("a1", 30), ("a1", 15)])
+	);
+}
+
+/// A version without a time is given that of the versions written before it. A compaction above
+/// the bottom level does not read them all, so it cannot tell the time of such a version, and
+/// keeps it, and the version that a read at the start of the period sees without it: one at the
+/// bottom reads everything there is.
+#[test]
+fn test_history_since_keeps_a_version_without_a_time_above_the_bottom_where_it_may_be_newer() {
+	let versions = [("a1", 30, SET, 0), ("a1", 25, SET, 80)];
+	assert_eq!(
+		compact_history_for(&versions, false, History::Since(100), vec![], u64::MAX),
+		kept(&[("a1", 30), ("a1", 25)])
+	);
+	assert_eq!(
+		compact_history_for(&versions, true, History::Since(100), vec![], u64::MAX),
+		kept(&[("a1", 30)])
+	);
+}
+
+/// A version without a time reads as written when the versions before it were. At the bottom
+/// level a compaction that keeps one stamps it with that time, so that it reads the same when a
+/// later compaction drops the versions it was inferred from.
+#[test]
+fn test_history_since_stamps_a_version_without_a_time_it_keeps_at_the_bottom() {
+	// The version at seq 30 has no time, and reads as written at 250, with the version at 25. It
+	// is the version a read at the start of the period sees, and those at 25 and 20 are not.
+	let versions =
+		[("a", 40, SET, 200), ("a", 30, SET, 0), ("a", 25, SET, 250), ("a", 20, SET, 200)];
+	assert_eq!(
+		compact_history_stamped(&versions, true, History::Since(460), vec![], u64::MAX, vec![]),
+		vec![("a".to_string(), 40, Some(200)), ("a".to_string(), 30, Some(250))]
+	);
+	// Above the bottom the time is not known, and nothing is stamped
+	assert_eq!(
+		compact_history_stamped(&versions, false, History::Since(460), vec![], u64::MAX, vec![]),
+		vec![
+			("a".to_string(), 40, Some(200)),
+			("a".to_string(), 30, None),
+			("a".to_string(), 25, Some(250)),
+		]
+	);
+	// Nor with every version kept, where nothing is dropped
+	let kept: Vec<_> =
+		compact_history_stamped(&versions, true, History::All, vec![], u64::MAX, vec![])
+			.into_iter()
+			.map(|(_, seq, time)| (seq, time))
+			.collect();
+	assert_eq!(kept, vec![(40, Some(200)), (30, None), (25, Some(250)), (20, Some(200))]);
+}
+
+/// A replace without a time reads at 0, whether or not a range deletion covers the key: it takes
+/// what is written before it away first, and so is not given the time of what it hides.
+#[test]
+fn test_history_since_gives_a_replace_without_a_time_the_time_0_past_a_range_deletion() {
+	let unread = vec![(b"a0".to_vec(), b"a2".to_vec(), 5)];
+	let versions = [("a1", 30, REPLACE, 0), ("a1", 20, SET, 500)];
+	for unread in [vec![], unread.clone()] {
+		assert_eq!(
+			compact_history_stamped(
+				&versions,
+				true,
+				History::Since(100),
+				vec![],
+				u64::MAX,
+				unread.clone()
+			),
+			vec![("a1".to_string(), 30, Some(0))],
+			"the replace is stamped with 0, unread range deletions {unread:?}"
+		);
+	}
+	// The version at 300 is the one a read at 600 sees: the replace at 0 hides the one at 500,
+	// and a time of 500 for the replace would have taken its place
+	let versions =
+		[("a1", 40, SET, 900), ("a1", 35, SET, 300), ("a1", 30, REPLACE, 0), ("a1", 25, SET, 500)];
+	for unread in [vec![], unread] {
+		assert_eq!(
+			compact_history_with(&versions, true, History::Since(600), vec![], u64::MAX, unread),
+			kept(&[("a1", 40), ("a1", 35)])
+		);
+	}
+}
+
+/// A barrier that a newer barrier hides from every reader is not read, and is not kept above the
+/// bottom for the tables below it: the newer barrier hides those as well.
+#[test]
+fn test_history_since_does_not_keep_the_barriers_that_another_hides() {
+	let versions = [
+		("a", 30, DELETE, 0),
+		("a", 25, SET, 5),
+		("a", 20, DELETE, 0),
+		("a", 15, SET, 5),
+		("a", 10, DELETE, 0),
+	];
+	assert_eq!(compact_history(&versions, false, History::Since(100)), kept(&[("a", 30)]));
+	// One that a snapshot reads stays: the snapshot is between it and the newer barrier
+	assert_eq!(
+		compact_history_for(&versions, false, History::Since(100), vec![22], u64::MAX),
+		kept(&[("a", 30), ("a", 20)])
+	);
 }

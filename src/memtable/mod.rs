@@ -568,7 +568,7 @@ impl MemTable {
 /// The value of a range delete is its raw end key, not an encoded value: it is never decoded or
 /// separated. Decoding needs two bytes, so a one-byte end key would fail the flush for good, and
 /// an end key longer than the threshold would be moved to the VLog and lose its meaning.
-fn maybe_separate_to_vlog(
+pub(crate) fn maybe_separate_to_vlog(
 	encoded_value: &[u8],
 	key: &InternalKey,
 	vlog: Option<&Arc<VLog>>,
@@ -591,7 +591,9 @@ fn maybe_separate_to_vlog(
 		if value.len() > vlog_threshold {
 			let encoded_key = key.encode();
 			let pointer = vlog.append(&encoded_key, value)?;
-			return Ok(ValueLocation::with_pointer(pointer).encode());
+			return Ok(ValueLocation::with_pointer(pointer)
+				.with_timestamp(location.timestamp)
+				.encode());
 		}
 	}
 

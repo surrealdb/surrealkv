@@ -41,10 +41,10 @@ fn reference_mask(crc: u32) -> u32 {
 	crc.rotate_right(15).wrapping_add(0xa282_ead8)
 }
 
-/// The footer of a table: format 1, checksum type 1, the two handles, zeros up to 42 bytes and
-/// the magic number.
+/// The footer of a table: format 2 (LSMV2), checksum type 1, the two handles, zeros up to 42 bytes
+/// and the magic number.
 fn reference_footer(meta_index: &BlockHandle, index: &BlockHandle) -> Vec<u8> {
-	let mut footer = vec![1u8, 1u8];
+	let mut footer = vec![2u8, 1u8];
 	footer.extend_from_slice(&meta_index.encode());
 	footer.extend_from_slice(&index.encode());
 	assert!(footer.len() <= 42, "the handles of a footer take at most 40 bytes");
@@ -527,9 +527,19 @@ impl<W: Write> ReferenceTableWriter<W> {
 		props.raw_key_size += key.size() as u64;
 		props.raw_value_size += value.len() as u64;
 
-		let ts = 0;
-		props.oldest_key_time = Some(props.oldest_key_time.map_or(ts, |t| t.min(ts)));
-		props.newest_key_time = Some(props.newest_key_time.map_or(ts, |t| t.max(ts)));
+		// The times of the versions the table holds: a barrier, or a version that has no time,
+		// spans every time.
+		let (oldest, newest) = match key.kind() {
+			InternalKeyKind::Delete | InternalKeyKind::RangeDelete | InternalKeyKind::Replace => {
+				(0, u64::MAX)
+			}
+			kind => match ValueLocation::entry_time(kind, value) {
+				Some(ts) => (ts, ts),
+				None => (0, u64::MAX),
+			},
+		};
+		props.oldest_key_time = Some(props.oldest_key_time.map_or(oldest, |t| t.min(oldest)));
+		props.newest_key_time = Some(props.newest_key_time.map_or(newest, |t| t.max(newest)));
 
 		if key.kind() == InternalKeyKind::RangeDelete {
 			props.num_range_deletions += 1;
