@@ -37,12 +37,12 @@ Every commit is flushed to disk before it returns (each figure is a single run).
 | **SurrealKV** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**6,985,826** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**150,251** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**160,043** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**63,282** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**903,668** |
 | RocksDB | 855,851 | 8,568 | 36,263 | 32,043 | 852,661 |
 | SlateDB | 92,303 | 8,257 | 8,122 | 8,242 | 17,985 |
-| Fjall | - | - | - | - | - |
-| ReDB | - | - | - | - | - |
-| LMDB | - | - | - | - | - |
-| Libmdbx | - | - | - | - | - |
+| Fjall | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> |
+| ReDB | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> |
+| LMDB | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> |
+| Libmdbx | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> | -<sup>*</sup> |
 
-Engines shown with a dash were not benchmarked with synchronous durability: at this dataset size the runs were too slow to complete in the time available.
+<sup>*</sup> Not benchmarked with synchronous durability: at this dataset size the run was too slow to complete in the time available.
 
 - **Creates (Writes)**: **150,251 OPS**: **17.5× faster** than RocksDB and **18.2× faster** than SlateDB.
 - **Updates**: **160,043 OPS**: **4.41× faster** than RocksDB and **19.7× faster** than SlateDB.
