@@ -2727,6 +2727,9 @@ impl Tree {
 	/// before a commit needs it, and after a commit failed with a key provider that was away, once
 	/// it is back. It may wait on the provider, and does nothing for a database that is not
 	/// encrypted.
+	///
+	/// Part of the encryption preview, and kept out of the documented interface until it is not.
+	#[doc(hidden)]
 	pub fn prepare_keys(&self) -> Result<()> {
 		self.core.inner.prepare_keys()
 	}
