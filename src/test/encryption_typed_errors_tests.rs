@@ -14,7 +14,15 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::encryption_background_tests::{Mode, SwitchManager};
-use super::encryption_commit_path_tests::{active_segment, commit, crash, get, open, options};
+use super::encryption_commit_path_tests::{
+	active_segment,
+	assert_running,
+	commit,
+	crash,
+	get,
+	open,
+	options,
+};
 use super::encryption_open_tests::{snapshot, SUITES};
 use crate::error::{EncryptionError, KeyProviderFailure};
 use crate::lsm::Core;
@@ -99,6 +107,39 @@ async fn a_key_that_cannot_be_had_is_the_error_of_every_rotation_of_the_wal_and_
 		commit(&tree, "after", 40).await.unwrap();
 		assert_eq!(get(&tree, "after"), Some(vec![b'v'; 40]), "{what}");
 		assert!(inner.error_handler.check_error().is_ok(), "{what}");
+		crash(&tree);
+	}
+}
+
+/// A seal that the log refuses, which only a bug that rewinds the count of a segment can make, is
+/// told to the committer as what it is: not a provider that may come back, and not an I/O error.
+#[tokio::test]
+async fn a_seal_that_the_log_refuses_is_the_error_of_the_commit_and_the_segment_is_replaced() {
+	for suite in SUITES {
+		let what = format!("{suite:?}");
+		let dir = TempDir::new().unwrap();
+		let km = SwitchManager::new();
+		let enc = context(&km, suite);
+		let tree = open(options(dir.path(), &enc, false)).await;
+		commit(&tree, "a", 40).await.unwrap();
+
+		// The count of the segment goes back to the batch that was sealed, as a bug would make it.
+		tree.core.inner.wal.write().set_next_index(1);
+		let refused = commit(&tree, "b", 40).await;
+		assert!(
+			matches!(refused, Err(Error::Encryption(EncryptionError::PositionReuse))),
+			"{what}: {refused:?}"
+		);
+		assert_running(&tree, &what);
+		assert!(tree.core.inner.wal.read().needs_replacement(), "{what}");
+		assert_eq!(get(&tree, "b"), None, "{what}");
+
+		// The segment that refused is replaced, under a key of its own, and the commits go on.
+		commit(&tree, "c", 40).await.unwrap();
+		assert!(!tree.core.inner.wal.read().needs_replacement(), "{what}");
+		assert_eq!(get(&tree, "a"), Some(vec![b'v'; 40]), "{what}");
+		assert_eq!(get(&tree, "c"), Some(vec![b'v'; 40]), "{what}");
+		assert_running(&tree, &what);
 		crash(&tree);
 	}
 }
