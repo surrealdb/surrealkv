@@ -66,6 +66,8 @@ pub mod encryption_checkpoint_tests;
 pub mod encryption_checkpoint_wal_tests;
 #[cfg(test)]
 pub mod encryption_commit_path_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod encryption_fuzz_tests;
 #[cfg(test)]
 pub mod encryption_open_tests;
 #[cfg(test)]
