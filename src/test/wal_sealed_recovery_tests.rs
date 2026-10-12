@@ -71,7 +71,7 @@ impl Recovered {
 /// Replays the WAL in `dir` as a tree does, with the context and the mode, and keeps what it made.
 fn recover(context: &WalContext, dir: &Path, mode: WalRecoveryMode) -> crate::Result<Recovered> {
 	let mut memtables = Vec::new();
-	let (max_seq, active) =
+	let (max_seq, active, _) =
 		Core::replay_wal_in(context, dir, 0, "test", mode, ARENA, |memtable, _, _| {
 			memtables.push(memtable);
 			Ok(())
@@ -412,7 +412,7 @@ fn a_sealed_segment_whose_type_byte_rotted_is_still_refused_by_a_wal_that_has_no
 			let dir = work_copy(template.path());
 			spoil(dir.path());
 			let before = snapshot(dir.path());
-			let error = crate::wal::recovery::repair_corrupted_wal_segment(dir.path(), 0)
+			let error = crate::wal::recovery::repair_corrupted_wal_segment(dir.path(), 0, 0)
 				.expect_err("a keyless repair of a sealed segment must be refused");
 			assert!(is_encryption(&error, &EncryptionError::NotConfigured), "{error}");
 			assert_eq!(snapshot(dir.path()), before, "{suite:?}, type byte {rotted:#x}");

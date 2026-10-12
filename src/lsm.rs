@@ -26,8 +26,14 @@ use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vlog::{VLog, ValueLocation};
-use crate::wal::recovery::{repair_corrupted_wal_segment_with, replay_wal_with};
-use crate::wal::{self, cleanup_old_segments_for, Wal, WalManager};
+use crate::wal::recovery::{
+	classify_wal_damage,
+	repair_corrupted_wal_segment,
+	replay_wal_inner_with,
+	WalDamage,
+	WalRecoveryReport,
+};
+use crate::wal::{self, cleanup_old_segments_for, list_segment_ids, Wal, WalManager};
 use crate::{
 	Comparator,
 	Error,
@@ -264,6 +270,9 @@ pub(crate) struct CoreInner {
 	#[cfg(test)]
 	pub(crate) compaction_stage_hook:
 		parking_lot::Mutex<Option<crate::compaction::compactor::CompactionStageHook>>,
+
+	/// Report of actions taken during WAL recovery at database open.
+	pub(crate) recovery_report: parking_lot::RwLock<WalRecoveryReport>,
 }
 
 /// What a failed `write_batch_direct_to_l0_sst` leaves behind.
@@ -375,6 +384,7 @@ impl CoreInner {
 			checkpoint_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
 			compaction_stage_hook: parking_lot::Mutex::new(None),
+			recovery_report: parking_lot::RwLock::new(WalRecoveryReport::default()),
 		})
 	}
 
@@ -1553,7 +1563,7 @@ impl Core {
 		recovery_mode: WalRecoveryMode,
 		arena_size: usize,
 		flush_memtable: F,
-	) -> Result<(Option<u64>, Option<Arc<MemTable>>)>
+	) -> Result<(Option<u64>, Option<Arc<MemTable>>, WalRecoveryReport)>
 	where
 		F: FnMut(Arc<MemTable>, u64, bool) -> Result<()>,
 	{
@@ -1597,29 +1607,29 @@ impl Core {
 		recovery_mode: WalRecoveryMode,
 		arena_size: usize,
 		mut flush_memtable: F,
-	) -> Result<(Option<u64>, Option<Arc<MemTable>>)>
+	) -> Result<(Option<u64>, Option<Arc<MemTable>>, WalRecoveryReport)>
 	where
 		F: FnMut(Arc<MemTable>, u64, bool) -> Result<()>,
 	{
-		// Replay WAL - returns memtables per segment
-		let (wal_seq_num_opt, memtables) = match replay_wal_with(
-			wal_context,
-			wal_path,
-			min_wal_number,
-			arena_size,
-		) {
-			Ok(result) => result,
-			Err(Error::WalCorruption {
-				segment_id,
-				offset,
-				message,
-			}) => {
-				// Handle corruption based on recovery mode
-				match recovery_mode {
+		let mut report = WalRecoveryReport::default();
+		let mut repair_attempts = 0;
+
+		let (wal_seq_num_opt, memtables) = loop {
+			match replay_wal_inner_with(wal_context, wal_path, min_wal_number, arena_size) {
+				Ok((seq, memtables, total_batches, segments_processed)) => {
+					report.records_replayed = total_batches;
+					report.segments_replayed = segments_processed;
+					break (seq, memtables);
+				}
+				Err(Error::WalCorruption {
+					segment_id,
+					offset,
+					message,
+				}) => match recovery_mode {
 					WalRecoveryMode::AbsoluteConsistency => {
 						tracing::error!(
 							"WAL corruption detected in segment {} at offset {}: {}. \
-							AbsoluteConsistency mode: failing immediately without repair.",
+								AbsoluteConsistency mode: failing immediately without repair.",
 							segment_id,
 							offset,
 							message
@@ -1630,60 +1640,133 @@ impl Core {
 							message,
 						});
 					}
-					WalRecoveryMode::TolerateCorruptedWithRepair => {
-						tracing::warn!(
-							"Detected WAL corruption in segment {} at offset {}: {}. Attempting repair...",
-							segment_id,
-							offset,
-							message
-						);
+					WalRecoveryMode::TolerateTornTail => {
+						if repair_attempts >= 10 {
+							return Err(Error::Other(format!(
+									"{context} failed: exceeded maximum repair attempts for WAL segment {segment_id}"
+								)));
+						}
+						repair_attempts += 1;
 
-						// Attempt repair
-						if let Err(repair_err) =
-							repair_corrupted_wal_segment_with(wal_context, wal_path, segment_id)
-						{
-							tracing::error!("Failed to repair WAL segment: {repair_err}");
-							return Err(match repair_err {
-								// A key that could not be had, the repair of a sealed segment needs
-								// one, is not a segment that could not be repaired, and may be asked
-								// for again: it keeps its type.
-								Error::Encryption(_) => repair_err,
-								repair_err => Error::Other(format!(
-									"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
-								)),
-							});
+						// A tear at the end of a sealed segment is already tolerated by its replay,
+						// so what reaches here is damage that is not one.
+						// Its records cannot be told apart without the key,
+						// and nothing is discarded unless asked for.
+						if wal_context.is_sealed() {
+							return Err(Error::Other(format!(
+								"WAL segment {segment_id:020}.wal is damaged at offset {offset} and is not a torn tail: {message}. \
+								Automatic repair refused to prevent data loss. Configure WalRecoveryMode::SalvageValidPrefix to explicitly salvage."
+							)));
 						}
 
-						// Retry after repair
-						match replay_wal_with(wal_context, wal_path, min_wal_number, arena_size) {
-							Ok(result) => result,
-							Err(Error::WalCorruption {
-								segment_id: seg_id,
-								offset: off,
-								message,
-							}) => {
-								return Err(Error::Other(format!(
-									"{context} failed: WAL segment {seg_id} still corrupted at offset {off} after repair: {message}"
-								)));
+						let segment_path = wal_path.join(format!("{segment_id:020}.wal"));
+						let all_ids = list_segment_ids(wal_path, Some("wal"))?;
+						let max_segment_id = all_ids.into_iter().max().unwrap_or(segment_id as u64);
+						let is_last_segment = segment_id as u64 == max_segment_id;
+
+						let damage = classify_wal_damage(&segment_path, offset, is_last_segment)?;
+						match damage {
+							WalDamage::TornTail {
+								last_valid_offset,
+								file_size,
+							} => {
+								tracing::info!(
+										"Torn tail detected at end of last WAL segment {segment_id} at offset {last_valid_offset} \
+										(file size {file_size}). Trimming torn tail and quarantining original."
+									);
+								let (quarantine_path, bytes_trimmed) =
+									repair_corrupted_wal_segment(
+										wal_path,
+										segment_id,
+										last_valid_offset,
+									)?;
+								report.quarantined_files.push(quarantine_path);
+								report.bytes_trimmed += bytes_trimmed;
 							}
-							Err(retry_err) => {
-								return Err(match retry_err {
-									Error::Encryption(_) => retry_err,
-									retry_err => Error::Other(format!(
-										"{context} failed: WAL replay failed after repair. {retry_err}"
-									)),
-								});
+							WalDamage::InteriorCorruption {
+								last_valid_offset,
+								intact_records_after,
+								is_last_segment,
+								..
+							} => {
+								let explanation = if !is_last_segment {
+									format!(
+											"WAL segment {segment_id} is an older segment (newest is {max_segment_id}); older segments cannot have torn tails"
+										)
+								} else {
+									format!(
+											"found {intact_records_after} intact record(s) after corruption offset {last_valid_offset}"
+										)
+								};
+								tracing::error!(
+										"Refusing automatic repair of interior corruption in WAL segment {segment_id} at offset {last_valid_offset}: {explanation}. \
+										Configure WalRecoveryMode::SalvageValidPrefix to explicitly discard subsequent data."
+									);
+								return Err(Error::Other(format!(
+										"WAL segment {segment_id:020}.wal has interior corruption at offset {last_valid_offset} ({explanation}). \
+										Automatic repair refused to prevent data loss. Configure WalRecoveryMode::SalvageValidPrefix to explicitly salvage."
+									)));
 							}
 						}
 					}
-				}
+					WalRecoveryMode::SalvageValidPrefix
+					| WalRecoveryMode::TolerateCorruptedWithRepair => {
+						if repair_attempts >= 10 {
+							return Err(Error::Other(format!(
+									"{context} failed: exceeded maximum repair attempts for WAL segment {segment_id}"
+								)));
+						}
+						repair_attempts += 1;
+
+						// A sealed segment is repaired by its own code, which keeps the records
+						// before the damage and deletes nothing. A key that
+						// could not be had keeps its type.
+						if wal_context.is_sealed() {
+							tracing::warn!(
+								"Salvaging the valid prefix of sealed WAL segment {segment_id}: {message}"
+							);
+							wal::sealed_recovery::repair(wal_context, wal_path, segment_id)?;
+							continue;
+						}
+
+						let segment_path = wal_path.join(format!("{segment_id:020}.wal"));
+						let all_ids = list_segment_ids(wal_path, Some("wal"))?;
+						let max_segment_id = all_ids.into_iter().max().unwrap_or(segment_id as u64);
+						let is_last_segment = segment_id as u64 == max_segment_id;
+
+						let damage = classify_wal_damage(&segment_path, offset, is_last_segment)?;
+						let (last_valid_offset, intact_records_after) = match damage {
+							WalDamage::TornTail {
+								last_valid_offset,
+								..
+							} => (last_valid_offset, 0),
+							WalDamage::InteriorCorruption {
+								last_valid_offset,
+								intact_records_after,
+								..
+							} => {
+								tracing::warn!(
+										"Salvaging valid prefix of WAL segment {segment_id} up to offset {last_valid_offset}. \
+										Discarding subsequent data ({intact_records_after} intact records after corruption)."
+									);
+								(last_valid_offset, intact_records_after)
+							}
+						};
+
+						report.records_dropped += intact_records_after;
+						let (quarantine_path, bytes_trimmed) =
+							repair_corrupted_wal_segment(wal_path, segment_id, last_valid_offset)?;
+						report.quarantined_files.push(quarantine_path);
+						report.bytes_trimmed += bytes_trimmed;
+					}
+				},
+				Err(e) => return Err(e),
 			}
-			Err(e) => return Err(e),
 		};
 
 		// If no memtables, nothing was recovered
 		if memtables.is_empty() {
-			return Ok((None, None));
+			return Ok((None, None, report));
 		}
 
 		// Flush all memtables except the last to SST
@@ -1724,7 +1807,7 @@ impl Core {
 			if !last_memtable.is_empty() {
 				flush_memtable(last_memtable, last_wal_number, false)?;
 			}
-			return Ok((wal_seq_num_opt, None));
+			return Ok((wal_seq_num_opt, None, report));
 		}
 		let entry_count = {
 			let mut iter = last_memtable.iter();
@@ -1743,7 +1826,7 @@ impl Core {
 			entry_count
 		);
 
-		Ok((wal_seq_num_opt, Some(last_memtable)))
+		Ok((wal_seq_num_opt, Some(last_memtable), report))
 	}
 
 	/// Creates a new LSM tree with background task management
@@ -1766,7 +1849,7 @@ impl Core {
 		);
 
 		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
-		let (wal_seq_num_opt, recovered_memtable) = Self::replay_wal_in(
+		let (wal_seq_num_opt, recovered_memtable, startup_report) = Self::replay_wal_in(
 			&wal::WalContext::for_options(&opts)?,
 			&wal_path,
 			min_wal_number,
@@ -1795,6 +1878,17 @@ impl Core {
 				Ok(())
 			},
 		)?;
+
+		if startup_report.bytes_trimmed > 0 || startup_report.records_dropped > 0 {
+			tracing::warn!(
+				"WAL recovery completed with modifications: {} bytes trimmed, {} records dropped, {} quarantined files: {:?}",
+				startup_report.bytes_trimmed,
+				startup_report.records_dropped,
+				startup_report.quarantined_files.len(),
+				startup_report.quarantined_files
+			);
+		}
+		*inner.recovery_report.write() = startup_report;
 
 		// Always continue in a fresh segment: replay may have repaired (replaced) the
 		// segment the writer was opened on, or flushed it and moved the manifest's
@@ -2636,7 +2730,7 @@ impl Tree {
 		}
 
 		// Replay any WAL entries that were restored
-		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_in(
+		let (wal_seq_num_opt, recovered_memtable, restore_report) = Core::replay_wal_in(
 			&wal::WalContext::for_options(&self.core.inner.opts)?,
 			&wal_path,
 			manifest_log_number,
@@ -2665,6 +2759,8 @@ impl Tree {
 				Ok(())
 			},
 		)?;
+
+		*self.core.inner.recovery_report.write() = restore_report;
 
 		// Always continue in a fresh segment: replay may have repaired (replaced) the
 		// segment the writer was opened on, or flushed it and moved the manifest's
@@ -2810,6 +2906,11 @@ impl Tree {
 	/// This is safe to call concurrently with ongoing transactions.
 	pub fn flush_wal(&self, sync: bool) -> Result<()> {
 		self.core.flush_wal(sync)
+	}
+
+	/// Returns the report of actions taken during WAL recovery at database open.
+	pub fn recovery_report(&self) -> WalRecoveryReport {
+		self.core.inner.recovery_report.read().clone()
 	}
 }
 

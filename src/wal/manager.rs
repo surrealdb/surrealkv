@@ -49,6 +49,7 @@ pub struct Wal {
 
 impl Wal {
 	/// Opens or creates a new WAL instance.
+	#[allow(dead_code)]
 	pub(crate) fn open(dir: &Path, opts: Options) -> Result<Self> {
 		// Ensure the options are valid
 		opts.validate()?;
@@ -343,7 +344,7 @@ impl Wal {
 	/// Reads the first record's header. If it's a SetCompressionType record,
 	/// parses and returns that compression type. Otherwise returns None (no
 	/// compression).
-	fn detect_compression_type(file_path: &Path) -> Result<CompressionType> {
+	pub(crate) fn detect_compression_type(file_path: &Path) -> Result<CompressionType> {
 		let mut file = File::open(file_path)?;
 
 		// Read just enough for the header

@@ -80,6 +80,7 @@ pub use crate::transaction::{
 	Transaction,
 	WriteOptions,
 };
+pub use crate::wal::WalRecoveryReport;
 
 /// An optimised trait for converting values to bytes only when needed
 pub trait IntoBytes {
@@ -205,12 +206,20 @@ pub enum VLogChecksumLevel {
 /// WAL recovery mode to control consistency guarantees during crash recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WalRecoveryMode {
-	/// Attempt automatic repair of corrupted WAL segments and retry replay.
+	/// Trim only a proven torn tail in the last segment. Refuse interior corruption
+	/// or corruption in any earlier segment.
 	#[default]
-	TolerateCorruptedWithRepair,
+	TolerateTornTail,
 
-	/// Fail immediately on any WAL corruption (no repair attempted).
+	/// Fail immediately on any WAL corruption (no repair or trimming attempted).
 	AbsoluteConsistency,
+
+	/// Salvage any valid prefix before corruption in any segment, discarding
+	/// all subsequent records.
+	SalvageValidPrefix,
+
+	/// Backward-compatible alias for `SalvageValidPrefix`.
+	TolerateCorruptedWithRepair,
 }
 
 #[derive(Clone)]

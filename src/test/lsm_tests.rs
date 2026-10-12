@@ -2194,7 +2194,7 @@ async fn test_clean_shutdown_actually_skips_wal() {
 		let wal_path = opts.wal_dir();
 		let min_wal_number = log_number;
 
-		let (wal_seq_opt, _memtable_opt) = Core::replay_wal_with_repair(
+		let (wal_seq_opt, _memtable_opt, _report) = Core::replay_wal_with_repair(
 			&wal_path,
 			min_wal_number,
 			"Test",
@@ -4155,12 +4155,12 @@ async fn test_wal_recovery_mode_tolerate_with_repair_succeeds_on_corruption() {
 
 #[test]
 fn test_wal_recovery_mode_default_is_tolerate_with_repair() {
-	// Verify that the default recovery mode is TolerateCorruptedWithRepair
+	// Verify that the default recovery mode is TolerateTornTail
 	let opts = Options::default();
 	assert_eq!(
 		opts.wal_recovery_mode,
-		WalRecoveryMode::TolerateCorruptedWithRepair,
-		"Default recovery mode should be TolerateCorruptedWithRepair"
+		WalRecoveryMode::TolerateTornTail,
+		"Default recovery mode should be TolerateTornTail"
 	);
 }
 
