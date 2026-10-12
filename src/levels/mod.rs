@@ -6,12 +6,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crc32fast::Hasher;
 use iter::LevelManifestIterator;
 pub(crate) use level::{Level, Levels};
 use rand::Rng;
 
 use crate::error::{EncryptionError, Error};
-use crate::sstable::table::Table;
+use crate::sstable::table::{mask, Table};
 use crate::tde::{
 	is_cut_inside_manifest_magic,
 	is_sealed_manifest,
@@ -335,20 +336,31 @@ pub(crate) struct LevelManifest {
 	pub(crate) encryption: Option<Arc<EncryptionContext>>,
 }
 
+pub(crate) const MANIFEST_TRAILER_MAGIC: [u8; 8] = *b"SKVMNFST";
+pub(crate) const MANIFEST_TRAILER_LEN: usize = 16;
+
+/// Computes the masked CRC-32 checksum of manifest body data.
+pub(crate) fn calculate_manifest_crc(data: &[u8]) -> u32 {
+	let mut hasher = Hasher::new();
+	hasher.update(data);
+	mask(hasher.finalize())
+}
+
 /// The contents of a manifest file, decoded without opening the tables it lists.
-struct DecodedManifest {
-	version: u16,
-	next_table_id: u64,
-	log_number: u64,
-	last_sequence: u64,
+#[derive(Debug)]
+pub(crate) struct DecodedManifest {
+	pub(crate) version: u16,
+	pub(crate) next_table_id: u64,
+	pub(crate) log_number: u64,
+	pub(crate) last_sequence: u64,
 	/// Table ids of each level
-	level_data: Vec<Vec<u64>>,
-	snapshots: Vec<SnapshotInfo>,
+	pub(crate) level_data: Vec<Vec<u64>>,
+	pub(crate) snapshots: Vec<SnapshotInfo>,
 }
 
 impl DecodedManifest {
-	fn decode(data: Vec<u8>) -> Result<Self> {
-		let mut level_manifest = Cursor::new(data);
+	pub(crate) fn decode(data: Vec<u8>) -> Result<Self> {
+		let mut level_manifest = Cursor::new(&data);
 
 		// Read versioned manifest format
 		let mut u16_buf = [0u8; 2];
@@ -393,6 +405,43 @@ impl DecodedManifest {
 			level_manifest.read_exact(&mut snapshot_bytes)?;
 			let snapshot = SnapshotInfo::decode(&snapshot_bytes)?;
 			snapshots.push(snapshot);
+		}
+
+		let body_len = level_manifest.position() as usize;
+		let remaining = data.len().saturating_sub(body_len);
+
+		if remaining == 0 {
+			// Legacy manifest without checksum trailer: accept for backwards compatibility
+			tracing::info!("Legacy manifest without checksum trailer accepted");
+		} else if remaining == MANIFEST_TRAILER_LEN {
+			let trailer = &data[body_len..];
+			let trailer_body_len = u32::from_be_bytes(trailer[0..4].try_into().unwrap()) as usize;
+			let trailer_crc = u32::from_be_bytes(trailer[4..8].try_into().unwrap());
+			let magic: [u8; 8] = trailer[8..16].try_into().unwrap();
+
+			if magic != MANIFEST_TRAILER_MAGIC {
+				return Err(Error::ManifestCorruption(format!(
+					"Manifest trailer magic mismatch: expected {:?}, got {:?}",
+					MANIFEST_TRAILER_MAGIC, magic
+				)));
+			}
+			if trailer_body_len != body_len {
+				return Err(Error::ManifestCorruption(format!(
+					"Manifest trailer body length mismatch: recorded {}, actual {}",
+					trailer_body_len, body_len
+				)));
+			}
+			let actual_crc = calculate_manifest_crc(&data[..body_len]);
+			if trailer_crc != actual_crc {
+				return Err(Error::ManifestCorruption(format!(
+					"Manifest checksum mismatch: recorded 0x{:08x}, computed 0x{:08x}",
+					trailer_crc, actual_crc
+				)));
+			}
+		} else {
+			return Err(Error::ManifestCorruption(format!(
+				"Manifest corruption: trailing data of length {remaining} bytes (expected 0 or {MANIFEST_TRAILER_LEN})"
+			)));
 		}
 
 		Ok(Self {
@@ -488,6 +537,14 @@ impl LevelManifest {
 			level_data,
 			snapshots,
 		} = DecodedManifest::decode(data)?;
+
+		// Sweep stale temporary manifest files left behind by uncompleted writes. An encrypted
+		// database never deletes what it did not write: such a file may hold a sealed manifest.
+		if encryption.is_none() {
+			if let Some(parent) = manifest_path.as_ref().parent() {
+				sweep_stale_manifest_temp_files(parent);
+			}
+		}
 
 		// Validate log_number against actual WAL segments BEFORE proceeding
 		validate_wal_log_number(&opts.wal_dir(), log_number)?;
@@ -1055,6 +1112,13 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 		buf.extend_from_slice(&snapshot_bytes);
 	}
 
+	// Append checksum trailer
+	let body_len = buf.len() as u32;
+	let crc = calculate_manifest_crc(&buf);
+	buf.extend_from_slice(&body_len.to_be_bytes());
+	buf.extend_from_slice(&crc.to_be_bytes());
+	buf.extend_from_slice(&MANIFEST_TRAILER_MAGIC);
+
 	// An encrypted database's manifest is sealed here, on every write and under a salt drawn
 	// by this write: a failed write that is tried again seals again, and never reuses a key.
 	// Failing to seal writes nothing.
@@ -1065,4 +1129,17 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 	replace_file_content(&manifest.path, &content)?;
 	tracing::debug!("Manifest written successfully to {:?}", manifest.path);
 	Ok(())
+}
+
+/// Sweeps any temporary manifest files (`.tmp_*`) left behind in the manifest directory.
+pub(crate) fn sweep_stale_manifest_temp_files(dir: &Path) {
+	if let Ok(entries) = std::fs::read_dir(dir) {
+		for entry in entries.flatten() {
+			let name = entry.file_name();
+			let name_str = name.to_string_lossy();
+			if name_str.starts_with(".tmp_") {
+				let _ = std::fs::remove_file(entry.path());
+			}
+		}
+	}
 }

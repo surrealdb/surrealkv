@@ -214,7 +214,13 @@ fn a_manifest_without_a_context_is_the_bytes_that_a_plaintext_database_always_ha
 	expected.push(3);
 	expected.extend_from_slice(&[0u8; 12]);
 	expected.extend_from_slice(&[0u8; 4]);
-	assert_eq!(fs::read(opts.manifest_file_path(0)).unwrap(), expected);
+
+	// Then the checksum trailer: the length of the body, its masked CRC-32, and the magic.
+	let mut written = expected.clone();
+	written.extend_from_slice(&(expected.len() as u32).to_be_bytes());
+	written.extend_from_slice(&crate::levels::calculate_manifest_crc(&expected).to_be_bytes());
+	written.extend_from_slice(b"SKVMNFST");
+	assert_eq!(fs::read(opts.manifest_file_path(0)).unwrap(), written);
 	assert!(frozen_old_decode(&expected).is_ok());
 }
 
