@@ -81,7 +81,7 @@ Range scans over the same dataset, as scans per second, without synchronous dura
 | :--- | ---: | ---: | ---: | ---: | ---: |
 | **SurrealKV** | 896,366 | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2,313,942** | 96,365 | 98,612 | 402 |
 | RocksDB | 851,848 | 851,580 | 35,539 | 35,902 | 159 |
-| SlateDB | 26,187 | 26,266 | 7,460 | 7,477 | 87.0 |
+| SlateDB | 26,187 | 26,266 | 7,460 | 7,477 | 87 |
 | Fjall | 132,698 | 151,861 | 4,335 | 4,383 | 42.4 |
 | ReDB | 561,837 | 571,629 | 44,438 | 44,462 | 249 |
 | LMDB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1,192,772** | 1,195,166 | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**549,220** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**552,090** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**902** |
