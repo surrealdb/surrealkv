@@ -116,8 +116,10 @@ impl KeyUsage {
 ///   not look at any.
 ///
 /// A file whose header cannot be read, `unattributed`, may be under any key, so a count that has
-/// some is not a proof that a key is unused. A key that is destroyed while a file needs it makes
-/// that file unreadable, and there is no way back.
+/// some is not a proof that a key is unused. A copy of a file that was kept aside under another
+/// name, such as a segment of the log that a repair kept, is not counted either: `notes` says which
+/// key it is sealed under, and it cannot be read once that key is destroyed. A key that is
+/// destroyed while a file needs it makes that file unreadable, and there is no way back.
 ///
 /// Key ids that no file names are not listed, except the active one: a key manager has no way
 /// to say which ids it holds.
@@ -227,10 +229,20 @@ impl Tally<'_> {
 
 /// Describes `path` for the report, which a file that has gone is not: it was removed between
 /// the listing of its directory and the look at it, which is what a database that is running does.
+/// A file that was shorter when it was read than when it was measured is gone in the same way, a
+/// write that began again where the old one ended. Any other failure to read is the error of the
+/// report: a file that cannot be looked at is not a file that has nothing to say.
 fn describe_present(path: &Path) -> Result<Option<FileDescription>> {
 	match crate::describe::describe_file(path) {
 		Ok(description) => Ok(Some(description)),
-		Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+		Err(Error::Io(error))
+			if matches!(
+				error.kind(),
+				std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+			) =>
+		{
+			Ok(None)
+		}
 		Err(error) => Err(error),
 	}
 }
@@ -402,11 +414,20 @@ fn walk_files(
 			Ok(entries) => {
 				for entry in entries {
 					let entry = entry?;
+					let path = entry.path();
 					// A directory, such as the place that a repair of the log works in, is not a
-					// file of the database.
-					if entry.file_type()?.is_file() {
-						names
-							.push((entry.file_name().to_string_lossy().into_owned(), entry.path()));
+					// file of the database. A link is the file that it leads to, as it is for the
+					// engine, which opens a table by its path and lists the segments of the log
+					// through `metadata`: a file that is a link is live, and a key that covers it
+					// must not be said to cover nothing. A file that has gone since it was listed,
+					// or a link that leads nowhere, is no file.
+					match std::fs::metadata(&path) {
+						Ok(metadata) if metadata.is_file() => {
+							names.push((entry.file_name().to_string_lossy().into_owned(), path));
+						}
+						Ok(_) => {}
+						Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+						Err(error) => return Err(error.into()),
 					}
 				}
 			}

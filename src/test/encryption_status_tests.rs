@@ -286,6 +286,37 @@ async fn a_file_of_another_database_and_suite_and_a_renamed_file_are_reported() 
 	);
 }
 
+/// The engine opens a table by its path and lists the segments of the log through `metadata`, so a
+/// file that is a link is live, and a key that covers it is needed. A report that skipped links
+/// would say that the key covers nothing.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_file_that_is_a_link_is_counted_as_the_file_that_it_leads_to() {
+	let (dir, _) = database().await;
+	let before = on_disk(dir.path());
+	let table = first_table(dir.path());
+	let size = fs::metadata(&table).unwrap().len();
+
+	// The table is moved out of the directory and a link to it takes its place, under its name.
+	let elsewhere = TempDir::new().unwrap();
+	let moved = elsewhere.path().join(table.file_name().unwrap());
+	fs::rename(&table, &moved).unwrap();
+	std::os::unix::fs::symlink(&moved, &table).unwrap();
+
+	let report = encryption_report(dir.path()).unwrap();
+	assert!(report.is_consistent(), "{:?}", report.warnings);
+	assert_eq!(counted_under(&report, 1), before);
+	assert_eq!(counted_under(&report, 1), on_disk(dir.path()));
+
+	// A link that leads nowhere is no file, as it is not one for the engine.
+	fs::remove_file(&moved).unwrap();
+	let report = encryption_report(dir.path()).unwrap();
+	assert!(report.is_consistent(), "{:?}", report.warnings);
+	let under_key_1 = counted_under(&report, 1);
+	assert_eq!(under_key_1[1], (before[1].0 - 1, before[1].1 - size));
+	assert_eq!((under_key_1[0], under_key_1[2], under_key_1[3]), (before[0], before[2], before[3]));
+}
+
 #[tokio::test]
 async fn a_header_that_cannot_be_read_is_reported_and_belongs_to_no_key() {
 	let (dir, _) = database().await;
