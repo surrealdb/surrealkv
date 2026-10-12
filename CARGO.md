@@ -26,8 +26,6 @@ It is designed as an independent, standalone key-value store suitable for high-t
 
 ## Performance
 
-> **The write figures are provisional.** The Create, Update and Delete numbers below were measured before a fix to WAL group commit and are being re-measured. The memory figures come from the same benchmark run and may change as well. Write throughput also depends on durability: the default is `Durability::Eventual`, where a commit does not wait for an fsync, while these numbers were produced with `--sync`.
-
 Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Processor @ 5.48 GHz, 128 GB DDR5 RAM, 4TB PCIe 4.0 NVMe SSD**, 500,000 keys across 48 concurrent worker threads with 128 clients, synchronous durability enabled with `--sync` via [`crud-bench`](https://github.com/surrealdb/crud-bench)):
 
 | Engine | Point&nbsp;Read&nbsp;(OPS) | Create&nbsp;(OPS) | Update&nbsp;(OPS) | Delete&nbsp;(OPS) | Scan&nbsp;(OPS) |
@@ -40,11 +38,29 @@ Benchmarked on bare metal (**AMD Ryzen Threadripper 9970X 32-Core / 64-Thread Pr
 | LMDB | 1,269,373 | 694 | 701 | 703 | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**1,007** |
 | Libmdbx | 627,955 | 706 | 712 | 674 | 925 |
 
-- **Creates (Writes)**: **219,545 OPS** (**6.24× faster** than RocksDB, **26.5× faster** than SlateDB, **170× faster** than ReDB, and **206× faster** than Fjall) in the `--sync` run (provisional, see above).
-- **Updates**: **199,730 OPS** (**5.43× faster** than RocksDB, **24.5× faster** than SlateDB, **144× faster** than ReDB, and **174× faster** than Fjall) in the `--sync` run (provisional, see above).
+- **Creates (Writes)**: **219,545 OPS** (**6.24× faster** than RocksDB, **26.5× faster** than SlateDB, **170× faster** than ReDB, and **206× faster** than Fjall).
+- **Updates**: **199,730 OPS** (**5.43× faster** than RocksDB, **24.5× faster** than SlateDB, **144× faster** than ReDB, and **174× faster** than Fjall).
 - **Point Reads**: **6.75M OPS** sustained (**5.32× faster** than LMDB, **7.80× faster** than RocksDB, **20.3× faster** than ReDB, and **76.2× faster** than SlateDB).
-- **Deletes**: **253,717 OPS** (**6.80× faster** than RocksDB, **30.9× faster** than SlateDB, **184× faster** than ReDB, and **283× faster** than Fjall), also provisional.
-- **Range Scans**: **1.80× faster** than ReDB, **3.01× faster** than RocksDB, **5.42× faster** than SlateDB, and **10.3× faster** than Fjall via zero-copy iterator merges and block-level restart points. LMDB (**1,007 OPS**) and Libmdbx (**925 OPS**) are faster at scans than SurrealKV (**438 OPS**), by **2.30×** and **2.11×**.
+- **Deletes**: **253,717 OPS** (**6.80× faster** than RocksDB, **30.9× faster** than SlateDB, **184× faster** than ReDB, and **283× faster** than Fjall).
+- **Range Scans**: **1.80× faster** than ReDB, **3.01× faster** than RocksDB, **5.42× faster** than SlateDB, and **10.3× faster** than Fjall via zero-copy iterator merges and block-level restart points. LMDB (**1,007 OPS**) and Libmdbx (**925 OPS**) are faster at scans than SurrealKV (**438 OPS**), by **2.30×** and **2.11×**. See [Scan Profile](#scan-profile) for other kinds of range scan.
+
+### Scan Profile
+
+Range scans over the same dataset, as scans per second: limit and skip scans, and counts over the full key range. These figures are pending and will be filled in once the benchmarks are complete.
+
+| Engine | Limit&nbsp;(OPS) | Keys,&nbsp;Limit&nbsp;(OPS) | Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Keys,&nbsp;Skip&nbsp;+&nbsp;Limit&nbsp;(OPS) | Full&nbsp;Count&nbsp;(OPS) |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **SurrealKV** | - | - | - | - | - |
+| RocksDB | - | - | - | - | - |
+| SlateDB | - | - | - | - | - |
+| Fjall | - | - | - | - | - |
+| ReDB | - | - | - | - | - |
+| LMDB | - | - | - | - | - |
+| Libmdbx | - | - | - | - | - |
+
+- **Limit**: `select(*) limit(100)` returns the first 100 key-value pairs of the range. **Keys, Limit** (`select(id) limit(100)`) returns only the keys.
+- **Skip + Limit**: `select(*) start(5000) limit(100)` walks and discards 5,000 entries before returning 100. **Keys, Skip + Limit** returns only the keys.
+- **Full Count**: `count()` visits every key in the range.
 
 ### Memory Profile
 
