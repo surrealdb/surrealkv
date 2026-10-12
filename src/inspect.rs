@@ -9,6 +9,8 @@ use crate::error::{EncryptionError, Error, Result};
 use crate::levels::LevelManifest;
 use crate::sstable::index_block::IndexIterator;
 use crate::sstable::table::{IndexType, Table, TABLE_FULL_FOOTER_LENGTH};
+use crate::sstable::verify::verify_blocks;
+pub use crate::sstable::verify::BlockCounts;
 use crate::tde::EncryptionContext;
 use crate::vfs::File;
 use crate::wal::sealed_recovery::{decode_segment, SegmentEnd};
@@ -94,7 +96,11 @@ pub struct SstInfo {
 	pub filter_size: u64,
 	pub created_at: u128,
 	pub keys: Option<Vec<SstKeyEntry>>,
+	/// The number of blocks of every kind that were read from the file and checked, when a
+	/// verification was asked for: a sealed table authenticates each of them.
 	pub verified_blocks: Option<usize>,
+	/// The same, by the kind of block.
+	pub verified: Option<BlockCounts>,
 }
 
 #[derive(Debug, Clone)]
@@ -128,10 +134,24 @@ pub struct WalSegmentSummary {
 /// Comprehensive database integrity scrub report.
 #[derive(Debug, Clone, Default)]
 pub struct ScrubReport {
+	/// The number of table files that were looked at.
 	pub total_tables: usize,
+	/// The number of tables that were read to the end and found whole.
 	pub verified_tables: usize,
+	/// The number of blocks, of every kind, that were read and found whole. It counts blocks and
+	/// not files: a table of a few blocks adds a few.
 	pub total_blocks: usize,
+	/// The same by kind of block.
+	pub blocks: BlockCounts,
+	/// The number of tables in which a block was found damaged: it does not match its checksum,
+	/// or, in a table that is sealed and was read with its key, it does not authenticate. It
+	/// counts the tables, and each of them stops at its first block that fails.
 	pub corrupt_blocks: usize,
+	/// The number of tables that were not verified, which is not the same as damaged: a table that
+	/// is sealed and was met without a key, or with one that does not fit, or that belongs to
+	/// another database, or is of a later format. Nothing is said of what is in them.
+	pub not_verified_tables: usize,
+	/// What was found, a line for each table that is damaged or was not verified.
 	pub errors: Vec<String>,
 }
 
@@ -498,33 +518,35 @@ pub fn dump_sst_with_options<P: AsRef<Path>>(
 	let filter_size = props.filter_size;
 	let created_at = props.created_at;
 
-	let mut verified_count = 0;
-	let mut keys = if dump_keys {
-		Some(Vec::new())
+	// Every block of every kind, read from the file and checked, which is what a verification
+	// is: the blocks that a lookup or a dump of the keys reads are the data blocks, and a lookup
+	// can be answered from the cache.
+	let verified = if verify_checksum {
+		Some(verify_blocks(&table)?)
 	} else {
 		None
 	};
 
-	let IndexType::Partitioned(ref partitioned) = table.index_block;
-	let mut index_iter = IndexIterator::new(partitioned);
-	// A table of range deletions alone has no data block and an empty index.
-	if !table.holds_only_range_deletions() {
-		index_iter.seek_to_first()?;
-	}
+	let mut keys = None;
+	if dump_keys {
+		let mut found = Vec::new();
+		let IndexType::Partitioned(ref partitioned) = table.index_block;
+		let mut index_iter = IndexIterator::new(partitioned);
+		// A table of range deletions alone has no data block and an empty index.
+		if !table.holds_only_range_deletions() {
+			index_iter.seek_to_first()?;
+		}
 
-	while index_iter.valid() {
-		let handle = index_iter.block_handle()?;
-		let block = table.read_block(&handle)?;
-		verified_count += 1;
+		while index_iter.valid() {
+			let handle = index_iter.block_handle()?;
+			let block = table.read_block(&handle)?;
 
-		if let Some(ref mut k_list) = keys {
 			let mut b_iter = block.iter()?;
 			b_iter.seek_first()?;
-
 			while b_iter.valid() {
 				let ikey = b_iter.key();
 				let val = b_iter.value_encoded()?;
-				k_list.push(SstKeyEntry {
+				found.push(SstKeyEntry {
 					user_key: ikey.user_key().to_vec(),
 					seq_num: ikey.seq_num(),
 					kind: format!("{:?}", ikey.kind()),
@@ -532,9 +554,10 @@ pub fn dump_sst_with_options<P: AsRef<Path>>(
 				});
 				b_iter.next()?;
 			}
-		}
 
-		index_iter.next()?;
+			index_iter.next()?;
+		}
+		keys = Some(found);
 	}
 
 	Ok(SstInfo {
@@ -552,11 +575,8 @@ pub fn dump_sst_with_options<P: AsRef<Path>>(
 		filter_size,
 		created_at,
 		keys,
-		verified_blocks: if verify_checksum {
-			Some(verified_count)
-		} else {
-			None
-		},
+		verified_blocks: verified.as_ref().map(BlockCounts::total),
+		verified,
 	})
 }
 
@@ -701,40 +721,95 @@ fn wal_context(
 	WalContext::for_options(&opts)
 }
 
+/// What is said of a table that was not verified, from what stopped it.
+fn not_verified(error: &EncryptionError) -> Option<&'static str> {
+	Some(match error {
+		EncryptionError::NotConfigured => "it cannot be read without a key",
+		EncryptionError::WrongKey | EncryptionError::UnknownKeyId | EncryptionError::KeyRetired => {
+			"the key that was given does not open it"
+		}
+		EncryptionError::KeyProvider(_) => "the key provider could not give the key",
+		EncryptionError::UnsupportedVersion | EncryptionError::UnsupportedSuite => {
+			"it is written in a newer format than this build reads"
+		}
+		EncryptionError::DbIdMismatch => "it belongs to another database",
+		EncryptionError::FileIdMismatch => "it is not the table that its file name says",
+		EncryptionError::PlaintextInEncryptedDb | EncryptionError::NotEncrypted => {
+			"it is not encrypted, and the database is"
+		}
+		// Not about a file at all: damage, as everything that is not named here is.
+		EncryptionError::AuthenticationFailed
+		| EncryptionError::MalformedHeader
+		| EncryptionError::PositionReuse
+		| EncryptionError::InvalidInput(_)
+		| EncryptionError::SuiteMismatch => return None,
+	})
+}
+
 /// Comprehensively verifies CRC32 checksums of all active SSTables in a database.
+///
+/// Every block of every table is read, of all six kinds, and a table whose blocks are sealed is
+/// read without a key as far as it can be, which is not at all: it is reported as not verified,
+/// which is not damage. See [`scrub_db_with_options`].
 pub fn scrub_db<P: AsRef<Path>>(db_path: P) -> Result<ScrubReport> {
-	let path = db_path.as_ref();
-	let opts = Options {
-		path: path.to_path_buf(),
-		..Default::default()
-	};
-	let tables_dir = opts.sstable_dir();
+	scrub_db_with_options(db_path, &Options::default())
+}
+
+/// Verifies every block of every table of a database as [`scrub_db`] does, and with the key manager
+/// of `options` authenticates the blocks of the tables that are sealed.
+///
+/// The count is of blocks, of the meta-index, the top-level index, each partition of the index,
+/// each data block and each filter index and partition: a table of a few blocks adds a few. A
+/// block that is damaged is counted as a damaged table, which is what stops the read of it, and
+/// a table that cannot be read for want of a key or for being another database's is not
+/// verified, and is said to be. In a sealed table a block that does not authenticate is damaged,
+/// and so is a header that is malformed; a header of a later format, a wrong or retired key, a
+/// database that is not the one in the manifest, a table that is not the one that its name says
+/// and a table in the clear in a database that is encrypted are not verified.
+///
+/// With a key and a manifest the identity of the database is the manifest's, and a key that does
+/// not open it is the error of the call. Without a manifest each table is read as the identity
+/// in its own header says. Nothing is written, and in a build that does not take a key manager
+/// the call is refused with `Error::InvalidArgument`.
+pub fn scrub_db_with_options<P: AsRef<Path>>(db_path: P, options: &Options) -> Result<ScrubReport> {
+	let opts = options_for_database(db_path.as_ref(), options)?;
 	let mut report = ScrubReport::default();
 
-	let entries = fs::read_dir(tables_dir)?;
-	for entry in entries.flatten() {
+	let mut tables = Vec::new();
+	for entry in fs::read_dir(opts.sstable_dir())?.flatten() {
 		let p = entry.path();
 		if p.extension().is_some_and(|ext| ext == "sst") {
-			report.total_tables += 1;
-			match dump_sst(&p, false, true) {
-				Ok(info) => {
-					report.verified_tables += 1;
-					if let Some(blocks) = info.verified_blocks {
-						report.total_blocks += blocks;
+			tables.push(p);
+		}
+	}
+	tables.sort();
+
+	for p in tables {
+		report.total_tables += 1;
+		match dump_sst_with_options(&p, false, true, &opts) {
+			Ok(info) => {
+				report.verified_tables += 1;
+				report.total_blocks += info.verified_blocks.unwrap_or(0);
+				if let Some(counts) = &info.verified {
+					report.blocks.add(counts);
+				}
+			}
+			Err(e) => match &e {
+				Error::Encryption(error) => match not_verified(error) {
+					Some(why) => {
+						report.not_verified_tables += 1;
+						report.errors.push(format!("{}: not verified, {why}: {e}", p.display()));
 					}
-				}
-				// A sealed table cannot be read without a key: it is not verified, which is not
-				// the same as damaged.
-				Err(e @ Error::Encryption(_)) => {
-					report
-						.errors
-						.push(format!("{}: not verified, it cannot be read: {e}", p.display()));
-				}
-				Err(e) => {
+					None => {
+						report.corrupt_blocks += 1;
+						report.errors.push(format!("{}: {e}", p.display()));
+					}
+				},
+				_ => {
 					report.corrupt_blocks += 1;
 					report.errors.push(format!("{}: {e}", p.display()));
 				}
-			}
+			},
 		}
 	}
 

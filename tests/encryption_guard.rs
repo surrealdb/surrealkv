@@ -168,6 +168,7 @@ fn an_inspection_with_a_key_manager_is_refused_before_a_file_is_read() {
 	assert_encryption_refused(inspect::dump_manifest_with_options(&nowhere, &options).unwrap_err());
 	assert_encryption_refused(inspect::dump_wal_with_options(&nowhere, &options).unwrap_err());
 	assert_encryption_refused(inspect::inspect_db_with_options(&nowhere, &options).unwrap_err());
+	assert_encryption_refused(inspect::scrub_db_with_options(&nowhere, &options).unwrap_err());
 	assert!(!nowhere.exists());
 }
 

@@ -9,3 +9,4 @@ pub(crate) mod partitioned_filter;
 pub(crate) mod ribbon;
 pub(crate) mod sealed;
 pub(crate) mod table;
+pub(crate) mod verify;
