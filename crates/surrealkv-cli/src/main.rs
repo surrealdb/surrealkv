@@ -133,14 +133,24 @@ fn hint_for(error: &anyhow::Error) -> Option<&'static str> {
 					 file it is: skv holds one key, key id 1. Nothing was changed.",
 				);
 			}
+			Some(surrealkv::Error::Encryption(EncryptionError::NotEncrypted)) => {
+				return Some(
+					"A key was given for data that is not encrypted: encryption is chosen when a \
+					 database is created and is never added to one that exists. Leave out \
+					 --key-file and SKV_KEY_FILE for a database that is not encrypted. Nothing \
+					 was changed.",
+				);
+			}
 			Some(surrealkv::Error::Encryption(
-				EncryptionError::NotEncrypted | EncryptionError::PlaintextInEncryptedDb,
+				EncryptionError::PlaintextInEncryptedDb
+				| EncryptionError::DbIdMismatch
+				| EncryptionError::SuiteMismatch
+				| EncryptionError::FileIdMismatch,
 			)) => {
 				return Some(
-					"A key was given for data that is not encrypted, or the other way round: \
-					 encryption is chosen when a database is created and is never added to one \
-					 that exists. Leave out --key-file and SKV_KEY_FILE for a database that is \
-					 not encrypted. Nothing was changed.",
+					"A file is not the one that this database or its name says. `skv enc-info \
+					 <DIR>` needs no key and lists which files of a database are not consistent. \
+					 Nothing was changed.",
 				);
 			}
 			Some(surrealkv::Error::InvalidArgument(message))
