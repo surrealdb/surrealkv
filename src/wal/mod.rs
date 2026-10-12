@@ -184,11 +184,14 @@ impl WalContext {
 	}
 
 	/// The context of the WAL of the tree that `opts` configure: sealed if the options carry a
-	/// resolved encryption context, plaintext otherwise.
-	pub(crate) fn for_options(opts: &crate::Options) -> Self {
-		Self {
+	/// resolved encryption context, plaintext otherwise. Options that name a key manager and have
+	/// no context are refused, since a plaintext log would be written for a database that was
+	/// asked to be encrypted.
+	pub(crate) fn for_options(opts: &crate::Options) -> crate::Result<Self> {
+		opts.ensure_encryption_resolved()?;
+		Ok(Self {
 			cipher: opts.encryption_context().cloned(),
-		}
+		})
 	}
 
 	/// Whether the segments of this WAL are sealed.
@@ -270,11 +273,11 @@ impl Default for Options {
 impl Options {
 	/// The options of the WAL of the tree that `opts` configure: the one constructor that a tree's
 	/// own sites (open, restore, repair) use.
-	pub(crate) fn for_tree(opts: &crate::Options) -> Self {
-		Self {
-			context: WalContext::for_options(opts),
+	pub(crate) fn for_tree(opts: &crate::Options) -> crate::Result<Self> {
+		Ok(Self {
+			context: WalContext::for_options(opts)?,
 			..Self::default()
-		}
+		})
 	}
 
 	/// Validates the options.

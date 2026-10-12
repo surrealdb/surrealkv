@@ -7,9 +7,8 @@
 //! files it leaves: a database is created encrypted, opens again with its key and with nothing
 //! else, and a refused open changes no file.
 //!
-//! The manifest, the tables and the value log are sealed at this point. The write-ahead log is
-//! not, so nothing here looks for a marker in it, and a database is only meant to be read back
-//! after a clean close, which flushes what the log holds into tables.
+//! Every file of the database is sealed: the manifest, the tables, the value log and the
+//! write-ahead log. A database that is not closed cleanly is recovered from its log with the key.
 
 #![cfg(all(not(target_arch = "wasm32"), feature = "encryption-preview"))]
 
@@ -223,6 +222,56 @@ async fn a_database_that_is_not_encrypted_is_not_made_encrypted_by_a_key_manager
 		assert!(snapshot(&db) == before, "{suite:?}: a refused open changed the database");
 
 		let tree = TreeBuilder::with_options(options(&db)).build().unwrap();
+		check(&tree);
+		tree.close().await.unwrap();
+	}
+}
+
+#[tokio::test]
+async fn the_log_of_an_encrypted_database_is_sealed_and_is_replayed_with_the_key() {
+	for suite in SUITES {
+		let dir = tempfile::tempdir().unwrap();
+		let db = dir.path().join("db");
+
+		// A close that does not flush leaves what was committed in the log.
+		let mut opts = encrypted(&db, ROOT, suite);
+		opts.flush_on_close = false;
+		let tree = TreeBuilder::with_options(opts).build().unwrap();
+		fill(&tree).await;
+		tree.close().await.unwrap();
+
+		let segments = files(&db.join("wal"), "wal");
+		assert!(!segments.is_empty(), "{suite:?}");
+		for segment in &segments {
+			let bytes = fs::read(segment).unwrap();
+			// The first record of a sealed segment is its header, a record of type 10 that holds
+			// the encryption header, and nothing that was committed is in any byte of
+			// it.
+			assert_eq!(bytes[6], 10, "{segment:?}");
+			assert!(CryptoHeader::has_magic(&bytes[7..]), "{segment:?}");
+			assert!(!contains(&bytes, b"pk-00") && !contains(&bytes, b"pv-canary"), "{segment:?}");
+		}
+		assert!(
+			segments.iter().any(|segment| fs::metadata(segment).unwrap().len() > 300),
+			"{suite:?}: the commits are in the log"
+		);
+
+		// The control: a database that is not encrypted has the keys in the clear in its log.
+		let plain_dir = dir.path().join("plain");
+		let mut plain = options(&plain_dir);
+		plain.flush_on_close = false;
+		let tree = TreeBuilder::with_options(plain).build().unwrap();
+		fill(&tree).await;
+		tree.close().await.unwrap();
+		assert!(
+			files(&plain_dir.join("wal"), "wal")
+				.iter()
+				.any(|segment| contains(&fs::read(segment).unwrap(), b"pk-00")),
+			"{suite:?}: the control holds the markers"
+		);
+
+		// Opened again with the key, the log is replayed and the commits are there.
+		let tree = TreeBuilder::with_options(encrypted(&db, ROOT, suite)).build().unwrap();
 		check(&tree);
 		tree.close().await.unwrap();
 	}

@@ -395,15 +395,29 @@ impl Options {
 		self
 	}
 
-	/// The resolved encryption context, if this database is encrypted.
-	// The writers and readers of SSTables take it, and those of the other kinds of file will.
+	/// The resolved encryption context, if this database is encrypted. The writers and readers of
+	/// every kind of file take their cipher from it.
 	pub(crate) fn encryption_context(&self) -> Option<&Arc<EncryptionContext>> {
 		self.encryption_context.as_ref()
 	}
 
+	/// Refuses options that name a key manager but carry no resolved context. `Tree::new` settles
+	/// the context from the manifest before it opens a file, so options like these reaching a
+	/// writer would mean a path that skipped that, and every writer would then write in the clear
+	/// without saying so.
+	pub(crate) fn ensure_encryption_resolved(&self) -> Result<()> {
+		if self.key_manager.is_some() && self.encryption_context.is_none() {
+			return Err(Error::InvalidArgument(
+				"A key manager is configured but the encryption of the database was not resolved: \
+				 refusing to write files in plaintext"
+					.to_string(),
+			));
+		}
+		Ok(())
+	}
+
 	/// Sets the resolved encryption context. The engine calls this once, with the identity and
 	/// the suite that the database's descriptor names, before any file is opened.
-	#[allow(dead_code)]
 	pub(crate) fn with_encryption_context(mut self, context: Arc<EncryptionContext>) -> Self {
 		self.encryption_context = Some(context);
 		self

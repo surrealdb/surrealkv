@@ -281,6 +281,11 @@ pub(crate) type FlushHook = Arc<dyn Fn(u64) -> Result<()> + Send + Sync>;
 impl CoreInner {
 	/// Creates a new LSM tree core instance
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		// Whether the database is encrypted was settled before this, from its manifest. A key
+		// manager with no context here is a path that did not, and every file below, tables
+		// included, would be written in the clear: nothing is created.
+		opts.ensure_encryption_resolved()?;
+
 		// Acquire database lock to prevent multiple processes from opening the same
 		// database
 		let mut lockfile = LockFile::new(&opts.path);
@@ -310,7 +315,7 @@ impl CoreInner {
 		let wal_instance = Wal::open_with_min_log_number(
 			&wal_path,
 			manifest_log_number,
-			wal::Options::for_tree(&opts),
+			wal::Options::for_tree(&opts)?,
 		)?;
 
 		// Starts at 0 since no commits have happened yet.
@@ -1726,7 +1731,7 @@ impl Core {
 
 		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
 		let (wal_seq_num_opt, recovered_memtable) = Self::replay_wal_in(
-			&wal::WalContext::for_options(&opts),
+			&wal::WalContext::for_options(&opts)?,
 			&wal_path,
 			min_wal_number,
 			"Database startup",
@@ -2585,14 +2590,14 @@ impl Tree {
 			let new_wal = Wal::open_with_min_log_number(
 				&wal_path,
 				manifest_log_number,
-				wal::Options::for_tree(&self.core.inner.opts),
+				wal::Options::for_tree(&self.core.inner.opts)?,
 			)?;
 			*wal_guard = new_wal;
 		}
 
 		// Replay any WAL entries that were restored
 		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_in(
-			&wal::WalContext::for_options(&self.core.inner.opts),
+			&wal::WalContext::for_options(&self.core.inner.opts)?,
 			&wal_path,
 			manifest_log_number,
 			"Database restore",

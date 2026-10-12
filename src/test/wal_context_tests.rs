@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use crate::tde::{CipherSuite, DbId, EncryptionContext, SoftwareKeyManager};
 use crate::wal::{Options as WalOptions, WalContext};
-use crate::Options;
+use crate::{Error, Options};
 
 fn assert_goes_to_pool_workers<T: Send + Sync + Clone + 'static>() {}
 
@@ -36,12 +36,12 @@ fn the_default_is_a_plaintext_wal() {
 #[test]
 fn the_options_of_a_tree_decide_whether_its_wal_is_sealed() {
 	let plain = Options::default();
-	assert!(!WalContext::for_options(&plain).is_sealed());
-	assert!(!WalOptions::for_tree(&plain).context.is_sealed());
+	assert!(!WalContext::for_options(&plain).unwrap().is_sealed());
+	assert!(!WalOptions::for_tree(&plain).unwrap().context.is_sealed());
 
 	let encrypted = Options::default().with_encryption_context(sealed());
-	assert!(WalContext::for_options(&encrypted).is_sealed());
-	let wal_options = WalOptions::for_tree(&encrypted);
+	assert!(WalContext::for_options(&encrypted).unwrap().is_sealed());
+	let wal_options = WalOptions::for_tree(&encrypted).unwrap();
 	assert!(wal_options.context.is_sealed());
 
 	// Nothing but the context differs from the defaults, so a tree's WAL is configured as it was.
@@ -58,14 +58,22 @@ fn the_options_of_a_tree_decide_whether_its_wal_is_sealed() {
 }
 
 #[test]
-fn a_key_manager_without_a_resolved_context_does_not_seal_the_wal() {
-	// The context is what the engine resolves from the descriptor of a database, and the tables
-	// and the value log follow it too: a manager that was not resolved seals nothing anywhere.
+fn a_key_manager_without_a_resolved_context_is_refused_and_never_gives_a_plaintext_wal() {
+	// The context is what the engine resolves from the descriptor of a database, and the tables,
+	// the value log and the log all follow it: options that name a manager and have no context
+	// would write every one of them in the clear, so nothing is built from them.
 	let key_manager: Arc<dyn crate::tde::KeyManager> =
 		Arc::new(SoftwareKeyManager::new([0x11; 32]));
 	let opts = Options::default().with_encryption(key_manager, CipherSuite::Aes256Gcm);
-	assert!(opts.key_manager.is_some());
-	assert!(!WalContext::for_options(&opts).is_sealed());
+	assert!(opts.key_manager.is_some() && opts.encryption_context().is_none());
+
+	let context = WalContext::for_options(&opts).expect_err("a plaintext WAL was handed out");
+	assert!(matches!(&context, Error::InvalidArgument(message) if message.contains("plaintext")));
+	assert!(matches!(WalOptions::for_tree(&opts), Err(Error::InvalidArgument(_))));
+
+	// With the context, the same manager is a sealed log.
+	let resolved = opts.with_encryption_context(sealed());
+	assert!(WalContext::for_options(&resolved).unwrap().is_sealed());
 }
 
 #[test]

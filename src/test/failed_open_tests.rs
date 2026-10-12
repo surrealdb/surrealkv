@@ -9,6 +9,8 @@ use std::sync::Arc;
 use tempfile::TempDir;
 
 use super::encryption_commit_path_tests::{active_segment, commit, crash, get};
+use crate::lsm::{Core, CoreInner};
+use crate::tde::{CipherSuite, KeyManager, SoftwareKeyManager};
 use crate::{Error, Options, Tree, WalRecoveryMode};
 
 #[tokio::test]
@@ -48,4 +50,31 @@ async fn a_tree_that_cannot_be_opened_does_not_keep_the_database_locked() {
 	assert_eq!(get(&tree, "b"), Some(vec![b'v'; 40]));
 	assert_eq!(get(&tree, "c"), None);
 	tree.close().await.unwrap();
+}
+
+/// Options that name a key manager and carry no context are not a database that is meant to be
+/// encrypted and has not been settled yet: they are a path that skipped the settling, and every
+/// file below would be written in the clear. `Tree::new` settles the context before it builds a
+/// core, so the cores are tried here.
+#[tokio::test]
+async fn options_with_a_key_manager_and_no_context_open_nothing_and_create_nothing() {
+	let dir = TempDir::new().unwrap();
+	let root = dir.path().join("db");
+	let key_manager: Arc<dyn KeyManager> = Arc::new(SoftwareKeyManager::new([0x12; 32]));
+	let opts = Arc::new(
+		Options {
+			path: root.clone(),
+			..Default::default()
+		}
+		.with_encryption(key_manager, CipherSuite::Aes256Gcm),
+	);
+	assert!(opts.encryption_context().is_none());
+
+	let refused = CoreInner::new(Arc::clone(&opts)).err().expect("the inner core is refused");
+	assert!(matches!(&refused, Error::InvalidArgument(message) if message.contains("plaintext")));
+	let refused = Core::new(opts).err().expect("the core is refused");
+	assert!(matches!(&refused, Error::InvalidArgument(message) if message.contains("plaintext")));
+
+	// Not a directory, not a lock file, not a segment of the log.
+	assert!(!root.exists(), "a refused core created {}", root.display());
 }
