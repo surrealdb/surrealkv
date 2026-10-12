@@ -82,6 +82,31 @@ pub enum SSTableError {
 	ChecksumVerificationFailed {
 		block_offset: u64,
 	},
+	/// A block handle names bytes that are not inside the part of the file that holds blocks,
+	/// which starts after the header, if the file has one, and ends where the footer begins.
+	BlockHandleOutOfBounds {
+		block_offset: u64,
+		block_size: u64,
+		/// Where the first block of the file starts.
+		first_block: u64,
+		limit: u64,
+	},
+	/// The length in the trailer of a sealed block is not the length that its handle gives.
+	TrailerLengthMismatch {
+		block_offset: u64,
+		block_size: u64,
+		trailer_len: u64,
+	},
+	/// A sealed block is shorter than what sealing adds to a block, so it cannot be one.
+	SealedBlockTooShort {
+		block_offset: u64,
+		size: u64,
+		min_size: u64,
+	},
+	/// A block is too long for the length field of the sealed trailer.
+	BlockTooLarge {
+		size: u64,
+	},
 
 	// BlockHandle decoding errors
 	FailedToDecodeBlockHandle {
@@ -257,6 +282,45 @@ impl fmt::Display for SSTableError {
 				block_offset,
 			} => {
 				write!(f, "checksum verification failed for block at {}", block_offset)
+			}
+			SSTableError::TrailerLengthMismatch {
+				block_offset,
+				block_size,
+				trailer_len,
+			} => {
+				write!(
+					f,
+					"block at {} is {} bytes by its handle and {} by its trailer",
+					block_offset, block_size, trailer_len
+				)
+			}
+			SSTableError::SealedBlockTooShort {
+				block_offset,
+				size,
+				min_size,
+			} => {
+				write!(
+					f,
+					"sealed block at {} is {} bytes, and sealing alone adds {}",
+					block_offset, size, min_size
+				)
+			}
+			SSTableError::BlockTooLarge {
+				size,
+			} => {
+				write!(f, "block of {} bytes is too long for the length of a sealed trailer", size)
+			}
+			SSTableError::BlockHandleOutOfBounds {
+				block_offset,
+				block_size,
+				first_block,
+				limit,
+			} => {
+				write!(
+					f,
+					"block at {} of {} bytes (and its trailer) does not fit between the first block at {} and the footer at {}",
+					block_offset, block_size, first_block, limit
+				)
 			}
 
 			// BlockHandle decoding errors

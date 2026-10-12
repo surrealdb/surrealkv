@@ -10,11 +10,52 @@ use iter::LevelManifestIterator;
 pub(crate) use level::{Level, Levels};
 use rand::Rng;
 
-use crate::error::Error;
+use crate::error::{EncryptionError, Error};
 use crate::sstable::table::Table;
+use crate::tde::{
+	is_cut_inside_manifest_magic,
+	is_sealed_manifest,
+	open_manifest,
+	seal_manifest,
+	EncryptionContext,
+};
 use crate::vfs::File;
 use crate::wal::list_segment_ids;
 use crate::{Options, Result};
+
+/// Makes the key that the table `table_id`, whose file is `file`, was sealed under available from
+/// the key manager, which may wait on a provider, and which a database that has only ever used the
+/// key it is opened with does not ask for again: see `EncryptionContext::prepare`.
+///
+/// Only the start of the file is read, and nothing is decided here that the open of the table does
+/// not decide again, in its own order: a file that is not sealed, whose header does not decode or
+/// is not the header of this table of this database is left to `Table::new`, which names what is
+/// wrong with it. The answer here is only the manager's, for a key that the header names.
+fn prepare_key_of_table(
+	file: &Arc<dyn File>,
+	file_size: u64,
+	table_id: u64,
+	context: &EncryptionContext,
+) -> Result<()> {
+	use crate::tde::{CryptoHeader, FileKind, HEADER_LEN};
+
+	if file_size < HEADER_LEN as u64 {
+		return Ok(());
+	}
+	let mut head = [0u8; HEADER_LEN];
+	file.read_exact_at(0, &mut head)?;
+	let Ok(header) = CryptoHeader::decode(&head) else {
+		return Ok(());
+	};
+	let identity = header.identity;
+	if identity.db_id != context.db_id()
+		|| identity.file_kind != FileKind::Sst
+		|| identity.file_id != table_id
+	{
+		return Ok(());
+	}
+	Ok(context.prepare(&[identity.key_id])?)
+}
 
 /// Validates that the manifest's log_number doesn't exceed actual WAL segments on disk.
 /// This detects manifest corruption that could cause silent data loss.
@@ -51,11 +92,15 @@ pub(crate) fn check_manifest_before_open(opts: &Options) -> Result<()> {
 
 	if manifest_path.try_exists()? {
 		let data = std::fs::read(&manifest_path)?;
-		return DecodedManifest::decode(data).map(drop).map_err(|e| {
-			Error::ManifestCorruption(format!(
+		let body = unseal_manifest(data, opts.encryption_context().map(Arc::as_ref));
+		return body.and_then(DecodedManifest::decode).map(drop).map_err(|e| match e {
+			// A key, a database or a manifest of the other kind is not damage, and is not
+			// reported as damage: the files are as they should be and the configuration is not.
+			Error::Encryption(_) => e,
+			e => Error::ManifestCorruption(format!(
 				"{} cannot be decoded: {e}. Restore it from a backup; the data files have not been touched.",
 				manifest_path.display()
-			))
+			)),
 		});
 	}
 
@@ -74,6 +119,79 @@ pub(crate) fn check_manifest_before_open(opts: &Options) -> Result<()> {
 		manifest_path.display(),
 		opts.path.display()
 	)))
+}
+
+/// What the first bytes of a manifest file say it is, without a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ManifestKind {
+	/// An encrypted manifest, see `tde::seal_manifest`.
+	Sealed,
+	/// Begins with a format version: a manifest that is not encrypted, as far as its first bytes
+	/// say. Whether it decodes is for its loader to say.
+	Plain,
+	/// Empty, or a part of the magic of an encrypted manifest and nothing more: a file that was
+	/// cut short. No plaintext manifest is that short.
+	CutShort,
+	/// Neither of them: what the first bytes of a plaintext or an encrypted manifest that has
+	/// rotted look like.
+	Unknown,
+}
+
+/// Tells what `prefix`, the first bytes of a manifest file, is. A plaintext manifest begins with
+/// its version as two bytes, a number that is small and not zero.
+pub(crate) fn manifest_kind(prefix: &[u8]) -> ManifestKind {
+	if is_sealed_manifest(prefix) {
+		return ManifestKind::Sealed;
+	}
+	if is_cut_inside_manifest_magic(prefix) {
+		return ManifestKind::CutShort;
+	}
+	match prefix.first_chunk::<2>().map(|version| u16::from_be_bytes(*version)) {
+		Some(1..=0xFF) => ManifestKind::Plain,
+		_ => ManifestKind::Unknown,
+	}
+}
+
+/// The body of the manifest file that holds `data`: the encoding that the manifest of a plaintext
+/// database has, which a sealed one is opened to give.
+///
+/// A manifest is read as the database is configured and never as what the file says it is, and
+/// a manifest of the other kind is refused, as a hard error: an encrypted one without a key is
+/// `NotConfigured`, and one that is not encrypted, where there is a key, is `NotEncrypted`. A
+/// plaintext manifest that is read without a key is returned as it is.
+pub(crate) fn unseal_manifest(
+	data: Vec<u8>,
+	context: Option<&EncryptionContext>,
+) -> Result<Vec<u8>> {
+	let Some(context) = context else {
+		return if is_sealed_manifest(&data) {
+			Err(EncryptionError::NotConfigured.into())
+		} else {
+			Ok(data)
+		};
+	};
+	match manifest_kind(&data) {
+		ManifestKind::Sealed => open_manifest(context, &data),
+		kind => Err(refuse_unsealed_manifest(kind)),
+	}
+}
+
+/// The error for a manifest that is not an encrypted one, where the database is encrypted: not
+/// being encrypted is a statement about the database, and a file that is not even a manifest is
+/// damage.
+pub(crate) fn refuse_unsealed_manifest(kind: ManifestKind) -> Error {
+	match kind {
+		ManifestKind::Plain => EncryptionError::NotEncrypted.into(),
+		// Not a reason to refuse a manifest, so never asked for one.
+		ManifestKind::Sealed => EncryptionError::InvalidInput("the manifest is encrypted").into(),
+		ManifestKind::CutShort => Error::ManifestCorruption(
+			"the manifest is cut short: it ends before its first header".to_string(),
+		),
+		ManifestKind::Unknown => Error::ManifestCorruption(
+			"the manifest begins with neither a version nor the magic of an encrypted manifest"
+				.to_string(),
+		),
+	}
 }
 
 /// Counts the files in `dir` with the given extension. A missing directory
@@ -173,6 +291,11 @@ pub(crate) struct ChangeSetRollback {
 
 mod iter;
 mod level;
+mod mode;
+mod orphans;
+
+pub(crate) use mode::{check_manifest_mode, resolve_encryption};
+pub(crate) use orphans::plan_cleanup as plan_orphan_cleanup;
 
 pub type HiddenSet = HashSet<u64>;
 
@@ -205,6 +328,11 @@ pub(crate) struct LevelManifest {
 	/// Tracks the highest sequence number across all SSTables.
 	/// Updated when new tables are added during flush operations.
 	pub(crate) last_sequence: u64,
+
+	/// The encryption of the database, if it is encrypted: every write of the manifest seals it
+	/// with this, under a new salt, and it was opened with it. Only what a write needs is kept,
+	/// never a salt or a cipher of an earlier one.
+	pub(crate) encryption: Option<Arc<EncryptionContext>>,
 }
 
 /// The contents of a manifest file, decoded without opening the tables it lists.
@@ -307,10 +435,19 @@ impl LevelManifest {
 			snapshots: Vec::new(),
 			log_number: 0,
 			last_sequence: 0,
+			encryption: opts.encryption_context().cloned(),
 		};
 
 		// Write levels to disk with the counter
 		write_manifest_to_disk(&manifest)?;
+
+		// The manifest of an encrypted database names the database and its suite, and nothing
+		// that is sealed under them may exist before it is on disk: the file and the directory
+		// that holds it are synced by the write, and the directory above it, which only now has
+		// the entry that names that one, is synced here.
+		if manifest.encryption.is_some() {
+			crate::lsm::fsync_directory(&opts.path)?;
+		}
 
 		Ok(manifest)
 	}
@@ -339,8 +476,10 @@ impl LevelManifest {
 	) -> Result<Self> {
 		tracing::debug!("Loading manifest from {:?}", manifest_path.as_ref());
 
-		// Read and parse the manifest file
+		// Read and parse the manifest file, opening it first if the database is encrypted
+		let encryption = opts.encryption_context().cloned();
 		let data = std::fs::read(&manifest_path)?;
+		let data = unseal_manifest(data, encryption.as_deref())?;
 		let DecodedManifest {
 			version,
 			next_table_id,
@@ -366,6 +505,12 @@ impl LevelManifest {
 				// Load the actual table from disk
 				match Self::load_table(table_id, Arc::clone(&opts)) {
 					Ok(table) => tables.push(table),
+					// A table that cannot be opened with the key is not a damaged manifest,
+					// and says so to the caller.
+					Err(err @ Error::Encryption(_)) => {
+						tracing::error!("Error loading table {table_id}: {err:?}");
+						return Err(err);
+					}
 					Err(err) => {
 						tracing::error!("Error loading table {table_id}: {err:?}");
 						return Err(Error::LoadManifestFail(err.to_string()));
@@ -420,6 +565,7 @@ impl LevelManifest {
 			snapshots,
 			log_number,
 			last_sequence,
+			encryption,
 		})
 	}
 
@@ -464,6 +610,13 @@ impl LevelManifest {
 		let file = SysFile::open(&table_file_path)?;
 		let file: Arc<dyn File> = Arc::new(file);
 		let file_size = file.size()?;
+
+		// The key of a table written under an older key than the one that is active is made
+		// available here, while the database is opened or restored, and not when its first block
+		// is read.
+		if let Some(context) = opts.encryption_context() {
+			prepare_key_of_table(&file, file_size, table_id, context)?;
+		}
 
 		// Create and return the table
 		let mut table = Table::new(table_id, opts, file, file_size)?;
@@ -869,7 +1022,7 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(file_path: P, new_content: &[
 	Ok(())
 }
 
-/// Write the full versioned manifest to disk
+/// Write the full versioned manifest to disk, sealed if the database is encrypted
 pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 	let next_table_id = manifest.next_table_id.load(Ordering::SeqCst);
 	let total_tables: usize = manifest.levels.get_levels().iter().map(|l| l.tables.len()).sum();
@@ -902,7 +1055,14 @@ pub(crate) fn write_manifest_to_disk(manifest: &LevelManifest) -> Result<()> {
 		buf.extend_from_slice(&snapshot_bytes);
 	}
 
-	replace_file_content(&manifest.path, &buf)?;
+	// An encrypted database's manifest is sealed here, on every write and under a salt drawn
+	// by this write: a failed write that is tried again seals again, and never reuses a key.
+	// Failing to seal writes nothing.
+	let content = match &manifest.encryption {
+		Some(context) => seal_manifest(context, &buf)?,
+		None => buf,
+	};
+	replace_file_content(&manifest.path, &content)?;
 	tracing::debug!("Manifest written successfully to {:?}", manifest.path);
 	Ok(())
 }

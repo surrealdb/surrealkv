@@ -4,6 +4,7 @@ use std::vec;
 use test_log::test;
 
 use crate::sstable::block::BlockHandle;
+use crate::sstable::block_io::{BlockSink, BlockSource};
 use crate::sstable::index_block::{BlockHandleWithKey, Index, IndexWriter};
 use crate::vfs::File;
 use crate::{
@@ -33,9 +34,9 @@ fn test_top_level_index_writer_basic() {
 	let handle1 = vec![1, 2, 3];
 	writer.add(&key1, &handle1).unwrap();
 
-	let mut d = Vec::new();
-	let top_level_block = writer.finish(&mut d, CompressionType::None, 0).unwrap();
-	assert!(!top_level_block.0.offset > 0);
+	let mut sink = BlockSink::new(Vec::new());
+	let top_level_block = writer.finish(&mut sink, CompressionType::None).unwrap();
+	assert!(!top_level_block.offset > 0);
 }
 
 #[test]
@@ -51,9 +52,9 @@ fn test_top_level_index_writer_multiple_blocks() {
 	}
 
 	// assert!(index_blocks.len() > 1, "Expected multiple index blocks");
-	let mut d = Vec::new();
-	let top_level_block = writer.finish(&mut d, CompressionType::None, 0).unwrap();
-	assert!(!top_level_block.0.offset > 0);
+	let mut sink = BlockSink::new(Vec::new());
+	let top_level_block = writer.finish(&mut sink, CompressionType::None).unwrap();
+	assert!(!top_level_block.offset > 0);
 }
 
 // #[test]
@@ -77,9 +78,9 @@ fn test_top_level_index_writer_large_entries() {
 	let large_handle = vec![b'b'; 500];
 	writer.add(&large_key, &large_handle).unwrap();
 
-	let mut d = Vec::new();
-	let top_level_block = writer.finish(&mut d, CompressionType::None, 0).unwrap();
-	assert!(!top_level_block.0.offset > 0);
+	let mut sink = BlockSink::new(Vec::new());
+	let top_level_block = writer.finish(&mut sink, CompressionType::None).unwrap();
+	assert!(!top_level_block.offset > 0);
 }
 
 #[test]
@@ -93,9 +94,9 @@ fn test_top_level_index_writer_exact_block_size() {
 	let handle = vec![0; 90];
 	writer.add(&key, &handle).unwrap();
 
-	let mut d = Vec::new();
-	let top_level_block = writer.finish(&mut d, CompressionType::None, 0).unwrap();
-	assert!(!top_level_block.0.offset > 0);
+	let mut sink = BlockSink::new(Vec::new());
+	let top_level_block = writer.finish(&mut sink, CompressionType::None).unwrap();
+	assert!(!top_level_block.offset > 0);
 }
 
 // #[test]
@@ -132,14 +133,13 @@ fn test_find_block_handle_by_key() {
 	// Initialize Index with predefined blocks using encoded internal keys
 	let index = Index {
 		id: 0,
-		cache_id: 0,
 		opts,
 		blocks: vec![
 			BlockHandleWithKey::new(sep_c.clone(), BlockHandle::new(0, 10)),
 			BlockHandleWithKey::new(sep_f.clone(), BlockHandle::new(10, 10)),
 			BlockHandleWithKey::new(sep_j.clone(), BlockHandle::new(20, 10)),
 		],
-		file: Arc::clone(&f),
+		source: BlockSource::new(Arc::clone(&f), 0),
 	};
 
 	// A list of tuples where the first element is the encoded internal key to find,
@@ -188,14 +188,13 @@ fn test_find_block_handle_by_key_with_descending_seq_nums() {
 
 	let index = Index {
 		id: 0,
-		cache_id: 0,
 		opts,
 		blocks: vec![
 			BlockHandleWithKey::new(sep_foo_60, BlockHandle::new(0, 100)),
 			BlockHandleWithKey::new(sep_foo_20, BlockHandle::new(100, 100)),
 			BlockHandleWithKey::new(sep_g, BlockHandle::new(200, 100)),
 		],
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	// Test cases: (query_key, expected_partition_index)
@@ -276,14 +275,13 @@ fn test_find_block_handle_by_key_different_user_keys() {
 
 	let index = Index {
 		id: 0,
-		cache_id: 0,
 		opts,
 		blocks: vec![
 			BlockHandleWithKey::new(sep_b, BlockHandle::new(0, 100)),
 			BlockHandleWithKey::new(sep_d, BlockHandle::new(100, 100)),
 			BlockHandleWithKey::new(sep_e, BlockHandle::new(200, 100)),
 		],
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	let test_cases = vec![
@@ -351,14 +349,13 @@ fn test_find_block_handle_returns_correct_partition_index() {
 
 	let index = Index {
 		id: 0,
-		cache_id: 0,
 		opts,
 		blocks: sep_keys
 			.iter()
 			.enumerate()
 			.map(|(i, sep)| BlockHandleWithKey::new(sep.clone(), BlockHandle::new(i * 100, 100)))
 			.collect(),
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	// Query for each separator key and verify correct index is returned
@@ -386,10 +383,9 @@ fn test_partition_lookup_empty_partition_returns_none() {
 
 	let index = Index {
 		id: 0,
-		cache_id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep, BlockHandle::new(0, 100))],
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	// Query for key beyond the single partition
@@ -409,10 +405,9 @@ fn test_partition_lookup_single_partition() {
 
 	let index = Index {
 		id: 0,
-		cache_id: 0,
 		opts,
 		blocks: vec![BlockHandleWithKey::new(sep.clone(), BlockHandle::new(0, 100))],
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	// Query before the separator
@@ -447,14 +442,13 @@ fn test_partition_lookup_exact_separator_match() {
 
 	let index = Index {
 		id: 0,
-		cache_id: 0,
 		opts,
 		blocks: vec![
 			BlockHandleWithKey::new(sep_a, BlockHandle::new(0, 100)),
 			BlockHandleWithKey::new(sep_b.clone(), BlockHandle::new(100, 100)),
 			BlockHandleWithKey::new(sep_c, BlockHandle::new(200, 100)),
 		],
-		file: f,
+		source: BlockSource::new(f, 0),
 	};
 
 	// Query exactly "bbb" at same seq

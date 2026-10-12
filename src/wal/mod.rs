@@ -9,10 +9,15 @@ use std::sync::{Arc, PoisonError};
 
 use crc32fast::Hasher;
 
+use crate::error::EncryptionError;
+use crate::tde::EncryptionContext;
+
 pub mod manager;
 pub(crate) mod parallel_recovery;
 pub mod reader;
 pub mod recovery;
+pub(crate) mod sealed;
+pub(crate) mod sealed_recovery;
 pub mod writer;
 
 pub use manager::Wal;
@@ -89,6 +94,10 @@ pub enum RecordType {
 	// Metadata record types
 	/// Indicates the compression type used for subsequent records.
 	SetCompressionType = 9,
+
+	/// The first record of a sealed segment, which holds its encryption header. A plaintext
+	/// segment never has one, and a sealed segment has no other record of the metadata types.
+	SegmentHeader = 10,
 }
 
 impl RecordType {
@@ -105,6 +114,7 @@ impl RecordType {
 			3 => Ok(RecordType::Middle),
 			4 => Ok(RecordType::Last),
 			9 => Ok(RecordType::SetCompressionType),
+			10 => Ok(RecordType::SegmentHeader),
 			_ => Err(Error::IO(IOError::new(io::ErrorKind::InvalidInput, "Invalid Record Type"))),
 		}
 	}
@@ -143,12 +153,90 @@ const DEFAULT_FILE_MODE: u32 = 0o644;
 /// Default maximum size of the segment file (100MB).
 const DEFAULT_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
+/// What a WAL needs to know about encryption to write, read and repair its segments.
+///
+/// The default is plaintext. A tree builds one with [`WalContext::for_options`] and nothing else
+/// decides whether segments are sealed, so every place that opens a WAL, replays one or repairs one
+/// is handed the same answer. A site that forgot to take it would read or write plaintext in an
+/// encrypted tree, which is why the plaintext constructor is for tests.
+///
+/// Cheap to clone, and shared by the workers that decode segments in parallel.
+#[derive(Clone, Default)]
+pub(crate) struct WalContext {
+	/// What creates and opens the encrypted files of the database, if the WAL is sealed.
+	cipher: Option<Arc<EncryptionContext>>,
+}
+
+impl WalContext {
+	/// A plaintext WAL. Only tests build one this way: a tree takes its context from its options.
+	#[cfg(test)]
+	pub(crate) fn plaintext() -> Self {
+		Self::default()
+	}
+
+	/// A sealed WAL under `context`. Only tests build one this way: a tree takes its context from
+	/// its options.
+	#[cfg(test)]
+	pub(crate) fn sealed(context: Arc<EncryptionContext>) -> Self {
+		Self {
+			cipher: Some(context),
+		}
+	}
+
+	/// The context of the WAL of the tree that `opts` configure: sealed if the options carry a
+	/// resolved encryption context, plaintext otherwise. Options that name a key manager and have
+	/// no context are refused, since a plaintext log would be written for a database that was
+	/// asked to be encrypted.
+	pub(crate) fn for_options(opts: &crate::Options) -> crate::Result<Self> {
+		opts.ensure_encryption_resolved()?;
+		Ok(Self {
+			cipher: opts.encryption_context().cloned(),
+		})
+	}
+
+	/// Whether the segments of this WAL are sealed.
+	pub(crate) fn is_sealed(&self) -> bool {
+		self.cipher.is_some()
+	}
+
+	/// What creates and opens the encrypted files of the database, if the WAL is sealed.
+	pub(crate) fn encryption(&self) -> Option<&Arc<EncryptionContext>> {
+		self.cipher.as_ref()
+	}
+}
+
+impl fmt::Debug for WalContext {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("WalContext").field("sealed", &self.cipher.is_some()).finish()
+	}
+}
+
+/// Test-only: where the creation of the next sealed segment is made to fail, as a disk that fails
+/// would.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CreationFault {
+	/// The write of the header record fails.
+	HeaderWrite,
+	/// The fsync of the header fails.
+	HeaderSync,
+	/// The fsync of the directory fails, after the header is durable.
+	Directory,
+}
+
 /// Options for configuring a WAL segment.
 ///
 /// This struct provides configuration options for WAL segments, including
 /// file permissions, compression settings, metadata, and file size limits.
 #[derive(Clone)]
 pub struct Options {
+	/// Whether the segments are sealed, and under what.
+	pub(crate) context: WalContext,
+
+	/// Test-only: where the creation of the next sealed segment fails, once.
+	#[cfg(test)]
+	pub(crate) creation_fault: Arc<parking_lot::Mutex<Option<CreationFault>>>,
+
 	/// The permission mode for creating directories (Unix only).
 	#[cfg_attr(not(unix), allow(dead_code))]
 	pub(crate) dir_mode: Option<u32>,
@@ -170,6 +258,9 @@ pub struct Options {
 impl Default for Options {
 	fn default() -> Self {
 		Options {
+			context: WalContext::default(),
+			#[cfg(test)]
+			creation_fault: Arc::default(),
 			dir_mode: Some(0o750),
 			file_mode: Some(DEFAULT_FILE_MODE),
 			compression_type: CompressionType::None,
@@ -180,6 +271,15 @@ impl Default for Options {
 }
 
 impl Options {
+	/// The options of the WAL of the tree that `opts` configure: the one constructor that a tree's
+	/// own sites (open, restore, repair) use.
+	pub(crate) fn for_tree(opts: &crate::Options) -> crate::Result<Self> {
+		Ok(Self {
+			context: WalContext::for_options(opts)?,
+			..Self::default()
+		})
+	}
+
 	/// Validates the options.
 	pub(crate) fn validate(&self) -> Result<()> {
 		if self.max_file_size == 0 {
@@ -228,6 +328,32 @@ pub enum Error {
 	Poison(String),
 	RecordTooLarge,
 	SegmentNotFound,
+	/// A key, a header or an authentication tag said no. Never damage, so never a reason to repair
+	/// or delete anything.
+	Encryption(EncryptionError),
+	/// A sealed segment holds records that pass their checksum after a block that is zero-filled
+	/// or damaged, or a segment of the sequence is missing: data was lost from the middle of
+	/// the WAL, which is not what a torn write at its end looks like.
+	IndexGap {
+		segment_id: u64,
+		offset: u64,
+	},
+	/// Something that passes its checksum, and so was written on purpose, and that a writer of
+	/// this segment never writes: a record of another kind, one out of sequence, one that does not
+	/// decompress after it authenticated.
+	Unexpected {
+		segment_id: u64,
+		offset: u64,
+		what: &'static str,
+	},
+}
+
+impl Error {
+	/// Whether the error is a statement about keys or about what was written on purpose, as
+	/// opposed to damage. Recovery never repairs, rewrites or deletes a segment for one.
+	pub(crate) fn is_integrity_failure(&self) -> bool {
+		matches!(self, Error::Encryption(_) | Error::IndexGap { .. } | Error::Unexpected { .. })
+	}
 }
 
 impl fmt::Display for Error {
@@ -243,6 +369,23 @@ impl fmt::Display for Error {
 				write!(f, "Record is too large to fit in a segment. Increase max segment size")
 			}
 			Error::SegmentNotFound => write!(f, "Segment not found"),
+			Error::Encryption(err) => write!(f, "Encryption error: {err}"),
+			Error::IndexGap {
+				segment_id,
+				offset,
+			} => write!(
+				f,
+				"Index gap in segment {segment_id:020} at offset {offset}: records that pass their \
+				 checksum follow a zero-filled or damaged block, or a segment is missing"
+			),
+			Error::Unexpected {
+				segment_id,
+				offset,
+				what,
+			} => write!(
+				f,
+				"Unexpected content in segment {segment_id:020} at offset {offset}: {what}"
+			),
 		}
 	}
 }
@@ -255,6 +398,12 @@ impl From<io::Error> for Error {
 			kind: e.kind(),
 			message: e.to_string(),
 		})
+	}
+}
+
+impl From<EncryptionError> for Error {
+	fn from(e: EncryptionError) -> Error {
+		Error::Encryption(e)
 	}
 }
 
@@ -640,6 +789,9 @@ pub struct BufferedFileWriter {
 	/// before one fails.
 	#[cfg(test)]
 	fail_after_ops: Option<usize>,
+	/// Fault injection for tests: the next cut back of the file fails.
+	#[cfg(test)]
+	fail_truncate: bool,
 	/// Test-only count of the `write(2)` calls that reached the file, see `file_writes`.
 	#[cfg(test)]
 	file_writes: usize,
@@ -656,6 +808,8 @@ impl BufferedFileWriter {
 			len,
 			#[cfg(test)]
 			fail_after_ops: None,
+			#[cfg(test)]
+			fail_truncate: false,
 			#[cfg(test)]
 			file_writes: 0,
 		}
@@ -692,6 +846,11 @@ impl BufferedFileWriter {
 	///
 	/// `len` must not be past the end of the file.
 	pub(crate) fn truncate(&mut self, len: u64) -> Result<()> {
+		#[cfg(test)]
+		if std::mem::take(&mut self.fail_truncate) {
+			return Err(Error::IO(IOError::new(io::ErrorKind::Other, "injected cut failure")));
+		}
+
 		// Rebuild the buffer around the same file. The old one is taken apart rather than
 		// dropped, because dropping a `BufWriter` writes out what it still holds.
 		let capacity = self.writer.capacity();
@@ -718,6 +877,12 @@ impl BufferedFileWriter {
 	#[cfg(test)]
 	pub(crate) fn fail_after_ops(&mut self, ops: usize) {
 		self.fail_after_ops = Some(ops);
+	}
+
+	/// Makes the next cut back of the file fail once.
+	#[cfg(test)]
+	pub(crate) fn fail_truncate(&mut self) {
+		self.fail_truncate = true;
 	}
 
 	/// How many `write(2)` calls have reached the file: one for every flush of a non-empty
@@ -818,7 +983,25 @@ impl WritableFile for BufferedFileWriter {
 /// # Returns
 ///
 /// A result with the count of removed segments or an error
+#[cfg(test)]
 pub(crate) fn cleanup_old_segments(wal_dir: &Path, min_wal_number: u64) -> Result<usize> {
+	cleanup_old_segments_for(None, wal_dir, min_wal_number)
+}
+
+/// Like `cleanup_old_segments`, for the WAL of a database that is encrypted if `context` is given.
+///
+/// A segment is removed by its number, and without being read: it is below the log number, so the
+/// database has no use for it. In an encrypted database that is not enough to know that it is the
+/// database's. The segments of another database that shares the key, or one that is not sealed at
+/// all, that someone put there, or left behind by a restore from the wrong place, are not looked at
+/// by the replay either, which starts at the log number. Each segment is therefore read from its
+/// first record (see `sealed::check_first_record`) before it is removed, and one that is not this
+/// database's is left where it is and said so, since nothing here knows what it is.
+pub(crate) fn cleanup_old_segments_for(
+	context: Option<&EncryptionContext>,
+	wal_dir: &Path,
+	min_wal_number: u64,
+) -> Result<usize> {
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
 		return Ok(0);
@@ -841,6 +1024,16 @@ pub(crate) fn cleanup_old_segments(wal_dir: &Path, min_wal_number: u64) -> Resul
 	for segment_id in segment_ids {
 		if segment_id < min_wal_number {
 			let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
+
+			if let Some(context) = context {
+				if let Err(e) = sealed::check_segment_file(context.db_id(), &segment_path) {
+					tracing::error!(
+						"Kept the WAL segment {segment_id:020}, which is below the log number: \
+						 it is not a segment of this database: {e}"
+					);
+					continue;
+				}
+			}
 
 			match fs::remove_file(&segment_path) {
 				Ok(_) => {

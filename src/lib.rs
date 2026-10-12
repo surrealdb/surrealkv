@@ -24,8 +24,8 @@ mod sstable;
 mod stall;
 pub mod storage;
 mod task;
-// Reachable only because `Options::key_manager` is a public field. Encryption at rest is not
-// implemented, so keep it out of the documented API.
+// Reachable only because `Options::key_manager` is a public field. Encryption at rest is a
+// preview, so keep it out of the documented API.
 #[doc(hidden)]
 pub mod tde;
 pub mod telemetry;
@@ -54,15 +54,18 @@ pub use crate::error::{
 	BackgroundError,
 	BackgroundErrorHandler,
 	BackgroundErrorReason,
+	EncryptionError,
 	Error,
 	ErrorSeverity,
+	KeyProviderFailure,
 	Result,
 	WriteStallReason,
 };
 pub use crate::lsm::{Tree, TreeBuilder};
 pub use crate::stall::WriteStallInfo;
+use crate::tde::EncryptionContext;
 #[doc(hidden)]
-pub use crate::tde::{BlockCipher, CipherSuite, KeyManager, SoftwareKeyManager};
+pub use crate::tde::{CipherPreference, CipherSuite, KeyManager, KeyState, SoftwareKeyManager};
 pub use crate::transaction::{
 	Durability,
 	HistoryOptions,
@@ -281,17 +284,27 @@ pub struct Options {
 	pub l0_stall_threshold: usize,
 
 	// Transparent Data Encryption (TDE) configuration
-	/// Key manager reserved for transparent data encryption at rest (TDE), which is not
-	/// implemented yet. The cipher primitives are not wired into any SSTable, WAL or value-log
-	/// path, so nothing would be encrypted. Building a tree with a key manager set returns
-	/// `Error::InvalidArgument` instead of writing plaintext.
+	/// Key manager for transparent data encryption at rest (TDE). A database that is created with
+	/// one is encrypted for good: its manifest, tables, value log and write-ahead log are sealed
+	/// under keys derived from it, and a database that was created without one cannot be given
+	/// one. Encryption is a preview: a key manager is refused with `Error::InvalidArgument` unless
+	/// the crate is built with the `encryption-preview` feature, and the formats are not final.
 	/// Default: None
 	pub key_manager: Option<Arc<dyn KeyManager>>,
-	/// Cipher suite reserved for encryption at rest. Has no effect until encryption is
-	/// implemented.
-	/// Options: Aes256Gcm, XChaCha20Poly1305.
-	/// Default: CipherSuite::Aes256Gcm
-	pub encryption_cipher: CipherSuite,
+	/// Cipher suite preference for a database that is created encrypted. `Auto` lets the library
+	/// pick AES-256-GCM when the CPU has AES instructions and XChaCha20-Poly1305 otherwise, once,
+	/// when the database is created. The suite is then kept in the database, and a database that
+	/// exists ignores this.
+	/// Options: Auto, Suite(Aes256Gcm), Suite(XChaCha20Poly1305).
+	/// Default: CipherPreference::Auto
+	pub encryption_cipher: CipherPreference,
+	/// The encryption context a database resolves once it has read its descriptor: the key
+	/// manager, the suite and the database identity. It is set by the engine after the manifest
+	/// is read, and every writer and reader of a file takes its cipher from it. It is a public
+	/// field only so that code outside the crate can keep building `Options` with
+	/// `..Default::default()`.
+	#[doc(hidden)]
+	pub encryption_context: Option<Arc<EncryptionContext>>,
 }
 
 impl Default for Options {
@@ -337,7 +350,8 @@ impl Default for Options {
 			memtable_stall_threshold: 2,
 			l0_stall_threshold: 12,
 			key_manager: None,
-			encryption_cipher: CipherSuite::default(),
+			encryption_cipher: CipherPreference::default(),
+			encryption_context: None,
 		}
 	}
 }
@@ -368,18 +382,48 @@ impl Options {
 		self
 	}
 
-	/// Reserved for Transparent Data Encryption (TDE), which is not implemented yet.
+	/// Creates the database encrypted at rest with the keys of `key_manager`, or opens the one that
+	/// is, which needs the same keys. Every file of the database is sealed: the manifest, the
+	/// tables, the value log and the write-ahead log. `cipher` is the suite a new database uses,
+	/// and an existing one keeps its own.
 	///
-	/// The cipher primitives are not wired into any SSTable, WAL or value-log path, so this
-	/// would encrypt nothing. Building a tree with a key manager set fails with
-	/// `Error::InvalidArgument` rather than writing plaintext.
+	/// Encryption is a preview: unless the crate is built with the `encryption-preview` feature,
+	/// building a tree with a key manager set fails with `Error::InvalidArgument`.
 	pub fn with_encryption(
 		mut self,
 		key_manager: Arc<dyn KeyManager>,
-		cipher: CipherSuite,
+		cipher: impl Into<CipherPreference>,
 	) -> Self {
 		self.key_manager = Some(key_manager);
-		self.encryption_cipher = cipher;
+		self.encryption_cipher = cipher.into();
+		self
+	}
+
+	/// The resolved encryption context, if this database is encrypted. The writers and readers of
+	/// every kind of file take their cipher from it.
+	pub(crate) fn encryption_context(&self) -> Option<&Arc<EncryptionContext>> {
+		self.encryption_context.as_ref()
+	}
+
+	/// Refuses options that name a key manager but carry no resolved context. `Tree::new` settles
+	/// the context from the manifest before it opens a file, so options like these reaching a
+	/// writer would mean a path that skipped that, and every writer would then write in the clear
+	/// without saying so.
+	pub(crate) fn ensure_encryption_resolved(&self) -> Result<()> {
+		if self.key_manager.is_some() && self.encryption_context.is_none() {
+			return Err(Error::InvalidArgument(
+				"A key manager is configured but the encryption of the database was not resolved: \
+				 refusing to write files in plaintext"
+					.to_string(),
+			));
+		}
+		Ok(())
+	}
+
+	/// Sets the resolved encryption context. The engine calls this once, with the identity and
+	/// the suite that the database's descriptor names, before any file is opened.
+	pub(crate) fn with_encryption_context(mut self, context: Arc<EncryptionContext>) -> Self {
+		self.encryption_context = Some(context);
 		self
 	}
 
@@ -648,17 +692,18 @@ impl Options {
 	/// This should be called when the store starts to catch configuration
 	/// errors early
 	pub fn validate(&self) -> Result<()> {
-		// Encryption at rest is not wired into any SSTable, WAL or value-log path yet, so a
-		// configured key manager would be accepted and then ignored, leaving every file in
-		// plaintext. Refuse here, which is the first thing `Tree::new` does, so a rejection
-		// creates nothing on disk. Compiled out only for this crate's own unit tests and under
-		// the non-default `encryption-preview` feature, which exist to build the missing parts.
+		// Encryption at rest is a preview and is not enabled in this build: its formats are not
+		// final, so a database that was sealed by it would not be one that a release reads. Refuse
+		// here, which is the first thing `Tree::new` does, so a rejection creates nothing on
+		// disk. A resolved context is refused as well: it is a public field, and it is what
+		// makes the files sealed. Compiled out only for this crate's own unit tests and under the
+		// non-default `encryption-preview` feature.
 		#[cfg(not(any(test, feature = "encryption-preview")))]
-		if self.key_manager.is_some() {
+		if self.key_manager.is_some() || self.encryption_context.is_some() {
 			return Err(Error::InvalidArgument(
-				"Encryption at rest is not implemented yet: the key manager would be accepted \
-				 but no SSTable, WAL or value-log data would be encrypted. Refusing to open \
-				 rather than write plaintext; remove the key manager."
+				"Encryption at rest is not enabled in this build: it is a preview behind the \
+				 `encryption-preview` feature, and its formats are not final. Refusing to open \
+				 with a key manager; remove the key manager."
 					.to_string(),
 			));
 		}

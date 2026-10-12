@@ -1,6 +1,6 @@
 //! A configured key manager must make `build` fail instead of silently writing plaintext.
 //!
-//! Encryption at rest is not wired into any SSTable, WAL or value-log path yet. These tests
+//! Encryption at rest is a preview and is not enabled in this build. These tests
 //! link against the library the way a downstream crate does, so `cfg(test)` is not set on it
 //! and the guard is active. They are compiled out when the non-default `encryption-preview`
 //! feature removes the guard.
@@ -10,11 +10,26 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use surrealkv::{CipherSuite, Error, KeyManager, Options, SoftwareKeyManager, Tree, TreeBuilder};
+use surrealkv::tde::{DbId, EncryptionContext};
+use surrealkv::{
+	CipherPreference,
+	CipherSuite,
+	Error,
+	KeyManager,
+	Options,
+	SoftwareKeyManager,
+	Tree,
+	TreeBuilder,
+};
 
-const SUITES: [CipherSuite; 2] = [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305];
+/// Every way of asking for a cipher, including leaving the choice to the library.
+const SUITES: [CipherPreference; 3] = [
+	CipherPreference::Auto,
+	CipherPreference::Suite(CipherSuite::Aes256Gcm),
+	CipherPreference::Suite(CipherSuite::XChaCha20Poly1305),
+];
 
-fn options_with_key_manager(path: &Path, suite: CipherSuite) -> Options {
+fn options_with_key_manager(path: &Path, suite: CipherPreference) -> Options {
 	let key_manager: Arc<dyn KeyManager> = Arc::new(SoftwareKeyManager::new([0x5a; 32]));
 	Options::new().with_path(path.to_path_buf()).with_encryption(key_manager, suite)
 }
@@ -73,7 +88,8 @@ async fn rejected_build_leaves_an_existing_directory_untouched() {
 	let db_path = dir.path().join("db");
 	std::fs::create_dir(&db_path).unwrap();
 
-	let opts = options_with_key_manager(&db_path, CipherSuite::default()).with_enable_vlog(true);
+	let opts =
+		options_with_key_manager(&db_path, CipherPreference::default()).with_enable_vlog(true);
 	assert_encryption_refused(expect_err(TreeBuilder::with_options(opts).build()));
 
 	let entries = std::fs::read_dir(&db_path).unwrap().count();
@@ -91,12 +107,43 @@ fn validate_rejects_key_manager() {
 	}
 }
 
+/// A context that the engine resolved, set on the options by hand and with no key manager: the
+/// SSTables would be sealed and the other files would not, so it is refused like a key manager.
+fn options_with_context(path: &Path) -> Options {
+	let key_manager: Arc<dyn KeyManager> = Arc::new(SoftwareKeyManager::new([0x5a; 32]));
+	let context = EncryptionContext::new(
+		key_manager,
+		DbId::from_bytes([0x07; 16]),
+		CipherSuite::XChaCha20Poly1305,
+	);
+	let mut opts = Options::new().with_path(path.to_path_buf());
+	opts.encryption_context = Some(Arc::new(context));
+	opts
+}
+
+#[test]
+fn validate_rejects_a_resolved_encryption_context() {
+	let opts = options_with_context(Path::new("unused"));
+	assert!(opts.key_manager.is_none());
+	assert_encryption_refused(opts.validate().unwrap_err());
+}
+
+#[tokio::test]
+async fn build_rejects_a_resolved_encryption_context_and_creates_nothing() {
+	let dir = tempfile::tempdir().unwrap();
+	let db_path = dir.path().join("db");
+
+	let opts = options_with_context(&db_path);
+	assert_encryption_refused(expect_err(TreeBuilder::with_options(opts).build()));
+	assert!(!db_path.exists(), "a rejected build must not create the directory");
+}
+
 #[tokio::test]
 async fn rejected_build_does_not_block_a_plain_build_at_the_same_path() {
 	let dir = tempfile::tempdir().unwrap();
 	let db_path = dir.path().join("db");
 
-	let opts = options_with_key_manager(&db_path, CipherSuite::default());
+	let opts = options_with_key_manager(&db_path, CipherPreference::default());
 	assert_encryption_refused(expect_err(TreeBuilder::with_options(opts).build()));
 	assert!(!db_path.exists());
 

@@ -33,7 +33,8 @@ pub trait LogStore: Send + Sync + Debug {
 
 /// Trait for immutable object/page storage (SSTables).
 pub trait ObjectStore: Send + Sync + Debug {
-	/// Reads a range of bytes `[offset..offset + len)` from the object.
+	/// Reads a range of bytes `[offset..offset + len)` from the object. The result is shorter
+	/// than `len` only where the object ends.
 	fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'_, Bytes>;
 
 	/// Returns total size of the object in bytes.
@@ -123,6 +124,16 @@ impl std::fmt::Debug for AffinityLogStore {
 	}
 }
 
+/// The error of a failed append or sync of the WAL, for the committer. As text, as it always was,
+/// except an encryption error, which keeps its type: a seal that was refused is not an I/O error,
+/// and the committer has to be able to tell.
+fn log_error(error: crate::wal::Error) -> crate::error::Error {
+	match error {
+		crate::wal::Error::Encryption(error) => crate::error::Error::Encryption(error),
+		error => crate::error::Error::Other(error.to_string()),
+	}
+}
+
 impl AffinityLogStore {
 	pub fn new(wal: Arc<parking_lot::RwLock<crate::wal::manager::Wal>>) -> Self {
 		Self {
@@ -144,7 +155,7 @@ impl AffinityLogStore {
 			affinitypool::spawn(move || -> Result<u64> {
 				let mut guard = wal.write();
 				let segment = guard.get_active_log_number();
-				guard.append(&data).map_err(|e| crate::error::Error::Other(e.to_string()))?;
+				guard.append(&data).map_err(log_error)?;
 				Ok(segment)
 			})
 			.await
@@ -178,9 +189,7 @@ impl AffinityLogStore {
 			if !admit() {
 				return Err(crate::error::Error::PipelineStall);
 			}
-			let segment = guard
-				.append_group(&buf, &ends)
-				.map_err(|e| crate::error::Error::Other(e.to_string()))?;
+			let segment = guard.append_group(&buf, &ends).map_err(log_error)?;
 			Ok((segment, buf, ends))
 		})
 		.await
@@ -194,7 +203,7 @@ impl LogStore for AffinityLogStore {
 		Box::pin(async move {
 			affinitypool::spawn(move || -> Result<u64> {
 				let mut guard = wal.write();
-				guard.append(&data).map_err(|e| crate::error::Error::Other(e.to_string()))
+				guard.append(&data).map_err(log_error)
 			})
 			.await
 		})
@@ -205,7 +214,7 @@ impl LogStore for AffinityLogStore {
 		Box::pin(async move {
 			affinitypool::spawn(move || -> Result<()> {
 				let mut guard = wal.write();
-				guard.sync().map_err(|e| crate::error::Error::Other(e.to_string()))
+				guard.sync().map_err(log_error)
 			})
 			.await
 		})
@@ -247,8 +256,11 @@ impl ObjectStore for AffinityObjectStore {
 		let file = Arc::clone(&self.file);
 		Box::pin(async move {
 			affinitypool::spawn(move || -> Result<Bytes> {
+				// Short only at the end of the file, like the other stores: the tail of the
+				// buffer is never left as zeros that were not read.
 				let mut buf = vec![0u8; len];
-				file.read_at(offset, &mut buf)?;
+				let read = file.read_up_to(offset, &mut buf)?;
+				buf.truncate(read);
 				Ok(Bytes::from(buf))
 			})
 			.await

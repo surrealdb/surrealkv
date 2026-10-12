@@ -193,6 +193,7 @@ fn create_test_manifest(
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 
 	// Write the manifest to disk
@@ -471,6 +472,7 @@ fn test_level_selection_score_based() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -641,6 +643,7 @@ async fn test_simple_merge_compaction() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 
 	write_manifest_to_disk(&manifest).unwrap();
@@ -835,6 +838,7 @@ async fn test_multi_level_merge_compaction() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 
 	write_manifest_to_disk(&manifest).unwrap();
@@ -1307,6 +1311,7 @@ async fn test_compaction_with_large_keys_and_values() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 
 	write_manifest_to_disk(&manifest).unwrap();
@@ -1384,6 +1389,7 @@ async fn test_compaction_respects_sequence_numbers() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 
 	write_manifest_to_disk(&manifest).unwrap();
@@ -1476,6 +1482,7 @@ async fn test_tombstone_propagation() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -1576,6 +1583,7 @@ async fn test_l0_overlapping_keys_compaction() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -1696,6 +1704,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -1817,6 +1826,7 @@ async fn test_tombstone_propagation_through_levels() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -2086,6 +2096,7 @@ async fn test_soft_delete_compaction_behavior() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -2237,6 +2248,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -2768,6 +2780,7 @@ fn test_clean_cut_shared_boundary_key() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -2831,6 +2844,7 @@ fn test_clean_cut_chain_expansion() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -2886,6 +2900,7 @@ fn test_clean_cut_no_expansion_needed() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -2955,6 +2970,7 @@ fn test_clean_cut_integration_shared_boundary() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -3031,6 +3047,7 @@ fn test_clean_cut_integration_chain_expansion() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -3099,6 +3116,7 @@ fn test_clean_cut_integration_with_oldest_seq_priority() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
@@ -3167,6 +3185,7 @@ fn test_clean_cut_integration_no_expansion() {
 		snapshots: Vec::new(),
 		log_number: 0,
 		last_sequence: 0,
+		encryption: None,
 	};
 	write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));

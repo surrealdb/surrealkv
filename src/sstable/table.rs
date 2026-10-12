@@ -27,6 +27,10 @@
 //! └─────────────────────────────────────────────────────────────────┘
 //! ```
 //!
+//! A sealed table, which is what the checksum type of its footer says, has a header before its
+//! first data block and sealed blocks, see `block_io`. The footer is never sealed and never holds
+//! anything secret: it is two block handles, the format and the layout of the blocks.
+//!
 //! ## Key Concept: Separator Keys
 //!
 //! Index entries use "separator keys" as upper bounds, NOT the actual last key.
@@ -72,23 +76,25 @@ use std::ops::Bound;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crc32fast::Hasher as Crc32;
 use snap::raw::max_compress_len;
 
 use crate::compression::CompressionSelector;
 use crate::error::{Error, Result};
 use crate::sstable::block::{Block, BlockData, BlockHandle, BlockIterator, BlockWriter};
+#[cfg(test)]
+use crate::sstable::block_io::Protection;
+use crate::sstable::block_io::{BlockKind, BlockSink, BlockSource};
 use crate::sstable::error::SSTableError;
 use crate::sstable::filter_block::FilterBlockReader;
 use crate::sstable::index_block::{Index, IndexIterator, IndexWriter};
 use crate::sstable::meta::TableMetadata;
 use crate::sstable::partitioned_filter::{PartitionedFilterReader, PartitionedFilterWriter};
+use crate::sstable::sealed::SstStarter;
 use crate::vfs::File;
 use crate::vlog::{ValueLocation, ValuePointer};
 use crate::{
 	Comparator,
 	CompressionType,
-	FilterPolicy,
 	InternalKey,
 	InternalKeyKind,
 	InternalKeyRange,
@@ -147,9 +153,21 @@ pub(crate) fn unmask(masked: u32) -> u32 {
 // TABLE FORMAT TYPES
 // =============================================================================
 
+/// How the blocks of a table are checked, which the footer says and which fixes the layout of
+/// every block of the file.
+///
+/// The second value is not a different checksum: it is the signal that a table is sealed. Its
+/// blocks are authenticated ciphertext followed by the trailer of nine bytes, and the file begins
+/// with a header. It is a value of this byte, and not a flag somewhere else in the footer, because
+/// a reader that does not know it must stop at the footer: bytes that were ignored, such as the
+/// padding, would be read as a plain table by a reader that has never heard of sealing.
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum ChecksumType {
+	/// Plain blocks, each followed by its compression type and a masked CRC32.
 	CRC32c = 1,
+	/// Sealed blocks, each followed by its compression type, its length and a masked CRC32. The
+	/// CRC is the same one, and it only tells damage from tampering, which the seal tells.
+	SealedCRC32c = 2,
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -178,7 +196,7 @@ impl TableFormat {
 /// Offset  Size  Field
 /// ------  ----  -----
 /// 0       1     Format version (1 = LSMV1)
-/// 1       1     Checksum type (1 = CRC32c)
+/// 1       1     Checksum type (1 = CRC32c, 2 = sealed blocks)
 /// 2       16    Meta index block handle (varint encoded offset + size)
 /// 18      16    Index block handle (varint encoded offset + size)
 /// 34      8     Padding (zeros)
@@ -191,6 +209,11 @@ impl TableFormat {
 /// 2. Verify magic number
 /// 3. Decode block handles
 /// 4. Use handles to read index and meta blocks
+///
+/// The footer is the one part of a table that is read before anything can be checked, and
+/// nothing authenticates it: whoever can write the file can write any footer. What it says about
+/// the layout of the blocks is therefore a claim that the reader of a database whose tables are
+/// sealed must not take at its word.
 #[derive(Debug, Clone)]
 pub(crate) struct Footer {
 	pub format: TableFormat,
@@ -209,24 +232,15 @@ impl Footer {
 		}
 	}
 
-	/// Reads the footer bytes from the end of the file.
-	pub(crate) fn read_from(reader: Arc<dyn File>, file_size: usize) -> Result<Vec<u8>> {
-		if file_size < TABLE_FULL_FOOTER_LENGTH {
-			return Err(Error::from(SSTableError::FileTooSmall {
-				file_size,
-				min_size: TABLE_FULL_FOOTER_LENGTH,
+	/// Decodes a footer from raw bytes.
+	pub(crate) fn decode(buf: &[u8]) -> Result<Footer> {
+		// The length is checked first: the magic number is read from the end of the buffer.
+		if buf.len() < TABLE_FOOTER_LENGTH {
+			return Err(Error::from(SSTableError::FooterTooShort {
+				footer_len: buf.len(),
 			}));
 		}
 
-		let mut buf = vec![0; TABLE_FULL_FOOTER_LENGTH];
-		let offset = file_size - TABLE_FULL_FOOTER_LENGTH;
-		reader.read_at(offset as u64, &mut buf)?;
-
-		Ok(buf)
-	}
-
-	/// Decodes a footer from raw bytes.
-	pub(crate) fn decode(buf: &[u8]) -> Result<Footer> {
 		// Step 1: Validate magic number (last 8 bytes)
 		let magic = &buf[buf.len() - TABLE_MAGIC_FOOTER_ENCODED.len()..];
 		if magic != TABLE_MAGIC_FOOTER_ENCODED {
@@ -235,16 +249,11 @@ impl Footer {
 			}));
 		}
 
-		if buf.len() < TABLE_FOOTER_LENGTH {
-			return Err(Error::from(SSTableError::FooterTooShort {
-				footer_len: buf.len(),
-			}));
-		}
-
 		// Step 2: Read format and checksum type
 		let format = TableFormat::from_u8(buf[0])?;
 		let checksum = match buf[1] {
 			1 => ChecksumType::CRC32c,
+			2 => ChecksumType::SealedCRC32c,
 			_ => {
 				return Err(Error::from(SSTableError::InvalidChecksumType {
 					checksum_type: buf[1],
@@ -326,15 +335,13 @@ impl Footer {
 /// Index entry: separator="b" → DataBlock 1 handle
 /// ```
 pub(crate) struct TableWriter<W: Write> {
-	writer: W,
+	/// Writes the blocks and the footer, and knows where the next block goes.
+	sink: BlockSink<W>,
 	opts: Arc<Options>,
 	compression_selector: CompressionSelector,
 	target_level: u8,
 
 	pub(crate) meta: TableMetadata,
-
-	/// Current write offset in the file
-	offset: usize,
 
 	/// Last key of the previous block (for ordering validation)
 	prev_block_last_key: Vec<u8>,
@@ -363,7 +370,30 @@ pub(crate) struct TableWriter<W: Write> {
 }
 
 impl<W: Write> TableWriter<W> {
+	/// A writer of table `id`. If the options carry the encryption context of the database the
+	/// table is sealed, and its file is started when its first block is written: the key of the
+	/// file is taken then, so a key that cannot be had is the error of `add` or `finish` and
+	/// not of this call, and no key is held by a writer that never writes.
+	///
+	/// Every writer takes a key of its own, also for an id that was used before: a table that is
+	/// written again after a crash, or by a compaction that was retried, is another file.
 	pub(crate) fn new(writer: W, id: u64, opts: Arc<Options>, target_level: u8) -> Self {
+		let sink = match opts.encryption_context() {
+			Some(context) => {
+				BlockSink::deferred(writer, Box::new(SstStarter::new(Arc::clone(context), id)))
+			}
+			None => BlockSink::new(writer),
+		};
+		Self::with_sink(sink, id, opts, target_level)
+	}
+
+	/// A writer that writes its blocks through `sink`.
+	pub(crate) fn with_sink(
+		sink: BlockSink<W>,
+		id: u64,
+		opts: Arc<Options>,
+		target_level: u8,
+	) -> Self {
 		let fb = opts
 			.filter_policy
 			.clone()
@@ -376,11 +406,10 @@ impl<W: Write> TableWriter<W> {
 		meta.properties.compression = compression_selector.select_compression(target_level);
 
 		TableWriter {
-			writer,
+			sink,
 			opts: Arc::clone(&opts),
 			compression_selector,
 			target_level,
-			offset: 0,
 			meta,
 			prev_block_last_key: Vec::new(),
 
@@ -402,7 +431,7 @@ impl<W: Write> TableWriter<W> {
 	/// over to a new output file.
 	pub(crate) fn estimated_file_size(&self) -> u64 {
 		let pending = self.data_block.as_ref().map_or(0, |b| b.size_estimate());
-		(self.offset + pending) as u64
+		(self.sink.offset() + pending) as u64
 	}
 
 	/// Adds a key-value pair to the table.
@@ -520,7 +549,7 @@ impl<W: Write> TableWriter<W> {
 		// Compress and write the block
 		let contents = block.finish()?;
 		let compression_type = self.compression_selector.select_compression(self.target_level);
-		let handle = self.write_compressed_block(contents, compression_type)?;
+		let handle = self.write_block(BlockKind::Data, contents, compression_type)?;
 
 		// Add index entry: separator_key → block_handle. If the filter's
 		// current partition is full, ask the index to cut here so filter and
@@ -611,13 +640,17 @@ impl<W: Write> TableWriter<W> {
 				);
 				let mut filter_bytes_total = 0u64;
 				for (separator, bits) in partitions {
-					let handle = self.write_compressed_block(bits, CompressionType::None)?;
+					let handle =
+						self.write_block(BlockKind::FilterPartition, bits, CompressionType::None)?;
 					filter_bytes_total += handle.size as u64;
 					filter_index.add(&separator, &handle.encode())?;
 				}
 				let filter_index_data = filter_index.finish()?;
-				let fi_handle =
-					self.write_compressed_block(filter_index_data, CompressionType::None)?;
+				let fi_handle = self.write_block(
+					BlockKind::FilterIndex,
+					filter_index_data,
+					CompressionType::None,
+				)?;
 				self.meta.properties.filter_size = filter_bytes_total + fi_handle.size as u64;
 				filter_index_entry = Some((filter_name, fi_handle));
 			}
@@ -625,9 +658,7 @@ impl<W: Write> TableWriter<W> {
 
 		// Write partitioned index blocks and top-level index
 		let compression_type = self.compression_selector.select_compression(self.target_level);
-		let (ix_handle, new_offset) =
-			self.partitioned_index.finish(&mut self.writer, compression_type, self.offset)?;
-		self.offset = new_offset;
+		let ix_handle = self.partitioned_index.finish(&mut self.sink, compression_type)?;
 
 		// Record index statistics
 		self.meta.properties.index_size = self.partitioned_index.index_size();
@@ -650,34 +681,22 @@ impl<W: Write> TableWriter<W> {
 
 		// Write meta index block
 		let meta_block = meta_ix_block.finish()?;
-		let meta_ix_handle = self.write_compressed_block(meta_block, CompressionType::None)?;
+		let meta_ix_handle =
+			self.write_block(BlockKind::MetaIndex, meta_block, CompressionType::None)?;
 
 		// Write footer
 		let footer = Footer::new(meta_ix_handle, ix_handle);
-		let mut buf = vec![0u8; TABLE_FULL_FOOTER_LENGTH];
-		footer.encode(&mut buf);
-
-		self.offset += self.writer.write(&buf[..])?;
-		self.writer.flush()?;
-		Ok(self.offset)
+		self.sink.write_footer(&footer)
 	}
 
-	/// Compresses and writes a block, returning its handle.
-	fn write_compressed_block(
+	/// Compresses and writes a block of the given kind, returning its handle.
+	fn write_block(
 		&mut self,
+		kind: BlockKind,
 		block_data: BlockData,
 		compression_type: CompressionType,
 	) -> Result<BlockHandle> {
-		let compressed_block = compress_block(block_data, compression_type)?;
-		let (handle, new_offset) = write_block_at_offset(
-			&mut self.writer,
-			compressed_block,
-			compression_type,
-			self.offset,
-		)?;
-		self.offset = new_offset;
-
-		Ok(handle)
+		self.sink.write_block(kind, block_data, compression_type)
 	}
 
 	fn update_meta_properties(&mut self, key: &InternalKey, value: &[u8]) {
@@ -720,33 +739,6 @@ impl<W: Write> TableWriter<W> {
 // BLOCK I/O UTILITIES
 // =============================================================================
 
-/// Writes a block to the file with compression type and checksum.
-///
-/// ## Block Format on Disk
-///
-/// ```text
-/// +------------------+-------------------+-----------------+
-/// | Block Data       | Compression Type  | Masked CRC32    |
-/// | (variable)       | (1 byte)          | (4 bytes)       |
-/// +------------------+-------------------+-----------------+
-/// ```
-pub(crate) fn write_block_at_offset<W: Write>(
-	writer: &mut W,
-	block: BlockData,
-	compression_type: CompressionType,
-	offset: usize,
-) -> Result<(BlockHandle, usize)> {
-	let cksum = calculate_checksum(&block, compression_type);
-	writer.write_all(&block)?;
-	writer.write_all(&[compression_type as u8; BLOCK_COMPRESS_LEN])?;
-	writer.write_all(&mask(cksum.finalize()).to_le_bytes())?;
-
-	let handle = BlockHandle::new(offset, block.len());
-	let new_offset = offset + block.len() + BLOCK_CKSUM_LEN + BLOCK_COMPRESS_LEN;
-
-	Ok((handle, new_offset))
-}
-
 /// Compresses block data using the specified compression type.
 pub(crate) fn compress_block(
 	raw_block: BlockData,
@@ -783,39 +775,6 @@ pub(crate) fn decompress_block(
 	}
 }
 
-/// Reads and decodes the footer from a file.
-pub(crate) fn read_footer(f: Arc<dyn File>, file_size: usize) -> Result<Footer> {
-	let buf = Footer::read_from(f, file_size)?;
-	Footer::decode(&buf)
-}
-
-/// Reads raw bytes at a block handle's location.
-fn read_bytes(f: Arc<dyn File>, location: &BlockHandle) -> Result<Vec<u8>> {
-	let mut buf = vec![0; location.size()];
-	f.read_at(location.offset() as u64, &mut buf).map(|_| buf)
-}
-
-/// Calculates CRC32 checksum for a block.
-pub(crate) fn calculate_checksum(block: &[u8], compression_type: CompressionType) -> Crc32 {
-	let mut cksum = Crc32::new();
-	cksum.update(block);
-	cksum.update(&[compression_type as u8; BLOCK_COMPRESS_LEN]);
-	cksum
-}
-
-/// Reads a filter block from the file.
-pub(crate) fn read_filter_block(
-	src: Arc<dyn File>,
-	location: &BlockHandle,
-	policy: Arc<dyn FilterPolicy>,
-) -> Result<FilterBlockReader> {
-	if location.size() == 0 {
-		return Err(Error::FilterBlockEmpty);
-	}
-	let buf = read_bytes(src, location)?;
-	Ok(FilterBlockReader::new(buf, policy))
-}
-
 pub(crate) fn read_writer_meta_properties(metaix: &Block) -> Result<Option<TableMetadata>> {
 	let meta_key = InternalKey::new(Vec::from(b"meta"), 0, InternalKeyKind::Set).encode();
 	let mut metaindexiter = metaix.iter()?;
@@ -828,60 +787,6 @@ pub(crate) fn read_writer_meta_properties(metaix: &Block) -> Result<Option<Table
 		return Ok(Some(TableMetadata::decode(buf_bytes)?));
 	}
 	Ok(None)
-}
-
-/// Reads and verifies a table block from the file.
-pub(crate) fn read_table_block(
-	comparator: Arc<dyn Comparator>,
-	f: Arc<dyn File>,
-	location: &BlockHandle,
-) -> Result<Block> {
-	let block = read_verified_raw_block(f, location)?;
-	Ok(Block::new(block, comparator))
-}
-
-/// Reads, checksum-verifies, and decompresses a block's raw bytes without
-/// interpreting them as a restart-encoded `Block` (used for bloom filter
-/// partitions, which have their own encoding).
-pub(crate) fn read_verified_raw_block(f: Arc<dyn File>, location: &BlockHandle) -> Result<Vec<u8>> {
-	// Read block data
-	let buf = read_bytes(Arc::clone(&f), location)?;
-
-	// Read compression type (1 byte after block data)
-	let compress = read_bytes(
-		Arc::clone(&f),
-		&BlockHandle::new(location.offset() + location.size(), BLOCK_COMPRESS_LEN),
-	)?;
-
-	// Read checksum (4 bytes after compression type)
-	let cksum = read_bytes(
-		Arc::clone(&f),
-		&BlockHandle::new(
-			location.offset() + location.size() + BLOCK_COMPRESS_LEN,
-			BLOCK_CKSUM_LEN,
-		),
-	)?;
-
-	// Verify checksum
-	let cksum_val = u32::from_le_bytes(
-		cksum.as_slice().try_into().map_err(|_| SSTableError::CorruptedBlockHandle)?,
-	);
-	if !verify_table_block(&buf, compress[0], unmask(cksum_val)) {
-		return Err(Error::from(SSTableError::ChecksumVerificationFailed {
-			block_offset: location.offset() as u64,
-		}));
-	}
-
-	// Decompress
-	decompress_block(&buf, CompressionType::try_from(compress[0])?)
-}
-
-/// Verifies a block's checksum.
-fn verify_table_block(block: &[u8], compression_type: u8, want: u32) -> bool {
-	let mut cksum = Crc32::new();
-	cksum.update(block);
-	cksum.update(&[compression_type; BLOCK_COMPRESS_LEN]);
-	cksum.finalize() == want
 }
 
 // =============================================================================
@@ -921,10 +826,10 @@ pub enum IndexType {
 pub(crate) struct Table {
 	pub id: u64,
 	/// The key of this instance's blocks in the block cache: unlike `id`, never given to another
-	/// table, see `cache::next_instance_id`.
+	/// table, see `BlockSource::cache_id`.
 	cache_id: u64,
-	pub file: Arc<dyn File>,
-	pub(crate) object_store: Arc<dyn crate::storage::ObjectStore>,
+	/// Reads the footer and the blocks of the table's file.
+	pub(crate) source: BlockSource,
 	pub file_size: u64,
 
 	pub(crate) opts: Arc<Options>,
@@ -956,33 +861,60 @@ pub(crate) enum TableFilter {
 }
 
 impl Table {
-	/// Opens an SSTable file for reading.
+	/// Opens the file of table `id` for reading.
+	///
+	/// A sealed table is opened only by a database that is encrypted, with the key of its file, and
+	/// a plain table only by one that is not: see `BlockSource::open_table`. Every table of a
+	/// database is opened here, whether a flush, a compaction or a manifest wrote it.
 	pub(crate) fn new(
 		id: u64,
 		opts: Arc<Options>,
 		file: Arc<dyn File>,
 		file_size: u64,
 	) -> Result<Table> {
-		let object_store: Arc<dyn crate::storage::ObjectStore> =
-			Arc::new(crate::storage::AffinityObjectStore::new(Arc::clone(&file)));
+		let (source, footer) =
+			BlockSource::open_table(file, file_size, id, opts.encryption_context())?;
+		Self::from_source(id, opts, file_size, source, footer)
+	}
 
-		// Step 1: Read footer
-		let footer = read_footer(Arc::clone(&file), file_size as usize)?;
+	/// Opens a table file whose blocks are protected as `protection_for` says once the footer is
+	/// read, which a table with sealed blocks needs and `new` does not.
+	#[cfg(test)]
+	pub(crate) fn open_with(
+		id: u64,
+		opts: Arc<Options>,
+		file: Arc<dyn File>,
+		file_size: u64,
+		protection_for: impl FnOnce(&Footer) -> Result<Protection>,
+	) -> Result<Table> {
+		let (source, footer) = BlockSource::open_with(file, file_size, protection_for)?;
+		Self::from_source(id, opts, file_size, source, footer)
+	}
 
-		let cache_id = crate::cache::next_instance_id();
+	/// Opens a table from the source of its blocks and its footer.
+	pub(crate) fn from_source(
+		id: u64,
+		opts: Arc<Options>,
+		file_size: u64,
+		source: BlockSource,
+		footer: Footer,
+	) -> Result<Table> {
+		// Step 1: The footer was read when the source was opened
+
+		let cache_id = source.cache_id();
 
 		// Step 2: Load partitioned index
 		let index_block = {
 			let partitioned_index =
-				Index::new(id, cache_id, Arc::clone(&opts), Arc::clone(&file), &footer.index)?;
+				Index::new(id, Arc::clone(&opts), source.clone(), &footer.index)?;
 			IndexType::Partitioned(partitioned_index)
 		};
 
 		// Step 3: Load meta index block
-		let metaindexblock = read_table_block(
-			Arc::clone(&opts.internal_comparator),
-			Arc::clone(&file),
+		let metaindexblock = source.read_block(
+			BlockKind::MetaIndex,
 			&footer.meta_index,
+			Arc::clone(&opts.internal_comparator),
 		)?;
 
 		// Step 4: Extract metadata
@@ -1003,20 +935,21 @@ impl Table {
 			{
 				TableFilter::Partitioned(PartitionedFilterReader::new(
 					id,
-					cache_id,
 					Arc::clone(&opts),
-					Arc::clone(&file),
+					source.clone(),
 					&handle,
 					Arc::clone(policy),
 				)?)
 			} else if let Some(handle) =
 				Self::find_meta_handle(&metaindexblock, &format!("filter.{name}"))?
 			{
-				TableFilter::Legacy(read_filter_block(
-					Arc::clone(&file),
-					&handle,
+				if handle.size() == 0 {
+					return Err(Error::FilterBlockEmpty);
+				}
+				TableFilter::Legacy(FilterBlockReader::new(
+					source.read_legacy_filter(&handle)?,
 					Arc::clone(policy),
-				)?)
+				))
 			} else {
 				TableFilter::None
 			}
@@ -1028,8 +961,7 @@ impl Table {
 		Ok(Table {
 			id,
 			cache_id,
-			file,
-			object_store,
+			source,
 			file_size,
 			opts,
 			filter,
@@ -1068,6 +1000,29 @@ impl Table {
 		Ok(None)
 	}
 
+	/// The number of reads of the table's file that were asked for, by the table, its clones and
+	/// its index and filter, see `BlockSource::raw_reads`.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn raw_reads(&self) -> u64 {
+		self.source.raw_reads()
+	}
+
+	/// The number of bytes that `raw_reads` asked for.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn raw_read_bytes(&self) -> u64 {
+		self.source.raw_read_bytes()
+	}
+
+	/// The number of lookups that were answered without the filter of the table because one of
+	/// its partitions could not be read.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn filter_reads_degraded(&self) -> u64 {
+		match &self.filter {
+			TableFilter::Partitioned(filters) => filters.degraded_reads(),
+			TableFilter::None | TableFilter::Legacy(_) => 0,
+		}
+	}
+
 	/// Reads a data block, using cache if available.
 	pub(crate) fn read_block(&self, location: &BlockHandle) -> Result<Arc<Block>> {
 		// Check cache first
@@ -1078,10 +1033,10 @@ impl Table {
 		}
 
 		// Cache miss: read from disk
-		let b = read_table_block(
-			Arc::clone(&self.opts.internal_comparator),
-			Arc::clone(&self.file),
+		let b = self.source.read_block(
+			BlockKind::Data,
 			location,
+			Arc::clone(&self.opts.internal_comparator),
 		)?;
 		let b = Arc::new(b);
 
@@ -1112,7 +1067,7 @@ impl Table {
 		}
 
 		// Cache miss: read from disk
-		let b = read_table_block(comparator, Arc::clone(&self.file), location)?;
+		let b = self.source.read_block(BlockKind::Data, location, comparator)?;
 		let b = Arc::new(b);
 
 		// Insert into history cache
@@ -1134,24 +1089,12 @@ impl Table {
 			return Ok(block);
 		}
 
-		// Read whole block + compress byte + checksum via ObjectStore asynchronously
-		let total_len = location.size() + BLOCK_COMPRESS_LEN + BLOCK_CKSUM_LEN;
-		let raw_bytes = self.object_store.read_at(location.offset() as u64, total_len).await?;
-
-		let buf = &raw_bytes[..location.size()];
-		let compress = &raw_bytes[location.size()..location.size() + BLOCK_COMPRESS_LEN];
-		let cksum = &raw_bytes[location.size() + BLOCK_COMPRESS_LEN..];
-
-		let cksum_val =
-			u32::from_le_bytes(cksum.try_into().map_err(|_| SSTableError::CorruptedBlockHandle)?);
-		if !verify_table_block(buf, compress[0], unmask(cksum_val)) {
-			return Err(Error::from(SSTableError::ChecksumVerificationFailed {
-				block_offset: location.offset() as u64,
-			}));
-		}
-
-		let block = decompress_block(buf, CompressionType::try_from(compress[0])?)?;
-		let b = Arc::new(Block::new(block, Arc::clone(&self.opts.internal_comparator)));
+		// The block and its trailer are read in one request through the object store
+		let block = self
+			.source
+			.read_block_async(BlockKind::Data, location, Arc::clone(&self.opts.internal_comparator))
+			.await?;
+		let b = Arc::new(block);
 
 		// Insert into cache
 		self.opts.block_cache.insert_data_block(
@@ -1182,7 +1125,7 @@ impl Table {
 				}
 			}
 			TableFilter::Partitioned(filters) => {
-				if !filters.may_contain(&key_encoded, key.user_key.as_slice()) {
+				if !filters.may_contain(&key_encoded, key.user_key.as_slice())? {
 					return Ok(None);
 				}
 			}
@@ -1302,7 +1245,7 @@ impl Table {
 				}
 			}
 			TableFilter::Partitioned(filters) => {
-				if !filters.may_contain(&key_encoded, key.user_key.as_slice()) {
+				if !filters.may_contain(&key_encoded, key.user_key.as_slice())? {
 					return Ok(None);
 				}
 			}

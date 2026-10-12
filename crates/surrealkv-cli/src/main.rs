@@ -597,11 +597,17 @@ fn cmd_scrub(path: &Path) -> Result<()> {
 		);
 		Ok(())
 	} else {
-		eprintln!(
-			"\n{} Detected {} corrupted blocks!",
-			"SCRUB FAILED:".red().bold(),
-			report.corrupt_blocks
-		);
+		if report.corrupt_blocks == 0 {
+			// Nothing was found damaged: some tables could not be read, which is for the errors to
+			// say.
+			eprintln!("\n{} Some tables could not be verified.", "SCRUB INCOMPLETE:".red().bold());
+		} else {
+			eprintln!(
+				"\n{} Detected {} corrupted blocks!",
+				"SCRUB FAILED:".red().bold(),
+				report.corrupt_blocks
+			);
+		}
 		for err in report.errors {
 			eprintln!("  - {}", err.red());
 		}

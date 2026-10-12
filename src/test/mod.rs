@@ -15,7 +15,15 @@ pub mod atomic_memtable_tests;
 #[cfg(test)]
 pub mod batch_tests;
 #[cfg(test)]
+pub mod block_io_tests;
+#[cfg(test)]
+pub mod block_read_tests;
+#[cfg(test)]
 pub mod block_tests;
+#[cfg(test)]
+pub mod cache_namespace_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod canary;
 #[cfg(test)]
 pub mod checkpoint_close_tests;
 #[cfg(test)]
@@ -51,6 +59,28 @@ pub mod direct_l0_manifest_failure_tests;
 #[cfg(test)]
 pub mod direct_l0_read_order_tests;
 #[cfg(test)]
+pub mod encryption_background_tests;
+#[cfg(test)]
+pub mod encryption_checkpoint_tests;
+#[cfg(test)]
+pub mod encryption_checkpoint_wal_tests;
+#[cfg(test)]
+pub mod encryption_commit_path_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod encryption_creation_crash_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod encryption_fuzz_tests;
+#[cfg(test)]
+pub mod encryption_open_tests;
+#[cfg(test)]
+pub mod encryption_prepare_tests;
+#[cfg(test)]
+pub mod encryption_surfaces_tests;
+#[cfg(test)]
+pub mod encryption_typed_errors_tests;
+#[cfg(test)]
+pub mod failed_open_tests;
+#[cfg(test)]
 pub mod flusher_alloc_diet_tests;
 #[cfg(test)]
 pub mod group_fail_stop_edge_tests;
@@ -69,6 +99,8 @@ pub mod level_tests;
 #[cfg(test)]
 pub mod lsm_tests;
 #[cfg(test)]
+pub mod manifest_encryption_tests;
+#[cfg(test)]
 pub mod manifest_missing_tests;
 #[cfg(test)]
 pub mod manifest_tests;
@@ -81,11 +113,15 @@ pub mod manifest_write_stop_tests;
 #[cfg(test)]
 pub mod memtable_tests;
 #[cfg(test)]
+pub mod orphan_cleanup_tests;
+#[cfg(test)]
 pub mod recovery_integration_tests;
 #[cfg(test)]
 pub mod recovery_test_helpers;
 #[cfg(test)]
 pub mod recovery_tests;
+#[cfg(test)]
+pub mod reference_writer;
 #[cfg(test)]
 pub mod restore_concurrency_tests;
 #[cfg(test)]
@@ -99,9 +135,17 @@ pub mod rotate_vlog_race_tests;
 #[cfg(test)]
 pub mod snapshot_tests;
 #[cfg(test)]
+pub mod sstable_encryption_tests;
+#[cfg(test)]
+pub mod sstable_encryption_tree_tests;
+#[cfg(test)]
+pub mod sstable_layout_tests;
+#[cfg(test)]
 pub mod sstable_tests;
 #[cfg(test)]
 pub mod stall_tests;
+#[cfg(test)]
+pub mod tde_tests;
 #[cfg(test)]
 pub mod transaction_tests;
 #[cfg(test)]
@@ -109,9 +153,17 @@ pub mod vlog_floor_tests;
 #[cfg(test)]
 pub mod vlog_gc_tests;
 #[cfg(test)]
+pub mod vlog_sealed_tests;
+#[cfg(test)]
+pub mod vlog_sealed_tree_tests;
+#[cfg(test)]
 pub mod vlog_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_context_tests;
 #[cfg(test)]
 pub mod wal_decode_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_foreign_segment_tests;
 #[cfg(test)]
 pub mod wal_fsync_poison_tests;
 #[cfg(test)]
@@ -126,6 +178,14 @@ pub mod wal_group_crash_tests;
 pub mod wal_replace_tests;
 #[cfg(test)]
 pub mod wal_rotation_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_sealed_recovery_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_sealed_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_sealed_tree_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_sealed_writer_tests;
 #[cfg(test)]
 pub mod wal_stale_rounds_tests;
 #[cfg(test)]

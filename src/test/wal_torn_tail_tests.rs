@@ -256,8 +256,8 @@ async fn absolute_scenario(shape: Shape, class: Class) {
 
 	match class {
 		Class::Corruption => {
-			// A refused open leaves its background tasks, and with them the lock file, alive
-			// until the runtime ends, so the refusal is tried on a copy of the directory.
+			// The refusal is tried on a copy of the directory, so that the directory itself is
+			// only ever opened in the mode that repairs it.
 			let copy = TempDir::new().unwrap();
 			copy_dir(dir.path(), copy.path());
 			let refused = opts(copy.path(), WalRecoveryMode::AbsoluteConsistency);

@@ -7,10 +7,10 @@ use tokio::sync::Notify;
 
 use crate::compaction::leveled::Strategy;
 use crate::compaction::CompactionStrategy;
-use crate::error::{BackgroundErrorReason, ErrorSeverity};
+use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, ErrorSeverity};
 use crate::lsm::CompactionOperations;
 use crate::stall::WriteStallController;
-use crate::Options;
+use crate::{Error, Options};
 
 /// The wait before a failed memtable flush is run again; it doubles with every failure. The
 /// commit pipeline spaces out the replacements of a failed WAL segment the same way.
@@ -102,7 +102,7 @@ impl TaskManager {
 							Err(e) => {
 								tracing::error!("Memtable compaction task error: {e:?}");
 								let severity = error_handler
-									.set_error(e, BackgroundErrorReason::MemtablaFlush);
+									.set_error(e.clone(), BackgroundErrorReason::MemtablaFlush);
 								// A database a commit group stopped refuses every flush for good,
 								// so there is nothing to retry.
 								if severity >= ErrorSeverity::FatalError
@@ -111,10 +111,32 @@ impl TaskManager {
 									write_stall.signal_shutdown();
 									break;
 								}
-								// The memtable stays queued and the manifest is as it was,
-								// so the flush is run again until it succeeds. Commits fail
-								// meanwhile, and the writers stalled on it are let go.
+								// The memtable stays queued and the manifest is as it was.
+								// Commits fail meanwhile if the error stops writes, and the
+								// writers stalled on the flush are let go.
 								write_stall.signal_failure();
+								// A key that does not fit, or bytes that did not authenticate,
+								// will not be any better the next time: the memtable stays
+								// queued, writes stay stopped, and nothing is attempted again
+								// until something asks for a flush.
+								if !BackgroundErrorHandler::retries(
+									&e,
+									severity,
+									BackgroundErrorReason::MemtablaFlush,
+								) {
+									break;
+								}
+								// Otherwise the flush is run again until it succeeds. A key
+								// provider that was away may have to be asked for its keys again
+								// first, which is slow, and is done here and not on the commit
+								// path.
+								if matches!(&e, Error::Encryption(_)) {
+									if let Err(prepare_error) = core.prepare_keys() {
+										tracing::debug!(
+											"The keys could not be prepared again: {prepare_error:?}"
+										);
+									}
+								}
 								let _ = tokio::time::timeout(retry_wait, notify.notified()).await;
 								if stop_flag.load(Ordering::SeqCst) {
 									running.store(false, Ordering::SeqCst);
@@ -151,7 +173,7 @@ impl TaskManager {
 			let write_stall = Arc::clone(&write_stall);
 
 			let handle = tokio::spawn(async move {
-				loop {
+				'task: loop {
 					// Wait for notification
 					notify.notified().await;
 
@@ -165,13 +187,48 @@ impl TaskManager {
 					// Use leveled compaction strategy
 					let strategy: Arc<dyn CompactionStrategy> =
 						Arc::new(Strategy::from_options(Arc::clone(&opts)));
-					if let Err(e) = core.compact(strategy) {
-						tracing::error!("Level compaction task error: {e:?}");
-						core.error_handler().set_error(e, BackgroundErrorReason::Compaction);
-						write_stall.signal_shutdown();
-					} else {
-						tracing::debug!("Level compaction completed successfully");
-						write_stall.signal_work_done();
+					let error_handler = core.error_handler();
+					let mut retry_wait = FLUSH_RETRY_MIN;
+					loop {
+						match core.compact(Arc::clone(&strategy)) {
+							Ok(()) => {
+								tracing::debug!("Level compaction completed successfully");
+								// A compaction that works ends the wait of the one before it for a
+								// key provider. Any other failure of a compaction stays on record.
+								error_handler.recover_soft(BackgroundErrorReason::Compaction);
+								error_handler.recover_soft(BackgroundErrorReason::ManifestWrite);
+								write_stall.signal_work_done();
+								break;
+							}
+							Err(e) => {
+								tracing::error!("Level compaction task error: {e:?}");
+								let severity = error_handler
+									.set_error(e.clone(), BackgroundErrorReason::Compaction);
+								if !BackgroundErrorHandler::retries(
+									&e,
+									severity,
+									BackgroundErrorReason::Compaction,
+								) {
+									write_stall.signal_shutdown();
+									break;
+								}
+								// A key provider that is away: nothing was changed, so the
+								// compaction is picked again after the wait that a failed flush
+								// makes, and the writers stalled on it are let go meanwhile.
+								write_stall.signal_failure();
+								if let Err(prepare_error) = core.prepare_keys() {
+									tracing::debug!(
+										"The keys could not be prepared again: {prepare_error:?}"
+									);
+								}
+								let _ = tokio::time::timeout(retry_wait, notify.notified()).await;
+								if stop_flag.load(Ordering::SeqCst) {
+									running.store(false, Ordering::SeqCst);
+									break 'task;
+								}
+								retry_wait = (retry_wait * 2).min(FLUSH_RETRY_MAX);
+							}
+						}
 					}
 					running.store(false, Ordering::SeqCst);
 				}
@@ -261,7 +318,7 @@ mod tests {
 		WriteStallCountProvider,
 	};
 	use crate::task::TaskManager;
-	use crate::{Error, Options};
+	use crate::{BackgroundErrorReason, Error, ErrorSeverity, Options};
 
 	struct NoopStallProvider;
 
@@ -294,23 +351,23 @@ mod tests {
 		/// Whether a failed `compact_memtable` is an I/O error, which is fatal
 		memtable_failure_is_io: AtomicBool,
 		memtable_attempts: AtomicUsize,
+		/// The errors that the next calls of `compact_memtable` fail with, the first one first
+		memtable_errors: std::sync::Mutex<Vec<Error>>,
+		/// An error that every call of `compact_memtable` fails with while it is set
+		memtable_error: std::sync::Mutex<Option<Error>>,
+		/// The same two for `compact`
+		level_errors: std::sync::Mutex<Vec<Error>>,
+		level_error: std::sync::Mutex<Option<Error>>,
+		/// Every call of `compact`, whether it failed or not
+		level_attempts: AtomicUsize,
+		/// The times the tasks asked for the keys again
+		prepares: AtomicUsize,
 		error_handler: Arc<BackgroundErrorHandler>,
 	}
 
 	impl MockCoreInner {
 		fn new() -> Self {
-			Self {
-				memtable_compactions: Arc::new(AtomicUsize::new(0)),
-				level_compactions: Arc::new(AtomicUsize::new(0)),
-				memtable_delay_ms: 20,
-				level_delay_ms: 20,
-				fail_memtable: Arc::new(AtomicBool::new(false)),
-				fail_level: Arc::new(AtomicBool::new(false)),
-				memtable_failures: AtomicUsize::new(0),
-				memtable_failure_is_io: AtomicBool::new(false),
-				memtable_attempts: AtomicUsize::new(0),
-				error_handler: Arc::new(BackgroundErrorHandler::new()),
-			}
+			Self::with_delays(20, 20)
 		}
 
 		fn with_delays(memtable_delay_ms: u64, level_delay_ms: u64) -> Self {
@@ -324,8 +381,32 @@ mod tests {
 				memtable_failures: AtomicUsize::new(0),
 				memtable_failure_is_io: AtomicBool::new(false),
 				memtable_attempts: AtomicUsize::new(0),
+				memtable_errors: std::sync::Mutex::new(Vec::new()),
+				memtable_error: std::sync::Mutex::new(None),
+				level_errors: std::sync::Mutex::new(Vec::new()),
+				level_error: std::sync::Mutex::new(None),
+				level_attempts: AtomicUsize::new(0),
+				prepares: AtomicUsize::new(0),
 				error_handler: Arc::new(BackgroundErrorHandler::new()),
 			}
+		}
+
+		/// The error that the next call of `compact_memtable` is to fail with, if one is set.
+		fn next_memtable_error(&self) -> Option<Error> {
+			if let Some(error) = self.memtable_error.lock().unwrap().clone() {
+				return Some(error);
+			}
+			let mut queued = self.memtable_errors.lock().unwrap();
+			(!queued.is_empty()).then(|| queued.remove(0))
+		}
+
+		/// The error that the next call of `compact` is to fail with, if one is set.
+		fn next_level_error(&self) -> Option<Error> {
+			if let Some(error) = self.level_error.lock().unwrap().clone() {
+				return Some(error);
+			}
+			let mut queued = self.level_errors.lock().unwrap();
+			(!queued.is_empty()).then(|| queued.remove(0))
 		}
 	}
 
@@ -337,6 +418,10 @@ mod tests {
 			}
 
 			self.memtable_attempts.fetch_add(1, Ordering::SeqCst);
+
+			if let Some(error) = self.next_memtable_error() {
+				return Err(error);
+			}
 
 			// Check if should fail
 			let mut left = self.memtable_failures.load(Ordering::SeqCst);
@@ -372,6 +457,11 @@ mod tests {
 				std::hint::spin_loop();
 			}
 
+			self.level_attempts.fetch_add(1, Ordering::SeqCst);
+			if let Some(error) = self.next_level_error() {
+				return Err(error);
+			}
+
 			// Check if should fail
 			if self.fail_level.load(Ordering::SeqCst) {
 				return Err(Error::Other("level error".into()));
@@ -388,6 +478,11 @@ mod tests {
 
 		fn has_pending_immutables(&self) -> bool {
 			false // Mock always returns false (no immutables)
+		}
+
+		fn prepare_keys(&self) -> Result<()> {
+			self.prepares.fetch_add(1, Ordering::SeqCst);
+			Ok(())
 		}
 	}
 
@@ -966,5 +1061,275 @@ mod tests {
 		}
 
 		task_manager.stop().await;
+	}
+
+	// ===== Encryption errors =====
+
+	use crate::{EncryptionError, KeyProviderFailure};
+
+	fn unavailable() -> Error {
+		Error::Encryption(EncryptionError::KeyProvider(KeyProviderFailure::Unavailable))
+	}
+
+	/// An error of each class that trying again does not cure.
+	fn errors_that_are_not_retried() -> Vec<(Error, ErrorSeverity)> {
+		vec![
+			(Error::Encryption(EncryptionError::WrongKey), ErrorSeverity::HardError),
+			(Error::Encryption(EncryptionError::KeyRetired), ErrorSeverity::HardError),
+			(
+				Error::Encryption(EncryptionError::KeyProvider(KeyProviderFailure::Failed)),
+				ErrorSeverity::HardError,
+			),
+			(
+				Error::Encryption(EncryptionError::AuthenticationFailed),
+				ErrorSeverity::Unrecoverable,
+			),
+			(Error::Encryption(EncryptionError::PositionReuse), ErrorSeverity::Unrecoverable),
+			(Error::Encryption(EncryptionError::InvalidInput("a test")), ErrorSeverity::FatalError),
+		]
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_a_flush_that_waits_for_a_key_provider_is_tried_again_and_stops_nothing() {
+		let write_stall = test_write_stall();
+		let core = Arc::new(MockCoreInner::new());
+		core.memtable_errors.lock().unwrap().extend([unavailable(), unavailable(), unavailable()]);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			Arc::clone(&write_stall),
+		);
+
+		task_manager.wake_up_memtable();
+		wait_for(|| core.memtable_compactions.load(Ordering::SeqCst) == 1).await;
+		// The success ends the failure on record, which the task does once the flush returns.
+		wait_for(|| core.error_handler.get_error().is_none()).await;
+
+		assert_eq!(core.memtable_attempts.load(Ordering::SeqCst), 4);
+		// The keys were asked for again before each of the three attempts that followed a failure.
+		assert_eq!(core.prepares.load(Ordering::SeqCst), 3);
+		// One failure on record, and a success that ended it. Writes were never stopped.
+		assert_eq!(core.error_handler.error_count(), 1);
+		assert!(!core.error_handler.is_db_stopped());
+		// And no writer is refused afterwards, as it would be after a shutdown.
+		assert!(write_stall.check().await.is_ok());
+		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_a_flush_that_waits_for_a_key_provider_does_not_stop_writes_while_it_waits() {
+		let core = Arc::new(MockCoreInner::new());
+		*core.memtable_error.lock().unwrap() = Some(unavailable());
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			test_write_stall(),
+		);
+
+		task_manager.wake_up_memtable();
+		wait_for(|| core.memtable_attempts.load(Ordering::SeqCst) >= 3).await;
+
+		// The failure is on record, soft, and nothing refuses a commit because of it.
+		let recorded = core.error_handler.get_error().expect("the failure is recorded");
+		assert_eq!(recorded.severity, ErrorSeverity::SoftError);
+		assert_eq!(recorded.reason, BackgroundErrorReason::MemtablaFlush);
+		assert!(matches!(recorded.error, Error::Encryption(_)));
+		assert!(!core.error_handler.is_db_stopped());
+		assert!(core.error_handler.check_error().is_ok());
+
+		// Not retried for ever: the task lets go when it is asked to stop.
+		stop_within_a_bound(task_manager).await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_a_flush_that_fails_for_another_key_error_is_not_tried_again() {
+		for (error, severity) in errors_that_are_not_retried() {
+			let write_stall = test_write_stall();
+			let core = Arc::new(MockCoreInner::new());
+			*core.memtable_error.lock().unwrap() = Some(error.clone());
+			let task_manager = TaskManager::new(
+				Arc::clone(&core) as Arc<dyn CompactionOperations>,
+				Arc::new(Options::default()),
+				Arc::clone(&write_stall),
+			);
+
+			task_manager.wake_up_memtable();
+			wait_for(|| core.error_handler.is_db_stopped()).await;
+			// The first wait of a retry is 50 ms: a retry would have run again by now.
+			time::sleep(Duration::from_millis(400)).await;
+
+			assert_eq!(core.memtable_attempts.load(Ordering::SeqCst), 1, "{error:?}");
+			assert_eq!(core.prepares.load(Ordering::SeqCst), 0, "{error:?}");
+			let recorded = core.error_handler.get_error().unwrap();
+			assert_eq!(recorded.severity, severity, "{error:?}");
+			assert_eq!(recorded.reason, BackgroundErrorReason::MemtablaFlush);
+			// Writes stop, and a commit is told the error as it is.
+			match core.error_handler.check_error() {
+				Err(Error::Encryption(told)) => {
+					assert!(
+						matches!(&error, Error::Encryption(sent) if *sent == told),
+						"{error:?}"
+					);
+				}
+				other => panic!("{error:?}: {other:?}"),
+			}
+			task_manager.stop().await;
+		}
+	}
+
+	/// A hard key error ends when a flush that is asked for later works, like any hard error, and
+	/// one that is worse than that does not.
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_a_flush_that_works_ends_a_key_error_that_was_hard_and_no_other() {
+		for (error, severity) in errors_that_are_not_retried() {
+			let core = Arc::new(MockCoreInner::new());
+			*core.memtable_error.lock().unwrap() = Some(error.clone());
+			let task_manager = TaskManager::new(
+				Arc::clone(&core) as Arc<dyn CompactionOperations>,
+				Arc::new(Options::default()),
+				test_write_stall(),
+			);
+			task_manager.wake_up_memtable();
+			wait_for(|| core.error_handler.is_db_stopped()).await;
+			// A wake-up is ignored while the task is still running, which it is for a moment after
+			// it recorded the failure.
+			wait_for(|| !task_manager.memtable_running.load(Ordering::Acquire)).await;
+
+			*core.memtable_error.lock().unwrap() = None;
+			task_manager.wake_up_memtable();
+			wait_for(|| core.memtable_compactions.load(Ordering::SeqCst) == 1).await;
+			// The task ends a hard error once the flush returns. The others stay.
+			let ends = severity == ErrorSeverity::HardError;
+			wait_for(|| core.error_handler.is_db_stopped() != ends).await;
+			assert_eq!(core.error_handler.is_db_stopped(), !ends, "{error:?}");
+			task_manager.stop().await;
+		}
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_a_compaction_that_waits_for_a_key_provider_is_tried_again_and_stops_nothing() {
+		let write_stall = test_write_stall();
+		let core = Arc::new(MockCoreInner::new());
+		core.level_errors.lock().unwrap().extend([unavailable(), unavailable()]);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			Arc::clone(&write_stall),
+		);
+
+		task_manager.wake_up_level();
+		wait_for(|| core.level_compactions.load(Ordering::SeqCst) == 1).await;
+		// The success ends the failure on record, which the task does once the compaction returns.
+		wait_for(|| core.error_handler.get_error().is_none()).await;
+
+		assert_eq!(core.level_attempts.load(Ordering::SeqCst), 3);
+		assert_eq!(core.prepares.load(Ordering::SeqCst), 2);
+		// One failure on record, ended by the success, and writes were not stopped or refused.
+		assert_eq!(core.error_handler.error_count(), 1);
+		assert!(!core.error_handler.is_db_stopped());
+		assert!(write_stall.check().await.is_ok());
+		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_a_compaction_that_waits_for_a_key_provider_lets_the_stalled_writers_go() {
+		let write_stall = stalled_write_stall(20);
+		let core = Arc::new(MockCoreInner::new());
+		*core.level_error.lock().unwrap() = Some(unavailable());
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			Arc::clone(&write_stall),
+		);
+
+		let stalled = Arc::clone(&write_stall);
+		let writer = tokio::spawn(async move { stalled.check().await });
+		time::sleep(Duration::from_millis(50)).await;
+
+		task_manager.wake_up_level();
+		let told = time::timeout(Duration::from_secs(10), writer)
+			.await
+			.expect("the stalled writer is let go")
+			.unwrap();
+		assert!(told.is_err());
+		wait_for(|| core.level_attempts.load(Ordering::SeqCst) >= 2).await;
+
+		// The provider being away stops nothing.
+		assert!(!core.error_handler.is_db_stopped());
+		stop_within_a_bound(task_manager).await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_a_compaction_that_fails_for_another_key_error_stops_writes_and_is_not_tried_again(
+	) {
+		for (error, severity) in errors_that_are_not_retried() {
+			let write_stall = test_write_stall();
+			let core = Arc::new(MockCoreInner::new());
+			*core.level_error.lock().unwrap() = Some(error.clone());
+			let task_manager = TaskManager::new(
+				Arc::clone(&core) as Arc<dyn CompactionOperations>,
+				Arc::new(Options::default()),
+				Arc::clone(&write_stall),
+			);
+
+			task_manager.wake_up_level();
+			wait_for(|| core.error_handler.is_db_stopped()).await;
+			time::sleep(Duration::from_millis(400)).await;
+
+			assert_eq!(core.level_attempts.load(Ordering::SeqCst), 1, "{error:?}");
+			assert_eq!(core.prepares.load(Ordering::SeqCst), 0, "{error:?}");
+			let recorded = core.error_handler.get_error().unwrap();
+			assert_eq!(recorded.severity, severity, "{error:?}");
+			assert_eq!(recorded.reason, BackgroundErrorReason::Compaction);
+			// As every compaction failure that is not retried, it refuses the writers that follow.
+			assert!(write_stall.check().await.is_err(), "{error:?}");
+			task_manager.stop().await;
+		}
+	}
+
+	/// What was not a key error keeps what it had: a compaction that fails stops the database, and
+	/// a later compaction that works does not end that.
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_a_compaction_failure_that_is_not_a_key_error_still_stops_the_database_for_good() {
+		let write_stall = test_write_stall();
+		let core = Arc::new(MockCoreInner::new());
+		core.fail_level.store(true, Ordering::SeqCst);
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			Arc::clone(&write_stall),
+		);
+
+		task_manager.wake_up_level();
+		wait_for(|| core.error_handler.is_db_stopped()).await;
+		time::sleep(Duration::from_millis(400)).await;
+		assert_eq!(core.level_attempts.load(Ordering::SeqCst), 1);
+		assert!(write_stall.check().await.is_err());
+
+		core.fail_level.store(false, Ordering::SeqCst);
+		wait_for(|| !task_manager.level_running.load(Ordering::Acquire)).await;
+		task_manager.wake_up_level();
+		wait_for(|| core.level_compactions.load(Ordering::SeqCst) == 1).await;
+		// The compaction has returned, so the task has decided what its success ends.
+		wait_for(|| !task_manager.level_running.load(Ordering::Acquire)).await;
+		assert!(core.error_handler.is_db_stopped(), "a compaction that works does not end it");
+		assert!(core.error_handler.check_error().is_err());
+		task_manager.stop().await;
+	}
+
+	#[test(tokio::test(flavor = "multi_thread"))]
+	async fn test_stop_does_not_wait_for_a_compaction_that_keeps_waiting_for_a_key_provider() {
+		let core = Arc::new(MockCoreInner::new());
+		*core.level_error.lock().unwrap() = Some(unavailable());
+		let task_manager = TaskManager::new(
+			Arc::clone(&core) as Arc<dyn CompactionOperations>,
+			Arc::new(Options::default()),
+			test_write_stall(),
+		);
+
+		task_manager.wake_up_level();
+		wait_for(|| core.level_attempts.load(Ordering::SeqCst) >= 3).await;
+
+		stop_within_a_bound(task_manager).await;
 	}
 }

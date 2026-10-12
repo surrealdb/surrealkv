@@ -5,9 +5,11 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::error::{Error, Result};
-use crate::levels::LevelManifest;
+use crate::error::{EncryptionError, Error, Result};
+use crate::levels::{check_manifest_mode, LevelManifest};
 use crate::lsm::{fsync_directory, CoreInner};
+use crate::tde::EncryptionContext;
+use crate::vlog::sealed;
 use crate::Options;
 
 /// Recursively copies a directory and all its contents
@@ -297,12 +299,20 @@ pub(crate) fn check_restore_finished(opts: &Options) -> Result<()> {
 		return Ok(());
 	}
 	let checkpoint = fs::read_to_string(&marker).unwrap_or_default();
+	// An empty directory is a database of its own when it is opened with a key manager, with an
+	// identity that no checkpoint of another database has, and a restore refuses that.
+	let advice = if opts.key_manager.is_some() || opts.encryption_context().is_some() {
+		"The database is encrypted, and a checkpoint of it is restored only into the database it \
+		 was taken from: copy the directory of the checkpoint to an empty place and open it there \
+		 instead."
+	} else {
+		"Restore the checkpoint into an empty directory instead."
+	};
 	Err(Error::RestoreInterrupted(format!(
 		"a restore of the checkpoint '{}' into {} did not finish, or is still running in another \
 		 process: the files of the database are neither the database as it was nor the \
-		 checkpoint, so it is not opened and nothing was changed. Restore the checkpoint into an \
-		 empty directory instead. Only if no restore is running and the files are known to be the \
-		 restored database, remove {} to open it.",
+		 checkpoint, so it is not opened and nothing was changed. {advice} Only if no restore is \
+		 running and the files are known to be the restored database, remove {} to open it.",
 		checkpoint.trim(),
 		opts.path.display(),
 		marker.display()
@@ -342,6 +352,84 @@ fn sync_below(dir: &Path) -> std::io::Result<()> {
 		}
 	}
 	fsync_directory(dir)
+}
+
+/// Whether a value-log file of a checkpoint, whose first bytes are `head` and whose length is
+/// `len`, is of the kind that a database with the encryption `live` reads, see
+/// `DatabaseCheckpoint::check_vlog_mode`.
+///
+/// In a database that is encrypted a sealed file must be of this database and open with its key,
+/// and a plaintext file is `PlaintextInEncryptedDb`. In one that is not, a sealed file is
+/// `NotConfigured`.
+fn check_vlog_head(
+	live: Option<&EncryptionContext>,
+	id: u32,
+	is_newest: bool,
+	len: u64,
+	head: &[u8],
+) -> Result<()> {
+	let Some(context) = live else {
+		return if sealed::is_sealed_start(head) {
+			Err(EncryptionError::NotConfigured.into())
+		} else {
+			Ok(())
+		};
+	};
+	// A file that was cut off before its header was whole holds no entry. The whole of such a file
+	// is in `head`, which is at most a header long.
+	if is_newest && len <= sealed::SEALED_HEADER_LEN as u64 && sealed::is_torn(head) {
+		return Ok(());
+	}
+	if sealed::is_sealed_start(head) {
+		// The database, the file, the key and the tag, the order in which the log checks them.
+		return sealed::open_header(context, id, head, true).map(drop);
+	}
+	if sealed::is_plain_start(head) {
+		return Err(EncryptionError::PlaintextInEncryptedDb.into());
+	}
+	Err(Error::Corruption(format!("VLog file {id} of the checkpoint is not a value-log file")))
+}
+
+/// Whether a segment of a checkpoint's write-ahead log, number `id`, whose first bytes are `head`,
+/// is of the kind that a database with the encryption `live` reads, see
+/// `DatabaseCheckpoint::check_wal_mode`.
+///
+/// In a database that is encrypted a sealed segment must be of this database and of this number and
+/// must open with its key, in the order the log checks them, and a segment in the clear is
+/// `PlaintextInEncryptedDb`. In one that is not, a sealed segment is `NotConfigured`. An empty
+/// segment, or one of zeros, is what a crash right after the file was made leaves, and holds
+/// nothing. A sealed header that was cut short holds no batch either, and recovery treats it as a
+/// tear, so only the database that it names is checked, if the bytes that name it are there.
+fn check_wal_head(live: Option<&EncryptionContext>, id: u64, head: &[u8]) -> Result<()> {
+	use crate::wal::sealed as wal_sealed;
+
+	let sealed = wal_sealed::starts_like_sealed(head);
+	let Some(context) = live else {
+		return if sealed {
+			Err(EncryptionError::NotConfigured.into())
+		} else {
+			Ok(())
+		};
+	};
+	if !sealed {
+		return if head.iter().all(|&byte| byte == 0) {
+			Ok(())
+		} else {
+			Err(EncryptionError::PlaintextInEncryptedDb.into())
+		};
+	}
+	let payload = head.get(crate::wal::HEADER_SIZE..).unwrap_or_default();
+	match payload.get(..wal_sealed::HEADER_PAYLOAD_LEN) {
+		Some(payload) => {
+			wal_sealed::open_header(context, id, payload).map(drop).map_err(Into::into)
+		}
+		None => match payload.get(16..16 + crate::tde::DB_ID_LEN) {
+			Some(named) if named != context.db_id().as_bytes() => {
+				Err(EncryptionError::DbIdMismatch.into())
+			}
+			_ => Ok(()),
+		},
+	}
 }
 
 /// Current checkpoint metadata format version
@@ -690,6 +778,11 @@ impl DatabaseCheckpoint {
 	/// [`Error::RestoreInterrupted`]. A restore that failed in between is repeated on the open
 	/// database; one that crashed is repeated into an empty directory. A directory that a
 	/// checkpoint of this process is writing is refused with [`Error::InvalidArgument`].
+	///
+	/// A checkpoint of an encrypted database is restored only into the database it was taken
+	/// from: another database has an identity of its own, and a checkpoint of another one is
+	/// refused with [`EncryptionError::DbIdMismatch`](crate::EncryptionError::DbIdMismatch). To
+	/// recover it elsewhere, copy the directory of the checkpoint and open it.
 	pub fn restore_from_checkpoint<P: AsRef<Path>>(
 		&self,
 		checkpoint_dir: P,
@@ -799,8 +892,33 @@ impl DatabaseCheckpoint {
 		if !manifest_file.is_file() {
 			return Err(unusable("it has no manifest file".to_string()));
 		}
-		let levels = LevelManifest::load_from_file(&manifest_file, Arc::clone(&opts))
-			.map_err(|e| unusable(format!("its manifest and tables do not load: {e}")))?;
+
+		// Whether the checkpoint is encrypted, and is of this database and its suite, is read
+		// from the start of its manifest and of its value-log files, before anything of it is
+		// opened and without a key. An encryption error is the answer as it is: a checkpoint of
+		// another kind is not a damaged one, and none of them is a reason to remove anything.
+		let live = self.core.opts.encryption_context();
+		check_manifest_mode(live.map(Arc::as_ref), &manifest_file).map_err(|e| match e {
+			Error::Encryption(_) => e,
+			e => unusable(format!("its manifest is not usable: {e}")),
+		})?;
+		self.check_vlog_mode(checkpoint_path, live.map(Arc::as_ref)).map_err(|e| match e {
+			Error::Encryption(_) => e,
+			e => unusable(format!("its value log is not usable: {e}")),
+		})?;
+		self.check_wal_mode(checkpoint_path, live.map(Arc::as_ref)).map_err(|e| match e {
+			Error::Encryption(_) => e,
+			e => unusable(format!("its write-ahead log is not usable: {e}")),
+		})?;
+
+		// The tables are opened with the key of this database, which a checkpoint of it needs, and
+		// a table that does not open for want of one says so, and is not called damaged.
+		let levels = LevelManifest::load_from_file(&manifest_file, Arc::clone(&opts)).map_err(
+			|e| match e {
+				Error::Encryption(_) => e,
+				e => unusable(format!("its manifest and tables do not load: {e}")),
+			},
+		)?;
 
 		// The tables read their values from the value-log files the checkpoint copied
 		let oldest = levels.min_oldest_vlog_file_id();
@@ -810,6 +928,92 @@ impl DatabaseCheckpoint {
 			)));
 		}
 
+		Ok(())
+	}
+
+	/// Refuses a checkpoint whose value-log files are not of the kind of this database: sealed
+	/// files where it is not encrypted, plaintext files where it is, or sealed files of another
+	/// database or that its key does not open. A restore replaces the log of the database and then
+	/// reloads it, and a file that the reload refuses would leave nothing to go back to, so what
+	/// the reload would refuse is found here, from the first bytes of each file and without
+	/// building a log over the checkpoint, which could set a file aside inside it. Reads only.
+	///
+	/// A checkpoint copies the file that the writer of the log is appending to as it is at that
+	/// moment, which may be one that is cut off inside its header: it holds no entry, and the
+	/// reload sets it aside. Only the newest file can be that, as in the log itself.
+	fn check_vlog_mode(
+		&self,
+		checkpoint_path: &Path,
+		live: Option<&EncryptionContext>,
+	) -> Result<()> {
+		let io = |e| Error::Io(Arc::new(e));
+		let entries = match fs::read_dir(checkpoint_path.join("vlog")) {
+			Ok(entries) => entries,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+			Err(e) => return Err(io(e)),
+		};
+		let mut files = Vec::new();
+		for entry in entries {
+			let entry = entry.map_err(io)?;
+			if let Some(id) =
+				self.core.opts.extract_vlog_file_id(&entry.file_name().to_string_lossy())
+			{
+				files.push((id, entry.path()));
+			}
+		}
+		let Some(newest) = files.iter().map(|(id, _)| *id).max() else {
+			return Ok(());
+		};
+
+		for (id, path) in files {
+			let file = File::open(&path).map_err(io)?;
+			let len = file.metadata().map_err(io)?.len();
+			let mut head = Vec::with_capacity(sealed::SEALED_HEADER_LEN);
+			file.take(sealed::SEALED_HEADER_LEN as u64).read_to_end(&mut head).map_err(io)?;
+			check_vlog_head(live, id, id == newest, len, &head)?;
+		}
+		Ok(())
+	}
+
+	/// Refuses a checkpoint whose write-ahead log is not of the kind of this database: a sealed
+	/// segment where it is not encrypted, a segment in the clear where it is, or a sealed segment
+	/// of another database or of another file, or that the key of this one does not open. A
+	/// checkpoint that this build takes has no segment, since it flushes first, but one that
+	/// was made by hand or by another build may have some, and the restore replays them after
+	/// it has replaced the files, when a refusal would leave nothing to go back to. Reads only,
+	/// and from the first bytes of each segment.
+	fn check_wal_mode(
+		&self,
+		checkpoint_path: &Path,
+		live: Option<&EncryptionContext>,
+	) -> Result<()> {
+		let io = |e| Error::Io(Arc::new(e));
+		// Something that is not a directory has no segments to look at: the restore says what is
+		// wrong with it when it copies it, as it always did.
+		let wal = checkpoint_path.join("wal");
+		if !wal.is_dir() {
+			return Ok(());
+		}
+		for entry in fs::read_dir(wal).map_err(io)? {
+			let entry = entry.map_err(io)?;
+			let name = entry.file_name().to_string_lossy().into_owned();
+			let Ok((id, Some(extension))) = crate::wal::parse_segment_name(&name) else {
+				continue;
+			};
+			// The path, not the entry: a segment that is a link is read through by the restore that
+			// copies it and by the replay that follows, as it is by the listing of the log, so it
+			// is looked at as the file it leads to.
+			if extension != "wal" || !entry.path().is_file() {
+				continue;
+			}
+			let mut head = Vec::with_capacity(crate::wal::sealed::HEADER_RECORD_LEN);
+			File::open(entry.path())
+				.map_err(io)?
+				.take(crate::wal::sealed::HEADER_RECORD_LEN as u64)
+				.read_to_end(&mut head)
+				.map_err(io)?;
+			check_wal_head(live, id, &head)?;
+		}
 		Ok(())
 	}
 
@@ -1145,6 +1349,155 @@ mod tests {
 		let result = CheckpointMetadata::from_bytes(&future_data);
 		assert!(result.is_err());
 		assert!(result.unwrap_err().to_string().contains("Unsupported checkpoint version"));
+	}
+
+	/// The first bytes of a sealed segment `id` of the database `db`: a record header, which
+	/// nothing here checks, and the payload of the header record.
+	fn sealed_head(db: u8, id: u64) -> Vec<u8> {
+		use crate::tde::{CipherSuite, DbId, SoftwareKeyManager};
+		use crate::wal::CompressionType;
+
+		let context = EncryptionContext::new(
+			Arc::new(SoftwareKeyManager::new([0x31; 32])),
+			DbId::from_bytes([db; 16]),
+			CipherSuite::XChaCha20Poly1305,
+		);
+		let (payload, _) =
+			crate::wal::sealed::new_header(&context, id, CompressionType::None).unwrap();
+		let mut head = vec![0xAA, 0xBB, 0xCC, 0xDD, 0x00, payload.len() as u8, 10];
+		head.extend_from_slice(&payload);
+		head
+	}
+
+	fn context_of(db: u8) -> EncryptionContext {
+		use crate::tde::{CipherSuite, DbId, SoftwareKeyManager};
+
+		EncryptionContext::new(
+			Arc::new(SoftwareKeyManager::new([0x31; 32])),
+			DbId::from_bytes([db; 16]),
+			CipherSuite::XChaCha20Poly1305,
+		)
+	}
+
+	fn encryption_of(result: Result<()>) -> Option<EncryptionError> {
+		match result {
+			Ok(()) => None,
+			Err(Error::Encryption(error)) => Some(error),
+			Err(other) => panic!("not an encryption error: {other:?}"),
+		}
+	}
+
+	#[test]
+	fn a_segment_is_of_this_database_and_this_number_and_opens_with_its_key_or_is_refused() {
+		let ours = context_of(0xD1);
+		let head = sealed_head(0xD1, 7);
+		assert_eq!(encryption_of(check_wal_head(Some(&ours), 7, &head)), None);
+
+		// Another number, which is the file name of another file.
+		assert_eq!(
+			encryption_of(check_wal_head(Some(&ours), 8, &head)),
+			Some(EncryptionError::FileIdMismatch)
+		);
+		// Another database.
+		let theirs = sealed_head(0xD2, 7);
+		assert_eq!(
+			encryption_of(check_wal_head(Some(&ours), 7, &theirs)),
+			Some(EncryptionError::DbIdMismatch)
+		);
+		// The database is told before the number, as the log checks them.
+		assert_eq!(
+			encryption_of(check_wal_head(Some(&ours), 8, &theirs)),
+			Some(EncryptionError::DbIdMismatch)
+		);
+		// A database that is not encrypted has no use for a sealed segment, however it looks.
+		assert_eq!(
+			encryption_of(check_wal_head(None, 7, &head)),
+			Some(EncryptionError::NotConfigured)
+		);
+	}
+
+	#[test]
+	fn a_segment_that_the_key_of_this_database_does_not_open_is_refused_as_a_wrong_key() {
+		use crate::tde::{CipherSuite, DbId, SoftwareKeyManager};
+
+		// The same database and the same number, sealed under a root that is not the one the
+		// database is opened with: the database and the number are right, the tag is not.
+		let head = sealed_head(0xD1, 7);
+		let other_root = EncryptionContext::new(
+			Arc::new(SoftwareKeyManager::new([0x32; 32])),
+			DbId::from_bytes([0xD1; 16]),
+			CipherSuite::XChaCha20Poly1305,
+		);
+		assert_eq!(
+			encryption_of(check_wal_head(Some(&other_root), 7, &head)),
+			Some(EncryptionError::WrongKey)
+		);
+		// The control: the root it was sealed under opens it.
+		assert_eq!(encryption_of(check_wal_head(Some(&context_of(0xD1)), 7, &head)), None);
+	}
+
+	#[test]
+	fn the_type_of_the_first_record_is_not_what_decides_that_a_segment_is_sealed() {
+		let ours = context_of(0xD1);
+		// A type byte that rotted: the start of the encryption header still says what it is.
+		let mut head = sealed_head(0xD2, 7);
+		head[6] = 1;
+		assert_eq!(
+			encryption_of(check_wal_head(Some(&ours), 7, &head)),
+			Some(EncryptionError::DbIdMismatch)
+		);
+		assert_eq!(
+			encryption_of(check_wal_head(None, 7, &head)),
+			Some(EncryptionError::NotConfigured)
+		);
+	}
+
+	#[test]
+	fn a_segment_in_the_clear_is_refused_by_a_database_that_is_encrypted_and_nothing_else_is() {
+		let ours = context_of(0xD1);
+		let clear = [0x12, 0x34, 0x56, 0x78, 0x00, 0x03, 0x01, b'a', b'b', b'c'];
+		assert_eq!(
+			encryption_of(check_wal_head(Some(&ours), 3, &clear)),
+			Some(EncryptionError::PlaintextInEncryptedDb)
+		);
+		assert_eq!(encryption_of(check_wal_head(None, 3, &clear)), None);
+
+		// What a crash right after the file was made leaves holds nothing.
+		for nothing in [&[][..], &[0u8; 5][..], &[0u8; 101][..]] {
+			assert_eq!(encryption_of(check_wal_head(Some(&ours), 3, nothing)), None);
+			assert_eq!(encryption_of(check_wal_head(None, 3, nothing)), None);
+		}
+	}
+
+	#[test]
+	fn a_sealed_header_that_was_cut_short_is_checked_for_the_database_it_names_if_it_names_one() {
+		let ours = context_of(0xD1);
+		let theirs = sealed_head(0xD2, 7);
+		let own = sealed_head(0xD1, 7);
+		// The database id is at 16..32 of the encryption header, which starts after the 7 bytes of
+		// the record header.
+		let named = crate::wal::HEADER_SIZE + 32;
+		assert_eq!(
+			encryption_of(check_wal_head(Some(&ours), 7, &theirs[..named])),
+			Some(EncryptionError::DbIdMismatch)
+		);
+		assert_eq!(encryption_of(check_wal_head(Some(&ours), 7, &own[..named])), None);
+		// Cut before the database id is there: nothing is said about it, and nothing is refused.
+		for cut in 11..named {
+			assert_eq!(
+				encryption_of(check_wal_head(Some(&ours), 7, &theirs[..cut])),
+				None,
+				"{cut}"
+			);
+		}
+		assert_eq!(
+			encryption_of(check_wal_head(
+				Some(&ours),
+				7,
+				&theirs[..crate::wal::sealed::HEADER_RECORD_LEN - 1]
+			)),
+			Some(EncryptionError::DbIdMismatch)
+		);
 	}
 
 	#[test]

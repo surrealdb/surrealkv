@@ -38,12 +38,13 @@
 //! (every partition containing any version of a user key contains that
 //! user key's hash).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::sstable::block::BlockHandle;
+use crate::sstable::block_io::{BlockKind, BlockSource, TrailerLayout};
+use crate::sstable::error::SSTableError;
 use crate::sstable::index_block::BlockHandleWithKey;
-use crate::sstable::table::read_verified_raw_block;
-use crate::vfs::File;
 use crate::{FilterPolicy, Options};
 
 // =============================================================================
@@ -150,31 +151,32 @@ impl PartitionedFilterWriter {
 #[derive(Clone)]
 pub(crate) struct PartitionedFilterReader {
 	table_id: u64,
-	/// The key of the table instance's blocks in the block cache, see `Table::cache_id`.
-	cache_id: u64,
 	opts: Arc<Options>,
 	policy: Arc<dyn FilterPolicy>,
-	file: Arc<dyn File>,
+	source: BlockSource,
 
 	/// Filter partition handles with their separator keys, ascending —
 	/// mirrors `Index.blocks` for the data index.
 	partitions: Vec<BlockHandleWithKey>,
+
+	/// How many partitions could not be read and were answered as "maybe" instead, shared by
+	/// the clones of the reader.
+	degraded: Arc<AtomicU64>,
 }
 
 impl PartitionedFilterReader {
 	/// Parses the filter top-level index block at `location`.
 	pub(crate) fn new(
 		table_id: u64,
-		cache_id: u64,
 		opts: Arc<Options>,
-		file: Arc<dyn File>,
+		source: BlockSource,
 		location: &BlockHandle,
 		policy: Arc<dyn FilterPolicy>,
 	) -> crate::Result<Self> {
-		let block = crate::sstable::table::read_table_block(
-			Arc::clone(&opts.internal_comparator),
-			Arc::clone(&file),
+		let block = source.read_block(
+			BlockKind::FilterIndex,
 			location,
+			Arc::clone(&opts.internal_comparator),
 		)?;
 
 		let mut partitions = Vec::new();
@@ -192,11 +194,11 @@ impl PartitionedFilterReader {
 
 		Ok(Self {
 			table_id,
-			cache_id,
 			opts,
 			policy,
-			file,
+			source,
 			partitions,
+			degraded: Arc::new(AtomicU64::new(0)),
 		})
 	}
 
@@ -205,13 +207,33 @@ impl PartitionedFilterReader {
 		self.partitions.len()
 	}
 
+	/// The number of lookups that were answered "maybe" because the partition of their filter
+	/// could not be read.
+	#[cfg_attr(not(test), allow(dead_code))]
+	pub(crate) fn degraded_reads(&self) -> u64 {
+		self.degraded.load(Ordering::Relaxed)
+	}
+
 	/// Returns whether `user_key` may be present, selecting the filter
 	/// partition with the same search the data index uses for
-	/// `encoded_internal_key`. Errors degrade to "maybe" (true): lookups
-	/// stay correct and merely lose the bloom short-circuit.
-	pub(crate) fn may_contain(&self, encoded_internal_key: &[u8], user_key: &[u8]) -> bool {
+	/// `encoded_internal_key`.
+	///
+	/// A partition that cannot be read degrades to "maybe" (true): lookups
+	/// stay correct and merely lose the bloom short-circuit. The exception is
+	/// a table whose blocks are sealed: there only what damage looks like
+	/// degrades, which is a failed read and a checksum that does not match.
+	/// A partition that failed authentication, or whose checksum is right but
+	/// whose trailer is not, was changed by someone who computed the
+	/// checksum again, or is not the one of this file, and a table whose
+	/// blocks are sealed does not go on reading as if it were. What is
+	/// degraded is counted and logged.
+	pub(crate) fn may_contain(
+		&self,
+		encoded_internal_key: &[u8],
+		user_key: &[u8],
+	) -> crate::Result<bool> {
 		if self.partitions.is_empty() {
-			return true;
+			return Ok(true);
 		}
 
 		// Same partition_point search as Index::find_block_handle_by_key.
@@ -223,35 +245,55 @@ impl PartitionedFilterReader {
 			// Beyond the last separator: leave the verdict to the data
 			// index (which will find nothing) rather than reasoning about
 			// successor-key edge cases here.
-			return true;
+			return Ok(true);
 		};
 
 		let offset = partition.handle.offset() as u64;
-		let bits =
-			if let Some(bits) = self.opts.block_cache.get_filter_partition(self.cache_id, offset) {
-				bits
-			} else {
-				match read_verified_raw_block(Arc::clone(&self.file), &partition.handle) {
-					Ok(bytes) => {
-						let bytes = Arc::new(bytes);
-						self.opts.block_cache.insert_filter_partition(
-							self.cache_id,
-							offset,
-							Arc::clone(&bytes),
-						);
-						bytes
-					}
-					Err(e) => {
-						tracing::warn!(
-							"Failed to read filter partition for table {} at offset {offset}: {e}; \
-							 proceeding without the filter",
-							self.table_id
-						);
-						return true;
-					}
+		let cache_id = self.source.cache_id();
+		let bits = if let Some(bits) = self.opts.block_cache.get_filter_partition(cache_id, offset)
+		{
+			bits
+		} else {
+			match self.source.read_contents(BlockKind::FilterPartition, &partition.handle) {
+				Ok(bytes) => {
+					let bytes = Arc::new(bytes);
+					self.opts.block_cache.insert_filter_partition(
+						cache_id,
+						offset,
+						Arc::clone(&bytes),
+					);
+					bytes
 				}
-			};
+				Err(e @ crate::Error::Encryption(_)) => return Err(e),
+				Err(e)
+					if self.source.layout() == TrailerLayout::Sealed && !looks_like_damage(&e) =>
+				{
+					return Err(e);
+				}
+				Err(e) => {
+					self.degraded.fetch_add(1, Ordering::Relaxed);
+					tracing::warn!(
+						"Failed to read filter partition for table {} at offset {offset}: {e}; \
+							 proceeding without the filter",
+						self.table_id
+					);
+					return Ok(true);
+				}
+			}
+		};
 
-		self.policy.may_contain(&bits, user_key)
+		Ok(self.policy.may_contain(&bits, user_key))
 	}
+}
+
+/// Whether a failed read of a block of a sealed table is what damage to the file looks like:
+/// the file could not be read, or the checksum of the block does not match its bytes. Whoever
+/// changes a sealed block without the key can make a checksum right, and what they leave is an
+/// authentication failure or a trailer that disagrees with the handle, so those are never damage.
+fn looks_like_damage(error: &crate::Error) -> bool {
+	matches!(
+		error,
+		crate::Error::Io(_)
+			| crate::Error::SSTable(SSTableError::ChecksumVerificationFailed { .. })
+	)
 }

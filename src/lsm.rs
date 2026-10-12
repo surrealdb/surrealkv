@@ -13,6 +13,7 @@ use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, Result};
 use crate::levels::{
 	check_manifest_before_open,
+	plan_orphan_cleanup,
 	write_manifest_to_disk,
 	LevelManifest,
 	ManifestChangeSet,
@@ -25,8 +26,8 @@ use crate::stall::{StallCounts, StallThresholds, WriteStallCountProvider};
 use crate::task::TaskManager;
 use crate::transaction::{Mode, Transaction, TransactionOptions};
 use crate::vlog::{VLog, ValueLocation};
-use crate::wal::recovery::{repair_corrupted_wal_segment, replay_wal};
-use crate::wal::{self, cleanup_old_segments, Wal, WalManager};
+use crate::wal::recovery::{repair_corrupted_wal_segment_with, replay_wal_with};
+use crate::wal::{self, cleanup_old_segments_for, Wal, WalManager};
 use crate::{
 	Comparator,
 	Error,
@@ -58,6 +59,13 @@ pub trait CompactionOperations: Send + Sync {
 
 	/// Returns true if there are immutable memtables pending flush.
 	fn has_pending_immutables(&self) -> bool;
+
+	/// Asks the key manager again for the keys the database uses, which a task that is about to
+	/// try again after a key provider failed does first, and which may wait on the provider. Does
+	/// nothing for a database that is not encrypted.
+	fn prepare_keys(&self) -> Result<()> {
+		Ok(())
+	}
 }
 
 // ===== Core LSM Tree Implementation =====
@@ -274,6 +282,11 @@ pub(crate) type FlushHook = Arc<dyn Fn(u64) -> Result<()> + Send + Sync>;
 impl CoreInner {
 	/// Creates a new LSM tree core instance
 	pub(crate) fn new(opts: Arc<Options>) -> Result<Self> {
+		// Whether the database is encrypted was settled before this, from its manifest. A key
+		// manager with no context here is a path that did not, and every file below, tables
+		// included, would be written in the clear: nothing is created.
+		opts.ensure_encryption_resolved()?;
+
 		// Acquire database lock to prevent multiple processes from opening the same
 		// database
 		let mut lockfile = LockFile::new(&opts.path);
@@ -288,11 +301,39 @@ impl CoreInner {
 		let manifest = LevelManifest::new(Arc::clone(&opts))?;
 		let manifest_log_number = manifest.get_log_number();
 
+		// Whether the table files that the manifest does not list are this database's is read
+		// before anything of the log or the value log is opened, so that a table of another
+		// database, which the clean-up after the replay would delete, refuses the open with
+		// nothing changed.
+		if manifest_loaded_from_disk {
+			if let Some(context) = opts.encryption_context() {
+				let live: HashSet<u64> = manifest.get_all_tables().keys().copied().collect();
+				plan_orphan_cleanup(&opts, &live)?;
+				// The same for the segments of the log. The ones from the log number on are read by
+				// the replay, which refuses another database's, but the ones below it are only
+				// deleted by number, and a manifest that names another database, or a segment that
+				// was put there, would have them deleted without anyone having read them.
+				wal::sealed::check_directory(context.db_id(), &opts.wal_dir())?;
+			}
+		}
+
+		// The value log is opened before the WAL is: opening the WAL makes a segment and removes
+		// what a repair left, and an open that the value log refuses (a file in the clear in an
+		// encrypted database, or one that the key does not open) must not have done either.
+		let vlog = if opts.enable_vlog {
+			Some(Arc::new(VLog::new(Arc::clone(&opts))?))
+		} else {
+			None
+		};
+
 		// Initialize WAL starting from manifest.log_number
 		let wal_path = opts.wal_dir();
 		// This avoids creating intermediate empty WAL files
-		let wal_instance =
-			Wal::open_with_min_log_number(&wal_path, manifest_log_number, wal::Options::default())?;
+		let wal_instance = Wal::open_with_min_log_number(
+			&wal_path,
+			manifest_log_number,
+			wal::Options::for_tree(&opts)?,
+		)?;
 
 		// Starts at 0 since no commits have happened yet.
 		let visible_seq_num = Arc::new(AtomicU64::new(0));
@@ -305,11 +346,6 @@ impl CoreInner {
 
 		let level_manifest = Arc::new(RwLock::new(manifest));
 
-		let vlog = if opts.enable_vlog {
-			Some(Arc::new(VLog::new(Arc::clone(&opts))?))
-		} else {
-			None
-		};
 		let memory_controller = Arc::new(crate::memory::MemoryController::default());
 
 		Ok(Self {
@@ -419,11 +455,14 @@ impl CoreInner {
 				self.opts.vlog_value_threshold,
 				collect_bptree,
 			)
-			.map_err(|e| {
-				Error::Other(format!(
+			.map_err(|e| match e {
+				// An encryption error keeps its type: a key that could not be had may be asked for
+				// again, and no other of them may, which a text does not say.
+				Error::Encryption(_) => e,
+				e => Error::Other(format!(
 					"Failed to flush memtable to SST table_id={}: {}",
 					table_id, e
-				))
+				)),
 			})?;
 
 		tracing::debug!("Created SST table_id={}, file_size={}", table.id, table.file_size);
@@ -506,6 +545,9 @@ impl CoreInner {
 				self.manifest_uncertain.store(true, Ordering::Release);
 				error
 			}
+			// A manifest that could not be sealed was not written: the key was not to be had, and
+			// whether it may be asked for again is what its type says, which text does not.
+			Error::Encryption(_) => error,
 			error => Error::Other(format!("{context}: {error}")),
 		}
 	}
@@ -757,7 +799,7 @@ impl CoreInner {
 			let mut wal_guard = self.wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
 			self.rotate_wal(&mut wal_guard).map_err(|e| {
-				Error::Other(format!("Failed to rotate WAL before memtable rotation: {}", e))
+				Self::rotation_error("Failed to rotate WAL before memtable rotation", e)
 			})?;
 			let new_log_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
@@ -851,7 +893,7 @@ impl CoreInner {
 
 		let mut wal_guard = self.wal.write();
 		self.rotate_wal(&mut wal_guard).map_err(|e| {
-			Error::Other(format!("Failed to rotate WAL before direct-to-L0 flush: {}", e))
+			Self::rotation_error("Failed to rotate WAL before direct-to-L0 flush", e)
 		})?;
 		let new_wal_number = wal_guard.get_active_log_number();
 		drop(wal_guard);
@@ -884,15 +926,29 @@ impl CoreInner {
 		};
 		if active_memtable.is_empty() {
 			let mut wal_guard = self.wal.write();
-			self.rotate_wal(&mut wal_guard).map_err(|e| replace_error(&e))?;
+			self.rotate_wal(&mut wal_guard)
+				.map_err(|e| Self::rotation_error("Failed to replace the failed WAL segment", e))?;
 			let new_wal_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
 			active_memtable.set_wal_number(new_wal_number);
 			return Ok(Some(false));
 		}
 
-		self.rotate_memtable_locked(active_memtable).map_err(|e| replace_error(&e))?;
+		self.rotate_memtable_locked(active_memtable).map_err(|e| match e {
+			Error::Encryption(_) => e,
+			e => replace_error(&e),
+		})?;
 		Ok(Some(true))
+	}
+
+	/// The error of a rotation of the WAL that failed. An encryption error keeps its type: a key
+	/// that could not be had may be asked for again, and no other of them may, which a text does
+	/// not say.
+	fn rotation_error(what: &str, error: wal::Error) -> Error {
+		match error {
+			wal::Error::Encryption(error) => Error::Encryption(error),
+			error => Error::Other(format!("{what}: {error}")),
+		}
 	}
 
 	/// Ends the hold of the WAL writer once no memtable tagged with a segment below the hold's
@@ -982,7 +1038,11 @@ impl CoreInner {
 			self.group_wal_pin.load(Ordering::Acquire),
 		);
 
-		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+		match cleanup_old_segments_for(
+			self.opts.encryption_context().map(Arc::as_ref),
+			&wal_dir,
+			min_wal_to_keep,
+		) {
 			Ok(count) if count > 0 => {
 				tracing::debug!(
 					"Cleaned up {} old WAL segments (min_wal_to_keep={})",
@@ -1246,10 +1306,14 @@ impl CoreInner {
 				let rollback = manifest.apply_changeset(&changeset)?;
 				if let Err(e) = write_manifest_to_disk(&manifest) {
 					manifest.revert_changeset(rollback);
-					return Err(Error::Other(format!(
-						"Failed to update manifest log_number after immutable flush: {}",
-						e
-					)));
+					return Err(match e {
+						// A manifest that could not be sealed keeps the error of the key.
+						Error::Encryption(_) => e,
+						e => Error::Other(format!(
+							"Failed to update manifest log_number after immutable flush: {}",
+							e
+						)),
+					});
 				}
 
 				tracing::debug!(
@@ -1290,6 +1354,19 @@ impl CoreInner {
 		let live_table_ids: HashSet<u64> = live_tables.keys().copied().collect();
 		drop(manifest);
 
+		// In a database that is encrypted, the files that the manifest does not list are read
+		// first, and none is deleted if one of them is not this database's: see
+		// `plan_orphan_cleanup`. One that is not is cleaned by the names, as it always was.
+		let removable: Option<HashSet<u64>> = match self.opts.encryption_context() {
+			Some(_) => Some(
+				plan_orphan_cleanup(&self.opts, &live_table_ids)?
+					.into_iter()
+					.map(|(id, _)| id)
+					.collect(),
+			),
+			None => None,
+		};
+
 		// Scan SST directory for orphaned files
 		let entries = std::fs::read_dir(&sstable_dir)?;
 		let mut removed_count = 0;
@@ -1303,7 +1380,9 @@ impl CoreInner {
 			if filename_str.ends_with(".sst") && filename_str.len() == 24 {
 				if let Ok(table_id) = filename_str[..20].parse::<u64>() {
 					// Delete if not in manifest
-					if !live_table_ids.contains(&table_id) {
+					if !live_table_ids.contains(&table_id)
+						&& removable.as_ref().is_none_or(|removable| removable.contains(&table_id))
+					{
 						let path = entry.path();
 						match std::fs::remove_file(&path) {
 							Ok(_) => {
@@ -1402,6 +1481,13 @@ impl CompactionOperations for CoreInner {
 	fn has_pending_immutables(&self) -> bool {
 		self.immutable_memtables.read().map(|guard| !guard.is_empty()).unwrap_or(false)
 	}
+
+	fn prepare_keys(&self) -> Result<()> {
+		match self.opts.encryption_context() {
+			Some(context) => Ok(context.refresh_in_use()?),
+			None => Ok(()),
+		}
+	}
 }
 
 impl WriteStallCountProvider for CoreInner {
@@ -1458,12 +1544,39 @@ impl std::ops::Deref for Core {
 }
 
 impl Core {
+	/// Replays a plaintext WAL, see [`replay_wal_in`](Self::replay_wal_in).
+	#[cfg(test)]
+	pub(crate) fn replay_wal_with_repair<F>(
+		wal_path: &Path,
+		min_wal_number: u64,
+		context: &str,
+		recovery_mode: WalRecoveryMode,
+		arena_size: usize,
+		flush_memtable: F,
+	) -> Result<(Option<u64>, Option<Arc<MemTable>>)>
+	where
+		F: FnMut(Arc<MemTable>, u64, bool) -> Result<()>,
+	{
+		Self::replay_wal_in(
+			&wal::WalContext::plaintext(),
+			wal_path,
+			min_wal_number,
+			context,
+			recovery_mode,
+			arena_size,
+			flush_memtable,
+		)
+	}
+
 	/// Replays WAL with configurable corruption handling.
 	///
 	/// Creates one memtable per WAL segment. Flushes all but the last memtable
 	/// to SST via the provided callback. Returns the last memtable as active.
 	///
+	/// Every replay of a tree (open and restore) goes through here with the context of the tree.
+	///
 	/// # Arguments
+	/// * `wal_context` - Whether the segments are sealed, and under what
 	/// * `wal_path` - Path to WAL directory
 	/// * `min_wal_number` - Minimum WAL to replay
 	/// * `context` - Context string for error messages
@@ -1475,7 +1588,9 @@ impl Core {
 	///
 	/// # Returns
 	/// * `(Option<max_seq_num>, Option<active_memtable>, did_recovery)`
-	pub(crate) fn replay_wal_with_repair<F>(
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) fn replay_wal_in<F>(
+		wal_context: &wal::WalContext,
 		wal_path: &Path,
 		min_wal_number: u64,
 		context: &str,
@@ -1487,7 +1602,12 @@ impl Core {
 		F: FnMut(Arc<MemTable>, u64, bool) -> Result<()>,
 	{
 		// Replay WAL - returns memtables per segment
-		let (wal_seq_num_opt, memtables) = match replay_wal(wal_path, min_wal_number, arena_size) {
+		let (wal_seq_num_opt, memtables) = match replay_wal_with(
+			wal_context,
+			wal_path,
+			min_wal_number,
+			arena_size,
+		) {
 			Ok(result) => result,
 			Err(Error::WalCorruption {
 				segment_id,
@@ -1519,16 +1639,23 @@ impl Core {
 						);
 
 						// Attempt repair
-						if let Err(repair_err) = repair_corrupted_wal_segment(wal_path, segment_id)
+						if let Err(repair_err) =
+							repair_corrupted_wal_segment_with(wal_context, wal_path, segment_id)
 						{
 							tracing::error!("Failed to repair WAL segment: {repair_err}");
-							return Err(Error::Other(format!(
-								"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
-							)));
+							return Err(match repair_err {
+								// A key that could not be had, the repair of a sealed segment needs
+								// one, is not a segment that could not be repaired, and may be asked
+								// for again: it keeps its type.
+								Error::Encryption(_) => repair_err,
+								repair_err => Error::Other(format!(
+									"{context} failed: WAL segment {segment_id} is corrupted and could not be repaired. {repair_err}"
+								)),
+							});
 						}
 
 						// Retry after repair
-						match replay_wal(wal_path, min_wal_number, arena_size) {
+						match replay_wal_with(wal_context, wal_path, min_wal_number, arena_size) {
 							Ok(result) => result,
 							Err(Error::WalCorruption {
 								segment_id: seg_id,
@@ -1540,9 +1667,12 @@ impl Core {
 								)));
 							}
 							Err(retry_err) => {
-								return Err(Error::Other(format!(
-									"{context} failed: WAL replay failed after repair. {retry_err}"
-								)));
+								return Err(match retry_err {
+									Error::Encryption(_) => retry_err,
+									retry_err => Error::Other(format!(
+										"{context} failed: WAL replay failed after repair. {retry_err}"
+									)),
+								});
 							}
 						}
 					}
@@ -1622,21 +1752,6 @@ impl Core {
 
 		let inner = Arc::new(CoreInner::new(Arc::clone(&opts))?);
 
-		// Create the write stall controller with the provider and thresholds
-		let thresholds =
-			StallThresholds::new(opts.memtable_stall_threshold, opts.l0_stall_threshold);
-		let write_stall = Arc::new(crate::stall::WriteStallController::new(
-			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
-			thresholds,
-		));
-
-		// Initialize background task manager
-		let task_manager = Arc::new(TaskManager::new(
-			Arc::clone(&inner) as Arc<dyn CompactionOperations>,
-			Arc::clone(&opts),
-			Arc::clone(&write_stall),
-		));
-
 		// Path for the WAL directory
 		let wal_path = opts.wal_dir();
 
@@ -1651,7 +1766,8 @@ impl Core {
 		);
 
 		// Replay WAL with configurable recovery mode (returns None if skipped/empty)
-		let (wal_seq_num_opt, recovered_memtable) = Self::replay_wal_with_repair(
+		let (wal_seq_num_opt, recovered_memtable) = Self::replay_wal_in(
+			&wal::WalContext::for_options(&opts)?,
 			&wal_path,
 			min_wal_number,
 			"Database startup",
@@ -1731,6 +1847,34 @@ impl Core {
 		// Set visible sequence number (in-memory, will be persisted on next flush)
 		inner.visible_seq_num.store(max_seq_num, Ordering::Release);
 
+		// Clean up any orphaned SST files from previous crashes
+		// SAFETY: This must happen AFTER WAL replay so data is recovered
+		// but BEFORE any new flushes that might create new SSTs
+		inner.cleanup_orphaned_sst_files()?;
+
+		// Clean up any orphaned VLog files that are no longer referenced by any SST
+		// SAFETY: This must happen AFTER manifest is loaded and the WAL is replayed
+		inner.cleanup_vlog("startup");
+
+		// Nothing that can fail is left, so the tasks and the flusher are started only now: a tree
+		// whose open fails keeps none of them, which would hold the lock of the database and keep
+		// it from being opened again in this process.
+
+		// Create the write stall controller with the provider and thresholds
+		let thresholds =
+			StallThresholds::new(opts.memtable_stall_threshold, opts.l0_stall_threshold);
+		let write_stall = Arc::new(crate::stall::WriteStallController::new(
+			Arc::clone(&inner) as Arc<dyn WriteStallCountProvider>,
+			thresholds,
+		));
+
+		// Initialize background task manager
+		let task_manager = Arc::new(TaskManager::new(
+			Arc::clone(&inner) as Arc<dyn CompactionOperations>,
+			Arc::clone(&opts),
+			Arc::clone(&write_stall),
+		));
+
 		// Initialize the CommitPipeline for lock-free OCC commits and background flushing.
 		let commit_pipeline = Arc::new(crate::ring::CommitPipeline::new(
 			Arc::clone(&inner),
@@ -1740,15 +1884,6 @@ impl Core {
 		));
 
 		let flusher_handle = commit_pipeline.start_flusher();
-
-		// Clean up any orphaned SST files from previous crashes
-		// SAFETY: This must happen AFTER WAL replay so data is recovered
-		// but BEFORE any new flushes that might create new SSTs
-		inner.cleanup_orphaned_sst_files()?;
-
-		// Clean up any orphaned VLog files that are no longer referenced by any SST
-		// SAFETY: This must happen AFTER manifest is loaded and the WAL is replayed
-		inner.cleanup_vlog("startup");
 
 		// Trigger level compaction check at startup
 		task_manager.wake_up_level();
@@ -1924,8 +2059,10 @@ impl Core {
 			tracing::debug!("Flushing all memtables on shutdown (flush_on_close=true)");
 
 			// Flush ALL memtables: immutables first (older data), then active (newest data)
-			self.inner.flush_all_memtables_for_shutdown().map_err(|e| {
-				Error::Other(format!("Failed to flush memtables during shutdown: {}", e))
+			self.inner.flush_all_memtables_for_shutdown().map_err(|e| match e {
+				// A key that could not be had stays what it is, for the caller of `close`.
+				Error::Encryption(_) => e,
+				e => Error::Other(format!("Failed to flush memtables during shutdown: {}", e)),
 			})?;
 
 			tracing::debug!("All memtables flushed successfully on shutdown");
@@ -1961,7 +2098,11 @@ impl Core {
 
 		tracing::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
 
-		match cleanup_old_segments(&wal_dir, min_wal_to_keep) {
+		match cleanup_old_segments_for(
+			self.inner.opts.encryption_context().map(Arc::as_ref),
+			&wal_dir,
+			min_wal_to_keep,
+		) {
 			Ok(count) if count > 0 => {
 				tracing::debug!("Cleaned up {} obsolete WAL files during shutdown", count);
 			}
@@ -2011,6 +2152,11 @@ impl Tree {
 		// finish, or if it holds database files but no usable manifest. These must stay ahead
 		// of the migrations, the directory creation and the lock file.
 		crate::checkpoint::check_restore_finished(&opts)?;
+
+		// Whether the database is encrypted is read from its manifest, and the key checked by
+		// opening it, before anything is created or moved. This writes nothing: an encrypted
+		// database that is new writes its first manifest, sealed, before any other file.
+		let opts = crate::levels::resolve_encryption(opts)?;
 		check_manifest_before_open(&opts)?;
 
 		// If the path contains an existing RocksDB database, automatically migrate it in pure Rust
@@ -2042,8 +2188,24 @@ impl Tree {
 		})
 	}
 
+	/// Refuses to migrate a database of another store into one that is meant to be encrypted. A
+	/// migration moves the old files into a backup directory inside this one, so that a copy of the
+	/// old database stays there in the clear, and writes what it migrates without the key. It is
+	/// refused before anything is read or moved.
+	fn refuse_migration_into_an_encrypted_database(opts: &Options, source: &str) -> Result<()> {
+		if opts.key_manager.is_some() || opts.encryption_context().is_some() {
+			return Err(Error::InvalidArgument(format!(
+				"A {source} database cannot be migrated into an encrypted database: the migration \
+				 keeps a plaintext copy of the old database in this directory and does not \
+				 encrypt what it writes. Migrate it without a key manager."
+			)));
+		}
+		Ok(())
+	}
+
 	/// Automatically migrates an existing RocksDB database to SurrealKV v2 format in pure Rust.
 	fn migrate_from_rocksdb(opts: &Options) -> Result<()> {
+		Self::refuse_migration_into_an_encrypted_database(opts, "RocksDB")?;
 		tracing::info!("Detected existing RocksDB database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
 		let records = surrealkv_compat_rocksdb::read_all_latest(&opts.path).map_err(|e| {
 			Error::Other(format!("Failed to read RocksDB database for migration: {e}"))
@@ -2128,6 +2290,7 @@ impl Tree {
 
 	/// Automatically migrates an existing SurrealKV v1 database to SurrealKV v2 format.
 	fn migrate_from_v1(opts: &Options) -> Result<()> {
+		Self::refuse_migration_into_an_encrypted_database(opts, "SurrealKV v1")?;
 		tracing::info!("Detected existing SurrealKV v1 database at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
 		let records = surrealkv_compat_v1::read_all_latest(&opts.path).map_err(|e| {
 			Error::Other(format!("Failed to read SurrealKV v1 database for migration: {e}"))
@@ -2206,6 +2369,7 @@ impl Tree {
 
 	/// Automatically migrates an existing IndexedDB dump to SurrealKV v2 format.
 	fn migrate_from_indxdb(opts: &Options) -> Result<()> {
+		Self::refuse_migration_into_an_encrypted_database(opts, "IndexedDB")?;
 		tracing::info!("Detected existing IndexedDB dump at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
 		let dump_file = if opts.path.is_dir() {
 			opts.path.join("indxdb_dump.bin")
@@ -2466,13 +2630,14 @@ impl Tree {
 			let new_wal = Wal::open_with_min_log_number(
 				&wal_path,
 				manifest_log_number,
-				wal::Options::default(),
+				wal::Options::for_tree(&self.core.inner.opts)?,
 			)?;
 			*wal_guard = new_wal;
 		}
 
 		// Replay any WAL entries that were restored
-		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_with_repair(
+		let (wal_seq_num_opt, recovered_memtable) = Core::replay_wal_in(
+			&wal::WalContext::for_options(&self.core.inner.opts)?,
 			&wal_path,
 			manifest_log_number,
 			"Database restore",
@@ -2551,6 +2716,22 @@ impl Tree {
 		self.core.write_stall.signal_work_done();
 
 		Ok(metadata)
+	}
+
+	/// Asks the key manager again for the keys this database uses: the key that new files are
+	/// written under, and every key that its files were found to use.
+	///
+	/// A database asks for them when it is opened, and creating a file afterwards, a segment of the
+	/// log, a file of the value log or a table, never waits on a key provider. Call this after the
+	/// key manager changed which key new files are written under, so that the new key is there
+	/// before a commit needs it, and after a commit failed with a key provider that was away, once
+	/// it is back. It may wait on the provider, and does nothing for a database that is not
+	/// encrypted.
+	///
+	/// Part of the encryption preview, and kept out of the documented interface until it is not.
+	#[doc(hidden)]
+	pub fn prepare_keys(&self) -> Result<()> {
+		self.core.inner.prepare_keys()
 	}
 
 	/// Closes the tree. Commits already admitted finish first, each with its real outcome, and a
@@ -2817,6 +2998,9 @@ impl TreeBuilder {
 	/// This is useful when you need to keep a reference to the options
 	/// after creating the tree.
 	pub fn build_with_options(self) -> Result<(Tree, Arc<Options>)> {
+		// The options as they were given, and not the ones the tree runs with: those carry the
+		// identity of the database they were opened for, and a caller that moves them to another
+		// path would make a second database with the first one's identity.
 		let opts = Arc::new(self.opts);
 		let tree = Tree::new(Arc::clone(&opts))?;
 		Ok((tree, opts))

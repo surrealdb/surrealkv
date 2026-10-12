@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::lsm::fsync_directory;
 use crate::memtable::MemTable;
 use crate::wal::reader::{Reader, Reporter};
-use crate::wal::{get_segment_range, list_segment_ids, Error as WalError, SegmentRef};
+use crate::wal::{get_segment_range, list_segment_ids, Error as WalError, SegmentRef, WalContext};
 
 /// Default implementation of the Reporter trait for standard
 /// recovery operations.
@@ -101,9 +101,21 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 /// * `Ok((Some(max_seq_num), memtables))` - Memtables with their WAL numbers
 /// * `Ok((None, vec![]))` - No data recovered
 /// * `Err(...)` - Error during replay
-type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>);
+pub(crate) type ReplayResult = (Option<u64>, Vec<(Arc<MemTable>, bool, u64)>);
 
+/// Replays a plaintext WAL, see [`replay_wal_with`].
+#[cfg(test)]
 pub(crate) fn replay_wal(
+	wal_dir: &Path,
+	min_wal_number: u64,
+	arena_size: usize,
+) -> Result<ReplayResult> {
+	replay_wal_with(&WalContext::plaintext(), wal_dir, min_wal_number, arena_size)
+}
+
+/// Replays the WAL whose segments are as `context` says.
+pub(crate) fn replay_wal_with(
+	context: &WalContext,
 	wal_dir: &Path,
 	min_wal_number: u64,
 	arena_size: usize,
@@ -114,6 +126,11 @@ pub(crate) fn replay_wal(
 		min_wal_number,
 		arena_size
 	);
+
+	// A sealed WAL is replayed by its own code, which fails on anything that is not a tear.
+	if context.is_sealed() {
+		return crate::wal::sealed_recovery::replay(context, wal_dir, min_wal_number, arena_size);
+	}
 
 	// Check if WAL directory exists
 	if !wal_dir.exists() {
@@ -178,6 +195,7 @@ pub(crate) fn replay_wal(
 	// Use parallel WAL decoder if multiple segments exist
 	if segments_to_replay.len() > 1 {
 		return crate::wal::parallel_recovery::replay_segments_sync(
+			context,
 			&segments_to_replay,
 			arena_size,
 		);
@@ -207,7 +225,7 @@ pub(crate) fn replay_wal(
 		// Open the segment file
 		let file = File::open(&segment.file_path)?;
 		let reporter = Box::new(DefaultReporter::new(segment_id));
-		let mut reader = Reader::with_options(file, Some(reporter), segment_id);
+		let mut reader = Reader::with_context(file, Some(reporter), segment_id, context);
 
 		let mut batches_in_segment = 0;
 		let mut last_valid_offset = 0;
@@ -298,12 +316,50 @@ pub(crate) fn replay_wal(
 	Ok((result, memtables))
 }
 
+/// Whether the file at `path` starts the way a sealed segment does: the type of the header record
+/// or the start of the encryption header that is its payload. A WAL that is not sealed has no
+/// business repairing such a file, whatever else is wrong with it, and the plaintext repair deletes
+/// a segment that holds no valid record. A file that does not exist is not one.
+fn segment_looks_sealed(path: &Path) -> Result<bool> {
+	use std::io::Read;
+
+	let mut head = Vec::new();
+	match File::open(path) {
+		Ok(file) => file.take(11).read_to_end(&mut head)?,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+		Err(e) => return Err(e.into()),
+	};
+	Ok(crate::wal::sealed::starts_like_sealed(&head))
+}
+
+/// Repairs a plaintext segment, see [`repair_corrupted_wal_segment_with`].
+#[cfg(test)]
 pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<()> {
+	repair_corrupted_wal_segment_with(&WalContext::plaintext(), wal_dir, segment_id)
+}
+
+/// Repairs the segment `segment_id` of the WAL whose segments are as `context` says, by keeping
+/// the records before the damage.
+pub(crate) fn repair_corrupted_wal_segment_with(
+	context: &WalContext,
+	wal_dir: &Path,
+	segment_id: usize,
+) -> Result<()> {
 	use std::fs;
 
 	use crate::wal::manager::Wal;
 	use crate::wal::reader::Reader;
 	use crate::wal::Options;
+
+	// The plaintext repair below reads and writes plaintext, and deletes a segment that holds no
+	// valid record: it must never run on a sealed segment, which a key that does not fit makes look
+	// like one. Sealed segments are repaired by their own code, which deletes nothing.
+	if context.is_sealed() {
+		return crate::wal::sealed_recovery::repair(context, wal_dir, segment_id);
+	}
+	if segment_looks_sealed(&wal_dir.join(format!("{segment_id:020}.wal")))? {
+		return Err(crate::error::EncryptionError::NotConfigured.into());
+	}
 
 	// Build segment paths
 	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
@@ -328,12 +384,15 @@ pub(crate) fn repair_corrupted_wal_segment(wal_dir: &Path, segment_id: usize) ->
 
 	// Create a new Wal for writing the repaired data
 	// We'll write to a temp directory then move the file
-	let opts = Options::default();
+	let opts = Options {
+		context: context.clone(),
+		..Options::default()
+	};
 	let mut repair_wal = Wal::open(&repair_dir, opts)?;
 
 	// Open the original segment file
 	let file = fs::File::open(&segment_path)?;
-	let mut reader = Reader::new(file);
+	let mut reader = Reader::with_context(file, None, segment_id as u64, context);
 
 	let mut valid_batches_count = 0;
 	let mut repair_failed = false;
