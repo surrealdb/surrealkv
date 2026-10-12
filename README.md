@@ -62,16 +62,16 @@ Commits are not flushed to disk before they return (each figure is a single run)
 | **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**6,992,767** | 321,715 | 274,172 | 307,034 | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**896,366** |
 | RocksDB | 846,293 | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**603,452** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**608,494** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**739,357** | 851,848 |
 | SlateDB | 96,397 | 6,314 | 6,352 | 6,380 | 26,187 |
-| Fjall | - | - | - | - | - |
+| Fjall | 992,874 | 62,608 | 64,059 | 2,676 | 132,698 |
 | ReDB | - | - | - | - | - |
 | LMDB | - | - | - | - | - |
 | Libmdbx | - | - | - | - | - |
 
-- **Creates (Writes)**: **321,715 OPS**: **1.88× slower** than RocksDB and **51.0× faster** than SlateDB.
-- **Updates**: **274,172 OPS**: **2.22× slower** than RocksDB and **43.2× faster** than SlateDB.
-- **Point Reads**: **6.99M OPS** sustained: **8.26× faster** than RocksDB and **72.5× faster** than SlateDB.
-- **Deletes**: **307,034 OPS**: **2.41× slower** than RocksDB and **48.1× faster** than SlateDB.
-- **Range Scans**: **896,366 OPS** on `select(*) limit(100)` scans: **1.05× faster** than RocksDB and **34.2× faster** than SlateDB. See [Scan Profile](#scan-profile) for other kinds of range scan.
+- **Creates (Writes)**: **321,715 OPS**: **1.88× slower** than RocksDB, **51.0× faster** than SlateDB, and **5.14× faster** than Fjall.
+- **Updates**: **274,172 OPS**: **2.22× slower** than RocksDB, **43.2× faster** than SlateDB, and **4.28× faster** than Fjall.
+- **Point Reads**: **6.99M OPS** sustained: **8.26× faster** than RocksDB, **72.5× faster** than SlateDB, and **7.04× faster** than Fjall.
+- **Deletes**: **307,034 OPS**: **2.41× slower** than RocksDB, **48.1× faster** than SlateDB, and **115× faster** than Fjall.
+- **Range Scans**: **896,366 OPS** on `select(*) limit(100)` scans: **1.05× faster** than RocksDB, **34.2× faster** than SlateDB, and **6.75× faster** than Fjall. See [Scan Profile](#scan-profile) for other kinds of range scan.
 
 ### Scan Profile
 
@@ -82,7 +82,7 @@ Range scans over the same dataset, as scans per second, without synchronous dura
 | **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**896,366** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**2,313,942** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**96,365** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**98,612** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**402** |
 | RocksDB | 851,848 | 851,580 | 35,539 | 35,902 | 159 |
 | SlateDB | 26,187 | 26,266 | 7,460 | 7,477 | 87.0 |
-| Fjall | - | - | - | - | - |
+| Fjall | 132,698 | 151,861 | 4,335 | 4,383 | 42.4 |
 | ReDB | - | - | - | - | - |
 | LMDB | - | - | - | - | - |
 | Libmdbx | - | - | - | - | - |
@@ -100,7 +100,7 @@ Resting and peak memory are the lowest and highest process memory sampled across
 | **SurrealKV** | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**221 MiB** | 1.79 GiB |
 | RocksDB | 590 MiB | <img width="16" align="absmiddle" src="/img/rocket.png" alt="🚀">&nbsp;**1.02 GiB** |
 | SlateDB | 265 MiB | 2.73 GiB |
-| Fjall | - | - |
+| Fjall | 627 MiB | 1.71 GiB |
 | ReDB | - | - |
 | LMDB | - | - |
 | Libmdbx | - | - |
