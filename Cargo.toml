@@ -54,7 +54,7 @@ aes-gcm = { version = "0.11", default-features = false, features = ["aes", "allo
 chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "zeroize"] }
 hkdf = { version = "0.13", default-features = false }
 sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
-zeroize = { version = "1.8", default-features = false }
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 # The OS random number generator, which draws the per-file salt and the database id. It is used
 # on every target; the wasm entry below only adds the browser backend.
 getrandom_04 = { package = "getrandom", version = "0.4" }
