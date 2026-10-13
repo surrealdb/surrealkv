@@ -23,6 +23,7 @@ use tempdir::TempDir;
 use test_log::test;
 use tokio::task::JoinHandle;
 
+use super::collect_transaction_all;
 use super::wal_group_budget_tests::{
 	assert_all_acked,
 	copy_dir,
@@ -691,6 +692,58 @@ async fn a_failure_in_the_log_again_of_a_cut_group_stops_the_database_and_recove
 	drop(txn);
 	mark_closed(&recovered);
 	release_lock(&recovered);
+}
+
+/// A group that a rotation cut logged its tail again, so for as long as the first segment is on
+/// disk, a batch is in two segments, and a crash then replays both. The copies have the same keys,
+/// sequence numbers and values, so the replay of the second changes nothing a read can see: the
+/// commits of the images where that is so read back exactly, once, and no batch is in the WAL more
+/// than twice.
+#[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
+async fn a_tail_that_is_in_two_segments_replays_without_effect() {
+	let (max_memtable_size, entries, batches) = (64 * KIB, 10, 200);
+	let pile = pile_up_taking_images(max_memtable_size, entries, batches, false, true).await;
+	let images: Vec<Image> = pile.images.clone();
+	let _dir = pile.end();
+	let mut twice = 0;
+	for (group, round, image) in images {
+		if round.is_none() {
+			continue;
+		}
+		let mut records: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+		for batch in wal_batches_of(&image, false) {
+			*records.entry(batch.entries[0].key.clone()).or_default() += 1;
+		}
+		assert!(records.values().all(|n| *n <= 2), "group {group}: a batch is in the WAL 3 times");
+		let doubled: Vec<Vec<u8>> =
+			records.iter().filter(|(_, n)| **n == 2).map(|(k, _)| k.clone()).collect();
+		if doubled.is_empty() {
+			continue;
+		}
+		twice += 1;
+
+		let tree = Tree::new(options(&image, max_memtable_size, false)).unwrap();
+		stop_background(&tree).await;
+		let txn = tree.begin_with_mode(Mode::ReadOnly).unwrap();
+		for key in doubled {
+			// The first key of a commit says which commit it is: `{commit:04}{entry:05}`.
+			let commit: usize = String::from_utf8_lossy(&key[..4]).parse().unwrap();
+			for e in 0..entries {
+				assert_eq!(
+					txn.get(key_of(commit, e)).unwrap().as_deref(),
+					Some(key_of(commit, e).as_slice()),
+					"group {group}: commit {commit} entry {e} after its tail was replayed twice"
+				);
+			}
+		}
+		// No key of a commit that was never logged appears, and none is there twice.
+		let all = collect_transaction_all(&mut txn.iter().unwrap()).unwrap();
+		assert!(all.len() <= (batches + 1) * entries, "group {group}: {} rows", all.len());
+		drop(txn);
+		mark_closed(&tree);
+		release_lock(&tree);
+	}
+	assert!(twice > 0, "control: some image holds a batch in two segments");
 }
 
 // ---------------------------------------------------------------------------

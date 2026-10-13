@@ -265,7 +265,9 @@ pub(super) const ADMISSION_PERMITS: u32 = (DEFAULT_COMMIT_RING_CAPACITY / 2) as 
 /// How many times in a row a group may find its records in a segment other than the active
 /// memtable's tag, with nothing applied in between, and log them again off the memtable's lock.
 /// One pass past a rotation fixes it. If rotations keep overtaking the group, the next pass is
-/// fenced: see `CommitPipeline::apply_fenced`.
+/// fenced: see `CommitPipeline::apply_fenced`. The rotations of the group's own apply do not come
+/// in a row without a batch applied in between: the bound of `group_est_budget` is what makes the
+/// rest of a group fit the memtable it rotated to.
 pub(crate) const UNFENCED_STALE_ROUNDS: u32 = 2;
 
 /// How many groups the flusher drains between two calls to `retire`.
@@ -1407,7 +1409,12 @@ impl CommitPipeline {
 		// This is only an optimisation for the common case (a lone writer then never
 		// logs a record twice): every other case is repaired in step 3, because the
 		// estimate is a worst case, so how far a group gets into a memtable is only
-		// known by applying it.
+		// known by applying it. The gather bounds what the repair can cost: the estimates
+		// of a group add up to no more than a fresh memtable takes (`group_est_budget`), so
+		// the rest of a group fits the memtable it rotated to. Below 32 MiB a group
+		// rotates at most once, before its append or during its apply, and a batch is
+		// logged at most twice; a rotation by someone else (a checkpoint, a seal, a heal)
+		// can still overtake a group, and it is repaired the same way.
 		if oversized.first() == Some(&false) && self.needs_rotation_for(estimates[0])? {
 			self.inner.rotate_memtable()?;
 			if let Some(ref tm) = self.task_manager {
@@ -1878,6 +1885,13 @@ impl CommitPipeline {
 	///
 	/// A record already in that segment is never appended a second time. The value
 	/// log needs no second pass: its entries were synced with the first.
+	///
+	/// A group is logged again once for every rotation that overtakes it, and the gather
+	/// bounds those: a group whose memtable estimates fit a fresh memtable (see
+	/// `group_est_budget`) is overtaken by its own rotation once at most, so a batch is in
+	/// the WAL twice at most, the second copy in the segment of the memtable that applies it.
+	/// Recovery replays both, which is harmless: the copies have the same keys, sequence
+	/// numbers and values, and the replay is not deduplicated.
 	///
 	/// The stale batches go to the WAL as one group, so they land in one segment. They are
 	/// encoded into the group's own buffers, which the first append gave back with room for the
