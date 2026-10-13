@@ -1816,3 +1816,106 @@ fn concurrent_appends_syncs_and_flushes_neither_deadlock_nor_lose_an_entry() {
 		);
 	}
 }
+
+/// The names of the files in `dir`, in order.
+fn names_in(dir: &Path) -> Vec<String> {
+	let mut names: Vec<_> = std::fs::read_dir(dir)
+		.unwrap()
+		.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+		.collect();
+	names.sort();
+	names
+}
+
+/// A crash while a new plaintext file has only part of its header leaves a file that holds no
+/// entry: as the newest file it is set aside, its id is not used again, and the log appends to a
+/// new file.
+#[test]
+fn a_plaintext_file_that_a_crash_left_without_its_header_is_set_aside() {
+	let header = VLogFileHeader::new(2, 1 << 20, 0).encode();
+	let torn: [(&str, Vec<u8>); 5] = [
+		("a byte of the magic", header[..1].to_vec()),
+		("the magic and a byte of the version", header[..5].to_vec()),
+		("all but the last byte", header[..header.len() - 1].to_vec()),
+		("a few zeros", vec![0; 5]),
+		("a header of zeros", vec![0; header.len()]),
+	];
+	for (what, bytes) in torn {
+		let dir = TempDir::new().unwrap();
+		let opts = Arc::new(Options {
+			path: dir.path().to_path_buf(),
+			vlog_max_file_size: 1 << 20,
+			..Default::default()
+		});
+		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		let pointer = {
+			let vlog = VLog::new(Arc::clone(&opts)).unwrap();
+			let pointer = vlog.append(b"key", &value_of(1, 100)).unwrap();
+			vlog.sync().unwrap();
+			pointer
+		};
+		assert_eq!(pointer.file_id, 1);
+		std::fs::write(opts.vlog_file_path(2), &bytes).unwrap();
+
+		let vlog = VLog::new(Arc::clone(&opts)).unwrap();
+		assert_eq!(
+			names_in(&opts.vlog_dir()),
+			["00000000000000000001.vlog", "00000000000000000002.vlog.torn"],
+			"{what}"
+		);
+		assert_eq!(
+			std::fs::read(opts.vlog_dir().join("00000000000000000002.vlog.torn")).unwrap(),
+			bytes,
+			"{what}: set aside with its bytes"
+		);
+		assert_eq!(vlog.get(&pointer).unwrap(), value_of(1, 100), "{what}");
+		let next = vlog.append(b"next", &value_of(2, 100)).unwrap();
+		assert_eq!(next.file_id, 3, "{what}: the id of the torn file is not used again");
+		vlog.sync().unwrap();
+		drop(vlog);
+
+		let vlog = VLog::new(Arc::clone(&opts)).unwrap();
+		assert_eq!(vlog.get(&pointer).unwrap(), value_of(1, 100), "{what}");
+		assert_eq!(vlog.get(&next).unwrap(), value_of(2, 100), "{what}");
+	}
+}
+
+/// Only the start of the header of the newest file is taken for a header that was cut off:
+/// anything else, or such a start in an older file, may be damage, and is an error that leaves
+/// the directory as it is.
+#[test]
+fn a_plaintext_file_is_set_aside_only_for_the_start_of_its_own_header() {
+	let header = VLogFileHeader::new(2, 1 << 20, 0).encode();
+	let other = VLogFileHeader::new(7, 1 << 20, 0).encode();
+	let mut flipped = header[..20].to_vec();
+	flipped[0] ^= 0x01;
+	let not_torn: [(&str, u64, Vec<u8>); 3] = [
+		("the start of the header of another file", 2, other[..20].to_vec()),
+		("a damaged start of a header", 2, flipped),
+		("the start of a header in a file that is not the newest", 1, header[..20].to_vec()),
+	];
+	for (what, file_id, bytes) in not_torn {
+		let dir = TempDir::new().unwrap();
+		let opts = Arc::new(Options {
+			path: dir.path().to_path_buf(),
+			vlog_max_file_size: 1 << 20,
+			..Default::default()
+		});
+		std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+		// A file 1 with an entry, or a file 3 when file 1 is the one under test.
+		let whole = if file_id == 1 {
+			3
+		} else {
+			1
+		};
+		let mut file = VLogFileHeader::new(whole, 1 << 20, 0).encode().to_vec();
+		file.extend(entry_bytes(b"key", b"value"));
+		std::fs::write(opts.vlog_file_path(u64::from(whole)), &file).unwrap();
+		std::fs::write(opts.vlog_file_path(file_id), &bytes).unwrap();
+
+		let before = names_in(&opts.vlog_dir());
+		assert!(VLog::new(Arc::clone(&opts)).is_err(), "{what}");
+		assert_eq!(names_in(&opts.vlog_dir()), before, "{what}");
+		assert_eq!(std::fs::read(opts.vlog_file_path(file_id)).unwrap(), bytes, "{what}");
+	}
+}
