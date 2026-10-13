@@ -34,7 +34,7 @@ Every commit is fully durable and flushed to disk before it returns (each figure
 
 | Engine | Point&nbsp;Read&nbsp;(OPS) | Create&nbsp;(OPS) | Update&nbsp;(OPS) | Delete&nbsp;(OPS) | Scan&nbsp;(OPS) |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| **SurrealKV** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**6,985,826** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**150,251** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**160,043** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**63,282** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**903,668** |
+| **SurrealKV** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**6,804,864** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**229,376** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**221,341** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**264,089** | <img width="16" align="absmiddle" src="https://raw.githubusercontent.com/surrealdb/surrealkv/main/img/rocket.png" alt="🚀">&nbsp;**905,132** |
 | RocksDB | 855,851 | 8,568 | 36,263 | 32,043 | 852,661 |
 | SlateDB | 92,303 | 8,257 | 8,122 | 8,242 | 17,985 |
 | Fjall | \* | \* | \* | \* | \* |
@@ -44,11 +44,11 @@ Every commit is fully durable and flushed to disk before it returns (each figure
 
 \* Not benchmarked with synchronous durability: at this dataset size the run was too slow to complete in the time available.
 
-- **Creates (Writes)**: **150,251 OPS**: **17.5× faster** than RocksDB and **18.2× faster** than SlateDB.
-- **Updates**: **160,043 OPS**: **4.41× faster** than RocksDB and **19.7× faster** than SlateDB.
-- **Point Reads**: **6.99M OPS** sustained: **8.16× faster** than RocksDB and **75.7× faster** than SlateDB.
-- **Deletes**: **63,282 OPS**: **1.97× faster** than RocksDB and **7.68× faster** than SlateDB.
-- **Range Scans**: **903,668 OPS** on `select(*) limit(100)` scans: **1.06× faster** than RocksDB and **50.2× faster** than SlateDB. See [Scan Profile](#scan-profile) for other kinds of range scan.
+- **Creates (Writes)**: **229,376 OPS**: **26.8× faster** than RocksDB and **27.8× faster** than SlateDB.
+- **Updates**: **221,341 OPS**: **6.10× faster** than RocksDB and **27.3× faster** than SlateDB.
+- **Point Reads**: **6.80M OPS** sustained: **7.95× faster** than RocksDB and **73.7× faster** than SlateDB.
+- **Deletes**: **264,089 OPS**: **8.24× faster** than RocksDB and **32.0× faster** than SlateDB.
+- **Range Scans**: **905,132 OPS** on `select(*) limit(100)` scans: **1.06× faster** than RocksDB and **50.3× faster** than SlateDB. See [Scan Profile](#scan-profile) for other kinds of range scan.
 
 ### Without synchronous durability
 
