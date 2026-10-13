@@ -1,9 +1,12 @@
 [package]
 name = "surrealkv-cli"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-publish = false
 license = "Apache-2.0"
+repository = "https://github.com/surrealdb/surrealkv"
+readme = "README.md"
+keywords = ["database", "lsm", "storage", "cli", "migration"]
+categories = ["command-line-utilities", "database-implementations"]
 description = "Operator and developer inspection, dump, and diagnostic CLI for SurrealKV"
 
 [[bin]]
@@ -18,9 +21,9 @@ encryption = ["surrealkv/encryption"]
 
 [dependencies]
 surrealkv = { path = "../..", version = "1.0.0", default-features = false }
-surrealkv-compat-rocksdb = { path = "../surrealkv-compat-rocksdb" }
-surrealkv-compat-v1 = { path = "../surrealkv-compat-v1" }
-surrealkv-compat-indxdb = { path = "../surrealkv-compat-indxdb" }
+surrealkv-compat-rocksdb = { path = "../surrealkv-compat-rocksdb", version = "0.1.0" }
+surrealkv-compat-v1 = { path = "../surrealkv-compat-v1", version = "0.1.0" }
+surrealkv-compat-indxdb = { path = "../surrealkv-compat-indxdb", version = "0.1.0" }
 clap = { version = "4.5", features = ["derive"] }
 colored = "2.1"
 indicatif = "0.17"
