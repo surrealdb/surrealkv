@@ -457,6 +457,9 @@ impl SealedGroup {
 		let dir = TempDir::new("wal_stale_rounds").unwrap();
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, max_memtable_size, vlog)).unwrap());
+		// A group here holds an oversized batch with others, or is overtaken by more than one
+		// rotation, as its subject: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		stop_background_tasks(&tree).await;
 		let first_segment = tag_of(&tree);
 		let probe = seal_when(&tree, |_| true);
@@ -599,6 +602,9 @@ fn a_group_overtaken_fewer_times_than_the_limit_is_repaired_without_the_fence() 
 				let dir = TempDir::new("wal_stale_rounds").unwrap();
 				let live = dir.path().join("live");
 				let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+				// A group here holds an oversized batch with others, or is overtaken by more than
+				// one rotation, as its subject: see `group_est_budget`.
+				tree.core.commit_pipeline.lift_group_estimate_cap();
 				stop_background_tasks(&tree).await;
 				let probe = seal_when(&tree, move |round| round < seals);
 
@@ -631,6 +637,9 @@ fn a_group_overtaken_for_a_while_ends_in_the_first_fenced_round() {
 			let dir = TempDir::new("wal_stale_rounds").unwrap();
 			let live = dir.path().join("live");
 			let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+			// A group here holds an oversized batch with others, or is overtaken by more than one
+			// rotation, as its subject: see `group_est_budget`.
+			tree.core.commit_pipeline.lift_group_estimate_cap();
 			stop_background_tasks(&tree).await;
 			let probe = seal_when(&tree, |round| round < 8);
 
@@ -666,6 +675,9 @@ fn a_group_that_only_overflows_memtables_never_fences() {
 		let dir = TempDir::new("wal_stale_rounds").unwrap();
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, SMALL, false)).unwrap());
+		// A group here holds an oversized batch with others, or is overtaken by more than one
+		// rotation, as its subject: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		stop_background_tasks(&tree).await;
 		let probe = seal_when(&tree, |_| false);
 
@@ -695,6 +707,9 @@ fn a_group_overtaken_by_a_rotation_of_a_full_memtable_is_applied_in_its_own_segm
 		let dir = TempDir::new("wal_stale_rounds").unwrap();
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+		// A group here holds an oversized batch with others, or is overtaken by more than one
+		// rotation, as its subject: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		stop_background_tasks(&tree).await;
 
 		let first = entries(0, 3, 100);
@@ -732,6 +747,9 @@ fn the_fence_of_one_group_does_not_leak_into_the_next() {
 		let dir = TempDir::new("wal_stale_rounds").unwrap();
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+		// A group here holds an oversized batch with others, or is overtaken by more than one
+		// rotation, as its subject: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		stop_background_tasks(&tree).await;
 		let group_no = Arc::new(AtomicUsize::new(0));
 		let probe = {
@@ -784,6 +802,9 @@ fn rotations_exactly_at_the_flip_and_after_the_fence_change_nothing() {
 				let dir = TempDir::new("wal_stale_rounds").unwrap();
 				let live = dir.path().join("live");
 				let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+				// A group here holds an oversized batch with others, or is overtaken by more than
+				// one rotation, as its subject: see `group_est_budget`.
+				tree.core.commit_pipeline.lift_group_estimate_cap();
 				stop_background_tasks(&tree).await;
 				let sealing = rounds_that_seal.clone();
 				let probe = seal_when(&tree, move |round| sealing.contains(&round));
@@ -816,6 +837,9 @@ fn nothing_behind_an_oversized_batch_is_logged_before_it_is_through() {
 		let dir = TempDir::new("wal_stale_rounds").unwrap();
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, SMALL, false)).unwrap());
+		// A group here holds an oversized batch with others, or is overtaken by more than one
+		// rotation, as its subject: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		stop_background_tasks(&tree).await;
 		let probe = seal_when(&tree, |_| true);
 
@@ -914,6 +938,9 @@ fn a_fenced_round_has_synced_what_it_logged_and_holds_the_guard_until_it_applies
 			let dir = TempDir::new("wal_stale_rounds").unwrap();
 			let live = dir.path().join("live");
 			let tree = Arc::new(Tree::new(opts(&live, max_memtable_size, vlog)).unwrap());
+			// A group here holds an oversized batch with others, or is overtaken by more than one
+			// rotation, as its subject: see `group_est_budget`.
+			tree.core.commit_pipeline.lift_group_estimate_cap();
 			stop_background_tasks(&tree).await;
 			let (probe, seen) = observe_fence(&tree, &live);
 
@@ -952,6 +979,9 @@ fn a_rotation_attempted_inside_a_fenced_round_waits_for_the_apply() {
 		let dir = TempDir::new("wal_stale_rounds").unwrap();
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+		// A group here holds an oversized batch with others, or is overtaken by more than one
+		// rotation, as its subject: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		stop_background_tasks(&tree).await;
 		let finished_in_the_fence = Arc::new(AtomicBool::new(true));
 		let rotator: Arc<Mutex<Option<std::thread::JoinHandle<()>>>> = Arc::new(Mutex::new(None));
@@ -1013,6 +1043,9 @@ fn a_fenced_round_waiting_for_the_memtable_does_not_hold_the_wal() {
 		let dir = TempDir::new("wal_stale_rounds").unwrap();
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+		// A group here holds an oversized batch with others, or is overtaken by more than one
+		// rotation, as its subject: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		stop_background_tasks(&tree).await;
 
 		let wal_was_free = Arc::new(AtomicBool::new(false));
@@ -1074,6 +1107,9 @@ fn a_rotation_queued_for_the_memtable_waits_through_the_log_and_the_sync() {
 		let dir = TempDir::new("wal_stale_rounds").unwrap();
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+		// A group here holds an oversized batch with others, or is overtaken by more than one
+		// rotation, as its subject: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		stop_background_tasks(&tree).await;
 
 		let holder = Arc::new(Mutex::new(None));
@@ -1147,6 +1183,9 @@ fn a_re_append_that_fails_anywhere_in_the_fence_leaves_the_segment_as_it_was() {
 			let dir = TempDir::new("wal_stale_rounds").unwrap();
 			let live = dir.path().join("live");
 			let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+			// A group here holds an oversized batch with others, or is overtaken by more than one
+			// rotation, as its subject: see `group_est_budget`.
+			tree.core.commit_pipeline.lift_group_estimate_cap();
 			stop_background_tasks(&tree).await;
 			let probe = {
 				let inner = Arc::clone(&tree.core.inner);
@@ -1233,6 +1272,9 @@ fn a_tag_unrelated_to_the_wal_fails_the_group_before_it_is_logged_again() {
 			let dir = TempDir::new("wal_stale_rounds").unwrap();
 			let live = dir.path().join("live");
 			let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+			// A group here holds an oversized batch with others, or is overtaken by more than one
+			// rotation, as its subject: see `group_est_budget`.
+			tree.core.commit_pipeline.lift_group_estimate_cap();
 			stop_background_tasks(&tree).await;
 			tree.core.inner.seal_active_wal_segment().unwrap();
 			tree.core.inner.seal_active_wal_segment().unwrap();
@@ -1277,6 +1319,9 @@ fn a_fenced_round_that_finds_the_tag_apart_from_the_wal_fails_before_it_logs() {
 		let dir = TempDir::new("wal_stale_rounds").unwrap();
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, BIG, false)).unwrap());
+		// A group here holds an oversized batch with others, or is overtaken by more than one
+		// rotation, as its subject: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		stop_background_tasks(&tree).await;
 		let fenced_round = UNFENCED_STALE_ROUNDS as usize + 1;
 		let real = Arc::new(AtomicU64::new(0));
@@ -1401,6 +1446,9 @@ impl Storm {
 		let dir = TempDir::new("wal_stale_rounds").unwrap();
 		let live = dir.path().join("live");
 		let tree = Arc::new(Tree::new(opts(&live, 8192, vlog)).unwrap());
+		// A group here holds an oversized batch with others, or is overtaken by more than one
+		// rotation, as its subject: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		stop_background_tasks(&tree).await;
 
 		let stop = Arc::new(AtomicBool::new(false));
@@ -1627,6 +1675,9 @@ fn a_sweep_of_rotation_schedules_never_fails_a_logged_commit() {
 			let dir = TempDir::new("wal_stale_rounds").unwrap();
 			let live = dir.path().join("live");
 			let tree = Arc::new(Tree::new(opts(&live, max_memtable_size, vlog)).unwrap());
+			// A group here holds an oversized batch with others, or is overtaken by more than one
+			// rotation, as its subject: see `group_est_budget`.
+			tree.core.commit_pipeline.lift_group_estimate_cap();
 			stop_background_tasks(&tree).await;
 
 			// Which group the rounds belong to, and what the schedule does in each.
@@ -1720,6 +1771,9 @@ fn a_group_overtaken_by_every_rotation_commits_with_a_global_pool() {
 			let dir = TempDir::new("wal_stale_rounds").unwrap();
 			let live = dir.path().join("live");
 			let tree = Arc::new(Tree::new(opts(&live, SMALL, true)).unwrap());
+			// A group here holds an oversized batch with others, or is overtaken by more than one
+			// rotation, as its subject: see `group_est_budget`.
+			tree.core.commit_pipeline.lift_group_estimate_cap();
 			stop_background_tasks(&tree).await;
 			let first = tag_of(&tree);
 			let probe = seal_when(&tree, |_| true);

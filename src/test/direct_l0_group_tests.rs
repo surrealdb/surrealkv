@@ -910,6 +910,9 @@ fn non_empty_segments(tree: &Tree) -> Vec<u64> {
 /// Opens a copy of a crashed tree, with the background tasks stopped.
 async fn reopen(image: &Path) -> Tree {
 	let tree = Tree::new(options(image, false)).unwrap();
+	// The groups of the tests that commit through this tree hold an oversized batch with others:
+	// see `group_est_budget`.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	stop_background(&tree).await;
 	tree
 }

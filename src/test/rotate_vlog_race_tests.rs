@@ -577,6 +577,9 @@ async fn a_failed_vlog_fsync_in_a_rotation_after_part_of_a_group_was_applied_sto
 	let dir = TempDir::new().unwrap();
 	let live = dir.path().join("live");
 	let tree = Arc::new(Tree::new(vlog_opts_with(&live, 4 * 1024)).unwrap());
+	// This test is about a group that rotates the memtable in the middle: the bound on a group's
+	// estimates (see `group_est_budget`) is lifted so that the pile-up forms one.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	stop_background_tasks(&tree).await;
 	put(&tree, "before", &payload(0, 300), Durability::Eventual).await;
 	let visible = tree.core.seq_num();

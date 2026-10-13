@@ -550,6 +550,7 @@ async fn a_cleanup_that_fails_does_not_fail_the_commit() {
 	std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o755)).unwrap();
 	let _ = std::fs::remove_file(wal.join("probe"));
 	if !*locked.lock().unwrap() {
+		println!("skipped: this process can write to a directory that is read-only");
 		crash(&tree);
 		return;
 	}

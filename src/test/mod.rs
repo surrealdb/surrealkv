@@ -201,6 +201,8 @@ pub mod wal_group_commit_tests;
 #[cfg(test)]
 pub mod wal_group_crash_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_group_rotation_bound_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod wal_replace_tests;
 #[cfg(test)]
 pub mod wal_rotation_tests;
