@@ -1888,6 +1888,10 @@ impl CommitPipeline {
 				sealed_wal_number,
 				rest_wal_number,
 			)?;
+			// The segments the manifest is past are obsolete now, and nothing else would remove
+			// them until the next flush or the close: a run of oversized commits has no flush, and
+			// would leave one segment each.
+			self.inner.remove_obsolete_wal_segments();
 		}
 
 		if let Some(ref tm) = self.task_manager {
