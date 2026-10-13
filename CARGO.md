@@ -143,11 +143,11 @@ surrealkv/
 
 ## Quick Start
 
-This README describes the engine on the `main` branch, which has not been released yet. The `0.21.x` versions of `surrealkv` on crates.io are the previous engine, so `surrealkv = "0.21"` does not give you what is described here. Until the next release, depend on this repository directly:
+Databases written by SurrealKV 0.20 and 0.21, and by SurrealDB's RocksDB backend, are migrated when they are opened.
 
 ```toml
 [dependencies]
-surrealkv = { git = "https://github.com/surrealdb/surrealkv" }
+surrealkv = "1"
 tokio = { version = "1", features = ["full"] }
 ```
 

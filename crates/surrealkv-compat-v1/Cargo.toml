@@ -2,8 +2,8 @@
 name = "surrealkv-compat-v1"
 version = "0.1.0"
 edition = "2021"
-publish = false
 license = "Apache-2.0"
+repository = "https://github.com/surrealdb/surrealkv"
 description = "Standalone reader of SurrealKV LSMV1 databases (v0.20 to v0.21.4), for conversion to LSMV2"
 
 # The checksum and compression this reads are exactly what v0.20.0 to v0.21.4 used: CRC-32 for
