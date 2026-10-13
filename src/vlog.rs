@@ -204,6 +204,29 @@ impl VLogFileHeader {
 		self.version == VLOG_FORMAT_VERSION
 	}
 
+	/// Whether `file` is what a crash leaves of plaintext file `file_id` while its header was
+	/// being written: zeros where the header did not reach the disk, or the start of the header
+	/// and no more. The header is written on its own before any entry, so such a file holds no
+	/// entry. An empty file is not torn: it is given its header when it is reopened.
+	pub(crate) fn is_torn(file: &[u8], file_id: u32) -> bool {
+		if file.is_empty() || file.len() > Self::SIZE {
+			return false;
+		}
+		if file.iter().all(|&byte| byte == 0) {
+			return true;
+		}
+		if file.len() == Self::SIZE {
+			return false;
+		}
+		// What every header of this file starts with: the magic, the version and the file id.
+		let mut start = [0u8; 10];
+		start[..4].copy_from_slice(&Self::MAGIC.to_be_bytes());
+		start[4..6].copy_from_slice(&VLOG_FORMAT_VERSION.to_be_bytes());
+		start[6..].copy_from_slice(&file_id.to_be_bytes());
+		let len = file.len().min(start.len());
+		file[..len] == start[..len]
+	}
+
 	pub(crate) fn validate(&self, file_id: u32) -> Result<()> {
 		if self.file_id != file_id {
 			return Err(Error::Corruption(format!(
@@ -1265,10 +1288,10 @@ impl VLog {
 	/// `files_map`, and returns the one with the highest id. A directory that does not exist
 	/// holds none.
 	///
-	/// A log of sealed files may find a crash's leftover as its newest file: a file that the
-	/// crash cut off before its header was complete, and which therefore holds no entry. It is
-	/// set aside under another name, never deleted, and the newest file is reported as one
-	/// that is sealed and no longer there, so that its id is not used again. Only the newest
+	/// A log may find a crash's leftover as its newest file: a file that the crash cut off
+	/// before its header was complete, and which therefore holds no entry. It is set aside
+	/// under another name, never deleted, and the newest file is reported as one that is never
+	/// appended to and is no longer there, so that its id is not used again. Only the newest
 	/// file can be that, and only a header that is incomplete or damaged and is no longer than a
 	/// header counts: whatever fails to authenticate is an error and leaves every file as it is.
 	/// The file is renamed only after every other file has opened, so a log that fails on a key
@@ -1305,7 +1328,7 @@ impl VLog {
 
 		for (file_id, file_path, file_size) in found {
 			let is_newest = file_id == newest_id;
-			if is_newest && self.is_torn(&file_path, file_size)? {
+			if is_newest && self.is_torn(&file_path, file_id, file_size)? {
 				torn = Some((file_id, file_path));
 				continue;
 			}
@@ -1412,12 +1435,18 @@ impl VLog {
 	}
 
 	/// Whether `path`, the newest file of the log, is what a crash during its creation leaves,
-	/// see [`sealed::is_torn`]. Only a log of sealed files can have such a file.
-	fn is_torn(&self, path: &Path, file_size: u64) -> Result<bool> {
-		if self.encryption().is_none() || file_size > sealed::SEALED_HEADER_LEN as u64 {
+	/// see [`sealed::is_torn`] and [`VLogFileHeader::is_torn`].
+	fn is_torn(&self, path: &Path, file_id: u32, file_size: u64) -> Result<bool> {
+		if self.encryption().is_some() {
+			if file_size > sealed::SEALED_HEADER_LEN as u64 {
+				return Ok(false);
+			}
+			return Ok(sealed::is_torn(&std::fs::read(path)?));
+		}
+		if file_size == 0 || file_size > VLogFileHeader::SIZE as u64 {
 			return Ok(false);
 		}
-		Ok(sealed::is_torn(&std::fs::read(path)?))
+		Ok(VLogFileHeader::is_torn(&std::fs::read(path)?, file_id))
 	}
 
 	/// Renames a file that a crash left without a complete header, which holds no entry, to a
