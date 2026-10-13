@@ -385,6 +385,7 @@ impl std::error::Error for EncryptionError {}
 
 /// Error severity levels
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[non_exhaustive]
 pub enum ErrorSeverity {
 	/// Error can be ignored
 	NoError = 0,
@@ -400,6 +401,7 @@ pub enum ErrorSeverity {
 
 /// Reason for background error (for classification)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum BackgroundErrorReason {
 	MemtablaFlush,
 	Compaction,
@@ -410,6 +412,7 @@ pub enum BackgroundErrorReason {
 
 /// Reason for write stall - used for logging and metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WriteStallReason {
 	/// Too many immutable memtables queued for flush
 	MemtableLimit,
@@ -419,10 +422,12 @@ pub enum WriteStallReason {
 
 /// Represents a background error with its severity and context
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct BackgroundError {
 	pub error: Error,
 	pub severity: ErrorSeverity,
 	pub reason: BackgroundErrorReason,
+	/// When the error was recorded, on a monotonic clock.
 	pub timestamp: Instant,
 }
 
