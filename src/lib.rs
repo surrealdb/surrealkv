@@ -25,6 +25,9 @@ mod scrubber;
 mod snapshot;
 mod sstable;
 mod stall;
+// The storage seam and the wasm32 OPFS primitives. Public only so that the integration tests can
+// reach them: not part of the stable API, and free to change in any release.
+#[doc(hidden)]
 pub mod storage;
 mod task;
 // Reachable only because `Options::key_manager` is a public field. The key manager, the cipher

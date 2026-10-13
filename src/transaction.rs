@@ -14,6 +14,7 @@ use crate::{InternalKeyKind, InternalKeyRef, IntoBytes, Key, LSMIterator, Value}
 /// `Mode` is an enumeration representing the different modes a transaction can
 /// have in an MVCC (Multi-Version Concurrency Control) system.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Mode {
 	/// `ReadWrite` mode allows the transaction to both read and write data.
 	ReadWrite,
@@ -45,6 +46,7 @@ impl Mode {
 }
 
 #[derive(Default, Debug, Copy, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Durability {
 	/// Writes are buffered in OS page cache.
 	/// May lose recent commits on power failure but fast.
