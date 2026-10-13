@@ -411,8 +411,8 @@ SKV_KEY_FILE=mydb.key skv scan path/to/db --prefix "user:"
 The `skv` utility (`crates/surrealkv-cli`) provides inspection, diagnostics, and data migration capabilities:
 
 ```bash
-# Build the CLI
-make build-cli
+# Install the CLI
+cargo install surrealkv-cli
 
 # Inspect database directory and storage breakdown
 skv inspect path/to/db
