@@ -17,7 +17,7 @@ default = ["encryption"]
 encryption = ["surrealkv/encryption"]
 
 [dependencies]
-surrealkv = { path = "../..", version = "0.21.3", default-features = false }
+surrealkv = { path = "../..", version = "1.0.0", default-features = false }
 surrealkv-compat-rocksdb = { path = "../surrealkv-compat-rocksdb" }
 surrealkv-compat-v1 = { path = "../surrealkv-compat-v1" }
 surrealkv-compat-indxdb = { path = "../surrealkv-compat-indxdb" }

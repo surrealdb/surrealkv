@@ -60,15 +60,30 @@ jobs:
           
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Create and push tag
-        run: |
-          git tag -a "v${{ steps.version.outputs.version }}" -m "Release version ${{ steps.version.outputs.version }}"
-          git push origin "v${{ steps.version.outputs.version }}"
+      - name: Publish surrealkv-compat-v1
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p surrealkv-compat-v1
+
+      - name: Publish surrealkv-compat-indxdb
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p surrealkv-compat-indxdb
+
+      - name: Publish surrealkv-compat-rocksdb
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p surrealkv-compat-rocksdb
 
       - name: Publish crate
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish
+        run: cargo publish -p surrealkv
+
+      - name: Create and push tag
+        run: |
+          git tag -a "v${{ steps.version.outputs.version }}" -m "Release version ${{ steps.version.outputs.version }}"
+          git push origin "v${{ steps.version.outputs.version }}"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844 # v1

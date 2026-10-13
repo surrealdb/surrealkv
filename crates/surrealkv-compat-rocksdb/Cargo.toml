@@ -3,6 +3,7 @@ name = "surrealkv-compat-rocksdb"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
+repository = "https://github.com/surrealdb/surrealkv"
 description = "Pure-Rust reader of RocksDB databases written by SurrealDB, for migration to SurrealKV"
 readme = "README.md"
 
