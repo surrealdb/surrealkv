@@ -633,3 +633,145 @@ fn perf_get_range_smoke() {
 		 {scanned} keys = {scan_ms} ms"
 	);
 }
+
+#[tokio::test]
+async fn proof_scan_value_ref_and_value_into_zero_allocs_per_row() {
+	let dir = TempDir::new().unwrap();
+	let tree = crate::TreeBuilder::new()
+		.with_path(dir.path().to_path_buf())
+		.with_block_size(1024)
+		.build()
+		.unwrap();
+
+	// Populate enough rows to span multiple SSTable data blocks and flush to L0.
+	{
+		let mut tx = tree.begin().unwrap();
+		for i in 0..200u32 {
+			let k = format!("key{i:06}");
+			let v = format!("val{i:06}_payload_0123456789abcdef");
+			tx.set(k.as_bytes(), v.as_bytes()).unwrap();
+		}
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Also add memtable rows so the scan merges SSTable + MemTable + WriteSet.
+	{
+		let mut tx = tree.begin().unwrap();
+		for i in 200..250u32 {
+			let k = format!("key{i:06}");
+			let v = format!("val{i:06}_payload_0123456789abcdef");
+			tx.set(k.as_bytes(), v.as_bytes()).unwrap();
+		}
+		tx.commit().await.unwrap();
+	}
+
+	let mut tx = tree.begin().unwrap();
+	tx.set(b"key000250", b"val000250_payload_0123456789abcdef").unwrap();
+
+	let mut iter = tx.range(b"key000000", b"key999999").unwrap();
+	let mut scratch = Vec::with_capacity(64);
+
+	// Warm the block cache and the iterator's reusable scratch buffers with one pass.
+	iter.seek_first().unwrap();
+	while iter.valid() {
+		let _ = iter.value_ref().unwrap();
+		iter.next().unwrap();
+	}
+
+	// Forward scan over all 251 rows across multiple SST blocks + memtable + write-set.
+	let (fwd_rows, fwd_allocs) = count_allocations(|| {
+		let mut count = 0usize;
+		iter.seek_first().unwrap();
+		while iter.valid() {
+			let k = iter.key().user_key();
+			let v = iter.value_ref().unwrap();
+			assert!(!k.is_empty() && !v.is_empty());
+			iter.value_into(&mut scratch).unwrap();
+			assert_eq!(scratch.as_slice(), &*v);
+			count += 1;
+			iter.next().unwrap();
+		}
+		count
+	});
+	assert_eq!(fwd_rows, 251);
+	assert_eq!(
+		fwd_allocs, 0,
+		"forward scan with value_ref/value_into should allocate 0 times across {fwd_rows} rows"
+	);
+
+	// Backward scan over all rows (prime the first backward step, then count the rest).
+	iter.seek_last().unwrap();
+	assert!(iter.valid());
+	let _ = iter.value_ref().unwrap();
+
+	let (bwd_rows, bwd_allocs) = count_allocations(|| {
+		let mut count = 0usize;
+		while iter.prev().unwrap() {
+			let k = iter.key().user_key();
+			let v = iter.value_ref().unwrap();
+			assert!(!k.is_empty() && !v.is_empty());
+			count += 1;
+		}
+		count
+	});
+	assert_eq!(bwd_rows, 250);
+	assert_eq!(
+		bwd_allocs, 0,
+		"backward scan with value_ref should allocate 0 times across {bwd_rows} rows"
+	);
+}
+
+#[tokio::test]
+async fn proof_point_get_allocates_one_vec_per_hit_and_zero_per_miss() {
+	let dir = TempDir::new().unwrap();
+	let tree = crate::TreeBuilder::new()
+		.with_path(dir.path().to_path_buf())
+		.with_block_size(1024)
+		.build()
+		.unwrap();
+
+	// Write keys 0..100 and flush to SSTable.
+	{
+		let mut tx = tree.begin().unwrap();
+		for i in 0..100u32 {
+			let k = format!("sst_key{i:06}");
+			let v = format!("sst_val{i:06}_payload");
+			tx.set(k.as_bytes(), v.as_bytes()).unwrap();
+		}
+		tx.commit().await.unwrap();
+	}
+	tree.flush().unwrap();
+
+	// Write keys 0..50 into active memtable.
+	{
+		let mut tx = tree.begin().unwrap();
+		for i in 0..50u32 {
+			let k = format!("mem_key{i:06}");
+			let v = format!("mem_val{i:06}_payload");
+			tx.set(k.as_bytes(), v.as_bytes()).unwrap();
+		}
+		tx.commit().await.unwrap();
+	}
+
+	let tx = tree.begin().unwrap();
+
+	// Warm SSTable block/filter cache.
+	assert!(tx.get(b"sst_key000042").unwrap().is_some());
+	assert!(tx.get(b"sst_key000042x").unwrap().is_none());
+
+	// 1. MemTable hit: must allocate at most 1 Vec (the returned Value).
+	let (val, mem_hit_allocs) = count_allocations(|| tx.get(b"mem_key000010").unwrap());
+	assert_eq!(val.as_deref(), Some(&b"mem_val000010_payload"[..]));
+	assert_eq!(mem_hit_allocs, 1, "memtable hit should allocate only the returned Value Vec");
+
+	// 2. Cached SSTable hit: must allocate at most 1 Vec (the returned Value).
+	let (val, sst_hit_allocs) = count_allocations(|| tx.get(b"sst_key000042").unwrap());
+	assert_eq!(val.as_deref(), Some(&b"sst_val000042_payload"[..]));
+	assert_eq!(sst_hit_allocs, 1, "cached SSTable hit should allocate only the returned Value Vec");
+
+	// 3. Cached SSTable / MemTable miss: must allocate 0 Vecs.
+	let (val, miss_allocs) = count_allocations(|| tx.get(b"sst_key000042x").unwrap());
+	assert!(val.is_none());
+	assert_eq!(miss_allocs, 0, "cached point-read miss should allocate 0 times");
+}

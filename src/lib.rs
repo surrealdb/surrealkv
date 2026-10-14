@@ -979,7 +979,8 @@ impl InternalKey {
 	}
 
 	pub(crate) fn encode(&self) -> Vec<u8> {
-		let mut buf = self.user_key.clone();
+		let mut buf = Vec::with_capacity(self.user_key.len() + 8);
+		buf.extend_from_slice(&self.user_key);
 		buf.extend_from_slice(&self.trailer.to_be_bytes());
 		buf
 	}
@@ -1237,15 +1238,33 @@ pub trait LSMIterator {
 	/// Get current raw value bytes (zero-copy). Caller must check valid() first.
 	///
 	/// For transaction-level iterators, this returns raw bytes that may be
-	/// VLog-encoded. Use `value()` for resolved values.
+	/// VLog-encoded. Use `value()`, `value_ref()`, or `value_into()` for resolved values.
 	fn value_encoded(&self) -> Result<&[u8]>;
+
+	/// Get current value with VLog resolution, borrowing inline or write-set bytes
+	/// without heap allocation when possible.
+	///
+	/// Returns `Cow::Borrowed` when the value is stored inline (or in the transaction
+	/// write-set), and `Cow::Owned` when fetched from the VLog.
+	fn value_ref(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+		Ok(std::borrow::Cow::Borrowed(self.value_encoded()?))
+	}
+
+	/// Copy the current resolved value into `buf`, clearing it first and reusing its
+	/// existing heap capacity.
+	fn value_into(&self, buf: &mut Vec<u8>) -> Result<()> {
+		let val = self.value_ref()?;
+		buf.clear();
+		buf.extend_from_slice(&val);
+		Ok(())
+	}
 
 	/// Get current value as owned bytes with VLog resolution.
 	///
 	/// This method resolves VLog pointers to actual values, returning owned data.
 	/// For iterators without VLog (internal iterators), this clones the raw bytes.
 	///
-	/// Default implementation clones raw bytes from `value()`.
+	/// Default implementation clones raw bytes from `value_encoded()`.
 	fn value(&self) -> Result<Value> {
 		Ok(self.value_encoded()?.to_vec())
 	}

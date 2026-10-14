@@ -781,7 +781,7 @@ impl Transaction {
 
 		match self.snapshot.as_ref().unwrap().get_async(key_slice).await? {
 			Some(val) => {
-				let resolved_value = self.core.resolve_value(&val.0)?;
+				let resolved_value = self.core.resolve_owned_value(val.0)?;
 				Ok(Some(resolved_value))
 			}
 			None => Ok(None),
@@ -836,7 +836,7 @@ impl Transaction {
 		match self.snapshot.as_ref().unwrap().get(key.as_slice())? {
 			Some(val) => {
 				// Resolve the value reference through VLog if needed
-				let resolved_value = self.core.resolve_value(&val.0)?;
+				let resolved_value = self.core.resolve_owned_value(val.0)?;
 				Ok(Some(resolved_value))
 			}
 			None => Ok(None),
@@ -1837,6 +1837,7 @@ impl<'a> TransactionRangeIterator<'a> {
 		let (key, entry) = self.write_set_entries[pos];
 
 		self.ws_encoded_key_buf.clear();
+		self.ws_encoded_key_buf.reserve(key.len() + 8);
 		self.ws_encoded_key_buf.extend_from_slice(key);
 		let trailer = ((entry.seqno as u64) << 8) | (entry.kind as u64);
 		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
@@ -1972,9 +1973,10 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 		self.is_key_equal = false;
 
 		// Encode user key with MAX trailer for >= seek
-		let mut encoded = target.to_vec();
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
-		self.snapshot_iter.seek(&encoded)?;
+		self.ws_encoded_key_buf.clear();
+		self.ws_encoded_key_buf.extend_from_slice(target);
+		self.ws_encoded_key_buf.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
+		self.snapshot_iter.seek(&self.ws_encoded_key_buf)?;
 
 		// Position write-set at first entry >= target
 		self.seek_ws(target);
@@ -2143,6 +2145,28 @@ impl LSMIterator for TransactionRangeIterator<'_> {
 			Ok(raw.to_vec())
 		} else {
 			self.core.resolve_value(raw)
+		}
+	}
+
+	fn value_ref(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+		debug_assert!(self.valid());
+		let raw = self.value_encoded()?;
+		if self.current_source == CurrentSource::WriteSet {
+			Ok(std::borrow::Cow::Borrowed(raw))
+		} else {
+			self.core.resolve_value_ref(raw)
+		}
+	}
+
+	fn value_into(&self, buf: &mut Vec<u8>) -> Result<()> {
+		debug_assert!(self.valid());
+		let raw = self.value_encoded()?;
+		if self.current_source == CurrentSource::WriteSet {
+			buf.clear();
+			buf.extend_from_slice(raw);
+			Ok(())
+		} else {
+			self.core.resolve_value_into(raw, buf)
 		}
 	}
 }
@@ -2462,6 +2486,7 @@ impl<'a> TransactionHistoryIterator<'a> {
 		let (key, entry) = self.write_set_entries[pos];
 
 		self.ws_encoded_key_buf.clear();
+		self.ws_encoded_key_buf.reserve(key.len() + 8);
 		self.ws_encoded_key_buf.extend_from_slice(key);
 		let trailer = ((entry.seqno as u64) << 8) | (entry.kind as u64);
 		self.ws_encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
@@ -2743,10 +2768,11 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 		self.initialized = true;
 
 		// Encode user key with MAX trailer for >= seek
-		let mut encoded = target.to_vec();
-		encoded.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
+		self.ws_encoded_key_buf.clear();
+		self.ws_encoded_key_buf.extend_from_slice(target);
+		self.ws_encoded_key_buf.extend_from_slice(&u64::MAX.to_be_bytes()); // max trailer
 		self.entries_returned = 0;
-		self.inner.seek(&encoded)?;
+		self.inner.seek(&self.ws_encoded_key_buf)?;
 
 		// Position write-set at first entry >= target
 		self.seek_ws(target);
@@ -2812,6 +2838,28 @@ impl LSMIterator for TransactionHistoryIterator<'_> {
 			Ok(raw.to_vec())
 		} else {
 			self.core.resolve_value(raw)
+		}
+	}
+
+	fn value_ref(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
+		debug_assert!(self.valid());
+		let raw = self.value_encoded()?;
+		if self.current_source == CurrentSource::WriteSet {
+			Ok(std::borrow::Cow::Borrowed(raw))
+		} else {
+			self.core.resolve_value_ref(raw)
+		}
+	}
+
+	fn value_into(&self, buf: &mut Vec<u8>) -> Result<()> {
+		debug_assert!(self.valid());
+		let raw = self.value_encoded()?;
+		if self.current_source == CurrentSource::WriteSet {
+			buf.clear();
+			buf.extend_from_slice(raw);
+			Ok(())
+		} else {
+			self.core.resolve_value_into(raw, buf)
 		}
 	}
 }

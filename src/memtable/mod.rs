@@ -186,7 +186,22 @@ impl MemTable {
 		self.has_range_deletions.load(Ordering::Relaxed)
 	}
 
+	#[cfg(test)]
 	pub(crate) fn get(&self, key: &[u8], seq_no: Option<u64>) -> Option<(InternalKey, Value)> {
+		self.get_raw(key, seq_no).map(|(trailer, val)| {
+			(
+				InternalKey {
+					user_key: key.to_vec(),
+					trailer,
+				},
+				val,
+			)
+		})
+	}
+
+	/// Looks up `key` at or below `seq_no`, returning `(trailer, value)` without allocating
+	/// a copy of `key`.
+	pub(crate) fn get_raw(&self, key: &[u8], seq_no: Option<u64>) -> Option<(u64, Value)> {
 		let max_seq = seq_no.unwrap_or(INTERNAL_KEY_SEQ_NUM_MAX);
 		let max_trailer = (max_seq << 8) | 0xFF;
 
@@ -200,18 +215,11 @@ impl MemTable {
 			}
 		}
 
-		let mut point_res: Option<(InternalKey, Value)> = None;
-		if let Some((found_trailer, val)) = self.map.get_version_le(key, max_trailer) {
-			let internal_key = InternalKey {
-				user_key: key.to_vec(),
-				trailer: found_trailer,
-			};
-			point_res = Some((internal_key, val));
-		}
+		let point_res = self.map.get_version_le(key, max_trailer);
 
 		if let Some(rseq) = range_tombstone_seq {
-			if let Some(ref res) = point_res {
-				if res.0.seq_num() > rseq {
+			if let Some((trailer, _)) = &point_res {
+				if crate::trailer_to_seq_num(*trailer) > rseq {
 					return point_res;
 				}
 			}
@@ -578,7 +586,7 @@ pub(crate) fn maybe_separate_to_vlog(
 		return Ok(encoded_value.to_vec());
 	}
 
-	let location = ValueLocation::decode(encoded_value)?;
+	let location = ValueLocation::decode_ref(encoded_value)?;
 
 	// Already a VLog pointer (e.g. from pre-upgrade WAL recovery) — pass through
 	if location.is_value_pointer() {
@@ -586,7 +594,7 @@ pub(crate) fn maybe_separate_to_vlog(
 	}
 
 	// Separate large values to VLog
-	let value = &location.value;
+	let value = location.value;
 	if let Some(vlog) = vlog {
 		if value.len() > vlog_threshold {
 			let encoded_key = key.encode();
@@ -663,6 +671,7 @@ impl<'a> MemTableIterator<'a> {
 		if let (Some(key), Some(&(trailer, _))) =
 			(self.current_key, self.current_versions.get(self.version_idx))
 		{
+			self.encoded_key_buf.reserve(key.len() + 8);
 			self.encoded_key_buf.extend_from_slice(key);
 			self.encoded_key_buf.extend_from_slice(&trailer.to_be_bytes());
 		}

@@ -1494,8 +1494,25 @@ impl CoreInner {
 	/// Resolves a value, checking if it's a VLog pointer and retrieving from
 	/// VLog if needed
 	pub(crate) fn resolve_value(&self, value: &[u8]) -> Result<Value> {
-		let location = ValueLocation::decode(value)?;
-		location.resolve_value(self.vlog.as_ref())
+		ValueLocation::resolve_raw_value(value, self.vlog.as_ref()).map(|cow| cow.into_owned())
+	}
+
+	/// Resolves a value, borrowing inline bytes directly without allocation.
+	pub(crate) fn resolve_value_ref<'a>(
+		&self,
+		value: &'a [u8],
+	) -> Result<std::borrow::Cow<'a, [u8]>> {
+		ValueLocation::resolve_raw_value(value, self.vlog.as_ref())
+	}
+
+	/// Resolves an owned encoded value, stripping the header in-place for inline values.
+	pub(crate) fn resolve_owned_value(&self, value: Value) -> Result<Value> {
+		ValueLocation::resolve_owned_value(value, self.vlog.as_ref())
+	}
+
+	/// Resolves an encoded value into `out`, reusing its capacity.
+	pub(crate) fn resolve_value_into(&self, value: &[u8], out: &mut Vec<u8>) -> Result<()> {
+		ValueLocation::resolve_value_into(value, self.vlog.as_ref(), out)
 	}
 }
 

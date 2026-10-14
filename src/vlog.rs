@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufWriter, Cursor, Read, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -257,6 +257,27 @@ pub(crate) struct ValueLocation {
 	pub timestamp: Option<u64>,
 }
 
+/// Zero-copy view of an encoded [`ValueLocation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ValueLocationRef<'a> {
+	pub meta: u8,
+	pub value: &'a [u8],
+	pub version: u8,
+	pub timestamp: Option<u64>,
+}
+
+impl<'a> ValueLocationRef<'a> {
+	#[inline]
+	pub(crate) fn is_value_pointer(&self) -> bool {
+		(self.meta & BIT_VALUE_POINTER) != 0
+	}
+
+	pub(crate) fn to_owned(self) -> ValueLocation {
+		ValueLocation::new(self.meta, self.value.to_vec(), self.version)
+			.with_timestamp(self.timestamp)
+	}
+}
+
 impl ValueLocation {
 	/// Creates a new ValueLocation
 	pub(crate) fn new(meta: u8, value: Value, version: u8) -> Self {
@@ -416,46 +437,120 @@ impl ValueLocation {
 		Ok(())
 	}
 
-	/// Decodes a ValueLocation from bytes
-	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
-		let mut cursor = Cursor::new(data);
-		Self::decode_from(&mut cursor)
-	}
-
-	/// Decodes a ValueLocation from a reader
-	fn decode_from<R: Read>(reader: &mut R) -> Result<Self> {
-		// Read meta byte
-		let mut meta_buf = [0u8; 1];
-		reader.read_exact(&mut meta_buf)?;
-		let meta = meta_buf[0];
-
-		// Read version as u8
-		let mut version_buf = [0u8; 1];
-		reader.read_exact(&mut version_buf)?;
-		let version = version_buf[0];
-
-		// Read the timestamp
-		let timestamp = if meta & BIT_HAS_TIMESTAMP != 0 {
-			let mut timestamp_buf = [0u8; VALUE_TIMESTAMP_SIZE];
-			reader.read_exact(&mut timestamp_buf).map_err(|_| {
+	/// Decodes a [`ValueLocationRef`] from bytes without copying the payload.
+	pub(crate) fn decode_ref(data: &[u8]) -> Result<ValueLocationRef<'_>> {
+		if data.len() < 2 {
+			return Err(Error::Io(Arc::new(io::Error::new(
+				io::ErrorKind::UnexpectedEof,
+				"failed to fill whole buffer",
+			))));
+		}
+		let meta = data[0];
+		let version = data[1];
+		let (timestamp, header_len) = if meta & BIT_HAS_TIMESTAMP != 0 {
+			let bytes = data.get(2..2 + VALUE_TIMESTAMP_SIZE).ok_or_else(|| {
 				Error::Corruption(
 					"a value location says it has a timestamp but is too short to hold it"
 						.to_string(),
 				)
 			})?;
-			Some(u64::from_be_bytes(timestamp_buf))
+			(Some(u64::from_be_bytes(bytes.try_into().unwrap())), 2 + VALUE_TIMESTAMP_SIZE)
 		} else {
-			None
+			(None, 2)
 		};
 
-		// Read remaining data as value
-		let mut value = Vec::new();
-		reader.read_to_end(&mut value)?;
+		Ok(ValueLocationRef {
+			meta: meta & !BIT_HAS_TIMESTAMP,
+			value: &data[header_len..],
+			version,
+			timestamp,
+		})
+	}
 
-		Ok(Self::new(meta, value, version).with_timestamp(timestamp))
+	/// Decodes a ValueLocation from bytes
+	pub(crate) fn decode(data: &[u8]) -> Result<Self> {
+		Self::decode_ref(data).map(ValueLocationRef::to_owned)
+	}
+
+	/// Resolves an encoded `ValueLocation` slice, borrowing inline value bytes directly
+	/// without allocation or fetching from `vlog` when the entry is a pointer.
+	pub(crate) fn resolve_raw_value<'a>(
+		data: &'a [u8],
+		vlog: Option<&Arc<VLog>>,
+	) -> Result<std::borrow::Cow<'a, [u8]>> {
+		let loc = Self::decode_ref(data)?;
+		if loc.is_value_pointer() {
+			if let Some(vlog) = vlog {
+				let pointer = ValuePointer::decode(loc.value)?;
+				let resolved = vlog.get(&pointer).map_err(|e| match e {
+					Error::Encryption(_) => e,
+					e => Error::Other(format!(
+						"Failed to resolve value from VLog: {e}. ValuePointer: {:?}",
+						pointer
+					)),
+				})?;
+				Ok(std::borrow::Cow::Owned(resolved))
+			} else {
+				Err(Error::Other("VLog not available for pointer resolution".to_string()))
+			}
+		} else {
+			Ok(std::borrow::Cow::Borrowed(loc.value))
+		}
+	}
+
+	/// Resolves an owned encoded `ValueLocation` buffer, stripping the header in-place
+	/// for inline values with zero additional allocations.
+	pub(crate) fn resolve_owned_value(mut data: Value, vlog: Option<&Arc<VLog>>) -> Result<Value> {
+		let loc = Self::decode_ref(&data)?;
+		if loc.is_value_pointer() {
+			if let Some(vlog) = vlog {
+				let pointer = ValuePointer::decode(loc.value)?;
+				vlog.get(&pointer).map_err(|e| match e {
+					Error::Encryption(_) => e,
+					e => Error::Other(format!(
+						"Failed to resolve value from VLog: {e}. ValuePointer: {:?}",
+						pointer
+					)),
+				})
+			} else {
+				Err(Error::Other("VLog not available for pointer resolution".to_string()))
+			}
+		} else {
+			let header_len = Self::header_len(data[0]);
+			data.drain(..header_len);
+			Ok(data)
+		}
+	}
+
+	/// Resolves an encoded `ValueLocation` slice into `out`, reusing `out`'s capacity.
+	pub(crate) fn resolve_value_into(
+		data: &[u8],
+		vlog: Option<&Arc<VLog>>,
+		out: &mut Vec<u8>,
+	) -> Result<()> {
+		let loc = Self::decode_ref(data)?;
+		if loc.is_value_pointer() {
+			if let Some(vlog) = vlog {
+				let pointer = ValuePointer::decode(loc.value)?;
+				vlog.get_into(&pointer, out).map_err(|e| match e {
+					Error::Encryption(_) => e,
+					e => Error::Other(format!(
+						"Failed to resolve value from VLog: {e}. ValuePointer: {:?}",
+						pointer
+					)),
+				})
+			} else {
+				Err(Error::Other("VLog not available for pointer resolution".to_string()))
+			}
+		} else {
+			out.clear();
+			out.extend_from_slice(loc.value);
+			Ok(())
+		}
 	}
 
 	/// Resolves the actual value, returning inline bytes directly or fetching from VLog.
+	#[cfg(test)]
 	pub(crate) fn resolve_value(self, vlog: Option<&Arc<VLog>>) -> Result<Value> {
 		if self.is_value_pointer() {
 			if let Some(vlog) = vlog {
@@ -1793,6 +1888,18 @@ impl VLog {
 		self.opts.block_cache.insert_vlog(cache_id, pointer.offset, value_bytes.clone());
 
 		Ok(value_bytes)
+	}
+
+	/// Retrieves a value using a ValuePointer into `out`, reusing `out`'s capacity on cache hits.
+	pub(crate) fn get_into(&self, pointer: &ValuePointer, out: &mut Vec<u8>) -> Result<()> {
+		let cache_id = self.cache_id(pointer.file_id);
+		if self.opts.block_cache.get_vlog_into(cache_id, pointer.offset, out) {
+			return Ok(());
+		}
+		let value = self.get(pointer)?;
+		out.clear();
+		out.extend_from_slice(&value);
+		Ok(())
 	}
 
 	/// Reads the value of a sealed entry. What is read is checked against the pointer's CRC-32 and

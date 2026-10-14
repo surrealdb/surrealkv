@@ -604,6 +604,15 @@ impl<'a> IndexIterator<'a> {
 		Ok(handle)
 	}
 
+	fn bind_partition_block(&mut self, block: &Block) -> Result<&mut BlockIterator> {
+		if let Some(ref mut iter) = self.partition_iter {
+			iter.reset_with_block(block, None)?;
+		} else {
+			self.partition_iter = Some(block.iter()?);
+		}
+		Ok(self.partition_iter.as_mut().unwrap())
+	}
+
 	/// Seeks to the first entry across all partitions.
 	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
 		if self.index.blocks.is_empty() {
@@ -618,9 +627,7 @@ impl<'a> IndexIterator<'a> {
 		// Load first partition
 		self.partition_index = 0;
 		let block = self.index.load_block(&self.index.blocks[0])?;
-		let mut iter = block.iter()?;
-		iter.seek_to_first()?;
-		self.partition_iter = Some(iter);
+		self.bind_partition_block(&block)?.seek_to_first()?;
 
 		// Handle empty first partition
 		if !self.valid() {
@@ -643,9 +650,7 @@ impl<'a> IndexIterator<'a> {
 		// Load last partition
 		self.partition_index = self.index.blocks.len() - 1;
 		let block = self.index.load_block(&self.index.blocks[self.partition_index])?;
-		let mut iter = block.iter()?;
-		iter.seek_to_last()?;
-		self.partition_iter = Some(iter);
+		self.bind_partition_block(&block)?.seek_to_last()?;
 
 		// Handle empty last partition
 		if !self.valid() {
@@ -694,11 +699,9 @@ impl<'a> IndexIterator<'a> {
 			Some((idx, block_handle)) => {
 				self.partition_index = idx;
 				let block = self.index.load_block(block_handle)?;
-				let mut iter = block.iter()?;
 
 				// Seek within partition
-				iter.seek_internal(target)?;
-				self.partition_iter = Some(iter);
+				self.bind_partition_block(&block)?.seek_internal(target)?;
 
 				// If past end of this partition, move to next
 				// This handles the "gap" case where target is between
@@ -709,7 +712,9 @@ impl<'a> IndexIterator<'a> {
 			}
 			None => {
 				// Target is beyond all partitions
-				self.partition_iter = None;
+				if let Some(ref mut iter) = self.partition_iter {
+					iter.reset();
+				}
 			}
 		}
 		Ok(())
@@ -740,15 +745,15 @@ impl<'a> IndexIterator<'a> {
 
 			// Check if we've exhausted all partitions
 			if self.partition_index >= self.index.blocks.len() {
-				self.partition_iter = None;
+				if let Some(ref mut iter) = self.partition_iter {
+					iter.reset();
+				}
 				return Ok(false);
 			}
 
 			// Load next partition and position at start
 			let block = self.index.load_block(&self.index.blocks[self.partition_index])?;
-			let mut iter = block.iter()?;
-			iter.seek_to_first()?;
-			self.partition_iter = Some(iter);
+			self.bind_partition_block(&block)?.seek_to_first()?;
 
 			if self.valid() {
 				return Ok(true);
@@ -769,16 +774,16 @@ impl<'a> IndexIterator<'a> {
 		// Current partition exhausted going backward, move to previous
 		loop {
 			if self.partition_index == 0 {
-				self.partition_iter = None;
+				if let Some(ref mut iter) = self.partition_iter {
+					iter.reset();
+				}
 				return Ok(false);
 			}
 			self.partition_index -= 1;
 
 			// Load previous partition and position at end
 			let block = self.index.load_block(&self.index.blocks[self.partition_index])?;
-			let mut iter = block.iter()?;
-			iter.seek_to_last()?;
-			self.partition_iter = Some(iter);
+			self.bind_partition_block(&block)?.seek_to_last()?;
 
 			if self.valid() {
 				return Ok(true);
