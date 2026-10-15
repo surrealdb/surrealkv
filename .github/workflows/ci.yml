@@ -97,7 +97,14 @@ jobs:
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-  
+
+      # Nothing outside src/rt.rs may call a clock, a timer, a spawner or a thread that panics or
+      # hangs in a browser. The self-test checks that the guard still refuses what it should.
+      - name: Runtime shim guard
+        run: |
+          scripts/check-rt-guard.sh --self-test
+          scripts/check-rt-guard.sh
+
   # Encryption is on by default, so the normal jobs cover it. Build and test without it here, to
   # keep the guard that rejects a key manager from rotting.
   no-encryption:
@@ -216,6 +223,24 @@ jobs:
           # accept `--test`, and the browser step failed before it ran any test.
           version: v0.15.0
 
+      # The browser tests link the whole engine, zstd's C code included. That is compiled by
+      # clang, and archived by the archiver of the target: GNU `ar` and Apple's write no symbol
+      # index for WebAssembly objects (an archive without members on macOS), and rust-lld then
+      # reports every zstd symbol as undefined. Both must be LLVM's, and the job stops here with a
+      # clear message if the runner does not have them. (Unverified on ubuntu-latest: the
+      # versioned names are a guess at what the image has.)
+      - name: Select the C toolchain for wasm32
+        if: matrix.runtime == 'browser'
+        run: |
+          CLANG=$(command -v clang || ls /usr/bin/clang-[0-9]* 2>/dev/null | sort -V | tail -n 1)
+          LLVM_AR=$(command -v llvm-ar || ls /usr/bin/llvm-ar-[0-9]* 2>/dev/null | sort -V | tail -n 1)
+          if [ ! -x "$CLANG" ] || [ ! -x "$LLVM_AR" ]; then
+            echo "clang and llvm-ar are needed to link zstd for wasm32, and this runner has none" >&2
+            exit 1
+          fi
+          echo "CC_wasm32_unknown_unknown=$CLANG" >> "$GITHUB_ENV"
+          echo "AR_wasm32_unknown_unknown=$LLVM_AR" >> "$GITHUB_ENV"
+
       - name: Run WASM tests in Browser (Headless Chrome)
         if: matrix.runtime == 'browser'
         run: |
@@ -228,6 +253,10 @@ jobs:
             echo "Running $name"
             WASM_BINDGEN_TEST_TIMEOUT=120 WASM_BINDGEN_USE_DEDICATED_WORKER=1 wasm-pack test --headless --chrome --test "$name"
           done
+          # The unit tests that need a browser: the runtime shim, the clock and the error handler
+          # (src/rt.rs, src/wasm_tests.rs), which are not reachable from tests/. This links the
+          # whole engine, zstd's C code included.
+          WASM_BINDGEN_TEST_TIMEOUT=300 WASM_BINDGEN_USE_DEDICATED_WORKER=1 wasm-pack test --headless --chrome -- --lib
           wasm-pack test --headless --chrome crates/surrealkv-compat-indxdb
 
       - name: Run WASM tests in Node.js

@@ -16,16 +16,33 @@ pub struct HardwareProfile {
 impl HardwareProfile {
 	/// Detects the host hardware configuration.
 	pub fn detect() -> Self {
-		let cpu_cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(1);
+		let cpu_cores = Self::detect_cpu_cores();
 
 		// Heuristic default RAM estimation if OS memory query is unavailable:
 		// Assume at least 4GB or 1GB per core
+		#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 		let total_ram_bytes = ((cpu_cores as u64) * 1024 * 1024 * 1024).max(4 * 1024 * 1024 * 1024);
+		// A browser tab does not have it: a worker is one thread, in an address space of at most
+		// 4 GiB that the page and every other tab share a budget of. Plan for half a gigabyte.
+		#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+		let total_ram_bytes = 512 * 1024 * 1024;
 
 		Self {
 			cpu_cores,
 			total_ram_bytes,
 		}
+	}
+
+	/// The number of cores, which is 4 when the OS does not say.
+	#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+	fn detect_cpu_cores() -> usize {
+		std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).max(1)
+	}
+
+	/// A browser worker is one thread, and its core count is not asked.
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	fn detect_cpu_cores() -> usize {
+		1
 	}
 
 	/// Calculates optimal auto-tuned SurrealKV options for this hardware.

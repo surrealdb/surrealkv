@@ -4,7 +4,6 @@ use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crc32fast::Hasher;
 use iter::LevelManifestIterator;
@@ -22,7 +21,7 @@ use crate::tde::{
 };
 use crate::vfs::File;
 use crate::wal::list_segment_ids;
-use crate::{Options, Result};
+use crate::{rt, Options, Result};
 
 /// Makes the key that the table `table_id`, whose file is `file`, was sealed under available from
 /// the key manager, which may wait on a provider, and which a database that has only ever used the
@@ -1076,7 +1075,7 @@ pub(crate) fn replace_file_content<P: AsRef<Path>>(file_path: P, new_content: &[
 		.ok_or(std::io::Error::new(std::io::ErrorKind::NotFound, "Parent directory not found"))?;
 
 	// Generate a unique temporary filename
-	let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
+	let timestamp = rt::now_unix_ns();
 	let temp_filename = format!(".tmp_{}_{}", timestamp, rand::rng().random::<u64>());
 	let temp_path = directory.join(temp_filename);
 

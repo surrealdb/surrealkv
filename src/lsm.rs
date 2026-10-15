@@ -35,6 +35,7 @@ use crate::wal::recovery::{
 };
 use crate::wal::{self, cleanup_old_segments_for, list_segment_ids, Wal, WalManager};
 use crate::{
+	rt,
 	Comparator,
 	Error,
 	FilterPolicy,
@@ -1641,7 +1642,7 @@ pub(crate) struct Core {
 	pub(crate) write_stall: Arc<crate::stall::WriteStallController>,
 
 	/// Handle to the background flusher task
-	pub(crate) flusher_handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
+	pub(crate) flusher_handle: Mutex<Option<rt::JoinHandle<()>>>,
 
 	/// Atomic flag indicating if the core has been closed
 	pub(crate) is_closed: AtomicBool,
@@ -2176,9 +2177,10 @@ impl Core {
 		Ok(())
 	}
 
-	/// Test-only: ends the flusher and the background tasks the way a crash does, so that a tree
-	/// a test abandons does not stay alive until the runtime is dropped.
-	#[cfg(all(test, not(target_arch = "wasm32")))]
+	/// Ends the flusher and the background tasks the way a crash does, without waiting for them:
+	/// a tree that is abandoned, or that a test abandons, does not stay alive until the runtime is
+	/// dropped. Nothing outside the tests calls this yet: `Tree::abandon` will.
+	#[allow(dead_code)]
 	pub(crate) fn abort_background_tasks(&self) {
 		if let Some(handle) = self.flusher_handle.lock().unwrap().take() {
 			handle.abort();
@@ -2929,15 +2931,14 @@ impl Drop for Tree {
 		{
 			// Only attempt async shutdown if the core is not already closed
 			if !self.core.is_closed.load(Ordering::SeqCst) {
-				if let Ok(handle) = tokio::runtime::Handle::try_current() {
-					// Clone the Arc to move into the async task
-					let core = Arc::clone(&self.core);
-					handle.spawn(async move {
-						if let Err(err) = core.close().await {
-							tracing::error!("Error closing store: {}", err);
-						}
-					});
-				} else {
+				// Clone the Arc to move into the async task
+				let core = Arc::clone(&self.core);
+				let spawned = rt::try_spawn(async move {
+					if let Err(err) = core.close().await {
+						tracing::error!("Error closing store: {}", err);
+					}
+				});
+				if !spawned {
 					tracing::warn!("No runtime available for closing the store correctly");
 				}
 			}

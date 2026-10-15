@@ -3,14 +3,13 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{EncryptionError, Error, Result};
 use crate::levels::{check_manifest_mode, LevelManifest};
 use crate::lsm::{fsync_directory, CoreInner};
 use crate::tde::EncryptionContext;
 use crate::vlog::sealed;
-use crate::Options;
+use crate::{rt, Options};
 
 /// Recursively copies a directory and all its contents
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -710,7 +709,7 @@ impl DatabaseCheckpoint {
 		fsync_directory(checkpoint_path).map_err(|e| Error::Io(Arc::new(e)))?;
 
 		// Step 9: Create checkpoint metadata
-		let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+		let timestamp = rt::now_unix_ns() / 1_000_000_000;
 
 		let metadata = CheckpointMetadata::new(
 			timestamp,

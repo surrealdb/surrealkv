@@ -1,10 +1,11 @@
 use std::cmp::Reverse;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Instant;
 use std::{fmt, io};
 
 use parking_lot::RwLock;
+
+use crate::rt::Instant;
 
 /// Result returning Error
 pub type Result<T> = std::result::Result<T, Error>;

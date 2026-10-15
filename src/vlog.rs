@@ -66,10 +66,7 @@ impl VLogFileHeader {
 			magic: Self::MAGIC,
 			version: VLOG_FORMAT_VERSION,
 			file_id,
-			created_at: std::time::SystemTime::now()
-				.duration_since(std::time::UNIX_EPOCH)
-				.unwrap()
-				.as_millis() as u64,
+			created_at: crate::rt::now_unix_ns() / 1_000_000,
 			max_file_size,
 			compression,
 			reserved: 0,

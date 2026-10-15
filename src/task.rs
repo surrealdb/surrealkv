@@ -10,7 +10,7 @@ use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, ErrorSeverity};
 use crate::lsm::CompactionOperations;
 use crate::stall::WriteStallController;
-use crate::{Error, Options};
+use crate::{rt, Error, Options};
 
 /// The wait before a failed memtable flush is run again; it doubles with every failure. The
 /// commit pipeline spaces out the replacements of a failed WAL segment the same way.
@@ -41,7 +41,7 @@ pub(crate) struct TaskManager {
 	level_running: Arc<AtomicBool>,
 
 	/// Task handles for cleanup
-	task_handles: Mutex<Option<Vec<tokio::task::JoinHandle<()>>>>,
+	task_handles: Mutex<Option<Vec<rt::JoinHandle<()>>>>,
 }
 
 impl fmt::Debug for TaskManager {
@@ -75,7 +75,7 @@ impl TaskManager {
 			let level_notify = Arc::clone(&level_notify);
 			let write_stall = Arc::clone(&write_stall);
 
-			let handle = tokio::spawn(async move {
+			let handle = rt::spawn(async move {
 				let error_handler = core.error_handler();
 				'task: loop {
 					// Wait for notification
@@ -142,7 +142,7 @@ impl TaskManager {
 										);
 									}
 								}
-								let _ = tokio::time::timeout(retry_wait, notify.notified()).await;
+								let _ = rt::timeout(retry_wait, notify.notified()).await;
 								if stop_flag.load(Ordering::SeqCst) {
 									running.store(false, Ordering::SeqCst);
 									break 'task;
@@ -177,7 +177,7 @@ impl TaskManager {
 			let running = Arc::clone(&level_running);
 			let write_stall = Arc::clone(&write_stall);
 
-			let handle = tokio::spawn(async move {
+			let handle = rt::spawn(async move {
 				'task: loop {
 					// Wait for notification
 					notify.notified().await;
@@ -227,7 +227,7 @@ impl TaskManager {
 										"The keys could not be prepared again: {prepare_error:?}"
 									);
 								}
-								let _ = tokio::time::timeout(retry_wait, notify.notified()).await;
+								let _ = rt::timeout(retry_wait, notify.notified()).await;
 								if stop_flag.load(Ordering::SeqCst) {
 									running.store(false, Ordering::SeqCst);
 									break 'task;
@@ -266,9 +266,10 @@ impl TaskManager {
 		}
 	}
 
-	/// Test-only: ends the background tasks without waiting for them, the way a crash does, so
-	/// that a tree a test abandons does not stay alive until the runtime is dropped.
-	#[cfg(all(test, not(target_arch = "wasm32")))]
+	/// Ends the background tasks without waiting for them, the way a crash does, so that a tree
+	/// that is abandoned does not stay alive until the runtime is dropped. Nothing outside the
+	/// tests calls this yet: `Tree::abandon` will.
+	#[allow(dead_code)]
 	pub(crate) fn abort(&self) {
 		self.stop_flag.store(true, Ordering::SeqCst);
 		if let Some(handles) = self.task_handles.lock().unwrap().take() {
@@ -292,7 +293,7 @@ impl TaskManager {
 			|| self.level_running.load(Ordering::Acquire)
 		{
 			// Yield to other tasks and wait a short time before checking again
-			tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+			rt::sleep(Duration::from_millis(50)).await;
 		}
 
 		// Now it's safe to wait for all tasks to complete

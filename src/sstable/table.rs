@@ -74,7 +74,6 @@ use std::cmp::Ordering;
 use std::io::Write;
 use std::ops::Bound;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use snap::raw::max_compress_len;
 
@@ -676,16 +675,7 @@ impl<W: Write> TableWriter<W> {
 	/// Finalizes the SSTable by writing all remaining blocks and the footer.
 	pub(crate) fn finish(mut self) -> Result<usize> {
 		// Set creation timestamp
-		self.meta.properties.created_at = SystemTime::now()
-			.duration_since(UNIX_EPOCH)
-			.map_err(|e| {
-				let err = Error::from(SSTableError::FailedToGetSystemTime {
-					source: e.to_string(),
-				});
-				tracing::error!("[TABLE_WRITER] {}", err);
-				err
-			})?
-			.as_nanos();
+		self.meta.properties.created_at = u128::from(crate::rt::now_unix_ns());
 
 		self.meta.properties.seqnos =
 			(self.meta.smallest_seq_num.unwrap_or(0), self.meta.largest_seq_num.unwrap_or(0));

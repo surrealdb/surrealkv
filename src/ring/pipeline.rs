@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, Notify, OwnedSemaphorePermit, Semaphore};
@@ -14,6 +14,7 @@ use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::lsm::CoreInner;
 use crate::memtable::MemTable;
+use crate::rt::{self, Instant};
 use crate::stall::WriteStallController;
 use crate::storage::{AffinityLogStore, LogStore};
 use crate::task::{TaskManager, FLUSH_RETRY_MAX, FLUSH_RETRY_MIN};
@@ -782,14 +783,14 @@ impl CommitPipeline {
 	}
 
 	/// Starts the background flusher task.
-	pub(crate) fn start_flusher(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+	pub(crate) fn start_flusher(self: &Arc<Self>) -> rt::JoinHandle<()> {
 		let pipeline = Arc::clone(self);
 		// The flusher's position is read here, not when the task is first polled. A commit that
 		// fails before then has its entry aborted, and its own guard advances the completed
 		// prefix over it. A flusher that started past that entry would never take its permit,
 		// and `close` waits for every permit.
 		let drained = self.ring.completed();
-		tokio::spawn(async move {
+		rt::spawn(async move {
 			pipeline.run_flusher(drained).await;
 		})
 	}
@@ -1081,12 +1082,12 @@ impl CommitPipeline {
 						retired_pending = self.free_retired(&mut scratch.retired, BUSY_FREE_SLOTS);
 						busy_steps += 1;
 						if busy_steps % BUSY_STEPS_PER_YIELD == 0 {
-							tokio::task::yield_now().await;
+							rt::yield_now().await;
 						}
 					} else {
 						retired_pending =
 							self.free_retired(&mut scratch.retired, retired_slots_per_step(0));
-						tokio::task::yield_now().await;
+						rt::yield_now().await;
 					}
 					continue;
 				}
@@ -1694,7 +1695,7 @@ impl CommitPipeline {
 		}
 		let inner = Arc::clone(&self.inner);
 		let current = Arc::clone(&self.restore_epoch);
-		let dropped = affinitypool::spawn(move || {
+		let dropped = rt::run_blocking(move || {
 			inner.drop_unapplied_group(below, || current.load(Ordering::SeqCst) == epoch)
 		})
 		.await;
@@ -1747,7 +1748,7 @@ impl CommitPipeline {
 
 		if !self.inner.try_release_wal_hold()? {
 			let inner = Arc::clone(&self.inner);
-			let flushed = affinitypool::spawn(move || inner.flush_all_immutables_sync()).await;
+			let flushed = rt::run_blocking(move || inner.flush_all_immutables_sync()).await;
 			if let Err(e) = flushed {
 				if let Some(ref tm) = self.task_manager {
 					tm.wake_up_memtable();
