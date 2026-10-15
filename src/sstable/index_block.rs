@@ -572,8 +572,7 @@ pub(crate) struct IndexIterator<'a> {
 	/// Current partition block index in index.blocks[]
 	partition_index: usize,
 
-	/// Iterator within the current partition block
-	/// None if not yet positioned or exhausted
+	/// Iterator within the current partition block (reused across partitions)
 	partition_iter: Option<BlockIterator>,
 }
 
@@ -604,6 +603,15 @@ impl<'a> IndexIterator<'a> {
 		Ok(handle)
 	}
 
+	fn bind_partition_block(&mut self, block: &Block) -> Result<&mut BlockIterator> {
+		if let Some(ref mut iter) = self.partition_iter {
+			iter.reset_with_block(block, None)?;
+		} else {
+			self.partition_iter = Some(block.iter()?);
+		}
+		Ok(self.partition_iter.as_mut().unwrap())
+	}
+
 	/// Seeks to the first entry across all partitions.
 	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
 		if self.index.blocks.is_empty() {
@@ -618,13 +626,11 @@ impl<'a> IndexIterator<'a> {
 		// Load first partition
 		self.partition_index = 0;
 		let block = self.index.load_block(&self.index.blocks[0])?;
-		let mut iter = block.iter()?;
-		iter.seek_to_first()?;
-		self.partition_iter = Some(iter);
+		self.bind_partition_block(&block)?.seek_to_first()?;
 
 		// Handle empty first partition
 		if !self.valid() {
-			self.next()?;
+			self.advance_to_next_partition()?;
 		}
 		Ok(())
 	}
@@ -643,13 +649,11 @@ impl<'a> IndexIterator<'a> {
 		// Load last partition
 		self.partition_index = self.index.blocks.len() - 1;
 		let block = self.index.load_block(&self.index.blocks[self.partition_index])?;
-		let mut iter = block.iter()?;
-		iter.seek_to_last()?;
-		self.partition_iter = Some(iter);
+		self.bind_partition_block(&block)?.seek_to_last()?;
 
 		// Handle empty last partition
 		if !self.valid() {
-			self.prev()?;
+			self.retreat_to_prev_partition()?;
 		}
 		Ok(())
 	}
@@ -694,22 +698,23 @@ impl<'a> IndexIterator<'a> {
 			Some((idx, block_handle)) => {
 				self.partition_index = idx;
 				let block = self.index.load_block(block_handle)?;
-				let mut iter = block.iter()?;
 
 				// Seek within partition
-				iter.seek_internal(target)?;
-				self.partition_iter = Some(iter);
+				self.bind_partition_block(&block)?.seek_internal(target)?;
 
 				// If past end of this partition, move to next
 				// This handles the "gap" case where target is between
 				// this partition's actual entries and its separator
 				if !self.valid() {
-					self.next()?;
+					self.advance_to_next_partition()?;
 				}
 			}
 			None => {
 				// Target is beyond all partitions
-				self.partition_iter = None;
+				self.partition_index = self.index.blocks.len();
+				if let Some(ref mut iter) = self.partition_iter {
+					iter.reset();
+				}
 			}
 		}
 		Ok(())
@@ -727,6 +732,10 @@ impl<'a> IndexIterator<'a> {
 	///    c. Repeat if that partition is also empty
 	/// ```
 	pub(crate) fn next(&mut self) -> Result<bool> {
+		if !self.valid() {
+			return Ok(false);
+		}
+
 		// Try advancing within current partition
 		if let Some(ref mut iter) = self.partition_iter {
 			if iter.advance()? {
@@ -734,21 +743,25 @@ impl<'a> IndexIterator<'a> {
 			}
 		}
 
+		self.advance_to_next_partition()
+	}
+
+	fn advance_to_next_partition(&mut self) -> Result<bool> {
 		// Current partition exhausted, move to next
 		loop {
-			self.partition_index += 1;
+			self.partition_index = self.partition_index.saturating_add(1);
 
 			// Check if we've exhausted all partitions
 			if self.partition_index >= self.index.blocks.len() {
-				self.partition_iter = None;
+				if let Some(ref mut iter) = self.partition_iter {
+					iter.reset();
+				}
 				return Ok(false);
 			}
 
 			// Load next partition and position at start
 			let block = self.index.load_block(&self.index.blocks[self.partition_index])?;
-			let mut iter = block.iter()?;
-			iter.seek_to_first()?;
-			self.partition_iter = Some(iter);
+			self.bind_partition_block(&block)?.seek_to_first()?;
 
 			if self.valid() {
 				return Ok(true);
@@ -759,6 +772,10 @@ impl<'a> IndexIterator<'a> {
 
 	/// Moves to the previous entry, crossing partition boundaries if needed.
 	pub(crate) fn prev(&mut self) -> Result<bool> {
+		if !self.valid() {
+			return Ok(false);
+		}
+
 		// Try retreating within current partition
 		if let Some(ref mut iter) = self.partition_iter {
 			if iter.prev_internal()? {
@@ -766,19 +783,23 @@ impl<'a> IndexIterator<'a> {
 			}
 		}
 
+		self.retreat_to_prev_partition()
+	}
+
+	fn retreat_to_prev_partition(&mut self) -> Result<bool> {
 		// Current partition exhausted going backward, move to previous
 		loop {
 			if self.partition_index == 0 {
-				self.partition_iter = None;
+				if let Some(ref mut iter) = self.partition_iter {
+					iter.reset();
+				}
 				return Ok(false);
 			}
 			self.partition_index -= 1;
 
 			// Load previous partition and position at end
 			let block = self.index.load_block(&self.index.blocks[self.partition_index])?;
-			let mut iter = block.iter()?;
-			iter.seek_to_last()?;
-			self.partition_iter = Some(iter);
+			self.bind_partition_block(&block)?.seek_to_last()?;
 
 			if self.valid() {
 				return Ok(true);

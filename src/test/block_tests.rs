@@ -784,3 +784,50 @@ fn test_prev_at_first_entry() {
 	assert!(!result, "prev() at first entry should return false");
 	assert!(!iter.valid(), "Iterator should be invalid after prev() at first entry");
 }
+
+#[test]
+fn test_block_iterator_reset_clears_entry_offset() {
+	let o = make_opts(Some(2));
+	let mut builder = BlockWriter::new(
+		o.block_size,
+		o.block_restart_interval,
+		Arc::clone(&o.internal_comparator),
+	);
+
+	for i in 0..5 {
+		let key = InternalKey::new(format!("key_{:02}", i).into_bytes(), 1, InternalKeyKind::Set);
+		builder.add(&key.encode(), b"value").unwrap();
+	}
+
+	let block = Block::new(builder.finish().unwrap(), Arc::clone(&o.internal_comparator));
+	let mut iter = block.iter().unwrap();
+
+	iter.seek_to_last().unwrap();
+	assert!(iter.valid());
+
+	iter.reset();
+	assert!(!iter.valid());
+	assert!(!iter.prev_internal().unwrap(), "prev_internal after reset must return false");
+	assert!(!iter.valid());
+}
+
+#[test]
+fn test_seek_with_buf_corrupt_restart_offset_returns_err() {
+	let o = make_opts(Some(2));
+	// Craft a block with 2 restart points where restart[1] points beyond block.len()
+	let mut raw = vec![0u8; 12];
+	// restart[0] = 0
+	raw[0..4].copy_from_slice(&0u32.to_le_bytes());
+	// restart[1] = 9999 (out of bounds)
+	raw[4..8].copy_from_slice(&9999u32.to_le_bytes());
+	// num_restarts = 2
+	raw[8..12].copy_from_slice(&2u32.to_le_bytes());
+
+	let block = Block::new(raw, Arc::clone(&o.internal_comparator));
+	let target = InternalKey::new(b"key".to_vec(), 1, InternalKeyKind::Set).encode();
+	let mut key_buf = crate::sstable::block::SmallKeyBuf::new();
+
+	assert!(block.seek_with_buf(&target, &mut key_buf).is_err());
+	let mut iter = block.iter().unwrap();
+	assert!(iter.seek(&target).is_err());
+}

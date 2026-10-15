@@ -189,10 +189,87 @@ impl BlockHandle {
 ///     println!("Found: {:?} = {:?}", iter.key(), iter.value());
 /// }
 /// ```
+/// Stack-first buffer for encoding or reconstructing internal keys on the read path
+/// without heap allocation for keys up to 256 bytes.
+pub(crate) struct SmallKeyBuf {
+	stack: [u8; 256],
+	len: usize,
+	heap: Vec<u8>,
+}
+
+impl SmallKeyBuf {
+	#[inline]
+	pub(crate) fn new() -> Self {
+		Self {
+			stack: [0u8; 256],
+			len: 0,
+			heap: Vec::new(),
+		}
+	}
+
+	/// Encodes `(user_key, seq_num, kind)` into a `SmallKeyBuf`.
+	#[inline]
+	pub(crate) fn from_internal_parts(
+		user_key: &[u8],
+		seq_num: u64,
+		kind: crate::InternalKeyKind,
+	) -> Self {
+		let mut buf = Self::new();
+		let trailer = ((seq_num << 8) | kind as u64).to_be_bytes();
+		let total = user_key.len() + 8;
+		if total <= buf.stack.len() {
+			buf.stack[..user_key.len()].copy_from_slice(user_key);
+			buf.stack[user_key.len()..total].copy_from_slice(&trailer);
+			buf.len = total;
+		} else {
+			buf.heap.reserve_exact(total);
+			buf.heap.extend_from_slice(user_key);
+			buf.heap.extend_from_slice(&trailer);
+			buf.len = total;
+		}
+		buf
+	}
+
+	#[inline]
+	pub(crate) fn clear(&mut self) {
+		self.len = 0;
+		self.heap.clear();
+	}
+
+	#[inline]
+	pub(crate) fn as_slice(&self) -> &[u8] {
+		if !self.heap.is_empty() {
+			&self.heap
+		} else {
+			&self.stack[..self.len]
+		}
+	}
+
+	/// Truncates the buffer to `shared` bytes (like `Vec::truncate`) and appends `suffix`.
+	#[inline]
+	pub(crate) fn truncate_and_extend(&mut self, shared: usize, suffix: &[u8]) {
+		let kept = shared.min(self.len);
+		let new_len = kept + suffix.len();
+		if !self.heap.is_empty() {
+			self.heap.truncate(kept);
+			self.heap.extend_from_slice(suffix);
+			self.len = self.heap.len();
+		} else if new_len <= self.stack.len() {
+			self.stack[kept..new_len].copy_from_slice(suffix);
+			self.len = new_len;
+		} else {
+			self.heap.reserve(new_len);
+			self.heap.extend_from_slice(&self.stack[..kept]);
+			self.heap.extend_from_slice(suffix);
+			self.len = new_len;
+		}
+	}
+}
+
 #[derive(Clone)]
 pub(crate) struct Block {
 	/// Raw block data
-	pub(crate) block: BlockData,
+	pub(crate) block: Arc<BlockData>,
 	/// Comparator for key ordering
 	comparator: Arc<dyn Comparator>,
 }
@@ -206,18 +283,120 @@ impl Block {
 	pub(crate) fn new(data: BlockData, comparator: Arc<dyn Comparator>) -> Block {
 		assert!(data.len() > 4);
 		Block {
-			block: data,
+			block: Arc::new(data),
 			comparator,
 		}
 	}
 
 	/// Creates an iterator over this block.
 	pub(crate) fn iter(&self) -> Result<BlockIterator> {
-		BlockIterator::new(Arc::clone(&self.comparator), self.block.clone())
+		BlockIterator::new(Arc::clone(&self.comparator), Arc::clone(&self.block))
 	}
 
 	pub(crate) fn size(&self) -> usize {
 		self.block.len()
+	}
+
+	/// Finds the first entry in this block with `key >= target`, reconstructing keys into
+	/// `key_buf` and returning `(encoded_key, value_bytes)` without allocating a `BlockIterator`.
+	pub(crate) fn seek_with_buf<'a, 'b>(
+		&'a self,
+		target: &[u8],
+		key_buf: &'b mut SmallKeyBuf,
+	) -> Result<Option<(&'b [u8], &'a [u8])>> {
+		key_buf.clear();
+		let block = self.block.as_slice();
+		let (num_restarts, restart_offset) = BlockIterator::parse_restarts(block)?;
+		if num_restarts == 0 {
+			let err = Error::from(SSTableError::EmptyCorruptBlockSeek {
+				block_size: block.len(),
+				restart_offset,
+			});
+			tracing::error!("[BLOCK] {}", err);
+			return Err(err);
+		}
+
+		let get_restart = |index: usize| -> usize {
+			let start = restart_offset + (index * 4);
+			u32::from_le_bytes(block[start..start + 4].try_into().unwrap()) as usize
+		};
+
+		let mut left = 0;
+		let mut right = num_restarts - 1;
+		while left < right {
+			let mid = (left + right).div_ceil(2);
+			let offset = get_restart(mid);
+			let (shared_prefix, non_shared_key, _, i) =
+				BlockIterator::decode_entry_lengths_from(block, offset)?;
+			let key_start = offset.checked_add(i).ok_or_else(|| {
+				Error::from(SSTableError::IntegerOverflowKeyEnd {
+					offset,
+				})
+			})?;
+			let key_end = key_start
+				.checked_add(shared_prefix)
+				.and_then(|sum| sum.checked_add(non_shared_key))
+				.ok_or_else(|| {
+					Error::from(SSTableError::IntegerOverflowKeyEnd {
+						offset,
+					})
+				})?;
+			if key_end > block.len() {
+				let err = Error::from(SSTableError::KeyExtendsBeyondBounds {
+					offset,
+					key_end,
+					block_len: block.len(),
+				});
+				tracing::error!("[BLOCK] {}", err);
+				return Err(err);
+			}
+			let current_key = &block[key_start..key_end];
+			match self.comparator.compare(current_key, target) {
+				Ordering::Less => left = mid,
+				_ => right = mid - 1,
+			}
+		}
+
+		let mut offset = get_restart(left);
+		while offset < restart_offset {
+			let (shared_prefix, non_shared_key, value_size, i) =
+				BlockIterator::decode_entry_lengths_from(block, offset)?;
+			let key_end = offset
+				.checked_add(i)
+				.and_then(|sum| sum.checked_add(non_shared_key))
+				.ok_or_else(|| {
+					Error::from(SSTableError::IntegerOverflowKeyEnd {
+						offset,
+					})
+				})?;
+			let value_end = key_end.checked_add(value_size).ok_or_else(|| {
+				Error::from(SSTableError::IntegerOverflowValueEnd {
+					offset,
+				})
+			})?;
+			if key_end > restart_offset || value_end > restart_offset {
+				let err = Error::from(SSTableError::DecodedLengthsExceedBounds {
+					offset,
+					i,
+					non_shared_key,
+					value_size,
+					key_end,
+					value_end,
+					restart_offset,
+				});
+				tracing::error!("[BLOCK] {}", err);
+				return Err(err);
+			}
+
+			key_buf.truncate_and_extend(shared_prefix, &block[offset + i..key_end]);
+			if self.comparator.compare(key_buf.as_slice(), target) != Ordering::Less {
+				return Ok(Some((key_buf.as_slice(), &block[key_end..value_end])));
+			}
+			offset = value_end;
+		}
+
+		key_buf.clear();
+		Ok(None)
 	}
 }
 
@@ -528,9 +707,9 @@ impl BlockWriter {
 /// ```
 pub(crate) struct BlockIterator {
 	/// Raw block data
-	block: BlockData,
-	/// Decoded restart point offsets
-	restart_points: Vec<u32>,
+	block: Arc<BlockData>,
+	/// Number of restart point offsets encoded at the tail of `block`
+	num_restarts: usize,
 	/// Current position in block
 	offset: usize,
 	/// Reconstructed current key
@@ -550,14 +729,7 @@ pub(crate) struct BlockIterator {
 }
 
 impl BlockIterator {
-	/// Creates a new iterator over a block.
-	///
-	/// ## Initialization
-	///
-	/// 1. Read number of restarts from last 4 bytes
-	/// 2. Calculate restart array offset
-	/// 3. Decode all restart point offsets
-	pub(crate) fn new(comparator: Arc<dyn Comparator>, block: BlockData) -> Result<Self> {
+	pub(crate) fn parse_restarts(block: &[u8]) -> Result<(usize, usize)> {
 		if block.len() < 4 {
 			let err = Error::from(SSTableError::BlockTooSmall {
 				size: block.len(),
@@ -583,32 +755,21 @@ impl BlockIterator {
 			})
 		})?;
 
-		// Decode all restart point offsets
-		let mut restart_points = vec![0; num_restarts];
-		for (i, restart_point) in restart_points.iter_mut().enumerate().take(num_restarts) {
-			let start_point = restart_offset + (i * 4);
-			let end_point = start_point + 4;
-			if end_point > block.len() {
-				let err = Error::from(SSTableError::RestartPointExceedsBounds {
-					index: i,
-					offset: start_point,
-					block_size: block.len(),
-				});
-				tracing::error!("[BLOCK] {}", err);
-				return Err(err);
-			}
-			*restart_point =
-				u32::from_le_bytes(block[start_point..end_point].try_into().map_err(|_| {
-					SSTableError::FailedToDecodeRestartPoint {
-						index: i,
-						offset: start_point,
-					}
-				})?);
-		}
+		Ok((num_restarts, restart_offset))
+	}
+
+	/// Creates a new iterator over a block.
+	///
+	/// ## Initialization
+	///
+	/// 1. Read number of restarts from last 4 bytes
+	/// 2. Calculate restart array offset
+	pub(crate) fn new(comparator: Arc<dyn Comparator>, block: Arc<BlockData>) -> Result<Self> {
+		let (num_restarts, restart_offset) = Self::parse_restarts(&block)?;
 
 		Ok(BlockIterator {
 			block,
-			restart_points,
+			num_restarts,
 			current_key: Vec::new(),
 			offset: 0,
 			current_entry_offset: 0,
@@ -620,48 +781,81 @@ impl BlockIterator {
 		})
 	}
 
+	/// Rebinds this iterator to `block`, reusing `current_key`'s heap capacity.
+	pub(crate) fn reset_with_block(
+		&mut self,
+		block: &Block,
+		comparator: Option<&Arc<dyn Comparator>>,
+	) -> Result<()> {
+		let (num_restarts, restart_offset) = Self::parse_restarts(&block.block)?;
+		self.block = Arc::clone(&block.block);
+		self.internal_cmp = match comparator {
+			Some(cmp) => Arc::clone(cmp),
+			None => Arc::clone(&block.comparator),
+		};
+		self.num_restarts = num_restarts;
+		self.restart_offset = restart_offset;
+		self.reset();
+		Ok(())
+	}
+
 	/// Gets a restart point offset by index.
+	#[inline]
 	fn get_restart_point(&self, index: usize) -> usize {
-		self.restart_points[index] as usize
+		let start = self.restart_offset + (index * 4);
+		u32::from_le_bytes(self.block[start..start + 4].try_into().unwrap()) as usize
 	}
 
 	/// Positions the iterator at a restart point.
 	fn seek_to_restart_point(&mut self, restart_index: usize) {
 		self.current_restart_index = restart_index;
-		let offset = self.restart_points[restart_index] as usize;
+		let offset = self.get_restart_point(restart_index);
 		self.offset = offset;
 		self.current_entry_offset = offset;
 	}
 
 	/// Decodes entry header: (shared, unshared, value_len, header_size).
-	fn decode_entry_lengths(&self, offset: usize) -> Result<(usize, usize, usize, usize)> {
+	#[inline]
+	pub(crate) fn decode_entry_lengths_from(
+		block: &[u8],
+		offset: usize,
+	) -> Result<(usize, usize, usize, usize)> {
+		let rest = block.get(offset..).ok_or_else(|| {
+			Error::from(SSTableError::FailedToDecodeSharedPrefix {
+				offset,
+			})
+		})?;
 		let mut i = 0;
 
-		let (shared_prefix_length, shared_prefix_length_size) =
-			decode_varint_usize(&self.block[offset..]).ok_or_else(|| {
+		let (shared_prefix_length, shared_prefix_length_size) = decode_varint_usize(rest)
+			.ok_or_else(|| {
 				Error::from(SSTableError::FailedToDecodeSharedPrefix {
 					offset,
 				})
 			})?;
 		i += shared_prefix_length_size;
 
-		let (non_shared_key_length, non_shared_key_length_size) =
-			decode_varint_usize(&self.block[offset + i..]).ok_or_else(|| {
-				Error::from(SSTableError::FailedToDecodeNonSharedKeyLength {
-					offset: offset + i,
-				})
-			})?;
+		let (non_shared_key_length, non_shared_key_length_size) = decode_varint_usize(&rest[i..])
+			.ok_or_else(|| {
+			Error::from(SSTableError::FailedToDecodeNonSharedKeyLength {
+				offset: offset + i,
+			})
+		})?;
 		i += non_shared_key_length_size;
 
-		let (value_size, value_size_size) = decode_varint_usize(&self.block[offset + i..])
-			.ok_or_else(|| {
-				Error::from(SSTableError::FailedToDecodeValueSize {
-					offset: offset + i,
-				})
-			})?;
+		let (value_size, value_size_size) = decode_varint_usize(&rest[i..]).ok_or_else(|| {
+			Error::from(SSTableError::FailedToDecodeValueSize {
+				offset: offset + i,
+			})
+		})?;
 		i += value_size_size;
 
 		Ok((shared_prefix_length, non_shared_key_length, value_size, i))
+	}
+
+	/// Decodes entry header: (shared, unshared, value_len, header_size).
+	fn decode_entry_lengths(&self, offset: usize) -> Result<(usize, usize, usize, usize)> {
+		Self::decode_entry_lengths_from(&self.block, offset)
 	}
 
 	/// Decodes current entry and advances offset to next entry.
@@ -739,6 +933,7 @@ impl BlockIterator {
 		self.current_key.clear();
 		self.current_value_offset_start = 0;
 		self.current_value_offset_end = 0;
+		self.current_entry_offset = 0;
 	}
 }
 
@@ -809,7 +1004,7 @@ impl BlockIterator {
 
 	/// Positions at the first entry.
 	pub(crate) fn seek_to_first(&mut self) -> Result<()> {
-		if self.restart_points.is_empty() {
+		if self.num_restarts == 0 {
 			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
 			tracing::error!("[BLOCK] {}", err);
 			return Err(err);
@@ -832,7 +1027,7 @@ impl BlockIterator {
 	/// 1. Go to last restart point
 	/// 2. Scan forward to find last entry before restart array
 	pub(crate) fn seek_to_last(&mut self) -> Result<()> {
-		if self.restart_points.is_empty() {
+		if self.num_restarts == 0 {
 			self.reset();
 			let err = Error::from(SSTableError::BlockHasNoRestartPoints);
 			tracing::error!("[BLOCK] {}", err);
@@ -840,7 +1035,7 @@ impl BlockIterator {
 		}
 
 		// Start from last restart point
-		self.seek_to_restart_point(self.restart_points.len() - 1);
+		self.seek_to_restart_point(self.num_restarts - 1);
 
 		// Scan to find the last entry
 		let mut last_entry_start = self.offset;
@@ -889,7 +1084,7 @@ impl BlockIterator {
 	pub(crate) fn seek_internal(&mut self, target: &[u8]) -> Result<Option<()>> {
 		self.reset();
 
-		if self.restart_points.is_empty() {
+		if self.num_restarts == 0 {
 			let err = Error::from(SSTableError::EmptyCorruptBlockSeek {
 				block_size: self.block.len(),
 				restart_offset: self.restart_offset,
@@ -900,7 +1095,7 @@ impl BlockIterator {
 
 		// Binary search on restart points
 		let mut left = 0;
-		let mut right = self.restart_points.len() - 1;
+		let mut right = self.num_restarts - 1;
 
 		while left < right {
 			let mid = (left + right).div_ceil(2);
@@ -908,8 +1103,19 @@ impl BlockIterator {
 
 			// Decode key at this restart point
 			let (shared_prefix, non_shared_key, _, i) = self.decode_entry_lengths(self.offset)?;
-			let key_start = self.offset + i;
-			let key_end = key_start + shared_prefix + non_shared_key;
+			let key_start = self.offset.checked_add(i).ok_or_else(|| {
+				Error::from(SSTableError::IntegerOverflowKeyEnd {
+					offset: self.offset,
+				})
+			})?;
+			let key_end = key_start
+				.checked_add(shared_prefix)
+				.and_then(|sum| sum.checked_add(non_shared_key))
+				.ok_or_else(|| {
+					Error::from(SSTableError::IntegerOverflowKeyEnd {
+						offset: self.offset,
+					})
+				})?;
 
 			if key_end > self.block.len() {
 				let err = Error::from(SSTableError::KeyExtendsBeyondBounds {
@@ -983,8 +1189,8 @@ impl BlockIterator {
 		// Find restart point before current position
 		while self.get_restart_point(self.current_restart_index) >= original {
 			if self.current_restart_index == 0 {
-				self.offset = self.restart_points[self.current_restart_index] as usize;
-				self.current_restart_index = self.restart_points.len();
+				self.offset = self.get_restart_point(self.current_restart_index);
+				self.current_restart_index = self.num_restarts;
 				return Ok(false);
 			}
 			self.current_restart_index -= 1

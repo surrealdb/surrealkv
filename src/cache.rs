@@ -248,6 +248,30 @@ impl BlockCache {
 		}
 	}
 
+	/// Copies a cached VLog value into `out`, reusing its capacity.
+	pub(crate) fn get_vlog_into(&self, id: u64, offset: u64, out: &mut Vec<u8>) -> bool {
+		let key = (KIND_VLOG, id, &offset);
+		let item = self.data.get(&key);
+
+		#[cfg(test)]
+		{
+			if item.is_some() {
+				self.vlog_hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			} else {
+				self.vlog_misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+			}
+		}
+
+		match item.as_ref() {
+			Some(Item::VLog(value)) => {
+				out.clear();
+				out.extend_from_slice(value);
+				true
+			}
+			_ => false,
+		}
+	}
+
 	#[cfg(test)]
 	/// Get cache statistics
 	pub(crate) fn get_stats(&self) -> CacheStats {

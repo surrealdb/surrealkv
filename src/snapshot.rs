@@ -10,6 +10,7 @@ use crate::iter::BoxedLSMIterator;
 use crate::levels::Levels;
 use crate::lsm::Core;
 use crate::memtable::MemTable;
+use crate::sstable::block::SmallKeyBuf;
 use crate::sstable::table::Table;
 use crate::vlog::ValueLocation;
 use crate::{
@@ -262,16 +263,17 @@ impl Snapshot {
 				}
 			}
 
-			if let Some(item) = active_lock.get(key, Some(self.seq_num)) {
-				if item.0.is_tombstone() {
+			if let Some((trailer, val)) = active_lock.get_raw(key, Some(self.seq_num)) {
+				if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 					return Ok(None);
 				}
+				let seq_num = crate::trailer_to_seq_num(trailer);
 				if let Some(rseq) = max_range_delete_seq {
-					if item.0.seq_num() <= rseq {
+					if seq_num <= rseq {
 						return Ok(None);
 					}
 				}
-				return Ok(Some((item.1, item.0.seq_num())));
+				return Ok(Some((val, seq_num)));
 			}
 		}
 
@@ -288,16 +290,17 @@ impl Snapshot {
 						}
 					}
 				}
-				if let Some(item) = memtable.get(key, Some(self.seq_num)) {
-					if item.0.is_tombstone() {
+				if let Some((trailer, val)) = memtable.get_raw(key, Some(self.seq_num)) {
+					if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 						return Ok(None);
 					}
+					let seq_num = crate::trailer_to_seq_num(trailer);
 					if let Some(rseq) = max_range_delete_seq {
-						if item.0.seq_num() <= rseq {
+						if seq_num <= rseq {
 							return Ok(None);
 						}
 					}
-					return Ok(Some((item.1, item.0.seq_num())));
+					return Ok(Some((val, seq_num)));
 				}
 			}
 		}
@@ -318,7 +321,7 @@ impl Snapshot {
 			}
 		}
 
-		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set);
+		let key_encoded = SmallKeyBuf::from_internal_parts(key, self.seq_num, InternalKeyKind::Set);
 
 		for (level_idx, level) in level_manifest.levels.get_levels().iter().enumerate() {
 			if level_idx == 0 {
@@ -329,38 +332,34 @@ impl Snapshot {
 						continue;
 					}
 
-					let maybe_item = table.get(&ikey)?;
-
-					if let Some(item) = maybe_item {
-						let ikey = &item.0;
-						if ikey.is_tombstone() {
+					if let Some((trailer, val)) = table.get_encoded(key, key_encoded.as_slice())? {
+						if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 							return Ok(None);
 						}
+						let seq_num = crate::trailer_to_seq_num(trailer);
 						if let Some(rseq) = max_range_delete_seq {
-							if ikey.seq_num() <= rseq {
+							if seq_num <= rseq {
 								return Ok(None);
 							}
 						}
-						return Ok(Some((item.1, ikey.seq_num())));
+						return Ok(Some((val, seq_num)));
 					}
 				}
 			} else {
 				// Level 1+: Non-overlapping, binary search for the one table with zero allocations
 				if let Some(table) = level.find_table_for_user_key(key, &self.core.opts.comparator)
 				{
-					let maybe_item = table.get(&ikey)?;
-
-					if let Some(item) = maybe_item {
-						let ikey = &item.0;
-						if ikey.is_tombstone() {
+					if let Some((trailer, val)) = table.get_encoded(key, key_encoded.as_slice())? {
+						if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 							return Ok(None);
 						}
+						let seq_num = crate::trailer_to_seq_num(trailer);
 						if let Some(rseq) = max_range_delete_seq {
-							if ikey.seq_num() <= rseq {
+							if seq_num <= rseq {
 								return Ok(None);
 							}
 						}
-						return Ok(Some((item.1, ikey.seq_num())));
+						return Ok(Some((val, seq_num)));
 					}
 				}
 			}
@@ -384,16 +383,17 @@ impl Snapshot {
 					}
 				}
 			}
-			if let Some(item) = active_lock.get(key, Some(self.seq_num)) {
-				if item.0.is_tombstone() {
+			if let Some((trailer, val)) = active_lock.get_raw(key, Some(self.seq_num)) {
+				if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 					return Ok(None);
 				}
+				let seq_num = crate::trailer_to_seq_num(trailer);
 				if let Some(rseq) = max_range_delete_seq {
-					if item.0.seq_num() <= rseq {
+					if seq_num <= rseq {
 						return Ok(None);
 					}
 				}
-				return Ok(Some((item.1, item.0.seq_num())));
+				return Ok(Some((val, seq_num)));
 			}
 		}
 
@@ -410,22 +410,22 @@ impl Snapshot {
 						}
 					}
 				}
-				if let Some(item) = memtable.get(key, Some(self.seq_num)) {
-					if item.0.is_tombstone() {
+				if let Some((trailer, val)) = memtable.get_raw(key, Some(self.seq_num)) {
+					if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 						return Ok(None);
 					}
+					let seq_num = crate::trailer_to_seq_num(trailer);
 					if let Some(rseq) = max_range_delete_seq {
-						if item.0.seq_num() <= rseq {
+						if seq_num <= rseq {
 							return Ok(None);
 						}
 					}
-					return Ok(Some((item.1, item.0.seq_num())));
+					return Ok(Some((val, seq_num)));
 				}
 			}
 		}
 
 		// 3. Collect level tables while holding level_manifest lock, then drop lock before awaiting
-		let ikey = InternalKey::new(key.to_vec(), self.seq_num, InternalKeyKind::Set);
 		let tables_to_check: Vec<Arc<Table>> = {
 			let level_manifest = self.core.level_manifest.read()?;
 			for level in &level_manifest.levels {
@@ -461,20 +461,26 @@ impl Snapshot {
 			tables
 		};
 
+		if tables_to_check.is_empty() {
+			return Ok(None);
+		}
+
 		// 4. Asynchronously search SSTables without holding any synchronous locks across await
+		let key_encoded = SmallKeyBuf::from_internal_parts(key, self.seq_num, InternalKeyKind::Set);
 		for table in tables_to_check {
-			let maybe_item = table.get_async(&ikey).await?;
-			if let Some(item) = maybe_item {
-				let ikey = &item.0;
-				if ikey.is_tombstone() {
+			if let Some((trailer, val)) =
+				table.get_encoded_async(key, key_encoded.as_slice()).await?
+			{
+				if crate::is_delete_kind(crate::trailer_to_kind(trailer)) {
 					return Ok(None);
 				}
+				let seq_num = crate::trailer_to_seq_num(trailer);
 				if let Some(rseq) = max_range_delete_seq {
-					if ikey.seq_num() <= rseq {
+					if seq_num <= rseq {
 						return Ok(None);
 					}
 				}
-				return Ok(Some((item.1, ikey.seq_num())));
+				return Ok(Some((val, seq_num)));
 			}
 		}
 
@@ -623,7 +629,7 @@ impl Snapshot {
 		match best {
 			Some((time, false, value)) => Ok(Some(SnapshotVersion {
 				time,
-				value: Some(self.core.resolve_value(&value)?),
+				value: Some(self.core.resolve_owned_value(value)?),
 			})),
 			Some((time, true, _)) => Ok(Some(SnapshotVersion {
 				time,
@@ -1106,10 +1112,8 @@ pub(crate) struct SnapshotIterator<'a> {
 	/// Last user key seen (forward direction) - reusable buffer
 	last_key_fwd: Vec<u8>,
 
-	/// For backward iteration: buffered key/value when we've read past current user key
+	/// For backward iteration: reusable user key buffer for the current group
 	buffered_back_key: Vec<u8>,
-	buffered_back_value: Vec<u8>,
-	has_buffered_back: bool,
 
 	/// For backward iteration: the current entry we're returning
 	/// (stored because merge_iter has already moved past it)
@@ -1156,8 +1160,6 @@ impl SnapshotIterator<'_> {
 			range_deletions,
 			last_key_fwd: Vec::new(),
 			buffered_back_key: Vec::new(),
-			buffered_back_value: Vec::new(),
-			has_buffered_back: false,
 			current_back_key: Vec::new(),
 			current_back_value: Vec::new(),
 			has_current_back: false,
@@ -1235,34 +1237,33 @@ impl SnapshotIterator<'_> {
 	/// or invisible to this snapshot until a valid live entry is found or the iterator exhausts.
 	fn find_latest_visible_backward(&mut self) -> Result<bool> {
 		loop {
-			// Position merge_iter at the start of the next user key to examine.
-			//
-			// `has_buffered_back` is set when a prior iteration crossed into a
-			// new user key while walking versions of the previous one; the
-			// boundary key is already loaded into merge_iter, so we just clear
-			// the flag and fall through.
-			if self.has_buffered_back {
-				self.has_buffered_back = false;
-			} else if !self.merge_iter.valid() {
+			// merge_iter is positioned at the start of the next user key to examine
+			// (either from initial seek_last / forward_to_backward, or from the prior
+			// iteration's inner loop stopping on a user key boundary).
+			if !self.merge_iter.valid() {
 				self.has_current_back = false;
 				return Ok(false);
 			}
 
 			let first_key_ref = self.merge_iter.key();
-			let current_user_key: Vec<u8> = first_key_ref.user_key().to_vec();
+			self.buffered_back_key.clear();
+			self.buffered_back_key.extend_from_slice(first_key_ref.user_key());
 
-			let mut latest_key: Option<Vec<u8>> = None;
-			let mut latest_value: Option<Vec<u8>> = None;
+			let mut found_visible = false;
 
 			if self.is_visible_ref(&first_key_ref) {
-				latest_key = Some(first_key_ref.encoded().to_vec());
-				latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
+				self.current_back_key.clear();
+				self.current_back_key.extend_from_slice(first_key_ref.encoded());
+				let val = self.merge_iter.value_encoded()?;
+				self.current_back_value.clear();
+				self.current_back_value.extend_from_slice(val);
+				found_visible = true;
 			}
 
 			// Walk older versions of this same user key, picking up the latest
 			// visible one. Stops when merge_iter goes invalid or crosses into
-			// a different user key (which becomes the buffered start for the
-			// next outer iteration).
+			// a different user key (leaving merge_iter positioned at that key
+			// for the next outer iteration).
 			loop {
 				self.merge_iter.prev()?;
 
@@ -1273,24 +1274,23 @@ impl SnapshotIterator<'_> {
 				let key_ref = self.merge_iter.key();
 				let user_key = key_ref.user_key();
 
-				if user_key != current_user_key.as_slice() {
-					self.buffered_back_key.clear();
-					self.buffered_back_key.extend_from_slice(key_ref.encoded());
-					self.buffered_back_value.clear();
-					self.buffered_back_value.extend_from_slice(self.merge_iter.value_encoded()?);
-					self.has_buffered_back = true;
+				if user_key != self.buffered_back_key.as_slice() {
 					break;
 				}
 
 				if self.is_visible_ref(&key_ref) {
-					latest_key = Some(key_ref.encoded().to_vec());
-					latest_value = Some(self.merge_iter.value_encoded()?.to_vec());
+					self.current_back_key.clear();
+					self.current_back_key.extend_from_slice(key_ref.encoded());
+					let val = self.merge_iter.value_encoded()?;
+					self.current_back_value.clear();
+					self.current_back_value.extend_from_slice(val);
+					found_visible = true;
 				}
 			}
 
 			// Decide the outcome for this user key.
-			if let (Some(key_bytes), Some(value_bytes)) = (latest_key, latest_value) {
-				let key_ref = InternalKeyRef::from_encoded(&key_bytes);
+			if found_visible {
+				let key_ref = InternalKeyRef::from_encoded(&self.current_back_key);
 				if key_ref.is_tombstone()
 					|| self.is_deleted_by_range(key_ref.user_key(), key_ref.seq_num())
 				{
@@ -1299,10 +1299,6 @@ impl SnapshotIterator<'_> {
 					self.has_current_back = false;
 					continue;
 				}
-				self.current_back_key.clear();
-				self.current_back_key.extend_from_slice(&key_bytes);
-				self.current_back_value.clear();
-				self.current_back_value.extend_from_slice(&value_bytes);
 				self.has_current_back = true;
 				return Ok(true);
 			}
@@ -1318,27 +1314,25 @@ impl SnapshotIterator<'_> {
 		self.direction = MergeDirection::Forward;
 
 		// Get current user key from backward state (equivalent to saved_key_)
-		let current_user_key = if self.has_current_back {
-			InternalKeyRef::from_encoded(&self.current_back_key).user_key().to_vec()
-		} else {
+		if !self.has_current_back {
 			// No current position in backward mode
-			self.has_buffered_back = false;
 			return Ok(false);
-		};
-
-		// Clear backward state
-		self.has_current_back = false;
-		self.has_buffered_back = false;
+		}
 
 		// Set last_key_fwd so skip_to_valid_forward() will skip this user key
 		// (equivalent to FindNextUserEntry(skipping_saved_key=true))
+		let current_user_key = InternalKeyRef::from_encoded(&self.current_back_key).user_key();
 		self.last_key_fwd.clear();
-		self.last_key_fwd.extend_from_slice(&current_user_key);
+		self.last_key_fwd.extend_from_slice(current_user_key);
+
+		// Clear backward state
+		self.has_current_back = false;
 
 		// Seek to first entry >= current user key
 		// Using (user_key, MAX_SEQ) positions at the start of this user key's entries
-		let seek_key = InternalKey::new(current_user_key, u64::MAX, InternalKeyKind::Set);
-		self.merge_iter.seek(&seek_key.encode())?;
+		let seek_key =
+			SmallKeyBuf::from_internal_parts(&self.last_key_fwd, u64::MAX, InternalKeyKind::Set);
+		self.merge_iter.seek(seek_key.as_slice())?;
 
 		// skip_to_valid_forward() will skip entries with user_key == last_key_fwd
 		// and return the first visible entry with a DIFFERENT user key
@@ -1350,7 +1344,6 @@ impl SnapshotIterator<'_> {
 		self.direction = MergeDirection::Backward;
 
 		// Clear backward buffers
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 
 		// In forward mode, merge_iter is positioned at the current entry
@@ -1361,7 +1354,7 @@ impl SnapshotIterator<'_> {
 		}
 
 		// find_latest_visible_backward will scan this user key's entries
-		// to find the latest visible version, then buffer the next user key
+		// to find the latest visible version, then leave merge_iter at the next user key
 		self.skip_to_valid_backward()
 	}
 }
@@ -1370,7 +1363,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.last_key_fwd.clear();
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 		self.merge_iter.seek(target)?;
 		self.initialized = true;
@@ -1380,7 +1372,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 	fn seek_first(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.last_key_fwd.clear();
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 		self.merge_iter.seek_first()?;
 		self.initialized = true;
@@ -1389,7 +1380,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 
 	fn seek_last(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Backward;
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 		self.merge_iter.seek_last()?;
 		self.initialized = true;
@@ -1425,7 +1415,7 @@ impl LSMIterator for SnapshotIterator<'_> {
 		}
 
 		// Normal backward iteration
-		if !self.merge_iter.valid() && !self.has_buffered_back {
+		if !self.merge_iter.valid() {
 			self.has_current_back = false;
 			return Ok(false);
 		}
