@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 use tokio::sync::{oneshot, OwnedSemaphorePermit};
@@ -47,10 +47,15 @@ pub(crate) struct CommitEntry {
 	state: AtomicU64,
 	/// Set before the entry is accepted, and taken by the flusher.
 	payload: Mutex<Option<Payload>>,
-	/// The encoded size of the payload's batch as `Batch::encoded_len_hint` estimates it, stored
-	/// before the entry is accepted. The flusher reads it to bound a group without locking the
-	/// payload. Zero until then.
-	bytes: AtomicUsize,
+	/// What the payload's batch costs a commit group, stored before the entry is accepted: its
+	/// encoded size as `Batch::encoded_len_hint` estimates it in the low 32 bits, and its
+	/// `Batch::gather_estimate` in the high 32 bits, each saturated at `u32::MAX`. The flusher
+	/// reads both with one load to bound a group without locking the payload. Zero until then.
+	///
+	/// A saturated size is over `MAX_GROUP_BYTES` and a saturated estimate is at least the
+	/// budget, so either keeps the entry from sharing a group, which is what its true value
+	/// would do.
+	cost: AtomicU64,
 	/// The committer's admission permit, released by the flusher only once
 	/// the ring's completed prefix has passed this entry.
 	permit: Mutex<Option<OwnedSemaphorePermit>>,
@@ -75,7 +80,7 @@ impl CommitEntry {
 			bloom,
 			state: AtomicU64::new(IN_FLIGHT),
 			payload: Mutex::new(None),
-			bytes: AtomicUsize::new(0),
+			cost: AtomicU64::new(0),
 			permit: Mutex::new(Some(permit)),
 		}
 	}
@@ -106,10 +111,12 @@ impl CommitEntry {
 		}
 	}
 
-	/// Hands the batch to the flusher. The payload and its size are stored before the state,
+	/// Hands the batch to the flusher. The payload and its cost are stored before the state,
 	/// so a flusher that observes `ACCEPTED` always finds them.
 	pub(crate) fn accept(&self, payload: Payload) {
-		self.bytes.store(payload.batch.encoded_len_hint(), Ordering::Relaxed);
+		let bytes = u32::try_from(payload.batch.encoded_len_hint()).unwrap_or(u32::MAX);
+		let estimate = u32::try_from(payload.batch.gather_estimate()).unwrap_or(u32::MAX);
+		self.cost.store(u64::from(bytes) | u64::from(estimate) << 32, Ordering::Relaxed);
 		*self.payload.lock() = Some(payload);
 		self.state.store(ACCEPTED, Ordering::SeqCst);
 	}
@@ -134,9 +141,11 @@ impl CommitEntry {
 		self.state.store(max_seq, Ordering::SeqCst);
 	}
 
-	/// The estimated encoded size of an accepted entry's batch.
-	pub(crate) fn payload_bytes(&self) -> usize {
-		self.bytes.load(Ordering::Relaxed)
+	/// What an accepted entry's batch costs a group: its estimated encoded size, and the
+	/// estimate of the memtable bytes it takes, see `cost`.
+	pub(crate) fn payload_cost(&self) -> (usize, u64) {
+		let cost = self.cost.load(Ordering::Relaxed);
+		((cost & u64::from(u32::MAX)) as usize, cost >> 32)
 	}
 
 	pub(crate) fn take_payload(&self) -> Option<Payload> {

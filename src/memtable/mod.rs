@@ -15,6 +15,24 @@ pub(crate) const fn max_entry_bytes(key_len: usize, value_len: usize) -> u64 {
 	ArenaVersionedArtMap::<Key, Value>::max_insert_bytes(key_len) as u64 + value_len as u64
 }
 
+/// The bytes at the start of an arena that no entry can use: artmap's null region.
+const ARENA_NULL_REGION: usize = 64;
+
+/// The bytes of arena that a memtable created with `max_memtable_size` has to give, empty: the size
+/// artmap rounds the arena to (a multiple of 64 bytes, within 64 and `MAX_ARENA_SIZE`) less its
+/// null region. A batch whose estimate is at most this fits a fresh memtable, and one that is not
+/// fits no memtable at all.
+pub(crate) const fn fresh_room(max_memtable_size: usize) -> u64 {
+	let mut capacity = max_memtable_size;
+	if capacity < ARENA_NULL_REGION {
+		capacity = ARENA_NULL_REGION;
+	}
+	if capacity > artmap::arena::MAX_ARENA_SIZE {
+		capacity = artmap::arena::MAX_ARENA_SIZE;
+	}
+	((capacity & !(ARENA_NULL_REGION - 1)) - ARENA_NULL_REGION) as u64
+}
+
 use crate::batch::Batch;
 use crate::error::Result;
 use crate::sstable::table::{Table, TableWriter};

@@ -62,6 +62,8 @@ pub mod direct_l0_group_tests;
 pub mod direct_l0_manifest_failure_tests;
 #[cfg(test)]
 pub mod direct_l0_read_order_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod direct_l0_wal_cleanup_tests;
 #[cfg(test)]
 pub mod encryption_background_tests;
 #[cfg(test)]
@@ -198,6 +200,8 @@ pub mod wal_group_budget_tests;
 pub mod wal_group_commit_tests;
 #[cfg(test)]
 pub mod wal_group_crash_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_group_rotation_bound_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod wal_replace_tests;
 #[cfg(test)]

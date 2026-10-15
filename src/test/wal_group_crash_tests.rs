@@ -1394,6 +1394,9 @@ async fn flusher_buffers_never_leak_bytes_between_groups_and_the_segment_is_the_
 /// and so is appended once and its tail appended again after the rotation.
 async fn straddling_setup(path: &Path) -> (Arc<Tree>, Vec<(String, Vec<u8>)>, u64) {
 	let tree = Arc::new(Tree::new(opts(path, 4096)).unwrap());
+	// The group fills the arena part-way: the bound on a group's estimates (see
+	// `group_est_budget`) would cut it in several, so it is lifted.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	stop_background_tasks(&tree).await;
 	let prefill: Vec<(String, Vec<u8>)> =
 		(0..10).map(|i| (format!("pre{i:03}"), payload(i, 100))).collect();

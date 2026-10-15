@@ -90,6 +90,10 @@ async fn open_tree(dir: &Path) -> Arc<Tree> {
 
 async fn open_tree_with(dir: &Path, max_memtable_size: usize) -> Arc<Tree> {
 	let tree = Arc::new(Tree::new(options(dir, max_memtable_size)).unwrap());
+	// These tests form groups that hold an oversized batch with others, or rotate the memtable more
+	// than once, to exercise what the pipeline does then: a group is only bounded by its estimates
+	// at the sizes where it cannot, see `group_est_budget`.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	let tm = tree.core.task_manager.lock().unwrap().clone().unwrap();
 	tm.stop().await;
 	tree.core.is_closed.store(true, Ordering::SeqCst);

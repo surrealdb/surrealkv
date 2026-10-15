@@ -162,11 +162,71 @@ fn recycle<T>(buffer: &mut Vec<T>, max_capacity: usize) {
 /// reaches the bound.
 pub(crate) const MAX_GROUP_BYTES: usize = 4 << 20;
 
-/// Whether the next entry, of `bytes`, joins a group that holds `entries` entries of
-/// `group_bytes` bytes between them. A group takes at least one entry, and after that entries
-/// only while it stays within `MAX_GROUP_BYTES`.
-fn group_has_room(entries: usize, group_bytes: usize, bytes: usize) -> bool {
-	entries == 0 || group_bytes.saturating_add(bytes) <= MAX_GROUP_BYTES
+/// The most memtable estimate (`Batch::gather_estimate`) the flusher gathers into one group, for
+/// a memtable of `max_memtable_size`, unless the first entry alone is bigger: that entry is a group
+/// of its own.
+///
+/// A batch is applied to a memtable only if its estimate, a worst case of some 2 KiB for every
+/// entry however small, fits what is left of the arena. A group whose estimates add up to more than
+/// a fresh arena takes rotates the memtable more than once, and logs the rest of the group again
+/// into the new segment every time: a pile-up of small commits rotated once per commit, wrote some
+/// 40 times its size to the WAL, and left a recovery with hundreds of segments to turn into tables.
+/// A group whose estimates add up to no more than a fresh arena rotates at most once, because
+/// what is left of it after a rotation fits the memtable it rotated to, and is logged at most
+/// twice.
+///
+/// Up to a memtable of 32 MiB that is exactly one fresh arena. A bigger memtable takes a multiple
+/// of it, up to six, so that at the default 100 MiB the bound is far over what `MAX_GROUP_BYTES`
+/// lets through, see the assertion below: the estimate never closes a group there.
+/// Between 32 and 96 MiB a group rotates at most twice per multiple, and with more than one, a
+/// batch over the memtable (`write_direct_to_l0`) can share a group with others.
+pub(crate) const fn group_est_budget(max_memtable_size: usize) -> u64 {
+	let room = crate::memtable::fresh_room(max_memtable_size);
+	let mut multiple = room / GROUP_EST_STEP;
+	if multiple < 1 {
+		multiple = 1;
+	}
+	if multiple > GROUP_EST_MAX_MULTIPLE {
+		multiple = GROUP_EST_MAX_MULTIPLE;
+	}
+	let budget = room.saturating_mul(multiple);
+	// The estimate of an entry is held in 32 bits, see `CommitEntry::cost`.
+	if budget > u32::MAX as u64 {
+		u32::MAX as u64
+	} else {
+		budget
+	}
+}
+
+/// How much more memtable than one fresh arena a group may fill, per this many bytes of arena.
+const GROUP_EST_STEP: u64 = 16 << 20;
+const GROUP_EST_MAX_MULTIPLE: u64 = 6;
+
+/// At the default memtable of 100 MiB the budget is over what any group the byte rule forms can
+/// add up to: an entry costs at least 14 bytes of `Batch::encoded_len_hint` (11 of `Batch::size`
+/// and 3 of slack) and at most `GATHER_ENTRY_BYTES` of estimate, and one of more bytes costs
+/// a little more of both, so `MAX_GROUP_BYTES` of hint is at most `MAX_GROUP_BYTES / 14` entries.
+/// A change of artmap that makes an arena entry dearer fails this build, and the answer is a bigger
+/// multiple, not a group rule that silently changes what typical workloads do.
+const _: () = assert!(
+	(MAX_GROUP_BYTES as u64 / 14 + 1) * crate::batch::GATHER_ENTRY_BYTES
+		<= group_est_budget(100 * 1024 * 1024)
+);
+
+/// Whether the next entry, of `bytes` and `estimate`, joins a group that holds `entries` entries
+/// of `group_bytes` bytes and `group_estimate` between them. A group takes at least one entry, and
+/// after that entries only while it stays within `MAX_GROUP_BYTES` and `est_budget`.
+fn group_has_room(
+	entries: usize,
+	group_bytes: usize,
+	bytes: usize,
+	group_estimate: u64,
+	estimate: u64,
+	est_budget: u64,
+) -> bool {
+	entries == 0
+		|| (group_bytes.saturating_add(bytes) <= MAX_GROUP_BYTES
+			&& group_estimate.saturating_add(estimate) <= est_budget)
 }
 
 /// Reserves room for `additional` more bytes in `buf`, and fails when the allocator refuses,
@@ -205,7 +265,9 @@ pub(super) const ADMISSION_PERMITS: u32 = (DEFAULT_COMMIT_RING_CAPACITY / 2) as 
 /// How many times in a row a group may find its records in a segment other than the active
 /// memtable's tag, with nothing applied in between, and log them again off the memtable's lock.
 /// One pass past a rotation fixes it. If rotations keep overtaking the group, the next pass is
-/// fenced: see `CommitPipeline::apply_fenced`.
+/// fenced: see `CommitPipeline::apply_fenced`. The rotations of the group's own apply do not come
+/// in a row without a batch applied in between: the bound of `group_est_budget` is what makes the
+/// rest of a group fit the memtable it rotated to.
 pub(crate) const UNFENCED_STALE_ROUNDS: u32 = 2;
 
 /// How many groups the flusher drains between two calls to `retire`.
@@ -378,7 +440,8 @@ impl ReplaceBackoff {
 /// cost is parallel in the number of commits in flight.
 ///
 /// The flusher drains accepted entries in ring order, in groups of at most
-/// `MAX_GROUP_BYTES` (a group always takes its first entry), assigns their LSM
+/// `MAX_GROUP_BYTES` and of memtable estimates that add up to at most `group_est_budget` (a group
+/// always takes its first entry), assigns their LSM
 /// sequence numbers in that same order, writes and syncs the WAL, applies the
 /// memtable, advances `visible_seq_num`, and only then marks the entries
 /// visible and advances the ring's completed prefix. A transaction that reads
@@ -386,6 +449,13 @@ impl ReplaceBackoff {
 /// at or below the prefix in its snapshot, and validates against the rest.
 pub(crate) struct CommitPipeline {
 	pub(crate) ring: CommitRing<CommitEntry>,
+	/// The most memtable estimate the flusher gathers into one group, see `group_est_budget`.
+	group_est_budget: u64,
+	/// Test-only: lifts the estimate bound of a group, for the tests whose subject is a group
+	/// that holds an oversized batch with others, which the bound only lets a bigger memtable
+	/// form.
+	#[cfg(test)]
+	est_cap_lifted: AtomicBool,
 	/// Entries that a lap of the ring overwrote while a live conflict window
 	/// could still reach them, keyed by ring sequence. Only long-lived
 	/// transactions, whose window spans more than a lap, ever read it. Entries
@@ -489,6 +559,9 @@ impl CommitPipeline {
 
 		Self {
 			ring,
+			group_est_budget: group_est_budget(inner.opts.max_memtable_size),
+			#[cfg(test)]
+			est_cap_lifted: AtomicBool::new(false),
 			overflow: Mutex::new(BTreeMap::new()),
 			admission,
 			inner,
@@ -632,6 +705,14 @@ impl CommitPipeline {
 	#[cfg(test)]
 	pub(crate) fn set_hook(&self, hook: Option<PipelineHookFn>) {
 		*self.hook.lock() = hook;
+	}
+
+	/// Test observer: lets the flusher gather groups whose estimates add up to more than a
+	/// fresh memtable takes, as it did before it bounded them. For the tests of what happens to
+	/// a group that holds an oversized batch together with others.
+	#[cfg(test)]
+	pub(crate) fn lift_group_estimate_cap(&self) {
+		self.est_cap_lifted.store(true, Ordering::Relaxed);
 	}
 
 	#[cfg(test)]
@@ -884,22 +965,40 @@ impl CommitPipeline {
 		loop {
 			// Gather the contiguous decided entries after `drained`, with the permits to
 			// release once the completed prefix passes them, as one. The group stops before
-			// the entry that would take it past `MAX_GROUP_BYTES`. That entry is still accepted
+			// the entry that would take it past `MAX_GROUP_BYTES`, or past what its memtable
+			// estimates may add up to (`group_est_budget`). That entry is still accepted
 			// and in the ring, and starts the next group: the flusher parks only when a pass
 			// finds nothing, and a group always takes its first entry.
 			let mut permits: Option<OwnedSemaphorePermit> = None;
 			let mut group_bytes = 0usize;
+			let mut group_estimate = 0u64;
+			#[cfg(test)]
+			let est_budget = if self.est_cap_lifted.load(Ordering::Relaxed) {
+				u64::MAX
+			} else {
+				self.group_est_budget
+			};
+			#[cfg(not(test))]
+			let est_budget = self.group_est_budget;
 			let mut next = drained + 1;
 			loop {
 				match self.ring.get(next) {
 					SlotRead::Ready(entry) => match entry.state() {
 						EntryState::InFlight => break,
 						EntryState::Accepted => {
-							let bytes = entry.payload_bytes();
-							if !group_has_room(scratch.group.len(), group_bytes, bytes) {
+							let (bytes, estimate) = entry.payload_cost();
+							if !group_has_room(
+								scratch.group.len(),
+								group_bytes,
+								bytes,
+								group_estimate,
+								estimate,
+								est_budget,
+							) {
 								break;
 							}
 							group_bytes = group_bytes.saturating_add(bytes);
+							group_estimate = group_estimate.saturating_add(estimate);
 							let payload =
 								entry.take_payload().expect("accepted entries carry a payload");
 							merge_permit(&mut permits, entry.take_permit());
@@ -1310,7 +1409,12 @@ impl CommitPipeline {
 		// This is only an optimisation for the common case (a lone writer then never
 		// logs a record twice): every other case is repaired in step 3, because the
 		// estimate is a worst case, so how far a group gets into a memtable is only
-		// known by applying it.
+		// known by applying it. The gather bounds what the repair can cost: the estimates
+		// of a group add up to no more than a fresh memtable takes (`group_est_budget`), so
+		// the rest of a group fits the memtable it rotated to. Below 32 MiB a group
+		// rotates at most once, before its append or during its apply, and a batch is
+		// logged at most twice; a rotation by someone else (a checkpoint, a seal, a heal)
+		// can still overtake a group, and it is repaired the same way.
 		if oversized.first() == Some(&false) && self.needs_rotation_for(estimates[0])? {
 			self.inner.rotate_memtable()?;
 			if let Some(ref tm) = self.task_manager {
@@ -1782,6 +1886,13 @@ impl CommitPipeline {
 	/// A record already in that segment is never appended a second time. The value
 	/// log needs no second pass: its entries were synced with the first.
 	///
+	/// A group is logged again once for every rotation that overtakes it, and the gather
+	/// bounds those: a group whose memtable estimates fit a fresh memtable (see
+	/// `group_est_budget`) is overtaken by its own rotation once at most, so a batch is in
+	/// the WAL twice at most, the second copy in the segment of the memtable that applies it.
+	/// Recovery replays both, which is harmless: the copies have the same keys, sequence
+	/// numbers and values, and the replay is not deduplicated.
+	///
 	/// The stale batches go to the WAL as one group, so they land in one segment. They are
 	/// encoded into the group's own buffers, which the first append gave back with room for the
 	/// whole group. Nothing is reserved for them, because part of the group is already applied.
@@ -1888,6 +1999,10 @@ impl CommitPipeline {
 				sealed_wal_number,
 				rest_wal_number,
 			)?;
+			// The segments the manifest is past are obsolete now, and nothing else would remove
+			// them until the next flush or the close: a run of oversized commits has no flush, and
+			// would leave one segment each.
+			self.inner.remove_obsolete_wal_segments();
 		}
 
 		if let Some(ref tm) = self.task_manager {
@@ -2516,21 +2631,139 @@ mod retire_due_tests {
 mod group_budget_tests {
 	use super::*;
 
+	/// A budget that no estimate reaches, for the tests of the byte rule.
+	const FAR: u64 = u64::MAX;
+
 	#[test]
 	fn a_group_always_takes_its_first_entry_and_then_only_what_fits_the_budget() {
 		// An entry over the budget is a group of its own: it is taken by an empty group, and
 		// nothing is taken after it.
-		assert!(group_has_room(0, 0, MAX_GROUP_BYTES + 1));
-		assert!(group_has_room(0, 0, usize::MAX));
-		assert!(!group_has_room(1, MAX_GROUP_BYTES + 1, 1));
+		assert!(group_has_room(0, 0, MAX_GROUP_BYTES + 1, 0, 0, FAR));
+		assert!(group_has_room(0, 0, usize::MAX, 0, 0, FAR));
+		assert!(!group_has_room(1, MAX_GROUP_BYTES + 1, 1, 0, 0, FAR));
 		// Within the budget, up to and including the byte that fills it.
-		assert!(group_has_room(1, 100, MAX_GROUP_BYTES - 100));
-		assert!(!group_has_room(1, 100, MAX_GROUP_BYTES - 100 + 1));
-		assert!(group_has_room(3, MAX_GROUP_BYTES - 1, 1));
-		assert!(!group_has_room(3, MAX_GROUP_BYTES, 1));
+		assert!(group_has_room(1, 100, MAX_GROUP_BYTES - 100, 0, 0, FAR));
+		assert!(!group_has_room(1, 100, MAX_GROUP_BYTES - 100 + 1, 0, 0, FAR));
+		assert!(group_has_room(3, MAX_GROUP_BYTES - 1, 1, 0, 0, FAR));
+		assert!(!group_has_room(3, MAX_GROUP_BYTES, 1, 0, 0, FAR));
 		// A size that overflows the sum is over the budget, not wrapped back under it.
-		assert!(!group_has_room(1, 10, usize::MAX));
-		assert!(!group_has_room(1, usize::MAX, usize::MAX));
+		assert!(!group_has_room(1, 10, usize::MAX, 0, 0, FAR));
+		assert!(!group_has_room(1, usize::MAX, usize::MAX, 0, 0, FAR));
+	}
+
+	#[test]
+	fn a_group_also_stops_at_the_memtable_estimate_it_may_add_up_to() {
+		// The first entry is taken whatever it estimates, and nothing joins it then.
+		assert!(group_has_room(0, 0, 1, 0, 1_000_000, 1000));
+		assert!(!group_has_room(1, 1, 1, 1_000_000, 1, 1000));
+		assert!(!group_has_room(1, 1, 1, 1, 1_000_000, 1000));
+		// Up to and including the estimate that fills the budget, and not one over.
+		assert!(group_has_room(2, 10, 10, 600, 400, 1000));
+		assert!(!group_has_room(2, 10, 10, 600, 401, 1000));
+		// Either bound closes the group.
+		assert!(!group_has_room(2, MAX_GROUP_BYTES, 1, 0, 1, 1000));
+		assert!(!group_has_room(2, 1, 1, 1000, 1, 1000));
+		// A sum that overflows is over the budget.
+		assert!(!group_has_room(1, 1, 1, u64::MAX, u64::MAX, u64::MAX - 1));
+	}
+
+	#[test]
+	fn the_budget_is_a_fresh_arena_up_to_32_mib_and_a_multiple_of_it_after() {
+		let mib = 1usize << 20;
+		for size in [0, 63, 64, 100, 4096, 64 * 1024, mib, 4 * mib, 16 * mib, 31 * mib] {
+			assert_eq!(group_est_budget(size), crate::memtable::fresh_room(size), "{size}");
+		}
+		assert_eq!(group_est_budget(32 * mib), crate::memtable::fresh_room(32 * mib));
+		assert_eq!(group_est_budget(32 * mib + 64), 2 * crate::memtable::fresh_room(32 * mib + 64));
+		assert_eq!(
+			group_est_budget(100 * mib),
+			6 * crate::memtable::fresh_room(100 * mib),
+			"the default memtable"
+		);
+		assert_eq!(
+			group_est_budget(usize::MAX),
+			u64::from(u32::MAX),
+			"a budget is held in the 32 bits of an entry's cost"
+		);
+		let default = crate::Options::default();
+		assert!(
+			(MAX_GROUP_BYTES as u64 / 14 + 1) * crate::batch::GATHER_ENTRY_BYTES
+				<= group_est_budget(default.max_memtable_size),
+			"the default options never close a group at the estimate"
+		);
+	}
+
+	#[test]
+	fn the_room_of_a_fresh_arena_is_what_a_real_memtable_has() {
+		for size in [
+			0,
+			1,
+			63,
+			64,
+			65,
+			127,
+			128,
+			1000,
+			4096,
+			64 * 1024,
+			64 * 1024 + 63,
+			1 << 20,
+			(1 << 20) + 1,
+			16 << 20,
+		] {
+			let memtable = crate::memtable::MemTable::new(size);
+			assert_eq!(
+				crate::memtable::fresh_room(size),
+				(memtable.arena_capacity() - memtable.size()) as u64,
+				"a memtable of {size}"
+			);
+		}
+		// Past the biggest arena, and the sizes that artmap clamps, without allocating them.
+		let max = artmap::arena::MAX_ARENA_SIZE;
+		assert_eq!(crate::memtable::fresh_room(max), (max - 64) as u64);
+		assert_eq!(crate::memtable::fresh_room(usize::MAX), (max - 64) as u64);
+	}
+
+	#[test]
+	fn a_cost_is_packed_and_saturates_in_each_half() {
+		use tokio::sync::Semaphore;
+
+		let permit = || Arc::new(Semaphore::new(1)).try_acquire_owned().unwrap();
+		let entry = CommitEntry::new(Vec::new(), permit());
+		let (tx, _rx) = oneshot::channel();
+		let mut batch = Batch::new(1);
+		batch
+			.add_record(InternalKeyKind::Set, b"key".to_vec(), Some(b"value".to_vec()), 1)
+			.unwrap();
+		let (hint, estimate) = (batch.encoded_len_hint(), batch.gather_estimate());
+		entry.accept(Payload {
+			batch,
+			sync: false,
+			complete_tx: tx,
+			epoch: 0,
+		});
+		assert_eq!(entry.payload_cost(), (hint, estimate));
+
+		// A batch whose estimate does not fit 32 bits: the half that overflows saturates and
+		// leaves the other alone.
+		let entry = CommitEntry::new(Vec::new(), permit());
+		let (tx, _rx) = oneshot::channel();
+		let mut big = Batch::new(1);
+		big.add_record(InternalKeyKind::Set, b"k".to_vec(), Some(b"v".to_vec()), 1).unwrap();
+		big.size = u64::from(u32::MAX) * 4;
+		entry.accept(Payload {
+			batch: big,
+			sync: false,
+			complete_tx: tx,
+			epoch: 0,
+		});
+		let (bytes, estimate) = entry.payload_cost();
+		assert_eq!(bytes, u32::MAX as usize);
+		assert_eq!(estimate, u64::from(u32::MAX));
+		assert!(
+			!group_has_room(1, 0, bytes, 0, estimate, group_est_budget(usize::MAX)),
+			"a saturated entry does not share a group"
+		);
 	}
 
 	#[test]
@@ -2557,6 +2790,74 @@ mod scratch_tests {
 
 	use super::*;
 	use crate::{Options, Tree};
+
+	/// The estimate that closes a commit group is an upper bound on the one that the memtable
+	/// reserves: the flusher encodes the values (wraps them, or replaces them by pointers) before
+	/// the memtable sees the batch, and the bound is read before that, from two numbers.
+	#[tokio::test]
+	async fn the_gather_estimate_is_never_under_the_estimate_of_the_encoded_batch() {
+		let mut x = 0x9E37_79B9_7F4A_7C15u64;
+		let mut next = move |n: usize| {
+			x ^= x << 13;
+			x ^= x >> 7;
+			x ^= x << 17;
+			(x % n as u64) as usize
+		};
+		let dir = TempDir::new("gather_estimate").unwrap();
+		for (name, vlog) in [("without", false), ("with", true)] {
+			let tree = Tree::new(Arc::new(Options {
+				path: dir.path().join(name),
+				enable_vlog: vlog,
+				..Default::default()
+			}))
+			.unwrap();
+			let vlog = tree.core.inner.vlog.as_ref();
+			assert_eq!(vlog.is_some(), name == "with");
+			let kinds = [
+				InternalKeyKind::Set,
+				InternalKeyKind::Delete,
+				InternalKeyKind::SoftDelete,
+				InternalKeyKind::RangeDelete,
+			];
+			let mut worst = 0f64;
+			for case in 0..3000 {
+				let mut batch = Batch::new(1);
+				for _ in 0..1 + next(8) {
+					// Key lengths cover every step of artmap's prefix chain, and 0 and 1.
+					let key = vec![
+						b'k';
+						if next(4) == 0 {
+							next(3)
+						} else {
+							next(301)
+						}
+					];
+					let value_len = [0, 1, 7, 8, 30, 100, 1000, 3000][next(8)];
+					let (kind, value) = match kinds[next(4)] {
+						InternalKeyKind::Set => (InternalKeyKind::Set, Some(vec![b'v'; value_len])),
+						InternalKeyKind::RangeDelete => {
+							(InternalKeyKind::RangeDelete, Some(vec![b'z'; next(301)]))
+						}
+						kind => (kind, None),
+					};
+					batch.add_record(kind, key, value, 1 + next(1 << 40) as u64).unwrap();
+				}
+				let (stamp, threshold) = (next(2) == 1, [8, 64, 1024, 2048][next(4)]);
+				let bound = batch.gather_estimate();
+				encode_values(&mut batch, vlog, threshold, stamp).unwrap();
+				let estimate = batch.memtable_size_estimate();
+				assert!(
+					bound >= estimate,
+					"case {case} (vlog {vlog:?}, stamp {stamp}, threshold {threshold}): bound {bound} \
+					 is under the estimate {estimate}",
+					vlog = vlog.is_some()
+				);
+				worst = worst.max(bound as f64 / estimate.max(1) as f64);
+			}
+			println!("gather estimate {name} a value log: loosest {worst:.2}x");
+			tree.close().await.unwrap();
+		}
+	}
 
 	#[test]
 	fn recycle_empties_a_buffer_and_gives_back_one_that_grew_too_big() {

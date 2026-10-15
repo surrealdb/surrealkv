@@ -202,6 +202,9 @@ async fn a_re_append_after_a_rotation_needs_no_buffer_of_its_own() {
 		}))
 		.unwrap(),
 	);
+	// This test is about a group that rotates the memtable in the middle: the bound on a group's
+	// estimates (see `group_est_budget`) is lifted so that the pile-up forms one.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	let tm = tree.core.task_manager.lock().unwrap().clone().unwrap();
 	tm.stop().await;
 
