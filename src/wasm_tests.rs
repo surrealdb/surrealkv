@@ -29,6 +29,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use wasm_bindgen::JsCast;
 use wasm_bindgen_test::*;
 
 use crate::clock::{DefaultLogicalClock, LogicalClock};
@@ -232,4 +233,55 @@ fn building_a_tree_fails_cleanly_and_does_not_trap() {
 	assert!(built.is_err(), "std::fs cannot work in a browser");
 	// The instance is alive: the shim still works.
 	assert!(rt::Instant::now().elapsed() < Duration::from_secs(60));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Memory
+// ---------------------------------------------------------------------------------------------
+
+/// The size of the instance's linear memory, in 64 KiB pages. It never shrinks, so growth is leak.
+fn memory_pages() -> u64 {
+	let memory: js_sys::WebAssembly::Memory = wasm_bindgen::memory().unchecked_into();
+	let buffer: js_sys::ArrayBuffer = memory.buffer().unchecked_into();
+	u64::from(buffer.byte_length()) / 65536
+}
+
+/// A timer that is cancelled must not leave anything behind. It once did: the promise behind a
+/// cleared `setTimeout` never settles, and the callbacks that `JsFuture` hung on it were never
+/// freed, about 90 bytes for each timer that lost a `timeout` race or was dropped asleep.
+#[wasm_bindgen_test]
+async fn a_cancelled_timer_does_not_leak_memory() {
+	use std::future::Future;
+	use std::task::{Context, Poll, Waker};
+
+	async fn cancel_some(rounds: usize) {
+		let notify = tokio::sync::Notify::new();
+		let mut context = Context::from_waker(Waker::noop());
+		for round in 0..rounds {
+			// A timeout that is polled (so its timer exists) and then dropped, as when the
+			// notification arrives first, and a bare sleep that is dropped asleep.
+			let mut waiting = Box::pin(rt::timeout(Duration::from_secs(3600), notify.notified()));
+			assert!(waiting.as_mut().poll(&mut context).is_pending(), "round {round}");
+			drop(waiting);
+			let mut asleep = Box::pin(rt::sleep(Duration::from_secs(3600)));
+			assert!(matches!(asleep.as_mut().poll(&mut context), Poll::Pending));
+			drop(asleep);
+			// Let the microtasks that settle the dropped timers run, so that the memory they
+			// hold while they wait is not counted as growth.
+			if round % 100 == 99 {
+				rt::relax().await;
+			}
+		}
+	}
+
+	// Warm up, so that one-time allocations (the executor's queues, the allocator's arenas) are
+	// not counted.
+	cancel_some(1_000).await;
+	rt::relax().await;
+	let before = memory_pages();
+	cancel_some(50_000).await;
+	rt::relax().await;
+	let grown = memory_pages() - before;
+	// A leak of 90 bytes a timer is 100,000 timers, or about 140 pages.
+	assert!(grown <= 8, "100,000 cancelled timers grew the memory by {grown} pages");
 }
