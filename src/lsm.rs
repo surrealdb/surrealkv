@@ -267,6 +267,11 @@ pub(crate) struct CoreInner {
 	#[cfg(test)]
 	pub(crate) direct_table_hook: parking_lot::Mutex<Option<FlushHook>>,
 
+	/// Test-only observer called by `remove_obsolete_wal_segments` with the `log_number` of the
+	/// manifest, after the direct table is registered and before any segment is removed.
+	#[cfg(test)]
+	pub(crate) direct_cleanup_hook: parking_lot::Mutex<Option<FlushHook>>,
+
 	/// Test-only observer called by `create_checkpoint` at each of its stages.
 	#[cfg(test)]
 	pub(crate) checkpoint_hook: parking_lot::Mutex<Option<crate::checkpoint::CheckpointHook>>,
@@ -387,6 +392,8 @@ impl CoreInner {
 			flush_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
 			direct_table_hook: parking_lot::Mutex::new(None),
+			#[cfg(test)]
+			direct_cleanup_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
 			checkpoint_hook: parking_lot::Mutex::new(None),
 			#[cfg(test)]
@@ -1095,13 +1102,31 @@ impl CoreInner {
 		)?;
 
 		// Clean up the WAL segments the flush made obsolete
-		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
 		let min_wal_to_keep = Self::hold_log_number(
 			entry.wal_number + 1,
 			self.level_manifest.read()?.get_log_number(),
 			self.group_wal_pin.load(Ordering::Acquire),
 		);
+		self.remove_wal_segments_below(min_wal_to_keep);
 
+		self.cleanup_vlog("flush");
+
+		tracing::debug!(
+			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
+			table.id,
+			table.file_size
+		);
+
+		Ok(Some(table))
+	}
+
+	/// Removes the WAL segments below `min_wal_to_keep`, which the manifest's `log_number` has
+	/// moved past. Best effort: a segment that stays is removed by the next flush or by `close`,
+	/// and recovery starts at `log_number`, so it is never read.
+	///
+	/// The caller holds `flush_lock`, which a restore holds while it replaces the WAL directory.
+	fn remove_wal_segments_below(&self, min_wal_to_keep: u64) {
+		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
 		match cleanup_old_segments_for(
 			self.opts.encryption_context().map(Arc::as_ref),
 			&wal_dir,
@@ -1119,16 +1144,28 @@ impl CoreInner {
 				tracing::warn!("Failed to clean up old WAL segments: {}", e);
 			}
 		}
+	}
 
-		self.cleanup_vlog("flush");
+	/// Removes the WAL segments that the manifest's `log_number` is past, after a direct L0 write
+	/// moved it. The bound is the manifest's own value, which already holds back the segments
+	/// that the rest of the commit group and the queued memtables still need, see
+	/// `hold_log_number`. See `remove_wal_segments_below`.
+	pub(crate) fn remove_obsolete_wal_segments(&self) {
+		let Ok(manifest) = self.level_manifest.read() else {
+			return;
+		};
+		let log_number = manifest.get_log_number();
+		drop(manifest);
 
-		tracing::debug!(
-			"flush_oldest_immutable_to_sst: flushed table_id={}, file_size={}",
-			table.id,
-			table.file_size
-		);
+		#[cfg(test)]
+		{
+			let hook = self.direct_cleanup_hook.lock().clone();
+			if let Some(hook) = hook {
+				let _ = hook(log_number);
+			}
+		}
 
-		Ok(Some(table))
+		self.remove_wal_segments_below(log_number);
 	}
 
 	/// Flushes the immutable memtables that are queued when it is called, synchronously.

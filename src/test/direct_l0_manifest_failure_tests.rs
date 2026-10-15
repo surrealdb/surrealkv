@@ -127,6 +127,10 @@ fn options(path: &Path, vlog: bool) -> Arc<Options> {
 
 async fn open_tree(path: &Path, background: bool, vlog: bool) -> Arc<Tree> {
 	let tree = Arc::new(Tree::new(options(path, vlog)).unwrap());
+	// These tests form groups that hold an oversized batch with others, or rotate the memtable more
+	// than once, to exercise what the pipeline does then: a group is only bounded by its estimates
+	// at the sizes where it cannot, see `group_est_budget`.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	if !background {
 		let tasks = tree.core.task_manager.lock().unwrap().take().unwrap();
 		tasks.stop().await;

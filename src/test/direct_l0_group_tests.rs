@@ -910,6 +910,9 @@ fn non_empty_segments(tree: &Tree) -> Vec<u64> {
 /// Opens a copy of a crashed tree, with the background tasks stopped.
 async fn reopen(image: &Path) -> Tree {
 	let tree = Tree::new(options(image, false)).unwrap();
+	// The groups of the tests that commit through this tree hold an oversized batch with others:
+	// see `group_est_budget`.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	stop_background(&tree).await;
 	tree
 }
@@ -973,6 +976,7 @@ async fn assert_survives_two_crashes(
 	tree: &Tree,
 	root: &Path,
 	expected: &Model,
+	holds_records: bool,
 	what: &str,
 ) {
 	let second = root.join("crash_two");
@@ -980,7 +984,11 @@ async fn assert_survives_two_crashes(
 	abandon(tree);
 	let again = reopen(&second).await;
 	assert_eq!(all_keys(&again), *expected, "{what}: the image of the recovered tree");
-	assert!(!non_empty_segments(&again).is_empty(), "control: the image holds records");
+	// A group that ends with a direct batch has no record left to replay: its segment went with
+	// the table, which holds the group.
+	if holds_records {
+		assert!(!non_empty_segments(&again).is_empty(), "control: the image holds records");
+	}
 
 	let third = root.join("crash_three");
 	copy_dir(&second, &third);
@@ -1021,7 +1029,11 @@ async fn group_on_a_recovered_tree(group: Vec<Vec<Op>>, queued: usize, durable: 
 	assert_reads(&read_only(&tree), &model, &keys(), &format!("{what}: live"));
 	assert_eq!(tree.core.inner.immutable_count(), 0, "{what}: the queue was flushed");
 
-	assert_survives_two_crashes(&live, &tree, dir.path(), &model, &what).await;
+	// The segment of a group that ends with a direct batch went with its table.
+	let ends_direct = group.last().is_some_and(|ops| {
+		ops.iter().any(|op| matches!(op, Op::Set(_, value) if value.len() > MEMTABLE))
+	});
+	assert_survives_two_crashes(&live, &tree, dir.path(), &model, !ends_direct, &what).await;
 }
 
 #[test(tokio::test)]
@@ -1119,7 +1131,7 @@ async fn failing_group_on_a_recovered_tree(queued: usize, fails: Fails) {
 	for ops in &group {
 		apply(&mut whole, ops);
 	}
-	assert_survives_two_crashes(&live, &tree, dir.path(), &whole, &what).await;
+	assert_survives_two_crashes(&live, &tree, dir.path(), &whole, true, &what).await;
 }
 
 #[test(tokio::test)]

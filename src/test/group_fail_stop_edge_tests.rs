@@ -62,6 +62,10 @@ fn opts(path: &Path) -> Options {
 /// drop to close it.
 async fn open(options: Options) -> Arc<Tree> {
 	let tree = Arc::new(Tree::new(Arc::new(options)).unwrap());
+	// These tests form groups that hold an oversized batch with others, or rotate the memtable more
+	// than once, to exercise what the pipeline does then: a group is only bounded by its estimates
+	// at the sizes where it cannot, see `group_est_budget`.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
 	let tm = tree.core.task_manager.lock().unwrap().clone().unwrap();
 	tm.stop().await;
 	tree.core.is_closed.store(true, Ordering::SeqCst);
@@ -693,6 +697,9 @@ fn churn(seed: u64) -> Churn {
 			..Default::default()
 		};
 		let tree = Arc::new(Tree::new(Arc::new(options.clone())).unwrap());
+		// The failures are injected between the rounds of a group, which only a group of several
+		// commits has: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 
 		// A xorshift generator that the hook, which runs on the flusher's thread, and the chaos
 		// task share.
@@ -1077,6 +1084,9 @@ fn stress(seed: u64, wal_fail: bool, writers: usize) -> bool {
 			..opts(dir.path())
 		};
 		let tree = Arc::new(Tree::new(Arc::new(options)).unwrap());
+		// Failures are injected between the rounds of a group, which only a group of several
+		// commits has: see `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 
 		let acked: Arc<std::sync::Mutex<BTreeMap<String, u64>>> = Default::default();
 		let failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1793,6 +1803,9 @@ fn the_background_flush_woken_by_the_mid_group_rotation_does_not_split_the_group
 			..opts(dir.path())
 		};
 		let tree = Arc::new(Tree::new(Arc::new(options)).unwrap());
+		// The thirty commits are one group that rotates the memtable in the middle: see
+		// `group_est_budget`.
+		tree.core.commit_pipeline.lift_group_estimate_cap();
 		for r in commit_group(&tree, &base(), Durability::Immediate).await {
 			r.unwrap();
 		}

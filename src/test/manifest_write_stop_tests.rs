@@ -31,7 +31,7 @@ use crate::{Durability, Error, Mode, Options, Result, Tree};
 const SMALL: usize = 4096;
 
 fn open(path: &Path, max_memtable_size: usize) -> Arc<Tree> {
-	Arc::new(
+	let tree = Arc::new(
 		Tree::new(Arc::new(Options {
 			path: path.to_path_buf(),
 			max_memtable_size,
@@ -40,7 +40,12 @@ fn open(path: &Path, max_memtable_size: usize) -> Arc<Tree> {
 			..Default::default()
 		}))
 		.unwrap(),
-	)
+	);
+	// These tests form groups that hold an oversized batch with others, or rotate the memtable more
+	// than once, to exercise what the pipeline does then: a group is only bounded by its estimates
+	// at the sizes where it cannot, see `group_est_budget`.
+	tree.core.commit_pipeline.lift_group_estimate_cap();
+	tree
 }
 
 async fn commit_one(tree: Arc<Tree>, key: String, value: Vec<u8>) -> Result<()> {

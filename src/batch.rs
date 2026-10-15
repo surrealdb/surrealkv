@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::memtable::max_entry_bytes;
 use crate::varint::{
 	decode_varint_u32,
 	decode_varint_u64,
@@ -17,6 +18,21 @@ pub(crate) const MAX_BATCH_SIZE: u64 = u32::MAX as u64;
 /// the sequence number (10 bytes) and of the entry count (5 bytes). An entry counts for 11 bytes
 /// at the least, so the count of a batch at the limit fits the `u32` it is written as.
 pub(crate) const ENCODED_HEADER_SIZE: u64 = 1 + 10 + 5;
+/// What the memtable estimate of an entry costs beyond the entry's key and value bytes, at most:
+/// artmap's worst case for a key of up to 16 bytes (a leaf and two prefix nodes) and the bytes by
+/// which the flusher grows a value when it encodes it: the header of an inline value (up to 2 + 8
+/// with a timestamp), or the whole of a value pointer (2 + 8 + `VALUE_POINTER_SIZE`) where the
+/// value was larger. One number for both, so that no branch picks between them.
+pub(crate) const GATHER_ENTRY_BYTES: u64 =
+	max_entry_bytes(0, 0) + (2 + crate::vlog::VALUE_TIMESTAMP_SIZE + VALUE_POINTER_SIZE) as u64;
+/// The bytes of the estimate that a byte of key or value costs at most: a key adds the prefix node
+/// that artmap counts for every 17 bytes of it, and a value counts for its length. A value counts
+/// for less than that, and the key for less than the rounding up, so this is an upper bound.
+const GATHER_BYTE_COST: u64 = (max_entry_bytes(17, 0) - max_entry_bytes(0, 0)).div_ceil(17);
+/// The bytes of `Batch::size` that an entry takes beyond its key and value: the kind, the two
+/// lengths (one byte each at the least) and the timestamp.
+const ENTRY_OVERHEAD: u64 = 1 + 1 + 1 + 8;
+
 /// The bytes an entry takes in an encoded batch beyond what `Batch::grow` counts for it, at
 /// most: a timestamp varint of up to 10 bytes where `grow` counts 8, and its value pointer flag.
 pub(crate) const ENCODED_ENTRY_SLACK: u64 = 2 + 1;
@@ -232,6 +248,21 @@ impl Batch {
 			.iter()
 			.map(|e| max_entry_bytes(e.key.len(), e.value.as_ref().map_or(0, |v| v.len())))
 			.sum()
+	}
+
+	/// An upper bound on `memtable_size_estimate` of this batch after the flusher has encoded its
+	/// values, from the two numbers the batch tracks, without a pass over its entries: `size` is at
+	/// least the key and value bytes and `ENTRY_OVERHEAD` for each entry. It is what the committer
+	/// hands the flusher, which closes a commit group before the sum of these passes what a fresh
+	/// memtable takes (see `CommitPipeline::group_est_budget`). Looser than the estimate by about
+	/// a fifth for entries of 50 bytes and 100 bytes, by up to five times for large values, and
+	/// more where the value log replaces a value by a pointer, which the bound does not count.
+	pub(crate) fn gather_estimate(&self) -> u64 {
+		let entries = self.entries.len() as u64;
+		let bytes = self.size.saturating_sub(entries.saturating_mul(ENTRY_OVERHEAD));
+		entries
+			.saturating_mul(GATHER_ENTRY_BYTES)
+			.saturating_add(GATHER_BYTE_COST.saturating_mul(bytes))
 	}
 
 	/// Get entries for VLog processing
