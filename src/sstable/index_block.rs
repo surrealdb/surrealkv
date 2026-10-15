@@ -572,8 +572,7 @@ pub(crate) struct IndexIterator<'a> {
 	/// Current partition block index in index.blocks[]
 	partition_index: usize,
 
-	/// Iterator within the current partition block
-	/// None if not yet positioned or exhausted
+	/// Iterator within the current partition block (reused across partitions)
 	partition_iter: Option<BlockIterator>,
 }
 
@@ -631,7 +630,7 @@ impl<'a> IndexIterator<'a> {
 
 		// Handle empty first partition
 		if !self.valid() {
-			self.next()?;
+			self.advance_to_next_partition()?;
 		}
 		Ok(())
 	}
@@ -654,7 +653,7 @@ impl<'a> IndexIterator<'a> {
 
 		// Handle empty last partition
 		if !self.valid() {
-			self.prev()?;
+			self.retreat_to_prev_partition()?;
 		}
 		Ok(())
 	}
@@ -707,11 +706,12 @@ impl<'a> IndexIterator<'a> {
 				// This handles the "gap" case where target is between
 				// this partition's actual entries and its separator
 				if !self.valid() {
-					self.next()?;
+					self.advance_to_next_partition()?;
 				}
 			}
 			None => {
 				// Target is beyond all partitions
+				self.partition_index = self.index.blocks.len();
 				if let Some(ref mut iter) = self.partition_iter {
 					iter.reset();
 				}
@@ -732,6 +732,10 @@ impl<'a> IndexIterator<'a> {
 	///    c. Repeat if that partition is also empty
 	/// ```
 	pub(crate) fn next(&mut self) -> Result<bool> {
+		if !self.valid() {
+			return Ok(false);
+		}
+
 		// Try advancing within current partition
 		if let Some(ref mut iter) = self.partition_iter {
 			if iter.advance()? {
@@ -739,9 +743,13 @@ impl<'a> IndexIterator<'a> {
 			}
 		}
 
+		self.advance_to_next_partition()
+	}
+
+	fn advance_to_next_partition(&mut self) -> Result<bool> {
 		// Current partition exhausted, move to next
 		loop {
-			self.partition_index += 1;
+			self.partition_index = self.partition_index.saturating_add(1);
 
 			// Check if we've exhausted all partitions
 			if self.partition_index >= self.index.blocks.len() {
@@ -764,6 +772,10 @@ impl<'a> IndexIterator<'a> {
 
 	/// Moves to the previous entry, crossing partition boundaries if needed.
 	pub(crate) fn prev(&mut self) -> Result<bool> {
+		if !self.valid() {
+			return Ok(false);
+		}
+
 		// Try retreating within current partition
 		if let Some(ref mut iter) = self.partition_iter {
 			if iter.prev_internal()? {
@@ -771,6 +783,10 @@ impl<'a> IndexIterator<'a> {
 			}
 		}
 
+		self.retreat_to_prev_partition()
+	}
+
+	fn retreat_to_prev_partition(&mut self) -> Result<bool> {
 		// Current partition exhausted going backward, move to previous
 		loop {
 			if self.partition_index == 0 {

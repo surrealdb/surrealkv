@@ -328,8 +328,19 @@ impl Block {
 			let offset = get_restart(mid);
 			let (shared_prefix, non_shared_key, _, i) =
 				BlockIterator::decode_entry_lengths_from(block, offset)?;
-			let key_start = offset + i;
-			let key_end = key_start + shared_prefix + non_shared_key;
+			let key_start = offset.checked_add(i).ok_or_else(|| {
+				Error::from(SSTableError::IntegerOverflowKeyEnd {
+					offset,
+				})
+			})?;
+			let key_end = key_start
+				.checked_add(shared_prefix)
+				.and_then(|sum| sum.checked_add(non_shared_key))
+				.ok_or_else(|| {
+					Error::from(SSTableError::IntegerOverflowKeyEnd {
+						offset,
+					})
+				})?;
 			if key_end > block.len() {
 				let err = Error::from(SSTableError::KeyExtendsBeyondBounds {
 					offset,
@@ -809,30 +820,34 @@ impl BlockIterator {
 		block: &[u8],
 		offset: usize,
 	) -> Result<(usize, usize, usize, usize)> {
+		let rest = block.get(offset..).ok_or_else(|| {
+			Error::from(SSTableError::FailedToDecodeSharedPrefix {
+				offset,
+			})
+		})?;
 		let mut i = 0;
 
-		let (shared_prefix_length, shared_prefix_length_size) =
-			decode_varint_usize(&block[offset..]).ok_or_else(|| {
+		let (shared_prefix_length, shared_prefix_length_size) = decode_varint_usize(rest)
+			.ok_or_else(|| {
 				Error::from(SSTableError::FailedToDecodeSharedPrefix {
 					offset,
 				})
 			})?;
 		i += shared_prefix_length_size;
 
-		let (non_shared_key_length, non_shared_key_length_size) =
-			decode_varint_usize(&block[offset + i..]).ok_or_else(|| {
-				Error::from(SSTableError::FailedToDecodeNonSharedKeyLength {
-					offset: offset + i,
-				})
-			})?;
+		let (non_shared_key_length, non_shared_key_length_size) = decode_varint_usize(&rest[i..])
+			.ok_or_else(|| {
+			Error::from(SSTableError::FailedToDecodeNonSharedKeyLength {
+				offset: offset + i,
+			})
+		})?;
 		i += non_shared_key_length_size;
 
-		let (value_size, value_size_size) =
-			decode_varint_usize(&block[offset + i..]).ok_or_else(|| {
-				Error::from(SSTableError::FailedToDecodeValueSize {
-					offset: offset + i,
-				})
-			})?;
+		let (value_size, value_size_size) = decode_varint_usize(&rest[i..]).ok_or_else(|| {
+			Error::from(SSTableError::FailedToDecodeValueSize {
+				offset: offset + i,
+			})
+		})?;
 		i += value_size_size;
 
 		Ok((shared_prefix_length, non_shared_key_length, value_size, i))
@@ -918,6 +933,7 @@ impl BlockIterator {
 		self.current_key.clear();
 		self.current_value_offset_start = 0;
 		self.current_value_offset_end = 0;
+		self.current_entry_offset = 0;
 	}
 }
 
@@ -1087,8 +1103,19 @@ impl BlockIterator {
 
 			// Decode key at this restart point
 			let (shared_prefix, non_shared_key, _, i) = self.decode_entry_lengths(self.offset)?;
-			let key_start = self.offset + i;
-			let key_end = key_start + shared_prefix + non_shared_key;
+			let key_start = self.offset.checked_add(i).ok_or_else(|| {
+				Error::from(SSTableError::IntegerOverflowKeyEnd {
+					offset: self.offset,
+				})
+			})?;
+			let key_end = key_start
+				.checked_add(shared_prefix)
+				.and_then(|sum| sum.checked_add(non_shared_key))
+				.ok_or_else(|| {
+					Error::from(SSTableError::IntegerOverflowKeyEnd {
+						offset: self.offset,
+					})
+				})?;
 
 			if key_end > self.block.len() {
 				let err = Error::from(SSTableError::KeyExtendsBeyondBounds {

@@ -807,3 +807,70 @@ fn test_partitioned_index_varying_partition_sizes() {
 		assert_eq!(count, 20, "Should iterate all 20 keys at partition_size {partition_size}");
 	}
 }
+
+#[test]
+fn test_index_and_table_iterator_remain_exhausted_after_end_and_past_end_seek() {
+	let opts = Arc::new(Options {
+		index_partition_size: 40,
+		block_size: 128,
+		..Default::default()
+	});
+
+	let mut buffer = Vec::new();
+	let mut writer = crate::sstable::table::TableWriter::new(&mut buffer, 0, Arc::clone(&opts), 0);
+
+	for i in 0..20 {
+		let key = format!("key_{i:03}");
+		let internal_key =
+			InternalKey::new(key.as_bytes().to_vec(), (i + 1) as u64, InternalKeyKind::Set);
+		let value = format!("value_{i:03}").into_bytes();
+		writer.add(internal_key, &value).unwrap();
+	}
+
+	let size = writer.finish().unwrap();
+	let table = Arc::new(
+		crate::sstable::table::Table::new(0, opts, wrap_buffer(buffer), size as u64).unwrap(),
+	);
+
+	// 1. Direct IndexIterator: repeated next()/prev() after exhaustion and after seek past end
+	let crate::sstable::table::IndexType::Partitioned(ref partitioned_index) = table.index_block;
+	let mut idx_iter = crate::sstable::index_block::IndexIterator::new(partitioned_index);
+	assert!(!idx_iter.next().unwrap());
+	assert!(!idx_iter.prev().unwrap());
+
+	idx_iter.seek_to_first().unwrap();
+	assert!(idx_iter.valid());
+	while idx_iter.next().unwrap() {}
+	assert!(!idx_iter.valid());
+	assert!(!idx_iter.next().unwrap(), "IndexIterator::next after exhaustion must stay false");
+	assert!(!idx_iter.valid());
+
+	idx_iter.seek_to_last().unwrap();
+	assert!(idx_iter.valid());
+	while idx_iter.prev().unwrap() {}
+	assert!(!idx_iter.valid());
+	assert!(!idx_iter.prev().unwrap(), "IndexIterator::prev after exhaustion must stay false");
+	assert!(!idx_iter.valid());
+
+	idx_iter.seek_to_first().unwrap();
+	assert!(idx_iter.valid());
+	let past_end = InternalKey::new(b"zzz_past_end".to_vec(), 1, InternalKeyKind::Set).encode();
+	idx_iter.seek(&past_end).unwrap();
+	assert!(!idx_iter.valid());
+	assert!(!idx_iter.next().unwrap(), "IndexIterator::next after seek past end must stay false");
+	assert!(!idx_iter.prev().unwrap(), "IndexIterator::prev after seek past end must stay false");
+
+	// 2. TableIterator: seek to valid entry (populating second_level), then seek past end
+	let mut table_iter = table.iter(None).unwrap();
+	let first_key = InternalKey::new(b"key_000".to_vec(), 1, InternalKeyKind::Set).encode();
+	assert!(table_iter.seek(&first_key).unwrap());
+	assert!(table_iter.valid());
+
+	assert!(!table_iter.seek(&past_end).unwrap());
+	assert!(!table_iter.valid());
+	assert!(
+		!table_iter.next().unwrap(),
+		"TableIterator::next after seek past end must not restart"
+	);
+	assert!(!table_iter.valid());
+}

@@ -1112,9 +1112,8 @@ pub(crate) struct SnapshotIterator<'a> {
 	/// Last user key seen (forward direction) - reusable buffer
 	last_key_fwd: Vec<u8>,
 
-	/// For backward iteration: reusable user key buffer and boundary flag
+	/// For backward iteration: reusable user key buffer for the current group
 	buffered_back_key: Vec<u8>,
-	has_buffered_back: bool,
 
 	/// For backward iteration: the current entry we're returning
 	/// (stored because merge_iter has already moved past it)
@@ -1161,7 +1160,6 @@ impl SnapshotIterator<'_> {
 			range_deletions,
 			last_key_fwd: Vec::new(),
 			buffered_back_key: Vec::new(),
-			has_buffered_back: false,
 			current_back_key: Vec::new(),
 			current_back_value: Vec::new(),
 			has_current_back: false,
@@ -1239,15 +1237,10 @@ impl SnapshotIterator<'_> {
 	/// or invisible to this snapshot until a valid live entry is found or the iterator exhausts.
 	fn find_latest_visible_backward(&mut self) -> Result<bool> {
 		loop {
-			// Position merge_iter at the start of the next user key to examine.
-			//
-			// `has_buffered_back` is set when a prior iteration crossed into a
-			// new user key while walking versions of the previous one; the
-			// boundary key is already loaded into merge_iter, so we just clear
-			// the flag and fall through.
-			if self.has_buffered_back {
-				self.has_buffered_back = false;
-			} else if !self.merge_iter.valid() {
+			// merge_iter is positioned at the start of the next user key to examine
+			// (either from initial seek_last / forward_to_backward, or from the prior
+			// iteration's inner loop stopping on a user key boundary).
+			if !self.merge_iter.valid() {
 				self.has_current_back = false;
 				return Ok(false);
 			}
@@ -1269,8 +1262,8 @@ impl SnapshotIterator<'_> {
 
 			// Walk older versions of this same user key, picking up the latest
 			// visible one. Stops when merge_iter goes invalid or crosses into
-			// a different user key (which becomes the buffered start for the
-			// next outer iteration).
+			// a different user key (leaving merge_iter positioned at that key
+			// for the next outer iteration).
 			loop {
 				self.merge_iter.prev()?;
 
@@ -1282,7 +1275,6 @@ impl SnapshotIterator<'_> {
 				let user_key = key_ref.user_key();
 
 				if user_key != self.buffered_back_key.as_slice() {
-					self.has_buffered_back = true;
 					break;
 				}
 
@@ -1324,7 +1316,6 @@ impl SnapshotIterator<'_> {
 		// Get current user key from backward state (equivalent to saved_key_)
 		if !self.has_current_back {
 			// No current position in backward mode
-			self.has_buffered_back = false;
 			return Ok(false);
 		}
 
@@ -1336,7 +1327,6 @@ impl SnapshotIterator<'_> {
 
 		// Clear backward state
 		self.has_current_back = false;
-		self.has_buffered_back = false;
 
 		// Seek to first entry >= current user key
 		// Using (user_key, MAX_SEQ) positions at the start of this user key's entries
@@ -1354,7 +1344,6 @@ impl SnapshotIterator<'_> {
 		self.direction = MergeDirection::Backward;
 
 		// Clear backward buffers
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 
 		// In forward mode, merge_iter is positioned at the current entry
@@ -1365,7 +1354,7 @@ impl SnapshotIterator<'_> {
 		}
 
 		// find_latest_visible_backward will scan this user key's entries
-		// to find the latest visible version, then buffer the next user key
+		// to find the latest visible version, then leave merge_iter at the next user key
 		self.skip_to_valid_backward()
 	}
 }
@@ -1374,7 +1363,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 	fn seek(&mut self, target: &[u8]) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.last_key_fwd.clear();
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 		self.merge_iter.seek(target)?;
 		self.initialized = true;
@@ -1384,7 +1372,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 	fn seek_first(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Forward;
 		self.last_key_fwd.clear();
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 		self.merge_iter.seek_first()?;
 		self.initialized = true;
@@ -1393,7 +1380,6 @@ impl LSMIterator for SnapshotIterator<'_> {
 
 	fn seek_last(&mut self) -> Result<bool> {
 		self.direction = MergeDirection::Backward;
-		self.has_buffered_back = false;
 		self.has_current_back = false;
 		self.merge_iter.seek_last()?;
 		self.initialized = true;
@@ -1429,7 +1415,7 @@ impl LSMIterator for SnapshotIterator<'_> {
 		}
 
 		// Normal backward iteration
-		if !self.merge_iter.valid() && !self.has_buffered_back {
+		if !self.merge_iter.valid() {
 			self.has_current_back = false;
 			return Ok(false);
 		}

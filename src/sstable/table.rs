@@ -1976,8 +1976,10 @@ impl<'a> TableIterator<'a> {
 				// No lower bound: seek to absolute first
 				self.first_level.seek_to_first()?;
 				self.init_data_block()?;
-				if let Some(ref mut iter) = self.second_level {
-					iter.seek_to_first()?;
+				if self.first_level.valid() {
+					if let Some(ref mut iter) = self.second_level {
+						iter.seek_to_first()?;
+					}
 				}
 				self.advance_to_valid_entry()?;
 			}
@@ -2000,7 +2002,7 @@ impl<'a> TableIterator<'a> {
 		}
 
 		// Verify we didn't overshoot the upper bound
-		if self.is_valid() && !self.satisfies_upper_bound(self.current_user_key()) {
+		if !self.is_valid() || !self.satisfies_upper_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
 		Ok(())
@@ -2086,8 +2088,10 @@ impl<'a> TableIterator<'a> {
 				// No upper bound: seek to absolute last
 				self.first_level.seek_to_last()?;
 				self.init_data_block()?;
-				if let Some(ref mut iter) = self.second_level {
-					iter.seek_to_last()?;
+				if self.first_level.valid() {
+					if let Some(ref mut iter) = self.second_level {
+						iter.seek_to_last()?;
+					}
 				}
 				self.retreat_to_valid_entry()?;
 			}
@@ -2137,7 +2141,7 @@ impl<'a> TableIterator<'a> {
 		}
 
 		// Verify we didn't back up past the lower bound
-		if self.is_valid() && !self.satisfies_lower_bound(self.current_user_key()) {
+		if !self.is_valid() || !self.satisfies_lower_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
 		Ok(())
@@ -2166,6 +2170,12 @@ impl<'a> TableIterator<'a> {
 	fn seek_internal(&mut self, target: &[u8]) -> Result<()> {
 		// Step 1: Position first_level at the right index entry
 		self.first_level.seek(target)?;
+		if !self.first_level.valid() {
+			if let Some(ref mut iter) = self.second_level {
+				iter.reset();
+			}
+			return Ok(());
+		}
 
 		// Step 2: Load the data block it points to
 		self.init_data_block()?;
@@ -2185,8 +2195,10 @@ impl<'a> TableIterator<'a> {
 		self.first_level.seek_to_last()?;
 		self.init_data_block()?;
 
-		if let Some(ref mut iter) = self.second_level {
-			iter.seek_to_last()?;
+		if self.first_level.valid() {
+			if let Some(ref mut iter) = self.second_level {
+				iter.seek_to_last()?;
+			}
 		}
 
 		self.retreat_to_valid_entry()?;
@@ -2195,7 +2207,7 @@ impl<'a> TableIterator<'a> {
 
 	fn advance_internal(&mut self) -> Result<bool> {
 		if let Some(ref mut iter) = self.second_level {
-			if iter.advance()? {
+			if iter.is_valid() && iter.advance()? {
 				return Ok(true);
 			}
 		}
@@ -2205,7 +2217,7 @@ impl<'a> TableIterator<'a> {
 
 	fn prev_internal(&mut self) -> Result<bool> {
 		if let Some(ref mut iter) = self.second_level {
-			if iter.prev_internal()? {
+			if iter.is_valid() && iter.prev_internal()? {
 				return Ok(true);
 			}
 		}
@@ -2223,7 +2235,7 @@ impl LSMIterator for TableIterator<'_> {
 		self.exhausted = false;
 		self.seek_internal(target)?;
 
-		if self.is_valid() && !self.satisfies_upper_bound(self.current_user_key()) {
+		if !self.is_valid() || !self.satisfies_upper_bound(self.current_user_key()) {
 			self.mark_exhausted();
 		}
 		Ok(self.is_valid())
