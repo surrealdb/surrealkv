@@ -442,7 +442,7 @@ These are storage primitives only. They are not yet wired into `Tree`, which ope
 To compile for WebAssembly:
 
 ```bash
-RUSTFLAGS="--cfg getrandom_backend=\"wasm_js\"" cargo build --target wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown
 ```
 
 ---

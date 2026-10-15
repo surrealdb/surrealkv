@@ -19,6 +19,7 @@ pub mod memory;
 mod memtable;
 mod migrate;
 mod ring;
+mod rt;
 // The background scrubber is planned, not implemented: nothing constructs it outside tests.
 #[cfg(test)]
 mod scrubber;
@@ -44,6 +45,9 @@ mod wal;
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod test;
+// The tests that need a browser: see the module for how to run them.
+#[cfg(all(test, target_arch = "wasm32", target_os = "unknown"))]
+mod wasm_tests;
 
 use std::cmp::Ordering;
 use std::fmt::Debug;
@@ -702,6 +706,13 @@ impl Options {
 	/// This should be called when the store starts to catch configuration
 	/// errors early
 	pub fn validate(&self) -> Result<()> {
+		self.validate_for_pointer_width(usize::BITS)
+	}
+
+	/// `validate`, for a target with `pointer_bits`-bit pointers. The limits that depend on the
+	/// address space are checked against it, so that a 32-bit target's limits are tested on any
+	/// host.
+	fn validate_for_pointer_width(&self, pointer_bits: u32) -> Result<()> {
 		// A build without the `encryption` feature must not seal anything, so it refuses a key
 		// manager rather than writing plaintext to a database that was asked to be encrypted.
 		// Refuse here, which is the first thing `Tree::new` does, so a rejection creates nothing
@@ -735,8 +746,29 @@ impl Options {
 			)));
 		}
 
+		check_memtable_size_is_addressable(self.max_memtable_size, pointer_bits)?;
+
 		Ok(())
 	}
+}
+
+/// The first `max_memtable_size` that a target with 32-bit pointers cannot give a memtable: the
+/// arena is one allocation of at most `isize::MAX` bytes there, which is 2 GiB less one, and its
+/// size is rounded down to a multiple of 64. A size from here up is refused rather than let the
+/// allocation abort the process, which in a browser traps the whole instance.
+const MEMTABLE_SIZE_LIMIT_32_BIT: u64 = (1 << 31) - 64;
+
+/// Refuses a `max_memtable_size` that a target with `pointer_bits`-bit pointers cannot allocate
+/// as one memtable arena. Nothing is refused on a 64-bit target, whose arenas are limited by
+/// artmap alone (4 GiB).
+fn check_memtable_size_is_addressable(max_memtable_size: usize, pointer_bits: u32) -> Result<()> {
+	if pointer_bits <= 32 && max_memtable_size as u64 >= MEMTABLE_SIZE_LIMIT_32_BIT {
+		return Err(Error::InvalidArgument(format!(
+			"max_memtable_size ({max_memtable_size}) must be less than {MEMTABLE_SIZE_LIMIT_32_BIT} \
+			 bytes on a target with 32-bit pointers"
+		)));
+	}
+	Ok(())
 }
 
 #[derive(Debug, PartialEq, Eq, Copy, Clone)]
@@ -1275,3 +1307,47 @@ pub trait LSMIterator {
 #[cfg(doctest)]
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
+
+#[cfg(test)]
+mod options_bound_tests {
+	use super::*;
+
+	const GIB: usize = 1 << 30;
+
+	#[test]
+	fn a_32_bit_target_refuses_a_memtable_it_cannot_allocate() {
+		for size in [2 * GIB, 2 * GIB - 64, 3 * GIB, u32::MAX as usize] {
+			let error = check_memtable_size_is_addressable(size, 32)
+				.expect_err("a memtable of 2 GiB or more cannot be allocated with 32-bit pointers");
+			assert!(matches!(error, Error::InvalidArgument(_)), "{error:?}");
+		}
+	}
+
+	#[test]
+	fn a_32_bit_target_accepts_what_it_can_allocate() {
+		for size in [0, 64, 16 * 1024 * 1024, GIB, 2 * GIB - 128, 2 * GIB - 65] {
+			check_memtable_size_is_addressable(size, 32).expect("the arena fits");
+		}
+	}
+
+	#[test]
+	fn a_64_bit_target_refuses_nothing() {
+		for size in [0, 100 * 1024 * 1024, 2 * GIB, 3 * GIB] {
+			check_memtable_size_is_addressable(size, 64).expect("no 32-bit limit applies");
+		}
+	}
+
+	#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+	#[test]
+	fn validate_applies_the_bound_of_the_pointer_width() {
+		let options = Options::default().with_max_memtable_size(2 * GIB);
+		options.validate_for_pointer_width(32).expect_err("2 GiB is refused with 32-bit pointers");
+		options.validate_for_pointer_width(64).expect("2 GiB is fine with 64-bit pointers");
+		// The default and the size of a browser's memtable pass either way.
+		for size in [Options::default().max_memtable_size, 16 * 1024 * 1024] {
+			let options = Options::default().with_max_memtable_size(size);
+			options.validate_for_pointer_width(32).expect("within the 32-bit limit");
+			options.validate().expect("valid on this target");
+		}
+	}
+}
