@@ -230,6 +230,31 @@ fn retire_due(groups: u32, entries: u64) -> bool {
 /// instead, and the flusher keeps going while it has nothing else to do.
 pub(crate) const RETIRED_FREE_CHUNK: usize = 256;
 
+/// How many commits in flight tell the flusher that it has landed in a gap between two groups
+/// under load, and not in a quiet moment.
+///
+/// A commit is in flight from its admission until the flusher has completed it. With this many,
+/// commits are about to be decided, so the gap is over soon. With fewer, nothing is waiting for
+/// the flusher.
+pub(crate) const BUSY_COMMITS: usize = 16;
+
+/// How many ring slots the flusher releases in one step while it has nothing to flush and
+/// commits are in flight, see `BUSY_COMMITS`.
+///
+/// Small, because a commit that is decided during a step is not taken up until the step is over.
+const BUSY_FREE_SLOTS: u64 = 64;
+
+/// How many steps of `BUSY_FREE_SLOTS` the flusher takes while it has nothing to flush and commits
+/// are in flight before it yields to the runtime.
+///
+/// A yield puts the flusher at the back of the run queue, behind every task that is ready to run,
+/// and a commit that is decided meanwhile is not taken up until the flusher runs again. With
+/// commits in flight the flusher is in a gap between two groups again and again, so it yields only
+/// every this many steps. With no commit in flight nothing is waiting for it, and it yields after
+/// every step, as it always did: on a runtime with few threads that is what gives the other tasks
+/// their turn while it frees what a long transaction left behind.
+pub(crate) const BUSY_STEPS_PER_YIELD: u32 = 64;
+
 /// How many ring slots the flusher releases after a group that drained `entries` entries. A
 /// retire passes as many slots as the groups since the last one drained, so releasing a fixed
 /// chunk per group would fall behind from about `RETIRED_FREE_CHUNK` entries a group and leave
@@ -539,6 +564,18 @@ impl CommitPipeline {
 				matches!(self.ring.get(*seq), SlotRead::Ready(e) if matches!(e.state(), EntryState::Accepted))
 			})
 			.count()
+	}
+
+	/// How many commits are in flight: admitted, and not yet completed by the flusher.
+	fn commits_in_flight(&self) -> usize {
+		(ADMISSION_PERMITS as usize).saturating_sub(self.admission.available_permits())
+	}
+
+	/// Test helper: takes `n` admission permits, which makes `n` commits count as in flight until
+	/// the permits are dropped.
+	#[cfg(test)]
+	pub(crate) fn hold_admission(&self, n: u32) -> OwnedSemaphorePermit {
+		Arc::clone(&self.admission).try_acquire_many_owned(n).expect("admission has the room")
 	}
 
 	/// Test observer: the admission permits not held by a claimed entry.
@@ -881,6 +918,8 @@ impl CommitPipeline {
 			std::pin::pin!(Arc::clone(&self.admission).acquire_many_owned(ADMISSION_PERMITS));
 		// Whether retired entries may still be waiting in the overflow map.
 		let mut retired_pending = false;
+		// Steps of freeing the flusher took in a gap under load since the last group.
+		let mut busy_steps = 0u32;
 		loop {
 			// Gather the contiguous decided entries after `drained`, with the permits to
 			// release once the completed prefix passes them, as one. The group stops before
@@ -936,9 +975,20 @@ impl CommitPipeline {
 				}
 				if retired_pending {
 					// Nothing to flush: carry on freeing instead of parking with the
-					// memory held, yielding so that the committers get to run.
-					retired_pending = self.free_retired(&mut scratch.retired, 0);
-					tokio::task::yield_now().await;
+					// memory held, yielding so that the committers get to run. Not after
+					// every step if commits are in flight, which makes this a gap between
+					// two groups: see `BUSY_COMMITS`.
+					if self.commits_in_flight() >= BUSY_COMMITS {
+						retired_pending = self.free_retired(&mut scratch.retired, BUSY_FREE_SLOTS);
+						busy_steps += 1;
+						if busy_steps % BUSY_STEPS_PER_YIELD == 0 {
+							tokio::task::yield_now().await;
+						}
+					} else {
+						retired_pending =
+							self.free_retired(&mut scratch.retired, retired_slots_per_step(0));
+						tokio::task::yield_now().await;
+					}
 					continue;
 				}
 				// Wait for new published or decided entries
@@ -948,6 +998,7 @@ impl CommitPipeline {
 			let entries = next - (drained + 1);
 			entries_since_retire += entries;
 			drained = next - 1;
+			busy_steps = 0;
 
 			if !scratch.group.is_empty() {
 				self.flush_entries(&mut scratch).await;
@@ -973,7 +1024,8 @@ impl CommitPipeline {
 			// One chunk per group, so that the entries a long-lived transaction left behind
 			// do not stall the commits that follow it.
 			if retired_pending {
-				retired_pending = self.free_retired(&mut scratch.retired, entries);
+				retired_pending =
+					self.free_retired(&mut scratch.retired, retired_slots_per_step(entries));
 			}
 		}
 	}
@@ -1165,14 +1217,13 @@ impl CommitPipeline {
 		self.ring.raise_taken(bound);
 	}
 
-	/// Frees one chunk of the ring slots and one chunk of the overflow entries that the retired
-	/// watermark has passed, and reports whether more of either are left. `entries` is how many
-	/// ring entries the group before it drained, which scales the ring's chunk, and `freed` is
-	/// the buffer the overflow entries go through, empty on entry.
+	/// Frees up to `slots` of the ring slots and one chunk of the overflow entries that the retired
+	/// watermark has passed, and reports whether more of either are left. `freed` is the buffer
+	/// the overflow entries go through, empty on entry.
 	///
 	/// What validation reads is above the watermark, so which of the entries at or below it are
 	/// still held does not matter to it, and the rest can wait for the next call.
-	fn free_retired(&self, freed: &mut Vec<Arc<CommitEntry>>, entries: u64) -> bool {
+	fn free_retired(&self, freed: &mut Vec<Arc<CommitEntry>>, slots: u64) -> bool {
 		#[cfg(test)]
 		{
 			let hook = self.free_hook.lock().clone();
@@ -1180,7 +1231,7 @@ impl CommitPipeline {
 				hook();
 			}
 		}
-		let more_slots = self.ring.release_retired(retired_slots_per_step(entries));
+		let more_slots = self.ring.release_retired(slots);
 		#[cfg_attr(not(test), allow(unused_variables))]
 		let (count, more) =
 			free_retired_from(&self.overflow, self.ring.taken(), RETIRED_FREE_CHUNK, freed);

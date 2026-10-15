@@ -8,7 +8,9 @@
 //! * Completeness: every retired entry is freed, with no further commits, and then the flusher
 //!   parks again: it does not spin, and nothing wakes it up on its own.
 //! * Fairness: a drain does not hold up a commit that was accepted meanwhile, nor, on a runtime
-//!   with few threads, the other tasks.
+//!   with few threads, the other tasks. With commits in flight the flusher is in a gap between two
+//!   groups under load and yields only every `BUSY_STEPS_PER_YIELD` steps, which is the one place
+//!   it does not give way after every chunk.
 //! * Safety: nothing above the retired watermark is ever freed, so validation finds every conflict
 //!   while the drain runs, whenever a transaction begins, and across close and restore.
 //!
@@ -26,6 +28,8 @@ use crate::lsm::Tree;
 use crate::ring::{
 	FreeStats,
 	PipelineHook,
+	BUSY_COMMITS,
+	BUSY_STEPS_PER_YIELD,
 	COMMIT_RING_CAPACITY,
 	RETIRED_FREE_CHUNK,
 	RETIRE_EVERY_ENTRIES,
@@ -691,19 +695,12 @@ async fn a_commit_accepted_during_the_idle_drain_is_flushed_before_the_next_step
 	until(60, "the drain to finish", || overflow_len(&store) == 0).await;
 }
 
-/// The flusher frees retired entries with nothing to flush, so it must give the runtime up between
-/// chunks, or on a runtime with few threads the committers and every other task wait for it for as
-/// long as the entries are many. A task that is always ready counts how often it ran, and the
-/// longest run of calls to `free_retired` with none of its turns in between is read off.
-#[tokio::test]
-async fn the_flusher_gives_way_to_other_tasks_between_chunks_when_it_has_nothing_to_flush() {
-	let (store, _dir) = create_store();
+/// Lets the flusher drain what `held` was keeping from being retired, and reports how many times
+/// it called `free_retired` and the longest run of those calls with no turn of another task in
+/// between. A task that is always ready counts how often it ran, which is how the turns are read
+/// off. Dropping `held` is what lets the commits that follow retire the entries.
+async fn drain_and_count_turns<H>(store: &Arc<Tree>, held: H) -> (usize, usize) {
 	let pipeline = &store.core.commit_pipeline;
-	let held = store.begin().unwrap();
-	commit_many(&store, "fill", 6 * CAP).await;
-	let (_, _, retained) = pipeline.watermarks();
-	assert!(retained > 16 * RETIRED_FREE_CHUNK, "setup: only {retained} entries are kept");
-
 	let turns = Arc::new(AtomicUsize::new(0));
 	let probe = {
 		let turns = Arc::clone(&turns);
@@ -740,12 +737,26 @@ async fn the_flusher_gives_way_to_other_tasks_between_chunks_when_it_has_nothing
 		})));
 	}
 	drop(held);
-	commit_unique(&store, "resume", 2 * u64::from(RETIRE_EVERY_GROUPS)).await;
-	overflow_drained(&store).await;
+	commit_unique(store, "resume", 2 * u64::from(RETIRE_EVERY_GROUPS)).await;
+	overflow_drained(store).await;
 	pipeline.set_free_retired_hook(None);
 	probe.abort();
+	(calls.load(Ordering::SeqCst), longest.load(Ordering::SeqCst))
+}
 
-	let (calls, longest) = (calls.load(Ordering::SeqCst), longest.load(Ordering::SeqCst));
+/// The flusher frees retired entries with nothing to flush, so it must give the runtime up between
+/// chunks, or on a runtime with few threads the committers and every other task wait for it for as
+/// long as the entries are many. With no commit in flight nothing is waiting for the flusher, and
+/// it gives way after every chunk.
+#[tokio::test]
+async fn the_flusher_gives_way_to_other_tasks_between_chunks_when_it_has_nothing_to_flush() {
+	let (store, _dir) = create_store();
+	let held = store.begin().unwrap();
+	commit_many(&store, "fill", 6 * CAP).await;
+	let (_, _, retained) = store.core.commit_pipeline.watermarks();
+	assert!(retained > 16 * RETIRED_FREE_CHUNK, "setup: only {retained} entries are kept");
+
+	let (calls, longest) = drain_and_count_turns(&store, held).await;
 	assert!(calls > retained / RETIRED_FREE_CHUNK, "setup: {calls} calls freed {retained} entries");
 	// A few calls can follow each other (the one after a group, and the one that finds nothing to
 	// flush), but not the dozens that freeing the entries of a long transaction takes
@@ -753,6 +764,45 @@ async fn the_flusher_gives_way_to_other_tasks_between_chunks_when_it_has_nothing
 		longest <= 8,
 		"{longest} calls to free_retired in a row without another task getting a turn"
 	);
+}
+
+/// With commits in flight the flusher that has nothing to flush is in a gap between two groups
+/// under load, and a yield there leaves the commits that are about to be decided waiting until the
+/// runtime comes round to it again. So it frees small chunks and yields only every
+/// `BUSY_STEPS_PER_YIELD` of them: the runs of calls without a turn of another task are long now,
+/// but they end. The commits in flight are held by taking admission permits, which count the
+/// same.
+#[tokio::test]
+async fn with_commits_in_flight_the_flusher_yields_only_every_few_chunks_and_still_drains() {
+	let (store, _dir) = create_store();
+	let pipeline = &store.core.commit_pipeline;
+	let held = store.begin().unwrap();
+	// Enough for several yields: the overflow map frees `RETIRED_FREE_CHUNK` entries a call
+	let fill = 4 * u64::from(BUSY_STEPS_PER_YIELD) * RETIRED_FREE_CHUNK as u64 + 2 * CAP;
+	commit_many(&store, "fill", fill).await;
+	let (_, _, retained) = pipeline.watermarks();
+	assert!(
+		retained > 3 * BUSY_STEPS_PER_YIELD as usize * RETIRED_FREE_CHUNK,
+		"setup: only {retained} entries are kept"
+	);
+
+	let in_flight = pipeline.hold_admission(2 * BUSY_COMMITS as u32);
+	let (calls, longest) = drain_and_count_turns(&store, held).await;
+	drop(in_flight);
+
+	assert!(calls >= 3 * BUSY_STEPS_PER_YIELD as usize, "setup: only {calls} calls");
+	// The calls that follow one another until the flusher yields, a few more than that for the
+	// ones around a group, and twice that for a turn the probe does not get after the first yield
+	let steps = BUSY_STEPS_PER_YIELD as usize;
+	assert!(
+		longest > 8,
+		"{longest} calls in a row: the flusher yielded after every few chunks with commits in flight"
+	);
+	assert!(
+		longest <= 2 * steps + 3,
+		"{longest} calls to free_retired in a row without another task getting a turn"
+	);
+	assert_eq!(overflow_len(&store), 0, "the drain finished");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -839,8 +889,21 @@ async fn validators_find_every_conflict_while_retired_entries_are_being_freed() 
 /// gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_entries_above_the_watermark_survive_the_free_of_everything_below_it() {
+	the_entries_above_the_watermark_survive_the_free_with(0).await;
+}
+
+/// The same with commits in flight, which makes the flusher free in the small steps that it takes
+/// in a gap between two groups under load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_entries_above_the_watermark_survive_the_free_with_commits_in_flight() {
+	the_entries_above_the_watermark_survive_the_free_with(2 * BUSY_COMMITS as u32).await;
+}
+
+/// `in_flight` admission permits are held from the start, so that many commits count as in flight.
+async fn the_entries_above_the_watermark_survive_the_free_with(in_flight: u32) {
 	let (store, _dir) = create_store();
 	let pipeline = &store.core.commit_pipeline;
+	let _in_flight = (in_flight > 0).then(|| pipeline.hold_admission(in_flight));
 	let calls = count_free_calls(&store);
 
 	let old = store.begin().unwrap();
@@ -885,8 +948,21 @@ async fn the_entries_above_the_watermark_survive_the_free_of_everything_below_it
 /// disjoint transaction begun at the same moment is not failed for a lost entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transactions_begun_inside_a_step_keep_the_entries_their_window_reaches() {
+	transactions_begun_inside_a_step_keep_their_entries_with(0).await;
+}
+
+/// The same with commits in flight, which makes the flusher free in the small steps that it takes
+/// in a gap between two groups under load.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn transactions_begun_inside_a_step_keep_their_entries_with_commits_in_flight() {
+	transactions_begun_inside_a_step_keep_their_entries_with(2 * BUSY_COMMITS as u32).await;
+}
+
+/// `in_flight` admission permits are held from the start, so that many commits count as in flight.
+async fn transactions_begun_inside_a_step_keep_their_entries_with(in_flight: u32) {
 	let (store, _dir) = create_store();
 	let pipeline = &store.core.commit_pipeline;
+	let _in_flight = (in_flight > 0).then(|| pipeline.hold_admission(in_flight));
 	let begun = Arc::new(Mutex::new(Vec::new()));
 	let draining = Arc::new(AtomicBool::new(false));
 	{
