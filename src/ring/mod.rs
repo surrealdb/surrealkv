@@ -10,6 +10,8 @@ pub(crate) use pipeline::{
 	CommitStage,
 	FreeStats,
 	PipelineHook,
+	BUSY_COMMITS,
+	BUSY_STEPS_PER_YIELD,
 	MAX_GROUP_BYTES,
 	RETIRED_FREE_CHUNK,
 	RETIRE_EVERY_ENTRIES,
