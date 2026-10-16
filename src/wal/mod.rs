@@ -1,5 +1,4 @@
 use std::fmt;
-use std::fs::{self, read_dir, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
@@ -11,7 +10,10 @@ use crc32fast::Hasher;
 
 use crate::error::EncryptionError;
 use crate::tde::EncryptionContext;
+use crate::vfs::{Fs, FsFile, FsKind, FsWriter, IntoFsFile};
 
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod fs_tests;
 pub mod manager;
 pub(crate) mod parallel_recovery;
 pub mod reader;
@@ -166,8 +168,9 @@ const DEFAULT_FILE_SIZE: u64 = 100 * 1024 * 1024;
 pub(crate) struct WalContext {
 	/// What creates and opens the encrypted files of the database, if the WAL is sealed.
 	cipher: Option<Arc<EncryptionContext>>,
-	/// The file system the segments are in. Nothing reads it yet: the write-ahead log moves over
-	/// to it in a later change, and until then it only travels with the context.
+	/// The file system the segments are in. Every open, listing, removal and repair of a segment
+	/// goes through it. The sealed (encrypted) log is the exception: its readers and its repair
+	/// stay on `std::fs`, and a file system that is not `std` is refused for it.
 	pub(crate) fs: Arc<dyn crate::vfs::Fs>,
 }
 
@@ -529,8 +532,21 @@ pub(crate) fn parse_segment_name(name: &str) -> Result<(u64, Option<String>)> {
 }
 
 /// Gets the range of segment IDs present in the specified directory.
+#[cfg_attr(
+	not(test),
+	allow(dead_code, reason = "kept for callers that have not moved to the _in form")
+)]
 pub(crate) fn get_segment_range(dir: &Path, allowed_extension: Option<&str>) -> Result<(u64, u64)> {
-	let refs = list_segment_ids(dir, allowed_extension)?;
+	get_segment_range_in(&*crate::vfs::default_fs(), dir, allowed_extension)
+}
+
+/// [`get_segment_range`] in the file system `fs`.
+pub(crate) fn get_segment_range_in(
+	fs: &dyn Fs,
+	dir: &Path,
+	allowed_extension: Option<&str>,
+) -> Result<(u64, u64)> {
+	let refs = list_segment_ids_in(fs, dir, allowed_extension)?;
 	if refs.is_empty() {
 		return Ok((0, 0));
 	}
@@ -539,15 +555,27 @@ pub(crate) fn get_segment_range(dir: &Path, allowed_extension: Option<&str>) -> 
 
 /// Lists the segment IDs found in the specified directory.
 pub(crate) fn list_segment_ids(dir: &Path, allowed_extension: Option<&str>) -> Result<Vec<u64>> {
+	list_segment_ids_in(&*crate::vfs::default_fs(), dir, allowed_extension)
+}
+
+/// [`list_segment_ids`] in the file system `fs`.
+///
+/// A directory that is not there is a `NotFound` error, as `read_dir` says. A file whose name is
+/// not `<digits>[.<extension>]` fails the whole listing, as it always did: the directory of the log
+/// holds the segments and what the log made beside them, and a file that is none of those is not
+/// something to step over in silence (a segment that went unseen is data that is not replayed). A
+/// pool holds only names that the engine made, so the case cannot arise there, and on `std` the
+/// error names the problem.
+pub(crate) fn list_segment_ids_in(
+	fs: &dyn Fs,
+	dir: &Path,
+	allowed_extension: Option<&str>,
+) -> Result<Vec<u64>> {
 	let mut refs: Vec<u64> = Vec::new();
-	let entries = read_dir(dir)?;
 
-	for entry in entries {
-		let file = entry?;
-
-		if std::fs::metadata(file.path())?.is_file() {
-			let fn_name = file.file_name();
-			let fn_str = fn_name.to_string_lossy();
+	for entry in fs.read_dir(dir)? {
+		if entry.kind == crate::vfs::EntryKind::File {
+			let fn_str = entry.name.to_string_lossy();
 			let (index, extension) = parse_segment_name(&fn_str)?;
 
 			if !should_include_file(allowed_extension, extension) {
@@ -585,19 +613,34 @@ pub(crate) struct SegmentRef {
 impl SegmentRef {
 	/// Creates a vector of SegmentRef instances by reading segments in the
 	/// specified directory.
+	#[cfg_attr(
+		not(test),
+		allow(dead_code, reason = "kept for callers that have not moved to the _in form")
+	)]
 	pub(crate) fn read_segments_from_directory(
+		directory_path: &Path,
+		allowed_extension: Option<&str>,
+	) -> Result<Vec<SegmentRef>> {
+		Self::read_segments_from_directory_in(
+			&*crate::vfs::default_fs(),
+			directory_path,
+			allowed_extension,
+		)
+	}
+
+	/// [`read_segments_from_directory`](Self::read_segments_from_directory) in the file system
+	/// `fs`.
+	pub(crate) fn read_segments_from_directory_in(
+		fs: &dyn Fs,
 		directory_path: &Path,
 		allowed_extension: Option<&str>,
 	) -> Result<Vec<SegmentRef>> {
 		let mut segment_refs = Vec::new();
 
-		let files = read_dir(directory_path)?;
-		for file in files {
-			let entry = file?;
-			if entry.file_type()?.is_file() {
-				let file_path = entry.path();
-				let fn_name = entry.file_name();
-				let fn_str = fn_name.to_string_lossy();
+		for entry in fs.read_dir(directory_path)? {
+			if entry.kind == crate::vfs::EntryKind::File {
+				let file_path = directory_path.join(&entry.name);
+				let fn_str = entry.name.to_string_lossy();
 				let (index, extension) = parse_segment_name(&fn_str)?;
 
 				if !should_include_file(allowed_extension, extension) {
@@ -742,7 +785,7 @@ impl SyncGate {
 
 	/// fsyncs `file`, unless an earlier fsync of the segment failed. The first failure is
 	/// returned as it happened, and every later call fails with [`sync_poisoned`].
-	pub(crate) fn sync(&self, file: &File) -> Result<()> {
+	pub(crate) fn sync(&self, file: &dyn FsFile) -> Result<()> {
 		#[cfg(test)]
 		self.arrivals.fetch_add(1, Ordering::SeqCst);
 		let _serial = self.serial.lock();
@@ -756,7 +799,7 @@ impl SyncGate {
 		result
 	}
 
-	fn fsync(&self, file: &File) -> Result<()> {
+	fn fsync(&self, file: &dyn FsFile) -> Result<()> {
 		#[cfg(test)]
 		{
 			let observer = self.observer.lock().clone();
@@ -765,7 +808,7 @@ impl SyncGate {
 			}
 			self.injected_failure()?;
 		}
-		file.sync_all()?;
+		file.sync()?;
 		Ok(())
 	}
 
@@ -804,9 +847,18 @@ impl SyncGate {
 	}
 }
 
-/// Buffered file writer wrapping BufWriter<File>.
+/// Buffered file writer wrapping `BufWriter<FsWriter>`.
+///
+/// The buffer is one block. Everything that reaches the file does so in one `FsFile::append` per
+/// flush of the buffer (and one more for a record that is a buffer long or longer), which on `std`
+/// is the one `write(2)` that `BufWriter<File>` made. The file is shared: the manager keeps a
+/// handle of it to fsync outside the lock of the log, which on `std` is the one descriptor and no
+/// longer a `dup` of it, and `truncate` rebuilds the buffer around it without a clone.
 pub struct BufferedFileWriter {
-	writer: BufWriter<File>,
+	writer: BufWriter<FsWriter>,
+	/// Whether a write or a flush of the buffer failed since it was last rebuilt. What is left in
+	/// the buffer then is not written when the writer is dropped, see the `Drop` below.
+	failed: bool,
 	pending_sync: bool,
 	/// Shared with the clone of the file `WalManager::sync` fsyncs through.
 	gate: Arc<SyncGate>,
@@ -827,10 +879,12 @@ pub struct BufferedFileWriter {
 
 impl BufferedFileWriter {
 	/// Creates a new BufferedFileWriter with the specified buffer size.
-	pub fn new(file: File, buffer_size: usize) -> Self {
-		let len = file.metadata().ok().map(|m| m.len());
+	pub fn new(file: impl IntoFsFile, buffer_size: usize) -> Self {
+		let file = file.into_fs_file();
+		let len = file.len().ok();
 		Self {
-			writer: BufWriter::with_capacity(buffer_size, file),
+			writer: BufWriter::with_capacity(buffer_size, FsWriter(file)),
+			failed: false,
 			pending_sync: false,
 			gate: Arc::default(),
 			len,
@@ -851,6 +905,17 @@ impl BufferedFileWriter {
 	/// Whether everything appended has reached the file.
 	pub(crate) fn is_flushed(&self) -> bool {
 		self.writer.buffer().is_empty()
+	}
+
+	/// Writes the buffer out, and remembers that it could not be.
+	fn flush_buffer(&mut self) -> Result<()> {
+		self.writer.flush().inspect_err(|_| self.failed = true)?;
+		Ok(())
+	}
+
+	/// The file that is written, which `truncate` and the fsync of the gate go through.
+	fn file(&self) -> &Arc<dyn FsFile> {
+		&self.writer.get_ref().0
 	}
 
 	/// The gate every fsync of this file goes through.
@@ -882,19 +947,22 @@ impl BufferedFileWriter {
 		// Rebuild the buffer around the same file. The old one is taken apart rather than
 		// dropped, because dropping a `BufWriter` writes out what it still holds.
 		let capacity = self.writer.capacity();
-		let file = self.writer.get_ref().try_clone()?;
-		let stale = std::mem::replace(&mut self.writer, BufWriter::with_capacity(capacity, file));
+		let file = Arc::clone(self.file());
+		let stale = std::mem::replace(
+			&mut self.writer,
+			BufWriter::with_capacity(capacity, FsWriter(Arc::clone(&file))),
+		);
 		drop(stale.into_parts());
+		self.failed = false;
 
-		let file = self.writer.get_ref();
-		if len > file.metadata()?.len() {
+		if len > file.len()? {
 			return Err(Error::IO(IOError::new(
 				io::ErrorKind::InvalidInput,
 				"refusing to extend the file while truncating it",
 			)));
 		}
 		file.set_len(len)?;
-		self.gate.sync(file)?;
+		self.gate.sync(&*file)?;
 		self.len = Some(len);
 		self.pending_sync = false;
 		Ok(())
@@ -944,13 +1012,33 @@ impl BufferedFileWriter {
 	}
 }
 
+impl Drop for BufferedFileWriter {
+	/// A buffer that could not be written is not written now. `BufWriter` would write what it still
+	/// holds, and what it holds after a failed `FsFile::append` is the whole chunk, a prefix of
+	/// which may be in the file already: the chunk would be written after its own beginning, and a
+	/// segment that ends in a torn record would end in a torn record followed by a whole one, which
+	/// recovery does not take for a torn tail. The commit that the chunk belonged to was told that
+	/// it failed, and nothing acknowledged is in the buffer.
+	fn drop(&mut self) {
+		if self.failed {
+			let file = Arc::clone(self.file());
+			let stale =
+				std::mem::replace(&mut self.writer, BufWriter::with_capacity(0, FsWriter(file)));
+			drop(stale.into_parts());
+		}
+	}
+}
+
 impl WritableFile for BufferedFileWriter {
 	fn append(&mut self, data: &[u8]) -> Result<()> {
 		#[cfg(test)]
 		self.injected_failure()?;
 		#[cfg(test)]
 		let buffered = self.writer.buffer().len();
-		self.writer.write_all(data)?;
+		if let Err(e) = self.writer.write_all(data) {
+			self.failed = true;
+			return Err(e.into());
+		}
 		#[cfg(test)]
 		if self.writer.buffer().len() != buffered + data.len() {
 			self.file_writes +=
@@ -968,8 +1056,7 @@ impl WritableFile for BufferedFileWriter {
 		self.injected_failure()?;
 		#[cfg(test)]
 		self.count_flush();
-		self.writer.flush()?;
-		Ok(())
+		self.flush_buffer()
 	}
 
 	fn sync(&mut self) -> Result<()> {
@@ -982,8 +1069,8 @@ impl WritableFile for BufferedFileWriter {
 		}
 		#[cfg(test)]
 		self.count_flush();
-		self.writer.flush()?;
-		self.gate.sync(self.writer.get_ref())?;
+		self.flush_buffer()?;
+		self.gate.sync(&**self.file())?;
 		self.pending_sync = false;
 		Ok(())
 	}
@@ -1030,15 +1117,72 @@ pub(crate) fn cleanup_old_segments_for(
 	wal_dir: &Path,
 	min_wal_number: u64,
 ) -> Result<usize> {
+	cleanup_old_segments_for_in(context, &*crate::vfs::default_fs(), wal_dir, min_wal_number)
+}
+
+/// Whether `dir` is there, in the file system `fs`.
+///
+/// Three answers that `Path::exists` folded into two: there, not there, and cannot tell. "Not
+/// there" is the only one that means there is nothing to do. "Cannot tell" is an error, because a
+/// recovery that skips its replay for a directory that it could not look at has dropped the log on
+/// the floor. On `std` it still reads as "not there", as it has always done (`Path::exists`), and
+/// the day that the native engine fails closed on it is a change of this one arm: the rest of the
+/// engine decides the same way, and moving one site of it alone would make them disagree.
+pub(crate) fn directory_present(fs: &dyn Fs, dir: &Path) -> io::Result<bool> {
+	match fs.try_exists(dir) {
+		Ok(present) => Ok(present),
+		Err(e) if fs.kind() == FsKind::Std => {
+			tracing::warn!("Could not tell whether {dir:?} exists, taking it as absent: {e}");
+			Ok(false)
+		}
+		Err(e) => Err(e),
+	}
+}
+
+/// The error of an operation that needs the encrypted log on a file system that is not `std`: the
+/// sealed log reads and repairs its segments through `std::fs`, so on another file system it would
+/// look at files that are not there and take them for files that are gone.
+pub(crate) fn sealed_needs_std() -> Error {
+	Error::IO(IOError::new(
+		io::ErrorKind::Unsupported,
+		"an encrypted write-ahead log is not supported on this file system yet",
+	))
+}
+
+/// [`cleanup_old_segments_for`] in the file system `fs`.
+///
+/// A directory that is not there, and a listing that finds it gone, have nothing to clean. Any
+/// other failure to list is the error of the call, which the callers log and go on from: what
+/// cannot be listed is not removed, and a call that said "nothing to clean" for it would hide the
+/// reason.
+///
+/// On a file system that is not `std` the copies that a repair made of a damaged segment
+/// (`<id>.wal.corrupt[.n]`) go with the segment they were made of, once its number is below the log
+/// number: a file of a pool takes a slot and a handle for as long as it is there, and a torn tail
+/// after a killed tab is routine in a browser. On `std` they stay, as they always did.
+pub(crate) fn cleanup_old_segments_for_in(
+	context: Option<&EncryptionContext>,
+	fs: &dyn Fs,
+	wal_dir: &Path,
+	min_wal_number: u64,
+) -> Result<usize> {
 	// Check if WAL directory exists
-	if !wal_dir.exists() {
+	if !directory_present(fs, wal_dir)? {
 		return Ok(0);
+	}
+	if context.is_some() && fs.kind() != FsKind::Std {
+		return Err(sealed_needs_std());
+	}
+
+	if fs.kind() != FsKind::Std {
+		recovery::reclaim_quarantine_in(fs, wal_dir, min_wal_number);
 	}
 
 	// List all segment IDs with .wal extension
-	let segment_ids = match list_segment_ids(wal_dir, Some("wal")) {
+	let segment_ids = match list_segment_ids_in(fs, wal_dir, Some("wal")) {
 		Ok(ids) => ids,
-		Err(_) => return Ok(0), // No segments to clean
+		Err(Error::IO(e)) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+		Err(e) => return Err(e),
 	};
 
 	// If no segments, nothing to clean
@@ -1063,7 +1207,7 @@ pub(crate) fn cleanup_old_segments_for(
 				}
 			}
 
-			match fs::remove_file(&segment_path) {
+			match fs.remove_file(&segment_path) {
 				Ok(_) => {
 					removed_count += 1;
 					tracing::debug!(

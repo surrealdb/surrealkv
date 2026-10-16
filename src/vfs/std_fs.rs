@@ -208,6 +208,23 @@ impl Fs for StdFs {
 		Ok(Arc::new(StdFile::from_file(options.open(path)?)))
 	}
 
+	fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+		std::fs::read(path)
+	}
+
+	fn read_prefix(&self, path: &Path, n: usize) -> io::Result<Option<Vec<u8>>> {
+		use std::io::Read;
+
+		let file = match SysFile::open(path) {
+			Ok(file) => file,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+			Err(e) => return Err(e),
+		};
+		let mut head = Vec::with_capacity(n);
+		file.take(n as u64).read_to_end(&mut head)?;
+		Ok(Some(head))
+	}
+
 	fn sync_file(&self, path: &Path) -> io::Result<()> {
 		vfs::fsync_file(path)
 	}

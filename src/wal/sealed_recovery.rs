@@ -20,7 +20,7 @@
 //! wrong key, no key, another database, a header that was changed, all fail before any record is
 //! looked at, and all fail the same way whatever the recovery mode is.
 
-use std::fs::{self, File};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,6 +40,16 @@ use crate::lsm::fsync_directory;
 use crate::memtable::MemTable;
 use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
+
+/// Refuses a file system that is not `std`: the replay and the repair of a sealed log use `std::fs`
+/// (a hard link and a rename that replaces, which the seam does not have), and so does the check of
+/// a segment before it is removed.
+fn require_std(context: &WalContext) -> Result<()> {
+	if context.fs.kind() != crate::vfs::FsKind::Std {
+		return Err(super::sealed_needs_std().into());
+	}
+	Ok(())
+}
 
 /// How a segment ends, once everything in it that authenticates was read.
 #[derive(Debug, PartialEq, Eq)]
@@ -67,7 +77,7 @@ pub(crate) struct DecodedSegment {
 /// ends. A failure that is not a tear is the error of the call, and nothing of the segment is
 /// returned.
 pub(crate) fn decode_segment(context: &WalContext, path: &Path, id: u64) -> Result<DecodedSegment> {
-	let file = File::open(path)?;
+	let file = context.fs.open_read(path)?;
 	let reporter = Box::new(DefaultReporter::new(id));
 	let mut reader = Reader::with_context(file, Some(reporter), id, context);
 
@@ -124,6 +134,9 @@ pub(crate) fn replay(
 	min_wal_number: u64,
 	arena_size: usize,
 ) -> Result<ReplayResult> {
+	// The sealed log is read and repaired through `std::fs`, below this point: on another file
+	// system it would find no segment and take the log for empty.
+	require_std(context)?;
 	if !wal_dir.exists() {
 		return Ok((None, vec![]));
 	}
@@ -220,6 +233,7 @@ pub(crate) fn replay(
 /// of the segments without a gap. Nothing is deleted, and nothing is touched if anything fails
 /// before the replacement: a failure that is not a tear is the error of the call, whatever it is.
 pub(crate) fn repair(context: &WalContext, wal_dir: &Path, segment_id: usize) -> Result<()> {
+	require_std(context)?;
 	let id = segment_id as u64;
 	let segment_path = wal_dir.join(segment_name(id, "wal"));
 	if !segment_path.exists() {
@@ -250,7 +264,7 @@ fn write_repaired(
 	repair_dir: &Path,
 	id: u64,
 ) -> Result<()> {
-	let mut reader = Reader::with_context(File::open(segment_path)?, None, id, context);
+	let mut reader = Reader::with_context(context.fs.open_read(segment_path)?, None, id, context);
 	let new_options = |compression: CompressionType| Options {
 		context: context.clone(),
 		compression_type: compression,

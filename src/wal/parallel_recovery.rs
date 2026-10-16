@@ -4,7 +4,6 @@
 //! WAL segments and record batches across disjoint sequence numbers can be decoded
 //! and prepared concurrently across available CPU cores via thread pools.
 
-use std::fs::File;
 use std::path::Path;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,7 +34,7 @@ pub(crate) fn decode_segment_batches_with(
 	file_path: &Path,
 	segment_id: u64,
 ) -> Result<(u64, Vec<Batch>)> {
-	let file = File::open(file_path)?;
+	let file = context.fs.open_read(file_path)?;
 	let reporter = Box::new(DefaultReporter::new(segment_id));
 	let mut reader = Reader::with_context(file, Some(reporter), segment_id, context);
 
@@ -288,6 +287,8 @@ pub(crate) async fn replay_segments_parallel(
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+	use std::fs::File;
+
 	use tempfile::TempDir;
 
 	use super::*;

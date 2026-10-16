@@ -1,13 +1,14 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::writer::Writer;
 use super::{
-	get_segment_range,
-	list_segment_ids,
+	directory_present,
+	get_segment_range_in,
+	list_segment_ids_in,
 	sealed,
+	sealed_needs_std,
 	segment_name,
 	BufferedFileWriter,
 	CompressionType,
@@ -22,6 +23,7 @@ use super::{
 };
 use crate::error::EncryptionError;
 use crate::tde::EncryptionContext;
+use crate::vfs::{CreateOpts, Fs, FsFile, FsKind};
 
 /// Write-Ahead Log (Wal) manager for coordinating WAL operations.
 pub struct Wal {
@@ -29,10 +31,10 @@ pub struct Wal {
 	/// opened and has not made its first segment yet, see `open_with_min_log_number`.
 	active_writer: Option<Writer>,
 
-	/// Cloned file descriptor for the active WAL file, used to perform
-	/// fsync outside the write lock so concurrent appends are not blocked.
-	/// The fsync goes through the segment's `SyncGate`, see `sync_handle`.
-	sync_fd: Option<Arc<File>>,
+	/// The active WAL file, shared with its writer, used to perform fsync outside the write lock
+	/// so concurrent appends are not blocked. The fsync goes through the segment's `SyncGate`, see
+	/// `sync_handle`.
+	sync_fd: Option<Arc<dyn FsFile>>,
 
 	/// The log number of the currently active Writer.
 	active_log_number: u64,
@@ -54,18 +56,22 @@ impl Wal {
 		// Ensure the options are valid
 		opts.validate()?;
 
+		// A sealed log reads and repairs its segments through `std::fs`: refused before anything
+		// is touched.
+		Self::refuse_sealed_off_std(&opts)?;
+
 		// Ensure the directory exists with proper permissions
 		Self::prepare_directory(dir, &opts)?;
 
 		// Clean up any stale .wal.repair files from previous crashed repair attempts
-		Self::cleanup_stale_repair_files(dir)?;
+		Self::cleanup_stale_repair_files(&*opts.context.fs, dir)?;
 
 		if let Some(context) = opts.context.encryption() {
 			return Self::open_sealed(dir, 0, opts.clone(), context);
 		}
 
 		// Determine the active log number
-		let active_log_number = Self::calculate_active_log_number(dir)?;
+		let active_log_number = Self::calculate_active_log_number(&*opts.context.fs, dir)?;
 
 		// Create the active Writer and sync fd
 		let (active_writer, sync_fd) = Self::create_writer(dir, active_log_number, &opts)?;
@@ -104,11 +110,15 @@ impl Wal {
 		// Ensure the options are valid
 		opts.validate()?;
 
+		// A sealed log reads and repairs its segments through `std::fs`: refused before anything
+		// is touched.
+		Self::refuse_sealed_off_std(&opts)?;
+
 		// Ensure the directory exists with proper permissions
 		Self::prepare_directory(dir, &opts)?;
 
 		// Clean up any stale .wal.repair files from previous crashed repair attempts
-		Self::cleanup_stale_repair_files(dir)?;
+		Self::cleanup_stale_repair_files(&*opts.context.fs, dir)?;
 
 		if let Some(context) = opts.context.encryption() {
 			return Self::open_sealed(dir, min_log_number, opts.clone(), context);
@@ -123,7 +133,11 @@ impl Wal {
 		// 3. Without this fix, new writes would go to segment #5
 		// 4. If memtable flushes (log_number = 6), then crash again
 		// 5. Segment #5 would be skipped, losing the new writes
-		let highest_on_disk = Self::calculate_active_log_number(dir).unwrap_or(0);
+		//
+		// A listing that fails is the error of the open. It used to read as "no segment": the log
+		// then started at `min_log_number`, which is the scenario above, with a segment that the
+		// listing could not see.
+		let highest_on_disk = Self::calculate_active_log_number(&*opts.context.fs, dir)?;
 		let active_log_number = std::cmp::max(min_log_number, highest_on_disk);
 
 		if active_log_number > min_log_number {
@@ -147,6 +161,14 @@ impl Wal {
 		})
 	}
 
+	/// Refuses the options of a sealed log on a file system that is not `std`.
+	fn refuse_sealed_off_std(opts: &Options) -> Result<()> {
+		if opts.context.is_sealed() && opts.context.fs.kind() != FsKind::Std {
+			return Err(sealed_needs_std());
+		}
+		Ok(())
+	}
+
 	/// Opens a sealed WAL: no segment is created and none is opened for appending.
 	///
 	/// A segment of a sealed WAL is never appended to after the process that wrote it is gone: a
@@ -163,10 +185,11 @@ impl Wal {
 		opts: Options,
 		context: &EncryptionContext,
 	) -> Result<Self> {
-		let active_log_number = match list_segment_ids(dir, Some("wal"))?.last() {
-			Some(&highest) => std::cmp::max(min_log_number, highest.saturating_add(1)),
-			None => min_log_number,
-		};
+		let active_log_number =
+			match list_segment_ids_in(&*opts.context.fs, dir, Some("wal"))?.last() {
+				Some(&highest) => std::cmp::max(min_log_number, highest.saturating_add(1)),
+				None => min_log_number,
+			};
 
 		// The key of the segments that will be made. Asked for here, where waiting on a key
 		// provider is allowed, and not when a segment is made.
@@ -186,10 +209,17 @@ impl Wal {
 	/// If the segment file already exists, appends to it instead of
 	/// overwriting.
 	///
-	/// Returns the Writer and an `Arc<File>` cloned from the same underlying
-	/// file. The sync fd can be used to perform fsync outside the WAL write
-	/// lock, allowing concurrent appends to proceed during the slow fsync.
-	fn create_writer(dir: &Path, log_number: u64, opts: &Options) -> Result<(Writer, Arc<File>)> {
+	/// Returns the Writer and the file that it writes, shared: the sync fd can be used to perform
+	/// fsync outside the WAL write lock, allowing concurrent appends to proceed during the slow
+	/// fsync. On `std` it is one descriptor that the writer and the fsync both use (a `write(2)`
+	/// and an `fsync(2)` of one descriptor are what a `dup` of it and the original did, on the one
+	/// open file description), and no `dup` is made. A pool has one handle of a file, and this is
+	/// the only way to have two users of it.
+	fn create_writer(
+		dir: &Path,
+		log_number: u64,
+		opts: &Options,
+	) -> Result<(Writer, Arc<dyn FsFile>)> {
 		if let Some(context) = opts.context.encryption() {
 			return Self::create_sealed_writer(dir, log_number, opts, context);
 		}
@@ -201,43 +231,34 @@ impl Wal {
 		// Open or create the file (append mode ensures writes go to end)
 		let file = Self::open_wal_file(&file_path, opts)?;
 
-		// Clone the fd before BufWriter consumes ownership. This cloned fd
-		// points to the same inode, so sync_all() on it will fsync all dirty
-		// pages for this file regardless of which fd wrote them.
-		// On platforms without dup (like WASI), open the file path again.
-		let sync_fd = Arc::new(match file.try_clone() {
-			Ok(cloned) => cloned,
-			Err(_) => Self::open_wal_file(&file_path, opts)?,
-		});
-
 		// Get file size from the opened file handle
-		let existing_size = file.metadata()?.len();
+		let existing_size = file.len()?;
 
 		if existing_size > 0 {
-			// Existing file: detect the compression type from the file itself.
-			// This prevents compression mismatch bugs when reopening with different
-			// options.
-			let detected_compression = Self::detect_compression_type(&file_path)?;
+			// Existing file: detect the compression type from the file itself, through the handle
+			// that is open, so that no second one is needed. This prevents compression mismatch
+			// bugs when reopening with different options.
+			let detected_compression = Self::detect_compression_of(&*file)?;
 
 			// Calculate block_offset from file size
-			let block_offset = (existing_size as usize) % BLOCK_SIZE;
+			let block_offset = (existing_size % BLOCK_SIZE as u64) as usize;
 
 			// Create buffered file writer
-			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+			let buffered_writer = BufferedFileWriter::new(Arc::clone(&file), BLOCK_SIZE);
 
-			Ok((Writer::new(buffered_writer, false, detected_compression, block_offset), sync_fd))
+			Ok((Writer::new(buffered_writer, false, detected_compression, block_offset), file))
 		} else {
 			// New file - use compression type from options
 			let compression_type = opts.compression_type;
 
 			// Create buffered file writer
-			let buffered_writer = BufferedFileWriter::new(file, BLOCK_SIZE);
+			let buffered_writer = BufferedFileWriter::new(Arc::clone(&file), BLOCK_SIZE);
 
 			let mut writer = Writer::new(buffered_writer, false, compression_type, 0);
 			if compression_type != CompressionType::None {
 				writer.add_compression_type_record()?;
 			}
-			Ok((writer, sync_fd))
+			Ok((writer, file))
 		}
 	}
 
@@ -255,24 +276,18 @@ impl Wal {
 		log_number: u64,
 		opts: &Options,
 		context: &EncryptionContext,
-	) -> Result<(Writer, Arc<File>)> {
+	) -> Result<(Writer, Arc<dyn FsFile>)> {
+		let fs = &*opts.context.fs;
 		let extension = opts.file_extension.as_deref().unwrap_or("wal");
 		let file_path = dir.join(segment_name(log_number, extension));
 
 		let (header, cipher) = sealed::new_header(context, log_number, opts.compression_type)?;
 		let file = Self::create_new_wal_file(&file_path, opts)?;
 
-		let started = Self::start_sealed_segment(
-			dir,
-			&file_path,
-			file,
-			&header,
-			cipher,
-			opts.compression_type,
-			opts,
-		);
+		let started =
+			Self::start_sealed_segment(dir, file, &header, cipher, opts.compression_type, opts);
 		if started.is_err() {
-			if let Err(e) = fs::remove_file(&file_path) {
+			if let Err(e) = fs.remove_file(&file_path) {
 				tracing::error!(
 					"A WAL segment that could not be started was left behind as {file_path:?}: {e}"
 				);
@@ -285,23 +300,17 @@ impl Wal {
 	/// when this returns an error, which the caller then removes.
 	fn start_sealed_segment(
 		dir: &Path,
-		file_path: &Path,
-		file: File,
+		file: Arc<dyn FsFile>,
 		header: &[u8; sealed::HEADER_PAYLOAD_LEN],
 		cipher: crate::tde::FileCipher,
 		compression_type: CompressionType,
 		opts: &Options,
-	) -> Result<(Writer, Arc<File>)> {
-		// Clone the fd before BufWriter consumes ownership, see `create_writer`.
-		let sync_fd = Arc::new(match file.try_clone() {
-			Ok(cloned) => cloned,
-			Err(_) => Self::open_wal_file(file_path, opts)?,
-		});
+	) -> Result<(Writer, Arc<dyn FsFile>)> {
 		#[cfg(test)]
 		let fault = opts.creation_fault.lock().take();
 
 		#[cfg_attr(not(test), allow(unused_mut))]
-		let mut dest = BufferedFileWriter::new(file, BLOCK_SIZE);
+		let mut dest = BufferedFileWriter::new(Arc::clone(&file), BLOCK_SIZE);
 		#[cfg(test)]
 		match fault {
 			Some(super::CreationFault::HeaderWrite) => dest.fail_after_ops(0),
@@ -317,26 +326,16 @@ impl Wal {
 				"injected directory failure",
 			)));
 		}
-		crate::lsm::fsync_directory(dir)
+		opts.context
+			.fs
+			.sync_dir(dir)
 			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
-		Ok((writer, sync_fd))
+		Ok((writer, file))
 	}
 
 	/// Creates the file of a segment, which must not exist yet.
-	#[cfg_attr(not(unix), allow(unused_variables))]
-	fn create_new_wal_file(file_path: &Path, opts: &Options) -> Result<File> {
-		let mut open_options = OpenOptions::new();
-		open_options.read(true).write(true).create_new(true).append(true);
-
-		#[cfg(unix)]
-		{
-			use std::os::unix::fs::OpenOptionsExt;
-			if let Some(file_mode) = opts.file_mode {
-				open_options.mode(file_mode);
-			}
-		}
-
-		Ok(open_options.open(file_path)?)
+	fn create_new_wal_file(file_path: &Path, opts: &Options) -> Result<Arc<dyn FsFile>> {
+		Ok(opts.context.fs.create_new(file_path, CreateOpts::new(opts.file_mode))?)
 	}
 
 	/// Detects the compression type used in an existing WAL file.
@@ -344,18 +343,44 @@ impl Wal {
 	/// Reads the first record's header. If it's a SetCompressionType record,
 	/// parses and returns that compression type. Otherwise returns None (no
 	/// compression).
+	#[cfg_attr(
+		not(test),
+		allow(dead_code, reason = "kept for callers that have not moved to the _in form")
+	)]
 	pub(crate) fn detect_compression_type(file_path: &Path) -> Result<CompressionType> {
-		let mut file = File::open(file_path)?;
+		Self::detect_compression_type_in(&*crate::vfs::default_fs(), file_path)
+	}
+
+	/// [`detect_compression_type`](Self::detect_compression_type) in the file system `fs`.
+	#[cfg_attr(
+		not(test),
+		allow(dead_code, reason = "kept for callers that have not moved to the _in form")
+	)]
+	pub(crate) fn detect_compression_type_in(
+		fs: &dyn Fs,
+		file_path: &Path,
+	) -> Result<CompressionType> {
+		let file = fs.open_read(file_path)?;
+		Self::detect_compression_of(&*file)
+	}
+
+	/// The compression type of the segment that `file` is, from its first record.
+	///
+	/// Positional reads of the file that is already open, so that a pool, which has one handle of
+	/// a file, is not asked for a second. A file that is too short to hold a header has none, a
+	/// sealed segment is refused, and a compression record whose byte is missing is an error: what
+	/// the open of a segment has always done.
+	pub(crate) fn detect_compression_of(file: &dyn crate::vfs::File) -> Result<CompressionType> {
+		fn read_at(file: &dyn crate::vfs::File, offset: u64, buf: &mut [u8]) -> Result<usize> {
+			crate::vfs::File::read_up_to(file, offset, buf)
+				.map_err(|e| Error::from(crate::vfs::into_io_error(e)))
+		}
 
 		// Read just enough for the header
 		let mut header = [0u8; HEADER_SIZE];
-		match file.read_exact(&mut header) {
-			Ok(_) => {}
-			Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-				// File too short, assume no compression
-				return Ok(CompressionType::None);
-			}
-			Err(e) => return Err(Error::IO(IOError::new(e.kind(), &e.to_string()))),
+		if read_at(file, 0, &mut header)? < HEADER_SIZE {
+			// File too short, assume no compression
+			return Ok(CompressionType::None);
 		}
 
 		// A sealed segment is not appended to by a WAL that is not sealed, and nothing is done
@@ -363,9 +388,9 @@ impl Wal {
 		// first record or by the start of the encryption header that is the payload of that
 		// record, which stays when the type byte rots.
 		let mut payload_start = [0u8; 4];
-		let sealed_by_magic = file.read_exact(&mut payload_start).is_ok()
-			&& payload_start == crate::tde::HEADER_MAGIC;
-		file.seek(SeekFrom::Start(HEADER_SIZE as u64))?;
+		let sealed_by_magic =
+			matches!(read_at(file, HEADER_SIZE as u64, &mut payload_start), Ok(4))
+				&& payload_start == crate::tde::HEADER_MAGIC;
 		if header[6] == RecordType::SegmentHeader as u8 || sealed_by_magic {
 			return Err(EncryptionError::NotConfigured.into());
 		}
@@ -379,7 +404,12 @@ impl Wal {
 			let length = u16::from_be_bytes([header[4], header[5]]);
 			if length >= 1 {
 				let mut compression_byte = [0u8; 1];
-				file.read_exact(&mut compression_byte)?;
+				if read_at(file, HEADER_SIZE as u64, &mut compression_byte)? < 1 {
+					return Err(Error::IO(IOError::new(
+						io::ErrorKind::UnexpectedEof,
+						"failed to fill whole buffer",
+					)));
+				}
 				return CompressionType::from_u8(compression_byte[0]);
 			}
 		}
@@ -388,53 +418,46 @@ impl Wal {
 		Ok(CompressionType::None)
 	}
 
-	#[cfg_attr(not(unix), allow(unused_variables))]
-	fn open_wal_file(file_path: &Path, opts: &Options) -> Result<File> {
-		let mut open_options = OpenOptions::new();
-		open_options.read(true).write(true).create(true).append(true);
-
-		#[cfg(unix)]
-		{
-			use std::os::unix::fs::OpenOptionsExt;
-			if let Some(file_mode) = opts.file_mode {
-				open_options.mode(file_mode);
-			}
-		}
-
-		Ok(open_options.open(file_path)?)
+	fn open_wal_file(file_path: &Path, opts: &Options) -> Result<Arc<dyn FsFile>> {
+		Ok(opts.context.fs.open_append(file_path, CreateOpts::new(opts.file_mode))?)
 	}
 
-	#[cfg_attr(not(unix), allow(unused_variables))]
 	fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
 		// Directory should already be created by Tree::new()
 		// Set permissions on Unix only; Windows NTFS uses ACLs and
-		// set_permissions on directories can fail with ERROR_ACCESS_DENIED.
+		// set_permissions on directories can fail with ERROR_ACCESS_DENIED. Permissions are not
+		// part of the file system seam: the directory is on `std::fs` or it is not on a disk at
+		// all, and a file system that is not `std` has nothing to set.
 		#[cfg(unix)]
-		if let Ok(metadata) = fs::metadata(dir) {
-			let mut permissions = metadata.permissions();
-			use std::os::unix::fs::PermissionsExt;
-			permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
-			fs::set_permissions(dir, permissions)?;
+		if opts.context.fs.kind() == FsKind::Std {
+			if let Ok(metadata) = std::fs::metadata(dir) {
+				let mut permissions = metadata.permissions();
+				use std::os::unix::fs::PermissionsExt;
+				permissions.set_mode(opts.dir_mode.unwrap_or(0o750));
+				std::fs::set_permissions(dir, permissions)?;
+			}
 		}
+		#[cfg(not(unix))]
+		let _ = (dir, opts);
 
 		Ok(())
 	}
 
-	fn calculate_active_log_number(dir: &Path) -> Result<u64> {
-		let (_, last) = get_segment_range(dir, Some("wal"))?;
+	fn calculate_active_log_number(fs: &dyn Fs, dir: &Path) -> Result<u64> {
+		let (_, last) = get_segment_range_in(fs, dir, Some("wal"))?;
 		// Return the last segment to append to, or 0 if no segments exist
 		Ok(last)
 	}
 
 	/// Cleans up stale .wal.repair files from crashed repair processes.
-	fn cleanup_stale_repair_files(dir: &Path) -> Result<()> {
+	fn cleanup_stale_repair_files(fs: &dyn Fs, dir: &Path) -> Result<()> {
 		// Check if the directory exists
-		if !dir.exists() {
+		if !directory_present(fs, dir)? {
 			return Ok(());
 		}
 
 		// Read all files in the WAL directory
-		let entries = match fs::read_dir(dir) {
+		let entries = match fs.read_dir(dir) {
 			Ok(entries) => entries,
 			Err(e) if e.kind() == io::ErrorKind::NotFound => {
 				return Ok(());
@@ -450,28 +473,25 @@ impl Wal {
 		let mut removed_count = 0;
 
 		// Find and remove all .wal.repair files
-		for entry in entries.flatten() {
-			let path = entry.path();
-			if let Some(filename) = path.file_name() {
-				let filename_str = filename.to_string_lossy();
+		for entry in entries {
+			let filename_str = entry.name.to_string_lossy();
 
-				if filename_str.ends_with(".wal.repair") {
-					match fs::remove_file(&path) {
-						Ok(()) => {
-							removed_count += 1;
-							tracing::warn!(
-								"Removed stale repair file from previous crashed repair: {}",
-								filename_str
-							);
-						}
-						Err(e) => {
-							tracing::error!(
-								"Failed to remove stale repair file {}: {}",
-								filename_str,
-								e
-							);
-							// Don't fail the entire open operation for this
-						}
+			if filename_str.ends_with(".wal.repair") {
+				match fs.remove_file(&dir.join(&entry.name)) {
+					Ok(()) => {
+						removed_count += 1;
+						tracing::warn!(
+							"Removed stale repair file from previous crashed repair: {}",
+							filename_str
+						);
+					}
+					Err(e) => {
+						tracing::error!(
+							"Failed to remove stale repair file {}: {}",
+							filename_str,
+							e
+						);
+						// Don't fail the entire open operation for this
 					}
 				}
 			}
@@ -742,7 +762,10 @@ impl Wal {
 		writer.close()?;
 
 		// Fsync the directory to persist metadata changes
-		crate::lsm::fsync_directory(&self.dir)
+		self.opts
+			.context
+			.fs
+			.sync_dir(&self.dir)
 			.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
 
 		tracing::debug!("WAL #{:020} closed and synced successfully", log_number);
@@ -821,7 +844,10 @@ impl Wal {
 		// before it was handed over: it must not fail after the file is there, or the number
 		// would be taken by a file that nothing refers to.
 		if !self.opts.context.is_sealed() {
-			crate::lsm::fsync_directory(&self.dir)
+			self.opts
+				.context
+				.fs
+				.sync_dir(&self.dir)
 				.map_err(|e| Error::IO(IOError::new(e.kind(), &e.to_string())))?;
 		}
 
@@ -861,19 +887,19 @@ impl Drop for Wal {
 	}
 }
 
-/// What `WalManager::sync` fsyncs through outside the WAL lock: a clone of the active
-/// segment's file and the segment's `SyncGate`.
+/// What `WalManager::sync` fsyncs through outside the WAL lock: the active segment's file, shared
+/// with its writer, and the segment's `SyncGate`.
 pub(crate) struct SyncHandle {
 	/// The file and its gate, `None` for a sealed WAL that has no segment yet, which has nothing
 	/// to sync.
-	target: Option<(Arc<File>, Arc<SyncGate>)>,
+	target: Option<(Arc<dyn FsFile>, Arc<SyncGate>)>,
 }
 
 impl SyncHandle {
 	/// fsyncs the segment. Fails if an earlier fsync of it failed.
 	pub(crate) fn sync(&self) -> Result<()> {
 		match &self.target {
-			Some((file, gate)) => gate.sync(file),
+			Some((file, gate)) => gate.sync(&**file),
 			None => Ok(()),
 		}
 	}
@@ -968,6 +994,8 @@ impl WalManager {
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
+	use std::fs;
+
 	use tempdir::TempDir;
 	use test_log::test;
 

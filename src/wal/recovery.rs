@@ -1,18 +1,16 @@
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::batch::Batch;
 use crate::error::{Error, Result};
-use crate::lsm::fsync_directory;
 use crate::memtable::MemTable;
+use crate::vfs::{CreateOpts, Fs};
 use crate::wal::manager::Wal;
 use crate::wal::reader::{Reader, Reporter};
 use crate::wal::{
 	calculate_crc32,
-	get_segment_range,
-	list_segment_ids,
+	directory_present,
+	sealed_needs_std,
 	CompressionType,
 	Error as WalError,
 	RecordType,
@@ -103,7 +101,7 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 		Ok(()) => Ok(current_memtable),
 		Err(Error::ArenaFull) => {
 			if current_memtable.is_empty() {
-				let needed = batch.memtable_size_estimate() as usize + 4096;
+				let needed = oversized_arena_size(batch)?;
 				let oversized = Arc::new(MemTable::new(needed));
 				oversized.add(batch)?;
 				memtables.push((oversized, true, segment_id));
@@ -119,7 +117,7 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 			match fresh.add(batch) {
 				Ok(()) => Ok(fresh),
 				Err(Error::ArenaFull) => {
-					let needed = batch.memtable_size_estimate() as usize + 4096;
+					let needed = oversized_arena_size(batch)?;
 					let oversized = Arc::new(MemTable::new(needed));
 					oversized.add(batch)?;
 					memtables.push((oversized, true, segment_id));
@@ -130,6 +128,20 @@ pub(crate) fn apply_batch_with_oversized_fallback(
 		}
 		Err(e) => Err(e),
 	}
+}
+
+/// The arena that a batch too large for a memtable gets of its own: its estimate and some room. An
+/// estimate that does not fit in an address (a 32-bit target) is an error, and not a wrapped size.
+fn oversized_arena_size(batch: &Batch) -> Result<usize> {
+	usize::try_from(batch.memtable_size_estimate())
+		.ok()
+		.and_then(|estimate| estimate.checked_add(4096))
+		.ok_or_else(|| {
+			Error::Other(format!(
+				"a recovered batch of {} bytes does not fit in memory on this platform",
+				batch.memtable_size_estimate()
+			))
+		})
 }
 
 /// Replays the Write-Ahead Log (WAL) to recover recent writes.
@@ -164,8 +176,12 @@ pub(crate) fn replay_wal_inner_with(
 	);
 
 	// A sealed WAL is replayed by its own code, which fails on anything that is not a tear. It
-	// does not count the batches it replays.
+	// does not count the batches it replays. That code reads through `std::fs`, so a file system
+	// that is not `std` is refused for it: it would find no segment and take the log for empty.
 	if context.is_sealed() {
+		if context.fs.kind() != crate::vfs::FsKind::Std {
+			return Err(sealed_needs_std().into());
+		}
 		let (max_seq, memtables) =
 			crate::wal::sealed_recovery::replay(context, wal_dir, min_wal_number, arena_size)?;
 		let segments =
@@ -173,32 +189,25 @@ pub(crate) fn replay_wal_inner_with(
 		return Ok((max_seq, memtables, 0, segments.len()));
 	}
 
-	// Check if WAL directory exists
-	if !wal_dir.exists() {
+	let fs = &*context.fs;
+
+	// Check if WAL directory exists. A directory that cannot be looked at is not one that is
+	// absent: see `directory_present`.
+	if !directory_present(fs, wal_dir)? {
 		tracing::debug!("WAL directory does not exist, skipping recovery");
 		return Ok((None, vec![], 0, 0));
 	}
 
-	if list_segment_ids(wal_dir, Some("wal"))?.is_empty() {
+	// Every segment in the directory (looking for .wal files), in order, from one listing. A
+	// listing that fails is an error whatever it says, "not found" included: the directory was
+	// there a moment ago, and a listing that found one of its entries gone is not an empty log.
+	let all_segments = SegmentRef::read_segments_from_directory_in(fs, wal_dir, Some("wal"))?;
+	let (Some(first_segment), Some(last_segment)) = (all_segments.first(), all_segments.last())
+	else {
 		tracing::debug!("No WAL segments found, skipping recovery");
 		return Ok((None, vec![], 0, 0));
-	}
-
-	// Get range of segment IDs (looking for .wal files)
-	let (first, last) = match get_segment_range(wal_dir, Some("wal")) {
-		Ok(range) => range,
-		Err(WalError::IO(ref io_err)) if io_err.kind() == std::io::ErrorKind::NotFound => {
-			tracing::debug!("WAL segment range not found, skipping recovery");
-			return Ok((None, vec![], 0, 0));
-		}
-		Err(e) => return Err(e.into()),
 	};
-
-	// If no segments, nothing to replay
-	if first > last {
-		tracing::debug!("No valid WAL segment range, skipping recovery");
-		return Ok((None, vec![], 0, 0));
-	}
+	let (first, last) = (first_segment.id, last_segment.id);
 
 	// Determine the range of segments to replay
 	let start_segment = std::cmp::max(first, min_wal_number);
@@ -221,9 +230,6 @@ pub(crate) fn replay_wal_inner_with(
 
 	// Collect memtables - one per WAL segment
 	let mut memtables: Vec<(Arc<MemTable>, bool, u64)> = Vec::new();
-
-	// Get all segments in the directory
-	let all_segments = SegmentRef::read_segments_from_directory(wal_dir, Some("wal"))?;
 
 	// Collect segments to replay in order
 	let mut segments_to_replay: Vec<SegmentRef> = Vec::new();
@@ -264,7 +270,7 @@ pub(crate) fn replay_wal_inner_with(
 		let mut current_memtable = Arc::new(MemTable::new(arena_size));
 
 		// Open the segment file
-		let file = File::open(&segment.file_path)?;
+		let file = fs.open_read(&segment.file_path)?;
 		let reporter = Box::new(DefaultReporter::new(segment_id));
 		let mut reader = Reader::with_context(file, Some(reporter), segment_id, context);
 
@@ -373,13 +379,8 @@ pub(crate) fn replay_wal(
 /// or the start of the encryption header that is its payload. A WAL that is not sealed has no
 /// business repairing such a file, whatever else is wrong with it. A file that does not exist is
 /// not one.
-fn segment_looks_sealed(path: &Path) -> Result<bool> {
-	let mut head = Vec::new();
-	match File::open(path) {
-		Ok(file) => file.take(11).read_to_end(&mut head)?,
-		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-		Err(e) => return Err(e.into()),
-	};
+fn segment_looks_sealed(fs: &dyn Fs, path: &Path) -> Result<bool> {
+	let head = fs.read_prefix(path, 11)?.unwrap_or_default();
 	Ok(crate::wal::sealed::starts_like_sealed(&head))
 }
 
@@ -521,18 +522,36 @@ fn try_validate_record(
 
 /// Scans the WAL segment file starting at `start_offset` for valid records.
 /// Returns the number of intact records found after `start_offset`.
+#[allow(dead_code, reason = "kept for callers that have not moved to the _in form")]
 pub(crate) fn scan_valid_records_after(file_path: &Path, start_offset: u64) -> Result<usize> {
-	let mut file = File::open(file_path)?;
-	let file_size = file.metadata()?.len();
+	scan_valid_records_after_in(&*crate::vfs::default_fs(), file_path, start_offset)
+}
+
+/// [`scan_valid_records_after`] in the file system `fs`.
+pub(crate) fn scan_valid_records_after_in(
+	fs: &dyn Fs,
+	file_path: &Path,
+	start_offset: u64,
+) -> Result<usize> {
+	let file = fs.open_read(file_path)?;
+	let file_size = file.len()?;
 	if start_offset >= file_size {
 		return Ok(0);
 	}
 
-	let compression = Wal::detect_compression_type(file_path).unwrap_or(CompressionType::None);
+	// The same file answers for the compression of the segment, so a pool is not asked for a
+	// second handle of it.
+	let compression = Wal::detect_compression_of(&*file).unwrap_or(CompressionType::None);
 
-	file.seek(SeekFrom::Start(start_offset))?;
-	let mut data = Vec::new();
-	file.read_to_end(&mut data)?;
+	// Everything after `start_offset`: read in one go, as it always was.
+	let rest = usize::try_from(file_size - start_offset).map_err(|_| {
+		Error::Other(format!(
+			"the WAL segment {file_path:?} is too large to scan on this platform: {file_size} bytes"
+		))
+	})?;
+	let mut data = vec![0u8; rest];
+	let read = crate::vfs::File::read_up_to(&*file, start_offset, &mut data)?;
+	data.truncate(read);
 
 	let mut intact_count = 0;
 	let mut pos = 0;
@@ -564,10 +583,25 @@ pub(crate) fn classify_wal_damage(
 	last_valid_offset: usize,
 	is_last_segment: bool,
 ) -> Result<WalDamage> {
-	let metadata = fs::metadata(file_path)?;
-	let file_size = metadata.len();
+	classify_wal_damage_in(
+		&*crate::vfs::default_fs(),
+		file_path,
+		last_valid_offset,
+		is_last_segment,
+	)
+}
 
-	let intact_records_after = scan_valid_records_after(file_path, last_valid_offset as u64)?;
+/// [`classify_wal_damage`] in the file system `fs`.
+pub(crate) fn classify_wal_damage_in(
+	fs: &dyn Fs,
+	file_path: &Path,
+	last_valid_offset: usize,
+	is_last_segment: bool,
+) -> Result<WalDamage> {
+	let file_size = fs.file_len(file_path)?;
+
+	let intact_records_after =
+		scan_valid_records_after_in(fs, file_path, last_valid_offset as u64)?;
 
 	if is_last_segment && intact_records_after == 0 {
 		Ok(WalDamage::TornTail {
@@ -584,9 +618,107 @@ pub(crate) fn classify_wal_damage(
 	}
 }
 
+/// The copies of damaged segments that a repair made: `<id>.wal.corrupt`, `.corrupt.1` and
+/// `.corrupt.2`, with the number of the segment each was made of.
+fn quarantined_segments_in(fs: &dyn Fs, wal_dir: &Path) -> Result<Vec<(u64, PathBuf)>> {
+	let mut copies = Vec::new();
+	for entry in fs.read_dir(wal_dir)? {
+		if entry.kind != crate::vfs::EntryKind::File {
+			continue;
+		}
+		let name = entry.name.to_string_lossy();
+		let Ok((id, Some(extension))) = crate::wal::parse_segment_name(&name) else {
+			continue;
+		};
+		if extension == "wal.corrupt" || extension.starts_with("wal.corrupt.") {
+			copies.push((id, wal_dir.join(&entry.name)));
+		}
+	}
+	Ok(copies)
+}
+
+/// Removes the quarantine copies of the segments that are below `min_wal_number`, which are in
+/// tables by now. Best effort: a copy that stays is taken again by the next call, and nothing is
+/// done with a listing that fails.
+///
+/// What a repair keeps is a copy of the damaged tail for someone to look at. In a pool each copy is
+/// a slot, a handle and a segment's worth of quota for as long as it is there, and with a default
+/// of no fsync a torn tail is what every killed tab leaves, so the copies would grow with each of
+/// them and with no bound. `std` keeps them, and so this is only called for a file system that is
+/// not `std`.
+pub(crate) fn reclaim_quarantine_in(fs: &dyn Fs, wal_dir: &Path, min_wal_number: u64) {
+	let copies = match quarantined_segments_in(fs, wal_dir) {
+		Ok(copies) => copies,
+		Err(e) => {
+			tracing::warn!("Could not list the quarantined WAL segments of {wal_dir:?}: {e}");
+			return;
+		}
+	};
+	for (id, path) in copies {
+		if id < min_wal_number {
+			match fs.remove_file(&path) {
+				Ok(()) => tracing::debug!("Removed the quarantined copy {path:?}"),
+				Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+				Err(e) => tracing::warn!("Could not remove the quarantined copy {path:?}: {e}"),
+			}
+		}
+	}
+}
+
+/// How many copies of damaged segments a pool keeps, of all segments together: the newest.
+pub(crate) const QUARANTINE_KEPT_ON_A_POOL: usize = 3;
+
+/// Removes the copies of damaged segments but the `keep` newest, which are the ones of the highest
+/// segment numbers and, within a number, the one without a suffix first. Best effort.
+fn prune_quarantine_in(fs: &dyn Fs, wal_dir: &Path, keep: usize) {
+	let mut copies = match quarantined_segments_in(fs, wal_dir) {
+		Ok(copies) => copies,
+		Err(e) => {
+			tracing::warn!("Could not list the quarantined WAL segments of {wal_dir:?}: {e}");
+			return;
+		}
+	};
+	// Newest first: by segment number, and within one by generation (`.corrupt` is the newest).
+	let generation = |path: &Path| {
+		path.extension()
+			.and_then(|ext| ext.to_str())
+			.and_then(|ext| ext.parse::<u32>().ok())
+			.unwrap_or(0)
+	};
+	copies.sort_by(|(a_id, a), (b_id, b)| {
+		b_id.cmp(a_id).then_with(|| generation(a).cmp(&generation(b)))
+	});
+	for (_, path) in copies.into_iter().skip(keep) {
+		match fs.remove_file(&path) {
+			Ok(()) => tracing::debug!("Removed the old quarantined copy {path:?}"),
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+			Err(e) => tracing::warn!("Could not remove the quarantined copy {path:?}: {e}"),
+		}
+	}
+}
+
+#[cfg_attr(
+	not(test),
+	allow(dead_code, reason = "kept for callers that have not moved to the _in form")
+)]
 pub(crate) fn quarantine_wal_segment(wal_dir: &Path, segment_id: usize) -> Result<PathBuf> {
+	quarantine_wal_segment_in(&*crate::vfs::default_fs(), wal_dir, segment_id)
+}
+
+/// [`quarantine_wal_segment`] in the file system `fs`.
+///
+/// The copy is made durable here, on every file system: the repair that follows cuts the original
+/// back, and a cut that is durable while its only copy is not would lose the tail on a power cut
+/// that falls between the two. `std::fs::copy` does not sync, so the copy is synced by its path,
+/// and a pool's copy (which syncs itself) is synced once more, which costs a flush on a path that
+/// runs once per crash.
+pub(crate) fn quarantine_wal_segment_in(
+	fs: &dyn Fs,
+	wal_dir: &Path,
+	segment_id: usize,
+) -> Result<PathBuf> {
 	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
-	if !segment_path.exists() {
+	if fs.entry(&segment_path)?.is_none() {
 		return Err(Error::Other(format!("WAL segment {segment_id:020}.wal does not exist")));
 	}
 
@@ -596,18 +728,26 @@ pub(crate) fn quarantine_wal_segment(wal_dir: &Path, segment_id: usize) -> Resul
 	let corrupt_1 = wal_dir.join(format!("{segment_id:020}.wal.corrupt.1"));
 	let corrupt_2 = wal_dir.join(format!("{segment_id:020}.wal.corrupt.2"));
 
-	if corrupt_2.exists() {
-		let _ = fs::remove_file(&corrupt_2);
+	if fs.exists(&corrupt_2) {
+		let _ = fs.remove_file(&corrupt_2);
 	}
-	if corrupt_1.exists() {
-		let _ = fs::rename(&corrupt_1, &corrupt_2);
+	if fs.exists(&corrupt_1) {
+		let _ = fs.rename(&corrupt_1, &corrupt_2);
 	}
-	if corrupt_base.exists() {
-		let _ = fs::rename(&corrupt_base, &corrupt_1);
+	if fs.exists(&corrupt_base) {
+		let _ = fs.rename(&corrupt_base, &corrupt_1);
 	}
 
-	fs::copy(&segment_path, &corrupt_base)?;
-	fsync_directory(wal_dir)?;
+	fs.copy(&segment_path, &corrupt_base)?;
+	fs.sync_file(&corrupt_base)?;
+	fs.sync_dir(wal_dir)?;
+
+	// A pool keeps the newest few copies of all segments, however many crashes there were: the
+	// reclaim of `cleanup_old_segments_for_in` only runs once the log number has passed a segment,
+	// and with tiny commits and a tab that is killed again and again it may not have.
+	if fs.kind() != crate::vfs::FsKind::Std {
+		prune_quarantine_in(fs, wal_dir, QUARANTINE_KEPT_ON_A_POOL);
+	}
 
 	Ok(corrupt_base)
 }
@@ -617,30 +757,46 @@ pub(crate) fn repair_corrupted_wal_segment(
 	segment_id: usize,
 	last_valid_offset: usize,
 ) -> Result<(PathBuf, u64)> {
+	repair_corrupted_wal_segment_in(
+		&*crate::vfs::default_fs(),
+		wal_dir,
+		segment_id,
+		last_valid_offset,
+	)
+}
+
+/// [`repair_corrupted_wal_segment`] in the file system `fs`.
+pub(crate) fn repair_corrupted_wal_segment_in(
+	fs: &dyn Fs,
+	wal_dir: &Path,
+	segment_id: usize,
+	last_valid_offset: usize,
+) -> Result<(PathBuf, u64)> {
 	let segment_path = wal_dir.join(format!("{segment_id:020}.wal"));
-	if !segment_path.exists() {
+	if fs.entry(&segment_path)?.is_none() {
 		return Err(Error::Other(format!("WAL segment {segment_id:020}.wal does not exist")));
 	}
 	// This truncates plaintext at an offset of plaintext: it never runs on a sealed segment, which
 	// a key that does not fit makes look like a damaged one.
-	if segment_looks_sealed(&segment_path)? {
+	if segment_looks_sealed(fs, &segment_path)? {
 		return Err(crate::error::EncryptionError::NotConfigured.into());
 	}
 
-	// 1. Quarantine original segment before modifying it
-	let quarantine_path = quarantine_wal_segment(wal_dir, segment_id)?;
+	// 1. Quarantine original segment before modifying it. The copy is durable when this returns.
+	let quarantine_path = quarantine_wal_segment_in(fs, wal_dir, segment_id)?;
 
-	// 2. Open file for in-place truncation on the same inode
-	let file = OpenOptions::new().write(true).open(&segment_path)?;
-	let old_len = file.metadata()?.len();
+	// 2. Open file for in-place truncation on the same inode. A file to append to and read: the
+	// segment is there, so nothing is created, and `set_len` does not look at the mode.
+	let file = fs.open_append(&segment_path, CreateOpts::default())?;
+	let old_len = file.len()?;
 	file.set_len(last_valid_offset as u64)?;
-	file.sync_all()?;
-	fsync_directory(wal_dir)?;
+	file.sync()?;
+	fs.sync_dir(wal_dir)?;
 
 	// 3. Clean up stale repair directory if present
 	let repair_dir = wal_dir.join("repair_temp");
-	if repair_dir.exists() {
-		let _ = fs::remove_dir_all(&repair_dir);
+	if fs.exists(&repair_dir) {
+		let _ = fs.remove_dir_all(&repair_dir);
 	}
 
 	let bytes_trimmed = old_len.saturating_sub(last_valid_offset as u64);
