@@ -153,7 +153,15 @@ debug_assert_with_mut_call = "warn"
 # Denies the configured methods and functions in `clippy.toml`.
 # Some methods are undesirable in certain contexts, and it’s beneficial to lint for them as needed.
 # https://rust-lang.github.io/rust-clippy/master/#disallowed_methods
-disallowed_methods = "warn"
+#
+# `clippy.toml` lists every call of `std::fs` and of the `Path` methods that ask the operating system,
+# which the engine has to make through its file system seam (`src/vfs`) so that it runs in a browser.
+# The engine is moved over to the seam one part at a time, and the CI jobs run clippy with
+# `-D warnings`, so the lint stays `allow` until the last part is moved. The change that moves it makes
+# this `deny` and puts a module-level `allow` with a reason on each module that stays on `std::fs` on
+# purpose. `scripts/check-fs-lint.sh --self-test` proves that every entry of the list is found when
+# the level is `deny`.
+disallowed_methods = "allow"
 
 expl_impl_clone_on_copy = "warn"
 

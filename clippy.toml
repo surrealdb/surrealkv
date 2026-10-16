@@ -1,0 +1,59 @@
+# The calls that go through the file system seam (`src/vfs`) and not through `std::fs`.
+#
+# A database in a browser lives in a pool of files that `std::fs` cannot see: a call that names the
+# operating system's file system anywhere on the path that opens or writes a database answers
+# "not there" or writes where nothing reads, and no test that runs on a native build notices. The
+# lint `clippy::disallowed_methods` finds every such call. It is `allow` for the crate in
+# `Cargo.toml` until the engine has been moved over to the seam; the change that moves the last
+# call site makes it `deny` and lists the modules that stay on `std::fs` on purpose (the native
+# file system itself, the migrators, checkpoints, `inspect`, encryption keys and sealed files),
+# each with a module-level `allow` and a reason.
+#
+# Exact paths only. `clippy.toml` takes no wildcards and no braces: a path such as `std::fs::*` is
+# not an error, it is a warning that matches nothing, so most of `std::fs` would go unseen.
+# `allow-invalid` keeps a path that a toolchain does not have (a function that was added or moved)
+# from becoming a warning, and `scripts/check-fs-lint.sh --self-test` runs every entry against a
+# fixture, so a path that is mistyped is found there and not by a build that finds nothing.
+#
+# A member crate of the workspace reads this file too, and every one of them sets the lint to
+# `allow` in its `Cargo.toml`.
+disallowed-methods = [
+	{ path = "std::fs::read", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::read_to_string", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::write", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::copy", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::rename", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::remove_file", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::remove_dir", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::remove_dir_all", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::create_dir", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::create_dir_all", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::read_dir", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::metadata", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::symlink_metadata", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::canonicalize", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::hard_link", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::read_link", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::set_permissions", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::exists", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::File::open", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::File::create", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::File::create_new", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::File::options", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::File::metadata", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::File::set_len", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::File::sync_all", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::File::sync_data", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::File::try_clone", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::OpenOptions::open", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::path::Path::exists", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::path::Path::try_exists", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::path::Path::is_dir", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::path::Path::is_file", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::path::Path::metadata", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::path::Path::read_dir", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::path::Path::canonicalize", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::path::Path::symlink_metadata", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::DirEntry::metadata", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+	{ path = "std::fs::DirEntry::file_type", reason = "go through the file system seam in src/vfs", allow-invalid = true },
+]

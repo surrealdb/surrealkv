@@ -19,3 +19,8 @@ tempfile = "3.10.1"
 [dev-dependencies]
 test-log = { version = "0.2.18", default-features = false, features = ["trace"] }
 tokio = { version = "1.39.2", features = ["full"] }
+
+[lints.clippy]
+# The calls that clippy.toml at the root lists are the engine's to route through its file system
+# seam, and are not this crate's concern.
+disallowed_methods = "allow"

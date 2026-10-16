@@ -127,9 +127,11 @@ impl std::fmt::Debug for AffinityLogStore {
 /// The error of a failed append or sync of the WAL, for the committer. As text, as it always was,
 /// except an encryption error, which keeps its type: a seal that was refused is not an I/O error,
 /// and the committer has to be able to tell.
-fn log_error(error: crate::wal::Error) -> crate::error::Error {
+pub(crate) fn log_error(error: crate::wal::Error) -> crate::error::Error {
 	match error {
 		crate::wal::Error::Encryption(error) => crate::error::Error::Encryption(error),
+		// A pool that had no free file is not a log that cannot be written: it passes.
+		crate::wal::Error::PoolExhausted => crate::error::Error::FilePoolExhausted,
 		error => crate::error::Error::Other(error.to_string()),
 	}
 }

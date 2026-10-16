@@ -1,0 +1,678 @@
+//! Files and the file system.
+//!
+//! [`File`] is the read seam of a table: positional reads of one open file. [`Fs`] is the
+//! directory-level seam beside it, and [`FsFile`] the open file it hands out. The engine does not
+//! call them yet (the milestones that move its call sites over are in the plan of the browser
+//! port), so everything below that is not `File` is built and tested and used by nothing.
+//!
+//! A file system is one of three kinds. [`StdFs`] is `std::fs` and is what a native build uses. A
+//! pool (to come) keeps its files in memory or in a browser's origin private file system.
+//! [`UnavailableFs`] is what a browser build has until a file system is mounted, and it refuses
+//! every operation with an error that says so.
+// The seam is built before anything calls it: each milestone that moves a call site over (tables,
+// the open path, the write-ahead log, the value log, the engine) takes a part out of this
+// allowance, and the last one removes it.
+#![allow(dead_code)]
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+mod std_fs;
+pub(crate) mod unavailable;
+
+#[cfg(test)]
+pub(crate) mod contract;
+
+use std::ffi::OsString;
+use std::fmt;
+use std::fs::File as SysFile;
+use std::future::Future;
+use std::io::{self, SeekFrom};
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::{Arc, LazyLock};
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+pub(crate) use self::std_fs::{StdFile, StdFs};
+pub(crate) use self::unavailable::UnavailableFs;
+use crate::error::{Error, Result};
+use crate::lockfile::LockFile;
+
+/// Read-only random-access file abstraction for SSTable blocks.
+pub trait File: Send + Sync {
+	/// Reads bytes from the given offset into the buffer.
+	///
+	/// Like `pread`, this may return fewer bytes than the buffer holds without being at the end
+	/// of the file. Callers that need the whole buffer use `read_exact_at`.
+	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize>;
+
+	/// Returns total file size in bytes.
+	fn size(&self) -> Result<u64>;
+
+	/// Reads until the buffer is full or the file ends, and returns how many bytes were read.
+	/// The count is short of the buffer only at the end of the file. A read that was interrupted
+	/// is retried.
+	fn read_up_to(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+		let mut filled = 0;
+		while filled < buf.len() {
+			let at = offset.checked_add(filled as u64).ok_or_else(|| {
+				Error::Io(Arc::new(std::io::Error::new(
+					std::io::ErrorKind::InvalidInput,
+					"read offset overflows",
+				)))
+			})?;
+			match self.read_at(at, &mut buf[filled..]) {
+				Ok(0) => break,
+				// A reader that claims more than it was asked for cannot move the position
+				// past the buffer.
+				Ok(n) => filled += n.min(buf.len() - filled),
+				Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+				Err(e) => return Err(e),
+			}
+		}
+		Ok(filled)
+	}
+
+	/// Fills the buffer from the given offset, or fails: a file that ends first is an
+	/// `UnexpectedEof` I/O error and the contents of the buffer are unspecified.
+	fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+		let read = self.read_up_to(offset, buf)?;
+		if read < buf.len() {
+			return Err(short_read(offset, buf.len(), read));
+		}
+		Ok(())
+	}
+}
+
+/// The error for a read that found the file ending before the bytes that were asked for.
+pub(crate) fn short_read(offset: u64, wanted: usize, got: usize) -> Error {
+	Error::Io(Arc::new(std::io::Error::new(
+		std::io::ErrorKind::UnexpectedEof,
+		format!("short read: wanted {wanted} bytes at offset {offset}, the file has {got}"),
+	)))
+}
+
+pub type InMemoryFile = Vec<u8>;
+
+impl File for InMemoryFile {
+	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+		// An offset at or past the end reads nothing, as `pread` does, and a request near
+		// `u64::MAX` cannot overflow.
+		let Some(rest) = usize::try_from(offset).ok().and_then(|start| self.get(start..)) else {
+			return Ok(0);
+		};
+		let bytes_read = rest.len().min(buf.len());
+		buf[..bytes_read].copy_from_slice(&rest[..bytes_read]);
+		Ok(bytes_read)
+	}
+
+	fn size(&self) -> Result<u64> {
+		Ok(self.len() as u64)
+	}
+}
+
+impl File for SysFile {
+	#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+		#[cfg(unix)]
+		{
+			std::os::unix::prelude::FileExt::read_at(self, buf, offset)
+				.map_err(|e| Error::Io(e.into()))
+		}
+
+		#[cfg(windows)]
+		{
+			std::os::windows::prelude::FileExt::seek_read(self, buf, offset)
+				.map_err(|e| Error::Io(e.into()))
+		}
+
+		#[cfg(target_os = "wasi")]
+		{
+			use std::os::fd::AsRawFd;
+			let fd = self.as_raw_fd();
+			let res = unsafe {
+				libc::pread(
+					fd,
+					buf.as_mut_ptr() as *mut libc::c_void,
+					buf.len(),
+					offset as libc::off_t,
+				)
+			};
+			if res < 0 {
+				Err(Error::Io(std::io::Error::last_os_error().into()))
+			} else {
+				Ok(res as usize)
+			}
+		}
+
+		#[cfg(all(target_arch = "wasm32", not(target_os = "wasi")))]
+		{
+			Err(Error::Io(
+				std::io::Error::new(
+					std::io::ErrorKind::Unsupported,
+					"read_at is not supported on WASM without OPFS or WASI",
+				)
+				.into(),
+			))
+		}
+	}
+
+	fn size(&self) -> Result<u64> {
+		self.metadata().map(|m| m.len()).map_err(|e| Error::Io(e.into()))
+	}
+}
+
+/// Opens a file with the access mode required for `sync_all()` to work
+/// on all platforms.
+///
+/// On Windows, `FlushFileBuffers` (called by `sync_all`) requires
+/// `GENERIC_WRITE` — a read-only handle returns `ERROR_ACCESS_DENIED`.
+/// On Unix, read-only access is sufficient for fsync.
+pub fn open_for_sync<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<SysFile> {
+	#[cfg(target_os = "windows")]
+	{
+		std::fs::OpenOptions::new().read(true).write(true).open(path)
+	}
+	#[cfg(not(target_os = "windows"))]
+	{
+		SysFile::open(path)
+	}
+}
+
+/// Fsyncs an existing file's data and metadata to disk (durability barrier).
+///
+/// Uses `sync_all` deliberately: readers depend on the durable file *size*
+/// (e.g. SST footers are located relative to the end of the file), so syncing
+/// data alone is not enough.
+pub(crate) fn fsync_file<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<()> {
+	let file = open_for_sync(&path)?;
+	file.sync_all()?;
+	#[cfg(test)]
+	sync_tracker::record(path.as_ref());
+	Ok(())
+}
+
+/// Test-only ledger of files made durable via [`fsync_file`].
+///
+/// Lets crash-consistency tests simulate power loss faithfully: files NOT in
+/// the ledger may legally lose their data (truncate to 0), while files in it
+/// must survive intact.
+#[cfg(test)]
+pub(crate) mod sync_tracker {
+	use std::collections::HashSet;
+	use std::path::{Path, PathBuf};
+	use std::sync::{LazyLock, Mutex};
+
+	static SYNCED: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Default::default);
+
+	// Canonicalize symmetrically in record() and was_synced(): on macOS,
+	// temp dirs under /var/folders canonicalize to /private/var/folders, so
+	// one-sided canonicalization would make lookups miss.
+	fn key(path: &Path) -> PathBuf {
+		path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+	}
+
+	pub(crate) fn record(path: &Path) {
+		SYNCED.lock().unwrap().insert(key(path));
+	}
+
+	pub(crate) fn was_synced(path: &Path) -> bool {
+		SYNCED.lock().unwrap().contains(&key(path))
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// The file system seam
+// ---------------------------------------------------------------------------------------------
+
+/// Whether the engine may use a pool file system. A pool's files live in a registry in memory, and
+/// the parts of the engine that decide from the file system whether a database exists (the open
+/// path, the manifest, the orphan sweep) have to go through it together: a database half-ported
+/// would write an empty manifest over the real one. Until every one of them does, a pool is
+/// refused when the options are validated, so that no build, release or pull request in between
+/// ships a `with_file_system` that opens a database in the wrong place.
+pub(crate) const POOL_FS_PORT_COMPLETE: bool = false;
+
+/// What a file system is, which is what the engine tests when it must behave differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FsKind {
+	/// `std::fs`: the files are the operating system's, and a native tool can read them.
+	Std,
+	/// A pool of pre-opened files with the names in a registry.
+	Pool,
+	/// Nothing is mounted: every operation fails.
+	Unavailable,
+}
+
+/// What a path names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+	File,
+	Dir,
+}
+
+/// One name in a directory listing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DirEntry {
+	pub(crate) name: OsString,
+	pub(crate) kind: EntryKind,
+}
+
+/// How a creation treats the spare files of a pool. A file system that has no spares ignores it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum SpareClass {
+	/// May use every spare file. The default.
+	#[default]
+	Reserved,
+	/// Fails with a pool-exhausted error unless more files are free than the commit path keeps for
+	/// itself. For the outputs of a compaction, which must not eat the files that a commit needs.
+	Opportunistic,
+}
+
+/// What a creation is given besides the path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct CreateOpts {
+	/// The permission bits of a file that is created. Only a Unix `StdFs` reads it.
+	pub(crate) mode: Option<u32>,
+	pub(crate) class: SpareClass,
+}
+
+impl CreateOpts {
+	pub(crate) const fn new(mode: Option<u32>) -> Self {
+		Self {
+			mode,
+			class: SpareClass::Reserved,
+		}
+	}
+
+	/// The same options, for a file that may only use the spare files that are not kept back.
+	pub(crate) const fn opportunistic(mut self) -> Self {
+		self.class = SpareClass::Opportunistic;
+		self
+	}
+}
+
+/// A wait for a pool to hold at least `n` free files. `Send`, because it only awaits a
+/// notification.
+pub(crate) type SpareWait = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'static>>;
+
+/// The directory-level seam. Synchronous and object-safe: the engine calls it under its own locks,
+/// so nothing in it may wait, and a call never calls back into the engine. The one exception is
+/// the future of [`Fs::ensure_spares`], which an `async` context that holds no lock awaits.
+///
+/// Every backend honours this, and every call site is correct under all of it.
+///
+/// * `open_*` and `create_*` of a path that is open may return the same shared handle (a pool) or
+///   an independent descriptor (`std`). A caller never relies on either: it keeps its own cursor
+///   ([`FsCursor`]), and never assumes that two handles cannot see each other's writes, or that an
+///   append is atomic across handles.
+/// * `remove_file` unlinks: a handle that is open keeps reading the old bytes.
+/// * `rename(from, to)` replaces `to`. On a pool it is crash-atomic and durable when it returns; on
+///   `std` it is `std::fs::rename`, durable at the next `sync_dir`, as it is today.
+/// * `create_new` is `AlreadyExists` if the path is present. `create_truncate` of a path that is
+///   present gives an empty file, and open readers of the old one may or may not keep their bytes.
+/// * `read_dir` is `NotFound` if the path is not there, and an error if it is not a directory. The
+///   order is unspecified, so a caller sorts. `create_dir_all` is idempotent. A creation in a
+///   directory that does not exist is `NotFound`.
+/// * `replace_atomic` is `Error::Io` if it failed before the commit point, and the old content is
+///   intact; from the commit point on it is `Error::ManifestWriteUncertain`.
+/// * `exists`, `is_dir` and `is_file` read an error as `false`, as `Path` does. A caller that must
+///   tell "absent" from "cannot tell" uses `entry` or `try_exists`.
+///
+/// Directory permissions and the symlink and hard link calls of a checkpoint are not part of this
+/// seam: they stay on `std::fs`, and the code that uses them refuses a file system that is not
+/// `std`.
+pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
+	fn kind(&self) -> FsKind;
+
+	/// The first call of `build_async`: a file system that has nothing mounted answers with a typed
+	/// error here, before any `exists` can answer `false` and make an empty database of it.
+	fn check_available(&self) -> io::Result<()> {
+		Ok(())
+	}
+
+	// ---- namespace --------------------------------------------------------------------------
+
+	/// What `path` names: `Ok(None)` if nothing, an error if it cannot be told. The primitive that
+	/// the other questions about a path are answered from.
+	fn entry(&self, path: &Path) -> io::Result<Option<EntryKind>>;
+
+	/// `Path::try_exists`: the three-way answer, for the sites that read `try_exists()?`.
+	fn try_exists(&self, path: &Path) -> io::Result<bool> {
+		Ok(self.entry(path)?.is_some())
+	}
+
+	/// `Path::exists`: an error reads as `false`. `StdFs` is `Path::exists` itself, so that no
+	/// decision on a native build changes.
+	fn exists(&self, path: &Path) -> bool {
+		self.try_exists(path).unwrap_or(false)
+	}
+
+	fn is_dir(&self, path: &Path) -> bool {
+		matches!(self.entry(path), Ok(Some(EntryKind::Dir)))
+	}
+
+	fn is_file(&self, path: &Path) -> bool {
+		matches!(self.entry(path), Ok(Some(EntryKind::File)))
+	}
+
+	fn create_dir_all(&self, path: &Path) -> io::Result<()>;
+
+	fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;
+
+	/// `NotFound` if `path` is not there.
+	fn remove_file(&self, path: &Path) -> io::Result<()>;
+
+	/// `NotFound` if `path` is not there.
+	fn remove_dir_all(&self, path: &Path) -> io::Result<()>;
+
+	/// `NotFound` if `from` is not there.
+	fn rename(&self, from: &Path, to: &Path) -> io::Result<()>;
+
+	/// Makes the names in a directory durable. `StdFs` is `lsm::fsync_directory`, which also keeps
+	/// the test ledger of synced directories.
+	fn sync_dir(&self, path: &Path) -> io::Result<()>;
+
+	// ---- files ------------------------------------------------------------------------------
+
+	/// An open file to read, `NotFound` if there is none. `FsFile::append` of it fails on a Unix
+	/// `std` (a Windows read open is writable, because syncing needs it).
+	fn open_read(&self, path: &Path) -> io::Result<Arc<dyn FsFile>>;
+
+	/// A file to read and append to, created if it is absent. What the write-ahead log opens.
+	fn open_append(&self, path: &Path, opts: CreateOpts) -> io::Result<Arc<dyn FsFile>>;
+
+	/// A new file, `AlreadyExists` if the path is present. What a new log segment is.
+	fn create_new(&self, path: &Path, opts: CreateOpts) -> io::Result<Arc<dyn FsFile>>;
+
+	/// An empty file to write and read back, truncated if it existed. What a table is: the handle
+	/// that wrote it can serve as its reader.
+	fn create_truncate(&self, path: &Path, opts: CreateOpts) -> io::Result<Arc<dyn FsFile>>;
+
+	/// Makes the bytes of the file at `path` and its place in its directory durable. `StdFs` is
+	/// `vfs::fsync_file`, which feeds the ledger of synced files that the crash tests read.
+	fn sync_file(&self, path: &Path) -> io::Result<()> {
+		self.open_read(path)?.sync()
+	}
+
+	// ---- composites the engine needs --------------------------------------------------------
+
+	/// Replaces the file at `path` with `content`, all or nothing: the manifest. `StdFs` is
+	/// `levels::replace_file_content` unchanged, failpoints included.
+	fn replace_atomic(&self, path: &Path, content: &[u8]) -> Result<()>;
+
+	/// The length of the file at `path`. What a listing does not say.
+	fn file_len(&self, path: &Path) -> io::Result<u64> {
+		self.open_read(path)?.len()
+	}
+
+	/// The whole file.
+	fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+		let file = self.open_read(path)?;
+		let len = usize::try_from(file.len()?).map_err(|_| {
+			io::Error::new(io::ErrorKind::OutOfMemory, "the file does not fit in memory")
+		})?;
+		let mut content = vec![0u8; len];
+		let read = File::read_up_to(&*file, 0, &mut content).map_err(into_io_error)?;
+		content.truncate(read);
+		Ok(content)
+	}
+
+	/// The first `n` bytes of the file, fewer if it is shorter, `None` if it is not there.
+	fn read_prefix(&self, path: &Path, n: usize) -> io::Result<Option<Vec<u8>>> {
+		let file = match self.open_read(path) {
+			Ok(file) => file,
+			Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+			Err(e) => return Err(e),
+		};
+		let want = usize::try_from(file.len()?).map_or(n, |len| len.min(n));
+		let mut head = vec![0u8; want];
+		let read = File::read_up_to(&*file, 0, &mut head).map_err(into_io_error)?;
+		head.truncate(read);
+		Ok(Some(head))
+	}
+
+	/// Copies the file at `from` over `to` and makes the copy durable, and returns its length.
+	/// `StdFs` is `std::fs::copy`, which keeps the permissions of the source and does not sync.
+	fn copy(&self, from: &Path, to: &Path) -> io::Result<u64> {
+		let source = self.open_read(from)?;
+		let copy = self.create_truncate(to, CreateOpts::default())?;
+		let mut chunk = vec![0u8; 64 * 1024];
+		let mut copied = 0u64;
+		loop {
+			let read = File::read_up_to(&*source, copied, &mut chunk).map_err(into_io_error)?;
+			if read == 0 {
+				break;
+			}
+			copy.append(&chunk[..read])?;
+			copied += read as u64;
+			if read < chunk.len() {
+				break;
+			}
+		}
+		copy.sync()?;
+		Ok(copied)
+	}
+
+	// ---- lifecycle --------------------------------------------------------------------------
+
+	/// The lock of the database in `dir`, not yet acquired. `StdFs` is the existing `flock` of a
+	/// `LOCK` file; a pool registers the directory in its own set, so that one tree owns it.
+	fn lock_file(&self, dir: &Path) -> LockFile;
+
+	/// `None` when at least `n` files can be created now, which is always the case of `StdFs`.
+	/// Otherwise a future that completes when they can. Awaited only where no lock is held.
+	fn ensure_spares(&self, n: usize) -> Option<SpareWait> {
+		let _ = n;
+		None
+	}
+
+	/// How many creations a pool has refused for want of a file, ever. A background task reads it
+	/// before and after a unit of work: if it advanced, a failure of that unit is not permanent,
+	/// whatever the failure looks like after the layers it went through.
+	fn pool_exhaustions(&self) -> u64 {
+		0
+	}
+}
+
+/// An open file that can be written as well as read, positional like the read seam it extends.
+/// `Arc<dyn FsFile>` coerces to `Arc<dyn File>`, which is what a table and a block source take.
+pub(crate) trait FsFile: File {
+	/// The length now, as the file system has it.
+	fn len(&self) -> io::Result<u64>;
+
+	/// Writes all of `buf` at the end of the file, or fails. A failed append may have written a
+	/// prefix of `buf`: `len` says how much, truthfully, and the write-ahead log cuts such a tail
+	/// back with `set_len`. "The end" is the end as of the last `append`, `set_len` or open, so
+	/// the caller never seeks.
+	fn append(&self, buf: &[u8]) -> io::Result<()>;
+
+	/// Shrinks or grows the file to `len` (a grown part reads as zeros) and makes `len` the end.
+	fn set_len(&self, len: u64) -> io::Result<()>;
+
+	/// Makes the bytes and the length of the file durable (`fsync`, or `flush` of a browser's
+	/// access handle, which is a barrier for ordering and not a promise about a power cut).
+	fn sync(&self) -> io::Result<()>;
+}
+
+/// What the write-ahead log and the tests pass where they used to pass a `std::fs::File`.
+pub(crate) trait IntoFsFile {
+	fn into_fs_file(self) -> Arc<dyn FsFile>;
+}
+
+impl IntoFsFile for Arc<dyn FsFile> {
+	fn into_fs_file(self) -> Arc<dyn FsFile> {
+		self
+	}
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+impl IntoFsFile for SysFile {
+	fn into_fs_file(self) -> Arc<dyn FsFile> {
+		Arc::new(StdFile::from_file(self))
+	}
+}
+
+/// `io::Write` over [`FsFile::append`]: what a table writer and the buffer of the write-ahead log
+/// are given. `flush` does nothing, as it does for `std::fs::File`.
+pub(crate) struct FsWriter(pub(crate) Arc<dyn FsFile>);
+
+impl io::Write for FsWriter {
+	fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+		self.0.append(buf)?;
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> io::Result<()> {
+		Ok(())
+	}
+}
+
+/// A private cursor over a shared positional file: `Read` and `Seek` for the reader of the
+/// write-ahead log, and `File` for its look-ahead.
+pub(crate) struct FsCursor {
+	file: Arc<dyn FsFile>,
+	pos: u64,
+}
+
+impl FsCursor {
+	pub(crate) fn new(file: Arc<dyn FsFile>) -> Self {
+		Self::at(file, 0)
+	}
+
+	pub(crate) fn at(file: Arc<dyn FsFile>, pos: u64) -> Self {
+		Self {
+			file,
+			pos,
+		}
+	}
+}
+
+impl io::Read for FsCursor {
+	fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+		let read = self.file.read_at(self.pos, buf).map_err(into_io_error)?;
+		self.pos += read as u64;
+		Ok(read)
+	}
+}
+
+impl io::Seek for FsCursor {
+	fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+		let target = match from {
+			SeekFrom::Start(at) => Some(at),
+			SeekFrom::Current(by) => self.pos.checked_add_signed(by),
+			SeekFrom::End(by) => self.file.len()?.checked_add_signed(by),
+		};
+		let at = target.ok_or_else(|| {
+			io::Error::new(
+				io::ErrorKind::InvalidInput,
+				"invalid seek to a negative or overflowing position",
+			)
+		})?;
+		self.pos = at;
+		Ok(at)
+	}
+}
+
+impl File for FsCursor {
+	fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<usize> {
+		self.file.read_at(offset, buf)
+	}
+
+	fn size(&self) -> Result<u64> {
+		self.file.size()
+	}
+}
+
+/// The opaque, cloneable file system that a `Tree` is built over. The traits behind it are private
+/// so that they can change.
+///
+/// `FileSystem::std` is the default of a native build, and the files are the operating system's.
+/// A build for a browser has none until one is mounted, and building a tree without one fails with
+/// an error that says so.
+#[derive(Clone, Debug)]
+pub struct FileSystem(pub(crate) Arc<dyn Fs>);
+
+impl FileSystem {
+	/// The operating system's files, through `std::fs`. The default of a native build.
+	#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+	pub fn std() -> Self {
+		Self(Arc::new(StdFs))
+	}
+
+	/// A file system that lives in memory and is lost with the process, on any target.
+	///
+	/// Not available yet: until it is, a tree built over it fails with an error that says so,
+	/// before it touches anything.
+	pub fn memory() -> Self {
+		Self(Arc::new(UnavailableFs::new(
+			"the in-memory file system is not implemented yet: use FileSystem::std()",
+		)))
+	}
+}
+
+/// The file system that `Options::default()` and the write-ahead log start from: `std::fs` where
+/// there is one, and a file system that refuses everything in a browser, so that a tree built there
+/// without a mount fails loudly and creates nothing.
+pub(crate) fn default_fs() -> Arc<dyn Fs> {
+	static DEFAULT: LazyLock<Arc<dyn Fs>> = LazyLock::new(make_default_fs);
+	Arc::clone(&DEFAULT)
+}
+
+#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+fn make_default_fs() -> Arc<dyn Fs> {
+	Arc::new(StdFs)
+}
+
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+fn make_default_fs() -> Arc<dyn Fs> {
+	Arc::new(UnavailableFs::no_file_system())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Errors that a file system raises on purpose
+// ---------------------------------------------------------------------------------------------
+
+/// The payload of the `io::Error` that a pool answers a creation with when it has no free file.
+/// It crosses every layer that takes an `io::Error`, and the conversions into [`Error`] and
+/// `wal::Error` look for it (`is_pool_exhausted`) and make the typed error of it, which the
+/// background tasks treat as something that passes once the pool is refilled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PoolExhausted;
+
+impl fmt::Display for PoolExhausted {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.write_str("the file pool has no free file")
+	}
+}
+
+impl std::error::Error for PoolExhausted {}
+
+/// The error of a creation that found no free file in a pool.
+pub(crate) fn pool_exhausted() -> io::Error {
+	io::Error::other(PoolExhausted)
+}
+
+/// Whether `error` is the one that [`pool_exhausted`] makes.
+pub(crate) fn is_pool_exhausted(error: &io::Error) -> bool {
+	error.get_ref().is_some_and(|inner| inner.is::<PoolExhausted>())
+}
+
+/// The error of an operation on a file system that has nothing mounted: `Unsupported`, with a
+/// text that names what to do.
+pub(crate) fn unavailable_error(reason: &str) -> io::Error {
+	io::Error::new(io::ErrorKind::Unsupported, reason.to_string())
+}
+
+/// The `io::Error` of an engine `Error`, for the places where a file API that speaks `io` calls
+/// one that speaks `Error`. An I/O error comes back as it was (so does a pool that is exhausted),
+/// and anything else is wrapped.
+pub(crate) fn into_io_error(error: Error) -> io::Error {
+	match error {
+		Error::Io(shared) => match Arc::try_unwrap(shared) {
+			Ok(error) => error,
+			Err(shared) if is_pool_exhausted(&shared) => pool_exhausted(),
+			Err(shared) => io::Error::new(shared.kind(), shared.to_string()),
+		},
+		Error::FilePoolExhausted => pool_exhausted(),
+		other => io::Error::other(other),
+	}
+}

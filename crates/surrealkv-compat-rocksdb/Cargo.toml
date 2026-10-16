@@ -19,3 +19,8 @@ rustix = { version = "1.0", features = ["fs"] }
 
 [dev-dependencies]
 tempfile = "3.10"
+
+[lints.clippy]
+# The calls that clippy.toml at the root lists are the engine's to route through its file system
+# seam, and are not this crate's concern.
+disallowed_methods = "allow"

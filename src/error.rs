@@ -95,6 +95,12 @@ pub enum Error {
 	/// Encryption at rest failed: a key problem, an authentication failure or an unreadable
 	/// encryption header. None of these is ever repaired by dropping data.
 	Encryption(EncryptionError),
+	/// A file system that keeps a fixed pool of files had none free for a file that was to be
+	/// created. This passes: the pool is refilled in the background and the work that asked can be
+	/// done again, so a flush or a compaction that fails with it waits and retries, and a build
+	/// that fails with it is built again once the pool has more. A database that was open is not
+	/// stopped by it.
+	FilePoolExhausted,
 }
 
 // Implementation of Display trait for Error
@@ -154,6 +160,7 @@ impl fmt::Display for Error {
             ),
             Self::SSTable(err) => write!(f, "SSTable error: {err}"),
             Self::Encryption(err) => write!(f, "Encryption error: {err}"),
+            Self::FilePoolExhausted => write!(f, "The file pool has no free file for a new file"),
         }
 	}
 }
@@ -176,7 +183,14 @@ impl Error {
 // Implementation to convert io::Error into Error
 impl From<io::Error> for Error {
 	fn from(e: io::Error) -> Error {
-		Error::Io(Arc::new(e))
+		// A pool that had no free file says so in the payload of its error, and the type keeps it
+		// through the layers that wrap an I/O error: it is what tells a failure that passes from
+		// one that does not.
+		if crate::vfs::is_pool_exhausted(&e) {
+			Error::FilePoolExhausted
+		} else {
+			Error::Io(Arc::new(e))
+		}
 	}
 }
 
@@ -185,6 +199,8 @@ impl From<crate::wal::Error> for Error {
 		match err {
 			// Keeps its type: whoever handles it must tell a key from damage.
 			crate::wal::Error::Encryption(err) => Error::Encryption(err),
+			// And this one a pool that has no free file from a log that cannot be written.
+			crate::wal::Error::PoolExhausted => Error::FilePoolExhausted,
 			err => Error::Wal(err.to_string()),
 		}
 	}
@@ -482,6 +498,11 @@ impl BackgroundErrorHandler {
 			// A memtable or a table holds batches that were never published: the process
 			// cannot go on
 			(BackgroundErrorReason::CommitGroup, _) => ErrorSeverity::Unrecoverable,
+
+			// A pool of files that has none free for now: a flush, a compaction or a manifest write
+			// that met it did not fail, it has to wait, and nothing it wrote is wrong. It must
+			// stay below the commit-group arm, which wins over every error, and above the default.
+			(_, Error::FilePoolExhausted) => ErrorSeverity::SoftError,
 
 			(_, Error::Encryption(err)) => match err.class() {
 				EncryptionClass::Retryable => ErrorSeverity::SoftError,

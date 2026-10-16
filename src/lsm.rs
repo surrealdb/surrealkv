@@ -2354,6 +2354,12 @@ impl Tree {
 		// Validate options before creating the tree
 		opts.validate()?;
 
+		// A file system that has nothing mounted is refused before any call asks it whether a
+		// database exists: on it every such call answers `false`, and a sync `build()` would
+		// make an empty database of that, or (while the engine still reads `opts.path` itself)
+		// write one to the operating system's disk. A no-op for every other file system.
+		opts.fs.check_available()?;
+
 		// Fail before anything is created or moved if a restore into the directory did not
 		// finish. This must stay ahead of the migrations, the directory creation and the lock
 		// file.
@@ -2976,6 +2982,12 @@ impl TreeBuilder {
 		self
 	}
 
+	/// Puts the database in `fs`: see [`Options::with_file_system`].
+	pub fn with_file_system(mut self, fs: crate::FileSystem) -> Self {
+		self.opts = self.opts.with_file_system(fs);
+		self
+	}
+
 	/// Sets the block size.
 	pub fn with_block_size(mut self, size: usize) -> Self {
 		self.opts = self.opts.with_block_size(size);
@@ -3169,6 +3181,25 @@ impl TreeBuilder {
 	/// for both the builder and the resulting tree.
 	pub fn build(self) -> Result<Tree> {
 		Tree::new(Arc::new(self.opts))
+	}
+
+	/// Builds the LSM tree: the entry point for a browser, and the same as [`build`](Self::build)
+	/// on a native build for now.
+	///
+	/// A file system that has nothing mounted is refused first, with an error that says what to
+	/// do, before anything is read or created.
+	pub async fn build_async(self) -> Result<Tree> {
+		self.opts.validate()?;
+		self.opts.fs.check_available()?;
+		self.build()
+	}
+
+	/// [`build_async`](Self::build_async), returning the options as well, as
+	/// [`build_with_options`](Self::build_with_options) does.
+	pub async fn build_with_options_async(self) -> Result<(Tree, Arc<Options>)> {
+		self.opts.validate()?;
+		self.opts.fs.check_available()?;
+		self.build_with_options()
 	}
 
 	/// Builds the LSM tree and returns both the tree and the options.

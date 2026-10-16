@@ -285,3 +285,108 @@ async fn a_cancelled_timer_does_not_leak_memory() {
 	// A leak of 90 bytes a timer is 100,000 timers, or about 140 pages.
 	assert!(grown <= 8, "100,000 cancelled timers grew the memory by {grown} pages");
 }
+
+// ---------------------------------------------------------------------------------------------
+// The file system seam
+//
+// A browser has no `std::fs`, so `Options::default()` starts from a file system that refuses
+// everything, and a tree can only be built over one that was mounted. Nothing mounts one yet; what
+// is held here is that the refusals are typed errors and not traps, and that the types that the
+// pool will use work in a browser.
+// ---------------------------------------------------------------------------------------------
+
+/// The default is the file system with nothing mounted, in the options and in the log's context,
+/// and it refuses every operation with `Unsupported` and the text that says what to do.
+#[wasm_bindgen_test]
+fn the_default_file_system_has_nothing_mounted_and_refuses_everything() {
+	use crate::vfs::{self, FsKind};
+
+	let options = Options::default();
+	assert_eq!(options.fs.kind(), FsKind::Unavailable);
+	assert_eq!(vfs::default_fs().kind(), FsKind::Unavailable);
+	assert_eq!(crate::wal::WalContext::default().fs.kind(), FsKind::Unavailable);
+	// The same options are valid: it is building a tree that says there is no file system.
+	options.validate().expect("the default options are valid");
+	vfs::unavailable::assert_refuses_everything(&*options.fs, "no file system is mounted");
+}
+
+/// Building a tree without a mounted file system is a typed error that names what to do, from
+/// both entry points, before anything is read.
+#[wasm_bindgen_test]
+async fn building_without_a_mounted_file_system_is_a_typed_error() {
+	let built = TreeBuilder::new().with_path("/surrealkv-wasm-fs".into()).build_async().await;
+	match built {
+		Err(Error::Io(e)) => {
+			assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+			assert!(e.to_string().contains("no file system is mounted"), "{e}");
+		}
+		Err(other) => panic!("a typed refusal was expected, got {other:?}"),
+		Ok(_) => panic!("a tree was built over no file system"),
+	}
+	let with_options = TreeBuilder::new().build_with_options_async().await;
+	assert!(matches!(with_options, Err(Error::Io(_))));
+
+	// The sync entry points refuse in the same way, before the first `exists` can answer `false`.
+	for built in [
+		TreeBuilder::new().with_path("/surrealkv-wasm-fs".into()).build().map(|_| ()),
+		TreeBuilder::new().build_with_options().map(|_| ()),
+	] {
+		match built {
+			Err(Error::Io(e)) => {
+				assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+				assert!(e.to_string().contains("no file system is mounted"), "{e}");
+			}
+			other => panic!("a typed refusal was expected, got {other:?}"),
+		}
+	}
+
+	// The in-memory file system is not there yet, and says so in the same way.
+	let memory =
+		TreeBuilder::new().with_file_system(crate::FileSystem::memory()).build_async().await;
+	match memory {
+		Err(Error::Io(e)) => assert!(e.to_string().contains("not implemented yet"), "{e}"),
+		other => panic!("{:?}", other.map(|_| ())),
+	}
+	// Still alive.
+	assert!(rt::Instant::now().elapsed() < Duration::from_secs(60));
+}
+
+/// The lock that a pool hands out gives its entry back when it is dropped: on this target too,
+/// where the lock of a native build is a no-op and had no `Drop`.
+#[wasm_bindgen_test]
+fn a_registered_lock_is_one_per_directory_and_is_given_back() {
+	crate::lockfile::check_registered_locks();
+}
+
+/// The typed error of a pool that has no free file: its payload survives the conversions, and it
+/// is a soft error for the background tasks, in a browser as it is natively.
+#[wasm_bindgen_test]
+fn an_exhausted_pool_is_a_typed_soft_error() {
+	use crate::error::ErrorSeverity;
+	use crate::vfs;
+
+	assert!(matches!(Error::from(vfs::pool_exhausted()), Error::FilePoolExhausted));
+	assert_eq!(crate::wal::Error::from(vfs::pool_exhausted()), crate::wal::Error::PoolExhausted);
+	assert!(matches!(Error::from(crate::wal::Error::PoolExhausted), Error::FilePoolExhausted));
+	assert!(matches!(Error::from(std::io::Error::other("full")), Error::Io(_)));
+	for reason in [
+		BackgroundErrorReason::MemtablaFlush,
+		BackgroundErrorReason::Compaction,
+		BackgroundErrorReason::ManifestWrite,
+	] {
+		assert_eq!(
+			BackgroundErrorHandler::classify_error(&Error::FilePoolExhausted, reason),
+			ErrorSeverity::SoftError
+		);
+	}
+	assert_eq!(
+		BackgroundErrorHandler::classify_error(
+			&Error::FilePoolExhausted,
+			BackgroundErrorReason::CommitGroup
+		),
+		ErrorSeverity::Unrecoverable
+	);
+	let handler = BackgroundErrorHandler::new();
+	handler.set_error(Error::FilePoolExhausted, BackgroundErrorReason::MemtablaFlush);
+	assert!(!handler.is_db_stopped());
+}

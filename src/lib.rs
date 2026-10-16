@@ -88,6 +88,7 @@ pub use crate::transaction::{
 	Transaction,
 	WriteOptions,
 };
+pub use crate::vfs::FileSystem;
 pub use crate::wal::WalRecoveryReport;
 
 /// An optimised trait for converting values to bytes only when needed
@@ -327,6 +328,10 @@ pub struct Options {
 	/// `..Default::default()`.
 	#[doc(hidden)]
 	pub encryption_context: Option<Arc<EncryptionContext>>,
+
+	/// The file system the database lives in. `std::fs` on a native build, and nothing in a
+	/// browser, where one has to be mounted and given with `with_file_system`.
+	pub(crate) fs: Arc<dyn vfs::Fs>,
 }
 
 impl Default for Options {
@@ -373,6 +378,7 @@ impl Default for Options {
 			key_manager: None,
 			encryption_cipher: CipherPreference::default(),
 			encryption_context: None,
+			fs: vfs::default_fs(),
 		}
 	}
 }
@@ -394,6 +400,14 @@ impl Options {
 
 	pub fn with_filter_policy(mut self, value: Option<Arc<dyn FilterPolicy>>) -> Self {
 		self.filter_policy = value;
+		self
+	}
+
+	/// Puts the database in `fs`. The default is the operating system's files on a native build,
+	/// and in a browser there is no default: a file system has to be mounted and given here, or
+	/// building a tree fails with an error that says so before it touches anything.
+	pub fn with_file_system(mut self, fs: FileSystem) -> Self {
+		self.fs = fs.0;
 		self
 	}
 
@@ -713,6 +727,15 @@ impl Options {
 	/// address space are checked against it, so that a 32-bit target's limits are tested on any
 	/// host.
 	fn validate_for_pointer_width(&self, pointer_bits: u32) -> Result<()> {
+		// A pool is refused until every part of the engine that asks the file system whether a
+		// database exists goes through it (see `vfs::POOL_FS_PORT_COMPLETE`). Nothing is created
+		// before this, so the refusal leaves nothing behind.
+		if !vfs::POOL_FS_PORT_COMPLETE && self.fs.kind() == vfs::FsKind::Pool {
+			return Err(Error::InvalidArgument(
+				"a pooled file system is not supported by this build of the engine yet".to_string(),
+			));
+		}
+
 		// A build without the `encryption` feature must not seal anything, so it refuses a key
 		// manager rather than writing plaintext to a database that was asked to be encrypted.
 		// Refuse here, which is the first thing `Tree::new` does, so a rejection creates nothing

@@ -162,10 +162,22 @@ const DEFAULT_FILE_SIZE: u64 = 100 * 1024 * 1024;
 /// encrypted tree, which is why the plaintext constructor is for tests.
 ///
 /// Cheap to clone, and shared by the workers that decode segments in parallel.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct WalContext {
 	/// What creates and opens the encrypted files of the database, if the WAL is sealed.
 	cipher: Option<Arc<EncryptionContext>>,
+	/// The file system the segments are in. Nothing reads it yet: the write-ahead log moves over
+	/// to it in a later change, and until then it only travels with the context.
+	pub(crate) fs: Arc<dyn crate::vfs::Fs>,
+}
+
+impl Default for WalContext {
+	fn default() -> Self {
+		Self {
+			cipher: None,
+			fs: crate::vfs::default_fs(),
+		}
+	}
 }
 
 impl WalContext {
@@ -181,6 +193,7 @@ impl WalContext {
 	pub(crate) fn sealed(context: Arc<EncryptionContext>) -> Self {
 		Self {
 			cipher: Some(context),
+			fs: crate::vfs::default_fs(),
 		}
 	}
 
@@ -192,6 +205,7 @@ impl WalContext {
 		opts.ensure_encryption_resolved()?;
 		Ok(Self {
 			cipher: opts.encryption_context().cloned(),
+			fs: Arc::clone(&opts.fs),
 		})
 	}
 
@@ -208,7 +222,10 @@ impl WalContext {
 
 impl fmt::Debug for WalContext {
 	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_struct("WalContext").field("sealed", &self.cipher.is_some()).finish()
+		f.debug_struct("WalContext")
+			.field("sealed", &self.cipher.is_some())
+			.field("fs", &self.fs.kind())
+			.finish()
 	}
 }
 
@@ -332,6 +349,10 @@ pub enum Error {
 	/// A key, a header or an authentication tag said no. Never damage, so never a reason to repair
 	/// or delete anything.
 	Encryption(EncryptionError),
+	/// A pool of files had none free for a segment that was to be created. This passes: the pool
+	/// is refilled, and the work can be done again. Kept apart from `IO` so that the type survives
+	/// the layers that turn an error into text.
+	PoolExhausted,
 	/// A sealed segment holds records that pass their checksum after a block that is zero-filled
 	/// or damaged, or a segment of the sequence is missing: data was lost from the middle of
 	/// the WAL, which is not what a torn write at its end looks like.
@@ -371,6 +392,7 @@ impl fmt::Display for Error {
 			}
 			Error::SegmentNotFound => write!(f, "Segment not found"),
 			Error::Encryption(err) => write!(f, "Encryption error: {err}"),
+			Error::PoolExhausted => write!(f, "The file pool has no free file for a new segment"),
 			Error::IndexGap {
 				segment_id,
 				offset,
@@ -395,6 +417,11 @@ impl std::error::Error for Error {}
 
 impl From<io::Error> for Error {
 	fn from(e: io::Error) -> Error {
+		// Only the kind and the text of an I/O error are kept, so the payload of a pool that had no
+		// free file is looked for before it is lost.
+		if crate::vfs::is_pool_exhausted(&e) {
+			return Error::PoolExhausted;
+		}
 		Error::IO(IOError {
 			kind: e.kind(),
 			message: e.to_string(),

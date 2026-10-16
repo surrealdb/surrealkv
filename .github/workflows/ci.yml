@@ -105,6 +105,20 @@ jobs:
           scripts/check-rt-guard.sh --self-test
           scripts/check-rt-guard.sh
 
+      # The typed error of a file pool that has no free file must pass through every place that
+      # lets an encryption error through unchanged, or a pool a moment from having a file stops the
+      # database. The self-test checks that the guard still refuses a missing arm.
+      - name: Pool error passthrough guard
+        run: |
+          scripts/check-passthrough.sh --self-test
+          scripts/check-passthrough.sh
+
+      # The list of calls that must go through the file system seam (clippy.toml) is not enforced
+      # while the engine is being moved over, so nothing else would notice an entry that matches
+      # nothing. This runs every entry against a fixture with the lint denied.
+      - name: File system lint list
+        run: scripts/check-fs-lint.sh --self-test
+
   # Encryption is on by default, so the normal jobs cover it. Build and test without it here, to
   # keep the guard that rejects a key manager from rotting.
   no-encryption:
