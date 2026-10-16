@@ -56,6 +56,14 @@ pub enum CrashMode {
 	/// The first `k` survive, and the next one, if it is a write, survives only in its first `n`
 	/// bytes: a write that was torn.
 	Tear(usize, usize),
+	/// Every unflushed operation survives except the one at index `lost`, which is dropped, and
+	/// the write at index `torn`, which survives in its first `n` bytes. A flush is the only
+	/// barrier, so an earlier write may be lost while a later one is torn: no other mode says so.
+	LoseTear {
+		lost: usize,
+		torn: usize,
+		n: usize,
+	},
 	/// Every operation survives as to the length of the file, and none as to the bytes: the size
 	/// of a file was kept and the blocks were not.
 	ZeroTail,
@@ -380,6 +388,34 @@ impl MemState {
 							},
 						));
 					}
+				}
+			}
+			CrashMode::LoseTear {
+				lost,
+				torn,
+				n,
+			} => {
+				for (index, (seq, name, op)) in unflushed.iter().enumerate() {
+					if index == lost {
+						continue;
+					}
+					let op = match op {
+						Op::Write {
+							offset,
+							data,
+						} if index == torn => {
+							let n = n.min(data.len());
+							if n == 0 {
+								continue;
+							}
+							Op::Write {
+								offset: *offset,
+								data: data[..n].to_vec(),
+							}
+						}
+						other => other.clone(),
+					};
+					kept.push((*seq, name.clone(), op));
 				}
 			}
 			CrashMode::ZeroTail => {
@@ -948,6 +984,21 @@ mod tests {
 		// A tear at a truncation keeps nothing of it.
 		let c = raw.crash(CrashMode::Tear(2, 1));
 		assert_eq!(read_all(&c, "a"), b"AAAA1111");
+
+		// An earlier write lost and a later one torn, both in one crash.
+		let c = raw.crash(CrashMode::LoseTear {
+			lost: 0,
+			torn: 3,
+			n: 2,
+		});
+		assert_eq!(read_all(&c, "a"), b"AAAA\0\0");
+		assert_eq!(read_all(&c, "b"), b"222233");
+		let c = raw.crash(CrashMode::LoseTear {
+			lost: 1,
+			torn: 1,
+			n: 2,
+		});
+		assert_eq!(read_all(&c, "b"), [0, 0, 0, 0, b'3', b'3', b'3', b'3']);
 
 		// Zero tail: the lengths survive and the new bytes do not.
 		let c = raw.crash(CrashMode::ZeroTail);

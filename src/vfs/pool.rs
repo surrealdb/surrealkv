@@ -15,7 +15,9 @@
 //!   the physical size minus the two pages, and the bytes of a file are exactly what a native file
 //!   would hold;
 //! * a header update writes the page that does not count, with a sequence number that only grows
-//!   for the whole pool, so a torn write leaves the old header readable;
+//!   for the whole pool, so a torn write leaves the old header readable. A write that is not
+//!   flushed never goes over the page that holds the newest header that is, also after a flush
+//!   fails: the next write goes over the page of the one that was not flushed;
 //! * a slot is claimed from a list of clean slots (free headers, no payload). A slot that is
 //!   unlinked is cleaned before it is reused: truncated to the headers, both pages made free,
 //!   flushed. Nothing is cleaned in a `Drop`: a dead slot is queued, and cleaned by `maintain` or,
@@ -700,8 +702,18 @@ impl<R: Raw> PoolShared<R> {
 
 	// ---- headers ----------------------------------------------------------------------------
 
-	/// Writes a header into the page of the slot that does not count. Nothing changes if the write
-	/// fails, so the old header still counts, and a retry writes the same page again.
+	/// Writes a header into a page of the slot. Nothing changes if the write fails, so the old
+	/// header still counts, and a retry writes the same page again.
+	///
+	/// The page is the one that does not count, unless the header that counts is not flushed: then
+	/// it is that one, and the other page, which holds the newest header that is flushed, is left
+	/// alone. This is the invariant of the protocol: a write that is not flushed never goes over
+	/// the page that holds the newest header that is. Without it, two writes between two flushes
+	/// (a header that was written and whose flush failed, and the write that takes it back) would
+	/// put the second on the flushed page, and a crash that loses the first and tears the second
+	/// leaves no valid header: a synced file is gone, which a flush being the only barrier makes
+	/// legal. The price is that a header that was not flushed is replaced and not kept, which is
+	/// what it is: it was never promised.
 	fn write_header(&self, slot: &Slot<R>, state: HeaderState) -> io::Result<u64> {
 		// The number is taken under the lock of the slot: two writers of one slot would otherwise
 		// be able to put the lower number in the page that is written second, and the page that
@@ -713,7 +725,11 @@ impl<R: Raw> PoolShared<R> {
 			state: state.clone(),
 		}
 		.encode()?;
-		let target = 1 - st.active_page;
+		let target = if st.hdr_gen > st.flushed_gen {
+			st.active_page
+		} else {
+			1 - st.active_page
+		};
 		let (_, written) = write_fully(&slot.raw, page_offset(target), &page);
 		written?;
 		st.active_page = target;
@@ -1644,6 +1660,10 @@ impl<R: Raw> PoolFs<R> {
 						.write_header(&fresh, HeaderState::Named(key.clone()))
 						.and_then(|_| shared.flush_slot(&fresh));
 					if let Err(e) = named {
+						// The free header that discard writes goes over the page of the failed
+						// write, and not over the flushed one. Whether the truncation took place
+						// is not known, as for any create that fails: a mount may find the old
+						// file or an empty one, and never none.
 						shared.discard(fresh);
 						return Err(e);
 					}
@@ -1866,8 +1886,14 @@ impl<R: Raw> Fs for PoolFs<R> {
 		// fails its checksum and the old page names `a`), and after it the file is `b`.
 		shared.write_header(&slot, HeaderState::Named(b.clone()))?;
 		if let Err(e) = shared.flush_slot(&slot) {
-			// The header may have landed. Name the old path again, so that what is in memory and
-			// what a mount would find are the same as far as can be made so.
+			// The header may have landed, and a mount may find the file under `b`: the rename
+			// failed, and the outcome is open. The header of `a` is written again, over the page
+			// of the failed one (see `write_header`): any later flush of the slot (a sync
+			// of the file, say) would otherwise make `b` durable under a file that the caller
+			// goes on using as `a`. The page that holds the newest flushed header is never
+			// written, so a crash that loses one of the two writes and tears the other still
+			// finds the file under one of its names. If the write fails too, the outcome stays
+			// open until the next flush.
 			let _ = shared.write_header(&slot, HeaderState::Named(a));
 			return Err(e);
 		}
@@ -4130,5 +4156,156 @@ mod tests {
 			Op::Crash(1, 3),
 			Op::Check(3),
 		]);
+	}
+
+	// ---- a failed flush never costs the header that was flushed ---------------------------------
+
+	/// Every mode of `crash_modes`, and every combination of one lost write with one torn write.
+	fn crash_modes_with_losses(raw: &MemRaw) -> Vec<CrashMode> {
+		let pending = raw.unflushed_ops();
+		let mut modes = crash_modes(raw);
+		for lost in 0..pending {
+			for torn in 0..pending {
+				for n in [1usize, 14, 17, 100, 2048, 4095] {
+					modes.push(CrashMode::LoseTear {
+						lost,
+						torn,
+						n,
+					});
+				}
+			}
+		}
+		modes
+	}
+
+	/// The invariant of the header protocol: a write that is not flushed never goes over the page
+	/// that holds the newest header that is. Whatever a crash does to the unflushed writes, that
+	/// page and so the last durable state of the file are still there.
+	fn assert_flushed_header_untouched(raw: &MemRaw, context: &str) {
+		for name in raw.names() {
+			if parse_slot_name(&name).is_none() {
+				continue;
+			}
+			let Some(durable) = raw.durable_image(&name) else {
+				continue;
+			};
+			if durable.len() < HEADER_LEN as usize {
+				continue;
+			}
+			if let Some((page, _)) = SlotHeaders::decode(&durable).current {
+				let now = raw.image(&name).unwrap();
+				let range = page * PAGE_LEN..(page + 1) * PAGE_LEN;
+				assert_eq!(
+					now[range.clone()],
+					durable[range],
+					"{context}: the unflushed writes of {name} went over its flushed header"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn a_rename_whose_flush_fails_leaves_the_flushed_header_alone_in_every_crash() {
+		let (fs, raw) = base_pool();
+		put(&fs, "/d/a", b"AAAA");
+		raw.fail_flush_after(0);
+		assert!(fs.rename(p("/d/a"), p("/d/b")).is_err());
+		raw.clear_faults();
+		assert_flushed_header_untouched(&raw, "after the failed rename");
+		// The file is still where memory says.
+		assert_eq!(read(&fs, "/d/a").as_deref(), Some(&b"AAAA"[..]));
+		let mut checked = 0;
+		for mode in crash_modes_with_losses(&raw) {
+			let image = raw.crash(mode);
+			let (after, _) = PoolFs::mount_sync(image.clone(), PoolConfig::memory()).unwrap();
+			after.create_dir_all(p("/d")).unwrap();
+			assert_sound(&image, &format!("{mode:?}"));
+			// A rename that failed may or may not have happened. The file is under one name.
+			let (a, b) = (read(&after, "/d/a"), read(&after, "/d/b"));
+			assert!(
+				(a.as_deref() == Some(&b"AAAA"[..])) != (b.as_deref() == Some(&b"AAAA"[..])),
+				"{mode:?}: the synced file is under exactly one name: a={a:?} b={b:?}"
+			);
+			checked += 1;
+		}
+		assert!(checked > 10, "{checked}");
+	}
+
+	#[test]
+	fn a_rename_that_failed_can_be_tried_again_and_still_keeps_the_flushed_header() {
+		let (fs, raw) = base_pool();
+		put(&fs, "/d/a", b"AAAA");
+		raw.fail_flush_after(0);
+		assert!(fs.rename(p("/d/a"), p("/d/b")).is_err());
+		raw.clear_faults();
+		// Another header write on the slot must not take the flushed page either.
+		raw.fail_flush_after(0);
+		assert!(fs.rename(p("/d/a"), p("/d/c")).is_err());
+		raw.clear_faults();
+		assert_flushed_header_untouched(&raw, "after two failed renames");
+		fs.rename(p("/d/a"), p("/d/d")).unwrap();
+		assert_eq!(read(&fs, "/d/d").as_deref(), Some(&b"AAAA"[..]));
+		let image = raw.crash(CrashMode::LoseUnsynced);
+		let (after, _) = PoolFs::mount_sync(image, PoolConfig::memory()).unwrap();
+		after.create_dir_all(p("/d")).unwrap();
+		assert_eq!(read(&after, "/d/d").as_deref(), Some(&b"AAAA"[..]));
+		assert!(read(&after, "/d/a").is_none() && read(&after, "/d/b").is_none());
+	}
+
+	#[test]
+	fn a_file_that_was_synced_after_a_failed_rename_is_under_its_old_name_in_every_crash() {
+		let (fs, raw) = base_pool();
+		let file = put(&fs, "/d/a", b"AAAA");
+		raw.fail_flush_after(0);
+		assert!(fs.rename(p("/d/a"), p("/d/b")).is_err());
+		raw.clear_faults();
+		// The caller goes on with the file under the name that memory says, and a sync that
+		// returns Ok makes it durable: the failed header must not become durable with it.
+		file.append(b"+more").unwrap();
+		file.sync().unwrap();
+		assert_flushed_header_untouched(&raw, "after the sync");
+		let mut checked = 0;
+		for mode in crash_modes_with_losses(&raw) {
+			let image = raw.crash(mode);
+			let (after, _) = PoolFs::mount_sync(image.clone(), PoolConfig::memory()).unwrap();
+			after.create_dir_all(p("/d")).unwrap();
+			assert_sound(&image, &format!("{mode:?}"));
+			assert_eq!(
+				read(&after, "/d/a").as_deref(),
+				Some(&b"AAAA+more"[..]),
+				"{mode:?}: a synced file is under the name it was synced under"
+			);
+			assert!(read(&after, "/d/b").is_none(), "{mode:?}: the failed rename is not there");
+			checked += 1;
+		}
+		assert!(checked > 10, "{checked}");
+	}
+
+	#[test]
+	fn a_truncating_create_whose_flush_fails_leaves_the_flushed_headers_alone_in_every_crash() {
+		let (fs, raw) = base_pool();
+		put(&fs, "/d/a", b"AAAA");
+		// A dead slot to reuse, so that the new slot is a clean one with flushed headers.
+		put(&fs, "/d/x", b"x");
+		fs.remove_file(p("/d/x")).unwrap();
+		fs.maintain(16);
+		raw.fail_flush_after(0);
+		assert!(fs.create_truncate(p("/d/a"), CreateOpts::default()).is_err());
+		raw.clear_faults();
+		assert_flushed_header_untouched(&raw, "after the failed create");
+		assert_eq!(read(&fs, "/d/a").as_deref(), Some(&b"AAAA"[..]));
+		for mode in crash_modes_with_losses(&raw) {
+			let image = raw.crash(mode);
+			let (after, _) = PoolFs::mount_sync(image.clone(), PoolConfig::memory()).unwrap();
+			after.create_dir_all(p("/d")).unwrap();
+			assert_sound(&image, &format!("{mode:?}"));
+			// The create failed: the file may have been emptied (the new header can be what a
+			// mount finds), and it is never gone.
+			let a = read(&after, "/d/a");
+			assert!(
+				a.as_deref() == Some(&b"AAAA"[..]) || a.as_deref() == Some(&b""[..]),
+				"{mode:?}: a={a:?}"
+			);
+		}
 	}
 }
