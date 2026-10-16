@@ -1,4 +1,3 @@
-use std::fs::File as SysFile;
 use std::ops::Bound;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -36,7 +35,7 @@ pub(crate) const fn fresh_room(max_memtable_size: usize) -> u64 {
 use crate::batch::Batch;
 use crate::error::Result;
 use crate::sstable::table::{Table, TableWriter};
-use crate::vfs::File;
+use crate::vfs::{CreateOpts, File, FsWriter};
 use crate::vlog::{VLog, ValueLocation, ValuePointer};
 use crate::{
 	InternalKey,
@@ -504,9 +503,16 @@ impl MemTable {
 				.fetch_min(vlog.active_writer_id.load(Ordering::SeqCst), Ordering::Release);
 		}
 
+		// The table goes through the file system of the options: created empty, written through the
+		// handle that is dropped when the writer finishes, made durable by path, and opened again
+		// for reading, which on a native file system is the `create`, `write`, `fsync` and `open`
+		// of a table, one call each. The handle is the file system's: a pool serves the reopen
+		// with a view of the slot that was just written.
+		let fs = &*lsm_opts.fs;
 		{
-			let file = SysFile::create(&table_file_path)?;
-			let mut table_writer = TableWriter::new(file, table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
+			let file = fs.create_truncate(&table_file_path, CreateOpts::default())?;
+			let mut table_writer =
+				TableWriter::new(FsWriter(file), table_id, Arc::clone(&lsm_opts), 0); // Memtables always flush to L0
 
 			let mut iter = self.iter();
 			iter.seek_first()?;
@@ -541,9 +547,9 @@ impl MemTable {
 
 		// Durability fix: the SST's data and its directory entry must be
 		// durable before the manifest references this table.
-		crate::vfs::fsync_file(&table_file_path)?;
-		crate::lsm::fsync_directory(lsm_opts.sstable_dir())?;
-		let file: Arc<dyn File> = Arc::new(SysFile::open(&table_file_path)?);
+		fs.sync_file(&table_file_path)?;
+		fs.sync_dir(&lsm_opts.sstable_dir())?;
+		let file: Arc<dyn File> = fs.open_read(&table_file_path)?;
 		let file_size = file.size()?;
 
 		let created_table = Arc::new(Table::new(table_id, lsm_opts, file, file_size)?);
