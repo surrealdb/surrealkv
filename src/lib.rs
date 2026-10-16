@@ -89,6 +89,8 @@ pub use crate::transaction::{
 	WriteOptions,
 };
 pub use crate::vfs::FileSystem;
+#[doc(hidden)]
+pub use crate::vfs::{CrashMode, MountReport};
 pub use crate::wal::WalRecoveryReport;
 
 /// An optimised trait for converting values to bytes only when needed

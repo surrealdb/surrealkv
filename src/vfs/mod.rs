@@ -6,7 +6,7 @@
 //! port), so everything below that is not `File` is built and tested and used by nothing.
 //!
 //! A file system is one of three kinds. [`StdFs`] is `std::fs` and is what a native build uses. A
-//! pool (to come) keeps its files in memory or in a browser's origin private file system.
+//! pool ([`pool`]) keeps its files in memory or in a browser's origin private file system.
 //! [`UnavailableFs`] is what a browser build has until a file system is mounted, and it refuses
 //! every operation with an error that says so.
 // The seam is built before anything calls it: each milestone that moves a call site over (tables,
@@ -14,6 +14,9 @@
 // allowance, and the last one removes it.
 #![allow(dead_code)]
 
+pub(crate) mod header;
+pub(crate) mod mem;
+pub(crate) mod pool;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod std_fs;
 pub(crate) mod unavailable;
@@ -30,6 +33,12 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 
+#[doc(hidden)]
+pub use self::mem::CrashMode;
+pub(crate) use self::mem::MemRaw;
+#[doc(hidden)]
+pub use self::pool::MountReport;
+pub(crate) use self::pool::{PoolConfig, PoolControl, PoolFs};
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) use self::std_fs::{StdFile, StdFs};
 pub(crate) use self::unavailable::UnavailableFs;
@@ -471,6 +480,12 @@ pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
 	fn pool_exhaustions(&self) -> u64 {
 		0
 	}
+
+	/// What only a pool has: cleaning, the reserve, closing and the hooks of the tests. `None` of
+	/// every other file system.
+	fn pool(&self) -> Option<&dyn PoolControl> {
+		None
+	}
 }
 
 /// An open file that can be written as well as read, positional like the read seam it extends.
@@ -600,12 +615,85 @@ impl FileSystem {
 
 	/// A file system that lives in memory and is lost with the process, on any target.
 	///
-	/// Not available yet: until it is, a tree built over it fails with an error that says so,
-	/// before it touches anything.
+	/// It is a pool over memory, the same code that keeps the files of a browser, so it needs no
+	/// runtime and no thread: it is made and used from a plain function, and a file is made
+	/// when it is asked for. It keeps what a simulated crash would lose (see
+	/// [`FileSystem::simulate_crash`]) at the cost of a second copy of what has not been synced.
 	pub fn memory() -> Self {
-		Self(Arc::new(UnavailableFs::new(
-			"the in-memory file system is not implemented yet: use FileSystem::std()",
-		)))
+		match PoolFs::<MemRaw>::mount_sync(MemRaw::new(), PoolConfig::memory()) {
+			Ok((fs, _)) => Self(fs),
+			Err(_) => {
+				Self(Arc::new(UnavailableFs::new("the in-memory file system could not be mounted")))
+			}
+		}
+	}
+
+	/// Flushes what has to be flushed, cleans the files that were removed, and releases every
+	/// handle of the file system. A file that is read or written after it fails with
+	/// `NotConnected`. Nothing to do for a file system that is not a pool.
+	pub async fn close(&self) -> Result<()> {
+		match self.0.pool() {
+			Some(pool) => pool.close().map_err(Error::from),
+			None => Ok(()),
+		}
+	}
+
+	/// Releases every handle without flushing anything: what is left of a worker that died.
+	#[doc(hidden)]
+	pub fn abandon(&self) {
+		if let Some(pool) = self.0.pool() {
+			pool.abandon();
+		}
+	}
+
+	/// A file system that holds what a crash would have left of this one, mounted: the memory file
+	/// system only. This one is not changed, so a test can crash one state in every way.
+	#[doc(hidden)]
+	pub fn simulate_crash(&self, mode: CrashMode) -> Result<FileSystem> {
+		match self.0.pool() {
+			Some(pool) => pool.simulate_crash(mode).map(Self).map_err(Error::from),
+			None => Err(Error::InvalidArgument(
+				"only the memory file system can simulate a crash".to_string(),
+			)),
+		}
+	}
+
+	/// The names in a directory, sorted. Empty if there is no such directory.
+	#[doc(hidden)]
+	pub fn list_for_test(&self, dir: &str) -> Vec<String> {
+		let mut names: Vec<String> = self
+			.0
+			.read_dir(Path::new(dir))
+			.map(|entries| {
+				entries.into_iter().map(|entry| entry.name.to_string_lossy().into_owned()).collect()
+			})
+			.unwrap_or_default();
+		names.sort();
+		names
+	}
+
+	/// The length of a file, if it is there.
+	#[doc(hidden)]
+	pub fn file_len_for_test(&self, path: &str) -> Option<u64> {
+		self.0.file_len(Path::new(path)).ok()
+	}
+
+	/// Cuts a file to `len` without flushing, as a crash in the middle of a write would: for a
+	/// pool.
+	#[doc(hidden)]
+	pub fn raw_truncate_for_test(&self, path: &str, len: u64) -> Result<()> {
+		match self.0.pool() {
+			Some(pool) => pool.raw_truncate(Path::new(path), len).map_err(Error::from),
+			None => {
+				Err(Error::InvalidArgument("only a pool cuts a file without flushing".to_string()))
+			}
+		}
+	}
+
+	/// What the mount of a pool found: for a pool, the files, the spares, the orphans.
+	#[doc(hidden)]
+	pub fn mount_report(&self) -> Option<MountReport> {
+		self.0.pool().and_then(|pool| pool.mount_report())
 	}
 }
 
@@ -649,6 +737,38 @@ impl std::error::Error for PoolExhausted {}
 /// The error of a creation that found no free file in a pool.
 pub(crate) fn pool_exhausted() -> io::Error {
 	io::Error::other(PoolExhausted)
+}
+
+/// The payload of the `io::Error` that a pool answers a creation with when it already holds as many
+/// files as it may (`PoolConfig::max_files`). Unlike [`PoolExhausted`] it does not pass by waiting
+/// for a refill: files have to be released first (a table that a snapshot pins, a log that is not
+/// removed yet), so it has a type of its own, and its kind is `StorageFull`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PoolFull {
+	pub(crate) max_files: usize,
+}
+
+impl fmt::Display for PoolFull {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "the file pool holds its limit of {} files and none is free", self.max_files)
+	}
+}
+
+impl std::error::Error for PoolFull {}
+
+/// The error of a creation that found the pool at its cap.
+pub(crate) fn pool_full(max_files: usize) -> io::Error {
+	io::Error::new(
+		io::ErrorKind::StorageFull,
+		PoolFull {
+			max_files,
+		},
+	)
+}
+
+/// Whether `error` is the one that [`pool_full`] makes.
+pub(crate) fn is_pool_full(error: &io::Error) -> bool {
+	error.get_ref().is_some_and(|inner| inner.is::<PoolFull>())
 }
 
 /// Whether `error` is the one that [`pool_exhausted`] makes.

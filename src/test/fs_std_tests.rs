@@ -269,22 +269,22 @@ fn the_sync_build_over_nothing_is_refused_and_creates_nothing() {
 			.build_with_options()
 			.map(|_| ()),
 	);
-	// `FileSystem::memory()` is a stub until the pool exists, and refuses in the same way: it must
-	// not fall through to the files of the operating system.
+	// `FileSystem::memory()` is a pool, and a pool is refused until the engine is ported to it: it
+	// must not fall through to the files of the operating system.
 	let built = TreeBuilder::new()
 		.with_path(path.clone())
 		.with_file_system(FileSystem::memory())
 		.build()
 		.map(|_| ());
 	match built {
-		Err(Error::Io(e)) => assert!(e.to_string().contains("not implemented yet"), "{e}"),
+		Err(Error::InvalidArgument(e)) => assert!(e.contains("pooled file system"), "{e}"),
 		other => panic!("{other:?}"),
 	}
 	assert!(!path.exists(), "nothing was created");
 }
 
 #[tokio::test]
-async fn the_memory_file_system_says_it_is_not_there_yet() {
+async fn the_memory_file_system_is_refused_until_the_engine_is_ported_to_it() {
 	let dir = TempDir::new().unwrap();
 	let path = dir.path().join("db");
 	let built = TreeBuilder::new()
@@ -293,10 +293,7 @@ async fn the_memory_file_system_says_it_is_not_there_yet() {
 		.build_async()
 		.await;
 	match built {
-		Err(Error::Io(e)) => {
-			assert_eq!(e.kind(), io::ErrorKind::Unsupported);
-			assert!(e.to_string().contains("not implemented yet"), "{e}");
-		}
+		Err(Error::InvalidArgument(e)) => assert!(e.contains("pooled file system"), "{e}"),
 		other => panic!("{:?}", other.map(|_| ())),
 	}
 	assert!(!path.exists());

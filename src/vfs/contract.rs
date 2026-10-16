@@ -409,3 +409,101 @@ pub(crate) fn spares(fs: &dyn Fs) {
 	assert!(vfs::is_pool_exhausted(&vfs::pool_exhausted()));
 	assert!(!vfs::is_pool_exhausted(&io::Error::other("a different error")));
 }
+
+/// What a pool gives that the contract above does not ask of every file system: the handles of
+/// one file are one file, and a reader of a file that is replaced keeps the bytes it had.
+///
+/// `StdFs` honours some of this (an open file survives an unlink) and not the rest (two
+/// descriptors have two positions), which is why the engine never relies on any of it, and why
+/// it is not in `run_all`.
+pub(crate) fn pool_semantics(fs: &dyn Fs, dir: &Path) {
+	// A reader keeps its bytes when `create_truncate` makes a new file of the path.
+	let path = dir.join("rewritten");
+	make(fs, &path, b"old bytes");
+	let reader = fs.open_read(&path).unwrap();
+	let writer = fs.create_truncate(&path, CreateOpts::default()).unwrap();
+	writer.append(b"new").unwrap();
+	assert_eq!(read_all(&reader), b"old bytes", "a reader keeps the bytes of the file it opened");
+	assert_eq!(reader.len().unwrap(), 9);
+	assert_eq!(contents(fs, &path), b"new");
+	assert_eq!(read_all(&writer), b"new");
+
+	// The same of a file that is replaced as a whole, or renamed over.
+	let manifest = dir.join("MANIFEST");
+	fs.replace_atomic(&manifest, b"generation one").unwrap();
+	let held = fs.open_read(&manifest).unwrap();
+	fs.replace_atomic(&manifest, b"generation two").unwrap();
+	assert_eq!(read_all(&held), b"generation one");
+	assert_eq!(contents(fs, &manifest), b"generation two");
+	let (from, to) = (dir.join("from"), dir.join("to"));
+	make(fs, &to, b"destination");
+	let destination = fs.open_read(&to).unwrap();
+	make(fs, &from, b"source");
+	let source = fs.open_append(&from, CreateOpts::default()).unwrap();
+	fs.rename(&from, &to).unwrap();
+	assert_eq!(read_all(&destination), b"destination", "a file renamed over keeps its readers");
+	source.append(b" and more").unwrap();
+	assert_eq!(contents(fs, &to), b"source and more", "an open file follows its rename");
+
+	// The files of one path are one file: an append through one is seen by every other, and so is
+	// a cut-back, since the end is a property of the file.
+	let shared = dir.join("shared");
+	let first = fs.open_append(&shared, CreateOpts::default()).unwrap();
+	let second = fs.open_append(&shared, CreateOpts::default()).unwrap();
+	let third = fs.open_read(&shared).unwrap();
+	first.append(b"ab").unwrap();
+	assert_eq!(second.len().unwrap(), 2);
+	second.append(b"cd").unwrap();
+	assert_eq!(read_all(&first), b"abcd");
+	assert_eq!(read_all(&third), b"abcd");
+	first.set_len(1).unwrap();
+	assert_eq!((second.len().unwrap(), third.len().unwrap()), (1, 1));
+	second.append(b"!").unwrap();
+	assert_eq!(read_all(&third), b"a!");
+	// A cursor of its own, over a shared file, keeps its position when the file is cut.
+	let mut cursor = FsCursor::at(Arc::clone(&third), 1);
+	let mut byte = [0u8; 1];
+	std::io::Read::read_exact(&mut cursor, &mut byte).unwrap();
+	assert_eq!(&byte, b"!");
+
+	// `read_dir` of a file is `NotFound`, not a listing and not another kind of error.
+	assert_eq!(kind_of(fs.read_dir(&shared)), io::ErrorKind::NotFound);
+	assert_eq!(kind_of(fs.read_dir(&dir.join("not here"))), io::ErrorKind::NotFound);
+
+	// A file that was removed while it is open is dead only when it is closed, and the name can be
+	// made again at once.
+	let gone = dir.join("gone");
+	make(fs, &gone, b"to be removed");
+	let open = fs.open_read(&gone).unwrap();
+	fs.remove_file(&gone).unwrap();
+	make(fs, &gone, b"made again");
+	assert_eq!(read_all(&open), b"to be removed");
+	assert_eq!(contents(fs, &gone), b"made again");
+}
+
+/// `len` says what is in the file, also after an append that failed part of the way: the log cuts
+/// such a tail back, and has to see how long it is. `fail_after` arranges for the next append to
+/// put its first `k` bytes in the file and then fail.
+pub(crate) fn failed_append_is_truthful(fs: &dyn Fs, dir: &Path, fail_after: &dyn Fn(usize)) {
+	let path = dir.join("log");
+	let file = fs.create_new(&path, CreateOpts::default()).unwrap();
+	file.append(b"head").unwrap();
+	let other = fs.open_append(&path, CreateOpts::default()).unwrap();
+
+	fail_after(3);
+	assert!(file.append(b"0123456789").is_err(), "the append fails");
+	assert_eq!(file.len().unwrap(), 7, "len counts the bytes that landed");
+	assert_eq!(other.len().unwrap(), 7);
+	assert_eq!(read_all(&file), b"head012");
+
+	// Cut back, as the log does, and the file goes on from the cut.
+	file.set_len(4).unwrap();
+	file.append(b"tail").unwrap();
+	assert_eq!(read_all(&file), b"headtail");
+
+	// A failure before any byte landed leaves the length alone.
+	fail_after(0);
+	assert!(file.append(b"more").is_err());
+	assert_eq!(file.len().unwrap(), 8);
+	assert_eq!(contents(fs, &path), b"headtail");
+}

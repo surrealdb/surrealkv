@@ -340,11 +340,11 @@ async fn building_without_a_mounted_file_system_is_a_typed_error() {
 		}
 	}
 
-	// The in-memory file system is not there yet, and says so in the same way.
+	// The in-memory file system is a pool, and a pool is refused until the engine is ported to it.
 	let memory =
 		TreeBuilder::new().with_file_system(crate::FileSystem::memory()).build_async().await;
 	match memory {
-		Err(Error::Io(e)) => assert!(e.to_string().contains("not implemented yet"), "{e}"),
+		Err(Error::InvalidArgument(e)) => assert!(e.contains("pooled file system"), "{e}"),
 		other => panic!("{:?}", other.map(|_| ())),
 	}
 	// Still alive.
@@ -389,4 +389,83 @@ fn an_exhausted_pool_is_a_typed_soft_error() {
 	let handler = BackgroundErrorHandler::new();
 	handler.set_error(Error::FilePoolExhausted, BackgroundErrorReason::MemtablaFlush);
 	assert!(!handler.is_db_stopped());
+}
+
+// ---------------------------------------------------------------------------------------------
+// The pool over memory, which is the pool of the browser with a different backend under it.
+// ---------------------------------------------------------------------------------------------
+
+/// The pool's own code runs on this target: the whole contract of the seam, and what only a pool
+/// promises (the handles of a file are one file, a reader keeps what it had), over memory, from a
+/// plain function with no runtime.
+#[wasm_bindgen_test]
+fn the_pool_over_memory_honours_the_contract_in_a_browser() {
+	use std::path::Path;
+
+	use crate::vfs::{contract, Fs, MemRaw, PoolConfig, PoolFs};
+
+	let (fs, report) = PoolFs::<MemRaw>::mount_sync(MemRaw::new(), PoolConfig::memory())
+		.expect("a pool over memory mounts without a runtime");
+	assert!(report.orphans_kept.is_empty(), "{report:?}");
+	let root = Path::new("/root");
+	fs.create_dir_all(root).unwrap();
+	contract::run_all(&*fs, root);
+	let pool = Path::new("/pool");
+	fs.create_dir_all(pool).unwrap();
+	contract::pool_semantics(&*fs, pool);
+}
+
+/// `FileSystem::memory()` through the crate's file system: creates, appends, syncs, renames and
+/// lists, then a crash that loses what was not synced, a remount of what is left, and a close that
+/// releases every file.
+#[wasm_bindgen_test]
+async fn the_memory_file_system_survives_a_crash_and_remounts_in_a_browser() {
+	use std::path::Path;
+
+	use crate::vfs::{CrashMode, CreateOpts};
+	use crate::FileSystem;
+
+	let fs = FileSystem::memory();
+	let inner = &fs.0;
+	let dir = Path::new("/db/wal");
+	inner.create_dir_all(dir).unwrap();
+
+	let synced = inner.create_new(&dir.join("00000001.wal"), CreateOpts::default()).unwrap();
+	synced.append(b"acknowledged").unwrap();
+	synced.sync().unwrap();
+	let renamed = inner.create_truncate(&dir.join("tmp"), CreateOpts::default()).unwrap();
+	renamed.append(b"renamed bytes").unwrap();
+	renamed.sync().unwrap();
+	inner.rename(&dir.join("tmp"), &dir.join("MANIFEST")).unwrap();
+	inner.sync_dir(dir).unwrap();
+	let lost = inner.create_new(&dir.join("00000002.wal"), CreateOpts::default()).unwrap();
+	lost.append(b"never synced").unwrap();
+	assert_eq!(lost.len().unwrap(), 12, "an unsynced write is visible before the crash");
+
+	assert_eq!(fs.list_for_test("/db/wal"), ["00000001.wal", "00000002.wal", "MANIFEST"]);
+	assert_eq!(fs.file_len_for_test("/db/wal/00000001.wal"), Some(12));
+	assert_eq!(fs.file_len_for_test("/db/wal/MANIFEST"), Some(13));
+	assert!(fs.list_for_test("/not/there").is_empty());
+
+	// A crash of the state above, which is not changed by it.
+	let after = fs.simulate_crash(CrashMode::LoseUnsynced).expect("the memory file system crashes");
+	assert_eq!(after.0.read(&dir.join("00000001.wal")).unwrap(), b"acknowledged");
+	assert_eq!(after.0.read(&dir.join("MANIFEST")).unwrap(), b"renamed bytes");
+	assert!(after.list_for_test("/db/wal").contains(&"MANIFEST".to_string()));
+	assert!(
+		after.file_len_for_test("/db/wal/00000002.wal").unwrap_or(0) == 0,
+		"what was never synced did not survive"
+	);
+	assert!(after.mount_report().is_some());
+	assert_eq!(fs.file_len_for_test("/db/wal/00000002.wal"), Some(12), "the original is untouched");
+
+	// A torn tail: a file cut back below what it held, without a flush.
+	fs.raw_truncate_for_test("/db/wal/00000001.wal", 5).unwrap();
+	assert_eq!(fs.file_len_for_test("/db/wal/00000001.wal"), Some(5));
+
+	// Close releases every file, and a file used after it fails.
+	after.close().await.expect("a pool closes");
+	assert!(after.0.read(&dir.join("MANIFEST")).is_err());
+	fs.abandon();
+	assert!(FileSystem::memory().simulate_crash(CrashMode::ZeroTail).is_ok());
 }
