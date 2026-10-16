@@ -41,8 +41,8 @@ src/storage/mod.rs|ENFORCED|log_error
 src/wal/mod.rs|ENFORCED|wal::Error (no arm of the shape counted here; its io::Error downcast and the severity arm in error.rs are pinned by src/test/fs_error_tests.rs, not by this script)
 src/lsm.rs|PENDING|M8: memtable flush, rotation, manifest update, shutdown flush
 src/ring/pipeline.rs|PENDING|M8: the group failure, drop of an unapplied group, heal
-src/levels/mod.rs|PENDING|M5/M8: check_manifest_before_open, manifest_write_error
-src/vlog.rs|PENDING|M7: the four resolve_* wrappers (reads: kept for the same shape)
+src/levels/mod.rs|ENFORCED|check_manifest_before_open_in, manifest_write_error
+src/vlog.rs|ENFORCED|the four resolve_* wrappers (reads: kept for the same shape)
 src/checkpoint.rs|EXCLUDED|checkpoint and restore are refused on a pool
 src/vlog/sealed.rs|EXCLUDED|a sealed value log is refused on a pool
 src/inspect.rs|EXCLUDED|inspect takes a Path and is refused on a pool'

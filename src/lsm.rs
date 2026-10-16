@@ -342,7 +342,7 @@ impl CoreInner {
 		// what a repair left, and an open that the value log refuses (a file in the clear in an
 		// encrypted database, or one that the key does not open) must not have done either.
 		let vlog = if opts.enable_vlog {
-			Some(Arc::new(VLog::new(Arc::clone(&opts))?))
+			Some(Arc::new(VLog::new_in(Arc::clone(&opts.fs), Arc::clone(&opts))?))
 		} else {
 			None
 		};
