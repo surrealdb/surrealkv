@@ -1189,7 +1189,8 @@ pub(crate) fn sealed_needs_std() -> Error {
 /// On a file system that is not `std` the copies that a repair made of a damaged segment
 /// (`<id>.wal.corrupt[.n]`) go with the segment they were made of, once its number is below the log
 /// number: a file of a pool takes a slot and a handle for as long as it is there, and a torn tail
-/// after a killed tab is routine in a browser. On `std` they stay, as they always did.
+/// after a killed tab is routine in a browser. On `std` the newest three of all the segments stay,
+/// and the others are removed when a repair makes a copy.
 pub(crate) fn cleanup_old_segments_for_in(
 	context: Option<&EncryptionContext>,
 	fs: &dyn Fs,

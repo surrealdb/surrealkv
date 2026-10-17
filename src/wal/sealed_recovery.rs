@@ -357,23 +357,42 @@ fn replace(wal_dir: &Path, segment_path: &Path, repaired: &Path) -> Result<PathB
 	fs::rename(repaired, segment_path)?;
 	fsync_directory(wal_dir)?;
 	tracing::info!("The damaged segment is kept as {kept:?}");
+	// The newest few copies of all segments stay, as for a log that is not sealed: here the copy
+	// with the highest number is the newest of a segment.
+	crate::wal::recovery::prune_quarantine_in(
+		&*crate::vfs::default_fs(),
+		wal_dir,
+		crate::wal::recovery::QUARANTINE_COPIES_KEPT,
+		&kept,
+		true,
+	);
 	Ok(kept)
 }
 
-/// A name for the damaged copy of a segment: the name of the segment and `.corrupt`, and a number
-/// after it if an earlier repair left one of those.
+/// A name for the damaged copy of a segment: the name of the segment and `.corrupt`, and after it
+/// the number that follows the highest of the copies that earlier repairs left (`.corrupt` is 0),
+/// so that the number of a copy says how new it is, also when older ones were removed.
 fn unused_name(segment_path: &Path) -> Result<PathBuf> {
 	let base = segment_path.as_os_str().to_owned();
-	for attempt in 0..1000u32 {
+	let named = |number: u32| {
 		let mut name = base.clone();
 		name.push(".corrupt");
-		if attempt > 0 {
-			name.push(format!(".{attempt}"));
+		if number > 0 {
+			name.push(format!(".{number}"));
 		}
-		let candidate = PathBuf::from(name);
-		if !candidate.try_exists()? {
-			return Ok(candidate);
+		PathBuf::from(name)
+	};
+	let mut highest = None;
+	for number in 0..1000u32 {
+		if named(number).try_exists()? {
+			highest = Some(number);
 		}
 	}
-	Err(Error::Other("too many damaged copies of a WAL segment are kept".to_string()))
+	match highest {
+		None => Ok(named(0)),
+		Some(number) if number + 1 < 1000 => Ok(named(number + 1)),
+		Some(_) => {
+			Err(Error::Other("too many damaged copies of a WAL segment are kept".to_string()))
+		}
+	}
 }

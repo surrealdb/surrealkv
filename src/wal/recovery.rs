@@ -645,8 +645,9 @@ fn quarantined_segments_in(fs: &dyn Fs, wal_dir: &Path) -> Result<Vec<(u64, Path
 /// What a repair keeps is a copy of the damaged tail for someone to look at. In a pool each copy is
 /// a slot, a handle and a segment's worth of quota for as long as it is there, and with a default
 /// of no fsync a torn tail is what every killed tab leaves, so the copies would grow with each of
-/// them and with no bound. `std` keeps them, and so this is only called for a file system that is
-/// not `std`.
+/// them and with no bound. This is only called for a file system that is not `std`; on `std` the
+/// newest [`QUARANTINE_COPIES_KEPT`] copies stay, whatever the log number, and
+/// [`prune_quarantine_in`] removes the others when a copy is made.
 pub(crate) fn reclaim_quarantine_in(fs: &dyn Fs, wal_dir: &Path, min_wal_number: u64) {
 	let copies = match quarantined_segments_in(fs, wal_dir) {
 		Ok(copies) => copies,
@@ -666,12 +667,23 @@ pub(crate) fn reclaim_quarantine_in(fs: &dyn Fs, wal_dir: &Path, min_wal_number:
 	}
 }
 
-/// How many copies of damaged segments a pool keeps, of all segments together: the newest.
-pub(crate) const QUARANTINE_KEPT_ON_A_POOL: usize = 3;
+/// How many copies of damaged segments a log directory keeps, of all segments together: the
+/// newest, on every file system.
+pub(crate) const QUARANTINE_COPIES_KEPT: usize = 3;
 
 /// Removes the copies of damaged segments but the `keep` newest, which are the ones of the highest
-/// segment numbers and, within a number, the one without a suffix first. Best effort.
-fn prune_quarantine_in(fs: &dyn Fs, wal_dir: &Path, keep: usize) {
+/// segment numbers and, within a number, the one without a suffix first (the order that
+/// [`quarantine_wal_segment_in`] makes them in) or, if `highest_number_is_newest`, the one with
+/// the highest suffix first (the order of the copies of an encrypted log). The copy at `protect`,
+/// which a repair has just made, is never removed, whatever its segment number: the repair says
+/// where it is. Best effort.
+pub(crate) fn prune_quarantine_in(
+	fs: &dyn Fs,
+	wal_dir: &Path,
+	keep: usize,
+	protect: &Path,
+	highest_number_is_newest: bool,
+) {
 	let mut copies = match quarantined_segments_in(fs, wal_dir) {
 		Ok(copies) => copies,
 		Err(e) => {
@@ -687,8 +699,18 @@ fn prune_quarantine_in(fs: &dyn Fs, wal_dir: &Path, keep: usize) {
 			.unwrap_or(0)
 	};
 	copies.sort_by(|(a_id, a), (b_id, b)| {
-		b_id.cmp(a_id).then_with(|| generation(a).cmp(&generation(b)))
+		b_id.cmp(a_id).then_with(|| {
+			if highest_number_is_newest {
+				generation(b).cmp(&generation(a))
+			} else {
+				generation(a).cmp(&generation(b))
+			}
+		})
 	});
+	if let Some(at) = copies.iter().position(|(_, path)| path == protect) {
+		let copy = copies.remove(at);
+		copies.insert(0, copy);
+	}
 	for (_, path) in copies.into_iter().skip(keep) {
 		match fs.remove_file(&path) {
 			Ok(()) => tracing::debug!("Removed the old quarantined copy {path:?}"),
@@ -750,12 +772,10 @@ pub(crate) fn quarantine_wal_segment_in(
 	}
 	fs.sync_dir(wal_dir)?;
 
-	// A pool keeps the newest few copies of all segments, however many crashes there were: the
-	// reclaim of `cleanup_old_segments_for_in` only runs once the log number has passed a segment,
-	// and with tiny commits and a tab that is killed again and again it may not have.
-	if fs.kind() != crate::vfs::FsKind::Std {
-		prune_quarantine_in(fs, wal_dir, QUARANTINE_KEPT_ON_A_POOL);
-	}
+	// The newest few copies of all segments are kept, however many crashes there were: the reclaim
+	// of `cleanup_old_segments_for_in` only runs once the log number has passed a segment, and with
+	// tiny commits and a process that is killed again and again it may not have.
+	prune_quarantine_in(fs, wal_dir, QUARANTINE_COPIES_KEPT, &corrupt_base, false);
 
 	Ok(corrupt_base)
 }
