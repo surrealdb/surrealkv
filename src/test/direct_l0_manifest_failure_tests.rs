@@ -20,7 +20,6 @@ use std::time::Duration;
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
 use super::manifest_write_failure_tests::{
 	copy_dir_all,
 	flush_in_background,
@@ -32,6 +31,7 @@ use super::manifest_write_failure_tests::{
 	REACHED,
 	STUCK,
 };
+use super::{collect_transaction_all, sfs, tfs};
 use crate::error::{BackgroundErrorReason, ErrorSeverity, Result};
 use crate::levels::{
 	fail_replacements,
@@ -177,7 +177,7 @@ fn log_number(tree: &Tree) -> u64 {
 
 /// The ids of the `.sst` files in the directory of tables.
 fn sst_ids(tree: &Tree) -> Vec<u64> {
-	let mut ids: Vec<u64> = std::fs::read_dir(tree.core.inner.opts.sstable_dir())
+	let mut ids: Vec<u64> = sfs::read_dir(tree.core.inner.opts.sstable_dir())
 		.unwrap()
 		.filter_map(|entry| {
 			let entry = entry.unwrap();
@@ -393,6 +393,9 @@ async fn unsettled(background: bool, vlog: bool, before: Option<&Path>) -> Unset
 /// commits succeed, the oversized one too, and every read is as the commits say.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_direct_commit_that_cannot_write_the_manifest_fails_and_the_next_commit_succeeds() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("direct_manifest_fail").unwrap();
 	let tree = open_tree(dir.path(), false, false).await;
 	let mut model = Model::new();
@@ -428,6 +431,9 @@ async fn a_direct_commit_that_cannot_write_the_manifest_fails_and_the_next_commi
 /// or absent after a crash, and the commits before and after it are not lost.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_failed_direct_commit_leaves_no_table_file_and_keeps_log_number() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("direct_manifest_files").unwrap();
 	let images = TempDir::new("direct_manifest_files_image").unwrap();
 	let tree = open_tree(dir.path(), false, false).await;
@@ -498,11 +504,17 @@ async fn a_failed_direct_commit_is_not_replayed_under_a_later_commit(seeded: boo
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_failed_direct_commit_after_writes_is_not_replayed_under_a_later_commit() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_failed_direct_commit_is_not_replayed_under_a_later_commit(true).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_failed_direct_commit_on_an_empty_memtable_is_not_replayed_under_a_later_commit() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_failed_direct_commit_is_not_replayed_under_a_later_commit(false).await;
 }
 
@@ -542,10 +554,10 @@ async fn an_error_after_the_table_file_is_written_removes_it() {
 	let next = tree.core.inner.level_manifest.read().unwrap().next_table_id.load(Ordering::SeqCst);
 	commit_small(&tree, &mut model, 2, 6).await;
 	let blocker = tree.core.inner.opts.sstable_file_path(next + 1);
-	std::fs::create_dir(&blocker).unwrap();
+	sfs::create_dir(&blocker).unwrap();
 	commit_big(&tree, 1, 7).await.expect_err("the table cannot be created");
-	assert!(blocker.is_dir(), "the directory that was in the way is still there");
-	std::fs::remove_dir(&blocker).unwrap();
+	assert!(sfs::is_dir(&blocker), "the directory that was in the way is still there");
+	sfs::remove_dir(&blocker).unwrap();
 	assert_healthy(&tree, "after the blocked table");
 	commit_big(&tree, 1, 8).await.unwrap();
 	model.insert(key(1), big_value(8));
@@ -563,6 +575,9 @@ async fn an_error_after_the_table_file_is_written_removes_it() {
 /// not list, is removed. A crash right after holds the earlier commits and lists no missing file.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_direct_commit_whose_manifest_write_may_have_landed_settles_and_removes_the_table() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("direct_manifest_after").unwrap();
 	let images = TempDir::new("direct_manifest_after_image").unwrap();
 	let tree = open_tree(dir.path(), false, false).await;
@@ -602,6 +617,9 @@ async fn a_direct_commit_whose_manifest_write_may_have_landed_settles_and_remove
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_direct_commit_whose_manifest_write_stays_uncertain_keeps_the_table_until_it_is_settled()
 {
+	if tfs::skip_listed() {
+		return;
+	}
 	let images = TempDir::new("direct_manifest_uncertain_image").unwrap();
 	let mut fx = unsettled(false, false, None).await;
 	let tree = Arc::clone(&fx.tree);
@@ -648,6 +666,9 @@ async fn checkpoint(tree: &Arc<Tree>, to: &Path) -> Result<()> {
 /// nothing, and the flag stays set.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_taken_while_the_manifest_is_unsettled_can_be_restored() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let out = TempDir::new("direct_manifest_checkpoint").unwrap();
 	let fx = unsettled(false, false, None).await;
 	let cp = out.path().join("cp");
@@ -779,6 +800,9 @@ fn group_keys(recovered: &Model, model: &Model, what: &str) {
 /// group is whole or absent after a crash. The next commit succeeds.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_failed_first_batch_of_a_group_fails_the_group_without_stopping_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("direct_manifest_group_first").unwrap();
 	let images = TempDir::new("direct_manifest_group_first_image").unwrap();
 	let tree = open_tree(dir.path(), false, false).await;
@@ -817,6 +841,9 @@ async fn a_failed_first_batch_of_a_group_fails_the_group_without_stopping_the_da
 /// segment, and recovery decides. No manifest write error is recorded beside it.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_direct_failure_after_part_of_the_group_was_applied_still_stops_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("direct_manifest_group_stop").unwrap();
 	let images = TempDir::new("direct_manifest_group_stop_image").unwrap();
 	let tree = open_tree(dir.path(), false, false).await;
@@ -864,6 +891,9 @@ async fn a_direct_failure_after_part_of_the_group_was_applied_still_stops_the_da
 /// absent.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn repeated_transient_direct_failures_leave_no_orphans_and_no_duplicate_ids() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("direct_manifest_repeated").unwrap();
 	let images = TempDir::new("direct_manifest_repeated_image").unwrap();
 	let tree = open_tree(dir.path(), false, false).await;
@@ -915,6 +945,9 @@ async fn repeated_transient_direct_failures_leave_no_orphans_and_no_duplicate_id
 /// Once the disk works the next commit settles the manifest and succeeds.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_direct_commit_with_the_manifest_unsettled_and_the_disk_failing_creates_no_table() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for at in [ReplaceFailure::BeforeRename, ReplaceFailure::AfterRename] {
 		let mut fx = unsettled(false, false, None).await;
 		let tree = Arc::clone(&fx.tree);
@@ -952,6 +985,9 @@ async fn a_direct_commit_with_the_manifest_unsettled_and_the_disk_failing_create
 /// With a commit in the memtable the shutdown flush settles the manifest first.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn close_and_reopen_right_after_an_unsettled_uncertain_failure() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for pending in [false, true] {
 		let mut fx = unsettled(false, false, None).await;
 		if pending {
@@ -987,6 +1023,9 @@ async fn close_and_reopen_right_after_an_unsettled_uncertain_failure() {
 /// then fails and its file is removed.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_concurrent_with_a_direct_install_never_copies_the_table() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("direct_manifest_concurrent").unwrap();
 	let out = TempDir::new("direct_manifest_concurrent_out").unwrap();
 	let tree = open_tree(dir.path(), false, false).await;
@@ -1034,6 +1073,9 @@ async fn a_checkpoint_concurrent_with_a_direct_install_never_copies_the_table() 
 /// one, the next write of the manifest settles the flag, and the tree reopens.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn restore_after_a_double_failure_with_the_flag_set() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let out = TempDir::new("direct_manifest_restore").unwrap();
 	let cp = out.path().join("cp");
 	let mut fx = unsettled(false, false, Some(&cp)).await;
@@ -1067,6 +1109,9 @@ async fn restore_after_a_double_failure_with_the_flag_set() {
 /// stopped and the error says why. That is the one way a direct failure can end in a stop.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flag_left_set_meets_the_background_flush() {
+	if tfs::skip_listed() {
+		return;
+	}
 	// A disk that works.
 	{
 		let images = TempDir::new("direct_manifest_flag_image").unwrap();
@@ -1129,6 +1174,9 @@ async fn a_flag_left_set_meets_the_background_flush() {
 /// the manifest again.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_kept_table_and_a_later_flush_with_vlog_cleanup_leave_a_reopenable_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let images = TempDir::new("direct_manifest_vlog_image").unwrap();
 	let mut fx = unsettled(false, true, None).await;
 	let tree = Arc::clone(&fx.tree);

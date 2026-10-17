@@ -5,15 +5,16 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::collections::HashSet;
-use std::fs::File as SysFile;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use tempfile::TempDir;
 
+use super::sfs::File as SysFile;
+use super::tfs;
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::leveled::Strategy;
-use crate::levels::{write_manifest_to_disk, LevelManifest, Levels, MANIFEST_FORMAT_VERSION_V1};
+use crate::levels::{LevelManifest, Levels, MANIFEST_FORMAT_VERSION_V1};
 use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
@@ -156,9 +157,9 @@ fn build_l0_store(
 	// The default trigger is 4 L0 files; more files -> compaction fires.
 	let opts = Arc::new(opts);
 
-	std::fs::create_dir_all(opts.sstable_dir()).unwrap();
-	std::fs::create_dir_all(opts.manifest_dir()).unwrap();
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	tfs::create_dir_all(&opts, opts.sstable_dir()).unwrap();
+	tfs::create_dir_all(&opts, opts.manifest_dir()).unwrap();
+	tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 
 	let mut levels = Levels::new(opts.level_count as usize, 10);
 	let value = ValueLocation::with_inline_value(vec![0xEFu8; 1024]).encode();
@@ -198,7 +199,7 @@ fn build_l0_store(
 		last_sequence: (num_tables * entries_per_table) as u64,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let strategy = Arc::new(Strategy::from_options(Arc::clone(&opts)));
@@ -260,6 +261,9 @@ fn retained_bytes_before_finish(n: usize, value_size: usize, with_filter: bool) 
 /// residency — the root memory bug of issue #397.
 #[test]
 fn proof_bp1_filter_buffers_every_key_until_finish() {
+	if tfs::skip_listed() {
+		return;
+	}
 	// Small-entry regime (~115 B/entry): pointer-sized values, like vlog mode.
 	let small_n = retained_bytes_before_finish(100_000, 100, true);
 	let small_4n = retained_bytes_before_finish(400_000, 100, true);

@@ -23,6 +23,7 @@ use super::encryption_open_tests::{
 	ROOT,
 	SUITES,
 };
+use super::tfs;
 use crate::error::{EncryptionError, KeyProviderFailure};
 use crate::inspect::{
 	dump_manifest,
@@ -118,6 +119,9 @@ async fn plain_database(root: &Path) {
 
 #[tokio::test]
 async fn a_sealed_table_is_refused_without_a_key_and_dumped_with_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		create(dir.path(), manager(), suite).await;
@@ -148,6 +152,9 @@ async fn a_sealed_table_is_refused_without_a_key_and_dumped_with_it() {
 
 #[tokio::test]
 async fn a_key_that_does_not_fit_is_refused_by_name_and_changes_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		create(dir.path(), manager(), suite).await;
@@ -178,6 +185,9 @@ async fn a_key_that_does_not_fit_is_refused_by_name_and_changes_nothing() {
 
 #[tokio::test]
 async fn a_sealed_table_is_read_as_the_table_that_its_name_says() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	create(&dir.path().join("db"), manager(), CipherSuite::XChaCha20Poly1305).await;
 	let table = tables_of(&dir.path().join("db")).remove(0);
@@ -203,6 +213,9 @@ async fn a_sealed_table_is_read_as_the_table_that_its_name_says() {
 
 #[tokio::test]
 async fn a_database_that_the_caller_expects_is_the_one_a_table_must_belong_to() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	create(dir.path(), manager(), CipherSuite::Aes256Gcm).await;
 	let table = tables_of(dir.path()).remove(0);
@@ -227,6 +240,9 @@ async fn a_database_that_the_caller_expects_is_the_one_a_table_must_belong_to() 
 
 #[tokio::test]
 async fn a_database_in_the_clear_is_inspected_as_before_and_refused_when_a_key_is_given() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	plain_database(dir.path()).await;
 	let before = snapshot(dir.path());
@@ -263,6 +279,9 @@ async fn a_database_in_the_clear_is_inspected_as_before_and_refused_when_a_key_i
 
 #[tokio::test]
 async fn the_manifest_and_the_state_of_an_encrypted_database_are_read_with_its_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		create(dir.path(), manager(), suite).await;
@@ -303,6 +322,9 @@ async fn the_manifest_and_the_state_of_an_encrypted_database_are_read_with_its_k
 
 #[tokio::test]
 async fn the_log_of_an_encrypted_database_is_refused_without_a_key_and_decoded_with_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		create(dir.path(), manager(), suite).await;
@@ -332,6 +354,9 @@ async fn the_log_of_an_encrypted_database_is_refused_without_a_key_and_decoded_w
 
 #[tokio::test]
 async fn a_segment_that_is_cut_short_is_reported_torn_and_is_left_as_it_is() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	create(dir.path(), manager(), CipherSuite::XChaCha20Poly1305).await;
 
@@ -359,6 +384,9 @@ async fn a_segment_that_is_cut_short_is_reported_torn_and_is_left_as_it_is() {
 
 #[tokio::test]
 async fn a_log_that_is_alone_takes_its_database_from_its_first_segment() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let ours = dir.path().join("ours");
 	let theirs = dir.path().join("theirs");
@@ -421,6 +449,9 @@ impl KeyManager for Provider {
 
 #[tokio::test]
 async fn a_key_that_a_provider_has_to_fetch_is_asked_for_before_a_table_is_opened() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		create(dir.path(), manager(), suite).await;

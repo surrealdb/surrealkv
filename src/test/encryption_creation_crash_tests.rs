@@ -25,6 +25,7 @@ use super::encryption_open_tests::{
 	KEYS,
 	SUITES,
 };
+use super::tfs;
 use crate::error::EncryptionError;
 use crate::tde::{CipherSuite, SoftwareKeyManager, ROOT_KEY_LEN};
 use crate::{Options, Tree};
@@ -65,6 +66,9 @@ async fn refused_without_its_key_and_working_with_it(
 
 #[tokio::test]
 async fn a_database_that_has_its_manifest_and_nothing_else_opens_with_its_key_and_not_without() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let opts = created_and_closed(&dir.path().join("db"), suite).await;
@@ -84,6 +88,9 @@ async fn a_database_that_has_its_manifest_and_nothing_else_opens_with_its_key_an
 
 #[tokio::test]
 async fn a_database_whose_first_segment_is_empty_opens_with_its_key_and_not_without() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let opts = created_and_closed(&dir.path().join("db"), suite).await;
@@ -101,6 +108,9 @@ async fn a_database_whose_first_segment_is_empty_opens_with_its_key_and_not_with
 
 #[tokio::test]
 async fn the_temporary_file_of_a_manifest_write_that_did_not_finish_is_not_read_and_not_removed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let opts = created_and_closed(&dir.path().join("db"), suite).await;

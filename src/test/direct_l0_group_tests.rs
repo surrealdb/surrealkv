@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::{collect_transaction_all, collect_transaction_reverse};
+use super::{collect_transaction_all, collect_transaction_reverse, sfs, tfs};
 use crate::batch::Batch;
 use crate::lsm::FlushHook;
 use crate::memtable::{max_entry_bytes, MemTable};
@@ -59,8 +59,8 @@ fn abandon(tree: &Tree) {
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		if entry.file_name() == "LOCK" {
 			continue;
@@ -69,7 +69,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), &to).unwrap();
+			sfs::copy(entry.path(), &to).unwrap();
 		}
 	}
 }
@@ -723,6 +723,9 @@ async fn close_while_a_direct_commit_flushes_waits_for_it_and_loses_nothing() {
 /// it, and what it holds is the tree before the commit or after it.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_taken_during_the_flush_of_a_direct_commit_is_whole() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("adv_l0_checkpoint").unwrap();
 	let live = dir.path().join("live");
 	let tree = Arc::new(Tree::new(options(&live, false)).unwrap());
@@ -859,11 +862,11 @@ async fn recover_after_a_failed_direct_write() -> (Model, Vec<Model>) {
 	// the direct batch takes the one after it.
 	let next = tree.core.inner.level_manifest.read().unwrap().next_table_id.load(Ordering::SeqCst);
 	let blocker = tree.core.inner.opts.sstable_file_path(next + 1);
-	std::fs::create_dir(&blocker).unwrap();
+	sfs::create_dir(&blocker).unwrap();
 	let batches = stamped(&tree, &group);
 	let outcome = tree.core.commit_pipeline.flush_group(&batches, true).await;
 	assert!(outcome.is_err(), "control: the group fails with the table of its direct batch");
-	std::fs::remove_dir(&blocker).unwrap();
+	sfs::remove_dir(&blocker).unwrap();
 
 	let image = dir.path().join("image");
 	copy_dir(&live, &image);
@@ -895,10 +898,10 @@ async fn a_group_whose_direct_write_fails_is_recovered_whole() {
 fn non_empty_segments(tree: &Tree) -> Vec<u64> {
 	let wal = tree.core.inner.wal.read();
 	let mut ids = Vec::new();
-	for entry in std::fs::read_dir(wal.get_dir_path()).unwrap() {
+	for entry in sfs::read_dir(wal.get_dir_path()).unwrap() {
 		let path = entry.unwrap().path();
 		if path.extension().is_some_and(|ext| ext == "wal")
-			&& std::fs::metadata(&path).unwrap().len() > 0
+			&& sfs::metadata(&path).unwrap().len() > 0
 		{
 			ids.push(path.file_stem().unwrap().to_str().unwrap().parse().unwrap());
 		}
@@ -1106,7 +1109,7 @@ async fn failing_group_on_a_recovered_tree(queued: usize, fails: Fails) {
 			});
 			*tree.core.inner.flush_hook.lock() = Some(hook);
 		}
-		Fails::DirectTable => std::fs::create_dir(&blocker).unwrap(),
+		Fails::DirectTable => sfs::create_dir(&blocker).unwrap(),
 	}
 	let handles: Vec<_> =
 		group.iter().map(|ops| tokio::spawn(commit_ops(Arc::clone(&tree), ops.clone()))).collect();
@@ -1119,7 +1122,7 @@ async fn failing_group_on_a_recovered_tree(queued: usize, fails: Fails) {
 	}
 	*tree.core.inner.flush_hook.lock() = None;
 	match fails {
-		Fails::DirectTable => std::fs::remove_dir(&blocker).unwrap(),
+		Fails::DirectTable => sfs::remove_dir(&blocker).unwrap(),
 		Fails::Flush(at) => {
 			assert!(calls.load(Ordering::SeqCst) > at, "{what}: control: the flush ran");
 		}

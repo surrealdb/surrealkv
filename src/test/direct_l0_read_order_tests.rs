@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::{collect_transaction_all, collect_transaction_reverse};
+use super::{collect_transaction_all, collect_transaction_reverse, sfs};
 use crate::lsm::FlushHook;
 use crate::{Durability, Error, Mode, Options, Transaction, Tree};
 
@@ -82,8 +82,8 @@ fn release_lock(tree: &Tree) {
 
 /// Copies the files of a live tree, as a crash would leave them.
 fn copy_dir(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		if entry.file_name() == "LOCK" {
 			continue;
@@ -92,7 +92,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), &to).unwrap();
+			sfs::copy(entry.path(), &to).unwrap();
 		}
 	}
 }

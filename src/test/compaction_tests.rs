@@ -1,18 +1,19 @@
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, RwLock};
 
 use tempfile::TempDir;
 use test_log::test;
 
+use super::sfs::File;
+use super::tfs;
 use crate::compaction::compactor::{CompactionOptions, Compactor};
 use crate::compaction::leveled::{CompactionPriority, Strategy};
 use crate::compaction::{CompactionChoice, CompactionStrategy};
 use crate::comparator::{BytewiseComparator, InternalKeyComparator};
 use crate::error::Result;
 use crate::iter::CompactionIterator;
-use crate::levels::{write_manifest_to_disk, Level, LevelManifest, Levels};
+use crate::levels::{Level, LevelManifest, Levels};
 use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableFormat, TableWriter};
@@ -33,7 +34,7 @@ impl TestEnv {
 	fn new_with_levels(level_count: u8) -> Self {
 		let temp_dir = TempDir::new().unwrap();
 		let table_dir = temp_dir.path().join("sstables");
-		std::fs::create_dir_all(&table_dir).unwrap();
+		super::sfs::create_dir_all(&table_dir).unwrap();
 
 		let options = Arc::new(Options {
 			path: temp_dir.path().to_path_buf(),
@@ -69,7 +70,7 @@ impl TestEnv {
 		writer.finish()?;
 
 		// Open the table
-		let file = std::fs::File::open(&table_path)?;
+		let file = super::sfs::File::open(&table_path)?;
 		let file_size = file.metadata()?.len();
 		let file = Arc::new(file);
 
@@ -197,7 +198,7 @@ fn create_test_manifest(
 	};
 
 	// Write the manifest to disk
-	write_manifest_to_disk(&manifest)?;
+	tfs::write_manifest_to_disk(&manifest)?;
 
 	Ok(Arc::new(RwLock::new(manifest)))
 }
@@ -207,7 +208,7 @@ fn create_compaction_options(
 	opts: Arc<Options>,
 	manifest: Arc<RwLock<LevelManifest>>,
 ) -> CompactionOptions {
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 
 	let vlog = Arc::new(crate::vlog::VLog::new(Arc::clone(&opts)).unwrap());
 
@@ -474,7 +475,7 @@ fn test_level_selection_score_based() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Calculate expected scores using the actual formula
@@ -646,7 +647,7 @@ async fn test_simple_merge_compaction() {
 		encryption: None,
 	};
 
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create the leveled compaction strategy
@@ -841,7 +842,7 @@ async fn test_multi_level_merge_compaction() {
 		encryption: None,
 	};
 
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create the strategy and compactor
@@ -1314,7 +1315,7 @@ async fn test_compaction_with_large_keys_and_values() {
 		encryption: None,
 	};
 
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Track expected data
@@ -1392,7 +1393,7 @@ async fn test_compaction_respects_sequence_numbers() {
 		encryption: None,
 	};
 
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Set up compaction
@@ -1484,7 +1485,7 @@ async fn test_tombstone_propagation() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Run compaction
@@ -1585,7 +1586,7 @@ async fn test_l0_overlapping_keys_compaction() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 2.0);
@@ -1706,7 +1707,7 @@ async fn test_l0_tombstone_propagation_overlapping() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 2.0);
@@ -1828,7 +1829,7 @@ async fn test_tombstone_propagation_through_levels() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Use very small byte limits to ensure compaction is triggered
@@ -2099,7 +2100,7 @@ async fn test_soft_delete_compaction_behavior() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 1.0);
@@ -2251,7 +2252,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let opts = create_options_with_compaction_settings(&env.options, 1, 1.0);
@@ -2294,7 +2295,7 @@ async fn test_older_soft_delete_marked_stale_during_compaction() {
 fn test_score_based_level_selection() {
 	let env = TestEnv::new();
 	// Ensure manifest directory exists
-	std::fs::create_dir_all(env.options.manifest_dir()).unwrap();
+	tfs::create_dir_all(&env.options, env.options.manifest_dir()).unwrap();
 	let mut manifest = LevelManifest::new(Arc::clone(&env.options)).unwrap();
 
 	// Create options with specific compaction settings
@@ -2335,7 +2336,7 @@ fn test_score_based_level_selection() {
 fn test_bytes_based_level_limits() {
 	let env = TestEnv::new();
 	// Ensure manifest directory exists
-	std::fs::create_dir_all(env.options.manifest_dir()).unwrap();
+	tfs::create_dir_all(&env.options, env.options.manifest_dir()).unwrap();
 	let mut manifest = LevelManifest::new(Arc::clone(&env.options)).unwrap();
 
 	// Create options with bytes-based limits
@@ -2370,7 +2371,7 @@ fn test_bytes_based_level_limits() {
 fn test_bottom_level_compaction() {
 	let env = TestEnv::new_with_levels(3); // 3 levels: L0, L1, L2 (L2 is bottom)
 										   // Ensure manifest directory exists
-	std::fs::create_dir_all(env.options.manifest_dir()).unwrap();
+	tfs::create_dir_all(&env.options, env.options.manifest_dir()).unwrap();
 	let mut manifest = LevelManifest::new(Arc::clone(&env.options)).unwrap();
 
 	// Create options
@@ -2415,7 +2416,7 @@ fn create_test_table_with_bounds(
 ) -> Arc<crate::sstable::table::Table> {
 	// Ensure the sstable directory exists in the temp directory
 	let sstable_dir = temp_dir.path().join("sstables");
-	std::fs::create_dir_all(&sstable_dir).unwrap();
+	super::sfs::create_dir_all(&sstable_dir).unwrap();
 
 	let table_path = opts.sstable_file_path(id);
 	let file = File::create(&table_path).unwrap();
@@ -2435,7 +2436,7 @@ fn create_test_table_with_bounds(
 
 	writer.finish().unwrap();
 
-	let file = std::fs::File::open(&table_path).unwrap();
+	let file = super::sfs::File::open(&table_path).unwrap();
 	let file_size = file.metadata().unwrap().len();
 	let table =
 		crate::sstable::table::Table::new(id, Arc::clone(opts), Arc::new(file), file_size).unwrap();
@@ -2665,7 +2666,7 @@ fn test_expand_same_user_key_different_seq() {
 
 	// Ensure the sstable directory exists in the temp directory
 	let sstable_dir = temp_dir.path().join("sstables");
-	std::fs::create_dir_all(&sstable_dir).unwrap();
+	super::sfs::create_dir_all(&sstable_dir).unwrap();
 
 	// File 1: user_key="foo" at seq=100 (newest)
 	let table_path1 = opts.sstable_file_path(1);
@@ -2675,7 +2676,7 @@ fn test_expand_same_user_key_different_seq() {
 	let value = ValueLocation::with_inline_value(b"v1".to_vec()).encode();
 	writer1.add(key1, &value).unwrap();
 	writer1.finish().unwrap();
-	let file1 = std::fs::File::open(&table_path1).unwrap();
+	let file1 = super::sfs::File::open(&table_path1).unwrap();
 	let file_size1 = file1.metadata().unwrap().len();
 	let table1 =
 		crate::sstable::table::Table::new(1, Arc::clone(&opts), Arc::new(file1), file_size1)
@@ -2689,7 +2690,7 @@ fn test_expand_same_user_key_different_seq() {
 	let key2 = InternalKey::new(b"foo".to_vec(), 50, InternalKeyKind::Set);
 	writer2.add(key2, &value).unwrap();
 	writer2.finish().unwrap();
-	let file2 = std::fs::File::open(&table_path2).unwrap();
+	let file2 = super::sfs::File::open(&table_path2).unwrap();
 	let file_size2 = file2.metadata().unwrap().len();
 	let table2 =
 		crate::sstable::table::Table::new(2, Arc::clone(&opts), Arc::new(file2), file_size2)
@@ -2783,7 +2784,7 @@ fn test_clean_cut_shared_boundary_key() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let levels_guard = manifest.read().unwrap();
@@ -2847,7 +2848,7 @@ fn test_clean_cut_chain_expansion() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let levels_guard = manifest.read().unwrap();
@@ -2903,7 +2904,7 @@ fn test_clean_cut_no_expansion_needed() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	let levels_guard = manifest.read().unwrap();
@@ -2973,7 +2974,7 @@ fn test_clean_cut_integration_shared_boundary() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create strategy with default priority (ByCompensatedSize)
@@ -3050,7 +3051,7 @@ fn test_clean_cut_integration_chain_expansion() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create strategy with default priority (ByCompensatedSize)
@@ -3119,7 +3120,7 @@ fn test_clean_cut_integration_with_oldest_seq_priority() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create strategy with OldestSmallestSeqFirst priority
@@ -3188,7 +3189,7 @@ fn test_clean_cut_integration_no_expansion() {
 		last_sequence: 0,
 		encryption: None,
 	};
-	write_manifest_to_disk(&manifest).unwrap();
+	tfs::write_manifest_to_disk(&manifest).unwrap();
 	let manifest = Arc::new(RwLock::new(manifest));
 
 	// Create strategy with default priority (ByCompensatedSize)
@@ -3221,7 +3222,7 @@ fn test_table_writer_add_zero_copy_vlog_check() {
 	let opts = Arc::new(Options::new());
 
 	let value = ValueLocation::with_inline_value(vec![0x5Au8; VALUE_SIZE]).encode();
-	let file = std::fs::File::create(&path).unwrap();
+	let file = super::sfs::File::create(&path).unwrap();
 	let mut writer = TableWriter::new(file, 1, Arc::clone(&opts), 1);
 
 	let key0 = InternalKey::new(b"key-a".to_vec(), 1, InternalKeyKind::Set);
@@ -3234,14 +3235,14 @@ fn test_table_writer_add_zero_copy_vlog_check() {
 	let path2 = dir.path().join("test_vlog_peek.sst");
 	let ptr = ValuePointer::new(7, 2048, 8, 100, 0);
 	let ptr_value = ValueLocation::with_pointer(ptr).encode();
-	let file2 = std::fs::File::create(&path2).unwrap();
+	let file2 = super::sfs::File::create(&path2).unwrap();
 	let mut writer2 = TableWriter::new(file2, 2, Arc::clone(&opts), 1);
 
 	let key1 = InternalKey::new(b"key-vlog".to_vec(), 2, InternalKeyKind::Set);
 	writer2.add(key1, &ptr_value).unwrap();
 	let size2 = writer2.finish().unwrap();
 
-	let read_file = std::fs::File::open(&path2).unwrap();
+	let read_file = super::sfs::File::open(&path2).unwrap();
 	let table = crate::sstable::table::Table::new(
 		2,
 		Arc::clone(&opts),

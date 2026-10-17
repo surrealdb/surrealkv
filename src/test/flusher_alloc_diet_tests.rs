@@ -21,14 +21,13 @@ use std::task::{Context, Poll, Waker};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
 use super::compaction_memory_proofs::count_allocations;
+use super::{collect_transaction_all, tfs};
 use crate::batch::Batch;
 use crate::clock::LogicalClock;
 use crate::memtable::{max_entry_bytes, MemTable};
 use crate::ring::{CommitPipeline, PipelineHook};
 use crate::vlog::ValueLocation;
-use crate::wal::parallel_recovery::decode_segment_batches;
 use crate::{
 	Error,
 	InternalKeyKind,
@@ -258,7 +257,7 @@ fn edge_records() -> Vec<Rec> {
 /// Every WAL segment of a database, as `(segment id, path)` in segment order.
 fn wal_segments(dir: &Path) -> Vec<(u64, PathBuf)> {
 	let mut segments = Vec::new();
-	for entry in std::fs::read_dir(dir.join("wal")).unwrap() {
+	for entry in super::sfs::read_dir(dir.join("wal")).unwrap() {
 		let path = entry.unwrap().path();
 		if path.extension().is_some_and(|ext| ext == "wal") {
 			let id: u64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
@@ -281,11 +280,11 @@ struct WalImage {
 
 fn wal_image(dir: &Path) -> WalImage {
 	let mut segments = wal_segments(dir);
-	segments.retain(|(_, path)| std::fs::metadata(path).unwrap().len() > 0);
+	segments.retain(|(_, path)| super::sfs::metadata(path).unwrap().len() > 0);
 	let mut len = 0u64;
 	let mut fnv = 0xcbf2_9ce4_8422_2325u64;
 	for (_, path) in &segments {
-		let bytes = std::fs::read(path).unwrap();
+		let bytes = super::sfs::read(path).unwrap();
 		len += bytes.len() as u64;
 		for byte in bytes {
 			fnv = (fnv ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
@@ -302,7 +301,7 @@ fn wal_image(dir: &Path) -> WalImage {
 fn wal_batches(dir: &Path) -> Vec<Batch> {
 	wal_segments(dir)
 		.into_iter()
-		.flat_map(|(id, path)| decode_segment_batches(&path, id).unwrap().1)
+		.flat_map(|(id, path)| tfs::decode_segment_batches(&path, id).unwrap().1)
 		.collect()
 }
 
@@ -1185,6 +1184,9 @@ async fn every_group_is_made_of_the_commits_of_its_own_round_only() {
 /// not poisoned: once the value log works again, later commits go through.
 #[test(tokio::test)]
 async fn a_value_log_failure_in_the_middle_of_a_group_fails_the_group_and_logs_none_of_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("alloc_diet").unwrap();
 	let opts = Arc::new(Options {
 		path: dir.path().to_path_buf(),
@@ -1204,7 +1206,7 @@ async fn a_value_log_failure_in_the_middle_of_a_group_fails_the_group_and_logs_n
 
 	// The value log directory is gone: the next file cannot be created.
 	let moved = dir.path().join("vlog_moved");
-	std::fs::rename(opts.vlog_dir(), &moved).unwrap();
+	super::sfs::rename(opts.vlog_dir(), &moved).unwrap();
 	let doomed = [
 		vec![Op::Set(b"inline".to_vec(), b"small".to_vec(), 2)],
 		vec![Op::Set(b"large".to_vec(), large(2), 3), Op::Set(b"other".to_vec(), large(3), 3)],
@@ -1229,7 +1231,7 @@ async fn a_value_log_failure_in_the_middle_of_a_group_fails_the_group_and_logs_n
 	}
 
 	// The value log works again, and the writer is not poisoned.
-	std::fs::rename(&moved, opts.vlog_dir()).unwrap();
+	super::sfs::rename(&moved, opts.vlog_dir()).unwrap();
 	let later = vec![Op::Set(b"later".to_vec(), large(4), 5)];
 	transaction_of(&tree, &later).commit().await.unwrap();
 	assert_eq!(wal_batches(dir.path()).len(), records_before + 1);
@@ -1546,6 +1548,9 @@ async fn allocations_per_group(
 /// commits and entries divide it.
 #[tokio::test]
 async fn a_group_of_small_commits_allocates_a_constant_number_of_times() {
+	if tfs::skip_listed() {
+		return;
+	}
 	const PER_GROUP: u64 = 4;
 	// Long enough to run `retire` twice, which is every 16 groups.
 	const GROUPS: usize = 34;

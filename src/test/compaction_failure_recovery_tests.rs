@@ -5,7 +5,6 @@
 //! - Output preservation on uncertain manifest writes
 
 use std::collections::BTreeSet;
-use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -14,6 +13,7 @@ use std::time::Duration;
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs as fs, tfs};
 use crate::compaction::compactor::CompactionStage;
 use crate::compaction::leveled::Strategy;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, Error, ErrorSeverity};
@@ -227,6 +227,9 @@ async fn test_compaction_corruption_halts_database() {
 
 #[test(tokio::test)]
 async fn test_compaction_manifest_write_uncertain_stops_db_and_preserves_outputs() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = TempDir::new("compaction_uncertain").unwrap();
 	let options = Arc::new(Options {
 		path: temp_dir.path().to_path_buf(),

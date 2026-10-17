@@ -8,13 +8,13 @@
 //! says and not only with themselves.
 
 use std::collections::HashSet;
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tempfile::TempDir;
 
 use super::encryption_open_tests::{create, files_with_extension, manager, plain, SUITES};
+use super::{sfs as fs, tfs};
 use crate::error::EncryptionError;
 use crate::inspect::{describe_file, is_encrypted, FileDescription, FileState};
 use crate::sstable::table::TableWriter;
@@ -111,6 +111,9 @@ fn sealed(description: &FileDescription) -> crate::inspect::CryptoSummary {
 
 #[tokio::test]
 async fn every_file_of_an_encrypted_database_names_its_key_and_database_without_a_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let opts = create(dir.path(), manager(), suite).await;
@@ -152,6 +155,9 @@ async fn every_file_of_an_encrypted_database_names_its_key_and_database_without_
 
 #[tokio::test]
 async fn a_database_in_the_clear_is_described_as_plaintext_in_every_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let opts = plain(dir.path());
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
@@ -179,6 +185,9 @@ async fn a_database_in_the_clear_is_described_as_plaintext_in_every_file() {
 
 #[tokio::test]
 async fn whether_a_database_a_directory_or_a_file_is_encrypted_is_answered_from_its_start() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let sealed_root = dir.path().join("sealed");
 	let opts = create(&sealed_root, manager(), CipherSuite::XChaCha20Poly1305).await;
@@ -219,6 +228,9 @@ fn sealed_table_and_manifest(suite: CipherSuite) -> (Vec<u8>, Vec<u8>, DbId) {
 
 #[test]
 fn a_file_that_a_write_did_not_finish_is_unfinished_and_never_an_error() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let (table, manifest, db_id) = sealed_table_and_manifest(suite);
@@ -265,6 +277,9 @@ fn a_file_that_a_write_did_not_finish_is_unfinished_and_never_an_error() {
 
 #[test]
 fn a_header_that_is_damaged_or_of_another_kind_or_version_is_said_to_be() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let (table, _, _) = sealed_table_and_manifest(suite);
@@ -319,6 +334,9 @@ fn a_header_that_is_damaged_or_of_another_kind_or_version_is_said_to_be() {
 
 #[test]
 fn a_table_is_sealed_or_not_as_its_footer_says_whatever_its_first_bytes_are() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let (table, _, _) = sealed_table_and_manifest(CipherSuite::Aes256Gcm);
 	let path = dir.path().join("00000000000000000009.sst");
@@ -346,6 +364,9 @@ fn a_table_is_sealed_or_not_as_its_footer_says_whatever_its_first_bytes_are() {
 
 #[tokio::test]
 async fn a_file_with_a_name_that_says_nothing_is_still_known_by_what_it_holds() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let root = dir.path().join("db");
 	create(&root, manager(), CipherSuite::Aes256Gcm).await;

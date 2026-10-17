@@ -9,21 +9,19 @@
 //!   failed append must cut the segment back to the last complete record and refuse further appends
 //!   until the writer is replaced by a rotation.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use tempfile::TempDir;
 
+use super::{sfs, sfs as fs, tfs};
 use crate::batch::{Batch, BATCH_VERSION};
 use crate::error::Error;
 use crate::varint::put_varint_u64;
 use crate::vlog::ValuePointer;
 use crate::wal::manager::Wal;
-use crate::wal::parallel_recovery::decode_segment_batches;
-use crate::wal::recovery::replay_wal;
-use crate::wal::{segment_name, Options as WalOptions};
+use crate::wal::segment_name;
 use crate::{InternalKeyKind, Options, Tree, WalRecoveryMode};
 
 // ---------------------------------------------------------------------------
@@ -389,7 +387,7 @@ fn wal_record(seq: u64, key: &str, value_len: usize) -> Vec<u8> {
 }
 
 fn replay(dir: &Path) -> crate::Result<()> {
-	replay_wal(dir, 0, 1 << 20).map(|_| ())
+	tfs::replay_wal(dir, 0, 1 << 20).map(|_| ())
 }
 
 /// Records that pass the WAL's own CRC but are not batches stop recovery with
@@ -413,7 +411,7 @@ fn recovery_rejects_records_that_are_not_batches() {
 
 	for (what, record) in cases {
 		let dir = TempDir::new().unwrap();
-		let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+		let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 		wal.append(&valid).unwrap();
 		wal.append(&record).unwrap();
 		wal.close().unwrap();
@@ -439,7 +437,7 @@ async fn opening_a_database_with_an_undecodable_record_is_an_error() {
 	tree.core.inner.lockfile.lock().unwrap().release().unwrap();
 	drop(tree);
 
-	let mut wal = Wal::open(&o.wal_dir(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(&o.wal_dir(), tfs::wal_options_for(&o.wal_dir())).unwrap();
 	wal.append(&[BATCH_VERSION, 1, 9]).unwrap();
 	wal.close().unwrap();
 
@@ -472,7 +470,7 @@ fn recovered_keys(dir: &Path) -> Vec<String> {
 	let mut keys = Vec::new();
 	for segment in segments {
 		let id: u64 = segment.file_stem().unwrap().to_str().unwrap().parse().unwrap();
-		let (_, batches) = decode_segment_batches(&segment, id)
+		let (_, batches) = tfs::decode_segment_batches(&segment, id)
 			.unwrap_or_else(|e| panic!("{} must parse end to end: {e}", segment.display()));
 		for batch in batches {
 			keys.extend(batch.entries.iter().map(|e| String::from_utf8(e.key.clone()).unwrap()));
@@ -490,7 +488,7 @@ fn append_failure_sweep(value_len: usize, min_failure_points: usize) {
 	for fail_after in 0..64 {
 		let dir = TempDir::new().unwrap();
 		let segment = dir.path().join(SEGMENT);
-		let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+		let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 		for i in 0..3 {
 			wal.append(&wal_record(i + 1, &format!("acked{i}"), 100)).unwrap();
 		}
@@ -571,7 +569,7 @@ fn append_group_failure_sweep(value_lens: &[usize], min_failure_points: usize) {
 	for fail_after in 0..200 {
 		let dir = TempDir::new().unwrap();
 		let segment = dir.path().join(SEGMENT);
-		let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+		let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 		for i in 0..3 {
 			wal.append(&wal_record(i + 1, &format!("acked{i}"), 100)).unwrap();
 		}
@@ -634,7 +632,7 @@ fn a_failed_group_spanning_blocks_leaves_nothing_behind() {
 #[test]
 fn a_failed_append_is_never_resurrected() {
 	let dir = TempDir::new().unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(&wal_record(1, "acked", 100)).unwrap();
 
 	// Header and payload are buffered, and the flush at the end of the append fails.
@@ -687,7 +685,7 @@ async fn tree_recovers_exactly_the_acknowledged_commits_after_a_failed_append() 
 	txn.set(b"later", &[b'z'; 64]).unwrap();
 	let outcome = tokio::time::timeout(Duration::from_secs(20), txn.commit()).await;
 	assert!(matches!(outcome, Ok(Ok(()))), "a later commit must succeed: {outcome:?}");
-	assert!(!segment.exists() || file_len(&segment) == acked_len);
+	assert!(!sfs::exists(&segment) || file_len(&segment) == acked_len);
 
 	tree.core.inner.lockfile.lock().unwrap().release().unwrap();
 	drop(tree);

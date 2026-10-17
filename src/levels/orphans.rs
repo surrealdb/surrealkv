@@ -220,6 +220,9 @@ mod tests {
 
 	#[test]
 	fn the_plan_names_what_this_database_left_and_refuses_everything_if_one_file_is_not_its_own() {
+		if crate::test::tfs::skip_listed() {
+			return;
+		}
 		let dir = TempDir::new().unwrap();
 		let opts = Options {
 			path: dir.path().to_path_buf(),

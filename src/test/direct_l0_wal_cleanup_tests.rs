@@ -18,6 +18,7 @@ use test_log::test;
 
 use super::wal_group_budget_tests::{copy_dir, mark_closed, release_lock};
 use super::wal_sealed_tests::context;
+use super::{sfs, tfs};
 use crate::batch::Batch;
 use crate::lsm::FlushHook;
 use crate::ring::PipelineHook;
@@ -73,7 +74,7 @@ fn big_value(tag: u64) -> Vec<u8> {
 /// The numbers of the WAL segments in `dir`, empty ones included.
 fn wal_segments(dir: &Path) -> Vec<u64> {
 	let mut ids = Vec::new();
-	for entry in std::fs::read_dir(dir.join("wal")).unwrap() {
+	for entry in sfs::read_dir(dir.join("wal")).unwrap() {
 		let path = entry.unwrap().path();
 		if path.extension().is_some_and(|ext| ext == "wal") {
 			ids.push(path.file_stem().unwrap().to_str().unwrap().parse().unwrap());
@@ -156,6 +157,9 @@ async fn direct_commits_leave_no_obsolete_wal_segments_plain() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn direct_commits_leave_no_obsolete_wal_segments_encrypted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	direct_commits_leave_no_obsolete_wal_segments(true).await;
 }
 
@@ -263,6 +267,9 @@ async fn a_direct_batch_keeps_the_segment_its_group_rest_needs_plain() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_direct_batch_keeps_the_segment_its_group_rest_needs_encrypted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_direct_batch_keeps_the_segment_its_group_rest_needs(true).await;
 }
 
@@ -366,6 +373,9 @@ async fn many_direct_groups_do_not_accumulate_segments_plain() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn many_direct_groups_do_not_accumulate_segments_encrypted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	many_direct_groups_do_not_accumulate_segments(true).await;
 }
 
@@ -380,7 +390,7 @@ fn image_hook(live: &Path, root: &Path, name: &'static str) -> (FlushHook, Arc<M
 		let (live, root, seen) = (live.to_path_buf(), root.to_path_buf(), Arc::clone(&seen));
 		Arc::new(move |n| {
 			let image = root.join(name);
-			assert!(!image.exists(), "{name}: the hook ran twice");
+			assert!(!sfs::exists(&image), "{name}: the hook ran twice");
 			copy_dir(&live, &image);
 			seen.lock().unwrap().push(n);
 			Ok(())
@@ -434,6 +444,9 @@ async fn a_failed_direct_commit_keeps_its_segment_plain() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_failed_direct_commit_keeps_its_segment_encrypted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_failed_direct_commit_keeps_its_segment(true).await;
 }
 
@@ -485,7 +498,7 @@ async fn an_image_between_the_manifest_and_the_unlink_recovers(encrypted: bool) 
 		let partial = dir.path().join(format!("partial_{n}"));
 		copy_dir(&image, &partial);
 		for id in drop_these {
-			std::fs::remove_file(partial.join("wal").join(format!("{id:020}.wal"))).unwrap();
+			sfs::remove_file(partial.join("wal").join(format!("{id:020}.wal"))).unwrap();
 		}
 		assert_image_recovers(&partial, encrypted, &model, "image with part of the unlink").await;
 	}
@@ -514,6 +527,9 @@ async fn an_image_between_the_manifest_and_the_unlink_recovers_plain() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn an_image_between_the_manifest_and_the_unlink_recovers_encrypted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	an_image_between_the_manifest_and_the_unlink_recovers(true).await;
 }
 
@@ -522,6 +538,9 @@ async fn an_image_between_the_manifest_and_the_unlink_recovers_encrypted() {
 #[cfg(unix)]
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_cleanup_that_fails_does_not_fail_the_commit() {
+	if tfs::skip_listed() {
+		return;
+	}
 	use std::os::unix::fs::PermissionsExt;
 
 	let dir = TempDir::new("l0_wal_cleanup_fails").unwrap();
@@ -537,9 +556,9 @@ async fn a_cleanup_that_fails_does_not_fail_the_commit() {
 	let hook: FlushHook = {
 		let (wal, locked) = (wal.clone(), Arc::clone(&locked));
 		Arc::new(move |_| {
-			std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o555)).unwrap();
+			sfs::set_permissions(&wal, sfs::Permissions::from_mode(0o555)).unwrap();
 			// A process that runs as root can remove files from a directory it cannot write to.
-			*locked.lock().unwrap() = std::fs::File::create(wal.join("probe")).is_err();
+			*locked.lock().unwrap() = sfs::File::create(wal.join("probe")).is_err();
 			Ok(())
 		})
 	};
@@ -547,8 +566,8 @@ async fn a_cleanup_that_fails_does_not_fail_the_commit() {
 	commit_set(&tree, key(1), big_value(2)).await;
 	model.insert(key(1), big_value(2));
 	*tree.core.inner.direct_cleanup_hook.lock() = None;
-	std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o755)).unwrap();
-	let _ = std::fs::remove_file(wal.join("probe"));
+	sfs::set_permissions(&wal, sfs::Permissions::from_mode(0o755)).unwrap();
+	let _ = sfs::remove_file(wal.join("probe"));
 	if !*locked.lock().unwrap() {
 		println!("skipped: this process can write to a directory that is read-only");
 		crash(&tree);

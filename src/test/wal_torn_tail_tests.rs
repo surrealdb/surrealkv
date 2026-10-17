@@ -16,18 +16,17 @@
 //! Each shape: 10 durable commits, one more record that is then cut short, recovery, 5 new
 //! commits, a second crash, recovery, a third crash, recovery.
 
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tempfile::TempDir;
 
+use super::{sfs, sfs as fs, tfs};
 use crate::batch::Batch;
 use crate::vlog::ValueLocation;
 use crate::wal::manager::Wal;
-use crate::wal::parallel_recovery::decode_segment_batches;
-use crate::wal::{CompressionType, Options as WalOptions, BLOCK_SIZE};
+use crate::wal::{CompressionType, BLOCK_SIZE};
 use crate::{Error, InternalKeyKind, Options, Tree, WalRecoveryMode};
 
 const BLOCK: u64 = BLOCK_SIZE as u64;
@@ -105,7 +104,7 @@ fn set_len(path: &Path, len: u64) {
 /// misframed record cannot hide behind the repair that the next open performs.
 fn strict_decode(path: &Path) -> Vec<Batch> {
 	let id: u64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
-	decode_segment_batches(path, id)
+	tfs::decode_segment_batches(path, id)
 		.unwrap_or_else(|e| panic!("{} must parse end to end: {e}", path.display()))
 		.1
 }
@@ -277,7 +276,7 @@ async fn absolute_scenario(shape: Shape, class: Class) {
 				"a refused open must not touch the WAL"
 			);
 			assert!(
-				!refused.wal_dir().join("repair_temp").exists(),
+				!sfs::exists(refused.wal_dir().join("repair_temp")),
 				"a refused open must not start a repair"
 			);
 
@@ -383,7 +382,7 @@ async fn segment_ending_on_a_block_boundary_is_left_alone() {
 
 	let tree = Tree::new(Arc::clone(&o)).unwrap();
 	assert_eq!(fs::read(&wal).unwrap(), before, "a clean segment must not be rewritten");
-	assert!(!o.wal_dir().join("repair_temp").exists());
+	assert!(!sfs::exists(o.wal_dir().join("repair_temp")));
 	for i in 0..5 {
 		put(&tree, &format!("new{i}"), &NEW).await;
 	}
@@ -783,7 +782,8 @@ fn compressed_database(o: &Options, records: usize) -> (PathBuf, Vec<u64>) {
 		fs::remove_file(entry.unwrap().path()).unwrap();
 	}
 	let mut wal =
-		Wal::open(&wal_dir, WalOptions::default().with_compression(CompressionType::Lz4)).unwrap();
+		Wal::open(&wal_dir, tfs::wal_options_for(&wal_dir).with_compression(CompressionType::Lz4))
+			.unwrap();
 	let segment = wal_path(o, wal.get_active_log_number());
 	let mut ends = Vec::new();
 	for i in 0..records {
@@ -899,7 +899,7 @@ async fn test_default_tolerate_torn_tail_trims_and_reports() {
 	assert_eq!(report.records_dropped, 0, "No valid records were dropped");
 	assert!(report.bytes_trimmed > 0, "Bytes trimmed should be > 0");
 	assert_eq!(report.quarantined_files.len(), 1, "Exactly one quarantined file");
-	assert!(report.quarantined_files[0].exists(), "Quarantined file exists");
+	assert!(sfs::exists(&report.quarantined_files[0]), "Quarantined file exists");
 	assert!(report.quarantined_files[0].to_string_lossy().ends_with(".wal.corrupt"));
 
 	crash(tree);
@@ -922,8 +922,9 @@ async fn test_tolerate_torn_tail_refuses_interior_corruption() {
 	// Corrupt batch2 in the middle of the file (interior corruption; batch3 remains intact after
 	// it)
 	{
-		use std::fs::OpenOptions;
 		use std::io::Seek;
+
+		use sfs::OpenOptions;
 		let mut file = OpenOptions::new().write(true).open(&wal).unwrap();
 		file.seek(std::io::SeekFrom::Start(after_batch1 + 2)).unwrap();
 		// Overwrite record length/crc with garbage
@@ -998,7 +999,7 @@ async fn test_tolerate_torn_tail_refuses_corruption_in_older_segment() {
 
 #[test_log::test(tokio::test)]
 async fn test_quarantine_rotation_retention() {
-	use crate::wal::recovery::quarantine_wal_segment;
+	use super::tfs::quarantine_wal_segment;
 
 	let dir = TempDir::new().unwrap();
 	let wal_dir = dir.path().join("wal");
@@ -1010,7 +1011,7 @@ async fn test_quarantine_rotation_retention() {
 	// Quarantine 1st time
 	let q0 = quarantine_wal_segment(&wal_dir, 0).unwrap();
 	assert_eq!(q0, wal_dir.join("00000000000000000000.wal.corrupt"));
-	assert!(q0.exists());
+	assert!(sfs::exists(&q0));
 
 	// Modify and quarantine 2nd time
 	fs::write(&seg0, b"content v2").unwrap();
@@ -1047,7 +1048,7 @@ async fn test_quarantine_rotation_retention() {
 		b"content v3"
 	);
 	assert_eq!(fs::read(&q3).unwrap(), b"content v4");
-	assert!(!wal_dir.join("00000000000000000000.wal.corrupt.3").exists());
+	assert!(!sfs::exists(wal_dir.join("00000000000000000000.wal.corrupt.3")));
 }
 
 #[test_log::test(tokio::test)]
@@ -1063,7 +1064,7 @@ async fn test_zero_valid_segment_truncated_in_place_not_deleted() {
 
 	let tree = Tree::new(Arc::clone(&o)).expect("Must recover 0-valid segment");
 	// The segment must still exist on disk with length 0
-	assert!(wal.exists(), "0-valid segment file must not be deleted");
+	assert!(sfs::exists(&wal), "0-valid segment file must not be deleted");
 	assert_eq!(file_len(&wal), 0, "0-valid segment must be truncated to 0 length");
 
 	// New commits must work

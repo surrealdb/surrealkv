@@ -1,17 +1,16 @@
 //! WAL Recovery Tests
 
-use std::fs;
 use std::io::Write;
 
 use tempfile::TempDir;
 use test_log::test;
 
+use super::tfs::replay_wal;
+use super::{sfs as fs, tfs};
 use crate::batch::Batch;
 use crate::error::Error;
 use crate::test::recovery_test_helpers::{CorruptionType, WalTestHelper};
 use crate::wal::manager::Wal;
-use crate::wal::recovery::replay_wal;
-use crate::wal::Options;
 
 // Tests use single-batch segments up to 10,000 entries. With `MemTable::add` now
 // performing an atomic worst-case preflight reservation (199 bytes per entry +
@@ -207,7 +206,7 @@ fn test_crash_immediately_after_rotation() {
 			.unwrap();
 	}
 
-	let opts = Options::default();
+	let opts = tfs::wal_options();
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 	wal.append(&batch.encode().unwrap()).unwrap();
 
@@ -230,7 +229,7 @@ fn test_crash_after_multiple_rapid_rotations() {
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
 
-	let opts = Options::default();
+	let opts = tfs::wal_options();
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 	// Rotate 5 times, each segment gets 1 entry
@@ -277,7 +276,7 @@ fn test_crash_during_wal_write_mid_batch() {
 			.unwrap();
 	}
 
-	let opts = Options::default();
+	let opts = tfs::wal_options();
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 	wal.append(&batch1.encode().unwrap()).unwrap();
 
@@ -366,7 +365,7 @@ fn test_partial_batch_at_segment_end() {
 			.unwrap();
 	}
 
-	let opts = Options::default();
+	let opts = tfs::wal_options();
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 	wal.append(&batch.encode().unwrap()).unwrap();
 	wal.close().unwrap();
@@ -1155,7 +1154,7 @@ fn test_very_large_values_across_segments() {
 	fs::create_dir_all(wal_dir).unwrap();
 
 	// Create segments with large values (10KB each)
-	let opts = Options::default();
+	let opts = tfs::wal_options();
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 	let large_value = vec![b'X'; 10240]; // 10KB value
@@ -1189,7 +1188,7 @@ fn test_many_small_batches() {
 	fs::create_dir_all(wal_dir).unwrap();
 
 	// Create 10 segments, each with 100 small batches (1 entry each)
-	let opts = Options::default();
+	let opts = tfs::wal_options();
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 	let mut entry_count = 0;
@@ -1226,7 +1225,7 @@ fn test_few_large_batches() {
 	fs::create_dir_all(wal_dir).unwrap();
 
 	// Create 5 segments, each with 1 large batch (200 entries)
-	let opts = Options::default();
+	let opts = tfs::wal_options();
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 	for seg_idx in 0..5 {
@@ -1375,6 +1374,9 @@ fn test_segment_larger_than_expected() {
 
 #[test]
 fn test_recovery_with_readonly_segment() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = TempDir::new().unwrap();
 	let wal_dir = temp_dir.path();
 	fs::create_dir_all(wal_dir).unwrap();
@@ -1495,10 +1497,8 @@ fn test_compressed_wal_segments() {
 	fs::create_dir_all(wal_dir).unwrap();
 
 	// Create WAL with LZ4 compression
-	let opts = Options {
-		compression_type: CompressionType::Lz4,
-		..Default::default()
-	};
+	let mut opts = tfs::wal_options();
+	opts.compression_type = CompressionType::Lz4;
 
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 
@@ -1533,7 +1533,7 @@ fn test_mixed_compression_segments() {
 	fs::create_dir_all(wal_dir).unwrap();
 
 	// Create first 2 segments without compression
-	let opts = Options::default();
+	let opts = tfs::wal_options();
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 	for seg_idx in 0..2 {
@@ -1548,10 +1548,9 @@ fn test_mixed_compression_segments() {
 	wal.close().unwrap();
 
 	// Create next 2 segments with LZ4 compression
-	let opts = Options {
-		compression_type: CompressionType::Lz4,
-		..Default::default()
-	};
+	let mut opts = tfs::wal_options();
+	opts.compression_type = CompressionType::Lz4;
+
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 
 	for seg_idx in 0..2 {
@@ -1583,10 +1582,8 @@ fn test_compressed_data_corruption() {
 	fs::create_dir_all(wal_dir).unwrap();
 
 	// Create compressed WAL
-	let opts = Options {
-		compression_type: CompressionType::Lz4,
-		..Default::default()
-	};
+	let mut opts = tfs::wal_options();
+	opts.compression_type = CompressionType::Lz4;
 
 	let mut wal = Wal::open(wal_dir, opts).unwrap();
 

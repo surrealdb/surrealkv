@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tempfile::TempDir;
 
+use super::tfs;
 use crate::error::Error;
 use crate::lockfile::LockFile;
 use crate::vfs::{
@@ -300,6 +301,9 @@ async fn the_memory_file_system_builds_a_database_and_leaves_the_disk_alone() {
 
 #[test]
 fn the_default_file_system_is_std_on_native() {
+	if tfs::skip_listed() {
+		return;
+	}
 	assert_eq!(Options::default().fs.kind(), FsKind::Std);
 	assert_eq!(vfs::default_fs().kind(), FsKind::Std);
 	assert_eq!(FileSystem::std().0.kind(), FsKind::Std);
@@ -344,6 +348,9 @@ async fn a_pool_is_a_valid_file_system_for_the_options() {
 
 #[tokio::test]
 async fn the_async_build_is_the_sync_build_on_native() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let tree = TreeBuilder::new().with_path(dir.path().join("db")).build_async().await.unwrap();
 	tree.close().await.unwrap();

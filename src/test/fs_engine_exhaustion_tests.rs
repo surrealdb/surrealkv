@@ -31,6 +31,7 @@ use super::fs_engine_tests::{
 	within,
 };
 use super::fs_probe::{Call, ProbeFs, Verdict, Wait};
+use super::tfs;
 use crate::error::ErrorSeverity;
 use crate::lsm::FLUSH_NEED;
 use crate::vfs::{self, SpareClass};
@@ -120,6 +121,9 @@ async fn spare_files_are_awaited_at_the_five_sites_and_nowhere_else() {
 
 #[test(tokio::test)]
 async fn a_database_on_std_never_asks_for_a_spare_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	within("std asks for nothing", async {
 		let dir = tempfile::TempDir::new().unwrap();
 		let tree = TreeBuilder::new()

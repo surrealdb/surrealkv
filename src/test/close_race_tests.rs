@@ -24,6 +24,7 @@ use tempdir::TempDir;
 use test_log::test;
 use tokio::task::JoinHandle;
 
+use super::sfs;
 use crate::lsm::Tree;
 use crate::ring::{CommitStage, PipelineHook, ADMISSION_PERMITS};
 use crate::{Durability, Error, Mode, Options, Result};
@@ -224,14 +225,14 @@ fn assert_present(tree: &Tree, keys: impl IntoIterator<Item = String>) {
 }
 
 fn copy_dir(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		let to = dst.join(entry.file_name());
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), to).unwrap();
+			sfs::copy(entry.path(), to).unwrap();
 		}
 	}
 }

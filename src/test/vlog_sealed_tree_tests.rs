@@ -15,6 +15,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
+use super::tfs;
 use crate::error::{EncryptionError, Error};
 use crate::tde::{CipherSuite, DbId, EncryptionContext, SoftwareKeyManager};
 use crate::{CompressionType, Mode, Options, Tree};
@@ -125,6 +126,9 @@ fn salts(files: &BTreeMap<String, Vec<u8>>) -> BTreeSet<Vec<u8>> {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_values_a_commit_separates_are_sealed_and_no_key_or_value_is_in_the_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		for compression in COMPRESSIONS {
 			let dir = TempDir::new().unwrap();
@@ -166,6 +170,9 @@ async fn the_values_a_commit_separates_are_sealed_and_no_key_or_value_is_in_the_
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_markers_are_in_a_plaintext_log_so_that_their_absence_in_a_sealed_one_means_something()
 {
+	if tfs::skip_listed() {
+		return;
+	}
 	for compression in COMPRESSIONS {
 		let dir = TempDir::new().unwrap();
 		let entries = canaries(0..6);
@@ -190,6 +197,9 @@ async fn the_markers_are_in_a_plaintext_log_so_that_their_absence_in_a_sealed_on
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_values_a_flush_separates_are_sealed_like_the_ones_a_commit_separates() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);
@@ -221,6 +231,9 @@ async fn the_values_a_flush_separates_are_sealed_like_the_ones_a_commit_separate
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_copies_sealed_files_as_they_are_and_a_restore_brings_them_back() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let db = dir.path().join("db");
@@ -268,6 +281,9 @@ async fn a_checkpoint_copies_sealed_files_as_they_are_and_a_restore_brings_them_
 /// the one entry that holds it, and never a value that is not the one that was written.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_changed_byte_in_a_sealed_log_fails_that_read_and_returns_no_wrong_value() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);
@@ -305,6 +321,9 @@ async fn a_changed_byte_in_a_sealed_log_fails_that_read_and_returns_no_wrong_val
 /// as they were.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_tree_opened_with_a_key_that_does_not_fit_is_refused_and_leaves_the_log_alone() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let ctx = context(suite);

@@ -2,13 +2,13 @@
 //! directory can be opened again in the same process, as an embedder that retries after a key
 //! provider was away, or after a mode was refused, does.
 
-use std::fs;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use tempfile::TempDir;
 
 use super::encryption_commit_path_tests::{active_segment, commit, crash, get};
+use super::{sfs, sfs as fs};
 use crate::lsm::{Core, CoreInner};
 use crate::tde::{CipherSuite, KeyManager, SoftwareKeyManager};
 use crate::{Error, Options, Tree, WalRecoveryMode};
@@ -76,5 +76,5 @@ async fn options_with_a_key_manager_and_no_context_open_nothing_and_create_nothi
 	assert!(matches!(&refused, Error::InvalidArgument(message) if message.contains("plaintext")));
 
 	// Not a directory, not a lock file, not a segment of the log.
-	assert!(!root.exists(), "a refused core created {}", root.display());
+	assert!(!sfs::exists(&root), "a refused core created {}", root.display());
 }

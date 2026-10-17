@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 
 use super::manifest_encryption_tests::frozen_old_decode;
+use super::tfs;
 use crate::error::EncryptionError;
 use crate::levels::{fail_replacements, ReplaceFailure};
 use crate::tde::{
@@ -183,6 +184,9 @@ fn table_suite(path: &Path) -> CipherSuite {
 
 #[tokio::test]
 async fn a_database_created_with_a_key_manager_is_encrypted_and_opens_again_with_the_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("db");
@@ -239,6 +243,9 @@ async fn a_database_created_with_a_key_manager_is_encrypted_and_opens_again_with
 
 #[tokio::test]
 async fn a_suite_that_is_left_to_the_library_is_resolved_once_and_written_to_the_manifest() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let opts = encrypted(&dir.path().join("db"), manager(), CipherPreference::Auto);
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
@@ -249,6 +256,9 @@ async fn a_suite_that_is_left_to_the_library_is_resolved_once_and_written_to_the
 
 #[tokio::test]
 async fn the_suite_a_database_was_created_with_is_the_one_it_keeps() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for (created, asked) in [
 		(CipherSuite::XChaCha20Poly1305, CipherSuite::Aes256Gcm),
 		(CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305),
@@ -311,6 +321,9 @@ impl KeyManager for Watching {
 
 #[tokio::test]
 async fn no_file_is_made_under_the_identity_of_a_database_before_its_manifest_is_on_disk() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("db");
@@ -355,6 +368,9 @@ async fn no_file_is_made_under_the_identity_of_a_database_before_its_manifest_is
 #[tokio::test]
 async fn a_creation_that_fails_at_its_manifest_leaves_no_file_under_an_identity_and_can_be_repeated(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("db");
@@ -385,6 +401,9 @@ async fn a_creation_that_fails_at_its_manifest_leaves_no_file_under_an_identity_
 #[tokio::test]
 async fn a_database_that_is_opened_with_the_wrong_configuration_is_refused_and_not_one_byte_changes(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("db");
@@ -443,6 +462,9 @@ async fn a_database_that_is_opened_with_the_wrong_configuration_is_refused_and_n
 
 #[tokio::test]
 async fn a_restore_that_did_not_finish_is_reported_before_any_key_is_looked_at() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let km = manager();
@@ -480,6 +502,9 @@ async fn a_restore_that_did_not_finish_is_reported_before_any_key_is_looked_at()
 
 #[tokio::test]
 async fn a_plaintext_database_is_not_opened_with_a_key_manager_and_not_one_byte_changes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let opts = plain(dir.path());
@@ -509,6 +534,9 @@ async fn a_plaintext_database_is_not_opened_with_a_key_manager_and_not_one_byte_
 
 #[tokio::test]
 async fn a_database_with_no_tables_and_no_value_file_is_not_opened_with_a_root_that_does_not_fit() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		// Values stay in the write-ahead log: the database has a manifest and a log, and no table
@@ -571,6 +599,9 @@ impl KeyManager for Spy {
 
 #[tokio::test]
 async fn a_database_written_under_two_keys_needs_both_and_a_key_that_was_retired_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("db");
@@ -640,6 +671,9 @@ async fn a_database_written_under_two_keys_needs_both_and_a_key_that_was_retired
 
 #[tokio::test]
 async fn a_loader_that_does_not_know_encryption_stops_at_the_manifest_and_reaches_no_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let opts = create(dir.path(), manager(), suite).await;
@@ -658,6 +692,9 @@ async fn a_loader_that_does_not_know_encryption_stops_at_the_manifest_and_reache
 
 #[tokio::test]
 async fn opening_an_encrypted_database_never_leaves_a_copy_of_its_data_in_the_clear() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("db");
@@ -699,6 +736,9 @@ async fn opening_an_encrypted_database_never_leaves_a_copy_of_its_data_in_the_cl
 
 #[tokio::test]
 async fn the_options_that_a_build_returns_do_not_carry_one_database_into_another() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let first = options(&dir.path().join("first")).with_encryption(manager(), suite);
@@ -721,6 +761,9 @@ async fn the_options_that_a_build_returns_do_not_carry_one_database_into_another
 
 #[tokio::test]
 async fn an_open_that_the_value_log_refuses_makes_no_segment_of_the_log_and_changes_no_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("db");

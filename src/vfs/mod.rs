@@ -780,6 +780,17 @@ pub(crate) fn default_fs() -> Arc<dyn Fs> {
 	Arc::clone(&DEFAULT)
 }
 
+/// The file system of `Options::default()`: `default_fs()`, except in the tests of the crate that
+/// are run over a pool (`SURREALKV_TEST_FS`, see `test::tfs`). Only `Options` is switched; the
+/// code that has no `Options` keeps `default_fs()`.
+pub(crate) fn options_default_fs() -> Arc<dyn Fs> {
+	#[cfg(all(test, not(target_arch = "wasm32")))]
+	if let Some(fs) = crate::test::tfs::options_fs() {
+		return fs;
+	}
+	default_fs()
+}
+
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 fn make_default_fs() -> Arc<dyn Fs> {
 	Arc::new(StdFs)

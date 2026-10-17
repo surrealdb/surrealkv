@@ -18,6 +18,7 @@ use tempfile::TempDir;
 
 use super::encryption_background_tests::{Mode, SwitchManager};
 use super::encryption_open_tests::{files_with_extension, SUITES};
+use super::tfs;
 use crate::error::{EncryptionError, KeyProviderFailure};
 use crate::ring::PipelineHook;
 use crate::tde::{CipherSuite, DbId, EncryptionContext, KeyManager};
@@ -158,6 +159,9 @@ pub(super) fn assert_running(tree: &Tree, what: &str) {
 
 #[tokio::test]
 async fn a_group_that_a_key_problem_refuses_before_it_is_applied_fails_and_the_database_goes_on() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -221,6 +225,9 @@ async fn a_group_that_a_key_problem_refuses_before_it_is_applied_fails_and_the_d
 
 #[tokio::test]
 async fn a_key_problem_after_part_of_a_group_was_applied_stops_the_database_as_any_failure_does() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -285,6 +292,9 @@ async fn a_key_problem_after_part_of_a_group_was_applied_stops_the_database_as_a
 
 #[tokio::test]
 async fn a_failed_segment_is_replaced_once_the_key_can_be_had_and_the_commit_that_found_it_fails() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -322,6 +332,9 @@ async fn a_failed_segment_is_replaced_once_the_key_can_be_had_and_the_commit_tha
 #[tokio::test]
 async fn a_held_segment_whose_memtables_cannot_be_flushed_for_want_of_a_key_fails_with_that_error()
 {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -366,6 +379,9 @@ async fn a_held_segment_whose_memtables_cannot_be_flushed_for_want_of_a_key_fail
 
 #[tokio::test]
 async fn a_value_log_file_that_cannot_be_started_fails_the_commit_and_leaves_no_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -404,6 +420,9 @@ async fn a_value_log_file_that_cannot_be_started_fails_the_commit_and_leaves_no_
 
 #[tokio::test]
 async fn a_table_whose_manifest_cannot_be_sealed_fails_the_commit_that_wrote_it_and_is_removed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();

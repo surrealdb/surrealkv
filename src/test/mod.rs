@@ -93,6 +93,8 @@ pub mod flusher_alloc_diet_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod format_gate_tests;
 #[cfg(test)]
+pub mod fs_conformance_crash_tests;
+#[cfg(test)]
 pub mod fs_engine_crash_tests;
 #[cfg(test)]
 pub mod fs_engine_exhaustion_tests;
@@ -167,6 +169,8 @@ pub mod rotate_vlog_race_tests;
 #[cfg(test)]
 pub mod scrub_encryption_tests;
 #[cfg(test)]
+pub mod sfs;
+#[cfg(test)]
 pub mod snapshot_tests;
 #[cfg(test)]
 pub mod sstable_encryption_tests;
@@ -180,6 +184,10 @@ pub mod sstable_tests;
 pub mod stall_tests;
 #[cfg(test)]
 pub mod tde_tests;
+#[cfg(test)]
+pub mod tfs;
+#[cfg(test)]
+mod tfs_excluded;
 #[cfg(test)]
 pub mod transaction_tests;
 #[cfg(test)]

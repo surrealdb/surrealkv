@@ -4,11 +4,11 @@ use std::sync::Arc;
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs, tfs};
 use crate::compaction::leveled::Strategy;
-use crate::levels::{validate_wal_log_number, LevelManifest, MANIFEST_TRAILER_LEN};
+use crate::levels::{LevelManifest, MANIFEST_TRAILER_LEN};
 use crate::lsm::{Core, CoreInner};
 use crate::test::collect_transaction_all;
-use crate::wal::list_segment_ids;
 use crate::{
 	Error,
 	InternalKeyKind,
@@ -292,6 +292,9 @@ async fn test_persistence() {
 
 #[test(tokio::test)]
 async fn test_checkpoint_functionality() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
@@ -324,11 +327,11 @@ async fn test_checkpoint_functionality() {
 	assert_eq!(metadata.sstable_count, 1);
 	assert!(metadata.total_size > 0);
 
-	assert!(checkpoint_dir.exists());
-	assert!(checkpoint_dir.join("sstables").exists());
-	assert!(checkpoint_dir.join("wal").exists());
-	assert!(checkpoint_dir.join("manifest").exists());
-	assert!(checkpoint_dir.join("CHECKPOINT_METADATA").exists());
+	assert!(sfs::exists(&checkpoint_dir));
+	assert!(sfs::exists(checkpoint_dir.join("sstables")));
+	assert!(sfs::exists(checkpoint_dir.join("wal")));
+	assert!(sfs::exists(checkpoint_dir.join("manifest")));
+	assert!(sfs::exists(checkpoint_dir.join("CHECKPOINT_METADATA")));
 
 	// Insert more data after checkpoint
 	for i in 10..15 {
@@ -377,6 +380,9 @@ async fn test_checkpoint_functionality() {
 
 #[test(tokio::test)]
 async fn test_checkpoint_restore_discards_pending_writes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
@@ -1261,7 +1267,7 @@ async fn test_vlog_file_rotation() {
 
 	// Check that multiple VLog files were created
 	let vlog_dir = path.join("vlog");
-	let entries = std::fs::read_dir(&vlog_dir).unwrap();
+	let entries = sfs::read_dir(&vlog_dir).unwrap();
 	let vlog_files: Vec<_> = entries
 		.filter_map(|e| {
 			let entry = e.ok()?;
@@ -2028,6 +2034,9 @@ async fn test_soft_delete() {
 
 #[test(tokio::test)]
 async fn test_checkpoint_with_vlog() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = create_temp_directory();
 	let path = temp_dir.path().to_path_buf();
 
@@ -2062,16 +2071,16 @@ async fn test_checkpoint_with_vlog() {
 	assert!(metadata.total_size > 0);
 
 	// Verify all expected directories exist in checkpoint
-	assert!(checkpoint_dir.exists());
-	assert!(checkpoint_dir.join("sstables").exists());
-	assert!(checkpoint_dir.join("wal").exists());
-	assert!(checkpoint_dir.join("manifest").exists());
-	assert!(checkpoint_dir.join("vlog").exists());
-	assert!(checkpoint_dir.join("CHECKPOINT_METADATA").exists());
+	assert!(sfs::exists(&checkpoint_dir));
+	assert!(sfs::exists(checkpoint_dir.join("sstables")));
+	assert!(sfs::exists(checkpoint_dir.join("wal")));
+	assert!(sfs::exists(checkpoint_dir.join("manifest")));
+	assert!(sfs::exists(checkpoint_dir.join("vlog")));
+	assert!(sfs::exists(checkpoint_dir.join("CHECKPOINT_METADATA")));
 
 	// Verify VLog files are in the checkpoint
 	let vlog_checkpoint_dir = checkpoint_dir.join("vlog");
-	let vlog_entries = std::fs::read_dir(&vlog_checkpoint_dir).unwrap();
+	let vlog_entries = sfs::read_dir(&vlog_checkpoint_dir).unwrap();
 	let vlog_files: Vec<_> = vlog_entries
 		.filter_map(|entry| {
 			let entry = entry.ok()?;
@@ -2128,10 +2137,10 @@ async fn test_checkpoint_with_vlog() {
 	// Verify VLog directory is restored
 	let vlog_dir = opts.vlog_dir();
 
-	assert!(vlog_dir.exists(), "VLog directory should exist after restore");
+	assert!(sfs::exists(&vlog_dir), "VLog directory should exist after restore");
 
 	// Verify VLog files are restored
-	let vlog_entries = std::fs::read_dir(&vlog_dir).unwrap();
+	let vlog_entries = sfs::read_dir(&vlog_dir).unwrap();
 	let vlog_files: Vec<_> = vlog_entries
 		.filter_map(|entry| {
 			let entry = entry.ok()?;
@@ -2449,7 +2458,7 @@ async fn test_clean_shutdown_no_empty_wal() {
 		tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
 		// Count WAL files after shutdown
-		let wals_after = crate::wal::list_segment_ids(&wal_dir, Some("wal")).unwrap();
+		let wals_after = tfs::list_segment_ids(&wal_dir, Some("wal")).unwrap();
 
 		// Validate: shutdown should NOT create additional WAL files
 		// WAL count may decrease due to cleanup, but should never increase
@@ -2855,7 +2864,7 @@ async fn test_flush_on_close_creates_sst() {
 
 	// Count SST files before
 	let count_ssts = || {
-		std::fs::read_dir(&sst_dir)
+		sfs::read_dir(&sst_dir)
 			.ok()
 			.map(|entries| {
 				entries
@@ -2917,7 +2926,7 @@ async fn test_multiple_flush_cycles_with_sst_and_wal_verification() {
 	let sst_dir = opts.sstable_dir();
 
 	let count_ssts = || {
-		std::fs::read_dir(&sst_dir)
+		sfs::read_dir(&sst_dir)
 			.ok()
 			.map(|entries| {
 				entries
@@ -3158,7 +3167,7 @@ async fn test_flush_all_memtables_on_close_ordering() {
 
 	// Helper to count SST files
 	let count_ssts = || -> usize {
-		std::fs::read_dir(&sst_dir)
+		sfs::read_dir(&sst_dir)
 			.ok()
 			.map(|entries| {
 				entries
@@ -3676,17 +3685,17 @@ async fn test_cleanup_orphaned_sst_files() {
 	// Manually create an orphaned SST file (simulating incomplete flush)
 	let orphaned_table_id = 9999;
 	let orphaned_path = opts.sstable_file_path(orphaned_table_id);
-	std::fs::write(&orphaned_path, b"fake sst data").unwrap();
+	sfs::write(&orphaned_path, b"fake sst data").unwrap();
 
 	// Verify orphaned file exists
-	assert!(orphaned_path.exists(), "Orphaned SST should exist before cleanup");
+	assert!(sfs::exists(&orphaned_path), "Orphaned SST should exist before cleanup");
 
 	// Reopen database - should trigger cleanup
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Verify orphaned file was deleted
-		assert!(!orphaned_path.exists(), "Orphaned SST should be cleaned up");
+		assert!(!sfs::exists(&orphaned_path), "Orphaned SST should be cleaned up");
 
 		// Verify real data still accessible
 		let txn = tree.begin().unwrap();
@@ -3800,7 +3809,7 @@ async fn test_crash_recovery_with_orphaned_sst() {
 	// Phase 2: Simulate incomplete flush (create orphaned SST + keep WAL)
 	let orphaned_table_id = 9998;
 	let orphaned_sst_path = opts.sstable_file_path(orphaned_table_id);
-	std::fs::write(&orphaned_sst_path, b"orphaned SST content").unwrap();
+	sfs::write(&orphaned_sst_path, b"orphaned SST content").unwrap();
 
 	// Add more data that would be in WAL
 	{
@@ -3817,7 +3826,7 @@ async fn test_crash_recovery_with_orphaned_sst() {
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Verify orphaned SST was cleaned up
-		assert!(!orphaned_sst_path.exists(), "Orphaned SST should be removed");
+		assert!(!sfs::exists(&orphaned_sst_path), "Orphaned SST should be removed");
 
 		// Verify WAL data was recovered
 		let txn = tree.begin().unwrap();
@@ -3851,12 +3860,12 @@ async fn test_cleanup_multiple_orphaned_ssts() {
 	let orphaned_ids = vec![8888, 9999, 10000];
 	for table_id in &orphaned_ids {
 		let orphaned_path = opts.sstable_file_path(*table_id);
-		std::fs::write(&orphaned_path, format!("orphaned {}", table_id)).unwrap();
+		sfs::write(&orphaned_path, format!("orphaned {}", table_id)).unwrap();
 	}
 
 	// Verify all exist
 	for table_id in &orphaned_ids {
-		assert!(opts.sstable_file_path(*table_id).exists());
+		assert!(sfs::exists(opts.sstable_file_path(*table_id)));
 	}
 
 	// Reopen - should cleanup all orphaned files
@@ -3866,7 +3875,7 @@ async fn test_cleanup_multiple_orphaned_ssts() {
 		// Verify all orphaned files deleted
 		for table_id in &orphaned_ids {
 			assert!(
-				!opts.sstable_file_path(*table_id).exists(),
+				!sfs::exists(opts.sstable_file_path(*table_id)),
 				"Orphaned SST {} should be cleaned up",
 				table_id
 			);
@@ -3908,19 +3917,19 @@ async fn test_valid_ssts_not_deleted_during_cleanup() {
 
 	// Create orphaned SST
 	let orphaned_id = 9999;
-	std::fs::write(opts.sstable_file_path(orphaned_id), b"orphaned").unwrap();
+	sfs::write(opts.sstable_file_path(orphaned_id), b"orphaned").unwrap();
 
 	// Reopen
 	{
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 
 		// Verify orphaned deleted
-		assert!(!opts.sstable_file_path(orphaned_id).exists());
+		assert!(!sfs::exists(opts.sstable_file_path(orphaned_id)));
 
 		// Verify all valid SSTs still exist
 		for table_id in &valid_table_ids {
 			assert!(
-				opts.sstable_file_path(*table_id).exists(),
+				sfs::exists(opts.sstable_file_path(*table_id)),
 				"Valid SST {} should not be deleted",
 				table_id
 			);
@@ -3980,20 +3989,20 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 	let orphaned_ids = vec![8888, 9999, 10000, 10001];
 	for table_id in &orphaned_ids {
 		let orphaned_path = opts.sstable_file_path(*table_id);
-		std::fs::write(&orphaned_path, format!("orphaned SST {}", table_id)).unwrap();
+		sfs::write(&orphaned_path, format!("orphaned SST {}", table_id)).unwrap();
 	}
 
 	// Verify all files exist (both valid and orphaned)
 	for table_id in &valid_sst_ids {
 		assert!(
-			opts.sstable_file_path(*table_id).exists(),
+			sfs::exists(opts.sstable_file_path(*table_id)),
 			"Valid SST {} should exist before reopen",
 			table_id
 		);
 	}
 	for table_id in &orphaned_ids {
 		assert!(
-			opts.sstable_file_path(*table_id).exists(),
+			sfs::exists(opts.sstable_file_path(*table_id)),
 			"Orphaned SST {} should exist before cleanup",
 			table_id
 		);
@@ -4006,7 +4015,7 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 		// Verify all orphaned files deleted
 		for table_id in &orphaned_ids {
 			assert!(
-				!opts.sstable_file_path(*table_id).exists(),
+				!sfs::exists(opts.sstable_file_path(*table_id)),
 				"Orphaned SST {} should be cleaned up",
 				table_id
 			);
@@ -4015,7 +4024,7 @@ async fn test_comprehensive_orphaned_cleanup_with_multiple_ssts() {
 		// Verify all valid SST files still exist
 		for table_id in &valid_sst_ids {
 			assert!(
-				opts.sstable_file_path(*table_id).exists(),
+				sfs::exists(opts.sstable_file_path(*table_id)),
 				"Valid SST {} should not be deleted",
 				table_id
 			);
@@ -4068,7 +4077,7 @@ async fn test_wal_recovery_mode_absolute_consistency_fails_on_corruption() {
 	let wal_dir = path.join("wal");
 	let segment_path = wal_dir.join("00000000000000000000.wal");
 	{
-		let mut file = std::fs::OpenOptions::new().append(true).open(&segment_path).unwrap();
+		let mut file = sfs::OpenOptions::new().append(true).open(&segment_path).unwrap();
 		file.write_all(b"CORRUPTED_DATA_AT_END").unwrap();
 	}
 
@@ -4124,7 +4133,7 @@ async fn test_wal_recovery_mode_tolerate_with_repair_succeeds_on_corruption() {
 	let wal_dir = path.join("wal");
 	let segment_path = wal_dir.join("00000000000000000000.wal");
 	{
-		let mut file = std::fs::OpenOptions::new().append(true).open(&segment_path).unwrap();
+		let mut file = sfs::OpenOptions::new().append(true).open(&segment_path).unwrap();
 		file.write_all(b"CORRUPTED_DATA_AT_END").unwrap();
 	}
 
@@ -4267,7 +4276,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 		tracing::info!("Phase 2: Creating additional WAL segments");
 
 		// Find the highest existing segment on disk
-		let highest_existing: u64 = std::fs::read_dir(&wal_path)
+		let highest_existing: u64 = sfs::read_dir(&wal_path)
 			.unwrap()
 			.filter_map(|e| e.ok())
 			.filter_map(|e| {
@@ -4294,7 +4303,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 			let mut wal = Wal::open_with_min_log_number(
 				&wal_path,
 				segment_for_key2,
-				crate::wal::Options::default(),
+				tfs::wal_options_for(&wal_path),
 			)
 			.unwrap();
 			wal.append(&batch.encode().unwrap()).unwrap();
@@ -4316,7 +4325,7 @@ async fn test_recovery_with_manually_created_wal_segments() {
 			let mut wal = Wal::open_with_min_log_number(
 				&wal_path,
 				segment_for_key3,
-				crate::wal::Options::default(),
+				tfs::wal_options_for(&wal_path),
 			)
 			.unwrap();
 			wal.append(&batch.encode().unwrap()).unwrap();
@@ -5049,7 +5058,7 @@ async fn test_vlog_files_persist_across_restart() {
 
 		// Count VLog files before shutdown
 		let vlog_dir = path.join("vlog");
-		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		let entries = sfs::read_dir(&vlog_dir).unwrap();
 		vlog_files_before_shutdown = entries
 			.filter_map(|e| {
 				let entry = e.ok()?;
@@ -5089,7 +5098,7 @@ async fn test_vlog_files_persist_across_restart() {
 
 		// Count VLog files after restart (before adding new entries)
 		let vlog_dir = path.join("vlog");
-		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		let entries = sfs::read_dir(&vlog_dir).unwrap();
 		let vlog_files_after_restart: Vec<String> = entries
 			.filter_map(|e| {
 				let entry = e.ok()?;
@@ -5135,7 +5144,7 @@ async fn test_vlog_files_persist_across_restart() {
 		tree.flush().unwrap();
 
 		// Count VLog files after flush
-		let entries = std::fs::read_dir(&vlog_dir).unwrap();
+		let entries = sfs::read_dir(&vlog_dir).unwrap();
 		let vlog_files_after_flush: Vec<String> = entries
 			.filter_map(|e| {
 				let entry = e.ok()?;
@@ -5216,8 +5225,8 @@ async fn test_vlog_gc_non_versioned_surrealdb_style_keys() {
 	fn print_storage_state(path: &std::path::Path, tree: &Tree, phase: &str, round: usize) {
 		// List VLog files
 		let vlog_dir = path.join("vlog");
-		let vlog_files: Vec<String> = if vlog_dir.exists() {
-			std::fs::read_dir(&vlog_dir)
+		let vlog_files: Vec<String> = if sfs::exists(&vlog_dir) {
+			sfs::read_dir(&vlog_dir)
 				.unwrap()
 				.filter_map(|e| {
 					let entry = e.ok()?;
@@ -5235,8 +5244,8 @@ async fn test_vlog_gc_non_versioned_surrealdb_style_keys() {
 
 		// List SSTable files
 		let sstables_dir = path.join("sstables");
-		let sstable_files: Vec<String> = if sstables_dir.exists() {
-			std::fs::read_dir(&sstables_dir)
+		let sstable_files: Vec<String> = if sfs::exists(&sstables_dir) {
+			sfs::read_dir(&sstables_dir)
 				.unwrap()
 				.filter_map(|e| {
 					let entry = e.ok()?;
@@ -5411,8 +5420,8 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 
 	fn print_storage_state(path: &std::path::Path, tree: &Tree, phase: &str, round: usize) {
 		let vlog_dir = path.join("vlog");
-		let vlog_files: Vec<String> = if vlog_dir.exists() {
-			std::fs::read_dir(&vlog_dir)
+		let vlog_files: Vec<String> = if sfs::exists(&vlog_dir) {
+			sfs::read_dir(&vlog_dir)
 				.unwrap()
 				.filter_map(|e| {
 					let entry = e.ok()?;
@@ -5429,8 +5438,8 @@ async fn test_vlog_gc_with_updates_deletes_and_reupdates() {
 		};
 
 		let sstables_dir = path.join("sstables");
-		let sstable_files: Vec<String> = if sstables_dir.exists() {
-			std::fs::read_dir(&sstables_dir)
+		let sstable_files: Vec<String> = if sfs::exists(&sstables_dir) {
+			sfs::read_dir(&sstables_dir)
 				.unwrap()
 				.filter_map(|e| {
 					let entry = e.ok()?;
@@ -5844,7 +5853,7 @@ async fn test_recovery_detects_corrupt_log_number() {
 		let manifest_path = path.join("manifest").join("00000000000000000000.manifest");
 
 		// Read the existing manifest
-		let data = std::fs::read(&manifest_path).expect("Failed to read manifest");
+		let data = sfs::read(&manifest_path).expect("Failed to read manifest");
 
 		// Create corrupted manifest with log_number = 999999 (way beyond any WAL)
 		let mut corrupted = Vec::new();
@@ -5859,7 +5868,7 @@ async fn test_recovery_detects_corrupt_log_number() {
 		append_manifest_trailer(&mut corrupted);
 
 		// Write corrupted manifest
-		std::fs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
+		sfs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
 	}
 
 	// Phase 3: Try to open the database - should fail with ManifestCorruption
@@ -5910,12 +5919,12 @@ async fn test_validate_wal_log_number_multiple_wals() {
 
 	// Phase 2: Verify multiple WAL segments exist
 	let wal_path = path.join("wal");
-	let segment_ids = list_segment_ids(&wal_path, Some("wal")).unwrap();
+	let segment_ids = tfs::list_segment_ids(&wal_path, Some("wal")).unwrap();
 	assert!(!segment_ids.is_empty(), "Expected WAL segments, got {}", segment_ids.len());
 	let max_wal = *segment_ids.last().unwrap();
 
 	// Phase 3: Test validation detects corruption
-	let result = validate_wal_log_number(&wal_path, max_wal + 10);
+	let result = tfs::validate_wal_log_number(&wal_path, max_wal + 10);
 	match result {
 		Ok(_) => panic!("Expected error for log_number exceeding max WAL segment"),
 		Err(Error::ManifestCorruption(msg)) => {
@@ -5925,7 +5934,7 @@ async fn test_validate_wal_log_number_multiple_wals() {
 	}
 
 	// Phase 4: Verify valid log_number passes
-	let valid_result = validate_wal_log_number(&wal_path, max_wal + 1);
+	let valid_result = tfs::validate_wal_log_number(&wal_path, max_wal + 1);
 	assert!(valid_result.is_ok(), "log_number = max_wal + 1 should be valid");
 }
 
@@ -5956,14 +5965,14 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 
 	// Phase 2: Verify multiple WAL segments exist
 	let wal_path = path.join("wal");
-	let segment_ids = list_segment_ids(&wal_path, Some("wal")).unwrap();
+	let segment_ids = tfs::list_segment_ids(&wal_path, Some("wal")).unwrap();
 	assert!(!segment_ids.is_empty(), "Expected WAL segments, got {}", segment_ids.len());
 	let max_wal = *segment_ids.last().unwrap();
 
 	// Phase 3: Corrupt the manifest file
 	{
 		let manifest_path = path.join("manifest").join("00000000000000000000.manifest");
-		let data = std::fs::read(&manifest_path).expect("Failed to read manifest");
+		let data = sfs::read(&manifest_path).expect("Failed to read manifest");
 
 		let mut corrupted = Vec::new();
 		corrupted.extend_from_slice(&data[0..2]); // version (u16)
@@ -5972,7 +5981,7 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 		corrupted.extend_from_slice(&data[18..data.len() - MANIFEST_TRAILER_LEN]); // rest of body
 		append_manifest_trailer(&mut corrupted);
 
-		std::fs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
+		sfs::write(&manifest_path, &corrupted).expect("Failed to write corrupted manifest");
 	}
 
 	// Phase 4: Try to open - should fail with ManifestCorruption
@@ -5996,6 +6005,9 @@ async fn test_recovery_detects_corrupt_log_number_multiple_wals() {
 
 #[test(tokio::test)]
 async fn test_auto_migration_from_indxdb_dump() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = tempfile::tempdir().unwrap();
 	let dump_file = temp_dir.path().join("indxdb_dump.bin");
 
@@ -6012,7 +6024,7 @@ async fn test_auto_migration_from_indxdb_dump() {
 	assert_eq!(tx.get(b"user:002").unwrap(), Some(b"Bob".to_vec()));
 
 	// Verify backup was created
-	assert!(temp_dir.path().join("_indxdb_backup/indxdb_dump.bin").exists());
+	assert!(sfs::exists(temp_dir.path().join("_indxdb_backup/indxdb_dump.bin")));
 
 	tree.close().await.unwrap();
 }

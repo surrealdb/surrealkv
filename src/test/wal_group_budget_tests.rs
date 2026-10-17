@@ -24,6 +24,7 @@ use tempdir::TempDir;
 use test_log::test;
 use tokio::task::JoinHandle;
 
+use super::{sfs, tfs};
 use crate::batch::Batch;
 use crate::ring::{
 	PipelineHook,
@@ -32,7 +33,6 @@ use crate::ring::{
 	RETIRE_EVERY_ENTRIES,
 	RETIRE_EVERY_GROUPS,
 };
-use crate::wal::parallel_recovery::decode_segment_batches;
 use crate::{Durability, Error, InternalKeyKind, Mode, Options, Tree};
 
 pub(super) const MIB: usize = 1 << 20;
@@ -67,8 +67,8 @@ pub(super) fn release_lock(tree: &Tree) {
 }
 
 pub(super) fn copy_dir(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		if entry.file_name() == "LOCK" {
 			continue;
@@ -77,7 +77,7 @@ pub(super) fn copy_dir(src: &Path, dst: &Path) {
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), &to).unwrap();
+			sfs::copy(entry.path(), &to).unwrap();
 		}
 	}
 }
@@ -311,7 +311,7 @@ pub(super) async fn queue_in_order(
 /// Every WAL record in `dir`, decoded as recovery decodes it, in segment order.
 pub(super) fn wal_batches(dir: &Path) -> Vec<Batch> {
 	let mut segments: Vec<(u64, PathBuf)> = Vec::new();
-	for entry in std::fs::read_dir(dir.join("wal")).unwrap() {
+	for entry in sfs::read_dir(dir.join("wal")).unwrap() {
 		let path = entry.unwrap().path();
 		if path.extension().is_some_and(|ext| ext == "wal") {
 			let id: u64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
@@ -321,18 +321,18 @@ pub(super) fn wal_batches(dir: &Path) -> Vec<Batch> {
 	segments.sort();
 	let mut out = Vec::new();
 	for (id, path) in segments {
-		out.extend(decode_segment_batches(&path, id).unwrap().1);
+		out.extend(tfs::decode_segment_batches(&path, id).unwrap().1);
 	}
 	out
 }
 
 /// The bytes of every WAL segment in `dir`.
 pub(super) fn wal_bytes(dir: &Path) -> BTreeMap<String, Vec<u8>> {
-	std::fs::read_dir(dir.join("wal"))
+	sfs::read_dir(dir.join("wal"))
 		.unwrap()
 		.map(|e| {
 			let e = e.unwrap();
-			(e.file_name().to_string_lossy().into_owned(), std::fs::read(e.path()).unwrap())
+			(e.file_name().to_string_lossy().into_owned(), sfs::read(e.path()).unwrap())
 		})
 		.collect()
 }
@@ -396,7 +396,7 @@ pub(super) fn recover_keys(
 	opts: Arc<Options>,
 	keys: &[String],
 ) -> Vec<Option<Vec<u8>>> {
-	let _ = std::fs::remove_dir_all(&opts.path);
+	let _ = sfs::remove_dir_all(&opts.path);
 	copy_dir(live, &opts.path);
 	let recovered = Tree::new(opts).unwrap();
 	let values = {

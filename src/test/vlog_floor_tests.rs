@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs, tfs};
 use crate::batch::Batch;
 use crate::compaction::leveled::Strategy;
-use crate::levels::write_manifest_to_disk;
 use crate::lsm::{cleanup_vlog, vlog_floor, CompactionOperations, FlushHook};
 use crate::memtable::MemTable;
 use crate::ring::PipelineHook;
@@ -216,7 +216,7 @@ fn cleanup(tree: &Tree) {
 
 /// The ids of the value-log files in `path`, in order.
 fn vlog_files(path: &Path) -> Vec<u32> {
-	let mut ids: Vec<u32> = std::fs::read_dir(path.join("vlog"))
+	let mut ids: Vec<u32> = sfs::read_dir(path.join("vlog"))
 		.unwrap()
 		.filter_map(|e| {
 			let name = e.unwrap().file_name().to_string_lossy().into_owned();
@@ -229,8 +229,8 @@ fn vlog_files(path: &Path) -> Vec<u32> {
 
 /// A copy of the data directory as a crash would leave it.
 fn copy_dir_all(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		if entry.file_name() == "LOCK" {
 			continue;
@@ -239,7 +239,7 @@ fn copy_dir_all(src: &Path, dst: &Path) {
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir_all(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), &to).unwrap();
+			sfs::copy(entry.path(), &to).unwrap();
 		}
 	}
 }
@@ -251,8 +251,8 @@ fn stamp_as_older(dir: &Path, id: u64) {
 	use std::io::{Seek, SeekFrom, Write};
 
 	let path = dir.join("sstables").join(format!("{id:020}.sst"));
-	let len = std::fs::metadata(&path).unwrap().len();
-	let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+	let len = sfs::metadata(&path).unwrap().len();
+	let mut file = sfs::OpenOptions::new().write(true).open(&path).unwrap();
 	file.seek(SeekFrom::Start(len - TABLE_FULL_FOOTER_LENGTH as u64)).unwrap();
 	file.write_all(&[TableFormat::LSMV1 as u8]).unwrap();
 	file.sync_all().unwrap();
@@ -305,7 +305,7 @@ fn register_table(tree: &Tree, batch: &Batch) {
 	let mut manifest = inner.level_manifest.write().unwrap();
 	if manifest.get_log_number() != log_number {
 		manifest.log_number = log_number;
-		write_manifest_to_disk(&manifest).unwrap();
+		tfs::write_manifest_to_disk(&manifest).unwrap();
 	}
 }
 
@@ -1249,6 +1249,9 @@ async fn the_pin_of_a_commit_group_is_released_when_the_commit_is_done() {
 #[cfg(unix)]
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_pin_of_a_commit_group_is_released_when_the_group_fails() {
+	if tfs::skip_listed() {
+		return;
+	}
 	use std::os::unix::fs::PermissionsExt;
 
 	let root = TempDir::new("vlog_floor_group_pin_failed").unwrap();
@@ -1258,9 +1261,9 @@ async fn the_pin_of_a_commit_group_is_released_when_the_group_fails() {
 	assert_eq!(active_min(), None, "nothing points into the value log yet");
 
 	let sstables = live.join("sstables");
-	std::fs::set_permissions(&sstables, std::fs::Permissions::from_mode(0o555)).unwrap();
+	sfs::set_permissions(&sstables, sfs::Permissions::from_mode(0o555)).unwrap();
 	let outcome = put_oversized_outcome(&tree, &[500, 501, 502]).await;
-	std::fs::set_permissions(&sstables, std::fs::Permissions::from_mode(0o755)).unwrap();
+	sfs::set_permissions(&sstables, sfs::Permissions::from_mode(0o755)).unwrap();
 	assert!(outcome.is_err(), "the table of the oversized batch cannot be created");
 
 	assert!(!group_pinned(&tree), "a group that failed");
@@ -1353,6 +1356,9 @@ async fn an_acknowledged_group_in_the_same_sequence_keeps_its_file() {
 #[cfg(unix)]
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_batch_whose_table_could_not_be_written_keeps_the_file_its_record_points_into() {
+	if tfs::skip_listed() {
+		return;
+	}
 	use std::os::unix::fs::PermissionsExt;
 
 	let root = TempDir::new("vlog_floor_failed_table").unwrap();
@@ -1366,9 +1372,9 @@ async fn a_batch_whose_table_could_not_be_written_keeps_the_file_its_record_poin
 	// The oversized batch: its values go to the value log and its record to the WAL, then its
 	// table cannot be created.
 	let sstables = live.join("sstables");
-	std::fs::set_permissions(&sstables, std::fs::Permissions::from_mode(0o555)).unwrap();
+	sfs::set_permissions(&sstables, sfs::Permissions::from_mode(0o555)).unwrap();
 	let outcome = put_oversized_outcome(&tree, &[500, 501]).await;
-	std::fs::set_permissions(&sstables, std::fs::Permissions::from_mode(0o755)).unwrap();
+	sfs::set_permissions(&sstables, sfs::Permissions::from_mode(0o755)).unwrap();
 	assert!(outcome.is_err(), "the table of the oversized batch cannot be created");
 
 	let first = vlog_files(&live)[0];

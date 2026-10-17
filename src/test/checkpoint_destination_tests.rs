@@ -18,7 +18,7 @@ use std::time::Duration;
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
+use super::{collect_transaction_all, tfs};
 use crate::{Error, Mode, Options, Tree};
 
 /// Large enough that nothing rotates unless a test rotates it.
@@ -213,23 +213,35 @@ async fn assert_refused(destination: impl Fn(&Path) -> PathBuf) {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_database_directory_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	assert_refused(|root| root.join("db")).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_database_directory_spelled_with_a_trailing_slash_and_dot_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	assert_refused(|root| root.join("db").join(".")).await;
 	assert_refused(|root| PathBuf::from(format!("{}/", root.join("db").display()))).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_child_of_the_database_directory_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	assert_refused(|root| root.join("db").join("checkpoint")).await;
 	assert_refused(|root| root.join("db").join("a").join("b").join("c")).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_subdirectory_of_the_database_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for sub in ["sstables", "wal", "manifest"] {
 		assert_refused(|root| root.join("db").join(sub)).await;
 	}
@@ -237,11 +249,17 @@ async fn a_subdirectory_of_the_database_is_refused() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_parent_of_the_database_directory_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	assert_refused(|root| root.to_path_buf()).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_path_through_dot_dot_back_to_the_database_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	assert_refused(|root| root.join("db").join("sstables").join("..")).await;
 	assert_refused(|root| root.join("db").join("wal").join("..").join("new")).await;
 	assert_refused(|root| root.join("db").join("..").join("db")).await;
@@ -259,6 +277,9 @@ async fn a_path_through_dot_dot_back_to_the_database_is_refused() {
 #[cfg(unix)]
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_relative_path_to_the_database_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	assert_refused(|root| relative_to_cwd(&root.join("db"))).await;
 	assert_refused(|root| relative_to_cwd(&root.join("db")).join("checkpoint")).await;
 	assert_refused(relative_to_cwd).await;
@@ -267,6 +288,9 @@ async fn a_relative_path_to_the_database_is_refused() {
 #[cfg(unix)]
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_symlink_to_the_database_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	use std::os::unix::fs::symlink;
 
 	assert_refused(|root| {
@@ -309,6 +333,9 @@ async fn a_symlink_to_the_database_is_refused() {
 #[cfg(unix)]
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_subdirectory_that_is_a_link_out_of_the_database_directory_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	use std::os::unix::fs::symlink;
 
 	for vlog in [false, true] {
@@ -338,6 +365,9 @@ async fn a_subdirectory_that_is_a_link_out_of_the_database_directory_is_refused(
 /// The message names the destination and the database directory.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_refusal_says_why() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_dest_msg").unwrap();
 	let (tree, _) = tree_with_data(root.path(), false).await;
 	let destination = root.path().join("db").join("checkpoint");
@@ -370,6 +400,9 @@ fn copy_dir(from: &Path, to: &Path) {
 /// rows and the ones committed since.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_refused_checkpoint_of_a_recovered_tree_changes_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let root = TempDir::new("ckpt_dest_recovered").unwrap();
 		let db = root.path().join("db");
@@ -426,6 +459,9 @@ async fn a_refused_checkpoint_of_a_recovered_tree_changes_nothing() {
 /// in a directory whose name only starts like the database's.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn destinations_outside_the_database_still_work() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let root = TempDir::new("ckpt_dest_ok").unwrap();
 		let (tree, mut expected) = tree_with_data(root.path(), vlog).await;
@@ -578,6 +614,9 @@ async fn a_database_opened_through_a_relative_path_refuses_its_real_path() {
 #[cfg(unix)]
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn dot_dot_after_a_link_is_resolved_through_the_link() {
+	if tfs::skip_listed() {
+		return;
+	}
 	use std::os::unix::fs::symlink;
 
 	let root = TempDir::new("ckpt_dest_link_dots").unwrap();
@@ -632,6 +671,9 @@ async fn the_filesystem_root_is_refused() {
 #[cfg(unix)]
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_destination_entry_that_links_into_the_database_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for entry in ["sstables", "manifest", "wal", "CHECKPOINT_METADATA"] {
 		for vlog in [false, true] {
 			let root = TempDir::new("ckpt_dest_entry").unwrap();
@@ -705,6 +747,9 @@ async fn a_dangling_link_as_the_destination_fails_without_changes() {
 /// process-wide, so the test runs itself again in a child process.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_removed_working_directory_does_not_stop_a_checkpoint_to_an_absolute_path() {
+	if tfs::skip_listed() {
+		return;
+	}
 	const NAME: &str = "a_removed_working_directory_does_not_stop_a_checkpoint_to_an_absolute_path";
 	const CHILD: &str = "CHECKPOINT_DESTINATION_REMOVED_CWD_CHILD";
 	if std::env::var_os(CHILD).is_none() {
@@ -746,6 +791,9 @@ async fn a_removed_working_directory_does_not_stop_a_checkpoint_to_an_absolute_p
 /// table that another checkpoint has just linked is not copied over, which would truncate it.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn concurrent_checkpoints_into_one_directory_leave_the_live_tables_intact() {
+	if tfs::skip_listed() {
+		return;
+	}
 	{
 		let root = TempDir::new("ckpt_dest_same").unwrap();
 		let tree = open(&root.path().join("db"), false);

@@ -11,20 +11,21 @@
 //! until those memtables are in tables: no later commit is logged, or acknowledged, ahead of
 //! data that a crash may drop.
 
-use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use sfs::{self as fs, File};
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs, tfs};
 use crate::batch::Batch;
 use crate::ring::PipelineHook;
 use crate::wal::manager::Wal;
 use crate::wal::reader::Reader;
-use crate::wal::{Error as WalError, Options as WalOptions};
+use crate::wal::Error as WalError;
 use crate::{Durability, Error, InternalKeyKind, Mode, Options, Tree};
 
 // ---------------------------------------------------------------------------
@@ -221,7 +222,7 @@ enum Damage {
 
 fn damage_segment(image: &Path, id: u64, damage: Damage) {
 	let segment = seg_path(image, id);
-	if !segment.exists() {
+	if !sfs::exists(&segment) {
 		return;
 	}
 	match damage {
@@ -379,7 +380,7 @@ async fn a_non_empty_memtable_is_flushed_before_the_next_commit_is_acknowledged(
 	assert_eq!(tree.core.inner.l0_file_count(), 1, "the memtable of the failed segment is a table");
 	assert_eq!(tree.core.inner.immutable_count(), 0);
 	assert_eq!(log_number(&tree), first + 1);
-	assert!(!seg_path(&live, first).exists(), "the flushed segment was removed");
+	assert!(!sfs::exists(seg_path(&live, first)), "the flushed segment was removed");
 	assert_eq!(active(&tree), first + 1);
 	assert_eq!(tag(&tree), first + 1);
 	assert_all(&tree, &prefill, "from the table");
@@ -409,7 +410,7 @@ async fn a_failed_flush_wal_is_replaced_by_the_next_commit() {
 	commit_one(&tree, "next", Durability::Immediate).await.unwrap();
 	assert_eq!(active(&tree), first + 1);
 	assert_eq!(tree.core.inner.l0_file_count(), 1);
-	assert!(!seg_path(&live, first).exists());
+	assert!(!sfs::exists(seg_path(&live, first)));
 	assert_all(&tree, &eventual, "from the table");
 	assert!(get(&tree, "next").is_some());
 	finish(&tree);
@@ -433,7 +434,7 @@ fn wal_record(seq: u64, key: &str) -> Vec<u8> {
 #[test]
 fn a_rotation_after_a_failed_fsync_gives_a_held_writer_that_refuses_appends_and_syncs() {
 	let dir = TempDir::new("wal_replace").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(&wal_record(1, "acked")).unwrap();
 	wal.sync().unwrap();
 	wal.append(&wal_record(2, "unsynced")).unwrap();
@@ -471,7 +472,7 @@ fn a_rotation_after_a_failed_fsync_gives_a_held_writer_that_refuses_appends_and_
 #[test]
 fn closing_a_held_writer_reports_the_hold() {
 	let dir = TempDir::new("wal_replace").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(&wal_record(1, "unsynced")).unwrap();
 	wal.fail_syncs_after(0);
 	assert!(wal.sync().is_err());
@@ -486,7 +487,7 @@ fn closing_a_held_writer_reports_the_hold() {
 #[test]
 fn a_failed_append_alone_does_not_hold_the_next_writer() {
 	let dir = TempDir::new("wal_replace").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(&wal_record(1, "acked")).unwrap();
 	wal.fail_writes_after(0);
 	assert!(wal.append(&wal_record(2, "failed")).is_err());
@@ -503,7 +504,7 @@ fn a_failed_append_alone_does_not_hold_the_next_writer() {
 #[test]
 fn a_held_writer_is_replaced_by_one_with_the_same_bound_and_is_not_synced() {
 	let dir = TempDir::new("wal_replace").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	wal.append(&wal_record(1, "unsynced")).unwrap();
 	wal.fail_syncs_after(0);
 	assert!(wal.sync().is_err());
@@ -575,9 +576,12 @@ async fn no_crash_image_holds_a_commit_acknowledged_after_a_failed_fsync_without
 	let image_c = root.path().join("image_c");
 	copy_dir(&live, &image_c);
 
-	assert!(!seg_path(&image_a, first + 1).exists());
+	assert!(!sfs::exists(seg_path(&image_a, first + 1)));
 	assert_eq!(file_len(&seg_path(&image_b, first + 1)), 0, "the held segment holds no record");
-	assert!(!seg_path(&image_c, first).exists(), "the segment that failed is gone once flushed");
+	assert!(
+		!sfs::exists(seg_path(&image_c, first)),
+		"the segment that failed is gone once flushed"
+	);
 
 	for (name, image) in [("a", &image_a), ("b", &image_b), ("c", &image_c)] {
 		for damage in [
@@ -776,6 +780,9 @@ async fn consecutive_heals_back_off_and_create_no_file_inside_the_window() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
 async fn a_checkpoint_that_rotates_a_failed_segment_first_leaves_a_held_writer_that_the_flusher_releases(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	for checkpoint_fails in [false, true] {
 		let root = TempDir::new("wal_replace").unwrap();
 		let tree = open_tree(&root.path().join("db")).await;
@@ -985,7 +992,7 @@ async fn a_rotation_after_a_failed_flush_wal_makes_a_held_writer_that_a_commit_r
 	assert!(!held(&tree));
 	assert_eq!(active(&tree), first + 1);
 	assert_eq!(tree.core.inner.l0_file_count(), 1);
-	assert!(!seg_path(&live, first).exists());
+	assert!(!sfs::exists(seg_path(&live, first)));
 	assert_all(&tree, &eventual, "from the table");
 	tree.flush_wal(true).unwrap();
 	finish(&tree);
@@ -1214,7 +1221,7 @@ async fn heal_does_not_run_during_a_restore() {
 		assert!(error.contains("Group commit failed"), "{after_replace}: {error}");
 		assert_eq!(replaced.load(Ordering::SeqCst), after_replace as usize);
 		assert_eq!(active(&tree), first + after_replace as u64, "{after_replace}");
-		assert_eq!(seg_path(&live, first + 1).exists(), after_replace, "{after_replace}");
+		assert_eq!(sfs::exists(seg_path(&live, first + 1)), after_replace, "{after_replace}");
 
 		tree.core.commit_pipeline.set_hook(None);
 		tree.core.commit_pipeline.restoring.store(false, Ordering::SeqCst);

@@ -12,7 +12,6 @@
 //! * opening a tree continues in a fresh segment by rotating the WAL, and that rotation goes
 //!   through the same hook as every other.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -21,6 +20,7 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs as fs, tfs};
 use crate::ring::PipelineHook;
 use crate::vlog::{VLog, SYNCED_VLOG_FILES};
 use crate::{Durability, Mode, Options, Tree};
@@ -96,8 +96,8 @@ fn crash(tree: Tree) {
 async fn a_value_appended_while_a_sync_runs_is_not_covered_by_it() {
 	let dir = TempDir::new("rotate_vlog_sync_prove").unwrap();
 	let opts = vlog_opts(dir.path());
-	fs::create_dir_all(opts.vlog_dir()).unwrap();
-	let vlog = Arc::new(VLog::new(opts).unwrap());
+	tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
+	let vlog = Arc::new(tfs::vlog_new(opts).unwrap());
 	let first = vlog.append(b"key-0", &payload(0, 100)).unwrap();
 	let file = vlog.vlog_file_path(first.file_id);
 

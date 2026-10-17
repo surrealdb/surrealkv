@@ -19,7 +19,6 @@
 //! `close` see, and what a crash image recovers.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -30,7 +29,7 @@ use tempdir::TempDir;
 use test_log::test;
 
 use super::compaction_memory_proofs::RefuseAllocations;
-use super::{collect_transaction_all, collect_transaction_reverse};
+use super::{collect_transaction_all, collect_transaction_reverse, sfs, sfs as fs, tfs};
 use crate::compaction::leveled::Strategy;
 use crate::lsm::{CompactionOperations, FlushHook};
 use crate::ring::{CommitStage, PipelineHook, UNFENCED_STALE_ROUNDS};
@@ -1033,6 +1032,9 @@ async fn stopped_tree(dir: &Path) -> (Arc<Tree>, Entries) {
 /// flushed. So no flush, no checkpoint and no compaction runs, and recovery finds the group whole.
 #[test(tokio::test)]
 async fn a_stopped_database_flushes_compacts_and_checkpoints_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("group_fail_stop").unwrap();
 	let (tree, group) = stopped_tree(dir.path()).await;
 	let queued = tree.core.inner.immutable_count();
@@ -1071,6 +1073,9 @@ async fn a_stopped_database_flushes_compacts_and_checkpoints_nothing() {
 /// it.
 #[test(tokio::test)]
 async fn a_stopped_database_does_not_checkpoint_a_table_that_holds_part_of_the_group() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("group_fail_stop").unwrap();
 	let tree = open(opts(dir.path(), false)).await;
 	let injected = inject(&tree, Failure::SecondDirectL0);
@@ -1085,7 +1090,7 @@ async fn a_stopped_database_does_not_checkpoint_a_table_that_holds_part_of_the_g
 	let checkpoint = TempDir::new("group_fail_stop_checkpoint").unwrap();
 	let cp = checkpoint.path().join("cp");
 	assert!(matches!(tree.create_checkpoint(&cp), Err(Error::DatabaseStopped(_))));
-	assert!(!cp.exists(), "nothing was copied");
+	assert!(!sfs::exists(&cp), "nothing was copied");
 	crash(&tree);
 }
 
@@ -1171,6 +1176,9 @@ async fn close_of_a_stopped_database_leaves_the_group_to_the_wal() {
 /// a reopen.
 #[test(tokio::test)]
 async fn a_restore_discards_what_a_failed_group_applied() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("group_fail_stop").unwrap();
 	let checkpoint = TempDir::new("group_fail_stop_checkpoint").unwrap();
 	let tree = open(opts(dir.path(), false)).await;

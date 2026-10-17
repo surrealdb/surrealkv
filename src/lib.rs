@@ -392,7 +392,7 @@ impl Default for Options {
 			key_manager: None,
 			encryption_cipher: CipherPreference::default(),
 			encryption_context: None,
-			fs: vfs::default_fs(),
+			fs: vfs::options_default_fs(),
 		}
 	}
 }

@@ -11,7 +11,6 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::BTreeMap;
-use std::fs;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -20,6 +19,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
+use super::{sfs, sfs as fs, tfs};
 use crate::lsm::Core;
 use crate::{Error, Options, Tree};
 
@@ -101,7 +101,7 @@ async fn write_database(opts: &Arc<Options>) {
 	assert!(count_files(opts.sstable_dir(), "sst") >= 2, "expected SSTables on disk");
 	assert!(count_files(opts.wal_dir(), "wal") >= 1, "expected a WAL segment on disk");
 	assert!(count_files(opts.vlog_dir(), "vlog") >= 1, "expected a value log file on disk");
-	assert!(opts.manifest_file_path(0).exists(), "expected a manifest on disk");
+	assert!(sfs::exists(opts.manifest_file_path(0)), "expected a manifest on disk");
 }
 
 async fn closed_database() -> (TempDir, Arc<Options>) {
@@ -140,7 +140,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Node> {
 		for entry in fs::read_dir(dir).unwrap() {
 			let path = entry.unwrap().path();
 			let rel = path.strip_prefix(root).unwrap().to_path_buf();
-			if path.is_dir() {
+			if sfs::is_dir(&path) {
 				out.insert(rel, Node::Dir);
 				walk(root, &path, out);
 			} else {
@@ -157,7 +157,7 @@ fn snapshot(root: &Path) -> BTreeMap<PathBuf, Node> {
 	}
 
 	let mut out = BTreeMap::new();
-	if root.exists() {
+	if sfs::exists(root) {
 		walk(root, root, &mut out);
 	}
 	out
@@ -243,7 +243,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 	for entry in fs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		let target = dst.join(entry.file_name());
-		if entry.path().is_dir() {
+		if sfs::is_dir(entry.path()) {
 			copy_dir(&entry.path(), &target);
 		} else {
 			fs::copy(entry.path(), target).unwrap();
@@ -263,10 +263,10 @@ async fn missing_manifest_directory_is_refused() {
 
 	let err = open_refused(&opts).await;
 	expect_manifest_missing(err, &opts);
-	assert!(!opts.manifest_dir().exists(), "the refused open must not recreate manifest/");
+	assert!(!sfs::exists(opts.manifest_dir()), "the refused open must not recreate manifest/");
 
 	// Nothing else was lost: putting the manifest back brings every key back.
-	fs::create_dir_all(opts.manifest_dir()).unwrap();
+	tfs::create_dir_all(&opts, opts.manifest_dir()).unwrap();
 	fs::write(opts.manifest_file_path(0), manifest).unwrap();
 	reopen_and_verify(&opts).await;
 }
@@ -279,7 +279,7 @@ async fn missing_manifest_file_is_refused() {
 
 	let err = open_refused(&opts).await;
 	expect_manifest_missing(err, &opts);
-	assert!(!opts.manifest_file_path(0).exists(), "the refused open must not write a manifest");
+	assert!(!sfs::exists(opts.manifest_file_path(0)), "the refused open must not write a manifest");
 
 	fs::write(opts.manifest_file_path(0), manifest).unwrap();
 	reopen_and_verify(&opts).await;
@@ -427,7 +427,7 @@ async fn orphan_cleanup_still_runs_against_a_loaded_manifest() {
 	fs::write(&orphan, b"left behind by an interrupted flush").unwrap();
 
 	reopen_and_verify(&opts).await;
-	assert!(!orphan.exists(), "an unlisted SSTable must be cleaned up at startup");
+	assert!(!sfs::exists(&orphan), "an unlisted SSTable must be cleaned up at startup");
 }
 
 /// Defence in depth below `Tree::new`: even if something reaches `Core::new`
@@ -476,16 +476,19 @@ async fn a_rocksdb_directory_that_cannot_be_read_is_refused_untouched() {
 	assert!(matches!(err, Error::MigrationFailed(_)), "{err:?}");
 
 	assert_eq!(fs::read(dir.path().join("CURRENT")).unwrap(), b"MANIFEST-000001\n");
-	assert!(dir.path().join("MANIFEST-000001").exists());
-	assert!(!dir.path().join("_rocksdb_backup").exists());
-	assert!(!dir.path().join("MIGRATING_ROCKSDB").exists());
-	assert!(!dir.path().join("manifest").exists(), "no database was created over it");
+	assert!(sfs::exists(dir.path().join("MANIFEST-000001")));
+	assert!(!sfs::exists(dir.path().join("_rocksdb_backup")));
+	assert!(!sfs::exists(dir.path().join("MIGRATING_ROCKSDB")));
+	assert!(!sfs::exists(dir.path().join("manifest")), "no database was created over it");
 }
 
 /// The migrated database is an ordinary database afterwards: losing its
 /// manifest is refused like any other.
 #[test(tokio::test)]
 async fn migrated_indxdb_directory_is_protected_like_any_other() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let entries = vec![(b"user:001".to_vec(), b"Alice".to_vec())];
 	surrealkv_compat_indxdb::export_dump(dir.path().join("indxdb_dump.bin"), &entries).unwrap();
@@ -494,7 +497,7 @@ async fn migrated_indxdb_directory_is_protected_like_any_other() {
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 	assert_eq!(tree.begin().unwrap().get(b"user:001").unwrap(), Some(b"Alice".to_vec()));
 	tree.close().await.unwrap();
-	assert!(dir.path().join("_indxdb_backup/indxdb_dump.bin").exists());
+	assert!(sfs::exists(dir.path().join("_indxdb_backup/indxdb_dump.bin")));
 	assert!(count_files(opts.sstable_dir(), "sst") >= 1, "the migration writes an SSTable");
 
 	fs::remove_dir_all(opts.manifest_dir()).unwrap();
@@ -510,6 +513,9 @@ async fn migrated_indxdb_directory_is_protected_like_any_other() {
 /// reopen.
 #[test(tokio::test)]
 async fn restore_from_checkpoint_survives_a_reopen() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let checkpoints = TempDir::new().unwrap();
 	let checkpoint = checkpoints.path().join("checkpoint");
@@ -541,6 +547,9 @@ async fn restore_from_checkpoint_survives_a_reopen() {
 /// orphans; now the open is refused and finishing the restore completes it.
 #[test(tokio::test)]
 async fn directory_left_by_an_interrupted_restore_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let source = TempDir::new().unwrap();
 	let checkpoints = TempDir::new().unwrap();
 	let checkpoint = checkpoints.path().join("checkpoint");

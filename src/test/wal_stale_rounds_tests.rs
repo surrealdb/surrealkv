@@ -29,7 +29,6 @@
 //! scenario would otherwise block the test binary for good.
 
 use std::collections::{BTreeMap, HashSet};
-use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -39,7 +38,7 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
+use super::{collect_transaction_all, sfs as fs, tfs};
 use crate::batch::Batch;
 use crate::memtable::MemTable;
 use crate::ring::{PipelineHook, UNFENCED_STALE_ROUNDS};
@@ -1634,6 +1633,9 @@ fn a_rotation_storm_never_fails_a_logged_commit_on_a_current_thread_runtime() {
 /// races the flusher.
 #[test]
 fn a_storm_of_checkpoints_and_seals_never_fails_a_logged_commit() {
+	if tfs::skip_listed() {
+		return;
+	}
 	bounded(true, async {
 		Storm {
 			rotators: vec![Rotator::Checkpoint, Rotator::Seal],

@@ -15,6 +15,7 @@ use super::encryption_open_tests::{
 	KEYS,
 	SUITES,
 };
+use super::tfs;
 use crate::error::EncryptionError;
 use crate::tde::{describe_manifest_file, is_sealed_manifest, CipherPreference, CipherSuite};
 use crate::{Mode, Options, TreeBuilder};
@@ -29,6 +30,9 @@ fn builder(dir: &std::path::Path) -> TreeBuilder {
 
 #[tokio::test]
 async fn a_tree_built_with_a_key_manager_is_encrypted_and_opens_with_the_same_keys() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("db");
@@ -73,6 +77,9 @@ async fn a_tree_built_with_a_key_manager_is_encrypted_and_opens_with_the_same_ke
 
 #[tokio::test]
 async fn a_tree_that_is_encrypted_is_refused_without_a_key_and_nothing_is_changed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let root = dir.path().join("db");
 	let tree = builder(&root).with_encryption(manager(), CipherPreference::Auto).build().unwrap();
@@ -89,6 +96,9 @@ async fn a_tree_that_is_encrypted_is_refused_without_a_key_and_nothing_is_change
 
 #[tokio::test]
 async fn a_tree_in_the_clear_is_refused_when_a_key_is_given_and_nothing_is_changed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let root = dir.path().join("db");
 	let tree = builder(&root).build().unwrap();
