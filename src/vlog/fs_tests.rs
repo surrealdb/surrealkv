@@ -518,6 +518,26 @@ fn lines(expected: &[&str]) -> Vec<String> {
 	expected.iter().map(|line| line.to_string()).collect()
 }
 
+/// The calls with every run of consecutive `file_len` calls put in name order. The log asks for the
+/// length of each file in the order the directory lists them, which is not the same on every file
+/// system, and the order is not something the log promises.
+fn with_file_lens_sorted(calls: Vec<String>) -> Vec<String> {
+	let mut sorted = Vec::with_capacity(calls.len());
+	let mut run: Vec<String> = Vec::new();
+	for call in calls {
+		if call.starts_with("file_len ") {
+			run.push(call);
+		} else {
+			run.sort();
+			sorted.append(&mut run);
+			sorted.push(call);
+		}
+	}
+	run.sort();
+	sorted.append(&mut run);
+	sorted
+}
+
 /// The calls of an append, a read, a rotation, a sync and a removal, in the order they are made.
 /// Each is the syscall that was made before the log went through the seam: `exists` is the
 /// `stat`, `open_append` the `open`, `len` the `fstat`, `append` the `write` of the buffer,
@@ -621,7 +641,7 @@ fn the_calls_of_opening_a_log_that_has_files() {
 	let fs = TestFs::new();
 	let vlog = open_in(&fs, Arc::clone(&opts));
 	assert_eq!(
-		fs.take(),
+		with_file_lens_sorted(fs.take()),
 		lines(&[
 			"read_dir vlog",
 			"file_len 1.vlog",
