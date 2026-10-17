@@ -19,9 +19,13 @@
 //!   flushed never goes over the page that holds the newest header that is, also after a flush
 //!   fails: the next write goes over the page of the one that was not flushed;
 //! * a slot is claimed from a list of clean slots (free headers, no payload). A slot that is
-//!   unlinked is cleaned before it is reused: truncated to the headers, both pages made free,
-//!   flushed. Nothing is cleaned in a `Drop`: a dead slot is queued, and cleaned by `maintain` or,
-//!   if a claim finds nothing clean, by the claim;
+//!   unlinked is cleaned before it is reused, in this order: a free header is written and flushed,
+//!   which is the commit (from then on the slot is free in every crash, and a payload that is left
+//!   in it is dead); then the payload is cut off, the other page is made free too, and that is
+//!   flushed, so that nothing of the old file is there when the slot is named again. The cut never
+//!   comes first: a crash would keep it and lose the header, and the name of a file that was
+//!   removed would come back with no bytes. Nothing is cleaned in a `Drop`: a dead slot is queued,
+//!   and cleaned by `maintain` or, if a claim finds nothing clean, by the claim;
 //! * `rename`, and the replacement of a manifest, commit in one flush of one slot, so there is no
 //!   ordering between two files and no directory to sync;
 //! * a mount reads every header, and a path that two slots claim goes to the one with the higher
@@ -596,6 +600,9 @@ struct SlotInfo {
 	flushed_gen: u64,
 	/// The number of the last write of a named header.
 	named_gen: u64,
+	/// The header that counts is a free one, as far as this pool knows: the one it wrote, or the
+	/// one that it read. Whether it is flushed is `hdr_gen` and `flushed_gen`.
+	free: bool,
 	/// Open files on this slot.
 	views: usize,
 	/// No name points at it any more.
@@ -618,11 +625,20 @@ impl SlotInfo {
 			hdr_gen: 0,
 			flushed_gen: 0,
 			named_gen: 0,
+			free: false,
 			views: 0,
 			unlinked: false,
 			queued: false,
 			poisoned: false,
 			orphan: false,
+		}
+	}
+
+	/// A slot whose headers are free and flushed: new, or cleaned, or read from the disk as such.
+	fn clean(active_page: usize, seq: u64) -> Self {
+		Self {
+			free: true,
+			..Self::fresh(active_page, seq)
 		}
 	}
 }
@@ -861,7 +877,9 @@ impl<R: Raw> PoolShared<R> {
 	// ---- headers ----------------------------------------------------------------------------
 
 	/// Writes a header into a page of the slot. Nothing changes if the write fails, so the old
-	/// header still counts, and a retry writes the same page again.
+	/// header still counts, and a retry writes the same page again. Except for one thing: the page
+	/// may hold all of the header that failed, and a mount would read it, so the slot is no longer
+	/// known to be free whatever it was, and a clean writes a free header of its own.
 	///
 	/// The page is the one that does not count, unless the header that counts is not flushed: then
 	/// it is that one, and the other page, which holds the newest header that is flushed, is left
@@ -889,10 +907,14 @@ impl<R: Raw> PoolShared<R> {
 			1 - st.active_page
 		};
 		let (_, written) = write_fully(&slot.raw, page_offset(target), &page);
-		written?;
+		if let Err(e) = written {
+			st.free = false;
+			return Err(e);
+		}
 		st.active_page = target;
 		st.seq = seq;
 		st.hdr_gen += 1;
+		st.free = matches!(state, HeaderState::Free);
 		match state {
 			HeaderState::Named(path) => {
 				st.named_gen = st.hdr_gen;
@@ -980,19 +1002,75 @@ impl<R: Raw> PoolShared<R> {
 		}
 	}
 
-	/// Makes a dead slot a clean one: cut to the headers, both pages free, flushed. The truncation
-	/// comes first: a crash after it and before the headers leaves the name of a dead file with no
-	/// bytes, which is no worse than the dead file, and loses to any newer claim of the path.
+	/// Makes a dead slot a clean one: both pages free, nothing after them, flushed.
+	///
+	/// The header pages are the commit record of what a slot is, and a flush is the only barrier
+	/// between two operations on its file: of the writes and the cut that have not been flushed, a
+	/// crash keeps any subset, and tears any write. So the order is the one in which every subset
+	/// is a slot that a mount reads right:
+	///
+	/// 1. A free header is written, in the page that does not hold the newest flushed header (the
+	///    rule of [`write_header`](Self::write_header)), and flushed. If a crash keeps it, the slot
+	///    is free, and a payload that is left is dead, which a mount cuts off. If a crash does not,
+	///    or tears it, the header that was there counts, and the file is what it was, whole: its
+	///    bytes have not been touched. The removal of a file has written the header already: then
+	///    it is only flushed, and if a flush of the slot has come after the removal, not even that.
+	/// 2. The payload is cut off and the other page is made free, and both are flushed. Either may
+	///    be lost, and the slot is free whichever is. The flush is what orders the cut before the
+	///    first write of the file that is named in the slot next: without it, a crash may keep that
+	///    write and lose the cut, and the new file shows the old bytes after its end. When there is
+	///    nothing to cut, the other page is already free, and nothing is written: but if step 1 did
+	///    not flush either (the header was durable already), the file is flushed all the same, for
+	///    a cut that was made after that, through a handle that was open when the file was removed,
+	///    and is not flushed yet. If any of it fails, the slot is no longer known to be free and
+	///    flushed, so that the next try starts at the first step and flushes the cut that may have
+	///    been made.
+	///
+	/// Cutting first is wrong: the cut can be kept while the header is lost, and a file that was
+	/// removed comes back with no bytes. So is writing both pages before a flush: one of them is
+	/// the newest flushed header, and a crash that tears it leaves an older header of the slot in
+	/// charge.
 	fn clean_slot(&self, slot: &Slot<R>) -> io::Result<()> {
-		let seq = self.next_seq()?;
-		slot.raw.set_len(HEADER_LEN)?;
-		let page = Header::free(seq).encode()?;
-		write_fully(&slot.raw, page_offset(0), &page).1?;
-		write_fully(&slot.raw, page_offset(1), &page).1?;
-		slot.raw.flush()?;
-		let mut st = slot.st.lock();
-		*st = SlotInfo::fresh(0, seq);
-		drop(st);
+		let (free, unflushed) = {
+			let st = slot.st.lock();
+			(st.free, st.hdr_gen > st.flushed_gen)
+		};
+		let flushed = if !free {
+			self.write_header(slot, HeaderState::Free)?;
+			self.flush_slot(slot)?;
+			true
+		} else if unflushed {
+			// The header of the removal is there: it only has to be made durable.
+			self.flush_slot(slot)?;
+			true
+		} else {
+			false
+		};
+		let (page, seq) = {
+			let st = slot.st.lock();
+			(st.active_page, st.seq)
+		};
+		let cut = || -> io::Result<()> {
+			if slot.raw.size()? > HEADER_LEN {
+				slot.raw.set_len(HEADER_LEN)?;
+				let free = Header::free(seq).encode()?;
+				write_fully(&slot.raw, page_offset(1 - page), &free).1?;
+				slot.raw.flush()?;
+			} else if !flushed {
+				// The length of the file already says that there is nothing to cut, and that may be
+				// a cut that nothing has flushed: make it durable before the slot is named again.
+				slot.raw.flush()?;
+			}
+			Ok(())
+		};
+		if let Err(e) = cut() {
+			// The cut may have been made and not flushed, and the next try would find the length
+			// where it is to be: it has to flush it all the same, which a free header that is not
+			// known to be flushed makes it do.
+			slot.st.lock().free = false;
+			return Err(e);
+		}
+		*slot.st.lock() = SlotInfo::clean(page, seq);
 		slot.end.store(0, Ordering::Release);
 		Ok(())
 	}
@@ -1126,7 +1204,7 @@ impl<R: Raw> PoolShared<R> {
 			self.total.fetch_sub(1, Ordering::AcqRel);
 			return Err(e);
 		}
-		let slot = Slot::new(name, raw, SlotInfo::fresh(0, 0), 0);
+		let slot = Slot::new(name, raw, SlotInfo::clean(0, 0), 0);
 		self.adopt(&slot);
 		Ok(Some(slot))
 	}
@@ -1875,8 +1953,13 @@ impl<R: Raw> PoolShared<R> {
 					}
 					match header.state {
 						HeaderState::Free => {
+							slot.st.lock().free = true;
 							if size > HEADER_LEN {
+								// Flushed before the slot is claimed: a claim writes a name and
+								// bytes into it, and a crash that kept those and lost the cut
+								// would show the old bytes after the end of the new file.
 								slot.raw.set_len(HEADER_LEN)?;
+								slot.raw.flush()?;
 								report.cut_back += 1;
 							}
 							free_slots.push(index);
@@ -1970,7 +2053,7 @@ impl<R: Raw> PoolShared<R> {
 			slot.raw.set_len(0)?;
 		}
 		self.init_blank(&slot.raw)?;
-		*slot.st.lock() = SlotInfo::fresh(0, 0);
+		*slot.st.lock() = SlotInfo::clean(0, 0);
 		slot.end.store(0, Ordering::Release);
 		Ok(())
 	}
@@ -2819,10 +2902,98 @@ mod tests {
 		);
 		assert_eq!(flushes(&|| fs.replace_atomic(p("/d/M"), b"two").unwrap()), 2);
 		assert_eq!(fs.stats().dirty, 2, "the removed file and the first manifest are dead");
-		assert_eq!(flushes(&|| assert_eq!(fs.maintain(1), 1)), 1, "a clean is one flush");
-		assert_eq!(flushes(&|| assert_eq!(fs.maintain(10), 1)), 1);
+		assert_eq!(
+			flushes(&|| assert_eq!(fs.maintain(1), 1)),
+			2,
+			"a clean of a slot that has bytes is two flushes: the free header, then the cut"
+		);
+		assert_eq!(
+			flushes(&|| assert_eq!(fs.maintain(10), 1)),
+			1,
+			"and of a slot that has none, one: the free header"
+		);
 		assert_eq!(flushes(&|| assert_eq!(fs.maintain(10), 0)), 0);
-		drop((b, created));
+
+		assert_eq!(
+			flushes(&|| {
+				let _ = fs.create_truncate(p("/d/a"), CreateOpts::default()).unwrap();
+			}),
+			1,
+			"a creation that takes the name of a file is one flush: the new name is durable \
+			 before the old one is given up"
+		);
+		assert_eq!(
+			flushes(&|| {
+				let _ = fs.create_truncate(p("/d/fresh"), CreateOpts::default()).unwrap();
+			}),
+			0,
+			"and one that takes a name that is not there is a creation"
+		);
+
+		// A file that is synced after it was removed has its free header durable: the clean has
+		// only the cut to flush.
+		let kept = fs.create_truncate(p("/d/k"), CreateOpts::default()).unwrap();
+		kept.append(b"bytes").unwrap();
+		kept.sync().unwrap();
+		fs.remove_file(p("/d/k")).unwrap();
+		assert_eq!(flushes(&|| kept.sync().unwrap()), 1);
+		drop(kept);
+		assert_eq!(flushes(&|| assert_eq!(fs.maintain(1), 1)), 1, "only the cut is left to flush");
+
+		// With no bytes to cut and the free header durable, the clean has nothing of its own to
+		// write, and flushes once all the same: a cut that was made through the handle of the
+		// removed file, after that flush, is not durable before it.
+		let bare = fs.create_truncate(p("/d/bare"), CreateOpts::default()).unwrap();
+		fs.remove_file(p("/d/bare")).unwrap();
+		assert_eq!(flushes(&|| bare.sync().unwrap()), 1);
+		drop(bare);
+		assert_eq!(
+			flushes(&|| assert_eq!(fs.maintain(1), 1)),
+			1,
+			"a slot with no bytes and a durable header is flushed once, for a cut that is not"
+		);
+
+		// What a write costs does not depend on any of it: a write, a cut of a file that is open
+		// and a sync are what they were.
+		let w = fs.create_new(p("/d/w"), CreateOpts::default()).unwrap();
+		assert_eq!(flushes(&|| w.append(b"0123456789").unwrap()), 0);
+		assert_eq!(flushes(&|| w.set_len(4).unwrap()), 0, "a cut of an open file is none");
+		assert_eq!(flushes(&|| w.sync().unwrap()), 1);
+		drop((b, created, w));
+
+		// A claim that finds no clean slot cleans a dead one for itself, and pays for it: two
+		// flushes. A claim that finds a clean slot, which is every other one, pays none.
+		let (tight, tight_raw) = strict_pool(1, 8);
+		tight.create_dir_all(p("/d")).unwrap();
+		put(&tight, "/d/a", b"bytes");
+		tight.remove_file(p("/d/a")).unwrap();
+		let before = tight_raw.flushes();
+		let _b = tight.create_new(p("/d/b"), CreateOpts::default()).unwrap();
+		assert_eq!(tight_raw.flushes() - before, 2, "a claim that cleans pays for the clean");
+		assert_eq!(tight.stats().total, 1, "no slot was made");
+
+		// A mount that cuts the bytes of a free slot flushes the cut, before the slot can be
+		// named. A mount that has nothing to cut flushes nothing.
+		let (fs, raw) = strict_pool(2, 8);
+		fs.create_dir_all(p("/d")).unwrap();
+		put(&fs, "/d/a", b"bytes");
+		fs.remove_file(p("/d/a")).unwrap();
+		let with_bytes = raw.snapshot();
+		let flushed_before = with_bytes.flushes();
+		let (_cut, report) =
+			PoolFs::mount_sync(with_bytes.clone(), PoolConfig::strict(0, 8)).unwrap();
+		assert_eq!(report.cut_back, 1);
+		assert_eq!(with_bytes.flushes() - flushed_before, 1, "the cut of a mount is flushed");
+		let plain = MemRaw::new();
+		drop(PoolFs::mount_sync(plain.clone(), PoolConfig::strict(2, 8)).unwrap());
+		let flushed_before = plain.flushes();
+		let (_again, report) = PoolFs::mount_sync(plain.clone(), PoolConfig::strict(0, 8)).unwrap();
+		assert_eq!(report.cut_back, 0);
+		assert_eq!(
+			plain.flushes() - flushed_before,
+			0,
+			"a mount that cuts nothing flushes nothing"
+		);
 	}
 
 	// ---- the lifecycle of slots --------------------------------------------------------------
@@ -3695,8 +3866,7 @@ mod tests {
 	}
 
 	#[test]
-	fn every_crash_point_of_a_clean_leaves_the_file_gone_or_resurrected_whole_or_empty() {
-		let stale = vec![0xEE; 300];
+	fn every_crash_point_of_a_clean_leaves_the_file_gone_or_resurrected_whole() {
 		let checked = enumerate(&Scenario {
 			prepare: &|| {
 				let (fs, raw) = base_pool();
@@ -3717,9 +3887,10 @@ mod tests {
 				match read(fs, "/d/a") {
 					None => {}
 					Some(content) => {
-						assert!(
-							content.is_empty() || content == vec![0xEE; 300],
-							"{context}: a resurrected file is whole or empty, not a mixture"
+						assert_eq!(
+							content,
+							vec![0xEE; 300],
+							"{context}: a resurrected file is whole: not empty, and not a mixture"
 						);
 						assert!(
 							!acks.contains(&"cleaned"),
@@ -3729,7 +3900,7 @@ mod tests {
 				}
 			},
 		});
-		assert!(checked > 100, "{checked} (stale {})", stale.len());
+		assert!(checked > 50, "{checked}");
 	}
 
 	#[test]

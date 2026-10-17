@@ -12,7 +12,9 @@
 //! from one count for the whole backend, in order (`pending`). A crash image is a new backend
 //! whose files are the durable bytes with some of the pending operations applied, as the
 //! [`CrashMode`] says. Nothing that was flushed is ever lost, and a file that exists keeps existing
-//! (see "What is not modelled" for what that leaves out).
+//! (see "What is not modelled" for what that leaves out). `MemRaw::crash_by` is the same with the
+//! fate of each operation given one by one (whole, lost, or a write torn): every subset of the
+//! operations, which is what the modes sample.
 //!
 //! # What is not modelled
 //!
@@ -105,6 +107,18 @@ pub enum CrashMode {
 	/// A seeded subset survives: later writes tend to, truncations tend not to. An operation that
 	/// persists while one before it does not is a reordering.
 	Reorder(u64),
+}
+
+/// What a crash does to one unflushed operation, for [`MemRaw::crash_by`].
+#[allow(dead_code, reason = "a hook of the tests")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Fate {
+	/// The operation is not there after the crash.
+	Lost,
+	/// The operation is whole.
+	Kept,
+	/// A write that is there in its first `n` bytes only. A truncation that is torn is lost.
+	Torn(usize),
 }
 
 /// How a backend behaves, besides what it is asked to do.
@@ -522,13 +536,57 @@ impl MemState {
 			}
 		}
 
+		self.image_of(&files, &kept)
+	}
+
+	/// A crash that says what happens to each unflushed operation, in the order they were made.
+	/// Every subset of the operations, with any write torn at any length, is one of these: the
+	/// modes of [`CrashMode`] are some of them.
+	fn crash_by(&self, fate: &dyn Fn(usize) -> Fate) -> MemRaw {
+		let files = self.files.lock();
+		let mut kept: Vec<(u64, String, Op)> = Vec::new();
+		for (index, (seq, name, op)) in Self::unflushed(&files).into_iter().enumerate() {
+			match (fate(index), op) {
+				(Fate::Kept, op) => kept.push((seq, name, op)),
+				(
+					Fate::Torn(n),
+					Op::Write {
+						offset,
+						data,
+					},
+				) => {
+					let n = n.min(data.len());
+					if n > 0 {
+						kept.push((
+							seq,
+							name,
+							Op::Write {
+								offset,
+								data: data[..n].to_vec(),
+							},
+						));
+					}
+				}
+				(Fate::Torn(_), Op::SetLen(_)) | (Fate::Lost, _) => {}
+			}
+		}
+		self.image_of(&files, &kept)
+	}
+
+	/// A backend whose files are the durable bytes of these with the operations of `kept` applied,
+	/// in the order they are given.
+	fn image_of(
+		&self,
+		files: &BTreeMap<String, Arc<MemFile>>,
+		kept: &[(u64, String, Op)],
+	) -> MemRaw {
 		let image = MemState::new(self.cfg);
 		let mut total = 0u64;
 		{
 			let mut out = image.files.lock();
 			for (name, file) in files.iter() {
 				let mut bytes = file.inner.lock().durable.clone();
-				for (_, op_name, op) in &kept {
+				for (_, op_name, op) in kept {
 					if op_name == name {
 						// A bound that the original passed cannot fail here; if it does the op
 						// is a lost one.
@@ -755,6 +813,32 @@ impl MemRaw {
 	/// This one is not touched, so a test can crash one state in every way.
 	pub(crate) fn crash(&self, mode: CrashMode) -> MemRaw {
 		self.state.crash(mode)
+	}
+
+	/// A new backend with what a crash would leave of this one when it did to each unflushed
+	/// operation (numbered from 0, in the order they were made, over all the files) what `fate`
+	/// says. This one is not touched.
+	pub(crate) fn crash_by(&self, fate: &dyn Fn(usize) -> Fate) -> MemRaw {
+		self.state.crash_by(fate)
+	}
+
+	/// The unflushed operations, in the order they were made: the file, and for a write the
+	/// number of bytes (a truncation has none), which is what a test needs to enumerate the
+	/// crashes of [`MemRaw::crash_by`].
+	pub(crate) fn unflushed_shape(&self) -> Vec<(String, Option<usize>)> {
+		MemState::unflushed(&self.state.files.lock())
+			.into_iter()
+			.map(|(_, name, op)| {
+				let len = match op {
+					Op::Write {
+						data,
+						..
+					} => Some(data.len()),
+					Op::SetLen(_) => None,
+				};
+				(name, len)
+			})
+			.collect()
 	}
 
 	/// A copy of everything, flushed or not, as it is now: a crash that loses nothing.
@@ -1161,6 +1245,44 @@ mod tests {
 		// The original is untouched by every crash.
 		assert_eq!(read_all(&raw, "a"), b"AAAA11");
 		assert_eq!(read_all(&raw, "b"), b"22223333");
+	}
+
+	#[test]
+	fn a_crash_that_says_what_happens_to_each_operation_is_any_subset_and_any_tear() {
+		let raw = MemRaw::new();
+		let a = create(&raw, "a");
+		write_all(&a, 0, b"AAAA");
+		a.flush().unwrap();
+		write_all(&a, 4, b"1111"); // op 0
+		a.set_len(6).unwrap(); // op 1
+		write_all(&a, 0, b"ZZ"); // op 2
+		assert_eq!(
+			raw.unflushed_shape(),
+			vec![("a".to_string(), Some(4)), ("a".to_string(), None), ("a".to_string(), Some(2))]
+		);
+		let image = |fates: [Fate; 3]| read_all(&raw.crash_by(&|index| fates[index]), "a");
+		assert_eq!(image([Fate::Lost, Fate::Lost, Fate::Lost]), b"AAAA");
+		assert_eq!(image([Fate::Kept, Fate::Lost, Fate::Lost]), b"AAAA1111");
+		assert_eq!(image([Fate::Kept, Fate::Kept, Fate::Lost]), b"AAAA11");
+		// A later operation kept and an earlier one lost: a reordering.
+		assert_eq!(image([Fate::Lost, Fate::Kept, Fate::Kept]), b"ZZAA\0\0");
+		assert_eq!(image([Fate::Kept, Fate::Lost, Fate::Kept]), b"ZZAA1111");
+		// A torn write keeps its first bytes, and a torn truncation is a lost one.
+		assert_eq!(image([Fate::Torn(2), Fate::Lost, Fate::Torn(1)]), b"ZAAA11");
+		assert_eq!(image([Fate::Lost, Fate::Torn(1), Fate::Lost]), b"AAAA");
+		assert_eq!(image([Fate::Torn(0), Fate::Kept, Fate::Lost]), b"AAAA\0\0");
+		// Every operation kept is the crash that loses nothing, and every one lost is the one
+		// that loses everything that was not flushed.
+		assert_eq!(
+			read_all(&raw.crash_by(&|_| Fate::Kept), "a"),
+			read_all(&raw.crash(CrashMode::Prefix(3)), "a")
+		);
+		assert_eq!(
+			read_all(&raw.crash_by(&|_| Fate::Lost), "a"),
+			read_all(&raw.crash(CrashMode::LoseUnsynced), "a")
+		);
+		// The original is untouched.
+		assert_eq!(read_all(&raw, "a"), b"ZZAA11");
 	}
 
 	#[test]

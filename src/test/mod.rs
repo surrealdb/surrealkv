@@ -105,6 +105,8 @@ pub mod fs_engine_tests;
 #[cfg(test)]
 pub mod fs_error_tests;
 #[cfg(test)]
+pub mod fs_pool_crash_tests;
+#[cfg(test)]
 pub mod fs_probe;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod fs_std_tests;
