@@ -717,6 +717,16 @@ fn only_the_newest_file_can_be_set_aside_and_only_for_a_header_that_was_not_comp
 	assert_eq!(encryption_error(VLog::new(Arc::clone(&opts))), EncryptionError::MalformedHeader);
 	assert_eq!(snapshot(&opts.vlog_dir()), before);
 
+	// A file of zeros that is not the newest, short or long: the header of a sealed file is made
+	// durable before the file holds an entry, so what a crash leaves does not look like that, and
+	// it is not taken for a file that was never synced.
+	for len in [127, 127 + 60] {
+		std::fs::write(opts.vlog_file_path(1), vec![0u8; len]).unwrap();
+		let before = snapshot(&opts.vlog_dir());
+		assert!(is_corruption(VLog::new(Arc::clone(&opts))), "{len} bytes of zeros");
+		assert_eq!(snapshot(&opts.vlog_dir()), before, "{len} bytes of zeros");
+	}
+
 	// An empty file that is not the newest.
 	std::fs::write(opts.vlog_file_path(1), b"").unwrap();
 	let before = snapshot(&opts.vlog_dir());

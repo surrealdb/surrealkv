@@ -242,15 +242,19 @@ pub enum VLogChecksumLevel {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WalRecoveryMode {
 	/// Trim only a proven torn tail in the last segment. Refuse interior corruption
-	/// or corruption in any earlier segment.
+	/// or corruption in any earlier segment. A record of the last segment whose value is
+	/// not in the value log is trimmed with the records after it if none of them points to a
+	/// value that is, and refused otherwise.
 	#[default]
 	TolerateTornTail,
 
-	/// Fail immediately on any WAL corruption (no repair or trimming attempted).
+	/// Fail immediately on any WAL corruption (no repair or trimming attempted), and on a
+	/// record of the last segment whose value is not in the value log.
 	AbsoluteConsistency,
 
 	/// Salvage any valid prefix before corruption in any segment, discarding
-	/// all subsequent records.
+	/// all subsequent records. The same for a record of the last segment whose value is
+	/// not in the value log.
 	SalvageValidPrefix,
 
 	/// Backward-compatible alias for `SalvageValidPrefix`.

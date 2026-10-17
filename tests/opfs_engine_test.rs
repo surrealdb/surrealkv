@@ -386,6 +386,57 @@ async fn the_engine_runs_over_the_origin_private_file_system_with_the_value_log(
 	finish_line(true).await;
 }
 
+/// The file of the value log that the commits are in: the highest one.
+fn value_log_file(fs: &FileSystem) -> String {
+	names(fs, "db/vlog")
+		.into_iter()
+		.filter(|name| name.ends_with(".vlog"))
+		.last()
+		.map(|name| format!("db/vlog/{name}"))
+		.expect("a file of the value log")
+}
+
+/// The open holds the last segment of the log to the value log. After a crash that kept the log
+/// and cut the end of the value log, the log ends before the first record whose value is not in
+/// the file, the commits that were acknowledged are all there, and the database takes commits.
+#[wasm_bindgen_test]
+async fn a_value_log_that_ends_early_ends_the_log_before_the_first_value_that_is_missing() {
+	let name = unique_name("skv-engine-value-log-tail", "db");
+	let fs = FileSystem::opfs(&name).await.expect("mount");
+	let tree = open(&fs, true).await;
+	let acked_end = PER_TXN * 2;
+	commit(&tree, 0..acked_end, true, Durability::Immediate).await;
+	let value_log = value_log_file(&fs);
+	let acked_len = fs.file_len_for_test(&value_log).unwrap();
+	let eventual_end = acked_end + PER_TXN * 3;
+	commit(&tree, acked_end..eventual_end, true, Durability::Eventual).await;
+	assert!(fs.file_len_for_test(&value_log).unwrap() > acked_len + 1000);
+	tree.abandon();
+	fs.abandon();
+	let fresh = FileSystem::opfs(&name).await.expect("mount after a crash");
+	drop(tree);
+	drop(fs);
+	let fs = fresh;
+	// The value log ends in the middle of the first entry that was not acknowledged.
+	fs.raw_truncate_for_test(&value_log, acked_len + 7).expect("cut the value log");
+
+	let tree = open(&fs, true).await;
+	let report = tree.recovery_report();
+	assert!(report.records_dropped > 0, "the log was cut: {report:?}");
+	assert!(report.bytes_trimmed > 0 && !report.quarantined_files.is_empty(), "{report:?}");
+	read_back(&tree, 0..acked_end, true).await;
+	let kept = present(&tree, acked_end..eventual_end, true);
+	assert!(kept.iter().all(|k| !*k), "nothing that points past the end is there: {kept:?}");
+
+	commit(&tree, acked_end..eventual_end, true, Durability::Immediate).await;
+	read_back(&tree, 0..eventual_end, true).await;
+	tree.close().await.expect("close the tree");
+	drop(tree);
+	fs.close().await.expect("close the file system");
+	drop(fs);
+	FileSystem::destroy_opfs(&name).await.expect("clean up");
+}
+
 // ---------------------------------------------------------------------------------------------
 // The edges of the public interface
 // ---------------------------------------------------------------------------------------------

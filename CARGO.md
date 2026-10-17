@@ -187,6 +187,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Commits use `Durability::Eventual` by default, so a commit does not wait for an fsync. Call `tx.set_durability(Durability::Immediate)` before `commit()` to make the commit wait for a sync of the write-ahead log before it returns. In a browser that sync is weaker: see [Durability in a browser](#durability-in-a-browser).
 
+When a database is opened, the open reads the values that the records of the last segment of the write-ahead log point to in the value log. A record whose value is not there, and the records after it, are not replayed. `WalRecoveryMode::SalvageValidPrefix` ends the log before that record. The default mode does the same if no later record has its value, and refuses to open the database otherwise. `WalRecoveryMode::AbsoluteConsistency` fails the open.
+
 ---
 
 ## Range Scans & Iteration

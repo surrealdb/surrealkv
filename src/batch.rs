@@ -7,7 +7,7 @@ use crate::varint::{
 	put_varint_u64,
 	varint_len_u64,
 };
-use crate::vlog::{ValuePointer, VALUE_POINTER_SIZE};
+use crate::vlog::{ValueLocation, ValuePointer, VALUE_POINTER_SIZE};
 use crate::{InternalKeyKind, Key, Value};
 
 /// The most bytes a batch may encode to: a WAL record is one batch, and the LZ4 block of a
@@ -263,6 +263,17 @@ impl Batch {
 		entries
 			.saturating_mul(GATHER_ENTRY_BYTES)
 			.saturating_add(GATHER_BYTE_COST.saturating_mul(bytes))
+	}
+
+	/// The pointers into the value log that the values of the batch hold, in the order of the
+	/// entries. A value that a flusher separated is a pointer behind the header of its location;
+	/// the end key of a range delete is not a value.
+	pub(crate) fn value_pointers(&self) -> impl Iterator<Item = ValuePointer> + '_ {
+		self.entries
+			.iter()
+			.filter(|entry| entry.kind != InternalKeyKind::RangeDelete)
+			.filter_map(|entry| ValueLocation::peek_pointer_payload(entry.value.as_deref()?))
+			.filter_map(|payload| ValuePointer::decode(payload).ok())
 	}
 
 	/// Get entries for VLog processing

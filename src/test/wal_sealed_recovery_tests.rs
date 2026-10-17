@@ -72,7 +72,7 @@ impl Recovered {
 fn recover(context: &WalContext, dir: &Path, mode: WalRecoveryMode) -> crate::Result<Recovered> {
 	let mut memtables = Vec::new();
 	let (max_seq, active, _) =
-		Core::replay_wal_in(context, dir, 0, "test", mode, ARENA, |memtable, _, _| {
+		Core::replay_wal_in(context, dir, 0, "test", mode, ARENA, None, |memtable, _, _| {
 			memtables.push(memtable);
 			Ok(())
 		})?;

@@ -200,6 +200,8 @@ pub mod tree_builder_encryption_tests;
 pub mod value_location_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod versioning_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod vlog_check_entry_tests;
 #[cfg(test)]
 pub mod vlog_floor_tests;
 #[cfg(test)]
@@ -242,6 +244,14 @@ pub mod wal_sealed_tree_tests;
 pub mod wal_sealed_writer_tests;
 #[cfg(test)]
 pub mod wal_stale_rounds_tests;
+#[cfg(test)]
+pub mod wal_tail_check_crash_tests;
+#[cfg(test)]
+pub mod wal_tail_check_replay_tests;
+#[cfg(all(test, not(target_arch = "wasm32")))]
+pub mod wal_tail_check_sealed_tests;
+#[cfg(test)]
+pub mod wal_tail_check_tests;
 #[cfg(test)]
 pub mod wal_tests;
 #[cfg(test)]

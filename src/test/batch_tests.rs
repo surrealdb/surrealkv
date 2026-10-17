@@ -1,6 +1,7 @@
 use test_log::test;
 
 use crate::batch::{Batch, BATCH_VERSION, MAX_BATCH_SIZE};
+use crate::vlog::{ValueLocation, ValuePointer};
 use crate::InternalKeyKind;
 
 #[test]
@@ -517,4 +518,40 @@ fn test_batch_encode_decode() {
 	// Test that we can re-encode the decoded batch and get the same result
 	let re_encoded = decoded_batch.encode().unwrap();
 	assert_eq!(encoded, re_encoded, "Re-encoding should produce identical result");
+}
+
+/// The pointers of a batch are those that its values hold, in the order of its entries. A value
+/// that is stored next to its key and an entry without a value hold none, and the end key of a
+/// range delete is not a value: it is the bytes of a key, whatever they look like, and 27 bytes
+/// that start with a letter have the length and the flag of a pointer to the value log.
+#[test]
+fn the_pointers_of_a_batch_are_those_of_its_values_and_not_the_end_key_of_a_range_delete() {
+	let first = ValuePointer::new(3, 31, 4, 300, 0x0102_0304);
+	let second = ValuePointer::new(7, 4_000, 6, 90, 0x0A0B_0C0D);
+	let location = |pointer: &ValuePointer| ValueLocation::with_pointer(pointer.clone()).encode();
+
+	let mut batch = Batch::new(1);
+	batch.add_record(InternalKeyKind::Set, b"a".to_vec(), Some(location(&first)), 0).unwrap();
+	batch
+		.add_record(
+			InternalKeyKind::Set,
+			b"b".to_vec(),
+			Some(ValueLocation::with_inline_value(vec![b'v'; 25]).encode()),
+			0,
+		)
+		.unwrap();
+	batch.add_record(InternalKeyKind::Delete, b"c".to_vec(), None, 0).unwrap();
+	let end_key = vec![b'a'; 27];
+	assert!(
+		ValueLocation::peek_pointer_payload(&end_key)
+			.is_some_and(|payload| ValuePointer::decode(payload).is_ok()),
+		"the end key reads as a pointer, which is why it is not looked at"
+	);
+	batch.add_record(InternalKeyKind::RangeDelete, b"A".to_vec(), Some(end_key), 0).unwrap();
+	batch.add_record(InternalKeyKind::Replace, b"d".to_vec(), Some(location(&second)), 0).unwrap();
+
+	assert_eq!(batch.value_pointers().collect::<Vec<_>>(), vec![first, second]);
+	// The same after the batch went through a log: it is decoded from its bytes.
+	let decoded = Batch::decode(&batch.encode().unwrap()).unwrap();
+	assert_eq!(decoded.value_pointers().count(), 2);
 }
