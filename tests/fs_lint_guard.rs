@@ -145,6 +145,20 @@ fn the_script_refuses_a_level_that_was_lowered() {
 	let output = levels(&blanket);
 	assert!(!output.status.success(), "a blanket allow was accepted: {}", text(&output));
 
+	// The same, written as a `cfg_attr` of anything but `test`.
+	let not_test = tree(
+		"not-test",
+		"deny",
+		"allow",
+		"#![cfg_attr(not(test), allow(clippy::disallowed_methods, reason = \"everything may use a disk\"))]\n",
+	);
+	let output = levels(&not_test);
+	assert!(
+		!output.status.success(),
+		"an allow for the code that is not a test was accepted: {}",
+		text(&output)
+	);
+
 	// An allow that does not say why.
 	let reasonless = tree("reasonless", "deny", "allow", TESTS_ONLY);
 	std::fs::write(
@@ -155,7 +169,7 @@ fn the_script_refuses_a_level_that_was_lowered() {
 	let output = levels(&reasonless);
 	assert!(!output.status.success(), "an allow without a reason was accepted: {}", text(&output));
 
-	for dir in [good, lowered, raised, blanket, reasonless] {
+	for dir in [good, lowered, raised, blanket, not_test, reasonless] {
 		let _ = std::fs::remove_dir_all(dir);
 	}
 }

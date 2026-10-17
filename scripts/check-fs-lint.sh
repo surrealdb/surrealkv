@@ -72,7 +72,7 @@ static_checks() {
 }
 
 # Every attribute of the sources that names the lint, one line each: `file:line<TAB>kind<TAB>reason`.
-# `kind` is `module` for an inner attribute, `test` for a `cfg_attr` and `item` for the rest. rustfmt
+# `kind` is `module` for an inner attribute, `test` for a `cfg_attr(test, ...)` and `item` for the rest. rustfmt
 # spreads a long attribute over several lines, so the attribute is read as a whole, up to its
 # closing bracket. (No reason that this script reads contains a bracket.)
 scan_allows() {
@@ -82,7 +82,9 @@ scan_allows() {
 				if (buf !~ /disallowed_methods/ || buf !~ /(allow|expect)\(/) return
 				kind = "item"
 				if (buf ~ /^#!/) kind = "module"
-				if (buf ~ /cfg_attr/) kind = "test"
+				# Only `cfg_attr(test, ...)` is for tests: any other predicate is for code that is
+				# not a test, and keeps the kind of the attribute it is written as.
+				if (buf ~ /cfg_attr\( *test *,/) kind = "test"
 				reason = ""
 				if (match(buf, /reason *= *"[^"]*"/)) {
 					rest = substr(buf, RSTART, RLENGTH)
