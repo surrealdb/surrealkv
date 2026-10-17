@@ -105,7 +105,12 @@ fn read_all(tree: &Tree, keys: &Model) -> Model {
 
 /// Opens a copy of a crashed directory and asserts that it holds `model`.
 async fn assert_image_recovers(image: &Path, encrypted: bool, model: &Model, what: &str) {
-	let tree = Tree::new(options(image, encrypted)).unwrap();
+	// On a copy: an open removes the segments that hold nothing, and the image is the state that
+	// the test goes on to cut.
+	let copy = TempDir::new("image_recovers").unwrap();
+	let at = copy.path().join("db");
+	copy_dir(image, &at);
+	let tree = Tree::new(options(&at, encrypted)).unwrap();
 	stop_background(&tree).await;
 	let got = read_all(&tree, model);
 	for (k, v) in model {

@@ -983,3 +983,104 @@ async fn a_quota_while_the_log_is_appended_to_fails_the_commit_with_its_own_type
 	})
 	.await;
 }
+
+// ---------------------------------------------------------------------------------------------
+// A session that ends without a close does not leave a segment of the log behind for ever
+// ---------------------------------------------------------------------------------------------
+
+/// A browser tab cannot run an asynchronous close, so most sessions end without one. Every open
+/// starts a new segment of the log, and the segments that a flush at the open moved the manifest
+/// past are not read again: they have to be removed, or a database that is opened and left again
+/// holds one more file of the pool each time, until the pool is full and the open fails.
+#[test(tokio::test)]
+async fn sessions_that_end_without_a_close_do_not_leave_the_log_to_grow() {
+	within("sessions without a close", async {
+		for (writes, mode) in [
+			(0usize, CrashMode::Prefix(usize::MAX)),
+			(5, CrashMode::Prefix(usize::MAX)),
+			(80, CrashMode::Prefix(usize::MAX)),
+			// What a crash does not keep is what was not synced: the removals of the open too.
+			(5, CrashMode::LoseUnsynced),
+			(0, CrashMode::ZeroTail),
+		] {
+			let mut fs = FileSystem::memory();
+			let sessions = 40;
+			let mut written = 0;
+			let mut most = 0;
+			for session in 0..sessions {
+				let options = options_for(&fs, false);
+				let tree = TreeBuilder::with_options(options).build_async().await.unwrap();
+				if written > 0 {
+					assert_present(&tree, 0..written, 40);
+				}
+				commit_range(&tree, written..written + writes, 40, Durability::Immediate).await;
+				written += writes;
+				most = most.max(fs.list_for_test("db/wal").len());
+				tree.abandon();
+				fs.abandon();
+				drop(tree);
+				// Everything that was written is kept, as a browser keeps what a worker wrote.
+				fs = fs.simulate_crash(mode).expect("a memory pool crashes");
+				let _ = session;
+			}
+			// One for the commits that are not in a table, one that the session started, and one
+			// that the last flush at the open leaves: a few, and never a number that grows with
+			// the sessions.
+			assert!(
+				most <= 6,
+				"{writes} writes a session, {mode:?}: {most} segments of the log after {sessions} sessions"
+			);
+		}
+	})
+	.await;
+}
+
+/// The failure that the growth ends in: a pool that holds a fixed number of files, and sessions
+/// that end without a close. Every open, and every commit, has to find a file to take, for as long
+/// as the sessions go on, and the files that are not tables must not grow with them.
+///
+/// A session that writes leaves its records to the next open, which puts them in a table, and the
+/// tables are merged only as the database grows: so most of these sessions only look, and the
+/// ones that write are few.
+#[test(tokio::test)]
+async fn sessions_that_end_without_a_close_never_fill_a_pool_with_a_limit_of_files() {
+	within("sessions in a pool with a limit", async {
+		let mut raw = MemRaw::new();
+		let mut written = 0;
+		let mut most_other_files = 0;
+		for session in 0..200 {
+			let config = PoolConfig {
+				max_files: 70,
+				..PoolConfig::memory()
+			};
+			let (pool, _) = PoolFs::<MemRaw>::mount_sync(raw.clone(), config)
+				.expect("a pool mounts over memory");
+			let fs = FileSystem(Arc::clone(&pool) as Arc<dyn Fs>);
+			let tree = TreeBuilder::with_options(options_for(&fs, false))
+				.build_async()
+				.await
+				.unwrap_or_else(|e| panic!("session {session}: the database opens: {e}"));
+			if written > 0 {
+				assert_present(&tree, 0..written, 40);
+			}
+			if session % 10 == 5 {
+				commit_range(&tree, written..written + 20, 40, Durability::Immediate).await;
+				written += 20;
+			}
+			let others: usize = ["db/wal", "db/vlog", "db/manifest"]
+				.iter()
+				.map(|dir| fs.list_for_test(dir).len())
+				.sum();
+			most_other_files = most_other_files.max(others);
+			tree.abandon();
+			pool.abandon();
+			drop(tree);
+			raw = raw.crash(CrashMode::Prefix(usize::MAX));
+		}
+		assert!(
+			most_other_files <= 6,
+			"{most_other_files} files that are not tables after 200 sessions"
+		);
+	})
+	.await;
+}

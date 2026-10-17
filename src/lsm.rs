@@ -702,6 +702,46 @@ impl CoreInner {
 			+ cleanup_old_segments_for_in(context, &*self.opts.fs, wal_dir, min_wal_to_keep)?)
 	}
 
+	/// Removes, at the open, the segments of the log that nothing needs, after the recovery has put
+	/// the records that it replayed in tables (all but `data_segment`, which holds those of the
+	/// recovered memtable) and a new segment, `active`, has been started.
+	///
+	/// A session that ends without a close (a browser tab cannot run one) is the usual end of a
+	/// session on the web, and every open starts a segment: a recovery flush moves the manifest's
+	/// `log_number` and removes nothing, and one that finds no records moves nothing, so without
+	/// this each of those sessions leaves one more file, and a file pool at its limit then cannot
+	/// open the database. The segments below `data_segment` are removed as a close does it, with
+	/// the newest of them last; those between it and `active` hold no record at all, and a
+	/// crash that keeps any of the removals leaves a log that opens, as the one that was there.
+	///
+	/// Best effort: what stays is removed by the next open, a flush or the close.
+	fn remove_dead_wal_segments_at_open(&self, data_segment: Option<u64>, active: u64) {
+		// A sealed log names, checks and numbers its segments in its own way, and is on `std`,
+		// which has no limit of files: it keeps what it kept.
+		if self.opts.encryption_context().is_some() {
+			return;
+		}
+		let wal_dir = self.wal.read().get_dir_path().to_path_buf();
+		let bound = data_segment.unwrap_or(active).min(active);
+		if let Err(e) = self.remove_obsolete_wal_segments_at_close(&wal_dir, bound) {
+			tracing::warn!("Failed to clean up old WAL segments at open: {}", e);
+			return;
+		}
+		let Some(data_segment) = data_segment else {
+			return;
+		};
+		let Ok(ids) = list_segment_ids_in(&*self.opts.fs, &wal_dir, Some("wal")) else {
+			return;
+		};
+		for id in ids.into_iter().filter(|id| *id > data_segment && *id < active) {
+			if let Err(e) = self.opts.fs.remove_file(&wal_dir.join(format!("{id:020}.wal"))) {
+				tracing::warn!("Failed to remove the empty WAL segment {}: {}", id, e);
+				return;
+			}
+		}
+		self.maintain_pool(usize::MAX);
+	}
+
 	/// Cleans some of the files that were removed, so that they return to the free ones without
 	/// waiting for the pool's own refill. A no-op for a file system that is not a pool.
 	pub(crate) fn maintain_pool(&self, budget: usize) {
@@ -2355,6 +2395,11 @@ impl Core {
 			entry_count
 		);
 
+		// Tagged with the segment that its records are in, until the caller gives it the segment
+		// that it will be written to: the open reads the tag to know which segments hold
+		// nothing that is not in a table.
+		last_memtable.set_wal_number(last_wal_number);
+
 		Ok((wal_seq_num_opt, Some(last_memtable), report))
 	}
 
@@ -2428,6 +2473,14 @@ impl Core {
 			inner.rotate_wal(&mut wal_guard)?;
 		}
 
+		// The segment that holds the records of the recovered memtable, which no table has: the
+		// only one below the new segment that a later open still has to read. Every other one
+		// holds records that are in tables, or none.
+		let data_segment = recovered_memtable
+			.as_ref()
+			.filter(|memtable| !memtable.is_empty())
+			.map(|memtable| memtable.get_wal_number());
+
 		// Set recovered memtable as active (if any)
 		if let Some(memtable) = recovered_memtable {
 			let mut active_memtable = inner.active_memtable.write()?;
@@ -2439,6 +2492,7 @@ impl Core {
 			let active_memtable = inner.active_memtable.read()?;
 			let current_wal_number = inner.wal.read().get_active_log_number();
 			active_memtable.set_wal_number(current_wal_number);
+			inner.remove_dead_wal_segments_at_open(data_segment, current_wal_number);
 		}
 
 		// Get last_sequence from manifest

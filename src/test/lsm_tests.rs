@@ -4075,7 +4075,12 @@ async fn test_wal_recovery_mode_absolute_consistency_fails_on_corruption() {
 
 	// Phase 2: Corrupt the WAL file
 	let wal_dir = path.join("wal");
-	let segment_path = wal_dir.join("00000000000000000000.wal");
+	// The segment that holds the commits: an open removes the segments that hold nothing, the
+	// first one of a new database among them.
+	let segment_path = {
+		let ids = crate::test::tfs::list_segment_ids(&wal_dir, Some("wal")).unwrap();
+		wal_dir.join(format!("{:020}.wal", ids.last().unwrap()))
+	};
 	{
 		let mut file = sfs::OpenOptions::new().append(true).open(&segment_path).unwrap();
 		file.write_all(b"CORRUPTED_DATA_AT_END").unwrap();
@@ -4131,7 +4136,12 @@ async fn test_wal_recovery_mode_tolerate_with_repair_succeeds_on_corruption() {
 
 	// Phase 2: Corrupt the WAL file at the end
 	let wal_dir = path.join("wal");
-	let segment_path = wal_dir.join("00000000000000000000.wal");
+	// The segment that holds the commits: an open removes the segments that hold nothing, the
+	// first one of a new database among them.
+	let segment_path = {
+		let ids = crate::test::tfs::list_segment_ids(&wal_dir, Some("wal")).unwrap();
+		wal_dir.join(format!("{:020}.wal", ids.last().unwrap()))
+	};
 	{
 		let mut file = sfs::OpenOptions::new().append(true).open(&segment_path).unwrap();
 		file.write_all(b"CORRUPTED_DATA_AT_END").unwrap();

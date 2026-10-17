@@ -227,6 +227,9 @@ async fn finish_line(vlog: bool) {
 	let mut next = 0usize;
 	let mut tables_seen: BTreeSet<String> = BTreeSet::new();
 	let mut most_segments = 0usize;
+	// The log has rotated when more than one segment was seen: a segment that holds nothing is
+	// removed at the open, and one that a flush has passed is removed at once.
+	let mut segments_seen: BTreeSet<String> = BTreeSet::new();
 	let mut tables_removed = false;
 	loop {
 		commit(&tree, next..next + PER_TXN * 4, vlog, Durability::Immediate).await;
@@ -235,8 +238,9 @@ async fn finish_line(vlog: bool) {
 		tables_removed |= tables_seen.iter().any(|seen| !now.contains(seen));
 		tables_seen.extend(now);
 		most_segments = most_segments.max(wal_segments(&fs).len());
+		segments_seen.extend(wal_segments(&fs));
 		let flushed = tables_seen.len() >= 5;
-		if most_segments >= 2 && flushed && tables_removed {
+		if segments_seen.len() >= 2 && flushed && tables_removed {
 			break;
 		}
 		assert!(next < 60_000, "no compaction after {next} keys: {tables_seen:?}");
@@ -244,9 +248,10 @@ async fn finish_line(vlog: bool) {
 		sleep_ms(1.0).await;
 	}
 	console_log!(
-		"{} keys, {} tables seen, most log segments {most_segments}, vlog files {:?}",
+		"{} keys, {} tables seen, {} log segments seen, most at once {most_segments}, vlog files {:?}",
 		next,
 		tables_seen.len(),
+		segments_seen.len(),
 		names(&fs, "db/vlog")
 	);
 	if vlog {
@@ -417,6 +422,40 @@ fn io_kind(error: &Error) -> Option<ErrorKind> {
 /// The default wait for a database that another page has open is long enough for a page that is
 /// being reloaded, and ends with the typed error. The second mount is made from this very worker,
 /// which holds the lock exactly as another worker would.
+/// A page that goes away cannot run an asynchronous close, so most sessions in a browser end
+/// without one. Each of them opens the database and leaves it: the log must not keep a segment for
+/// each, because every segment is a file of a pool that holds a fixed number of them.
+#[wasm_bindgen_test]
+async fn sessions_that_end_without_a_close_do_not_leave_the_log_to_grow() {
+	let name = unique_name("skv-engine-sessions", "db");
+	let mut fs = FileSystem::opfs(&name).await.expect("mount");
+	let mut written = 0usize;
+	let mut most = 0usize;
+	for session in 0..30 {
+		let tree = open(&fs, false).await;
+		if written > 0 {
+			read_back(&tree, 0..written, false).await;
+		}
+		// Some sessions write and some only look.
+		if session % 3 != 0 {
+			commit(&tree, written..written + 3, false, Durability::Immediate).await;
+			written += 3;
+		}
+		// Every file that is not a table: the tables are merged as the database grows, and a
+		// session that writes leaves its records to a table at the next open.
+		most = most
+			.max(["db/wal", "db/vlog", "db/manifest"].iter().map(|d| names(&fs, d).len()).sum());
+		tree.abandon();
+		fs.abandon();
+		let fresh = FileSystem::opfs(&name).await.expect("mount after the end of a session");
+		drop(tree);
+		drop(std::mem::replace(&mut fs, fresh));
+	}
+	assert!(most <= 6, "{most} files that are not tables after 30 sessions without a close");
+	fs.close().await.expect("close");
+	FileSystem::destroy_opfs(&name).await.expect("clean up");
+}
+
 #[wasm_bindgen_test]
 async fn a_second_mount_waits_and_then_fails_with_the_lock_error() {
 	let name = unique_name("skv-engine-lock", "db");

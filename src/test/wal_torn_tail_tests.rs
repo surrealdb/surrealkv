@@ -657,12 +657,16 @@ async fn multi_segment_scenario(shape: Shape) {
 	assert_keys(&tree, "good", 10, &GOOD, "recovery #1");
 	assert!(get(&tree, "torn").is_none());
 	assert_eq!(strict_decode(&last).len(), 10, "the last segment holds what was acknowledged");
-	assert_eq!(fs::read(wal_path(&o, first)).unwrap(), earlier[0], "an earlier segment changed");
-	assert_eq!(
-		fs::read(wal_path(&o, first + 1)).unwrap(),
-		earlier[1],
-		"an earlier segment changed"
-	);
+	// What recovery replayed from the earlier segments is in tables by now, and the open removes
+	// them: nothing in them is read again, and none was changed on the way (they were not
+	// repaired: only the last one was damaged).
+	assert_eq!(earlier.len(), 2);
+	for at in 0..2 {
+		assert!(
+			!sfs::exists(wal_path(&o, first + at)),
+			"an earlier segment is in a table and is removed"
+		);
+	}
 	assert_eq!(active_segment(&tree), first + 3, "recovery continues in a fresh segment");
 	for i in 0..5 {
 		put(&tree, &format!("new{i}"), &NEW).await;
@@ -748,7 +752,13 @@ async fn multi_segment_corruption_in_an_earlier_segment() {
 		assert!(get(&tree, &format!("a{i}")).is_none(), "a{i} follows the damage");
 	}
 	assert_keys(&tree, "b", 10, &GOOD, "recovery #1");
-	assert_eq!(strict_decode(&first).len(), 5, "the earlier segment keeps its valid prefix");
+	// The open removes the segments whose records it put in tables, the earlier one included:
+	// what it kept of its records is in a table, and the original is in the quarantine.
+	assert!(!sfs::exists(&first), "the earlier segment is in a table and is removed");
+	assert!(
+		!tree.core.inner.recovery_report.read().quarantined_files.is_empty(),
+		"the damaged segment was quarantined"
+	);
 	assert_eq!(
 		fs::read(wal_path(&tolerate, first_id + 1)).unwrap(),
 		second,
@@ -764,6 +774,65 @@ async fn multi_segment_corruption_in_an_earlier_segment() {
 	assert_keys(&tree, "b", 10, &GOOD, "recovery #2");
 	assert_keys(&tree, "new", 5, &NEW, "recovery #2");
 	crash(tree);
+}
+
+/// What the open removes of the log, in every mode that repairs it: the segments below the one
+/// that holds the records of the recovered memtable (their records are in tables), and the empty
+/// ones after it. A segment in the middle that is damaged loses what follows the damage, as it
+/// always did, and nothing else: the segments around it are replayed, and what the open removes
+/// loses nothing at the next open.
+#[test_log::test(tokio::test)]
+async fn the_open_removes_the_segments_that_hold_nothing_and_loses_no_record() {
+	for mode in [WalRecoveryMode::TolerateCorruptedWithRepair, WalRecoveryMode::SalvageValidPrefix]
+	{
+		let dir = TempDir::new().unwrap();
+		let o = opts(dir.path(), mode);
+
+		let tree = Tree::new(Arc::clone(&o)).unwrap();
+		let first = active_segment(&tree);
+		for i in 0..10 {
+			put(&tree, &format!("a{i}"), &GOOD).await;
+		}
+		rotate_wal(&tree);
+		let middle = wal_path(&o, first + 1);
+		for i in 0..10 {
+			put(&tree, &format!("b{i}"), &GOOD).await;
+		}
+		let record_len = file_len(&middle) / 10;
+		rotate_wal(&tree);
+		for i in 0..10 {
+			put(&tree, &format!("c{i}"), &GOOD).await;
+		}
+		// An empty segment follows the last one that holds records.
+		rotate_wal(&tree);
+		let empty = wal_path(&o, first + 3);
+		assert_eq!(file_len(&empty), 0);
+		crash(tree);
+		flip_byte_in_record(&middle, record_len, 5);
+
+		for open in 1..=2 {
+			let tree = Tree::new(Arc::clone(&o))
+				.unwrap_or_else(|e| panic!("{mode:?}, open {open}: the log opens: {e}"));
+			assert_keys(&tree, "a", 10, &GOOD, "a segment before the damage");
+			assert_keys(&tree, "b", 5, &GOOD, "the valid prefix of the damaged segment");
+			for i in 5..10 {
+				assert!(
+					get(&tree, &format!("b{i}")).is_none(),
+					"{mode:?}: b{i} follows the damage"
+				);
+			}
+			assert_keys(&tree, "c", 10, &GOOD, "a segment after the damage");
+			// What holds the records that no table has stays, and what holds none is gone.
+			let last_with_records = wal_path(&o, first + 2);
+			if open == 1 {
+				assert!(sfs::exists(&last_with_records), "{mode:?}: the segment of c stays");
+				assert!(!sfs::exists(wal_path(&o, first)), "{mode:?}: a is in a table");
+				assert!(!sfs::exists(&middle), "{mode:?}: b is in a table");
+				assert!(!sfs::exists(&empty), "{mode:?}: the empty segment is removed");
+			}
+			crash(tree);
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,9 +1132,10 @@ async fn test_zero_valid_segment_truncated_in_place_not_deleted() {
 	fs::write(&wal, [0x01, 0x00, 0x05]).unwrap();
 
 	let tree = Tree::new(Arc::clone(&o)).expect("Must recover 0-valid segment");
-	// The segment must still exist on disk with length 0
-	assert!(sfs::exists(&wal), "0-valid segment file must not be deleted");
-	assert_eq!(file_len(&wal), 0, "0-valid segment must be truncated to 0 length");
+	// The repair trims the 3 bytes and keeps what it trimmed in the quarantine. The segment then
+	// holds nothing, and the open removes it with the others that hold nothing.
+	assert_eq!(tree.core.inner.recovery_report.read().bytes_trimmed, 3);
+	assert!(!sfs::exists(&wal), "a segment that holds nothing is removed at the open");
 
 	// New commits must work
 	put(&tree, "key_after", &NEW).await;
