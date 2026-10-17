@@ -93,7 +93,15 @@ pub mod flusher_alloc_diet_tests;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod format_gate_tests;
 #[cfg(test)]
+pub mod fs_engine_crash_tests;
+#[cfg(test)]
+pub mod fs_engine_exhaustion_tests;
+#[cfg(test)]
+pub mod fs_engine_tests;
+#[cfg(test)]
 pub mod fs_error_tests;
+#[cfg(test)]
+pub mod fs_probe;
 #[cfg(all(test, not(target_arch = "wasm32")))]
 pub mod fs_std_tests;
 #[cfg(test)]

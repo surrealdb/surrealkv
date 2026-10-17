@@ -244,7 +244,7 @@ pub(crate) mod sync_tracker {
 /// would write an empty manifest over the real one. Until every one of them does, a pool is
 /// refused when the options are validated, so that no build, release or pull request in between
 /// ships a `with_file_system` that opens a database in the wrong place.
-pub(crate) const POOL_FS_PORT_COMPLETE: bool = false;
+pub(crate) const POOL_FS_PORT_COMPLETE: bool = true;
 
 /// What a file system is, which is what the engine tests when it must behave differently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -338,10 +338,6 @@ impl CreateOpts {
 
 /// A wait for a pool to hold at least `n` free files. `Send`, because it only awaits a
 /// notification.
-#[allow(
-	dead_code,
-	reason = "no call site of the engine uses it until the engine's own files go through the file system"
-)]
 pub(crate) type SpareWait = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'static>>;
 
 /// The directory-level seam. Synchronous and object-safe: the engine calls it under its own locks,
@@ -397,12 +393,18 @@ pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
 		self.try_exists(path).unwrap_or(false)
 	}
 
-	#[cfg_attr(not(test), allow(dead_code, reason = "no call site of the engine asks it yet"))]
+	#[cfg_attr(
+		not(test),
+		allow(dead_code, reason = "the engine asks `entry` or `exists`, and only tests ask this")
+	)]
 	fn is_dir(&self, path: &Path) -> bool {
 		matches!(self.entry(path), Ok(Some(EntryKind::Dir)))
 	}
 
-	#[cfg_attr(not(test), allow(dead_code, reason = "no call site of the engine asks it yet"))]
+	#[cfg_attr(
+		not(test),
+		allow(dead_code, reason = "the engine asks `entry` or `exists`, and only tests ask this")
+	)]
 	fn is_file(&self, path: &Path) -> bool {
 		matches!(self.entry(path), Ok(Some(EntryKind::File)))
 	}
@@ -526,18 +528,10 @@ pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
 
 	/// The lock of the database in `dir`, not yet acquired. `StdFs` is the existing `flock` of a
 	/// `LOCK` file; a pool registers the directory in its own set, so that one tree owns it.
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	fn lock_file(&self, dir: &Path) -> LockFile;
 
 	/// `None` when at least `n` files can be created now, which is always the case of `StdFs`.
 	/// Otherwise a future that completes when they can. Awaited only where no lock is held.
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	fn ensure_spares(&self, n: usize) -> Option<SpareWait> {
 		let _ = n;
 		None
@@ -546,10 +540,6 @@ pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
 	/// How many creations a pool has refused for want of a file, ever. A background task reads it
 	/// before and after a unit of work: if it advanced, a failure of that unit is not permanent,
 	/// whatever the failure looks like after the layers it went through.
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	fn pool_exhaustions(&self) -> u64 {
 		0
 	}
@@ -840,10 +830,6 @@ pub(crate) fn pool_full(max_files: usize) -> io::Error {
 }
 
 /// Whether `error` is the one that [`pool_full`] makes.
-#[allow(
-	dead_code,
-	reason = "no call site of the engine uses it until the engine's own files go through the file system"
-)]
 pub(crate) fn is_pool_full(error: &io::Error) -> bool {
 	error.get_ref().is_some_and(|inner| inner.is::<PoolFull>())
 }

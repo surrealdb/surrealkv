@@ -1,3 +1,7 @@
+// A guard of a `std` or `parking_lot` lock that lives across an `.await` blocks the one thread of a
+// browser's worker, or every task on a runtime that has few threads: the new awaits of the engine
+// (the waits for the spare files of a pool) hold none, and this keeps it so.
+#![deny(clippy::await_holding_lock)]
 pub mod autotune;
 mod batch;
 pub use byteslice::{self, ByteSlice};

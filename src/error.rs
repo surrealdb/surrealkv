@@ -169,6 +169,14 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 impl Error {
+	/// Whether this is an I/O error that a pool raised for holding as many files as it may: the
+	/// one that does not pass by waiting for a refill (see `vfs::PoolFull`). It is an `Error::Io`
+	/// and keeps that shape, so that the layers that read an I/O error as fatal go on doing so,
+	/// and the layers that turn an error into text must let it through to keep it typed.
+	pub(crate) fn is_pool_full(&self) -> bool {
+		matches!(self, Error::Io(e) if crate::vfs::is_pool_full(e))
+	}
+
 	/// Creates a WalCorruption error with the given segment ID, offset, and
 	/// message
 	pub fn wal_corruption(segment_id: usize, offset: usize, message: impl Into<String>) -> Self {
@@ -587,6 +595,60 @@ impl BackgroundErrorHandler {
 	/// the more severe one it did not replace.
 	pub fn set_error(&self, error: Error, reason: BackgroundErrorReason) -> ErrorSeverity {
 		let severity = Self::classify_error(&error, reason);
+		self.record_error(error, reason, severity)
+	}
+
+	/// The severity that a background failure has when a pool of files refused a creation during
+	/// the unit of work that failed (`exhausted`), whatever shape the failure has now. It is the
+	/// rewrap-proof second net of the typed `Error::FilePoolExhausted`: an error that went through
+	/// a layer that turned it into text is classified as the unrelated failure it looks like, and
+	/// would stop the database, where the pool is a moment away from having a file.
+	///
+	/// A failure is `SoftError` then, the work is run again, and nothing stops. Left as it is: what
+	/// is `Unrecoverable` (corruption, a commit group), what leaves the manifest on disk in doubt
+	/// (`ManifestWriteUncertain`, which is not a missing file whatever else happened in the unit),
+	/// and the error of a pool that is at its limit (`is_pool_full`), which waiting does not cure.
+	pub(crate) fn classify_after_exhaustion(
+		error: &Error,
+		reason: BackgroundErrorReason,
+		exhausted: bool,
+	) -> ErrorSeverity {
+		let severity = Self::classify_error(error, reason);
+		if exhausted
+			&& severity < ErrorSeverity::Unrecoverable
+			&& !matches!(error, Error::ManifestWriteUncertain(_))
+			&& !error.is_pool_full()
+		{
+			if severity > ErrorSeverity::SoftError {
+				tracing::debug!(
+					"A pool of files refused a creation during the unit that failed with {error}: \
+					 the failure is taken as one that passes, not as {severity:?}"
+				);
+			}
+			return ErrorSeverity::SoftError;
+		}
+		severity
+	}
+
+	/// [`set_error`](Self::set_error) for a unit of work during which a pool may have refused a
+	/// creation: see [`classify_after_exhaustion`](Self::classify_after_exhaustion).
+	pub(crate) fn set_error_after_exhaustion(
+		&self,
+		error: Error,
+		reason: BackgroundErrorReason,
+		exhausted: bool,
+	) -> ErrorSeverity {
+		let severity = Self::classify_after_exhaustion(&error, reason, exhausted);
+		self.record_error(error, reason, severity)
+	}
+
+	/// Records `error` as the error of `reason` with `severity`.
+	fn record_error(
+		&self,
+		error: Error,
+		reason: BackgroundErrorReason,
+		severity: ErrorSeverity,
+	) -> ErrorSeverity {
 		let bg_error = BackgroundError {
 			error: error.clone(),
 			severity,

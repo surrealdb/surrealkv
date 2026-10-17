@@ -760,10 +760,6 @@ pub(crate) struct PoolShared<R: Raw> {
 	/// The number of times a refill has failed for good, and the last such error.
 	refill_error: Mutex<(u64, Option<(io::ErrorKind, String)>)>,
 	clean_failures: AtomicU64,
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	locks: Arc<LockRegistry>,
 	lock_handle: Mutex<Option<R::File>>,
 	report: Mutex<Option<MountReport>>,
@@ -1246,10 +1242,6 @@ impl<R: Raw> PoolShared<R> {
 	}
 
 	/// How many times a refill has failed for good so far.
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	fn refill_error_count(&self) -> u64 {
 		self.refill_error.lock().0
 	}
@@ -1257,10 +1249,6 @@ impl<R: Raw> PoolShared<R> {
 	/// The error of a refill that failed for good after `seen` such failures were counted: every
 	/// wait that began before it hears of it, and a wait that begins later waits for the next
 	/// try, which it asks for.
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	fn refill_error_since(&self, seen: u64) -> Option<io::Error> {
 		let error = self.refill_error.lock();
 		if error.0 == seen {
@@ -1407,10 +1395,6 @@ async fn background_refill<R: Raw>(weak: Weak<PoolShared<R>>, refill: Arc<Notify
 /// The wait of `Fs::ensure_spares`: until `n` slots can be claimed, the pool is closed, or the
 /// refill fails for good. A wait and not a reservation: what it says is true at the poll that
 /// returns, and the caller uses it before it awaits anything else.
-#[allow(
-	dead_code,
-	reason = "no call site of the engine uses it until the engine's own files go through the file system"
-)]
 async fn wait_for_spares<R: Raw>(shared: Arc<PoolShared<R>>, n: usize) -> io::Result<()> {
 	let failures_before = shared.refill_error_count();
 	loop {
@@ -1687,10 +1671,6 @@ impl<R: Raw> PoolFs<R> {
 	}
 
 	/// The spares that a claim of the `Opportunistic` class leaves, raised to `n` if it is lower.
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	pub(crate) fn set_reserve(&self, n: usize) {
 		self.shared.reserve.fetch_max(n, Ordering::AcqRel);
 	}
@@ -2312,21 +2292,9 @@ impl<R: Raw> FsFile for PoolFile<R> {
 /// The operations that a pool has and no other file system does, reached through `Fs::pool`.
 pub(crate) trait PoolControl: Send + Sync {
 	/// Cleans up to `budget` dead slots; returns how many.
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	fn maintain(&self, budget: usize) -> usize;
 	/// Raises the spares that an `Opportunistic` creation leaves.
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	fn set_reserve(&self, n: usize);
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	fn stats(&self) -> PoolStats;
 	fn mount_report(&self) -> Option<MountReport>;
 	/// Flushes what has to be flushed, cleans, and releases every handle. Later reads and writes

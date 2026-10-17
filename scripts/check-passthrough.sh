@@ -39,8 +39,8 @@ set -eu
 TABLE='src/error.rs|ENFORCED|conversions
 src/storage/mod.rs|ENFORCED|log_error
 src/wal/mod.rs|ENFORCED|wal::Error (no arm of the shape counted here; its io::Error downcast and the severity arm in error.rs are pinned by src/test/fs_error_tests.rs, not by this script)
-src/lsm.rs|PENDING|M8: memtable flush, rotation, manifest update, shutdown flush
-src/ring/pipeline.rs|PENDING|M8: the group failure, drop of an unapplied group, heal
+src/lsm.rs|ENFORCED|memtable flush, rotation (rotation_error), manifest update, shutdown flush
+src/ring/pipeline.rs|ENFORCED|the group failure, drop of an unapplied group, heal
 src/levels/mod.rs|ENFORCED|check_manifest_before_open_in, manifest_write_error
 src/vlog.rs|ENFORCED|the four resolve_* wrappers (reads: kept for the same shape)
 src/checkpoint.rs|EXCLUDED|checkpoint and restore are refused on a pool
@@ -133,6 +133,11 @@ expect() {
 self_test() {
 	failures=0
 
+	# The fixtures treat src/lsm.rs as a file that is still pending, which none of the real table
+	# is any more: the table of the self-test says so, and the real one is put back after it.
+	real_table=$TABLE
+	TABLE=$(printf '%s\n' "$TABLE" | sed 's#^src/lsm.rs|ENFORCED|#src/lsm.rs|PENDING|#')
+
 	# An arm of each shape that the engine has, with and without its pool arm.
 	expect fail 0 '	Error::Encryption(_) => e,'
 	expect pass 0 '	Error::Encryption(_) => e,
@@ -190,6 +195,7 @@ self_test() {
 	fi
 	rm -rf "$fixture"
 
+	TABLE=$real_table
 	if [ "$failures" -ne 0 ]; then
 		echo "self-test: $failures failure(s)" >&2
 		return 1

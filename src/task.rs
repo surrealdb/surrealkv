@@ -10,6 +10,7 @@ use crate::compaction::CompactionStrategy;
 use crate::error::{BackgroundErrorHandler, BackgroundErrorReason, ErrorSeverity};
 use crate::lsm::CompactionOperations;
 use crate::stall::WriteStallController;
+use crate::vfs::{FsKind, SpareWait};
 use crate::{rt, Error, Options};
 
 /// The wait before a failed memtable flush is run again; it doubles with every failure. The
@@ -42,6 +43,38 @@ pub(crate) struct TaskManager {
 
 	/// Task handles for cleanup
 	task_handles: Mutex<Option<Vec<rt::JoinHandle<()>>>>,
+
+	/// Told when the tasks are to stop, so that one that waits for the spare files of a pool is
+	/// not waited for: `stop` would otherwise wait for a refill that may never come.
+	stop_notify: Arc<Notify>,
+}
+
+/// How a wait for the spare files of a pool ended, for a task.
+enum Spares {
+	/// The files are there.
+	Ready,
+	/// The task was told to stop while it waited.
+	Stopped,
+	/// The pool could not make them: it is closed, at its limit, or its refill failed for good.
+	Failed(Error),
+}
+
+/// Waits for `wait`, unless the tasks are told to stop first. Registered for the stop signal
+/// before the flag is read, so a stop that comes between the two is not missed.
+async fn await_spares(wait: SpareWait, stop_flag: &AtomicBool, stop_notify: &Notify) -> Spares {
+	let stopped = stop_notify.notified();
+	tokio::pin!(stopped);
+	stopped.as_mut().enable();
+	if stop_flag.load(Ordering::SeqCst) {
+		return Spares::Stopped;
+	}
+	tokio::select! {
+		done = wait => match done {
+			Ok(()) => Spares::Ready,
+			Err(e) => Spares::Failed(Error::from(e)),
+		},
+		() = &mut stopped => Spares::Stopped,
+	}
 }
 
 impl fmt::Debug for TaskManager {
@@ -65,6 +98,10 @@ impl TaskManager {
 		let memtable_running = Arc::new(AtomicBool::new(false));
 		let level_running = Arc::new(AtomicBool::new(false));
 		let task_handles = Mutex::new(Some(Vec::new()));
+		let stop_notify = Arc::new(Notify::new());
+		// Everything that only a pool needs is done behind this, so that the tasks of a database on
+		// `std` do exactly what they did.
+		let pooled = opts.fs.kind() == FsKind::Pool;
 
 		// Spawn memtable compaction task
 		{
@@ -74,6 +111,7 @@ impl TaskManager {
 			let running = Arc::clone(&memtable_running);
 			let level_notify = Arc::clone(&level_notify);
 			let write_stall = Arc::clone(&write_stall);
+			let stop_notify = Arc::clone(&stop_notify);
 
 			let handle = rt::spawn(async move {
 				let error_handler = core.error_handler();
@@ -92,13 +130,42 @@ impl TaskManager {
 					let mut flush_count = 0;
 					let mut retry_wait = COMPACTION_RETRY_MIN;
 					loop {
-						match core.compact_memtable() {
+						// A pool has a fixed number of files: the flush waits until it has the ones
+						// it creates, and a failure of the unit during which the pool refused a
+						// creation is not taken for a permanent one (see
+						// `set_error_after_exhaustion`).
+						let exhaustions = if pooled {
+							core.pool_exhaustions()
+						} else {
+							0
+						};
+						let spares = match pooled.then(|| core.spares_for_flush()).flatten() {
+							Some(wait) if core.has_pending_immutables() => {
+								await_spares(wait, &stop_flag, &stop_notify).await
+							}
+							_ => Spares::Ready,
+						};
+						let result = match spares {
+							Spares::Ready => core.compact_memtable(),
+							Spares::Stopped => {
+								running.store(false, Ordering::SeqCst);
+								break 'task;
+							}
+							Spares::Failed(e) => Err(e),
+						};
+						match result {
 							Ok(()) => {
 								flush_count += 1;
 								retry_wait = FLUSH_RETRY_MIN;
 								// A flush that succeeds ends the failure of the one before it
 								error_handler.recover(BackgroundErrorReason::MemtablaFlush);
 								write_stall.signal_work_done();
+								if pooled {
+									core.after_background_unit();
+								}
+								// Gives the event loop of a browser its turn between two flushes: a
+								// worker has no other thread to serve what is waiting.
+								rt::relax().await;
 								// Check if there are more immutables to flush
 								if !core.has_pending_immutables() {
 									break;
@@ -106,8 +173,11 @@ impl TaskManager {
 							}
 							Err(e) => {
 								tracing::error!("Memtable compaction task error: {e:?}");
-								let severity = error_handler
-									.set_error(e.clone(), BackgroundErrorReason::MemtablaFlush);
+								let severity = error_handler.set_error_after_exhaustion(
+									e.clone(),
+									BackgroundErrorReason::MemtablaFlush,
+									pooled && core.exhausted_since(exhaustions),
+								);
 								// A database a commit group stopped refuses every flush for good,
 								// so there is nothing to retry.
 								if severity >= ErrorSeverity::FatalError
@@ -176,6 +246,7 @@ impl TaskManager {
 			let notify = Arc::clone(&level_notify);
 			let running = Arc::clone(&level_running);
 			let write_stall = Arc::clone(&write_stall);
+			let stop_notify = Arc::clone(&stop_notify);
 
 			let handle = rt::spawn(async move {
 				'task: loop {
@@ -195,7 +266,31 @@ impl TaskManager {
 					let error_handler = core.error_handler();
 					let mut retry_wait = COMPACTION_RETRY_MIN;
 					loop {
-						match core.compact(Arc::clone(&strategy)) {
+						// See the flush task. The outputs of a compaction are created only while
+						// the pool has more files than the commit path
+						// keeps back, so the wait is for those and the ones
+						// that the compaction itself needs.
+						let exhaustions = if pooled {
+							core.pool_exhaustions()
+						} else {
+							0
+						};
+						let spares = match pooled.then(|| core.spares_for_compaction()).flatten() {
+							Some(wait) => await_spares(wait, &stop_flag, &stop_notify).await,
+							None => Spares::Ready,
+						};
+						let result = match spares {
+							Spares::Ready => core.compact(Arc::clone(&strategy)),
+							Spares::Stopped => {
+								running.store(false, Ordering::SeqCst);
+								break 'task;
+							}
+							Spares::Failed(e) => Err(e),
+						};
+						if pooled {
+							core.compaction_ran(&result);
+						}
+						match result {
 							Ok(()) => {
 								tracing::debug!("Level compaction completed successfully");
 								// A compaction that works ends the wait of the one before it for a
@@ -203,12 +298,19 @@ impl TaskManager {
 								error_handler.recover_soft(BackgroundErrorReason::Compaction);
 								error_handler.recover_soft(BackgroundErrorReason::ManifestWrite);
 								write_stall.signal_work_done();
+								if pooled {
+									core.after_background_unit();
+								}
+								rt::relax().await;
 								break;
 							}
 							Err(e) => {
 								tracing::error!("Level compaction task error: {e:?}");
-								let severity = error_handler
-									.set_error(e.clone(), BackgroundErrorReason::Compaction);
+								let severity = error_handler.set_error_after_exhaustion(
+									e.clone(),
+									BackgroundErrorReason::Compaction,
+									pooled && core.exhausted_since(exhaustions),
+								);
 								if !BackgroundErrorHandler::retries(
 									&e,
 									severity,
@@ -249,6 +351,7 @@ impl TaskManager {
 			memtable_running,
 			level_running,
 			task_handles,
+			stop_notify,
 		}
 	}
 
@@ -269,9 +372,9 @@ impl TaskManager {
 	/// Ends the background tasks without waiting for them, the way a crash does, so that a tree
 	/// that is abandoned does not stay alive until the runtime is dropped. Nothing outside the
 	/// tests calls this yet: `Tree::abandon` will.
-	#[allow(dead_code)]
 	pub(crate) fn abort(&self) {
 		self.stop_flag.store(true, Ordering::SeqCst);
+		self.stop_notify.notify_waiters();
 		if let Some(handles) = self.task_handles.lock().unwrap().take() {
 			for handle in handles {
 				handle.abort();
@@ -283,9 +386,11 @@ impl TaskManager {
 		// Set the stop flag to prevent new operations from starting
 		self.stop_flag.store(true, Ordering::SeqCst);
 
-		// Wake up any waiting tasks so they can check the stop flag and exit
+		// Wake up any waiting tasks so they can check the stop flag and exit, and the ones that
+		// wait for the spare files of a pool, which may never come.
 		self.memtable_notify.notify_one();
 		self.level_notify.notify_one();
+		self.stop_notify.notify_waiters();
 
 		// Wait for any in-progress compactions to complete (no timeout - wait
 		// indefinitely)

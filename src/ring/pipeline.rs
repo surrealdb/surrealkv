@@ -199,6 +199,51 @@ pub(crate) const fn group_est_budget(max_memtable_size: usize) -> u64 {
 	}
 }
 
+/// The most queued memtables that `group_need_of` counts.
+const MAX_QUEUE_IN_NEED: usize = 32;
+
+/// The spare files that one commit group may create, as an upper bound that is derived from the
+/// options and never measured, and that only a pool uses.
+///
+/// A group takes a bounded number of files, because the flusher bounds it (see
+/// `group_est_budget`): its memtable estimates add up to at most `multiple` fresh memtables, so it
+/// rotates the memtable (one new log segment) at most `multiple` times while it is applied and
+/// once before, and it logs a batch at most twice. Of the files below, `rotations` is that count.
+/// - the log segments of the rotations;
+/// - a batch bigger than a memtable goes to a table of its own, which seals the log (one segment)
+///   and flushes the whole queue first, `stall_threshold` memtables and the ones this group
+///   rotated, each a table and a manifest, and then writes its own table and a manifest;
+/// - a failed log segment is replaced, and the memtables of a group that failed are flushed and
+///   `log_number` moved past them, before the group logs anything (the heal): the same as the
+///   rotation and the queue above.
+///
+/// Every table is counted with its manifest, which is more than it costs once the old manifest is
+/// clean, so that the sum stays above the files that one window can have open at the same time. A
+/// commit group that finds fewer than this is a failure that stops the database, so the
+/// strict-mode tests with a tiny memtable are the check of this number, and the value log's rolls
+/// (`vlog_term`) are added per group, from its bytes.
+pub(crate) fn group_need_of(opts: &crate::Options) -> usize {
+	let room = crate::memtable::fresh_room(opts.max_memtable_size).max(1);
+	let budget = group_est_budget(opts.max_memtable_size);
+	let multiple = usize::try_from(budget / room).unwrap_or(usize::MAX).clamp(1, 16);
+	let rotations = multiple + 1;
+	// A stall threshold that is far beyond what a pool can hold is clamped: no number of files
+	// answers it, and the pool's own limit (`PoolConfig::max_files`) is what bounds the queue then.
+	let queued = opts.memtable_stall_threshold.min(MAX_QUEUE_IN_NEED) + rotations;
+	6 + 2 * queued + rotations + usize::from(opts.enable_vlog)
+}
+
+/// The files that a group of `group_bytes` bytes of batches rolls the value log into, which is one
+/// more file for every `vlog_max_file_size` bytes of values that it holds, and the one that is
+/// open now may be full.
+pub(crate) fn vlog_term(opts: &crate::Options, group_bytes: usize) -> usize {
+	if !opts.enable_vlog {
+		return 0;
+	}
+	let file = usize::try_from(opts.vlog_max_file_size).unwrap_or(usize::MAX).max(1);
+	group_bytes / file
+}
+
 /// How much more memtable than one fresh arena a group may fill, per this many bytes of arena.
 const GROUP_EST_STEP: u64 = 16 << 20;
 const GROUP_EST_MAX_MULTIPLE: u64 = 6;
@@ -270,6 +315,13 @@ pub(super) const ADMISSION_PERMITS: u32 = (DEFAULT_COMMIT_RING_CAPACITY / 2) as 
 /// in a row without a batch applied in between: the bound of `group_est_budget` is what makes the
 /// rest of a group fit the memtable it rotated to.
 pub(crate) const UNFENCED_STALE_ROUNDS: u32 = 2;
+
+/// How long a group waits for the files of a pool once the pipeline is shut down.
+const SHUTDOWN_SPARES_WAIT: Duration = if cfg!(test) {
+	Duration::from_millis(300)
+} else {
+	Duration::from_secs(5)
+};
 
 /// How many groups the flusher drains between two calls to `retire`.
 pub(crate) const RETIRE_EVERY_GROUPS: u32 = 16;
@@ -582,6 +634,11 @@ impl CommitPipeline {
 		let notify_flusher = Arc::new(Notify::new());
 		let seq = start_seq.max(1);
 		let log_store = Arc::new(AffinityLogStore::new(Arc::clone(&inner.wal.inner)));
+		if inner.pooled {
+			// The files one group may create, which the flusher waits for before a group and the
+			// pool keeps back from the outputs of a compaction.
+			inner.set_group_need(group_need_of(&inner.opts));
+		}
 
 		Self {
 			ring,
@@ -1101,7 +1158,19 @@ impl CommitPipeline {
 			busy_steps = 0;
 
 			if !scratch.group.is_empty() {
-				self.flush_entries(&mut scratch).await;
+				// A pool has a fixed number of files to create from: the group waits until it has
+				// as many as the group may need, before it logs or applies anything of it. Nothing
+				// is awaited between this and the end of the group that is not a file system call
+				// that answers at once, so what was found here is there when the group needs it.
+				let spares = if self.inner.pooled {
+					self.wait_for_spares(group_bytes).await
+				} else {
+					Ok(())
+				};
+				match spares {
+					Ok(()) => self.flush_entries(&mut scratch).await,
+					Err(error) => self.fail_unstarted_group(&mut scratch, &error),
+				}
 				scratch.recycle();
 			}
 			// Every drained entry is now complete, so the completed prefix
@@ -1127,6 +1196,45 @@ impl CommitPipeline {
 				retired_pending =
 					self.free_retired(&mut scratch.retired, retired_slots_per_step(entries));
 			}
+		}
+	}
+
+	/// Waits until the pool has the files that a group of `group_bytes` bytes may create (see
+	/// `group_need_of`). Nothing of the group is logged or applied yet, so a wait that fails fails
+	/// the group cleanly: see `fail_unstarted_group`.
+	///
+	/// Once the pipeline is shut down the wait is bounded: a refill that never answers must not
+	/// keep `close` from ending.
+	async fn wait_for_spares(&self, group_bytes: usize) -> Result<()> {
+		let need = self.inner.group_need.load(Ordering::Acquire)
+			+ vlog_term(&self.inner.opts, group_bytes);
+		let Some(mut wait) = self.inner.opts.fs.ensure_spares(need) else {
+			return Ok(());
+		};
+		while !self.shutdown.load(Ordering::Acquire) {
+			tokio::select! {
+				done = &mut wait => return done.map_err(Error::from),
+				() = self.notify_flusher.notified() => {}
+			}
+		}
+		match rt::timeout(SHUTDOWN_SPARES_WAIT, wait).await {
+			Ok(done) => done.map_err(Error::from),
+			Err(_) => Err(Error::Other(
+				"the pool did not make the files for the last commits while the tree was closing"
+					.to_string(),
+			)),
+		}
+	}
+
+	/// Fails every entry of the group that was gathered and has not been started, with `error` as
+	/// it is: the committers hear whether to try again (`Error::FilePoolExhausted`) or not. No
+	/// sequence number was taken and nothing was logged, so there is nothing to undo, and the
+	/// database does not stop.
+	fn fail_unstarted_group(&self, scratch: &mut FlushScratch, error: &Error) {
+		tracing::warn!("A commit group was failed before it began: {error}");
+		for (entry, payload) in scratch.group.drain(..) {
+			entry.abort();
+			let _ = payload.complete_tx.send(Err(error.clone()));
 		}
 	}
 
@@ -1256,7 +1364,8 @@ impl CommitPipeline {
 				// A key that could not be had, or a seal that was refused, is told to every
 				// committer of the group as it is: whether to try the commit again depends on
 				// which.
-				Err(e @ Error::Encryption(_)) => Err(e.clone()),
+				Err(e @ (Error::Encryption(_) | Error::FilePoolExhausted)) => Err(e.clone()),
+				Err(e) if e.is_pool_full() => Err(e.clone()),
 				Err(e) => Err(Error::Io(
 					std::io::Error::other(format!("Group commit failed: {e}")).into(),
 				)),
@@ -1705,7 +1814,8 @@ impl CommitPipeline {
 			}
 			return Err(match e {
 				// Whether the group may be tried again depends on the key error.
-				Error::Encryption(_) | Error::PipelineStall => e,
+				Error::Encryption(_) | Error::FilePoolExhausted | Error::PipelineStall => e,
+				e if e.is_pool_full() => e,
 				e => Error::Other(format!(
 					"Failed to drop the records of a failed commit group from the WAL: {e}"
 				)),
@@ -1755,7 +1865,8 @@ impl CommitPipeline {
 				}
 				return Err(match e {
 					// Whether the group may be tried again depends on the key error.
-					Error::Encryption(_) => e,
+					Error::Encryption(_) | Error::FilePoolExhausted => e,
+					e if e.is_pool_full() => e,
 					e => Error::Other(format!(
 						"Failed to flush the memtables of the failed WAL segment: {e}"
 					)),

@@ -340,15 +340,72 @@ async fn building_without_a_mounted_file_system_is_a_typed_error() {
 		}
 	}
 
-	// The in-memory file system is a pool, and a pool is refused until the engine is ported to it.
-	let memory =
-		TreeBuilder::new().with_file_system(crate::FileSystem::memory()).build_async().await;
-	match memory {
-		Err(Error::InvalidArgument(e)) => assert!(e.contains("pooled file system"), "{e}"),
-		other => panic!("{:?}", other.map(|_| ())),
+	// The in-memory file system is a pool, and the engine runs over it in the worker: a database is
+	// opened, committed to, closed and opened again, on the only thread there is.
+	let memory = crate::FileSystem::memory();
+	let tree = TreeBuilder::new()
+		.with_path("/surrealkv-wasm-memory".into())
+		.with_file_system(memory.clone())
+		.build_async()
+		.await
+		.expect("the engine builds over the memory file system");
+	for i in 0..20u32 {
+		let mut txn = tree.begin().unwrap();
+		txn.set(i.to_be_bytes().to_vec(), b"value".to_vec()).unwrap();
+		txn.commit().await.unwrap();
 	}
+	tree.close().await.unwrap();
+	drop(tree);
+	let tree = TreeBuilder::new()
+		.with_path("/surrealkv-wasm-memory".into())
+		.with_file_system(memory)
+		.build_async()
+		.await
+		.expect("and opens again");
+	let txn = tree.begin().unwrap();
+	for i in 0..20u32 {
+		assert_eq!(txn.get(i.to_be_bytes().to_vec()).unwrap(), Some(b"value".to_vec()));
+	}
+	drop(txn);
+	tree.close().await.unwrap();
 	// Still alive.
 	assert!(rt::Instant::now().elapsed() < Duration::from_secs(60));
+}
+
+/// Dropping the last `Tree` closes the database in the background, although a transaction that
+/// outlives it holds the core: the lock is given back, and the database opens again in the worker.
+#[wasm_bindgen_test]
+async fn the_last_tree_dropped_closes_the_database_while_a_transaction_lives() {
+	let memory = crate::FileSystem::memory();
+	let build = || {
+		TreeBuilder::new()
+			.with_path("/surrealkv-wasm-drop".into())
+			.with_file_system(memory.clone())
+			.build_async()
+	};
+	let tree = build().await.expect("the database opens");
+	let clone = tree.clone();
+	let mut txn = tree.begin().unwrap();
+	txn.set(b"k".to_vec(), b"v".to_vec()).unwrap();
+	// One tree is left: nothing closes.
+	drop(tree);
+	rt::sleep(Duration::from_millis(50)).await;
+	assert!(build().await.is_err(), "the database is still open");
+	// The last one goes, with the transaction alive: the close runs in the background.
+	drop(clone);
+	let mut reopened = None;
+	for _ in 0..200 {
+		match build().await {
+			Ok(tree) => {
+				reopened = Some(tree);
+				break;
+			}
+			Err(_) => rt::sleep(Duration::from_millis(10)).await,
+		}
+	}
+	let reopened = reopened.expect("the lock was given back by the close of the last tree");
+	assert!(txn.commit().await.is_err(), "the transaction that outlived it finds it shut");
+	reopened.close().await.unwrap();
 }
 
 /// The lock that a pool hands out gives its entry back when it is dropped: on this target too,

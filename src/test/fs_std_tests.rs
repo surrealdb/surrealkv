@@ -245,8 +245,8 @@ async fn building_over_an_unavailable_file_system_fails_before_it_creates_anythi
 /// The sync entry points are refused too: the options validate (a default browser build has
 /// nothing mounted and its options are still valid), and it is the build that says there is no
 /// file system, before the first `exists` can answer `false`.
-#[test]
-fn the_sync_build_over_nothing_is_refused_and_creates_nothing() {
+#[tokio::test]
+async fn the_sync_build_over_nothing_is_refused_and_creates_nothing() {
 	let dir = TempDir::new().unwrap();
 	let path = dir.path().join("db");
 	let nothing = || FileSystem(Arc::new(UnavailableFs::no_file_system()));
@@ -269,34 +269,29 @@ fn the_sync_build_over_nothing_is_refused_and_creates_nothing() {
 			.build_with_options()
 			.map(|_| ()),
 	);
-	// `FileSystem::memory()` is a pool, and a pool is refused until the engine is ported to it: it
-	// must not fall through to the files of the operating system.
-	let built = TreeBuilder::new()
+	// `FileSystem::memory()` is a pool, and the engine is ported to it: the database is built in
+	// the pool, and does not fall through to the files of the operating system.
+	let tree = TreeBuilder::new()
 		.with_path(path.clone())
 		.with_file_system(FileSystem::memory())
 		.build()
-		.map(|_| ());
-	match built {
-		Err(Error::InvalidArgument(e)) => assert!(e.contains("pooled file system"), "{e}"),
-		other => panic!("{other:?}"),
-	}
-	assert!(!path.exists(), "nothing was created");
+		.expect("the engine builds over the memory file system");
+	assert!(!path.exists(), "nothing was created on the disk");
+	tree.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn the_memory_file_system_is_refused_until_the_engine_is_ported_to_it() {
+async fn the_memory_file_system_builds_a_database_and_leaves_the_disk_alone() {
 	let dir = TempDir::new().unwrap();
 	let path = dir.path().join("db");
-	let built = TreeBuilder::new()
+	let tree = TreeBuilder::new()
 		.with_path(path.clone())
 		.with_file_system(FileSystem::memory())
 		.build_async()
-		.await;
-	match built {
-		Err(Error::InvalidArgument(e)) => assert!(e.contains("pooled file system"), "{e}"),
-		other => panic!("{:?}", other.map(|_| ())),
-	}
-	assert!(!path.exists());
+		.await
+		.expect("the engine is ported to the memory file system");
+	assert!(!path.exists(), "the database is in the pool, and nothing was created on the disk");
+	tree.close().await.unwrap();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -336,22 +331,12 @@ async fn with_file_system_sets_the_file_system_and_the_log_takes_it_from_the_opt
 }
 
 #[tokio::test]
-async fn a_pool_is_refused_until_the_engine_is_ported_to_it() {
-	let complete = std::hint::black_box(vfs::POOL_FS_PORT_COMPLETE);
-	assert!(!complete, "this test goes when the constant is set");
-	let dir = TempDir::new().unwrap();
-	let path = dir.path().join("db");
-	let pool = || FileSystem(Arc::new(Provided(FsKind::Pool)));
-	let options = Options::default().with_path(path.clone()).with_file_system(pool());
-	assert!(matches!(options.validate(), Err(Error::InvalidArgument(_))));
-	let built = TreeBuilder::with_options(options).build_async().await;
-	assert!(matches!(built, Err(Error::InvalidArgument(_))), "{:?}", built.map(|_| ()));
-	let built = TreeBuilder::new().with_path(path.clone()).with_file_system(pool()).build();
-	assert!(matches!(built, Err(Error::InvalidArgument(_))), "{:?}", built.map(|_| ()));
-	assert!(!path.exists(), "nothing was created");
-	// The other kinds are valid options: an unavailable file system is refused by the build,
-	// where it says why.
-	for kind in [FsKind::Std, FsKind::Unavailable] {
+async fn a_pool_is_a_valid_file_system_for_the_options() {
+	// The refusal that kept a half-ported engine from opening a database in the wrong place is
+	// gone, with the constant that held it: every kind is valid, and the engine decides from the
+	// file system what it can do.
+	assert!(std::hint::black_box(vfs::POOL_FS_PORT_COMPLETE));
+	for kind in [FsKind::Std, FsKind::Pool, FsKind::Unavailable] {
 		let fs = FileSystem(Arc::new(Provided(kind)));
 		Options::default().with_file_system(fs).validate().unwrap();
 	}

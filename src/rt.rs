@@ -105,10 +105,6 @@ mod native {
 	/// Lets the host's event loop run. A thread of its own has nothing to give way to, so this is
 	/// ready at once.
 	#[inline(always)]
-	#[allow(
-		dead_code,
-		reason = "no call site of the engine uses it until the engine's own files go through the file system"
-	)]
 	pub(crate) fn relax() -> std::future::Ready<()> {
 		std::future::ready(())
 	}
@@ -369,20 +365,12 @@ mod browser {
 	}
 
 	/// A task that waits for the macrotask that [`relax`] asked for.
-	#[allow(
-		dead_code,
-		reason = "nothing calls `relax` until the commit pipeline goes through the file system"
-	)]
 	struct Waiting {
 		done: Cell<bool>,
 		waker: RefCell<Option<Waker>>,
 	}
 
 	impl Waiting {
-		#[allow(
-			dead_code,
-			reason = "nothing calls `relax` until the commit pipeline goes through the file system"
-		)]
 		fn finish(&self) {
 			self.done.set(true);
 			if let Some(waker) = self.waker.borrow_mut().take() {
@@ -393,10 +381,6 @@ mod browser {
 
 	/// The one `MessageChannel` that every [`relax`] posts to. Each message releases the oldest
 	/// task that is waiting, so `n` calls post `n` messages and release `n` tasks, in order.
-	#[allow(
-		dead_code,
-		reason = "nothing calls `relax` until the commit pipeline goes through the file system"
-	)]
 	struct Relaxer {
 		port: JsValue,
 		post_message: Function,
@@ -407,10 +391,6 @@ mod browser {
 
 	impl Relaxer {
 		/// Opens the channel, or says that the global scope has no `MessageChannel`.
-		#[allow(
-			dead_code,
-			reason = "nothing calls `relax` until the commit pipeline goes through the file system"
-		)]
 		fn open() -> Option<Self> {
 			let global = js_sys::global();
 			let constructor: Function = Reflect::get(&global, &JsValue::from_str("MessageChannel"))
@@ -449,10 +429,6 @@ mod browser {
 			})
 		}
 
-		#[allow(
-			dead_code,
-			reason = "nothing calls `relax` until the commit pipeline goes through the file system"
-		)]
 		fn post(&self, waiting: Rc<Waiting>) {
 			self.waiting.borrow_mut().push_back(waiting);
 			let _ = self.post_message.call1(&self.port, &JsValue::from_f64(0.0));
@@ -464,20 +440,12 @@ mod browser {
 	}
 
 	/// Where there is no `MessageChannel`: a timer, which is slow to chain but never traps.
-	#[allow(
-		dead_code,
-		reason = "nothing calls `relax` until the commit pipeline goes through the file system"
-	)]
 	fn relax_with_a_timer(waiting: Rc<Waiting>) {
 		let on_timer = Closure::once_into_js(move || waiting.finish());
 		set_timeout(on_timer.unchecked_ref(), 0);
 	}
 
 	/// The future of [`relax`].
-	#[allow(
-		dead_code,
-		reason = "nothing calls `relax` until the commit pipeline goes through the file system"
-	)]
 	pub(crate) struct Relax {
 		waiting: Rc<Waiting>,
 		posted: bool,
@@ -516,10 +484,6 @@ mod browser {
 	/// waiting are delivered before this returns, which a loop that yields with [`yield_now`]
 	/// alone never lets happen. A macrotask yield over one persistent `MessageChannel` port, at
 	/// about 4 microseconds a yield (measured in Chrome 155).
-	#[allow(
-		dead_code,
-		reason = "nothing calls `relax` until the commit pipeline goes through the file system"
-	)]
 	pub(crate) fn relax() -> Relax {
 		Relax {
 			waiting: Rc::new(Waiting {
