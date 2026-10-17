@@ -88,6 +88,18 @@ pub use crate::error::{
 	WriteStallReason,
 };
 pub use crate::lsm::{Tree, TreeBuilder};
+// The move of a legacy IndexedDB database into a database of the origin private file system,
+// which needs both of them, so it exists in a browser only. Its tests run everywhere, in this
+// crate.
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+pub use crate::migrate::indexeddb::{migrate_from_indexeddb, IndexedDbMigration};
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[doc(hidden)]
+pub use crate::migrate::indexeddb::{
+	migrate_from_indexeddb_with_tuning,
+	ImportReport,
+	ImportTuning,
+};
 pub use crate::stall::WriteStallInfo;
 use crate::tde::EncryptionContext;
 #[doc(hidden)]

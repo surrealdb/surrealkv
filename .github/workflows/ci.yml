@@ -345,6 +345,8 @@ jobs:
             name=$(basename "$test" .rs)
             case "$name" in
               opfs_engine_test) limit=600 ;;
+              # Copies a legacy database in many ways, and drops the call at every moment of one.
+              opfs_migrate_test) limit=300 ;;
               *) limit=120 ;;
             esac
             run_chrome "$name" "$limit" --test "$name"
@@ -357,9 +359,11 @@ jobs:
           # the raw OPFS backend (src/rt.rs, src/wasm_tests.rs, src/vfs/opfs_raw_tests.rs), which
           # are not reachable from tests/. This links the whole engine, zstd's C code included.
           run_chrome "unit tests (--lib)" 300 -- --lib
-          # The IndexedDB reader runs on the page, with the runner's own defaults.
+          # The IndexedDB reader runs on the page. Its tests drop a read at every moment of it, one
+          # database each, and the runner's default of 20 seconds for a whole binary is short for them
+          # on a slow machine.
           echo "::group::Running surrealkv-compat-indxdb"
-          if ! wasm-pack test --headless --chrome crates/surrealkv-compat-indxdb; then
+          if ! WASM_BINDGEN_TEST_TIMEOUT=120 wasm-pack test --headless --chrome crates/surrealkv-compat-indxdb; then
             failed="$failed surrealkv-compat-indxdb"
           fi
           echo "::endgroup::"

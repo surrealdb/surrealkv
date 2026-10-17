@@ -117,6 +117,8 @@ pub mod group_fail_stop_tests;
 #[cfg(test)]
 pub mod index_block_tests;
 #[cfg(test)]
+pub mod indexeddb_migration_tests;
+#[cfg(test)]
 pub mod inspect_encryption_tests;
 #[cfg(test)]
 pub mod iterator_semantics_tests;

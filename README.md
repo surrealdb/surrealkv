@@ -115,11 +115,11 @@ Resting and peak memory are the lowest and highest process memory sampled across
 - **Async Commit Pipeline**: Concurrent commit pipeline built on lock-free ring buffers and optimistic concurrency control (OCC), awaited asynchronously. Point reads and iteration are synchronous; `get_async` is an opt-in asynchronous point read.
 - **Snapshot Isolation**: Multi-version concurrency control with non-blocking concurrent reads and isolated read transactions.
 - **Versioned Queries**: Opt in with `with_versioning(true, retention_ns)`. Every write is stamped with its timestamp (`set_at`, or the time of the commit) and kept with its value. `get_at(key, ts)` reads a key as of a time, `history` returns every version of a key newest timestamp first, with its timestamp, and compaction keeps the versions for the retention period, or for ever with `0`. Versions can be written for a time in the past. It needs no value log and no index.
-- **Browser Persistence over OPFS**: In a dedicated Web Worker, a `Tree` keeps its write-ahead log, SSTables, value log and manifest in the Origin Private File System (`FileSystem::opfs`, `wasm32-unknown-unknown`). Chrome is the only browser that is tested, and encryption, checkpoints and the migrators are not available there yet. See [WebAssembly & OPFS](#webassembly--opfs).
+- **Browser Persistence over OPFS**: In a dedicated Web Worker, a `Tree` keeps its write-ahead log, SSTables, value log and manifest in the Origin Private File System (`FileSystem::opfs`, `wasm32-unknown-unknown`). Chrome is the only browser that is tested, and encryption, checkpoints and the RocksDB and SurrealKV v0.x migrators are not available there yet. Data of SurrealDB's legacy IndexedDB backend can be moved into it: see [Moving data from IndexedDB](#moving-data-from-indexeddb).
 - **Automated Zero-Effort Migration**: Opening an existing database converts it. The conversion is one way: the original files are moved to a backup directory inside it, but the backup is not a rollback point (the value log is shared, and its garbage collection follows the new tables), and a database that this version has opened can no longer be opened by an earlier release. Take a copy of the directory first if you may need to go back:
   - SurrealKV v0.20 and v0.21 databases, migrated when they are opened: the retained versions with their sequence numbers and timestamps, and the unflushed write-ahead log. The old files are kept in `_surrealkv_v0_backup/`.
   - RocksDB databases written by SurrealDB (RocksDB 8 to 11, read without linking RocksDB) via `surrealkv-compat-rocksdb`: a database that SurrealDB ran in versioned mode is migrated with the versions it stores and their timestamps (converted from SurrealDB's hybrid logical clock to nanoseconds); any other keeps the newest value of each key. Blob files and the write-ahead log are read. The database must not be open in RocksDB while it is migrated, and its files are kept in `_rocksdb_backup/`. A tree opened with `with_versioning(true, retention_ns)` keeps those versions as its retention says, and answers `get_at` and `history` for them.
-  - Browser IndexedDB (`indxdb://`) data from an exported IndexedDB dump via `surrealkv-compat-indxdb`.
+  - Browser IndexedDB (`indxdb://`) data from an exported IndexedDB dump via `surrealkv-compat-indxdb`. In a browser, `migrate_from_indexeddb` reads the IndexedDB database directly and copies it into a database in the OPFS, without an export: see [Moving data from IndexedDB](#moving-data-from-indexeddb).
 - **Encryption at Rest**: Transparent data encryption of the manifest, SSTables, value log and write-ahead log with AES-256-GCM or XChaCha20-Poly1305, under per-file keys derived from a root key that you provide through a `KeyManager`. See [Transparent Data Encryption](#transparent-data-encryption).
 - **Value Log Separation (WiscKey)**: Opt-in via `with_enable_vlog(true)`. Values larger than `vlog_value_threshold` (1 KiB by default) are stored outside the LSM tree to minimize write amplification during leveled compaction.
 - **Data Integrity**: CRC32 checksums on SSTable blocks and WAL records, verified when they are read from disk, plus the offline `skv scrub` sweep of SSTable data blocks. Continuous background scrubbing is not implemented yet.
@@ -139,7 +139,7 @@ surrealkv/
     ├── surrealkv-sim/                      (Deterministic Simulation Testing & Differential Testing Harness)
     ├── surrealkv-compat-rocksdb/           (Pure-Rust Reader of SurrealDB's RocksDB databases, for migration)
     ├── surrealkv-compat-v1/                (Standalone reader of LSMV1 databases (SurrealKV up to v0.21.4); the core converts them to LSMV2 when it opens them)
-    └── surrealkv-compat-indxdb/            (Pure-Rust & WASM IndexedDB Reader & Migrator)
+    └── surrealkv-compat-indxdb/            (Pure-Rust & WASM reader of legacy IndexedDB stores, for the move into the OPFS)
 ```
 
 ---
@@ -454,7 +454,7 @@ The code runs on one thread. There is no async runtime to start, no thread to sp
 - **A dedicated worker only.** The browser gives the synchronous file handles that the engine needs to dedicated workers only. A `Tree` over the OPFS cannot run on the main thread of a page, and the other kinds of worker are not supported.
 - **One tab per database.** A mount takes an exclusive lock on the database. It waits about five seconds for a worker that is closing, and then a second mount of the same name fails with an error for which `Error::is_database_locked` is true.
 - **Chrome is the only browser that is tested.** Firefox and Safari have not been examined.
-- **Not available yet:** encryption at rest, `create_checkpoint` and `restore_from_checkpoint`, the path-based tools (`inspect_db`, `describe_file` and `scrub_db`), and every migrator (RocksDB, SurrealKV v0.x and IndexedDB). Encryption and the two checkpoint calls fail with `Error::InvalidArgument` before they create anything. A directory in the file system that holds a RocksDB database, an IndexedDB dump or an interrupted migration is refused with `Error::MigrationFailed`, and nothing is moved or created. The path-based tools read the files of the operating system, which a browser does not have, and fail with an I/O error. Data in IndexedDB is not moved to the OPFS, and SurrealKV never deletes it.
+- **Not available yet:** encryption at rest, `create_checkpoint` and `restore_from_checkpoint`, the path-based tools (`inspect_db`, `describe_file` and `scrub_db`), and the migrators of RocksDB and of SurrealKV v0.x. Encryption and the two checkpoint calls fail with `Error::InvalidArgument` before they create anything. A directory in the file system that holds a RocksDB database, an IndexedDB dump or an interrupted migration is refused with `Error::MigrationFailed`, and nothing is moved or created. So is a file system that has the marker of a copy from IndexedDB that was not finished. The path-based tools read the files of the operating system, which a browser does not have, and fail with an I/O error. Data in IndexedDB is not moved by itself: [Moving data from IndexedDB](#moving-data-from-indexeddb) says how to move it. SurrealKV never deletes it.
 - **The files are not a database directory.** The files of a database in the OPFS are kept in a pool of files with their own format. A native build cannot open them, and there is no export yet.
 - **A fixed number of files.** The pool holds a fixed maximum number of files. A database that reaches it fails with an error that says so. A session that writes and ends without a close leaves its records to the next open, which puts them in a table, and small tables are merged only as the database grows, so a database that is opened, written to a little and left thousands of times can reach the limit. Close the `Tree` when the application ends.
 - **The browser can evict the storage.** Unless the page has asked the browser to keep the storage of the origin (`navigator.storage.persist()`, which a worker cannot call), the browser can remove it when the disk fills. `FileSystem::persisted().await` tells the worker whether the request was granted.
@@ -507,6 +507,63 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 `FileSystem::destroy_opfs("mydb").await?` removes the files of a database that is not mounted.
 
+### Moving data from IndexedDB
+
+An application that used the `indxdb://` backend of SurrealDB has its data in an IndexedDB database: the object store `kv`, with keys and values that are `Uint8Array`s (`ArrayBuffer`s and strings are read too). `migrate_from_indexeddb` copies that data into a database in the OPFS. It exists on `wasm32-unknown-unknown` only. Call it in the dedicated worker, at every start, **before** the application opens the database:
+
+```rust,ignore
+use surrealkv::{migrate_from_indexeddb, FileSystem, IndexedDbMigration, Options, TreeBuilder};
+
+async fn start() -> Result<(), Box<dyn std::error::Error>> {
+    // The options that the application opens its database with, which the move makes it with.
+    let options = Options::default().with_path("db".into());
+
+    // Before the database is opened, at every start: when there is nothing to do, it only looks
+    // at the files of the database.
+    match migrate_from_indexeddb("my-indexeddb-name", "mydb", options.clone()).await? {
+        IndexedDbMigration::Imported {
+            entries,
+            bytes,
+        } => {
+            // The rows of the IndexedDB database are in the database now.
+            let _ = (entries, bytes);
+        }
+        IndexedDbMigration::Existing => {
+            // The database was there already, and was left as it is.
+        }
+        IndexedDbMigration::NoSource => {
+            // There was nothing to move: this is a new installation.
+        }
+        _ => {}
+    }
+
+    // Then the database is opened as always.
+    let fs = FileSystem::opfs("mydb").await?;
+    let tree =
+        TreeBuilder::with_options(options.with_file_system(fs.clone())).build_async().await?;
+    // ...
+    tree.close().await?;
+    fs.close().await?;
+    Ok(())
+}
+```
+
+The function takes the name of the IndexedDB database, the name of the database in the OPFS (the name that `FileSystem::opfs` takes) and the `Options` that the application opens the database with. The database is made with the `path` of these options, and the application opens it with the same `path`. The `fs` of the options is not used. The result says what happened:
+
+- `IndexedDbMigration::NoSource`: the database in the OPFS is not there, and there is no IndexedDB database with an object store `kv` to copy. Nothing was made.
+- `IndexedDbMigration::Existing`: the database in the OPFS is there, with no copy that was left unfinished. It was not changed, and IndexedDB was not read. This is the result of every call after the first. (One more case: another tab or worker finished the copy while this call was checking its own. That database is left as it is.)
+- `IndexedDbMigration::Imported { entries, bytes }`: the rows were copied. `entries` is the number of rows, and `bytes` is the length of their keys and values added up. An IndexedDB database that has the store and no row is a copy of none: the database is empty, and `entries` is zero.
+
+What to know:
+
+- **Call it before the database is opened, and do not open the database if it fails.** A database that is there is never copied over, whatever IndexedDB holds. If the application opens the database first, the database is there, and the data is not moved. While a copy is unfinished (the marker is there), `TreeBuilder` refuses to open the database, with an `Error::MigrationFailed` that names the unfinished copy, so nothing that the application writes can be lost to the next call, which copies again. The call mounts the files of the database, so it fails with an error for which `Error::is_database_locked` is true if another tab or worker has the database open. If two tabs call it at the same time, one of them finishes the copy, and the other one waits for the lock, or gets that error, or finds the database that the first one made.
+- **IndexedDB is only read.** SurrealKV does not create, change or delete the IndexedDB database, also after a copy that went well. A name that is not there is not created by the call. The application removes the old database (`indexedDB.deleteDatabase`) when it wants to. Do not write to it while it is copied.
+- **The copy does not hold the whole source in memory.** The rows are read in chunks, each in a read-only transaction of its own, and written to the database in transactions of a bounded size.
+- **A copy that did not finish is made again.** The call makes a marker file in the database before it makes any other file, and removes it when the copy is done. If the page closes or the worker stops during a copy, the next call finds the marker, removes what was made, and copies again from IndexedDB. A copy that fails with an error removes the files that it made, as far as it can, and keeps the marker. If the IndexedDB database is not there by then, the call fails with `Error::MigrationFailed` and no database is made, so that nothing takes a database that was not finished for an empty one. `FileSystem::destroy_opfs` removes what is left, to start without data.
+- **The copy is checked.** Before it counts, the database is closed and opened again, and the number of its rows and digests of its keys and values are compared with what was read. The rows of the database must come back in the order of their keys, and if the source gave its keys in that order, the rows are compared in sequence too (a source of string keys is in the order of UTF-16 units, which is not that order, and its rows are compared as a set). If they differ, the database is removed and the call fails with `Error::MigrationFailed` that says what differs. Two rows of the source cannot be copied if their keys are the same bytes (a string key and a binary key that has the same bytes), and neither can a row with an empty key: both fail the copy.
+- **The types of keys and values.** A key of any binary kind (IndexedDB hands every one of them back as an `ArrayBuffer`) is read as the bytes of that view, and so is a string. A value must be a `Uint8Array`, an `ArrayBuffer` or a string, and a number, for example, fails the copy. The legacy backend wrote only `Uint8Array`s. An object store `kv` with a key path or with automatic keys was not made by that backend, and is refused.
+- **Errors.** A failure is an `Error::MigrationFailed` with a message that says what failed, except a mount that another tab or worker holds, which is the error for which `Error::is_database_locked` is true. Calling the function again is how to try again. In a context where IndexedDB is not available the call fails, and nothing is made.
+
 ### Build
 
 ```bash
@@ -536,6 +593,8 @@ WASM_BINDGEN_TEST_TIMEOUT=300 WASM_BINDGEN_USE_DEDICATED_WORKER=1 \
 ```
 
 `opfs_engine_test` runs a `Tree` over the real OPFS: it commits enough data to rotate the log, flush and compact, closes and opens the database again, mounts the files again, opens a database that was left without a close, and repairs a torn log tail, with and without the value log. The tests that simulate a crash release the file handles without flushing. They do not terminate a worker, and they do not cut the power.
+
+`opfs_migrate_test` builds legacy IndexedDB databases in the browser and moves them into the OPFS with `migrate_from_indexeddb`: it compares the rows of the new database with the source, checks that the IndexedDB database is the same afterwards (version, object stores and rows) and that a name that is not there is not created, copies a large store in chunks, stops a copy half way and completes it with the next call, and fails a mount while the files are open elsewhere with the error for a locked database. The tests of the move over the memory file system, which crash it at every operation, are in `src/test/indexeddb_migration_tests.rs`.
 
 CI runs these tests (every `tests/opfs_*.rs` target and the `--lib` unit tests) in headless Chrome on Linux. The tests of the IndexedDB reader (`surrealkv-compat-indxdb`) run in headless Chrome too, against a real IndexedDB. CI also checks, lints and builds the crate for `wasm32-unknown-unknown`, and checks the zstd archive of that build when one is present, and fails if it has no members. The unit tests of the library also run in CI over the memory file system, which uses the same pool logic as the browser over a memory backend instead of the OPFS. The tests that need a real directory, encryption or checkpoints skip themselves.
 

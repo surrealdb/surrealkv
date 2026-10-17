@@ -3138,6 +3138,35 @@ impl Tree {
 		Ok(())
 	}
 
+	/// Refuses to open a database in a file system that is not the operating system's if a copy
+	/// of an IndexedDB database into it was begun and not finished: a file at the root of the
+	/// pool says so. What the files hold then is part of a copy, which the next call of
+	/// `migrate_from_indexeddb` removes and makes again, so whatever an application wrote there
+	/// would be lost. It is an `Error::MigrationFailed` that names the unfinished copy, and the
+	/// open is refused before anything is read or created. The copy opens the database itself
+	/// without this check, with `open_async`: only what an application calls goes through it, which
+	/// is the builder.
+	fn refuse_an_unfinished_import(opts: &Options) -> Result<()> {
+		let fs = &*opts.fs;
+		if fs.kind() == FsKind::Std {
+			return Ok(());
+		}
+		// A file system that has nothing mounted answers every question with `false`: it is asked
+		// to say so first, as `new` does.
+		fs.check_available()?;
+		if fs.try_exists(Path::new(crate::migrate::INDEXEDDB_MARKER))? {
+			return Err(Error::MigrationFailed(format!(
+				"the copy of an IndexedDB database into {:?} was begun and not finished (the file \
+				 {:?} is at the root of the file system), so what is there is not a database yet. \
+				 Call migrate_from_indexeddb again, which makes the copy again, before the database \
+				 is opened, or remove the files of the database to start without one.",
+				opts.path,
+				crate::migrate::INDEXEDDB_MARKER
+			)));
+		}
+		Ok(())
+	}
+
 	/// Refuses, in a file system that is not the operating system's, the directory of another
 	/// store that the migrators convert on `std`: see `refuse_what_the_file_system_cannot_do`. It
 	/// reads the names in the directory, and the first bytes of the three files that a name alone
@@ -3989,6 +4018,7 @@ impl TreeBuilder {
 	/// This method ensures type safety by using the same key type K
 	/// for both the builder and the resulting tree.
 	pub fn build(self) -> Result<Tree> {
+		Tree::refuse_an_unfinished_import(&self.opts)?;
 		Tree::new(Arc::new(self.opts))
 	}
 
@@ -4006,12 +4036,14 @@ impl TreeBuilder {
 	/// what a crash during the recovery leaves. A pool that is at its limit of files fails the open
 	/// at once, with an error that says so.
 	pub async fn build_async(self) -> Result<Tree> {
+		Tree::refuse_an_unfinished_import(&self.opts)?;
 		Tree::open_async(Arc::new(self.opts)).await
 	}
 
 	/// [`build_async`](Self::build_async), returning the options as well, as
 	/// [`build_with_options`](Self::build_with_options) does.
 	pub async fn build_with_options_async(self) -> Result<(Tree, Arc<Options>)> {
+		Tree::refuse_an_unfinished_import(&self.opts)?;
 		let opts = Arc::new(self.opts);
 		let tree = Tree::open_async(Arc::clone(&opts)).await?;
 		Ok((tree, opts))
@@ -4022,6 +4054,7 @@ impl TreeBuilder {
 	/// This is useful when you need to keep a reference to the options
 	/// after creating the tree.
 	pub fn build_with_options(self) -> Result<(Tree, Arc<Options>)> {
+		Tree::refuse_an_unfinished_import(&self.opts)?;
 		// The options as they were given, and not the ones the tree runs with: those carry the
 		// identity of the database they were opened for, and a caller that moves them to another
 		// path would make a second database with the first one's identity.

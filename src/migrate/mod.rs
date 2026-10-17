@@ -13,6 +13,10 @@
 //! [`rocksdb`] does the same for a RocksDB database. Both fail only if the data itself is
 //! unreadable, and then leave a state that opening the database again resumes.
 
+// The move out of IndexedDB runs in a browser, and on every other target in the tests only, where a
+// source of rows that is not a browser's stands in for IndexedDB.
+#[cfg(any(test, all(target_arch = "wasm32", target_os = "unknown")))]
+pub mod indexeddb;
 pub(crate) mod legacy;
 pub(crate) mod rocksdb;
 
@@ -21,6 +25,11 @@ use xxhash_rust::xxh3::Xxh3;
 use crate::error::Result;
 use crate::sstable::table::Table;
 use crate::{InternalKeyKind, LSMIterator};
+
+/// The name of the file, at the root of a pool, whose presence says that a copy of an IndexedDB
+/// database into the pool was begun and not finished (see `indexeddb`). The engine refuses to
+/// open a database in a pool that has it, which is why it is here, in code that every build has.
+pub(crate) const INDEXEDDB_MARKER: &str = "IMPORTING_FROM_INDEXEDDB";
 
 /// A hash of the entries that went through a migration, independent of how they were stored: what
 /// was read is compared with what the migrated table gives back.

@@ -117,6 +117,19 @@ proptest = "1.4"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
+# What the browser tests of the move out of IndexedDB (tests/opfs_migrate_test.rs) build a legacy
+# store with.
+web-sys = { version = "0.3", features = [
+	"Event",
+	"IdbDatabase",
+	"IdbFactory",
+	"IdbObjectStore",
+	"IdbOpenDbRequest",
+	"IdbRequest",
+	"IdbTransaction",
+	"IdbTransactionMode",
+	"IdbVersionChangeEvent",
+] }
 
 [lints.clippy]
 

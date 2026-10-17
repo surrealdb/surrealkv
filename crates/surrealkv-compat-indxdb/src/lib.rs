@@ -1,9 +1,10 @@
-//! Pure-Rust and WebAssembly reader and migrator for legacy SurrealDB IndexedDB (`indxdb://`)
-//! stores.
+//! Pure-Rust and WebAssembly reader for legacy SurrealDB IndexedDB (`indxdb://`) stores.
 //!
-//! Enables automated, transparent migration of existing browser `indxdb://` data
-//! into high-performance `file://` SurrealKV stores over OPFS without manual export/import scripts.
+//! In a browser, `wasm::IdbSource` reads the object store `kv` of a legacy database in chunks,
+//! and never creates, changes or deletes it. `surrealkv` moves what it reads into a database in the
+//! origin private file system. Outside a browser, [`read_dump`] reads an exported dump.
 
+pub mod chunk;
 pub mod dump;
 pub mod error;
 
@@ -15,6 +16,7 @@ mod tests;
 
 use std::path::Path;
 
+pub use chunk::{Chunk, ChunkFill, ChunkLimits, DEFAULT_CHUNK_BYTES, DEFAULT_CHUNK_ENTRIES};
 pub use dump::{export_dump, is_indxdb_dump_dir, read_dump, INDXDB_DUMP_MAGIC};
 pub use error::{Error, Result};
 
