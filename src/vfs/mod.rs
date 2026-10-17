@@ -166,6 +166,10 @@ impl File for SysFile {
 		}
 	}
 
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "this is the std::fs::File implementation of the file trait, which StdFs hands out"
+	)]
 	fn size(&self) -> Result<u64> {
 		self.metadata().map(|m| m.len()).map_err(|e| Error::Io(e.into()))
 	}
@@ -177,6 +181,10 @@ impl File for SysFile {
 /// On Windows, `FlushFileBuffers` (called by `sync_all`) requires
 /// `GENERIC_WRITE` — a read-only handle returns `ERROR_ACCESS_DENIED`.
 /// On Unix, read-only access is sufficient for fsync.
+#[allow(
+	clippy::disallowed_methods,
+	reason = "opens a std::fs file by path for the syncs of StdFs, of the migrators and of the tools; no other file system calls it"
+)]
 pub fn open_for_sync<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<SysFile> {
 	#[cfg(target_os = "windows")]
 	{
@@ -196,6 +204,10 @@ pub fn open_for_sync<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<SysF
 #[cfg_attr(
 	all(target_arch = "wasm32", target_os = "unknown"),
 	allow(dead_code, reason = "only `StdFs` syncs a file by its path")
+)]
+#[allow(
+	clippy::disallowed_methods,
+	reason = "called only by StdFs, so that the crash-test ledgers see the syncs of a native build exactly as before"
 )]
 pub(crate) fn fsync_file<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<()> {
 	let file = open_for_sync(&path)?;

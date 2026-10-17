@@ -159,12 +159,13 @@ debug_assert_with_mut_call = "warn"
 #
 # `clippy.toml` lists every call of `std::fs` and of the `Path` methods that ask the operating system,
 # which the engine has to make through its file system seam (`src/vfs`) so that it runs in a browser.
-# The engine is moved over to the seam one part at a time, and the CI jobs run clippy with
-# `-D warnings`, so the lint stays `allow` until the last part is moved. The change that moves it makes
-# this `deny` and puts a module-level `allow` with a reason on each module that stays on `std::fs` on
-# purpose. `scripts/check-fs-lint.sh --self-test` proves that every entry of the list is found when
-# the level is `deny`.
-disallowed_methods = "allow"
+# A call that stays on `std::fs` on purpose (the native file system itself, the migrators, checkpoints,
+# `inspect`, encryption keys and sealed files, the lock file) carries a module-level or item-level
+# `#[allow(clippy::disallowed_methods, reason = "...")]` that says why, and test code is allowed at the
+# root of the library. The member crates of the workspace set the lint to `allow` in their own
+# `Cargo.toml`. `scripts/check-fs-lint.sh --self-test` proves that every entry of the list is found
+# when the level is `deny`, and `--audit` lists what each file still calls.
+disallowed_methods = "deny"
 
 expl_impl_clone_on_copy = "warn"
 

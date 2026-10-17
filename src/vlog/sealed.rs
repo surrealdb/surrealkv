@@ -129,6 +129,10 @@ fn encode_header(
 /// another name, which keeps a later start from finding a log file without a header between
 /// two that have one. It holds nothing and is never deleted.
 #[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+#[allow(
+	clippy::disallowed_methods,
+	reason = "a sealed value-log file exists only in an encrypted database, which a file system that is not std refuses"
+)]
 pub(crate) fn create(
 	path: &Path,
 	file_id: u32,

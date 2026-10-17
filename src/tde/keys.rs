@@ -340,6 +340,10 @@ fn not_a_regular_file(path: &Path) -> Error {
 }
 
 /// Reads the key file at `path`, see `SoftwareKeyManager::from_key_file`.
+#[allow(
+	clippy::disallowed_methods,
+	reason = "key files are read from the operating system's file system by path, by a tool or at the start of a process, and never from a database's file pool"
+)]
 fn read_key_file(
 	path: &Path,
 	check_permissions: bool,

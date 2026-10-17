@@ -6,6 +6,10 @@
 //! removes the guard. Run them with `--no-default-features`.
 
 #![cfg(all(not(target_arch = "wasm32"), not(feature = "encryption")))]
+#![allow(
+	clippy::disallowed_methods,
+	reason = "a test looks at the files that a refused open leaves on a disk"
+)]
 
 use std::path::Path;
 use std::sync::Arc;

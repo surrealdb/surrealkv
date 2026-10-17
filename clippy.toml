@@ -3,11 +3,11 @@
 # A database in a browser lives in a pool of files that `std::fs` cannot see: a call that names the
 # operating system's file system anywhere on the path that opens or writes a database answers
 # "not there" or writes where nothing reads, and no test that runs on a native build notices. The
-# lint `clippy::disallowed_methods` finds every such call. It is `allow` for the crate in
-# `Cargo.toml` until the engine has been moved over to the seam; the change that moves the last
-# call site makes it `deny` and lists the modules that stay on `std::fs` on purpose (the native
-# file system itself, the migrators, checkpoints, `inspect`, encryption keys and sealed files),
-# each with a module-level `allow` and a reason.
+# lint `clippy::disallowed_methods` finds every such call. It is `deny` for the library in
+# `Cargo.toml`. A module that stays on `std::fs` on purpose (the native file system itself, the
+# migrators, checkpoints, `inspect`, encryption keys and sealed files, the lock file) carries a
+# module-level or item-level `#[allow(clippy::disallowed_methods, reason = "...")]` that says why,
+# the library root allows the lint for test code, and `scripts/check-fs-lint.sh --audit` lists them.
 #
 # Exact paths only. `clippy.toml` takes no wildcards and no braces: a path such as `std::fs::*` is
 # not an error, it is a warning that matches nothing, so most of `std::fs` would go unseen.

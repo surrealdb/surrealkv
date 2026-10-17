@@ -20,6 +20,11 @@
 //! wrong key, no key, another database, a header that was changed, all fail before any record is
 //! looked at, and all fail the same way whatever the recovery mode is.
 
+#![allow(
+	clippy::disallowed_methods,
+	reason = "recovery of a sealed log is reached only for an encrypted database, which a file system that is not std refuses"
+)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

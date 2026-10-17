@@ -2,6 +2,14 @@
 // browser's worker, or every task on a runtime that has few threads: the new awaits of the engine
 // (the waits for the spare files of a pool) hold none, and this keeps it so.
 #![deny(clippy::await_holding_lock)]
+// Every call that names the operating system's file system is denied (`clippy.toml`, `Cargo.toml`),
+// so that the engine goes through the file system seam in `src/vfs` and runs in a browser. The code
+// of the tests builds and inspects directories on a disk on purpose, and is allowed here; the code
+// of the engine that stays on `std::fs` is allowed where it is, each with a reason.
+#![cfg_attr(
+	test,
+	allow(clippy::disallowed_methods, reason = "tests build and inspect directories on a disk")
+)]
 pub mod autotune;
 mod batch;
 pub use byteslice::{self, ByteSlice};

@@ -17,6 +17,11 @@
 //! A file here is a descriptor of its own: two `open_*` calls of one path give two descriptors,
 //! unlike a pool, which gives views of one handle. The engine is written to be correct under both.
 
+#![allow(
+	clippy::disallowed_methods,
+	reason = "StdFs is the file system seam's own implementation over std::fs"
+)]
+
 use std::fs::{File as SysFile, OpenOptions};
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;

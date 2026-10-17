@@ -422,6 +422,10 @@ impl Wal {
 		Ok(opts.context.fs.open_append(file_path, CreateOpts::new(opts.file_mode))?)
 	}
 
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "permissions are set only when the file system kind is std; a pool or an in-memory file system has none to set"
+	)]
 	fn prepare_directory(dir: &Path, opts: &Options) -> Result<()> {
 		// Directory should already be created by Tree::new()
 		// Set permissions on Unix only; Windows NTFS uses ACLs and

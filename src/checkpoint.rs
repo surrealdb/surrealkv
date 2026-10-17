@@ -1,3 +1,8 @@
+#![allow(
+	clippy::disallowed_methods,
+	reason = "checkpoints are copies and hard links of a database directory on a disk: create_checkpoint and restore_from_checkpoint refuse a file system that is not std, and only the finished-restore check goes through the seam"
+)]
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
@@ -293,6 +298,9 @@ const RESTORE_MARKER_FILE: &str = "RESTORE_IN_PROGRESS";
 /// the WAL, the manifest and the value log before it copies the checkpoint's files back, so what
 /// an interrupted one leaves is an empty directory, or a part of the checkpoint, which would open
 /// as an empty database or as a wrong one. Reads only, like `check_manifest_before_open`.
+// The one part of this module that goes through the seam: it runs on every open, and stays linted
+// although the module is allowed.
+#[deny(clippy::disallowed_methods)]
 pub(crate) fn check_restore_finished(opts: &Options) -> Result<()> {
 	check_restore_finished_in(&*opts.fs, opts)
 }
@@ -301,6 +309,7 @@ pub(crate) fn check_restore_finished(opts: &Options) -> Result<()> {
 /// directory, so that a file system that cannot answer is an error here and not a database
 /// without a marker. A marker that cannot be read is an empty one: the refusal does not wait for
 /// the name of the checkpoint.
+#[deny(clippy::disallowed_methods)]
 pub(crate) fn check_restore_finished_in(fs: &dyn Fs, opts: &Options) -> Result<()> {
 	let marker = opts.path.join(RESTORE_MARKER_FILE);
 	if !fs.try_exists(&marker)? {

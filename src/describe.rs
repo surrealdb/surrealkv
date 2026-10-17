@@ -8,6 +8,11 @@
 //! the salt. None of it is secret, and none of it is authentic: the tag of a header is checked
 //! with a key, which nothing here has.
 
+#![allow(
+	clippy::disallowed_methods,
+	reason = "std-path tooling that reads the clear headers of the files of a directory on a disk, for a tool that holds no file system handle; it is not part of opening a database"
+)]
+
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;

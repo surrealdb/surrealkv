@@ -1113,6 +1113,10 @@ fn injected_failure(path: &Path) -> Option<ReplaceFailure> {
 }
 
 /// Writes `content` to the temporary file `path`, syncs it and gives it `permissions`.
+#[allow(
+	clippy::disallowed_methods,
+	reason = "called only by replace_file_content, which only StdFs and the std-only migrators call"
+)]
 fn write_temp_file(
 	path: &Path,
 	content: &[u8],
@@ -1136,6 +1140,10 @@ fn write_temp_file(
 /// A failure before the rename is an `Error::Io` and leaves the file as it was. A failure from
 /// the rename on is an `Error::ManifestWriteUncertain`: the new content may be in place, and
 /// until the directory is synced a crash may bring the old content back.
+#[allow(
+	clippy::disallowed_methods,
+	reason = "this is the body of StdFs::replace and of the std-only migrators; no other file system calls it"
+)]
 pub(crate) fn replace_file_content<P: AsRef<Path>>(file_path: P, new_content: &[u8]) -> Result<()> {
 	let target_path = file_path.as_ref();
 	#[cfg(test)]

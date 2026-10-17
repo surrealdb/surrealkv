@@ -3192,6 +3192,10 @@ impl Tree {
 	}
 
 	/// Automatically migrates an existing IndexedDB dump to SurrealKV v2 format.
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "the migration of an IndexedDB dump runs only for a native build, behind the file system kind check in Tree::new"
+	)]
 	fn migrate_from_indxdb(opts: &Options) -> Result<()> {
 		Self::refuse_migration_into_an_encrypted_database(opts, "IndexedDB")?;
 		tracing::info!("Detected existing IndexedDB dump at {:?}. Starting automatic migration to SurrealKV v2...", opts.path);
@@ -3985,6 +3989,10 @@ pub(crate) static SYNCED_DIRECTORIES: parking_lot::Mutex<Vec<std::path::PathBuf>
 	parking_lot::Mutex::new(Vec::new());
 
 /// Syncs a directory to ensure all changes are persisted to disk
+#[allow(
+	clippy::disallowed_methods,
+	reason = "this is the body of StdFs::sync_dir and of the tools that run on std::fs; no other file system calls it"
+)]
 pub(crate) fn fsync_directory<P: AsRef<Path>>(path: P) -> std::io::Result<()> {
 	let path = path.as_ref();
 

@@ -130,6 +130,10 @@ impl OsLock {
 
 	/// Acquires the lock, returning an error if the database is already in use
 	#[cfg(not(target_arch = "wasm32"))]
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "the operating system's lock file is the one place that locks a native database against another process, and a file system that is not std takes a registered lock instead"
+	)]
 	fn acquire(&mut self) -> Result<()> {
 		// Try to open the lock file with create flag
 		let file = OpenOptions::new()

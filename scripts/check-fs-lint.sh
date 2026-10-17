@@ -1,33 +1,42 @@
 #!/bin/sh
-# Proves that the list of disallowed calls in clippy.toml does what it says.
+# Keeps the file system seam enforced, and proves that the list of disallowed calls in clippy.toml
+# does what it says.
 #
 # `clippy.toml` names every call of `std::fs`, of `File` and of the `Path` methods that ask the
 # operating system, which the engine has to make through its file system seam (src/vfs) so that
-# it runs in a browser. The lint that reads it, `clippy::disallowed_methods`, is `allow` in
-# Cargo.toml until the engine has been moved over, because CI runs clippy with `-D warnings`. Two
-# things can go wrong in the meantime without any build noticing, and this script checks both:
+# it runs in a browser. The lint that reads it, `clippy::disallowed_methods`, is `deny` for the
+# library in Cargo.toml, and `allow` for every other member of the workspace. A call that stays on
+# `std::fs` on purpose carries an `#[allow(clippy::disallowed_methods, reason = "...")]`, at module
+# or item level, and the library root allows the lint for test code only. Things can go wrong
+# without any build noticing, and this script checks them:
 #
 #   1. an entry that matches nothing. clippy.toml takes exact paths only: `std::fs::*` or a
 #      brace set is not an error, it is a warning that matches nothing, and a path that is
 #      mistyped, or that a toolchain does not have, is silent with `allow-invalid`.
 #   2. an entry that is not in the fixture, so that nobody knows whether it works.
+#   3. a level that was lowered: the library not at `deny`, a member crate not at `allow` (the
+#      rest of the workspace is not moved over), a blanket allow at the root of the library for
+#      code that is not a test, an allow without a reason.
 #
 # Usage:
 #   scripts/check-fs-lint.sh [--static]   static checks of clippy.toml (no wildcards, a reason on
-#                                         each entry, no duplicates)
+#                                         each entry, no duplicates) and of the levels (3 above)
 #   scripts/check-fs-lint.sh --self-test  the static checks, and then: builds a scratch crate that
 #                                         makes one call of every entry with the lint at `deny`,
 #                                         using this clippy.toml, and fails unless clippy reports
 #                                         exactly the entries of the file. Needs `cargo clippy`.
 #   FS_LINT_CONFIG=file   names another clippy.toml (the self-test of the tests uses it)
-#   scripts/check-fs-lint.sh --audit      counts, for each source file, the calls of the engine that
-#                                         the lint finds when it is made a warning: the size of the
-#                                         allow-list that the last move to the seam has to write.
-#                                         Never fails because of a count.
+#   FS_LINT_ROOT=dir      names another source tree for the level checks (ditto)
+#   scripts/check-fs-lint.sh --audit      lists every allow of the lint in the sources with its
+#                                         scope and its reason, and then runs clippy at the level
+#                                         of Cargo.toml: fails if the lint finds a call that no
+#                                         allow covers, so that what it lists is the whole of what
+#                                         stays on `std::fs`.
 set -eu
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 config=${FS_LINT_CONFIG:-$root/clippy.toml}
+src_root=${FS_LINT_ROOT:-$root}
 
 entries() {
 	sed -n 's/.*{ *path *= *"\([^"]*\)".*/\1/p' "$config" | sort
@@ -58,7 +67,79 @@ static_checks() {
 		echo "check-fs-lint: duplicate entries in $config: $dup" >&2
 		status=1
 	fi
+	level_checks || status=1
 	return $status
+}
+
+# Every attribute of the sources that names the lint, one line each: `file:line<TAB>kind<TAB>reason`.
+# `kind` is `module` for an inner attribute, `test` for a `cfg_attr` and `item` for the rest. rustfmt
+# spreads a long attribute over several lines, so the attribute is read as a whole, up to its
+# closing bracket. (No reason that this script reads contains a bracket.)
+scan_allows() {
+	for f in $(find "$@" -name '*.rs' -type f 2> /dev/null | sort); do
+		awk -v file="$f" '
+			function emit(   kind, reason, rest) {
+				if (buf !~ /disallowed_methods/ || buf !~ /(allow|expect)\(/) return
+				kind = "item"
+				if (buf ~ /^#!/) kind = "module"
+				if (buf ~ /cfg_attr/) kind = "test"
+				reason = ""
+				if (match(buf, /reason *= *"[^"]*"/)) {
+					rest = substr(buf, RSTART, RLENGTH)
+					sub(/^reason *= *"/, "", rest)
+					sub(/"$/, "", rest)
+					reason = rest
+				}
+				printf "%s:%d\t%s\t%s\n", file, start, kind, reason
+			}
+			{
+				line = $0
+				if (!inattr && line ~ /^[ \t]*#!?\[/) {
+					inattr = 1; buf = ""; start = NR; depth = 0
+				}
+				if (inattr) {
+					sub(/^[ \t]+/, "", line)
+					buf = buf (buf == "" ? "" : " ") line
+					n = gsub(/\[/, "[", line); m = gsub(/\]/, "]", line)
+					depth += n - m
+					if (depth <= 0) { emit(); inattr = 0 }
+				}
+			}
+		' "$f"
+	done
+}
+
+# The levels that keep the seam enforced.
+level_checks() {
+	level_status=0
+	if ! grep -q '^disallowed_methods *= *"deny"' "$src_root/Cargo.toml"; then
+		echo "check-fs-lint: $src_root/Cargo.toml does not set disallowed_methods = \"deny\"" >&2
+		level_status=1
+	fi
+	for manifest in "$src_root"/crates/*/Cargo.toml; do
+		[ -f "$manifest" ] || continue
+		if ! grep -q '^disallowed_methods *= *"allow"' "$manifest"; then
+			echo "check-fs-lint: $manifest does not set disallowed_methods = \"allow\"" >&2
+			level_status=1
+		fi
+	done
+	# The root of the library may allow the lint for tests only: `cfg_attr(test, allow(..))`; and
+	# every allow of the lint says why.
+	allows=$(scan_allows "$src_root/src" "$src_root/tests" "$src_root/examples" "$src_root/benches")
+	blanket=$(printf '%s\n' "$allows" | awk -F'\t' -v lib="$src_root/src/lib.rs" \
+		'index($1, lib ":") == 1 && $2 != "test"')
+	if [ -n "$blanket" ]; then
+		echo "check-fs-lint: src/lib.rs allows disallowed_methods for the whole library, not only for tests:" >&2
+		printf '%s\n' "$blanket" >&2
+		level_status=1
+	fi
+	reasonless=$(printf '%s\n' "$allows" | awk -F'\t' 'NF >= 2 && length($3) < 8')
+	if [ -n "$reasonless" ]; then
+		echo "check-fs-lint: an allow of disallowed_methods has no reason:" >&2
+		printf '%s\n' "$reasonless" >&2
+		level_status=1
+	fi
+	return $level_status
 }
 
 # One call of every entry, in a function whose arguments are what the methods need.
@@ -158,8 +239,8 @@ TOML
 		status=1
 	fi
 
-	# The lint must stay quiet when it is `allow`, which is how Cargo.toml has it: the same
-	# fixture with the level lowered makes no diagnostic.
+	# The lint must stay quiet when it is `allow`, which is how the member crates have it: the
+	# same fixture with the level lowered makes no diagnostic.
 	sed -i.bak 's/#!\[deny(clippy::disallowed_methods)\]/#![allow(clippy::disallowed_methods)]/' "$work/src/main.rs"
 	quiet=$(cd "$work" && CARGO_TARGET_DIR="$work/target" RUSTFLAGS="" cargo clippy --message-format short 2>&1 || true)
 	if printf '%s\n' "$quiet" | grep -q 'disallowed method'; then
@@ -176,12 +257,31 @@ TOML
 audit() {
 	static_checks
 	cd "$root"
+	echo "allowed on purpose (file:line, scope, reason):"
+	scan_allows src tests examples benches | awk -F'\t' '{
+		if ($2 == "test") $3 = "test code of the library"
+		printf "%s  %s: %s\n", $1, $2, $3
+	}'
+	echo
+	echo "calls that no allow covers:"
 	target=$(mktemp -d)
 	trap 'rm -rf "$target"' EXIT
 	CARGO_TARGET_DIR="$target" cargo clippy -p surrealkv --all-targets --message-format short \
-		-- -W clippy::disallowed_methods 2>&1 \
-		| sed -n 's/^\([^:]*\):[0-9]*:[0-9]*: warning: use of a disallowed method.*/\1/p' \
-		| sort | uniq -c | sort -rn
+		> "$target/clippy.out" 2>&1 || true
+	found=$(sed -En 's/^([^ ]*): (warning|error): use of a disallowed method.*/\1/p' "$target/clippy.out" \
+		| sort | uniq -c | sort -rn)
+	if [ -n "$found" ]; then
+		printf '%s\n' "$found"
+		echo "check-fs-lint: the lint finds calls that no allow covers" >&2
+		return 1
+	fi
+	# A build that does not get as far as the lint finds nothing, and must not read as a pass.
+	if grep -q '^error: could not compile' "$target/clippy.out"; then
+		echo "check-fs-lint: clippy did not finish, so the audit proves nothing:" >&2
+		grep '^error' "$target/clippy.out" | head -10 >&2
+		return 1
+	fi
+	echo "  none"
 }
 
 case "${1:-}" in
