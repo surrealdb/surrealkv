@@ -12,6 +12,12 @@
 
 pub(crate) mod header;
 pub(crate) mod mem;
+#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+#[allow(
+	dead_code,
+	reason = "no pool is mounted over the origin private file system until `FileSystem::opfs`"
+)]
+pub(crate) mod opfs_raw;
 pub(crate) mod pool;
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 mod std_fs;
