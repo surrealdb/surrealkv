@@ -22,6 +22,9 @@ async fn main() {
 		extended
 	};
 
+	// SURREALKV_SIM_FS=mem runs over the memory file system, and every restart is a crash.
+	let memory = std::env::var("SURREALKV_SIM_FS").is_ok_and(|v| v == "mem");
+
 	let parallelism = std::thread::available_parallelism().map_or(4, |n| n.get()).min(64);
 	println!(
 		"Starting SurrealKV Deterministic Simulation: {} seeds, {} steps/seed ({} total ops), parallelism: {}",
@@ -54,7 +57,11 @@ async fn main() {
 		}
 
 		join_set.spawn(async move {
-			let mut runner = SimRunner::new();
+			let mut runner = if memory {
+				SimRunner::in_memory()
+			} else {
+				SimRunner::new()
+			};
 			runner.run(seed, steps).await;
 			runner.close().await;
 		});

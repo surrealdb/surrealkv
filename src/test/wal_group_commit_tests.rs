@@ -20,10 +20,10 @@ use std::sync::Arc;
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs, tfs};
 use crate::batch::Batch;
 use crate::ring::PipelineHook;
 use crate::vlog::ValueLocation;
-use crate::wal::parallel_recovery::decode_segment_batches;
 use crate::wal::{segment_name, BLOCK_SIZE, HEADER_SIZE};
 use crate::{Durability, InternalKeyKind, Mode, Options, Tree};
 
@@ -32,8 +32,8 @@ use crate::{Durability, InternalKeyKind, Mode, Options, Tree};
 // ---------------------------------------------------------------------------
 
 fn copy_dir(src: &Path, dst: &Path) {
-	std::fs::create_dir_all(dst).unwrap();
-	for entry in std::fs::read_dir(src).unwrap() {
+	sfs::create_dir_all(dst).unwrap();
+	for entry in sfs::read_dir(src).unwrap() {
 		let entry = entry.unwrap();
 		if entry.file_name() == "LOCK" {
 			continue;
@@ -42,7 +42,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 		if entry.file_type().unwrap().is_dir() {
 			copy_dir(&entry.path(), &to);
 		} else {
-			std::fs::copy(entry.path(), &to).unwrap();
+			sfs::copy(entry.path(), &to).unwrap();
 		}
 	}
 }
@@ -51,7 +51,7 @@ fn copy_dir(src: &Path, dst: &Path) {
 /// `Batch::decode` per record), in segment order.
 fn wal_batches(dir: &Path) -> Vec<Batch> {
 	let mut ids: Vec<(u64, PathBuf)> = Vec::new();
-	for entry in std::fs::read_dir(dir.join("wal")).unwrap() {
+	for entry in sfs::read_dir(dir.join("wal")).unwrap() {
 		let path = entry.unwrap().path();
 		if path.extension().is_some_and(|ext| ext == "wal") {
 			let id: u64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
@@ -61,7 +61,7 @@ fn wal_batches(dir: &Path) -> Vec<Batch> {
 	ids.sort();
 	let mut out = Vec::new();
 	for (id, path) in ids {
-		out.extend(decode_segment_batches(&path, id).unwrap().1);
+		out.extend(tfs::decode_segment_batches(&path, id).unwrap().1);
 	}
 	out
 }
@@ -667,7 +667,7 @@ async fn a_failing_group_aborts_every_waiter_and_acknowledges_nothing() {
 		for result in commit_group(&tree, &acked, Durability::Immediate).await {
 			result.unwrap();
 		}
-		let acked_len = std::fs::metadata(&segment).unwrap().len();
+		let acked_len = sfs::metadata(&segment).unwrap().len();
 		assert!(acked_len > 0, "the acknowledged commits are in the segment");
 
 		let doomed: Vec<(String, Vec<u8>)> =
@@ -686,11 +686,7 @@ async fn a_failing_group_aborts_every_waiter_and_acknowledges_nothing() {
 			results.iter().all(|r| r.is_err()),
 			"fail_after={fail_after}: the group fails as a whole, got {results:?}"
 		);
-		assert_eq!(
-			std::fs::metadata(&segment).unwrap().len(),
-			acked_len,
-			"fail_after={fail_after}"
-		);
+		assert_eq!(sfs::metadata(&segment).unwrap().len(), acked_len, "fail_after={fail_after}");
 		{
 			let txn = tree.begin_with_mode(Mode::ReadOnly).unwrap();
 			for (k, _) in &doomed {
@@ -702,7 +698,7 @@ async fn a_failing_group_aborts_every_waiter_and_acknowledges_nothing() {
 		assert!(later[0].is_ok(), "fail_after={fail_after}: the next commit replaces the segment");
 		// The segment that failed is not written to again; the background flush of its memtable
 		// removes it.
-		assert!(!segment.exists() || std::fs::metadata(&segment).unwrap().len() == acked_len);
+		assert!(!sfs::exists(&segment) || sfs::metadata(&segment).unwrap().len() == acked_len);
 
 		release_lock(&tree);
 		mark_closed(&tree);
@@ -776,7 +772,7 @@ async fn golden_segment_digest() -> (u64, u32, u64) {
 	let dir = TempDir::new("wal_group").unwrap();
 	let tree = Tree::new(options(dir.path())).unwrap();
 	let segment = active_segment_path(dir.path(), &tree);
-	let segment_len = || std::fs::metadata(&segment).unwrap().len() as usize;
+	let segment_len = || sfs::metadata(&segment).unwrap().len() as usize;
 	let value = |len: usize, c: char| c.to_string().repeat(len);
 
 	let group = |sync: bool, batches: Vec<Batch>| {
@@ -852,7 +848,7 @@ async fn golden_segment_digest() -> (u64, u32, u64) {
 		.await;
 	}
 
-	let bytes = std::fs::read(&segment).unwrap();
+	let bytes = sfs::read(&segment).unwrap();
 	let digest = (bytes.len() as u64, crc32fast::hash(&bytes), xxhash_rust::xxh3::xxh3_64(&bytes));
 	mark_closed(&tree);
 	release_lock(&tree);

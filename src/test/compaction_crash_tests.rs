@@ -28,7 +28,6 @@
 #![cfg(not(target_arch = "wasm32"))]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -39,7 +38,7 @@ use tempdir::TempDir;
 use test_log::test;
 use tokio::task::JoinHandle;
 
-use super::collect_transaction_all;
+use super::{collect_transaction_all, sfs, sfs as fs, tfs};
 use crate::compaction::compactor::{directory_syncs, CompactionStage};
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::Error;
@@ -760,7 +759,7 @@ fn assert_raw_image(image: &Image, plan: &Plan, landed: &[u64], orphans: &[u64])
 /// outputs of a compaction whose directory fsync had not completed are gone.
 fn power_loss(image: &Image, outputs: &BTreeSet<u64>, before_syncs: usize, root: &Path) -> PathBuf {
 	let dst = root.join(format!("power-loss-{:?}", image.stage));
-	if dst.exists() {
+	if sfs::exists(&dst) {
 		fs::remove_dir_all(&dst).unwrap();
 	}
 	copy_image(&image.dir, &dst);
@@ -949,6 +948,9 @@ macro_rules! stage_tests {
 		$(
 			#[test(tokio::test)]
 			async fn $name() {
+				if tfs::skip_listed() {
+					return;
+				}
 				stage_scenario($shape, $stage).await
 			}
 		)*
@@ -978,6 +980,9 @@ stage_tests! {
 /// step further, and the value log loses files only at the last stage.
 #[test(tokio::test)]
 async fn the_four_stages_of_a_compaction_leave_four_directories_one_step_apart() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for shape in [Shape::L0ToL1, Shape::L1ToL2, Shape::L2ToL3] {
 		let dir = TempDir::new("cc-db").unwrap();
 		let images = TempDir::new("cc-images").unwrap();
@@ -1033,6 +1038,9 @@ fn vlog_ids(names: &BTreeSet<String>) -> Vec<u64> {
 /// both sides of the removal read every value.
 #[test(tokio::test)]
 async fn the_value_log_files_of_overwritten_values_are_removed_at_the_last_stage_only() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("cc-db").unwrap();
 	let images = TempDir::new("cc-images").unwrap();
 	let db = dir.path().join("db");
@@ -1229,6 +1237,9 @@ async fn tables_flushed_after_a_crash_after_the_manifest_write_get_ids_above_eve
 /// of its own and leaves an image that recovers as well.
 #[test(tokio::test)]
 async fn a_compaction_that_fails_after_its_outputs_are_written_loses_nothing_and_can_be_retried() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for shape in [Shape::L0ToL1, Shape::L1ToL2] {
 		let dir = TempDir::new("cc-db").unwrap();
 		let images = TempDir::new("cc-images").unwrap();
@@ -1320,6 +1331,9 @@ impl Drop for Healed {
 /// the manifest write. In both cases a crash image recovers every key.
 #[test(tokio::test)]
 async fn a_failed_manifest_write_inside_a_compaction_leaves_the_tree_and_the_directory_right() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for (shape, at) in [
 		(Shape::L0ToL1, ReplaceFailure::BeforeRename),
 		(Shape::L1ToL2, ReplaceFailure::BeforeRename),
@@ -1391,7 +1405,7 @@ async fn a_failed_manifest_write_inside_a_compaction_leaves_the_tree_and_the_dir
 				let plan = Plan::new(before.clone(), &raw.levels, shape.source(), shape.target());
 				assert_eq!(raw.levels, plan.after(), "{what}: the tables of the new manifest");
 				assert!(
-					plan.input.iter().all(|id| sst_path(&db, *id).exists()),
+					plan.input.iter().all(|id| sfs::exists(sst_path(&db, *id))),
 					"{what}: the inputs are still on disk"
 				);
 			}
@@ -1472,6 +1486,9 @@ fn verify_with_writers(tree: &Tree, model: &Model, acked: &Acked, what: &str) {
 /// after its acknowledgement, with its value, beside the data the compaction merged.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn commits_acknowledged_before_an_image_are_in_the_image_taken_at_every_stage() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("cc-db").unwrap();
 	let images = TempDir::new("cc-images").unwrap();
 	let db = dir.path().join("db");
@@ -1593,6 +1610,9 @@ async fn commits_acknowledged_before_an_image_are_in_the_image_taken_at_every_st
 /// outputs of the first. An image at each stage of the second recovers all of it.
 #[test(tokio::test)]
 async fn a_crash_during_a_second_compaction_after_the_first_one_settled_keeps_every_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("cc-db").unwrap();
 	let images = TempDir::new("cc-images").unwrap();
 	let db = dir.path().join("db");
@@ -1659,6 +1679,9 @@ async fn a_crash_during_a_second_compaction_after_the_first_one_settled_keeps_ev
 /// compaction then merges the table that landed.
 #[test(tokio::test)]
 async fn a_flush_that_lands_while_a_compaction_is_parked_stays_newer_than_the_outputs() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("cc-db").unwrap();
 	let images = TempDir::new("cc-images").unwrap();
 	let db = dir.path().join("db");
@@ -1794,6 +1817,9 @@ fn temp_manifest_name(n: u64) -> String {
 /// at it: the tables, the data and the files of the directory are those of the manifest.
 #[test(tokio::test)]
 async fn a_temporary_manifest_beside_a_valid_manifest_has_no_effect_on_recovery() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("cc-db").unwrap();
 	let images = TempDir::new("cc-images").unwrap();
 	let db = dir.path().join("db");
@@ -1884,13 +1910,13 @@ async fn inputs_that_a_crash_left_beside_the_new_manifest_are_reclaimed_at_open(
 		}
 		let left: Vec<u64> = inputs[removed..].to_vec();
 		assert!(!left.is_empty());
-		assert!(left.iter().all(|id| sst_path(&work, *id).exists()));
+		assert!(left.iter().all(|id| sfs::exists(sst_path(&work, *id))));
 		assert_eq!(read_manifest(&work).levels, plan.after(), "the manifest is the new one");
 
 		let what = format!("{} of {} inputs removed", removed, inputs.len());
 		let (tree, _) = open_and_check(&work, &model, &what);
 		for id in &inputs {
-			assert!(!sst_path(&work, *id).exists(), "{what}: the input {id} is reclaimed");
+			assert!(!sfs::exists(sst_path(&work, *id)), "{what}: the input {id} is reclaimed");
 		}
 		kill(&tree);
 		drop(tree);
@@ -1974,11 +2000,17 @@ async fn range_scenario(with_points: bool) {
 
 #[test(tokio::test)]
 async fn a_range_tombstone_survives_a_compaction_crash_beside_newer_values() {
+	if tfs::skip_listed() {
+		return;
+	}
 	range_scenario(true).await
 }
 
 #[test(tokio::test)]
 async fn a_range_tombstone_alone_survives_a_compaction_crash() {
+	if tfs::skip_listed() {
+		return;
+	}
 	range_scenario(false).await
 }
 
@@ -2174,6 +2206,9 @@ async fn random_scenario(seed: u64) {
 /// message.
 #[test(tokio::test)]
 async fn randomised_workloads_recover_from_an_image_at_a_random_stage() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for seed in 1..=8u64 {
 		random_scenario(seed).await;
 	}

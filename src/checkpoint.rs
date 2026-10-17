@@ -1,16 +1,21 @@
+#![allow(
+	clippy::disallowed_methods,
+	reason = "checkpoints are copies and hard links of a database directory on a disk: create_checkpoint and restore_from_checkpoint refuse a file system that is not std, and only the finished-restore check goes through the seam"
+)]
+
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{EncryptionError, Error, Result};
 use crate::levels::{check_manifest_mode, LevelManifest};
 use crate::lsm::{fsync_directory, CoreInner};
 use crate::tde::EncryptionContext;
+use crate::vfs::Fs;
 use crate::vlog::sealed;
-use crate::Options;
+use crate::{rt, Options};
 
 /// Recursively copies a directory and all its contents
 fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
@@ -293,12 +298,25 @@ const RESTORE_MARKER_FILE: &str = "RESTORE_IN_PROGRESS";
 /// the WAL, the manifest and the value log before it copies the checkpoint's files back, so what
 /// an interrupted one leaves is an empty directory, or a part of the checkpoint, which would open
 /// as an empty database or as a wrong one. Reads only, like `check_manifest_before_open`.
+// The one part of this module that goes through the seam: it runs on every open, and stays linted
+// although the module is allowed.
+#[deny(clippy::disallowed_methods)]
 pub(crate) fn check_restore_finished(opts: &Options) -> Result<()> {
+	check_restore_finished_in(&*opts.fs, opts)
+}
+
+/// [`check_restore_finished`] over `fs`: the first question the open of a database asks of its
+/// directory, so that a file system that cannot answer is an error here and not a database
+/// without a marker. A marker that cannot be read is an empty one: the refusal does not wait for
+/// the name of the checkpoint.
+#[deny(clippy::disallowed_methods)]
+pub(crate) fn check_restore_finished_in(fs: &dyn Fs, opts: &Options) -> Result<()> {
 	let marker = opts.path.join(RESTORE_MARKER_FILE);
-	if !marker.try_exists()? {
+	if !fs.try_exists(&marker)? {
 		return Ok(());
 	}
-	let checkpoint = fs::read_to_string(&marker).unwrap_or_default();
+	let checkpoint =
+		fs.read(&marker).ok().and_then(|bytes| String::from_utf8(bytes).ok()).unwrap_or_default();
 	// An empty directory is a database of its own when it is opened with a key manager, with an
 	// identity that no checkpoint of another database has, and a restore refuses that.
 	let advice = if opts.key_manager.is_some() || opts.encryption_context().is_some() {
@@ -710,7 +728,7 @@ impl DatabaseCheckpoint {
 		fsync_directory(checkpoint_path).map_err(|e| Error::Io(Arc::new(e)))?;
 
 		// Step 9: Create checkpoint metadata
-		let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+		let timestamp = rt::now_unix_ns() / 1_000_000_000;
 
 		let metadata = CheckpointMetadata::new(
 			timestamp,

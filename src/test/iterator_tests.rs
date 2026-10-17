@@ -34,7 +34,7 @@ fn create_test_vlog() -> (Arc<VLog>, TempDir) {
 		path: temp_dir.path().to_path_buf(),
 		..Default::default()
 	};
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 
 	let vlog = Arc::new(VLog::new(Arc::new(opts)).unwrap());
 	(vlog, temp_dir)

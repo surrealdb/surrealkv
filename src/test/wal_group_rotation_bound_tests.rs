@@ -23,7 +23,6 @@ use tempdir::TempDir;
 use test_log::test;
 use tokio::task::JoinHandle;
 
-use super::collect_transaction_all;
 use super::wal_group_budget_tests::{
 	assert_all_acked,
 	copy_dir,
@@ -37,6 +36,7 @@ use super::wal_group_budget_tests::{
 	wal_batches,
 };
 use super::wal_sealed_tests::{context, read_records, sealed_context};
+use super::{collect_transaction_all, tfs};
 use crate::batch::Batch;
 use crate::memtable::max_entry_bytes;
 use crate::ring::PipelineHook;
@@ -263,7 +263,7 @@ async fn pile_up_taking_images(
 	stop_background(&tree).await;
 	let take = images.then(|| {
 		let root = dir.path().join("images");
-		std::fs::create_dir_all(&root).unwrap();
+		super::sfs::create_dir_all(&root).unwrap();
 		(live.clone(), root)
 	});
 	let probe = Probe::install_taking_images(&tree, take);
@@ -395,6 +395,9 @@ async fn a_group_rotates_at_most_once_plain() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_group_rotates_at_most_once_encrypted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_group_rotates_at_most_once(true).await;
 }
 
@@ -438,7 +441,7 @@ fn wal_batches_of(live: &Path, encrypted: bool) -> Vec<Batch> {
 	}
 	let wal_context = sealed_context(&context(CipherSuite::Aes256Gcm));
 	let mut segments = Vec::new();
-	for entry in std::fs::read_dir(live.join("wal")).unwrap() {
+	for entry in super::sfs::read_dir(live.join("wal")).unwrap() {
 		let path = entry.unwrap().path();
 		if path.extension().is_some_and(|ext| ext == "wal") {
 			let id: u64 = path.file_stem().unwrap().to_str().unwrap().parse().unwrap();
@@ -462,6 +465,9 @@ async fn a_batch_is_logged_at_most_twice_plain() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_batch_is_logged_at_most_twice_encrypted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_batch_is_logged_at_most_twice(true).await;
 }
 
@@ -471,12 +477,12 @@ async fn a_batch_is_logged_at_most_twice_encrypted() {
 
 /// The non-empty WAL segments of a directory.
 fn non_empty_segments(dir: &Path) -> usize {
-	std::fs::read_dir(dir.join("wal"))
+	super::sfs::read_dir(dir.join("wal"))
 		.unwrap()
 		.filter(|e| {
 			let path = e.as_ref().unwrap().path();
 			path.extension().is_some_and(|ext| ext == "wal")
-				&& std::fs::metadata(&path).unwrap().len() > 0
+				&& super::sfs::metadata(&path).unwrap().len() > 0
 		})
 		.count()
 }
@@ -537,6 +543,9 @@ async fn recovery_creates_at_most_two_tables_per_segment_plain() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn recovery_creates_at_most_two_tables_per_segment_encrypted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	recovery_creates_at_most_two_tables_per_segment(true).await;
 }
 
@@ -614,6 +623,9 @@ async fn a_crash_at_every_hook_of_the_groups_the_bound_forms_recovers_a_prefix_p
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_crash_at_every_hook_of_the_groups_the_bound_forms_recovers_a_prefix_encrypted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_crash_at_every_hook_of_the_groups_the_bound_forms_recovers_a_prefix(true).await;
 }
 

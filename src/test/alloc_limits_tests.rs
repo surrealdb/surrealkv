@@ -13,7 +13,6 @@
 //! A batch that a memtable cannot hold is written to an L0 table after its record is logged,
 //! which borrows its values; one test pins that no second copy of a value is made.
 
-use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -21,6 +20,8 @@ use std::sync::Arc;
 use tempdir::TempDir;
 
 use super::compaction_memory_proofs::{count_allocations, RefuseAllocations};
+use super::sfs::File;
+use super::tfs;
 use super::wal_group_budget_tests::{
 	assert_recovers,
 	commit as spawn_commit,
@@ -64,7 +65,7 @@ async fn commit(tree: &Tree, key: &str, value: &[u8]) -> crate::Result<()> {
 /// the WAL for it and does not name one.
 fn active_segment(tree: &Tree, live: &Path) -> Vec<u8> {
 	let number = tree.core.inner.wal.read().get_active_log_number();
-	std::fs::read(live.join("wal").join(segment_name(number, "wal"))).unwrap()
+	super::sfs::read(live.join("wal").join(segment_name(number, "wal"))).unwrap()
 }
 
 /// The flusher grows a value by the two bytes that wrap it, which allocates when the value has no
@@ -148,7 +149,7 @@ fn a_record_the_allocator_cannot_compress_is_refused_and_the_writer_stays_usable
 	let mut writer = new_writer(&path, CompressionType::Lz4);
 	let small = vec![b'a'; 100];
 	writer.add_records(&small, &[small.len()]).unwrap();
-	let before = std::fs::read(&path).unwrap();
+	let before = super::sfs::read(&path).unwrap();
 
 	// Incompressible, so its block is as large as the record and needs `LEN` bytes at least.
 	let huge: Vec<u8> = value_of(1, LEN);
@@ -161,7 +162,7 @@ fn a_record_the_allocator_cannot_compress_is_refused_and_the_writer_stays_usable
 		assert!(writer.add_records(&group, &ends).is_err(), "a group with a record too big");
 		assert!(writer.add_record(&huge).is_err(), "a single record");
 	}
-	assert!(std::fs::read(&path).unwrap() == before, "the segment is byte-identical");
+	assert!(super::sfs::read(&path).unwrap() == before, "the segment is byte-identical");
 
 	let more = vec![b'b'; 100];
 	writer.add_records(&more, &[more.len()]).unwrap();
@@ -364,8 +365,8 @@ fn a_compressed_group_of_several_records_reads_back_record_by_record() {
 	}
 	assert_eq!(read_records(&single), records);
 	assert_eq!(
-		std::fs::read(&single).unwrap(),
-		std::fs::read(dir.path().join("group_1.wal")).unwrap(),
+		super::sfs::read(&single).unwrap(),
+		super::sfs::read(dir.path().join("group_1.wal")).unwrap(),
 		"a record added alone is framed as a group of one"
 	);
 }
@@ -397,6 +398,9 @@ fn allocations_of_lz4_flex(record: &[u8]) -> u64 {
 /// cannot fail cleanly.
 #[test]
 fn compressing_a_group_allocates_its_room_once() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for count in [1usize, 2, 8, 40] {
 		let records: Vec<Vec<u8>> = (0..count)
 			.map(|i| {
@@ -428,7 +432,7 @@ fn a_group_whose_block_ends_cannot_be_allocated_is_refused() {
 	let dir = TempDir::new("alloc_limits").unwrap();
 	let path = dir.path().join("ends.wal");
 	let mut writer = new_writer(&path, CompressionType::Lz4);
-	let before = std::fs::read(&path).unwrap();
+	let before = super::sfs::read(&path).unwrap();
 	let records: Vec<Vec<u8>> = (0..RECORDS).map(|i| value_of(i, 8)).collect();
 	let buf = records.concat();
 	let ends: Vec<usize> = (1..=RECORDS).map(|i| i * 8).collect();
@@ -438,7 +442,7 @@ fn a_group_whose_block_ends_cannot_be_allocated_is_refused() {
 		);
 		assert!(writer.add_records(&buf, &ends).is_err());
 	}
-	assert!(std::fs::read(&path).unwrap() == before, "the segment is byte-identical");
+	assert!(super::sfs::read(&path).unwrap() == before, "the segment is byte-identical");
 	writer.add_records(&buf, &ends).unwrap();
 	assert_eq!(read_records(&path), records, "the writer is not poisoned");
 }

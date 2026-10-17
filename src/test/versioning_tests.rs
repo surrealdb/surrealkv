@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tempdir::TempDir;
 use test_log::test;
 
+use super::tfs;
 use crate::compaction::leveled::Strategy;
 use crate::vlog::ValueLocation;
 use crate::{HistoryOptions, LSMIterator, Options, Transaction, Tree, TreeBuilder};
@@ -1790,6 +1791,9 @@ async fn a_transaction_orders_its_range_deletes_and_writes_by_when_it_did_them()
 /// tables after a restart as well.
 #[test(tokio::test)]
 async fn a_versioned_encrypted_tree_keeps_and_reads_its_history() {
+	if tfs::skip_listed() {
+		return;
+	}
 	use super::encryption_open_tests::{manager, SUITES};
 
 	let big = vec![b'x'; 500];

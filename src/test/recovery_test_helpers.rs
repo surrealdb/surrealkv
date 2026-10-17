@@ -1,14 +1,15 @@
 //! Test helper utilities for LSM recovery integration tests
 
-use std::fs::{self, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::Arc;
 
+use sfs::{self as fs, OpenOptions};
+
+use super::sfs;
 use crate::batch::Batch;
 use crate::memtable::MemTable;
 use crate::wal::manager::Wal;
-use crate::wal::Options;
 use crate::{LSMIterator, Tree};
 
 pub struct RecoveryTestHelper;
@@ -16,7 +17,7 @@ pub struct RecoveryTestHelper;
 impl RecoveryTestHelper {
 	/// Count WAL files in directory
 	pub fn count_wal_files(wal_dir: &Path) -> usize {
-		if !wal_dir.exists() {
+		if !sfs::exists(wal_dir) {
 			return 0;
 		}
 
@@ -39,7 +40,7 @@ impl RecoveryTestHelper {
 
 	/// Count SST files in directory
 	pub fn count_sst_files(sst_dir: &Path) -> usize {
-		if !sst_dir.exists() {
+		if !sfs::exists(sst_dir) {
 			return 0;
 		}
 
@@ -101,8 +102,7 @@ impl WalTestHelper {
 	/// # Returns
 	/// The final sequence number after all segments are created
 	pub fn create_segments(dir: &Path, entries_per_segment: &[usize], starting_seq: u64) -> u64 {
-		let opts = Options::default();
-		let mut wal = Wal::open(dir, opts).unwrap();
+		let mut wal = Wal::open(dir, super::tfs::wal_options_for(dir)).unwrap();
 		let mut current_seq = starting_seq;
 
 		for (seg_idx, &entry_count) in entries_per_segment.iter().enumerate() {
@@ -142,7 +142,7 @@ impl WalTestHelper {
 	) {
 		let segment_path = dir.join(format!("{:020}.wal", segment_id));
 
-		if !segment_path.exists() {
+		if !sfs::exists(&segment_path) {
 			panic!("Segment {} does not exist", segment_id);
 		}
 

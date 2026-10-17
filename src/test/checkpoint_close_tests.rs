@@ -25,7 +25,7 @@ use tempdir::TempDir;
 use test_log::test;
 use tokio::task::JoinHandle;
 
-use super::collect_transaction_all;
+use super::{collect_transaction_all, tfs};
 use crate::checkpoint::{CheckpointGate, CheckpointMetadata, CheckpointStage};
 use crate::lsm::Tree;
 use crate::ring::PipelineHook;
@@ -312,18 +312,27 @@ async fn close_waits_for_the_checkpoint(at: Park, vlog: bool) {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn close_waits_for_a_checkpoint_in_its_flush() {
+	if tfs::skip_listed() {
+		return;
+	}
 	close_waits_for_the_checkpoint(Park::InFlush, false).await;
 	close_waits_for_the_checkpoint(Park::InFlush, true).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn close_waits_for_a_checkpoint_copying_the_sstables() {
+	if tfs::skip_listed() {
+		return;
+	}
 	close_waits_for_the_checkpoint(Park::At(CheckpointStage::SstablesCopied), false).await;
 	close_waits_for_the_checkpoint(Park::At(CheckpointStage::SstablesCopied), true).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn close_waits_for_a_checkpoint_about_to_copy_the_value_log() {
+	if tfs::skip_listed() {
+		return;
+	}
 	close_waits_for_the_checkpoint(Park::At(CheckpointStage::ManifestReleased), false).await;
 	close_waits_for_the_checkpoint(Park::At(CheckpointStage::ManifestReleased), true).await;
 }
@@ -332,6 +341,9 @@ async fn close_waits_for_a_checkpoint_about_to_copy_the_value_log() {
 /// database between the checkpoint's flush and the end of the close.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn the_directory_lock_is_held_until_the_checkpoint_is_over() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_lock").unwrap();
 	let (db, cp) = (root.path().join("db"), root.path().join("cp"));
 	let opts = options(&db, false);
@@ -356,6 +368,9 @@ async fn the_directory_lock_is_held_until_the_checkpoint_is_over() {
 /// Checkpoints do not exclude each other: one that is held does not keep a second one waiting.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_held_checkpoint_does_not_stop_another() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_two").unwrap();
 	let opts = options(&root.path().join("db"), false);
 	let tree = Arc::new(Tree::new(Arc::clone(&opts)).unwrap());
@@ -388,6 +403,9 @@ async fn a_held_checkpoint_does_not_stop_another() {
 /// other tasks keep running, and the checkpoint, which needs no runtime, finishes.
 #[test(tokio::test(flavor = "current_thread"))]
 async fn close_waiting_for_a_checkpoint_does_not_block_the_runtime() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_rt").unwrap();
 	let (db, cp) = (root.path().join("db"), root.path().join("cp"));
 	let opts = options(&db, false);
@@ -428,6 +446,9 @@ async fn close_waiting_for_a_checkpoint_does_not_block_the_runtime() {
 /// finish, and a `close()` after it completes the shutdown.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_close_dropped_while_waiting_for_a_checkpoint_can_be_repeated() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_drop").unwrap();
 	let (db, cp) = (root.path().join("db"), root.path().join("cp"));
 	let opts = options(&db, true);
@@ -461,6 +482,9 @@ async fn a_close_dropped_while_waiting_for_a_checkpoint_can_be_repeated() {
 /// still going. The commit in the group, and the data from before, survive.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_that_begins_while_close_is_running_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_late").unwrap();
 	let (db, cp) = (root.path().join("db"), root.path().join("cp"));
 	let opts = options(&db, false);
@@ -511,6 +535,9 @@ async fn a_checkpoint_that_begins_while_close_is_running_is_refused() {
 /// touches nothing: not the directory it was asked to write, not the closed database.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_on_a_closed_tree_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let root = TempDir::new("ckpt_close_after").unwrap();
 		let (db, cp) = (root.path().join("db"), root.path().join("cp"));
@@ -549,6 +576,9 @@ async fn a_checkpoint_on_a_closed_tree_is_refused() {
 /// refused at once, and neither it nor `close()` is allowed to starve the other.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_that_begins_while_close_waits_for_another_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_second").unwrap();
 	let (db, first, second) =
 		(root.path().join("db"), root.path().join("first"), root.path().join("second"));
@@ -589,6 +619,9 @@ async fn a_checkpoint_that_begins_while_close_waits_for_another_is_refused() {
 /// Three checkpoints are held; `close()` returns after the last of them ends, not the first.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn close_waits_for_the_last_of_several_checkpoints() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_many").unwrap();
 	let opts = options(&root.path().join("db"), false);
 	let tree = Arc::new(Tree::new(Arc::clone(&opts)).unwrap());
@@ -639,6 +672,9 @@ async fn close_waits_for_the_last_of_several_checkpoints() {
 /// stopped, which happens after the checkpoint has entered the gate.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_that_fails_or_panics_does_not_keep_close_waiting() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for how in ["refused", "stopped", "file", "flush", "panic"] {
 		let root = TempDir::new("ckpt_close_fail").unwrap();
 		let (db, cp) = (root.path().join("db"), root.path().join("cp"));
@@ -697,6 +733,9 @@ async fn a_checkpoint_that_fails_or_panics_does_not_keep_close_waiting() {
 /// and refuses every later checkpoint as "closing or closed".
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_close_given_up_while_waiting_does_not_stop_later_checkpoints() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_timeout").unwrap();
 	let (db, cp) = (root.path().join("db"), root.path().join("cp"));
 	let opts = options(&db, false);
@@ -775,6 +814,9 @@ fn the_gate_does_not_lose_the_wake_up_of_a_checkpoint_that_ends_as_close_begins(
 /// over; the doc of `Tree::close` says a commit that begins after the close fails.)
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn commits_that_begin_while_close_waits_for_a_checkpoint_survive() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let root = TempDir::new("ckpt_close_commits").unwrap();
 		let (db, cp) = (root.path().join("db"), root.path().join("cp"));
@@ -833,6 +875,9 @@ fn copy_dir(from: &Path, to: &Path) {
 /// been acknowledged, the ones made while the checkpoint was parked included.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_crash_image_while_close_waits_for_a_checkpoint_recovers_every_acknowledged_commit() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let root = TempDir::new("ckpt_close_crashimage").unwrap();
 		let (db, cp, image) =
@@ -883,6 +928,9 @@ async fn a_crash_image_while_close_waits_for_a_checkpoint_recovers_every_acknowl
 /// image taken during the wait, the copy and the tree after the close hold what they must.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn close_waits_for_a_checkpoint_of_a_recovered_tree() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let root = TempDir::new("ckpt_close_recovered").unwrap();
 		let (first, db, cp) =
@@ -944,6 +992,9 @@ async fn close_waits_for_a_checkpoint_of_a_recovered_tree() {
 /// Closers queued behind one that is dropped while it waits still finish, one after another.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn closers_queued_behind_a_dropped_one_still_finish() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_queue").unwrap();
 	let (db, cp) = (root.path().join("db"), root.path().join("cp"));
 	let opts = options(&db, true);
@@ -976,6 +1027,9 @@ async fn closers_queued_behind_a_dropped_one_still_finish() {
 /// running; neither panics, and everything is intact after.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn dropping_a_tree_handle_while_a_checkpoint_runs_waits_for_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_dropclone").unwrap();
 	let (db, cp) = (root.path().join("db"), root.path().join("cp"));
 	let opts = options(&db, true);
@@ -1017,6 +1071,9 @@ async fn dropping_a_tree_handle_while_a_checkpoint_runs_waits_for_it() {
 /// checkpoint after it is the closed error, not a panic or a hang.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_after_a_close_that_failed_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let root = TempDir::new("ckpt_close_failedclose").unwrap();
 	let (db, cp) = (root.path().join("db"), root.path().join("cp"));
 	let opts = Arc::new(Options {
@@ -1042,6 +1099,9 @@ async fn a_checkpoint_after_a_close_that_failed_is_refused() {
 /// closed refusal.
 #[test(tokio::test(flavor = "current_thread"))]
 async fn checkpoints_called_on_a_single_thread_runtime_while_close_is_pending_do_not_deadlock() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let root = TempDir::new("ckpt_close_current").unwrap();
 		let db = root.path().join("db");
@@ -1171,6 +1231,9 @@ fn pause_until(flag: &AtomicBool) {
 /// the source.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 6))]
 async fn a_checkpoint_racing_close_is_a_valid_copy_or_a_clean_refusal() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (mut copies, mut refusals) = (0, 0);
 	let (mut forced, pauses) = (0, Arc::new(AtomicUsize::new(0)));
 	for round in 0..rounds(12) {
@@ -1364,6 +1427,9 @@ async fn a_checkpoint_racing_close_is_a_valid_copy_or_a_clean_refusal() {
 /// The pool is process-wide, so the test runs itself again in a child process.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_racing_close_with_a_global_pool_is_a_valid_copy_or_a_clean_refusal() {
+	if tfs::skip_listed() {
+		return;
+	}
 	const NAME: &str =
 		"a_checkpoint_racing_close_with_a_global_pool_is_a_valid_copy_or_a_clean_refusal";
 	if std::env::var_os("CHECKPOINT_CLOSE_POOL_CHILD").is_none() {

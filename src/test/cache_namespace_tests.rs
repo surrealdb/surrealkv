@@ -233,7 +233,7 @@ fn log_in(base: &Options) -> (VLog, TempDir, Arc<Options>) {
 	let dir = TempDir::new().unwrap();
 	let mut opts = base.clone();
 	opts.path = dir.path().to_path_buf();
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 	let opts = Arc::new(opts);
 	let log = VLog::new(Arc::clone(&opts)).unwrap();
 	(log, dir, opts)

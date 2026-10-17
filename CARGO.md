@@ -20,7 +20,7 @@
 
 SurrealKV is a high-performance, embedded key-value storage engine built on a modern Log-Structured Merge (LSM) tree architecture. Commits go through an asynchronous commit pipeline; point reads and iteration are synchronous, and `get_async` is available as an opt-in asynchronous point read.
 
-It is designed as an independent, standalone key-value store suitable for high-throughput server workloads, embedded systems, and desktop applications. Storage primitives for browser WebAssembly over the Origin Private File System (OPFS) are included, but are not yet wired into `Tree`.
+It is designed as an independent, standalone key-value store suitable for high-throughput server workloads, embedded systems, and desktop applications. A `Tree` can also run in a browser, in a dedicated Web Worker, and keep its files in the Origin Private File System (OPFS): see [WebAssembly & OPFS](#webassembly--opfs) for what works and what does not.
 
 ---
 
@@ -112,7 +112,7 @@ Resting and peak memory are the lowest and highest process memory sampled across
 - **Async Commit Pipeline**: Concurrent commit pipeline built on lock-free ring buffers and optimistic concurrency control (OCC), awaited asynchronously. Point reads and iteration are synchronous; `get_async` is an opt-in asynchronous point read.
 - **Snapshot Isolation**: Multi-version concurrency control with non-blocking concurrent reads and isolated read transactions.
 - **Versioned Queries**: Opt in with `with_versioning(true, retention_ns)`. Every write is stamped with its timestamp (`set_at`, or the time of the commit) and kept with its value. `get_at(key, ts)` reads a key as of a time, `history` returns every version of a key newest timestamp first, with its timestamp, and compaction keeps the versions for the retention period, or for ever with `0`. Versions can be written for a time in the past. It needs no value log and no index.
-- **Origin Private File System (OPFS) Primitives**: `LogStore` and `ObjectStore` implementations over `FileSystemSyncAccessHandle` for Web Workers (`surrealkv::storage::opfs`, `wasm32` only, doc-hidden and not part of the stable API). They are not yet wired into `Tree`, so a `Tree` does not persist to OPFS yet.
+- **Browser Persistence over OPFS**: In a dedicated Web Worker, a `Tree` keeps its write-ahead log, SSTables, value log and manifest in the Origin Private File System (`FileSystem::opfs`, `wasm32-unknown-unknown`). Chrome is the only browser that is tested, and encryption, checkpoints and the migrators are not available there yet. See [WebAssembly & OPFS](#webassembly--opfs).
 - **Automated Zero-Effort Migration**: Opening an existing database converts it. The conversion is one way: the original files are moved to a backup directory inside it, but the backup is not a rollback point (the value log is shared, and its garbage collection follows the new tables), and a database that this version has opened can no longer be opened by an earlier release. Take a copy of the directory first if you may need to go back:
   - SurrealKV v0.20 and v0.21 databases, migrated when they are opened: the retained versions with their sequence numbers and timestamps, and the unflushed write-ahead log. The old files are kept in `_surrealkv_v0_backup/`.
   - RocksDB databases written by SurrealDB (RocksDB 8 to 11, read without linking RocksDB) via `surrealkv-compat-rocksdb`: a database that SurrealDB ran in versioned mode is migrated with the versions it stores and their timestamps (converted from SurrealDB's hybrid logical clock to nanoseconds); any other keeps the newest value of each key. Blob files and the write-ahead log are read. The database must not be open in RocksDB while it is migrated, and its files are kept in `_rocksdb_backup/`. A tree opened with `with_versioning(true, retention_ns)` keeps those versions as its retention says, and answers `get_at` and `history` for them.
@@ -185,7 +185,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-Commits use `Durability::Eventual` by default, so a commit does not wait for an fsync. Call `tx.set_durability(Durability::Immediate)` before `commit()` to make a commit durable before it returns.
+Commits use `Durability::Eventual` by default, so a commit does not wait for an fsync. Call `tx.set_durability(Durability::Immediate)` before `commit()` to make the commit wait for a sync of the write-ahead log before it returns. In a browser that sync is weaker: see [Durability in a browser](#durability-in-a-browser).
 
 ---
 
@@ -433,17 +433,108 @@ skv migrate path/to/rocksdb_dir path/to/new_surrealkv_db
 
 ---
 
-## WebAssembly & OPFS Storage Primitives
+## WebAssembly & OPFS
 
-SurrealKV builds for WebAssembly (`wasm32-unknown-unknown`). On that target, `surrealkv::storage::opfs` (doc-hidden, not part of the stable API) provides `LogStore` and `ObjectStore` implementations over the Origin Private File System (OPFS), using `FileSystemSyncAccessHandle` inside Web Workers.
+SurrealKV builds for WebAssembly (`wasm32-unknown-unknown`). In a browser, a `Tree` can keep its files in the Origin Private File System (OPFS), so that a page does not need IndexedDB to store a database.
 
-These are storage primitives only. They are not yet wired into `Tree`, which opens its WAL, SSTable and value-log files through `std::fs`, so a `Tree` cannot persist to OPFS today. CI builds the crate for `wasm32-unknown-unknown` and tests the OPFS primitives in headless Chrome, but it does not run a `Tree` on that target.
+### What works
 
-To compile for WebAssembly:
+- A `Tree` in a dedicated Web Worker, over files in the OPFS: open, commit, read, flush, compaction, `close`, and open again, in the same worker or, once the old worker has released its files, in a new one.
+- Write-ahead log replay when a database was not closed, with repair of a torn tail of the log.
+- The value log (`with_enable_vlog(true)`), which the browser tests cover. Versioned queries and the zstd, lz4 and snappy block codecs are built for the browser and tested over the memory file system on a native build, but not yet in a browser.
+- `FileSystem::memory()`, on any target and in any thread of a browser, including the main thread of a page. It keeps a database in memory and loses it with the page.
+
+The code runs on one thread. There is no async runtime to start, no thread to spawn and no `affinitypool` to install. A build with WebAssembly threads (`atomics`) is refused at compile time.
+
+### Limits
+
+- **A dedicated worker only.** The browser gives the synchronous file handles that the engine needs to dedicated workers only. A `Tree` over the OPFS cannot run on the main thread of a page, and the other kinds of worker are not supported.
+- **One tab per database.** A mount takes an exclusive lock on the database. It waits about five seconds for a worker that is closing, and then a second mount of the same name fails with an error for which `Error::is_database_locked` is true.
+- **Chrome is the only browser that is tested.** Firefox and Safari have not been examined.
+- **Not available yet:** encryption at rest, `create_checkpoint` and `restore_from_checkpoint`, the path-based tools (`inspect_db`, `describe_file` and `scrub_db`), and every migrator (RocksDB, SurrealKV v0.x and IndexedDB). Encryption and the two checkpoint calls fail with `Error::InvalidArgument` before they create anything. A directory in the file system that holds a RocksDB database, an IndexedDB dump or an interrupted migration is refused with `Error::MigrationFailed`, and nothing is moved or created. The path-based tools read the files of the operating system, which a browser does not have, and fail with an I/O error. Data in IndexedDB is not moved to the OPFS, and SurrealKV never deletes it.
+- **The files are not a database directory.** The files of a database in the OPFS are kept in a pool of files with their own format. A native build cannot open them, and there is no export yet.
+- **A fixed number of files.** The pool holds a fixed maximum number of files. A database that reaches it fails with an error that says so. A session that writes and ends without a close leaves its records to the next open, which puts them in a table, and small tables are merged only as the database grows, so a database that is opened, written to a little and left thousands of times can reach the limit. Close the `Tree` when the application ends.
+- **The browser can evict the storage.** Unless the page has asked the browser to keep the storage of the origin (`navigator.storage.persist()`, which a worker cannot call), the browser can remove it when the disk fills. `FileSystem::persisted().await` tells the worker whether the request was granted.
+- **A full disk is an error.** When the browser refuses more storage (`QuotaExceededError`), the write fails with an error of kind `StorageFull`. A flush or a compaction that meets it fails and is tried again later, without stopping the database. A commit that meets it fails, and if part of its commit group was already applied the database can stop: close it and open it again. The first commit after the space returns can fail once.
+- **Memory is not bounded by the size of the memtable.** `max_memtable_size` counts the keys and the structure of the entries, not the values, which are on the heap. A worker that writes large values holds them in memory until the memtable is flushed. Enable the value log to keep the values over its threshold out of the memtable, and size the worker's data with its address space (at most 4 GiB) in mind.
+- **Long jobs block the worker.** A flush and a compaction run without a pause, so the worker does not answer other messages while one runs.
+- **Close the tree.** The worker cannot wait for an asynchronous close in a page-unload handler. Close the `Tree`, and then the `FileSystem`, when your application knows that it is ending, for example on a message from the page, and do it early: closing a `FileSystem` takes longer the more files the database has. A database that was not closed is opened again like one that a crash left behind. After a reload without a close, the browser can take longer than the default wait to release the lock: the mount then fails with `Error::is_database_locked`, and can be tried again, or use `FileSystem::opfs_with_lock_wait` to wait longer.
+
+### Durability in a browser
+
+`Durability::Eventual` is the default on every platform, in a browser too. With `Durability::Immediate`, a commit asks the browser to flush the file handle of the log before it returns. In a browser, `flush()` on a file handle asks the browser to try to transfer the cached changes to the storage device. The specification calls it an attempt and says that it can do nothing on some file systems, and browsers do not document what survives a power cut or a crash of the operating system. Do not rely on it to keep a commit through either, on any browser.
+
+### Use
+
+`FileSystem::opfs` mounts the files of a database by name, `TreeBuilder::with_file_system` gives them to a tree, and `build_async` opens it. Run the code in a dedicated worker, on whatever drives your futures there (for example `wasm_bindgen_futures::spawn_local`).
+
+```rust,ignore
+use surrealkv::{Durability, FileSystem, TreeBuilder};
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Mount the files of the database called "mydb". This fails if another tab or worker has it.
+    let fs = FileSystem::opfs("mydb").await?;
+
+    let tree = TreeBuilder::new()
+        .with_file_system(fs.clone())
+        .with_path("db".into())
+        .build_async()
+        .await?;
+
+    {
+        let mut tx = tree.begin()?;
+        tx.set(b"user:001", b"Alice")?;
+        tx.set_durability(Durability::Immediate);
+        tx.commit().await?;
+    }
+
+    {
+        let tx = tree.begin()?;
+        if let Some(val) = tx.get(b"user:001")? {
+            // use `val`
+        }
+    }
+
+    // Close the tree, and then release the files, when the application ends.
+    tree.close().await?;
+    fs.close().await?;
+    Ok(())
+}
+```
+
+`FileSystem::destroy_opfs("mydb").await?` removes the files of a database that is not mounted.
+
+### Build
 
 ```bash
-RUSTFLAGS="--cfg getrandom_backend=\"wasm_js\"" cargo build --target wasm32-unknown-unknown
+rustup target add wasm32-unknown-unknown
+cargo build --target wasm32-unknown-unknown
 ```
+
+No `RUSTFLAGS` are needed. The engine links zstd, which is C code, so a build that links an application or a test needs a C compiler and an archiver that write WebAssembly archives correctly. The archiver that comes with macOS writes an archive that has no members for WebAssembly objects, and the link can then fail. On macOS, use the compiler and the archiver of LLVM:
+
+```bash
+brew install llvm
+export CC_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/clang"
+export AR_wasm32_unknown_unknown="$(brew --prefix llvm)/bin/llvm-ar"
+```
+
+On Linux, `clang` and `llvm-ar` (a versioned name such as `llvm-ar-18` is common) serve the same purpose. `scripts/check-zstd-archive.sh target/wasm32-unknown-unknown` reports an archive that has no members.
+
+### Test
+
+The browser tests need Chrome and `wasm-pack`. Each `tests/opfs_*.rs` target runs in headless Chrome, in a dedicated worker:
+
+```bash
+WASM_BINDGEN_TEST_TIMEOUT=300 WASM_BINDGEN_USE_DEDICATED_WORKER=1 \
+  wasm-pack test --headless --chrome --test opfs_engine_test
+WASM_BINDGEN_TEST_TIMEOUT=300 WASM_BINDGEN_USE_DEDICATED_WORKER=1 \
+  wasm-pack test --headless --chrome -- --lib
+```
+
+`opfs_engine_test` runs a `Tree` over the real OPFS: it commits enough data to rotate the log, flush and compact, closes and opens the database again, mounts the files again, opens a database that was left without a close, and repairs a torn log tail, with and without the value log. The tests that simulate a crash release the file handles without flushing. They do not terminate a worker, and they do not cut the power.
+
+CI runs these tests (every `tests/opfs_*.rs` target and the `--lib` unit tests) in headless Chrome on Linux. The tests of the IndexedDB reader run in Node.js only: the Chrome run skips them. CI also checks, lints and builds the crate for `wasm32-unknown-unknown`, and checks the zstd archive of that build when one is present, and fails if it has no members. The unit tests of the library also run in CI over the memory file system, which uses the same pool logic as the browser over a memory backend instead of the OPFS. The tests that need a real directory, encryption or checkpoints skip themselves.
 
 ---
 
@@ -459,7 +550,8 @@ RUSTFLAGS="--cfg getrandom_backend=\"wasm_js\"" cargo build --target wasm32-unkn
 | **WebAssembly** | `wasm32-unknown-unknown` | Tier 2 |
 
 - **Tier 1**: built and tested in CI.
-- **Tier 2**: built in CI, but the test suite is not run on that target. Windows tests are skipped, and the Linux `aarch64` and macOS `x86_64` builds are cross-compiled while the tests run on the CI runner's own architecture. For WebAssembly only the OPFS storage primitives are tested (in headless Chrome); `Tree` is not run.
+- **Tier 2**: built in CI, but the native test suite is not run on that target. Windows tests are skipped, and the Linux `aarch64` and macOS `x86_64` builds are cross-compiled while the tests run on the CI runner's own architecture.
+- **WebAssembly** (Tier 2): the crate is checked, linted and built for the target in CI. CI also runs the browser tests in headless Chrome, in a dedicated worker: every `tests/opfs_*.rs` target, which includes a `Tree` over the real OPFS, and the unit tests of the library. Other browsers are not tested. See [WebAssembly & OPFS](#webassembly--opfs).
 
 WAL appends and syncs, `get_async` block reads and parallel WAL replay go through `affinitypool`, which runs them on a worker pool when the host application installs one and otherwise inline on the calling thread. SurrealKV does not install a pool itself. Point reads and iteration are plain synchronous `pread` calls on the calling thread. `io_uring` is not used.
 

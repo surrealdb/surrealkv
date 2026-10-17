@@ -14,7 +14,6 @@ use std::time::{Duration, Instant};
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
 use super::manifest_write_failure_tests::{
 	copy_dir_all,
 	count_attempts,
@@ -31,6 +30,7 @@ use super::manifest_write_failure_tests::{
 	REACHED,
 	STUCK,
 };
+use super::{collect_transaction_all, tfs};
 use crate::error::{BackgroundErrorReason, ErrorSeverity, Result};
 use crate::levels::{fail_replacements, heal_replacements, ReplaceFailure};
 use crate::lsm::FlushHook;
@@ -196,6 +196,9 @@ async fn concurrent_committers_ride_out_transient_manifest_failures() {
 /// The retry on a current-thread runtime, where the flush task and the committers share one thread.
 #[test(tokio::test(flavor = "current_thread"))]
 async fn a_failed_manifest_write_is_retried_on_a_current_thread_runtime() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_current_thread").unwrap();
 	let tree = open(dir.path());
 	let mut expected = put(&tree, 0..200).await;
@@ -223,6 +226,9 @@ async fn a_failed_manifest_write_is_retried_on_a_current_thread_runtime() {
 /// is listed once, the copy holds everything and so does a reopen. The database stays stopped.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn an_uncertain_failure_then_a_checkpoint_keeps_every_commit() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_uncertain_ckpt").unwrap();
 	let out = TempDir::new("manifest_retry_uncertain_ckpt_out").unwrap();
 	let tree = open(dir.path());
@@ -265,6 +271,9 @@ async fn an_uncertain_failure_then_a_checkpoint_keeps_every_commit() {
 /// do; that counts as a success, so the database resumes.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_that_drains_the_queue_lets_the_retry_recover() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_ckpt_drains").unwrap();
 	let out = TempDir::new("manifest_retry_ckpt_drains_out").unwrap();
 	let tree = open(dir.path());
@@ -305,6 +314,9 @@ async fn a_checkpoint_that_drains_the_queue_lets_the_retry_recover() {
 /// writes, a flush, another reopen.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_crash_image_cut_while_the_retry_is_parked_reopens_whole() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_image_parked").unwrap();
 	let images = TempDir::new("manifest_retry_image_parked_img").unwrap();
 	let tree = open(dir.path());
@@ -342,6 +354,9 @@ async fn a_crash_image_cut_while_the_retry_is_parked_reopens_whole() {
 /// with every commit, and it keeps working like the parked one.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_crash_image_cut_after_an_uncertain_failure_keeps_working() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_image_uncertain").unwrap();
 	let images = TempDir::new("manifest_retry_image_uncertain_img").unwrap();
 	let tree = open(dir.path());
@@ -425,6 +440,9 @@ async fn a_failed_middle_flush_keeps_the_order_of_overwrites() {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn an_uncertain_middle_flush_keeps_the_order_of_overwrites() {
+	if tfs::skip_listed() {
+		return;
+	}
 	overwrites_across_memtables(ReplaceFailure::AfterRename).await;
 }
 
@@ -435,6 +453,9 @@ async fn an_uncertain_middle_flush_keeps_the_order_of_overwrites() {
 /// does not start a retry loop under the fatal error, and when it succeeds the error stays.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_after_an_uncertain_failure_settles_the_manifest_before_it_writes_the_table() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_settle").unwrap();
 	let out = TempDir::new("manifest_retry_settle_out").unwrap();
 	let tree = open(dir.path());
@@ -450,11 +471,11 @@ async fn a_flush_after_an_uncertain_failure_settles_the_manifest_before_it_write
 	assert_eq!(attempts.load(Ordering::SeqCst), 1);
 
 	// The manifest on disk lists the table, whose file is complete.
-	let listed = std::fs::read(&manifest).unwrap();
+	let listed = super::sfs::read(&manifest).unwrap();
 	let sst = tree.core.inner.opts.sstable_file_path(1);
-	let before = std::fs::metadata(&sst).unwrap();
+	let before = super::sfs::metadata(&sst).unwrap();
 	let unchanged = || {
-		let after = std::fs::metadata(&sst).unwrap();
+		let after = super::sfs::metadata(&sst).unwrap();
 		after.len() == before.len() && after.modified().unwrap() == before.modified().unwrap()
 	};
 
@@ -467,7 +488,7 @@ async fn a_flush_after_an_uncertain_failure_settles_the_manifest_before_it_write
 	tokio::time::sleep(Duration::from_secs(1)).await;
 	assert_eq!(attempts.load(Ordering::SeqCst), 1, "no flush got as far as the table");
 	assert!(unchanged(), "the table was rewritten under a manifest that may list it");
-	assert_eq!(std::fs::read(&manifest).unwrap(), listed);
+	assert_eq!(super::sfs::read(&manifest).unwrap(), listed);
 	assert_eq!(immutables(&tree), 1, "the failed wake is not retried");
 
 	// The write of the manifest fails once more, now in a checkpoint, which reports it.
@@ -486,7 +507,7 @@ async fn a_flush_after_an_uncertain_failure_settles_the_manifest_before_it_write
 	let hook: FlushHook = {
 		let (seen, manifest) = (Arc::clone(&seen), manifest.clone());
 		Arc::new(move |_| {
-			*seen.lock().unwrap() = Some(std::fs::read(&manifest).unwrap());
+			*seen.lock().unwrap() = Some(super::sfs::read(&manifest).unwrap());
 			Ok(())
 		})
 	};
@@ -521,7 +542,7 @@ async fn an_sst_write_failure_is_retried_too() {
 	rotate(&tree);
 	let id = tree.core.inner.immutable_memtables.read().unwrap().first().unwrap().table_id;
 	let obstacle = tree.core.inner.opts.sstable_file_path(id);
-	std::fs::create_dir_all(&obstacle).unwrap();
+	super::sfs::create_dir_all(&obstacle).unwrap();
 	wake(&tree);
 	wait_until("the failure to be recorded", || !error_is_clear(&tree)).await;
 	tokio::time::sleep(GRACE).await;
@@ -532,7 +553,7 @@ async fn an_sst_write_failure_is_retried_too() {
 	assert!(commit_one(&tree, 9_999).await.is_err());
 	assert_eq!(immutables(&tree), 1);
 
-	std::fs::remove_dir_all(&obstacle).unwrap();
+	super::sfs::remove_dir_all(&obstacle).unwrap();
 	wait_until("the error to clear", || error_is_clear(&tree)).await;
 	assert_eq!(immutables(&tree), 0);
 	expected.extend(put(&tree, 200..250).await);
@@ -581,6 +602,9 @@ async fn a_value_log_sync_failure_in_the_flush_is_retried() {
 /// it fails, and writers after the recovery go through.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_writer_stalled_on_the_queue_is_released_by_a_failed_flush() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_stalled").unwrap();
 	let mut opts = options(dir.path());
 	opts.memtable_stall_threshold = 2;
@@ -627,6 +651,9 @@ async fn a_writer_stalled_on_the_queue_is_released_by_a_failed_flush() {
 /// and leaves the database stopped, with no writer left waiting.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_retry_that_turns_fatal_ends_the_retrying_and_keeps_the_database_stopped() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_turns_fatal").unwrap();
 	let tree = open(dir.path());
 	let expected = put(&tree, 0..300).await;
@@ -684,6 +711,9 @@ async fn a_retry_that_turns_fatal_ends_the_retrying_and_keeps_the_database_stopp
 /// Failures that come and go: every one is recorded, every success ends it, and nothing is lost.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn repeated_failures_and_recoveries_lose_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_flaps").unwrap();
 	let tree = open(dir.path());
 	let manifest = manifest_path(&tree);
@@ -715,6 +745,9 @@ async fn repeated_failures_and_recoveries_lose_nothing() {
 /// enough failures the pause is long, and the shutdown must cut it short.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn close_cuts_short_the_wait_between_two_attempts() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_close_wait").unwrap();
 	let tree = open(dir.path());
 	put(&tree, 0..200).await;
@@ -765,6 +798,9 @@ async fn a_close_racing_the_retry_loses_nothing() {
 /// once the disk is back, and holds every commit.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_tree_dropped_while_the_flush_keeps_failing_releases_the_directory() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_retry_drop").unwrap();
 	let tree = open(dir.path());
 	let expected = put(&tree, 0..200).await;
@@ -800,15 +836,18 @@ async fn a_tree_dropped_while_the_flush_keeps_failing_releases_the_directory() {
 /// shutdown flush writes it and a reopen finds every commit.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_rename_that_fails_stays_fatal_and_leaves_no_file() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_rename_fails").unwrap();
 	let tree = open(dir.path());
 	let expected = put(&tree, 0..300).await;
 	let manifest = manifest_path(&tree);
-	let saved = std::fs::read(&manifest).unwrap();
+	let saved = super::sfs::read(&manifest).unwrap();
 
-	std::fs::remove_file(&manifest).unwrap();
-	std::fs::create_dir(&manifest).unwrap();
-	std::fs::write(manifest.join("held"), b"held").unwrap();
+	super::sfs::remove_file(&manifest).unwrap();
+	super::sfs::create_dir(&manifest).unwrap();
+	super::sfs::write(manifest.join("held"), b"held").unwrap();
 
 	let attempts = count_attempts(&tree);
 	flush_in_background(&tree);
@@ -831,8 +870,8 @@ async fn a_rename_that_fails_stays_fatal_and_leaves_no_file() {
 	assert!(table_ids(&tree).is_empty(), "the in-memory manifest is as it was");
 	assert_contents(&tree, &expected, "the stopped tree");
 
-	std::fs::remove_dir_all(&manifest).unwrap();
-	std::fs::write(&manifest, saved).unwrap();
+	super::sfs::remove_dir_all(&manifest).unwrap();
+	super::sfs::write(&manifest, saved).unwrap();
 	tree.close().await.unwrap();
 	let reopened = open(dir.path());
 	assert_contents(&reopened, &expected, "the reopened tree");
@@ -846,8 +885,12 @@ async fn a_rename_that_fails_stays_fatal_and_leaves_no_file() {
 #[cfg(unix)]
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_manifest_that_cannot_be_synced_after_the_rename_stays_fatal() {
-	use std::fs::Permissions;
+	if tfs::skip_listed() {
+		return;
+	}
 	use std::os::unix::fs::PermissionsExt;
+
+	use super::sfs::Permissions;
 
 	let dir = TempDir::new("manifest_unreadable").unwrap();
 	let images = TempDir::new("manifest_unreadable_image").unwrap();
@@ -855,10 +898,10 @@ async fn a_manifest_that_cannot_be_synced_after_the_rename_stays_fatal() {
 	let expected = put(&tree, 0..300).await;
 	let manifest = manifest_path(&tree);
 
-	std::fs::set_permissions(&manifest, Permissions::from_mode(0o000)).unwrap();
-	if std::fs::File::open(&manifest).is_ok() {
+	super::sfs::set_permissions(&manifest, Permissions::from_mode(0o000)).unwrap();
+	if super::sfs::File::open(&manifest).is_ok() {
 		// The mode does not stop this user (root), so there is no failure to observe.
-		std::fs::set_permissions(&manifest, Permissions::from_mode(0o644)).unwrap();
+		super::sfs::set_permissions(&manifest, Permissions::from_mode(0o644)).unwrap();
 		tree.close().await.unwrap();
 		return;
 	}
@@ -884,7 +927,7 @@ async fn a_manifest_that_cannot_be_synced_after_the_rename_stays_fatal() {
 	assert!(table_ids(&tree).is_empty(), "the in-memory manifest is as it was");
 
 	// The renamed manifest is on disk: a crash now leaves the table listed, with its data.
-	std::fs::set_permissions(&manifest, Permissions::from_mode(0o644)).unwrap();
+	super::sfs::set_permissions(&manifest, Permissions::from_mode(0o644)).unwrap();
 	let image = images.path().join("crash");
 	copy_dir_all(dir.path(), &image);
 	let recovered = open(&image);
@@ -917,6 +960,9 @@ fn most_attempts_within(elapsed: Duration) -> usize {
 /// A flush that keeps failing is not run in a loop: the waits between the attempts grow.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_that_keeps_failing_is_retried_with_growing_waits() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_backoff").unwrap();
 	let tree = open(dir.path());
 	put(&tree, 0..300).await;
@@ -985,6 +1031,9 @@ async fn a_failure_of_a_later_queued_memtable_is_retried_and_ends() {
 /// nothing itself.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_that_flushes_the_failed_memtable_ends_the_stop() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("manifest_drained").unwrap();
 	let out = TempDir::new("manifest_drained_out").unwrap();
 	let tree = open(dir.path());
@@ -1030,7 +1079,7 @@ async fn a_checkpoint_that_flushes_the_failed_memtable_ends_the_stop() {
 
 /// The WAL segments of a database directory that hold records, by number.
 fn non_empty_segments(dir: &Path) -> Vec<u64> {
-	let mut ids: Vec<u64> = std::fs::read_dir(dir.join("wal"))
+	let mut ids: Vec<u64> = super::sfs::read_dir(dir.join("wal"))
 		.unwrap()
 		.map(|e| e.unwrap())
 		.filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
@@ -1146,11 +1195,17 @@ async fn a_failed_flush_on_a_recovered_tree(at: ReplaceFailure) {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_manifest_write_that_fails_once_on_a_recovered_tree_is_retried_and_loses_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_failed_flush_on_a_recovered_tree(ReplaceFailure::BeforeRename).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn an_uncertain_manifest_write_on_a_recovered_tree_loses_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_failed_flush_on_a_recovered_tree(ReplaceFailure::AfterRename).await;
 }
 
@@ -1210,10 +1265,16 @@ async fn a_recovery_flush_that_cannot_write_the_manifest(at: ReplaceFailure) {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_recovery_flush_that_fails_before_the_rename_fails_the_open_and_loses_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_recovery_flush_that_cannot_write_the_manifest(ReplaceFailure::BeforeRename).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_recovery_flush_that_fails_after_the_rename_fails_the_open_and_loses_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_recovery_flush_that_cannot_write_the_manifest(ReplaceFailure::AfterRename).await;
 }

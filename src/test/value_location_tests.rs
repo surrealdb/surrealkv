@@ -139,7 +139,7 @@ fn separating_a_value_to_the_value_log_keeps_its_timestamp() {
 		enable_vlog: true,
 		..Default::default()
 	});
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 	let vlog = Arc::new(VLog::new(Arc::clone(&opts)).unwrap());
 	let key = InternalKey::new(b"key".to_vec(), 5, InternalKeyKind::Set);
 
@@ -173,7 +173,7 @@ fn the_end_key_of_a_range_delete_is_never_read_as_a_value_location() {
 		enable_vlog: true,
 		..Default::default()
 	});
-	std::fs::create_dir_all(opts.vlog_dir()).unwrap();
+	crate::test::tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 	let vlog = Arc::new(VLog::new(Arc::clone(&opts)).unwrap());
 	let key = InternalKey::new(b"start".to_vec(), 5, InternalKeyKind::RangeDelete);
 

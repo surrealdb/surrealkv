@@ -2,7 +2,6 @@
 //! names. In a database that is encrypted it reads the start of each of them first: what is not a
 //! file that this database could have left is refused, with the open, and nothing is deleted.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -22,6 +21,7 @@ use super::encryption_open_tests::{
 	KEYS,
 	SUITES,
 };
+use super::{sfs, sfs as fs, tfs};
 use crate::error::EncryptionError;
 use crate::tde::CipherSuite;
 use crate::{Options, Tree};
@@ -44,6 +44,9 @@ fn table_file(dir: &Path, id: u64) -> PathBuf {
 
 #[tokio::test]
 async fn a_table_of_another_database_refuses_the_open_and_nothing_is_deleted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -103,7 +106,10 @@ async fn a_table_of_another_database_refuses_the_open_and_nothing_is_deleted() {
 				"{what}: {label}: a refused open changed or removed a file"
 			);
 			for id in leftovers {
-				assert!(table_file(&sstables, id).exists(), "{what}: {label}: {id} was deleted");
+				assert!(
+					sfs::exists(table_file(&sstables, id)),
+					"{what}: {label}: {id} was deleted"
+				);
 			}
 			fs::remove_file(&stranger).unwrap();
 		}
@@ -112,7 +118,7 @@ async fn a_table_of_another_database_refuses_the_open_and_nothing_is_deleted() {
 		// always did, and keeps what is its own.
 		let tree = Tree::new(Arc::clone(&opts)).unwrap();
 		for id in leftovers {
-			assert!(!table_file(&sstables, id).exists(), "{what}: {id} is still there");
+			assert!(!sfs::exists(table_file(&sstables, id)), "{what}: {id} is still there");
 		}
 		assert_eq!(files_with_extension(&sstables, "sst").len(), 2, "{what}");
 		let mut expected = rounds('1', 0..KEYS);
@@ -124,6 +130,9 @@ async fn a_table_of_another_database_refuses_the_open_and_nothing_is_deleted() {
 
 #[tokio::test]
 async fn a_database_that_is_not_encrypted_cleans_up_by_name_as_it_always_did() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let root = dir.path().join("plain");
 	let opts = plain(&root);
@@ -145,7 +154,7 @@ async fn a_database_that_is_not_encrypted_cleans_up_by_name_as_it_always_did() {
 
 	let tree = Tree::new(Arc::clone(&opts)).unwrap();
 	for id in [9001, 9002, 9003] {
-		assert!(!table_file(&sstables, id).exists(), "{id} is still there");
+		assert!(!sfs::exists(table_file(&sstables, id)), "{id} is still there");
 	}
 	assert_eq!(files_with_extension(&sstables, "sst"), own);
 	read(&tree, &rounds('1', 0..KEYS));

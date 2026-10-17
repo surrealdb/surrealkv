@@ -10,6 +10,10 @@
 //! write-ahead log. A database that is not closed cleanly is recovered from its log with the key.
 
 #![cfg(all(not(target_arch = "wasm32"), feature = "encryption"))]
+#![allow(
+	clippy::disallowed_methods,
+	reason = "a test looks at the files that a database leaves on a disk"
+)]
 
 use std::collections::BTreeMap;
 use std::fs;

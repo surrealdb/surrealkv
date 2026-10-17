@@ -24,6 +24,7 @@ use super::encryption_open_tests::{
 	ROOT,
 	SUITES,
 };
+use super::tfs;
 use crate::error::EncryptionError;
 use crate::tde::{
 	describe_manifest_file,
@@ -78,6 +79,9 @@ fn vlog_ids(checkpoint: &Path) -> Vec<u32> {
 #[tokio::test]
 async fn a_checkpoint_of_an_encrypted_database_holds_the_sealed_manifest_as_it_is_and_restores_with_the_key(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let checkpoints = TempDir::new().unwrap();
@@ -130,6 +134,9 @@ async fn a_checkpoint_of_an_encrypted_database_holds_the_sealed_manifest_as_it_i
 
 #[tokio::test]
 async fn a_checkpoint_of_another_kind_or_database_is_refused_before_anything_is_cleared() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let checkpoints = TempDir::new().unwrap();
@@ -169,6 +176,9 @@ async fn a_checkpoint_of_another_kind_or_database_is_refused_before_anything_is_
 
 #[tokio::test]
 async fn a_checkpoint_of_the_same_database_in_another_suite_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for (suite, other) in [
 		(CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305),
 		(CipherSuite::XChaCha20Poly1305, CipherSuite::Aes256Gcm),
@@ -202,6 +212,9 @@ async fn a_checkpoint_of_the_same_database_in_another_suite_is_refused() {
 
 #[tokio::test]
 async fn an_encrypted_checkpoint_is_not_restored_into_a_database_that_is_not_encrypted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let checkpoints = TempDir::new().unwrap();
 	let sealed_cp = checkpoints.path().join("sealed");
@@ -227,6 +240,9 @@ async fn an_encrypted_checkpoint_is_not_restored_into_a_database_that_is_not_enc
 #[tokio::test]
 async fn the_value_log_of_a_checkpoint_is_checked_from_its_first_bytes_before_anything_is_cleared()
 {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let checkpoints = TempDir::new().unwrap();
@@ -287,6 +303,9 @@ async fn the_value_log_of_a_checkpoint_is_checked_from_its_first_bytes_before_an
 
 #[tokio::test]
 async fn a_checkpoint_that_was_taken_while_the_value_log_was_written_is_valid() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let checkpoints = TempDir::new().unwrap();
@@ -361,6 +380,9 @@ async fn a_checkpoint_that_was_taken_while_the_value_log_was_written_is_valid() 
 #[tokio::test]
 async fn a_table_that_does_not_open_for_want_of_a_key_is_a_key_error_and_not_a_damaged_checkpoint()
 {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let checkpoints = TempDir::new().unwrap();

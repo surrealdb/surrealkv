@@ -27,6 +27,11 @@
 //! its `LOCK` file with a POSIX record lock, which the lock SurrealKV takes does not conflict with,
 //! so this takes that same lock: a live RocksDB process keeps the migration out.
 
+#![allow(
+	clippy::disallowed_methods,
+	reason = "the migration of a RocksDB database runs only for a native build on std::fs, behind the file system kind check in Tree::new"
+)]
+
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};

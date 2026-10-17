@@ -1,4 +1,3 @@
-use std::fs::File as SysFile;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
@@ -6,12 +5,12 @@ use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use crate::compaction::{CompactionChoice, CompactionInput, CompactionStrategy};
 use crate::error::{Error, Result};
 use crate::iter::{BoxedLSMIterator, CompactionIterator, History};
-use crate::levels::{write_manifest_to_disk, LevelManifest, ManifestChangeSet};
+use crate::levels::{write_manifest_to_disk_in, LevelManifest, ManifestChangeSet};
 use crate::lsm::{cleanup_vlog, CoreInner};
 use crate::memtable::{ImmutableMemtables, MemTable};
 use crate::snapshot::SnapshotTracker;
 use crate::sstable::table::{Table, TableWriter};
-use crate::vfs::File;
+use crate::vfs::{CreateOpts, File, FsWriter};
 use crate::vlog::VLog;
 use crate::{Comparator, Options as LSMOptions};
 
@@ -179,7 +178,7 @@ impl Compactor {
 
 		#[cfg(test)]
 		if let Err(e) = self.reach(CompactionStage::OutputsDurable) {
-			Self::cleanup_outputs(&outputs);
+			self.cleanup_outputs(&outputs);
 			return Err(e);
 		}
 
@@ -192,7 +191,7 @@ impl Compactor {
 					// Guard will unhide tables on drop; clean up outputs so they
 					// don't linger on disk as orphans.
 					drop(new_tables);
-					Self::cleanup_outputs(&outputs);
+					self.cleanup_outputs(&outputs);
 					return Err(e);
 				}
 			}
@@ -203,7 +202,7 @@ impl Compactor {
 			// If manifest write was uncertain, do not delete outputs because on-disk
 			// manifest might already reference them.
 			if !matches!(e, Error::ManifestWriteUncertain(_)) {
-				Self::cleanup_outputs(&outputs);
+				self.cleanup_outputs(&outputs);
 			}
 			return Err(e);
 		}
@@ -362,7 +361,12 @@ impl Compactor {
 
 		let target_file_size = self.options.lopts.target_file_size;
 		let mut outputs: Vec<(u64, PathBuf)> = Vec::new();
-		let mut current: Option<(TableWriter<SysFile>, u64, PathBuf)> = None;
+		// Every output goes through the file system of the options. An output may only use the
+		// files of a pool that the commit path does not keep for itself: a compaction that
+		// finds none fails, soft, and is done again once the pool is refilled.
+		let fs = &*self.options.lopts.fs;
+		let create = CreateOpts::default().opportunistic();
+		let mut current: Option<(TableWriter<FsWriter>, u64, PathBuf)> = None;
 		let mut prev_user_key: Vec<u8> = Vec::new();
 
 		let result = (|| -> Result<()> {
@@ -391,9 +395,9 @@ impl Compactor {
 					None => {
 						let id = self.options.level_manifest.read()?.next_table_id();
 						let path = self.get_table_path(id);
-						let file = SysFile::create(&path)?;
+						let file = fs.create_truncate(&path, create)?;
 						let writer = TableWriter::new(
-							file,
+							FsWriter(file),
 							id,
 							Arc::clone(&self.options.lopts),
 							input.target_level,
@@ -422,9 +426,13 @@ impl Compactor {
 				// The table has no data block and no key range (`Table::has_points`).
 				let id = self.options.level_manifest.read()?.next_table_id();
 				let path = self.get_table_path(id);
-				let file = SysFile::create(&path)?;
-				let mut writer =
-					TableWriter::new(file, id, Arc::clone(&self.options.lopts), input.target_level);
+				let file = fs.create_truncate(&path, create)?;
+				let mut writer = TableWriter::new(
+					FsWriter(file),
+					id,
+					Arc::clone(&self.options.lopts),
+					input.target_level,
+				);
 				for (start, end, seq) in comp_iter.active_range_deletions() {
 					writer.add_range_deletion(start.clone(), end.clone(), *seq);
 				}
@@ -436,7 +444,7 @@ impl Compactor {
 				// Durability: the directory entries of all outputs must be
 				// durable BEFORE the manifest (fsynced in update_manifest)
 				// references them (surrealdb/surrealdb#7426).
-				crate::lsm::fsync_directory(self.options.lopts.sstable_dir()).inspect(|()| {
+				fs.sync_dir(&self.options.lopts.sstable_dir()).inspect(|()| {
 					#[cfg(test)]
 					directory_syncs::record(&self.options.lopts.sstable_dir());
 				})?;
@@ -450,26 +458,28 @@ impl Compactor {
 			Err(e) => {
 				if let Some((w, _id, path)) = current.take() {
 					drop(w);
-					let _ = std::fs::remove_file(&path);
+					let _ = fs.remove_file(&path);
 				}
-				Self::cleanup_outputs(&outputs);
+				self.cleanup_outputs(&outputs);
 				Err(e)
 			}
 		}
 	}
 
-	fn cleanup_outputs(outputs: &[(u64, PathBuf)]) {
+	fn cleanup_outputs(&self, outputs: &[(u64, PathBuf)]) {
 		for (_id, path) in outputs {
-			let _ = std::fs::remove_file(path);
+			let _ = self.options.lopts.fs.remove_file(path);
 		}
 	}
 
 	/// Finishes one compaction output and makes its contents durable. The
 	/// file must be fsynced before the manifest references it; the directory
 	/// fsync happens once after all outputs are finished.
-	fn finish_output(&self, writer: TableWriter<SysFile>, id: u64, path: &Path) -> Result<()> {
+	fn finish_output(&self, writer: TableWriter<FsWriter>, id: u64, path: &Path) -> Result<()> {
+		// The writer, which holds the handle that wrote the table, is gone before the file is
+		// synced.
 		writer.finish()?;
-		crate::vfs::fsync_file(path)?;
+		self.options.lopts.fs.sync_file(path)?;
 		tracing::debug!("Compaction finished output table {id} at {}", path.display());
 		Ok(())
 	}
@@ -509,7 +519,7 @@ impl Compactor {
 		let rollback = manifest.apply_changeset(&changeset)?;
 
 		// Write manifest to disk - if this fails, revert in-memory state
-		if let Err(e) = write_manifest_to_disk(&manifest) {
+		if let Err(e) = write_manifest_to_disk_in(&*self.options.lopts.fs, &manifest) {
 			manifest.revert_changeset(rollback);
 			if let Error::ManifestWriteUncertain(_) = &e {
 				self.options.manifest_uncertain.store(true, Ordering::Release);
@@ -533,7 +543,7 @@ impl Compactor {
 	fn cleanup_old_tables(&self, input: &CompactionInput) {
 		for &table_id in &input.tables_to_merge {
 			let path = self.options.lopts.sstable_file_path(table_id);
-			if let Err(e) = std::fs::remove_file(path) {
+			if let Err(e) = self.options.lopts.fs.remove_file(&path) {
 				// Log error but continue with cleanup
 				tracing::warn!("Failed to remove old table file: {e}");
 			}
@@ -541,8 +551,7 @@ impl Compactor {
 	}
 
 	fn open_table(&self, table_id: u64, table_path: &Path) -> Result<Arc<Table>> {
-		let file = SysFile::open(table_path)?;
-		let file: Arc<dyn File> = Arc::new(file);
+		let file: Arc<dyn File> = self.options.lopts.fs.open_read(table_path)?;
 		let file_size = file.size()?;
 
 		Ok(Arc::new(Table::new(table_id, Arc::clone(&self.options.lopts), file, file_size)?))

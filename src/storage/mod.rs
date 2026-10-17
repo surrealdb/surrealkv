@@ -127,9 +127,16 @@ impl std::fmt::Debug for AffinityLogStore {
 /// The error of a failed append or sync of the WAL, for the committer. As text, as it always was,
 /// except an encryption error, which keeps its type: a seal that was refused is not an I/O error,
 /// and the committer has to be able to tell.
-fn log_error(error: crate::wal::Error) -> crate::error::Error {
+pub(crate) fn log_error(error: crate::wal::Error) -> crate::error::Error {
 	match error {
 		crate::wal::Error::Encryption(error) => crate::error::Error::Encryption(error),
+		// A pool that had no free file is not a log that cannot be written: it passes.
+		crate::wal::Error::PoolExhausted => crate::error::Error::FilePoolExhausted,
+		// A browser that is out of quota: soft, and the committer can tell it from a disk that
+		// failed.
+		crate::wal::Error::StorageFull(message) => crate::error::Error::Io(std::sync::Arc::new(
+			std::io::Error::new(std::io::ErrorKind::StorageFull, message),
+		)),
 		error => crate::error::Error::Other(error.to_string()),
 	}
 }
@@ -184,7 +191,7 @@ impl AffinityLogStore {
 		admit: impl FnOnce() -> bool + Send + 'static,
 	) -> Result<(u64, Vec<u8>, Vec<usize>)> {
 		let wal = Arc::clone(&self.wal);
-		affinitypool::spawn(move || -> Result<(u64, Vec<u8>, Vec<usize>)> {
+		crate::rt::run_blocking(move || -> Result<(u64, Vec<u8>, Vec<usize>)> {
 			let mut guard = wal.write();
 			if !admit() {
 				return Err(crate::error::Error::PipelineStall);
@@ -201,7 +208,7 @@ impl LogStore for AffinityLogStore {
 		let wal = Arc::clone(&self.wal);
 		let data = data.to_vec();
 		Box::pin(async move {
-			affinitypool::spawn(move || -> Result<u64> {
+			crate::rt::run_blocking(move || -> Result<u64> {
 				let mut guard = wal.write();
 				guard.append(&data).map_err(log_error)
 			})
@@ -212,7 +219,7 @@ impl LogStore for AffinityLogStore {
 	fn sync(&self) -> BoxFuture<'_, ()> {
 		let wal = Arc::clone(&self.wal);
 		Box::pin(async move {
-			affinitypool::spawn(move || -> Result<()> {
+			crate::rt::run_blocking(move || -> Result<()> {
 				let mut guard = wal.write();
 				guard.sync().map_err(log_error)
 			})
@@ -223,7 +230,7 @@ impl LogStore for AffinityLogStore {
 	fn size(&self) -> BoxFuture<'_, u64> {
 		let wal = Arc::clone(&self.wal);
 		Box::pin(async move {
-			affinitypool::spawn(move || -> Result<u64> {
+			crate::rt::run_blocking(move || -> Result<u64> {
 				let _guard = wal.read();
 				Ok(0)
 			})
@@ -255,7 +262,7 @@ impl ObjectStore for AffinityObjectStore {
 	fn read_at(&self, offset: u64, len: usize) -> BoxFuture<'_, Bytes> {
 		let file = Arc::clone(&self.file);
 		Box::pin(async move {
-			affinitypool::spawn(move || -> Result<Bytes> {
+			crate::rt::run_blocking(move || -> Result<Bytes> {
 				// Short only at the end of the file, like the other stores: the tail of the
 				// buffer is never left as zeros that were not read.
 				let mut buf = vec![0u8; len];
@@ -269,7 +276,9 @@ impl ObjectStore for AffinityObjectStore {
 
 	fn size(&self) -> BoxFuture<'_, u64> {
 		let file = Arc::clone(&self.file);
-		Box::pin(async move { affinitypool::spawn(move || -> Result<u64> { file.size() }).await })
+		Box::pin(
+			async move { crate::rt::run_blocking(move || -> Result<u64> { file.size() }).await },
+		)
 	}
 }
 

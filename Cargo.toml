@@ -46,7 +46,7 @@ quick_cache = "0.6.16"
 parking_lot = "0.12.1"
 bytes = "1.11.1"
 rand = "0.9.2"
-tokio = { version = "1.36", features = ["rt", "sync", "macros", "time"] }
+tokio = { version = "1.36", features = ["rt", "sync", "macros"] }
 tracing = "0.1"
 lz4_flex = "0.12.1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
@@ -62,6 +62,14 @@ getrandom_04 = { package = "getrandom", version = "0.4" }
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1.36", features = ["rt-multi-thread"] }
 
+# Tokio's timers panic in a browser, where there is no runtime to drive them, so the feature is not
+# enabled there: a stray `tokio::time` in this crate is a compile error on wasm32-unknown-unknown.
+# The engine's timers are `rt::sleep` and `rt::timeout`. WASI keeps the feature, since its
+# `rt` arm is the native one. (A crate that depends on this one and enables `time` itself turns
+# the API back on, which is why the shim never calls it on a browser either.)
+[target.'cfg(not(all(target_arch = "wasm32", target_os = "unknown")))'.dependencies]
+tokio = { version = "1.36", features = ["time"] }
+
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.0", features = ["fs"] }
 
@@ -76,15 +84,18 @@ windows-sys = { version = "0.59", features = [
 libc = "0.2"
 
 [target.'cfg(target_family = "wasm")'.dependencies]
-getrandom = { version = "0.3.3", features = ["wasm_js"] }
+getrandom = { version = "0.3.4", features = ["wasm_js"] }
 getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 web-sys = { version = "0.3", features = [
+	"DomException",
 	"FileSystemDirectoryHandle",
 	"FileSystemFileHandle",
+	"FileSystemGetDirectoryOptions",
 	"FileSystemGetFileOptions",
+	"FileSystemRemoveOptions",
 	"FileSystemSyncAccessHandle",
 	"FileSystemReadWriteOptions",
 	"StorageManager",
@@ -145,7 +156,16 @@ debug_assert_with_mut_call = "warn"
 # Denies the configured methods and functions in `clippy.toml`.
 # Some methods are undesirable in certain contexts, and it’s beneficial to lint for them as needed.
 # https://rust-lang.github.io/rust-clippy/master/#disallowed_methods
-disallowed_methods = "warn"
+#
+# `clippy.toml` lists every call of `std::fs` and of the `Path` methods that ask the operating system,
+# which the engine has to make through its file system seam (`src/vfs`) so that it runs in a browser.
+# A call that stays on `std::fs` on purpose (the native file system itself, the migrators, checkpoints,
+# `inspect`, encryption keys and sealed files, the lock file) carries a module-level or item-level
+# `#[allow(clippy::disallowed_methods, reason = "...")]` that says why, and test code is allowed at the
+# root of the library. The member crates of the workspace set the lint to `allow` in their own
+# `Cargo.toml`. `scripts/check-fs-lint.sh --self-test` proves that every entry of the list is found
+# when the level is `deny`, and `--audit` lists what each file still calls.
+disallowed_methods = "deny"
 
 expl_impl_clone_on_copy = "warn"
 

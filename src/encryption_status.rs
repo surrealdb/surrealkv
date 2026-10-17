@@ -12,6 +12,11 @@
 //! hidden: a file in the clear in an encrypted database, a file of another database, a header that
 //! cannot be read.
 
+#![allow(
+	clippy::disallowed_methods,
+	reason = "std-path tooling that reads the clear headers of the files of an encrypted database on a disk, which a file system that is not std refuses; none of it is on the path that opens or writes a database"
+)]
+
 use std::collections::BTreeMap;
 use std::path::Path;
 

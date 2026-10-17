@@ -18,6 +18,7 @@ use test_log::test;
 use super::files::DirImage;
 use super::scan::{scan_dir, Markers};
 use crate::tde::{CipherSuite, KeyManager, SoftwareKeyManager};
+use crate::test::tfs;
 use crate::{Error, Mode, Options, Tree};
 
 const DUMP: &str = "indxdb_dump.bin";
@@ -36,6 +37,9 @@ fn plant_dump(dir: &Path, markers: &Markers, key: usize, value: usize) -> Vec<u8
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_migration_leaves_a_backup_in_the_clear_and_an_encrypted_database_refuses_to() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let mut markers = Markers::from_environment();
 	let key = markers.mint("migrated-key");
 	let value = markers.mint("migrated-value");

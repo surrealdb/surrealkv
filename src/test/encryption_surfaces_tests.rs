@@ -22,6 +22,7 @@ use super::encryption_open_tests::{
 	SUITES,
 };
 use super::sstable_encryption_tests::FlakyManager;
+use super::tfs;
 use crate::error::{EncryptionError, KeyProviderFailure};
 use crate::tde::{CipherSuite, KeyManager, KeyState, SoftwareKeyManager, Zeroizing, ROOT_KEY_LEN};
 use crate::{Error, Options, Tree};
@@ -32,6 +33,9 @@ fn unavailable(err: &Error) -> bool {
 
 #[tokio::test]
 async fn a_manifest_that_cannot_be_sealed_is_the_error_of_the_flush_and_is_not_written() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let flaky = FlakyManager::new();
@@ -76,6 +80,9 @@ async fn a_manifest_that_cannot_be_sealed_is_the_error_of_the_flush_and_is_not_w
 
 #[tokio::test]
 async fn the_flush_at_shutdown_keeps_the_error_of_a_key_that_could_not_be_had() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let flaky = FlakyManager::new();
@@ -123,6 +130,9 @@ impl KeyManager for AfterOne {
 
 #[tokio::test]
 async fn the_manifest_that_follows_the_last_flush_of_a_shutdown_keeps_the_error_of_the_key() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let key_manager = Arc::new(AfterOne {
@@ -158,6 +168,9 @@ async fn the_manifest_that_follows_the_last_flush_of_a_shutdown_keeps_the_error_
 #[tokio::test]
 async fn a_database_of_another_store_in_the_directory_of_an_encrypted_one_is_not_migrated_into_it()
 {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let km = manager();
 	let opts =
@@ -238,6 +251,9 @@ fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
 /// its own, before it reads, locks or moves anything.
 #[tokio::test]
 async fn a_v0_x_database_is_not_migrated_into_an_encrypted_one() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
 		.join("tests/fixtures/legacy/v0.21.4/tiny-plain/db");
 	let dir = TempDir::new().unwrap();

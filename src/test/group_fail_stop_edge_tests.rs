@@ -7,7 +7,6 @@
 //! leave the group whole or absent for recovery.
 
 use std::collections::BTreeMap;
-use std::fs;
 use std::future::Future;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -17,7 +16,7 @@ use std::time::Duration;
 use tempdir::TempDir;
 use test_log::test;
 
-use super::{collect_all, collect_transaction_all, collect_transaction_reverse};
+use super::{collect_all, collect_transaction_all, collect_transaction_reverse, sfs as fs};
 use crate::compaction::leveled::Strategy;
 use crate::lsm::{CompactionOperations, CoreInner};
 use crate::ring::{CommitStage, PipelineHook};

@@ -1,7 +1,7 @@
-use std::fs;
 use std::io::{Cursor, Read};
 use std::sync::Arc;
 
+use super::{sfs, sfs as fs, tfs};
 use crate::levels::{
 	DecodedManifest,
 	SnapshotInfo,
@@ -86,7 +86,7 @@ async fn test_manifest_checksum_written_and_verified() {
 	tree.close().await.expect("close");
 
 	let manifest_path = opts.manifest_file_path(0);
-	assert!(manifest_path.exists());
+	assert!(sfs::exists(&manifest_path));
 	let raw_bytes = fs::read(&manifest_path).expect("read manifest");
 
 	assert!(raw_bytes.len() >= 26 + MANIFEST_TRAILER_LEN);
@@ -301,6 +301,9 @@ async fn test_trailer_corruption_details() {
 
 #[tokio::test]
 async fn test_stale_manifest_temp_files_swept_on_open() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let temp_dir = tempfile::tempdir().expect("temp dir");
 	let opts = Arc::new(Options {
 		path: temp_dir.path().to_path_buf(),
@@ -319,15 +322,15 @@ async fn test_stale_manifest_temp_files_swept_on_open() {
 	fs::write(&stale_temp2, b"partial write 2").expect("write temp2");
 	fs::write(&keep_file, b"should stay").expect("write keep");
 
-	assert!(stale_temp1.exists());
-	assert!(stale_temp2.exists());
-	assert!(keep_file.exists());
+	assert!(sfs::exists(&stale_temp1));
+	assert!(sfs::exists(&stale_temp2));
+	assert!(sfs::exists(&keep_file));
 
 	// Reopening the tree should sweep the stale .tmp_* files
 	let tree2 = Tree::new(Arc::clone(&opts)).expect("reopen tree");
 	tree2.close().await.expect("close tree2");
 
-	assert!(!stale_temp1.exists(), "stale_temp1 was not swept");
-	assert!(!stale_temp2.exists(), "stale_temp2 was not swept");
-	assert!(keep_file.exists(), "keep_file was unexpectedly deleted");
+	assert!(!sfs::exists(&stale_temp1), "stale_temp1 was not swept");
+	assert!(!sfs::exists(&stale_temp2), "stale_temp2 was not swept");
+	assert!(sfs::exists(&keep_file), "keep_file was unexpectedly deleted");
 }

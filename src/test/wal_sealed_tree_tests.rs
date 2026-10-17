@@ -14,6 +14,7 @@ use tempfile::TempDir;
 use test_log::test;
 
 use super::sstable_encryption_tests::FlakyManager;
+use super::tfs;
 use super::wal_sealed_tests::{
 	context,
 	names,
@@ -165,6 +166,9 @@ async fn write_canaries(
 
 #[test(tokio::test)]
 async fn no_key_and_no_value_is_in_any_byte_of_the_wal_of_a_sealed_tree() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let entries = canaries();
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
@@ -202,6 +206,9 @@ async fn no_key_and_no_value_is_in_any_byte_of_the_wal_of_a_sealed_tree() {
 /// the files, so that finding none in a sealed one means something.
 #[test(tokio::test)]
 async fn the_markers_are_in_the_wal_of_a_plaintext_tree_so_that_their_absence_means_something() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let entries = canaries();
 	let dir = TempDir::new().unwrap();
 	let wal = write_canaries(dir.path(), None, &entries).await;
@@ -403,6 +410,9 @@ async fn tear_scenario(suite: CipherSuite, shape: Shape) {
 
 #[test(tokio::test)]
 async fn a_tail_cut_inside_a_header_or_a_payload_is_repaired_and_the_commits_go_on() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		for cut in [3u64, 7, 20] {
 			tear_scenario(
@@ -420,6 +430,9 @@ async fn a_tail_cut_inside_a_header_or_a_payload_is_repaired_and_the_commits_go_
 
 #[test(tokio::test)]
 async fn a_record_that_spans_blocks_and_is_cut_in_the_first_or_a_later_block_is_repaired() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		for cut in [Cut::Bytes(1000), Cut::Block(3), Cut::Block(7)] {
 			tear_scenario(
@@ -437,6 +450,9 @@ async fn a_record_that_spans_blocks_and_is_cut_in_the_first_or_a_later_block_is_
 
 #[test(tokio::test)]
 async fn a_record_whose_first_fragment_ends_a_block_is_a_clean_end_that_is_not_repaired() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		tear_scenario(
 			suite,
@@ -466,6 +482,9 @@ fn tree_record(seq: u64, key: &str, value: &[u8]) -> Vec<u8> {
 /// restored, and the segment that it continues in is a sealed one of that database.
 #[test(tokio::test)]
 async fn a_restore_reads_the_wal_of_the_checkpoint_with_the_key_of_the_live_tree() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let root = TempDir::new().unwrap();
 		let live = root.path().join("live");
@@ -540,6 +559,9 @@ async fn a_restore_reads_the_wal_of_the_checkpoint_with_the_key_of_the_live_tree
 /// commits are where they were, and the same call works when the provider is back.
 #[test(tokio::test)]
 async fn a_provider_that_is_away_is_the_error_of_the_rotation_and_it_can_be_tried_again() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let manager = FlakyManager::new();
 	let enc = Arc::new(EncryptionContext::new(

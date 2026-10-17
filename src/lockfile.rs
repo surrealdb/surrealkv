@@ -2,20 +2,23 @@
 use std::fs::{File, OpenOptions};
 #[cfg(not(target_arch = "wasm32"))]
 use std::io::{ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 #[cfg(not(target_arch = "wasm32"))]
 use std::process;
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
 
-#[cfg(not(target_arch = "wasm32"))]
-use crate::error::Error;
-use crate::error::Result;
+use parking_lot::Mutex;
+
+use crate::error::{Error, Result};
 
 /// LockFile prevents multiple processes from accessing the same database
 /// directory
 ///
-/// # How it works
+/// It is one of three kinds, and `new` makes the first: `Os` is the lock of a native build,
+/// `Registered` the lock of a pool file system, and `Refused` the lock of a file system that has
+/// nothing mounted, which cannot be acquired.
+///
+/// # How `Os` works
 ///
 /// This implementation uses OS-level file locking to
 /// ensure that only one process can hold the lock at a time. The lock file
@@ -37,17 +40,27 @@ use crate::error::Result;
 ///
 /// The lock is released in two ways:
 /// 1. Explicitly by calling `release()` (typically during database close)
-/// 2. Automatically via the `Drop` implementation when the LockFile goes out of scope
+/// 2. Automatically when the LockFile goes out of scope
 ///
 /// Even if `release()` is not called explicitly, the OS will release the file
 /// lock when the process terminates (normal exit or crash).
-pub(crate) struct LockFile {
-	/// The path to the lock file
-	#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-	path: PathBuf,
-	/// The lock file handle
-	#[cfg(not(target_arch = "wasm32"))]
-	file: Option<File>,
+///
+/// # Targets
+///
+/// The `Os` lock does nothing on `wasm32`, browser or WASI alike: a browser has no `flock`, and a
+/// WASI runtime is left without a lock as it always was. `Registered` and `Refused` are the same
+/// on every target, and a `Registered` lock gives its entry back when it is dropped there too.
+pub(crate) enum LockFile {
+	/// The `flock` of a `LOCK` file, held by this process.
+	Os(OsLock),
+	/// An entry in a set that a file system keeps: one tree in this process owns a directory.
+	Registered(RegisteredLock),
+	/// There is nothing to lock: the file system has nothing mounted.
+	#[allow(
+		dead_code,
+		reason = "made by a file system with nothing mounted, which a native build never has"
+	)]
+	Refused(&'static str),
 }
 
 impl LockFile {
@@ -56,9 +69,60 @@ impl LockFile {
 
 	/// Creates a new lock file at the specified path
 	pub fn new<P: AsRef<Path>>(path: P) -> Self {
-		let lock_path = path.as_ref().join(Self::LOCK_FILE_NAME);
+		Self::Os(OsLock::new(path.as_ref()))
+	}
+
+	/// A lock on `dir` in `registry`, for a file system that keeps its files in a registry and so
+	/// has no `LOCK` file to lock. The directory is normalised, so `a/./b` and `a/b` are one.
+	pub(crate) fn registered(registry: Arc<LockRegistry>, dir: &Path) -> Self {
+		Self::Registered(RegisteredLock {
+			registry,
+			dir: normalise_dir(dir),
+			held: false,
+		})
+	}
+
+	/// A lock that cannot be acquired, with the reason.
+	#[allow(dead_code, reason = "handed out by a file system with nothing mounted")]
+	pub(crate) fn refused(reason: &'static str) -> Self {
+		Self::Refused(reason)
+	}
+
+	/// Acquires the lock, returning an error if the database is already in use
+	pub fn acquire(&mut self) -> Result<()> {
+		match self {
+			Self::Os(lock) => lock.acquire(),
+			Self::Registered(lock) => lock.acquire(),
+			Self::Refused(reason) => {
+				Err(Error::Io(Arc::new(crate::vfs::unavailable_error(reason))))
+			}
+		}
+	}
+
+	/// Releases the lock
+	pub fn release(&mut self) -> Result<()> {
+		match self {
+			Self::Os(lock) => lock.release(),
+			Self::Registered(lock) => lock.release(),
+			Self::Refused(_) => Ok(()),
+		}
+	}
+}
+
+/// The `flock` of a `LOCK` file.
+pub(crate) struct OsLock {
+	/// The path to the lock file
+	#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+	path: PathBuf,
+	/// The lock file handle
+	#[cfg(not(target_arch = "wasm32"))]
+	file: Option<File>,
+}
+
+impl OsLock {
+	fn new(dir: &Path) -> Self {
 		Self {
-			path: lock_path,
+			path: dir.join(LockFile::LOCK_FILE_NAME),
 			#[cfg(not(target_arch = "wasm32"))]
 			file: None,
 		}
@@ -66,7 +130,11 @@ impl LockFile {
 
 	/// Acquires the lock, returning an error if the database is already in use
 	#[cfg(not(target_arch = "wasm32"))]
-	pub fn acquire(&mut self) -> Result<()> {
+	#[allow(
+		clippy::disallowed_methods,
+		reason = "the operating system's lock file is the one place that locks a native database against another process, and a file system that is not std takes a registered lock instead"
+	)]
+	fn acquire(&mut self) -> Result<()> {
 		// Try to open the lock file with create flag
 		let file = OpenOptions::new()
 			.read(true)
@@ -98,7 +166,7 @@ impl LockFile {
 
 	/// Releases the lock
 	#[cfg(not(target_arch = "wasm32"))]
-	pub fn release(&mut self) -> Result<()> {
+	fn release(&mut self) -> Result<()> {
 		if let Some(file) = self.file.take() {
 			let _ = unlock(&file);
 			drop(file);
@@ -108,23 +176,160 @@ impl LockFile {
 
 	/// Acquires the lock (WASM no-op)
 	#[cfg(target_arch = "wasm32")]
-	pub fn acquire(&mut self) -> Result<()> {
+	fn acquire(&mut self) -> Result<()> {
 		Ok(())
 	}
 
 	/// Releases the lock (WASM no-op)
 	#[cfg(target_arch = "wasm32")]
-	pub fn release(&mut self) -> Result<()> {
+	fn release(&mut self) -> Result<()> {
 		Ok(())
 	}
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-impl Drop for LockFile {
+impl Drop for OsLock {
 	fn drop(&mut self) {
 		// Try to release the lock, but don't panic if it fails
 		let _ = self.release();
 	}
+}
+
+/// The directories that are locked in one file system: one tree owns each, in this process. A
+/// browser has one worker, so this is the whole of what a lock can mean there; a second tab is
+/// kept out by the exclusive handle that the file system holds on its own lock file.
+#[derive(Debug, Default)]
+pub(crate) struct LockRegistry {
+	held: Mutex<Vec<PathBuf>>,
+}
+
+impl LockRegistry {
+	fn try_insert(&self, dir: &Path) -> bool {
+		let mut held = self.held.lock();
+		if held.iter().any(|held| held == dir) {
+			return false;
+		}
+		held.push(dir.to_path_buf());
+		true
+	}
+
+	fn remove(&self, dir: &Path) {
+		self.held.lock().retain(|held| held != dir);
+	}
+
+	/// Whether `dir` is locked now, for a test.
+	#[cfg(test)]
+	pub(crate) fn is_held(&self, dir: &Path) -> bool {
+		let dir = normalise_dir(dir);
+		self.held.lock().contains(&dir)
+	}
+}
+
+/// An entry in a [`LockRegistry`], taken by `acquire` and given back by `release` and by drop, on
+/// every target.
+pub(crate) struct RegisteredLock {
+	registry: Arc<LockRegistry>,
+	dir: PathBuf,
+	held: bool,
+}
+
+impl RegisteredLock {
+	fn acquire(&mut self) -> Result<()> {
+		if self.held {
+			return Ok(());
+		}
+		if !self.registry.try_insert(&self.dir) {
+			return Err(Error::Other(format!(
+				"Database at {} is already locked by another tree on this file system",
+				self.dir.display()
+			)));
+		}
+		self.held = true;
+		Ok(())
+	}
+
+	fn release(&mut self) -> Result<()> {
+		if self.held {
+			self.registry.remove(&self.dir);
+			self.held = false;
+		}
+		Ok(())
+	}
+}
+
+impl Drop for RegisteredLock {
+	fn drop(&mut self) {
+		let _ = self.release();
+	}
+}
+
+/// The directory with `.` and `..` resolved by name and the separators collapsed, without asking
+/// the file system, so that two spellings of one directory take the same entry. A `..` that has
+/// nothing to remove is kept on a relative path and dropped at the root.
+pub(crate) fn normalise_dir(dir: &Path) -> PathBuf {
+	let mut out = PathBuf::new();
+	for component in dir.components() {
+		match component {
+			Component::CurDir => {}
+			Component::ParentDir => match out.components().next_back() {
+				Some(Component::Normal(_)) => {
+					out.pop();
+				}
+				Some(Component::RootDir | Component::Prefix(_)) => {}
+				_ => out.push(".."),
+			},
+			other => out.push(other.as_os_str()),
+		}
+	}
+	out
+}
+
+/// The behaviour of a registered lock, for the native and the browser tests, which run the same
+/// check: the entry is taken, refused to a second lock on the same directory, and given back on
+/// release and on drop.
+#[cfg(test)]
+pub(crate) fn check_registered_locks() {
+	let registry = Arc::new(LockRegistry::default());
+	let dir = Path::new("db/./inner/../");
+
+	let mut first = LockFile::registered(Arc::clone(&registry), dir);
+	assert!(!registry.is_held(Path::new("db")));
+	first.acquire().expect("the first lock is granted");
+	assert!(registry.is_held(Path::new("db")), "the directory is held under its normal form");
+	// Acquiring a lock that is held is not an error, and takes nothing more.
+	first.acquire().expect("a held lock is held");
+
+	let mut second = LockFile::registered(Arc::clone(&registry), Path::new("db"));
+	match second.acquire() {
+		Err(Error::Other(message)) => assert!(message.contains("already locked"), "{message}"),
+		other => panic!("the second lock on one directory is refused: {other:?}"),
+	}
+	// Another directory is its own.
+	let mut other = LockFile::registered(Arc::clone(&registry), Path::new("db2"));
+	other.acquire().expect("another directory is free");
+
+	// A release gives the entry back, and so does a second one, which does nothing.
+	first.release().expect("release");
+	first.release().expect("release twice");
+	assert!(!registry.is_held(Path::new("db")));
+	second.acquire().expect("the directory is free after the release");
+	drop(second);
+	assert!(!registry.is_held(Path::new("db")), "a dropped lock gives its entry back");
+
+	// A lock that was never acquired takes nothing and gives nothing back.
+	let mut held = LockFile::registered(Arc::clone(&registry), Path::new("db3"));
+	held.acquire().unwrap();
+	drop(LockFile::registered(Arc::clone(&registry), Path::new("db3")));
+	assert!(registry.is_held(Path::new("db3")), "dropping a lock that was not acquired is free");
+	drop(held);
+	assert!(!registry.is_held(Path::new("db3")));
+	drop(other);
+	assert!(!registry.is_held(Path::new("db2")));
+
+	// A lock that is refused cannot be acquired, and releasing it is not an error.
+	let mut refused = LockFile::refused("nothing is mounted");
+	assert!(matches!(refused.acquire(), Err(Error::Io(_))));
+	refused.release().expect("release of a refused lock");
 }
 
 #[cfg(unix)]
@@ -427,4 +632,36 @@ mod tests {
 	// 		}
 	// 	}
 	// }
+}
+
+#[cfg(test)]
+mod registered_tests {
+	use std::path::Path;
+
+	use super::*;
+
+	/// The check that the browser tests run too: see `check_registered_locks`.
+	#[test]
+	fn a_registered_lock_is_one_per_directory_and_is_given_back() {
+		check_registered_locks();
+	}
+
+	#[test]
+	fn directories_are_normalised_by_name() {
+		for (given, normal) in [
+			("a/b", "a/b"),
+			("a/./b/", "a/b"),
+			("a//b", "a/b"),
+			("a/b/..", "a"),
+			("a/b/../../c", "c"),
+			("../a", "../a"),
+			("a/../..", ".."),
+			("/a/../..", "/"),
+			("/a/./b", "/a/b"),
+			("", ""),
+			(".", ""),
+		] {
+			assert_eq!(normalise_dir(Path::new(given)), Path::new(normal), "{given:?}");
+		}
+	}
 }

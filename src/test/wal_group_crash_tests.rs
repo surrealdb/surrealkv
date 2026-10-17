@@ -25,14 +25,15 @@
 //! `VLog::dir_syncs`, and the failpoints `VLog::fail_writes_after`, `VLog::fail_next_sync` and
 //! `VLog::set_sync_gap`.
 
-use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use sfs::{self as fs, File};
 use tempdir::TempDir;
 use test_log::test;
 
+use super::{sfs, tfs};
 use crate::batch::Batch;
 use crate::ring::PipelineHook;
 use crate::vlog::ValueLocation;
@@ -43,7 +44,6 @@ use crate::wal::{
 	BufferedFileWriter,
 	CompressionType,
 	Error as WalError,
-	Options as WalOptions,
 	WritableFile,
 	BLOCK_SIZE,
 	HEADER_SIZE,
@@ -522,7 +522,7 @@ fn random_groups_are_byte_identical_to_one_append_per_record() {
 #[test]
 fn wal_append_group_lands_in_one_segment_and_a_bad_group_neither_writes_nor_poisons() {
 	let dir = TempDir::new("wal_group_crash").unwrap();
-	let mut wal = Wal::open(dir.path(), WalOptions::default()).unwrap();
+	let mut wal = Wal::open(dir.path(), tfs::wal_options_for(dir.path())).unwrap();
 	let seg0 = dir.path().join("00000000000000000000.wal");
 	let seg1 = dir.path().join("00000000000000000001.wal");
 	let buf: Vec<u8> = payload(7, 100);
@@ -626,6 +626,9 @@ mod short_write {
 	/// that `add_records` cuts exactly that back.
 	#[test]
 	fn short_write_child_writer() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let Some(dir) = std::env::var_os(CHILD_DIR) else {
 			return;
 		};
@@ -666,6 +669,9 @@ mod short_write {
 	/// middle of its append.
 	#[test(tokio::test)]
 	async fn short_write_child_tree() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let Some(dir) = std::env::var_os(CHILD_DIR) else {
 			return;
 		};
@@ -702,7 +708,7 @@ mod short_write {
 		assert!(later[0].is_ok(), "the next commit replaces the segment");
 		// The segment that failed is not written to again; the background flush of its memtable
 		// removes it.
-		assert!(!segment.exists() || fs::read(&segment).unwrap() == acked_bytes);
+		assert!(!sfs::exists(&segment) || fs::read(&segment).unwrap() == acked_bytes);
 
 		let tree = Arc::try_unwrap(tree).ok().expect("the writers are done");
 		crash(tree);
@@ -712,6 +718,9 @@ mod short_write {
 	/// then space comes back and a commit is acknowledged. That commit's value must read back.
 	#[test(tokio::test)]
 	async fn short_write_child_vlog() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let Some(dir) = std::env::var_os(CHILD_DIR) else {
 			return;
 		};
@@ -775,6 +784,9 @@ mod short_write {
 	/// entry started at, would point into the failed value. Run with a real short write.
 	#[test(tokio::test)]
 	async fn a_transient_vlog_write_failure_does_not_corrupt_the_next_acknowledged_value() {
+		if tfs::skip_listed() {
+			return;
+		}
 		if std::env::var_os(CHILD_DIR).is_some() {
 			return;
 		}
@@ -798,6 +810,9 @@ mod short_write {
 	/// disk is full when the next append has to write it out.
 	#[test]
 	fn short_write_child_vlog_full_buffer() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let Some(dir) = std::env::var_os(CHILD_DIR) else {
 			return;
 		};
@@ -807,7 +822,7 @@ mod short_write {
 			vlog_checksum_verification: crate::VLogChecksumLevel::Full,
 			..Default::default()
 		};
-		fs::create_dir_all(opts.vlog_dir()).unwrap();
+		tfs::create_dir_all(&opts, opts.vlog_dir()).unwrap();
 		let vlog = crate::vlog::VLog::new(Arc::new(opts)).unwrap();
 		let seed = vlog.append(b"seed", b"seed").unwrap();
 		vlog.flush().unwrap();
@@ -833,6 +848,9 @@ mod short_write {
 	/// disk is full. Run with a real write failure.
 	#[test(tokio::test)]
 	async fn a_failed_append_behind_a_full_vlog_buffer_keeps_the_entry_in_it() {
+		if tfs::skip_listed() {
+			return;
+		}
 		if std::env::var_os(CHILD_DIR).is_some() {
 			return;
 		}
@@ -857,6 +875,9 @@ mod short_write {
 	/// killed child left, with no limit.
 	#[test(tokio::test)]
 	async fn a_real_short_write_in_the_middle_of_a_group_is_cut_back_and_recovered() {
+		if tfs::skip_listed() {
+			return;
+		}
 		if std::env::var_os(CHILD_DIR).is_some() {
 			return;
 		}
@@ -1026,7 +1047,7 @@ async fn torn_group_sweep(left: usize, group_lens: &[usize], cuts: Cuts, damage:
 
 	let work = base.path().join("work");
 	for &cut in &offsets {
-		if work.exists() {
+		if sfs::exists(&work) {
 			fs::remove_dir_all(&work).unwrap();
 		}
 		copy_dir(&image, &work);
@@ -2403,6 +2424,9 @@ async fn a_rotation_by_the_flusher_fsyncs_the_vlog_before_the_segment() {
 /// A checkpoint flushes the memtable, which rotates the WAL first.
 #[test(tokio::test)]
 async fn a_checkpoint_fsyncs_the_vlog_before_the_segment_it_seals() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("wal_group_crash").unwrap();
 	let live = dir.path().join("live");
 	let (tree, seen) = rolled_over_and_watched(&live).await;
@@ -2566,6 +2590,9 @@ async fn a_rotation_replacing_a_poisoned_segment_does_not_need_the_vlog() {
 /// once, and not by the Eventual commits that created the file, which fsync nothing.
 #[test(tokio::test)]
 async fn the_vlog_directory_is_fsynced_with_the_files_created_since_it_was_last() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("wal_group_crash").unwrap();
 	let live = dir.path().join("live");
 	let tree = eventual_commits_across_a_rollover(&live).await;

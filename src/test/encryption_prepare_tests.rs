@@ -23,6 +23,7 @@ use super::encryption_commit_path_tests::{
 	SMALL,
 };
 use super::encryption_open_tests::{files_with_extension, read as read_all, rounds, KEYS, SUITES};
+use super::tfs;
 use crate::error::{EncryptionError, KeyProviderFailure};
 use crate::tde::{CipherSuite, CryptoHeader, KeyManager, KeyState, Zeroizing, ROOT_KEY_LEN};
 use crate::{Error, Options, Tree};
@@ -132,6 +133,9 @@ fn prepared_options(path: &Path, km: &Arc<PreparedOnly>, suite: CipherSuite) -> 
 
 #[tokio::test]
 async fn a_table_under_an_older_key_opens_with_a_manager_that_serves_only_what_it_was_asked_for() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -170,6 +174,9 @@ async fn a_table_under_an_older_key_opens_with_a_manager_that_serves_only_what_i
 
 #[tokio::test]
 async fn once_the_keys_are_prepared_a_provider_that_is_away_is_not_reached_by_any_write() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -249,6 +256,9 @@ async fn once_the_keys_are_prepared_a_provider_that_is_away_is_not_reached_by_an
 
 #[tokio::test]
 async fn a_key_that_became_active_is_made_available_by_preparing_the_keys_again() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();

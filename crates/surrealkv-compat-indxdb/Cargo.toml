@@ -36,3 +36,8 @@ tempfile = "3.10"
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
+
+[lints.clippy]
+# The calls that clippy.toml at the root lists are the engine's to route through its file system
+# seam, and are not this crate's concern.
+disallowed_methods = "allow"

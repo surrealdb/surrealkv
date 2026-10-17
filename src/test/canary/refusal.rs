@@ -72,6 +72,7 @@ use crate::tde::{
 	MANIFEST_PREFIX_LEN,
 };
 use crate::test::sstable_encryption_tests::{first_of, flip, walk};
+use crate::test::tfs;
 use crate::test::wal_sealed_tests::{fix_checksum, physical_records};
 use crate::wal::{BLOCK_SIZE, HEADER_SIZE};
 use crate::{Durability, Mode, Options, Tree, WalRecoveryMode};
@@ -473,6 +474,9 @@ fn assert_caught(what: &str, work: &Path, before: &DirImage, outcome: Outcome, s
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_key_that_does_not_fit_is_refused_with_its_error_and_no_file_changes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let tables = tables_db(suite, &Auth::Right).await;
 		let wal = wal_db(suite).await;
@@ -556,6 +560,9 @@ async fn a_key_that_does_not_fit_is_refused_with_its_error_and_no_file_changes()
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_file_of_the_other_kind_is_refused_in_either_direction_and_nothing_changes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let sealed = tables_db(suite, &Auth::Right).await;
 		let plain = tables_db(suite, &Auth::None).await;
@@ -610,6 +617,9 @@ async fn a_file_of_the_other_kind_is_refused_in_either_direction_and_nothing_cha
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_file_of_another_database_with_the_same_key_is_refused_for_its_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let ours = tables_db(suite, &Auth::Right).await;
 		// Made the same way, so its files have the names of ours, and its own identity.
@@ -671,6 +681,9 @@ fn with_header_checksum(mut bytes: Vec<u8>) -> Vec<u8> {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_changed_manifest_is_the_error_of_the_part_that_changed_and_no_file_changes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let db = tables_db(suite, &Auth::Right).await;
 		let pristine = Pristine {
@@ -741,6 +754,9 @@ fn table_id(path: &Path) -> u64 {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_changed_byte_in_a_block_of_each_kind_fails_authentication_where_the_block_is_read() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let db = tables_db(suite, &Auth::Right).await;
 		let context = db.context.clone().expect("an encrypted database has a context");
@@ -798,6 +814,9 @@ async fn a_changed_byte_in_a_block_of_each_kind_fails_authentication_where_the_b
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_changed_entry_of_the_value_log_is_a_corrupt_value_and_never_a_wrong_one() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let db = tables_db(suite, &Auth::Right).await;
 		let log = first_file(db.dir.path(), "vlog", "vlog");
@@ -868,6 +887,9 @@ async fn a_changed_entry_of_the_value_log_is_a_corrupt_value_and_never_a_wrong_o
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_damaged_wal_is_never_repaired_unless_it_is_a_tear_in_the_last_segment() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let pristine_dir = wal_db(suite).await;
 		let pristine = Pristine {
@@ -1022,6 +1044,9 @@ async fn rotated_db(suite: CipherSuite) -> Db {
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 2))]
 async fn a_key_that_rotated_is_needed_until_it_is_retired_and_then_the_database_is_refused() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let db = rotated_db(suite).await;
 		assert_holds_no_key(

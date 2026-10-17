@@ -12,7 +12,6 @@
 //! never written are the leftovers of this database's own crashes, and are deleted as they always
 //! were.
 
-use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -29,6 +28,7 @@ use super::encryption_open_tests::{
 	KEYS,
 	SUITES,
 };
+use super::{sfs, sfs as fs, tfs};
 use crate::error::{EncryptionError, Error};
 use crate::tde::{CipherSuite, DbId, EncryptionContext, SoftwareKeyManager};
 use crate::wal::{calculate_crc32, sealed, segment_name, CompressionType, RecordType, HEADER_SIZE};
@@ -153,6 +153,9 @@ fn write_segment(dir: &Path, id: u64, bytes: &[u8]) {
 
 #[test]
 fn the_segments_of_a_directory_are_each_read_and_the_first_that_is_not_ours_is_the_answer() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new().unwrap();
 	let wal = dir.path().join("wal");
 	let ours = DbId::from_bytes(OURS);
@@ -241,6 +244,9 @@ fn first_segment(opts: &Options) -> std::path::PathBuf {
 
 #[tokio::test]
 async fn a_segment_of_another_database_below_the_log_number_refuses_the_open_and_changes_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let foreign = segment_of_another_database(&dir.path().join("other"), suite).await;
@@ -258,6 +264,9 @@ async fn a_segment_of_another_database_below_the_log_number_refuses_the_open_and
 
 #[tokio::test]
 async fn a_segment_in_the_clear_below_the_log_number_refuses_the_open_and_changes_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("db");
@@ -278,6 +287,9 @@ async fn a_segment_in_the_clear_below_the_log_number_refuses_the_open_and_change
 
 #[tokio::test]
 async fn what_this_database_left_behind_below_the_log_number_is_opened_over_and_deleted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let root = dir.path().join("db");
@@ -298,13 +310,16 @@ async fn what_this_database_left_behind_below_the_log_number_is_opened_over_and_
 			// The database opens and is closed, and what was there is removed as an old segment is.
 			let tree = Tree::new(Arc::clone(&opts)).unwrap();
 			tree.close().await.unwrap();
-			assert!(!first_segment(&opts).exists(), "{suite:?}: {what} was not removed");
+			assert!(!sfs::exists(first_segment(&opts)), "{suite:?}: {what} was not removed");
 		}
 	}
 }
 
 #[tokio::test]
 async fn a_segment_of_another_database_that_appears_while_the_database_is_open_is_kept() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let dir = TempDir::new().unwrap();
 		let foreign = segment_of_another_database(&dir.path().join("other"), suite).await;
@@ -328,7 +343,7 @@ async fn a_segment_of_another_database_that_appears_while_the_database_is_open_i
 		write_segment(&opts.wal_dir(), 0, &own);
 		tree.close().await.unwrap();
 		assert!(
-			!first_segment(&opts).exists(),
+			!sfs::exists(first_segment(&opts)),
 			"{suite:?}: an old segment of this database stayed"
 		);
 	}
@@ -336,6 +351,9 @@ async fn a_segment_of_another_database_that_appears_while_the_database_is_open_i
 
 #[tokio::test]
 async fn a_manifest_of_another_database_does_not_have_the_segments_of_this_one_deleted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	// A database that has not flushed holds its acknowledged writes in the log alone. The manifest
 	// of another database that shares the key, and the table that it lists, are put in its place: a
 	// restore by copying, which a checkpoint's empty log does not clear. The segment of the first

@@ -135,6 +135,10 @@ pub(crate) fn check_first_record(
 /// Reads the first record of the segment at `path`, no more than it holds, and says what
 /// [`check_first_record`] says of it. A file that is gone, or that has no whole record, says
 /// nothing.
+#[allow(
+	clippy::disallowed_methods,
+	reason = "a sealed log exists only in an encrypted database, which a file system that is not std refuses"
+)]
 pub(crate) fn check_segment_file(db_id: DbId, path: &Path) -> crate::error::Result<()> {
 	let mut file = match File::open(path) {
 		Ok(file) => file,

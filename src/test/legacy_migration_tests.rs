@@ -27,6 +27,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
+use super::tfs;
 use crate::levels::{DecodedManifest, MANIFEST_FORMAT_VERSION_V2};
 use crate::migrate::for_each_entry;
 use crate::migrate::legacy::{
@@ -168,7 +169,7 @@ pub(crate) fn assert_every_value_resolves(opts: &Arc<Options>, what: &str) {
 pub(crate) fn migrated_entries(opts: &Arc<Options>) -> Vec<MigratedEntry> {
 	let manifest = DecodedManifest::decode(fs::read(opts.manifest_file_path(0)).unwrap()).unwrap();
 	assert_eq!(manifest.version, MANIFEST_FORMAT_VERSION_V2);
-	fs::create_dir_all(opts.vlog_dir()).unwrap();
+	tfs::create_dir_all(opts, opts.vlog_dir()).unwrap();
 	let vlog = Arc::new(VLog::new(Arc::clone(opts)).unwrap());
 	let mut out = Vec::new();
 	for id in manifest.level_data.iter().flatten() {
@@ -370,6 +371,9 @@ fn assert_report(name: &str, report: &MigrationReport) {
 
 #[test(tokio::test)]
 async fn opening_a_v0_21_4_database_migrates_it_and_every_key_reads_as_it_did() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ALL {
 		let (dir, opts, oracle) = database(name, true);
 		let tree = Tree::new(Arc::clone(&opts)).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -388,6 +392,9 @@ async fn opening_a_v0_21_4_database_migrates_it_and_every_key_reads_as_it_did() 
 
 #[test]
 fn the_migration_keeps_every_version_with_its_timestamp_and_sequence_number() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-versioned", "tiny-versioned-wal-only", "tiny-versioned-wal-tail"] {
 		let (_dir, opts, oracle) = database(name, true);
 		let report = migrate_if_needed(&opts).unwrap().expect("a legacy database");
@@ -398,6 +405,9 @@ fn the_migration_keeps_every_version_with_its_timestamp_and_sequence_number() {
 
 #[test]
 fn an_unversioned_database_keeps_the_timestamps_of_its_versions_too() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-plain", "tiny-wal-only", "tiny-wal-tail"] {
 		let (_dir, opts, oracle) = database(name, true);
 		let report = migrate_if_needed(&opts).unwrap().expect("a legacy database");
@@ -451,6 +461,9 @@ fn what_was_replaced_is_kept_and_what_was_derived_is_removed() {
 /// A run cut short after any step is resumed by the next open, to the same database.
 #[test(tokio::test)]
 async fn a_migration_cut_short_at_any_step_is_resumed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-versioned", "tiny-versioned-wal-tail", "tiny-wal-only"] {
 		let mut completed_without_failing = false;
 		for fail_after in 0..32 {
@@ -503,6 +516,9 @@ async fn a_migration_cut_short_at_any_step_is_resumed() {
 /// value log disabled must not turn every value into an error.
 #[test(tokio::test)]
 async fn a_database_with_value_log_files_is_opened_with_the_value_log_whatever_the_options_say() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-plain", "tiny-versioned"] {
 		let (_dir, opts, oracle) = database(name, false);
 		assert!(!opts.enable_vlog);
@@ -518,6 +534,9 @@ async fn a_database_with_value_log_files_is_opened_with_the_value_log_whatever_t
 /// make the manifest claim more WAL than there is.
 #[test(tokio::test)]
 async fn a_flushed_wal_segment_left_behind_does_not_stop_the_migrated_database_opening() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (_dir, opts, oracle) = database("tiny-versioned-wal-tail", true);
 	let segment = opts.wal_dir().join("00000000000000000001.wal");
 	fs::copy(&segment, opts.wal_dir().join("00000000000000000000.wal")).unwrap();
@@ -534,6 +553,9 @@ async fn a_flushed_wal_segment_left_behind_does_not_stop_the_migrated_database_o
 /// of its data is in the WAL.
 #[test(tokio::test)]
 async fn a_wal_only_database_without_an_sstables_directory_migrates() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-wal-only", "tiny-versioned-wal-only"] {
 		let (_dir, opts, oracle) = database(name, true);
 		let _ = fs::remove_dir_all(opts.sstable_dir());
@@ -548,6 +570,9 @@ async fn a_wal_only_database_without_an_sstables_directory_migrates() {
 /// unless it was set to refuse any corruption. The migration follows the same setting.
 #[test(tokio::test)]
 async fn a_damaged_wal_segment_is_cut_at_the_damage_as_v0_x_did() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let damage = |opts: &Options| {
 		// Records that are valid, then bytes that are not a record, in a segment that is not the
 		// last one.
@@ -582,6 +607,9 @@ async fn a_damaged_wal_segment_is_cut_at_the_damage_as_v0_x_did() {
 /// database of those versions holds pointers, and converts with its timestamps like the rest.
 #[test(tokio::test)]
 async fn a_v0_20_1_wal_tail_that_logged_value_pointers_is_migrated_with_its_timestamps() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-versioned-wal-tail", "tiny-versioned-wal-only", "tiny-wal-tail"] {
 		let (dir, opts, oracle) = database_of("v0.20.1", name, true);
 		let report = migrate_if_needed(&opts).unwrap().expect("a legacy database");
@@ -654,6 +682,9 @@ fn scrubbing_a_directory_of_legacy_tables_says_it_is_legacy_not_corrupt() {
 /// from the replayed log, and after the database was closed and opened again.
 #[test(tokio::test)]
 async fn the_versioned_queries_of_a_migrated_database_answer_what_the_old_engine_answered() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for (version, name) in [
 		("v0.21.4", "tiny-versioned"),
 		("v0.21.4", "tiny-versioned-wal-only"),
@@ -683,6 +714,9 @@ async fn the_versioned_queries_of_a_migrated_database_answer_what_the_old_engine
 /// reads them is the bottom one.
 #[test(tokio::test)]
 async fn a_migrated_database_keeps_what_the_period_promises_through_a_compaction() {
+	if tfs::skip_listed() {
+		return;
+	}
 	use std::sync::atomic::Ordering;
 
 	use super::versioning_tests::SetClock;
@@ -812,6 +846,9 @@ async fn a_migrated_database_keeps_what_the_period_promises_through_a_compaction
 /// marker was lost. Opening the database finishes the job instead of failing every time.
 #[test(tokio::test)]
 async fn a_lost_marker_is_recovered_by_opening_the_database() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (_dir, opts, oracle) = database("tiny-versioned", true);
 	let mut manifest =
 		DecodedManifest::decode(fs::read(opts.manifest_file_path(0)).unwrap()).unwrap();
@@ -830,6 +867,9 @@ async fn a_lost_marker_is_recovered_by_opening_the_database() {
 /// anything is deleted.
 #[test(tokio::test)]
 async fn a_checkpoint_taken_by_v0_x_is_refused_before_the_live_database_is_touched() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let live_dir = TempDir::new().unwrap();
 	let live_opts = Arc::new(Options {
 		path: live_dir.path().to_path_buf(),

@@ -26,6 +26,7 @@ use std::{fs, io};
 use super::scan::{scan_dir, Needle, Needles};
 use crate::sstable::table::{ChecksumType, Footer, TABLE_FULL_FOOTER_LENGTH};
 use crate::tde::{is_sealed_manifest, CryptoHeader, HEADER_LEN, MANIFEST_PREFIX_LEN, SALT_LEN};
+use crate::test::tfs;
 use crate::vlog::sealed::{is_sealed_start, SEALED_HEADER_LEN};
 use crate::wal::{RecordType, HEADER_SIZE};
 
@@ -405,6 +406,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn every_file_of_an_encrypted_database_is_sealed_and_the_check_sees_every_kind_of_file() {
+		if tfs::skip_listed() {
+			return;
+		}
 		for suite in [CipherSuite::Aes256Gcm, CipherSuite::XChaCha20Poly1305] {
 			let dir = TempDir::new().unwrap();
 			database(dir.path(), Some(suite)).await;
@@ -420,6 +424,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn the_files_of_a_database_that_is_not_encrypted_are_each_found_wanting() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let dir = TempDir::new().unwrap();
 		database(dir.path(), None).await;
 		let wrong = unsealed_files(dir.path()).unwrap();
@@ -435,6 +442,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn one_file_that_is_in_the_clear_or_of_no_known_kind_is_the_only_one_found() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let sealed = TempDir::new().unwrap();
 		database(sealed.path(), Some(CipherSuite::Aes256Gcm)).await;
 		let plain = TempDir::new().unwrap();
@@ -487,6 +497,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn two_files_that_share_a_salt_are_copies_or_the_start_of_one_another() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let sealed = TempDir::new().unwrap();
 		database(sealed.path(), Some(CipherSuite::XChaCha20Poly1305)).await;
 		let root = TempDir::new().unwrap();
@@ -528,6 +541,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn a_key_in_a_file_is_found_and_a_key_that_is_in_none_is_not() {
+		if tfs::skip_listed() {
+			return;
+		}
 		let dir = TempDir::new().unwrap();
 		database(dir.path(), Some(CipherSuite::Aes256Gcm)).await;
 		let key = *b"a root key that nothing writes 1";

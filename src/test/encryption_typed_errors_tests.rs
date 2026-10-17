@@ -24,6 +24,7 @@ use super::encryption_commit_path_tests::{
 	options,
 };
 use super::encryption_open_tests::{snapshot, SUITES};
+use super::tfs;
 use crate::error::{EncryptionError, KeyProviderFailure};
 use crate::lsm::Core;
 use crate::tde::{
@@ -59,6 +60,9 @@ fn context(km: &Arc<SwitchManager>, suite: crate::tde::CipherSuite) -> Arc<Encry
 
 #[tokio::test]
 async fn a_key_that_cannot_be_had_is_the_error_of_every_rotation_of_the_wal_and_moves_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -115,6 +119,9 @@ async fn a_key_that_cannot_be_had_is_the_error_of_every_rotation_of_the_wal_and_
 /// told to the committer as what it is: not a provider that may come back, and not an I/O error.
 #[tokio::test]
 async fn a_seal_that_the_log_refuses_is_the_error_of_the_commit_and_the_segment_is_replaced() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -236,6 +243,9 @@ fn replay(
 #[tokio::test]
 async fn a_key_that_cannot_be_had_to_repair_a_torn_segment_is_the_error_of_the_open_and_nothing_changes(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();
@@ -276,6 +286,9 @@ async fn a_key_that_cannot_be_had_to_repair_a_torn_segment_is_the_error_of_the_o
 #[tokio::test]
 async fn a_key_that_cannot_be_had_once_a_segment_is_repaired_is_the_error_of_the_open_and_nothing_is_lost(
 ) {
+	if tfs::skip_listed() {
+		return;
+	}
 	for suite in SUITES {
 		let what = format!("{suite:?}");
 		let dir = TempDir::new().unwrap();

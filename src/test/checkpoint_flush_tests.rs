@@ -17,7 +17,7 @@ use std::time::Duration;
 use tempdir::TempDir;
 use test_log::test;
 
-use super::collect_transaction_all;
+use super::{collect_transaction_all, tfs};
 use crate::batch::Batch;
 use crate::checkpoint::{CheckpointMetadata, CheckpointStage};
 use crate::error::Result;
@@ -349,6 +349,9 @@ async fn two_flushes_of_one_immutable_memtable_make_one_table() {
 /// as the first one: the checkpoint waits for the flush in flight and captures its table once.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn checkpoint_waits_for_the_flush_in_flight_and_captures_its_table_once() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_cp").unwrap();
 	let checkpoints = TempDir::new("ckpt_flush_cp_out").unwrap();
 	let tree = open(dir.path(), NEVER_ROTATING);
@@ -575,6 +578,9 @@ async fn a_flush_waits_for_the_shutdown_flush_in_flight() {
 /// in flight instead of letting the flush list its table in the manifest it restored.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_restore_waits_for_a_flush_in_flight() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_restore").unwrap();
 	let out = TempDir::new("ckpt_flush_restore_out").unwrap();
 	let tree = open(dir.path(), NEVER_ROTATING);
@@ -747,16 +753,25 @@ async fn a_failed_flush_leaves_the_memtable_and_its_wal_segment(failure: Failure
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_that_cannot_create_its_table_leaves_the_memtable_and_its_wal_segment() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_failed_flush_leaves_the_memtable_and_its_wal_segment(Failure::TableCreate).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_that_fails_after_writing_its_table_leaves_the_memtable_and_its_wal_segment() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_failed_flush_leaves_the_memtable_and_its_wal_segment(Failure::AfterTableWritten).await;
 }
 
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_whose_manifest_update_fails_leaves_the_memtable_and_its_wal_segment() {
+	if tfs::skip_listed() {
+		return;
+	}
 	a_failed_flush_leaves_the_memtable_and_its_wal_segment(Failure::ManifestReplace).await;
 }
 
@@ -804,6 +819,9 @@ async fn a_failed_flush_holds_back_the_memtables_queued_behind_it() {
 /// background error, and the retry (into the same directory) succeeds and matches.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_whose_second_flush_fails_can_be_retried() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_half").unwrap();
 	let out = TempDir::new("ckpt_flush_half_out").unwrap();
 	let tree = open(dir.path(), NEVER_ROTATING);
@@ -845,6 +863,9 @@ async fn a_checkpoint_whose_second_flush_fails_can_be_retried() {
 /// lists no table twice.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_crash_image_taken_between_the_sstable_and_the_manifest_reopens_whole() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_image").unwrap();
 	let image = TempDir::new("ckpt_flush_image_copy").unwrap();
 	let tree = open(dir.path(), NEVER_ROTATING);
@@ -897,6 +918,9 @@ fn the_log_number_a_flush_records_stays_below_the_oldest_queued_segment() {
 /// that is still there: the image of the directory at that instant must hold all of them.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn close_keeps_the_wal_of_a_memtable_rotated_after_its_snapshot() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_close_rotate").unwrap();
 	let image = TempDir::new("ckpt_flush_close_rotate_img").unwrap();
 	let tree = open(dir.path(), NEVER_ROTATING);
@@ -935,6 +959,9 @@ async fn close_keeps_the_wal_of_a_memtable_rotated_after_its_snapshot() {
 /// queued ahead of it, and must not carry `log_number` over the rotated memtable's segment.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn close_keeps_the_wal_of_a_memtable_rotated_ahead_of_the_active_one_it_flushes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_close_ahead").unwrap();
 	let image = TempDir::new("ckpt_flush_close_ahead_img").unwrap();
 	let tree = open(dir.path(), NEVER_ROTATING);
@@ -974,6 +1001,9 @@ async fn close_keeps_the_wal_of_a_memtable_rotated_ahead_of_the_active_one_it_fl
 /// acknowledgement holds it.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_between_a_groups_wal_sync_and_its_apply_loses_nothing() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_stale").unwrap();
 	let out = TempDir::new("ckpt_flush_stale_out").unwrap();
 	let image = TempDir::new("ckpt_flush_stale_img").unwrap();
@@ -1043,6 +1073,9 @@ async fn a_checkpoint_between_a_groups_wal_sync_and_its_apply_loses_nothing() {
 /// taken after the checkpoint, hold the recovered keys and the ones committed after recovery.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_checkpoint_of_a_recovered_tree_holds_what_the_crashed_segment_held() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let dir = TempDir::new("ckpt_flush_recovered").unwrap();
 		let out = TempDir::new("ckpt_flush_recovered_out").unwrap();
@@ -1094,6 +1127,9 @@ async fn a_checkpoint_of_a_recovered_tree_holds_what_the_crashed_segment_held() 
 /// made obsolete before it returns, and copies a database that matches the source.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn create_checkpoint_works_on_a_thread_without_a_runtime() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let dir = TempDir::new("ckpt_flush_no_rt").unwrap();
 		let checkpoints = TempDir::new("ckpt_flush_no_rt_out").unwrap();
@@ -1138,6 +1174,9 @@ async fn create_checkpoint_works_on_a_thread_without_a_runtime() {
 /// database and holds exactly what the source holds, with and without the value log.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn checkpoint_copy_opens_and_matches_the_source() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for vlog in [false, true] {
 		let dir = TempDir::new("ckpt_flush_copy").unwrap();
 		let checkpoints = TempDir::new("ckpt_flush_copy_out").unwrap();
@@ -1164,6 +1203,9 @@ async fn checkpoint_copy_opens_and_matches_the_source() {
 /// the checkpoint holds lists exactly the SSTables it holds, and the checkpoint opens.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_cannot_change_the_manifest_while_a_checkpoint_copies_it() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_manifest").unwrap();
 	let checkpoints = TempDir::new("ckpt_flush_manifest_out").unwrap();
 	let tree = open(dir.path(), NEVER_ROTATING);
@@ -1205,6 +1247,9 @@ async fn a_flush_cannot_change_the_manifest_while_a_checkpoint_copies_it() {
 /// of its own hard links.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_second_checkpoint_into_the_same_directory_leaves_the_live_tables_intact() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_twice").unwrap();
 	let out = TempDir::new("ckpt_flush_twice_out").unwrap();
 	let tree = open(dir.path(), NEVER_ROTATING);
@@ -1237,6 +1282,9 @@ async fn a_second_checkpoint_into_the_same_directory_leaves_the_live_tables_inta
 /// file the tables it holds point into, and a flush afterwards deletes them.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn value_log_files_a_checkpoint_has_yet_to_copy_are_not_deleted() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_vlog").unwrap();
 	let out = TempDir::new("ckpt_flush_vlog_out").unwrap();
 	let opts = Arc::new(Options {
@@ -1305,6 +1353,9 @@ async fn value_log_files_a_checkpoint_has_yet_to_copy_are_not_deleted() {
 /// once the checkpoint is released everything finishes, and the copy matches.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn a_flush_queued_behind_a_checkpoint_does_not_deadlock_the_tree() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_parked").unwrap();
 	let out = TempDir::new("ckpt_flush_parked_out").unwrap();
 	let tree = open(dir.path(), 32 * 1024);
@@ -1357,6 +1408,9 @@ async fn a_flush_queued_behind_a_checkpoint_does_not_deadlock_the_tree() {
 /// task is woken must finish, and the runtime must come back.
 #[test(tokio::test(flavor = "current_thread"))]
 async fn a_checkpoint_beside_the_background_flush_on_a_single_threaded_runtime_finishes() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_current").unwrap();
 	let out = TempDir::new("ckpt_flush_current_out").unwrap();
 	let tree = open(dir.path(), 32 * 1024);
@@ -1391,6 +1445,9 @@ async fn a_checkpoint_beside_the_background_flush_on_a_single_threaded_runtime_f
 /// threshold every commit waits for a compaction nobody asks for.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 4))]
 async fn commits_still_succeed_after_many_checkpoints_of_a_tree_that_never_rotates_by_itself() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_l0").unwrap();
 	let out = TempDir::new("ckpt_flush_l0_out").unwrap();
 	let tree = open_with(Arc::new(Options {
@@ -1525,6 +1582,9 @@ async fn check_checkpoint(path: &Path, before: &[(usize, usize)], failures: &Fai
 /// and the tree keeps every commit across a close and a reopen.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
 async fn checkpoints_racing_the_background_flush_never_fail() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_stress").unwrap();
 	let checkpoints = TempDir::new("ckpt_flush_stress_out").unwrap();
 	let opts = Arc::new(Options {
@@ -1630,6 +1690,9 @@ fn check_copy(path: &Path, floor: &BTreeMap<(usize, usize), usize>) -> Vec<Strin
 /// one succeeds, opens, and holds every commit acknowledged before it started.
 #[test(tokio::test(flavor = "multi_thread", worker_threads = 8))]
 async fn concurrent_checkpoints_each_hold_what_was_acknowledged_before_them() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let dir = TempDir::new("ckpt_flush_many").unwrap();
 	let out = TempDir::new("ckpt_flush_many_out").unwrap();
 	let tree = open_with(Arc::new(Options {

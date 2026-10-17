@@ -24,6 +24,7 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use test_log::test;
 
+use super::tfs;
 use crate::migrate::rocksdb::{hlc_to_nanos, migrate_failing_after, migrate_if_needed, BACKUP_DIR};
 use crate::test::legacy_migration_tests::{
 	assert_every_value_resolves,
@@ -222,6 +223,9 @@ fn assert_versioned_queries(tree: &Tree, dump: &Dump, what: &str) {
 /// the versioned queries answer once it is migrated: read from the tables, and after a restart.
 #[test(tokio::test)]
 async fn the_versioned_queries_of_a_migrated_rocksdb_database_answer_what_rocksdb_answered() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-versioned", "tiny-versioned-wal-only", "tiny-versioned-wal-tail"] {
 		let (_dir, opts, dump) = database(name, true);
 		let opts = Arc::new(Options {
@@ -253,6 +257,9 @@ fn the_conversion_keeps_order_and_zero() {
 
 #[test(tokio::test)]
 async fn opening_a_rocksdb_database_migrates_it_and_every_key_reads_as_rocksdb_returned() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ALL {
 		let (dir, opts, dump) = database(name, true);
 		let tree = Tree::new(Arc::clone(&opts)).unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -289,6 +296,9 @@ async fn opening_a_rocksdb_database_migrates_it_and_every_key_reads_as_rocksdb_r
 
 #[test]
 fn a_versioned_database_keeps_every_version_with_its_converted_timestamp() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-versioned", "tiny-versioned-wal-only", "tiny-versioned-wal-tail"] {
 		let (_dir, opts, dump) = database(name, true);
 		let report = migrate_if_needed(&opts).unwrap().expect("a RocksDB database");
@@ -300,6 +310,9 @@ fn a_versioned_database_keeps_every_version_with_its_converted_timestamp() {
 
 #[test]
 fn an_unversioned_database_keeps_the_newest_value_of_each_key_and_no_timestamps() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-plain", "tiny-plain-wal-only"] {
 		let (_dir, opts, dump) = database(name, true);
 		let report = migrate_if_needed(&opts).unwrap().expect("a RocksDB database");
@@ -317,6 +330,9 @@ fn an_unversioned_database_keeps_the_newest_value_of_each_key_and_no_timestamps(
 /// Values that RocksDB kept in blob files go to the value log, where a large value belongs here.
 #[test(tokio::test)]
 async fn blob_values_go_to_the_value_log_or_stay_inline_as_the_options_say() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for (enable_vlog, threshold) in [(true, 1024usize), (true, usize::MAX / 2), (false, 1024)] {
 		let (dir, opts, dump) = database("tiny-versioned", enable_vlog);
 		let opts = Arc::new(Options {
@@ -348,6 +364,9 @@ async fn blob_values_go_to_the_value_log_or_stay_inline_as_the_options_say() {
 /// migration reads the blob, checking it against its checksums and its key, and goes on.
 #[test(tokio::test)]
 async fn a_trimmed_history_is_migrated_past_the_blob_rocksdb_itself_cannot_read() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (_dir, opts, dump) = database("tiny-versioned-gc", true);
 	assert!(dump.truncated, "the fixture is the case where RocksDB's iterator gives up");
 	let report = migrate_if_needed(&opts).unwrap().expect("a RocksDB database");
@@ -378,6 +397,9 @@ async fn a_trimmed_history_is_migrated_past_the_blob_rocksdb_itself_cannot_read(
 /// A run cut short after any step is finished or undone by the next open, to the same database.
 #[test(tokio::test)]
 async fn a_migration_cut_short_at_any_step_is_resumed() {
+	if tfs::skip_listed() {
+		return;
+	}
 	for name in ["tiny-versioned", "tiny-plain-wal-only", "tiny-versioned-wal-tail"] {
 		let mut completed = false;
 		for fail_after in 0..40 {
@@ -421,6 +443,9 @@ async fn a_migration_cut_short_at_any_step_is_resumed() {
 #[cfg(unix)]
 #[test]
 fn a_database_a_rocksdb_process_has_open_is_not_migrated() {
+	if tfs::skip_listed() {
+		return;
+	}
 	let (dir, opts, _) = database("tiny-versioned", true);
 	let lock = dir.path().join("LOCK");
 	let child = Command::new("python3")

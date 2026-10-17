@@ -2,9 +2,12 @@ use std::fmt::Debug;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use parking_lot::RwLock;
+
+use crate::ring::sync::backoff;
+use crate::rt::{self, Instant};
 
 /// Defines the logical clock that SurrealKV will use to measure
 /// commit timestamps and retention periods checks.
@@ -34,7 +37,9 @@ impl Drop for DefaultLogicalClock {
 pub struct DefaultLogicalClockInner {
 	/// The latest monotonic counter for this oracle
 	timestamp: AtomicU64,
-	/// Reference time when this clock was last synced with system clock
+	/// Reference time when this clock was last synced with system clock. Not read on a browser,
+	/// where the clock reads the wall clock on every call.
+	#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 	reference: RwLock<(u64, Instant)>,
 	/// Specifies whether timestamp syncing is enabled in the background
 	#[cfg_attr(target_family = "wasm", allow(dead_code))]
@@ -94,19 +99,26 @@ impl DefaultLogicalClock {
 	/// Gets the current system time in nanoseconds since the Unix epoch
 	#[inline]
 	pub(crate) fn current_unix_ns() -> u64 {
-		// Get the current system time
-		let timestamp = SystemTime::now().duration_since(UNIX_EPOCH);
-		// Count the nanoseconds since the Unix epoch
-		timestamp.unwrap_or_default().as_nanos() as u64
+		rt::now_unix_ns()
 	}
 
 	/// Gets the current estimated time in nanoseconds since the Unix epoch
+	#[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 	#[inline]
 	pub(crate) fn current_time_ns(&self) -> u64 {
 		// Get the current reference time
 		let reference = *self.inner.reference.read();
 		// Calculate the nanoseconds since the Unix epoch
 		reference.0 + reference.1.elapsed().as_nanos() as u64
+	}
+
+	/// Gets the current time in nanoseconds since the Unix epoch. There is no thread that
+	/// resyncs a reference time in a browser, so the wall clock is read on every call, which is
+	/// cheap there; `now` makes the result strictly increasing.
+	#[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+	#[inline]
+	pub(crate) fn current_time_ns(&self) -> u64 {
+		rt::now_unix_ns()
 	}
 
 	/// Shutdown the oracle resync, waiting for background threads to exit
@@ -158,7 +170,7 @@ impl LogicalClock for DefaultLogicalClock {
 	#[inline]
 	fn now(&self) -> u64 {
 		// Store the number of spins
-		let mut spins = 0;
+		let mut spins = 0usize;
 		// Loop until we reach the next incremental timestamp
 		loop {
 			// Get current time estimate
@@ -179,13 +191,7 @@ impl LogicalClock for DefaultLogicalClock {
 				return version;
 			}
 			// Ensure the thread backs off when under contention
-			if spins < 10 {
-				std::hint::spin_loop();
-			} else if spins < 100 {
-				std::thread::yield_now();
-			} else {
-				std::thread::park_timeout(Duration::from_micros(10));
-			}
+			backoff(spins);
 			spins += 1;
 		}
 	}

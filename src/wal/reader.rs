@@ -1,10 +1,9 @@
-use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::vec::Vec;
 
 use crate::error::EncryptionError;
 use crate::tde::{FileCipher, HEADER_MAGIC};
-use crate::vfs::File as VfsFile;
+use crate::vfs::{File as VfsFile, FsCursor, IntoFsFile};
 use crate::wal::{
 	calculate_crc32,
 	sealed,
@@ -60,8 +59,9 @@ fn physical(what: &str) -> Error {
 /// remain, the remainder is discarded (it's padding) and the next block is
 /// read.
 pub(crate) struct Reader {
-	/// The underlying file handle
-	file: File,
+	/// The underlying file, read through a cursor of the reader's own: the file may be shared
+	/// (a pool has one handle of a file), so nothing here depends on where it is positioned.
+	file: FsCursor,
 
 	/// Buffer holding the current block's data
 	buffer: Box<[u8; BLOCK_SIZE]>,
@@ -118,14 +118,14 @@ pub(crate) struct Reader {
 impl Reader {
 	/// Creates a new Reader of a plaintext segment from a File with default settings.
 	#[cfg(test)]
-	pub(crate) fn new(file: File) -> Self {
+	pub(crate) fn new(file: impl IntoFsFile) -> Self {
 		Self::with_context(file, None, 0, &WalContext::plaintext())
 	}
 
 	/// Creates a reader of the segment `log_number` for a WAL whose segments are as `context`
 	/// says.
 	pub(crate) fn with_context(
-		file: File,
+		file: impl IntoFsFile,
 		reporter: Option<Box<dyn Reporter>>,
 		log_number: u64,
 		context: &WalContext,
@@ -135,7 +135,7 @@ impl Reader {
 			sealed: None,
 			record_start: 0,
 			parsed_length: None,
-			file,
+			file: FsCursor::new(file.into_fs_file()),
 			buffer: Box::new([0; BLOCK_SIZE]),
 			buffer_offset: 0,
 			buffer_end: 0,

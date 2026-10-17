@@ -52,6 +52,7 @@ use crate::tde::{
 	HEADER_LEN,
 	TAG_LEN,
 };
+use crate::vfs::Fs;
 use crate::CompressionType;
 
 /// The `version` of the file header of a sealed file.
@@ -87,6 +88,7 @@ const ENTRY_COMPRESSION: u8 = CompressionType::None as u8;
 ///
 /// Every call draws a new salt, so a file that is made again after a failure, or under an id
 /// that an earlier file had, never shares a key with it.
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 fn encode_header(
 	ctx: &EncryptionContext,
 	file_id: u32,
@@ -112,6 +114,11 @@ fn encode_header(
 /// Creates the file of a new sealed log, with its header written and fsynced, and returns it
 /// with the cipher that seals its entries.
 ///
+/// Made with `std::fs` and not through the file system seam: a sealed value log is only made on
+/// the operating system's file system, and is refused on any other before this is called (see
+/// `VLogWriter::create_sealed_in`). Moving it is part of the encryption of a database in a
+/// browser, which has not been done.
+///
 /// The file is created exclusively: a file that is already there is an error and is left alone,
 /// never appended to. Nothing may be sealed under a key that an older file of the same name
 /// used, and nothing that was written after a header that is not durable is worth having, so
@@ -121,6 +128,11 @@ fn encode_header(
 /// If writing or syncing the header fails, the file that was just created is set aside under
 /// another name, which keeps a later start from finding a log file without a header between
 /// two that have one. It holds nothing and is never deleted.
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
+#[allow(
+	clippy::disallowed_methods,
+	reason = "a sealed value-log file exists only in an encrypted database, which a file system that is not std refuses"
+)]
 pub(crate) fn create(
 	path: &Path,
 	file_id: u32,
@@ -337,13 +349,23 @@ pub(crate) fn open_entry(
 
 /// Renames a file that must not be used, and must not be lost, to a name that the log does not
 /// read: `<name>.torn`, or `<name>.torn.1` and so on if that is taken. Returns the new path.
+///
+/// On the operating system's file system. [`create`], which calls it with the file it just made
+/// still open, is the one caller that is not given a file system.
+#[cfg_attr(all(target_arch = "wasm32", target_os = "unknown"), allow(dead_code))]
 pub(crate) fn set_aside(path: &Path) -> io::Result<PathBuf> {
+	set_aside_in(&*crate::vfs::default_fs(), path)
+}
+
+/// As [`set_aside`], in `fs`. The file must not be open: a file system that keeps one handle per
+/// path (a browser's) does not rename a file that is open.
+pub(crate) fn set_aside_in(fs: &dyn Fs, path: &Path) -> io::Result<PathBuf> {
 	let mut base = path.as_os_str().to_owned();
 	base.push(".torn");
 	let mut target = PathBuf::from(&base);
 	for attempt in 1..=ASIDE_ATTEMPTS {
-		if !target.exists() {
-			std::fs::rename(path, &target)?;
+		if !fs.exists(&target) {
+			fs.rename(path, &target)?;
 			return Ok(target);
 		}
 		let mut name = base.clone();

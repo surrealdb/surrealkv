@@ -105,3 +105,23 @@ async fn opening_a_sync_file_on_the_main_thread_returns_an_error_instead_of_thro
 	let err = file_handle(&root, &name, false).await.expect_err("an entry that was never made");
 	assert!(text(&err).contains("NotFoundError"), "{}", text(&err));
 }
+
+#[wasm_bindgen_test]
+async fn the_file_system_cannot_be_mounted_on_the_main_thread() {
+	let name = unique_name("skv-window-mount", "db");
+	let e = surrealkv::FileSystem::opfs(&name)
+		.await
+		.expect_err("a page has no synchronous access handles");
+	match &e {
+		surrealkv::Error::Io(io) => assert_eq!(io.kind(), std::io::ErrorKind::Unsupported),
+		other => panic!("{other:?}"),
+	}
+	assert!(e.to_string().contains("dedicated worker"), "{e}");
+
+	// Nothing was made.
+	let root = root().await;
+	assert!(
+		JsFuture::from(root.get_directory_handle(&name)).await.is_err(),
+		"the directory of a mount that was refused is not there"
+	);
+}
