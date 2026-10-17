@@ -708,11 +708,12 @@ pub(crate) fn quarantine_wal_segment(wal_dir: &Path, segment_id: usize) -> Resul
 
 /// [`quarantine_wal_segment`] in the file system `fs`.
 ///
-/// The copy is made durable here, on every file system: the repair that follows cuts the original
-/// back, and a cut that is durable while its only copy is not would lose the tail on a power cut
-/// that falls between the two. `std::fs::copy` does not sync, so the copy is synced by its path,
-/// and a pool's copy (which syncs itself) is synced once more, which costs a flush on a path that
-/// runs once per crash.
+/// The copy of a pool is synced here, because the pool orders the content of a slot before the
+/// directory sync only by a flush of that file. `std::fs::copy` is not synced, and it stays that
+/// way on the std file system: the native path never had that fsync and gets no new one. (A cut
+/// that is durable while its only copy is not could lose a torn tail on a power cut that falls
+/// between the two; that is how it was, and it is for the quarantine copy, which is a courtesy
+/// for a person.)
 pub(crate) fn quarantine_wal_segment_in(
 	fs: &dyn Fs,
 	wal_dir: &Path,
@@ -740,7 +741,13 @@ pub(crate) fn quarantine_wal_segment_in(
 	}
 
 	fs.copy(&segment_path, &corrupt_base)?;
-	fs.sync_file(&corrupt_base)?;
+	// A pool holds the copy in a slot whose content is only ordered before the directory sync by
+	// a flush of the file; the std file system never synced the copy (a quarantine copy is a
+	// courtesy for a person, not part of recovery), and keeps not doing so: no new fsync on a
+	// native path.
+	if fs.kind() != crate::vfs::FsKind::Std {
+		fs.sync_file(&corrupt_base)?;
+	}
 	fs.sync_dir(wal_dir)?;
 
 	// A pool keeps the newest few copies of all segments, however many crashes there were: the

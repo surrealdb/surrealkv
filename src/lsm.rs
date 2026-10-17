@@ -662,7 +662,7 @@ impl CoreInner {
 				// no free file keeps its type too: it passes once the pool is refilled, which a
 				// text does not say either, and one that is at its limit does not.
 				Error::Encryption(_) | Error::FilePoolExhausted => e,
-				e if e.is_pool_full() => e,
+				e if e.is_storage_full() => e,
 				e => Error::Other(format!(
 					"Failed to flush memtable to SST table_id={}: {}",
 					table_id, e
@@ -746,7 +746,7 @@ impl CoreInner {
 	fn manifest_write_error(&self, error: Error, context: String) -> Error {
 		// A pool that is at its limit of files keeps its type: it does not pass by waiting, and
 		// the layer below only lets through the one that does.
-		if error.is_pool_full() {
+		if error.is_storage_full() {
 			return error;
 		}
 		crate::levels::manifest_write_error(&self.manifest_uncertain, error, &context)
@@ -1145,7 +1145,7 @@ impl CoreInner {
 
 		self.rotate_memtable_locked(active_memtable).map_err(|e| match e {
 			Error::Encryption(_) | Error::FilePoolExhausted => e,
-			e if e.is_pool_full() => e,
+			e if e.is_storage_full() => e,
 			e => replace_error(&e),
 		})?;
 		Ok(Some(true))
@@ -1609,7 +1609,7 @@ impl CoreInner {
 						// A manifest that could not be sealed keeps the error of the key, and one
 						// that a pool had no file for keeps the type that says it passes.
 						Error::Encryption(_) | Error::FilePoolExhausted => e,
-						e if e.is_pool_full() => e,
+						e if e.is_storage_full() => e,
 						e => Error::Other(format!(
 							"Failed to update manifest log_number after immutable flush: {}",
 							e
@@ -2569,7 +2569,7 @@ impl Core {
 				// A key that could not be had stays what it is, for the caller of `close`, and a
 				// pool that has no free file stays one that passes.
 				Error::Encryption(_) | Error::FilePoolExhausted => e,
-				e if e.is_pool_full() => e,
+				e if e.is_storage_full() => e,
 				// Not a typed error that a layer turned into text, but the pool did refuse a file
 				// during the flush: say that it passes.
 				e if self.inner.pooled && self.inner.exhausted_since(exhaustions) => {

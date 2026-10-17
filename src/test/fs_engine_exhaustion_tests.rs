@@ -370,25 +370,56 @@ async fn a_flush_whose_wait_fails_with_the_typed_error_is_tried_again() {
 	.await;
 }
 
-#[test(tokio::test)]
-async fn a_flush_whose_wait_fails_because_the_pool_is_full_is_not_tried_again() {
-	within("flush wait fails, pool full", async {
-		let (probe, fs) = ProbeFs::wrap(&FileSystem::memory());
-		let tree = open_probed(&fs, MEMTABLE, false).await;
-		probe.spares(move |n| (n == FLUSH_NEED).then(|| Err(vfs::pool_full(2048))));
-		let (reached, _) =
-			commit_until(&tree, 0, 3000, 300, || tree.background_error().is_some()).await;
-		until("the flush task to give up", || tree.background_error().is_some()).await;
-		let error = tree.background_error().unwrap();
-		assert!(error.error.is_pool_full(), "{:?}", error.error);
-		assert_eq!(error.severity, ErrorSeverity::FatalError, "an I/O error of a flush is fatal");
-		let count = tree.background_error_count();
-		tokio::time::sleep(Duration::from_millis(300)).await;
-		assert_eq!(tree.background_error_count(), count, "nothing is attempted again");
-		// What was acknowledged is still readable, and is in the log.
-		assert_present(&tree, 0..reached, 300);
-		tree.abandon();
+/// A flush that meets a pool at its limit, or a quota of the browser, does not stop the database:
+/// it is a soft error, the memtable stays queued, and the flush is tried again with a back-off
+/// until the pool has room (a snapshot was released) or the page freed space.
+async fn a_flush_that_meets_a_full_pool_goes_on(failure: fn() -> io::Error) {
+	let (probe, fs) = ProbeFs::wrap(&FileSystem::memory());
+	let tree = open_probed(&fs, MEMTABLE, false).await;
+	let failures = Arc::new(AtomicUsize::new(0));
+	let counter = Arc::clone(&failures);
+	probe.spares(move |n| {
+		(n == FLUSH_NEED && counter.fetch_add(1, Ordering::SeqCst) < 3).then(|| Err(failure()))
+	});
+	let (reached, _) = commit_until(&tree, 0, 3000, 300, || {
+		tree.background_error().is_some() || tree.is_stopped()
 	})
+	.await;
+	until("the flush task to meet the error", || tree.background_error().is_some()).await;
+	let error = tree.background_error().unwrap();
+	assert_eq!(error.severity, ErrorSeverity::SoftError, "{:?}", error.error);
+	assert!(!tree.is_stopped(), "a pool at its limit is not a stopped database");
+	// The error does not pass by itself, but the flush is tried again and works once the pool does
+	// (here: once the probe lets the wait through), and nothing acknowledged was lost.
+	until("the flushes", || {
+		failures.load(Ordering::SeqCst) > 3 && tree.core.inner.immutable_count() == 0
+	})
+	.await;
+	assert!(!tree.is_stopped());
+	assert_present(&tree, 0..reached, 300);
+	let (next, error) = commit_until(&tree, reached, reached + 50, 300, || false).await;
+	assert!(error.is_none(), "{error:?}");
+	assert_present(&tree, 0..next, 300);
+	tree.close().await.unwrap();
+}
+
+#[test(tokio::test)]
+async fn a_flush_whose_wait_fails_because_the_pool_is_full_is_soft_and_is_tried_again() {
+	within(
+		"flush wait fails, pool full",
+		a_flush_that_meets_a_full_pool_goes_on(|| vfs::pool_full(2048)),
+	)
+	.await;
+}
+
+#[test(tokio::test)]
+async fn a_flush_whose_wait_fails_with_a_quota_error_is_soft_and_is_tried_again() {
+	within(
+		"flush wait fails, quota",
+		a_flush_that_meets_a_full_pool_goes_on(|| {
+			io::Error::new(io::ErrorKind::StorageFull, "QuotaExceededError")
+		}),
+	)
 	.await;
 }
 

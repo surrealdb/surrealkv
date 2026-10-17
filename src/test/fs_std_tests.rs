@@ -443,3 +443,55 @@ fn a_listing_tells_a_link_from_what_it_points_to_and_entry_follows_it() {
 	);
 	assert!(!gone.exists());
 }
+
+// ---------------------------------------------------------------------------------------------
+// No new fsync on a native path
+// ---------------------------------------------------------------------------------------------
+
+/// The calls that a quarantine of a WAL segment makes on `fs`, in order.
+fn calls_of_a_quarantine(fs: &FileSystem, dir: &Path) -> Vec<super::fs_probe::Call> {
+	use std::sync::Mutex;
+
+	use super::fs_probe::{Call, ProbeFs};
+
+	let (probe, probed) = ProbeFs::wrap(fs);
+	let wal_dir = dir.join("wal");
+	probed.0.create_dir_all(&wal_dir).unwrap();
+	let segment = wal_dir.join(format!("{:020}.wal", 7));
+	let file = probed.0.create_new(&segment, CreateOpts::default()).unwrap();
+	file.append(b"a segment with a torn tail").unwrap();
+	drop(file);
+	let seen = Arc::new(Mutex::new(Vec::<Call>::new()));
+	let log = Arc::clone(&seen);
+	probe.before(move |call| {
+		log.lock().unwrap().push(call.clone());
+		super::fs_probe::Verdict::Go
+	});
+	crate::wal::recovery::quarantine_wal_segment_in(&*probed.0, &wal_dir, 7).unwrap();
+	let calls = seen.lock().unwrap().clone();
+	calls
+}
+
+#[test]
+fn a_quarantine_does_not_sync_the_copy_on_std_and_does_on_a_pool() {
+	use super::fs_probe::Call;
+
+	let dir = TempDir::new().unwrap();
+	let calls = calls_of_a_quarantine(&FileSystem::std(), dir.path());
+	assert!(
+		calls.iter().any(|c| matches!(c, Call::SyncDir(_))),
+		"the directory is synced, as it always was: {calls:?}"
+	);
+	assert!(
+		!calls.iter().any(|c| matches!(c, Call::SyncFile(_))),
+		"the std file system gains no fsync on the repair of a torn tail: {calls:?}"
+	);
+
+	let calls = calls_of_a_quarantine(&FileSystem::memory(), Path::new("/db"));
+	assert!(
+		calls.iter().any(
+			|c| matches!(c, Call::SyncFile(p) if p.to_string_lossy().ends_with(".wal.corrupt"))
+		),
+		"a pool syncs the copy: {calls:?}"
+	);
+}

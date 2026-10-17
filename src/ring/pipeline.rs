@@ -1365,7 +1365,7 @@ impl CommitPipeline {
 				// committer of the group as it is: whether to try the commit again depends on
 				// which.
 				Err(e @ (Error::Encryption(_) | Error::FilePoolExhausted)) => Err(e.clone()),
-				Err(e) if e.is_pool_full() => Err(e.clone()),
+				Err(e) if e.is_storage_full() => Err(e.clone()),
 				Err(e) => Err(Error::Io(
 					std::io::Error::other(format!("Group commit failed: {e}")).into(),
 				)),
@@ -1815,7 +1815,7 @@ impl CommitPipeline {
 			return Err(match e {
 				// Whether the group may be tried again depends on the key error.
 				Error::Encryption(_) | Error::FilePoolExhausted | Error::PipelineStall => e,
-				e if e.is_pool_full() => e,
+				e if e.is_storage_full() => e,
 				e => Error::Other(format!(
 					"Failed to drop the records of a failed commit group from the WAL: {e}"
 				)),
@@ -1866,7 +1866,7 @@ impl CommitPipeline {
 				return Err(match e {
 					// Whether the group may be tried again depends on the key error.
 					Error::Encryption(_) | Error::FilePoolExhausted => e,
-					e if e.is_pool_full() => e,
+					e if e.is_storage_full() => e,
 					e => Error::Other(format!(
 						"Failed to flush the memtables of the failed WAL segment: {e}"
 					)),

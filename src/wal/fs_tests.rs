@@ -823,7 +823,7 @@ fn torn_segment(dir: &Path, id: u64, garbage: usize) -> u64 {
 }
 
 #[test]
-fn the_copy_of_a_repair_is_durable_before_the_segment_is_cut() {
+fn the_copy_of_a_repair_of_a_pool_is_synced_before_the_segment_is_cut_and_that_of_std_is_not() {
 	for kind in [FsKind::Std, FsKind::Pool] {
 		let dir = TempDir::new().unwrap();
 		let good = torn_segment(dir.path(), 1, 50);
@@ -852,9 +852,15 @@ fn the_copy_of_a_repair_is_durable_before_the_segment_is_cut() {
 		let corrupt = format!("{:020}.wal.corrupt", 1);
 		let at = |wanted: &Op| calls.iter().position(|op| op == wanted);
 		let copied = at(&Op::Copy(format!("{:020}.wal", 1), corrupt.clone())).expect("copied");
-		let synced = at(&Op::SyncFile(corrupt)).expect("the copy is synced");
 		let cut = at(&Op::SetLen(good)).expect("cut back");
-		assert!(copied < synced && synced < cut, "copy, sync of the copy, cut: {calls:?}");
+		if kind == FsKind::Std {
+			// Native recovery gains no fsync: the copy was never synced by name.
+			assert!(at(&Op::SyncFile(corrupt)).is_none(), "std does not sync the copy: {calls:?}");
+			assert!(copied < cut, "copy, cut: {calls:?}");
+		} else {
+			let synced = at(&Op::SyncFile(corrupt)).expect("the copy is synced");
+			assert!(copied < synced && synced < cut, "copy, sync of the copy, cut: {calls:?}");
+		}
 		// And the cut is synced, then the directory.
 		assert!(
 			calls[cut..].contains(&Op::Sync) && calls.last() == Some(&Op::SyncDir),
@@ -1036,10 +1042,10 @@ fn a_pool_with_no_free_file_fails_a_rotation_with_the_typed_error_and_leaves_the
 
 #[test]
 fn the_name_of_the_copy_of_a_repair_is_durable_before_the_segment_is_cut() {
-	// A copy that is synced but whose directory entry is not can be gone after a power cut that
-	// also keeps the cut of the original: the directory is synced between the two, on every kind
-	// of file system. (A pool cannot see the difference: its copy syncs the slot that holds the
-	// name, so this runs over `std`, where the order of the calls is the only evidence.)
+	// A copy whose directory entry is not durable can be gone after a power cut that also keeps
+	// the cut of the original: the directory is synced between the two, on every kind of file
+	// system. (A pool cannot see the difference: its copy syncs the slot that holds the name, so
+	// this runs over `std`, where the order of the calls is the only evidence.)
 	for kind in [FsKind::Std, FsKind::Pool] {
 		let dir = TempDir::new().unwrap();
 		let good = torn_segment(dir.path(), 1, 50);
@@ -1047,11 +1053,12 @@ fn the_name_of_the_copy_of_a_repair_is_durable_before_the_segment_is_cut() {
 		repair_corrupted_wal_segment_in(&*fs, dir.path(), 1, good as usize).unwrap();
 		let calls = the_log(&log);
 		let corrupt = format!("{:020}.wal.corrupt", 1);
-		let synced = calls.iter().position(|op| *op == Op::SyncFile(corrupt.clone())).unwrap();
+		let copied =
+			calls.iter().position(|op| matches!(op, Op::Copy(_, to) if *to == corrupt)).unwrap();
 		let cut = calls.iter().position(|op| *op == Op::SetLen(good)).unwrap();
 		assert!(
-			calls[synced..cut].contains(&Op::SyncDir),
-			"the directory is synced after the copy is and before the cut: {calls:?}"
+			calls[copied..cut].contains(&Op::SyncDir),
+			"the directory is synced after the copy is made and before the cut: {calls:?}"
 		);
 	}
 }
