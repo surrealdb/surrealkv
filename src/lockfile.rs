@@ -1,7 +1,3 @@
-// The registered lock is built before a file system that hands it out exists: the pool takes it
-// into use, and this allowance goes with that change.
-#![allow(dead_code)]
-
 #[cfg(not(target_arch = "wasm32"))]
 use std::fs::{File, OpenOptions};
 #[cfg(not(target_arch = "wasm32"))]
@@ -58,8 +54,16 @@ pub(crate) enum LockFile {
 	/// The `flock` of a `LOCK` file, held by this process.
 	Os(OsLock),
 	/// An entry in a set that a file system keeps: one tree in this process owns a directory.
+	#[allow(
+		dead_code,
+		reason = "made by a pool, which no tree is built over until the engine is ported"
+	)]
 	Registered(RegisteredLock),
 	/// There is nothing to lock: the file system has nothing mounted.
+	#[allow(
+		dead_code,
+		reason = "made by a file system with nothing mounted, which a native build never has"
+	)]
 	Refused(&'static str),
 }
 
@@ -74,6 +78,10 @@ impl LockFile {
 
 	/// A lock on `dir` in `registry`, for a file system that keeps its files in a registry and so
 	/// has no `LOCK` file to lock. The directory is normalised, so `a/./b` and `a/b` are one.
+	#[allow(
+		dead_code,
+		reason = "handed out by a pool, which no tree is built over until the engine is ported"
+	)]
 	pub(crate) fn registered(registry: Arc<LockRegistry>, dir: &Path) -> Self {
 		Self::Registered(RegisteredLock {
 			registry,
@@ -83,6 +91,7 @@ impl LockFile {
 	}
 
 	/// A lock that cannot be acquired, with the reason.
+	#[allow(dead_code, reason = "handed out by a file system with nothing mounted")]
 	pub(crate) fn refused(reason: &'static str) -> Self {
 		Self::Refused(reason)
 	}
@@ -261,6 +270,7 @@ impl Drop for RegisteredLock {
 /// The directory with `.` and `..` resolved by name and the separators collapsed, without asking
 /// the file system, so that two spellings of one directory take the same entry. A `..` that has
 /// nothing to remove is kept on a relative path and dropped at the root.
+#[allow(dead_code, reason = "the name of a directory in the registry of a pool")]
 pub(crate) fn normalise_dir(dir: &Path) -> PathBuf {
 	let mut out = PathBuf::new();
 	for component in dir.components() {

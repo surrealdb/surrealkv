@@ -428,6 +428,10 @@ impl Fs for RecordingFs {
 		Ok(self.wrap(path, StdFs.open_append(path, opts)?))
 	}
 
+	fn open_append_existing(&self, path: &Path) -> io::Result<Arc<dyn FsFile>> {
+		Ok(self.wrap(path, StdFs.open_append_existing(path)?))
+	}
+
 	fn create_new(&self, path: &Path, opts: CreateOpts) -> io::Result<Arc<dyn FsFile>> {
 		self.check_exhausted()?;
 		Ok(self.wrap(path, StdFs.create_new(path, opts)?))
@@ -1026,4 +1030,206 @@ fn a_pool_with_no_free_file_fails_a_rotation_with_the_typed_error_and_leaves_the
 	exhausted.store(true, Ordering::SeqCst);
 	let opened = Wal::open_with_min_log_number(other.path(), 1, options_over(fs));
 	assert_eq!(opened.err(), Some(WalError::PoolExhausted));
+}
+
+// ---- the name of the copy of a repair ---------------------------------------------------------
+
+#[test]
+fn the_name_of_the_copy_of_a_repair_is_durable_before_the_segment_is_cut() {
+	// A copy that is synced but whose directory entry is not can be gone after a power cut that
+	// also keeps the cut of the original: the directory is synced between the two, on every kind
+	// of file system. (A pool cannot see the difference: its copy syncs the slot that holds the
+	// name, so this runs over `std`, where the order of the calls is the only evidence.)
+	for kind in [FsKind::Std, FsKind::Pool] {
+		let dir = TempDir::new().unwrap();
+		let good = torn_segment(dir.path(), 1, 50);
+		let (fs, log) = RecordingFs::recording(kind);
+		repair_corrupted_wal_segment_in(&*fs, dir.path(), 1, good as usize).unwrap();
+		let calls = the_log(&log);
+		let corrupt = format!("{:020}.wal.corrupt", 1);
+		let synced = calls.iter().position(|op| *op == Op::SyncFile(corrupt.clone())).unwrap();
+		let cut = calls.iter().position(|op| *op == Op::SetLen(good)).unwrap();
+		assert!(
+			calls[synced..cut].contains(&Op::SyncDir),
+			"the directory is synced after the copy is and before the cut: {calls:?}"
+		);
+	}
+}
+
+#[test]
+fn the_repair_of_a_segment_that_has_gone_creates_nothing() {
+	// A segment that is not there is not made by opening it to cut it: `NotFound`, and not a new
+	// empty file that the log would then take for a segment. The repair itself looks first and says
+	// so; the open that follows looks again, and says the same.
+	let dir = TempDir::new().unwrap();
+	let path = dir.path().join(format!("{:020}.wal", 7));
+	assert_eq!(
+		StdFs.open_append_existing(&path).err().map(|e| e.kind()),
+		Some(io::ErrorKind::NotFound)
+	);
+	assert!(!path.exists(), "nothing was created");
+	let error = repair_corrupted_wal_segment_in(&StdFs, dir.path(), 7, 0).unwrap_err();
+	assert!(error.to_string().contains("does not exist"), "{error}");
+	assert!(!path.exists());
+}
+
+// ---- a writer whose write failed --------------------------------------------------------------
+
+/// A pool file over memory, and the backend to make it fail.
+fn pool_file(path: &str) -> (crate::vfs::MemRaw, Arc<dyn FsFile>) {
+	use crate::vfs::{MemRaw, PoolConfig, PoolFs};
+
+	let raw = MemRaw::new();
+	let (fs, _) = PoolFs::mount_sync(raw.clone(), PoolConfig::memory()).unwrap();
+	fs.create_dir_all(Path::new("/w")).unwrap();
+	let file = fs.create_new(Path::new(path), CreateOpts::default()).unwrap();
+	// The pool lives as long as the file does not: the file keeps its slot, which is all it needs.
+	std::mem::forget(fs);
+	(raw, file)
+}
+
+fn contents_of(file: &Arc<dyn FsFile>) -> Vec<u8> {
+	let mut bytes = vec![0u8; file.len().unwrap() as usize];
+	file.read_exact_at(0, &mut bytes).unwrap();
+	bytes
+}
+
+#[test]
+fn a_buffer_whose_flush_failed_is_not_written_again_when_the_writer_is_dropped() {
+	use super::{BufferedFileWriter, WritableFile};
+
+	let (raw, file) = pool_file("/w/a.wal");
+	let mut writer = BufferedFileWriter::new(Arc::clone(&file), 64);
+	let chunk = vec![7u8; 40];
+	writer.append(&chunk).unwrap();
+	assert_eq!(file.len().unwrap(), 0, "the chunk is in the buffer");
+	// The write of the buffer puts ten bytes in the file and fails.
+	raw.write_then_fail(10);
+	assert!(writer.flush().is_err());
+	assert_eq!(file.len().unwrap(), 10, "ten bytes of the chunk landed");
+	drop(writer);
+	assert_eq!(
+		contents_of(&file),
+		vec![7u8; 10],
+		"the chunk is not written after its own beginning when the writer is dropped"
+	);
+}
+
+#[test]
+fn a_buffer_whose_append_failed_is_not_written_again_when_the_writer_is_dropped() {
+	use super::{BufferedFileWriter, WritableFile};
+
+	let (raw, file) = pool_file("/w/b.wal");
+	let mut writer = BufferedFileWriter::new(Arc::clone(&file), 64);
+	writer.append(&[1u8; 40]).unwrap();
+	// This one does not fit what is left of the buffer: appending it writes the buffer out first,
+	// and that write puts five bytes in the file and fails.
+	raw.write_then_fail(5);
+	assert!(writer.append(&[2u8; 40]).is_err());
+	assert_eq!(file.len().unwrap(), 5);
+	drop(writer);
+	assert_eq!(contents_of(&file), vec![1u8; 5], "nothing is written when the writer is dropped");
+}
+
+#[test]
+fn a_writer_whose_writes_all_succeeded_still_writes_its_buffer_when_dropped() {
+	use super::{BufferedFileWriter, WritableFile};
+
+	// The guard is for a failed write only: a buffer that is whole and was never written is the
+	// one that `BufWriter` writes on drop, as it always did.
+	let (_raw, file) = pool_file("/w/c.wal");
+	let mut writer = BufferedFileWriter::new(Arc::clone(&file), 64);
+	writer.append(&[3u8; 40]).unwrap();
+	drop(writer);
+	assert_eq!(contents_of(&file), vec![3u8; 40]);
+}
+
+// ---- links in the directory of the log --------------------------------------------------------
+//
+// The log listed its directory in two ways before the seam, which differ for a link: the ids of the
+// segments (`list_segment_ids`) asked `std::fs::metadata` of each name, which follows a link and
+// fails for one that points to nothing, and the references to them (`SegmentRef`) took the type of
+// the entry from `DirEntry::file_type`, which does not follow a link, so that a link was not a
+// segment. `StdFs::read_dir` says that an entry is a link, and each listing decides, as it did.
+
+#[cfg(unix)]
+fn segment_name(id: u64) -> String {
+	format!("{id:020}.wal")
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_to_a_segment_is_a_segment_and_a_link_to_nothing_fails_the_listing_of_ids() {
+	use std::os::unix::fs::symlink;
+
+	let dir = TempDir::new().unwrap();
+	let elsewhere = TempDir::new().unwrap();
+	let wal = dir.path();
+	fs::write(wal.join(segment_name(1)), b"one").unwrap();
+	let target = elsewhere.path().join("two");
+	fs::write(&target, b"two").unwrap();
+	symlink(&target, wal.join(segment_name(2))).unwrap();
+	// A link to a directory is not a segment, and does not fail the listing.
+	symlink(elsewhere.path(), wal.join(segment_name(4))).unwrap();
+	assert_eq!(list_segment_ids_in(&StdFs, wal, Some("wal")).unwrap(), [1, 2]);
+
+	// A link to nothing is not adopted: the listing fails, as `metadata` of it did, and nothing is
+	// created at the end of it.
+	let gone = elsewhere.path().join("gone");
+	symlink(&gone, wal.join(segment_name(3))).unwrap();
+	assert!(list_segment_ids_in(&StdFs, wal, Some("wal")).is_err());
+	assert!(!gone.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_link_is_not_a_segment_reference() {
+	use std::os::unix::fs::symlink;
+
+	let dir = TempDir::new().unwrap();
+	let elsewhere = TempDir::new().unwrap();
+	let wal = dir.path();
+	fs::write(wal.join(segment_name(1)), b"one").unwrap();
+	let target = elsewhere.path().join("two");
+	fs::write(&target, b"two").unwrap();
+	symlink(&target, wal.join(segment_name(2))).unwrap();
+	let gone = elsewhere.path().join("gone");
+	symlink(&gone, wal.join(segment_name(3))).unwrap();
+
+	let refs =
+		super::SegmentRef::read_segments_from_directory_in(&StdFs, wal, Some("wal")).unwrap();
+	assert_eq!(refs.iter().map(|segment| segment.id).collect::<Vec<_>>(), [1]);
+	assert!(!gone.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_log_opened_beside_a_link_to_nothing_named_like_a_segment_creates_no_target() {
+	use std::os::unix::fs::symlink;
+
+	let dir = TempDir::new().unwrap();
+	let elsewhere = TempDir::new().unwrap();
+	torn_segment(dir.path(), 1, 0);
+	let gone = elsewhere.path().join("gone");
+	symlink(&gone, dir.path().join(segment_name(2))).unwrap();
+
+	// Taking the link for the newest segment would open it to append, and that makes the file that
+	// the link points to.
+	assert!(Wal::open(dir.path(), Options::default()).is_err());
+	assert!(!gone.exists(), "the target of the link was not made");
+}
+
+#[cfg(unix)]
+#[test]
+fn the_check_of_the_log_number_is_skipped_when_the_listing_fails_as_it_always_was() {
+	use std::os::unix::fs::symlink;
+
+	let dir = TempDir::new().unwrap();
+	let elsewhere = TempDir::new().unwrap();
+	fs::write(dir.path().join(segment_name(1)), b"one").unwrap();
+	// A log number that is two past the last segment is a corrupt manifest.
+	assert!(crate::levels::validate_wal_log_number(dir.path(), 10).is_err());
+	// With a link to nothing in the directory the listing fails, and the check does not run.
+	symlink(elsewhere.path().join("gone"), dir.path().join(segment_name(5))).unwrap();
+	crate::levels::validate_wal_log_number(dir.path(), 10).unwrap();
 }

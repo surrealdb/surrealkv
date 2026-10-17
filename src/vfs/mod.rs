@@ -1,18 +1,14 @@
 //! Files and the file system.
 //!
 //! [`File`] is the read seam of a table: positional reads of one open file. [`Fs`] is the
-//! directory-level seam beside it, and [`FsFile`] the open file it hands out. The engine does not
-//! call them yet (the milestones that move its call sites over are in the plan of the browser
-//! port), so everything below that is not `File` is built and tested and used by nothing.
+//! directory-level seam beside it, and [`FsFile`] the open file it hands out. Tables, the manifest,
+//! the write-ahead log and the value log make their file calls through them; what an item here is
+//! for that nothing calls yet is said at the item, with an `allow` that gives the reason.
 //!
 //! A file system is one of three kinds. [`StdFs`] is `std::fs` and is what a native build uses. A
 //! pool ([`pool`]) keeps its files in memory or in a browser's origin private file system.
 //! [`UnavailableFs`] is what a browser build has until a file system is mounted, and it refuses
 //! every operation with an error that says so.
-// The seam is built before anything calls it: each milestone that moves a call site over (tables,
-// the open path, the write-ahead log, the value log, the engine) takes a part out of this
-// allowance, and the last one removes it.
-#![allow(dead_code)]
 
 pub(crate) mod header;
 pub(crate) mod mem;
@@ -191,6 +187,10 @@ pub fn open_for_sync<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<SysF
 /// Uses `sync_all` deliberately: readers depend on the durable file *size*
 /// (e.g. SST footers are located relative to the end of the file), so syncing
 /// data alone is not enough.
+#[cfg_attr(
+	all(target_arch = "wasm32", target_os = "unknown"),
+	allow(dead_code, reason = "only `StdFs` syncs a file by its path")
+)]
 pub(crate) fn fsync_file<P: AsRef<std::path::Path>>(path: P) -> std::io::Result<()> {
 	let file = open_for_sync(&path)?;
 	file.sync_all()?;
@@ -251,18 +251,49 @@ pub(crate) enum FsKind {
 	Unavailable,
 }
 
-/// What a path names.
+/// What a path names, or what an entry of a directory is.
+///
+/// [`Fs::entry`] follows links, as `std::fs::metadata` does, so it answers `File`, `Dir`, or (of
+/// `StdFs` only) `Other`. [`Fs::read_dir`] does not follow them, as `DirEntry::file_type` does, and
+/// is the only call that answers `Symlink`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EntryKind {
 	File,
 	Dir,
+	/// A symbolic link, whatever it points to, or to nothing. Only a listing of `StdFs` has one: a
+	/// pool has no links. A caller that has to treat a link as what it points to asks
+	/// [`DirEntry::resolved_kind`]; one that has to treat it as not being a file compares the kind
+	/// with `File`, which a link never is.
+	Symlink,
+	/// Neither a regular file, a directory nor a link: a socket, a pipe, a device. `StdFs` only.
+	#[cfg_attr(
+		all(target_arch = "wasm32", target_os = "unknown"),
+		allow(dead_code, reason = "only `StdFs` lists one, and there is none in a browser")
+	)]
+	Other,
 }
 
 /// One name in a directory listing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DirEntry {
 	pub(crate) name: OsString,
+	/// What the entry is itself: a link is a `Symlink`, not what it points to.
 	pub(crate) kind: EntryKind,
+}
+
+impl DirEntry {
+	/// What the entry is with a link followed to what it points to, which is what
+	/// `std::fs::metadata` of its path says: the answer of the call sites that listed a
+	/// directory and then asked for the metadata of each name. A link that points to nothing is
+	/// a `NotFound` error, as `metadata` of it is, and so is any other failure to tell.
+	pub(crate) fn resolved_kind(&self, fs: &dyn Fs, dir: &Path) -> io::Result<EntryKind> {
+		if self.kind != EntryKind::Symlink {
+			return Ok(self.kind);
+		}
+		fs.entry(&dir.join(&self.name))?.ok_or_else(|| {
+			io::Error::new(io::ErrorKind::NotFound, "a link points to a file that is not there")
+		})
+	}
 }
 
 /// How a creation treats the spare files of a pool. A file system that has no spares ignores it.
@@ -301,6 +332,10 @@ impl CreateOpts {
 
 /// A wait for a pool to hold at least `n` free files. `Send`, because it only awaits a
 /// notification.
+#[allow(
+	dead_code,
+	reason = "no call site of the engine uses it until the engine's own files go through the file system"
+)]
 pub(crate) type SpareWait = Pin<Box<dyn Future<Output = io::Result<()>> + Send + 'static>>;
 
 /// The directory-level seam. Synchronous and object-safe: the engine calls it under its own locks,
@@ -340,8 +375,9 @@ pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
 
 	// ---- namespace --------------------------------------------------------------------------
 
-	/// What `path` names: `Ok(None)` if nothing, an error if it cannot be told. The primitive that
-	/// the other questions about a path are answered from.
+	/// What `path` names, a link followed to what it points to: `Ok(None)` if nothing (a link to
+	/// nothing too), an error if it cannot be told. The primitive that the other questions about a
+	/// path are answered from.
 	fn entry(&self, path: &Path) -> io::Result<Option<EntryKind>>;
 
 	/// `Path::try_exists`: the three-way answer, for the sites that read `try_exists()?`.
@@ -355,16 +391,23 @@ pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
 		self.try_exists(path).unwrap_or(false)
 	}
 
+	#[cfg_attr(not(test), allow(dead_code, reason = "no call site of the engine asks it yet"))]
 	fn is_dir(&self, path: &Path) -> bool {
 		matches!(self.entry(path), Ok(Some(EntryKind::Dir)))
 	}
 
+	#[cfg_attr(not(test), allow(dead_code, reason = "no call site of the engine asks it yet"))]
 	fn is_file(&self, path: &Path) -> bool {
 		matches!(self.entry(path), Ok(Some(EntryKind::File)))
 	}
 
 	fn create_dir_all(&self, path: &Path) -> io::Result<()>;
 
+	/// The names in a directory, each with what it is itself: a link is a [`EntryKind::Symlink`],
+	/// not what it points to (the kind that `std::fs::DirEntry::file_type` gives, which costs
+	/// no call). A caller that used to look at each name with `std::fs::metadata` follows a
+	/// link with [`DirEntry::resolved_kind`]; one that used `DirEntry::file_type` compares the
+	/// kind as it is.
 	fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>>;
 
 	/// `NotFound` if `path` is not there.
@@ -388,6 +431,18 @@ pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
 
 	/// A file to read and append to, created if it is absent. What the write-ahead log opens.
 	fn open_append(&self, path: &Path, opts: CreateOpts) -> io::Result<Arc<dyn FsFile>>;
+
+	/// A file to read and append to that must be there already: `NotFound` if the path is absent,
+	/// and nothing is created. What the repair of a log segment and the newest file of the
+	/// value log open, which both used to open an existing file and fail if it was gone. The
+	/// provided method asks first and opens after, which is not atomic: every file system that
+	/// is not a wrapper of another overrides it.
+	fn open_append_existing(&self, path: &Path) -> io::Result<Arc<dyn FsFile>> {
+		if !self.try_exists(path)? {
+			return Err(io::Error::new(io::ErrorKind::NotFound, "no such file"));
+		}
+		self.open_append(path, CreateOpts::default())
+	}
 
 	/// A new file, `AlreadyExists` if the path is present. What a new log segment is.
 	fn create_new(&self, path: &Path, opts: CreateOpts) -> io::Result<Arc<dyn FsFile>>;
@@ -465,10 +520,18 @@ pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
 
 	/// The lock of the database in `dir`, not yet acquired. `StdFs` is the existing `flock` of a
 	/// `LOCK` file; a pool registers the directory in its own set, so that one tree owns it.
+	#[allow(
+		dead_code,
+		reason = "no call site of the engine uses it until the engine's own files go through the file system"
+	)]
 	fn lock_file(&self, dir: &Path) -> LockFile;
 
 	/// `None` when at least `n` files can be created now, which is always the case of `StdFs`.
 	/// Otherwise a future that completes when they can. Awaited only where no lock is held.
+	#[allow(
+		dead_code,
+		reason = "no call site of the engine uses it until the engine's own files go through the file system"
+	)]
 	fn ensure_spares(&self, n: usize) -> Option<SpareWait> {
 		let _ = n;
 		None
@@ -477,6 +540,10 @@ pub(crate) trait Fs: Send + Sync + fmt::Debug + 'static {
 	/// How many creations a pool has refused for want of a file, ever. A background task reads it
 	/// before and after a unit of work: if it advanced, a failure of that unit is not permanent,
 	/// whatever the failure looks like after the layers it went through.
+	#[allow(
+		dead_code,
+		reason = "no call site of the engine uses it until the engine's own files go through the file system"
+	)]
 	fn pool_exhaustions(&self) -> u64 {
 		0
 	}
@@ -767,6 +834,10 @@ pub(crate) fn pool_full(max_files: usize) -> io::Error {
 }
 
 /// Whether `error` is the one that [`pool_full`] makes.
+#[allow(
+	dead_code,
+	reason = "no call site of the engine uses it until the engine's own files go through the file system"
+)]
 pub(crate) fn is_pool_full(error: &io::Error) -> bool {
 	error.get_ref().is_some_and(|inner| inner.is::<PoolFull>())
 }

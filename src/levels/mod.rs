@@ -64,7 +64,9 @@ fn prepare_key_of_table(
 fn segment_ids_in(fs: &dyn Fs, dir: &Path, allowed_extension: &str) -> Option<Vec<u64>> {
 	let mut ids = Vec::new();
 	for entry in fs.read_dir(dir).ok()? {
-		if entry.kind != crate::vfs::EntryKind::File {
+		// A link is followed, and one that points to nothing fails the listing: as the
+		// `wal::list_segment_ids` that this stands for did.
+		if entry.resolved_kind(fs, dir).ok()? != crate::vfs::EntryKind::File {
 			continue;
 		}
 		let (index, extension) = parse_segment_name(&entry.name.to_string_lossy()).ok()?;

@@ -192,6 +192,15 @@ impl Fs for Arc<RecordingFs> {
 		}))
 	}
 
+	fn open_append_existing(&self, path: &Path) -> io::Result<Arc<dyn FsFile>> {
+		self.record(format!("open_append_existing {}", short(path)));
+		Ok(Arc::new(RecordingFile {
+			name: short(path),
+			inner: self.inner.open_append_existing(path)?,
+			fs: Arc::clone(self),
+		}))
+	}
+
 	fn open_append(&self, path: &Path, opts: CreateOpts) -> io::Result<Arc<dyn FsFile>> {
 		self.record(format!("open_append {} {}", short(path), class(opts)));
 		Ok(Arc::new(RecordingFile {

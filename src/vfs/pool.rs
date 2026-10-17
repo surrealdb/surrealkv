@@ -53,7 +53,9 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use super::header::{
+	is_seq_exhausted,
 	page_offset,
+	seq_exhausted,
 	Header,
 	SlotHeaders,
 	SlotState as HeaderState,
@@ -90,8 +92,14 @@ const REFILL_BATCH: usize = 16;
 const OPEN_BATCH: usize = 256;
 
 /// A future of a backend. `Send` where there are threads, and not in a browser, where the futures
-/// of a file system are those of JavaScript. A backend must make these safe to drop: a creation or
-/// an open that is dropped after it was asked for must close the file when it arrives.
+/// of a file system are those of JavaScript.
+///
+/// A backend must make these safe to drop: a creation or an open that is dropped after it was
+/// asked for must close the file when it arrives, because the pool cannot: it never sees a handle
+/// that was not delivered, and a handle of a browser that is not closed stays locked until it is
+/// collected. A future of a backend that is dropped must also not need an executor to do that, so
+/// the close is made from `Drop`, with the one call that does not wait (`RawFile::close`, or the
+/// continuation of the promise that is still outstanding).
 #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
 pub(crate) type RawFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
@@ -102,6 +110,11 @@ pub(crate) type RawFut<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 ///
 /// A handle that is dropped without `close` may stay locked, as the handles of a browser do until
 /// they are collected, so a pool closes every handle it holds.
+///
+/// `close` is the way to release a handle without waiting: it is called from `Drop` (of the pool,
+/// of a mount that was cancelled, of a refill that was), from any state of the handle, any number
+/// of times, and must not need an executor, a lock that an awaiting task may hold, or a handle
+/// that has not been opened yet.
 pub(crate) trait RawFile: Send + Sync + 'static {
 	/// Reads at `offset`; fewer bytes than asked for only at the end of the file.
 	fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
@@ -215,6 +228,7 @@ impl PoolConfig {
 
 	/// A pool that is refilled only by the code that waits for spares, with a bounded number of
 	/// slots: the configuration that makes a missing `ensure_spares` visible in a test.
+	#[cfg_attr(not(test), allow(dead_code, reason = "the strict pool of the tests"))]
 	pub(crate) fn strict(initial: usize, max_files: usize) -> Self {
 		Self {
 			low: 0,
@@ -320,6 +334,15 @@ pub(crate) fn key_of(path: &Path) -> io::Result<String> {
 		return Err(invalid("a path has a NUL in it"));
 	}
 	Ok(key)
+}
+
+/// The name in the registry of a path that a header holds, if it is a name of a file: the path
+/// resolved as every lookup resolves its own, and short enough to be one. `None` for what no lookup
+/// can ask for (the root, a name that resolves to nothing, one that is too long).
+fn normal_name(path: &str) -> Option<String> {
+	let key = key_of(Path::new(path)).ok()?;
+	check_file_key(&key).ok()?;
+	Some(key)
 }
 
 /// The directory that holds `key`, if it has one.
@@ -442,15 +465,41 @@ pub(crate) fn poll_ready<F: Future>(future: F) -> Option<F::Output> {
 	None
 }
 
+/// A result that may hold an open handle, which is closed if nobody takes it.
+trait Dispose {
+	fn dispose(&mut self);
+}
+
+impl<F: RawFile> Dispose for io::Result<F> {
+	fn dispose(&mut self) {
+		if let Ok(file) = self {
+			let _ = file.close();
+		}
+	}
+}
+
 /// Polls every future until each is done, and gives the results in order. Nothing is dropped
 /// before it completes, which is what a browser needs of opens that are in flight: a handle that
 /// arrives after its future was dropped stays locked.
-struct JoinAllSettled<'a, T> {
+///
+/// That holds while this is polled, and no longer. If it is dropped half way (the task that awaits
+/// it was cancelled) the futures that are still pending are dropped with it, and a backend has to
+/// close what they would have delivered (see [`RawFut`]). What the futures that did complete
+/// delivered is in `results` and was never handed to anyone, so it is closed here.
+struct JoinAllSettled<'a, T: Dispose> {
 	futures: Vec<Option<RawFut<'a, T>>>,
 	results: Vec<Option<T>>,
 }
 
-impl<'a, T> JoinAllSettled<'a, T> {
+impl<T: Dispose> Drop for JoinAllSettled<'_, T> {
+	fn drop(&mut self) {
+		for result in self.results.iter_mut().flatten() {
+			result.dispose();
+		}
+	}
+}
+
+impl<'a, T: Dispose> JoinAllSettled<'a, T> {
 	fn new(futures: Vec<RawFut<'a, T>>) -> Self {
 		let results = futures.iter().map(|_| None).collect();
 		Self {
@@ -460,9 +509,9 @@ impl<'a, T> JoinAllSettled<'a, T> {
 	}
 }
 
-impl<T> Unpin for JoinAllSettled<'_, T> {}
+impl<T: Dispose> Unpin for JoinAllSettled<'_, T> {}
 
-impl<T> Future for JoinAllSettled<'_, T> {
+impl<T: Dispose> Future for JoinAllSettled<'_, T> {
 	type Output = Vec<T>;
 
 	fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Vec<T>> {
@@ -631,6 +680,52 @@ impl<R: Raw> Namespace<R> {
 // The shared state of a pool
 // ---------------------------------------------------------------------------------------------
 
+/// Slots that a refill counts against the cap while it makes them. Whatever is left of it when it
+/// is dropped (a refill that failed part of the way, or was cancelled at an await) is given back,
+/// so that the room is not used up for good.
+struct Reservation<'a, R: Raw> {
+	pool: &'a PoolShared<R>,
+	/// How many are still counted and not yet a slot.
+	left: usize,
+}
+
+impl<'a, R: Raw> Reservation<'a, R> {
+	/// Counts up to `wanted` slots, as many as the cap has room for.
+	fn new(pool: &'a PoolShared<R>, wanted: usize) -> Self {
+		let mut left = 0;
+		while left < wanted && pool.reserve_slot() {
+			left += 1;
+		}
+		pool.making.fetch_add(left, Ordering::AcqRel);
+		Self {
+			pool,
+			left,
+		}
+	}
+
+	/// One of them is a slot now: it stays counted, as a slot and not as one on the way.
+	fn made(&mut self) {
+		self.left -= 1;
+		self.pool.making.fetch_sub(1, Ordering::AcqRel);
+	}
+
+	/// One of them will not be a slot: the room is free again.
+	fn release(&mut self) {
+		self.left -= 1;
+		self.pool.making.fetch_sub(1, Ordering::AcqRel);
+		self.pool.total.fetch_sub(1, Ordering::AcqRel);
+	}
+}
+
+impl<R: Raw> Drop for Reservation<'_, R> {
+	fn drop(&mut self) {
+		if self.left > 0 {
+			self.pool.making.fetch_sub(self.left, Ordering::AcqRel);
+			self.pool.total.fetch_sub(self.left, Ordering::AcqRel);
+		}
+	}
+}
+
 struct Free<R: Raw> {
 	clean: Vec<Arc<Slot<R>>>,
 	dirty: Vec<Arc<Slot<R>>>,
@@ -649,6 +744,8 @@ pub(crate) struct PoolShared<R: Raw> {
 	avail: AtomicUsize,
 	/// Slots that exist or are being made, against `max_files`.
 	total: AtomicUsize,
+	/// Of `total`, the slots that a refill is making now: they are not there yet, and will be.
+	making: AtomicUsize,
 	next_phys: AtomicU64,
 	seq: AtomicU64,
 	reserve: AtomicUsize,
@@ -663,14 +760,30 @@ pub(crate) struct PoolShared<R: Raw> {
 	/// The number of times a refill has failed for good, and the last such error.
 	refill_error: Mutex<(u64, Option<(io::ErrorKind, String)>)>,
 	clean_failures: AtomicU64,
+	#[allow(
+		dead_code,
+		reason = "no call site of the engine uses it until the engine's own files go through the file system"
+	)]
 	locks: Arc<LockRegistry>,
 	lock_handle: Mutex<Option<R::File>>,
 	report: Mutex<Option<MountReport>>,
 }
 
 impl<R: Raw> PoolShared<R> {
-	fn next_seq(&self) -> u64 {
-		self.seq.fetch_add(1, Ordering::AcqRel) + 1
+	/// The next sequence number, which only grows. A pool whose numbers have run out (a header
+	/// that a mount found with the highest number there is: nothing this pool wrote, and no
+	/// header it could write would win against it) refuses to write any more, with a typed error,
+	/// and does not wrap: a number that is the same as another breaks the rule that the higher one
+	/// wins, and a wrap to 0 would make every later header lose.
+	fn next_seq(&self) -> io::Result<u64> {
+		let mut seq = self.seq.load(Ordering::Acquire);
+		loop {
+			let next = seq.checked_add(1).ok_or_else(seq_exhausted)?;
+			match self.seq.compare_exchange_weak(seq, next, Ordering::AcqRel, Ordering::Acquire) {
+				Ok(_) => return Ok(next),
+				Err(now) => seq = now,
+			}
+		}
 	}
 
 	/// How many slots can be had without waiting: the free ones, and, where the backend makes
@@ -688,9 +801,13 @@ impl<R: Raw> PoolShared<R> {
 		self.cfg.max_files.saturating_sub(self.total.load(Ordering::Acquire))
 	}
 
-	/// Free slots, and the ones that the cap lets be made: the most that a wait could ever get.
+	/// Free slots, the ones that a refill is making, and the ones that the cap lets be made: the
+	/// most that a wait could ever get.
 	fn potential(&self) -> usize {
-		self.avail.load(Ordering::Acquire).saturating_add(self.headroom())
+		self.avail
+			.load(Ordering::Acquire)
+			.saturating_add(self.making.load(Ordering::Acquire))
+			.saturating_add(self.headroom())
 	}
 
 	fn live(&self) -> io::Result<()> {
@@ -719,7 +836,7 @@ impl<R: Raw> PoolShared<R> {
 		// be able to put the lower number in the page that is written second, and the page that
 		// counts at a mount would not be the one that memory says counts.
 		let mut st = slot.st.lock();
-		let seq = self.next_seq();
+		let seq = self.next_seq()?;
 		let page = Header {
 			seq,
 			state: state.clone(),
@@ -813,7 +930,7 @@ impl<R: Raw> PoolShared<R> {
 	/// comes first: a crash after it and before the headers leaves the name of a dead file with no
 	/// bytes, which is no worse than the dead file, and loses to any newer claim of the path.
 	fn clean_slot(&self, slot: &Slot<R>) -> io::Result<()> {
-		let seq = self.next_seq();
+		let seq = self.next_seq()?;
 		slot.raw.set_len(HEADER_LEN)?;
 		let page = Header::free(seq).encode()?;
 		write_fully(&slot.raw, page_offset(0), &page).1?;
@@ -915,7 +1032,12 @@ impl<R: Raw> PoolShared<R> {
 		if let Some(e) = last_error {
 			return Err(e);
 		}
-		if self.total.load(Ordering::Acquire) >= self.cfg.max_files {
+		// At the cap, and nothing on the way: files have to be released first. A refill that is
+		// making slots counts against the cap and will bring them, which is a wait and not a
+		// limit.
+		if self.total.load(Ordering::Acquire) >= self.cfg.max_files
+			&& self.making.load(Ordering::Acquire) == 0
+		{
 			Err(pool_full(self.cfg.max_files))
 		} else {
 			Err(pool_exhausted())
@@ -945,8 +1067,21 @@ impl<R: Raw> PoolShared<R> {
 			return Err(e);
 		}
 		let slot = Slot::new(name, raw, SlotInfo::fresh(0, 0), 0);
-		self.slots.lock().push(Arc::clone(&slot));
+		self.adopt(&slot);
 		Ok(Some(slot))
+	}
+
+	/// Puts a slot that was made in the list of the handles that this mount holds, to be closed.
+	///
+	/// A pool that is closed or abandoned at this very moment may already have gone through that
+	/// list. The list is read and written under one lock, and `closed` is set before it is read, so
+	/// either the close sees this slot, or this sees `closed`, and it is closed here.
+	fn adopt(&self, slot: &Arc<Slot<R>>) {
+		let mut slots = self.slots.lock();
+		slots.push(Arc::clone(slot));
+		if self.closed.load(Ordering::Acquire) {
+			let _ = slot.raw.close();
+		}
 	}
 
 	/// Counts one more slot against the cap, if there is room.
@@ -1011,8 +1146,13 @@ impl<R: Raw> PoolShared<R> {
 	/// Makes blank slots until `target` are free, after cleaning the dead ones. Stops with an error
 	/// at the cap, or when the backend fails.
 	///
-	/// Cancel-safe at its awaits as far as the backend is: a creation that is in flight is
-	/// awaited to its end, and a slot that arrives after the pool was closed is closed.
+	/// Safe to drop at its await, which is what a task that is cancelled does to it. The slots that
+	/// it was making count against the cap while they are made, and a [`Reservation`] gives back
+	/// what was not turned into a slot, so a dropped refill does not use up room for good. The
+	/// creations that were in flight are not awaited to their end: the ones that had completed are
+	/// closed (see `JoinAllSettled`), and the ones that had not are the backend's to close when
+	/// they arrive (see [`RawFut`]). A file that a creation made and that was closed in this way
+	/// has no header, and is a blank slot at the next mount.
 	async fn refill_now(&self, target: usize) -> io::Result<()> {
 		self.maintain(usize::MAX);
 		let mut progressed = false;
@@ -1030,11 +1170,8 @@ impl<R: Raw> PoolShared<R> {
 				};
 			}
 			let wanted = (goal - have).min(REFILL_BATCH);
-			let mut reserved = 0;
-			while reserved < wanted && self.reserve_slot() {
-				reserved += 1;
-			}
-			if reserved == 0 {
+			let mut reservation = Reservation::new(self, wanted);
+			if reservation.left == 0 {
 				// Somebody else took the last of the room.
 				return if progressed {
 					Ok(())
@@ -1042,7 +1179,7 @@ impl<R: Raw> PoolShared<R> {
 					Err(pool_full(self.cfg.max_files))
 				};
 			}
-			let names: Vec<String> = (0..reserved)
+			let names: Vec<String> = (0..reservation.left)
 				.map(|_| slot_name(self.next_phys.fetch_add(1, Ordering::AcqRel)))
 				.collect();
 			let futures: Vec<_> = names.iter().map(|name| self.raw.create(name)).collect();
@@ -1055,7 +1192,7 @@ impl<R: Raw> PoolShared<R> {
 							// Arrived after the pool was closed or abandoned: nobody will close it
 							// but this.
 							let _ = raw.close();
-							self.total.fetch_sub(1, Ordering::AcqRel);
+							reservation.release();
 							first_error.get_or_insert_with(|| {
 								io::Error::new(
 									io::ErrorKind::NotConnected,
@@ -1067,20 +1204,21 @@ impl<R: Raw> PoolShared<R> {
 						match self.init_blank(&raw) {
 							Ok(()) => {
 								let slot = Slot::new(name, raw, SlotInfo::fresh(0, 0), 0);
-								self.slots.lock().push(Arc::clone(&slot));
+								self.adopt(&slot);
 								self.free.lock().clean.push(slot);
 								self.avail.fetch_add(1, Ordering::AcqRel);
+								reservation.made();
 								progressed = true;
 							}
 							Err(e) => {
 								let _ = raw.close();
-								self.total.fetch_sub(1, Ordering::AcqRel);
+								reservation.release();
 								first_error.get_or_insert(e);
 							}
 						}
 					}
 					Err(e) => {
-						self.total.fetch_sub(1, Ordering::AcqRel);
+						reservation.release();
 						first_error.get_or_insert(e);
 					}
 				}
@@ -1108,6 +1246,10 @@ impl<R: Raw> PoolShared<R> {
 	}
 
 	/// How many times a refill has failed for good so far.
+	#[allow(
+		dead_code,
+		reason = "no call site of the engine uses it until the engine's own files go through the file system"
+	)]
 	fn refill_error_count(&self) -> u64 {
 		self.refill_error.lock().0
 	}
@@ -1115,6 +1257,10 @@ impl<R: Raw> PoolShared<R> {
 	/// The error of a refill that failed for good after `seen` such failures were counted: every
 	/// wait that began before it hears of it, and a wait that begins later waits for the next
 	/// try, which it asks for.
+	#[allow(
+		dead_code,
+		reason = "no call site of the engine uses it until the engine's own files go through the file system"
+	)]
 	fn refill_error_since(&self, seen: u64) -> Option<io::Error> {
 		let error = self.refill_error.lock();
 		if error.0 == seen {
@@ -1261,6 +1407,10 @@ async fn background_refill<R: Raw>(weak: Weak<PoolShared<R>>, refill: Arc<Notify
 /// The wait of `Fs::ensure_spares`: until `n` slots can be claimed, the pool is closed, or the
 /// refill fails for good. A wait and not a reservation: what it says is true at the poll that
 /// returns, and the caller uses it before it awaits anything else.
+#[allow(
+	dead_code,
+	reason = "no call site of the engine uses it until the engine's own files go through the file system"
+)]
 async fn wait_for_spares<R: Raw>(shared: Arc<PoolShared<R>>, n: usize) -> io::Result<()> {
 	let failures_before = shared.refill_error_count();
 	loop {
@@ -1332,8 +1482,37 @@ impl<R: Raw> fmt::Debug for PoolFs<R> {
 enum Open {
 	Read,
 	Append,
+	/// Appends to a file that is there, and creates nothing.
+	AppendExisting,
 	New,
 	Truncate,
+}
+
+/// What a mount holds before the pool that closes it exists: the lock, and the slots opened so
+/// far. It closes them when it is dropped.
+struct Held<R: Raw> {
+	lock: Option<R::File>,
+	opened: Vec<Arc<Slot<R>>>,
+}
+
+impl<R: Raw> Default for Held<R> {
+	fn default() -> Self {
+		Self {
+			lock: None,
+			opened: Vec::new(),
+		}
+	}
+}
+
+impl<R: Raw> Drop for Held<R> {
+	fn drop(&mut self) {
+		for slot in &self.opened {
+			let _ = slot.raw.close();
+		}
+		if let Some(lock) = &self.lock {
+			let _ = lock.close();
+		}
+	}
 }
 
 impl<R: Raw> PoolFs<R> {
@@ -1344,10 +1523,15 @@ impl<R: Raw> PoolFs<R> {
 		backend: R,
 		cfg: PoolConfig,
 	) -> Result<(Arc<PoolFs<R>>, MountReport)> {
+		// What the mount holds until the pool exists, which closes it from then on. A mount that is
+		// dropped at an await (the task that runs it was cancelled) closes all of it here: a handle
+		// that is only dropped stays locked in a browser.
+		let mut held = Held::<R>::default();
+
 		// 1. The lock, alone and first. Another page releases it when it is closed, or when the
 		// browser has killed its worker, which can take a couple of seconds.
 		let started = rt::Instant::now();
-		let lock = loop {
+		held.lock = Some(loop {
 			match backend.open_lock().await {
 				Ok(lock) => break lock,
 				Err(e)
@@ -1367,16 +1551,10 @@ impl<R: Raw> PoolFs<R> {
 				}
 				Err(e) => return Err(e.into()),
 			}
-		};
+		});
 
-		// 2. The slots. A failure from here on closes whatever was opened.
-		let names = match backend.list().await {
-			Ok(names) => names,
-			Err(e) => {
-				let _ = lock.close();
-				return Err(e.into());
-			}
-		};
+		// 2. The slots. A failure from here on closes whatever was opened, which `held` does.
+		let names = backend.list().await?;
 		let mut found: Vec<(u64, String)> = Vec::new();
 		for name in names {
 			match parse_slot_name(&name) {
@@ -1389,14 +1567,16 @@ impl<R: Raw> PoolFs<R> {
 		let next_phys = found.last().map_or(0, |(index, _)| index + 1);
 
 		// Opened together, and every open is awaited to its end, so that none is dropped in
-		// flight: a handle that arrives late would stay locked.
-		let mut opened: Vec<Arc<Slot<R>>> = Vec::with_capacity(found.len());
+		// flight: a handle that arrives late would stay locked. The results are handed to `held`
+		// one by one, so that those of a batch that was not finished are not lost with it.
 		let mut open_error = None;
 		for batch in found.chunks(OPEN_BATCH) {
 			let futures: Vec<_> = batch.iter().map(|(_, name)| backend.open(name)).collect();
 			for ((_, name), result) in batch.iter().zip(JoinAllSettled::new(futures).await) {
 				match result {
-					Ok(raw) => opened.push(Slot::new(name.clone(), raw, SlotInfo::fresh(0, 0), 0)),
+					Ok(raw) => {
+						held.opened.push(Slot::new(name.clone(), raw, SlotInfo::fresh(0, 0), 0))
+					}
 					Err(e) => {
 						open_error.get_or_insert(e);
 					}
@@ -1407,13 +1587,12 @@ impl<R: Raw> PoolFs<R> {
 			}
 		}
 		if let Some(e) = open_error {
-			for slot in &opened {
-				let _ = slot.raw.close();
-			}
-			let _ = lock.close();
 			return Err(e.into());
 		}
 
+		// The pool takes over what `held` has: from here the pool closes it.
+		let lock = held.lock.take();
+		let opened = std::mem::take(&mut held.opened);
 		let total = opened.len();
 		let shared = Arc::new_cyclic(|me| PoolShared {
 			raw: backend,
@@ -1426,6 +1605,7 @@ impl<R: Raw> PoolFs<R> {
 			slots: Mutex::new(opened.clone()),
 			avail: AtomicUsize::new(0),
 			total: AtomicUsize::new(total),
+			making: AtomicUsize::new(0),
 			next_phys: AtomicU64::new(next_phys),
 			seq: AtomicU64::new(0),
 			reserve: AtomicUsize::new(cfg.reserve),
@@ -1439,7 +1619,7 @@ impl<R: Raw> PoolFs<R> {
 			refill_error: Mutex::new((0, None)),
 			clean_failures: AtomicU64::new(0),
 			locks: Arc::new(LockRegistry::default()),
-			lock_handle: Mutex::new(Some(lock)),
+			lock_handle: Mutex::new(lock),
 			report: Mutex::new(None),
 			cfg: cfg.clone(),
 		});
@@ -1485,29 +1665,38 @@ impl<R: Raw> PoolFs<R> {
 	}
 
 	/// Cleans up to `budget` dead slots.
+	#[cfg_attr(not(test), allow(dead_code, reason = "the engine reaches it through `PoolControl`"))]
 	pub(crate) fn maintain(&self, budget: usize) -> usize {
 		self.shared.maintain(budget)
 	}
 
 	/// Makes blank slots until `target` are free. For a caller that drives the refill itself.
+	#[cfg_attr(not(test), allow(dead_code, reason = "the strict pool of the tests drives it"))]
 	pub(crate) async fn refill(&self, target: usize) -> io::Result<()> {
 		self.shared.refill_now(target).await
 	}
 
+	#[cfg_attr(not(test), allow(dead_code, reason = "the engine reaches it through `PoolControl`"))]
 	pub(crate) fn stats(&self) -> PoolStats {
 		self.shared.stats()
 	}
 
+	#[allow(dead_code, reason = "a hook of the tests")]
 	pub(crate) fn raw(&self) -> &R {
 		&self.shared.raw
 	}
 
 	/// The spares that a claim of the `Opportunistic` class leaves, raised to `n` if it is lower.
+	#[allow(
+		dead_code,
+		reason = "no call site of the engine uses it until the engine's own files go through the file system"
+	)]
 	pub(crate) fn set_reserve(&self, n: usize) {
 		self.shared.reserve.fetch_max(n, Ordering::AcqRel);
 	}
 
 	/// Whether the refill task is running.
+	#[cfg_attr(not(test), allow(dead_code, reason = "a hook of the tests"))]
 	pub(crate) fn background_alive(&self) -> bool {
 		self.shared.bg_alive.load(Ordering::Acquire)
 	}
@@ -1568,15 +1757,37 @@ impl<R: Raw> PoolShared<R> {
 							}
 							free_slots.push(index);
 						}
-						HeaderState::Named(path) => {
-							claims.entry(path).or_default().push((header.seq, index));
-						}
+						HeaderState::Named(path) => match normal_name(&path) {
+							// Under the name that every lookup resolves it to: a header that says
+							// `/d//x` is the file `/d/x`, and competes with the other slots that
+							// name it, whatever spelling theirs has.
+							Some(key) => {
+								claims.entry(key).or_default().push((header.seq, index));
+							}
+							// Not a name that this pool could have written, and not one that a path
+							// could ever reach. Nothing is known about what it is, so it is kept as
+							// it is and never cleaned, as a payload that nothing names.
+							None => {
+								tracing::warn!(
+									"the slot {} names {path:?}, which is not a file name: kept",
+									slot.name
+								);
+								slot.st.lock().orphan = true;
+								report.orphans_kept.push(slot.name.clone());
+							}
+						},
 					}
 				}
 			}
 		}
 		report.max_seq = max_seq;
 		self.seq.store(max_seq, Ordering::Release);
+		if max_seq == u64::MAX {
+			tracing::warn!(
+				"a header of the pool has the highest sequence number there is: no file can be named \
+				 or renamed in it"
+			);
+		}
 
 		// Who has each path: the higher sequence number; the lower slot on a tie, which nothing
 		// but damage makes.
@@ -1590,6 +1801,8 @@ impl<R: Raw> PoolShared<R> {
 			let slot = &slots[winner];
 			slot.end.store(sizes[winner] - HEADER_LEN, Ordering::Release);
 			{
+				// In memory under its name. Its header is not rewritten (a mount only writes to
+				// slots that are not files), and the next header it gets says the name.
 				let mut st = slot.st.lock();
 				st.path = Some(path.clone());
 			}
@@ -1647,7 +1860,7 @@ impl<R: Raw> PoolFs<R> {
 		let mut ns = shared.ns.lock();
 		if let Some(slot) = ns.files.get(&key).cloned() {
 			match mode {
-				Open::Read | Open::Append => return Ok(slot.view(shared)),
+				Open::Read | Open::Append | Open::AppendExisting => return Ok(slot.view(shared)),
 				Open::New => {
 					return Err(io::Error::new(io::ErrorKind::AlreadyExists, "the file is there"));
 				}
@@ -1680,7 +1893,7 @@ impl<R: Raw> PoolFs<R> {
 				_ => invalid("the path is a directory"),
 			});
 		}
-		if mode == Open::Read {
+		if matches!(mode, Open::Read | Open::AppendExisting) {
 			return Err(io::Error::new(io::ErrorKind::NotFound, "no such file"));
 		}
 		check_file_key(&key)?;
@@ -1732,6 +1945,13 @@ impl<R: Raw> PoolFs<R> {
 			.write_header(&slot, HeaderState::Named(key.clone()))
 			.and_then(|_| shared.flush_slot(&slot));
 		if let Err(e) = committed {
+			// A header that could not be numbered was never written: the commit was not made, and
+			// the old content is the manifest, which is what an error before the commit point says.
+			if is_seq_exhausted(&e) {
+				drop(ns);
+				shared.discard(slot);
+				return Err(Error::Io(Arc::new(e)));
+			}
 			// Whether the new content is the manifest is not known, and the slot may be what a
 			// mount finds. It is kept as it is, and never reused.
 			slot.st.lock().poisoned = true;
@@ -1942,6 +2162,10 @@ impl<R: Raw> Fs for PoolFs<R> {
 		self.open_path(path, Open::Append, opts.class)
 	}
 
+	fn open_append_existing(&self, path: &Path) -> io::Result<Arc<dyn FsFile>> {
+		self.open_path(path, Open::AppendExisting, SpareClass::Reserved)
+	}
+
 	fn create_new(&self, path: &Path, opts: CreateOpts) -> io::Result<Arc<dyn FsFile>> {
 		self.open_path(path, Open::New, opts.class)
 	}
@@ -2088,9 +2312,21 @@ impl<R: Raw> FsFile for PoolFile<R> {
 /// The operations that a pool has and no other file system does, reached through `Fs::pool`.
 pub(crate) trait PoolControl: Send + Sync {
 	/// Cleans up to `budget` dead slots; returns how many.
+	#[allow(
+		dead_code,
+		reason = "no call site of the engine uses it until the engine's own files go through the file system"
+	)]
 	fn maintain(&self, budget: usize) -> usize;
 	/// Raises the spares that an `Opportunistic` creation leaves.
+	#[allow(
+		dead_code,
+		reason = "no call site of the engine uses it until the engine's own files go through the file system"
+	)]
 	fn set_reserve(&self, n: usize);
+	#[allow(
+		dead_code,
+		reason = "no call site of the engine uses it until the engine's own files go through the file system"
+	)]
 	fn stats(&self) -> PoolStats;
 	fn mount_report(&self) -> Option<MountReport>;
 	/// Flushes what has to be flushed, cleans, and releases every handle. Later reads and writes
@@ -2232,6 +2468,9 @@ mod tests {
 					out.insert(path.clone(), fs.read(p(&path)).expect("a listed file reads"));
 				}
 				EntryKind::Dir => walk(fs, &path, out),
+				EntryKind::Symlink | EntryKind::Other => {
+					panic!("a pool lists a {path} that is not a file")
+				}
 			}
 		}
 	}
@@ -3808,6 +4047,7 @@ mod tests {
 		Replace(usize, Vec<u8>),
 		Maintain,
 		Drop(usize),
+		#[allow(dead_code, reason = "a number that only tells two checks apart in a script")]
 		Check(usize),
 		Crash(u8, u64),
 	}
@@ -4307,5 +4547,162 @@ mod tests {
 				"{mode:?}: a={a:?}"
 			);
 		}
+	}
+
+	// ---- futures that are dropped, and the end of the sequence numbers -----------------------
+
+	/// Polls a future once with a waker that does nothing, and keeps it for the drop.
+	fn start<'a, T>(
+		future: impl Future<Output = T> + 'a,
+	) -> (Pin<Box<dyn Future<Output = T> + 'a>>, bool) {
+		let mut future: Pin<Box<dyn Future<Output = T> + 'a>> = Box::pin(future);
+		let pending = future.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending();
+		(future, pending)
+	}
+
+	#[test]
+	fn a_refill_that_is_dropped_gives_back_what_it_reserved_and_closes_what_arrived() {
+		let raw = MemRaw::new();
+		let fs = mounted(&raw, PoolConfig::strict(0, 8));
+		let held = raw.open_handles();
+		assert_eq!(fs.stats().total, 0);
+		// Two of the four creations complete, and two never do.
+		raw.hang_after(2);
+		let (refill, pending) = start(fs.refill(4));
+		assert!(pending);
+		assert_eq!(fs.stats().total, 4, "the four that are being made count against the cap");
+		assert_eq!(raw.open_handles(), held + 2, "two of them have arrived");
+		drop(refill);
+		assert_eq!(fs.stats().total, 0, "a refill that was dropped gives its room back");
+		assert_eq!(raw.open_handles(), held, "and closes what had arrived");
+		assert_eq!(raw.leaked(), 0, "nothing was dropped without a close");
+		raw.clear_hangs();
+		poll_ready(fs.refill(8)).unwrap().unwrap();
+		assert_eq!(fs.stats().total, 8, "the whole of the cap is still there to be used");
+	}
+
+	#[test]
+	fn a_creation_that_finds_slots_on_the_way_is_a_wait_and_not_a_limit() {
+		let raw = MemRaw::new();
+		let fs = mounted(&raw, PoolConfig::strict(0, 2));
+		raw.hang_after(0);
+		let (refill, pending) = start(fs.refill(2));
+		assert!(pending);
+		// At the cap, but both of the slots are being made: they will be free, and this is not the
+		// limit that only a release of files lifts.
+		let error = fs.create_new(p("/a"), CreateOpts::default()).err().expect("no slot yet");
+		assert!(vfs::is_pool_exhausted(&error), "{error}");
+		assert!(!vfs::is_pool_full(&error), "{error}");
+		drop(refill);
+		// With nothing on the way, the cap is what it is.
+		let error = fs.create_new(p("/a"), CreateOpts::default()).err().expect("no slot");
+		assert!(vfs::is_pool_exhausted(&error) && !vfs::is_pool_full(&error), "{error}");
+		assert_eq!(fs.stats().total, 0);
+	}
+
+	#[test]
+	fn a_mount_that_is_dropped_at_an_await_closes_the_lock_and_the_slots_it_opened() {
+		let raw = MemRaw::new();
+		{
+			let fs = mounted(&raw, PoolConfig::strict(3, 8));
+			fs.pool().unwrap().close().unwrap();
+		}
+		assert_eq!(raw.open_handles(), 0);
+		// The lock, the list, and two of the three opens complete; the third never does.
+		raw.hang_after(1 + 1 + 2);
+		let (mount, pending) = start(Mem::mount(raw.clone(), PoolConfig::strict(0, 8)));
+		assert!(pending);
+		assert_eq!(raw.open_handles(), 3, "the lock and two slots are held while it waits");
+		drop(mount);
+		assert_eq!(raw.open_handles(), 0, "a mount that is dropped closes what it holds");
+		assert_eq!(raw.leaked(), 0, "and does not drop a handle without closing it");
+		raw.clear_hangs();
+		let fs = mounted(&raw, PoolConfig::strict(0, 8));
+		assert_eq!(fs.stats().total, 3, "the lock was free again, and so were the slots");
+	}
+
+	#[test]
+	fn a_mount_that_is_dropped_while_it_makes_its_first_slots_closes_them_too() {
+		let raw = MemRaw::new();
+		// The lock, the list, and two of the four creations complete.
+		raw.hang_after(1 + 1 + 2);
+		let (mount, pending) = start(Mem::mount(raw.clone(), PoolConfig::strict(4, 8)));
+		assert!(pending);
+		assert_eq!(raw.open_handles(), 3);
+		drop(mount);
+		assert_eq!(raw.open_handles(), 0);
+		assert_eq!(raw.leaked(), 0);
+		raw.clear_hangs();
+		let fs = mounted(&raw, PoolConfig::strict(4, 8));
+		assert_eq!(fs.stats().total, 2, "the two that were made and closed are blank slots now");
+		assert_eq!(fs.stats().clean, 2);
+	}
+
+	#[test]
+	fn the_highest_sequence_number_is_refused_with_a_typed_error_and_never_wraps() {
+		use crate::vfs::header::is_seq_exhausted;
+
+		let raw = MemRaw::new();
+		raw.put("p00000000", &slot_bytes(Some(Header::named(u64::MAX, "/d/x")), None, b"payload"));
+		raw.put("p00000001", &slot_bytes(Some(Header::free(1)), None, b""));
+		raw.put("p00000002", &slot_bytes(Some(Header::free(2)), None, b""));
+		let fs = mounted(&raw, PoolConfig::strict(0, 8));
+		assert_eq!(read(&fs, "/d/x").as_deref(), Some(&b"payload"[..]), "what is there is read");
+
+		let error = fs.create_new(p("/d/y"), CreateOpts::default()).err().expect("no header");
+		assert!(is_seq_exhausted(&error), "{error}");
+		assert!(!fs.exists(p("/d/y")));
+		let error = fs.rename(p("/d/x"), p("/d/z")).unwrap_err();
+		assert!(is_seq_exhausted(&error), "{error}");
+		assert!(fs.exists(p("/d/x")) && !fs.exists(p("/d/z")));
+		match fs.replace_atomic(p("/d/m"), b"manifest") {
+			Err(Error::Io(error)) => assert!(is_seq_exhausted(&error), "{error}"),
+			other => panic!("replace_atomic at the end of the sequence numbers: {other:?}"),
+		}
+		// Asking again says the same, and no slot was lost to the failures.
+		let error = fs.create_new(p("/d/y"), CreateOpts::default()).err().expect("no header");
+		assert!(is_seq_exhausted(&error), "{error}");
+		assert_eq!(fs.stats().total, 3);
+		assert_eq!(read(&fs, "/d/x").as_deref(), Some(&b"payload"[..]));
+	}
+
+	#[test]
+	fn a_path_in_a_header_is_taken_as_every_lookup_takes_it() {
+		let raw = MemRaw::new();
+		raw.put("p00000000", &slot_bytes(Some(Header::named(5, "/d//x")), None, b"newer"));
+		raw.put("p00000001", &slot_bytes(Some(Header::named(3, "/d/./x")), None, b"older"));
+		raw.put("p00000002", &slot_bytes(Some(Header::named(4, "/d/y/../z")), None, b"zed"));
+		let (fs, report) = PoolFs::mount_sync(raw, PoolConfig::strict(0, 8)).unwrap();
+		// Two spellings of one name are one file, and the higher sequence number has it.
+		assert_eq!(read(&fs, "/d/x").as_deref(), Some(&b"newer"[..]));
+		assert_eq!(read(&fs, "/d/z").as_deref(), Some(&b"zed"[..]));
+		assert_eq!(report.files, 2);
+		assert_eq!(report.losers_cleaned, 1, "the older spelling lost, and was cleaned");
+		let mut names: Vec<String> = fs
+			.read_dir(p("/d"))
+			.unwrap()
+			.into_iter()
+			.map(|entry| entry.name.to_string_lossy().into_owned())
+			.collect();
+		names.sort();
+		assert_eq!(names, ["x", "z"], "the listing has the names, once");
+		assert_eq!(logical(&fs).keys().cloned().collect::<Vec<_>>(), ["/d/x", "/d/z"]);
+		assert!(!fs.is_dir(p("/d/y")), "no directory comes of a path that was resolved");
+	}
+
+	#[test]
+	fn a_header_that_names_no_file_is_kept_as_an_orphan_and_never_cleaned() {
+		let raw = MemRaw::new();
+		let root = slot_bytes(Some(Header::named(5, "/")), None, b"payload");
+		let nothing = slot_bytes(Some(Header::named(6, "a/..")), None, b"");
+		raw.put("p00000000", &root);
+		raw.put("p00000001", &nothing);
+		let (fs, report) = PoolFs::mount_sync(raw.clone(), PoolConfig::strict(0, 8)).unwrap();
+		assert_eq!(report.files, 0, "a name that no path reaches is not a file");
+		assert_eq!(report.orphans_kept, ["p00000000", "p00000001"]);
+		assert_eq!(fs.stats().orphans, 2);
+		assert_eq!(raw.image("p00000000").unwrap(), root, "what is not understood is not touched");
+		assert_eq!(raw.image("p00000001").unwrap(), nothing);
+		assert!(logical(&fs).is_empty());
 	}
 }

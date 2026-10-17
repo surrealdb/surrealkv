@@ -1583,7 +1583,11 @@ impl VLog {
 		// Which file is the newest has to be known before any is opened
 		let mut found = Vec::new();
 		for entry in entries {
-			// Look for VLog files
+			// Look for VLog files, by name and not by type, as it always was. The length is the
+			// length of the file that the path leads to: where the listing took it from the entry
+			// (`DirEntry::metadata`, which does not follow a link) a link gave the length of the
+			// link itself, which is not the length of anything in the log. A link to nothing
+			// fails here with `NotFound`, where it failed at the open that followed.
 			if let Some(file_id) = self.opts.extract_vlog_file_id(&entry.name.to_string_lossy()) {
 				let path = self.path.join(&entry.name);
 				let len = self.fs.file_len(&path)?;
@@ -1614,9 +1618,11 @@ impl VLog {
 
 			// Pre-open the file handle and validate header. The newest file of a log that is not
 			// encrypted is the one that is appended to next, so it is opened to do that too, and
-			// its writer takes the handle over: it is not opened a second time.
+			// its writer takes the handle over: it is not opened a second time. It was listed, so
+			// it is there, and one that is gone since is a `NotFound` as it was when this opened it
+			// to read (`File::open`), and not a new empty file.
 			let opened = if is_newest && self.encryption().is_none() {
-				self.fs.open_append(&file_path, CreateOpts::default())
+				self.fs.open_append_existing(&file_path)
 			} else {
 				self.fs.open_read(&file_path)
 			};

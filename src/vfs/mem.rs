@@ -12,8 +12,36 @@
 //! from one count for the whole backend, in order (`pending`). A crash image is a new backend
 //! whose files are the durable bytes with some of the pending operations applied, as the
 //! [`CrashMode`] says. Nothing that was flushed is ever lost, and a file that exists keeps existing
-//! (that a browser keeps the name of a file that was created and never flushed is not something the
-//! pool relies on: it creates a slot and flushes its headers before it is used).
+//! (see "What is not modelled" for what that leaves out).
+//!
+//! # What is not modelled
+//!
+//! The crash analysis of the pool is only as good as this model of a browser, which is the model of
+//! the people who wrote the pool. These are the places where a browser may do something that this
+//! backend never does, and where a test that passes over it says nothing:
+//!
+//! * **The loss of a slot file, or of its directory entry (E6).** A crash here never loses a file
+//!   that was created, not even one that was never flushed, and never brings back one that was
+//!   removed. A browser may keep the size of a file and lose its name, or the other way round. The
+//!   pool does not depend on it, since it flushes the two header pages of a slot that it creates
+//!   before it uses the slot, and a slot that a mount does not find is a slot that is lost and not
+//!   one that is wrong: but that is an argument, and nothing here runs it. `MemRaw::remove` builds
+//!   the state by hand, for a test that wants to look at one case.
+//! * **A flush that is not a durability barrier.** The pool takes `flush` for an ordering barrier
+//!   only: what was written before it is ordered before what was written after it, and nothing is
+//!   promised about a power cut. Here a flush that returns makes every operation before it durable,
+//!   at once and for ever, which is the strongest thing a flush could be. The modes that lose
+//!   unflushed operations are what stands in for the weaker ones, and a flush that returns and is
+//!   lost anyway (the platform did not write it to the medium) is not among them.
+//! * **The order and the atomicity of what a crash keeps.** `Reorder` and `LoseTear` pick some
+//!   subsets and some tears, in a model of how a cache writes blocks back. A real device may keep a
+//!   write whole in two places and torn in a third, or tear below the size of a header page in a
+//!   way that a prefix of the write does not describe.
+//! * **Time.** Nothing is slow, and a handle that is not closed is only locked in a backend that is
+//!   strict: a browser releases it at an unspecified time after the handle is collected.
+//! * **Quota and handle limits** are single numbers that a test sets. A browser says
+//!   `QuotaExceededError` from `write` and from `truncate`, and may say it later than a number
+//!   does.
 //!
 //! # Faults
 //!
@@ -24,6 +52,11 @@
 //! after that does, which is what a crash at that point looks like to the code that ran. An
 //! exhaustive crash test runs a scenario once for each `n`, and applies every mode to what is left.
 //!
+//! A call can also be made to hang (`hang_after`, `hang_name`): its future is pending for ever, is
+//! never woken, and does nothing, which is a request that a browser never answers. It is what a
+//! test of a future that is dropped half way waits for, and since the backend has done nothing for
+//! it, whatever such a test finds left open afterwards is a leak of the code under test.
+//!
 //! # Handles
 //!
 //! A handle must be closed. One that is dropped without a close is counted (`leaked`), and in a
@@ -33,7 +66,7 @@
 //! only after a pending poll, with the operation done when the future is first polled, so a future
 //! that is dropped half way leaves a handle that nobody closes, exactly as a browser does.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
@@ -65,7 +98,9 @@ pub enum CrashMode {
 		n: usize,
 	},
 	/// Every operation survives as to the length of the file, and none as to the bytes: the size
-	/// of a file was kept and the blocks were not.
+	/// of a file was kept and the blocks were not. The bytes that the file grew by read as
+	/// zeros, and a write over bytes that were durable is lost, so the old ones stay (a
+	/// browser zero-fills growth, and never writes zeros over what was there).
 	ZeroTail,
 	/// A seeded subset survives: later writes tend to, truncations tend not to. An operation that
 	/// persists while one before it does not is a reordering.
@@ -98,6 +133,7 @@ impl Default for MemConfig {
 
 impl MemConfig {
 	/// The configuration of the strict tests.
+	#[cfg_attr(not(test), allow(dead_code, reason = "the strict backend of the tests"))]
 	pub(crate) fn strict() -> Self {
 		Self {
 			strict: true,
@@ -159,6 +195,15 @@ struct Faults {
 	max_open: Option<usize>,
 }
 
+/// Which calls never complete. See `MemRaw::hang_after` and `MemRaw::hang_name`.
+#[derive(Default)]
+struct Hangs {
+	/// The number of calls that still complete before every later one hangs.
+	after: Option<usize>,
+	/// The names whose calls hang.
+	names: BTreeSet<String>,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
 	Write,
@@ -178,6 +223,8 @@ struct MemState {
 	/// The sum of the lengths of every file, for the quota.
 	total_bytes: AtomicU64,
 	pending_polls: AtomicUsize,
+	hangs: Mutex<Hangs>,
+	hung: AtomicUsize,
 	writes: AtomicU64,
 	flushes: AtomicU64,
 	creates: AtomicU64,
@@ -237,6 +284,8 @@ impl MemState {
 			faults: Mutex::new(Faults::default()),
 			total_bytes: AtomicU64::new(0),
 			pending_polls: AtomicUsize::new(cfg.pending_polls),
+			hangs: Mutex::new(Hangs::default()),
+			hung: AtomicUsize::new(0),
 			writes: AtomicU64::new(0),
 			flushes: AtomicU64::new(0),
 			creates: AtomicU64::new(0),
@@ -419,18 +468,42 @@ impl MemState {
 				}
 			}
 			CrashMode::ZeroTail => {
+				// The length of every file survives, and the bytes that it grew by read as zeros: a
+				// browser sizes a file when it is written past its end, and the blocks that were
+				// never flushed are not there. What was already durable is not zeroed by a write
+				// over it, which a browser never does: the write is lost, and the old bytes stay.
+				// The line between the two is the durable length, which a truncation that is not
+				// flushed lowers for every write after it.
+				let mut reach: BTreeMap<&str, u64> = files
+					.iter()
+					.map(|(name, file)| (name.as_str(), file.inner.lock().durable.len() as u64))
+					.collect();
 				for (seq, name, op) in &unflushed {
-					let op = match op {
+					let reach = reach.entry(name.as_str()).or_default();
+					match op {
 						Op::Write {
 							offset,
 							data,
-						} => Op::Write {
-							offset: *offset,
-							data: vec![0; data.len()],
-						},
-						other => other.clone(),
-					};
-					kept.push((*seq, name.clone(), op));
+						} => {
+							// The part of the write that is past the line, as zeros.
+							let from = (*reach).max(*offset);
+							let end = offset.saturating_add(data.len() as u64);
+							if end > from {
+								kept.push((
+									*seq,
+									name.clone(),
+									Op::Write {
+										offset: from,
+										data: vec![0; usize::try_from(end - from).unwrap_or(0)],
+									},
+								));
+							}
+						}
+						Op::SetLen(len) => {
+							*reach = (*reach).min(*len);
+							kept.push((*seq, name.clone(), op.clone()));
+						}
+					}
 				}
 			}
 			CrashMode::Reorder(seed) => {
@@ -509,7 +582,12 @@ impl MemRaw {
 			state: Arc::new(MemState::new(cfg)),
 		}
 	}
+}
 
+/// What the tests of the pool, of the engine and of a browser do to a backend and look at in it:
+/// the faults, the hangs, and what was written. Nothing outside a test calls them.
+#[allow(dead_code, reason = "the hooks of the tests: each test uses some of them")]
+impl MemRaw {
 	pub(crate) fn config(&self) -> MemConfig {
 		self.state.cfg
 	}
@@ -567,9 +645,36 @@ impl MemRaw {
 		self.state.pending_polls.store(n, Ordering::SeqCst);
 	}
 
-	/// Ends every fault and revives a killed backend.
+	/// Ends every fault and revives a killed backend. The hangs are not faults: `clear_hangs` ends
+	/// them.
 	pub(crate) fn clear_faults(&self) {
 		*self.state.faults.lock() = Faults::default();
+	}
+
+	/// The `n` calls of `list`, `open`, `create` and `open_lock` that are made from now on complete
+	/// as they would, and every later one hangs: its future returns `Pending` for ever, does not
+	/// wake its task, and does not do its work, so nothing is created, opened or locked. A request
+	/// that the browser never answers, for the tests of a future that is dropped while it waits:
+	/// whatever such a test finds open or locked afterwards was left by the code under test, and
+	/// not by this backend. The calls are counted when the future is made, not when it is polled.
+	pub(crate) fn hang_after(&self, n: usize) {
+		self.state.hangs.lock().after = Some(n);
+	}
+
+	/// Every `open` and `create` of `name` hangs from now on, as under `hang_after`. The lock is
+	/// the name [`LOCK_NAME`], and `list` has none.
+	pub(crate) fn hang_name(&self, name: &str) {
+		self.state.hangs.lock().names.insert(name.to_string());
+	}
+
+	/// Ends every hang. Futures that are hanging stay hung.
+	pub(crate) fn clear_hangs(&self) {
+		*self.state.hangs.lock() = Hangs::default();
+	}
+
+	/// The futures that were made hung, ever.
+	pub(crate) fn hung_futures(&self) -> usize {
+		self.state.hung.load(Ordering::SeqCst)
 	}
 
 	// ---- what a test looks at ---------------------------------------------------------------
@@ -842,11 +947,46 @@ impl<T> Future for Delayed<T> {
 	}
 }
 
+/// A result that never comes: pending for ever, and nothing wakes the task.
+struct Hung<T>(std::marker::PhantomData<fn() -> T>);
+
+impl<T> Unpin for Hung<T> {}
+
+impl<T> Future for Hung<T> {
+	type Output = T;
+
+	fn poll(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<T> {
+		Poll::Pending
+	}
+}
+
 impl MemRaw {
+	/// Whether a call for `name` hangs, which is decided, and counted, when it is made.
+	fn hangs(&self, name: &str) -> bool {
+		let mut hangs = self.state.hangs.lock();
+		let hang = hangs.names.contains(name)
+			|| match hangs.after.as_mut() {
+				Some(0) => true,
+				Some(left) => {
+					*left -= 1;
+					false
+				}
+				None => false,
+			};
+		if hang {
+			self.state.hung.fetch_add(1, Ordering::SeqCst);
+		}
+		hang
+	}
+
 	fn delayed<T: Send + 'static>(
 		&self,
+		name: &str,
 		op: impl FnOnce() -> T + Send + 'static,
 	) -> RawFut<'static, T> {
+		if self.hangs(name) {
+			return Box::pin(Hung(std::marker::PhantomData));
+		}
 		Box::pin(Delayed {
 			op: Some(Box::new(op)),
 			result: None,
@@ -860,7 +1000,7 @@ impl Raw for MemRaw {
 
 	fn list(&self) -> RawFut<'_, io::Result<Vec<String>>> {
 		let state = Arc::clone(&self.state);
-		self.delayed(move || {
+		self.delayed("", move || {
 			state.check_alive()?;
 			Ok(state.files.lock().keys().filter(|name| *name != LOCK_NAME).cloned().collect())
 		})
@@ -869,18 +1009,18 @@ impl Raw for MemRaw {
 	fn open(&self, name: &str) -> RawFut<'_, io::Result<MemRawFile>> {
 		let state = Arc::clone(&self.state);
 		let name = name.to_string();
-		self.delayed(move || state.open_file(&name))
+		self.delayed(&name.clone(), move || state.open_file(&name))
 	}
 
 	fn create(&self, name: &str) -> RawFut<'_, io::Result<MemRawFile>> {
 		let state = Arc::clone(&self.state);
 		let name = name.to_string();
-		self.delayed(move || state.create_file(&name))
+		self.delayed(&name.clone(), move || state.create_file(&name))
 	}
 
 	fn open_lock(&self) -> RawFut<'_, io::Result<MemRawFile>> {
 		let state = Arc::clone(&self.state);
-		self.delayed(move || {
+		self.delayed(LOCK_NAME, move || {
 			state.check_alive()?;
 			let existing = state.files.lock().get(LOCK_NAME).cloned();
 			match existing {
@@ -1021,6 +1161,84 @@ mod tests {
 		// The original is untouched by every crash.
 		assert_eq!(read_all(&raw, "a"), b"AAAA11");
 		assert_eq!(read_all(&raw, "b"), b"22223333");
+	}
+
+	#[test]
+	fn zero_tail_zeroes_only_what_grew_and_keeps_the_durable_bytes_below_it() {
+		let raw = MemRaw::new();
+		let a = create(&raw, "a");
+		write_all(&a, 0, b"AAAA");
+		a.flush().unwrap();
+		write_all(&a, 0, b"BB"); // in place: below the durable end
+		write_all(&a, 2, b"CCCC"); // straddles the durable end
+		let c = raw.crash(CrashMode::ZeroTail);
+		assert_eq!(
+			read_all(&c, "a"),
+			b"AAAA\0\0",
+			"an overwrite of durable bytes is lost whole, and only the growth reads as zeros"
+		);
+
+		// A shrink that is not flushed lowers the end that counts for the writes after it.
+		let b = create(&raw, "b");
+		write_all(&b, 0, b"AAAA");
+		b.flush().unwrap();
+		b.set_len(1).unwrap();
+		write_all(&b, 0, b"XY"); // byte 0 is below the lowered end, byte 1 is past it
+		let c = raw.crash(CrashMode::ZeroTail);
+		assert_eq!(read_all(&c, "b"), b"A\0");
+		b.set_len(0).unwrap();
+		write_all(&b, 0, b"BB");
+		assert_eq!(read_all(&raw.crash(CrashMode::ZeroTail), "b"), [0u8, 0]);
+
+		// A file that never was flushed has nothing below its end: all of it is growth.
+		let n = create(&raw, "n");
+		write_all(&n, 0, b"new");
+		assert_eq!(read_all(&raw.crash(CrashMode::ZeroTail), "n"), [0u8; 3]);
+	}
+
+	#[test]
+	fn a_hung_future_never_completes_wakes_nothing_and_does_nothing() {
+		use std::sync::atomic::AtomicUsize;
+		use std::task::Wake;
+
+		struct Counting(AtomicUsize);
+		impl Wake for Counting {
+			fn wake(self: Arc<Self>) {
+				self.0.fetch_add(1, Ordering::SeqCst);
+			}
+		}
+		let wakes = Arc::new(Counting(AtomicUsize::new(0)));
+		let waker = std::task::Waker::from(Arc::clone(&wakes));
+		let mut cx = Context::from_waker(&waker);
+
+		let raw = MemRaw::new();
+		// The first two calls complete, the third and every one after it hang.
+		raw.hang_after(2);
+		create(&raw, "p00000001").close().unwrap();
+		create(&raw, "p00000002").close().unwrap();
+		let mut hung = raw.create("p00000003");
+		for _ in 0..1000 {
+			assert!(hung.as_mut().poll(&mut cx).is_pending());
+		}
+		assert_eq!(wakes.0.load(Ordering::SeqCst), 0, "a hung future does not wake itself");
+		assert!(!raw.names().contains(&"p00000003".to_string()), "and does not do its work");
+		assert_eq!(raw.hung_futures(), 1);
+		drop(hung);
+		assert_eq!(raw.open_handles(), 0);
+		assert_eq!(raw.leaked(), 0, "nothing arrived, so nothing can leak");
+		raw.clear_hangs();
+		create(&raw, "p00000003").close().unwrap();
+
+		// By name: only the calls that ask for that name hang.
+		raw.hang_name("p00000009");
+		let mut other = raw.open("p00000009");
+		assert!(other.as_mut().poll(&mut cx).is_pending());
+		assert!(other.as_mut().poll(&mut cx).is_pending());
+		poll_ready(raw.open("p00000001")).unwrap().unwrap().close().unwrap();
+		raw.hang_name(LOCK_NAME);
+		let mut hung_lock = raw.open_lock();
+		assert!(hung_lock.as_mut().poll(&mut cx).is_pending());
+		assert_eq!(wakes.0.load(Ordering::SeqCst), 0);
 	}
 
 	#[test]

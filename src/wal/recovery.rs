@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
 use crate::memtable::MemTable;
-use crate::vfs::{CreateOpts, Fs};
+use crate::vfs::Fs;
 use crate::wal::manager::Wal;
 use crate::wal::reader::{Reader, Reporter};
 use crate::wal::{
@@ -578,6 +578,7 @@ pub(crate) fn scan_valid_records_after_in(
 	Ok(intact_count)
 }
 
+#[allow(dead_code, reason = "kept for callers that have not moved to the _in form")]
 pub(crate) fn classify_wal_damage(
 	file_path: &Path,
 	last_valid_offset: usize,
@@ -752,6 +753,10 @@ pub(crate) fn quarantine_wal_segment_in(
 	Ok(corrupt_base)
 }
 
+#[cfg_attr(
+	not(test),
+	allow(dead_code, reason = "kept for callers that have not moved to the _in form")
+)]
 pub(crate) fn repair_corrupted_wal_segment(
 	wal_dir: &Path,
 	segment_id: usize,
@@ -785,9 +790,10 @@ pub(crate) fn repair_corrupted_wal_segment_in(
 	// 1. Quarantine original segment before modifying it. The copy is durable when this returns.
 	let quarantine_path = quarantine_wal_segment_in(fs, wal_dir, segment_id)?;
 
-	// 2. Open file for in-place truncation on the same inode. A file to append to and read: the
-	// segment is there, so nothing is created, and `set_len` does not look at the mode.
-	let file = fs.open_append(&segment_path, CreateOpts::default())?;
+	// 2. Open file for in-place truncation on the same inode. The segment is there, so nothing is
+	// created: a segment that has gone since is a `NotFound`, as it was when this opened it with
+	// `OpenOptions::write` and no `create`.
+	let file = fs.open_append_existing(&segment_path)?;
 	let old_len = file.len()?;
 	file.set_len(last_valid_offset as u64)?;
 	file.sync()?;

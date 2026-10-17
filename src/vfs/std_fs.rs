@@ -119,9 +119,12 @@ impl Fs for StdFs {
 	}
 
 	fn entry(&self, path: &Path) -> io::Result<Option<EntryKind>> {
+		// `metadata` follows a link: what the path leads to is what it names, and a link to
+		// nothing names nothing.
 		match std::fs::metadata(path) {
 			Ok(metadata) if metadata.is_dir() => Ok(Some(EntryKind::Dir)),
-			Ok(_) => Ok(Some(EntryKind::File)),
+			Ok(metadata) if metadata.is_file() => Ok(Some(EntryKind::File)),
+			Ok(_) => Ok(Some(EntryKind::Other)),
 			Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
 			Err(e) => Err(e),
 		}
@@ -147,14 +150,26 @@ impl Fs for StdFs {
 		std::fs::create_dir_all(path)
 	}
 
+	/// Each entry is what the directory says it is, which costs no call (`d_type`), and a link is
+	/// not followed: the engine's call sites that listed a directory with `std::fs::read_dir` took
+	/// the type of an entry from `DirEntry::file_type`, which does not follow a link, or asked
+	/// `std::fs::metadata` of each path, which does, and the two differ for a link. A link is a
+	/// `Symlink`, so that a site of the first kind skips it by comparing the kind with `File` and a
+	/// site of the second kind follows it with `DirEntry::resolved_kind`: the table of who does
+	/// which is in the notes of `wal::list_segment_ids_in`.
 	fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
 		let mut entries = Vec::new();
 		for entry in std::fs::read_dir(path)? {
 			let entry = entry?;
-			let kind = if entry.file_type()?.is_dir() {
+			let file_type = entry.file_type()?;
+			let kind = if file_type.is_symlink() {
+				EntryKind::Symlink
+			} else if file_type.is_dir() {
 				EntryKind::Dir
-			} else {
+			} else if file_type.is_file() {
 				EntryKind::File
+			} else {
+				EntryKind::Other
 			};
 			entries.push(DirEntry {
 				name: entry.file_name(),
@@ -190,6 +205,16 @@ impl Fs for StdFs {
 		let mut options = OpenOptions::new();
 		options.read(true).write(true).create(true).append(true);
 		apply_mode(&mut options, opts);
+		Ok(Arc::new(StdFile::appending(options.open(path)?)))
+	}
+
+	fn open_append_existing(&self, path: &Path) -> io::Result<Arc<dyn FsFile>> {
+		// Read, write and append, with no `create`: a path that is not there is `NotFound`, and a
+		// link to nothing is not followed to make its target. The repair of a log segment used to
+		// open `write(true)` alone, and the newest file of the value log `File::open`; this is the
+		// descriptor that either needs to cut a file and to read it, which is one that appends.
+		let mut options = OpenOptions::new();
+		options.read(true).write(true).append(true);
 		Ok(Arc::new(StdFile::appending(options.open(path)?)))
 	}
 

@@ -16,6 +16,10 @@ use crate::error::{Error, Result};
 use crate::lockfile::LockFile;
 
 /// What a browser build says until a file system is mounted.
+#[cfg_attr(
+	not(all(target_arch = "wasm32", target_os = "unknown")),
+	allow(dead_code, reason = "the default file system of a browser build")
+)]
 const NO_FILE_SYSTEM: &str = "no file system is mounted: use \
 	`TreeBuilder::with_file_system(FileSystem::opfs(..).await?)`";
 
@@ -33,6 +37,10 @@ impl UnavailableFs {
 	}
 
 	/// The file system of a browser build that has not mounted one.
+	#[cfg_attr(
+		not(all(target_arch = "wasm32", target_os = "unknown")),
+		allow(dead_code, reason = "the default file system of a browser build")
+	)]
 	pub(crate) const fn no_file_system() -> Self {
 		Self::new(NO_FILE_SYSTEM)
 	}

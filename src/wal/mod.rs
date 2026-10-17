@@ -566,6 +566,21 @@ pub(crate) fn list_segment_ids(dir: &Path, allowed_extension: Option<&str>) -> R
 /// something to step over in silence (a segment that went unseen is data that is not replayed). A
 /// pool holds only names that the engine made, so the case cannot arise there, and on `std` the
 /// error names the problem.
+///
+/// A link is followed to what it points to, as it was when this asked `std::fs::metadata` of each
+/// name: a link to a segment is one, a link to a directory is not, and a link to nothing is a
+/// `NotFound` error for the whole listing (not a segment that is adopted: opening it to append
+/// would make the file it points to). [`SegmentRef`] decides the other way, as it did, and takes a
+/// link for nothing. The two never agreed, and the callers of each rely on what it was:
+///
+/// | listing                                  | a link to a file | a link to nothing |
+/// |------------------------------------------|------------------|-------------------|
+/// | `list_segment_ids_in` (and `get_segment_range_in`, the open of the log, the log number check of `levels`) | a segment | the listing fails |
+/// | `SegmentRef::read_segments_from_directory_in` | skipped | skipped |
+///
+/// The listings that look at names alone (the `.wal.repair` files, the table orphans, the value-log
+/// files, the count of files with an extension) never looked at the type, and still do not. The
+/// copies of the repairs (`.wal.corrupt`) are new, and skip a link.
 pub(crate) fn list_segment_ids_in(
 	fs: &dyn Fs,
 	dir: &Path,
@@ -574,7 +589,7 @@ pub(crate) fn list_segment_ids_in(
 	let mut refs: Vec<u64> = Vec::new();
 
 	for entry in fs.read_dir(dir)? {
-		if entry.kind == crate::vfs::EntryKind::File {
+		if entry.resolved_kind(fs, dir)? == crate::vfs::EntryKind::File {
 			let fn_str = entry.name.to_string_lossy();
 			let (index, extension) = parse_segment_name(&fn_str)?;
 
@@ -1112,6 +1127,10 @@ pub(crate) fn cleanup_old_segments(wal_dir: &Path, min_wal_number: u64) -> Resul
 /// by the replay either, which starts at the log number. Each segment is therefore read from its
 /// first record (see `sealed::check_first_record`) before it is removed, and one that is not this
 /// database's is left where it is and said so, since nothing here knows what it is.
+#[cfg_attr(
+	not(test),
+	allow(dead_code, reason = "kept for callers that have not moved to the _in form")
+)]
 pub(crate) fn cleanup_old_segments_for(
 	context: Option<&EncryptionContext>,
 	wal_dir: &Path,

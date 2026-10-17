@@ -260,6 +260,9 @@ struct State {
 	fail_remove: AtomicBool,
 	/// What the file system says it is.
 	pool: AtomicBool,
+	/// A file that the listing has and the disk has not, with the length that is given for it: a
+	/// file that went between the listing of the directory and the open of it.
+	ghost: Mutex<Option<(PathBuf, u64)>>,
 }
 
 /// A file system that does what `StdFs` does, writes down each call, and can behave as a file
@@ -426,7 +429,16 @@ impl Fs for TestFs {
 
 	fn read_dir(&self, path: &Path) -> io::Result<Vec<DirEntry>> {
 		self.record(format!("read_dir {}", short(path)));
-		StdFs.read_dir(path)
+		let mut entries = StdFs.read_dir(path)?;
+		if let Some((ghost, _)) = &*self.0.ghost.lock().unwrap() {
+			if ghost.parent() == Some(path) {
+				entries.push(DirEntry {
+					name: ghost.file_name().unwrap().to_owned(),
+					kind: EntryKind::File,
+				});
+			}
+		}
+		Ok(entries)
 	}
 
 	fn remove_file(&self, path: &Path) -> io::Result<()> {
@@ -461,6 +473,10 @@ impl Fs for TestFs {
 		self.open("open_append", path, || StdFs.open_append(path, opts))
 	}
 
+	fn open_append_existing(&self, path: &Path) -> io::Result<Arc<dyn FsFile>> {
+		self.open("open_append_existing", path, || StdFs.open_append_existing(path))
+	}
+
 	fn create_new(&self, path: &Path, opts: CreateOpts) -> io::Result<Arc<dyn FsFile>> {
 		self.open("create_new", path, || StdFs.create_new(path, opts))
 	}
@@ -471,6 +487,11 @@ impl Fs for TestFs {
 
 	fn file_len(&self, path: &Path) -> io::Result<u64> {
 		self.record(format!("file_len {}", short(path)));
+		if let Some((ghost, len)) = &*self.0.ghost.lock().unwrap() {
+			if ghost == path {
+				return Ok(*len);
+			}
+		}
 		StdFs.file_len(path)
 	}
 
@@ -607,14 +628,42 @@ fn the_calls_of_opening_a_log_that_has_files() {
 			"file_len 2.vlog",
 			"open_read 1.vlog",
 			"read_at 1.vlog 0 31",
-			"open_append 2.vlog",
+			"open_append_existing 2.vlog",
 			"read_at 2.vlog 0 31",
 			"len 2.vlog",
 			"read_at 2.vlog 0 6",
 		]),
-		"one open per file, and none for the writer"
+		"one open per file, and none for the writer; the newest is opened to append and is never \
+		 made if it has gone since the listing"
 	);
 	assert!(vlog.writer.read().is_some());
+}
+
+/// The newest file is opened to append to, and one that is not there any more is a `NotFound`: it
+/// is not made empty, and then taken for a log that has a file with nothing in it.
+#[test]
+fn a_newest_file_that_went_after_the_listing_is_not_made() {
+	let dir = TempDir::new().unwrap();
+	let opts = options(dir.path());
+	{
+		let vlog = std_open(Arc::clone(&opts));
+		vlog.append(&key(0), &value(0)).unwrap();
+		vlog.sync().unwrap();
+	}
+	let ghost = opts.vlog_file_path(5);
+	let fs = TestFs::new();
+	*fs.0.ghost.lock().unwrap() = Some((ghost.clone(), 100));
+	let error = VLog::new_in(Arc::new(fs.clone()), Arc::clone(&opts))
+		.err()
+		.expect("a log whose newest file is gone does not open");
+	match &error {
+		crate::error::Error::Io(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound, "{error}"),
+		other => {
+			panic!("a newest file that is gone is an I/O error that says not found: {other:?}")
+		}
+	}
+	assert!(!ghost.exists(), "the file was not made");
+	assert_eq!(fs.take().last().map(String::as_str), Some("open_append_existing 5.vlog"));
 }
 
 /// The handle of a file is the one handle it has, through the whole of its life, on a file system

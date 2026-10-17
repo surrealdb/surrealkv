@@ -89,6 +89,34 @@ pub(crate) enum HeaderError {
 	BadPath,
 }
 
+/// The payload of the `io::Error` that a pool answers a header write with when its sequence numbers
+/// have run out: the highest number that a header holds is `u64::MAX`, which is what a mount found
+/// (nothing that this pool wrote: it would take 2^64 header writes), and a number that wrapped or
+/// repeated would break the rule that the higher one wins. Reads go on working; every write of a
+/// header fails with this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SeqExhausted;
+
+impl std::fmt::Display for SeqExhausted {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(
+			"the sequence numbers of the file pool have run out, so no file can be named or renamed",
+		)
+	}
+}
+
+impl std::error::Error for SeqExhausted {}
+
+/// The error of a header write at the end of the sequence numbers.
+pub(crate) fn seq_exhausted() -> io::Error {
+	io::Error::other(SeqExhausted)
+}
+
+/// Whether `error` is the one that [`seq_exhausted`] makes.
+pub(crate) fn is_seq_exhausted(error: &io::Error) -> bool {
+	error.get_ref().is_some_and(|inner| inner.is::<SeqExhausted>())
+}
+
 impl Header {
 	pub(crate) fn free(seq: u64) -> Self {
 		Self {

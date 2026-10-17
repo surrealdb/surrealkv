@@ -141,6 +141,25 @@ pub(crate) fn creation(fs: &dyn Fs, dir: &Path) {
 	let again = fs.open_append(&path, CreateOpts::default()).expect("open_append");
 	again.append(b"cd").unwrap();
 	assert_eq!(read_all(&fs.open_read(&path).expect("open_read")), b"abcd");
+
+	// `open_append_existing` is the same for a file that is there (it reads, appends, and cuts
+	// back), and a `NotFound` that creates nothing for one that is not.
+	let existing = fs.open_append_existing(&path).expect("open_append_existing");
+	assert_eq!(existing.len().unwrap(), 4);
+	existing.append(b"ef").unwrap();
+	assert_eq!(read_all(&fs.open_read(&path).expect("open_read")), b"abcdef");
+	existing.set_len(4).unwrap();
+	assert_eq!(read_all(&existing), b"abcd");
+	let absent = dir.join("absent");
+	assert_eq!(kind_of(fs.open_append_existing(&absent)), io::ErrorKind::NotFound);
+	assert!(!fs.exists(&absent), "open_append_existing of what is not there creates nothing");
+	assert_eq!(
+		kind_of(fs.open_append_existing(&dir.join("missing/child"))),
+		io::ErrorKind::NotFound
+	);
+	assert!(!fs.exists(&dir.join("missing")));
+	assert!(fs.open_append_existing(dir).is_err(), "a directory is not a file to append to");
+
 	let fresh = dir.join("g");
 	let appended = fs.open_append(&fresh, CreateOpts::default()).expect("open_append creates");
 	assert_eq!(appended.len().unwrap(), 0);

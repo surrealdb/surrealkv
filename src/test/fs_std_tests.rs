@@ -389,3 +389,72 @@ fn build_async_is_send() {
 	assert_send_sync::<LockFile>();
 	assert_send(&None::<vfs::SpareWait>);
 }
+
+/// A listing says what each entry is itself, and a link is not what it points to: the engine's two
+/// ways of listing the log directory used to differ for a link (see `wal::fs_tests`), and what
+/// keeps both exactly as they were is that the listing tells a link from a file and from a
+/// directory, and that `entry`, which follows a link, does not.
+#[cfg(unix)]
+#[test]
+fn a_listing_tells_a_link_from_what_it_points_to_and_entry_follows_it() {
+	use std::collections::BTreeMap;
+	use std::os::unix::fs::symlink;
+	use std::os::unix::net::UnixListener;
+
+	let dir = TempDir::new().unwrap();
+	let elsewhere = TempDir::new().unwrap();
+	let at = |name: &str| dir.path().join(name);
+	std::fs::write(at("file"), b"x").unwrap();
+	std::fs::create_dir(at("dir")).unwrap();
+	let target = elsewhere.path().join("target");
+	std::fs::write(&target, b"y").unwrap();
+	symlink(&target, at("to_file")).unwrap();
+	symlink(elsewhere.path(), at("to_dir")).unwrap();
+	symlink(elsewhere.path().join("gone"), at("to_nothing")).unwrap();
+	let _socket = UnixListener::bind(at("socket")).unwrap();
+
+	let listed: BTreeMap<String, EntryKind> = StdFs
+		.read_dir(dir.path())
+		.unwrap()
+		.into_iter()
+		.map(|entry| (entry.name.to_string_lossy().into_owned(), entry.kind))
+		.collect();
+	assert_eq!(
+		listed,
+		BTreeMap::from([
+			("dir".to_string(), EntryKind::Dir),
+			("file".to_string(), EntryKind::File),
+			("socket".to_string(), EntryKind::Other),
+			("to_dir".to_string(), EntryKind::Symlink),
+			("to_file".to_string(), EntryKind::Symlink),
+			("to_nothing".to_string(), EntryKind::Symlink),
+		])
+	);
+
+	// `entry` is `metadata`: it follows a link, and a link to nothing is nothing.
+	assert_eq!(StdFs.entry(&at("to_file")).unwrap(), Some(EntryKind::File));
+	assert_eq!(StdFs.entry(&at("to_dir")).unwrap(), Some(EntryKind::Dir));
+	assert_eq!(StdFs.entry(&at("to_nothing")).unwrap(), None);
+	assert_eq!(StdFs.entry(&at("socket")).unwrap(), Some(EntryKind::Other));
+
+	// A listing entry resolves the way `metadata` of its path does.
+	let entries = StdFs.read_dir(dir.path()).unwrap();
+	let resolved = |name: &str| {
+		let entry = entries.iter().find(|entry| entry.name == name).unwrap();
+		entry.resolved_kind(&StdFs, dir.path())
+	};
+	assert_eq!(resolved("file").unwrap(), EntryKind::File);
+	assert_eq!(resolved("to_file").unwrap(), EntryKind::File);
+	assert_eq!(resolved("to_dir").unwrap(), EntryKind::Dir);
+	assert_eq!(resolved("socket").unwrap(), EntryKind::Other);
+	assert_eq!(resolved("to_nothing").unwrap_err().kind(), io::ErrorKind::NotFound);
+
+	// Opening a link to nothing to append to it is `NotFound` and does not make its target; the
+	// open that creates does.
+	let gone = elsewhere.path().join("gone");
+	assert_eq!(
+		StdFs.open_append_existing(&at("to_nothing")).err().map(|e| e.kind()),
+		Some(io::ErrorKind::NotFound)
+	);
+	assert!(!gone.exists());
+}
