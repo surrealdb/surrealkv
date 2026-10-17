@@ -132,6 +132,11 @@ pub(crate) fn log_error(error: crate::wal::Error) -> crate::error::Error {
 		crate::wal::Error::Encryption(error) => crate::error::Error::Encryption(error),
 		// A pool that had no free file is not a log that cannot be written: it passes.
 		crate::wal::Error::PoolExhausted => crate::error::Error::FilePoolExhausted,
+		// A browser that is out of quota: soft, and the committer can tell it from a disk that
+		// failed.
+		crate::wal::Error::StorageFull(message) => crate::error::Error::Io(std::sync::Arc::new(
+			std::io::Error::new(std::io::ErrorKind::StorageFull, message),
+		)),
 		error => crate::error::Error::Other(error.to_string()),
 	}
 }

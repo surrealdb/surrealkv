@@ -97,6 +97,8 @@ pub mod fs_engine_crash_tests;
 #[cfg(test)]
 pub mod fs_engine_exhaustion_tests;
 #[cfg(test)]
+pub mod fs_engine_followup_tests;
+#[cfg(test)]
 pub mod fs_engine_tests;
 #[cfg(test)]
 pub mod fs_error_tests;

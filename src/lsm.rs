@@ -334,6 +334,25 @@ pub(crate) struct CoreInner {
 	/// would eat them (`PoolControl::set_reserve`). 0 until then.
 	pub(crate) group_need: AtomicUsize,
 
+	/// Whether the cap of the pool (`PoolConfig::max_files`) is too low for the full bound
+	/// `group_need`: a pool that cannot hold it twice over, with `cap_band` to spare, could be
+	/// made to refuse every commit, and every compaction, once its database has grown a little
+	/// (see `commit_group_need`). The database then degrades, in the way that `commit_group_need`
+	/// says, and does not wedge. False for a pool with the default cap, and for every file system
+	/// that is not a pool.
+	cap_limited: AtomicBool,
+
+	/// With `cap_limited`: the files, above `cap_floor`, that only a delete-only commit group and
+	/// a compaction may take. A group that holds anything else is not started while fewer than
+	/// `cap_floor + cap_band` files are free, so that a compaction always has `cap_band` files to
+	/// make its outputs in, and what it frees brings the commits back.
+	cap_band: AtomicUsize,
+
+	/// With `cap_limited`: the files that the commit path keeps back from the outputs of a
+	/// compaction, which is what a group of the usual size needs (`small_group_need_of`), and
+	/// never less than a flush does.
+	cap_floor: AtomicUsize,
+
 	/// How many spare files beyond `group_need` the next level compaction waits for. It starts at
 	/// `COMPACTION_HINT_MIN`, doubles each time a compaction met an empty pool, up to
 	/// `COMPACTION_HINT_MAX`, and starts again after a compaction that worked.
@@ -370,6 +389,24 @@ pub(crate) fn clamp_to_pool(fs: &dyn Fs, need: usize) -> usize {
 /// replaced manifest frees its old file only once it is clean), a roll of the value log, and room
 /// to spare.
 pub(crate) const FLUSH_NEED: usize = 8;
+
+/// The least and the most files that `CoreInner::cap_band` keeps for the work that frees files in
+/// a pool whose cap is below the bound of a commit group.
+const CAP_BAND_MIN: usize = 4;
+const CAP_BAND_MAX: usize = 32;
+
+/// What a commit group is, as far as the files it needs go: see `CoreInner::commit_group_need`.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct GroupShape {
+	/// What a group of this size needs if it is not a batch of its own: one segment of the log
+	/// for each rotation of the memtable that it can make, and a margin
+	/// (`ring::pipeline::small_group_need_of`).
+	pub(crate) usual: usize,
+	/// Every entry of every batch is a delete.
+	pub(crate) delete_only: bool,
+	/// A batch of it is bigger than a memtable.
+	pub(crate) oversized: bool,
+}
 
 /// The first wait of a compaction for spare files, beyond what the commit path keeps back.
 const COMPACTION_HINT_MIN: usize = 4;
@@ -493,6 +530,9 @@ impl CoreInner {
 			recovery_report: parking_lot::RwLock::new(WalRecoveryReport::default()),
 			pooled,
 			group_need: AtomicUsize::new(0),
+			cap_limited: AtomicBool::new(false),
+			cap_band: AtomicUsize::new(0),
+			cap_floor: AtomicUsize::new(0),
 			compaction_hint: AtomicUsize::new(COMPACTION_HINT_MIN),
 		})
 	}
@@ -500,10 +540,59 @@ impl CoreInner {
 	/// Records the files that one commit group may need (see `group_need_of`) and has the pool keep
 	/// that many back from the outputs of a compaction. Called once, when the commit pipeline is
 	/// made, and only for a pool.
-	pub(crate) fn set_group_need(&self, need: usize) {
+	///
+	/// `usual` is what the largest group that is not a batch of its own needs
+	/// (`small_group_need_max`). A pool whose cap is below `2 * need + band` is `cap_limited`:
+	/// what the pool keeps back is then `usual`, and the bound `need` is asked only of a batch that
+	/// is bigger than a memtable, which the pool then refuses with `PoolFull` when it cannot be
+	/// given.
+	pub(crate) fn set_group_need(&self, need: usize, usual: usize) {
 		self.group_need.store(need, Ordering::Release);
-		if let Some(pool) = self.opts.fs.pool() {
+		let Some(pool) = self.opts.fs.pool() else {
+			return;
+		};
+		let max_files = pool.stats().max_files;
+		let band = (max_files / 8).clamp(CAP_BAND_MIN, CAP_BAND_MAX);
+		if max_files < need.saturating_mul(2).saturating_add(band) {
+			let floor = usual.max(FLUSH_NEED);
+			self.cap_band.store(band, Ordering::Release);
+			self.cap_floor.store(floor, Ordering::Release);
+			self.cap_limited.store(true, Ordering::Release);
+			pool.set_reserve(floor);
+		} else {
 			pool.set_reserve(need);
+		}
+	}
+
+	/// Whether the cap of the pool is too low for the full bound of a commit group: see
+	/// `cap_limited`.
+	pub(crate) fn is_cap_limited(&self) -> bool {
+		self.cap_limited.load(Ordering::Acquire)
+	}
+
+	/// The files that a commit group of this `shape` waits for, `vlog` of them for the rolls of
+	/// the value log, in a pool.
+	///
+	/// With a cap that holds the full bound it is `group_need`, as it always was. In a
+	/// `cap_limited` pool the bound could never be met once the database has grown, so what a group
+	/// needs is what it can use: one log segment for each time it can rotate the memtable, and a
+	/// margin (`small_group_need_of`), but at least `cap_floor`, which compaction leaves free. A
+	/// group of puts and merges also asks for `cap_band` more, so that the last files of the pool
+	/// are left to the work that frees files: a delete-only group (a delete does not grow the
+	/// database, and is how a full one is made smaller) and the outputs of a compaction. A batch
+	/// that is bigger than a memtable needs the full bound, because it writes a table of its own
+	/// after flushing the queue, and a pool that cannot hold that refuses it with `PoolFull`.
+	pub(crate) fn commit_group_need(&self, shape: GroupShape, vlog: usize) -> usize {
+		let full = self.group_need.load(Ordering::Acquire);
+		if !self.is_cap_limited() || shape.oversized {
+			return full + vlog;
+		}
+		let floor = self.cap_floor.load(Ordering::Acquire);
+		let base = (shape.usual + vlog).max(floor);
+		if shape.delete_only {
+			base
+		} else {
+			base + self.cap_band.load(Ordering::Acquire)
 		}
 	}
 
@@ -516,14 +605,22 @@ impl CoreInner {
 	}
 
 	/// The wait of a level compaction for the files its outputs take, which are created only while
-	/// more than `group_need` files are free.
+	/// more than `group_need` files are free (more than `cap_floor` in a `cap_limited` pool, and
+	/// then at most `cap_band` of them are waited for, which is all that the commits leave it).
+	/// Never for more than the pool can have: a wait for more would fail with `PoolFull` every
+	/// time, before the compaction was tried.
 	fn spares_for_compaction(&self) -> Option<crate::vfs::SpareWait> {
 		if !self.pooled {
 			return None;
 		}
 		let hint =
 			self.compaction_hint.load(Ordering::Acquire).max(self.compaction_outputs_bound());
-		self.opts.fs.ensure_spares(self.group_need.load(Ordering::Acquire) + hint)
+		let need = if self.is_cap_limited() {
+			self.cap_floor.load(Ordering::Acquire) + hint.min(self.cap_band.load(Ordering::Acquire))
+		} else {
+			self.group_need.load(Ordering::Acquire) + hint
+		};
+		self.opts.fs.ensure_spares(self.clamped_to_pool(need))
 	}
 
 	/// How many output files the next compaction may make, as far as the tables that it can merge
@@ -567,6 +664,42 @@ impl CoreInner {
 	/// tried.
 	pub(crate) fn clamped_to_pool(&self, need: usize) -> usize {
 		clamp_to_pool(&*self.opts.fs, need)
+	}
+
+	/// Removes the segments of the log below `min_wal_to_keep`, at the close, when every memtable
+	/// is in a table and the segment that was active goes too.
+	///
+	/// In a pool a removal is a write that a crash may keep or lose on its own: the removals that
+	/// are not flushed are lost or kept in any combination, and a crash that keeps the removal of
+	/// the newest segment and loses that of an older one leaves a database whose manifest is past
+	/// every segment that is there, which the open refuses (`log_number exceeds WAL segments`),
+	/// with all of its data in tables. So a pool removes all of them but the newest, makes those
+	/// removals durable (`maintain_pool` cleans the files and flushes each), and removes the
+	/// newest last: whatever a crash keeps, the newest segment is there or nothing is.
+	///
+	/// On `std` it is the one pass that it always was. A journaled file system keeps the removals
+	/// of one directory in the order they were made, which is the case that this does not change
+	/// (a file system that does not is not known to be one of those that are used: unverified).
+	fn remove_obsolete_wal_segments_at_close(
+		&self,
+		wal_dir: &Path,
+		min_wal_to_keep: u64,
+	) -> Result<usize> {
+		let context = self.opts.encryption_context().map(Arc::as_ref);
+		let newest = if self.pooled {
+			list_segment_ids_in(&*self.opts.fs, wal_dir, Some("wal"))
+				.ok()
+				.and_then(|ids| ids.into_iter().filter(|id| *id < min_wal_to_keep).max())
+		} else {
+			None
+		};
+		let mut removed = 0;
+		if let Some(newest) = newest {
+			removed += cleanup_old_segments_for_in(context, &*self.opts.fs, wal_dir, newest)?;
+			self.maintain_pool(usize::MAX);
+		}
+		Ok(removed
+			+ cleanup_old_segments_for_in(context, &*self.opts.fs, wal_dir, min_wal_to_keep)?)
 	}
 
 	/// Cleans some of the files that were removed, so that they return to the free ones without
@@ -1008,7 +1141,11 @@ impl CoreInner {
 			let mut wal_guard = self.wal.write();
 			let old_log_number = wal_guard.get_active_log_number();
 			self.rotate_wal(&mut wal_guard).map_err(|e| {
-				Self::rotation_error("Failed to rotate WAL before memtable rotation", e)
+				Self::rotation_error(
+					self.pooled,
+					"Failed to rotate WAL before memtable rotation",
+					e,
+				)
 			})?;
 			let new_log_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
@@ -1102,7 +1239,7 @@ impl CoreInner {
 
 		let mut wal_guard = self.wal.write();
 		self.rotate_wal(&mut wal_guard).map_err(|e| {
-			Self::rotation_error("Failed to rotate WAL before direct-to-L0 flush", e)
+			Self::rotation_error(self.pooled, "Failed to rotate WAL before direct-to-L0 flush", e)
 		})?;
 		let new_wal_number = wal_guard.get_active_log_number();
 		drop(wal_guard);
@@ -1135,8 +1272,9 @@ impl CoreInner {
 		};
 		if active_memtable.is_empty() {
 			let mut wal_guard = self.wal.write();
-			self.rotate_wal(&mut wal_guard)
-				.map_err(|e| Self::rotation_error("Failed to replace the failed WAL segment", e))?;
+			self.rotate_wal(&mut wal_guard).map_err(|e| {
+				Self::rotation_error(self.pooled, "Failed to replace the failed WAL segment", e)
+			})?;
 			let new_wal_number = wal_guard.get_active_log_number();
 			drop(wal_guard);
 			active_memtable.set_wal_number(new_wal_number);
@@ -1211,10 +1349,27 @@ impl CoreInner {
 	/// that could not be had may be asked for again, and no other of them may, which a text does
 	/// not say. So does a pool that had no free file for the new segment: it passes once the pool
 	/// is refilled.
-	fn rotation_error(what: &str, error: wal::Error) -> Error {
+	///
+	/// A pool that is at its limit of files, and a browser that is out of quota, fail the new
+	/// segment with an I/O error of the kind `StorageFull`, which the log keeps only as a kind and
+	/// a text. It is given its type again here (see `Error::is_storage_full`), so that it is
+	/// soft and the committer can tell it from a disk that failed. Only on a pool: no file system
+	/// of a pool gives an error of an operating system, and the full disk of a native one (the
+	/// same kind, with a code) is as it always was.
+	fn rotation_error(pooled: bool, what: &str, error: wal::Error) -> Error {
 		match error {
 			wal::Error::Encryption(error) => Error::Encryption(error),
 			wal::Error::PoolExhausted => Error::FilePoolExhausted,
+			wal::Error::IO(error) if pooled && error.kind() == std::io::ErrorKind::StorageFull => {
+				Error::Io(Arc::new(std::io::Error::new(
+					std::io::ErrorKind::StorageFull,
+					format!("{what}: {error}"),
+				)))
+			}
+			wal::Error::StorageFull(message) => Error::Io(Arc::new(std::io::Error::new(
+				std::io::ErrorKind::StorageFull,
+				format!("{what}: {message}"),
+			))),
 			error => Error::Other(format!("{what}: {error}")),
 		}
 	}
@@ -2455,14 +2610,16 @@ impl Core {
 	/// Ends the tree the way a crash does, from a function that is not async: it is marked closed
 	/// (so that no drop of it flushes or closes anything afterwards), its three tasks are aborted,
 	/// and its lock is released. Nothing is flushed, no log is synced and no manifest is written,
-	/// and the commits that were in flight are not decided. What the file system holds is what a
-	/// crash at this point would have left, as far as the file system is concerned.
+	/// and the commits that were in flight are not decided: they end with `Error::PipelineStall`,
+	/// as they do after a close, whether or not they are in the log. What the file system holds
+	/// is what a crash at this point would have left, as far as the file system is concerned.
 	pub(crate) fn abandon(&self) {
 		self.is_closed.store(true, Ordering::SeqCst);
 		self.abort_background_tasks();
 		self.write_stall.signal_shutdown();
-		// Nothing more is logged: the flusher is gone, and a commit that arrives is refused.
-		self.commit_pipeline.shutdown();
+		// Nothing more is logged: the flusher is gone, and a commit that arrives is refused. The
+		// commits that were admitted are told so, and none waits for the flusher.
+		self.commit_pipeline.abandon();
 		if let Ok(mut lockfile) = self.inner.lockfile.lock() {
 			let _ = lockfile.release();
 		}
@@ -2561,8 +2718,12 @@ impl Core {
 
 			// The failures of the unit are read against the pool's counter, as a background unit's
 			// are: an error that went through a layer that turned it into text is still the one
-			// that a pool that has no free file made.
-			let exhaustions = self.inner.opts.fs.pool_exhaustions();
+			// that a pool that has no free file made. Only a pool has one.
+			let exhaustions = if self.inner.pooled {
+				self.inner.opts.fs.pool_exhaustions()
+			} else {
+				0
+			};
 
 			// Flush ALL memtables: immutables first (older data), then active (newest data)
 			self.inner.flush_all_memtables_for_shutdown().map_err(|e| match e {
@@ -2621,12 +2782,7 @@ impl Core {
 
 		tracing::debug!("Cleaning up obsolete WAL files (min_wal_to_keep={})", min_wal_to_keep);
 
-		match cleanup_old_segments_for_in(
-			self.inner.opts.encryption_context().map(Arc::as_ref),
-			&*self.inner.opts.fs,
-			&wal_dir,
-			min_wal_to_keep,
-		) {
+		match self.inner.remove_obsolete_wal_segments_at_close(&wal_dir, min_wal_to_keep) {
 			Ok(count) if count > 0 => {
 				tracing::debug!("Cleaned up {} obsolete WAL files during shutdown", count);
 			}
@@ -2796,7 +2952,7 @@ impl Tree {
 		// it, then try again.
 		let core = match Core::new(Arc::clone(&opts)) {
 			Err(Error::LegacyFormat(_))
-				if crate::migrate::legacy::migrate_forced(&opts)?.is_some() =>
+				if native && crate::migrate::legacy::migrate_forced(&opts)?.is_some() =>
 			{
 				Core::new(Arc::clone(&opts))?
 			}
@@ -2812,14 +2968,17 @@ impl Tree {
 	/// Opens the database, after waiting for the files of a pool that the open creates. A file
 	/// system that is not a pool has nothing to wait for, and this is `new` behind an `async fn`.
 	pub(crate) async fn open_async(opts: Arc<Options>) -> Result<Self> {
+		// `new` validates the options and asks the file system whether it is there, in that order:
+		// a file system that is not a pool goes straight to it, so that an open on `std` does each
+		// of them once.
+		if opts.fs.kind() != FsKind::Pool {
+			return Self::new(opts);
+		}
 		opts.validate()?;
 		let fs = Arc::clone(&opts.fs);
 		// Before anything: a file system that has nothing mounted answers with its own error here,
 		// and not with the `false` that a question about a manifest would make of it.
 		fs.check_available()?;
-		if fs.kind() != FsKind::Pool {
-			return Self::new(opts);
-		}
 		// What a pool cannot do is refused before it is asked for the files of an open.
 		Self::refuse_what_the_file_system_cannot_do(&opts)?;
 
@@ -2908,11 +3067,78 @@ impl Tree {
 	/// sealed log and the sealed value log that come with it, which read and repair their files
 	/// by path. Checkpoints and restores are refused where they begin, and the migrators are not
 	/// run (see `Tree::new`). A refusal is an `Error::InvalidArgument` that names the feature.
+	///
+	/// The migrators are not run in a pool, and a directory that one of them would have had to
+	/// convert is refused too, with an `Error::MigrationFailed` that names the other store: a
+	/// RocksDB directory, a migration of one that was cut short (its marker), an IndexedDB dump,
+	/// and the marker of a v0.x migration. They are the files of other stores, which a pool holds
+	/// only if somebody put them there. A v0.x directory whose tables are in the old layout is
+	/// refused with `Error::LegacyFormat`, when its tables are opened.
 	fn refuse_what_the_file_system_cannot_do(opts: &Options) -> Result<()> {
-		if opts.fs.kind() != FsKind::Std
-			&& (opts.key_manager.is_some() || opts.encryption_context().is_some())
-		{
-			return Err(Self::unsupported_here("encryption at rest"));
+		if opts.fs.kind() != FsKind::Std {
+			if opts.key_manager.is_some() || opts.encryption_context().is_some() {
+				return Err(Self::unsupported_here("encryption at rest"));
+			}
+			Self::refuse_a_directory_that_needs_a_migration(&*opts.fs, opts)?;
+		}
+		Ok(())
+	}
+
+	/// Refuses, in a file system that is not the operating system's, the directory of another
+	/// store that the migrators convert on `std`: see `refuse_what_the_file_system_cannot_do`. It
+	/// reads the names in the directory, and the first bytes of the three files that a name alone
+	/// does not settle, and nothing is created or changed.
+	fn refuse_a_directory_that_needs_a_migration(fs: &dyn Fs, opts: &Options) -> Result<()> {
+		let refuse = |store: &str| {
+			Error::MigrationFailed(format!(
+				"{:?} holds {store}, which is converted only in the files of the operating \
+				 system, and not in this file system yet. Nothing was read, moved or created.",
+				opts.path
+			))
+		};
+		let is_a_dump = |path: &Path| {
+			matches!(
+				fs.read_prefix(path, surrealkv_compat_indxdb::INDXDB_DUMP_MAGIC.len()),
+				Ok(Some(head)) if head == surrealkv_compat_indxdb::INDXDB_DUMP_MAGIC
+			)
+		};
+		// A dump can be the path itself.
+		match fs.entry(&opts.path)? {
+			Some(crate::vfs::EntryKind::File) if is_a_dump(&opts.path) => {
+				return Err(refuse("an IndexedDB dump"));
+			}
+			Some(crate::vfs::EntryKind::Dir) => {}
+			_ => return Ok(()),
+		}
+		let entries = match fs.read_dir(&opts.path) {
+			Ok(entries) => entries,
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+			Err(e) => return Err(e.into()),
+		};
+		for entry in entries.iter().filter(|entry| entry.kind == crate::vfs::EntryKind::File) {
+			let path = opts.path.join(&entry.name);
+			match entry.name.to_string_lossy().as_ref() {
+				"MIGRATING_ROCKSDB" => {
+					return Err(refuse("a RocksDB migration that was cut short"))
+				}
+				"MIGRATING" => return Err(refuse("a SurrealKV v0.x migration that was cut short")),
+				"indxdb_dump.bin" if is_a_dump(&path) => {
+					return Err(refuse("an IndexedDB dump"));
+				}
+				// What RocksDB does: `CURRENT` names the manifest, which is there.
+				"CURRENT" => {
+					let named = fs
+						.read(&path)
+						.ok()
+						.and_then(|content| String::from_utf8(content).ok())
+						.map(|text| text.trim_end_matches(['\n', '\r']).to_string())
+						.filter(|name| name.starts_with("MANIFEST-"));
+					if named.is_some_and(|name| fs.is_file(&opts.path.join(name))) {
+						return Err(refuse("a RocksDB database"));
+					}
+				}
+				_ => {}
+			}
 		}
 		Ok(())
 	}
@@ -3380,9 +3606,10 @@ impl Tree {
 	}
 
 	/// Ends the tree the way a crash does: its tasks are aborted, its lock is released, and nothing
-	/// is flushed, no log is synced and no manifest is written. Commits that are in flight are not
-	/// decided. For the tests of a file system that crashes, which then remount it and open the
-	/// database again: it is not part of the interface of the crate.
+	/// is flushed, no log is synced and no manifest is written. Commits that are in flight end with
+	/// `Error::PipelineStall`, and whether they reached the log is not said. For the tests of a
+	/// file system that crashes, which then remount it and open the database again: it is not
+	/// part of the interface of the crate.
 	#[doc(hidden)]
 	pub fn abandon(&self) {
 		self.core.abandon();

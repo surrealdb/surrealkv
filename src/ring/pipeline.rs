@@ -12,7 +12,7 @@ use super::queue::{CommitEntry, EntryState, Payload};
 use super::sync::backoff;
 use crate::batch::Batch;
 use crate::error::{Error, Result};
-use crate::lsm::CoreInner;
+use crate::lsm::{CoreInner, GroupShape};
 use crate::memtable::MemTable;
 use crate::rt::{self, Instant};
 use crate::stall::WriteStallController;
@@ -231,6 +231,24 @@ pub(crate) fn group_need_of(opts: &crate::Options) -> usize {
 	// answers it, and the pool's own limit (`PoolConfig::max_files`) is what bounds the queue then.
 	let queued = opts.memtable_stall_threshold.min(MAX_QUEUE_IN_NEED) + rotations;
 	6 + 2 * queued + rotations + usize::from(opts.enable_vlog)
+}
+
+/// The spare files that a commit group needs in a pool whose cap is too low for `group_need_of`
+/// (see `CoreInner::commit_group_need`), if none of its batches is bigger than a memtable and the
+/// log is healthy: one segment of the log for each time that `group_estimate` bytes of estimates
+/// can fill the memtable and rotate it, one for the rotation before the group, and a margin, and
+/// one for the value log's first roll if there is one.
+fn small_group_need_of(opts: &crate::Options, group_estimate: u64) -> usize {
+	let room = crate::memtable::fresh_room(opts.max_memtable_size).max(1);
+	let rotations = usize::try_from(group_estimate / room).unwrap_or(usize::MAX).min(16) + 2;
+	rotations + 1 + usize::from(opts.enable_vlog)
+}
+
+/// The most that `small_group_need_of` is for a group that the flusher forms, with the value log's
+/// rolls of the largest of them.
+pub(crate) fn small_group_need_max(opts: &crate::Options) -> usize {
+	small_group_need_of(opts, group_est_budget(opts.max_memtable_size))
+		+ vlog_term(opts, MAX_GROUP_BYTES)
 }
 
 /// The files that a group of `group_bytes` bytes of batches rolls the value log into, which is one
@@ -552,6 +570,10 @@ pub(crate) struct CommitPipeline {
 	pub(crate) task_manager: Option<Arc<TaskManager>>,
 	pub(crate) notify_flusher: Arc<Notify>,
 	pub(crate) shutdown: AtomicBool,
+	/// Set by `abandon`: the flusher is gone, and no commit that is accepted from now on will be
+	/// drained. Read only by a commit on a pool (a plain bool decides that), so the commit of a
+	/// database on `std` is what it was.
+	abandoned: AtomicBool,
 	/// Sequence number allocator for batch entries, advanced only by the
 	/// flusher (and restore), in ring order.
 	pub(crate) log_seq_num: AtomicU64,
@@ -637,7 +659,7 @@ impl CommitPipeline {
 		if inner.pooled {
 			// The files one group may create, which the flusher waits for before a group and the
 			// pool keeps back from the outputs of a compaction.
-			inner.set_group_need(group_need_of(&inner.opts));
+			inner.set_group_need(group_need_of(&inner.opts), small_group_need_max(&inner.opts));
 		}
 
 		Self {
@@ -652,6 +674,7 @@ impl CommitPipeline {
 			task_manager,
 			notify_flusher,
 			shutdown: AtomicBool::new(false),
+			abandoned: AtomicBool::new(false),
 			log_seq_num: AtomicU64::new(seq),
 			restoring: Arc::new(AtomicBool::new(false)),
 			restore_epoch: Arc::new(AtomicU64::new(0)),
@@ -945,6 +968,11 @@ impl CommitPipeline {
 		if self.restoring.load(Ordering::Acquire) {
 			return Err(Error::PipelineStall);
 		}
+		// The permit may have been handed to this commit while the tree was being abandoned, with
+		// the semaphore closed after it: nobody is left to decide what it accepts.
+		if self.inner.pooled && self.abandoned.load(Ordering::SeqCst) {
+			return Err(Error::PipelineStall);
+		}
 		#[cfg(test)]
 		self.fire_commit(CommitStage::Admitted);
 
@@ -972,6 +1000,12 @@ impl CommitPipeline {
 		// The entry is decided, and the flusher takes it from here.
 		drop(claim);
 		self.notify_flusher.notify_one();
+		// Unless the tree was abandoned: its flusher is gone, and `abandon` has looked at the
+		// ring already. The payload is taken from the entry by whichever comes first, this or the
+		// scan of `abandon`, and the one that takes it tells the committer.
+		if self.inner.pooled && self.abandoned.load(Ordering::SeqCst) {
+			self.fail_accepted_entries();
+		}
 		#[cfg(test)]
 		self.fire_commit(CommitStage::Accepted);
 
@@ -1163,7 +1197,8 @@ impl CommitPipeline {
 				// is awaited between this and the end of the group that is not a file system call
 				// that answers at once, so what was found here is there when the group needs it.
 				let spares = if self.inner.pooled {
-					self.wait_for_spares(group_bytes).await
+					let shape = self.group_shape(&scratch.group, group_estimate);
+					self.wait_for_spares(group_bytes, shape).await
 				} else {
 					Ok(())
 				};
@@ -1199,15 +1234,38 @@ impl CommitPipeline {
 		}
 	}
 
+	/// What the group that was gathered is, for the files it needs: see `GroupShape`. Looked at
+	/// only for a pool whose cap is below the full bound, since it is the only one that tells
+	/// groups apart.
+	fn group_shape(&self, group: &[(Arc<CommitEntry>, Payload)], estimate: u64) -> GroupShape {
+		if !self.inner.is_cap_limited() {
+			return GroupShape::default();
+		}
+		let room = crate::memtable::fresh_room(self.inner.opts.max_memtable_size);
+		GroupShape {
+			usual: small_group_need_of(&self.inner.opts, estimate),
+			delete_only: group.iter().all(|(_, payload)| {
+				payload.batch.entries.iter().all(|entry| {
+					matches!(
+						entry.kind,
+						crate::InternalKeyKind::Delete
+							| crate::InternalKeyKind::SoftDelete
+							| crate::InternalKeyKind::RangeDelete
+					)
+				})
+			}),
+			oversized: group.iter().any(|(entry, _)| entry.payload_cost().1 > room),
+		}
+	}
+
 	/// Waits until the pool has the files that a group of `group_bytes` bytes may create (see
 	/// `group_need_of`). Nothing of the group is logged or applied yet, so a wait that fails fails
 	/// the group cleanly: see `fail_unstarted_group`.
 	///
 	/// Once the pipeline is shut down the wait is bounded: a refill that never answers must not
 	/// keep `close` from ending.
-	async fn wait_for_spares(&self, group_bytes: usize) -> Result<()> {
-		let need = self.inner.group_need.load(Ordering::Acquire)
-			+ vlog_term(&self.inner.opts, group_bytes);
+	async fn wait_for_spares(&self, group_bytes: usize, shape: GroupShape) -> Result<()> {
+		let need = self.inner.commit_group_need(shape, vlog_term(&self.inner.opts, group_bytes));
 		let Some(mut wait) = self.inner.opts.fs.ensure_spares(need) else {
 			return Ok(());
 		};
@@ -2195,6 +2253,47 @@ impl CommitPipeline {
 	pub(crate) fn shutdown(&self) {
 		self.shutdown.store(true, Ordering::Release);
 		self.notify_flusher.notify_one();
+	}
+
+	/// Ends the pipeline the way a crash does, for a tree that is abandoned and whose flusher is
+	/// aborted: every commit that is not decided is told `Error::PipelineStall`, and none waits for
+	/// a flusher that is not there.
+	///
+	/// - A commit that queues for admission is let go (`admission` is closed).
+	/// - A commit that was accepted and not drained is failed here, from the ring.
+	/// - A commit that the flusher had gathered fails when its task is dropped (its sender goes
+	///   with it).
+	/// - A commit that is not accepted yet, whether it is validating, or has been given its permit
+	///   and has not run, finds `abandoned` set when it accepts, or when it wakes, and fails
+	///   itself: the flag is stored before the ring is read here, and read after the entry is
+	///   accepted there, both with `SeqCst`, so one of the two sees the other. On a database that
+	///   is not in a pool that last check is not made (a commit on `std` is not given an atomic
+	///   load more), and such a commit may be left pending: abandoning a tree is a test of crashes
+	///   there, which does not commit while it abandons.
+	pub(crate) fn abandon(&self) {
+		self.abandoned.store(true, Ordering::SeqCst);
+		self.shutdown();
+		self.admission.close();
+		self.fail_accepted_entries();
+	}
+
+	/// Tells `Error::PipelineStall` to every commit that is accepted and not taken by a flusher.
+	fn fail_accepted_entries(&self) {
+		// Admission keeps at most `ADMISSION_PERMITS` entries above the completed prefix. A slot
+		// that is not published (yet) is skipped: its committer finds `abandoned` when it accepts.
+		let from = self.ring.completed() + 1;
+		for seq in from..from + u64::from(ADMISSION_PERMITS) {
+			let SlotRead::Ready(entry) = self.ring.get(seq) else {
+				continue;
+			};
+			if !matches!(entry.state(), EntryState::Accepted) {
+				continue;
+			}
+			if let Some(payload) = entry.take_payload() {
+				entry.abort();
+				let _ = payload.complete_tx.send(Err(Error::PipelineStall));
+			}
+		}
 	}
 
 	/// Locks writes for database restore.

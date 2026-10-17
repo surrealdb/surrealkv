@@ -356,6 +356,12 @@ pub enum Error {
 	/// is refilled, and the work can be done again. Kept apart from `IO` so that the type survives
 	/// the layers that turn an error into text.
 	PoolExhausted,
+	/// A browser's storage that has no room for what was written (`QuotaExceededError`, an I/O
+	/// error of the kind `StorageFull` that no operating system raised). This passes once there
+	/// is room. Kept apart from `IO` so that the type survives the layers that turn an error
+	/// into text. The full disk of a native file system has an operating system's error code,
+	/// and stays an `IO` error as it always was.
+	StorageFull(String),
 	/// A sealed segment holds records that pass their checksum after a block that is zero-filled
 	/// or damaged, or a segment of the sequence is missing: data was lost from the middle of
 	/// the WAL, which is not what a torn write at its end looks like.
@@ -396,6 +402,7 @@ impl fmt::Display for Error {
 			Error::SegmentNotFound => write!(f, "Segment not found"),
 			Error::Encryption(err) => write!(f, "Encryption error: {err}"),
 			Error::PoolExhausted => write!(f, "The file pool has no free file for a new segment"),
+			Error::StorageFull(msg) => write!(f, "The storage is full: {msg}"),
 			Error::IndexGap {
 				segment_id,
 				offset,
@@ -424,6 +431,9 @@ impl From<io::Error> for Error {
 		// free file is looked for before it is lost.
 		if crate::vfs::is_pool_exhausted(&e) {
 			return Error::PoolExhausted;
+		}
+		if e.kind() == io::ErrorKind::StorageFull && e.raw_os_error().is_none() {
+			return Error::StorageFull(e.to_string());
 		}
 		Error::IO(IOError {
 			kind: e.kind(),

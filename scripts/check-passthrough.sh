@@ -22,6 +22,16 @@
 # A source file that has an encryption passthrough arm and is not in the table fails the check, so
 # that a new place is not forgotten, and so does a file of the table that does not exist.
 #
+# A second rule covers what the first cannot count. A pool that is at its limit of files, and a
+# browser that is out of quota, give an I/O error of the kind `StorageFull` (`is_pool_full`,
+# `is_storage_full`). It is an `Error::Io`, so no arm of the shape above lets it through, and each
+# of the places above needs one more arm for it, right after the arm of the encryption error:
+# `e if e.is_storage_full() => e`. A file of GUARDED below is checked line by line: after a
+# passthrough arm for an encryption error (and the arms for the pool error that follow it), the
+# next arm must be the guard for a full storage, or, in the rotation of the log (`rotation_error`),
+# the arm that gives the same error its type. A guard that is deleted, or that is moved to another
+# place, fails the check, which balancing the numbers of arms of a file does not see.
+#
 # It does not see a new wrapper that is not modelled on an encryption arm; the engine has a second
 # safety net for that (the exhaustion witness of the background tasks).
 #
@@ -32,7 +42,7 @@
 #   scripts/check-passthrough.sh --self-test  run the script against fixtures that must fail and
 #                                             fixtures that must pass
 #
-# POSIX sh and grep -E only.
+# POSIX sh, grep -E and awk only.
 set -eu
 
 # file|state|owner or reason
@@ -47,12 +57,42 @@ src/checkpoint.rs|EXCLUDED|checkpoint and restore are refused on a pool
 src/vlog/sealed.rs|EXCLUDED|a sealed value log is refused on a pool
 src/inspect.rs|EXCLUDED|inspect takes a Path and is refused on a pool'
 
+# The files whose passthrough arms for an encryption error are each followed by the guard for a full
+# storage.
+GUARDED='src/lsm.rs
+src/ring/pipeline.rs
+src/storage/mod.rs'
+
 ENC='Error::Encryption\([a-z_]*\)\)?[[:space:]]*(\|[^=]*)?=>[[:space:]]*(e|error|err|Err\(e\.clone\(\)\)|(crate::)?(error::)?Error::Encryption\([a-z]+\)),?[[:space:]]*$'
 POOL='(File)?PoolExhausted\)*[[:space:]]*(\|[^=]*)?=>[[:space:]]*(e|error|err|Err\(e\.clone\(\)\)|(crate::)?(error::)?Error::FilePoolExhausted),?[[:space:]]*$'
+
+# The arm that follows the arms of the encryption error and the pool error: the guard for a storage
+# that is full (an I/O error of the kind StorageFull that no operating system raised), as a match
+# arm over an engine error, or the arm of the rotation of the log for the same error of the log.
+GUARD='(Err\()?e\)?[[:space:]]+if[[:space:]]+e\.is_storage_full\(\)[[:space:]]*=>|Error::IO\([a-z_]+\)[[:space:]]+if[[:space:]].*StorageFull.*=>|wal::Error::StorageFull\([a-z_]+\)[[:space:]]*=>'
 
 count() {
 	n=$(grep -v '^[[:space:]]*//' "$2" | grep -Ec "$1" || true)
 	echo "${n:-0}"
+}
+
+# unguarded FILE: prints the line number of every passthrough arm for an encryption error that is not
+# followed by the guard for a full storage (after the arms for the pool error, which may be on the
+# same line or on the next lines), and of one at the end of the file.
+unguarded() {
+	ENC_RE=$ENC POOL_RE=$POOL GUARD_RE=$GUARD awk '
+		BEGIN { enc = ENVIRON["ENC_RE"]; pool = ENVIRON["POOL_RE"]; guard = ENVIRON["GUARD_RE"] }
+		/^[[:space:]]*\/\// { next }
+		{
+			if (pending) {
+				if ($0 ~ enc || $0 ~ pool) { next }
+				if ($0 !~ guard) { print pending }
+				pending = 0
+			}
+			if ($0 ~ enc) { pending = NR }
+		}
+		END { if (pending) { print pending } }
+	' "$1"
 }
 
 # check ROOT ENFORCE_ALL: prints the table, returns 1 on a violation.
@@ -83,6 +123,18 @@ check_tree() {
 			fi
 		else
 			echo "check-passthrough: pending $file: $enc encryption arm(s), $pool pool arm(s) ($note)"
+		fi
+	done
+
+	# The arms for a full storage, in the files that have them.
+	printf '%s\n' "$GUARDED" | while IFS= read -r file; do
+		path="$root/$file"
+		[ -n "$file" ] && [ -f "$path" ] || continue
+		missing=$(unguarded "$path")
+		if [ -n "$missing" ]; then
+			echo "check-passthrough: $file has a passthrough arm for an encryption error with no guard for a full storage after it (line $(printf '%s' "$missing" | tr '\n' ' '))" >&2
+			echo "    the next arm must be 'e if e.is_storage_full() => e', or its form for that place" >&2
+			echo NOGUARD >> "$root/.passthrough-status"
 		fi
 	done
 
@@ -137,6 +189,9 @@ self_test() {
 	# is any more: the table of the self-test says so, and the real one is put back after it.
 	real_table=$TABLE
 	TABLE=$(printf '%s\n' "$TABLE" | sed 's#^src/lsm.rs|ENFORCED|#src/lsm.rs|PENDING|#')
+	# The guard for a full storage is enforced only where a fixture says so.
+	real_guarded=$GUARDED
+	GUARDED=
 
 	# An arm of each shape that the engine has, with and without its pool arm.
 	expect fail 0 '	Error::Encryption(_) => e,'
@@ -182,6 +237,60 @@ self_test() {
 	Error::FilePoolExhausted => e,' '	Error::Encryption(_) => e,
 	Error::FilePoolExhausted => e,'
 
+	# The guard for a full storage after the arms of the encryption error and the pool error, in
+	# the shapes that the engine has. The fixtures are the file src/lsm.rs, with every arm balanced
+	# (--all), so that only the guard decides.
+	GUARDED='src/lsm.rs'
+	enc_pool='	Error::Encryption(_) | Error::FilePoolExhausted => e,'
+	other_arm='	e => Error::Other(format!("Failed: {e}")),'
+	# No guard: the next arm is another one. This is a guard that was deleted.
+	expect fail 1 'fn nothing() {}' "$enc_pool
+$other_arm"
+	# The guard right after it.
+	expect pass 1 'fn nothing() {}' "$enc_pool
+	e if e.is_storage_full() => e,
+$other_arm"
+	# The arms on two lines, as the pool arm on a line of its own.
+	expect pass 1 'fn nothing() {}' '	Error::Encryption(_) => e,
+	Error::FilePoolExhausted => e,
+	e if e.is_storage_full() => e,
+	e => x,'
+	expect fail 1 'fn nothing() {}' '	Error::Encryption(_) => e,
+	Error::FilePoolExhausted => e,
+	e => x,'
+	# The shape of a result.
+	expect pass 1 'fn nothing() {}' '	Err(e @ (Error::Encryption(_) | Error::FilePoolExhausted)) => Err(e.clone()),
+	Err(e) if e.is_storage_full() => Err(e.clone()),
+	Err(e) => Err(Error::Other(e)),'
+	expect fail 1 'fn nothing() {}' '	Err(e @ (Error::Encryption(_) | Error::FilePoolExhausted)) => Err(e.clone()),
+	Err(e) => Err(Error::Other(e)),'
+	# A guard in another place does not do for this one.
+	expect fail 1 'fn nothing() {}' "$enc_pool
+$other_arm
+}
+fn elsewhere() {
+	e if e.is_storage_full() => e,"
+	# An arm that is the last line of the file has no guard after it.
+	expect fail 1 'fn nothing() {}' "$enc_pool"
+	# The rotation of the log has the same error of the log, with its own shape.
+	expect pass 1 'fn nothing() {}' '	wal::Error::Encryption(error) => Error::Encryption(error),
+	wal::Error::PoolExhausted => Error::FilePoolExhausted,
+	wal::Error::IO(error) if pooled && error.kind() == std::io::ErrorKind::StorageFull => Error::Io(x),
+	error => Error::Other(format!("{what}: {error}")),'
+	expect fail 1 'fn nothing() {}' '	wal::Error::Encryption(error) => Error::Encryption(error),
+	wal::Error::PoolExhausted => Error::FilePoolExhausted,
+	error => Error::Other(format!("{what}: {error}")),'
+	# Comments between the arms do not count as arms.
+	expect pass 1 'fn nothing() {}' "$enc_pool
+	// A full storage keeps its type too.
+	e if e.is_storage_full() => e,
+$other_arm"
+	# A file that is not listed is not checked for the guard.
+	GUARDED='src/other.rs'
+	expect pass 1 'fn nothing() {}' "$enc_pool
+$other_arm"
+	GUARDED=
+
 	# A place that is not in the table is refused.
 	expect fail 0 'fn nothing() {}' '' '	Error::Encryption(_) => e,'
 	expect pass 0 'fn nothing() {}' '' '	let x = 1;'
@@ -196,6 +305,7 @@ self_test() {
 	rm -rf "$fixture"
 
 	TABLE=$real_table
+	GUARDED=$real_guarded
 	if [ "$failures" -ne 0 ]; then
 		echo "self-test: $failures failure(s)" >&2
 		return 1

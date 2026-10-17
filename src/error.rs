@@ -225,6 +225,10 @@ impl From<crate::wal::Error> for Error {
 			crate::wal::Error::Encryption(err) => Error::Encryption(err),
 			// And this one a pool that has no free file from a log that cannot be written.
 			crate::wal::Error::PoolExhausted => Error::FilePoolExhausted,
+			// A browser that is out of quota keeps its type: it passes once there is room.
+			crate::wal::Error::StorageFull(message) => {
+				Error::Io(Arc::new(std::io::Error::new(std::io::ErrorKind::StorageFull, message)))
+			}
 			err => Error::Wal(err.to_string()),
 		}
 	}

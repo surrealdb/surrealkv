@@ -45,8 +45,10 @@ pub(crate) struct TaskManager {
 	task_handles: Mutex<Option<Vec<rt::JoinHandle<()>>>>,
 
 	/// Told when the tasks are to stop, so that one that waits for the spare files of a pool is
-	/// not waited for: `stop` would otherwise wait for a refill that may never come.
-	stop_notify: Arc<Notify>,
+	/// not waited for: `stop` would otherwise wait for a refill that may never come. Only a pool
+	/// has such a wait, and a database on `std` has none of this: no allocation at open and no
+	/// lock at close.
+	stop_notify: Option<Arc<Notify>>,
 }
 
 /// How a wait for the spare files of a pool ended, for a task.
@@ -61,7 +63,19 @@ enum Spares {
 
 /// Waits for `wait`, unless the tasks are told to stop first. Registered for the stop signal
 /// before the flag is read, so a stop that comes between the two is not missed.
-async fn await_spares(wait: SpareWait, stop_flag: &AtomicBool, stop_notify: &Notify) -> Spares {
+async fn await_spares(
+	wait: SpareWait,
+	stop_flag: &AtomicBool,
+	stop_notify: Option<&Notify>,
+) -> Spares {
+	// A wait for spare files is only made on a pool, and a pool has the signal. Without one
+	// there is nothing to hear a stop with, and the wait is the whole of it.
+	let Some(stop_notify) = stop_notify else {
+		return match wait.await {
+			Ok(()) => Spares::Ready,
+			Err(e) => Spares::Failed(Error::from(e)),
+		};
+	};
 	let stopped = stop_notify.notified();
 	tokio::pin!(stopped);
 	stopped.as_mut().enable();
@@ -98,10 +112,10 @@ impl TaskManager {
 		let memtable_running = Arc::new(AtomicBool::new(false));
 		let level_running = Arc::new(AtomicBool::new(false));
 		let task_handles = Mutex::new(Some(Vec::new()));
-		let stop_notify = Arc::new(Notify::new());
 		// Everything that only a pool needs is done behind this, so that the tasks of a database on
 		// `std` do exactly what they did.
 		let pooled = opts.fs.kind() == FsKind::Pool;
+		let stop_notify = pooled.then(|| Arc::new(Notify::new()));
 
 		// Spawn memtable compaction task
 		{
@@ -111,7 +125,7 @@ impl TaskManager {
 			let running = Arc::clone(&memtable_running);
 			let level_notify = Arc::clone(&level_notify);
 			let write_stall = Arc::clone(&write_stall);
-			let stop_notify = Arc::clone(&stop_notify);
+			let stop_notify = stop_notify.clone();
 
 			let handle = rt::spawn(async move {
 				let error_handler = core.error_handler();
@@ -141,7 +155,7 @@ impl TaskManager {
 						};
 						let spares = match pooled.then(|| core.spares_for_flush()).flatten() {
 							Some(wait) if core.has_pending_immutables() => {
-								await_spares(wait, &stop_flag, &stop_notify).await
+								await_spares(wait, &stop_flag, stop_notify.as_deref()).await
 							}
 							_ => Spares::Ready,
 						};
@@ -246,7 +260,7 @@ impl TaskManager {
 			let notify = Arc::clone(&level_notify);
 			let running = Arc::clone(&level_running);
 			let write_stall = Arc::clone(&write_stall);
-			let stop_notify = Arc::clone(&stop_notify);
+			let stop_notify = stop_notify.clone();
 
 			let handle = rt::spawn(async move {
 				'task: loop {
@@ -276,7 +290,9 @@ impl TaskManager {
 							0
 						};
 						let spares = match pooled.then(|| core.spares_for_compaction()).flatten() {
-							Some(wait) => await_spares(wait, &stop_flag, &stop_notify).await,
+							Some(wait) => {
+								await_spares(wait, &stop_flag, stop_notify.as_deref()).await
+							}
 							None => Spares::Ready,
 						};
 						let result = match spares {
@@ -355,6 +371,13 @@ impl TaskManager {
 		}
 	}
 
+	/// Test observer: whether the tasks have a signal for a stop that a wait for spare files is
+	/// to hear, which only a pool needs.
+	#[cfg(test)]
+	pub(crate) fn has_stop_signal(&self) -> bool {
+		self.stop_notify.is_some()
+	}
+
 	pub(crate) fn wake_up_memtable(&self) {
 		// Only notify if not already running
 		if !self.memtable_running.load(Ordering::Acquire) {
@@ -374,7 +397,9 @@ impl TaskManager {
 	/// tests calls this yet: `Tree::abandon` will.
 	pub(crate) fn abort(&self) {
 		self.stop_flag.store(true, Ordering::SeqCst);
-		self.stop_notify.notify_waiters();
+		if let Some(notify) = &self.stop_notify {
+			notify.notify_waiters();
+		}
 		if let Some(handles) = self.task_handles.lock().unwrap().take() {
 			for handle in handles {
 				handle.abort();
@@ -390,7 +415,9 @@ impl TaskManager {
 		// wait for the spare files of a pool, which may never come.
 		self.memtable_notify.notify_one();
 		self.level_notify.notify_one();
-		self.stop_notify.notify_waiters();
+		if let Some(notify) = &self.stop_notify {
+			notify.notify_waiters();
+		}
 
 		// Wait for any in-progress compactions to complete (no timeout - wait
 		// indefinitely)
