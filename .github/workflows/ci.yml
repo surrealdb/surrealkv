@@ -113,11 +113,19 @@ jobs:
           scripts/check-passthrough.sh --self-test
           scripts/check-passthrough.sh
 
-      # The list of calls that must go through the file system seam (clippy.toml) is not enforced
-      # while the engine is being moved over, so nothing else would notice an entry that matches
-      # nothing. This runs every entry against a fixture with the lint denied.
+      # The calls that must go through the file system seam (clippy.toml) are denied by the Clippy
+      # steps (`clippy::disallowed_methods`), but clippy.toml matches exact paths only: an entry
+      # that is a wildcard or is mistyped is not an error, it matches nothing. This runs every
+      # entry against a fixture with the lint denied, so that such an entry is found here. It also
+      # checks that nobody lowered the levels that keep the seam enforced: the library at `deny`,
+      # no blanket allow outside test code, and a reason on every allow.
       - name: File system lint list
         run: scripts/check-fs-lint.sh --self-test
+
+      # The browser job checks the archive that a real wasm32 build writes. This checks the check,
+      # on fixtures, so that a change to the script cannot make that step pass on anything.
+      - name: Zstd archive guard
+        run: scripts/check-zstd-archive.sh --self-test
 
   # Encryption is on by default, so the normal jobs cover it. Build and test without it here, to
   # keep the guard that rejects a key manager from rotting.
@@ -154,6 +162,61 @@ jobs:
 
       - name: Test (skv)
         run: cargo test -p surrealkv-cli --no-default-features
+
+  # The engine's own tests, over the memory file system instead of the operating system's: the
+  # same pool of files that the browser uses (src/vfs/pool.rs), without a browser. Native
+  # behaviour over `std::fs` is what build-test runs; these two check the engine against the
+  # pool's contract, and `native-mem-strict` also against its strictest settings: no background
+  # refill, and a second raw open of a file is an error. A test that needs a real directory, or
+  # a feature that the pool does not have (encryption, checkpoints), skips itself.
+  native-mem:
+    name: Native tests over the memory file system
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+
+      - name: Test
+        env:
+          RUST_BACKTRACE: 1
+          SURREALKV_TEST_FS: mem
+        run: cargo test -p surrealkv --lib
+
+  native-mem-strict:
+    name: Native tests over the strict memory file system
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Setup cache
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
+        with:
+          toolchain: stable
+
+      # One test at a time: the strict settings are meant for tests that run on one thread.
+      - name: Test
+        env:
+          RUST_BACKTRACE: 1
+          SURREALKV_TEST_FS: mem-strict
+        run: cargo test -p surrealkv --lib -- --test-threads=1
 
   format:
     runs-on: ubuntu-latest
@@ -212,6 +275,7 @@ jobs:
   wasm-test:
     name: WASM Test (${{ matrix.runtime }})
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -241,8 +305,9 @@ jobs:
       # clang, and archived by the archiver of the target: GNU `ar` and Apple's write no symbol
       # index for WebAssembly objects (an archive without members on macOS), and rust-lld then
       # reports every zstd symbol as undefined. Both must be LLVM's, and the job stops here with a
-      # clear message if the runner does not have them. (Unverified on ubuntu-latest: the
-      # versioned names are a guess at what the image has.)
+      # clear message if the runner does not have them. On ubuntu-latest there is an unversioned
+      # `clang` and only a versioned `llvm-ar` (llvm-ar-18 when this was written), hence the
+      # fallback to the highest numbered one.
       - name: Select the C toolchain for wasm32
         if: matrix.runtime == 'browser'
         run: |
@@ -256,22 +321,66 @@ jobs:
           echo "AR_wasm32_unknown_unknown=$LLVM_AR" >> "$GITHUB_ENV"
 
       - name: Run WASM tests in Browser (Headless Chrome)
+        id: chrome
         if: matrix.runtime == 'browser'
         run: |
+          set -euo pipefail
           # Every tests/opfs_*.rs target runs in headless Chrome. Each one picks its own context
           # (a dedicated worker, or the main thread for opfs_window_test) with
           # wasm_bindgen_test_configure!, and the default below only covers a target that does not.
-          # The runner gives a whole test binary 20 seconds by default.
+          # The runner gives a whole test binary 20 seconds by default (WASM_BINDGEN_TEST_TIMEOUT
+          # is that limit in seconds). The engine test (tests/opfs_engine_test.rs) opens, fills,
+          # compacts, closes and crashes a database twice in one binary and is given more.
+          # A target that fails does not stop the others, so that one run shows every failure, but
+          # the step fails at the end if any did.
+          failed=""
+          run_chrome() {
+            label=$1
+            limit=$2
+            shift 2
+            echo "::group::Running $label"
+            if ! WASM_BINDGEN_TEST_TIMEOUT="$limit" WASM_BINDGEN_USE_DEDICATED_WORKER=1 wasm-pack test --headless --chrome "$@"; then
+              failed="$failed $label"
+            fi
+            echo "::endgroup::"
+          }
+          found=0
           for test in tests/opfs_*.rs; do
+            [ -e "$test" ] || continue
+            found=$((found + 1))
             name=$(basename "$test" .rs)
-            echo "Running $name"
-            WASM_BINDGEN_TEST_TIMEOUT=120 WASM_BINDGEN_USE_DEDICATED_WORKER=1 wasm-pack test --headless --chrome --test "$name"
+            case "$name" in
+              opfs_engine_test) limit=600 ;;
+              *) limit=120 ;;
+            esac
+            run_chrome "$name" "$limit" --test "$name"
           done
-          # The unit tests that need a browser: the runtime shim, the clock and the error handler
-          # (src/rt.rs, src/wasm_tests.rs), which are not reachable from tests/. This links the
-          # whole engine, zstd's C code included.
-          WASM_BINDGEN_TEST_TIMEOUT=300 WASM_BINDGEN_USE_DEDICATED_WORKER=1 wasm-pack test --headless --chrome -- --lib
-          wasm-pack test --headless --chrome crates/surrealkv-compat-indxdb
+          if [ "$found" -eq 0 ]; then
+            echo "no tests/opfs_*.rs target found" >&2
+            exit 1
+          fi
+          # The unit tests that need a browser: the runtime shim, the clock, the error handler and
+          # the raw OPFS backend (src/rt.rs, src/wasm_tests.rs, src/vfs/opfs_raw_tests.rs), which
+          # are not reachable from tests/. This links the whole engine, zstd's C code included.
+          run_chrome "unit tests (--lib)" 300 -- --lib
+          # The IndexedDB reader runs on the page, with the runner's own defaults.
+          echo "::group::Running surrealkv-compat-indxdb"
+          if ! wasm-pack test --headless --chrome crates/surrealkv-compat-indxdb; then
+            failed="$failed surrealkv-compat-indxdb"
+          fi
+          echo "::endgroup::"
+          if [ -n "$failed" ]; then
+            echo "Failed in headless Chrome:$failed" >&2
+            exit 1
+          fi
+
+      # Looks at the archive of zstd's C code that the build above wrote, whether or not the tests
+      # ran: if the link failed, this says why. A run that has no archive in the cached target
+      # directory (a cache can restore the compiled crates without their build directories) has
+      # nothing to check, and says so.
+      - name: Check the zstd archive of the wasm32 build
+        if: ${{ !cancelled() && matrix.runtime == 'browser' && steps.chrome.outcome != 'skipped' }}
+        run: scripts/check-zstd-archive.sh --allow-none target/wasm32-unknown-unknown
 
       - name: Run WASM tests in Node.js
         if: matrix.runtime == 'node'
